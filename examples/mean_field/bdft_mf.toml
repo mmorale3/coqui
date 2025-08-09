@@ -1,0 +1,58 @@
+#
+# This example shows how to convert a Quantum Esppresso mean-field system into
+# the internal `coqui` data structure format, [mean_field.bdft] using the
+# [orbitals] table.
+# Although [mean_field.qe] can read a QE output directly, the benefit of this
+# conversion is that one gets to modify its single-particle basis through
+# [orbitals] directly in coqui.
+#
+# The output of [orbitals] is a self-contained hdf5 checkpoint file to start an
+# coqui calculations.
+#
+# [orbitals] currently supports the following modifications to the orbital set:
+#   1. [select]: Choosing a subset of the orbitals.
+#   2. [pgto]: Augmenting periodic Gaussian-type orbitals.
+#
+
+# Initializes a qe mean-field system, and assumes Norb = 800 KS orbitals.
+[mean_field.qe]
+name     = "qe_N800"
+prefix   = "pwscf"
+outdir   = "qe_N800/OUT/"
+filetype = "h5"
+
+#######################################################
+# [select]: Choosing a subset of the orbitals.
+#######################################################
+[orbitals]
+mean_field = "qe_N800"          # tag for the input [mean_field]
+prefix     = "bdft_N200"        # prefix of the output hdf5: prefix.h5
+outdir     = "./"               # directory of the ouptut hdf5
+select.n0  = 200                # leave the lowest 200 KS orbitals untouched
+select.n_blocks = 0             # Number of blocks uniformly distributed between the 200~800 KS orbitals
+
+# reading the resulting mean-field system
+[mean_field.bdft]
+name   = "bdft_mf"              # tag for the new [mean_field] instance
+prefix = "bdft_N200"            # prefix of the coqui input hdf5, constructed in the previous step
+outdir = "./"                   # directory of the coqui input hdf5
+
+#######################################################
+# [pgto]: Augmenting periodic Gaussian-type orbitals.
+#######################################################
+[orbitals]
+mean_field = "qe_N800"          # tag for the input [mean_field]
+prefix     = "bdft_N200_gto"    # prefix of the output hdf5: prefix.h5
+outdir     = "./"               # directory of the ouptut hdf5
+pgto.n0    = 200                # leave the lowest 200 KS orbitals untouched
+pgto.basis = "ccpvdz.dat"       # Gaussian-type orbitals in the NWChem format
+
+# reading the resulting mean-field system
+[mean_field.bdft]
+name   = "bdft_mf"
+prefix = "bdft_N200_gto"
+outdir = "./"
+
+
+
+

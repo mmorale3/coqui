@@ -1,0 +1,33 @@
+[mean_field.qe]
+name     = "mf_qe"
+prefix   = "pwscf"
+outdir   = "qe_output_dir/OUT/"
+filetype = "h5"
+
+[interaction.thc]
+name        = "eri"
+mean_field  = "mf_qe"
+storage     = "incore"
+thresh      = 1e-6
+chol_block_size = 8
+r_blk       = 20
+distr_tol   = 0.4
+
+[evgw0]
+interaction = "eri"
+beta      = 300
+lambda    = 1200.0
+iaft_prec = "high"
+niter     = 1
+output    = "g0w0"
+div_treatment = "gygi"
+qp_type   = "sc"
+ac_alg    = "pade"
+eta       = 1e-6
+Nfit      = 26
+
+[band_interpolation]             # Wannier interpolation for a givne G0W0 electronic structure
+mean_field   = "mf_qe"           # tag for the input [mean_field] instance
+outdir       = "./"              # directory where the coqui G0W0 HDF5 output is
+prefix       = "g0w0"            # prefix for the input/output coqui G0W0 h5 archive
+wannier_file = "wan.h5"          # input h5 which defines the targeted correlated subspace

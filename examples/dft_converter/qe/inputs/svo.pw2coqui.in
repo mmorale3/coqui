@@ -1,0 +1,6 @@
+&input_pw2coqui
+
+prefix = 'svo'
+outdir = './OUT'
+
+/

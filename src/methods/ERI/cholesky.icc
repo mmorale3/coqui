@@ -1,0 +1,1165 @@
+#//include <tuple>
+#include <iomanip>
+#include <algorithm>
+#include <fstream>
+
+#include "configuration.hpp"
+#include "utilities/check.hpp"
+//#include "hamiltonian/potentials.hpp"
+
+#include "mpi3/communicator.hpp"
+#if defined(ENABLE_NCCL)
+#include "mpi3/nccl/communicator.hpp"
+#endif
+
+#include "nda/nda.hpp"
+#include "nda/blas.hpp"
+#include "nda/tensor.hpp"
+#include "h5/h5.hpp"
+#include "nda/h5.hpp"
+#include "itertools/itertools.hpp"
+#include "numerics/fft/nda.hpp"
+#include "grids/g_grids.hpp"
+#include "numerics/distributed_array/nda.hpp"
+#include "numerics/distributed_array/h5.hpp"
+#include "utilities/proc_grid_partition.hpp"
+#include "utilities/functions.hpp"
+#include "numerics/nda_functions.hpp"
+
+#include "nda/linalg/det_and_inverse.hpp"
+
+namespace methods
+{
+
+/**
+ * Evaluate pair densities multiplied by sqrt(V^{q}_{G}) in the plane-wave basis, rho^{k, k-q}_{a, b}(G) * sqrt(4*pi/|-q + G|^{2}),
+ * for a given q-point, local range for orbital index a, and local range for orbital index b
+ * @tparam local_Array_t
+ * @param iq - [INPUT] index for the q-point
+ * @param gPab - [OUTPUT] global pair density (nspin*npol, nkpts, a_range_global, b_range_global, ngm)
+ * @param a_range - [INPUT] global range for orbital index a
+ * @param b_range - [INPUT] global range for orbital index b
+ */
+template<MEMORY_SPACE MEM>
+void cholesky::evaluate_pair_densities(int iq, dArray_t<memory::array<MEM,ComplexType,5>> & gPab,
+				       nda::range a_range, nda::range b_range)
+{
+  decltype(nda::range::all) all;
+
+  // nspin==1 for rhf and ghf, 2 for uhf
+  long npol = mf->npol_in_basis();
+  long nkpts = mf->nkpts();
+  double omega = mf->volume();
+  long ngm = rho_g.size();
+
+  // K and Q vectors 
+  auto kpts = mf->kpts();
+  auto Q  = mf->Qpts()(iq,all);
+  nda::array<RealType,1> v_zero = {0.0,0.0,0.0};
+
+  // gPab.local(): (nspin*npol, nkloc, a_range_local, b_range_local, ngm)
+  utils::check( gPab.grid()[0] == 1, "Grid mismatch: Expects gPab.grid()[0] ({}) == 1", gPab.grid()[0]);
+  utils::check(gPab.local_shape()[4] == ngm,"Size mismatch: {}, {}", gPab.local_shape()[4], ngm);
+  utils::check(gPab.global_shape()[4] == ngm,"Size mismatch: {}, {}", gPab.global_shape()[4], ngm);
+  auto isp_rng = gPab.local_range(0);
+  auto kpt_rng = gPab.local_range(1);
+  auto a_loc_rng = gPab.local_range(2);
+  auto b_loc_rng = gPab.local_range(3);
+
+  // e-e potential in rho_g evaluated at G-Q: V = 4*pi/|G-Q|^{2}
+  memory::unified_array<RealType,1> sqrtVg(ngm,0.0);  
+//  hamilt::potential_g(sqrtVg,rho_g.g_vectors(),v_zero,Q,"coulomb");
+  vG.evaluate(sqrtVg,mf->lattv(),rho_g.g_vectors(),v_zero,Q); 
+  for( auto& v: sqrtVg ) v = std::sqrt(v);
+
+  /**************************************************************************/
+  /* calculate pair densities  */
+  /**************************************************************************/
+  // Pair densities in rho_g, including phase factor! 
+  auto Pab = gPab.local();
+  { // Pair densities 
+    long nnr = mf->nnr();
+//    long fft_batch = 1;
+    long fft_batch = a_loc_rng.size();
+    if constexpr (MEM == HOST_MEMORY) fft_batch=1;
+
+    Timer.start("ALLOC");
+    memory::array<MEM, ComplexType, 2> Psia(fft_batch,nnr); 
+    memory::array<MEM, ComplexType, 2> Psib(b_loc_rng.size(),nnr);
+    memory::array<MEM, ComplexType, 4> fft_b(fft_batch*b_loc_rng.size(),
+					     mf->fft_grid_dim(0),
+					     mf->fft_grid_dim(1),
+					     mf->fft_grid_dim(2));
+    Psia() = ComplexType(0.0);
+    Psib() = ComplexType(0.0);
+    fft_b() = ComplexType(0.0);
+
+    auto fft_b_2D = nda::reshape(fft_b, shape_t<2>{fft_batch*b_loc_rng.size(),nnr});
+    auto fft_b_3D = nda::reshape(fft_b, shape_t<3>{fft_batch,b_loc_rng.size(),nnr});
+    auto phase = memory::unified_array<ComplexType, 3>::zeros({mf->fft_grid_dim(0),
+						    mf->fft_grid_dim(1),
+						    mf->fft_grid_dim(2)});
+    auto phase_1D = nda::reshape(phase, shape_t<1>{nnr});
+    nda::stack_array<RealType,3> Gab = {0.0,0.0,0.0};
+    Timer.stop("ALLOC");
+
+    // fft object
+    Timer.start("FFTPLAN");
+    math::nda::fft<true> F(fft_b);
+    Timer.stop("FFTPLAN");
+
+    for(auto [isp0,isp] : itertools::enumerate(isp_rng) ) { 
+      long ispin = isp/npol; 
+      long ipol = isp%npol;
+      nda::range r_rng{ipol*nnr,(ipol+1)*nnr}; 
+      for(auto [ik, ka] : itertools::enumerate(kpt_rng) ) { 
+
+        long kb = mf->qk_to_k2(iq,ka);   // K(kb) = K(ka) - Q(iq) + G, for some G
+	Timer.start("IO");
+        // orbital Psi^{Kb=Ka-Q}_{b}(r)
+        mf->get_orbital_set('r',ispin,kb,b_loc_rng+b_range.first(),Psib,r_rng);
+	Timer.stop("IO");
+
+        // find -Gab such that: Q + Gab = ka - kb
+        // -Gab = Q - kpts(ka,all) + kpts(kb,all);
+        Gab = Q - kpts(ka,all) + kpts(kb,all);
+        // phase(i, j, k) = exp(i * Gab * r) where r = (i, j, k) * translational vectors
+ 	// MAM: to GPU...
+        utils::rspace_phase_factor(mf->lattv(),Gab,phase);  
+
+        if constexpr (MEM == HOST_MEMORY) {
+          for(long ib=0; ib<b_loc_rng.size(); ++ib ) { 
+            for(long n=0; n<nnr; ++n)
+              Psib(ib,n) *= phase_1D(n)/std::sqrt(omega*nkpts);
+          }
+	} else {
+          nda::tensor::contract(ComplexType(1.0/std::sqrt(omega*nkpts)), Psib(all,all), "bn", phase_1D, "n", 
+			 	ComplexType(0.0), Psib(all,all), "bn");
+        }
+      
+        for(auto ia : itertools::range(0,a_loc_rng.size(),fft_batch) ) {
+
+	  // shift by origin of a_range
+	  long nb = std::min(a_loc_rng.size()-ia,fft_batch);
+	  long a = a_range.first() + a_loc_rng.first() + ia;
+	  Timer.start("IO");
+          mf->get_orbital_set('r',ispin,ka,{a,a+nb},Psia(nda::range(0,nb),all),r_rng);
+	  Timer.stop("IO");
+        
+          if constexpr (MEM == HOST_MEMORY) {
+            for(long i=0, iib=0; i<nb; ++i) 
+              for(long ib=0; ib<b_loc_rng.size(); ++ib,++iib ) 
+                for(long n=0; n<nnr; ++n)
+                  fft_b_2D(iib,n) = std::conj(Psia(i,n)) * Psib(ib,n); 
+          } else {
+	    nda::tensor::contract(nda::conj(Psia(nda::range(0,nb),all)), "an",
+				  Psib(all,all), "bn",
+				  fft_b_3D, "abn");
+	  }
+
+          // fft r->G
+	  Timer.start("FFT");
+          F.forward(fft_b);   
+	  Timer.stop("FFT");
+
+          auto Pin = nda::reshape(Pab(isp0,ik,nda::range(ia,ia+nb),all,all), shape_t<2>{nb*b_loc_rng.size(),ngm});
+	  nda::copy_select(false,1,rho_g.gv_to_fft(),sqrtVg,ComplexType(1.0),
+			fft_b_2D(nda::range(nb*b_loc_rng.size()),all),ComplexType(0.0),Pin);
+        } // a
+      }  // kp
+    }  // ispin 
+  } // Pair densities
+  /**************************************************************************/
+  /**************************************************************************/
+}
+
+template<MEMORY_SPACE MEM>
+void cholesky::evaluate_pair_densities(int iq, int ka, dArray_t<memory::array<MEM,ComplexType,3>> & gPab,
+				       nda::range a_range, nda::range b_range)
+{
+  decltype(nda::range::all) all;
+
+  // nspin==1 for rhf and ghf, 2 for uhf
+  long nkpts = mf->nkpts();
+  double omega = mf->volume();
+  long ngm = rho_g.size();
+
+  // K and Q vectors 
+  auto kpts = mf->kpts();
+  auto Q  = mf->Qpts()(iq,all);
+  nda::array<RealType,1> v_zero = {0.0,0.0,0.0};
+
+  // gPab.local(): (a_range_local, b_range_local, ngm)
+  utils::check(gPab.local_shape()[2] == ngm,"Size mismatch: {}, {}", gPab.local_shape()[2], ngm);
+  utils::check(gPab.global_shape()[2] == ngm,"Size mismatch: {}, {}", gPab.global_shape()[2], ngm);
+  auto a_loc_rng = gPab.local_range(0);
+  auto b_loc_rng = gPab.local_range(1);
+
+  // e-e potential in rho_g evaluated at G-Q: V = 4*pi/|G-Q|^{2}
+  memory::unified_array<RealType,1> sqrtVg(ngm,0.0);  
+//  hamilt::potential_g(sqrtVg,rho_g.g_vectors(),v_zero,Q,"coulomb");
+  vG.evaluate(sqrtVg,mf->lattv(),rho_g.g_vectors(),v_zero,Q);
+  for( auto& v: sqrtVg ) v = std::sqrt(v);
+
+  /**************************************************************************/
+  /* calculate pair densities  */
+  /**************************************************************************/
+  // Pair densities in rho_g, including phase factor! 
+  auto Pab = gPab.local();
+  { // Pair densities 
+// enable fft_many!!!
+    long nnr = mf->nnr();
+
+    Timer.start("ALLOC");
+    nda::array<ComplexType, 1> Psia(nnr,ComplexType(0.0)); 
+    auto Psib = nda::array<ComplexType, 2>::zeros({b_loc_rng.size(),nnr});
+    auto fft_b = nda::array<ComplexType, 3>::zeros({mf->fft_grid_dim(0),
+						    mf->fft_grid_dim(1),
+						    mf->fft_grid_dim(2)});
+    auto fft_b_1D = nda::reshape(fft_b, shape_t<1>{nnr});
+    auto phase = memory::unified_array<ComplexType, 3>::zeros({mf->fft_grid_dim(0),
+							       mf->fft_grid_dim(1),
+							       mf->fft_grid_dim(2)});
+    auto phase_1D = nda::reshape(phase, shape_t<1>{nnr});
+    nda::stack_array<RealType,3> Gab = {0.0,0.0,0.0};
+    Timer.stop("ALLOC");
+
+    Timer.start("FFTPLAN");
+    math::nda::fft<false> F(fft_b);
+    Timer.stop("FFTPLAN");
+    
+    long kb = mf->qk_to_k2(iq,ka);   // K(kb) = K(ka) - Q(iq) + G, for some G
+    Timer.start("IO");
+    // orbital Psi^{Kb=Ka-Q}_{b}(r)
+    mf->get_orbital_set('r',0,kb,b_loc_rng+b_range.first(),Psib);
+    Timer.stop("IO");
+
+    // find -Gab such that: Q + Gab = ka - kb
+    // -Gab = Q - kpts(ka,all) + kpts(kb,all);
+    Gab = Q - kpts(ka,all) + kpts(kb,all);
+    // phase(i, j, k) = exp(i * Gab * r) where r = (i, j, k) * translational vectors
+    utils::rspace_phase_factor(mf->lattv(),Gab,phase);
+
+    for(auto [ia, a0] : itertools::enumerate(a_loc_rng) ) {
+
+      // shift by origin of a_range
+      long a = a0 + a_range.first();
+      Timer.start("IO");
+      mf->get_orbital('r',0,ka,a,Psia);
+      Timer.stop("IO");
+      for(long n=0; n<nnr; ++n)
+        Psia(n) *= (std::conj(phase_1D(n))/std::sqrt(omega*nkpts));
+        
+      for(auto [ib, b0] : itertools::enumerate(b_loc_rng) ) { 
+
+        // shift by origin of b_range
+        for(long n=0; n<nnr; ++n)
+          fft_b_1D(n) = std::conj(Psia(n)) * Psib(ib,n); 
+
+        // fft r->G
+	Timer.start("FFT");
+	F.forward(fft_b);
+	Timer.stop("FFT");
+
+	// fft G ->rho_g 
+	auto P_ = Pab(ia,ib,all); 
+        for( auto [i,n] : itertools::enumerate(rho_g.gv_to_fft()) ) 
+          P_(i) = sqrtVg(i) * fft_b_1D(n);
+
+      } // b 
+    } // a
+  } // Pair densities
+  /**************************************************************************/
+  /**************************************************************************/
+}
+
+/**
+ * Evaluate Cholesky matrix L^{k, k-q}_{a, b}(P) for a given q-point
+ * @tparam local_Array_t
+ * @param iq - [INPUT] index for q-point
+ * @param a_range - [INPUT] basis range for orbital a
+ * @param b_range - [INPUT] basis range for orbital b
+ * @return
+ */
+template<MEMORY_SPACE MEM, typename comm_t>
+auto cholesky::evaluate_impl(comm_t& k_intra_comm, int iq, nda::range a_range, nda::range b_range) 
+{
+  Timer.start("TOTAL");
+  using local_Array_t = memory::array<MEM, ComplexType, 5>;
+  using Array_t = dArray_t<local_Array_t>; 
+
+  decltype(nda::range::all) all;
+
+  // nspin==1 for rhf and ghf, 2 for uhf
+  int nspin = mf->nspin_in_basis();
+  int npol = mf->npol_in_basis();
+  int nkpts = mf->nkpts();
+  int ngm = rho_g.size();
+
+  // K and Q vectors 
+  nda::array<RealType,1> v_zero = {0.0,0.0,0.0};
+
+  /**************************************************************************/
+  /*
+   * For a given q-point,
+   * calculate pair densities, rho^{k, k-q}_{a, b}(G), multiplied by the square root of V^{q}_{G} = 4 * pi / |-q + G|^{2}
+   * rho^{k, k-q}_{a, b}(G) = (nspin*npol, nkpts, a_range, b_range, ngm).
+   *
+   * We split all k-points into npools that are handled by multiple sub-communicators (k_intra_comm).
+   * In each k_intra_comm, partition the evaluations in {k, a, b} space based on npx, npy
+   */
+  /**************************************************************************/
+  // Pair densities in rho_g, including phase factor! 
+  Timer.start("ALLOC");
+  long npx = utils::find_proc_grid_min_diff(k_intra_comm.size(),a_range.size(),b_range.size());
+  long npy = k_intra_comm.size()/npx;
+  auto global_Pab = math::nda::make_distributed_array<local_Array_t>(mpi->comm,
+			{1,npools,npx,npy,1},
+			{nspin*npol,nkpts,a_range.size(),b_range.size(),ngm},
+			{1,1,1,1,1});  // no blocking for now
+  global_Pab.local()=0.0;
+  // partition {kp, a, b} space 
+  auto kpt_rng = global_Pab.local_range(1);
+  auto a_loc_rng = global_Pab.local_range(2);
+  auto b_loc_rng = global_Pab.local_range(3);
+  long nkloc = kpt_rng.size(); 
+  Timer.stop("ALLOC");
+  Timer.start("Pab");
+  evaluate_pair_densities<MEM>(iq, global_Pab, a_range, b_range);
+  Timer.stop("Pab");
+  auto Pab = global_Pab.local(); // (nspin*npol, nkpts, a_local, b_local, G)
+  auto Pab2d = nda::reshape(Pab,
+			shape_t<2>{nspin*npol*nkloc*a_loc_rng.size()*b_loc_rng.size(),ngm});
+
+  // MAM: In principle, we already have a symmetric factorization of the
+  //      Coulomb kernel, reducing it to an optimal subspace...
+  // (ab|cd) = sum_g Pab(ka,a,b,g) * conj( Pab(kd,d,c,g) )
+  //   where Q = ka-kb - Gab = kd-kc - Gdc
+
+  /**************************************************************************/
+  /* For a given q-point (iq),
+   * calculate the diagonals of residual matrix (ResM) in the first iteration of Cholesky decomposition,
+   * find the largest element and the index.
+   * ResM = (nspin*npol, nkloc, a_loc, b_loc) = U^{ka, kb, kb, ka}_{a, b, b, a}. */
+  /**************************************************************************/
+  Timer.start("ALLOC");
+  // keeping as complex type, since I have problems reducing to real in GPU
+  memory::array<MEM, ComplexType, 4> ResM(nspin*npol,nkloc,a_loc_rng.size(),
+					      b_loc_rng.size());
+  auto ResM1d = nda::reshape(ResM, shape_t<1>{ResM.size()});
+  ResM()=0;
+  // global maximum value along the residual and processor which owns the value
+  mpi3::vlp<RealType> gmax;
+  // location of local maximum of ResM
+  std::array<long,4> lmax_res_indx;                  
+  Timer.stop("ALLOC");
+  { // residual 
+    // calculate residual matrix: Rkab = ({ka,a},{kb,b}|{kb,b},{ka,a}) 
+    Timer.start("DIAG");
+    if constexpr (MEM == HOST_MEMORY) {
+      for(int i=0; i<ResM1d.size(); ++i) {
+        ComplexType s(0.0);
+        auto L = Pab2d(i,all);
+        for(int n=0; n<ngm; ++n)
+          s += L(n) * std::conj(L(n));
+        ResM1d(i) = s;
+      }
+    } else {
+      nda::tensor::contract( Pab2d, "ab", nda::conj(Pab2d), "ab", ResM1d, "a"); 
+    }
+    std::tie(lmax_res_indx, gmax.value) = nda::argmax(ResM);
+    // find index and value of maximum element  
+    Timer.stop("DIAG");
+    Timer.start("COMM");
+    gmax = mpi->comm.max_loc(gmax.value);
+    utils::check(gmax.value>0.0,"Negative Residual.");     
+    Timer.stop("COMM");
+  } // residual 
+  /**************************************************************************/
+  /**************************************************************************/
+
+  /**************************************************************************/
+  /* iterative construction of cholesky matrix  */
+  /**************************************************************************/
+  Timer.start("ALLOC");
+  // L( chol_i, ispin*npol+ipol, kp_i, a_i, b_i)
+  long nguess = int(std::sqrt(double(a_range.size()*b_range.size())));// reasonable guess 
+  std::vector<std::unique_ptr<Array_t>> gL;
+  gL.push_back(std::make_unique<Array_t>( std::addressof(mpi->comm), shape_t<5>{1,1,npools,npx,npy},
+	shape_t<5>{nguess,nspin*npol,nkpts,a_range.size(),b_range.size()},
+	shape_t<5>{nguess,nspin*npol,nkloc,a_loc_rng.size(),b_loc_rng.size()}, 
+	shape_t<5>{0,0,kpt_rng.first(),a_loc_rng.first(),b_loc_rng.first()},
+	shape_t<5>{1,1,1,1,1} ));
+  gL.back()->local() = 0.0;
+  int nchol = 0;
+  // communication buffer
+  memory::array<MEM, ComplexType, 1> comm_buff( ngm + nguess );
+  comm_buff() = ComplexType(0.0);
+#if defined(MPI_NO_CUDA_AWARE)
+  nda::array<ComplexType, 1> comm_buff_h( ngm + nguess, ComplexType(0.0) );
+#endif
+  Timer.stop("ALLOC");
+
+  app_log(3,"nchol, max |D|: ");
+  Timer.start("ITER");
+  while( gmax.value > cutoff ) {
+
+    // need new bucket? 
+    if( nchol > 0 and nchol%nguess == 0 ) {
+      Timer.start("ALLOC");
+      gL.push_back(std::make_unique<Array_t>( std::addressof(mpi->comm), shape_t<5>{1,1,npools,npx,npy},
+	shape_t<5>{nguess,nspin*npol,nkpts,a_range.size(),b_range.size()},
+	shape_t<5>{nguess,nspin*npol,nkloc,a_loc_rng.size(),b_loc_rng.size()}, 
+	shape_t<5>{0,0,kpt_rng.first(),a_loc_rng.first(),b_loc_rng.first()}, 
+	shape_t<5>{1,1,1,1,1} ));
+      gL.back()->local()=0.0;
+      comm_buff.resize(ngm + nchol+nguess );
+      comm_buff()=0.0;
+      Timer.stop("ALLOC");
+    }
+
+    // views to local matrix and to 2d reshaped view 
+    auto L = (gL.back())->local();
+    auto L2d = nda::reshape(L, shape_t<2>{L.shape()[0],ResM.size()});
+    long nchol_bucket = nchol%nguess;
+
+    app_log(3," {}  {} ",nchol,gmax.value);
+
+    // bcast Puv(g) and Chol(0:nchol-1,u,v) 
+    if(mpi->comm.rank() == gmax.location)
+    {
+      comm_buff( nda::range(0,ngm) ) = Pab(lmax_res_indx[0],lmax_res_indx[1],
+      				           lmax_res_indx[2],lmax_res_indx[3],all); 
+      if(nchol > 0) {
+	long ic0 = 0;
+        for(auto& v : gL) {
+	  long ic1 = std::min(ic0+v->local_shape()[0],long(nchol));
+	  if( ic1 > ic0 )
+            comm_buff( nda::range(ngm+ic0,ngm+ic1) ) = 
+                 v->local()( nda::range(0,ic1-ic0),
+                    lmax_res_indx[0],lmax_res_indx[1],
+                    lmax_res_indx[2],lmax_res_indx[3]);
+ 	  ic0 = ic1;
+        }
+      }
+      nda::tensor::scale(ComplexType(1.0),
+			 comm_buff(nda::range(ngm+nchol)),
+			 nda::tensor::op::CONJ);
+    }
+    Timer.start("COMM");
+    if constexpr ( MEM == HOST_MEMORY )
+      mpi->comm.broadcast_n(comm_buff.data(), ngm+nchol, gmax.location);
+    else {
+#if defined(MPI_NO_CUDA_AWARE)
+      if(comm_buff_h.shape()[0] != comm_buff.shape()[0]) comm_buff_h.resize(comm_buff.shape()[0]);
+      if(mpi->comm.rank() == gmax.location)
+        comm_buff_h = comm_buff;
+      mpi->comm.broadcast_n(comm_buff_h.data(), ngm+nchol, gmax.location);
+      comm_buff() = comm_buff_h;
+#else
+#if defined(ENABLE_NCCL)
+      mpi->dev_comm.broadcast_n(reinterpret_cast<RealType*>(comm_buff.data()), 2*(ngm+nchol), gmax.location);
+#else
+      mpi->comm.broadcast_n(comm_buff.data(), ngm+nchol, gmax.location);
+#endif
+#endif
+    }
+    Timer.stop("COMM");
+
+    auto Puv = comm_buff(nda::range(0,ngm));
+    auto Luv = comm_buff(nda::range(ngm,ngm+nchol));
+
+    Timer.start("ERI");
+    // contruct new cholesky vector L(p,ik,ia,ib)
+    // L(n, ab) = (ab|vu) - sum_{1,n-1} L(p,ab) * conjg(L(p,uv))
+    nda::blas::gemv(Pab2d,Puv,L2d(nchol_bucket,all));
+
+    // orthonormalize cholesky vector
+    if(nchol > 0) {
+      long ic0 = 0; 
+      for(auto& v : gL) {
+	long nc = v->local_shape()[0];
+        long ic1 = std::min(ic0+nc,long(nchol));
+        if( ic1 > ic0 ) { 
+	  auto A_ = nda::reshape(v->local(),shape_t<2>{nc,ResM.size()});
+          nda::blas::gemv(ComplexType(-1.0), 
+		nda::transpose(A_(nda::range(0,ic1-ic0),all)),Luv(nda::range(ic0,ic1)),
+		ComplexType(1.0) , L2d(nchol_bucket,all));
+	} 
+        ic0 = ic1;
+      }
+    }
+
+    // scal
+    nda::blas::scal(ComplexType(1.0/std::sqrt(std::abs(gmax.value))),
+		    L2d(nchol_bucket, all));
+    Timer.stop("ERI");
+   
+    Timer.start("DIAG");
+    // update residual: R(ik,ia,ib) -= L(nchol,ik,ia,ib) * conjg(L(nchol,ik,ia,ib)) 
+    // which blas/batched blas routine? a foreach?
+    if constexpr ( MEM == HOST_MEMORY ) {
+      for(int n=0; n<ResM1d.size(); ++n) 
+        ResM1d(n) -= L2d(nchol_bucket,n)*std::conj(L2d(nchol_bucket,n)); 
+    } else {
+      nda::tensor::contract( ComplexType(-1.0), L2d(nchol_bucket,all), "n", 
+			     nda::conj(L2d(nchol_bucket,all)), "n", 
+			     ComplexType(1.0), ResM1d, "n");
+    }
+    // find new maximum along residual 
+    std::tie(lmax_res_indx, gmax.value) = nda::argmax(ResM);
+    Timer.stop("DIAG");
+    Timer.start("COMM");
+    gmax = mpi->comm.max_loc(gmax.value);
+    utils::check(gmax.value>0.0,"Negative Residual.");
+    Timer.stop("COMM");
+
+    // increase counter
+    ++nchol;
+
+  };
+  Timer.stop("ITER");
+
+  /**************************************************************************/
+  /**************************************************************************/
+
+  /**************************************************************************/
+  /*                         prepare compact object   			    */
+  /**************************************************************************/
+  auto return_value = Array_t{ std::addressof(mpi->comm), {1,1,npools,npx,npy},
+                 {nchol,nspin*npol,nkpts,a_range.size(),b_range.size()},
+                 {nchol,nspin*npol,nkloc,a_loc_rng.size(),b_loc_rng.size()},
+                 {0,0,kpt_rng.first(),a_loc_rng.first(),b_loc_rng.first()},
+		 {1,1,1,1,1}}; 
+  {
+    auto ___ = nda::ellipsis{};
+    auto L = return_value.local();
+    long ic0 = 0;
+    for(auto& v : gL) {
+      long nc = v->local_shape()[0];
+      long ic1 = std::min(ic0+nc,long(nchol));
+      if( ic1 > ic0 ) 
+        L(nda::range(ic0,ic1),___) = v->local()(nda::range(0,ic1-ic0),___); 
+      ic0 = ic1;
+    }
+  }
+  Timer.stop("TOTAL");
+  return return_value; 
+}
+
+template<MEMORY_SPACE MEM, typename comm_t>
+auto cholesky::evaluate_blocked_impl(comm_t& k_intra_comm, int iq, 
+                                     nda::range a_range, nda::range b_range, int block_size) 
+{
+  Timer.start("TOTAL");
+  using local_Array_t = memory::array<MEM,ComplexType,5>;
+  using Array_t = dArray_t<local_Array_t>; 
+
+  decltype(nda::range::all) all;
+
+  // nspin==1 for rhf and ghf, 2 for uhf
+  int nspin = mf->nspin_in_basis();
+  int npol = mf->npol_in_basis();
+  int nkpts = mf->nkpts();
+  int ngm = rho_g.size();
+  int grank = mpi->comm.rank(); 
+
+  // K and Q vectors 
+  nda::array<RealType,1> v_zero = {0.0,0.0,0.0};
+
+  /**************************************************************************/
+  /* calculate pair densities  */
+  /**************************************************************************/
+  // Pair densities in rho_g, including phase factor! 
+  Timer.start("ALLOC");
+  // partition {kp, a, b} space 
+  long npx = utils::find_proc_grid_min_diff(k_intra_comm.size(),a_range.size(),b_range.size());
+  long npy = k_intra_comm.size()/npx;
+  auto global_Pab = math::nda::make_distributed_array<local_Array_t>(mpi->comm,
+                        {1,npools,npx,npy,1},
+			{nspin*npol,nkpts,a_range.size(),b_range.size(),ngm},
+			{1,1,1,1,1});  // no blocking for now
+  auto kpt_rng = global_Pab.local_range(1);
+  auto a_loc_rng = global_Pab.local_range(2);
+  auto b_loc_rng = global_Pab.local_range(3);
+  long nkloc = kpt_rng.size(); 
+  Timer.stop("ALLOC");
+  
+  {
+    int min_b, val = std::max(1,int(nspin*npol*nkloc*a_loc_rng.size()*b_loc_rng.size())); 
+    mpi->comm.reduce_value(val,min_b,mpi3::min<>{},0);
+    mpi->comm.broadcast_value(min_b);
+    block_size = std::min(block_size,min_b);
+  }
+  utils::check(block_size <= nspin*npol*nkloc*a_loc_rng.size()*b_loc_rng.size(), 
+    "cholesky::evaluate: should not happen, block_size: {}",block_size); 
+
+  Timer.start("Pab");
+  evaluate_pair_densities<MEM>(iq, global_Pab, a_range, b_range);
+  Timer.stop("Pab");
+  auto Pab = global_Pab.local(); 
+  auto Pab2d = nda::reshape(Pab,
+		shape_t<2>{nspin*npol*nkloc*a_loc_rng.size()*b_loc_rng.size(),ngm});
+
+  /**************************************************************************/
+  /* calculate residual matrix  */
+  /**************************************************************************/
+  Timer.start("ALLOC");
+  auto ResM = memory::array<MEM, ComplexType, 4>::zeros({nspin*npol,nkloc,a_loc_rng.size(),
+					      b_loc_rng.size()});
+  auto ResM1d = nda::reshape(ResM, shape_t<1>{ResM.size()});
+  nda::array<RealType,1> lmax_res_val(block_size,0.0);
+  // linear indexes of the locations of the maximum residuals (not in order)
+  nda::array<long, 1> lmax_res_indx(block_size,0); 
+  nda::array<std::pair<RealType,int>,1> gmax_res(block_size);
+  Timer.stop("ALLOC");
+  Timer.start("DIAG");
+  { // residual 
+    // calculate residual matrix: Rkab = ({ka,a},{kb,b}|{kb,b},{ka,a}) 
+    if constexpr (MEM==HOST_MEMORY) { 
+      for(int i=0; i<ResM1d.size(); ++i) {
+        ComplexType s(0.0);
+        auto L = Pab2d(i,all);
+        for(int n=0; n<ngm; ++n)
+          s += L(n) * std::conj(L(n));
+        ResM1d(i) = s;
+      }
+    } else {
+      nda::tensor::contract( Pab2d, "ab", nda::conj(Pab2d), "ab", ResM1d, "a");
+    }
+    // find index and value of maximum element  
+    utils::max_element_multi(ResM1d,lmax_res_val,lmax_res_indx);
+    utils::find_distributed_maximum(mpi->comm,lmax_res_val,gmax_res);
+  } // residual 
+  Timer.stop("DIAG");
+  /**************************************************************************/
+  /**************************************************************************/
+
+  /**************************************************************************/
+  /* iterative construction of cholesky matrix  */
+  /**************************************************************************/
+  // L( chol_i, ispin*npol, kp_i, a_i, b_i)
+  Timer.start("ALLOC");
+// MAM: control nguess from input to increase gemm efficiency and reduce copies, at expense of memory
+  long nguess = int(std::sqrt(double(a_range.size()*b_range.size())));// reasonable guess 
+  nguess = std::max(nguess,long(block_size));
+  std::vector<std::unique_ptr<Array_t>> gL;
+  gL.push_back(std::make_unique<Array_t>( std::addressof(mpi->comm), shape_t<5>{1,1,npools,npx,npy},
+        shape_t<5>{nguess,nspin*npol,nkpts,a_range.size(),b_range.size()},
+        shape_t<5>{nguess,nspin*npol,nkloc,a_loc_rng.size(),b_loc_rng.size()},
+        shape_t<5>{0,0,kpt_rng.first(),a_loc_rng.first(),b_loc_rng.first()},
+        shape_t<5>{1,1,1,1,1} ));
+  long nchol = 0;
+  long nchol_bucket = 0;  // counter within a bucket
+  // communication buffer
+  memory::array<MEM,ComplexType, 1> comm_buff( block_size*(ngm + 2*nguess)); 
+#if defined(MPI_NO_CUDA_AWARE)
+  nda::array<ComplexType, 1> comm_buff_h( block_size*(ngm + 2*nguess)); 
+#endif
+  memory::array<MEM,ComplexType,2> Tab(block_size,ResM1d.size()); 
+  nda::array<int,1> piv(block_size+1,0); 
+  memory::unified_array<ComplexType,2> Abb(block_size,block_size);
+  Tab() = ComplexType(0.0);
+  Abb() = ComplexType(0.0);
+  Timer.stop("ALLOC");
+
+  app_log(3," nchol, max |D|: ");
+  Timer.start("ITER");
+
+  // a bit nicer this way...
+  auto find_max = [&]() {
+    return (*std::max_element(gmax_res.begin(),gmax_res.end(), [](auto& a, auto& b) {
+		return a.first < b.first;		
+	})).first; 
+  };
+  while( find_max() > cutoff ) {
+
+
+    // bcast Puv(g) and Luv(ichol) 
+    // should loop over bcast?
+    comm_buff() = ComplexType(0.0);
+    {
+      // views to local matrix and to 2d reshaped view 
+      auto Puv = memory::array_view<MEM,ComplexType, 2>({block_size,ngm},comm_buff.data());
+      auto Luv = memory::array_view<MEM,ComplexType, 2>({block_size,nchol},
+						comm_buff.data()+block_size*ngm);
+      for(int n=0; n<block_size; ++n) {
+        if(grank == gmax_res(n).second/block_size)
+        {
+          auto in = lmax_res_indx(gmax_res(n).second%block_size);
+          Puv(n,all) = Pab2d(in,all);
+          if(nchol > 0) {
+            long ic0 = 0;
+            for(auto& v : gL) {
+  	      long nc = v->local_shape()[0];
+              long ic1 = std::min(ic0+nc,nchol);
+	      auto A_ = nda::reshape(v->local(),shape_t<2>{nc,ResM.size()});
+              if( ic1 > ic0 )
+                Luv(n, nda::range(ic0,ic1) ) = A_( nda::range(ic1-ic0), in);
+              ic0 = ic1;
+            }
+    	  }
+        }
+      }
+    }
+    nda::tensor::scale(ComplexType(1.0), comm_buff, nda::tensor::op::CONJ);
+    Timer.start("COMM");
+    if constexpr (MEM == HOST_MEMORY) {
+      mpi->comm.all_reduce_in_place_n(comm_buff.data(), block_size*(ngm+nchol), 
+						  std::plus<>{});
+    } else {
+#if defined(MPI_NO_CUDA_AWARE)
+      if(comm_buff_h.shape()[0] != comm_buff.shape()[0]) comm_buff_h.resize(comm_buff.shape()[0]);
+      comm_buff_h() = comm_buff;
+      mpi->comm.all_reduce_in_place_n(comm_buff_h.data(), block_size*(ngm+nchol), 
+						  std::plus<>{});
+      comm_buff() = comm_buff_h;
+#else
+#if defined(ENABLE_NCCL)
+      mpi->dev_comm.all_reduce_in_place_n(reinterpret_cast<RealType*>(comm_buff.data()), 
+			    2*block_size*(ngm+nchol), 
+			    std::plus<>{});
+#else
+      mpi->comm.all_reduce_in_place_n(comm_buff.data(), block_size*(ngm+nchol), 
+						  std::plus<>{});
+#endif
+#endif
+    }
+    Timer.stop("COMM");
+
+    // views to local matrix and to 2d reshaped view, reset them in case comm_buff is reallocated 
+    auto Puv = memory::array_view<MEM,ComplexType, 2>({block_size,ngm},comm_buff.data());
+    auto Luv = memory::array_view<MEM,ComplexType, 2>({block_size,nchol},
+						comm_buff.data()+block_size*ngm);
+
+    Timer.start("ERI");
+    // contruct new cholesky vector L(p,ik,ia,ib)
+    // L(n, ab) = (ab|vu) - sum_{0,n} L(p,ab) * conjg(L(p,uv))
+    nda::blas::gemm(Puv,nda::transpose(Pab2d),Tab);
+
+    // orthonormalize cholesky vector to previous set
+    if(nchol > 0) {
+      // MAM: this is slower due to bucket structure, keep nguess reasonably large... 	
+      long ic0 = 0;
+      for(auto& v : gL) {
+        long nc = v->local_shape()[0];
+        long ic1 = std::min(ic0+nc,nchol);
+        if( ic1 > ic0 ) {
+          auto A_ = nda::reshape(v->local(),shape_t<2>{nc,ResM.size()});
+          nda::blas::gemm(ComplexType(-1.0), Luv(all,nda::range(ic0,ic1)),
+                			     A_(nda::range(0,ic1-ic0),all),
+                	  ComplexType(1.0) , Tab);
+        }
+        ic0 = ic1;
+      }
+    }
+    Timer.stop("ERI");
+
+    // form block matrix
+    Abb() = ComplexType(0.0);
+    for(int n=0; n<block_size; ++n) {
+      if(grank == gmax_res(n).second/block_size) {
+        auto ip = lmax_res_indx(gmax_res(n).second%block_size);
+        Abb(n,all) = Tab(all,ip);   //remember that Tab is transposed
+      }
+    }    
+    Timer.start("COMM");
+    mpi->comm.reduce_in_place_n(Abb.data(),block_size*block_size,std::plus<>{});
+    Timer.stop("COMM");
+    Timer.start("SERIAL");
+    if(mpi->comm.rank() == 0) {
+      // pivots are guaranteed to be in ascending order!
+      // MAM: inverse_in_place requires nda::matrix
+      using W_type = nda::matrix<ComplexType,nda::C_layout>;
+      auto W = utils::chol<false,W_type>(Abb,piv,cutoff);
+      W() = nda::conj(W());  // need to conjugate before inverting, since W is C_ordered
+      int nc=piv(block_size);
+      for(int v=0; v<nc; ++v)
+        app_log(3,"  {}  {} ",nchol+v,std::real(W(v,v)*std::conj(W(v,v))));
+      app_log(3,"");
+      nda::inverse_in_place(W);
+      Abb(nda::range(0,nc),nda::range(0,nc)) = W(all,all);
+    }
+    Timer.stop("SERIAL");
+    Timer.start("COMM");
+    mpi->comm.broadcast_n(piv.data(),block_size+1);
+    mpi->comm.broadcast_n(Abb.data(),block_size*block_size);
+    Timer.stop("COMM");
+
+    // number of linearly independent cholesky vectors found
+    int newv=piv(block_size);
+
+    // resize if needed 
+    bool new_bucket = false;
+    long old_nchol_bucket = nchol_bucket;
+    if( nchol > 0 and ( nchol_bucket + newv > nguess ) ) {
+      Timer.start("ALLOC");
+      gL.push_back(std::make_unique<Array_t>(std::addressof(mpi->comm), shape_t<5>{1,1,npools,npx,npy},
+        shape_t<5>{nguess,nspin*npol,nkpts,a_range.size(),b_range.size()},
+        shape_t<5>{nguess,nspin*npol,nkloc,a_loc_rng.size(),b_loc_rng.size()},
+        shape_t<5>{0,0,kpt_rng.first(),a_loc_rng.first(),b_loc_rng.first()}, 
+        shape_t<5>{1,1,1,1,1} ));
+      comm_buff.resize(block_size*(ngm + nchol+2*nguess));
+      new_bucket = true;
+      nchol_bucket = 0;  // reset bucket counter
+      Timer.stop("ALLOC");
+    }
+    // always write into the last bucket. If a new one was inserted, 
+    // copy data into empty sector in the next to last bucket at the end    
+    auto L = (gL.back())->local();
+    auto L2d = nda::reshape(L, shape_t<2>{L.shape()[0],ResM.size()});
+
+    Timer.start("ERI");
+    for(int i=0; i<newv; i++) {
+      utils::check(piv(i) >= i, "Failed condition: piv(i) >= i");
+      if(i != piv(i))
+        Tab(i,all) = Tab(piv(i),all);
+    }
+    nda::blas::gemm(Abb(nda::range(0,newv),nda::range(0,newv)), 
+        	    Tab(nda::range(0,newv),all), 
+  		    L2d(nda::range(nchol_bucket,nchol_bucket+newv), all)); 
+    Timer.stop("ERI");
+
+    Timer.start("DIAG");
+    if constexpr ( MEM == HOST_MEMORY ) {
+      for(int v=0; v<newv; ++v)
+        for(int n=0; n<ResM1d.size(); ++n) 
+          ResM1d(n) -= std::real(L2d(nchol_bucket+v,n)*std::conj(L2d(nchol_bucket+v,n))); 
+    } else {
+      auto Lnv = L2d(nda::range(nchol_bucket,nchol_bucket+newv),all);
+      nda::tensor::contract( ComplexType(-1.0), Lnv, "vn",
+                             nda::conj(Lnv), "vn",
+                             ComplexType(1.0), ResM1d, "n");
+    }
+    // find new maximum along residual 
+    utils::max_element_multi(ResM1d,lmax_res_val,lmax_res_indx);
+    utils::find_distributed_maximum(mpi->comm,lmax_res_val,gmax_res);
+    Timer.stop("DIAG");
+
+    nchol+=newv;
+    nchol_bucket+=newv;
+
+    // copy to empty sector if needed, not preserving order right now
+    if(new_bucket) {
+      long nc = (*(gL.rbegin()+1))->local().shape()[0]; 
+      long ncopy = nc - old_nchol_bucket; 
+      auto L_ = nda::reshape((*(gL.rbegin()+1))->local(),shape_t<2>{nc,ResM.size()});
+      L_(nda::range(nc-ncopy,nc),all) = L2d(nda::range(newv-ncopy,newv),all); 
+      nchol_bucket -= ncopy;
+    }
+
+  };
+  Timer.stop("ITER");
+  /**************************************************************************/
+  /**************************************************************************/
+
+  app_log(2,"  iq:{}  nchol:{} ",iq,nchol);
+
+  auto return_value = Array_t{ std::addressof(mpi->comm), {1,1,npools,npx,npy},
+                 {nchol,nspin*npol,nkpts,a_range.size(),b_range.size()},
+                 {nchol,nspin*npol,nkloc,a_loc_rng.size(),b_loc_rng.size()},
+                 {0,0,kpt_rng.first(),a_loc_rng.first(),b_loc_rng.first()},
+		 {1,1,1,1,1}}; 
+
+  {
+    auto ___ = nda::ellipsis{};
+    auto L = return_value.local();
+    long ic0 = 0;
+    for(auto& v : gL) {
+      long nc = v->local_shape()[0];
+      long ic1 = std::min(ic0+nc,long(nchol));
+      if( ic1 > ic0 )
+        L(nda::range(ic0,ic1),___) = v->local()(nda::range(ic1-ic0),___);
+      ic0=ic1;
+    }
+  }
+  Timer.stop("TOTAL");
+  return return_value; 
+}
+
+template<MEMORY_SPACE MEM, typename comm_t>
+auto cholesky::evaluate_diagkk_impl(comm_t& k_intra_comm, int iq, int ik, 
+                                    nda::range a_range, nda::range b_range, int block_size) 
+{
+  Timer.start("TOTAL");
+  using local_Array_t = memory::array<MEM,ComplexType,3>;
+  using Array_t = dArray_t<local_Array_t>; 
+
+  decltype(nda::range::all) all;
+
+  // nspin==1 for rhf and ghf, 2 for uhf
+  int nspin = mf->nspin_in_basis();
+  int npol = mf->npol_in_basis();
+  int ngm = rho_g.size();
+  int grank = k_intra_comm.rank(); 
+
+  utils::check(nspin == 1 and npol == 1, "Not working yet for nspin>1");
+
+  // K and Q vectors 
+  nda::array<RealType,1> v_zero = {0.0,0.0,0.0};
+
+  /**************************************************************************/
+  /* calculate pair densities  */
+  /**************************************************************************/
+  // Pair densities in rho_g, including phase factor! 
+  Timer.start("ALLOC");
+  // partition {kp, a, b} space 
+  long npx = utils::find_proc_grid_min_diff(k_intra_comm.size(),a_range.size(),b_range.size());
+  long npy = k_intra_comm.size()/npx;
+  auto global_Pab = math::nda::make_distributed_array<local_Array_t>(k_intra_comm,
+                        {npx,npy,1},
+			{a_range.size(),b_range.size(),ngm},
+			{1,1,1});  // no blocking for now
+  auto a_loc_rng = global_Pab.local_range(0);
+  auto b_loc_rng = global_Pab.local_range(1);
+  long nab_loc = a_loc_rng.size()*b_loc_rng.size();
+  Timer.stop("ALLOC");
+  
+  {
+    int min_b, val = std::max(1,int(a_loc_rng.size()*b_loc_rng.size())); 
+    k_intra_comm.reduce_value(val,min_b,mpi3::min<>{},0);
+    k_intra_comm.broadcast_value(min_b);
+    block_size = std::min(block_size,min_b);
+  }
+  utils::check(block_size <= a_loc_rng.size()*b_loc_rng.size(), 
+    "cholesky::evaluate: should not happen, block_size: {}",block_size); 
+
+  Timer.start("Pab");
+  evaluate_pair_densities<MEM>(iq, ik, global_Pab, a_range, b_range);
+  Timer.stop("Pab");
+  auto Pab = global_Pab.local(); 
+  auto Pab2d = nda::reshape(Pab, shape_t<2>{nab_loc,ngm});
+
+  /**************************************************************************/
+  /* calculate residual matrix  */
+  /**************************************************************************/
+  Timer.start("ALLOC");
+  auto ResM = nda::array<RealType, 2>::zeros({a_loc_rng.size(),b_loc_rng.size()});
+  auto ResM1d = nda::reshape(ResM, shape_t<1>{nab_loc});
+  nda::array<RealType,1> lmax_res_val(block_size,0.0);
+  // linear indexes of the locations of the maximum residuals (not in order)
+  nda::array<long, 1> lmax_res_indx(block_size,0); 
+  nda::array<std::pair<RealType,int>,1> gmax_res(block_size);
+  Timer.stop("ALLOC");
+  Timer.start("DIAG");
+  { // residual 
+    // calculate residual matrix: Rkab = ({ka,a},{kb,b}|{kb,b},{ka,a}) 
+    // nda::blas::batched::dot(Pab2d,nda::conj(Pab2d),ResM1d);
+    for(int ab=0; ab<nab_loc; ++ab) {
+      RealType s(0.0);
+      auto L = Pab2d(ab,all);
+      for(int n=0; n<ngm; ++n)
+        s += std::real(L(n) * std::conj(L(n)));
+      ResM1d(ab) = s;
+    }
+    // find index and value of maximum element  
+    utils::max_element_multi(ResM1d,lmax_res_val,lmax_res_indx);
+    utils::find_distributed_maximum(k_intra_comm,lmax_res_val,gmax_res);
+  } // residual 
+  Timer.stop("DIAG");
+  /**************************************************************************/
+  /**************************************************************************/
+
+  /**************************************************************************/
+  /* iterative construction of cholesky matrix  */
+  /**************************************************************************/
+  // L( chol_i, a_i, b_i)
+  Timer.start("ALLOC");
+// MAM: control nguess from input to increase gemm efficiency and reduce copies, at expense of memory
+  long nguess = int(std::sqrt(double(a_range.size()*b_range.size())));// reasonable guess 
+  nguess = std::max(nguess,long(block_size));
+  std::vector<std::unique_ptr<Array_t>> gL;
+  gL.push_back(std::make_unique<Array_t>( std::addressof(k_intra_comm), shape_t<3>{1,npx,npy},
+        shape_t<3>{nguess,a_range.size(),b_range.size()},
+        shape_t<3>{nguess,a_loc_rng.size(),b_loc_rng.size()},
+        shape_t<3>{0,a_loc_rng.first(),b_loc_rng.first()},
+        shape_t<3>{1,1,1} ));
+  long nchol = 0;
+  long nchol_bucket = 0;  // counter within a bucket
+  // communication buffer
+  nda::array<ComplexType, 1> comm_buff( block_size*(ngm + 2*nguess), ComplexType(0.0)); 
+  auto Tab = nda::array<ComplexType,2>::zeros({block_size,nab_loc}); 
+  nda::array<int,1> piv(block_size+1); 
+  auto Abb = nda::array<ComplexType,2>::zeros({block_size,block_size});
+  Timer.stop("ALLOC");
+
+  app_log(3," nchol, max |D|: ");
+  Timer.start("ITER");
+
+  // a bit nicer this way...
+  auto find_max = [&]() {
+    return (*std::max_element(gmax_res.begin(),gmax_res.end(), [](auto& a, auto& b) {
+		return a.first < b.first;		
+	})).first; 
+  };
+  while( find_max() > cutoff ) {
+
+    // views to local matrix and to 2d reshaped view 
+    auto Puv = nda::array_view<ComplexType, 2>({block_size,ngm},comm_buff.data());
+    auto Luv = nda::array_view<ComplexType, 2>({block_size,nchol},
+						comm_buff.data()+block_size*ngm);
+
+    // bcast Puv(g) and Luv(ichol) 
+    // should loop over bcast?
+    comm_buff() = ComplexType(0.0);
+    for(int n=0; n<block_size; ++n) {
+      if(grank == gmax_res(n).second/block_size)
+      {
+        auto in = lmax_res_indx(gmax_res(n).second%block_size);
+        Puv(n,all) = nda::conj(Pab2d(in,all));
+        if(nchol > 0) {
+          long ic0 = 0;
+          for(auto& v : gL) {
+            long nc = v->local_shape()[0];
+            long ic1 = std::min(ic0+nc,nchol);
+	    auto A_ = nda::reshape(v->local(),shape_t<2>{nc,nab_loc});
+            if( ic1 > ic0 )
+              Luv(n, nda::range(ic0,ic1) ) = nda::conj( A_( nda::range(ic1-ic0), in) );
+            ic0 = ic1;
+          }
+  	}
+      }
+    }
+    Timer.start("COMM");
+    k_intra_comm.all_reduce_in_place_n(comm_buff.data(), block_size*(ngm+nchol), 
+						  std::plus<>{});
+    Timer.stop("COMM");
+
+    Timer.start("ERI");
+    // contruct new cholesky vector L(p,ia,ib)
+    // L(n, ab) = (ab|vu) - sum_{0,n} L(p,ab) * conjg(L(p,uv))
+    nda::blas::gemm(Puv,nda::transpose(Pab2d),Tab);
+
+    // orthonormalize cholesky vector to previous set
+    if(nchol > 0) {
+      // MAM: this is slower due to bucket structure, keep nguess reasonably large... 	
+      long ic0 = 0;
+      for(auto& v : gL) {
+        long nc = v->local_shape()[0];
+        long ic1 = std::min(ic0+nc,nchol);
+        if( ic1 > ic0 ) {
+          auto A_ = nda::reshape(v->local(),shape_t<2>{nc,nab_loc});
+          nda::blas::gemm(ComplexType(-1.0), Luv(all,nda::range(ic0,ic1)),
+                			     A_(nda::range(0,ic1-ic0),all),
+                 	  ComplexType(1.0) , Tab(all,all));
+        }
+        ic0 = ic1;
+      }
+    }
+    Timer.stop("ERI");
+
+    // form block matrix
+    Abb() = ComplexType(0.0);
+    for(int n=0; n<block_size; ++n) {
+      if(grank == gmax_res(n).second/block_size) {
+        auto ip = lmax_res_indx(gmax_res(n).second%block_size);
+        Abb(n,all) = Tab(all,ip);   //remember that Tab is transposed
+      }
+    }    
+    Timer.start("COMM");
+    k_intra_comm.reduce_in_place_n(Abb.data(),Abb.size(),std::plus<>{});
+    Timer.stop("COMM");
+    Timer.start("SERIAL");
+    if(k_intra_comm.rank() == 0) {
+      // pivots are guaranteed to be in ascending order!
+      // MAM: inverse_in_place requires nda::matrix
+      using W_type = nda::matrix<ComplexType,nda::C_layout>;
+      auto W = utils::chol<false,W_type>(Abb,piv,cutoff); 
+      W() = nda::conj(W());  // need to conjugate before inverting, since W is C_ordered
+      int nc=piv(block_size);
+      for(int v=0; v<nc; ++v)
+        app_log(3,"  {}  {} ",nchol+v,std::real(W(v,v)*std::conj(W(v,v))));
+      app_log(3,"");
+      nda::inverse_in_place(W);
+      Abb(nda::range(0,nc),nda::range(0,nc)) = W(all,all);
+    }
+    Timer.stop("SERIAL");
+    Timer.start("COMM");
+    k_intra_comm.broadcast_n(piv.data(),(block_size+1));
+    k_intra_comm.broadcast_n(Abb.data(),block_size*block_size);
+    Timer.stop("COMM");
+
+    // number of linearly independent cholesky vectors found
+    int newv=piv(block_size);
+
+    // resize if needed 
+    bool new_bucket = false;
+    long old_nchol_bucket = nchol_bucket;
+    if( nchol > 0 and ( nchol_bucket + newv > nguess ) ) {
+      Timer.start("ALLOC");
+      gL.push_back(std::make_unique<Array_t>(std::addressof(k_intra_comm), shape_t<3>{1,npx,npy},
+        shape_t<3>{nguess,a_range.size(),b_range.size()},
+        shape_t<3>{nguess,a_loc_rng.size(),b_loc_rng.size()},
+        shape_t<3>{0,a_loc_rng.first(),b_loc_rng.first()}, 
+        shape_t<3>{1,1,1} ));
+      comm_buff.resize(block_size*(ngm + nchol+2*nguess));
+      new_bucket = true;
+      nchol_bucket = 0;  // reset bucket counter
+      Timer.stop("ALLOC");
+    }
+    // always write into the last bucket. If a new one was inserted, 
+    // copy data into empty sector in the next to last bucket at the end    
+    auto L = (gL.back())->local();
+    auto L2d = nda::reshape(L, shape_t<2>{L.shape()[0],ResM.size()});
+
+    Timer.start("ERI");
+    for(int i=0; i<newv; i++) {
+      utils::check(piv(i) >= i, "Failed condition: piv(i) >= i");
+      if(i != piv(i))
+        Tab(i,all) = Tab(piv(i),all);
+    }
+    nda::blas::gemm(Abb(nda::range(0,newv),nda::range(0,newv)), 
+        	    Tab(nda::range(0,newv),all), 
+  		    L2d(nda::range(nchol_bucket,nchol_bucket+newv), all)); 
+    Timer.stop("ERI");
+
+    Timer.start("DIAG");
+    for(int v=0; v<newv; ++v)
+      for(int n=0; n<ResM1d.size(); ++n) 
+        ResM1d(n) -= std::real(L2d(nchol_bucket+v,n)*std::conj(L2d(nchol_bucket+v,n))); 
+    // find new maximum along residual 
+    utils::max_element_multi(ResM1d,lmax_res_val,lmax_res_indx);
+    utils::find_distributed_maximum(k_intra_comm,lmax_res_val,gmax_res);
+    Timer.stop("DIAG");
+
+    nchol+=newv;
+    nchol_bucket+=newv;
+
+    // copy to empty sector if needed, not preserving order right now
+    if(new_bucket) {
+      long nc = (*(gL.rbegin()+1))->local().shape()[0]; 
+      long ncopy = nc - old_nchol_bucket; 
+      auto L_ = nda::reshape((*(gL.rbegin()+1))->local(),shape_t<2>{nc,ResM.size()});
+      L_(nda::range(nc-ncopy,nc),all) = L2d(nda::range(newv-ncopy,newv),all); 
+      nchol_bucket -= ncopy;
+    }
+  };
+  Timer.stop("ITER");
+  /**************************************************************************/
+  /**************************************************************************/
+
+  // MAM: FIX FIX FIX: This is a problem, using a communicator whose scope is controlled
+  //                   by cholesky and returning a distributed array that only keeps a pointer
+  auto return_value = Array_t{ std::addressof(k_intra_comm), {1,npx,npy},
+                 {nchol,a_range.size(),b_range.size()},
+                 {nchol,a_loc_rng.size(),b_loc_rng.size()},
+                 {0,a_loc_rng.first(),b_loc_rng.first()},
+		 {1,1,1}}; 
+
+  {
+    auto ___ = nda::ellipsis{};
+    auto L = return_value.local();
+    long ic0 = 0;
+    for(auto& v : gL) {
+      long nc = v->local_shape()[0];
+      long ic1 = std::min(ic0+nc,long(nchol));
+      if( ic1 > ic0 )
+        L(nda::range(ic0,ic1),___) = v->local()(nda::range(ic1-ic0),___);
+      ic0=ic1;
+    }
+  }
+  Timer.stop("TOTAL");
+  return return_value; 
+}
+
+} // methods

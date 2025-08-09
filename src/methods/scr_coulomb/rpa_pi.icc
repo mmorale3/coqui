@@ -1,0 +1,462 @@
+#ifndef COQUI_RPA_PI_ICC
+#define COQUI_RPA_PI_ICC
+
+#include "configuration.hpp"
+#include "nda/nda.hpp"
+#include "nda/h5.hpp"
+#include "numerics/distributed_array/nda.hpp"
+#include "numerics/shared_array/nda.hpp"
+
+#include "utilities/mpi_context.h"
+#include "utilities/Timer.hpp"
+#include "IO/app_loggers.h"
+
+#include "mean_field/MF.hpp"
+#include "numerics/imag_axes_ft/iaft_utils.hpp"
+#include "methods/ERI/detail/concepts.hpp"
+#include "methods/HF/thc_solver_comm.hpp"
+
+namespace methods {
+namespace solvers {
+
+  auto scr_coulomb_t::eval_Pi_rpa_Rspace(
+      const nda::MemoryArrayOfRank<5> auto &G_tskij,
+      THC_ERI auto &thc)
+  -> memory::darray_t<memory::array<HOST_MEMORY, ComplexType, 4>, mpi3::communicator>
+  {
+    using local_Array_4D_t = nda::array<ComplexType, 4>;
+    using math::nda::make_distributed_array;
+    decltype(nda::range::all) all;
+
+    _Timer.start("EVALUATE_PI_R");
+
+    auto mpi = thc.mpi();
+    auto MF = thc.MF();
+
+    size_t nkpts = MF->nkpts();
+    size_t nqpts_ibz = MF->nqpts_ibz();
+    long nkpts_no_trev = nkpts - MF->nkpts_trev_pairs();
+    auto kp_trev = MF->kp_trev();
+    auto kp_trev_pair = MF->kp_trev_pair();
+
+    size_t nt_f  = G_tskij.shape(0);
+    size_t ns    = G_tskij.shape(1);
+    size_t Np    = thc.Np();
+    size_t nt_half = (nt_f % 2 == 0)? nt_f / 2 : nt_f / 2 + 1;
+    double sp_factor = (ns == 2)? -1.0 : -2.0;
+
+    // CNY: Memory for intermediate objects scales with ntpools.
+    // Therefore, we restrict ntpools*ns*nkpts*Np*Np*2 < nt_half*nqpts_ibz*Np*Np
+    long ntpools_max = std::max(long(nt_half * nqpts_ibz / (ns * nkpts * 2)), 1L);
+    while (mpi->comm.size()%ntpools_max !=0) ntpools_max -= 1;
+    long ntpools = utils::find_proc_grid_max_npools(mpi->comm.size(), nt_half, 0.2);
+    if (ntpools > ntpools_max) ntpools = ntpools_max;
+    int np_PQ = mpi->comm.size() / ntpools;
+    int np_P = utils::find_proc_grid_min_diff(np_PQ, 1, 1);
+    int np_Q = np_PQ / np_P;
+    utils::check(ntpools > 0 and ntpools <= nt_half, "scr_coulomb_t::eval_Pi_rpa_Rspace: ntpools <= 0 or ntpools > nt_half");
+    utils::check(mpi->comm.size() % ntpools == 0,
+                 "scr_coulomb_t::eval_Pi_rpa_Rspace: gcomm.size() % ntpools({}) != 0", ntpools);
+
+    app_log(2, "  Evaluation of the RPA polarization function:\n"
+               "    - processor grid for Pi: (t, q, P, Q) = ({}, {}, {}, {})\n",
+               ntpools, 1, np_P, np_Q);
+
+    _Timer.start("PI_ALLOC_R");
+    auto dPi_tqPQ = make_distributed_array<local_Array_4D_t>(
+        mpi->comm, {ntpools, 1, np_P, np_Q}, {nt_half, nqpts_ibz, Np, Np}, {1, 1, 1, 1});
+    auto [t_origin, q_origin, P_origin, Q_origin] = dPi_tqPQ.origin();
+    auto [nt_loc, nq_loc, NP_loc, NQ_loc] = dPi_tqPQ.local_shape();
+
+    // prepare Fourier transform matrices between k-space and R-space
+    math::shm::shared_array<nda::array_view<ComplexType,2>> sf_Rk(*mpi, {nkpts,nkpts});
+    utils::k_to_R_coefficients(mpi->comm, nda::range(nkpts), MF->kpts(), MF->lattv(), MF->kp_grid(), sf_Rk);
+    auto f_Rk = sf_Rk.local();
+    math::shm::shared_array<nda::array_view<ComplexType,2>> sf_qR(*mpi,{nqpts_ibz,nkpts});
+    utils::R_to_k_coefficients(mpi->comm, nda::range(nkpts), MF->Qpts_ibz(), MF->lattv(), MF->kp_grid(), sf_qR);
+    auto f_qR = sf_qR.local();
+
+    // Setup t_intra_comm
+    mpi3::communicator t_intra_comm = mpi->comm.split(t_origin, mpi->comm.rank());
+    utils::check(t_intra_comm.size()==np_P*np_Q, "t_intra_comm.size() = {} != np_P*np_Q", t_intra_comm.size());
+
+    // The total memory requirement is ntpools*ns*nkpts*Np*Np rather than nt*ns*nkpts*Np*Np
+    auto dGp_sRPQ = make_distributed_array<local_Array_4D_t>(
+        t_intra_comm, {1, 1, np_P, np_Q}, {ns, nkpts, Np, Np}, {1, 1, 1, 1});
+    auto dGn_sRPQ = make_distributed_array<local_Array_4D_t>(
+        t_intra_comm, {1, 1, np_P, np_Q}, {ns, nkpts, Np, Np}, {1, 1, 1, 1});
+    auto dbuf_skPQ  = make_distributed_array<local_Array_4D_t>(
+        t_intra_comm, {1, 1, np_P, np_Q}, {ns, nkpts_no_trev, Np, Np}, {1, 1, 1, 1});
+    nda::matrix<ComplexType> X_R_PQ(nkpts, NP_loc*NQ_loc);
+    utils::check(dGp_sRPQ.local_shape()[2] == NP_loc, "dGp_sRPQ.local_shape[2] != NP_loc");
+    utils::check(dGp_sRPQ.local_shape()[3] == NQ_loc, "dGp_sRPQ.local_shape[3] != NQ_loc");
+    _Timer.stop("PI_ALLOC_R");
+
+    auto Pi_tqPQ_loc  = dPi_tqPQ.local();
+    auto Gp_sRPQ_loc  = dGp_sRPQ.local();
+    auto Gn_sRPQ_loc  = dGn_sRPQ.local();
+    auto buf_skPQ_loc = dbuf_skPQ.local();
+
+    auto had_prod2 = nda::map([](ComplexType x, ComplexType y) { return (x * y); });
+
+    for (size_t it=0; it<nt_loc; it++) {
+      // setup Gp
+      _Timer.start("PI_PRIM_TO_AUX");
+      thc_solver_comm::primary_to_aux(0, 0, G_tskij(it+t_origin,nda::ellipsis{}), dbuf_skPQ, thc, MF->kp_to_ibz(), MF->kp_trev());
+      //thc_solver_comm::setup_G_thc(it+t_origin, G_tskij, dbuf_skPQ, thc, false,  MF->kp_to_ibz(), MF->kp_trev());
+      _Timer.stop("PI_PRIM_TO_AUX");
+      for (size_t ik=0; ik<nkpts; ++ik) {
+        if (kp_trev(ik)) {
+          Gp_sRPQ_loc(all,ik,all,all) = nda::conj(buf_skPQ_loc(all,kp_trev_pair(ik),all,all));
+        } else {
+          Gp_sRPQ_loc(all,ik,all,all) = buf_skPQ_loc(all,ik,all,all);
+        }
+      }
+      if (nkpts!=1) {
+        _Timer.start("PI_FT_R");
+        for (size_t is=0; is<ns; ++is) {
+          auto GpR_2D = nda::reshape(Gp_sRPQ_loc(is, nda::ellipsis{}),
+                                     shape_t<2>{nkpts, NP_loc * NQ_loc});
+          nda::blas::gemm(f_Rk, GpR_2D, X_R_PQ);
+          GpR_2D = X_R_PQ;
+        }
+        _Timer.stop("PI_FT_R");
+      }
+
+      // setup Gn
+      _Timer.start("PI_PRIM_TO_AUX");
+      thc_solver_comm::primary_to_aux(0, 0, G_tskij(G_tskij.shape(0)-it-t_origin-1,nda::ellipsis{}),
+                                      dbuf_skPQ, thc, MF->kp_to_ibz(), MF->kp_trev());
+      //thc_solver_comm::setup_G_thc(it+t_origin, G_tskij, dbuf_skPQ, thc, true, MF->kp_to_ibz(), MF->kp_trev()); // G_PQ(t)
+      _Timer.stop("PI_PRIM_TO_AUX");
+      for (size_t ik=0; ik<nkpts; ++ik) {
+        if (kp_trev(ik)) {
+          Gn_sRPQ_loc(all,ik,all,all) = nda::conj(buf_skPQ_loc(all,kp_trev_pair(ik),all,all));
+        } else {
+          Gn_sRPQ_loc(all,ik,all,all) = buf_skPQ_loc(all,ik,all,all);
+        }
+      }
+      if (nkpts!=1) {
+        _Timer.start("PI_FT_R");
+        for (size_t is=0; is<ns; ++is) {
+          auto GnR_2D = nda::reshape(Gn_sRPQ_loc(is, nda::ellipsis{}),
+                                     shape_t<2>{nkpts, NP_loc * NQ_loc});
+          nda::blas::gemm(f_Rk, GnR_2D, X_R_PQ);
+          GnR_2D = X_R_PQ;
+        }
+        _Timer.stop("PI_FT_R");
+      }
+
+      // Hadamard product
+      _Timer.start("PI_HADPROD_R");
+      auto GG_RPQ = Gp_sRPQ_loc(0, nda::ellipsis{});
+      auto Gn_RPQ = Gn_sRPQ_loc(0, nda::ellipsis{});
+      auto Gp_RPQ = Gp_sRPQ_loc(0, nda::ellipsis{});
+      // MAM: reusing memory
+      GG_RPQ = had_prod2(Gp_RPQ, nda::conj(Gn_RPQ));
+      for (long s = 1; s < ns; ++s) {
+        auto Gp_RPQ_s = Gp_sRPQ_loc(s,nda::ellipsis{});
+        auto Gn_RPQ_s = Gn_sRPQ_loc(s,nda::ellipsis{});
+        GG_RPQ += had_prod2(Gp_RPQ_s, nda::conj(Gn_RPQ_s));
+      }
+      GG_RPQ *= sp_factor;
+      _Timer.stop("PI_HADPROD_R");
+
+      if (nkpts != 1) {
+        // FT back to q-space
+        _Timer.start("PI_FT_R");
+        auto Piq_2D = nda::reshape(Pi_tqPQ_loc(it,nda::ellipsis{}),
+                                   shape_t<2>{nqpts_ibz, NP_loc*NQ_loc});
+        auto GGR_2D = nda::reshape(GG_RPQ, shape_t<2>{nkpts, NP_loc*NQ_loc});
+        nda::blas::gemm(f_qR, GGR_2D, Piq_2D);
+        _Timer.stop("PI_FT_R");
+      } else {
+        Pi_tqPQ_loc(it,nda::ellipsis{}) = GG_RPQ;
+      }
+    } // it
+    dPi_tqPQ.communicator()->barrier();
+    _Timer.stop("EVALUATE_PI_R");
+    return dPi_tqPQ;
+  }
+
+  auto scr_coulomb_t::eval_Pi_rpa_kspace(const nda::MemoryArrayOfRank<5> auto &G_tskij, THC_ERI auto &thc)
+  -> memory::darray_t<memory::array<HOST_MEMORY, ComplexType, 4>, mpi3::communicator>
+  {
+    _Timer.start("EVALUATE_PI_K");
+    auto mpi = thc.mpi();
+    auto MF = thc.MF();
+    size_t nkpts = MF->nkpts();
+    size_t nqpts_ibz = MF->nqpts_ibz();
+    size_t nt_f  = G_tskij.shape(0);
+    size_t ns    = G_tskij.shape(1);
+    size_t Np    = thc.Np();
+    size_t nt_half = (nt_f % 2 == 0)? nt_f / 2 : nt_f / 2 + 1;
+
+    // maximize ntpools: a) nt_half = i * b; b) np = i * bb
+    int np = mpi->comm.size();
+    int ntpools = 1;
+    for(long i = std::min(np,(int)nt_half); i > 0; --i) {
+      int p_size = nt_half / i;
+      if (p_size >= 10 and np % i == 0) {
+        ntpools = i;
+        break;
+      }
+    }
+    utils::check(ntpools > 0 and ntpools <= nt_half, "scr_coulomb_t::eval_Pi_rpa_kspace: ntpools <= 0 or ntpools > nt_half");
+    utils::check(mpi->comm.size() % ntpools == 0, "scr_coulomb_t::eval_Pi_rpa_kspace: gcomm.size() % ntpools != 0");
+
+    // processor grid: (t, s, k, P, Q)
+    int np_PQ = mpi->comm.size() / ntpools;
+    int np_P = utils::find_proc_grid_min_diff(np_PQ, 1, 1);
+    int np_Q = np_PQ / np_P;
+
+    app_log(2, "Evaluation of the polarization function:");
+    app_log(2, "  - processor grid for G:  (t, k, P, Q) = ({}, {}, {}, {})", ntpools, 1, np_P, np_Q);
+    app_log(2, "  - processor grid for Pi: (t, q, P, Q) = ({}, {}, {}, {})", ntpools, 1, np_P, np_Q);
+
+    using local_Array_5D_t = nda::array<ComplexType, 5>;
+    using local_Arrayv_5D_t = nda::array_view<ComplexType, 5>;
+    using local_Array_4D_t = nda::array<ComplexType, 4>;
+    using math::nda::make_distributed_array;
+
+    // from primary to auxiliary basis: G_ij -> G_PQ
+    _Timer.start("PI_ALLOC_K");
+    auto dGp_sktPQ_c = make_distributed_array<local_Array_5D_t>(
+        mpi->comm, {1, 1, ntpools, np_P, np_Q}, {ns, nkpts, nt_half, Np, Np}, {1, 1, 1, 1, 1});
+    long nt_loc = dGp_sktPQ_c.local_shape()[2];
+    {
+      auto dGp_tskPQ  = make_distributed_array<local_Array_5D_t>(
+          mpi->comm, {ntpools, 1, 1, np_P, np_Q}, {nt_half, ns, nkpts, Np, Np}, {1, 1, 1, 1, 1});
+      _Timer.stop("PI_ALLOC_K");
+
+      _Timer.start("PI_PRIM_TO_AUX");
+      thc_solver_comm::primary_to_aux(0, 0, G_tskij, dGp_tskPQ, thc, MF->kp_to_ibz(), MF->kp_trev()); // G_PQ(t)
+      _Timer.stop("PI_PRIM_TO_AUX");
+
+      _Timer.start("PI_ALLOC_K");
+      auto G_tskPQ = dGp_tskPQ.local();
+      auto G_sktPQ = dGp_sktPQ_c.local();
+      for (size_t skt = 0; skt < ns*nkpts*nt_loc; ++skt) {
+        size_t is = skt / (nkpts*nt_loc); // skt = is*nkpts*nt_loc + ik*nt_loc + it
+        size_t ik = (skt / nt_loc) % nkpts;
+        size_t it = skt % nt_loc;
+        G_sktPQ(is, ik, it, nda::ellipsis{}) = nda::conj(G_tskPQ(it, is, ik, nda::ellipsis{}));
+      }
+    }
+    auto dGn_sktPQ = make_distributed_array<local_Array_5D_t>(
+        mpi->comm, {1, 1, ntpools, np_P, np_Q}, {ns, nkpts, nt_half, Np, Np}, {1, 1, 1, 1, 1});
+    {
+      auto dGn_tskPQ = make_distributed_array<local_Array_5D_t>(
+          mpi->comm, {ntpools, 1, 1, np_P, np_Q}, {nt_half, ns, nkpts, Np, Np}, {1, 1, 1, 1, 1});
+      _Timer.stop("PI_ALLOC_K");
+
+      _Timer.start("PI_PRIM_TO_AUX");
+      // G_ij(t) -> G_ij(beta-t)
+      auto sG_ttskij = math::shm::make_shared_array<local_Arrayv_5D_t>(*mpi, G_tskij.shape());
+      auto Gtt_loc = sG_ttskij.local();
+      size_t nt = G_tskij.shape()[0];
+      sG_ttskij.win().fence();
+      for (size_t it = mpi->node_comm.rank(); it < nt; it += mpi->node_comm.size()) {
+        Gtt_loc(it, nda::ellipsis{}) = G_tskij(nt-it-1, nda::ellipsis{});
+      }
+      sG_ttskij.win().fence();
+      thc_solver_comm::primary_to_aux(0, 0, sG_ttskij.local(), dGn_tskPQ, thc, MF->kp_to_ibz(), MF->kp_trev()); // G_PQ(beta-t)
+      _Timer.stop("PI_PRIM_TO_AUX");
+
+      _Timer.start("PI_ALLOC_K");
+      auto G_tskPQ = dGn_tskPQ.local();
+      auto G_sktPQ = dGn_sktPQ.local();
+      for (size_t skt = 0; skt < ns*nkpts*nt_loc; ++skt) {
+        size_t is = skt / (nkpts*nt_loc); // skt = is*nkpts*nt_loc + ik*nt_loc + it
+        size_t ik = (skt / nt_loc) % nkpts;
+        size_t it = skt % nt_loc;
+        G_sktPQ(is, ik, it, nda::ellipsis{}) = G_tskPQ(it, is, ik, nda::ellipsis{});
+      }
+    }
+
+    auto dPi_qtPQ = make_distributed_array<local_Array_4D_t>(
+        mpi->comm, {1, ntpools, np_P, np_Q}, {nqpts_ibz, nt_half, Np, Np}, {1, 1, 1, 1});
+    _Timer.stop("PI_ALLOC_K");
+
+    eval_Pi_rpa_k_impl(dGp_sktPQ_c, dGn_sktPQ, dPi_qtPQ, thc);
+    dGp_sktPQ_c.reset();
+    dGn_sktPQ.reset();
+
+    _Timer.start("PI_ALLOC_K");
+    auto dPi_tqPQ = make_distributed_array<local_Array_4D_t>(
+        mpi->comm, {ntpools, 1, np_P, np_Q}, {nt_half, nqpts_ibz, Np, Np}, {1, 1, 1, 1});
+    {
+      auto Pi_tqPQ = dPi_tqPQ.local();
+      auto Pi_qtPQ = dPi_qtPQ.local();
+      for (size_t tq = 0; tq < nt_loc * nqpts_ibz; ++tq) {
+        size_t it = tq / nqpts_ibz;
+        size_t iq = tq % nqpts_ibz;
+        Pi_tqPQ(it, iq, nda::ellipsis{}) = Pi_qtPQ(iq, it, nda::ellipsis{});
+      }
+    }
+    _Timer.stop("PI_ALLOC_K");
+
+    mpi->comm.barrier();
+    _Timer.stop("EVALUATE_PI_K");
+
+    return dPi_tqPQ;
+  }
+
+  template<nda::MemoryArray Array_5D_t, nda::MemoryArray Array_4D_t, typename communicator_t>
+  void scr_coulomb_t::eval_Pi_rpa_k_impl(const memory::darray_t<Array_5D_t, communicator_t> &dGp_sktPQ_c,
+                                         const memory::darray_t<Array_5D_t, communicator_t> &dGn_sktPQ,
+                                         memory::darray_t<Array_4D_t, communicator_t> &dPi_qtPQ,
+                                         [[maybe_unused]] THC_ERI auto &thc) {
+    auto[ns, nkpts, nt_loc, Np_loc, Nq_loc] = dGp_sktPQ_c.local_shape();
+    int nqpts = dPi_qtPQ.global_shape()[0];
+    double factor = (ns == 2)? -1.0/nkpts : -2.0/nkpts;
+
+    auto had_prod2 =
+        nda::map([factor](ComplexType x, ComplexType y) { return (x * y) * factor; });
+
+    auto Gp_sktPQ_c  = dGp_sktPQ_c.local();
+    auto Gn_sktPQ = dGn_sktPQ.local();
+    auto Pi_qtPQ = dPi_qtPQ.local();
+    Pi_qtPQ() = 0.0;
+
+    _Timer.start("PI_HADPROD_K");
+    for (size_t qsk = 0; qsk < nqpts*ns*nkpts; ++qsk) {
+      // qskt = iq*ns*nkpts + is*nkpts + ik
+      size_t iq = qsk / (ns*nkpts);
+      size_t is = (qsk / nkpts) % ns;
+      size_t ik = qsk % nkpts;
+      long ikmq = thc.MF()->qk_to_k2(iq, ik);
+
+      auto Gn_k = Gn_sktPQ(is, ik, nda::ellipsis{});
+      auto Gp_kmq = Gp_sktPQ_c(is, ikmq, nda::ellipsis{});
+      auto Pi = Pi_qtPQ(iq, nda::ellipsis{});
+      Pi += had_prod2(Gp_kmq, Gn_k);
+    }
+    _Timer.stop("PI_HADPROD_K");
+  }
+
+  auto scr_coulomb_t::eval_Pi_rpa_active(const nda::ArrayOfRank<5> auto &G_tskij, THC_ERI auto &thc,
+                                         const projector_t &proj, int scheme)
+  -> memory::darray_t<memory::array<HOST_MEMORY, ComplexType, 4>, mpi3::communicator> {
+    using math::shm::make_shared_array;
+    using Array_view_5D_t = nda::array_view<ComplexType, 5>;
+
+    auto mpi = thc.mpi();
+    auto sGG_tskij = make_shared_array<Array_view_5D_t>(*mpi, G_tskij.shape());
+    sGG_tskij.set_zero();
+
+    auto find_largest_indices = [&](const nda::array<ComplexType, 2> &P_ij, int nImpOrbs) {
+      // Check the largest diagonals
+      auto nOrbs_W = P_ij.shape(0);
+      std::vector<std::pair<double, int>> vp;
+      for (int i = 0; i < nOrbs_W; ++i)
+        vp.emplace_back(P_ij(i, i).real(), i);
+
+      std::nth_element(vp.begin(), vp.begin() + nImpOrbs, vp.end(),
+                       [](const std::pair<double, int>& a, const std::pair<double, int>& b) {
+                         return a.first > b.first;
+                       });
+      std::vector<int> indices(nImpOrbs);
+      for (int i = 0; i < nImpOrbs; ++i)
+        indices[i] = vp[i].second;
+
+      return indices;
+    };
+
+    if (scheme == 0) {
+      app_log(2, "Evaluate polarizability within the active space using projection matrices.\n"
+                 "(This might give problems when the projection matrices are not unitary!)");
+      auto G_tskIab = proj.downfold_k(G_tskij, mpi->comm);
+      proj.upfold(sGG_tskij, G_tskIab);
+    } else if (scheme == 1) {
+      app_log(2, "Evaluate polarizability within the active space using KS bands having strong Wannier orbitals character at each k-point.\n"
+                 "(This is exact if the projection matrices are unitary)");
+      // construct sGG_tskij locally here:
+      // 1) Compute P_kij = C_kai.T.conj * C_kai
+      // 2) For each k-points, check the largest "nImpOrbs" diagonals
+      // 3) For those diagonals, set it to identity to P_kij_regularized
+      // 4) Set other entries to zero
+      auto C_skIai = proj.C_skIai();
+      auto W_rng = proj.W_rng();
+      auto [ns, nkpts, nImps, nImpOrbs, nOrbs_W] = C_skIai.shape();
+      auto nkpts_ibz = sGG_tskij.shape()[2];
+      nda::array<ComplexType, 2> P_ij(nOrbs_W, nOrbs_W);
+      nda::array<ComplexType, 2> G_tmp(nOrbs_W, nOrbs_W);
+      auto GG_loc = sGG_tskij.local();
+      sGG_tskij.win().fence();
+      for (size_t skI=mpi->node_comm.rank(); skI<ns*nkpts_ibz*nImps; skI+=mpi->node_comm.size()) {
+        size_t is = skI / (nkpts_ibz * nImps); // skI = is * nkpts_ibz*nImps + ik * nImps + imp
+        size_t ik = (skI / nImps) % nkpts_ibz;
+        size_t imp = skI % nImps;
+
+        nda::blas::gemm(ComplexType(1.0), nda::dagger(C_skIai(is,ik,imp,nda::ellipsis{})),
+                        C_skIai(is,ik,imp,nda::ellipsis{}),
+                        ComplexType(0.0), P_ij);
+
+        auto indices = find_largest_indices(P_ij, nImpOrbs);
+        P_ij() = 0.0;
+        for (int i=0; i<indices.size(); ++i)
+          P_ij(indices[i], indices[i]) = ComplexType(1.0);
+
+        size_t nts = G_tskij.shape(0);
+        for (size_t it=0; it<nts; ++it) {
+          nda::blas::gemm(G_tskij(it,is,ik,W_rng[imp],W_rng[imp]), P_ij, G_tmp);
+          nda::blas::gemm(ComplexType(1.0), nda::dagger(P_ij), G_tmp,
+                          ComplexType(0.0), GG_loc(it,is,ik,W_rng[imp],W_rng[imp]));
+        }
+
+      }
+      sGG_tskij.win().fence();
+
+    } else if (scheme == 2) {
+      app_log(2, "Evaluate polarizability within the active space using the regularized projection matrices \n"
+                 "motivated by Merzuk Kaltak's thesis and VASP implementation. \n"
+                 "(This is exact if the projection matrices are unitary)");
+      // construct sGG_tskij locally here:
+      // 1) Compute P_kij = C_kai.T.conj * C_kai
+      // 2) For each k-points, check the largest "nImpOrbs" diagonals
+      // 3) Construct regularized projection matrices
+      auto C_skIai = proj.C_skIai();
+      auto W_rng = proj.W_rng();
+      auto [ns, nkpts, nImps, nImpOrbs, nOrbs_W] = C_skIai.shape();
+      auto nkpts_ibz = sGG_tskij.shape()[2];
+      nda::array<ComplexType, 2> P_ij(nOrbs_W, nOrbs_W);
+      nda::array<ComplexType, 2> P_ij_reg(nOrbs_W, nOrbs_W);
+      nda::array<ComplexType, 2> G_tmp(nOrbs_W, nOrbs_W);
+      auto GG_loc = sGG_tskij.local();
+      sGG_tskij.win().fence();
+      for (size_t skI=mpi->node_comm.rank(); skI<ns*nkpts_ibz*nImps; skI+=mpi->node_comm.size()) {
+        size_t is = skI / (nkpts_ibz * nImps); // skI = is * nkpts_ibz*nImps + ik * nImps + imp
+        size_t ik = (skI / nImps) % nkpts_ibz;
+        size_t imp = skI % nImps;
+
+        nda::blas::gemm(ComplexType(1.0), nda::dagger(C_skIai(is,ik,imp,nda::ellipsis{})),
+                        C_skIai(is,ik,imp,nda::ellipsis{}),
+                        ComplexType(0.0), P_ij);
+
+        auto indices = find_largest_indices(P_ij, nImpOrbs);
+        P_ij_reg() = 0.0;
+        for (int i=0; i<indices.size(); ++i)
+          P_ij_reg(indices[i], nda::range::all) = P_ij(indices[i], nda::range::all);
+
+        size_t nts = G_tskij.shape(0);
+        for (size_t it=0; it<nts; ++it) {
+          nda::blas::gemm(G_tskij(it,is,ik,W_rng[imp],W_rng[imp]), P_ij_reg, G_tmp);
+          nda::blas::gemm(ComplexType(1.0), nda::dagger(P_ij_reg), G_tmp,
+                          ComplexType(0.0), GG_loc(it,is,ik,W_rng[imp],W_rng[imp]));
+        }
+
+      }
+      sGG_tskij.win().fence();
+
+    } else
+      utils::check(false, "embed_eri_t::eval_Pi_active: invalid scheme = {} for polarizability in the active space.", scheme);
+    mpi->comm.barrier();
+
+    return eval_Pi_rpa_Rspace(sGG_tskij.local(), thc);
+  }
+
+} // solvers
+} // methods
+
+#endif //COQUI_RPA_PI_ICC

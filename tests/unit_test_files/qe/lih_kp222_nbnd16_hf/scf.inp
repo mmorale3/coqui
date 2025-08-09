@@ -1,0 +1,32 @@
+ &control
+    calculation = 'scf',
+    verbosity = 'high',
+    outdir = './',
+    prefix = 'pwscf',
+    pseudo_dir = './'
+ /
+ &system
+    ibrav=2, A=4.083,
+    nat=2, ntyp=2,
+    nbnd=16,
+    ecutwfc=100,
+    nosym=.true.,
+    force_symmorphic=.true.,
+    nosym = .true.
+    noinv = .true.
+    no_t_rev = .true.
+    input_dft='hf+noc'
+    exxdiv_treatment = 'none'
+    x_gamma_extrapolation = .false.
+ /
+ &electrons
+    conv_thr=1e-10,
+ /
+ATOMIC_SPECIES
+ Li   0.0  Li_ONCV_PBE-1.2.upf
+ H    0.0  H_ONCV_PBE-1.2.upf
+ATOMIC_POSITIONS {alat}
+ Li 0.00 0.00 0.00
+ H  0.50 0.50 0.50
+K_POINTS {automatic}
+ 2 2 2 0 0 0

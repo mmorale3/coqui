@@ -1,0 +1,252 @@
+#ifndef HAMILTONIAN_GEN_ONE_BODY_HAMILTONIAN_ICC
+#define HAMILTONIAN_GEN_ONE_BODY_HAMILTONIAN_ICC
+
+#include "configuration.hpp"
+#include "IO/app_loggers.h"
+#include "utilities/check.hpp"
+
+#include "mpi3/environment.hpp"
+#include "mpi3/communicator.hpp"
+#include "nda/nda.hpp"
+
+#include "numerics/distributed_array/nda.hpp"
+#include "mean_field/MF.hpp"
+#include "mean_field/distributed_orbital_readers.hpp"
+#include "hamiltonian/matrix_elements.h"
+#include "utilities/proc_grid_partition.hpp"
+
+namespace hamilt::detail
+{
+
+/**
+ * Compute the matrix elements of the non-interacting Hamiltonian "H0_ab" using FFT.
+ * @tparam MEM    - Memory type
+ * @tparam Arr3   - Array type of p3
+ * @tparam Arr4   - Array type of p4
+ * @param mf      - Coqui's Mean-field class
+ * @param comm    - MPI communicator
+ * @param psp     - Pseudopotential handler
+ * @param k_range - Range of k-points
+ * @param b_range - Range of orbital indices "b"
+ * @param psi     - Single-particle basis in a distributed array
+ * @param p3      - Pointer to diagonal density matrix (3D nda array). If not null, the hartree energy is added. 
+ * @param p4      -
+ * @return - A distributed array of non-interacting one-body Hamiltonian
+ *           with global shape = (nspin, nkpts, nbnd, nbnd)
+ */
+template<MEMORY_SPACE MEM, nda::ArrayOfRank<3> Arr3, nda::ArrayOfRank<4> Arr4>
+auto gen_H0(mf::MF& mf, boost::mpi3::communicator& comm, pseudopot *psp, 
+            nda::range k_range, nda::range b_range,
+            memory::darray_t<memory::array<MEM,ComplexType,4>, mpi3::communicator>& psi,
+            Arr3 const* p3, Arr4 const* p4)
+{
+  decltype(nda::range::all) all;
+  using larray = memory::array<MEM,ComplexType,4>;
+  utils::check(k_range.size() == psi.global_shape()[1], "Shape mismatch.");
+  utils::check(b_range.size() == psi.global_shape()[2], "Shape mismatch.");
+  // psi(is,ik,ia,g)
+  auto hpsi = math::nda::make_distributed_array<larray>(comm,psi.grid(),psi.global_shape(),psi.block_size());
+  hpsi.local() = ComplexType{0.0};
+
+  long nspin = psi.global_shape()[0];
+  long nkpts = psi.global_shape()[1];
+  long nbnd = psi.global_shape()[2];
+  auto kpts = mf.kpts()(k_range,all);
+  auto wfc_g = mf.wfc_truncated_grid();
+  long npol = mf.npol();
+
+  auto Hij = math::nda::make_distributed_array<larray>(comm,psi.grid(),{nspin,nkpts,nbnd,nbnd},
+                {psi.block_size()[0],psi.block_size()[1],psi.block_size()[2],psi.block_size()[2]});
+  Hij.local() = ComplexType(0.0);
+    
+  // add kinetic part to hpsi
+  hamilt::add_kinetic(npol,kpts,*wfc_g,psi,hpsi);
+
+  // add local pp to hpsi, non-local pp to Hij
+  if(p3 != nullptr)
+    psp->add_Vpp(comm,k_range,b_range,*p3,psi,hpsi,Hij);
+  else if(p4 != nullptr)
+    psp->add_Vpp(comm,k_range,b_range,*p4,psi,hpsi,Hij);
+  else 
+    psp->add_Vpp(comm,k_range,b_range,psi,hpsi,Hij);
+
+  // Combine the local and non-local parts:
+  // Hij = Hij + conj(psi(i,:)) * hpsi(j,:) = conj( conj(Hij) + psi(i,:) * conj(hpsi(j,:)) ) 
+  nda::tensor::scale(ComplexType(1.0),Hij.local(),nda::tensor::op::CONJ);
+  math::nda::slate_ops::multiply(ComplexType(1.0),psi,math::nda::dagger(hpsi),
+                                 ComplexType(1.0),Hij);
+  nda::tensor::scale(ComplexType(1.0),Hij.local(),nda::tensor::op::CONJ);
+  
+  return Hij;
+}
+
+template<MEMORY_SPACE MEM, nda::ArrayOfRank<3> Arr3_t, nda::ArrayOfRank<4> Arr4_t>
+auto gen_Vhartree(mf::MF& mf, boost::mpi3::communicator& comm, pseudopot *psp,
+            nda::range k_range, nda::range b_range,
+            memory::darray_t<memory::array<MEM,ComplexType,4>, mpi3::communicator>& psi,
+            Arr3_t const* nii, Arr4_t const* nij, bool symmetrize=false)
+{
+  using larray = memory::array<MEM,ComplexType,4>;
+
+  app_log(2, "Evaluate the Hartree matrix using fast Fourier transform");
+  app_log(2, "--------------------------------------------------------\n");
+  app_log(2, "  nbnd = {}", mf.nbnd());
+  app_log(2, "  npol = {}", mf.npol());
+  app_log(2, "  nspin = {}", mf.nspin());
+  app_log(2, "  nkpts = {}", mf.nkpts());
+  app_log(2, "  nkpts_ibz = {}", mf.nkpts_ibz());
+  app_log(2, "  diagonal density matrix = {}", (nii!=nullptr)? true : false);
+  app_log(2, "  symmetrization over available symmetries: {}\n", symmetrize);
+
+  utils::check(nii==nullptr or nij==nullptr, "gen_Vhartree: Both nii and nij are provided. "
+                                             "Either one of them should be provided, not both.");
+  utils::check(k_range.size() == psi.global_shape()[1], "Shape mismatch.");
+  utils::check(b_range.size() == psi.global_shape()[2], "Shape mismatch.");
+  // psi(is,ik,ia,g)
+  auto hpsi = math::nda::make_distributed_array<larray>(comm,psi.grid(),psi.global_shape(),psi.block_size());
+  hpsi.local() = ComplexType{0.0};
+
+  long nspin = psi.global_shape()[0];
+  long nkpts = psi.global_shape()[1];
+  long nbnd = psi.global_shape()[2];
+
+  // add Hartree potential to hpsi
+  if(nii != nullptr)
+    psp->add_Hartree(k_range,*nii,psi,hpsi,symmetrize);
+  else if(nij != nullptr)
+    psp->add_Hartree(k_range,*nij,psi,hpsi,symmetrize);
+  else
+    utils::check(false, "gen_Vhartree: both nii and nij are \"nullptr\". ");
+
+  // Vij = conj(psi(i,:)) * hpsi(j,:) = conj( conj(Vij) + psi(i,:) * conj(hpsi(j,:)) )
+  auto Vij = math::nda::make_distributed_array<larray>(comm,psi.grid(),{nspin,nkpts,nbnd,nbnd},
+                                                       {psi.block_size()[0],psi.block_size()[1],psi.block_size()[2],psi.block_size()[2]});
+
+  math::nda::slate_ops::multiply(ComplexType(1.0),psi,math::nda::dagger(hpsi),
+                                   ComplexType(0.0),Vij);
+  nda::tensor::scale(ComplexType(1.0),Vij.local(),nda::tensor::op::CONJ);
+
+  return Vij;
+}
+
+/**
+ * Compute the matrix elements of the exchange-correlation potential "Vxc" using FFT
+ * @tparam MEM - Type parameter for memory space
+ * @param mf - Coqui's mean-field handler
+ * @param comm - Communicator
+ * @param k_range - Index range for k-points
+ * @param b_range - Index range for orbitals
+ * @param psi - Single-particle basis (s, k, i, g) on the "wfc" grid
+ * @return Vxc_ij in a distributed array (s, k, i, j)
+ */
+template<MEMORY_SPACE MEM>
+auto gen_Vxc(mf::MF& mf,
+            nda::range k_range, nda::range b_range,
+            memory::darray_t<memory::array<MEM,ComplexType,4>, mpi3::communicator>& psi)
+{
+  using larray = memory::array<MEM,ComplexType,4>;
+  using math::nda::make_distributed_array;
+  utils::check(k_range.size() == psi.global_shape()[1], "Shape mismatch.");
+  utils::check(b_range.size() == psi.global_shape()[2], "Shape mismatch.");
+
+  auto comm = psi.communicator();
+  long nspin = psi.global_shape()[0];
+  long nkpts = psi.global_shape()[1];
+  long M = psi.global_shape()[2];
+
+  // hpsi(is,ik,ia,g)
+  auto hpsi = make_distributed_array<larray>(*comm,psi.grid(),psi.global_shape(),psi.block_size());
+  hpsi.local() = ComplexType{0.0};
+
+  // add vxc to Vxc_ij 
+  hamilt::add_vxc(mf, k_range, b_range, psi, hpsi);
+
+  auto Vxc_ij = make_distributed_array<larray>(
+      *comm, psi.grid(), {nspin,nkpts,M,M},
+      {psi.block_size()[0],psi.block_size()[1],psi.block_size()[2],psi.block_size()[2]});
+  Vxc_ij.local() = ComplexType(0.0);
+
+  // Vxc_ij = conj(psi(i,:)) * hpsi(j,:) = conj( psi(i,:) * conj(hpsi(j,:)) )
+  math::nda::slate_ops::multiply(ComplexType(1.0),psi,math::nda::dagger(hpsi),
+                                 ComplexType(0.0),Vxc_ij);
+  nda::tensor::scale(ComplexType(1.0),Vxc_ij.local(),nda::tensor::op::CONJ);
+
+  return Vxc_ij;
+}
+
+// MAM: mf object should keep a flag which in case basis set is orthonormal, e.g. from QE...
+template<MEMORY_SPACE MEM, bool diagonal = false>
+auto gen_ovlp(boost::mpi3::communicator& comm, 
+              memory::darray_t<memory::array<MEM,ComplexType,4>, mpi3::communicator>& psi) 
+{
+  decltype(nda::range::all) all;
+  using larray = memory::array<MEM,ComplexType,4>;
+  long nspin = psi.global_shape()[0];
+  long nkpts = psi.global_shape()[1];
+  long nbnd = psi.global_shape()[2];
+
+  if constexpr (diagonal) {
+
+    utils::check(psi.grid()[2]*psi.grid()[3] <= psi.global_shape()[2], 
+                 "Error in gen_H0: Too many processors, pg[2]*pg[3] > nbnd. pg:({},{}), nbnd:{}",
+                 psi.grid()[2],psi.grid()[3],psi.global_shape()[2]);
+  
+    using larray3D = memory::array<MEM,ComplexType,3>;
+    auto k_comm = comm.split(psi.origin()[0]*nkpts+psi.origin()[1],comm.rank());
+    std::array<long,3> pg = {psi.grid()[0], psi.grid()[1], psi.grid()[2]*psi.grid()[3]};
+    auto psiloc = psi.local();
+    auto Hii = math::nda::make_distributed_array<larray3D>(comm,pg,{nspin,nkpts,nbnd},
+                  {psi.block_size()[0],psi.block_size()[1],psi.block_size()[2]});
+    auto Hloc = Hii.local();
+    Hloc() = ComplexType(0.0);
+    if constexpr (MEM == HOST_MEMORY) {
+      memory::array<MEM, ComplexType, 1> hk;
+      if(psi.grid()[3] > 1)
+        hk = memory::array<MEM, ComplexType, 1>(nbnd);
+      for( auto [is,s] : itertools::enumerate(psi.local_range(0)))
+        for( auto [ik,k] : itertools::enumerate(psi.local_range(1)))
+        {
+          if(psi.grid()[3] > 1) {
+             hk(all) = ComplexType(0.0);
+            for( auto [ib,b] : itertools::enumerate(psi.local_range(2)))
+              hk(b) = nda::blas::dotc(psiloc(is,ik,ib,all),psiloc(is,ik,ib,all));
+            k_comm.all_reduce_in_place_n(hk.data(),hk.size(),std::plus<>{});
+            Hloc(is,ik,all) = hk(Hii.local_range(2));
+          } else {
+            for( auto [ib,b] : itertools::enumerate(psi.local_range(2)))
+              Hloc(is,ik,ib) = nda::blas::dotc(psiloc(is,ik,ib,all),psiloc(is,ik,ib,all));
+          }
+        }
+    } else {
+
+      if(psi.grid()[3] > 1) {
+        auto hk = memory::array<MEM, ComplexType, 3>::zeros({psi.local_shape()[0],psi.local_shape()[1],nbnd});
+        nda::tensor::contract(ComplexType(1.0), nda::conj(psiloc), "skbr",
+                psiloc, "skbr", ComplexType(0.0), hk(all,all,psi.local_range(2)),"skb");
+        k_comm.all_reduce_in_place_n(hk.data(),hk.size(),std::plus<>{});
+        Hloc(all,all,all) = hk(all,all,Hii.local_range(2));
+      } else {
+        nda::tensor::contract(ComplexType(1.0), nda::conj(psiloc), "skbr",
+                              psiloc, "skbr", ComplexType(0.0), Hloc,"skb");
+      }
+    }
+
+    return Hii;
+
+  } else {
+
+    auto Hij = math::nda::make_distributed_array<larray>(comm,psi.grid(),{nspin,nkpts,nbnd,nbnd},
+                    {psi.block_size()[0],psi.block_size()[1],psi.block_size()[2],psi.block_size()[2]});
+    //  Hij = conj(psi(i,:)) * psi(j,:) 
+    math::nda::slate_ops::multiply(psi,math::nda::dagger(psi),Hij);
+    nda::tensor::scale(ComplexType(1.0),Hij.local(),nda::tensor::op::CONJ);
+  
+    return Hij;
+
+  }
+}
+
+
+}  // namespace hamilt::detail
+
+#endif

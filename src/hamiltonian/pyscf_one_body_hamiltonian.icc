@@ -1,0 +1,128 @@
+#ifndef HAMILTONIAN_PYSCF_ONE_BODY_HAMILTONIAN_ICC
+#define HAMILTONIAN_PYSCF_ONE_BODY_HAMILTONIAN_ICC
+
+#include "configuration.hpp"
+#include "IO/app_loggers.h"
+#include "utilities/check.hpp"
+
+#include "mpi3/environment.hpp"
+#include "mpi3/communicator.hpp"
+#include "h5/h5.hpp"
+#include "nda/nda.hpp"
+#include "nda/h5.hpp"
+
+#include "numerics/distributed_array/nda.hpp"
+#include "numerics/distributed_array/h5.hpp"
+#include "mean_field/MF.hpp"
+#include "mean_field/distributed_orbital_readers.hpp"
+
+#include "utilities/proc_grid_partition.hpp"
+#include "utilities/fortran_utilities.h"
+#include "utilities/qe_utilities.hpp"
+
+namespace hamilt::detail
+{
+/**
+ * Read PySCF one-body Hamiltonian associated with a MF object from a h5 file
+ * @param mf      - [INPUT] mean-field object
+ * @param h5_name - [INPUT] name of h5 file
+ * @param comm    - [INPUT] communicator for the output distributed array
+ * @param pgrid   - [INPUT] processor grid for the distributed array
+ * @param bz      - [INPUT] block size for the distributed array
+ * @return - one-body Hamiltonian in a distributed array
+ */
+template<MEMORY_SPACE MEM = HOST_MEMORY>
+auto pyscf_read_1B_from_file(mf::MF& mf, std::string h5_name, boost::mpi3::communicator& comm, 
+			     std::array<long,4> pgrid = {0}, std::array<long,4> bz = {1,1,2048,2048})
+{
+  long nspin = mf.nspin();
+  long nkpts = mf.nkpts_ibz();
+  long nbnd = mf.nbnd();
+  if( (pgrid==std::array<long,4>{0}) ) {
+    long sz = comm.size();
+    long ps = (sz%nspin==0?nspin:1);
+    long n_ = sz/ps;
+    long pk = utils::find_proc_grid_max_rows(n_,nkpts);
+    pgrid = {ps,pk,n_/pk,1};
+  }
+  utils::check(comm.size() == std::accumulate(pgrid.cbegin(), pgrid.cend(), long(1), std::multiplies<>{}),
+               "pyscf_read_1B_from_file: MPI size mismatch.");
+
+  using larray = memory::array<MEM,ComplexType,4>;
+  auto Hij = math::nda::make_distributed_array<larray>(comm,pgrid,{nspin,nkpts,nbnd,nbnd},bz);
+
+  auto fn = mf.filename();  
+  h5::file file;
+  try {
+    file = h5::file(fn, 'r');
+  } catch(...) {
+    APP_ABORT("Failed to open h5 file: {}, mode:r",fn);
+  }
+  h5::group grp(file);
+  h5::group scf_grp = grp.open_group("SCF");
+  math::nda::h5_read(scf_grp, h5_name, Hij);
+
+  return Hij;
+}
+
+/**
+ * Read the diagonal elements of the PySCF one-body Hamiltonian associated with a MF object from a h5 file
+ * @param mf      - [INPUT] mean-field object
+ * @param h5_name - [INPUT] name of h5 file
+ * @param comm    - [INPUT] communicator for the output distributed array
+ * @param pgrid   - [INPUT] processor grid for the distributed array
+ * @param bz      - [INPUT] block size for the distributed array
+ * @return - one-body Hamiltonian in a distributed array
+ */
+template<MEMORY_SPACE MEM = HOST_MEMORY>
+auto pyscf_read_diag_1B_from_file(mf::MF& mf, std::string h5_name, boost::mpi3::communicator& comm, 
+			     std::array<long,3> pgrid = {0}, std::array<long,3> bz = {1,1,2048})
+{
+  decltype(nda::range::all) all;
+  long nspin = mf.nspin();
+  long nkpts = mf.nkpts_ibz();
+  long nbnd = mf.nbnd();
+  if( (pgrid==std::array<long,3>{0}) ) {
+    long sz = comm.size();
+    long ps = (sz%nspin==0?nspin:1);
+    long n_ = sz/ps;
+    long pk = utils::find_proc_grid_max_rows(n_,nkpts);
+    pgrid = {ps,pk,n_/pk};
+  }
+  utils::check(comm.size() == std::accumulate(pgrid.cbegin(), pgrid.cend(), long(1), std::multiplies<>{}),
+               "pyscf_read_diag_1B_from_file: MPI size mismatch.");
+
+
+  using larray = memory::array<MEM,ComplexType,4>;
+  std::array<long,4> pg4 = {pgrid[0],pgrid[1],pgrid[2],1};
+  std::array<long,4> bz4 = {bz[0],bz[1],bz[2],2048};
+  auto Hij = math::nda::make_distributed_array<larray>(comm,pg4,{nspin,nkpts,nbnd,nbnd},bz4);
+
+  auto fn = mf.filename();
+  h5::file file;
+  try {
+    file = h5::file(fn, 'r');
+  } catch(...) {
+    APP_ABORT("Failed to open h5 file: {}, mode:r",fn);
+  }
+  h5::group grp(file);
+  h5::group scf_grp = grp.open_group("SCF");
+  math::nda::h5_read(scf_grp, h5_name, Hij);
+
+  using larray3D = memory::array<MEM,ComplexType,3>;
+  auto Hii = math::nda::make_distributed_array<larray3D>(comm,pgrid,{nspin,nkpts,nbnd},bz);
+
+  for( auto [is,s] : itertools::enumerate(Hij.local_range(0)))
+    for( auto [ik,k] : itertools::enumerate(Hij.local_range(1))) {
+      auto Hsk = Hij.local()(is,ik,all,all);
+      Hii.local()(is,ik,all) = nda::diagonal(Hsk);
+    }
+
+  return Hii;
+}
+
+
+
+}  // namespace hamilt::detail
+
+#endif

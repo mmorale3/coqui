@@ -1,0 +1,38 @@
+#
+# Least-square tensor hypercontraction from given three-index ERI
+#
+# There are two different ways to initialize a THC-ERI calculation:
+#   1. Specifying number of THC auxiliary basis
+#   2. Specifying the accuracy of the pivoted Cholesky.
+#
+
+# Input mean_field instance which contains the basis functions for the Many-body Hamiltonian.
+[mean_field.qe]
+name     = "mf_qe"
+prefix   = "pwscf"
+outdir   = "qe_output_dir/OUT/"
+filetype = "h5"
+
+# First constuct a Cholesky 3-index ERI and stored them in "./chol_V" directory
+[interaction.cholesky]
+name            = "chol_eri"
+mean_field      = "mf_qe"
+tol             = 1e-6
+storage         = "outcore"
+path            = "./chol_V"
+chol_block_size = 32
+
+
+# Constructing THC-ERI by solving a least-square problem with a given 3-index ERI.
+[interaction.thc]
+name            = "eri"
+mean_field      = "mf_qe"
+cd_dir          = "./chol_V"       # Directory of the starting 3-index ERI for LS-THC algorithm
+thresh          = 1e-6             # accuracy for the pivoted Cholesky.
+                                   # [IMPORTANT] The accuracy of the pivoted Cholesky is "not" the
+                                   #             accuracy of the final THC-ERI.
+                                   #             Roughly speaking, the accuracy of the THC-ERI ~ sqrt(thresh).
+save            = "thc_eri.h5"
+storage         = "incore"
+distr_tol       = 0.4
+memory_frac     = 0.75

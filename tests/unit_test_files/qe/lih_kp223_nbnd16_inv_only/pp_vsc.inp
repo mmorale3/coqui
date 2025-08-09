@@ -1,0 +1,8 @@
+&inputpp
+
+outdir = "./",
+prefix = "pwscf",
+filplot = "VSC",
+plot_num = 1
+
+/

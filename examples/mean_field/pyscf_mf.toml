@@ -1,0 +1,8 @@
+#
+# PySCF mean-field reader
+#
+
+[mean_field.pyscf]
+name   = "mf_si"               # name tag for this mean_field instance
+prefix = "pyscf"               # prefix for the pyscf output hdf5 file
+outdir = "pyscf_output_dir"    # directory where the pyscf output files locates

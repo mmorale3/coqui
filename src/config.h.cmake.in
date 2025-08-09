@@ -1,0 +1,33 @@
+#ifndef COQUI_CONFIGURATION_H
+#define COQUI_CONFIGURATION_H
+
+/* define the major version */
+#define COQUI_VERSION_MAJOR  @COQUI_VERSION_MAJOR@
+
+/* define the minor version */
+#define COQUI_VERSION_MINOR  @COQUI_VERSION_MINOR@
+
+/* define the patch version */
+#define COQUI_VERSION_PATCH  @COQUI_VERSION_PATCH@
+
+/* define the release version */
+#cmakedefine COQUI_RELEASE  @COQUI_RELEASE@
+
+/* source directory */
+#cmakedefine PROJECT_SOURCE_DIR "@PROJECT_SOURCE_DIR@"
+
+/* install directory */
+#define INSTALL_DIR "@CMAKE_INSTALL_PREFIX@"
+
+/* building from Git repository or not */
+#cmakedefine IS_GIT_PROJECT  @IS_GIT_PROJECT@
+
+/* Using cpptrace */
+#cmakedefine ENABLE_CPPTRACE @ENABLE_CPPTRACE@
+
+#cmakedefine HAVE_STDINT_H  @HAVE_STDINT_H@
+#cmakedefine HAVE_UNISTD_H  @HAVE_UNISTD_H@
+#cmakedefine HAVE_FCNTL_H  @HAVE_FCNTL_H@
+
+#endif // COQUI_CONFIGURATION_H
+

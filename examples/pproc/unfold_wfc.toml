@@ -1,0 +1,20 @@
+#
+# Unfold the wfc in symmetry-adapted nscf calculation and
+# overwrite the wfc in the non-symmetry-adapted nscf results.
+#
+
+[mean_field.qe]
+name     = "mf_qe_sym"
+prefix   = "pwscf"
+outdir   = "qe_output_dir/OUT/"
+filetype = "h5"
+
+[mean_field.qe]
+name     = "mf_qe_nosym"
+prefix   = "pwscf"
+outdir   = "qe_output_dir_nosym/OUT/"
+filetype = "h5"
+
+[unfold_wfc]
+mean_field_sym   = "mf_qe_sym"    # nscf results to be unfolded
+mean_field_nosym = "mf_qe_nosym"  # nscf results to be overwritten

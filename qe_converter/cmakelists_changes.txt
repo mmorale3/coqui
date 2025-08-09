@@ -1,0 +1,22 @@
+
+###########################################################
+# pw2coqui.x
+###########################################################
+set(src_pw2coqui_x src/pw2coqui.f90)
+qe_add_executable(qe_pp_pw2coqui_exe ${src_pw2coqui_x})
+set_target_properties(qe_pp_pw2coqui_exe PROPERTIES OUTPUT_NAME pw2coqui.x)
+target_link_libraries(qe_pp_pw2coqui_exe
+    PRIVATE
+        qe_pw
+        qe_modules
+        qe_pp
+        qe_upflib
+        qe_fftx
+        qe_mpi_fortran
+        qe_xclib)
+
+
+
+
+# Add the following to "PP_EXE_TARGETS": 
+qe_pp_pw2coqui_exe

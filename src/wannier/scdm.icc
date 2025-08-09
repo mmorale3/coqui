@@ -1,0 +1,317 @@
+#include <iostream>
+#include <cmath>
+
+#include "configuration.hpp"
+
+#include "nda/nda.hpp"
+#include "nda/h5.hpp"
+#include "h5/h5.hpp"
+
+#include "IO/app_loggers.h"
+#include "IO/ptree/ptree_utilities.hpp"
+#include "utilities/mpi_context.h"
+#include "utilities/kpoint_utils.hpp"
+#include "grids/g_grids.hpp"
+#include "numerics/shared_array/nda.hpp"
+#include "numerics/nda_functions.hpp"
+#include "mean_field/MF.hpp"
+#include "wannier/wan90_utils.hpp"
+
+namespace wannier
+{
+
+namespace scdm_detail
+{
+
+auto weight_function(ptree const& pt)
+{
+  auto type = io::get_value_with_default<std::string>(pt,"scdm_entanglement", "isolated");
+  auto units = io::get_value_with_default<std::string>(pt,"scdm_units","bohr");
+  auto mu = io::get_value_with_default<double>(pt,"scdm_mu",0.0);
+  auto sigma = io::get_value_with_default<double>(pt,"scdm_sigma",0.2);
+
+  io::tolower(type);
+  io::tolower(units);
+
+  utils::check(type == "isolated" or type == "erfc" or type == "gaussian", 
+               "Invalid scdm_entanglement:{}",type);
+  if(type != "isolated") {
+    utils::check(mu > 0.0, "Invalid scdm_mu:{} (expect >0.0)",mu);
+    utils::check(sigma > 0.0, "Invalid scdm_sigma:{} (expect >0.0)",sigma);
+
+    if(units == "bohr") {
+    } else if(units == "ry") {
+      mu *= 0.5;
+      sigma *= 0.5;
+    } else if(units == "ev") {
+      mu *= 3.674932540e-2;
+      sigma *= 3.674932540e-2; 
+    } else {
+      utils::check(false,"Error: Invalid scdm_units:{} (allowed bohr, ry, ev)",units);
+    }
+  }
+
+  auto fun = [=](double  e) {
+    if(type=="isolated") {
+      return 1.0; 
+    } else if(type == "erfc") {
+      return 0.5*std::erfc((e-mu)/sigma);
+    } else if(type == "gaussian") {
+      return std::exp(-(e-mu)*(e-mu)/(sigma*sigma));
+    }
+    utils::check(false,"Oh oh");
+    return 0.0;
+  };
+  return fun;
+} 
+
+// evaluate interpolating points
+auto interpolating_points_qcrp(utils::mpi_context_t<mpi3::communicator> &mpi, mf::MF &mf, 
+          nda::MemoryArrayOfRank<1> auto && mesh, nda::MemoryArrayOfRank<1> auto && wfc_to_rho,
+          int nwann, nda::array<int,1> const& band_list, auto const& f_i)
+{
+  utils::check(band_list.size() <= mf.nbnd() and nwann <= band_list.size(), "Size mismatch");
+  auto all = nda::range::all;
+  auto kpts = mf.kpts();
+  auto nkpts_ibz = mf.nkpts_ibz();
+  long isp = 0; // FIX FIX FIX!!!
+  // check that band_list is sorted
+
+  nda::array<int,1> rp(nwann);
+
+  // running in serial for now
+  if(mpi.comm.root()) {
+
+    int ik0 = -1;
+    for( int i=0; i<nkpts_ibz; ++i) {
+      if(nda::sum(kpts(i,all)*kpts(i,all)) < 1e-8) {
+        ik0 = i;
+        break;
+      }
+    }
+    utils::check(ik0 >= 0, "interpolating_points_qcrp: SCDM requires a gamma-centered kpoint grid.");
+
+    auto wfc_g = mf.wfc_truncated_grid();
+    long nnr = mesh(0)*mesh(1)*mesh(2);
+    int nband = band_list.size();
+
+    // Read orbitals psi(i,r), 
+    nda::array<ComplexType,1> buff_w(wfc_g->size());
+    nda::array<ComplexType,1> buff_r(nnr);
+    auto b3d = nda::reshape(buff_r, std::array<long,3>{mesh(0),mesh(1),mesh(2)});
+    math::nda::fft<false> F(b3d,math::fft::FFT_MEASURE);
+
+    // need F_layout
+    nda::matrix<ComplexType,nda::F_layout> psir(nband,nnr);
+
+    // move orbitals to the front, conjugate and multiply by f_i(ev)
+    for( auto [i,n] : itertools::enumerate(band_list) ) {
+
+      // spin???
+      // MAM: check that ev for at least nwann bands is non-zero
+      mf.get_orbital('w',isp,ik0,n,buff_w);
+
+      // w->g
+      buff_r() = ComplexType(0.0);
+      nda::copy_select(true,wfc_to_rho,ComplexType(1.0),buff_w,ComplexType(0.0),buff_r);
+
+      // g->r
+      F.backward(b3d);
+
+      double ev = mf.eigval(isp,ik0,n);
+      psir(i,all) = f_i(ev) * nda::conj(buff_r());
+
+    } 
+
+    // QCRP
+    nda::array<int,1> ipiv(nnr,0); 
+    nda::array<ComplexType,1> tau(nband,ComplexType(0.0)); 
+    int info = nda::lapack::geqp3(psir,ipiv,tau);
+    utils::check(info==0, "interpolating_points_qcrp: Failed QCRP with info:{}",info);
+
+    // picking top nwann centers, they could also be picked based on location, 
+    // e.g. proximity to a set of centers
+    rp() = ipiv(nda::range(nwann));
+  }
+
+  mpi.broadcast(rp);
+
+  return rp;
+}
+
+} // scdm_detail
+
+/**
+* Calculates the expansion coefficients of the localized orbitals, A(k,m,n) = <psi^{k}_m | g^{k}_n>. 
+*
+* @param nwann     - [INPUT] Number of localized functions. 
+* @param band_list  - [INPUT] List of orbitals included in calculation.
+* @param fi        - [INPUT] Weight of each orbital. 
+*
+*/
+//template<MEMORY_SPACE MEM = HOST_MEMORY>
+auto scdm(utils::mpi_context_t<mpi3::communicator> &mpi, mf::MF &mf, ptree const& pt, int nwann,
+          nda::array<int, 1> const& kp_map, nda::array<double,2> const& wann_kp,
+          nda::array<int,1> const& band_list, bool transpose, bool write_to_file)
+{
+  using Array_view_3D_t = nda::array_view<ComplexType,3>;
+
+  app_log(2, "\n Generating localized orbitals with SCDM \n");
+
+  // options
+  auto prefix = io::get_value<std::string>(pt,"prefix");
+
+  // local variables
+  auto all = ::nda::range::all;
+  long nband = band_list.size();
+  long nkpts = wann_kp.extent(0);  
+  auto lattv = mf.lattv();
+  auto wfc_g = mf.wfc_truncated_grid();
+  auto fft2gv = wfc_g->fft_to_gv();
+  auto gvecs = wfc_g->g_vectors();
+  nda::array<long,1> k2g(wfc_g->size());
+  nda::array<ComplexType,1> *Xft = nullptr;
+  long isp = 0;
+  auto rho_g = grids::truncated_g_grid( mf.ecutrho(), mf.fft_grid_dim(), mf.recv() );
+  auto mesh = rho_g.mesh();
+  long nnr = mesh(0)*mesh(1)*mesh(2);
+
+  math::shm::shared_array<nda::array_view<long,1>> swfc_to_rho(mpi,std::array<long,1>{wfc_g->size()});
+  auto wfc_to_rho = swfc_to_rho.local();
+  if(mpi.comm.root()) {
+    grids::map_truncated_grids(true,*wfc_g,rho_g,wfc_to_rho);
+    mpi.internode_comm.broadcast_n(wfc_to_rho.data(),wfc_to_rho.size(),0);
+  } else if(mpi.node_comm.root()) {
+    mpi.internode_comm.broadcast_n(wfc_to_rho.data(),wfc_to_rho.size(),0);
+  }
+  mpi.node_comm.barrier();
+
+  // weight function for quasi-density matrix
+  auto f_i = scdm_detail::weight_function(pt);
+
+  // pivots of quasi-density matrix at k=0
+  auto rp = scdm_detail::interpolating_points_qcrp(mpi,mf,mesh,wfc_to_rho,nwann,band_list,f_i);
+  nda::array<double,2> rp_crys(nwann,3); 
+
+  {
+    app_log(2, "  SCDM Pivot positions");
+    nda::array<long,2> mill(nwann,3);
+    utils::generate_miller_index(rp, mill, mesh);
+    nda::stack_array<double,3> r_ = {0.0,0.0,0.0};
+    for(int i=0; i<nwann; ++i) {
+      rp_crys(i,0) = double(mill(i,0))/double(mesh(0));
+      rp_crys(i,1) = double(mill(i,1))/double(mesh(1));
+      rp_crys(i,2) = double(mill(i,2))/double(mesh(2));
+      r_() = rp_crys(i,0)*lattv(0,all) +
+             rp_crys(i,1)*lattv(1,all) + 
+             rp_crys(i,2)*lattv(2,all); 
+      app_log(2,"   i:{} Rp:{} ",i,r_); 
+    }
+  }
+
+  std::array<long,3> shape = {nkpts,nband,nwann};
+  if(transpose) shape = {nkpts,nwann,nband};
+  auto Amn = math::shm::make_shared_array<Array_view_3D_t>(mpi, shape);  
+  auto Aloc = Amn.local();
+
+  nda::array<ComplexType,1> buff_w(wfc_g->size());
+  nda::array<ComplexType,1> buff_r(nnr);
+  auto b3d = nda::reshape(buff_r, std::array<long,3>{mesh(0),mesh(1),mesh(2)});
+  math::nda::fft<false> F(b3d,math::fft::FFT_MEASURE);
+
+  // need F_layout: you can use Amn as temporary space
+  nda::matrix<ComplexType,nda::F_layout> Qnm(nband,nwann);
+  nda::array<ComplexType,1> phase(nwann);
+
+  // no parallelization within a kpoint right now
+  // slow!!! not optimized yet!
+  for(int ik=0; ik<nkpts; ++ik) {
+
+     if( ik%mpi.comm.size() != mpi.comm.rank() ) continue;
+    //read psi, fft, accumulate
+
+    // wannier ordering
+    auto kl = kp_map[ik];
+
+    for(int i=0; i<nwann; ++i) {
+      constexpr double tpi = 2.0 * 3.14159265358979;
+      double kr = nda::sum(wann_kp(ik,all)*rp_crys(i,all)); 
+      phase(i) = std::exp(ComplexType{0.0,tpi*kr});
+    }
+
+    // Read orbitals psi(i,r), 
+    // build f_i(ev) * conj(Qnm(k,n,iw)) * phase(iw) 
+    for( auto [i,n] : itertools::enumerate(band_list) ) {
+
+      // spin???
+      mf.get_orbital('w',isp,kl,n,buff_w);
+      // add phase factor if needed!
+      utils::check(utils::equivalent_k(wann_kp(ik,all),mf.kpts_crystal(kl),1e-6),
+        "wannier::scdm: Problems mapping kpoints: nnkp:{}, CoQui:{}",
+        wann_kp(ik,all),mf.kpts_crystal(kl));
+      if(nda::sum( nda::abs(wann_kp(ik,all)-mf.kpts_crystal(kl)) ) > 1e-6) {
+        k2g() = wfc_g->gv_to_fft()();
+        // careful with sigh of dG, since transform_k2g performs G -> G-dG
+        // k2g(i) = N -> G[N] -> G - (-dG) -> N'  
+        // psi(...,N) = buff(...,fft2g(N')), which is equivalent to psi_{k+dG}(G) = psi_{k}( G + dG ) 
+        // for dG = wann_kp(ik,all)-mf.kpts_crystal(kl) 
+        utils::transform_k2g(false, mf.symm_list(0),
+                             mf.kpts_crystal(kl)-wann_kp(ik,all),
+                             wfc_g->mesh(), wann_kp(ik,all), k2g, Xft);
+        for(auto [j,m] : itertools::enumerate(k2g))
+          buff_r(j) = buff_w(fft2gv(m)); 
+        buff_w() = buff_r(nda::range(wfc_g->size())); 
+      } 
+
+      // w->g
+      buff_r() = ComplexType(0.0);
+      nda::copy_select(true,wfc_to_rho,ComplexType(1.0),buff_w,ComplexType(0.0),buff_r);
+
+      // g->r
+      F.backward(b3d);
+
+      // for symmetry equivalent kpoints, you just need to read the rotated points!
+      double ev = mf.eigval(isp,kl,n);
+      nda::copy_select(false,rp,ComplexType(f_i(ev)),buff_r,ComplexType(0.0),Qnm(i,all));
+      for( int iw=0; iw<nwann; ++iw )
+        Qnm(i,iw) = nda::conj(Qnm(i,iw)*phase(iw)); 
+
+    }
+
+    // SVD
+    nda::array<double,1> S(nband,0.0);
+    nda::matrix<ComplexType,nda::F_layout> U(nband,nband), Vt(nwann,nwann);
+    int info = nda::lapack::gesvd(Qnm,S,U,Vt);
+    utils::check(info==0, "scdm: Failed SVD with info:{}",info);
+
+    // different options here, following pw2wannier90.x convention
+/*
+    // A = U*Vt
+    if(transpose)
+      Aloc(ik,nda::ellipsis{}) = nda::transpose(U(all,nda::range(nwann)));
+    else
+      Aloc(ik,nda::ellipsis{}) = U(all,nda::range(nwann));
+*/
+    if(transpose)   
+      // A(nwann,nband)
+      nda::blas::gemm(nda::transpose(Vt),nda::transpose(U(all,nda::range(nwann))),
+                      Aloc(ik,nda::ellipsis{}));
+    else
+      // A(nband,nwann)
+      nda::blas::gemm(U(all,nda::range(nwann)),Vt,Aloc(ik,nda::ellipsis{}));
+  }  // ik
+
+  mpi.comm.barrier();
+  if(mpi.node_comm.root()) 
+    mpi.internode_comm.all_reduce_in_place_n(Aloc.data(),Aloc.size(),std::plus<>{});
+  if(mpi.comm.root() and write_to_file)
+    detail::write_amn_file(prefix,Amn.local(),transpose);  
+  mpi.comm.barrier();
+
+  return Amn; 
+}
+
+
+}
+
+

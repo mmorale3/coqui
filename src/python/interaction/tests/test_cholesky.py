@@ -1,0 +1,27 @@
+from mpi4py import MPI
+import os
+import pytest
+
+import coqui
+from coqui.utils.tests.test_coqui_env import mpi
+from coqui.mean_field.tests.test_qe import construct_qe_mf
+
+def test_cholesky_eri(mpi):
+    mf = construct_qe_mf(mpi, "qe_lih222")
+    chol_params = {
+        "tol": 1e-3,
+        "storage": "outcore",
+        "path": "./",
+        "chol_block_size": 32
+    }
+    chol = coqui.make_chol_coulomb(mf, chol_params)
+    assert isinstance(chol, coqui._lib.eri_module.CholCoulomb)
+    assert mpi == chol.mpi()
+    mpi.barrier()
+
+    if mpi.root():
+        os.remove("./chol_info.h5")
+        for iq in range(mf.nqpts_ibz()):
+            os.remove(f"./Vq{iq}.h5")
+    mpi.barrier()
+

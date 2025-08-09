@@ -1,0 +1,15 @@
+#
+# Evaluate the matrix elements of Vxc and dump it to h5 archive
+#
+
+[mean_field.qe]
+name     = "mf"                           # name tag for this mean_field instance
+prefix   = "pwscf"                        # prefix for the quantum espresso outputs
+outdir   = "qe_output_dir/OUT/"           # direcotry where the qe outputs locate
+filetype = "h5"                           # input format from QE converter: "h5" or "xml"
+
+[dump_vxc]                              
+mean_field = "mf"                         # input mean_field handler 
+outdir     = "./"                         # directory for the vxc output
+prefix     = "hf"                         # prefix for the vxc output. 
+                                          # final h5 archive is "outdir"/"prefix".mbpt.h5

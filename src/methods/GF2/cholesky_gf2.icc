@@ -1,0 +1,361 @@
+#include "mpi3/communicator.hpp"
+#include "nda/nda.hpp"
+#include "nda/blas.hpp"
+#include "numerics/shared_array/nda.hpp"
+#include "numerics/nda_functions.hpp"
+
+#include "utilities/proc_grid_partition.hpp"
+#include "IO/app_loggers.h"
+#include "utilities/Timer.hpp"
+
+#include "mean_field/MF.hpp"
+#include "methods/ERI/detail/concepts.hpp"
+
+
+namespace methods {
+  namespace solvers {
+
+    template<nda::MemoryArray Array_5D_t, nda::MemoryArray Array_5D_t2>
+      void gf2_t::add_exc_to_Sigma(sArray_t<Array_5D_t> &sSigma,
+                                   sArray_t<Array_5D_t2> &sSigma_exc, ComplexType scale){
+        auto size = sSigma.size();
+        auto[origin_i, end_i] = itertools::chunk_range(0, size, _context->node_comm.size(), _context->node_comm.rank());
+        ::nda::range i_range(origin_i, end_i);
+        auto Sigma_1D = ::nda::reshape(sSigma.local(), std::array<long, 1>{size});
+        auto Sigma_exc_1D = ::nda::reshape(sSigma_exc.local(), std::array<long, 1>{size});
+        sSigma.win().fence();
+        Sigma_1D(i_range) += scale*Sigma_exc_1D(i_range);
+        sSigma.win().fence();
+      }
+
+    template<nda::MemoryArray Array_5D_t>
+    void gf2_t::chol_run_direct(const nda::MemoryArrayOfRank<5> auto &G_tskij,
+                        sArray_t<Array_5D_t> &sSigma_tskij,
+                        Cholesky_ERI auto &chol) {
+      app_log(2, " *** Cholesky GF2-direct solver begin *** ");
+      using namespace math::shm;
+      using Array_3D_t = nda::array_view<ComplexType, 3>;
+
+      gw_t gw(_ft);
+      gw.output() = output();
+
+      _Timer.start("ALLOC");
+      sSigma_tskij.set_zero();
+      sArray_t<Array_3D_t> sP0_tPQ(*_context, {_ft->nt_b(), chol.Np(), chol.Np()});
+      _Timer.stop("ALLOC");
+
+      int Np_batch = sP0_tPQ.local().shape(1);
+      int nbnd_batch = sSigma_tskij.local().shape(3);
+      for (size_t iq = 0; iq < _MF->nkpts(); ++iq) {
+        _Timer.start("EVALUATE_P0");
+        gw.evaluate_P0(iq, G_tskij, sP0_tPQ, chol, Np_batch, (iq==0)? true : false);
+        _Timer.stop("EVALUATE_P0");
+
+        _Timer.start("EVALUATE_SIGMA_DIR");
+        gw.evaluate_Sigma(iq, G_tskij, sP0_tPQ.local(), sSigma_tskij, chol, nbnd_batch, (iq==0)? true : false);
+        _Timer.stop("EVALUATE_SIGMA_DIR");
+      }
+      _Timer.start("COMM");
+      sSigma_tskij.win().fence();
+      sSigma_tskij.all_reduce();
+      sSigma_tskij.win().fence();
+      _Timer.stop("COMM");
+      app_log(2, " **** Cholesky GF2-direct solver end **** \n");
+    }
+
+    
+    
+    //TODO: 3-layered communicator (q1,q2,t)?
+    template<nda::MemoryArray Array_5D_t>
+    void gf2_t::chol_run_2(const nda::MemoryArrayOfRank<5> auto &G_tskij,
+                        sArray_t<Array_5D_t> &sSigma_tskij,
+                        Cholesky_ERI auto &chol) {
+      app_log(2, " *** Cholesky GF2-exchange solver begin *** ");
+        size_t nt    = G_tskij.shape(0);
+        size_t ns    = G_tskij.shape(1);
+        size_t nkpts = G_tskij.shape(2);
+        size_t nbnd =  G_tskij.shape(3);
+
+
+        auto[dim0_rank, dim0_comm_size, dim1_rank, dim1_comm_size] =
+            utils::setup_two_layer_mpi(sSigma_tskij.communicator(), nkpts, nt); 
+        std::swap(dim0_rank, dim1_rank);
+        std::swap(dim0_comm_size,dim1_comm_size);
+        if (true) {
+          app_log(2, "    - chol_run" );
+          app_log(2, "    - MPI processors along nkpts axis k_t = {}", dim0_comm_size);
+          app_log(2, "    - MPI processors along time axis it = {}", dim1_comm_size);
+        }
+
+        _Timer.start("ALLOC");
+        nda::array<ComplexType, 4> v_tuvw(nbnd, nbnd, nbnd, nbnd);
+        nda::array<ComplexType, 4> v_rqsp(nbnd, nbnd, nbnd, nbnd);
+        // temporary arrays:
+        nda::array<ComplexType, 4> buffer1(nbnd, nbnd, nbnd, nbnd);
+        nda::array<ComplexType, 4> buffer2(nbnd, nbnd, nbnd, nbnd);
+        nda::array<ComplexType, 4>& v_prqs = buffer1;
+
+        nda::array<ComplexType, 4> I1_tuvp(nbnd, nbnd, nbnd, nbnd); 
+        nda::array<ComplexType, 4>& I2_tusp = I1_tuvp;
+        nda::array<ComplexType, 4>& I3_tqsp = I1_tuvp;
+        _Timer.stop("ALLOC");
+       
+        _Timer.start("ALLOC");
+        nda::array<size_t, 2> kmap(nkpts, nkpts);
+        setup_qk_to_k1(kmap); 
+        _Timer.stop("ALLOC");
+
+        sSigma_tskij.win().fence();
+        for(size_t is = 0; is < ns; is++) 
+        for(size_t k_t = dim0_rank; k_t < nkpts; k_t+=dim0_comm_size) 
+        for(size_t q2 = 0; q2 < nkpts; q2++)
+        for(size_t q1 = 0; q1 < nkpts; q1++) {
+            size_t k_r = k_t;
+            size_t k_u = _MF->qk_to_k2(q2, k_t); 
+            size_t k_p = qk_to_k1(q1, k_r, kmap); 
+            size_t k_w = k_p;
+            size_t k_v = _MF->qk_to_k2(q2, k_w); 
+            size_t k_s = k_v;
+            {
+                _Timer.start("BUILD_INT");
+                build_int(v_prqs, q1, k_p, k_s, is, chol);
+                _Timer.stop("BUILD_INT");
+                auto V_p_rqs = nda::reshape(v_prqs, shape_t<2>{nbnd, nbnd*nbnd*nbnd});
+                auto V_rqs_p = nda::reshape(v_rqsp, shape_t<2>{nbnd*nbnd*nbnd, nbnd});
+                V_rqs_p = nda::make_regular(nda::transpose(V_p_rqs)); 
+            }
+            _Timer.start("BUILD_INT");
+            build_int(v_tuvw, q2, k_t, k_w, is, chol);
+            _Timer.stop("BUILD_INT");
+
+            _Timer.start("EVALUATE_SIGMA_EXC");
+            for(size_t it = dim1_rank; it < nt; it+=dim1_comm_size) { // FIXME: optimize memory consumption here...
+                _Timer.start("CONTRACT");
+                auto G_wp = G_tskij(it, is, k_w, nda::ellipsis{});
+                // Cannot do inplace contraction here because 
+                // v_tuvw will be needed for other it and is points
+                contract_4_4(v_tuvw, G_wp, I1_tuvp);
+                
+                auto G_vs = make_regular(nda::transpose(G_tskij(nt - it - 1, is, k_v, nda::ellipsis{})));
+                //contract_4_3(I1_tuvp, G_vs, I2_tusp);
+                contract_4_3_inplace(I2_tusp, G_vs, buffer1, buffer2);
+
+                auto G_uq = G_tskij(it, is, k_u, nda::ellipsis{});
+                //contract_4_2(I2_tusp, G_uq, I3_tqsp);
+                contract_4_2_inplace(I3_tqsp, G_uq, buffer1, buffer2);
+                _Timer.stop("CONTRACT");
+
+
+                nda::array<ComplexType, 2> S_tr(nbnd, nbnd);
+                set_zero(S_tr);
+
+                auto I3_t_qsp = nda::reshape(I3_tqsp, shape_t<2>{nbnd, nbnd*nbnd*nbnd});
+
+                auto V_r_qsp = nda::reshape(v_rqsp, shape_t<2>{nbnd, nbnd*nbnd*nbnd});
+                nda::blas::gemm(I3_t_qsp, nda::transpose(V_r_qsp), S_tr);
+                S_tr *= (-1.0/(nkpts*nkpts));
+                //This is safe since parallelization is done by it and k_t
+                sSigma_tskij.local()(it, is, k_t, nda::range::all, nda::range::all) += S_tr; 
+
+            } // it
+            _Timer.stop("EVALUATE_SIGMA_EXC");
+        }
+        sSigma_tskij.win().fence();
+
+
+        //sSigma_tskij.local() *= (-1.0/(nkpts*nkpts)); 
+      app_log(2, " *** Cholesky GF2-exchange solver end *** ");
+   }
+
+    template<nda::MemoryArray Array_4D_t1, nda::MemoryArray Array_4D_t2, nda::MemoryArray Array_view_2D_t>
+    void gf2_t::contract_4_4(const Array_4D_t1& v_tuvw,
+                             const Array_view_2D_t& G_wp,
+                             Array_4D_t2& I_tuvp) {
+        size_t nbnd = v_tuvw.shape()[0];
+
+        auto V_tuv_w = nda::reshape(v_tuvw, shape_t<2>{nbnd*nbnd*nbnd, nbnd});
+        auto I_tuv_p = nda::reshape(I_tuvp, shape_t<2>{nbnd*nbnd*nbnd, nbnd});
+        auto G_w_p = nda::reshape(G_wp, shape_t<2>{nbnd, nbnd});
+
+        nda::blas::gemm(V_tuv_w, G_w_p, I_tuv_p);
+
+    }
+
+    template<nda::MemoryArray Array_4D_t1, nda::MemoryArray Array_4D_t2, nda::MemoryArray Array_view_2D_t>
+    void gf2_t::contract_4_4_inplace(Array_4D_t1& v_tuvw,
+                      const Array_view_2D_t& G_wp,
+                      Array_4D_t2& buffer_loc) { //I_tuvp
+        size_t nbnd = v_tuvw.shape()[0];
+
+        auto V_tuv_w = nda::reshape(v_tuvw, shape_t<2>{nbnd*nbnd*nbnd, nbnd});
+        auto I_tuv_p = nda::reshape(buffer_loc, shape_t<2>{nbnd*nbnd*nbnd, nbnd});
+        auto G_w_p = nda::reshape(G_wp, shape_t<2>{nbnd, nbnd});
+
+        nda::blas::gemm(V_tuv_w, G_w_p, I_tuv_p);
+
+        v_tuvw = nda::make_regular(buffer_loc);
+
+    }
+
+    template<nda::MemoryArray Array_4D_t1, nda::MemoryArray Array_4D_t2, nda::MemoryArray Array_view_2D_t>
+    void gf2_t::contract_4_3(const Array_4D_t1& v_tuvw,
+                             const Array_view_2D_t& G_vs,
+                             Array_4D_t2& I_tusw) {
+        size_t nbnd = v_tuvw.shape()[0];
+        auto V_tuv_w = nda::reshape(v_tuvw, shape_t<2>{nbnd*nbnd*nbnd, nbnd});
+
+        //nda::array<ComplexType, 4> v_wtuv(nbnd, nbnd, nbnd, nbnd);
+        nda::array<ComplexType, 4>& v_wtuv = I_tusw;
+        auto V_w_tuv = nda::reshape(v_wtuv, shape_t<2>{nbnd, nbnd*nbnd*nbnd});
+        V_w_tuv = make_regular(nda::transpose(V_tuv_w));
+        auto V_wtu_v = nda::reshape(v_wtuv, shape_t<2>{nbnd*nbnd*nbnd, nbnd});
+
+        nda::array<ComplexType, 4> I2_wtus(nbnd, nbnd, nbnd, nbnd);
+        //nda::array<ComplexType, 4>& I2_wtus = buffer;
+        auto I2_wtu_s = nda::reshape(I2_wtus, shape_t<2>{nbnd*nbnd*nbnd, nbnd});
+        nda::blas::gemm(V_wtu_v, G_vs, I2_wtu_s);
+        auto I2_w_tus = nda::reshape(I2_wtus, shape_t<2>{nbnd, nbnd*nbnd*nbnd});
+        auto I_tus_w = nda::reshape(I_tusw, shape_t<2>{nbnd*nbnd*nbnd, nbnd});
+        I_tus_w = nda::make_regular(nda::transpose(I2_w_tus));
+    }
+
+    template<nda::MemoryArray Array_4D_t1, nda::MemoryArray Array_4D_t2, 
+             nda::MemoryArray Array_4D_t3, nda::MemoryArray Array_view_2D_t>
+    void gf2_t::contract_4_3_inplace(Array_4D_t1& v_tuvw,
+                      const Array_view_2D_t& G_vs,
+                      Array_4D_t2& buffer1, Array_4D_t3& buffer2) { // I_tusw
+        size_t nbnd = v_tuvw.shape()[0];
+        auto V_tuv_w = nda::reshape(v_tuvw, shape_t<2>{nbnd*nbnd*nbnd, nbnd});
+
+        //nda::array<ComplexType, 4> v_wtuv(nbnd, nbnd, nbnd, nbnd);
+        nda::array<ComplexType, 4>& v_wtuv = buffer1;
+        auto V_w_tuv = nda::reshape(v_wtuv, shape_t<2>{nbnd, nbnd*nbnd*nbnd});
+        V_w_tuv = make_regular(nda::transpose(V_tuv_w));
+        auto V_wtu_v = nda::reshape(v_wtuv, shape_t<2>{nbnd*nbnd*nbnd, nbnd});
+
+        //nda::array<ComplexType, 4> I2_wtus(nbnd, nbnd, nbnd, nbnd);
+        nda::array<ComplexType, 4>& I2_wtus = buffer2;
+        auto I2_wtu_s = nda::reshape(I2_wtus, shape_t<2>{nbnd*nbnd*nbnd, nbnd});
+        nda::blas::gemm(V_wtu_v, G_vs, I2_wtu_s);
+        auto I2_w_tus = nda::reshape(I2_wtus, shape_t<2>{nbnd, nbnd*nbnd*nbnd});
+        //auto I_tus_w = nda::reshape(I_tusw, shape_t<2>{nbnd*nbnd*nbnd, nbnd});
+        V_tuv_w = nda::make_regular(nda::transpose(I2_w_tus));
+    }
+
+    template<nda::MemoryArray Array_4D_t1, nda::MemoryArray Array_4D_t2, 
+             nda::MemoryArray Array_view_2D_t>
+    void gf2_t::contract_4_2(const Array_4D_t1& v_tuvw,
+                             const Array_view_2D_t& G_uq,
+                             Array_4D_t2& I_tqvw) {
+        size_t nbnd = v_tuvw.shape()[0];
+
+        auto V_tu_vw = nda::reshape(v_tuvw, shape_t<2>{nbnd*nbnd, nbnd*nbnd});
+
+        //nda::array<ComplexType, 4> v_vwtu(nbnd, nbnd, nbnd, nbnd);
+        nda::array<ComplexType, 4>& v_vwtu = I_tqvw;
+        auto V_vw_tu = nda::reshape(v_vwtu, shape_t<2>{nbnd*nbnd, nbnd*nbnd});
+        V_vw_tu = nda::make_regular(nda::transpose(V_tu_vw));
+        auto V_vwt_u = nda::reshape(v_vwtu, shape_t<2>{nbnd*nbnd*nbnd, nbnd});
+
+        nda::array<ComplexType, 4> I2_vwtq(nbnd, nbnd, nbnd, nbnd);
+        auto I2_vwt_q = nda::reshape(I2_vwtq, shape_t<2>{nbnd*nbnd*nbnd, nbnd});
+        nda::blas::gemm(V_vwt_u, G_uq, I2_vwt_q);
+        auto I2_vw_tq = nda::reshape(I2_vwtq, shape_t<2>{nbnd*nbnd, nbnd*nbnd});
+        auto I_tq_vw = nda::reshape(I_tqvw, shape_t<2>{nbnd*nbnd, nbnd*nbnd});
+        I_tq_vw = nda::make_regular(nda::transpose(I2_vw_tq));
+    }
+
+
+    template<nda::MemoryArray Array_4D_t1, nda::MemoryArray Array_4D_t2, 
+             nda::MemoryArray Array_4D_t3, nda::MemoryArray Array_view_2D_t>
+    void gf2_t::contract_4_2_inplace(Array_4D_t1& v_tuvw,
+                             const Array_view_2D_t& G_uq,
+                             Array_4D_t2& buffer1, Array_4D_t3& buffer2) {
+        size_t nbnd = v_tuvw.shape()[0];
+
+        auto V_tu_vw = nda::reshape(v_tuvw, shape_t<2>{nbnd*nbnd, nbnd*nbnd});
+
+        //nda::array<ComplexType, 4> v_vwtu(nbnd, nbnd, nbnd, nbnd);
+        nda::array<ComplexType, 4>& v_vwtu = buffer1;
+        auto V_vw_tu = nda::reshape(v_vwtu, shape_t<2>{nbnd*nbnd, nbnd*nbnd});
+        V_vw_tu = nda::make_regular(nda::transpose(V_tu_vw));
+        auto V_vwt_u = nda::reshape(v_vwtu, shape_t<2>{nbnd*nbnd*nbnd, nbnd});
+
+        //nda::array<ComplexType, 4> I2_vwtq(nbnd, nbnd, nbnd, nbnd);
+        nda::array<ComplexType, 4>& I2_vwtq = buffer2;
+        auto I2_vwt_q = nda::reshape(I2_vwtq, shape_t<2>{nbnd*nbnd*nbnd, nbnd});
+        nda::blas::gemm(V_vwt_u, G_uq, I2_vwt_q);
+        auto I2_vw_tq = nda::reshape(I2_vwtq, shape_t<2>{nbnd*nbnd, nbnd*nbnd});
+        //auto I_tq_vw = nda::reshape(I_tqvw, shape_t<2>{nbnd*nbnd, nbnd*nbnd});
+        V_tu_vw = nda::make_regular(nda::transpose(I2_vw_tq));
+    }
+
+
+    // I_prqs =  \sum_Q L1_Qpr L2_Qqs 
+    template<nda::MemoryArray Array_3D_t1, nda::MemoryArray Array_3D_t2, nda::MemoryArray Array_4D_t>
+    void gf2_t::merge_4indx_basic(const Array_3D_t1& L1_Qpr, const Array_3D_t2& L2_Qqs, Array_4D_t& I_prqs) {
+        size_t Np = L1_Qpr.shape()[0];
+        size_t nbnd = L1_Qpr.shape()[1];
+
+        auto L1_Q_pr = nda::reshape(L1_Qpr, shape_t<2>{Np, nbnd*nbnd});
+        nda::array<ComplexType, 3> L1_prQ(nbnd, nbnd, Np); 
+        auto L1_pr_Q = nda::reshape(L1_prQ, shape_t<2>{nbnd*nbnd, Np});
+        L1_pr_Q = nda::make_regular(nda::transpose(L1_Q_pr));
+        auto L2_Q_qs = nda::reshape(L2_Qqs, shape_t<2>{Np, nbnd*nbnd});
+        
+        auto I_pr_qs = nda::reshape(I_prqs, shape_t<2>{nbnd*nbnd, nbnd*nbnd});
+
+        nda::blas::gemm(L1_pr_Q, L2_Q_qs, I_pr_qs);
+
+    }
+
+    template<nda::MemoryArray Array_4D_t>
+    void gf2_t::build_int(Array_4D_t& V_prqs,
+                          size_t q1, size_t k_p, size_t k_s, size_t is,
+                          Cholesky_ERI auto& chol) {
+        size_t nbnd = V_prqs.shape()[0];
+
+        // (pr|qs) = sum_Q L_Qpr L_Qsq^*
+        auto L1_Qpr = chol.V(q1, is, k_p);
+        auto L2_Qsq = chol.V(q1, is, k_s);
+
+        size_t Np = L1_Qpr.shape()[0];
+
+        nda::array<ComplexType, 3> L2_Qqs_conj(Np, nbnd, nbnd); 
+        for(size_t Q = 0; Q < Np; Q++) {
+            auto L2_qs_conj = L2_Qqs_conj(Q, nda::range::all, nda::range::all);
+            auto L2_sq = L2_Qsq(Q, nda::range::all, nda::range::all);
+            L2_qs_conj = nda::make_regular(nda::conj(nda::transpose(L2_sq)));
+        }
+
+        merge_4indx_basic(L1_Qpr, L2_Qqs_conj, V_prqs); 
+
+    }
+
+
+    template<nda::MemoryArray Array_4D_t, nda::MemoryArray Array_2D_t>
+    void gf2_t::build_Sigma(const Array_4D_t& I1_rqps, const Array_4D_t& I2_tqps, 
+                           Array_2D_t &Sigma_tr) {
+
+        size_t nbnd = I1_rqps.shape()[0];
+
+        auto I2_t_qps = nda::reshape(I2_tqps, shape_t<2>{nbnd, nbnd*nbnd*nbnd});
+        auto I1_r_qps = nda::reshape(I1_rqps, shape_t<2>{nbnd, nbnd*nbnd*nbnd});
+
+        nda::blas::gemm(I2_t_qps, nda::transpose(I1_r_qps), Sigma_tr);
+    }
+    
+    // ported from shared_array
+    template<nda::MemoryArray Array_ND_t>
+    void gf2_t::set_zero(Array_ND_t& A) {
+        using Array_view_t = decltype(std::declval<std::decay_t < Array_ND_t>>()());
+        using value_type = typename std::decay_t<Array_view_t>::value_type;
+        auto shape = A.shape();
+        size_t size = std::accumulate(shape.cbegin(), shape.cend(), 1, std::multiplies<>{}); 
+        auto A_1D = nda::reshape(A, shape_t<1>{size});
+        A_1D = value_type(0.0);
+    }
+
+
+} //solvers
+} // methods

@@ -1,0 +1,87 @@
+#ifndef COQUI_EDMFT_PI_ICC
+#define COQUI_EDMFT_PI_ICC
+
+#include "configuration.hpp"
+#include "utilities/mpi_context.h"
+#include "nda/h5.hpp"
+#include "numerics/distributed_array/nda.hpp"
+#include "numerics/shared_array/nda.hpp"
+#include "numerics/nda_functions.hpp"
+
+#include "utilities/Timer.hpp"
+#include "IO/app_loggers.h"
+
+#include "mean_field/MF.hpp"
+#include "numerics/imag_axes_ft/iaft_utils.hpp"
+#include "methods/ERI/detail/concepts.hpp"
+#include "methods/tools/chkpt_utils.h"
+#include "methods/embedding/dc_utilities.hpp"
+
+namespace methods {
+namespace solvers {
+
+  auto scr_coulomb_t::upfold_pi_local(
+      const nda::MemoryArrayOfRank<5> auto &Pi_loc_tabcd,
+      THC_ERI auto &thc,
+      const projector_boson_t &proj,
+      std::array<long, 4> pgrid, std::array<long, 4> bsize)
+  -> memory::darray_t<memory::array<HOST_MEMORY, ComplexType, 4>, mpi3::communicator> {
+
+    using local_Array_4D_t = nda::array<ComplexType, 4>;
+    using math::nda::make_distributed_array;
+    decltype(nda::range::all) all;
+
+    app_log(2, "  Upfold local corrections to the polarizability\n"
+               "    - processor grid for Pi: (t, q, P, Q) = ({}, {}, {}, {})\n"
+               "    - block size: (t, q, P, Q) = ({}, {}, {}, {})\n",
+            pgrid[0], pgrid[1], pgrid[2], pgrid[3], bsize[0], bsize[1], bsize[2], bsize[3]);
+
+    auto mpi = thc.mpi();
+    auto mf = thc.MF();
+
+    // upfold the polarizability corrections to THC auxiliary basis
+    // TODO we only need B for q in ibz. No need to compute for all q.
+    auto sB_qIPab = (mf->nqpts_ibz()==mf->nqpts())?
+                    proj.calc_bosonic_projector(thc) :
+                    proj.calc_bosonic_projector_symm(thc);
+
+    long nts = _ft->nt_b();
+    long nts_half = (nts%2==0)? nts/2 : nts/2+1;
+    auto nqpts = sB_qIPab.shape()[0];
+    auto nImpOrbs = sB_qIPab.shape()[3];
+    auto NP = sB_qIPab.shape()[2];
+    auto nqpts_ibz = mf->nqpts_ibz();
+    auto dPi_tqPQ = make_distributed_array<local_Array_4D_t>(mpi->comm, pgrid, {nts_half, nqpts_ibz, NP, NP}, bsize);
+
+    auto [nt_loc, nq_loc, NP_loc, NQ_loc] = dPi_tqPQ.local_shape();
+    auto P_rng = dPi_tqPQ.local_range(2);
+    auto Q_rng = dPi_tqPQ.local_range(3);
+    auto [t_origin, q_origin, P_origin, Q_origin] = dPi_tqPQ.origin();
+
+    // Pi[t,q,P,Q] = B[q,0,P,ab] * Pi_imp[t,ab,cd] * conj(B[q,0,Q,cd])
+    //             = B[q,0,P,ab] * X[t,q,ab,Q]
+    auto Pi_imp = nda::reshape(Pi_loc_tabcd, shape_t<3>{nts_half, nImpOrbs*nImpOrbs, nImpOrbs*nImpOrbs});
+    auto Pi_loc = dPi_tqPQ.local();
+    auto B_loc = nda::reshape(sB_qIPab.local(), shape_t<3>{nqpts, NP, nImpOrbs*nImpOrbs});
+    nda::matrix<ComplexType> B_cd_Q_conj(nImpOrbs*nImpOrbs, NQ_loc);
+    nda::matrix<ComplexType> X(nImpOrbs*nImpOrbs, NQ_loc);
+    mpi->comm.barrier();
+    for (size_t itq = 0; itq < nt_loc*nq_loc; ++itq) {
+      size_t it = itq / nq_loc;
+      size_t iq = itq % nq_loc;
+
+      // X[t,q,ab,Q] = Pi_imp[t,ab,cd] * conj(B[q,0,Q,cd])
+      B_cd_Q_conj = nda::transpose(nda::conj(B_loc(iq+q_origin,Q_rng,all)));
+      nda::blas::gemm(ComplexType(1.0),Pi_imp(it+t_origin,nda::ellipsis{}), B_cd_Q_conj, ComplexType(0.0), X);
+
+      // Pi[t,q,P,Q] = B[q,0,P,ab] * X[t,q,ab,Q]
+      nda::blas::gemm(B_loc(iq+q_origin,P_rng,all), X, Pi_loc(it,iq,nda::ellipsis{}));
+    }
+
+    return dPi_tqPQ;
+  }
+
+} // solvers
+} // methods
+
+#endif //COQUI_EDMFT_PI_ICC

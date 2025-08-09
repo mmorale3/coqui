@@ -1,0 +1,55 @@
+#include "mpi3/communicator.hpp"
+#include "nda/nda.hpp"
+#include "nda/blas.hpp"
+#include "numerics/shared_array/nda.hpp"
+#include "numerics/nda_functions.hpp"
+
+#include "utilities/proc_grid_partition.hpp"
+#include "IO/app_loggers.h"
+#include "utilities/Timer.hpp"
+
+#include "mean_field/MF.hpp"
+#include "methods/ERI/detail/concepts.hpp"
+
+
+namespace methods {
+  namespace solvers {
+
+    template<nda::MemoryArray Array_3D_t>
+    ComplexType gw_t::chol_rpa_energy_impl(const sArray_t<Array_3D_t> &sP0_wPQ)
+    {
+      size_t nw_half = sP0_wPQ.local().shape(0);
+      size_t Np = sP0_wPQ.local().shape(1);
+      _Timer.start("ALLOC");
+      auto I = nda::eye<ComplexType>(Np);
+      nda::matrix<ComplexType> A(Np, Np);
+
+      nda::array<ComplexType, 1> e_rpa(1);
+      nda::array<ComplexType, 2> e_rpa_w(_ft->nw_b(), 1);
+      nda::array<ComplexType, 2> e_rpa_t(_ft->nt_b(), 1);
+      _Timer.start("ALLOC");
+
+      int rank = sP0_wPQ.communicator()->rank();
+      int comm_size = sP0_wPQ.communicator()->size();
+      for (size_t n = rank; n < nw_half; n += comm_size) {
+        size_t wn = _ft->nw_b()/2 + n;
+        size_t mwn = _ft->nw_b()/2 - n;
+        auto P0w_PQ = sP0_wPQ.local()(n, nda::ellipsis{});
+        e_rpa_w(wn, 0) = nda::sum(nda::diagonal(P0w_PQ));
+        if (mwn != wn) e_rpa_w(mwn, 0) = nda::sum(nda::diagonal(P0w_PQ));
+
+        // A = [I - P0w_PQ]
+        A = I - P0w_PQ;
+        ComplexType det_A = nda::determinant(A);
+        e_rpa_w(wn, 0) += std::log(det_A.real());
+        if (mwn != wn) e_rpa_w(mwn, 0) += std::log(det_A.real());
+        //app_log(2, "At iw = {}, det_B = {}.", wn, det_A);
+      }
+      sP0_wPQ.communicator()->all_reduce_in_place_n(e_rpa_w.data(), e_rpa_w.size(), std::plus<>{});
+      _ft->w_to_tau(e_rpa_w, e_rpa_t, imag_axes_ft::boson);
+      _ft->tau_to_beta(e_rpa_t, e_rpa);
+      return e_rpa(0);
+    }
+
+  } // solvers
+} // methods

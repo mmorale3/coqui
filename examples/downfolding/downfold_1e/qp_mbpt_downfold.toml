@@ -1,0 +1,58 @@
+[mean_field.qe]
+name     = "mf_qe"
+prefix   = "pwscf"
+outdir   = "qe_output_dir/OUT/"
+filetype = "h5"
+
+[interaction.thc]
+name        = "eri"
+mean_field  = "mf_qe"
+storage     = "incore"
+thresh      = 1e-6
+chol_block_size = 8
+distr_tol   = 0.4
+
+[downfold_2e]                            # cRPA@DFT
+input_type    = "mf"                     # input G^k_ij(tau) type: "mf" or "coqui".
+                                         # if "mf": create/overwirte a new/existing coqui h5 and take G^k_ij(tau) from the input MF
+                                         # if "coqui": read G^k_ij(tau) from the existing "outdir/prefix.mbpt.h5"
+interaction   = "eri"                    # tag for the input [interaction] instance
+wannier_file  = "wan.h5"                 # input h5 which defines the targeted correlated subspace
+outdir        = "./"                     # directory for the output/input coqui h5 archive
+prefix        = "qp_mbpt_downfold"       # prefix for the input/output coqui h5 archive
+screen_type   = "crpa"                   # method for the screening effects: "crpa" or "edmft"
+beta          = 2000
+lambda        = 1200.0
+iaft_prec     = "high"
+
+# general optional parameters
+force_real    = true                     # enforce U_abcd(tau) to be real or not
+permut_symm   = true                     # enforce permutation symmetry to U_abcd(tau) or not
+div_treatment = "gygi"                   # divergence treatment for the q-summation in U_abcd(tau)
+
+[gw]                                     # G0W0@DFT
+restart   = true                         # "restart = true" is necessay to instruct CoQui to continue
+                                         # working on the same h5 archive.
+                                         # In addition, there is no need to specify "beta", "lambda", and "iaft_prec"
+                                         # since coqui would read them from qp_mbpt_downfold.mbpt.h5.
+interaction = "eri"
+niter     = 1                            # perform only one iteration
+output    = "qp_mbpt_downfold"
+div_treatment = "gygi"
+
+[downfold_1e]                            # effective one-body Hamiltonian based on G0W0@DFT and cRPA@DFT
+mean_field    = "mf_qe"                  # tag for the input [mean_field] instance
+outdir        = "./"                     # directory for the output/input coqui h5 archive
+prefix        = "qp_mbpt_downfold"       # prefix for the input/output coqui h5 archive
+wannier_file  = "wan.h5"                 # input h5 which defines the targeted correlated subspace
+dc_type       = "gw"                     # double counting formula.
+                                         # Available options are "hartree", "hf", "gw", "gw_dynamic_u"
+# optional variable
+qp_selfenergy = true                     # quasiparticle embedding scheme or not. default = false
+force_real    = true                     # enforce the downfolded Hamiltonian to be real or not
+# qp qpprox. parameters (all optional)
+ac_alg        = "pade"                   # analytical continuation algorithm. default = "pade"
+eta           = 1e-6                     # infinitesimal shift above the real axis
+Nfit          = 30                       # Number of poles to fit
+off_diag_mode = "qp_energy"              # QP schemes for off-diagonal self-energy: "qp_energy" or "fermi".
+                                         # default: "qp_energy"

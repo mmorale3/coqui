@@ -1,0 +1,1945 @@
+#include <tuple>
+#include <cmath>
+#include <iomanip>
+#include <algorithm>
+#include <limits>
+#include <random>
+
+#include "configuration.hpp"
+#include "utilities/check.hpp"
+#include "utilities/freemem.h"
+#include "arch/arch.h"
+//#include "hamiltonian/potentials.hpp"
+
+#include "mpi3/communicator.hpp"
+
+#include "nda/nda.hpp"
+#include "h5/h5.hpp"
+#include "nda/h5.hpp"
+#include "nda/blas.hpp"
+#include "nda/tensor.hpp"
+#include "nda/linalg/det_and_inverse.hpp"
+#include "itertools/itertools.hpp"
+#include "numerics/fft/nda.hpp"
+#include "grids/r_grids.hpp"
+#include "numerics/distributed_array/nda.hpp"
+#include "numerics/distributed_array/h5.hpp"
+#include "utilities/proc_grid_partition.hpp"
+#include "utilities/functions.hpp"
+#include "utilities/kpoint_utils.hpp"
+#include "numerics/nda_functions.hpp"
+#include "mean_field/properties.hpp"
+#include "mean_field/distributed_orbital_readers.hpp"
+#include "grids/g_grids.hpp"
+#include "numerics/shared_array/nda.hpp"
+
+// include auxiliary routines
+#include "methods/ERI/thc_aux.icc"
+
+namespace methods
+{
+
+template<MEMORY_SPACE MEM, bool Ipts_only, bool return_Ruv>
+auto thc::chol_metric_impl_ibz(int iq, int nIpts, nda::range a_range, nda::range b_range, int block_size)
+{
+  if constexpr (Ipts_only) {
+    Timer.start("IntPts");
+  } else {
+    Timer.start("IntVecs");
+  }
+  using local_IArray_t = memory::array<MEM,long,1>;
+  using local_CArray_t = memory::array<MEM,ComplexType,2>;
+  decltype(nda::range::all) all;
+  utils::check(thresh > 0.0 or nIpts>0,"Error in thc::chol_metric_impl_ibz: thresh and nIpts both zero.");
+  utils::check(thresh == 0.0 or thresh > 1e-14,
+               "Error in thc::chol_metric_impl_ibz: Invalid threshold:{}. Must be either 0.0 or larger than 1e-14.", thresh);
+  utils::check(mf->npol_in_basis() == 1, "Error in chol_metric_impl_ibz: npol>1 not yet implemented.");
+
+  // storage space, to be adjusted synamically later on
+  int nmax = (nIpts > 0 ? nIpts : 6*int(sqrt(a_range.size()*b_range.size()))); 
+  long nspins = mf->nspin_in_basis();
+  long nkpts = mf->nkpts();
+  long nkpts_ibz = mf->nkpts_ibz();
+  auto Q  = mf->Qpts()(iq,all);
+  bool gamma = (Q(0)*Q(0)+Q(1)*Q(1)+Q(2)*Q(2) < 1e-8);
+  bool single_psi = gamma and (a_range==b_range); 
+  auto symm_list = mf->symm_list();
+  auto kp_to_ibz = mf->kp_to_ibz();  
+  auto kp_symm = mf->kp_symm();  
+  auto trev_pair = mf->kp_trev_pair();  
+  long ntrev_pairs = mf->nkpts_trev_pairs();
+  ComplexType Znorm = ComplexType(1.0)/std::sqrt(std::sqrt(RealType(a_range.size()*b_range.size()*nspins*nkpts)));
+
+  // setting up pointer to appropriate communicator here, to simplify code below 
+  auto& local_comm = utils::get_dev_comm<MEM>(*mpi);
+/*
+#if defined(ENABLE_NCCL)
+  using local_comm_t = std::conditional_t< MEM==HOST_MEMORY, mpi3::communicator, mpi3::nccl::communicator>; 
+  local_comm_t* local_comm = nullptr; 
+  if constexpr (MEM==HOST_MEMORY)
+    local_comm = std::addressof(mpi->comm);
+  else
+    local_comm = std::addressof(mpi->dev_comm);
+#else
+  mpi3::communicator* local_comm = std::addressof(mpi->comm); 
+#endif
+*/
+
+  // processor grid for accumulating collation matrix. Redistribution to requested grid at the end
+  long nkpool = utils::find_proc_grid_max_npools(mpi->comm.size(),nkpts,distr_tol);
+  long nproc_per_pool = mpi->comm.size() / nkpool;
+  utils::check(nkpool*nproc_per_pool == mpi->comm.size(), "Error in chol_metric_impl_ibz: Problems with processor partitioning ");
+  utils::check(nproc_per_pool <= a_range.size(), "Error in chol_metric_impl_ibz: Too many processors. Decrease # of processors or increase distr_tol. ");
+
+  utils::check(single_psi, "Error: chol_metric_impl_ibz not yet implemented with Q!=0 and/or different ranges");
+
+  // FBZ-IBZ relations, kpoint symmetry maps  
+  // Only account for space symmetries, k-points that need trev are ignored at this step!
+  auto [ksymms,k_to_s,ns_per_kibz,Ks,Skibz] = utils::generate_kp_maps(nkpts-ntrev_pairs,nkpts_ibz,
+                                              kp_symm,kp_to_ibz);
+  int nsym = ksymms.size();
+  utils::check( ksymms[0] == 0, "Error: ksymms[0] != 0, ksymms[0]:{}", ksymms[0]);
+
+  long max_ns_per_kibz = *std::max_element(ns_per_kibz.begin(),ns_per_kibz.end());
+
+  // fft grid symmetry maps: Careful here since find_inverse_symmetry ignores identity operation by default
+  // on exit, slist.size() == ksymms.size()-1, since ksymms[0] == 0
+  auto slist = utils::find_inverse_symmetry(ksymms,symm_list);
+  utils::check( slist.size() ==  ksymms.size()-1, "Error: slist.size() ({}) !=  ksymms.size()-1 ({})",
+                slist.size(), ksymms.size()-1); 
+
+  // partition r-grid into sectors that contain symmetry equivalent points
+  auto ir_r_set = utils::partition_irreducible_r_grid(mpi->comm,rho_g.mesh(),symm_list,slist);
+  utils::check(ir_r_set.size() == mpi->comm.size(), "Error: partition_irreducible_r_grid return error.");
+  auto& ir_rgrid = ir_r_set[mpi->comm.rank()];
+  // copy to device space if needed
+  {
+    long min_=ir_r_set[0].size(),max_=min_,sum_=0.0;
+    for( auto& v : ir_r_set ) {
+      long sz = v.size();
+      min_=std::min(sz,min_); 
+      max_=std::max(sz,max_);
+      sum_+=sz; 
+    }
+    app_log(2,"  - FFT grid partitioning stats: min:{}, max:{}, mean:{}",
+              min_,max_,sum_/double(mpi->comm.size()));
+    utils::check( sum_ == rho_g.nnr(), 
+                  "Error: Problems with partition_irreducible_r_grid, sum ({}) != nnr ({})",
+                  sum_,rho_g.nnr() );
+  }
+
+  // need to keep copy in host for use in loops
+  nda::array<long,2> Sr_to_r_h(nsym-1, ir_rgrid.size()); 
+  {
+    for( auto i: nda::range(nsym-1) ) { 
+      Sr_to_r_h(i,all) = ir_rgrid();
+      // fft index of rotated point
+      utils::transform_r(symm_list[slist(i)],nda::array<long,1>::zeros({3}),
+                         rho_g.mesh(),Sr_to_r_h(i,all));
+      // position of rotated index in ir_rgrid
+      for( auto& v : Sr_to_r_h(i, all) ) {
+        auto it = std::lower_bound(ir_rgrid.begin(),ir_rgrid.end(),v);
+        utils::check(it != ir_rgrid.end(),"Error: Problems with IR partition.");
+        utils::check(v == *it,"Error: Problems with IR partition.");
+        v = std::distance(ir_rgrid.begin(),it);
+      }
+    }
+  }
+  auto Sr_to_r = memory::to_memory_space<MEM>(Sr_to_r_h());
+  
+
+  Timer.start("DistOrbs");
+  long r0 = std::accumulate(ir_r_set.begin(), ir_r_set.begin()+mpi->comm.rank(), long(0), 
+          [&] (auto const& a, auto const& b) { return a + b.size(); });
+  auto distPsia = memory::darray_t<local_CArray_t,mpi3::communicator>(std::addressof(mpi->comm),{1,mpi->comm.size()},
+       {nspins*nkpts_ibz*a_range.size(),rho_g.nnr()},{nspins*nkpts_ibz*a_range.size(),ir_rgrid.size()},
+       {0,r0},{1,1});  
+
+  if( not mf->has_wfc_grid() or mf->fft_grid_dim() == rho_g.mesh() )
+  {  
+    auto dPsia = mf::read_distributed_orbital_set<local_CArray_t>(*mf,mpi->comm,'r',{mpi->comm.size(),1},
+				       nda::range(0,nspins),nda::range(0,nkpts_ibz),a_range,{1,1}); 
+    auto dPloc = dPsia.local();
+    nda::tensor::scale(Znorm, dPloc);
+    local_CArray_t T = dPloc;
+    long ir = 0;
+    for( auto& v : ir_r_set )
+      for( auto i : v )
+        dPloc(all,ir++) = T(all,i); 
+    math::nda::redistribute(dPsia,distPsia);  
+  } else {
+    auto wfc_to_rho = swfc_to_rho.local();
+    auto dPsia = mf::read_distributed_orbital_set<local_CArray_t>(*mf,mpi->comm,'w',{mpi->comm.size(),1},
+                                     nda::range(0,nspins),nda::range(0,nkpts_ibz),a_range,{1,1});
+    auto dPsir = memory::darray_t<local_CArray_t,boost::mpi3::communicator>(
+             std::addressof(mpi->comm),{mpi->comm.size(),1},{dPsia.global_shape()[0],rho_g.nnr()},{dPsia.local_shape()[0],rho_g.nnr()},
+             dPsia.origin(),{1,1});
+    auto psir = dPsir.local();
+    auto P4d = nda::reshape(psir,
+          std::array<long,4>{psir.extent(0),rho_g.mesh(0),rho_g.mesh(1),rho_g.mesh(2)});
+    math::nda::fft<true> F(P4d,math::fft::FFT_MEASURE);
+    psir() = ComplexType(0.0);
+    if constexpr (MEM==HOST_MEMORY) {
+      nda::copy_select(true,1,wfc_to_rho,ComplexType(1.0),dPsia.local(),ComplexType(0.0),psir);
+    } else { 
+      auto wfc_to_rho_dev = memory::to_memory_space<MEM>(wfc_to_rho);
+      nda::copy_select(true,1,wfc_to_rho_dev,ComplexType(1.0),dPsia.local(),ComplexType(0.0),psir);
+    }
+    F.backward(P4d);
+    nda::tensor::scale(Znorm, psir);
+    local_CArray_t T = psir;
+    long ir = 0;
+    for( auto& v : ir_r_set )
+      for( auto i : v )
+        psir(all,ir++) = T(all,i);
+    math::nda::redistribute(dPsir,distPsia);
+  }
+  Timer.stop("DistOrbs");
+
+  // when thresh = 0.0, set block_size to 1 until a more robust algorithm is found.
+  if(thresh == 0.0 and block_size>1) {
+    block_size=1;
+    if(mpi->comm.root()) app_warning(" Setting block_size to 1 in thc::chol_metric_impl_ibz, since algorithm with block_size>1 is not robust enough when thresh = 0.0. "); 
+  } 
+
+  nda::range r_range = distPsia.local_range(1);
+  // list of selected interpolating vectors 
+  auto rn = nda::array<long,1>::zeros({nmax});
+  // iteratively constructed cholesky vectors
+  auto R = local_CArray_t::zeros({nmax,r_range.size()});
+  utils::check( block_size <= r_range.size(), "Error: block_size:{} > r_range:{}",block_size,r_range.size());
+  
+  // 4D views into local sector of Psi
+  auto Psia = nda::reshape(distPsia.local(),shape_t<4>{nspins,nkpts_ibz,a_range.size(),r_range.size()});
+
+  /*********************************************
+                 Diagonal/Residual 
+  *********************************************/
+
+  // list of largest block_size residuals and (local) indexes
+  nda::array<RealType,1> lmax_res_val(block_size,0.0);
+  // linear indexes of the locations of the maximum residuals (not in order)
+  nda::array<long, 1> lmax_res_indx(block_size,0);
+  nda::array<std::pair<RealType,int>,1> gmax_res(block_size);
+
+  memory::array<MEM,ComplexType,1> Diag(r_range.size(),0.0);
+  if constexpr (MEM==HOST_MEMORY) {
+    memory::array<MEM,ComplexType,1> Tr(r_range.size(),0.0);
+    for( auto ispin : itertools::range(nspins) ) {
+      for( auto k : itertools::range(nkpts_ibz) ) {
+        RealType scl = ( trev_pair(k) >= 0 ? 2.0 : 1.0 );
+        for( auto r : itertools::range(r_range.size()) ) { 
+          auto Lrr = nda::blas::dotc(Psia(ispin,k,all,r),Psia(ispin,k,all,r));
+          Tr(r) = std::conj(Lrr) * Lrr; 
+          Diag(r) += scl*Tr(r); // from k in IBZ 
+        }
+        for( auto [is, ik] : itertools::zip(Skibz(k,nda::range(ns_per_kibz(k)-1)),
+                                            Ks(k,nda::range(ns_per_kibz(k)-1))) ) { 
+          scl = ( trev_pair(ik) >= 0 ? 2.0 : 1.0 );
+          for( auto r : itertools::range(r_range.size()) ) 
+            Diag(r) += scl*Tr(Sr_to_r(is,r)); 
+        }
+      }
+    }
+  } else {
+    // is it worth using all this memory to speed up the contraction???
+    // consider batching over kpoints
+    memory::device_array<ComplexType,3> Lr(nspins,nkpts_ibz,r_range.size());
+    nda::tensor::contract(nda::conj(Psia),"skar",Psia,"skar",Lr,"skr");
+    // L(r) = conj(Lr) * Lr
+    nda::tensor::elementwise(ComplexType(1.0),nda::conj(Lr),"skr",
+                             ComplexType(1.0),Lr,"skr",nda::tensor::op::MUL);
+    for( auto ispin : itertools::range(nspins) ) {
+      for( auto k : itertools::range(nkpts_ibz) ) {
+        ComplexType scl = ( trev_pair(k) >= 0 ? ComplexType(2.0) : ComplexType(1.0) );
+        // Diag() += scl * Lr(is,k,all)
+        nda::tensor::add(scl,Lr(ispin,k,all),"r",ComplexType(1.0),Diag,"r");
+        for( auto [is, ik] : itertools::zip(Skibz(k,nda::range(ns_per_kibz(k)-1)),
+                                            Ks(k,nda::range(ns_per_kibz(k)-1))) ) {
+          scl = ( trev_pair(ik) >= 0 ? ComplexType(2.0) : ComplexType(1.0) );
+          // Diag(r) = Diag(r) + scl * Lr(Sr_to_r(r))
+          nda::copy_select(false,Sr_to_r(is,all),scl,Lr(ispin,k,all),ComplexType(1.0),Diag);
+        }
+      }
+    }
+  }
+  // find index and value of maximum element  
+  utils::max_element_multi(Diag,lmax_res_val(nda::range(0,block_size)),
+                           lmax_res_indx(nda::range(0,block_size)));
+  Timer.start("COMM");
+  utils::find_distributed_maximum(mpi->comm,lmax_res_val(nda::range(0,block_size)),gmax_res);
+  Timer.stop("COMM");
+
+  /**************************************************************************/
+  /*  Store */ 
+  /**************************************************************************/
+  // accumulation ranges for Pska
+  nda::range k_subrange(1), a_subrange(1);
+  long arng_bsize = 1;//std::min( default_block_size, a_range.size()/nproc_per_pool);
+  {
+    auto [a,b] = itertools::chunk_range(0,a_range.size()/arng_bsize,
+                 nproc_per_pool,mpi->comm.rank()%nproc_per_pool);
+    a *= arng_bsize;
+    if(mpi->comm.rank()%nproc_per_pool == nproc_per_pool-1)
+      b = a_range.size(); 
+    else
+      b *= arng_bsize; 
+    a_subrange = nda::range(a,b);
+    std::tie(a,b) = itertools::chunk_range(0,nkpts,nkpool,mpi->comm.rank()/nproc_per_pool);
+    k_subrange = nda::range(a,b);
+  }
+  std::vector<memory::array<MEM,ComplexType,3>> Pskau;
+
+  // for every kpoint in the Full BZ, get its location in Ks (+1 to restore identity operation)  
+  nda::array<int,1> loc_in_Ks(nkpts, -1);
+  for( auto k : itertools::range(nkpts_ibz) ) {
+    loc_in_Ks(k) = 0; // IBZ always at zero, corresponding to identity operation
+    if( trev_pair(k) >= 0 ) 
+      loc_in_Ks(trev_pair(k)) = 0;
+    for( auto [is, ik] : itertools::enumerate(Ks(k,nda::range(ns_per_kibz(k)-1))) ) { 
+      loc_in_Ks(ik) = is+1;
+      if( trev_pair(ik) >= 0 ) 
+        loc_in_Ks(trev_pair(ik)) = is+1;
+    }
+  }
+
+  /**************************************************************************/
+  /* iterative construction of cholesky matrix  */
+  /**************************************************************************/
+
+  memory::array<MEM,ComplexType,1> comm_buff(block_size*(nmax +
+                max_ns_per_kibz*nspins*nkpts_ibz*a_range.size()));
+
+  memory::array<MEM,ComplexType,4> Lr(nspins,nkpts_ibz,block_size*max_ns_per_kibz,r_range.size());
+  auto Tab = memory::array<MEM,ComplexType,2>::zeros({block_size,r_range.size()});
+  nda::array<long,1> ur(block_size,-1);  // global index of chosen grid point
+  nda::array<int,1> piv(block_size+1,0);
+  memory::unified_array<ComplexType,2> Abb(block_size,block_size);
+
+  Timer.start("IpIter");
+  // a bit nicer this way...
+  auto find_max = [&]() {
+    return (*std::max_element(gmax_res.begin(),gmax_res.end(), [](auto& a, auto& b) {
+                return a.first < b.first;
+        })).first;
+  };
+
+  long nchol (0);
+  auto old_max = find_max();
+  app_log(3," nchol, max |D|: ");
+  while(true) { 
+
+    utils::check( old_max > 1e-14, " Error in thc::chol_metric_impl_ibz: Reached truncation error of 1e-14 without convergence. This likely means that nIpts is too large. Current number of cholesky vectors = {}. Set nIpts to a value equal or larger than this. ",nchol);
+
+    // stopping condition when thresh is set
+    if( thresh > 0.0 and thresh > old_max) break;
+
+    utils::check( std::isfinite(old_max), 
+          std::string("Error: Cholesky algorithm failed in thc::chol_metric_impl_ibz. \n") + 
+          std::string("       Found invalid residual:{}"),old_max); 
+
+    auto Paki = memory::array_view<MEM,ComplexType,3>({nspins*nkpts_ibz*a_range.size(),
+                                                       block_size,max_ns_per_kibz},comm_buff.data());
+    auto Rc = memory::array_view<MEM,ComplexType,2>({nmax,block_size},Paki.data()+Paki.size()); 
+    auto Paki4d = memory::array_view<MEM,ComplexType,4>({nspins,nkpts_ibz,a_range.size(),
+                                                         block_size*max_ns_per_kibz},Paki.data());
+    auto Paki5d = memory::array_view<MEM,ComplexType,5>({nspins,nkpts_ibz,a_range.size(),
+                                                         block_size,max_ns_per_kibz},Paki.data());
+
+    Timer.start("ip_setup_comm");
+    comm_buff() = ComplexType(0.0);
+    ur() = 0;
+    for(int n=0; n<block_size; ++n) {
+      if( gmax_res(n).second/block_size == mpi->comm.rank()) {
+        // rank with the maximum value
+        long lr = lmax_res_indx(gmax_res(n).second%block_size);
+        ur(n) = ir_rgrid(lr);
+        // conj(Psia(:,ru))
+        if constexpr (MEM==HOST_MEMORY) {
+          for( auto ispin : itertools::range(nspins) ) 
+            for( auto k : itertools::range(nkpts_ibz) ) { 
+              Paki5d(ispin,k,all,n,0) = nda::conj(Psia(ispin,k,all,lr)); 
+              for( auto [i,is] : itertools::enumerate(Skibz(k,nda::range(ns_per_kibz(k)-1))) ) 
+                Paki5d(ispin,k,all,n,i+1) = nda::conj(Psia(ispin,k,all,Sr_to_r(is,lr))); 
+            }
+        } else {
+          nda::tensor::set_device_synchronization(false);
+          nda::tensor::assign(nda::conj(Psia(all,all,all,lr)),Paki5d(all,all,all,n,0));
+          for( auto k : itertools::range(nkpts_ibz) )  
+            for( auto [i,is] : itertools::enumerate(Skibz(k,nda::range(ns_per_kibz(k)-1))) ) 
+              nda::tensor::assign(nda::conj(Psia(all,k,all,Sr_to_r_h(is,lr))),Paki5d(all,k,all,n,i+1));
+          arch::synchronize();
+          nda::tensor::set_device_synchronization(true);
+        }
+        if(nchol > 0) Rc(nda::range(0,nchol),n) = R(nda::range(0,nchol),lr);
+      }
+    }
+    Timer.stop("ip_setup_comm");
+    Timer.start("ip_COMM");
+    if(mpi->comm.size()>1) mpi->comm.all_reduce_in_place_n(ur.data(), block_size, std::plus<>{}); 
+    if(mpi->comm.size()>1) 
+      local_comm.all_reduce_in_place_n(reinterpret_cast<RealType*>(comm_buff.data()), 
+                2*block_size*(max_ns_per_kibz*nspins*nkpts_ibz*a_range.size()+nchol),std::plus<>{}); 
+    arch::synchronize();
+    Timer.stop("ip_COMM");
+
+    // contruct new cholesky vector L(p,ik,ia,ib)
+    // R(n, r) = ZtZ(r,u(n)) - sum_{1,n-1} R(p,r) * std::conj(R(p,u(n)))
+    // ZtZ(r,u(n)) = sum_is_k conj([ sum_i conj(Psia(is,k,i,r)) * Psia(is,k,i,u(n)) ]) *
+    // 			      [ sum_i conj(Psia(is,k,i,r)) * Psia(is,k,i,u(n)) ] 
+    Timer.start("ip_chol");
+    Tab() = ComplexType(0.0);
+    if constexpr (MEM==HOST_MEMORY) {
+      // MAM: could dispatch with batched gemm, but nda implementation is not ideal, 
+      //      e.g. how to transpose the A/B matrices meaningfully?
+      Timer.start("ip_chol_gemm");
+      for( auto is : itertools::range(nspins) ) {
+        for( auto k : itertools::range(nkpts_ibz) ) {
+          nda::blas::gemm(nda::transpose(Paki4d(is,k,all,all)),
+                          Psia(is,k,all,all),Lr(is,k,all,all));
+        }
+      }
+      Timer.stop("ip_chol_gemm");
+      Timer.start("ip_chol_hadd");
+      auto L5D = nda::reshape(Lr,shape_t<5>{nspins,nkpts_ibz,block_size,max_ns_per_kibz,r_range.size()});
+      {
+        for( auto ispin : itertools::range(nspins) )
+          for( auto ik : itertools::range(nkpts_ibz) ) { 
+            {
+              RealType scl = ( trev_pair(ik)>=0 ? 2.0 : 1.0 );
+              auto L_ = L5D(ispin,ik,all,0,all);
+              Tab += scl*nda::conj(L_)*L_;
+            }
+            for( auto ib : itertools::range(block_size) ) 
+              for( auto [i,is] : itertools::enumerate(Skibz(ik,nda::range(ns_per_kibz(ik)-1))) ) {
+                RealType scl = ( trev_pair(Ks(ik,i))>=0 ? 2.0 : 1.0 );
+                auto Ls = L5D(ispin,ik,ib,i+1,all); 
+                for( auto [r,sr] : itertools::enumerate(Sr_to_r(is,all)) ) {
+                  auto L_ = Ls(sr); 
+                  Tab(ib,r) += scl*std::conj(L_)*L_; 
+                }
+              }
+          }
+      }
+      Timer.stop("ip_chol_hadd");
+    } else {
+      Timer.start("ip_chol_gemm");
+      nda::tensor::contract(Paki4d,"skau",Psia,"skar",Lr,"skur");
+      { // L(r) = conj(Lr) * Lr
+        auto L1D = nda::reshape(Lr,shape_t<1>{Lr.size()});
+        nda::tensor::elementwise(ComplexType(1.0),nda::conj(L1D),"r",
+                                 ComplexType(1.0),L1D,"r",nda::tensor::op::MUL);
+      }
+      Timer.stop("ip_chol_gemm");
+      Timer.start("ip_chol_hadd");
+      auto L5D = nda::reshape(Lr,shape_t<5>{nspins,nkpts_ibz,block_size,max_ns_per_kibz,r_range.size()});
+      {
+        for( auto ik : itertools::range(nkpts_ibz) ) {
+          ComplexType scl = ( trev_pair(ik)>=0 ? ComplexType(2.0) : ComplexType(1.0) );
+          for( auto ispin : itertools::range(nspins) )
+            nda::tensor::add(scl,L5D(ispin,ik,all,0,all),ComplexType(1.0),Tab);
+          for( auto [i,is] : itertools::enumerate(Skibz(ik,nda::range(ns_per_kibz(ik)-1))) ) {
+            scl = ( trev_pair(Ks(ik,i))>=0 ? ComplexType(2.0) : ComplexType(1.0) );
+            for( auto ispin : itertools::range(nspins) ) 
+              nda::copy_select(false,1,Sr_to_r(is,all),scl,L5D(ispin,ik,all,i+1,all),ComplexType(1.0),Tab);
+          }
+        }
+      }
+      Timer.stop("ip_chol_hadd");
+    }
+
+    // orthonormalize cholesky vector
+    if(nchol > 0) {
+      nda::blas::gemm(ComplexType(-1.0),nda::dagger(Rc(nda::range(0,nchol),all)),
+                      R(nda::range(0,nchol),all),ComplexType(1.0),Tab);
+    }
+
+    // form block matrix
+    Abb() = ComplexType(0.0);
+    for(int n=0; n<block_size; ++n) {
+      if(mpi->comm.rank() == gmax_res(n).second/block_size) {
+        auto ip = lmax_res_indx(gmax_res(n).second%block_size);
+        Abb(n,all) = Tab(all,ip);  
+      }
+    }
+    Timer.stop("ip_chol");
+    Timer.start("ip_COMM");
+#if defined(ENABLE_NCCL)
+    if(mpi->dev_comm.count()>1 and not (MEM==HOST_MEMORY)) 
+      mpi->dev_comm.all_reduce_in_place_n(reinterpret_cast<RealType*>(Abb.data()),2*block_size*block_size,std::plus<>{});
+    else
+#endif
+    if(mpi->comm.size()>1) mpi->comm.reduce_in_place_n(Abb.data(),block_size*block_size,std::plus<>{});
+    arch::synchronize();
+    Timer.stop("ip_COMM");
+    Timer.start("ip_SERIAL");
+    if(mpi->comm.rank() == 0) {
+      // pivots are guaranteed to be in ascending order!
+      // MAM: inverse_in_place requires nda::matrix
+      using W_type = nda::matrix<ComplexType,nda::C_layout>;
+      auto W = utils::chol<false,W_type>(Abb,piv,thresh);
+      W() = nda::conj(W());  // need to conjugate before inverting, since W is C_ordered
+      if( nIpts > 0 and piv(block_size) > nIpts-int(nchol) ) {
+        // in the last iteration, reorder states
+        int nv = nIpts-int(nchol);
+        nda::array<int,1> piv_(nv);
+        int cnt=0;  // number of states found so far...
+        for( int i=0; i<piv(block_size); ++i ) { // slow but simple
+          // count number of terms beyond i that are larger than W(i,i), keep if
+          int nabove = 0;
+          RealType Wii = std::real(W(i,i)*std::conj(W(i,i)));
+          for( int j=i+1; j<piv(block_size); ++j )
+            if( std::real(W(j,j)*std::conj(W(j,j))) > Wii ) ++nabove;
+          if( nabove < nv-cnt ) piv_(cnt++) = i;
+          if(cnt==nv) break; // found all needed
+        }
+        utils::check(cnt==nv, " Error in thc::chol_metric_impl Oh Oh...");
+        // piv(i) is monotonically increasing, so this is ok
+        piv(block_size) = nv;
+        nda::matrix<ComplexType,nda::C_layout> W_(nv,nv);
+        for(int i=0; i<nv; i++) { 
+          piv(i) = piv(piv_(i));
+          for(int j=0; j<nv; j++)
+            W_(i,j) = W(piv_(i),piv_(j)); 
+        }
+        // nda giving problems with sub-matrix in inverse_in_place
+        for(int v=0; v<nv; ++v)
+          app_log(3,"  {}  {} ",nchol+v,std::real(W_(v,v)*std::conj(W_(v,v))));
+        nda::inverse_in_place(W_);
+        Abb(nda::range(0,nv),nda::range(0,nv)) = W_(all,all);
+      } else {
+        int nc=piv(block_size);
+        for(int v=0; v<nc; ++v)
+          app_log(3,"  {}  {} ",nchol+v,std::real(W(v,v)*std::conj(W(v,v))));
+        nda::inverse_in_place(W);
+        Abb(nda::range(0,nc),nda::range(0,nc)) = W(all,all);
+      }
+    }
+    Timer.stop("ip_SERIAL");
+    Timer.start("ip_COMM");
+    if(mpi->comm.size()>1) {
+      mpi->comm.broadcast_n(piv.data(),block_size+1);
+      local_comm.broadcast_n(reinterpret_cast<RealType*>(Abb.data()),2*block_size*block_size);
+    }
+    arch::synchronize();
+    Timer.stop("ip_COMM");
+    // stopping criteria
+
+    Timer.start("ip_update_res");
+     // number of linearly independent cholesky vectors found
+    int newv = ( nIpts > 0 ? std::min( piv(block_size), nIpts-int(nchol)) :
+                             piv(block_size) );
+    utils::check( newv > 0, "Failed to find cholesky vector.");
+
+    // copy collation matrix (before comm_buff is resized)
+    for(int i=0; i<newv; ++i) {
+      Pskau.emplace_back(memory::array<MEM,ComplexType,3>(nspins,k_subrange.size(),a_subrange.size()));
+      auto& pska = Pskau.back();
+      for( auto ispin : itertools::range(nspins) )
+        for( auto [ik, k] : itertools::enumerate(k_subrange) ) 
+          pska(ispin,ik,all) = Paki5d(ispin,kp_to_ibz(k),a_subrange,piv(i),loc_in_Ks(k));
+    }
+
+    // resize data structures
+    if(nchol+newv > nmax) {
+      int nmax_new = nmax + 2*int(sqrt(a_range.size()*b_range.size()));
+      comm_buff = memory::array<MEM,ComplexType,1>(block_size*(nmax_new +
+                max_ns_per_kibz*nspins*nkpts_ibz*a_range.size()));
+      {
+        auto rn_ = nda::array<long,1>::zeros({nmax_new});
+        rn_(nda::range(nmax)) = rn(); 
+        rn = std::move(rn_);
+      }
+      { 
+        auto R_ = local_CArray_t::zeros({nmax_new,r_range.size()});
+        R_(nda::range(nmax),all) = R();
+        R = std::move(R_);
+      }
+      nmax = nmax_new;
+    }
+
+    auto Rn = R(nda::range(nchol,nchol+newv), all);    // new cholesky vector 
+    for(int i=0; i<newv; i++) {
+      utils::check(piv(i) >= i, "Failed condition: piv(i) >= i");
+      if(i != piv(i))
+        Tab(i,all) = Tab(piv(i),all);
+    }
+    nda::blas::gemm(Abb(nda::range(0,newv),nda::range(0,newv)),
+                    Tab(nda::range(0,newv),all), Rn);
+    
+    // reduce at the end, no need to know this during iterations...
+    for(int n=0; n<newv; ++n)
+      rn(nchol+n) = ur(piv(n));
+
+    // increase counter
+    nchol+=newv;
+
+    // stopping criteria based on nIpts if >0
+    if(nIpts > 0 and nchol>=nIpts) break;
+
+    // update diagonal
+    // Diag(r) -= R(p,r) * std::conj(R(p,r))
+    if constexpr (MEM==HOST_MEMORY) {
+      for( auto v : itertools::range(newv) )
+        for( auto r : itertools::range(r_range.size()) )
+          Diag(r) -= std::conj(Rn(v,r)) * Rn(v,r);
+    } else {
+      nda::tensor::contract(ComplexType(-1.0), nda::conj(Rn), "vr", Rn, "vr", ComplexType(1.0), Diag,"r");
+    }
+    Timer.stop("ip_update_res");
+
+    // find index and value of maximum element  
+    utils::max_element_multi(Diag,lmax_res_val(nda::range(0,block_size)),
+                             lmax_res_indx(nda::range(0,block_size)));
+    Timer.start("ip_COMM");
+    utils::find_distributed_maximum(mpi->comm,lmax_res_val(nda::range(0,block_size)),gmax_res);
+    Timer.stop("ip_COMM");
+
+    auto curr_max = find_max();
+    utils::check( old_max >= curr_max,
+          std::string("Error: Cholesky algorithm failed in thc::chol_metric_impl_ibz. \n") +
+          std::string("       Found non-decreasing residual error: last it:{}, curr it:{}"),old_max,curr_max);
+    utils::check( std::isfinite(curr_max),
+          std::string("Error: Cholesky algorithm failed in thc::chol_metric_impl_ibz. \n") +
+          std::string("       Found invalid residual:{}"),curr_max);
+
+    // stopping condition when thresh is set
+    if( thresh > 0.0 and thresh > curr_max) break;
+    old_max = find_max();
+  }  
+  Timer.stop("IpIter");
+
+  if constexpr (Ipts_only) {
+    Timer.stop("IntPts");
+  } else {
+    Timer.stop("IntVecs");
+  }
+
+  if constexpr (Ipts_only) {
+  app_log(4,"\n***************************************************");
+  app_log(4,"        Interpolating points detailed timers ");
+  app_log(4,"***************************************************");
+  app_log(4,"  Iterpolating points total:         {}",Timer.elapsed("IpIter"));
+  app_log(4,"  Iter total:                        {}",Timer.elapsed("IntPts"));
+  app_log(4,"  Communication:                     {}",Timer.elapsed("ip_COMM"));
+  app_log(4,"  Iter. Setup:                       {}",Timer.elapsed("ip_setup_comm"));
+  app_log(4,"  Cholesky vector gemm:              {}",Timer.elapsed("ip_chol_gemm"));
+  app_log(4,"  Cholesky vector hadamard:          {}",Timer.elapsed("ip_chol_hadd"));
+  app_log(4,"  Cholesky vector build:             {}",Timer.elapsed("ip_chol"));
+  app_log(4,"  Serial solve:                      {}",Timer.elapsed("ip_SERIAL"));
+  app_log(4,"  Residual update:                   {}",Timer.elapsed("ip_update_res"));
+  app_log(4,"***************************************************\n");
+  }
+
+  // interpolating points
+  local_IArray_t ipts = rn(nda::range(nchol));
+
+  // collect collation matrices from distributed data
+  utils::check(Pskau.size() ==  nchol, 
+               "Error in chol_metric_impl: Pskau.size():{} != nchol:{}",Pskau.size(),nchol);
+  // MAM: only store for kpts < nkpts-nkpts_trev_pairs, since you can just conjugate 
+  auto Xskau = _darray_t_<MEM,4>(std::addressof(mpi->comm),{1,nkpool,nproc_per_pool,1},
+       {nspins,nkpts,a_range.size(),nchol},
+       {nspins,k_subrange.size(),a_subrange.size(),nchol},
+       {0,k_subrange.first(),a_subrange.first(),0},{1,1,arng_bsize,1});  
+  // return empty optional for b_range
+  std::optional<_darray_t_<MEM,4>> Xskbu;
+
+  {
+    auto phase = memory::unified_array<ComplexType, 1>::zeros({nchol});
+    auto kpts_c = mf->kpts_crystal(); 
+    auto Xloc = Xskau.local();
+    for( int i=0; i<nchol; ++i ) 
+      Xloc(all,all,all,i) = Pskau[i]; 
+    // remove normalization
+    nda::tensor::scale(ComplexType(1.0)/Znorm, Xloc);
+    for( int is=0; is<nspins; ++is ) {
+      for( auto [ik,k] : itertools::enumerate(k_subrange) ) {
+        utils::rspace_phase_factor(kpts_c(k,all),rho_g.mesh(),ipts,phase);
+        auto X_ = Xloc(is,ik,nda::ellipsis{});
+        if( k < nkpts-ntrev_pairs ) {
+          // X(u) = conj(X(u)) * phase(u)
+          if constexpr (MEM==HOST_MEMORY) { 
+            for( auto [ia,a] : itertools::enumerate(a_subrange) ) 
+              X_(ia,all) = nda::conj(X_(ia,all))*phase(); 
+          } else { 
+            nda::tensor::contract(phase,"i",nda::conj(X_),"bi",X_,"bi");
+          }
+        } else {
+          // X(u) = X(u) * phase(u)
+          if constexpr (MEM==HOST_MEMORY) { 
+            for( auto [ia,a] : itertools::enumerate(a_subrange) ) 
+              X_(ia,all) = X_(ia,all)*phase(); 
+          } else { 
+            nda::tensor::contract(phase,"i",X_,"bi",X_,"bi");
+          }
+        }
+      }
+    } 
+
+    // redistribute into more slate friendly layout
+    if(nproc_per_pool > 1) {
+      // processor grid for slate 
+      long nx = std::max(1l, std::min( nproc_per_pool,
+             a_range.size() / default_block_size) );
+      while( nproc_per_pool%nx != 0 ) --nx;
+      long ny = nproc_per_pool/nx;
+      long bu = std::min( nchol/std::max(nx,ny), default_block_size );
+      math::nda::redistribute_in_place(Xskau,{1,nkpool,nx,ny},
+                                       {1,1,default_block_size,bu}); 
+    }
+  }
+
+  if constexpr (Ipts_only) {
+  
+    return std::make_tuple(std::move(ipts),std::move(Xskau),std::move(Xskbu));
+
+  } else {
+
+    if constexpr ( return_Ruv ) {
+      // returns only Ruv, instead of full Rur
+
+      auto return_value{math::nda::make_distributed_array<local_CArray_t>(mpi->comm,
+                          {1,mpi->comm.size()},{nchol,nchol},{512,512},true)};
+
+      if(mpi->comm.size()==1) {
+
+        auto xloc = return_value.local();
+        for( auto [i,r] : itertools::enumerate(rn(nda::range(nchol))) ) 
+          xloc(all,i) = R(nda::range(nchol),r);  
+
+      } else {
+
+        auto xloc = return_value.local()(nda::range(nchol),all);
+        auto Xt = math::nda::distributed_array_view<local_CArray_t,mpi3::communicator>(std::addressof(mpi->comm),
+		return_value.grid(),return_value.global_shape(),return_value.origin(),{1,1},xloc);
+  
+        auto rloc = R(nda::range(nchol),all);
+        auto Rt = math::nda::make_distributed_array_view<local_CArray_t>(mpi->comm,
+                            {1,mpi->comm.size()},{nchol,rho_g.nnr()},{1,1},rloc);
+        utils::check(Rt.local_range(1) == r_range, "Range error.");
+
+        Timer.start("COMM");
+        // loop over buckets and pass views and buckets...
+        math::nda::distributed_column_select(rn(nda::range(nchol)),Rt,Xt);
+        Timer.stop("COMM");
+      }
+
+      return std::make_tuple(std::move(ipts),std::move(return_value),std::move(Xskau),std::move(Xskbu));
+
+    } else {
+
+      // todo... redistribute from buckets...
+      auto Rt{math::nda::make_distributed_array<local_CArray_t>(mpi->comm,
+                          {1,mpi->comm.size()},{nchol,rho_g.nnr()})};
+      utils::check(Rt.local_range(1) == r_range, "Range error.");
+      Rt.local() = R(nda::range(nchol),all);
+
+      auto return_value{math::nda::make_distributed_array<local_CArray_t>(mpi->comm,
+                          {1,mpi->comm.size()},{nchol,rho_g.nnr()},{512,512})};
+
+      Timer.start("COMM");
+      math::nda::redistribute(Rt,return_value);
+      Timer.stop("COMM");
+
+      return std::make_tuple(std::move(ipts),std::move(return_value),std::move(Xskau),std::move(Xskbu));
+
+    } // constexpr ( return_Ruv ) 
+ 
+  } // constexpr (Ipts_only)
+}
+
+template<MEMORY_SPACE MEM, bool Ipts_only, bool return_Ruv, typename Tensor_t>
+auto thc::chol_metric_impl(int iq, int nIpts, nda::range a_range, nda::range b_range, int block_size,
+                           Tensor_t const* C_skai)
+{
+  if constexpr (Ipts_only) {
+    Timer.start("IntPts");
+  } else {
+    Timer.start("IntVecs");
+  }
+  using local_IArray_t = memory::array<MEM,long,1>;
+  using local_CArray_t = memory::array<MEM,ComplexType,2>;
+  decltype(nda::range::all) all;
+  utils::check(thresh > 0.0 or nIpts>0,
+               "Error in thc::chol_metric_impl: thresh and nIpts both zero.");
+  utils::check(thresh == 0.0 or thresh > 1e-14, 
+               "Error in thc::chol_metric_impl: Invalid threshold:{}. Must be either 0.0 or larger than 1e-14.", thresh);
+
+  // should also check that C*dagger(C) is the identity matrix.
+  utils::check(C_skai==nullptr or (C_skai->extent(0) == mf->nspin_in_basis() and
+                                   C_skai->extent(1) == mf->nkpts() and
+                                   C_skai->extent(2) == a_range.size() and
+                                   C_skai->extent(3) == mf->nbnd() and
+                                   b_range.size() == mf->nbnd()), 
+               "Error in chol_metric_impl: Rotation and range simultaneously used. ");
+
+  // storage space, to be adjusted synamically later on
+  int nmax = (nIpts > 0 ? nIpts : 6*int(sqrt(a_range.size()*b_range.size()))); 
+  long nspins = mf->nspin_in_basis();
+  long npol = mf->npol_in_basis();
+  long nkpts = mf->nkpts();
+  auto Q  = mf->Qpts()(iq,all);
+  auto kpts = mf->kpts();
+  bool gamma = (Q(0)*Q(0)+Q(1)*Q(1)+Q(2)*Q(2) < 1e-8);
+  bool single_psi = gamma and (a_range==b_range) and (C_skai==nullptr); 
+  ComplexType Znorm = ComplexType(1.0)/std::sqrt(std::sqrt(RealType(a_range.size()*b_range.size()*nspins*nkpts*npol)));
+
+  // processor grid for accumulating collation matrix. Redistribution to requested grid at the end
+  long nkpool = utils::find_proc_grid_max_npools(mpi->comm.size(),nkpts,distr_tol);
+  long nproc_per_pool = mpi->comm.size() / nkpool;
+  utils::check(nkpool*nproc_per_pool == mpi->comm.size(), "Error in chol_metric_impl: Problems with processor partitioning ");
+  utils::check(nproc_per_pool <= a_range.size(), "Error in chol_metric_impl: Too many processors. Decrease # of processors or increase distr_tol. ");
+  if(not single_psi)
+    utils::check(nproc_per_pool <= b_range.size(), "Error in chol_metric_impl: Too many processors. Decrease # of processors or increase distr_tol. ");
+
+  Timer.start("DistOrbs");
+  // read orbitals in real space and redistribute 
+  bool custom_grid = (mf->has_wfc_grid() and mf->fft_grid_dim() != rho_g.mesh());
+  auto distPsia = mf::read_distributed_orbital_set<local_CArray_t>(*mf,mpi->comm,
+               (custom_grid?'w':'r'),
+               (custom_grid?std::array<long,2>{mpi->comm.size(),1}:std::array<long,2>{1,mpi->comm.size()}),
+               nda::range(0,nspins),nda::range(0,nkpts),
+               (C_skai!=nullptr?nda::range(mf->nbnd()):a_range),{1,1}); 
+
+  if(custom_grid) {
+    auto wfc_to_rho = memory::to_memory_space<MEM>(swfc_to_rho.local());
+    auto dPsir = memory::darray_t<local_CArray_t,boost::mpi3::communicator>(
+             std::addressof(mpi->comm),{mpi->comm.size(),1}, {distPsia.global_shape()[0],rho_g.nnr()},
+             {distPsia.local_shape()[0],rho_g.nnr()}, distPsia.origin(),{1,1});
+    auto psir = dPsir.local();
+    auto P4d = nda::reshape(psir,
+          std::array<long,4>{psir.extent(0),rho_g.mesh(0),rho_g.mesh(1),rho_g.mesh(2)});
+    math::nda::fft<true> F(P4d,math::fft::FFT_MEASURE);
+    psir() = ComplexType(0.0);
+    nda::copy_select(true,1,wfc_to_rho,ComplexType(1.0),distPsia.local(),ComplexType(0.0),psir);
+    F.backward(P4d);
+    math::nda::redistribute_in_place(dPsir,{1,mpi->comm.size()},{1,1});
+    distPsia = std::move(dPsir);
+  }
+  // If a rotation matrix is provided, rotate orbitals
+  if(C_skai!=nullptr) {
+    // multiply by conj(C) on the left
+    long skap = nspins*nkpts*a_range.size()*npol; 
+    long nnr_loc = distPsia.local_shape()[1];
+    auto dPsir = memory::darray_t<local_CArray_t,boost::mpi3::communicator>(
+             std::addressof(mpi->comm),{1,mpi->comm.size()},{skap,distPsia.global_shape()[1]},
+             {skap,distPsia.local_shape()[1]},
+             distPsia.origin(),{1,1});
+    utils::check(dPsir.local_shape()[1] == nnr_loc, "Shape mismatch.");
+
+    // conjugate distPsia and dPsir afterwards, to avoid needing to modify C_skai
+    // Currently, C_skai is a spinor rotation, so merge polarization into nnr_loc
+    auto Pi = nda::reshape(distPsia.local(),std::array<long,4>{nspins,nkpts,mf->nbnd(),npol*nnr_loc});
+    auto Pa = nda::reshape(dPsir.local(),std::array<long,4>{nspins,nkpts,a_range.size(),npol*nnr_loc});
+    if constexpr (MEM==HOST_MEMORY) {
+      nda::tensor::scale(ComplexType(1.0), distPsia.local(), nda::tensor::op::CONJ);
+      for( auto is : itertools::range(nspins) ) {
+        for( auto ik : itertools::range(nkpts) ) {
+          nda::blas::gemm((*C_skai)(is,ik,all,all),Pi(is,ik,all,all),Pa(is,ik,all,all));
+        }
+      }  
+      nda::tensor::scale(ComplexType(1.0), dPsir.local(), nda::tensor::op::CONJ);
+    } else {
+      nda::tensor::contract(nda::conj(*C_skai),"skai",Pi,"skir",Pa,"skar");
+    }
+    mpi->comm.barrier(); 
+    distPsia = std::move(dPsir);
+  }
+  nda::tensor::scale(Znorm, distPsia.local());
+  utils::check(distPsia.local_shape()[0] == nspins*nkpts*a_range.size()*npol, "Shape mismatch"); 
+  
+  // Similar to distPsia
+  decltype(distPsia)* distPsib;
+  if( single_psi ) 
+    distPsib = std::addressof(distPsia);
+  else {
+    if(custom_grid) {
+      auto wfc_to_rho = memory::to_memory_space<MEM>(swfc_to_rho.local());
+      auto Psib = mf::read_distributed_orbital_set<local_CArray_t>(*mf,mpi->comm,'w',{mpi->comm.size(),1},
+                          nda::range(0,nspins),nda::range(0,nkpts),b_range,{1}); 
+      auto dPsir = memory::darray_t<local_CArray_t,boost::mpi3::communicator>(
+             std::addressof(mpi->comm),{mpi->comm.size(),1},{Psib.global_shape()[0],rho_g.nnr()},{Psib.local_shape()[0],rho_g.nnr()},
+             Psib.origin(),{1,1});
+      auto psir = dPsir.local();
+      auto P4d = nda::reshape(psir,
+          std::array<long,4>{psir.extent(0),rho_g.mesh(0),rho_g.mesh(1),rho_g.mesh(2)});
+      math::nda::fft<true> F(P4d,math::fft::FFT_MEASURE);
+      psir() = ComplexType(0.0);
+      nda::copy_select(true,1,wfc_to_rho,ComplexType(1.0),Psib.local(),ComplexType(0.0),psir);
+      F.backward(P4d);
+      // stealing the distribution from distPsia 
+      distPsib = new memory::darray_t<local_CArray_t,mpi3::communicator>(std::addressof(mpi->comm),
+                          {1,mpi->comm.size()},dPsir.global_shape(),{dPsir.global_shape()[0],distPsia.local_shape()[1]},
+                          distPsia.origin(),{1,1});
+      math::nda::redistribute(dPsir,*distPsib);
+    } else {
+      auto Psib = mf::read_distributed_orbital_set<local_CArray_t>(*mf,mpi->comm,'r',{1,mpi->comm.size()},
+                          nda::range(0,nspins),nda::range(0,nkpts),b_range,{1}); 
+      distPsib = new memory::darray_t<local_CArray_t,mpi3::communicator>(std::addressof(mpi->comm),
+                          Psib.grid(),Psib.global_shape(),Psib.local_shape(),
+                          Psib.origin(),Psib.block_size());
+      *distPsib = Psib;
+      //*distPsib = std::move(Psib);
+    }
+    utils::check(distPsia.local_range(1) == distPsib->local_range(1), "Error in chol_metric_impl: Range mismatch.");
+    nda::tensor::scale(Znorm, distPsib->local());
+  }
+  utils::check(distPsia.local_range(1) == distPsib->local_range(1), "Error: Distribution error.");
+  if(b_range.size() > 0)
+    utils::check(distPsib->local_shape()[0]==nspins*nkpts*b_range.size()*npol,"Shape mismatch"); 
+  Timer.stop("DistOrbs");
+
+  // when thresh = 0.0, set block_size to 1 until a more robust algorithm is found.
+  if(thresh == 0.0 and block_size>1) {
+    block_size=1;
+    if(mpi->comm.root()) app_warning(" Setting block_size to 1 in thc::chol_metric_impl, since algorithm with block_size>1 is not robust enough when thresh = 0.0. "); 
+  }
+
+  // partition of fft grid over gcomm 
+  nda::range r_range = distPsia.local_range(1);
+  auto rn = nda::array<long,1>::zeros({nmax});
+  auto R = local_CArray_t::zeros({nmax,r_range.size()});
+  utils::check( block_size <= r_range.size(), "Error: block_size:{} > r_range:{}",block_size,r_range.size());
+  
+  auto Psia = nda::reshape(distPsia.local(),shape_t<5>{nspins,nkpts,a_range.size(),npol,r_range.size()});
+  auto Psib = nda::reshape(distPsib->local(),shape_t<5>{nspins,nkpts,b_range.size(),npol,r_range.size()});
+
+  /*
+   * Add phase factor to right hand side!
+   */ 
+  if( not gamma )
+  {
+    // apply phase factor to Psib here! 
+    auto phase = memory::unified_array<ComplexType, 3>::zeros({rho_g.mesh(0),
+                                                               rho_g.mesh(1),
+                                                               rho_g.mesh(2)});
+    auto phase_1D = nda::reshape(phase, shape_t<1>{rho_g.nnr()});
+    nda::stack_array<RealType,3> Gab = {0.0,0.0,0.0};
+    for( auto is : itertools::range(nspins) ) {
+      for( auto k : itertools::range(nkpts) ) {
+        long kb = mf->qk_to_k2(iq,k);
+        // calculate the phase that generates k2 = k-(q+G) -> k-q 
+        // Gab = -G !!!
+        Gab = Q - kpts(k,all) + kpts(kb,all);
+        // phase(i, j, k) = exp(i * Gab * r) where r = (i, j, k) * translational vectors
+        utils::rspace_phase_factor(mf->lattv(),Gab,phase);
+        // Pb(b,i) = Pb(b,i) * phase_1D(r_range(i))
+        if constexpr (MEM == HOST_MEMORY) {
+          for( auto b : itertools::range(b_range.size()) ) 
+            for( auto p : itertools::range(npol) ) 
+              Psib(is,k,b,p,all) *= phase_1D(r_range);
+        } else {
+          nda::tensor::contract(phase_1D(r_range),"i",Psib(is,k,all,all,all),"bpi",Psib(is,k,all,all,all),"bpi");
+        }
+      }
+    }
+  }
+
+  /*********************************************
+                 Diagonal/Residual 
+  *********************************************/
+
+  nda::array<RealType,1> lmax_res_val(block_size,0.0);
+  // linear indexes of the locations of the maximum residuals (not in order)
+  nda::array<long, 1> lmax_res_indx(block_size,0);
+  nda::array<std::pair<RealType,int>,1> gmax_res(block_size);
+
+  // batched dot gemm in gpu!!!
+  memory::array<MEM,ComplexType,1> Diag(r_range.size(),0.0);
+  if constexpr (MEM==HOST_MEMORY) {
+    for( auto is : itertools::range(nspins) ) {
+      for( auto k : itertools::range(nkpts) ) {
+        long ka = k;
+        long kb = mf->qk_to_k2(iq,ka);
+        for( auto p : itertools::range(npol) ) {
+          for( auto r : itertools::range(r_range.size()) ) {
+            auto Lrr = nda::blas::dotc(Psia(is,ka,all,p,r),Psia(is,ka,all,p,r));
+            if( single_psi ) {
+              Diag(r) += std::conj(Lrr) * Lrr;
+            } else {
+              auto Rrr = nda::blas::dotc(Psib(is,kb,all,p,r),Psib(is,kb,all,p,r));
+              Diag(r) += std::conj(Lrr) * Rrr;
+            }
+          }
+        }
+      }
+    }
+  } else {
+    memory::device_array<ComplexType,4> Lr(nspins,nkpts,npol,r_range.size());
+    nda::tensor::contract(nda::conj(Psia),"skapr",Psia,"skapr",Lr,"skpr");
+    if(single_psi) {
+      for( auto is : itertools::range(nspins) ) {
+        for( auto k : itertools::range(nkpts) ) {
+          for( auto p : itertools::range(npol) ) {
+            nda::tensor::contract(ComplexType(1.0),nda::conj(Lr(is,k,p,all)),"r",
+                                                   Lr(is,k,p,all),"r",
+                                  ComplexType(1.0),Diag,"r");
+          }
+        }
+      }
+    } else { 
+      memory::device_array<ComplexType,4> Rr(nspins,nkpts,npol,r_range.size());
+      nda::tensor::contract(nda::conj(Psib),"skbpr",Psib,"skbpr",Rr,"skpr");
+      for( auto is : itertools::range(nspins) ) {
+        for( auto k : itertools::range(nkpts) ) {
+          long ka = k;
+          long kb = mf->qk_to_k2(iq,ka);
+          for( auto p : itertools::range(npol) ) {
+            nda::tensor::contract(ComplexType(1.0),nda::conj(Lr(is,ka,p,all)),"r",
+                                                   Rr(is,kb,p,all),"r",
+                                  ComplexType(1.0),Diag,"r");
+          }
+        }
+      }
+    }
+  }
+  // find index and value of maximum element  
+  utils::max_element_multi(Diag,lmax_res_val(nda::range(0,block_size)),
+                           lmax_res_indx(nda::range(0,block_size)));
+// MAM: dyn_thresh should be set by the magnitude of the residual at position nmax-nchol 
+//      in the globally ordered list, try to find the best approximation (upper bound) to it from 
+//      the information available in find_distributed_maximum
+//      even in this case is not guareanteed         
+  Timer.start("COMM");
+  utils::find_distributed_maximum(mpi->comm,lmax_res_val(nda::range(0,block_size)),gmax_res);
+  Timer.stop("COMM");
+
+  /**************************************************************************/
+  /*  Store */
+  /**************************************************************************/
+  // accumulation ranges for Pska
+  nda::range k_subrange(1), a_subrange(1), b_subrange(1);
+  long arng_bsize = std::min( default_block_size, a_range.size()/nproc_per_pool);
+  long brng_bsize = std::min( default_block_size, b_range.size()/nproc_per_pool);
+  {
+    auto [a,b] = itertools::chunk_range(0,a_range.size()/arng_bsize,
+                 nproc_per_pool,mpi->comm.rank()%nproc_per_pool);
+    a *= arng_bsize;
+    if(mpi->comm.rank()%nproc_per_pool == nproc_per_pool-1)
+      b = a_range.size();
+    else
+      b *= arng_bsize;
+    a_subrange = nda::range(a,b);
+    std::tie(a,b) = itertools::chunk_range(0,nkpts,nkpool,mpi->comm.rank()/nproc_per_pool);
+    k_subrange = nda::range(a,b);
+    if(not single_psi)
+    {
+      std::tie(a,b) = itertools::chunk_range(0,b_range.size()/brng_bsize,
+                 nproc_per_pool,mpi->comm.rank()%nproc_per_pool);
+      a *= brng_bsize;
+      if(mpi->comm.rank()%nproc_per_pool == nproc_per_pool-1)
+        b = b_range.size();
+      else
+        b *= brng_bsize;
+      b_subrange = nda::range(a,b);
+    }
+  }
+  std::vector<memory::array<MEM,ComplexType,3>> Pskau;
+  std::vector<memory::array<MEM,ComplexType,3>> Pskbu;
+
+  /**************************************************************************/
+  /* iterative construction of cholesky matrix  */
+  /**************************************************************************/
+
+  // add bucket structure to minimize wasted space/reallocation
+
+  const long b_scale = ( single_psi ? 0 : 1 );
+
+  memory::array<MEM,ComplexType,1> comm_buff(block_size*(nmax +
+                nspins*nkpts*(a_range.size()+b_scale*b_range.size())*npol));
+  memory::array<MEM,ComplexType,5> Lr(nspins,nkpts,npol,block_size,r_range.size());
+  memory::array<MEM,ComplexType,5> Rr;
+  if(not single_psi) 
+    Rr = memory::array<MEM,ComplexType,5>(nspins,nkpts,npol,block_size,r_range.size());
+  auto Tab = memory::array<MEM,ComplexType,2>::zeros({block_size,r_range.size()});
+  nda::array<long,1> ur(block_size,-1);  // global index of chosen grid point
+  nda::array<int,1> piv(block_size+1,0);
+  memory::unified_array<ComplexType,2> Abb(block_size,block_size);
+
+  Timer.start("IpIter");
+  // a bit nicer this way...
+  auto find_max = [&]() {
+    return (*std::max_element(gmax_res.begin(),gmax_res.end(), [](auto& a, auto& b) {
+                return a.first < b.first;
+        })).first;
+  };
+
+  long nchol (0);
+  auto old_max = find_max();
+  app_log(3,"nchol, max |D|: ");
+  while(true) { 
+
+    utils::check( old_max > 1e-14, " Error in thc::chol_metric_impl: Reached truncation error of 1e-14 without convergence. This likely means that nIpts is too large. Current number of cholesky vectors = {}. Set nIpts to a value equal or larger than this. ",nchol);   
+
+    // stopping condition when thresh is set
+    if( thresh > 0.0 and thresh > old_max) break;
+
+    utils::check( std::isfinite(old_max), 
+          std::string("Error: Cholesky algorithm failed in thc::chol_metric_impl. \n") + 
+          std::string("       Found invalid residual:{}"),old_max); 
+
+    auto Paki = memory::array_view<MEM,ComplexType,2>({nspins*nkpts*a_range.size()*npol,block_size},
+                                                    comm_buff.data());
+    auto Pbki = memory::array_view<MEM,ComplexType,2>({nspins*nkpts*b_range.size()*npol*b_scale,block_size},
+                                                    comm_buff.data() + Paki.size());
+    auto Rc = memory::array_view<MEM,ComplexType,2>({nmax,block_size}, Pbki.data() + Pbki.size()); 
+    // the layout of Paki is being chosen as nda::layout_prop_e::strided_1d, 
+    // which prevents the use of reshaped_view, how to fix this in nda?
+    auto Paki5d = memory::array_view<MEM,ComplexType,5>({nspins,nkpts,a_range.size(),npol,block_size},
+                                                        Paki.data());
+    auto Pbki5d = memory::array_view<MEM,ComplexType,5>({nspins,nkpts,b_scale*b_range.size(),npol,block_size},
+                                                        Pbki.data());
+
+    Timer.start("ip_setup_comm");
+    comm_buff() = ComplexType(0.0);
+    ur() = 0;
+    for(int n=0; n<block_size; ++n) {
+      if( gmax_res(n).second/block_size == mpi->comm.rank()) {
+        // rank with the maximum value
+        long lr = lmax_res_indx(gmax_res(n).second%block_size);
+        ur(n) = r_range.first() + lr;
+        // conj(Psia(:,ru))
+        if constexpr (MEM==HOST_MEMORY) {
+          Paki(all,n) = nda::conj(distPsia.local()(all,lr));
+          if(not single_psi) 
+            Pbki(all,n) = nda::conj(distPsib->local()(all,lr));
+        } else {
+          nda::tensor::assign(nda::conj(distPsia.local()(all,lr)),Paki(all,n));
+          if(not single_psi) 
+            nda::tensor::assign(nda::conj(distPsib->local()(all,lr)),Pbki(all,n));
+        }
+        if(nchol > 0) 
+          Rc(nda::range(0,nchol),n) = R(nda::range(0,nchol),lr);
+      }
+    }
+    Timer.stop("ip_setup_comm");
+    Timer.start("ip_COMM");
+    if(mpi->comm.size()>1) mpi->comm.all_reduce_in_place_n(ur.data(), block_size, std::plus<>{}); 
+    if(mpi->comm.size()>1) mpi->comm.all_reduce_in_place_n(comm_buff.data(), 
+		block_size*(nspins*nkpts*(a_range.size()+b_scale*b_range.size())*npol+nchol),std::plus<>{}); 
+    Timer.stop("ip_COMM");
+
+    // contruct new cholesky vector L(p,ik,ia,ib)
+    // R(n, r) = ZtZ(r,u(n)) - sum_{1,n-1} R(p,r) * std::conj(R(p,u(n)))
+    // ZtZ(r,u(n)) = sum_is_k conj([ sum_i conj(Psia(is,k,i,r)) * Psia(is,k,i,u(n)) ]) *
+    // 			      [ sum_i conj(Psib(is,k,i,r)) * Psib(is,k,i,u(n)) ] 
+    Timer.start("ip_chol");
+    Tab() = ComplexType(0.0);
+    if constexpr (MEM==HOST_MEMORY) {
+      for( auto is : itertools::range(nspins) ) {
+        for( auto k : itertools::range(nkpts) ) {
+          long ka = k;
+          long kb = mf->qk_to_k2(iq, ka);
+          for( auto p : itertools::range(npol) ) {
+            nda::blas::gemm(nda::transpose(Paki5d(is,ka,all,p,all)),
+                            Psia(is,ka,all,p,all),Lr(is,ka,p,all,all));
+            if(not single_psi) 
+              nda::blas::gemm(nda::transpose(Pbki5d(is,kb,all,p,all)),
+                              Psib(is,kb,all,p,all),Rr(is,kb,p,all,all));
+          }
+        }
+      }
+      auto L3D = nda::reshape(Lr,shape_t<3>{nspins*nkpts*npol,block_size,r_range.size()});
+      if(single_psi) {
+        auto T1D = nda::reshape(Tab,shape_t<1>{block_size*r_range.size()});
+        auto L2D = nda::reshape(Lr,shape_t<2>{nspins*nkpts*npol,block_size*r_range.size()});
+        for( auto isk : itertools::range(nspins*nkpts*npol) )
+          T1D(all) += nda::conj(L2D(isk,all))*L2D(isk,all);
+      } else {
+        auto R3D = nda::reshape(Rr,shape_t<3>{nspins*nkpts*npol,block_size,r_range.size()});
+        for( auto ib : itertools::range(block_size) ) 
+          for( auto r : itertools::range(r_range.size()) ) 
+            Tab(ib,r) = nda::blas::dotc(L3D(all,ib,r),R3D(all,ib,r)); 
+      }
+    } else {
+      if(single_psi) {
+        nda::tensor::contract(Paki5d,"skapu",Psia,"skapr",Lr,"skpur");
+        nda::tensor::contract(nda::conj(Lr),"skpur",Lr,"skpur",Tab,"ur");    
+      } else {
+        nda::tensor::contract(Paki5d,"skapu",Psia,"skapr",Lr,"skpur");
+        nda::tensor::contract(Pbki5d,"skbpu",Psib,"skbpr",Rr,"skpur");
+        nda::tensor::contract(nda::conj(Lr),"skpur",Rr,"skpur",Tab,"ur");    
+      }
+    }
+
+    // orthonormalize cholesky vector
+    if(nchol > 0) {
+      nda::blas::gemm(ComplexType(-1.0),nda::dagger(Rc(nda::range(0,nchol),all)),
+                      R(nda::range(0,nchol),all),ComplexType(1.0),Tab);
+    }
+
+    // form block matrix
+    Abb() = ComplexType(0.0);
+    for(int n=0; n<block_size; ++n) {
+      if(mpi->comm.rank() == gmax_res(n).second/block_size) {
+        auto ip = lmax_res_indx(gmax_res(n).second%block_size);
+        Abb(n,all) = Tab(all,ip);  
+      }
+    }
+    Timer.stop("ip_chol");
+    Timer.start("ip_COMM");
+    // nccl?
+    if(mpi->comm.size()>1) mpi->comm.reduce_in_place_n(Abb.data(),block_size*block_size,std::plus<>{});
+    Timer.stop("ip_COMM");
+    Timer.start("ip_SERIAL");
+    if(mpi->comm.rank() == 0) {
+      // pivots are guaranteed to be in ascending order!
+      // MAM: inverse_in_place requires nda::matrix
+      using W_type = nda::matrix<ComplexType,nda::C_layout>;
+      auto W = utils::chol<false,W_type>(Abb,piv,thresh);
+      W() = nda::conj(W());  // need to conjugate before inverting, since W is C_ordered
+      if( nIpts > 0 and piv(block_size) > nIpts-int(nchol) ) {
+        // in the last iteration, reorder states
+        int nv = nIpts-int(nchol);
+        nda::array<int,1> piv_(nv);
+        int cnt=0;  // number of states found so far...
+        for( int i=0; i<piv(block_size); ++i ) { // slow but simple
+          // count number of terms beyond i that are larger than W(i,i), keep if
+          int nabove = 0;
+          RealType Wii = std::real(W(i,i)*std::conj(W(i,i)));
+          for( int j=i+1; j<piv(block_size); ++j )
+            if( std::real(W(j,j)*std::conj(W(j,j))) > Wii ) ++nabove;
+          if( nabove < nv-cnt ) piv_(cnt++) = i;
+          if(cnt==nv) break; // found all needed
+        }
+        utils::check(cnt==nv, " Error in thc::chol_metric_impl Oh Oh...");
+        // piv(i) is monotonically increasing, so this is ok
+        piv(block_size) = nv;
+        nda::matrix<ComplexType,nda::C_layout> W_(nv,nv);
+        for(int i=0; i<nv; i++) { 
+          piv(i) = piv(piv_(i));
+          for(int j=0; j<nv; j++)
+            W_(i,j) = W(piv_(i),piv_(j)); 
+        }
+        // nda giving problems with sub-matrix in inverse_in_place
+        for(int v=0; v<nv; ++v)
+          app_log(3,"  {}  {} ",nchol+v,std::real(W_(v,v)*std::conj(W_(v,v))));
+        nda::inverse_in_place(W_);
+        Abb(nda::range(0,nv),nda::range(0,nv)) = W_(all,all);
+      } else {
+        int nc=piv(block_size);
+        for(int v=0; v<nc; ++v)
+          app_log(3,"  {}  {} ",nchol+v,std::real(W(v,v)*std::conj(W(v,v))));
+        nda::inverse_in_place(W);
+        Abb(nda::range(0,nc),nda::range(0,nc)) = W(all,all);
+      }
+    }
+    Timer.stop("ip_SERIAL");
+    Timer.start("ip_COMM");
+    if(mpi->comm.size()>1) mpi->comm.broadcast_n(piv.data(),block_size+1);
+    if(mpi->comm.size()>1) mpi->comm.broadcast_n(Abb.data(),block_size*block_size);
+    Timer.stop("ip_COMM");
+    // stopping criteria
+
+    Timer.start("ip_update_res");
+     // number of linearly independent cholesky vectors found
+    int newv = ( nIpts > 0 ? std::min( piv(block_size), nIpts-int(nchol)) :
+                             piv(block_size) );
+    utils::check( newv > 0, "Failed to find cholesky vector.");
+
+    // copy collation matrix (before comm_buff is resized)
+    for(int i=0; i<newv; ++i) {
+      Pskau.emplace_back(memory::array<MEM,ComplexType,3>(nspins*npol,k_subrange.size(),a_subrange.size()));
+      auto& pska = Pskau.back();
+      // MAM: On GPU, these could be done async!
+      for( auto ispin : itertools::range(nspins) )
+        for( auto p : itertools::range(npol) )
+          for( auto [ik,k] : itertools::enumerate(k_subrange) )
+            pska(ispin*npol+p,ik,all) = Paki5d(ispin,k,a_subrange,p,piv(i));
+      if(not single_psi) {
+        Pskbu.emplace_back(memory::array<MEM,ComplexType,3>(nspins*npol,k_subrange.size(),b_subrange.size()));
+        auto& pskb = Pskbu.back();
+        // MAM: On GPU, these could be done async!
+        for( auto ispin : itertools::range(nspins) )
+          for( auto p : itertools::range(npol) )
+            for( auto [ik,k] : itertools::enumerate(k_subrange) )
+              pskb(ispin*npol+p,ik,all) = Pbki5d(ispin,k,b_subrange,p,piv(i));
+      }
+    }
+
+    // resize data structures
+    if(nchol+newv > nmax) {
+      int nmax_new = nmax + 2*int(sqrt(a_range.size()*b_range.size()));
+      comm_buff = memory::array<MEM,ComplexType,1>(block_size*(nmax_new +
+                nspins*nkpts*(a_range.size()+b_scale*b_range.size())*npol));
+      {
+        auto rn_ = nda::array<long,1>::zeros({nmax_new});
+        rn_(nda::range(nmax)) = rn(); 
+        rn = std::move(rn_);
+      }
+      { 
+        auto R_ = local_CArray_t::zeros({nmax_new,r_range.size()});
+        R_(nda::range(nmax),all) = R();
+        R = std::move(R_);
+      }
+      nmax = nmax_new;
+    }
+
+    auto Rn = R(nda::range(nchol,nchol+newv), all);    // new cholesky vector 
+    for(int i=0; i<newv; i++) {
+      utils::check(piv(i) >= i, "Failed condition: piv(i) >= i");
+      if(i != piv(i))
+        Tab(i,all) = Tab(piv(i),all);
+    }
+    nda::blas::gemm(Abb(nda::range(0,newv),nda::range(0,newv)),
+                    Tab(nda::range(0,newv),all), Rn);
+    
+    // reduce at the end, no need to know this during iterations...
+    for(int n=0; n<newv; ++n)
+      rn(nchol+n) = ur(piv(n));
+    Timer.stop("ip_update_res");
+
+    // increase counter
+    nchol+=newv;
+
+    // stopping criteria based on nIpts if >0
+    if(nIpts > 0 and nchol>=nIpts) break;
+
+    // update diagonal
+    // Diag(r) -= R(p,r) * std::conj(R(p,r))
+    if constexpr (MEM==HOST_MEMORY) {
+      for( auto v : itertools::range(newv) )
+        for( auto r : itertools::range(r_range.size()) )
+          Diag(r) -= std::conj(Rn(v,r)) * Rn(v,r);
+    } else {
+      nda::tensor::contract(ComplexType(-1.0), nda::conj(Rn), "vr", Rn, "vr", ComplexType(1.0), Diag,"r");
+    }
+
+    // find index and value of maximum element  
+    utils::max_element_multi(Diag,lmax_res_val(nda::range(0,block_size)),
+                             lmax_res_indx(nda::range(0,block_size)));
+    Timer.start("ip_COMM");
+    utils::find_distributed_maximum(mpi->comm,lmax_res_val(nda::range(0,block_size)),gmax_res);
+    Timer.stop("ip_COMM");
+
+    auto curr_max = find_max();  
+    utils::check( old_max >= curr_max,
+          std::string("Error: Cholesky algorithm failed in thc::chol_metric_impl. \n") +
+          std::string("       Found non-decreasing residual error: last it:{}, curr it:{}"),old_max,curr_max);
+    utils::check( std::isfinite(curr_max),
+          std::string("Error: Cholesky algorithm failed in thc::chol_metric_impl. \n") +
+          std::string("       Found invalid residual:{}"),curr_max);
+
+    // stopping condition when thresh is set
+    if( thresh > 0.0 and thresh > curr_max) break;
+    old_max = curr_max;
+  }
+  Timer.stop("IpIter");
+
+  if constexpr (Ipts_only) {
+    Timer.stop("IntPts");
+  } else {
+    Timer.stop("IntVecs");
+  }
+
+  if constexpr (Ipts_only) {
+  app_log(4,"\n***************************************************");
+  app_log(4,"        Interpolating points detailed timers ");
+  app_log(4,"***************************************************");
+  app_log(4,"  Iterpolating points total:         {}",Timer.elapsed("IpIter"));
+  app_log(4,"  Iter total:                        {}",Timer.elapsed("IntPts"));
+  app_log(4,"  Communication:                     {}",Timer.elapsed("ip_COMM"));
+  app_log(4,"  Iter. Setup:                       {}",Timer.elapsed("ip_setup_comm"));
+  app_log(4,"  Cholesky vector build:             {}",Timer.elapsed("ip_chol"));
+  app_log(4,"  Serial solve:                      {}",Timer.elapsed("ip_SERIAL"));
+  app_log(4,"  Residual update:                   {}",Timer.elapsed("ip_update_res"));
+  app_log(4,"***************************************************\n");
+  }
+
+  // interpolating points
+  local_IArray_t ipts = rn(nda::range(nchol));
+
+  if( not single_psi ) delete distPsib;
+
+  // collect collation matrices from distributed data
+  utils::check(Pskau.size() ==  nchol,
+               "Error in chol_metric_impl: Pskau.size():{} != nchol:{}",Pskau.size(),nchol);
+  if(not single_psi)
+    utils::check(Pskbu.size() ==  nchol,
+                 "Error in chol_metric_impl: Pskbu.size():{} != nchol:{}",Pskbu.size(),nchol);
+  // MAM: only store for kpts < nkpts-nkpts_trev_pairs, since you can just conjugate 
+  auto Xskau = _darray_t_<MEM,4>(std::addressof(mpi->comm),{1,nkpool,nproc_per_pool,1},
+       {nspins*npol,nkpts,a_range.size(),nchol},
+       {nspins*npol,k_subrange.size(),a_subrange.size(),nchol},
+       {0,k_subrange.first(),a_subrange.first(),0},{1,1,arng_bsize,nchol});
+  std::optional<_darray_t_<MEM,4>> Xskbu;
+
+  {
+    auto phase = memory::unified_array<ComplexType, 1>::zeros({nchol});
+    auto kpts_c = mf->kpts_crystal();
+    auto Xloc = Xskau.local();
+    for( int i=0; i<nchol; ++i )
+      Xloc(all,all,all,i) = Pskau[i];
+    // remove normalization
+    nda::tensor::scale(ComplexType(1.0)/Znorm, Xloc);
+    for( int is=0; is<nspins*npol; ++is ) {
+      for( auto [ik,k] : itertools::enumerate(k_subrange) ) {
+        utils::rspace_phase_factor(kpts_c(k,all),rho_g.mesh(),ipts,phase);
+        auto X_ = Xloc(is,ik,nda::ellipsis{});
+        // X(u) = conj(X(u)) * phase(u)
+        if constexpr (MEM==HOST_MEMORY) {
+          for( auto [ia,a] : itertools::enumerate(a_subrange) )
+            X_(ia,all) = nda::conj(X_(ia,all))*phase();
+        } else {
+          nda::tensor::contract(phase,"i",nda::conj(X_),"bi",X_,"bi");
+        }
+      }
+    }
+
+    // redistribute into more slate friendly layout
+    if(nproc_per_pool > 1) {
+      // processor grid for slate 
+      long nx = std::max(1l, std::min( nproc_per_pool,
+             a_range.size() / default_block_size) );
+      while( nproc_per_pool%nx != 0 ) --nx;
+      long ny = nproc_per_pool/nx;
+      long bu = std::min( nchol/std::max(nx,ny), default_block_size );
+      math::nda::redistribute_in_place(Xskau,{1,nkpool,nx,ny},
+                                       {1,1,default_block_size,bu});
+    }
+  }
+  if(not single_psi)
+  {
+    Xskbu = _darray_t_<MEM,4>(std::addressof(mpi->comm),{1,nkpool,nproc_per_pool,1},
+       {nspins*npol,nkpts,b_range.size(),nchol},
+       {nspins*npol,k_subrange.size(),b_subrange.size(),nchol},
+       {0,k_subrange.first(),b_subrange.first(),0},{1,1,brng_bsize,nchol});
+    auto phase = memory::unified_array<ComplexType, 1>::zeros({nchol});
+    auto kpts_c = mf->kpts_crystal();
+    auto Xloc = Xskbu->local();
+    for( int i=0; i<nchol; ++i )
+      Xloc(all,all,all,i) = Pskbu[i];
+    // remove normalization
+    nda::tensor::scale(ComplexType(1.0)/Znorm, Xloc);
+    for( int is=0; is<nspins*npol; ++is ) {
+      for( auto [ik,k] : itertools::enumerate(k_subrange) ) {
+        utils::rspace_phase_factor(kpts_c(k,all),rho_g.mesh(),ipts,phase);
+        auto X_ = Xloc(is,ik,nda::ellipsis{});
+        // X(u) = conj(X(u)) * phase(u)
+        if constexpr (MEM==HOST_MEMORY) {
+          for( auto [ia,a] : itertools::enumerate(b_subrange) )
+            X_(ia,all) = nda::conj(X_(ia,all))*phase();
+        } else {
+          nda::tensor::contract(phase,"i",nda::conj(X_),"bi",X_,"bi");
+        }
+      }
+    }
+
+    // redistribute into more slate friendly layout
+    if(nproc_per_pool > 1) {
+      // processor grid for slate 
+      long nx = std::max(1l, std::min( nproc_per_pool,
+             b_range.size() / default_block_size) );
+      while( nproc_per_pool%nx != 0 ) --nx;
+      long ny = nproc_per_pool/nx;
+      long bu = std::min( nchol/std::max(nx,ny), default_block_size );
+      math::nda::redistribute_in_place(*Xskbu,{1,nkpool,nx,ny},
+                                       {1,1,default_block_size,bu});
+    }
+  }
+
+  if constexpr (Ipts_only) {
+  
+    return std::make_tuple(std::move(ipts),std::move(Xskau),std::move(Xskbu));
+
+  } else {
+
+    if constexpr ( return_Ruv ) {
+      // returns only Ruv, instead of full Rur
+
+      auto return_value{math::nda::make_distributed_array<local_CArray_t>(mpi->comm,
+                          {1,mpi->comm.size()},{nchol,nchol},{512,512},true)};
+
+      if(mpi->comm.size()==1) {
+
+        auto xloc = return_value.local();
+        for( auto [i,r] : itertools::enumerate(rn(nda::range(nchol))) ) 
+          xloc(all,i) = R(nda::range(nchol),r);  
+
+      } else {
+
+        auto xloc = return_value.local()(nda::range(nchol),all);
+        auto Xt = math::nda::distributed_array_view<local_CArray_t,mpi3::communicator>(std::addressof(mpi->comm),
+		return_value.grid(),return_value.global_shape(),return_value.origin(),{1,1},xloc);
+  
+        auto rloc = R(nda::range(nchol),all);
+        auto Rt = math::nda::make_distributed_array_view<local_CArray_t>(mpi->comm,
+                            {1,mpi->comm.size()},{nchol,rho_g.nnr()},{1,1},rloc);
+        utils::check(Rt.local_range(1) == r_range, "Range error.");
+
+        Timer.start("COMM");
+        // loop over buckets and pass views and buckets...
+        math::nda::distributed_column_select(rn(nda::range(nchol)),Rt,Xt);
+        Timer.stop("COMM");
+      }
+
+      return std::make_tuple(std::move(ipts),std::move(return_value),std::move(Xskau),std::move(Xskbu));
+
+    } else {
+
+      // todo... redistribute from buckets...
+      auto Rt{math::nda::make_distributed_array<local_CArray_t>(mpi->comm,
+                          {1,mpi->comm.size()},{nchol,rho_g.nnr()})};
+      utils::check(Rt.local_range(1) == r_range, "Range error.");
+      Rt.local() = R(nda::range(nchol),all);
+
+      auto return_value{math::nda::make_distributed_array<local_CArray_t>(mpi->comm,
+                          {1,mpi->comm.size()},{nchol,rho_g.nnr()},{512,512})};
+
+      Timer.start("COMM");
+      math::nda::redistribute(Rt,return_value);
+      Timer.stop("COMM");
+
+      return std::make_tuple(std::move(ipts),std::move(return_value),std::move(Xskau),std::move(Xskbu));
+
+    } // constexpr ( return_Ruv ) 
+ 
+  } // constexpr (Ipts_only)
+
+}
+
+// MAM: Given C_skai, the only modification needed, in addition to implementing the version with
+// a separate Xb, is to pass as Xa: transpose(C_skai) * Xa, which will lead to the appropriate Tkur. 
+// Instead of expecting the users of the routine to do this, write a new evaluate routine that 
+// takes C_skia and expects both Xa and Xb (no optional since this case is always not single_psi) 
+// and generates transpose(C)*Xa = Xa_new, passes Xa_new to intvec_impl. 
+template<MEMORY_SPACE MEM, bool return_coul_matrix, typename Tensor_t, typename Tensor2_t>
+auto thc::intvec_impl(nda::MemoryArrayOfRank<1> auto const& IPts, 
+                      Tensor_t const& Xa,
+                      Tensor2_t const* Xb,
+                      bool return_Sinv_Ivec, 
+                      nda::range a_range, nda::range b_range, std::array<long, 3> pgrid3D)
+{
+  Timer.start("IntVecs");
+  using local_Array_t = memory::array<MEM,ComplexType,3>;
+  // MAM: temporary HACK until I figure out why slate::lu_solve seg faults with device memory
+  using local_uArray_t = std::conditional_t<MEM==HOST_MEMORY, memory::host_array<ComplexType,3>,
+          						  memory::unified_array<ComplexType,3>>; 
+  app_log(0,"*********************************************************************");
+  app_log(0,"  ISDF - fitting interpolating vectors to pair densities ");
+  app_log(0,"*********************************************************************");
+  using math::nda::make_distributed_array; 
+  using math::nda::transpose;
+  using math::nda::dagger;
+  decltype(nda::range::all) all;
+
+  auto Q  = mf->Qpts();
+  auto mesh = rho_g.mesh();
+  long nIpts = IPts.shape()[0];
+  long nqpts_ibz = mf->nqpts_ibz(); 
+  long nnr = rho_g.nnr(); 
+
+  {
+    auto IPts_h = nda::to_host(IPts());
+    utils::check((*std::min_element(IPts_h.begin(),IPts_h.end()) >= 0) and
+                 (*std::max_element(IPts_h.begin(),IPts_h.end()) < nnr),
+                 "Ipts out of range.");
+  }
+
+  // check if a processor grid was provided, otherwise set to sensible default
+  if(pgrid3D[0]*pgrid3D[1]*pgrid3D[2] <= 0) 
+  {
+    pgrid3D[0] = utils::find_proc_grid_max_npools(mpi->comm.size(),nqpts_ibz,distr_tol);
+    long np = mpi->comm.size() / pgrid3D[0]; 
+    // MAM: in case of irregular grids, e.g. (uxr:17x1), which axis should be larger???
+    pgrid3D[1] = utils::find_proc_grid_min_diff(np,1,1);
+    pgrid3D[2] = np/pgrid3D[1]; 
+  }
+
+  utils::check(mpi->comm.size()==(pgrid3D[0]*pgrid3D[1]*pgrid3D[2]),
+               "Error: Inconsistent processor grid: ({},{},{}) with number of MPI tasks:{}",
+               pgrid3D[0],pgrid3D[1],pgrid3D[2],mpi->comm.size());
+
+  app_log(1, " - Number of interpolating points: {}", nIpts);
+  app_log(1, " - Number of q-points in IBZ: {}",nqpts_ibz);
+  app_log(1, " - processor grid: ({},{},{})",pgrid3D[0],pgrid3D[1],pgrid3D[2]);
+
+  /* 
+   * std::optional<_darray_t_<MEM,3>> I(q,u,G) = (S)^{-1}(q,u,v) * IVec(q,v,G), "inverse" interpolating vector 
+   * We can represent functions in real space using I(u,G), for example the representation of the coulomb potential
+   * within the THC basis is:
+   *   V(r,r') = sum_quv conj(I(q,u,r)) Vuv(q) I(q,v,r')
+   */  
+  std::optional<_darray_t_<MEM,3>> IquG;
+
+  utils::memory_report(4, "thc::get_ZquG_Cquv");
+  // Z_quG: quG array with appropriate distribution slate
+  auto [Z_quG, C_quv] = get_ZquG_Cquv<MEM>(IPts,Xa,Xb,a_range,b_range,pgrid3D);
+
+  auto block_size = Z_quG.block_size();
+  utils::check(C_quv.grid() == Z_quG.grid()  and
+               C_quv.grid() == pgrid3D,
+               "Error: Processor grid mismatch. Oh oh");
+  utils::check(C_quv.block_size()[0] == block_size[0] and
+               C_quv.block_size()[1] == block_size[1] and
+               C_quv.block_size()[2] == block_size[1],
+               "Error: Block size mismatch. Oh oh...");
+
+  // MAM: leave option for round-robin serial solves!  
+  Timer.start("LSSolve");
+  // ls-solve IVecs = ls_solve( (C^H*C), (C^H*Z) )
+  // conjugate and use transposed (e.g. in column-major)
+  using lArray_t = std::conditional_t<MEM==HOST_MEMORY, memory::host_array<ComplexType,2>,
+                                      memory::unified_array<ComplexType,2>>;
+  {
+    mpi3::communicator q_intra_comm = mpi->comm.split(C_quv.origin()[0],mpi->comm.rank());   
+    for( auto [iq,q] : itertools::enumerate(Z_quG.local_range(0)) ) { 
+
+      // this should be a standalone function, for slicing distributed arrays
+      auto C2D = C_quv.local()(iq,all,all);
+      auto Z2D = Z_quG.local()(iq,all,all);
+      memory::darray_view_t<lArray_t,mpi3::communicator> Ciq(std::addressof(q_intra_comm),
+                {pgrid3D[1],pgrid3D[2]}, {nIpts,nIpts}, {C_quv.origin()[1], C_quv.origin()[2]},
+                {block_size[1],block_size[1]}, C2D);
+      memory::darray_view_t<lArray_t,mpi3::communicator> Ziq(std::addressof(q_intra_comm),
+                {pgrid3D[1],pgrid3D[2]}, {nIpts,Z_quG.global_shape()[2]}, 
+                {Z_quG.origin()[1], Z_quG.origin()[2]},
+                {block_size[1],block_size[2]}, Z2D);
+
+      if (use_least_squares) {
+        long info = math::nda::slate_ops::least_squares_solve<true>(Ciq,Ziq);
+        utils::check(info==0,"  thc::evaluate::least_squares_solve returned info={}.",info);
+      } else { 
+        long info = math::nda::slate_ops::lu_solve<true>(Ciq,Ziq);
+        utils::check(info==0,"  thc::evaluate::lu_solve returned info={}.",info);
+      }
+    } 
+  }
+  Timer.stop("LSSolve");
+  Timer.stop("IntVecs"); 
+
+  if constexpr (return_coul_matrix) {
+
+    // First compute the inverse of overlap matrices
+    Timer.start("ZBAR");
+    math::nda::slate_ops::multiply(Z_quG, dagger(Z_quG), C_quv);
+    {
+      std::vector<std::pair<long,long> > diag_idx;
+      for (auto [iu, u] : itertools::enumerate(C_quv.local_range(1))) {
+        for (auto [iv, v] : itertools::enumerate(C_quv.local_range(2))) {
+          if (u == v) diag_idx.push_back({iu, iv});
+        }
+      }
+      mpi3::communicator q_intra_comm = mpi->comm.split(C_quv.origin()[0], mpi->comm.rank());
+      Timer.start("ALLOC");
+      auto buffer = make_distributed_array<lArray_t>(q_intra_comm, {pgrid3D[1], pgrid3D[2]},
+                                                     {nIpts,nIpts},{block_size[1],block_size[1]});
+      Timer.stop("ALLOC");
+      auto buf_loc = buffer.local();
+      for (auto [iq, q]: itertools::enumerate(C_quv.local_range(0))) {
+        buf_loc() = ComplexType(0.0);
+        for (auto idx: diag_idx) {
+          buf_loc(idx.first, idx.second) = ComplexType(1.0);
+        }
+        auto C2D = C_quv.local()(iq, all, all);
+
+        memory::darray_view_t <lArray_t, mpi3::communicator> Ciq(std::addressof(q_intra_comm),
+                  {pgrid3D[1], pgrid3D[2]}, {nIpts, nIpts}, {C_quv.origin()[1], C_quv.origin()[2]},
+                  {block_size[1], block_size[1]}, C2D);
+
+        if(use_least_squares) {
+          long info = math::nda::slate_ops::least_squares_solve<true>(Ciq,buffer);
+          utils::check(info==0,"  thc::evaluate::least_squares_solve returned info={}.",info);
+        } else {
+          long info = math::nda::slate_ops::lu_solve<true>(Ciq,buffer);
+          utils::check(info==0,"  thc::evaluate::lu_solve returned info={}.",info);
+        }
+        C2D = buf_loc;
+      }
+    }
+
+    if( return_Sinv_Ivec ) {
+      // construct IquG
+      Timer.start("ALLOC");
+      IquG = make_distributed_array<local_uArray_t>(mpi->comm,pgrid3D,Z_quG.global_shape(),
+                  Z_quG.block_size());  
+      Timer.stop("ALLOC");
+      math::nda::slate_ops::multiply(C_quv, Z_quG, *IquG);
+    }    
+
+    auto Zloc = Z_quG.local();
+
+    // Store Chi^{q}_{u}(G=0) and \bar(Chi)^{q}_{u}(G=0)
+    // \bar(Chi)^{q}_{v} = (S^{q})^{-1}_{uv} Chi^{q}_{u}
+    // Note: <Chi^q_u | \bar(Chi)^q_v > = delta_uv
+    auto gv_to_fft = rho_g.gv_to_fft();
+    auto g_it = std::find(gv_to_fft.begin(), gv_to_fft.end(),0);
+    auto g0_idx = std::distance(gv_to_fft.begin(), g_it);
+    auto g0_vec = rho_g.g_vectors(g0_idx);
+    utils::check(g0_vec(0) == 0.0 and g0_vec(1) == 0.0 and g0_vec(2) == 0.0, "gvec({}) = ({},{},{}) != (0,0,0)",
+                 g0_idx, g0_vec(0), g0_vec(1), g0_vec(2));
+
+    memory::array<MEM,ComplexType, 2> Z_qu(nqpts_ibz, nIpts);
+    Z_qu() = 0.0;
+    for (auto [iq, q]: itertools::enumerate(Z_quG.local_range(0))) {
+      for (auto [ig, g]: itertools::enumerate(Z_quG.local_range(2))) {
+        if (g == g0_idx) {
+          // convert from -q to q
+          nda::tensor::assign(nda::conj(Zloc(iq,nda::range(Z_quG.local_range(1).size()),ig)),Z_qu(q, Z_quG.local_range(1)));
+        }
+      }
+    }
+    Z_quG.communicator()->all_reduce_in_place_n(Z_qu.data(), Z_qu.size(), std::plus<>{});
+
+    Timer.start("ALLOC");
+    memory::array<MEM,ComplexType, 2> Zbar_qu(nqpts_ibz, nIpts);
+    memory::array<MEM,ComplexType, 2> S_inv_uv(C_quv.local_shape()[1], C_quv.local_shape()[2]);
+    Timer.stop("ALLOC");
+    for (auto [iq, q]: itertools::enumerate(Z_quG.local_range(0))) {
+      nda::tensor::assign(nda::conj(C_quv.local()(iq, all, all)),S_inv_uv);
+      auto Zbar_u = Zbar_qu(q, C_quv.local_range(1));
+      auto Z_v = Z_qu(q, C_quv.local_range(2));
+      nda::blas::gemv(ComplexType(1.0), S_inv_uv, Z_v, ComplexType(0.0), Zbar_u);
+    }
+    mpi->comm.all_reduce_in_place_n(Zbar_qu.data(), Zbar_qu.size(), std::plus<>{});
+    Timer.stop("ZBAR");
+    Timer.start("VCoul");
+    Timer.start("ALLOC");
+    nda::array<RealType,1> v_zero = {0.0,0.0,0.0};
+    memory::unified_array<ComplexType,1> sqrtVg(rho_g.size());
+    Timer.stop("ALLOC");
+    // multiply Coulomb potential
+    for( auto [iq,q] : itertools::enumerate(Z_quG.local_range(0)) ) {
+      vG.evaluate(sqrtVg,mf->lattv(),rho_g.g_vectors(),v_zero,Q(q,all));
+      for( auto& v: sqrtVg ) v = std::sqrt(v);
+      if constexpr (MEM==HOST_MEMORY) {
+        for( auto iu : nda::range(Z_quG.local_shape()[1]) )
+          for( auto [ig, g] : itertools::enumerate(Z_quG.local_range(2)) ) {
+            Zloc(iq, iu, ig) *= sqrtVg(g);
+          }
+      } else {
+        nda::tensor::elementwise(ComplexType(1.0),sqrtVg(Z_quG.local_range(2)),"g",
+                                 ComplexType(1.0),Zloc(iq,all,all),"ug",nda::tensor::op::MUL);
+      }
+    }
+    math::nda::slate_ops::multiply(Z_quG,dagger(Z_quG),C_quv);
+    nda::tensor::scale(ComplexType(1.0)/mf->volume()/mf->nkpts(), C_quv.local());
+    Timer.stop("VCoul");
+    if constexpr (MEM==DEVICE_MEMORY) {
+      Timer.start("ALLOC");
+      math::nda::distributed_array<local_Array_t,mpi3::communicator> C_quv_(
+          std::addressof(mpi->comm),C_quv.grid(),C_quv.global_shape(),C_quv.local_shape(),
+          C_quv.origin(),C_quv.block_size());
+      Timer.stop("ALLOC");
+      C_quv_.local() = C_quv.local();	
+      return std::make_tuple(std::move(C_quv_), std::move(Z_qu), std::move(Zbar_qu), 
+                             std::move(IquG));
+    } else {
+      return std::make_tuple(std::move(C_quv), std::move(Z_qu), std::move(Zbar_qu),
+                             std::move(IquG));
+    }
+
+  } else {
+
+    // return interpolating vectors
+    return Z_quG;
+
+  } // constexpr (return_coul_matrix) 
+
+}
+
+template<MEMORY_SPACE MEM, bool return_coul_matrix>
+auto thc::intvec_impl(int iq, nda::MemoryArrayOfRank<1> auto const& IPts,
+           nda::range a_range, nda::range b_range,
+           memory::darray_t<memory::array<MEM,ComplexType,5>,mpi3::communicator> const& B)
+{
+  Timer.start("IntVecs");
+  using local_Array_t = memory::array<MEM,ComplexType,2>;
+  if(iq==0) {
+    app_log(0,"************************************************************************");
+    app_log(0,"  ISDF - fitting interpolating vectors to Cholesky/DF ERI decomposition ");
+    app_log(0,"************************************************************************");
+  }
+  using math::nda::make_distributed_array; 
+  using math::nda::transpose;
+  using math::nda::dagger;
+  decltype(nda::range::all) all;
+
+  auto Q  = mf->Qpts()(iq,all);
+  long nIpts = IPts.shape()[0];
+  long nspins = mf->nspin_in_basis();
+  long npol = mf->npol_in_basis();
+  long nkpts = mf->nkpts();
+  long nchol = B.global_shape()[0];
+  bool gamma = (Q(0)*Q(0)+Q(1)*Q(1)+Q(2)*Q(2) < 1e-8);
+  utils::check(B.global_shape()[1] == nspins,
+               "Size mismatch: B.global_shape(1):{}, nspins: {}.",B.global_shape()[1],nspins);
+  utils::check(B.global_shape()[2] == nkpts,
+               "Size mismatch: B.global_shape(2):{}, nkpts: {}.",B.global_shape()[2],nkpts);
+  utils::check(B.global_shape()[3] == a_range.size(),
+               "Size mismatch: B.global_shape(3):{}, na: {}.",B.global_shape()[3],a_range.size());
+  utils::check(B.global_shape()[4] == b_range.size(),
+               "Size mismatch: B.global_shape(4):{}, nb: {}.",B.global_shape()[4],b_range.size());
+  auto Bloc = B.local();
+  auto n_rg = B.local_range(0);
+  auto kp_rg = B.local_range(2);
+  auto a_rg = B.local_range(3);
+  auto b_rg = B.local_range(4);
+
+  // temporary limitations
+  utils::check(nspins==1 and npol==1, "Finish implementation for spin polarized/noncollinear in the basis.");
+  utils::check(n_rg.size() == B.global_shape()[0], "Finish implementation of distributed chol");
+
+  // temporary, optimize later!
+  std::array<long, 2> pgrid2D = {mpi->comm.size(), 1};
+
+  // make sure block sizes produce at least one full block per task 
+  std::array<long, 2> block_size = {  
+    std::min( { long(default_block_size), 
+                nIpts/pgrid2D[0],
+                nIpts/pgrid2D[1]
+              } ), 
+    std::min(long(default_block_size), nIpts/pgrid2D[1])
+  };
+
+  if(iq==0) { 
+    app_log(1," - processor grid: ({},{})",pgrid2D[0],pgrid2D[1]); 
+    app_log(1," - block sizes: ({},{})",block_size[0],block_size[1]); 
+  }
+
+  // (C^H*C)(p,q) = sum_k conj(Ta(k,p,q)) * Tb(k,p,q)
+  auto ChC_uv{make_distributed_array<local_Array_t>(mpi->comm,pgrid2D,{nIpts,nIpts},{block_size[0],block_size[0]})};
+  // 1D views of local arrays
+  auto ChC_uv_1D = nda::reshape(ChC_uv.local(),shape_t<1>{ChC_uv.local().size()});
+  ChC_uv_1D() = ComplexType(0.0);
+
+  { // to control memory scope
+    // Tl/r(p,r) = sum_a_range std::conj(Psi(k,a,Ipts(p)))*Psi(k,a,r) 
+    auto Tl{make_distributed_array<local_Array_t>(mpi->comm,pgrid2D,{nIpts,nIpts},{block_size[0],block_size[0]})};
+    auto Tr{make_distributed_array<local_Array_t>(mpi->comm,pgrid2D,{nIpts,nIpts},{block_size[0],block_size[0]})};
+
+    auto Tl_1D = nda::reshape(Tl.local(),shape_t<1>{Tl.local().size()});
+    auto Tr_1D = nda::reshape(Tr.local(),shape_t<1>{Tr.local().size()});
+
+    for( int is=0; is<nspins; ++is )
+    {
+      for( int k=0; k<nkpts; ++k )
+      {
+        long ka = k;
+        long kb = mf->qk_to_k2(iq,ka);	
+
+        // T = sum_i conj(Psi(i,r(u))) * Psi(i,r(v))
+        if (mf->orb_on_fft_grid()) {
+          get_Tuv_fft_grid<MEM>(not gamma,is,ka,a_range,IPts,Tl);
+          get_Tuv_fft_grid<MEM>(not gamma,is,kb,b_range,IPts,Tr);
+        } else {
+          get_Tuv_nonuniform_rgrid<MEM>(not gamma,is,ka,a_range,IPts,Tl);
+          get_Tuv_nonuniform_rgrid<MEM>(not gamma,is,kb,b_range,IPts,Tr);
+        }
+
+        // (C^H*C)(u,v) += sum_k conj(Ta(k,p,u)) * Tb(k,p,v)
+        for (int uv = 0; uv < ChC_uv_1D.extent(0); ++uv)
+          ChC_uv_1D(uv) += std::conj(Tl_1D(uv)) * Tr_1D(uv);
+      }
+    }
+  }
+
+  // Snv = sum_k_a_b Pa(k,a,v) * conj(Pb(k,b,v)) * B(n,s,k,a,b)
+  auto Snv{math::nda::make_distributed_array<local_Array_t>(mpi->comm,
+                      {mpi->comm.size(),1},{nchol,nIpts},{default_block_size,block_size[0]})};
+//  auto Sloc = Snv.local();
+
+  // NOT OPTIMAL!!!
+  {
+    // loop over subsets of kpts to keep memory under control!
+    // get local ranges
+    auto [Pa,Pb] = (mf->orb_on_fft_grid())?
+        load_basis_subset_fft_grid<MEM>(IPts,iq,kp_rg,a_rg,b_rg) :
+        load_basis_subset_nonuniform_rgrid<MEM>(IPts,iq,kp_rg,a_rg,b_rg);
+
+    // MAM: doing this for now!!! find better way!!!
+    memory::array<MEM,ComplexType,2> Sloc(nchol,nIpts);
+    Sloc() = 0.0;
+
+    // conjugate Pb, to avoid needing to dispatch the unary operation later
+    for( auto& v: Pb ) v = std::conj(v);
+
+    // batch over kpoints later!!! 
+    memory::array<MEM,ComplexType,3> A(1,a_rg.size(),nIpts);
+
+    // use batched blas!!!
+    // MAM: how does spin enter???
+    // MAM: later on, order the products based on the smaller range!
+    // A(n,s,k,a,v) = sum_b B(n,s,k,a,b) * std::conj(Pb(k,b,v))
+    // S(n,v) = sum_k sum_a Pa(k,a,v) * A(n,s,k,a,v)
+    for( auto [in,n] : itertools::enumerate(n_rg) ) {
+      for( auto [is,s] : itertools::enumerate(itertools::range(nspins)) ) {
+        for( auto [ik,k] : itertools::enumerate(kp_rg) ) {
+          nda::blas::gemm(Bloc(in,is,ik,all,all),Pb(is,ik,all,all),A(0,all,all));
+          // this becomes batched Ci = sum_j Aij * Bij --> contract(A,01,B,01,C,0);
+          for( auto [ia,a] : itertools::enumerate(a_rg) )
+            for( auto v : itertools::range(nIpts) )
+              Sloc(in,v) += Pa(is,ik,ia,v) * A(0,ia,v);
+        }
+      }
+    }
+    // when distributing over nchol, only reduce over tasks sharing a range of nchol
+    mpi->comm.all_reduce_in_place_n(Sloc.data(),Sloc.size(),std::plus<>{});
+    // IMPROVE THIS!!!
+    Snv.local() = Sloc(Snv.local_range(0), Snv.local_range(1));
+  }
+
+  Timer.start("LSSolve");
+  // ls-solve IVecs = ls_solve( (C^H*C), (C^H*Z) )
+  {    
+    long info=0;
+    // simple trick to avoid transposing into F_layout arrays, works because ChC is hermitian
+    for( auto& v: ChC_uv.local() ) v = std::conj(v); // conjugate
+#if defined(ENABLE_SLATE)
+    auto As = math::nda::slate_ops::detail::to_slate_view<true>(ChC_uv);
+    auto Bs = math::nda::slate_ops::detail::to_slate_view<true>(Snv);
+    if(use_least_squares) {
+      if constexpr (MEM==HOST_MEMORY) {
+        ::slate::least_squares_solve(As,Bs
+#if defined(USE_SLATE_HOSTBATCH)
+        ,{ { ::slate::Option::Target, ::slate::Target::HostBatch} }
+#endif  
+        );
+      } else { 
+        ::slate::least_squares_solve(As,Bs, {
+        // Set execution target to GPU Devices
+        { ::slate::Option::Target, ::slate::Target::Devices },
+        { ::slate::Option::Lookahead, 1 }
+          });
+      }
+      utils::check(info==0, "Error in thc::intvec_impl: least_squares_solve info:{}",info);
+    } else {
+      if constexpr (MEM==HOST_MEMORY) {
+        info = ::slate::lu_solve(As,Bs
+#if defined(USE_SLATE_HOSTBATCH)
+        ,{ { ::slate::Option::Target, ::slate::Target::HostBatch} }
+#endif
+        );
+      } else {
+        info = ::slate::lu_solve(As,Bs, {
+        // Set execution target to GPU Devices
+        { ::slate::Option::Target, ::slate::Target::Devices },
+        { ::slate::Option::Lookahead, 1 }
+          });
+      }
+      utils::check(info==0, "Error in thc::intvec_impl: lu_solve info:{}",info);
+    }
+#else
+    utils::check(false, "requires SLATE, compile with ENABLE_SLATE.");
+#endif
+  } 
+  Timer.stop("LSSolve");
+  Timer.stop("IntVecs");
+
+  if constexpr (return_coul_matrix) {
+    // return coulomb matrix
+    // V = transpose(Snv) * conj(Snv) => dagger(conj(Snv)) * conj(Snv)
+    Timer.start("GEMM");
+    for( auto& v: Snv.local() ) v = std::conj(v); // conjugate
+    math::nda::slate_ops::multiply(math::nda::dagger(Snv),Snv,ChC_uv);
+    Timer.stop("GEMM");
+    return ChC_uv;
+  } else {
+    utils::check(false,"Needs transpose!!!");
+    return Snv;
+  } // constexpr (return_coul_matrix) 
+
+}
+
+} // methods

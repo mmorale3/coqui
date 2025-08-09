@@ -1,0 +1,2412 @@
+#include <tuple>
+#include <cmath>
+#include <iomanip>
+#include <algorithm>
+#include <limits>
+#include <random>
+
+#include "configuration.hpp"
+#include "utilities/check.hpp"
+#include "hamiltonian/potentials.hpp"
+
+#include "mpi3/communicator.hpp"
+
+#include "nda/nda.hpp"
+#include "h5/h5.hpp"
+#include "nda/h5.hpp"
+#include "nda/blas.hpp"
+#include "nda/tensor.hpp"
+#include "nda/linalg/det_and_inverse.hpp"
+#include "itertools/itertools.hpp"
+#include "numerics/fft/nda.hpp"
+#include "grids/r_grids.hpp"
+#include "numerics/shared_array/nda.hpp"
+#include "numerics/shared_array/nda_blas.hpp"
+#include "numerics/distributed_array/nda.hpp"
+#include "numerics/distributed_array/h5.hpp"
+#include "utilities/proc_grid_partition.hpp"
+#include "utilities/functions.hpp"
+#include "utilities/kpoint_utils.hpp"
+#include "numerics/nda_functions.hpp"
+#include "mean_field/properties.hpp"
+#include "mean_field/distributed_orbital_readers.hpp"
+#include "grids/g_grids.hpp"
+#include "numerics/device_kernels/kernels.h"
+
+namespace methods
+{
+
+template<MEMORY_SPACE MEM>
+auto thc::load_basis_subset_nonuniform_rgrid(nda::MemoryArrayOfRank<1> auto const& IPts, int iq,
+                                             nda::range kp_rg, nda::range a_rg, nda::range b_rg)
+{
+  using local_Array_t = typename memory::array<MEM,ComplexType,4>;
+  utils::check(iq==0, "load_basis_subset_nonuniform_rgrid: non gamma-point is not implemented yet!");
+  utils::check(kp_rg.size()==1 and kp_rg.first()==0,
+               "load_basis_subset_nonuniform_rgrid: non gamma-point is not implemented yet!");
+  utils::check(mf->npol()==1, "Non-collinear not yet implemented");
+
+
+  long nIpts = IPts.shape(0);
+  long nspins = mf->nspin_in_basis();
+  utils::check( rho_g.nnr() == mf->nnr(), "Error: Incompatible grids, Oh oh...");
+
+  memory::array<MEM,ComplexType,1> Psir(rho_g.nnr());
+  local_Array_t Psia(nspins,1,a_rg.size(),nIpts);
+  local_Array_t Psib(nspins,1,b_rg.size(),nIpts);
+
+// do all orbitals for a kpoint in batched mode
+  // a_range
+  for( auto [is,s] : itertools::enumerate(itertools::range(nspins)) ) {
+    for( auto [ia,a] : itertools::enumerate(a_rg) ) {
+      Timer.start("IO_ORBS");
+      mf->get_orbital('r',s,0,a,Psir);
+      Timer.stop("IO_ORBS");
+
+      // r->ru
+      for( int u=0; u<nIpts; ++u )
+        Psia(is,0,ia,u) = Psir(IPts(u));
+    }
+  }
+  // b_range
+  for( auto [is,s] : itertools::enumerate(itertools::range(nspins)) ) {
+    for( auto [ib,b] : itertools::enumerate(b_rg) ) {
+      Timer.start("IO_ORBS");
+      mf->get_orbital('r',s,0,b,Psir);
+      Timer.stop("IO_ORBS");
+
+      // r->ru
+      for( int u=0; u<nIpts; ++u )
+        Psib(is,0,ib,u) = Psir(IPts(u));
+    }
+  }
+  return std::make_tuple(std::move(Psia),std::move(Psib));
+}
+
+template<MEMORY_SPACE MEM>
+auto thc::load_basis_subset_fft_grid(nda::MemoryArrayOfRank<1> auto const& IPts, int iq,
+                   nda::range kp_rg, nda::range a_rg, nda::range b_rg)
+//     -> std::tuple<memory::array<MEM,ComplexType,4>,memory::array<MEM,ComplexType,4>>
+{
+  using local_Array_t = typename memory::array<MEM,ComplexType,4>;
+  decltype(nda::range::all) all;
+  long nIpts = IPts.shape()[0];
+  long nspins = mf->nspin_in_basis();
+  auto kpts = mf->kpts();
+  bool custom_grid = (mf->has_wfc_grid() and mf->fft_grid_dim() != rho_g.mesh());
+  auto wfc_to_rho = memory::to_memory_space<MEM>(swfc_to_rho.local());
+  utils::check(mf->npol()==1, "Non-collinear not yet implemented");
+
+  // batch fft later
+  memory::array<MEM,ComplexType,2> Psir(1,rho_g.nnr());
+  auto Psir_4d = nda::reshape(Psir, std::array<long,4>{Psir.shape()[0],
+                                                    rho_g.mesh(0),
+                                                    rho_g.mesh(1),
+                                                    rho_g.mesh(2)});
+
+  auto phase = memory::unified_array<ComplexType, 3>::zeros({rho_g.mesh(0),
+                                                  rho_g.mesh(1),
+                                                  rho_g.mesh(2)});
+  auto phase_1D = nda::reshape(phase, shape_t<1>{rho_g.nnr()});
+  nda::stack_array<RealType,3> Gab = {0.0,0.0,0.0};
+
+  Timer.start("FFTPLAN");
+  math::nda::fft<true> F(Psir_4d);
+  Timer.stop("FFTPLAN");
+
+  local_Array_t Psia(nspins,kp_rg.size(),a_rg.size(),nIpts);
+  local_Array_t Psib(nspins,kp_rg.size(),b_rg.size(),nIpts);
+
+  memory::array<MEM,ComplexType,1> buff;
+  if(custom_grid) {
+    auto wfc_g = mf->wfc_truncated_grid();
+    buff = memory::array<MEM,ComplexType,1>(wfc_g->size());
+  }
+
+// do all orbitals for a kpoint in batched mode
+  // a_range
+  for( auto [is,s] : itertools::enumerate(itertools::range(nspins)) ) {
+    for( auto [ik,k] : itertools::enumerate(kp_rg) ) {
+      utils::rspace_phase_factor(mf->lattv(),kpts(k,all),phase);
+      for( auto [ia,a] : itertools::enumerate(a_rg) ) {
+
+        if(custom_grid) {
+          Timer.start("IO_ORBS");
+          mf->get_orbital('w',s,k,a,buff);
+          Timer.stop("IO_ORBS");
+          Psir(0,all) = ComplexType(0.0);
+          nda::copy_select(true,wfc_to_rho,ComplexType(1.0),buff,ComplexType(0.0),Psir(0,all));
+        } else {
+          Timer.start("IO_ORBS");
+          mf->get_orbital('g',s,k,a,Psir(0,all));
+          Timer.stop("IO_ORBS");
+        }
+
+        Timer.start("FFT");
+        F.backward(Psir_4d);
+        Timer.stop("FFT");
+
+        // r->ru
+        for( int u=0; u<nIpts; ++u )
+          Psia(is,ik,ia,u) = Psir(0,IPts(u)) * phase_1D(IPts(u));
+      }
+    }
+  }
+  // b_range
+  for( auto [is,s] : itertools::enumerate(itertools::range(nspins)) ) {
+    for( auto [ik,k] : itertools::enumerate(kp_rg) ) {
+      long kb = mf->qk_to_k2(iq,k);  // kb = k - (q + G)
+      utils::rspace_phase_factor(mf->lattv(),kpts(kb,all),phase);
+      for( auto [ib,b] : itertools::enumerate(b_rg) ) {
+        if(custom_grid) {
+          Timer.start("IO_ORBS");
+          mf->get_orbital('w',s,kb,b,buff);
+          Timer.stop("IO_ORBS");
+          Psir(0,all) = ComplexType(0.0);
+          nda::copy_select(true,wfc_to_rho,ComplexType(1.0),buff,ComplexType(0.0),Psir(0,all));
+        } else {
+          Timer.start("IO_ORBS");
+          mf->get_orbital('g',s,kb,b,Psir(0,all));
+          Timer.stop("IO_ORBS");
+        }
+        Timer.start("FFT");
+        F.backward(Psir_4d);
+        Timer.stop("FFT");
+
+        // r->ru
+        for( int u=0; u<nIpts; ++u )
+          Psib(is,ik,ib,u) = Psir(0,IPts(u)) * phase_1D(IPts(u));
+      }
+    }
+  }
+
+  return std::make_tuple(std::move(Psia),std::move(Psib)); 
+}
+
+template<MEMORY_SPACE MEM>
+void thc::get_Tkur_nonuniform_rgrid(bool add_phase, int ispin, nda::range orb_range, nda::range r_range,
+                                   memory::array<MEM,long,1> const& IPts,
+                                   memory::darray_t<memory::array<MEM,ComplexType,3>,mpi3::communicator>& Tkur)
+{
+  using local_Array_t = memory::array<MEM, ComplexType, 2>;
+  using math::nda::make_distributed_array;
+  using math::nda::transpose;
+  using math::nda::dagger;
+  decltype(nda::range::all) all;
+
+  long nIpts = IPts.shape()[0];
+  long nkpts = mf->nkpts();
+  auto kpts = mf->kpts();
+  auto bu = Tkur.block_size()[1];
+  auto br = Tkur.block_size()[2];
+  auto grid = Tkur.grid();
+
+  utils::check( nkpts==1 and kpts(0,0)*kpts(0,0)*kpts(0,1)*kpts(0,1)*kpts(0,2)*kpts(0,2) < 1e-8,
+                "get_Tkur_nonuniform_rgrid: non gamma-point is not implemented");
+  utils::check( Tkur.global_shape()[1] == nIpts, "Size mismatch.");
+  utils::check( Tkur.global_shape()[2] == r_range.size(), "Size mismatch.");
+
+  // generate intra-pool communicator, use first k-point index as a key
+  mpi3::communicator q_intra_comm = mpi->comm.split(Tkur.local_range(0).first(),mpi->comm.rank());
+  utils::check(q_intra_comm.size() == grid[1]*grid[2], "Communicator size mismatch.");
+  utils::check( rho_g.nnr() == mf->nnr(), "Error: Incompatible grids, oh oh...");
+
+  auto Psiu{make_distributed_array<local_Array_t>(q_intra_comm,{grid[1],grid[2]},
+                                                  {orb_range.size(),nIpts},{default_block_size,bu})};
+  auto Psir{make_distributed_array<local_Array_t>(q_intra_comm,{grid[1],grid[2]},
+                                                  {orb_range.size(),r_range.size()},{default_block_size,br})};
+
+  // FIXME breaks when orb_range < q_intra_comm.size()
+  auto buff{make_distributed_array<local_Array_t>(q_intra_comm,{q_intra_comm.size(),1},
+                                                  {orb_range.size(),rho_g.nnr()},{1,1})};
+  auto buff_loc = buff.local();
+  auto buff_rng_loc = buff_loc(all,r_range);
+  memory::darray_view_t<local_Array_t,mpi3::communicator> buff_rng(std::addressof(q_intra_comm),
+                                                                   {q_intra_comm.size(),1}, {orb_range.size(),r_range.size()},
+                                                                   {buff.origin()[0], 0}, {1,1}, buff_rng_loc);
+
+  auto buff_iu{make_distributed_array<local_Array_t>(q_intra_comm,{q_intra_comm.size(),1},
+                                                    {orb_range.size(),nIpts},{1,1})};
+  auto buff_iu_loc = buff_iu.local();
+
+  auto phase = memory::unified_array<ComplexType, 3>::zeros({rho_g.mesh(0),
+                                                             rho_g.mesh(1),
+                                                             rho_g.mesh(2)});
+  auto phase_1D = nda::reshape(phase, shape_t<1>{rho_g.nnr()});
+  memory::array<MEM, ComplexType, 1> phase_d(rho_g.nnr());
+
+  for( auto [ik,k]: itertools::enumerate(Tkur.local_range(0))) {
+
+    Timer.start("IO_ORBS");
+    mf->get_orbital_set('r',ispin,k,buff.local_range(0)+orb_range.first(),buff_loc);
+    Timer.stop("IO_ORBS");
+
+    // psi(a,r) *= exp(i k r)
+    if(add_phase) {
+      utils::rspace_phase_factor(mf->lattv(),kpts(k,all),phase);
+      if constexpr ( MEM == HOST_MEMORY ) {
+        for( auto ia : nda::range(buff_loc.shape()[0]) )
+          buff_loc(ia,all) *= phase_1D(all);
+      } else {
+        phase_d() = phase_1D();
+        nda::tensor::elementwise(ComplexType(1.0),phase_d,"r",
+                                 ComplexType(1.0),buff_loc,"ar",nda::tensor::op::MUL);
+      }
+    }
+
+    // r->ru
+    Timer.start("EXTRA");
+    nda::copy_select(false,1,IPts,ComplexType(1.0),buff_loc,ComplexType(0.0),buff_iu_loc);
+    Timer.stop("EXTRA");
+
+    Timer.start("COMM");
+    math::nda::redistribute(buff_rng,Psir);
+    math::nda::redistribute(buff_iu,Psiu);
+    Timer.stop("COMM");
+
+    // distributed GEMM (might be slow in small systems if overly distributed...)
+    Timer.start("GEMM");
+    memory::darray_view_t<local_Array_t,mpi3::communicator> Tur(std::addressof(q_intra_comm),
+                                                                {grid[1],grid[2]}, {nIpts,r_range.size()}, {Tkur.origin()[1], Tkur.origin()[2]},
+                                                                {bu,br}, Tkur.local()(ik,all,all));
+    math::nda::slate_ops::multiply(dagger(Psiu),Psir,Tur);
+    Timer.stop("GEMM");
+  }
+}
+
+template<MEMORY_SPACE MEM>
+void thc::get_Tkur_fft_grid(bool add_phase, int ispin, nda::range orb_range, nda::range r_range,
+        memory::array<MEM,long,1> const& IPts, 
+	memory::darray_t<memory::array<MEM,ComplexType,3>,mpi3::communicator>& Tkur)
+{
+  using local_Array_t = memory::array<MEM, ComplexType, 2>; 
+  using math::nda::make_distributed_array;
+  using math::nda::transpose;
+  using math::nda::dagger;
+  decltype(nda::range::all) all;
+  utils::check(mf->npol()==1, "Non-collinear not yet implemented");
+
+  long nIpts = IPts.shape()[0];
+  auto kpts = mf->kpts();
+  auto bu = Tkur.block_size()[1];
+  auto br = Tkur.block_size()[2];
+  auto grid = Tkur.grid();
+
+  utils::check( Tkur.global_shape()[1] == nIpts, "Size mismatch.");
+  utils::check( Tkur.global_shape()[2] == r_range.size(), "Size mismatch.");
+
+  // generate intra-pool communicator, use first k-point index as a key 
+  mpi3::communicator q_intra_comm = mpi->comm.split(Tkur.local_range(0).first(),mpi->comm.rank());   
+  utils::check(q_intra_comm.size() == grid[1]*grid[2], "Communicator size mismatch.");
+  utils::check( rho_g.nnr() == mf->nnr(), "Error: Incompatible grids, oh oh...");
+
+  auto Psiu{make_distributed_array<local_Array_t>(q_intra_comm,{grid[1],grid[2]},
+                {orb_range.size(),nIpts},{default_block_size,bu})};
+  auto Psir{make_distributed_array<local_Array_t>(q_intra_comm,{grid[1],grid[2]},
+                {orb_range.size(),r_range.size()},{default_block_size,br})};
+
+  // FIXME breaks when orb_range < q_intra_comm.size()
+  auto buff{make_distributed_array<local_Array_t>(q_intra_comm,{q_intra_comm.size(),1},
+                {orb_range.size(),rho_g.nnr()},{1,1})};
+  auto buff_loc = buff.local();
+  auto buff_loc_4d = nda::reshape(buff_loc, std::array<long,4>{buff_loc.shape()[0],
+                                                rho_g.mesh(0),
+                                                rho_g.mesh(1),
+                                                rho_g.mesh(2)});
+  auto buff_rng_loc = buff_loc(all,r_range);
+  memory::darray_view_t<local_Array_t,mpi3::communicator> buff_rng(std::addressof(q_intra_comm),
+            {q_intra_comm.size(),1}, {orb_range.size(),r_range.size()}, 
+            {buff.origin()[0], 0}, {1,1}, buff_rng_loc);
+
+  auto buffuv{make_distributed_array<local_Array_t>(q_intra_comm,{q_intra_comm.size(),1},
+                {orb_range.size(),nIpts},{1,1})};
+  auto buffuv_loc = buffuv.local();
+
+  auto phase = memory::unified_array<ComplexType, 3>::zeros({rho_g.mesh(0),
+                                                             rho_g.mesh(1),
+                                                             rho_g.mesh(2)});
+  auto phase_1D = nda::reshape(phase, shape_t<1>{rho_g.nnr()});
+  memory::array<MEM, ComplexType, 1> phase_d(rho_g.nnr());
+
+  Timer.start("FFTPLAN");
+  math::nda::fft<true> F(buff_loc_4d);
+  Timer.stop("FFTPLAN");
+
+  for( auto [ik,k]: itertools::enumerate(Tkur.local_range(0))) {
+
+    Timer.start("IO_ORBS");
+    mf->get_orbital_set('g',ispin,k,buff.local_range(0)+orb_range.first(),buff_loc);
+    Timer.stop("IO_ORBS");
+
+    Timer.start("FFT");
+    F.backward(buff_loc_4d);
+    Timer.stop("FFT");
+
+    // psi(a,r) *= exp(i k r)
+    if(add_phase) {
+      utils::rspace_phase_factor(mf->lattv(),kpts(k,all),phase); 
+      if constexpr ( MEM == HOST_MEMORY ) {
+        for( auto ia : nda::range(buff_loc.shape()[0]) ) 
+          buff_loc(ia,all) *= phase_1D();
+      } else {
+        phase_d() = phase_1D();
+        nda::tensor::elementwise(ComplexType(1.0),phase_d,"r",
+              ComplexType(1.0),buff_loc,"ar",nda::tensor::op::MUL);
+      }
+    }
+
+    // r->ru
+    Timer.start("EXTRA");
+    nda::copy_select(false,1,IPts,ComplexType(1.0),buff_loc,ComplexType(0.0),buffuv_loc);
+    Timer.stop("EXTRA");
+
+    Timer.start("COMM");
+    math::nda::redistribute(buff_rng,Psir);
+    math::nda::redistribute(buffuv,Psiu);
+    Timer.stop("COMM");
+
+    // distributed GEMM (might be slow in small systems if overly distributed...)
+    Timer.start("GEMM");
+    memory::darray_view_t<local_Array_t,mpi3::communicator> Tur(std::addressof(q_intra_comm),
+		{grid[1],grid[2]}, {nIpts,r_range.size()}, {Tkur.origin()[1], Tkur.origin()[2]},
+		{bu,br}, Tkur.local()(ik,all,all));   
+    math::nda::slate_ops::multiply(dagger(Psiu),Psir,Tur);
+    Timer.stop("GEMM"); 
+  }
+} 
+
+/*
+ * Calculates T(k,u,g) = sum_a X(k,u,a) * psi(is,korder(k),a,g)
+ *   Returns distributed array, distributed over u 
+ */ 
+template<MEMORY_SPACE MEM, typename dArray_t, typename dArray2_t>
+void thc::get_Tkug(int ispin, int ipol, nda::array<int,1> const& kp_to_ibz, 
+              nda::array<int,1> const& kp_order, 
+              nda::ArrayOfRank<3> auto const& Xkua, _darray_t_<MEM,5> const& psi,
+              dArray_t& Tkug_g, dArray2_t& Tkug_u)
+{
+  decltype(nda::range::all) all;
+  long nk = Xkua.extent(0);  
+  long nu = Xkua.extent(1);  
+  long na = Xkua.extent(2);  
+  long ng = psi.global_shape()[4];
+
+  utils::check( kp_order.size() == nk, "Shape mismatch: kp_order.size:{}, nk:{}",kp_order.size(), nk);
+  utils::check( psi.global_shape()[2] == na, "Shape mismatch Psi(2):{}, Xkua(2):{}",psi.global_shape()[2], na);  
+  utils::check( psi.grid() == std::array<long,5>{1,1,1,1,mpi->comm.size()}, "Grid mismatch");
+  utils::check( Tkug_g.grid() == std::array<long,3>{1,1,mpi->comm.size()}, "Grid mismatch");
+  utils::check( Tkug_g.global_shape() == std::array<long,3>{nk,nu,ng} and
+                Tkug_g.global_shape() == Tkug_u.global_shape(), "Shape mismatch");
+  utils::check(Tkug_g.local_range(2) == psi.local_range(4), "Range mismatch");
+
+  auto Tloc = Tkug_g.local();
+  auto ploc = psi.local()(ispin,all,all,all,all);
+ 
+  Timer.start("GEMM");
+  for( auto [ik,k] : itertools::enumerate(kp_order) ) 
+    nda::blas::gemm(Xkua(ik,all,all),ploc(kp_to_ibz(k),all,ipol,all),Tloc(ik,all,all));
+  Timer.stop("GEMM");
+
+  math::nda::redistribute<decltype(Tkug_g), decltype(Tkug_u), 1>(Tkug_g,Tkug_u);
+  Tkug_g.communicator()->barrier(); 
+}
+
+/*
+ * Calculates T(k,u,g) = sum_a X(k,u,a) * psi(is,korder(k),a,g)
+ *   Returns distributed array, distributed over u 
+ *   This version allocates temporary on the fly
+ */
+template<MEMORY_SPACE MEM, typename dArray_t>
+void thc::get_Tkug(int ispin, int ipol, nda::array<int,1> const& kp_to_ibz,
+              nda::array<int,1> const& kp_order,
+              nda::ArrayOfRank<3> auto const& Xkua, _darray_t_<MEM,5> const& psi,
+              dArray_t& Tkug_u)
+{
+  using local_Array3_t = memory::array<MEM, ComplexType, 3>;
+  decltype(nda::range::all) all;
+  long nk = Xkua.extent(0);
+  long nu = Xkua.extent(1);
+  long na = Xkua.extent(2);
+  long ng = psi.global_shape()[4];
+  auto comm = Tkug_u.communicator();
+
+  auto Tkug_g{math::nda::make_distributed_array<local_Array3_t>(*comm,{1,1,comm->size()},
+                Tkug_u.global_shape(),{1,1,1})};
+
+  utils::check( kp_order.size() == nk, "Shape mismatch: kp_order.size:{}, nk:{}",kp_order.size(), nk);
+  utils::check( psi.global_shape()[2] == na, "Shape mismatch Psi(2):{}, Xkua(2):{}",psi.global_shape()[2], na);
+  utils::check( psi.grid() == std::array<long,5>{1,1,1,1,comm->size()}, "Grid mismatch");
+  utils::check( Tkug_g.grid() == std::array<long,3>{1,1,comm->size()}, "Grid mismatch");
+  utils::check( Tkug_g.global_shape() == std::array<long,3>{nk,nu,ng} and
+                Tkug_g.global_shape() == Tkug_u.global_shape(), "Shape mismatch");
+  utils::check(Tkug_g.local_range(2) == psi.local_range(4), "Range mismatch");
+
+  auto Tloc = Tkug_g.local();
+  auto ploc = psi.local()(ispin,all,all,all,all);
+
+  Timer.start("GEMM");
+  for( auto [ik,k] : itertools::enumerate(kp_order) )
+    nda::blas::gemm(Xkua(ik,all,all),ploc(kp_to_ibz(k),all,ipol,all),Tloc(ik,all,all));
+  Timer.stop("GEMM");
+
+  math::nda::redistribute(Tkug_g,Tkug_u);
+  comm->barrier();
+}
+
+/*
+ * Tuv = sum_(i in orb_range) conj(Psi(k,i,ru)) * Psi(k,i,rv)
+ */ 
+template<MEMORY_SPACE MEM>
+void thc::get_Tuv_nonuniform_rgrid(bool add_phase, int ispin, int k, nda::range orb_range,
+                  memory::array<MEM,long,1> const& IPts,
+                  memory::darray_t<memory::array<MEM,ComplexType,2>,mpi3::communicator>& Tuv)
+{
+  using local_Array_t = memory::array<MEM,ComplexType,2>;
+  using math::nda::make_distributed_array;
+  using math::nda::dagger;
+  decltype(nda::range::all) all;
+
+  utils::check(!add_phase, "get_Tuv_nonuniform_rgrid: non gamma-point is not implemented");
+  utils::check(k == 0, "get_Tuv_nonuniform_rgrid: non gamma-point is not implemented");
+  utils::check( rho_g.nnr() == mf->nnr(), "Error: Incompatible grids, Oh oh...");
+  utils::check(mf->npol()==1, "Non-collinear not yet implemented");
+
+  long nIpts = IPts.shape()[0];
+  auto mb = Tuv.block_size()[0];
+  auto grid = Tuv.grid();
+
+  utils::check( Tuv.global_shape()[0] == nIpts, "Size mismatch.");
+  utils::check( Tuv.global_shape()[1] == nIpts, "Size mismatch.");
+
+  auto Psiu{make_distributed_array<local_Array_t>(mpi->comm,grid,
+                {orb_range.size(),nIpts}, {default_block_size,mb})};
+  auto buff_nr{make_distributed_array<local_Array_t>(mpi->comm,{mpi->comm.size(),1},
+                {orb_range.size(),rho_g.nnr()}, {1,1})};
+  auto buff_nu{make_distributed_array<local_Array_t>(mpi->comm,{mpi->comm.size(),1},
+                {orb_range.size(),nIpts}, {1,1})};
+
+  auto buff_nr_loc = buff_nr.local();
+  auto buff_nu_loc = buff_nu.local();
+
+  auto sa_rng = buff_nr.local_range(0);
+  Timer.start("IO_ORBS");
+  for( auto [i,sa] : itertools::enumerate(sa_rng) ) 
+    mf->get_orbital('r',ispin,0,int(orb_range.first() + sa),buff_nr_loc(i,all));
+  Timer.stop("IO_ORBS");
+
+  Timer.start("EXTRA");
+  // r->ru
+  nda::copy_select(false,1,IPts,ComplexType(1.0),buff_nr_loc,ComplexType(0.0),buff_nu_loc);
+  Timer.stop("EXTRA");
+
+  Timer.start("COMM");
+  math::nda::redistribute(buff_nu,Psiu);
+  Timer.stop("COMM");
+
+  // distributed GEMM (might be slow in small systems if overly distributed...)
+  Timer.start("GEMM");
+  math::nda::slate_ops::multiply(dagger(Psiu),Psiu,Tuv);
+  Timer.stop("GEMM");
+}
+
+
+/*
+ * Tuv = sum_(i in orb_range) conj(Psi(k,i,ru)) * Psi(k,i,rv)
+ */ 
+template<MEMORY_SPACE MEM>
+void thc::get_Tuv_fft_grid(bool add_phase, int ispin, int k, nda::range orb_range, memory::array<MEM,long,1> const& IPts,
+        memory::darray_t<memory::array<MEM,ComplexType,2>,mpi3::communicator>& Tuv)
+{
+  using local_Array_t = memory::array<MEM,ComplexType,2>; 
+
+  using math::nda::make_distributed_array;
+  using math::nda::transpose;
+  using math::nda::dagger;
+  decltype(nda::range::all) all;
+
+  auto kpts = mf->kpts();
+  long nIpts = IPts.shape()[0];
+  auto mb = Tuv.block_size()[0];
+  auto grid = Tuv.grid();
+  bool custom_grid = (mf->has_wfc_grid() and mf->fft_grid_dim() != rho_g.mesh());
+  auto wfc_to_rho = memory::to_memory_space<MEM>(swfc_to_rho.local());
+
+  utils::check( Tuv.global_shape()[0] == nIpts, "Size mismatch.");
+  utils::check( Tuv.global_shape()[1] == nIpts, "Size mismatch.");
+  utils::check(mf->npol()==1, "Non-collinear not yet implemented");
+
+  auto phase = memory::unified_array<ComplexType, 3>::zeros({rho_g.mesh(0),
+                                                  rho_g.mesh(1),
+                                                  rho_g.mesh(2)});
+  auto phase_1D = nda::reshape(phase, shape_t<1>{rho_g.nnr()});
+  if(add_phase)
+    utils::rspace_phase_factor(mf->lattv(),kpts(k,all),phase);
+
+  auto Psiu{make_distributed_array<local_Array_t>(mpi->comm,grid,
+                {orb_range.size(),nIpts},{default_block_size,mb})};
+
+  auto buff{make_distributed_array<local_Array_t>(mpi->comm,{mpi->comm.size(),1},
+                {orb_range.size(),rho_g.nnr()},{1,1})};
+  auto buff_loc = buff.local();
+  auto buffuv{make_distributed_array<local_Array_t>(mpi->comm,{mpi->comm.size(),1},
+                {orb_range.size(),nIpts},{1,1})};
+  auto buffuv_loc = buffuv.local();
+
+  memory::array<MEM,ComplexType,1> wbuff;
+  if(custom_grid) {
+    auto wfc_g = mf->wfc_truncated_grid();
+    wbuff = memory::array<MEM,ComplexType,1>(wfc_g->size());
+  }
+
+  auto rng = buff.local_range(0);
+  Timer.start("IO_ORBS");
+  // for GPU, orbitals in kinetic grid and fft in batches
+  // add kernel to shift from kinetic grid to fft grid
+  for( auto [i,n] : itertools::enumerate(rng) ) { 
+    if(custom_grid) {
+      mf->get_orbital('w',ispin,k,int(orb_range.first() + n),wbuff);
+      buff_loc(i,all) = ComplexType(0.0);
+      nda::copy_select(true,wfc_to_rho,ComplexType(1.0),wbuff,ComplexType(0.0),buff_loc(i,all));
+    } else {
+      mf->get_orbital('g',ispin,k,int(orb_range.first() + n),buff_loc(i,all));
+    }
+  }
+  Timer.stop("IO_ORBS");
+// MAM: add fft_plan
+  Timer.start("FFT");
+  auto buff_loc_4d = nda::reshape(buff_loc, std::array<long,4>{buff_loc.shape()[0],
+                                                                     rho_g.mesh(0),
+                                                                     rho_g.mesh(1),
+                                                                     rho_g.mesh(2)});
+  math::fft::invfft_many(buff_loc_4d);
+  Timer.stop("FFT");
+
+  // add phase: u(r) -> u(r) * phase(r) = u(r) * exp( -iGr ), so k-(q+G) -> k-q 
+  Timer.start("EXTRA");
+  if(add_phase) {
+    if( MEM == HOST_MEMORY ) {
+      for( auto i : itertools::range(rng.size()) )
+        buff_loc(i,all) *= phase_1D();
+    } else {
+      memory::array<MEM, ComplexType, 1> phase_d(phase_1D);
+      nda::tensor::elementwise(ComplexType(1.0),phase_d,"r",
+                  ComplexType(1.0),buff_loc,"ar",nda::tensor::op::MUL);
+    }
+  }
+  // r->ru
+  nda::copy_select(false,1,IPts,ComplexType(1.0),buff_loc,ComplexType(0.0),buffuv_loc);
+  Timer.stop("EXTRA");
+
+  Timer.start("COMM");
+  math::nda::redistribute(buffuv,Psiu);
+  Timer.stop("COMM");
+
+  // distributed GEMM (might be slow in small systems if overly distributed...)
+  Timer.start("GEMM");
+  math::nda::slate_ops::multiply(dagger(Psiu),Psiu,Tuv);
+  Timer.stop("GEMM");
+}
+
+/*
+ * This routine does 4 things:
+ * 1. copies Xskau from distributed memory to shared memory on all nodes
+ * 2. changes the structure of ipts from original order to the block consistent order given by iu_for_sXb 
+ * 3. chooses kpts from kp_order
+ * 4. conjugates X
+ */
+template<MEMORY_SPACE MEM, typename Tensor_t>
+auto thc::Xskau_to_sXbkua(int ispin, nda::ArrayOfRank<1> auto const& iu_for_sXb,
+                     Tensor_t const& Xa, nda::array<int,1>& kp_order)
+{
+  decltype(nda::range::all) all;
+  long nIpts_per_blk = iu_for_sXb.extent(0);
+  auto kp_range = Xa.local_range(1);
+  auto a_range_loc = Xa.local_range(2);
+  auto u_range = Xa.local_range(3);
+
+  if constexpr (MEM==HOST_MEMORY) {
+
+    mpi->comm.barrier();
+    math::shm::shared_array<nda::array_view<ComplexType,3>> sXkua(*mpi,
+          {kp_order.size(),nIpts_per_blk,Xa.global_shape()[2]});
+    mpi->node_comm.barrier();
+    auto dXloc = Xa.local();
+    auto sXloc = sXkua.local();
+
+    for( auto [ik,k] : itertools::enumerate(kp_order) ) {
+
+      if( k < kp_range.first() or k >= kp_range.last() ) continue;
+
+      for( long iub=0; iub<nIpts_per_blk; ++iub ) {
+
+        if( iu_for_sXb(iub) < 0 ) continue;
+        long n = iu_for_sXb(iub) - u_range.first();
+        if( n >= 0 and n < u_range.size() )
+          sXloc(ik,iub,a_range_loc) = nda::conj(dXloc(ispin,k-kp_range.first(),all,n));
+
+      }
+
+    }
+    mpi->comm.barrier();
+    // linearize and let all tasks reduce?
+    if(mpi->node_comm.root()) {
+      mpi->internode_comm.all_reduce_in_place_n(sXloc.data(),sXloc.size(),std::plus<>{});
+    }
+    mpi->comm.barrier();
+
+    return sXkua;
+
+  } else {
+
+    memory::array<MEM,ComplexType,3> Xkua(kp_order.size(),nIpts_per_blk,Xa.global_shape()[2]);
+    Xkua() = ComplexType(0.0);
+    auto dXloc = Xa.local();
+
+    for( auto [ik,k] : itertools::enumerate(kp_order) ) {
+
+      if( k < kp_range.first() or k >= kp_range.last() ) continue;
+
+      for( long iub=0; iub<nIpts_per_blk; ++iub ) {
+
+        if( iu_for_sXb(iub) < 0 ) continue;
+        long n = iu_for_sXb(iub) - u_range.first();
+        if( n >= 0 and n < u_range.size() )
+          nda::tensor::assign(dXloc(ispin,k-kp_range.first(),all,n),Xkua(ik,iub,a_range_loc));
+
+      }
+
+    }
+    arch::synchronize(); 
+    nda::tensor::scale(ComplexType(1.0), Xkua, nda::tensor::op::CONJ); 
+#if defined(ENABLE_NCCL)
+    mpi->dev_comm.all_reduce_in_place_n(reinterpret_cast<RealType*>(Xkua.data()),2*Xkua.size(),std::plus<>{});
+    arch::synchronize(); 
+#else
+    mpi->comm.all_reduce_in_place_n(Xkua.data(),Xkua.size(),std::plus<>{});
+#endif
+
+    return Xkua;
+
+  }
+}
+
+/*
+ * This routine does 4 things:
+ * 1. copies Xskau from distributed memory to shared memory on all nodes
+ * 2. changes the structure of ipts from a contiguous range to nblk blocks of appropriate size
+ * 3. chooses kpts from kp_order
+ * 4. conjugates X
+ */
+/*template<MEMORY_SPACE MEM, typename Tensor_t>
+auto thc::Xskau_to_sXbkua(int ispin, nda::ArrayOfRank<2> auto const& iu_for_sXb,
+                          Tensor_t const& Xa, nda::array<int,1>& kp_order)
+{
+  if constexpr (MEM == HOST_MEMORY) {
+    decltype(nda::range::all) all;
+    long nblk = iu_for_sXb.extent(0);
+    long nIpts_per_blk = iu_for_sXb.extent(1);
+    auto kp_range = Xa.local_range(1);
+    auto a_range_loc = Xa.local_range(2);
+    auto u_range = Xa.local_range(3);
+
+    mpi->comm.barrier();
+    math::shm::shared_array<nda::array_view<ComplexType, 3>> sXbkua(
+        *mpi, {kp_order.size(), nIpts_per_blk, Xa.global_shape()[2]});
+    mpi->node_comm.barrier();
+    auto dXloc = Xa.local();
+    auto sXloc = sXbkua.local();
+
+    for (auto [ik, k]: itertools::enumerate(kp_order)) {
+
+      if (k < kp_range.first() or k >= kp_range.last()) continue;
+
+      for (long iblk = 0; iblk < nblk; ++iblk) {
+
+        for (long iub = 0; iub < nIpts_per_blk; ++iub) {
+
+          if (iu_for_sXb(iblk, iub) < 0) continue;
+          long n = iu_for_sXb(iblk, iub) - u_range.first();
+          if (n >= 0 and n < u_range.size())
+            sXloc(iblk, ik, iub, a_range_loc) = nda::conj(dXloc(ispin, k - kp_range.first(), all, n));
+
+        }
+
+      }
+
+    }
+    mpi->comm.barrier();
+    // linearize and let all tasks reduce?
+    if (mpi->node_comm.root()) {
+      mpi->internode_comm.all_reduce_in_place_n(sXloc.data(), sXloc.size(), std::plus<>{});
+    }
+    mpi->comm.barrier();
+
+    return sXbkua;
+
+  } else {
+
+    utils::check(false, "Xskau_to_sXbkua is not implemented for GPU yet");
+    memory::array<MEM,ComplexType,3> Xkua(kp_order.size(),nIpts_per_blk,Xa.global_shape()[2]);
+    Xkua() = ComplexType(0.0);
+
+    return Xkua;
+  }
+}*/
+
+/*
+ * C(q,u,v) = sum_k conj(T(k,ru,rv)) * T(k-q,ru,rv)
+ * Z(q,u,G) = fft{r->G}(sum_k conj(T(k,u,r)) * T(k-q,u,r)) on truncated grid
+ */ 
+template<MEMORY_SPACE MEM, typename Tensor_t, typename Tensor2_t>
+auto thc::get_ZquG_Cquv(nda::MemoryArrayOfRank<1> auto const& IPts, 
+                        Tensor_t const& Xa,
+                        Tensor2_t const* Xb,
+                        nda::range a_range, nda::range b_range, 
+                        std::array<long, 3> pgrid) 
+{
+  long nIpts = IPts.size();
+  if (mf->has_wfc_grid()) {
+    utils::check(mf->orb_on_fft_grid(),
+                 "thc::get_ZquG_Cquv: mf->orb_on_fft_grid()==false while mf->has_wfc_grid()==true. "
+                 "                    This is not implemented yet. ");
+    std::array<long, 3> block_size = { 
+      1,  // keep at one to minimize load imbalance 
+      std::min(long(default_block_size), std::min(nIpts/pgrid[1], nIpts/pgrid[2]) ),
+      std::min(long(default_block_size), rho_g.size()/pgrid[2] )
+    };
+    app_log(1," - block sizes: ({},{},{})",block_size[0],block_size[1],block_size[2]);
+    app_log(2," - Calculating Zqur with fft algorithm ");
+    if constexpr (MEM == HOST_MEMORY) {
+      return get_ZquG_Cquv_fft_shared_memory(IPts,Xa,Xb,a_range,b_range,pgrid,block_size);
+    } else {
+      return get_ZquG_Cquv_fft<MEM>(IPts,Xa,Xb,a_range,b_range,pgrid,block_size);
+    }
+  } else { 
+    utils::check(mf->npol()==1, "Non-collinear not yet implemented");
+    std::array<long, 3> block_size = { 
+      1,  // keep at one to minimize load imbalance 
+      std::min(long(default_block_size), std::min(nIpts/pgrid[1], nIpts/pgrid[2]) ),
+      std::min(long(default_block_size), rho_g.nnr()/pgrid[2] )
+    };
+    app_log(1," - block sizes: ({},{},{})",block_size[0],block_size[1],block_size[2]);
+    app_log(2," - Calculating Zqur with r-space algorithm ");
+    return get_ZquG_Cquv_rspace<MEM>(IPts,a_range,b_range,pgrid,block_size);
+  }
+}
+
+/*
+ * Uses intermediates, Tkur = sum_a conj(Psi(k,a,ru))*Psi(k,a,r) in real space.
+ * Slower routine and uses more memory. Appropriate for cases where orbitals are only
+ * available in a real space grid, e.g. finite systems. 
+ */ 
+template<MEMORY_SPACE MEM>
+auto thc::get_ZquG_Cquv_rspace(nda::MemoryArrayOfRank<1> auto const& IPts, 
+                        nda::range a_range, nda::range b_range, 
+                        std::array<long, 3> pgrid, 
+                        std::array<long, 3> block_size) 
+{
+  using math::nda::make_distributed_array;
+  using local_Array_t = memory::array<MEM,ComplexType,3>;
+  using local_uArray_t = memory::array<MEM,ComplexType,3>;
+//  using local_uArray_t = std::conditional_t<MEM==HOST_MEMORY, memory::host_array<ComplexType,3>,
+//                                                          memory::unified_array<ComplexType,3>>;
+  decltype(nda::range::all) all;
+
+  long nqpools = pgrid[0];
+  auto kpts = mf->kpts();
+  auto Q  = mf->Qpts();
+  auto mesh = rho_g.mesh();
+  long nIpts = IPts.shape()[0];
+  long nspins = mf->nspin_in_basis();
+  long nkpts = mf->nkpts();
+  long nqpts_ibz = mf->nqpts_ibz();
+  bool same_orb_range = (a_range==b_range);
+  long proc_per_pool = mpi->comm.size()/nqpools;
+  utils::check(mpi->comm.size() == proc_per_pool*nqpools, "Error in get_ZquG_rspace: nqpools must divide nprocs.");
+  utils::check(mf->npol()==1, "Non-collinear not yet implemented");
+
+  math::shm::shared_array<nda::array_view<ComplexType,2>> sf_Rk(*mpi,{nkpts,nkpts});
+  auto sf_Rk_dev = memory::to_memory_space<MEM>(sf_Rk.local());
+
+  // number of nnr blocks 
+  long nblocks_nnr = get_nblocks_nnr();
+  long nnr_block_size = (rho_g.nnr()+nblocks_nnr - 1)/nblocks_nnr;
+  utils::check(rho_g.nnr() <= nnr_block_size*nblocks_nnr,
+       "Error: nnr() <= nnr_block_size*nblocks_nnr (nnr:{}, block size:{}, n_blocks:{} ",
+       rho_g.nnr(),nnr_block_size,nblocks_nnr);
+
+  Timer.start("ALLOC");
+  long nx = utils::find_proc_grid_max_rows(mpi->comm.size(),nqpts_ibz);
+  utils::check(mpi->comm.size()/nx <= nIpts, "Incompatible processor grid.");
+  auto Z_qur{make_distributed_array<local_uArray_t>(mpi->comm,{nx,mpi->comm.size()/nx,1},
+		{nqpts_ibz,nIpts,rho_g.nnr()},{1})};
+  Z_qur.local() = ComplexType(0.0);
+  Timer.stop("ALLOC");
+
+  // this loop calculates Z_qur by looping over nnr ranges
+  for( long i_nnr=0; i_nnr<nblocks_nnr; ++i_nnr ) {
+ 
+    nda::range nnr_range(i_nnr*nnr_block_size,std::min((i_nnr+1)*nnr_block_size,long(rho_g.nnr())));    
+    // try to avoid all the reallocations!
+    // F(R,u,r) = sum_k exp(ikR) Ta(k,u,r)
+    // distribution only over (u,r)
+    Timer.start("ALLOC");
+    auto F_Rur{make_distributed_array<local_Array_t>(mpi->comm,{1,1,mpi->comm.size()},
+               {nkpts,nIpts,nnr_range.size()})};
+    auto F2D = nda::reshape(F_Rur.local(), shape_t<2>{nkpts,nIpts*F_Rur.local_shape()[2]});
+    F2D() = ComplexType(0.0);
+    Timer.stop("ALLOC");
+
+    // calculate T(u,r) for all kpoints and orbital ranges 
+    for( auto ispin : nda::range(nspins) ) 
+    {
+
+      {
+        // attempt to find a better processor grid for this step
+        long nx2 = std::max(1l, std::min( proc_per_pool, 
+                 std::min(a_range.size(),b_range.size()) / default_block_size) );
+        while( proc_per_pool%nx2 != 0 ) --nx2;
+        long ny2 = proc_per_pool/nx2;
+
+        // temporary array with proper data distribution for get_Tkur 
+        Timer.start("ALLOC");
+        auto Tk{make_distributed_array<local_Array_t>(mpi->comm,{nqpools,nx2,ny2},
+            {nkpts,nIpts,nnr_range.size()},{1,nIpts/std::max(nx2,ny2),default_block_size})};
+        Timer.stop("ALLOC");
+
+        // calculate Ta(k,u,r) for all k-points
+        Timer.start("TUR");
+        if (mf->orb_on_fft_grid())
+          get_Tkur_fft_grid<MEM>(true,ispin,a_range,nnr_range,IPts,Tk);
+        else
+          get_Tkur_nonuniform_rgrid<MEM>(true,ispin,a_range,nnr_range,IPts,Tk);
+        Timer.stop("TUR");
+
+        // Ta(k,u,r) = sum_a_range std::conj(Psi(k,a,Ipts(u)))*Psi(k,a,r) 
+        // distribution only over (u,r)
+        Timer.start("ALLOC");
+        auto Ta_kur{make_distributed_array<local_Array_t>(mpi->comm,{1,1,mpi->comm.size()},
+                    {nkpts,nIpts,nnr_range.size()})};
+        auto T2D = nda::reshape(Ta_kur.local(),shape_t<2>{nkpts,nIpts*Ta_kur.local_shape()[2]});
+        Timer.stop("ALLOC");
+
+        Timer.start("COMM");
+        math::nda::redistribute(Tk,Ta_kur);
+        Timer.stop("COMM");
+        Timer.start("ZUR");
+        utils::k_to_R_coefficients(mpi->comm, nda::range(nkpts), kpts, mf->lattv(), mf->kp_grid(), sf_Rk);
+        auto f_Rk = sf_Rk.local(); 
+        if constexpr (MEM == HOST_MEMORY) {
+          nda::blas::gemm(ComplexType(1.0),f_Rk,T2D,ComplexType(0.0),F2D);
+        } else {
+          sf_Rk_dev() = f_Rk();
+          nda::blas::gemm(ComplexType(1.0),sf_Rk_dev,T2D,ComplexType(0.0),F2D);
+        }
+        Timer.stop("ZUR");
+
+        if(same_orb_range) {
+          Timer.start("ZUR");
+          auto F1D = nda::reshape(F_Rur.local(), shape_t<1>{F_Rur.local().size()});
+          if constexpr (MEM==HOST_MEMORY) {
+            for( auto& v : F1D ) v = std::conj(v)*v;
+          } else {
+            nda::tensor::elementwise(ComplexType(1.0),nda::conj(F1D),"n",
+                                     ComplexType(1.0),F1D,"n",nda::tensor::op::MUL);
+          }
+          Timer.stop("ZUR");
+        } else {
+          Timer.start("TUR");
+          if (mf->orb_on_fft_grid())
+            get_Tkur_fft_grid<MEM>(true,ispin,b_range,nnr_range,IPts,Tk);
+          else
+            get_Tkur_nonuniform_rgrid<MEM>(true,ispin,b_range,nnr_range,IPts,Tk);
+          Timer.stop("TUR");
+          Timer.start("COMM");
+          math::nda::redistribute(Tk,Ta_kur);
+          Timer.stop("COMM");
+          Timer.start("ZUR");
+          Timer.start("ALLOC");
+          memory::array<MEM, ComplexType, 2> T_(T2D.shape());
+          Timer.stop("ALLOC");
+          auto F1D = nda::reshape(F_Rur.local(), shape_t<1>{F_Rur.local().size()});
+          auto T1D = nda::reshape(T_, shape_t<1>{T_.size()});
+          if constexpr (MEM == HOST_MEMORY) {
+            nda::blas::gemm(ComplexType(1.0),f_Rk,T2D,ComplexType(0.0),T_);
+            F1D = nda::conj(F1D) * T1D; 
+          } else {
+            sf_Rk_dev() = f_Rk();
+            nda::blas::gemm(ComplexType(1.0),sf_Rk_dev,T2D,ComplexType(0.0),T_);
+            nda::tensor::elementwise(ComplexType(1.0),T1D,"n",
+                                     ComplexType(1.0),nda::conj(F1D),"n",nda::tensor::op::MUL);
+          }
+          Timer.stop("ZUR");
+        }
+      }
+
+      {
+        Timer.start("ALLOC");
+        auto Zq{make_distributed_array<local_Array_t>(mpi->comm,{1,1,mpi->comm.size()},
+                {nqpts_ibz,nIpts,nnr_range.size()})};
+        Timer.stop("ALLOC");
+  
+        Timer.start("ZUR");
+        auto Z2D = nda::reshape(Zq.local(), shape_t<2>{nqpts_ibz,nIpts*Zq.local_shape()[2]});
+        auto Qm = nda::make_regular(mf->Qpts_ibz());
+        Qm() *= -1.0;
+        utils::R_to_k_coefficients(mpi->comm, nda::range(nkpts), Qm, mf->lattv(), mf->kp_grid(), sf_Rk);
+        if constexpr (MEM == HOST_MEMORY) {
+          auto f_kR = sf_Rk.local()(nda::range(Qm.extent(0)),all);
+          nda::blas::gemm(ComplexType(1.0),f_kR,F2D,ComplexType(0.0),Z2D);
+        } else {
+          sf_Rk_dev() = sf_Rk.local();
+          auto f_kR = sf_Rk_dev(nda::range(Qm.extent(0)),all);
+          nda::blas::gemm(ComplexType(1.0),f_kR,F2D,ComplexType(0.0),Z2D);
+        } 
+        Timer.stop("ZUR");
+
+        Timer.start("COMM");
+        auto Z_qur_rng_loc = Z_qur.local()(all,all,nnr_range);
+        memory::darray_view_t<local_uArray_t,mpi3::communicator> Z_qur_rng(std::addressof(mpi->comm),
+              Z_qur.grid(), {nqpts_ibz,nIpts,nnr_range.size()},
+              {Z_qur.origin()[0], Z_qur.origin()[1], 0}, 
+              {Z_qur.block_size()[0],Z_qur.block_size()[1],1}, Z_qur_rng_loc);
+        utils::check(Z_qur_rng.local_range(0) == Z_qur.local_range(0), "Range mismatch: Z_qur");
+        utils::check(Z_qur_rng.local_range(1) == Z_qur.local_range(1), "Range mismatch: Z_qur");
+        math::nda::redistribute(Zq,Z_qur_rng,ComplexType(1.0));
+        Timer.stop("COMM");
+      }
+
+    } // ispin
+
+  } // nnr_range
+
+  // quv distributed array 
+  Timer.start("ALLOC");
+  auto C_quv{make_distributed_array<local_uArray_t>(mpi->comm,pgrid,
+                {nqpts_ibz,nIpts,nIpts},{block_size[0],block_size[1],block_size[1]})};
+  Timer.stop("ALLOC");
+
+  // ur -> uv
+  { 
+    Timer.start("ALLOC");
+    auto Cq_{make_distributed_array<local_uArray_t>(mpi->comm,Z_qur.grid(),
+                {nqpts_ibz,nIpts,nIpts},{1})};
+    Timer.stop("ALLOC");
+    long nab = Cq_.local_shape()[0]*Cq_.local_shape()[1];
+    auto Z2D = nda::reshape(Z_qur.local(), shape_t<2>{nab,rho_g.nnr()});
+    auto C2D = nda::reshape(Cq_.local(), shape_t<2>{nab,nIpts});
+    nda::copy_select(false,1,IPts,ComplexType(1.0),Z2D,ComplexType(0.0),C2D);
+    Timer.start("COMM");
+    math::nda::redistribute(Cq_,C_quv);
+    Timer.stop("COMM");
+  }
+
+  // add exp(i q*r) phase factor
+  if constexpr (MEM==HOST_MEMORY) { 
+    Timer.start("ALLOC");
+    memory::unified_array<ComplexType, 1> phase(Z_qur.local_shape()[2]);
+    Timer.stop("ALLOC");
+    // Z_qux(q,u,x) = Z_qux(q,u,x) * phase(q,x)
+    auto Zloc = Z_qur.local();
+    for( auto [iq,q] : itertools::enumerate(Z_qur.local_range(0)) ) { 
+      utils::rspace_phase_factor(mf->lattv(),Q(q,all),mesh,Z_qur.local_range(2),phase);
+      for( auto [iu,u] : itertools::enumerate(Z_qur.local_range(1)) ) 
+        Zloc(iq,iu,all) *= phase();
+    }
+  } else {
+    Timer.start("ALLOC");
+    memory::unified_array<ComplexType, 2> phase(Z_qur.local_shape()[0],Z_qur.local_shape()[2]);
+    Timer.stop("ALLOC");
+    auto Zloc = Z_qur.local();
+    for( auto [iq,q] : itertools::enumerate(Z_qur.local_range(0)) ) 
+      utils::rspace_phase_factor(mf->lattv(),Q(q,all),mesh,Z_qur.local_range(2),phase(iq,all));
+    // Z_qux(q,u,x) = Z_qux(q,u,x) * phase(q,x)
+    nda::tensor::elementwise(ComplexType(1.0),phase,"qr",
+                             ComplexType(1.0),Zloc,"qur",nda::tensor::op::MUL);
+  }
+
+  // fft r->G
+  if (mf->orb_on_fft_grid()) {
+    auto Zloc = Z_qur.local();
+    utils::check(Zloc.shape()[2] == rho_g.nnr(), "Size mismatch.");
+    auto Z4d = nda::reshape(Zloc,
+               std::array<long,4>{Zloc.shape()[0]*Zloc.shape()[1],mesh(0),mesh(1),mesh(2)});
+    Timer.start("FFTPLAN");
+    math::nda::fft<true> F(Z4d);
+    Timer.stop("FFTPLAN");
+    Timer.start("FFT");
+    F.forward(Z4d);
+    Timer.stop("FFT");
+
+    Timer.start("ALLOC");
+    auto Z_{make_distributed_array<local_uArray_t>(mpi->comm,Z_qur.grid(),
+              {nqpts_ibz,nIpts,rho_g.size()},{1})};
+    Timer.stop("ALLOC");
+    // copy from fft mesh to reduced g-grid
+    for( auto [iq,q] : itertools::enumerate(Z_qur.local_range(0)) ) {
+      // Z_(iq, :, :) = Z_qux(iq, :, gv_to_fft)
+      nda::copy_select(false,1,rho_g.gv_to_fft(), 
+                       ComplexType(1.0),Z_qur.local()(iq,all,all),
+                       ComplexType(0.0),Z_.local()(iq,all,all));
+    }
+    Z_qur.reset(); // returning memory in case it is needed!
+    auto Z2_{make_distributed_array<local_uArray_t>(mpi->comm,pgrid,
+                                                    {nqpts_ibz,nIpts,rho_g.size()},
+                                                    block_size)};
+    Timer.start("COMM");
+    math::nda::redistribute(Z_,Z2_);
+    Z_qur = std::move(Z2_);
+    Timer.stop("COMM");
+  } else {
+    auto Z_{make_distributed_array<local_uArray_t>(mpi->comm,pgrid,
+                                                   Z_qur.global_shape(),
+                                                   block_size)};
+    Timer.start("COMM");
+    math::nda::redistribute(Z_qur,Z_);
+    Z_qur.reset();
+    Z_qur = std::move(Z_);
+    Timer.stop("COMM");
+  }
+
+  return std::make_tuple(std::move(Z_qur),std::move(C_quv));;
+}
+
+/*
+ * Uses intermediates in truncated 'w' grid, 
+ * Tkug = sum_a conj(Psi(k,a,ru))*Psi(k,a,g), where g is the 'w' grid. 
+ * Faster and uses less memory than XXX_rspace vesion.
+ *
+ * Algorithm: 
+ *  D  0. Psi(k_ibz,a,g), g in truncated wfn grid.
+ *  D  1. Xc(b,k,u,a): c:conj(), b:blocks of Ipts
+ *     *** The order of ipts needs to be modified in Xc, to make it consistent with the order in
+ *         Z(q,u,G) when processed in blocks 
+ *     loop over blocks of u: 
+ *  L    2.  T(k,u,g) = Xc(b,k,u,a) Psi(kp_to_ibz(k),a,g)
+ *  L    3a. T(k,u,r) = fft(T(k,u,GSinv(g))) * exp(ikr) 
+ *  D    3b. T(R,u,r) = exp(ikR) T(k,u,r), where exp(ikR) is ordered consistently with T   
+ *  L    3e. T(R,u,r) *= conj(T(R,u,r)) , technically at this point it becomes Z(R,u,r)
+ *  D    3f. Z(q,u,r) = exp(iqR) T(R,u,r) 
+ *  L    3g. C(q,u,v) = Z(q,u,rv)
+ *  L    3h. Z(q,u,r) *= exp(-q*r)
+ *  L    3i. Z(q,u,G) = fft(Z(q,u,r)) => mapped to truncated G grid 
+ *
+ *  NOTE: This routine assumes either 1. MEM=DEVICE/UNIFIED or 2. HOST with OpenMP implementation.
+ *  It does NOT use MPI3 shared memory, so not appropriate for MPI parallelization on node. 
+ */
+template<MEMORY_SPACE MEM, typename Tensor_t, typename Tensor2_t>
+auto thc::get_ZquG_Cquv_fft(nda::MemoryArrayOfRank<1> auto const& IPts, 
+                        Tensor_t const& Xa,
+                        Tensor2_t const* Xb,
+                        nda::range a_range, nda::range b_range, 
+                        std::array<long, 3> pgrid, 
+                        std::array<long, 3> block_size) 
+{
+  using math::nda::make_distributed_array;
+  using local_3Array_t = memory::array<MEM,ComplexType,3>;
+  using local_5Array_t = memory::array<MEM,ComplexType,5>;
+  decltype(nda::range::all) all;
+
+  auto kpts = mf->kpts();
+  auto Q  = mf->Qpts();
+  long nIpts = IPts.shape()[0];
+  long nspins = mf->nspin_in_basis();
+  long npol = mf->npol_in_basis();
+  long nkpts = mf->nkpts();
+  long nkpts_ibz = mf->nkpts_ibz();
+  long nkpts_trev_pairs = mf->nkpts_trev_pairs();
+  auto kp_trev_pair = mf->kp_trev_pair();
+  long nqpts_ibz = mf->nqpts_ibz();
+  auto kp_to_ibz = mf->kp_to_ibz();
+  bool same_orb_range = (a_range==b_range);
+  auto wfc_grid = mf->wfc_truncated_grid(); 
+  auto wfc_to_rho = memory::to_memory_space<MEM>(swfc_to_rho.local());
+  auto gv_to_fft = memory::to_memory_space<MEM>(wfc_grid->gv_to_fft());  // 'g' vector indexes of the wfc grid
+  auto symm_list = mf->symm_list();
+
+// examine the role of both a_/b_range and Xb, need clear definitions of what is allowed
+//    - conditions: 1. a_range.size() == Xa.extent(2) always
+//                  2. if Xb , check b_range.size() == Xb->extent(2) 
+//                     otherwise, a_range == b_range              
+// adjust memory estimates
+// implement subroutine to evaluate TRur
+// add version when Xb is provided
+
+  //checks
+  utils::check(a_range.size() == Xa.global_shape()[2], 
+               "Error in thc::get_ZquG_Cquv_fft: Xa size mismatch. Xa.shape(2):{}, a_range.size:{}", 
+               Xa.global_shape()[2],b_range.size());
+  if(Xb != nullptr) 
+    utils::check(b_range.size() == Xb->global_shape()[2], 
+               "Error in thc::get_ZquG_Cquv_fft: Xb size mismatch. Xb.shape(2):{}, b_range.size:{}", 
+               Xb->global_shape()[2],b_range.size());
+  else
+    utils::check(a_range==b_range, "Error in thc::get_ZquG_Cquv_fft: a_range!=b_range with empty Xb."); 
+  if( mpi->comm.size() > nIpts )
+    app_warning( " Unused processors in thc::evaluate: Consider reducing the number of processors");
+
+  long ntasks = mpi->comm.size();
+  long rank = mpi->comm.rank();
+
+  // FBZ-IBZ relations, kpoint symmetry maps
+  // Only account for space symmetries, k-points that need trev are ignored at this step!
+  auto [ksymms,k_to_s,ns_per_kibz,Ks,Skibz] = 
+             utils::generate_kp_maps(nkpts-nkpts_trev_pairs,nkpts_ibz,mf->kp_symm(),mf->kp_to_ibz());
+  int nsym = ksymms.size();
+  utils::check( ksymms[0] == 0, "Error: ksymms[0] != 0, ksymms[0]:{}", ksymms[0]);
+
+  /********************************************************************
+   *     Memory estimates: worst case scenario of 1 ipt per node 
+   ********************************************************************/
+  if(mf->orb_on_fft_grid())
+  {
+    double mem0;
+    if constexpr (MEM==HOST_MEMORY) {
+      mem0 = long(utils::freemem());
+    } else {
+      mem0 = long(utils::freemem_device());
+    }
+    double mem=0.0;
+    // the largest memory usage is in get_ZquG_Cquv, so using just that
+    mem = ( 
+            /* global distributed memory  */
+            nqpts_ibz*nIpts*(rho_g.size()+nIpts)/ntasks                  +  // Z_qug, C_quv
+            nspins*nkpts_ibz*a_range.size()*npol*wfc_grid->size()/ntasks      +  // dPsia 
+      
+            /* local memory */
+            (nkpts-nkpts_trev_pairs) * ntasks * a_range.size()     +  // sXkau (1 ipt per node as the worst case scenario) 
+            nkpts * (nqpts_ibz + nkpts-nkpts_trev_pairs)          +  // RQ,kR 
+            rho_g.nnr() * (nqpts_ibz + nkpts-nkpts_trev_pairs)    +  // phase_q,phase_r,rots
+            /*  working space in shared memory, 1 ipt per node */
+            2.0*(nkpts-nkpts_trev_pairs)*wfc_grid->size()  +  // Tkug_G, Tkug_u
+            ((Xb!=nullptr?3.0:2.0)*nkpts-nkpts_trev_pairs)*rho_g.nnr()          // Tkur_a, TRur_a
+          );
+    if(ntasks > 1) {
+      mem = std::max( mem, 4.0*nqpts_ibz*nIpts*rho_g.size()/ntasks); // redistribute Z_qug at the end
+      mem = std::max( mem, 4.0*nqpts_ibz*nIpts*nIpts/ntasks); // redistribute C_quv at the end
+    }
+    mem *= sizeof(ComplexType) / (1024.0 * 1024.0 * 1024.0); 
+    app_log(1, " - Available memory at this stage:{}",mem0);
+    app_log(1, " - Estimated minimum memory requirement for this step, \n     per (current type of) device: {} GB ", mem);
+  }
+
+  /*******************************************************************
+   *             Shared memory and distributed allocations        
+   ********************************************************************/
+
+  // Arrays generated by this routine:
+  // Z(q,u,g) 
+  // C(q,u,v)
+  Timer.start("ALLOC");
+  auto Z_qug = math::nda::make_distributed_array<local_3Array_t>(mpi->comm,{1,mpi->comm.size(),1},
+                {nqpts_ibz,nIpts,rho_g.size()},{1,1,1});
+  auto C_quv = math::nda::make_distributed_array<local_3Array_t>(mpi->comm,{1,mpi->comm.size(),1},
+                {nqpts_ibz,nIpts,nIpts},{1,1,1});
+  utils::check(Z_qug.local_range(0) == C_quv.local_range(0) and
+               Z_qug.local_range(1) == C_quv.local_range(1), "Partition mismatch.");
+  Z_qug.local() = ComplexType(0.0);
+  C_quv.local() = ComplexType(0.0);
+  long nI_loc = Z_qug.local_shape()[1];
+
+  // temporarily calculating in host and moving to dev
+  // k<->R and R<->k transformations
+  math::shm::shared_array<nda::array_view<ComplexType,2>> sf_RQ(*mpi,{nqpts_ibz,nkpts});
+  math::shm::shared_array<nda::array_view<ComplexType,2>> sf_kR(*mpi,{nkpts,nkpts-nkpts_trev_pairs});
+  // exp(iqr), exp(ikr) phase factor 
+  math::shm::shared_array<nda::array_view<ComplexType,2>> sf_phase_q(*mpi,{nqpts_ibz,rho_g.nnr()});
+  math::shm::shared_array<nda::array_view<ComplexType,2>> sf_phase_k(*mpi,{nkpts-nkpts_trev_pairs,rho_g.nnr()});
+
+  // symmetry rotations of the 'w' grid. Used to obtain orbitals at k outside IBZ
+  math::shm::shared_array<nda::array_view<long,2>> swfc_to_rho_sym(*mpi,{nsym-1,wfc_grid->size()});
+  Timer.stop("ALLOC");
+
+  Timer.start("DistOrbs");
+  // Psi(kIBZ,a,g) distributed over g
+  auto dPsia = mf::read_distributed_orbital_set<local_5Array_t>(*mf,mpi->comm,'w',
+              {1,1,1,1,mpi->comm.size()},nda::range(0,nspins),nda::range(0,nkpts_ibz),a_range,{1,1,1,1,1});
+
+  decltype(dPsia)* dPsib;
+  if(not same_orb_range) {
+    auto Psib = mf::read_distributed_orbital_set<local_5Array_t>(*mf,mpi->comm,'w',
+              {1,1,1,1,mpi->comm.size()},nda::range(0,nspins),nda::range(0,nkpts_ibz),b_range,{1,1,1,1,1});
+    dPsib = new memory::darray_t<local_5Array_t,mpi3::communicator>(std::addressof(mpi->comm),
+                        Psib.grid(),Psib.global_shape(),Psib.local_shape(),
+                        Psib.origin(),Psib.block_size());
+    *dPsib = std::move(Psib);
+  } else {
+    dPsib = std::addressof(dPsia);
+  }
+  Timer.stop("DistOrbs");
+
+  /*
+   * (Significant) Memory usage in the remaining of this routine:
+   *  *** Notice that distributed arrays are already allocated, 
+   *      so they don't need to be counted.
+   *
+   *   nI_per_blk = # of Ipts processed per device per iteration, as allowed by memory  
+   * 
+   *   # per device in local memory 
+   *   sXkau:   {nkpts-nkpts_trev, nbnd, ntasks*nI_per_blk}           
+   *   Tkur:   {nkpts-nkpts_trev, nI_per_blk, rho_g.nnr()}    
+   *   TRur:   {nkpts, nI_per_blk, rho_g.nnr()}                
+   *   if (Xb) ZRur:   {nkpts, nI_per_blk, rho_g.nnr()}  
+   *   dTkug_g:  {nkpts-ntrev, ntasks*nI_per_blk, wfc_g->size()} : local_size {nkpts-ntrev, ntasks*nI_per_blk, wfc_g->size()/ntasks} 
+   *   dTkug_u:  {nkpts-ntrev, ntasks*nI_per_blk, wfc_g->size()} : local size {nkpts-ntrev, nI_per_blk, wfc_g->size()}    
+   *
+   *   where MEM is the available memory on the node and x is the fraction of memory
+   *   assumed usable, e.g. 0.9.
+   *
+   */ 
+
+/* 
+ * MAM: to do/think about:
+ *   - implement kernel to apply phase_q/phase_k without precomputing
+ *   - use nccl in redistribute???
+ */
+  // figure out the number of Ipts in this node and the maximum over all nodes 
+  long max_nI_per_task=0;
+  { 
+    max_nI_per_task = Z_qug.local_range(1).size();
+    mpi->comm.all_reduce_in_place_n(&max_nI_per_task,1,mpi3::max<>{});
+  }
+
+  // memory_usage: memory (in units of  number of ComplexType) needed for buffers 
+  long nI_per_blk, memory_buffer_1, memory_buffer_2 = 0;
+  {
+    double mem;
+    if constexpr (MEM==HOST_MEMORY) {
+      mem = long(utils::freemem());
+    } else {
+      mem = long(utils::freemem_device());
+    }
+    // 75% of available memory in units of ComplexType
+    mem *= memory_frac * 1024.0 * 1024.0 / sizeof(ComplexType);        
+    // MAM: Need enough memory to allocate: sXkau, dTkug_g, dTkug_u, Tkur, TRur and ZRur.
+    //      General strategy is to use 2 memory buffers large enough to allocate the necessary
+    //      objects. 
+    //      If Xb!=nullptr, ZRur is treated separately since it is always needed.
+    // The order of use is as follows:
+    //   1. sXkau * dPsia -> dTkug_g  (b1)
+    //   2. dTkug_g -> dTkug_u        (b1->b2) 
+    //   3. dTkug_u -> Tkur           (b2->b1)
+    //   4. Tkur -> TRur              (b1->b2)
+    //   5. TRur -> Zqur              (b2->b1) (or ZRur if Xb!=nullptr) 
+    // largest usage between dTkug_g and Tkur 
+    memory_buffer_1 = std::max( long((nkpts-nkpts_trev_pairs)*ntasks*(wfc_grid->size()/ntasks + 10)), 
+                                long(std::max(nqpts_ibz,nkpts-nkpts_trev_pairs)*rho_g.nnr() + 10) );
+    // largest usage between dTkug_u and TRur 
+    memory_buffer_2 = std::max( long((nkpts-nkpts_trev_pairs)*wfc_grid->size() + 10), 
+                                long(nkpts*rho_g.nnr()+10) );
+    // baseline memory: keeping sXkau and ZRur (when Xb!=nullptr) outside buffers for now
+    //                  adding a copy of dTkug_g/dTkug_u for now, which is currently needed in redistribution
+    double m0 = (nkpts-nkpts_trev_pairs) * std::max(a_range.size(),b_range.size()) * ntasks +
+                2.0*(nkpts-nkpts_trev_pairs)*wfc_grid->size(); 
+    if( Xb!=nullptr ) m0 += (nkpts*rho_g.nnr()); 
+    nI_per_blk = long(std::floor( mem / ( m0 + double(memory_buffer_1 + memory_buffer_2) ) )); 
+    // reduce without proper bounds to catch =0 case
+    mpi->comm.all_reduce_in_place_n(&nI_per_blk,1,mpi3::min<>{});  
+    if(mpi->comm.root() and nI_per_blk == 0) {
+      app_warning("****************************************************************");
+      app_warning("  According to internal estimates, there is not enough   ");
+      app_warning("  memory to run this calculation. Will attempt to continue. "); 
+      app_warning("  Execution can fail from out of memory error. ");
+      app_warning("  Increase the number of nodes or reduce the number of cores per node, if needed"); 
+      app_warning("  Memory estimate performed assuming {}% of the available memory. ", memory_frac*100); 
+      app_warning("****************************************************************");
+    }
+    // now apply bounds
+    nI_per_blk = std::min( std::max( 1l, nI_per_blk ), max_nI_per_task); 
+    mpi->comm.all_reduce_in_place_n(&nI_per_blk,1,mpi3::min<>{});  
+    memory_buffer_1 *= nI_per_blk;
+    memory_buffer_2 *= nI_per_blk;
+  }
+
+  Timer.start("EXTRA");
+  long nblk = (nI_loc + nI_per_blk - 1)/nI_per_blk;   
+  mpi->comm.all_reduce_in_place_n(&nblk,1,mpi3::max<>{});  
+  utils::check( nblk>0 and nblk*nI_per_blk >= nI_loc and
+                (nblk-1)*nI_per_blk < nI_loc , "thc::get_ZquG_Cquv_fft: Logic error!!!");
+  app_log(2," - # of blocks used to process Ipts:{}",nblk);
+  app_log(2," - # of Ipts/iteration/device:{}",nI_per_blk);
+
+  // number of Ipts per mpi task 
+  nda::array<int,1> nI_per_task(ntasks,0);
+  nI_per_task(rank) = nI_loc;
+  mpi->comm.all_reduce_in_place_n(nI_per_task.data(),nI_per_task.size(),std::plus<>{});  
+
+  // will contain the list of Ipts being processed at the current iteration
+  nda::array<int,1> iu_for_Xb(ntasks*nI_per_blk);
+
+  // kpts with trev(k)==false, the first group are those with a trev pair
+  // Only these kpoints are evaluated explicitly, trev pairs are obtain through conjugation! 
+  nda::array<int,1> kp_order(nkpts-nkpts_trev_pairs, -1);
+  kp_order(nda::range(nkpts_trev_pairs)) = kp_trev_pair(nda::range(nkpts-nkpts_trev_pairs,nkpts));
+  utils::check( std::all_of(kp_order.begin(), kp_order.begin()+nkpts_trev_pairs, 
+                [](auto const& a) {return a>=0;}), "Error: kp_trev_pair<0" );
+  {
+    int cnt=nkpts_trev_pairs;
+    for( auto [ik,k] : itertools::enumerate(kp_trev_pair) ) {
+      if( k<0 ) {
+        utils::check(cnt < kp_order.size(), "Oh oh, logic error in get_ZquG_Cquv_fft");
+        kp_order(cnt++) = ik;
+      }
+    }
+    utils::check(cnt==kp_order.size(), "Oh oh, logic error in get_ZquG_Cquv_fft (2)");
+  }
+  utils::check( std::all_of(kp_order.begin(), kp_order.end(), 
+                [](auto const& a) {return a>=0;}), "Error: kp_order<0" );
+  long nkloc = kp_order.size(); 
+
+  // initialize wfc_to_rho_sym, calculate symmetry rotations 
+  if(nsym>1)
+  {
+    nda::stack_array<double, 3> Gs;
+    Gs() = 0;
+    nda::array<ComplexType,1> *Xft = nullptr;
+    mpi->node_comm.barrier();
+    for(int i=0; i<nsym-1; ++i) {
+      if( mpi->node_comm.rank() != i%mpi->node_comm.size() ) continue;
+      auto wfc_to_rho_sym = swfc_to_rho_sym.local()(i,all);
+      wfc_to_rho_sym() = wfc_to_rho();
+      // MAM: the kpt provided is irrelevant for now
+      utils::transform_k2g(false,symm_list[ksymms(i+1)],Gs,rho_g.mesh(),kpts(0,all),
+                           wfc_to_rho_sym,Xft);
+    }
+    mpi->node_comm.barrier();
+  } else {
+    // allocate to avoid issues below
+    swfc_to_rho_sym = math::shm::shared_array<nda::array_view<long,2>>(*mpi,{1,1});
+  }
+  // copy to device
+  auto wfc_to_rho_sym = memory::to_memory_space<MEM>(swfc_to_rho_sym.local());
+  Timer.stop("EXTRA");
+
+  Timer.start("ALLOC");
+  // using a memory pool to maximize memory use and minimize calls to cudaMalloc (which is quite slow)
+  memory::array<MEM,ComplexType,1> buffer1( memory_buffer_1 );
+  memory::array<MEM,ComplexType,1> buffer2( memory_buffer_2 );
+  memory::array<MEM,ComplexType,1> ZRur_1d( ((Xb!=nullptr)?nkpts*nI_per_blk*rho_g.nnr():1) );
+  // distributed_array_view for dTkug_g/dTkug_u
+  auto [g0,g1] = itertools::chunk_range(0,wfc_grid->size(),ntasks,rank); 
+  auto loc_Tkug_g = memory::array_view<MEM,ComplexType,3>({nkloc, ntasks*nI_per_blk, g1-g0},buffer1.data());
+  auto loc_Tkug_u = memory::array_view<MEM,ComplexType,3>({nkloc, nI_per_blk, wfc_grid->size()},buffer2.data());
+  auto dTkug_g = math::nda::distributed_array_view<decltype(loc_Tkug_g),mpi3::communicator>(std::addressof(mpi->comm),
+           {1,1,mpi->comm.size()},{nkloc,ntasks*nI_per_blk,wfc_grid->size()},{0,0,g0},{1,1,1},loc_Tkug_g); 
+  auto dTkug_u = math::nda::distributed_array_view<decltype(loc_Tkug_u),mpi3::communicator>(std::addressof(mpi->comm),
+           {1,mpi->comm.size(),1},{nkloc,ntasks*nI_per_blk,wfc_grid->size()},{0,rank*nI_per_blk,0},{1,1,1},loc_Tkug_u); 
+  Timer.stop("ALLOC");
+
+  // R<->k, R<->Q, phase factors exp(-ikr), exp(-iqr)
+  Timer.start("EXTRA");
+  { 
+    // setup R_to_Q and k_to_R
+    nda::array<double, 2> kpts_new_order(nkpts-nkpts_trev_pairs,3);
+    for( auto [ik,k] : itertools::enumerate(kp_order) ) 
+      kpts_new_order(ik,all) = kpts(k,all); 
+    utils::k_to_R_coefficients(mpi->comm, nda::range(nkpts), kpts_new_order, mf->lattv(),
+                                 mf->kp_grid(), sf_kR);
+    auto Qm = nda::make_regular(mf->Qpts_ibz());
+    Qm() *= -1.0;
+    utils::R_to_k_coefficients(mpi->comm, nda::range(nkpts), Qm, mf->lattv(), mf->kp_grid(), sf_RQ);
+    // setup phase factors
+    // can be further parallelized if needed
+    for( auto iq : nda::range(mpi->node_comm.rank(),nqpts_ibz,mpi->node_comm.size()) ) 
+      utils::rspace_phase_factor(mf->lattv(),Q(iq,all),rho_g.mesh(),nda::range(rho_g.nnr()),
+                                       sf_phase_q.local()(iq,all));
+    for( auto ik : nda::range(mpi->node_comm.rank(),kp_order.size(),mpi->node_comm.size()) ) 
+      utils::rspace_phase_factor(mf->lattv(),kpts_new_order(ik,all),rho_g.mesh(),
+             nda::range(rho_g.nnr()),sf_phase_k.local()(ik,all));
+    mpi->node_comm.barrier();
+  }
+  auto f_kR = memory::to_memory_space<MEM>(sf_kR.local());
+  auto f_RQ = memory::to_memory_space<MEM>(sf_RQ.local());
+  auto f_phase_q = memory::to_memory_space<MEM>(sf_phase_q.local());
+  auto f_phase_k = memory::to_memory_space<MEM>(sf_phase_k.local());
+  Timer.stop("EXTRA");
+
+  // calculate T(u,r) for all kpoints and orbital ranges 
+  for( auto isp : nda::range(nspins*npol) ) 
+  {
+    long ispin = isp/npol;
+    long ipol  = isp%npol;
+
+    Timer.start("ZUR");
+    for( auto ib : nda::range(nblk) ) { 
+
+      // Ipts in this iteration
+      long b0 = ib*nI_per_blk;
+      long nI = std::min(nI_per_blk, nI_loc-b0);
+
+      { // fill array with Ipts being processed in this block 
+        // MAM: This can be done without communication, keeping it simple for now
+        iu_for_Xb() = 0;
+        auto iu_loc = iu_for_Xb(nda::range(rank*nI_per_blk,(rank+1)*nI_per_blk));
+        for( auto i : nda::range(nI) )
+          iu_loc(i) = Z_qug.origin()[1] + b0 + i;
+        if(nI<nI_per_blk)
+          iu_for_Xb(nda::range(nI,nI_per_blk)) = -1;
+        mpi->comm.all_reduce_in_place_n(iu_for_Xb.data(),iu_for_Xb.size(),std::plus<>{});
+      }
+      auto Tkur = memory::array_view<MEM,ComplexType,2>({nkloc, nI*rho_g.nnr()},buffer1.data());
+      auto TRur = memory::array_view<MEM,ComplexType,2>({nkpts, nI*rho_g.nnr()},buffer2.data());
+      // if Xb.has_value, space to accumulate, if not, operate in place in TRur
+      auto ZRur = memory::array_view<MEM,ComplexType,2>({nkpts, nI*rho_g.nnr()},
+                   ((Xb!=nullptr)?ZRur_1d.data():buffer2.data()));
+      auto Zqur = memory::array_view<MEM,ComplexType,2>({nqpts_ibz, nI*rho_g.nnr()},buffer1.data());
+
+      auto T4d_in = nda::reshape(Tkur,
+                    std::array<long,4>{nkloc*nI,rho_g.mesh(0),rho_g.mesh(1),rho_g.mesh(2)});
+
+      Timer.start("FFTPLAN");
+      math::nda::fft<true> F(T4d_in,
+                             math::fft::FFT_MEASURE|math::fft::FFT_DESTROY_INPUT);
+      Timer.stop("FFTPLAN");
+
+      {
+        Timer.start("shmX");
+        auto Xaku = Xskau_to_sXbkua<MEM>(isp,iu_for_Xb,Xa,kp_order);
+        Timer.stop("shmX");
+
+        Timer.start("TUR");
+        // Tkug for the current block, distributed only over g
+        get_Tkug<MEM>(ispin,ipol,kp_to_ibz,kp_order,Xaku,dPsia,dTkug_g,dTkug_u);
+        Timer.stop("TUR");
+      }
+
+      // T(k,u,r) = fft(T(k,u,g)), careful to map input g from wfn to density fft  grid,
+      if(nI > 0)
+      {
+ 
+        {
+          Timer.start("EXTRA");
+          auto T3d = nda::reshape(Tkur,std::array<long,3>{nkloc, nI, rho_g.nnr()});
+          T3d() = ComplexType(0.0);
+          arch::set_device_synchronization(false);
+          for( auto ik : nda::range(nkloc) ) { 
+            auto k = kp_order(ik);
+            auto Tk = dTkug_u.local()(ik,nda::range(nI),all); 
+            if( k < nkpts_ibz ) {
+              nda::copy_select(true,1,wfc_to_rho,ComplexType(1.0),Tk,
+                                                 ComplexType(0.0),T3d(ik,all,all));
+            } else {
+              nda::copy_select(true,1,wfc_to_rho_sym(k_to_s(k)-1,all),ComplexType(1.0),Tk,
+                               ComplexType(0.0),T3d(ik,all,all));
+            }
+          }
+          arch::set_device_synchronization(true);
+          Timer.stop("EXTRA");
+ 
+          Timer.start("FFT");
+          // G -> r
+          F.backward(T4d_in);
+          Timer.stop("FFT");
+ 
+          // add missing exp(ikr) phase
+          if constexpr (MEM==HOST_MEMORY) {
+            // T(k,u,r) *= phase(k,r)
+            for( auto ik : nda::range(nkloc) ) 
+              for( auto iI : nda::range(nI) )  
+                T3d(ik,iI,all) *= f_phase_k(ik,all);
+          } else {
+            // Z_qux(q,u,x) = Z_qux(q,u,x) * phase(q,x)
+            nda::tensor::elementwise(ComplexType(1.0),f_phase_k,"kr",
+                        ComplexType(1.0),T3d,"kur",nda::tensor::op::MUL);
+          } 
+        }
+
+        // T(R,u,r) = exp(ikR) T(k,u,r)
+        if(nkpts>1) {
+          if(nkpts_trev_pairs>0) {
+            auto krng1 = nda::range(nkpts_trev_pairs);
+            auto krng2 = nda::range(nkpts_trev_pairs,nkpts-nkpts_trev_pairs);
+
+            nda::blas::gemm(ComplexType(2.0),f_kR(all,krng1),Tkur(krng1,all),
+                            ComplexType(0.0),TRur);
+            ::nda::zero_imag(TRur);
+            nda::blas::gemm(ComplexType(1.0),f_kR(all,krng2),Tkur(krng2,all),
+                            ComplexType(1.0),TRur);
+          } else {
+            nda::blas::gemm(f_kR,Tkur,TRur);
+          }
+        } else {
+          TRur(0,all) = Tkur(0,all);  
+        }
+
+      }
+
+      // 4b. Z(R,u,r) = conj(T(R,u,r)) * T(R,u,r), 
+      if(Xb == nullptr) {
+
+        // save to return now
+        // Exit loop if no more work!
+        if(nI==0) continue;
+
+        if constexpr (MEM==HOST_MEMORY) {
+          TRur() = nda::conj(TRur())*TRur();
+        } else {
+          auto T1d = nda::reshape(TRur,std::array<long,1>{TRur.size()});
+          nda::tensor::elementwise(ComplexType(1.0),nda::conj(T1d),"n",
+                      ComplexType(1.0),T1d,"n",nda::tensor::op::MUL);
+        } 
+
+      } else {
+        // Store TRur in ZRur
+        if constexpr (MEM==HOST_MEMORY) {
+          ZRur = nda::conj(TRur); 
+        } else {
+          nda::tensor::assign(nda::conj(TRur),ZRur); 
+        } 
+
+        // Repeat calculation for Xb/dPsib, multiply into ZRur
+        { 
+          Timer.start("shmX");
+          auto Xbku = Xskau_to_sXbkua<MEM>(isp,iu_for_Xb,*Xb,kp_order);
+          Timer.stop("shmX");
+        
+          Timer.start("TUR");
+          // Tkug for the current block, distributed only over g
+          get_Tkug<MEM>(ispin,ipol,kp_to_ibz,kp_order,Xbku,*dPsib,dTkug_g,dTkug_u);
+          Timer.stop("TUR");
+        }
+
+        // save to return now
+        // Exit loop if no more work!
+        if(nI==0) continue;
+
+        {
+          Timer.start("EXTRA");
+          auto T3d = nda::reshape(Tkur,std::array<long,3>{nkloc, nI, rho_g.nnr()});
+          T3d() = ComplexType(0.0);
+          arch::set_device_synchronization(false);
+          for( auto ik : nda::range(nkloc) ) {
+            auto k = kp_order(ik);
+            auto Tk = dTkug_u.local()(ik,nda::range(nI),all);
+            if( k < nkpts_ibz ) {
+              nda::copy_select(true,1,wfc_to_rho,ComplexType(1.0),Tk,
+                               ComplexType(0.0),T3d(ik,all,all));
+            } else {
+              nda::copy_select(true,1,wfc_to_rho_sym(k_to_s(k)-1,all),ComplexType(1.0),Tk,
+                               ComplexType(0.0),T3d(ik,all,all));
+            }
+          }
+          arch::set_device_synchronization(true);
+          Timer.stop("EXTRA");
+
+          Timer.start("FFT");
+          // G -> r
+          F.backward(T4d_in);
+          Timer.stop("FFT");
+
+          // add missing exp(ikr) phase
+          if constexpr (MEM==HOST_MEMORY) {
+            // T(k,u,r) *= phase(k,r)
+            for( auto ik : nda::range(nkloc) )
+              for( auto iI : nda::range(nI) )
+                T3d(ik,iI,all) *= f_phase_k(ik,all);
+          } else {
+            // Z_qux(q,u,x) = Z_qux(q,u,x) * phase(q,x)
+            nda::tensor::elementwise(ComplexType(1.0),f_phase_k,"kr",
+                                     ComplexType(1.0),T3d,"kur",nda::tensor::op::MUL);
+          }
+        }
+
+        // T(R,u,r) = exp(ikR) T(k,u,r)
+        if(nkpts>1) {
+          if(nkpts_trev_pairs>0) {
+            auto krng1 = nda::range(nkpts_trev_pairs);
+            auto krng2 = nda::range(nkpts_trev_pairs,nkpts-nkpts_trev_pairs);
+
+            nda::blas::gemm(ComplexType(2.0),f_kR(all,krng1),Tkur(krng1,all),
+                            ComplexType(0.0),TRur);
+            ::nda::zero_imag(TRur);
+            nda::blas::gemm(ComplexType(1.0),f_kR(all,krng2),Tkur(krng2,all),
+                            ComplexType(1.0),TRur);
+          } else {
+            nda::blas::gemm(f_kR,Tkur,TRur);
+          }
+        } else {
+          TRur(0,all) = Tkur(0,all);
+        }
+
+        if constexpr (MEM==HOST_MEMORY) {
+        } else {
+        }
+
+        if constexpr (MEM==HOST_MEMORY) {
+          ZRur() *= TRur();
+        } else {
+          auto T1d = nda::reshape(TRur,std::array<long,1>{TRur.size()});
+          auto Z1d = nda::reshape(ZRur,std::array<long,1>{ZRur.size()});
+          nda::tensor::elementwise(ComplexType(1.0),T1d,"n",
+                                   ComplexType(1.0),Z1d,"n",nda::tensor::op::MUL);
+        }
+      } // (not Xb.has_value())
+ 
+      // 4c. Z(q,u,r) = exp(iqR) Z(R,u,r) 
+      if(nkpts>1) {
+        nda::blas::gemm(f_RQ,ZRur,Zqur);
+      } else {
+        Zqur(0,all) = ZRur(0,all);
+      }
+
+      // 4d. C(q,u,v) = Z(q,u,rv)
+      { 
+        auto T3d = nda::reshape(Zqur,std::array<long,3>{nqpts_ibz,nI,rho_g.nnr()});
+        auto Irng = nda::range(b0,b0+nI);
+        arch::set_device_synchronization(false);
+        for( auto iq : nda::range(nqpts_ibz) ) 
+          nda::copy_select(false,1,IPts,ComplexType(1.0),T3d(iq,all,all),
+                           ComplexType(1.0),C_quv.local()(iq,Irng,all));
+        arch::set_device_synchronization(true);
+      }
+
+      // 4e. Z(q,u,r) *= exp(-q*r)
+      // add exp(i q*r) phase factor
+      if constexpr (MEM==HOST_MEMORY) { 
+        // Z_qux(q,u,x) = Z_qux(q,u,x) * phase(q,x)
+        auto Z3d = nda::reshape(Zqur,std::array<long,3>{nqpts_ibz,nI,rho_g.nnr()});
+        for( auto iq : nda::range(nqpts_ibz) )
+          for( auto iI : nda::range(nI) )
+            Z3d(iq,iI,all) *= f_phase_q(iq,all);
+      } else {
+        // Z_qux(q,u,x) = Z_qux(q,u,x) * phase(q,x)
+        auto Z3d = nda::reshape(Zqur,std::array<long,3>{nqpts_ibz,nI,rho_g.nnr()});
+        nda::tensor::elementwise(ComplexType(1.0),f_phase_q,"qr",
+                                 ComplexType(1.0),Z3d,"qur",nda::tensor::op::MUL);
+      }
+
+      // 4f. Z(q,u,G) = fft(Z(q,u,r)) => mapped to truncated G grid
+      // fft r->G
+      { 
+        auto Z4d_in = nda::reshape(Zqur,
+           std::array<long,4>{nqpts_ibz*nI,rho_g.mesh(0),rho_g.mesh(1),rho_g.mesh(2)});
+
+        Timer.start("FFTPLAN");
+        math::nda::fft<true> F2(Z4d_in,
+                 math::fft::FFT_MEASURE|math::fft::FFT_PRESERVE_INPUT);
+        Timer.stop("FFTPLAN");
+        Timer.start("FFT");
+        F2.forward(Z4d_in); // data now in TRur
+        Timer.stop("FFT");
+
+        // copy from fft mesh to reduced g-grid
+        auto Z3D = nda::reshape(Z4d_in,std::array<long,3>{nqpts_ibz,nI,rho_g.nnr()});
+        auto Irng = nda::range(b0,b0+nI);
+        arch::set_device_synchronization(false);
+        for( auto iq : nda::range(nqpts_ibz) )
+          nda::copy_select(false,1,rho_g.gv_to_fft(),ComplexType(1.0),Z3D(iq,all,all),
+                           ComplexType(1.0),Z_qug.local()(iq,Irng,all));
+        arch::set_device_synchronization(true);
+      }
+          
+    } // b : loop over nIpts segments 
+    Timer.stop("ZUR");
+  } // ispin/ipol
+  // return all memory before redistributing, just in case!
+  dPsia.reset();
+  if(not same_orb_range) delete dPsib; 
+  wfc_to_rho_sym.resize(1,1);
+  buffer1.resize(1);
+  buffer2.resize(1);
+  ZRur_1d.resize(1);
+  Timer.start("ALLOC");
+  math::nda::redistribute_in_place(C_quv,pgrid,{block_size[0],block_size[1],block_size[1]});
+  math::nda::redistribute_in_place(Z_qug,pgrid,block_size);
+  Timer.stop("ALLOC");
+
+  return std::make_tuple(std::move(Z_qug),std::move(C_quv));;
+}
+
+/*
+ * Equivalent to get_ZquG_Cquv_fft, but implemented only on HOST_MEMORY and designed 
+ * for MPI only parallelization with MPI3 shared memory storage.
+ */ 
+template<typename Tensor_t, typename Tensor2_t>
+auto thc::get_ZquG_Cquv_fft_shared_memory(nda::MemoryArrayOfRank<1> auto const& IPts, 
+                        Tensor_t const& Xa,
+                        Tensor2_t const* Xb,
+                        nda::range a_range, nda::range b_range, 
+                        std::array<long, 3> pgrid, 
+                        std::array<long, 3> block_size) 
+{
+  constexpr MEMORY_SPACE MEM = HOST_MEMORY;
+  using math::nda::make_distributed_array;
+  using local_3Array_t = memory::array<MEM,ComplexType,3>;
+  using local_5Array_t = memory::array<MEM,ComplexType,5>;
+  decltype(nda::range::all) all;
+
+  auto kpts = mf->kpts();
+  auto Q  = mf->Qpts();
+  long nIpts = IPts.shape()[0];
+  long nspins = mf->nspin_in_basis();
+  long npol = mf->npol_in_basis();
+  long nkpts = mf->nkpts();
+  long nkpts_ibz = mf->nkpts_ibz();
+  long nkpts_trev_pairs = mf->nkpts_trev_pairs();
+  auto kp_trev_pair = mf->kp_trev_pair();
+  long nqpts_ibz = mf->nqpts_ibz();
+  auto kp_to_ibz = mf->kp_to_ibz();
+  bool same_orb_range = (a_range==b_range);
+  auto wfc_grid = mf->wfc_truncated_grid(); 
+  auto wfc_to_rho = swfc_to_rho.local();
+  auto gv_to_fft = wfc_grid->gv_to_fft();  // 'g' vector indexes of the wfc grid
+  auto symm_list = mf->symm_list();
+
+// examine the role of both a_/b_range and Xb, need clear definitions of what is allowed
+//    - conditions: 1. a_range.size() == Xa.extent(2) always
+//                  2. if Xb , check b_range.size() == Xb->extent(2) 
+//                     otherwise, a_range == b_range              
+// adjust memory estimates
+// implement subroutine to evaluate TRur
+// add version when Xb is provided
+
+  //checks
+  utils::check(a_range.size() == Xa.global_shape()[2], 
+               "Error in thc::get_ZquG_Cquv_fft: Xa size mismatch. Xa.shape(2):{}, a_range.size:{}", 
+               Xa.global_shape()[2],b_range.size());
+  if(Xb != nullptr) 
+    utils::check(b_range.size() == Xb->global_shape()[2], 
+               "Error in thc::get_ZquG_Cquv_fft: Xb size mismatch. Xb.shape(2):{}, b_range.size:{}", 
+               Xb->global_shape()[2],b_range.size());
+  else
+    utils::check(a_range==b_range, "Error in thc::get_ZquG_Cquv_fft: a_range!=b_range with empty Xb."); 
+  if( mpi->comm.size() > nIpts )
+    app_warning( " Unused processors in thc::evaluate: Consider reducing the number of processors");
+
+  long ntasks = mpi->comm.size();
+  long nnodes = mpi->internode_comm.size(), ncores = mpi->node_comm.size();
+  long node_id = mpi->internode_comm.rank();
+  mpi->comm.all_reduce_in_place_n(&nnodes,1,mpi3::max<>{});  
+  mpi->node_comm.broadcast_n(&node_id,1,0);  
+
+  // FBZ-IBZ relations, kpoint symmetry maps
+  // Only account for space symmetries, k-points that need trev are ignored at this step!
+  auto [ksymms,k_to_s,ns_per_kibz,Ks,Skibz] = 
+             utils::generate_kp_maps(nkpts-nkpts_trev_pairs,nkpts_ibz,mf->kp_symm(),mf->kp_to_ibz());
+  int nsym = ksymms.size();
+  utils::check( ksymms[0] == 0, "Error: ksymms[0] != 0, ksymms[0]:{}", ksymms[0]);
+
+  /********************************************************************
+   *     Memory estimates: worst case scenario of 1 ipt per node 
+   ********************************************************************/
+  if(mf->orb_on_fft_grid())
+  {
+    double mem=0.0;
+    // the largest memory usage is in get_ZquG_Cquv, so using just that
+    mem = ( 
+            /* global distributed memory  */
+            nqpts_ibz*nIpts*(rho_g.size()+nIpts)/nnodes                  +  // Z_qug, C_quv
+            nspins*nkpts_ibz*a_range.size()*npol*wfc_grid->size()/nnodes      +  // dPsia 
+      
+            /* shared memory per node */
+            (nkpts-nkpts_trev_pairs) * nnodes * a_range.size()     +  // sXkau (1 ipt per node as the worst case scenario) 
+            nkpts * (nqpts_ibz + nkpts-nkpts_trev_pairs)          +  // RQ,kR 
+            rho_g.nnr() * (nqpts_ibz + nkpts-nkpts_trev_pairs)    +  // phase_q,phase_r,rots
+            /*  working space in shared memory, 1 ipt per node */
+            4.0*(nkpts-nkpts_trev_pairs)*wfc_grid->size()  +  // Tkug_G, Tkug_u
+            (2.0*nkpts-nkpts_trev_pairs)*rho_g.nnr()          // Tkur_a, TRur_a
+          ) * sizeof(ComplexType) / (1024.0 * 1024.0 * 1024.0); 
+    app_log(1, " - Estimated minimum memory requirement for this step, \n     per (current type of) node: {} GB ", mem);
+  }
+
+  /*******************************************************************
+   *             Shared memory and distributed allocations        
+   ********************************************************************/
+
+  // Arrays generated by this routine:
+  // Z(q,u,g) 
+  // C(q,u,v)
+  Timer.start("ALLOC");
+  // MAM: Need custom paritioning of u axis to improve load balancing over nodes (not over cores)
+  long nI0_core, nI1_core;
+  {
+    // chunk_range over nodes, followed by chunk_range over cores
+    auto [n0,n1] = itertools::chunk_range(0,nIpts,nnodes,node_id);
+    std::tie(nI0_core,nI1_core) = itertools::chunk_range(n0,n1,mpi->node_comm.size(),mpi->node_comm.rank());
+  } 
+  memory::darray_t<local_3Array_t,mpi3::communicator> Z_qug(std::addressof(mpi->comm), {1,ntasks,1},
+                {nqpts_ibz,nIpts,rho_g.size()},{nqpts_ibz,nI1_core-nI0_core,rho_g.size()},       
+                {0,nI0_core,0},{1,1,1});
+  memory::darray_t<local_3Array_t,mpi3::communicator> C_quv(std::addressof(mpi->comm), {1,ntasks,1},
+                {nqpts_ibz,nIpts,nIpts},{nqpts_ibz,nI1_core-nI0_core,nIpts},       
+                {0,nI0_core,0},{1,1,1});
+  utils::check(Z_qug.local_range(0) == C_quv.local_range(0) and
+               Z_qug.local_range(1) == C_quv.local_range(1), "Partition mismatch.");
+  Z_qug.local() = ComplexType(0.0);
+  C_quv.local() = ComplexType(0.0);
+
+  // figure out the number of Ipts in this node and the maximum over all nodes 
+  int tot_nI_in_node = 0, max_nI_in_node=0; 
+  {
+    tot_nI_in_node = Z_qug.local_range(1).size();
+    mpi->node_comm.all_reduce_in_place_n(&tot_nI_in_node,1,std::plus<>{});
+    utils::check(tot_nI_in_node>0, "Error: tot_nI_in_node == 0");
+    max_nI_in_node = tot_nI_in_node;
+    mpi->comm.all_reduce_in_place_n(&max_nI_in_node,1,mpi3::max<>{});
+  }
+
+  // k<->R and R<->k transformations
+  math::shm::shared_array<nda::array_view<ComplexType,2>> sf_RQ(*mpi,{nqpts_ibz,nkpts});
+  math::shm::shared_array<nda::array_view<ComplexType,2>> sf_kR(*mpi,{nkpts,nkpts-nkpts_trev_pairs});
+  // exp(iqr), exp(ikr) phase factor 
+  math::shm::shared_array<nda::array_view<ComplexType,2>> sf_phase_q(*mpi,{nqpts_ibz,rho_g.nnr()});
+  math::shm::shared_array<nda::array_view<ComplexType,2>> sf_phase_k(*mpi,{nkpts-nkpts_trev_pairs,rho_g.nnr()});
+
+  // symmetry rotations of the 'w' grid. Used to obtain orbitals at k outside IBZ
+  math::shm::shared_array<nda::array_view<long,2>> swfc_to_rho_sym(*mpi,{nsym-1,wfc_grid->size()});
+  Timer.stop("ALLOC");
+
+  Timer.start("DistOrbs");
+  // Psi(kIBZ,a,g) distributed over g
+  auto dPsia = mf::read_distributed_orbital_set<local_5Array_t>(*mf,mpi->comm,'w',
+              {1,1,1,1,mpi->comm.size()},nda::range(0,nspins),nda::range(0,nkpts_ibz),a_range,{1,1,1,1,1});
+
+  decltype(dPsia)* dPsib;
+  if(not same_orb_range) {
+    auto Psib = mf::read_distributed_orbital_set<local_5Array_t>(*mf,mpi->comm,'w',
+              {1,1,1,1,mpi->comm.size()},nda::range(0,nspins),nda::range(0,nkpts_ibz),b_range,{1,1,1,1,1});
+    dPsib = new memory::darray_t<local_5Array_t,mpi3::communicator>(std::addressof(mpi->comm),
+                        Psib.grid(),Psib.global_shape(),Psib.local_shape(),
+                        Psib.origin(),Psib.block_size());
+    *dPsib = std::move(Psib);
+  } else {
+    dPsib = std::addressof(dPsia);
+  }
+  Timer.stop("DistOrbs");
+
+  /*
+   * (Significant) Memory usage in the remaining of this routine:
+   *
+   *   nI_per_node = determined by memory constrains, number of Ipts processed per iteration by every node
+   *   nI_per_blk = nI_per_node * nnodes, total number of Ipts processed per iteration by all nodes
+   * 
+   *   # per node, in shared memory
+   *   sXkau:   {nkpts-nkpts_trev, nbnd, nI_per_blk}           
+   *   Tkur:   {nkpts-nkpts_trev, nI_per_node, rho_g.nnr()}    
+   *   TRur:   {nkpts, nI_per_node, rho_g.nnr()}                
+   *   if (Xb) ZRur:   {nkpts, nI_per_node, rho_g.nnr()}  
+   *   dTkug_g:  {nkpts-ntrev, nI_per_node, wfc_g->size()}     (storage per node)
+   *   dTkug_u:  {nkpts-ntrev, nI_per_node, wfc_g->size()}     (storage per node)     
+   *
+   *   where MEM is the available memory on the node and x is the fraction of memory
+   *   assumed usable, e.g. 0.9.
+   *
+   */ 
+  long nI_per_node = 0;
+  {
+    double mem;
+    mem = long(utils::freemem());
+    // 75% of available memory in units of ComplexType
+    mem *= memory_frac * 1024.0 * 1024.0 / sizeof(ComplexType);        
+    double m0 = (nkpts-nkpts_trev_pairs) * std::max(a_range.size(),b_range.size()) * nnodes +  
+                4.0*(nkpts-nkpts_trev_pairs)*wfc_grid->size()+(2.0*nkpts-nkpts_trev_pairs)*rho_g.nnr();
+    if( Xb!=nullptr ) m0 += (nkpts*rho_g.nnr()); 
+    nI_per_node = long(std::floor( mem / m0 )); 
+    mpi->comm.all_reduce_in_place_n(&nI_per_node,1,mpi3::min<>{});  
+    if(mpi->comm.root() and nI_per_node == 0) {
+      app_warning("****************************************************************");
+      app_warning("  According to internal estimates, there is not enough   ");
+      app_warning("  memory to run this calculation. Will attempt to continue. "); 
+      app_warning("  Execution can fail from out of memory error. ");
+      app_warning("  Increase the number of nodes or reduce the number of cores per node, if needed"); 
+      app_warning("  Memory estimate performed assuming {}% of the available memory. ", memory_frac*100); 
+      app_warning("****************************************************************");
+    }
+  }
+  // make sure nI_per_node is within proper bounds
+  nI_per_node = std::min( std::max( 1l, nI_per_node ), long(max_nI_in_node)); 
+
+  Timer.start("EXTRA");
+  long nI_per_blk = nI_per_node*nnodes; 
+  long nblk = (nIpts + nI_per_blk - 1)/nI_per_blk;   
+  utils::check( nblk>0 and nblk*nI_per_blk >= nIpts and
+                (nblk-1)*nI_per_blk < nIpts , "thc::get_ZquG_Cquv_fft: Logic error!!!");
+  app_log(2," - # of blocks used to process Ipts:{}",nblk);
+  app_log(2," - # of Ipts/iteration/node:{}",nI_per_node);
+
+  // mapping of ipts from original order to new "blocked consistent" order 
+  nda::array<int,3> iu_for_sXb(nblk,nnodes,nI_per_node);
+  iu_for_sXb() = 0;
+  iu_for_sXb(all,node_id,all) = -1;
+  {
+    // list of first ipt of each task
+    nda::array<int,2> ipt(ncores,2);
+    ipt() = 0;
+    ipt(mpi->node_comm.rank(),0) = Z_qug.local_range(1).first();   // index of first ipt
+    ipt(mpi->node_comm.rank(),1) = Z_qug.local_range(1).size();    // number of ipts 
+    mpi->node_comm.all_reduce_in_place_n(ipt.data(),ipt.size(),std::plus<>{});
+    // round robin over all cores to improve compute balance during iterations
+    int icnt = 0; 
+    long ic = 0;
+    for( long ib=0; ib<nblk; ++ib ) {
+      for( long iu=0; iu<nI_per_node; ++iu ) {
+
+        // look for next available ipt (is there a scenario when this runs indefinitely???)
+        while(ipt(ic,1) == 0) { ic = (ic+1)%ncores; } 
+  
+        iu_for_sXb(ib, node_id, iu) = ipt(ic,0);
+        ipt(ic,0)++; 
+        ipt(ic,1)--;
+        ic = (ic+1)%ncores; 
+        icnt++;
+ 
+        if(icnt == tot_nI_in_node)
+          break;
+      } 
+      if(icnt == tot_nI_in_node)
+        break;
+    }
+    if(mpi->node_comm.root())
+      mpi->internode_comm.all_reduce_in_place_n(iu_for_sXb.data(),iu_for_sXb.size(),std::plus<>{});
+    mpi->node_comm.barrier();
+    mpi->node_comm.broadcast_n(iu_for_sXb.data(),iu_for_sXb.size(),0);
+    utils::check(icnt == tot_nI_in_node, "Error: Problems reordering Ipts: {},{}",icnt,tot_nI_in_node);
+  }  
+
+  // kpts with trev(k)==false, the first group are those with a trev pair
+  // Only these kpoints are evaluated explicitly, trev pairs are obtain through conjugation! 
+  nda::array<int,1> kp_order(nkpts-nkpts_trev_pairs, -1);
+  kp_order(nda::range(nkpts_trev_pairs)) = kp_trev_pair(nda::range(nkpts-nkpts_trev_pairs,nkpts));
+  utils::check( std::all_of(kp_order.begin(), kp_order.begin()+nkpts_trev_pairs, 
+                [](auto const& a) {return a>=0;}), "Error: kp_trev_pair<0" );
+  {
+    int cnt=nkpts_trev_pairs;
+    for( auto [ik,k] : itertools::enumerate(kp_trev_pair) ) {
+      if( k<0 ) {
+        utils::check(cnt < kp_order.size(), "Oh oh, logic error in get_ZquG_Cquv_fft");
+        kp_order(cnt++) = ik;
+      }
+    }
+    utils::check(cnt==kp_order.size(), "Oh oh, logic error in get_ZquG_Cquv_fft (2)");
+  }
+  utils::check( std::all_of(kp_order.begin(), kp_order.end(), 
+                [](auto const& a) {return a>=0;}), "Error: kp_order<0" );
+  long nkloc = kp_order.size(); 
+
+  // initialize wfc_to_rho_sym, calculate symmetry rotations 
+  {
+    nda::stack_array<double, 3> Gs;
+    Gs() = 0;
+    nda::array<ComplexType,1> *Xft = nullptr;
+    mpi->node_comm.barrier();
+    for(int i=0; i<nsym-1; ++i) {
+      if( mpi->node_comm.rank() != i%mpi->node_comm.size() ) continue;
+      auto wfc_to_rho_sym = swfc_to_rho_sym.local()(i,all);
+      wfc_to_rho_sym() = wfc_to_rho();
+      // MAM: the kpt provided is irrelevant for now
+      utils::transform_k2g(false,symm_list[ksymms(i+1)],Gs,rho_g.mesh(),kpts(0,all),
+                           wfc_to_rho_sym,Xft);
+    }
+    mpi->node_comm.barrier();
+  }
+  Timer.stop("EXTRA");
+
+  Timer.start("ALLOC");
+  // Tkug for ipts in a block, distributed over g
+  auto dTkug_g{math::nda::make_distributed_array<local_3Array_t>(mpi->comm,{1,1,mpi->comm.size()},
+                {kp_order.size(),nI_per_blk,dPsia.global_shape()[4]},{1,1,1})};
+  // Tkug for ipts in a block, distributed over u (in shared memory) 
+  math::shm::shared_array<nda::array_view<ComplexType,3>> sTkug_u(*mpi,
+      {kp_order.size(),nI_per_node,dPsia.global_shape()[4]}); 
+  sTkug_u.set_zero(); 
+  auto sTkug_u_loc = sTkug_u.local();
+   // dummy empty array
+  decltype(sTkug_u_loc) dummy_local(std::array<long,3>{kp_order.size(),0,dPsia.global_shape()[4]},sTkug_u_loc.data());
+  // distributed_array_view, root of node_comm has all the segment of the node 
+  math::nda::distributed_array_view<decltype(sTkug_u_loc),mpi3::communicator> dTkug_u(std::addressof(mpi->comm),
+                {1,mpi->comm.size(),1},dTkug_g.global_shape(),{0,node_id*nI_per_node,0},{1,1,1},
+                (mpi->node_comm.root()?sTkug_u_loc:dummy_local));
+
+  // for FFT g<->r, allocate later
+  math::shm::shared_array<nda::array_view<ComplexType,1>> sTkur_1d(*mpi,
+      {std::max(nkloc,nqpts_ibz)*nI_per_node*rho_g.nnr()});
+  math::shm::shared_array<nda::array_view<ComplexType,1>> sTRur_1d(*mpi,
+      {nkpts*nI_per_node*rho_g.nnr()});
+  math::shm::shared_array<nda::array_view<ComplexType,1>> sZRur_1d(*mpi,
+      { ((Xb!=nullptr)?nkpts*nI_per_node*rho_g.nnr():1) });
+  sTkur_1d.set_zero();
+  sTRur_1d.set_zero();
+  sZRur_1d.set_zero();
+  auto Tkur_1d = sTkur_1d.local();
+  auto TRur_1d = sTRur_1d.local();
+  auto ZRur_1d = sZRur_1d.local();
+  Timer.stop("ALLOC");
+
+  // R<->k, R<->Q, phase factors exp(-ikr), exp(-iqr)
+  Timer.start("EXTRA");
+  { 
+    // setup R_to_Q and k_to_R
+    nda::array<double, 2> kpts_new_order(nkpts-nkpts_trev_pairs,3);
+    for( auto [ik,k] : itertools::enumerate(kp_order) ) 
+      kpts_new_order(ik,all) = kpts(k,all); 
+    utils::k_to_R_coefficients(mpi->comm, nda::range(nkpts), kpts_new_order, mf->lattv(),
+                                 mf->kp_grid(), sf_kR);
+    auto Qm = nda::make_regular(mf->Qpts_ibz());
+    Qm() *= -1.0;
+    utils::R_to_k_coefficients(mpi->comm, nda::range(nkpts), Qm, mf->lattv(), mf->kp_grid(), sf_RQ);
+    // setup phase factors
+    // can be further parallelized if needed
+    for( auto iq : nda::range(mpi->node_comm.rank(),nqpts_ibz,mpi->node_comm.size()) ) 
+      utils::rspace_phase_factor(mf->lattv(),Q(iq,all),rho_g.mesh(),nda::range(rho_g.nnr()),
+                                       sf_phase_q.local()(iq,all));
+    for( auto ik : nda::range(mpi->node_comm.rank(),kp_order.size(),mpi->node_comm.size()) ) 
+      utils::rspace_phase_factor(mf->lattv(),kpts_new_order(ik,all),rho_g.mesh(),
+             nda::range(rho_g.nnr()),sf_phase_k.local()(ik,all));
+    mpi->node_comm.barrier();
+  }
+  Timer.stop("EXTRA");
+
+  // calculate T(u,r) for all kpoints and orbital ranges 
+  for( auto isp : nda::range(nspins*npol) ) 
+  {
+    long ispin = isp/npol;
+    long ipol  = isp%npol;
+
+    Timer.start("ZUR");
+    for( auto ib : nda::range(nblk) ) { 
+
+      // Ipts in this iteration
+      int b0 = ib*nI_per_node;
+      int nI = std::min(int(nI_per_node), tot_nI_in_node-b0);
+
+      auto Tkur = memory::array_view<MEM,ComplexType,2>({nkloc, nI*rho_g.nnr()},Tkur_1d.data()); 
+      auto TRur = memory::array_view<MEM,ComplexType,2>({nkpts, nI*rho_g.nnr()},TRur_1d.data()); 
+      // if Xb.has_value, space to accumulate, if not, operate in place in TRur
+      auto ZRur = memory::array_view<MEM,ComplexType,2>({nkpts, nI*rho_g.nnr()},
+                   ((Xb!=nullptr)?ZRur_1d.data():TRur_1d.data())); 
+      auto Zqur = memory::array_view<MEM,ComplexType,2>({nqpts_ibz, nI*rho_g.nnr()},Tkur_1d.data()); 
+
+      auto [kI0,kI1] = itertools::chunk_range(0,nkloc*nI,mpi->node_comm.size(),mpi->node_comm.rank());
+      nda::range kI_rng(kI0,kI1);
+
+      using arr_v =  typename memory::array_view<MEM,ComplexType,4>;
+      auto T4d_in = arr_v({kI_rng.size(),rho_g.mesh(0),rho_g.mesh(1),rho_g.mesh(2)},
+                           Tkur_1d.data() + kI0*rho_g.nnr());
+      auto T4d_out = arr_v({kI_rng.size(),rho_g.mesh(0),rho_g.mesh(1),rho_g.mesh(2)},
+                           TRur_1d.data() + kI0*rho_g.nnr());
+
+      Timer.start("FFTPLAN");
+      math::nda::fft<true> F(T4d_in,T4d_out,
+                             math::fft::FFT_MEASURE|math::fft::FFT_DESTROY_INPUT);
+      Timer.stop("FFTPLAN");
+
+      {
+        Timer.start("shmX");
+        // Xaku for ipts in block, in shared memory, with kpts ordered by kp_to_ibz
+        auto iu_for_sXb_1d = nda::reshape(iu_for_sXb(ib,nda::ellipsis{}),
+                                                std::array<long,1>{nI_per_blk});
+        auto sXaku = Xskau_to_sXbkua(isp,iu_for_sXb_1d,Xa,kp_order);
+        Timer.stop("shmX");
+
+        Timer.start("TUR");
+        // Tkug for the current block, distributed only over g
+        get_Tkug<MEM>(ispin,ipol,kp_to_ibz,kp_order,sXaku.local(),dPsia,dTkug_g,dTkug_u);
+        Timer.stop("TUR");
+      }
+
+      // T(k,u,r) = fft(T(k,u,g)), careful to map input g from wfn to density fft  grid,
+      if(nI > 0)
+      {
+ 
+        {
+          Timer.start("EXTRA");
+          auto T2d = nda::reshape(T4d_in,std::array<long,2>{T4d_in.extent(0),rho_g.nnr()});
+          T2d() = ComplexType(0.0);
+          for( auto [i,kI] : itertools::enumerate(kI_rng) ) {
+          long ik = kI/nI;
+          long iI = kI%nI;
+          auto k = kp_order(ik);
+          auto Tk = sTkug_u_loc(ik,iI,all); 
+            auto w_to_r = ( k < nkpts_ibz ? wfc_to_rho() : swfc_to_rho_sym.local()(k_to_s(k)-1,all) ); 
+            nda::copy_select(true,w_to_r,ComplexType(1.0),Tk,ComplexType(0.0),T2d(i,all));
+          }
+          Timer.stop("EXTRA");
+          Timer.start("FFT");
+          // G -> r
+          F.backward(T4d_in,T4d_out);
+          Timer.stop("FFT");
+          T4d_in() = T4d_out();
+ 
+          // add missing exp(ikr) phase
+          {
+            // T(k,u,r) *= phase(k,r)
+            for( auto [i,kI] : itertools::enumerate(kI_rng) ) {
+              long ik = kI/nI;
+              T2d(i,all) *= sf_phase_k.local()(ik,all);
+            }
+          } 
+        }
+        mpi->node_comm.barrier();
+
+        // T(R,u,r) = exp(ikR) T(k,u,r)
+        if(nkpts>1) {
+          auto f_kR = sf_kR.local();
+          if(nkpts_trev_pairs>0) {
+            auto krng1 = nda::range(nkpts_trev_pairs);
+            auto krng2 = nda::range(nkpts_trev_pairs,nkpts-nkpts_trev_pairs);
+
+            math::shm::blas::detail::gemm(mpi->node_comm,ComplexType(2.0),f_kR(all,krng1),
+                            Tkur(krng1,all),ComplexType(0.0),TRur);
+            auto [n0,n1] = itertools::chunk_range(0,TRur.size(),mpi->node_comm.size(),mpi->node_comm.rank()); 
+            auto p = TRur_1d.data()+n0;
+            for( long n=0; n<(n1-n0); ++n, ++p ) *p = ComplexType(p->real(),0.0);
+            mpi->node_comm.barrier();
+            math::shm::blas::detail::gemm(mpi->node_comm,ComplexType(1.0),f_kR(all,krng2),
+                            Tkur(krng2,all),ComplexType(1.0),TRur);
+          } else {
+            math::shm::blas::detail::gemm(mpi->node_comm,ComplexType(1.0),f_kR,Tkur,ComplexType(0.0),TRur);
+          }
+        } else {
+          TRur(0,all) = Tkur(0,all);  
+        }
+        mpi->node_comm.barrier();
+      }
+
+      // 4b. Z(R,u,r) = conj(T(R,u,r)) * T(R,u,r), 
+      if(Xb == nullptr) {
+
+        // save to return now
+        // Exit loop if no more work!
+        if(nI==0) continue;
+
+        {
+          auto [n0,n1] = itertools::chunk_range(0,TRur.size(),mpi->node_comm.size(),mpi->node_comm.rank()); 
+          // remember that in this case, we reuse TRur (multiply in place) 
+          auto p = TRur_1d.data()+n0;
+          for( long n=0; n<(n1-n0); ++n, ++p ) *p = std::conj(*p)*(*p); 
+        } 
+        mpi->node_comm.barrier();
+
+      } else {
+
+        // Store TRur in ZRur
+        { 
+          auto [n0,n1] = itertools::chunk_range(0,TRur.size(),mpi->node_comm.size(),mpi->node_comm.rank());
+          auto p = TRur_1d.data()+n0;
+          auto pz = ZRur_1d.data()+n0;
+          for( long n=0; n<(n1-n0); ++n, ++p, ++pz ) *pz = std::conj(*p);
+        } 
+        mpi->node_comm.barrier();
+
+        // Repeat calculation for Xb/dPsib, multiply into ZRur
+        { 
+          Timer.start("shmX");
+          // Xbku for ipts in block, in shared memory, with kpts ordered by kp_to_ibz
+          auto iu_for_sXb_1d = nda::reshape(iu_for_sXb(ib,nda::ellipsis{}),
+                                                  std::array<long,1>{nI_per_blk});
+          auto sXbku = Xskau_to_sXbkua(isp,iu_for_sXb_1d,*Xb,kp_order);
+          Timer.stop("shmX");
+        
+          Timer.start("TUR");
+          // Tkug for the current block, distributed only over g
+          get_Tkug<MEM>(ispin,ipol,kp_to_ibz,kp_order,sXbku.local(),*dPsib,dTkug_g,dTkug_u);
+          Timer.stop("TUR");
+        }
+
+        // save to return now
+        // Exit loop if no more work!
+        if(nI==0) continue;
+
+        {
+          Timer.start("EXTRA");
+          auto T2d = nda::reshape(T4d_in,std::array<long,2>{T4d_in.extent(0),rho_g.nnr()});
+          T2d() = ComplexType(0.0);
+          for( auto [i,kI] : itertools::enumerate(kI_rng) ) {
+          long ik = kI/nI;
+          long iI = kI%nI;
+          auto k = kp_order(ik);
+          auto Tk = sTkug_u_loc(ik,iI,all);
+            auto w_to_r = ( k < nkpts_ibz ? wfc_to_rho() : swfc_to_rho_sym.local()(k_to_s(k)-1,all) );
+            nda::copy_select(true,w_to_r,ComplexType(1.0),Tk,ComplexType(0.0),T2d(i,all));
+          }
+          Timer.stop("EXTRA");
+          Timer.start("FFT");
+          // G -> r
+          F.backward(T4d_in,T4d_out);
+          Timer.stop("FFT");
+          T4d_in() = T4d_out();
+
+          // add missing exp(ikr) phase
+          { 
+            // T(k,u,r) *= phase(k,r)
+            for( auto [i,kI] : itertools::enumerate(kI_rng) ) {
+              long ik = kI/nI;
+              T2d(i,all) *= sf_phase_k.local()(ik,all);
+            }
+          }
+        }
+        mpi->node_comm.barrier();
+
+        // T(R,u,r) = exp(ikR) T(k,u,r)
+        if(nkpts>1) {
+          auto f_kR = sf_kR.local();
+          if(nkpts_trev_pairs>0) {
+            auto krng1 = nda::range(nkpts_trev_pairs);
+            auto krng2 = nda::range(nkpts_trev_pairs,nkpts-nkpts_trev_pairs);
+
+            math::shm::blas::detail::gemm(mpi->node_comm,ComplexType(2.0),f_kR(all,krng1),
+                            Tkur(krng1,all),ComplexType(0.0),TRur);
+            auto [n0,n1] = itertools::chunk_range(0,TRur.size(),mpi->node_comm.size(),mpi->node_comm.rank()); 
+            auto p = TRur_1d.data()+n0;
+            for( long n=0; n<(n1-n0); ++n, ++p ) *p = ComplexType(p->real(),0.0);
+            mpi->node_comm.barrier();
+            math::shm::blas::detail::gemm(mpi->node_comm,ComplexType(1.0),f_kR(all,krng2),
+                            Tkur(krng2,all),ComplexType(1.0),TRur);
+          } else {
+            math::shm::blas::detail::gemm(mpi->node_comm,ComplexType(1.0),f_kR,Tkur,ComplexType(0.0),TRur);
+          }
+        } else {
+          TRur(0,all) = Tkur(0,all);
+        }
+        mpi->node_comm.barrier();
+
+        {
+          auto [n0,n1] = itertools::chunk_range(0,TRur.size(),mpi->node_comm.size(),mpi->node_comm.rank());
+          auto p = TRur_1d.data()+n0;
+          auto pz = ZRur_1d.data()+n0;
+          for( long n=0; n<(n1-n0); ++n, ++p, ++pz ) (*pz) *= (*p);
+        }
+        mpi->node_comm.barrier();
+      } // (not Xb.has_value())
+
+      // 4c. Z(q,u,r) = exp(iqR) Z(R,u,r) 
+      if(nkpts>1) {
+        auto f_RQ = sf_RQ.local();
+        math::shm::blas::detail::gemm(mpi->node_comm,ComplexType(1.0),f_RQ,ZRur,ComplexType(0.0),Zqur);
+      } else {
+        Zqur(0,all) = ZRur(0,all);
+      }
+      mpi->node_comm.barrier();
+
+      // update kI to new range: {0,nqpts_ibz*nI}
+      std::tie(kI0,kI1) = itertools::chunk_range(0,nqpts_ibz*nI,mpi->node_comm.size(),mpi->node_comm.rank()); 
+      kI_rng = nda::range(kI0,kI1);
+
+      // 4d. C(q,u,v) = Z(q,u,rv)
+      { 
+        auto T3d = nda::reshape(Zqur,std::array<long,3>{nqpts_ibz,nI,rho_g.nnr()});
+        long u0 = C_quv.local_range(1).first();
+        long u1 = C_quv.local_range(1).last();
+        for( auto iq : nda::range(nqpts_ibz) ) { 
+          for( auto [i,iu] : itertools::enumerate(iu_for_sXb(ib, node_id, nda::range(nI))) ) { 
+            if(iu >= u0 and iu < u1)
+              nda::copy_select(false,IPts,ComplexType(1.0),T3d(iq,i,all),
+                               ComplexType(1.0),C_quv.local()(iq,iu-u0,all));
+          }
+        }
+      }
+      mpi->node_comm.barrier();
+
+      // 4e. Z(q,u,r) *= exp(-q*r)
+      // add exp(i q*r) phase factor
+      {
+        // Z_qux(q,u,x) = Z_qux(q,u,x) * phase(q,x)
+        auto Z2D = nda::array_view<ComplexType,2>({kI_rng.size(),rho_g.nnr()},
+                                                   Zqur.data()+kI0*rho_g.nnr()); 
+        for( auto [i,kI] : itertools::enumerate(kI_rng) ) {
+          long iq = kI/nI;
+          Z2D(i,all) *= sf_phase_q.local()(iq,all);
+        }
+      }
+      mpi->node_comm.barrier();
+
+      // 4f. Z(q,u,G) = fft(Z(q,u,r)) => mapped to truncated G grid
+      // fft r->G
+      { 
+        auto Z2D = memory::array_view<MEM,ComplexType,2>({kI_rng.size(),rho_g.nnr()},
+                                                          Zqur.data()+kI0*rho_g.nnr()); 
+        auto Z4d_in = nda::reshape(Z2D,
+           std::array<long,4>{kI_rng.size(),rho_g.mesh(0),rho_g.mesh(1),rho_g.mesh(2)});
+        auto Z4d_out = memory::array_view<MEM,ComplexType,4>({kI_rng.size(),
+           rho_g.mesh(0),rho_g.mesh(1),rho_g.mesh(2)},TRur_1d.data()+kI0*rho_g.nnr());
+
+        Timer.start("FFTPLAN");
+        math::nda::fft<true> F2(Z4d_in,Z4d_out,
+                             math::fft::FFT_MEASURE|math::fft::FFT_DESTROY_INPUT);
+        Timer.stop("FFTPLAN");
+        Timer.start("FFT");
+        F2.forward(Z4d_in,Z4d_out);
+        Timer.stop("FFT");
+        mpi->node_comm.barrier();
+
+        // copy from fft mesh to reduced g-grid
+        //auto Z3D = nda::reshape(Zqur, shape_t<3>{nqpts_ibz,nI,rho_g.nnr()});
+        auto Z3D = memory::array_view<MEM,ComplexType,3>({nqpts_ibz,nI,rho_g.nnr()},
+                                                         TRur_1d.data());
+        long u0 = Z_qug.local_range(1).first();
+        long u1 = Z_qug.local_range(1).last();
+        // Z_qug(iq, :, :) += Z2D(iq, :, gv_to_fft)
+        for( auto iq : nda::range(nqpts_ibz) ) {
+          for( auto [i,iu] : itertools::enumerate(iu_for_sXb(ib, node_id, nda::range(nI))) ) {
+            if(iu >= u0 and iu < u1)
+              nda::copy_select(false,rho_g.gv_to_fft(),ComplexType(1.0),Z3D(iq,i,all),
+                   ComplexType(1.0),Z_qug.local()(iq,iu-u0,all));
+          }
+        }
+      }
+      mpi->node_comm.barrier();
+          
+    } // b : loop over nIpts segments 
+    Timer.stop("ZUR");
+  } // ispin/ipol
+  dPsia.reset();
+  if (not same_orb_range) delete dPsib;
+  swfc_to_rho_sym = math::shm::shared_array<nda::array_view<long,2>>(*mpi,{1,1});
+  sTkur_1d = math::shm::shared_array<nda::array_view<ComplexType,1>>(*mpi,{1});
+  sTRur_1d = math::shm::shared_array<nda::array_view<ComplexType,1>>(*mpi,{1});
+  Timer.start("ALLOC");
+  math::nda::redistribute_in_place(C_quv,pgrid,{block_size[0],block_size[1],block_size[1]});
+  math::nda::redistribute_in_place(Z_qug,pgrid,block_size);
+  Timer.stop("ALLOC");
+
+  return std::make_tuple(std::move(Z_qug),std::move(C_quv));;
+}
+
+template<typename Arr>
+auto thc::chol(Arr& A, nda::array<int,1>& piv, double cut)
+//auto thc::chol(nda::MemoryArrayOfRank<2> auto & A, nda::array<int,1>& piv, double cut)
+{
+  int n = A.shape()[0];
+  utils::check(piv.size() >= n+1,"Size mismatch: {},{} ",piv.size(),n+1);
+  int nc=0;
+  for(int i=0; i<n; ++i) {
+    for(int j=0; j<i; ++j) A(j,i) = ComplexType(0.0);
+    double v = std::real(A(i,i));
+    for(int j=0; j<nc; ++j)
+      v -= std::real(A(i,piv(j))*std::conj(A(i,piv(j))));
+    if(std::abs(v) > cut) {
+      piv(nc)=i;
+      v = std::sqrt(v);
+      A(i,i) = v;
+      for(int j=i+1; j<n; ++j) {
+        for(int k=0; k<nc; ++k)
+          A(j,i) -= A(j,piv(k))*std::conj(A(i,piv(k)));
+        A(j,i) = A(j,i) / v;
+      }
+      nc++;
+    }
+  }
+  if(nc==0) { // choose largest
+    int k=0;
+    double v = std::real(A(0,0));
+    for(int i=1; i<n; ++i) 
+      if(std::real(A(i,i)) > v) {
+        k=i;
+        v = std::real(A(i,i));
+      }
+    piv(nc)=k;
+    A(k,k) = v;
+    for(int j=k+1; j<n; ++j) 
+      A(j,k) = A(j,k) / v;
+    nc++;
+  }
+  piv(n)=nc;
+  nda::matrix<ComplexType,nda::C_layout> W(nc,nc);
+  for(int i=0; i<nc; i++) {
+    for(int j=0; j<nc; j++)
+      W(i,j) = std::conj(A(piv(i),piv(j)));
+  }
+  return W;
+}
+
+} // methods

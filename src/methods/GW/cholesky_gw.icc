@@ -1,0 +1,75 @@
+#include "mpi3/communicator.hpp"
+#include "nda/nda.hpp"
+#include "nda/blas.hpp"
+#include "numerics/shared_array/nda.hpp"
+#include "numerics/nda_functions.hpp"
+
+#include "utilities/proc_grid_partition.hpp"
+#include "IO/app_loggers.h"
+#include "utilities/Timer.hpp"
+
+#include "mean_field/MF.hpp"
+#include "methods/ERI/detail/concepts.hpp"
+
+
+namespace methods {
+  namespace solvers {
+
+    // TODO
+    //   - Optimize memory usage
+    //   - dyson_P in place
+    //   - option for sP_tQP
+    template<nda::MemoryArray Array_3D_t>
+    void gw_t::dyson_P(sArray_t<Array_3D_t> &sP0_tPQ,
+                       sArray_t<Array_3D_t> &sP0_wPQ) {
+      size_t Np = sP0_tPQ.local().shape(1);
+      size_t nw_half = sP0_wPQ.local().shape(0);
+      _Timer.start("ALLOC");
+      auto I = nda::eye<ComplexType>(Np);
+      nda::matrix<ComplexType> X(Np, Np);
+      nda::matrix<ComplexType> Y(Np, Np);
+      _Timer.start("ALLOC");
+
+      _Timer.start("IMAG_FT");
+      sP0_wPQ.win().fence();
+      if (sP0_wPQ.node_comm()->root())
+        _ft->tau_to_w_PHsym(sP0_tPQ.local(), sP0_wPQ.local());
+      sP0_wPQ.win().fence();
+      _Timer.stop("IMAG_FT");
+
+      int rank = sP0_wPQ.communicator()->rank();
+      int comm_size = sP0_wPQ.communicator()->size();
+      int node_rank = sP0_wPQ.internode_comm()->rank();
+      int num_nodes = sP0_wPQ.internode_comm()->size();
+      int node_size = sP0_wPQ.node_comm()->size();
+      sP0_wPQ.win().fence();
+      for (size_t iw = 0; iw < nw_half; ++iw) {
+        int iw_node = (iw / node_size) % num_nodes;
+        if (iw % comm_size == rank) {
+          auto P0w_PQ = sP0_wPQ.local()(iw, nda::ellipsis{});
+          // Y = [I - P0w_PQ]^{-1}
+          Y = nda::inverse(I - P0w_PQ);
+          // [I - P0w_PQ]^{-1} * P0w_PQ
+          nda::blas::gemm(Y, P0w_PQ, X);
+          P0w_PQ = X;
+        } else if (iw_node != node_rank) {
+          auto P0w_PQ = sP0_wPQ.local()(iw, nda::ellipsis{});
+          P0w_PQ() = 0.0;
+        }
+      }
+      sP0_wPQ.communicator()->barrier();
+      _Timer.start("COMM");
+      sP0_wPQ.win().fence();
+      sP0_wPQ.all_reduce();
+      _Timer.stop("COMM");
+
+      _Timer.start("IMAG_FT");
+      sP0_tPQ.win().fence();
+      if (sP0_tPQ.node_comm()->root())
+        _ft->w_to_tau_PHsym(sP0_wPQ.local(), sP0_tPQ.local());
+      sP0_tPQ.win().fence();
+      _Timer.stop("IMAG_FT");
+    }
+
+  } // solvers
+} // methods

@@ -1,0 +1,39 @@
+r"""
+ ---------------------------------
+     ____ ___   ___  _   _ ___
+    / ___/ _ \ / _ \| | | |_ _|
+   | |  | | | | | | | | | || |
+   | |__| |_| | |_| | |_| || |
+    \____\___/ \__\_\\___/|___|
+  --------------------------------
+ |  Correlated Quantum Interface  |
+  --------------------------------
+
+CoQuí python is a lightweight python interface to CoQuí, a software project designed for
+ab initio electronic structure calculations beyond the scope of density functional theory (DFT)
+for quantum materials.
+
+This python package provides a user-friendly interface to the CoQui library, with parameters directly
+parsed to the C++ code and allows for easy integration with other python libraries.
+
+For the pure C++ interface, please refer to the CoQuí C++ documentation [link here].
+
+"""
+
+from .version import *
+
+# Direct api for important routines
+from .utils import set_verbosity, MpiHandler
+from .mean_field import make_mf
+from .interaction import make_thc_coulomb, make_chol_coulomb
+from .mbpt import run_hf, run_gw, run_qpg0w0
+from .embed import downfold_1e, downfold_2e, downfold_local_gf, downfold_local_coulomb, dmft_embed
+from .wannier import wannier90,coqui2wannier90,append_wannier90_win
+
+# Make submodules available
+from . import utils
+from . import mean_field
+from . import interaction
+from . import mbpt
+from . import embed
+from . import wannier 

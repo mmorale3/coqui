@@ -1,0 +1,19 @@
+[mean_field.qe]
+name     = "mf_qe"
+prefix   = "pwscf"
+outdir   = "qe_output_dir/OUT/"
+filetype = "h5"
+
+[spectral_interpolation]
+mean_field   = "mf_qe"
+outdir       = "./"
+prefix       = "mbpt"
+wannier_file = "wan.h5"
+grp_name     = "scf"
+iteration    = 1
+ac_alg       = "pade"
+w_min = -0.2
+w_max = 0.2
+Nw    = 8000
+eta   = 1e-3
+Nfit  = 30

@@ -1,0 +1,30 @@
+
+[mean_field.qe]
+name   = "mf1"
+prefix = "pwscf"
+outdir = "../../qe/lih_kp222_nbnd16/"
+filetype = "h5"
+
+[orbitals]
+mean_field = "mf1"
+name       = "mf1_"
+prefix     = "../lih_kp222_nbnd16/bdft"
+type       = "bdft"
+[orbitals.select]
+n0       = 16
+n_blocks = 0 
+
+[mean_field.qe]
+name   = "mf2"
+prefix = "pwscf"
+outdir = "../../qe/lih_kp222_nbnd16_sym/"
+filetype = "h5"
+
+[orbitals]
+mean_field = "mf2"
+name       = "mf2_"
+prefix     = "../lih_kp222_nbnd16_sym/bdft"
+type       = "bdft"
+[orbitals.select]
+n0       = 16
+n_blocks = 0

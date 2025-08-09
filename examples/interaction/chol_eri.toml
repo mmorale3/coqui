@@ -1,0 +1,13 @@
+[mean_field.qe]
+name     = "mf_qe"
+prefix   = "pwscf"
+outdir   = "qe_output_dir/OUT/"
+filetype = "h5"
+
+[interaction.cholesky]
+name            = "eri"
+mean_field      = "mf_qe"
+tol             = 1e-6
+storage         = "outcore"
+path            = "./"
+chol_block_size = 32

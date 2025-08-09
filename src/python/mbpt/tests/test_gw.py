@@ -1,0 +1,85 @@
+from mpi4py import MPI
+import os
+import pytest
+
+import coqui
+from coqui.utils.tests.test_coqui_env import mpi
+from coqui.mean_field.tests.test_qe import construct_qe_mf
+
+
+def test_gw_thc(mpi):
+    mf = construct_qe_mf(mpi, "qe_lih222_sym")
+    eri_params = {
+        "storage": "incore",
+        "nIpts": mf.nbnd() * 10,
+        "thresh": 1e-10,
+        "chol_block_size": 1,
+        "init": True
+    }
+    thc = coqui.make_thc_coulomb(mf, eri_params)
+
+    gw_params = {
+        "restart": False, "output": "gw", "niter": 1,
+        "beta": 300, "lambda": 1200, "iaft_prec": "mid",
+        "iter_alg": {"alg": "damping", "mixing": 0.7}
+    }
+    coqui.run_gw(gw_params, h_int=thc)
+    mpi.barrier()
+
+
+def test_gw_mix_thc_chol(mpi):
+    mf = construct_qe_mf(mpi, "qe_lih222")
+    thc_params = {
+        "storage": "incore",
+        "nIpts": mf.nbnd() * 10,
+        "thresh": 1e-10,
+        "chol_block_size": 1,
+        "init": True
+    }
+    thc = coqui.make_thc_coulomb(mf, thc_params)
+
+    gw_params = {
+        "restart": False, "output": "gw", "niter": 1,
+        "beta": 300, "lambda": 1200, "iaft_prec": "mid",
+        "iter_alg": {"alg": "damping", "mixing": 0.7}
+    }
+    coqui.run_gw(gw_params, h_int=thc)
+    mpi.barrier()
+
+    # mix thc/cholesky eri for J/K terms
+    chol_params = {
+        "tol": 1e-3,
+        "storage": "outcore",
+        "path": "./",
+        "chol_block_size": 32
+    }
+    chol = coqui.make_chol_coulomb(mf, chol_params)
+    coqui.run_gw(gw_params, h_int=thc, h_int_hf=chol)
+    mpi.barrier()
+
+    if mpi.root():
+        os.remove("./chol_info.h5")
+        for iq in range(mf.nqpts_ibz()):
+            os.remove(f"./Vq{iq}.h5")
+    mpi.barrier()
+
+
+def test_g0w0_thc(mpi):
+    mf = construct_qe_mf(mpi, "qe_lih222_sym")
+    eri_params = {
+        "storage": "incore",
+        "nIpts": mf.nbnd() * 10,
+        "thresh": 1e-10,
+        "chol_block_size": 1,
+        "init": True
+    }
+    thc = coqui.make_thc_coulomb(mf, eri_params)
+
+    gw_params = {
+        "restart": False, "output": "gw", "niter": 1,
+        "beta": 300, "lambda": 1200, "iaft_prec": "mid",
+        "qp_type": "sc", "ac_alg": "pade", "eta": 1e-6, "Nfit": 26
+    }
+    coqui.run_qpg0w0(gw_params, h_int=thc)
+    mpi.barrier()
+

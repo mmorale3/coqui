@@ -1,0 +1,2234 @@
+#ifndef BEYONDDFT_THC_SOSEX_ICC
+#define BEYONDDFT_THC_SOSEX_ICC
+
+#include "mpi3/communicator.hpp"
+#include "mpi3/operation.hpp"
+#include "mpi3/group.hpp"
+#include "nda/nda.hpp"
+#include "nda/blas.hpp"
+#include "numerics/shared_array/nda.hpp"
+#include "numerics/distributed_array/nda.hpp"
+#include "numerics/nda_functions.hpp"
+
+#include "IO/app_loggers.h"
+#include "utilities/Timer.hpp"
+#include "utilities/kpoint_utils.hpp"
+
+#include "mean_field/MF.hpp"
+#include "methods/ERI/detail/concepts.hpp"
+#include "methods/HF/thc_solver_comm.hpp"
+#include "methods/ERI/div_treatment_e.hpp"
+
+#define W_CACHED 1
+
+namespace methods {
+  namespace solvers {
+
+    template<nda::MemoryArray Array_view_5D_t>
+    void gf2_t::add_2sosex(sArray_t<Array_view_5D_t> &sSigma_tskij, [[maybe_unused]] THC_ERI auto &thc) {
+        size_t nt = sSigma_tskij.shape()[0];
+        size_t ns = sSigma_tskij.shape()[1];
+        size_t nk = sSigma_tskij.shape()[2];
+        size_t nbnd = sSigma_tskij.shape()[3];
+
+        // local buffer
+        nda::array<ComplexType, 2> St(nbnd,nbnd);
+
+        // skip the middle odd point in the cycle:
+        for(size_t tsk = _context->node_comm.rank(); tsk < nt*ns*nk; tsk+=_context->node_comm.size()) {
+            size_t t = tsk / (ns*nk);
+            size_t s = (tsk / nk) % ns;
+            size_t k = tsk % nk;
+
+            St = sSigma_tskij.local()(t,s,k,nda::ellipsis{});
+            sSigma_tskij.local()(t,s,k,nda::ellipsis{}) += make_regular(nda::transpose(St));
+        }
+        _context->comm.barrier();
+
+    }
+
+    template<nda::MemoryArray Array_view_5D_t>
+    void gf2_t::thc_sosex_scheme2(
+        const nda::MemoryArrayOfRank<5> auto &G_tskij,
+        sArray_t<Array_view_5D_t> &sSigma_tskij, THC_ERI auto &thc) {
+      using Array_7D_t = memory::array<HOST_MEMORY, ComplexType, 7>;
+
+      app_log(2, "Running the dynamical part of SOSEX");
+
+      _Timer.start("BUILD_UPqs");
+      if(!U_computed) {
+        app_log(2, "MY: U IS NOT COMPUTED YET");
+        build_U_Pqs_all(thc, dU_sqkPqs_int, true, false);
+      }
+      _Timer.stop("BUILD_UPqs");
+
+      auto [sG_tskQj, sG_tskiQ] = prepare_G_sosex(G_tskij, thc);
+
+      auto dA_tsqkQuv = build_GG_Quv_all_full_t(thc, sG_tskiQ, sG_tskQj);
+      std::array<long,7> w_bsize_out = {1,1,1,1,1,1,1};
+      std::array<long,7> w_pgrid_out = dA_tsqkQuv.grid();
+
+      app_log(2, "Performing tau-to-w transform of GG_Quv");
+      auto dA_wsqkQuv = tau_to_w_full(dA_tsqkQuv, w_pgrid_out, w_bsize_out, "GG_Quv", true);
+
+      app_log(2, "Building WGG_Puv(w)");
+      auto dWA_wsqkPuv = build_WGG(thc, dA_wsqkQuv);
+
+      app_log(2, "Performing w-to-tau transform of WGG_Puv");
+      auto dWA_tsqkPuv = w_to_tau_full(dWA_wsqkPuv, w_pgrid_out, w_bsize_out, "WGG_Quv", true);
+
+      app_log(2, "Building B_PRv(t)");
+      auto dB_tsqkPRv = build_B_WA(dWA_tsqkPuv, thc);
+
+      size_t np_tsqk = dB_tsqkPRv.grid()[0]*dB_tsqkPRv.grid()[1]*dB_tsqkPRv.grid()[2]*dB_tsqkPRv.grid()[3];
+
+      _Timer.start("REDISTRIBUTE_BC");
+      if(np_tsqk != 1) { // redistribute for D build
+        size_t np = _context->comm.size();
+        size_t np_P = utils::find_proc_grid_min_diff(np, 1, 1);
+        size_t np_R = np / np_P;
+
+        _Timer.start("ALLOC_SOSEX");
+        auto dB_tsqkPRv_new = math::nda::make_distributed_array<Array_7D_t>(
+            _context->comm, {1,1,1,1,np_P,np_R,1}, dB_tsqkPRv.global_shape(), dB_tsqkPRv.block_size());
+        _Timer.stop("ALLOC_SOSEX");
+        _Timer.start("REDISTRIBUTE_SOSEX");
+        math::nda::redistribute(dB_tsqkPRv, dB_tsqkPRv_new);
+        _Timer.stop("REDISTRIBUTE_SOSEX");
+
+        dB_tsqkPRv = dB_tsqkPRv_new;
+
+        utils::check(dB_tsqkPRv.grid()[0] == 1, "dB_tsqkPRv.grid()[0] != 1");
+        utils::check(dB_tsqkPRv.grid()[1] == 1, "dB_tsqkPRv.grid()[1] != 1");
+        utils::check(dB_tsqkPRv.grid()[2] == 1, "dB_tsqkPRv.grid()[2] != 1");
+        utils::check(dB_tsqkPRv.grid()[3] == 1, "dB_tsqkPRv.grid()[3] != 1");
+      }
+
+      _Timer.start("GET_C_SOSEX");
+      if(dB_tsqkPRv.grid() != dC_tsqkPRv_opt.value().grid()) {
+        _Timer.start("ALLOC_SOSEX");
+        auto dC_tsqkPRv_new = math::nda::make_distributed_array<Array_7D_t>(
+            _context->comm, dB_tsqkPRv.grid(), dB_tsqkPRv.global_shape(), dB_tsqkPRv.block_size());
+        _Timer.stop("ALLOC_SOSEX");
+
+        _Timer.start("REDISTRIBUTE_SOSEX");
+        math::nda::redistribute(dC_tsqkPRv_opt.value(), dC_tsqkPRv_new);
+        _Timer.stop("REDISTRIBUTE_SOSEX");
+        dC_tsqkPRv_opt.value() = dC_tsqkPRv_new;
+      }
+      _Timer.stop("GET_C_SOSEX");
+      _Timer.stop("REDISTRIBUTE_BC");
+
+      auto dD_tsqkPR = allocate_D_sosex(dB_tsqkPRv, thc);
+      app_log(2, "Building D_PR");
+      build_D_sosex_all_t(dB_tsqkPRv, dC_tsqkPRv_opt.value(), dD_tsqkPR, thc);
+
+      app_log(2, "Evaluating Sigma");
+      evaluate_Sigma_sosex_all_t(sSigma_tskij, dD_tsqkPR, thc);
+    }
+
+    template<nda::MemoryArray Array_view_5D_t>
+    void gf2_t::thc_sosex_scheme2_4D(
+        const nda::MemoryArrayOfRank<5> auto &G_tskij,
+        sArray_t<Array_view_5D_t> &sSigma_tskij, THC_ERI auto &thc) {
+      size_t nbnd = thc.nbnd();
+      size_t nkpts = G_tskij.shape(2);
+
+      app_log(2, "Running the dynamical part of SOSEX");
+
+      _Timer.start("BUILD_UPqs");
+      if(!U_computed) {
+        app_log(2, "MY: U IS NOT COMPUTED YET");
+        build_U_Pqs_all(thc, dU_sqkPqs_int, true, false);
+      }
+      _Timer.stop("BUILD_UPqs");
+
+      auto [sG_tskQj, sG_tskiQ] = prepare_G_sosex(G_tskij, thc);
+
+      auto dD_tsqkPR_acc = allocate_D_sosex(thc);
+
+      if(save_C() && dC_tsqkPRv_opt.has_value()) app_log(2, "SOSEX: Will reuse the saved C intermediate from GF2");
+      else app_log(2, "SOSEX: Will recompute C intermediate to save memory");
+
+      std::optional<nda::array<ComplexType, 4>> Wloc_wqPQ_opt; // local buffer to cache gathered W
+
+      for(size_t v = 0; v < nbnd; v++) {
+        app_log(2, "v = {}", v);
+        auto dA_tsqkQu = build_GG_Qu_all_full_t_4D(thc, sG_tskiQ, sG_tskQj, v);
+        std::array<long,6> w_bsize_out = {1,1,1,1,1,1};
+        std::array<long,6> t_pgrid_out = dA_tsqkQu.grid();
+        std::array<long,6> w_pgrid_out = t_pgrid_out;
+      {
+        size_t np = _context->comm.size();
+        long nqpools = utils::find_proc_grid_max_npools(np, nkpts, 0.2);
+        np /= nqpools;
+        long nwpools = utils::find_proc_grid_max_npools(np, _ft->nw_b(), 0.2);
+        np /= nwpools;
+        long nkpools = utils::find_proc_grid_max_npools(np, nkpts, 0.2);
+        np /= nkpools;
+      
+        size_t np_Quv = np;
+        w_pgrid_out = {nwpools,1,nqpools,nkpools,np_Quv,1};
+        utils::check(std::accumulate(w_pgrid_out.begin(),w_pgrid_out.end(),1,std::multiplies<long>()) == _context->comm.size(),
+                     "w_pgrid_out has inconsistent processors");
+      }
+        app_log(2, "Performing tau-to-w transform of GG_Qu");
+        auto dA_wsqkQu_v = tau_to_w_full(dA_tsqkQu, w_pgrid_out, w_bsize_out, "GG_Qu_v", true);
+
+        app_log(2, "Building WGG_Pu_v(w)");
+        auto dWA_wsqkPu = build_WGG_4D(thc, dA_wsqkQu_v, Wloc_wqPQ_opt, true); // reuse cached Wloc for all v
+
+        app_log(2, "Performing w-to-tau transform of WGG_Pu_v");
+        auto dWA_tsqkPu = w_to_tau_full(dWA_wsqkPu, t_pgrid_out, w_bsize_out, "WGG_Qu_v", true);
+
+        app_log(2, "Building B_PRv(t)");
+        auto dB_tsqkPR = build_B_WA_4D(dWA_tsqkPu, thc, true);
+
+        _Timer.start("REDISTRIBUTE_BC");
+        if(dD_tsqkPR_acc.grid() != dB_tsqkPR.grid()) { // redistribute for D build
+          _Timer.start("ALLOC_SOSEX");
+          auto dB_tsqkPR_new =
+              math::nda::make_distributed_array<Array_6D_t>(_context->comm, dD_tsqkPR_acc.grid(),
+                                                            dD_tsqkPR_acc.global_shape(),
+                                                            dD_tsqkPR_acc.block_size());
+          _Timer.stop("ALLOC_SOSEX");
+          _Timer.start("REDISTRIBUTE_SOSEX");
+          math::nda::redistribute(dB_tsqkPR, dB_tsqkPR_new);
+          _Timer.stop("REDISTRIBUTE_SOSEX");
+
+          dB_tsqkPR = dB_tsqkPR_new;
+
+          utils::check(dB_tsqkPR.grid()[0] == 1, "dB_tsqkPR.grid()[0] != 1");
+          utils::check(dB_tsqkPR.grid()[1] == 1, "dB_tsqkPR.grid()[1] != 1");
+          utils::check(dB_tsqkPR.grid()[2] == 1, "dB_tsqkPR.grid()[2] != 1");
+          utils::check(dB_tsqkPR.grid()[3] == 1, "dB_tsqkPR.grid()[3] != 1");
+        }
+
+        _Timer.start("GET_C_SOSEX");
+        auto dC_tsqkPR = (save_C() && dC_tsqkPRv_opt.has_value()) ? prepare_C_from_saved(dB_tsqkPR, v) :
+                                                    build_C_sosex(sG_tskiQ, dU_sqkPqs_int, dB_tsqkPR, v, thc);
+        _Timer.stop("GET_C_SOSEX");
+
+        _context->comm.barrier();
+        _Timer.stop("REDISTRIBUTE_BC");
+
+        //app_log(2, "Building D_PR");
+        build_D_sosex_all_t_4D(dB_tsqkPR, dC_tsqkPR, dD_tsqkPR_acc, thc);
+        _context->comm.barrier();
+      }
+      app_log(2, "Evaluating Sigma");
+      evaluate_Sigma_sosex_all_t(sSigma_tskij, dD_tsqkPR_acc, thc);
+    }
+
+    template<nda::MemoryArray Array_view_5D_t>
+    void gf2_t::thc_sosex_scheme2_4D_no_reallocation(
+        const nda::MemoryArrayOfRank<5> auto &G_tskij,
+        sArray_t<Array_view_5D_t> &sSigma_tskij, THC_ERI auto &thc) {
+      size_t nbnd = thc.nbnd();
+      size_t nkpts = G_tskij.shape(2);
+
+      app_log(2, "Running the dynamical part of SOSEX");
+
+      _Timer.start("BUILD_UPqs");
+      if(!U_computed) {
+        app_log(2, "MY: U IS NOT COMPUTED YET");
+        build_U_Pqs_all(thc, dU_sqkPqs_int, true, false);
+      }
+      _Timer.stop("BUILD_UPqs");
+
+      auto [sG_tskQj, sG_tskiQ] = prepare_G_sosex(G_tskij, thc);
+
+      auto [dA_tsqkQu, dA_wsqkQu] = allocate_A_sosex_4D(thc);
+
+      auto [dWA_tsqkPu, dWA_wsqkPu] = allocate_A_sosex_4D(thc);
+
+      auto dD_tsqkPR_acc = allocate_D_sosex(thc);
+
+      auto [dB_tsqkPR, dB_tsqkPR_for_D] = allocate_B_sosex_4D(thc, dWA_tsqkPu, dD_tsqkPR_acc);
+
+
+      if(save_C() && dC_tsqkPRv_opt.has_value()) app_log(2, "SOSEX: Will reuse the saved C intermediate from GF2");
+      else app_log(2, "SOSEX: Will recompute C intermediate to save memory");
+
+      std::optional<nda::array<ComplexType, 4>> Wloc_wqPQ_opt; // local buffer to cache gathered W
+
+      for(size_t v = 0; v < nbnd; v++) {
+        app_log(2, "v = {}", v);
+        build_GG_Qu_all_full_t_4D(thc,dA_tsqkQu, sG_tskiQ, sG_tskQj, v);
+        std::array<long,6> t_pgrid_out = dA_tsqkQu.grid();
+        std::array<long,6> w_pgrid_out = t_pgrid_out;
+      {
+        size_t np = _context->comm.size();
+        long nqpools = utils::find_proc_grid_max_npools(np, nkpts, 0.2);
+        np /= nqpools;
+        long nwpools = utils::find_proc_grid_max_npools(np, _ft->nw_b(), 0.2);
+        np /= nwpools;
+        long nkpools = utils::find_proc_grid_max_npools(np, nkpts, 0.2);
+        np /= nkpools;
+      
+        size_t np_Quv = np;
+        w_pgrid_out = {nwpools,1,nqpools,nkpools,np_Quv,1};
+        utils::check(std::accumulate(w_pgrid_out.begin(),w_pgrid_out.end(),1,std::multiplies<long>()) == _context->comm.size(), "w_pgrid_out has inconsistent processors");
+      }
+        app_log(2, "Performing tau-to-w transform of GG_Qu");
+        tau_to_w_full(dA_tsqkQu, dA_wsqkQu, "GG_Qu_v");
+
+        app_log(2, "Building WGG_Pu_v(w)");
+        build_WGG_4D(thc, dA_wsqkQu, dWA_wsqkPu, Wloc_wqPQ_opt, false); // reuse cached Wloc for all v
+
+        app_log(2, "Performing w-to-tau transform of WGG_Pu_v");
+        w_to_tau_full(dWA_wsqkPu, dWA_tsqkPu, "WGG_Qu_v");
+
+        app_log(2, "Building B_PRv(t)");
+        build_B_WA_4D(dWA_tsqkPu, dB_tsqkPR, thc, false);
+
+        _Timer.start("REDISTRIBUTE_BC");
+        if(dD_tsqkPR_acc.grid() != dB_tsqkPR.grid()) { // redistribute for D build
+          _Timer.start("REDISTRIBUTE_SOSEX");
+          math::nda::redistribute(dB_tsqkPR, dB_tsqkPR_for_D);
+          _Timer.stop("REDISTRIBUTE_SOSEX");
+
+          utils::check(dB_tsqkPR_for_D.grid()[0] == 1, "dB_tsqkPR_for_D.grid()[0] != 1");
+          utils::check(dB_tsqkPR_for_D.grid()[1] == 1, "dB_tsqkPR_for_D.grid()[1] != 1");
+          utils::check(dB_tsqkPR_for_D.grid()[2] == 1, "dB_tsqkPR_for_D.grid()[2] != 1");
+          utils::check(dB_tsqkPR_for_D.grid()[3] == 1, "dB_tsqkPR_for_D.grid()[3] != 1");
+        }
+
+        auto& B = (dD_tsqkPR_acc.grid() != dB_tsqkPR.grid()) ? dB_tsqkPR_for_D : dB_tsqkPR;
+
+        _Timer.start("GET_C_SOSEX");
+        auto dC_tsqkPR = (save_C() && dC_tsqkPRv_opt.has_value()) ?
+            prepare_C_from_saved(B, v) : build_C_sosex(sG_tskiQ, dU_sqkPqs_int, B, v, thc);
+        _Timer.stop("GET_C_SOSEX");
+
+        _context->comm.barrier();
+        _Timer.stop("REDISTRIBUTE_BC");
+
+        //app_log(2, "Building D_PR");
+        build_D_sosex_all_t_4D(B, dC_tsqkPR, dD_tsqkPR_acc, thc);
+        _context->comm.barrier();
+      }
+      app_log(2, "Evaluating Sigma");
+      evaluate_Sigma_sosex_all_t(sSigma_tskij, dD_tsqkPR_acc, thc);
+    }
+
+    template<nda::MemoryArray local_Array_6D_t, nda::MemoryArray local_Array_5D_t, 
+             nda::MemoryArray local_Array_6D_t1>
+    auto gf2_t::build_C_sosex(const sArray_t<local_Array_5D_t> &sG_tskiQ, 
+                        const memory::darray_t<local_Array_6D_t1, mpi3::communicator> &dU_sqkRvw,
+                        memory::darray_t<local_Array_6D_t, mpi3::communicator> &dB_tsqkPR,
+                        size_t v, THC_ERI auto &thc)
+      -> memory::darray_t<local_Array_6D_t, mpi3::communicator> {
+      using math::nda::make_distributed_array;
+      using Array_2D_t = memory::array<HOST_MEMORY, ComplexType, 2>;
+
+      // global shapes
+      size_t Np    = thc.Np();
+      size_t nbnd = thc.nbnd();
+
+      utils::check(dU_sqkRvw.local_shape()[4] == nbnd, "v must be a full dimension in dU_sqkRvw");
+      utils::check(dU_sqkRvw.local_shape()[5] == nbnd, "w must be a full dimension in dU_sqkRvw");
+
+      _Timer.start("ALLOC_SOSEX");
+      auto dC_tsqkPR = make_distributed_array<local_Array_6D_t>(
+            _context->comm, {1,dU_sqkRvw.grid()[0],dU_sqkRvw.grid()[1],dU_sqkRvw.grid()[2],
+            dU_sqkRvw.grid()[4],dU_sqkRvw.grid()[3]},
+            dB_tsqkPR.global_shape(), {1,1,1,1, 1,1});
+      _Timer.stop("ALLOC_SOSEX");
+
+
+      // local shapes
+      auto [nt_loc, ns_loc, nq_kpts_loc, nk_kpts_loc, Np_loc2, Np_loc] = dC_tsqkPR.local_shape();
+      auto [t_origin, s_origin, q_origin, k_origin, P_origin, R_origin] = dC_tsqkPR.origin();
+
+      {
+        // temporary array
+        Array_2D_t C_RP(Np_loc, Np);
+        auto C_R_P = nda::reshape(C_RP, shape_t<2>{Np_loc, Np});
+
+        for(size_t t = 0; t < nt_loc; t++)
+        for(size_t s = 0; s < ns_loc; s++)
+        for(size_t q = 0; q < nq_kpts_loc; q++) {
+          for(size_t k = 0; k < nk_kpts_loc; k++) {
+            size_t it = t + t_origin;
+            size_t is = s + s_origin;
+            size_t ik = k + k_origin;
+            auto G_wP = sG_tskiQ.local()(it,is,ik, nda::ellipsis{});
+
+            auto U_R_v_w = nda::reshape(dU_sqkRvw.local()(s, q, k, nda::ellipsis{}),
+                                             shape_t<3>{Np_loc, nbnd, nbnd});
+            // copy to avoid nda issues with non-contigeous arrays
+            auto U_R_w = nda::make_regular(U_R_v_w(nda::range::all, v, nda::range::all));
+            _Timer.start("C_GEMM_SOSEX");
+            nda::blas::gemm(U_R_w, G_wP, C_R_P);
+            _Timer.stop("C_GEMM_SOSEX");
+
+            auto C_PR = dC_tsqkPR.local()(t, s, q, k, nda::ellipsis{});
+            auto C_P_R = nda::reshape(C_PR, shape_t<2>{Np, Np_loc});
+            C_P_R = nda::make_regular(nda::transpose(C_R_P));
+          }
+        }
+      }
+
+      _Timer.start("ALLOC_SOSEX");
+      auto dC_tsqkPR_out = make_distributed_array<local_Array_6D_t>(
+            _context->comm, dB_tsqkPR.grid(), dB_tsqkPR.global_shape(), dB_tsqkPR.block_size());
+      _Timer.stop("ALLOC_SOSEX");
+
+      _Timer.start("COMM");
+      _Timer.start("REDISTRIBUTE_SOSEX");
+      math::nda::redistribute(dC_tsqkPR, dC_tsqkPR_out);
+      _Timer.stop("REDISTRIBUTE_SOSEX");
+      _Timer.stop("COMM");
+
+      return dC_tsqkPR_out;
+    }
+
+
+    template<nda::MemoryArrayOfRank<5> Array_5D_t>
+    auto gf2_t::prepare_G_sosex(const Array_5D_t &G_tskij, THC_ERI auto &thc)
+      -> std::array<sArray_t<nda::array_view<typename std::decay_t<Array_5D_t>::value_type, 5> >, 2> {
+
+      using value_type = typename std::decay_t<Array_5D_t>::value_type;
+      using Array_view_5D_t = nda::array_view<value_type, 5>;
+
+      size_t nt = G_tskij.shape()[0];
+      size_t nkpts = thc.nkpts();
+      size_t ns = thc.ns();
+      size_t Np    = thc.Np();
+      size_t nbnd = thc.nbnd();
+      _Timer.start("G_TRANSFORM_SOSEX");
+
+      sArray_t<Array_view_5D_t> G_tskQj_shm(
+          math::shm::make_shared_array<Array_view_5D_t>(*_context, {nt, ns, nkpts, Np, nbnd}));
+      sArray_t<Array_view_5D_t> G_tskiQ_shm(
+          math::shm::make_shared_array<Array_view_5D_t>(*_context, {nt, ns, nkpts, nbnd, Np}));
+
+      // TODO CNY: check with Pavel if we can safely use _context->comm
+      auto[dim0_rank, dim0_comm_size, dim1_rank, dim1_comm_size] =
+          utils::setup_two_layer_mpi(std::addressof(_context->comm), nt, nkpts);
+
+      for(size_t t = dim0_rank; t < nt; t += dim0_comm_size) {
+        for(size_t q = dim1_rank; q < nkpts; q += dim1_comm_size) {
+          for(size_t is = 0; is < ns; is++) {
+            auto G_Qj = nda::make_regular(G_tskQj_shm.local()(t, is, q, nda::ellipsis{}));
+            auto G_iQ = nda::make_regular(G_tskiQ_shm.local()(t, is, q, nda::ellipsis{}));
+
+            auto G_Q_j = nda::reshape(G_Qj, shape_t<2>{Np, nbnd});
+            auto G_i_Q = nda::reshape(G_iQ, shape_t<2>{nbnd, Np});
+
+            transform_G(G_tskij, G_i_Q, is, q, t, "right", thc);
+            transform_G(G_tskij, G_Q_j, is, q, t, "left", thc);
+
+            G_tskQj_shm.local()(t, is, q, nda::ellipsis{}) = G_Qj;
+            G_tskiQ_shm.local()(t, is, q, nda::ellipsis{}) = G_iQ;
+          }
+        }
+      }
+      G_tskQj_shm.all_reduce();
+      G_tskiQ_shm.all_reduce();
+      _Timer.stop("G_TRANSFORM_SOSEX");
+
+      return std::array<decltype(G_tskiQ_shm), 2>{G_tskQj_shm, G_tskiQ_shm};
+    }
+
+
+    template<nda::MemoryArray local_Array_t, typename communicator_t>
+    auto gf2_t::tau_to_w_full(memory::darray_t<local_Array_t, communicator_t> &dA_tx,
+                        std::array<long, ::nda::get_rank<std::decay_t<local_Array_t>>> w_pgrid_out,
+                        std::array<long, ::nda::get_rank<std::decay_t<local_Array_t>>> w_bsize_out,
+                        std::string name,
+                        bool reset_input)
+      -> memory::darray_t<local_Array_t, mpi3::communicator>
+    {
+      using math::nda::make_distributed_array;
+      constexpr int rank = ::nda::get_rank<std::decay_t<local_Array_t>>;
+
+      static_assert(rank > 1, "gf2_t::tau_to_w rank of the array is too small");
+      static_assert(rank > 2, "gf2_t::tau_to_w rank=2 is NIY");
+
+      _Timer.start("IMAG_FT_TtoW");
+
+      long nw = _ft->nw_b();
+      auto t_gshape = dA_tx.global_shape();
+      std::array<long, rank> w_gshape; 
+      std::array<long, rank> w_pgrid; 
+
+      for(long i = 0; i < rank; i++) w_pgrid[i] = 1;
+      w_gshape[0] = nw;
+      for(long i = 1; i < rank; i++) w_gshape[i] = t_gshape[i];
+
+      if (dA_tx.communicator()->size() == 1) {
+        _ft->check_leakage(dA_tx, imag_axes_ft::boson, name, false);
+        _Timer.start("ALLOC_SOSEX");
+        auto dA_wx = make_distributed_array<local_Array_t>(
+            _context->comm, w_pgrid, w_gshape, dA_tx.block_size());
+        _Timer.stop("ALLOC_SOSEX");
+        // local arrays cover all tau and w points
+        auto A_tx_loc = dA_tx.local();
+        auto A_wx_loc = dA_wx.local();
+        _ft->tau_to_w(A_tx_loc, A_wx_loc, imag_axes_ft::string_to_stats_enum("boson"));
+        if (reset_input) dA_tx.reset();
+        _Timer.stop("IMAG_FT_TtoW");
+        return dA_wx;
+      }
+
+      // redistribute to cover (tau, w)-axes locally -> FT locally -> redistribute back
+      std::array<long, rank> b_pgrid; // pgrid for buffer
+      for(long i = 0; i < rank; i++) b_pgrid[i] = 1;
+      long xdim = std::accumulate(t_gshape.begin()+1,t_gshape.end(),1,std::multiplies<long>());
+      {
+        int np = _context->comm.size();
+        if (xdim >= np) {
+          // greedy way of partitioning
+          for(long i = 1; i < rank-1; i++) { // rank >= 3
+              // xdim_rest = t_gshape[i+1]*t_gshape[i+2]*...
+              long xdim_rest = std::accumulate(t_gshape.begin()+i+1,t_gshape.end(),1,std::multiplies<long>());
+              long p = utils::find_proc_grid_min_diff(np, t_gshape[i], xdim_rest);
+              b_pgrid[i] = p <= t_gshape[i] ? p : np/p; // if find_proc_grid misbehaves
+              np /= b_pgrid[i];
+          }
+          b_pgrid[rank-1] = np;
+        } else {
+          APP_ABORT("gw_t::tau_to_w: Error finding proper pgrid: xdim < np.");
+        }
+      }
+        _Timer.start("ALLOC_SOSEX");
+      auto buffer_ti  = make_distributed_array<local_Array_t>(
+          _context->comm, b_pgrid, t_gshape, dA_tx.block_size());
+        _Timer.stop("ALLOC_SOSEX");
+      _Timer.start("FT_REDISTRIBUTE");
+            _Timer.start("REDISTRIBUTE_SOSEX");
+      math::nda::redistribute(dA_tx, buffer_ti);
+            _Timer.stop("REDISTRIBUTE_SOSEX");
+      _Timer.stop("FT_REDISTRIBUTE");
+      if (reset_input) dA_tx.reset();
+      _ft->check_leakage(buffer_ti, imag_axes_ft::boson, name+"_redistr", false);
+      buffer_ti.communicator()->barrier();
+
+        _Timer.start("ALLOC_SOSEX");
+      auto buffer_wi  = make_distributed_array<local_Array_t>(
+          _context->comm, b_pgrid, w_gshape, buffer_ti.block_size());
+        _Timer.stop("ALLOC_SOSEX");
+      {
+        auto buf_ti_loc = buffer_ti.local();
+        auto buf_wi_loc = buffer_wi.local();
+        _ft->tau_to_w(buf_ti_loc, buf_wi_loc, imag_axes_ft::string_to_stats_enum("boson"));
+      }
+      buffer_ti.reset();
+      buffer_wi.communicator()->barrier();
+
+        _Timer.start("ALLOC_SOSEX");
+      auto dA_wx = make_distributed_array<local_Array_t>(
+          _context->comm, w_pgrid_out, w_gshape, w_bsize_out);
+        _Timer.stop("ALLOC_SOSEX");
+
+      _Timer.start("FT_REDISTRIBUTE");
+            _Timer.start("REDISTRIBUTE_SOSEX");
+      math::nda::redistribute(buffer_wi, dA_wx);
+            _Timer.stop("REDISTRIBUTE_SOSEX");
+      _Timer.stop("FT_REDISTRIBUTE");
+      buffer_wi.reset();
+      dA_wx.communicator()->barrier();
+
+      _Timer.stop("IMAG_FT_TtoW");
+      return dA_wx;
+    }
+
+    template<nda::MemoryArray local_Array_t, typename communicator_t>
+    void gf2_t::tau_to_w_full(memory::darray_t<local_Array_t, communicator_t> &dA_tx,
+                        memory::darray_t<local_Array_t, communicator_t> &dA_wx,
+                        std::string name)
+    {
+      using math::nda::make_distributed_array;
+      constexpr int rank = ::nda::get_rank<std::decay_t<local_Array_t>>;
+
+      static_assert(rank > 1, "gf2_t::tau_to_w rank of the array is too small");
+      static_assert(rank > 2, "gf2_t::tau_to_w rank=2 is NIY");
+
+      _Timer.start("IMAG_FT_TtoW");
+
+      long nw = _ft->nw_b();
+      auto t_gshape = dA_tx.global_shape();
+      std::array<long, rank> w_gshape; 
+      std::array<long, rank> w_pgrid; 
+
+      for(long i = 0; i < rank; i++) w_pgrid[i] = 1;
+      w_gshape[0] = nw;
+      for(long i = 1; i < rank; i++) w_gshape[i] = t_gshape[i];
+
+      if (dA_tx.communicator()->size() == 1) {
+        _ft->check_leakage(dA_tx, imag_axes_ft::boson, name, false);
+        // local arrays cover all tau and w points
+        auto A_tx_loc = dA_tx.local();
+        auto A_wx_loc = dA_wx.local();
+        _ft->tau_to_w(A_tx_loc, A_wx_loc, imag_axes_ft::string_to_stats_enum("boson"));
+        _Timer.stop("IMAG_FT_TtoW");
+      }
+
+      // redistribute to cover (tau, w)-axes locally -> FT locally -> redistribute back
+      std::array<long, rank> b_pgrid; // pgrid for buffer
+      for(long i = 0; i < rank; i++) b_pgrid[i] = 1;
+      long xdim = std::accumulate(t_gshape.begin()+1,t_gshape.end(),1,std::multiplies<long>());
+      {
+        int np = _context->comm.size();
+        if (xdim >= np) {
+          // greedy way of partitioning
+          for(long i = 1; i < rank-1; i++) { // rank >= 3
+              // xdim_rest = t_gshape[i+1]*t_gshape[i+2]*...
+              long xdim_rest = std::accumulate(t_gshape.begin()+i+1,t_gshape.end(),1,std::multiplies<long>());
+              long p = utils::find_proc_grid_min_diff(np, t_gshape[i], xdim_rest);
+              b_pgrid[i] = p <= t_gshape[i] ? p : np/p; // if find_proc_grid misbehaves
+              np /= b_pgrid[i];
+          }
+          b_pgrid[rank-1] = np;
+        } else {
+          APP_ABORT("gw_t::tau_to_w: Error finding proper pgrid: xdim < np.");
+        }
+      }
+        _Timer.start("ALLOC_SOSEX");
+      auto buffer_ti  = make_distributed_array<local_Array_t>(
+          _context->comm, b_pgrid, t_gshape, dA_tx.block_size());
+        _Timer.stop("ALLOC_SOSEX");
+      _Timer.start("FT_REDISTRIBUTE");
+            _Timer.start("REDISTRIBUTE_SOSEX");
+      math::nda::redistribute(dA_tx, buffer_ti);
+            _Timer.stop("REDISTRIBUTE_SOSEX");
+      _Timer.stop("FT_REDISTRIBUTE");
+      _ft->check_leakage(buffer_ti, imag_axes_ft::boson, name+"_redistr", false);
+      buffer_ti.communicator()->barrier();
+
+        _Timer.start("ALLOC_SOSEX");
+      auto buffer_wi  = make_distributed_array<local_Array_t>(
+          _context->comm, b_pgrid, w_gshape, buffer_ti.block_size());
+        _Timer.stop("ALLOC_SOSEX");
+      {
+        auto buf_ti_loc = buffer_ti.local();
+        auto buf_wi_loc = buffer_wi.local();
+        _ft->tau_to_w(buf_ti_loc, buf_wi_loc, imag_axes_ft::string_to_stats_enum("boson"));
+      }
+      buffer_ti.reset();
+      buffer_wi.communicator()->barrier();
+
+      _Timer.start("FT_REDISTRIBUTE");
+            _Timer.start("REDISTRIBUTE_SOSEX");
+      math::nda::redistribute(buffer_wi, dA_wx);
+            _Timer.stop("REDISTRIBUTE_SOSEX");
+      _Timer.stop("FT_REDISTRIBUTE");
+      buffer_wi.reset();
+      dA_wx.communicator()->barrier();
+
+      _Timer.stop("IMAG_FT_TtoW");
+    }
+
+
+    template<nda::MemoryArray local_Array_6D_t>
+    auto gf2_t::prepare_C_from_saved(
+        memory::darray_t<local_Array_6D_t, mpi3::communicator> &dB_tsqkPR, size_t v)
+      -> memory::darray_t<local_Array_6D_t, mpi3::communicator>
+    {
+      decltype(nda::range::all) all;
+      auto C_grid = dC_tsqkPRv_opt.value().grid();
+      auto C_gshape = dC_tsqkPRv_opt.value().global_shape();
+      _Timer.start("ALLOC_SOSEX");
+      auto dC_tsqkPR = math::nda::make_distributed_array<Array_6D_t>(_context->comm, {C_grid[0], C_grid[1], C_grid[2], C_grid[3], C_grid[4], C_grid[5]}, {C_gshape[0], C_gshape[1], C_gshape[2], C_gshape[3], C_gshape[4], C_gshape[5]}, {1,1,1,1,1,1});
+      _Timer.stop("ALLOC_SOSEX");
+
+      auto C_lshape7 = dC_tsqkPRv_opt.value().local_shape();
+      auto C_lshape6 = dC_tsqkPR.local_shape();
+
+      for(size_t i = 0; i < 6; i++)
+        utils::check(C_lshape6[i] == C_lshape7[i], "C_lshape is not consistent!");
+
+      dC_tsqkPR.local() = dC_tsqkPRv_opt.value().local()(all,all,all,all, all,all,v);
+      _context->comm.barrier();
+            
+      if(dB_tsqkPR.grid() != dC_tsqkPR.grid()) {
+        _Timer.start("ALLOC_SOSEX");
+        auto dC_tsqkPR_new = math::nda::make_distributed_array<Array_6D_t>(
+                    _context->comm, dB_tsqkPR.grid(), dB_tsqkPR.global_shape(), dB_tsqkPR.block_size());
+        _Timer.stop("ALLOC_SOSEX");
+            
+        _Timer.start("REDISTRIBUTE_SOSEX");
+        math::nda::redistribute(dC_tsqkPR, dC_tsqkPR_new);
+        _Timer.stop("REDISTRIBUTE_SOSEX");
+        dC_tsqkPR = dC_tsqkPR_new;
+      }
+      return dC_tsqkPR;
+    }
+
+    template<nda::MemoryArray local_Array_t, typename communicator_t>
+    auto gf2_t::w_to_tau_full(memory::darray_t<local_Array_t, communicator_t> &dA_wx,
+                        std::array<long, ::nda::get_rank<std::decay_t<local_Array_t>>> t_pgrid_out,
+                        std::array<long, ::nda::get_rank<std::decay_t<local_Array_t>>> t_bsize_out,
+                        std::string name,
+                        bool reset_input)
+      -> memory::darray_t<local_Array_t, mpi3::communicator>
+    {
+      using math::nda::make_distributed_array;
+      constexpr int rank = ::nda::get_rank<std::decay_t<local_Array_t>>;
+
+      static_assert(rank > 1, "gf2_t::w_to_tau rank of the array is too small");
+      static_assert(rank > 2, "gf2_t::w_to_tau rank=2 is NIY");
+
+      _Timer.start("IMAG_FT_WtoT");
+
+      size_t nt = _ft->nt_b();
+
+      auto w_gshape = dA_wx.global_shape();
+      std::array<long, rank> t_gshape; 
+      std::array<long, rank> t_pgrid; 
+
+      for(long i = 0; i < rank; i++) t_pgrid[i] = 1;
+      t_gshape[0] = nt;
+      for(long i = 1; i < rank; i++) t_gshape[i] = w_gshape[i];
+
+      if (dA_wx.communicator()->size() == 1) {
+        _Timer.start("ALLOC_SOSEX");
+        auto dA_tx = make_distributed_array<local_Array_t>(
+            _context->comm, t_pgrid, t_gshape, dA_wx.block_size());
+        _Timer.stop("ALLOC_SOSEX");
+        // local arrays cover all tau and w points
+        auto A_tx_loc = dA_tx.local();
+        auto A_wx_loc = dA_wx.local();
+        _ft->w_to_tau(A_wx_loc, A_tx_loc, imag_axes_ft::string_to_stats_enum("boson"));
+        if (reset_input) dA_wx.reset();
+        _ft->check_leakage(dA_tx, imag_axes_ft::boson, name, false);
+        _Timer.stop("IMAG_FT_TtoW");
+        return dA_tx;
+      }
+
+      // redistribute to cover (tau, w)-axes locally -> FT locally -> redistribute back
+      std::array<long, rank> wb_pgrid; // pgrid for buffer
+      for(long i = 0; i < rank; i++) wb_pgrid[i] = 1;
+      {
+        long xdim = std::accumulate(w_gshape.begin()+1,w_gshape.end(),1,std::multiplies<long>());
+        int np = _context->comm.size();
+        if (xdim >= np) {
+          // greedy way of partitioning
+          for(long i = 1; i < rank-1; i++) { // rank >= 3
+            // xdim_rest = t_gshape[i+1]*t_gshape[i+2]*...
+            long xdim_rest = std::accumulate(w_gshape.begin()+i+1,w_gshape.end(),1,std::multiplies<long>());
+            long p = utils::find_proc_grid_min_diff(np, w_gshape[i], xdim_rest);
+            wb_pgrid[i] = p <= t_gshape[i] ? p : np/p; // if find_proc_grid misbehaves
+            np /= wb_pgrid[i];
+          }
+          wb_pgrid[rank-1] = np;
+        } else {
+          APP_ABORT("gf2_t::w_to_tau: Error finding proper pgrid: xdim < np.");
+        }
+      }
+
+      std::array<long, rank> tb_pgrid; // pgrid for buffer
+      for(long i = 0; i < rank; i++) tb_pgrid[i] = 1;
+      {
+        long xdim = std::accumulate(t_gshape.begin()+1,t_gshape.end(),1,std::multiplies<long>());
+        int np = _context->comm.size();
+        if (xdim >= np) {
+          // greedy way of partitioning
+          for(long i = 1; i < rank-1; i++) { // rank >= 3
+            // xdim_rest = t_gshape[i+1]*t_gshape[i+2]*...
+            long xdim_rest = std::accumulate(t_gshape.begin()+i+1,t_gshape.end(),1,std::multiplies<long>());
+            long p = utils::find_proc_grid_min_diff(np, t_gshape[i], xdim_rest);
+            tb_pgrid[i] = p <= t_gshape[i] ? p : np/p; // if find_proc_grid misbehaves
+            np /= tb_pgrid[i];
+          }
+          tb_pgrid[rank-1] = np;
+        } else {
+          APP_ABORT("gf2_t::w_to_tau: Error finding proper pgrid: xdim < np.");
+        }
+      }
+
+      _Timer.start("ALLOC_SOSEX");
+      auto buffer_wi  = make_distributed_array<local_Array_t>(
+          _context->comm, wb_pgrid, w_gshape, dA_wx.block_size());
+      _Timer.stop("ALLOC_SOSEX");
+      _Timer.start("FT_REDISTRIBUTE");
+      _Timer.start("REDISTRIBUTE_SOSEX");
+      math::nda::redistribute(dA_wx, buffer_wi);
+      _Timer.stop("REDISTRIBUTE_SOSEX");
+      _Timer.stop("FT_REDISTRIBUTE");
+      if (reset_input) dA_wx.reset();
+
+      _Timer.start("ALLOC_SOSEX");
+      auto buffer_ti  = make_distributed_array<local_Array_t>(
+          _context->comm, tb_pgrid, t_gshape, buffer_wi.block_size());
+      _Timer.stop("ALLOC_SOSEX");
+      {
+        auto buf_ti_loc = buffer_ti.local();
+        auto buf_wi_loc = buffer_wi.local();
+        _ft->w_to_tau(buf_wi_loc, buf_ti_loc, imag_axes_ft::string_to_stats_enum("boson"));
+      }
+      buffer_wi.reset();
+      _ft->check_leakage(buffer_ti, imag_axes_ft::boson, name, false);
+
+      _Timer.start("ALLOC_SOSEX");
+      auto dA_tx = make_distributed_array<local_Array_t>(
+          _context->comm, t_pgrid_out, t_gshape, t_bsize_out);
+      _Timer.stop("ALLOC_SOSEX");
+
+      _Timer.start("FT_REDISTRIBUTE");
+      _Timer.start("REDISTRIBUTE_SOSEX");
+      math::nda::redistribute(buffer_ti, dA_tx);
+      _Timer.stop("REDISTRIBUTE_SOSEX");
+      _Timer.stop("FT_REDISTRIBUTE");
+      //_ft->check_leakage(dA_tx, imag_axes_ft::boson, name, false);
+      buffer_ti.reset();
+
+      _Timer.stop("IMAG_FT_WtoT");
+      return dA_tx;
+    }
+
+    template<nda::MemoryArray local_Array_t, typename communicator_t>
+    void gf2_t::w_to_tau_full(memory::darray_t<local_Array_t, communicator_t> &dA_wx,
+                       memory::darray_t<local_Array_t, communicator_t> &dA_tx,
+                        std::string name)
+    {
+      using math::nda::make_distributed_array;
+      constexpr int rank = ::nda::get_rank<std::decay_t<local_Array_t>>;
+
+      static_assert(rank > 1, "gf2_t::w_to_tau rank of the array is too small");
+      static_assert(rank > 2, "gf2_t::w_to_tau rank=2 is NIY");
+
+      _Timer.start("IMAG_FT_WtoT");
+
+      size_t nt = _ft->nt_b();
+
+      auto w_gshape = dA_wx.global_shape();
+      std::array<long, rank> t_gshape; 
+      std::array<long, rank> t_pgrid; 
+
+      for(long i = 0; i < rank; i++) t_pgrid[i] = 1;
+      t_gshape[0] = nt;
+      for(long i = 1; i < rank; i++) t_gshape[i] = w_gshape[i];
+
+      if (dA_wx.communicator()->size() == 1) {
+        _Timer.start("ALLOC_SOSEX");
+        auto dA_tx_ = make_distributed_array<local_Array_t>(
+            _context->comm, t_pgrid, t_gshape, dA_wx.block_size());
+        _Timer.stop("ALLOC_SOSEX");
+        // local arrays cover all tau and w points
+        auto A_tx_loc = dA_tx_.local();
+        auto A_wx_loc = dA_wx.local();
+        _ft->w_to_tau(A_wx_loc, A_tx_loc, imag_axes_ft::string_to_stats_enum("boson"));
+        _ft->check_leakage(dA_tx_, imag_axes_ft::boson, name, false);
+        _Timer.stop("IMAG_FT_TtoW");
+      }
+
+      // redistribute to cover (tau, w)-axes locally -> FT locally -> redistribute back
+      std::array<long, rank> wb_pgrid; // pgrid for buffer
+      for(long i = 0; i < rank; i++) wb_pgrid[i] = 1;
+      {
+        long xdim = std::accumulate(w_gshape.begin()+1,w_gshape.end(),1,std::multiplies<long>());
+        int np = _context->comm.size();
+        if (xdim >= np) {
+          // greedy way of partitioning
+          for(long i = 1; i < rank-1; i++) { // rank >= 3
+            // xdim_rest = t_gshape[i+1]*t_gshape[i+2]*...
+            long xdim_rest = std::accumulate(w_gshape.begin()+i+1,w_gshape.end(),1,std::multiplies<long>());
+            long p = utils::find_proc_grid_min_diff(np, w_gshape[i], xdim_rest);
+            wb_pgrid[i] = p <= t_gshape[i] ? p : np/p; // if find_proc_grid misbehaves
+            np /= wb_pgrid[i];
+          }
+          wb_pgrid[rank-1] = np;
+        } else {
+          APP_ABORT("gf2_t::w_to_tau: Error finding proper pgrid: xdim < np.");
+        }
+      }
+
+      std::array<long, rank> tb_pgrid; // pgrid for buffer
+      for(long i = 0; i < rank; i++) tb_pgrid[i] = 1;
+      {
+        long xdim = std::accumulate(t_gshape.begin()+1,t_gshape.end(),1,std::multiplies<long>());
+        int np = _context->comm.size();
+        if (xdim >= np) {
+          // greedy way of partitioning
+          for(long i = 1; i < rank-1; i++) { // rank >= 3
+            // xdim_rest = t_gshape[i+1]*t_gshape[i+2]*...
+            long xdim_rest = std::accumulate(t_gshape.begin()+i+1,t_gshape.end(),1,std::multiplies<long>());
+            long p = utils::find_proc_grid_min_diff(np, t_gshape[i], xdim_rest);
+            tb_pgrid[i] = p <= t_gshape[i] ? p : np/p; // if find_proc_grid misbehaves
+            np /= tb_pgrid[i];
+          }
+          tb_pgrid[rank-1] = np;
+        } else {
+          APP_ABORT("gf2_t::w_to_tau: Error finding proper pgrid: xdim < np.");
+        }
+      }
+
+      _Timer.start("ALLOC_SOSEX");
+      auto buffer_wi  = make_distributed_array<local_Array_t>(
+          _context->comm, wb_pgrid, w_gshape, dA_wx.block_size());
+      _Timer.stop("ALLOC_SOSEX");
+      _Timer.start("FT_REDISTRIBUTE");
+      _Timer.start("REDISTRIBUTE_SOSEX");
+      math::nda::redistribute(dA_wx, buffer_wi);
+      _Timer.stop("REDISTRIBUTE_SOSEX");
+      _Timer.stop("FT_REDISTRIBUTE");
+
+      _Timer.start("ALLOC_SOSEX");
+      auto buffer_ti  = make_distributed_array<local_Array_t>(
+          _context->comm, tb_pgrid, t_gshape, buffer_wi.block_size());
+      _Timer.stop("ALLOC_SOSEX");
+      {
+        auto buf_ti_loc = buffer_ti.local();
+        auto buf_wi_loc = buffer_wi.local();
+        _ft->w_to_tau(buf_wi_loc, buf_ti_loc, imag_axes_ft::string_to_stats_enum("boson"));
+      }
+      buffer_wi.reset();
+      _ft->check_leakage(buffer_ti, imag_axes_ft::boson, name, false);
+
+      _Timer.start("FT_REDISTRIBUTE");
+      _Timer.start("REDISTRIBUTE_SOSEX");
+      math::nda::redistribute(buffer_ti, dA_tx);
+      _Timer.stop("REDISTRIBUTE_SOSEX");
+      _Timer.stop("FT_REDISTRIBUTE");
+      //_ft->check_leakage(dA_tx, imag_axes_ft::boson, name, false);
+      buffer_ti.reset();
+
+      _Timer.stop("IMAG_FT_WtoT");
+    }
+
+
+    auto gf2_t::build_WGG(THC_ERI auto &thc,
+       memory::darray_t<memory::array<HOST_MEMORY, ComplexType, 7>, mpi3::communicator>& dA_wsqkQuv)
+       -> memory::darray_t<memory::array<HOST_MEMORY, ComplexType, 7>, mpi3::communicator> 
+    {
+      using math::nda::make_distributed_array;
+      using Array_2D_t = memory::array<HOST_MEMORY, ComplexType, 2>;
+      using Array_7D_t = memory::array<HOST_MEMORY, ComplexType, 7>;
+
+      _Timer.start("BUILD_WGG_SOSEX");
+  
+      size_t nw  = dA_wsqkQuv.global_shape()[0];
+      size_t ns    = thc.ns();
+      size_t nkpts = thc.nkpts();
+      size_t Np    = thc.Np();
+      size_t nbnd = thc.nbnd();
+
+      _Timer.start("ALLOC_SOSEX");
+      auto dWA_wsqkPuv = make_distributed_array<Array_7D_t>(
+          _context->comm, dA_wsqkQuv.grid(), dA_wsqkQuv.global_shape(), dA_wsqkQuv.block_size());
+      _Timer.stop("ALLOC_SOSEX");
+  
+      auto [nw_loc, ns_loc, nq_kpts_loc, nk_kpts_loc, Np_loc, nbnd_loc1, nbnd_loc2] = dA_wsqkQuv.local_shape();
+      app_log(2, "    - local shape = {},{},{},{},{},{},{}", nw_loc, ns_loc, nq_kpts_loc, nk_kpts_loc, Np_loc, nbnd_loc1, nbnd_loc2);
+  
+      auto [w_origin, s_origin, q_origin, k_origin, Q_origin, orb_u_origin, orb_v_origin] = dA_wsqkQuv.origin();
+
+      size_t color = w_origin*nw*nkpts*nkpts + q_origin*nkpts + k_origin;  // don't parallelize over spin
+      size_t key = _context->comm.rank();
+      mpi3::communicator wqk_intra_comm = _context->comm.split(color, key);
+      utils::check(wqk_intra_comm.size() == dA_wsqkQuv.grid()[4], "wqk_intra_comm.size() != np_Puv");
+
+      _Timer.start("ALLOC_SOSEX");
+      auto dA_Quv  = make_distributed_array<Array_2D_t>(wqk_intra_comm, {wqk_intra_comm.size(), 1}, {Np, nbnd*nbnd}, {dA_wsqkQuv.block_size()[4], dA_wsqkQuv.block_size()[5]*dA_wsqkQuv.block_size()[6]});
+      auto dWA_Puv  = make_distributed_array<Array_2D_t>(wqk_intra_comm, {wqk_intra_comm.size(), 1}, {Np, nbnd*nbnd}, {dA_wsqkQuv.block_size()[4], dA_wsqkQuv.block_size()[5]*dA_wsqkQuv.block_size()[6]});
+
+      long np_Z_bigger = utils::find_proc_grid_min_diff(wqk_intra_comm.size(), 1, 1);
+      long np_Z_smaller = wqk_intra_comm.size() / np_Z_bigger;
+      long Z_bsize = std::min( {(long unsigned)1024, Np/np_Z_smaller, Np/np_Z_bigger} );
+
+      auto dA_Quv_mult  = make_distributed_array<Array_2D_t>(wqk_intra_comm, {np_Z_smaller, np_Z_bigger}, {Np, nbnd*nbnd}, {Z_bsize, Z_bsize });
+      auto dWA_Puv_mult  = make_distributed_array<Array_2D_t>(wqk_intra_comm, {np_Z_smaller, np_Z_bigger}, {Np, nbnd*nbnd}, {Z_bsize, Z_bsize });
+      auto dW_PQ  = make_distributed_array<Array_2D_t>(wqk_intra_comm, {np_Z_smaller, np_Z_bigger}, {Np, Np}, {Z_bsize, Z_bsize });
+      _Timer.stop("ALLOC_SOSEX");
+
+      utils::check(nbnd == nbnd_loc1,
+                     "gf2_t::build_WGG, nbnd != nbnd_loc1");
+      utils::check(nbnd == nbnd_loc2,
+                     "gf2_t::build_WGG, nbnd != nbnd_loc2");
+      utils::check(orb_u_origin == 0,
+                     "gf2_t::build_WGG, orb_u_origin != 0");
+      utils::check(orb_v_origin == 0,
+                     "gf2_t::build_WGG, orb_v_origin != 0");
+  
+      auto A_wsqkQuv = dA_wsqkQuv.local();
+
+      auto P_rng = dW_PQ.local_range(0);
+      auto Q_rng = dW_PQ.local_range(1);
+
+      auto WA_P_u_v = nda::reshape(dWA_Puv.local(), shape_t<3>{Np_loc, nbnd, nbnd});
+      auto A_Q_u_v = nda::reshape(dA_Quv.local(), shape_t<3>{Np_loc, nbnd, nbnd});
+
+      long nq_kpts_loc_max = nq_kpts_loc;
+      dA_wsqkQuv.communicator()->broadcast_n(&nq_kpts_loc_max, 1, 0);
+
+      long nw_loc_max = nw_loc;
+      dA_wsqkQuv.communicator()->broadcast_n(&nw_loc_max, 1, 0);
+  
+      long nw_half = (_ft->nw_b()%2==0)? _ft->nw_b()/2 : _ft->nw_b()/2 + 1;
+
+      utils::check(_ft->nw_b()%2==1, "gf2_t::build_WGG, The number of bosonic frequences must be odd");
+
+      for(size_t w = 0; w < nw_loc; w++)
+      for(size_t q = 0; q < nq_kpts_loc; q++) {
+        // there are 2*n+1 bosonic frequences:
+        // [0,..,n-1] indices describe all the negative physical frequences
+        // [n] index describes the zero physical frequency
+        // [n+1,...,2n] describe the positive physical frequency
+        size_t iw = w + w_origin;
+        size_t w_mid = _ft->nw_b()/2; // zero physical frequency
+        // Find the corresponding index for PH-symmetric W(iw_ph)
+        size_t iw_ph = (iw >= w_mid) ? (iw - w_mid) :  // positive or zero physical freqs
+                                       (w_mid - iw);   // negative physical freqs
+
+        utils::check(iw_ph < nw_half, "iw_ph >= nw_half");
+
+        size_t iq = q + q_origin;
+#if W_GATHER_OLD
+        dW_PQ.local() = get_dyn_W(thc, iw_ph, iq)(P_rng, Q_rng);
+#else
+        dW_PQ.local() = get_dyn_W_ranged(thc, iw_ph, iq, P_rng, Q_rng);
+#endif
+        for(size_t is = 0; is < ns; is++) {
+        for(size_t k = 0; k < nk_kpts_loc; k++) {
+
+            A_Q_u_v = A_wsqkQuv(w,is,q,k, nda::ellipsis{});
+
+            _Timer.start("REDISTRIBUTE_SOSEX");
+            math::nda::redistribute(dA_Quv, dA_Quv_mult);
+            _Timer.stop("REDISTRIBUTE_SOSEX");
+            math::nda::slate_ops::multiply(dW_PQ, dA_Quv_mult, dWA_Puv_mult);
+            _Timer.start("REDISTRIBUTE_SOSEX");
+            math::nda::redistribute(dWA_Puv_mult, dWA_Puv);
+            _Timer.stop("REDISTRIBUTE_SOSEX");
+
+            dWA_wsqkPuv.local()(w,is,q,k, nda::ellipsis{}) = WA_P_u_v;
+
+        }
+        }
+        // prevent dead block from blocking operations in case nq_loc is not the same for all processors
+        for (size_t iq_loc = nq_kpts_loc; iq_loc < nq_kpts_loc_max; ++iq_loc)
+#if W_GATHER_OLD
+          auto Z = get_dyn_W(thc, w,iq_loc)(P_rng, Q_rng);
+#else
+          auto Z = get_dyn_W_ranged(thc, w,iq_loc, P_rng, Q_rng);
+#endif
+      } // q
+
+      // prevent dead block from blocking operations in case nq_loc is not the same for all processors
+      for (size_t w_loc = nw_loc; w_loc < nw_loc_max; ++w_loc)
+#if W_GATHER_OLD
+        auto Z = get_dyn_W(thc, w_loc,0)(P_rng, Q_rng);
+#else
+        auto Z = get_dyn_W_ranged(thc, w_loc,0, P_rng, Q_rng);
+#endif
+      dA_wsqkQuv.reset();
+      _Timer.stop("BUILD_WGG_SOSEX");
+
+      return dWA_wsqkPuv;
+    }
+
+    auto gf2_t::build_WGG_4D(THC_ERI auto &thc,
+         memory::darray_t<memory::array<HOST_MEMORY, ComplexType, 6>, mpi3::communicator>& dA_wsqkQu,
+         std::optional<nda::array<ComplexType, 4>>& Wloc_wqPQ_opt, bool reset_A)
+       -> memory::darray_t<memory::array<HOST_MEMORY, ComplexType, 6>, mpi3::communicator> 
+    {
+
+      using math::nda::make_distributed_array;
+      using Array_2D_t = memory::array<HOST_MEMORY, ComplexType, 2>;
+
+      _Timer.start("BUILD_WGG_SOSEX");
+  
+      size_t ns    = thc.ns();
+      size_t nkpts = thc.nkpts();
+      size_t Np    = thc.Np();
+      size_t nbnd = thc.nbnd();
+
+      _Timer.start("ALLOC_SOSEX");
+      auto dWA_wsqkPu = make_distributed_array<Array_6D_t>(
+          _context->comm, dA_wsqkQu.grid(), dA_wsqkQu.global_shape(), dA_wsqkQu.block_size());
+      _Timer.stop("ALLOC_SOSEX");
+  
+      auto [nw_loc, ns_loc, nq_kpts_loc, nk_kpts_loc, Np_loc, nbnd_loc1] = dA_wsqkQu.local_shape();
+      app_log(2, "A    - pgrid = {},{},{},{},{},{}", dA_wsqkQu.grid()[0], dA_wsqkQu.grid()[1], dA_wsqkQu.grid()[2], dA_wsqkQu.grid()[3], dA_wsqkQu.grid()[4], dA_wsqkQu.grid()[5]);
+      app_log(2, "A    - local shape = {},{},{},{},{},{}", nw_loc, ns_loc, nq_kpts_loc, nk_kpts_loc, Np_loc, nbnd_loc1);
+  
+      auto [w_origin, s_origin, q_origin, k_origin, Q_origin, orb_u_origin] = dA_wsqkQu.origin();
+
+      size_t color = w_origin*nkpts*nkpts + q_origin*nkpts + k_origin;  // don't parallelize over spin
+      size_t key = _context->comm.rank();
+      mpi3::communicator wqk_intra_comm = _context->comm.split(color, key);
+      utils::check(wqk_intra_comm.size() == dA_wsqkQu.grid()[4], "wqk_intra_comm.size() != np_Puv");
+
+      _Timer.start("ALLOC_SOSEX");
+      auto dA_Qu  = make_distributed_array<Array_2D_t>(wqk_intra_comm, {wqk_intra_comm.size(), 1}, {Np, nbnd}, {dA_wsqkQu.block_size()[4], dA_wsqkQu.block_size()[5]});
+
+      auto dWA_Pu  = make_distributed_array<Array_2D_t>(wqk_intra_comm, {wqk_intra_comm.size(), 1}, {Np, nbnd}, {dA_wsqkQu.block_size()[4], dA_wsqkQu.block_size()[5]});
+
+      long np_Z_bigger = utils::find_proc_grid_min_diff(wqk_intra_comm.size(), 1, 1);
+      long np_Z_smaller = wqk_intra_comm.size() / np_Z_bigger;
+      long Z_bsize = std::min( {(long unsigned)1024, Np/np_Z_smaller, Np/np_Z_bigger} );
+
+      auto dA_Qu_mult  = make_distributed_array<Array_2D_t>(wqk_intra_comm, {np_Z_smaller, np_Z_bigger}, {Np, nbnd}, {Z_bsize, Z_bsize });
+      auto dWA_Pu_mult  = make_distributed_array<Array_2D_t>(wqk_intra_comm, {np_Z_smaller, np_Z_bigger}, {Np, nbnd}, {Z_bsize, Z_bsize });
+      auto dW_PQ  = make_distributed_array<Array_2D_t>(wqk_intra_comm, {np_Z_smaller, np_Z_bigger}, {Np, Np}, {Z_bsize, Z_bsize });
+      _Timer.stop("ALLOC_SOSEX");
+
+      utils::check(nbnd == nbnd_loc1, "gf2_t::build_WGG, nbnd != nbnd_loc1");
+      utils::check(orb_u_origin == 0, "gf2_t::build_WGG, orb_u_origin != 0");
+  
+      auto A_wsqkQu = dA_wsqkQu.local();
+
+      auto P_rng = dW_PQ.local_range(0);
+      auto Q_rng = dW_PQ.local_range(1);
+
+      auto WA_P_u = nda::reshape(dWA_Pu.local(), shape_t<2>{Np_loc, nbnd});
+      auto A_Q_u = nda::reshape(dA_Qu.local(), shape_t<2>{Np_loc, nbnd});
+
+      long nq_kpts_loc_max = nq_kpts_loc;
+      dA_wsqkQu.communicator()->broadcast_n(&nq_kpts_loc_max, 1, 0);
+
+      long nw_loc_max = nw_loc;
+      dA_wsqkQu.communicator()->broadcast_n(&nw_loc_max, 1, 0);
+  
+      long nw_half = (_ft->nw_b()%2==0)? _ft->nw_b()/2 : _ft->nw_b()/2 + 1;
+
+      utils::check(_ft->nw_b()%2==1, "gf2_t::build_WGG, The number of bosonic frequences must be odd");
+
+      // allocate and gather W into a reusable buffer
+      if(!Wloc_wqPQ_opt.has_value()) {
+        Wloc_wqPQ_opt = nda::array<ComplexType, 4>(nw_loc, nq_kpts_loc,
+                                                   dW_PQ.local_shape()[0], dW_PQ.local_shape()[1]);
+        for(size_t w = 0; w < nw_loc; w++) {
+          for(size_t q = 0; q < nq_kpts_loc; q++) {
+            size_t iw = w + w_origin;
+            size_t w_mid = _ft->nw_b()/2; // zero physical frequency
+            // Find the corresponding index for PH-symmetric W(iw_ph)
+            size_t iw_ph = (iw >= w_mid) ? (iw - w_mid) :  // positive or zero physical freqs
+                                           (w_mid - iw);   // negative physical freqs
+
+            utils::check(iw_ph < nw_half, "iw_ph >= nw_half");
+
+            size_t iq = q + q_origin;
+            Wloc_wqPQ_opt.value()(w,q,nda::ellipsis{}) = get_dyn_W_ranged(thc, iw_ph, iq, P_rng, Q_rng);
+          }
+          // dead block prevention
+          for (size_t iq_loc = nq_kpts_loc; iq_loc < nq_kpts_loc_max; ++iq_loc)
+            auto Z = get_dyn_W_ranged(thc, 0,0, P_rng, Q_rng);
+        }
+        // dead block prevention
+        for (size_t w_loc = nw_loc; w_loc < nw_loc_max; ++w_loc)
+          for (size_t iq_loc = 0; iq_loc < nq_kpts_loc_max; ++iq_loc)
+            auto Z = get_dyn_W_ranged(thc, 0,0, P_rng, Q_rng);
+      }
+
+      for(size_t w = 0; w < nw_loc; w++) {
+      for(size_t q = 0; q < nq_kpts_loc; q++) {
+          // there are 2*n+1 bosonic frequences:
+          // [0,..,n-1] indices describe all the negative physical frequences
+          // [n] index describes the zero physical frequency
+          // [n+1,...,2n] describe the positive physical frequency
+          size_t iw = w + w_origin;
+          size_t w_mid = _ft->nw_b()/2; // zero physical frequency
+          // Find the corresponding index for PH-symmetric W(iw_ph)
+          size_t iw_ph = (iw >= w_mid) ? (iw - w_mid) :  // positive or zero physical freqs
+                                         (w_mid - iw);   // negative physical freqs
+
+          utils::check(iw_ph < nw_half, "iw_ph >= nw_half");
+
+          [[maybe_unused]] size_t iq = q + q_origin;
+          _Timer.start("W_RETRIEVAL_SOSEX");
+#if W_GATHER_OLD
+          dW_PQ.local() = get_dyn_W(thc, iw_ph, iq)(P_rng, Q_rng);
+#else
+#if W_CACHED
+          dW_PQ.local() = Wloc_wqPQ_opt.value()(w, q, nda::ellipsis{});
+#else
+          dW_PQ.local() = get_dyn_W_ranged(thc, iw_ph, iq, P_rng, Q_rng);
+#endif
+#endif
+          _Timer.stop("W_RETRIEVAL_SOSEX");
+          for(size_t is = 0; is < ns; is++) {
+            for(size_t k = 0; k < nk_kpts_loc; k++) {
+
+              A_Q_u = A_wsqkQu(w,is,q,k, nda::ellipsis{});
+
+              _Timer.start("REDISTRIBUTE_SOSEX");
+              math::nda::redistribute(dA_Qu, dA_Qu_mult);
+              _Timer.stop("REDISTRIBUTE_SOSEX");
+              _Timer.start("W_MULT_SOSEX");
+              math::nda::slate_ops::multiply(dW_PQ, dA_Qu_mult, dWA_Pu_mult);
+              _Timer.stop("W_MULT_SOSEX");
+              _Timer.start("REDISTRIBUTE_SOSEX");
+              math::nda::redistribute(dWA_Pu_mult, dWA_Pu);
+              _Timer.stop("REDISTRIBUTE_SOSEX");
+
+              dWA_wsqkPu.local()(w,is,q,k, nda::ellipsis{}) = WA_P_u;
+
+            }
+          }
+        } // q
+        for (size_t iq_loc = nq_kpts_loc; iq_loc < nq_kpts_loc_max; ++iq_loc) {
+#if W_GATHER_OLD
+          auto Z = get_dyn_W(thc, 0,0)(P_rng, Q_rng);
+#else
+#if W_CACHED // empty
+#else
+          auto Z = get_dyn_W_ranged(thc, 0,0, P_rng, Q_rng);
+#endif
+#endif
+        } // iq_loc
+        } // w
+
+        // prevent dead block from blocking operations in case nq_loc is not the same for all processors
+        for (size_t w_loc = nw_loc; w_loc < nw_loc_max; ++w_loc)
+            for (size_t iq_loc = 0; iq_loc < nq_kpts_loc_max; ++iq_loc) {
+#if W_GATHER_OLD
+              auto Z = get_dyn_W(thc, 0,0)(P_rng, Q_rng);
+#else
+#if W_CACHED // empty
+#else
+              auto Z = get_dyn_W_ranged(thc, 0,0, P_rng, Q_rng);
+#endif
+#endif
+            }
+
+        if(reset_A) dA_wsqkQu.reset();
+        _Timer.stop("BUILD_WGG_SOSEX");
+        return dWA_wsqkPu;
+    }
+
+    void gf2_t::build_WGG_4D(THC_ERI auto &thc,
+         memory::darray_t<memory::array<HOST_MEMORY, ComplexType, 6>, mpi3::communicator>& dA_wsqkQu,
+         memory::darray_t<memory::array<HOST_MEMORY, ComplexType, 6>, mpi3::communicator>& dWA_wsqkPu,
+         std::optional<nda::array<ComplexType, 4>>& Wloc_wqPQ_opt, bool reset_A)
+    {
+
+      using math::nda::make_distributed_array;
+      using Array_2D_t = memory::array<HOST_MEMORY, ComplexType, 2>;
+
+      _Timer.start("BUILD_WGG_SOSEX");
+  
+      size_t ns    = thc.ns();
+      size_t nkpts = thc.nkpts();
+      size_t Np    = thc.Np();
+      size_t nbnd = thc.nbnd();
+
+      utils::check(dA_wsqkQu.grid() == dWA_wsqkPu.grid(), "A and WA have different pgrids");
+      utils::check(dA_wsqkQu.global_shape() == dWA_wsqkPu.global_shape(), "A and WA have different gshapes");
+  
+      auto [nw_loc, ns_loc, nq_kpts_loc, nk_kpts_loc, Np_loc, nbnd_loc1] = dA_wsqkQu.local_shape();
+      app_log(2, "A    - pgrid = {},{},{},{},{},{}", dA_wsqkQu.grid()[0], dA_wsqkQu.grid()[1], dA_wsqkQu.grid()[2], dA_wsqkQu.grid()[3], dA_wsqkQu.grid()[4], dA_wsqkQu.grid()[5]);
+      app_log(2, "A    - local shape = {},{},{},{},{},{}", nw_loc, ns_loc, nq_kpts_loc, nk_kpts_loc, Np_loc, nbnd_loc1);
+  
+      auto [w_origin, s_origin, q_origin, k_origin, Q_origin, orb_u_origin] = dA_wsqkQu.origin();
+
+      size_t color = w_origin*nkpts*nkpts + q_origin*nkpts + k_origin;  // don't parallelize over spin
+      size_t key = _context->comm.rank();
+      mpi3::communicator wqk_intra_comm = _context->comm.split(color, key);
+      utils::check(wqk_intra_comm.size() == dA_wsqkQu.grid()[4], "wqk_intra_comm.size() != np_Puv");
+
+      _Timer.start("ALLOC_SOSEX");
+      auto dA_Qu  = make_distributed_array<Array_2D_t>(wqk_intra_comm, {wqk_intra_comm.size(), 1}, {Np, nbnd}, {dA_wsqkQu.block_size()[4], dA_wsqkQu.block_size()[5]});
+
+      auto dWA_Pu  = make_distributed_array<Array_2D_t>(wqk_intra_comm, {wqk_intra_comm.size(), 1}, {Np, nbnd}, {dA_wsqkQu.block_size()[4], dA_wsqkQu.block_size()[5]});
+
+      long np_Z_bigger = utils::find_proc_grid_min_diff(wqk_intra_comm.size(), 1, 1);
+      long np_Z_smaller = wqk_intra_comm.size() / np_Z_bigger;
+      long Z_bsize = std::min( {(long unsigned)1024, Np/np_Z_smaller, Np/np_Z_bigger} );
+
+      auto dA_Qu_mult  = make_distributed_array<Array_2D_t>(wqk_intra_comm, {np_Z_smaller, np_Z_bigger}, {Np, nbnd}, {Z_bsize, Z_bsize });
+      auto dWA_Pu_mult  = make_distributed_array<Array_2D_t>(wqk_intra_comm, {np_Z_smaller, np_Z_bigger}, {Np, nbnd}, {Z_bsize, Z_bsize });
+      auto dW_PQ  = make_distributed_array<Array_2D_t>(wqk_intra_comm, {np_Z_smaller, np_Z_bigger}, {Np, Np}, {Z_bsize, Z_bsize });
+      _Timer.stop("ALLOC_SOSEX");
+
+      utils::check(nbnd == nbnd_loc1, "gf2_t::build_WGG, nbnd != nbnd_loc1");
+      utils::check(orb_u_origin == 0, "gf2_t::build_WGG, orb_u_origin != 0");
+  
+      auto A_wsqkQu = dA_wsqkQu.local();
+
+      auto P_rng = dW_PQ.local_range(0);
+      auto Q_rng = dW_PQ.local_range(1);
+
+      auto WA_P_u = nda::reshape(dWA_Pu.local(), shape_t<2>{Np_loc, nbnd});
+      auto A_Q_u = nda::reshape(dA_Qu.local(), shape_t<2>{Np_loc, nbnd});
+
+      long nq_kpts_loc_max = nq_kpts_loc;
+      dA_wsqkQu.communicator()->broadcast_n(&nq_kpts_loc_max, 1, 0);
+
+      long nw_loc_max = nw_loc;
+      dA_wsqkQu.communicator()->broadcast_n(&nw_loc_max, 1, 0);
+  
+      long nw_half = (_ft->nw_b()%2==0)? _ft->nw_b()/2 : _ft->nw_b()/2 + 1;
+
+      utils::check(_ft->nw_b()%2==1, "gf2_t::build_WGG, The number of bosonic frequences must be odd");
+
+      // allocate and gather W into a reusable buffer
+      if(!Wloc_wqPQ_opt.has_value()) {
+        Wloc_wqPQ_opt = nda::array<ComplexType, 4>(nw_loc, nq_kpts_loc,
+                        dW_PQ.local_shape()[0], dW_PQ.local_shape()[1]);
+        for(size_t w = 0; w < nw_loc; w++) {
+          for(size_t q = 0; q < nq_kpts_loc; q++) {
+            size_t iw = w + w_origin;
+            size_t w_mid = _ft->nw_b()/2; // zero physical frequency
+            // Find the corresponding index for PH-symmetric W(iw_ph)
+            size_t iw_ph = (iw >= w_mid) ? (iw - w_mid) :  // positive or zero physical freqs
+                                           (w_mid - iw);   // negative physical freqs
+
+            utils::check(iw_ph < nw_half, "iw_ph >= nw_half");
+
+            size_t iq = q + q_origin;
+            Wloc_wqPQ_opt.value()(w,q,nda::ellipsis{}) = get_dyn_W_ranged(thc, iw_ph, iq, P_rng, Q_rng);
+          }
+          // dead block prevention
+          for (size_t iq_loc = nq_kpts_loc; iq_loc < nq_kpts_loc_max; ++iq_loc)
+            auto Z = get_dyn_W_ranged(thc, 0,0, P_rng, Q_rng);
+        }
+        // dead block prevention
+        for (size_t w_loc = nw_loc; w_loc < nw_loc_max; ++w_loc)
+          for (size_t iq_loc = 0; iq_loc < nq_kpts_loc_max; ++iq_loc)
+            auto Z = get_dyn_W_ranged(thc, 0,0, P_rng, Q_rng);
+      }
+
+      for(size_t w = 0; w < nw_loc; w++) {
+      for(size_t q = 0; q < nq_kpts_loc; q++) {
+          // there are 2*n+1 bosonic frequences:
+          // [0,..,n-1] indices describe all the negative physical frequences
+          // [n] index describes the zero physical frequency
+          // [n+1,...,2n] describe the positive physical frequency
+          size_t iw = w + w_origin;
+          size_t w_mid = _ft->nw_b()/2; // zero physical frequency
+          // Find the corresponding index for PH-symmetric W(iw_ph)
+          size_t iw_ph = (iw >= w_mid) ? (iw - w_mid) :  // positive or zero physical freqs
+                                         (w_mid - iw);   // negative physical freqs
+
+          utils::check(iw_ph < nw_half, "iw_ph >= nw_half");
+
+          [[maybe_unused]] size_t iq = q + q_origin;
+          _Timer.start("W_RETRIEVAL_SOSEX");
+#if W_GATHER_OLD
+          dW_PQ.local() = get_dyn_W(thc, iw_ph, iq)(P_rng, Q_rng);
+#else
+#if W_CACHED
+          dW_PQ.local() = Wloc_wqPQ_opt.value()(w, q, nda::ellipsis{});
+#else
+          dW_PQ.local() = get_dyn_W_ranged(thc, iw_ph, iq, P_rng, Q_rng);
+#endif
+#endif
+          _Timer.stop("W_RETRIEVAL_SOSEX");
+          for(size_t is = 0; is < ns; is++) {
+            for(size_t k = 0; k < nk_kpts_loc; k++) {
+
+              A_Q_u = A_wsqkQu(w,is,q,k, nda::ellipsis{});
+
+              _Timer.start("REDISTRIBUTE_SOSEX");
+              math::nda::redistribute(dA_Qu, dA_Qu_mult);
+              _Timer.stop("REDISTRIBUTE_SOSEX");
+              _Timer.start("W_MULT_SOSEX");
+              math::nda::slate_ops::multiply(dW_PQ, dA_Qu_mult, dWA_Pu_mult);
+              _Timer.stop("W_MULT_SOSEX");
+              _Timer.start("REDISTRIBUTE_SOSEX");
+              math::nda::redistribute(dWA_Pu_mult, dWA_Pu);
+              _Timer.stop("REDISTRIBUTE_SOSEX");
+
+              dWA_wsqkPu.local()(w,is,q,k, nda::ellipsis{}) = WA_P_u;
+
+            }
+          }
+        } // q
+        for (size_t iq_loc = nq_kpts_loc; iq_loc < nq_kpts_loc_max; ++iq_loc) {
+#if W_GATHER_OLD
+          auto Z = get_dyn_W(thc, 0,0)(P_rng, Q_rng);
+#else
+#if W_CACHED // empty
+#else
+          auto Z = get_dyn_W_ranged(thc, 0,0, P_rng, Q_rng);
+#endif
+#endif
+        } // iq_loc
+
+        } // w
+
+        // prevent dead block from blocking operations in case nq_loc is not the same for all processors
+        for (size_t w_loc = nw_loc; w_loc < nw_loc_max; ++w_loc)
+          for (size_t iq_loc = 0; iq_loc < nq_kpts_loc_max; ++iq_loc) {
+#if W_GATHER_OLD
+            auto Z = get_dyn_W(thc, 0,0)(P_rng, Q_rng);
+#else
+#if W_CACHED // empty
+#else
+            auto Z = get_dyn_W_ranged(thc, 0,0, P_rng, Q_rng);
+#endif
+#endif
+          }
+
+        if(reset_A) dA_wsqkQu.reset();
+        _Timer.stop("BUILD_WGG_SOSEX");
+    }
+
+    memory::array<HOST_MEMORY, ComplexType, 2> gf2_t::get_dyn_W(THC_ERI auto &thc, size_t iw, size_t iq) {
+
+      auto [nwk, Np, Np2] = dW_wq_PQ_opt.value().global_shape();
+
+      auto Np_thc = thc.Np();
+      auto nkpts = thc.nkpts();
+
+      utils::check(iw*nkpts + iq < nwk, "gf2_t::get_dyn_W, iw >= nw_half");
+      utils::check(Np == Np2, "gf2_t::get_dyn_W, Np != Np2");
+      utils::check(Np == Np_thc, "gf2_t::get_dyn_W, Np != Np");
+
+      auto [nwk_loc, Np_loc, Np2_loc] = dW_wq_PQ_opt.value().local_shape();
+
+      utils::check(dW_wq_PQ_opt.value().grid()[0] == 1, "gf2_t::get_dyn_W, dW_wq_PQ.grid()[0] != 1");
+      utils::check(nwk_loc == nwk, "gf2_t::get_dyn_W, nwk");
+
+      nda::array<ComplexType, 2> W_PQ(Np, Np2);
+      W_PQ() = 0;
+
+      // Idea is from thc.Z(iq)
+      int iwk_at_ip = -1;
+      for (int ip = 0; ip < dW_wq_PQ_opt.value().communicator()->size(); ++ip) {
+        if (ip == dW_wq_PQ_opt.value().communicator()->rank()) iwk_at_ip = iw*nkpts + iq;
+        dW_wq_PQ_opt.value().communicator()->broadcast_n(&iwk_at_ip, 1, ip);
+        utils::check(iwk_at_ip >= 0, "Error: iwk_at_ip < 0");
+        math::nda::gather_sub_matrix(iwk_at_ip, ip, dW_wq_PQ_opt.value(), &W_PQ);
+      }
+
+      return W_PQ;
+    }
+
+#if 1
+    memory::array<HOST_MEMORY, ComplexType, 2> gf2_t::get_dyn_W_ranged(
+        THC_ERI auto &thc, size_t iw, size_t iq, nda::range P_rng, nda::range Q_rng) {
+
+      auto [nw, nk, Np, Np2] = dW_wqPQ_sosex_opt.value().global_shape();
+      nda::array<ComplexType, 4> W_PQ_buf;
+
+      auto Np_thc = thc.Np();
+      auto nkpts = thc.nkpts();
+
+      utils::check(iw < nw, "gf2_t::get_dyn_W, iw >= nw_half");
+      utils::check(iq < nk, "gf2_t::get_dyn_W, ik >= nk");
+      utils::check(Np == Np2, "gf2_t::get_dyn_W, Np != Np2");
+      utils::check(Np == Np_thc, "gf2_t::get_dyn_W, Np != Np");
+      utils::check(nkpts == nk, "gf2_t::get_dyn_W, nkpts != nk");
+
+      // Idea is from thc.Z(iq)
+      int iwk_at_ip = -1;
+      long P_st = -1;
+      long Q_st = -1;
+      long P_end = -1;
+      long Q_end = -1;
+      for (int ip = 0; ip < dW_wqPQ_sosex_opt.value().communicator()->size(); ++ip) {
+        if (ip == dW_wqPQ_sosex_opt.value().communicator()->rank()) {
+          iwk_at_ip = iw*nkpts + iq;
+          P_st = P_rng.first();
+          Q_st = Q_rng.first();
+          P_end = P_rng.last();
+          Q_end = Q_rng.last();
+        }
+        dW_wqPQ_sosex_opt.value().communicator()->broadcast_n(&iwk_at_ip, 1, ip);
+        dW_wqPQ_sosex_opt.value().communicator()->broadcast_n(&P_st, 1, ip);
+        dW_wqPQ_sosex_opt.value().communicator()->broadcast_n(&Q_st, 1, ip);
+        dW_wqPQ_sosex_opt.value().communicator()->broadcast_n(&P_end, 1, ip);
+        dW_wqPQ_sosex_opt.value().communicator()->broadcast_n(&Q_end, 1, ip);
+        auto P_rng_inner = nda::range(P_st, P_end);
+        auto Q_rng_inner = nda::range(Q_st, Q_end);
+        nda::array<ComplexType, 4> W_PQ_inner(1, 1, P_rng_inner.size(), Q_rng_inner.size());
+        utils::check(iwk_at_ip >= 0, "Error: iwk_at_ip < 0");
+        size_t iw_at_ip = iwk_at_ip / nkpts;
+        size_t iq_at_ip = iwk_at_ip % nkpts;
+        math::nda::gather_ranged(ip, dW_wqPQ_sosex_opt.value(), &W_PQ_inner,
+        {nda::range(iw_at_ip, iw_at_ip+1), nda::range(iq_at_ip, iq_at_ip+1), P_rng_inner, Q_rng_inner});
+        // save the result and continue collective call
+        if (ip == dW_wqPQ_sosex_opt.value().communicator()->rank()) {
+          W_PQ_buf = W_PQ_inner;
+        }
+      }
+
+      return nda::make_regular(W_PQ_buf(0, 0, nda::ellipsis{}));
+    }
+#endif
+
+    template<nda::MemoryArray Array_7D_t1, typename communicator_t>
+    auto gf2_t::build_B_WA(memory::darray_t<Array_7D_t1, communicator_t> &dWA_tsqkPuv, THC_ERI auto &thc)
+        -> memory::darray_t<Array_7D_t1, communicator_t> {
+      using math::nda::make_distributed_array;
+      using Array_3D_t = memory::array<HOST_MEMORY, ComplexType, 3>;
+
+      _Timer.start("B_WA_SOSEX");
+      // global shapes
+      size_t ns    = thc.ns();
+      size_t nkpts = thc.nkpts();
+      size_t Np    = thc.Np();
+      size_t nbnd = thc.nbnd();
+
+      // grids and distributed setup
+      auto WA_pgrid =  dWA_tsqkPuv.grid();
+      auto WA_gshape = dWA_tsqkPuv.global_shape();
+      auto WA_bsize =  dWA_tsqkPuv.block_size();
+
+      _Timer.start("ALLOC_SOSEX");
+      auto dB_tsqkPRv = make_distributed_array<Array_7D_t1>(
+          _context->comm, WA_pgrid, {WA_gshape[0], ns, nkpts, nkpts, Np, Np, nbnd}, WA_bsize);
+      _Timer.stop("ALLOC_SOSEX");
+
+      // local shapes
+      auto [nt_loc, ns_loc, nq_kpts_loc, nk_kpts_loc, Np_loc, Np_loc2, nbnd_loc1] = dB_tsqkPRv.local_shape();
+      auto [t_origin, s_origin, q_origin, k_origin, P_origin, R_origin, orb_v_origin] = dB_tsqkPRv.origin();
+      utils::check(dWA_tsqkPuv.grid() == dB_tsqkPRv.grid(), "gf2_t::build_BWA, pgrid != dB_tsqkPRv.grid()");
+      utils::check(nbnd == nbnd_loc1, "gf2_t::build_BWA, nbnd != nbnd_loc1");
+      utils::check(Np == Np_loc2, "gf2_t::build_BWA, Np != Np_loc2");
+      utils::check(R_origin == 0, "gf2_t::build_BWA, R_origin != 0");
+      utils::check(orb_v_origin == 0, "gf2_t::build_BWA, orb_v_origin != 0");
+
+      // temporary arrays / intermediates
+      Array_3D_t A_Puv(Np_loc, nbnd, nbnd);
+      auto A_P_uv = nda::reshape(A_Puv, shape_t<2>{Np_loc, nbnd*nbnd});
+
+      Array_3D_t A_uvP(nbnd, nbnd, Np_loc);
+      auto A_uv_P = nda::reshape(A_uvP, shape_t<2>{nbnd*nbnd, Np_loc});
+      auto A_u_vP = nda::reshape(A_uvP, shape_t<2>{nbnd, nbnd*Np_loc});
+
+      Array_3D_t B_RvP(Np, nbnd, Np_loc);
+      auto B_R_vP = nda::reshape(B_RvP, shape_t<2>{Np, nbnd*Np_loc});
+      auto B_Rv_P = nda::reshape(B_RvP, shape_t<2>{Np*nbnd, Np_loc});
+
+      for(size_t t = 0; t < nt_loc; t++)
+      for(size_t is = 0; is < ns_loc; is++)
+      for(size_t q = 0; q < nq_kpts_loc; q++) {
+        for(size_t k = 0; k < nk_kpts_loc; k++) {
+          size_t ik = k + k_origin;
+          size_t iq = q + q_origin;
+
+          size_t ikmq = _MF->qk_to_k2(iq, ik);
+          auto X_R_u = thc.X(is, 0, ikmq); //  _Np, _nbnd
+
+          // copy to prevent contigious issues
+          A_Puv = dWA_tsqkPuv.local()(t,is,q,k, nda::ellipsis{});
+
+          A_uv_P = nda::transpose(A_P_uv);
+
+          nda::blas::gemm(X_R_u, A_u_vP, B_R_vP);
+
+          auto B_PRv = dB_tsqkPRv.local()(t, is, q, k, nda::ellipsis{});
+          auto B_P_Rv = nda::reshape(B_PRv, shape_t<2>{Np_loc, Np*nbnd});
+          B_P_Rv = nda::make_regular(nda::transpose(B_Rv_P));
+        }
+      }
+      _Timer.stop("B_WA_SOSEX");
+
+      dWA_tsqkPuv.reset();
+
+      return dB_tsqkPRv;
+    }
+
+    template<nda::MemoryArray Array_6D_t1, typename communicator_t>
+    auto gf2_t::build_B_WA_4D(memory::darray_t<Array_6D_t1, communicator_t> &dWA_tsqkPu,
+                              THC_ERI auto &thc, bool reset_WA)
+        -> memory::darray_t<Array_6D_t1, communicator_t> {
+      using math::nda::make_distributed_array;
+      using Array_2D_t = memory::array<HOST_MEMORY, ComplexType, 2>;
+
+      _Timer.start("B_WA_SOSEX");
+      // global shapes
+      size_t ns    = thc.ns();
+      size_t nkpts = thc.nkpts();
+      size_t Np    = thc.Np();
+      size_t nbnd = thc.nbnd();
+
+      // grids and distributed setup
+      auto WA_pgrid =  dWA_tsqkPu.grid();
+      auto WA_gshape = dWA_tsqkPu.global_shape();
+      auto WA_bsize =  dWA_tsqkPu.block_size();
+
+      _Timer.start("ALLOC_SOSEX");
+      auto dB_tsqkPR = make_distributed_array<Array_6D_t1>(
+          _context->comm, WA_pgrid, {WA_gshape[0], ns, nkpts, nkpts, Np, Np}, WA_bsize);
+      _Timer.stop("ALLOC_SOSEX");
+
+      // local shapes
+      auto [nt_loc, ns_loc, nq_kpts_loc, nk_kpts_loc, Np_loc, Np_loc2] = dB_tsqkPR.local_shape();
+      auto [t_origin, s_origin, q_origin, k_origin, P_origin, R_origin] = dB_tsqkPR.origin();
+      utils::check(dWA_tsqkPu.grid() == dB_tsqkPR.grid(), "gf2_t::build_BWA, pgrid != dB_tsqkPR.grid()");
+      utils::check(Np == Np_loc2, "gf2_t::build_BWA, Np != Np_loc2");
+      utils::check(R_origin == 0, "gf2_t::build_BWA, R_origin != 0");
+
+      // temporary arrays / intermediates
+      Array_2D_t A_Pu(Np_loc, nbnd);
+      auto A_P_u = nda::reshape(A_Pu, shape_t<2>{Np_loc, nbnd});
+
+      Array_2D_t A_uP(nbnd, Np_loc);
+      auto A_u_P = nda::reshape(A_uP, shape_t<2>{nbnd, Np_loc});
+
+      Array_2D_t B_RP(Np, Np_loc);
+      auto B_R_P = nda::reshape(B_RP, shape_t<2>{Np, Np_loc});
+
+      for(size_t t = 0; t < nt_loc; t++)
+      for(size_t is = 0; is < ns_loc; is++)
+      for(size_t q = 0; q < nq_kpts_loc; q++) {
+        for(size_t k = 0; k < nk_kpts_loc; k++) {
+          size_t ik = k + k_origin;
+          size_t iq = q + q_origin;
+
+          size_t ikmq = _MF->qk_to_k2(iq, ik);
+          auto X_R_u = thc.X(is, 0, ikmq); //  _Np, _nbnd
+
+          // copy to prevent contiguous issues
+          A_Pu = dWA_tsqkPu.local()(t,is,q,k, nda::ellipsis{});
+
+          A_u_P = nda::transpose(A_P_u);
+
+          nda::blas::gemm(X_R_u, A_u_P, B_R_P);
+
+          auto B_PR2 = dB_tsqkPR.local()(t, is, q, k, nda::ellipsis{});
+          auto B_P_R2 = nda::reshape(B_PR2, shape_t<2>{Np_loc, Np});
+          B_P_R2 = nda::make_regular(nda::transpose(B_R_P));
+        }
+      }
+      _Timer.stop("B_WA_SOSEX");
+
+      if(reset_WA) dWA_tsqkPu.reset();
+
+      return dB_tsqkPR;
+    }
+
+    template<nda::MemoryArray Array_6D_t1, typename communicator_t>
+    void gf2_t::build_B_WA_4D(memory::darray_t<Array_6D_t1, communicator_t> &dWA_tsqkPu,
+                       memory::darray_t<Array_6D_t1, communicator_t> &dB_tsqkPR,
+                       THC_ERI auto &thc, bool reset_WA) {
+      using math::nda::make_distributed_array;
+      using Array_2D_t = memory::array<HOST_MEMORY, ComplexType, 2>;
+
+      _Timer.start("B_WA_SOSEX");
+      // global shapes
+      size_t Np    = thc.Np();
+      size_t nbnd = thc.nbnd();
+
+      // local shapes
+      auto [nt_loc, ns_loc, nq_kpts_loc, nk_kpts_loc, Np_loc, Np_loc2] = dB_tsqkPR.local_shape();
+      auto [t_origin, s_origin, q_origin, k_origin, P_origin, R_origin] = dB_tsqkPR.origin();
+      utils::check(dWA_tsqkPu.grid() == dB_tsqkPR.grid(), "gf2_t::build_BWA, pgrid != dB_tsqkPR.grid()");
+      utils::check(Np == Np_loc2, "gf2_t::build_BWA, Np != Np_loc2");
+      utils::check(R_origin == 0, "gf2_t::build_BWA, R_origin != 0");
+
+      // temporary arrays / intermediates
+      Array_2D_t A_Pu(Np_loc, nbnd);
+      auto A_P_u = nda::reshape(A_Pu, shape_t<2>{Np_loc, nbnd});
+
+      Array_2D_t A_uP(nbnd, Np_loc);
+      auto A_u_P = nda::reshape(A_uP, shape_t<2>{nbnd, Np_loc});
+
+      Array_2D_t B_RP(Np, Np_loc);
+      auto B_R_P = nda::reshape(B_RP, shape_t<2>{Np, Np_loc});
+
+      for(size_t t = 0; t < nt_loc; t++)
+      for(size_t is = 0; is < ns_loc; is++)
+      for(size_t q = 0; q < nq_kpts_loc; q++) {
+        for(size_t k = 0; k < nk_kpts_loc; k++) {
+          size_t ik = k + k_origin;
+          size_t iq = q + q_origin;
+
+          size_t ikmq = _MF->qk_to_k2(iq, ik);
+          auto X_R_u = thc.X(is, 0, ikmq); //  _Np, _nbnd
+
+          // copy to prevent contigious issues
+          A_Pu = dWA_tsqkPu.local()(t,is,q,k, nda::ellipsis{});
+
+          A_u_P = nda::transpose(A_P_u);
+
+          nda::blas::gemm(X_R_u, A_u_P, B_R_P);
+
+          auto B_PR2 = dB_tsqkPR.local()(t, is, q, k, nda::ellipsis{});
+          auto B_P_R2 = nda::reshape(B_PR2, shape_t<2>{Np_loc, Np});
+          B_P_R2 = nda::make_regular(nda::transpose(B_R_P));
+        }
+      }
+      _Timer.stop("B_WA_SOSEX");
+
+      if(reset_WA) dWA_tsqkPu.reset();
+    }
+
+    template<nda::MemoryArray Array_7D_t1, typename communicator_t>
+    void gf2_t::redistribute_BC_sosex(memory::darray_t<Array_7D_t1, communicator_t> &dB_tsqkPRv,
+                                      THC_ERI auto &thc) {
+
+      size_t Np = thc.Np();
+
+      std::array<long,7> B_pgrid = {1,1,1,1,1,1,1};
+      std::array<long,7> B_bsize = {1,1,1,1,1,1,1};
+      {
+        size_t np = _context->comm.size();
+        //long ntpools = utils::find_proc_grid_max_npools(np, nt_half, 0.2);
+        long ntpools = 1;
+        np /= ntpools;
+
+        long nPpools = utils::find_proc_grid_max_npools(np, Np, 0.2);
+        np /= nPpools;
+
+        size_t nQpools = np;
+        B_pgrid = {ntpools,1,1,1,nPpools,nQpools,1};
+      }
+
+      _Timer.start("ALLOC_SOSEX");
+      auto buffer_B  = math::nda::make_distributed_array<Array_7D_t1>(
+        _context->comm, B_pgrid,dB_tsqkPRv.global_shape(), B_bsize);
+      _Timer.stop("ALLOC_SOSEX");
+
+      _Timer.start("REDISTRIBUTE_SOSEX");
+      math::nda::redistribute(dB_tsqkPRv, buffer_B);
+      _Timer.stop("REDISTRIBUTE_SOSEX");
+
+      dB_tsqkPRv = buffer_B;
+
+      buffer_B.reset();
+      _Timer.start("ALLOC_SOSEX");
+      buffer_B  = math::nda::make_distributed_array<Array_7D_t1>(
+        _context->comm, B_pgrid,dC_tsqkPRv_opt.value().global_shape(), B_bsize);
+      _Timer.stop("ALLOC_SOSEX");
+
+      _Timer.start("REDISTRIBUTE_SOSEX");
+      math::nda::redistribute(dC_tsqkPRv_opt.value(), buffer_B);
+      _Timer.stop("REDISTRIBUTE_SOSEX");
+
+      dC_tsqkPRv_opt.value() = buffer_B;
+    }
+
+    template<nda::MemoryArray Array_7D_t1, typename communicator_t>
+    auto gf2_t::allocate_D_sosex(memory::darray_t<Array_7D_t1, communicator_t> &dB_tsqkPRv,
+                                 [[maybe_unused]] THC_ERI auto &thc)
+      -> memory::darray_t<memory::array<HOST_MEMORY, ComplexType, 6>, mpi3::communicator> {
+
+      auto B_pgrid = dB_tsqkPRv.grid();
+      auto B_gshape = dB_tsqkPRv.global_shape();
+
+      std::array<long,6> D_bsize = {1,1,1,1,1,1};
+      std::array<long,6> D_pgrid = {1,1,1,1,1,1};
+      std::array<long,6> D_gshape = {1,1,1,1,1,1};
+      for(long i = 0; i < 6; i++) {
+        D_pgrid[i] = B_pgrid[i];
+        D_gshape[i] = B_gshape[i];
+      }
+
+      _Timer.start("ALLOC_SOSEX");
+      auto D  = math::nda::make_distributed_array<Array_6D_t>(
+          _context->comm, D_pgrid, D_gshape, D_bsize);
+      _Timer.stop("ALLOC_SOSEX");
+
+      return D;
+    }
+
+    auto gf2_t::allocate_D_sosex(THC_ERI auto &thc)
+    -> memory::darray_t<memory::array<HOST_MEMORY, ComplexType, 6>, mpi3::communicator> {
+      size_t nt = _ft->nt_f();
+      size_t Np = thc.Np();
+      size_t ns = thc.ns();
+      size_t nkpts = thc.nkpts();
+
+      size_t np = _context->comm.size();
+      size_t np_P = utils::find_proc_grid_min_diff(np, 1, 1);
+      size_t np_R = np / np_P;
+
+      _Timer.start("ALLOC_SOSEX");
+      auto dD_tsqkPR_acc = math::nda::make_distributed_array<Array_6D_t>(_context->comm, {1,1,1,1,np_P,np_R}, {nt,ns,nkpts,nkpts,Np,Np}, {1,1,1, 1,1,1});
+      _Timer.stop("ALLOC_SOSEX");
+      return dD_tsqkPR_acc;
+    }
+
+    auto gf2_t::allocate_A_sosex_4D(THC_ERI auto &thc)
+    -> std::array<memory::darray_t<memory::array<HOST_MEMORY, ComplexType, 6>, mpi3::communicator>,2> {
+      using math::nda::make_distributed_array;
+
+      size_t nt_f  = _ft->nt_f();
+      size_t ns    = thc.ns();
+      size_t nkpts = thc.nkpts();
+      size_t Np    = thc.Np();
+      size_t nbnd = thc.nbnd();
+
+      std::array<long,6> A_pgrid = {1,1,1,1, 1,1};
+      std::array<long,6> A_bsize = {1,1,1,1, 1,1};
+      {
+        size_t np = _context->comm.size();
+        long nqpools = utils::find_proc_grid_max_npools(np, nkpts, 0.2);
+        np /= nqpools;
+        long ntpools = utils::find_proc_grid_max_npools(np, nt_f, 0.2);
+        np /= ntpools;
+        long nkpools = utils::find_proc_grid_max_npools(np, nkpts, 0.2);
+        np /= nkpools;
+
+        A_pgrid = {ntpools,1,nqpools,nkpools,np,1};
+      }
+
+      _Timer.start("ALLOC_SOSEX");
+      auto dA_tsqkQu_v = make_distributed_array<Array_6D_t>(
+          _context->comm, A_pgrid, {nt_f, ns, nkpts, nkpts, Np, nbnd}, A_bsize);
+      _Timer.stop("ALLOC_SOSEX");
+
+      std::array<long,6> w_bsize_out = {1,1,1,1,1,1};
+      std::array<long,6> t_pgrid_out = dA_tsqkQu_v.grid();
+      std::array<long,6> w_pgrid_out = t_pgrid_out;
+      std::array<long,6> w_gshape = dA_tsqkQu_v.global_shape();
+      w_gshape[0] = _ft->nw_b();
+      {
+        size_t np = _context->comm.size();
+        long nqpools = utils::find_proc_grid_max_npools(np, nkpts, 0.2);
+        np /= nqpools;
+        long nwpools = utils::find_proc_grid_max_npools(np, _ft->nw_b(), 0.2);
+        np /= nwpools;
+        long nkpools = utils::find_proc_grid_max_npools(np, nkpts, 0.2);
+        np /= nkpools;
+
+        w_pgrid_out = {nwpools,1,nqpools,nkpools,np,1};
+        utils::check(
+            std::accumulate(w_pgrid_out.begin(),w_pgrid_out.end(),1,std::multiplies<long>()) == _context->comm.size(),
+            "w_pgrid_out has inconsistent processors");
+      }
+
+      _Timer.start("ALLOC_SOSEX");
+      auto dA_wsqkQu_v = make_distributed_array<Array_6D_t>(
+          _context->comm, w_pgrid_out, w_gshape, w_bsize_out);
+      _Timer.stop("ALLOC_SOSEX");
+
+/*
+      _Timer.start("ALLOC_SOSEX");
+      auto dWA_wsqkPu_v = make_distributed_array<Array_6D_t>(
+          _context->comm, dA_wsqkQu_v.grid(), dA_wsqkQu_v.global_shape(), dA_wsqkQu_v.block_size());
+      _Timer.stop("ALLOC_SOSEX");
+*/
+
+      _context->comm.barrier();
+      return std::array<decltype(dA_wsqkQu_v), 2>{dA_tsqkQu_v, dA_wsqkQu_v};
+    }
+
+    auto gf2_t::allocate_B_sosex_4D(THC_ERI auto &thc,
+         memory::darray_t<memory::array<HOST_MEMORY, ComplexType, 6>, mpi3::communicator>& A_tx,
+         memory::darray_t<memory::array<HOST_MEMORY, ComplexType, 6>, mpi3::communicator>& D)
+         -> std::array<memory::darray_t<memory::array<HOST_MEMORY, ComplexType, 6>, mpi3::communicator>,2> {
+      using math::nda::make_distributed_array;
+
+      size_t nt_f  = _ft->nt_f();
+      size_t ns    = thc.ns();
+      size_t nkpts = thc.nkpts();
+      size_t Np    = thc.Np();
+
+      _Timer.start("ALLOC_SOSEX");
+      auto dB_tsqkPR = make_distributed_array<Array_6D_t>(
+          _context->comm, A_tx.grid(), {nt_f, ns, nkpts, nkpts, Np, Np}, {1,1,1, 1,1,1});
+      _Timer.stop("ALLOC_SOSEX");
+
+      _Timer.start("ALLOC_SOSEX");
+      auto dB_tsqkPR_new = math::nda::make_distributed_array<Array_6D_t>(_context->comm, D.grid(), D.global_shape(), D.block_size());
+      _Timer.stop("ALLOC_SOSEX");
+
+      _context->comm.barrier();
+
+      return std::array<decltype(dB_tsqkPR), 2>{dB_tsqkPR, dB_tsqkPR_new};
+    }
+
+
+    template<nda::MemoryArray Array_7D_t1, nda::MemoryArray Array_6D_t1, typename communicator_t>
+    void gf2_t::build_D_sosex_all_t(const memory::darray_t<Array_7D_t1, communicator_t> &dB_tsqkPRv,
+                        const memory::darray_t<Array_7D_t1, communicator_t> &dC_tsqkPRv,
+                        memory::darray_t<Array_6D_t1, communicator_t> &dD_tsqkPR,
+                        THC_ERI auto &thc) {
+      // global shapes
+      size_t nkpts = thc.nkpts();
+      size_t nbnd = thc.nbnd();
+
+      // grids and distributed setup
+      auto pgrid =  dB_tsqkPRv.grid();
+      auto gshape = dB_tsqkPRv.global_shape();
+      auto lshape = dB_tsqkPRv.local_shape();
+      auto bsize =  dB_tsqkPRv.block_size();
+
+      // consistency check for both arrays
+      utils::check(pgrid == dC_tsqkPRv.grid(), "gf2_t::build_D_sosex, dB_qkPRv.grid() != dC_qkPRv.grid()");
+      for(long i = 1; i < 7; i++)
+      utils::check(gshape[i] == dC_tsqkPRv.global_shape()[i], "gf2_t::build_D_sosex, dB_qkPRv.global_shape() != dC_qkPRv.global_shape()");
+
+      for(long i = 1; i < 7; i++)
+      utils::check(lshape[i] == dC_tsqkPRv.local_shape()[i], "gf2_t::build_D_sosex, dB_qkPRv.local_shape() != dC_qkPRv.local_shape()");
+
+      utils::check(bsize == dC_tsqkPRv.block_size(), "gf2_t::build_D_sosex, dB_qkPRv.block_size() != dC_qkPRv.block_size()");
+
+
+      // need to have full dimensions by q and k
+      utils::check(pgrid[2] == 1, "gf2_t::build_D_sosex, dB_tsqkPRv.grid()[2] != 1");
+      utils::check(pgrid[3] == 1, "gf2_t::build_D_sosex, dB_tsqkPRv.grid()[3] != 1");
+      utils::check(lshape[2] == nkpts, "gf2_t::build_D_sosex, dB_tsqkPRv.local_shape()[2] != nkpts");
+      utils::check(lshape[3] == nkpts, "gf2_t::build_D_sosex, dB_tsqkPRv.local_shape()[3] != nkpts");
+
+      // need to have full v dimension
+      utils::check(lshape[6] == nbnd, "gf2_t::build_D_sosex, dB_tsqkPRv.local_shape()[6] != nbnd");
+
+      // full t dimension
+      utils::check(pgrid[0] == 1, "gf2_t::build_D_sosex, dB_tsqkPRv.grid()[0] != 1");
+
+      _Timer.start("BUILD_D_SOSEX");
+
+      auto P_Np_loc = lshape[4];
+      auto R_Np_loc = lshape[5];
+
+      auto D_tsqkPR_loc = dD_tsqkPR.local();
+      set_zero(D_tsqkPR_loc);
+
+      // full dimensions by q1,q2,kw
+      for(size_t t = 0; t < lshape[0]; t++)
+      for(size_t s = 0; s < lshape[1]; s++)
+      for(size_t q1 = 0; q1 < nkpts; q1++)
+      for(size_t q2 = 0; q2 < nkpts; q2++)
+        for(size_t kw = 0; kw < nkpts; kw++) {
+          size_t kv = _MF->qk_to_k2(q2, kw);
+          size_t ku = _MF->qk_to_k2(q1, kv);
+
+          auto B_PRv = dB_tsqkPRv.local()(t, s, q1, kv, nda::ellipsis{});
+          auto B_PR_v = nda::reshape(B_PRv, shape_t<2>{P_Np_loc*R_Np_loc, nbnd});
+          auto C_PRv = dC_tsqkPRv.local()(t, s, q2, kw, nda::ellipsis{});
+          auto C_PR_v = nda::reshape(C_PRv, shape_t<2>{P_Np_loc*R_Np_loc, nbnd});
+
+          auto D_PR = dD_tsqkPR.local()(t, s, q2, ku, nda::ellipsis{});
+          auto D_PR_1D = nda::reshape(D_PR, shape_t<1>{P_Np_loc*R_Np_loc});
+          auto buffer_PR_1D = nda::array<ComplexType, 1>(P_Np_loc*R_Np_loc);
+          for(size_t iPR = 0; iPR < P_Np_loc*R_Np_loc; iPR++) {
+              auto B_v = B_PR_v(iPR, nda::range::all);
+              auto C_v = C_PR_v(iPR, nda::range::all);
+              auto B_1_v = nda::reshape(B_v, shape_t<2>{1, nbnd});
+              auto C_v_1 = nda::reshape(C_v, shape_t<2>{nbnd, 1});
+              nda::array<ComplexType, 2> prod(1, 1);
+              nda::blas::gemm(B_1_v, C_v_1, prod);
+              buffer_PR_1D(iPR) = prod(0,0);
+          }
+          D_PR_1D += buffer_PR_1D;
+        }
+      _Timer.stop("BUILD_D_SOSEX");
+    }
+
+    template<nda::MemoryArray Array_6D_t1, nda::MemoryArray Array_6D_t2, typename communicator_t>
+    void gf2_t::build_D_sosex_all_t_4D(const memory::darray_t<Array_6D_t2, communicator_t> &dB_tsqkPR,
+                      const memory::darray_t<Array_6D_t2, communicator_t> &dC_tsqkPR,
+                      memory::darray_t<Array_6D_t1, communicator_t> &dD_tsqkPR,
+                      THC_ERI auto &thc) {
+      // global shapes
+      size_t nkpts = thc.nkpts();
+
+      // grids and distributed setup
+      auto pgrid =  dB_tsqkPR.grid();
+      auto lshape = dB_tsqkPR.local_shape();
+      auto bsize =  dB_tsqkPR.block_size();
+
+      // consistency check for both arrays
+      utils::check(pgrid == dC_tsqkPR.grid(), "gf2_t::build_D_sosex, dB_qkPR.grid() != dC_qkPR.grid()");
+      utils::check(dB_tsqkPR.local_shape() == dC_tsqkPR.local_shape(), "gf2_t::build_D_sosex, dB_qkPR.local_shape() != dC_qkPR.local_shape()");
+      utils::check(dD_tsqkPR.local_shape() == dC_tsqkPR.local_shape(), "gf2_t::build_D_sosex, dD_qkPR.local_shape() != dC_qkPR.local_shape()");
+
+      utils::check(bsize == dC_tsqkPR.block_size(), "gf2_t::build_D_sosex, dB_qkPR.block_size() != dC_qkPR.block_size()");
+
+      // need to have full dimensions by q and k
+      utils::check(pgrid[2] == 1, "gf2_t::build_D_sosex, dB_tsqkPR.grid()[2] != 1");
+      utils::check(pgrid[3] == 1, "gf2_t::build_D_sosex, dB_tsqkPR.grid()[3] != 1");
+      utils::check(lshape[2] == nkpts, "gf2_t::build_D_sosex, dB_tsqkPR.local_shape()[2] != nkpts");
+      utils::check(lshape[3] == nkpts, "gf2_t::build_D_sosex, dB_tsqkPR.local_shape()[3] != nkpts");
+
+      // full t dimension
+      utils::check(pgrid[0] == 1, "gf2_t::build_D_sosex, dB_tsqkPR.grid()[0] != 1");
+
+      _context->comm.barrier();
+      _Timer.start("BUILD_D_SOSEX");
+
+      auto had_prod2 = nda::map([](ComplexType x, ComplexType y) { return (x * y); });
+
+      // full dimensions by q1,q2,kw
+      for(size_t t = 0; t < lshape[0]; t++)
+      for(size_t s = 0; s < lshape[1]; s++)
+      for(size_t q1 = 0; q1 < nkpts; q1++)
+      for(size_t q2 = 0; q2 < nkpts; q2++)
+        for(size_t kw = 0; kw < nkpts; kw++) {
+          size_t kv = _MF->qk_to_k2(q2, kw);
+          size_t ku = _MF->qk_to_k2(q1, kv);
+
+          auto B_PR = dB_tsqkPR.local()(t, s, q1, kv, nda::ellipsis{});
+          auto C_PR = dC_tsqkPR.local()(t, s, q2, kw, nda::ellipsis{});
+          auto D_PR = dD_tsqkPR.local()(t, s, q2, ku, nda::ellipsis{});
+
+          D_PR += had_prod2(B_PR, C_PR);
+        }
+      _Timer.stop("BUILD_D_SOSEX");
+    }
+
+    template<nda::MemoryArray Array_view_5D_t, nda::MemoryArray Array_6D_t1, typename communicator_t>
+    void gf2_t::evaluate_Sigma_sosex_all_t(sArray_t<Array_view_5D_t> &sSigma_tskij,
+                              const memory::darray_t<Array_6D_t1, communicator_t> &dD_tsqkPR,
+                              THC_ERI auto &thc) {
+
+      using math::nda::make_distributed_array;
+
+      _Timer.start("EVALUATE_SIGMA_SOSEX");
+
+      // global shapes
+      size_t nt = sSigma_tskij.local().shape(0);
+      size_t ns    = thc.ns();
+      size_t nkpts = thc.nkpts();
+      size_t Np    = thc.Np();
+
+      math::shm::shared_array<nda::array_view<ComplexType,3>> Sigma_kPR(*_context, {nkpts, Np, Np});
+
+      auto loc_Sigma_kPR = Sigma_kPR.local();
+
+      // avoid double counting for odd number of points
+
+      for(size_t s = 0; s < ns; s++)
+      for(size_t t = 0; t < nt; t++) {
+        size_t it = t;
+
+        Sigma_kPR.win().fence();
+        loc_Sigma_kPR() = 0;
+        Sigma_kPR.win().fence();
+
+        auto P_range_D = dD_tsqkPR.local_range(4);
+        auto R_range_D = dD_tsqkPR.local_range(5);
+
+        utils::check(dD_tsqkPR.local_shape()[2] == nkpts, "gf2_t::evaluate_Sigma_sosex, dD_tsqkPRv.lshape()[2] != nkpts");
+
+        for(size_t k = 0; k < nkpts; k++)
+        for(size_t q = 0; q < nkpts; q++) {
+          size_t iq = q + dD_tsqkPR.origin()[2];
+          size_t kmq = _MF->qk_to_k2(iq, k);
+          loc_Sigma_kPR(k, P_range_D, R_range_D) += dD_tsqkPR.local()(t, s, q, kmq, nda::ellipsis{});
+        }
+
+        Sigma_kPR.win().fence();
+        Sigma_kPR.all_reduce();
+        Sigma_kPR.win().fence();
+
+        sSigma_tskij.win().fence();
+        for(size_t k = _context->comm.rank(); k < nkpts; k+=_context->comm.size()) {
+          ComplexType factor = -1.0/(nkpts*nkpts);
+          auto S_RP = nda::make_regular(factor * nda::transpose(loc_Sigma_kPR(k, nda::ellipsis{})));
+          transform_Sigma(sSigma_tskij, S_RP, s, k, it, thc);
+        }
+        sSigma_tskij.win().fence();
+      }
+      _Timer.stop("EVALUATE_SIGMA_SOSEX");
+    }
+
+
+    template<nda::MemoryArray Array_view_5D_t>
+    auto gf2_t::build_GG_Quv_all_full_t(THC_ERI auto &thc,
+                                        const sArray_t<Array_view_5D_t> &sG_tskiQ,
+                                        const sArray_t<Array_view_5D_t> &sG_tskQj)
+       -> memory::darray_t<memory::array<HOST_MEMORY, ComplexType, 7>, mpi3::communicator> 
+    {
+
+      using math::nda::make_distributed_array;
+      using Array_7D_t = memory::array<HOST_MEMORY, ComplexType, 7>;
+  
+      size_t nt_f  = sG_tskiQ.shape()[0];
+      size_t ns    = thc.ns();
+      size_t nkpts = thc.nkpts();
+      size_t Np    = thc.Np();
+      size_t nbnd = thc.nbnd();
+
+      _Timer.start("BUILD_GG_SOSEX");
+
+      std::array<long,7> A_pgrid = {1,1,1,1,1,1,1};
+      std::array<long,7> A_bsize = {1,1,1,1,1,1,1};
+      {
+        size_t np = _context->comm.size();
+        long nqpools = utils::find_proc_grid_max_npools(np, nkpts, 0.2);
+        np /= nqpools;
+        long ntpools = 1; //utils::find_proc_grid_max_npools(np, nt_f, 0.2);
+        np /= ntpools;
+        long nkpools = utils::find_proc_grid_max_npools(np, nkpts, 0.2);
+        np /= nkpools;
+
+        size_t np_Quv = np;
+        A_pgrid = {ntpools,1,nqpools,nkpools,np_Quv,1,1};
+      }
+
+      app_log(2, "Evaluation of the GG intermediate in tau:");
+      app_log(2, "    -  pgrid = {},{},{},{},{},{},{}", A_pgrid[0],A_pgrid[1],A_pgrid[2],A_pgrid[3],A_pgrid[4],A_pgrid[5],A_pgrid[6]);
+      app_log(2, "    -  gshape = {},{},{},{},{},{},{}", nt_f, ns, nkpts, nkpts, Np, nbnd, nbnd);
+  
+      _Timer.start("ALLOC_SOSEX");
+      auto dA_tsqkQuv = make_distributed_array<Array_7D_t>(
+          _context->comm, A_pgrid, {nt_f, ns, nkpts, nkpts, Np, nbnd, nbnd}, A_bsize);
+      _Timer.stop("ALLOC_SOSEX");
+
+      _context->comm.barrier();
+  
+      auto [nt_loc, ns_loc, nq_kpts_loc, nk_kpts_loc, Np_loc, nbnd_loc1, nbnd_loc2] = dA_tsqkQuv.local_shape();
+      app_log(2, "    - local shape = {},{},{},{},{},{},{}", nt_loc, ns_loc, nq_kpts_loc, nk_kpts_loc, Np_loc, nbnd_loc1, nbnd_loc2);
+  
+      auto [t_origin, s_origin, q_origin, k_origin, Q_origin, orb_u_origin, orb_v_origin] = dA_tsqkQuv.origin();
+  
+      utils::check(nbnd == nbnd_loc1, "gf2_t::build_GG, nbnd != nbnd_loc1");
+      utils::check(nbnd == nbnd_loc2, "gf2_t::build_GG, nbnd != nbnd_loc2");
+      utils::check(orb_u_origin == 0, "gf2_t::build_GG, orb_u_origin != 0");
+      utils::check(orb_v_origin == 0, "gf2_t::build_GG, orb_s_origin != 0");
+  
+      auto A_tsqkQuv = dA_tsqkQuv.local();
+
+      nda::array<ComplexType, 1> X_Q2(nbnd);
+      nda::array<ComplexType, 1> X_Q(nbnd);
+  
+      for(size_t t = 0; t < nt_loc; t++)
+      for(size_t is = 0; is < ns; is++) {
+        size_t it = t + t_origin;
+        for(size_t q = 0; q < nq_kpts_loc; q++) {
+          size_t iq = q + q_origin;
+          for(size_t k = 0; k < nk_kpts_loc; k++) {
+            size_t ik = k + k_origin;
+            size_t ikmq = _MF->qk_to_k2(iq, ik);
+            auto G_uQ = nda::make_regular(sG_tskiQ.local()(it,is,ikmq,nda::ellipsis{}));
+            auto G_Qv = nda::make_regular(sG_tskQj.local()(nt_f-it-1,is,ik,nda::ellipsis{}));
+
+            for(size_t Q = 0; Q < Np_loc; Q++) {
+              size_t iQ = Q + Q_origin;
+              auto A_Q = nda::reshape(A_tsqkQuv(t,is,q,k, Q, nda::ellipsis{}), shape_t<2>{nbnd,nbnd});
+              X_Q = G_Qv(iQ, nda::range::all);
+              X_Q2 = G_uQ(nda::range::all, iQ);
+              A_Q = nda::blas::outer_product(X_Q2, X_Q);
+            }
+          }
+        }
+      }
+
+      _Timer.stop("BUILD_GG_SOSEX");
+      return dA_tsqkQuv;
+    }
+
+    //FIXME: remove
+    template<nda::MemoryArray Array_view_5D_t>
+    auto gf2_t::build_GG_Qu_all_full_t_4D(THC_ERI auto &thc,
+                                          const sArray_t<Array_view_5D_t> &sG_tskiQ,
+                                          const sArray_t<Array_view_5D_t> &sG_tskQj,
+                                          size_t v)
+       -> memory::darray_t<memory::array<HOST_MEMORY, ComplexType, 6>, mpi3::communicator>
+    {
+
+      using math::nda::make_distributed_array;
+  
+      size_t nt_f  = sG_tskiQ.shape()[0];
+      size_t ns    = thc.ns();
+      size_t nkpts = thc.nkpts();
+      size_t Np    = thc.Np();
+      size_t nbnd = thc.nbnd();
+
+      _Timer.start("BUILD_GG_SOSEX");
+
+      std::array<long,6> A_pgrid = {1,1,1,1, 1,1};
+      std::array<long,6> A_bsize = {1,1,1,1, 1,1};
+      {
+        size_t np = _context->comm.size();
+        long nqpools = utils::find_proc_grid_max_npools(np, nkpts, 0.2);
+        np /= nqpools;
+        long ntpools = utils::find_proc_grid_max_npools(np, nt_f, 0.2);
+        np /= ntpools;
+        long nkpools = utils::find_proc_grid_max_npools(np, nkpts, 0.2);
+        np /= nkpools;
+
+        size_t np_Quv = np;
+        A_pgrid = {ntpools,1,nqpools,nkpools,np_Quv,1};
+      }
+
+      app_log(2, "Evaluation of the GG intermediate in tau:");
+      app_log(2, "    -  pgrid = {},{},{},{},{},{},{}", A_pgrid[0],A_pgrid[1],A_pgrid[2],A_pgrid[3],A_pgrid[4],A_pgrid[5]);
+      app_log(2, "    -  gshape = {},{},{},{},{},{},{}", nt_f, ns, nkpts, nkpts, Np, nbnd);
+  
+      _Timer.start("ALLOC_SOSEX");
+      auto dA_tsqkQu_v = make_distributed_array<Array_6D_t>(
+          _context->comm, A_pgrid, {nt_f, ns, nkpts, nkpts, Np, nbnd}, A_bsize);
+      _Timer.stop("ALLOC_SOSEX");
+
+      _context->comm.barrier();
+  
+      auto [nt_loc, ns_loc, nq_kpts_loc, nk_kpts_loc, Np_loc, nbnd_loc1] = dA_tsqkQu_v.local_shape();
+      app_log(2, "    - local shape = {},{},{},{},{},{},{}", nt_loc, ns_loc, nq_kpts_loc, nk_kpts_loc, Np_loc, nbnd_loc1);
+  
+      auto [t_origin, s_origin, q_origin, k_origin, Q_origin, orb_u_origin] = dA_tsqkQu_v.origin();
+  
+      utils::check(nbnd == nbnd_loc1, "gf2_t::build_GG, nbnd != nbnd_loc1");
+      utils::check(orb_u_origin == 0, "gf2_t::build_GG, orb_u_origin != 0");
+  
+      auto A_tsqkQu_v = dA_tsqkQu_v.local();
+
+      nda::array<ComplexType, 1> X_Q2(nbnd);
+  
+      for(size_t t = 0; t < nt_loc; t++)
+      for(size_t is = 0; is < ns; is++) {
+        size_t it = t + t_origin;
+        for(size_t q = 0; q < nq_kpts_loc; q++) {
+          size_t iq = q + q_origin;
+          for(size_t k = 0; k < nk_kpts_loc; k++) {
+            size_t ik = k + k_origin;
+            size_t ikmq = _MF->qk_to_k2(iq, ik);
+            auto G_uQ = nda::make_regular(sG_tskiQ.local()(it,is,ikmq,nda::ellipsis{}));
+            auto G_Qv = nda::make_regular(sG_tskQj.local()(nt_f-it-1,is,ik,nda::ellipsis{}));
+
+            for(size_t Q = 0; Q < Np_loc; Q++) {
+              size_t iQ = Q + Q_origin;
+              auto A_Q = nda::reshape(A_tsqkQu_v(t,is,q,k, Q, nda::ellipsis{}), shape_t<1>{nbnd});
+              ComplexType X_Q = G_Qv(iQ, v);
+              X_Q2 = G_uQ(nda::range::all, iQ);
+              A_Q = X_Q * X_Q2;
+            }
+          }
+        }
+      }
+
+      _Timer.stop("BUILD_GG_SOSEX");
+      return dA_tsqkQu_v;
+    }
+
+    template<nda::MemoryArray Array_view_5D_t>
+    void gf2_t::build_GG_Qu_all_full_t_4D(THC_ERI auto &thc,
+                memory::darray_t<memory::array<HOST_MEMORY, ComplexType, 6>, mpi3::communicator>& dA_tsqkQu_v,
+                const sArray_t<Array_view_5D_t> &sG_tskiQ, const sArray_t<Array_view_5D_t> &sG_tskQj, size_t v) 
+    {
+
+      using math::nda::make_distributed_array;
+  
+      size_t nt_f  = sG_tskiQ.shape()[0];
+      size_t ns    = thc.ns();
+      size_t nbnd = thc.nbnd();
+
+      _Timer.start("BUILD_GG_SOSEX");
+
+      app_log(2, "Evaluation of the GG intermediate in tau:");
+  
+  
+      auto [nt_loc, ns_loc, nq_kpts_loc, nk_kpts_loc, Np_loc, nbnd_loc1] = dA_tsqkQu_v.local_shape();
+  
+      auto [t_origin, s_origin, q_origin, k_origin, Q_origin, orb_u_origin] = dA_tsqkQu_v.origin();
+  
+      utils::check(nbnd == nbnd_loc1, "gf2_t::build_GG, nbnd != nbnd_loc1");
+      utils::check(orb_u_origin == 0, "gf2_t::build_GG, orb_u_origin != 0");
+  
+      auto A_tsqkQu_v = dA_tsqkQu_v.local();
+
+      nda::array<ComplexType, 1> X_Q2(nbnd);
+  
+      for(size_t t = 0; t < nt_loc; t++)
+      for(size_t is = 0; is < ns; is++) {
+        size_t it = t + t_origin;
+        for(size_t q = 0; q < nq_kpts_loc; q++) {
+          size_t iq = q + q_origin;
+          for(size_t k = 0; k < nk_kpts_loc; k++) {
+            size_t ik = k + k_origin;
+            size_t ikmq = _MF->qk_to_k2(iq, ik);
+            auto G_uQ = nda::make_regular(sG_tskiQ.local()(it,is,ikmq,nda::ellipsis{}));
+            auto G_Qv = nda::make_regular(sG_tskQj.local()(nt_f-it-1,is,ik,nda::ellipsis{}));
+
+            for(size_t Q = 0; Q < Np_loc; Q++) {
+              size_t iQ = Q + Q_origin;
+              auto A_Q = nda::reshape(A_tsqkQu_v(t,is,q,k, Q, nda::ellipsis{}), shape_t<1>{nbnd});
+              ComplexType X_Q = G_Qv(iQ, v);
+              X_Q2 = G_uQ(nda::range::all, iQ);
+              A_Q = X_Q * X_Q2;
+            }
+          }
+        }
+      }
+
+      _Timer.stop("BUILD_GG_SOSEX");
+      return;
+    }
+
+
+
+} // solvers
+} //methods
+
+#endif //BEYONDDFT_THC_SOSEX_ICC

@@ -1,0 +1,45 @@
+# cRPA screened interaction U_abcd(tau) for V t2g based on the G0W0 electronic structure
+
+[mean_field.qe]                          # QE DFT results for SrVO3
+name     = "svo_qe"
+prefix   = "svo"
+outdir   = "./coqui_nscf/OUT/"
+filetype = "h5"
+
+[interaction.thc]                        # THC MB Hamiltonian: H = H0 + V^THC_ee
+name            = "svo_eri"
+mean_field      = "svo_qe"
+storage         = "incore"
+thresh          = 1e-6
+save            = "svo_thc_eri.h5"
+chol_block_size = 8
+distr_tol       = 0.4
+
+[gw]                           # 4 iterations of full-frequency GW, and the resulting G^k_ij will be used in the subsequent cRPA
+interaction = "svo_eri"
+restart   = false
+output    = "svo_t2g"
+beta      = 300
+lambda    = 8200.0
+iaft_prec = "high"
+niter     = 4
+conv_thr  = 1e-6
+div_treatment = "gygi"
+
+[downfold_2e]
+interaction   = "svo_eri"                # tag for the input [interaction] instance
+wannier_file  = "./wannier/svo_t2g.h5"   # input h5 which defines the targeted correlated subspace
+outdir        = "./"                     # directory for the output/input coqui h5 archive
+prefix        = "svo_t2g"                # prefix for the input/output coqui h5 archive
+screen_type   = "crpa"                   # method for the screening effects: "crpa" or "edmft"
+input_type    = "coqui"                  # input G^k_ij(tau) type: "mf" or "coqui".
+                                         # if "mf": create/overwirte a new/existing coqui h5 and take G^k_ij(tau) from the input MF
+                                         # if "coqui": read G^k_ij(tau) from the existing "outdir/prefix.mbpt.h5"
+input_grp     = "scf"                    # the group name within the HDF5 file where the input G is stored.
+input_iter    = 2                        # the iteration number of the input G.
+                                         # Since we have run 4 iterations of GW, input_iter here can be 0 ~ 4 (0 means DFT Green's function).
+
+# general optional parameters
+force_real    = true                     # enforce U_abcd(tau) to be real or not
+permut_symm   = true                     # enforce permutation symmetry to U_abcd(tau) or not
+div_treatment = "gygi"                   # divergence treatment for the q-summation in U_abcd(tau)

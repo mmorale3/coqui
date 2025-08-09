@@ -1,0 +1,2413 @@
+#ifndef COQUI_THC_GF2_ICC
+#define COQUI_THC_GF2_ICC
+
+#include "mpi3/communicator.hpp"
+#include "mpi3/operation.hpp"
+#include "mpi3/group.hpp"
+#include "nda/nda.hpp"
+#include "nda/blas.hpp"
+#include "numerics/shared_array/nda.hpp"
+#include "numerics/distributed_array/nda.hpp"
+#include "numerics/nda_functions.hpp"
+
+#include "IO/app_loggers.h"
+#include "utilities/Timer.hpp"
+#include "utilities/kpoint_utils.hpp"
+
+#include "mean_field/MF.hpp"
+#include "methods/ERI/detail/concepts.hpp"
+#include "methods/HF/thc_solver_comm.hpp"
+#include "methods/ERI/div_treatment_e.hpp"
+
+
+namespace methods {
+  namespace solvers {
+    void gf2_t::thc_gf2_Xqindep(MBState &mb_state, THC_ERI auto &thc) {
+
+      auto G_tskij = mb_state.sG_tskij.value().local();
+      auto& sSigma_tskij = mb_state.sSigma_tskij.value();
+
+      _Timer.start("TOTAL_DIR");
+      thc_run_direct(mb_state, thc);
+      _Timer.stop("TOTAL_DIR");
+
+      _Timer.start("TOTAL_EXC");
+
+      if (_exchange_alg == "none") {
+        _Timer.stop("TOTAL_EXC");
+        return;
+      }
+
+      sArray_t<nda::array_view<ComplexType, 5>> sSigma_exc(*_context, sSigma_tskij.shape());
+      sSigma_exc.set_zero();
+      if(_exchange_type == "gf2") {
+          if(_exchange_alg == "orb"){
+              thc_gf2_scheme1_orb_4D(G_tskij, sSigma_exc, thc);
+          }
+          else if(_exchange_alg == "3ind_reallocate"){
+              thc_gf2_scheme1(G_tskij, sSigma_exc, false, thc);
+          }
+          else if(_exchange_alg == "3ind"){
+              thc_gf2_scheme1(G_tskij, sSigma_exc, true, thc);
+          }
+      }
+      else if(_exchange_type == "static_sosex" || _exchange_type == "static_2sosex"
+           || _exchange_type == "static_g3w2") {
+          // reuse the most efficient SOX contractions
+          // it has a selection of interaction type inside
+          thc_gf2_scheme1(G_tskij, sSigma_exc, true, thc);
+      }
+      else if(_exchange_type == "dynamic_sosex" || _exchange_type == "dynamic_2sosex") {
+          std::string requested_exchange_type = _exchange_type;
+          doing_dyn = true;
+          if(_exchange_type == "dynamic_sosex")  app_log(2, "DYNAMIC SOSEX is requested!");
+          if(_exchange_type == "dynamic_2sosex") app_log(2, "DYNAMIC 2SOSEX is requested!");
+          _exchange_type = "gf2";
+          app_log(2, "  will execute GF2 first and add the dynamical part");
+          thc_gf2_scheme1(G_tskij, sSigma_exc, true, thc);
+          _Timer.start("COMM");
+          sSigma_exc.win().fence();
+          sSigma_exc.all_reduce();
+          sSigma_exc.win().fence();
+          _Timer.stop("COMM");
+          add_exc_to_Sigma(sSigma_tskij, sSigma_exc); //Sigma += sSigma_exc.local();
+          sSigma_exc.set_zero();
+
+          _exchange_type = requested_exchange_type;
+          _Timer.start("TOTAL_SOSEX");
+          //if(_sosex_save_memory) thc_sosex_scheme2_4D(G_tskij, sSigma_exc, thc);
+          if(_sosex_save_memory) thc_sosex_scheme2_4D_no_reallocation(G_tskij, sSigma_exc, thc);
+          else thc_sosex_scheme2(G_tskij, sSigma_exc, thc);
+          _Timer.stop("TOTAL_SOSEX");
+
+          if(_exchange_type == "dynamic_2sosex") {
+              _Timer.start("COMM");
+              sSigma_exc.win().fence();
+              sSigma_exc.all_reduce();
+              sSigma_exc.win().fence();
+              _Timer.stop("COMM");
+              add_2sosex(sSigma_exc, thc);
+          }
+      }
+      else {
+          APP_ABORT("GF2 exchange selection: Unknown exchange_type");
+      }
+      
+      if(_exchange_type != "dynamic_2sosex") {
+          _Timer.start("COMM");
+          sSigma_exc.win().fence();
+          sSigma_exc.all_reduce();
+          sSigma_exc.win().fence();
+          _Timer.stop("COMM");
+      }
+      add_exc_to_Sigma(sSigma_tskij, sSigma_exc); //Sigma += sSigma_exc.local();
+
+
+      _Timer.stop("TOTAL_EXC");
+
+
+    }
+
+    void gf2_t::thc_run_direct(MBState &mb_state, THC_ERI auto &thc) {
+      /** THC-GF2-direct steps **/
+      /** Based on THF-GW code **/
+      auto G_tskij = mb_state.sG_tskij.value().local();
+      auto& sSigma_tskij = mb_state.sSigma_tskij.value();
+      sSigma_tskij.set_zero();
+
+      if(direct_type() == "gf2") {
+        if (mb_state.dW_qtPQ) {
+          app_log(2, "WARNING: screened ineraction exists in mb_state although direct_type == \"gf2\". "
+                     "CoQuí simply ignore the provided dW_qtPQ. ");
+        }
+
+        _Timer.start("EVALUATE_PI");
+        solvers::scr_coulomb_t scr_eri(_ft, "rpa", _div_treatment);
+        auto dPi_tqPQ = scr_eri.eval_Pi_qdep(G_tskij, thc);
+        _Timer.stop("EVALUATE_PI");
+
+        _Timer.start("EVALUATE_PIUPI");
+        eval_UPiU_in_place(dPi_tqPQ, thc);
+        _Timer.stop("EVALUATE_PIUPI");
+
+        auto dUPiU_tqPQ = dPi_tqPQ;
+
+        auto t_pgrid = dPi_tqPQ.grid();
+        auto t_bsize = dPi_tqPQ.block_size();
+        auto gshape = dUPiU_tqPQ.global_shape();
+        auto dUPiU_qtPQ = math::nda::make_distributed_array<nda::array<ComplexType, 4> >(
+            _context->comm, {t_pgrid[1], t_pgrid[0], t_pgrid[2], t_pgrid[3]},
+            {gshape[1], gshape[0], gshape[2], gshape[3]}, {t_bsize[1], t_bsize[0], t_bsize[2], t_bsize[3]});
+        auto UPiU_tqPQ = dUPiU_tqPQ.local();
+        auto UPiU_qtPQ = dUPiU_qtPQ.local();
+        long nt_loc = dUPiU_tqPQ.local_shape()[0];
+        long nq_loc = dUPiU_tqPQ.local_shape()[1];
+        for (size_t qt = 0; qt < nq_loc * nt_loc; ++qt) {
+          size_t iq = qt / nt_loc;
+          size_t it = qt % nt_loc;
+          UPiU_qtPQ(iq, it, nda::ellipsis{}) = UPiU_tqPQ(it, iq, nda::ellipsis{});
+        }
+        dUPiU_tqPQ.reset();
+
+        _Timer.start("EVALUATE_SIGMA_DIR");
+        gw_t gw(_ft, ignore_g0, _output);
+        gw.eval_Sigma_all(G_tskij, dUPiU_qtPQ, sSigma_tskij, thc, "R");
+        _Timer.stop("EVALUATE_SIGMA_DIR");
+
+      } else if (_direct_type == "gw") {
+
+        gw_t gw(_ft, gw_div_treatment(), _output);
+        solvers::scr_coulomb_t scr_eri(_ft, "rpa", _div_treatment);
+
+        if(_exchange_type == "gf2"){
+          gw.evaluate(mb_state, thc, false);
+        } else {
+          gw.evaluate(mb_state, thc, false);
+
+          // Retrieve dynamical part of W
+          utils::check(mb_state.dW_qtPQ.has_value(),
+                       "gf2_t::thc_run_direct: mb_state.dW_qtPQ == nullptr while direct_type = \"gw\".");
+          auto& dW_qtPQ = mb_state.dW_qtPQ.value();
+          auto q_pgrid = dW_qtPQ.grid();
+          auto q_bsize = dW_qtPQ.block_size();
+          auto gshape = dW_qtPQ.global_shape();
+
+          // Change the format
+          auto dW_tqPQ = math::nda::make_distributed_array<nda::array<ComplexType, 4>>(
+              _context->comm, {q_pgrid[1], q_pgrid[0], q_pgrid[2], q_pgrid[3]},
+              {gshape[1], gshape[0], gshape[2], gshape[3]}, {q_bsize[1], q_bsize[0], q_bsize[2], q_bsize[3]});
+
+          auto W_tqPQ = dW_tqPQ.local();
+          auto W_qtPQ = dW_qtPQ.local();
+
+          long nt_loc = dW_tqPQ.local_shape()[0];
+          long nq_loc = dW_tqPQ.local_shape()[1];
+          for (size_t qt = 0; qt < nq_loc * nt_loc; ++qt) {
+            size_t iq = qt / nt_loc;
+            size_t it = qt % nt_loc;
+            W_tqPQ(it, iq, nda::ellipsis{}) = W_qtPQ(iq, it, nda::ellipsis{});
+          }
+
+          // Perform tau-to-w transform
+          size_t np = _context->comm.size();
+          size_t np_P = utils::find_proc_grid_min_diff(np, 1, 1);
+          size_t np_Q = np / np_P;
+
+          std::array<long, 4> w_pgrid = {1, 1, np_P, np_Q};
+          std::array<long, 4> w_bsize = {1, 1, 1, 1};
+          app_log(2, "||dW_wqPQ(t)|| = {}", frob_norm2(dW_tqPQ));
+          auto dW_wqPQ = scr_eri.tau_to_w(dW_tqPQ, w_pgrid, w_bsize, false);
+
+          if(_exchange_type == "dynamic_sosex" || _exchange_type == "dynamic_2sosex") {
+#if W_GATHER_OLD // a switch to the old version for debugging
+            dW_wq_PQ_opt = math::nda::make_distributed_array<nda::array<ComplexType, 3>> (
+                      _context->comm, {1, np_P, np_Q}, {dW_wqPQ.global_shape()[0]*dW_wqPQ.global_shape()[1],dW_wqPQ.global_shape()[2],dW_wqPQ.global_shape()[3]}, {1,1,1});
+
+                  for(size_t iw = 0; iw < dW_wqPQ.global_shape()[0]; iw++)
+                  for(size_t iq = 0; iq < dW_wqPQ.global_shape()[1]; iq++)
+                  dW_wq_PQ_opt.value().local()(iw*dW_wqPQ.global_shape()[1] + iq, nda::ellipsis{}) = dW_wqPQ.local()(iw,iq,nda::ellipsis{});
+                  _context->comm.barrier();
+#else // create partitioning consistent with SOSEX GG for more efficient gathering
+            size_t np2 = _context->comm.size();
+            long nqpools = utils::find_proc_grid_max_npools(np2, dW_wqPQ.global_shape()[1], 0.2);
+            np2 /= nqpools;
+            long nwpools = utils::find_proc_grid_max_npools(np2, dW_wqPQ.global_shape()[0], 0.2);
+            np2 /= nwpools;
+            size_t np2_P = utils::find_proc_grid_min_diff(np2, 1, 1);
+            size_t np2_Q = np2 / np2_P;
+
+            dW_wqPQ_sosex_opt = math::nda::make_distributed_array<nda::array<ComplexType, 4>> (
+                _context->comm, {nwpools, nqpools, np2_P, np2_Q}, dW_wqPQ.global_shape(), {1,1,1,1});
+            math::nda::redistribute(dW_wqPQ, dW_wqPQ_sosex_opt.value());
+#endif
+
+            /*
+            for(size_t iw = 1; iw < dW_wqPQ.global_shape()[0]; iw++)
+            for(size_t iq = 0; iq < dW_wqPQ.global_shape()[1]; iq++)
+            dW_wq_PQ_opt.value().local()(iw*dW_wqPQ.global_shape()[1] + iq, nda::ellipsis{}) = dW_wq_PQ_opt.value().local()(0 + iq, nda::ellipsis{}) ;
+*/
+          } // end of dynamic sosex
+
+#if 0
+          for(size_t iw=0; iw < dW_wqPQ.global_shape()[0]; iw++) {
+                  auto Ww_loc = nda::make_regular(dW_wqPQ.local()(iw, nda::ellipsis{}));
+                  double norm_sq = frob_norm2(Ww_loc);
+                  dW_wqPQ.communicator()->all_reduce_in_place_n(&norm_sq, 1, std::plus<>{});
+                  app_log(2, "iw = {}  ||W_qPQ|| = {}", iw, std::sqrt(std::abs(norm_sq)));
+              }
+#endif
+
+          // Take w=0 slice
+
+          // unoptimal block sizes are not a problem because build_U_ functions
+          // repartitions tensors in a good way
+          dW0_qPQ_opt = math::nda::make_distributed_array<nda::array<ComplexType, 3>> (
+              _context->comm, {1, np_P, np_Q},
+              {gshape[0], gshape[2], gshape[3]}, {1, 1, 1});
+
+          dW0_qPQ_opt.value().local() = dW_wqPQ.local()(0, nda::ellipsis{});
+
+        } // static sosex/g3w2
+      } // direct type gw
+
+      //Sigma_div_correction(sSigma_tskij, G_tskij, thc, eps_inv_head);
+    }
+
+    template<nda::MemoryArray Array_4D_t, typename communicator_t>
+    void gf2_t::eval_UPiU_in_place(memory::darray_t<Array_4D_t, communicator_t> &dPi_tqPQ,
+                                   THC_ERI auto &thc) {
+      using math::nda::make_distributed_array;
+      auto [nt, nqpts, NP, NQ] = dPi_tqPQ.global_shape();
+      auto pgrid_old = dPi_tqPQ.grid();
+      auto block_size_old = dPi_tqPQ.block_size();
+
+      { // setup a new pgrid maximizing nqpools and redistribute
+        int np = _context->comm.size();
+
+        long nqpools = utils::find_proc_grid_max_npools(np, nqpts, 0.2);
+        np /= nqpools;
+        long ntpools = utils::find_proc_grid_max_npools(np, nt, 0.2);
+        np /= ntpools;
+        long np_P = utils::find_proc_grid_min_diff(np, 1, 1);
+        long np_Q = np / np_P;
+
+        std::array<long,4> pgrid = {ntpools,nqpools,np_P,np_Q};
+        std::array<long,4> bsize = {1,1,1,1};
+        bsize[2] = std::min( {(long)1024, NP/pgrid[2], NP/pgrid[3]});
+        bsize[3] = bsize[2];
+
+        auto buffer_loc  = make_distributed_array<Array_4D_t>(
+          _context->comm, pgrid, {nt,nqpts,NP,NQ}, bsize);
+
+        math::nda::redistribute(dPi_tqPQ, buffer_loc);
+        dPi_tqPQ = buffer_loc;
+      }
+
+      {
+      auto [nt_loc, nq_loc, NP_loc, NQ_loc] = dPi_tqPQ.local_shape();
+      auto [t_origin, q_origin, P_origin, Q_origin] = dPi_tqPQ.origin();
+      long nq_loc_max = nq_loc;
+      dPi_tqPQ.communicator()->broadcast_n(&nq_loc_max, 1, 0);
+
+      auto P_rng = dPi_tqPQ.local_range(2);
+      auto Q_rng = dPi_tqPQ.local_range(3);
+      auto pgrid = dPi_tqPQ.grid();
+      auto block_size = dPi_tqPQ.block_size();
+
+      app_log(2, "Evaluation of the U Pi U interaction:");
+      app_log(2, "  - processor grid for U Pi U: (t, q, P, Q) = ({}, {}, {}, {})", pgrid[0], pgrid[1], pgrid[2], pgrid[3]);
+      app_log(2, "  - block size: (t, q, P, Q) = ({}, {}, {}, {})", block_size[0], block_size[1], block_size[2], block_size[3]);
+
+      // Setup tq_intra_comm
+      int color = t_origin*nqpts + q_origin;
+      int key = _context->comm.rank();
+      mpi3::communicator tq_intra_comm = _context->comm.split(color, key);
+      utils::check(tq_intra_comm.size() == pgrid[2]*pgrid[3], "tq_intra_comm.size() != pgrid[2]*pgrid[3]");
+
+      using Array_2D_t = memory::array<HOST_MEMORY, ComplexType, 2>;
+      auto dPi_PQ = make_distributed_array<Array_2D_t>(tq_intra_comm, {pgrid[2], pgrid[3]}, {NP, NQ}, {block_size[2], block_size[3]});
+      auto dZ_PQ  = make_distributed_array<Array_2D_t>(tq_intra_comm, {pgrid[2], pgrid[3]}, {NP, NQ}, {block_size[2], block_size[3]});
+      auto dA_PQ  = make_distributed_array<Array_2D_t>(tq_intra_comm, {pgrid[2], pgrid[3]}, {NP, NQ}, {block_size[2], block_size[3]});
+      utils::check(dPi_PQ.local_range(0) == P_rng, "Error: local range mismatches!" );
+      utils::check(dPi_PQ.local_range(1) == Q_rng, "Error: local range mismatches!");
+      utils::check(dPi_PQ.local_shape()[0] == NP_loc and dPi_PQ.local_shape()[1] == NQ_loc, "Error: local shape mismatched!");
+
+
+      auto Pi_tqPQ = dPi_tqPQ.local();
+      auto Pi_PQ = dPi_PQ.local();
+      auto Z_PQ = dZ_PQ.local();
+      for (size_t iq_loc = 0; iq_loc < nq_loc; ++iq_loc) {
+        long iq = q_origin + iq_loc;
+        auto Z = thc.Z(iq);
+        Z_PQ = Z(P_rng, Q_rng);
+
+        // UPU(t) = Z * P(t) * Z 
+        for (size_t n = 0; n < nt_loc; ++n) {
+          Pi_PQ = Pi_tqPQ(n, iq_loc, nda::ellipsis{});
+
+          // A = Z * Pi(t)
+          math::nda::slate_ops::multiply(dZ_PQ, dPi_PQ, dA_PQ);
+          // P = A * Z
+          math::nda::slate_ops::multiply(dA_PQ, dZ_PQ, dPi_PQ);
+
+          Pi_tqPQ(n, iq_loc, nda::ellipsis{}) = Pi_PQ;
+        }
+      }
+      // prevent dead block in thc.Z() in case nq_loc is not the same for all processors
+      for (long iq_loc = nq_loc; iq_loc < nq_loc_max; ++iq_loc)
+        auto Z = thc.Z(0);
+
+      }
+
+      auto buffer_loc  = make_distributed_array<Array_4D_t>(
+        _context->comm, pgrid_old, {nt,nqpts,NP,NQ}, block_size_old);
+
+      math::nda::redistribute(dPi_tqPQ, buffer_loc);
+      dPi_tqPQ = buffer_loc;
+
+    }
+
+    auto gf2_t::allocate_B(THC_ERI auto &thc, mpi3::communicator& comm, bool print_mpi)
+      -> memory::darray_t<memory::array<HOST_MEMORY, ComplexType, 4>, mpi3::communicator> {
+        using math::nda::make_distributed_array;
+        using Array_4D_t = memory::array<HOST_MEMORY, ComplexType, 4>;
+
+        // global shapes
+        size_t nkpts = thc.nkpts();
+        size_t Np    = thc.Np();
+
+        std::array<long,4> B_pgrid = {1,1,1,1};
+        std::array<long,4> B_bsize = {1,1,1,1};
+        {
+            size_t np = comm.size();
+            long nqpools = 1;
+            nqpools = utils::find_proc_grid_max_npools(np, nkpts, 0.2);
+            np /= nqpools;
+            long nkpools = 1;
+            //long nkpools = utils::find_proc_grid_max_npools(np, nkpts, 0.2);
+            //np /= nkpools;
+      
+            size_t np_P = utils::find_proc_grid_min_diff(np, 1, 1);
+            size_t np_R = np / np_P;
+            //size_t np_P = std::min(np, Np);
+            //size_t np_R = 1;
+            B_pgrid = {nqpools,nkpools,np_P,np_R};
+      
+            B_bsize[2] = std::min({(long unsigned)1024, Np/B_pgrid[2], Np/B_pgrid[3]});
+            B_bsize[3] = B_bsize[2];
+
+        }
+
+        auto dB_qkPR_contr = make_distributed_array<Array_4D_t>(comm, B_pgrid, {nkpts, nkpts, Np, Np}, B_bsize);
+
+        if(print_mpi) {
+            app_log(2, "Allocation of the B and C intermediates:");
+            app_log(2, "  - processor grid for B/C: (q, k, P, R) = ({}, {}, {}, {})", 
+                    B_pgrid[0], B_pgrid[1], B_pgrid[2], B_pgrid[3]);
+            app_log(2, "  - block sizes for B/C: (q, k, P, R) = ({}, {}, {}, {})", 
+                    B_bsize[0], B_bsize[1], B_bsize[2], B_bsize[3]);
+        }
+
+        return dB_qkPR_contr;
+
+    }
+
+    auto gf2_t::prepare_G(const nda::MemoryArrayOfRank<5> auto &G_tskij,
+                        size_t is, size_t it, THC_ERI auto &thc)
+      -> std::array< nda::array<ComplexType, 3>, 2> {
+        size_t nt = G_tskij.shape(0);
+        size_t nkpts = thc.nkpts();
+        size_t Np    = thc.Np();
+        size_t nbnd = thc.nbnd();
+        _Timer.start("G_TRANSFORM");
+        // CNY: should this be in share memory?
+        nda::array<ComplexType, 3> GRQ(nkpts, Np, Np); 
+        nda::array<ComplexType, 3> GQv(nkpts, Np, nbnd); 
+        for(size_t q = 0; q < nkpts; q++) {
+            auto G_R_Q = nda::reshape(GRQ(q, nda::ellipsis{}), shape_t<2>{Np, Np});
+            auto G_Q_v = nda::reshape(GQv(q, nda::ellipsis{}), shape_t<2>{Np, nbnd});
+            transform_G(G_tskij, G_R_Q, is, q, it, "both", thc); 
+            transform_G(G_tskij, G_Q_v, is, q, nt - it - 1, "left", thc); 
+        }
+        _Timer.stop("G_TRANSFORM");
+
+        return std::array<decltype(GRQ), 2>{GRQ, GQv};
+    }
+
+
+    template<nda::MemoryArray Array_4D_t1, typename communicator_t>
+    auto gf2_t::allocate_Z([[maybe_unused]] const nda::MemoryArrayOfRank<5> auto &G_tskij, 
+                              memory::darray_t<Array_4D_t1, communicator_t> &dB_qkPR,
+                              THC_ERI auto &thc)
+      -> memory::darray_t<memory::array<HOST_MEMORY, ComplexType, 3>, mpi3::communicator> {
+        using math::nda::make_distributed_array;
+        using Array_3D_t = memory::array<HOST_MEMORY, ComplexType, 3>;
+
+        // global shapes
+        size_t nkpts = thc.nkpts();
+        size_t Np    = thc.Np();
+
+        // local shapes
+        auto [nq_kpts_loc, nk_kpts_loc, Np_loc1, Np_loc2] = dB_qkPR.local_shape();
+        auto [q_origin, k_origin, P_origin, R_origin] = dB_qkPR.origin();
+        auto bsize =  dB_qkPR.block_size();
+        auto pgrid =  dB_qkPR.grid();
+
+        auto dZ_qPQ  = make_distributed_array<Array_3D_t>(*dB_qkPR.communicator(), {pgrid[0], pgrid[2], pgrid[3]}, 
+                                                                                  {nkpts, Np, Np}, 
+                                                                                  {bsize[0], bsize[2], bsize[3]});
+
+        auto P_rngZ = dZ_qPQ.local_range(1);
+        auto Q_rngZ = dZ_qPQ.local_range(2);
+
+        long nq_kpts_loc_max = nq_kpts_loc;
+        dB_qkPR.communicator()->broadcast_n(&nq_kpts_loc_max, 1, 0);
+
+      _Timer.start("B_Z");
+        for(size_t q = 0; q < nq_kpts_loc; q++) {
+            size_t iq = q + q_origin;
+            auto Z = thc.Z(iq); 
+            dZ_qPQ.local()(q, nda::ellipsis{}) = Z(P_rngZ, Q_rngZ);
+        }
+      _Timer.stop("B_Z");
+        // prevent dead block in thc.Z() in case nq_loc is not the same for all processors
+        for (size_t iq_loc = nq_kpts_loc; iq_loc < nq_kpts_loc_max; ++iq_loc) {
+            auto Z = thc.Z(0);
+        }
+
+        return dZ_qPQ;
+    
+    }
+
+    template<nda::MemoryArray Array_3D_t1, typename communicator_t>
+    auto gf2_t::estimate_Z_norm(memory::darray_t<Array_3D_t1, communicator_t> &dZ_qPR, 
+                                const std::string& norm_def, [[maybe_unused]] THC_ERI auto &thc)
+      ->  memory::array<HOST_MEMORY, ComplexType, 1> {
+        using math::nda::make_distributed_array;
+        using Array_1D_t = memory::array<HOST_MEMORY, ComplexType, 1>;
+
+        // local shapes
+        auto [nq_kpts, Np1, Np2] = dZ_qPR.global_shape();
+        auto [nq_kpts_loc, Np_loc1, Np_loc2] = dZ_qPR.local_shape();
+        auto [q_origin, P_origin, R_origin] = dZ_qPR.origin();
+
+        Array_1D_t Z_q_norms(nq_kpts);
+        Z_q_norms() = 0;
+
+        for(size_t q = 0; q < nq_kpts_loc; q++) {
+            size_t iq = q + q_origin;
+            auto Zq = dZ_qPR.local()(q, nda::ellipsis{});
+            if(norm_def == "max") {
+                Z_q_norms(iq) = std::max(std::abs(Z_q_norms(iq)), max_norm(Zq));
+            }
+            else {
+                Z_q_norms(iq) += (norm_def == "frobenious" ? frob_norm2(Zq) : abs_norm(Zq)); 
+            }
+        }
+        dZ_qPR.communicator()->all_reduce_in_place_n(Z_q_norms.data(), Z_q_norms.size(), std::plus<>{}); 
+
+        if(norm_def == "frobenious") {
+            for(size_t iq = 0; iq < nq_kpts; iq++) Z_q_norms(iq) = std::sqrt(std::abs(Z_q_norms(iq)));
+        }
+
+        return Z_q_norms;
+    
+    }
+
+    template<nda::MemoryArray Array_4D_t1, typename communicator_t>
+    mpi3::communicator gf2_t::make_qk_intracom(memory::darray_t<Array_4D_t1, communicator_t> &dB_qkPR,
+                                               THC_ERI auto &thc) {
+        size_t nkpts = thc.nkpts();
+        auto [q_origin, k_origin, P_origin, R_origin] = dB_qkPR.origin();
+        auto pgrid =  dB_qkPR.grid();
+
+        size_t color = q_origin*nkpts + k_origin;
+        size_t key = dB_qkPR.communicator()->rank();
+        mpi3::communicator qk_intra_comm = dB_qkPR.communicator()->split(color, key);
+        utils::check(qk_intra_comm.size() == pgrid[2]*pgrid[3], "qk_intra_comm.size() != np_P*np_Q");
+
+        return qk_intra_comm;
+
+    }
+
+    template<nda::MemoryArray Array_4D_t1, typename communicator_t>
+    auto gf2_t::allocate_buffers_B(memory::darray_t<Array_4D_t1, communicator_t> &dB_qkPR,
+                                   mpi3::communicator& qk_intra_comm, THC_ERI auto &thc)
+      -> std::array<memory::darray_t<memory::array<HOST_MEMORY, ComplexType, 2>, mpi3::communicator>, 3> {
+        using math::nda::make_distributed_array;
+        using Array_2D_t = memory::array<HOST_MEMORY, ComplexType, 2>;
+        // global shapes
+        size_t Np    = thc.Np();
+
+        // local shapes
+        auto bsize =  dB_qkPR.block_size();
+        auto pgrid =  dB_qkPR.grid();
+
+        auto dZ_PQ  = make_distributed_array<Array_2D_t>(qk_intra_comm, {pgrid[2], pgrid[3]}, {Np, Np}, 
+                                                                        {bsize[2], bsize[3]});
+        _Timer.start("MAKE_DISTR_ARRAY_XX");
+        auto dXX_QR  = make_distributed_array<Array_2D_t>(qk_intra_comm, {pgrid[2], pgrid[3]}, 
+                                                               {Np, Np}, {bsize[2],bsize[3]});
+        _Timer.stop("MAKE_DISTR_ARRAY_XX");
+
+        _Timer.start("MAKE_DISTR_ARRAY_U");
+        auto dB_PR  = make_distributed_array<Array_2D_t>(qk_intra_comm, {pgrid[2], pgrid[3]}, {Np, Np}, 
+                                                                        {bsize[2],bsize[3]});
+        _Timer.stop("MAKE_DISTR_ARRAY_U");
+        utils::check(dB_qkPR.local_shape()[2] == dB_PR.local_shape()[0], "dB_qkPR.local_shape()[2] != dB_PR.local_shape()[0]");
+        utils::check(dB_qkPR.local_shape()[3] == dB_PR.local_shape()[1], "dB_qkPR.local_shape()[3] != dB_PR.local_shape()[1]");
+        utils::check(dZ_PQ.local_shape()[0] == dB_PR.local_shape()[0], "dZ_PQ.local_shape()[0] != dB_PR.local_shape()[0]");
+        utils::check(dZ_PQ.local_shape()[1] == dB_PR.local_shape()[1], "dZ_PQ.local_shape()[1] != dB_PR.local_shape()[1]");
+
+        return std::array<decltype(dZ_PQ), 3>{dZ_PQ, dXX_QR, dB_PR};
+
+    }
+
+
+    template<nda::MemoryArray Array_4D_t1, typename communicator_t>
+    auto gf2_t::estimate_B_norm([[maybe_unused]] memory::darray_t<Array_4D_t1, communicator_t> &dB_qkPR,
+                              nda::array<ComplexType, 1> &Z_q_norms,
+                              nda::array<ComplexType, 3>& GRQ, nda::array<ComplexType, 3>& GQv,
+                              [[maybe_unused]] size_t is, const std::string& norm_def, THC_ERI auto &thc)
+      ->  memory::array<HOST_MEMORY, ComplexType, 2> {
+        using math::nda::make_distributed_array;
+        using Array_2D_t = memory::array<HOST_MEMORY, ComplexType, 2>;
+
+        // global shapes
+        size_t nkpts = thc.nkpts();
+        size_t Np    = thc.Np();
+
+        Array_2D_t XX_norms(nkpts, nkpts);
+        XX_norms() = 0;
+        Array_2D_t B_qk_norms(nkpts, nkpts);
+
+        Array_2D_t X_Q_norms(nkpts, Np);
+        Array_2D_t X_Q2_norms(nkpts, Np);
+
+        for(size_t ik = 0; ik < nkpts; ik++) 
+        for(size_t iQ = 0; iQ < Np; iQ++) {
+            auto X_Q = GQv(ik, iQ, nda::range::all); 
+            X_Q_norms(ik, iQ) = ( norm_def == "max" ? max_norm(X_Q) :
+                                  ( norm_def == "frobenious" ? frob_norm2(X_Q) : abs_norm(X_Q) )); 
+            auto X_Q2 = nda::make_regular(GRQ(ik, nda::range::all, iQ)); 
+            X_Q2_norms(ik, iQ) = ( norm_def == "max" ? max_norm(X_Q2) :
+                                  ( norm_def == "frobenious" ? frob_norm2(X_Q2) : abs_norm(X_Q2) )); 
+        }
+
+        for(size_t iq = 0; iq < nkpts; iq++) 
+        for(size_t ik = 0; ik < nkpts; ik++) {
+            size_t ikmq = _MF->qk_to_k2(iq, ik); 
+            for(size_t iQ = 0; iQ < Np; iQ++) 
+                if(norm_def == "max") {
+                    XX_norms(iq, ik) = std::max(std::abs(XX_norms(iq, ik)), 
+                                                std::abs(X_Q_norms(ik, iQ) * X_Q2_norms(ikmq, iQ)));
+                }
+                else {
+                    XX_norms(iq, ik) += X_Q_norms(ik, iQ) * X_Q2_norms(ikmq, iQ);
+                }
+
+            B_qk_norms(iq, ik) = norm_def == "frobenious" ?  
+                             std::sqrt(std::abs(Z_q_norms(iq) * XX_norms(iq, ik))) : 
+                             std::abs(Z_q_norms(iq) * XX_norms(iq, ik));
+        }
+            
+        return B_qk_norms;
+    }
+
+
+    template<nda::MemoryArray Array_4D_t1, nda::MemoryArray Array_3D_t1,
+             nda::MemoryArray Array_2D_t1, typename communicator_t>
+    void gf2_t::build_B_4D([[maybe_unused]] const nda::MemoryArrayOfRank<5> auto &G_tskij, 
+                           memory::darray_t<Array_4D_t1, communicator_t> &dB_qkPR,
+                           memory::darray_t<Array_3D_t1, communicator_t> &dZ_qPQ,
+                           memory::darray_t<Array_2D_t1, communicator_t> &dZ_PQ,
+                           memory::darray_t<Array_2D_t1, communicator_t> &dXX_QR,
+                           memory::darray_t<Array_2D_t1, communicator_t> &dB_PR,
+                           nda::array<ComplexType, 3>& GRQ, nda::array<ComplexType, 3>& GQv,
+                           [[maybe_unused]] size_t is, [[maybe_unused]] size_t it, size_t iv, [[maybe_unused]] THC_ERI auto &thc) {
+        using math::nda::make_distributed_array;
+        // local shapes
+        auto [nq_kpts_loc, nk_kpts_loc, Np_loc1, Np_loc2] = dB_qkPR.local_shape();
+        auto [q_origin, k_origin, P_origin, R_origin] = dB_qkPR.origin();
+
+        // X times X
+        auto XX_QR = dXX_QR.local();
+        auto Z_PQ = dZ_PQ.local();
+        auto B_P_R = dB_PR.local();
+
+        auto R_rngXX = dXX_QR.local_range(1);
+
+        long nq_kpts_loc_max = nq_kpts_loc;
+        dB_qkPR.communicator()->broadcast_n(&nq_kpts_loc_max, 1, 0);
+  
+      _Timer.start("B_LOOP");
+        for(size_t q = 0; q < nq_kpts_loc; q++) {
+            size_t iq = q + q_origin;
+
+            Z_PQ = dZ_qPQ.local()(q, nda::ellipsis{});
+        //    print_self_norm(dZ_PQ, "dZ_PQ");
+            for(size_t k = 0; k < nk_kpts_loc; k++) {
+                size_t ik = k + k_origin;
+                size_t ikmq = _MF->qk_to_k2(iq, ik); 
+            
+      _Timer.start("B_XX_BUILD");
+                for(size_t Q = 0; Q < dXX_QR.local_shape()[0]; Q++) {
+                    size_t iQ = Q + dXX_QR.origin()[0];
+                    auto XX_Q = XX_QR(Q, nda::ellipsis{});  
+                    ComplexType X_Q = GQv(ik, iQ, iv); //Xsk(iQ, nda::range::all); 
+
+                    auto X_Q2 = nda::make_regular(GRQ(ikmq, R_rngXX, iQ)); //Xsk2(iQ, nda::range::all); 
+                    XX_Q = X_Q * X_Q2;
+                }
+      _Timer.stop("B_XX_BUILD");
+            
+            //    print_self_norm(dXX_QR, "dXX_QR");
+      _Timer.start("MULTIPLY_B");
+                math::nda::slate_ops::multiply(dZ_PQ, dXX_QR, dB_PR);
+      _Timer.stop("MULTIPLY_B");
+            //    print_self_norm(dB_PR, "dB_PR");
+                dB_qkPR.local()(q, k, nda::ellipsis{}) = B_P_R;
+            }
+        }
+      _Timer.stop("B_LOOP");
+
+        
+    }
+
+    auto gf2_t::prepare_vcomm(long nvpools, [[maybe_unused]] THC_ERI auto &thc)
+      -> std::array<mpi3::communicator, 2> {
+
+        struct proc_struct {
+            std::string name;
+            size_t id;
+        };
+
+        auto less = [](auto& a, auto& b) { return a.name < b.name; };
+
+        std::vector<std::string> names(_context->comm.size());
+        names[_context->comm.rank()] = mpi3::processor_name();
+
+        for(size_t i = 0; i < names.size(); i++) {
+            size_t sz = names[i].length();
+            _context->comm.broadcast_n(&sz, 1, i); // send sizes
+            std::string str(sz, 'A');
+            if(_context->comm.rank() == i) str = names[i];
+            _context->comm.broadcast_n(str.data(), sz, i); // send data with appropriate sz
+            names[i] = str;
+        }
+
+#if 0
+        if(_context->comm.rank() == 0) {
+            std::cout << "NAMES: ";
+            for(auto str: names) std::cout << str << "  ";
+            std::cout << std::endl;
+        }
+#endif
+
+        std::vector<proc_struct> struct_names(_context->comm.size());
+        for(size_t i = 0; i < names.size(); i++) {
+            struct_names[i].name = names[i];
+            struct_names[i].id = i;
+        }
+
+        std::stable_sort(struct_names.begin(), struct_names.end(), less);
+
+#if 0
+        if(_context->comm.rank() == 0) {
+            std::cout << "STABLE NAMES: ";
+            for(auto st: struct_names) std::cout << "(" << st.name << "," << st.id << ")  ";
+            std::cout << std::endl;
+        }
+#endif
+        
+        std::vector<long> proc_colors(_context->comm.size());
+        std::vector<long> proc_colors_red(_context->comm.size());
+
+        long pool_size = _context->comm.size() / nvpools;
+        for(size_t i = 0; i < _context->comm.size(); i++) {
+            size_t p = struct_names[i].id;
+            proc_colors[p] = i / pool_size;
+            proc_colors_red[p] = i % pool_size;
+        }
+#if 0
+        for(size_t i = 0; i < _context->comm.size(); i++) {
+            if(_context->comm.rank() == 0) std::cout << "  proc_colors[" << i << "]=" << proc_colors[i] << std::endl;
+        }
+#endif
+
+        int key = _context->comm.rank();
+        mpi3::communicator vcomm = _context->comm.split(proc_colors[_context->comm.rank()], key);
+        mpi3::communicator redvcomm = _context->comm.split(proc_colors_red[_context->comm.rank()], key);
+        return std::array<mpi3::communicator, 2>{vcomm, redvcomm};
+    }
+
+    template<nda::MemoryArray Array_view_5D_t>
+    void gf2_t::thc_gf2_scheme1_orb_4D(const nda::MemoryArrayOfRank<5> auto &G_tskij,
+                              sArray_t<Array_view_5D_t> &sSigma_tskij,  
+                              THC_ERI auto &thc) {
+        size_t nbnd = thc.nbnd();
+        size_t nt    = G_tskij.shape(0);
+        size_t ns    = G_tskij.shape(1);
+
+        // TODO: setup two-layer MPI?
+        long nvpools = utils::find_proc_grid_max_rows(_context->comm, nbnd);
+        long np_nvpools = _context->comm.size() / nvpools;
+
+        auto [vcomm, redvcomm] = prepare_vcomm(nvpools, thc);
+/*
+        int color = _context->comm.rank() / np_nvpools;
+        int key = _context->comm.rank();
+        mpi3::communicator vcomm = _context->comm.split(color, key);
+        mpi3::communicator redvcomm = _context->comm.split(_context->comm.rank() % np_nvpools, key);
+*/
+
+        app_log(2, "Orbital loop will run with {} processors", nvpools);
+        app_log(2, "vcomm.size() = {}", vcomm.size());
+        app_log(2, "redvcomm.size() = {}", redvcomm.size());
+
+        utils::check(vcomm.size() == _context->comm.size() / nvpools,
+                    "vcomm.size() != _context->comm.size() / nvpools");
+        utils::check(redvcomm.size() == nvpools, 
+                    "redvcomm.size() != nvpools");
+        for(size_t is = 0; is < ns; is++) {
+                auto dB_qkPR = allocate_B(thc, vcomm, vcomm.rank() == 0 ? true : false);
+                auto dC_qkPR = allocate_B(thc, vcomm, vcomm.rank() == 0 ? true : false);
+
+                auto qk_comm = make_qk_intracom(dB_qkPR, thc);
+                auto [dZ_PQ, dXX_QR, dB_PR] = allocate_buffers_B(dB_qkPR, qk_comm, thc);  
+
+                auto dD_qkPR = allocate_D(dB_qkPR.grid(), dB_qkPR.block_size(), vcomm, thc);
+
+                auto dZ_qPQ = allocate_Z(G_tskij, dB_qkPR, thc);
+
+
+                // This buffer will be resized dynamically
+                _Timer.start("BUILD_D_BUF");
+                nda::array<ComplexType, 3> B_kPR_dbuf(dB_qkPR.local_shape()[1],dB_qkPR.local_shape()[2],dB_qkPR.local_shape()[3]);
+                _Timer.stop("BUILD_D_BUF");
+
+                _Timer.start("BUILD_D_PR_GR");
+                auto PR_group = create_PR_group(dB_qkPR);
+                mpi3::communicator PR_comm{PR_group};
+                _Timer.stop("BUILD_D_PR_GR");
+
+                auto B_qkPR_bounds = get_qkPR_bounds(dB_qkPR, PR_comm) ;
+                //auto B_q_origins = get_B_q_origins(dB_qkPR, PR_comm); 
+
+                size_t n_prescreened = 0;
+                for(size_t it = 0; it < nt; it++) {
+                    _Timer.start("NORMS");
+                    auto [GRQ, GQv] = prepare_G(G_tskij, is, it, thc);
+                    auto Z_q_fnorms = estimate_Z_norm(dZ_qPQ, "frobenious", thc);
+                    auto B_qk_fnorms = estimate_B_norm(dB_qkPR, Z_q_fnorms, GRQ, GQv, is, "frobenious", thc); 
+                    auto C_qk_fnorms = estimate_C_norm(dC_qkPR, Z_q_fnorms, GRQ, is, "frobenious", thc);
+
+                    auto N_B = max_norm(B_qk_fnorms);
+                    auto N_C = max_norm(C_qk_fnorms);
+                    _Timer.stop("NORMS");
+
+                    if(N_B <= _t_thresh or N_C <= _t_thresh) {n_prescreened++; continue;}
+                    {
+                        dD_qkPR.local()() = 0;
+                    }
+                    for(size_t iv = _context->comm.rank() / np_nvpools; iv < thc.nbnd(); iv += nvpools) {
+                        _Timer.start("BUILD_B");
+                        build_B_4D(G_tskij, dB_qkPR, dZ_qPQ, dZ_PQ, dXX_QR, dB_PR, GRQ, GQv, is, it, iv, thc);
+                        _Timer.stop("BUILD_B");
+                        _Timer.start("BUILD_C");
+                        build_C_4D(G_tskij, dC_qkPR, dZ_qPQ, dZ_PQ, dXX_QR, dB_PR, GRQ, is, it, iv, thc); // GSP is passed
+                        _Timer.stop("BUILD_C");
+                        _Timer.start("BUILD_D");
+                        build_D_4D(dB_qkPR, dC_qkPR, dD_qkPR,B_qkPR_bounds, 
+                                   B_kPR_dbuf, PR_comm, is, it, thc);
+                        _Timer.stop("BUILD_D");
+                    }
+                        _Timer.start("D_REDUCE");
+                    redvcomm.all_reduce_in_place_n(dD_qkPR.local().data(), dD_qkPR.local().size(), std::plus<>{}); 
+                        _Timer.stop("D_REDUCE");
+                
+                    _Timer.start("EVALUATE_SIGMA_EXC");
+                    evaluate_Sigma_par(sSigma_tskij, dD_qkPR, B_qkPR_bounds, B_kPR_dbuf, PR_comm, is, it, thc);
+                    _Timer.stop("EVALUATE_SIGMA_EXC");
+
+                    app_log(2, "GF2: it = {}  est||B|| = {}, est||C|| = {}", it, N_B, N_C);
+                } // it
+                app_log(2, "GF2: N prescreened points: {}", n_prescreened);
+        } //is
+    }
+
+    double gf2_t::norm_X(size_t is, size_t iv, THC_ERI auto &thc) {
+        size_t nkpts = thc.nkpts();
+        double sum = 0.0;
+        for(size_t ik = 0; ik < nkpts; ik++) {
+            auto Xsk = thc.X(is, 0, ik); //  _Np, _nbnd
+            auto Xskv = Xsk(nda::range::all, iv);
+            auto norm = frob_norm(Xskv);
+            sum += norm*norm;
+        }
+        return std::sqrt(sum);
+    }
+
+    double gf2_t::norm_X(size_t is, THC_ERI auto &thc) {
+        size_t nkpts = thc.nkpts();
+        double sum = 0.0;
+        for(size_t ik = 0; ik < nkpts; ik++) {
+            auto Xsk = thc.X(is, 0, ik); //  _Np, _nbnd
+            auto norm = frob_norm(Xsk);
+            sum += norm*norm;
+        }
+        return std::sqrt(sum);
+    }
+
+
+//////////////  FUNCTIONS WITH 5D ALLOCATIONS /////////////////
+
+    template<nda::MemoryArray Array_view_5D_t>
+    void gf2_t::thc_gf2_scheme1(const nda::MemoryArrayOfRank<5> auto &G_tskij,
+                              sArray_t<Array_view_5D_t> &sSigma_tskij, bool dontreallocate, 
+                              THC_ERI auto &thc) {
+        size_t nt    = G_tskij.shape(0);
+        size_t ns    = G_tskij.shape(1);
+
+        app_log(2, "Running {}", _exchange_type);
+        if(_exchange_type == "static_2sosex") {
+            app_log(2, "  Will first do static_g3w2, then subtract dynamic-dynamic contribution");
+        }
+
+        math::nda::distributed_array<Array_6D_t, mpi3::communicator>& first_interaction =
+                 (_exchange_type == "gf2" || _exchange_type == "static_sosex") ? dU_sqkPqs_int : dW0_sqkPqs_int;
+
+        math::nda::distributed_array<Array_6D_t, mpi3::communicator>& second_interaction =
+                 (_exchange_type == "static_sosex" || _exchange_type == "static_2sosex" || _exchange_type == "static_g3w2") ? dW0_sqkPqs_int : dU_sqkPqs_int;
+
+        std::vector<int> exchange_components; // needed for 2SOSEX subtraction
+        exchange_components.push_back(0);
+        if(_exchange_type == "static_2sosex") exchange_components.push_back(1);
+
+        for(auto component : exchange_components) {
+          if(component == 1) { // allocate new Sigma for subtraction
+              sSigma_WdynWdyn_opt = sArray_t<Array_view_5D_t>(*_context, sSigma_tskij.shape());
+              sSigma_WdynWdyn_opt.value().set_zero();
+          }
+          _Timer.start("BUILD_UPqs");
+          // Prepare 3-index intermediate through outer products from bare interactions
+          if(_exchange_type == "static_sosex" || _exchange_type == "gf2") {
+              if(!U_computed) {
+                  app_log(2, "U IS NOT COMPUTED YET: computing bare interaction intermediate");
+                  build_U_Pqs_all(thc, dU_sqkPqs_int, true, false);
+              }
+          }
+          // Prepare 3-index intermediate through outer products from statically screened interactions
+          if(_exchange_type == "static_sosex" || _exchange_type == "static_2sosex" || _exchange_type == "static_g3w2") {
+                  app_log(2, "computing statically screened interaction intermediate");
+                  if(component != 0) {
+                    app_log(2, "  using only the static slice of only the dynamical contribution");
+                  }
+                  build_U_Pqs_all(thc, dW0_sqkPqs_int, false, component == 0 ? false : true);
+                  if(_context->comm.rank() == 0) {
+                      std::cout << "shape of W0:" << dW0_sqkPqs_int.local_shape() << std::endl;
+                  }
+                  app_log(2, "dW0_sqkPqs norm^2: {}", frob_norm2(dW0_sqkPqs_int));
+          }
+          _Timer.stop("BUILD_UPqs");
+          
+          if(doing_dyn && _save_C) allocate_C_for_saving(G_tskij, thc);
+          for(size_t is = 0; is < ns; is++) {
+              if(dontreallocate) {
+          
+                  auto [dB_qkPRv, dB_qkPRv_contr] = allocate_B(first_interaction, thc);
+                  auto [dC_qkPRv, dC_qkPRv_contr] = allocate_C(second_interaction, thc); // C has the same shape
+                  auto dD_qkPR = allocate_D(dB_qkPRv.grid(), dB_qkPRv.block_size(), _context->comm, thc);
+                  auto dD_qkPR_buf = allocate_D(dB_qkPRv.grid(), dB_qkPRv.block_size(), _context->comm, thc);
+                  if(doing_dyn && _save_C) check_C_for_saving(thc, dC_qkPRv);
+                  
+                  for(size_t it = 0; it < nt; it++) {
+                    _Timer.start("BUILD_B");
+                    build_B_and_redistribute(G_tskij, first_interaction, dB_qkPRv, dB_qkPRv_contr, is, it, thc);
+                    _Timer.stop("BUILD_B");
+                  
+                    _Timer.start("BUILD_C");
+                    build_C_and_redistribute(G_tskij, second_interaction, dC_qkPRv, dC_qkPRv_contr, is, it, thc);
+                    _Timer.stop("BUILD_C");
+                  
+                    if(doing_dyn && _save_C) dC_tsqkPRv_opt.value().local()(it, is, nda::ellipsis{}) = dC_qkPRv.local();
+
+                    _Timer.start("BUILD_D");
+                    build_D(dB_qkPRv, dC_qkPRv, dD_qkPR, is, it, thc);
+                    _Timer.stop("BUILD_D");
+                  
+                    _Timer.start("EVALUATE_SIGMA_EXC");
+                    evaluate_Sigma(component == 0 ? sSigma_tskij : sSigma_WdynWdyn_opt.value(), dD_qkPR, is, it, thc);
+                    _Timer.stop("EVALUATE_SIGMA_EXC");
+                  }
+              }
+              else {
+                  for(size_t it = 0; it < nt; it++) {
+                  
+                      _Timer.start("BUILD_B");
+                      auto dB_qkPRv = build_B_and_redistribute(G_tskij, first_interaction, is, it, thc);
+                      _Timer.stop("BUILD_B");
+                  
+                      _Timer.start("BUILD_C");
+                      auto dC_qkPRv = build_C_and_redistribute(G_tskij, second_interaction, is, it, thc);
+                      _Timer.stop("BUILD_C");
+                  
+                      _Timer.start("BUILD_D");
+                      auto dD_qkPR = build_D(dB_qkPRv, dC_qkPRv, is, it, thc);
+                      _Timer.stop("BUILD_D");
+                  
+                      _Timer.start("EVALUATE_SIGMA_EXC");
+                      evaluate_Sigma(component == 0 ? sSigma_tskij : sSigma_WdynWdyn_opt.value(), dD_qkPR, is, it, thc);
+                      _Timer.stop("EVALUATE_SIGMA_EXC");
+                  }
+              }
+          } // spin loop
+          if(component == 1) { // SOX(Wfull,Wfull) - SOX(Wdyn,Wdyn)
+            add_exc_to_Sigma(sSigma_tskij, sSigma_WdynWdyn_opt.value(), -1.0); 
+          }
+        } // exchange_components
+    }
+
+
+    template<nda::MemoryArray Array_6D_t1, typename communicator_t>
+    void gf2_t::build_U_Pqs_all(THC_ERI auto &thc,
+                                memory::darray_t<Array_6D_t1, communicator_t>& dA_sqkPqs,
+                                bool bare, bool dynamic_only) {
+      //-> memory::darray_t<memory::array<HOST_MEMORY, ComplexType, 6>, mpi3::communicator> {
+
+        using math::nda::make_distributed_array;
+        using Array_2D_t = memory::array<HOST_MEMORY, ComplexType, 2>;
+  
+        size_t ns    = thc.ns();
+        size_t nkpts = thc.nkpts();
+        size_t Np    = thc.Np();
+        size_t nbnd = thc.nbnd();
+
+        std::array<long,6> A_pgrid = {1,1,1,1,1,1};
+        std::array<long,6> A_bsize = {1,1,1,1,1,1};
+        {
+            size_t np = _context->comm.size();
+            long nqpools = utils::find_proc_grid_max_npools(np, nkpts, 0.2);
+            np /= nqpools;
+            long nkpools = utils::find_proc_grid_max_npools(np, nkpts, 0.2);
+            np /= nkpools;
+      
+            size_t np_Pqs = np;
+            A_pgrid = {1,nqpools,nkpools,np_Pqs,1,1};
+            // TODO think how to partition np_Pqs...
+            // TODO: setup a good block size
+      
+#if 1
+            A_bsize[3] = 1; //std::min( (long unsigned)1024, Np/A_pgrid[3]);
+            A_bsize[4] = 1; //std::min( (long unsigned)1024, nbnd/A_pgrid[3]);
+            A_bsize[5] = 1; //std::min( (long unsigned)1024, nbnd/A_pgrid[4]);
+#endif
+        }
+        size_t np_Pqs = A_pgrid[3];
+
+        app_log(2, "Evaluation of the ZXX interaction:");
+        app_log(2, "    - U_sqkPqs pgrid = {},{},{},{},{},{}", A_pgrid[0],A_pgrid[1],A_pgrid[2],A_pgrid[3],A_pgrid[4],A_pgrid[5]);
+        app_log(2, "    - U_sqkPqs bsize = {},{},{},{},{},{}", A_bsize[0],A_bsize[1],A_bsize[2],A_bsize[3],A_bsize[4],A_bsize[5]);
+  
+        dA_sqkPqs = make_distributed_array<Array_6D_t>(
+            _context->comm, A_pgrid, {ns, nkpts, nkpts, Np, nbnd, nbnd}, A_bsize);
+
+        auto [ns_loc, nq_kpts_loc, nk_kpts_loc, Np_loc, nbnd_loc1, nbnd_loc2] = dA_sqkPqs.local_shape();
+        app_log(2, "    - U_sqkPqs local shape = {},{},{},{},{},{}", ns_loc, nq_kpts_loc, nk_kpts_loc, Np_loc, nbnd_loc1, nbnd_loc2);
+  
+        auto [s_origin, q_origin, k_origin, P_origin, orb_q_origin, orb_s_origin] = dA_sqkPqs.origin();
+
+        auto block_size = dA_sqkPqs.block_size();
+  
+        utils::check(nbnd == nbnd_loc1, 
+                       "gf2_t::build_U_Pqs_all, nbnd != nbnd_loc1");
+        utils::check(nbnd == nbnd_loc2, 
+                       "gf2_t::build_U_Pqs_all, nbnd != nbnd_loc2");
+        utils::check(orb_q_origin == 0, 
+                       "gf2_t::build_U_Pqs_all, orb_q_origin != 0");
+        utils::check(orb_s_origin == 0, 
+                       "gf2_t::build_U_Pqs_all, orb_s_origin != 0");
+
+        size_t color = q_origin*nkpts + k_origin; // FIXME: number of spin processors is assumed 1
+        size_t key = _context->comm.rank();
+        mpi3::communicator qk_intra_comm = _context->comm.split(color, key);
+        utils::check(qk_intra_comm.size() == A_pgrid[3], "qk_intra_comm.size() != np_Pqs");
+
+        
+        long np_Z_bigger = utils::find_proc_grid_min_diff(np_Pqs, 1, 1);
+        long np_Z_smaller = np_Pqs / np_Z_bigger;
+        long Z_bsize = std::min( {(long unsigned)1024, Np/np_Z_smaller, Np/np_Z_bigger} );
+        // Better pgrid / block size balance for slate gemm
+        auto dZ_PQ  = make_distributed_array<Array_2D_t>(qk_intra_comm, {np_Z_smaller, np_Z_bigger}, {Np, Np}, {Z_bsize, Z_bsize });
+        _Timer.start("MAKE_DISTR_ARRAY_XX");
+        auto dXX_Qqs  = make_distributed_array<Array_2D_t>(qk_intra_comm, {np_Pqs, 1}, {Np, nbnd*nbnd}, {block_size[3], block_size[4]*block_size[5]});
+        // Better pgrid / block size balance for slate gemm
+        auto dXX_Qqs_mult  = make_distributed_array<Array_2D_t>(qk_intra_comm, {np_Z_smaller, np_Z_bigger}, {Np, nbnd*nbnd}, {Z_bsize, Z_bsize });
+        _Timer.stop("MAKE_DISTR_ARRAY_XX");
+
+        _Timer.start("MAKE_DISTR_ARRAY_U");
+        auto dU_Pqs  = make_distributed_array<Array_2D_t>(qk_intra_comm, {np_Pqs, 1}, {Np, nbnd*nbnd}, {block_size[3], block_size[4]*block_size[5]});
+        // Better pgrid / block size balance for slate gemm
+        auto dU_Pqs_mult  = make_distributed_array<Array_2D_t>(qk_intra_comm, {np_Z_smaller, np_Z_bigger}, {Np, nbnd*nbnd},  {Z_bsize, Z_bsize });
+        _Timer.stop("MAKE_DISTR_ARRAY_U");
+
+        utils::check(Np_loc == dU_Pqs.local_shape()[0], "gf2_t::build_U, Np_loc != dU_Pqs.local_shape()[0]");
+
+        app_log(2, "    - dZ_PQ pgrid = {},{}", np_Z_smaller, np_Z_bigger);
+        app_log(2, "    - dZ_PQ bsize = {},{}", Z_bsize, Z_bsize);
+
+        auto Z_P_rng = dZ_PQ.local_range(0);
+        auto Z_Q_rng = dZ_PQ.local_range(1);
+        auto XX_Q_origin = dXX_Qqs.origin()[0];
+  
+        // X times X
+        auto XX_Qqs = dXX_Qqs.local();
+        auto Z_PQ = dZ_PQ.local();
+        auto U_P_q_s = nda::reshape(dU_Pqs.local(), shape_t<3>{Np_loc, nbnd, nbnd});
+  
+        nda::array<ComplexType, 1> X_Q2c(nbnd); 
+        nda::array<ComplexType, 1> X_Q(nbnd); 
+
+        long nq_kpts_loc_max = nq_kpts_loc;
+        dA_sqkPqs.communicator()->broadcast_n(&nq_kpts_loc_max, 1, 0);
+  
+        for(size_t is = 0; is < ns; is++) {
+        for(size_t q = 0; q < nq_kpts_loc; q++) {
+            size_t iq = q + q_origin;
+            auto Z = bare ? thc.Z(iq) : get_static_W(iq, thc, dynamic_only);
+            Z_PQ = Z(Z_P_rng, Z_Q_rng);
+            for(size_t k = 0; k < nk_kpts_loc; k++) {
+                size_t ik = k + k_origin;
+                auto Xsk = thc.X(is, 0, ik); //  _Np, _nbnd
+                size_t ikmq = _MF->qk_to_k2(iq, ik); 
+                auto Xsk2 = thc.X(is, 0, ikmq); //  _Np, _nbnd
+            
+                for(size_t Q = 0; Q < Np_loc; Q++) {
+                    size_t iQ = Q + XX_Q_origin;
+                    auto XX_Q = nda::reshape(XX_Qqs(Q, nda::ellipsis{}), shape_t<2>{nbnd,nbnd});
+                    X_Q = Xsk(iQ, nda::range::all); 
+                    auto X_Q2 = Xsk2(iQ, nda::range::all); 
+                    X_Q2c = nda::conj(X_Q2); 
+                    XX_Q = nda::blas::outer_product(X_Q2c, X_Q);
+                }
+            
+                math::nda::redistribute(dXX_Qqs, dXX_Qqs_mult);
+                math::nda::slate_ops::multiply(dZ_PQ, dXX_Qqs_mult, dU_Pqs_mult);
+                math::nda::redistribute(dU_Pqs_mult, dU_Pqs);
+
+                dA_sqkPqs.local()(is, q, k, nda::ellipsis{}) = U_P_q_s;
+            }
+        }
+        // prevent dead block in thc.Z() in case nq_loc is not the same for all processors
+        // needed for both bare and statically screened interaction cases because thc.Z() is called in both
+        for (size_t iq_loc = nq_kpts_loc; iq_loc < nq_kpts_loc_max; ++iq_loc)
+            auto Z = thc.Z(0);
+        }
+
+        if(bare) {
+            U_computed = true;
+        }
+        else buffer.reset(); // to save memory
+        return;
+    }
+
+
+
+
+    template<nda::MemoryArray Array_6D_t1, typename communicator_t>
+    auto gf2_t::allocate_C(const memory::darray_t<Array_6D_t1, communicator_t> &dU_sqkRvw,
+                           THC_ERI auto &thc)
+      -> std::array<memory::darray_t<memory::array<HOST_MEMORY, ComplexType, 5>, mpi3::communicator>, 2> {
+        using math::nda::make_distributed_array;
+        using Array_5D_t = memory::array<HOST_MEMORY, ComplexType, 5>;
+
+        // global shapes
+        size_t nkpts = thc.nkpts();
+        size_t Np    = thc.Np();
+        size_t nbnd = thc.nbnd();
+
+        // grids and distributed setup
+        auto U_pgrid =  dU_sqkRvw.grid();
+        auto U_lshape = dU_sqkRvw.local_shape();
+
+        std::array<long,5> pgrid = {U_pgrid[1],U_pgrid[2],U_pgrid[3],U_pgrid[4],U_pgrid[5]};
+        std::array<long,5> lshape = {U_lshape[1],U_lshape[2],U_lshape[3],U_lshape[4],U_lshape[5]};
+
+            app_log(2, "MY: trying to allocate C with pgrid: (q, k, P, R, v) = ({}, {}, {}, {}, {})", 
+                    pgrid[0], pgrid[1], pgrid[3], pgrid[2], pgrid[4]);
+
+        // make only C distributed; 
+        auto dC_qkPRv_contr = make_distributed_array<Array_5D_t>(_context->comm,
+                                                          {pgrid[0], pgrid[1], pgrid[3], pgrid[2], pgrid[4]}, 
+                                                          //{nkpts, nkpts, Np, Np, nbnd}, {1,1,1,Np/pgrid[2],1}); // FIXME!
+                                                          {nkpts, nkpts, Np, Np, nbnd}, {1,1,1,1,1});
+
+
+        // local shapes
+        auto [nq_kpts_loc, nk_kpts_loc, Np_loc2, Np_loc, nbnd_loc1] = dC_qkPRv_contr.local_shape();
+        auto [q_origin, k_origin, P_origin, R_origin, orb_v_origin] = dC_qkPRv_contr.origin();
+
+            app_log(2, "MY: trying to allocate C with local shape: (q, k, P, R, v) = ({}, {}, {}, {}, {})", 
+                    nq_kpts_loc, nk_kpts_loc, Np_loc2, Np_loc, nbnd_loc1);
+            app_log(2, "MY: allocate U with local shape: (q, k, R, v, w) = ({}, {}, {}, {}, {})", 
+                    lshape[0], lshape[1], lshape[2], lshape[3], lshape[4]);
+
+
+        utils::check(nbnd == nbnd_loc1, "gf2_t::build_C, nbnd != nbnd_loc1");
+        utils::check(Np == Np_loc2, "gf2_t::build_C, Np != Np_loc2");
+        utils::check(Np_loc == lshape[2], "gf2_t::build_C, Np_loc != U Np_loc");
+        utils::check(P_origin == 0, "gf2_t::build_C, P_origin != 0");
+        utils::check(orb_v_origin == 0, "gf2_t::build_C, orb_v_origin != 0");
+
+        size_t np = _context->comm.size();
+        size_t np_P = utils::find_proc_grid_min_diff(np, 1, 1);
+        size_t np_R = np / np_P;
+
+        auto dC_qkPRv = make_distributed_array<Array_5D_t>(_context->comm, {1,1,np_P,np_R,1},
+                                                          {nkpts, nkpts, Np, Np, nbnd}, {1,1,1,1,1});
+        return std::array<decltype(dC_qkPRv), 2>{dC_qkPRv, dC_qkPRv_contr};
+
+}
+
+    void gf2_t::allocate_C_for_saving(const nda::MemoryArrayOfRank<5> auto &G_tskij,
+                                      THC_ERI auto &thc) {
+        using math::nda::make_distributed_array;
+
+        // global shapes
+        size_t nt = G_tskij.shape()[0];
+        size_t ns    = thc.ns();
+        size_t nkpts = thc.nkpts();
+        size_t Np    = thc.Np();
+        size_t nbnd = thc.nbnd();
+
+        size_t np = _context->comm.size();
+        size_t np_P = utils::find_proc_grid_min_diff(np, 1, 1);
+        size_t np_R = np / np_P;
+
+        app_log(2, "Attempting to allocate C for saving...");
+
+        dC_tsqkPRv_opt = make_distributed_array<nda::array<ComplexType, 7>>(
+            _context->comm, {1,1,1,1,np_P,np_R,1},
+            {nt, ns, nkpts, nkpts, Np, Np, nbnd}, {1,1,1,1,1,1,1});
+
+        // local shapes
+        auto [nt_loc, ns_loc, nq_kpts_loc, nk_kpts_loc, Np_loc2, Np_loc, nbnd_loc1] = dC_tsqkPRv_opt.value().local_shape();
+        auto [t_origin, s_origin, q_origin, k_origin, P_origin, R_origin, orb_v_origin] = dC_tsqkPRv_opt.value().origin();
+
+        utils::check(nbnd == nbnd_loc1, "gf2_t::build_C, nbnd != nbnd_loc1");
+        utils::check(orb_v_origin == 0, "gf2_t::build_C, orb_v_origin != 0");
+        utils::check(t_origin     == 0, "gf2_t::build_C, t_origin != 0");
+        utils::check(s_origin     == 0, "gf2_t::build_C, s_origin != 0");
+        utils::check(q_origin     == 0, "gf2_t::build_C, q_origin != 0");
+        utils::check(k_origin     == 0, "gf2_t::build_C, k_origin != 0");
+
+        return ;
+
+    }
+
+    void gf2_t::check_C_for_saving([[maybe_unused]] THC_ERI auto &thc,
+              memory::darray_t<memory::array<HOST_MEMORY, ComplexType, 5>, mpi3::communicator>& dC_qkPRv) {
+        for(size_t i = 0; i < dC_qkPRv.origin().size(); i++) {
+            utils::check(dC_tsqkPRv_opt.value().origin()[i+2] == dC_qkPRv.origin()[i], 
+                "gf2_t::check_C_for_saving, origin mismatch at i = {}", i);
+            utils::check(dC_tsqkPRv_opt.value().local_shape()[i+2] == dC_qkPRv.local_shape()[i],
+                "gf2_t::check_C_for_saving, local shape mismatch at i = {}", i);
+        }
+    }
+
+
+    template<nda::MemoryArray Array_6D_t1, typename communicator_t>
+    auto gf2_t::allocate_B(const memory::darray_t<Array_6D_t1, communicator_t> &dU_sqkPqs,
+                           THC_ERI auto &thc)
+      -> std::array<memory::darray_t<memory::array<HOST_MEMORY, ComplexType, 5>, mpi3::communicator>, 2> {
+
+        using math::nda::make_distributed_array;
+        using Array_5D_t = memory::array<HOST_MEMORY, ComplexType, 5>;
+
+        app_log(2, "Allocating 5D B or C arrays...");
+
+        _Timer.start("BUILD_B_INIT");
+        // global shapes
+        size_t nkpts = thc.nkpts();
+        size_t Np    = thc.Np();
+        size_t nbnd  = thc.nbnd();
+
+        // grids and distributed setup
+        auto U_pgrid  = dU_sqkPqs.grid();
+
+        std::array<long,5> pgrid = {U_pgrid[1],U_pgrid[2],U_pgrid[3],U_pgrid[4],U_pgrid[5]};
+        std::array<long,5> bsize = {1,1,1,1,1};
+
+        // make only B distributed; do not make A distributed!
+        _Timer.start("MAKE_DISTR_ARRAY1");
+        auto dB_qkPRv_contr = make_distributed_array<Array_5D_t>(_context->comm, pgrid, {nkpts, nkpts, Np, Np, nbnd}, bsize);
+        _Timer.stop("MAKE_DISTR_ARRAY1");
+
+        // local shapes
+        auto [nq_kpts_loc, nk_kpts_loc, Np_loc, Np_loc2, nbnd_loc1] = dB_qkPRv_contr.local_shape();
+        auto [q_origin, k_origin, P_origin, R_origin, orb_v_origin] = dB_qkPRv_contr.origin();
+        utils::check(nbnd == nbnd_loc1, "gf2_t::build_B, nbnd != nbnd_loc1");
+        utils::check(Np == Np_loc2, "gf2_t::build_B, Np != Np_loc2");
+        utils::check(R_origin == 0, "gf2_t::build_B, R_origin != 0");
+        utils::check(orb_v_origin == 0, "gf2_t::build_B, orb_v_origin != 0");
+
+        app_log(2, "Evaluation of the B intermediate:");
+        app_log(2, "  - processor grid for B: (q, k, P, R, v) = ({}, {}, {}, {}, {})", 
+                pgrid[0], pgrid[1], pgrid[2], pgrid[3], pgrid[4]);
+        app_log(2, "  - block sizes for B: (q, k, P, R, v) = ({}, {}, {}, {}, {})", 
+                bsize[0], bsize[1], bsize[2], bsize[3], bsize[4]);
+
+        size_t np = _context->comm.size();
+        size_t np_P = utils::find_proc_grid_min_diff(np, 1, 1);
+        size_t np_R = np / np_P;
+
+        bsize = {1,1,1,1,1};
+
+        _Timer.start("MAKE_DISTR_ARRAY2");
+        auto dB_qkPRv = make_distributed_array<Array_5D_t>(_context->comm, {1,1,np_P,np_R,1},
+                                                          {nkpts, nkpts, Np, Np, nbnd}, bsize);
+        _Timer.stop("MAKE_DISTR_ARRAY2");
+
+        return std::array<decltype(dB_qkPRv), 2>{dB_qkPRv, dB_qkPRv_contr};
+
+}
+
+
+    template<nda::MemoryArray Array_6D_t1, typename communicator_t>
+    auto gf2_t::build_B_and_redistribute(const nda::MemoryArrayOfRank<5> auto &G_tskij, 
+                        const memory::darray_t<Array_6D_t1, communicator_t> &dU_sqkPqs,
+                        size_t is, size_t it, THC_ERI auto &thc)
+      -> memory::darray_t<memory::array<HOST_MEMORY, ComplexType, 5>, mpi3::communicator> {
+
+        using math::nda::make_distributed_array;
+        using Array_5D_t = memory::array<HOST_MEMORY, ComplexType, 5>;
+
+        _Timer.start("BUILD_B_BEFORE_RED");
+        auto dB_qkPRv_by_qk = build_B(G_tskij, dU_sqkPqs, is, it, thc);
+        _Timer.stop("BUILD_B_BEFORE_RED");
+
+        // global shapes
+        size_t nkpts = thc.nkpts();
+        size_t Np    = thc.Np();
+        size_t nbnd = thc.nbnd();
+
+        size_t np = _context->comm.size();
+        size_t np_P = utils::find_proc_grid_min_diff(np, 1, 1);
+        size_t np_R = np / np_P;
+
+        auto bsize = dB_qkPRv_by_qk.block_size();
+        bsize[0] = 1; // TODO: revisit these at optimization of D evaluation
+        bsize[1] = 1;
+/*
+        bsize[2] = std::min( (long unsigned)1024, Np/np_P);
+        bsize[3] = std::min( (long unsigned)1024, Np/np_R);
+        bsize[4] = std::min( (long unsigned)1024, nbnd);
+*/
+        bsize[2] = 1;
+        bsize[3] = 1;
+        bsize[4] = 1;
+
+        _Timer.start("MAKE_DISTR_ARRAY2");
+        auto dB_qkPRv = make_distributed_array<Array_5D_t>(_context->comm, {1,1,np_P,np_R,1}, {nkpts, nkpts, Np, Np, nbnd}, bsize);
+        _Timer.stop("MAKE_DISTR_ARRAY2");
+        
+        _Timer.start("COMM");
+        math::nda::redistribute(dB_qkPRv_by_qk, dB_qkPRv);
+        _Timer.stop("COMM");
+
+        return dB_qkPRv;
+    }
+
+    template<nda::MemoryArray Array_6D_t1, nda::MemoryArray Array_5D_t1, typename communicator_t>
+    void gf2_t::build_B_and_redistribute(const nda::MemoryArrayOfRank<5> auto &G_tskij, 
+                        const memory::darray_t<Array_6D_t1, communicator_t> &dU_sqkPqs,
+                        memory::darray_t<Array_5D_t1, communicator_t> &dB_qkPRv,
+                        memory::darray_t<Array_5D_t1, communicator_t> &dB_qkPRv_contr,
+                        size_t is, size_t it, THC_ERI auto &thc) {
+
+        using math::nda::make_distributed_array;
+
+        _Timer.start("BUILD_B_BEFORE_RED");
+        build_B(G_tskij, dU_sqkPqs, dB_qkPRv_contr, is, it, thc);
+        _Timer.stop("BUILD_B_BEFORE_RED");
+
+        
+        _Timer.start("BUILD_B_RED");
+        math::nda::redistribute(dB_qkPRv_contr, dB_qkPRv);
+        _Timer.stop("BUILD_B_RED");
+
+    }
+
+
+    template<nda::MemoryArray Array_6D_t1, typename communicator_t>
+    auto gf2_t::build_B(const nda::MemoryArrayOfRank<5> auto &G_tskij, 
+                        const memory::darray_t<Array_6D_t1, communicator_t> &dU_sqkPqs,
+                        size_t is, size_t it, THC_ERI auto &thc)
+      -> memory::darray_t<memory::array<HOST_MEMORY, ComplexType, 5>, mpi3::communicator> {
+        using math::nda::make_distributed_array;
+        using Array_3D_t = memory::array<HOST_MEMORY, ComplexType, 3>;
+        using Array_5D_t = memory::array<HOST_MEMORY, ComplexType, 5>;
+
+        _Timer.start("BUILD_B_INIT");
+        // global shapes
+        size_t nt = G_tskij.shape(0);
+        size_t nkpts = thc.nkpts();
+        size_t Np    = thc.Np();
+        size_t nbnd = thc.nbnd();
+
+        // grids and distributed setup
+        auto U_pgrid =  dU_sqkPqs.grid();
+
+        std::array<long,5> pgrid = {U_pgrid[1],U_pgrid[2],U_pgrid[3],U_pgrid[4],U_pgrid[5]};
+        std::array<long,5> bsize = {1,1,1,1,1};
+
+        bsize[2] = std::min( (long unsigned)1024, Np/pgrid[2]);
+        //bsize[3] = std::min( (long unsigned)1024, Np/pgrid[3]);
+        //bsize[4] = std::min( (long unsigned)1024, nbnd/pgrid[4]);
+
+        // make only B distributed; do not make A distributed!
+        _Timer.start("MAKE_DISTR_ARRAY1");
+        auto dB_qkPRv = make_distributed_array<Array_5D_t>(_context->comm, pgrid, {nkpts, nkpts, Np, Np, nbnd}, bsize);
+        _Timer.stop("MAKE_DISTR_ARRAY1");
+
+        // local shapes
+        auto [nq_kpts_loc, nk_kpts_loc, Np_loc, Np_loc2, nbnd_loc1] = dB_qkPRv.local_shape();
+        auto [q_origin, k_origin, P_origin, R_origin, orb_v_origin] = dB_qkPRv.origin();
+        utils::check(nbnd == nbnd_loc1, "gf2_t::build_B, nbnd != nbnd_loc1");
+        utils::check(Np == Np_loc2, "gf2_t::build_B, Np != Np_loc2");
+        utils::check(R_origin == 0, "gf2_t::build_B, R_origin != 0");
+        utils::check(orb_v_origin == 0, "gf2_t::build_B, orb_v_origin != 0");
+
+        if(is == 0 && it == 0) {
+            app_log(2, "Evaluation of the B intermediate:");
+            app_log(2, "  - processor grid for B: (q, k, P, R, v) = ({}, {}, {}, {}, {})", 
+                    pgrid[0], pgrid[1], pgrid[2], pgrid[3], pgrid[4]);
+            app_log(2, "  - block sizes for B: (q, k, P, R, v) = ({}, {}, {}, {}, {})", 
+                    bsize[0], bsize[1], bsize[2], bsize[3], bsize[4]);
+        }
+
+        // temporary arrays / intermediates
+        Array_3D_t A_Pqv(Np_loc, nbnd, nbnd);
+        auto A_Pq_v = nda::reshape(A_Pqv, shape_t<2>{Np_loc*nbnd, nbnd});
+        auto A_P_qv = nda::reshape(A_Pqv, shape_t<2>{Np_loc, nbnd*nbnd});
+
+        Array_3D_t A_qvP(nbnd, nbnd, Np_loc);
+        auto A_qv_P = nda::reshape(A_qvP, shape_t<2>{nbnd*nbnd, Np_loc});
+        auto A_q_vP = nda::reshape(A_qvP, shape_t<2>{nbnd, nbnd*Np_loc});
+
+        Array_3D_t B_RvP(Np, nbnd, Np_loc);
+        auto B_R_vP = nda::reshape(B_RvP, shape_t<2>{Np, nbnd*Np_loc});
+        auto B_Rv_P = nda::reshape(B_RvP, shape_t<2>{Np*nbnd, Np_loc});
+
+        _Timer.stop("BUILD_B_INIT");
+
+        // TODO: this can be moved outside and be done fully parallely
+        _Timer.start("G_TRANSFORM");
+        nda::array<ComplexType, 3> GRq(nkpts, Np, nbnd); 
+        for(size_t q = 0; q < nkpts; q++) {
+            auto G_R_q = nda::reshape(GRq(q, nda::ellipsis{}), shape_t<2>{Np, nbnd});
+            transform_G(G_tskij, G_R_q, is, q, it, "left", thc); 
+        }
+        _Timer.stop("G_TRANSFORM");
+
+        // build A, then B
+        for(size_t q = 0; q < nq_kpts_loc; q++) {
+            for(size_t k = 0; k < nk_kpts_loc; k++) {
+                size_t ik = k + k_origin;
+                size_t iq = q + q_origin;
+
+                // G_sv^{k_v}(-t)
+                _Timer.start("MAKE_A");
+                auto Gtt = G_tskij(nt - it - 1, is, ik, nda::ellipsis{});
+                auto U_Pqs = dU_sqkPqs.local()(is, q, k, nda::ellipsis{});
+
+                auto U_Pq_s = nda::reshape(U_Pqs, shape_t<2>{Np_loc*nbnd, nbnd});
+        
+                nda::blas::gemm(U_Pq_s, Gtt, A_Pq_v);
+                _Timer.stop("MAKE_A");
+
+                // Partly tranformed G_Rq^{k_v - q1}(t)
+                _Timer.start("MAKE_B");
+                size_t ikmq = _MF->qk_to_k2(iq, ik); 
+                auto G_R_q = nda::make_regular(nda::reshape(GRq(ikmq, nda::ellipsis{}), shape_t<2>{Np, nbnd}));
+
+                A_qv_P = nda::transpose(A_P_qv);
+
+                nda::blas::gemm(G_R_q, A_q_vP, B_R_vP); 
+                
+                auto B_PRv = dB_qkPRv.local()(q, k, nda::ellipsis{});
+                auto B_P_Rv = nda::reshape(B_PRv, shape_t<2>{Np_loc, Np*nbnd});
+                B_P_Rv = nda::make_regular(nda::transpose(B_Rv_P));
+                _Timer.stop("MAKE_B");
+
+            }
+        }
+        return dB_qkPRv;
+
+    }
+
+    template<nda::MemoryArray Array_6D_t1,  nda::MemoryArray Array_5D_t2, typename communicator_t>
+    void gf2_t::build_B(const nda::MemoryArrayOfRank<5> auto &G_tskij, 
+                        const memory::darray_t<Array_6D_t1, communicator_t> &dU_sqkPqs,
+                        memory::darray_t<Array_5D_t2, communicator_t> &dB_qkPRv,
+                        size_t is, size_t it, THC_ERI auto &thc) {
+        using math::nda::make_distributed_array;
+        using Array_3D_t = memory::array<HOST_MEMORY, ComplexType, 3>;
+
+        _Timer.start("BUILD_B_INIT");
+        // global shapes
+        size_t nt = G_tskij.shape(0);
+        size_t nkpts = thc.nkpts();
+        size_t Np    = thc.Np();
+        size_t nbnd = thc.nbnd();
+
+        // grids and distributed setup
+        auto U_pgrid =  dU_sqkPqs.grid();
+
+        std::array<long,5> pgrid = {U_pgrid[1],U_pgrid[2],U_pgrid[3],U_pgrid[4],U_pgrid[5]};
+
+        // local shapes
+        auto [nq_kpts_loc, nk_kpts_loc, Np_loc, Np_loc2, nbnd_loc1] = dB_qkPRv.local_shape();
+        auto [q_origin, k_origin, P_origin, R_origin, orb_v_origin] = dB_qkPRv.origin();
+        auto bsize =  dB_qkPRv.block_size();
+        utils::check(pgrid == dB_qkPRv.grid(), "gf2_t::build_B, pgrid != dB_qkPRv.grid()");
+        utils::check(nbnd == nbnd_loc1, "gf2_t::build_B, nbnd != nbnd_loc1");
+        utils::check(Np == Np_loc2, "gf2_t::build_B, Np != Np_loc2");
+        utils::check(R_origin == 0, "gf2_t::build_B, R_origin != 0");
+        utils::check(orb_v_origin == 0, "gf2_t::build_B, orb_v_origin != 0");
+
+        if(is == 0 && it == 0) {
+            app_log(2, "Evaluation of the B intermediate:");
+            app_log(2, "  - processor grid for B: (q, k, P, R, v) = ({}, {}, {}, {}, {})", 
+                    pgrid[0], pgrid[1], pgrid[2], pgrid[3], pgrid[4]);
+            app_log(2, "  - block sizes for B: (q, k, P, R, v) = ({}, {}, {}, {}, {})", 
+                    bsize[0], bsize[1], bsize[2], bsize[3], bsize[4]);
+        }
+
+        // temporary arrays / intermediates
+        Array_3D_t A_Pqv(Np_loc, nbnd, nbnd);
+        auto A_Pq_v = nda::reshape(A_Pqv, shape_t<2>{Np_loc*nbnd, nbnd});
+        auto A_P_qv = nda::reshape(A_Pqv, shape_t<2>{Np_loc, nbnd*nbnd});
+
+        Array_3D_t A_qvP(nbnd, nbnd, Np_loc);
+        auto A_qv_P = nda::reshape(A_qvP, shape_t<2>{nbnd*nbnd, Np_loc});
+        auto A_q_vP = nda::reshape(A_qvP, shape_t<2>{nbnd, nbnd*Np_loc});
+
+        Array_3D_t B_RvP(Np, nbnd, Np_loc);
+        auto B_R_vP = nda::reshape(B_RvP, shape_t<2>{Np, nbnd*Np_loc});
+        auto B_Rv_P = nda::reshape(B_RvP, shape_t<2>{Np*nbnd, Np_loc});
+
+        _Timer.stop("BUILD_B_INIT");
+
+        // TODO: this can be moved outside and be done fully parallely
+        _Timer.start("G_TRANSFORM");
+        nda::array<ComplexType, 3> GRq(nkpts, Np, nbnd); 
+        for(size_t q = 0; q < nkpts; q++) {
+            auto G_R_q = nda::reshape(GRq(q, nda::ellipsis{}), shape_t<2>{Np, nbnd});
+            transform_G(G_tskij, G_R_q, is, q, it, "left", thc); 
+        }
+        _Timer.stop("G_TRANSFORM");
+
+        // build A, then B
+        for(size_t q = 0; q < nq_kpts_loc; q++) {
+            for(size_t k = 0; k < nk_kpts_loc; k++) {
+                size_t ik = k + k_origin;
+                size_t iq = q + q_origin;
+
+                // G_sv^{k_v}(-t)
+                _Timer.start("MAKE_A");
+                auto Gtt = G_tskij(nt - it - 1, is, ik, nda::ellipsis{});
+                auto U_Pqs = dU_sqkPqs.local()(is, q, k, nda::ellipsis{});
+
+                auto U_Pq_s = nda::reshape(U_Pqs, shape_t<2>{Np_loc*nbnd, nbnd});
+        
+                nda::blas::gemm(U_Pq_s, Gtt, A_Pq_v);
+                _Timer.stop("MAKE_A");
+
+                // Partly tranformed G_Rq^{k_v - q1}(t)
+                _Timer.start("MAKE_B");
+                size_t ikmq = _MF->qk_to_k2(iq, ik); 
+                auto G_R_q = nda::make_regular(nda::reshape(GRq(ikmq, nda::ellipsis{}), shape_t<2>{Np, nbnd}));
+
+                A_qv_P = nda::transpose(A_P_qv);
+
+                nda::blas::gemm(G_R_q, A_q_vP, B_R_vP); 
+                
+                auto B_PRv = dB_qkPRv.local()(q, k, nda::ellipsis{});
+                auto B_P_Rv = nda::reshape(B_PRv, shape_t<2>{Np_loc, Np*nbnd});
+                B_P_Rv = nda::make_regular(nda::transpose(B_Rv_P));
+                _Timer.stop("MAKE_B");
+
+            }
+        }
+
+    }
+
+
+
+    template<nda::MemoryArray Array_6D_t1, nda::MemoryArray Array_5D_t1, typename communicator_t>
+    void gf2_t::build_C_and_redistribute(const nda::MemoryArrayOfRank<5> auto &G_tskij, 
+                        const memory::darray_t<Array_6D_t1, communicator_t> &dU_sqkRvw,
+                        memory::darray_t<Array_5D_t1, communicator_t> &dC_qkPRv_out,
+                        memory::darray_t<Array_5D_t1, communicator_t> &dC_qkPRv,
+                        size_t is, size_t it, THC_ERI auto &thc) {
+        using math::nda::make_distributed_array;
+        using Array_3D_t = memory::array<HOST_MEMORY, ComplexType, 3>;
+
+        // global shapes
+        size_t Np    = thc.Np();
+        size_t nbnd = thc.nbnd();
+
+        // local shapes
+        auto [nq_kpts_loc, nk_kpts_loc, Np_loc2, Np_loc, nbnd_loc1] = dC_qkPRv.local_shape();
+        auto [q_origin, k_origin, P_origin, R_origin, orb_v_origin] = dC_qkPRv.origin();
+
+        {
+            // temporary array
+            Array_3D_t C_RvP(Np_loc, nbnd, Np);
+            auto C_Rv_P = nda::reshape(C_RvP, shape_t<2>{Np_loc*nbnd, Np});
+            
+            for(size_t q = 0; q < nq_kpts_loc; q++) {
+                for(size_t k = 0; k < nk_kpts_loc; k++) {
+                    size_t ik = k + k_origin;
+                    // partly transformed G // FIXME: move
+                    nda::array<ComplexType, 2> GwP(nbnd, Np); 
+                    auto G_w_P = nda::reshape(GwP, shape_t<2>{nbnd, Np});
+                    transform_G(G_tskij, G_w_P, is, ik, it, "right", thc);
+            
+                    auto U_Rv_w = nda::reshape(dU_sqkRvw.local()(is, q, k, nda::ellipsis{}),
+                                                     shape_t<2>{Np_loc*nbnd, nbnd});
+                    nda::blas::gemm(U_Rv_w, G_w_P, C_Rv_P);
+            
+                    auto C_PRv = dC_qkPRv.local()(q, k, nda::ellipsis{});
+                    auto C_P_Rv = nda::reshape(C_PRv, shape_t<2>{Np, Np_loc*nbnd});
+                    C_P_Rv = make_regular(nda::transpose(C_Rv_P)); 
+                }
+            }
+        }
+
+        _Timer.start("COMM");
+        math::nda::redistribute(dC_qkPRv, dC_qkPRv_out);
+        _Timer.stop("COMM");
+
+    }
+
+    template<nda::MemoryArray Array_6D_t1, typename communicator_t>
+    auto gf2_t::build_C_and_redistribute(const nda::MemoryArrayOfRank<5> auto &G_tskij, 
+                        const memory::darray_t<Array_6D_t1, communicator_t> &dU_sqkRvw,
+                        size_t is, size_t it, THC_ERI auto &thc)
+    -> memory::darray_t<memory::array<HOST_MEMORY, ComplexType, 5>, mpi3::communicator> {
+      using math::nda::make_distributed_array;
+      using Array_3D_t = memory::array<HOST_MEMORY, ComplexType, 3>;
+      using Array_5D_t = memory::array<HOST_MEMORY, ComplexType, 5>;
+
+      // global shapes
+      size_t nkpts = thc.nkpts();
+      size_t Np    = thc.Np();
+      size_t nbnd = thc.nbnd();
+
+      // grids and distributed setup
+      auto U_pgrid =  dU_sqkRvw.grid();
+      auto U_lshape = dU_sqkRvw.local_shape();
+
+      std::array<long,5> pgrid = {U_pgrid[1],U_pgrid[2],U_pgrid[3],U_pgrid[4],U_pgrid[5]};
+      std::array<long,5> lshape = {U_lshape[1],U_lshape[2],U_lshape[3],U_lshape[4],U_lshape[5]};
+
+      // make only C distributed;
+      auto dC_qkPRv = make_distributed_array<Array_5D_t>(_context->comm, {pgrid[0], pgrid[1], pgrid[3], pgrid[2], pgrid[4]},
+                                                        {nkpts, nkpts, Np, Np, nbnd}, {1,1,1,Np/pgrid[2],1});
+
+      // local shapes
+      auto [nq_kpts_loc, nk_kpts_loc, Np_loc2, Np_loc, nbnd_loc1] = dC_qkPRv.local_shape();
+      auto [q_origin, k_origin, P_origin, R_origin, orb_v_origin] = dC_qkPRv.origin();
+
+      utils::check(nbnd == nbnd_loc1, "gf2_t::build_C, nbnd != nbnd_loc1");
+      utils::check(Np == Np_loc2, "gf2_t::build_C, Np != Np_loc2");
+      utils::check(Np_loc == lshape[2], "gf2_t::build_C, Np_loc != U Np_loc");
+      utils::check(P_origin == 0, "gf2_t::build_C, P_origin != 0");
+      utils::check(orb_v_origin == 0, "gf2_t::build_C, orb_v_origin != 0");
+
+      if(is == 0 && it == 0) {
+          app_log(2, "Evaluation of the C intermediate:");
+          app_log(2, "  - processor grid for C: (q, k, P, R, v) = ({}, {}, {}, {}, {})",
+                  pgrid[0], pgrid[1], pgrid[3], pgrid[2], pgrid[4]);
+          app_log(2, "  - local shape for C: (q, k, P, R, v) = ({}, {}, {}, {}, {})",
+                  nq_kpts_loc, nk_kpts_loc, Np_loc2, Np_loc, nbnd_loc1);
+          app_log(2, "  - local shape for U: (q, k, R, v, w) = ({}, {}, {}, {}, {})",
+                  lshape[0], lshape[1], lshape[2], lshape[3], lshape[4]);
+      }
+
+      {
+          // temporary array
+          Array_3D_t C_RvP(Np_loc, nbnd, Np);
+          auto C_Rv_P = nda::reshape(C_RvP, shape_t<2>{Np_loc*nbnd, Np});
+
+          for(size_t q = 0; q < nq_kpts_loc; q++) {
+              for(size_t k = 0; k < nk_kpts_loc; k++) {
+                  size_t ik = k + k_origin;
+                  // partly transformed G // FIXME: move
+                  nda::array<ComplexType, 2> GwP(nbnd, Np);
+                  auto G_w_P = nda::reshape(GwP, shape_t<2>{nbnd, Np});
+                  transform_G(G_tskij, G_w_P, is, ik, it, "right", thc);
+
+                  auto U_Rv_w = nda::reshape(dU_sqkRvw.local()(is, q, k, nda::ellipsis{}),
+                                                   shape_t<2>{Np_loc*nbnd, nbnd});
+                  nda::blas::gemm(U_Rv_w, G_w_P, C_Rv_P);
+
+                  auto C_PRv = dC_qkPRv.local()(q, k, nda::ellipsis{});
+                  auto C_P_Rv = nda::reshape(C_PRv, shape_t<2>{Np, Np_loc*nbnd});
+                  C_P_Rv = make_regular(nda::transpose(C_Rv_P));
+              }
+          }
+      }
+
+
+      size_t np = _context->comm.size();
+      size_t np_P = utils::find_proc_grid_min_diff(np, 1, 1);
+      size_t np_R = np / np_P;
+
+      auto out_bsize = dC_qkPRv.block_size();
+      out_bsize[0] = 1; // TODO: revisit these at optimization of D evaluation
+      out_bsize[1] = 1;
+/*
+      out_bsize[2] = std::min( (long unsigned)1024, Np/np_P);
+      out_bsize[3] = std::min( (long unsigned)1024, Np/np_R);
+      out_bsize[4] = std::min( (long unsigned)1024, nbnd);
+*/
+      out_bsize[2] = 1;
+      out_bsize[3] = 1;
+      out_bsize[4] = 1;
+
+      auto dC_qkPRv_out = make_distributed_array<Array_5D_t>(_context->comm, {1, 1, np_P, np_R, 1},
+                                                        {nkpts, nkpts, Np, Np, nbnd}, out_bsize);
+
+      _Timer.start("COMM");
+      math::nda::redistribute(dC_qkPRv, dC_qkPRv_out);
+      _Timer.stop("COMM");
+
+      return dC_qkPRv_out;
+    }
+
+    template<nda::MemoryArray Array_4D_t1, typename communicator_t>
+    auto gf2_t::estimate_C_norm([[maybe_unused]] memory::darray_t<Array_4D_t1, communicator_t> &dC_qkPR,
+                                nda::array<ComplexType, 1> &Z_q_norms,
+                                nda::array<ComplexType, 3>& GSP,
+                                size_t is, const std::string& norm_def, THC_ERI auto &thc)
+      ->  memory::array<HOST_MEMORY, ComplexType, 2> {
+        using math::nda::make_distributed_array;
+        using Array_2D_t = memory::array<HOST_MEMORY, ComplexType, 2>;
+
+        // global shapes
+        size_t nkpts = thc.nkpts();
+        size_t Np    = thc.Np();
+
+        Array_2D_t XX_norms(nkpts, nkpts);
+        XX_norms() = 0;
+        Array_2D_t C_qk_norms(nkpts, nkpts);
+
+        Array_2D_t X_S_norms(nkpts, Np);
+        Array_2D_t X_S2_norms(nkpts, Np);
+
+        for(size_t ik = 0; ik < nkpts; ik++) 
+        for(size_t iQ = 0; iQ < Np; iQ++) {
+            auto X_S = nda::make_regular(GSP(ik, iQ, nda::range::all)); //Xsk(iQ, nda::range::all); 
+            X_S_norms(ik, iQ) = ("frobenious" ? frob_norm2(X_S) : abs_norm(X_S));
+            auto Xsk = thc.X(is, 0, ik); //  _Np, _nbnd
+            auto X_S2 = Xsk(iQ, nda::range::all);
+            X_S2_norms(ik, iQ) = ("frobenious" ? frob_norm2(X_S2) : abs_norm(X_S2)); 
+        }
+
+        for(size_t iq = 0; iq < nkpts; iq++) 
+        for(size_t ik = 0; ik < nkpts; ik++) {
+            size_t ikmq = _MF->qk_to_k2(iq, ik); 
+        
+            for(size_t iS = 0; iS < Np; iS++) {
+                XX_norms(iq, ik) += X_S_norms(ik, iS) * X_S2_norms(ikmq, iS);
+            }
+
+            C_qk_norms(iq, ik) = norm_def == "frobenious" ?  
+                             std::sqrt(std::abs(Z_q_norms(iq) * XX_norms(iq, ik))) : 
+                             std::abs(Z_q_norms(iq) * XX_norms(iq, ik));
+        }
+        return C_qk_norms;
+    }
+
+    template<nda::MemoryArray Array_4D_t1, nda::MemoryArray Array_3D_t1, 
+             nda::MemoryArray Array_2D_t1, typename communicator_t>
+    void gf2_t::build_C_4D([[maybe_unused]] const nda::MemoryArrayOfRank<5> auto &G_tskij, 
+                           memory::darray_t<Array_4D_t1, communicator_t> &dC_qkPR,
+                           memory::darray_t<Array_3D_t1, communicator_t> &dZ_qRS,
+                           memory::darray_t<Array_2D_t1, communicator_t> &dZ_RS,
+                           memory::darray_t<Array_2D_t1, communicator_t> &dXX_SP,
+                           memory::darray_t<Array_2D_t1, communicator_t> &dC_PR,
+                           nda::array<ComplexType, 3>& GSP,
+                           size_t is, [[maybe_unused]] size_t it, size_t iv, THC_ERI auto &thc) {
+        using math::nda::make_distributed_array;
+        // local shapes
+        auto [nq_kpts_loc, nk_kpts_loc, Np_loc2, Np_loc] = dC_qkPR.local_shape();
+        auto [q_origin, k_origin, P_origin, R_origin] = dC_qkPR.origin();
+
+        // X times X
+        auto XX_SP = dXX_SP.local();
+        auto Z_RS = dZ_RS.local();
+        auto P_rngXX = dXX_SP.local_range(1);
+
+        for(size_t q = 0; q < nq_kpts_loc; q++) {
+            size_t iq = q + q_origin;
+            Z_RS = dZ_qRS.local()(q, nda::ellipsis{});
+            for(size_t k = 0; k < nk_kpts_loc; k++) {
+                size_t ik = k + k_origin;
+                size_t ikmq = _MF->qk_to_k2(iq, ik); 
+                auto Xsk2 = thc.X(is, 0, ikmq); //  _Np, _nbnd
+            
+                for(size_t S = 0; S < XX_SP.shape()[0]; S++) {
+                    size_t iS = S + dXX_SP.origin()[0];
+                    auto XX_S = XX_SP(S, nda::ellipsis{});  
+                    auto X_S = nda::make_regular(GSP(ik, iS, P_rngXX)); //Xsk(iQ, nda::range::all); 
+                    ComplexType X_S2 = nda::conj(Xsk2(iS, iv)); 
+                    XX_S = X_S2 * X_S;
+                }
+            
+      _Timer.start("MULTIPLY_C");
+                math::nda::slate_ops::multiply( math::nda::transpose(dXX_SP), math::nda::transpose(dZ_RS), dC_PR);
+      _Timer.stop("MULTIPLY_C");
+
+
+                dC_qkPR.local()(q, k, nda::ellipsis{}) = nda::make_regular(dC_PR.local());
+            }
+        }
+    }
+
+
+    template<typename Array>
+    auto gf2_t::allocate_D(Array B_pgrid, Array B_bsize, mpi3::communicator& comm,
+                           THC_ERI auto &thc)
+      -> memory::darray_t<memory::array<HOST_MEMORY, ComplexType, 4>, mpi3::communicator> {
+        using math::nda::make_distributed_array;
+        using Array_4D_t = memory::array<HOST_MEMORY, ComplexType, 4>;
+
+        size_t nkpts = thc.nkpts();
+        size_t Np    = thc.Np();
+
+        long np_P = B_pgrid[2];
+        long np_R = B_pgrid[3];
+
+        app_log(2, "MY: try to allocate D with procs {},{},{},{}", B_pgrid[0],1,np_P,np_R);
+        auto dD_qkPR = make_distributed_array<Array_4D_t>(comm, {B_pgrid[0], 1, np_P, np_R}, 
+                                                          {nkpts, nkpts, Np, Np}, {B_bsize[0],1,B_bsize[2],B_bsize[3]});
+        return dD_qkPR;
+
+    }
+
+
+    template<nda::MemoryArray Array_4D_t1, typename communicator_t>
+    auto gf2_t::get_qkPR_bounds(const memory::darray_t<Array_4D_t1, communicator_t> &dB_qkPR,
+                              mpi3::communicator& PR_comm) 
+      -> nda::array<long,2> {
+        size_t nproc = PR_comm.size();
+#if 1
+        _Timer.start("BUILD_D_PR_RED");
+        nda::array<long,2> B_kPR_bounds(3,nproc);
+        B_kPR_bounds()=0;
+        B_kPR_bounds(0,PR_comm.rank()) = dB_qkPR.local_shape()[1];
+        B_kPR_bounds(1,PR_comm.rank()) = dB_qkPR.local_shape()[2];
+        B_kPR_bounds(2,PR_comm.rank()) = dB_qkPR.local_shape()[3];
+        PR_comm.all_reduce_in_place_n(B_kPR_bounds.data(),3*nproc,std::plus<>{});
+        return B_kPR_bounds;
+        _Timer.stop("BUILD_D_PR_RED");
+#else
+        _Timer.start("BUILD_D_PR_RED");
+        nda::array<long,2> B_qkPR_bounds(4,nproc);
+        B_qkPR_bounds()=0;
+        B_qkPR_bounds(0,PR_comm.rank()) = dB_qkPR.local_shape()[0];
+        B_qkPR_bounds(1,PR_comm.rank()) = dB_qkPR.local_shape()[1];
+        B_qkPR_bounds(2,PR_comm.rank()) = dB_qkPR.local_shape()[2];
+        B_qkPR_bounds(3,PR_comm.rank()) = dB_qkPR.local_shape()[3];
+        PR_comm.all_reduce_in_place_n(B_qkPR_bounds.data(),4*nproc,std::plus<>{});
+        return B_qkPR_bounds;
+        _Timer.stop("BUILD_D_PR_RED");
+#endif
+    }
+
+
+
+    template<nda::MemoryArray Array_4D_t1, typename communicator_t>
+    auto gf2_t::get_B_q_origins(const memory::darray_t<Array_4D_t1, communicator_t> &dB_qkPR,
+                              mpi3::communicator& PR_comm) 
+      -> nda::array<long,1> {
+        size_t nproc = PR_comm.size();
+
+        nda::array<long,1> B_q_origins(nproc);
+        B_q_origins()=0;
+        B_q_origins(PR_comm.rank()) = dB_qkPR.origin()[0];
+        PR_comm.all_reduce_in_place_n(B_q_origins.data(),nproc,std::plus<>{});
+
+        std::vector<long> B_q_origins_sorted(nproc);
+        std::copy(B_q_origins.begin(), B_q_origins.end(), B_q_origins_sorted.begin());
+
+        std::stable_sort(B_q_origins_sorted.begin(), B_q_origins_sorted.end());
+        auto last_garb = std::unique(B_q_origins_sorted.begin(), B_q_origins_sorted.end());
+        B_q_origins_sorted.erase(last_garb, B_q_origins_sorted.end());
+        return B_q_origins;
+    }
+
+
+    template<nda::MemoryArray Array_4D_t1, typename communicator_t>
+    void gf2_t::build_D_4D(const memory::darray_t<Array_4D_t1, communicator_t> &dB_qkPR,
+                           const memory::darray_t<Array_4D_t1, communicator_t> &dC_qkPR,
+                           memory::darray_t<Array_4D_t1, communicator_t> &dD_qkPR,
+                           nda::array<long,2>& B_kPR_bounds,
+                           nda::array<ComplexType, 3>& B_kPR,
+                           mpi3::communicator& PR_comm,
+                           [[maybe_unused]] size_t is, [[maybe_unused]] size_t it, THC_ERI auto &thc) {
+
+        using math::nda::make_distributed_array;
+
+        // global shapes
+        size_t nkpts = thc.nkpts();
+
+        // grids and distributed setup
+        auto pgrid =  dB_qkPR.grid();
+        auto gshape = dB_qkPR.global_shape();
+        auto lshape = dB_qkPR.local_shape();
+        auto bsize =  dB_qkPR.block_size();
+
+        // consistency check for both arrays
+        utils::check(pgrid == dC_qkPR.grid(), "dB_qkPR.grid() != dC_qkPR.grid()");
+        utils::check(gshape == dC_qkPR.global_shape(), "dB_qkPR.global_shape() != dC_qkPR.global_shape()");
+        utils::check(lshape == dC_qkPR.local_shape(), "dB_qkPR.local_shape() != dC_qkPR.local_shape()");
+        utils::check(bsize == dC_qkPR.block_size(), "dB_qkPR.block_size() != dC_qkPR.block_size()");
+
+        // need to have full dimensions by k
+        //utils::check(pgrid[0] == 1, "dB_qkPR.grid()[0] != 1");
+        utils::check(pgrid[1] == 1, "dB_qkPR.grid()[1] != 1");
+        //utils::check(lshape[0] == nkpts, "dB_qkPR.local_shape()[0] != nkpts");
+        utils::check(lshape[1] == nkpts, "dB_qkPR.local_shape()[1] != nkpts");
+
+        auto had_prod2 = nda::map([](ComplexType x, ComplexType y) { return (x * y); });
+
+        std::vector<long> sender_procs;
+        _Timer.start("BUILD_D_OUTLOOP");
+        for(int iq1 = 0; iq1 < nkpts; iq1++) {
+            // Find all processes in PR_group that contain iq1 in dB_qkPR blocks.
+            sender_procs = search_sender_proc(iq1, dB_qkPR, PR_comm);
+            for(const size_t sproc: sender_procs) {
+                if(sproc == PR_comm.rank()) {
+                    // resize to be safe
+                    B_kPR.resize({B_kPR_bounds(0,sproc), B_kPR_bounds(1,sproc), B_kPR_bounds(2,sproc)});
+                    B_kPR = dB_qkPR.local()(iq1-dB_qkPR.origin()[0], nda::ellipsis{});
+                }
+                else {
+                    B_kPR.resize({B_kPR_bounds(0,sproc), B_kPR_bounds(1,sproc), B_kPR_bounds(2,sproc)});
+                }
+                _Timer.start("BUILD_D_BCAST");
+                PR_comm.broadcast_n(B_kPR.data(),B_kPR.size(),sproc);
+                _Timer.stop("BUILD_D_BCAST");
+                _Timer.start("BUILD_D_LOOP");
+                for(size_t q2 = 0; q2 < dC_qkPR.local_shape()[0]; q2++) {
+                    for(size_t kw = 0; kw < nkpts; kw++) {
+                        size_t iq2 = q2 + dC_qkPR.origin()[0];
+                        size_t kv = _MF->qk_to_k2(iq2, kw); 
+                        size_t ku = _MF->qk_to_k2(iq1, kv); 
+                
+                        auto B_PR = B_kPR(kv, nda::ellipsis{});
+                        auto C_PR = dC_qkPR.local()(q2, kw, nda::ellipsis{});
+                        auto D_PR = dD_qkPR.local()(q2, ku, nda::ellipsis{});
+
+                        D_PR += had_prod2(B_PR, C_PR);
+                    }
+                } //q2
+                _Timer.stop("BUILD_D_LOOP");
+            } //sproc
+        } //iq1
+        _Timer.stop("BUILD_D_OUTLOOP");
+    }
+
+    template<nda::MemoryArray Array_4D_t1, typename communicator_t>
+    mpi3::group gf2_t::create_PR_group(const memory::darray_t<Array_4D_t1, communicator_t> &dB_qkPR) {
+
+        size_t nproc = dB_qkPR.communicator()->size();
+        long id = dB_qkPR.communicator()->rank();
+
+        // Collect PR origins from all procs in dB
+        nda::array<long,2> B_PR_origin(2,nproc);
+        B_PR_origin() = -1;
+        B_PR_origin(0,id) = dB_qkPR.origin()[2];
+        B_PR_origin(1,id) = dB_qkPR.origin()[3];
+
+        using namespace mpi3;
+        dB_qkPR.communicator()->all_reduce_in_place_n(B_PR_origin.data(), B_PR_origin.size(), max<>{});
+
+        // Mark processors with the same local origin with +1,
+        // mark all other with -1
+        nda::array<int,1> B_PR_proc(nproc);
+        B_PR_proc() = -1;
+
+        for(long proc = 0; proc < nproc; proc++) {
+          bool status = B_PR_origin(0,proc) == dB_qkPR.origin()[2]
+                    and B_PR_origin(1,proc) == dB_qkPR.origin()[3];
+            B_PR_proc(proc) = status ? +1 : -1;
+        }
+
+
+        std::vector<int> procs_with_PR;
+
+        for (auto [proc, status] : itertools::enumerate(B_PR_proc)) {
+            if(status > 0) procs_with_PR.push_back(proc);
+        }
+
+        group base(*dB_qkPR.communicator());
+        group group_PR = base.include(procs_with_PR); // TODO: does not work with previous mpi3
+                                                      // because it accepts only initializer_list
+
+
+
+/*
+        // Workaround for the group: // TODO: add to mpi3 library?
+        MPI_Group group_PR_impl =  group_PR.get();
+        MPI_Group group_base_impl =  base.get();
+        {
+            MPI_(Group_incl)(group_base_impl, static_cast<int>(procs_with_PR.size()), procs_with_PR.data(), group_PR_impl); 
+	}
+*/
+
+        return group_PR;
+
+    }
+
+    template<nda::MemoryArray Array_4D_t1, typename communicator_t>
+    std::vector<long> gf2_t::search_sender_proc(size_t iq,
+                      const memory::darray_t<Array_4D_t1, communicator_t> &dB_qkPR,
+                      mpi3::communicator& PR_comm) {
+
+        auto is_in_range = [](auto v, auto a, auto b) {
+            return (a <= v) && (v < b);
+        };
+
+        size_t nproc = PR_comm.size();
+        long id = PR_comm.rank();
+
+
+        nda::array<int,1> B_q_proc(nproc);
+        B_q_proc() = -1;
+
+        {
+          bool status = (is_in_range(iq, dB_qkPR.origin()[0], 
+                                         dB_qkPR.origin()[0]+dB_qkPR.local_shape()[0]));
+            B_q_proc(id) = status ? +1 : -1;
+        }
+
+        PR_comm.all_reduce_in_place_n(B_q_proc.data(), B_q_proc.size(), mpi3::max<>{});
+
+        std::vector<long> procs_with_iq;
+
+        for (auto [proc, status] : itertools::enumerate(B_q_proc)) {
+            if(status > 0) procs_with_iq.push_back(proc);
+        }
+        
+        return procs_with_iq;
+    }
+
+
+    template<nda::MemoryArray Array_5D_t1, nda::MemoryArray Array_4D_t1, typename communicator_t>
+    auto gf2_t::build_D(const memory::darray_t<Array_5D_t1, communicator_t> &dB_qkPRv,
+                        const memory::darray_t<Array_5D_t1, communicator_t> &dC_qkPRv,
+                        memory::darray_t<Array_4D_t1, communicator_t> &dD_qkPR,
+                        [[maybe_unused]] size_t is, [[maybe_unused]] size_t it, THC_ERI auto &thc)
+      -> memory::darray_t<memory::array<HOST_MEMORY, ComplexType, 4>, mpi3::communicator> {
+
+        using math::nda::make_distributed_array;
+
+        // global shapes
+        size_t nkpts = thc.nkpts();
+        size_t nbnd = thc.nbnd();
+
+        // grids and distributed setup
+        auto pgrid =  dB_qkPRv.grid();
+        auto gshape = dB_qkPRv.global_shape();
+        auto lshape = dB_qkPRv.local_shape();
+        auto bsize =  dB_qkPRv.block_size();
+
+        // consistency check for both arrays
+        utils::check(pgrid == dC_qkPRv.grid(), "gf2_t::build_D, dB_qkPRv.grid() != dC_qkPRv.grid()");
+        utils::check(gshape == dC_qkPRv.global_shape(), "gf2_t::build_D, dB_qkPRv.global_shape() != dC_qkPRv.global_shape()");
+        utils::check(lshape == dC_qkPRv.local_shape(), "gf2_t::build_D, dB_qkPRv.local_shape() != dC_qkPRv.local_shape()");
+        utils::check(bsize == dC_qkPRv.block_size(), "gf2_t::build_D, dB_qkPRv.block_size() != dC_qkPRv.block_size()");
+
+        // need to have full dimensions by q and k
+        utils::check(pgrid[0] == 1, "gf2_t::build_D, dB_qkPRv.grid()[0] != 1");
+        utils::check(pgrid[1] == 1, "gf2_t::build_D, dB_qkPRv.grid()[1] != 1");
+        utils::check(lshape[0] == nkpts, "gf2_t::build_D, dB_qkPRv.local_shape()[0] != nkpts");
+        utils::check(lshape[1] == nkpts, "gf2_t::build_D, dB_qkPRv.local_shape()[1] != nkpts");
+
+        auto P_Np_loc = lshape[2];
+        auto R_Np_loc = lshape[3];
+
+        auto D_qkPR_loc = dD_qkPR.local();
+        set_zero(D_qkPR_loc); 
+
+        // full dimensions by q1,q2,kw
+        for(size_t q1 = 0; q1 < nkpts; q1++) 
+        for(size_t q2 = 0; q2 < nkpts; q2++) 
+            for(size_t kw = 0; kw < nkpts; kw++) {
+                size_t kv = _MF->qk_to_k2(q2, kw); 
+                size_t ku = _MF->qk_to_k2(q1, kv); 
+
+                auto B_PRv = dB_qkPRv.local()(q1, kv, nda::ellipsis{});
+                auto B_PR_v = nda::reshape(B_PRv, shape_t<2>{P_Np_loc*R_Np_loc, nbnd});
+
+                auto C_PRv = dC_qkPRv.local()(q2, kw, nda::ellipsis{});
+                auto C_PR_v = nda::reshape(C_PRv, shape_t<2>{P_Np_loc*R_Np_loc, nbnd});
+             
+                auto D_PR = dD_qkPR.local()(q2, ku, nda::ellipsis{});
+                auto D_PR_1D = nda::reshape(D_PR, shape_t<1>{P_Np_loc*R_Np_loc});
+                auto buffer_PR_1D = nda::array<ComplexType, 1>(P_Np_loc*R_Np_loc);
+                for(size_t iPR = 0; iPR < P_Np_loc*R_Np_loc; iPR++) {
+                    auto B_v = B_PR_v(iPR, nda::range::all);
+                    auto C_v = C_PR_v(iPR, nda::range::all);
+                    auto B_1_v = nda::reshape(B_v, shape_t<2>{1, nbnd});
+                    auto C_v_1 = nda::reshape(C_v, shape_t<2>{nbnd, 1});
+                    nda::array<ComplexType, 2> prod(1, 1); 
+                    nda::blas::gemm(B_1_v, C_v_1, prod);
+                    buffer_PR_1D(iPR) = prod(0,0);
+                }
+                D_PR_1D += buffer_PR_1D;
+            }
+
+        return dD_qkPR;
+
+    }
+
+    template<nda::MemoryArray Array_5D_t1, typename communicator_t>
+    auto gf2_t::build_D(const memory::darray_t<Array_5D_t1, communicator_t> &dB_qkPRv,
+                        const memory::darray_t<Array_5D_t1, communicator_t> &dC_qkPRv,
+                        size_t is, size_t it, THC_ERI auto &thc)
+      -> memory::darray_t<memory::array<HOST_MEMORY, ComplexType, 4>, mpi3::communicator> {
+
+        using math::nda::make_distributed_array;
+        using Array_4D_t = memory::array<HOST_MEMORY, ComplexType, 4>;
+
+        // global shapes
+        size_t nkpts = thc.nkpts();
+        size_t Np    = thc.Np();
+        size_t nbnd = thc.nbnd();
+
+        // grids and distributed setup
+        auto pgrid =  dB_qkPRv.grid();
+        auto gshape = dB_qkPRv.global_shape();
+        auto lshape = dB_qkPRv.local_shape();
+        auto bsize =  dB_qkPRv.block_size();
+
+        auto np_P = pgrid[2];
+        auto np_R = pgrid[3];
+
+        // consistency check for both arrays
+        utils::check(pgrid == dC_qkPRv.grid(), "gf2_t::build_D, dB_qkPRv.grid() != dC_qkPRv.grid()");
+        utils::check(gshape == dC_qkPRv.global_shape(), "gf2_t::build_D, dB_qkPRv.global_shape() != dC_qkPRv.global_shape()");
+        utils::check(lshape == dC_qkPRv.local_shape(), "gf2_t::build_D, dB_qkPRv.local_shape() != dC_qkPRv.local_shape()");
+        utils::check(bsize == dC_qkPRv.block_size(), "gf2_t::build_D, dB_qkPRv.block_size() != dC_qkPRv.block_size()");
+
+        // need to have full dimensions by q and k
+        utils::check(pgrid[0] == 1, "gf2_t::build_D, dB_qkPRv.grid()[0] != 1");
+        utils::check(pgrid[1] == 1, "gf2_t::build_D, dB_qkPRv.grid()[1] != 1");
+        utils::check(lshape[0] == nkpts, "gf2_t::build_D, dB_qkPRv.local_shape()[0] != nkpts");
+        utils::check(lshape[1] == nkpts, "gf2_t::build_D, dB_qkPRv.local_shape()[1] != nkpts");
+
+        auto P_Np_loc = lshape[2];
+        auto R_Np_loc = lshape[3];
+
+        auto dD_qkPR = make_distributed_array<Array_4D_t>(_context->comm, {1, 1, np_P, np_R},
+                                                          {nkpts, nkpts, Np, Np}, {1,1,1,1});
+
+        if(is == 0 && it == 0) {
+            app_log(2, "Evaluation of the D intermediate:");
+            app_log(2, "  - processor grid for D: (q, k, P, R) = ({}, {}, {}, {})", 
+                    1,1,np_P,np_R);
+        }
+
+        // full dimensions by q1,q2,kw
+        for(size_t q1 = 0; q1 < nkpts; q1++) 
+        for(size_t q2 = 0; q2 < nkpts; q2++) 
+            for(size_t kw = 0; kw < nkpts; kw++) {
+                size_t kv = _MF->qk_to_k2(q2, kw); 
+                size_t ku = _MF->qk_to_k2(q1, kv); 
+
+                auto B_PRv = dB_qkPRv.local()(q1, kv, nda::ellipsis{});
+                auto B_PR_v = nda::reshape(B_PRv, shape_t<2>{P_Np_loc*R_Np_loc, nbnd});
+
+                auto C_PRv = dC_qkPRv.local()(q2, kw, nda::ellipsis{});
+                auto C_PR_v = nda::reshape(C_PRv, shape_t<2>{P_Np_loc*R_Np_loc, nbnd});
+             
+                auto D_PR = dD_qkPR.local()(q2, ku, nda::ellipsis{});
+                auto D_PR_1D = nda::reshape(D_PR, shape_t<1>{P_Np_loc*R_Np_loc});
+                auto buffer_PR_1D = nda::array<ComplexType, 1>(P_Np_loc*R_Np_loc);
+                for(size_t iPR = 0; iPR < P_Np_loc*R_Np_loc; iPR++) {
+                    auto B_v = B_PR_v(iPR, nda::range::all);
+                    auto C_v = C_PR_v(iPR, nda::range::all);
+                    auto B_1_v = nda::reshape(B_v, shape_t<2>{1, nbnd});
+                    auto C_v_1 = nda::reshape(C_v, shape_t<2>{nbnd, 1});
+                    nda::array<ComplexType, 2> prod(1, 1); 
+                    nda::blas::gemm(B_1_v, C_v_1, prod);
+                    buffer_PR_1D(iPR) = prod(0,0);
+                }
+                D_PR_1D += buffer_PR_1D;
+            }
+
+        return dD_qkPR;
+
+    }
+
+    template<nda::MemoryArray Array_view_5D_t, nda::MemoryArray Array_4D_t1, typename communicator_t>
+    void gf2_t::evaluate_Sigma_par(sArray_t<Array_view_5D_t> &sSigma_tskij,
+                              const memory::darray_t<Array_4D_t1, communicator_t> &dD_qkPR,
+                              nda::array<long,2>& D_kPR_bounds, 
+                              nda::array<ComplexType, 3>& D_kPR,
+                              mpi3::communicator& PR_comm,
+                              size_t is, size_t it, THC_ERI auto &thc) {
+
+        using math::nda::make_distributed_array;
+
+        // global shapes
+        size_t nkpts = thc.nkpts();
+        size_t Np    = thc.Np();
+
+        using Array_3D_t = memory::array<HOST_MEMORY, ComplexType, 3>;
+        auto D_comm = *dD_qkPR.communicator();
+        auto dSigma_kPR = make_distributed_array<Array_3D_t>(D_comm, 
+                              {dD_qkPR.grid()[0], dD_qkPR.grid()[2], dD_qkPR.grid()[3]}, 
+                                                          {nkpts, Np, Np}, 
+                              {dD_qkPR.block_size()[0], dD_qkPR.block_size()[2], dD_qkPR.block_size()[3]});
+
+        auto P_range_D = dD_qkPR.local_range(2);
+        auto R_range_D = dD_qkPR.local_range(3);
+
+        utils::check(P_range_D == dSigma_kPR.local_range(1), "P_range_D != dSigma_kPR.local_range(1)");
+        utils::check(R_range_D == dSigma_kPR.local_range(2), "R_range_D != dSigma_kPR.local_range(2)");
+        utils::check(dD_qkPR.local_shape()[1] == nkpts, "dD_qkPR.local_shape()[1] != nkpts");
+
+        std::vector<long> sender_procs;
+        for(int iq1 = 0; iq1 < nkpts; iq1++) {
+            // Find all processes in PR_group that contain iq1 in dD_qkPR blocks.
+            sender_procs = search_sender_proc(iq1, dD_qkPR, PR_comm); 
+            for(const size_t sproc: sender_procs) {
+                if(sproc == PR_comm.rank()) {
+                    // resize to be safe
+                    D_kPR.resize({D_kPR_bounds(0,sproc), D_kPR_bounds(1,sproc), D_kPR_bounds(2,sproc)}); 
+                    D_kPR = dD_qkPR.local()(iq1-dD_qkPR.origin()[0], nda::ellipsis{});
+                }
+                else {
+                    D_kPR.resize({D_kPR_bounds(0,sproc), D_kPR_bounds(1,sproc), D_kPR_bounds(2,sproc)});
+                }
+                PR_comm.broadcast_n(D_kPR.data(),D_kPR.size(),sproc);
+                for(size_t k = 0; k < dSigma_kPR.local_shape()[0]; k++) {
+                    size_t ik = k + dSigma_kPR.origin()[0];
+                    size_t kmq = _MF->qk_to_k2(iq1, ik); 
+                    dSigma_kPR.local()(k, nda::ellipsis{}) += D_kPR(kmq, nda::ellipsis{});
+                }
+            } // sproc
+        } // iq1
+
+        // TODO: replace with distributed transform later
+        nda::array<ComplexType, 3> loc_Sigma_kPR(nkpts, Np, Np);
+        math::nda::gather(0, dSigma_kPR, &loc_Sigma_kPR);
+
+        _Timer.start("EVALUATE_SIGMA_EXC_NP");
+        sSigma_tskij.win().fence();
+        if(_context->comm.rank() == 0) {
+            for(size_t k = 0; k < nkpts; k++) {
+                ComplexType factor = -1.0/(nkpts*nkpts);
+                auto S_RP = nda::make_regular(factor * nda::transpose(loc_Sigma_kPR(k, nda::ellipsis{}))); 
+                transform_Sigma(sSigma_tskij, S_RP, is, k, it, thc);
+            }
+        }
+        sSigma_tskij.win().fence();
+        _Timer.stop("EVALUATE_SIGMA_EXC_NP");
+/*
+        sSigma_tskij.win().fence();
+        sSigma_tskij.all_reduce();
+        sSigma_tskij.win().fence();
+*/
+
+    }
+
+
+
+    template<nda::MemoryArray Array_view_5D_t, nda::MemoryArray Array_4D_t1, typename communicator_t>
+    void gf2_t::evaluate_Sigma(sArray_t<Array_view_5D_t> &sSigma_tskij,
+                      const memory::darray_t<Array_4D_t1, communicator_t> &dD_qkPR,
+                      size_t is, size_t it, THC_ERI auto &thc) {
+
+        using math::nda::make_distributed_array;
+
+        // global shapes
+        size_t nkpts = thc.nkpts();
+        size_t Np    = thc.Np();
+
+        // TODO: this is correct, but a bit hard on memory
+
+        nda::array<ComplexType, 3> loc_Sigma_kPR(nkpts, Np, Np); 
+        set_zero(loc_Sigma_kPR);
+
+        auto P_range_D = dD_qkPR.local_range(2);
+        auto R_range_D = dD_qkPR.local_range(3);
+
+        for(size_t k = 0; k < nkpts; k++) 
+        for(size_t q = 0; q < dD_qkPR.local_shape()[0]; q++) {
+            size_t iq = q + dD_qkPR.origin()[0];
+            size_t kmq = _MF->qk_to_k2(iq, k); 
+            loc_Sigma_kPR(k, P_range_D, R_range_D) += dD_qkPR.local()(q, kmq, nda::ellipsis{});
+        }
+        dD_qkPR.communicator()->all_reduce_in_place_n(loc_Sigma_kPR.data(), nkpts*Np*Np, std::plus<>{});
+
+
+        // TODO: replace with distributed transform later
+        _Timer.start("EVALUATE_SIGMA_EXC_NP");
+        sSigma_tskij.win().fence();
+        if(_context->comm.rank() == 0) {
+            for(size_t k = 0; k < nkpts; k++) {
+                ComplexType factor = -1.0/(nkpts*nkpts);
+                auto S_RP = nda::make_regular(factor * nda::transpose(loc_Sigma_kPR(k, nda::ellipsis{}))); 
+                transform_Sigma(sSigma_tskij, S_RP, is, k, it, thc);
+            }
+        }
+        sSigma_tskij.win().fence();
+        _Timer.stop("EVALUATE_SIGMA_EXC_NP");
+/*
+        sSigma_tskij.win().fence();
+        sSigma_tskij.all_reduce();
+        sSigma_tskij.win().fence();
+*/
+
+    }
+
+    template<nda::MemoryArray Array_view_2D_t>
+    void gf2_t::transform_G(const nda::MemoryArrayOfRank<5> auto &G_tskij,
+                            Array_view_2D_t& G_tr,
+                            size_t is, size_t ik, size_t it,
+                            std::string code,
+                            THC_ERI auto &thc) {
+        size_t Np = thc.Np();
+        size_t nbnd = thc.nbnd();
+
+        auto Gt_loc = G_tskij(it, is, ik, nda::ellipsis{});
+
+        G_tr() = 0.0;
+        //G_tr *= ComplexType(0.0);
+        auto Xsk = thc.X(is, 0, ik); //  _Np, _nbnd
+        if(code == "left") {
+            nda::blas::gemm(Xsk, Gt_loc, G_tr);
+            return;
+        }
+        else 
+        if(code == "right") {
+            nda::blas::gemm(Gt_loc, nda::conj(nda::transpose(Xsk)), G_tr);
+            return;
+        }
+        else 
+        if(code == "both") {
+            nda::array<ComplexType, 2> G_left_tr(Np, nbnd); 
+            nda::blas::gemm(Xsk, Gt_loc, G_left_tr);
+            nda::blas::gemm(G_left_tr, nda::conj(nda::transpose(Xsk)), G_tr);
+            return;
+        }
+    }
+
+    template<nda::MemoryArray Array_view_5D_t, nda::MemoryArray Array_view_2D_t>
+    void gf2_t::transform_Sigma(sArray_t<Array_view_5D_t> &sSigma_tskij,
+                            Array_view_2D_t& Sigma_PR,
+                            size_t is, size_t ik, size_t it,
+                            THC_ERI auto &thc) {
+        size_t Np = thc.Np();
+        size_t nbnd = thc.nbnd();
+
+        auto Sigma_tr = sSigma_tskij.local()(it, is, ik, nda::ellipsis{});
+
+        auto Xsk = thc.X(is, 0, ik); //  _Np, _nbnd
+
+        nda::array<ComplexType, 2> Sigma_tR(nbnd, Np); 
+        nda::matrix<ComplexType> Xsk_t_c(nbnd, Np);
+        Xsk_t_c = nda::conj(nda::transpose(Xsk));
+        nda::blas::gemm(Xsk_t_c, Sigma_PR, Sigma_tR);
+        nda::blas::gemm(Sigma_tR, Xsk, Sigma_tr);
+    }
+
+
+    template<nda::MemoryArray Array_t>
+    void gf2_t::print_self_norm(const Array_t& A, std::string name){
+      auto norm = frob_norm(A); 
+          std::cout << "proc " << _context->comm.rank() << " MY: ||" << name << "||_F" << "  " << norm << std::endl;
+    }
+
+
+  template <typename Array_t>
+  double gf2_t::frob_norm2(Array_t const &a)  {
+    return fold(
+       [](double r, auto const &x) -> double {
+         auto ab = std::abs(x);
+         return r + ab * ab;
+       },
+       a, double(0));
+  }
+
+  template <typename Array_t>
+  double gf2_t::abs_norm(Array_t const &a)  {
+    return fold(
+       [](double r, auto const &x) -> double {
+         return r + std::abs(x);
+       },
+       a, double(0));
+  }
+
+  template <typename Array_t>
+  double gf2_t::max_norm(Array_t const &a)  {
+    return fold(
+       [](double r, auto const &x) -> double {
+         return std::max(r, std::abs(x));
+       },
+       a, double(0));
+  }
+
+  template <typename Array_t>
+  double gf2_t::frob_norm(Array_t const &a)  {
+    return std::sqrt(frob_norm2(a));
+  }
+
+    template<nda::MemoryArray Array_t, typename communicator_t>
+    double gf2_t::frob_norm2(memory::darray_t<Array_t, communicator_t> &dA) {
+
+        auto A_loc = dA.local(); 
+
+        double norm_sq = frob_norm2(A_loc);
+        dA.communicator()->all_reduce_in_place_n(&norm_sq, 1, std::plus<>{});
+        return norm_sq;
+    }
+
+    template<nda::MemoryArray Array_t, typename communicator_t>
+    double gf2_t::abs_norm(memory::darray_t<Array_t, communicator_t> &dA) {
+
+        auto A_loc = dA.local(); 
+
+        double norm = abs_norm(A_loc);
+        dA.communicator()->all_reduce_in_place_n(&norm, 1, std::plus<>{});
+        return norm;
+    }
+
+    template<nda::MemoryArray Array_t, typename communicator_t>
+    double gf2_t::max_norm(memory::darray_t<Array_t, communicator_t> &dA) {
+
+        auto A_loc = dA.local(); 
+
+        double norm = max_norm(A_loc);
+        dA.communicator()->all_reduce_in_place_n(&norm, 1, mpi3::max<>{});
+        return norm;
+    }
+
+    template<nda::MemoryArray Array_t, typename communicator_t>
+    double gf2_t::frob_norm(memory::darray_t<Array_t, communicator_t> &dA) {
+        return std::sqrt(frob_norm2(dA));
+    }
+
+    memory::array<HOST_MEMORY, ComplexType, 2> gf2_t::get_static_W(
+        size_t iq, THC_ERI auto &thc, bool dynamic_only) {
+
+        app_log(2, "  Gathering W(iw=0)...");
+
+        utils::check(dW0_qPQ_opt.has_value(), "get_static_W: dW0_qPQ_opt is empty!");
+        auto [nkpts, Np, Np2] = dW0_qPQ_opt.value().global_shape();
+        if(!buffer.has_value()) {
+            buffer = nda::array<ComplexType, 3>(nkpts, Np, Np); 
+           
+            for(size_t ip = 0; ip < dW0_qPQ_opt.value().communicator()->size(); ip++)
+              math::nda::gather(ip, dW0_qPQ_opt.value(), &buffer.value());
+        }
+        if(dynamic_only) {
+            return nda::make_regular(buffer.value()(iq, nda::ellipsis{}));
+        } else {
+            return nda::make_regular(buffer.value()(iq, nda::ellipsis{})) + thc.Z(iq);
+        }
+    }
+
+} // solvers
+} //methods
+
+#endif //COQUI_THC_GF2_ICC
