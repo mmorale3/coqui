@@ -28,7 +28,7 @@ void APP_ABORT(Args&&... args)
   spdlog::get("err_console")->error("**********************************************");
   spdlog::get("err_console")->error("        APPLICATION ABORT: Fatal Error.");
   spdlog::get("err_console")->error("**********************************************");
-//  spdlog::get("err_console")->error(std::forward<Args>(args)...);
+  spdlog::get("err_console")->error(std::forward<Args>(args)...);
   spdlog::get("err_console")->error("**********************************************");
   // how to make cpptrace interact with spdlog???
   if(__app_stacktrace__) {
@@ -62,7 +62,7 @@ void APP_ABORT(const std::source_location& loc = std::source_location::current()
   spdlog::get("err_console")->error(" line:          {}",loc.line());
   spdlog::get("err_console")->error(" column:        {}",loc.column());
 
-//  spdlog::get("err_console")->error(std::forward<Args>(args)...);
+  spdlog::get("err_console")->error(std::forward<Args>(args)...);
   spdlog::get("err_console")->error("**********************************************");
   // how to make cpptrace interact with spdlog???
   if(__app_stacktrace__) {

@@ -45,7 +45,7 @@ void app_warning(const std::string_view string_format, Args&&... args)
 #if defined(ENABLE_SPDLOG)
   auto l = spdlog::get("warn_console");
   if(l)
-    l->warn(std::forward<Args>(args)...);
+    l->warn(string_format,std::forward<Args>(args)...);
   else
     APP_ABORT(" Error: app_warning used uninitialized.");
 #else
@@ -62,7 +62,7 @@ void app_error(const std::string_view string_format, Args&&... args)
 #if defined(ENABLE_SPDLOG)
   auto l = spdlog::get("err_console");
   if(l) { 
-    l->error(std::forward<Args>(args)...);
+    l->error(string_format,std::forward<Args>(args)...);
     l->flush();
   } else
     APP_ABORT(" Error: app_error used uninitialized.");
@@ -81,7 +81,7 @@ void app_debug(int level, const std::string_view string_format, Args&&... args)
 #if defined(ENABLE_SPDLOG)
     auto l = spdlog::get("err_console");
     if(l)
-      l->debug(std::forward<Args>(args)...);
+      l->debug(string_format, std::forward<Args>(args)...);
     else
       APP_ABORT(" Error: app_debug used uninitialized.");
 #else
