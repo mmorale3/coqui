@@ -98,42 +98,42 @@ namespace methods {
     void add_Vcorr_correction(sArray_t<Array_base_t> &sVcorr_skij, MBState &mb_state);
 
     inline void print_dmft_embed_timers() {
-      app_log(1, "\n  EMBED timers");
-      app_log(1, "  ------------");
-      app_log(1, "    Total:                    {0:.3f} sec", _Timer.elapsed("EMBED_TOTAL"));
-      app_log(1, "    Allocation:               {0:.3f} sec", _Timer.elapsed("EMBED_ALLOC"));
-      app_log(1, "    Upfold:                   {0:.3f} sec", _Timer.elapsed("EMBED_UPFOLD"));
-      app_log(1, "    Find chemical potential:  {0:.3f} sec", _Timer.elapsed("EMBED_FIND_MU"));
-      app_log(1, "    Dyson equation:           {0:.3f} sec", _Timer.elapsed("EMBED_DYSON"));
-      app_log(1, "    Iterative solver:         {0:.3f} sec", _Timer.elapsed("EMBED_ITERATIVE"));
-      app_log(1, "    Read:                     {0:.3f} sec", _Timer.elapsed("EMBED_READ"));
-      app_log(1, "    Write:                    {0:.3f} sec\n", _Timer.elapsed("EMBED_WRITE"));
+      app_log(2, "\n  EMBED timers");
+      app_log(2, "  ------------");
+      app_log(2, "    Total:                    {0:.3f} sec", _Timer.elapsed("EMBED_TOTAL"));
+      app_log(2, "    Allocation:               {0:.3f} sec", _Timer.elapsed("EMBED_ALLOC"));
+      app_log(2, "    Upfold:                   {0:.3f} sec", _Timer.elapsed("EMBED_UPFOLD"));
+      app_log(2, "    Find chemical potential:  {0:.3f} sec", _Timer.elapsed("EMBED_FIND_MU"));
+      app_log(2, "    Dyson equation:           {0:.3f} sec", _Timer.elapsed("EMBED_DYSON"));
+      app_log(2, "    Iterative solver:         {0:.3f} sec", _Timer.elapsed("EMBED_ITERATIVE"));
+      app_log(2, "    Read:                     {0:.3f} sec", _Timer.elapsed("EMBED_READ"));
+      app_log(2, "    Write:                    {0:.3f} sec\n", _Timer.elapsed("EMBED_WRITE"));
     }
 
     inline void print_downfold_mb_timers() {
-      app_log(1, "\n  DOWNFOLD_1E timers");
-      app_log(1, "  ------------------");
-      app_log(1, "    Total:                    {0:.3f} sec", _Timer.elapsed("DF_TOTAL"));
-      app_log(1, "    Allocation:               {0:.3f} sec", _Timer.elapsed("DF_ALLOC"));
-      app_log(1, "    Double counting:          {0:.3f} sec", _Timer.elapsed("DF_DC"));
-      app_log(1, "    Downfold:                 {0:.3f} sec", _Timer.elapsed("DF_DOWNFOLD"));
-      app_log(1, "    Upfold:                   {0:.3f} sec", _Timer.elapsed("DF_UPFOLD"));
-      app_log(1, "    Find chemical potential:  {0:.3f} sec", _Timer.elapsed("DF_FIND_MU"));
-      app_log(1, "    Dyson equation:           {0:.3f} sec", _Timer.elapsed("DF_DYSON"));
-      app_log(1, "    Fermionic Weiss field:    {0:.3f} sec", _Timer.elapsed("DF_G_WEISS"));
-      app_log(1, "    Read:                     {0:.3f} sec", _Timer.elapsed("DF_READ"));
-      app_log(1, "    Write:                    {0:.3f} sec\n", _Timer.elapsed("DF_WRITE"));
+      app_log(2, "\n  DOWNFOLD_1E timers");
+      app_log(2, "  ------------------");
+      app_log(2, "    Total:                    {0:.3f} sec", _Timer.elapsed("DF_TOTAL"));
+      app_log(2, "    Allocation:               {0:.3f} sec", _Timer.elapsed("DF_ALLOC"));
+      app_log(2, "    Double counting:          {0:.3f} sec", _Timer.elapsed("DF_DC"));
+      app_log(2, "    Downfold:                 {0:.3f} sec", _Timer.elapsed("DF_DOWNFOLD"));
+      app_log(2, "    Upfold:                   {0:.3f} sec", _Timer.elapsed("DF_UPFOLD"));
+      app_log(2, "    Find chemical potential:  {0:.3f} sec", _Timer.elapsed("DF_FIND_MU"));
+      app_log(2, "    Dyson equation:           {0:.3f} sec", _Timer.elapsed("DF_DYSON"));
+      app_log(2, "    Fermionic Weiss field:    {0:.3f} sec", _Timer.elapsed("DF_G_WEISS"));
+      app_log(2, "    Read:                     {0:.3f} sec", _Timer.elapsed("DF_READ"));
+      app_log(2, "    Write:                    {0:.3f} sec\n", _Timer.elapsed("DF_WRITE"));
     }
 
     inline void print_downfold_hf_timers() {
-      app_log(1, "\n  DOWNFOLD_1E timers");
-      app_log(1, "  ------------------");
-      app_log(1, "    Total:                    {0:.3f} sec", _Timer.elapsed("DF_TOTAL"));
-      app_log(1, "    Allocation:               {0:.3f} sec", _Timer.elapsed("DF_ALLOC"));
-      app_log(1, "    Double counting:          {0:.3f} sec", _Timer.elapsed("DF_DC"));
-      app_log(1, "    Downfold:                 {0:.3f} sec", _Timer.elapsed("DF_DOWNFOLD"));
-      app_log(1, "    Read:                     {0:.3f} sec", _Timer.elapsed("DF_READ"));
-      app_log(1, "    Write:                    {0:.3f} sec\n", _Timer.elapsed("DF_WRITE"));
+      app_log(2, "\n  DOWNFOLD_1E timers");
+      app_log(2, "  ------------------");
+      app_log(2, "    Total:                    {0:.3f} sec", _Timer.elapsed("DF_TOTAL"));
+      app_log(2, "    Allocation:               {0:.3f} sec", _Timer.elapsed("DF_ALLOC"));
+      app_log(2, "    Double counting:          {0:.3f} sec", _Timer.elapsed("DF_DC"));
+      app_log(2, "    Downfold:                 {0:.3f} sec", _Timer.elapsed("DF_DOWNFOLD"));
+      app_log(2, "    Read:                     {0:.3f} sec", _Timer.elapsed("DF_READ"));
+      app_log(2, "    Write:                    {0:.3f} sec\n", _Timer.elapsed("DF_WRITE"));
     }
 
   private:

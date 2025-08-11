@@ -35,7 +35,7 @@ namespace methods
  * Optional arguments (with default values):
  *  - beta: "1000" Inverse temperature (a.u.)
  *  - lambda: "12000.0" Dimensionless parameter to control the size of IAFT grids. lambda should >= beta*(bandwidth).
- *  - iaft_prec: "high" Precision of IAFT grids. {choices: "high", "mid", "low"}
+ *  - iaft_prec: "high" Precision of IAFT grids. {choices: "high", "medium", "low"}
  *  - div_treatment: "gygi" Divergent treatment for Coulomb kernel. {choices: "ignore_g0", "gygi"}
  *  - hf_div_treatment: "gygi" Divergent treatment for Coulomb kernel in HF. {choices: "ignore_g0", "gygi"}
  *  - niter: "1" Number of iterations in the self-consistent loop.
@@ -534,7 +534,7 @@ downfold_wloc(eri_t &eri, ptree const& pt,
  * Optional arguments used only when outdir/prefix.mbpt.h5 does not exist:
  *  - beta: "1000" Inverse temperature (a.u.)
  *  - lambda: "12000.0" Dimensionless parameter to control the size of IAFT grids. lambda should >= beta*(bandwidth).
- *  - iaft_prec: "high" Precision of IAFT grids. {choices: "high", "mid", "low"}
+ *  - iaft_prec: "high" Precision of IAFT grids. {choices: "high", "medium", "low"}
  */
 template<bool return_vw, typename eri_t>
 std::conditional_t<return_vw, std::tuple<nda::array<ComplexType, 4>, nda::array<ComplexType, 5>>, void>
@@ -775,7 +775,7 @@ downfolding_2e(eri_t &eri, ptree const& pt,
  * Optional arguments used only when outdir/prefix.mbpt.h5 does not exist:
  *  - beta: "1000" Inverse temperature (a.u.)
  *  - lambda: "12000.0" Dimensionless parameter to control the size of IAFT grids. lambda should >= beta*(bandwidth).
- *  - iaft_prec: "high" Precision of IAFT grids. {choices: "high", "mid", "low"}
+ *  - iaft_prec: "high" Precision of IAFT grids. {choices: "high", "medium", "low"}
  */
 template<typename eri_t>
 void hf_downfold(eri_t &eri, ptree const& pt) {

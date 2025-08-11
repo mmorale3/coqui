@@ -172,7 +172,7 @@ namespace methods {
     }
 
     void print_thc_summary() {
-      app_log(1, "  Summary of THC Coulomb Integrals");
+      app_log(1, "\n  Summary of THC Coulomb Integrals");
       app_log(1, "  --------------------------------");
       app_log(1, "  Number of interpolating points = {}", _Np);
       app_log(1, "  X orbital index range          = [{},{})", x_range.first(),x_range.last());
@@ -273,14 +273,14 @@ namespace methods {
 
       _thc_builder_opt.value().print_timers();
       _thc_builder_opt.reset();
-      app_log(1, "  THC-READER::BUILD()");
-      app_log(1, "  -------------------");
-      app_log(1, "    Build total:                     {0:.3f} sec", _Timer.elapsed("BUILD_TOTAL"));
-      app_log(1, "      - compute thc-eri:             {0:.3f} sec", _Timer.elapsed("BUILD_THC"));
-      app_log(1, "      - gather collocation matrices: {0:.3f} sec", _Timer.elapsed("BUILD_GATHER"));
+      app_log(2, "  THC-READER::BUILD()");
+      app_log(2, "  -------------------");
+      app_log(2, "    Build total:                     {0:.3f} sec", _Timer.elapsed("BUILD_TOTAL"));
+      app_log(2, "      - compute thc-eri:             {0:.3f} sec", _Timer.elapsed("BUILD_THC"));
+      app_log(2, "      - gather collocation matrices: {0:.3f} sec", _Timer.elapsed("BUILD_GATHER"));
       if (_Timer.elapsed("BUILD_WRITE") > 0)
-        app_log(1, "      - write eri:                   {0:.3f} sec", _Timer.elapsed("BUILD_WRITE"));
-      app_log(1, " ");
+        app_log(2, "      - write eri:                   {0:.3f} sec", _Timer.elapsed("BUILD_WRITE"));
+      app_log(2, " ");
 
       print_thc_summary();
     }
@@ -422,14 +422,14 @@ namespace methods {
       _Timer.stop("BUILD_TOTAL");
       _thc_builder_opt.value().print_timers();
       _thc_builder_opt.reset();
-      app_log(1, "\n  THC-READER::BUILD_FROM_CD()");
-      app_log(1, "  ---------------------------");
-      app_log(1, "    Build total:                     {0:.3f} sec", _Timer.elapsed("BUILD_TOTAL"));
-      app_log(1, "      - compute thc-eri:             {0:.3f} sec", _Timer.elapsed("BUILD_THC"));
-      app_log(1, "      - gather collocation matrices: {0:.3f} sec", _Timer.elapsed("BUILD_GATHER"));
+      app_log(2, "\n  THC-READER::BUILD_FROM_CD()");
+      app_log(2, "  ---------------------------");
+      app_log(2, "    Build total:                     {0:.3f} sec", _Timer.elapsed("BUILD_TOTAL"));
+      app_log(2, "      - compute thc-eri:             {0:.3f} sec", _Timer.elapsed("BUILD_THC"));
+      app_log(2, "      - gather collocation matrices: {0:.3f} sec", _Timer.elapsed("BUILD_GATHER"));
       if (_Timer.elapsed("BUILD_WRITE") > 0)
-        app_log(1, "      - write eri:                   {0:.3f} sec", _Timer.elapsed("BUILD_WRITE"));
-      app_log(1, " ");
+        app_log(2, "      - write eri:                   {0:.3f} sec", _Timer.elapsed("BUILD_WRITE"));
+      app_log(2, " ");
 
       print_thc_summary();
     }
@@ -492,16 +492,16 @@ namespace methods {
       _Timer.stop("BUILD_TOTAL");
       _thc_builder_opt.value().print_timers();
       _thc_builder_opt.reset();
-      app_log(1, "***************************************************");
-      app_log(1, "                  THC-READER::BUILD_ISDF_ONLY() ");
-      app_log(1, "***************************************************");
-      app_log(1, "    Build total:                     {0:.3f} sec", _Timer.elapsed("BUILD_TOTAL"));
-      app_log(1, "      - compute ISDF:                {0:.3f} sec", _Timer.elapsed("BUILD_ISDF"));
-      app_log(1, "      - gather collocation matrices: {0:.3f} sec", _Timer.elapsed("BUILD_GATHER"));
-      app_log(1, "      - ISDF check:                  {0:.3f} sec", _Timer.elapsed("ISDF_CHECK"));
+      app_log(2, "***************************************************");
+      app_log(2, "                  THC-READER::BUILD_ISDF_ONLY() ");
+      app_log(2, "***************************************************");
+      app_log(2, "    Build total:                     {0:.3f} sec", _Timer.elapsed("BUILD_TOTAL"));
+      app_log(2, "      - compute ISDF:                {0:.3f} sec", _Timer.elapsed("BUILD_ISDF"));
+      app_log(2, "      - gather collocation matrices: {0:.3f} sec", _Timer.elapsed("BUILD_GATHER"));
+      app_log(2, "      - ISDF check:                  {0:.3f} sec", _Timer.elapsed("ISDF_CHECK"));
       if (_Timer.elapsed("BUILD_WRITE") > 0)
-        app_log(1, "      - write ISDF:                  {0:.3f} sec", _Timer.elapsed("BUILD_WRITE"));
-      app_log(1, "***************************************************\n");
+        app_log(2, "      - write ISDF:                  {0:.3f} sec", _Timer.elapsed("BUILD_WRITE"));
+      app_log(2, "***************************************************\n");
     }
 
     void read() {
@@ -821,11 +821,11 @@ namespace methods {
     auto Y_orbital_range() const { return y_range; }
 
     void print_timers() const {
-      app_log(1, "\n  THC-READER timers");
-      app_log(1, "  -----------------");
-      app_log(1, "    BUILD:                {0:.3f} sec", _Timer.elapsed("BUILD_TOTAL"));
-      app_log(1, "    READ_X:               {0:.3f} sec", _Timer.elapsed("READ_X"));
-      app_log(1, "    READ_V:               {0:.3f} sec\n", _Timer.elapsed("READ_V"));
+      app_log(2, "\n  THC-READER timers");
+      app_log(2, "  -----------------");
+      app_log(2, "    BUILD:                {0:.3f} sec", _Timer.elapsed("BUILD_TOTAL"));
+      app_log(2, "    READ_X:               {0:.3f} sec", _Timer.elapsed("READ_X"));
+      app_log(2, "    READ_V:               {0:.3f} sec\n", _Timer.elapsed("READ_V"));
     }
 
   private:

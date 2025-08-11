@@ -179,87 +179,87 @@ namespace methods::solvers {
   }
 
   void gf2_t::print_chol_gf2_timers() {
-    app_log(1, "\n  Chol-GF2 timers");
-    app_log(1, "  ---------------");
-    app_log(1, "    Total:                 {0:.3f} sec", _Timer.elapsed("TOTAL"));
-    app_log(1, "    Total dir diagram:     {0:.3f} sec", _Timer.elapsed("TOTAL_DIR"));
-    app_log(1, "    Total exc diagram:     {0:.3f} sec", _Timer.elapsed("TOTAL_EXC"));
-    app_log(1, "    Allocations:           {0:.3f} sec", _Timer.elapsed("ALLOC"));
-    app_log(1, "    Communication:         {0:.3f} sec", _Timer.elapsed("COMM"));
+    app_log(2, "\n  Chol-GF2 timers");
+    app_log(2, "  ---------------");
+    app_log(2, "    Total:                 {0:.3f} sec", _Timer.elapsed("TOTAL"));
+    app_log(2, "    Total dir diagram:     {0:.3f} sec", _Timer.elapsed("TOTAL_DIR"));
+    app_log(2, "    Total exc diagram:     {0:.3f} sec", _Timer.elapsed("TOTAL_EXC"));
+    app_log(2, "    Allocations:           {0:.3f} sec", _Timer.elapsed("ALLOC"));
+    app_log(2, "    Communication:         {0:.3f} sec", _Timer.elapsed("COMM"));
     if(exchange_type() == "gf2") {
-     app_log(1, "    Evaluate_P0:           {0:.3f} sec", _Timer.elapsed("EVALUATE_P0"));
+     app_log(2, "    Evaluate_P0:           {0:.3f} sec", _Timer.elapsed("EVALUATE_P0"));
     }
-    app_log(1, "    Evaluate_Sigma dir:    {0:.3f} sec", _Timer.elapsed("EVALUATE_SIGMA_DIR"));
-    app_log(1, "    Evaluate_Sigma exc:    {0:.3f} sec", _Timer.elapsed("EVALUATE_SIGMA_EXC"));
-    app_log(1, "    4-index integrals:     {0:.3f} sec", _Timer.elapsed("BUILD_INT"));
-    app_log(1, "    int-G contractions:    {0:.3f} sec", _Timer.elapsed("CONTRACT"));
-    app_log(1, "    Chol-ERI reader:       {0:.3f} sec\n", _Timer.elapsed("ERI_READER"));
+    app_log(2, "    Evaluate_Sigma dir:    {0:.3f} sec", _Timer.elapsed("EVALUATE_SIGMA_DIR"));
+    app_log(2, "    Evaluate_Sigma exc:    {0:.3f} sec", _Timer.elapsed("EVALUATE_SIGMA_EXC"));
+    app_log(2, "    4-index integrals:     {0:.3f} sec", _Timer.elapsed("BUILD_INT"));
+    app_log(2, "    int-G contractions:    {0:.3f} sec", _Timer.elapsed("CONTRACT"));
+    app_log(2, "    Chol-ERI reader:       {0:.3f} sec\n", _Timer.elapsed("ERI_READER"));
   }
 
   void gf2_t::print_thc_gf2_timers(){
-    app_log(1, "\n  THC-GF2 timers");
-    app_log(1, "  --------------");
-    app_log(1, "    Total:                      {0:.3f} sec", _Timer.elapsed("TOTAL"));
-    app_log(1, "    Total direct term:          {0:.3f} sec", _Timer.elapsed("TOTAL_DIR"));
-    app_log(1, "    Evaluate Pi (R):            {0:.3f} sec", _Timer.elapsed("EVALUATE_PI"));
-    app_log(1, "    Evaluate Pi U Pi:           {0:.3f} sec", _Timer.elapsed("EVALUATE_PIUPI"));
-    app_log(1, "    Evaluate Sigma direct:      {0:.3f} sec", _Timer.elapsed("EVALUATE_SIGMA_DIR"));
-    app_log(1, "    Total exchange term:        {0:.3f} sec", _Timer.elapsed("TOTAL_EXC"));
+    app_log(2, "\n  THC-GF2 timers");
+    app_log(2, "  --------------");
+    app_log(2, "    Total:                      {0:.3f} sec", _Timer.elapsed("TOTAL"));
+    app_log(2, "    Total direct term:          {0:.3f} sec", _Timer.elapsed("TOTAL_DIR"));
+    app_log(2, "    Evaluate Pi (R):            {0:.3f} sec", _Timer.elapsed("EVALUATE_PI"));
+    app_log(2, "    Evaluate Pi U Pi:           {0:.3f} sec", _Timer.elapsed("EVALUATE_PIUPI"));
+    app_log(2, "    Evaluate Sigma direct:      {0:.3f} sec", _Timer.elapsed("EVALUATE_SIGMA_DIR"));
+    app_log(2, "    Total exchange term:        {0:.3f} sec", _Timer.elapsed("TOTAL_EXC"));
     if(exchange_alg() != "none") {
-    app_log(1, "    Build U_Pqs:                {0:.3f} sec", _Timer.elapsed("BUILD_UPqs"));
-    app_log(1, "    Build U_Pqs: make distr XX  {0:.3f} sec", _Timer.elapsed("MAKE_DISTR_ARRAY_XX"));
-    app_log(1, "    Build U_Pqs: make distr U   {0:.3f} sec", _Timer.elapsed("MAKE_DISTR_ARRAY_U"));
-    app_log(1, "    Build B:                    {0:.3f} sec", _Timer.elapsed("BUILD_B"));
-    app_log(1, "    Build B: for loop           {0:.3f} sec", _Timer.elapsed("B_LOOP"));
-    app_log(1, "    Build B: X                  {0:.3f} sec", _Timer.elapsed("B_X"));
-    app_log(1, "    Build B: Z                  {0:.3f} sec", _Timer.elapsed("B_Z"));
-    app_log(1, "    Build B: XX                 {0:.3f} sec", _Timer.elapsed("B_XX_BUILD"));
-    app_log(1, "    Build B multiply:           {0:.3f} sec", _Timer.elapsed("MULTIPLY_B"));
-    app_log(1, "    Build B before redistr:     {0:.3f} sec", _Timer.elapsed("BUILD_B_BEFORE_RED"));
-    app_log(1, "    Build B redistr:            {0:.3f} sec", _Timer.elapsed("BUILD_B_RED"));
-    app_log(1, "    Build B init                {0:.3f} sec", _Timer.elapsed("BUILD_B_INIT"));
-    app_log(1, "    Build B make distr ar1      {0:.3f} sec", _Timer.elapsed("MAKE_DISTR_ARRAY1"));
-    app_log(1, "    Build B make distr ar2      {0:.3f} sec", _Timer.elapsed("MAKE_DISTR_ARRAY2"));
-    app_log(1, "    G transform:                {0:.3f} sec", _Timer.elapsed("G_TRANSFORM"));
-    app_log(1, "    Build C:                    {0:.3f} sec", _Timer.elapsed("BUILD_C"));
-    app_log(1, "    Build C multiply:           {0:.3f} sec", _Timer.elapsed("MULTIPLY_C"));
-    app_log(1, "    Build D:                    {0:.3f} sec", _Timer.elapsed("BUILD_D"));
-    app_log(1, "    Build D outer loop:         {0:.3f} sec", _Timer.elapsed("BUILD_D_OUTLOOP"));
-    app_log(1, "    Build D bcast:              {0:.3f} sec", _Timer.elapsed("BUILD_D_BCAST"));
-    app_log(1, "    Build D loop:               {0:.3f} sec", _Timer.elapsed("BUILD_D_LOOP"));
-    app_log(1, "    Build D buf :               {0:.3f} sec", _Timer.elapsed("BUILD_D_BUF"));
-    app_log(1, "    Build D zero :              {0:.3f} sec", _Timer.elapsed("BUILD_D_ZERO"));
-    app_log(1, "    Build D PR   :              {0:.3f} sec", _Timer.elapsed("BUILD_D_PR"));
-    app_log(1, "    Build D PR GR  :            {0:.3f} sec", _Timer.elapsed("BUILD_D_PR_GR"));
-    app_log(1, "    Build D PR RED  :           {0:.3f} sec", _Timer.elapsed("BUILD_D_PR_RED"));
-    app_log(1, "    D reduce:                   {0:.3f} sec", _Timer.elapsed("D_REDUCE"));
-    app_log(1, "    Norm evaluation:            {0:.3f} sec", _Timer.elapsed("NORMS"));
-    app_log(1, "    Evaluate Sigma exc:         {0:.3f} sec", _Timer.elapsed("EVALUATE_SIGMA_EXC"));
-    app_log(1, "    Evaluate Sigma exc non-p:   {0:.3f} sec\n", _Timer.elapsed("EVALUATE_SIGMA_EXC_NP"));
+    app_log(2, "    Build U_Pqs:                {0:.3f} sec", _Timer.elapsed("BUILD_UPqs"));
+    app_log(2, "    Build U_Pqs: make distr XX  {0:.3f} sec", _Timer.elapsed("MAKE_DISTR_ARRAY_XX"));
+    app_log(2, "    Build U_Pqs: make distr U   {0:.3f} sec", _Timer.elapsed("MAKE_DISTR_ARRAY_U"));
+    app_log(2, "    Build B:                    {0:.3f} sec", _Timer.elapsed("BUILD_B"));
+    app_log(2, "    Build B: for loop           {0:.3f} sec", _Timer.elapsed("B_LOOP"));
+    app_log(2, "    Build B: X                  {0:.3f} sec", _Timer.elapsed("B_X"));
+    app_log(2, "    Build B: Z                  {0:.3f} sec", _Timer.elapsed("B_Z"));
+    app_log(2, "    Build B: XX                 {0:.3f} sec", _Timer.elapsed("B_XX_BUILD"));
+    app_log(2, "    Build B multiply:           {0:.3f} sec", _Timer.elapsed("MULTIPLY_B"));
+    app_log(2, "    Build B before redistr:     {0:.3f} sec", _Timer.elapsed("BUILD_B_BEFORE_RED"));
+    app_log(2, "    Build B redistr:            {0:.3f} sec", _Timer.elapsed("BUILD_B_RED"));
+    app_log(2, "    Build B init                {0:.3f} sec", _Timer.elapsed("BUILD_B_INIT"));
+    app_log(2, "    Build B make distr ar1      {0:.3f} sec", _Timer.elapsed("MAKE_DISTR_ARRAY1"));
+    app_log(2, "    Build B make distr ar2      {0:.3f} sec", _Timer.elapsed("MAKE_DISTR_ARRAY2"));
+    app_log(2, "    G transform:                {0:.3f} sec", _Timer.elapsed("G_TRANSFORM"));
+    app_log(2, "    Build C:                    {0:.3f} sec", _Timer.elapsed("BUILD_C"));
+    app_log(2, "    Build C multiply:           {0:.3f} sec", _Timer.elapsed("MULTIPLY_C"));
+    app_log(2, "    Build D:                    {0:.3f} sec", _Timer.elapsed("BUILD_D"));
+    app_log(2, "    Build D outer loop:         {0:.3f} sec", _Timer.elapsed("BUILD_D_OUTLOOP"));
+    app_log(2, "    Build D bcast:              {0:.3f} sec", _Timer.elapsed("BUILD_D_BCAST"));
+    app_log(2, "    Build D loop:               {0:.3f} sec", _Timer.elapsed("BUILD_D_LOOP"));
+    app_log(2, "    Build D buf :               {0:.3f} sec", _Timer.elapsed("BUILD_D_BUF"));
+    app_log(2, "    Build D zero :              {0:.3f} sec", _Timer.elapsed("BUILD_D_ZERO"));
+    app_log(2, "    Build D PR   :              {0:.3f} sec", _Timer.elapsed("BUILD_D_PR"));
+    app_log(2, "    Build D PR GR  :            {0:.3f} sec", _Timer.elapsed("BUILD_D_PR_GR"));
+    app_log(2, "    Build D PR RED  :           {0:.3f} sec", _Timer.elapsed("BUILD_D_PR_RED"));
+    app_log(2, "    D reduce:                   {0:.3f} sec", _Timer.elapsed("D_REDUCE"));
+    app_log(2, "    Norm evaluation:            {0:.3f} sec", _Timer.elapsed("NORMS"));
+    app_log(2, "    Evaluate Sigma exc:         {0:.3f} sec", _Timer.elapsed("EVALUATE_SIGMA_EXC"));
+    app_log(2, "    Evaluate Sigma exc non-p:   {0:.3f} sec\n", _Timer.elapsed("EVALUATE_SIGMA_EXC_NP"));
     }
   }
 
   void gf2_t::print_thc_sosex_timers(){
     if(exchange_type() == "dynamic_sosex" || exchange_type() == "dynamic_2sosex" ) {
-    app_log(1, "\n  THC-SOSEX timers");
-    app_log(1, "  --------------");
-    app_log(1, "    Total SOSEX:              {0:.3f} sec", _Timer.elapsed("TOTAL_SOSEX"));
-    app_log(1, "    Distributed allocations:  {0:.3f} sec", _Timer.elapsed("ALLOC_SOSEX"));
-    app_log(1, "    Redistributions:          {0:.3f} sec", _Timer.elapsed("REDISTRIBUTE_SOSEX"));
-    app_log(1, "    G_ij -> G_Qj,G_iQ:        {0:.3f} sec", _Timer.elapsed("G_TRANSFORM_SOSEX"));
-    app_log(1, "    outer(G,G):               {0:.3f} sec", _Timer.elapsed("BUILD_GG_SOSEX"));
-    app_log(1, "    FT t->w:                  {0:.3f} sec", _Timer.elapsed("IMAG_FT_TtoW"));
-    app_log(1, "    FT w->t:                  {0:.3f} sec", _Timer.elapsed("IMAG_FT_WtoT"));
-    app_log(1, "    FT REDISTRIBUTE:          {0:.3f} sec", _Timer.elapsed("FT_REDISTRIBUTE"));
-    app_log(1, "    W * GG:                   {0:.3f} sec", _Timer.elapsed("BUILD_WGG_SOSEX"));
-    app_log(1, "    W retrieval:              {0:.3f} sec", _Timer.elapsed("W_RETRIEVAL_SOSEX"));
-    app_log(1, "    W multiplication:         {0:.3f} sec", _Timer.elapsed("W_MULT_SOSEX"));
-    app_log(1, "    B_WA:                     {0:.3f} sec", _Timer.elapsed("B_WA_SOSEX"));
-    app_log(1, "    C build/access:           {0:.3f} sec", _Timer.elapsed("GET_C_SOSEX"));
-    app_log(1, "    C gemm        :           {0:.3f} sec", _Timer.elapsed("C_GEMM_SOSEX"));
-    app_log(1, "    BC REDISTRIBUTE:          {0:.3f} sec", _Timer.elapsed("REDISTRIBUTE_BC"));
-    app_log(1, "    Build D:                  {0:.3f} sec", _Timer.elapsed("BUILD_D_SOSEX"));
-    app_log(1, "    Sigma:                    {0:.3f} sec\n", _Timer.elapsed("EVALUATE_SIGMA_SOSEX"));
+    app_log(2, "\n  THC-SOSEX timers");
+    app_log(2, "  --------------");
+    app_log(2, "    Total SOSEX:              {0:.3f} sec", _Timer.elapsed("TOTAL_SOSEX"));
+    app_log(2, "    Distributed allocations:  {0:.3f} sec", _Timer.elapsed("ALLOC_SOSEX"));
+    app_log(2, "    Redistributions:          {0:.3f} sec", _Timer.elapsed("REDISTRIBUTE_SOSEX"));
+    app_log(2, "    G_ij -> G_Qj,G_iQ:        {0:.3f} sec", _Timer.elapsed("G_TRANSFORM_SOSEX"));
+    app_log(2, "    outer(G,G):               {0:.3f} sec", _Timer.elapsed("BUILD_GG_SOSEX"));
+    app_log(2, "    FT t->w:                  {0:.3f} sec", _Timer.elapsed("IMAG_FT_TtoW"));
+    app_log(2, "    FT w->t:                  {0:.3f} sec", _Timer.elapsed("IMAG_FT_WtoT"));
+    app_log(2, "    FT REDISTRIBUTE:          {0:.3f} sec", _Timer.elapsed("FT_REDISTRIBUTE"));
+    app_log(2, "    W * GG:                   {0:.3f} sec", _Timer.elapsed("BUILD_WGG_SOSEX"));
+    app_log(2, "    W retrieval:              {0:.3f} sec", _Timer.elapsed("W_RETRIEVAL_SOSEX"));
+    app_log(2, "    W multiplication:         {0:.3f} sec", _Timer.elapsed("W_MULT_SOSEX"));
+    app_log(2, "    B_WA:                     {0:.3f} sec", _Timer.elapsed("B_WA_SOSEX"));
+    app_log(2, "    C build/access:           {0:.3f} sec", _Timer.elapsed("GET_C_SOSEX"));
+    app_log(2, "    C gemm        :           {0:.3f} sec", _Timer.elapsed("C_GEMM_SOSEX"));
+    app_log(2, "    BC REDISTRIBUTE:          {0:.3f} sec", _Timer.elapsed("REDISTRIBUTE_BC"));
+    app_log(2, "    Build D:                  {0:.3f} sec", _Timer.elapsed("BUILD_D_SOSEX"));
+    app_log(2, "    Sigma:                    {0:.3f} sec\n", _Timer.elapsed("EVALUATE_SIGMA_SOSEX"));
     }
   }
 

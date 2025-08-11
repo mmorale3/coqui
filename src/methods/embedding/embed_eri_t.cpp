@@ -194,9 +194,9 @@ namespace methods {
                "║  ║ ║║═╬╗║ ║║   │ ││││ │───├┤    │││ │││││││├┤ │ ││   ││\n"
                "╚═╝╚═╝╚═╝╚╚═╝╩   ┴ └┴┘└─┘   └─┘  ─┴┘└─┘└┴┘┘└┘└  └─┘┴─┘─┴┘\n");
     app_log(1, "  - CoQui checkpoint file:                     {}", filename);
-    app_log(2, "  - Input Green's function: ");
-    app_log(2, "      HDF5 group:                              {}", g_grp);
-    app_log(2, "      Iteration:                               {}", g_iter);
+    app_log(1, "  - Input Green's function: ");
+    app_log(1, "      HDF5 group:                              {}", g_grp);
+    app_log(1, "      Iteration:                               {}", g_iter);
     if (proj_boson.C_file() != "") {
       app_log(1, "  - Transformation matrices:                   {}", proj_boson.C_file());
     }
@@ -326,11 +326,11 @@ namespace methods {
                "╚═╝╚═╝╚═╝╚╚═╝╩   ┴ └┴┘└─┘   └─┘  ─┴┘└─┘└┴┘┘└┘└  └─┘┴─┘─┴┘\n");
     app_log(1, "  - coqui checkpoint file:                     {}", filename);
     if (g_grp == "" or g_iter == -1)
-      app_log(2, "  - use default logic to determine the input G^k_ij(tau)");
+      app_log(1, "  - use default logic to determine the input G^k_ij(tau)");
     else {
-      app_log(2, "  - Input Green's function: ");
-      app_log(2, "      HDF5 group:                              {}", g_grp);
-      app_log(2, "      iteration:                               {}", g_iter);
+      app_log(1, "  - Input Green's function: ");
+      app_log(1, "      HDF5 group:                              {}", g_grp);
+      app_log(1, "      iteration:                               {}", g_iter);
     }
     app_log(1, "  - transformation matrices:                   {}", proj_boson.C_file());
     app_log(1, "  - number of impurities:                      {}", proj_boson.nImps());
@@ -398,11 +398,11 @@ namespace methods {
     if (screen_type != "bare") {
       app_log(1, "  - type of the bosonic weiss field u(iw):     {}", screen_type);
       if (g_grp == "" or g_iter == -1)
-        app_log(2, "  - use default logic to determine the input G^k_ij(tau)");
+        app_log(1, "  - use default logic to determine the input G^k_ij(tau)");
       else {
-        app_log(2, "  - Input Green's function: ");
-        app_log(2, "      HDF5 group:                              {}", g_grp);
-        app_log(2, "      iteration:                               {}", g_iter);
+        app_log(1, "  - Input Green's function: ");
+        app_log(1, "      HDF5 group:                              {}", g_grp);
+        app_log(1, "      iteration:                               {}", g_iter);
       }
     }
     app_log(1, "  - factorization type:                        {}", factorization_type);

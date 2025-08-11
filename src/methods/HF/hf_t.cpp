@@ -47,10 +47,10 @@ namespace methods {
                          double madelung) {
 
       if (_div_treatment == ignore_g0) {
-        app_log(1, "No finite-size correction to the non-local HF exchangge potential.");
+        app_log(1, "No finite-size correction to the non-local HF exchange potential.\n");
         return;
       }
-      app_log(1, "  Treatment of long-wavelength divergence in the non-local HF exchange potential : {}",
+      app_log(1, "  Treatment of long-wavelength divergence in the non-local HF exchange potential : {}\n",
               div_enum_to_string(_div_treatment));
 
       decltype(nda::range::all) all;
@@ -85,23 +85,23 @@ namespace methods {
     }
 
     void hf_t::print_thc_hf_timers() {
-      app_log(1, "\n  THC-HF timers");
-      app_log(1, "  -------------");
-      app_log(1, "    Total:                 {0:.3f} sec", _Timer.elapsed("TOTAL"));
-      app_log(1, "    Allocations:           {0:.3f} sec", _Timer.elapsed("ALLOC"));
-      app_log(1, "    Primary_to_aux:        {0:.3f} sec", _Timer.elapsed("PRIM_TO_AUX"));
-      app_log(1, "    Coulomb:               {0:.3f} sec", _Timer.elapsed("COULOMB"));
-      app_log(1, "    Exchange:              {0:.3f} sec", _Timer.elapsed("EXCHANGE"));
-      app_log(1, "    Aux_to_primary:        {0:.3f} sec\n", _Timer.elapsed("AUX_TO_PRIM"));
+      app_log(2, "\n  THC-HF timers");
+      app_log(2, "  -------------");
+      app_log(2, "    Total:                 {0:.3f} sec", _Timer.elapsed("TOTAL"));
+      app_log(2, "    Allocations:           {0:.3f} sec", _Timer.elapsed("ALLOC"));
+      app_log(2, "    Primary_to_aux:        {0:.3f} sec", _Timer.elapsed("PRIM_TO_AUX"));
+      app_log(2, "    Coulomb:               {0:.3f} sec", _Timer.elapsed("COULOMB"));
+      app_log(2, "    Exchange:              {0:.3f} sec", _Timer.elapsed("EXCHANGE"));
+      app_log(2, "    Aux_to_primary:        {0:.3f} sec\n", _Timer.elapsed("AUX_TO_PRIM"));
     }
 
     void hf_t::print_chol_hf_timers() {
-      app_log(1, "\n  CHOL-HF timers");
-      app_log(1, "  --------------");
-      app_log(1, "    Total:                 {0:.3f} sec", _Timer.elapsed("TOTAL"));
-      app_log(1, "    Allocations:           {0:.3f} sec", _Timer.elapsed("ALLOC"));
-      app_log(1, "    Coulomb:               {0:.3f} sec", _Timer.elapsed("COULOMB"));
-      app_log(1, "    Exchange:              {0:.3f} sec\n", _Timer.elapsed("EXCHANGE"));
+      app_log(2, "\n  CHOL-HF timers");
+      app_log(2, "  --------------");
+      app_log(2, "    Total:                 {0:.3f} sec", _Timer.elapsed("TOTAL"));
+      app_log(2, "    Allocations:           {0:.3f} sec", _Timer.elapsed("ALLOC"));
+      app_log(2, "    Coulomb:               {0:.3f} sec", _Timer.elapsed("COULOMB"));
+      app_log(2, "    Exchange:              {0:.3f} sec\n", _Timer.elapsed("EXCHANGE"));
     }
 
     // instantiate templates

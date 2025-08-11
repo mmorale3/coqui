@@ -226,21 +226,21 @@ void cholesky::write_meta_data(h5::group& gh5, std::string format)
 
 void cholesky::print_timers()
 {
-  app_log(1,"\n***************************************************");
-  app_log(1,"                  Cholesky timers ");
-  app_log(1,"***************************************************");
-  app_log(1,"    Total:                 {}",Timer.elapsed("TOTAL"));
-  app_log(1,"    FFT_PLAN:              {}",Timer.elapsed("FFTPLAN"));
-  app_log(1,"    Allocations:           {}",Timer.elapsed("ALLOC"));
-  app_log(1,"    Communication:         {}",Timer.elapsed("COMM"));
-  app_log(1,"    Orb. Pairs:            {}",Timer.elapsed("Pab"));
-  app_log(1,"      IO:                  {}",Timer.elapsed("IO"));
-  app_log(1,"      FFT:                 {}",Timer.elapsed("FFT"));
-  app_log(1,"    Residual:              {}",Timer.elapsed("DIAG"));
-  app_log(1,"    Iterations:            {}",Timer.elapsed("ITER"));
-  app_log(1,"      ERI:                 {}",Timer.elapsed("ERI"));
-  app_log(1,"      Serial (@root):      {}",Timer.elapsed("SERIAL"));
-  app_log(1,"***************************************************\n");
+  app_log(2,"\n***************************************************");
+  app_log(2,"                  Cholesky timers ");
+  app_log(2,"***************************************************");
+  app_log(2,"    Total:                 {}",Timer.elapsed("TOTAL"));
+  app_log(2,"    FFT_PLAN:              {}",Timer.elapsed("FFTPLAN"));
+  app_log(2,"    Allocations:           {}",Timer.elapsed("ALLOC"));
+  app_log(2,"    Communication:         {}",Timer.elapsed("COMM"));
+  app_log(2,"    Orb. Pairs:            {}",Timer.elapsed("Pab"));
+  app_log(2,"      IO:                  {}",Timer.elapsed("IO"));
+  app_log(2,"      FFT:                 {}",Timer.elapsed("FFT"));
+  app_log(2,"    Residual:              {}",Timer.elapsed("DIAG"));
+  app_log(2,"    Iterations:            {}",Timer.elapsed("ITER"));
+  app_log(2,"      ERI:                 {}",Timer.elapsed("ERI"));
+  app_log(2,"      Serial (@root):      {}",Timer.elapsed("SERIAL"));
+  app_log(2,"***************************************************\n");
 }
 
 }

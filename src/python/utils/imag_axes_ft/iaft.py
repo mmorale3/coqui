@@ -11,7 +11,7 @@ def set_precision(precision):
     if isinstance(precision, str):
         if precision == "high":
             return 1e-15
-        elif precision == "med":
+        elif precision == "medium":
             return 1e-10
         elif precision == "low":
             return 1e-6

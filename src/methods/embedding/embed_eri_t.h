@@ -279,13 +279,13 @@ namespace methods {
     void downfold_2e_logic(std::string g_grp, long g_iter, long gw_iter, long embed_iter);
 
     inline void print_downfold_timers() {
-      app_log(1, "\n  DOWNFOLD_2E timers");
-      app_log(1, "  ------------------");
-      app_log(1, "    Total:                    {0:.3f} sec", _Timer.elapsed("DF_TOTAL"));
-      app_log(1, "    Downfold:                 {0:.3f} sec", _Timer.elapsed("DF_DOWNFOLD"));
-      app_log(1, "    Symmetrization:           {0:.3f} sec", _Timer.elapsed("DF_SYMM"));
-      app_log(1, "    Read:                     {0:.3f} sec", _Timer.elapsed("DF_READ"));
-      app_log(1, "    Write:                    {0:.3f} sec\n", _Timer.elapsed("DF_WRITE"));
+      app_log(2, "\n  DOWNFOLD_2E timers");
+      app_log(2, "  ------------------");
+      app_log(2, "    Total:                    {0:.3f} sec", _Timer.elapsed("DF_TOTAL"));
+      app_log(2, "    Downfold:                 {0:.3f} sec", _Timer.elapsed("DF_DOWNFOLD"));
+      app_log(2, "    Symmetrization:           {0:.3f} sec", _Timer.elapsed("DF_SYMM"));
+      app_log(2, "    Read:                     {0:.3f} sec", _Timer.elapsed("DF_READ"));
+      app_log(2, "    Write:                    {0:.3f} sec\n", _Timer.elapsed("DF_WRITE"));
     }
 
   private:

@@ -19,7 +19,7 @@ def tau_to_w(Ot, beta, lamb, prec='high', stats='f', debug=False):
     home_dir = os.path.dirname(os.path.abspath(__file__))
     if prec == "high":
         filename = home_dir + "/" + lamb + ".1e-15.h5"
-    elif prec == "mid":
+    elif prec == "medium":
         filename = home_dir + "/" + lamb + ".1e-10.h5"
     else:
         filename = home_dir + "/" + lamb + ".1e-6.h5"
@@ -56,7 +56,7 @@ def w_to_tau(Ow, beta, lamb, prec='high', stats='f', debug=False):
     home_dir = os.path.dirname(os.path.abspath(__file__))
     if prec == "high":
         filename = home_dir + "/" + lamb + ".1e-15.h5"
-    elif prec == "mid":
+    elif prec == "medium":
         filename = home_dir + "/" + lamb + ".1e-10.h5"
     else:
         filename = home_dir + "/" + lamb + ".1e-6.h5"
@@ -85,7 +85,7 @@ def check_leakage(Ot, dataset, beta, lamb, prec="high", stats='f', debug=False):
     home_dir = os.path.dirname(os.path.abspath(__file__))
     if prec == "high":
         filename = home_dir + "/" + lamb + ".1e-15.h5"
-    elif prec == "mid":
+    elif prec == "medium":
         filename = home_dir + "/" + lamb + ".1e-10.h5"
     else:
         filename = home_dir + "/" + lamb + ".1e-6.h5"
@@ -119,7 +119,7 @@ class iaft(object):
         home_dir = os.path.dirname(os.path.abspath(__file__))
         if prec == "high":
             self.filename = home_dir + "/" + lamb + ".1e-15.h5"
-        elif prec == "mid":
+        elif prec == "medium":
             self.filename = home_dir + "/" + lamb + ".1e-10.h5"
         else:
             self.filename = home_dir + "/" + lamb + ".1e-6.h5"

@@ -81,14 +81,14 @@ double rpa_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_
   Timer.stop("WRITE");
   Timer.stop("RPA_TOTAL");
 
-  app_log(1, "\n***************************************************");
-  app_log(1, "                 RPA timers ");
-  app_log(1, "***************************************************");
-  app_log(1, "    Total:                {0:.3f} sec", Timer.elapsed("RPA_TOTAL"));
-  app_log(1, "    Dyson:                {0:.3f} sec", Timer.elapsed("DYSON"));
-  app_log(1, "    RPA solvers:          {0:.3f} sec", Timer.elapsed("MBPT_SOLVERS"));
-  app_log(1, "    Write:                {0:.3f} sec", Timer.elapsed("WRITE"));
-  app_log(1, "***************************************************\n");
+  app_log(2, "\n***************************************************");
+  app_log(2, "                 RPA timers ");
+  app_log(2, "***************************************************");
+  app_log(2, "    Total:                {0:.3f} sec", Timer.elapsed("RPA_TOTAL"));
+  app_log(2, "    Dyson:                {0:.3f} sec", Timer.elapsed("DYSON"));
+  app_log(2, "    RPA solvers:          {0:.3f} sec", Timer.elapsed("MBPT_SOLVERS"));
+  app_log(2, "    Write:                {0:.3f} sec", Timer.elapsed("WRITE"));
+  app_log(2, "***************************************************\n");
 
   app_log(1, "####### RPA energy routines end #######\n");
   return e_rpa;

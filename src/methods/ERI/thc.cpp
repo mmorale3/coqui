@@ -402,34 +402,34 @@ void thc::save(h5::group& gh5, std::string format, memory::array<MEM,long,1> con
 
 void thc::print_timers()
 {
-  app_log(1,"\n");
-  app_log(1,"  THC timers for the Cholesky algorithm");
-  app_log(1,"  -------------------------------------");
-  app_log(1,"  Total:                   {}",Timer.elapsed("TOTAL"));
-  app_log(1,"    IO (save):             {}",Timer.elapsed("IO_SAVE"));
-  app_log(1,"    IO (orbs):             {}",Timer.elapsed("IO_ORBS"));
-  app_log(1,"    allocations:           {}",Timer.elapsed("ALLOC"));
-  app_log(1,"    communications:        {}",Timer.elapsed("COMM")+Timer.elapsed("ip_COMM"));
-  app_log(1,"    fft:                   {}",Timer.elapsed("FFT"));
-  app_log(1,"      - fft (planning):    {}",Timer.elapsed("FFTPLAN"));
-  app_log(1,"    int. points:           {}",Timer.elapsed("IntPts"));
-  app_log(1,"      -orbs IO+FFT:        {}",Timer.elapsed("DistOrbs"));
-  app_log(1,"      -serial:             {}",Timer.elapsed("SERIAL")+Timer.elapsed("ip_SERIAL"));
-  app_log(1,"      -iters:              {}",Timer.elapsed("IpIter"));
-  app_log(1,"        -setup_comm:       {}",Timer.elapsed("ip_setup_comm"));
-  app_log(1,"        -comm:             {}",Timer.elapsed("ip_COMM"));
-  app_log(1,"        -chol:             {}",Timer.elapsed("ip_chol"));
-  app_log(1,"        -residual:         {}",Timer.elapsed("ip_update_res"));
-  app_log(1,"    int. vectors:          {}",Timer.elapsed("IntVecs"));
-  app_log(1,"      - gemm:              {}",Timer.elapsed("GEMM"));
-  app_log(1,"      - shmX:              {}",Timer.elapsed("shmX"));
-  app_log(1,"      - Tur:               {}",Timer.elapsed("TUR"));
-  app_log(1,"      - Zur:               {}",Timer.elapsed("ZUR"));
-  app_log(1,"      - extra:             {}",Timer.elapsed("EXTRA"));
-  app_log(1,"      - ls solve:          {}",Timer.elapsed("LSSolve"));
-  app_log(1,"    coulomb matrix:        {}",Timer.elapsed("VCoul"));
+  app_log(2,"\n");
+  app_log(2,"  THC timers for the Cholesky algorithm");
+  app_log(2,"  -------------------------------------");
+  app_log(2,"  Total:                   {}",Timer.elapsed("TOTAL"));
+  app_log(2,"    IO (save):             {}",Timer.elapsed("IO_SAVE"));
+  app_log(2,"    IO (orbs):             {}",Timer.elapsed("IO_ORBS"));
+  app_log(2,"    allocations:           {}",Timer.elapsed("ALLOC"));
+  app_log(2,"    communications:        {}",Timer.elapsed("COMM")+Timer.elapsed("ip_COMM"));
+  app_log(2,"    fft:                   {}",Timer.elapsed("FFT"));
+  app_log(2,"      - fft (planning):    {}",Timer.elapsed("FFTPLAN"));
+  app_log(2,"    int. points:           {}",Timer.elapsed("IntPts"));
+  app_log(2,"      -orbs IO+FFT:        {}",Timer.elapsed("DistOrbs"));
+  app_log(2,"      -serial:             {}",Timer.elapsed("SERIAL")+Timer.elapsed("ip_SERIAL"));
+  app_log(2,"      -iters:              {}",Timer.elapsed("IpIter"));
+  app_log(2,"        -setup_comm:       {}",Timer.elapsed("ip_setup_comm"));
+  app_log(2,"        -comm:             {}",Timer.elapsed("ip_COMM"));
+  app_log(2,"        -chol:             {}",Timer.elapsed("ip_chol"));
+  app_log(2,"        -residual:         {}",Timer.elapsed("ip_update_res"));
+  app_log(2,"    int. vectors:          {}",Timer.elapsed("IntVecs"));
+  app_log(2,"      - gemm:              {}",Timer.elapsed("GEMM"));
+  app_log(2,"      - shmX:              {}",Timer.elapsed("shmX"));
+  app_log(2,"      - Tur:               {}",Timer.elapsed("TUR"));
+  app_log(2,"      - Zur:               {}",Timer.elapsed("ZUR"));
+  app_log(2,"      - extra:             {}",Timer.elapsed("EXTRA"));
+  app_log(2,"      - ls solve:          {}",Timer.elapsed("LSSolve"));
+  app_log(2,"    coulomb matrix:        {}",Timer.elapsed("VCoul"));
   utils::memory_report(2);
-  app_log(1,"\n");
+  app_log(2,"\n");
 }
 
 void thc::set_range(nda::range& a_range) 

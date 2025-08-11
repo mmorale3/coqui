@@ -108,13 +108,13 @@ public:
   void compute_eigenspectra(double mu, const X_t&_sF_skij, const Xt_t &_G_shm, const Xt_t &_Sigma_shm, nda::array<ComplexType, 4> &spectra);
 
   inline void print_timers() {
-    app_log(1, "\n  DYSON timers");
-    app_log(1, "  ------------");
-    app_log(1, "    Dyson eqn:                      {0:.3f} sec", _Timer.elapsed("DYSON"));
-    app_log(1, "      - Sigma(t)->Sigma(w):         {0:.3f} sec", _Timer.elapsed("SIGMA_TAU_TO_W"));
-    app_log(1, "      - Dyson loop:                 {0:.3f} sec", _Timer.elapsed("DYSON_LOOP"));
-    app_log(1, "      - Redistribute                {0:.3f} sec", _Timer.elapsed("REDISTRIBUTE"));
-    app_log(1, "      - Gather:                     {0:.3f} sec\n", _Timer.elapsed("DYSON_GATHER"));
+    app_log(2, "\n  DYSON timers");
+    app_log(2, "  ------------");
+    app_log(2, "    Dyson eqn:                      {0:.3f} sec", _Timer.elapsed("DYSON"));
+    app_log(2, "      - Sigma(t)->Sigma(w):         {0:.3f} sec", _Timer.elapsed("SIGMA_TAU_TO_W"));
+    app_log(2, "      - Dyson loop:                 {0:.3f} sec", _Timer.elapsed("DYSON_LOOP"));
+    app_log(2, "      - Redistribute                {0:.3f} sec", _Timer.elapsed("REDISTRIBUTE"));
+    app_log(2, "      - Gather:                     {0:.3f} sec\n", _Timer.elapsed("DYSON_GATHER"));
   }
 
 private:

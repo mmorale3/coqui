@@ -173,13 +173,13 @@ auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_ax
   } while(it<init_it+niter+1 and (std::abs(F_conv) > std::abs(conv_tol) or std::abs(Sigma_conv) > std::abs(conv_tol)));
   Timer.stop("SCF_TOTAL");
 
-  app_log(1, "\n  Dyson-SCF timers");
-  app_log(1, "  ----------------");
-  app_log(1, "    Total:                {0:.3f} sec", Timer.elapsed("SCF_TOTAL"));
-  app_log(1, "    Dyson:                {0:.3f} sec", Timer.elapsed("DYSON"));
-  app_log(1, "    MBPT solvers:         {0:.3f} sec", Timer.elapsed("MBPT_SOLVERS"));
-  app_log(1, "    Iterative alg:        {0:.3f} sec", Timer.elapsed("ITERATIVE"));
-  app_log(1, "    Write:                {0:.3f} sec\n", Timer.elapsed("WRITE"));
+  app_log(2, "\n  Dyson-SCF timers");
+  app_log(2, "  ----------------");
+  app_log(2, "    Total:                {0:.3f} sec", Timer.elapsed("SCF_TOTAL"));
+  app_log(2, "    Dyson:                {0:.3f} sec", Timer.elapsed("DYSON"));
+  app_log(2, "    MBPT solvers:         {0:.3f} sec", Timer.elapsed("MBPT_SOLVERS"));
+  app_log(2, "    Iterative alg:        {0:.3f} sec", Timer.elapsed("ITERATIVE"));
+  app_log(2, "    Write:                {0:.3f} sec\n", Timer.elapsed("WRITE"));
 
   app_log(1, "####### SCF routines end #######\n");
   return std::make_tuple(e_1e+e_hf, e_corr);
@@ -340,13 +340,13 @@ double qp_scf_loop(MBState &mb_state, eri_t &mb_eri, const imag_axes_ft::IAFT& F
   } while(it<init_it+niter+1 and std::abs(Heff_conv) > std::abs(conv_tol));
   Timer.stop("SCF_TOTAL");
 
-  app_log(1, "\n  QP-SCF timers");
-  app_log(1, "  -------------");
-  app_log(1, "    Total:                  {0:.3f} sec", Timer.elapsed("SCF_TOTAL"));
-  app_log(1, "    Canonicalization:       {0:.3f} sec", Timer.elapsed("CANONICALIZATION"));
-  app_log(1, "    MBPT solvers:           {0:.3f} sec", Timer.elapsed("MBPT_SOLVERS"));
-  app_log(1, "    Iterative alg:          {0:.3f} sec", Timer.elapsed("ITERATIVE"));
-  app_log(1, "    Write:                  {0:.3f} sec\n", Timer.elapsed("WRITE"));
+  app_log(2, "\n  QP-SCF timers");
+  app_log(2, "  -------------");
+  app_log(2, "    Total:                  {0:.3f} sec", Timer.elapsed("SCF_TOTAL"));
+  app_log(2, "    Canonicalization:       {0:.3f} sec", Timer.elapsed("CANONICALIZATION"));
+  app_log(2, "    MBPT solvers:           {0:.3f} sec", Timer.elapsed("MBPT_SOLVERS"));
+  app_log(2, "    Iterative alg:          {0:.3f} sec", Timer.elapsed("ITERATIVE"));
+  app_log(2, "    Write:                  {0:.3f} sec\n", Timer.elapsed("WRITE"));
 
   app_log(1, "####### quasi-particle SCF routines end #######\n");
   return e_tot;

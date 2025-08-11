@@ -28,12 +28,12 @@ namespace imag_axes_ft {
         std::string prec_prefix;
         if (prec == "high") {
           prec_prefix = "1e-15";
-        } else if (prec == "mid") {
+        } else if (prec == "medium") {
           prec_prefix = "1e-10";
         } else if (prec == "low") {
           prec_prefix = "1e-06";
         } else {
-          utils::check(false, "imag_axes_ft::ir: prec = {} is not acceptable. Acceptable list = \"high\", \"mid\", \"low\"", prec);
+          utils::check(false, "imag_axes_ft::ir: prec = {} is not acceptable. Acceptable list = \"high\", \"medium\", \"low\"", prec);
         }
         std::string filename = ir_file(lambda, prec_prefix);
         h5::file file(filename, 'r');
@@ -84,12 +84,12 @@ namespace imag_axes_ft {
         std::string prec_prefix;
         if (prec == "high") {
           prec_prefix = "1e-15";
-        } else if (prec == "mid") {
+        } else if (prec == "medium") {
           prec_prefix = "1e-10";
         } else if (prec == "low") {
           prec_prefix = "1e-06";
         } else {
-          utils::check(false, "imag_axes_ft::ir: prec = {} is not acceptable. Acceptable list = \"high\", \"mid\", \"low\"", prec);
+          utils::check(false, "imag_axes_ft::ir: prec = {} is not acceptable. Acceptable list = \"high\", \"medium\", \"low\"", prec);
         }
 
         app_log(2, "  Mesh details on the imaginary axis");

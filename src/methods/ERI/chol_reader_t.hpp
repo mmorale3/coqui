@@ -455,12 +455,12 @@ namespace methods {
 
 
     inline void print_timers() {
-      app_log(1, "\n***************************************************");
-      app_log(1, "                  CHOl-ERI timers ");
-      app_log(1, "***************************************************");
-      app_log(1, "    BUILD:                {} sec", _Timer.elapsed("BUILD"));
-      app_log(1, "    READ:                 {} sec", _Timer.elapsed("READ"));
-      app_log(1, "***************************************************\n");
+      app_log(2, "\n***************************************************");
+      app_log(2, "                  CHOl-ERI timers ");
+      app_log(2, "***************************************************");
+      app_log(2, "    BUILD:                {} sec", _Timer.elapsed("BUILD"));
+      app_log(2, "    READ:                 {} sec", _Timer.elapsed("READ"));
+      app_log(2, "***************************************************\n");
     }
 
   private:

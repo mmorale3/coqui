@@ -522,6 +522,7 @@ namespace methods {
       } else {
         utils::check(false, "Unsupported divergence treatment: {}", div_enum_to_string(div_treatment));
       }
+      app_log(1, "");
     }
 
   }
