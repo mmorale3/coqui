@@ -774,7 +774,7 @@ auto thc::get_ZquG_Cquv(nda::MemoryArrayOfRank<1> auto const& IPts,
       std::min(long(default_block_size), std::min(nIpts/pgrid[1], nIpts/pgrid[2]) ),
       std::min(long(default_block_size), rho_g.size()/pgrid[2] )
     };
-    app_log(1," - block sizes: ({},{},{})",block_size[0],block_size[1],block_size[2]);
+    app_log(2," - block sizes: ({},{},{})",block_size[0],block_size[1],block_size[2]);
     app_log(2," - Calculating Zqur with fft algorithm ");
     if constexpr (MEM == HOST_MEMORY) {
       return get_ZquG_Cquv_fft_shared_memory(IPts,Xa,Xb,a_range,b_range,pgrid,block_size);
@@ -788,7 +788,7 @@ auto thc::get_ZquG_Cquv(nda::MemoryArrayOfRank<1> auto const& IPts,
       std::min(long(default_block_size), std::min(nIpts/pgrid[1], nIpts/pgrid[2]) ),
       std::min(long(default_block_size), rho_g.nnr()/pgrid[2] )
     };
-    app_log(1," - block sizes: ({},{},{})",block_size[0],block_size[1],block_size[2]);
+    app_log(2," - block sizes: ({},{},{})",block_size[0],block_size[1],block_size[2]);
     app_log(2," - Calculating Zqur with r-space algorithm ");
     return get_ZquG_Cquv_rspace<MEM>(IPts,a_range,b_range,pgrid,block_size);
   }

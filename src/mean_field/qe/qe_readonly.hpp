@@ -184,17 +184,17 @@ public:
   }
 
   void print_metadata() {
-    app_log(2,"  Quantum ESPRESSO reader");
-    app_log(2,"  -----------------------");
-    app_log(2,"  Number of spins                = {}", sys.nspin);
-    app_log(2,"  Number of polarizations        = {}", sys.npol);
-    app_log(2,"  Number of bands                = {}", sys.nbnd);
-    app_log(2,"  Monkhorst-Pack mesh            = ({},{},{})", sys.bz().kp_grid(0), sys.bz().kp_grid(1), sys.bz().kp_grid(2));
-    app_log(2,"  K-points                       = {} total, {} in the IBZ", sys.bz().nkpts, sys.bz().nkpts_ibz);
-    app_log(2,"  Number of electrons            = {}", sys.nelec);
-    app_log(2,"  Electron density energy cutoff = {0:.3f} a.u. | FFT mesh = ({1},{2},{3})",
+    app_log(1,"  Quantum ESPRESSO reader");
+    app_log(1,"  -----------------------");
+    app_log(1,"  Number of spins                = {}", sys.nspin);
+    app_log(1,"  Number of polarizations        = {}", sys.npol);
+    app_log(1,"  Number of bands                = {}", sys.nbnd);
+    app_log(1,"  Monkhorst-Pack mesh            = ({},{},{})", sys.bz().kp_grid(0), sys.bz().kp_grid(1), sys.bz().kp_grid(2));
+    app_log(1,"  K-points                       = {} total, {} in the IBZ", sys.bz().nkpts, sys.bz().nkpts_ibz);
+    app_log(1,"  Number of electrons            = {}", sys.nelec);
+    app_log(1,"  Electron density energy cutoff = {0:.3f} a.u. | FFT mesh = ({1},{2},{3})",
             ecut, fft_mesh(0),fft_mesh(1),fft_mesh(2));
-    app_log(2,"  Wavefunction energy cutoff     = {0:.3f} a.u. | FFT mesh = ({1},{2},{3}), Number of PWs = {4}\n",
+    app_log(1,"  Wavefunction energy cutoff     = {0:.3f} a.u. | FFT mesh = ({1},{2},{3}), Number of PWs = {4}\n",
             wfc_g.ecut(), wfc_g.mesh(0),wfc_g.mesh(1),wfc_g.mesh(2), wfc_g.size());
   }
 

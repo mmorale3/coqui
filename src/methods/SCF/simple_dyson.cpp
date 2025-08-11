@@ -32,8 +32,8 @@ namespace methods {
 
       utils::check(nwpools*nkpools*np_i*np_j == _context->comm.size(), "solve_dyson: pgrid mismatches!");
 
-      app_log(2, "Dyson equation for Green's function:");
-      app_log(2, "  - processor grid for G/Self-energy: (w, k, i, j) = ({}, {}, {}, {})", nwpools, nkpools, np_i, np_j);
+      app_log(1, "Dyson equation for Green's function:");
+      app_log(1, "  - processor grid for G/Self-energy: (w, k, i, j) = ({}, {}, {}, {})", nwpools, nkpools, np_i, np_j);
       app_log(2, "  - block size: (w, k, i, j) = ({}, {}, {}, {})", 1, 1, ibsize, ibsize);
     }
 

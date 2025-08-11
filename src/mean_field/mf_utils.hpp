@@ -68,7 +68,7 @@ inline decltype(auto) make_MF(const std::shared_ptr<utils::mpi_context_t<comm_t>
   auto outdir = io::get_value_with_default<std::string>(pt,"outdir","./");
   auto ecut = io::get_value_with_default<double>(pt,"ecut",0.0);
   auto nbnd = io::get_value_with_default<int>(pt,"nbnd",-1);
-  auto ftype = io::get_value_with_default<std::string>(pt,"filetype","xml");
+  auto ftype = io::get_value_with_default<std::string>(pt,"filetype","h5");
   if(mf_type == "qe") {
     utils::check(ftype == "xml" or ftype == "h5", "Error: Invalid file type: {}", ftype);
     mf_input_file_type_e mf_ftype = (ftype=="xml"?xml_input_type:h5_input_type);

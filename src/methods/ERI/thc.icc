@@ -1516,9 +1516,9 @@ auto thc::intvec_impl(nda::MemoryArrayOfRank<1> auto const& IPts,
   // MAM: temporary HACK until I figure out why slate::lu_solve seg faults with device memory
   using local_uArray_t = std::conditional_t<MEM==HOST_MEMORY, memory::host_array<ComplexType,3>,
           						  memory::unified_array<ComplexType,3>>; 
-  app_log(0,"*********************************************************************");
-  app_log(0,"  ISDF - fitting interpolating vectors to pair densities ");
-  app_log(0,"*********************************************************************");
+  app_log(1,"*********************************************************************");
+  app_log(1,"  ISDF - fitting interpolating vectors to pair densities ");
+  app_log(1,"*********************************************************************");
   using math::nda::make_distributed_array; 
   using math::nda::transpose;
   using math::nda::dagger;
@@ -1553,7 +1553,7 @@ auto thc::intvec_impl(nda::MemoryArrayOfRank<1> auto const& IPts,
 
   app_log(1, " - Number of interpolating points: {}", nIpts);
   app_log(1, " - Number of q-points in IBZ: {}",nqpts_ibz);
-  app_log(1, " - processor grid: ({},{},{})",pgrid3D[0],pgrid3D[1],pgrid3D[2]);
+  app_log(2, " - Processor grid: ({},{},{})",pgrid3D[0],pgrid3D[1],pgrid3D[2]);
 
   /* 
    * std::optional<_darray_t_<MEM,3>> I(q,u,G) = (S)^{-1}(q,u,v) * IVec(q,v,G), "inverse" interpolating vector 
@@ -1747,9 +1747,9 @@ auto thc::intvec_impl(int iq, nda::MemoryArrayOfRank<1> auto const& IPts,
   Timer.start("IntVecs");
   using local_Array_t = memory::array<MEM,ComplexType,2>;
   if(iq==0) {
-    app_log(0,"************************************************************************");
-    app_log(0,"  ISDF - fitting interpolating vectors to Cholesky/DF ERI decomposition ");
-    app_log(0,"************************************************************************");
+    app_log(1,"************************************************************************");
+    app_log(1,"  ISDF - fitting interpolating vectors to Cholesky/DF ERI decomposition ");
+    app_log(1,"************************************************************************");
   }
   using math::nda::make_distributed_array; 
   using math::nda::transpose;
@@ -1794,8 +1794,8 @@ auto thc::intvec_impl(int iq, nda::MemoryArrayOfRank<1> auto const& IPts,
   };
 
   if(iq==0) { 
-    app_log(1," - processor grid: ({},{})",pgrid2D[0],pgrid2D[1]); 
-    app_log(1," - block sizes: ({},{})",block_size[0],block_size[1]); 
+    app_log(2," - processor grid: ({},{})",pgrid2D[0],pgrid2D[1]);
+    app_log(2," - block sizes: ({},{})",block_size[0],block_size[1]);
   }
 
   // (C^H*C)(p,q) = sum_k conj(Ta(k,p,q)) * Tb(k,p,q)

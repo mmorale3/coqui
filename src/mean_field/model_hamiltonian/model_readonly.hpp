@@ -137,16 +137,16 @@ public:
   std::vector< math::sparse::csr_matrix<ComplexType,HOST_MEMORY,int,int> > dmat;
 
   void print_output_info() const {
-    app_log(2, "  COQUI Model Hamiltonian reader");
-    app_log(2, "  ------------------------");
-    app_log(2, "    - nspin: {}", sys.nspin);
-    app_log(2, "    - nspin in basis: {}", sys.nspin_in_basis);
-    app_log(2, "    - npol: {}", sys.npol);
-    app_log(2, "    - nbnd  = {}", sys.nbnd);
-    app_log(2, "    - Monkhorst-Pack mesh = ({},{},{})", sys.bz().kp_grid(0), sys.bz().kp_grid(1), sys.bz().kp_grid(2));
-    app_log(2, "    - nkpts = {}", sys.bz().nkpts);
-    app_log(2, "    - nkpts_ibz = {}", sys.bz().nkpts_ibz);
-    app_log(2, "    - nelec = {}", sys.nelec);
+    app_log(1, "  COQUI Model Hamiltonian reader");
+    app_log(1, "  ------------------------");
+    app_log(1, "    - nspin: {}", sys.nspin);
+    app_log(1, "    - nspin in basis: {}", sys.nspin_in_basis);
+    app_log(1, "    - npol: {}", sys.npol);
+    app_log(1, "    - nbnd  = {}", sys.nbnd);
+    app_log(1, "    - Monkhorst-Pack mesh = ({},{},{})", sys.bz().kp_grid(0), sys.bz().kp_grid(1), sys.bz().kp_grid(2));
+    app_log(1, "    - nkpts = {}", sys.bz().nkpts);
+    app_log(1, "    - nkpts_ibz = {}", sys.bz().nkpts_ibz);
+    app_log(1, "    - nelec = {}", sys.nelec);
   }
 
   void _abort_(std::string m) const {

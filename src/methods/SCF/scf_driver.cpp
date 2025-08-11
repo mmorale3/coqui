@@ -88,7 +88,7 @@ auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_ax
   double e_tot_diff = 0.0;
   long it = 1 + init_it;
   do {
-    app_log(2, "\n** Iteration # {} **", it);
+    app_log(1, "\n** Iteration # {} **", it);
     Timer.start("MBPT_SOLVERS");
     // HF
     if (mb_solver.hf != nullptr) {
@@ -154,17 +154,17 @@ auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_ax
     e_tot_diff = e_tot_new - e_tot;
 
     // print energies and scf convergence
-    app_log(2, "\nEnergy contributions");
-    app_log(2, "--------------------");
-    app_log(2, "  non-interacting (H0):           {} a.u.", e_1e);
-    app_log(2, "  Hartree-Fock:                   {} a.u.", e_hf);
-    app_log(2, "  correlation:                    {} a.u.", e_corr);
-    app_log(2, "  total energy:                   {} a.u.", e_tot_new);
-    app_log(2, " ");
-    app_log(2, "energy difference:                {} a.u.", e_tot_diff);
-    app_log(2, "abs max diff of Fock matrix:   {}", F_conv);
+    app_log(1, "\nEnergy contributions");
+    app_log(1, "--------------------");
+    app_log(1, "  non-interacting (H0):           {} a.u.", e_1e);
+    app_log(1, "  Hartree-Fock:                   {} a.u.", e_hf);
+    app_log(1, "  correlation:                    {} a.u.", e_corr);
+    app_log(1, "  total energy:                   {} a.u.", e_tot_new);
+    app_log(1, " ");
+    app_log(1, "energy difference:                {} a.u.", e_tot_diff);
+    app_log(1, "abs max diff of Fock matrix:   {}", F_conv);
     if (mb_solver.corr!=nullptr)
-      app_log(2, "abs max diff of self-energy:   {}\n", Sigma_conv);
+      app_log(1, "abs max diff of self-energy:   {}\n", Sigma_conv);
     e_tot  = e_tot_new;
     Timer.start("WRITE");
     chkpt::dump_scf(mpi->comm, it, sDm_skij, sG_tskij, sF_skij, sSigma_tskij, mu, mb_state.coqui_prefix);
@@ -255,7 +255,7 @@ double qp_scf_loop(MBState &mb_state, eri_t &mb_eri, const imag_axes_ft::IAFT& F
   double e_diff = 0.0;
   long it = init_it + 1;
   do {
-    app_log(2, "\n** Iteration # {} **", it);
+    app_log(1, "\n** Iteration # {} **", it);
 
     Timer.start("MBPT_SOLVERS");
     if (mb_solver.hf != nullptr) { // HF
@@ -323,14 +323,14 @@ double qp_scf_loop(MBState &mb_state, eri_t &mb_eri, const imag_axes_ft::IAFT& F
     e_tot  = e_1e + e_hf;
 
     // print energies and scf convergence
-    app_log(2, "\nEnergy contributions");
-    app_log(2, "--------------------");
-    app_log(2, "  non-interacting (H0):           {} a.u.", e_1e);
-    app_log(2, "  beyond H0:                      {} a.u.", e_hf);
-    app_log(2, "  total energy:                   {} a.u.", e_tot);
-    app_log(2, " ");
-    app_log(2, "energy difference:                {} a.u.", e_diff);
-    app_log(2, "abs max diff of QP Hamiltonian:    {} a.u.\n", Heff_conv);
+    app_log(1, "\nEnergy contributions");
+    app_log(1, "--------------------");
+    app_log(1, "  non-interacting (H0):           {} a.u.", e_1e);
+    app_log(1, "  beyond H0:                      {} a.u.", e_hf);
+    app_log(1, "  total energy:                   {} a.u.", e_tot);
+    app_log(1, " ");
+    app_log(1, "energy difference:                {} a.u.", e_diff);
+    app_log(1, "abs max diff of QP Hamiltonian:    {} a.u.\n", Heff_conv);
 
     Timer.start("WRITE");
     chkpt::dump_scf(mpi->comm, it, sDm_skij, sHeff_skij, sMO_skia, sE_ska, mu, mb_state.coqui_prefix);

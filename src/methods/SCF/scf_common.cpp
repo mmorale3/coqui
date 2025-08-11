@@ -157,8 +157,8 @@ double update_mu(double old_mu, dyson_type& dyson, const mf::MF &mf, const imag_
   app_log(2, "Initial chemical potential (mu) = {}, nelec = {}", old_mu, nel);
 
   if (std::abs(nel - nel_target) < dyson.mu_tol()) {
-    app_log(2, "Chemical potential found (mu) = {} a.u.", mu);
-    app_log(2, "Number of electrons per unit cell = {}", nel);
+    app_log(1, "Chemical potential found (mu) = {} a.u.", mu);
+    app_log(1, "Number of electrons per unit cell = {}", nel);
     return mu;
   }
 
@@ -196,8 +196,8 @@ double update_mu(double old_mu, dyson_type& dyson, const mf::MF &mf, const imag_
     app_log(4, "mu = {}, nelec = {}", mu_mid, nel);
   }
   mu = mu_mid;
-  app_log(2, "Chemical potential found (mu) = {} a.u.", mu);
-  app_log(2, "Number of electrons per unit cell = {}", nel);
+  app_log(1, "Chemical potential found (mu) = {} a.u.", mu);
+  app_log(1, "Number of electrons per unit cell = {}", nel);
   return mu;
 }
 

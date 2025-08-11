@@ -75,25 +75,7 @@ namespace mf {
         wfc_g(1.0,nda::array<int,1>(3,3),sys.recv) {
         // no symmetries yet!
         dmat.clear();
-   
-        app_log(2, "  PySCF reader");
-        app_log(2, "  ------------");
-        app_log(2, "    - nbnd  = {}", sys.nbnd);
-        app_log(2, "    - nbnd_aux  = {}", sys.nbnd_aux);
-        app_log(2, "    - nspin = {}", sys.nspin);
-        app_log(2, "    - nspin in basis: {}", sys.nspin_in_basis);
-        app_log(2, "    - Monkhorst-Pack mesh = ({},{},{})", sys.bz().kp_grid(0), sys.bz().kp_grid(1), sys.bz().kp_grid(2));
-        app_log(2, "    - nkpt  = {}", sys.bz().nkpts);
-        app_log(2, "    - nkpts_ibz = {}", sys.bz().nkpts_ibz);
-        app_log(2, "    - nelec = {}", sys.nelec);
-        if (sys.orb_on_fft_grid) {
-          app_log(2, "    - orbital storage type: uniform G-grid");
-          app_log(2, "    - ecutrho = {} a.u.", sys.ecutrho);
-          app_log(2, "    - fft mesh =  ({},{},{})\n", sys.fft_mesh(0), sys.fft_mesh(1), sys.fft_mesh(2));
-        } else {
-          app_log(2, "    - orbital storage type: non-uniform r-grid");
-          app_log(2, "    - grid size = {}", sys.nnr);
-        }
+        print_metadata();
       }
 
       template<utils::Communicator comm_t>
@@ -104,25 +86,7 @@ namespace mf {
         wfc_g(1.0,nda::array<int,1>(3,3),sys.recv) {
         // no symmetries yet!
         dmat.clear();
-   
-        app_log(2, "  PySCF reader");
-        app_log(2, "  ------------");
-        app_log(2, "    - nbnd  = {}", sys.nbnd);
-        app_log(2, "    - nbnd_aux  = {}", sys.nbnd_aux);
-        app_log(2, "    - nspin = {}", sys.nspin);
-        app_log(2, "    - nspin in basis: {}", sys.nspin_in_basis);
-        app_log(2, "    - Monkhorst-Pack mesh = ({},{},{})", sys.bz().kp_grid(0), sys.bz().kp_grid(1), sys.bz().kp_grid(2));
-        app_log(2, "    - nkpt  = {}", sys.bz().nkpts);
-        app_log(2, "    - nkpts_ibz = {}", sys.bz().nkpts_ibz);
-        app_log(2, "    - nelec = {}", sys.nelec);
-        if (sys.orb_on_fft_grid) {
-          app_log(2, "    - orbital storage type: uniform G-grid");
-          app_log(2, "    - ecutrho = {} a.u.", sys.ecutrho);
-          app_log(2, "    - fft mesh = ({},{},{})\n", sys.fft_mesh(0), sys.fft_mesh(1), sys.fft_mesh(2));
-        } else {
-          app_log(2, "    - orbital storage type: non-uniform r-grid");
-          app_log(2, "    - grid size = {}", sys.nnr);
-        }
+        print_metadata();
       }
 
       pyscf_readonly(const pyscf_readonly& other):
@@ -139,25 +103,7 @@ namespace mf {
         wfc_g(1.0,nda::array<int,1>(3,3),sys.recv) {
         // no symmetries yet!
         dmat.clear();
-   
-        app_log(2, "  PySCF reader");
-        app_log(2, "  ------------");
-        app_log(2, "    - nbnd  = {}", sys.nbnd);
-        app_log(2, "    - nbnd_aux  = {}", sys.nbnd_aux);
-        app_log(2, "    - nspin = {}", sys.nspin);
-        app_log(2, "    - nspin in basis: {}", sys.nspin_in_basis);
-        app_log(2, "    - Monkhorst-Pack mesh = ({},{},{})", sys.bz().kp_grid(0), sys.bz().kp_grid(1), sys.bz().kp_grid(2));
-        app_log(2, "    - nkpt  = {}", sys.bz().nkpts);
-        app_log(2, "    - nkpts_ibz = {}", sys.bz().nkpts_ibz);
-        app_log(2, "    - nelec = {}", sys.nelec);
-        if (sys.orb_on_fft_grid) {
-          app_log(2, "    - orbital storage type: uniform G-grid");
-          app_log(2, "    - ecutrho = {} a.u.", sys.ecutrho);
-          app_log(2, "    - fft mesh = ({},{},{})\n", sys.fft_mesh(0), sys.fft_mesh(1), sys.fft_mesh(2));
-        } else {
-          app_log(2, "    - orbital storage type: non-uniform r-grid");
-          app_log(2, "    - grid size = {}", sys.nnr);
-        }
+        print_metadata();
       }
 
       pyscf_readonly(pyscf_readonly&& other):
@@ -187,6 +133,25 @@ namespace mf {
         this->fft_mesh = other.fft_mesh;
         this->wfc_g = std::move(other.wfc_g);
         return *this;
+      }
+
+      void print_metadata() {
+        app_log(1, "  PySCF reader");
+        app_log(1, "  ------------");
+        app_log(1, "  Number of spins          = {}", sys.nspin);
+        app_log(1, "  Number of spins in basis = {}", sys.nspin_in_basis);
+        app_log(1, "  Number of bands          = {}", sys.nbnd);
+        app_log(1, "  Monkhorst-Pack mesh      = ({},{},{})", sys.bz().kp_grid(0), sys.bz().kp_grid(1), sys.bz().kp_grid(2));
+        app_log(1, "  K-points                 = {} total, {} in the IBZ", sys.bz().nkpts, sys.bz().nkpts_ibz);
+        app_log(1, "  Number of electrons      = {}", sys.nelec);
+        if (sys.orb_on_fft_grid) {
+          app_log(1, "  Orbital storage type     = uniform G-grid");
+          app_log(1, "  Energy cutoff            = {0:.3f} a.u. | FFT mesh = ({1}.{2},{3})\n",
+                  sys.ecutrho, sys.fft_mesh(0), sys.fft_mesh(1), sys.fft_mesh(2));
+        } else {
+          app_log(1, "  Orbital storage type     = non-uniform r-grid");
+          app_log(1, "  Grid size                = {}\n", sys.nnr);
+        }
       }
 
       /**

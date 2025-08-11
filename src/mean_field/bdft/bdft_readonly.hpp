@@ -163,21 +163,7 @@ public:
     if(slist.size() > 0) 
       std::tie(sk_to_n,dmat) = utils::generate_dmatrix<true>(*this, sys.bz().symm_list, slist);
 
-    app_log(2, "  CoQuí mean-field reader");
-    app_log(2, "  ------------------------");
-    app_log(2, "    - nspin: {}", sys.nspin);
-    app_log(2, "    - nspin in basis: {}", sys.nspin_in_basis);
-    app_log(2, "    - npol: {}", sys.npol);
-    app_log(2, "    - nbnd  = {}", sys.nbnd);
-    app_log(2, "    - Monkhorst-Pack mesh = ({},{},{})", sys.bz().kp_grid(0), sys.bz().kp_grid(1), sys.bz().kp_grid(2));
-    app_log(2, "    - nkpts = {}", sys.bz().nkpts);
-    app_log(2, "    - nkpts_ibz = {}", sys.bz().nkpts_ibz);
-    app_log(2, "    - nelec = {}", sys.nelec);
-    app_log(2, "    - ecutrho: {} a.u.", ecut);
-    app_log(2, "    - fft mesh: ({},{},{})",fft_mesh(0),fft_mesh(1),fft_mesh(2));
-    app_log(2, "    - wfc ecut: {} a.u.",wfc_g.ecut());
-    app_log(2, "    - wfc ngm: {}",wfc_g.size());   
-    app_log(2, "    - wfc fft mesh: ({},{},{})\n",wfc_g.mesh(0),wfc_g.mesh(1),wfc_g.mesh(2));
+    print_metadata("CoQuí mean-field reader");
   }
 
   bdft_readonly(bdft_system const& bdft_sys):
@@ -193,21 +179,7 @@ public:
     if(slist.size() > 0) 
       std::tie(sk_to_n,dmat) = utils::generate_dmatrix<true>(*this,sys.bz().symm_list,slist);
 
-    app_log(2, "  CoQuí mean-field reader");
-    app_log(2, "  ------------------------");
-    app_log(2, "    - nspin: {}", sys.nspin);
-    app_log(2, "    - nspin in basis: {}", sys.nspin_in_basis);
-    app_log(2, "    - npol: {}", sys.npol);
-    app_log(2, "    - nbnd  = {}", sys.nbnd);
-    app_log(2, "    - Monkhorst-Pack mesh = ({},{},{})", sys.bz().kp_grid(0), sys.bz().kp_grid(1), sys.bz().kp_grid(2));
-    app_log(2, "    - nkpts = {}", sys.bz().nkpts);
-    app_log(2, "    - nkpts_ibz = {}", sys.bz().nkpts_ibz);
-    app_log(2, "    - nelec = {}", sys.nelec);
-    app_log(2, "    - ecutrho: {} a.u.", ecut);
-    app_log(2, "    - fft mesh: ({},{},{})",fft_mesh(0),fft_mesh(1),fft_mesh(2));
-    app_log(2, "    - wfc ecut: {} a.u.",wfc_g.ecut());
-    app_log(2, "    - wfc ngm: {}",wfc_g.size());   
-    app_log(2, "    - wfc fft mesh: ({},{},{})\n",wfc_g.mesh(0),wfc_g.mesh(1),wfc_g.mesh(2));
+    print_metadata("CoQuí mean-field reader");
   }
 
   bdft_readonly(bdft_readonly const& other):
@@ -233,21 +205,7 @@ public:
     if(slist.size() > 0) 
       std::tie(sk_to_n,dmat) = utils::generate_dmatrix<true>(*this,sys.bz().symm_list,slist);
 
-    app_log(2, "  CoQuí mean-field reader");
-    app_log(2, "  ------------------------");
-    app_log(2, "    - nspin: {}", sys.nspin);
-    app_log(2, "    - nspin in basis: {}", sys.nspin_in_basis);
-    app_log(2, "    - npol: {}", sys.npol);
-    app_log(2, "    - nbnd  = {}", sys.nbnd);
-    app_log(2, "    - Monkhorst-Pack mesh = ({},{},{})", sys.bz().kp_grid(0), sys.bz().kp_grid(1), sys.bz().kp_grid(2));
-    app_log(2, "    - nkpts = {}", sys.bz().nkpts);
-    app_log(2, "    - nkpts_ibz = {}", sys.bz().nkpts_ibz);
-    app_log(2, "    - nelec = {}", sys.nelec);
-    app_log(2, "    - ecutrho: {} a.u.", ecut);
-    app_log(2, "    - fft mesh: ({},{},{})",fft_mesh(0),fft_mesh(1),fft_mesh(2));
-    app_log(2, "    - wfc ecut: {} a.u.",wfc_g.ecut());
-    app_log(2, "    - wfc ngm: {}",wfc_g.size());   
-    app_log(2, "    - wfc fft mesh: ({},{},{})\n",wfc_g.mesh(0),wfc_g.mesh(1),wfc_g.mesh(2));
+    print_metadata("CoQuí mean-field reader");
   }
 
   template<class MF>
@@ -355,21 +313,7 @@ public:
       std::tie(sk_to_n,dmat) = utils::generate_dmatrix<true>(*this,sys.bz().symm_list,slist);
     sys.mpi->comm.barrier();
 
-    app_log(2, "  CoQuí mean-field reader (from mf object)");
-    app_log(2, "  -----------------------------------------");
-    app_log(2, "    - nspin: {}", sys.nspin);
-    app_log(2, "    - nspin in basis: {}", sys.nspin_in_basis);
-    app_log(2, "    - npol: {}", sys.npol);
-    app_log(2, "    - nbnd  = {}", sys.nbnd);
-    app_log(2, "    - Monkhorst-Pack mesh = ({},{},{})", sys.bz().kp_grid(0), sys.bz().kp_grid(1), sys.bz().kp_grid(2));
-    app_log(2, "    - nkpts = {}", sys.bz().nkpts);
-    app_log(2, "    - nkpts_ibz = {}", sys.bz().nkpts_ibz);
-    app_log(2, "    - nelec = {}", sys.nelec);
-    app_log(2, "    - ecutrho: {} a.u.", ecut);
-    app_log(2, "    - fft mesh: ({},{},{})",fft_mesh(0),fft_mesh(1),fft_mesh(2));
-    app_log(2, "    - wfc ecut: {} a.u.",wfc_g.ecut());
-    app_log(2, "    - wfc ngm: {}",wfc_g.size());   
-    app_log(2, "    - wfc fft mesh: ({},{},{})\n",wfc_g.mesh(0),wfc_g.mesh(1),wfc_g.mesh(2));
+    print_metadata("CoQuí mean-field reader (from mf object)");
     sys.mpi->comm.barrier();
   }
 
@@ -468,21 +412,7 @@ public:
     if(slist.size() > 0) 
       std::tie(sk_to_n,dmat) = utils::generate_dmatrix<true>(*this,sys.bz().symm_list,slist);
 
-    app_log(2, "  AIMBES mean-field reader (from mf object with orbital selection)");
-    app_log(2, "  ----------------------------------------------------------------");
-    app_log(2, "    - nspin: {}", sys.nspin);
-    app_log(2, "    - nspin in basis: {}", sys.nspin_in_basis);
-    app_log(2, "    - npol: {}", sys.npol);
-    app_log(2, "    - nbnd  = {}", sys.nbnd);
-    app_log(2, "    - Monkhorst-Pack mesh = ({},{},{})", sys.bz().kp_grid(0), sys.bz().kp_grid(1), sys.bz().kp_grid(2));
-    app_log(2, "    - nkpts = {}", sys.bz().nkpts);
-    app_log(2, "    - nkpts_ibz = {}", sys.bz().nkpts_ibz);
-    app_log(2, "    - nelec = {}", sys.nelec);
-    app_log(2, "    - ecutrho: {} a.u.", ecut);
-    app_log(2, "    - fft mesh: ({},{},{})",fft_mesh(0),fft_mesh(1),fft_mesh(2));
-    app_log(2, "    - wfc ecut: {} a.u.",wfc_g.ecut());
-    app_log(2, "    - wfc ngm: {}",wfc_g.size());   
-    app_log(2, "    - wfc fft mesh: ({},{},{})\n",wfc_g.mesh(0),wfc_g.mesh(1),wfc_g.mesh(2));
+    print_metadata("CoQuí mean-field reader (from mf object with orbital selection)");
     sys.mpi->comm.barrier();
   }
 
@@ -520,6 +450,22 @@ public:
     this->swfc_maps = std::move(other.swfc_maps);
     this->wfc_g = std::move(other.wfc_g);
     return *this;
+  }
+
+  void print_metadata(std::string header = "CoQuí mean-field reader") {
+    app_log(1, "  {}", header);
+    app_log(1, "  ------------------------------------");
+    app_log(1, "  Number of spins            =  {}", sys.nspin);
+    app_log(1, "  Number of spins in basis   =  {}", sys.nspin_in_basis);
+    app_log(1, "  Number of polarizations    = {}", sys.npol);
+    app_log(1, "  Number of bands            = {}", sys.nbnd);
+    app_log(1, "  Monkhorst-Pack mesh        = ({},{},{})", sys.bz().kp_grid(0), sys.bz().kp_grid(1), sys.bz().kp_grid(2));
+    app_log(1, "  K-points                   = {} total, {} in the IBZ", sys.bz().nkpts, sys.bz().nkpts_ibz);
+    app_log(1, "  Number of electrons        = {}", sys.nelec);
+    app_log(1, "  Density energy cutoff      = {0:.3f} a.u. | FFT mesh = ({1},{2},{3})",
+            ecut,fft_mesh(0),fft_mesh(1),fft_mesh(2));
+    app_log(1, "  Wavefunction energy cutoff = {0:.3f} a.u. | FFT mesh = ({1},{2},{3}), Number of PWs = {4}\n",
+            wfc_g.ecut(), wfc_g.mesh(0),wfc_g.mesh(1),wfc_g.mesh(2), wfc_g.size());
   }
 
   // read orbital

@@ -124,12 +124,12 @@ void thc::print_metadata()
   app_log(1,"  ----------------------------");
   app_log(1,"  Energy cutoff                = {} a.u. | FFT mesh = ({},{},{}), Number of PWs = {}",
           ecut, rho_g.mesh(0),rho_g.mesh(1),rho_g.mesh(2), rho_g.size());
-  app_log(1,"  Default Slate block size     = {}",default_block_size);
-  app_log(1,"  Default cholesky block size  = {}",default_cholesky_block_size);
+  app_log(2,"  Default Slate block size     = {}",default_block_size);
+  app_log(2,"  Default cholesky block size  = {}",default_cholesky_block_size);
   app_log(1,"  Threshold                    = {}",thresh);
-  app_log(1,"  Distribution tolerance       = {}",distr_tol);
-  app_log(1,"  Fraction of memory used for estimation = {}",memory_frac);
-  utils::memory_report(1);
+  app_log(2,"  Distribution tolerance       = {}",distr_tol);
+  app_log(2,"  Fraction of memory used for estimation = {}",memory_frac);
+  utils::memory_report(2);
   app_log(1,"");
 }
 
