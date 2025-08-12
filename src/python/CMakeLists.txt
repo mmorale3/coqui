@@ -1,5 +1,6 @@
 set(PYTHON_PACKAGE_PATH ${PROJECT_BINARY_DIR}/python/coqui  CACHE PATH "Python package directory.")
-set(PYTHON_PACKAGE_INSTALL_PATH lib/python/site-packages/coqui CACHE PATH "Python package install directory")
+set(PythonPrefix "python${Python_VERSION_MAJOR}.${Python_VERSION_MINOR}" CACHE INTERNAL "")
+set(PYTHON_PACKAGE_INSTALL_PATH lib/${PythonPrefix}/site-packages/coqui CACHE PATH "Python package install directory")
 
 add_subdirectory(utils)
 add_subdirectory(mean_field)
