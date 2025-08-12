@@ -37,9 +37,8 @@ endif(ENABLE_SPHERICART)
 install(TARGETS utils
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
 
-ADD_LIBRARY(catch_main catch_main.cpp)
-TARGET_LINK_LIBRARIES(catch_main PUBLIC utils Catch2::Catch2)
-
 if(BUILD_UNIT_TESTS)
+  ADD_LIBRARY(catch_main catch_main.cpp)
+  TARGET_LINK_LIBRARIES(catch_main PUBLIC utils Catch2::Catch2)
   add_subdirectory(tests)
 endif(BUILD_UNIT_TESTS)
