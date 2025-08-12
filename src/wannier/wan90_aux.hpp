@@ -563,7 +563,8 @@ auto compute_mmn(utils::mpi_context_t<mpi3::communicator> &mpi, mf::MF &mf,
                            wfc_g->mesh(), wann_kp(ik,all), k2g, Xft);
       for(auto [i,n] : itertools::enumerate(shifted_band_list)) 
         for(auto [j,m] : itertools::enumerate(k2g)) 
-          psi(0,i,j) = std::conj(buff(n,fft2gv(m)));  // conjugate to allow use of gemm below 
+          if(fft2gv(m) >= 0)
+            psi(0,i,j) = std::conj(buff(n,fft2gv(m)));  // conjugate to allow use of gemm below 
     } else {
       for(auto [i,n] : itertools::enumerate(shifted_band_list)) psi(0,i,all) = nda::conj(buff(n,all)); 
     }
@@ -586,7 +587,8 @@ auto compute_mmn(utils::mpi_context_t<mpi3::communicator> &mpi, mf::MF &mf,
                              wfc_g->mesh(), k_plus_b, k2g, Xft);
         for(auto [i,n] : itertools::enumerate(shifted_band_list))
           for(auto [j,nn] : itertools::enumerate(k2g)) 
-            psi(1,i,j) = buff(n,fft2gv(nn)); 
+            if(fft2gv(nn) >= 0)
+              psi(1,i,j) = buff(n,fft2gv(nn)); 
       } else {
         for(auto [i,n] : itertools::enumerate(shifted_band_list)) psi(1,i,all) = buff(n,all); 
       }
@@ -599,7 +601,7 @@ auto compute_mmn(utils::mpi_context_t<mpi3::communicator> &mpi, mf::MF &mf,
   }
 
   if(mpi.node_comm.root()) 
-    mpi.internode_comm.reduce_in_place_n(Mloc.data(),Mloc.size(),std::plus<>{},0);
+    mpi.internode_comm.all_reduce_in_place_n(Mloc.data(),Mloc.size(),std::plus<>{});
   if(mpi.comm.root() and write_to_file) 
     detail::write_mmn_file(prefix,nnkpts,Mloc,transpose);
   mpi.comm.barrier();
@@ -693,7 +695,8 @@ auto compute_amn_projections(utils::mpi_context_t<mpi3::communicator> &mpi, mf::
                            wfc_g->mesh(), wann_kp(ik,all), k2g, Xft);
       for(auto [i,n] : itertools::enumerate(shifted_band_list)) 
         for(auto [j,m] : itertools::enumerate(k2g)) 
-          psi(i,j) = std::conj(buff(n,fft2gv(m)));  // conjugate to allow use of gemm below 
+          if(fft2gv(m) >= 0)
+            psi(i,j) = std::conj(buff(n,fft2gv(m)));  // conjugate to allow use of gemm below 
     } else {
       for(auto [i,n] : itertools::enumerate(shifted_band_list)) psi(i,all) = nda::conj(buff(n,all)); 
     }
@@ -781,7 +784,7 @@ auto compute_amn_projections(utils::mpi_context_t<mpi3::communicator> &mpi, mf::
   }
 
   if(mpi.node_comm.root()) 
-    mpi.internode_comm.reduce_in_place_n(Aloc.data(),Aloc.size(),std::plus<>{},0);
+    mpi.internode_comm.all_reduce_in_place_n(Aloc.data(),Aloc.size(),std::plus<>{});
   if(mpi.comm.root() and write_to_file) 
     detail::write_amn_file(prefix,Aloc,transpose);
   mpi.comm.barrier();
@@ -875,7 +878,8 @@ auto compute_amn_projections_2(utils::mpi_context_t<mpi3::communicator> &mpi, mf
                            wfc_g->mesh(), wann_kp(ik,all), k2g, Xft);
       for(auto [i,n] : itertools::enumerate(shifted_band_list)) 
         for(auto [j,m] : itertools::enumerate(k2g)) 
-          psi(i,j) = std::conj(buff(n,fft2gv(m)));  // conjugate to allow use of gemm below 
+          if(fft2gv(m) >= 0)
+            psi(i,j) = std::conj(buff(n,fft2gv(m)));  // conjugate to allow use of gemm below 
     } else {
       for(auto [i,n] : itertools::enumerate(shifted_band_list)) psi(i,all) = nda::conj(buff(n,all)); 
     }
@@ -961,7 +965,7 @@ auto compute_amn_projections_2(utils::mpi_context_t<mpi3::communicator> &mpi, mf
   }
 
   if(mpi.node_comm.root()) 
-    mpi.internode_comm.reduce_in_place_n(Aloc.data(),Aloc.size(),std::plus<>{},0);
+    mpi.internode_comm.all_reduce_in_place_n(Aloc.data(),Aloc.size(),std::plus<>{});
   if(mpi.comm.root() and write_to_file) 
     detail::write_amn_file(prefix,Aloc,transpose);
   mpi.comm.barrier();
@@ -1360,8 +1364,8 @@ auto wannier90_library_run(utils::mpi_context_t<mpi3::communicator> &mpi, mf::MF
   mpi.comm.barrier();
 
   // Wannierize
-  ::nda::array<double,2> wann_center(nwann,3);
-  ::nda::array<double,1> wann_spreads(nwann);
+  ::nda::array<double,3> wann_center(nspin,nwann,3);
+  ::nda::array<double,2> wann_spreads(nspin,nwann);
 
   if(mpi.comm.root()) {
 #if defined(ENABLE_WANNIER90)
@@ -1384,7 +1388,7 @@ auto wannier90_library_run(utils::mpi_context_t<mpi3::communicator> &mpi, mf::MF
   mpi.broadcast(wann_spreads);
 
   if(mpi.comm.root() and write_modest) {
-    write_modest_h5(mf,pt,band_list,eigv,Amn);
+    write_modest_h5(mf,pt,band_list,eigv,Amn,wann_center);
   }
   mpi.comm.barrier();
 
@@ -1397,12 +1401,13 @@ inline auto wannier90_library_run_from_files(utils::mpi_context_t<mpi3::communic
 {
   auto prefix = io::get_value<std::string>(pt,"prefix");
   int nband = band_list.size();  
+  auto nspin = mf.nspin();
   ::nda::array<double,2> lattv = mf.lattv()*0.529177210544;
   int ierr=0;
   // keeping this in local memory for now
   ::nda::array<std::complex<double>,3> Pkam(mf.nkpts(),nwann,nband);
-  ::nda::array<double,2> wann_center(nwann,3);
-  ::nda::array<double,1> wann_spreads(nwann);
+  ::nda::array<double,3> wann_center(nspin,nwann,3);
+  ::nda::array<double,2> wann_spreads(nspin,nwann);
 
   if(mpi.comm.root()) {
     auto eigv = get_eig(mpi,mf,prefix,kp_map,band_list,false);

@@ -312,7 +312,8 @@ auto read_amn_file(std::string fname, bool transposed)
 }
 
 void write_modest_h5(mf::MF &mf, ptree pt, nda::array<int,1> const& band_list, 
-                     nda::MemoryArrayOfRank<3> auto const& eigv, nda::Array auto && Pkwa) {
+                     nda::MemoryArrayOfRank<3> auto const& eigv, nda::Array auto && Pkwa,
+                     nda::MemoryArrayOfRank<3> auto && R_wan) {
 
   auto all = nda::range::all;
   app_log(2, "\n");
@@ -406,6 +407,7 @@ void write_modest_h5(mf::MF &mf, ptree pt, nda::array<int,1> const& band_list,
   {
     nda::array<double,1> wgt(nkpts,1.0/double(nkpts));
     nda::h5_write(dgrp, "bz_weights", wgt);
+    nda::h5_write(dgrp, "kpts", mf.kpts_crystal());
   }
 
   // n_orbitals, need to partition over impurities
@@ -509,6 +511,25 @@ void write_modest_h5(mf::MF &mf, ptree pt, nda::array<int,1> const& band_list,
     for(int i=0; i<nshell; i++) {
       h5::h5_write(cgrp,std::to_string(i),0l);
     }
+  }
+
+  // wannier centers
+  {
+    nda::h5_write(dgrp,"wan_centres",R_wan);
+  }
+
+  // band window
+  {
+    nda::array<long,3> band_window(nshell,nkpts,2);
+    // MAM: This assumes contiguous bands
+    band_window(all,all,0) = *std::min_element(band_list.begin(),band_list.end())+1;  // 1-based indexing
+    band_window(all,all,1) = *std::max_element(band_list.begin(),band_list.end())+1;  // 1-based indexing 
+    if( (band_window(0,0,1)-band_window(0,0,0)+1) != band_list.size() )
+      app_log(0," [WARNING] Non-contiguous band window detected in ModEST h5 file. CAUTION!");
+    h5::group mgrp = (grp.has_subgroup("dft_misc_input") ?
+                      grp.open_group("dft_misc_input")    :
+                      grp.create_group("dft_misc_input"));
+    nda::h5_write(mgrp,"band_window",band_window);
   }
 
 }
