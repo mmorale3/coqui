@@ -13,7 +13,7 @@
 template <> struct fmt::formatter<std::complex<double>> {
   constexpr auto parse(format_parse_context& ctx) -> decltype(ctx.begin()) {
     auto it = ctx.begin(), end = ctx.end();
-    if (*it == '}') return it;
+    if (it == end || *it == '}') return it;
     if (*it == 'f') ++it;
     if (it != end && *it != '}')
       throw format_error("invalid format");
@@ -32,7 +32,7 @@ template <> struct fmt::formatter<std::complex<double>> {
 template <> struct fmt::formatter<std::complex<float>> {
   constexpr auto parse(format_parse_context& ctx) -> decltype(ctx.begin()) {
     auto it = ctx.begin(), end = ctx.end();
-    if (*it == '}') return it;
+    if (it == end || *it == '}') return it;
     if (*it == 'f') ++it;
     if (it != end && *it != '}')
       throw format_error("invalid format");
@@ -54,7 +54,7 @@ template<typename T> struct fmt::formatter<std::vector<T>>
   template<typename ParseContext>
   constexpr auto parse(ParseContext& ctx) -> decltype(ctx.begin()) {
     auto it = ctx.begin(), end = ctx.end();
-    if (*it == '}') return it;
+    if (it == end || *it == '}') return it;
     if (*it == 'f') ++it;
     if (it != end && *it != '}')
       throw format_error("invalid format");
@@ -85,7 +85,7 @@ struct fmt::formatter<Arr>
   template<typename ParseContext>
   constexpr auto parse(ParseContext& ctx) -> decltype(ctx.begin()) {
     auto it = ctx.begin(), end = ctx.end();
-    if (*it == '}') return it;
+    if (it == end || *it == '}') return it;
     if (*it == 'f') ++it;
     if (it != end && *it != '}')
       throw format_error("invalid format");
@@ -117,7 +117,7 @@ namespace std
 template <> struct formatter<std::complex<double>> {
   constexpr auto parse(format_parse_context& ctx) -> decltype(ctx.begin()) {
     auto it = ctx.begin(), end = ctx.end();
-    if (*it == '}') return it;
+    if (it == end || *it == '}') return it;
     if (*it == 'f') ++it;
     if (it != end && *it != '}')
       throw format_error("invalid format");
@@ -136,7 +136,7 @@ template <> struct formatter<std::complex<float>> {
 //  char presentation = 'f';
   constexpr auto parse(format_parse_context& ctx) -> decltype(ctx.begin()) {
     auto it = ctx.begin(), end = ctx.end();
-    if (*it == '}') return it;
+    if (it == end || *it == '}') return it;
     if (*it == 'f') ++it;
     if (it != end && *it != '}')
       throw format_error("invalid format");
@@ -155,9 +155,11 @@ template<typename T>
 struct formatter<std::vector<T>> 
 {
 
+//  template<typename ParseContext>
+//  constexpr auto parse(ParseContext& ctx) -> decltype(ctx.begin()) {
   constexpr auto parse(format_parse_context& ctx) -> decltype(ctx.begin()) {
     auto it = ctx.begin(), end = ctx.end();
-    if (*it == '}') return it;
+    if (it == end || *it == '}') return it;
     if (*it == 'f') ++it;
     if (it != end && *it != '}')
       throw format_error("invalid format");
@@ -185,9 +187,11 @@ template <nda::Array Arr>
 struct formatter<Arr> 
 {
 
+//  template<typename ParseContext>
+//  constexpr auto parse(ParseContext& ctx) -> decltype(ctx.begin()) {
   constexpr auto parse(format_parse_context& ctx) -> decltype(ctx.begin()) {
     auto it = ctx.begin(), end = ctx.end();
-    if (*it == '}') return it;
+    if (it == end || *it == '}') return it;
     if (*it == 'f') ++it;
     if (it != end && *it != '}')
       throw format_error("invalid format");
