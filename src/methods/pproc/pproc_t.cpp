@@ -282,14 +282,12 @@ namespace methods {
     nda::array<double ,2> kpts_interpolate;
     nda::array<long, 1> kpath_label_idx;
     std::string kpath_labels;
-    bool ws_lattice;
     nda::array<long, 2> Rpts_idx;
     nda::array<long, 1> Rpts_weights;
     {
       h5::file file(project_file, 'r');
       auto dft_grp = h5::group(file).open_group("dft_input");
       if (dft_grp.has_dataset("r_vector") and dft_grp.has_dataset("r_degeneracy")) {
-        ws_lattice = true;
         nda::h5_read(dft_grp, "r_vector", Rpts_idx);
         nda::h5_read(dft_grp, "r_degeneracy", Rpts_weights);
       } else {
@@ -373,7 +371,6 @@ namespace methods {
             mf.kp_grid()(0), mf.kp_grid()(1), mf.kp_grid()(2));
     app_log(1, "    - Number of k-points                = {} total, {} in the IBZ", mf.nkpts(), mf.nkpts_ibz());
     app_log(1, "  Output k-mesh:");
-    app_log(1, "    - Intermediate Wigner-Seitz lattice = {}", ws_lattice);
     app_log(1, "    - Kpath                             = {}.", kpath_labels);
     app_log(1, "    - Number of k-points                = {}\n", kpts_interpolate.shape(0));
 
