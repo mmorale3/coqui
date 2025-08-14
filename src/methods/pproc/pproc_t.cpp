@@ -322,10 +322,8 @@ namespace methods {
         id.pop_back();
         id.pop_back();
         // assemble kpath_labels, kpath_label_idx and print summary
-        long ip=0;
         app_log(3, "  kpath: ");
         for(int i=0; i<pts.size(); i++) {
-          ip += id[2*i].length();
           kpath_labels.push_back(id[2*i][0]);
           app_log(3, "    {} - {} : {} - {}",
                   id[2*i],pts[i](0,nda::range::all),id[2*i+1],pts[i](1,nda::range::all));

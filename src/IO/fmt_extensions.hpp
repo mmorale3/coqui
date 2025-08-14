@@ -94,7 +94,6 @@ struct fmt::formatter<Arr>
 
   template <typename FormatContext>
   auto format(Arr const& p, FormatContext& ctx) const -> decltype(ctx.out()) {
-    // can I use basic_ostream? <<p?
     *ctx.out()++ = '[';
     bool first = true;
     for(auto const& v : p) {
@@ -115,7 +114,8 @@ struct fmt::formatter<Arr>
 namespace std
 {
 template <> struct formatter<std::complex<double>> {
-  constexpr auto parse(format_parse_context& ctx) -> decltype(ctx.begin()) {
+  template<typename ParseContext>
+  constexpr auto parse(ParseContext& ctx) -> decltype(ctx.begin()) {
     auto it = ctx.begin(), end = ctx.end();
     if (it == end || *it == '}') return it;
     if (*it == 'f') ++it;
@@ -124,7 +124,8 @@ template <> struct formatter<std::complex<double>> {
     return it;
   } 
 
-  auto format(const std::complex<double>& p, std::format_context& ctx) const -> decltype(ctx.out()) {
+  template<typename FormatContext>
+  auto format(const std::complex<double>& p, FormatContext& ctx) const -> decltype(ctx.out()) {
     return std::format_to(
         ctx.out(),
         "({:f}, {:f})", 
@@ -134,7 +135,8 @@ template <> struct formatter<std::complex<double>> {
 
 template <> struct formatter<std::complex<float>> {
 //  char presentation = 'f';
-  constexpr auto parse(format_parse_context& ctx) -> decltype(ctx.begin()) {
+  template<typename ParseContext>
+  constexpr auto parse(ParseContext& ctx) -> decltype(ctx.begin()) {
     auto it = ctx.begin(), end = ctx.end();
     if (it == end || *it == '}') return it;
     if (*it == 'f') ++it;
@@ -143,7 +145,8 @@ template <> struct formatter<std::complex<float>> {
     return it;
   }
   
-  auto format(const std::complex<float>& p, std::format_context& ctx) -> decltype(ctx.out()) {
+  template<typename FormatContext>
+  auto format(const std::complex<float>& p, FormatContext& ctx) -> decltype(ctx.out()) {
     return std::format_to(
         ctx.out(),
         "({:f}, {:f})", 
@@ -155,9 +158,8 @@ template<typename T>
 struct formatter<std::vector<T>> 
 {
 
-//  template<typename ParseContext>
-//  constexpr auto parse(ParseContext& ctx) -> decltype(ctx.begin()) {
-  constexpr auto parse(format_parse_context& ctx) -> decltype(ctx.begin()) {
+  template<typename ParseContext>
+  constexpr auto parse(ParseContext& ctx) -> decltype(ctx.begin()) {
     auto it = ctx.begin(), end = ctx.end();
     if (it == end || *it == '}') return it;
     if (*it == 'f') ++it;
@@ -166,7 +168,8 @@ struct formatter<std::vector<T>>
     return it;
   }
 
-  auto format(std::vector<T> const& p, std::format_context& ctx) const -> decltype(ctx.out()) {
+  template<typename FormatContext>
+  auto format(std::vector<T> const& p, FormatContext& ctx) const -> decltype(ctx.out()) {
     *ctx.out()++ = '[';
     bool first = true;
     for(auto const& v : p) {
@@ -182,14 +185,12 @@ struct formatter<std::vector<T>>
 
 };
 
-// generalize to other template choices???
 template <nda::Array Arr>
 struct formatter<Arr> 
 {
 
-//  template<typename ParseContext>
-//  constexpr auto parse(ParseContext& ctx) -> decltype(ctx.begin()) {
-  constexpr auto parse(format_parse_context& ctx) -> decltype(ctx.begin()) {
+  template<typename ParseContext>
+  constexpr auto parse(ParseContext& ctx) -> decltype(ctx.begin()) {
     auto it = ctx.begin(), end = ctx.end();
     if (it == end || *it == '}') return it;
     if (*it == 'f') ++it;
@@ -198,8 +199,8 @@ struct formatter<Arr>
     return it;
   }
 
-  auto format(Arr const& p, std::format_context& ctx) const -> decltype(ctx.out()) {
-    // can I use basic_ostream? <<p?
+  template<typename FormatContext>
+  auto format(Arr const& p, FormatContext& ctx) const -> decltype(ctx.out()) {
     *ctx.out()++ = '[';
     bool first = true;
     for(auto const& v : p) {
