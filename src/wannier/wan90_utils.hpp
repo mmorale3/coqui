@@ -311,19 +311,19 @@ auto read_amn_file(std::string fname, bool transposed)
   return A;
 }
 
-void write_modest_h5(mf::MF &mf, ptree pt, nda::array<int,1> const& band_list, 
+void write_wan90_h5(mf::MF &mf, ptree pt, nda::array<int,1> const& band_list,
                      nda::MemoryArrayOfRank<3> auto const& eigv, nda::Array auto && Pkwa,
                      nda::MemoryArrayOfRank<3> auto && R_wan) {
 
   auto all = nda::range::all;
   app_log(2, "\n");
-  app_log(2," Writing ModEST h5 file.");
+  app_log(2," Writing Wannier90 results into h5 file");
 
   auto [nspin,nkpts,nwann,nband] = Pkwa.shape();
 
   auto prefix = io::get_value<std::string>(pt,"prefix");
   auto dset_name = io::get_value_with_default<std::string>(pt,"dset_name","dft_input");
-  auto h5_fname = io::get_value_with_default<std::string>(pt,"h5_filename",prefix+".modest.h5");
+  auto h5_fname = io::get_value_with_default<std::string>(pt,"h5_filename",prefix+".mlwf.h5");
  
   // read shell information: 'atom', 'sort', 'l', 'dim', 'SO', 'irep'
   nda::array<long,2> shells = { {0,0,0,long(nwann),0,0} };
@@ -338,7 +338,7 @@ void write_modest_h5(mf::MF &mf, ptree pt, nda::array<int,1> const& band_list,
                          shell_dim.size(),shell_SO.size(),shell_irrep.size()}); 
   auto check_size = [&](std::vector<long> &A, std::string const& str) {
         utils::check(A.size()==0 or A.size()==nshell, 
-          "write_modest_h5: Incompatible size in shell definition of {}: nshell:{}, size:{}",
+          "write_wan90_h5: Incompatible size in shell definition of {}: nshell:{}, size:{}",
           str,nshell,A.size());  
       };
   check_size(shell_atoms,"shells.atoms"); 
@@ -353,11 +353,11 @@ void write_modest_h5(mf::MF &mf, ptree pt, nda::array<int,1> const& band_list,
       shell_dim.emplace_back(long(nwann));
   } else {
     utils::check(shell_dim.size() == nshell, 
-                 "write_modest_h5: shells.dim is required if any shell information is provided."); 
+                 "write_wan90_h5: shells.dim is required if any shell information is provided.");
   }
   long tot_norbs = std::accumulate(shell_dim.begin(),shell_dim.end(),0);
   utils::check(tot_norbs <= nwann,
-               "write_modest_h5: Too many orbitals specified in shells: sum(shells.dim):{}, nwann:{}",
+               "write_wan90_h5: Too many orbitals specified in shells: sum(shells.dim):{}, nwann:{}",
                tot_norbs,nwann); 
   if(nshell > 0) {
     shells = nda::array<long,2>{nshell,6};
@@ -484,7 +484,7 @@ void write_modest_h5(mf::MF &mf, ptree pt, nda::array<int,1> const& band_list,
   // hopping: assuming bloch_basis = T
   {
     auto bloch_basis = io::get_value_with_default<bool>(pt,"bloch_basis",true);
-    utils::check(bloch_basis, "write_modest_h5: bloch_basis = false not implemented yet.");
+    utils::check(bloch_basis, "write_wan90_h5: bloch_basis = false not implemented yet.");
     nda::array<ComplexType,4> hopping(nkpts,nspin,nband,nband);
     hopping() = ComplexType(0.0);
     ComplexType ef(mf.efermi()/3.674932540e-2);

@@ -1013,7 +1013,7 @@ auto wannier90_library_run(utils::mpi_context_t<mpi3::communicator> &mpi, mf::MF
   auto write_amn = io::get_value_with_default<bool>(pt,"write_amn",false);
   auto write_eigv = io::get_value_with_default<bool>(pt,"write_eig",false);
   auto write_nnkp = io::get_value_with_default<bool>(pt,"write_nnkp",false);
-  auto write_modest = io::get_value_with_default<bool>(pt,"write_modest",true);
+  auto write_h5 = io::get_value_with_default<bool>(pt,"write_h5",true);
 
   int nband = 0;
   int nwann = 0;
@@ -1387,8 +1387,8 @@ auto wannier90_library_run(utils::mpi_context_t<mpi3::communicator> &mpi, mf::MF
   mpi.broadcast(wann_center);
   mpi.broadcast(wann_spreads);
 
-  if(mpi.comm.root() and write_modest) {
-    write_modest_h5(mf,pt,band_list,eigv,Amn,wann_center);
+  if(mpi.comm.root() and write_h5) {
+    write_wan90_h5(mf,pt,band_list,eigv,Amn,wann_center);
   }
   mpi.comm.barrier();
 

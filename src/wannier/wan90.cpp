@@ -149,9 +149,9 @@ void wannier90_library_mode_from_nnkp(mf::MF &mf, ptree &pt)
  */
 void wannier90_library_mode(mf::MF &mf, ptree &pt)
 {
-  app_log(2, "*************************************************");
-  app_log(2, "       Running Wannier90 in library-mode         "); 
-  app_log(2, "*************************************************");
+  app_log(1, "*************************************************");
+  app_log(1, "       Running Wannier90 in library-mode         ");
+  app_log(1, "*************************************************");
 
   auto& mpi = *(mf.mpi());
   auto prefix = io::get_value<std::string>(pt,"prefix");
@@ -172,9 +172,9 @@ void wannier90_library_mode(mf::MF &mf, ptree &pt)
 
   // write files 
 
-  app_log(2, "*************************************************");
-  app_log(2, "                Done with Wannier90              "); 
-  app_log(2, "*************************************************");
+  app_log(1, "*************************************************");
+  app_log(1, "                Done with Wannier90              ");
+  app_log(1, "*************************************************");
 
 }
 
