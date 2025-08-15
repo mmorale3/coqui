@@ -78,3 +78,40 @@ def test_downfold(mpi):
     if mpi.root():
         os.remove("./gw.mbpt.h5")
     mpi.barrier()
+
+def test_local_coulomb_from_mf(mpi):
+    mf = construct_qe_mf(mpi, "qe_lih222_sym")
+    eri_params = {
+        "storage": "incore",
+        "nIpts": mf.nbnd() * 10,
+        "thresh": 1e-10,
+        "chol_block_size": 1,
+        "init": True
+    }
+    thc = coqui.make_thc_coulomb(mf, eri_params)
+
+    # downfold the local screened interaction
+    wloc_params = {
+        "outdir": "./", "prefix": "crpa",
+        "screen_type": "crpa",
+        "input_type": "mf",
+        "wannier_file": mf.outdir() + "/lih_wan.h5",
+        "permut_symm": True, "force_real": True
+    }
+    Vloc, Wloc_t = coqui.downfold_local_coulomb(thc, wloc_params)#, projector_info=proj_info)
+
+    assert np.allclose(Vloc.imag, 0.0, atol=1e-12), "Imaginary part of Vloc is not negligible"
+    assert Vloc[0,0,0,0] == pytest.approx(1.4160723518754155, abs=1e-12)
+    assert Vloc[0,0,1,1] == pytest.approx(0.25499347676713535, abs=1e-12)
+    assert Vloc[0,1,0,1] == pytest.approx(4.286546964169289e-05, abs=1e-12)
+    assert Vloc[1,1,1,1] == pytest.approx(0.5557140951494038, abs=1e-12)
+
+    assert np.allclose(Wloc_t.imag, 0.0, atol=1e-12), "Imaginary part of Wloc(t) is not negligible"
+    assert Wloc_t[0,0,0,0,0] == pytest.approx(-0.2058301133749745, abs=1e-12)
+    assert Wloc_t[0,0,0,1,1] == pytest.approx(-0.04205916393585766, abs=1e-12)
+    assert Wloc_t[0,0,1,0,1] == pytest.approx(-6.881435931595962e-06, abs=1e-12)
+    assert Wloc_t[0,1,1,1,1] == pytest.approx(-0.08689366256595832, abs=1e-12)
+
+    if mpi.root():
+        os.remove("./crpa.mbpt.h5")
+    mpi.barrier()
