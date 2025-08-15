@@ -124,7 +124,7 @@ T read_key(std::string const& file_data, std::string const& key, T def = T{}) {
         if(iss2 >> val) {
           return val;
         } else
-          utils::check(false,"Error parsing line: {}",line);
+          utils::check(false,"Error parsing line: {} token:{}",line,token);
       }
     }
   }

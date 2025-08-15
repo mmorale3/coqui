@@ -25,7 +25,7 @@ void add_to_kpath(std::vector<nda::stack_array<double,3>> & kplist,
   }
 }
 
-auto WS_rgrid_impl(nda::MemoryArrayOfRank<2> auto const& recv,
+auto WS_rgrid_impl(nda::MemoryArrayOfRank<2> auto const& lattv,
               nda::MemoryArrayOfRank<1> auto && mesh, 
               nda::MemoryArrayOfRank<1> auto && rgrid,
               double tol,
@@ -34,7 +34,7 @@ auto WS_rgrid_impl(nda::MemoryArrayOfRank<2> auto const& recv,
 {
   auto all = nda::range::all;
   using arr = nda::stack_array<long,3>;
-  utils::check(recv.shape() == std::array<long,2>{3,3}, "Size mismatch.");
+  utils::check(lattv.shape() == std::array<long,2>{3,3}, "Size mismatch.");
   utils::check(mesh.size() == 3, "Size mismatch.");
   utils::check(rgrid.size() == 3, "Size mismatch.");
   nda::stack_array<double,3> r2;
@@ -51,9 +51,9 @@ auto WS_rgrid_impl(nda::MemoryArrayOfRank<2> auto const& recv,
         for( auto ii : nda::range(-rgrid(0)-1,rgrid(0)+2) )
           for( auto jj : nda::range(-rgrid(1)-1,rgrid(1)+2) )
             for( auto kk : nda::range(-rgrid(2)-1,rgrid(2)+2) ) {
-              r2() = recv(0,all) * double(i - mesh(0)*ii) + 
-                     recv(1,all) * double(j - mesh(1)*jj) + 
-                     recv(2,all) * double(k - mesh(2)*kk); 
+              r2() = lattv(0,all) * double(i - mesh(0)*ii) + 
+                     lattv(1,all) * double(j - mesh(1)*jj) + 
+                     lattv(2,all) * double(k - mesh(2)*kk); 
               dist(ip++) = nda::sum(r2*r2); 
             } 
         double dmin = *std::min_element(dist.begin(),dist.end());
@@ -67,7 +67,7 @@ auto WS_rgrid_impl(nda::MemoryArrayOfRank<2> auto const& recv,
 
   double sum_degen = 0.0;
   for( auto x : deg ) sum_degen += 1.0/double(x);
-  if( sum_degen != N ) return false;
+  if( std::abs(sum_degen-double(N)) > 1e-8 ) return false;
 
   utils::check(ws.size() == deg.size(), "WS_rgrid_impl: Size mismatch");
 
@@ -134,25 +134,26 @@ auto generate_kpath(nda::MemoryArrayOfRank<2> auto const& recv,
 /*
  * Constructs the list of grid points and their degeneracies in the Wigner-Seitz cell of the supercell.
  */
-auto WS_rgrid(nda::MemoryArrayOfRank<2> auto const& recv,
+auto WS_rgrid(nda::MemoryArrayOfRank<2> auto const& lattv,
               nda::MemoryArrayOfRank<1> auto && mesh, 
               double tol = 1e-6) {
 
   // MAM: not sure how to determine the optimal grid, trying until I find it
   // FIX FIX FIX: This will rurely fail for highly anisotropic grids
+ 
   long N = mesh(0)*mesh(1)*mesh(2);
   nda::array<long,2> rp;
   nda::array<long,1> rw;
   for(long i=2; i<6; ++i) { 
     nda::stack_array<long,3> rg = {i,i,i};
-    if( detail::WS_rgrid_impl(recv,mesh,rg,tol,rp,rw) ) 
+    if( detail::WS_rgrid_impl(lattv,mesh,rg,tol,rp,rw) ) 
       return std::make_tuple(rw,rp);
   }
   // Failed to generate grid, fall back to trivial choice 
   app_log(2, "  [WARNING] Failed to generate Wigner-Seitz grid. Contact developers."); 
   app_log(2, "            Falling back to uniform R-grid, which can lead to larger interpolation errors."); 
   app_log(2, "            k-mesh:{}",mesh());
-  app_log(2, "            recv:{}",recv());
+  app_log(2, "            lattv:{}",lattv());
 
   rp.resize(std::array<long,2>{N,3});
   rw.resize(std::array<long,1>{N});

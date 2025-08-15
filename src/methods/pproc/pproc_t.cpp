@@ -291,7 +291,7 @@ namespace methods {
         nda::h5_read(dft_grp, "r_vector", Rpts_idx);
         nda::h5_read(dft_grp, "r_degeneracy", Rpts_weights);
       } else {
-        std::tie(Rpts_weights,Rpts_idx) = utils::WS_rgrid(mf.recv(),mf.kp_grid()); 
+        std::tie(Rpts_weights,Rpts_idx) = utils::WS_rgrid(mf.lattv(),mf.kp_grid()); 
       }
 
       auto kpath_str = io::get_value_with_default<std::string>(pt, "kpath", "");
