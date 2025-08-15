@@ -101,7 +101,7 @@ namespace methods {
       auto iteration = io::get_value_with_default<int>(pt, "iteration", -1);
 
       auto ac_alg  = io::get_value_with_default<std::string>(pt,"ac_alg","pade");
-      auto eta     = io::get_value_with_default<double>(pt,"eta",0.01);
+      auto eta     = io::get_value_with_default<double>(pt,"eta",0.001);
       auto Nfit    = io::get_value_with_default<int>(pt, "Nfit", -1);
       auto w_min   = io::get_value_with_default<double>(pt,"w_min",-1.0);
       auto w_max   = io::get_value_with_default<double>(pt,"w_max",1.0);

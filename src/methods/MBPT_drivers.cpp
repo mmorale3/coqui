@@ -65,7 +65,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
   auto output = io::get_value_with_default<std::string>(pt,"output","bdft.mbpt");
 
   auto restart = io::get_value_with_default<bool>(pt,"restart",false);
-  auto input_grp = io::get_value_with_default<std::string>(pt,"input_grp", "scf");
+  auto input_grp = io::get_value_with_default<std::string>(pt,"input_type", "scf");
   auto input_iter = io::get_value_with_default<long>(pt, "input_iter", -1);
 
   auto beta = io::get_value_with_default<double>(pt,"beta",1000.0);
@@ -237,7 +237,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
   auto output = io::get_value_with_default<std::string>(pt,"output","bdft.mbpt");
 
   auto restart = io::get_value_with_default<bool>(pt,"restart",false);
-  auto input_grp = io::get_value_with_default<std::string>(pt,"input_grp", "scf");
+  auto input_grp = io::get_value_with_default<std::string>(pt,"input_type", "scf");
   auto input_iter = io::get_value_with_default<long>(pt, "input_iter", -1);
 
   auto trans_home_cell = io::get_value_with_default<bool>(pt,"translate_home_cell",false);
@@ -379,8 +379,8 @@ auto downfold_gloc_impl(std::shared_ptr<mf::MF> mf,
                         ptree const& pt)
 -> nda::array<ComplexType, 5> {
   std::string err = std::string("downfolding_1e - Incorrect input - ");
-  auto g_grp = io::get_value<std::string>(pt, "input_grp", err+"input_grp");
-  auto g_iter = io::get_value<long>(pt, "input_iter", err+"input_iter");
+  auto g_grp = io::get_value<std::string>(pt, "input_type", err+"input_type");
+  auto g_iter = io::get_value_with_default<long>(pt, "input_iter", -1);
   auto force_real = io::get_value_with_default<bool>(pt, "force_real", true);
   embed_t embed(*mf);
   return embed.downfold_gloc(mb_state, force_real, g_grp, g_iter);
@@ -417,8 +417,10 @@ std::tuple<nda::array<ComplexType, 4>, nda::array<ComplexType, 5> >
 downfold_wloc_impl(eri_t &eri, MBState&& mb_state, ptree const& pt,
                    std::optional<std::map<std::string, nda::array<ComplexType, 5> > > local_polarizabilities) {
   std::string err = std::string("downfolding_2e - Incorrect input - ");
-  auto g_grp = io::get_value<std::string>(pt, "input_grp");
-  auto g_iter = io::get_value<long>(pt, "input_iter");
+  auto g_grp = io::get_value<std::string>(pt, "input_type");
+  io::tolower(g_grp);
+  g_grp = (g_grp == "mf")? "scf" : g_grp;
+  auto g_iter = io::get_value_with_default<long>(pt, "input_iter", -1);
   auto screen_type = io::get_value<std::string>(
       pt, "screen_type", err+"screen_type. This parameter determines the type of screened interactions for the downfolded Hamiltonian. "
                              "Valid types are \"crpa\", \"crpa_ks\", \"crpa_vasp\", "
@@ -454,9 +456,8 @@ downfold_wloc(eri_t &eri, ptree const& pt,
   auto prefix = io::get_value<std::string>(pt,"prefix",err+"prefix");
   auto wannier_file = io::get_value<std::string>(pt,"wannier_file",err+"wannier_file");
   auto trans_home_cell = io::get_value_with_default<bool>(pt,"translate_home_cell",false);
-  auto input_type = io::get_value<std::string>(
-      pt,"input_type",
-      err+"input_type. This parameter defines the source of input Green's function. Valid types are \"mf\" and \"coqui\". ");
+  auto input_type = io::get_value<std::string>(pt, "input_type",
+      err+"input_type. This parameter defines the source of input Green's function. Valid types are \"mf\", \"scf\", and \"embed\".");
   io::tolower(input_type);
 
   auto mf = eri.MF();
@@ -470,9 +471,9 @@ downfold_wloc(eri_t &eri, ptree const& pt,
     imag_axes_ft::IAFT ft(beta, lambda, imag_axes_ft::ir_source, iaft_prec, true);
     hamilt::pseudopot psp(*mf);
     write_mf_data(*mf, ft, psp, output);
-  } else if (input_type == "coqui") {
+  } else if (input_type == "scf" or input_type == "embed") {
     utils::check(std::filesystem::exists(output+".mbpt.h5"),
-                 "downfold_2e: input_type == \"coqui\" while the coqui h5, {}.mbpt.h5, does not exist!", output);
+                 "downfold_2e: input_type == \"{}\" while the coqui h5, {}.mbpt.h5, does not exist!", input_type, output);
   } else
     utils::check(false, "downfold_2e: invalid input_type = {}. Valid options are \"mf\" and \"coqui\".", input_type);
 
@@ -493,25 +494,25 @@ downfold_wloc(eri_t &eri, ptree const& pt,
   auto outdir = io::get_value_with_default<std::string>(pt,"outdir","./");
   auto prefix = io::get_value<std::string>(pt,"prefix",err+"prefix");
   auto trans_home_cell = io::get_value_with_default<bool>(pt,"translate_home_cell",false);
-  auto input_type = io::get_value<std::string>(
-      pt,"input_type",
-      err+"input_type. This parameter defines the source of input Green's function. Valid types are \"mf\" and \"coqui\". ");
+  auto input_type = io::get_value<std::string>(pt,"input_type",
+      err+"input_type. This parameter defines the source of input Green's function. Valid types are \"mf\", \"scf\", and \"embed\". ");
   io::tolower(input_type);
 
   auto mf = eri.MF();
   std::string output = outdir + "/" + prefix;
   if (input_type == "mf") {
-    utils::check(not std::filesystem::exists(output+".mbpt.h5"), "downfold_wloc: input_type = \"mf\" can not be launched if {}.mbpt.h5 already exists. "
-                                                                 "Please set input_type = \"coqui\" and input_iter = 0 if you want to use MF Green's function as the input.", output);
+    utils::check(not std::filesystem::exists(output+".mbpt.h5"),
+                 "downfold_wloc: input_type = \"mf\" can not be launched if {}.mbpt.h5 already exists. "
+                 "Set input_type = \"scf\" and input_iter = 0 if you want to use MF Green's function as the input.", output);
     auto beta = io::get_value_with_default<double>(pt,"beta", 1000.0);
     auto lambda = io::get_value_with_default<double>(pt,"lambda", 12000.0);
     auto iaft_prec = io::get_value_with_default<std::string>(pt, "iaft_prec", "high");
     imag_axes_ft::IAFT ft(beta, lambda, imag_axes_ft::ir_source, iaft_prec, true);
     hamilt::pseudopot psp(*mf);
     write_mf_data(*mf, ft, psp, output);
-  } else if (input_type == "coqui") {
+  } else if (input_type == "scf" or input_type == "embed") {
     utils::check(std::filesystem::exists(output+".mbpt.h5"),
-                 "downfold_2e: input_type == \"coqui\" while the coqui h5, {}.mbpt.h5, does not exist!", output);
+                 "downfold_2e: input_type == \"{}\" while the coqui h5, {}.mbpt.h5, does not exist!", input_type, output);
   } else
     utils::check(false, "downfold_2e: invalid input_type = {}. Valid options are \"mf\" and \"coqui\".", input_type);
 

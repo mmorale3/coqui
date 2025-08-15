@@ -21,7 +21,7 @@ def test_downfold(mpi):
 
     gw_params = {
         "restart": False, "output": "gw", "niter": 1,
-        "beta": 300, "lambda": 1200, "iaft_prec": "mid",
+        "beta": 300, "lambda": 1200, "iaft_prec": "medium",
         "iter_alg": {"alg": "damping", "mixing": 0.7}
     }
     coqui.run_gw(gw_params, h_int=thc)
@@ -32,7 +32,7 @@ def test_downfold(mpi):
     # downfold the local Green's function
     gloc_params = {
         "outdir": "./", "prefix": "gw",
-        "input_grp": "scf", "input_iter": 1,
+        "input_type": "scf", "input_iter": 1,
         "wannier_file": mf.outdir() + "/lih_wan.h5",
         "force_real": True
     }
@@ -47,7 +47,7 @@ def test_downfold(mpi):
     wloc_params = {
         "outdir": "./", "prefix": "gw",
         "screen_type": "gw_edmft_density",
-        "input_type": "coqui", "input_grp": "scf", "input_iter": 1,
+        "input_type": "scf", "input_iter": 1,
         "wannier_file": mf.outdir() + "/lih_wan.h5",
         "permut_symm": True, "force_real": True
     }

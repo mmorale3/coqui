@@ -17,7 +17,7 @@ def downfold_local_gf(mf, df_params, *, projector_info=None):
         )[:,:,0]
 
 
-def downfold_local_coulomb(eri, df_params, *, projector_info=None, local_polarizabilities=None):
+def downfold_local_coulomb(h_int, df_params, *, projector_info=None, local_polarizabilities=None):
     if local_polarizabilities is not None:
         required_keys = {"imp", "dc"}
         missing = required_keys - local_polarizabilities.keys()
@@ -28,14 +28,14 @@ def downfold_local_coulomb(eri, df_params, *, projector_info=None, local_polariz
 
     if projector_info is None:
         return embed_cxx.downfold_wloc(
-            eri, json.dumps(df_params), local_polarizabilities=local_polarizabilities
+            h_int, json.dumps(df_params), local_polarizabilities=local_polarizabilities
         )
     else:
         proj_mat = projector_info.get("proj_mat")
         band_window = projector_info.get("band_window")
         kpts_w90 = projector_info.get("kpts_w90")
         return embed_cxx.downfold_wloc(
-            eri, json.dumps(df_params), proj_mat, band_window, kpts_w90,
+            h_int, json.dumps(df_params), proj_mat, band_window, kpts_w90,
             local_polarizabilities=local_polarizabilities
         )
 
@@ -62,7 +62,7 @@ def downfold_1e(mf, df_params,
                               local_selfenergies = local_selfenergies)
 
 
-def downfold_2e(eri, df_params,
+def downfold_2e(h_int, df_params,
                 *, projector_info = None, pi_imp_and_dc = None):
     if pi_imp_and_dc is None:
         pi_imp, pi_dc = None, None
@@ -74,11 +74,11 @@ def downfold_2e(eri, df_params,
         proj_mat = projector_info.get("proj_mat")
         band_window = projector_info.get("band_window")
         kpts_w90 = projector_info.get("kpts_w90")
-        embed_cxx.downfold_2e(eri, json.dumps(df_params),
+        embed_cxx.downfold_2e(h_int, json.dumps(df_params),
                               proj_mat, band_window, kpts_w90,
                               pi_imp_opt=pi_imp, pi_dc_opt=pi_dc)
     else:
-        embed_cxx.downfold_2e(eri, json.dumps(df_params),
+        embed_cxx.downfold_2e(h_int, json.dumps(df_params),
                               pi_imp_opt=pi_imp, pi_dc_opt=pi_dc)
 
 

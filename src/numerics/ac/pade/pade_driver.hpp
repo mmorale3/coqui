@@ -31,7 +31,7 @@ namespace analyt_cont {
       if (!is_iw_pos_only) utils::check(niw % 2 == 0, "pade_driver::init: niw ({}) % 2 != 0", niw);
 
       long niw_pos = (is_iw_pos_only)? niw : niw/2;
-      if (Nfit == -1) Nfit = 18;
+      if (Nfit == -1) Nfit = niw_pos;
       utils::check(Nfit <= niw_pos,
                    "pade_driver::init: Nfit ({}) > number of positive imaginary frequency points ({})",
                    Nfit, niw_pos);

@@ -92,13 +92,13 @@ namespace imag_axes_ft {
           utils::check(false, "imag_axes_ft::ir: prec = {} is not acceptable. Acceptable list = \"high\", \"medium\", \"low\"", prec);
         }
 
-        app_log(2, "  Mesh details on the imaginary axis");
-        app_log(2, "  ----------------------------------");
-        app_log(2, "  Intermediate Representation");
-        app_log(2, "  Beta                   = {} a.u.", beta);
-        app_log(2, "  Lambda                 = {}", lambda);
-        app_log(2, "  Precision              = {}", prec_prefix);
-        app_log(2, "  nt_f, nt_b, nw_f, nw_b = {}, {}, {}, {}\n", nt_f, nt_b, nw_f, nw_b);
+        app_log(1, "  Mesh details on the imaginary axis");
+        app_log(1, "  ----------------------------------");
+        app_log(1, "  Intermediate Representation");
+        app_log(1, "  Beta                   = {} a.u.", beta);
+        app_log(1, "  Lambda                 = {}", lambda);
+        app_log(1, "  Precision              = {}", prec_prefix);
+        app_log(1, "  nt_f, nt_b, nw_f, nw_b = {}, {}, {}, {}\n", nt_f, nt_b, nw_f, nw_b);
       }
 
       std::string ir_file(double lbda, std::string prec_prefix) {
