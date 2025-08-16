@@ -72,10 +72,25 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
   auto lambda = io::get_value_with_default<double>(pt,"lambda",12000.0);
   auto iaft_prec = io::get_value_with_default<std::string>(pt, "iaft_prec", "high");
 
-  if (restart and not std::filesystem::exists(output+".mbpt.h5")) {
-    restart = true;
-    app_log(2, "mbpt: Restart mode is set to true, but no previous mbpt calculation found. "
-               "--> CoQui will restart from scratch.");
+  bool chkpt_exist = std::filesystem::exists(output + ".mbpt.h5");
+  if (restart and !chkpt_exist) {
+    restart = false;
+    app_log(1, "");
+    app_log(1, "╔══════════════════════════════════════════════════════════╗");
+    app_log(1, "║ [ WARNING ]                                              ║");
+    app_log(1, "║ Running in restart mode while the checkpoint HDF5 does   ║");
+    app_log(1, "║ not exist. Switching to the start-from-scratch mode.     ║");
+    app_log(1, "╚══════════════════════════════════════════════════════════╝\n");
+  } else if (not restart and chkpt_exist) {
+    app_log(1, "");
+    app_log(1, "╔══════════════════════════════════════════════════════════╗");
+    app_log(1, "║ [ WARNING ]                                              ║");
+    app_log(1, "║ An existing CoQuí checkpoint HDF5 with the same prefix   ║");
+    app_log(1, "║ has been detected even though CoQuí is running in the    ║");
+    app_log(1, "║ start-from-scratch mode. --> The old checkpoint will be  ║");
+    app_log(1, "║ overwritten. Considering move the old HDF5 or change the ║");
+    app_log(1, "║ prefix next time.                                        ║");
+    app_log(1, "╚══════════════════════════════════════════════════════════╝\n");
   }
 
   imag_axes_ft::IAFT ft = (!restart)?
@@ -239,6 +254,26 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
   auto restart = io::get_value_with_default<bool>(pt,"restart",false);
   auto input_grp = io::get_value_with_default<std::string>(pt,"input_type", "scf");
   auto input_iter = io::get_value_with_default<long>(pt, "input_iter", -1);
+  bool chkpt_exist = std::filesystem::exists(output + ".mbpt.h5");
+  if (restart and !chkpt_exist) {
+    restart = false;
+    app_log(1, "");
+    app_log(1, "╔══════════════════════════════════════════════════════════╗");
+    app_log(1, "║ [ WARNING ]                                              ║");
+    app_log(1, "║ Running in restart mode while the checkpoint HDF5 does   ║");
+    app_log(1, "║ not exist. Switching to the start-from-scratch mode.     ║");
+    app_log(1, "╚══════════════════════════════════════════════════════════╝\n");
+  } else if (not restart and chkpt_exist) {
+    app_log(1, "");
+    app_log(1, "╔══════════════════════════════════════════════════════════╗");
+    app_log(1, "║ [ WARNING ]                                              ║");
+    app_log(1, "║ An existing CoQuí checkpoint HDF5 with the same prefix   ║");
+    app_log(1, "║ has been detected even though CoQuí is running in the    ║");
+    app_log(1, "║ start-from-scratch mode. --> The old checkpoint will be  ║");
+    app_log(1, "║ overwritten. Considering move the old HDF5 or change the ║");
+    app_log(1, "║ prefix next time.                                        ║");
+    app_log(1, "╚══════════════════════════════════════════════════════════╝\n");
+  }
 
   auto trans_home_cell = io::get_value_with_default<bool>(pt,"translate_home_cell",false);
 
@@ -378,7 +413,7 @@ auto downfold_gloc_impl(std::shared_ptr<mf::MF> mf,
                         MBState&& mb_state,
                         ptree const& pt)
 -> nda::array<ComplexType, 5> {
-  std::string err = std::string("downfolding_1e - Incorrect input - ");
+  std::string err = std::string("downfold_gloc_impl - Incorrect input - ");
   auto g_grp = io::get_value<std::string>(pt, "input_type", err+"input_type");
   auto g_iter = io::get_value_with_default<long>(pt, "input_iter", -1);
   auto force_real = io::get_value_with_default<bool>(pt, "force_real", true);
@@ -391,7 +426,7 @@ auto downfold_gloc(std::shared_ptr<mf::MF> mf, ptree const& pt,
                   nda::array<long, 3> const& band_window,
                   nda::array<RealType, 2> const& kpts_crys)
   -> nda::array<ComplexType, 5> {
-  std::string err = std::string("downfolding_1e - Incorrect input - ");
+  std::string err = std::string("downfold_gloc - Incorrect input - ");
   auto prefix = io::get_value<std::string>(pt, "prefix", err+"prefix");
   auto outdir = io::get_value_with_default<std::string>(pt, "outdir", "./");
   auto trans_home_cell = io::get_value_with_default<bool>(pt, "translate_home_cell", false);
@@ -402,7 +437,7 @@ auto downfold_gloc(std::shared_ptr<mf::MF> mf, ptree const& pt,
 
 auto downfold_gloc(std::shared_ptr<mf::MF> mf, ptree const& pt)
 -> nda::array<ComplexType, 5> {
-  std::string err = std::string("downfolding_1e - Incorrect input - ");
+  std::string err = std::string("downfold_gloc - Incorrect input - ");
   auto prefix = io::get_value<std::string>(pt, "prefix", err+"prefix");
   auto outdir = io::get_value_with_default<std::string>(pt, "outdir", "./");
   auto wannier_file = io::get_value<std::string>(pt,"wannier_file",err+"wannier_file");
@@ -416,7 +451,7 @@ template<typename eri_t>
 std::tuple<nda::array<ComplexType, 4>, nda::array<ComplexType, 5> >
 downfold_wloc_impl(eri_t &eri, MBState&& mb_state, ptree const& pt,
                    std::optional<std::map<std::string, nda::array<ComplexType, 5> > > local_polarizabilities) {
-  std::string err = std::string("downfolding_2e - Incorrect input - ");
+  std::string err = std::string("downfold_wloc_impl - Incorrect input - ");
   auto g_grp = io::get_value<std::string>(pt, "input_type");
   io::tolower(g_grp);
   g_grp = (g_grp == "mf")? "scf" : g_grp;
@@ -451,7 +486,7 @@ template<typename eri_t>
 std::tuple<nda::array<ComplexType, 4>, nda::array<ComplexType, 5> >
 downfold_wloc(eri_t &eri, ptree const& pt,
               std::optional<std::map<std::string, nda::array<ComplexType, 5> > > local_polarizabilities) {
-  std::string err = std::string("downfolding_2e - Incorrect input - ");
+  std::string err = std::string("downfold_wloc - Incorrect input - ");
   auto outdir = io::get_value_with_default<std::string>(pt,"outdir","./");
   auto prefix = io::get_value<std::string>(pt,"prefix",err+"prefix");
   auto wannier_file = io::get_value<std::string>(pt,"wannier_file",err+"wannier_file");
@@ -463,12 +498,20 @@ downfold_wloc(eri_t &eri, ptree const& pt,
   auto mf = eri.MF();
   std::string output = outdir + "/" + prefix;
   if (input_type == "mf") {
-    utils::check(not std::filesystem::exists(output+".mbpt.h5"), "downfold_wloc: input_type = \"mf\" can not be launched if {}.mbpt.h5 already exists. "
-                                                                 "Please set input_type = \"coqui\" and input_iter = 0 if you want to use MF Green's function as the input.", output);
+    if (std::filesystem::exists(output+".mbpt.h5")) {
+      app_log(1, "");
+      app_log(1, "╔══════════════════════════════════════════════════════════╗");
+      app_log(1, "║ [ WARNING ]                                              ║");
+      app_log(1, "║ Input type is set to \"mf\", while a CoQuí checkpoint      ║");
+      app_log(1, "║ HDF5 with the same prefix has been detected. CoQuí will  ║");
+      app_log(1, "║ overwrite the old checkpoint. Considering moving the old ║");
+      app_log(1, "║ HDF5 or changing CoQuí prefix next time.                 ║");
+      app_log(1, "╚══════════════════════════════════════════════════════════╝\n");
+    }
     auto beta = io::get_value_with_default<double>(pt,"beta", 1000.0);
     auto lambda = io::get_value_with_default<double>(pt,"lambda", 12000.0);
     auto iaft_prec = io::get_value_with_default<std::string>(pt, "iaft_prec", "high");
-    imag_axes_ft::IAFT ft(beta, lambda, imag_axes_ft::ir_source, iaft_prec, true);
+    imag_axes_ft::IAFT ft(beta, lambda, imag_axes_ft::ir_source, iaft_prec, false);
     hamilt::pseudopot psp(*mf);
     write_mf_data(*mf, ft, psp, output);
   } else if (input_type == "scf" or input_type == "embed") {
@@ -490,7 +533,7 @@ downfold_wloc(eri_t &eri, ptree const& pt,
               nda::array<long, 3> const& band_window,
               nda::array<RealType, 2> const& kpts_crys,
               std::optional<std::map<std::string, nda::array<ComplexType, 5> > > local_polarizabilities) {
-  std::string err = std::string("downfolding_2e - Incorrect input - ");
+  std::string err = std::string("downfold_wloc - Incorrect input - ");
   auto outdir = io::get_value_with_default<std::string>(pt,"outdir","./");
   auto prefix = io::get_value<std::string>(pt,"prefix",err+"prefix");
   auto trans_home_cell = io::get_value_with_default<bool>(pt,"translate_home_cell",false);
@@ -501,13 +544,20 @@ downfold_wloc(eri_t &eri, ptree const& pt,
   auto mf = eri.MF();
   std::string output = outdir + "/" + prefix;
   if (input_type == "mf") {
-    utils::check(not std::filesystem::exists(output+".mbpt.h5"),
-                 "downfold_wloc: input_type = \"mf\" can not be launched if {}.mbpt.h5 already exists. "
-                 "Set input_type = \"scf\" and input_iter = 0 if you want to use MF Green's function as the input.", output);
+    if (std::filesystem::exists(output+".mbpt.h5")) {
+      app_log(1, "");
+      app_log(1, "╔══════════════════════════════════════════════════════════╗");
+      app_log(1, "║ [ WARNING ]                                              ║");
+      app_log(1, "║ Input type is set to \"mf\", while a CoQuí checkpoint      ║");
+      app_log(1, "║ HDF5 with the same prefix has been detected. CoQuí will  ║");
+      app_log(1, "║ overwrite the old checkpoint. Considering moving the old ║");
+      app_log(1, "║ HDF5 or changing CoQuí prefix next time.                 ║");
+      app_log(1, "╚══════════════════════════════════════════════════════════╝\n");
+    }
     auto beta = io::get_value_with_default<double>(pt,"beta", 1000.0);
     auto lambda = io::get_value_with_default<double>(pt,"lambda", 12000.0);
     auto iaft_prec = io::get_value_with_default<std::string>(pt, "iaft_prec", "high");
-    imag_axes_ft::IAFT ft(beta, lambda, imag_axes_ft::ir_source, iaft_prec, true);
+    imag_axes_ft::IAFT ft(beta, lambda, imag_axes_ft::ir_source, iaft_prec, false);
     hamilt::pseudopot psp(*mf);
     write_mf_data(*mf, ft, psp, output);
   } else if (input_type == "scf" or input_type == "embed") {

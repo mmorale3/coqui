@@ -267,18 +267,18 @@ namespace methods {
     auto[W, Wp, J_pair_scr, J_spin_scr] = orbital_average_int(W_wabcd(0,nda::ellipsis{}));
 
     double hartree_to_eV = 27.211386245988;
-    app_log(2, "\ndownfold_2e summary");
-    app_log(2, "-------------------");
-    app_log(2, "bare interactions (orbital-average):");
-    app_log(2, "  - intra-orbital = {} eV", V*hartree_to_eV);
-    app_log(2, "  - inter-orbital = {} eV", Vp*hartree_to_eV);
-    app_log(2, "  - Hund's coupling (spin-flip) = {} eV", J_spin_bare*hartree_to_eV);
-    app_log(2, "  - Hund's coupling (pair-hopping) = {} eV", J_pair_bare*hartree_to_eV);
-    app_log(2, "static screened interactions (orbital-average):");
-    app_log(2, "  - intra-orbital = {} eV", (V+W)*hartree_to_eV);
-    app_log(2, "  - inter-orbital = {} eV", (Vp+Wp)*hartree_to_eV);
-    app_log(2, "  - Hund's coupling (spin-flip) = {} eV", (J_spin_bare+J_spin_scr)*hartree_to_eV);
-    app_log(2, "  - Hund's coupling (pair-hopping) = {} eV\n", (J_pair_bare+J_pair_scr)*hartree_to_eV);
+    app_log(1, "\ndownfold_2e summary");
+    app_log(1, "-------------------");
+    app_log(1, "bare interactions (orbital-average):");
+    app_log(1, "  - intra-orbital = {} eV", V*hartree_to_eV);
+    app_log(1, "  - inter-orbital = {} eV", Vp*hartree_to_eV);
+    app_log(1, "  - Hund's coupling (spin-flip) = {} eV", J_spin_bare*hartree_to_eV);
+    app_log(1, "  - Hund's coupling (pair-hopping) = {} eV", J_pair_bare*hartree_to_eV);
+    app_log(1, "static screened interactions (orbital-average):");
+    app_log(1, "  - intra-orbital = {} eV", (V+W)*hartree_to_eV);
+    app_log(1, "  - inter-orbital = {} eV", (Vp+Wp)*hartree_to_eV);
+    app_log(1, "  - Hund's coupling (spin-flip) = {} eV", (J_spin_bare+J_spin_scr)*hartree_to_eV);
+    app_log(1, "  - Hund's coupling (pair-hopping) = {} eV\n", (J_pair_bare+J_pair_scr)*hartree_to_eV);
 
     mpi->comm.barrier();
     _Timer.stop("DF_TOTAL");
@@ -2067,7 +2067,7 @@ namespace methods {
                  "the local bare V. ");
       return;
     }
-    app_log(2, "  Treatment of long-wavelength divergence in bare V: {}\n"
+    app_log(1, "  Treatment of long-wavelength divergence in bare V: {}\n"
                "    - madelung = {}\n",
             div_enum_to_string(_bare_div_treatment), _MF->madelung());
     auto [nqpts, nImps, NP, nImpOrbs, nImpOrbs2] = B_qIPab.shape();
@@ -2090,11 +2090,11 @@ namespace methods {
                                 nda::array<ComplexType, 5> &W_wcdab,
                                 const nda::array<ComplexType, 5> &B_qIPab,
                                 const nda::array<ComplexType, 1> &eps_inv_head) {
-    app_log(2, "  Treatment of long-wavelength divergence in W: {}", div_enum_to_string(_div_treatment));
+    app_log(1, "  Treatment of long-wavelength divergence in W: {}", div_enum_to_string(_div_treatment));
     if (_div_treatment == ignore_g0) {
       return;
     } else if (_div_treatment == gygi or _div_treatment == gygi_extrplt or _div_treatment==gygi_extrplt_2d) {
-      app_log(2, "    - madelung = {}", _MF->madelung());
+      app_log(1, "    - madelung = {}", _MF->madelung());
 
       auto [nqpts, nImps, NP, nImpOrbs, nImpOrbs2] = B_qIPab.shape();
       auto nw = W_wcdab.shape(0);
@@ -2117,7 +2117,7 @@ namespace methods {
     } else {
       utils::check(false, "Unsupported divergence treatment: {}", div_enum_to_string(_div_treatment));
     }
-    app_log(2, "");
+    app_log(1, "");
   }
 
   template<nda::MemoryArrayOfRank<4> Array_4D_t>
