@@ -103,7 +103,7 @@ namespace imag_axes_ft {
 
       std::string ir_file(double lbda, std::string prec_prefix) {
         std::string source_path = INSTALL_DIR;
-        std::string filename = source_path + "/data/ir" + lambda_map[lbda] + "." + prec_prefix + ".h5";
+        std::string filename = source_path + "/data/ir/" + lambda_map[lbda] + "." + prec_prefix + ".h5";
         if (std::filesystem::exists(filename))
           return filename;
 
