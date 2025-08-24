@@ -3,10 +3,10 @@ import json
 from coqui._lib.mbpt_module import mbpt as mbpt_cxx
 
 
-def _run_mbpt(solver_type, mbpt_params, h_int,
+def _run_mbpt(solver_type, params, h_int,
              h_int_hf = None, h_int_hartree = None, h_int_exchange = None,
              *, projector_info = None, local_polarizabilities = None):
-    args = [solver_type, json.dumps(mbpt_params), h_int]
+    args = [solver_type, json.dumps(params), h_int]
 
     if projector_info is not None:
         ## GW+EDMFT interface with optional local polarizabilities

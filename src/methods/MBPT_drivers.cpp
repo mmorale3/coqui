@@ -470,6 +470,8 @@ downfold_wloc_impl(eri_t &eri, MBState&& mb_state, ptree const& pt,
   io::tolower(div_treatment);
   io::tolower(bare_div_treatment);
 
+  auto output_in_tau = io::get_value_with_default<bool>(pt, "output_in_tau", true);
+
   auto mf = eri.MF();
 
   // set local polarizabilities if provided
@@ -479,7 +481,9 @@ downfold_wloc_impl(eri_t &eri, MBState&& mb_state, ptree const& pt,
   }
   embed_eri_t embed_eri(*mf, string_to_div_enum(div_treatment),
                         string_to_div_enum(bare_div_treatment), "default");
-  return embed_eri.downfold_wloc(eri, mb_state, screen_type, permut_symm, force_real, mb_state.ft, g_grp, g_iter);
+  return (output_in_tau)?
+    embed_eri.downfold_wloc<true>(eri, mb_state, screen_type, permut_symm, force_real, mb_state.ft, g_grp, g_iter) :
+    embed_eri.downfold_wloc<false>(eri, mb_state, screen_type, permut_symm, force_real, mb_state.ft, g_grp, g_iter);
 }
 
 template<typename eri_t>

@@ -21,7 +21,7 @@ def thc_default_params():
       "chol_block_size": 8
   }
 
-def make_thc_coulomb(mf, eri_params):
+def make_thc_coulomb(mf, params):
   """
   Create a THC Coulomb interaction handler using interpolative separable density fitting (ISDF).
 
@@ -30,7 +30,7 @@ def make_thc_coulomb(mf, eri_params):
   mf : coqui Mf class
     The mean-field handler for the target system.
 
-  eri_params: dict
+  params: dict
     Parameters for the THC Coulomb interaction. Supported keys include:
 
       - init: bool, default=True
@@ -71,4 +71,4 @@ def make_thc_coulomb(mf, eri_params):
   -------
   CoQui ThcCoulomb class
   """
-  return ThcCoulomb(mf, json.dumps(eri_params))
+  return ThcCoulomb(mf, json.dumps(params))

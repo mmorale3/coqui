@@ -122,7 +122,7 @@ namespace methods {
                g_grp, g_iter, g_iter+1);
   }
 
-  template<THC_ERI thc_t>
+  template<bool return_wt, THC_ERI thc_t>
   auto embed_eri_t::downfold_wloc(thc_t &eri, MBState &mb_state, std::string screen_type,
                                   bool force_permut_symm, bool force_real,
                                   imag_axes_ft::IAFT *ft,
@@ -132,11 +132,11 @@ namespace methods {
     // sanity checks
     std::unordered_set<std::string> valid_screen_types = {
         "gw_edmft", "gw_edmft_rpa", "gw_edmft_rpa_density", "gw_edmft_density",
-        "crpa", "crpa_ks", "crpa_vasp", "crpa_edmft", "crpa_edmft_density"};
+        "rpa", "crpa", "crpa_ks", "crpa_vasp", "crpa_edmft", "crpa_edmft_density"};
     utils::check(valid_screen_types.count(screen_type),
                  "embed_2e_t::downfolding: invalid screen_type: {}. "
                  "Acceptable options are \"gw_edmft\", \"gw_edmft_rpa\", \"gw_edmft_density\", "
-                 "\"crpa\", \"crpa_ks\", \"crpa_vasp\", \"crpa_edmft\", \"crpa_edmft_density\".",
+                 "\"rpa\", \"crpa\", \"crpa_ks\", \"crpa_vasp\", \"crpa_edmft\", \"crpa_edmft_density\".",
                  screen_type);
     utils::check(_context == eri.mpi() and _context == mb_state.mpi,
                  "embed_2e_t::downfolding_edmft: eri.mpi() and mb_state.mpi() must be the same as _context.");
@@ -155,9 +155,10 @@ namespace methods {
     auto permut_symm = determine_permut_symm(force_permut_symm, force_real);
     _Timer.stop("DF_READ");
 
-    return downfold_wloc_impl(eri, mb_state, screen_type, permut_symm, *ft, g_grp, g_iter);
+    return downfold_wloc_impl<return_wt>(eri, mb_state, screen_type, permut_symm, *ft, g_grp, g_iter);
   }
 
+  template<bool return_wt>
   auto embed_eri_t::downfold_wloc_impl(
     THC_ERI auto &eri, MBState &mb_state,
     std::string screen_type, std::string permut_symm,
@@ -193,19 +194,19 @@ namespace methods {
                "╔═╗╔═╗╔═╗ ╦ ╦╦  ┌┬┐┬ ┬┌─┐   ┌─┐  ┌┬┐┌─┐┬ ┬┌┐┌┌─┐┌─┐┬  ┌┬┐\n"
                "║  ║ ║║═╬╗║ ║║   │ ││││ │───├┤    │││ │││││││├┤ │ ││   ││\n"
                "╚═╝╚═╝╚═╝╚╚═╝╩   ┴ └┴┘└─┘   └─┘  ─┴┘└─┘└┴┘┘└┘└  └─┘┴─┘─┴┘\n");
-    app_log(1, "  - CoQui checkpoint file:                     {}", filename);
-    app_log(1, "  - Input Green's function: ");
-    app_log(1, "      HDF5 group:                              {}", g_grp);
-    app_log(1, "      Iteration:                               {}", g_iter);
+    app_log(1, "  - CoQui checkpoint file                     = {}", filename);
+    app_log(1, "  - Input Green's function ");
+    app_log(1, "      HDF5 group                              = {}", g_grp);
+    app_log(1, "      Iteration                               = {}", g_iter);
     if (proj_boson.C_file() != "") {
-      app_log(1, "  - Transformation matrices:                   {}", proj_boson.C_file());
+      app_log(1, "  - Transformation matrices                   = {}", proj_boson.C_file());
     }
-    app_log(1, "  - Number of impurities:                      {}", proj_boson.nImps());
-    app_log(1, "  - Number of local orbitals per impurity:     {}", proj_boson.nImpOrbs());
-    app_log(1, "  - Range of primary orbitals for local basis: [{}, {})",
+    app_log(1, "  - Number of impurities                      = {}", proj_boson.nImps());
+    app_log(1, "  - Number of local orbitals per impurity     = {}", proj_boson.nImpOrbs());
+    app_log(1, "  - Range of primary orbitals for local basis = [{}, {})",
             proj_boson.W_rng()[0].first(), proj_boson.W_rng()[0].last());
-    app_log(1, "  - Type of the bosonic weiss field u(iw):     {}", screen_type);
-    app_log(1, "  - Permutation symmetry:                      {}\n", permut_symm);
+    app_log(1, "  - Screening type                            = {}", screen_type);
+    app_log(1, "  - Permutation symmetry                      = {}\n", permut_symm);
 
     _Timer.start("DF_READ");
     // Check status of MBState
@@ -283,7 +284,10 @@ namespace methods {
     mpi->comm.barrier();
     _Timer.stop("DF_TOTAL");
     print_downfold_timers();
-    return std::make_tuple(V_abcd, W_tabcd);
+    if constexpr (return_wt)
+      return std::make_tuple(V_abcd, W_tabcd);
+    else
+      return std::make_tuple(V_abcd, W_wabcd);
   }
 
   template<THC_ERI thc_t>
@@ -2174,7 +2178,9 @@ namespace methods {
 namespace methods {
 
   template std::tuple<nda::array<ComplexType, 4>, nda::array<ComplexType, 5> >
-  embed_eri_t::downfold_wloc(thc_reader_t&, MBState &, std::string, bool, bool, imag_axes_ft::IAFT *, std::string, long);
+  embed_eri_t::downfold_wloc<true>(thc_reader_t&, MBState &, std::string, bool, bool, imag_axes_ft::IAFT *, std::string, long);
+  template std::tuple<nda::array<ComplexType, 4>, nda::array<ComplexType, 5> >
+  embed_eri_t::downfold_wloc<false>(thc_reader_t&, MBState &, std::string, bool, bool, imag_axes_ft::IAFT *, std::string, long);
 
   template void embed_eri_t::downfolding_edmft(thc_reader_t&, MBState&, std::string, bool, bool, imag_axes_ft::IAFT*,
       std::string, long, double);

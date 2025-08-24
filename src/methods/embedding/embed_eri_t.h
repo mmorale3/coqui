@@ -72,7 +72,7 @@ namespace methods {
 
     ~embed_eri_t() = default;
 
-    template<THC_ERI thc_t>
+    template<bool return_wt = true, THC_ERI thc_t>
     auto downfold_wloc(thc_t &eri, MBState &mb_state, std::string screen_type,
                        bool force_permut_symm, bool force_real,
                        imag_axes_ft::IAFT *ft,
@@ -95,6 +95,7 @@ namespace methods {
         std::string g_grp = "", long g_iter = -1,
         bool q_dependent = false, double thresh = 1e-6);
 
+    template<bool return_wt = true>
     auto downfold_wloc_impl(
         THC_ERI auto &eri, MBState &mb_state,
         std::string screen_type, std::string permut_symm,

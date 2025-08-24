@@ -140,7 +140,7 @@ class IAFT(object):
                 self.prec == other.prec
         )
 
-    def wn_mesh(self, stats: str, ir_notation: bool = True):
+    def wn_mesh(self, stats: str, ir_notation: bool = True, *, positive_only=False):
         """
         Return Matsubara frequency indices.
         :param stats: str
@@ -158,7 +158,12 @@ class IAFT(object):
         wn_mesh = np.array(self._wn_mesh_f, dtype=int) if stats == 'f' else np.array(self._wn_mesh_b, dtype=int)
         if not ir_notation:
             wn_mesh = (wn_mesh-1)//2 if stats == 'f' else wn_mesh//2
-        return wn_mesh
+
+        if positive_only:
+            nw_half = wn_mesh.shape[0]//2
+            return wn_mesh[nw_half:]
+        else:
+            return wn_mesh
 
     def tau_to_w(self, Ot, stats: str):
         """
