@@ -19,7 +19,7 @@ def test_hf_thc(mpi):
 
     hf_params = {
         "restart": False, "output": "hf", "niter": 1,
-        "beta": 300, "lambda": 1200, "iaft_prec": "high",
+        "beta": 300, "wmax": 4.0, "iaft_prec": "high",
         "iter_alg": {"alg": "damping", "mixing": 0.7}
     }
     coqui.run_hf(hf_params, h_int=thc)

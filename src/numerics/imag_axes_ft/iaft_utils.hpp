@@ -12,7 +12,7 @@ namespace imag_axes_ft {
    */
   inline decltype(auto) read_iaft(std::string scf_file, bool print_meta_log = true) {
     double beta;
-    double lambda;
+    double wmax;
     std::string prec;
     std::string source;
 
@@ -22,9 +22,15 @@ namespace imag_axes_ft {
     h5::h5_read(iaft_grp, "source", source);
     h5::h5_read(iaft_grp, "prec", prec);
     h5::h5_read(iaft_grp, "beta", beta);
-    h5::h5_read(iaft_grp, "lambda", lambda);
 
-    return imag_axes_ft::IAFT(beta, lambda, imag_axes_ft::string_to_source_enum(source), prec, print_meta_log);
+    if (iaft_grp.has_dataset("wmax")) {
+      h5::h5_read(iaft_grp, "wmax", wmax);
+    } else {
+      double lambda;
+      h5::h5_read(iaft_grp, "lambda", lambda);
+      wmax = lambda / beta;
+    }
+    return imag_axes_ft::IAFT(beta, wmax, imag_axes_ft::string_to_source_enum(source), prec, print_meta_log);
   }
 
 } // imag_axes_ft

@@ -42,6 +42,7 @@ void write_metadata(communicator_t &comm, const mf::MF &mf, const imag_axes_ft::
     h5::h5_write(iaft_grp, "source", iaft_source);
     h5::h5_write(iaft_grp, "prec", ft.prec());
     h5::h5_write(iaft_grp, "beta", ft.beta());
+    h5::h5_write(iaft_grp, "wmax", ft.wmax());
     h5::h5_write(iaft_grp, "lambda", ft.lambda());
     auto tau_grp = iaft_grp.create_group("tau_mesh");
     nda::h5_write(tau_grp, "fermion", ft.tau_mesh(), false);

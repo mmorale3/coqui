@@ -25,7 +25,7 @@ namespace bdft_tests {
   TEST_CASE("thc_g0w0_qe_bdft", "[methods][thc][gw][qe][bdft]") {
     auto& mpi_context = utils::make_unit_test_mpi_context();
 
-    imag_axes_ft::IAFT ft(1000, 1.2e3, imag_axes_ft::ir_source);
+    imag_axes_ft::IAFT ft(1000, 1.2, imag_axes_ft::ir_source);
     std::string output = "coqui";
 
     auto solve_thc_g0w0 = [&](std::shared_ptr<mf::MF> &mf) {
@@ -59,18 +59,18 @@ namespace bdft_tests {
       app_log(2, "E_ska at k = 0: {0:.12f}, {1:.12f}, {2:.12f}, {3:.12f}",
               E_ska(0,0,homo-1).real(), E_ska(0,0,homo).real(),
               E_ska(0,0,lumo).real(), E_ska(0,0,lumo+1).real());
-      VALUE_EQUAL(E_ska(0,0,homo-1).real(), -1.9592008084, 1e-5);
-      VALUE_EQUAL(E_ska(0,0,homo).real(), -0.3435901353, 1e-5);
-      VALUE_EQUAL(E_ska(0,0,lumo).real(), 0.7694529869, 1e-5);
-      VALUE_EQUAL(E_ska(0,0,lumo+1).real(), 0.8193580336, 1e-5);
+      VALUE_EQUAL(E_ska(0,0,homo-1).real(), -1.959166853350, 1e-5);
+      VALUE_EQUAL(E_ska(0,0,homo).real(), -0.343590135344, 1e-5);
+      VALUE_EQUAL(E_ska(0,0,lumo).real(), 0.769452793794, 1e-5);
+      VALUE_EQUAL(E_ska(0,0,lumo+1).real(), 0.819356108320, 1e-5);
 
       app_log(2, "E_ska at k = 1: {0:.12f}, {1:.12f}, {2:.12f}, {3:.12f}",
               E_ska(0,1,homo-1).real(), E_ska(0,1,homo).real(),
               E_ska(0,1,lumo).real(), E_ska(0,1,lumo+1).real());
-      VALUE_EQUAL(E_ska(0,1,homo-1).real(), -1.9496375513, 1e-5);
-      VALUE_EQUAL(E_ska(0,1,homo).real(), -0.2345616251, 1e-5);
-      VALUE_EQUAL(E_ska(0,1,lumo).real(), 0.3321682981, 1e-5);
-      VALUE_EQUAL(E_ska(0,1,lumo+1).real(), 0.6914882525, 1e-5);
+      VALUE_EQUAL(E_ska(0,1,homo-1).real(), -1.949608656698, 1e-5);
+      VALUE_EQUAL(E_ska(0,1,homo).real(), -0.234561625134, 1e-5);
+      VALUE_EQUAL(E_ska(0,1,lumo).real(), 0.332168314756, 1e-5);
+      VALUE_EQUAL(E_ska(0,1,lumo+1).real(), 0.691491471197, 1e-5);
       mpi_context->comm.barrier();
 
       if (mpi_context->comm.root()) {
@@ -101,8 +101,8 @@ namespace bdft_tests {
     auto& mpi_context = utils::make_unit_test_mpi_context();
 
     auto solve_thc_gw = [&](
-        std::shared_ptr<mf::MF> &mf, float lambda, bool chol_eri_hf=false) {
-      imag_axes_ft::IAFT ft(1000, lambda, imag_axes_ft::ir_source);
+        std::shared_ptr<mf::MF> &mf, double wmax, bool chol_eri_hf=false) {
+      imag_axes_ft::IAFT ft(1000, wmax, imag_axes_ft::ir_source);
       std::string output = "coqui";
 
       solvers::hf_t hf;
@@ -155,24 +155,24 @@ namespace bdft_tests {
 
     SECTION("nosym") {
       auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_lih222"));
-      solve_thc_gw(mf, 1.2e3);
+      solve_thc_gw(mf, 1.2);
     }
     SECTION("sym") {
       auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_lih222_sym"));
-      solve_thc_gw(mf, 1.2e3);
-      solve_thc_gw(mf, 1.2e4);
+      solve_thc_gw(mf, 1.2);
+      solve_thc_gw(mf, 12.0);
     }
     SECTION("nosym_mix_eri") {
       auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_lih222"));
-      solve_thc_gw(mf, 1.2e3, true);
+      solve_thc_gw(mf, 1.2, true);
     }
   }
 
   TEST_CASE("thc_rpa_qe", "[methods][thc][rpa][qe]") {
     auto& mpi_context = utils::make_unit_test_mpi_context();
 
-    auto solve_thc_rpa = [&](std::shared_ptr<mf::MF> &mf, double lambda) {
-      imag_axes_ft::IAFT ft(1000, lambda, imag_axes_ft::ir_source);
+    auto solve_thc_rpa = [&](std::shared_ptr<mf::MF> &mf, double wmax) {
+      imag_axes_ft::IAFT ft(1000, wmax, imag_axes_ft::ir_source);
 
       solvers::hf_t hf;
       solvers::gw_t gw(&ft);
@@ -199,12 +199,12 @@ namespace bdft_tests {
 
     SECTION("nosym") {
       auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_lih222"));
-      solve_thc_rpa(mf, 1.2e3);
+      solve_thc_rpa(mf, 1.2);
     }
     SECTION("sym") {
       auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_lih222_sym"));
-      solve_thc_rpa(mf, 1.2e3);
-      solve_thc_rpa(mf, 1.2e4);
+      solve_thc_rpa(mf, 1.2);
+      solve_thc_rpa(mf, 12.0);
     }
   }
 
@@ -214,7 +214,7 @@ namespace bdft_tests {
 
     std::string output = "coqui";
     auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, mf::pyscf_source));
-    imag_axes_ft::IAFT ft(1000, 1.2e4, imag_axes_ft::ir_source);
+    imag_axes_ft::IAFT ft(1000, 12.0, imag_axes_ft::ir_source);
     solvers::hf_t hf;
     solvers::gw_t gw(&ft, string_to_div_enum("ignore_g0"), output);
 
@@ -270,7 +270,7 @@ namespace bdft_tests {
     auto& mpi_context = utils::make_unit_test_mpi_context();
 
     auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, mf::pyscf_source));
-    imag_axes_ft::IAFT ft(1000, 1.2e4, imag_axes_ft::ir_source);
+    imag_axes_ft::IAFT ft(1000, 12.0, imag_axes_ft::ir_source);
     solvers::hf_t hf;
     solvers::gw_t gw(&ft);
     solvers::mb_solver_t mb_solver(&hf, &gw);
@@ -306,7 +306,7 @@ namespace bdft_tests {
     auto& mpi_context = utils::make_unit_test_mpi_context();
 
     std::string output = "coqui";
-    imag_axes_ft::IAFT ft(2000, 1.2e4, imag_axes_ft::ir_source);
+    imag_axes_ft::IAFT ft(2000, 6.0, imag_axes_ft::ir_source);
 
     auto solve_gdf_thc_gw = [&](std::shared_ptr<mf::MF> &mf, std::string gdf_dir) {
       solvers::hf_t hf;

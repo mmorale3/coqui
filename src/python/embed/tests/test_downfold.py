@@ -21,7 +21,7 @@ def test_downfold(mpi):
 
     gw_params = {
         "restart": False, "output": "gw", "niter": 1,
-        "beta": 300, "lambda": 1200, "iaft_prec": "medium",
+        "beta": 300, "wmax": 4.0, "iaft_prec": "medium",
         "iter_alg": {"alg": "damping", "mixing": 0.7}
     }
     coqui.run_gw(gw_params, h_int=thc)

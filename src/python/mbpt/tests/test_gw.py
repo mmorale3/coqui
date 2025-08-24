@@ -20,7 +20,7 @@ def test_gw_thc(mpi):
 
     gw_params = {
         "restart": False, "output": "gw", "niter": 1,
-        "beta": 300, "lambda": 1200, "iaft_prec": "medium",
+        "beta": 300, "wmax": 4.0, "iaft_prec": "medium",
         "iter_alg": {"alg": "damping", "mixing": 0.7}
     }
     coqui.run_gw(gw_params, h_int=thc)
@@ -40,7 +40,7 @@ def test_gw_mix_thc_chol(mpi):
 
     gw_params = {
         "restart": False, "output": "gw", "niter": 1,
-        "beta": 300, "lambda": 1200, "iaft_prec": "medium",
+        "beta": 300, "wmax": 4.0, "iaft_prec": "medium",
         "iter_alg": {"alg": "damping", "mixing": 0.7}
     }
     coqui.run_gw(gw_params, h_int=thc)
@@ -77,7 +77,7 @@ def test_g0w0_thc(mpi):
 
     gw_params = {
         "restart": False, "output": "gw", "niter": 1,
-        "beta": 300, "lambda": 1200, "iaft_prec": "medium",
+        "beta": 300, "wmax": 4.0, "iaft_prec": "medium",
         "qp_type": "sc", "ac_alg": "pade", "eta": 1e-6, "Nfit": 26
     }
     coqui.run_qpg0w0(gw_params, h_int=thc)

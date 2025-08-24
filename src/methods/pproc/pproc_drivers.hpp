@@ -81,12 +81,12 @@ namespace methods {
                      iteration, scf_output);
 
         auto beta = io::get_value_with_default<double>(pt,"beta",1000.0);
-        auto lambda = io::get_value_with_default<double>(pt,"lambda",12000.0);
+        auto wmax = io::get_value_with_default<double>(pt,"wmax",12.0);
         auto iaft_prec = io::get_value_with_default<std::string>(pt, "iaft_prec", "high");
 
         // dump mf data to "scf_output".mbpt.h5
         auto psp = hamilt::make_pseudopot(*mf);
-        imag_axes_ft::IAFT ft(beta, lambda, imag_axes_ft::ir_source, iaft_prec, true);
+        imag_axes_ft::IAFT ft(beta, wmax, imag_axes_ft::ir_source, iaft_prec, true);
         write_mf_data(*mf, ft, *psp.get(), scf_output);
       }
       pp.wannier_interpolation(*mf, pt, wannier_file, "quasiparticle", "scf", iteration, trans_home_cell);
@@ -148,11 +148,11 @@ namespace methods {
                      scf_iter, scf_output);
 
         auto beta = io::get_value_with_default<double>(pt,"beta",1000.0);
-        auto lambda = io::get_value_with_default<double>(pt,"lambda",12000.0);
+        auto wmax = io::get_value_with_default<double>(pt,"wmax",12.0);
         auto iaft_prec = io::get_value_with_default<std::string>(pt, "iaft_prec", "high");
 
         // dump mf data to "scf_output".mbpt.h5
-        imag_axes_ft::IAFT ft(beta, lambda, imag_axes_ft::ir_source, iaft_prec, true);
+        imag_axes_ft::IAFT ft(beta, wmax, imag_axes_ft::ir_source, iaft_prec, true);
         write_mf_data(*mf, ft, *psp.get(), scf_output);
       }
 

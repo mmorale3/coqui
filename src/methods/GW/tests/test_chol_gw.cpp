@@ -22,11 +22,81 @@ namespace bdft_tests {
 
   using namespace methods;
 
+  TEST_CASE("chol_g0w0_qe", "[methods][chol][gw][qe]") {
+    auto& mpi_context = utils::make_unit_test_mpi_context();
+
+    imag_axes_ft::IAFT ft(1000, 1.2, imag_axes_ft::ir_source);
+    std::string output = "coqui";
+
+    auto solve_thc_g0w0 = [&](std::shared_ptr<mf::MF> &mf) {
+      solvers::hf_t hf;
+      solvers::gw_t gw(&ft, string_to_div_enum("ignore_g0"), output);
+      solvers::scr_coulomb_t scr_eri(&ft, "rpa", string_to_div_enum("ignore_g0"));
+
+      chol_reader_t chol(mf, methods::make_chol_reader_ptree(1e-10, mf->ecutrho(), 32, "./"));
+      auto eri = mb_eri_t(chol, chol);
+      qp_context_t qp_context("sc", "pade", 18, 0.0001, 1e-8);
+      iter_scf::iter_scf_t iter_sol("damping");
+      MBState mb_state(mpi_context, ft, output);
+      [[maybe_unused]] double e_hf = qp_scf_loop<true>(
+          mb_state, eri, ft, qp_context,
+          solvers::mb_solver_t(&hf,&gw,&scr_eri), &iter_sol, 1, false, 1e-8);
+      mpi_context->comm.barrier();
+
+      nda::array<ComplexType, 3> E_ska;
+      {
+        h5::file file(output+".mbpt.h5", 'r');
+        auto scf_grp = h5::group(file).open_group("scf");
+        auto iter_grp = scf_grp.open_group("iter1");
+        nda::h5_read(iter_grp, "E_ska", E_ska);
+      }
+      /**
+       * Reference value is obtained from Chol-G0W0 with ERIs converge to 1e-10.
+       * The accuracy is roughly 1e-5 at alpha=24 for this system in the presence of AC.
+       **/
+      int homo = int(mf->nelec()/2 - 1);
+      int lumo = int(mf->nelec()/2);
+      app_log(2, "E_ska at k = 0: {0:.12f}, {1:.12f}, {2:.12f}, {3:.12f}",
+              E_ska(0,0,homo-1).real(), E_ska(0,0,homo).real(),
+              E_ska(0,0,lumo).real(), E_ska(0,0,lumo+1).real());
+      // -1.959166853350, -0.343590135344, 0.769452793794, 0.819356108320
+      VALUE_EQUAL(E_ska(0,0,homo-1).real(), -1.959166853350, 1e-5); // perhaps 1e-4
+      VALUE_EQUAL(E_ska(0,0,homo).real(), -0.343590135344, 1e-5);
+      VALUE_EQUAL(E_ska(0,0,lumo).real(), 0.769452793794, 1e-5);
+      VALUE_EQUAL(E_ska(0,0,lumo+1).real(), 0.819356108320, 1e-5);
+
+      app_log(2, "E_ska at k = 1: {0:.12f}, {1:.12f}, {2:.12f}, {3:.12f}",
+              E_ska(0,1,homo-1).real(), E_ska(0,1,homo).real(),
+              E_ska(0,1,lumo).real(), E_ska(0,1,lumo+1).real());
+      // -1.949608656698, -0.234561625134, 0.332168314756, 0.691491471197
+      VALUE_EQUAL(E_ska(0,1,homo-1).real(), -1.949608656698, 1e-5);
+      VALUE_EQUAL(E_ska(0,1,homo).real(), -0.234561625134, 1e-5);
+      VALUE_EQUAL(E_ska(0,1,lumo).real(), 0.332168314756, 1e-5);
+      VALUE_EQUAL(E_ska(0,1,lumo+1).real(), 0.691491471197, 1e-5);
+      mpi_context->comm.barrier();
+
+      if (mpi_context->comm.root()) {
+        remove("chol_info.h5");
+        for (size_t ik = 0; ik < mf->nqpts(); ++ik) {
+          std::string fname = "Vq"+std::to_string(ik)+".h5";
+          remove(fname.c_str());
+        }
+        remove((output+".mbpt.h5").c_str());
+      }
+      mpi_context->comm.barrier();
+    };
+
+    SECTION("nosym_qe") {
+      auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_lih222"));
+      solve_thc_g0w0(mf);
+    }
+  }
+
   TEST_CASE("chol_gw_qe", "[methods][chol][gw][qe]") {
     auto& mpi_context = utils::make_unit_test_mpi_context();
 
     auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_lih222"));
-    imag_axes_ft::IAFT ft(1000, 1.2e3, imag_axes_ft::ir_source);
+    imag_axes_ft::IAFT ft(1000, 1.2, imag_axes_ft::ir_source);
     chol_reader_t chol(mf, methods::make_chol_reader_ptree(1e-10, mf->ecutrho(), 32, "./"));
     auto eri = mb_eri_t(chol, chol);
     solvers::gw_t gw(std::addressof(ft));
@@ -58,7 +128,7 @@ namespace bdft_tests {
 
     auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_lih222"));
 
-    imag_axes_ft::IAFT ft(1000, 1.2e3, imag_axes_ft::ir_source);
+    imag_axes_ft::IAFT ft(1000, 1.2, imag_axes_ft::ir_source);
     chol_reader_t chol(mf, methods::make_chol_reader_ptree(1e-10, mf->ecutrho(), 32, "./"));
     auto eri = mb_eri_t(chol, chol);
     solvers::gw_t gw(std::addressof(ft));
@@ -90,7 +160,7 @@ namespace bdft_tests {
 
     auto mf = std::make_shared<mf::MF>(mf::MF(mf::pyscf::pyscf_readonly(mpi_context, filepath, "pyscf")));
 
-    imag_axes_ft::IAFT ft(1000, 1.2e4, imag_axes_ft::ir_source);
+    imag_axes_ft::IAFT ft(1000, 12.0, imag_axes_ft::ir_source);
     chol_reader_t chol(mf, methods::make_chol_reader_ptree(1e-10, mf->ecutrho(), 32, "./"));
     auto eri = mb_eri_t(chol, chol);
     solvers::gw_t gw(std::addressof(ft));
@@ -125,7 +195,7 @@ namespace bdft_tests {
 
     auto mf = std::make_shared<mf::MF>(mf::MF(mf::pyscf::pyscf_readonly(mpi_context, filepath, "pyscf")));
 
-    imag_axes_ft::IAFT ft(1000, 1.2e4, imag_axes_ft::ir_source);
+    imag_axes_ft::IAFT ft(1000, 12.0, imag_axes_ft::ir_source);
     chol_reader_t chol(mf, methods::make_chol_reader_ptree(1e-10, mf->ecutrho(), 32, "./"));
     auto eri = mb_eri_t(chol, chol);
     solvers::gw_t gw(std::addressof(ft));
@@ -154,7 +224,7 @@ namespace bdft_tests {
     std::string gdf_dir = std::string(PROJECT_SOURCE_DIR)+"/tests/unit_test_files/pyscf/h2o_mol/gdf_eri/";
     auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "pyscf_h2o_mol"));
 
-    imag_axes_ft::IAFT ft(2000, 1.2e4, imag_axes_ft::ir_source);
+    imag_axes_ft::IAFT ft(2000, 6.0, imag_axes_ft::ir_source);
 
     chol_reader_t chol(mf, gdf_dir);
     auto eri = mb_eri_t(chol, chol);

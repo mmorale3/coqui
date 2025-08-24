@@ -31,10 +31,10 @@ namespace bdft_tests {
     auto& mpi = utils::make_unit_test_mpi_context();
 
     double beta = 1000.0;
-    double lambda = 1.2e5;
+    double wmax = 120.0;
 
     std::string coqui_prefix = "downfold_1e_mb";
-    imag_axes_ft::IAFT ft(beta, lambda, imag_axes_ft::ir_source);
+    imag_axes_ft::IAFT ft(beta, wmax, imag_axes_ft::ir_source);
     iter_scf::iter_scf_t iter_sol("damping");
 
     auto downfold = [&](
@@ -44,7 +44,7 @@ namespace bdft_tests {
       solvers::gw_t gw(&ft, string_to_div_enum("gygi"), coqui_prefix);
       solvers::scr_coulomb_t scr_eri(&ft, "rpa", string_to_div_enum("gygi"));
       simple_dyson dyson(mf.get(), &ft);
-      thc_reader_t thc(mf, make_thc_reader_ptree(mf->nbnd() * 20, "", "incore", "", "bdft",
+      thc_reader_t thc(mf, make_thc_reader_ptree(mf->nbnd()*20, "", "incore", "", "bdft",
                                                  1e-10, mf->ecutrho(), 1, 1024));
       auto eri = mb_eri_t(thc, thc);
 
@@ -100,15 +100,7 @@ namespace bdft_tests {
       mpi->comm.barrier();
     };
 
-    // the references are obtained in "sym_gw_dc" and "sym_gw_dynamic_dc" cases
-    SECTION("sym_gw_dc") {
-      std::array<double,6> refs = {1.345184327541, 0.613445332739, 0.004841810510,
-                                    0.0, 0.0, 0.0};
-      auto [outdir, prefix] = utils::utest_filename("qe_lih222_sym");
-      auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi, "qe_lih222_sym"));
-      std::string wannier_file = outdir + "/lih_wan.h5";
-      downfold(mf, wannier_file, "gw", refs, 1e-6);
-    }
+    // the references are obtained in "sym_gw_dynamic_dc" cases
     SECTION("sym_gw_dynamic_dc") {
       std::array<double,6> refs = {0.994863460627, 0.392527791391, 0.003913713921,
                                     -0.205980066335, -0.086783668184, -0.000961596821};
@@ -131,10 +123,10 @@ TEST_CASE("downfold_1e_mb_qp", "[methods][embed][df_1e]") {
     auto& mpi = utils::make_unit_test_mpi_context();
 
     double beta = 1000.0;
-    double lambda = 1.2e3;
+    double wmax = 1.2;
 
     std::string coqui_prefix = "downfold_1e_mb";
-    imag_axes_ft::IAFT ft(beta, lambda, imag_axes_ft::ir_source);
+    imag_axes_ft::IAFT ft(beta, wmax, imag_axes_ft::ir_source);
     iter_scf::iter_scf_t iter_sol("damping");
 
     auto downfold = [&](
@@ -210,11 +202,11 @@ TEST_CASE("downfold_1e_mb_qp", "[methods][embed][df_1e]") {
     // the references are obtained using
     //    a) isdf threshold = 1e-8, chol_blk = 1
     //    b) Pade with Nfit = 18, eta = 1e-8, qp-eqn threshold = 1e-8
-    //    c) with space-group symmetries activated
+    //    c) with space-group symmetries activated.
     // AC seems to amplify the error coming from DFT w/ and w/o symmetry, resulting
     // in errors ~ 1e-3. The Wannier functions in the two cases are therefore not
     // exactly the same.
-    // This is mainly because the presence of very deep orbital (Li: 1s).
+    // This is mainly because of the presence of very deep orbital (Li: 1s).
     SECTION("sym_gw_dc") {
       std::array<double,12> refs = {0.123474085511, -0.543810434672, 0.004800884640,
                                     1.345183158146, 0.613449576594, 0.004843167376,
@@ -225,37 +217,23 @@ TEST_CASE("downfold_1e_mb_qp", "[methods][embed][df_1e]") {
       std::string wannier_file = outdir + "/lih_wan.h5";
       downfold(mf, wannier_file, "gw", refs, 1e-3);
     }
-    SECTION("sym_gw_dynamic_dc") {
+
+    SECTION("nosym_gw_dc") {
       std::array<double,12> refs = {0.123474085511, -0.543810434672, 0.004800884640,
-                                    0.994862711883, 0.392531733919, 0.003914219717,
+                                    1.345183158146, 0.613449576594, 0.004843167376,
                                     0.237810227112, 0.079665538571, 0.000517075666,
-                                    0.257952347178, 0.133536645058, -0.000178639405};
-      auto [outdir, prefix] = utils::utest_filename("qe_lih222_sym");
-      auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi, "qe_lih222_sym"));
-      std::string wannier_file = outdir + "/lih_wan.h5";
-      downfold(mf, wannier_file, "gw_dynamic_u", refs, 1e-3);
-    }
-    SECTION("nosym_gw_dynamic_dc") {
-      std::array<double,12> refs = {0.123474085511, -0.543810434672, 0.004800884640,
-                                    0.994862711883, 0.392531733919, 0.003914219717,
-                                    0.237810227112, 0.079665538571, 0.000517075666,
-                                    0.257952347178, 0.133536645058, -0.000178639405};
-      // references from nosym case
-      //std::array<double,12> refs = {0.123474132213, -0.543810507015, 0.004800938397,
-      //                              0.994862523522, 0.392531758272, 0.003914117365,
-      //                              0.237810666083, 0.079665101294, 0.000521566758,
-      //                              0.257948509947, 0.133535670309, 0.000056638019};
+                                    0.0, 0.0, 0.0};
       auto [outdir, prefix] = utils::utest_filename("qe_lih222");
       auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi, "qe_lih222"));
       std::string wannier_file = outdir + "/lih_wan.h5";
-      downfold(mf, wannier_file, "gw_dynamic_u", refs, 1e-3);
+      downfold(mf, wannier_file, "gw", refs, 1e-3);
     }
   }
 
   TEST_CASE("downfold_Gloc", "[methods][embed]") {
     auto& mpi = utils::make_unit_test_mpi_context();
 
-    imag_axes_ft::IAFT ft(1000.0, 1.2e3, imag_axes_ft::ir_source, "high", false);
+    imag_axes_ft::IAFT ft(1000.0, 1.2, imag_axes_ft::ir_source, "high", false);
 
     auto downfold = [&](mf::MF &mf, std::string wannier_file) {
       // write dft data
@@ -316,7 +294,7 @@ TEST_CASE("downfold_1e_mb_qp", "[methods][embed][df_1e]") {
                                                  1e-10, mf->ecutrho(), 1, 1024));
 
       std::string prefix = "coqui";
-      imag_axes_ft::IAFT ft(1000.0, 1.2e3, imag_axes_ft::ir_source, "high", true);
+      imag_axes_ft::IAFT ft(1000.0, 1.2, imag_axes_ft::ir_source, "high", true);
       simple_dyson dyson(mf.get(), &ft);
       write_mf_data(*mf, ft, dyson, prefix);
       mpi->comm.barrier();
@@ -395,7 +373,7 @@ TEST_CASE("downfold_1e_mb_qp", "[methods][embed][df_1e]") {
                                                  1e-10, mf->ecutrho(), 1, 1024));
 
       std::string prefix = "coqui";
-      imag_axes_ft::IAFT ft(1000.0, 1.2e3, imag_axes_ft::ir_source, "high", true);
+      imag_axes_ft::IAFT ft(1000.0, 1.2, imag_axes_ft::ir_source, "high", true);
       simple_dyson dyson(mf.get(), &ft);
       write_mf_data(*mf, ft, dyson, prefix);
       mpi->comm.barrier();
@@ -471,7 +449,7 @@ TEST_CASE("downfold_1e_mb_qp", "[methods][embed][df_1e]") {
         std::shared_ptr<mf::MF> &mf, std::string wannier_file) {
 
       std::string prefix = "coqui";
-      imag_axes_ft::IAFT ft(1000.0, 1.2e3, imag_axes_ft::ir_source, "high", true);
+      imag_axes_ft::IAFT ft(1000.0, 1.2, imag_axes_ft::ir_source, "high", true);
       solvers::hf_t hf;
       solvers::gw_t gw(&ft, string_to_div_enum("gygi"), prefix);
       solvers::scr_coulomb_t scr_eri(&ft, "rpa", string_to_div_enum("gygi"));

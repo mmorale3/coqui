@@ -20,10 +20,13 @@ namespace imag_axes_ft {
     public:
       IR () = default;
 
-      IR(double beta_, double lambda_, std::string prec_="high", bool print_meta_log = false): beta(beta_), prec(prec_) {
+      IR(double beta_, double wmax_, std::string prec_="high", bool print_meta_log = false):
+      beta(beta_), wmax(wmax_), prec(prec_) {
         // determine _lambda
-        lambda = determine_lambda(lambda_);
-        utils::check(lambda > 0.0, "Invalid value of lambda in imag_axes_ft::ir::ir.");
+        lambda = determine_lambda(beta*wmax);
+        wmax = lambda / beta;
+        utils::check(lambda > 0.0, "Invalid value of lambda, {}, in imag_axes_ft::ir::ir.", lambda);
+        utils::check(wmax > 0.0, "Invalid value of wmax, {}, in imag_axes_ft::ir::ir.", wmax);
 
         std::string prec_prefix;
         if (prec == "high") {
@@ -96,31 +99,33 @@ namespace imag_axes_ft {
         app_log(1, "  ----------------------------------");
         app_log(1, "  Intermediate Representation");
         app_log(1, "  Beta                   = {} a.u.", beta);
+        app_log(1, "  Frequency cutoff       = {} a.u.", wmax);
         app_log(1, "  Lambda                 = {}", lambda);
         app_log(1, "  Precision              = {}", prec_prefix);
         app_log(1, "  nt_f, nt_b, nw_f, nw_b = {}, {}, {}, {}\n", nt_f, nt_b, nw_f, nw_b);
       }
 
-      std::string ir_file(double lbda, std::string prec_prefix) {
+      std::string ir_file(double lmbda, std::string prec_prefix) {
         std::string source_path = INSTALL_DIR;
-        std::string filename = source_path + "/data/ir/" + lambda_map[lbda] + "." + prec_prefix + ".h5";
+        std::string filename = source_path + "/data/ir/" + lambda_map[lmbda] + "." + prec_prefix + ".h5";
         if (std::filesystem::exists(filename))
           return filename;
 
         source_path = PROJECT_SOURCE_DIR;
-        filename = source_path + "/src/numerics/imag_axes_ft/ir/data/" + lambda_map[lbda] + "." + prec_prefix + ".h5";
+        filename = source_path + "/src/numerics/imag_axes_ft/ir/data/" + lambda_map[lmbda] + "." + prec_prefix + ".h5";
         return filename;
       }
 
     public:
+      double beta;
+      double wmax;
+      std::string prec;
+      double lambda;
+
       int nt_f;
       int nt_b;
       int nw_f;
       int nw_b;
-
-      double lambda;
-      double beta;
-      std::string prec;
 
       // Matsubara frequency mesh
       nda::array<long, 1> wn_mesh_f;
@@ -150,7 +155,9 @@ namespace imag_axes_ft {
       nda::matrix<ComplexType> Tct_bb;
 
       inline double determine_lambda(double lbda) {
-        if (lbda <= 1000) {
+        if (lbda <= 100) {
+          return 100;
+        } else if (lbda > 100 and lbda <= 1000) {
           return 1000;
         } else if (lbda > 1000 and lbda <= 10000) {
           return 10000;
@@ -165,6 +172,7 @@ namespace imag_axes_ft {
 
     private:
       std::unordered_map<double, std::string> lambda_map = {
+          {100, "1e2"},
           {1000, "1e3"},
           {10000, "1e4"},
           {100000, "1e5"},

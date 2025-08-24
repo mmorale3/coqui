@@ -34,7 +34,7 @@ namespace methods
  * Many-body perturbation calculations from a given mean-field and ERI objects with arguments in property tree.
  * Optional arguments (with default values):
  *  - beta: "1000" Inverse temperature (a.u.)
- *  - lambda: "12000.0" Dimensionless parameter to control the size of IAFT grids. lambda should >= beta*(bandwidth).
+ *  - wmax: "12.0" Frequency cutoff for the IAFT grids (a.u.)
  *  - iaft_prec: "high" Precision of IAFT grids. {choices: "high", "medium", "low"}
  *  - div_treatment: "gygi" Divergent treatment for Coulomb kernel. {choices: "ignore_g0", "gygi"}
  *  - hf_div_treatment: "gygi" Divergent treatment for Coulomb kernel in HF. {choices: "ignore_g0", "gygi"}
@@ -69,7 +69,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
   auto input_iter = io::get_value_with_default<long>(pt, "input_iter", -1);
 
   auto beta = io::get_value_with_default<double>(pt,"beta",1000.0);
-  auto lambda = io::get_value_with_default<double>(pt,"lambda",12000.0);
+  auto wmax = io::get_value_with_default<double>(pt,"wmax",12.0);
   auto iaft_prec = io::get_value_with_default<std::string>(pt, "iaft_prec", "high");
 
   bool chkpt_exist = std::filesystem::exists(output + ".mbpt.h5");
@@ -94,7 +94,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
   }
 
   imag_axes_ft::IAFT ft = (!restart)?
-      imag_axes_ft::IAFT(beta, lambda, imag_axes_ft::ir_source, iaft_prec) :
+      imag_axes_ft::IAFT(beta, wmax, imag_axes_ft::ir_source, iaft_prec) :
       imag_axes_ft::read_iaft(output+".mbpt.h5");
 
   using namespace solvers;
@@ -278,10 +278,10 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
   auto trans_home_cell = io::get_value_with_default<bool>(pt,"translate_home_cell",false);
 
   auto beta = io::get_value_with_default<double>(pt,"beta",1000.0);
-  auto lambda = io::get_value_with_default<double>(pt,"lambda",12000.0);
+  auto wmax = io::get_value_with_default<double>(pt,"wmax",12.0);
   auto iaft_prec = io::get_value_with_default<std::string>(pt, "iaft_prec", "high");
   imag_axes_ft::IAFT ft = (!restart)?
-                          imag_axes_ft::IAFT(beta, lambda, imag_axes_ft::ir_source, iaft_prec) :
+                          imag_axes_ft::IAFT(beta, wmax, imag_axes_ft::ir_source, iaft_prec) :
                           imag_axes_ft::read_iaft(output+".mbpt.h5");
 
   using namespace solvers;
@@ -513,9 +513,9 @@ downfold_wloc(eri_t &eri, ptree const& pt,
       app_log(1, "╚══════════════════════════════════════════════════════════╝\n");
     }
     auto beta = io::get_value_with_default<double>(pt,"beta", 1000.0);
-    auto lambda = io::get_value_with_default<double>(pt,"lambda", 12000.0);
+    auto wmax = io::get_value_with_default<double>(pt,"wmax", 12.0);
     auto iaft_prec = io::get_value_with_default<std::string>(pt, "iaft_prec", "high");
-    imag_axes_ft::IAFT ft(beta, lambda, imag_axes_ft::ir_source, iaft_prec, false);
+    imag_axes_ft::IAFT ft(beta, wmax, imag_axes_ft::ir_source, iaft_prec, false);
     hamilt::pseudopot psp(*mf);
     write_mf_data(*mf, ft, psp, output);
   } else if (input_type == "scf" or input_type == "embed") {
@@ -559,9 +559,9 @@ downfold_wloc(eri_t &eri, ptree const& pt,
       app_log(1, "╚══════════════════════════════════════════════════════════╝\n");
     }
     auto beta = io::get_value_with_default<double>(pt,"beta", 1000.0);
-    auto lambda = io::get_value_with_default<double>(pt,"lambda", 12000.0);
+    auto wmax = io::get_value_with_default<double>(pt,"wmax", 12.0);
     auto iaft_prec = io::get_value_with_default<std::string>(pt, "iaft_prec", "high");
-    imag_axes_ft::IAFT ft(beta, lambda, imag_axes_ft::ir_source, iaft_prec, false);
+    imag_axes_ft::IAFT ft(beta, wmax, imag_axes_ft::ir_source, iaft_prec, false);
     hamilt::pseudopot psp(*mf);
     write_mf_data(*mf, ft, psp, output);
   } else if (input_type == "scf" or input_type == "embed") {
@@ -588,7 +588,7 @@ downfold_wloc(eri_t &eri, ptree const& pt,
  *  - bare_div_treatment: "gygi" Divergent treatment for the bare Coulomb kernel. {choices: "ignore_g0", "gygi"}
  * Optional arguments used only when outdir/prefix.mbpt.h5 does not exist:
  *  - beta: "1000" Inverse temperature (a.u.)
- *  - lambda: "12000.0" Dimensionless parameter to control the size of IAFT grids. lambda should >= beta*(bandwidth).
+ *  - wmax: "12.0" Frequency cutoff for the IAFT grid (a.u.)
  *  - iaft_prec: "high" Precision of IAFT grids. {choices: "high", "medium", "low"}
  */
 template<bool return_vw, typename eri_t>
@@ -627,7 +627,7 @@ downfolding_2e(eri_t &eri, ptree const& pt,
 
   // only use when outdir/prefix.mbpt.h5 does not exist.
   auto beta = io::get_value_with_default<double>(pt,"beta",1000.0);
-  auto lambda = io::get_value_with_default<double>(pt,"lambda",12000.0);
+  auto wmax = io::get_value_with_default<double>(pt,"wmax",12.0);
   auto iaft_prec = io::get_value_with_default<std::string>(pt, "iaft_prec", "high");
 
   auto mf = eri.MF();
@@ -636,7 +636,7 @@ downfolding_2e(eri_t &eri, ptree const& pt,
   if (input_type == "mf") {
     utils::check(not std::filesystem::exists(output+".mbpt.h5"), "downfold_2e: input_type = \"mf\" can not be launched if {}.mbpt.h5 already exists. "
                           "Please set input_type = \"coqui\" and input_iter = 0 if you want to use MF Green's function as the input.", output);
-    imag_axes_ft::IAFT ft(beta, lambda, imag_axes_ft::ir_source, iaft_prec, true);
+    imag_axes_ft::IAFT ft(beta, wmax, imag_axes_ft::ir_source, iaft_prec, true);
     hamilt::pseudopot psp(*mf);
     write_mf_data(*mf, ft, psp, output);
   } else if (input_type == "coqui") {
@@ -737,7 +737,7 @@ downfolding_2e(eri_t &eri, ptree const& pt,
 
   // only use when outdir/prefix.mbpt.h5 does not exist.
   auto beta = io::get_value_with_default<double>(pt,"beta",1000.0);
-  auto lambda = io::get_value_with_default<double>(pt,"lambda",12000.0);
+  auto wmax = io::get_value_with_default<double>(pt,"wmax",12.0);
   auto iaft_prec = io::get_value_with_default<std::string>(pt, "iaft_prec", "high");
 
   auto mf = eri.MF();
@@ -746,7 +746,7 @@ downfolding_2e(eri_t &eri, ptree const& pt,
   if (input_type == "mf") {
     utils::check(not std::filesystem::exists(output+".mbpt.h5"), "downfold_2e: input_type = \"mf\" can not be launched if {}.mbpt.h5 already exists. "
                                                                  "Please set input_type = \"coqui\" and input_iter = 0 if you want to use MF Green's function as the input.", output);
-    imag_axes_ft::IAFT ft(beta, lambda, imag_axes_ft::ir_source, iaft_prec, true);
+    imag_axes_ft::IAFT ft(beta, wmax, imag_axes_ft::ir_source, iaft_prec, true);
     hamilt::pseudopot psp(*mf);
     write_mf_data(*mf, ft, psp, output);
   } else if (input_type == "coqui") {
@@ -829,7 +829,7 @@ downfolding_2e(eri_t &eri, ptree const& pt,
  *  - thresh: 1e-6. Threshold used if factorization is requested.
  * Optional arguments used only when outdir/prefix.mbpt.h5 does not exist:
  *  - beta: "1000" Inverse temperature (a.u.)
- *  - lambda: "12000.0" Dimensionless parameter to control the size of IAFT grids. lambda should >= beta*(bandwidth).
+ *  - wmax: "12.0" Frequency cutoff for the IAFT grids (a.u.)
  *  - iaft_prec: "high" Precision of IAFT grids. {choices: "high", "medium", "low"}
  */
 template<typename eri_t>
@@ -841,7 +841,7 @@ void hf_downfold(eri_t &eri, ptree const& pt) {
   auto trans_home_cell = io::get_value_with_default<bool>(pt,"translate_home_cell",false);
 
   auto beta = io::get_value_with_default<double>(pt,"beta",1000.0);
-  auto lambda = io::get_value_with_default<double>(pt,"lambda",12000.0);
+  auto wmax = io::get_value_with_default<double>(pt,"wmax",12.0);
   auto iaft_prec = io::get_value_with_default<std::string>(pt, "iaft_prec", "high");
 
   // two-body downfolding options
@@ -866,7 +866,7 @@ void hf_downfold(eri_t &eri, ptree const& pt) {
   std::string output = outdir + "/" + prefix;
 
   // initialize
-  imag_axes_ft::IAFT ft(beta, lambda, imag_axes_ft::ir_source, iaft_prec, true);
+  imag_axes_ft::IAFT ft(beta, wmax, imag_axes_ft::ir_source, iaft_prec, true);
   hamilt::pseudopot psp(*mf);
   write_mf_data(*mf, ft, psp, output);
   MBState mb_state(ft, output, mf, wannier_file, trans_home_cell, false);

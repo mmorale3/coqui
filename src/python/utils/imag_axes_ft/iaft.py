@@ -22,7 +22,9 @@ def set_precision(precision):
 
 def set_lambda(lmbda, coqui_cxx_style=False):
     if coqui_cxx_style:
-        if lmbda <= 1000:
+        if lmbda <= 100:
+            return 100
+        elif lmbda > 100 and lmbda <= 1000:
             return 1000
         elif lmbda > 1000 and lmbda <= 10000:
             return 10000
@@ -40,7 +42,7 @@ def set_lambda(lmbda, coqui_cxx_style=False):
 class IAFT(object):
     """
     Driver for FT on the imaginary axis.
-    Given inverse temperature, lambda and precision, the IAFT class evaluate the corresponding
+    Given inverse temperature, frequency cutoff and precision, the IAFT class evaluate the corresponding
     IR basis and sparse sampling points on-the-fly.
 
     Dependency:
@@ -50,6 +52,8 @@ class IAFT(object):
     Attributes:
     beta: float
         Inverse temperature (a.u.)
+    wmax: float
+        Frequency cutoff (a.u.)
     lmbda: float
         Dimensionless lambda parameter for constructing the IR basis
     prec: float
@@ -75,20 +79,19 @@ class IAFT(object):
     nw_b: int
         Number of bosonic frequency sampling points
     """
-    def __init__(self, beta: float, lmbda: float, prec = 1e-15, verbose: bool = True,
-                 *, coqui_cxx_style: bool = False):
+    def __init__(self, beta: float, wmax: float, prec = 1e-15, verbose: bool = True):
         """
         :param beta: float
             Inverse temperature (a.u.)
-        :param lmbda: float
-            Lambda parameter for constructing IR basis.
+        :param wmax: float
+            Frequency cutoff (a.u.)
         :param prec: float
             Precision for IR basis
         """
         self.beta  = beta
-        self.lmbda = set_lambda(lmbda, coqui_cxx_style=coqui_cxx_style)
-        self.prec  = set_precision(prec)
+        self.lmbda = set_lambda(wmax*beta, coqui_cxx_style=True if isinstance(prec, str) else False)
         self.wmax  = self.lmbda / self.beta
+        self.prec  = set_precision(prec)
         self.statisics = {'f', 'b'}
 
         self.bases = sparse_ir.FiniteTempBasisSet(beta=self.beta, wmax=self.wmax, eps=self.prec)
@@ -125,10 +128,12 @@ class IAFT(object):
                 "Intermediate Representation\n" \
                 "precision = {}\n" \
                 "beta = {}\n" \
+                "frequency cutoff = {}\n" \
                 "lambda = {}\n" \
                 "nt_f, nw_f = {}, {}\n" \
-                "nt_b, nw_b = {}, {}\n".format(self.prec, self.beta, self.lmbda, self.nt_f, self.nw_f,
-                                                self.nt_b, self.nw_b))
+                "nt_b, nw_b = {}, {}\n".format(
+            self.prec, self.beta, self.wmax, self.lmbda,
+            self.nt_f, self.nw_f, self.nt_b, self.nw_b))
 
     def __eq__(self, other):
         if not isinstance(other, IAFT):
@@ -551,7 +556,7 @@ class IAFT(object):
 
     def check_leakage(self, Ot, stats: str, name: str = "", w_input: bool = False):
         """
-        Check decay of the IR coefficients to assess the quality of IR basis for the beta and lambda.
+        Check decay of the IR coefficients to assess the quality of IR basis for the beta and wmax.
         The coefficients should decay exponentially, and the leakage is defined as:
             leakage = the smallest coefficients / the largest coefficients
         :param Ot:
@@ -590,7 +595,7 @@ class IAFT(object):
 
     def check_leakage_phsym(self, Ot, stats: str, name: str = "", w_input: bool = False):
         """
-        Check decay of the IR coefficients to assess the quality of IR basis for the beta and lambda.
+        Check decay of the IR coefficients to assess the quality of IR basis for the beta and wmax.
         The coefficients should decay exponentially, and the leakage is defined as:
             leakage = the smallest coefficients / the largest coefficients
         :param Ot:
@@ -645,7 +650,7 @@ class IAFT(object):
 
 if __name__ == '__main__':
     # Initialize IAFT object for given inverse temperature, lambda and precision
-    ft = IAFT(1000, 1e4, 1e-6)
+    ft = IAFT(1000.0, 10.0, 1e-6)
 
     print(ft.wn_mesh('f', True))
 

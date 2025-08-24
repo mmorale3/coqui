@@ -67,8 +67,8 @@ namespace bdft_tests {
     hamilt::pseudopot psp(mf);
 
     double beta = 1000;
-    double lambda = 1.2e4;
-    imag_axes_ft::IAFT ft(beta, lambda, imag_axes_ft::ir_source);
+    double wmax = 12.0;
+    imag_axes_ft::IAFT ft(beta, wmax, imag_axes_ft::ir_source);
 
     auto [sMO_skij, sE_ski] = get_mf_MOs(*context, mf, psp);
     double mu = 0.2;

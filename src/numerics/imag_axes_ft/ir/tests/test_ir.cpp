@@ -16,7 +16,7 @@ namespace bdft_tests {
   TEST_CASE("ir_read", "[ir_read]") {
     double beta = 1000;
     double lambda = 1.2e4;
-    imag_axes_ft::ir::IR myir(beta, lambda, "high");
+    imag_axes_ft::ir::IR myir(beta, lambda/beta, "high");
 
     REQUIRE(myir.lambda == 1e5);
     REQUIRE(myir.nt_f == 137);

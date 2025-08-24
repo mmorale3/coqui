@@ -1,6 +1,5 @@
 import numpy as np
 import h5._h5py as h5
-import h5py
 import sparse_ir
 
 '''
@@ -79,6 +78,7 @@ def gen_dimensionless_ir_bases(outdir, prefix, lmbda, eps=None):
         filename = outdir + "/" + prefix + "." + str(eps) + ".h5"
     f = h5.File(filename, 'w')
     g = h5.Group(f)
+    h5.h5_write(g, "version", sparse_ir.__version__)
 
     f_grp = g.create_group("fermion")
     h5.h5_write(f_grp, "nt", np.int32(nt_f))
@@ -104,7 +104,7 @@ def gen_dimensionless_ir_bases(outdir, prefix, lmbda, eps=None):
 
     del f
 
-lamb_dict = {"1e3": 1000, "1e4": 10000, "1e5": 100000, "1e6": 1000000}
+lamb_dict = {"1e2": 100, "1e3": 1000, "1e4": 10000, "1e5": 100000, "1e6": 1000000}
 for fname in lamb_dict:
     print(fname)
     gen_dimensionless_ir_bases("./", fname, lamb_dict[fname], 1e-6)

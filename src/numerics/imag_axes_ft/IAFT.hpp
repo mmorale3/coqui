@@ -31,11 +31,11 @@ namespace imag_axes_ft {
 
   public:
     IAFT(): grid_var{} { APP_ABORT(" imag_axes_ft::IAFT(): Empty state is not allowed. \n"); }
-    IAFT(double beta, double lambda, source_e source, std::string prec = "high", bool print_meta_log = false) {
+    IAFT(double beta, double wmax, source_e source, std::string prec = "high", bool print_meta_log = false) {
       if (source == dlr_source) {
         APP_ABORT(" imag_axes_ft::IAFT(): DLR interface is not ready yet. \n");
       } else if (source == ir_source) {
-        grid_var = ir::IR(beta, lambda, prec, print_meta_log);
+        grid_var = ir::IR(beta, wmax, prec, print_meta_log);
       } else {
         APP_ABORT(" imag_axes_ft::IAFT(): Invalid value of imag_axes_ft::source_e. \n");
       }
@@ -175,6 +175,9 @@ namespace imag_axes_ft {
     }
     double beta() const {
       return std::visit( [&](auto&& v) { return v.beta; }, grid_var);
+    }
+    double wmax() const {
+      return std::visit( [&](auto&& v) { return v.wmax; }, grid_var);
     }
     double lambda() const {
       return std::visit( [&](auto&& v) { return v.lambda; }, grid_var);

@@ -33,9 +33,9 @@ namespace bdft_tests {
     std::string filepath = source_path + "/tests/unit_test_files/pyscf/si_kp222_krhf/";
 
     double beta = 1000;
-    double lambda = 1.2e4;
+    double wmax = 12.0;
     auto mf = mf::make_MF(context, mf::pyscf_source, filepath, "pyscf");
-    imag_axes_ft::IAFT ft(beta, lambda, imag_axes_ft::ir_source);
+    imag_axes_ft::IAFT ft(beta, wmax, imag_axes_ft::ir_source);
     simple_dyson dyson(std::addressof(mf), std::addressof(ft));
   }
 
@@ -44,9 +44,9 @@ namespace bdft_tests {
     std::string source_path = PROJECT_SOURCE_DIR;
     std::string filepath = source_path + "/tests/unit_test_files/pyscf/si_kp222_krhf/";
     double beta = 1000;
-    double lambda = 1.2e4;
+    double wmax = 12.0;
     auto mf = mf::make_MF(context, mf::pyscf_source, filepath, "pyscf");
-    imag_axes_ft::IAFT ft(beta, lambda, imag_axes_ft::ir_source);
+    imag_axes_ft::IAFT ft(beta, wmax, imag_axes_ft::ir_source);
     hamilt::pseudopot psp(mf);
     sArray_t<Array_view_4D_t> F(math::shm::make_shared_array<Array_view_4D_t>(
         *context, {mf.nspin(), mf.nkpts(), mf.nbnd(), mf.nbnd()}));
@@ -61,7 +61,7 @@ namespace bdft_tests {
     simple_dyson dyson( std::addressof(mf), std::addressof(ft));
     context->comm.barrier();
 
-    double mu = update_mu(0.0, dyson, mf, ft, F, G, Sigma);
+    double mu = update_mu(0.2, dyson, mf, ft, F, G, Sigma);
     CHECK(mu == Approx(0.2));
     context->comm.barrier();
 

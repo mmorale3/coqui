@@ -16,12 +16,12 @@ namespace bdft_tests {
 
   TEST_CASE("iaft_ir_read", "[iaft_ir_read]") {
     double beta = 1000;
-    double lambda = 1.2e4;
+    double wmax = 12.0;
     {
-      imag_axes_ft::ir::IR myir(beta, lambda);
+      imag_axes_ft::ir::IR myir(beta, wmax);
       imag_axes_ft::IAFT iaft(myir);
     }
-    imag_axes_ft::IAFT iaft(beta, lambda, imag_axes_ft::ir_source);
+    imag_axes_ft::IAFT iaft(beta, wmax, imag_axes_ft::ir_source);
 
     REQUIRE(iaft.beta() == beta);
     REQUIRE(iaft.nt_f() == 137);
@@ -45,63 +45,76 @@ namespace bdft_tests {
 
   TEST_CASE("iaft_ir_ft", "[iaft_ir_ft]") {
     decltype(nda::range::all) all;
+
+    std::string source_path = std::string(PROJECT_SOURCE_DIR)+"/tests/unit_test_files/pyscf/si_kp222_krhf/";
+
+    auto test_iaft = [&](double beta, double wmax, std::string prec, double tol) {
+
+      imag_axes_ft::IAFT myft(beta, wmax, imag_axes_ft::ir_source, prec, true);
+
+      std::string filename = source_path+"/Gw_Gt_beta"+std::to_string(int(beta))+"_wmax"+std::format("{:.1f}", wmax)+"_"+prec+".h5";
+      h5::file file(filename, 'r');
+      h5::group grp(file);
+
+      nda::array<std::complex<double>, 5> G_tskij_ref;
+      nda::array<std::complex<double>, 5> G_wskij_ref;
+      nda::array<std::complex<double>, 4> Dm_skij_ref;
+      nda::h5_read(grp, "Gt", G_tskij_ref);
+      nda::h5_read(grp, "Gw", G_wskij_ref);
+      nda::h5_read(grp, "Dm", Dm_skij_ref);
+
+      size_t nts   = G_tskij_ref.shape(0);
+      size_t nw    = G_wskij_ref.shape(0);
+      size_t ns    = G_tskij_ref.shape(1);
+      size_t nkpts = G_tskij_ref.shape(2);
+      size_t nbnd  = G_tskij_ref.shape(3);
+      // Fourier transform between tau and iwn
+      {
+        nda::array<std::complex<double>, 5> G_tskij(nts, ns, nkpts, nbnd, nbnd);
+        nda::array<std::complex<double>, 5> G_wskij(nw, ns, nkpts, nbnd, nbnd);
+        myft.tau_to_w(G_tskij_ref, G_wskij, imag_axes_ft::fermi);
+        myft.w_to_tau(G_wskij_ref, G_tskij, imag_axes_ft::fermi);
+
+        ARRAY_EQUAL(G_tskij, G_tskij_ref, tol);
+        ARRAY_EQUAL(G_wskij, G_wskij_ref, tol);
+      }
+      // tau to a specific w
+      {
+        nda::array<std::complex<double>, 5> G_wskij(nw, ns, nkpts, nbnd, nbnd);
+        nda::array<std::complex<double>, 4> G_skij(ns, nkpts, nbnd, nbnd);
+        for (size_t n = 0; n < nw; ++n) {
+          nda::array_view<std::complex<double>, 4> Gw_skij({ns, nkpts, nbnd, nbnd},
+                                                           G_wskij.data() + n*ns*nkpts*nbnd*nbnd);
+          myft.tau_to_w(G_tskij_ref, G_skij, imag_axes_ft::fermi, n);
+          Gw_skij = G_skij;
+        }
+        ARRAY_EQUAL(G_wskij, G_wskij_ref, tol);
+      }
+      // Partial Fourier transform
+      {
+        nda::array<std::complex<double>, 5> G_tskij(nts, ns, nkpts, nbnd, nbnd);
+        for (size_t n = 0; n < nw; ++n) {
+          auto Gw_skij = G_wskij_ref(n, all, all, all, all);
+          myft.w_to_tau_partial(Gw_skij, G_tskij, imag_axes_ft::fermi, n);
+        }
+        ARRAY_EQUAL(G_tskij, G_tskij_ref, tol);
+      }
+      // tau = beta^{-} via the interpolation at sparse sampling nodes
+      {
+        nda::array<std::complex<double>, 4> Dm_skij(ns, nkpts, nbnd, nbnd);
+        myft.tau_to_beta(G_tskij_ref, Dm_skij);
+        Dm_skij *= -1.0;
+        ARRAY_EQUAL(Dm_skij, Dm_skij_ref, tol);
+      }
+    };
+
     double beta = 1000;
-    double lambda = 1.2e4;
-    imag_axes_ft::IAFT myft(beta, lambda, imag_axes_ft::ir_source);
-    std::string source_path = PROJECT_SOURCE_DIR;
-    std::string filename = source_path + "/tests/unit_test_files/pyscf/si_kp222_krhf/Gw_Gt_beta1000_1e5.h5";
-    h5::file file(filename, 'r');
-    h5::group grp(file);
-
-    nda::array<std::complex<double>, 5> G_tskij_ref;
-    nda::array<std::complex<double>, 5> G_wskij_ref;
-    nda::array<std::complex<double>, 4> Dm_skij_ref;
-    nda::h5_read(grp, "Gt", G_tskij_ref);
-    nda::h5_read(grp, "Gw", G_wskij_ref);
-    nda::h5_read(grp, "Dm", Dm_skij_ref);
-
-    size_t nts   = G_tskij_ref.shape(0);
-    size_t nw    = G_wskij_ref.shape(0);
-    size_t ns    = G_tskij_ref.shape(1);
-    size_t nkpts = G_tskij_ref.shape(2);
-    size_t nbnd  = G_tskij_ref.shape(3);
-    // Fourier transform between tau and iwn
-    {
-      nda::array<std::complex<double>, 5> G_tskij(nts, ns, nkpts, nbnd, nbnd);
-      nda::array<std::complex<double>, 5> G_wskij(nw, ns, nkpts, nbnd, nbnd);
-      myft.tau_to_w(G_tskij_ref, G_wskij, imag_axes_ft::fermi);
-      myft.w_to_tau(G_wskij_ref, G_tskij, imag_axes_ft::fermi);
-
-      ARRAY_EQUAL(G_tskij, G_tskij_ref, 1e-12);
-      ARRAY_EQUAL(G_wskij, G_wskij_ref, 1e-12);
+    double wmax = 1.2;
+    SECTION("prec_high") {
+      test_iaft(beta, wmax, "high", 1e-11);
     }
-    // tau to a specific w
-    {
-      nda::array<std::complex<double>, 5> G_wskij(nw, ns, nkpts, nbnd, nbnd);
-      nda::array<std::complex<double>, 4> G_skij(ns, nkpts, nbnd, nbnd);
-      for (size_t n = 0; n < nw; ++n) {
-        nda::array_view<std::complex<double>, 4> Gw_skij({ns, nkpts, nbnd, nbnd},
-                                                         G_wskij.data() + n*ns*nkpts*nbnd*nbnd);
-        myft.tau_to_w(G_tskij_ref, G_skij, imag_axes_ft::fermi, n);
-        Gw_skij = G_skij;
-      }
-      ARRAY_EQUAL(G_wskij, G_wskij_ref, 1e-12);
-    }
-    // Partial Fourier transform
-    {
-      nda::array<std::complex<double>, 5> G_tskij(nts, ns, nkpts, nbnd, nbnd);
-      for (size_t n = 0; n < nw; ++n) {
-        auto Gw_skij = G_wskij_ref(n, all, all, all, all);
-        myft.w_to_tau_partial(Gw_skij, G_tskij, imag_axes_ft::fermi, n);
-      }
-      ARRAY_EQUAL(G_tskij, G_tskij_ref, 1e-12);
-    }
-    // tau = beta^{-} via the interpolation at sparse sampling nodes
-    {
-      nda::array<std::complex<double>, 4> Dm_skij(ns, nkpts, nbnd, nbnd);
-      myft.tau_to_beta(G_tskij_ref, Dm_skij);
-      Dm_skij *= -1.0;
-      ARRAY_EQUAL(Dm_skij, Dm_skij_ref, 1e-12);
+    SECTION("prec_medium") {
+      test_iaft(beta, wmax, "medium", 1e-9);
     }
   }
 } // bdft_tests

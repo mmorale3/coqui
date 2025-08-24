@@ -24,7 +24,7 @@ namespace bdft_tests {
     auto& mpi_context = utils::make_unit_test_mpi_context();
 
     std::string output = "coqui";
-    imag_axes_ft::IAFT ft(1000, 1200, imag_axes_ft::ir_source);
+    imag_axes_ft::IAFT ft(1000, 1.2, imag_axes_ft::ir_source);
     auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "pyscf_h2_222"));
     solvers::hf_t hf;
     solvers::gf2_t gf2(mf.get(), &ft, string_to_div_enum("gygi"),
@@ -70,7 +70,7 @@ namespace bdft_tests {
     auto& mpi_context = utils::make_unit_test_mpi_context();
 
     auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "pyscf_li_222u"));
-    imag_axes_ft::IAFT ft(1000, 1200, imag_axes_ft::ir_source);
+    imag_axes_ft::IAFT ft(1000, 1.2, imag_axes_ft::ir_source);
     solvers::hf_t hf;
     solvers::gf2_t gf2(mf.get(), &ft);
 
