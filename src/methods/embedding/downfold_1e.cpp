@@ -53,16 +53,16 @@ namespace methods {
     } else
       utils::check(false, "downfold_1e logic fail: the input dataset {} does not exist!", g_grp);
 
-    app_log(2, "  - CoQui check-point file:                    {}", filename);
-    app_log(2, "  - Input Green's function: ");
-    app_log(2, "      HDF5 group:                              {}", g_grp);
-    app_log(2, "      Iteration:                               {}", g_iter);
-    app_log(2, "  - Transformation matrices:                   {}", proj.C_file());
+    app_log(1, "  - CoQui checkpoint file                     = {}", filename);
+    app_log(1, "  - Input Green's function ");
+    app_log(1, "      HDF5 group                              = {}", g_grp);
+    app_log(1, "      Iteration                               = {}", g_iter);
+    app_log(1, "  - Transformation matrices                   = {}", proj.C_file());
     if (proj.C_file() != "")
-      app_log(2, "  - Force real local Hamiltonian:              {}", force_real);
-    app_log(2, "  - Number of impurities:                      {}", proj.nImps());
-    app_log(2, "  - Number of local orbitals per impurity:     {}", proj.nImpOrbs());
-    app_log(2, "  - Range of primary orbitals for local basis: [{}, {})\n",
+      app_log(1, "  - Force real local Hamiltonian              = {}", force_real);
+    app_log(1, "  - Number of impurities                      = {}", proj.nImps());
+    app_log(1, "  - Number of local orbitals per impurity     = {}", proj.nImpOrbs());
+    app_log(1, "  - Range of primary orbitals for local basis = [{}, {})\n",
             proj.W_rng()[0].first(), proj.W_rng()[0].last());
     ft->metadata_log();
     mpi->comm.barrier();
