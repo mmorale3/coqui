@@ -178,15 +178,24 @@ namespace methods {
     auto FT = imag_axes_ft::read_iaft(_scf_output+".mbpt.h5");
     size_t niw   = (ac_params.stats == imag_axes_ft::fermi)? FT.nw_f() : FT.nw_b();
 
-    app_log(2, "Analytical continuation from iw to w:");
-    app_log(2, "  - ac alg:  {}", ac_params.ac_alg);
-    app_log(2, "  - h5 file: {}", _scf_output + ".mbpt.h5");
-    app_log(2, "  - dataset: {}", dataset);
-    app_log(2, "  - ns, nkpts_ibz, nbnd: {}, {}, {}", ns, nkpts_ibz, nbnds);
-    app_log(2, "  - stats:   {}", imag_axes_ft::stats_enum_to_string(ac_params.stats));
-    app_log(2, "  - w grid:  [{}, {}] (a.u.) with {} frequency points", ac_params.w_min, ac_params.w_max, ac_params.Nw);
-    app_log(2, "  - eta:     {}", ac_params.eta);
-    app_log(2, "  - processor grid: (w, s, k, i) = ({}, {}, {}, {})\n", pgrid[0], pgrid[1], pgrid[2], pgrid[3]);
+    app_log(1, "  Analytical continuation from iw to w");
+    app_log(1, "  ------------------------------------");
+    app_log(1, "    AC algorithm              =  {}", ac_params.ac_alg);
+    app_log(1, "      - Statistics            = {}", imag_axes_ft::stats_enum_to_string(ac_params.stats));
+    if (ac_params.ac_alg == "pade")
+      app_log(1, "      - Nfit                  = {}", ac_params.Nfit);
+    app_log(1, "");
+    app_log(1, "    Input / Output");
+    app_log(1, "      - Checkpoint            = {}", _scf_output + ".mbpt.h5");
+    app_log(1, "      - Input path            = {}\n", dataset);
+    app_log(1, "    Number of spins           = {}", ns);
+    app_log(1, "    Number of k-points in IBZ = {}", nkpts_ibz);
+    app_log(1, "    Number of bands           = {}\n", nbnds);
+    app_log(1, "    Frequency mesh");
+    app_log(1, "      - Range                 = [{}, {}] (a.u.)", ac_params.w_min, ac_params.w_max);
+    app_log(1, "      - Number of points      = {}", ac_params.Nw);
+    app_log(1, "      - Offset                = {}\n", ac_params.eta);
+    app_log(2, "    Processor grid: (w, s, k, i) = ({}, {}, {}, {})\n", pgrid[0], pgrid[1], pgrid[2], pgrid[3]);
 
     // Prepare input and output buffer
     auto dA_iw_ski = make_distributed_array<local_Array_4D_t>(_context.comm, pgrid, {niw, ns, nkpts_ibz, nbnds}, {1, 1, 1, 1});
@@ -675,16 +684,25 @@ namespace methods {
                  _context.comm.size(), nkpools);
     utils::check(np/nkpools <= nbnd, "pproc_t::spectral_interpolation: too many processors ({}) along band indices ({})", np/nkpools, nbnd);
 
-    app_log(2, "Analytical continuation from iw to w");
-    app_log(2, "------------------------------------");
-    app_log(2, "  - ac alg:  {}", ac_params.ac_alg);
-    app_log(2, "  - h5 file: {}", _scf_output + ".mbpt.h5");
-    app_log(2, "  - dataset: {}/iter{}/wannier_inter/G_wskab", grp_name, iter);
-    app_log(2, "  - ns, nkpts, nbnd: {}, {}, {}", ns, nkpts, nbnd);
-    app_log(2, "  - stats:   {}", imag_axes_ft::stats_enum_to_string(ac_params.stats));
-    app_log(2, "  - w grid:  [{}, {}] (a.u.) with {} frequency points", ac_params.w_min, ac_params.w_max, ac_params.Nw);
-    app_log(2, "  - eta:     {}", ac_params.eta);
-    app_log(2, "  - processor grid: (w, s, k, i) = ({}, {}, {}, {})\n", pgrid[0], pgrid[1], pgrid[2], pgrid[3]);
+    app_log(1, "  Analytical continuation from iw to w");
+    app_log(1, "  ------------------------------------");
+    app_log(1, "    AC algorithm         = {}", ac_params.ac_alg);
+    app_log(1, "      - Statistics       = {}", imag_axes_ft::stats_enum_to_string(ac_params.stats));
+    if (ac_params.ac_alg == "pade")
+      app_log(1, "      - Nfit             = {}", ac_params.Nfit);
+    app_log(1, "");
+    app_log(1, "    Input / Output");
+    app_log(1, "      - Checkpoint       = {}", _scf_output + ".mbpt.h5");
+    app_log(1, "      - Input path       = {}/iter{}/wannier_inter/G_wskab", grp_name, iter);
+    app_log(1, "      - Output path      = {}/iter{}/ac/G_wskab_inter\n", grp_name, iter);
+    app_log(1, "    Number of spins      = {}", ns);
+    app_log(1, "    Number of k-points   = {}", nkpts);
+    app_log(1, "    Number of bands      = {}\n", nbnd);
+    app_log(1, "    Frequency mesh");
+    app_log(1, "      - Range            = [{}, {}] (a.u.)", ac_params.w_min, ac_params.w_max);
+    app_log(1, "      - Number of points = {}", ac_params.Nw);
+    app_log(1, "      - Offset           = {}\n", ac_params.eta);
+    app_log(2, "    Processor grid (w, s, k, i) = ({}, {}, {}, {})\n", pgrid[0], pgrid[1], pgrid[2], pgrid[3]);
 
     // Prepare input and output buffer
     using math::nda::make_distributed_array;
@@ -710,7 +728,6 @@ namespace methods {
     AC.iw_to_w(dG_wska.local(), iw_mesh, dA_wska.local(), w_grid, is_iw_pos_only, ac_params.Nfit);
     _context.comm.barrier();
 
-    app_log(2, "Dump AC results for G_wskab_inter.");
     dump_ac_output(w_grid, dA_wska, iw_mesh, dG_wska, "G_wskab_inter", grp_name, iter);
     _context.comm.barrier();
   }
