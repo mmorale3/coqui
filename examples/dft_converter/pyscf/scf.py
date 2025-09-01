@@ -6,7 +6,7 @@ Converter for a PySCF mean-field object with periodic boundary condition.
 Our converter uses the Python interface for hdf5 from nda (https://github.com/TRIQS/nda), rather than h5py.
 Before running the script, make sure to install nda and to add 
 
-"{BeyondDFT_source_dir}/src/mean_field/pyscf/pyscf_interface"
+"{CoQui_source_dir}/src/mean_field/pyscf/pyscf_interface"
 "{nda_build_dir}/deps/h5/python"
 
 in PYTHONPATH. 
@@ -37,7 +37,7 @@ kmf.kernel()
 kmf.analyze()
 
 #
-# dump_to_h5() function extracts necessary information form kmf into h5 files which will then be read by BeyondDFT. 
+# dump_to_h5() function extracts necessary information form kmf into h5 files which will then be read by CoQui. 
 # The outputs include: 
 #   a) a h5 file for metadata: "outdir/prefix.h5"
 #   b) a folder for wfc on a FFT mesh: "outdir/Orb_fft"

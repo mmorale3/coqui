@@ -62,7 +62,7 @@ square brackets (`[]`) with your local settings.
 
 ```shell
 # Step 1: Clone the git repository of CoQui
-git clone https://github.com/mmorale3/BeyondDFT.git coqui.src
+git clone https://github.com/AbInitioQHub/coqui.git coqui.src
 
 # Step 2: Create working directory for CMake to build in
 mkdir -p coqui.build && cd coqui.build
