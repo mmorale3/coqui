@@ -6,7 +6,7 @@ from h5 import HDFArchive
 
 # mpi handler and verbosity
 mpi = coqui.MpiHandler()
-coqui.set_verbosity(mpi, output_level=2, debug_level=0)
+coqui.set_verbosity(mpi, output_level=2)
 
 # construct MF from a dictionary 
 mf_params = {
@@ -38,13 +38,21 @@ coqui.run_gw(h_int=my_eri, params=gw_params)
 
 #########
 
-ir = IAFT(beta=beta, wmax=wmax, prec=prec, coqui_cxx_style=True)
+ir = IAFT(beta=beta, wmax=wmax, prec=prec)
 with HDFArchive("gw.mbpt.h5", 'r') as ar:
     Gt = ar["scf/iter1/G_tskij"]
+    Gt_hf = ar["scf/iter0/G_tskij"]
 Gw = ir.tau_to_w(Gt, stats='f')
 Dm = -ir.tau_interpolate(Gt, [beta], stats='f')[0]
 
-with HDFArchive(f"Gw_Gt_beta{beta}_wmax{wmax}_{prec}.h5", 'w') as ar:
+with HDFArchive(f"gw_Gw_Gt_beta{beta}_wmax{wmax}_{prec}.h5", 'w') as ar:
     ar["Gt"] = Gt
     ar["Gw"] = Gw
     ar["Dm"] = Dm
+
+Gw_hf = ir.tau_to_w(Gt_hf, stats='f')
+Dm_hf = -ir.tau_interpolate(Gt_hf, [beta], stats='f')[0]
+with HDFArchive(f"hf_Gw_Gt_beta{beta}_wmax{wmax}_{prec}.h5", 'w') as ar:
+    ar["Gt"] = Gt_hf
+    ar["Gw"] = Gw_hf
+    ar["Dm"] = Dm_hf

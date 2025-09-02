@@ -44,7 +44,7 @@ namespace bdft_tests {
     std::string source_path = PROJECT_SOURCE_DIR;
     std::string filepath = source_path + "/tests/unit_test_files/pyscf/si_kp222_krhf/";
     double beta = 1000;
-    double wmax = 12.0;
+    double wmax = 1.2;
     auto mf = mf::make_MF(context, mf::pyscf_source, filepath, "pyscf");
     imag_axes_ft::IAFT ft(beta, wmax, imag_axes_ft::ir_source);
     hamilt::pseudopot psp(mf);
@@ -61,8 +61,8 @@ namespace bdft_tests {
     simple_dyson dyson( std::addressof(mf), std::addressof(ft));
     context->comm.barrier();
 
-    double mu = update_mu(0.2, dyson, mf, ft, F, G, Sigma);
-    CHECK(mu == Approx(0.2));
+    double mu = update_mu(0.0, dyson, mf, ft, F, G, Sigma);
+    CHECK(mu == Approx(0.175));
     context->comm.barrier();
 
     update_G(dyson, mf, ft, Dm, G, F, Sigma, mu, true);// keep mu constant
@@ -74,7 +74,7 @@ namespace bdft_tests {
      **/
     {
       std::string source_path_ = PROJECT_SOURCE_DIR;
-      std::string filename = source_path_ + "/tests/unit_test_files/pyscf/si_kp222_krhf/Gw_Gt_beta1000_1e5.h5";
+      std::string filename = source_path_ + "/tests/unit_test_files/pyscf/si_kp222_krhf/hf_Gw_Gt_beta1000_wmax1.2_high.h5";
       h5::file file(filename, 'r');
       h5::group grp(file);
 

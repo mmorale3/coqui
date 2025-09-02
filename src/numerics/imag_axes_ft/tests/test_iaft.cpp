@@ -52,7 +52,7 @@ namespace bdft_tests {
 
       imag_axes_ft::IAFT myft(beta, wmax, imag_axes_ft::ir_source, prec, true);
 
-      std::string filename = source_path+"/Gw_Gt_beta"+std::to_string(int(beta))+"_wmax"+std::format("{:.1f}", wmax)+"_"+prec+".h5";
+      std::string filename = source_path+"/gw_Gw_Gt_beta"+std::to_string(int(beta))+"_wmax"+std::format("{:.1f}", wmax)+"_"+prec+".h5";
       h5::file file(filename, 'r');
       h5::group grp(file);
 
