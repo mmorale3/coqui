@@ -1,10 +1,10 @@
 CoQui: Correlated Quantum Interface
 -----------------------------------------------
-**Last Updated:** January 30, 2025
+**Last Updated:** Sept. 2, 2025
 
-CoQui is a scientific software project designed for 
-***Co**rrelated **Qu**antum **I**nterface* that goes beyond the scope 
-of density functional theory (DFT). Starting with a single-particle basis 
+CoQuí, **Cor**related **Qu**antum **í**nterface, is a software project 
+designed for *ab initio* electronic structure beyond density functional 
+theory (DFT). Starting with a single-particle basis 
 set and a mean-field solution, typically DFT or Hartree-Fock, CoQui employs 
 tensor hypercontraction (THC) decomposition to efficiently process two-electron 
 operators. This sophisticated approach enables CoQui to achieve exceptionally 
@@ -46,8 +46,8 @@ please visit our [examples](examples/README.md) page.
 ## Getting started with `CoQui` 
 ### Prerequisites
 - C++ compiler that supports at least C++20.
-- CMake >= 3.2.0
-- MPI Library: openmpi >= 4 or mpich >= ?. 
+- CMake >= 3.2.0.
+- MPI Library: openmpi >= 4. 
 - HDF5 >= 1.8.2 for checkpoint file I/O. 
 - BLAS Library: OpenBLAS or Intel MKL. 
 - LAPACK Library: OpenBLAS or Intel MKL. 
@@ -56,7 +56,7 @@ please visit our [examples](examples/README.md) page.
 - FFTW >= 3.2
 
 ### Installation
-`CoQui` uses `CMake` to configure the build process. Please follow 
+`CoQui` uses `CMake` to configure the build process. Follow 
 the instructions below step-by-step, and replace the placeholders in 
 square brackets (`[]`) with your local settings.
 
@@ -67,31 +67,36 @@ git clone https://github.com/AbInitioQHub/coqui.git coqui.src
 # Step 2: Create working directory for CMake to build in
 mkdir -p coqui.build && cd coqui.build
 
-# Step 3: Use cmake to configure the coqui build process
+# Step 3: Configure with CMake
 # Replace `[YOUR_INSTALL_PREFIX]` with the directory where you want CoQui installed.
 # Replace `[NCORES]` with the number of cores you want to use for the test processes.
 # Replace `[SLATE_INSTALL_PATH]` with your SLATE installation path. 
+# Add `COQUI_PYTHON_SUPPORT=ON
 export slate_ROOT=[SLATE_INSTALL_PATH]
 cmake \
         -DCMAKE_INSTALL_PREFIX=[YOUR_INSTALL_PREFIX] \
         -DCTEST_NPROC=[NCORES] \
+        -DCOQUI_PYTHON_SUPPORT=ON \ # Optional: enable Python bindings
         ../coqui.src
 
-# Step 4: Build, test and install coqui
+# Step 4: Build, test and install
 # Replace `[NCORES_MAKE] with the number of cores you want to use for the build processes. 
 # The ctests will be executed in parallel using `[NCORES]` processors.
-make -j[NCORES_MAKE] && make test && make install
+make -j[NCORES_MAKE] && ctest && make install
 
-# Step 5: Verify the installation
-# Check if the executable `coqui` was successfully installed in `[YOUR_INSTALL_PREFIX]/bin`.
+# Verify: the 'coqui' executable should be in [YOUR_INSTALL_PREFIX]/bin
+ls -l [YOUR_INSTALL_PREFIX]/bin/coqui
 
-# For convenience, you can add `[YOUR_INSTALL_PREFIX]/bin` to your `PATH` environment variable: 
-export PATH="[YOUR_INSTALL_PREFIX]/bin:$PATH"
+# Step 5: Set CoQui environment 
+# You would need to source this in every new shell, or add 
+# this line to your ~/.bashrc or ~/.zshrc to make it persistent.
+source [YOUR_INSTALL_PREFIX]/share/coqui/coqui_env.sh
 ```
 
-### Tutorials and Examples 
-For guidance on preparing inputs for `CoQui`, please refer to the 
-[Examples](examples/README.md) section. 
+### Tutorials and Examples
+- **Quick start:** See the step-by-step notebooks in the
+  [coqui tutorial](https://github.com/AbInitioQHub/coqui-tutorial).
+- **Reference inputs:** Browse runnable cases in [examples](examples/README.md).
 
 ## Citation
 If you use `CoQui` in your research, please consider supporting our developers 

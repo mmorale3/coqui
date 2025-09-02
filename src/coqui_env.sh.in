@@ -1,0 +1,10 @@
+# Script to automatically setup CoQui in the environment
+
+export COQUI_ROOT=@CMAKE_INSTALL_PREFIX@
+
+export PATH="@CMAKE_INSTALL_PREFIX@/@CMAKE_INSTALL_BINDIR@:$PATH"
+# Shared libraries
+export LD_LIBRARY_PATH="@CMAKE_INSTALL_PREFIX@/@CMAKE_INSTALL_LIBDIR@:$LD_LIBRARY_PATH"
+
+# Python path (present only if built)
+@APPEND_COQUI_TO_PYTHONPATH@

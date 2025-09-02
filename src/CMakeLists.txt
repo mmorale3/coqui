@@ -21,7 +21,13 @@ add_subdirectory(methods)
 
 add_subdirectory(main)
 
+set(APPEND_COQUI_TO_PYTHONPATH "# Python support not enabled at build time.")
 if(COQUI_PYTHON_SUPPORT)
   add_subdirectory(python)
+  set(APPEND_COQUI_TO_PYTHONPATH "export PYTHONPATH=\"${CMAKE_INSTALL_PREFIX}/lib/${PythonPrefix}/site-packages:\$PYTHONPATH\"")
 endif()
+
+# Configure CoQui environment variables
+configure_file(${PROJECT_SOURCE_DIR}/src/coqui_env.sh.in
+               ${CMAKE_INSTALL_PREFIX}/share/coqui/coqui_env.sh)
 
