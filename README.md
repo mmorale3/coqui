@@ -39,6 +39,7 @@ please visit our [examples](examples/README.md) page.
 - Self-consistency with full frequency dependence
 
 #### Downfolding for effective low-energy Hamiltonians
+- Maximally localized Wannier functions via Wannier90 interface 
 - Constrained RPA to calculate screened interactions [[ref](https://pubs.acs.org/doi/abs/10.1021/acs.jctc.4c00085)]
 - Local effective low-energy Hamiltonian for further correlated calculations
   [[ref](https://pubs.acs.org/doi/abs/10.1021/acs.jctc.4c00085)]
