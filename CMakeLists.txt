@@ -356,7 +356,6 @@ set(TblisSupport ${ENABLE_TBLIS} CACHE INTERNAL "")
 set(Build_Tests ${COMPILE_NDA_TESTS} CACHE INTERNAL "")
 if(COQUI_PYTHON_SUPPORT)
   # nda_py library is needed in CoQui python version
-  # CNY: is this necessary?
   set(PythonSupport ON CACHE INTERNAL "")
 else()
   set(PythonSupport ${NDA_PYTHON_SUPPORT} CACHE INTERNAL "")
@@ -366,13 +365,7 @@ FetchContent_Declare(
         GIT_REPOSITORY "https://github.com/triqs/nda.git"
         GIT_TAG        tensor
 )
-#FetchContent_MakeAvailable(nda)
-FetchContent_Populate(nda)
-if(COMPILE_NDA_TESTS)
-  add_subdirectory(${nda_SOURCE_DIR} ${nda_BINARY_DIR})
-else()
-  add_subdirectory(${nda_SOURCE_DIR} ${nda_BINARY_DIR} EXCLUDE_FROM_ALL)
-endif()
+FetchContent_MakeAvailable(nda)
 
 set_property(GLOBAL PROPERTY nda_FOUND TRUE)
 
