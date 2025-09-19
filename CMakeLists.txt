@@ -4,6 +4,11 @@
 cmake_minimum_required(VERSION 3.18.0)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# Necessary for cmake try_compile of Fortran/C Interface
+# when mixing gfortran and clang
+# CNY: Any workaround?
+set(CMAKE_Fortran_FLAGS_INIT "-fPIC")
+
 #######################
 # Check CoQui git info
 #######################
@@ -118,8 +123,13 @@ option(FORCE_COLORED_OUTPUT "Always produce ANSI-colored output (GNU/Clang only)
 option(COQUI_PYTHON_SUPPORT "Build with Python interface" OFF)
 option(COQUI_UPDATE_PYTHON_BINDINGS "Generate coqui python bindings from scratch" OFF)
 
+if(COQUI_PYTHON_SUPPORT)
+  # Set PIC for all libraries
+  set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+endif()
+
 #option(USE_DEVICE_COMPILER "Use gpu compiler, e.g. nvcc, for all files." OFF)
-set(USE_DEVICE_COMPILER OFF) 
+set(USE_DEVICE_COMPILER OFF)
 
 if( ENABLE_CUDA OR ENABLE_HIP OR ENABLE_OPENMP)
   set(ENABLE_DEVICE ON)
