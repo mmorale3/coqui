@@ -4,6 +4,11 @@
 cmake_minimum_required(VERSION 3.18.0)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# Necessary for cmake try_compile of Fortran/C Interface
+# when mixing gfortran and clang
+# CNY: Any workaround?
+set(CMAKE_Fortran_FLAGS_INIT "-fPIC")
+
 #######################
 # Check CoQui git info
 #######################
@@ -118,8 +123,13 @@ option(FORCE_COLORED_OUTPUT "Always produce ANSI-colored output (GNU/Clang only)
 option(COQUI_PYTHON_SUPPORT "Build with Python interface" OFF)
 option(COQUI_UPDATE_PYTHON_BINDINGS "Generate coqui python bindings from scratch" OFF)
 
+if(COQUI_PYTHON_SUPPORT)
+  # Set PIC for all libraries
+  set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+endif()
+
 #option(USE_DEVICE_COMPILER "Use gpu compiler, e.g. nvcc, for all files." OFF)
-set(USE_DEVICE_COMPILER OFF) 
+set(USE_DEVICE_COMPILER OFF)
 
 if( ENABLE_CUDA OR ENABLE_HIP OR ENABLE_OPENMP)
   set(ENABLE_DEVICE ON)
@@ -356,7 +366,6 @@ set(TblisSupport ${ENABLE_TBLIS} CACHE INTERNAL "")
 set(Build_Tests ${COMPILE_NDA_TESTS} CACHE INTERNAL "")
 if(COQUI_PYTHON_SUPPORT)
   # nda_py library is needed in CoQui python version
-  # CNY: is this necessary?
   set(PythonSupport ON CACHE INTERNAL "")
 else()
   set(PythonSupport ${NDA_PYTHON_SUPPORT} CACHE INTERNAL "")
@@ -366,13 +375,7 @@ FetchContent_Declare(
         GIT_REPOSITORY "https://github.com/triqs/nda.git"
         GIT_TAG        tensor
 )
-#FetchContent_MakeAvailable(nda)
-FetchContent_Populate(nda)
-if(COMPILE_NDA_TESTS)
-  add_subdirectory(${nda_SOURCE_DIR} ${nda_BINARY_DIR})
-else()
-  add_subdirectory(${nda_SOURCE_DIR} ${nda_BINARY_DIR} EXCLUDE_FROM_ALL)
-endif()
+FetchContent_MakeAvailable(nda)
 
 set_property(GLOBAL PROPERTY nda_FOUND TRUE)
 
