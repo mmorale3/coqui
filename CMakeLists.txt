@@ -104,6 +104,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 option(ENABLE_ROCM " Build device code with ROCM backend" OFF)
 option(ENABLE_OPENMP " Build device code with OPENMP backend" OFF)
 option(ENABLE_FFTW "Build using FFTW3 library." ON)
+option(ENABLE_FINUFFT "Enable FINUFFT non-uniform FFT backend" ON)
 option(ENABLE_HEFFTE "Build using heFFTe library." OFF)
 option(ENABLE_SLATE "Build using Slate library." ON)
 option(ENABLE_CUTENSOR "Build using cutensor library. Must set CUTENSOR_ROOT" OFF)
@@ -257,8 +258,12 @@ cmake_print_properties(TARGETS MPI::MPI_CXX PROPERTIES INTERFACE_LINK_LIBRARIES 
 ######################################################################
 # FFTW: not using MKL's FFTW yet, figure out how if requested 
 ######################################################################
-if(ENABLE_FFTW)
-  find_package(FFTW REQUIRED DOUBLE_OPENMP_LIB)
+if(ENABLE_FFTW) 
+  if(ENABLE_OPENMP)
+    find_package(FFTW REQUIRED DOUBLE_OPENMP_LIB)
+  else()
+    find_package(FFTW REQUIRED DOUBLE_LIB)
+  endif()
   add_compile_definitions(ENABLE_FFTW)
 endif()
 
@@ -520,6 +525,14 @@ if(ENABLE_WANNIER90)
     target_include_directories(Wannier90_lib PRIVATE "${GFORTRAN_INCLUDE_DIR}")
     add_compile_definitions(ENABLE_WANNIER90)
 endif(ENABLE_WANNIER90)
+
+######################################################################
+# FINUFFT: Flatiron Institute NUFFT library 
+######################################################################
+if(ENABLE_FINUFFT)
+  include(${CMAKE_SOURCE_DIR}/cmake/finufft.cmake)
+  add_compile_definitions(ENABLE_FINUFFT)
+endif()
 
 ######################################################################
 # Boost

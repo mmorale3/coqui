@@ -11,6 +11,13 @@ if(ENABLE_FFTW)
      )
 endif()
 
+if(ENABLE_FINUFFT)
+  set(fft_src 
+       ${fft_src}
+       finufft.cpp 
+     )
+endif()
+
 if(ENABLE_CUDA)
   set(fft_src 
        ${fft_src}
@@ -26,6 +33,9 @@ if(ENABLE_FFTW)
 endif()
 if(ENABLE_CUDA)
   target_link_libraries(fft_lib PUBLIC CUDA::cufft) 
+endif()
+if(ENABLE_FINUFFT)
+  target_link_libraries(fft_lib PUBLIC FINUFFT::finufft)
 endif()
 install(TARGETS fft_lib
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
