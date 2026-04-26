@@ -1,20 +1,11 @@
 #//////////////////////////////////////////////////////////////////////////////////////
 #//////////////////////////////////////////////////////////////////////////////////////
 
-add_subdirectory(ERI)
-add_subdirectory(tools)
-add_subdirectory(mb_state)
-add_subdirectory(HF)
-add_subdirectory(scr_coulomb)
-add_subdirectory(GW)
-add_subdirectory(GW_real_axis)
-add_subdirectory(GF2)
-add_subdirectory(embedding)
-add_subdirectory(SCF)
-add_subdirectory(pproc)
+# Real-axis ISDF/THC GW solver. Header-only for now (foundational utilities);
+# implementation .cpp files are added as the solver gains state-coupled methods.
 
 SET(SRCS
-  MBPT_drivers.cpp
+  real_axis_gw.cpp
   )
 
 if(USE_DEVICE_COMPILER)
@@ -29,7 +20,14 @@ elseif(ENABLE_HIP)
 endif()
 endif()
 
-add_library(methods_lib ${SRCS})
-target_link_libraries(methods_lib PUBLIC meanfield methods_tools_lib eri_lib hf_lib scr_coulomb_lib gw_lib gw_real_axis_lib gf2_lib scf_lib embed_lib pproc_lib)
-install(TARGETS methods_lib
+add_library(gw_real_axis_lib ${SRCS})
+target_link_libraries(gw_real_axis_lib PUBLIC meanfield eri_lib scr_coulomb_lib fft_lib)
+if(ENABLE_FINUFFT)
+  target_link_libraries(gw_real_axis_lib PUBLIC FINUFFT::finufft)
+endif()
+install(TARGETS gw_real_axis_lib
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+
+if (BUILD_UNIT_TESTS)
+  add_subdirectory(tests)
+endif()
