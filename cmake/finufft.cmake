@@ -63,15 +63,10 @@ set(FINUFFT_BUILD_PYTHON   OFF CACHE BOOL "" FORCE)
 # Set to ON if you prefer a shared library.
 set(BUILD_SHARED_LIBS      OFF CACHE BOOL "" FORCE)
 
-# 
+# FFTW is added before FINUFFT if requested 
 if(DEFINED ENABLE_FFTW)
-  if(DEFINED USE_OPENMP)
-    set(FINUFFT_FFTW_LIBRARIES fftw3 fftw3_omp CACHE STRING "" FORCE)
-    set(FINUFFT_USE_FFTW ON CACHE BOOL "" FORCE)
-  else()
-    set(FINUFFT_FFTW_LIBRARIES fftw3 CACHE STRING "" FORCE)
-    set(FINUFFT_USE_FFTW ON CACHE BOOL "" FORCE)
-  endif()
+  set(FINUFFT_FFTW_LIBRARIES ${FFTW_LIBRARIES} CACHE STRING "" FORCE)
+  set(FINUFFT_USE_FFTW ON CACHE BOOL "" FORCE)
 endif()
 
 # ---------------------------------------------------------------------------
