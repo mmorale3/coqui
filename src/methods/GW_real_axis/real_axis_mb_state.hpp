@@ -15,6 +15,7 @@
 
 #include "configuration.hpp"
 #include "nda/nda.hpp"
+#include "mpi3/communicator.hpp"
 #include "methods/GW_real_axis/real_freq_grid.hpp"
 
 namespace methods {
@@ -63,6 +64,11 @@ struct real_axis_mb_state_t {
 
   // Reference to the frequency/time grid (non-owning).
   real_freq_grid_t const* grid = nullptr;
+
+  // Non-owning MPI communicator. Distributed kernels accept a comm by
+  // reference; this slot is provided for callers that want to thread the
+  // comm through state alongside the grid.
+  boost::mpi3::communicator* comm = nullptr;
 
   // SCF metadata.
   std::string coqui_prefix = "coqui_real_axis";

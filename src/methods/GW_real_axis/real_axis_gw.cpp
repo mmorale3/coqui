@@ -17,6 +17,12 @@
 #include "methods/GW_real_axis/real_axis_dyson.hpp"
 #include "methods/GW_real_axis/real_axis_pi.hpp"
 #include "methods/GW_real_axis/real_axis_sigma.hpp"
+#include "methods/GW_real_axis/real_axis_thc_project.hpp"
+#include "methods/GW_real_axis/real_axis_gw_driver.hpp"
+#include "methods/GW_real_axis/real_axis_gw_thc.hpp"
+#include "methods/GW_real_axis/real_axis_sigma_x.hpp"
+#include "methods/GW_real_axis/real_axis_dyson_G.hpp"
+#include "methods/GW_real_axis/real_axis_scf.hpp"
 #include "methods/GW_real_axis/real_axis_gw_t.h"
 
 namespace methods {

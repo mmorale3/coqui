@@ -21,7 +21,7 @@ endif()
 endif()
 
 add_library(gw_real_axis_lib ${SRCS})
-target_link_libraries(gw_real_axis_lib PUBLIC meanfield eri_lib scr_coulomb_lib fft_lib)
+target_link_libraries(gw_real_axis_lib PUBLIC meanfield eri_lib scr_coulomb_lib fft_lib hamilt)
 if(ENABLE_FINUFFT)
   target_link_libraries(gw_real_axis_lib PUBLIC FINUFFT::finufft)
 endif()

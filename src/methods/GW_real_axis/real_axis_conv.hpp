@@ -179,37 +179,8 @@ public:
     nda::array<cval_t,2> Fhat(B, N_t_);
     nda::array<cval_t,2> Ghat(B, N_t_);
 
-    // For ntrans larger than B, we still need to provide a B-row plan.
-    // FINUFFT supports passing data with the "many" plan if the trailing
-    // batch dimension matches; for simplicity we rebuild a sized plan when
-    // B != _ntrans. (Most call sites should size _ntrans to B once.)
-    auto run_type1 = [&](nda::array<cval_t,2>& C, nda::array<cval_t,2>& F_out,
-                         grid_kind kind) {
-      if (B == _ntrans) {
-        if (kind == grid_kind::fermionic) _plan_w->forward(C, F_out);
-        else                              _plan_Omega->forward(C, F_out);
-      } else {
-        const std::array<int64_t,1> nm = { N_t_ };
-        const long N_pts = (kind == grid_kind::fermionic ? N_w() : N_Omega());
-        math::nda::nufft tmp(nm, N_pts, B, _eps, math::nufft::NUFFT_FORWARD);
-        if (kind == grid_kind::fermionic) tmp.setpts(_x_w);
-        else                              tmp.setpts(_x_Omega);
-        tmp.forward(C, F_out);
-      }
-    };
-
-    auto run_type2 = [&](nda::array<cval_t,2>& F_in, nda::array<cval_t,2>& C_out,
-                         grid_kind kind) {
-      const std::array<int64_t,1> nm = { N_t_ };
-      const long N_pts = (kind == grid_kind::fermionic ? N_w() : N_Omega());
-      math::nda::nufft tmp(nm, N_pts, B, _eps, math::nufft::NUFFT_FORWARD);
-      if (kind == grid_kind::fermionic) tmp.setpts(_x_w);
-      else                              tmp.setpts(_x_Omega);
-      tmp.backward(F_in, C_out);
-    };
-
-    run_type1(F, Fhat, src);
-    run_type1(G, Ghat, src);
+    run_forward(F, Fhat, src, B);
+    run_forward(G, Ghat, src, B);
 
     // H_hat(t_k) = conj(Fhat(t_k)) * Ghat(t_k), with the time-shift phase
     // factor that compensates the symmetric shift of the t-grid.
@@ -228,13 +199,69 @@ public:
         Hhat(b, k) = std::conj(Fhat(b, k)) * Ghat(b, k);
 
     nda::array<cval_t,2> Hraw(B, N_dst);
-    run_type2(Hhat, Hraw, dst);
+    run_backward(Hhat, Hraw, dst, B);
 
     // Final scaling: dt/(2*pi).  This converts the discrete sum
     //   (1/N_t) sum_k Hhat_k exp(-i Omega t_k)  ~  (1/(2pi)) int dt
     // when N_t * dt = T_window, so dt = 2pi/(N_t * (2pi/T)) and the
     // appropriate trapezoidal weight per t-sample is dt. The 1/(2pi) is
     // the inverse-FT normalization. We do NOT divide by N_t.
+    const double s = _grid->dt() / (2.0 * M_PI);
+    H = s * Hraw;
+  }
+
+  /**
+   * Convolution H(w) = int de F(e) G(w - e), with F, G, H all on the SAME
+   * frequency grid (`kind`). Identical NUFFT structure to `cross_correlate`
+   * but WITHOUT the conjugate on F_hat: Hhat(t) = F_hat(t) * G_hat(t).
+   *
+   * Quadrature weights on the source grid are applied internally to BOTH
+   * inputs (each is independently FT'd).
+   *
+   * @param F_in  (B, N_grid) input F (no weights pre-applied)
+   * @param G_in  (B, N_grid) input G (no weights pre-applied)
+   * @param H     (B, N_grid) output H, OVERWRITTEN
+   * @param kind  frequency grid (same source and destination)
+   */
+  void convolve(nda::array<cval_t,2> const& F_in,
+                nda::array<cval_t,2> const& G_in,
+                nda::array<cval_t,2> & H,
+                grid_kind kind)
+  {
+    const long B    = F_in.shape()[0];
+    const long N    = (kind == grid_kind::fermionic ? N_w() : N_Omega());
+    const long N_t_ = N_t();
+
+    utils::check(F_in.shape()[0] == B and F_in.shape()[1] == N,
+                 "convolve: F shape mismatch");
+    utils::check(G_in.shape()[0] == B and G_in.shape()[1] == N,
+                 "convolve: G shape mismatch");
+    utils::check(H.shape()[0] == B and H.shape()[1] == N,
+                 "convolve: H shape mismatch");
+    utils::check(B <= _ntrans,
+                 "convolve: B={} > ntrans={}", B, _ntrans);
+
+    auto const& wq = (kind == grid_kind::fermionic
+                      ? _grid->w_weights() : _grid->Omega_weights());
+    nda::array<cval_t,2> F(B, N), G(B, N);
+    for (long b = 0; b < B; ++b)
+      for (long j = 0; j < N; ++j) {
+        F(b, j) = F_in(b, j) * wq(j);
+        G(b, j) = G_in(b, j) * wq(j);
+      }
+
+    nda::array<cval_t,2> Fhat(B, N_t_), Ghat(B, N_t_);
+    run_forward(F, Fhat, kind, B);
+    run_forward(G, Ghat, kind, B);
+
+    // Convolution: NO conjugate on F_hat.
+    nda::array<cval_t,2> Hhat(B, N_t_);
+    for (long b = 0; b < B; ++b)
+      for (long k = 0; k < N_t_; ++k)
+        Hhat(b, k) = Fhat(b, k) * Ghat(b, k);
+
+    nda::array<cval_t,2> Hraw(B, N);
+    run_backward(Hhat, Hraw, kind, B);
     const double s = _grid->dt() / (2.0 * M_PI);
     H = s * Hraw;
   }
@@ -278,13 +305,7 @@ public:
         C(b, j) = cval_t(ImX_in(b, j) * wq(j), 0.0);
 
     nda::array<cval_t,2> Chat(B, N_t_);
-    {
-      const std::array<int64_t,1> nm = { N_t_ };
-      math::nda::nufft tmp(nm, N_grid, B, _eps, math::nufft::NUFFT_FORWARD);
-      if (kind == grid_kind::fermionic) tmp.setpts(_x_w);
-      else                              tmp.setpts(_x_Omega);
-      tmp.forward(C, Chat);
-    }
+    run_forward(C, Chat, kind, B);
 
     // Multiply by -i * sgn(t_k). The internal mode index k_int = 0..N_t-1
     // corresponds to physical t_k = (k_int - N_t/2) * dt. Therefore
@@ -312,19 +333,35 @@ public:
     }
 
     nda::array<cval_t,2> Rraw(B, N_grid);
-    {
-      const std::array<int64_t,1> nm = { N_t_ };
-      math::nda::nufft tmp(nm, N_grid, B, _eps, math::nufft::NUFFT_FORWARD);
-      if (kind == grid_kind::fermionic) tmp.setpts(_x_w);
-      else                              tmp.setpts(_x_Omega);
-      tmp.backward(Hhat, Rraw);
-    }
+    run_backward(Hhat, Rraw, kind, B);
 
     const double s = _grid->dt() / (2.0 * M_PI);
     for (long b = 0; b < B; ++b)
       for (long j = 0; j < N_grid; ++j)
         ReX_w(b, j) = s * Rraw(b, j).real();
   }
+
+  /**
+   * Type-1 NUFFT: nonuniform-frequency strengths C → uniform-time modes F.
+   * Public wrapper around the cached plan; falls back to a fresh per-call
+   * plan when B != _ntrans (set ntrans = B at construction to avoid).
+   *
+   * @param C   [INPUT, weights NOT applied internally]  (B, N_grid)
+   * @param F   [OUTPUT]  (B, N_t)
+   * @param kind  source grid (fermionic or bosonic)
+   */
+  void forward(nda::array<cval_t,2>& C, nda::array<cval_t,2>& F, grid_kind kind) {
+    run_forward(C, F, kind, C.shape()[0]);
+  }
+
+  /// Type-2 NUFFT: uniform-time modes F → nonuniform-frequency values C.
+  void backward(nda::array<cval_t,2>& F, nda::array<cval_t,2>& C, grid_kind kind) {
+    run_backward(F, C, kind, F.shape()[0]);
+  }
+
+  /// dt / (2*pi) — the trapezoidal-quadrature × inverse-FT normalization
+  /// applied to NUFFT2 outputs in cross_correlate / convolve / hilbert.
+  double nufft_scale() const { return _grid->dt() / (2.0 * M_PI); }
 
   /**
    * Helper: multiply each row of arr by the source-grid quadrature weights
@@ -352,6 +389,42 @@ public:
   }
 
 private:
+  // Type-1 (nonuniform -> uniform). Uses cached plans when B == _ntrans;
+  // builds a fresh plan otherwise. Both type-1 and type-2 plans share the
+  // same nuplan_t and setpts, so when we build a fresh "many" plan we get
+  // both directions for free; the helper is parameterised on the call
+  // pattern to keep cross_correlate / convolve / hilbert call sites flat.
+  void run_forward(nda::array<cval_t,2>& C, nda::array<cval_t,2>& F_out,
+                   grid_kind kind, long B) {
+    if (B == _ntrans) {
+      if (kind == grid_kind::fermionic) _plan_w->forward(C, F_out);
+      else                              _plan_Omega->forward(C, F_out);
+      return;
+    }
+    const std::array<int64_t,1> nm = { _grid->N_t() };
+    const long N_pts = (kind == grid_kind::fermionic ? N_w() : N_Omega());
+    math::nda::nufft tmp(nm, N_pts, B, _eps, math::nufft::NUFFT_FORWARD);
+    if (kind == grid_kind::fermionic) tmp.setpts(_x_w);
+    else                              tmp.setpts(_x_Omega);
+    tmp.forward(C, F_out);
+  }
+
+  // Type-2 (uniform -> nonuniform). Mirrors run_forward but calls backward.
+  void run_backward(nda::array<cval_t,2>& F_in, nda::array<cval_t,2>& C_out,
+                    grid_kind kind, long B) {
+    if (B == _ntrans) {
+      if (kind == grid_kind::fermionic) _plan_w->backward(F_in, C_out);
+      else                              _plan_Omega->backward(F_in, C_out);
+      return;
+    }
+    const std::array<int64_t,1> nm = { _grid->N_t() };
+    const long N_pts = (kind == grid_kind::fermionic ? N_w() : N_Omega());
+    math::nda::nufft tmp(nm, N_pts, B, _eps, math::nufft::NUFFT_FORWARD);
+    if (kind == grid_kind::fermionic) tmp.setpts(_x_w);
+    else                              tmp.setpts(_x_Omega);
+    tmp.backward(F_in, C_out);
+  }
+
   real_freq_grid_t const* _grid;
   long                    _ntrans;
   double                  _eps;

@@ -11,6 +11,13 @@ if(ENABLE_FINUFFT)
       test_real_axis_pi.cpp
       test_real_axis_sigma.cpp
       test_real_axis_gw.cpp
+      test_real_axis_driver.cpp
+      test_real_axis_sigma_x.cpp
+      test_real_axis_dyson_G.cpp
+      test_real_axis_scf.cpp
+      test_real_axis_thc.cpp
+      test_real_axis_xvalidate.cpp
+      test_real_axis_div_utils.cpp
      )
 
   add_executable(test_${TEST_ID} ${TEST_SRCS})
@@ -19,8 +26,12 @@ if(ENABLE_FINUFFT)
     PRIVATE
       catch_main
       utils
+      numerics
       fft_lib
       gw_real_axis_lib
+      meanfield
+      eri_lib
+      scf_lib
       FINUFFT::finufft
   )
 

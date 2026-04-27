@@ -54,10 +54,11 @@ namespace real_axis {
  *                  ACCUMULATED into (caller zeros first).
  * @param k_weight  weight of this k point in the BZ sum (1/Nk, IBZ stars, etc.)
  */
+template <typename AK, typename AKQ, typename POut>
 inline void accumulate_ImPi_one_kq(real_axis_conv_t & conv,
-                                   nda::array<ComplexType, 3> const& A_PQ_k,
-                                   nda::array<ComplexType, 3> const& A_PQ_kq,
-                                   nda::array<ComplexType, 3>      & ImPi_PQ_O,
+                                   AK   const& A_PQ_k,
+                                   AKQ  const& A_PQ_kq,
+                                   POut      & ImPi_PQ_O,
                                    double k_weight)
 {
   const long Naux = A_PQ_k.shape()[0];
@@ -74,14 +75,17 @@ inline void accumulate_ImPi_one_kq(real_axis_conv_t & conv,
                "accumulate_ImPi_one_kq: grid mismatch");
 
   auto const& grid = conv.grid();
-  auto const& w   = grid.w();
+  auto const& w    = grid.w();
+  auto const& wq   = grid.w_weights();
 
   // Build weighted spectra at k and k+q for the bubble.
   // Layout: (B, N_w) with B = Naux*Naux, and for index b = P*Naux + Q:
   //   - F^<_{b}(w) = f(w) A_{PQ}(k, w)        (left leg, at k)
   //   - G^>_{b}(w) = (1-f(w)) A_{QP}(k+q, w)  (right leg, at k+q, transposed indices)
-  // and similarly for the swapped sign of the kernel.
-  const long B = Naux * Naux;
+  // The weighted forms also absorb the trapezoidal quadrature weights, so
+  // the lower-level NUFFT primitives don't need to apply them again.
+  const long B   = Naux * Naux;
+  const long N_t = conv.N_t();
 
   nda::array<ComplexType, 2> Aless_k(B, N_w);
   nda::array<ComplexType, 2> Agtr_k(B, N_w);
@@ -92,33 +96,44 @@ inline void accumulate_ImPi_one_kq(real_axis_conv_t & conv,
     for (long Q = 0; Q < Naux; ++Q) {
       const long b = P * Naux + Q;
       for (long j = 0; j < N_w; ++j) {
-        const double f_w   = grid.fermi(w(j));
-        const double fb_w  = 1.0 - f_w;
-        Aless_k (b, j) = f_w  * A_PQ_k (P, Q, j);
-        Agtr_k  (b, j) = fb_w * A_PQ_k (P, Q, j);
+        const double f_w  = grid.fermi(w(j));
+        const double fb_w = 1.0 - f_w;
+        const double q_j  = wq(j);
+        Aless_k (b, j) = f_w  * q_j * A_PQ_k (P, Q, j);
+        Agtr_k  (b, j) = fb_w * q_j * A_PQ_k (P, Q, j);
         // For the "QP" leg at k+q, swap (P,Q) index access.
-        Aless_kq(b, j) = f_w  * A_PQ_kq(Q, P, j);
-        Agtr_kq (b, j) = fb_w * A_PQ_kq(Q, P, j);
+        Aless_kq(b, j) = f_w  * q_j * A_PQ_kq(Q, P, j);
+        Agtr_kq (b, j) = fb_w * q_j * A_PQ_kq(Q, P, j);
       }
     }
   }
 
-  nda::array<ComplexType, 2> term1(B, N_O);
-  nda::array<ComplexType, 2> term2(B, N_O);
-  // Im Pi  ~  (A^< * A^>)(k,q; Omega) - (A^> * A^<)(k,q; Omega)
-  conv.cross_correlate(Aless_k,  Agtr_kq, term1,
-                       real_axis_conv_t::grid_kind::fermionic,
-                       real_axis_conv_t::grid_kind::bosonic);
-  conv.cross_correlate(Agtr_k,   Aless_kq, term2,
-                       real_axis_conv_t::grid_kind::fermionic,
-                       real_axis_conv_t::grid_kind::bosonic);
+  // Im Pi ~ cross-correlate(Aless_k, Agtr_kq) - cross-correlate(Agtr_k, Aless_kq).
+  // Compute each pair's Hhat in time space, sum (with sign) before a single
+  // type-2 NUFFT. Saves one type-2 per call vs two cross_correlate calls.
+  using gk = real_axis_conv_t::grid_kind;
+  nda::array<ComplexType, 2> Fless_hat(B, N_t), Fgtr_hat(B, N_t);
+  nda::array<ComplexType, 2> Gless_hat(B, N_t), Ggtr_hat(B, N_t);
+  conv.forward(Aless_k,  Fless_hat, gk::fermionic);
+  conv.forward(Agtr_k,   Fgtr_hat,  gk::fermionic);
+  conv.forward(Aless_kq, Gless_hat, gk::fermionic);
+  conv.forward(Agtr_kq,  Ggtr_hat,  gk::fermionic);
 
-  const double scale = -M_PI * k_weight;
+  nda::array<ComplexType, 2> Hhat(B, N_t);
+  for (long b = 0; b < B; ++b)
+    for (long k = 0; k < N_t; ++k)
+      Hhat(b, k) = std::conj(Fless_hat(b, k)) * Ggtr_hat(b, k)
+                 - std::conj(Fgtr_hat(b, k))  * Gless_hat(b, k);
+
+  nda::array<ComplexType, 2> Hraw(B, N_O);
+  conv.backward(Hhat, Hraw, gk::bosonic);
+  const double s_nufft = conv.nufft_scale();
+  const double s_pi    = -M_PI * k_weight * s_nufft;
   for (long P = 0; P < Naux; ++P)
     for (long Q = 0; Q < Naux; ++Q) {
       const long b = P * Naux + Q;
       for (long iO = 0; iO < N_O; ++iO)
-        ImPi_PQ_O(P, Q, iO) += scale * (term1(b, iO) - term2(b, iO));
+        ImPi_PQ_O(P, Q, iO) += s_pi * Hraw(b, iO);
     }
 }
 

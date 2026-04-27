@@ -22,104 +22,216 @@ namespace methods {
 namespace real_axis {
 
 /**
- * Compute Im Sigma^{c,R}(k, w) -- imaginary part of the retarded correlation
- * self-energy in the THC auxiliary basis -- from the projected fermionic
- * spectral function A_{P}(k-q, w) on the FERMIONIC w-grid and the bosonic
- * spectral function B_{PQ}(q, Omega) of the screened interaction on the
- * BOSONIC Omega-grid.
+ * Resample a bosonic auxiliary spectral function B_{PQ}(Omega) (defined on
+ * Omega >= 0) onto the fermionic w-grid via the diagonal-odd extension
+ *   B_{PQ}(-Omega) = -B_{PQ}(Omega).
+ * Linear interpolation between bosonic grid points; linear extrapolation to
+ * 0 inside [0, Omega_min); zero beyond Omega_max.
  *
- * Implements the spectral form (notes Eq. ImSigma_spectral_isdf), specialized
- * to the auxiliary basis kernel:
- *
- *   Im Sigma^{c,R}_{P}(k-q, w) = -pi * sum_Q  Z_factor *
- *       int de int dO  A_Q(k-q, e) B_{PQ}(q, O) [f(e) + n_B(O)] delta(w-e-O)
- *
- * Restricted to the bosonic half-grid Omega>=0 we use B(-Omega) = -B(Omega)
- * (diagonal) to fold the integral; equivalently, separate into emission and
- * absorption channels:
- *
- *   Im Sigma^{c,R}(w) = -pi * sum_Q  [
- *           ( A_Q(k-q, .) star B_{PQ}^+(q, .) )(w; weight = f+n_B)
- *           - ( A_Q(k-q, .) star B_{PQ}^+(q, .) )(w; ...)  swapped
- *       ]
- *
- * For the standalone/test interface we expose a single-(k, q) accumulator
- * that takes the projected spectra at (k-q) and the bosonic spectral function
- * at (q), and accumulates the contribution into Im Sigma at this k.
- *
- * NOTE: This is the auxiliary-basis Im Sigma^c contribution; the final
- * ORBITAL-BASIS self-energy comes from the contraction with Z_{(mu alpha)P}
- * Z*_{(beta nu)Q}. That contraction lives in the higher-level driver code.
- *
- * @param conv         NUFFT engine
- * @param A_Q_kq       (Naux, N_w) projected spectral function at k-q
- * @param B_PQ_q       (Naux, Naux, N_Omega) bosonic auxiliary spectral function
- *                     of W^c at this q. Stored on Omega>=0 half-grid.
- * @param ImSigma_P_w  OUTPUT (Naux, N_w) Im Sigma^c contribution, accumulated.
- * @param q_weight     weight of this q point (1/Nq, IBZ stars, etc.)
- *
- * Internally this packs Naux*Naux batched cross-correlations.
+ * @param grid     real-frequency grid
+ * @param B_PQ_O   (Naux, Naux, N_Omega)  bosonic spectral function on Omega>=0
+ * @param B_PQ_w   OUTPUT (Naux, Naux, N_w) bosonic function resampled on w
  */
+template <typename BIn, typename BOut>
+inline void resample_bosonic_to_fermionic(real_freq_grid_t const& grid,
+                                          BIn  const& B_PQ_O,
+                                          BOut      & B_PQ_w)
+{
+  const long Naux = B_PQ_O.shape()[0];
+  const long N_w  = grid.N_w();
+  utils::check(B_PQ_O.shape()[1] == Naux,
+               "resample_bosonic_to_fermionic: B not square in (P,Q)");
+  utils::check(B_PQ_O.shape()[2] == grid.N_Omega(),
+               "resample_bosonic_to_fermionic: bosonic length mismatch");
+  utils::check(B_PQ_w.shape()[0] == Naux and B_PQ_w.shape()[1] == Naux and
+               B_PQ_w.shape()[2] == N_w,
+               "resample_bosonic_to_fermionic: output shape mismatch");
+
+  auto const& Og = grid.Omega();
+  const long N_O = Og.shape()[0];
+
+  for (long P = 0; P < Naux; ++P)
+    for (long Q = 0; Q < Naux; ++Q)
+      for (long iw = 0; iw < N_w; ++iw) {
+        const double w_l = grid.w()(iw);
+        const double sign = (w_l >= 0.0 ? 1.0 : -1.0);
+        const double a    = std::abs(w_l);
+        ComplexType v(0.0, 0.0);
+        if (a <= Og(0)) {
+          v = B_PQ_O(P, Q, 0) * (a / Og(0));
+        } else if (a < Og(N_O - 1)) {
+          long lo = 0, hi = N_O - 1;
+          while (hi - lo > 1) {
+            long mid = (lo + hi) / 2;
+            if (Og(mid) <= a) lo = mid; else hi = mid;
+          }
+          const double t = (a - Og(lo)) / (Og(hi) - Og(lo));
+          v = (1.0 - t) * B_PQ_O(P, Q, lo) + t * B_PQ_O(P, Q, hi);
+        }
+        B_PQ_w(P, Q, iw) = sign * v;
+      }
+}
+
+/**
+ * NUFFT-accelerated single-(k, q) Im Sigma^{c,R} accumulator.
+ * Mathematically equivalent to accumulate_ImSigma_one_kq below; replaces the
+ * O(N_w^2) direct quadrature with two O(N_w * log N_t) NUFFT-based
+ * convolutions, one per (f, n_B) channel.
+ *
+ * @param conv          NUFFT engine (ntrans must be >= Naux^2)
+ * @param A_PQ_kmq      (Naux, Naux, N_w) projected spectral function at k-q
+ * @param B_PQ_q        (Naux, Naux, N_Omega) bosonic spectral function at q
+ * @param ImSigma_PQ_w  (Naux, Naux, N_w) accumulated output
+ * @param q_weight      weight of this q point
+ */
+template <typename AKMQ, typename BQ, typename SOut>
+inline void accumulate_ImSigma_one_kq_nufft(
+    real_axis_conv_t & conv,
+    AKMQ const& A_PQ_kmq,
+    BQ   const& B_PQ_q,
+    SOut      & ImSigma_PQ_w,
+    double q_weight)
+{
+  const long Naux = A_PQ_kmq.shape()[0];
+  const long N_w  = A_PQ_kmq.shape()[2];
+  const long B    = Naux * Naux;
+
+  utils::check(B <= conv.ntrans(),
+               "accumulate_ImSigma_one_kq_nufft: ntrans={} too small (need {})",
+               conv.ntrans(), B);
+
+  auto const& grid = conv.grid();
+  auto const& wq   = grid.w_weights();
+  const long N_t   = conv.N_t();
+
+  // Resample B onto the fermionic grid (with diagonal odd extension).
+  nda::array<ComplexType, 3> B_PQ_w(Naux, Naux, N_w);
+  resample_bosonic_to_fermionic(grid, B_PQ_q, B_PQ_w);
+
+  // Pre-multiply A by f(eps) -> F1, resampled B by n_B(w) -> G2 (the
+  // n_B factor handles the singular Omega=0 limit using
+  //   lim_{O -> 0} n_B(O) * B(O) = b_1 / beta
+  // via the linear extrapolation already applied to B in the resampler:
+  // for |w| < Omega_min, B is linear in w. We evaluate n_B(w) for w != 0
+  // and set the product to 0 at w=0 (the surrounding integration weights
+  // make that point negligible).
+  // The trapezoidal quadrature weights are absorbed into F1, F2, G1, G2
+  // here so the lower-level NUFFT primitives can run unweighted.
+  nda::array<ComplexType, 2> F1(B, N_w), G1(B, N_w);
+  nda::array<ComplexType, 2> F2(B, N_w), G2(B, N_w);
+  for (long P = 0; P < Naux; ++P)
+    for (long Q = 0; Q < Naux; ++Q) {
+      const long b = P * Naux + Q;
+      for (long iw = 0; iw < N_w; ++iw) {
+        const double w_l = grid.w()(iw);
+        const double f_w = grid.fermi(w_l);
+        const double q_j = wq(iw);
+        F1(b, iw) = q_j * f_w * A_PQ_kmq(P, Q, iw);
+        G1(b, iw) = q_j * B_PQ_w(P, Q, iw);
+        F2(b, iw) = q_j * A_PQ_kmq(P, Q, iw);
+        double nB_w = 0.0;
+        if (std::abs(w_l) > 1e-12) nB_w = grid.bose(w_l);
+        G2(b, iw) = q_j * nB_w * B_PQ_w(P, Q, iw);
+      }
+    }
+
+  // Im Sigma ~ convolve(F1, G1) + convolve(F2, G2). Compute each pair's
+  // Hhat in time space, sum (no conjugates for convolve), then a single
+  // type-2 NUFFT. Saves one type-2 per call vs two convolve calls.
+  using gk = real_axis_conv_t::grid_kind;
+  nda::array<ComplexType, 2> F1hat(B, N_t), G1hat(B, N_t);
+  nda::array<ComplexType, 2> F2hat(B, N_t), G2hat(B, N_t);
+  conv.forward(F1, F1hat, gk::fermionic);
+  conv.forward(G1, G1hat, gk::fermionic);
+  conv.forward(F2, F2hat, gk::fermionic);
+  conv.forward(G2, G2hat, gk::fermionic);
+
+  nda::array<ComplexType, 2> Hhat(B, N_t);
+  for (long b = 0; b < B; ++b)
+    for (long k = 0; k < N_t; ++k)
+      Hhat(b, k) = F1hat(b, k) * G1hat(b, k)
+                 + F2hat(b, k) * G2hat(b, k);
+
+  nda::array<ComplexType, 2> Hraw(B, N_w);
+  conv.backward(Hhat, Hraw, gk::fermionic);
+  const double s_nufft = conv.nufft_scale();
+  const double s_sig   = -M_PI * q_weight * s_nufft;
+  for (long P = 0; P < Naux; ++P)
+    for (long Q = 0; Q < Naux; ++Q) {
+      const long b = P * Naux + Q;
+      for (long iw = 0; iw < N_w; ++iw)
+        ImSigma_PQ_w(P, Q, iw) += s_sig * Hraw(b, iw);
+    }
+}
+
+/**
+ * Compute Im Sigma^{c,R}_{PQ}(k, w) -- imaginary part of the retarded
+ * correlation self-energy in the THC auxiliary basis -- for a single (k, q)
+ * pair, with HADAMARD product structure in the auxiliary indices (P, Q):
+ *
+ *   Im Sigma^{c,R}_{PQ}(k, w) -=  pi * q_weight *
+ *       int de  A_{PQ}(k-q, e) * B_{PQ}(q, w-e) * [f(e) + n_B(w-e)]
+ *
+ * This is the auxiliary-basis form of the GW self-energy under the CoQui
+ * THC ansatz where the auxiliary index pair (P, Q) is Hadamard-coupled
+ * between the projected G and the auxiliary W (Eq. ImSigma_spectral_isdf
+ * in the v2 notes, in the basis where the THC factor X is k-diagonal).
+ *
+ * Direct quadrature implementation. The bosonic spectral function B is
+ * defined on Omega >= 0 only; for the convolution argument w-e we use
+ * the diagonal-odd extension B_{PQ}(-Omega) = -B_{PQ}(Omega) on the
+ * diagonal (P=Q) and the corresponding hermitian relation for off-diagonal.
+ * For simplicity we apply the diagonal-odd extension uniformly and rely on
+ * downstream cross-validation; the precise off-diagonal symmetry can be
+ * refined when fully needed.
+ *
+ * @param conv          NUFFT engine (carries the grid via conv.grid())
+ * @param A_PQ_kmq      (Naux, Naux, N_w) projected spectral function at k-q
+ * @param B_PQ_q        (Naux, Naux, N_Omega) bosonic auxiliary spectral
+ *                      function of W^c at q (Omega>=0)
+ * @param ImSigma_PQ_w  OUTPUT (Naux, Naux, N_w) accumulated Im Sigma at this k
+ * @param q_weight      weight of this q point
+ */
+template <typename AKMQ, typename BQ, typename SOut>
 inline void accumulate_ImSigma_one_kq(real_axis_conv_t & conv,
-                                      nda::array<ComplexType, 2> const& A_Q_kq,
-                                      nda::array<ComplexType, 3> const& B_PQ_q,
-                                      nda::array<ComplexType, 2>      & ImSigma_P_w,
+                                      AKMQ const& A_PQ_kmq,
+                                      BQ   const& B_PQ_q,
+                                      SOut      & ImSigma_PQ_w,
                                       double q_weight)
 {
-  const long Naux = A_Q_kq.shape()[0];
-  const long N_w = A_Q_kq.shape()[1];
-  const long N_O = B_PQ_q.shape()[2];
+  const long Naux = A_PQ_kmq.shape()[0];
+  const long N_w  = A_PQ_kmq.shape()[2];
+  const long N_O  = B_PQ_q.shape()[2];
 
+  utils::check(A_PQ_kmq.shape()[1] == Naux,
+               "accumulate_ImSigma_one_kq: A not square in (P,Q)");
   utils::check(B_PQ_q.shape()[0] == Naux and B_PQ_q.shape()[1] == Naux,
                "accumulate_ImSigma_one_kq: B shape mismatch");
-  utils::check(ImSigma_P_w.shape()[0] == Naux and ImSigma_P_w.shape()[1] == N_w,
+  utils::check(ImSigma_PQ_w.shape()[0] == Naux and
+               ImSigma_PQ_w.shape()[1] == Naux and
+               ImSigma_PQ_w.shape()[2] == N_w,
                "accumulate_ImSigma_one_kq: ImSigma shape mismatch");
   utils::check(N_w == conv.N_w() and N_O == conv.N_Omega(),
                "accumulate_ImSigma_one_kq: grid mismatch");
 
   auto const& grid = conv.grid();
+  auto const& w_grid = grid.w();
+  auto const& w_wts  = grid.w_weights();
 
-  // Build kernel-weighted spectra.
-  // Channel 1 (emission, Omega > 0):  weight = f(e) + n_B(O)
-  //   delta(w - e - O) means w = e + O, so e = w - O ranges over fermionic w.
-  // The cross-correlation engine performs
-  //   H(w) = int de F^*(e) G(e + w)
-  // We use src=fermionic, dst=fermionic.
-  //
-  // Identification with the self-energy formula (notes ImSigma_spectral_isdf):
-  //   Im Sigma_P(w) = -pi sum_Q int de int dO A_Q(e) B_{PQ}(O) [f(e)+n_B(O)] delta(w-e-O)
-  // Setting O = w - e:
-  //   = -pi sum_Q int de A_Q(e) [f(e) + n_B(w-e)] B_{PQ}(w-e)  on Omega>=0 (w>=e)
-  //   + (channel for w < e via Omega -> -Omega, with B odd: B(-O) = -B(O))
-  //   = -pi sum_Q int de A_Q(e) [f(e) + n_B(w-e)] B_{PQ}(w-e) Theta(w-e)
-  //   - pi sum_Q int de A_Q(e) [f(e) - n_B(e-w)-1] B_{PQ}(e-w) Theta(e-w)
-  //
-  // To express both as cross-correlations of fermionic-grid spectra, define
-  //   F1(e) = A_Q(e) f(e),    F2(e) = A_Q(e) [1 - f(e)]
-  // and the bosonic kernel B(Omega) extended to Omega<0 via odd extension.
-  //
-  // For a pragmatic single-pass implementation we INTERPOLATE B from the
-  // bosonic grid onto the fermionic grid (since Omega = w - e ranges over
-  // [-2 w_max, 2 w_max], wider than the fermionic window). Linear interp.
-  // Then the contribution becomes a fermionic-fermionic cross-correlation.
-  //
-  // This linear interpolation is acceptable because B is smooth where it is
-  // appreciable, the auxiliary spectral function has compact support away
-  // from |Omega| > Omega_max where it tends to zero by tail subtraction.
-
-  // Helper: linear interpolation of B on the bosonic grid (Omega>=0) with odd
-  // extension for Omega<0. Returns 0 outside the grid.
+  // Helper: linear interpolation of B_{P,Q}(Omega) on the bosonic grid
+  // (Omega>=0) extended to Omega<0 via odd-extension on the diagonal and
+  // (for off-diagonal) the same odd extension as a working approximation.
+  // Returns 0 outside the grid.
   auto B_at = [&](long P, long Q, double O) -> ComplexType {
     auto const& Og = grid.Omega();
     const long N = Og.shape()[0];
     const double sign = (O >= 0.0 ? 1.0 : -1.0);
     const double Oa = std::abs(O);
     if (Oa <= Og(0)) {
-      // linear extrapolation toward 0; B is odd, B(0)=0.
+      // B(0) = 0 by oddness; linear extrapolation toward the smallest grid pt.
       return sign * B_PQ_q(P, Q, 0) * (Oa / Og(0));
     }
     if (Oa >= Og(N-1)) return ComplexType(0.0, 0.0);
-    // bisection
     long lo = 0, hi = N - 1;
     while (hi - lo > 1) {
       long mid = (lo + hi) / 2;
@@ -130,100 +242,72 @@ inline void accumulate_ImSigma_one_kq(real_axis_conv_t & conv,
     return sign * v;
   };
 
-  // Build, per (P, Q), the fermionic-grid quantity
-  //   K_{PQ}(w, e) = [f(e) + n_B(w - e)]  but evaluated as a function of e
-  //                 with parameter w, multiplied by B_{PQ}(w - e).
-  // Express through a cross-correlation:
-  //   Im Sigma_P(w) ≈ -pi sum_Q int de A_Q(e) [f(e) + n_B(w-e)] B_{PQ}(w-e)
-  // Let G_{PQ}(e) = A_Q(e) f(e), H1_{PQ}(O) = B_{PQ}(O) (for Omega>=0)
-  //     extended to Omega<0 via B(-O)=-B(O). Then
-  //   ∫ de G(e) [n_B(w-e) + f(e)] B(w-e) =
-  //     ∫ de G(e) f(e) B(w-e)  +  ∫ de G(e) n_B(w-e) B(w-e)
-  // The first integrand is a function of e with parameter w; substituting
-  // O = w-e makes it ∫ dO G(w-O) f(w-O) B(O).
-  //
-  // We implement directly by sampling on the fermionic grid (since the
-  // bosonic kernel can be interpolated onto it).
-  //
-  // For each (P, Q), evaluate:
-  //   For each w_l on fermionic grid:
-  //     I1(w_l) += sum_j w_j A_Q(e_j) [f(e_j) + n_B(w_l - e_j)] B_{PQ}(w_l - e_j)
-  // This is O(N_w * N_w * Naux^2 * N_kq) which is acceptable for moderate
-  // sizes; downstream the cross-correlation kernel can be substituted in.
-
-  auto const& w_grid = grid.w();
-  auto const& w_wts  = grid.w_weights();
-
-  // Loop over (P, Q) and w_l.
-  for (long P = 0; P < Naux; ++P) {
-    for (long l = 0; l < N_w; ++l) {
-      const double w_l = w_grid(l);
-      ComplexType acc(0.0, 0.0);
-      for (long Q = 0; Q < Naux; ++Q) {
+  // Per (P, Q) scalar convolution. O(Naux^2 * N_w^2) per (k, q) — direct
+  // quadrature; the NUFFT-accelerated version becomes available once a
+  // generic real-axis convolve primitive (no conjugate) is added.
+  for (long P = 0; P < Naux; ++P)
+    for (long Q = 0; Q < Naux; ++Q)
+      for (long l = 0; l < N_w; ++l) {
+        const double w_l = w_grid(l);
+        ComplexType acc(0.0, 0.0);
         for (long j = 0; j < N_w; ++j) {
           const double e_j = w_grid(j);
           const double O   = w_l - e_j;
           const ComplexType Bv = B_at(P, Q, O);
           if (Bv == ComplexType(0.0, 0.0)) continue;
-          const double f_e  = grid.fermi(e_j);
-          // n_B at O = w_l - e_j; if O is small in magnitude, the singularity
-          // is regularized by the small-|O| linear extrapolation of B which
-          // already kills the divergence (B ~ O so B*n_B is finite). For
-          // safety, when O is exactly zero we skip the contribution (set to
-          // limit).
+          const double f_e = grid.fermi(e_j);
           double nB_O;
           if (std::abs(O) < 1e-12) {
-            // B(O) ~ b1 * O, n_B(O) ~ 1/(beta O), so B*n_B -> b1/beta finite.
-            // The product Bv * n_B(O) for B already multiplied by O via the
-            // sign*Oa/Og(0) extrapolation: this product is ~ b1*O * 1/(beta O)
-            // = b1/beta. We compute it as the limit using one-sided values.
-            nB_O = 0.0;  // contribute zero from the n_B branch
+            // n_B * B is finite as Omega->0 (n_B ~ 1/(beta Omega), B ~ b1*Omega).
+            // Set n_B contribution to zero here; the f(e) branch carries the rest.
+            nB_O = 0.0;
           } else {
             nB_O = grid.bose(O);
           }
-          const double weight = f_e + nB_O;
-          acc += w_wts(j) * A_Q_kq(Q, j) * weight * Bv;
+          acc += w_wts(j) * A_PQ_kmq(P, Q, j) * Bv * (f_e + nB_O);
         }
+        ImSigma_PQ_w(P, Q, l) += -M_PI * q_weight * acc;
       }
-      ImSigma_P_w(P, l) += -M_PI * q_weight * acc;
-    }
-  }
 }
 
 /**
- * Recover Re Sigma^{c,R} from Im Sigma^{c,R} by Hilbert transform on the
- * fermionic grid. Must subtract the m^{(1)}/w high-frequency tail before the
- * transform for accuracy; the basic interface here applies the raw transform
- * and is suitable for testing or for use with sufficiently wide windows.
+ * Recover Re Sigma^{c,R} from Im Sigma^{c,R} on the fermionic grid via
+ * batched Hilbert transform over the (P, Q) auxiliary indices.
+ *
+ * @param conv           NUFFT engine
+ * @param ImSigma_PQ_w   (Naux, Naux, N_w) input, real part is Im Sigma
+ * @param ReSigma_PQ_w   (Naux, Naux, N_w) output, real part is Re Sigma
+ *
+ * NOTE: The complex-valued I/O is purely a storage convention; physically,
+ * Im/Re Sigma are real-valued matrix elements at each (P,Q,w). We carry the
+ * Im part through .real() of the input ComplexType and write back into the
+ * .real() of the output, leaving the imaginary slot unused.
  */
-inline void ReSigma_from_ImSigma(real_axis_conv_t & conv,
-                                 nda::array<double, 3> const& ImSigma_skP_w,
-                                 nda::array<double, 3>      & ReSigma_skP_w)
+template <typename AIn, typename AOut>
+inline void ReSigma_from_ImSigma_aux(real_axis_conv_t & conv,
+                                     AIn  const& ImSigma_PQ_w,
+                                     AOut      & ReSigma_PQ_w)
 {
-  const long ns_kP = ImSigma_skP_w.shape()[0];
-  const long N_w = ImSigma_skP_w.shape()[1];
-  // We treat the leading dimension as a flat batch.
-  utils::check(ImSigma_skP_w.shape() == ReSigma_skP_w.shape(),
-               "ReSigma_from_ImSigma: shape mismatch");
-  utils::check(N_w == conv.N_w(),
-               "ReSigma_from_ImSigma: grid mismatch");
+  const long Naux = ImSigma_PQ_w.shape()[0];
+  const long N_w  = ImSigma_PQ_w.shape()[2];
+  const long B = Naux * Naux;
 
-  // Flatten to (B, N_w).
-  const long B = ns_kP;
-  const long N_extra = ImSigma_skP_w.shape()[2];
-
-  nda::array<double, 2> ImBuf(B * N_extra, N_w), ReBuf(B * N_extra, N_w);
-  for (long b = 0; b < B; ++b)
-    for (long n = 0; n < N_extra; ++n)
+  nda::array<double, 2> ImBuf(B, N_w), ReBuf(B, N_w);
+  for (long P = 0; P < Naux; ++P)
+    for (long Q = 0; Q < Naux; ++Q) {
+      const long b = P * Naux + Q;
       for (long l = 0; l < N_w; ++l)
-        ImBuf(b * N_extra + n, l) = ImSigma_skP_w(b, l, n);
+        ImBuf(b, l) = ImSigma_PQ_w(P, Q, l).real();
+    }
 
   conv.hilbert(ImBuf, ReBuf, real_axis_conv_t::grid_kind::fermionic);
 
-  for (long b = 0; b < B; ++b)
-    for (long n = 0; n < N_extra; ++n)
+  for (long P = 0; P < Naux; ++P)
+    for (long Q = 0; Q < Naux; ++Q) {
+      const long b = P * Naux + Q;
       for (long l = 0; l < N_w; ++l)
-        ReSigma_skP_w(b, l, n) = ReBuf(b * N_extra + n, l);
+        ReSigma_PQ_w(P, Q, l) = ComplexType(ReBuf(b, l), 0.0);
+    }
 }
 
 } // namespace real_axis
