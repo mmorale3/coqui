@@ -112,28 +112,28 @@ namespace bdft_tests {
     // -----------------------------------------------------------------------
     real_axis_mb_state_t state(grid);
     state.mpi = mpi_context;
-    state.A_wskij = nda::array<cval_t, 5>(N_w, ns, Nk, nbnd, nbnd);
-    auto& A = *state.A_wskij;
-    A = cval_t(0.0, 0.0);
-
-    const double eta = 0.05;
-    auto kp2ibz = mf->kp_to_ibz();
-    for (long s = 0; s < ns; ++s)
-      for (long k = 0; k < Nk; ++k) {
-        const long kibz = kp2ibz(k);
-        for (long n = 0; n < nbnd; ++n) {
-          const double eps_n = eigval(s, kibz, n);
-          for (long iw = 0; iw < N_w; ++iw) {
-            // Convention in real_freq_grid_t: w runs from -w_max to +w_max
-            // around mu_chem implicitly via grid.w(); the Dyson identifier
-            // (w + mu) - eps_n controls the Lorentzian center.
-            const double w_l = grid.w()(iw) + grid.mu_chem();
-            const double v = (1.0 / M_PI) * eta
-                           / ((w_l - eps_n)*(w_l - eps_n) + eta*eta);
-            A(iw, s, k, n, n) = cval_t(v, 0.0);
+    state.A_wskij.emplace(*state.mpi,
+        std::array<long, 5>{N_w, ns, Nk, nbnd, nbnd});
+    if (state.A_wskij->node_comm()->root()) {
+      auto A = state.A_wskij->local();
+      A = cval_t(0.0, 0.0);
+      const double eta = 0.05;
+      auto kp2ibz = mf->kp_to_ibz();
+      for (long s = 0; s < ns; ++s)
+        for (long k = 0; k < Nk; ++k) {
+          const long kibz = kp2ibz(k);
+          for (long n = 0; n < nbnd; ++n) {
+            const double eps_n = eigval(s, kibz, n);
+            for (long iw = 0; iw < N_w; ++iw) {
+              const double w_l = grid.w()(iw) + grid.mu_chem();
+              const double v = (1.0 / M_PI) * eta
+                             / ((w_l - eps_n)*(w_l - eps_n) + eta*eta);
+              A(iw, s, k, n, n) = cval_t(v, 0.0);
+            }
           }
         }
-      }
+    }
+    state.A_wskij->node_sync();
 
     // -----------------------------------------------------------------------
     // Run the real-axis G0W0 wrapper.
@@ -143,8 +143,8 @@ namespace bdft_tests {
 
     REQUIRE(state.ImSigma_wskij.has_value());
     REQUIRE(state.ReSigma_wskij.has_value());
-    auto const& ImS = *state.ImSigma_wskij;
-    auto const& ReS = *state.ReSigma_wskij;
+    auto ImS = state.ImSigma_wskij->local();
+    auto ReS = state.ReSigma_wskij->local();
 
     REQUIRE(ImS.shape()[0] == N_w);
     REQUIRE(ImS.shape()[1] == ns);
@@ -234,32 +234,35 @@ namespace bdft_tests {
     auto grid = real_freq_grid_t::make_uniform(
                   beta, mu0, w_max, N_w, Omega_max, N_Omega, N_t, T_window);
 
-    auto build_state = [&]() {
-      real_axis_mb_state_t state(grid);
+    auto fill_state = [&](real_axis_mb_state_t& state) {
       state.mpi = mpi_context;
-      state.A_wskij = nda::array<cval_t, 5>(N_w, ns, Nk, nbnd, nbnd);
-      auto& A = *state.A_wskij;
-      A = cval_t(0.0, 0.0);
-      const double eta = 0.05;
-      auto kp2ibz = mf->kp_to_ibz();
-      for (long s = 0; s < ns; ++s)
-        for (long k = 0; k < Nk; ++k) {
-          const long kibz = kp2ibz(k);
-          for (long n = 0; n < nbnd; ++n) {
-            const double eps_n = eigval(s, kibz, n);
-            for (long iw = 0; iw < N_w; ++iw) {
-              const double w_l = grid.w()(iw) + grid.mu_chem();
-              const double v = (1.0 / M_PI) * eta
-                             / ((w_l - eps_n)*(w_l - eps_n) + eta*eta);
-              A(iw, s, k, n, n) = cval_t(v, 0.0);
+      state.A_wskij.emplace(*state.mpi,
+          std::array<long, 5>{N_w, ns, Nk, nbnd, nbnd});
+      if (state.A_wskij->node_comm()->root()) {
+        auto A = state.A_wskij->local();
+        A = cval_t(0.0, 0.0);
+        const double eta = 0.05;
+        auto kp2ibz = mf->kp_to_ibz();
+        for (long s = 0; s < ns; ++s)
+          for (long k = 0; k < Nk; ++k) {
+            const long kibz = kp2ibz(k);
+            for (long n = 0; n < nbnd; ++n) {
+              const double eps_n = eigval(s, kibz, n);
+              for (long iw = 0; iw < N_w; ++iw) {
+                const double w_l = grid.w()(iw) + grid.mu_chem();
+                const double v = (1.0 / M_PI) * eta
+                               / ((w_l - eps_n)*(w_l - eps_n) + eta*eta);
+                A(iw, s, k, n, n) = cval_t(v, 0.0);
+              }
             }
           }
-        }
-      return state;
+      }
+      state.A_wskij->node_sync();
     };
 
-    auto state_k = build_state();
-    auto state_r = build_state();
+    real_axis_mb_state_t state_k(grid), state_r(grid);
+    fill_state(state_k);
+    fill_state(state_r);
     evaluate_thc_serial(state_k, thc, /*eps_nufft*/ 1e-8,
                         "ignore_g0", /*verbose*/ false, /*use_rspace*/ false);
     evaluate_thc_serial(state_r, thc, /*eps_nufft*/ 1e-8,
@@ -267,10 +270,10 @@ namespace bdft_tests {
 
     REQUIRE(state_k.ImSigma_wskij.has_value());
     REQUIRE(state_r.ImSigma_wskij.has_value());
-    auto const& ImSk = *state_k.ImSigma_wskij;
-    auto const& ImSr = *state_r.ImSigma_wskij;
-    auto const& ReSk = *state_k.ReSigma_wskij;
-    auto const& ReSr = *state_r.ReSigma_wskij;
+    auto ImSk = state_k.ImSigma_wskij->local();
+    auto ImSr = state_r.ImSigma_wskij->local();
+    auto ReSk = state_k.ReSigma_wskij->local();
+    auto ReSr = state_r.ReSigma_wskij->local();
 
     REQUIRE(ImSk.shape() == ImSr.shape());
     double max_diff_im = 0.0, max_diff_re = 0.0;

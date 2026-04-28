@@ -19,6 +19,7 @@
 #include "utilities/mpi_context.h"
 #include "numerics/distributed_array/nda.hpp"
 #include "numerics/distributed_array/nda_utils.hpp"
+#include "numerics/shared_array/nda.hpp"
 #include "methods/GW_real_axis/real_freq_grid.hpp"
 #include "methods/GW_real_axis/real_axis_proc_grid.hpp"
 
@@ -70,6 +71,8 @@ struct real_axis_mb_state_t {
   using bosonic_dArray_t = memory::darray_t<
       memory::array<HOST_MEMORY, ComplexType, 4>,
       boost::mpi3::communicator>;
+  template<nda::MemoryArray Array_base_t>
+  using sArray_t = math::shm::shared_array<Array_base_t>;
 
   // Finite-temperature parameters. Mandatory, not optional.
   double beta    = 0.0;
@@ -86,11 +89,14 @@ struct real_axis_mb_state_t {
   std::string coqui_prefix = "coqui_real_axis";
   long mbpt_iter = -1;
 
-  // Fermionic fields. Indexing: (w, s, k, i, j).
-  std::optional<nda::array<ComplexType, 5>> A_wskij;
-  std::optional<nda::array<ComplexType, 5>> ImSigma_wskij;
-  std::optional<nda::array<ComplexType, 5>> ReSigma_wskij;
-  std::optional<nda::array<ComplexType, 4>> Sigma_x_skij;
+  // Fermionic fields. Indexing: (w, s, k, i, j) or (s, k, i, j).
+  // Stored as math::shm::shared_array (one copy per node) since these
+  // are orbital-basis (nbnd^2 -- moderate per-rank size, but worth
+  // sharing across ranks on the same node).
+  std::optional<sArray_t<nda::array_view<ComplexType, 5>>> A_wskij;
+  std::optional<sArray_t<nda::array_view<ComplexType, 5>>> ImSigma_wskij;
+  std::optional<sArray_t<nda::array_view<ComplexType, 5>>> ReSigma_wskij;
+  std::optional<sArray_t<nda::array_view<ComplexType, 4>>> Sigma_x_skij;
 
   // Bosonic fields, auxiliary basis. Indexing: (q, P, Q, Omega).
   // Distributed over (P, Q) with grid = (1, gridP, gridQ, 1). Each rank
@@ -108,13 +114,22 @@ struct real_axis_mb_state_t {
   real_axis_mb_state_t(real_freq_grid_t const& g)
     : beta(g.beta()), mu_chem(g.mu_chem()), grid(&g) {}
 
-  /// Allocate fermionic arrays for given (ns, nkpts_ibz, nbnd) shape.
+  /// Allocate fermionic sArrays for given (ns, nkpts_ibz, nbnd) shape.
+  /// Each is one copy per node (math::shm::shared_array).
   void allocate_fermionic(long ns, long nkpts_ibz, long nbnd) {
+    utils::check(this->mpi != nullptr,
+                 "real_axis_mb_state_t::allocate_fermionic: mpi context not bound");
+    utils::check(this->grid != nullptr,
+                 "real_axis_mb_state_t::allocate_fermionic: grid not bound");
     long N_w = grid->N_w();
-    A_wskij        = nda::array<ComplexType, 5>(N_w, ns, nkpts_ibz, nbnd, nbnd);
-    ImSigma_wskij  = nda::array<ComplexType, 5>(N_w, ns, nkpts_ibz, nbnd, nbnd);
-    ReSigma_wskij  = nda::array<ComplexType, 5>(N_w, ns, nkpts_ibz, nbnd, nbnd);
-    Sigma_x_skij   = nda::array<ComplexType, 4>(ns, nkpts_ibz, nbnd, nbnd);
+    A_wskij.emplace(*this->mpi,
+        std::array<long, 5>{N_w, ns, nkpts_ibz, nbnd, nbnd});
+    ImSigma_wskij.emplace(*this->mpi,
+        std::array<long, 5>{N_w, ns, nkpts_ibz, nbnd, nbnd});
+    ReSigma_wskij.emplace(*this->mpi,
+        std::array<long, 5>{N_w, ns, nkpts_ibz, nbnd, nbnd});
+    Sigma_x_skij.emplace(*this->mpi,
+        std::array<long, 4>{ns, nkpts_ibz, nbnd, nbnd});
   }
 
   /// Allocate bosonic dArrays for given (nqpts_ibz, Naux) shape.

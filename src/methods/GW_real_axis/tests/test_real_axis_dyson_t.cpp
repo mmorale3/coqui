@@ -95,27 +95,33 @@ namespace bdft_tests {
 
     real_axis_mb_state_t state(grid);
     state.mpi          = mpi_context;
-    state.A_wskij      = nda::array<cval_t, 5>(N_w, ns, Nk, nbnd, nbnd);
-    state.Sigma_x_skij = nda::array<cval_t, 4>(ns, Nk, nbnd, nbnd);
-    auto& A0 = *state.A_wskij;
-    A0 = cval_t(0.0, 0.0);
-    *state.Sigma_x_skij = cval_t(0.0, 0.0);
-
-    const double eta_lor = 0.05;
-    auto kp2ibz = mf->kp_to_ibz();
-    for (long s = 0; s < ns; ++s)
-      for (long k = 0; k < Nk; ++k) {
-        const long kibz = kp2ibz(k);
-        for (long n = 0; n < nbnd; ++n) {
-          const double eps_n = eigval(s, kibz, n);
-          for (long iw = 0; iw < N_w; ++iw) {
-            const double w_l = grid.w()(iw) + grid.mu_chem();
-            const double v = (1.0 / M_PI) * eta_lor
-                           / ((w_l - eps_n)*(w_l - eps_n) + eta_lor*eta_lor);
-            A0(iw, s, k, n, n) = cval_t(v, 0.0);
+    state.A_wskij.emplace(*state.mpi,
+        std::array<long, 5>{N_w, ns, Nk, nbnd, nbnd});
+    state.Sigma_x_skij.emplace(*state.mpi,
+        std::array<long, 4>{ns, Nk, nbnd, nbnd});
+    if (state.A_wskij->node_comm()->root()) {
+      auto A0 = state.A_wskij->local();
+      A0 = cval_t(0.0, 0.0);
+      state.Sigma_x_skij->local() = cval_t(0.0, 0.0);
+      const double eta_lor = 0.05;
+      auto kp2ibz = mf->kp_to_ibz();
+      for (long s = 0; s < ns; ++s)
+        for (long k = 0; k < Nk; ++k) {
+          const long kibz = kp2ibz(k);
+          for (long n = 0; n < nbnd; ++n) {
+            const double eps_n = eigval(s, kibz, n);
+            for (long iw = 0; iw < N_w; ++iw) {
+              const double w_l = grid.w()(iw) + grid.mu_chem();
+              const double v = (1.0 / M_PI) * eta_lor
+                             / ((w_l - eps_n)*(w_l - eps_n) + eta_lor*eta_lor);
+              A0(iw, s, k, n, n) = cval_t(v, 0.0);
+            }
           }
         }
-      }
+    }
+    state.A_wskij->node_sync();
+    state.Sigma_x_skij->node_sync();
+    auto kp2ibz = mf->kp_to_ibz();
 
     // Build Sigma_c via scr_coulomb + gw.
     real_axis_scr_coulomb_t scr_eri(&grid, "rpa", "ignore_g0", 1e-8);
@@ -145,7 +151,7 @@ namespace bdft_tests {
 
     // A should be allocated, right shape, finite.
     REQUIRE(state.A_wskij.has_value());
-    auto const& A = *state.A_wskij;
+    auto A = state.A_wskij->local();
     REQUIRE(A.shape()[0] == N_w);
     REQUIRE(A.shape()[1] == ns);
     REQUIRE(A.shape()[2] == Nk);
@@ -220,12 +226,21 @@ namespace bdft_tests {
                   beta, mu0, w_max, N_w, Omega_max, N_Omega, N_t, T_window);
 
     real_axis_mb_state_t state(grid);
-    state.Sigma_x_skij = nda::array<cval_t, 4>(ns, Nk, nbnd, nbnd);
-    state.ImSigma_wskij = nda::array<cval_t, 5>(N_w, ns, Nk, nbnd, nbnd);
-    state.ReSigma_wskij = nda::array<cval_t, 5>(N_w, ns, Nk, nbnd, nbnd);
-    *state.Sigma_x_skij  = cval_t(0.0, 0.0);
-    *state.ImSigma_wskij = cval_t(0.0, 0.0);
-    *state.ReSigma_wskij = cval_t(0.0, 0.0);
+    state.mpi = mpi_context;
+    state.Sigma_x_skij.emplace(*state.mpi,
+        std::array<long, 4>{ns, Nk, nbnd, nbnd});
+    state.ImSigma_wskij.emplace(*state.mpi,
+        std::array<long, 5>{N_w, ns, Nk, nbnd, nbnd});
+    state.ReSigma_wskij.emplace(*state.mpi,
+        std::array<long, 5>{N_w, ns, Nk, nbnd, nbnd});
+    if (state.Sigma_x_skij->node_comm()->root()) {
+      state.Sigma_x_skij->local()  = cval_t(0.0, 0.0);
+      state.ImSigma_wskij->local() = cval_t(0.0, 0.0);
+      state.ReSigma_wskij->local() = cval_t(0.0, 0.0);
+    }
+    state.Sigma_x_skij->node_sync();
+    state.ImSigma_wskij->node_sync();
+    state.ReSigma_wskij->node_sync();
 
     nda::array<cval_t, 4> H_MF_skij(ns, Nk, nbnd, nbnd);
     H_MF_skij = cval_t(0.0, 0.0);

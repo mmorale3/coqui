@@ -99,8 +99,12 @@ public:
     const long nbnd = _H_MF.shape()[2];
     const long N_w  = grid.N_w();
 
-    // Allocate / resize A.
-    state.A_wskij = nda::array<ComplexType, 5>(N_w, ns, Nk, nbnd, nbnd);
+    // Allocate / resize A as sArray (one copy per node).
+    if (!state.A_wskij.has_value()
+        or state.A_wskij->shape() != std::array<long, 5>{N_w, ns, Nk, nbnd, nbnd}) {
+      state.A_wskij.emplace(*state.mpi,
+          std::array<long, 5>{N_w, ns, Nk, nbnd, nbnd});
+    }
 
     // Build a temporary grid with the requested mu_chem so dyson_update_A
     // (which reads grid.mu_chem()) sees the right value. Beta and the
@@ -109,9 +113,22 @@ public:
                                         nda::array<double,1>(grid.w()),
                                         nda::array<double,1>(grid.Omega()),
                                         grid.N_t(), grid.T_window());
-    dyson_update_A(grid_at_mu, _H_MF, *state.Sigma_x_skij,
-                   *state.ReSigma_wskij, *state.ImSigma_wskij,
-                   _eta, *state.A_wskij);
+
+    // Compute A into a per-rank scratch buffer (dyson_update_A is purely
+    // local: every rank does the same redundant work). Then write to the
+    // node-shared sArray on node-root and node_sync.
+    nda::array<ComplexType, 5> A_local(N_w, ns, Nk, nbnd, nbnd);
+    nda::array<ComplexType, 4> Sx_local(ns, Nk, nbnd, nbnd);
+    nda::array<ComplexType, 5> ReSc_local(N_w, ns, Nk, nbnd, nbnd);
+    nda::array<ComplexType, 5> ImSc_local(N_w, ns, Nk, nbnd, nbnd);
+    Sx_local()   = state.Sigma_x_skij->local();
+    ReSc_local() = state.ReSigma_wskij->local();
+    ImSc_local() = state.ImSigma_wskij->local();
+    dyson_update_A(grid_at_mu, _H_MF, Sx_local, ReSc_local, ImSc_local,
+                   _eta, A_local);
+    if (state.A_wskij->node_comm()->root())
+      state.A_wskij->local() = A_local;
+    state.A_wskij->node_sync();
 
     state.mu_chem = mu;
   }
@@ -133,7 +150,8 @@ public:
   {
     utils::check(state.A_wskij.has_value(),
                  "real_axis_dyson_t::find_mu_chem: state.A_wskij not allocated");
-    return real_axis::find_mu_chem(*_grid, *state.A_wskij, k_weights, N_elec,
+    auto A_loc = state.A_wskij->local();
+    return real_axis::find_mu_chem(*_grid, A_loc, k_weights, N_elec,
                                     _mu_tol, max_iter);
   }
 

@@ -189,24 +189,28 @@ namespace bdft_tests {
     // ---------------------------------------------------------------
     real_axis_mb_state_t state(grid);
     state.mpi = mpi_context;
-    state.A_wskij = nda::array<cval_t, 5>(N_w, ns, Nk, nbnd, nbnd);
-    auto& A = *state.A_wskij;
-    A = cval_t(0.0, 0.0);
-    const double eta = 0.05;
-    auto kp2ibz = mf->kp_to_ibz();
-    for (long s = 0; s < ns; ++s)
-      for (long k = 0; k < Nk; ++k) {
-        const long kibz = kp2ibz(k);
-        for (long n = 0; n < nbnd; ++n) {
-          const double eps_n = eigval(s, kibz, n);
-          for (long iw = 0; iw < N_w; ++iw) {
-            const double w_l = grid.w()(iw) + grid.mu_chem();
-            const double v = (1.0 / M_PI) * eta
-                           / ((w_l - eps_n)*(w_l - eps_n) + eta*eta);
-            A(iw, s, k, n, n) = cval_t(v, 0.0);
+    state.A_wskij.emplace(*state.mpi,
+        std::array<long, 5>{N_w, ns, Nk, nbnd, nbnd});
+    if (state.A_wskij->node_comm()->root()) {
+      auto A = state.A_wskij->local();
+      A = cval_t(0.0, 0.0);
+      const double eta = 0.05;
+      auto kp2ibz = mf->kp_to_ibz();
+      for (long s = 0; s < ns; ++s)
+        for (long k = 0; k < Nk; ++k) {
+          const long kibz = kp2ibz(k);
+          for (long n = 0; n < nbnd; ++n) {
+            const double eps_n = eigval(s, kibz, n);
+            for (long iw = 0; iw < N_w; ++iw) {
+              const double w_l = grid.w()(iw) + grid.mu_chem();
+              const double v = (1.0 / M_PI) * eta
+                             / ((w_l - eps_n)*(w_l - eps_n) + eta*eta);
+              A(iw, s, k, n, n) = cval_t(v, 0.0);
+            }
           }
         }
-      }
+    }
+    state.A_wskij->node_sync();
 
     // ---------------------------------------------------------------
     // Run the real-axis G0W0 wrapper to produce Sigma_c(s, k, w, i, j).
@@ -216,8 +220,9 @@ namespace bdft_tests {
 
     REQUIRE(state.ImSigma_wskij.has_value());
     REQUIRE(state.ReSigma_wskij.has_value());
-    auto const& ImS = *state.ImSigma_wskij;
-    auto const& ReS = *state.ReSigma_wskij;
+    auto ImS = state.ImSigma_wskij->local();
+    auto ReS = state.ReSigma_wskij->local();
+    auto A = state.A_wskij->local();
 
     bool all_finite = true;
     for (long iw = 0; iw < N_w; ++iw)

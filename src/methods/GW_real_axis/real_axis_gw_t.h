@@ -305,7 +305,7 @@ void real_axis_gw_t::evaluate(real_axis::real_axis_mb_state_t & state,
                "real_axis_gw_t::evaluate: npol={} not supported (need 1)",
                MF.npol());
 
-  auto const& A_in = *state.A_wskij;
+  auto A_in = state.A_wskij->local();
   utils::check(A_in.shape()[0] == N_w and A_in.shape()[1] == ns and
                A_in.shape()[2] == Nk and A_in.shape()[3] == nbnd and
                A_in.shape()[4] == nbnd,
@@ -325,14 +325,16 @@ void real_axis_gw_t::evaluate(real_axis::real_axis_mb_state_t & state,
   // Read state.W directly via .local(); no gather, no replicated buffer.
   auto ImW_loc = state.ImW_qPQO->local();
 
-  // Allocate Sigma outputs in state with the canonical (N_w, ns, Nk, nbnd, nbnd)
-  // layout. Re-allocate so previous-iteration data is wiped.
-  state.ImSigma_wskij = nda::array<ComplexType, 5>(N_w, ns, Nk, nbnd, nbnd);
-  state.ReSigma_wskij = nda::array<ComplexType, 5>(N_w, ns, Nk, nbnd, nbnd);
-  auto & ImSigma_out  = *state.ImSigma_wskij;
-  auto & ReSigma_out  = *state.ReSigma_wskij;
-  ImSigma_out = ComplexType(0.0, 0.0);
-  ReSigma_out = ComplexType(0.0, 0.0);
+  // Allocate Sigma outputs in state as sArrays (one copy per node) if
+  // not already allocated.
+  if (!state.ImSigma_wskij.has_value() or !state.ReSigma_wskij.has_value()) {
+    state.ImSigma_wskij.emplace(*state.mpi,
+        std::array<long, 5>{N_w, ns, Nk, nbnd, nbnd});
+    state.ReSigma_wskij.emplace(*state.mpi,
+        std::array<long, 5>{N_w, ns, Nk, nbnd, nbnd});
+  }
+  auto ImSigma_out = state.ImSigma_wskij->local();
+  auto ReSigma_out = state.ReSigma_wskij->local();
 
   // Repack A from (N_w, ns, Nk, nbnd, nbnd) to (ns, Nk, N_w, nbnd, nbnd),
   // taking the matrix-hermitian symmetrization that recovers the physical
@@ -595,14 +597,19 @@ void real_axis_gw_t::evaluate(real_axis::real_axis_mb_state_t & state,
   }
 
   // Repack into state.{Im,Re}Sigma_wskij with (N_w, ns, Nk, nbnd, nbnd) layout.
-  for (long s = 0; s < ns; ++s)
-    for (long k = 0; k < Nk; ++k)
-      for (long iw = 0; iw < N_w; ++iw)
-        for (long mu = 0; mu < nbnd; ++mu)
-          for (long nu = 0; nu < nbnd; ++nu) {
-            ImSigma_out(iw, s, k, mu, nu) = ImSigma(s, k, iw, mu, nu);
-            ReSigma_out(iw, s, k, mu, nu) = ReSigma(s, k, iw, mu, nu);
-          }
+  // sArray writes only on node-root (else races on shared memory).
+  if (state.ImSigma_wskij->node_comm()->root()) {
+    for (long s = 0; s < ns; ++s)
+      for (long k = 0; k < Nk; ++k)
+        for (long iw = 0; iw < N_w; ++iw)
+          for (long mu = 0; mu < nbnd; ++mu)
+            for (long nu = 0; nu < nbnd; ++nu) {
+              ImSigma_out(iw, s, k, mu, nu) = ImSigma(s, k, iw, mu, nu);
+              ReSigma_out(iw, s, k, mu, nu) = ReSigma(s, k, iw, mu, nu);
+            }
+  }
+  state.ImSigma_wskij->node_sync();
+  state.ReSigma_wskij->node_sync();
   const double dt8 = sec_since(t8);
 
   if (verbose and comm.root()) {

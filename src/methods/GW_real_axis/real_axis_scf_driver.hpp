@@ -137,33 +137,43 @@ inline scgw_result real_axis_scf_loop(real_axis_mb_state_t& state,
   // ---- Initial A: Lorentzian per H_MF diagonal if state.A_wskij is empty.
   bool A_is_zero = true;
   if (state.A_wskij.has_value()) {
-    auto const* d = state.A_wskij->data();
-    for (long i = 0; i < state.A_wskij->size(); ++i)
+    auto A_loc = state.A_wskij->local();
+    auto const* d = A_loc.data();
+    for (long i = 0; i < A_loc.size(); ++i)
       if (std::abs(d[i]) > 0.0) { A_is_zero = false; break; }
   }
   if (!state.A_wskij.has_value() or A_is_zero) {
-    state.A_wskij = nda::array<ComplexType, 5>(N_w, ns, Nk, nbnd, nbnd);
-    auto& A = *state.A_wskij;
-    A = ComplexType(0.0, 0.0);
-    const double eta_init = std::max(cfg.eta, 1e-2);
-    for (long s = 0; s < ns; ++s)
-      for (long k = 0; k < Nk; ++k)
-        for (long m = 0; m < nbnd; ++m) {
-          const double e = H_MF(s, k, m, m).real();
-          for (long iw = 0; iw < N_w; ++iw) {
-            const double wl = grid_in.w()(iw) + grid_in.mu_chem();
-            const double v = (1.0 / M_PI) * eta_init
-                           / ((wl - e)*(wl - e) + eta_init*eta_init);
-            A(iw, s, k, m, m) = ComplexType(v, 0.0);
+    if (!state.A_wskij.has_value()) {
+      state.A_wskij.emplace(*state.mpi,
+          std::array<long, 5>{N_w, ns, Nk, nbnd, nbnd});
+    }
+    if (state.A_wskij->node_comm()->root()) {
+      auto A = state.A_wskij->local();
+      A = ComplexType(0.0, 0.0);
+      const double eta_init = std::max(cfg.eta, 1e-2);
+      for (long s = 0; s < ns; ++s)
+        for (long k = 0; k < Nk; ++k)
+          for (long m = 0; m < nbnd; ++m) {
+            const double e = H_MF(s, k, m, m).real();
+            for (long iw = 0; iw < N_w; ++iw) {
+              const double wl = grid_in.w()(iw) + grid_in.mu_chem();
+              const double v = (1.0 / M_PI) * eta_init
+                             / ((wl - e)*(wl - e) + eta_init*eta_init);
+              A(iw, s, k, m, m) = ComplexType(v, 0.0);
+            }
           }
-        }
+    }
+    state.A_wskij->node_sync();
   }
 
   // Sigma_x storage on state (read by dyson.solve_dyson). Allocate so even
   // a HF-less SCF (mb_solver.hf == nullptr) can pass it to dyson.
   if (!state.Sigma_x_skij.has_value())
-    state.Sigma_x_skij = nda::array<ComplexType, 4>(ns, Nk, nbnd, nbnd);
-  *state.Sigma_x_skij = ComplexType(0.0, 0.0);
+    state.Sigma_x_skij.emplace(*state.mpi,
+        std::array<long, 4>{ns, Nk, nbnd, nbnd});
+  if (state.Sigma_x_skij->node_comm()->root())
+    state.Sigma_x_skij->local() = ComplexType(0.0, 0.0);
+  state.Sigma_x_skij->node_sync();
 
   // Use R-space if the THC fixture is periodic (Nk > 1).
   const bool use_rspace = (Nk > 1);
@@ -189,9 +199,10 @@ inline scgw_result real_axis_scf_loop(real_axis_mb_state_t& state,
     mb_solver.gw->evaluate(state, thc, cfg.eps_nufft,
                            "ignore_g0", /*verbose*/ false, use_rspace);
 
-    // Causality projection on Im Sigma_c (skwij layout).
+    // Causality projection on Im Sigma_c (skwij layout). Write only on
+    // node-root, then node_sync.
     {
-      auto& ImS = *state.ImSigma_wskij;
+      auto ImS = state.ImSigma_wskij->local();
       // Repack to (ns, Nk, N_w, nbnd, nbnd) for project_causality_ImSigma,
       // then back. Cheap relative to the kernel cost.
       nda::array<ComplexType, 5> ImS_skwij(ns, Nk, N_w, nbnd, nbnd);
@@ -202,12 +213,15 @@ inline scgw_result real_axis_scf_loop(real_axis_mb_state_t& state,
               for (long nu = 0; nu < nbnd; ++nu)
                 ImS_skwij(s, k, iw, mu, nu) = ImS(iw, s, k, mu, nu);
       project_causality_ImSigma(ImS_skwij);
-      for (long s = 0; s < ns; ++s)
-        for (long k = 0; k < Nk; ++k)
-          for (long iw = 0; iw < N_w; ++iw)
-            for (long mu = 0; mu < nbnd; ++mu)
-              for (long nu = 0; nu < nbnd; ++nu)
-                ImS(iw, s, k, mu, nu) = ImS_skwij(s, k, iw, mu, nu);
+      if (state.ImSigma_wskij->node_comm()->root()) {
+        for (long s = 0; s < ns; ++s)
+          for (long k = 0; k < Nk; ++k)
+            for (long iw = 0; iw < N_w; ++iw)
+              for (long mu = 0; mu < nbnd; ++mu)
+                for (long nu = 0; nu < nbnd; ++nu)
+                  ImS(iw, s, k, mu, nu) = ImS_skwij(s, k, iw, mu, nu);
+      }
+      state.ImSigma_wskij->node_sync();
     }
 
     // ---- 3. Sigma^x (HF) ----
@@ -215,23 +229,27 @@ inline scgw_result real_axis_scf_loop(real_axis_mb_state_t& state,
       mb_solver.hf->evaluate(state, thc, mu_cur);
     // (else: state.Sigma_x_skij stays zero; correlation-only SCF.)
 
-    // ---- 4. Dyson update -> A_full (scratch) ----
-    nda::array<ComplexType, 5> A_old = *state.A_wskij;
+    // ---- 4. Dyson update -> A_full (scratch). Snapshot A_old before. ----
+    nda::array<ComplexType, 5> A_old(state.A_wskij->shape());
+    A_old() = state.A_wskij->local();
     dyson.solve_dyson(state, mu_cur);
-    auto A_full = *state.A_wskij;
+    nda::array<ComplexType, 5> A_full(state.A_wskij->shape());
+    A_full() = state.A_wskij->local();
 
-    // ---- 5. Mix A_old <- (A_old, A_full). ----
+    // ---- 5. Mix A_old <- (A_old, A_full). Write back via node-root + sync. ----
     const double diff = frobenius_diff(A_old, A_full);
+    nda::array<ComplexType, 5> A_next(A_old.shape());
     if (cfg.mix_kind == scgw_mix_kind::diis) {
-      nda::array<ComplexType, 5> A_next(A_old.shape());
       diis.mix(A_old, A_full, cfg.alpha_mix, A_next);
-      *state.A_wskij = A_next;
     } else {
       const double a = cfg.alpha_mix;
-      *state.A_wskij = nda::map([a](ComplexType old_v, ComplexType new_v) {
+      A_next = nda::map([a](ComplexType old_v, ComplexType new_v) {
         return (1.0 - a) * old_v + a * new_v;
       })(A_old, A_full);
     }
+    if (state.A_wskij->node_comm()->root())
+      state.A_wskij->local() = A_next;
+    state.A_wskij->node_sync();
 
     // ---- 6. mu update ----
     if (cfg.update_mu) {

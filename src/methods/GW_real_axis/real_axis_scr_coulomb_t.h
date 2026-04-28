@@ -162,7 +162,7 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
                "real_axis_scr_coulomb_t::update_w: npol={} not supported (need 1)",
                MF.npol());
 
-  auto const& A_in = *state.A_wskij;
+  auto A_in = state.A_wskij->local();
   utils::check(A_in.shape()[0] == N_w and A_in.shape()[1] == ns and
                A_in.shape()[2] == Nk and A_in.shape()[3] == nbnd and
                A_in.shape()[4] == nbnd,

@@ -172,7 +172,7 @@ namespace bdft_tests {
     REQUIRE(state.ImW_qPQO.has_value());
 
     // Causality on diag A.
-    auto const& A = *state.A_wskij;
+    auto A = state.A_wskij->local();
     long n_total = 0, n_violations = 0;
     for (long iw = 0; iw < N_w; ++iw)
       for (long s = 0; s < ns; ++s)

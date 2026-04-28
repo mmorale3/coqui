@@ -259,18 +259,29 @@ namespace bdft_tests {
     // show O(1) violation, expected) and the symmetrized form (should be
     // hermitian to round-off).
     // -----------------------------------------------------------------------
-    auto res_Sx  = check_skij (*state.Sigma_x_skij,  "Sigma_x_skij");
-    auto res_ImS = check_wskij(*state.ImSigma_wskij, "ImSigma_wskij (correlation)");
-    auto res_ReS = check_wskij(*state.ReSigma_wskij, "ReSigma_wskij (correlation)");
-    auto res_A   = check_wskij(*state.A_wskij,       "A_wskij (storage, componentwise)");
+    // Materialize sArray local views as regular nda::array buffers so the
+    // generic check_wskij / check_skij lambdas (which accept nda::array<5>)
+    // accept them.
+    auto Sx_loc  = state.Sigma_x_skij->local();
+    auto ImS_loc = state.ImSigma_wskij->local();
+    auto ReS_loc = state.ReSigma_wskij->local();
+    auto A_loc   = state.A_wskij->local();
+    nda::array<cval_t, 4> Sx_buf(Sx_loc.shape()); Sx_buf() = Sx_loc;
+    nda::array<cval_t, 5> ImS_buf(ImS_loc.shape()); ImS_buf() = ImS_loc;
+    nda::array<cval_t, 5> ReS_buf(ReS_loc.shape()); ReS_buf() = ReS_loc;
+    nda::array<cval_t, 5> A_buf(A_loc.shape()); A_buf() = A_loc;
+
+    auto res_Sx  = check_skij (Sx_buf,  "Sigma_x_skij");
+    auto res_ImS = check_wskij(ImS_buf, "ImSigma_wskij (correlation)");
+    auto res_ReS = check_wskij(ReS_buf, "ReSigma_wskij (correlation)");
+    auto res_A   = check_wskij(A_buf,   "A_wskij (storage, componentwise)");
 
     // Build the matrix-hermitian symmetrized A and check hermiticity.
     {
-      auto const& A0 = *state.A_wskij;
-      const long Nw_ = A0.shape()[0];
-      const long Ns_ = A0.shape()[1];
-      const long Nk_ = A0.shape()[2];
-      const long Nb_ = A0.shape()[3];
+      const long Nw_ = A_buf.shape()[0];
+      const long Ns_ = A_buf.shape()[1];
+      const long Nk_ = A_buf.shape()[2];
+      const long Nb_ = A_buf.shape()[3];
       nda::array<cval_t, 5> A_phys(Nw_, Ns_, Nk_, Nb_, Nb_);
       for (long iw = 0; iw < Nw_; ++iw)
         for (long s = 0; s < Ns_; ++s)
@@ -278,7 +289,7 @@ namespace bdft_tests {
             for (long i = 0; i < Nb_; ++i)
               for (long j = 0; j < Nb_; ++j)
                 A_phys(iw, s, k, i, j) =
-                    0.5 * (A0(iw, s, k, i, j) + std::conj(A0(iw, s, k, j, i)));
+                    0.5 * (A_buf(iw, s, k, i, j) + std::conj(A_buf(iw, s, k, j, i)));
       check_wskij(A_phys, "A_phys (matrix-hermitian symmetrized)");
     }
 
@@ -286,7 +297,7 @@ namespace bdft_tests {
     // Project A -> A_aux and check (P, Q) hermiticity at each (s, k).
     // -----------------------------------------------------------------------
     {
-      auto const& A = *state.A_wskij;
+      auto const& A = A_buf;
       // Repack A from (N_w, ns, Nk, nbnd, nbnd) to (ns, Nk, N_w, nbnd, nbnd).
       nda::array<cval_t, 5> A_drv(ns, Nk, N_w, nbnd, nbnd);
       for (long s = 0; s < ns; ++s)

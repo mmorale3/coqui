@@ -90,7 +90,7 @@ public:
 
     auto const& grid_in = *_grid;
     auto const& MF      = *thc.MF();
-    auto const& A_in    = *state.A_wskij;
+    auto A_in           = state.A_wskij->local();
 
     const long ns   = MF.nspin();
     const long Nk   = MF.nkpts();
@@ -103,10 +103,13 @@ public:
                  "real_axis_hf_t::evaluate: npol={} not supported (need 1)",
                  MF.npol());
 
-    // Allocate Sigma_x output.
+    // Allocate Sigma_x output sArray (one copy per node).
     if (!state.Sigma_x_skij.has_value())
-      state.Sigma_x_skij = nda::array<ComplexType, 4>(ns, Nk, nbnd, nbnd);
-    *state.Sigma_x_skij = ComplexType(0.0, 0.0);
+      state.Sigma_x_skij.emplace(*state.mpi,
+          std::array<long, 4>{ns, Nk, nbnd, nbnd});
+    if (state.Sigma_x_skij->node_comm()->root())
+      state.Sigma_x_skij->local() = ComplexType(0.0, 0.0);
+    state.Sigma_x_skij->node_sync();
 
     // Repack A from (N_w, ns, Nk, nbnd, nbnd) to driver layout, and apply
     // the matrix-hermitian symmetrization that recovers the physical
@@ -199,8 +202,15 @@ public:
                                        nda::array<double,1>(grid_in.Omega()),
                                        grid_in.N_t(), grid_in.T_window());
 
+    // evaluate_Sigma_x_serial allreduces Sigma_x to per-rank-replicated;
+    // we then copy into the sArray on node root and sync.
+    nda::array<ComplexType, 4> Sigma_x_local(ns, Nk, nbnd, nbnd);
+    Sigma_x_local() = ComplexType(0.0, 0.0);
     evaluate_Sigma_x_serial(comm, grid_at_mu, A_drv, X_skPmu, V_qPQ_loc,
-                            kmq_to_kp, *state.Sigma_x_skij, iq_gamma);
+                            kmq_to_kp, Sigma_x_local, iq_gamma);
+    if (state.Sigma_x_skij->node_comm()->root())
+      state.Sigma_x_skij->local() = Sigma_x_local;
+    state.Sigma_x_skij->node_sync();
 
     state.mu_chem = mu;
   }

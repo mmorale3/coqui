@@ -102,25 +102,29 @@ namespace bdft_tests {
     const long Nk   = mf->nkpts();
     const long nbnd = mf->nbnd();
     const long N_w  = grid.N_w();
-    state.A_wskij = nda::array<cval_t, 5>(N_w, ns, Nk, nbnd, nbnd);
-    auto& A = *state.A_wskij;
-    A = cval_t(0.0, 0.0);
-    const double eta = 0.05;
-    auto eigval = mf->eigval();
-    auto kp2ibz = mf->kp_to_ibz();
-    for (long s = 0; s < ns; ++s)
-      for (long k = 0; k < Nk; ++k) {
-        const long kibz = kp2ibz(k);
-        for (long n = 0; n < nbnd; ++n) {
-          const double eps_n = eigval(s, kibz, n);
-          for (long iw = 0; iw < N_w; ++iw) {
-            const double w_l = grid.w()(iw) + grid.mu_chem();
-            const double v = (1.0 / M_PI) * eta
-                           / ((w_l - eps_n)*(w_l - eps_n) + eta*eta);
-            A(iw, s, k, n, n) = cval_t(v, 0.0);
+    state.A_wskij.emplace(*state.mpi,
+        std::array<long, 5>{N_w, ns, Nk, nbnd, nbnd});
+    if (state.A_wskij->node_comm()->root()) {
+      auto A = state.A_wskij->local();
+      A = cval_t(0.0, 0.0);
+      const double eta = 0.05;
+      auto eigval = mf->eigval();
+      auto kp2ibz = mf->kp_to_ibz();
+      for (long s = 0; s < ns; ++s)
+        for (long k = 0; k < Nk; ++k) {
+          const long kibz = kp2ibz(k);
+          for (long n = 0; n < nbnd; ++n) {
+            const double eps_n = eigval(s, kibz, n);
+            for (long iw = 0; iw < N_w; ++iw) {
+              const double w_l = grid.w()(iw) + grid.mu_chem();
+              const double v = (1.0 / M_PI) * eta
+                             / ((w_l - eps_n)*(w_l - eps_n) + eta*eta);
+              A(iw, s, k, n, n) = cval_t(v, 0.0);
+            }
           }
         }
-      }
+    }
+    state.A_wskij->node_sync();
   }
 
   // ===========================================================================
@@ -318,10 +322,10 @@ namespace bdft_tests {
                 /*eps_nufft*/ 1e-8, "ignore_g0", /*verbose*/ false,
                 /*use_rspace*/ false);
 
-    auto const& ImS_drv = *state_drv.ImSigma_wskij;
-    auto const& ImS_spl = *state_split.ImSigma_wskij;
-    auto const& ReS_drv = *state_drv.ReSigma_wskij;
-    auto const& ReS_spl = *state_split.ReSigma_wskij;
+    auto ImS_drv = state_drv.ImSigma_wskij->local();
+    auto ImS_spl = state_split.ImSigma_wskij->local();
+    auto ReS_drv = state_drv.ReSigma_wskij->local();
+    auto ReS_spl = state_split.ReSigma_wskij->local();
 
     double max_diff = 0.0;
     const long size = ImS_drv.size();
