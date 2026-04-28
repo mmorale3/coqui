@@ -114,25 +114,14 @@ inline void evaluate_Sigma_x_serial(
   using nda::range;
   const auto _ = range::all;
 
-  // Pick the same (P, Q) proc grid used by the bosonic/fermionic kernels.
-  const long nproc = static_cast<long>(comm.size());
-  auto pgrid_PQ = square_factor_capped(nproc, Naux);
-  const long gridP = pgrid_PQ[0];
-  const long gridQ = pgrid_PQ[1];
-  // Determine this rank's (P_loc, Q_loc) block. Convention matches
-  // make_distributed_array's row-major C-layout assignment.
-  const long ip = static_cast<long>(comm.rank());
-  const long iP_block = (ip / gridQ) % gridP;
-  const long iQ_block = ip % gridQ;
-  auto chunk = [](long N, long G, long i) {
-    long base = N / G;
-    long rem  = N % G;
-    long start = i * base + std::min(i, rem);
-    long sz    = base + (i < rem ? 1 : 0);
-    return std::array<long, 2>{start, sz};
-  };
-  auto [P0, NP_loc] = chunk(Naux, gridP, iP_block);
-  auto [Q0, NQ_loc] = chunk(Naux, gridQ, iQ_block);
+  // Determine this rank's (P_loc, Q_loc) block on the standard (gridP, gridQ)
+  // partitioning of Naux x Naux.
+  auto block = bosonic_local_block(static_cast<long>(comm.size()),
+                                   static_cast<long>(comm.rank()), Naux);
+  const long P0     = block[0];
+  const long NP_loc = block[1];
+  const long Q0     = block[2];
+  const long NQ_loc = block[3];
   range Pr(P0, P0 + NP_loc);
   range Qr(Q0, Q0 + NQ_loc);
 

@@ -147,24 +147,14 @@ public:
     }
     sX_skPmu.node_sync();
 
-    // Determine this rank's (P_loc, Q_loc) block via the same proc-grid
-    // convention used by evaluate_Sigma_x_serial internally.
-    const long nproc = static_cast<long>(comm.size());
-    auto pgrid_PQ_hf = real_axis::square_factor_capped(nproc, Naux);
-    const long gridP_hf = pgrid_PQ_hf[0];
-    const long gridQ_hf = pgrid_PQ_hf[1];
-    const long ip_hf = static_cast<long>(comm.rank());
-    const long iP_block_hf = (ip_hf / gridQ_hf) % gridP_hf;
-    const long iQ_block_hf = ip_hf % gridQ_hf;
-    auto chunk_hf = [](long N, long G, long i) {
-      long base = N / G;
-      long rem  = N % G;
-      long start = i * base + std::min(i, rem);
-      long sz    = base + (i < rem ? 1 : 0);
-      return std::array<long, 2>{start, sz};
-    };
-    auto [P0_hf, NP_loc_hf] = chunk_hf(Naux, gridP_hf, iP_block_hf);
-    auto [Q0_hf, NQ_loc_hf] = chunk_hf(Naux, gridQ_hf, iQ_block_hf);
+    // Determine this rank's (P_loc, Q_loc) block.
+    auto block = real_axis::bosonic_local_block(
+        static_cast<long>(comm.size()),
+        static_cast<long>(comm.rank()), Naux);
+    const long P0_hf     = block[0];
+    const long NP_loc_hf = block[1];
+    const long Q0_hf     = block[2];
+    const long NQ_loc_hf = block[3];
     nda::array<ComplexType, 3> V_qPQ_loc(Nq, NP_loc_hf, NQ_loc_hf);
     for (long iq = 0; iq < Nq; ++iq) {
       auto Zq = thc.Z(static_cast<int>(iq));

@@ -179,7 +179,15 @@ inline scgw_result real_axis_scf_loop(real_axis_mb_state_t& state,
   const bool use_rspace = (Nk > 1);
 
   // DIIS mixer (always allocated; consulted only when mix_kind == diis).
-  diis_mixer_t diis(cfg.diis_window);
+  diis_mixer_t diis(state.mpi, cfg.diis_window);
+
+  // Pre-allocate per-iteration scratch as sArrays (one copy per node).
+  // Reused across all iterations.
+  std::array<long, 5> A_shape =
+      {N_w, ns, Nk, nbnd, nbnd};
+  using sArray5 = real_axis_mb_state_t::sArray_t<nda::array_view<ComplexType, 5>>;
+  sArray5 A_old_shm(*state.mpi, A_shape);
+  sArray5 A_new_shm(*state.mpi, A_shape);
 
   // Working mu (rebuilt grid is owned by dyson.solve_dyson).
   double mu_cur = grid_in.mu_chem();
@@ -229,26 +237,46 @@ inline scgw_result real_axis_scf_loop(real_axis_mb_state_t& state,
       mb_solver.hf->evaluate(state, thc, mu_cur);
     // (else: state.Sigma_x_skij stays zero; correlation-only SCF.)
 
-    // ---- 4. Dyson update -> A_full (scratch). Snapshot A_old before. ----
-    nda::array<ComplexType, 5> A_old(state.A_wskij->shape());
-    A_old() = state.A_wskij->local();
+    // ---- 4. Snapshot A^(k) into A_old_shm; Dyson updates state.A_wskij in
+    //         place to A_full = Dyson(Sigma[A^(k)]). Both are sArrays.
+    if (A_old_shm.node_comm()->root())
+      A_old_shm.local() = state.A_wskij->local();
+    A_old_shm.node_sync();
     dyson.solve_dyson(state, mu_cur);
-    nda::array<ComplexType, 5> A_full(state.A_wskij->shape());
-    A_full() = state.A_wskij->local();
+    auto& A_full_shm = *state.A_wskij;
 
-    // ---- 5. Mix A_old <- (A_old, A_full). Write back via node-root + sync. ----
-    const double diff = frobenius_diff(A_old, A_full);
-    nda::array<ComplexType, 5> A_next(A_old.shape());
+    // ---- 5. Mix(A_old_shm, A_full_shm) -> A_new_shm. Then copy back
+    //         to state.A_wskij. ||dA||_F = sqrt(<R, R>) where R = A_full - A_old.
+    double diff = 0.0;
     if (cfg.mix_kind == scgw_mix_kind::diis) {
-      diis.mix(A_old, A_full, cfg.alpha_mix, A_next);
+      diff = diis.mix(A_old_shm, A_full_shm, cfg.alpha_mix, A_new_shm);
     } else {
+      // Linear mix on node root.
       const double a = cfg.alpha_mix;
-      A_next = nda::map([a](ComplexType old_v, ComplexType new_v) {
-        return (1.0 - a) * old_v + a * new_v;
-      })(A_old, A_full);
+      if (A_new_shm.node_comm()->root()) {
+        auto An = A_new_shm.local();
+        auto Ao = A_old_shm.local();
+        auto Af = A_full_shm.local();
+        const long N = An.size();
+        auto * dn = An.data();
+        auto const* da = Ao.data();
+        auto const* df = Af.data();
+        for (long i = 0; i < N; ++i)
+          dn[i] = (1.0 - a) * da[i] + a * df[i];
+      }
+      A_new_shm.node_sync();
+      // Compute ||A_full - A_old||_F using shared-memory reads.
+      auto Ao = A_old_shm.local();
+      auto Af = A_full_shm.local();
+      double acc = 0.0;
+      const long N = Ao.size();
+      auto const* da = Ao.data();
+      auto const* df = Af.data();
+      for (long i = 0; i < N; ++i) acc += std::norm(df[i] - da[i]);
+      diff = std::sqrt(acc);
     }
     if (state.A_wskij->node_comm()->root())
-      state.A_wskij->local() = A_next;
+      state.A_wskij->local() = A_new_shm.local();
     state.A_wskij->node_sync();
 
     // ---- 6. mu update ----

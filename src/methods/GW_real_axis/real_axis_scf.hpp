@@ -178,8 +178,13 @@ inline scgw_result run_scgw_serial(
 
   scgw_result res;
 
-  // DIIS mixer (allocated regardless; only consulted when mix_kind == diis).
-  diis_mixer_t diis(cfg.diis_window);
+  // Legacy run_scgw_serial supports linear mixing only -- the new
+  // diis_mixer_t requires shared-memory storage (sArray) which the
+  // free-function array-API does not provide. The class-API SCF
+  // (real_axis_scf_loop) supports DIIS.
+  utils::check(cfg.mix_kind == scgw_mix_kind::linear,
+               "run_scgw_serial: only linear mixing is supported in the "
+               "legacy free-function API. Use real_axis_scf_loop for DIIS.");
 
   for (long it = 0; it < cfg.max_iter; ++it) {
 
@@ -244,24 +249,13 @@ inline scgw_result run_scgw_serial(
     dyson_update_A(grid, H_MF_skij, Sigma_x_skij,
                    ReSigma_c_skwij, ImSigma_c_skwij, cfg.eta, A_full_wskij);
 
-    // ---- Mix A. ----
-    // Residual diagnostic ||A_full - A_old||_F is independent of the mix
-    // choice; record it for convergence checks.
+    // ---- Linear mix: A_next = (1 - alpha) * A_old + alpha * A_full.
+    // MEM-agnostic via nda::map.
     const double diff = frobenius_diff(A_wskij, A_full_wskij);
-    if (cfg.mix_kind == scgw_mix_kind::diis) {
-      // DIIS: extrapolate from the residual history, with alpha damping
-      // on the per-history residual contribution.
-      nda::array<ComplexType, 5> A_next(A_wskij.shape());
-      diis.mix(A_wskij, A_full_wskij, cfg.alpha_mix, A_next);
-      A_wskij = A_next;
-    } else {
-      // Linear: A_next = (1 - alpha) * A_old + alpha * A_full.
-      // MEM-agnostic via nda::map.
-      const double a = cfg.alpha_mix;
-      A_wskij = nda::map([a](ComplexType old_v, ComplexType new_v) {
-        return (1.0 - a) * old_v + a * new_v;
-      })(A_wskij, A_full_wskij);
-    }
+    const double a = cfg.alpha_mix;
+    A_wskij = nda::map([a](ComplexType old_v, ComplexType new_v) {
+      return (1.0 - a) * old_v + a * new_v;
+    })(A_wskij, A_full_wskij);
 
     // ---- mu update ----
     if (cfg.update_mu) {

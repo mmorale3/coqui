@@ -62,6 +62,29 @@ inline std::array<long, 4> bosonic_proc_grid(long nproc, long Naux) {
 }
 
 /**
+ * Compute this rank's local (P, Q) block on the standard (gridP, gridQ)
+ * partitioning of Naux x Naux: square_factor_capped + row-major (C-layout)
+ * rank-to-block mapping consistent with make_distributed_array.
+ *
+ * Returns: {P0, NP_loc, Q0, NQ_loc}.
+ */
+inline std::array<long, 4> bosonic_local_block(long nproc, long rank, long Naux) {
+  auto [gridP, gridQ] = square_factor_capped(nproc, Naux);
+  const long iP_block = (rank / gridQ) % gridP;
+  const long iQ_block = rank % gridQ;
+  auto chunk = [](long N, long G, long i) {
+    long base = N / G;
+    long rem  = N % G;
+    long start = i * base + std::min(i, rem);
+    long sz    = base + (i < rem ? 1 : 0);
+    return std::array<long, 2>{start, sz};
+  };
+  auto [P0, NP_loc] = chunk(Naux, gridP, iP_block);
+  auto [Q0, NQ_loc] = chunk(Naux, gridQ, iQ_block);
+  return {P0, NP_loc, Q0, NQ_loc};
+}
+
+/**
  * 4D block size for bosonic dArrays. Picks the largest square block that
  * still leaves at least one full block per rank along each Naux axis.
  */
