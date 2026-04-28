@@ -333,10 +333,12 @@ void real_axis_gw_t::evaluate(real_axis::real_axis_mb_state_t & state,
   ReSigma_out = ComplexType(0.0, 0.0);
 
   // Repack A from (N_w, ns, Nk, nbnd, nbnd) to (ns, Nk, N_w, nbnd, nbnd),
-  // taking only the .real() part. state.A_wskij stores -(i/pi) G^R; the
-  // kernel consumes its real component as the spectral function. Letting
-  // the imag (Re G^R / pi) leak through the cross-correlation conjugate
-  // introduces spurious Kramers-Kronig cross-terms in Im Sigma^c.
+  // taking the matrix-hermitian symmetrization that recovers the physical
+  // matrix-valued spectral function:
+  //
+  //   A_phys_{ij} = 0.5 * (A_wskij_{ij} + conj(A_wskij_{ji}))
+  //
+  // (See the longer comment in real_axis_scr_coulomb_t.h::update_w.)
   nda::array<ComplexType, 5> A(ns, Nk, N_w, nbnd, nbnd);
   for (long s = 0; s < ns; ++s)
     for (long k = 0; k < Nk; ++k)
@@ -344,7 +346,9 @@ void real_axis_gw_t::evaluate(real_axis::real_axis_mb_state_t & state,
         for (long mu = 0; mu < nbnd; ++mu)
           for (long nu = 0; nu < nbnd; ++nu)
             A(s, k, iw, mu, nu) =
-                ComplexType(A_in(iw, s, k, mu, nu).real(), 0.0);
+                ComplexType(0.5, 0.0) *
+                (A_in(iw, s, k, mu, nu)
+                 + std::conj(A_in(iw, s, k, nu, mu)));
 
   // Marshal X(s, k, P, mu).
   nda::array<ComplexType, 4> X(ns, Nk, Naux, nbnd);

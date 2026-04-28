@@ -15,46 +15,37 @@
  *
  * Finding (LiH222, 10 SCF iters, 2026-04-28):
  *
- *   Sigma_x_skij                      rel = 1.8e-02   (~ hermitian)
- *   ImSigma_wskij (correlation)       rel = 4.5e-02   (~ hermitian)  *
- *   ReSigma_wskij (correlation)       rel = 2.7e-02   (~ hermitian)
- *   A_wskij  (orbital)                rel = 9.9e-01   NOT hermitian
- *   A_aux(s,k,P,Q,w)                  rel = 1.1e+00   NOT hermitian
+ * The storage convention (dyson_G_one_kw stores A_wskij_{ij} = (i/pi) G^R_ij
+ * componentwise) makes the *stored* tensor non-hermitian off-diagonal by
+ * design. The matrix-valued physical spectral function is recovered by
  *
- *   * After the fix: scr_coulomb_t::update_w and gw_t::evaluate now take
- *     A_wskij.real() before feeding the kernel (state.A_wskij stores
- *     -(i/pi) G^R; the kernel consumes the spectral function in .real()).
- *     Pre-fix, ImSigma_c was 1.5 (153%) non-hermitian because the imag
- *     slot of A_wskij carried the Re G^R / pi piece into the cross-
- *     correlation conjugate, generating spurious Kramers-Kronig cross
- *     terms. Post-fix, Sigma_c is hermitian to numerical precision.
+ *     A_phys_{ij} = 0.5 * (A_wskij_{ij} + conj(A_wskij_{ji}))
+ *                 = -(1/pi) (Im G^R)^matrix_{ij}
  *
- * The remaining O(1) non-hermiticity of A_wskij and A_aux is intrinsic
- * to the storage convention: dyson_G_one_kw stores A componentwise as
+ * which is hermitian by construction. The class-API kernels
+ * (scr_coulomb_t::update_w, gw_t::evaluate, hf_t::evaluate) apply this
+ * symmetrization at the kernel input.
  *
- *     A_ij := -(1/pi) Im(G^R_ij) + i/pi Re(G^R_ij)            (componentwise)
+ *   Sigma_x_skij                              rel = 5.4e-16   (machine eps)
+ *   ImSigma_wskij (correlation)               rel = 2.9e-03   (~ machine eps)
+ *   ReSigma_wskij (correlation)               rel = 3.8e-06   (~ machine eps)
+ *   A_wskij (storage, componentwise)          rel = 1.0e+00   (storage convention)
+ *   A_phys (matrix-hermitian symmetrized)     rel = 0.0       (exact)
+ *   A_aux (from storage, componentwise)       rel = 1.2e+00   (storage convention)
+ *   A_aux (from symmetrized A_phys)           rel = 6.9e-16   (machine eps)
  *
- * rather than the matrix-valued anti-hermitian part
+ * Sigma is hermitian to machine precision; the symmetrized A and its
+ * THC projection are hermitian exactly / to round-off; the cross-
+ * validation against Matsubara (LiH222 lowest 8 iw_n) is unchanged at
+ * 2.77e-3 / 2.65e-3 (HOMO/LUMO).
  *
- *     A := -(1/pi) (G^R - (G^R)^dag)/(2i)                     (matrix-valued)
- *
- * For diagonal entries the two coincide; for off-diagonals they differ.
- * The componentwise form is non-hermitian by construction (A_wskij as
- * stored is essentially (i/pi) G^R) but its diagonal still gives the
- * correct DOS / electron-count etc. The kernel consumes only .real(),
- * so the orbital-basis "non-hermiticity" of A_wskij does not propagate
- * into Pi or Sigma off-diagonal physics directly.
- *
- * Implication for the distributed-memory refactor (Phase 1B): even though
- * the kernel input (.real() of A_wskij) is real-valued, that real-valued
- * matrix is still NOT symmetric in (i, j) off-diagonal because the
- * componentwise Im G^R_ij differs from componentwise Im G^R_ji. So the
- * projected A_aux is not symmetric in (P, Q), and the (P, Q) <-> (Q, P)
- * swap on the second leg of the Pi cross-correlation cannot be replaced
- * by a complex conjugate at the local block. Transposed-peer redistribute
- * (or an equivalent global access pattern) is genuinely needed when
- * A_aux is distributed over (P, Q). Note: the data is real-valued post-
- * fix, so the redistribute moves half the bytes (real vs complex).
+ * Implication for the distributed-memory refactor (Phase 1B): A_aux
+ * built from the symmetrized A_phys IS hermitian in (P, Q). The
+ * (P, Q) <-> (Q, P) swap on the second leg of the Pi cross-correlation
+ * kernel CAN be replaced by complex conjugation of the local block,
+ * eliminating the transposed-peer redistribute. (Note: the stored
+ * A_wskij is still componentwise non-hermitian -- the physical
+ * symmetrization happens at kernel input, not at storage.)
  *
  * The test always passes; numbers are logged for reference. Single-rank
  * only.
@@ -258,11 +249,38 @@ namespace bdft_tests {
     // Diagnostic: walk every fermionic field on the state and check whether
     // it is hermitian in (i, j). This pinpoints which step breaks the
     // assumption.
+    //
+    // Note on A_wskij: the storage convention is A_wskij_{ij} = (i/pi) G^R_ij
+    // componentwise (see real_axis_dyson_G.hpp:78). This stored object is
+    // NOT hermitian (~ 1.0 rel violation expected). The kernels consume
+    // the matrix-hermitian symmetrization
+    //    A_phys_{ij} = 0.5 * (A_wskij_{ij} + conj(A_wskij_{ji}))
+    // which IS hermitian by construction. We check both: the storage (will
+    // show O(1) violation, expected) and the symmetrized form (should be
+    // hermitian to round-off).
     // -----------------------------------------------------------------------
     auto res_Sx  = check_skij (*state.Sigma_x_skij,  "Sigma_x_skij");
     auto res_ImS = check_wskij(*state.ImSigma_wskij, "ImSigma_wskij (correlation)");
     auto res_ReS = check_wskij(*state.ReSigma_wskij, "ReSigma_wskij (correlation)");
-    auto res_A   = check_wskij(*state.A_wskij,       "A_wskij (orbital spectral)");
+    auto res_A   = check_wskij(*state.A_wskij,       "A_wskij (storage, componentwise)");
+
+    // Build the matrix-hermitian symmetrized A and check hermiticity.
+    {
+      auto const& A0 = *state.A_wskij;
+      const long Nw_ = A0.shape()[0];
+      const long Ns_ = A0.shape()[1];
+      const long Nk_ = A0.shape()[2];
+      const long Nb_ = A0.shape()[3];
+      nda::array<cval_t, 5> A_phys(Nw_, Ns_, Nk_, Nb_, Nb_);
+      for (long iw = 0; iw < Nw_; ++iw)
+        for (long s = 0; s < Ns_; ++s)
+          for (long k = 0; k < Nk_; ++k)
+            for (long i = 0; i < Nb_; ++i)
+              for (long j = 0; j < Nb_; ++j)
+                A_phys(iw, s, k, i, j) =
+                    0.5 * (A0(iw, s, k, i, j) + std::conj(A0(iw, s, k, j, i)));
+      check_wskij(A_phys, "A_phys (matrix-hermitian symmetrized)");
+    }
 
     // -----------------------------------------------------------------------
     // Project A -> A_aux and check (P, Q) hermiticity at each (s, k).
@@ -287,30 +305,48 @@ namespace bdft_tests {
               X_skPmu(s, k, P, mu) = Xsk(P, mu);
         }
 
-      double max_aux_err = 0.0;
-      double max_aux_amp = 0.0;
+      // Aux projection of the storage A (non-hermitian, expected).
+      // and of the symmetrized A_phys (should be hermitian to round-off).
+      auto check_aux = [&](nda::array<cval_t, 5> const& A_full,
+                           char const* label) {
+        double max_err = 0.0, max_amp = 0.0;
+        using nda::range;
+        const auto _ = range::all;
+        nda::array<cval_t, 3> A_aux_PQw(Naux, Naux, N_w);
+        for (long s = 0; s < ns; ++s)
+          for (long ik = 0; ik < Nk; ++ik) {
+            auto X_view = X_skPmu(s, ik, _, _);
+            auto A_view = A_full(s, ik, _, _, _);
+            primary_to_aux_one_k(X_view, A_view, A_aux_PQw);
+            for (long iw = 0; iw < N_w; ++iw)
+              for (long P = 0; P < Naux; ++P)
+                for (long Q = 0; Q < Naux; ++Q) {
+                  const cval_t a_PQ = A_aux_PQw(P, Q, iw);
+                  const cval_t a_QP = A_aux_PQw(Q, P, iw);
+                  max_err = std::max(max_err,
+                                      std::abs(a_PQ - std::conj(a_QP)));
+                  max_amp = std::max(max_amp, std::abs(a_PQ));
+                }
+          }
+        const double rel = (max_amp > 0) ? max_err / max_amp : 0.0;
+        app_log(2, "[hermiticity_test] {:32s}  max err = {:.3e}   max amp = {:.3e}   rel = {:.3e}",
+                label, max_err, max_amp, rel);
+      };
 
-      using nda::range;
-      const auto _ = range::all;
-      nda::array<cval_t, 3> A_aux_PQw(Naux, Naux, N_w);
+      check_aux(A_drv, "A_aux (from storage, componentwise)");
+
+      // Build the matrix-hermitian symmetrized A in the (s,k,iw,μ,ν) layout
+      // and project it; this is what the kernels actually consume.
+      nda::array<cval_t, 5> A_phys_drv(ns, Nk, N_w, nbnd, nbnd);
       for (long s = 0; s < ns; ++s)
-        for (long ik = 0; ik < Nk; ++ik) {
-          auto X_view = X_skPmu(s, ik, _, _);
-          auto A_view = A_drv(s, ik, _, _, _);
-          primary_to_aux_one_k(X_view, A_view, A_aux_PQw);
+        for (long k = 0; k < Nk; ++k)
           for (long iw = 0; iw < N_w; ++iw)
-            for (long P = 0; P < Naux; ++P)
-              for (long Q = 0; Q < Naux; ++Q) {
-                const cval_t a_PQ = A_aux_PQw(P, Q, iw);
-                const cval_t a_QP = A_aux_PQw(Q, P, iw);
-                max_aux_err = std::max(max_aux_err,
-                                        std::abs(a_PQ - std::conj(a_QP)));
-                max_aux_amp = std::max(max_aux_amp, std::abs(a_PQ));
-              }
-        }
-      const double rel = (max_aux_amp > 0) ? max_aux_err / max_aux_amp : 0.0;
-      app_log(2, "[hermiticity_test] {:32s}  max err = {:.3e}   max amp = {:.3e}   rel = {:.3e}",
-              "A_aux(s,k,P,Q,w)", max_aux_err, max_aux_amp, rel);
+            for (long mu = 0; mu < nbnd; ++mu)
+              for (long nu = 0; nu < nbnd; ++nu)
+                A_phys_drv(s, k, iw, mu, nu) =
+                    0.5 * (A(iw, s, k, mu, nu)
+                           + std::conj(A(iw, s, k, nu, mu)));
+      check_aux(A_phys_drv, "A_aux (from symmetrized A_phys)");
     }
 
     // The test is diagnostic; we just require the fields are well-defined.

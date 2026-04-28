@@ -186,13 +186,20 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
   ImW_loc  = ComplexType(0.0, 0.0);
   ReW_loc  = ComplexType(0.0, 0.0);
 
-  // Repack input A from (N_w, ns, nkpts, nbnd, nbnd) to driver layout
-  // (ns, nkpts, N_w, nbnd, nbnd). Take only the .real() part: state.A_wskij
-  // stores -(i/pi) G^R, whose real component is the spectral function the
-  // kernel actually consumes (see real_axis_dyson_G.hpp:78). Letting the
-  // imag (Re G^R / pi) leak through introduces spurious Kramers-Kronig
-  // cross-terms in the cross-correlation and was inconsistent with the
-  // legacy run_scgw_serial path which truncated this way.
+  // Repack A from (N_w, ns, nkpts, nbnd, nbnd) to driver layout
+  // (ns, nkpts, N_w, nbnd, nbnd) and symmetrize into the matrix-hermitian
+  // physical spectral function:
+  //
+  //   A_phys_{ij} = 0.5 * (A_wskij_{ij} + conj(A_wskij_{ji}))
+  //               = -(1/pi) (Im G^R)^matrix_{ij}
+  //
+  // state.A_wskij stores -(i/pi) G^R componentwise, which is NOT hermitian
+  // off-diagonal. The above symmetrization recovers the matrix-valued
+  // hermitian spectral function exactly. Diagonals are unchanged
+  // (.imag(A_wskij_ii) = 0 for the spectral-function-on-diagonal); off-
+  // diagonals pull from both Re and Im of A_wskij. After this, A_aux is
+  // hermitian in (P, Q), and Pi/Sigma kernels see a physically correct
+  // (matrix-hermitian) input.
   nda::array<ComplexType, 5> A(ns, Nk, N_w, nbnd, nbnd);
   for (long s = 0; s < ns; ++s)
     for (long k = 0; k < Nk; ++k)
@@ -200,7 +207,9 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
         for (long mu = 0; mu < nbnd; ++mu)
           for (long nu = 0; nu < nbnd; ++nu)
             A(s, k, iw, mu, nu) =
-                ComplexType(A_in(iw, s, k, mu, nu).real(), 0.0);
+                ComplexType(0.5, 0.0) *
+                (A_in(iw, s, k, mu, nu)
+                 + std::conj(A_in(iw, s, k, nu, mu)));
 
   // Marshal X(s, k, P, mu) from THC reader.
   nda::array<ComplexType, 4> X(ns, Nk, Naux, nbnd);

@@ -108,7 +108,13 @@ public:
       state.Sigma_x_skij = nda::array<ComplexType, 4>(ns, Nk, nbnd, nbnd);
     *state.Sigma_x_skij = ComplexType(0.0, 0.0);
 
-    // Repack A from (N_w, ns, Nk, nbnd, nbnd) to driver layout.
+    // Repack A from (N_w, ns, Nk, nbnd, nbnd) to driver layout, and apply
+    // the matrix-hermitian symmetrization that recovers the physical
+    // matrix-valued spectral function:
+    //
+    //   A_phys_{ij} = 0.5 * (A_wskij_{ij} + conj(A_wskij_{ji}))
+    //
+    // (See the longer comment in real_axis_scr_coulomb_t.h::update_w.)
     nda::array<ComplexType, 5> A_drv(ns, Nk, N_w, nbnd, nbnd);
     for (long s = 0; s < ns; ++s)
       for (long k = 0; k < Nk; ++k)
@@ -116,7 +122,9 @@ public:
           for (long mu_i = 0; mu_i < nbnd; ++mu_i)
             for (long nu = 0; nu < nbnd; ++nu)
               A_drv(s, k, iw, mu_i, nu) =
-                  ComplexType(A_in(iw, s, k, mu_i, nu).real(), 0.0);
+                  ComplexType(0.5, 0.0) *
+                  (A_in(iw, s, k, mu_i, nu)
+                   + std::conj(A_in(iw, s, k, nu, mu_i)));
 
     // Marshal X, V, kmq from THC.
     nda::array<ComplexType, 4> X_skPmu(ns, Nk, Naux, nbnd);
