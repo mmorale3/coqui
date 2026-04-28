@@ -18,6 +18,7 @@
 
 #include "methods/GW_real_axis/real_freq_grid.hpp"
 #include "methods/GW_real_axis/real_axis_thc_project.hpp"
+#include "methods/GW_real_axis/real_axis_proc_grid.hpp"
 
 namespace methods {
 namespace real_axis {
@@ -107,60 +108,86 @@ inline void evaluate_Sigma_x_serial(
       }
     }
 
-  // Step 2: project n to auxiliary basis. Reuse primary_to_aux_one_k by
-  // packaging n as a single-frequency array. Layout convention now has
-  // iw innermost, so the dummy aux array is (Naux, Naux, 1).
+  // Step 2: project n to auxiliary basis using the (P, Q) distribution
+  // pattern: each rank fills only its local (P_loc, Q_loc) block of
+  // n_aux_skPQ via the two-X-views overload of primary_to_aux_one_k.
   using nda::range;
   const auto _ = range::all;
 
-  nda::array<ComplexType, 4> n_aux_skPQ(ns, Nk, Naux, Naux);
+  // Pick the same (P, Q) proc grid used by the bosonic/fermionic kernels.
+  const long nproc = static_cast<long>(comm.size());
+  auto pgrid_PQ = square_factor_capped(nproc, Naux);
+  const long gridP = pgrid_PQ[0];
+  const long gridQ = pgrid_PQ[1];
+  // Determine this rank's (P_loc, Q_loc) block. Convention matches
+  // make_distributed_array's row-major C-layout assignment.
+  const long ip = static_cast<long>(comm.rank());
+  const long iP_block = (ip / gridQ) % gridP;
+  const long iQ_block = ip % gridQ;
+  auto chunk = [](long N, long G, long i) {
+    long base = N / G;
+    long rem  = N % G;
+    long start = i * base + std::min(i, rem);
+    long sz    = base + (i < rem ? 1 : 0);
+    return std::array<long, 2>{start, sz};
+  };
+  auto [P0, NP_loc] = chunk(Naux, gridP, iP_block);
+  auto [Q0, NQ_loc] = chunk(Naux, gridQ, iQ_block);
+  range Pr(P0, P0 + NP_loc);
+  range Qr(Q0, Q0 + NQ_loc);
+
+  nda::array<ComplexType, 4> n_aux_skPQ_loc(ns, Nk, NP_loc, NQ_loc);
   {
     nda::array<ComplexType, 3> n_dummy_munu(1, nbnd, nbnd);
-    nda::array<ComplexType, 3> n_dummy_PQ(Naux, Naux, 1);
+    nda::array<ComplexType, 3> n_dummy_PQ(NP_loc, NQ_loc, 1);
     for (long s = 0; s < ns; ++s)
       for (long k = 0; k < Nk; ++k) {
-        auto X_view = X_skPmu(s, k, _, _);
+        auto X_P_slice = X_skPmu(s, k, Pr, _);
+        auto X_Q_slice = X_skPmu(s, k, Qr, _);
         for (long mu = 0; mu < nbnd; ++mu)
           for (long nu = 0; nu < nbnd; ++nu)
             n_dummy_munu(0, mu, nu) = n_skij(s, k, mu, nu);
-        primary_to_aux_one_k(X_view, n_dummy_munu, n_dummy_PQ);
-        for (long P = 0; P < Naux; ++P)
-          for (long Q = 0; Q < Naux; ++Q)
-            n_aux_skPQ(s, k, P, Q) = n_dummy_PQ(P, Q, 0);
+        primary_to_aux_one_k(X_P_slice, X_Q_slice,
+                             n_dummy_munu, n_dummy_PQ);
+        for (long iP = 0; iP < NP_loc; ++iP)
+          for (long iQ = 0; iQ < NQ_loc; ++iQ)
+            n_aux_skPQ_loc(s, k, iP, iQ) = n_dummy_PQ(iP, iQ, 0);
       }
   }
 
-  // Step 3: for each (s, k), accumulate Sigma_x_aux_PQ(k) =
-  //         -(1/Nq) sum_q V_PQ(q) (Hadamard) n_aux_PQ(k-q),
-  // then back-project to orbital basis. Distributed over (s, k) by rank;
-  // single allreduce on the orbital-basis Sigma_x at the end.
+  // Step 3: each rank accumulates the local (P_loc, Q_loc) block of
+  // SxA(k) = -(1/Nq) sum_q V(q)_local Hadamard n_aux(k-q)_local, then
+  // back-projects to orbital. Single allreduce on Sigma_x_skij at the end.
   Sigma_x_skij = ComplexType(0.0, 0.0);
   {
-    const int rank = comm.rank();
-    const int size = comm.size();
-    const long total_sk = ns * Nk;
-    nda::array<ComplexType, 3> SxA_dummy_PQ(Naux, Naux, 1);
+    nda::array<ComplexType, 3> SxA_dummy_PQ(NP_loc, NQ_loc, 1);
     nda::array<ComplexType, 3> SxA_dummy_munu(1, nbnd, nbnd);
     const double inv_Nq = 1.0 / static_cast<double>(Nq);
-    for (long sk = rank; sk < total_sk; sk += size) {
-      const long s = sk / Nk;
-      const long k = sk % Nk;
-      SxA_dummy_PQ = ComplexType(0.0, 0.0);
-      for (long iq = 0; iq < Nq; ++iq) {
-        if (iq == iq_gamma) continue;
-        const long ikmq = kmq_to_kp(k, iq);
-        for (long P = 0; P < Naux; ++P)
-          for (long Q = 0; Q < Naux; ++Q)
-            SxA_dummy_PQ(P, Q, 0) -=
-                inv_Nq * V_qPQ(iq, P, Q) * n_aux_skPQ(s, ikmq, P, Q);
+    for (long s = 0; s < ns; ++s) {
+      for (long k = 0; k < Nk; ++k) {
+        SxA_dummy_PQ = ComplexType(0.0, 0.0);
+        for (long iq = 0; iq < Nq; ++iq) {
+          if (iq == iq_gamma) continue;
+          const long ikmq = kmq_to_kp(k, iq);
+          for (long iP = 0; iP < NP_loc; ++iP) {
+            const long P = P0 + iP;
+            for (long iQ = 0; iQ < NQ_loc; ++iQ) {
+              const long Q = Q0 + iQ;
+              SxA_dummy_PQ(iP, iQ, 0) -=
+                  inv_Nq * V_qPQ(iq, P, Q) * n_aux_skPQ_loc(s, ikmq, iP, iQ);
+            }
+          }
+        }
+        auto X_P_slice = X_skPmu(s, k, Pr, _);
+        auto X_Q_slice = X_skPmu(s, k, Qr, _);
+        aux_to_primary_one_k(X_P_slice, X_Q_slice,
+                             SxA_dummy_PQ, SxA_dummy_munu);
+        for (long mu = 0; mu < nbnd; ++mu)
+          for (long nu = 0; nu < nbnd; ++nu)
+            Sigma_x_skij(s, k, mu, nu) += SxA_dummy_munu(0, mu, nu);
       }
-      auto X_view = X_skPmu(s, k, _, _);
-      aux_to_primary_one_k(X_view, SxA_dummy_PQ, SxA_dummy_munu);
-      for (long mu = 0; mu < nbnd; ++mu)
-        for (long nu = 0; nu < nbnd; ++nu)
-          Sigma_x_skij(s, k, mu, nu) = SxA_dummy_munu(0, mu, nu);
     }
-    if (size > 1)
+    if (comm.size() > 1)
       comm.all_reduce_in_place_n(Sigma_x_skij.data(), Sigma_x_skij.size(), std::plus<>{});
   }
 }
