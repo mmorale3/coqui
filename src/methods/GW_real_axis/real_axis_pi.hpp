@@ -54,13 +54,21 @@ namespace real_axis {
  *                  ACCUMULATED into (caller zeros first).
  * @param k_weight  weight of this k point in the BZ sum (1/Nk, IBZ stars, etc.)
  */
-template <typename AK, typename AKQ, typename POut>
-inline void accumulate_ImPi_one_kq(real_axis_conv_t & conv,
+template <MEMORY_SPACE MEM = HOST_MEMORY,
+          typename AK, typename AKQ, typename POut>
+inline void accumulate_ImPi_one_kq(detail::real_axis_conv_base_t<MEM> & conv,
                                    AK   const& A_PQ_k,
                                    AKQ  const& A_PQ_kq,
                                    POut      & ImPi_PQ_O,
                                    double k_weight)
 {
+  if constexpr (MEM != HOST_MEMORY) {
+    utils::check(false,
+                 "accumulate_ImPi_one_kq<DEVICE>: device kernels for the "
+                 "weighted A_PQ projection and the auxiliary-index gather "
+                 "are not yet implemented.");
+    return;
+  }
   const long Naux = A_PQ_k.shape()[0];
   const long N_w = A_PQ_k.shape()[2];
   const long N_O = ImPi_PQ_O.shape()[2];
@@ -111,7 +119,7 @@ inline void accumulate_ImPi_one_kq(real_axis_conv_t & conv,
   // Im Pi ~ cross-correlate(Aless_k, Agtr_kq) - cross-correlate(Agtr_k, Aless_kq).
   // Compute each pair's Hhat in time space, sum (with sign) before a single
   // type-2 NUFFT. Saves one type-2 per call vs two cross_correlate calls.
-  using gk = real_axis_conv_t::grid_kind;
+  using gk = grid_kind;
   nda::array<ComplexType, 2> Fless_hat(B, N_t), Fgtr_hat(B, N_t);
   nda::array<ComplexType, 2> Gless_hat(B, N_t), Ggtr_hat(B, N_t);
   conv.forward(Aless_k,  Fless_hat, gk::fermionic);
@@ -144,15 +152,22 @@ inline void accumulate_ImPi_one_kq(real_axis_conv_t & conv,
  * @param ImPi_PQ_O Im Pi for one q (Naux, Naux, N_Omega), real-valued
  * @param RePi_PQ_O OUTPUT Re Pi for one q (Naux, Naux, N_Omega), real-valued
  */
-inline void RePi_from_ImPi(real_axis_conv_t & conv,
-                           nda::array<double, 3> const& ImPi_PQ_O,
-                           nda::array<double, 3>      & RePi_PQ_O)
+template<MEMORY_SPACE MEM = HOST_MEMORY>
+inline void RePi_from_ImPi(detail::real_axis_conv_base_t<MEM> & conv,
+                           memory::array<MEM, double, 3> const& ImPi_PQ_O,
+                           memory::array<MEM, double, 3>      & RePi_PQ_O)
 {
+  if constexpr (MEM != HOST_MEMORY) {
+    utils::check(false,
+                 "RePi_from_ImPi<DEVICE>: device kernel for the (P, Q) "
+                 "<-> batch (B = Naux^2) gather/scatter not yet implemented.");
+    return;
+  }
   const long Naux = ImPi_PQ_O.shape()[0];
   const long N_O = ImPi_PQ_O.shape()[2];
   const long B = Naux * Naux;
 
-  nda::array<double, 2> ImBuf(B, N_O), ReBuf(B, N_O);
+  memory::array<MEM, double, 2> ImBuf(B, N_O), ReBuf(B, N_O);
   for (long P = 0; P < Naux; ++P)
     for (long Q = 0; Q < Naux; ++Q) {
       const long b = P * Naux + Q;
@@ -160,7 +175,7 @@ inline void RePi_from_ImPi(real_axis_conv_t & conv,
         ImBuf(b, iO) = ImPi_PQ_O(P, Q, iO);
     }
 
-  conv.hilbert(ImBuf, ReBuf, real_axis_conv_t::grid_kind::bosonic);
+  conv.hilbert(ImBuf, ReBuf, grid_kind::bosonic);
 
   for (long P = 0; P < Naux; ++P)
     for (long Q = 0; Q < Naux; ++Q) {

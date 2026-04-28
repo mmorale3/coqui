@@ -55,16 +55,22 @@ namespace real_axis {
  * @param kmq_to_kp     (Nk, Nq) BZ index of k-q
  * @param Sigma_x_skij  OUTPUT (ns, Nk, nbnd, nbnd) static exchange self-energy
  */
+template<MEMORY_SPACE MEM = HOST_MEMORY>
 inline void evaluate_Sigma_x_serial(
     boost::mpi3::communicator        & comm,
     real_freq_grid_t            const& grid,
-    nda::array<ComplexType, 5>  const& A_skwij,
-    nda::array<ComplexType, 4>  const& X_skPmu,
-    nda::array<ComplexType, 3>  const& V_qPQ,
-    nda::array<long, 2>         const& kmq_to_kp,
-    nda::array<ComplexType, 4>       & Sigma_x_skij,
+    memory::array<MEM, ComplexType, 5> const& A_skwij,
+    memory::array<MEM, ComplexType, 4> const& X_skPmu,
+    memory::array<MEM, ComplexType, 3> const& V_qPQ,
+    nda::array<long, 2>                const& kmq_to_kp,
+    memory::array<MEM, ComplexType, 4>       & Sigma_x_skij,
     long iq_gamma = -1)
 {
+  static_assert(MEM == HOST_MEMORY,
+                "evaluate_Sigma_x_serial<DEVICE>: device-side allocation is "
+                "MEM-aware but the inner element-wise loops over (s, k, q, "
+                "P, Q, w) (Sigma_x = -V * n_aux) are still host-only. The "
+                "Hadamard product is a single nda::map call once devicified.");
   const long ns    = A_skwij.shape()[0];
   const long Nk    = A_skwij.shape()[1];
   const long N_w   = A_skwij.shape()[2];

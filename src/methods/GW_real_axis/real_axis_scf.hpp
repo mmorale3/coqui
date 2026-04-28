@@ -102,27 +102,32 @@ struct scgw_result {
  * mean-field spectral function); however if A_wskij is empty/zero, the
  * routine builds a Lorentzian initial A from H_MF and grid.eta.
  */
+template<MEMORY_SPACE MEM = HOST_MEMORY>
 inline scgw_result run_scgw_serial(
     boost::mpi3::communicator        & comm,
     real_freq_grid_t            const& grid_in,
-    nda::array<ComplexType, 4>  const& H_MF_skij,
-    nda::array<ComplexType, 4>  const& X_skPmu,
-    nda::array<ComplexType, 3>  const& V_qPQ,
-    nda::array<long, 2>         const& kpq_to_kp,
-    nda::array<long, 2>         const& kmq_to_kp,
-    nda::array<double, 1>       const& q_weights,
-    nda::array<double, 1>       const& k_weights,
-    double                             N_elec,
-    scgw_config                 const& cfg,
-    nda::array<ComplexType, 5>       & A_wskij,
-    nda::array<ComplexType, 4>       & Sigma_x_skij,
-    nda::array<ComplexType, 5>       & ImSigma_c_skwij,
-    nda::array<ComplexType, 5>       & ReSigma_c_skwij,
-    nda::array<ComplexType, 2>  const& f_Rk = nda::array<ComplexType,2>{},
-    nda::array<ComplexType, 2>  const& f_qR = nda::array<ComplexType,2>{},
-    nda::array<ComplexType, 2>  const& f_Rq = nda::array<ComplexType,2>{},
-    nda::array<ComplexType, 2>  const& f_kR = nda::array<ComplexType,2>{})
+    memory::array<MEM, ComplexType, 4> const& H_MF_skij,
+    memory::array<MEM, ComplexType, 4> const& X_skPmu,
+    memory::array<MEM, ComplexType, 3> const& V_qPQ,
+    nda::array<long, 2>                const& kpq_to_kp,
+    nda::array<long, 2>                const& kmq_to_kp,
+    nda::array<double, 1>              const& q_weights,
+    nda::array<double, 1>              const& k_weights,
+    double                                    N_elec,
+    scgw_config                        const& cfg,
+    memory::array<MEM, ComplexType, 5>       & A_wskij,
+    memory::array<MEM, ComplexType, 4>       & Sigma_x_skij,
+    memory::array<MEM, ComplexType, 5>       & ImSigma_c_skwij,
+    memory::array<MEM, ComplexType, 5>       & ReSigma_c_skwij,
+    memory::array<MEM, ComplexType, 2> const& f_Rk = memory::array<MEM, ComplexType, 2>{},
+    memory::array<MEM, ComplexType, 2> const& f_qR = memory::array<MEM, ComplexType, 2>{},
+    memory::array<MEM, ComplexType, 2> const& f_Rq = memory::array<MEM, ComplexType, 2>{},
+    memory::array<MEM, ComplexType, 2> const& f_kR = memory::array<MEM, ComplexType, 2>{})
 {
+  static_assert(MEM == HOST_MEMORY,
+                "run_scgw_serial<DEVICE>: gated on host pending device "
+                "support in evaluate_serial / evaluate_Sigma_x_serial / "
+                "the DIIS mixer / dyson_update_A / find_mu_chem.");
   const long ns   = H_MF_skij.shape()[0];
   const long Nk   = H_MF_skij.shape()[1];
   const long nbnd = H_MF_skij.shape()[2];

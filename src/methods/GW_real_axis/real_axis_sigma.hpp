@@ -84,14 +84,22 @@ inline void resample_bosonic_to_fermionic(real_freq_grid_t const& grid,
  * @param ImSigma_PQ_w  (Naux, Naux, N_w) accumulated output
  * @param q_weight      weight of this q point
  */
-template <typename AKMQ, typename BQ, typename SOut>
+template <MEMORY_SPACE MEM = HOST_MEMORY,
+          typename AKMQ, typename BQ, typename SOut>
 inline void accumulate_ImSigma_one_kq_nufft(
-    real_axis_conv_t & conv,
+    detail::real_axis_conv_base_t<MEM> & conv,
     AKMQ const& A_PQ_kmq,
     BQ   const& B_PQ_q,
     SOut      & ImSigma_PQ_w,
     double q_weight)
 {
+  if constexpr (MEM != HOST_MEMORY) {
+    utils::check(false,
+                 "accumulate_ImSigma_one_kq_nufft<DEVICE>: device kernels "
+                 "for the inner f / n_B weighting and Sigma accumulation "
+                 "are not yet implemented.");
+    return;
+  }
   const long Naux = A_PQ_kmq.shape()[0];
   const long N_w  = A_PQ_kmq.shape()[2];
   const long B    = Naux * Naux;
@@ -138,7 +146,7 @@ inline void accumulate_ImSigma_one_kq_nufft(
   // Im Sigma ~ convolve(F1, G1) + convolve(F2, G2). Compute each pair's
   // Hhat in time space, sum (no conjugates for convolve), then a single
   // type-2 NUFFT. Saves one type-2 per call vs two convolve calls.
-  using gk = real_axis_conv_t::grid_kind;
+  using gk = grid_kind;
   nda::array<ComplexType, 2> F1hat(B, N_t), G1hat(B, N_t);
   nda::array<ComplexType, 2> F2hat(B, N_t), G2hat(B, N_t);
   conv.forward(F1, F1hat, gk::fermionic);
@@ -192,13 +200,21 @@ inline void accumulate_ImSigma_one_kq_nufft(
  * @param ImSigma_PQ_w  OUTPUT (Naux, Naux, N_w) accumulated Im Sigma at this k
  * @param q_weight      weight of this q point
  */
-template <typename AKMQ, typename BQ, typename SOut>
-inline void accumulate_ImSigma_one_kq(real_axis_conv_t & conv,
+template <MEMORY_SPACE MEM = HOST_MEMORY,
+          typename AKMQ, typename BQ, typename SOut>
+inline void accumulate_ImSigma_one_kq(detail::real_axis_conv_base_t<MEM> & conv,
                                       AKMQ const& A_PQ_kmq,
                                       BQ   const& B_PQ_q,
                                       SOut      & ImSigma_PQ_w,
                                       double q_weight)
 {
+  if constexpr (MEM != HOST_MEMORY) {
+    utils::check(false,
+                 "accumulate_ImSigma_one_kq<DEVICE>: device kernel for the "
+                 "direct-quadrature implementation not yet implemented "
+                 "(prefer the NUFFT variant on device).");
+    return;
+  }
   const long Naux = A_PQ_kmq.shape()[0];
   const long N_w  = A_PQ_kmq.shape()[2];
   const long N_O  = B_PQ_q.shape()[2];
@@ -283,16 +299,23 @@ inline void accumulate_ImSigma_one_kq(real_axis_conv_t & conv,
  * Im part through .real() of the input ComplexType and write back into the
  * .real() of the output, leaving the imaginary slot unused.
  */
-template <typename AIn, typename AOut>
-inline void ReSigma_from_ImSigma_aux(real_axis_conv_t & conv,
+template <MEMORY_SPACE MEM = HOST_MEMORY,
+          typename AIn, typename AOut>
+inline void ReSigma_from_ImSigma_aux(detail::real_axis_conv_base_t<MEM> & conv,
                                      AIn  const& ImSigma_PQ_w,
                                      AOut      & ReSigma_PQ_w)
 {
+  if constexpr (MEM != HOST_MEMORY) {
+    utils::check(false,
+                 "ReSigma_from_ImSigma_aux<DEVICE>: device kernel for the "
+                 "(P,Q) <-> batch gather/scatter not yet implemented.");
+    return;
+  }
   const long Naux = ImSigma_PQ_w.shape()[0];
   const long N_w  = ImSigma_PQ_w.shape()[2];
   const long B = Naux * Naux;
 
-  nda::array<double, 2> ImBuf(B, N_w), ReBuf(B, N_w);
+  memory::array<MEM, double, 2> ImBuf(B, N_w), ReBuf(B, N_w);
   for (long P = 0; P < Naux; ++P)
     for (long Q = 0; Q < Naux; ++Q) {
       const long b = P * Naux + Q;
@@ -300,7 +323,7 @@ inline void ReSigma_from_ImSigma_aux(real_axis_conv_t & conv,
         ImBuf(b, l) = ImSigma_PQ_w(P, Q, l).real();
     }
 
-  conv.hilbert(ImBuf, ReBuf, real_axis_conv_t::grid_kind::fermionic);
+  conv.hilbert(ImBuf, ReBuf, grid_kind::fermionic);
 
   for (long P = 0; P < Naux; ++P)
     for (long Q = 0; Q < Naux; ++Q) {

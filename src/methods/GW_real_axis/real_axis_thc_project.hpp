@@ -46,11 +46,20 @@ namespace real_axis {
  * Cost: 2 BLAS-3 GEMMs (totaling 2 * N_w * Naux * nbnd * (nbnd + Naux) FLOPs)
  * plus two element permutations of total size O(N_w * Naux * (nbnd + Naux)).
  */
-template <typename XK, typename AIn, typename AOut>
+template <MEMORY_SPACE MEM = HOST_MEMORY,
+          typename XK, typename AIn, typename AOut>
 inline void primary_to_aux_one_k(XK   const& X_kPmu,
                                  AIn  const& A_wmunu,
                                  AOut      & A_aux_PQw)
 {
+  if constexpr (MEM != HOST_MEMORY) {
+    utils::check(false,
+                 "primary_to_aux_one_k<DEVICE>: device kernels for the "
+                 "two intermediate (mu,iw,nu)<->(P,iw,nu) permutations "
+                 "not yet implemented. The two GEMMs themselves go through "
+                 "cuBLAS automatically once arrays are device-allocated.");
+    return;
+  }
   const long Naux = X_kPmu.shape()[0];
   const long nbnd = X_kPmu.shape()[1];
   const long N_w  = A_wmunu.shape()[0];
@@ -109,11 +118,19 @@ inline void primary_to_aux_one_k(XK   const& X_kPmu,
  * @param M_aux_PQw  (Naux, Naux, N_w) auxiliary quantity (iw innermost).
  * @param M_wmunu    OUTPUT (N_w, nbnd, nbnd) orbital-basis quantity.
  */
-template <typename XK, typename MIn, typename MOut>
+template <MEMORY_SPACE MEM = HOST_MEMORY,
+          typename XK, typename MIn, typename MOut>
 inline void aux_to_primary_one_k(XK   const& X_kPmu,
                                  MIn  const& M_aux_PQw,
                                  MOut      & M_wmunu)
 {
+  if constexpr (MEM != HOST_MEMORY) {
+    utils::check(false,
+                 "aux_to_primary_one_k<DEVICE>: device kernels for the "
+                 "two intermediate (P,Q,iw)<->(P,iw,Q) and (mu,iw,nu)<->"
+                 "(iw,mu,nu) permutations not yet implemented.");
+    return;
+  }
   const long Naux = X_kPmu.shape()[0];
   const long nbnd = X_kPmu.shape()[1];
   const long N_w  = M_wmunu.shape()[0];

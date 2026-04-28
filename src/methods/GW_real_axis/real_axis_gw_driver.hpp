@@ -75,24 +75,33 @@ namespace real_axis {
  * partitioning + reductions land in subsequent steps. Multi-rank runs
  * therefore produce identical results on every rank.
  */
+template<MEMORY_SPACE MEM = HOST_MEMORY>
 inline void evaluate_serial(boost::mpi3::communicator& comm,
                             real_freq_grid_t const& grid,
-                            nda::array<ComplexType, 5> const& A_skwij,
-                            nda::array<ComplexType, 4> const& X_skPmu,
-                            nda::array<ComplexType, 3> const& V_qPQ,
-                            nda::array<long, 2>        const& kpq_to_kp,
-                            nda::array<long, 2>        const& kmq_to_kp,
-                            nda::array<double, 1>      const& q_weights,
-                            nda::array<ComplexType, 5> & ImSigma_c_skwij,
-                            nda::array<ComplexType, 5> & ReSigma_c_skwij,
+                            memory::array<MEM, ComplexType, 5> const& A_skwij,
+                            memory::array<MEM, ComplexType, 4> const& X_skPmu,
+                            memory::array<MEM, ComplexType, 3> const& V_qPQ,
+                            nda::array<long, 2>                const& kpq_to_kp,
+                            nda::array<long, 2>                const& kmq_to_kp,
+                            nda::array<double, 1>              const& q_weights,
+                            memory::array<MEM, ComplexType, 5>       & ImSigma_c_skwij,
+                            memory::array<MEM, ComplexType, 5>       & ReSigma_c_skwij,
                             double eps_nufft = 1e-10,
                             long iq_gamma = -1,
                             bool verbose = false,
-                            nda::array<ComplexType, 2> const& f_Rk = nda::array<ComplexType,2>{},
-                            nda::array<ComplexType, 2> const& f_qR = nda::array<ComplexType,2>{},
-                            nda::array<ComplexType, 2> const& f_Rq = nda::array<ComplexType,2>{},
-                            nda::array<ComplexType, 2> const& f_kR = nda::array<ComplexType,2>{})
+                            memory::array<MEM, ComplexType, 2> const& f_Rk = memory::array<MEM, ComplexType, 2>{},
+                            memory::array<MEM, ComplexType, 2> const& f_qR = memory::array<MEM, ComplexType, 2>{},
+                            memory::array<MEM, ComplexType, 2> const& f_Rq = memory::array<MEM, ComplexType, 2>{},
+                            memory::array<MEM, ComplexType, 2> const& f_kR = memory::array<MEM, ComplexType, 2>{})
 {
+  static_assert(MEM == HOST_MEMORY,
+                "evaluate_serial<DEVICE>: device-side instantiation is not yet "
+                "supported. The conv engine, the (cu)FINUFFT plan layer, and "
+                "the kernel signatures are MEM-aware, but the per-element "
+                "loops inside this driver (Step 4 Dyson Pi assembly, Step 5 "
+                "B = -Im W / pi, Step 7 Hilbert pack/unpack, output repack) "
+                "are still host-only. Replace those with device kernels (or "
+                "to_host round-trips) to enable the device path.");
   // Phase-2 R-space options.
   //  - Step 2 (Im Pi) runs in R-space when f_Rk (NR, Nk) and f_qR (Nq, NR)
   //    are supplied. Identity: with the kernel's (P,Q)<->(Q,P) swap on the

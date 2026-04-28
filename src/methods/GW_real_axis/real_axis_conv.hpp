@@ -24,8 +24,23 @@
 namespace methods {
 namespace real_axis {
 
+/// Frequency-grid identifier: which set of (cu)FINUFFT plans to use. Lifted
+/// to namespace level since it's independent of the conv-engine memory space.
+enum class grid_kind { fermionic, bosonic };
+
+namespace detail {
+
 /**
  * NUFFT-based convolution and Hilbert-transform engine for real-axis GW.
+ *
+ * Templated on MEMORY_SPACE MEM. The internal storage and the underlying
+ * (cu)FINUFFT plan live in MEM. For MEM == HOST_MEMORY (the default via the
+ * `real_axis_conv_t` alias) the engine uses FINUFFT and host arrays; for
+ * MEM == DEVICE_MEMORY it uses cuFINUFFT and device (cuarray) storage.
+ *
+ * Existing callers that name `real_axis_conv_t` directly continue to bind
+ * to the host instantiation. Future device callers should use
+ * `real_axis_conv_mem_t<DEVICE_MEMORY>`.
  *
  * The grid pair consists of a non-uniform frequency grid {w_j} and a uniform
  * conjugate "time" grid {t_k = (k - N_t/2) * dt, k=0..N_t-1, dt=T_window/N_t}.
@@ -56,13 +71,20 @@ namespace real_axis {
  * uses the FINUFFT internal threading). Higher-level parallelism over
  * (k, q) batches is the responsibility of the caller.
  */
-class real_axis_conv_t {
+template<MEMORY_SPACE MEM = HOST_MEMORY>
+class real_axis_conv_base_t {
 public:
 
-  using cval_t = std::complex<double>;
+  static constexpr MEMORY_SPACE memory_space = MEM;
 
-  /// Frequency-grid identifier: which set of FINUFFT plans to use.
-  enum class grid_kind { fermionic, bosonic };
+  using cval_t = std::complex<double>;
+  template<int N> using array_t      = memory::array<MEM, cval_t, N>;
+  template<int N> using rarray_t     = memory::array<MEM, double, N>;
+  using plan_t                       = math::nda::nufft_t<MEM>;
+  // grid_kind is the namespace-level enum, re-exposed here for backward
+  // compatibility with the previous nested-enum API
+  // `real_axis_conv_t::grid_kind::fermionic`.
+  using grid_kind                    = methods::real_axis::grid_kind;
 
   /// Construct from a real_freq_grid_t. Stores a non-owning reference to it.
   /// Builds two type-1 plans (fermionic, bosonic) and two type-2 plans
@@ -77,40 +99,59 @@ public:
   /// @param ntrans  maximum simultaneous transforms; must be >= the largest
   ///                "leading" dimension passed to cross_correlate / hilbert.
   /// @param eps     FINUFFT accuracy tolerance
-  real_axis_conv_t(real_freq_grid_t const& grid, long ntrans = 1,
-                   double eps = 1e-10)
+  real_axis_conv_base_t(real_freq_grid_t const& grid, long ntrans = 1,
+                        double eps = 1e-10)
     : _grid(&grid)
     , _ntrans(ntrans)
     , _eps(eps)
   {
-    utils::check(_ntrans >= 1, "real_axis_conv_t: ntrans must be >= 1.");
+    utils::check(_ntrans >= 1, "real_axis_conv_base_t: ntrans must be >= 1.");
 
     const long N_t = grid.N_t();
     const long N_w = grid.N_w();
     const long N_Omega = grid.N_Omega();
     const double dt = grid.dt();
 
-    // Scaled coordinates x = w * dt for FINUFFT (must lie in [-pi, pi]).
-    _x_w = nda::array<double,1>(N_w);
-    for (long j = 0; j < N_w; ++j)
-      _x_w(j) = grid.w()(j) * dt;
-    _x_Omega = nda::array<double,1>(N_Omega);
-    for (long l = 0; l < N_Omega; ++l)
-      _x_Omega(l) = grid.Omega()(l) * dt;
+    // Scaled coordinates x = w * dt for (cu)FINUFFT (must lie in [-pi, pi]).
+    // Built on host first, then promoted to MEM (a no-op for HOST_MEMORY).
+    nda::array<double, 1> x_w_host(N_w);
+    for (long j = 0; j < N_w; ++j) x_w_host(j) = grid.w()(j) * dt;
+    nda::array<double, 1> x_O_host(N_Omega);
+    for (long l = 0; l < N_Omega; ++l) x_O_host(l) = grid.Omega()(l) * dt;
+
+    if constexpr (MEM == HOST_MEMORY) {
+      _x_w = std::move(x_w_host);
+      _x_Omega = std::move(x_O_host);
+    } else {
+      _x_w     = memory::to_memory_space<MEM>(x_w_host);
+      _x_Omega = memory::to_memory_space<MEM>(x_O_host);
+    }
 
     // Plans use iflag=+1: type-1 sums  exp(+i * x_j * k_int) per finufft conv
     // (where k_int is the integer mode index that we re-interpret as t_k).
-    // The mathematical interpretation is f_hat(t_k) = sum_j c_j exp(+i*w_j*t_k)
-    // under the identification t_k = k_int * dt (after the symmetric shift).
     const std::array<int64_t,1> nm = { N_t };
 
-    _plan_w = std::make_unique<math::nda::nufft>(
+    _plan_w = std::make_unique<plan_t>(
         nm, N_w, _ntrans, _eps, math::nufft::NUFFT_FORWARD);
     _plan_w->setpts(_x_w);
 
-    _plan_Omega = std::make_unique<math::nda::nufft>(
+    _plan_Omega = std::make_unique<plan_t>(
         nm, N_Omega, _ntrans, _eps, math::nufft::NUFFT_FORWARD);
     _plan_Omega->setpts(_x_Omega);
+
+    // Pre-build the Hilbert-kernel sgn(t_k) array as i*sgn(t_k) in MEM.
+    // The internal mode index k_int = 0..N_t-1 corresponds to physical
+    // t_k = (k_int - N_t/2) * dt, so sgn(t_k) = +1 for k_int > N_t/2,
+    // -1 for k_int < N_t/2, and 0 at k_int = N_t/2.
+    nda::array<cval_t, 1> sgn_host(N_t);
+    for (long k = 0; k < N_t; ++k) {
+      double s = (k > N_t/2 ? +1.0 : (k < N_t/2 ? -1.0 : 0.0));
+      sgn_host(k) = cval_t(0.0, s);   // i*sgn(t_k)
+    }
+    if constexpr (MEM == HOST_MEMORY)
+      _sgn_t = std::move(sgn_host);
+    else
+      _sgn_t = memory::to_memory_space<MEM>(sgn_host);
   }
 
   long N_t()      const { return _grid->N_t(); }
@@ -141,9 +182,9 @@ public:
    * @param src  source frequency grid kind
    * @param dst  destination frequency grid kind
    */
-  void cross_correlate(nda::array<cval_t,2> const& F_in,
-                       nda::array<cval_t,2> const& G_in,
-                       nda::array<cval_t,2> & H,
+  void cross_correlate(array_t<2> const& F_in,
+                       array_t<2> const& G_in,
+                       array_t<2> & H,
                        grid_kind src,
                        grid_kind dst)
   {
@@ -159,55 +200,43 @@ public:
     utils::check(H.shape()[0] == B and H.shape()[1] == N_dst,
                  "cross_correlate: H shape mismatch");
     utils::check(B <= _ntrans,
-                 "cross_correlate: B={} > ntrans={}; rebuild engine with larger ntrans",
-                 B, _ntrans);
+                 "cross_correlate: B={} > ntrans={}", B, _ntrans);
 
-    // Make weighted local copies. Both F and G must carry quadrature weights
-    // because each is independently FT'd (the cross-correlation is a single
-    // integral over w but the Fourier-space implementation transforms each
-    // factor separately and multiplies in conjugate-time space).
-    auto const& wq = (src == grid_kind::fermionic
-                      ? _grid->w_weights() : _grid->Omega_weights());
-    nda::array<cval_t,2> F(B, N_src), G(B, N_src);
-    for (long b = 0; b < B; ++b)
-      for (long j = 0; j < N_src; ++j) {
-        F(b, j) = F_in(b, j) * wq(j);
-        G(b, j) = G_in(b, j) * wq(j);
-      }
+    if constexpr (MEM != HOST_MEMORY) {
+      // TODO: device kernels for weight application + Hadamard product.
+      // The host body below uses straight 2D loops; on device this becomes
+      // either a per-row gemv-style scaling + per-element conj()*mul, or a
+      // single fused kernel. The (cu)FINUFFT plan calls already work in
+      // both spaces.
+      utils::check(false,
+                   "real_axis_conv_base_t<DEVICE>::cross_correlate: device "
+                   "kernels for the inner Hadamard loops are not yet implemented.");
+    } else {
+      auto const& wq = (src == grid_kind::fermionic
+                        ? _grid->w_weights() : _grid->Omega_weights());
+      array_t<2> F(B, N_src), G(B, N_src);
+      for (long b = 0; b < B; ++b)
+        for (long j = 0; j < N_src; ++j) {
+          F(b, j) = F_in(b, j) * wq(j);
+          G(b, j) = G_in(b, j) * wq(j);
+        }
 
-    // Fhat, Ghat live on the uniform t-grid. Allocate per-call (small).
-    nda::array<cval_t,2> Fhat(B, N_t_);
-    nda::array<cval_t,2> Ghat(B, N_t_);
+      array_t<2> Fhat(B, N_t_);
+      array_t<2> Ghat(B, N_t_);
+      run_forward(F, Fhat, src, B);
+      run_forward(G, Ghat, src, B);
 
-    run_forward(F, Fhat, src, B);
-    run_forward(G, Ghat, src, B);
+      array_t<2> Hhat(B, N_t_);
+      for (long b = 0; b < B; ++b)
+        for (long k = 0; k < N_t_; ++k)
+          Hhat(b, k) = std::conj(Fhat(b, k)) * Ghat(b, k);
 
-    // H_hat(t_k) = conj(Fhat(t_k)) * Ghat(t_k), with the time-shift phase
-    // factor that compensates the symmetric shift of the t-grid.
-    // Internal NUFFT mode index k_int = 0..N_t-1 corresponds to physical
-    // t_k = (k_int - N_t/2) * dt. The forward NUFFT yields
-    //   sum_j c_j exp(+i * x_j * k_int) = sum_j c_j exp(+i*w_j*(k_int*dt))
-    // i.e., F_hat at virtual time k_int*dt, NOT at the shifted t_k.
-    // We absorb the shift e^{+i w_max_shift t} after the type-2 to recover
-    // the physical-time interpretation. Equivalently, multiply Fhat and Ghat
-    // by exp(+i * w_offset * t) factors in time -- but since we only need
-    // their product, the time-shift phase factors cancel for cross_correlate
-    // when src==same. We therefore apply NO shift here for cross_correlate.
-    nda::array<cval_t,2> Hhat(B, N_t_);
-    for (long b = 0; b < B; ++b)
-      for (long k = 0; k < N_t_; ++k)
-        Hhat(b, k) = std::conj(Fhat(b, k)) * Ghat(b, k);
+      array_t<2> Hraw(B, N_dst);
+      run_backward(Hhat, Hraw, dst, B);
 
-    nda::array<cval_t,2> Hraw(B, N_dst);
-    run_backward(Hhat, Hraw, dst, B);
-
-    // Final scaling: dt/(2*pi).  This converts the discrete sum
-    //   (1/N_t) sum_k Hhat_k exp(-i Omega t_k)  ~  (1/(2pi)) int dt
-    // when N_t * dt = T_window, so dt = 2pi/(N_t * (2pi/T)) and the
-    // appropriate trapezoidal weight per t-sample is dt. The 1/(2pi) is
-    // the inverse-FT normalization. We do NOT divide by N_t.
-    const double s = _grid->dt() / (2.0 * M_PI);
-    H = s * Hraw;
+      const double s = _grid->dt() / (2.0 * M_PI);
+      H = s * Hraw;
+    }
   }
 
   /**
@@ -223,9 +252,9 @@ public:
    * @param H     (B, N_grid) output H, OVERWRITTEN
    * @param kind  frequency grid (same source and destination)
    */
-  void convolve(nda::array<cval_t,2> const& F_in,
-                nda::array<cval_t,2> const& G_in,
-                nda::array<cval_t,2> & H,
+  void convolve(array_t<2> const& F_in,
+                array_t<2> const& G_in,
+                array_t<2> & H,
                 grid_kind kind)
   {
     const long B    = F_in.shape()[0];
@@ -241,29 +270,35 @@ public:
     utils::check(B <= _ntrans,
                  "convolve: B={} > ntrans={}", B, _ntrans);
 
-    auto const& wq = (kind == grid_kind::fermionic
-                      ? _grid->w_weights() : _grid->Omega_weights());
-    nda::array<cval_t,2> F(B, N), G(B, N);
-    for (long b = 0; b < B; ++b)
-      for (long j = 0; j < N; ++j) {
-        F(b, j) = F_in(b, j) * wq(j);
-        G(b, j) = G_in(b, j) * wq(j);
-      }
+    if constexpr (MEM != HOST_MEMORY) {
+      utils::check(false,
+                   "real_axis_conv_base_t<DEVICE>::convolve: device kernels "
+                   "for the inner Hadamard loops are not yet implemented.");
+    } else {
+      auto const& wq = (kind == grid_kind::fermionic
+                        ? _grid->w_weights() : _grid->Omega_weights());
+      array_t<2> F(B, N), G(B, N);
+      for (long b = 0; b < B; ++b)
+        for (long j = 0; j < N; ++j) {
+          F(b, j) = F_in(b, j) * wq(j);
+          G(b, j) = G_in(b, j) * wq(j);
+        }
 
-    nda::array<cval_t,2> Fhat(B, N_t_), Ghat(B, N_t_);
-    run_forward(F, Fhat, kind, B);
-    run_forward(G, Ghat, kind, B);
+      array_t<2> Fhat(B, N_t_), Ghat(B, N_t_);
+      run_forward(F, Fhat, kind, B);
+      run_forward(G, Ghat, kind, B);
 
-    // Convolution: NO conjugate on F_hat.
-    nda::array<cval_t,2> Hhat(B, N_t_);
-    for (long b = 0; b < B; ++b)
-      for (long k = 0; k < N_t_; ++k)
-        Hhat(b, k) = Fhat(b, k) * Ghat(b, k);
+      // Convolution: NO conjugate on F_hat.
+      array_t<2> Hhat(B, N_t_);
+      for (long b = 0; b < B; ++b)
+        for (long k = 0; k < N_t_; ++k)
+          Hhat(b, k) = Fhat(b, k) * Ghat(b, k);
 
-    nda::array<cval_t,2> Hraw(B, N);
-    run_backward(Hhat, Hraw, kind, B);
-    const double s = _grid->dt() / (2.0 * M_PI);
-    H = s * Hraw;
+      array_t<2> Hraw(B, N);
+      run_backward(Hhat, Hraw, kind, B);
+      const double s = _grid->dt() / (2.0 * M_PI);
+      H = s * Hraw;
+    }
   }
 
   /**
@@ -281,8 +316,8 @@ public:
    * @param ReX  [OUTPUT] real-valued real part, shape (B, N_grid).
    * @param kind frequency grid (same source and destination).
    */
-  void hilbert(nda::array<double,2> const& ImX_in,
-               nda::array<double,2> & ReX_w,
+  void hilbert(rarray_t<2> const& ImX_in,
+               rarray_t<2> & ReX_w,
                grid_kind kind)
   {
     const long B = ImX_in.shape()[0];
@@ -295,50 +330,37 @@ public:
     utils::check(ReX_w.shape()[0] == B and ReX_w.shape()[1] == N_grid,
                  "hilbert: ReX shape mismatch");
 
-    // Promote real input to complex for the NUFFT, applying quadrature
-    // weights as we go (the Hilbert transform is an integral over w').
-    auto const& wq = (kind == grid_kind::fermionic
-                      ? _grid->w_weights() : _grid->Omega_weights());
-    nda::array<cval_t,2> C(B, N_grid);
-    for (long b = 0; b < B; ++b)
-      for (long j = 0; j < N_grid; ++j)
-        C(b, j) = cval_t(ImX_in(b, j) * wq(j), 0.0);
+    if constexpr (MEM != HOST_MEMORY) {
+      utils::check(false,
+                   "real_axis_conv_base_t<DEVICE>::hilbert: device kernels "
+                   "for the inner sgn(t)-multiply and weight-application "
+                   "loops are not yet implemented. _sgn_t is already in "
+                   "MEM-space, so the device port is mostly a single fused "
+                   "kernel: Hhat(b, k) = _sgn_t(k) * Chat(b, k).");
+    } else {
+      auto const& wq = (kind == grid_kind::fermionic
+                        ? _grid->w_weights() : _grid->Omega_weights());
+      array_t<2> C(B, N_grid);
+      for (long b = 0; b < B; ++b)
+        for (long j = 0; j < N_grid; ++j)
+          C(b, j) = cval_t(ImX_in(b, j) * wq(j), 0.0);
 
-    nda::array<cval_t,2> Chat(B, N_t_);
-    run_forward(C, Chat, kind, B);
+      array_t<2> Chat(B, N_t_);
+      run_forward(C, Chat, kind, B);
 
-    // Multiply by -i * sgn(t_k). The internal mode index k_int = 0..N_t-1
-    // corresponds to physical t_k = (k_int - N_t/2) * dt. Therefore
-    // sgn(t_k) is positive for k_int > N_t/2, negative for k_int < N_t/2,
-    // and the boundary value at k_int == N_t/2 (t=0) is set to 0. But
-    // FINUFFT internally indexes from -N_t/2 to N_t/2-1, NOT 0..N_t-1.
-    // We need to be careful here: the output Chat(b, k_int) corresponds to
-    // mode index k = k_int - N_t/2 in finufft's convention, which IS the
-    // physical t_k = k * dt. So sgn(t_k) is positive for k_int >= N_t/2 + 1,
-    // zero at k_int == N_t/2, and negative for k_int < N_t/2.
-    // Wait: with a symmetric grid t_k = (k_int - N_t/2) * dt, the value at
-    // k_int = N_t/2 is t=0 with sgn=0; for k_int < N_t/2, t<0 (negative),
-    // sgn = -1; for k_int > N_t/2, t>0, sgn = +1.
-    // Hilbert kernel multiplier: with our convention F̂(t) = ∫f(w)exp(+iwt)dw,
-    // (Hf)^(t) = +i sgn(t) F̂(t), where t_k = (k - N_t/2) * dt.
-    nda::array<cval_t,2> Hhat(B, N_t_);
-    for (long b = 0; b < B; ++b) {
-      for (long k = 0; k < N_t_; ++k) {
-        double s_k;
-        if (k > N_t_ / 2)      s_k = +1.0;
-        else if (k < N_t_ / 2) s_k = -1.0;
-        else                   s_k =  0.0;
-        Hhat(b, k) = cval_t(0.0, +s_k) * Chat(b, k);
-      }
+      array_t<2> Hhat(B, N_t_);
+      for (long b = 0; b < B; ++b)
+        for (long k = 0; k < N_t_; ++k)
+          Hhat(b, k) = _sgn_t(k) * Chat(b, k);
+
+      array_t<2> Rraw(B, N_grid);
+      run_backward(Hhat, Rraw, kind, B);
+
+      const double s = _grid->dt() / (2.0 * M_PI);
+      for (long b = 0; b < B; ++b)
+        for (long j = 0; j < N_grid; ++j)
+          ReX_w(b, j) = s * Rraw(b, j).real();
     }
-
-    nda::array<cval_t,2> Rraw(B, N_grid);
-    run_backward(Hhat, Rraw, kind, B);
-
-    const double s = _grid->dt() / (2.0 * M_PI);
-    for (long b = 0; b < B; ++b)
-      for (long j = 0; j < N_grid; ++j)
-        ReX_w(b, j) = s * Rraw(b, j).real();
   }
 
   /**
@@ -350,12 +372,12 @@ public:
    * @param F   [OUTPUT]  (B, N_t)
    * @param kind  source grid (fermionic or bosonic)
    */
-  void forward(nda::array<cval_t,2>& C, nda::array<cval_t,2>& F, grid_kind kind) {
+  void forward(array_t<2>& C, array_t<2>& F, grid_kind kind) {
     run_forward(C, F, kind, C.shape()[0]);
   }
 
   /// Type-2 NUFFT: uniform-time modes F → nonuniform-frequency values C.
-  void backward(nda::array<cval_t,2>& F, nda::array<cval_t,2>& C, grid_kind kind) {
+  void backward(array_t<2>& F, array_t<2>& C, grid_kind kind) {
     run_backward(F, C, kind, F.shape()[0]);
   }
 
@@ -368,24 +390,36 @@ public:
    * in-place. Convenience for callers preparing inputs to cross_correlate
    * or hilbert.
    */
-  void apply_weights(nda::array<cval_t,2>& arr, grid_kind kind) const {
-    auto const& w = (kind == grid_kind::fermionic
-                     ? _grid->w_weights() : _grid->Omega_weights());
-    const long N = arr.shape()[1];
-    utils::check(w.shape()[0] == N, "apply_weights: shape mismatch");
-    for (long b = 0; b < arr.shape()[0]; ++b)
-      for (long j = 0; j < N; ++j)
-        arr(b, j) *= w(j);
+  void apply_weights(array_t<2>& arr, grid_kind kind) const {
+    if constexpr (MEM != HOST_MEMORY) {
+      utils::check(false,
+                   "real_axis_conv_base_t<DEVICE>::apply_weights: device "
+                   "kernel for 1D weights * 2D array broadcast not yet implemented.");
+    } else {
+      auto const& w = (kind == grid_kind::fermionic
+                       ? _grid->w_weights() : _grid->Omega_weights());
+      const long N = arr.shape()[1];
+      utils::check(w.shape()[0] == N, "apply_weights: shape mismatch");
+      for (long b = 0; b < arr.shape()[0]; ++b)
+        for (long j = 0; j < N; ++j)
+          arr(b, j) *= w(j);
+    }
   }
 
-  void apply_weights(nda::array<double,2>& arr, grid_kind kind) const {
-    auto const& w = (kind == grid_kind::fermionic
-                     ? _grid->w_weights() : _grid->Omega_weights());
-    const long N = arr.shape()[1];
-    utils::check(w.shape()[0] == N, "apply_weights: shape mismatch");
-    for (long b = 0; b < arr.shape()[0]; ++b)
-      for (long j = 0; j < N; ++j)
-        arr(b, j) *= w(j);
+  void apply_weights(rarray_t<2>& arr, grid_kind kind) const {
+    if constexpr (MEM != HOST_MEMORY) {
+      utils::check(false,
+                   "real_axis_conv_base_t<DEVICE>::apply_weights(double): "
+                   "device kernel for 1D weights * 2D array broadcast not yet implemented.");
+    } else {
+      auto const& w = (kind == grid_kind::fermionic
+                       ? _grid->w_weights() : _grid->Omega_weights());
+      const long N = arr.shape()[1];
+      utils::check(w.shape()[0] == N, "apply_weights: shape mismatch");
+      for (long b = 0; b < arr.shape()[0]; ++b)
+        for (long j = 0; j < N; ++j)
+          arr(b, j) *= w(j);
+    }
   }
 
 private:
@@ -394,8 +428,7 @@ private:
   // same nuplan_t and setpts, so when we build a fresh "many" plan we get
   // both directions for free; the helper is parameterised on the call
   // pattern to keep cross_correlate / convolve / hilbert call sites flat.
-  void run_forward(nda::array<cval_t,2>& C, nda::array<cval_t,2>& F_out,
-                   grid_kind kind, long B) {
+  void run_forward(array_t<2>& C, array_t<2>& F_out, grid_kind kind, long B) {
     if (B == _ntrans) {
       if (kind == grid_kind::fermionic) _plan_w->forward(C, F_out);
       else                              _plan_Omega->forward(C, F_out);
@@ -403,15 +436,13 @@ private:
     }
     const std::array<int64_t,1> nm = { _grid->N_t() };
     const long N_pts = (kind == grid_kind::fermionic ? N_w() : N_Omega());
-    math::nda::nufft tmp(nm, N_pts, B, _eps, math::nufft::NUFFT_FORWARD);
+    plan_t tmp(nm, N_pts, B, _eps, math::nufft::NUFFT_FORWARD);
     if (kind == grid_kind::fermionic) tmp.setpts(_x_w);
     else                              tmp.setpts(_x_Omega);
     tmp.forward(C, F_out);
   }
 
-  // Type-2 (uniform -> nonuniform). Mirrors run_forward but calls backward.
-  void run_backward(nda::array<cval_t,2>& F_in, nda::array<cval_t,2>& C_out,
-                    grid_kind kind, long B) {
+  void run_backward(array_t<2>& F_in, array_t<2>& C_out, grid_kind kind, long B) {
     if (B == _ntrans) {
       if (kind == grid_kind::fermionic) _plan_w->backward(F_in, C_out);
       else                              _plan_Omega->backward(F_in, C_out);
@@ -419,7 +450,7 @@ private:
     }
     const std::array<int64_t,1> nm = { _grid->N_t() };
     const long N_pts = (kind == grid_kind::fermionic ? N_w() : N_Omega());
-    math::nda::nufft tmp(nm, N_pts, B, _eps, math::nufft::NUFFT_FORWARD);
+    plan_t tmp(nm, N_pts, B, _eps, math::nufft::NUFFT_FORWARD);
     if (kind == grid_kind::fermionic) tmp.setpts(_x_w);
     else                              tmp.setpts(_x_Omega);
     tmp.backward(F_in, C_out);
@@ -428,11 +459,22 @@ private:
   real_freq_grid_t const* _grid;
   long                    _ntrans;
   double                  _eps;
-  nda::array<double,1>    _x_w;       // scaled fermionic coords w_j * dt
-  nda::array<double,1>    _x_Omega;   // scaled bosonic coords Omega_l * dt
-  std::unique_ptr<math::nda::nufft> _plan_w;
-  std::unique_ptr<math::nda::nufft> _plan_Omega;
+  rarray_t<1>             _x_w;       // scaled fermionic coords w_j * dt, in MEM
+  rarray_t<1>             _x_Omega;   // scaled bosonic coords Omega_l * dt, in MEM
+  array_t<1>              _sgn_t;     // i*sgn(t_k) for the Hilbert kernel, in MEM
+  std::unique_ptr<plan_t> _plan_w;
+  std::unique_ptr<plan_t> _plan_Omega;
 };
+
+} // namespace detail
+
+/// Backwards-compat alias: existing host-only call sites can continue to
+/// reference `real_axis_conv_t`. Future device callers use
+/// `real_axis_conv_mem_t<DEVICE_MEMORY>`.
+using real_axis_conv_t = detail::real_axis_conv_base_t<HOST_MEMORY>;
+
+template<MEMORY_SPACE MEM>
+using real_axis_conv_mem_t = detail::real_axis_conv_base_t<MEM>;
 
 } // namespace real_axis
 } // namespace methods

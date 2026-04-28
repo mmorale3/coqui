@@ -62,7 +62,8 @@ namespace real_axis {
  * The function is templated on the THC ERI type and constrained by the
  * THC_ERI concept.
  */
-template<methods::THC_ERI THC_t>
+template<MEMORY_SPACE MEM = HOST_MEMORY,
+         methods::THC_ERI THC_t>
 void evaluate_thc_serial(boost::mpi3::communicator& comm,
                          real_axis_mb_state_t & state,
                          THC_t const& thc,
@@ -71,6 +72,10 @@ void evaluate_thc_serial(boost::mpi3::communicator& comm,
                          bool verbose = false,
                          bool use_rspace = false)
 {
+  static_assert(MEM == HOST_MEMORY,
+                "evaluate_thc_serial<DEVICE>: gated on host pending device "
+                "support in evaluate_serial. real_axis_mb_state_t storage "
+                "would also need to become MEM-aware before this can land.");
   utils::check(state.A_wskij.has_value(),
                "evaluate_thc_serial: state.A_wskij not allocated");
   utils::check(state.grid != nullptr,
