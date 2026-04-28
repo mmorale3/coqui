@@ -340,14 +340,16 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
     }
 
     // Per-R cross-correlation, into per-rank local (P_loc, Q_loc, N_O) slice.
+    // Kernel reads only LOCAL (P, Q) blocks of A_aux on both legs; the
+    // second-leg "global Q, P" read is replaced by conj of the local
+    // block via aux-hermiticity.
     nda::array<ComplexType, 4> ImPi_RPQO_loc(NR, Naux_loc_P, Naux_loc_Q, N_O);
     ImPi_RPQO_loc = ComplexType(0.0, 0.0);
     for (long iR = 0; iR < NR; ++iR) {
       for (long s = 0; s < ns; ++s) {
-        auto A_view      = A_aux_sRPQw(s, iR, _, _, _);
+        auto A_local    = A_aux_sRPQw(s, iR, Pr, Qr, _);
         auto ImPi_R_view = ImPi_RPQO_loc(iR, _, _, _);
-        accumulate_ImPi_one_kq(conv, A_view, A_view, ImPi_R_view, 1.0,
-                               Pr.first(), Qr.first());
+        accumulate_ImPi_one_kq(conv, A_local, A_local, ImPi_R_view, 1.0);
       }
     }
 
@@ -373,10 +375,10 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
       for (long s = 0; s < ns; ++s) {
         for (long ik = 0; ik < Nk; ++ik) {
           const long ikq = kpq(ik, iq);
-          auto Ak_view  = A_aux_skPQw(s, ik,  _, _, _);
-          auto Akq_view = A_aux_skPQw(s, ikq, _, _, _);
-          accumulate_ImPi_one_kq(conv, Ak_view, Akq_view, ImPi_q_view,
-                                 k_weight, Pr.first(), Qr.first());
+          auto Ak_local  = A_aux_skPQw(s, ik,  Pr, Qr, _);
+          auto Akq_local = A_aux_skPQw(s, ikq, Pr, Qr, _);
+          accumulate_ImPi_one_kq(conv, Ak_local, Akq_local, ImPi_q_view,
+                                 k_weight);
         }
       }
     }

@@ -189,14 +189,24 @@ inline scgw_result run_scgw_serial(
                                  nda::array<double,1>(grid_in.Omega()),
                                  grid_in.N_t(), grid_in.T_window());
 
-    // Repack A into driver layout (ns, Nk, N_w, nbnd, nbnd). Real part is A.
+    // Repack A into driver layout (ns, Nk, N_w, nbnd, nbnd) and apply
+    // matrix-hermitian symmetrization. state.A_wskij stores -(i/pi) G^R
+    // componentwise; the matrix-valued physical spectral function is
+    //   A_phys_{ij} = 0.5 * (A_wskij_{ij} + conj(A_wskij_{ji}))
+    // (See scr_coulomb_t::update_w for the long-form comment and
+    //  test_real_axis_hermiticity for validation.) The Pi cross-correlation
+    // kernel relies on aux-hermiticity to apply the second-leg swap as
+    // conj on the local block, so the input A must be matrix-hermitian.
     nda::array<ComplexType, 5> A_drv(ns, Nk, N_w, nbnd, nbnd);
     for (long s = 0; s < ns; ++s)
       for (long k = 0; k < Nk; ++k)
         for (long iw = 0; iw < N_w; ++iw)
           for (long mu = 0; mu < nbnd; ++mu)
             for (long nu = 0; nu < nbnd; ++nu)
-              A_drv(s, k, iw, mu, nu) = ComplexType(A_wskij(iw, s, k, mu, nu).real(), 0.0);
+              A_drv(s, k, iw, mu, nu) =
+                  ComplexType(0.5, 0.0) *
+                  (A_wskij(iw, s, k, mu, nu)
+                   + std::conj(A_wskij(iw, s, k, nu, mu)));
 
     // ---- Sigma^c ----
     nda::array<ComplexType, 5> ImSc_drv(ns, Nk, N_w, nbnd, nbnd);

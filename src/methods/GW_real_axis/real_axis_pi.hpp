@@ -60,9 +60,7 @@ inline void accumulate_ImPi_one_kq(detail::real_axis_conv_base_t<MEM> & conv,
                                    AK   const& A_PQ_k,
                                    AKQ  const& A_PQ_kq,
                                    POut      & ImPi_PQ_O,
-                                   double k_weight,
-                                   long P_origin = 0,
-                                   long Q_origin = 0)
+                                   double k_weight)
 {
   if constexpr (MEM != HOST_MEMORY) {
     utils::check(false,
@@ -71,25 +69,27 @@ inline void accumulate_ImPi_one_kq(detail::real_axis_conv_base_t<MEM> & conv,
                  "are not yet implemented.");
     return;
   }
-  // A_PQ_k / A_PQ_kq are full (Naux, Naux, N_w) replicated views.
-  // ImPi_PQ_O is a local slice of shape (Naux_loc_P, Naux_loc_Q, N_Omega) into
-  // which this rank's contribution is accumulated. (P_origin, Q_origin)
-  // give the global offsets for the local slice; default 0 reproduces the
-  // legacy fully-replicated behavior.
-  const long Naux = A_PQ_k.shape()[0];
-  const long N_w  = A_PQ_k.shape()[2];
-  const long Naux_loc_P = ImPi_PQ_O.shape()[0];
-  const long Naux_loc_Q = ImPi_PQ_O.shape()[1];
-  const long N_O  = ImPi_PQ_O.shape()[2];
+  // A_PQ_k, A_PQ_kq, and ImPi_PQ_O are all (Naux_P, Naux_Q, N_*) views
+  // with matching (P, Q) ranges. When (P, Q) is distributed, all three are
+  // local blocks of the same shape and rank-ordering, so the kernel runs
+  // entirely on local data with no cross-rank reads.
+  //
+  // The bare bubble formally calls for A_QP on the second leg (transposed
+  // aux indices). For the matrix-hermitian symmetrized spectral function
+  // -- which is what the class API feeds into the kernel -- aux A_aux is
+  // hermitian: A_aux(Q, P) = conj(A_aux(P, Q)). We therefore replace the
+  // "global (Q, P)" read on the second leg with conj of the LOCAL (P, Q)
+  // entry on the same rank. See test_real_axis_hermiticity (commit
+  // 40d91a2) for the round-off-level validation of this identity.
+  const long Naux_P = ImPi_PQ_O.shape()[0];
+  const long Naux_Q = ImPi_PQ_O.shape()[1];
+  const long N_w    = A_PQ_k.shape()[2];
+  const long N_O    = ImPi_PQ_O.shape()[2];
 
   utils::check(A_PQ_k.shape() == A_PQ_kq.shape(),
                "accumulate_ImPi_one_kq: A_k and A_kq must have same shape");
-  utils::check(A_PQ_k.shape()[1] == Naux,
-               "accumulate_ImPi_one_kq: A must be square in (P,Q)");
-  utils::check(P_origin >= 0 and P_origin + Naux_loc_P <= Naux,
-               "accumulate_ImPi_one_kq: P range out of bounds");
-  utils::check(Q_origin >= 0 and Q_origin + Naux_loc_Q <= Naux,
-               "accumulate_ImPi_one_kq: Q range out of bounds");
+  utils::check(A_PQ_k.shape()[0] == Naux_P and A_PQ_k.shape()[1] == Naux_Q,
+               "accumulate_ImPi_one_kq: A and ImPi (P, Q) shapes must match");
   utils::check(N_w == conv.N_w() and N_O == conv.N_Omega(),
                "accumulate_ImPi_one_kq: grid mismatch");
 
@@ -98,12 +98,14 @@ inline void accumulate_ImPi_one_kq(detail::real_axis_conv_base_t<MEM> & conv,
   auto const& wq   = grid.w_weights();
 
   // Build weighted spectra at k and k+q for the bubble.
-  // Layout: (B, N_w) with B = Naux_loc_P * Naux_loc_Q. For index b = iP*Naux_loc_Q + iQ:
-  //   - F^<_{b}(w) = f(w) A_{P,Q}(k, w)            (left leg, at k, global (P,Q))
-  //   - G^>_{b}(w) = (1-f(w)) A_{Q,P}(k+q, w)      (right leg, at k+q, transposed indices)
+  // Layout: (B, N_w) with B = Naux_P * Naux_Q. For index b = iP*Naux_Q + iQ:
+  //   - F^<_{b}(w) = f(w) A_{P,Q}(k, w)                 (left leg, at k)
+  //   - G^>_{b}(w) = (1-f(w)) conj(A_{P,Q}(k+q, w))     (right leg, at k+q,
+  //                                                      conj of LOCAL block via
+  //                                                      aux hermiticity)
   // The weighted forms also absorb the trapezoidal quadrature weights, so
   // the lower-level NUFFT primitives don't need to apply them again.
-  const long B   = Naux_loc_P * Naux_loc_Q;
+  const long B   = Naux_P * Naux_Q;
   const long N_t = conv.N_t();
 
   nda::array<ComplexType, 2> Aless_k(B, N_w);
@@ -111,20 +113,19 @@ inline void accumulate_ImPi_one_kq(detail::real_axis_conv_base_t<MEM> & conv,
   nda::array<ComplexType, 2> Aless_kq(B, N_w);
   nda::array<ComplexType, 2> Agtr_kq(B, N_w);
 
-  for (long iP = 0; iP < Naux_loc_P; ++iP) {
-    const long P = P_origin + iP;
-    for (long iQ = 0; iQ < Naux_loc_Q; ++iQ) {
-      const long Q = Q_origin + iQ;
-      const long b = iP * Naux_loc_Q + iQ;
+  for (long iP = 0; iP < Naux_P; ++iP) {
+    for (long iQ = 0; iQ < Naux_Q; ++iQ) {
+      const long b = iP * Naux_Q + iQ;
       for (long j = 0; j < N_w; ++j) {
         const double f_w  = grid.fermi(w(j));
         const double fb_w = 1.0 - f_w;
         const double q_j  = wq(j);
-        Aless_k (b, j) = f_w  * q_j * A_PQ_k (P, Q, j);
-        Agtr_k  (b, j) = fb_w * q_j * A_PQ_k (P, Q, j);
-        // For the "QP" leg at k+q, swap (P,Q) index access.
-        Aless_kq(b, j) = f_w  * q_j * A_PQ_kq(Q, P, j);
-        Agtr_kq (b, j) = fb_w * q_j * A_PQ_kq(Q, P, j);
+        Aless_k (b, j) = f_w  * q_j * A_PQ_k (iP, iQ, j);
+        Agtr_k  (b, j) = fb_w * q_j * A_PQ_k (iP, iQ, j);
+        // Second leg "Q, P" at k+q -> conj of LOCAL (iP, iQ) block via
+        // matrix-hermiticity of the symmetrized A_aux (commit 40d91a2).
+        Aless_kq(b, j) = f_w  * q_j * std::conj(A_PQ_kq(iP, iQ, j));
+        Agtr_kq (b, j) = fb_w * q_j * std::conj(A_PQ_kq(iP, iQ, j));
       }
     }
   }
@@ -152,9 +153,9 @@ inline void accumulate_ImPi_one_kq(detail::real_axis_conv_base_t<MEM> & conv,
   conv.backward(Hhat, Hraw, gk::bosonic);
   const double s_nufft = conv.nufft_scale();
   const double s_pi    = -M_PI * k_weight * s_nufft;
-  for (long iP = 0; iP < Naux_loc_P; ++iP)
-    for (long iQ = 0; iQ < Naux_loc_Q; ++iQ) {
-      const long b = iP * Naux_loc_Q + iQ;
+  for (long iP = 0; iP < Naux_P; ++iP)
+    for (long iQ = 0; iQ < Naux_Q; ++iQ) {
+      const long b = iP * Naux_Q + iQ;
       for (long iO = 0; iO < N_O; ++iO)
         ImPi_PQ_O(iP, iQ, iO) += s_pi * Hraw(b, iO);
     }
