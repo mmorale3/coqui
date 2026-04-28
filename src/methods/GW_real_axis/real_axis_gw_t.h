@@ -316,12 +316,14 @@ void real_axis_gw_t::evaluate(real_axis::real_axis_mb_state_t & state,
                state.ImW_qPQO->global_shape()[3] == N_O,
                "real_axis_gw_t::evaluate: state.ImW_qPQO shape mismatch");
 
-  // Phase 1A.1 backwards-compat: this body still consumes Pi/W as
-  // fully-replicated nda::array. Gather from the distributed state into
-  // local replicated buffers. Phase 2 will rewrite this body to consume
-  // dArray Pi/W natively (no gather).
-  auto ImW = math::nda::all_gather_slow<HOST_MEMORY>(*state.ImW_qPQO);
-  auto ReW = math::nda::all_gather_slow<HOST_MEMORY>(*state.ReW_qPQO);
+  // Local (P_loc, Q_loc) ranges and shapes from the distributed state.W.
+  auto Pr = state.ImW_qPQO->local_range(1);
+  auto Qr = state.ImW_qPQO->local_range(2);
+  const long Naux_loc_P = Pr.size();
+  const long Naux_loc_Q = Qr.size();
+  const long B_loc      = Naux_loc_P * Naux_loc_Q;
+  // Read state.W directly via .local(); no gather, no replicated buffer.
+  auto ImW_loc = state.ImW_qPQO->local();
 
   // Allocate Sigma outputs in state with the canonical (N_w, ns, Nk, nbnd, nbnd)
   // layout. Re-allocate so previous-iteration data is wiped.
@@ -430,41 +432,52 @@ void real_axis_gw_t::evaluate(real_axis::real_axis_mb_state_t & state,
   }
   const bool do_rspace = (NR > 0);
 
-  // NUFFT engine.
+  // NUFFT engine sized to the local (P_loc, Q_loc) block.
   const auto t_conv0 = t_now();
-  real_axis_conv_t conv(grid, /*ntrans*/ Naux*Naux, eps_nufft);
+  real_axis_conv_t conv(grid, /*ntrans*/ B_loc, eps_nufft);
   const double dt_conv = sec_since(t_conv0);
 
   // ----------------------------------------------------------------
-  // Step 1: project A(k) -> A_aux_skPQw.
+  // Step 1: project A(k) -> A_aux distributed over (P, Q). Same proc
+  // grid as state.W so .local() blocks line up.
   // ----------------------------------------------------------------
   const auto t1 = t_now();
-  nda::array<ComplexType, 5> A_aux_skPQw(ns, Nk, Naux, Naux, N_w);
+  using local_5d_t = memory::array<HOST_MEMORY, ComplexType, 5>;
+  auto pgrid_4d = state.ImW_qPQO->grid();
+  auto bsize_4d = state.ImW_qPQO->block_size();
+  std::array<long, 5> pgrid_aux = {1, 1, pgrid_4d[1], pgrid_4d[2], 1};
+  std::array<long, 5> bsize_aux = {1, 1, bsize_4d[1], bsize_4d[2], 1};
+  std::array<long, 5> shape_aux = {ns, Nk, Naux, Naux, N_w};
+  auto dA_aux_skPQw = math::nda::make_distributed_array<local_5d_t>(
+      comm, pgrid_aux, shape_aux, bsize_aux);
+  auto A_aux_loc = dA_aux_skPQw.local();
   for (long s = 0; s < ns; ++s)
     for (long ik = 0; ik < Nk; ++ik) {
-      auto X_view     = X(s, ik, _, _);
+      auto X_P_slice  = X(s, ik, Pr, _);
+      auto X_Q_slice  = X(s, ik, Qr, _);
       auto A_view     = A(s, ik, _, _, _);
-      auto A_aux_view = A_aux_skPQw(s, ik, _, _, _);
-      primary_to_aux_one_k(X_view, A_view, A_aux_view);
+      auto A_aux_view = A_aux_loc(s, ik, _, _, _);
+      primary_to_aux_one_k(X_P_slice, X_Q_slice, A_view, A_aux_view);
     }
   const double dt1 = sec_since(t1);
 
   // ----------------------------------------------------------------
-  // Step 5: B = -Im W / pi on the bosonic grid (q, P, Q, Omega).
+  // Step 5: B = -Im W / pi on the local (P_loc, Q_loc, Omega) block.
   // ----------------------------------------------------------------
   const auto t5 = t_now();
-  nda::array<ComplexType, 4> B_qPQO(Nq, Naux, Naux, N_O);
-  B_qPQO = nda::map([](ComplexType w) {
+  nda::array<ComplexType, 4> B_qPQO_loc(Nq, Naux_loc_P, Naux_loc_Q, N_O);
+  B_qPQO_loc = nda::map([](ComplexType w) {
     return ComplexType(-w.real() / M_PI, 0.0);
-  })(ImW);
+  })(ImW_loc);
   const double dt5 = sec_since(t5);
 
   // ----------------------------------------------------------------
-  // Step 6: Im Sigma^c_PQ(k, w). k-space or R-space.
+  // Step 6: Im Sigma^c_PQ(k, w). Each rank computes its (P_loc, Q_loc)
+  // block for ALL (s, k, q); no allreduce.
   // ----------------------------------------------------------------
   const auto t6 = t_now();
-  nda::array<ComplexType, 5> ImSigma_aux_skPQw(ns, Nk, Naux, Naux, N_w);
-  ImSigma_aux_skPQw = ComplexType(0.0, 0.0);
+  nda::array<ComplexType, 5> ImSigma_aux_skPQw_loc(ns, Nk, Naux_loc_P, Naux_loc_Q, N_w);
+  ImSigma_aux_skPQw_loc = ComplexType(0.0, 0.0);
 
   if (do_rspace) {
     auto f_Rk = sf_Rk_opt->local();
@@ -472,95 +485,86 @@ void real_axis_gw_t::evaluate(real_axis::real_axis_mb_state_t & state,
     auto f_kR = sf_kR_opt->local();
 
     if (iq_gamma >= 0) {
-      for (long P = 0; P < Naux; ++P)
-        for (long Q = 0; Q < Naux; ++Q)
-          for (long iO = 0; iO < N_O; ++iO)
-            B_qPQO(iq_gamma, P, Q, iO) = ComplexType(0.0, 0.0);
+      B_qPQO_loc(iq_gamma, nda::ellipsis{}) = ComplexType(0.0, 0.0);
     }
 
-    // FT B from q-space to R-space.
-    nda::array<ComplexType, 4> B_RPQO(NR, Naux, Naux, N_O);
+    // FT B from q-space to R-space (per-rank on local block).
+    nda::array<ComplexType, 4> B_RPQO_loc(NR, Naux_loc_P, Naux_loc_Q, N_O);
     {
-      auto B_q_2D = nda::reshape(B_qPQO, std::array<long,2>{Nq, Naux*Naux*N_O});
-      auto B_R_2D = nda::reshape(B_RPQO, std::array<long,2>{NR, Naux*Naux*N_O});
+      auto B_q_2D = nda::reshape(B_qPQO_loc,
+                                 std::array<long,2>{Nq, B_loc * N_O});
+      auto B_R_2D = nda::reshape(B_RPQO_loc,
+                                 std::array<long,2>{NR, B_loc * N_O});
       nda::blas::gemm(ComplexType(1.0, 0.0), f_Rq, B_q_2D,
                       ComplexType(0.0, 0.0), B_R_2D);
     }
 
-    // FT A from k-space to R-space.
-    nda::array<ComplexType, 5> A_aux_sRPQw(ns, NR, Naux, Naux, N_w);
+    // FT A from k-space to R-space (per-rank on local block).
+    nda::array<ComplexType, 5> A_aux_sRPQw_loc(ns, NR, Naux_loc_P, Naux_loc_Q, N_w);
     for (long s = 0; s < ns; ++s) {
-      auto A_in_2D  = nda::reshape(A_aux_skPQw(s, _, _, _, _),
-                                   std::array<long,2>{Nk, Naux*Naux*N_w});
-      auto A_out_2D = nda::reshape(A_aux_sRPQw(s, _, _, _, _),
-                                   std::array<long,2>{NR, Naux*Naux*N_w});
+      auto A_in_2D  = nda::reshape(A_aux_loc(s, _, _, _, _),
+                                   std::array<long,2>{Nk, B_loc * N_w});
+      auto A_out_2D = nda::reshape(A_aux_sRPQw_loc(s, _, _, _, _),
+                                   std::array<long,2>{NR, B_loc * N_w});
       nda::blas::gemm(ComplexType(1.0, 0.0), f_Rk, A_in_2D,
                       ComplexType(0.0, 0.0), A_out_2D);
     }
 
-    nda::array<ComplexType, 5> ImSigma_aux_sRPQw(ns, NR, Naux, Naux, N_w);
-    ImSigma_aux_sRPQw = ComplexType(0.0, 0.0);
-    {
-      const int rank = comm.rank();
-      const int size = comm.size();
-      for (long iR = rank; iR < NR; iR += size) {
-        for (long s = 0; s < ns; ++s) {
-          auto A_view   = A_aux_sRPQw(s, iR, _, _, _);
-          auto B_view   = B_RPQO(iR, _, _, _);
-          auto Sig_view = ImSigma_aux_sRPQw(s, iR, _, _, _);
-          accumulate_ImSigma_one_kq_nufft(conv, A_view, B_view, Sig_view, 1.0);
-        }
+    // Per-R Sigma kernel on local (P_loc, Q_loc) blocks. No allreduce.
+    nda::array<ComplexType, 5> ImSigma_aux_sRPQw_loc(ns, NR, Naux_loc_P, Naux_loc_Q, N_w);
+    ImSigma_aux_sRPQw_loc = ComplexType(0.0, 0.0);
+    for (long iR = 0; iR < NR; ++iR) {
+      for (long s = 0; s < ns; ++s) {
+        auto A_view   = A_aux_sRPQw_loc(s, iR, _, _, _);
+        auto B_view   = B_RPQO_loc(iR, _, _, _);
+        auto Sig_view = ImSigma_aux_sRPQw_loc(s, iR, _, _, _);
+        accumulate_ImSigma_one_kq_nufft(conv, A_view, B_view, Sig_view, 1.0);
       }
-      if (size > 1)
-        comm.all_reduce_in_place_n(ImSigma_aux_sRPQw.data(),
-                                    ImSigma_aux_sRPQw.size(), std::plus<>{});
     }
 
+    // FT Sigma from R-space to k-space (per-rank on local block).
     for (long s = 0; s < ns; ++s) {
-      auto Sig_R_2D = nda::reshape(ImSigma_aux_sRPQw(s, _, _, _, _),
-                                   std::array<long,2>{NR, Naux*Naux*N_w});
-      auto Sig_k_2D = nda::reshape(ImSigma_aux_skPQw(s, _, _, _, _),
-                                   std::array<long,2>{Nk, Naux*Naux*N_w});
+      auto Sig_R_2D = nda::reshape(ImSigma_aux_sRPQw_loc(s, _, _, _, _),
+                                   std::array<long,2>{NR, B_loc * N_w});
+      auto Sig_k_2D = nda::reshape(ImSigma_aux_skPQw_loc(s, _, _, _, _),
+                                   std::array<long,2>{Nk, B_loc * N_w});
       nda::blas::gemm(ComplexType(1.0, 0.0), f_kR, Sig_R_2D,
                       ComplexType(0.0, 0.0), Sig_k_2D);
     }
   } else {
-    const long total_skq = ns * Nk * Nq;
-    const int rank = comm.rank();
-    const int size = comm.size();
-    for (long idx = rank; idx < total_skq; idx += size) {
-      const long s   = idx / (Nk * Nq);
-      const long rem = idx % (Nk * Nq);
-      const long ik  = rem / Nq;
-      const long iq  = rem % Nq;
-      if (iq == iq_gamma) continue;
-      const long ikmq = kmq(ik, iq);
-      auto A_view   = A_aux_skPQw(s, ikmq, _, _, _);
-      auto B_view   = B_qPQO(iq, _, _, _);
-      auto Sig_view = ImSigma_aux_skPQw(s, ik, _, _, _);
-      accumulate_ImSigma_one_kq_nufft(conv, A_view, B_view, Sig_view, qw(iq));
+    for (long s = 0; s < ns; ++s) {
+      for (long ik = 0; ik < Nk; ++ik) {
+        for (long iq = 0; iq < Nq; ++iq) {
+          if (iq == iq_gamma) continue;
+          const long ikmq = kmq(ik, iq);
+          auto A_view   = A_aux_loc(s, ikmq, _, _, _);
+          auto B_view   = B_qPQO_loc(iq, _, _, _);
+          auto Sig_view = ImSigma_aux_skPQw_loc(s, ik, _, _, _);
+          accumulate_ImSigma_one_kq_nufft(conv, A_view, B_view, Sig_view, qw(iq));
+        }
+      }
     }
-    if (size > 1)
-      comm.all_reduce_in_place_n(ImSigma_aux_skPQw.data(),
-                                  ImSigma_aux_skPQw.size(), std::plus<>{});
   }
   const double dt6 = sec_since(t6);
 
   // ----------------------------------------------------------------
-  // Step 7: Re Sigma^c via batched Hilbert transform on the fermionic grid.
+  // Step 7: Re Sigma^c via batched Hilbert transform (per-rank on local block).
   // ----------------------------------------------------------------
   const auto t7 = t_now();
-  nda::array<ComplexType, 5> ReSigma_aux_skPQw(ns, Nk, Naux, Naux, N_w);
+  nda::array<ComplexType, 5> ReSigma_aux_skPQw_loc(ns, Nk, Naux_loc_P, Naux_loc_Q, N_w);
   for (long s = 0; s < ns; ++s)
     for (long ik = 0; ik < Nk; ++ik) {
-      auto Im_view = ImSigma_aux_skPQw(s, ik, _, _, _);
-      auto Re_view = ReSigma_aux_skPQw(s, ik, _, _, _);
+      auto Im_view = ImSigma_aux_skPQw_loc(s, ik, _, _, _);
+      auto Re_view = ReSigma_aux_skPQw_loc(s, ik, _, _, _);
       ReSigma_from_ImSigma_aux(conv, Im_view, Re_view);
     }
   const double dt7 = sec_since(t7);
 
   // ----------------------------------------------------------------
-  // Step 8: back-project Sigma_PQ(k, w) -> Sigma_munu(k, w).
+  // Step 8: back-project Sigma_PQ_loc(k, w) -> Sigma_munu(k, w).
+  // Each rank computes a PARTIAL contribution from its (P_loc, Q_loc)
+  // block. The full orbital-basis Sigma is the sum across (P, Q) ranks,
+  // obtained via a single allreduce on the orbital-shape Sigma at the end.
   // ----------------------------------------------------------------
   const auto t8 = t_now();
   nda::array<ComplexType, 5> ImSigma(ns, Nk, N_w, nbnd, nbnd);
@@ -569,14 +573,20 @@ void real_axis_gw_t::evaluate(real_axis::real_axis_mb_state_t & state,
   ReSigma = ComplexType(0.0, 0.0);
   for (long s = 0; s < ns; ++s)
     for (long ik = 0; ik < Nk; ++ik) {
-      auto X_view  = X(s, ik, _, _);
-      auto Im_view = ImSigma_aux_skPQw(s, ik, _, _, _);
-      auto Re_view = ReSigma_aux_skPQw(s, ik, _, _, _);
+      auto X_P_slice = X(s, ik, Pr, _);
+      auto X_Q_slice = X(s, ik, Qr, _);
+      auto Im_view = ImSigma_aux_skPQw_loc(s, ik, _, _, _);
+      auto Re_view = ReSigma_aux_skPQw_loc(s, ik, _, _, _);
       auto ImOut   = ImSigma(s, ik, _, _, _);
       auto ReOut   = ReSigma(s, ik, _, _, _);
-      aux_to_primary_one_k(X_view, Im_view, ImOut);
-      aux_to_primary_one_k(X_view, Re_view, ReOut);
+      aux_to_primary_one_k(X_P_slice, X_Q_slice, Im_view, ImOut);
+      aux_to_primary_one_k(X_P_slice, X_Q_slice, Re_view, ReOut);
     }
+  // Allreduce the partial sums across (P, Q) ranks to get the full Sigma.
+  if (comm.size() > 1) {
+    comm.all_reduce_in_place_n(ImSigma.data(), ImSigma.size(), std::plus<>{});
+    comm.all_reduce_in_place_n(ReSigma.data(), ReSigma.size(), std::plus<>{});
+  }
 
   // Repack into state.{Im,Re}Sigma_wskij with (N_w, ns, Nk, nbnd, nbnd) layout.
   for (long s = 0; s < ns; ++s)

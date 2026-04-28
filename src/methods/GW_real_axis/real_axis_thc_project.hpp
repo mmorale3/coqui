@@ -139,8 +139,9 @@ inline void primary_to_aux_one_k(XK   const& X_kPmu,
  * @param M_wmunu    OUTPUT (N_w, nbnd, nbnd) orbital-basis quantity.
  */
 template <MEMORY_SPACE MEM = HOST_MEMORY,
-          typename XK, typename MIn, typename MOut>
-inline void aux_to_primary_one_k(XK   const& X_kPmu,
+          typename XKP, typename XKQ, typename MIn, typename MOut>
+inline void aux_to_primary_one_k(XKP  const& X_kP_mu,
+                                 XKQ  const& X_kQ_nu,
                                  MIn  const& M_aux_PQw,
                                  MOut      & M_wmunu)
 {
@@ -151,12 +152,15 @@ inline void aux_to_primary_one_k(XK   const& X_kPmu,
                  "(iw,mu,nu) permutations not yet implemented.");
     return;
   }
-  const long Naux = X_kPmu.shape()[0];
-  const long nbnd = X_kPmu.shape()[1];
+  const long Naux_P = X_kP_mu.shape()[0];
+  const long Naux_Q = X_kQ_nu.shape()[0];
+  const long nbnd = X_kP_mu.shape()[1];
   const long N_w  = M_wmunu.shape()[0];
 
-  utils::check(M_aux_PQw.shape()[0] == Naux and
-               M_aux_PQw.shape()[1] == Naux and
+  utils::check(X_kQ_nu.shape()[1] == nbnd,
+               "aux_to_primary_one_k: X_P and X_Q nbnd mismatch");
+  utils::check(M_aux_PQw.shape()[0] == Naux_P and
+               M_aux_PQw.shape()[1] == Naux_Q and
                M_aux_PQw.shape()[2] == N_w,
                "aux_to_primary_one_k: M_aux shape mismatch");
   utils::check(M_wmunu.shape()[1] == nbnd and M_wmunu.shape()[2] == nbnd,
@@ -167,33 +171,49 @@ inline void aux_to_primary_one_k(XK   const& X_kPmu,
   const ComplexType c_one(1.0, 0.0);
   const ComplexType c_zero(0.0, 0.0);
 
-  // Step 1: T(P, w, nu) = sum_Q M_aux(P, Q, w) X(Q, nu).
+  // Step 1: T(P, w, nu) = sum_Q M_aux(P, Q, w) X_Q(Q, nu).
   //
   // Permute M_aux from (P, Q, w) -> (P, w, Q) so we can reshape the (P, w)
-  // pair into a single matrix row index and dot the Q axis against X.
-  nda::array<ComplexType, 3> M_PWQ(Naux, N_w, Naux);
-  for (long P = 0; P < Naux; ++P)
-    for (long Q = 0; Q < Naux; ++Q)
+  // pair into a single matrix row index and dot the Q axis against X_Q.
+  nda::array<ComplexType, 3> M_PWQ(Naux_P, N_w, Naux_Q);
+  for (long P = 0; P < Naux_P; ++P)
+    for (long Q = 0; Q < Naux_Q; ++Q)
       for (long iw = 0; iw < N_w; ++iw)
         M_PWQ(P, iw, Q) = M_aux_PQw(P, Q, iw);
-  auto M_PWQ_2d = nda::reshape(M_PWQ, std::array<long, 2>{Naux * N_w, Naux});
-  nda::array<ComplexType, 3> T_PWN(Naux, N_w, nbnd);
-  auto T_PWN_2d = nda::reshape(T_PWN, std::array<long, 2>{Naux * N_w, nbnd});
-  nda::blas::gemm(c_one, M_PWQ_2d, X_kPmu, c_zero, T_PWN_2d);
+  auto M_PWQ_2d = nda::reshape(M_PWQ, std::array<long, 2>{Naux_P * N_w, Naux_Q});
+  nda::array<ComplexType, 3> T_PWN(Naux_P, N_w, nbnd);
+  auto T_PWN_2d = nda::reshape(T_PWN, std::array<long, 2>{Naux_P * N_w, nbnd});
+  // Materialize a contiguous local copy of X_Q (may be a strided view).
+  nda::array<ComplexType, 2> X_Q_local(Naux_Q, nbnd);
+  for (long Q = 0; Q < Naux_Q; ++Q)
+    for (long nu = 0; nu < nbnd; ++nu)
+      X_Q_local(Q, nu) = X_kQ_nu(Q, nu);
+  nda::blas::gemm(c_one, M_PWQ_2d, X_Q_local, c_zero, T_PWN_2d);
 
-  // Step 2: M(w, mu, nu) = sum_P conj(X)(P, mu) T(P, w, nu).
-  //
-  // Reshape T to (Naux, N_w * nbnd) and left-multiply by X^H. The result
-  // is laid out (mu, w, nu); a final permutation copies into (w, mu, nu).
-  auto T_PWN_2d_b = nda::reshape(T_PWN, std::array<long, 2>{Naux, N_w * nbnd});
+  // Step 2: M(w, mu, nu) = sum_P conj(X_P)(P, mu) T(P, w, nu).
+  auto T_PWN_2d_b = nda::reshape(T_PWN, std::array<long, 2>{Naux_P, N_w * nbnd});
   nda::array<ComplexType, 3> M_perm(nbnd, N_w, nbnd);
   auto M_perm_2d = nda::reshape(M_perm, std::array<long, 2>{nbnd, N_w * nbnd});
-  nda::blas::gemm(c_one, nda::dagger(X_kPmu), T_PWN_2d_b, c_zero, M_perm_2d);
+  nda::array<ComplexType, 2> X_P_local(Naux_P, nbnd);
+  for (long P = 0; P < Naux_P; ++P)
+    for (long mu = 0; mu < nbnd; ++mu)
+      X_P_local(P, mu) = X_kP_mu(P, mu);
+  nda::blas::gemm(c_one, nda::dagger(X_P_local), T_PWN_2d_b, c_zero, M_perm_2d);
 
   for (long iw = 0; iw < N_w; ++iw)
     for (long mu = 0; mu < nbnd; ++mu)
       for (long nu = 0; nu < nbnd; ++nu)
         M_wmunu(iw, mu, nu) = M_perm(mu, iw, nu);
+}
+
+// Convenience overload: same X for both P and Q.
+template <MEMORY_SPACE MEM = HOST_MEMORY,
+          typename XK, typename MIn, typename MOut>
+inline void aux_to_primary_one_k(XK   const& X_kPmu,
+                                 MIn  const& M_aux_PQw,
+                                 MOut      & M_wmunu)
+{
+  aux_to_primary_one_k<MEM>(X_kPmu, X_kPmu, M_aux_PQw, M_wmunu);
 }
 
 } // namespace real_axis
