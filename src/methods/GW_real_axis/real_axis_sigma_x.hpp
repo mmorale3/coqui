@@ -55,14 +55,15 @@ namespace real_axis {
  * @param kmq_to_kp     (Nk, Nq) BZ index of k-q
  * @param Sigma_x_skij  OUTPUT (ns, Nk, nbnd, nbnd) static exchange self-energy
  */
-template<MEMORY_SPACE MEM = HOST_MEMORY>
+template<MEMORY_SPACE MEM = HOST_MEMORY,
+         nda::ArrayOfRank<2> KMap_t>
 inline void evaluate_Sigma_x_serial(
     boost::mpi3::communicator        & comm,
     real_freq_grid_t            const& grid,
     memory::array<MEM, ComplexType, 5> const& A_skwij,
     memory::array<MEM, ComplexType, 4> const& X_skPmu,
     memory::array<MEM, ComplexType, 3> const& V_qPQ,
-    nda::array<long, 2>                const& kmq_to_kp,
+    KMap_t                       const& kmq_to_kp,
     memory::array<MEM, ComplexType, 4>       & Sigma_x_skij,
     long iq_gamma = -1)
 {

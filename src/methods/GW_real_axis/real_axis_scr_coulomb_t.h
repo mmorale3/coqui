@@ -21,6 +21,7 @@
 #include "mpi3/communicator.hpp"
 #include "utilities/check.hpp"
 #include "utilities/kpoint_utils.hpp"
+#include "numerics/shared_array/nda.hpp"
 
 #include "mean_field/MF.hpp"
 #include "methods/ERI/detail/concepts.hpp"
@@ -204,13 +205,20 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
         V(iq, P, Q) = Zq(P, Q);
   }
 
-  // BZ closure maps. kpq(ik, iq) = ik+iq via qk_to_k2(qminus(iq), ik).
-  nda::array<long, 2> kpq(Nk, Nq);
-  auto const& qk_to_k2 = MF.qk_to_k2();
-  auto const& qm       = MF.qminus();
-  for (long iq = 0; iq < Nq; ++iq)
-    for (long ik = 0; ik < Nk; ++ik)
-      kpq(ik, iq) = qk_to_k2(qm(iq), ik);
+  // BZ closure maps in shared memory. kpq(ik, iq) = ik+iq via qk_to_k2(qminus(iq), ik).
+  math::shm::shared_array<nda::array_view<long, 2>> skpq(*state.mpi, {Nk, Nq});
+  {
+    if (skpq.node_comm()->root()) {
+      auto kpq_loc = skpq.local();
+      auto const& qk_to_k2 = MF.qk_to_k2();
+      auto const& qm       = MF.qminus();
+      for (long iq = 0; iq < Nq; ++iq)
+        for (long ik = 0; ik < Nk; ++ik)
+          kpq_loc(ik, iq) = qk_to_k2(qm(iq), ik);
+    }
+    skpq.node_sync();
+  }
+  auto kpq = skpq.local();
 
   // Identify the Gamma q-point if div_treatment == "ignore_g0".
   long iq_gamma = -1;
@@ -223,8 +231,9 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
     }
   }
 
-  // R-space FT matrices for Pi, when requested.
-  nda::array<ComplexType, 2> f_Rk, f_qR;
+  // R-space FT matrices for Pi, when requested. One copy per node.
+  std::optional<math::shm::shared_array<nda::array_view<ComplexType, 2>>> sf_Rk_opt;
+  std::optional<math::shm::shared_array<nda::array_view<ComplexType, 2>>> sf_qR_opt;
   long NR = 0;
   if (use_rspace and Nk > 1) {
     auto kp_grid = MF.kp_grid();
@@ -252,10 +261,11 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
     nda::array<long, 1> Rpts_weights(NR);
     Rpts_weights() = 1;
 
-    f_Rk = nda::array<ComplexType, 2>(NR, Nk);
-    f_qR = nda::array<ComplexType, 2>(Nq, NR);
-    utils::k_to_R_coefficients(Rpts_idx, MF.kpts(), lattv, f_Rk);
-    utils::R_to_k_coefficients(Rpts_idx, Rpts_weights, MF.Qpts(), lattv, f_qR);
+    sf_Rk_opt.emplace(*state.mpi, std::array<long,2>{NR, Nk});
+    sf_qR_opt.emplace(*state.mpi, std::array<long,2>{Nq, NR});
+    utils::k_to_R_coefficients(comm, Rpts_idx, MF.kpts(), lattv, *sf_Rk_opt);
+    utils::R_to_k_coefficients(comm, Rpts_idx, Rpts_weights, MF.Qpts(), lattv,
+                               *sf_qR_opt);
   }
   const bool do_rspace = (NR > 0);
 
@@ -284,6 +294,9 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
   const auto t2 = t_now();
 
   if (do_rspace) {
+    auto f_Rk = sf_Rk_opt->local();
+    auto f_qR = sf_qR_opt->local();
+
     // FT A_aux from k-space to R-space, per s.
     nda::array<ComplexType, 5> A_aux_sRPQw(ns, NR, Naux, Naux, N_w);
     for (long s = 0; s < ns; ++s) {

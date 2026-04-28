@@ -13,6 +13,7 @@
 #include <utility>
 
 #include "configuration.hpp"
+#include "numerics/shared_array/nda.hpp"
 #include "nda/nda.hpp"
 #include "mpi3/communicator.hpp"
 #include "utilities/check.hpp"
@@ -133,11 +134,18 @@ public:
         for (long Q = 0; Q < Naux; ++Q)
           V_qPQ(iq, P, Q) = Zq(P, Q);
     }
-    nda::array<long, 2> kmq_to_kp(Nk, Nq);
-    auto const& qk_to_k2 = MF.qk_to_k2();
-    for (long iq = 0; iq < Nq; ++iq)
-      for (long ik = 0; ik < Nk; ++ik)
-        kmq_to_kp(ik, iq) = qk_to_k2(iq, ik);
+    math::shm::shared_array<nda::array_view<long, 2>> skmq(*state.mpi, {Nk, Nq});
+    {
+      if (skmq.node_comm()->root()) {
+        auto kmq_loc = skmq.local();
+        auto const& qk_to_k2 = MF.qk_to_k2();
+        for (long iq = 0; iq < Nq; ++iq)
+          for (long ik = 0; ik < Nk; ++ik)
+            kmq_loc(ik, iq) = qk_to_k2(iq, ik);
+      }
+      skmq.node_sync();
+    }
+    auto kmq_to_kp = skmq.local();
 
     long iq_gamma = -1;
     if (_div_treatment == "ignore_g0") {

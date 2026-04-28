@@ -19,6 +19,7 @@
 #include "nda/blas.hpp"
 #include "mpi3/communicator.hpp"
 #include "utilities/kpoint_utils.hpp"
+#include "numerics/shared_array/nda.hpp"
 
 #include "mean_field/MF.hpp"
 #include "methods/ERI/detail/concepts.hpp"
@@ -316,12 +317,19 @@ void real_axis_gw_t::evaluate(real_axis::real_axis_mb_state_t & state,
           X(s, k, P, mu) = Xsk(P, mu);
     }
 
-  // BZ closure: kmq(ik, iq) = ik - iq.
-  nda::array<long, 2> kmq(Nk, Nq);
-  auto const& qk_to_k2 = MF.qk_to_k2();
-  for (long iq = 0; iq < Nq; ++iq)
-    for (long ik = 0; ik < Nk; ++ik)
-      kmq(ik, iq) = qk_to_k2(iq, ik);
+  // BZ closure: kmq(ik, iq) = ik - iq, in shared memory.
+  math::shm::shared_array<nda::array_view<long, 2>> skmq(*state.mpi, {Nk, Nq});
+  {
+    if (skmq.node_comm()->root()) {
+      auto kmq_loc = skmq.local();
+      auto const& qk_to_k2 = MF.qk_to_k2();
+      for (long iq = 0; iq < Nq; ++iq)
+        for (long ik = 0; ik < Nk; ++ik)
+          kmq_loc(ik, iq) = qk_to_k2(iq, ik);
+    }
+    skmq.node_sync();
+  }
+  auto kmq = skmq.local();
 
   // q-mesh weights (uniform 1/Nq).
   nda::array<double, 1> qw(Nq);
@@ -338,8 +346,10 @@ void real_axis_gw_t::evaluate(real_axis::real_axis_mb_state_t & state,
     }
   }
 
-  // R-space FT matrices for Sigma.
-  nda::array<ComplexType, 2> f_Rk, f_Rq, f_kR;
+  // R-space FT matrices for Sigma. One copy per node.
+  std::optional<math::shm::shared_array<nda::array_view<ComplexType, 2>>> sf_Rk_opt;
+  std::optional<math::shm::shared_array<nda::array_view<ComplexType, 2>>> sf_Rq_opt;
+  std::optional<math::shm::shared_array<nda::array_view<ComplexType, 2>>> sf_kR_opt;
   long NR = 0;
   if (use_rspace and Nk > 1) {
     auto kp_grid = MF.kp_grid();
@@ -367,12 +377,13 @@ void real_axis_gw_t::evaluate(real_axis::real_axis_mb_state_t & state,
     nda::array<long, 1> Rpts_weights(NR);
     Rpts_weights() = 1;
 
-    f_Rk = nda::array<ComplexType, 2>(NR, Nk);
-    f_Rq = nda::array<ComplexType, 2>(NR, Nq);
-    f_kR = nda::array<ComplexType, 2>(Nk, NR);
-    utils::k_to_R_coefficients(Rpts_idx, MF.kpts(), lattv, f_Rk);
-    utils::k_to_R_coefficients(Rpts_idx, MF.Qpts(), lattv, f_Rq);
-    utils::R_to_k_coefficients(Rpts_idx, Rpts_weights, MF.kpts(), lattv, f_kR);
+    sf_Rk_opt.emplace(*state.mpi, std::array<long,2>{NR, Nk});
+    sf_Rq_opt.emplace(*state.mpi, std::array<long,2>{NR, Nq});
+    sf_kR_opt.emplace(*state.mpi, std::array<long,2>{Nk, NR});
+    utils::k_to_R_coefficients(comm, Rpts_idx, MF.kpts(), lattv, *sf_Rk_opt);
+    utils::k_to_R_coefficients(comm, Rpts_idx, MF.Qpts(), lattv, *sf_Rq_opt);
+    utils::R_to_k_coefficients(comm, Rpts_idx, Rpts_weights, MF.kpts(), lattv,
+                               *sf_kR_opt);
   }
   const bool do_rspace = (NR > 0);
 
@@ -413,6 +424,10 @@ void real_axis_gw_t::evaluate(real_axis::real_axis_mb_state_t & state,
   ImSigma_aux_skPQw = ComplexType(0.0, 0.0);
 
   if (do_rspace) {
+    auto f_Rk = sf_Rk_opt->local();
+    auto f_Rq = sf_Rq_opt->local();
+    auto f_kR = sf_kR_opt->local();
+
     if (iq_gamma >= 0) {
       for (long P = 0; P < Naux; ++P)
         for (long Q = 0; Q < Naux; ++Q)
