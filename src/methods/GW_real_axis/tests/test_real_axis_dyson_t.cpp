@@ -94,6 +94,7 @@ namespace bdft_tests {
                   beta, mu0, w_max, N_w, Omega_max, N_Omega, N_t, T_window);
 
     real_axis_mb_state_t state(grid);
+    state.mpi          = mpi_context;
     state.A_wskij      = nda::array<cval_t, 5>(N_w, ns, Nk, nbnd, nbnd);
     state.Sigma_x_skij = nda::array<cval_t, 4>(ns, Nk, nbnd, nbnd);
     auto& A0 = *state.A_wskij;
@@ -120,9 +121,9 @@ namespace bdft_tests {
     real_axis_scr_coulomb_t scr_eri(&grid, "rpa", "ignore_g0", 1e-8);
     real_axis_gw_t          gw(grid, /*max_iter*/ 1, /*mix*/ 0.5,
                                /*eps_nufft*/ 1e-8, /*ntrans*/ 1);
-    scr_eri.update_w(mpi_context->comm, state, thc,
+    scr_eri.update_w(state, thc,
                      /*verbose*/ false, /*use_rspace*/ false);
-    gw.evaluate(mpi_context->comm, state, thc,
+    gw.evaluate(state, thc,
                 /*eps_nufft*/ 1e-8, "ignore_g0",
                 /*verbose*/ false, /*use_rspace*/ false);
 

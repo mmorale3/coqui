@@ -146,11 +146,12 @@ namespace bdft_tests {
                   p.beta, p.mu0, p.w_max, p.N_w,
                   p.Omega_max, p.N_Omega, p.N_t, p.T_window);
     real_axis_mb_state_t state(grid);
+    state.mpi = mpi_context;
     fill_lorentzian_A(mf, grid, state);
     const long N_O = grid.N_Omega();
 
     real_axis_scr_coulomb_t scr_eri(&grid, "rpa", "ignore_g0", 1e-8);
-    scr_eri.update_w(mpi_context->comm, state, thc,
+    scr_eri.update_w(state, thc,
                      /*verbose*/ false, /*use_rspace*/ false);
 
     REQUIRE(state.ImPi_qPQO.has_value());
@@ -223,14 +224,16 @@ namespace bdft_tests {
                     p.beta, p.mu0, p.w_max, p.N_w,
                     p.Omega_max, p.N_Omega, p.N_t, p.T_window);
     real_axis_mb_state_t state_k(grid_k), state_R(grid_R);
+    state_k.mpi = mpi_context;
+    state_R.mpi = mpi_context;
     fill_lorentzian_A(mf, grid_k, state_k);
     fill_lorentzian_A(mf, grid_R, state_R);
 
     real_axis_scr_coulomb_t scr_k(&grid_k, "rpa", "ignore_g0", 1e-8);
     real_axis_scr_coulomb_t scr_R(&grid_R, "rpa", "ignore_g0", 1e-8);
-    scr_k.update_w(mpi_context->comm, state_k, thc,
+    scr_k.update_w(state_k, thc,
                    /*verbose*/ false, /*use_rspace*/ false);
-    scr_R.update_w(mpi_context->comm, state_R, thc,
+    scr_R.update_w(state_R, thc,
                    /*verbose*/ false, /*use_rspace*/ true);
 
     auto const& ImPi_k = *state_k.ImPi_qPQO;
@@ -288,11 +291,13 @@ namespace bdft_tests {
                         p.beta, p.mu0, p.w_max, p.N_w,
                         p.Omega_max, p.N_Omega, p.N_t, p.T_window);
     real_axis_mb_state_t state_drv(grid_drv), state_split(grid_split);
+    state_drv.mpi   = mpi_context;
+    state_split.mpi = mpi_context;
     fill_lorentzian_A(mf, grid_drv, state_drv);
     fill_lorentzian_A(mf, grid_split, state_split);
 
     // Reference: full driver.
-    evaluate_thc_serial(mpi_context->comm, state_drv, thc, /*eps_nufft*/ 1e-8,
+    evaluate_thc_serial(state_drv, thc, /*eps_nufft*/ 1e-8,
                         "ignore_g0", /*verbose*/ false, /*use_rspace*/ false);
 
     // Split: update_w computes W into state, then gw_t::evaluate computes
@@ -302,9 +307,9 @@ namespace bdft_tests {
     real_axis_scr_coulomb_t scr_eri(&grid_split, "rpa", "ignore_g0", 1e-8);
     real_axis_gw_t          gw(grid_split, /*max_iter*/ 1, /*mix*/ 0.5,
                                /*eps_nufft*/ 1e-8, /*ntrans*/ 1);
-    scr_eri.update_w(mpi_context->comm, state_split, thc,
+    scr_eri.update_w(state_split, thc,
                      /*verbose*/ false, /*use_rspace*/ false);
-    gw.evaluate(mpi_context->comm, state_split, thc,
+    gw.evaluate(state_split, thc,
                 /*eps_nufft*/ 1e-8, "ignore_g0", /*verbose*/ false,
                 /*use_rspace*/ false);
 

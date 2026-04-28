@@ -9,8 +9,8 @@
  * iteration. Mirrors `methods::scf_loop` (imag-axis side) in shape:
  *
  *     real_axis_mb_solver_t mb_solver{ &scr_eri, &gw };
- *     real_axis_scf_loop(comm, state, dyson, thc, mb_solver, cfg,
- *                        k_weights, N_elec);
+ *     real_axis_scf_loop(state, dyson, thc, mb_solver, cfg,
+ *                        k_weights, N_elec);   // comm is read from state.mpi
  *
  * Once the real-axis HF class is split off from `evaluate_Sigma_x_serial`
  * the mb_solver_t struct will gain an hf member; for now the SCF loop calls
@@ -77,8 +77,8 @@ using real_axis_mb_solver_t = real_axis_mb_solver_base_t<HOST_MEMORY>;
  * dispatch + `update_G` Dyson update of `methods::scf_loop` (imag-axis).
  *
  * Inputs:
- *   comm        MPI communicator.
  *   state       reads/writes A_wskij, Sigma_x_skij, {Im,Re}Sigma_wskij.
+ *               The MPI communicator is read from state.mpi->comm.
  *               If state.A_wskij is unset/zero the loop builds an initial
  *               Lorentzian A from H_MF (taken from `dyson.H_MF()`).
  *   dyson       supplies H_MF, eta, mu_tol; wraps the Dyson + mu-update.
@@ -92,8 +92,7 @@ using real_axis_mb_solver_t = real_axis_mb_solver_base_t<HOST_MEMORY>;
  */
 template<MEMORY_SPACE MEM = HOST_MEMORY,
          methods::THC_ERI THC_t>
-inline scgw_result real_axis_scf_loop(boost::mpi3::communicator& comm,
-                                       real_axis_mb_state_t& state,
+inline scgw_result real_axis_scf_loop(real_axis_mb_state_t& state,
                                        real_axis_dyson_base_t<MEM>& dyson,
                                        THC_t const& thc,
                                        real_axis_mb_solver_base_t<MEM> mb_solver,
@@ -108,10 +107,13 @@ inline scgw_result real_axis_scf_loop(boost::mpi3::communicator& comm,
                "real_axis_scf_loop: state.grid not bound");
   utils::check(state.grid == &dyson.grid(),
                "real_axis_scf_loop: state.grid disagrees with dyson.grid()");
+  utils::check(state.mpi != nullptr,
+               "real_axis_scf_loop: state.mpi not bound");
   utils::check(mb_solver.scr_eri != nullptr,
                "real_axis_scf_loop: mb_solver.scr_eri must not be null");
   utils::check(mb_solver.gw != nullptr,
                "real_axis_scf_loop: mb_solver.gw must not be null");
+  auto& comm = state.mpi->comm;
 
   using nda::range;
   const auto _ = range::all;
@@ -180,11 +182,11 @@ inline scgw_result real_axis_scf_loop(boost::mpi3::communicator& comm,
 
   for (long it = 0; it < cfg.max_iter; ++it) {
     // ---- 1. update W (scr_coulomb) ----
-    mb_solver.scr_eri->update_w(comm, state, thc,
+    mb_solver.scr_eri->update_w(state, thc,
                                 /*verbose*/ false, use_rspace);
 
     // ---- 2. Sigma^c (gw) ----
-    mb_solver.gw->evaluate(comm, state, thc, cfg.eps_nufft,
+    mb_solver.gw->evaluate(state, thc, cfg.eps_nufft,
                            "ignore_g0", /*verbose*/ false, use_rspace);
 
     // Causality projection on Im Sigma_c (skwij layout).
@@ -210,7 +212,7 @@ inline scgw_result real_axis_scf_loop(boost::mpi3::communicator& comm,
 
     // ---- 3. Sigma^x (HF) ----
     if (mb_solver.hf != nullptr)
-      mb_solver.hf->evaluate(comm, state, thc, mu_cur);
+      mb_solver.hf->evaluate(state, thc, mu_cur);
     // (else: state.Sigma_x_skij stays zero; correlation-only SCF.)
 
     // ---- 4. Dyson update -> A_full (scratch) ----

@@ -111,6 +111,7 @@ namespace bdft_tests {
     // We use the IBZ eigenvalue for each FBZ k by mapping through kp_to_ibz.
     // -----------------------------------------------------------------------
     real_axis_mb_state_t state(grid);
+    state.mpi = mpi_context;
     state.A_wskij = nda::array<cval_t, 5>(N_w, ns, Nk, nbnd, nbnd);
     auto& A = *state.A_wskij;
     A = cval_t(0.0, 0.0);
@@ -137,7 +138,7 @@ namespace bdft_tests {
     // -----------------------------------------------------------------------
     // Run the real-axis G0W0 wrapper.
     // -----------------------------------------------------------------------
-    evaluate_thc_serial(mpi_context->comm, state, thc, /*eps_nufft*/ 1e-8,
+    evaluate_thc_serial(state, thc, /*eps_nufft*/ 1e-8,
                         "ignore_g0", /*verbose*/ false, /*use_rspace*/ true);
 
     REQUIRE(state.ImSigma_wskij.has_value());
@@ -235,6 +236,7 @@ namespace bdft_tests {
 
     auto build_state = [&]() {
       real_axis_mb_state_t state(grid);
+      state.mpi = mpi_context;
       state.A_wskij = nda::array<cval_t, 5>(N_w, ns, Nk, nbnd, nbnd);
       auto& A = *state.A_wskij;
       A = cval_t(0.0, 0.0);
@@ -258,9 +260,9 @@ namespace bdft_tests {
 
     auto state_k = build_state();
     auto state_r = build_state();
-    evaluate_thc_serial(mpi_context->comm, state_k, thc, /*eps_nufft*/ 1e-8,
+    evaluate_thc_serial(state_k, thc, /*eps_nufft*/ 1e-8,
                         "ignore_g0", /*verbose*/ false, /*use_rspace*/ false);
-    evaluate_thc_serial(mpi_context->comm, state_r, thc, /*eps_nufft*/ 1e-8,
+    evaluate_thc_serial(state_r, thc, /*eps_nufft*/ 1e-8,
                         "ignore_g0", /*verbose*/ false, /*use_rspace*/ true);
 
     REQUIRE(state_k.ImSigma_wskij.has_value());

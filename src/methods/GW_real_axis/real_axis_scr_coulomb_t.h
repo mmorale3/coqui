@@ -84,17 +84,15 @@ public:
   /**
    * Compute the dynamic screened interaction and store it in the MBState.
    *
-   * @param comm        MPI communicator. Π and W loops distributed across ranks
-   *                    and allreduced; result is fully replicated.
    * @param state       reads state.A_wskij; writes state.{Im,Re}{Pi,W}_qPQO.
+   *                    The MPI communicator is read from state.mpi->comm.
    * @param thc         THC ERI object (provides X, Z=V_PQ, MF accessors).
    * @param verbose     emit per-step timings on rank 0.
    * @param use_rspace  when true and Nk>1, run Π in R-space (Nk-fold reduction
    *                    in NUFFT calls) rather than k-space.
    */
   template<methods::THC_ERI THC_t>
-  void update_w(mpi_communicator_t& comm,
-                real_axis_mb_state_t& state,
+  void update_w(real_axis_mb_state_t& state,
                 THC_t const& thc,
                 bool verbose    = false,
                 bool use_rspace = false);
@@ -115,7 +113,6 @@ using real_axis_scr_coulomb_t = real_axis_scr_coulomb_base_t<HOST_MEMORY>;
 template<MEMORY_SPACE MEM>
 template<methods::THC_ERI THC_t>
 void real_axis_scr_coulomb_base_t<MEM>::update_w(
-    mpi_communicator_t& comm,
     real_axis_mb_state_t& state,
     THC_t const& thc,
     bool verbose,
@@ -133,6 +130,9 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
   utils::check(state.grid == _grid,
                "real_axis_scr_coulomb_t::update_w: state.grid disagrees with "
                "the grid the solver was constructed with");
+  utils::check(state.mpi != nullptr,
+               "real_axis_scr_coulomb_t::update_w: state.mpi not bound");
+  auto& comm = state.mpi->comm;
 
   using nda::range;
   const auto _ = range::all;

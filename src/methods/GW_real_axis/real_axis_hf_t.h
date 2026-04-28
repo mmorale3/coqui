@@ -68,11 +68,11 @@ public:
    *
    * The mu used for the f(w) integration in `evaluate_Sigma_x_serial` is
    * taken from `mu` (NOT grid->mu_chem()), so the SCF loop can pass the
-   * current mu without rebuilding the grid.
+   * current mu without rebuilding the grid. The MPI communicator is read
+   * from state.mpi->comm.
    */
   template<methods::THC_ERI THC_t>
-  void evaluate(mpi_communicator_t& comm,
-                real_axis_mb_state_t& state,
+  void evaluate(real_axis_mb_state_t& state,
                 THC_t const& thc,
                 double mu)
   {
@@ -83,6 +83,9 @@ public:
                  "grid the solver was constructed with");
     utils::check(state.A_wskij.has_value(),
                  "real_axis_hf_t::evaluate: state.A_wskij not allocated");
+    utils::check(state.mpi != nullptr,
+                 "real_axis_hf_t::evaluate: state.mpi not bound");
+    auto& comm = state.mpi->comm;
 
     auto const& grid_in = *_grid;
     auto const& MF      = *thc.MF();

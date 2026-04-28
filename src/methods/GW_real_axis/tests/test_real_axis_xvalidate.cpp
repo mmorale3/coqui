@@ -188,6 +188,7 @@ namespace bdft_tests {
     // Build initial A: diagonal Lorentzians per (s, k, n) eigenvalue.
     // ---------------------------------------------------------------
     real_axis_mb_state_t state(grid);
+    state.mpi = mpi_context;
     state.A_wskij = nda::array<cval_t, 5>(N_w, ns, Nk, nbnd, nbnd);
     auto& A = *state.A_wskij;
     A = cval_t(0.0, 0.0);
@@ -210,7 +211,7 @@ namespace bdft_tests {
     // ---------------------------------------------------------------
     // Run the real-axis G0W0 wrapper to produce Sigma_c(s, k, w, i, j).
     // ---------------------------------------------------------------
-    evaluate_thc_serial(mpi_context->comm, state, thc, /*eps_nufft*/ 1e-10,
+    evaluate_thc_serial(state, thc, /*eps_nufft*/ 1e-10,
                         "ignore_g0", /*verbose*/ false, /*use_rspace*/ true);
 
     REQUIRE(state.ImSigma_wskij.has_value());

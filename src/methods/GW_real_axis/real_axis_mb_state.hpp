@@ -16,6 +16,7 @@
 #include "configuration.hpp"
 #include "nda/nda.hpp"
 #include "mpi3/communicator.hpp"
+#include "utilities/mpi_context.h"
 #include "methods/GW_real_axis/real_freq_grid.hpp"
 
 namespace methods {
@@ -62,6 +63,8 @@ namespace real_axis {
  */
 struct real_axis_mb_state_t {
 
+  using mpi_context_t = utils::mpi_context_t<boost::mpi3::communicator>;
+
   // Finite-temperature parameters. Mandatory, not optional.
   double beta    = 0.0;
   double mu_chem = 0.0;
@@ -69,10 +72,9 @@ struct real_axis_mb_state_t {
   // Reference to the frequency/time grid (non-owning).
   real_freq_grid_t const* grid = nullptr;
 
-  // Non-owning MPI communicator. Distributed kernels accept a comm by
-  // reference; this slot is provided for callers that want to thread the
-  // comm through state alongside the grid.
-  boost::mpi3::communicator* comm = nullptr;
+  // MPI context (mirrors methods::MBState::mpi). Distributed solver classes
+  // read state.mpi->comm rather than taking a separate communicator argument.
+  std::shared_ptr<mpi_context_t> mpi;
 
   // SCF metadata.
   std::string coqui_prefix = "coqui_real_axis";

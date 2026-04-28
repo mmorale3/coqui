@@ -125,6 +125,7 @@ namespace bdft_tests {
 
     // State: empty A (loop builds Lorentzian initial from H_MF).
     real_axis_mb_state_t state(grid);
+    state.mpi = mpi_context;
 
     // Solver bundle.
     real_axis_hf_t          hf(&grid, "ignore_g0");
@@ -145,7 +146,7 @@ namespace bdft_tests {
     cfg.mix_kind    = scgw_mix_kind::diis;
     cfg.diis_window = 8;
 
-    auto res = real_axis_scf_loop(mpi_context->comm, state, dyson, thc,
+    auto res = real_axis_scf_loop(state, dyson, thc,
                                    mb_solver, cfg, k_weights,
                                    /*N_elec*/ static_cast<double>(mf->nelec()));
 

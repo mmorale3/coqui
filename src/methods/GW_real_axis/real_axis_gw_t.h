@@ -203,8 +203,8 @@ public:
    * MPI: the convolution loop is rank-distributed and allreduced; result is
    * fully replicated. Mirrors `evaluate_thc_serial` Steps 5-8.
    *
-   * @param comm        MPI communicator.
    * @param state       reads A and W; writes Sigma.
+   *                    The MPI communicator is read from state.mpi->comm.
    * @param thc         THC ERI (provides X and MF accessors).
    * @param eps_nufft   FINUFFT accuracy for the conv engine.
    * @param div_treatment  "ignore_g0" zeroes iq_gamma in the Sigma sum.
@@ -212,8 +212,7 @@ public:
    * @param use_rspace  when true and Nk>1, run the conv in R-space.
    */
   template<methods::THC_ERI THC_t>
-  void evaluate(boost::mpi3::communicator& comm,
-                real_axis::real_axis_mb_state_t & state,
+  void evaluate(real_axis::real_axis_mb_state_t & state,
                 THC_t const& thc,
                 double eps_nufft = 1e-10,
                 std::string div_treatment = "ignore_g0",
@@ -233,8 +232,7 @@ private:
 // `evaluate_serial`. Header-inline (matches the rest of the real-axis module).
 // --------------------------------------------------------------------------
 template<methods::THC_ERI THC_t>
-void real_axis_gw_t::evaluate(boost::mpi3::communicator& comm,
-                              real_axis::real_axis_mb_state_t & state,
+void real_axis_gw_t::evaluate(real_axis::real_axis_mb_state_t & state,
                               THC_t const& thc,
                               double eps_nufft,
                               std::string div_treatment,
@@ -247,6 +245,9 @@ void real_axis_gw_t::evaluate(boost::mpi3::communicator& comm,
   utils::check(state.ImW_qPQO.has_value() and state.ReW_qPQO.has_value(),
                "real_axis_gw_t::evaluate: state.{Im,Re}W_qPQO not allocated; "
                "call real_axis_scr_coulomb_t::update_w first");
+  utils::check(state.mpi != nullptr,
+               "real_axis_gw_t::evaluate: state.mpi not bound");
+  auto& comm = state.mpi->comm;
   utils::check(state.grid != nullptr,
                "real_axis_gw_t::evaluate: state.grid not bound");
   utils::check(state.grid == _grid,

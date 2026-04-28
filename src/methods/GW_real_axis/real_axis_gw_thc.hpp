@@ -43,8 +43,7 @@ namespace real_axis {
  */
 template<MEMORY_SPACE MEM = HOST_MEMORY,
          methods::THC_ERI THC_t>
-void evaluate_thc_serial(boost::mpi3::communicator& comm,
-                         real_axis_mb_state_t & state,
+void evaluate_thc_serial(real_axis_mb_state_t & state,
                          THC_t const& thc,
                          double eps_nufft = 1e-10,
                          std::string div_treatment = "ignore_g0",
@@ -56,15 +55,17 @@ void evaluate_thc_serial(boost::mpi3::communicator& comm,
                 "in the underlying solver classes.");
   utils::check(state.grid != nullptr,
                "evaluate_thc_serial: state.grid not bound");
+  utils::check(state.mpi != nullptr,
+               "evaluate_thc_serial: state.mpi not bound");
 
   auto const& grid = *state.grid;
 
   real_axis_scr_coulomb_t scr_eri(&grid, "rpa", div_treatment, eps_nufft);
-  scr_eri.update_w(comm, state, thc, verbose, use_rspace);
+  scr_eri.update_w(state, thc, verbose, use_rspace);
 
   methods::solvers::real_axis_gw_t gw(grid, /*max_iter*/ 1, /*mix*/ 0.5,
                                       eps_nufft, /*ntrans*/ 1);
-  gw.evaluate(comm, state, thc, eps_nufft, div_treatment, verbose, use_rspace);
+  gw.evaluate(state, thc, eps_nufft, div_treatment, verbose, use_rspace);
 }
 
 } // namespace real_axis
