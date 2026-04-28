@@ -302,16 +302,29 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
   const double dt_conv = sec_since(t_conv0);
 
   // ----------------------------------------------------------------
-  // Step 1: project A(k) -> A_aux_skPQw with iw innermost.
+  // Step 1: project A(k) -> A_aux_skPQw with iw innermost. A_aux is
+  // distributed over (P, Q) with the SAME proc grid as state.{Im,Re}Pi
+  // so the kernel reads/writes line up. Each rank produces only its
+  // local (P_loc, Q_loc, N_w) slice via the two-X-views overload of
+  // primary_to_aux_one_k.
   // ----------------------------------------------------------------
   const auto t1 = t_now();
-  nda::array<ComplexType, 5> A_aux_skPQw(ns, Nk, Naux, Naux, N_w);
+  using local_5d_t = memory::array<HOST_MEMORY, ComplexType, 5>;
+  auto pgrid_4d = state.ImPi_qPQO->grid();
+  auto bsize_4d = state.ImPi_qPQO->block_size();
+  std::array<long, 5> pgrid_aux = {1, 1, pgrid_4d[1], pgrid_4d[2], 1};
+  std::array<long, 5> bsize_aux = {1, 1, bsize_4d[1], bsize_4d[2], 1};
+  std::array<long, 5> shape_aux = {ns, Nk, Naux, Naux, N_w};
+  auto dA_aux_skPQw = math::nda::make_distributed_array<local_5d_t>(
+      comm, pgrid_aux, shape_aux, bsize_aux);
+  auto A_aux_loc = dA_aux_skPQw.local();  // (ns, Nk, Naux_loc_P, Naux_loc_Q, N_w)
   for (long s = 0; s < ns; ++s)
     for (long ik = 0; ik < Nk; ++ik) {
-      auto X_view     = X(s, ik, _, _);
+      auto X_P_slice  = X(s, ik, Pr, _);
+      auto X_Q_slice  = X(s, ik, Qr, _);
       auto A_view     = A(s, ik, _, _, _);
-      auto A_aux_view = A_aux_skPQw(s, ik, _, _, _);
-      primary_to_aux_one_k(X_view, A_view, A_aux_view);
+      auto A_aux_view = A_aux_loc(s, ik, _, _, _);
+      primary_to_aux_one_k(X_P_slice, X_Q_slice, A_view, A_aux_view);
     }
   const double dt1 = sec_since(t1);
 
@@ -327,27 +340,26 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
     auto f_Rk = sf_Rk_opt->local();
     auto f_qR = sf_qR_opt->local();
 
-    // FT A_aux from k-space to R-space, per s. A_aux is replicated, FT is
-    // a per-rank gemm.
-    nda::array<ComplexType, 5> A_aux_sRPQw(ns, NR, Naux, Naux, N_w);
+    // FT A_aux from k-space to R-space, per s. Each rank does its OWN
+    // local (P_loc, Q_loc, N_w) block: a single gemm of f_Rk by the
+    // (Nk, B_loc * N_w) reshape of the rank's local A_aux slice. No comm.
+    nda::array<ComplexType, 5> A_aux_sRPQw_loc(ns, NR, Naux_loc_P, Naux_loc_Q, N_w);
     for (long s = 0; s < ns; ++s) {
-      auto A_in_2D  = nda::reshape(A_aux_skPQw(s, _, _, _, _),
-                                   std::array<long,2>{Nk, Naux*Naux*N_w});
-      auto A_out_2D = nda::reshape(A_aux_sRPQw(s, _, _, _, _),
-                                   std::array<long,2>{NR, Naux*Naux*N_w});
+      auto A_in_2D  = nda::reshape(A_aux_loc(s, _, _, _, _),
+                                   std::array<long,2>{Nk, B_loc * N_w});
+      auto A_out_2D = nda::reshape(A_aux_sRPQw_loc(s, _, _, _, _),
+                                   std::array<long,2>{NR, B_loc * N_w});
       nda::blas::gemm(ComplexType(1.0, 0.0), f_Rk, A_in_2D,
                       ComplexType(0.0, 0.0), A_out_2D);
     }
 
     // Per-R cross-correlation, into per-rank local (P_loc, Q_loc, N_O) slice.
-    // Kernel reads only LOCAL (P, Q) blocks of A_aux on both legs; the
-    // second-leg "global Q, P" read is replaced by conj of the local
-    // block via aux-hermiticity.
+    // Kernel reads only LOCAL (P, Q) blocks of A_aux on both legs.
     nda::array<ComplexType, 4> ImPi_RPQO_loc(NR, Naux_loc_P, Naux_loc_Q, N_O);
     ImPi_RPQO_loc = ComplexType(0.0, 0.0);
     for (long iR = 0; iR < NR; ++iR) {
       for (long s = 0; s < ns; ++s) {
-        auto A_local    = A_aux_sRPQw(s, iR, Pr, Qr, _);
+        auto A_local     = A_aux_sRPQw_loc(s, iR, _, _, _);
         auto ImPi_R_view = ImPi_RPQO_loc(iR, _, _, _);
         accumulate_ImPi_one_kq(conv, A_local, A_local, ImPi_R_view, 1.0);
       }
@@ -375,8 +387,8 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
       for (long s = 0; s < ns; ++s) {
         for (long ik = 0; ik < Nk; ++ik) {
           const long ikq = kpq(ik, iq);
-          auto Ak_local  = A_aux_skPQw(s, ik,  Pr, Qr, _);
-          auto Akq_local = A_aux_skPQw(s, ikq, Pr, Qr, _);
+          auto Ak_local  = A_aux_loc(s, ik,  _, _, _);
+          auto Akq_local = A_aux_loc(s, ikq, _, _, _);
           accumulate_ImPi_one_kq(conv, Ak_local, Akq_local, ImPi_q_view,
                                  k_weight);
         }
