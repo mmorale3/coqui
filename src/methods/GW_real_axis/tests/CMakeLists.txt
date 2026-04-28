@@ -21,6 +21,7 @@ if(ENABLE_FINUFFT)
       test_real_axis_scr_coulomb.cpp
       test_real_axis_dyson_t.cpp
       test_real_axis_scf_loop.cpp
+      test_real_axis_hermiticity.cpp
      )
 
   add_executable(test_${TEST_ID} ${TEST_SRCS})
