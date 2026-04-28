@@ -60,7 +60,9 @@ inline void accumulate_ImPi_one_kq(detail::real_axis_conv_base_t<MEM> & conv,
                                    AK   const& A_PQ_k,
                                    AKQ  const& A_PQ_kq,
                                    POut      & ImPi_PQ_O,
-                                   double k_weight)
+                                   double k_weight,
+                                   long P_origin = 0,
+                                   long Q_origin = 0)
 {
   if constexpr (MEM != HOST_MEMORY) {
     utils::check(false,
@@ -69,16 +71,25 @@ inline void accumulate_ImPi_one_kq(detail::real_axis_conv_base_t<MEM> & conv,
                  "are not yet implemented.");
     return;
   }
+  // A_PQ_k / A_PQ_kq are full (Naux, Naux, N_w) replicated views.
+  // ImPi_PQ_O is a local slice of shape (Naux_loc_P, Naux_loc_Q, N_Omega) into
+  // which this rank's contribution is accumulated. (P_origin, Q_origin)
+  // give the global offsets for the local slice; default 0 reproduces the
+  // legacy fully-replicated behavior.
   const long Naux = A_PQ_k.shape()[0];
-  const long N_w = A_PQ_k.shape()[2];
-  const long N_O = ImPi_PQ_O.shape()[2];
+  const long N_w  = A_PQ_k.shape()[2];
+  const long Naux_loc_P = ImPi_PQ_O.shape()[0];
+  const long Naux_loc_Q = ImPi_PQ_O.shape()[1];
+  const long N_O  = ImPi_PQ_O.shape()[2];
 
   utils::check(A_PQ_k.shape() == A_PQ_kq.shape(),
                "accumulate_ImPi_one_kq: A_k and A_kq must have same shape");
   utils::check(A_PQ_k.shape()[1] == Naux,
                "accumulate_ImPi_one_kq: A must be square in (P,Q)");
-  utils::check(ImPi_PQ_O.shape()[0] == Naux and ImPi_PQ_O.shape()[1] == Naux,
-               "accumulate_ImPi_one_kq: ImPi shape mismatch");
+  utils::check(P_origin >= 0 and P_origin + Naux_loc_P <= Naux,
+               "accumulate_ImPi_one_kq: P range out of bounds");
+  utils::check(Q_origin >= 0 and Q_origin + Naux_loc_Q <= Naux,
+               "accumulate_ImPi_one_kq: Q range out of bounds");
   utils::check(N_w == conv.N_w() and N_O == conv.N_Omega(),
                "accumulate_ImPi_one_kq: grid mismatch");
 
@@ -87,12 +98,12 @@ inline void accumulate_ImPi_one_kq(detail::real_axis_conv_base_t<MEM> & conv,
   auto const& wq   = grid.w_weights();
 
   // Build weighted spectra at k and k+q for the bubble.
-  // Layout: (B, N_w) with B = Naux*Naux, and for index b = P*Naux + Q:
-  //   - F^<_{b}(w) = f(w) A_{PQ}(k, w)        (left leg, at k)
-  //   - G^>_{b}(w) = (1-f(w)) A_{QP}(k+q, w)  (right leg, at k+q, transposed indices)
+  // Layout: (B, N_w) with B = Naux_loc_P * Naux_loc_Q. For index b = iP*Naux_loc_Q + iQ:
+  //   - F^<_{b}(w) = f(w) A_{P,Q}(k, w)            (left leg, at k, global (P,Q))
+  //   - G^>_{b}(w) = (1-f(w)) A_{Q,P}(k+q, w)      (right leg, at k+q, transposed indices)
   // The weighted forms also absorb the trapezoidal quadrature weights, so
   // the lower-level NUFFT primitives don't need to apply them again.
-  const long B   = Naux * Naux;
+  const long B   = Naux_loc_P * Naux_loc_Q;
   const long N_t = conv.N_t();
 
   nda::array<ComplexType, 2> Aless_k(B, N_w);
@@ -100,9 +111,11 @@ inline void accumulate_ImPi_one_kq(detail::real_axis_conv_base_t<MEM> & conv,
   nda::array<ComplexType, 2> Aless_kq(B, N_w);
   nda::array<ComplexType, 2> Agtr_kq(B, N_w);
 
-  for (long P = 0; P < Naux; ++P) {
-    for (long Q = 0; Q < Naux; ++Q) {
-      const long b = P * Naux + Q;
+  for (long iP = 0; iP < Naux_loc_P; ++iP) {
+    const long P = P_origin + iP;
+    for (long iQ = 0; iQ < Naux_loc_Q; ++iQ) {
+      const long Q = Q_origin + iQ;
+      const long b = iP * Naux_loc_Q + iQ;
       for (long j = 0; j < N_w; ++j) {
         const double f_w  = grid.fermi(w(j));
         const double fb_w = 1.0 - f_w;
@@ -139,20 +152,22 @@ inline void accumulate_ImPi_one_kq(detail::real_axis_conv_base_t<MEM> & conv,
   conv.backward(Hhat, Hraw, gk::bosonic);
   const double s_nufft = conv.nufft_scale();
   const double s_pi    = -M_PI * k_weight * s_nufft;
-  for (long P = 0; P < Naux; ++P)
-    for (long Q = 0; Q < Naux; ++Q) {
-      const long b = P * Naux + Q;
+  for (long iP = 0; iP < Naux_loc_P; ++iP)
+    for (long iQ = 0; iQ < Naux_loc_Q; ++iQ) {
+      const long b = iP * Naux_loc_Q + iQ;
       for (long iO = 0; iO < N_O; ++iO)
-        ImPi_PQ_O(P, Q, iO) += s_pi * Hraw(b, iO);
+        ImPi_PQ_O(iP, iQ, iO) += s_pi * Hraw(b, iO);
     }
 }
 
 /**
  * Recover Re Pi^R from Im Pi^R via Hilbert transform on the bosonic grid.
  *
- * @param conv      NUFFT engine (ntrans >= Naux*Naux)
- * @param ImPi_PQ_O Im Pi for one q (Naux, Naux, N_Omega), real-valued
- * @param RePi_PQ_O OUTPUT Re Pi for one q (Naux, Naux, N_Omega), real-valued
+ * @param conv      NUFFT engine (ntrans >= Naux_P*Naux_Q)
+ * @param ImPi_PQ_O Im Pi for one q (Naux_P, Naux_Q, N_Omega), real-valued.
+ *                  Either the full (Naux, Naux, ...) array or a (P_loc, Q_loc, ...)
+ *                  local slice from a distributed array.
+ * @param RePi_PQ_O OUTPUT Re Pi, same shape as ImPi_PQ_O.
  */
 template<MEMORY_SPACE MEM = HOST_MEMORY>
 inline void RePi_from_ImPi(detail::real_axis_conv_base_t<MEM> & conv,
@@ -162,26 +177,27 @@ inline void RePi_from_ImPi(detail::real_axis_conv_base_t<MEM> & conv,
   if constexpr (MEM != HOST_MEMORY) {
     utils::check(false,
                  "RePi_from_ImPi<DEVICE>: device kernel for the (P, Q) "
-                 "<-> batch (B = Naux^2) gather/scatter not yet implemented.");
+                 "<-> batch gather/scatter not yet implemented.");
     return;
   }
-  const long Naux = ImPi_PQ_O.shape()[0];
+  const long Naux_P = ImPi_PQ_O.shape()[0];
+  const long Naux_Q = ImPi_PQ_O.shape()[1];
   const long N_O = ImPi_PQ_O.shape()[2];
-  const long B = Naux * Naux;
+  const long B = Naux_P * Naux_Q;
 
   memory::array<MEM, double, 2> ImBuf(B, N_O), ReBuf(B, N_O);
-  for (long P = 0; P < Naux; ++P)
-    for (long Q = 0; Q < Naux; ++Q) {
-      const long b = P * Naux + Q;
+  for (long P = 0; P < Naux_P; ++P)
+    for (long Q = 0; Q < Naux_Q; ++Q) {
+      const long b = P * Naux_Q + Q;
       for (long iO = 0; iO < N_O; ++iO)
         ImBuf(b, iO) = ImPi_PQ_O(P, Q, iO);
     }
 
   conv.hilbert(ImBuf, ReBuf, grid_kind::bosonic);
 
-  for (long P = 0; P < Naux; ++P)
-    for (long Q = 0; Q < Naux; ++Q) {
-      const long b = P * Naux + Q;
+  for (long P = 0; P < Naux_P; ++P)
+    for (long Q = 0; Q < Naux_Q; ++Q) {
+      const long b = P * Naux_Q + Q;
       for (long iO = 0; iO < N_O; ++iO)
         RePi_PQ_O(P, Q, iO) = ReBuf(b, iO);
     }

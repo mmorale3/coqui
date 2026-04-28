@@ -22,6 +22,9 @@
 #include "utilities/check.hpp"
 #include "utilities/kpoint_utils.hpp"
 #include "numerics/shared_array/nda.hpp"
+#include "numerics/distributed_array/nda.hpp"
+#include "numerics/distributed_array/nda_utils.hpp"
+#include "numerics/distributed_array/slate_ops.hpp"
 
 #include "mean_field/MF.hpp"
 #include "methods/ERI/detail/concepts.hpp"
@@ -168,18 +171,20 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
   // (Re)allocate bosonic state dArrays (distributed over (P, Q)).
   state.allocate_bosonic(Nq, Naux);
 
-  // Phase 1A.1: kernel still computes Pi/W in fully-replicated nda::array
-  // buffers; the local (P_loc, Q_loc) slice is copied into the state
-  // dArrays at the end of each step. Phase 1A.2 will rewrite the kernels
-  // to write directly into the distributed slice with no replicated buffer.
-  nda::array<ComplexType, 4> ImPi(Nq, Naux, Naux, N_O);
-  nda::array<ComplexType, 4> RePi(Nq, Naux, Naux, N_O);
-  nda::array<ComplexType, 4> ImW(Nq, Naux, Naux, N_O);
-  nda::array<ComplexType, 4> ReW(Nq, Naux, Naux, N_O);
-  ImPi() = ComplexType(0.0, 0.0);
-  RePi() = ComplexType(0.0, 0.0);
-  ImW()  = ComplexType(0.0, 0.0);
-  ReW()  = ComplexType(0.0, 0.0);
+  // Local (P_loc, Q_loc) ranges and shapes from the distributed state.
+  auto Pr = state.ImPi_qPQO->local_range(1);
+  auto Qr = state.ImPi_qPQO->local_range(2);
+  const long Naux_loc_P = Pr.size();
+  const long Naux_loc_Q = Qr.size();
+  const long B_loc      = Naux_loc_P * Naux_loc_Q;
+  auto ImPi_loc = state.ImPi_qPQO->local();
+  auto RePi_loc = state.RePi_qPQO->local();
+  auto ImW_loc  = state.ImW_qPQO->local();
+  auto ReW_loc  = state.ReW_qPQO->local();
+  ImPi_loc = ComplexType(0.0, 0.0);
+  RePi_loc = ComplexType(0.0, 0.0);
+  ImW_loc  = ComplexType(0.0, 0.0);
+  ReW_loc  = ComplexType(0.0, 0.0);
 
   // Repack input A from (N_w, ns, nkpts, nbnd, nbnd) to driver layout
   // (ns, nkpts, N_w, nbnd, nbnd).
@@ -274,9 +279,11 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
   }
   const bool do_rspace = (NR > 0);
 
-  // NUFFT engine sized to the largest batched cross-correlation (Naux*Naux).
+  // NUFFT engine sized to the local batched cross-correlation
+  // (Naux_loc_P * Naux_loc_Q). Each rank only does the FFTs for its
+  // (P_loc, Q_loc) block; the full Naux^2 batch is split across ranks.
   const auto t_conv0 = t_now();
-  real_axis_conv_t conv(grid, /*ntrans*/ Naux*Naux, _eps_nufft);
+  real_axis_conv_t conv(grid, /*ntrans*/ B_loc, _eps_nufft);
   const double dt_conv = sec_since(t_conv0);
 
   // ----------------------------------------------------------------
@@ -298,11 +305,15 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
   // ----------------------------------------------------------------
   const auto t2 = t_now();
 
+  // Step 2 distribution model: each rank works on its local (P_loc, Q_loc)
+  // slice for ALL (s, k, q). The (P, Q) partitioning replaces the previous
+  // (s, k, q) partitioning + allreduce. No comm in Step 2.
   if (do_rspace) {
     auto f_Rk = sf_Rk_opt->local();
     auto f_qR = sf_qR_opt->local();
 
-    // FT A_aux from k-space to R-space, per s.
+    // FT A_aux from k-space to R-space, per s. A_aux is replicated, FT is
+    // a per-rank gemm.
     nda::array<ComplexType, 5> A_aux_sRPQw(ns, NR, Naux, Naux, N_w);
     for (long s = 0; s < ns; ++s) {
       auto A_in_2D  = nda::reshape(A_aux_skPQw(s, _, _, _, _),
@@ -313,151 +324,160 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
                       ComplexType(0.0, 0.0), A_out_2D);
     }
 
-    // Per-R cross-correlation, distributed over R.
-    nda::array<ComplexType, 4> ImPi_RPQO(NR, Naux, Naux, N_O);
-    ImPi_RPQO = ComplexType(0.0, 0.0);
-    {
-      const int rank = comm.rank();
-      const int size = comm.size();
-      for (long iR = rank; iR < NR; iR += size) {
-        for (long s = 0; s < ns; ++s) {
-          auto A_view      = A_aux_sRPQw(s, iR, _, _, _);
-          auto ImPi_R_view = ImPi_RPQO(iR, _, _, _);
-          accumulate_ImPi_one_kq(conv, A_view, A_view, ImPi_R_view, 1.0);
-        }
+    // Per-R cross-correlation, into per-rank local (P_loc, Q_loc, N_O) slice.
+    nda::array<ComplexType, 4> ImPi_RPQO_loc(NR, Naux_loc_P, Naux_loc_Q, N_O);
+    ImPi_RPQO_loc = ComplexType(0.0, 0.0);
+    for (long iR = 0; iR < NR; ++iR) {
+      for (long s = 0; s < ns; ++s) {
+        auto A_view      = A_aux_sRPQw(s, iR, _, _, _);
+        auto ImPi_R_view = ImPi_RPQO_loc(iR, _, _, _);
+        accumulate_ImPi_one_kq(conv, A_view, A_view, ImPi_R_view, 1.0,
+                               Pr.first(), Qr.first());
       }
-      if (size > 1)
-        comm.all_reduce_in_place_n(ImPi_RPQO.data(), ImPi_RPQO.size(), std::plus<>{});
     }
 
-    // FT ImPi from R-space to q-space.
+    // FT ImPi from R-space to q-space. Per-rank gemm on the local block;
+    // f_qR is replicated, contracts over R.
     {
-      auto ImPi_R_2D = nda::reshape(ImPi_RPQO, std::array<long,2>{NR, Naux*Naux*N_O});
-      auto ImPi_q_2D = nda::reshape(ImPi, std::array<long,2>{Nq, Naux*Naux*N_O});
+      auto ImPi_R_2D = nda::reshape(ImPi_RPQO_loc,
+                                    std::array<long,2>{NR, B_loc * N_O});
+      auto ImPi_q_2D = nda::reshape(ImPi_loc,
+                                    std::array<long,2>{Nq, B_loc * N_O});
       nda::blas::gemm(ComplexType(1.0, 0.0), f_qR, ImPi_R_2D,
                       ComplexType(0.0, 0.0), ImPi_q_2D);
     }
 
     if (iq_gamma >= 0) {
-      for (long P = 0; P < Naux; ++P)
-        for (long Q = 0; Q < Naux; ++Q)
-          for (long iO = 0; iO < N_O; ++iO)
-            ImPi(iq_gamma, P, Q, iO) = ComplexType(0.0, 0.0);
+      ImPi_loc(iq_gamma, nda::ellipsis{}) = ComplexType(0.0, 0.0);
     }
   } else {
     const double k_weight = 1.0 / static_cast<double>(Nk);
-    const long total_qsk = Nq * ns * Nk;
-    const int rank = comm.rank();
-    const int size = comm.size();
-    for (long idx = rank; idx < total_qsk; idx += size) {
-      const long iq  = idx / (ns * Nk);
-      const long rem = idx % (ns * Nk);
-      const long s   = rem / Nk;
-      const long ik  = rem % Nk;
+    for (long iq = 0; iq < Nq; ++iq) {
       if (iq == iq_gamma) continue;
-      const long ikq = kpq(ik, iq);
-      auto Ak_view   = A_aux_skPQw(s, ik,  _, _, _);
-      auto Akq_view  = A_aux_skPQw(s, ikq, _, _, _);
-      auto ImPi_view = ImPi(iq, _, _, _);
-      accumulate_ImPi_one_kq(conv, Ak_view, Akq_view, ImPi_view, k_weight);
+      auto ImPi_q_view = ImPi_loc(iq, _, _, _);
+      for (long s = 0; s < ns; ++s) {
+        for (long ik = 0; ik < Nk; ++ik) {
+          const long ikq = kpq(ik, iq);
+          auto Ak_view  = A_aux_skPQw(s, ik,  _, _, _);
+          auto Akq_view = A_aux_skPQw(s, ikq, _, _, _);
+          accumulate_ImPi_one_kq(conv, Ak_view, Akq_view, ImPi_q_view,
+                                 k_weight, Pr.first(), Qr.first());
+        }
+      }
     }
-    if (size > 1)
-      comm.all_reduce_in_place_n(ImPi.data(), ImPi.size(), std::plus<>{});
   }
   const double dt2 = sec_since(t2);
 
   // ----------------------------------------------------------------
   // Step 3: Re Pi via batched Hilbert transform on the bosonic grid.
-  // Distributed over iq, allreduced.
+  // Each rank Hilbert-transforms its own (P_loc, Q_loc, N_O) slice for
+  // every iq. No comm.
   // ----------------------------------------------------------------
   const auto t3 = t_now();
   {
-    const int rank = comm.rank();
-    const int size = comm.size();
-    nda::array<double, 3> ImPi_PQ_O(Naux, Naux, N_O);
-    nda::array<double, 3> RePi_PQ_O(Naux, Naux, N_O);
-    for (long iq = rank; iq < Nq; iq += size) {
+    nda::array<double, 3> ImPi_loc_real(Naux_loc_P, Naux_loc_Q, N_O);
+    nda::array<double, 3> RePi_loc_real(Naux_loc_P, Naux_loc_Q, N_O);
+    for (long iq = 0; iq < Nq; ++iq) {
       if (iq == iq_gamma) continue;
-      auto ImPi_view = ImPi(iq, _, _, _);
-      for (long P = 0; P < Naux; ++P)
-        for (long Q = 0; Q < Naux; ++Q)
+      auto ImPi_q_view = ImPi_loc(iq, _, _, _);
+      auto RePi_q_view = RePi_loc(iq, _, _, _);
+      for (long iP = 0; iP < Naux_loc_P; ++iP)
+        for (long iQ = 0; iQ < Naux_loc_Q; ++iQ)
           for (long iO = 0; iO < N_O; ++iO)
-            ImPi_PQ_O(P, Q, iO) = ImPi_view(P, Q, iO).real();
-      RePi_from_ImPi(conv, ImPi_PQ_O, RePi_PQ_O);
-      auto RePi_view = RePi(iq, _, _, _);
-      for (long P = 0; P < Naux; ++P)
-        for (long Q = 0; Q < Naux; ++Q)
+            ImPi_loc_real(iP, iQ, iO) = ImPi_q_view(iP, iQ, iO).real();
+      RePi_from_ImPi(conv, ImPi_loc_real, RePi_loc_real);
+      for (long iP = 0; iP < Naux_loc_P; ++iP)
+        for (long iQ = 0; iQ < Naux_loc_Q; ++iQ)
           for (long iO = 0; iO < N_O; ++iO)
-            RePi_view(P, Q, iO) = ComplexType(RePi_PQ_O(P, Q, iO), 0.0);
+            RePi_q_view(iP, iQ, iO) =
+                ComplexType(RePi_loc_real(iP, iQ, iO), 0.0);
     }
-    if (size > 1)
-      comm.all_reduce_in_place_n(RePi.data(), RePi.size(), std::plus<>{});
   }
   const double dt3 = sec_since(t3);
 
   // ----------------------------------------------------------------
-  // Step 4: Solve Dyson W per (q, Omega). Distributed over iq, allreduced.
+  // Step 4: Solve Dyson W = (I - V Pi)^{-1} V per (q, Omega) via slate_ops
+  // on (P, Q)-distributed matrices. The same proc grid as state.{Im,Re}Pi
+  // is used so .local() blocks line up.
   // ----------------------------------------------------------------
   const auto t4 = t_now();
   {
-    const int rank = comm.rank();
-    const int size = comm.size();
-    nda::array<ComplexType, 2> Vmat(Naux, Naux);
-    nda::array<ComplexType, 2> Pi(Naux, Naux);
-    nda::array<ComplexType, 2> W(Naux, Naux);
-    for (long iq = rank; iq < Nq; iq += size) {
-      // ignore_g0: leave W at iq_gamma exactly zero (consistent with Pi=0
-      // there). The Sigma kernel skips iq_gamma anyway, so this is
-      // semantically equivalent to leaving W = V_bare at gamma -- but the
-      // explicit zero gives a cleaner contract for downstream consumers
-      // (e.g. eps_inv_head, divergence corrections).
+    using Array_2D_t = memory::array<HOST_MEMORY, ComplexType, 2>;
+    auto pgrid_full = state.ImPi_qPQO->grid();
+    auto bsize_full = state.ImPi_qPQO->block_size();
+    std::array<long, 2> pgrid_PQ = {pgrid_full[1], pgrid_full[2]};
+    std::array<long, 2> bsize_PQ = {bsize_full[1], bsize_full[2]};
+    auto dV_PQ  = math::nda::make_distributed_array<Array_2D_t>(
+        comm, pgrid_PQ, {Naux, Naux}, bsize_PQ, true);
+    auto dPi_PQ = math::nda::make_distributed_array<Array_2D_t>(
+        comm, pgrid_PQ, {Naux, Naux}, bsize_PQ, true);
+    auto dA_PQ  = math::nda::make_distributed_array<Array_2D_t>(
+        comm, pgrid_PQ, {Naux, Naux}, bsize_PQ, true);
+    auto dW_PQ  = math::nda::make_distributed_array<Array_2D_t>(
+        comm, pgrid_PQ, {Naux, Naux}, bsize_PQ, true);
+    auto V_loc  = dV_PQ.local();
+    auto Pi_loc = dPi_PQ.local();
+    auto A_loc  = dA_PQ.local();
+    auto W_loc  = dW_PQ.local();
+
+    // Identity-diagonal entries owned by this rank.
+    std::vector<std::pair<long, long>> diag_idx;
+    for (long iP = 0; iP < Naux_loc_P; ++iP) {
+      const long P_g = Pr.first() + iP;
+      for (long iQ = 0; iQ < Naux_loc_Q; ++iQ) {
+        const long Q_g = Qr.first() + iQ;
+        if (P_g == Q_g) diag_idx.push_back({iP, iQ});
+      }
+    }
+
+    for (long iq = 0; iq < Nq; ++iq) {
+      // ignore_g0: leave W at iq_gamma exactly zero (Pi was zeroed there
+      // already). Σ kernel skips iq_gamma; explicit zero is a cleaner
+      // contract for downstream consumers (eps_inv_head, divergence corrections).
       if (iq == iq_gamma) continue;
-      for (long P = 0; P < Naux; ++P)
-        for (long Q = 0; Q < Naux; ++Q)
-          Vmat(P, Q) = V(iq, P, Q);
+
+      // Fill V_loc and Pi_loc from replicated V and distributed state.Pi.
+      for (long iP = 0; iP < Naux_loc_P; ++iP) {
+        const long P_g = Pr.first() + iP;
+        for (long iQ = 0; iQ < Naux_loc_Q; ++iQ) {
+          const long Q_g = Qr.first() + iQ;
+          V_loc(iP, iQ) = V(iq, P_g, Q_g);
+        }
+      }
+
       for (long iO = 0; iO < N_O; ++iO) {
-        for (long P = 0; P < Naux; ++P)
-          for (long Q = 0; Q < Naux; ++Q)
-            Pi(P, Q) = ComplexType(RePi(iq, P, Q, iO).real(),
-                                   ImPi(iq, P, Q, iO).real());
-        solve_dyson_W_aux(Vmat, Pi, W);
-        for (long P = 0; P < Naux; ++P)
-          for (long Q = 0; Q < Naux; ++Q) {
-            ReW(iq, P, Q, iO) = ComplexType(W(P, Q).real(), 0.0);
-            ImW(iq, P, Q, iO) = ComplexType(W(P, Q).imag(), 0.0);
+        for (long iP = 0; iP < Naux_loc_P; ++iP)
+          for (long iQ = 0; iQ < Naux_loc_Q; ++iQ)
+            Pi_loc(iP, iQ) = ComplexType(RePi_loc(iq, iP, iQ, iO).real(),
+                                         ImPi_loc(iq, iP, iQ, iO).real());
+
+        // A = V * Pi
+        math::nda::slate_ops::multiply(ComplexType(1.0, 0.0), dV_PQ, dPi_PQ,
+                                       ComplexType(0.0, 0.0), dA_PQ);
+        // A = -A
+        A_loc *= ComplexType(-1.0, 0.0);
+        // A = I - V*Pi (add identity to diagonal entries owned by this rank)
+        for (auto const& d : diag_idx)
+          A_loc(d.first, d.second) += ComplexType(1.0, 0.0);
+        // A := A^{-1} = (I - V*Pi)^{-1}
+        math::nda::slate_ops::inverse(dA_PQ);
+        // A -= I
+        for (auto const& d : diag_idx)
+          A_loc(d.first, d.second) -= ComplexType(1.0, 0.0);
+        // W = ((I - V*Pi)^{-1} - I) * V
+        math::nda::slate_ops::multiply(ComplexType(1.0, 0.0), dA_PQ, dV_PQ,
+                                       ComplexType(0.0, 0.0), dW_PQ);
+
+        // Write into state.{Im,Re}W at this (iq, iO).
+        for (long iP = 0; iP < Naux_loc_P; ++iP)
+          for (long iQ = 0; iQ < Naux_loc_Q; ++iQ) {
+            ReW_loc(iq, iP, iQ, iO) = ComplexType(W_loc(iP, iQ).real(), 0.0);
+            ImW_loc(iq, iP, iQ, iO) = ComplexType(W_loc(iP, iQ).imag(), 0.0);
           }
       }
     }
-    if (size > 1) {
-      comm.all_reduce_in_place_n(ReW.data(), ReW.size(), std::plus<>{});
-      comm.all_reduce_in_place_n(ImW.data(), ImW.size(), std::plus<>{});
-    }
   }
   const double dt4 = sec_since(t4);
-
-  // ----------------------------------------------------------------
-  // Phase 1A.1 finalize: copy each rank's (P_loc, Q_loc) slice from
-  // the replicated buffers into the distributed state dArrays.
-  // ----------------------------------------------------------------
-  {
-    auto copy_slice = [&](nda::array<ComplexType, 4> const& src,
-                          real_axis_mb_state_t::bosonic_dArray_t& dst) {
-      auto Pr = dst.local_range(1);
-      auto Qr = dst.local_range(2);
-      auto loc = dst.local();
-      // Local slice: (Nq, P_loc, Q_loc, N_O); src is (Nq, Naux, Naux, N_O).
-      for (long iq = 0; iq < Nq; ++iq)
-        for (long iP = 0; iP < Pr.size(); ++iP)
-          for (long iQ = 0; iQ < Qr.size(); ++iQ)
-            for (long iO = 0; iO < N_O; ++iO)
-              loc(iq, iP, iQ, iO) =
-                  src(iq, Pr.first() + iP, Qr.first() + iQ, iO);
-    };
-    copy_slice(ImPi, *state.ImPi_qPQO);
-    copy_slice(RePi, *state.RePi_qPQO);
-    copy_slice(ImW,  *state.ImW_qPQO);
-    copy_slice(ReW,  *state.ReW_qPQO);
-  }
 
   if (verbose and comm.root()) {
     const double dt_total = sec_since(t_total);
