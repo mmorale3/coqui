@@ -187,14 +187,20 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
   ReW_loc  = ComplexType(0.0, 0.0);
 
   // Repack input A from (N_w, ns, nkpts, nbnd, nbnd) to driver layout
-  // (ns, nkpts, N_w, nbnd, nbnd).
+  // (ns, nkpts, N_w, nbnd, nbnd). Take only the .real() part: state.A_wskij
+  // stores -(i/pi) G^R, whose real component is the spectral function the
+  // kernel actually consumes (see real_axis_dyson_G.hpp:78). Letting the
+  // imag (Re G^R / pi) leak through introduces spurious Kramers-Kronig
+  // cross-terms in the cross-correlation and was inconsistent with the
+  // legacy run_scgw_serial path which truncated this way.
   nda::array<ComplexType, 5> A(ns, Nk, N_w, nbnd, nbnd);
   for (long s = 0; s < ns; ++s)
     for (long k = 0; k < Nk; ++k)
       for (long iw = 0; iw < N_w; ++iw)
         for (long mu = 0; mu < nbnd; ++mu)
           for (long nu = 0; nu < nbnd; ++nu)
-            A(s, k, iw, mu, nu) = A_in(iw, s, k, mu, nu);
+            A(s, k, iw, mu, nu) =
+                ComplexType(A_in(iw, s, k, mu, nu).real(), 0.0);
 
   // Marshal X(s, k, P, mu) from THC reader.
   nda::array<ComplexType, 4> X(ns, Nk, Naux, nbnd);

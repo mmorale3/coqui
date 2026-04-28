@@ -13,34 +13,48 @@
  *
  *     A_aux(s, k, P, Q, w) =? conj(A_aux(s, k, Q, P, w))
  *
- * Finding (LiH222, 10 SCF iters, 2026-04-28): NEITHER holds.
+ * Finding (LiH222, 10 SCF iters, 2026-04-28):
  *
- *   Sigma_x_skij                      rel = 1.9e-02   (~ hermitian)
- *   ImSigma_wskij (correlation)       rel = 1.5e+00   NOT hermitian
- *   ReSigma_wskij (correlation)       rel = 6.3e-03   (~ hermitian)
- *   A_wskij  (orbital)                rel = 1.0e+00   NOT hermitian
+ *   Sigma_x_skij                      rel = 1.8e-02   (~ hermitian)
+ *   ImSigma_wskij (correlation)       rel = 4.5e-02   (~ hermitian)  *
+ *   ReSigma_wskij (correlation)       rel = 2.7e-02   (~ hermitian)
+ *   A_wskij  (orbital)                rel = 9.9e-01   NOT hermitian
  *   A_aux(s,k,P,Q,w)                  rel = 1.1e+00   NOT hermitian
  *
- * Root cause: dyson_G_one_kw stores A as a componentwise transform of
- * G^R, not the matrix-valued anti-hermitian part:
+ *   * After the fix: scr_coulomb_t::update_w and gw_t::evaluate now take
+ *     A_wskij.real() before feeding the kernel (state.A_wskij stores
+ *     -(i/pi) G^R; the kernel consumes the spectral function in .real()).
+ *     Pre-fix, ImSigma_c was 1.5 (153%) non-hermitian because the imag
+ *     slot of A_wskij carried the Re G^R / pi piece into the cross-
+ *     correlation conjugate, generating spurious Kramers-Kronig cross
+ *     terms. Post-fix, Sigma_c is hermitian to numerical precision.
+ *
+ * The remaining O(1) non-hermiticity of A_wskij and A_aux is intrinsic
+ * to the storage convention: dyson_G_one_kw stores A componentwise as
  *
  *     A_ij := -(1/pi) Im(G^R_ij) + i/pi Re(G^R_ij)            (componentwise)
  *
- * vs. the matrix-valued definition that would be hermitian:
+ * rather than the matrix-valued anti-hermitian part
  *
  *     A := -(1/pi) (G^R - (G^R)^dag)/(2i)                     (matrix-valued)
  *
- * For diagonal entries the two coincide; for off-diagonals they differ and
- * the componentwise form is generally non-hermitian. Combined with
- * ImSigma_c not being symmetrized after each iteration, the off-diagonal
- * orbital spectral function picks up O(1) non-hermiticity within a few SCF
- * cycles, which carries through the X projection.
+ * For diagonal entries the two coincide; for off-diagonals they differ.
+ * The componentwise form is non-hermitian by construction (A_wskij as
+ * stored is essentially (i/pi) G^R) but its diagonal still gives the
+ * correct DOS / electron-count etc. The kernel consumes only .real(),
+ * so the orbital-basis "non-hermiticity" of A_wskij does not propagate
+ * into Pi or Sigma off-diagonal physics directly.
  *
- * Implication for the distributed-memory refactor (Phase 1B): the Pi
- * cross-correlation kernel's (P, Q) <-> (Q, P) swap on the second leg
- * CANNOT be replaced by a complex conjugate at the local block. The
- * transposed-peer redistribute (or an equivalent global access pattern)
- * is genuinely needed when A_aux is distributed over (P, Q).
+ * Implication for the distributed-memory refactor (Phase 1B): even though
+ * the kernel input (.real() of A_wskij) is real-valued, that real-valued
+ * matrix is still NOT symmetric in (i, j) off-diagonal because the
+ * componentwise Im G^R_ij differs from componentwise Im G^R_ji. So the
+ * projected A_aux is not symmetric in (P, Q), and the (P, Q) <-> (Q, P)
+ * swap on the second leg of the Pi cross-correlation cannot be replaced
+ * by a complex conjugate at the local block. Transposed-peer redistribute
+ * (or an equivalent global access pattern) is genuinely needed when
+ * A_aux is distributed over (P, Q). Note: the data is real-valued post-
+ * fix, so the redistribute moves half the bytes (real vs complex).
  *
  * The test always passes; numbers are logged for reference. Single-rank
  * only.

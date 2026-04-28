@@ -332,14 +332,19 @@ void real_axis_gw_t::evaluate(real_axis::real_axis_mb_state_t & state,
   ImSigma_out = ComplexType(0.0, 0.0);
   ReSigma_out = ComplexType(0.0, 0.0);
 
-  // Repack A from (N_w, ns, Nk, nbnd, nbnd) to (ns, Nk, N_w, nbnd, nbnd).
+  // Repack A from (N_w, ns, Nk, nbnd, nbnd) to (ns, Nk, N_w, nbnd, nbnd),
+  // taking only the .real() part. state.A_wskij stores -(i/pi) G^R; the
+  // kernel consumes its real component as the spectral function. Letting
+  // the imag (Re G^R / pi) leak through the cross-correlation conjugate
+  // introduces spurious Kramers-Kronig cross-terms in Im Sigma^c.
   nda::array<ComplexType, 5> A(ns, Nk, N_w, nbnd, nbnd);
   for (long s = 0; s < ns; ++s)
     for (long k = 0; k < Nk; ++k)
       for (long iw = 0; iw < N_w; ++iw)
         for (long mu = 0; mu < nbnd; ++mu)
           for (long nu = 0; nu < nbnd; ++nu)
-            A(s, k, iw, mu, nu) = A_in(iw, s, k, mu, nu);
+            A(s, k, iw, mu, nu) =
+                ComplexType(A_in(iw, s, k, mu, nu).real(), 0.0);
 
   // Marshal X(s, k, P, mu).
   nda::array<ComplexType, 4> X(ns, Nk, Naux, nbnd);
