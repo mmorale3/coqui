@@ -181,6 +181,15 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
   auto RePi_loc = state.RePi_qPQO->local();
   auto ImW_loc  = state.ImW_qPQO->local();
   auto ReW_loc  = state.ReW_qPQO->local();
+
+  // V(iq, P_loc, Q_loc) from THC.Z(iq) -- only this rank's local block.
+  nda::array<ComplexType, 3> V_qPQ_loc(Nq, Naux_loc_P, Naux_loc_Q);
+  for (long iq = 0; iq < Nq; ++iq) {
+    auto Zq = thc.Z(static_cast<int>(iq));
+    for (long iP = 0; iP < Naux_loc_P; ++iP)
+      for (long iQ = 0; iQ < Naux_loc_Q; ++iQ)
+        V_qPQ_loc(iq, iP, iQ) = Zq(Pr.first() + iP, Qr.first() + iQ);
+  }
   ImPi_loc = ComplexType(0.0, 0.0);
   RePi_loc = ComplexType(0.0, 0.0);
   ImW_loc  = ComplexType(0.0, 0.0);
@@ -211,24 +220,26 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
                 (A_in(iw, s, k, mu, nu)
                  + std::conj(A_in(iw, s, k, nu, mu)));
 
-  // Marshal X(s, k, P, mu) from THC reader.
-  nda::array<ComplexType, 4> X(ns, Nk, Naux, nbnd);
-  for (long s = 0; s < ns; ++s)
-    for (long k = 0; k < Nk; ++k) {
-      auto Xsk = thc.X(static_cast<int>(s), /*ip*/ 0, static_cast<int>(k));
-      for (long P = 0; P < Naux; ++P)
-        for (long mu = 0; mu < nbnd; ++mu)
-          X(s, k, P, mu) = Xsk(P, mu);
-    }
-
-  // V(iq, P, Q) from THC.Z(iq).
-  nda::array<ComplexType, 3> V(Nq, Naux, Naux);
-  for (long iq = 0; iq < Nq; ++iq) {
-    auto Zq = thc.Z(static_cast<int>(iq));
-    for (long P = 0; P < Naux; ++P)
-      for (long Q = 0; Q < Naux; ++Q)
-        V(iq, P, Q) = Zq(P, Q);
+  // Marshal X(s, k, P, mu) from THC reader into shared memory: one copy
+  // per node since X is read-only and moderately large for production
+  // (Naux * nbnd) per (s, k).
+  math::shm::shared_array<nda::array_view<ComplexType, 4>>
+      sX(*state.mpi, {ns, Nk, Naux, nbnd});
+  if (sX.node_comm()->root()) {
+    auto X_loc = sX.local();
+    for (long s = 0; s < ns; ++s)
+      for (long k = 0; k < Nk; ++k) {
+        auto Xsk = thc.X(static_cast<int>(s), /*ip*/ 0, static_cast<int>(k));
+        for (long P = 0; P < Naux; ++P)
+          for (long mu = 0; mu < nbnd; ++mu)
+            X_loc(s, k, P, mu) = Xsk(P, mu);
+      }
   }
+  sX.node_sync();
+  auto X = sX.local();
+
+  // V is marshaled below as a local (Nq, NP_loc, NQ_loc) block once Pr/Qr
+  // are known from state.ImPi_qPQO->local_range.
 
   // BZ closure maps in shared memory. kpq(ik, iq) = ik+iq via qk_to_k2(qminus(iq), ik).
   math::shm::shared_array<nda::array_view<long, 2>> skpq(*state.mpi, {Nk, Nq});
@@ -465,14 +476,11 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
       // contract for downstream consumers (eps_inv_head, divergence corrections).
       if (iq == iq_gamma) continue;
 
-      // Fill V_loc and Pi_loc from replicated V and distributed state.Pi.
-      for (long iP = 0; iP < Naux_loc_P; ++iP) {
-        const long P_g = Pr.first() + iP;
-        for (long iQ = 0; iQ < Naux_loc_Q; ++iQ) {
-          const long Q_g = Qr.first() + iQ;
-          V_loc(iP, iQ) = V(iq, P_g, Q_g);
-        }
-      }
+      // Fill V_loc (the slate-distributed scratch) and Pi_loc from the
+      // local V_qPQ_loc and distributed state.Pi (both already local).
+      for (long iP = 0; iP < Naux_loc_P; ++iP)
+        for (long iQ = 0; iQ < Naux_loc_Q; ++iQ)
+          V_loc(iP, iQ) = V_qPQ_loc(iq, iP, iQ);
 
       for (long iO = 0; iO < N_O; ++iO) {
         for (long iP = 0; iP < Naux_loc_P; ++iP)

@@ -126,22 +126,50 @@ public:
                   (A_in(iw, s, k, mu_i, nu)
                    + std::conj(A_in(iw, s, k, nu, mu_i)));
 
-    // Marshal X, V, kmq from THC.
-    nda::array<ComplexType, 4> X_skPmu(ns, Nk, Naux, nbnd);
-    for (long s = 0; s < ns; ++s)
-      for (long k = 0; k < Nk; ++k) {
-        auto Xsk = thc.X(static_cast<int>(s), 0, static_cast<int>(k));
-        for (long P = 0; P < Naux; ++P)
-          for (long mu_i = 0; mu_i < nbnd; ++mu_i)
-            X_skPmu(s, k, P, mu_i) = Xsk(P, mu_i);
-      }
-    nda::array<ComplexType, 3> V_qPQ(Nq, Naux, Naux);
+    // Marshal X, V, kmq from THC. X is moderately large (Naux x nbnd per
+    // s, k); put it in shared memory (one copy per node). V has 2 aux
+    // indices; marshal only this rank's local (P_loc, Q_loc) block from
+    // each thc.Z(iq) -- evaluate_Sigma_x_serial accepts this directly.
+    math::shm::shared_array<nda::array_view<ComplexType, 4>>
+        sX_skPmu(*state.mpi, {ns, Nk, Naux, nbnd});
+    if (sX_skPmu.node_comm()->root()) {
+      auto X_loc = sX_skPmu.local();
+      for (long s = 0; s < ns; ++s)
+        for (long k = 0; k < Nk; ++k) {
+          auto Xsk = thc.X(static_cast<int>(s), 0, static_cast<int>(k));
+          for (long P = 0; P < Naux; ++P)
+            for (long mu_i = 0; mu_i < nbnd; ++mu_i)
+              X_loc(s, k, P, mu_i) = Xsk(P, mu_i);
+        }
+    }
+    sX_skPmu.node_sync();
+
+    // Determine this rank's (P_loc, Q_loc) block via the same proc-grid
+    // convention used by evaluate_Sigma_x_serial internally.
+    const long nproc = static_cast<long>(comm.size());
+    auto pgrid_PQ_hf = real_axis::square_factor_capped(nproc, Naux);
+    const long gridP_hf = pgrid_PQ_hf[0];
+    const long gridQ_hf = pgrid_PQ_hf[1];
+    const long ip_hf = static_cast<long>(comm.rank());
+    const long iP_block_hf = (ip_hf / gridQ_hf) % gridP_hf;
+    const long iQ_block_hf = ip_hf % gridQ_hf;
+    auto chunk_hf = [](long N, long G, long i) {
+      long base = N / G;
+      long rem  = N % G;
+      long start = i * base + std::min(i, rem);
+      long sz    = base + (i < rem ? 1 : 0);
+      return std::array<long, 2>{start, sz};
+    };
+    auto [P0_hf, NP_loc_hf] = chunk_hf(Naux, gridP_hf, iP_block_hf);
+    auto [Q0_hf, NQ_loc_hf] = chunk_hf(Naux, gridQ_hf, iQ_block_hf);
+    nda::array<ComplexType, 3> V_qPQ_loc(Nq, NP_loc_hf, NQ_loc_hf);
     for (long iq = 0; iq < Nq; ++iq) {
       auto Zq = thc.Z(static_cast<int>(iq));
-      for (long P = 0; P < Naux; ++P)
-        for (long Q = 0; Q < Naux; ++Q)
-          V_qPQ(iq, P, Q) = Zq(P, Q);
+      for (long iP = 0; iP < NP_loc_hf; ++iP)
+        for (long iQ = 0; iQ < NQ_loc_hf; ++iQ)
+          V_qPQ_loc(iq, iP, iQ) = Zq(P0_hf + iP, Q0_hf + iQ);
     }
+    auto X_skPmu = sX_skPmu.local();
     math::shm::shared_array<nda::array_view<long, 2>> skmq(*state.mpi, {Nk, Nq});
     {
       if (skmq.node_comm()->root()) {
@@ -171,7 +199,7 @@ public:
                                        nda::array<double,1>(grid_in.Omega()),
                                        grid_in.N_t(), grid_in.T_window());
 
-    evaluate_Sigma_x_serial(comm, grid_at_mu, A_drv, X_skPmu, V_qPQ,
+    evaluate_Sigma_x_serial(comm, grid_at_mu, A_drv, X_skPmu, V_qPQ_loc,
                             kmq_to_kp, *state.Sigma_x_skij, iq_gamma);
 
     state.mu_chem = mu;

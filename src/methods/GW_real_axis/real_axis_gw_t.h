@@ -352,15 +352,21 @@ void real_axis_gw_t::evaluate(real_axis::real_axis_mb_state_t & state,
                 (A_in(iw, s, k, mu, nu)
                  + std::conj(A_in(iw, s, k, nu, mu)));
 
-  // Marshal X(s, k, P, mu).
-  nda::array<ComplexType, 4> X(ns, Nk, Naux, nbnd);
-  for (long s = 0; s < ns; ++s)
-    for (long k = 0; k < Nk; ++k) {
-      auto Xsk = thc.X(static_cast<int>(s), /*ip*/ 0, static_cast<int>(k));
-      for (long P = 0; P < Naux; ++P)
-        for (long mu = 0; mu < nbnd; ++mu)
-          X(s, k, P, mu) = Xsk(P, mu);
-    }
+  // Marshal X(s, k, P, mu) into shared memory: one copy per node.
+  math::shm::shared_array<nda::array_view<ComplexType, 4>>
+      sX(*state.mpi, {ns, Nk, Naux, nbnd});
+  if (sX.node_comm()->root()) {
+    auto X_loc = sX.local();
+    for (long s = 0; s < ns; ++s)
+      for (long k = 0; k < Nk; ++k) {
+        auto Xsk = thc.X(static_cast<int>(s), /*ip*/ 0, static_cast<int>(k));
+        for (long P = 0; P < Naux; ++P)
+          for (long mu = 0; mu < nbnd; ++mu)
+            X_loc(s, k, P, mu) = Xsk(P, mu);
+      }
+  }
+  sX.node_sync();
+  auto X = sX.local();
 
   // BZ closure: kmq(ik, iq) = ik - iq, in shared memory.
   math::shm::shared_array<nda::array_view<long, 2>> skmq(*state.mpi, {Nk, Nq});

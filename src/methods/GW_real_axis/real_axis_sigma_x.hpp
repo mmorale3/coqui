@@ -57,13 +57,15 @@ namespace real_axis {
  * @param Sigma_x_skij  OUTPUT (ns, Nk, nbnd, nbnd) static exchange self-energy
  */
 template<MEMORY_SPACE MEM = HOST_MEMORY,
-         nda::ArrayOfRank<2> KMap_t>
+         nda::ArrayOfRank<2> KMap_t,
+         nda::ArrayOfRank<4> X_t,
+         nda::ArrayOfRank<3> V_t>
 inline void evaluate_Sigma_x_serial(
     boost::mpi3::communicator        & comm,
     real_freq_grid_t            const& grid,
     memory::array<MEM, ComplexType, 5> const& A_skwij,
-    memory::array<MEM, ComplexType, 4> const& X_skPmu,
-    memory::array<MEM, ComplexType, 3> const& V_qPQ,
+    X_t                          const& X_skPmu,
+    V_t                          const& V_qPQ,
     KMap_t                       const& kmq_to_kp,
     memory::array<MEM, ComplexType, 4>       & Sigma_x_skij,
     long iq_gamma = -1)
@@ -78,13 +80,11 @@ inline void evaluate_Sigma_x_serial(
   const long N_w   = A_skwij.shape()[2];
   const long nbnd  = A_skwij.shape()[3];
   const long Nq    = V_qPQ.shape()[0];
-  const long Naux  = V_qPQ.shape()[1];
+  const long Naux  = X_skPmu.shape()[2];
 
   utils::check(X_skPmu.shape()[0] == ns and X_skPmu.shape()[1] == Nk and
-               X_skPmu.shape()[2] == Naux and X_skPmu.shape()[3] == nbnd,
+               X_skPmu.shape()[3] == nbnd,
                "evaluate_Sigma_x_serial: X shape mismatch");
-  utils::check(V_qPQ.shape()[2] == Naux,
-               "evaluate_Sigma_x_serial: V not square in (P,Q)");
   utils::check(kmq_to_kp.shape()[0] == Nk and kmq_to_kp.shape()[1] == Nq,
                "evaluate_Sigma_x_serial: kmq_to_kp shape mismatch");
   utils::check(Sigma_x_skij.shape()[0] == ns and Sigma_x_skij.shape()[1] == Nk and
@@ -136,6 +136,21 @@ inline void evaluate_Sigma_x_serial(
   range Pr(P0, P0 + NP_loc);
   range Qr(Q0, Q0 + NQ_loc);
 
+  // V may be passed as full (Nq, Naux, Naux) or as the local block
+  // (Nq, NP_loc, NQ_loc). Auto-detect via shape and slice if needed.
+  const bool V_is_full =
+      (V_qPQ.shape()[1] == Naux and V_qPQ.shape()[2] == Naux);
+  if (!V_is_full) {
+    utils::check(V_qPQ.shape()[1] == NP_loc and V_qPQ.shape()[2] == NQ_loc,
+                 "evaluate_Sigma_x_serial: V shape neither full ({} x {}) "
+                 "nor matching local block ({} x {})",
+                 Naux, Naux, NP_loc, NQ_loc);
+  }
+  auto V_loc_at = [&](long iq, long iP, long iQ) -> ComplexType {
+    return V_is_full ? V_qPQ(iq, P0 + iP, Q0 + iQ)
+                     : V_qPQ(iq, iP, iQ);
+  };
+
   nda::array<ComplexType, 4> n_aux_skPQ_loc(ns, Nk, NP_loc, NQ_loc);
   {
     nda::array<ComplexType, 3> n_dummy_munu(1, nbnd, nbnd);
@@ -170,11 +185,10 @@ inline void evaluate_Sigma_x_serial(
           if (iq == iq_gamma) continue;
           const long ikmq = kmq_to_kp(k, iq);
           for (long iP = 0; iP < NP_loc; ++iP) {
-            const long P = P0 + iP;
             for (long iQ = 0; iQ < NQ_loc; ++iQ) {
-              const long Q = Q0 + iQ;
               SxA_dummy_PQ(iP, iQ, 0) -=
-                  inv_Nq * V_qPQ(iq, P, Q) * n_aux_skPQ_loc(s, ikmq, iP, iQ);
+                  inv_Nq * V_loc_at(iq, iP, iQ)
+                         * n_aux_skPQ_loc(s, ikmq, iP, iQ);
             }
           }
         }
