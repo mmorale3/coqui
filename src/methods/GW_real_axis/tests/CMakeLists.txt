@@ -18,6 +18,9 @@ if(ENABLE_FINUFFT)
       test_real_axis_thc.cpp
       test_real_axis_xvalidate.cpp
       test_real_axis_div_utils.cpp
+      test_real_axis_scr_coulomb.cpp
+      test_real_axis_dyson_t.cpp
+      test_real_axis_scf_loop.cpp
      )
 
   add_executable(test_${TEST_ID} ${TEST_SRCS})

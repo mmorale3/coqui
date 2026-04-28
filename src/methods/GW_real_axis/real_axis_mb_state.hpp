@@ -37,13 +37,17 @@ namespace real_axis {
  * Shape conventions (C-layout, leading axes first):
  *
  *   A_wskij        : (N_w,  ns, nkpts_ibz, nbnd, nbnd)   spectral function
- *   ImPi_qOmegaPQ  : (nqpts_ibz, N_Omega, Naux, Naux)    Im polarization
- *   RePi_qOmegaPQ  : (nqpts_ibz, N_Omega, Naux, Naux)    Re polarization
- *   ImW_qOmegaPQ   : (nqpts_ibz, N_Omega, Naux, Naux)    Im screened interaction
- *   ReW_qOmegaPQ   : (nqpts_ibz, N_Omega, Naux, Naux)    Re screened interaction
+ *   ImPi_qPQO      : (nqpts_ibz, Naux, Naux, N_Omega)    Im polarization
+ *   RePi_qPQO      : (nqpts_ibz, Naux, Naux, N_Omega)    Re polarization
+ *   ImW_qPQO       : (nqpts_ibz, Naux, Naux, N_Omega)    Im screened interaction
+ *   ReW_qPQO       : (nqpts_ibz, Naux, Naux, N_Omega)    Re screened interaction
  *   ImSigma_wskij  : (N_w,  ns, nkpts_ibz, nbnd, nbnd)   Im correlation self-energy
  *   ReSigma_wskij  : (N_w,  ns, nkpts_ibz, nbnd, nbnd)   Re correlation self-energy
  *   Sigma_x_skij   : (ns, nkpts_ibz, nbnd, nbnd)         static exchange self-energy
+ *
+ * Bosonic (q,Naux,Naux,N_Omega) layout puts Omega innermost: matches the
+ * FINUFFT-batched kernels (cross_correlate / convolve / Hilbert) that operate
+ * on contiguous (P,Q,Omega) slices.
  *
  * Bosonic objects live on the Omega>=0 half-grid (see notes section on BZ
  * symmetries: bosonic Omega->-Omega symmetry is exact at any temperature).
@@ -80,11 +84,11 @@ struct real_axis_mb_state_t {
   std::optional<nda::array<ComplexType, 5>> ReSigma_wskij;
   std::optional<nda::array<ComplexType, 4>> Sigma_x_skij;
 
-  // Bosonic fields, auxiliary basis. Indexing: (q, Omega, P, Q).
-  std::optional<nda::array<ComplexType, 4>> ImPi_qOmegaPQ;
-  std::optional<nda::array<ComplexType, 4>> RePi_qOmegaPQ;
-  std::optional<nda::array<ComplexType, 4>> ImW_qOmegaPQ;
-  std::optional<nda::array<ComplexType, 4>> ReW_qOmegaPQ;
+  // Bosonic fields, auxiliary basis. Indexing: (q, P, Q, Omega).
+  std::optional<nda::array<ComplexType, 4>> ImPi_qPQO;
+  std::optional<nda::array<ComplexType, 4>> RePi_qPQO;
+  std::optional<nda::array<ComplexType, 4>> ImW_qPQO;
+  std::optional<nda::array<ComplexType, 4>> ReW_qPQO;
 
   // Default constructor leaves everything in a default-initialized state.
   real_axis_mb_state_t() = default;
@@ -105,10 +109,10 @@ struct real_axis_mb_state_t {
   /// Allocate bosonic arrays for given (nqpts_ibz, Naux) shape.
   void allocate_bosonic(long nqpts_ibz, long Naux) {
     long N_O = grid->N_Omega();
-    ImPi_qOmegaPQ = nda::array<ComplexType, 4>(nqpts_ibz, N_O, Naux, Naux);
-    RePi_qOmegaPQ = nda::array<ComplexType, 4>(nqpts_ibz, N_O, Naux, Naux);
-    ImW_qOmegaPQ  = nda::array<ComplexType, 4>(nqpts_ibz, N_O, Naux, Naux);
-    ReW_qOmegaPQ  = nda::array<ComplexType, 4>(nqpts_ibz, N_O, Naux, Naux);
+    ImPi_qPQO = nda::array<ComplexType, 4>(nqpts_ibz, Naux, Naux, N_O);
+    RePi_qPQO = nda::array<ComplexType, 4>(nqpts_ibz, Naux, Naux, N_O);
+    ImW_qPQO  = nda::array<ComplexType, 4>(nqpts_ibz, Naux, Naux, N_O);
+    ReW_qPQO  = nda::array<ComplexType, 4>(nqpts_ibz, Naux, Naux, N_O);
   }
 };
 

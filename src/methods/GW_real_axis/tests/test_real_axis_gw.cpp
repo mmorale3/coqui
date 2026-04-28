@@ -60,14 +60,14 @@ TEST_CASE("real_axis_gw_endtoend_smoke", "[real_axis][gw][e2e]")
   state.allocate_bosonic(Nq, Naux);
 
   // Synthetic, causal Im Pi: small negative diagonal contribution.
-  auto& ImPi = *state.ImPi_qOmegaPQ;
-  auto& RePi = *state.RePi_qOmegaPQ;
+  auto& ImPi = *state.ImPi_qPQO;
+  auto& RePi = *state.RePi_qPQO;
   for (long iq = 0; iq < Nq; ++iq)
-    for (long iO = 0; iO < N_Omega; ++iO)
-      for (long P = 0; P < Naux; ++P)
-        for (long Q = 0; Q < Naux; ++Q) {
-          ImPi(iq, iO, P, Q) = std::complex<double>(0.0, 0.0);
-          RePi(iq, iO, P, Q) = std::complex<double>(0.0, 0.0);
+    for (long P = 0; P < Naux; ++P)
+      for (long Q = 0; Q < Naux; ++Q)
+        for (long iO = 0; iO < N_Omega; ++iO) {
+          ImPi(iq, P, Q, iO) = std::complex<double>(0.0, 0.0);
+          RePi(iq, P, Q, iO) = std::complex<double>(0.0, 0.0);
         }
   // Small Lorentzian-like contribution on the diagonal at Omega = 1.
   for (long iq = 0; iq < Nq; ++iq)
@@ -75,7 +75,7 @@ TEST_CASE("real_axis_gw_endtoend_smoke", "[real_axis][gw][e2e]")
       const double O = grid.Omega()(iO);
       const double v = -0.05 / (1.0 + (O - 1.0)*(O - 1.0));
       for (long P = 0; P < Naux; ++P)
-        ImPi(iq, iO, P, P) = std::complex<double>(v, 0.0);
+        ImPi(iq, P, P, iO) = std::complex<double>(v, 0.0);
     }
 
   // Bare Coulomb V: identity scaled by 1.0
@@ -88,24 +88,24 @@ TEST_CASE("real_axis_gw_endtoend_smoke", "[real_axis][gw][e2e]")
   gw.solve_W(state, V);
 
   // Outputs must exist and be finite.
-  REQUIRE(state.ImW_qOmegaPQ.has_value());
-  REQUIRE(state.ReW_qOmegaPQ.has_value());
-  auto const& ImW = *state.ImW_qOmegaPQ;
-  auto const& ReW = *state.ReW_qOmegaPQ;
+  REQUIRE(state.ImW_qPQO.has_value());
+  REQUIRE(state.ReW_qPQO.has_value());
+  auto const& ImW = *state.ImW_qPQO;
+  auto const& ReW = *state.ReW_qPQO;
   for (long iq = 0; iq < Nq; ++iq)
-    for (long iO = 0; iO < N_Omega; ++iO)
-      for (long P = 0; P < Naux; ++P)
-        for (long Q = 0; Q < Naux; ++Q) {
-          REQUIRE(std::isfinite(ImW(iq, iO, P, Q).real()));
-          REQUIRE(std::isfinite(ReW(iq, iO, P, Q).real()));
+    for (long P = 0; P < Naux; ++P)
+      for (long Q = 0; Q < Naux; ++Q)
+        for (long iO = 0; iO < N_Omega; ++iO) {
+          REQUIRE(std::isfinite(ImW(iq, P, Q, iO).real()));
+          REQUIRE(std::isfinite(ReW(iq, P, Q, iO).real()));
         }
 
   // Sanity: at this Im Pi, ReW should be close to V (~1 on diagonal, ~0 off).
   for (long iq = 0; iq < Nq; ++iq)
     for (long iO = 0; iO < N_Omega; ++iO) {
       for (long P = 0; P < Naux; ++P)
-        REQUIRE(ReW(iq, iO, P, P).real() == Approx(1.0).margin(0.1));
-      REQUIRE(std::abs(ReW(iq, iO, 0, 1).real()) < 0.05);
+        REQUIRE(ReW(iq, P, P, iO).real() == Approx(1.0).margin(0.1));
+      REQUIRE(std::abs(ReW(iq, 0, 1, iO).real()) < 0.05);
     }
 }
 

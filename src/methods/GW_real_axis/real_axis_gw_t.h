@@ -9,14 +9,23 @@
 #ifndef COQUI_REAL_AXIS_GW_T_H
 #define COQUI_REAL_AXIS_GW_T_H
 
+#include <chrono>
 #include <string>
 #include <memory>
 
 #include "configuration.hpp"
+#include "IO/app_loggers.h"
 #include "nda/nda.hpp"
+#include "nda/blas.hpp"
+#include "mpi3/communicator.hpp"
+#include "utilities/kpoint_utils.hpp"
+
+#include "mean_field/MF.hpp"
+#include "methods/ERI/detail/concepts.hpp"
 #include "methods/GW_real_axis/real_freq_grid.hpp"
 #include "methods/GW_real_axis/real_axis_conv.hpp"
 #include "methods/GW_real_axis/real_axis_mb_state.hpp"
+#include "methods/GW_real_axis/real_axis_thc_project.hpp"
 #include "methods/GW_real_axis/real_axis_pi.hpp"
 #include "methods/GW_real_axis/real_axis_dyson.hpp"
 #include "methods/GW_real_axis/real_axis_sigma.hpp"
@@ -102,51 +111,51 @@ public:
     }
   }
 
-  /// Apply causality projection to a bosonic Im Pi array. The diagonal of
-  /// Im Pi must satisfy sgn(Omega) Im Pi(Omega) <= 0 on the diagonal; we
-  /// clip violations.
+  /// Apply causality projection to a bosonic Im Pi array (layout (q,P,Q,Omega)).
+  /// The diagonal of Im Pi must satisfy sgn(Omega) Im Pi(Omega) <= 0 on the
+  /// diagonal; we clip violations.
   template<typename ArrayT>
-  void apply_causality_bosonic_diag(ArrayT && ImPi_q_O_PQ,
+  void apply_causality_bosonic_diag(ArrayT && ImPi_q_PQ_O,
                                     nda::array<double,1> const& Omega) const {
-    auto sh = ImPi_q_O_PQ.shape();
-    const long Nq  = sh[0];
-    const long NO  = sh[1];
-    const long Naux = sh[2];
+    auto sh = ImPi_q_PQ_O.shape();
+    const long Nq   = sh[0];
+    const long Naux = sh[1];
+    const long NO   = sh[3];
     for (long iq = 0; iq < Nq; ++iq)
       for (long iO = 0; iO < NO; ++iO) {
         const double sO = (Omega(iO) > 0 ? 1.0 : -1.0);
         for (long P = 0; P < Naux; ++P) {
-          auto v = ImPi_q_O_PQ(iq, iO, P, P).real();
+          auto v = ImPi_q_PQ_O(iq, P, P, iO).real();
           if (sO * v > 0.0)
-            ImPi_q_O_PQ(iq, iO, P, P) =
-                ComplexType(0.0, ImPi_q_O_PQ(iq, iO, P, P).imag());
+            ImPi_q_PQ_O(iq, P, P, iO) =
+                ComplexType(0.0, ImPi_q_PQ_O(iq, P, P, iO).imag());
         }
       }
   }
 
   /**
    * Solve the bosonic Dyson equation W = (I - V Pi)^{-1} V across all (q, Omega)
-   * grid points using state.RePi_qOmegaPQ + i state.ImPi_qOmegaPQ as input
-   * and writing state.ReW_qOmegaPQ + i state.ImW_qOmegaPQ as output.
+   * grid points using state.RePi_qPQO + i state.ImPi_qPQO as input
+   * and writing state.ReW_qPQO + i state.ImW_qPQO as output.
    *
    * @param V_qPQ   (Nq, Naux, Naux) auxiliary Coulomb matrices, complex.
    */
   void solve_W(real_axis::real_axis_mb_state_t & state,
                nda::array<ComplexType, 3> const& V_qPQ) const
   {
-    utils::check(state.ImPi_qOmegaPQ.has_value() and state.RePi_qOmegaPQ.has_value(),
+    utils::check(state.ImPi_qPQO.has_value() and state.RePi_qPQO.has_value(),
                  "real_axis_gw_t::solve_W: state Pi arrays not allocated");
-    utils::check(state.ImW_qOmegaPQ.has_value() and state.ReW_qOmegaPQ.has_value(),
+    utils::check(state.ImW_qPQO.has_value() and state.ReW_qPQO.has_value(),
                  "real_axis_gw_t::solve_W: state W arrays not allocated");
 
-    auto const& ImPi = *state.ImPi_qOmegaPQ;
-    auto const& RePi = *state.RePi_qOmegaPQ;
-    auto      & ImW  = *state.ImW_qOmegaPQ;
-    auto      & ReW  = *state.ReW_qOmegaPQ;
+    auto const& ImPi = *state.ImPi_qPQO;
+    auto const& RePi = *state.RePi_qPQO;
+    auto      & ImW  = *state.ImW_qPQO;
+    auto      & ReW  = *state.ReW_qPQO;
 
     const long Nq    = ImPi.shape()[0];
-    const long NOm   = ImPi.shape()[1];
-    const long Naux  = ImPi.shape()[2];
+    const long Naux  = ImPi.shape()[1];
+    const long NOm   = ImPi.shape()[3];
 
     nda::array<ComplexType, 2> Vmat(Naux, Naux);
     nda::array<ComplexType, 2> Pi(Naux, Naux);
@@ -159,13 +168,13 @@ public:
       for (long iO = 0; iO < NOm; ++iO) {
         for (long P = 0; P < Naux; ++P)
           for (long Q = 0; Q < Naux; ++Q)
-            Pi(P, Q) = ComplexType(RePi(iq, iO, P, Q).real(),
-                                   ImPi(iq, iO, P, Q).real());
+            Pi(P, Q) = ComplexType(RePi(iq, P, Q, iO).real(),
+                                   ImPi(iq, P, Q, iO).real());
         real_axis::solve_dyson_W_aux(Vmat, Pi, W);
         for (long P = 0; P < Naux; ++P)
           for (long Q = 0; Q < Naux; ++Q) {
-            ReW(iq, iO, P, Q) = ComplexType(W(P, Q).real(), 0.0);
-            ImW(iq, iO, P, Q) = ComplexType(W(P, Q).imag(), 0.0);
+            ReW(iq, P, Q, iO) = ComplexType(W(P, Q).real(), 0.0);
+            ImW(iq, P, Q, iO) = ComplexType(W(P, Q).imag(), 0.0);
           }
       }
     }
@@ -175,6 +184,42 @@ public:
 
   real_axis::real_freq_grid_t const& grid() const { return *_grid; }
 
+  /**
+   * Evaluate the GW correlation self-energy from a real-axis MBState.
+   *
+   * Reads `state.A_wskij` (orbital-basis fermionic spectral function) and
+   * `state.{Im,Re}W_qPQO` (auxiliary-basis screened interaction; produced
+   * upstream by real_axis_scr_coulomb_t::update_w). Writes
+   * `state.{Im,Re}Sigma_wskij` (orbital-basis correlation self-energy).
+   *
+   * Internally:
+   *   1. project A from orbital -> aux basis (one BLAS-3 GEMM pair per (s,k))
+   *   2. B = -Im W / pi (bosonic spectral function on Omega>=0 grid)
+   *   3. Im Sigma_PQ via NUFFT-based fermionic*bosonic convolution
+   *      (k-space loop over (s,k,q), or R-space FT k->R + q->R + per-R conv)
+   *   4. Re Sigma_PQ via batched Hilbert transform
+   *   5. back-project to orbital basis
+   *
+   * MPI: the convolution loop is rank-distributed and allreduced; result is
+   * fully replicated. Mirrors `evaluate_thc_serial` Steps 5-8.
+   *
+   * @param comm        MPI communicator.
+   * @param state       reads A and W; writes Sigma.
+   * @param thc         THC ERI (provides X and MF accessors).
+   * @param eps_nufft   FINUFFT accuracy for the conv engine.
+   * @param div_treatment  "ignore_g0" zeroes iq_gamma in the Sigma sum.
+   * @param verbose     emit per-step timings on rank 0.
+   * @param use_rspace  when true and Nk>1, run the conv in R-space.
+   */
+  template<methods::THC_ERI THC_t>
+  void evaluate(boost::mpi3::communicator& comm,
+                real_axis::real_axis_mb_state_t & state,
+                THC_t const& thc,
+                double eps_nufft = 1e-10,
+                std::string div_treatment = "ignore_g0",
+                bool verbose = false,
+                bool use_rspace = false);
+
 private:
   real_axis::real_freq_grid_t const* _grid;
   long _max_iter;
@@ -182,6 +227,323 @@ private:
   std::string _output;
   std::shared_ptr<real_axis::real_axis_conv_t> _conv;
 };
+
+// --------------------------------------------------------------------------
+// real_axis_gw_t::evaluate implementation. Body parallels Steps 5-8 of
+// `evaluate_serial`. Header-inline (matches the rest of the real-axis module).
+// --------------------------------------------------------------------------
+template<methods::THC_ERI THC_t>
+void real_axis_gw_t::evaluate(boost::mpi3::communicator& comm,
+                              real_axis::real_axis_mb_state_t & state,
+                              THC_t const& thc,
+                              double eps_nufft,
+                              std::string div_treatment,
+                              bool verbose,
+                              bool use_rspace)
+{
+  using namespace methods::real_axis;
+  utils::check(state.A_wskij.has_value(),
+               "real_axis_gw_t::evaluate: state.A_wskij not allocated");
+  utils::check(state.ImW_qPQO.has_value() and state.ReW_qPQO.has_value(),
+               "real_axis_gw_t::evaluate: state.{Im,Re}W_qPQO not allocated; "
+               "call real_axis_scr_coulomb_t::update_w first");
+  utils::check(state.grid != nullptr,
+               "real_axis_gw_t::evaluate: state.grid not bound");
+  utils::check(state.grid == _grid,
+               "real_axis_gw_t::evaluate: state.grid disagrees with the grid "
+               "the solver was constructed with");
+
+  using nda::range;
+  const auto _ = range::all;
+  using clock_t = std::chrono::steady_clock;
+  auto t_now = []{ return clock_t::now(); };
+  auto sec_since = [](clock_t::time_point t0) {
+    return std::chrono::duration<double>(clock_t::now() - t0).count();
+  };
+  const auto t_total = t_now();
+
+  auto const& grid = *_grid;
+  auto const& MF   = *thc.MF();
+
+  const long ns    = MF.nspin();
+  const long nbnd  = MF.nbnd();
+  const long Nk    = MF.nkpts();
+  const long Nq    = MF.nqpts();
+  const long Naux  = thc.Np();
+  const long N_w   = grid.N_w();
+  const long N_O   = grid.N_Omega();
+
+  utils::check(MF.npol() == 1,
+               "real_axis_gw_t::evaluate: npol={} not supported (need 1)",
+               MF.npol());
+
+  auto const& A_in = *state.A_wskij;
+  utils::check(A_in.shape()[0] == N_w and A_in.shape()[1] == ns and
+               A_in.shape()[2] == Nk and A_in.shape()[3] == nbnd and
+               A_in.shape()[4] == nbnd,
+               "real_axis_gw_t::evaluate: state.A_wskij shape mismatch");
+  auto const& ImW = *state.ImW_qPQO;
+  utils::check(ImW.shape()[0] == Nq and ImW.shape()[1] == Naux and
+               ImW.shape()[2] == Naux and ImW.shape()[3] == N_O,
+               "real_axis_gw_t::evaluate: state.ImW_qPQO shape mismatch");
+
+  // Allocate Sigma outputs in state with the canonical (N_w, ns, Nk, nbnd, nbnd)
+  // layout. Re-allocate so previous-iteration data is wiped.
+  state.ImSigma_wskij = nda::array<ComplexType, 5>(N_w, ns, Nk, nbnd, nbnd);
+  state.ReSigma_wskij = nda::array<ComplexType, 5>(N_w, ns, Nk, nbnd, nbnd);
+  auto & ImSigma_out  = *state.ImSigma_wskij;
+  auto & ReSigma_out  = *state.ReSigma_wskij;
+  ImSigma_out = ComplexType(0.0, 0.0);
+  ReSigma_out = ComplexType(0.0, 0.0);
+
+  // Repack A from (N_w, ns, Nk, nbnd, nbnd) to (ns, Nk, N_w, nbnd, nbnd).
+  nda::array<ComplexType, 5> A(ns, Nk, N_w, nbnd, nbnd);
+  for (long s = 0; s < ns; ++s)
+    for (long k = 0; k < Nk; ++k)
+      for (long iw = 0; iw < N_w; ++iw)
+        for (long mu = 0; mu < nbnd; ++mu)
+          for (long nu = 0; nu < nbnd; ++nu)
+            A(s, k, iw, mu, nu) = A_in(iw, s, k, mu, nu);
+
+  // Marshal X(s, k, P, mu).
+  nda::array<ComplexType, 4> X(ns, Nk, Naux, nbnd);
+  for (long s = 0; s < ns; ++s)
+    for (long k = 0; k < Nk; ++k) {
+      auto Xsk = thc.X(static_cast<int>(s), /*ip*/ 0, static_cast<int>(k));
+      for (long P = 0; P < Naux; ++P)
+        for (long mu = 0; mu < nbnd; ++mu)
+          X(s, k, P, mu) = Xsk(P, mu);
+    }
+
+  // BZ closure: kmq(ik, iq) = ik - iq.
+  nda::array<long, 2> kmq(Nk, Nq);
+  auto const& qk_to_k2 = MF.qk_to_k2();
+  for (long iq = 0; iq < Nq; ++iq)
+    for (long ik = 0; ik < Nk; ++ik)
+      kmq(ik, iq) = qk_to_k2(iq, ik);
+
+  // q-mesh weights (uniform 1/Nq).
+  nda::array<double, 1> qw(Nq);
+  for (long iq = 0; iq < Nq; ++iq) qw(iq) = 1.0 / static_cast<double>(Nq);
+
+  // Identify Gamma.
+  long iq_gamma = -1;
+  if (div_treatment == "ignore_g0") {
+    auto Qp = MF.Qpts();
+    if (Qp.shape()[0] >= 1) {
+      double norm0 = 0.0;
+      for (long c = 0; c < Qp.shape()[1]; ++c) norm0 += std::abs(Qp(0, c));
+      if (norm0 < 1e-10) iq_gamma = 0;
+    }
+  }
+
+  // R-space FT matrices for Sigma.
+  nda::array<ComplexType, 2> f_Rk, f_Rq, f_kR;
+  long NR = 0;
+  if (use_rspace and Nk > 1) {
+    auto kp_grid = MF.kp_grid();
+    auto lattv   = MF.lattv();
+    const long nx = kp_grid(0);
+    const long ny = kp_grid(1);
+    const long nz = kp_grid(2);
+    NR = nx * ny * nz;
+    utils::check(NR == Nk,
+                 "real_axis_gw_t::evaluate: R-space path expects NR ({}) == Nk ({})",
+                 NR, Nk);
+
+    nda::array<long, 2> Rpts_idx(NR, 3);
+    for (long p = 0; p < NR; ++p) {
+      long a = p / (ny * nz);
+      long b = (p / nz) % ny;
+      long c = p % nz;
+      if (a > nx / 2) a -= nx;
+      if (b > ny / 2) b -= ny;
+      if (c > nz / 2) c -= nz;
+      Rpts_idx(p, 0) = a;
+      Rpts_idx(p, 1) = b;
+      Rpts_idx(p, 2) = c;
+    }
+    nda::array<long, 1> Rpts_weights(NR);
+    Rpts_weights() = 1;
+
+    f_Rk = nda::array<ComplexType, 2>(NR, Nk);
+    f_Rq = nda::array<ComplexType, 2>(NR, Nq);
+    f_kR = nda::array<ComplexType, 2>(Nk, NR);
+    utils::k_to_R_coefficients(Rpts_idx, MF.kpts(), lattv, f_Rk);
+    utils::k_to_R_coefficients(Rpts_idx, MF.Qpts(), lattv, f_Rq);
+    utils::R_to_k_coefficients(Rpts_idx, Rpts_weights, MF.kpts(), lattv, f_kR);
+  }
+  const bool do_rspace = (NR > 0);
+
+  // NUFFT engine.
+  const auto t_conv0 = t_now();
+  real_axis_conv_t conv(grid, /*ntrans*/ Naux*Naux, eps_nufft);
+  const double dt_conv = sec_since(t_conv0);
+
+  // ----------------------------------------------------------------
+  // Step 1: project A(k) -> A_aux_skPQw.
+  // ----------------------------------------------------------------
+  const auto t1 = t_now();
+  nda::array<ComplexType, 5> A_aux_skPQw(ns, Nk, Naux, Naux, N_w);
+  for (long s = 0; s < ns; ++s)
+    for (long ik = 0; ik < Nk; ++ik) {
+      auto X_view     = X(s, ik, _, _);
+      auto A_view     = A(s, ik, _, _, _);
+      auto A_aux_view = A_aux_skPQw(s, ik, _, _, _);
+      primary_to_aux_one_k(X_view, A_view, A_aux_view);
+    }
+  const double dt1 = sec_since(t1);
+
+  // ----------------------------------------------------------------
+  // Step 5: B = -Im W / pi on the bosonic grid (q, P, Q, Omega).
+  // ----------------------------------------------------------------
+  const auto t5 = t_now();
+  nda::array<ComplexType, 4> B_qPQO(Nq, Naux, Naux, N_O);
+  B_qPQO = nda::map([](ComplexType w) {
+    return ComplexType(-w.real() / M_PI, 0.0);
+  })(ImW);
+  const double dt5 = sec_since(t5);
+
+  // ----------------------------------------------------------------
+  // Step 6: Im Sigma^c_PQ(k, w). k-space or R-space.
+  // ----------------------------------------------------------------
+  const auto t6 = t_now();
+  nda::array<ComplexType, 5> ImSigma_aux_skPQw(ns, Nk, Naux, Naux, N_w);
+  ImSigma_aux_skPQw = ComplexType(0.0, 0.0);
+
+  if (do_rspace) {
+    if (iq_gamma >= 0) {
+      for (long P = 0; P < Naux; ++P)
+        for (long Q = 0; Q < Naux; ++Q)
+          for (long iO = 0; iO < N_O; ++iO)
+            B_qPQO(iq_gamma, P, Q, iO) = ComplexType(0.0, 0.0);
+    }
+
+    // FT B from q-space to R-space.
+    nda::array<ComplexType, 4> B_RPQO(NR, Naux, Naux, N_O);
+    {
+      auto B_q_2D = nda::reshape(B_qPQO, std::array<long,2>{Nq, Naux*Naux*N_O});
+      auto B_R_2D = nda::reshape(B_RPQO, std::array<long,2>{NR, Naux*Naux*N_O});
+      nda::blas::gemm(ComplexType(1.0, 0.0), f_Rq, B_q_2D,
+                      ComplexType(0.0, 0.0), B_R_2D);
+    }
+
+    // FT A from k-space to R-space.
+    nda::array<ComplexType, 5> A_aux_sRPQw(ns, NR, Naux, Naux, N_w);
+    for (long s = 0; s < ns; ++s) {
+      auto A_in_2D  = nda::reshape(A_aux_skPQw(s, _, _, _, _),
+                                   std::array<long,2>{Nk, Naux*Naux*N_w});
+      auto A_out_2D = nda::reshape(A_aux_sRPQw(s, _, _, _, _),
+                                   std::array<long,2>{NR, Naux*Naux*N_w});
+      nda::blas::gemm(ComplexType(1.0, 0.0), f_Rk, A_in_2D,
+                      ComplexType(0.0, 0.0), A_out_2D);
+    }
+
+    nda::array<ComplexType, 5> ImSigma_aux_sRPQw(ns, NR, Naux, Naux, N_w);
+    ImSigma_aux_sRPQw = ComplexType(0.0, 0.0);
+    {
+      const int rank = comm.rank();
+      const int size = comm.size();
+      for (long iR = rank; iR < NR; iR += size) {
+        for (long s = 0; s < ns; ++s) {
+          auto A_view   = A_aux_sRPQw(s, iR, _, _, _);
+          auto B_view   = B_RPQO(iR, _, _, _);
+          auto Sig_view = ImSigma_aux_sRPQw(s, iR, _, _, _);
+          accumulate_ImSigma_one_kq_nufft(conv, A_view, B_view, Sig_view, 1.0);
+        }
+      }
+      if (size > 1)
+        comm.all_reduce_in_place_n(ImSigma_aux_sRPQw.data(),
+                                    ImSigma_aux_sRPQw.size(), std::plus<>{});
+    }
+
+    for (long s = 0; s < ns; ++s) {
+      auto Sig_R_2D = nda::reshape(ImSigma_aux_sRPQw(s, _, _, _, _),
+                                   std::array<long,2>{NR, Naux*Naux*N_w});
+      auto Sig_k_2D = nda::reshape(ImSigma_aux_skPQw(s, _, _, _, _),
+                                   std::array<long,2>{Nk, Naux*Naux*N_w});
+      nda::blas::gemm(ComplexType(1.0, 0.0), f_kR, Sig_R_2D,
+                      ComplexType(0.0, 0.0), Sig_k_2D);
+    }
+  } else {
+    const long total_skq = ns * Nk * Nq;
+    const int rank = comm.rank();
+    const int size = comm.size();
+    for (long idx = rank; idx < total_skq; idx += size) {
+      const long s   = idx / (Nk * Nq);
+      const long rem = idx % (Nk * Nq);
+      const long ik  = rem / Nq;
+      const long iq  = rem % Nq;
+      if (iq == iq_gamma) continue;
+      const long ikmq = kmq(ik, iq);
+      auto A_view   = A_aux_skPQw(s, ikmq, _, _, _);
+      auto B_view   = B_qPQO(iq, _, _, _);
+      auto Sig_view = ImSigma_aux_skPQw(s, ik, _, _, _);
+      accumulate_ImSigma_one_kq_nufft(conv, A_view, B_view, Sig_view, qw(iq));
+    }
+    if (size > 1)
+      comm.all_reduce_in_place_n(ImSigma_aux_skPQw.data(),
+                                  ImSigma_aux_skPQw.size(), std::plus<>{});
+  }
+  const double dt6 = sec_since(t6);
+
+  // ----------------------------------------------------------------
+  // Step 7: Re Sigma^c via batched Hilbert transform on the fermionic grid.
+  // ----------------------------------------------------------------
+  const auto t7 = t_now();
+  nda::array<ComplexType, 5> ReSigma_aux_skPQw(ns, Nk, Naux, Naux, N_w);
+  for (long s = 0; s < ns; ++s)
+    for (long ik = 0; ik < Nk; ++ik) {
+      auto Im_view = ImSigma_aux_skPQw(s, ik, _, _, _);
+      auto Re_view = ReSigma_aux_skPQw(s, ik, _, _, _);
+      ReSigma_from_ImSigma_aux(conv, Im_view, Re_view);
+    }
+  const double dt7 = sec_since(t7);
+
+  // ----------------------------------------------------------------
+  // Step 8: back-project Sigma_PQ(k, w) -> Sigma_munu(k, w).
+  // ----------------------------------------------------------------
+  const auto t8 = t_now();
+  nda::array<ComplexType, 5> ImSigma(ns, Nk, N_w, nbnd, nbnd);
+  nda::array<ComplexType, 5> ReSigma(ns, Nk, N_w, nbnd, nbnd);
+  ImSigma = ComplexType(0.0, 0.0);
+  ReSigma = ComplexType(0.0, 0.0);
+  for (long s = 0; s < ns; ++s)
+    for (long ik = 0; ik < Nk; ++ik) {
+      auto X_view  = X(s, ik, _, _);
+      auto Im_view = ImSigma_aux_skPQw(s, ik, _, _, _);
+      auto Re_view = ReSigma_aux_skPQw(s, ik, _, _, _);
+      auto ImOut   = ImSigma(s, ik, _, _, _);
+      auto ReOut   = ReSigma(s, ik, _, _, _);
+      aux_to_primary_one_k(X_view, Im_view, ImOut);
+      aux_to_primary_one_k(X_view, Re_view, ReOut);
+    }
+
+  // Repack into state.{Im,Re}Sigma_wskij with (N_w, ns, Nk, nbnd, nbnd) layout.
+  for (long s = 0; s < ns; ++s)
+    for (long k = 0; k < Nk; ++k)
+      for (long iw = 0; iw < N_w; ++iw)
+        for (long mu = 0; mu < nbnd; ++mu)
+          for (long nu = 0; nu < nbnd; ++nu) {
+            ImSigma_out(iw, s, k, mu, nu) = ImSigma(s, k, iw, mu, nu);
+            ReSigma_out(iw, s, k, mu, nu) = ReSigma(s, k, iw, mu, nu);
+          }
+  const double dt8 = sec_since(t8);
+
+  if (verbose and comm.root()) {
+    const double dt_total = sec_since(t_total);
+    app_log(2, "[real_axis_gw_t::evaluate] Naux={}, N_w={}, N_O={}, "
+                "Nk={}, Nq={}, ns={}, nbnd={}",
+            Naux, N_w, N_O, Nk, Nq, ns, nbnd);
+    app_log(2, "[real_axis_gw_t::evaluate]   conv_t setup     : {0:8.3f}", dt_conv);
+    app_log(2, "[real_axis_gw_t::evaluate]   step 1 project A : {0:8.3f}", dt1);
+    app_log(2, "[real_axis_gw_t::evaluate]   step 5 B=-ImW/pi : {0:8.3f}", dt5);
+    app_log(2, "[real_axis_gw_t::evaluate]   step 6 Im Sigma  : {0:8.3f}", dt6);
+    app_log(2, "[real_axis_gw_t::evaluate]   step 7 Re Sig (H): {0:8.3f}", dt7);
+    app_log(2, "[real_axis_gw_t::evaluate]   step 8 backproj  : {0:8.3f}", dt8);
+    app_log(2, "[real_axis_gw_t::evaluate]   TOTAL            : {0:8.3f}", dt_total);
+  }
+}
 
 } // namespace solvers
 } // namespace methods
