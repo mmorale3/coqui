@@ -25,7 +25,7 @@
 namespace math::nufft
 {
 
-enum NUFFT_BACKEND { NUFFT_BACKEND_UNDEFINED, NUFFT_BACKEND_FINUFFT };
+enum NUFFT_BACKEND { NUFFT_BACKEND_UNDEFINED, NUFFT_BACKEND_FINUFFT, NUFFT_BACKEND_CUFINUFFT };
 
 // Sign-convention flag passed to finufft_makeplan.
 // +1 : f(k) = sum_j c_j exp(+i k.x_j)   (type-1 forward)

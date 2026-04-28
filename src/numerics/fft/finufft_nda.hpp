@@ -22,11 +22,24 @@
 #define NUMERICS_FFT_FINUFFT_NDA_HPP
 
 /*
- * nda-level interface for the FINUFFT (non-uniform FFT) backend.
+ * nda-level interface for the (cu)FINUFFT non-uniform FFT backend.
  *
- * Mirrors the structure of nda.hpp but for NUFFTs.  Only host (CPU)
- * arrays are supported; the nonuniform coordinate arrays and the
- * strength / mode arrays must all be contiguous nda arrays allocated on host.
+ * Mirrors the structure of nda.hpp but for NUFFTs. Both host (FINUFFT)
+ * and device (cuFINUFFT) backends are dispatched on the array memory
+ * space: host nda arrays route to math::nufft::impl::host::* and device
+ * nda::cuarrays route to math::nufft::impl::dev::*. The `nuplan_t::bend`
+ * field carries the backend tag so it stays consistent across the
+ * create_plan / setpts / fwdnufft / invnufft / destroy_plan lifecycle.
+ *
+ * To create a device plan, pass `MEMORY_SPACE` explicitly:
+ *
+ *     auto p = math::nufft::create_plan<DEVICE_MEMORY>(nmodes, npts, ...);
+ *
+ * The default is `HOST_MEMORY`, so existing host code is unchanged.
+ *
+ * Device array support requires CoQui to be built with the
+ * `COQUI_HAVE_CUFINUFFT` flag; without it the device path links but
+ * aborts at runtime with a clear "compiled without cuFINUFFT" message.
  *
  * Transform conventions (matching finufft):
  *
@@ -66,6 +79,7 @@
 #include "configuration.hpp"
 #include "numerics/fft/finufft_define.hpp"
 #include "numerics/fft/finufft.h"
+#include "numerics/fft/cufinufft.h"
 #include "utilities/check.hpp"
 #include "nda/nda.hpp"
 
@@ -82,8 +96,19 @@ void check_dimensions(nuplan_t &p, CMat &&C, FMat &&F)
   using F_t = std::decay_t<FMat>;
   utils::check(F.is_contiguous() and C.is_contiguous(), "Only contiguous arrays allowed.");
   static_assert(F_t::layout_t::is_stride_order_Fortran(), "Layout mismatch");
-  static_assert(::nda::mem::on_host<CMat>, "Only host arrays supported.");
-  static_assert(::nda::mem::on_host<FMat>, "Only host arrays supported.");
+  static_assert(::nda::mem::on_host<CMat> == ::nda::mem::on_host<FMat>,
+                "C and F must be in the same memory space (both host or both device).");
+  // Plan-vs-array memory-space consistency: a host-built plan must be
+  // executed with host arrays and vice versa.
+  if constexpr (::nda::mem::on_host<CMat>) {
+    utils::check(p.bend == NUFFT_BACKEND_FINUFFT,
+                 "nufft: host arrays passed to a non-FINUFFT plan (bend={}).",
+                 int(p.bend));
+  } else {
+    utils::check(p.bend == NUFFT_BACKEND_CUFINUFFT,
+                 "nufft: device arrays passed to a non-cuFINUFFT plan (bend={}).",
+                 int(p.bend));
+  }
 
   constexpr int rank = ::nda::get_rank<C_t>;
   static_assert(rank == 1 or rank == 2, "Rank mismatch.");
@@ -112,8 +137,9 @@ void check_dimensions(nuplan_t &p, CMat &&C, FMat &&F)
 
 }
 
-// finufft does not normalise — disable the normalisation step.
+// finufft / cufinufft do not normalise — disable the normalisation step.
 namespace impl::host { static constexpr bool __normalize__ = false; }
+namespace impl::dev  { static constexpr bool __normalize__ = false; }
 
 // =========================================================================
 // Precision helper
@@ -145,31 +171,40 @@ constexpr eps_t<VT> default_eps()
 // =========================================================================
 // create_plan
 //
-// Single-transform plan.
+// Single-transform plan. The MEMORY_SPACE template parameter selects the
+// backend: HOST_MEMORY uses FINUFFT, DEVICE_MEMORY uses cuFINUFFT.
 //
-// nmodes: 1-D array with the number of modes in each dimension. 
+// nmodes: 1-D array with the number of modes in each dimension.
 //         Its shape implicitly defines the rank of the transformation.
-// npts:   Number of non-uniform points on the grid.           
+// npts:   Number of non-uniform points on the grid.
 // ntrans: Number of transformations.
 //
 // Usage:
-//   auto p = math::nufft::create_plan(nmodes, npts, eps, iflag);
+//   auto p = math::nufft::create_plan<HOST_MEMORY>(nmodes, npts, ...);  // CPU
+//   auto p = math::nufft::create_plan<DEVICE_MEMORY>(nmodes, npts, ...); // GPU
+// The default is HOST_MEMORY for backwards compatibility.
 // =========================================================================
 
-template<typename Itype = int64_t, std::size_t rank = 1, typename value_type = double>
+template<MEMORY_SPACE MEM = HOST_MEMORY,
+         typename Itype = int64_t, std::size_t rank = 1, typename value_type = double>
 nuplan_t create_plan(std::array<Itype,rank> nmodes, int64_t npts,
                      int ntrans = 1,
-                     value_type eps = impl::default_eps<value_type>(), 
+                     value_type eps = impl::default_eps<value_type>(),
                      int iflag = NUFFT_FORWARD)
 {
-//  int rank = nmodes.size(); 
   static_assert(rank >= 1 && rank <= 3, "Fourier-mode rank must be 1, 2, or 3.");
+  static_assert(MEM == HOST_MEMORY || MEM == DEVICE_MEMORY,
+                "create_plan: MEMORY_SPACE must be HOST_MEMORY or DEVICE_MEMORY "
+                "(UNIFIED is not yet supported by the cuFINUFFT backend).");
 
   // nmodes: the shape of F gives N1[,N2[,N3]]
   std::array<int64_t,rank> nm;
   for (int d = 0; d < rank; ++d) nm[d] = int64_t(nmodes[d]);
 
-  return impl::host::create_plan(rank,nm.data(),npts,ntrans,eps,iflag);
+  if constexpr (MEM == HOST_MEMORY)
+    return impl::host::create_plan(rank, nm.data(), npts, ntrans, eps, iflag);
+  else
+    return impl::dev::create_plan(rank, nm.data(), npts, ntrans, eps, iflag);
 }
 
 // =========================================================================
@@ -189,41 +224,68 @@ nuplan_t create_plan(std::array<Itype,rank> nmodes, int64_t npts,
 // execute (fwdnufft / invnufft) call.
 // =========================================================================
 
+// Helper: dispatch setpts to host or device based on plan backend.
+namespace detail {
+template<typename val_t>
+inline void setpts_dispatch(nuplan_t &p, val_t *x, val_t *y, val_t *z)
+{
+  if (p.bend == NUFFT_BACKEND_FINUFFT)
+    impl::host::setpts(p, x, y, z);
+  else if (p.bend == NUFFT_BACKEND_CUFINUFFT)
+    impl::dev::setpts(p, x, y, z);
+  else
+    utils::check(false, "setpts: unknown NUFFT backend (bend={}).", int(p.bend));
+}
+
+// Memory-space consistency check between coordinate array and plan.
+template<typename CoordMat>
+inline void check_coord_memspace(nuplan_t const& p)
+{
+  if constexpr (::nda::mem::on_host<CoordMat>) {
+    utils::check(p.bend == NUFFT_BACKEND_FINUFFT,
+                 "setpts: host coordinate array passed to a non-FINUFFT plan.");
+  } else {
+    utils::check(p.bend == NUFFT_BACKEND_CUFINUFFT,
+                 "setpts: device coordinate array passed to a non-cuFINUFFT plan.");
+  }
+}
+}
+
 template<::nda::MemoryArrayOfRank<1> CoordMat>
 void setpts(nuplan_t &p, CoordMat &&x)
 {
   using X_t = std::decay_t<CoordMat>;
-  static_assert(::nda::mem::on_host<CoordMat>, "Only host arrays supported.");
+  detail::check_coord_memspace<CoordMat>(p);
   utils::check(p.rank == 1, "setpts: plan rank={} but only x supplied.", p.rank);
   utils::check(int64_t(x.shape()[0]) == p.npts,
                "setpts: x.size={} != p.npts={}", x.shape()[0], p.npts);
 
   using val_t = typename X_t::value_type;
-  impl::host::setpts(p, const_cast<val_t*>(x.data()), nullptr, nullptr);
+  detail::setpts_dispatch<val_t>(p, const_cast<val_t*>(x.data()), nullptr, nullptr);
 }
 
 template<::nda::MemoryArrayOfRank<1> CoordMat>
 void setpts(nuplan_t &p, CoordMat &&x, CoordMat &&y)
 {
   using X_t = std::decay_t<CoordMat>;
-  static_assert(::nda::mem::on_host<CoordMat>, "Only host arrays supported.");
+  detail::check_coord_memspace<CoordMat>(p);
   utils::check(p.rank == 2, "setpts: plan rank={} but x,y supplied.", p.rank);
   utils::check(int64_t(x.shape()[0]) == p.npts &&
                int64_t(y.shape()[0]) == p.npts,
                "setpts: coordinate array sizes don't match p.npts={}.", p.npts);
 
   using val_t = typename X_t::value_type;
-  impl::host::setpts(p,
-                     const_cast<val_t*>(x.data()),
-                     const_cast<val_t*>(y.data()),
-                     nullptr);
+  detail::setpts_dispatch<val_t>(p,
+                                  const_cast<val_t*>(x.data()),
+                                  const_cast<val_t*>(y.data()),
+                                  nullptr);
 }
 
 template<::nda::MemoryArrayOfRank<1> CoordMat>
 void setpts(nuplan_t &p, CoordMat &&x, CoordMat &&y, CoordMat &&z)
 {
   using X_t = std::decay_t<CoordMat>;
-  static_assert(::nda::mem::on_host<CoordMat>, "Only host arrays supported.");
+  detail::check_coord_memspace<CoordMat>(p);
   utils::check(p.rank == 3, "setpts: plan rank={} but x,y,z supplied.", p.rank);
   utils::check(int64_t(x.shape()[0]) == p.npts &&
                int64_t(y.shape()[0]) == p.npts &&
@@ -231,18 +293,24 @@ void setpts(nuplan_t &p, CoordMat &&x, CoordMat &&y, CoordMat &&z)
                "setpts: coordinate array sizes don't match p.npts={}.", p.npts);
 
   using val_t = typename X_t::value_type;
-  impl::host::setpts(p,
-                     const_cast<val_t*>(x.data()),
-                     const_cast<val_t*>(y.data()),
-                     const_cast<val_t*>(z.data()));
+  detail::setpts_dispatch<val_t>(p,
+                                  const_cast<val_t*>(x.data()),
+                                  const_cast<val_t*>(y.data()),
+                                  const_cast<val_t*>(z.data()));
 }
 
 // =========================================================================
-// destroy_plan
+// destroy_plan — dispatched on the plan's backend tag.
 // =========================================================================
 inline void destroy_plan(nuplan_t &p)
 {
-  impl::host::destroy_plan(p);
+  if (p.bend == NUFFT_BACKEND_FINUFFT)
+    impl::host::destroy_plan(p);
+  else if (p.bend == NUFFT_BACKEND_CUFINUFFT)
+    impl::dev::destroy_plan(p);
+  else if (p.fwd != nullptr || p.inv != nullptr)
+    utils::check(false, "destroy_plan: unknown NUFFT backend (bend={}).", int(p.bend));
+  // bend==UNDEFINED + nullptrs: silently ignore (default-constructed plan).
 }
 
 // =========================================================================
@@ -271,7 +339,10 @@ void fwdnufft(nuplan_t &p, CMat &&C, FMat &&F)
     detail::check_dimensions(p,C,F);
   }
 
-  impl::host::fwdnufft(p, C.data(), F.data());
+  if constexpr (::nda::mem::on_host<CMat>)
+    impl::host::fwdnufft(p, C.data(), F.data());
+  else
+    impl::dev::fwdnufft(p, C.data(), F.data());
 }
 
 // =========================================================================
@@ -297,7 +368,10 @@ void invnufft(nuplan_t &p, FMat &&F, CMat &&C)
     detail::check_dimensions(p,C,F);
   }
 
-  impl::host::invnufft(p, F.data(), C.data());
+  if constexpr (::nda::mem::on_host<CMat>)
+    impl::host::invnufft(p, F.data(), C.data());
+  else
+    impl::dev::invnufft(p, F.data(), C.data());
 }
 
 // =========================================================================
@@ -533,27 +607,30 @@ void invnufft(FMat &&F, CMat &&C, CoordMat &&x, CoordMat &&y, CoordMat &&z,
 namespace math::nda
 {
 
-class nufft
+template<MEMORY_SPACE MEM = HOST_MEMORY>
+class nufft_t
 {
 public:
+  static constexpr MEMORY_SPACE memory_space = MEM;
 
   /// Construct and plan (does NOT call setpts — call it separately).
+  /// MEM selects the FINUFFT (host) or cuFINUFFT (device) backend.
   template<typename Itype = int64_t, std::size_t rank = 1, typename value_type = double>
-  nufft(std::array<Itype,rank> const& nmodes, int64_t npts, int ntrans = 1, 
-        value_type eps = math::nufft::impl::default_eps<value_type>(),
-        int iflag = math::nufft::NUFFT_FORWARD)
-    : plan(math::nufft::create_plan(nmodes,npts,ntrans,eps,iflag))
+  nufft_t(std::array<Itype,rank> const& nmodes, int64_t npts, int ntrans = 1,
+          value_type eps = math::nufft::impl::default_eps<value_type>(),
+          int iflag = math::nufft::NUFFT_FORWARD)
+    : plan(math::nufft::create_plan<MEM>(nmodes, npts, ntrans, eps, iflag))
   {}
 
-  ~nufft() { math::nufft::destroy_plan(plan); }
+  ~nufft_t() { math::nufft::destroy_plan(plan); }
 
-  nufft(nufft const &) = delete;
-  nufft(nufft &&other) : plan(other.plan)
+  nufft_t(nufft_t const &) = delete;
+  nufft_t(nufft_t &&other) : plan(other.plan)
   {
     other.plan = math::nufft::nuplan_t{};
   }
-  nufft &operator=(nufft const &) = delete;
-  nufft &operator=(nufft &&other)
+  nufft_t &operator=(nufft_t const &) = delete;
+  nufft_t &operator=(nufft_t &&other)
   {
     math::nufft::destroy_plan(plan);
     plan = other.plan;
@@ -583,6 +660,9 @@ public:
 private:
   math::nufft::nuplan_t plan;
 };
+
+/// Backwards-compatibility alias for the host backend.
+using nufft = nufft_t<HOST_MEMORY>;
 
 } // namespace math::nda
 
