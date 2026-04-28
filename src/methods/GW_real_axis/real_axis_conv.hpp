@@ -226,10 +226,9 @@ public:
       run_forward(F, Fhat, src, B);
       run_forward(G, Ghat, src, B);
 
+      // 2-arg Hadamard, MEM-agnostic via nda::map.
       array_t<2> Hhat(B, N_t_);
-      for (long b = 0; b < B; ++b)
-        for (long k = 0; k < N_t_; ++k)
-          Hhat(b, k) = std::conj(Fhat(b, k)) * Ghat(b, k);
+      Hhat = nda::map([](cval_t f, cval_t g) { return std::conj(f) * g; })(Fhat, Ghat);
 
       array_t<2> Hraw(B, N_dst);
       run_backward(Hhat, Hraw, dst, B);
@@ -288,11 +287,9 @@ public:
       run_forward(F, Fhat, kind, B);
       run_forward(G, Ghat, kind, B);
 
-      // Convolution: NO conjugate on F_hat.
+      // Convolution Hadamard: NO conjugate. MEM-agnostic via nda::map.
       array_t<2> Hhat(B, N_t_);
-      for (long b = 0; b < B; ++b)
-        for (long k = 0; k < N_t_; ++k)
-          Hhat(b, k) = Fhat(b, k) * Ghat(b, k);
+      Hhat = nda::map([](cval_t f, cval_t g) { return f * g; })(Fhat, Ghat);
 
       array_t<2> Hraw(B, N);
       run_backward(Hhat, Hraw, kind, B);

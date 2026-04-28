@@ -45,12 +45,12 @@ if(ENABLE_CUDA)
 endif()
 if(ENABLE_FINUFFT)
   target_link_libraries(fft_lib PUBLIC FINUFFT::finufft)
-  if(COQUI_HAVE_CUFINUFFT)
-    # Caller is expected to provide a cufinufft IMPORTED target via
-    # find_package(cufinufft) or FetchContent. The build flag below makes
-    # cufinufft.cpp use the real cuFINUFFT calls; without it the file
-    # compiles to runtime-aborting stubs.
-    target_compile_definitions(fft_lib PUBLIC COQUI_HAVE_CUFINUFFT)
+  if(ENABLE_CUFINUFFT)
+    # The cufinufft target is produced by the FINUFFT FetchContent superbuild
+    # when FINUFFT_USE_CUDA=ON (set in cmake/finufft.cmake). The
+    # COQUI_HAVE_CUFINUFFT compile flag is set at the project level
+    # (see top-level CMakeLists.txt) so cufinufft.cpp uses the real
+    # cuFINUFFT calls instead of its runtime-aborting stubs.
     target_link_libraries(fft_lib PUBLIC cufinufft)
   endif()
 endif()

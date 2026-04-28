@@ -127,11 +127,13 @@ inline void accumulate_ImPi_one_kq(detail::real_axis_conv_base_t<MEM> & conv,
   conv.forward(Aless_kq, Gless_hat, gk::fermionic);
   conv.forward(Agtr_kq,  Ggtr_hat,  gk::fermionic);
 
-  nda::array<ComplexType, 2> Hhat(B, N_t);
-  for (long b = 0; b < B; ++b)
-    for (long k = 0; k < N_t; ++k)
-      Hhat(b, k) = std::conj(Fless_hat(b, k)) * Ggtr_hat(b, k)
-                 - std::conj(Fgtr_hat(b, k))  * Gless_hat(b, k);
+  // Pi Hadamard kernel: a 4-ary elementwise map, MEM-agnostic via nda::map
+  // (lazy expression evaluated on host or device per the array memory space).
+  memory::array<MEM, ComplexType, 2> Hhat(B, N_t);
+  Hhat = nda::map([](ComplexType fl, ComplexType gg,
+                     ComplexType fg, ComplexType gl) {
+    return std::conj(fl) * gg - std::conj(fg) * gl;
+  })(Fless_hat, Ggtr_hat, Fgtr_hat, Gless_hat);
 
   nda::array<ComplexType, 2> Hraw(B, N_O);
   conv.backward(Hhat, Hraw, gk::bosonic);

@@ -154,11 +154,12 @@ inline void accumulate_ImSigma_one_kq_nufft(
   conv.forward(F2, F2hat, gk::fermionic);
   conv.forward(G2, G2hat, gk::fermionic);
 
-  nda::array<ComplexType, 2> Hhat(B, N_t);
-  for (long b = 0; b < B; ++b)
-    for (long k = 0; k < N_t; ++k)
-      Hhat(b, k) = F1hat(b, k) * G1hat(b, k)
-                 + F2hat(b, k) * G2hat(b, k);
+  // Sigma Hadamard kernel: 4-ary elementwise map (host/device-agnostic).
+  memory::array<MEM, ComplexType, 2> Hhat(B, N_t);
+  Hhat = nda::map([](ComplexType f1, ComplexType g1,
+                     ComplexType f2, ComplexType g2) {
+    return f1 * g1 + f2 * g2;
+  })(F1hat, G1hat, F2hat, G2hat);
 
   nda::array<ComplexType, 2> Hraw(B, N_w);
   conv.backward(Hhat, Hraw, gk::fermionic);

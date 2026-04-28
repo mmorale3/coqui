@@ -246,12 +246,11 @@ inline scgw_result run_scgw_serial(
       A_wskij = A_next;
     } else {
       // Linear: A_next = (1 - alpha) * A_old + alpha * A_full.
+      // MEM-agnostic via nda::map.
       const double a = cfg.alpha_mix;
-      const long N = A_wskij.size();
-      auto * dA_old = A_wskij.data();
-      auto const* dA_full = A_full_wskij.data();
-      for (long i = 0; i < N; ++i)
-        dA_old[i] = (1.0 - a) * dA_old[i] + a * dA_full[i];
+      A_wskij = nda::map([a](ComplexType old_v, ComplexType new_v) {
+        return (1.0 - a) * old_v + a * new_v;
+      })(A_wskij, A_full_wskij);
     }
 
     // ---- mu update ----

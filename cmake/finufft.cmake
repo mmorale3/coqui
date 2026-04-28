@@ -59,6 +59,14 @@ set(FINUFFT_SPREAD_ONLY    OFF CACHE BOOL "" FORCE)
 set(FINUFFT_BUILD_FORTRAN  OFF CACHE BOOL "" FORCE)
 set(FINUFFT_BUILD_MATLAB   OFF CACHE BOOL "" FORCE)
 set(FINUFFT_BUILD_PYTHON   OFF CACHE BOOL "" FORCE)
+# cuFINUFFT (GPU): enabled when ENABLE_CUFINUFFT is set. The FINUFFT cmake
+# variable to turn on the CUDA build is FINUFFT_USE_CUDA. When ON the
+# superbuild also produces the `cufinufft` target which the FFT lib links.
+if(ENABLE_CUFINUFFT)
+  set(FINUFFT_USE_CUDA       ON  CACHE BOOL "" FORCE)
+else()
+  set(FINUFFT_USE_CUDA       OFF CACHE BOOL "" FORCE)
+endif()
 # Build a static library by default to avoid runtime-path headaches.
 # Set to ON if you prefer a shared library.
 set(BUILD_SHARED_LIBS      OFF CACHE BOOL "" FORCE)
@@ -84,6 +92,20 @@ FetchContent_MakeAvailable(finufft)
 # ---------------------------------------------------------------------------
 if(TARGET finufft AND NOT TARGET FINUFFT::finufft)
   add_library(FINUFFT::finufft ALIAS finufft)
+endif()
+
+# When FINUFFT_USE_CUDA was on, the superbuild produced a `cufinufft`
+# target. Alias it so the FFT lib's link logic in
+# src/numerics/fft/CMakeLists.txt can resolve `cufinufft` cleanly.
+if(ENABLE_CUFINUFFT)
+  if(NOT TARGET cufinufft)
+    message(WARNING
+      "ENABLE_CUFINUFFT=ON but the FINUFFT FetchContent build did not "
+      "produce a `cufinufft` target. Check FINUFFT_USE_CUDA and that the "
+      "version pinned in this file (${FINUFFT_GIT_TAG}) supports CUDA. "
+      "The COQUI_HAVE_CUFINUFFT compile flag is set, so cufinufft.cpp will "
+      "fail to link without this target.")
+  endif()
 endif()
 
 # ---------------------------------------------------------------------------

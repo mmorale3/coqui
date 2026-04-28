@@ -334,12 +334,10 @@ inline void evaluate_serial(boost::mpi3::communicator& comm,
   // --------------------------------------------------------------------
   const auto t5 = t_now();
   nda::array<ComplexType, 4> B_qPQO(Nq, Naux, Naux, N_O);
-  for (long iq = 0; iq < Nq; ++iq)
-    for (long P = 0; P < Naux; ++P)
-      for (long Q = 0; Q < Naux; ++Q)
-        for (long iO = 0; iO < N_O; ++iO)
-          B_qPQO(iq, P, Q, iO) = ComplexType(
-              -ImW_qPQO(iq, P, Q, iO).real() / M_PI, 0.0);
+  // Step 5: B = -Im W / pi. MEM-agnostic via nda::map (host/device).
+  B_qPQO = nda::map([](ComplexType w) {
+    return ComplexType(-w.real() / M_PI, 0.0);
+  })(ImW_qPQO);
 
   const double dt5 = sec_since(t5);
 

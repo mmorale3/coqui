@@ -105,6 +105,7 @@ option(ENABLE_ROCM " Build device code with ROCM backend" OFF)
 option(ENABLE_OPENMP " Build device code with OPENMP backend" OFF)
 option(ENABLE_FFTW "Build using FFTW3 library." ON)
 option(ENABLE_FINUFFT "Enable FINUFFT non-uniform FFT backend" ON)
+option(ENABLE_CUFINUFFT "Enable cuFINUFFT (GPU NUFFT) backend. Requires CUDA + ENABLE_FINUFFT." OFF)
 option(ENABLE_HEFFTE "Build using heFFTe library." OFF)
 option(ENABLE_SLATE "Build using Slate library." ON)
 option(ENABLE_CUTENSOR "Build using cutensor library. Must set CUTENSOR_ROOT" OFF)
@@ -532,6 +533,22 @@ endif(ENABLE_WANNIER90)
 if(ENABLE_FINUFFT)
   include(${CMAKE_SOURCE_DIR}/cmake/finufft.cmake)
   add_compile_definitions(ENABLE_FINUFFT)
+endif()
+
+# cuFINUFFT (GPU NUFFT) -- enables the device-side dispatch in
+# numerics/fft/cufinufft.cpp. The CUDA target is built by the same FINUFFT
+# FetchContent superbuild via FINUFFT_USE_CUDA, so ENABLE_CUFINUFFT requires
+# ENABLE_FINUFFT to be on.
+if(ENABLE_CUFINUFFT)
+  if(NOT ENABLE_FINUFFT)
+    message(FATAL_ERROR
+      "ENABLE_CUFINUFFT requires ENABLE_FINUFFT=ON (cuFINUFFT is built as "
+      "part of the FINUFFT superbuild via FINUFFT_USE_CUDA).")
+  endif()
+  add_compile_definitions(COQUI_HAVE_CUFINUFFT)
+  message(STATUS "cuFINUFFT: enabled (defined COQUI_HAVE_CUFINUFFT). "
+                 "Ensure CUDA is available and FINUFFT_USE_CUDA was set in "
+                 "the FetchContent flow (see cmake/finufft.cmake).")
 endif()
 
 ######################################################################
