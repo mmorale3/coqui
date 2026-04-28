@@ -17,7 +17,10 @@
 #include "nda/nda.hpp"
 #include "mpi3/communicator.hpp"
 #include "utilities/mpi_context.h"
+#include "numerics/distributed_array/nda.hpp"
+#include "numerics/distributed_array/nda_utils.hpp"
 #include "methods/GW_real_axis/real_freq_grid.hpp"
+#include "methods/GW_real_axis/real_axis_proc_grid.hpp"
 
 namespace methods {
 namespace real_axis {
@@ -64,6 +67,9 @@ namespace real_axis {
 struct real_axis_mb_state_t {
 
   using mpi_context_t = utils::mpi_context_t<boost::mpi3::communicator>;
+  using bosonic_dArray_t = memory::darray_t<
+      memory::array<HOST_MEMORY, ComplexType, 4>,
+      boost::mpi3::communicator>;
 
   // Finite-temperature parameters. Mandatory, not optional.
   double beta    = 0.0;
@@ -87,10 +93,13 @@ struct real_axis_mb_state_t {
   std::optional<nda::array<ComplexType, 4>> Sigma_x_skij;
 
   // Bosonic fields, auxiliary basis. Indexing: (q, P, Q, Omega).
-  std::optional<nda::array<ComplexType, 4>> ImPi_qPQO;
-  std::optional<nda::array<ComplexType, 4>> RePi_qPQO;
-  std::optional<nda::array<ComplexType, 4>> ImW_qPQO;
-  std::optional<nda::array<ComplexType, 4>> ReW_qPQO;
+  // Distributed over (P, Q) with grid = (1, gridP, gridQ, 1). Each rank
+  // holds a (Nq, Naux_loc_P, Naux_loc_Q, N_Omega) local slice; the q and
+  // Omega axes are not distributed (kernels need full slices along them).
+  std::optional<bosonic_dArray_t> ImPi_qPQO;
+  std::optional<bosonic_dArray_t> RePi_qPQO;
+  std::optional<bosonic_dArray_t> ImW_qPQO;
+  std::optional<bosonic_dArray_t> ReW_qPQO;
 
   // Default constructor leaves everything in a default-initialized state.
   real_axis_mb_state_t() = default;
@@ -108,13 +117,30 @@ struct real_axis_mb_state_t {
     Sigma_x_skij   = nda::array<ComplexType, 4>(ns, nkpts_ibz, nbnd, nbnd);
   }
 
-  /// Allocate bosonic arrays for given (nqpts_ibz, Naux) shape.
+  /// Allocate bosonic dArrays for given (nqpts_ibz, Naux) shape.
+  /// Proc grid auto-picked: distributes (P, Q) over the full mpi->comm.
   void allocate_bosonic(long nqpts_ibz, long Naux) {
+    utils::check(this->mpi != nullptr,
+                 "real_axis_mb_state_t::allocate_bosonic: mpi context not bound");
+    utils::check(this->grid != nullptr,
+                 "real_axis_mb_state_t::allocate_bosonic: grid not bound");
     long N_O = grid->N_Omega();
-    ImPi_qPQO = nda::array<ComplexType, 4>(nqpts_ibz, Naux, Naux, N_O);
-    RePi_qPQO = nda::array<ComplexType, 4>(nqpts_ibz, Naux, Naux, N_O);
-    ImW_qPQO  = nda::array<ComplexType, 4>(nqpts_ibz, Naux, Naux, N_O);
-    ReW_qPQO  = nda::array<ComplexType, 4>(nqpts_ibz, Naux, Naux, N_O);
+    auto pgrid = bosonic_proc_grid(this->mpi->comm.size(), Naux);
+    auto bsize = bosonic_block_size(pgrid, nqpts_ibz, Naux, N_O);
+    using local_t = memory::array<HOST_MEMORY, ComplexType, 4>;
+    std::array<long, 4> shape = {nqpts_ibz, Naux, Naux, N_O};
+    ImPi_qPQO.emplace(math::nda::make_distributed_array<local_t>(
+        this->mpi->comm, pgrid, shape, bsize));
+    RePi_qPQO.emplace(math::nda::make_distributed_array<local_t>(
+        this->mpi->comm, pgrid, shape, bsize));
+    ImW_qPQO.emplace(math::nda::make_distributed_array<local_t>(
+        this->mpi->comm, pgrid, shape, bsize));
+    ReW_qPQO.emplace(math::nda::make_distributed_array<local_t>(
+        this->mpi->comm, pgrid, shape, bsize));
+    ImPi_qPQO->local() = ComplexType(0.0, 0.0);
+    RePi_qPQO->local() = ComplexType(0.0, 0.0);
+    ImW_qPQO->local()  = ComplexType(0.0, 0.0);
+    ReW_qPQO->local()  = ComplexType(0.0, 0.0);
   }
 };
 

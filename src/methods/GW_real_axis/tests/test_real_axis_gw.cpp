@@ -13,6 +13,8 @@
 #include "IO/app_loggers.h"
 
 #include "nda/nda.hpp"
+#include "utilities/test_common.hpp"
+#include "numerics/distributed_array/nda_utils.hpp"
 #include "methods/GW_real_axis/real_freq_grid.hpp"
 #include "methods/GW_real_axis/real_axis_mb_state.hpp"
 #include "methods/GW_real_axis/real_axis_gw_t.h"
@@ -54,29 +56,44 @@ TEST_CASE("real_axis_gw_endtoend_smoke", "[real_axis][gw][e2e]")
                     /*ntrans*/   Naux*Naux,
                     /*output*/   "test_real_axis_gw");
 
-  // Set up state.
+  // Set up state. State.mpi must be bound for the dArray allocation.
+  auto& mpi_context = utils::make_unit_test_mpi_context();
   const long Nq = 1;
   real_axis_mb_state_t state(grid);
+  state.mpi = mpi_context;
   state.allocate_bosonic(Nq, Naux);
 
-  // Synthetic, causal Im Pi: small negative diagonal contribution.
-  auto& ImPi = *state.ImPi_qPQO;
-  auto& RePi = *state.RePi_qPQO;
-  for (long iq = 0; iq < Nq; ++iq)
-    for (long P = 0; P < Naux; ++P)
-      for (long Q = 0; Q < Naux; ++Q)
-        for (long iO = 0; iO < N_Omega; ++iO) {
-          ImPi(iq, P, Q, iO) = std::complex<double>(0.0, 0.0);
-          RePi(iq, P, Q, iO) = std::complex<double>(0.0, 0.0);
-        }
+  // Synthetic, causal Im Pi: small negative diagonal contribution. Build
+  // the deterministic full array on every rank, then write each rank's
+  // local (P_loc, Q_loc) slice into the distributed state.
+  nda::array<std::complex<double>, 4> ImPi_full(Nq, Naux, Naux, N_Omega);
+  nda::array<std::complex<double>, 4> RePi_full(Nq, Naux, Naux, N_Omega);
+  ImPi_full() = std::complex<double>(0.0, 0.0);
+  RePi_full() = std::complex<double>(0.0, 0.0);
   // Small Lorentzian-like contribution on the diagonal at Omega = 1.
   for (long iq = 0; iq < Nq; ++iq)
     for (long iO = 0; iO < N_Omega; ++iO) {
       const double O = grid.Omega()(iO);
       const double v = -0.05 / (1.0 + (O - 1.0)*(O - 1.0));
       for (long P = 0; P < Naux; ++P)
-        ImPi(iq, P, P, iO) = std::complex<double>(v, 0.0);
+        ImPi_full(iq, P, P, iO) = std::complex<double>(v, 0.0);
     }
+  {
+    auto fill = [&](nda::array<std::complex<double>, 4> const& src,
+                    real_axis_mb_state_t::bosonic_dArray_t& dst) {
+      auto Pr = dst.local_range(1);
+      auto Qr = dst.local_range(2);
+      auto loc = dst.local();
+      for (long iq = 0; iq < Nq; ++iq)
+        for (long iP = 0; iP < Pr.size(); ++iP)
+          for (long iQ = 0; iQ < Qr.size(); ++iQ)
+            for (long iO = 0; iO < N_Omega; ++iO)
+              loc(iq, iP, iQ, iO) =
+                  src(iq, Pr.first() + iP, Qr.first() + iQ, iO);
+    };
+    fill(ImPi_full, *state.ImPi_qPQO);
+    fill(RePi_full, *state.RePi_qPQO);
+  }
 
   // Bare Coulomb V: identity scaled by 1.0
   nda::array<std::complex<double>, 3> V(Nq, Naux, Naux);
@@ -87,11 +104,12 @@ TEST_CASE("real_axis_gw_endtoend_smoke", "[real_axis][gw][e2e]")
 
   gw.solve_W(state, V);
 
-  // Outputs must exist and be finite.
+  // Outputs must exist and be finite. Gather to a replicated array for
+  // convenient global-index inspection.
   REQUIRE(state.ImW_qPQO.has_value());
   REQUIRE(state.ReW_qPQO.has_value());
-  auto const& ImW = *state.ImW_qPQO;
-  auto const& ReW = *state.ReW_qPQO;
+  auto ImW = math::nda::all_gather_slow<HOST_MEMORY>(*state.ImW_qPQO);
+  auto ReW = math::nda::all_gather_slow<HOST_MEMORY>(*state.ReW_qPQO);
   for (long iq = 0; iq < Nq; ++iq)
     for (long P = 0; P < Naux; ++P)
       for (long Q = 0; Q < Naux; ++Q)

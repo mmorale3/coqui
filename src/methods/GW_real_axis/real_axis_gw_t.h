@@ -149,14 +149,21 @@ public:
     utils::check(state.ImW_qPQO.has_value() and state.ReW_qPQO.has_value(),
                  "real_axis_gw_t::solve_W: state W arrays not allocated");
 
-    auto const& ImPi = *state.ImPi_qPQO;
-    auto const& RePi = *state.RePi_qPQO;
-    auto      & ImW  = *state.ImW_qPQO;
-    auto      & ReW  = *state.ReW_qPQO;
+    // Phase 1A.1: gather distributed Pi locally on every rank, compute W
+    // redundantly, then each rank writes its own (P_loc, Q_loc) slice
+    // back to the distributed state.W arrays. Phase 1A.2 will replace
+    // this with a slate_ops Dyson on (P, Q)-distributed inputs.
+    auto ImPi = math::nda::all_gather_slow<HOST_MEMORY>(*state.ImPi_qPQO);
+    auto RePi = math::nda::all_gather_slow<HOST_MEMORY>(*state.RePi_qPQO);
 
     const long Nq    = ImPi.shape()[0];
     const long Naux  = ImPi.shape()[1];
     const long NOm   = ImPi.shape()[3];
+
+    nda::array<ComplexType, 4> ImW_full(Nq, Naux, Naux, NOm);
+    nda::array<ComplexType, 4> ReW_full(Nq, Naux, Naux, NOm);
+    ImW_full() = ComplexType(0.0, 0.0);
+    ReW_full() = ComplexType(0.0, 0.0);
 
     nda::array<ComplexType, 2> Vmat(Naux, Naux);
     nda::array<ComplexType, 2> Pi(Naux, Naux);
@@ -174,11 +181,30 @@ public:
         real_axis::solve_dyson_W_aux(Vmat, Pi, W);
         for (long P = 0; P < Naux; ++P)
           for (long Q = 0; Q < Naux; ++Q) {
-            ReW(iq, P, Q, iO) = ComplexType(W(P, Q).real(), 0.0);
-            ImW(iq, P, Q, iO) = ComplexType(W(P, Q).imag(), 0.0);
+            ReW_full(iq, P, Q, iO) = ComplexType(W(P, Q).real(), 0.0);
+            ImW_full(iq, P, Q, iO) = ComplexType(W(P, Q).imag(), 0.0);
           }
       }
     }
+
+    // Write each rank's local (P_loc, Q_loc) slice into the distributed
+    // state arrays.
+    auto write_slice = [](nda::array<ComplexType, 4> const& src,
+                          real_axis::real_axis_mb_state_t::bosonic_dArray_t& dst) {
+      auto Pr = dst.local_range(1);
+      auto Qr = dst.local_range(2);
+      auto loc = dst.local();
+      const long Nq_  = src.shape()[0];
+      const long NOm_ = src.shape()[3];
+      for (long iq = 0; iq < Nq_; ++iq)
+        for (long iP = 0; iP < Pr.size(); ++iP)
+          for (long iQ = 0; iQ < Qr.size(); ++iQ)
+            for (long iO = 0; iO < NOm_; ++iO)
+              loc(iq, iP, iQ, iO) =
+                  src(iq, Pr.first() + iP, Qr.first() + iQ, iO);
+    };
+    write_slice(ImW_full, *state.ImW_qPQO);
+    write_slice(ReW_full, *state.ReW_qPQO);
   }
 
   real_axis::real_axis_conv_t & conv() { return *_conv; }
@@ -284,10 +310,18 @@ void real_axis_gw_t::evaluate(real_axis::real_axis_mb_state_t & state,
                A_in.shape()[2] == Nk and A_in.shape()[3] == nbnd and
                A_in.shape()[4] == nbnd,
                "real_axis_gw_t::evaluate: state.A_wskij shape mismatch");
-  auto const& ImW = *state.ImW_qPQO;
-  utils::check(ImW.shape()[0] == Nq and ImW.shape()[1] == Naux and
-               ImW.shape()[2] == Naux and ImW.shape()[3] == N_O,
+  utils::check(state.ImW_qPQO->global_shape()[0] == Nq and
+               state.ImW_qPQO->global_shape()[1] == Naux and
+               state.ImW_qPQO->global_shape()[2] == Naux and
+               state.ImW_qPQO->global_shape()[3] == N_O,
                "real_axis_gw_t::evaluate: state.ImW_qPQO shape mismatch");
+
+  // Phase 1A.1 backwards-compat: this body still consumes Pi/W as
+  // fully-replicated nda::array. Gather from the distributed state into
+  // local replicated buffers. Phase 2 will rewrite this body to consume
+  // dArray Pi/W natively (no gather).
+  auto ImW = math::nda::all_gather_slow<HOST_MEMORY>(*state.ImW_qPQO);
+  auto ReW = math::nda::all_gather_slow<HOST_MEMORY>(*state.ReW_qPQO);
 
   // Allocate Sigma outputs in state with the canonical (N_w, ns, Nk, nbnd, nbnd)
   // layout. Re-allocate so previous-iteration data is wiped.

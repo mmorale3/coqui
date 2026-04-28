@@ -25,6 +25,7 @@
 #include "utilities/mpi_context.h"
 #include "mean_field/default_MF.hpp"
 
+#include "numerics/distributed_array/nda_utils.hpp"
 #include "methods/ERI/thc_reader_t.hpp"
 #include "methods/ERI/eri_utils.hpp"
 
@@ -159,13 +160,16 @@ namespace bdft_tests {
     REQUIRE(state.ImW_qPQO.has_value());
     REQUIRE(state.ReW_qPQO.has_value());
 
-    auto const& ImPi = *state.ImPi_qPQO;
-    auto const& ImW  = *state.ImW_qPQO;
-    auto const& ReW  = *state.ReW_qPQO;
-    REQUIRE(ImPi.shape()[0] == Nq);
-    REQUIRE(ImPi.shape()[1] == Naux);
-    REQUIRE(ImPi.shape()[2] == Naux);
-    REQUIRE(ImPi.shape()[3] == N_O);
+    REQUIRE(state.ImPi_qPQO->global_shape()[0] == Nq);
+    REQUIRE(state.ImPi_qPQO->global_shape()[1] == Naux);
+    REQUIRE(state.ImPi_qPQO->global_shape()[2] == Naux);
+    REQUIRE(state.ImPi_qPQO->global_shape()[3] == N_O);
+
+    // Gather to a fully-replicated array for convenient global-index checks.
+    auto ImPi = math::nda::all_gather_slow<HOST_MEMORY>(*state.ImPi_qPQO);
+    auto RePi = math::nda::all_gather_slow<HOST_MEMORY>(*state.RePi_qPQO);
+    auto ImW  = math::nda::all_gather_slow<HOST_MEMORY>(*state.ImW_qPQO);
+    auto ReW  = math::nda::all_gather_slow<HOST_MEMORY>(*state.ReW_qPQO);
 
     bool all_finite = true;
     bool nonzero_Pi = false;
@@ -184,7 +188,6 @@ namespace bdft_tests {
     REQUIRE(nonzero_Pi);
 
     // ignore_g0: iq_gamma=0 should be exactly zero across all four arrays.
-    auto const& RePi = *state.RePi_qPQO;
     bool gamma_zero = true;
     for (long P = 0; P < Naux; ++P)
       for (long Q = 0; Q < Naux; ++Q)
@@ -236,22 +239,24 @@ namespace bdft_tests {
     scr_R.update_w(state_R, thc,
                    /*verbose*/ false, /*use_rspace*/ true);
 
-    auto const& ImPi_k = *state_k.ImPi_qPQO;
-    auto const& ImPi_R = *state_R.ImPi_qPQO;
-    auto const& ImW_k  = *state_k.ImW_qPQO;
-    auto const& ImW_R  = *state_R.ImW_qPQO;
-    auto const& ReW_k  = *state_k.ReW_qPQO;
-    auto const& ReW_R  = *state_R.ReW_qPQO;
+    // Both states have the same proc grid -> same local layout. Compare
+    // local slices directly (no gather needed).
+    auto ImPi_k_loc = state_k.ImPi_qPQO->local();
+    auto ImPi_R_loc = state_R.ImPi_qPQO->local();
+    auto ImW_k_loc  = state_k.ImW_qPQO->local();
+    auto ImW_R_loc  = state_R.ImW_qPQO->local();
+    auto ReW_k_loc  = state_k.ReW_qPQO->local();
+    auto ReW_R_loc  = state_R.ReW_qPQO->local();
 
     double max_diff_Pi = 0.0;
     double max_diff_W  = 0.0;
-    const long size = ImPi_k.size();
-    auto const* p_Pi_k = ImPi_k.data();
-    auto const* p_Pi_R = ImPi_R.data();
-    auto const* p_ImW_k = ImW_k.data();
-    auto const* p_ImW_R = ImW_R.data();
-    auto const* p_ReW_k = ReW_k.data();
-    auto const* p_ReW_R = ReW_R.data();
+    const long size = ImPi_k_loc.size();
+    auto const* p_Pi_k = ImPi_k_loc.data();
+    auto const* p_Pi_R = ImPi_R_loc.data();
+    auto const* p_ImW_k = ImW_k_loc.data();
+    auto const* p_ImW_R = ImW_R_loc.data();
+    auto const* p_ReW_k = ReW_k_loc.data();
+    auto const* p_ReW_R = ReW_R_loc.data();
     for (long i = 0; i < size; ++i) {
       max_diff_Pi = std::max(max_diff_Pi,
                               std::abs(p_Pi_k[i] - p_Pi_R[i]));
@@ -331,13 +336,14 @@ namespace bdft_tests {
     app_log(2, "[scr_coulomb matches_driver] max diff Sigma = {:.3e}", max_diff);
     REQUIRE(max_diff < 1e-12);
 
-    // Side-effect check: state.W from update_w must be finite.
-    auto const& ImW = *state_split.ImW_qPQO;
-    auto const& ReW = *state_split.ReW_qPQO;
+    // Side-effect check: state.W from update_w must be finite (check
+    // the local slice on each rank).
+    auto ImW_loc = state_split.ImW_qPQO->local();
+    auto ReW_loc = state_split.ReW_qPQO->local();
     bool all_finite = true;
-    for (long i = 0; i < ImW.size(); ++i) {
-      if (!std::isfinite(ImW.data()[i].real()) ||
-          !std::isfinite(ReW.data()[i].real()))
+    for (long i = 0; i < ImW_loc.size(); ++i) {
+      if (!std::isfinite(ImW_loc.data()[i].real()) ||
+          !std::isfinite(ReW_loc.data()[i].real()))
         all_finite = false;
     }
     REQUIRE(all_finite);

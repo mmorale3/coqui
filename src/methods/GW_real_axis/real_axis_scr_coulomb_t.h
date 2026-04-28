@@ -165,16 +165,21 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
                A_in.shape()[4] == nbnd,
                "real_axis_scr_coulomb_t::update_w: state.A_wskij shape mismatch");
 
-  // (Re)allocate bosonic state fields.
+  // (Re)allocate bosonic state dArrays (distributed over (P, Q)).
   state.allocate_bosonic(Nq, Naux);
-  auto & ImPi = *state.ImPi_qPQO;
-  auto & RePi = *state.RePi_qPQO;
-  auto & ImW  = *state.ImW_qPQO;
-  auto & ReW  = *state.ReW_qPQO;
-  ImPi = ComplexType(0.0, 0.0);
-  RePi = ComplexType(0.0, 0.0);
-  ImW  = ComplexType(0.0, 0.0);
-  ReW  = ComplexType(0.0, 0.0);
+
+  // Phase 1A.1: kernel still computes Pi/W in fully-replicated nda::array
+  // buffers; the local (P_loc, Q_loc) slice is copied into the state
+  // dArrays at the end of each step. Phase 1A.2 will rewrite the kernels
+  // to write directly into the distributed slice with no replicated buffer.
+  nda::array<ComplexType, 4> ImPi(Nq, Naux, Naux, N_O);
+  nda::array<ComplexType, 4> RePi(Nq, Naux, Naux, N_O);
+  nda::array<ComplexType, 4> ImW(Nq, Naux, Naux, N_O);
+  nda::array<ComplexType, 4> ReW(Nq, Naux, Naux, N_O);
+  ImPi() = ComplexType(0.0, 0.0);
+  RePi() = ComplexType(0.0, 0.0);
+  ImW()  = ComplexType(0.0, 0.0);
+  ReW()  = ComplexType(0.0, 0.0);
 
   // Repack input A from (N_w, ns, nkpts, nbnd, nbnd) to driver layout
   // (ns, nkpts, N_w, nbnd, nbnd).
@@ -429,6 +434,30 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
     }
   }
   const double dt4 = sec_since(t4);
+
+  // ----------------------------------------------------------------
+  // Phase 1A.1 finalize: copy each rank's (P_loc, Q_loc) slice from
+  // the replicated buffers into the distributed state dArrays.
+  // ----------------------------------------------------------------
+  {
+    auto copy_slice = [&](nda::array<ComplexType, 4> const& src,
+                          real_axis_mb_state_t::bosonic_dArray_t& dst) {
+      auto Pr = dst.local_range(1);
+      auto Qr = dst.local_range(2);
+      auto loc = dst.local();
+      // Local slice: (Nq, P_loc, Q_loc, N_O); src is (Nq, Naux, Naux, N_O).
+      for (long iq = 0; iq < Nq; ++iq)
+        for (long iP = 0; iP < Pr.size(); ++iP)
+          for (long iQ = 0; iQ < Qr.size(); ++iQ)
+            for (long iO = 0; iO < N_O; ++iO)
+              loc(iq, iP, iQ, iO) =
+                  src(iq, Pr.first() + iP, Qr.first() + iQ, iO);
+    };
+    copy_slice(ImPi, *state.ImPi_qPQO);
+    copy_slice(RePi, *state.RePi_qPQO);
+    copy_slice(ImW,  *state.ImW_qPQO);
+    copy_slice(ReW,  *state.ReW_qPQO);
+  }
 
   if (verbose and comm.root()) {
     const double dt_total = sec_since(t_total);
