@@ -303,6 +303,20 @@ class thc
   void print_timers();
   void reset_timers() { Timer.reset(); }
 
+  // Read-only access to the dense G grid used by the smooth ISDF (built
+  // from the input ecut, default = ecutrho). Needed by external callers
+  // that wish to evaluate auxiliary functions (e.g. PAW augmentation
+  // η^q(G)) on the same grid for cross-block Coulomb contractions.
+  grids::truncated_g_grid const& g_grid() const { return rho_g; }
+
+  // Cell volume Ω of the underlying MF object — convenience for callers
+  // assembling Coulomb contractions in G-space.
+  double volume() const { return (mf != nullptr) ? mf->volume() : 0.0; }
+
+  // MF accessor (used by augmentation hooks to reach pseudopot via
+  // make_pseudopot, atom positions, etc.).
+  mf::MF* get_mf() const { return mf; }
+
   private:
 
   // mpi context with global, node, internode and gpu communicators

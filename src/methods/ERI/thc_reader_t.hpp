@@ -44,6 +44,11 @@
 #include "methods/ERI/thc.h"
 #include "methods/ERI/chol_reader_t.hpp"
 #include "mean_field/MF.hpp"
+#include "hamiltonian/pseudo/pseudopot.h"
+#include "hamiltonian/paw/local_isdf.hpp"
+#include "hamiltonian/paw/local_isdf_compress.hpp"
+#include "hamiltonian/paw/local_isdf_h5.hpp"
+#include "hamiltonian/paw/paw_aug_thc.hpp"
 
 namespace methods {
 
@@ -95,12 +100,25 @@ namespace methods {
       _Y_shm{std::nullopt},
       _dSinv_Ivec(std::nullopt),
       _Timer() {
-      utils::check(x_range.first() >= 0 and x_range.last() <= _nbnd, 
+      utils::check(x_range.first() >= 0 and x_range.last() <= _nbnd,
                    "X orbitals out of range: ({},{}), nbnd:{}",x_range.first(),x_range.last(),_nbnd);
       utils::check(y_range.first() >= 0 and y_range.last() <= _nbnd,
                    "Y orbitals out of range: ({},{}), nbnd:{}",y_range.first(),y_range.last(),_nbnd);
       auto thresh = io::get_value_with_default<double>(pt,"thresh",1e-10);
       utils::check( _Np>0 or thresh>0.0, "Error in thc_reader_t: Must set nIpts and/or thresh");
+
+      // PAW augmentation options (Phase 4.2: q=0 G-L/L-L; K_a at all q).
+      // Default to false (user must opt in). Auto-detect from MF metadata
+      // is a follow-up; for now mf::MF doesn't expose a pp_type() and we
+      // do not want to construct hamilt::pseudopot just to peek.
+      _paw_aug = io::get_value_with_default<bool>(pt, "paw_aug", false);
+      _paw_isdf_tol = io::get_value_with_default<double>(pt, "paw_isdf_tol", 1e-12);
+      _paw_isdf_cache_h5 = io::get_value_with_default<std::string>(pt, "paw_isdf_cache_h5", "");
+      {
+        std::string m = io::tolower_copy(io::get_value_with_default<std::string>(pt, "paw_isdf_metric", "coulomb"));
+        _paw_isdf_metric = (m == "l2") ? hamilt::paw::isdf_metric::L2
+                                       : hamilt::paw::isdf_metric::Coulomb;
+      }
       if(_storage == eri_storage_e::outcore and _eri_file == "") 
         _eri_file = "./thc.eri.h5";
 
@@ -155,8 +173,12 @@ namespace methods {
       utils::check(_X_type == "q_indep", "thc_reader_t: q-dependent Xk is not implemented yet!");
 
       for (auto &v: {"BUILD_TOTAL", "BUILD_THC", "BUILD_GATHER", "BUILD_WRITE",
-                     "READ_X", "READ_V"})
+                     "READ_X", "READ_V", "PAW_AUG"})
         _Timer.add(v);
+
+      // PAW-aug: lazily acquire pseudopot through MF (shared with other
+      // consumers via make_pseudopot) and build/load the compressed isdf.
+      if (_paw_aug) prepare_paw_isdf();
 
       if (build_eri) {
         utils::check(_thc_builder_opt!=std::nullopt, "thc_builder is not initialized!");
@@ -193,6 +215,70 @@ namespace methods {
       app_log(1, "");
     }
 
+    // Acquire pseudopot via MF's lazy reference and build / load the
+    // compressed local-ISDF for PAW augmentation. Idempotent: safe to call
+    // multiple times.
+    void prepare_paw_isdf() {
+      _Timer.start("PAW_AUG");
+      if (!_psp) _psp = hamilt::make_pseudopot(*_MF);
+      utils::check(_psp != nullptr,
+                   "thc_reader_t: paw_aug=true but make_pseudopot returned null.");
+
+      // Try to load a cached compressed isdf if a path was given.
+      if (!_paw_isdf_cache_h5.empty() && std::filesystem::exists(_paw_isdf_cache_h5)) {
+        hamilt::paw::isdf_metric m_back = hamilt::paw::isdf_metric::Coulomb;
+        double tol_back = 0.0;
+        _isdf = hamilt::paw::load_compressed_local_isdf_from_h5(
+            _paw_isdf_cache_h5, &m_back, &tol_back);
+        if (!_isdf.empty()) {
+          app_log(1, "  paw_aug: loaded compressed local-ISDF from {} "
+                     "(metric={}, tol={:.1e})",
+                     _paw_isdf_cache_h5, hamilt::paw::metric_name(m_back), tol_back);
+          _Timer.stop("PAW_AUG");
+          return;
+        }
+      }
+
+      // Build from psp (compressed-by-norm at the requested tolerance).
+      // Compressed-by-norm preserves exact reconstruction at every kept
+      // pair (the scheme we use elsewhere); this is the right default.
+      auto const& sps = _psp->paw_species_view();
+      int nsp = (int)sps.size();
+      auto recv = _MF->recv();
+      double det_B =
+          recv(0,0)*(recv(1,1)*recv(2,2) - recv(1,2)*recv(2,1))
+        - recv(1,0)*(recv(0,1)*recv(2,2) - recv(0,2)*recv(2,1))
+        + recv(2,0)*(recv(0,1)*recv(1,2) - recv(0,2)*recv(1,1));
+      double omega = (2.0*M_PI)*(2.0*M_PI)*(2.0*M_PI) / std::abs(det_B);
+      _isdf.clear(); _isdf.reserve(nsp);
+      for (int nt = 0; nt < nsp; ++nt) {
+        bool has_aug = sps[nt].is_paw || sps[nt].is_uspp;
+        if (!has_aug) {
+          _isdf.emplace_back();
+          continue;
+        }
+        auto isdf_nt = hamilt::paw::build_local_isdf_compressed_by_norm(
+            *_psp, nt, recv, omega, _paw_isdf_metric, _paw_isdf_tol);
+        _isdf.push_back(std::move(isdf_nt));
+      }
+      app_log(1, "  paw_aug: built compressed local-ISDF (metric={}, tol={:.1e}, nsp={})",
+              hamilt::paw::metric_name(_paw_isdf_metric), _paw_isdf_tol, nsp);
+
+      // Optionally save the cache.
+      if (!_paw_isdf_cache_h5.empty() && _mpi->comm.root()) {
+        std::vector<hamilt::paw::isdf_compression_report> empty_reps(_isdf.size());
+        h5::file f(_paw_isdf_cache_h5,
+                   std::filesystem::exists(_paw_isdf_cache_h5) ? 'a' : 'w');
+        h5::group root(f);
+        hamilt::paw::write_local_isdf_h5(root, _isdf, empty_reps,
+                                          _paw_isdf_metric, _paw_isdf_tol);
+        app_log(1, "  paw_aug: saved compressed local-ISDF to {}",
+                _paw_isdf_cache_h5);
+      }
+      _mpi->comm.barrier();
+      _Timer.stop("PAW_AUG");
+    }
+
     void print_thc_summary() {
       app_log(1, "\n  Summary of THC Coulomb Integrals");
       app_log(1, "  --------------------------------");
@@ -221,6 +307,8 @@ namespace methods {
           utils::check( _get_Sinv_Ivec == _dSinv_Ivec_d.has_value(), "Error: Inconsistent optional return value.");
           _Timer.stop("BUILD_THC");
 
+          _Np_smooth = (int)_Np;
+
           // copy to host memory if needed, otherwise just move
           _dZ = std::move(_dZ_d);
           _Chi_head = std::move(_Chi_head_d);
@@ -235,6 +323,9 @@ namespace methods {
           else
             utils::check(x_range == y_range, "thc_reader::build: x_range != y_range with missing dXb value.");
           _Timer.stop("BUILD_GATHER");
+
+          // PAW augmentation deferred until after the * Nk scaling below
+          // so smooth and aug blocks share the same (1/Ω) prefactor.
         };
 
         if(_MEM_EVAL == HOST_MEMORY)
@@ -247,9 +338,29 @@ namespace methods {
 #endif
       }
 
-      // scale by nkpts
+      // scale by nkpts: thc.cpp's intvec_impl divides by Ω*Nk, so promote to 1/Ω.
       auto Z_loc = _dZ.local();
       Z_loc *= _nkpts;
+
+      // ---- PAW augmentation (Phase 4.2: q=0 G-L/L-L; K_a at all q) ----
+      // Done AFTER the * Nk scaling so smooth and aug both end up at (1/Ω).
+      if (_paw_aug) {
+        _Timer.start("PAW_AUG");
+        auto dispatch = [&]<MEMORY_SPACE MEM>() {
+          auto [ri,dXa,dXb] = _thc_builder_opt.value().interpolating_points<MEM>(
+              0, _Np_smooth, x_range, y_range);
+          (void)ri;
+          auto dzeta_quG = _thc_builder_opt.value().template evaluate_isdf_only<MEM>(
+              ri, dXa, dXb, x_range, y_range);
+          augment_thc_with_paw<MEM>(dzeta_quG);
+        };
+        if (_MEM_EVAL == HOST_MEMORY) dispatch.template operator()<HOST_MEMORY>();
+#if defined(ENABLE_DEVICE)
+        else if (_MEM_EVAL == DEVICE_MEMORY) dispatch.template operator()<DEVICE_MEMORY>();
+        else if (_MEM_EVAL == UNIFIED_MEMORY) dispatch.template operator()<UNIFIED_MEMORY>();
+#endif
+        _Timer.stop("PAW_AUG");
+      }
 
       // save if requested
       if (_eri_file != "") {
@@ -305,6 +416,225 @@ namespace methods {
       app_log(2, " ");
 
       print_thc_summary();
+    }
+
+    /**
+     * Augment the smooth (X_shm, dZ) with PAW atom-local rows. Replaces
+     * `_X_shm` and `_dZ` with their augmented counterparts and updates
+     * `_Np = N_smooth + N_aug`. Phase 4.2: V_GL/V_LL filled at q=0 only;
+     * K_a same-atom block added at every q.
+     *
+     * `dzeta_quG` is the smooth ζ_μ^q(G) on the thc rho_g grid (output of
+     * `thc::evaluate_isdf_only`).
+     */
+    template<MEMORY_SPACE MEM>
+    void augment_thc_with_paw(
+        memory::darray_t<memory::array<MEM,ComplexType,3>,mpi3::communicator>
+            const& dzeta_quG)
+    {
+      using nda::range;
+      utils::check(_psp != nullptr,
+                   "augment_thc_with_paw: _psp is null (call prepare_paw_isdf first).");
+      auto const& thc_b = _thc_builder_opt.value();
+      auto const& rho_g = thc_b.g_grid();
+      double omega = thc_b.volume();
+
+      _aug_layout = hamilt::paw::make_paw_aug_layout(*_psp, _isdf, _Np_smooth);
+      _N_aug = _aug_layout.N_A;
+      int N_total = _Np_smooth + _N_aug;
+      app_log(1, "  paw_aug: N_smooth={}, N_aug={}, N_total={}",
+              _Np_smooth, _N_aug, N_total);
+
+      if (_N_aug == 0) {
+        // Nothing to augment (no PAW species).
+        _Np = _Np_smooth;
+        return;
+      }
+
+      // ---------------------------------------------------------------
+      // 1) Augment X_shm: append Y rows below smooth ζ rows.
+      // ---------------------------------------------------------------
+      auto X_old = _X_shm;
+      int dim_s = _ns_in_basis * _npol_in_basis;
+      auto X_new = math::shm::make_shared_array<Array_view_t<HOST_MEMORY,4>>(
+          *_mpi, {dim_s, _nkpts, N_total, x_range.size()});
+      X_new.win().fence();
+      if (X_new.node_comm()->root()) {
+        auto Xn = X_new.local();
+        auto Xo = X_old.local();
+        for (int s = 0; s < dim_s; ++s)
+        for (int k = 0; k < _nkpts; ++k) {
+          // smooth rows
+          for (int mu = 0; mu < _Np_smooth; ++mu)
+            Xn(s, k, mu, range::all) = Xo(s, k, mu, range::all);
+          // Y rows = U · P
+          nda::array<ComplexType,2> Y_buf(_N_aug,
+              x_range.size() * std::max(1, _npol));
+          hamilt::paw::fill_Y_rows_for_sk(
+              *_psp, _isdf, _aug_layout, _npol,
+              s, k, _psp->Pskna_view(), Y_buf);
+          for (int la = 0; la < _N_aug; ++la)
+            for (int i = 0; i < (int)x_range.size(); ++i)
+              Xn(s, k, _Np_smooth + la, i) = Y_buf(la, i);
+        }
+      }
+      X_new.win().fence();
+      _X_shm = X_new;
+
+      // (For now, if x_range != y_range: also need to augment _Y_shm.
+      //  Phase 4.2 only validates Hartree which uses X = Y; defer.)
+      utils::check(x_range == y_range || !_Y_shm.has_value(),
+        "thc_reader::augment_thc_with_paw: x_range != y_range augmentation "
+        "is a Phase 4.3 follow-up.");
+
+      // ---------------------------------------------------------------
+      // 2) Build augmented dZ: copy smooth GG block, fill GL/LL at q=0,
+      //    add K_a at all q.
+      // ---------------------------------------------------------------
+      auto _dZ_smooth = std::move(_dZ);
+      // distribution: keep a single q-pool slab on rank 0 for simplicity
+      // (matches the pattern used in build_from_CD).
+      int np = _mpi->comm.size();
+      long nqpools = utils::find_proc_grid_max_npools(np, _nqpts_ibz, 0.2);
+      utils::check(nqpools > 0 && np % nqpools == 0,
+                   "thc_reader::augment: bad pgrid (np={}, nqpts_ibz={})",
+                   np, _nqpts_ibz);
+      int np_PQ = np / nqpools;
+      int np_P = utils::find_proc_grid_min_diff(np_PQ, 1, 1);
+      int np_Q = np_PQ / np_P;
+      _dZ = math::nda::make_distributed_array<Array_t<HOST_MEMORY,3>>(
+          _mpi->comm, {(long)nqpools, np_P, np_Q},
+          {_nqpts_ibz, N_total, N_total});
+
+      // Gather smooth dZ slab-by-slab on root, build augmented full slab,
+      // scatter back into the distributed _dZ. Acceptable for fixture-
+      // sized N_total (≤ a few hundred) and validated explicitly here.
+      auto rho_g_size = rho_g.size();
+      auto wG = hamilt::paw::coulomb_weights_on_rho_g(rho_g, omega);
+
+      // Bring smooth dZ to a single host array first (q-by-q).
+      nda::array<ComplexType,3> V_full_q(_nqpts_ibz, N_total, N_total);
+      V_full_q() = ComplexType(0.0);
+      // Smooth GG block (broadcast each iq from its owner)
+      for (int iq = 0; iq < _nqpts_ibz; ++iq) {
+        nda::array<ComplexType,2> Vq_smooth(_Np_smooth, _Np_smooth);
+        for (int ip = 0; ip < _dZ_smooth.communicator()->size(); ++ip) {
+          int iq_at_ip = (ip == _dZ_smooth.communicator()->rank()) ? iq : -1;
+          _dZ_smooth.communicator()->broadcast_n(&iq_at_ip, 1, ip);
+          if (iq_at_ip < 0) continue;
+          math::nda::gather_sub_matrix(iq_at_ip, ip, _dZ_smooth, &Vq_smooth);
+        }
+        for (long u = 0; u < _Np_smooth; ++u)
+          for (long v = 0; v < _Np_smooth; ++v)
+            V_full_q(iq, u, v) = Vq_smooth(u, v);
+      }
+
+      // ── Phase 4.3: per-q V_GL / V_LL via CoQui-side qvan2 ─────────────
+      //
+      // Build the angular-coupling tables once (depends only on max l of
+      // any projector across all PAW species).
+      int aainit_lli = 1;
+      for (auto const& sp : _psp->paw_species_view()) {
+        if (sp.lll.size() == 0) continue;
+        for (long b = 0; b < sp.lll.extent(0); ++b)
+          aainit_lli = std::max(aainit_lli, sp.lll(b) + 1);
+      }
+      auto aatab = hamilt::paw::aainit_tables_build(aainit_lli);
+
+      // Convention scaling — V_LL needs Ω², V_GL needs Ω. See the
+      // detailed derivation in the q=0 phase note (V_LL_buf carries one
+      // 1/Ω from wG; the smooth ζ_code carries one Ω; bare η_QE has no Ω).
+      double omega_sq = omega * omega;
+
+      // K_a injection (q-independent — applied at every q in the loop).
+      nda::array<ComplexType,2> K_LL_buf(_N_aug, _N_aug);
+      K_LL_buf() = ComplexType(0.0);
+      hamilt::paw::add_K_a_to_LL(*_psp, _isdf, _aug_layout, K_LL_buf);
+
+      // dzeta_quG global shape: (nqpts_ibz, Np_smooth, ngm_rho_or_nnr).
+      long ngm_z = dzeta_quG.global_shape()[2];
+      utils::check(ngm_z == rho_g_size,
+        "thc_reader::augment: dzeta_quG G-dim ({}) != rho_g.size ({}). "
+        "Augmentation requires orb_on_fft_grid mode (ζ in G-space).",
+        ngm_z, rho_g_size);
+      auto dzeta_local = dzeta_quG.local();
+      auto q_rng_owned = dzeta_quG.local_range(0);
+      auto u_rng       = dzeta_quG.local_range(1);
+      auto g_rng       = dzeta_quG.local_range(2);
+
+      auto Qpts_cart = _MF->Qpts();    // (nqpts, 3) cartesian
+      nda::array<ComplexType,2> zeta_mu_g(_Np_smooth, rho_g_size);
+      nda::array<ComplexType,2> V_GL_buf(_Np_smooth, _N_aug);
+      nda::array<ComplexType,2> V_LL_buf(_N_aug, _N_aug);
+
+      for (int iq = 0; iq < _nqpts_ibz; ++iq) {
+        // Add K_a (q-independent) at every q.
+        for (long la = 0; la < _N_aug; ++la)
+          for (long lb = 0; lb < _N_aug; ++lb)
+            V_full_q(iq, _Np_smooth + la, _Np_smooth + lb) += K_LL_buf(la, lb);
+
+        // Smooth-aug Coulomb blocks: build at this q.
+        // q_cart for the augmentation η^q is chosen to match thc's Coulomb
+        // convention (which uses K_eff = G − Q_thc). The ζ for the same iq
+        // is built consistent with this convention by thc.cpp, so the
+        // smooth-aug cross-block uses the same q_cart.
+        std::array<double,3> q_cart = {
+            -Qpts_cart(iq, 0), -Qpts_cart(iq, 1), -Qpts_cart(iq, 2)};
+
+        // Gather ζ_μ^q(G) for this iq across MPI.
+        zeta_mu_g() = ComplexType(0.0);
+        for (auto [iq_l, iq_g] : itertools::enumerate(q_rng_owned)) {
+          if (iq_g != iq) continue;
+          for (auto [iu, u] : itertools::enumerate(u_rng))
+            for (auto [ig, g] : itertools::enumerate(g_rng))
+              zeta_mu_g(u, g) = dzeta_local(iq_l, iu, ig);
+        }
+        _mpi->comm.all_reduce_in_place_n(zeta_mu_g.data(), zeta_mu_g.size(),
+                                          std::plus<>{});
+
+        // η^q on rho_g grid + q-shifted Coulomb weights.
+        auto eta_aug = hamilt::paw::build_eta_on_rho_g_at_q(
+            *_psp, _isdf, rho_g, q_cart, omega, aatab);
+        auto wG_q = hamilt::paw::coulomb_weights_on_rho_g_at_q(
+            rho_g, q_cart, omega);
+
+        // V_GL and V_LL at this q. The compute_*_q0 routines are
+        // q-agnostic in form — q dependence enters only through eta_aug
+        // and wG_q.
+        V_GL_buf() = ComplexType(0.0);
+        V_LL_buf() = ComplexType(0.0);
+        hamilt::paw::compute_VGL_q0_on_rho_g(*_psp, _isdf, _aug_layout,
+                                              zeta_mu_g, eta_aug, wG_q,
+                                              V_GL_buf);
+        hamilt::paw::compute_VLL_q0_on_rho_g(*_psp, _isdf, _aug_layout,
+                                              eta_aug, wG_q, V_LL_buf);
+        for (auto& v : V_GL_buf) v *= omega;
+        for (auto& v : V_LL_buf) v *= omega_sq;
+
+        // Stitch into V_full_q[iq].
+        for (long mu = 0; mu < _Np_smooth; ++mu)
+          for (long la = 0; la < _N_aug; ++la) {
+            ComplexType v = V_GL_buf(mu, la);
+            V_full_q(iq, mu, _Np_smooth + la) += v;
+            V_full_q(iq, _Np_smooth + la, mu) += std::conj(v);
+          }
+        for (long la = 0; la < _N_aug; ++la)
+          for (long lb = 0; lb < _N_aug; ++lb)
+            V_full_q(iq, _Np_smooth + la, _Np_smooth + lb) += V_LL_buf(la, lb);
+      }
+
+      // Scatter V_full_q into _dZ
+      auto Z_loc = _dZ.local();
+      auto qloc = _dZ.local_range(0);
+      auto Ploc = _dZ.local_range(1);
+      auto Qloc = _dZ.local_range(2);
+      for (auto [iq_l, iq] : itertools::enumerate(qloc)) {
+        for (auto [iP_l, iP] : itertools::enumerate(Ploc))
+          for (auto [iQ_l, iQ] : itertools::enumerate(Qloc))
+            Z_loc(iq_l, iP_l, iQ_l) = V_full_q(iq, iP, iQ);
+      }
+
+      _Np = N_total;
     }
 
     void build_from_CD() {
@@ -982,6 +1312,25 @@ namespace methods {
     memory::array<HOST_MEMORY, long, 1> _rp;
 
     mutable utils::TimerManager _Timer;
+
+    // ====== PAW augmentation state (Phase 4.2) =========================
+    // _paw_aug == true means the X / V arrays in this reader are
+    // pre-augmented: rows [N_smooth, N_smooth + N_aug) are atom-local
+    // ISDF features rather than smooth ζ. Downstream code consumes the
+    // composite (X, V) without distinguishing.
+    //
+    // Phase 4.2 fills V_GL / V_LL only at q=0 (Hartree-correct); the K_a
+    // same-atom block is added at every q. Multi-q exchange/SCF awaits
+    // Phase 4.3 which fills q≠0 G-L/L-L blocks via radial-Bessel η^q(G).
+    bool _paw_aug = false;
+    int _Np_smooth = 0;                // smooth-only block size
+    int _N_aug = 0;                    // total atom-local rows
+    std::shared_ptr<hamilt::pseudopot> _psp;        // lazy via make_pseudopot
+    std::vector<hamilt::paw::species_local_isdf> _isdf;
+    hamilt::paw::paw_aug_layout _aug_layout;
+    hamilt::paw::isdf_metric _paw_isdf_metric = hamilt::paw::isdf_metric::Coulomb;
+    double _paw_isdf_tol = 1e-12;
+    std::string _paw_isdf_cache_h5;
   };
 
 } // methods

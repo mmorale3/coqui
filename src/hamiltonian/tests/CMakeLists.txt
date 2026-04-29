@@ -3,9 +3,10 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${PROJECT_UNIT_TEST_DIR})
 
 set(TEST_ID hamiltonian)
 
-set( TEST_SRCS 
+set( TEST_SRCS
      test_hamilt.cpp
      test_pseudo.cpp
+     test_paw_energy_check.cpp
    )
 
 if(USE_DEVICE_COMPILER)

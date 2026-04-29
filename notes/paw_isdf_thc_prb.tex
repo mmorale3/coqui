@@ -1,0 +1,868 @@
+\documentclass[aps,prb,reprint,superscriptaddress,longbibliography,nofootinbib]{revtex4-2}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsfonts,bm}
+\usepackage{mathtools}
+\usepackage{braket}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{hyperref}
+
+\hypersetup{colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue}
+
+\newcommand{\br}{\mathbf r}
+\newcommand{\bR}{\mathbf R}
+\newcommand{\bG}{\mathbf G}
+\newcommand{\bk}{\mathbf k}
+\newcommand{\bq}{\mathbf q}
+\newcommand{\btau}{\boldsymbol\tau}
+\newcommand{\tpsi}{\widetilde\psi}
+\newcommand{\tphi}{\widetilde\phi}
+\newcommand{\tp}{\widetilde p}
+\newcommand{\trho}{\widetilde\rho}
+\newcommand{\barrho}{\overline\rho}
+\newcommand{\hatrho}{\widehat\rho}
+\newcommand{\hatQ}{\widehat Q}
+\newcommand{\tQ}{\widetilde Q}
+\newcommand{\dd}{\mathrm d}
+\newcommand{\coul}[2]{\left(#1\middle|#2\right)}
+\newcommand{\ee}{\mathrm e}
+\newcommand{\ii}{\mathrm i}
+\newcommand{\cell}{\Omega}
+\newcommand{\ibz}{\mathrm{IBZ}}
+\newcommand{\orb}{\mathrm{orb}}
+\newcommand{\loc}{\mathrm{loc}}
+\newcommand{\PAW}{\mathrm{PAW}}
+\newcommand{\ISDF}{\mathrm{ISDF}}
+\newcommand{\THC}{\mathrm{THC}}
+
+\begin{document}
+
+\title{Projector-Augmented-Wave Interpolative Separable Density Fitting for All-Electron Tensor Hypercontraction of Two-Electron Integrals}
+
+\author{A. Researcher}
+\affiliation{Department of Physics, Institution, City, State, USA}
+\author{PAW-ISDF Collaboration}
+\affiliation{Computational Materials Theory Group, Institution, City, State, USA}
+\date{\today}
+
+\begin{abstract}
+We formulate a projector-augmented-wave interpolative separable density fitting (PAW-ISDF) representation of all-electron two-electron repulsion integrals.  The construction follows the momentum-resolved tensor-hypercontraction notation used by Yeh and Morales, in which Bloch pair densities at a fixed transferred momentum are interpolated from a compact set of real-space points and auxiliary functions.  The central modification is that ISDF is applied to the PAW compensated pair-density algebra, rather than to the pseudo pair density alone.  This leads to a tensor-hypercontracted electron repulsion tensor of the form
+\begin{equation*}
+V_{ijkl}^{\bk_i\bk_j\bk_k\bk_l}
+\approx
+\sum_{\Lambda\Sigma}
+X_{\Lambda i}^{\bk_i *}X_{\Lambda j}^{\bk_j}
+\mathcal V_{\Lambda\Sigma}^{\bq}
+X_{\Sigma k}^{\bk_k *}X_{\Sigma l}^{\bk_l},
+\end{equation*}
+where the composite auxiliary index \(\Lambda\) contains both smooth ISDF interpolation rows and atom-centered PAW augmentation rows.  The projected Coulomb matrix \(\mathcal V^{\bq}\) is the Coulomb metric of smooth compensated auxiliary functions plus a same-atom residual all-electron correction built from one-center PAW partial waves.  The resulting factorization preserves the separability in orbital and momentum indices needed for low-scaling many-body perturbation theory, while retaining the all-electron nodal information encoded in PAW partial waves.  We give the complete density decomposition, compensation-charge construction, local channel factorization, kernel assembly, algorithmic workflow, error estimates in the Coulomb metric, and practical implementation considerations for periodic systems.
+\end{abstract}
+
+\maketitle
+
+\section{Introduction}
+
+Two-electron repulsion integrals (ERIs) over all-electron single-particle orbitals are central to Hartree-Fock theory, hybrid density functionals, random phase approximation (RPA), \(GW\), vertex-corrected Green's-function methods, quantum embedding, and wave-function-based correlation theories.  For crystalline systems, a generic Bloch-basis ERI is a rank-four tensor with orbital and momentum labels,
+\begin{equation}
+\begin{aligned}
+V_{ijkl}^{\bk_i\bk_j\bk_k\bk_l}
+&=
+\int_{\cell}\dd\br\int_{\cell}\dd\br'
+\frac{1}{|\br-\br'|}
+\\
+&\quad\times
+\varphi_i^{\bk_i *}(\br)\varphi_j^{\bk_j}(\br)
+\varphi_k^{\bk_k *}(\br')\varphi_l^{\bk_l}(\br').
+\end{aligned}
+\label{eq:eri-def-intro}
+\end{equation}
+subject to crystal-momentum conservation.  In a direct representation, storage and contractions involving Eq.~\eqref{eq:eri-def-intro} are prohibitive.  Tensor hypercontraction (THC) overcomes this by expressing the ERI as a product of five second-order tensors, fully separating the four orbital indices.  Interpolative separable density fitting (ISDF) is a systematic route to THC: it compresses the set of pair densities by selecting interpolation points and auxiliary functions, leading directly to a compact projected Coulomb matrix.
+
+For plane-wave pseudopotential calculations, the pair densities are smooth and can be interpolated on moderate uniform grids.  The projector-augmented-wave (PAW) method changes the situation.  PAW provides access to all-electron wave functions through a transformation from smooth pseudo orbitals plus atom-centered all-electron corrections.  The near-nucleus nodal structure is essential for all-electron Coulomb matrix elements, but resolving it directly on a uniform grid would largely destroy the compactness that makes ISDF attractive.  The objective of this paper is therefore to combine PAW and ISDF in a way that preserves both advantages: smooth-grid ISDF in the interstitial region and compact atom-local all-electron corrections inside augmentation spheres.
+
+The key idea is simple but important: ISDF should not be applied to pseudo pair densities and then interpreted as an all-electron factorization.  Instead, one first rewrites the all-electron PAW Coulomb integral in terms of compensated smooth pair densities plus strictly one-center corrections.  ISDF is then applied to the compensated smooth part, while a separate low-rank factorization is applied to the finite-dimensional one-center PAW correction.  The result is a PAW-compatible THC factorization with the same structure as the momentum-dependent ISDF representation of Yeh and Morales,
+\begin{equation}
+V_{ijkl}^{\bk_i\bk_j\bk_k\bk_l}
+\approx
+\sum_{\mu\nu}
+X_{\mu i}^{\bk_i *}X_{\mu j}^{\bk_j}
+V_{\mu\nu}^{\bq}
+X_{\nu k}^{\bk_k *}X_{\nu l}^{\bk_l},
+\label{eq:standard-thc-intro}
+\end{equation}
+but with an enlarged auxiliary index containing PAW augmentation features.  The notation below follows Refs.~\onlinecite{YehMoralesRPA,YehMoralesGW}: \(\varphi_i^{\bk}\) denotes a Bloch orbital, \(X_{\mu i}^{\bk}\) the collocation matrix, \(\zeta_\mu^{\bq}\) the ISDF auxiliary function at transferred momentum \(\bq\), \(V_{\mu\nu}^{\bq}\) the projected Coulomb matrix, \(N_\mu\) the number of interpolation points, and \(\alpha=N_\mu/N_{\orb}\) the ISDF compression ratio.
+
+\section{Momentum-resolved ISDF and THC notation}
+\label{sec:isdf}
+
+Consider Bloch orbitals
+\begin{equation}
+\varphi_i^{\bk}(\br)=u_i^{\bk}(\br)\ee^{\ii\bk\cdot\br},
+\label{eq:bloch}
+\end{equation}
+where \(u_i^{\bk}\) is lattice-periodic.  With the momentum-transfer convention used in Refs.~\onlinecite{YehMoralesRPA,YehMoralesGW}, the ERI in Eq.~\eqref{eq:eri-def-intro} is nonzero when
+\begin{equation}
+\bq=\bk_i-\bk_j+\bG=\bk_l-\bk_k+\bG'
+\label{eq:q-convention}
+\end{equation}
+for reciprocal lattice vectors \(\bG\) and \(\bG'\).  The first pair density has crystal momentum \(-\bq\), while the second has crystal momentum \(+\bq\).  For an arbitrary fixed \(\bq\), define the family of pair densities
+\begin{equation}
+\rho^{\bq}(\bk ij,\br)
+=
+\varphi_i^{\bk-\bq *}(\br)\varphi_j^{\bk}(\br).
+\label{eq:pair-density-yem}
+\end{equation}
+ISDF approximates Eq.~\eqref{eq:pair-density-yem} as
+\begin{equation}
+\rho^{\bq}(\bk ij,\br)
+\approx
+\sum_{\mu=1}^{N_\mu}
+\varphi_i^{\bk-\bq *}(\br_\mu)\varphi_j^{\bk}(\br_\mu)
+\zeta_\mu^{\bq}(\br),
+\label{eq:isdf-standard}
+\end{equation}
+where \(\{\br_\mu\}\) are interpolating points and \(\{\zeta_\mu^{\bq}\}\) are auxiliary functions.  Equivalently,
+\begin{equation}
+\rho^{\bq}(\bk ij,\br)
+\approx
+\sum_\mu X_{\mu i}^{\bk-\bq *}X_{\mu j}^{\bk}\zeta_\mu^{\bq}(\br),
+\quad
+X_{\mu i}^{\bk}=\varphi_i^{\bk}(\br_\mu).
+\label{eq:x-standard}
+\end{equation}
+The corresponding projected Coulomb matrix is
+\begin{equation}
+V_{\mu\nu}^{\bq}
+=
+\int_{\cell}\dd\br\int_{\cell}\dd\br'
+\zeta_\mu^{-\bq}(\br)
+\frac{1}{|\br-\br'|}
+\zeta_\nu^{\bq}(\br'),
+\label{eq:vmunu-standard}
+\end{equation}
+with the usual periodic treatment of the Coulomb singularity.  Inserting Eq.~\eqref{eq:x-standard} into Eq.~\eqref{eq:eri-def-intro} gives
+\begin{equation}
+V_{ijkl}^{\bk_i\bk_j\bk_k\bk_l}
+\approx
+\sum_{\mu\nu}
+X_{\mu i}^{\bk_i *}X_{\mu j}^{\bk_j}
+V_{\mu\nu}^{\bq}
+X_{\nu k}^{\bk_k *}X_{\nu l}^{\bk_l}.
+\label{eq:thc-standard}
+\end{equation}
+
+After the interpolation points are selected, the auxiliary functions may be obtained from a least-squares problem.  Written in the notation of Ref.~\onlinecite{YehMoralesRPA}, let the pair-density matrix be \(\rho^{\bq}(\bk ij,\br)\).  The overdetermined system is
+\begin{equation}
+C^{\bq}\Theta^{\bq}=Z^{\bq},
+\label{eq:ctheta-z}
+\end{equation}
+with
+\begin{subequations}
+\begin{align}
+Z_{\nu r}^{\bq}
+&=
+\sum_{\bk ij}
+\rho^{\bq *}(\bk ij,\br_\nu)
+\rho^{\bq}(\bk ij,\br),
+\label{eq:zq}\\
+C_{\nu\mu}^{\bq}
+&=
+\sum_{\bk ij}
+\rho^{\bq *}(\bk ij,\br_\nu)
+\rho^{\bq}(\bk ij,\br_\mu),
+\label{eq:cq}\\
+\Theta_{\mu r}^{\bq}
+&=\zeta_\mu^{\bq}(\br).
+\label{eq:thetaq}
+\end{align}
+\end{subequations}
+A common point-selection strategy is pivoted Cholesky on
+\begin{equation}
+S^{\bq}=(\rho^{\bq})^\dagger \rho^{\bq},
+\label{eq:pivoted-cholesky}
+\end{equation}
+or the equivalent column-pivoted QR factorization of \(\rho^{\bq}\).  Empirically, \(N_\mu=\alpha N_{\orb}\) with moderate \(\alpha\) is often sufficient for chemically useful accuracy in pseudopotential periodic calculations.
+
+\section{PAW all-electron pair densities}
+\label{sec:paw}
+
+\subsection{PAW transformation}
+
+The PAW transformation maps smooth pseudo orbitals to all-electron valence orbitals.  For a Bloch orbital, we write
+\begin{equation}
+\ket{\varphi_i^{\bk}}
+=\ket{\widetilde\varphi_i^{\bk}}
++
+\sum_a\sum_\alpha
+\left(
+\ket{\phi_{a\alpha}^{\bk}}-
+\ket{\widetilde\phi_{a\alpha}^{\bk}}
+\right)
+P_{i,a\alpha}^{\bk},
+\label{eq:paw-transform}
+\end{equation}
+where \(a\) labels atoms in the primitive cell, \(\alpha\) labels partial-wave channels on atom \(a\), and
+\begin{equation}
+P_{i,a\alpha}^{\bk}
+=
+\braket{\widetilde p_{a\alpha}^{\bk}|\widetilde\varphi_i^{\bk}}
+\label{eq:projector-overlap}
+\end{equation}
+is the PAW projector overlap.  The Bloch-summed projector is
+\begin{equation}
+\widetilde p_{a\alpha}^{\bk}(\br)
+=
+\sum_{\bR}
+\ee^{\ii\bk\cdot(\bR+\btau_a)}
+\widetilde p_{a\alpha}(\br-\bR-\btau_a),
+\label{eq:bloch-projector}
+\end{equation}
+up to the normalization convention used for Bloch functions.  Within each augmentation sphere, the pseudo orbital and the all-electron orbital have simultaneous partial-wave expansions,
+\begin{subequations}
+\begin{align}
+\varphi_i^{\bk}(\br)
+&\simeq
+\sum_\alpha \phi_{a\alpha}(\br-\btau_a)P_{i,a\alpha}^{\bk},
+\label{eq:ae-inside}\\
+\widetilde\varphi_i^{\bk}(\br)
+&\simeq
+\sum_\alpha \widetilde\phi_{a\alpha}(\br-\btau_a)P_{i,a\alpha}^{\bk}.
+\label{eq:pseudo-inside}
+\end{align}
+\end{subequations}
+The equalities become exact in the complete partial-wave limit.  In the remainder, frozen core contributions are suppressed unless explicitly stated; the target ERI tensor is the valence all-electron tensor reconstructed by PAW.
+
+\subsection{Uncompensated PAW pair-density decomposition}
+
+For the pair \((i\bk_i,j\bk_j)\), define
+\begin{equation}
+\rho_{ij}^{\bk_i\bk_j}(\br)
+=\varphi_i^{\bk_i *}(\br)\varphi_j^{\bk_j}(\br),
+\quad
+\widetilde\rho_{ij}^{\bk_i\bk_j}(\br)
+=\widetilde\varphi_i^{\bk_i *}(\br)\widetilde\varphi_j^{\bk_j}(\br).
+\label{eq:paw-pair-def}
+\end{equation}
+The one-center all-electron and pseudo pair densities are
+\begin{subequations}
+\begin{align}
+\rho_{ij}^{1,a;\bk_i\bk_j}(\br)
+&=
+\sum_{\alpha\beta}
+P_{i,a\alpha}^{\bk_i *}P_{j,a\beta}^{\bk_j}
+\phi_{a\alpha}^*(\br-\btau_a)\phi_{a\beta}(\br-\btau_a),
+\label{eq:rho-one-ae}\\
+\widetilde\rho_{ij}^{1,a;\bk_i\bk_j}(\br)
+&=
+\sum_{\alpha\beta}
+P_{i,a\alpha}^{\bk_i *}P_{j,a\beta}^{\bk_j}
+\widetilde\phi_{a\alpha}^*(\br-\btau_a)
+\widetilde\phi_{a\beta}(\br-\btau_a).
+\label{eq:rho-one-ps}
+\end{align}
+\end{subequations}
+Then the all-electron PAW pair density has the standard additive form
+\begin{equation}
+\rho_{ij}^{\bk_i\bk_j}(\br)
+=
+\widetilde\rho_{ij}^{\bk_i\bk_j}(\br)
++
+\sum_a
+\left[
+\rho_{ij}^{1,a;\bk_i\bk_j}(\br)
+-
+\widetilde\rho_{ij}^{1,a;\bk_i\bk_j}(\br)
+\right].
+\label{eq:paw-density-decomp}
+\end{equation}
+This expression alone is not a useful way to compute ERIs, because the Coulomb interaction couples localized augmentation corrections on different atoms and couples localized radial-grid quantities to smooth-grid quantities.
+
+\subsection{Compensation charges and PAW Coulomb partition}
+
+Define the channel product difference
+\begin{equation}
+\Delta Q_{a,\alpha\beta}(\mathbf s)
+=
+\phi_{a\alpha}^*(\mathbf s)\phi_{a\beta}(\mathbf s)
+-
+\widetilde\phi_{a\alpha}^*(\mathbf s)
+\widetilde\phi_{a\beta}(\mathbf s),
+\quad
+\mathbf s=\br-\btau_a.
+\label{eq:deltaq}
+\end{equation}
+For every pair of partial-wave channels, introduce a smooth localized compensation charge \(\widehat Q_{a,\alpha\beta}(\mathbf s)\) such that
+\begin{equation}
+\int_{\Omega_a}\dd\mathbf s\,
+|\mathbf s|^\ell Y_{\ell m}(\widehat{\mathbf s})
+\left[\Delta Q_{a,\alpha\beta}(\mathbf s)-\widehat Q_{a,\alpha\beta}(\mathbf s)\right]=0
+\label{eq:moment-condition}
+\end{equation}
+for all included multipoles \((\ell m)\).  Equivalently, \(\Delta Q_{a,\alpha\beta}-\widehat Q_{a,\alpha\beta}\) has zero multipole moments through the PAW compensation order, so its electrostatic potential vanishes outside the augmentation sphere.
+
+The pair-specific compensation charge is
+\begin{equation}
+\widehat\rho_{ij}^{a;\bk_i\bk_j}(\br)
+=
+\sum_{\alpha\beta}
+P_{i,a\alpha}^{\bk_i *}P_{j,a\beta}^{\bk_j}
+\widehat Q_{a,\alpha\beta}(\br-\btau_a),
+\label{eq:comp-pair}
+\end{equation}
+and its Bloch-periodic form at momentum \(\bk_j-\bk_i\) is obtained by the corresponding lattice sum.  The compensated smooth pair density is
+\begin{equation}
+\overline\rho_{ij}^{\bk_i\bk_j}(\br)
+=
+\widetilde\rho_{ij}^{\bk_i\bk_j}(\br)
++
+\sum_a \widehat\rho_{ij}^{a;\bk_i\bk_j}(\br).
+\label{eq:comp-smooth-pair}
+\end{equation}
+Using the zero-multipole property, the all-electron PAW Coulomb integral can be partitioned into a smooth compensated part and one-center residual corrections,
+\begin{widetext}
+\begin{align}
+V_{ijkl}^{\bk_i\bk_j\bk_k\bk_l,\PAW}
+&=
+\coul{\overline\rho_{ij}^{\bk_i\bk_j}}{\overline\rho_{kl}^{\bk_k\bk_l}}
++
+\sum_a
+\Delta V_{ij,kl}^{a;\bk_i\bk_j\bk_k\bk_l},
+\label{eq:paw-coulomb-partition}\\
+\Delta V_{ij,kl}^{a;\bk_i\bk_j\bk_k\bk_l}
+&=
+\sum_{\alpha\beta\gamma\delta}
+P_{i,a\alpha}^{\bk_i *}P_{j,a\beta}^{\bk_j}
+\Delta C_{a,\alpha\beta,\gamma\delta}
+P_{k,a\gamma}^{\bk_k *}P_{l,a\delta}^{\bk_l},
+\label{eq:paw-local-correction}\\
+\Delta C_{a,\alpha\beta,\gamma\delta}
+&=
+\coul{\phi_{a\alpha}^*\phi_{a\beta}}{\phi_{a\gamma}^*\phi_{a\delta}}_{a}
+-
+\coul{\widetilde\phi_{a\alpha}^*\widetilde\phi_{a\beta}+\widehat Q_{a,\alpha\beta}}
+{\widetilde\phi_{a\gamma}^*\widetilde\phi_{a\delta}+\widehat Q_{a,\gamma\delta}}_{a}.
+\label{eq:delta-c-def}
+\end{align}
+\end{widetext}
+Here \(\coul{f}{g}\) denotes the Coulomb bilinear form,
+\begin{equation}
+\coul{f}{g}
+=\int\dd\br\int\dd\br' f(\br)\frac{1}{|\br-\br'|}g(\br'),
+\label{eq:coulomb-form}
+\end{equation}
+and the subscript \(a\) means that the one-center radial/angular representation of atom \(a\) is used.  Equation~\eqref{eq:paw-coulomb-partition} is the PAW object to compress.  It is exact in the complete partial-wave and compensation-multipole limits and avoids long-range cross terms between augmentation spheres.
+
+\section{PAW-ISDF ansatz}
+\label{sec:pawisdf}
+
+\subsection{Composite auxiliary index}
+
+The PAW-ISDF construction uses a composite auxiliary index
+\begin{equation}
+\Lambda\in \mathcal G\cup\mathcal A,
+\label{eq:lambda-composite}
+\end{equation}
+where \(\mathcal G\) labels global smooth ISDF interpolation rows and \(\mathcal A\) labels atom-centered augmentation rows.  The goal is to interpolate the compensated smooth pair density in Eq.~\eqref{eq:comp-smooth-pair} as
+\begin{equation}
+\overline\rho_{ij}^{\bk_i\bk_j}(\br)
+\approx
+\sum_{\Lambda}
+X_{\Lambda i}^{\bk_i *}X_{\Lambda j}^{\bk_j}
+\zeta_\Lambda^{\bk_j-\bk_i}(\br).
+\label{eq:paw-isdf-density}
+\end{equation}
+For the ERI convention in Eq.~\eqref{eq:q-convention}, the first pair uses \(\zeta_\Lambda^{-\bq}\) and the second pair uses \(\zeta_\Sigma^{\bq}\).
+
+For global rows \(\Lambda=\mu\in\mathcal G\),
+\begin{equation}
+\begin{aligned}
+X_{\mu i}^{\bk}&=\widetilde\varphi_i^{\bk}(\br_\mu),\\
+\zeta_\mu^{\bq}(\br)&=\text{smooth ISDF auxiliary function}.
+\end{aligned}
+\label{eq:global-x}
+\end{equation}
+These rows interpolate the smooth pseudo pair density.
+
+For atom-centered rows \(\Lambda=(a\lambda)\in\mathcal A\), define a local channel factor \(U_{a,\lambda\alpha}\) and the projector-derived orbital feature
+\begin{equation}
+Y_{a\lambda,i}^{\bk}
+\equiv
+X_{a\lambda,i}^{\bk}
+=
+\sum_\alpha U_{a,\lambda\alpha}P_{i,a\alpha}^{\bk}.
+\label{eq:y-feature}
+\end{equation}
+The associated auxiliary function is a Bloch sum of an atom-local function,
+\begin{equation}
+\eta_{a\lambda}^{\bq}(\br)
+=
+\sum_{\bR}\ee^{\ii\bq\cdot(\bR+\btau_a)}
+\eta_{a\lambda}(\br-\bR-\btau_a),
+\label{eq:local-bloch-eta}
+\end{equation}
+and
+\begin{equation}
+\zeta_{a\lambda}^{\bq}(\br)=\eta_{a\lambda}^{\bq}(\br).
+\label{eq:local-zeta}
+\end{equation}
+The local ISDF condition for the compensation-charge products is
+\begin{equation}
+\widehat Q_{a,\alpha\beta}(\mathbf s)
+\approx
+\sum_\lambda
+U_{a,\lambda\alpha}^*U_{a,\lambda\beta}
+\eta_{a\lambda}(\mathbf s).
+\label{eq:local-isdf-qhat}
+\end{equation}
+Inserting Eq.~\eqref{eq:local-isdf-qhat} into Eq.~\eqref{eq:comp-pair} gives
+\begin{equation}
+\widehat\rho_{ij}^{a;\bk_i\bk_j}(\br)
+\approx
+\sum_\lambda
+Y_{a\lambda,i}^{\bk_i *}Y_{a\lambda,j}^{\bk_j}
+\eta_{a\lambda}^{\bk_j-\bk_i}(\br).
+\label{eq:comp-rho-local-isdf}
+\end{equation}
+Thus Eq.~\eqref{eq:paw-isdf-density} has the same separable orbital structure as ordinary ISDF, but with additional rows based on PAW projector overlaps rather than real-space pseudo-orbital values.
+
+\subsection{Projected Coulomb matrix for compensated densities}
+
+Define the compensated projected Coulomb matrix
+\begin{equation}
+V_{\Lambda\Sigma}^{\bq,C}
+=
+\int_{\cell}\dd\br\int_{\cell}\dd\br'
+\zeta_\Lambda^{-\bq}(\br)
+\frac{1}{|\br-\br'|}
+\zeta_\Sigma^{\bq}(\br').
+\label{eq:v-composite-coulomb}
+\end{equation}
+In reciprocal space, for a neutral periodic pair-density block, this can be evaluated as
+\begin{equation}
+V_{\Lambda\Sigma}^{\bq,C}
+=\frac{4\pi}{\Omega}
+\sum_{\bG}^{'}
+\frac{
+\zeta_{\Lambda}^{-\bq}(\bG)
+\zeta_{\Sigma}^{\bq}(-\bG)
+}{|\bq+\bG|^2},
+\label{eq:v-reciprocal}
+\end{equation}
+where the prime indicates the standard treatment of the \(\bq+\bG=0\) Coulomb singularity.  In practice, the smooth-smooth block is computed with FFT or Poisson solves; the smooth-local and local-local blocks can be computed by FFT after depositing the local functions on the smooth grid, by reciprocal-space analytic transforms of localized functions, or by multipole/radial-grid integration.
+
+\subsection{Local PAW residual in the same THC space}
+
+The one-center correction tensor \(\Delta C_a\) in Eq.~\eqref{eq:delta-c-def} is finite-dimensional.  We factor it in the same local channel basis used for the compensation functions,
+\begin{equation}
+\Delta C_{a,\alpha\beta,\gamma\delta}
+\approx
+\sum_{\lambda\xi}
+U_{a,\lambda\alpha}^*U_{a,\lambda\beta}
+K_{a,\lambda\xi}
+U_{a,\xi\gamma}^*U_{a,\xi\delta}.
+\label{eq:local-k-factorization}
+\end{equation}
+This equation can be viewed as a local THC factorization in PAW channel-product space.  It is exact if the local rank includes all independent channel products; otherwise \(K_a\) is obtained by a Coulomb-metric or Frobenius-metric least-squares fit.  Inserting Eq.~\eqref{eq:local-k-factorization} into Eq.~\eqref{eq:paw-local-correction} yields
+\begin{equation}
+\Delta V_{ij,kl}^{a;\bk_i\bk_j\bk_k\bk_l}
+\approx
+\sum_{\lambda\xi}
+Y_{a\lambda,i}^{\bk_i *}Y_{a\lambda,j}^{\bk_j}
+K_{a,\lambda\xi}
+Y_{a\xi,k}^{\bk_k *}Y_{a\xi,l}^{\bk_l}.
+\label{eq:delta-v-local-thc}
+\end{equation}
+
+\section{Final PAW-ISDF-THC ERI formula}
+\label{sec:final}
+
+Combining the compensated Coulomb term and the one-center residual correction gives the proposed PAW-ISDF-THC representation:
+\begin{widetext}
+\begin{equation}
+\boxed{
+V_{ijkl}^{\bk_i\bk_j\bk_k\bk_l,\PAW\text{-}\ISDF}
+=
+\sum_{\Lambda\Sigma}
+X_{\Lambda i}^{\bk_i *}X_{\Lambda j}^{\bk_j}
+\mathcal V_{\Lambda\Sigma}^{\bq}
+X_{\Sigma k}^{\bk_k *}X_{\Sigma l}^{\bk_l}
+}
+\label{eq:final-paw-isdf-thc}
+\end{equation}
+\end{widetext}
+where
+\begin{equation}
+\boxed{
+\mathcal V_{\Lambda\Sigma}^{\bq}
+=V_{\Lambda\Sigma}^{\bq,C}
++
+\sum_a
+\delta_{\Lambda,a\lambda}\delta_{\Sigma,a\xi}
+K_{a,\lambda\xi}
+}
+\label{eq:kernel-final}
+\end{equation}
+and
+\begin{equation}
+X_{\Lambda i}^{\bk}
+=
+\begin{cases}
+\widetilde\varphi_i^{\bk}(\br_\mu), & \Lambda=\mu\in\mathcal G,\\[4pt]
+\displaystyle\sum_\alpha U_{a,\lambda\alpha}P_{i,a\alpha}^{\bk}, & \Lambda=(a\lambda)\in\mathcal A.
+\end{cases}
+\label{eq:x-final}
+\end{equation}
+The first term in Eq.~\eqref{eq:kernel-final} is the Coulomb metric of the compensated ISDF auxiliary functions, while the second term restores the all-electron one-center PAW correction that was subtracted when the compensated smooth density was introduced.  Equation~\eqref{eq:final-paw-isdf-thc} is the desired THC form for all-electron PAW ERIs.
+
+Hermiticity follows from the properties
+\begin{equation}
+\left[V_{\Lambda\Sigma}^{\bq,C}\right]^*
+=V_{\Sigma\Lambda}^{-\bq,C},
+\quad
+K_{a,\lambda\xi}^*=K_{a,\xi\lambda},
+\label{eq:hermiticity}
+\end{equation}
+which imply
+\begin{equation}
+\left(V_{ijkl}^{\bk_i\bk_j\bk_k\bk_l}\right)^*
+=V_{jilk}^{\bk_j\bk_i\bk_l\bk_k}.
+\label{eq:eri-hermitian}
+\end{equation}
+
+\section{Construction algorithm}
+\label{sec:algorithm}
+
+The following workflow constructs Eq.~\eqref{eq:final-paw-isdf-thc}.
+
+\subsection{Smooth orbital and projector data}
+
+For every orbital \((i,\bk)\), compute the smooth grid values \(\widetilde\varphi_i^{\bk}(\br_g)\) and PAW projector overlaps \(P_{i,a\alpha}^{\bk}\).  This is the only orbital-dependent input needed for the final THC factor \(X_{\Lambda i}^{\bk}\).
+
+\subsection{Global ISDF on smooth pseudo pair densities}
+
+For each transferred momentum \(\bq\), construct or sample the smooth pseudo pair-density matrix
+\begin{equation}
+\widetilde\rho^{\bq}(\bk ij,\br_g)
+=
+\widetilde\varphi_i^{\bk-\bq *}(\br_g)
+\widetilde\varphi_j^{\bk}(\br_g).
+\label{eq:smooth-pair-matrix}
+\end{equation}
+Select interpolation points \(\{\br_\mu\}\) using pivoted Cholesky on \(\widetilde S^{\bq}=(\widetilde\rho^{\bq})^\dagger\widetilde\rho^{\bq}\), randomized QR with column pivoting, or a rank-revealing interpolative decomposition.  Then solve Eq.~\eqref{eq:ctheta-z}, using \(\widetilde\rho^{\bq}\), to obtain the smooth global auxiliary functions \(\widetilde\zeta_\mu^{\bq}\).  As in the momentum-dependent ISDF construction, a practical simplification is to choose the points at \(\bq=0\) and reuse them for other \(\bq\) blocks, while keeping \(\zeta_\mu^{\bq}\) momentum dependent.
+
+\subsection{Local ISDF in PAW channel space}
+
+For each chemical species, construct a local matrix of channel-product functions on radial/angular grids.  A useful combined training set is
+\begin{equation}
+\begin{aligned}
+\mathcal B_{a,\alpha\beta}(\mathbf s)
+=\{&
+\phi_{a\alpha}^*(\mathbf s)\phi_{a\beta}(\mathbf s),
+\widetilde\phi_{a\alpha}^*(\mathbf s)\widetilde\phi_{a\beta}(\mathbf s),
+\\
+&\widehat Q_{a,\alpha\beta}(\mathbf s),
+\Delta Q_{a,\alpha\beta}(\mathbf s)\}.
+\end{aligned}
+\label{eq:local-training-set}
+\end{equation}
+Apply a local ID or pivoted Cholesky procedure to this finite channel-product set to obtain \(U_{a,\lambda\alpha}\).  Then solve the local least-squares problem
+\begin{equation}
+\min_{\{\eta_{a\lambda}\}}
+\sum_{\alpha\beta}
+\left\|
+\widehat Q_{a,\alpha\beta}
+-
+\sum_\lambda U_{a,\lambda\alpha}^*U_{a,\lambda\beta}\eta_{a\lambda}
+\right\|_M^2,
+\label{eq:eta-fit}
+\end{equation}
+where \(M\) is either the local \(L^2\) metric or a local Coulomb metric.  The Coulomb metric is preferred when the goal is direct control of ERI errors.
+
+\subsection{One-center residual fit}
+
+Compute the exact one-center residual tensor \(\Delta C_a\) from Eq.~\eqref{eq:delta-c-def} using radial Coulomb integrals and Gaunt coefficients.  Fit \(K_a\) from
+\begin{equation}
+\min_{K_a}
+\left\|
+\Delta C_{a,\alpha\beta,\gamma\delta}
+-
+\sum_{\lambda\xi}
+U_{a,\lambda\alpha}^*U_{a,\lambda\beta}
+K_{a,\lambda\xi}
+U_{a,\xi\gamma}^*U_{a,\xi\delta}
+\right\|_M^2.
+\label{eq:k-fit}
+\end{equation}
+Since this fit is atom-local and species-local, it can be performed to high accuracy and cached with the PAW data set.  In the full-rank local product limit, Eq.~\eqref{eq:k-fit} is exact.
+
+\subsection{Kernel assembly}
+
+Assemble \(V^{\bq,C}_{\Lambda\Sigma}\) from Eq.~\eqref{eq:v-composite-coulomb}.  The blocks are
+\begin{subequations}
+\begin{align}
+V_{\mu\nu}^{\bq,C}
+&=\coul{\zeta_\mu^{-\bq}}{\zeta_\nu^{\bq}},
+\label{eq:block-gg}\\
+V_{\mu,a\lambda}^{\bq,C}
+&=\coul{\zeta_\mu^{-\bq}}{\eta_{a\lambda}^{\bq}},
+\label{eq:block-gl}\\
+V_{a\lambda,b\xi}^{\bq,C}
+&=\coul{\eta_{a\lambda}^{-\bq}}{\eta_{b\xi}^{\bq}}.
+\label{eq:block-ll}
+\end{align}
+\end{subequations}
+Then add \(K_{a,\lambda\xi}\) only to same-atom local-local blocks according to Eq.~\eqref{eq:kernel-final}.  The final output is the pair \((X,\mathcal V)\), which can be consumed by any THC-based post-DFT method.
+
+\section{Relation to direct all-electron ISDF}
+\label{sec:aevariant}
+
+A formally simpler but less efficient alternative is to reconstruct the all-electron orbital values at the ISDF interpolation points,
+\begin{subequations}
+\begin{align}
+X_{\mu i}^{\bk,\mathrm{AE}}
+&=
+\varphi_i^{\bk}(\br_\mu)
+=
+\widetilde\varphi_i^{\bk}(\br_\mu)
++
+\sum_{a\alpha}
+\Delta\phi_{a\alpha}(\br_\mu-\btau_a)
+P_{i,a\alpha}^{\bk},
+\label{eq:direct-ae-x}\\
+\Delta\phi_{a\alpha}(\mathbf s)
+&=\phi_{a\alpha}(\mathbf s)-\widetilde\phi_{a\alpha}(\mathbf s).
+\end{align}
+\end{subequations}
+One could then fit the all-electron pair density directly,
+\begin{equation}
+\rho_{ij}^{\bk_i\bk_j}(\br)
+\approx
+\sum_\mu X_{\mu i}^{\bk_i,\mathrm{AE} *}X_{\mu j}^{\bk_j,\mathrm{AE}}
+\zeta_\mu^{\bk_j-\bk_i,\mathrm{AE}}(\br),
+\label{eq:direct-ae-isdf}
+\end{equation}
+and form a THC kernel from \(\zeta^{\mathrm{AE}}\).  This direct all-electron collocation approach is conceptually straightforward, but it requires the interpolation points and auxiliary functions to resolve core-region oscillations and cusps.  The PAW-ISDF formulation avoids that cost by keeping the global grid smooth and representing core-region physics through compact atom-local features.
+
+\section{Error analysis}
+\label{sec:error}
+
+Let
+\begin{equation}
+\epsilon_{ij}^{\bk_i\bk_j}(\br)
+=\overline\rho_{ij}^{\bk_i\bk_j}(\br)
+-
+\sum_\Lambda X_{\Lambda i}^{\bk_i *}X_{\Lambda j}^{\bk_j}
+\zeta_\Lambda^{\bk_j-\bk_i}(\br)
+\label{eq:density-error}
+\end{equation}
+be the compensated pair-density interpolation error, and let \(\delta K_a\) be the local residual-fit error in Eq.~\eqref{eq:local-k-factorization}.  Define the Coulomb norm
+\begin{equation}
+\|f\|_C^2=\coul{f}{f}.
+\label{eq:coulomb-norm}
+\end{equation}
+Then the smooth compensated contribution to the ERI error satisfies the bound
+\begin{widetext}
+\begin{align}
+|\delta V_{ij,kl}^{C}|
+&\le
+\|\epsilon_{ij}^{\bk_i\bk_j}\|_C
+\|\overline\rho_{kl}^{\bk_k\bk_l}\|_C
++
+\|\overline\rho_{ij}^{\bk_i\bk_j}\|_C
+\|\epsilon_{kl}^{\bk_k\bk_l}\|_C
++
+\|\epsilon_{ij}^{\bk_i\bk_j}\|_C
+\|\epsilon_{kl}^{\bk_k\bk_l}\|_C.
+\label{eq:error-bound}
+\end{align}
+\end{widetext}
+The local correction contributes
+\begin{equation}
+\delta V_{ij,kl}^{\loc}
+=
+\sum_a
+\sum_{\alpha\beta\gamma\delta}
+P_{i,a\alpha}^{\bk_i *}P_{j,a\beta}^{\bk_j}
+\delta C_{a,\alpha\beta,\gamma\delta}
+P_{k,a\gamma}^{\bk_k *}P_{l,a\delta}^{\bk_l}.
+\label{eq:local-error}
+\end{equation}
+This separates the total error into three controllable pieces: global ISDF truncation of the pseudo pair densities, local ISDF truncation of the compensation charges, and local fitting error of the all-electron residual tensor.  The complete method is exact in the simultaneous limit of complete PAW partial waves, complete compensation multipoles, full-rank global ISDF, and full-rank local channel ISDF.
+
+Equation~\eqref{eq:error-bound} also suggests a practical fitting criterion.  Least squares in the ordinary grid metric controls pointwise or \(L^2\) pair-density errors, but Coulomb-metric fitting controls the ERI error more directly.  A robust implementation can therefore use an inexpensive \(L^2\) or pivoted-Cholesky selection step followed by Coulomb-metric refinement of \(\zeta_\Lambda^{\bq}\), \(\eta_{a\lambda}\), and \(K_a\).
+
+\section{Computational scaling and storage}
+\label{sec:scaling}
+
+Let \(N_{\orb}\) be the number of orbitals per \(\bk\) point, \(N_k\) the number of \(\bk\) points, \(N_\mu\) the number of global interpolation points, and
+\begin{equation}
+N_A=\sum_a n_a
+\label{eq:na-def}
+\end{equation}
+the total number of atom-local augmentation rows per unit cell.  The total PAW-ISDF THC rank is
+\begin{equation}
+N_\Lambda=N_\mu+N_A.
+\label{eq:nlambda}
+\end{equation}
+The factor storage is
+\begin{equation}
+\mathrm{storage}(X)=O(N_k N_{\orb}N_\Lambda),
+\quad
+\mathrm{storage}(\mathcal V)=O(N_q N_\Lambda^2),
+\label{eq:storage}
+\end{equation}
+with possible reductions from time-reversal, point-group, and momentum symmetries.  When \(N_\mu\sim \alpha N_{\orb}\) and \(N_A\sim O(N_{\orb})\), downstream THC contractions retain the cubic-in-system-size and linear-in-\(N_k\) structure characteristic of momentum-resolved ISDF formulations, but with a modest PAW augmentation overhead.
+
+The dominant construction costs are: (i) building or sampling smooth pair densities, (ii) selecting interpolation points and solving Eq.~\eqref{eq:ctheta-z}, (iii) computing PAW projector features, (iv) assembling the Coulomb matrix in the composite auxiliary basis, and (v) fitting the species-local tensors \(\eta_a\) and \(K_a\).  Steps (iii) and (v) are low-dimensional compared with global pair-density operations.  Step (iv) can be accelerated by FFTs for smooth components and by analytic or multipole representations for local components.
+
+\section{Discussion}
+\label{sec:discussion}
+
+The proposed PAW-ISDF formulation has several practical advantages.  First, the global ISDF problem remains smooth.  The interpolation points are chosen to represent \(\widetilde\varphi_i^*\widetilde\varphi_j\), not the rapidly oscillatory all-electron products.  Second, all-electron core-region information is retained through PAW partial waves and the one-center residual matrix \(K_a\).  Third, the final output has exactly the THC structure used in modern low-scaling many-body algorithms, so existing THC contractions can be reused with only a larger auxiliary dimension.
+
+The central numerical question is the choice of local rank.  A minimal implementation can take the local factorization in Eq.~\eqref{eq:local-k-factorization} to be full rank in the PAW channel-product space.  Since the number of PAW channels per atom is small, this may already be affordable and avoids local fitting error.  A more aggressive implementation can compress the channel products by a local ISDF or Cholesky procedure.  This becomes useful for semicore-rich PAW data sets, high angular momentum channels, spin-orbit projectors, or multi-projector setups.
+
+The compensation-charge construction must be consistent with the PAW data set.  If \(\widehat Q_{a,\alpha\beta}\) does not reproduce the multipoles of \(\Delta Q_{a,\alpha\beta}\), Eq.~\eqref{eq:paw-coulomb-partition} is not a clean separation into smooth and one-center terms.  In that case, spurious inter-sphere terms would be folded into the global ISDF error and convergence with respect to \(N_\mu\) could become poor.  Therefore the PAW compensation multipole order should be converged before the ISDF rank is tuned.
+
+The Coulomb singularity requires the same care as in ordinary periodic ERIs.  For \(\bq\ne 0\), Eq.~\eqref{eq:v-reciprocal} is well-defined.  For \(\bq=0\), the \(\bG=0\) term is treated by charge neutrality, by a neutralizing background, by Ewald correction, or by the convention used by the target many-body method.  The PAW compensation charges should be included in the neutralized pair density before this step.
+
+Frozen-core PAW introduces additional issues if one wants ERIs involving core states.  The valence-valence ERI in Eq.~\eqref{eq:final-paw-isdf-thc} is the most common target for post-DFT valence Hamiltonians.  Core-valence and core-core exchange or correlation terms can be added as additional atom-local tensors, analogous to \(K_a\), because frozen core orbitals are atom-centered and species-local.  If explicit core orbitals are included in the single-particle basis, they can be appended as additional local rows in \(X\) rather than represented on the global smooth grid.
+
+Spinor and noncollinear calculations can also be incorporated.  The orbital index \(i\) then carries spinor components, the projector overlaps become spinor projector overlaps, and the pair density includes spin contractions appropriate to the target interaction.  For the spin-independent Coulomb operator, the spatial PAW-ISDF kernel \(\mathcal V^{\bq}\) is unchanged; only the construction of the pair factors \(X_{\Lambda i}^{\bk *}X_{\Lambda j}^{\bk'}\) is modified.
+
+\section{Conclusions}
+\label{sec:conclusion}
+
+We have presented a PAW-compatible extension of momentum-resolved ISDF for all-electron ERIs in THC form.  The formulation starts from the exact PAW electrostatic partition of a pair density into a compensated smooth density and atom-local residual corrections.  The compensated smooth density is represented by a composite ISDF auxiliary basis containing ordinary smooth interpolation rows and atom-centered projector-derived augmentation rows.  The one-center residual correction is factored in the same local channel basis and added to the same-atom block of the projected Coulomb matrix.  The final expression,
+\begin{equation}
+V_{ijkl}^{\bk_i\bk_j\bk_k\bk_l}
+\approx
+\sum_{\Lambda\Sigma}
+X_{\Lambda i}^{\bk_i *}X_{\Lambda j}^{\bk_j}
+\mathcal V_{\Lambda\Sigma}^{\bq}
+X_{\Sigma k}^{\bk_k *}X_{\Sigma l}^{\bk_l},
+\label{eq:conclusion-formula}
+\end{equation}
+retains the standard THC separability of orbital and momentum indices while preserving the all-electron physics encoded by PAW partial waves.  This makes the approach a natural route to all-electron-quality hybrid, RPA, \(GW\), embedding, and wave-function calculations starting from PAW mean-field orbitals.
+
+\appendix
+
+\section{Compact derivation of the PAW Coulomb partition}
+\label{app:pawpartition}
+
+Let
+\begin{equation}
+\Delta\rho_{ij}^{a}=\rho_{ij}^{1,a}-\widetilde\rho_{ij}^{1,a},
+\quad
+\delta\rho_{ij}^{a}=\Delta\rho_{ij}^{a}-\widehat\rho_{ij}^{a}.
+\label{eq:app-deltarho}
+\end{equation}
+Then
+\begin{equation}
+\rho_{ij}
+=\overline\rho_{ij}+
+\sum_a\delta\rho_{ij}^{a}.
+\label{eq:app-rho-split}
+\end{equation}
+Because each \(\delta\rho_{ij}^{a}\) has zero multipole moments through the compensation order, its electrostatic potential vanishes outside the augmentation sphere.  For non-overlapping augmentation spheres,
+\begin{equation}
+\coul{\delta\rho_{ij}^{a}}{\overline\rho_{kl}}+
+\coul{\overline\rho_{ij}}{\delta\rho_{kl}^{a}}
++
+\sum_{b\ne a}\coul{\delta\rho_{ij}^{a}}{\delta\rho_{kl}^{b}}=0
+\label{eq:app-cross-vanish}
+\end{equation}
+up to the chosen multipole completeness.  Therefore
+\begin{equation}
+\coul{\rho_{ij}}{\rho_{kl}}
+=\coul{\overline\rho_{ij}}{\overline\rho_{kl}}
++
+\sum_a\coul{\delta\rho_{ij}^{a}}{\delta\rho_{kl}^{a}}.
+\label{eq:app-partition-1}
+\end{equation}
+Using \(\delta\rho^a=\rho^{1,a}-(\widetilde\rho^{1,a}+\widehat\rho^a)\), Eq.~\eqref{eq:app-partition-1} is equivalent to Eq.~\eqref{eq:paw-coulomb-partition}.  The finite-dimensional tensor \(\Delta C_a\) is obtained by inserting the partial-wave expansions of the one-center pair densities.
+
+\section{Least-squares solution for local channel THC}
+\label{app:localfit}
+
+Let \(I=(\alpha\beta)\) and \(\lambda\) label channel products and local interpolation rows.  Define
+\begin{equation}
+B_{\lambda I}^{a}=U_{a,\lambda\alpha}^*U_{a,\lambda\beta}.
+\label{eq:app-b-matrix}
+\end{equation}
+The compensation-charge fit in Eq.~\eqref{eq:eta-fit} is the matrix problem
+\begin{equation}
+\widehat Q_I^a(\mathbf s)
+\approx
+\sum_\lambda B_{\lambda I}^{a}\eta_{a\lambda}(\mathbf s).
+\label{eq:app-qfit}
+\end{equation}
+For each grid point or radial basis coefficient \(m\), this becomes
+\begin{equation}
+\mathbf q_m^a\approx (B^a)^T\boldsymbol\eta_m^a.
+\label{eq:app-qfit-matrix}
+\end{equation}
+The local residual fit is similarly
+\begin{equation}
+\Delta C_a\approx (B^a)^\dagger K_a B^a,
+\label{eq:app-kfit-matrix}
+\end{equation}
+where \(\Delta C_a\) is viewed as a matrix in the compound channel-product index \(I\).  If \(B^a\) has full row rank, the least-squares solution is
+\begin{equation}
+K_a=
+\left[(B^a)^\dagger\right]^+\Delta C_a (B^a)^+,
+\label{eq:app-kfit-solution}
+\end{equation}
+with \(+\) denoting the Moore-Penrose pseudoinverse, optionally evaluated in a metric-weighted inner product.
+
+\begin{acknowledgments}
+This manuscript is a preliminary theoretical formulation.  Numerical benchmarks, convergence studies, and code-level validation against direct PAW Coulomb matrix elements remain necessary before production use.
+\end{acknowledgments}
+
+\begin{thebibliography}{99}
+
+\bibitem{BlochlPAW}
+P. E. Blochl, Projector augmented-wave method, Phys. Rev. B \textbf{50}, 17953 (1994).
+
+\bibitem{KresseJoubert}
+G. Kresse and D. Joubert, From ultrasoft pseudopotentials to the projector augmented-wave method, Phys. Rev. B \textbf{59}, 1758 (1999).
+
+\bibitem{RostgaardPAW}
+C. Rostgaard, The Projector Augmented-wave Method, arXiv:0910.1921 (2009).
+
+\bibitem{LuYingISDF}
+J. Lu and L. Ying, Compression of the electron repulsion integral tensor in tensor hypercontraction format with cubic scaling cost, J. Comput. Phys. \textbf{302}, 329 (2015).
+
+\bibitem{LuThickeRPA}
+J. Lu and K. Thicke, Cubic scaling algorithms for RPA correlation using interpolative separable density fitting, J. Comput. Phys. \textbf{351}, 187 (2017).
+
+\bibitem{HohensteinTHC1}
+E. G. Hohenstein, R. M. Parrish, and T. J. Martinez, Tensor hypercontraction density fitting. I. Quartic scaling second- and third-order Moller-Plesset perturbation theory, J. Chem. Phys. \textbf{137}, 044103 (2012).
+
+\bibitem{LeeLinHeadGordon}
+J. Lee, L. Lin, and M. Head-Gordon, Systematically improvable tensor hypercontraction: Interpolative separable density-fitting for molecules applied to exact exchange, second- and third-order Moller-Plesset perturbation theory, J. Chem. Theory Comput. \textbf{16}, 243 (2020).
+
+\bibitem{MaloneZhangMorales}
+F. D. Malone, S. Zhang, and M. A. Morales, Overcoming the memory bottleneck in auxiliary field quantum Monte Carlo simulations with interpolative separable density fitting, J. Chem. Theory Comput. \textbf{15}, 256 (2019).
+
+\bibitem{YehMoralesRPA}
+C.-N. Yeh and M. A. Morales, Low-scaling algorithm for the random phase approximation using tensor hypercontraction with \(\mathbf k\)-point sampling, J. Chem. Theory Comput. \textbf{19}, 6197 (2023).
+
+\bibitem{YehMoralesGW}
+C.-N. Yeh and M. A. Morales, Low-scaling algorithms for \(GW\) and constrained random phase approximation using symmetry-adapted interpolative separable density fitting, J. Chem. Theory Comput. \textbf{20}, 3184 (2024).
+
+\bibitem{ZhuYehMoralesAdaptive}
+H. Zhu, C.-N. Yeh, M. A. Morales, L. Greengard, S. Jiang, and J. Kaye, Interpolative separable density fitting on adaptive real space grids, arXiv:2510.20826 (2025).
+
+\bibitem{DucheminBlaseGW}
+I. Duchemin and X. Blase, Cubic-scaling all-electron \(GW\) calculations with a separable density-fitting space-time approach, J. Chem. Theory Comput. \textbf{17}, 2383 (2021).
+
+\bibitem{ShishkinKresseGW}
+M. Shishkin and G. Kresse, Implementation and performance of the frequency-dependent \(GW\) method within the PAW framework, Phys. Rev. B \textbf{74}, 035101 (2006).
+
+\end{thebibliography}
+
+\end{document}

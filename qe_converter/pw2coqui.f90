@@ -105,7 +105,10 @@ PROGRAM pw2coqui
 
   ! write /System information
   if(add_system) call write_system(h5f)
-  if(add_pp) call write_pp(h5f)
+  if(add_pp) then
+    call write_pp(h5f)
+    call write_species(h5f)
+  endif
 
   if(ionode) CALL qeh5_close(h5f)
 
@@ -146,6 +149,11 @@ subroutine write_system(h5_f)
   USE noncollin_module,     ONLY : noncolin, npol, lspinorb
   USE fft_base, ONLY : dfftp, dffts
   USE start_k,            ONLY : nks_start,nk1, nk2, nk3, k1, k2, k3
+  USE ener,               ONLY : ehart, etxc, vtxc, epaw
+  USE paw_variables,      ONLY : okpaw, ddd_paw
+  USE paw_onecenter,      ONLY : PAW_potential
+  USE scf,                ONLY : rho, rho_core, rhog_core, v
+  USE extfield,           ONLY : etotefield
 
   IMPLICIT NONE
 
@@ -156,6 +164,7 @@ subroutine write_system(h5_f)
   integer :: ns, nk, i, j, k, vi3(3), ierr
   integer, allocatable :: ityp_s(:)
   real(dp) :: enuc
+  real(dp) :: eth_dum, charge_dum
   real(dp) :: v3(3,3)
   real(dp), allocatable :: vn(:,:), wgt(:) 
   character(len=2) :: isym 
@@ -195,6 +204,28 @@ subroutine write_system(h5_f)
     enuc = ewald( alat, nat, nsp, ityp, zv, at, bg, tau, &
                 omega, g, gg, ngm, gcutm, gstart, gamma_only, strf ) / e2
     call qeh5_add_attribute(h5_s%id,"nuclear_energy",enuc)
+
+  endif ! ionode (close so v_of_rho/PAW_potential run on all ranks)
+
+  ! Recompute ehart, etxc, vtxc, epaw from the converged SCF density.
+  ! read_file_new uses local variables for these, so the ener module
+  ! globals are stale until we explicitly call v_of_rho here.
+  CALL v_of_rho( rho, rho_core, rhog_core, &
+                 ehart, etxc, vtxc, eth_dum, etotefield, charge_dum, v )
+  if (okpaw) then
+    CALL PAW_potential(rho%bec, ddd_paw, epaw)
+  else
+    epaw = 0.0d0
+  end if
+
+
+  if(ionode) then
+    ! Reference energies from QE's converged SCF (Ry → Ha conversion via /e2).
+    ! These let CoQui regression-test its own E_H, E_xc, ∫V_xc·ρ pipelines.
+    call qeh5_add_attribute(h5_s%id,"qe_ehart", ehart/e2)
+    call qeh5_add_attribute(h5_s%id,"qe_etxc",  etxc/e2)
+    call qeh5_add_attribute(h5_s%id,"qe_vtxc",  vtxc/e2)
+    call qeh5_add_attribute(h5_s%id,"qe_epaw", epaw/e2)
 
     v3(:,:) = at(:,:)*alat
     call h5_write_mat_r(h5_s,v3,"lattice_vectors")
@@ -340,10 +371,10 @@ subroutine write_pp(h5_f)
   USE lsda_mod, ONLY: lsda, nspin
   USE noncollin_module, ONLY : noncolin, npol, lspinorb
   USE fft_base, ONLY : dfftp, dffts
-  USE uspp, ONLY : okvan, vkb, nkb, ofsbeta, ijtoh, dvan, dvan_so, deeq 
+  USE uspp, ONLY : okvan, vkb, nkb, ofsbeta, ijtoh, dvan, dvan_so, deeq, deeq_nc, qq_so, qq_nt
   USE uspp_param, ONLY : nhm, nh, upf, lmaxq
   USE scf, ONLY : vltot, v, rho, rho_core, rhog_core
-  USE ener, ONLY : etxc, vtxc
+  USE ener, ONLY : etxc, vtxc, ehart, epaw
   USE wavefunctions, ONLY : psic
   USE mp_wave, ONLY : mergewf
   USE uspp_init,            ONLY : init_us_2
@@ -415,11 +446,24 @@ subroutine write_pp(h5_f)
 
     if(lspinorb) then
       ! (nhm,nhm,nspin,nsp)
-      call h5_write_tensor4_c(h5_n,dvan_so,"dion_so")       
+      call h5_write_tensor4_c(h5_n,dvan_so,"dion_so")
+      ! qq_so: (nhm,nhm,4,nsp), spinor-coupled augmentation overlap
+      if(allocated(qq_so)) call h5_write_tensor4_c(h5_n,qq_so,"qq_so")
     else
       ! (nhm,nhm,nsp)
-      call h5_write_tensor_r(h5_n,dvan,"dion")       
+      call h5_write_tensor_r(h5_n,dvan,"dion")
     endif
+    ! qq_nt(nhm,nhm,nsp): species-resolved augmentation overlap S = 1 + Σ |β⟩q⟨β|
+    if(allocated(qq_nt)) call h5_write_tensor_r(h5_n,qq_nt,"qq_nt")
+    ! deeq(nhm,nhm,nat,nspin): SCF correction to D — for USPP, ∫ V_eff(r) Q^IJ(r)dr;
+    ! for PAW, additionally the one-center Hxc multipole differences
+    ! (filled by QE's add_paw_to_deeq during read_file/hinit0).
+    ! Effective non-local D for the non-local Hamiltonian:
+    !   D_eff(s, a, I, J) = dvan(type(a), I, J) + deeq(I, J, a, s)
+    if(allocated(deeq) .and. (okvan .or. okpaw)) &
+      call h5_write_tensor4_r(h5_n,deeq,"deeq")
+    if(lspinorb .and. allocated(deeq_nc)) &
+      call h5_write_tensor4_c(h5_n,deeq_nc,"deeq_nc")
     !
   endif ! ionode
 
@@ -487,9 +531,11 @@ subroutine write_pp(h5_f)
     !
   endif
 
-  if( okpaw .and. ionode ) then
-    call write_factorized_paw_one_center()
-  endif
+  ! (PAW one-center deltaC and Kcv/Kcc moved to write_species, written under
+  !  /Hamiltonian/Species/{nt}/Onecenter/. The previous "factorized" routine
+  !  was a stub: it computed L = U sqrt(λ) and silently discarded it. Phase 0
+  !  drops the factorization (fits live in CoQui per implementation plan
+  !  decision 1) and exports the raw ke%k tensor.)
 
   ALLOCATE ( mill_g ( 3, ngm_g ) )
   mill_g = 0
@@ -771,80 +817,186 @@ subroutine write_pp(h5_f)
 end subroutine write_pp
 
 !
-SUBROUTINE write_factorized_paw_one_center( )
-!=----
-! factorize paw's ke%k for each species  
-!=----
+SUBROUTINE write_species(h5_f)
+!=----------------------------------------------------------------------------=!
+! Per-species pseudopotential data exported under /Hamiltonian/Species/{nt}/.
+! For PAW species, also writes /Hamiltonian/Species/{nt}/Onecenter/deltaC
+! (raw ke%k from PAW_init_fock_kernel) and /Hamiltonian/Species/{nt}/Core/
+! (GIPAW core orbitals when has_gipaw is true).
+!
+! Schema reference: notes/paw_implementation_plan.md
+!=----------------------------------------------------------------------------=!
   USE kinds, ONLY : DP
-  USE constants, ONLY: e2
-  USE ions_base,          ONLY : nat, ityp, ntyp => nsp
-  USE uspp_param,         ONLY : nh, upf
-  USE paw_variables,        ONLY : okpaw
-  USE mp_images, ONLY: intra_image_comm, me_image, root_image
-  USE mp, ONLY: mp_bcast
-  USE paw_exx,            ONLY : ke, PAW_init_fock_kernel, &
-                                     PAW_clean_fock_kernel
+  USE qeh5_base_module, ONLY : qeh5_open_group, qeh5_close, qeh5_add_attribute
+  USE ions_base, ONLY : ntyp => nsp
+  USE uspp_param, ONLY : nh, upf
+  USE uspp, ONLY : indv, nhtol, nhtolm, nhtoj
+  USE atom, ONLY : g => rgrid
+  USE paw_variables, ONLY : okpaw
+  USE paw_exx, ONLY : ke, PAW_init_fock_kernel, PAW_clean_fock_kernel
+  USE noncollin_module, ONLY : lspinorb
   !
   IMPLICIT NONE
   !
+  type(qeh5_file), intent(inout) :: h5_f
+  type(qeh5_file) :: h5_h, h5_sp, h5_nt, h5_paw, h5_core, h5_oc
+  character(len=8) :: nt_str
+  integer :: nt, mesh, ncore
+  logical :: any_paw
   !
-  INTEGER :: ns, ij, ou, na,n, lda
-  INTEGER :: i,ih, jh, oh, uh
-  REAL(DP), ALLOCATABLE :: k(:,:), L(:,:)
-  REAL(DP), ALLOCATABLE :: ev(:)
-
+  if (.not.ionode) return
   !
-  ! on the first call, symmetrize ke tensor
-  if(.not.okpaw) return
-  if(.not.ionode) return
-  CALL PAW_init_fock_kernel()
-  do ns = 1,ntyp
-    if (.not. upf(ns)%tpawp ) continue 
-    ij=0
-    allocate(k(nh(ns)*nh(ns),nh(ns)*nh(ns)), ev(nh(ns)*nh(ns)))
-    do jh = 1, nh(ns)
-    do ih = 1, nh(ns)
-    ij=ij+1
-    ou=0
-    do uh = 1, nh(ns)
-    do oh = 1, nh(ns)
-      !
-      ou=ou+1
-      ! factor of 1/e2 is to convert to Hartree, factor of 0.5
-      ! comes from the QE implementation. Not sure I understand why!
-      ! Keeping it for consistency with QE
-      k(ij,ou) = (0.5d0/e2) * 0.125_dp * ( &
-          ke(ns)%k(ih,jh,oh,uh) + ke(ns)%k(oh,uh,ih,jh) + &
-          ke(ns)%k(jh,ih,oh,uh) + ke(ns)%k(uh,oh,ih,jh) + &
-          ke(ns)%k(ih,jh,uh,oh) + ke(ns)%k(oh,uh,jh,ih) + &
-          ke(ns)%k(jh,ih,uh,oh) + ke(ns)%k(uh,oh,jh,ih))
-      !
-    enddo
-    enddo
-    enddo
-    enddo
-
-    lda = nh(ns)*nh(ns)
-    call eigsysD('V', 'U', .true.,lda,lda,k,ev)
-    n=0
-    do i=1, nh(ns)* nh(ns)
-      if( abs(ev(i)) > 1.e-14 ) n = n + 1
-    enddo
-    allocate(L(nh(ns)*nh(ns),n))
-    n=0
-    do i=1,nh(ns)* nh(ns)
-      if( abs(ev(i)) > 1.e-14 ) then
-        n = n + 1
-        L(:,n) = CMPLX(k(:,i),0._dp,kind=DP) * &
-                             sqrt(CMPLX(ev(i),0._dp,kind=DP))
-      endif
-    enddo
-    write(*,*) 'ns,nh,nke:',ns,nh(ns),n
-    deallocate(k,ev,L)
+  ! Compute one-center Coulomb residual ΔC up front for all PAW species.
+  ! PAW_init_fock_kernel allocates ke(:)%k internally and is idempotent.
+  any_paw = .false.
+  do nt = 1, ntyp
+    if (upf(nt)%tpawp) any_paw = .true.
   enddo
-  call PAW_clean_fock_kernel()
-
-END SUBROUTINE write_factorized_paw_one_center
+  if (any_paw) CALL PAW_init_fock_kernel()
+  !
+  ! qeh5_open_group is idempotent (h5gopen → h5gcreate fallback) so opening
+  ! /Hamiltonian here is safe; write_pp has already created and closed it.
+  call qeh5_open_group(h5_f, "Hamiltonian", h5_h)
+  call qeh5_open_group(h5_h, "Species", h5_sp)
+  !
+  do nt = 1, ntyp
+    write(nt_str, '(I8)') nt-1   ! 0-based species index
+    call qeh5_open_group(h5_sp, "nt"//adjustl(trim(nt_str)), h5_nt)
+    !
+    ! species kind (string attribute): paw | uspp | ncpp
+    if (upf(nt)%tpawp) then
+      call qeh5_add_attribute(h5_nt%id, "species_kind", "paw")
+    elseif (upf(nt)%tvanp) then
+      call qeh5_add_attribute(h5_nt%id, "species_kind", "uspp")
+    else
+      call qeh5_add_attribute(h5_nt%id, "species_kind", "ncpp")
+    endif
+    !
+    mesh = g(nt)%mesh
+    call qeh5_add_attribute(h5_nt%id, "mesh", mesh)
+    call qeh5_add_attribute(h5_nt%id, "kkbeta", upf(nt)%kkbeta)
+    call qeh5_add_attribute(h5_nt%id, "lmax", upf(nt)%lmax)
+    call qeh5_add_attribute(h5_nt%id, "lmax_rho", upf(nt)%lmax_rho)
+    call qeh5_add_attribute(h5_nt%id, "nbeta", upf(nt)%nbeta)
+    call qeh5_add_attribute(h5_nt%id, "nh", nh(nt))
+    call qeh5_add_attribute(h5_nt%id, "zp", upf(nt)%zp)
+    !
+    ! Radial grid
+    call h5_write_vector_r(h5_nt, g(nt)%r(1:mesh), "r")
+    call h5_write_vector_r(h5_nt, g(nt)%rab(1:mesh), "rab")
+    !
+    ! Projector / partial-wave bookkeeping
+    call h5_write_vector_int(h5_nt, upf(nt)%lll(1:upf(nt)%nbeta), "lll")
+    call h5_write_vector_int(h5_nt, upf(nt)%kbeta(1:upf(nt)%nbeta), "kbeta")
+    call h5_write_mat_r(h5_nt, upf(nt)%beta(1:mesh,1:upf(nt)%nbeta), "beta")
+    call h5_write_mat_r(h5_nt, upf(nt)%dion(1:upf(nt)%nbeta,1:upf(nt)%nbeta), "dion")
+    !
+    ! ih → (l, lm, j) maps - per-species slices of global uspp tables
+    if (allocated(nhtolm)) &
+      call h5_write_vector_int(h5_nt, nhtolm(1:nh(nt), nt), "nhtolm")
+    if (allocated(nhtol)) &
+      call h5_write_vector_int(h5_nt, nhtol(1:nh(nt), nt), "nhtol")
+    if (allocated(indv)) &
+      call h5_write_vector_int(h5_nt, indv(1:nh(nt), nt), "indv")
+    if (lspinorb .and. allocated(nhtoj)) &
+      call h5_write_vector_r(h5_nt, nhtoj(1:nh(nt), nt), "nhtoj")
+    !
+    ! Augmentation (USPP and PAW)
+    if (upf(nt)%tvanp .or. upf(nt)%tpawp) then
+      call h5_write_mat_r(h5_nt, &
+        upf(nt)%qqq(1:upf(nt)%nbeta,1:upf(nt)%nbeta), "qqq")
+      call qeh5_add_attribute(h5_nt%id, "q_with_l", &
+        merge(1, 0, upf(nt)%q_with_l))
+      call qeh5_add_attribute(h5_nt%id, "nqf", upf(nt)%nqf)
+      call qeh5_add_attribute(h5_nt%id, "nqlc", upf(nt)%nqlc)
+      if (allocated(upf(nt)%qfuncl)) &
+        call h5_write_tensor_r(h5_nt, upf(nt)%qfuncl, "qfuncl")
+      if (allocated(upf(nt)%qfunc)) &
+        call h5_write_mat_r(h5_nt, upf(nt)%qfunc, "qfunc")
+    endif
+    !
+    ! Spin-orbit per-species j_b
+    if (lspinorb .and. allocated(upf(nt)%jjj)) &
+      call h5_write_vector_r(h5_nt, upf(nt)%jjj(1:upf(nt)%nbeta), "jjj")
+    !
+    ! AE/PS partial waves (PAW always; USPP only when generated --with-ae-wfc)
+    if (upf(nt)%tpawp .or. upf(nt)%has_wfc) then
+      if (allocated(upf(nt)%aewfc)) &
+        call h5_write_mat_r(h5_nt, &
+          upf(nt)%aewfc(1:mesh,1:upf(nt)%nbeta), "aewfc")
+      if (allocated(upf(nt)%pswfc)) &
+        call h5_write_mat_r(h5_nt, &
+          upf(nt)%pswfc(1:mesh,1:upf(nt)%nbeta), "pswfc")
+    endif
+    !
+    ! PAW-specific subgroup
+    if (upf(nt)%tpawp) then
+      call qeh5_open_group(h5_nt, "paw", h5_paw)
+      call qeh5_add_attribute(h5_paw%id, "raug", upf(nt)%paw%raug)
+      call qeh5_add_attribute(h5_paw%id, "iraug", upf(nt)%paw%iraug)
+      call qeh5_add_attribute(h5_paw%id, "lmax_aug", upf(nt)%paw%lmax_aug)
+      call qeh5_add_attribute(h5_paw%id, "augshape", &
+        TRIM(upf(nt)%paw%augshape))
+      !
+      if (allocated(upf(nt)%paw%pfunc)) &
+        call h5_write_tensor_r(h5_paw, upf(nt)%paw%pfunc, "pfunc")
+      if (allocated(upf(nt)%paw%ptfunc)) &
+        call h5_write_tensor_r(h5_paw, upf(nt)%paw%ptfunc, "ptfunc")
+      if (allocated(upf(nt)%paw%augmom)) &
+        call h5_write_tensor_r(h5_paw, upf(nt)%paw%augmom, "augmom")
+      if (allocated(upf(nt)%paw%ae_vloc)) &
+        call h5_write_vector_r(h5_paw, upf(nt)%paw%ae_vloc, "ae_vloc")
+      if (allocated(upf(nt)%paw%ae_rho_atc)) &
+        call h5_write_vector_r(h5_paw, upf(nt)%paw%ae_rho_atc, "ae_rho_atc")
+      if (allocated(upf(nt)%paw%oc)) &
+        call h5_write_vector_r(h5_paw, upf(nt)%paw%oc, "oc")
+      !
+      ! SOC small-component data (only present on relativistic PAW datasets)
+      if (lspinorb) then
+        if (allocated(upf(nt)%paw%pfunc_rel)) &
+          call h5_write_tensor_r(h5_paw, upf(nt)%paw%pfunc_rel, "pfunc_rel")
+        if (allocated(upf(nt)%paw%aewfc_rel)) &
+          call h5_write_mat_r(h5_paw, upf(nt)%paw%aewfc_rel, "aewfc_rel")
+      endif
+      !
+      call qeh5_close(h5_paw)
+      !
+      ! One-center Coulomb residual ΔC = K_AE - K_PS (raw ke%k from QE)
+      ! Used as the local-channel correction K_a in the PAW-ISDF-THC kernel
+      ! (notes/paw_isdf_thc_prb.tex Eq. paw-local-correction).
+      call qeh5_open_group(h5_nt, "Onecenter", h5_oc)
+      call h5_write_tensor4_r(h5_oc, ke(nt)%k, "deltaC")
+      call qeh5_close(h5_oc)
+    endif
+    !
+    ! Core orbitals (GIPAW). Required for explicit core-valence/core-core
+    ! exchange (notes §7). Pseudopotentials must be generated with
+    ! --with-gipaw to populate these fields.
+    if (upf(nt)%has_gipaw .and. upf(nt)%gipaw_ncore_orbitals > 0) then
+      ncore = upf(nt)%gipaw_ncore_orbitals
+      call qeh5_open_group(h5_nt, "Core", h5_core)
+      call qeh5_add_attribute(h5_core%id, "ncore_orbitals", ncore)
+      if (allocated(upf(nt)%gipaw_core_orbital_n)) &
+        call h5_write_vector_r(h5_core, &
+          upf(nt)%gipaw_core_orbital_n(1:ncore), "n")
+      if (allocated(upf(nt)%gipaw_core_orbital_l)) &
+        call h5_write_vector_r(h5_core, &
+          upf(nt)%gipaw_core_orbital_l(1:ncore), "l")
+      if (allocated(upf(nt)%gipaw_core_orbital)) &
+        call h5_write_mat_r(h5_core, &
+          upf(nt)%gipaw_core_orbital(1:mesh,1:ncore), "ae_wfc")
+      call qeh5_close(h5_core)
+    endif
+    !
+    call qeh5_close(h5_nt)
+  enddo
+  !
+  call qeh5_close(h5_sp)
+  call qeh5_close(h5_h)
+  !
+  if (any_paw) CALL PAW_clean_fock_kernel()
+  !
+END SUBROUTINE write_species
 
 ! MAM: This should really be in qeh5_base_module, or in a module outside!
 subroutine h5_write_vector_int(h5_f, v, id)
@@ -1035,6 +1187,28 @@ subroutine h5_write_tensor_c(h5_f, v, id)
 
 end subroutine h5_write_tensor_c
 
+subroutine h5_write_tensor4_r(h5_f, v, id)
+  ! qeh5_write_dataset only overloads rank ≤ 3; for rank 4 we use raw
+  ! H5Dwrite_f via write_real_data_raw (parallel to write_complex_as_real).
+
+  USE qeh5_base_module, ONLY : qeh5_file, qeh5_dataset, &
+                               qeh5_open_dataset, qeh5_close, qeh5_set_space
+
+  IMPLICIT NONE
+
+  type(qeh5_file), intent(inout) :: h5_f
+  real(dp), intent(inout), target :: v(:,:,:,:)
+  character(len=*), intent(in) :: id
+  type(qeh5_dataset) :: dset
+
+  CALL qeh5_set_space(dset, v(1,1,1,1), RANK=4, &
+                      DIMENSIONS=[size(v,1),size(v,2),size(v,3),size(v,4)])
+  CALL qeh5_open_dataset(h5_f, dset, ACTION='write', NAME=TRIM(id))
+  call write_real_data_raw(v(1,1,1,1), dset)
+  call qeh5_close(dset)
+
+end subroutine h5_write_tensor4_r
+
 subroutine h5_write_tensor4_c(h5_f, v, id)
 
   USE qeh5_base_module, ONLY : qeh5_file, qeh5_dataset, qeh5_write_dataset, &
@@ -1100,6 +1274,31 @@ subroutine add_complex(h5_hid)
   call H5Aclose_f(attr_id, ierr )
 
 end subroutine add_complex
+
+SUBROUTINE write_real_data_raw( r_data, h5_dataset )
+  ! Generic rank-agnostic real(dp) writer using raw H5Dwrite_f. The dataspace
+  ! shape is taken from h5_dataset; the caller passes the address of the
+  ! contiguous backing buffer via r_data (e.g. v(1,1,1,1) for a 4-D array).
+  USE hdf5
+  USE ISO_C_BINDING
+  IMPLICIT NONE
+  REAL(DP), TARGET, INTENT(INOUT) ::  r_data
+  TYPE(qeh5_dataset),INTENT(IN) ::  h5_dataset
+  !
+  TYPE(C_PTR) ::  buf
+  INTEGER ::  ierr
+  INTEGER(HID_T) ::  memspace_, filespace_
+  INTEGER(HID_T) :: H5_REALDP_TYPE
+  !
+  buf = C_LOC(r_data)
+  filespace_ = H5S_ALL_F
+  memspace_  = H5S_ALL_F
+  IF( ALLOCATED (h5_dataset%filespace%offset)) filespace_ = h5_dataset%filespace%id
+  IF ( h5_dataset%memspace_ispresent)  memspace_ = h5_dataset%memspace%id
+  H5_REALDP_TYPE = h5kind_to_type( DP, H5_REAL_KIND)
+  CALL H5Dwrite_f ( h5_dataset%id, H5_REALDP_TYPE, buf, ierr, memspace_, &
+                    filespace_, H5P_DEFAULT_F )
+END SUBROUTINE write_real_data_raw
 
 SUBROUTINE write_complex_as_real( c_data, h5_dataset )
   USE hdf5

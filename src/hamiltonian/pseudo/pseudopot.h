@@ -90,6 +90,26 @@ class pseudopot
 
   pp_type_e pp_type() const { return ptype; }
 
+  // Read-only accessors for the host-resident augmentation data used by
+  // v_h_paw and similar PAW/USPP utilities. The full state remains private
+  // to keep the data model encapsulated.
+  auto Pskna_view() const { return Pskna.local(); }
+  auto qgm_view() const { return qgm.local(); }
+  nda::array<int,3> const& ijtoh_view() const { return ijtoh; }
+  nda::array<int,1> const& ityp_view() const { return ityp; }
+  nda::array<int,1> const& nh_view() const { return nh; }
+  nda::array<int,1> const& ofs_view() const { return ofs; }
+  nda::array<int,2> const& miller_g_dense_view() const { return miller_g_dense; }
+  nda::array<double,2> const& atom_pos_cart_view() const { return atom_pos_cart; }
+  long ngm_dense_get() const { return ngm_dense; }
+
+  // Read-only access to per-species PAW data (qfuncl, deltaC, partial waves
+  // and friends). Empty entry for non-PAW species — check is_paw before use.
+  auto const& paw_species_view() const { return paw_species; }
+  // wfc-G → dense-FFT-linear-index mapping (REMAPPED to dense mesh, NOT
+  // the raw wfc_g.gv_to_fft() which is encoded on the wfc mesh).
+  auto swfc_to_rho_view() const { return swfc_to_rho.local(); }
+
   void save(std::string fname, bool append = true);
   void save(h5::group& grp);
 
@@ -219,9 +239,19 @@ class pseudopot
   // Matrix elements between projectors and basis orbitals (in mf)
   sarray_t<nda::array_view<ComplexType,4>> Pskna;
 
-  // D matrix for local projectors
+  // D matrix for local projectors. Species-resolved (nsp, nhm*npol, nhm*npol)
+  // for NCPP. For USPP/PAW the SCF-dependent deeq correction is per-atom and
+  // is held separately in Dnn_atom (below); add_Vpp dispatches between the two.
   //memory::unified_array<ComplexType,3> Dnn;
   sarray_t<nda::array_view<ComplexType,3>> Dnn;
+
+  // Atom-resolved effective non-local D for USPP/PAW:
+  //   D_eff(a, I, J) = dvan(type(a), I, J) + deeq(I, J, a, spin=0)
+  // shape (nat, nhm*npol, nhm*npol). Empty for NCPP. Spin-polarized
+  // calculations would need (nspin, nat, ...); collinear non-magnetic
+  // (nspin=1 or 2 with deeq same on both spins) is supported here. Magnetic
+  // PAW with deeq(s=1)≠deeq(s=2) is a documented TODO.
+  sarray_t<nda::array_view<ComplexType,3>> Dnn_atom;
 
   // mapping from wfc_g grid to rho grid. 
   // hard coding ecut in mf now, allow for a custom cutoff later on
@@ -233,18 +263,175 @@ class pseudopot
   // scf local potential
   sarray_t<nda::array_view<ComplexType,3>> svsc;
 
-  // qgm
+  // qgm: Q^IJ(G) augmentation in reciprocal space, structure-factor free
+  // shape: (nsp, nij_max, ngm_dense), where nij_max = max_t nh(t)*(nh(t)+1)/2
+  // For species nt, valid pair indices are ij ∈ [0, nh(nt)*(nh(nt)+1)/2 ).
+  // Non-USPP/PAW species rows are zero.
   sarray_t<nda::array_view<ComplexType,3>> qgm;
 
+  // composite (ih,jh) -> ij index map for augmentation, shape (nsp, nhm, nhm)
+  // 1-based indices coming from QE; subtract 1 before indexing into qgm.
+  // Allocated empty for ncpp.
+  nda::array<int,3> ijtoh;
+
+  // augmentation overlap S = 1 + Σ_a Σ_IJ |β_aI⟩ q_{IJ} ⟨β_aJ|
+  // shape: (nsp, nhm*npol, nhm*npol). Real-only convention until SOC ops land;
+  // for non-SO USPP/PAW the imag part is zero.
+  sarray_t<nda::array_view<ComplexType,3>> qq_nt_data;
+
+  // Phase 0/1: per-species PAW data populated from /Hamiltonian/Species/{nt}/.
+  // Empty until pseudopot::read_vnl_h5 fills it. Phase 2 ingests Onecenter.
+  struct species_paw_t {
+    bool is_paw = false;
+    bool is_uspp = false;
+    int  mesh = 0;
+    int  nbeta = 0;
+    int  kkbeta = 0;
+    int  nh = 0;
+    int  lmax_aug = 0;
+    double raug = 0.0;
+    int  iraug = 0;
+    nda::array<double,1> r;            // (mesh)
+    nda::array<double,1> rab;          // (mesh)
+    nda::array<double,2> aewfc;        // (nbeta, mesh)  — read row-major from HDF5
+    nda::array<double,2> pswfc;        // (nbeta, mesh)
+    nda::array<double,3> qfuncl;       // (2*lmax+1, nbeta(nbeta+1)/2, mesh)
+                                       // pseudized augmentation per L channel
+    // Phase 4.3 angular momentum metadata (per-species slices of QE's
+    // global uspp tables; ih ∈ [0, nh), nbeta ∈ [0, nbeta)).
+    nda::array<int,1> lll;             // (nbeta) — l per beta projector
+    nda::array<int,1> nhtol;           // (nh)    — l per ih
+    nda::array<int,1> nhtolm;          // (nh)    — lm = l*(l+1)+m+1 (1-based) per ih
+    nda::array<int,1> indv;            // (nh)    — beta-channel index per ih (1-based)
+    // Phase 2 fields (populated when present):
+    nda::array<double,4> deltaC;       // (nh, nh, nh, nh) — raw ke%k from QE
+    nda::array<double,3> pfunc;        // (nbeta, nbeta, mesh)  — paw subgroup
+    nda::array<double,3> ptfunc;       // (nbeta, nbeta, mesh)
+    nda::array<double,3> augmom;       // (2*lmax+1, nbeta, nbeta)
+    nda::array<double,1> ae_vloc;      // (mesh)
+    nda::array<double,1> ae_rho_atc;   // (mesh)
+    // GIPAW core orbitals (only when species was generated --with-gipaw)
+    int  ncore_orbitals = 0;
+    nda::array<double,1> core_n;       // principal qno (ncore)
+    nda::array<double,1> core_l;       // l qno (ncore)  (real for QE convention)
+    nda::array<double,2> core_aewfc;   // (ncore, mesh)
+  };
+  std::vector<species_paw_t> paw_species;
+
+  // dense-grid G-vector count (read from /Hamiltonian/{type}/ngm attribute);
+  // needed to size qgm and to map Q-index space.
+  long ngm_dense = 0;
+
+  // Miller indices for the dense G-grid that qgm lives on, shape (ngm_dense, 3).
+  // Allocated only for USPP/PAW; needed by v_h_paw to build structure factors
+  // and cartesian G-vectors when injecting the augmentation Q^IJ(G) e^{-iG·τ_a}.
+  nda::array<int,2> miller_g_dense;
+
+  // Cartesian atom positions, shape (nat, 3). Cached from mf at construct time
+  // so the Hartree augmentation step doesn't need to thread mf through.
+  nda::array<double,2> atom_pos_cart;
+
   template<typename MF_t>
-  void read_vnl_pw2bgw(MF_t &mf, std::string outdir); 
+  void read_vnl_pw2bgw(MF_t &mf, std::string outdir);
 
   template<typename MF_t>
   void read_vnl_h5(MF_t &mf, h5::group& grp); 
 
-  void add_vnl_impl(nda::range k_range, nda::range b_range, 
-               nda::ArrayOfRank<3> auto const& Dion, 
+  void add_vnl_impl(nda::range k_range, nda::range b_range,
+               nda::ArrayOfRank<3> auto const& Dion,
                math::nda::DistributedArrayOfRank<4> auto & Hij);
+
+  // Public PAW/USPP utilities exposed to callers (test code, paw_thc_kernel,
+  // v_h_paw, etc.). Re-open public scope here.
+public:
+
+  /**
+   * Add the smooth-grid USPP/PAW augmentation Σ_a Σ_IJ becsum_aIJ Q^IJ_nt(G) e^{-iG·τ_a}
+   * to a pair density rhoG already on the dense G grid. NCPP species are
+   * skipped. This is the temporary "raw augmentation" form used in Phase 1
+   * and is replaced by the compensation-charge formulation in Phase 3.
+   * The caller is responsible for building becsum_aIJ from Pskna and the
+   * gvec_phase structure-factor table.
+   */
+  void add_augmentation_to_pairdensity(
+      nda::ArrayOfRank<2> auto const& becsum_aIJ,
+      nda::ArrayOfRank<2> auto const& gvec_phase,
+      nda::ArrayOfRank<1> auto       & rhoG) const;
+
+  /**
+   * Add the augmentation contribution to a (s,k,a,b) orbital-basis overlap:
+   *   S_ab(s,k) += Σ_atom Σ_IJ conj(P_aI(s,k,a)) * q_IJ(type(atom)) * P_aJ(s,k,b)
+   *
+   * Combined with the identity, this yields the full ultrasoft/PAW S overlap
+   * S = 1 + Σ_a Σ_IJ |β_aI⟩ q_{IJ} ⟨β_aJ|
+   * For NCPP species (qq_nt = 0) the call is a no-op. For SOC the diagonal
+   * spinor block is used (qq_so support is a TODO).
+   *
+   * Sij must already hold the bare overlap (typically the identity) on entry;
+   * this method *adds* the augmentation correction. Pattern matches
+   * add_vnl_impl so consumers can dispatch the same way they do for V_NL.
+   */
+  void add_S(nda::range k_range, nda::range b_range,
+             math::nda::DistributedArrayOfRank<4> auto & Sij)
+  {
+    using nda::range;
+    decltype(range::all) all;
+    constexpr auto MEM = memory::get_memory_space<std::decay_t<decltype(Sij.local())>>();
+
+    if (ptype == pp_ncpp_t) return;
+
+    auto k_range_loc = Sij.local_range(1) + k_range.first();
+    auto b_range_loc = Sij.local_range(2) + b_range.first();
+    long nkb  = Pskna.shape()[2]/npol;
+    if (nkb == 0) return;
+
+    auto Qloc  = qq_nt_data.local();
+    auto Sloc  = Sij.local();
+    auto Ploc  = Pskna.local();
+
+    if constexpr (MEM == HOST_MEMORY) {
+      long nbnd = b_range_loc.size();
+      memory::array<MEM, ComplexType, 2> T(nbnd, nkb*npol);
+      memory::array<MEM, ComplexType, 3> Qfull;
+      int nhm = Qloc.shape()[1];
+      Qfull = memory::array<MEM, ComplexType, 3>(Qloc.shape()[0], nhm*npol, nhm*npol);
+      Qfull() = ComplexType(0.0);
+      for (int s=0; s<int(Qloc.shape()[0]); ++s)
+        for (int p=0; p<npol; ++p)
+          for (int n=0; n<nhm; ++n)
+            for (int m=0; m<nhm; ++m)
+              Qfull(s, n*npol+p, m*npol+p) = Qloc(s, n, m);
+      for (auto [is,s] : itertools::enumerate(Sij.local_range(0)))
+        for (auto [ik,k] : itertools::enumerate(k_range_loc)) {
+          for (auto [ia,nt] : itertools::enumerate(ityp)) {
+            if (nh(nt) == 0) continue;
+            nda::blas::gemm(ComplexType(1.0),
+              nda::dagger(Ploc(s, k,
+                    range(ofs(ia)*npol, (ofs(ia)+nh(nt))*npol), b_range_loc)),
+              Qfull(nt, range(nh(nt)*npol), range(nh(nt)*npol)),
+              ComplexType(0.0),
+              T(all, range(ofs(ia)*npol, (ofs(ia)+nh(nt))*npol)));
+          }
+          nda::blas::gemm(ComplexType(1.0), T,
+                          Ploc(s, k, all, b_range),
+                          ComplexType(1.0), Sloc(is, ik, all, all));
+        }
+    } else {
+      static_assert(MEM == HOST_MEMORY,
+          "pseudopot::add_S device path not yet implemented");
+    }
+  }
+
+  /**
+   * Phase 2 self-consistency: assert ΔC_{αβγδ} symmetries from the .tex
+   * (Eq. paw-local-correction). For each PAW species:
+   *   ΔC[α,β,γ,δ] == ΔC[γ,δ,α,β]                  (Coulomb-bilinear swap)
+   *   ΔC[α,β,γ,δ] == ΔC[β,α,γ,δ]                  (real partial waves)
+   *   ΔC[α,β,γ,δ] == ΔC[α,β,δ,γ]                  (real partial waves)
+   * Returns the maximum violation across species; throws via utils::check
+   * when violation exceeds tol. Skipping species without deltaC populated.
+   */
+  double validate_deltaC_symmetry(double tol = 1e-10) const;
 
   /**
    * Add the contributions of a generic pseudopotentials:
