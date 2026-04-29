@@ -1233,12 +1233,21 @@ void test_hartree_thc_paw_aug(mpi_context_t& mpi, std::shared_ptr<mf::MF> mf_ptr
                                double tol = 5e-3)
 {
   using math::shm::make_shared_array;
+  using clk_t = std::chrono::steady_clock;
+  auto t_phase = clk_t::now();
+  auto dt = [&t_phase]() {
+    auto now = clk_t::now();
+    double s = std::chrono::duration<double>(now - t_phase).count();
+    t_phase = now;
+    return s;
+  };
   auto all = nda::range::all;
   auto& mfobj = *mf_ptr;
   long nspin   = mfobj.nspin();
   long nk_ibz  = mfobj.nkpts_ibz();
   long nbnd    = mfobj.nbnd();
   int  npol    = mfobj.npol();
+  app_log(2, "[TIMER {}] mf+psp+nii setup={:.2f}s", fixture_name, dt());
 
   // -------- Direct E_H_paw with augmentation --------
   memory::array<MEM, ComplexType, 3> nii(nspin, nk_ibz, nbnd);
@@ -1248,11 +1257,13 @@ void test_hartree_thc_paw_aug(mpi_context_t& mpi, std::shared_ptr<mf::MF> mf_ptr
     nii() = nda::array<ComplexType,3>(mfobj.occ()(all, nda::range(nk_ibz), all));
   }
   hamilt::pseudopot V(mfobj);
+  app_log(2, "[TIMER {}] pseudopot ctor={:.2f}s", fixture_name, dt());
   using larray = memory::array<MEM, ComplexType, 4>;
   auto psi = mf::read_distributed_orbital_set_ibz<larray>(
       mfobj, mpi.comm, 'w', std::array<long,4>{0,0,0,0},
       nda::range(nspin), nda::range(nk_ibz), nda::range(nbnd),
       std::array<long,4>{1,1,2048,2048});
+  app_log(2, "[TIMER {}] orbital read={:.2f}s", fixture_name, dt());
   auto fft_mesh = mfobj.fft_grid_dim();
   auto recv     = mfobj.recv();
   auto wfc_g    = mfobj.wfc_truncated_grid();
@@ -1263,10 +1274,18 @@ void test_hartree_thc_paw_aug(mpi_context_t& mpi, std::shared_ptr<mf::MF> mf_ptr
   auto symm_list = mfobj.symm_list();
   auto k2g       = V.swfc_to_rho_view();
 
-  double E_H_direct = hamilt::paw::hartree_energy_paw(
-      mpi, V, npol, fft_mesh, recv, k2g,
-      kpts_full, kp_to_ibz, kp_trev, kp_symm, symm_list, nii, psi,
-      /*include_augmentation=*/true);
+  // hartree_energy_paw is rank-0-only (operates on `psi.local()` without
+  // gathering), so we only run it under serial MPI. Under MPI > 1 we still
+  // exercise the THC build but skip the direct-target comparison.
+  bool const direct_ok = (mpi.comm.size() == 1);
+  double E_H_direct = 0.0;
+  if (direct_ok) {
+    E_H_direct = hamilt::paw::hartree_energy_paw(
+        mpi, V, npol, fft_mesh, recv, k2g,
+        kpts_full, kp_to_ibz, kp_trev, kp_symm, symm_list, nii, psi,
+        /*include_augmentation=*/true);
+  }
+  app_log(2, "[TIMER {}] hartree_energy_paw direct={:.2f}s", fixture_name, dt());
 
   // PAW augmentation in V_full includes the closed-form one-center K_a
   // correction (ΔC contraction), so the THC Hartree reproduces the
@@ -1299,6 +1318,8 @@ void test_hartree_thc_paw_aug(mpi_context_t& mpi, std::shared_ptr<mf::MF> mf_ptr
     }
   }
   double E_H_target = E_H_direct + E_K_a_direct;
+  app_log(2, "[TIMER {}] one-center K_a (becsum × ΔC × becsum)={:.2f}s",
+          fixture_name, dt());
 
   // -------- E_H_thc with paw_aug=true --------
   // Use ecut = ecutrho so thc's rho_g matches the QE dense grid that
@@ -1310,6 +1331,8 @@ void test_hartree_thc_paw_aug(mpi_context_t& mpi, std::shared_ptr<mf::MF> mf_ptr
   thc_pt.put("paw_isdf_metric", "coulomb");
   thc_pt.put("paw_isdf_tol", 1e-12);
   methods::thc_reader_t thc(mf_ptr, thc_pt);
+  app_log(2, "[TIMER {}] thc_reader_t ctor (smooth ISDF + paw_aug q-loop)={:.2f}s",
+          fixture_name, dt());
 
   methods::solvers::hf_t hf(methods::ignore_g0);
   auto sDm_skij = make_shared_array<array_view_4d_t>(mpi,
@@ -1328,16 +1351,24 @@ void test_hartree_thc_paw_aug(mpi_context_t& mpi, std::shared_ptr<mf::MF> mf_ptr
   auto sJ = make_shared_array<array_view_4d_t>(mpi,
                 {nspin, nk_ibz, nbnd, nbnd});
   hf.evaluate(sJ, sDm_skij.local(), thc, sS_skij.local(), true, false);
+  app_log(2, "[TIMER {}] HF Hartree evaluate={:.2f}s", fixture_name, dt());
   auto k_weight = mfobj.k_weight();
   auto [e1e_dummy, E_H_thc] = methods::eval_hf_energy(
       sDm_skij, sJ, sS_skij, k_weight, false);
 
-  app_log(2, "PAW-augmented THC Hartree: direct(smooth-grid) = {:+.8f} Ha, "
-             "ΔE_one_center = {:+.8f} Ha, AE target = {:+.8f} Ha, "
-             "THC = {:+.8f} Ha, diff = {:+.2e} Ha",
-             E_H_direct, E_K_a_direct, E_H_target,
-             E_H_thc, E_H_thc - E_H_target);
-  CHECK(std::abs(E_H_thc - E_H_target) < tol);
+  if (direct_ok) {
+    app_log(2, "PAW-augmented THC Hartree: direct(smooth-grid) = {:+.8f} Ha, "
+               "ΔE_one_center = {:+.8f} Ha, AE target = {:+.8f} Ha, "
+               "THC = {:+.8f} Ha, diff = {:+.2e} Ha",
+               E_H_direct, E_K_a_direct, E_H_target,
+               E_H_thc, E_H_thc - E_H_target);
+    CHECK(std::abs(E_H_thc - E_H_target) < tol);
+  } else {
+    app_log(2, "PAW-augmented THC Hartree (np={}): direct comparison "
+               "skipped (rank-0-only path); THC = {:+.8f} Ha (smoke check).",
+               mpi.comm.size(), E_H_thc);
+    CHECK(std::isfinite(E_H_thc));
+  }
 }
 
 /**
@@ -1440,6 +1471,14 @@ TEST_CASE("paw_aug_q_eval_at_q0", "[hamilt][paw][isdf]")
     auto qe_h5 = mf::default_MF(mpi, "qe_lih222_paw", mf::h5_input_type);
     test_paw_aug_q_eval_at_q0<HOST_MEMORY>(*mpi, qe_h5);
   }
+  SECTION("si_kp222 (USPP psl 1.0.0)") {
+    auto qe_h5 = mf::default_MF(mpi, "qe_si222_uspp", mf::h5_input_type);
+    test_paw_aug_q_eval_at_q0<HOST_MEMORY>(*mpi, qe_h5);
+  }
+  SECTION("si_kp222 (PAW psl 1.0.0)") {
+    auto qe_h5 = mf::default_MF(mpi, "qe_si222_paw", mf::h5_input_type);
+    test_paw_aug_q_eval_at_q0<HOST_MEMORY>(*mpi, qe_h5);
+  }
 }
 
 /**
@@ -1520,6 +1559,26 @@ TEST_CASE("thc_paw_hermiticity", "[hamilt][paw][thc]")
   }
 }
 
+TEST_CASE("thc_paw_hermiticity_si", "[hamilt][paw][thc][slow]")
+{
+  auto& mpi = utils::make_unit_test_mpi_context();
+  SECTION("si_kp222 (NCPP)") {
+    auto mf_ptr = std::make_shared<mf::MF>(
+        mf::default_MF(mpi, "qe_si222_ncpp", mf::h5_input_type));
+    test_thc_paw_hermiticity<HOST_MEMORY>(*mpi, mf_ptr);
+  }
+  SECTION("si_kp222 (USPP psl 1.0.0)") {
+    auto mf_ptr = std::make_shared<mf::MF>(
+        mf::default_MF(mpi, "qe_si222_uspp", mf::h5_input_type));
+    test_thc_paw_hermiticity<HOST_MEMORY>(*mpi, mf_ptr);
+  }
+  SECTION("si_kp222 (PAW psl 1.0.0)") {
+    auto mf_ptr = std::make_shared<mf::MF>(
+        mf::default_MF(mpi, "qe_si222_paw", mf::h5_input_type));
+    test_thc_paw_hermiticity<HOST_MEMORY>(*mpi, mf_ptr);
+  }
+}
+
 /**
  * Phase 4.3 smoke test: full HF (Hartree + exchange) with paw_aug=true
  * runs to completion and gives finite, real energy. Exchange exercises
@@ -1586,6 +1645,21 @@ TEST_CASE("thc_paw_hf_smoke", "[hamilt][paw][thc]")
   }
 }
 
+TEST_CASE("thc_paw_hf_smoke_si", "[hamilt][paw][thc][slow]")
+{
+  auto& mpi = utils::make_unit_test_mpi_context();
+  SECTION("si_kp222 (USPP psl 1.0.0)") {
+    auto mf_ptr = std::make_shared<mf::MF>(
+        mf::default_MF(mpi, "qe_si222_uspp", mf::h5_input_type));
+    test_thc_paw_hf_smoke<HOST_MEMORY>(*mpi, mf_ptr);
+  }
+  SECTION("si_kp222 (PAW psl 1.0.0)") {
+    auto mf_ptr = std::make_shared<mf::MF>(
+        mf::default_MF(mpi, "qe_si222_paw", mf::h5_input_type));
+    test_thc_paw_hf_smoke<HOST_MEMORY>(*mpi, mf_ptr);
+  }
+}
+
 TEST_CASE("hartree_thc_paw_aug", "[hamilt][energy][thc][paw]")
 {
   auto& mpi = utils::make_unit_test_mpi_context();
@@ -1610,6 +1684,37 @@ TEST_CASE("hartree_thc_paw_aug", "[hamilt][energy][thc][paw]")
     auto mf_ptr = std::make_shared<mf::MF>(
         mf::default_MF(mpi, "qe_lih222_paw", mf::h5_input_type));
     test_hartree_thc_paw_aug<HOST_MEMORY>(*mpi, mf_ptr, "qe_lih222_paw",
+                                           /*thc_thresh*/1e-5, /*tol*/5e-3);
+  }
+}
+
+// Si sections are split into a separate test case tagged [slow]: the q-loop
+// in augment_thc_with_paw with Si's lmax=2 (Lmax=4 in the angular sum) does
+// ~4M radial spherical-Bessel transforms per fixture and takes ~1 hour
+// each in serial. They are NOT run by default; invoke explicitly with
+//   test_hamiltonian "[slow]"   or   test_hamiltonian -c "si_kp222 ..."
+// once the Phase 4.4 |K|-grid qrad cache lands and brings them back to
+// minute-scale.
+TEST_CASE("hartree_thc_paw_aug_si", "[hamilt][energy][thc][paw][slow]")
+{
+  auto& mpi = utils::make_unit_test_mpi_context();
+
+  SECTION("si_kp222 (NCPP)") {
+    auto mf_ptr = std::make_shared<mf::MF>(
+        mf::default_MF(mpi, "qe_si222_ncpp", mf::h5_input_type));
+    test_hartree_thc_paw_aug<HOST_MEMORY>(*mpi, mf_ptr, "qe_si222_ncpp",
+                                           /*thc_thresh*/1e-5, /*tol*/5e-3);
+  }
+  SECTION("si_kp222 (USPP psl 1.0.0)") {
+    auto mf_ptr = std::make_shared<mf::MF>(
+        mf::default_MF(mpi, "qe_si222_uspp", mf::h5_input_type));
+    test_hartree_thc_paw_aug<HOST_MEMORY>(*mpi, mf_ptr, "qe_si222_uspp",
+                                           /*thc_thresh*/1e-5, /*tol*/5e-3);
+  }
+  SECTION("si_kp222 (PAW psl 1.0.0)") {
+    auto mf_ptr = std::make_shared<mf::MF>(
+        mf::default_MF(mpi, "qe_si222_paw", mf::h5_input_type));
+    test_hartree_thc_paw_aug<HOST_MEMORY>(*mpi, mf_ptr, "qe_si222_paw",
                                            /*thc_thresh*/1e-5, /*tol*/5e-3);
   }
 }

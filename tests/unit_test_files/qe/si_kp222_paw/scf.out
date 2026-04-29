@@ -1,0 +1,542 @@
+
+     Program PWSCF v.7.5 starts on 29Apr2026 at  5: 7:37 
+        Git branch: develop
+        Last git commit: f06ac4d1f9697b7505603566d9533923a40008c1
+        Last git commit date: Thu Apr 23 19:57:23 2026 +0000
+        Last git commit subject: Merge branch 'fix_stress_mgga' into 'develop'
+
+     This program is part of the open-source Quantum ESPRESSO suite
+     for quantum simulation of materials; please cite
+         "P. Giannozzi et al., J. Phys.:Condens. Matter 21 395502 (2009);
+         "P. Giannozzi et al., J. Phys.:Condens. Matter 29 465901 (2017);
+         "P. Giannozzi et al., J. Chem. Phys. 152 154105 (2020);
+          URL http://www.quantum-espresso.org", 
+     in publications or presentations arising from this work. More details at
+     http://www.quantum-espresso.org/quote
+
+     Parallel version (MPI), running on     4 processors
+
+     MPI processes distributed on     1 nodes
+     0 MiB available memory on the printing compute node when the environment starts
+
+     Waiting for input...
+     Reading input from standard input
+
+     Current dimensions of program PWSCF are:
+     Max number of different atomic species (ntypx) = 10
+     Max number of k-points (npk) =  40000
+     Max angular momentum in pseudopotentials (lmaxx) =  4
+     file Si.pbe-n-kjpaw_psl.1.0.0.UPF: wavefunction(s)  3S 3P renormalized
+
+     Exact exchange band parallelism type set to band_pairs
+
+
+     R & G space division:  proc/nbgrp/npool/nimage =       4
+     Subspace diagonalization in iterative solution of the eigenvalue problem:
+     a serial algorithm will be used
+
+
+     Parallelization info
+     --------------------
+     sticks:   dense  smooth     PW     G-vecs:    dense   smooth      PW
+     Min         182     182     52                 3222     3222     520
+     Max         184     184     53                 3223     3223     522
+     Sum         733     733    211                12891    12891    2085
+
+     Using Slab Decomposition
+
+
+
+     bravais-lattice index     =            2
+     lattice parameter (alat)  =      10.2440  a.u.
+     unit-cell volume          =     268.7502 (a.u.)^3
+     number of atoms/cell      =            2
+     number of atomic types    =            1
+     number of electrons       =         8.00
+     number of Kohn-Sham states=           16
+     kinetic-energy cutoff     =      50.0000  Ry
+     charge density cutoff     =     200.0000  Ry
+     scf convergence threshold =      1.0E-12
+     mixing beta               =       0.3000
+     number of iterations used =            8  plain     mixing
+     Exchange-correlation= SLA  PW   PBX  PBC
+                           (   1   4   3   4   0   0   0)
+
+     celldm(1)=  10.244000  celldm(2)=   0.000000  celldm(3)=   0.000000
+     celldm(4)=   0.000000  celldm(5)=   0.000000  celldm(6)=   0.000000
+
+     crystal axes: (cart. coord. in units of alat)
+               a(1) = (  -0.500000   0.000000   0.500000 )  
+               a(2) = (   0.000000   0.500000   0.500000 )  
+               a(3) = (  -0.500000   0.500000   0.000000 )  
+
+     reciprocal axes: (cart. coord. in units 2 pi/alat)
+               b(1) = ( -1.000000 -1.000000  1.000000 )  
+               b(2) = (  1.000000  1.000000  1.000000 )  
+               b(3) = ( -1.000000  1.000000 -1.000000 )  
+
+
+     PseudoPot. # 1 for Si read from file:
+     ./Si.pbe-n-kjpaw_psl.1.0.0.UPF
+     MD5 check sum: c39c59da582df4a0d9f10159256ea34e
+     Pseudo is Projector augmented-wave + core cor, Zval =  4.0
+     Generated using &quot;atomic&quot; code by A. Dal Corso  v.6.3
+     Shape of augmentation charge: PSQ
+     Using radial grid of 1141 points,  6 beta functions with: 
+                l(1) =   0
+                l(2) =   0
+                l(3) =   1
+                l(4) =   1
+                l(5) =   2
+                l(6) =   2
+     Q(r) pseudized with 0 coefficients 
+
+
+     atomic species   valence    mass     pseudopotential
+     Si                4.00    28.08550     Si( 1.00)
+
+     No symmetry found
+
+
+                                    s                        frac. trans.
+
+      isym =  1     identity                                     
+
+ cryst.   s( 1) = (     1          0          0      )
+                  (     0          1          0      )
+                  (     0          0          1      )
+
+ cart.    s( 1) = (  1.0000000  0.0000000  0.0000000 )
+                  (  0.0000000  1.0000000  0.0000000 )
+                  (  0.0000000  0.0000000  1.0000000 )
+
+
+     point group C_1 (1)    
+     there are  1 classes
+     the character table:
+
+       E    
+A      1.00
+
+     the symmetry operations in each class and the name of the first element:
+
+     E        1
+          identity                                               
+
+   Cartesian axes
+
+     site n.     atom                  positions (alat units)
+         1        Si     tau(   1) = (   0.0000000   0.0000000   0.0000000  )
+         2        Si     tau(   2) = (   0.2500000   0.2500000   0.2500000  )
+
+   Crystallographic axes
+
+     site n.     atom                  positions (cryst. coord.)
+         1        Si     tau(   1) = (  0.0000000  0.0000000  0.0000000  )
+         2        Si     tau(   2) = ( -0.2500000  0.7500000 -0.2500000  )
+
+     number of k points=     8  Fermi-Dirac smearing, width (Ry)=  0.0001
+                       cart. coord. in units 2pi/alat
+        k(    1) = (   0.0000000   0.0000000   0.0000000), wk =   0.2500000
+        k(    2) = (   0.5000000  -0.5000000   0.5000000), wk =   0.2500000
+        k(    3) = (  -0.5000000  -0.5000000  -0.5000000), wk =   0.2500000
+        k(    4) = (   0.0000000  -1.0000000   0.0000000), wk =   0.2500000
+        k(    5) = (   0.5000000   0.5000000  -0.5000000), wk =   0.2500000
+        k(    6) = (   1.0000000   0.0000000   0.0000000), wk =   0.2500000
+        k(    7) = (   0.0000000   0.0000000  -1.0000000), wk =   0.2500000
+        k(    8) = (   0.5000000  -0.5000000  -0.5000000), wk =   0.2500000
+
+                       cryst. coord.
+        k(    1) = (   0.0000000   0.0000000   0.0000000), wk =   0.2500000
+        k(    2) = (   0.0000000   0.0000000  -0.5000000), wk =   0.2500000
+        k(    3) = (   0.0000000  -0.5000000   0.0000000), wk =   0.2500000
+        k(    4) = (   0.0000000  -0.5000000  -0.5000000), wk =   0.2500000
+        k(    5) = (  -0.5000000   0.0000000   0.0000000), wk =   0.2500000
+        k(    6) = (  -0.5000000   0.0000000  -0.5000000), wk =   0.2500000
+        k(    7) = (  -0.5000000  -0.5000000   0.0000000), wk =   0.2500000
+        k(    8) = (  -0.5000000  -0.5000000  -0.5000000), wk =   0.2500000
+
+     Dense  grid:    12891 G-vectors     FFT dimensions: (  36,  36,  36)
+
+     Dynamical RAM for                 wfc:       0.10 MB
+
+     Dynamical RAM for     wfc (w. buffer):       0.88 MB
+
+     Dynamical RAM for           str. fact:       0.05 MB
+
+     Dynamical RAM for           local pot:       0.00 MB
+
+     Dynamical RAM for          nlocal pot:       0.22 MB
+
+     Dynamical RAM for                qrad:       1.14 MB
+
+     Dynamical RAM for          rho,v,vnew:       0.41 MB
+
+     Dynamical RAM for               rhoin:       0.14 MB
+
+     Dynamical RAM for            rho*nmix:       0.79 MB
+
+     Dynamical RAM for           G-vectors:       0.21 MB
+
+     Dynamical RAM for          h,s,v(r/c):       0.05 MB
+
+     Dynamical RAM for          <psi|beta>:       0.01 MB
+
+     Dynamical RAM for                 psi:       0.20 MB
+
+     Dynamical RAM for                hpsi:       0.20 MB
+
+     Dynamical RAM for                spsi:       0.20 MB
+
+     Dynamical RAM for      wfcinit/wfcrot:       0.20 MB
+
+     Dynamical RAM for           addusdens:       9.25 MB
+
+     Estimated static dynamical RAM per process >       3.59 MB
+
+     Estimated max dynamical RAM per process >      13.62 MB
+
+     Estimated total dynamical RAM >      54.50 MB
+
+     Initial potential from superposition of free atoms
+
+     starting charge       7.9989, renormalised to       8.0000
+     Starting wfcs are    8 randomized atomic wfcs +    8 random wfcs
+     Checking if some PAW data can be deallocated... 
+
+     total cpu time spent up to now is        0.4 secs
+
+     Self-consistent Calculation
+
+     iteration #  1     ecut=    50.00 Ry     beta= 0.30
+     Davidson diagonalization with overlap
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  1.00E-02,  avg # of iterations =  6.1
+
+     total cpu time spent up to now is        0.7 secs
+
+     total energy              =     -93.27175998 Ry
+     estimated scf accuracy    <       0.11066137 Ry
+
+     iteration #  2     ecut=    50.00 Ry     beta= 0.30
+     Davidson diagonalization with overlap
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  1.38E-03,  avg # of iterations =  1.1
+
+     total cpu time spent up to now is        1.5 secs
+
+     total energy              =     -93.26144930 Ry
+     estimated scf accuracy    <       0.04613757 Ry
+
+     iteration #  3     ecut=    50.00 Ry     beta= 0.30
+     Davidson diagonalization with overlap
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  5.77E-04,  avg # of iterations =  1.2
+
+     total cpu time spent up to now is        1.7 secs
+
+     total energy              =     -93.26428200 Ry
+     estimated scf accuracy    <       0.00054390 Ry
+
+     iteration #  4     ecut=    50.00 Ry     beta= 0.30
+     Davidson diagonalization with overlap
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  6.80E-06,  avg # of iterations =  6.4
+
+     total cpu time spent up to now is        2.5 secs
+
+     total energy              =     -93.26434051 Ry
+     estimated scf accuracy    <       0.00001964 Ry
+
+     iteration #  5     ecut=    50.00 Ry     beta= 0.30
+     Davidson diagonalization with overlap
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  2.45E-07,  avg # of iterations =  1.9
+
+     total cpu time spent up to now is        3.1 secs
+
+     total energy              =     -93.26434311 Ry
+     estimated scf accuracy    <       0.00000079 Ry
+
+     iteration #  6     ecut=    50.00 Ry     beta= 0.30
+     Davidson diagonalization with overlap
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  9.92E-09,  avg # of iterations =  1.1
+
+     total cpu time spent up to now is        3.3 secs
+
+     total energy              =     -93.26434374 Ry
+     estimated scf accuracy    <       0.00000033 Ry
+
+     iteration #  7     ecut=    50.00 Ry     beta= 0.30
+     Davidson diagonalization with overlap
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  4.15E-09,  avg # of iterations =  2.0
+
+     total cpu time spent up to now is        3.7 secs
+
+     total energy              =     -93.26434385 Ry
+     estimated scf accuracy    <       0.00000003 Ry
+
+     iteration #  8     ecut=    50.00 Ry     beta= 0.30
+     Davidson diagonalization with overlap
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  3.83E-10,  avg # of iterations =  2.0
+
+     total cpu time spent up to now is        4.3 secs
+
+     total energy              =     -93.26434386 Ry
+     estimated scf accuracy    <          7.7E-10 Ry
+
+     iteration #  9     ecut=    50.00 Ry     beta= 0.30
+     Davidson diagonalization with overlap
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  9.68E-12,  avg # of iterations =  2.0
+
+     total cpu time spent up to now is        4.9 secs
+
+     total energy              =     -93.26434386 Ry
+     estimated scf accuracy    <          2.3E-11 Ry
+
+     iteration # 10     ecut=    50.00 Ry     beta= 0.30
+     Davidson diagonalization with overlap
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  2.83E-13,  avg # of iterations =  2.4
+
+     total cpu time spent up to now is        5.1 secs
+
+     total energy              =     -93.26434386 Ry
+     estimated scf accuracy    <          2.9E-11 Ry
+
+     iteration # 11     ecut=    50.00 Ry     beta= 0.30
+     Davidson diagonalization with overlap
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  2.83E-13,  avg # of iterations =  2.0
+
+     total cpu time spent up to now is        5.4 secs
+
+     End of self-consistent calculation
+
+          k = 0.0000 0.0000 0.0000 (  1639 PWs)   bands (ev):
+
+    -5.4978   6.5611   6.5611   6.5611   9.0038   9.0038   9.0038  10.0054
+    14.1423  14.1423  14.5439  17.6739  17.6739  17.6739  22.0208  29.6232
+
+     occupation numbers 
+     1.0000   1.0000   1.0000   1.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000-0.5000 0.5000 (  1622 PWs)   bands (ev):
+
+    -3.1327  -0.5069   5.3273   5.3273   8.0726   9.7601   9.7601  14.2150
+    17.0298  17.0298  17.8399  17.8399  18.0094  19.6385  25.9939  26.5319
+
+     occupation numbers 
+     1.0000   1.0000   1.0000   1.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k =-0.5000-0.5000-0.5000 (  1622 PWs)   bands (ev):
+
+    -3.1327  -0.5069   5.3273   5.3273   8.0726   9.7601   9.7601  14.2150
+    17.0298  17.0298  17.8399  17.8399  18.0094  19.6385  25.9939  26.5319
+
+     occupation numbers 
+     1.0000   1.0000   1.0000   1.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.0000-1.0000 0.0000 (  1588 PWs)   bands (ev):
+
+    -1.3118  -1.3118   3.6274   3.6274   7.1471   7.1471  16.6575  16.6575
+    17.5239  17.5239  18.9758  18.9758  19.7072  19.7072  25.4343  25.4345
+
+     occupation numbers 
+     1.0000   1.0000   1.0000   1.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000 0.5000-0.5000 (  1622 PWs)   bands (ev):
+
+    -3.1327  -0.5069   5.3273   5.3273   8.0726   9.7601   9.7601  14.2150
+    17.0298  17.0298  17.8399  17.8399  18.0094  19.6385  25.9939  26.5319
+
+     occupation numbers 
+     1.0000   1.0000   1.0000   1.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 1.0000 0.0000 0.0000 (  1588 PWs)   bands (ev):
+
+    -1.3118  -1.3118   3.6274   3.6274   7.1471   7.1471  16.6575  16.6575
+    17.5239  17.5239  18.9758  18.9758  19.7072  19.7072  25.4343  25.4344
+
+     occupation numbers 
+     1.0000   1.0000   1.0000   1.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.0000 0.0000-1.0000 (  1588 PWs)   bands (ev):
+
+    -1.3118  -1.3118   3.6274   3.6274   7.1471   7.1471  16.6575  16.6575
+    17.5239  17.5239  18.9758  18.9758  19.7072  19.7072  25.4343  25.4344
+
+     occupation numbers 
+     1.0000   1.0000   1.0000   1.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000-0.5000-0.5000 (  1622 PWs)   bands (ev):
+
+    -3.1327  -0.5069   5.3273   5.3273   8.0726   9.7601   9.7601  14.2150
+    17.0298  17.0298  17.8399  17.8399  18.0094  19.6385  25.9939  26.5320
+
+     occupation numbers 
+     1.0000   1.0000   1.0000   1.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+     the Fermi energy is     6.8454 ev
+
+!    total energy              =     -93.26434386 Ry
+     total all-electron energy =     -1159.956074 Ry
+     estimated scf accuracy    <          3.3E-13 Ry
+     smearing contrib. (-TS)   =       0.00000000 Ry
+     internal energy E=F+TS    =     -93.26434386 Ry
+
+     The total energy is F=E-TS. E is the sum of the following terms:
+     one-electron contribution =       5.89096301 Ry
+     hartree contribution      =       1.26435254 Ry
+     xc contribution           =     -12.40017105 Ry
+     ewald contribution        =     -16.82717081 Ry
+     one-center paw contrib.   =     -71.19231755 Ry
+      -> PAW hartree energy AE =       3.12320858 Ry
+      -> PAW hartree energy PS =      -3.11128834 Ry
+      -> PAW xc energy AE      =     -40.93782281 Ry
+      -> PAW xc energy PS      =       5.32974377 Ry
+      -> total E_H with PAW    =       1.27627278 Ry
+      -> total E_XC with PAW   =     -48.00825008 Ry
+
+     convergence has been achieved in  11 iterations
+
+     Writing all to output data dir ./pwscf.save/ :
+     XML data file, charge density, pseudopotentials, collected wavefunctions
+
+     init_run     :      0.91s CPU      0.30s WALL (       1 calls)
+     electrons    :     15.83s CPU      5.07s WALL (       1 calls)
+
+     Called by init_run:
+     wfcinit      :      0.45s CPU      0.13s WALL (       1 calls)
+     wfcinit:atom :      0.00s CPU      0.00s WALL (       8 calls)
+     wfcinit:wfcr :      0.45s CPU      0.13s WALL (       8 calls)
+     potinit      :      0.04s CPU      0.04s WALL (       1 calls)
+     hinit0       :      0.03s CPU      0.03s WALL (       1 calls)
+
+     Called by electrons:
+     c_bands      :      5.41s CPU      2.03s WALL (      11 calls)
+     sum_band     :      1.22s CPU      0.44s WALL (      11 calls)
+     v_of_rho     :      0.02s CPU      0.02s WALL (      12 calls)
+     v_h          :      0.00s CPU      0.00s WALL (      12 calls)
+     v_xc         :      0.02s CPU      0.02s WALL (      12 calls)
+     newd         :      9.17s CPU      2.26s WALL (      12 calls)
+     PAW_pot      :      0.44s CPU      0.44s WALL (      12 calls)
+     mix_rho      :      0.00s CPU      0.00s WALL (      11 calls)
+
+     Called by c_bands:
+     init_us_2    :      0.01s CPU      0.01s WALL (     184 calls)
+     cegterg      :      5.38s CPU      2.01s WALL (      88 calls)
+
+     Called by sum_band:
+     sum_band:wei :      0.00s CPU      0.00s WALL (      11 calls)
+     sum_band:loo :      0.08s CPU      0.08s WALL (      11 calls)
+     sum_band:buf :      0.00s CPU      0.00s WALL (      88 calls)
+     sum_band:ini :      0.00s CPU      0.00s WALL (      88 calls)
+     sum_band:cal :      0.00s CPU      0.00s WALL (      88 calls)
+     sum_band:bec :      0.00s CPU      0.00s WALL (      88 calls)
+     addusdens    :      1.12s CPU      0.32s WALL (      11 calls)
+                                        0.00s GPU  (      11 calls)
+     addusd:skk   :      0.00s CPU      0.00s WALL (      11 calls)
+                                        0.00s GPU  (      11 calls)
+
+     Called by *egterg:
+     cdiaghg      :      0.04s CPU      0.04s WALL (     314 calls)
+     cegterg:over :      0.04s CPU      0.07s WALL (     226 calls)
+     cegterg:upda :      0.03s CPU      0.05s WALL (     226 calls)
+     cegterg:last :      0.94s CPU      0.32s WALL (     174 calls)
+     h_psi        :      4.13s CPU      1.44s WALL (     322 calls)
+     s_psi        :      0.62s CPU      0.19s WALL (     322 calls)
+     g_psi        :      0.00s CPU      0.00s WALL (     226 calls)
+
+     Called by h_psi:
+     h_psi:calbec :      0.02s CPU      0.02s WALL (     322 calls)
+     vloc_psi     :      0.33s CPU      0.34s WALL (     322 calls)
+                                        0.00s GPU  (     322 calls)
+     add_vuspsi   :      3.78s CPU      1.07s WALL (     322 calls)
+
+     General routines
+     calbec       :      0.02s CPU      0.03s WALL (     410 calls)
+     fft          :      0.04s CPU      0.05s WALL (     132 calls)
+     ffts         :      0.00s CPU      0.00s WALL (      11 calls)
+     fftw         :      0.37s CPU      0.38s WALL (    8434 calls)
+
+     Parallel routines
+
+     PAW routines
+     PAW_pot      :      0.44s CPU      0.44s WALL (      12 calls)
+
+     PWSCF        :     16.80s CPU      5.43s WALL
+
+
+   This run was terminated on:   5: 7:43  29Apr2026            
+
+=------------------------------------------------------------------------------=
+   JOB DONE.
+=------------------------------------------------------------------------------=
