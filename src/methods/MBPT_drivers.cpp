@@ -46,6 +46,7 @@
 
 #include "SCF/scf_driver.hpp"
 #include "MBPT_drivers.h"
+#include "methods/GW_real_axis/real_axis_mbpt_dispatch.hpp"
 
 namespace mpi3 = boost::mpi3;
 namespace methods
@@ -331,6 +332,22 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     MBState mb_state(mpi, ft, output);
     qp_scf_loop<false>(mb_state, eri, ft, qp_context, mb_solver_t(&hf,&gw,&scr_eri), iter_solver.get(),
                        niter, restart, conv_thr);
+
+  } else if (solver_type == "real_axis_gw") {
+
+    // Real-axis GW (THC-only). The real-axis pipeline does not consume the
+    // imag-axis IAFT machinery; it builds its own real_freq_grid_t inside
+    // run_real_axis_gw based on ptree params (or sensible defaults derived
+    // from the MF spectrum).
+    // The corr_eri_t isn't exposed as a member type; derive it from the
+    // optional<reference_wrapper<...>> field.
+    using corr_t = typename decltype(eri.corr_eri)::value_type::type;
+    if constexpr (THC_ERI<corr_t>) {
+      real_axis::run_real_axis_gw(eri.corr_eri->get(), pt);
+    } else {
+      APP_ABORT("mbpt: real_axis_gw requires a THC interaction; "
+                "Cholesky is not supported in the real-axis pipeline.");
+    }
 
   } else
     APP_ABORT("mbpt: Unknown solver type: {}",solver_type);

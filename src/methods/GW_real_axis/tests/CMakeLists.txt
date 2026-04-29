@@ -22,6 +22,7 @@ if(ENABLE_FINUFFT)
       test_real_axis_dyson_t.cpp
       test_real_axis_scf_loop.cpp
       test_real_axis_hermiticity.cpp
+      test_real_axis_dispatch.cpp
      )
 
   add_executable(test_${TEST_ID} ${TEST_SRCS})
@@ -32,6 +33,7 @@ if(ENABLE_FINUFFT)
       utils
       numerics
       fft_lib
+      methods_lib
       gw_real_axis_lib
       meanfield
       eri_lib
