@@ -173,7 +173,12 @@ namespace methods {
       utils::check(_X_type == "q_indep", "thc_reader_t: q-dependent Xk is not implemented yet!");
 
       for (auto &v: {"BUILD_TOTAL", "BUILD_THC", "BUILD_GATHER", "BUILD_WRITE",
-                     "READ_X", "READ_V", "PAW_AUG"})
+                     "READ_X", "READ_V", "PAW_AUG",
+                     "PAW_AUG.aainit", "PAW_AUG.qrad_tab", "PAW_AUG.dzeta",
+                     "PAW_AUG.gather_smooth", "PAW_AUG.eta_at_q",
+                     "PAW_AUG.wG_at_q", "PAW_AUG.V_GL", "PAW_AUG.V_LL",
+                     "PAW_AUG.K_a", "PAW_AUG.stitch", "PAW_AUG.scatter",
+                     "PAW_AUG.X_aug"})
         _Timer.add(v);
 
       // PAW-aug: lazily acquire pseudopot through MF (shared with other
@@ -413,6 +418,21 @@ namespace methods {
       app_log(2, "      - gather collocation matrices: {0:.3f} sec", _Timer.elapsed("BUILD_GATHER"));
       if (_Timer.elapsed("BUILD_WRITE") > 0)
         app_log(2, "      - write eri:                   {0:.3f} sec", _Timer.elapsed("BUILD_WRITE"));
+      app_log(2, "      - paw augmentation total:      {0:.3f} sec", _Timer.elapsed("PAW_AUG"));
+      if (_paw_aug) {
+        app_log(2, "        .  X aug (Y rows x ks):      {0:.3f} sec", _Timer.elapsed("PAW_AUG.X_aug"));
+        app_log(2, "        .  gather smooth GG block:   {0:.3f} sec", _Timer.elapsed("PAW_AUG.gather_smooth"));
+        app_log(2, "        .  aainit (ap, lpx, lpl):    {0:.3f} sec", _Timer.elapsed("PAW_AUG.aainit"));
+        app_log(2, "        .  qrad table (per species): {0:.3f} sec", _Timer.elapsed("PAW_AUG.qrad_tab"));
+        app_log(2, "        .  q-loop dz gather:         {0:.3f} sec", _Timer.elapsed("PAW_AUG.dzeta"));
+        app_log(2, "        .  q-loop eta at q+G:        {0:.3f} sec", _Timer.elapsed("PAW_AUG.eta_at_q"));
+        app_log(2, "        .  q-loop wG at q+G:         {0:.3f} sec", _Timer.elapsed("PAW_AUG.wG_at_q"));
+        app_log(2, "        .  q-loop V_GL contraction:  {0:.3f} sec", _Timer.elapsed("PAW_AUG.V_GL"));
+        app_log(2, "        .  q-loop V_LL contraction:  {0:.3f} sec", _Timer.elapsed("PAW_AUG.V_LL"));
+        app_log(2, "        .  q-loop K_a inject:        {0:.3f} sec", _Timer.elapsed("PAW_AUG.K_a"));
+        app_log(2, "        .  q-loop stitch V_full:     {0:.3f} sec", _Timer.elapsed("PAW_AUG.stitch"));
+        app_log(2, "        .  scatter V_full -> _dZ:    {0:.3f} sec", _Timer.elapsed("PAW_AUG.scatter"));
+      }
       app_log(2, " ");
 
       print_thc_summary();
@@ -454,6 +474,7 @@ namespace methods {
       // ---------------------------------------------------------------
       // 1) Augment X_shm: append Y rows below smooth ζ rows.
       // ---------------------------------------------------------------
+      _Timer.start("PAW_AUG.X_aug");
       auto X_old = _X_shm;
       int dim_s = _ns_in_basis * _npol_in_basis;
       auto X_new = math::shm::make_shared_array<Array_view_t<HOST_MEMORY,4>>(
@@ -480,6 +501,7 @@ namespace methods {
       }
       X_new.win().fence();
       _X_shm = X_new;
+      _Timer.stop("PAW_AUG.X_aug");
 
       // (For now, if x_range != y_range: also need to augment _Y_shm.
       //  Phase 4.2 only validates Hartree which uses X = Y; defer.)
@@ -491,6 +513,7 @@ namespace methods {
       // 2) Build augmented dZ: copy smooth GG block, fill GL/LL at q=0,
       //    add K_a at all q.
       // ---------------------------------------------------------------
+      _Timer.start("PAW_AUG.gather_smooth");
       auto _dZ_smooth = std::move(_dZ);
       // distribution: keep a single q-pool slab on rank 0 for simplicity
       // (matches the pattern used in build_from_CD).
@@ -528,11 +551,13 @@ namespace methods {
           for (long v = 0; v < _Np_smooth; ++v)
             V_full_q(iq, u, v) = Vq_smooth(u, v);
       }
+      _Timer.stop("PAW_AUG.gather_smooth");
 
       // ── Phase 4.3: per-q V_GL / V_LL via CoQui-side qvan2 ─────────────
       //
       // Build the angular-coupling tables once (depends only on max l of
       // any projector across all PAW species).
+      _Timer.start("PAW_AUG.aainit");
       int aainit_lli = 1;
       for (auto const& sp : _psp->paw_species_view()) {
         if (sp.lll.size() == 0) continue;
@@ -540,6 +565,7 @@ namespace methods {
           aainit_lli = std::max(aainit_lli, sp.lll(b) + 1);
       }
       auto aatab = hamilt::paw::aainit_tables_build(aainit_lli);
+      _Timer.stop("PAW_AUG.aainit");
 
       // Precompute per-species qrad(K, ijv, L) on a uniform |K|-grid so
       // each (q, G) becomes a 4-point cubic interpolation rather than a
@@ -563,11 +589,13 @@ namespace methods {
         }
       }
       double K_max = K_max_g + q_cart_max;
+      _Timer.start("PAW_AUG.qrad_tab");
       std::vector<hamilt::paw::qrad_tab> qrad_tabs;
       qrad_tabs.reserve(_psp->paw_species_view().size());
       for (auto const& sp : _psp->paw_species_view()) {
         qrad_tabs.push_back(hamilt::paw::build_qrad_tab(sp, K_max));
       }
+      _Timer.stop("PAW_AUG.qrad_tab");
       app_log(2, "  paw_aug: built qrad table for {} species, K_max={:.2f} a.u., "
                  "n_K={}", qrad_tabs.size(), K_max,
               qrad_tabs.empty() ? 0L : qrad_tabs.front().n_K);
@@ -600,9 +628,11 @@ namespace methods {
 
       for (int iq = 0; iq < _nqpts_ibz; ++iq) {
         // Add K_a (q-independent) at every q.
+        _Timer.start("PAW_AUG.K_a");
         for (long la = 0; la < _N_aug; ++la)
           for (long lb = 0; lb < _N_aug; ++lb)
             V_full_q(iq, _Np_smooth + la, _Np_smooth + lb) += K_LL_buf(la, lb);
+        _Timer.stop("PAW_AUG.K_a");
 
         // Smooth-aug Coulomb blocks: build at this q.
         // q_cart for the augmentation η^q is chosen to match thc's Coulomb
@@ -613,6 +643,7 @@ namespace methods {
             -Qpts_cart(iq, 0), -Qpts_cart(iq, 1), -Qpts_cart(iq, 2)};
 
         // Gather ζ_μ^q(G) for this iq across MPI.
+        _Timer.start("PAW_AUG.dzeta");
         zeta_mu_g() = ComplexType(0.0);
         for (auto [iq_l, iq_g] : itertools::enumerate(q_rng_owned)) {
           if (iq_g != iq) continue;
@@ -622,27 +653,37 @@ namespace methods {
         }
         _mpi->comm.all_reduce_in_place_n(zeta_mu_g.data(), zeta_mu_g.size(),
                                           std::plus<>{});
+        _Timer.stop("PAW_AUG.dzeta");
 
         // η^q on rho_g grid + q-shifted Coulomb weights.
+        _Timer.start("PAW_AUG.eta_at_q");
         auto eta_aug = hamilt::paw::build_eta_on_rho_g_at_q(
             *_psp, _isdf, rho_g, q_cart, omega, aatab, qrad_tabs);
+        _Timer.stop("PAW_AUG.eta_at_q");
+        _Timer.start("PAW_AUG.wG_at_q");
         auto wG_q = hamilt::paw::coulomb_weights_on_rho_g_at_q(
             rho_g, q_cart, omega);
+        _Timer.stop("PAW_AUG.wG_at_q");
 
         // V_GL and V_LL at this q. The compute_*_q0 routines are
         // q-agnostic in form — q dependence enters only through eta_aug
         // and wG_q.
         V_GL_buf() = ComplexType(0.0);
         V_LL_buf() = ComplexType(0.0);
+        _Timer.start("PAW_AUG.V_GL");
         hamilt::paw::compute_VGL_q0_on_rho_g(*_psp, _isdf, _aug_layout,
                                               zeta_mu_g, eta_aug, wG_q,
                                               V_GL_buf);
+        _Timer.stop("PAW_AUG.V_GL");
+        _Timer.start("PAW_AUG.V_LL");
         hamilt::paw::compute_VLL_q0_on_rho_g(*_psp, _isdf, _aug_layout,
                                               eta_aug, wG_q, V_LL_buf);
+        _Timer.stop("PAW_AUG.V_LL");
         for (auto& v : V_GL_buf) v *= omega;
         for (auto& v : V_LL_buf) v *= omega_sq;
 
         // Stitch into V_full_q[iq].
+        _Timer.start("PAW_AUG.stitch");
         for (long mu = 0; mu < _Np_smooth; ++mu)
           for (long la = 0; la < _N_aug; ++la) {
             ComplexType v = V_GL_buf(mu, la);
@@ -652,9 +693,11 @@ namespace methods {
         for (long la = 0; la < _N_aug; ++la)
           for (long lb = 0; lb < _N_aug; ++lb)
             V_full_q(iq, _Np_smooth + la, _Np_smooth + lb) += V_LL_buf(la, lb);
+        _Timer.stop("PAW_AUG.stitch");
       }
 
       // Scatter V_full_q into _dZ
+      _Timer.start("PAW_AUG.scatter");
       auto Z_loc = _dZ.local();
       auto qloc = _dZ.local_range(0);
       auto Ploc = _dZ.local_range(1);
@@ -664,6 +707,7 @@ namespace methods {
           for (auto [iQ_l, iQ] : itertools::enumerate(Qloc))
             Z_loc(iq_l, iP_l, iQ_l) = V_full_q(iq, iP, iQ);
       }
+      _Timer.stop("PAW_AUG.scatter");
 
       _Np = N_total;
     }
@@ -812,6 +856,21 @@ namespace methods {
       app_log(2, "      - gather collocation matrices: {0:.3f} sec", _Timer.elapsed("BUILD_GATHER"));
       if (_Timer.elapsed("BUILD_WRITE") > 0)
         app_log(2, "      - write eri:                   {0:.3f} sec", _Timer.elapsed("BUILD_WRITE"));
+      app_log(2, "      - paw augmentation total:      {0:.3f} sec", _Timer.elapsed("PAW_AUG"));
+      if (_paw_aug) {
+        app_log(2, "        .  X aug (Y rows x ks):      {0:.3f} sec", _Timer.elapsed("PAW_AUG.X_aug"));
+        app_log(2, "        .  gather smooth GG block:   {0:.3f} sec", _Timer.elapsed("PAW_AUG.gather_smooth"));
+        app_log(2, "        .  aainit (ap, lpx, lpl):    {0:.3f} sec", _Timer.elapsed("PAW_AUG.aainit"));
+        app_log(2, "        .  qrad table (per species): {0:.3f} sec", _Timer.elapsed("PAW_AUG.qrad_tab"));
+        app_log(2, "        .  q-loop dz gather:         {0:.3f} sec", _Timer.elapsed("PAW_AUG.dzeta"));
+        app_log(2, "        .  q-loop eta at q+G:        {0:.3f} sec", _Timer.elapsed("PAW_AUG.eta_at_q"));
+        app_log(2, "        .  q-loop wG at q+G:         {0:.3f} sec", _Timer.elapsed("PAW_AUG.wG_at_q"));
+        app_log(2, "        .  q-loop V_GL contraction:  {0:.3f} sec", _Timer.elapsed("PAW_AUG.V_GL"));
+        app_log(2, "        .  q-loop V_LL contraction:  {0:.3f} sec", _Timer.elapsed("PAW_AUG.V_LL"));
+        app_log(2, "        .  q-loop K_a inject:        {0:.3f} sec", _Timer.elapsed("PAW_AUG.K_a"));
+        app_log(2, "        .  q-loop stitch V_full:     {0:.3f} sec", _Timer.elapsed("PAW_AUG.stitch"));
+        app_log(2, "        .  scatter V_full -> _dZ:    {0:.3f} sec", _Timer.elapsed("PAW_AUG.scatter"));
+      }
       app_log(2, " ");
 
       print_thc_summary();
