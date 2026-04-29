@@ -107,6 +107,13 @@ struct real_axis_mb_state_t {
   std::optional<bosonic_dArray_t> ImW_qPQO;
   std::optional<bosonic_dArray_t> ReW_qPQO;
 
+  // Head channel of the inverse symmetric dielectric function at q->0,
+  // shape (N_Omega,), complex. Set by scr_coulomb_t::update_w when
+  // div_treatment != "ignore_g0"; consumed by gw_t::evaluate to apply
+  // the q=0 GW divergence correction. Same role as MBState::eps_inv_head
+  // on the imag-axis side.
+  std::optional<nda::array<ComplexType, 1>> eps_inv_head_O;
+
   // Default constructor leaves everything in a default-initialized state.
   real_axis_mb_state_t() = default;
 

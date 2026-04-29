@@ -204,8 +204,12 @@ inline scgw_result real_axis_scf_loop(real_axis_mb_state_t& state,
                                 /*verbose*/ false, use_rspace);
 
     // ---- 2. Sigma^c (gw) ----
+    // Forward the divergence treatment from scr_coulomb so the head
+    // correction in gw_t::evaluate sees the same setting that produced
+    // state.eps_inv_head_O.
     mb_solver.gw->evaluate(state, thc, cfg.eps_nufft,
-                           "ignore_g0", /*verbose*/ false, use_rspace);
+                           mb_solver.scr_eri->div_treatment(),
+                           /*verbose*/ false, use_rspace);
 
     // Causality projection on Im Sigma_c (skwij layout). Write only on
     // node-root, then node_sync.

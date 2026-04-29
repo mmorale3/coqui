@@ -30,6 +30,7 @@
 #include "methods/GW_real_axis/real_axis_pi.hpp"
 #include "methods/GW_real_axis/real_axis_dyson.hpp"
 #include "methods/GW_real_axis/real_axis_sigma.hpp"
+#include "methods/GW_real_axis/real_axis_div_utils.hpp"
 
 namespace methods {
 namespace solvers {
@@ -612,6 +613,47 @@ void real_axis_gw_t::evaluate(real_axis::real_axis_mb_state_t & state,
   state.ReSigma_wskij->node_sync();
   const double dt8 = sec_since(t8);
 
+  // ----------------------------------------------------------------
+  // Step 9: Sigma^head divergence correction (Gygi-Baldereschi style).
+  // Mirrors gw_t::Sigma_div_correction on the imag-axis side. Only applied
+  // when scr_coulomb_t::update_w has populated state.eps_inv_head_O
+  // (i.e. div_treatment != "ignore_g0").
+  //
+  // Direct quadrature over (s, k, w, w'), per-rank local nda::array
+  // scratch; then write back into state.{Im,Re}Sigma_wskij on node-root +
+  // node_sync so the sArrays remain consistent.
+  // ----------------------------------------------------------------
+  const auto t9 = t_now();
+  if (state.eps_inv_head_O.has_value() and div_treatment != "ignore_g0") {
+    const double madelung = MF.madelung();
+    auto chi_head_qP = thc.basis_head();    // (Nq, Naux), local copy
+    nda::array<ComplexType, 2> chi_head_buf(chi_head_qP);  // contiguous local
+
+    // Snapshot the orbital-basis Sigma into per-rank scratch buffers
+    // (so we can call the in-place updater locally and node-write the
+    // result via the standard pattern).
+    nda::array<ComplexType, 5> ImSig_local(N_w, ns, Nk, nbnd, nbnd);
+    nda::array<ComplexType, 5> ReSig_local(N_w, ns, Nk, nbnd, nbnd);
+    ImSig_local() = state.ImSigma_wskij->local();
+    ReSig_local() = state.ReSigma_wskij->local();
+
+    nda::array<ComplexType, 5> A_buf(state.A_wskij->local().shape());
+    A_buf() = state.A_wskij->local();
+
+    real_axis::apply_sigma_head_correction_real_axis(
+        conv, grid, madelung, *state.eps_inv_head_O,
+        chi_head_buf, X, A_buf,
+        ImSig_local, ReSig_local);
+
+    if (state.ImSigma_wskij->node_comm()->root()) {
+      state.ImSigma_wskij->local() = ImSig_local;
+      state.ReSigma_wskij->local() = ReSig_local;
+    }
+    state.ImSigma_wskij->node_sync();
+    state.ReSigma_wskij->node_sync();
+  }
+  const double dt9 = sec_since(t9);
+
   if (verbose and comm.root()) {
     const double dt_total = sec_since(t_total);
     app_log(2, "[real_axis_gw_t::evaluate] Naux={}, N_w={}, N_O={}, "
@@ -623,6 +665,7 @@ void real_axis_gw_t::evaluate(real_axis::real_axis_mb_state_t & state,
     app_log(2, "[real_axis_gw_t::evaluate]   step 6 Im Sigma  : {0:8.3f}", dt6);
     app_log(2, "[real_axis_gw_t::evaluate]   step 7 Re Sig (H): {0:8.3f}", dt7);
     app_log(2, "[real_axis_gw_t::evaluate]   step 8 backproj  : {0:8.3f}", dt8);
+    app_log(2, "[real_axis_gw_t::evaluate]   step 9 div corr  : {0:8.3f}", dt9);
     app_log(2, "[real_axis_gw_t::evaluate]   TOTAL            : {0:8.3f}", dt_total);
   }
 }

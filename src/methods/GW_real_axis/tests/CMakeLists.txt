@@ -23,6 +23,7 @@ if(ENABLE_FINUFFT)
       test_real_axis_scf_loop.cpp
       test_real_axis_hermiticity.cpp
       test_real_axis_dispatch.cpp
+      test_real_axis_div_correction.cpp
      )
 
   add_executable(test_${TEST_ID} ${TEST_SRCS})

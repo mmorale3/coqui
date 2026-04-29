@@ -147,10 +147,23 @@ inline void run_real_axis_gw(THC_t& thc, ptree const& pt)
   io::tolower(mix_kind_s);
 
   // ---- Validation ---------------------------------------------------------
-  utils::check(div_treat == "ignore_g0",
-               "real_axis_gw: only div_treatment=\"ignore_g0\" is supported "
-               "in this version (got \"{}\"). Gygi-Baldereschi for the "
-               "real-axis is open work.", div_treat);
+  // Accepted div_treatment values:
+  //   "ignore_g0"        -- skip q=Gamma, no head correction
+  //   "gygi_smallest_q"  -- use eps_inv_head from smallest-|q| in IBZ
+  //   "gygi"             -- alias for gygi_smallest_q until polynomial-fit
+  //                          extrapolation is ported from g0_div_utils
+  if (div_treat == "gygi") {
+    if (mpi->comm.root())
+      app_log(2, "real_axis_gw: div_treatment=\"gygi\" mapped to "
+                 "\"gygi_smallest_q\" -- polynomial-fit extrapolation is "
+                 "open work; the smallest-|q| estimate is used.");
+    div_treat = "gygi_smallest_q";
+  }
+  utils::check(div_treat == "ignore_g0" or div_treat == "gygi_smallest_q",
+               "real_axis_gw: div_treatment must be \"ignore_g0\" or "
+               "\"gygi_smallest_q\" (got \"{}\"). Polynomial-fit \"gygi\" "
+               "extrapolation is not yet ported from the imag-axis side.",
+               div_treat);
   utils::check(screen_t == "rpa",
                "real_axis_gw: only screen_type=\"rpa\" is supported (got "
                "\"{}\"). EDMFT/cRPA hooks are imag-axis only at present.",

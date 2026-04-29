@@ -34,6 +34,7 @@
 #include "methods/GW_real_axis/real_axis_thc_project.hpp"
 #include "methods/GW_real_axis/real_axis_pi.hpp"
 #include "methods/GW_real_axis/real_axis_dyson.hpp"
+#include "methods/GW_real_axis/real_axis_div_utils.hpp"
 
 namespace methods {
 namespace real_axis {
@@ -515,6 +516,38 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
     }
   }
   const double dt4 = sec_since(t4);
+
+  // ----------------------------------------------------------------
+  // Step 5: head of eps^-1 at q->0, for the GW divergence correction.
+  // Mirrors `g0_div_utils::eps_inv_head_t` on the imag-axis side. Computed
+  // unconditionally; gw_t::evaluate only consumes it when div_treatment
+  // is not "ignore_g0".
+  // Requires the full (Nq, Naux, Naux, N_Omega) W to project through
+  // chi_bar_head; gather from the distributed state on each rank since
+  // the cost is small (Nq * N_O scalar accumulations of length Naux^2).
+  // ----------------------------------------------------------------
+  if (_div_treatment != "ignore_g0") {
+    auto W_full = math::nda::all_gather_slow<HOST_MEMORY>(*state.ImW_qPQO);
+    auto Re_full = math::nda::all_gather_slow<HOST_MEMORY>(*state.ReW_qPQO);
+    // Combine Re + i Im into the complex W viewed by compute_eps_inv_head_O.
+    // (Re_full and W_full have the same shape; same with ImW_qPQO.)
+    nda::array<ComplexType, 4> W_complex(W_full.shape());
+    {
+      const long N = W_complex.size();
+      auto * dst = W_complex.data();
+      auto const* re = Re_full.data();
+      auto const* im = W_full.data();
+      for (long i = 0; i < N; ++i)
+        dst[i] = ComplexType(re[i].real(), im[i].real());
+    }
+    auto Qpts = nda::array<double, 2>(MF.Qpts());
+    auto chi_bar = nda::array<ComplexType, 2>(thc.basis_bar_head());
+    nda::array<ComplexType, 2> eps_inv_qO(Nq, N_O);
+    if (!state.eps_inv_head_O.has_value())
+      state.eps_inv_head_O = nda::array<ComplexType, 1>(N_O);
+    compute_eps_inv_head_O(W_complex, Qpts, chi_bar, MF.volume(),
+                           eps_inv_qO, *state.eps_inv_head_O);
+  }
 
   if (verbose and comm.root()) {
     const double dt_total = sec_since(t_total);
