@@ -98,6 +98,22 @@ struct real_axis_mb_state_t {
   std::optional<sArray_t<nda::array_view<ComplexType, 5>>> ReSigma_wskij;
   std::optional<sArray_t<nda::array_view<ComplexType, 4>>> Sigma_x_skij;
 
+  // Quasiparticle SCF fields. Allocated only by the QP-SCF driver
+  // (real_axis_qp_scf_loop); unused by the standard scGW path. Mirrors
+  // methods::MBState::{sF_skij, sMO_skia, sE_ska, sDm_skij} on the imag-axis side.
+  //
+  //   H_eff_skij  : effective one-body Hamiltonian (the QSGW iteration
+  //                 variable) -- (s, k, nbnd, nbnd) complex hermitian.
+  //   MO_skia     : MO coefficients in the primary basis -- column a is
+  //                 the a-th MO. (s, k, nbnd, nbnd).
+  //   E_ska       : MO eigenvalues in absolute energy. (s, k, nbnd).
+  //   Dm_skij     : density matrix in the primary basis,
+  //                 Dm_ij = sum_n MO(i,n) * f(eps_n - mu) * conj(MO(j,n)).
+  std::optional<sArray_t<nda::array_view<ComplexType, 4>>> H_eff_skij;
+  std::optional<sArray_t<nda::array_view<ComplexType, 4>>> MO_skia;
+  std::optional<sArray_t<nda::array_view<ComplexType, 3>>> E_ska;
+  std::optional<sArray_t<nda::array_view<ComplexType, 4>>> Dm_skij;
+
   // Bosonic fields, auxiliary basis. Indexing: (q, P, Q, Omega).
   // Distributed over (P, Q) with grid = (1, gridP, gridQ, 1). Each rank
   // holds a (Nq, Naux_loc_P, Naux_loc_Q, N_Omega) local slice; the q and

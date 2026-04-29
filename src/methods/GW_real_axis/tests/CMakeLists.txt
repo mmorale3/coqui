@@ -25,6 +25,7 @@ if(ENABLE_FINUFFT)
       test_real_axis_dispatch.cpp
       test_real_axis_div_correction.cpp
       test_real_axis_qp_solver.cpp
+      test_real_axis_qp_scf.cpp
      )
 
   add_executable(test_${TEST_ID} ${TEST_SRCS})
