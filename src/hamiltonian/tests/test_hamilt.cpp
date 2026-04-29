@@ -1460,6 +1460,74 @@ void test_paw_aug_q_eval_at_q0(mpi_context_t& mpi, mf::MF& mfobj,
   if (!any) app_log(2, "paw_aug_q_eval: no species with augmentation, skipped.");
 }
 
+/**
+ * Diagnostic: report how the per-species local-ISDF row count (nlambda)
+ * shrinks as the compression tolerance is relaxed. Helps decide whether
+ * the default tol=1e-12 (full-rank) is leaving any easy compression on
+ * the table for a given fixture.
+ */
+template<MEMORY_SPACE MEM>
+void test_paw_isdf_rank_vs_tol(mpi_context_t& mpi, mf::MF& mfobj,
+                                std::string const& label)
+{
+  hamilt::pseudopot V(mfobj);
+  auto const& sps = V.paw_species_view();
+  auto recv = mfobj.recv();
+  double det_B =
+      recv(0,0)*(recv(1,1)*recv(2,2) - recv(1,2)*recv(2,1))
+    - recv(1,0)*(recv(0,1)*recv(2,2) - recv(0,2)*recv(2,1))
+    + recv(2,0)*(recv(0,1)*recv(1,2) - recv(0,2)*recv(1,1));
+  double omega = (2.0*M_PI)*(2.0*M_PI)*(2.0*M_PI) / std::abs(det_B);
+  long nat = V.ityp_view().extent(0);
+
+  for (auto metric : {hamilt::paw::isdf_metric::Coulomb,
+                       hamilt::paw::isdf_metric::L2}) {
+    auto mname = std::string(hamilt::paw::metric_name(metric));
+    app_log(2, "=== local-ISDF rank vs tol [{} metric] ({}) ===", mname, label);
+    app_log(2, "  {:>18} {:>5} {:>10} {:>5} {:>5} {:>5} {:>5} {:>8}",
+            "species", "nh", "full-rank", "1e-3", "1e-6", "1e-9", "1e-12", "N_aug");
+    for (int nt = 0; nt < (int)sps.size(); ++nt) {
+      if (!(sps[nt].is_paw || sps[nt].is_uspp)) continue;
+      int nh_a = (int)V.nh_view()(nt);
+      int full = nh_a * nh_a;
+      int n3 = hamilt::paw::build_local_isdf_compressed_by_norm(
+                   V, nt, recv, omega, metric, 1e-3).nlambda;
+      int n6 = hamilt::paw::build_local_isdf_compressed_by_norm(
+                   V, nt, recv, omega, metric, 1e-6).nlambda;
+      int n9 = hamilt::paw::build_local_isdf_compressed_by_norm(
+                   V, nt, recv, omega, metric, 1e-9).nlambda;
+      int n12 = hamilt::paw::build_local_isdf_compressed_by_norm(
+                   V, nt, recv, omega, metric, 1e-12).nlambda;
+      int atoms_of_nt = 0;
+      for (long ia = 0; ia < nat; ++ia)
+        if ((int)V.ityp_view()(ia) == nt) ++atoms_of_nt;
+      app_log(2, "  {:>18} {:>5} {:>10} {:>5} {:>5} {:>5} {:>5} (×{} atoms = {})",
+              label, nh_a, full, n3, n6, n9, n12, atoms_of_nt, n12 * atoms_of_nt);
+    }
+  }
+}
+
+TEST_CASE("paw_isdf_rank_vs_tol", "[hamilt][paw][isdf]")
+{
+  auto& mpi = utils::make_unit_test_mpi_context();
+  SECTION("LiH PAW") {
+    auto mf = mf::default_MF(mpi, "qe_lih222_paw", mf::h5_input_type);
+    test_paw_isdf_rank_vs_tol<HOST_MEMORY>(*mpi, mf, "LiH PAW");
+  }
+  SECTION("LiH USPP") {
+    auto mf = mf::default_MF(mpi, "qe_lih222_uspp", mf::h5_input_type);
+    test_paw_isdf_rank_vs_tol<HOST_MEMORY>(*mpi, mf, "LiH USPP");
+  }
+  SECTION("Si PAW") {
+    auto mf = mf::default_MF(mpi, "qe_si222_paw", mf::h5_input_type);
+    test_paw_isdf_rank_vs_tol<HOST_MEMORY>(*mpi, mf, "Si PAW");
+  }
+  SECTION("Si USPP") {
+    auto mf = mf::default_MF(mpi, "qe_si222_uspp", mf::h5_input_type);
+    test_paw_isdf_rank_vs_tol<HOST_MEMORY>(*mpi, mf, "Si USPP");
+  }
+}
+
 TEST_CASE("paw_aug_q_eval_at_q0", "[hamilt][paw][isdf]")
 {
   auto& mpi = utils::make_unit_test_mpi_context();

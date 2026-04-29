@@ -270,6 +270,19 @@ namespace methods {
       }
       app_log(1, "  paw_aug: built compressed local-ISDF (metric={}, tol={:.1e}, nsp={})",
               hamilt::paw::metric_name(_paw_isdf_metric), _paw_isdf_tol, nsp);
+      // Per-species size breakdown — clarifies where N_aug comes from.
+      // Full-rank cap is nh² per atom: nh diagonal pairs + 2 × nh*(nh-1)/2
+      // off-diagonal sym/antisym rows. Compression drops parity/cutoff
+      // -forbidden (ij)-pairs whose qgm metric norm is below `tol`.
+      for (int nt = 0; nt < nsp; ++nt) {
+        if (_isdf[nt].nlambda == 0) continue;
+        int nh_nt = _isdf[nt].nh;
+        long nij  = (long)nh_nt * (nh_nt + 1) / 2;
+        app_log(1,
+            "  paw_aug:   species nt={}: nh={}, nij_max={}, "
+            "kept nlambda={} (full-rank cap={})",
+            nt, nh_nt, nij, _isdf[nt].nlambda, nh_nt * nh_nt);
+      }
 
       // Optionally save the cache.
       if (!_paw_isdf_cache_h5.empty() && _mpi->comm.root()) {
