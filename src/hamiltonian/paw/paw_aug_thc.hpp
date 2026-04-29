@@ -394,31 +394,22 @@ inline nda::array<double, 1> coulomb_weights_on_rho_g_at_q(
  * Output (caller-owned):
  *   V_GL(μ, Λ_aug)  for Λ_aug ∈ [0, N_A); accumulated additively.
  */
-inline void compute_VGL_q0_on_rho_g(
+/**
+ * Flatten (atom, lam, g) → (Λ, g) for the (nat, nlam_max, ngm)-shaped
+ * `eta_aug`. Accumulates into the caller-owned `eta_flat`. wG is NOT
+ * applied; use `flatten_eta_apply_wG` for the wG-multiplied flavour.
+ */
+inline void flatten_eta(
     pseudopot const& psp,
     std::vector<species_local_isdf> const& isdf,
     paw_aug_layout const& layout,
-    nda::ArrayOfRank<2> auto const& zeta_mu_g,
     nda::ArrayOfRank<3> auto const& eta_aug,
-    nda::ArrayOfRank<1> auto const& wG,
-    nda::ArrayOfRank<2> auto       & V_GL_out)
+    nda::ArrayOfRank<2> auto       & eta_flat)
 {
-    long N_mu = layout.N_mu;
-    long N_A  = layout.N_A;
-    if (N_A == 0 || N_mu == 0) return;
-    long ngm = wG.extent(0);
-    utils::check(zeta_mu_g.extent(0) == N_mu, "compute_VGL_q0: zeta_mu_g mu-dim");
-    utils::check(zeta_mu_g.extent(1) == ngm,  "compute_VGL_q0: zeta_mu_g G-dim");
-    utils::check(eta_aug.extent(2) == ngm,    "compute_VGL_q0: eta_aug G-dim");
-    utils::check(V_GL_out.extent(0) == N_mu,  "compute_VGL_q0: V_GL_out shape");
-    utils::check(V_GL_out.extent(1) == N_A,   "compute_VGL_q0: V_GL_out shape");
-
-    // Flatten (atom, lam, g) → (Λ, g), absorbing wG into η so the V_GL
-    // contraction Σ_g ζ × conj(η) × wG becomes a single complex GEMM:
-    //   V_GL(μ, Λ) = ζ(μ, g) × conj(η_w(Λ, g))^T = gemm(ζ, dagger(η_w)).
-    // Speedup over scalar nested loops: ~50–100× for Si-class fixtures.
-    nda::array<ComplexType, 2> eta_w(N_A, ngm);
-    eta_w() = ComplexType(0.0);
+    long N_A = layout.N_A;
+    long ngm = eta_aug.extent(2);
+    eta_flat() = ComplexType(0.0);
+    if (N_A == 0) return;
     auto const& ityp = psp.ityp_view();
     long nat = ityp.extent(0);
     for (long ia = 0; ia < nat; ++ia) {
@@ -429,10 +420,25 @@ inline void compute_VGL_q0_on_rho_g(
         long row0 = layout.atom_aug_offset[ia];
         for (int lam = 0; lam < nlam; ++lam)
             for (long g = 0; g < ngm; ++g)
-                eta_w(row0 + lam, g) = eta_aug(ia, lam, g) * wG(g);
+                eta_flat(row0 + lam, g) = eta_aug(ia, lam, g);
     }
-    // gemm: V_GL_out += ζ × dagger(η_w)
-    //   dagger(η_w) is (ngm × N_A), conj-transposed.
+}
+
+/**
+ * V_GL via GEMM, taking caller-provided scratch:
+ *   V_GL(μ, Λ) += Σ_g ζ(μ, g) × conj(η(Λ, g)) × wG(g)
+ *              = gemm(ζ, dagger(eta_w))
+ * where eta_w(Λ, g) = η(Λ, g) × wG(g) (caller fills before this call).
+ */
+inline void compute_VGL_q0_on_rho_g(
+    paw_aug_layout const& layout,
+    nda::ArrayOfRank<2> auto const& zeta_mu_g,
+    nda::ArrayOfRank<2> auto const& eta_w,
+    nda::ArrayOfRank<2> auto       & V_GL_out)
+{
+    long N_mu = layout.N_mu;
+    long N_A  = layout.N_A;
+    if (N_A == 0 || N_mu == 0) return;
     nda::blas::gemm(ComplexType(1.0), zeta_mu_g, nda::dagger(eta_w),
                     ComplexType(1.0), V_GL_out);
 }
@@ -447,44 +453,21 @@ inline void compute_VGL_q0_on_rho_g(
  *
  * Output: V_LL_out(N_A, N_A); accumulated additively.
  */
+/**
+ * V_LL via GEMM, taking caller-provided scratch:
+ *   V_LL(la, lb) += Σ_g conj(η(la, g)) × η(lb, g) × wG(g)
+ *                = gemm(eta_conj, transpose(eta_w))
+ * Caller is responsible for filling eta_conj = conj(η_flat) and
+ * eta_w = η_flat × wG before this call.
+ */
 inline void compute_VLL_q0_on_rho_g(
-    pseudopot const& psp,
-    std::vector<species_local_isdf> const& isdf,
     paw_aug_layout const& layout,
-    nda::ArrayOfRank<3> auto const& eta_aug,
-    nda::ArrayOfRank<1> auto const& wG,
+    nda::ArrayOfRank<2> auto const& eta_conj,
+    nda::ArrayOfRank<2> auto const& eta_w,
     nda::ArrayOfRank<2> auto       & V_LL_out)
 {
     long N_A = layout.N_A;
     if (N_A == 0) return;
-    long ngm = wG.extent(0);
-    utils::check(eta_aug.extent(2) == ngm, "compute_VLL_q0: eta_aug G-dim");
-    utils::check(V_LL_out.extent(0) == N_A, "compute_VLL_q0: V_LL_out shape");
-    utils::check(V_LL_out.extent(1) == N_A, "compute_VLL_q0: V_LL_out shape");
-
-    // Flatten (atom, lam, g) → (Λ, g), build eta_conj and eta_w, and do
-    // V_LL(la, lb) = Σ_g conj(η(la, g)) × η(lb, g) × wG(g)
-    //              = (eta_conj × transpose(eta_w))(la, lb)
-    // as a single complex GEMM. Speedup ~50–100× vs scalar nested loops
-    // for Si-class fixtures.
-    nda::array<ComplexType, 2> eta_conj(N_A, ngm);
-    nda::array<ComplexType, 2> eta_w(N_A, ngm);
-    eta_conj() = ComplexType(0.0);
-    eta_w()    = ComplexType(0.0);
-    auto const& ityp = psp.ityp_view();
-    long nat = ityp.extent(0);
-    for (long ia = 0; ia < nat; ++ia) {
-        int nt = ityp(ia);
-        if (nt >= (int)isdf.size()) continue;
-        int nlam = isdf[nt].nlambda;
-        if (nlam == 0) continue;
-        long row0 = layout.atom_aug_offset[ia];
-        for (int lam = 0; lam < nlam; ++lam)
-            for (long g = 0; g < ngm; ++g) {
-                eta_conj(row0 + lam, g) = std::conj(eta_aug(ia, lam, g));
-                eta_w   (row0 + lam, g) = eta_aug(ia, lam, g) * wG(g);
-            }
-    }
     nda::blas::gemm(ComplexType(1.0), eta_conj, nda::transpose(eta_w),
                     ComplexType(1.0), V_LL_out);
 }

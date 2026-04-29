@@ -174,9 +174,11 @@ namespace methods {
 
       for (auto &v: {"BUILD_TOTAL", "BUILD_THC", "BUILD_GATHER", "BUILD_WRITE",
                      "READ_X", "READ_V", "PAW_AUG",
+                     "PAW_AUG.dzeta_build",
                      "PAW_AUG.aainit", "PAW_AUG.qrad_tab", "PAW_AUG.dzeta",
                      "PAW_AUG.gather_smooth", "PAW_AUG.eta_at_q",
-                     "PAW_AUG.wG_at_q", "PAW_AUG.V_GL", "PAW_AUG.V_LL",
+                     "PAW_AUG.wG_at_q", "PAW_AUG.eta_flat",
+                     "PAW_AUG.V_GL", "PAW_AUG.V_LL",
                      "PAW_AUG.K_a", "PAW_AUG.stitch", "PAW_AUG.scatter",
                      "PAW_AUG.X_aug"})
         _Timer.add(v);
@@ -349,14 +351,28 @@ namespace methods {
 
       // ---- PAW augmentation (Phase 4.2: q=0 G-L/L-L; K_a at all q) ----
       // Done AFTER the * Nk scaling so smooth and aug both end up at (1/Ω).
-      if (_paw_aug) {
+      //
+      // Skip the entire augmentation dispatch (including the expensive
+      // `evaluate_isdf_only` re-build of dζ_quG) when no species carries
+      // augmentation data. NCPP-only fixtures hit this path and would
+      // otherwise pay ~20s for the dζ build to drop into a function that
+      // immediately returns at N_A == 0.
+      bool any_aug_species = false;
+      if (_paw_aug && _psp != nullptr) {
+        for (auto const& sp : _psp->paw_species_view()) {
+          if (sp.is_paw || sp.is_uspp) { any_aug_species = true; break; }
+        }
+      }
+      if (_paw_aug && any_aug_species) {
         _Timer.start("PAW_AUG");
         auto dispatch = [&]<MEMORY_SPACE MEM>() {
+          _Timer.start("PAW_AUG.dzeta_build");
           auto [ri,dXa,dXb] = _thc_builder_opt.value().interpolating_points<MEM>(
               0, _Np_smooth, x_range, y_range);
           (void)ri;
           auto dzeta_quG = _thc_builder_opt.value().template evaluate_isdf_only<MEM>(
               ri, dXa, dXb, x_range, y_range);
+          _Timer.stop("PAW_AUG.dzeta_build");
           augment_thc_with_paw<MEM>(dzeta_quG);
         };
         if (_MEM_EVAL == HOST_MEMORY) dispatch.template operator()<HOST_MEMORY>();
@@ -420,6 +436,7 @@ namespace methods {
         app_log(2, "      - write eri:                   {0:.3f} sec", _Timer.elapsed("BUILD_WRITE"));
       app_log(2, "      - paw augmentation total:      {0:.3f} sec", _Timer.elapsed("PAW_AUG"));
       if (_paw_aug) {
+        app_log(2, "        .  dzeta_quG build:          {0:.3f} sec", _Timer.elapsed("PAW_AUG.dzeta_build"));
         app_log(2, "        .  X aug (Y rows x ks):      {0:.3f} sec", _Timer.elapsed("PAW_AUG.X_aug"));
         app_log(2, "        .  gather smooth GG block:   {0:.3f} sec", _Timer.elapsed("PAW_AUG.gather_smooth"));
         app_log(2, "        .  aainit (ap, lpx, lpl):    {0:.3f} sec", _Timer.elapsed("PAW_AUG.aainit"));
@@ -427,6 +444,7 @@ namespace methods {
         app_log(2, "        .  q-loop dz gather:         {0:.3f} sec", _Timer.elapsed("PAW_AUG.dzeta"));
         app_log(2, "        .  q-loop eta at q+G:        {0:.3f} sec", _Timer.elapsed("PAW_AUG.eta_at_q"));
         app_log(2, "        .  q-loop wG at q+G:         {0:.3f} sec", _Timer.elapsed("PAW_AUG.wG_at_q"));
+        app_log(2, "        .  q-loop eta flatten/conj:  {0:.3f} sec", _Timer.elapsed("PAW_AUG.eta_flat"));
         app_log(2, "        .  q-loop V_GL contraction:  {0:.3f} sec", _Timer.elapsed("PAW_AUG.V_GL"));
         app_log(2, "        .  q-loop V_LL contraction:  {0:.3f} sec", _Timer.elapsed("PAW_AUG.V_LL"));
         app_log(2, "        .  q-loop K_a inject:        {0:.3f} sec", _Timer.elapsed("PAW_AUG.K_a"));
@@ -625,6 +643,13 @@ namespace methods {
       nda::array<ComplexType,2> zeta_mu_g(_Np_smooth, rho_g_size);
       nda::array<ComplexType,2> V_GL_buf(_Np_smooth, _N_aug);
       nda::array<ComplexType,2> V_LL_buf(_N_aug, _N_aug);
+      // Hoist V_GL/V_LL gemm scratch out of the q-loop. eta_flat(la, g) is
+      // the per-q η_aλ(G) flattened to (Λ, g); eta_w(la, g) = η × wG is
+      // shared between V_GL and V_LL; eta_conj(la, g) = conj(η) is needed
+      // for V_LL only. All three are (N_A × ngm) — re-used each q.
+      nda::array<ComplexType,2> eta_flat(_N_aug, rho_g_size);
+      nda::array<ComplexType,2> eta_w   (_N_aug, rho_g_size);
+      nda::array<ComplexType,2> eta_conj(_N_aug, rho_g_size);
 
       for (int iq = 0; iq < _nqpts_ibz; ++iq) {
         // Add K_a (q-independent) at every q.
@@ -665,19 +690,27 @@ namespace methods {
             rho_g, q_cart, omega);
         _Timer.stop("PAW_AUG.wG_at_q");
 
-        // V_GL and V_LL at this q. The compute_*_q0 routines are
-        // q-agnostic in form — q dependence enters only through eta_aug
-        // and wG_q.
+        // Build per-q scratch (eta_flat, eta_w, eta_conj) ONCE — V_GL
+        // and V_LL share eta_w, V_LL also needs eta_conj.
+        _Timer.start("PAW_AUG.eta_flat");
+        hamilt::paw::flatten_eta(*_psp, _isdf, _aug_layout, eta_aug, eta_flat);
+        for (long la = 0; la < _N_aug; ++la)
+          for (long g = 0; g < (long)rho_g_size; ++g) {
+            eta_w(la, g)    = eta_flat(la, g) * wG_q(g);
+            eta_conj(la, g) = std::conj(eta_flat(la, g));
+          }
+        _Timer.stop("PAW_AUG.eta_flat");
+
+        // V_GL and V_LL at this q via single ZGEMM each.
         V_GL_buf() = ComplexType(0.0);
         V_LL_buf() = ComplexType(0.0);
         _Timer.start("PAW_AUG.V_GL");
-        hamilt::paw::compute_VGL_q0_on_rho_g(*_psp, _isdf, _aug_layout,
-                                              zeta_mu_g, eta_aug, wG_q,
-                                              V_GL_buf);
+        hamilt::paw::compute_VGL_q0_on_rho_g(_aug_layout, zeta_mu_g,
+                                              eta_w, V_GL_buf);
         _Timer.stop("PAW_AUG.V_GL");
         _Timer.start("PAW_AUG.V_LL");
-        hamilt::paw::compute_VLL_q0_on_rho_g(*_psp, _isdf, _aug_layout,
-                                              eta_aug, wG_q, V_LL_buf);
+        hamilt::paw::compute_VLL_q0_on_rho_g(_aug_layout, eta_conj,
+                                              eta_w, V_LL_buf);
         _Timer.stop("PAW_AUG.V_LL");
         for (auto& v : V_GL_buf) v *= omega;
         for (auto& v : V_LL_buf) v *= omega_sq;
@@ -858,6 +891,7 @@ namespace methods {
         app_log(2, "      - write eri:                   {0:.3f} sec", _Timer.elapsed("BUILD_WRITE"));
       app_log(2, "      - paw augmentation total:      {0:.3f} sec", _Timer.elapsed("PAW_AUG"));
       if (_paw_aug) {
+        app_log(2, "        .  dzeta_quG build:          {0:.3f} sec", _Timer.elapsed("PAW_AUG.dzeta_build"));
         app_log(2, "        .  X aug (Y rows x ks):      {0:.3f} sec", _Timer.elapsed("PAW_AUG.X_aug"));
         app_log(2, "        .  gather smooth GG block:   {0:.3f} sec", _Timer.elapsed("PAW_AUG.gather_smooth"));
         app_log(2, "        .  aainit (ap, lpx, lpl):    {0:.3f} sec", _Timer.elapsed("PAW_AUG.aainit"));
@@ -865,6 +899,7 @@ namespace methods {
         app_log(2, "        .  q-loop dz gather:         {0:.3f} sec", _Timer.elapsed("PAW_AUG.dzeta"));
         app_log(2, "        .  q-loop eta at q+G:        {0:.3f} sec", _Timer.elapsed("PAW_AUG.eta_at_q"));
         app_log(2, "        .  q-loop wG at q+G:         {0:.3f} sec", _Timer.elapsed("PAW_AUG.wG_at_q"));
+        app_log(2, "        .  q-loop eta flatten/conj:  {0:.3f} sec", _Timer.elapsed("PAW_AUG.eta_flat"));
         app_log(2, "        .  q-loop V_GL contraction:  {0:.3f} sec", _Timer.elapsed("PAW_AUG.V_GL"));
         app_log(2, "        .  q-loop V_LL contraction:  {0:.3f} sec", _Timer.elapsed("PAW_AUG.V_LL"));
         app_log(2, "        .  q-loop K_a inject:        {0:.3f} sec", _Timer.elapsed("PAW_AUG.K_a"));
