@@ -541,6 +541,37 @@ namespace methods {
       }
       auto aatab = hamilt::paw::aainit_tables_build(aainit_lli);
 
+      // Precompute per-species qrad(K, ijv, L) on a uniform |K|-grid so
+      // each (q, G) becomes a 4-point cubic interpolation rather than a
+      // full radial Bessel transform (analogue of QE's tab_qrad).
+      // K_max = max |q + G| over the full rho_g grid + IBZ q-points,
+      // padded by one dq for safety.
+      double K_max_g = 0.0;
+      {
+        auto const& gv = rho_g.g_vectors();
+        for (long ig = 0; ig < (long)rho_g.size(); ++ig) {
+          double g2 = gv(ig,0)*gv(ig,0) + gv(ig,1)*gv(ig,1) + gv(ig,2)*gv(ig,2);
+          K_max_g = std::max(K_max_g, std::sqrt(g2));
+        }
+      }
+      double q_cart_max = 0.0;
+      {
+        auto Qpc = _MF->Qpts();
+        for (long iq = 0; iq < _nqpts_ibz; ++iq) {
+          double q2 = Qpc(iq,0)*Qpc(iq,0) + Qpc(iq,1)*Qpc(iq,1) + Qpc(iq,2)*Qpc(iq,2);
+          q_cart_max = std::max(q_cart_max, std::sqrt(q2));
+        }
+      }
+      double K_max = K_max_g + q_cart_max;
+      std::vector<hamilt::paw::qrad_tab> qrad_tabs;
+      qrad_tabs.reserve(_psp->paw_species_view().size());
+      for (auto const& sp : _psp->paw_species_view()) {
+        qrad_tabs.push_back(hamilt::paw::build_qrad_tab(sp, K_max));
+      }
+      app_log(2, "  paw_aug: built qrad table for {} species, K_max={:.2f} a.u., "
+                 "n_K={}", qrad_tabs.size(), K_max,
+              qrad_tabs.empty() ? 0L : qrad_tabs.front().n_K);
+
       // Convention scaling — V_LL needs Ω², V_GL needs Ω. See the
       // detailed derivation in the q=0 phase note (V_LL_buf carries one
       // 1/Ω from wG; the smooth ζ_code carries one Ω; bare η_QE has no Ω).
@@ -594,7 +625,7 @@ namespace methods {
 
         // η^q on rho_g grid + q-shifted Coulomb weights.
         auto eta_aug = hamilt::paw::build_eta_on_rho_g_at_q(
-            *_psp, _isdf, rho_g, q_cart, omega, aatab);
+            *_psp, _isdf, rho_g, q_cart, omega, aatab, qrad_tabs);
         auto wG_q = hamilt::paw::coulomb_weights_on_rho_g_at_q(
             rho_g, q_cart, omega);
 

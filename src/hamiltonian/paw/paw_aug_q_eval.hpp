@@ -315,6 +315,125 @@ inline aainit_tables aainit_tables_build(int lli)
  *
  * (No 4π or i^L — those are applied by the caller in the qvan2 sum.)
  */
+/**
+ * Per-species precomputed radial Bessel table — analogue of QE's tab_qrad.
+ *
+ *   tab(iK, ijv, L) = ∫ qfuncl(L, ijv, r) j_L(K_iK r) dr,    K_iK = iK · dq
+ *
+ * Filled once per species over `iK ∈ [0, n_K)`. Runtime evaluation is a
+ * 4-point cubic interpolation in iK (`qrad_interp_at_K` below). Replaces
+ * the per-(q+G) Bessel transform inside `build_eta_on_rho_g_at_q` and
+ * brings Si-class fixtures (lmax=2, Lmax_aug=4, ngm~5000) from minutes
+ * per q to milliseconds per q. (4π/Ω) prefactor is baked in (matches
+ * QE's tab_qrad convention).
+ */
+struct qrad_tab {
+    double dq      = 0.01;     // grid spacing in cartesian a.u.
+    long   n_K     = 0;        // number of grid points
+    nda::array<double, 3> tab; // (n_K, n_ijv, Lp1) — flattened for fast iK access
+};
+
+/**
+ * Build a qrad table for one species, sampling K in [0, K_max + safety) on
+ * a uniform grid of spacing dq. The Bessel quadrature uses Simpson's rule
+ * on the species's UPF radial mesh (no extra r² — qfuncl carries it).
+ *
+ * Bare radial integral (no 4π/Ω prefactor) — callers (build_eta_on_rho_g_at_q,
+ * evaluate_Q_IJ_at_K) apply that factor at the end of their angular sum.
+ */
+template<typename SpeciesPawT>
+inline qrad_tab build_qrad_tab(
+    SpeciesPawT const& sp,
+    double K_max,
+    double dq = 0.01)
+{
+    qrad_tab T;
+    T.dq = dq;
+    if (sp.qfuncl.size() == 0) return T;
+    long Lp1   = sp.qfuncl.extent(0);
+    long n_ijv = sp.qfuncl.extent(1);
+    long mesh_full = sp.qfuncl.extent(2);
+    if (mesh_full == 0) return T;
+
+    // QE pattern: integrate only out to kkbeta (the projector cutoff radius).
+    // qfuncl is zero beyond kkbeta by construction, so extending to mesh
+    // wastes 5–10× of the radial work for typical UPFs.
+    long mesh = (sp.kkbeta > 0 && sp.kkbeta <= (int)mesh_full)
+              ? (long)sp.kkbeta : mesh_full;
+
+    // 3 extra grid points to allow 4-point cubic interpolation up through
+    // the highest sampled K without indexing past the end.
+    T.n_K = (long)std::ceil(K_max / dq) + 4;
+    T.tab = nda::array<double, 3>::zeros({T.n_K, n_ijv, Lp1});
+
+    long N = (mesh % 2 == 1) ? mesh : mesh - 1;  // odd for Simpson
+    using boost::math::sph_bessel;
+
+    // Precompute Simpson weights × rab (same for all iK, L, ijv).
+    nda::array<double, 1> simp(N);
+    {
+        simp(0)     = sp.rab(0);
+        simp(N - 1) = sp.rab(N - 1);
+        double fct = 4.0;
+        int sg = -1;
+        for (long i = 1; i < N - 1; ++i) {
+            simp(i) = fct * sp.rab(i);
+            fct += sg * 2.0;
+            sg = -sg;
+        }
+    }
+    nda::array<double, 1> besr(N);
+    for (long iK = 0; iK < T.n_K; ++iK) {
+        double K = (double)iK * dq;
+        for (long L = 0; L < Lp1; ++L) {
+            // Cache j_L(K·r) once for this (iK, L) — independent of ijv.
+            for (long i = 0; i < N; ++i) {
+                double Kr = K * sp.r(i);
+                besr(i) = (std::abs(Kr) < 1e-30) ? (L == 0 ? 1.0 : 0.0)
+                                                 : sph_bessel((unsigned int)L, Kr);
+            }
+            for (long ijv = 0; ijv < n_ijv; ++ijv) {
+                double F = 0.0;
+                for (long i = 0; i < N; ++i)
+                    F += simp(i) * sp.qfuncl(L, ijv, i) * besr(i);
+                T.tab(iK, ijv, L) = F / 3.0;
+            }
+        }
+    }
+    return T;
+}
+
+/**
+ * 4-point cubic interpolation of qrad at arbitrary K, matching the formula
+ * in QE/upflib/qvan2.f90 lines 143-157. Returns an array of length Lp1
+ * with the per-L radial values for the requested ijv.
+ */
+inline nda::array<double, 1> qrad_interp_at_K(
+    qrad_tab const& T, int ijv, double K)
+{
+    long Lp1 = T.tab.extent(2);
+    nda::array<double, 1> out(Lp1);
+    out() = 0.0;
+    if (T.n_K == 0) return out;
+    double qm = K / T.dq;
+    long i0 = (long)std::floor(qm);
+    if (i0 < 0) i0 = 0;
+    if (i0 + 3 >= T.n_K) i0 = T.n_K - 4;
+    double px = qm - (double)i0;
+    double ux = 1.0 - px;
+    double vx = 2.0 - px;
+    double wx = 3.0 - px;
+    double uvx = ux * vx * (1.0 / 6.0);
+    double pwx = px * wx * 0.5;
+    for (long L = 0; L < Lp1; ++L) {
+        out(L) = T.tab(i0,     ijv, L) * uvx * wx
+               + T.tab(i0 + 1, ijv, L) * pwx * vx
+               - T.tab(i0 + 2, ijv, L) * pwx * ux
+               + T.tab(i0 + 3, ijv, L) * px * uvx;
+    }
+    return out;
+}
+
 template<typename SpeciesPawT>
 inline nda::array<double, 1> qrad_at_K(
     SpeciesPawT const& sp, int ij, double K)

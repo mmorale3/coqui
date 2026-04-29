@@ -204,9 +204,10 @@ inline nda::array<ComplexType, 3> build_eta_on_rho_g_q0(
  * Coulomb kernel convention used in V_GG (thc.icc evaluates the kernel at
  * |G - Q_thc|, so q_cart = -Q_thc(iq) here).
  *
- * Optimization: precompute the radial Bessel transforms qrad(L, ij, G)
- * once per (species, ij) over the entire G grid (atom-independent), then
- * the per-atom angular sum is O(N_λ × n_lp × ngm).
+ * `qrad_tabs[nt]` is a precomputed radial Bessel table (built once per
+ * species via `build_qrad_tab`) — the runtime cost per (q, G) drops from
+ * O(L × mesh) Bessel evaluations to O(L) cubic interpolation, the same
+ * amortization QE uses (qrad_mod.f90 / qvan2.f90).
  */
 inline nda::array<ComplexType, 3> build_eta_on_rho_g_at_q(
     pseudopot const& psp,
@@ -214,7 +215,8 @@ inline nda::array<ComplexType, 3> build_eta_on_rho_g_at_q(
     grids::truncated_g_grid const& rho_g,
     std::array<double, 3> const& q_cart,
     double omega,
-    aainit_tables const& aatab)
+    aainit_tables const& aatab,
+    std::vector<qrad_tab> const& qrad_tabs)
 {
     long ngm_rho = rho_g.size();
     auto const& ityp = psp.ityp_view();
@@ -263,13 +265,17 @@ inline nda::array<ComplexType, 3> build_eta_on_rho_g_at_q(
 
         long Lp1   = sp.qfuncl.extent(0);
         long n_ijv = sp.qfuncl.extent(1);
-        // qrad_g(L, ij, g) = ∫ qfuncl(L, ij, r) j_L(|q+G|·r) dr  (no extra r²;
-        // qfuncl already carries it per UPF convention).
+        // qrad_g(L, ij, g) = qrad_tab interpolated at |q+G|. Cubic 4-point
+        // interpolation in iK = K/dq (matches QE's qvan2.f90:143-157).
         nda::array<double, 3> qrad_g(Lp1, n_ijv, ngm_rho);
         qrad_g() = 0.0;
+        utils::check((long)qrad_tabs.size() > nt && qrad_tabs[nt].n_K > 0,
+                     "build_eta_on_rho_g_at_q: missing qrad_tab for species nt={}",
+                     nt);
+        auto const& Tt = qrad_tabs[nt];
         for (long g = 0; g < ngm_rho; ++g) {
             for (long ijv = 0; ijv < n_ijv; ++ijv) {
-                auto qrL = qrad_at_K(sp, (int)ijv, Kmod(g));
+                auto qrL = qrad_interp_at_K(Tt, (int)ijv, Kmod(g));
                 for (long L = 0; L < Lp1; ++L) qrad_g(L, ijv, g) = qrL(L);
             }
         }
