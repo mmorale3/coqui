@@ -1568,10 +1568,15 @@ void test_thc_paw_hermiticity(mpi_context_t& mpi,
   methods::thc_reader_t thc(mf_ptr, thc_pt);
 
   // Gather V_full(q, P, Q) for all q on rank 0 for the comparison.
+  // Distribute across q to match comm.size(), then gather to root.
   long Np = thc.Np();
-  auto dZ_qPQ = thc.template dZ<HOST_MEMORY>({1, 1, 1}, {0, 0, 0});
+  auto dZ_qPQ = thc.template dZ<HOST_MEMORY>(
+      {(long)mpi.comm.size(), 1, 1}, {0, 0, 0});
+  nda::array<ComplexType, 3> V;
+  if (mpi.comm.root())
+    V = nda::array<ComplexType, 3>(dZ_qPQ.global_shape());
+  math::nda::gather(0, dZ_qPQ, &V);
   if (!mpi.comm.root()) return;
-  auto V = dZ_qPQ.local();   // shape (nq_ibz, Np, Np)
 
   double max_dev = 0.0;
   double max_val = 0.0;

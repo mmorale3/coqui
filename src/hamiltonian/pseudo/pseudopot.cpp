@@ -104,8 +104,8 @@ pseudopot::pseudopot(MF_t &mf, std::string const filename) :
     app_log(2,"  Device support enabled.");
 #endif
     if(filename != "" or mf.input_file_type() == mf::h5_input_type) {
-      input_file_name = (filename != ""?filename:mf.filename()); 
-      utils::check(std::filesystem::exists(input_file_name), "Error: Missing file: {}",input_file_name); 
+      input_file_name = (filename != ""?filename:mf.filename());
+      utils::check(std::filesystem::exists(input_file_name), "Error: Missing file: {}",input_file_name);
       h5::file file;
       try {
         file = h5::file(input_file_name, 'r');
@@ -344,7 +344,7 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
 {
   using nda::range;
   decltype(range::all) all;
-  std::string type(""); 
+  std::string type("");
 
   h5::group grp1 = grp0.open_group("Hamiltonian");
   h5::h5_read_attribute(grp1, "pp_type", type);
@@ -414,7 +414,12 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
   if(mpi->comm.root()) {
     int ngm;
     h5::h5_read_attribute(grp,"ngm",ngm);
-    nda::array<long,1> k2g(ngm); 
+    // Cache the dense-grid size on the member here so the USPP/PAW broadcast
+    // block below propagates the correct value to non-root ranks (otherwise
+    // ngm_dense stayed 0 on root and the subsequent miller_g_dense broadcast
+    // had a count mismatch under MPI > 1).
+    ngm_dense = ngm;
+    nda::array<long,1> k2g(ngm);
 
     {
       nda::array<int,2> mill_g(ngm,3);
@@ -486,7 +491,7 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
 
   // miller_g_dense was populated only on mpi.comm.root above; replicate.
   {
-    int ngm_attr = (int)ngm_dense; // 0 for ncpp until set; broadcast it too
+    int ngm_attr = (int)ngm_dense;
     if (ptype == pp_uspp_t || ptype == pp_paw_t) {
       // ngm_dense was set on root inside the uspp/paw branch above
       mpi->comm.broadcast_value(ngm_attr);
@@ -779,6 +784,79 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
           }
         }
       }
+    }
+    mpi->comm.barrier();
+
+    // Broadcast paw_species data to non-root ranks. The h5 read above only
+    // executes on comm.root; without this broadcast, downstream consumers
+    // (paw_thc_kernel, paw_aug_q_eval, local_isdf, hartree_xc_energy) get
+    // empty species data on non-root ranks and either silently skip work
+    // or hang on collective ops triggered by inconsistent metadata.
+    auto bcast_array_1 = [this](nda::array<double,1>& a) {
+      long sz = a.size();
+      mpi->comm.broadcast_value(sz);
+      if (!mpi->comm.root()) a.resize(sz);
+      if (sz > 0) mpi->comm.broadcast_n(a.data(), sz, 0);
+    };
+    auto bcast_array_2 = [this](nda::array<double,2>& a) {
+      std::array<long,2> sh{a.shape()[0], a.shape()[1]};
+      mpi->comm.broadcast_n(sh.data(), 2, 0);
+      if (!mpi->comm.root()) a = nda::array<double,2>::zeros({sh[0], sh[1]});
+      long sz = sh[0]*sh[1];
+      if (sz > 0) mpi->comm.broadcast_n(a.data(), sz, 0);
+    };
+    auto bcast_array_3 = [this](nda::array<double,3>& a) {
+      std::array<long,3> sh{a.shape()[0], a.shape()[1], a.shape()[2]};
+      mpi->comm.broadcast_n(sh.data(), 3, 0);
+      if (!mpi->comm.root()) a = nda::array<double,3>::zeros({sh[0], sh[1], sh[2]});
+      long sz = sh[0]*sh[1]*sh[2];
+      if (sz > 0) mpi->comm.broadcast_n(a.data(), sz, 0);
+    };
+    auto bcast_array_4 = [this](nda::array<double,4>& a) {
+      std::array<long,4> sh{a.shape()[0], a.shape()[1], a.shape()[2], a.shape()[3]};
+      mpi->comm.broadcast_n(sh.data(), 4, 0);
+      if (!mpi->comm.root()) a = nda::array<double,4>::zeros({sh[0], sh[1], sh[2], sh[3]});
+      long sz = sh[0]*sh[1]*sh[2]*sh[3];
+      if (sz > 0) mpi->comm.broadcast_n(a.data(), sz, 0);
+    };
+    auto bcast_iarray_1 = [this](nda::array<int,1>& a) {
+      long sz = a.size();
+      mpi->comm.broadcast_value(sz);
+      if (!mpi->comm.root()) a.resize(sz);
+      if (sz > 0) mpi->comm.broadcast_n(a.data(), sz, 0);
+    };
+    for (int nt = 0; nt < nsp; ++nt) {
+      auto& sp = paw_species[nt];
+      // scalars
+      mpi->comm.broadcast_value(sp.is_paw);
+      mpi->comm.broadcast_value(sp.is_uspp);
+      mpi->comm.broadcast_value(sp.mesh);
+      mpi->comm.broadcast_value(sp.nbeta);
+      mpi->comm.broadcast_value(sp.kkbeta);
+      mpi->comm.broadcast_value(sp.nh);
+      mpi->comm.broadcast_value(sp.lmax_aug);
+      mpi->comm.broadcast_value(sp.raug);
+      mpi->comm.broadcast_value(sp.iraug);
+      mpi->comm.broadcast_value(sp.ncore_orbitals);
+      // mandatory arrays (always present for USPP/PAW; size 0 otherwise)
+      bcast_array_1(sp.r);
+      bcast_array_1(sp.rab);
+      bcast_array_2(sp.aewfc);
+      bcast_array_2(sp.pswfc);
+      bcast_array_3(sp.qfuncl);
+      bcast_iarray_1(sp.lll);
+      bcast_iarray_1(sp.nhtol);
+      bcast_iarray_1(sp.nhtolm);
+      bcast_iarray_1(sp.indv);
+      bcast_array_4(sp.deltaC);
+      bcast_array_3(sp.pfunc);
+      bcast_array_3(sp.ptfunc);
+      bcast_array_3(sp.augmom);
+      bcast_array_1(sp.ae_vloc);
+      bcast_array_1(sp.ae_rho_atc);
+      bcast_array_1(sp.core_n);
+      bcast_array_1(sp.core_l);
+      bcast_array_2(sp.core_aewfc);
     }
     mpi->comm.barrier();
   }

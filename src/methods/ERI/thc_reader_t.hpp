@@ -312,7 +312,7 @@ namespace methods {
 
       _Timer.start("BUILD_THC");
       {
-        auto eval = [&]<MEMORY_SPACE MEM>() { 
+        auto eval = [&]<MEMORY_SPACE MEM>() {
           auto [ri,dXa,dXb] = _thc_builder_opt.value().interpolating_points<MEM>(0, _Np, x_range, y_range);
           _rp = std::move(ri);
           _Np = _rp.size();
