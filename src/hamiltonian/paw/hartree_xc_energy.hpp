@@ -31,6 +31,7 @@
 #include "utilities/mpi_context.h"
 #include "numerics/fft/nda.hpp"
 #include "numerics/distributed_array/nda.hpp"
+#include "numerics/distributed_array/nda_utils.hpp"
 #include "hamiltonian/pseudo/pseudopot.h"
 #include "hamiltonian/paw/v_h_paw.hpp"
 #include "utilities/kpoint_utils.hpp"
@@ -81,6 +82,14 @@ inline nda::array<double, 1> build_total_density_r(
     nda::array<double, 1> rho(nnr);
     rho() = 0.0;
 
+    // Gather distributed psi to root. Collective: all ranks call. Only root
+    // allocates the gather buffer at the global shape; other ranks pass nullptr.
+    using local_psi_t = typename std::decay_t<Psi_t>::Array_t;
+    local_psi_t psi_full;
+    if (mpi.comm.root())
+        psi_full = local_psi_t(psi.global_shape());
+    math::nda::gather(0, psi, &psi_full);
+
     if (mpi.comm.root()) {
         // ---- Smooth density: ρ_smooth(r) = (ns_scl/N_k) Σ f |ψ|² ----
         nda::array<ComplexType, 1> psi_g(nnr);
@@ -94,7 +103,6 @@ inline nda::array<double, 1> build_total_density_r(
         Gs() = 0.0;
         memory::array<HOST_MEMORY, long, 1> k2g_rot(k2g.shape(0));
 
-        auto ploc = psi.local();
         for (long s = 0; s < nspin; ++s)
         for (long k = 0; k < nk; ++k) {
             long k_sym = kp_to_ibz(k);
@@ -115,7 +123,7 @@ inline nda::array<double, 1> build_total_density_r(
                 for (long g = 0; g < ngm; ++g) {
                     long N = k2g_rot(g);
                     if (N >= 0 && N < nnr)
-                        psi_g(N) = ploc(s, k_sym, n, p*ngm + g);
+                        psi_g(N) = psi_full(s, k_sym, n, p*ngm + g);
                 }
                 // G → r (un-normalized)
                 F.backward(psi_g3d);
