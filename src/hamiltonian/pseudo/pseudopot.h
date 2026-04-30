@@ -103,8 +103,48 @@ class pseudopot
   nda::array<double,2> const& atom_pos_cart_view() const { return atom_pos_cart; }
   long ngm_dense_get() const { return ngm_dense; }
 
-  // Read-only access to per-species PAW data (qfuncl, deltaC, partial waves
-  // and friends). Empty entry for non-PAW species — check is_paw before use.
+  // Per-species PAW data (qfuncl, deltaC, partial waves, projector metadata,
+  // GIPAW core orbitals). Populated from /Hamiltonian/Species/{nt}/ in
+  // `read_vnl_h5`; entries for non-PAW species are mostly empty and should
+  // be guarded with `sp.is_paw` (or `sp.is_uspp` for USPP-like data).
+  struct species_paw_t {
+    bool is_paw = false;
+    bool is_uspp = false;
+    int  mesh = 0;
+    int  nbeta = 0;
+    int  kkbeta = 0;
+    int  nh = 0;
+    int  lmax_aug = 0;
+    double raug = 0.0;
+    int  iraug = 0;
+    nda::array<double,1> r;            // (mesh)
+    nda::array<double,1> rab;          // (mesh)
+    nda::array<double,2> aewfc;        // (nbeta, mesh) — row-major from H5
+    nda::array<double,2> pswfc;        // (nbeta, mesh)
+    nda::array<double,3> qfuncl;       // (2*lmax+1, nbeta(nbeta+1)/2, mesh)
+                                       // pseudized augmentation per L channel
+    // Phase 4.3 angular momentum metadata (per-species slices of QE's
+    // global uspp tables; ih ∈ [0, nh), nbeta ∈ [0, nbeta)).
+    nda::array<int,1> lll;             // (nbeta) — l per beta projector
+    nda::array<int,1> nhtol;           // (nh)    — l per ih
+    nda::array<int,1> nhtolm;          // (nh)    — lm = l*(l+1)+m+1 (1-based) per ih
+    nda::array<int,1> indv;            // (nh)    — beta-channel index per ih (1-based)
+    // Phase 2 fields (populated when present):
+    nda::array<double,4> deltaC;       // (nh, nh, nh, nh) — raw ke%k from QE
+    nda::array<double,3> pfunc;        // (nbeta, nbeta, mesh)  — paw subgroup
+    nda::array<double,3> ptfunc;       // (nbeta, nbeta, mesh)
+    nda::array<double,3> augmom;       // (2*lmax+1, nbeta, nbeta)
+    nda::array<double,1> ae_vloc;      // (mesh)
+    nda::array<double,1> ae_rho_atc;   // (mesh)
+    // GIPAW core orbitals (only when species was generated --with-gipaw)
+    int  ncore_orbitals = 0;
+    nda::array<double,1> core_n;       // principal qno (ncore)
+    nda::array<double,1> core_l;       // l qno (ncore)  (real for QE convention)
+    nda::array<double,2> core_aewfc;   // (ncore, mesh)
+  };
+
+  // Read-only access to per-species PAW data. Empty entry for non-PAW
+  // species — check `sp.is_paw` before consuming PAW-only fields.
   auto const& paw_species_view() const { return paw_species; }
   // wfc-G → dense-FFT-linear-index mapping (REMAPPED to dense mesh, NOT
   // the raw wfc_g.gv_to_fft() which is encoded on the wfc mesh).
@@ -279,43 +319,8 @@ class pseudopot
   // for non-SO USPP/PAW the imag part is zero.
   sarray_t<nda::array_view<ComplexType,3>> qq_nt_data;
 
-  // Phase 0/1: per-species PAW data populated from /Hamiltonian/Species/{nt}/.
-  // Empty until pseudopot::read_vnl_h5 fills it. Phase 2 ingests Onecenter.
-  struct species_paw_t {
-    bool is_paw = false;
-    bool is_uspp = false;
-    int  mesh = 0;
-    int  nbeta = 0;
-    int  kkbeta = 0;
-    int  nh = 0;
-    int  lmax_aug = 0;
-    double raug = 0.0;
-    int  iraug = 0;
-    nda::array<double,1> r;            // (mesh)
-    nda::array<double,1> rab;          // (mesh)
-    nda::array<double,2> aewfc;        // (nbeta, mesh)  — read row-major from HDF5
-    nda::array<double,2> pswfc;        // (nbeta, mesh)
-    nda::array<double,3> qfuncl;       // (2*lmax+1, nbeta(nbeta+1)/2, mesh)
-                                       // pseudized augmentation per L channel
-    // Phase 4.3 angular momentum metadata (per-species slices of QE's
-    // global uspp tables; ih ∈ [0, nh), nbeta ∈ [0, nbeta)).
-    nda::array<int,1> lll;             // (nbeta) — l per beta projector
-    nda::array<int,1> nhtol;           // (nh)    — l per ih
-    nda::array<int,1> nhtolm;          // (nh)    — lm = l*(l+1)+m+1 (1-based) per ih
-    nda::array<int,1> indv;            // (nh)    — beta-channel index per ih (1-based)
-    // Phase 2 fields (populated when present):
-    nda::array<double,4> deltaC;       // (nh, nh, nh, nh) — raw ke%k from QE
-    nda::array<double,3> pfunc;        // (nbeta, nbeta, mesh)  — paw subgroup
-    nda::array<double,3> ptfunc;       // (nbeta, nbeta, mesh)
-    nda::array<double,3> augmom;       // (2*lmax+1, nbeta, nbeta)
-    nda::array<double,1> ae_vloc;      // (mesh)
-    nda::array<double,1> ae_rho_atc;   // (mesh)
-    // GIPAW core orbitals (only when species was generated --with-gipaw)
-    int  ncore_orbitals = 0;
-    nda::array<double,1> core_n;       // principal qno (ncore)
-    nda::array<double,1> core_l;       // l qno (ncore)  (real for QE convention)
-    nda::array<double,2> core_aewfc;   // (ncore, mesh)
-  };
+  // Per-species PAW data (definition hoisted to public scope, see above).
+  // Populated from /Hamiltonian/Species/{nt}/ in read_vnl_h5.
   std::vector<species_paw_t> paw_species;
 
   // dense-grid G-vector count (read from /Hamiltonian/{type}/ngm attribute);

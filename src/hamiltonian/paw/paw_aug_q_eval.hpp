@@ -341,9 +341,8 @@ struct qrad_tab {
  * Bare radial integral (no 4π/Ω prefactor) — callers (build_eta_on_rho_g_at_q,
  * evaluate_Q_IJ_at_K) apply that factor at the end of their angular sum.
  */
-template<typename SpeciesPawT>
 inline qrad_tab build_qrad_tab(
-    SpeciesPawT const& sp,
+    pseudopot::species_paw_t const& sp,
     double K_max,
     double dq = 0.01)
 {
@@ -434,9 +433,8 @@ inline nda::array<double, 1> qrad_interp_at_K(
     return out;
 }
 
-template<typename SpeciesPawT>
 inline nda::array<double, 1> qrad_at_K(
-    SpeciesPawT const& sp, int ij, double K)
+    pseudopot::species_paw_t const& sp, int ij, double K)
 {
     long Lp1   = sp.qfuncl.extent(0);
     long mesh  = sp.qfuncl.extent(2);
@@ -489,9 +487,8 @@ inline nda::array<double, 1> qrad_at_K(
  * `omega_volume` is the unit-cell volume Ω. Caller must NOT include the
  * structure factor e^{-iK·τ_a} — that is layered on at the call site.
  */
-template<typename SpeciesPawT>
 inline ComplexType evaluate_Q_IJ_at_K(
-    SpeciesPawT const& sp,
+    pseudopot::species_paw_t const& sp,
     aainit_tables const& aatab,
     int ih, int jh,
     std::array<double, 3> const& K_vec,
