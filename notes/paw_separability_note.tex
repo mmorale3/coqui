@@ -1,0 +1,895 @@
+\documentclass[aps,prb,reprint,superscriptaddress,nofootinbib]{revtex4-2}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsfonts,bm}
+\usepackage{mathtools}
+\usepackage{braket}
+\usepackage{xcolor}
+\usepackage{hyperref}
+
+\hypersetup{colorlinks=true,linkcolor=blue,citecolor=blue,urlcolor=blue}
+
+\newcommand{\bG}{\mathbf G}
+\newcommand{\bq}{\mathbf q}
+\newcommand{\btau}{\boldsymbol\tau}
+\newcommand{\ee}{\mathrm e}
+\newcommand{\ii}{\mathrm i}
+\newcommand{\cell}{\Omega}
+\newcommand{\dd}{\mathrm d}
+
+\begin{document}
+
+\title{Note on the preservation of separability under
+species-resolved truncated SVD of the local PAW auxiliary}
+
+\author{Internal note}
+\affiliation{Companion to \emph{paw\_isdf\_thc\_prb.tex}, Sec.~V.A--V.D.}
+\date{\today}
+
+\begin{abstract}
+This note clarifies a point raised about the derivation in Sec.~V of the
+PAW-ISDF-THC manuscript: how the separability of the local auxiliary
+functions
+\(\eta_{a\lambda}^{\bq}(\bG)
+=\ee^{-\ii(\bq+\bG)\cdot\btau_a}\,\eta_{s(a)}(\lambda;\bq+\bG)\)
+is preserved when the species-resolved factor is rotated to a truncated
+SVD basis.  The conclusion is that separability is preserved by
+construction, because the rotation acts on an index that is absent from
+the atom phase, and the only approximation introduced by truncation is a
+rank reduction in the channel index.  We also distinguish this exact
+algebraic statement from the empirical claim that the \(\bq=0\) basis
+also covers \(\eta_s\) at \(\bq\neq 0\), which is a separate, evidence-based
+assertion.
+\end{abstract}
+
+\maketitle
+
+\section{What ``separability'' means in the original definition}
+
+The starting point is the species-resolved factorization of the local
+auxiliary, Eq.~(eta-species-factor) of the manuscript,
+\begin{equation}
+\eta_{a\lambda}^{\bq}(\bG)
+=\ee^{-\ii(\bq+\bG)\cdot\btau_a}\,
+\eta_{s(a)}(\lambda;\bq+\bG).
+\label{eq:def}
+\end{equation}
+This is \emph{not} a tensor-product decomposition over the indices
+\((\lambda,\bG)\): both factors carry a \(\bG\) dependence.  The
+``separability'' that the manuscript claims is structural and concerns
+the role of the atom index \(a\):
+\begin{itemize}
+\item the atom dependence is carried entirely by the unitary phase
+\(\ee^{-\ii(\bq+\bG)\cdot\btau_a}\), which has \emph{no} channel index
+\(\lambda\);
+\item the channel/species dependence is carried entirely by
+\(\eta_s(\lambda;\bq+\bG)\), which depends on the atom only through
+\(a\!\mapsto\!s(a)\).
+\end{itemize}
+This particular separation -- atom phase factored out from a species
+function -- is what enables a per-species (rather than per-atom) low-rank
+compression in the first place: a basis built once for species \(s\)
+applies, modulo the phase, to all atoms of that species.
+
+\section{The rotation acts on \texorpdfstring{$\lambda$}{lambda} only}
+
+The truncated singular vectors are stored in a fixed matrix
+\(B_s^{(\varepsilon)}\in\mathbb C^{n_\lambda\times k_s}\), of which the
+relevant fact is its index structure: it carries an old channel index
+\(\lambda\) and a reduced channel index \(\widetilde\lambda\), and
+\emph{nothing else}.  Concretely, \(B_s^{(\varepsilon)}\) does not
+depend on
+\begin{enumerate}
+\item the atom \(a\) (only on the species \(s\));
+\item the transferred momentum \(\bq\);
+\item the reciprocal vector \(\bG\).
+\end{enumerate}
+This is the entire content of the separability claim under truncation.
+Because \(B_s^{(\varepsilon)}\) lives in a different index space from
+the atom phase and from the K-argument, contraction with
+\(B_s^{(\varepsilon)\,\dagger}\) commutes with both:
+\begin{align}
+&\sum_\lambda\bigl[B_s^{(\varepsilon)}\bigr]^{*}_{\lambda\widetilde\lambda}
+\Bigl[\,\ee^{-\ii(\bq+\bG)\cdot\btau_a}\,
+\eta_s(\lambda;\bq+\bG)\Bigr] \notag\\
+&\quad=\;\ee^{-\ii(\bq+\bG)\cdot\btau_a}\,
+\underbrace{\sum_\lambda
+\bigl[B_s^{(\varepsilon)}\bigr]^{*}_{\lambda\widetilde\lambda}\,
+\eta_s(\lambda;\bq+\bG)}_{\Phi^{(s)}_{\widetilde\lambda}(\bq+\bG)}.
+\label{eq:rotation-commutes}
+\end{align}
+The right-hand side has the same shape as Eq.~\eqref{eq:def}: an atom
+phase multiplying an atom-independent K-space function indexed by the
+reduced channel \(\widetilde\lambda\).  This is precisely the definition
+of the reduced auxiliary in Eq.~(eta-reduced-spectral),
+\begin{equation}
+\eta'_{a\widetilde\lambda}(\bG;\bq)
+=\ee^{-\ii(\bq+\bG)\cdot\btau_a}\,
+\Phi^{(s)}_{\widetilde\lambda}(\bq+\bG).
+\label{eq:reduced}
+\end{equation}
+No assumption about the SVD itself was used in
+Eq.~\eqref{eq:rotation-commutes}.  For \emph{any} fixed rectangular
+matrix \(B\in\mathbb C^{n_\lambda\times k}\), the same identity holds
+and the same separability follows.  The role of the SVD is only to
+choose a particular \(B\) that captures most of the spectrum of
+\(\eta_s\) at small \(k\).
+
+\section{Where the approximation actually enters}
+
+The expansion (eta-low-rank-expansion) of the manuscript states
+\begin{equation}
+\eta_{a\lambda}^{\bq}(\bG)
+\;\approx\;
+\sum_{\widetilde\lambda}
+\bigl[B_s^{(\varepsilon)}\bigr]_{\lambda\widetilde\lambda}\,
+\eta'_{a\widetilde\lambda}(\bG;\bq).
+\label{eq:expansion}
+\end{equation}
+Substituting Eq.~\eqref{eq:reduced} into Eq.~\eqref{eq:expansion} and
+collecting,
+\begin{align}
+\sum_{\widetilde\lambda}
+\bigl[B_s^{(\varepsilon)}\bigr]_{\lambda\widetilde\lambda}\,
+\eta'_{a\widetilde\lambda}(\bG;\bq)
+&=\ee^{-\ii(\bq+\bG)\cdot\btau_a}\,
+\bigl[B_s^{(\varepsilon)}{B_s^{(\varepsilon)}}^{\dagger}
+\eta_s(\cdot;\bq+\bG)\bigr]_\lambda.
+\label{eq:projector-form}
+\end{align}
+Comparing this with Eq.~\eqref{eq:def} shows that the
+``\(\approx\)'' in Eq.~\eqref{eq:expansion} reduces to a single
+operation: replacing the full \(\eta_s(\lambda;\bq+\bG)\) by its
+projection onto the column space of \(B_s^{(\varepsilon)}\).  Two
+features are notable:
+\begin{enumerate}
+\item the atom phase is identically preserved -- it factors out of
+Eq.~\eqref{eq:projector-form} with no approximation, exactly as in the
+original definition;
+\item the projector \(B_s^{(\varepsilon)}{B_s^{(\varepsilon)}}^{\dagger}\)
+acts on the channel index \(\lambda\) only, not on \(a\), \(\bq\), or
+\(\bG\).
+\end{enumerate}
+In particular, the truncation does not introduce any new dependence on
+the atom or on \(\bG\) into the species factor.  Whatever separation
+of indices was present in Eq.~\eqref{eq:def} is preserved verbatim by
+Eqs.~\eqref{eq:reduced} and \eqref{eq:projector-form}.
+
+\section{Algebraic vs.\ empirical content}
+
+It is helpful to keep two layers of the construction distinct, since
+they are sometimes conflated.
+
+\paragraph{Exact (algebraic).}  For \emph{any} \(n_\lambda\times k\)
+matrix \(B\), the form
+\(\ee^{-\ii(\bq+\bG)\cdot\btau_a}\,\Phi^{(s)}_{\widetilde\lambda}(\bq+\bG)\)
+with
+\(\Phi^{(s)}_{\widetilde\lambda}(\mathbf K)
+=\sum_\lambda B^{*}_{\lambda\widetilde\lambda}\,\eta_s(\lambda;\mathbf K)\)
+has the same atom-phase / species-resolved separability as the original
+\(\eta_{a\lambda}^{\bq}(\bG)\).  This is the algebraic content of
+Sec.~V.A and is independent of how \(B\) was chosen.
+
+\paragraph{Empirical (numerical).}  The specific basis
+\(B_s^{(\varepsilon)}\) constructed from a Coulomb-weighted SVD of
+\(\eta_s\) at \(\bq=0\) is observed to cover \(\eta_s(\lambda;\bq+\bG)\)
+at all \(\bq\neq 0\) with essentially the same projection residual.
+Equivalently, the column space of \(B_s^{(\varepsilon)}\) is closed
+under the \(\bq\)-shift in argument.  This is the carry-to-q claim of
+Sec.~V.D.  The structural reason is that \(\bq\) enters only through
+the magnitude \(|\bq+\bG|\) in the radial Bessel transforms and through
+the angular factors \(Y_{LM}(\widehat{\bq+\bG})\), both of which vary
+smoothly within the same finite-dimensional angular--radial subspace as
+\(\bq\) sweeps the IBZ.  The numerical evidence in Sec.~V.D (full
+\(2\times 2\times 2\) IBZ for Si PAW/USPP and LiH PAW; residual at
+\(\bq\neq 0\) within numerical precision of the residual at \(\bq=0\))
+substantiates this empirically.
+
+The two questions are therefore:
+\begin{itemize}
+\item \emph{Does truncation preserve separability?}  Yes,
+unconditionally and by construction
+(Eqs.~\eqref{eq:rotation-commutes}--\eqref{eq:projector-form}).
+\item \emph{Does the \(\bq=0\) truncation also approximate \(\eta_s\) at
+\(\bq\neq 0\) well?}  This is an empirical statement, not an algebraic
+one, and is the content of the carry-to-q test in Sec.~V.D.
+\end{itemize}
+A concern about ``separability after truncation'' is therefore really
+either trivial (the algebraic case) or about the rank captured by the
+\(\bq=0\) SVD at finite \(\bq\) (the empirical case); these are
+qualitatively different and should be evaluated separately.
+
+\section{Separability of the augmentation charge}
+\label{sec:Qhat}
+
+The same separability question can be asked of the augmentation pair
+density \(\widehat Q^{\,a}_{\alpha\beta}\) that drives the local-ISDF
+construction in Eq.~(local-isdf-qhat) of the manuscript.  We show that
+the atom-phase / species-resolved separability of \(\widehat Q\)
+survives the channel-index truncation by the same mechanism as for
+\(\eta\), and discuss the additional structural feature
+(rank-1 in the channel-pair indices) that makes the THC ansatz hold.
+
+\subsection{The original separable form}
+
+The augmentation pair density of atom \(a\), species \(s=s(a)\), in
+Bloch form on the dense \(\bG\)-grid, is
+\begin{equation}
+\widehat Q^{\,a}_{\alpha\beta}(\bG;\bq)
+=\ee^{-\ii(\bq+\bG)\cdot\btau_a}\,
+q^{(s)}_{\alpha\beta}(\bq+\bG),
+\label{eq:Qhat-species}
+\end{equation}
+i.e.\ an atom-dependent unitary phase times the species-resolved
+augmentation charge \(q^{(s)}_{\alpha\beta}(\mathbf K)\) (the QE
+\(Q^{IJ}(\mathbf K)\) before structure factor).  This is the
+\(\widehat Q\) analog of Eq.~(eta-species-factor) and asserts the
+same atom-phase / species separation: the atom enters only through the
+phase and does not act on the channel-pair indices \((\alpha,\beta)\).
+
+The full-rank local-ISDF in Eq.~(local-isdf-qhat) writes the species
+augmentation charge as a sum of rank-1 outer products in the
+channel-pair indices,
+\begin{equation}
+q^{(s)}_{\alpha\beta}(\mathbf K)
+=\sum_{\lambda=1}^{n_\lambda}
+U^{(s)\,*}_{\lambda\alpha}\,
+U^{(s)}_{\lambda\beta}\,
+\eta_s(\lambda;\mathbf K),
+\label{eq:Qhat-full-rank}
+\end{equation}
+in the symmetric-pair basis defined by the
+\texttt{build\_local\_isdf\_full\_rank} construction
+(\(n_\lambda=n_h^2\); each diagonal pair \(I=J\) contributes one row,
+each off-diagonal pair \(I<J\) contributes two rows
+\((\lambda_+,\lambda_-)\) with \(U_{\lambda_\pm,I}=+1/\sqrt2\),
+\(U_{\lambda_+,J}=+1/\sqrt2\), \(U_{\lambda_-,J}=-1/\sqrt2\), and
+sign \(\pm1\) absorbed into \(\eta_s(\lambda;\cdot)\)).  At full rank
+this representation is exact.
+
+\subsection{Atom-phase separability is preserved unconditionally}
+
+Combining Eqs.~\eqref{eq:Qhat-species}--\eqref{eq:Qhat-full-rank},
+\begin{equation}
+\widehat Q^{\,a}_{\alpha\beta}(\bG;\bq)
+=\ee^{-\ii(\bq+\bG)\cdot\btau_a}
+\sum_\lambda U^{(s)\,*}_{\lambda\alpha}\,U^{(s)}_{\lambda\beta}\,
+\eta_s(\lambda;\bq+\bG).
+\label{eq:Qhat-original}
+\end{equation}
+The atom enters only through the prefactor; the sum on the right-hand
+side has no \(a\)-dependence beyond \(a\!\mapsto\!s(a)\).  Now apply
+the truncation argument of Sec.~II to the species function under the
+sum.  Replacing \(\eta_s(\lambda;\mathbf K)\) by its rank-\(k_s\)
+projection gives, with \(\Pi_s:=B_s^{(\varepsilon)}{B_s^{(\varepsilon)}}^\dagger\),
+\begin{align}
+\widehat Q^{\,a}_{\alpha\beta}(\bG;\bq)
+&\approx
+\ee^{-\ii(\bq+\bG)\cdot\btau_a}
+\sum_\lambda U^{(s)\,*}_{\lambda\alpha}\,U^{(s)}_{\lambda\beta}\,
+\bigl[\Pi_s\,\eta_s(\cdot;\bq+\bG)\bigr]_\lambda. \notag\\
+&\quad
+\label{eq:Qhat-projected}
+\end{align}
+The atom phase factors out identically: the truncation operator
+\(\Pi_s\) acts on the channel index \(\lambda\) alone and has no
+\(a\)-, \(\bq\)-, or \(\bG\)-dependence.  Thus the species-resolved
+factorization \eqref{eq:Qhat-species} survives -- the truncated
+species charge is still atom-independent, the K-argument still
+\(\bq+\bG\), and the atom dependence still lives entirely in the phase.
+This is the augmentation-charge analog of the result in
+Sec.~II--III for \(\eta\).
+
+\subsection{The rank-1 channel-pair structure}
+
+The \(\widehat Q\) factorization in Eq.~\eqref{eq:Qhat-full-rank} has
+an additional structural property that the THC ansatz of
+Eq.~(final-paw-isdf-thc) requires: the coefficient at each channel row
+\(\lambda\) is a \emph{rank-1 outer product} in the channel-pair
+indices, \(U^{(s)\,*}_{\lambda\alpha}U^{(s)}_{\lambda\beta}\).  This is
+what permits the linear-in-projector feature
+\(Y_{a\lambda,i}=\sum_\alpha U_{a,\lambda\alpha}P_{i,a\alpha}\) of
+Eq.~(Y-feature), and hence the
+\(X_{\Lambda i}^{*}X_{\Lambda j}\) form of the smooth-grid pair-density
+factorization in Eq.~(comp-rho-local-isdf).
+
+Two compression strategies are visible in the present codebase and
+manuscript.  They differ in how the rank-1 structure interacts with
+the channel-index truncation, and it is worth being explicit about
+this distinction.
+
+\subsubsection{Strategy A -- pair-subset selection (current implementation)}
+
+The implementation in \texttt{local\_isdf\_compress.hpp} performs a
+pivoted Cholesky on the pair-space Gram matrix in the \(L^2\) or
+Coulomb metric and \emph{selects a subset of the original symmetric
+pairs}.  Each kept pair contributes its original symmetric-pair rows
+(one diagonal row, or a \(\pm\) split) verbatim from the full-rank
+construction.  The compressed \(U\) is \(U\) restricted to those rows;
+the compressed \(\eta_s\) is \(\eta_s\) restricted to the same rows.
+The augmentation-charge representation in this case is
+\begin{equation}
+q^{(s)}_{\alpha\beta}(\mathbf K)
+\approx
+\sum_{\lambda\in\mathcal P_s}
+U^{(s)\,*}_{\lambda\alpha}\,U^{(s)}_{\lambda\beta}\,
+\eta_s(\lambda;\mathbf K),
+\label{eq:Qhat-subset}
+\end{equation}
+where \(\mathcal P_s\) is the kept pair set.  The rank-1 outer-product
+structure in \((\alpha,\beta)\) is preserved trivially -- the truncation
+discards entire \(\lambda\) rows, and what remains is a direct subset
+of the original sum.  The \(K_a\) closed form
+(\texttt{local\_isdf.hpp::compute\_K\_a}) inherits this structure: the
+round-trip identity
+\(\sum_\lambda \mathrm{sign}(\lambda)U_{\lambda I}U_{\lambda J} f(i(\lambda),j(\lambda))=f(I,J)\)
+holds restricted to \((I,J)\in\mathcal P_s\), and \(\Delta C\)
+contributions from dropped pairs are reconstructed as zero.
+Atom-phase separability and rank-1 channel-pair structure are both
+exact, with truncation error governed by the pivoted-Cholesky residual
+in the chosen metric.
+
+\subsubsection{Strategy B -- channel-index SVD rotation
+(manuscript Sec.~V.B): numerical refutation}
+
+The manuscript Sec.~V.B describes a different compression: rotate the
+channel index by the truncated SVD basis,
+\(U'_{a,\widetilde\lambda\alpha}
+=\sum_\lambda[B_s^{(\varepsilon)}]^{*}_{\lambda\widetilde\lambda}
+U_{a,\lambda\alpha}\) (Eq.~(U-reduced)), and
+\(\Phi^{(s)}_{\widetilde\lambda}(\mathbf K)
+=\sum_\lambda[B_s^{(\varepsilon)}]^{*}_{\lambda\widetilde\lambda}
+\eta_s(\lambda;\mathbf K)\) (Eq.~(phi-species)).  The implicit claim is
+that the augmentation charge can then be reconstructed in the rotated
+basis as
+\begin{equation}
+q^{(s),\,B}_{\alpha\beta}(\mathbf K)
+:=\sum_{\widetilde\lambda}
+U'^{(s)\,*}_{\widetilde\lambda\alpha}\,
+U'^{(s)}_{\widetilde\lambda\beta}\,
+\Phi^{(s)}_{\widetilde\lambda}(\mathbf K),
+\label{eq:Qhat-Bs-claim}
+\end{equation}
+parallel to Eq.~\eqref{eq:Qhat-full-rank}.  This claim is
+\emph{numerically false}, and not by a small amount.  Substituting
+the rotation definitions on the right-hand side gives
+\begin{equation}
+q^{(s),\,B}_{\alpha\beta}(\mathbf K)
+=\sum_{\lambda_1\lambda_2\lambda_3}
+T_{\lambda_1\lambda_2\lambda_3}\,
+U^{(s)}_{\lambda_1\alpha}\,U^{(s)}_{\lambda_2\beta}\,
+\eta_s(\lambda_3;\mathbf K),
+\label{eq:Qhat-Bs-trilinear}
+\end{equation}
+with the trilinear kernel
+\begin{equation}
+T_{\lambda_1\lambda_2\lambda_3}
+=\sum_{\widetilde\lambda}
+\bigl[B_s^{(\varepsilon)}\bigr]_{\lambda_1\widetilde\lambda}\,
+\bigl[B_s^{(\varepsilon)}\bigr]^{*}_{\lambda_2\widetilde\lambda}\,
+\bigl[B_s^{(\varepsilon)}\bigr]^{*}_{\lambda_3\widetilde\lambda}.
+\label{eq:trilinear-T}
+\end{equation}
+For Eq.~\eqref{eq:Qhat-Bs-claim} to reduce to the original full-rank
+identity Eq.~\eqref{eq:Qhat-full-rank}, one would need
+\(T_{\lambda_1\lambda_2\lambda_3}
+=\delta_{\lambda_1\lambda_2}\delta_{\lambda_1\lambda_3}\),
+which holds for \(B_s=I\) but \emph{not} for any other unitary -- in
+particular not for the SVD basis of \(\eta_s\).
+
+The diagnostic test \texttt{paw\_qhat\_strategy\_b}
+(\texttt{src/hamiltonian/tests/test\_hamilt.cpp}) builds
+\(B_s^{(\varepsilon)}\) from the full Coulomb-weighted SVD of
+\(\eta_s\) at \(\bq=0\), reconstructs
+\(q^{(s),B}_{\alpha\beta}(\mathbf K)\) per
+Eq.~\eqref{eq:Qhat-Bs-claim}, and compares it to the
+\(\mathrm{qgm}_{\alpha\beta}(\mathbf K)\) stored in the pseudopotential.
+Reporting the relative Coulomb-norm residual
+\(\bigl\|q^{(s),B}-\mathrm{qgm}\bigr\|_C/\bigl\|\mathrm{qgm}\bigr\|_C\):
+\begin{table}[h]
+\centering
+\begin{tabular}{lccccc}
+\hline
+species & \(n_\lambda\) & full-rank id. & \(k=n_\lambda\) (no trunc.) & \(k(10^{-3})\) & \(k(10^{-9})\) \\
+\hline
+LiH Li PAW & 64  & \(4{\times}10^{-19}\) & \(\mathbf{1.97}\) & \(\mathbf{1.97}\) & \(\mathbf{1.97}\) \\
+LiH H  PAW & 4   & \(1{\times}10^{-20}\) & \(\mathbf{2.61}\) & \(\mathbf{2.61}\) & \(\mathbf{2.61}\) \\
+Si    PAW  & 324 & \(5{\times}10^{-20}\) & \(\mathbf{1.93}\) & \(\mathbf{1.93}\) & \(\mathbf{1.93}\) \\
+\hline
+\end{tabular}
+\end{table}
+
+The middle column verifies that
+\(\sum_\lambda U_{\lambda I}U_{\lambda J}\eta_\lambda=\mathrm{qgm}_{IJ}\)
+holds at machine precision in the symmetric-pair basis -- the original
+full-rank ISDF identity is exact.  The remaining three columns show
+that the Strategy~B reconstruction is off by an O(1) factor at every
+truncation rank, including the full rank \(k=n_\lambda\) where the
+SVD basis itself introduces \emph{no} approximation.  The error is the
+trilinear obstruction Eq.~\eqref{eq:trilinear-T}, not an SVD truncation
+residual: the SVD basis cannot make
+\(\sum_\lambda B B^{*}B^{*}\) into \(\delta\delta\), and the
+manuscript's substitution
+\(\widehat Q\to\sum_{\widetilde\lambda}U'^{*}U'\Phi\) is therefore
+\emph{wrong as a representation of the augmentation charge}.
+
+The same conclusion applies to \(\Delta C_{a,\alpha\beta,\gamma\delta}\)
+in Eq.~(dC-reduced) of the manuscript: the substitution of
+\(U^{*}U\to U'^{*}U'\) and \(K\to K'=B^\dagger K B\) into
+Eq.~(local-k-factorization) does not reproduce the original
+\(\Delta C\) under generic \(B_s\), by the same trilinear obstruction
+acting on each pair of \((\alpha,\beta)\) and \((\gamma,\delta)\)
+indices.
+
+\subsubsection{Summary}
+
+Atom-phase separability of \(\widehat Q\) is preserved unconditionally
+by either compression strategy, by the argument in Secs.~II--III: the
+truncation acts on an index that is absent from both the atom phase
+and the K-argument, so the factorization
+\(\widehat Q^{\,a}=\ee^{-\ii(\bq+\bG)\cdot\btau_a}\,q^{(s)}\) survives
+unchanged and the truncated \(q^{(s)}\) remains atom-independent.
+
+The rank-1 outer-product structure in \((\alpha,\beta)\), however,
+\emph{cannot} be carried through a generic SVD rotation:
+\(\widetilde C^{(s)}_{\widetilde\lambda,\alpha\beta}
+=\sum_\lambda U^{*}_{\lambda\alpha}U_{\lambda\beta}B_{\lambda\widetilde\lambda}\)
+is a weighted sum of rank-1 outer products and is generically of
+higher rank in \((\alpha,\beta)\).  Replacing \(\widetilde C^{(s)}\)
+by \(U'^{(s)\,*}U'^{(s)}\) (Strategy~B as written in the manuscript)
+introduces an O(1) error, demonstrated numerically above.
+
+The implementation in \texttt{local\_isdf\_compress.hpp} avoids this
+problem by selecting a \emph{subset} of the original symmetric-pair
+rows (Strategy~A): the kept rows retain the rank-1 form verbatim, the
+roundtrip identity holds restricted to kept pairs, and the truncation
+error is governed by the pivoted-Cholesky residual in the chosen
+metric -- a single, well-controlled approximation.  This is the
+strategy that should be referenced in Sec.~V.B; the SVD-rotation
+language as currently written in the manuscript is incorrect for
+\(\widehat Q\) and \(\Delta C\), even though it is correct for the
+species function \(\eta_s\) on its own (Secs.~II--III of this note).
+
+\section{Numerical search for tighter compressions}
+\label{sec:tighter}
+
+Strategy A preserves the rank-1 form by construction but is restricted
+to a \emph{subset} of the original \(n_\lambda=n_h^2\) channel rows.
+A natural question is whether a different rank-1 outer-product
+decomposition can do better -- i.e.\ whether
+\begin{equation}
+q^{(s)}_{\alpha\beta}(\mathbf K)\;\approx\;
+\sum_{k=1}^{K} u_{k\alpha}\,u_{k\beta}\,v_k(\mathbf K),
+\qquad K \ll n_h^2,
+\label{eq:cp-symmetric}
+\end{equation}
+admits a small \(K\) for given Coulomb-norm tolerance.  Equation
+\eqref{eq:cp-symmetric} is the symmetric tensor-rank (CP) decomposition
+of \(q^{(s)}_{\alpha\beta}(\mathbf K)\) viewed as a complex symmetric
+3-tensor in \((\alpha,\beta,\mathbf K)\), and finding the minimal \(K\)
+is in general NP-hard.  Two heuristic constructions were attempted
+(\texttt{paw\_qhat\_greedy\_rank1} and
+\texttt{paw\_qhat\_outer\_svd\_inner\_takagi} in
+\texttt{src/hamiltonian/tests/test\_hamilt.cpp}); both fall short.
+
+\subsection{Greedy rank-1 ALS}
+
+The greedy approach extracts a sequence of rank-1 components by
+power-iteration on Takagi (best symmetric rank-1 fit), subtracts each
+from the residual, and repeats:
+\begin{enumerate}
+\item Initialize \(u\in\mathbb C^{n_h}\) (unit norm).
+\item \(v_g=\sum_{\alpha\beta}\bar u_\alpha\bar u_\beta R_{\alpha\beta g}\).
+\item \(M_{\alpha\gamma}=\sum_g w_C(g)\,v_g^{*}\,R_{\alpha\gamma g}\).
+\item \(u\to M\bar u/\|M\bar u\|\).  Iterate until converged.
+\item \(R\gets R-u\,u^{T}\otimes v\); next \(k\).
+\end{enumerate}
+For Si PAW (\(n_h=18\), \(n_\lambda=324\)) the greedy residual is
+\(8.6\times 10^{-2}\) at \(K=100\), and never reaches \(10^{-3}\)
+within the \(K\le 100\) budget.  For LiH Li PAW (\(n_h=8\),
+\(n_\lambda=64\)), \(K=64\) reaches only \(5\times 10^{-4}\) -- well
+short of machine precision, even though the original symmetric-pair
+construction is exact at the same \(K\).  Greedy CP is famously
+trapped by local minima; the leading rank-1 components are correct,
+but later ones must fit a deflated residual that is no longer
+well-aligned with any single rank-1 outer product.
+
+\subsection{Outer SVD + inner Takagi}
+
+A constructive 2-level decomposition truncates first in the
+\((\alpha\beta,g)\) Coulomb-weighted unfolding, then Takagi-decomposes
+each leading symmetric \(n_h\times n_h\) component:
+\begin{equation}
+q^{(s)}_{\alpha\beta}(g)\;\approx\;
+\sum_{k=1}^{K_{\text{out}}}\sigma_k\,W_k(\alpha,\beta)\,V_k(g),
+\quad
+W_k=\sum_{m=1}^{r_k}\mu_m^{(k)}w_m^{(k)}{w_m^{(k)}}^{T},
+\label{eq:outer-inner}
+\end{equation}
+giving a total of \(\sum_k r_k\) rank-1 outer-product terms.  In the
+test on Si PAW, the leading \(W_k\) matrices are essentially full
+inner rank (typical \(r_k(10^{-6})\!\sim\!12\text{--}18\) out of
+\(n_h=18\)), so the 2-level construction \emph{inflates} the
+auxiliary dimension well above \(n_\lambda\):
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lccc}
+\hline
+\(\varepsilon_{\text{out}}\) & inner \(\varepsilon=10^{-2}\) & \(10^{-3}\) & \(10^{-6}\) \\
+\hline
+LiH Li (\(n_\lambda=64\), Coul) \\
+\quad \(10^{-3}\) & 57 & 73  & 86 \\
+\quad \(10^{-6}\) & 134 & 166 & 186 \\
+\quad \(10^{-9}\) & 214 & 246 & 266 \\
+Si PAW (\(n_\lambda=324\), Coul) \\
+\quad \(10^{-3}\) & 619 & 684 & 842 \\
+\quad \(10^{-6}\) & 1033 & 1186 & 1419 \\
+\quad \(10^{-9}\) & 2415 & 2614 & 2981 \\
+\hline
+\end{tabular}
+\end{table}
+
+Even the loosest setting (\(\varepsilon_{\text{out}}=10^{-3}\),
+\(\varepsilon_{\text{in}}=10^{-2}\)) gives \(619>n_\lambda=324\) for
+Si.  The leading symmetric directions in the
+\((\alpha\beta,g)\) unfolding are simply not aligned with single rank-1
+outer products: each \(W_k\) is a generic complex symmetric matrix
+that requires \(\mathcal O(n_h)\) Takagi modes to represent.
+
+\subsection{What this means}
+
+These experiments suggest that the symmetric tensor rank of
+\(q^{(s)}_{\alpha\beta}(\mathbf K)\) is essentially tight at
+\(n_\lambda=n_h^2\) under the rank-1-per-term constraint required by
+the THC ansatz.  The \(\eta_s\) Coulomb-rank diagnostic of
+Sec.~V.A--V.D in the manuscript (Si: \(k_\eta\sim 100\) at
+\(\varepsilon=10^{-6}\)) measures the rank of the species function
+\(\eta_s(\lambda;\mathbf K)\) as a 2-tensor in \((\lambda,\mathbf K)\).
+That rank is small.  But coupling \(\eta_s\) to the symmetric-pair
+structure factor \(U_{\lambda\alpha}U_{\lambda\beta}\) requires
+\(n_h^2\) rank-1 outer products in \((\alpha,\beta)\), one per
+\(\lambda\), and the empirical evidence is that no other rank-1 basis
+of similar size does any better.
+
+The practical conclusion: Strategy A (pivoted Cholesky pair-subset on
+the symmetric-pair Gram in the chosen metric, as already implemented
+in \texttt{local\_isdf\_compress.hpp}) is the right route.  It
+respects the rank-1-per-term structure exactly, achieves the
+information-theoretic lower bound for that ansatz class, and is
+controlled by a single tolerance.  The Phase 4.5 plan should be
+updated to describe Strategy A explicitly and drop the
+\(B_s\)-rotation language entirely.
+
+If genuinely smaller compression is required, three escape routes are
+worth flagging, none free:
+\begin{enumerate}
+\item Replace the symmetric form \(u_{k\alpha}u_{k\beta}v_k(g)\) by a
+non-symmetric form \(p_{k\alpha}q_{k\beta}v_k(g)\) (different left and
+right factors).  This breaks the THC \(X=Y^{*}Y\) ansatz and forces a
+generalized THC kernel.
+\item Allow simultaneous (non-greedy) ALS on
+Eq.~\eqref{eq:cp-symmetric} with multiple random restarts.  This is
+expensive and offers no rank guarantees -- but the symmetric tensor
+rank may be smaller than the upper bounds the simple heuristics
+above provide.
+\item Exploit physical structure further: angular-momentum coupling
+selection rules (Wigner 3-j) restrict which \((\alpha,\beta)\) pairs
+appear at given \((L,M)\) channels of \(\eta_s\), suggesting a
+block-diagonal structure that Strategy A does not exploit.
+\end{enumerate}
+
+\section{The local Coulomb tensor \texorpdfstring{$\Delta C$}{Delta C}: same story}
+\label{sec:deltaC}
+
+The same compression question can be asked of the one-center correction
+\(\Delta C_{a,\alpha\beta,\gamma\delta}\), which the manuscript factors
+in the same channel basis as
+\begin{equation}
+\Delta C_{a,\alpha\beta,\gamma\delta}
+=\sum_{\lambda\xi}
+U_{\lambda\alpha}\,U_{\lambda\beta}\,
+K_{a,\lambda\xi}\,
+U_{\xi\gamma}\,U_{\xi\delta},
+\label{eq:dC-K}
+\end{equation}
+with \(K_a\) the \(n_\lambda\times n_\lambda\) real symmetric Coulomb
+kernel.  Two perspectives on compressibility, again testing the THC
+form against an unconstrained matrix-rank bound.
+
+\subsection{Matrix rank of \texorpdfstring{$K_a$}{K_a}}
+
+The eigendecomposition \(K_a=\sum_k\sigma_k v_k v_k^{T}\) gives the
+optimal rank-\(r\) approximation of the unfolding
+\(\Delta C_{(\alpha\beta),(\gamma\delta)}\).  Because \(\Delta C\) is
+the difference between AE and PS Coulomb tensors,
+\(K_a\) is generically \emph{indefinite} (signed eigenvalues).  Test
+\texttt{paw\_K\_a\_compressibility}:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lccccc}
+\hline
+species & \(n_\lambda\) & \(r(10^{-3})\) & \(r(10^{-6})\) & \(r(10^{-9})\) & signs (+/-/0) \\
+\hline
+LiH Li & 64  & \textbf{5}   & 15 & 23  & 16 / 17 / 31 \\
+Si PAW & 324 & \textbf{60}  & 97 & 113 & 87 / 76 / 161 \\
+\hline
+\end{tabular}
+\end{table}
+
+For Si PAW, half the eigenvalues are zero (\(K_a\) has effective rank
+\(\le 163\)), and at relative tolerance \(10^{-3}\) the matrix rank is
+\(60\) -- a \(5.4\times\) compression of the unfolding.
+
+\subsection{Constrained ALS: rank-1 form
+\texorpdfstring{$\sum u_\alpha u_\beta v_\gamma v_\delta$}{Sum u u v v}}
+
+To compress \(\Delta C\) while keeping rank-1 outer products in each
+pair (the THC-preserving constraint, analogous to
+Eq.~\eqref{eq:cp-symmetric} for \(q^{(s)}\)) we ran greedy rank-1 ALS
+on
+\begin{equation}
+\Delta C_{\alpha\beta\gamma\delta}
+\;\approx\;
+\sum_{k=1}^{K}\,u_{k\alpha}u_{k\beta}\,v_{k\gamma}v_{k\delta}.
+\label{eq:dC-uuvv}
+\end{equation}
+Test \texttt{paw\_deltaC\_greedy\_rank1}.  Convergence is much slower
+than the unconstrained matrix-rank bound suggests:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lccc}
+\hline
+species & \(n_\lambda\) & ALS rank @ \(10^{-3}\) & residual @ \(K=200\) \\
+\hline
+LiH Li & 64  & 28      & --   \\
+Si PAW & 324 & \emph{not reached} & \(7\times 10^{-2}\) \\
+\hline
+\end{tabular}
+\end{table}
+
+For Si PAW, even \(K=200\) terms in the constrained ALS form reach
+only \(\sim7\times 10^{-2}\) relative Frobenius residual -- compared
+to the unconstrained matrix rank \(60\) at \(10^{-3}\) and rank \(97\)
+at \(10^{-6}\) from the eigendecomposition.
+
+\subsection{Why the constrained form costs so much more}
+
+The eigendecomposition of \(K_a\) writes
+\(\Delta C\!=\!\sum_k\sigma_k W_k(\alpha,\beta)W_k(\gamma,\delta)\)
+with each \(W_k(\alpha,\beta)=\sum_\lambda v_{k\lambda}U_{\lambda\alpha}U_{\lambda\beta}\)
+a generic symmetric \(n_h\times n_h\) matrix -- not necessarily
+rank-1.  Forcing every term into the form
+\(u_\alpha u_\beta\) instead requires further Takagi-decomposing each
+\(W_k\) into up to \(n_h\) rank-1 outer products, multiplying the
+total auxiliary count by a factor of order \(n_h\).  The outer-SVD +
+inner-Takagi obstruction of Sec.~\ref{sec:tighter} reappears here in
+exactly the same form.
+
+\subsection{Conclusion: same trilinear obstruction, different tensor}
+
+The local Coulomb tensor exhibits the same pattern as the augmentation
+charge:
+\begin{itemize}
+\item As a generic matrix in \((\alpha\beta,\gamma\delta)\) the
+unfolding is genuinely low rank (\(60\) of \(324\) for Si at
+\(10^{-3}\)).
+\item Under the rank-1-per-term constraint required by the THC
+\(X^{*}\!X\) ansatz, that low rank cannot be exploited -- greedy ALS
+plateaus and the constrained tensor rank is much higher.
+\item Using the matrix-rank compression directly (rotating to the
+\(K_a\) eigenbasis and identifying \(\widetilde\lambda\to k\)) breaks
+the THC ansatz by exactly the same trilinear obstruction analyzed in
+Sec.~\ref{sec:Qhat} for \(\widehat Q\): the auxiliary-rotated
+expression \(\sum_k\widetilde U_k\widetilde U_k\,(\sigma_k)\,\widetilde U_k\widetilde U_k\)
+involves
+\(\sum_\lambda v_{k\lambda}v_{k\lambda'}v_{k\lambda''}\), which does
+not reduce to a Kronecker-delta product.
+\end{itemize}
+For Phase 4.5 of the implementation, this leaves Strategy A (pivoted
+Cholesky pair-subset on the symmetric-pair Gram) as the only
+THC-respecting compression of either \(\widehat Q\) or \(\Delta C\).
+A genuinely lower-dimensional THC representation of the local block
+would require giving up the \(X^{*}X\) ansatz on the local rows,
+e.g.\ a generalized factorization
+\(\sum_k X^Y_{ki}X^Z_{kj}\) with two distinct features per local row.
+
+\section{Redefining the augmentation by moment-matching only}
+\label{sec:moment-matching}
+
+A different way out of the trilinear wall is to relax the augmentation
+function itself.  The PAW augmentation
+\(\widehat Q^{\,a}_{\alpha\beta}(\mathbf r)\) is constrained
+\emph{only} by its multipole moments
+\begin{equation}
+q^{LM}_{\alpha\beta}
+\;=\;\int\!\dd^3 r\; r^L Y_{LM}(\hat r)
+\bigl[\rho^{a,\mathrm{AE}}_{\alpha\beta}(\mathbf r)
+-\rho^{a,\mathrm{PS}}_{\alpha\beta}(\mathbf r)\bigr],
+\label{eq:moments}
+\end{equation}
+which is a \emph{finite} set of linear conditions; the radial shape of
+\(\widehat Q\) is otherwise free.  QE's canonical construction
+\begin{equation}
+\widehat Q^{\,a}_{\alpha\beta}(\mathbf r)
+=\sum_{LM}a^{LM}_{\alpha\beta}\,
+q^{l_\alpha l_\beta}_L(|\mathbf r|)\,Y_{LM}(\hat r)
+\label{eq:QE-aug}
+\end{equation}
+is one such choice, with \(a^{LM}_{\alpha\beta}\) the angular Wigner
+coupling and \(q^{l_\alpha l_\beta}_L(r)\) the radial Q function.
+
+If one postulates instead a strictly separable form
+\begin{equation}
+\widehat Q^{\,a}_{\alpha\beta}(\mathbf r)
+\;\approx\;\sum_{k=1}^{K}\,
+u_{k\alpha}\,u_{k\beta}\,f_k(\mathbf r),
+\label{eq:aug-CP}
+\end{equation}
+with \(f_k\) any localized shape, the moment-matching condition
+becomes a constraint on the moments \(\mu_k^{LM}\) of \(f_k\):
+\begin{equation}
+q^{LM}_{\alpha\beta}
+\;=\;\sum_k u_{k\alpha}u_{k\beta}\,\mu_k^{LM}.
+\label{eq:moment-match-CP}
+\end{equation}
+Since \(f_k(\mathbf r)\) is free up to its moments, the
+\(\mu_k^{LM}\) are free parameters; the entire problem reduces to a
+symmetric CP decomposition of the \emph{moment tensor}
+\(q^{LM}_{\alpha\beta}\), which lives on a tiny finite-dimensional
+auxiliary index \((LM)\) -- not the dense G-grid where the trilinear
+obstruction was so painful.
+
+\subsection{Numerical test on the moment tensor}
+
+Test \texttt{paw\_moment\_separable} builds
+\(q^{LM}_{\alpha\beta}=a^{LM}_{\alpha\beta}\cdot\mathrm{augmom}(L,\beta_\alpha,\beta_\beta)\)
+from QE's \texttt{ap} table and per-species \texttt{augmom} radial
+moments, then reports two ranks: (i) the \emph{matrix unfolding} rank
+in \((\alpha\beta\text{-pair},LM)\), which is the rank achievable in
+the more flexible Tucker form, and (ii) the symmetric CP rank from
+greedy rank-1 ALS of Eq.~\eqref{eq:aug-CP}.
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lcccccc}
+\hline
+species & \(n_h\) & \(n_\lambda\) & \(n_{LM}\) & matrix \(@10^{-6}\) & matrix \(@10^{-9}\) & ALS \(@10^{-3}\) \\
+\hline
+LiH Li & 8  & 64  & 9  & 9   & 25  & 34 \\
+LiH H  & 2  & 4   & 9  & 1   & 3   & 1  \\
+Si PAW & 18 & 324 & 25 & \textbf{25}  & 130 & not reached \\
+\hline
+\end{tabular}
+\end{table}
+
+The matrix unfolding rank is the rank achievable in the
+\emph{Tucker} form
+\begin{equation}
+q^{LM}_{\alpha\beta}
+\;=\;\sum_{k=1}^{K_{\text{Tuck}}}\,
+W_k(\alpha,\beta)\,\nu_k^{LM},
+\label{eq:aug-Tucker}
+\end{equation}
+where each \(W_k\) is a generic symmetric matrix in \((\alpha,\beta)\)
+-- not rank-1.  For Si this drops the auxiliary count from
+\(n_\lambda=324\) to \(\mathbf{25}\) at \(10^{-6}\) tolerance, a 13×
+reduction.  This is the lower bound on what any rank-1-respecting
+construction can achieve, and it is genuinely small.
+
+The greedy CP rank, however, does not reach this lower bound -- for
+Si, \(K=200\) terms in Eq.~\eqref{eq:aug-CP} still leave
+\(\sim4\times 10^{-2}\) relative residual.  Putting each \(W_k\) into
+rank-1 outer-product form via Takagi would multiply
+\(K_{\text{Tuck}}=25\) by an inner Takagi rank that is empirically
+\(\mathcal O(n_h)\); the total is no smaller than \(n_\lambda\), and
+the trilinear wall reappears.
+
+\subsection{What this implies for THC}
+
+The conceptual answer to ``can we redefine \(\widehat Q\) as separable
+and still match moments'' is unambiguously \textbf{yes}: the moment
+condition is finite and linear, and Eq.~\eqref{eq:moment-match-CP}
+admits a CP solution at sufficiently large \(K\).  The numerical
+answer about how small \(K\) gets divides into two regimes:
+\begin{enumerate}
+\item \textbf{Tucker-like form} (Eq.~\eqref{eq:aug-Tucker} with
+generic \(W_k\)) reaches \(K_{\text{Tuck}}=25\) for Si at
+\(10^{-6}\), \(13\times\) below \(n_\lambda=324\).  This form is
+\emph{not} compatible with the standard \(X=Y^{*}Y\) THC ansatz:
+each \(W_k\) is not rank-1 in \((\alpha,\beta)\).
+\item \textbf{Strict CP form} (Eq.~\eqref{eq:aug-CP}, rank-1
+outer product per term) is what THC requires.  Greedy ALS for Si
+cannot reach \(10^{-3}\) within \(K\le 200\) terms; the symmetric
+CP rank of the moment tensor is empirically much larger than the
+matrix-unfolding rank, by the same mechanism that defeats every
+other rank-1-preserving compression we tried.
+\end{enumerate}
+
+In short: the moment-matching reformulation does \emph{not} circumvent
+the trilinear obstruction.  It does, however, sharpen the conclusion:
+the bottleneck is the rank-1-in-\((\alpha,\beta)\) constraint required
+by THC, not the radial-shape freedom that the moment-only condition
+provides.  The intrinsic rank of the moment tensor (25 for Si) is
+already genuinely small; what fails is the further insistence that
+each contribution carry a rank-1 outer product.  Any future low-rank
+local-block compression for THC would need to relax the
+\(X=Y^{*}Y\) ansatz on the local rows, not the choice of augmentation
+function.
+
+\subsection{Asymmetric form: \texorpdfstring{$\sum u_\alpha v_\beta \mu_{LM}$}{Sum u v mu} with \texorpdfstring{$u\neq v$}{u != v}}
+
+A natural generalization is to drop the \((\alpha\!\leftrightarrow\!\beta)\)
+symmetry of each rank-1 component:
+\begin{equation}
+\widehat Q^{\,a}_{\alpha\beta}(\mathbf r)
+\;\approx\;\sum_{k=1}^K u_{k\alpha}\,v_{k\beta}\,f_k(\mathbf r),
+\quad u_k\neq v_k,
+\label{eq:aug-CP-asym}
+\end{equation}
+which gives the moment-matching condition
+\(q^{LM}_{\alpha\beta}=\sum_k u_{k\alpha} v_{k\beta} \mu_k^{LM}\) -- a
+plain (asymmetric) CP decomposition of the 3-tensor.  This form has
+strictly more freedom than the symmetric one and matches the form
+underlying the ``two distinct features per local row''
+(\(X^Y_{ki}X^Z_{kj}\)) generalization of THC.
+
+Test \texttt{paw\_moment\_asymmetric} runs greedy rank-1 ALS for
+Eq.~\eqref{eq:aug-CP-asym}.  Comparison of residuals at matched \(K\):
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lccc}
+\hline
+species & form & residual @ \(K=96\) & residual @ \(K=200\) \\
+\hline
+Si PAW & symmetric \(uu\)        & \(4.22\times10^{-2}\) & --                   \\
+Si PAW & asymmetric \(uv\)       & \(4.55\times10^{-2}\) & \(7.9\times 10^{-3}\) \\
+\hline
+\end{tabular}
+\end{table}
+
+The two forms behave nearly identically for the first \(\sim\!100\)
+terms; the asymmetric form pulls ahead modestly at higher \(K\),
+reaching \(\sim 8\times 10^{-3}\) at \(K=200\) where the symmetric
+form is still at \(\sim 4\times 10^{-2}\).  At neither setting does
+the asymmetric CP reach the matrix-unfolding lower bound of \(25\) (Si
+at \(10^{-6}\)) or even \(10^{-3}\) within \(K\le 200\).
+
+The structural reason is the same as the outer-SVD-+-inner-Takagi
+analysis for \(\widehat Q^{(s)}\) and \(\Delta C\): the leading
+matrix-unfolding singular components \(W_k(\alpha,\beta)\) have
+SVD-rank \(\sim n_h\) in \((\alpha,\beta)\), so converting them to
+rank-1 outer products \(u_{k\alpha}v_{k\beta}\) -- whether symmetric
+or asymmetric -- still costs \(\mathcal O(n_h)\) terms per leading
+\(W_k\).  Going asymmetric saves a factor of \(\le 2\) (since real
+symmetric eigendecomposition pairs eigenvalues vs.\ a single
+asymmetric SVD), but does not unlock the matrix-rank compression.
+
+The bottom line is the same as before: the rank-1-on-each-pair-side
+constraint is the hard wall, not the symmetry constraint.  Going
+asymmetric helps a little; it does not help enough to make local-block
+compression below \(n_\lambda\) feasible while keeping a strict
+THC-like factorization on each local row.
+
+\section{Suggested clarification in the manuscript}
+
+To prevent the present source of confusion in a referee report, one
+sentence inserted immediately after Eq.~(eta-reduced-spectral) is
+sufficient.  A possible wording:
+\begin{quote}
+\itshape
+We emphasize that \(B_s^{(\varepsilon)}\) is a fixed
+\(n_\lambda\times k_s\) matrix with no dependence on the atom \(a\), the
+transferred momentum \(\bq\), or the reciprocal vector \(\bG\).  The
+rotation therefore acts on the channel index \(\lambda\) alone and
+commutes with both the atom phase and the K-argument.  The separable
+structure of Eq.~(eta-species-factor) is preserved by construction, and
+the only approximation in Eq.~(eta-low-rank-expansion) is the rank-\(k_s\)
+truncation in the channel index.
+\end{quote}
+
+\end{document}

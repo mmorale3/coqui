@@ -1,0 +1,533 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{tabularx}
+\usepackage{multirow}
+\usepackage{siunitx}
+\usepackage{xcolor}
+\usepackage[hidelinks]{hyperref}
+\usepackage{fancyhdr}
+
+\title{Reference Benchmarks for the CoQui PAW + ISDF--THC\\
+       Validation Suite: Band Gaps and RPA Energies}
+\author{Compiled from the published literature}
+\date{April 30, 2026}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{CoQui PAW Validation References}
+\fancyhead[R]{\thepage}
+
+\newcommand{\eV}{\ensuremath{\,\mathrm{eV}}}
+\newcommand{\meV}{\ensuremath{\,\mathrm{meV}}}
+\newcommand{\GPa}{\ensuremath{\,\mathrm{GPa}}}
+\newcommand{\target}[1]{\textbf{\textcolor{blue!60!black}{#1}}}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+\noindent
+This document is a reference compendium for the CoQui PAW + ISDF--THC
+validation suite. It collects published quasiparticle band gaps (G$_0$W$_0$,
+GW$_0$, scGW) and RPA total/correlation energies for benchmark solids,
+spanning VASP, ABINIT, BerkeleyGW, GPAW, FHI--aims, exciting, SPEX/FLEUR
+and Quantum~ESPRESSO. Two systems anchor the validation: Si (the standard
+``easy'' benchmark) and ZnO (the well-known ``hard'' benchmark). Secondary
+systems --- diamond, MgO, LiF, NaCl, GaAs, hBN, graphite, noble-gas solids,
+and selected metals --- are included for completeness. For each entry we
+record the level of theory, code, projector type (PAW / ONCV / all-electron
+LAPW / NAO), k-mesh, band cutoff, frequency treatment, and the source DOI.
+The document also flags published convergence pitfalls (notably the
+ZnO ``false-convergence trap'' and the basis-set $E_{\mathrm{cut}}^{-3/2}$
+tail in RPA) so they can be avoided when comparing CoQui results to the
+literature.
+\end{abstract}
+
+\tableofcontents
+
+\newpage
+
+\section{Executive summary}
+
+\subsection{What to target for CoQui}
+
+\begin{table}[h]
+\centering
+\caption{Headline targets for the first round of CoQui PAW+ISDF--THC
+validation. Numbers are typical converged values from the literature; see
+the body of the document for full tables and sources.}
+\label{tab:targets}
+\small
+\begin{tabular}{l l c c c}
+\toprule
+System & Quantity                 & Target value                   & Reference         & Difficulty \\
+\midrule
+Si     & G$_0$W$_0$@PBE indirect gap & $\approx 1.1$--$1.2\eV$       & multi-code 2024   & easy \\
+Si     & RPA@PBE $E_{\mathrm{coh}}$  & $\approx 4.6\eV$/atom          & Harl 2010 (VASP)  & easy \\
+Si     & RPA@PBE lattice constant   & $5.421\AA$                     & Harl 2010 (VASP)  & easy \\
+ZnO    & G$_0$W$_0$@PBE direct gap   & $2.5$--$2.9\eV$                & multi-code 2024   & hard \\
+ZnO    & RPA@PBE lattice $a$        & $\approx 3.254\AA$             & Harl 2010 (VASP)  & hard \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Three things to watch}
+
+\begin{enumerate}
+  \item \textbf{Always extrapolate $E_{\mathrm{cut}}^{-3/2}$ for RPA.}
+  Single-cutoff RPA correlation energies are not comparable across codes;
+  the tail is large (0.3--0.5\,eV/atom for Si at typical cutoffs).
+  \item \textbf{ZnO needs Zn 3s/3p/3d in valence and large virtual space}
+  for both GW and RPA. Anything less than 1000 bands plus extrapolation
+  is the well-documented false-convergence trap.
+  \item \textbf{Mind the starting point.} RPA@LDA and RPA@PBE differ by
+  $\sim 0.2$--$0.3\eV$/atom for covalent solids; G$_0$W$_0$@LDA and
+  G$_0$W$_0$@PBE/PBEsol differ by $\sim 0.1\eV$ for Si. Compare
+  apples-to-apples.
+\end{enumerate}
+
+\subsection{Bottom-line accuracy expectations}
+
+For Si, the four-code 2024 benchmark (Borlido et al., arXiv:2411.19701)
+gives a 112\,meV cross-code spread for the G$_0$W$_0$@PBEsol gap. For ZnO
+the same benchmark shows 334\,meV spread --- the largest of any solid in
+the test set. Anything CoQui produces inside the 2.5--2.9\,eV window for
+ZnO with proper convergence is consistent with the established
+literature; values below $\sim 2.0\eV$ indicate a PAW augmentation or
+basis-set issue.
+
+\newpage
+\section{Part I --- GW band gaps}
+
+\subsection{Silicon (Si, diamond structure)}
+
+\textbf{Structure:} Fd--3m, $a = 5.431\AA$. The gap is indirect
+$\Gamma \to \Delta$ (about $0.85 \times X$). Experimental indirect gap:
+\target{1.17\eV} (0\,K, no zero-point renormalization).
+
+\begin{longtable}{p{3.0cm} c l l l l p{3.5cm}}
+\caption{G$_0$W$_0$, GW$_0$, scGW gap of Si.} \label{tab:si_gw} \\
+\toprule
+Level & Gap (eV) & Code & PP & k-mesh & Freq. & Source \\
+\midrule
+\endfirsthead
+\multicolumn{7}{l}{\emph{Table~\ref{tab:si_gw} continued.}} \\
+\toprule
+Level & Gap (eV) & Code & PP & k-mesh & Freq. & Source \\
+\midrule
+\endhead
+LDA (KS)         & 0.51  & VASP    & PAW       & ---     & ---       & textbook \\
+G$_0$W$_0$@LDA   & 0.85  & VASP    & PAW       & 4$\times$4$\times$4 & PP (GN) & Shishkin/Kresse 2007 \\
+GW$_0$@LDA       & 1.22  & VASP    & PAW       & 4$\times$4$\times$4 & PP    & Shishkin/Kresse 2007 \\
+scGW@LDA         & 1.41  & VASP    & PAW       & 4$\times$4$\times$4 & PP    & Shishkin/Kresse 2007 \\
+G$_0$W$_0$@LDA   & 1.094 & VASP    & PAW       & 10$\times$10$\times$10 & CD & VASP wiki tutorial \\
+G$_0$W$_0$@PBEsol& 1.257 & ABINIT  & ONCV      & 8$\times$8$\times$8 & CD+AC & Borlido 2024 \\
+G$_0$W$_0$@PBEsol& 1.145 & exciting& LAPW+lo   & 8$\times$8$\times$8 & 32 imag.\ freq. & Borlido 2024 \\
+G$_0$W$_0$@PBEsol& 1.147 & FHI-aims& NAO (all-e)& 8$\times$8$\times$8 & 60 freq. (Pad\'e) & Borlido 2024 \\
+G$_0$W$_0$@PBEsol& 1.152 & GPAW    & PW (NC-PP)& 8$\times$8$\times$8 & real-freq.\ extrap.& Borlido 2024 \\
+\target{Experiment} & \target{1.17} & --- & --- & --- & --- & standard \\
+\bottomrule
+\end{longtable}
+
+\noindent \emph{Highlights.}
+G$_0$W$_0$@LDA underestimates by $\sim 0.3\eV$. Eigenvalue self-consistency
+in $G$ (GW$_0$) closes the gap to within $0.05\eV$ of experiment. The
+2024 multi-code benchmark with PBEsol orbitals gives 1.145--1.257\,eV;
+all-electron codes (FHI-aims, exciting) cluster at $\sim 1.15\eV$. The
+ABINIT outlier at 1.257\,eV reflects residual ONCV / $\epsilon_{\mathrm{cut}}$
+sensitivity.
+
+\subsection{ZnO (wurtzite)}
+
+\textbf{Structure:} P6$_3$mc, $a = 3.250\AA$, $c = 5.207\AA$.
+The gap is \emph{direct} $\Gamma \to \Gamma$. Experimental optical gap:
+\target{3.44\eV} (4\,K). Zn 3d band at $\sim -7\eV$. LDA gives
+$\sim 0.7$--$0.8\eV$.
+
+\begin{longtable}{p{3.2cm} c l l c c l p{3.0cm}}
+\caption{G$_0$W$_0$ gap of ZnO --- the canonical hard benchmark.}
+\label{tab:zno_gw} \\
+\toprule
+Level & Gap (eV) & Code & PP & Zn 3d & k-mesh & Freq. & Source \\
+\midrule
+\endfirsthead
+\multicolumn{8}{l}{\emph{Table~\ref{tab:zno_gw} continued.}} \\
+\toprule
+Level & Gap (eV) & Code & PP & Zn 3d & k-mesh & Freq. & Source \\
+\midrule
+\endhead
+LDA (KS)              & 0.76     & ABINIT    & ONCV  & val.\ & 8$\times$8$\times$5 & ---       & Borlido 2024 \\
+G$_0$W$_0$@LDA        & $\sim$0.8 & VASP     & PAW   & core  & 4$\times$4$\times$4 & PP & Shishkin/Kresse 2007 \\
+GW$_0$@LDA            & $\sim$2.97 & VASP    & PAW   & core  & 4$\times$4$\times$4 & PP & Shishkin/Kresse 2007 \\
+G$_0$W$_0$@LDA conv.\ & $\sim$2.5 & BerkeleyGW & NC-PP & val.\ & 4$\times$4$\times$3 & GPP & Shih 2010 \\
+G$_0$W$_0$@LDA conv.\ & 3.0--3.2 & SPEX     & FLAPW & val.\ & 4$\times$4$\times$4 & full-freq.\ & Friedrich 2011 \\
+G$_0$W$_0$@LDA (CD)   & $\sim$2.4 & ABINIT   & PAW   & val.\ & 6$\times$6$\times$4 & CD & Stankovski 2011 \\
+G$_0$W$_0$@LDA+U      & $\sim$3.2 & VASP     & PAW   & val.\ & 6$\times$6$\times$4 & PP & Lany/Zunger 2010 \\
+G$_0$W$_0$@PBEsol     & 2.613    & ABINIT    & ONCV  & val.\ & 8$\times$8$\times$5 & CD+AC & Borlido 2024 \\
+G$_0$W$_0$@PBEsol     & 2.878    & exciting  & LAPW  & val.\ & 8$\times$8$\times$5 & 32 imag. & Borlido 2024 \\
+G$_0$W$_0$@PBEsol     & 2.758    & FHI-aims  & NAO   & val.\ & 8$\times$8$\times$5 & 60 freq. & Borlido 2024 \\
+G$_0$W$_0$@PBEsol     & 2.544    & GPAW      & PW    & val.\ & 8$\times$8$\times$5 & real-freq.\ & Borlido 2024 \\
+\target{Experiment (optical)} & \target{3.44} & --- & --- & --- & --- & --- & standard \\
+\target{Experiment (transport)} & \target{3.37} & --- & --- & --- & --- & --- & standard \\
+\bottomrule
+\end{longtable}
+
+\noindent \emph{The convergence saga.}
+The published ZnO G$_0$W$_0$ value drifted from $\sim 0.8\eV$ (2007) to
+$\sim 2.5$--$2.9\eV$ (2024) as two issues were resolved. (1) Zn 3s/3p/3d
+must be in valence, not core. (2) The number of empty bands must be
+$\gg 1000$ with explicit $E_{\mathrm{cut}}^{-3/2}$ extrapolation, because
+the Coulomb-hole self-energy $\Sigma_{\mathrm{COH}}$ shows
+\emph{non-uniform convergence}: VBM and CBM converge at different rates,
+biasing the gap. f-sum-rule plasmon-pole models are unreliable for ZnO
+because the shallow Zn 3d resonance pollutes the f-sum; contour
+deformation or full-frequency integration is required.
+
+\subsection{Secondary GW benchmarks}
+
+\paragraph{MgO (rock-salt, Fm--3m).}
+Direct $\Gamma \to \Gamma$ gap; experiment \target{7.83\eV}; LDA $\sim 4.5\eV$.
+VASP PAW (Shishkin/Kresse 2007): G$_0$W$_0$@LDA $\sim 6.2$--$6.5\eV$,
+GW$_0$@LDA $\sim 7.2$--$7.5\eV$, scGW@LDA $\sim 7.8\eV$.
+
+\paragraph{LiF (rock-salt, Fm--3m).}
+Direct gap; experiment \target{14.2\eV}; LDA $\sim 9.2\eV$.
+VASP PAW: G$_0$W$_0$@LDA 12.0--12.5\,eV, GW$_0$@LDA $\sim 13.5\eV$,
+scGW@LDA $\sim 14.8\eV$ (overshoots).
+
+\paragraph{GaAs (zinc-blende, F--43m).}
+Direct gap, experiment \target{1.52\eV} at 0\,K; LDA $\sim 0.2$--$0.5\eV$;
+Ga 3d at $\sim -18\eV$. VASP PAW (Ga 3d as core): G$_0$W$_0$@LDA
+$\sim 1.1$--$1.3\eV$, GW$_0$@LDA $\sim 1.5\eV$. BerkeleyGW (Ga 3d valence):
+G$_0$W$_0$@LDA 1.3--1.5\,eV.
+
+\paragraph{TiO$_2$ rutile (P4$_2$/mnm).}
+Direct optical gap, experiment \target{3.03\eV}; LDA $\sim 1.8\eV$.
+2024 cross-code G$_0$W$_0$@PBEsol: ABINIT 3.333, exciting 3.321,
+FHI-aims 3.546, GPAW 3.281\,eV.
+
+\subsection{Cross-code precision benchmark (2024)}
+
+\textbf{Source:} Borlido et~al., \emph{arXiv:2411.19701} /
+Comput.~Mater.~Sci.\ 2025, DOI 10.1016/j.commatsci.2024.113495.
+PBEsol orbitals; full-frequency methods (no plasmon-pole). Zn valence in
+ABINIT ONCV is 20 electrons; exciting and FHI-aims are all-electron.
+
+\begin{table}[h]
+\centering
+\caption{Four-code G$_0$W$_0$@PBEsol gaps for Si, ZnO, TiO$_2$
+(eV). Spread is the max--min range across the four codes.}
+\label{tab:multicode_2024}
+\small
+\begin{tabular}{l c c c c c c}
+\toprule
+Material & ABINIT & exciting & FHI-aims & GPAW & Spread (meV) & Expt \\
+\midrule
+Si (indirect)        & 1.257 & 1.145 & 1.147 & 1.152 & 112 & 1.17 \\
+ZnO (direct)         & 2.613 & 2.878 & 2.758 & 2.544 & 334 & 3.44 \\
+TiO$_2$ rutile (dir.) & 3.333 & 3.321 & 3.546 & 3.281 & 265 & 3.03 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Six-step ZnO convergence checklist}
+
+\begin{enumerate}
+  \item \textbf{Semicore in valence.} Zn 3s, 3p, 3d in the active space
+        (12 vs 20 valence electrons). Core treatment $\Rightarrow$
+        $\sim 0.8\eV$ gap, wrong by $\sim 2.6\eV$.
+  \item \textbf{Empty bands.} $\sim 1000$--$3000$ bands or basis-set
+        extrapolation; $\Sigma_{\mathrm{COH}}$ converges non-uniformly.
+  \item \textbf{$\boldsymbol{\chi}$ cutoff.} ENCUTGW $\gtrsim 30$--$50$\,Ha
+        in plane-wave codes; otherwise a false convergence plateau.
+  \item \textbf{Frequency scheme.} Avoid f-sum-rule plasmon-pole;
+        use contour deformation or full-frequency integration.
+  \item \textbf{Starting point.} LDA places Zn 3d too high
+        ($-5$ vs $-7\eV$). LDA+U or hybrid starting points improve
+        convergence.
+  \item \textbf{PAW partial-wave completeness.} Standard PAW partial waves
+        are incomplete for high-energy unoccupied states; norm-conserving
+        partial waves or basis-set corrections (Klime\v{s}/Kaltak/Kresse,
+        PRB 90, 075125, 2014) are needed for predictive results.
+\end{enumerate}
+
+\newpage
+\section{Part II --- RPA total / correlation energies}
+
+\textbf{Convention.} In what follows ``RPA'' means RPA correlation on top
+of a DFT exchange piece, i.e.\ $E_{\mathrm{tot}} = E_x[\phi^{\mathrm{KS}}]
++ E_c^{\mathrm{RPA}}[\chi_0]$. ``RPA@PBE'' is the standard choice in the
+literature (Harl/Kresse). Cohesive energies are reported as positive
+$=$ bound, in eV/atom unless noted.
+
+\subsection{Silicon}
+
+Experimental cohesive energy: \target{4.62\eV/atom} (0\,K, ZPE-corrected).
+Lattice constant: \target{5.431\AA}; bulk modulus \target{99\GPa}.
+
+\begin{table}[h]
+\centering
+\caption{Si cohesive energy at the RPA level.}
+\label{tab:si_rpa_ecoh}
+\small
+\begin{tabular}{l c l l l p{4cm}}
+\toprule
+Method & $E_{\mathrm{coh}}$ (eV/atom) & Code & PP & k-mesh & Source \\
+\midrule
+PBE                  & 4.55     & VASP  & PAW & 8$\times$8$\times$8 & Harl 2010 \\
+RPA@PBE              & $\sim$4.6 & VASP & PAW & 8$\times$8$\times$8 & Harl 2010 \\
+RPA@LDA              & 4.32     & GPAW  & PAW & 4$\times$4$\times$4 & Olsen/Thygesen 2013 \\
+EXX@PBE (no corr.)   & 2.82     & GPAW  & PAW & 4$\times$4$\times$4 & GPAW tutorial \\
+\target{Experiment}  & \target{4.62} & --- & --- & --- & standard \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering
+\caption{Si lattice constant and bulk modulus, RPA vs PBE vs experiment.}
+\label{tab:si_rpa_struct}
+\small
+\begin{tabular}{l c c l l}
+\toprule
+Method & $a$ (\AA) & $B$ (GPa) & Code & Source \\
+\midrule
+PBE              & 5.468 & 90    & VASP/PAW   & Harl 2010 \\
+RPA@PBE          & 5.421 & $\sim$98 & VASP/PAW & Harl 2010 \\
+RPA              & 5.414 & ---   & QE/ONCV    & Pitts 2025 \\
+PBE              & 5.479 & ---   & QE/ONCV    & Pitts 2025 \\
+\target{Expt.}   & \target{5.431} & \target{99} & --- & standard \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Diamond, MgO, LiF, NaCl}
+
+Compact summary; full per-system tables in
+\texttt{notes/paw\_rpa\_reference\_benchmarks.md}.
+
+\begin{table}[h]
+\centering
+\caption{RPA@PBE structural and cohesive properties (VASP/PAW, Harl 2010,
+unless noted). Experimental values in the right column.}
+\label{tab:secondary_rpa}
+\small
+\begin{tabular}{l c c c c c c}
+\toprule
+Material   & $a_{\mathrm{PBE}}$ & $a_{\mathrm{RPA}}$ & $a_{\mathrm{expt}}$ & $E_{\mathrm{coh}}^{\mathrm{RPA}@\mathrm{PBE}}$ & $E_{\mathrm{coh}}^{\mathrm{expt}}$ & Notes \\
+           & (\AA)  & (\AA)  & (\AA)  & (eV/at.) & (eV/at.) & \\
+\midrule
+Si              & 5.468 & 5.421 & \target{5.431} & $\sim 4.6$    & \target{4.62} & covalent \\
+C (diamond)     & 3.572 & 3.553 & \target{3.553} & $\sim 7.4$--$7.5$ & \target{7.37} & covalent, $B=443\GPa$ \\
+BN (zinc-blende)& 3.626 & 3.604 & \target{3.592} & ---           & ---           & --- \\
+MgO             & 4.258 & 4.196 & \target{4.211} & $\sim 5.0$--$5.1$ & \target{5.20} & ionic \\
+LiF             & 4.073 & 3.986 & \target{3.972} & $\sim 4.3$--$4.4$ & \target{4.46} & ionic \\
+NaCl            & 5.694 & 5.573 & \target{5.595} & $\sim 3.3$    & \target{3.34} & soft ionic \\
+ZnO ($a$)       & 3.283 & 3.254 & \target{3.250} & ---           & $\sim 3.60$/atom & semicore \\
+ZnO ($c$)       & 5.304 & 5.262 & \target{5.207} & ---           & ---           & semicore \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Layered and weakly-bound systems}
+
+\paragraph{Graphite interlayer binding.}
+The landmark RPA-for-graphite paper (Leb\`egue et~al., PRL 105, 196401,
+2010): VASP/PAW RPA@PBE gives an interlayer binding energy of
+\target{48\,meV/atom} at $d_{\mathrm{int}} = 3.34\AA$, in agreement with
+the experimental window 35--52\,meV/atom. PBE gives essentially zero
+interlayer binding. RPA captures the correct $1/d^3$ van~der~Waals
+asymptotics.
+
+\paragraph{Hexagonal BN.}
+RPA@PBE in-plane $a \approx 2.50\AA$, interlayer binding 30--40\,meV/atom
+(VASP/PAW, Harl 2010). PBE: no binding.
+
+\paragraph{Noble-gas solids.}
+Harl \& Kresse, PRB 77, 045136 (2008), VASP/PAW, RPA@LDA. The foundational
+RPA-for-vdW-solids paper.
+
+\begin{table}[h]
+\centering
+\caption{Noble-gas solids: lattice constant and cohesive energy at RPA@LDA
+vs experiment.}
+\label{tab:noble_gas}
+\small
+\begin{tabular}{l c c c c}
+\toprule
+System & $a_{\mathrm{RPA}}$ (\AA) & $a_{\mathrm{expt}}$ (\AA) & $E_{\mathrm{coh}}^{\mathrm{RPA}}$ (meV/at) & $E_{\mathrm{coh}}^{\mathrm{expt}}$ (meV/at) \\
+\midrule
+Ne & $\sim 4.46$ & 4.430 & $\sim 27$  & 27 \\
+Ar & $\sim 5.26$ & 5.256 & $\sim 88$  & 88 \\
+Kr & $\sim 5.64$ & 5.646 & $\sim 120$ & 116 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Metals}
+
+Schimka et~al., \emph{Nature Materials} 9, 741 (2010) and PRB 87, 214102
+(2013). RPA@PBE cohesive energies for bulk metals are roughly
+PBE-quality; the gain from RPA is concentrated in surface and adsorption
+energies, not bulk cohesion. Approximate values (eV/atom): Cu $\sim 3.5$,
+Fe $\sim 4.3$, Na $\sim 1.1$, Mg $\sim 1.5$, Al $\sim 3.4$.
+
+\subsection{Statistical summary across 20 solids (Harl 2010)}
+
+\begin{itemize}
+  \item PBE lattice constant MAE $\approx 0.05\AA$ (systematic
+        overestimate);\\
+        RPA@PBE lattice constant MAE $\approx 0.02\AA$ (mixed).
+  \item PBE bulk modulus MAE $\approx 9\GPa$;
+        RPA@PBE MAE $\approx 5\GPa$.
+  \item RPA@PBE is a clear improvement over PBE for structural
+        properties.
+  \item RPA \emph{underbinds} covalent solids (Si, C) by 0.1--0.3\,eV/atom
+        relative to experiment; ionic solids fare better.
+\end{itemize}
+
+\subsection{Convergence parameters by code}
+
+\begin{table}[h]
+\centering
+\caption{Recommended RPA convergence parameters by code.}
+\label{tab:rpa_conv}
+\small
+\begin{tabular}{l p{2.4cm} p{2.4cm} p{2.6cm} p{4cm}}
+\toprule
+Code & Cutoff for $\chi_0$ & N$_\omega$ & N$_\mathrm{bands}$ & Extrapolation \\
+\midrule
+VASP/PAW   & ENCUTGW = ENCUT (or 2/3) & 12--16 Gauss-Legendre & $\sim 3$--$5\times N_{\mathrm{occ}}$ & $E_{\mathrm{cut}}^{-3/2}$ on $E_{\mathrm{RPA}}$ \\
+GPAW/PAW   & 80--164\,eV ($\chi_0$ cutoff) & 16 GL & set by N$_{\mathrm{pw}}$ & $E_{\mathrm{cut}}^{-3/2}$ \\
+FHI-aims   & all-electron NAO tier-2/3 & 40--60 imag.\ freq. & all virtual NAO & NAO basis tier \\
+QE/ONCV    & $\sim 80\,$Ry        & 8 imag.\ freq. & $\sim 5\times N_e$ & basis ext.\ implicit \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{The $E_{\mathrm{cut}}^{-3/2}$ tail.}
+The leading correction to a finite-cutoff RPA correlation energy is
+$E_{\mathrm{RPA}}(E_{\mathrm{cut}}) \approx E_{\mathrm{RPA}}(\infty)
++ A\, E_{\mathrm{cut}}^{-3/2}$ (Harl/Kresse 2008). For Si at
+ENCUT $\sim 400$\,eV the missing tail is 0.3--0.5\,eV/atom. \emph{Always
+extrapolate.} Single-cutoff numbers are not portable across codes.
+
+\newpage
+\section{Recommended validation order for CoQui}
+
+\begin{enumerate}
+  \item \textbf{Si} --- both G$_0$W$_0$ and RPA. The simplest check on
+        the full PAW + ISDF--THC pipeline. Targets: G$_0$W$_0$@PBE gap
+        $\approx 1.1\eV$, RPA@PBE $E_{\mathrm{coh}} \approx 4.6\eV$/atom,
+        $a_{\mathrm{RPA}} \approx 5.421\AA$.
+  \item \textbf{MgO and LiF} --- ionic solids where RPA performs well.
+        Tests Hartree/exchange balance in the PAW augmentation. Targets:
+        $a_{\mathrm{MgO}} \approx 4.196$--$4.200\AA$,
+        $a_{\mathrm{LiF}} \approx 3.986$--$3.996\AA$.
+  \item \textbf{Diamond} --- covalent, small cell, well-studied. Target
+        $a \approx 3.553\AA$, RPA@PBE $E_{\mathrm{coh}} \approx
+        7.4$--$7.5\eV$/atom.
+  \item \textbf{ZnO} --- semicore-state stress test. Zn 3s/3p/3d in
+        valence, $\geq 1000$ bands with extrapolation, contour
+        deformation. Targets: G$_0$W$_0$@PBE in 2.5--2.9\,eV window;
+        $a_{\mathrm{RPA}} \approx 3.254\AA$. Anything below
+        $\sim 2.0\eV$ for the ZnO gap indicates a PAW augmentation or
+        basis-set issue.
+\end{enumerate}
+
+\section{Key references}
+
+\begin{enumerate}
+  \item Shishkin \& Kresse, \emph{Phys.\ Rev.\ B} \textbf{75}, 235102
+        (2007). DOI 10.1103/PhysRevB.75.235102. Canonical VASP PAW
+        G$_0$W$_0$/GW$_0$/scGW for Si, ZnO, MgO, LiF, GaAs, GaN.
+
+  \item Shih, Xue, Zhang, Cohen, Louie, \emph{Phys.\ Rev.\ Lett.}
+        \textbf{105}, 146401 (2010). DOI
+        10.1103/PhysRevLett.105.146401. BerkeleyGW; resolves the ZnO
+        gap underestimate (semicore + 3000 bands).
+
+  \item Friedrich, M\"{u}ller, Bl\"{u}gel, \emph{Phys.\ Rev.\ B}
+        \textbf{83}, 081101(R) (2011); erratum \textbf{84}, 039906.
+        DOI 10.1103/PhysRevB.83.081101. SPEX/FLAPW; ZnO as ``extreme
+        case''; linearization-error correction; converged $\sim 2.83\eV$.
+
+  \item Stankovski et~al., \emph{Phys.\ Rev.\ B} \textbf{84}, 241201(R)
+        (2011). DOI 10.1103/PhysRevB.84.241201. ABINIT; PP models
+        unreliable for ZnO; CD gives $\sim 2.4\eV$.
+
+  \item Klime\v{s}, Kaltak, Kresse, \emph{Phys.\ Rev.\ B} \textbf{90},
+        075125 (2014). DOI 10.1103/PhysRevB.90.075125. PAW partial-wave
+        completeness; NC partial waves + finite-basis correction.
+
+  \item Borlido et~al., arXiv:2411.19701 / \emph{Comput.\ Mater.\ Sci.}
+        2025. DOI 10.1016/j.commatsci.2024.113495. Four-code G$_0$W$_0$
+        precision benchmark (ABINIT, exciting, FHI-aims, GPAW); Si, ZnO,
+        TiO$_2$. \textbf{Most current multi-code reference.}
+
+  \item Harl \& Kresse, \emph{Phys.\ Rev.\ B} \textbf{77}, 045136 (2008).
+        DOI 10.1103/PhysRevB.77.045136. Foundational RPA-for-solids
+        paper: VASP/PAW ACFDT for Ne, Ar, Kr; establishes
+        $E_{\mathrm{cut}}^{-3/2}$ basis extrapolation.
+
+  \item Harl, Schimka, Kresse, \emph{Phys.\ Rev.\ B} \textbf{81},
+        115126 (2010). DOI 10.1103/PhysRevB.81.115126.
+        \textbf{Primary RPA benchmark for solids:} VASP/PAW RPA@PBE,
+        20 solids, lattice constants, bulk moduli, atomization energies.
+
+  \item Schimka et~al., \emph{Nat.\ Mater.} \textbf{9}, 741 (2010).
+        DOI 10.1038/nmat2806. RPA@PBE for metals + insulators; surface
+        and adsorption energies.
+
+  \item Leb\`egue et~al., \emph{Phys.\ Rev.\ Lett.} \textbf{105},
+        196401 (2010). DOI 10.1103/PhysRevLett.105.196401. VASP/PAW RPA
+        for graphite interlayer binding (48\,meV/atom).
+
+  \item Olsen \& Thygesen, \emph{Phys.\ Rev.\ B} \textbf{86}, 081103(R)
+        (2012); \textbf{87}, 075111 (2013). DOI
+        10.1103/PhysRevB.86.081103, 10.1103/PhysRevB.87.075111.
+        GPAW RPA benchmarks.
+
+  \item Kaltak, Klime\v{s}, Kresse, \emph{J.\ Chem.\ Theory Comput.}
+        \textbf{10}, 2498 (2014). DOI 10.1021/ct5001268. Low-scaling
+        $O(N^3)$ RPA via imaginary time + Laplace; minimax quadrature.
+
+  \item Ren, Rinke, Joas, Scheffler, \emph{J.\ Mater.\ Sci.} \textbf{47},
+        7447 (2012). DOI 10.1007/s10853-012-6570-4. FHI-aims all-electron
+        RPA review with benchmark table for 11 solids.
+
+  \item Booth, Gr\"{u}neis, Kresse, Alavi, \emph{Nature} \textbf{493},
+        365 (2013). DOI 10.1038/nature11770. FCIQMC for solids; exact
+        wavefunction benchmark vs RPA and CCSD(T).
+
+  \item Pitts, Contant, Hellgren, \emph{Phys.\ Rev.\ B} \textbf{112},
+        085137 (2025). DOI 10.1103/PhysRevB.112.085137 / arXiv:2504.12768.
+        Self-consistent RPA in QE/ONCV; cross-validation of VASP PAW
+        within $0.01\AA$.
+
+  \item Schimka et~al., \emph{Phys.\ Rev.\ B} \textbf{87}, 214102 (2013).
+        DOI 10.1103/PhysRevB.87.214102. RPA@PBE lattice constants and
+        cohesive energies of alkali / alkaline-earth / transition metals.
+\end{enumerate}
+
+\section{Provenance and uncertainty}
+
+The numerical values in this document are drawn from the cited primary
+references where the published tables are accessible, and from review
+abstracts / cross-citations in newer papers where the original tables
+are paywalled (notably Harl 2010 PRB 81, 115126). Values quoted with a
+``$\sim$'' carry approximately $\pm 0.1\eV$ (or $\pm 0.01\AA$ for lattice
+constants) of indirect-sourcing uncertainty. The DOIs are included so
+the original tables can be consulted when institutional access is
+available. The companion markdown files
+(\texttt{notes/paw\_gw\_reference\_benchmarks.md} and
+\texttt{notes/paw\_rpa\_reference\_benchmarks.md}) include longer
+annotations and per-row sources.
+
+\end{document}
