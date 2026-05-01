@@ -107,11 +107,18 @@ namespace methods {
       auto thresh = io::get_value_with_default<double>(pt,"thresh",1e-10);
       utils::check( _Np>0 or thresh>0.0, "Error in thc_reader_t: Must set nIpts and/or thresh");
 
-      // PAW augmentation options (Phase 4.2: q=0 G-L/L-L; K_a at all q).
-      // Default to false (user must opt in). Auto-detect from MF metadata
-      // is a follow-up; for now mf::MF doesn't expose a pp_type() and we
-      // do not want to construct hamilt::pseudopot just to peek.
-      _paw_aug = io::get_value_with_default<bool>(pt, "paw_aug", false);
+      // PAW augmentation options. Defaults: include every term that is
+      // compatible with each species' pseudopotential type:
+      //   - NCPP species  : skipped entirely (nothing to augment)
+      //   - USPP species  : compensation-charge augmentation (V_GL/V_LL),
+      //                     no on-site kernel (USPP has no K_a)
+      //   - PAW species   : compensation-charge augmentation + on-site K_a
+      // The per-species discrimination is enforced in make_paw_aug_layout
+      // (NCPP entries get 0 ISDF rows) and in add_K_a_to_LL (skips non-PAW).
+      // `paw_onsite` lets the user disable just the K_a contribution for
+      // PAW species while still keeping their compensation augmentation.
+      _paw_aug = io::get_value_with_default<bool>(pt, "paw_aug", true);
+      _paw_onsite = io::get_value_with_default<bool>(pt, "paw_onsite", true);
       _paw_isdf_tol = io::get_value_with_default<double>(pt, "paw_isdf_tol", 1e-12);
       _paw_isdf_cache_h5 = io::get_value_with_default<std::string>(pt, "paw_isdf_cache_h5", "");
       {
@@ -636,10 +643,14 @@ namespace methods {
       // 1/Ω from wG; the smooth ζ_code carries one Ω; bare η_QE has no Ω).
       double omega_sq = omega * omega;
 
-      // K_a injection (q-independent — applied at every q in the loop).
+      // K_a injection (PAW only, q-independent — applied at every q in the
+      // loop). Skipped entirely if the user disabled the on-site kernel via
+      // `paw_onsite=false`. add_K_a_to_LL itself iterates over species and
+      // skips non-PAW (USPP / NCPP) entries.
       nda::array<ComplexType,2> K_LL_buf(_N_aug, _N_aug);
       K_LL_buf() = ComplexType(0.0);
-      hamilt::paw::add_K_a_to_LL(*_psp, _isdf, _aug_layout, K_LL_buf);
+      if (_paw_onsite)
+        hamilt::paw::add_K_a_to_LL(*_psp, _isdf, _aug_layout, K_LL_buf);
 
       // dzeta_quG global shape: (nqpts_ibz, Np_smooth, ngm_rho_or_nnr).
       long ngm_z = dzeta_quG.global_shape()[2];
@@ -665,12 +676,16 @@ namespace methods {
       nda::array<ComplexType,2> eta_conj(_N_aug, rho_g_size);
 
       for (int iq = 0; iq < _nqpts_ibz; ++iq) {
-        // Add K_a (q-independent) at every q.
-        _Timer.start("PAW_AUG.K_a");
-        for (long la = 0; la < _N_aug; ++la)
-          for (long lb = 0; lb < _N_aug; ++lb)
-            V_full_q(iq, _Np_smooth + la, _Np_smooth + lb) += K_LL_buf(la, lb);
-        _Timer.stop("PAW_AUG.K_a");
+        // Add K_a (q-independent) at every q. K_LL_buf is zero when
+        // _paw_onsite is false; the explicit guard below is there to skip
+        // a useless O(N_A^2) add per q in that case.
+        if (_paw_onsite) {
+          _Timer.start("PAW_AUG.K_a");
+          for (long la = 0; la < _N_aug; ++la)
+            for (long lb = 0; lb < _N_aug; ++lb)
+              V_full_q(iq, _Np_smooth + la, _Np_smooth + lb) += K_LL_buf(la, lb);
+          _Timer.stop("PAW_AUG.K_a");
+        }
 
         // Smooth-aug Coulomb blocks: build at this q.
         // q_cart for the augmentation η^q is chosen to match thc's Coulomb
@@ -1460,7 +1475,8 @@ namespace methods {
     // Phase 4.2 fills V_GL / V_LL only at q=0 (Hartree-correct); the K_a
     // same-atom block is added at every q. Multi-q exchange/SCF awaits
     // Phase 4.3 which fills q≠0 G-L/L-L blocks via radial-Bessel η^q(G).
-    bool _paw_aug = false;
+    bool _paw_aug = true;
+    bool _paw_onsite = true;           // include K_a one-center kernel for PAW species
     int _Np_smooth = 0;                // smooth-only block size
     int _N_aug = 0;                    // total atom-local rows
     std::shared_ptr<hamilt::pseudopot> _psp;        // lazy via make_pseudopot
