@@ -408,10 +408,19 @@ auto ovlp(mf::MF& mf, boost::mpi3::communicator& comm,
   if(k_range == nda::range{-1,-1}) k_range = nda::range(mf.nkpts_ibz());
   if(b_range == nda::range{-1,-1}) b_range = nda::range(mf.nbnd());
   // this is, unfortunately, code dependent, so fork here!
-  if (mf.mf_type() == mf::qe_source or mf.mf_type() == mf::bdft_source) {
+  if (mf.mf_type() == mf::qe_source) {
+    // QE produces orbitals from the augmented eigenproblem H|ψ̃> = ε S_aug|ψ̃>
+    // (NCPP / USPP / PAW), so the bands are S_aug-orthonormal and the
+    // all-electron / physical band-basis overlap is the identity by
+    // construction. Skip the I/O of psi and write identity directly. See
+    // gen_identity_ovlp docstring for the derivation.
+    return detail::gen_identity_ovlp<MEM>(comm, pgrid,
+                                          mf.nspin(), k_range.size(), b_range.size(),
+                                          bz);
+  } else if (mf.mf_type() == mf::bdft_source) {
     using larray = memory::array<MEM,ComplexType,4>;
     auto psi = mf::read_distributed_orbital_set_ibz<larray>(mf,comm,'w',pgrid,
-                               nda::range(-1,-1), k_range, b_range, bz); 
+                               nda::range(-1,-1), k_range, b_range, bz);
     return detail::gen_ovlp<MEM,false>(comm,psi);
   } else {
     utils::check(mf.mf_type() == mf::pyscf_source, "Source mismatch");
@@ -425,14 +434,19 @@ auto ovlp(mf::MF& mf, boost::mpi3::communicator& comm,
  * @return - A distributed array of overlap matrix with global shape = (nspin, nkpts, nbnd, nbnd)
  */
 template<MEMORY_SPACE MEM = HOST_MEMORY>
-auto ovlp_diagonal(mf::MF& mf, boost::mpi3::communicator& comm, 
+auto ovlp_diagonal(mf::MF& mf, boost::mpi3::communicator& comm,
           nda::range k_range = {-1,-1}, nda::range b_range = {-1,-1},
           std::array<long,3> pgrid = {0}, std::array<long,3> bz = {1,1,2048})
 {
   if(k_range == nda::range{-1,-1}) k_range = nda::range(mf.nkpts_ibz());
   if(b_range == nda::range{-1,-1}) b_range = nda::range(mf.nbnd());
   // this is, unfortunately, code dependent, so fork here!
-  if (mf.mf_type() == mf::qe_source or mf.mf_type() == mf::bdft_source) {
+  if (mf.mf_type() == mf::qe_source) {
+    // See ovlp(): QE bands are S_aug-orthonormal so the physical overlap is I.
+    return detail::gen_identity_ovlp_diagonal<MEM>(comm, pgrid,
+                                                   mf.nspin(), k_range.size(), b_range.size(),
+                                                   bz);
+  } else if (mf.mf_type() == mf::bdft_source) {
     using larray = memory::array<MEM,ComplexType,4>;
     auto psi = mf::read_distributed_orbital_set_ibz<larray>(mf,comm,'w',
              {pgrid[0],pgrid[1],pgrid[2],1},nda::range(-1,-1), k_range, b_range,

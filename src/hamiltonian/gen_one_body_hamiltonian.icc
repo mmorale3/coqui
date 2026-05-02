@@ -247,6 +247,58 @@ auto gen_ovlp(boost::mpi3::communicator& comm,
 }
 
 
+/**
+ * Identity overlap matrix in the band basis (full N×N).
+ *
+ * For PAW and USPP the QE pseudo-orbitals satisfy <ψ̃_n|S_aug|ψ̃_m> = δ_nm,
+ * where S_aug = 1 + Σ_a |p̃_a⟩(<φ_a^AE|φ_b^AE> − <φ_a^PS|φ_b^PS>)⟨p̃_b| is the
+ * augmented overlap operator, and the AE inner product equals the augmented
+ * pseudo inner product: <ψ_n^AE|ψ_m^AE> = <ψ̃_n|S_aug|ψ̃_m> = δ_nm. The AE
+ * (i.e. physical) band-basis overlap is therefore the identity. NCPP is a
+ * trivial case (S_aug = I, so even <ψ̃|ψ̃> = I); for USPP/PAW the pseudo-only
+ * inner product <ψ̃|ψ̃> ≠ I and silently misses the augmentation correction.
+ *
+ * This helper short-circuits the smooth-orbital `gen_ovlp` for QE-sourced
+ * mean-fields and writes the mathematically correct identity directly.
+ */
+template<MEMORY_SPACE MEM>
+auto gen_identity_ovlp(boost::mpi3::communicator& comm,
+                       std::array<long,4> grid,
+                       long nspin, long nkpts, long nbnd,
+                       std::array<long,4> bsize)
+{
+  using larray = memory::array<MEM, ComplexType, 4>;
+  auto Hij = math::nda::make_distributed_array<larray>(
+      comm, grid, {nspin, nkpts, nbnd, nbnd}, bsize);
+  auto Hloc = Hij.local();
+  Hloc() = ComplexType(0.0);
+  auto iloc = Hij.local_range(2);
+  auto jloc = Hij.local_range(3);
+  for (auto [is_l, is] : itertools::enumerate(Hij.local_range(0)))
+    for (auto [ik_l, ik] : itertools::enumerate(Hij.local_range(1)))
+      for (auto [ii_l, ii] : itertools::enumerate(iloc))
+        for (auto [ij_l, ij] : itertools::enumerate(jloc))
+          if (ii == ij) Hloc(is_l, ik_l, ii_l, ij_l) = ComplexType(1.0, 0.0);
+  return Hij;
+}
+
+/**
+ * Diagonal-only identity overlap (rank-3). Companion to gen_identity_ovlp; see
+ * that function's docstring for the math.
+ */
+template<MEMORY_SPACE MEM>
+auto gen_identity_ovlp_diagonal(boost::mpi3::communicator& comm,
+                                std::array<long,3> grid,
+                                long nspin, long nkpts, long nbnd,
+                                std::array<long,3> bsize)
+{
+  using larray3D = memory::array<MEM, ComplexType, 3>;
+  auto Hii = math::nda::make_distributed_array<larray3D>(
+      comm, grid, {nspin, nkpts, nbnd}, bsize);
+  Hii.local()() = ComplexType(1.0);
+  return Hii;
+}
+
 }  // namespace hamilt::detail
 
 #endif
