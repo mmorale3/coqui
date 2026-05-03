@@ -72,12 +72,12 @@ pseudopot::pseudopot(MF_t &mf, std::string const filename) :
   kp_symm(mf.kp_symm()),
   Pskna(make_shared_array<nda::array_view<ComplexType,4>>(*mpi,{1,1,1,1})),   // resize later
   Dnn(make_shared_array<nda::array_view<ComplexType,3>>(*mpi,{1,1,1})),       // resize later
+  Dnn_atom(make_shared_array<nda::array_view<ComplexType,3>>(*mpi,{1,1,1})),        // resize later
   swfc_to_rho(detail::make_wfc_to_rho(*mpi,mf,fft_mesh)),
   svloc(make_shared_array<nda::array_view<ComplexType,3>>(*mpi,{1,1,1})),            // resize later
   svsc(make_shared_array<nda::array_view<ComplexType,3>>(*mpi,{1,1,1})),  // resize later
   qgm(make_shared_array<nda::array_view<ComplexType,3>>(*mpi,{1,1,1})),            // resize later
-  qq_nt_data(make_shared_array<nda::array_view<ComplexType,3>>(*mpi,{1,1,1})),     // resize later
-  Dnn_atom(make_shared_array<nda::array_view<ComplexType,3>>(*mpi,{1,1,1}))        // resize later
+  qq_nt_data(make_shared_array<nda::array_view<ComplexType,3>>(*mpi,{1,1,1}))     // resize later
 {
   // Cache cartesian atom positions for the v_h_paw augmentation step.
   // mf.atomic_positions() returns shape (nat, 3) in cartesian.

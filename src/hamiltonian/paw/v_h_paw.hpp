@@ -208,6 +208,7 @@ inline void add_paw_augmentation_to_VH(
     int npol,
     math::shm::shared_array<Arr>& svr)
 {
+    (void) nk_total;
     if (psp.pp_type() == pp_ncpp_t) return;
     if (psp.qgm_view().size() == 0) return;
 
@@ -235,9 +236,9 @@ inline void add_paw_augmentation_to_VH(
     // as v_h's `nr(G) = un-normalized FFT[Σ_n f_n |ψ̃|²]`. The relation:
     //   nr(G) = N_grid × ρ_proper(G)
     // Hence Δρ_aug,nr(G) = N_grid × becsum × qgm × sf.
+    // double N_grid = (double)mesh(0)*mesh(1)*mesh(2);
     nda::array<ComplexType,1> rho_aug(nnr);
     rho_aug() = ComplexType(0.0);
-    double N_grid = (double)mesh(0)*mesh(1)*mesh(2);
 
     if (mpi.comm.root()) {
         auto qg = psp.qgm_view();           // (nsp, nij_max, ngm)
