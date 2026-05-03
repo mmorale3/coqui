@@ -117,17 +117,24 @@ namespace methods {
       // (NCPP entries get 0 ISDF rows) and in add_K_a_to_LL (skips non-PAW).
       // `paw_onsite` lets the user disable just the K_a contribution for
       // PAW species while still keeping their compensation augmentation.
-      _paw_aug = io::get_value_with_default<bool>(pt, "paw_aug", true);
-      _paw_onsite = io::get_value_with_default<bool>(pt, "paw_onsite", true);
-      _paw_isdf_tol = io::get_value_with_default<double>(pt, "paw_isdf_tol", 1e-12);
-      _paw_isdf_cache_h5 = io::get_value_with_default<std::string>(pt, "paw_isdf_cache_h5", "");
-      {
-        std::string m = io::tolower_copy(io::get_value_with_default<std::string>(pt, "paw_isdf_metric", "coulomb"));
-        _paw_isdf_metric = (m == "l2") ? hamilt::paw::isdf_metric::L2
-                                       : hamilt::paw::isdf_metric::Coulomb;
+      if(_MF->pp_type() == hamilt::pp_paw_t or _MF->pp_type() == hamilt::pp_uspp_t) { 
+        _paw_aug = io::get_value_with_default<bool>(pt, "paw_aug", true);
+        _paw_onsite = io::get_value_with_default<bool>(pt, "paw_onsite", _MF->pp_type() == hamilt::pp_paw_t);
+        _paw_isdf_tol = io::get_value_with_default<double>(pt, "paw_isdf_tol", 1e-12);
+        _paw_isdf_cache_h5 = io::get_value_with_default<std::string>(pt, "paw_isdf_cache_h5", "");
+        {
+          std::string m = io::tolower_copy(io::get_value_with_default<std::string>(pt, "paw_isdf_metric", "coulomb"));
+          _paw_isdf_metric = (m == "l2") ? hamilt::paw::isdf_metric::L2
+                                         : hamilt::paw::isdf_metric::Coulomb;
+        }
+      } else {
+        _paw_aug = false;
+        _paw_onsite = false;
       }
       if(_storage == eri_storage_e::outcore and _eri_file == "") 
         _eri_file = "./thc.eri.h5";
+
+// MAM: use mf.pp_type() to determine what needs to be done. If ncpp, turn off any PAW/USPP related work.   
 
       if (intialize) {
         if (isdf_only) {
@@ -387,6 +394,8 @@ namespace methods {
         _Timer.start("PAW_AUG");
         auto dispatch = [&]<MEMORY_SPACE MEM>() {
           _Timer.start("PAW_AUG.dzeta_build");
+// MAM: No need to redo this again, which is expensive. dzeta_quG can be optionally
+//      returned by evaluate. FIX!!!
           auto [ri,dXa,dXb] = _thc_builder_opt.value().interpolating_points<MEM>(
               0, _Np_smooth, x_range, y_range);
           (void)ri;
@@ -939,6 +948,7 @@ namespace methods {
       print_thc_summary();
     }
 
+    // MAM: No PAW here yet!!!
     void build_isdf_only(bool check_accuracy=true, bool write_zeta_on_fft_mesh=false) {
       _Timer.start("BUILD_TOTAL");
 

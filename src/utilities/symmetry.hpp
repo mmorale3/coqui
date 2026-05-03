@@ -974,7 +974,6 @@ auto generate_dmatrix(MF_t &mf,
   } else {
     shm_dmat = make_shared_array<Array_view_3D_t>(*mpi, {sk.size(),nbnd,nbnd});
     shm_dmat.set_zero();
-
   }
 
 // MAM: This assumes an orthonormal basis, the general formula is:

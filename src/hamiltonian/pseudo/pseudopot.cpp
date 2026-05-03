@@ -560,19 +560,8 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
 
   // Phase 1+: build atom-resolved effective D for USPP/PAW.
   //
-  // QE's compute_deff (PW/src/compute_deff.f90) shows that the eigenvalue
-  // equation H|ψ⟩ = ε S|ψ⟩ is solved with effective D coefficients
-  //   deff(a, I, J) = deeq(I, J, a, current_spin) − ε * qq_at(I, J, a)   (USPP/PAW)
-  //   deff(a, I, J) = deeq(I, J, a, current_spin)                        (NCPP)
-  //
-  // QE's `newd_g` overwrites `deeq` with the SCF integral and ADDS `dvan`
-  // back at the end, so at SCF convergence `deeq` already contains
   //   deeq = ∫ V_eff(r) Q^IJ(r) dr  + ΔPAW^Hxc + dvan      (in Rydberg)
   // Therefore for USPP/PAW we use `deeq` directly (not `dvan + deeq`).
-  //
-  // The band-dependent −ε qq_at part is folded in below by per-band
-  // application during ⟨ψ_n|H|ψ_n⟩ evaluation; here we just store the
-  // band-independent piece deeq.
   //
   // pw2coqui writes deeq(nhm, nhm, nat, nspin) (Fortran column-major) so
   // on the C++ side the read shape is (nspin, nat, nhm, nhm). We collapse
@@ -1027,10 +1016,6 @@ void pseudopot::add_vnl_impl(nda::range k_range, nda::range b_range,
   }
 }
 
-// USPP/PAW augmentation overlap: implementation moved to pseudopot.h so the
-// templated method can be instantiated from external callers (test code,
-// v_h_paw, etc.).
-
 // MAM: This routine should take an mpi_context and use it, instead of mpi
 //      since we are currently calling it with a different set of processes
 template< nda::ArrayOfRank<3> Arr3, nda::ArrayOfRank<4> Arr4>
@@ -1143,40 +1128,13 @@ void pseudopot::add_vpp_impl(boost::mpi3::communicator& comm,
   // (built in read_vnl_h5).
   if (ptype == pp_ncpp_t)
     add_vnl_impl(k_range, b_range, Dnn.local(),      Hij);
-  else
+  else {
+    // MAM: In USPP/PAW, we are using the DFT/QE deeq. We need to recalculate
+    //      the augmentation term here (need to make sure to remove any terms from DFT/QE) 
+    //      since we are generally going to be going SCF calculations where Veff changes.
+    app_warning(" PAW implementation of Vnl is not yet complete !!!");
     add_vnl_impl(k_range, b_range, Dnn_atom.local(), Hij);
-}
-
-// Phase 2 self-consistency: ΔC symmetries.
-double pseudopot::validate_deltaC_symmetry(double tol) const
-{
-  double max_viol = 0.0;
-  for (size_t nt=0; nt<paw_species.size(); ++nt) {
-    auto const& sp = paw_species[nt];
-    if (!sp.is_paw) continue;
-    if (sp.deltaC.size() == 0) continue;
-    long n = sp.deltaC.extent(0);
-    utils::check(sp.deltaC.extent(1) == n &&
-                 sp.deltaC.extent(2) == n &&
-                 sp.deltaC.extent(3) == n,
-                 "validate_deltaC_symmetry: deltaC for species {} is not "
-                 "n^4-shaped: {}x{}x{}x{}", nt, n,
-                 sp.deltaC.extent(1), sp.deltaC.extent(2), sp.deltaC.extent(3));
-    auto const& C = sp.deltaC;
-    for (long a=0; a<n; ++a)
-    for (long b=0; b<n; ++b)
-    for (long c=0; c<n; ++c)
-    for (long d=0; d<n; ++d) {
-      double v1 = std::abs(C(a,b,c,d) - C(c,d,a,b));     // pair-swap
-      double v2 = std::abs(C(a,b,c,d) - C(b,a,c,d));     // index-swap left
-      double v3 = std::abs(C(a,b,c,d) - C(a,b,d,c));     // index-swap right
-      max_viol = std::max({max_viol, v1, v2, v3});
-    }
   }
-  utils::check(max_viol < tol,
-               "validate_deltaC_symmetry: max violation {} exceeds tol {}",
-               max_viol, tol);
-  return max_viol;
 }
 
 // Standalone helper: add the USPP/PAW augmentation to a smooth-grid pair

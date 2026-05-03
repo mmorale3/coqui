@@ -428,17 +428,6 @@ public:
   }
 
   /**
-   * Phase 2 self-consistency: assert ΔC_{αβγδ} symmetries from the .tex
-   * (Eq. paw-local-correction). For each PAW species:
-   *   ΔC[α,β,γ,δ] == ΔC[γ,δ,α,β]                  (Coulomb-bilinear swap)
-   *   ΔC[α,β,γ,δ] == ΔC[β,α,γ,δ]                  (real partial waves)
-   *   ΔC[α,β,γ,δ] == ΔC[α,β,δ,γ]                  (real partial waves)
-   * Returns the maximum violation across species; throws via utils::check
-   * when violation exceeds tol. Skipping species without deltaC populated.
-   */
-  double validate_deltaC_symmetry(double tol = 1e-10) const;
-
-  /**
    * Add the contributions of a generic pseudopotentials:
    *
    *   1. Contributions from the local potentials are added to wavefunctions "hpsi"

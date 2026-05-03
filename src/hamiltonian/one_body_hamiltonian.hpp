@@ -414,6 +414,15 @@ auto ovlp(mf::MF& mf, boost::mpi3::communicator& comm,
     // all-electron / physical band-basis overlap is the identity by
     // construction. Skip the I/O of psi and write identity directly. See
     // gen_identity_ovlp docstring for the derivation.
+    // default grid compatible with mf::read_distributed_orbital_set_ibz
+    long np0 = std::accumulate(pgrid.cbegin(), pgrid.cend(), long(1), std::multiplies<>{});
+    if(np0 == 0) {
+      long sz = comm.size();
+      long ps = (sz%mf.nspin()==0?mf.nspin():1);
+      long n_ = sz/ps;
+      long pk = utils::find_proc_grid_max_rows(n_,k_range.size());
+      pgrid = {ps,pk,n_/pk,1};
+    }
     return detail::gen_identity_ovlp<MEM>(comm, pgrid,
                                           mf.nspin(), k_range.size(), b_range.size(),
                                           bz);
@@ -443,6 +452,14 @@ auto ovlp_diagonal(mf::MF& mf, boost::mpi3::communicator& comm,
   // this is, unfortunately, code dependent, so fork here!
   if (mf.mf_type() == mf::qe_source) {
     // See ovlp(): QE bands are S_aug-orthonormal so the physical overlap is I.
+    long np0 = std::accumulate(pgrid.cbegin(), pgrid.cend(), long(1), std::multiplies<>{});
+    if(np0 == 0) {
+      long sz = comm.size();
+      long ps = (sz%mf.nspin()==0?mf.nspin():1);
+      long n_ = sz/ps;
+      long pk = utils::find_proc_grid_max_rows(n_,k_range.size());
+      pgrid = {ps,pk,n_/pk};
+    }
     return detail::gen_identity_ovlp_diagonal<MEM>(comm, pgrid,
                                                    mf.nspin(), k_range.size(), b_range.size(),
                                                    bz);

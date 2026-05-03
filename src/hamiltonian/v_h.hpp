@@ -43,6 +43,7 @@ using boost::mpi3::shared_communicator;
 // TODO:
 //   1. construct rho(r) from non-orthogonal basis
 //   2. symmetrize rho(r)
+//   3. Move fuse v_h_paw with v_h, no need to separate interfaces
 
 /*
  * MAM: Implementation uses 2 copies of the charge density per core in a node. 
