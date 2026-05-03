@@ -327,6 +327,9 @@ class MF
     auto efermi() const 
     { return std::visit( [&](auto&& v) { return v.get_sys().efermi; }, var ); }
 
+    // symmetry rotations
+    void setup_symmetry_rotations() 
+    { std::visit( [&](auto&& v) { v.setup_symmetry_rotations(); }, var ); }
     decltype(auto) symmetry_rotation(long s, long k) const
     {
       auto ns = qsymms().extent(0);

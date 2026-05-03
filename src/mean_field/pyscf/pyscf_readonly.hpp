@@ -399,6 +399,8 @@ namespace mf {
         }
       }
 
+      void setup_symmetry_rotations() {}
+
       decltype(auto) symmetry_rotation(long s, long k) const
       { 
         utils::check( false, "Symmetry operations are not allowed in pyscf backend.");

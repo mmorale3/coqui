@@ -275,6 +275,9 @@ namespace methods {
       nda::array<ComplexType,2> Tm(nbnd,nbnd);
       _Timer.stop("SIGMA_ALLOC_K");
 
+      // setup symmetry rotations if needed
+      if(MF->qsymms().size()>1) MF->setup_symmetry_rotations();
+
       sSigma_tskij.win().fence();
       for (size_t it=0; it<nt_loc; it++) {
         long it_global = (minus_t)? nt-(it+t_origin)-1 : it+t_origin;

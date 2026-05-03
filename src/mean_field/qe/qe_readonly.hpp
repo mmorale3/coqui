@@ -114,11 +114,6 @@ public:
     fft_mesh( ecut_>0.0 ? nda::stack_array<int, 3>{grids::find_fft_mesh(sys.mpi->comm,ecut,sys.recv,sys.bz().symm_list)} : sys.fft_mesh),
     wfc_g(detail::wfc_grid_from_h5(sys))
   {
-    // build symmetry rotations
-    auto slist = utils::find_inverse_symmetry(sys.bz().qsymms,sys.bz().symm_list);
-    if(slist.size() > 0) 
-      std::tie(sk_to_n,dmat) = utils::generate_dmatrix<true>(*this,sys.bz().symm_list,slist);
-
     print_metadata();
   }
 
@@ -131,11 +126,6 @@ public:
     fft_mesh( ecut_>0.0 ? nda::stack_array<int, 3>{grids::find_fft_mesh(sys.mpi->comm,ecut,sys.recv,sys.bz().symm_list)} : sys.fft_mesh),
     wfc_g(detail::wfc_grid_from_h5(sys))
   {
-    // build symmetry rotations
-    auto slist = utils::find_inverse_symmetry(sys.bz().qsymms,sys.bz().symm_list);
-    if(slist.size() > 0) 
-      std::tie(sk_to_n,dmat) = utils::generate_dmatrix<true>(*this,sys.bz().symm_list,slist);
-
     print_metadata();
   }
 
@@ -148,11 +138,6 @@ public:
     fft_mesh( ecut_>0.0 ? nda::stack_array<int, 3>{grids::find_fft_mesh(sys.mpi->comm, ecut, sys.recv, sys.bz().symm_list)} : sys.fft_mesh),
     wfc_g(detail::wfc_grid_from_h5(sys))
   {
-    // build symmetry rotations
-    auto slist = utils::find_inverse_symmetry(sys.bz().qsymms, sys.bz().symm_list);
-    if(slist.size() > 0)
-      std::tie(sk_to_n,dmat) = utils::generate_dmatrix<true>(*this, sys.bz().symm_list, slist);
-
     print_metadata();
   }
 
@@ -272,6 +257,19 @@ public:
       nda::range r_=r;
       check_dimensions(OT,Orb(ik,nda::ellipsis{}),r_);
       orbital_set_from_h5(OT,ispin,k,b_rng,p_rng,Orb(ik,nda::ellipsis{}),r_);
+    }
+  }
+
+  // setup should be deterministic, so we are going to assume that if dmat is not empty
+  // that this was already called
+  void setup_symmetry_rotations() 
+  {
+    if(dmat.size() == 0) 
+    {
+      // build symmetry rotations
+      auto slist = utils::find_inverse_symmetry(sys.bz().qsymms,sys.bz().symm_list);
+      if(slist.size() > 0)
+        std::tie(sk_to_n,dmat) = utils::generate_dmatrix<true>(*this,sys.bz().symm_list,slist);
     }
   }
 

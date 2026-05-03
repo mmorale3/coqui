@@ -51,6 +51,9 @@ namespace methods {
     auto qsymms = _MF->qsymms();
     auto nsym = qsymms.size();
 
+    // setup symmetry rotations if needed
+    if(qsymms.size()>1) _MF->setup_symmetry_rotations();
+
     // collation matrix (partition over Np by u_rng)
     using comm_t = std::decay_t<decltype(mpi->comm)>;
     memory::darray_t<Array_6D_t,comm_t> dT_skIPa(std::addressof(mpi->comm),

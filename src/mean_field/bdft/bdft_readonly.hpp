@@ -179,11 +179,6 @@ public:
     ksymms(detail::make_ksymms(sys.bz())),
     swfc_maps(detail::make_swfc_maps(sys,ksymms,fft_mesh,wfc_g))
   {
-    // build symmetry rotations: only correct with orthogonal bases, fix!
-    auto slist = utils::find_inverse_symmetry(sys.bz().qsymms,sys.bz().symm_list);
-    if(slist.size() > 0) 
-      std::tie(sk_to_n,dmat) = utils::generate_dmatrix<true>(*this, sys.bz().symm_list, slist);
-
     print_metadata("CoQuí mean-field reader");
   }
 
@@ -195,11 +190,6 @@ public:
     ksymms(detail::make_ksymms(sys.bz())),
     swfc_maps(detail::make_swfc_maps(sys,ksymms,fft_mesh,wfc_g))
   {
-    // build symmetry rotations
-    auto slist = utils::find_inverse_symmetry(sys.bz().qsymms,sys.bz().symm_list);
-    if(slist.size() > 0) 
-      std::tie(sk_to_n,dmat) = utils::generate_dmatrix<true>(*this,sys.bz().symm_list,slist);
-
     print_metadata("CoQuí mean-field reader");
   }
 
@@ -221,11 +211,6 @@ public:
     ksymms(detail::make_ksymms(sys.bz())),
     swfc_maps(detail::make_swfc_maps(sys,ksymms,fft_mesh,wfc_g))
   {
-    // build symmetry rotations
-    auto slist = utils::find_inverse_symmetry(sys.bz().qsymms,sys.bz().symm_list);
-    if(slist.size() > 0) 
-      std::tie(sk_to_n,dmat) = utils::generate_dmatrix<true>(*this,sys.bz().symm_list,slist);
-
     print_metadata("CoQuí mean-field reader");
   }
 
@@ -328,12 +313,6 @@ public:
     }
     sys.mpi->comm.barrier();
 
-    // build symmetry rotations
-    auto slist = utils::find_inverse_symmetry(sys.bz().qsymms,sys.bz().symm_list);
-    if(slist.size() > 0) 
-      std::tie(sk_to_n,dmat) = utils::generate_dmatrix<true>(*this,sys.bz().symm_list,slist);
-    sys.mpi->comm.barrier();
-
     print_metadata("CoQuí mean-field reader (from mf object)");
     sys.mpi->comm.barrier();
   }
@@ -427,11 +406,6 @@ public:
     }
     sys.mpi->comm.barrier();
 
-
-    // build symmetry rotations
-    auto slist = utils::find_inverse_symmetry(sys.bz().qsymms,sys.bz().symm_list);
-    if(slist.size() > 0) 
-      std::tie(sk_to_n,dmat) = utils::generate_dmatrix<true>(*this,sys.bz().symm_list,slist);
 
     print_metadata("CoQuí mean-field reader (from mf object with orbital selection)");
     sys.mpi->comm.barrier();
@@ -568,6 +542,19 @@ public:
     get_orbital_set(OT,_ispin,k_rng,b_rng,O_,r);
   }
 
+  // setup should be deterministic, so we are going to assume that if dmat is not empty
+  // that this was already called
+  void setup_symmetry_rotations() 
+  {
+    if(dmat.size() == 0) 
+    {
+      // build symmetry rotations
+      auto slist = utils::find_inverse_symmetry(sys.bz().qsymms,sys.bz().symm_list);
+      if(slist.size() > 0)
+        std::tie(sk_to_n,dmat) = utils::generate_dmatrix<true>(*this,sys.bz().symm_list,slist);   
+    }
+  }
+
   decltype(auto) symmetry_rotation(long s, long k) const
   { 
     long ns = sys.bz().qsymms.extent(0);
@@ -587,10 +574,7 @@ public:
   void set_pseudopot(std::shared_ptr<hamilt::pseudopot> const& psp_) { psp = psp_; }
   std::shared_ptr<hamilt::pseudopot> get_pseudopot() { return psp; }
 
-  // Hardcoded to NCPP for now: bdft has not been updated to carry PAW/USPP
-  // augmentation data. Lift this once bdft handles PAW so guards in the
-  // orbital-overlap consumers (generate_dmatrix, compute_mmn, etc.) start
-  // firing correctly on bdft + PAW workloads.
+  // type of pseudopotential treatment
   hamilt::pp_type_e pp_type() const { return hamilt::pp_ncpp_t; }
 
   // close h5 handles 

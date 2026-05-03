@@ -353,6 +353,9 @@ namespace methods {
       auto qk_to_k2     = MF->qk_to_k2();
       auto ks_to_k      = MF->ks_to_k();
 
+      // setup symmetry rotations if needed
+      if(MF->qsymms().size()>1) MF->setup_symmetry_rotations();
+
       _Timer.start("ALLOC");
       // For cases where trev(n)==true, use the conjugate of the trev-pair: kp_trev_pair(n).  
       auto dDm_skPQ = make_distributed_array<local_Array_4D_t>(mpi->comm, {1, 1, np_P, np_Q},

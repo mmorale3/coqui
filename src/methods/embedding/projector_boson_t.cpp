@@ -86,6 +86,9 @@ namespace methods {
     nda::array<ComplexType, 2> Cfull_jb(_MF->nbnd(), nImpOrbs);
     nda::array<ComplexType, 2> tmp_ib(_MF->nbnd(), nImpOrbs);
 
+    // setup symmetry rotations if needed
+    if(qsymms.size()>1) _MF->setup_symmetry_rotations();
+
     using math::sparse::T;
     using math::sparse::csrmm;
     sB_qIPab.win().fence();

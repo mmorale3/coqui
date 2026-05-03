@@ -128,6 +128,8 @@ public:
 
   template<typename... Args> void get_orbital_set(Args&&...) {  _abort_("get_orbital_set"); }
 
+  void setup_symmetry_rotations() {}
+
   template<typename... Args> decltype(auto) symmetry_rotation(Args&&...) const
   { 
     _abort_("symmetry_rotation");
