@@ -134,13 +134,17 @@ public:
     return std::make_tuple(false,  std::addressof(dmat.at(0)));
   }
 
-  void set_pseudopot([[maybe_unused]] std::shared_ptr<hamilt::pseudopot> const& psp_) 
-  { _abort_("set_pseudopot"); } 
-  std::shared_ptr<hamilt::pseudopot> get_pseudopot() 
-  {  
-    _abort_("get_pseudopot"); 
+  void set_pseudopot([[maybe_unused]] std::shared_ptr<hamilt::pseudopot> const& psp_)
+  { _abort_("set_pseudopot"); }
+  std::shared_ptr<hamilt::pseudopot> get_pseudopot()
+  {
+    _abort_("get_pseudopot");
     return std::shared_ptr<hamilt::pseudopot>{nullptr};
   }
+
+  // Model Hamiltonian has no pseudopotential; reported as pp_FILE_t so
+  // augmentation guards stay inactive here.
+  hamilt::pp_type_e pp_type() const { return hamilt::pp_FILE_t; }
 
   void close() {}
 

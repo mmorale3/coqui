@@ -413,6 +413,10 @@ namespace mf {
       void set_pseudopot(std::shared_ptr<hamilt::pseudopot> const& psp_) { psp = psp_; }
       std::shared_ptr<hamilt::pseudopot> get_pseudopot() { return psp; }
 
+      // pyscf path is not pseudopotential-driven in the QE/PAW sense; report
+      // pp_FILE_t so guards that abort on USPP/PAW remain inactive here.
+      hamilt::pp_type_e pp_type() const { return hamilt::pp_FILE_t; }
+
     private:
       pyscf_system sys;
       // plane wave cutoff of the FFT grid for AOs

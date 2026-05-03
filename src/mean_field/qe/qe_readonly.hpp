@@ -291,8 +291,13 @@ public:
     return std::make_tuple(sys.bz().kp_trev(k),  std::addressof(dmat.at(n)));
   }
 
-  void set_pseudopot(std::shared_ptr<hamilt::pseudopot> const& psp_) { psp = psp_; } 
-  std::shared_ptr<hamilt::pseudopot> get_pseudopot() { return psp; } 
+  void set_pseudopot(std::shared_ptr<hamilt::pseudopot> const& psp_) { psp = psp_; }
+  std::shared_ptr<hamilt::pseudopot> get_pseudopot() { return psp; }
+
+  // Pseudopotential type as recorded by qe_interface::read_h5 from the
+  // /Hamiltonian/pp_type attribute on the coqui h5. Returns pp_FILE_t for
+  // xml-source qe runs (the type isn't currently parsed from UPF here).
+  hamilt::pp_type_e pp_type() const { return sys.pp_type; }
 
   void close()
   {

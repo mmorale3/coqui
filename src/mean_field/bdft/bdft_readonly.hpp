@@ -587,6 +587,12 @@ public:
   void set_pseudopot(std::shared_ptr<hamilt::pseudopot> const& psp_) { psp = psp_; }
   std::shared_ptr<hamilt::pseudopot> get_pseudopot() { return psp; }
 
+  // Hardcoded to NCPP for now: bdft has not been updated to carry PAW/USPP
+  // augmentation data. Lift this once bdft handles PAW so guards in the
+  // orbital-overlap consumers (generate_dmatrix, compute_mmn, etc.) start
+  // firing correctly on bdft + PAW workloads.
+  hamilt::pp_type_e pp_type() const { return hamilt::pp_ncpp_t; }
+
   // close h5 handles 
   void close()
   {

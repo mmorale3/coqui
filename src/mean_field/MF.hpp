@@ -352,10 +352,20 @@ class MF
     { std::visit( [&](auto&& v) { v.get_orbital_set(OT,ispin,k_rng,b_rng,p_rng,std::forward<A4D>(Orb),r); }, var ); }
 
     /* accessor functions for pseudopot shared pointer */
-    void set_pseudopot(std::shared_ptr<hamilt::pseudopot> const& psp) 
+    void set_pseudopot(std::shared_ptr<hamilt::pseudopot> const& psp)
     { return std::visit( [&](auto&& v) { v.set_pseudopot(psp); }, var ); }
-    std::shared_ptr<hamilt::pseudopot> get_pseudopot() 
+    std::shared_ptr<hamilt::pseudopot> get_pseudopot()
     { return std::visit( [&](auto&& v) { return v.get_pseudopot(); }, var ); }
+
+    // Backend-reported pseudopotential type. Available without constructing
+    // the full hamilt::pseudopot. Backends:
+    //   qe    : value cached in qe_system from /Hamiltonian/pp_type
+    //   bdft  : hardcoded pp_ncpp_t (TODO: lift once bdft handles PAW/USPP)
+    //   pyscf : pp_FILE_t
+    //   model : pp_FILE_t
+    // See hamilt::mf_requires_augmentation in pseudopot.h.
+    hamilt::pp_type_e pp_type() const
+    { return std::visit( [&](auto&& v) { return v.pp_type(); }, var ); }
 
     /* closes record */
     template<class... Args>

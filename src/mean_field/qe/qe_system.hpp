@@ -34,6 +34,7 @@
 
 #include "mean_field/mf_source.hpp"
 #include "mean_field/symmetry/bz_symmetry.hpp"
+#include "hamiltonian/pseudo/pseudopot_type.hpp"
 
 namespace mf
 {
@@ -50,6 +51,7 @@ struct qe_system
   qe_system(std::shared_ptr<utils::mpi_context_t<mpi3::communicator>> mpi_,
             std::string out, std::string pre,
             mf_input_file_type_e input_file_type_,
+            hamilt::pp_type_e pp_type_,
             bool no_q_sym,
             double alat_, int npwx_, int ng,
             int ngms_, double nelec_, int ndims_, int nspin_,
@@ -75,6 +77,7 @@ struct qe_system
         prefix(pre),
         filename(outdir+"/"+prefix+".coqui.h5"),
         input_file_type(input_file_type_),
+        pp_type(pp_type_),
         ndims(ndims_),
         nspin(nspin_),
         nspin_in_basis(nspin),      // no choice in this backend
@@ -144,6 +147,7 @@ struct qe_system
   qe_system(std::shared_ptr<utils::mpi_context_t<mpi3::communicator>> mpi_,
             std::string out, std::string pre,
             mf_input_file_type_e input_file_type_,
+            hamilt::pp_type_e pp_type_,
             [[maybe_unused]] bool no_q_sym,
             double alat_, int npwx_, int ng,
             int ngms_, double nelec_, int ndims_, int nspin_,
@@ -169,6 +173,7 @@ struct qe_system
         prefix(pre),
         filename(outdir+"/"+prefix+".coqui.h5"),
         input_file_type(input_file_type_),
+        pp_type(pp_type_),
         ndims(ndims_),
         nspin(nspin_),
         npol(npol_),                  // no choice right now, hardcoded in QE
@@ -259,6 +264,14 @@ struct qe_system
     //BZ
     symm.save(sgrp);
 
+    // pp_type
+    std::string pp_type_str;
+    if(pp_type == hamilt::pp_ncpp_t) pp_type_str = "ncpp"; 
+    else if(pp_type == hamilt::pp_uspp_t) pp_type_str = "uspp"; 
+    else if(pp_type == hamilt::pp_paw_t) pp_type_str = "paw"; 
+    else utils::check(false,"Unexpected pp_type.");
+    h5::h5_write_attribute(sgrp, "pp_type", pp_type_str);
+
     // unit cell
     h5::h5_write_attribute(sgrp, "number_of_atoms", natoms);
     h5::h5_write_attribute(sgrp, "number_of_species", nspecies);
@@ -274,6 +287,7 @@ struct qe_system
     nda::h5_write(sgrp, "atomic_positions", at_pos, false);
     nda::h5_write(sgrp, "lattice_vectors", latt, false);
     nda::h5_write(sgrp, "reciprocal_vectors", recv, false);
+    
 
     nda::h5_write(sgrp, "kpoint_weights", k_weight, false);
         
@@ -308,7 +322,10 @@ struct qe_system
   std::string filename = "";
 
   // type of input file, hardwired to h5
-  mf_input_file_type_e input_file_type;  
+  mf_input_file_type_e input_file_type;
+
+  // type of pseudopotential
+  hamilt::pp_type_e pp_type = hamilt::pp_ncpp_t;
 
   // basic info
   int ndims = 3;                        // number of dimensions

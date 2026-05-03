@@ -16,6 +16,7 @@
 #include "numerics/nda_functions.hpp"
 #include "mean_field/MF.hpp"
 #include "wannier/wan90_utils.hpp"
+#include "hamiltonian/pseudo/pseudopot_query.h"
 
 namespace wannier
 {
@@ -154,6 +155,15 @@ auto scdm(utils::mpi_context_t<mpi3::communicator> &mpi, mf::MF &mf, ptree const
           nda::array<int, 1> const& kp_map, nda::array<double,2> const& wann_kp,
           nda::array<int,1> const& band_list, bool transpose, bool write_to_file)
 {
+  // SCDM operates on the smooth/pseudo orbitals to build the Amn projector.
+  // For USPP/PAW the all-electron projector differs by the augmentation
+  // contribution Σ_a Q_ab^I <p̃_a|ψ̃><ψ̃|p̃_b>; the resulting Wannier
+  // initialization would be silently inconsistent with the AE wavefunction.
+  // Aborting until the augmentation-aware path is in place.
+  utils::check(!hamilt::mf_requires_augmentation(mf),
+    "wannier::scdm: column-pivoted QR/SVD is performed on smooth-only "
+    "orbitals; the USPP/PAW augmentation contribution is missing. "
+    "Aborting until the augmentation-aware path is in place.");
   using Array_view_3D_t = nda::array_view<ComplexType,3>;
 
   app_log(2, "\n Generating localized orbitals with SCDM \n");

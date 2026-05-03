@@ -283,7 +283,7 @@ qe_system read_xml(std::shared_ptr<utils::mpi_context_t<mpi3::communicator>> mpi
   utils::check(symm_list.size() == nsym,
                "Error parsing symmetries from qe::xml. nsym:{}, # symmetries found:{}",nsym,symm_list.size());
 
-  return qe_system(std::move(mpi),outdir,prefix,xml_input_type,no_q_sym,
+  return qe_system(std::move(mpi),outdir,prefix,xml_input_type,hamilt::pp_ncpp_t,no_q_sym,
 		   alat,npwx,ngm,ngms,nelec,3,nspin,(noncolin?2:1),spinorbit,
 		   ecrho,species,at_ids,at_pos,fft_mesh,
 		   lattv,bg,kp_grid,kpts,k_weight,npw,eigval,occ,symm_list,efermi,not noinv);
@@ -482,18 +482,41 @@ qe_system read_h5(std::shared_ptr<utils::mpi_context_t<mpi3::communicator>> mpi,
   std::map<std::string,double> total_energy;
   total_energy[std::string("ewald")] = enuc;
 
+  // read pseudopotential type
+  hamilt::pp_type_e pp_type = hamilt::pp_ncpp_t;
+  std::string pp_type_str = "none";
+  if(H5Aexists(h5::hid_t(sgrp), "pp_type")) {
+    h5::h5_read_attribute(sgrp, "pp_type", pp_type_str);
+  } else if (grp.has_subgroup("Hamiltonian")) {
+    auto hgrp = grp.open_group("Hamiltonian");
+    if (H5Aexists(h5::hid_t(hgrp), "pp_type")) {
+      h5::h5_read_attribute(hgrp, "pp_type", pp_type_str);
+    } else {
+      utils::check(false,
+        "qe_interface::read_h5: Could not find pp_type in either System or Hamiltonian datasets.");
+    }
+  } else {
+    utils::check(false,
+      "qe_interface::read_h5: Could not find pp_type in either System or Hamiltonian datasets.");
+  }
+  if      (pp_type_str == "ncpp") pp_type = hamilt::pp_ncpp_t;
+  else if (pp_type_str == "uspp") pp_type = hamilt::pp_uspp_t;
+  else if (pp_type_str == "paw")  pp_type = hamilt::pp_paw_t;
+  else utils::check(false,"qe_interface::read_h5: unrecognised pp_type='{}' in {}",
+                   pp_type_str, outdir+"/"+prefix+".coqui.h5");
+
   if( mf::bz_symm::can_init_from_h5(sgrp) ) {
-    mf::bz_symm bz(sgrp); 
-    return qe_system(std::move(mpi),outdir,prefix,h5_input_type,false,
+    mf::bz_symm bz(sgrp);
+    return qe_system(std::move(mpi),outdir,prefix,h5_input_type,pp_type,false,
                      alat,npwx,ngm,ngms,nelec,ndims,nspin,npol,spinorbit,
                      ecrho,species,at_ids,at_pos,fft_mesh,
                      lattv,bg,kp_grid,kpts,k_weight,npw,eigval,occ,symm_list,efermi,bz);
   } else {
-    return qe_system(std::move(mpi),outdir,prefix,h5_input_type,false,
+    return qe_system(std::move(mpi),outdir,prefix,h5_input_type,pp_type,false,
                      alat,npwx,ngm,ngms,nelec,ndims,nspin,npol,spinorbit,
                      ecrho,species,at_ids,at_pos,fft_mesh,
                      lattv,bg,kp_grid,kpts,k_weight,npw,eigval,occ,symm_list,efermi,not noinv);
-  } 
+  }
 }
 
 } // qe

@@ -33,6 +33,7 @@
 #include "numerics/sparse/csr_utils.hpp"
 #include "numerics/device_kernels/kernels.h"
 #include "utilities/details/symmetry_utils.hpp"
+#include "hamiltonian/pseudo/pseudopot_query.h"
 
 namespace utils
 {
@@ -799,6 +800,18 @@ auto generate_dmatrix(MF_t &mf,
 
   // checks!
   utils::check(mf.has_wfc_grid(), "Error in generate_dmat: has_wfc_grid==false");
+
+  // The d-matrix elements are <ψ_m(Sk) | ψ_n(k_ibz, rotated)>, computed
+  // here from the smooth (pseudo) wavefunction only. For USPP/PAW this
+  // misses the augmentation term Σ_a Q_ab^I <p̃_a|ψ̃><ψ̃|p̃_b> and yields
+  // silently-wrong d-matrices that have surfaced as RPA NaN downstream.
+  // Aborting here until the augmentation-aware path is implemented; see
+  // notes/dmatrix_paw_generalization.{tex,pdf} for the working equations.
+  utils::check(!hamilt::mf_requires_augmentation(mf),
+    "generate_dmatrix: orbital overlaps used for the symmetry d-matrix are "
+    "computed using only the smooth/pseudo wavefunction. For USPP/PAW the "
+    "augmentation contribution is missing and silently corrupts the rotation. "
+    "Aborting until the augmentation-aware path is in place.");
 
   auto mpi = mf.mpi();
   auto comm = mpi->comm;

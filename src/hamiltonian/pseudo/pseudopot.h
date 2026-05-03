@@ -491,7 +491,7 @@ public:
 };
 
 // if mf.get_pseudopot() returns a valid shared pointer, return it.
-// otherwise, construct a new object managed by a shared pointer, 
+// otherwise, construct a new object managed by a shared pointer,
 // store the pointer in mf and return it.
 template<typename MF_t>
 std::shared_ptr<pseudopot> make_pseudopot(MF_t &mf)
@@ -500,8 +500,8 @@ std::shared_ptr<pseudopot> make_pseudopot(MF_t &mf)
   auto mpi = mf.mpi();
   mpi->comm.barrier();
   if(mf.get_pseudopot()) { return mf.get_pseudopot(); }
-  else { 
-    //
+  else {
+    // Construct object, attach lazy reference to mf, return
     auto psp = std::make_shared<pseudopot>(mf);
     mf.set_pseudopot(psp);
     if( not mf.get_pseudopot() )
