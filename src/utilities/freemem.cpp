@@ -19,24 +19,41 @@
  */
 
 
-#ifdef __linux__
-#include <sys/sysinfo.h>
-#include <sys/resource.h>
+#if defined(__linux__)
+  #include <sys/sysinfo.h>
+  #include <sys/resource.h>
+#elif defined(__APPLE__)
+  #include <mach/mach.h>
+  #include <TargetConditionals.h>
+#endif
+#if defined(ENABLE_CUDA)
+  #include "cuda_runtime.h"
 #endif
 #include "IO/app_loggers.h"
-#if defined(ENABLE_CUDA)
-#include "cuda_runtime.h"
-#endif
 
 namespace utils {
 
 std::size_t freemem()
 {
-#ifdef __linux__
+#if defined(__linux__)
   struct sysinfo si;
   sysinfo(&si);
   si.freeram += si.bufferram;
   return si.freeram >> 20;
+#elif defined(__APPLE__)
+  vm_statistics64_data_t vm_stats;
+  mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+  vm_size_t page_size;
+
+  if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t)&vm_stats, &count) == KERN_SUCCESS) {
+    host_page_size(mach_host_self(), &page_size);
+      
+    // On macOS, Free + Inactive + Speculative is the "available" pool
+    uint64_t available_pages = (uint64_t)vm_stats.free_count + vm_stats.inactive_count + vm_stats.speculative_count;
+    return (long)((available_pages * page_size) >> 20);
+  } else {
+    return 0;
+  }
 #else
   return 0;
 #endif
