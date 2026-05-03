@@ -1,0 +1,286 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage[hidelinks]{hyperref}
+\usepackage{microtype}
+
+\title{Symmetry $d$-matrices: orthogonal, augmented, non-orthogonal}
+\author{CoQui developer notes}
+\date{2026-05-02}
+
+\newcommand{\bra}[1]{\langle #1 |}
+\newcommand{\ket}[1]{| #1 \rangle}
+\newcommand{\matel}[3]{\langle #1 | #2 | #3 \rangle}
+\newcommand{\AEt}{\mathrm{AE}}
+\newcommand{\rotpsiAE}[2]{\hat{R}\,\psi_{#1}^{\,#2,\AEt}}
+\newcommand{\psiAE}[2]{\psi_{#1}^{\,#2,\AEt}}
+\newcommand{\rotpsipt}[2]{\hat{R}\,\widetilde{\psi}_{#1}^{\,#2}}
+\newcommand{\psipt}[2]{\widetilde{\psi}_{#1}^{\,#2}}
+
+\begin{document}
+\maketitle
+
+\section*{Setup}
+
+Symmetry acts on physical states; the relation is between
+all-electron (AE) orbitals. For a point-group operation $\hat{R}$
+mapping IBZ point $k_1$ to full-BZ point $k_2 = R\,k_1$,
+\begin{equation}
+  \psiAE{n}{k_2}(\mathbf{r})
+  \;=\; \sum_{m} D_{mn}(R, k_1)\,
+        (\hat{R}\,\psiAE{m}{k_1})(\mathbf{r}),
+  \qquad
+  (\hat{R}\,\psiAE{m}{k_1})(\mathbf{r})
+  = \psiAE{m}{k_1}(R^{-1}\mathbf{r}).
+  \label{eq:basis-relation-AE}
+\end{equation}
+Define
+\begin{align}
+  F_{pn}(R, k_1) &\;:=\; \matel{\rotpsiAE{p}{k_1}}{}{\psiAE{n}{k_2}}_{\AEt},
+  \\
+  M_{pm}(R, k_1) &\;:=\; \matel{\rotpsiAE{p}{k_1}}{}{\rotpsiAE{m}{k_1}}_{\AEt},
+\end{align}
+where $\langle\cdot|\cdot\rangle_{\AEt}$ is the inner product on the
+all-electron Hilbert space. Combining with
+Eq.~\eqref{eq:basis-relation-AE},
+\begin{equation}
+  F \;=\; M\,D, \qquad
+  D \;=\; M^{-1}\,F.
+  \label{eq:master}
+\end{equation}
+
+In NCPP the AE orbitals coincide with the pseudo ones,
+$\psiAE{n}{k} \equiv \psipt{n}{k}$, and the AE inner product reduces
+to the plane-wave dot product on the smooth coefficients. In USPP/PAW
+the link between the AE and the pseudo orbital is the
+projector-augmentation transformation
+$\ket{\psiAE{n}{k}} = \widehat{T}\,\ket{\psipt{n}{k}}$, with
+\begin{equation}
+  \widehat{T}
+  \;=\; 1 \;+\; \sum_{a,L}
+        \big(\ket{\phi_L^{\AEt,a}} - \ket{\phi_L^{\mathrm{PS},a}}\big)
+        \bra{p_L^{a}},
+\end{equation}
+so that the AE inner product becomes the augmented pseudo inner
+product
+\begin{equation}
+  \matel{\psiAE{a}{k}}{}{\psiAE{b}{k}}_{\AEt}
+  \;=\; \matel{\psipt{a}{k}}{S^{(k)}}{\psipt{b}{k}},
+  \qquad
+  S^{(k)} \;=\; \widehat{T}^{\dagger}\widehat{T}
+  \;=\; 1 + \sum_{a,L,L'} \ket{p_L^{a,k}}\,Q^a_{LL'}\,\bra{p_{L'}^{a,k}},
+  \label{eq:S-aug}
+\end{equation}
+with $Q^a_{LL'} = \matel{\phi_L^{\AEt,a}}{}{\phi_{L'}^{\AEt,a}}
+- \matel{\phi_L^{\mathrm{PS},a}}{}{\phi_{L'}^{\mathrm{PS},a}}$.
+
+\section*{Case 1 --- NCPP, orthonormal AE bands}
+
+$\widehat{T} = 1$, $\psiAE{n}{k} \equiv \psipt{n}{k}$,
+$\matel{\psiAE{p}{k}}{}{\psiAE{q}{k}}_{\AEt} = \delta_{pq}$. Then
+$M = \mathbb{I}$ and
+\begin{equation}
+  \boxed{
+  D_{pn}(R, k_1)
+  \;=\; \sum_{\mathbf{G}}
+        \big[\rotpsipt{p}{k_1}(\mathbf{G})\big]^{*}\,
+        \psipt{n}{k_2}(\mathbf{G}).
+  }
+  \label{eq:D-orth}
+\end{equation}
+
+\section*{Case 2 --- USPP/PAW, AE-orthonormal bands}
+
+The QE-shipped bands satisfy
+$\matel{\psiAE{p}{k}}{}{\psiAE{q}{k}}_{\AEt}
+= \matel{\psipt{p}{k}}{S^{(k)}}{\psipt{q}{k}}
+= \delta_{pq}$, so $M = \mathbb{I}$ and
+\begin{equation}
+  \boxed{
+  \begin{aligned}
+  D_{pn}(R, k_1)
+  \;=\; & \matel{\rotpsiAE{p}{k_1}}{}{\psiAE{n}{k_2}}_{\AEt}
+  \;=\; \matel{\rotpsipt{p}{k_1}}{S^{(k_2)}}{\psipt{n}{k_2}}
+  \\[2pt]
+  \;=\; & \sum_{\mathbf{G}}
+        \big[\rotpsipt{p}{k_1}(\mathbf{G})\big]^{*}\,
+        \psipt{n}{k_2}(\mathbf{G})
+  \\[2pt]
+  & +\;
+  \sum_{a, L, L'}
+        \matel{\rotpsipt{p}{k_1}}{}{p_L^{a, k_2}}\,
+        Q^a_{LL'}\,
+        \matel{p_{L'}^{a, k_2}}{}{\psipt{n}{k_2}}.
+  \end{aligned}
+  }
+  \label{eq:D-paw}
+\end{equation}
+
+\section*{Case 3 --- non-orthogonal AE bands}
+
+Drop the AE-orthonormality assumption; keep both $F$ and $M$ in the
+master equation~\eqref{eq:master}:
+\begin{equation}
+  \boxed{
+  D(R, k_1) \;=\; \big[M(R, k_1)\big]^{-1}\,F(R, k_1).
+  }
+  \label{eq:D-nonorth}
+\end{equation}
+Written in the pseudo basis (covers NCPP, USPP, and PAW
+simultaneously),
+\begin{align}
+  F_{pn} &\;=\;
+        \matel{\rotpsipt{p}{k_1}}{S^{(k_2)}}{\psipt{n}{k_2}}
+        \notag \\
+        &\;=\;
+        \sum_{\mathbf{G}} \big[\rotpsipt{p}{k_1}(\mathbf{G})\big]^{*}
+                          \psipt{n}{k_2}(\mathbf{G})
+        \;+\;
+        \sum_{a, L, L'}
+              \matel{\rotpsipt{p}{k_1}}{}{p_L^{a, k_2}}\,
+              Q^a_{LL'}\,
+              \matel{p_{L'}^{a, k_2}}{}{\psipt{n}{k_2}},
+  \\[4pt]
+  M_{pm} &\;=\;
+        \matel{\rotpsipt{p}{k_1}}{S^{(k_2)}}{\rotpsipt{m}{k_1}}
+        \notag \\
+        &\;=\;
+        \sum_{\mathbf{G}} \big[\rotpsipt{p}{k_1}(\mathbf{G})\big]^{*}
+                          \rotpsipt{m}{k_1}(\mathbf{G})
+        \;+\;
+        \sum_{a, L, L'}
+              \matel{\rotpsipt{p}{k_1}}{}{p_L^{a, k_2}}\,
+              Q^a_{LL'}\,
+              \matel{p_{L'}^{a, k_2}}{}{\rotpsipt{m}{k_1}}.
+\end{align}
+For NCPP the augmentation terms vanish ($Q \equiv 0$); the equations
+reduce to the smooth dot products of the pseudo (= AE) coefficients.
+
+\section*{Evaluating the augmentation term}
+
+\paragraph{Should this involve $\widehat{T}_{k_1}^{\dagger}\,\widehat{T}_{k_2}$?}
+No --- $\widehat{T}$ is a single, real-space, $k$-independent operator,
+$\widehat{T} = 1 + \sum_{a,L}(\ket{\phi_L^{\AEt,a}} -
+\ket{\phi_L^{\mathrm{PS},a}})\bra{p_L^{a}}$, where the sums run over
+all atoms in the crystal (every periodic image) and the partial
+waves/projectors are the same atom-localised functions used for every
+$k$. The apparent $k$-dependence enters only through Bloch summation
+over the periodic images when one projects a Bloch state against
+those atom-local projectors.
+
+In our case both states in
+$F_{pn} = \matel{\rotpsipt{p}{k_1}}{\widehat{T}^{\dagger}\widehat{T}}{\psipt{n}{k_2}}$
+carry crystal momentum $k_2$: $\rotpsipt{p}{k_1}$ has crystal
+momentum $R\,k_1 = k_2$ by construction, and $\psipt{n}{k_2}$ is at
+$k_2$ already. Performing the sum over all atom positions
+$\tau_\alpha + T$ with $\alpha$ a unit-cell atom and $T$ a lattice
+translation, the Bloch translation phases combine as
+$e^{-i k_2 \cdot T} e^{+i k_2 \cdot T} = 1$, leaving
+\begin{equation}
+  F_{pn}^{\mathrm{aug}}
+  \;=\; \sum_{\alpha, L, L'}
+        \matel{\rotpsipt{p}{k_1}}{}{p_L^{\alpha, k_2}}\,
+        Q^{\alpha}_{LL'}\,
+        \matel{p_{L'}^{\alpha, k_2}}{}{\psipt{n}{k_2}},
+  \label{eq:F-aug-explicit}
+\end{equation}
+where the sum is over unit-cell atoms $\alpha$ and the projectors
+$\ket{p_L^{\alpha, k_2}}$ are the standard Bloch-summed,
+unit-cell-restricted projectors at $k_2$:
+\begin{equation}
+  \ket{p_L^{\alpha, k}}
+  \;=\; \frac{1}{\sqrt{N_{\mathrm{cell}}}}
+        \sum_{T} e^{i k \cdot T}\,
+        \ket{p_L^{\alpha}(\mathbf{r}-\boldsymbol{\tau}_\alpha-\mathbf{T})}.
+\end{equation}
+The right-hand projection
+$\matel{p_{L'}^{\alpha, k_2}}{}{\psipt{n}{k_2}}$ is the standard
+\texttt{Pskna} entry at $k_2$, already in storage. The new piece is
+the left-hand projection
+$\matel{\rotpsipt{p}{k_1}}{}{p_L^{\alpha, k_2}}$, between an orbital
+indexed by $k_1$ (its storage label) and a projector at $k_2$ (its
+crystal-momentum label after rotation).
+
+\paragraph{Why $k_1 \neq k_2$ does not break the calculation.}
+If we did the same exercise with $\matel{\psipt{p}{k_1}}{S}{\psipt{n}{k_2}}$
+\emph{without} the rotation, the Bloch-translation phase sum gives
+$\sum_T e^{i (k_2 - k_1)\cdot T} = N_{\mathrm{cell}}\,\delta_{k_1, k_2 \bmod \mathbf{G}}$,
+which vanishes for distinct $k_1, k_2$ as it must for an orthonormal
+Bloch basis. The rotation $\hat{R}$ shifts the bra-side crystal
+momentum from $k_1$ to $k_2$, restoring the matching that makes the
+overlap non-trivial.
+
+\paragraph{Strategy A --- direct re-projection at $k_2$.}
+Apply the same $\mathbf{G}$-vector rotation that builds
+$\rotpsipt{p}{k_1}(\mathbf{G})$ for the smooth term (already in the
+code at \texttt{transform\_k2g}), and reuse the standard projector
+machinery at $k_2$ to compute
+\begin{equation}
+  \matel{\rotpsipt{p}{k_1}}{}{p_L^{\alpha, k_2}}
+  \;=\; \sum_{\mathbf{G}} \big[\rotpsipt{p}{k_1}(\mathbf{G})\big]^{*}\,
+        p_L^{\alpha, k_2}(\mathbf{G})\, e^{-i (\mathbf{G}+k_2)\cdot \boldsymbol{\tau}_\alpha}.
+\end{equation}
+Pros: reuses the FFT-rotated coefficients already needed for the
+smooth term; no symmetry-property machinery for the projectors. Cons:
+costs an additional projector sweep per $(R, k_1)$ pair.
+
+\paragraph{Strategy B --- symmetry-routed projection at $k_1$.}
+Use the transformation property of the projector under $\hat{R}$. With
+$R$ acting on atom $\alpha$ as
+$\hat{R}\,(\boldsymbol{\tau}_\alpha) = \boldsymbol{\tau}_{R\alpha}
++ \mathbf{t}_R^{\alpha}$ (the residual translation $\mathbf{t}_R^{\alpha}$
+takes the rotated atom into the same unit cell), and $D^{(l)}_{ML}(R)$
+the Wigner $D$-matrix of the angular momentum $l = l_L$:
+\begin{equation}
+  \hat{R}\,\ket{p_L^{\alpha, k_1}}
+  \;=\; e^{-i k_2 \cdot \mathbf{t}_R^{\alpha}}
+        \sum_{M} D^{(l)}_{ML}(R)\,
+        \ket{p_M^{R\alpha,\, k_2}}.
+\end{equation}
+Hence
+\begin{equation}
+  \matel{\rotpsipt{p}{k_1}}{}{p_L^{\alpha, k_2}}
+  \;=\; \matel{\psipt{p}{k_1}}{\hat{R}^{\dagger}}{p_L^{\alpha, k_2}}
+  \;=\; e^{+i k_2 \cdot \mathbf{t}_R^{R^{-1}\alpha}}
+        \sum_{M}\!\big[D^{(l)}_{ML}(R)\big]^{*}\,
+        \matel{\psipt{p}{k_1}}{}{p_M^{R^{-1}\alpha,\, k_1}}.
+  \label{eq:strat-B}
+\end{equation}
+Pros: the projector overlaps on the right of Eq.~\eqref{eq:strat-B}
+are exactly the standard \texttt{Pskna} entries at $k_1$, already
+cached --- no FFT rotation of the wavefunction, no recomputation of
+projector convolutions. Cost is only the per-$(R,\alpha,L)$ Wigner
+rotation. Cons: requires the lookup tables $R\alpha$,
+$\mathbf{t}_R^{\alpha}$, $D^{(l)}(R)$ to be in place.
+
+\paragraph{Strategy C --- precompute the rotated \texttt{Pskna} table.}
+A practical hybrid: Strategy~B is applied once per $(R, k_1)$ pair to
+build a rotated projector-overlap table
+\begin{equation}
+  \widetilde{P}^{(R, k_1)}_{p, L, \alpha}
+  \;:=\; \matel{\rotpsipt{p}{k_1}}{}{p_L^{\alpha, k_2}}
+\end{equation}
+which is then reused for all $n$ in
+Eq.~\eqref{eq:F-aug-explicit}. Cost: same as Strategy~B for the table
+build, then a single \texttt{GEMM} per $(R, k_1)$ block to contract
+with $Q^{\alpha}_{LL'}$ and the $k_2$-side
+$\matel{p_{L'}^{\alpha, k_2}}{}{\psipt{n}{k_2}}$. This is the
+recommended layout: it keeps the full $D$-matrix as a single GEMM
+plus the augmentation correction as a second GEMM of the same shape.
+
+\paragraph{Recap of what is needed.} Implementation footprint for the
+QE-source PAW workflow ($M = \mathbb{I}$):
+\begin{itemize}
+  \item The species-resolved $Q^{\alpha}_{LL'}$ is already loaded in
+        \texttt{pseudopot::qq\_nt\_data}.
+  \item The right-hand $\matel{p_{L'}^{\alpha, k_2}}{}{\psipt{n}{k_2}}$
+        is the standard \texttt{Pskna} entry at $k_2$ (already cached).
+  \item The left-hand $\matel{\rotpsipt{p}{k_1}}{}{p_L^{\alpha, k_2}}$
+        is the new piece. Strategy~A and~C share the same final
+        contraction; they differ only in how the table is built (FFT
+        rotation vs. Wigner-$D$ symmetry routing). Strategy~B/C is
+        cheaper if the symmetry tables are already on hand.
+\end{itemize}
+
+\end{document}
