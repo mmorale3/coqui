@@ -518,6 +518,31 @@ namespace methods {
         return;
       }
 
+      // The augmentation Y rows below loop k = 0..nkpts-1 (full BZ) and
+      // read Pskna(s, k, p, i). pseudopot stores Pskna only on the IBZ
+      // k-points (shape (nspin, nkpts_ibz, npol*nkb, nbnd)). For
+      // nkpts > nkpts_ibz this is an out-of-bounds read into the SHM
+      // region — silently-wrong values at np=1 (read garbage in heap)
+      // and a SIGSEGV "Invalid permissions" at np>1 (walk past the
+      // end of the SHM mapping on the node-root). Both surface as
+      // wrong RPA energies / NaN downstream.
+      //
+      // The fix is the symmetry-aware View-2 transformation of the
+      // IBZ Pskna at each full-BZ k (atom permutation + Wigner-D on
+      // the projector m-index + fractional-translation phase). See
+      // notes/paw_symmetry_notes.tex Eq. coef-symm. Until that
+      // helper lands, abort cleanly so the silent-OOB / SIGSEGV
+      // failure mode is loud and actionable.
+      utils::check(_MF->nkpts() == _MF->nkpts_ibz(),
+        "thc_reader_t::augment_thc_with_paw: PAW/USPP augmentation does "
+        "not yet support QE symmetry reduction (nkpts={} != nkpts_ibz={}). "
+        "Y rows of X_shm are computed via Pskna(s, k_full, ...), but "
+        "Pskna is stored only at k_ibz. Until the symmetry-aware View-2 "
+        "Pskna transform is implemented (see notes/paw_symmetry_notes.tex "
+        "for the working equations), rerun the QE inputs with "
+        "nosym=.true., noinv=.true., no_t_rev=.true.",
+        _MF->nkpts(), _MF->nkpts_ibz());
+
       // ---------------------------------------------------------------
       // 1) Augment X_shm: append Y rows below smooth ζ rows.
       // ---------------------------------------------------------------
@@ -583,6 +608,7 @@ namespace methods {
       auto wG = hamilt::paw::coulomb_weights_on_rho_g(rho_g, omega);
 
       // Bring smooth dZ to a single host array first (q-by-q).
+// MAM: This is unacceptable, N_total can larger than 10000, _nqpts_ibz can be up to a few hundred, so this simply can't be stored on a single node. Need a fully distributed assembly of _dZ.
       nda::array<ComplexType,3> V_full_q(_nqpts_ibz, N_total, N_total);
       V_full_q() = ComplexType(0.0);
       // Smooth GG block (broadcast each iq from its owner)
