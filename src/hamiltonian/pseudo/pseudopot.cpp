@@ -234,11 +234,11 @@ void pseudopot::read_vnl_pw2bgw(MF_t &mf, std::string outdir)
         long n1 = mill(i,0); if(n1<0) n1 += NX;
         long n2 = mill(i,1); if(n2<0) n2 += NY;
         long n3 = mill(i,2); if(n3<0) n3 += NZ;
-        utils::check(n1 < NX, "read_vnl_h5: Index out of range. i:{}, n:{}, NX:{}",i,n1,NX);
-        utils::check(n2 < NY, "read_vnl_h5: Index out of range. i:{}, n:{}, NY:{}",i,n2,NY);
-        utils::check(n3 < NZ, "read_vnl_h5: Index out of range. i:{}, n:{}, NZ:{}",i,n3,NZ);
+        utils::check(n1 < NX, "read_vnl_pw2bgw: Index out of range. i:{}, n:{}, NX:{}",i,n1,NX);
+        utils::check(n2 < NY, "read_vnl_pw2bgw: Index out of range. i:{}, n:{}, NY:{}",i,n2,NY);
+        utils::check(n3 < NZ, "read_vnl_pw2bgw: Index out of range. i:{}, n:{}, NZ:{}",i,n3,NZ);
         long N = (n1*NY + n2)*NZ + n3;
-        utils::check( N >= 0 and N < wfc_nnr, "read_vnl_h5: Index out of range. N:{}, nnr:{}",N,wfc_nnr);
+        utils::check( N >= 0 and N < wfc_nnr, "read_vnl_pw2bgw: Index out of range. N:{}, nnr:{}",N,wfc_nnr);
         k2g(ik,i) = fft2gv(N);  
         utils::check( k2g(ik,i) >= 0 and k2g(ik,i) < ngm, "read_vnl_xml: Index not mapped in truncated grid. ");
       }

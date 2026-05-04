@@ -329,7 +329,17 @@ class MF
 
     // symmetry rotations
     void setup_symmetry_rotations() 
-    { std::visit( [&](auto&& v) { v.setup_symmetry_rotations(); }, var ); }
+    { 
+      // paw/uspp need pseudopot constructed to be able to generate symmetry rotations
+      // construct here since you need MF, not the backend object.
+      auto ps_type = pp_type();
+      if( ps_type == hamilt::pp_paw_t or ps_type == hamilt::pp_uspp_t ) {
+        // forces construction of pseudopot if not yet constructed
+        auto ps = hamilt::make_pseudopot(*this);
+        (void) ps;
+      }
+      std::visit( [&](auto&& v) { v.setup_symmetry_rotations(); }, var ); 
+    }
     decltype(auto) symmetry_rotation(long s, long k) const
     {
       auto ns = qsymms().extent(0);

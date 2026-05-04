@@ -56,6 +56,8 @@ public:
 
   // accessor functions
   auto mpi() const { return sys.mpi; }
+  long nspin() const { return sys.nspin; }
+  long npol() const { return sys.npol; }
   long nbnd() const { return sys.nbnd; }
   long nbnd_aux() const { return sys.nbnd_aux; }
   decltype(auto) kpts() { return sys.bz().kpts(); }

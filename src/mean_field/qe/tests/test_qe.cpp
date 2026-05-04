@@ -49,9 +49,9 @@ using utils::ARRAY_EQUAL;
 
 TEST_CASE("qe_dmat", "[mean_field_qe]")
 {
- // auto [outdir,prefix] = utils::utest_filename("qe_lih222_sym");
   auto& mpi = utils::make_unit_test_mpi_context();
-  auto [outdir,prefix] = utils::utest_filename(mf::qe_source);
+  auto [outdir,prefix] = utils::utest_filename("qe_lih222_sym");
+  //auto [outdir,prefix] = utils::utest_filename(mf::qe_source);
   mf::qe::qe_readonly mf(mpi, outdir,prefix);
 
   auto bz = mf.bz();

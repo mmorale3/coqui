@@ -66,6 +66,8 @@ namespace mf {
 
       // accessor functions
       auto mpi() const { return sys.mpi; }
+      long nspin() const { return sys.nspin; }
+      long npol() const { return sys.npol; }
       long nbnd() const { return sys.nbnd; }
       long nbnd_aux() const { return sys.nbnd_aux; }
       int nnr() const { return sys.nnr; }

@@ -46,10 +46,6 @@ namespace hamilt
 template<typename MF_t>
 inline bool mf_requires_augmentation(MF_t &mf)
 {
-  if (auto psp = mf.get_pseudopot()) {
-    auto t = psp->pp_type();
-    return t == pp_uspp_t || t == pp_paw_t;
-  }
   auto t = mf.pp_type();
   return t == pp_uspp_t || t == pp_paw_t;
 }

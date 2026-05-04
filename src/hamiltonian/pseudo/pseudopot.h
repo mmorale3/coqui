@@ -19,8 +19,7 @@
  */
 
 
-#ifndef HAMILTONIAN_PSEUDO_NCPP_H
-#define HAMILTONIAN_PSEUDO_NCPP_H
+#pragma once
 
 #include <iostream>
 #include <memory>
@@ -88,12 +87,16 @@ class pseudopot
   pseudopot& operator=(pseudopot const&) = default;
   pseudopot& operator=(pseudopot &&) = default;
 
+  // accessor functions
   pp_type_e pp_type() const { return ptype; }
+  auto get_input_file_type() const { return input_file_type; }
+  auto get_input_file_name() const { return input_file_name; } 
 
   // Read-only accessors for the host-resident augmentation data used by
   // v_h_paw and similar PAW/USPP utilities. The full state remains private
   // to keep the data model encapsulated.
   auto Pskna_view() const { return Pskna.local(); }
+  auto Qij_view() const { return qq_nt_data.local(); }
   auto qgm_view() const { return qgm.local(); }
   nda::array<int,3> const& ijtoh_view() const { return ijtoh; }
   nda::array<int,1> const& ityp_view() const { return ityp; }
@@ -501,4 +504,3 @@ std::shared_ptr<pseudopot> make_pseudopot(MF_t &mf)
 
 }
 
-#endif

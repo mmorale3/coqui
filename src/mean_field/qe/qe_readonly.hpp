@@ -44,6 +44,8 @@
 #include "utilities/qe_utilities.hpp"
 #include "grids/g_grids.hpp"
 #include "hamiltonian/pseudo/pseudopot.h"
+#include "utilities/symmetry.hpp"
+#include "utilities/symmetry_rotations.hpp"
 
 namespace mf
 {
@@ -75,6 +77,8 @@ public:
 
   // accessor functions
   auto mpi() const { return sys.mpi; }
+  long nspin() const { return sys.nspin; }
+  long npol() const { return sys.npol; }
   long nbnd() const { return sys.nbnd; }
   long nbnd_aux() const { return sys.nbnd_aux; }
   int fft_grid_size() const { return fft_mesh(0)*fft_mesh(1)*fft_mesh(2); }
@@ -262,14 +266,20 @@ public:
 
   // setup should be deterministic, so we are going to assume that if dmat is not empty
   // that this was already called
-  void setup_symmetry_rotations() 
+  void setup_symmetry_rotations()
   {
     if(dmat.size() == 0) 
     {
       // build symmetry rotations
       auto slist = utils::find_inverse_symmetry(sys.bz().qsymms,sys.bz().symm_list);
-      if(slist.size() > 0)
-        std::tie(sk_to_n,dmat) = utils::generate_dmatrix<true>(*this,sys.bz().symm_list,slist);
+      if(slist.size() > 0) {
+        if(sys.pp_type == hamilt::pp_paw_t or sys.pp_type == hamilt::pp_uspp_t) {
+          utils::check(bool(psp),"Error in setup_symmetry_rotations: pseudopot must be attached before calling setup_symmetry_rotations when PAW/USPP is used.");
+          std::tie(sk_to_n,dmat) = utils::generate_dmatrix<true>(*this,sys.bz().symm_list,slist,psp.get());
+        } else {
+          std::tie(sk_to_n,dmat) = utils::generate_dmatrix<true>(*this,sys.bz().symm_list,slist);
+        }
+      }
     }
   }
 
