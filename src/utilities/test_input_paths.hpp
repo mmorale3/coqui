@@ -99,6 +99,10 @@ inline std::tuple<std::string,std::string> utest_filename(std::string src)
     return std::make_tuple(std::string(PROJECT_SOURCE_DIR)+
                                "/tests/unit_test_files/qe/si_kp222_paw/",
                            std::string("pwscf"));
+  } else if (src == "qe_si222_paw_sym") {
+    return std::make_tuple(std::string(PROJECT_SOURCE_DIR)+
+                               "/tests/unit_test_files/qe/si_kp222_paw_sym/",
+                           std::string("pwscf"));
   } else if (src == "qe_lih222") {
     return std::make_tuple(std::string(PROJECT_SOURCE_DIR)+
                                "/tests/unit_test_files/qe/lih_kp222_nbnd16/",
@@ -110,6 +114,10 @@ inline std::tuple<std::string,std::string> utest_filename(std::string src)
   } else if (src == "qe_lih222_paw") {
     return std::make_tuple(std::string(PROJECT_SOURCE_DIR)+
                                "/tests/unit_test_files/qe/lih_kp222_nbnd16_paw/",
+                           std::string("pwscf"));
+  } else if (src == "qe_lih222_paw_sym") {
+    return std::make_tuple(std::string(PROJECT_SOURCE_DIR)+
+                               "/tests/unit_test_files/qe/lih_kp222_nbnd16_paw_sym/",
                            std::string("pwscf"));
   } else if (src == "qe_lih222_uspp") {
     return std::make_tuple(std::string(PROJECT_SOURCE_DIR)+
