@@ -970,7 +970,6 @@ void test_hartree_energy(mpi_context_t& mpi, mf::MF& mfobj,
 
   auto fft_mesh = mfobj.fft_grid_dim();
   auto recv     = mfobj.recv();
-  auto wfc_g    = mfobj.wfc_truncated_grid();
   auto kpts_full = mfobj.kpts();
   auto kp_to_ibz = mfobj.kp_to_ibz();
   auto kp_trev   = mfobj.kp_trev();
@@ -1044,7 +1043,6 @@ void test_vxc_rho_integral(mpi_context_t& mpi, mf::MF& mfobj,
 
   auto fft_mesh = mfobj.fft_grid_dim();
   auto recv     = mfobj.recv();
-  auto wfc_g    = mfobj.wfc_truncated_grid();
   auto kpts_full = mfobj.kpts();
   auto kp_to_ibz = mfobj.kp_to_ibz();
   auto kp_trev   = mfobj.kp_trev();
@@ -1133,7 +1131,7 @@ TEST_CASE("vxc_rho_integral", "[hamilt][energy]")
  */
 template<MEMORY_SPACE MEM>
 void test_hartree_thc_vs_direct(mpi_context_t& mpi, std::shared_ptr<mf::MF> mf_ptr,
-                                std::string const& fixture_name,
+                                [[maybe_unused]] std::string const& fixture_name,
                                 double thc_thresh = 1e-5,
                                 double tol = 5e-3)
 {
@@ -1160,7 +1158,6 @@ void test_hartree_thc_vs_direct(mpi_context_t& mpi, std::shared_ptr<mf::MF> mf_p
       std::array<long,4>{1,1,2048,2048});
   auto fft_mesh = mfobj.fft_grid_dim();
   auto recv     = mfobj.recv();
-  auto wfc_g    = mfobj.wfc_truncated_grid();
   auto kpts_full = mfobj.kpts();
   auto kp_to_ibz = mfobj.kp_to_ibz();
   auto kp_trev   = mfobj.kp_trev();
@@ -1268,7 +1265,6 @@ void test_hartree_thc_paw_aug(mpi_context_t& mpi, std::shared_ptr<mf::MF> mf_ptr
   app_log(2, "[TIMER {}] orbital read={:.2f}s", fixture_name, dt());
   auto fft_mesh = mfobj.fft_grid_dim();
   auto recv     = mfobj.recv();
-  auto wfc_g    = mfobj.wfc_truncated_grid();
   auto kpts_full = mfobj.kpts();
   auto kp_to_ibz = mfobj.kp_to_ibz();
   auto kp_trev   = mfobj.kp_trev();
@@ -1371,7 +1367,7 @@ void test_hartree_thc_paw_aug(mpi_context_t& mpi, std::shared_ptr<mf::MF> mf_ptr
  * Y_LM matrix-inverse conditioning + radial Bessel quadrature accuracy).
  */
 template<MEMORY_SPACE MEM>
-void test_paw_aug_q_eval_at_q0(mpi_context_t& mpi, mf::MF& mfobj,
+void test_paw_aug_q_eval_at_q0([[maybe_unused]] mpi_context_t& mpi, mf::MF& mfobj,
                                 double tol = 1e-10)
 {
   hamilt::pseudopot V(mfobj);
@@ -1457,7 +1453,7 @@ void test_paw_aug_q_eval_at_q0(mpi_context_t& mpi, mf::MF& mfobj,
  * the table for a given fixture.
  */
 template<MEMORY_SPACE MEM>
-void test_paw_isdf_rank_vs_tol(mpi_context_t& mpi, mf::MF& mfobj,
+void test_paw_isdf_rank_vs_tol([[maybe_unused]] mpi_context_t& mpi, mf::MF& mfobj,
                                 std::string const& label)
 {
   hamilt::pseudopot V(mfobj);
@@ -1954,7 +1950,7 @@ TEST_CASE("hartree_thc_vs_direct", "[hamilt][energy][thc]")
  * non-zero residual signals a bug in build_local_isdf_full_rank.
  */
 template<MEMORY_SPACE MEM>
-void test_local_isdf_qhat_roundtrip(mpi_context_t& mpi, mf::MF& mfobj,
+void test_local_isdf_qhat_roundtrip([[maybe_unused]] mpi_context_t& mpi, mf::MF& mfobj,
                                     double tol = 1e-12)
 {
   hamilt::pseudopot V(mfobj);
@@ -1989,7 +1985,7 @@ void test_local_isdf_qhat_roundtrip(mpi_context_t& mpi, mf::MF& mfobj,
  * this is exact algebra.
  */
 template<MEMORY_SPACE MEM>
-void test_local_isdf_deltaC_roundtrip(mpi_context_t& mpi, mf::MF& mfobj,
+void test_local_isdf_deltaC_roundtrip([[maybe_unused]] mpi_context_t& mpi, mf::MF& mfobj,
                                      double tol = 1e-12)
 {
   hamilt::pseudopot V(mfobj);
@@ -2028,7 +2024,7 @@ void test_local_isdf_deltaC_roundtrip(mpi_context_t& mpi, mf::MF& mfobj,
  * Exact in the full-rank limit; any deviation is a U/η bug.
  */
 template<MEMORY_SPACE MEM>
-void test_local_isdf_rho_aug_reconstruction(mpi_context_t& mpi, mf::MF& mfobj,
+void test_local_isdf_rho_aug_reconstruction([[maybe_unused]] mpi_context_t& mpi, mf::MF& mfobj,
                                             double tol = 1e-12)
 {
   auto all = nda::range::all;
@@ -2158,7 +2154,7 @@ void test_local_isdf_rho_aug_reconstruction(mpi_context_t& mpi, mf::MF& mfobj,
  * the correct one-center Hartree contribution.
  */
 template<MEMORY_SPACE MEM>
-void test_local_isdf_K_a_one_center(mpi_context_t& mpi, mf::MF& mfobj,
+void test_local_isdf_K_a_one_center([[maybe_unused]] mpi_context_t& mpi, mf::MF& mfobj,
                                      double tol = 1e-12)
 {
   auto all = nda::range::all;
@@ -2289,7 +2285,7 @@ TEST_CASE("local_isdf_rho_aug_reconstruction", "[hamilt][paw][isdf]")
  * one-center K_a tensor instead of Q̂.
  */
 template<MEMORY_SPACE MEM>
-void test_local_isdf_K_a_compressed_accuracy(mpi_context_t& mpi, mf::MF& mfobj,
+void test_local_isdf_K_a_compressed_accuracy([[maybe_unused]] mpi_context_t& mpi, mf::MF& mfobj,
                                               hamilt::paw::isdf_metric metric)
 {
   hamilt::pseudopot V(mfobj);
@@ -2366,7 +2362,7 @@ TEST_CASE("local_isdf_K_a_compressed_accuracy", "[hamilt][paw][isdf]")
  * `local_isdf_K_a_one_center`, but here we trace the convergence).
  */
 template<MEMORY_SPACE MEM>
-void test_local_isdf_K_a_one_center_vs_rank(mpi_context_t& mpi, mf::MF& mfobj,
+void test_local_isdf_K_a_one_center_vs_rank([[maybe_unused]] mpi_context_t& mpi, mf::MF& mfobj,
                                              hamilt::paw::isdf_metric metric)
 {
   auto all = nda::range::all;
@@ -2530,7 +2526,7 @@ TEST_CASE("local_isdf_K_a_one_center", "[hamilt][paw][isdf]")
  * max pointwise error) — useful as a diagnostic when picking a tolerance.
  */
 template<MEMORY_SPACE MEM>
-void test_local_isdf_compression_accuracy(mpi_context_t& mpi, mf::MF& mfobj,
+void test_local_isdf_compression_accuracy([[maybe_unused]] mpi_context_t& mpi, mf::MF& mfobj,
                                           hamilt::paw::isdf_metric metric)
 {
   hamilt::pseudopot V(mfobj);
@@ -2629,7 +2625,7 @@ TEST_CASE("local_isdf_compression_accuracy", "[hamilt][paw][isdf]")
  * confirming the relative error matches the rank-vs-error report.
  */
 template<MEMORY_SPACE MEM>
-void test_local_isdf_compressed_rho_aug(mpi_context_t& mpi, mf::MF& mfobj,
+void test_local_isdf_compressed_rho_aug([[maybe_unused]] mpi_context_t& mpi, mf::MF& mfobj,
                                          double tol_pc, double tol_check)
 {
   auto all = nda::range::all;

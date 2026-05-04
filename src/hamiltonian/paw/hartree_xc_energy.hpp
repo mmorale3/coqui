@@ -159,7 +159,6 @@ inline nda::array<double, 1> build_total_density_r(
             // wk = 1/N_k and no spin factor; QE's becsum (which qvan2 +
             // ddd_paw assume) is wg × |β·ψ|² with wg = ns_scl × wk × occ.
             // Apply the missing ns_scl here so ρ_aug matches QE's addusdens.
-            double ns_scl = (nspin == 1 && npol == 1) ? 2.0 : 1.0;
             for (long ia = 0; ia < becsum.extent(0); ++ia)
             for (long I  = 0; I  < becsum.extent(1); ++I)
             for (long J  = 0; J  < becsum.extent(2); ++J)

@@ -261,8 +261,7 @@ auto generate_dmatrix(MF_t &mf,
   auto [isk0, isk1] = itertools::chunk_range(0, sk.size(), comm.size() ,comm.rank());
   long bad_norm_count = 0;
   
-std::cout<<" generate_dmatrix 0 " <<std::endl;
-  if(false and needs_aug) {
+  if(needs_aug) {
 
     // can't use shared arrays
     utils::check(MEM==HOST_MEMORY, "Finish PAW/USPP generate_dmatrix on GPU!");
@@ -280,12 +279,9 @@ std::cout<<" generate_dmatrix 0 " <<std::endl;
     auto ityp = ps->ityp_view();
     auto nh = ps->nh_view();
     auto ofs = ps->ofs_view();
-    long nsp = Qij.extent(0);
-    long nhm = Qij.extent(1);
     long nkb = Pskna.extent(2);  // in principle this is nkb*npol
     memory::array<MEM,ComplexType,2> Fmaj(nbnd,nkb);
     memory::array<MEM,ComplexType,2> vkb(nkb,ngm);
-    vkb() = ComplexType(0.0);
     h5::file file;
     utils::check(filetype == mf::h5_input_type, "Error in generate_dmatrix: Only h5 input files allowed when using PAW/USPP and symmetries."); 
     utils::check(std::filesystem::exists(filename), "Error: Missing file: {}",filename);
@@ -304,20 +300,20 @@ std::cout<<" generate_dmatrix 0 " <<std::endl;
     // mapping from indexing in h5 and wfc mapping
     int npwx;
     h5::h5_read_attribute(grp,"max_npw",npwx);
-    math::shm::shared_array<nda::array_view<long,2>> sk2g(*mpi,{nkpts,npwx});
+    math::shm::shared_array<nda::array_view<long,2>> sk2g(*mpi,{nkpts_ibz,npwx});
     nda::array<ComplexType,2> buff(1,npwx);
     auto k2g = sk2g.local();
     auto fft2gv = wfc_g->fft_to_gv();
     long wfc_nnr = wfc_g->nnr();
     int rank = mpi->comm.rank();
     int np = mpi->comm.size();
-    nda::array<int,1> npw(nkpts);
+    nda::array<int,1> npw(nkpts_ibz);
     nda::h5_read(grp,"npw",npw);
 
     // setup index mappings
     {
       long NX = wfc_g->mesh(0), NY = wfc_g->mesh(1), NZ = wfc_g->mesh(2);
-      for( int ik=0; ik<nkpts; ik++ ) {
+      for( int ik=0; ik<nkpts_ibz; ik++ ) {
         if(  ik%np != rank ) continue;
         nda::array<int,2> mill(npw(ik),3);
         nda::h5_read(grp,"miller_k"+std::to_string(ik),mill);
@@ -367,13 +363,15 @@ std::cout<<" generate_dmatrix 0 " <<std::endl;
         // keep a copy of pseudo orbitals
         psi(2,all,all) = psi(0,all,all);
 
+        vkb() = ComplexType(0.0);
         // read projector from h5 and map to wfc grid
         for( int ib=0; ib<nkb; ++ib ) {
           auto b_k = buff(all,range(npw(ik)));
           auto tpl = std::tuple{range(ib,ib+1),range(npw(ik))};
           nda::h5_read(grp,"projector_k"+std::to_string(ik),b_k,tpl);
           for( auto [in,n] : itertools::enumerate(k2g(ik,range(npw(ik)))) )
-            vkb(ib,n) = std::conj(buff(0,in));
+            vkb(ib,n) = buff(0,in);
+            //vkb(ib,n) = std::conj(buff(0,in));
         }
 
         // add augmentation terms: 
@@ -470,7 +468,6 @@ std::cout<<" generate_dmatrix 0 " <<std::endl;
             e=std::sqrt(std::abs(nda::blas::dotc(shm_dmat.local()(isk,r,all),shm_dmat.local()(isk,r,all))));
             shm_dmat.local()(isk,r,all) /= e;
           }
-std::cout<<" norm: " <<ik <<" " <<r <<" " <<e <<std::endl;
           if(std::abs(e-1.0) > 1e-3) bad_norm_count += 1;
         }
       }
@@ -578,14 +575,12 @@ std::cout<<" norm: " <<ik <<" " <<r <<" " <<e <<std::endl;
             e=std::sqrt(std::abs(nda::blas::dotc(shm_dmat.local()(isk,r,all),shm_dmat.local()(isk,r,all))));
             shm_dmat.local()(isk,r,all) /= e;
           }
-std::cout<<" norm: " <<ik <<" " <<r <<" " <<e <<std::endl;
           if(std::abs(e-1.0) > 1e-3) bad_norm_count += 1;
         }
       }
     }
 
   } // needs_aug
-std::cout<<" generate_dmatrix 10 " <<std::endl;
 
   // check # of Bloch orbitals with a incomplete degenerate set
   bad_norm_count = comm.all_reduce_value(bad_norm_count, std::plus<>{});
@@ -636,7 +631,6 @@ std::cout<<" generate_dmatrix 10 " <<std::endl;
     node_comm.barrier();
     return std::make_tuple(std::move(sk_to_n),std::move(shm_dmat));
   }
-std::cout<<" generate_dmatrix 100 " <<std::endl;
 }
 
 } // namespace utils

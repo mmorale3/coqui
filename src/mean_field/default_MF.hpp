@@ -59,6 +59,7 @@ template<utils::Communicator comm_t>
 inline decltype(auto) default_MF(std::shared_ptr<utils::mpi_context_t<comm_t>>& comm, std::string src,
                                  mf_input_file_type_e ftype = xml_input_type)
 {
+  // this is unnecessary, utest_filename should return {outdir,prefix,mf_type,def_input_type}
   if(src == "model_chol") {
 
     auto [outdir,prefix] = utils::utest_filename("model_chol");
@@ -94,6 +95,11 @@ inline decltype(auto) default_MF(std::shared_ptr<utils::mpi_context_t<comm_t>>& 
     auto [outdir,prefix] = utils::utest_filename("qe_si222_paw");
     return default_MF(comm, mf::qe_source, outdir, prefix, h5_input_type);
 
+  } else if (src == "qe_si222_paw_sym") {
+
+    auto [outdir,prefix] = utils::utest_filename("qe_si222_paw_sym");
+    return default_MF(comm, mf::qe_source, outdir, prefix, h5_input_type);
+
   } else if (src == "qe_lih222") {
 
     auto [outdir,prefix] = utils::utest_filename("qe_lih222");
@@ -107,6 +113,11 @@ inline decltype(auto) default_MF(std::shared_ptr<utils::mpi_context_t<comm_t>>& 
   } else if (src == "qe_lih222_paw") {
 
     auto [outdir,prefix] = utils::utest_filename("qe_lih222_paw");
+    return default_MF(comm, mf::qe_source, outdir, prefix, h5_input_type);
+
+  } else if (src == "qe_lih222_paw_sym") {
+
+    auto [outdir,prefix] = utils::utest_filename("qe_lih222_paw_sym");
     return default_MF(comm, mf::qe_source, outdir, prefix, h5_input_type);
 
   } else if (src == "qe_lih222_uspp") {
@@ -159,12 +170,10 @@ inline decltype(auto) default_MF(std::shared_ptr<utils::mpi_context_t<comm_t>>& 
     auto [outdir,prefix] = utils::utest_filename("bdft_lih222_sym");
     return default_MF(comm, mf::bdft_source, outdir, prefix, ftype);
 
-/*
   } else if (src == "bdft_si222") {
 
     auto [outdir,prefix] = utils::utest_filename("bdft_si222");
     return default_MF(comm, mf::bdft_source, outdir, prefix);
-*/
   } else if (src == "pyscf_si222") {
 
     auto [outdir,prefix] = utils::utest_filename("pyscf_si222");
@@ -186,8 +195,8 @@ inline decltype(auto) default_MF(std::shared_ptr<utils::mpi_context_t<comm_t>>& 
     return default_MF(comm, mf::pyscf_source, outdir, prefix, ftype);
 
   } else {
-    utils::check(false, "Unrecognized test system: {}. "
-                        "Available options: qe_si211, qe_lih222, bdft_si222, pyscf_si222, pyscf_h2_222, pyscf_li_222u", src);
+    utils::check(false, "Unrecognized test system: {}. ", src);
+//                        "Available options: qe_si211, qe_lih222, bdft_si222, pyscf_si222, pyscf_h2_222, pyscf_li_222u", src);
 
     auto [outdir,prefix] = utils::utest_filename("pyscf_si222");
     return default_MF(comm, mf::pyscf_source, outdir, prefix, ftype);
