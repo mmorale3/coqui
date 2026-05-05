@@ -179,8 +179,8 @@ void fwdnufft(nuplan_t const &p, std::complex<double> *c, std::complex<double> *
   auto *pfwd = static_cast<cufinufft_plan*>(p.fwd);
   utils::check(pfwd, "dev::fwdnufft: uninitialised cufinufft plan.");
   int ier = cufinufft_execute(*pfwd,
-                               reinterpret_cast<std::complex<double>*>(c),
-                               reinterpret_cast<std::complex<double>*>(f));
+                               reinterpret_cast<cuDoubleComplex*>(c),
+                               reinterpret_cast<cuDoubleComplex*>(f));
   CUNUFFT_CHECK(ier, "cufinufft_execute type-1 (double) failed");
 #else
   (void)p; (void)c; (void)f;
@@ -197,8 +197,8 @@ void invnufft(nuplan_t const &p, std::complex<double> *f, std::complex<double> *
   utils::check(pinv, "dev::invnufft: uninitialised cufinufft plan.");
   // type-2: cufinufft_execute(plan, c_out, f_in)
   int ier = cufinufft_execute(*pinv,
-                               reinterpret_cast<std::complex<double>*>(c),
-                               reinterpret_cast<std::complex<double>*>(f));
+                               reinterpret_cast<cuDoubleComplex*>(c),
+                               reinterpret_cast<cuDoubleComplex*>(f));
   CUNUFFT_CHECK(ier, "cufinufft_execute type-2 (double) failed");
 #else
   (void)p; (void)c; (void)f;
@@ -216,8 +216,8 @@ void fwdnufft(nuplan_t const &p, std::complex<float> *c, std::complex<float> *f)
   auto *pfwd = static_cast<cufinufftf_plan*>(p.fwd);
   utils::check(pfwd, "dev::fwdnufft: uninitialised cufinufftf plan.");
   int ier = cufinufftf_execute(*pfwd,
-                                reinterpret_cast<std::complex<float>*>(c),
-                                reinterpret_cast<std::complex<float>*>(f));
+                                reinterpret_cast<cuFloatComplex*>(c),
+                                reinterpret_cast<cuFloatComplex*>(f));
   CUNUFFT_CHECK(ier, "cufinufftf_execute type-1 (float) failed");
 #else
   (void)p; (void)c; (void)f;
@@ -235,8 +235,8 @@ void invnufft(nuplan_t const &p, std::complex<float> *f, std::complex<float> *c)
   auto *pinv = static_cast<cufinufftf_plan*>(p.inv);
   utils::check(pinv, "dev::invnufft: uninitialised cufinufftf plan.");
   int ier = cufinufftf_execute(*pinv,
-                                reinterpret_cast<std::complex<float>*>(c),
-                                reinterpret_cast<std::complex<float>*>(f));
+                                reinterpret_cast<cuFloatComplex*>(c),
+                                reinterpret_cast<cuFloatComplex*>(f));
   CUNUFFT_CHECK(ier, "cufinufftf_execute type-2 (float) failed");
 #else
   (void)p; (void)c; (void)f;

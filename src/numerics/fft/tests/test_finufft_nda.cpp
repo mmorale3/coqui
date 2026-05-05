@@ -865,4 +865,177 @@ TEST_CASE("finufft_nda_mem_template_compile", "[nufft][memory_space]")
   REQUIRE(true);
 }
 
+// ===========================================================================
+// cuFINUFFT device-vs-host validation
+//
+// These cases compile and run only when the build defines
+// COQUI_HAVE_CUFINUFFT (which implies ENABLE_DEVICE / nda::cuarray are
+// available). They re-run the host fixtures on the device backend through
+// nufft_t<DEVICE_MEMORY> and require the two outputs to agree element-wise
+// to NUFFT precision. The check is bit-for-bit "same plan, same data";
+// floating-point eps drift between FINUFFT and cuFINUFFT shows up here.
+// ===========================================================================
+#if defined(COQUI_HAVE_CUFINUFFT)
+
+template<typename T>
+void test_1d_device_vs_host()
+{
+  using namespace math::nufft;
+  using RealT = real_of_t<T>;
+
+  const int N  = 64;
+  const int NT = 3;
+  const auto eps = finufft_eps<T>();
+
+  auto x_h = uniform_pts<RealT>(N);
+
+  // Random batched input, replicated across the NT batches.
+  nda::array<T,1> c_ref(N);
+  utils::fillRandomArray(c_ref);
+  nda::array<T,2> C_h(NT, N), F_h(NT, N), C_rt_h(NT, N);
+  for (int t = 0; t < NT; ++t) C_h(t, nda::range::all) = c_ref;
+
+  // Host reference round-trip
+  {
+    auto p = create_plan<HOST_MEMORY>(std::array<int,1>{N}, N, NT, eps, NUFFT_FORWARD);
+    setpts(p, x_h);
+    fwdnufft(p, C_h, F_h);
+    invnufft(p, F_h, C_rt_h);
+    destroy_plan(p);
+  }
+
+  // Device round-trip via the templated path.
+  auto x_d = memory::to_memory_space<DEVICE_MEMORY>(x_h);
+  auto C_d = memory::to_memory_space<DEVICE_MEMORY>(C_h);
+  memory::array<DEVICE_MEMORY, T, 2> F_d(NT, N), C_rt_d(NT, N);
+  {
+    auto p = create_plan<DEVICE_MEMORY>(std::array<int,1>{N}, N, NT, eps, NUFFT_FORWARD);
+    setpts(p, x_d);
+    fwdnufft(p, C_d, F_d);
+    invnufft(p, F_d, C_rt_d);
+    destroy_plan(p);
+  }
+
+  auto F_h_from_d    = nda::to_host(F_d);
+  auto C_rt_h_from_d = nda::to_host(C_rt_d);
+
+  for (int t = 0; t < NT; ++t)
+    for (int k = 0; k < N; ++k)
+      REQUIRE(std::abs(F_h(t, k) - F_h_from_d(t, k)) < tol<T>() * double(N));
+  for (int t = 0; t < NT; ++t)
+    for (int j = 0; j < N; ++j)
+      REQUIRE(std::abs(C_rt_h(t, j) - C_rt_h_from_d(t, j)) < tol<T>() * double(N));
+}
+
+template<typename T>
+void test_2d_device_vs_host()
+{
+  using namespace math::nufft;
+  using RealT = real_of_t<T>;
+
+  const int N1 = 9, N2 = 8;
+  const int M  = N1 * N2;
+  const int NT = 2;
+  const auto eps = finufft_eps<T>();
+
+  // 2-D uniform grid on [-π, π) × [-π, π).
+  nda::array<RealT,1> x_h(M), y_h(M);
+  {
+    const RealT hx = RealT(2.0*M_PI) / RealT(N1);
+    const RealT hy = RealT(2.0*M_PI) / RealT(N2);
+    int idx = 0;
+    for (int j2 = 0; j2 < N2; ++j2)
+      for (int j1 = 0; j1 < N1; ++j1, ++idx) {
+        x_h(idx) = RealT(-M_PI) + RealT(j1) * hx;
+        y_h(idx) = RealT(-M_PI) + RealT(j2) * hy;
+      }
+  }
+
+  nda::array<T,1> c_ref(M);
+  utils::fillRandomArray(c_ref);
+  nda::array<T,2> C_h(NT, M), C_rt_h(NT, M);
+  for (int t = 0; t < NT; ++t) C_h(t, nda::range::all) = c_ref;
+
+  // F is C-layout (NT, N1, N2); plan modes are passed transposed for C-order.
+  nda::array<T,3> F_h(NT, N1, N2);
+
+  {
+    auto p = create_plan<HOST_MEMORY>(std::array<int,2>{N2, N1}, M, NT, eps, NUFFT_FORWARD);
+    setpts(p, y_h, x_h);
+    fwdnufft(p, C_h, F_h);
+    invnufft(p, F_h, C_rt_h);
+    destroy_plan(p);
+  }
+
+  auto x_d = memory::to_memory_space<DEVICE_MEMORY>(x_h);
+  auto y_d = memory::to_memory_space<DEVICE_MEMORY>(y_h);
+  auto C_d = memory::to_memory_space<DEVICE_MEMORY>(C_h);
+  memory::array<DEVICE_MEMORY, T, 3> F_d(NT, N1, N2);
+  memory::array<DEVICE_MEMORY, T, 2> C_rt_d(NT, M);
+  {
+    auto p = create_plan<DEVICE_MEMORY>(std::array<int,2>{N2, N1}, M, NT, eps, NUFFT_FORWARD);
+    setpts(p, y_d, x_d);
+    fwdnufft(p, C_d, F_d);
+    invnufft(p, F_d, C_rt_d);
+    destroy_plan(p);
+  }
+
+  auto F_h_from_d    = nda::to_host(F_d);
+  auto C_rt_h_from_d = nda::to_host(C_rt_d);
+
+  for (int t = 0; t < NT; ++t)
+    for (int a = 0; a < N1; ++a)
+      for (int b = 0; b < N2; ++b)
+        REQUIRE(std::abs(F_h(t, a, b) - F_h_from_d(t, a, b)) < tol<T>() * double(M));
+  for (int t = 0; t < NT; ++t)
+    for (int j = 0; j < M; ++j)
+      REQUIRE(std::abs(C_rt_h(t, j) - C_rt_h_from_d(t, j)) < tol<T>() * double(M));
+}
+
+template<typename T>
+void test_RAII_device_vs_host()
+{
+  using namespace math::nufft;
+  using RealT = real_of_t<T>;
+  const int N = 32;
+  const auto eps = finufft_eps<T>();
+
+  auto x_h = uniform_pts<RealT>(N);
+  nda::array<T,1> c_ref(N), c_h(N), F_h(N), c_rt_h(N);
+  utils::fillRandomArray(c_ref);
+  c_h = c_ref;
+
+  {
+    math::nda::nufft_t<HOST_MEMORY> nft(std::array<int,1>{N}, N, 1, eps, NUFFT_FORWARD);
+    nft.setpts(x_h);
+    nft.forward(c_h, F_h);
+    nft.backward(F_h, c_rt_h);
+  }
+
+  auto x_d   = memory::to_memory_space<DEVICE_MEMORY>(x_h);
+  auto c_d   = memory::to_memory_space<DEVICE_MEMORY>(c_h);
+  memory::array<DEVICE_MEMORY, T, 1> F_d(N), c_rt_d(N);
+  {
+    math::nda::nufft_t<DEVICE_MEMORY> nft(std::array<int,1>{N}, N, 1, eps, NUFFT_FORWARD);
+    nft.setpts(x_d);
+    nft.forward(c_d, F_d);
+    nft.backward(F_d, c_rt_d);
+  }
+
+  auto F_h_from_d    = nda::to_host(F_d);
+  auto c_rt_h_from_d = nda::to_host(c_rt_d);
+
+  REQUIRE(approx_equal(F_h, F_h_from_d, tol<T>()));
+  REQUIRE(approx_equal(c_rt_h, c_rt_h_from_d, tol<T>()));
+}
+
+TEST_CASE("cufinufft_nda_1d_device_vs_host_double", "[nufft][device]")
+{ test_1d_device_vs_host<std::complex<double>>(); }
+TEST_CASE("cufinufft_nda_2d_device_vs_host_double", "[nufft][device]")
+{ test_2d_device_vs_host<std::complex<double>>(); }
+TEST_CASE("cufinufft_nda_RAII_device_vs_host_double", "[nufft][device]")
+{ test_RAII_device_vs_host<std::complex<double>>(); }
+
+#endif // COQUI_HAVE_CUFINUFFT
+
 } // namespace nufft_tests

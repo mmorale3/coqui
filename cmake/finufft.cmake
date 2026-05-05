@@ -105,6 +105,14 @@ if(ENABLE_CUFINUFFT)
       "version pinned in this file (${FINUFFT_GIT_TAG}) supports CUDA. "
       "The COQUI_HAVE_CUFINUFFT compile flag is set, so cufinufft.cpp will "
       "fail to link without this target.")
+  else()
+    # FINUFFT v2.4.x builds cufinufft with CUDA_SEPARABLE_COMPILATION ON.
+    # Without device-symbol resolution at the library, every consuming
+    # binary would have to be linked with nvcc (LINKER_LANGUAGE CUDA) to
+    # finalize __cudaRegisterLinkedBinary_*. CoQui builds plain C++ test
+    # binaries, so push the device link back into the cufinufft library.
+    set_target_properties(cufinufft PROPERTIES
+                          CUDA_RESOLVE_DEVICE_SYMBOLS ON)
   endif()
 endif()
 
