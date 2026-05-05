@@ -396,6 +396,11 @@ namespace methods {
 
         decltype(nda::range::all) all;
         constexpr int N = nda::get_rank<Array_primary_t>;
+        // The aux output may live on device while the primary input
+        // is HOST. Both gemms need to share an address space; we run
+        // them in HOST scratch on the host path and stage the second
+        // result into the device-typed O_ikPQ slice on the device path.
+        constexpr bool aux_on_device = ::nda::mem::on_device<Array_aux_t>;
         size_t ns         = O_tskab.shape(N-4);
         size_t nkpts_ibz  = O_tskab.shape(N-3);
         size_t nbnd       = O_tskab.shape(N-2);
@@ -421,7 +426,14 @@ namespace methods {
         int offset = (rank % nbatch < n_large_batch)? 0 : 0 + n_large_batch;
 
         nda::array<ComplexType, 2> Ask_Pb(batch_size, nbnd);
-        //nda::matrix<ComplexType> Xsk_bQ_conj(nbnd, NQ_loc);
+        // Device-side scratch for the second gemm output, staged once
+        // per inner iter to the device-typed O_ikPQ slice.
+        [[maybe_unused]] memory::array<DEVICE_MEMORY, ComplexType, 2> O_PQ_dev;
+        [[maybe_unused]] memory::array<DEVICE_MEMORY, ComplexType, 2> Ask_Pb_dev;
+        if constexpr (aux_on_device) {
+          O_PQ_dev   = memory::array<DEVICE_MEMORY, ComplexType, 2>(batch_size, NQ_loc);
+          Ask_Pb_dev = memory::array<DEVICE_MEMORY, ComplexType, 2>(batch_size, nbnd);
+        }
 
         for (size_t ikP = rank; ikP < dim_i*nkpts*nbatch; ikP += comm_size) {
           // ikP = (i * nkpts + k) * nbatch + PP
@@ -433,10 +445,10 @@ namespace methods {
           nda::range O_P_rng(PP*batch_size + offset, (PP+1)*batch_size + offset);
           nda::range O_Q_rng(Q_offset, Q_offset + NQ_loc);
 
-          // Ask_Pb = Xsk_Pa * Osk_ab
+          // Ask_Pb = Xsk_Pa * Osk_ab  (host gemm; primary input is HOST)
           auto Xsk_Pa_l = thc.X(s, ip, k);
           auto Xsk_Pa_r = thc.X(s, iq, k);
-          
+
           if(kp_trev(k)) {
             nda::blas::gemm(Xsk_Pa_l(X_P_rng, all), nda::transpose(O_ikab_4D(i, kp_map(k), all, all)), Ask_Pb);
           } else {
@@ -444,8 +456,18 @@ namespace methods {
           }
 
           // Osk_PQ = Ask_Pb * conj(Xsk_Qb)
-          //Xsk_bQ_conj = nda::conj(nda::transpose(Xsk_Pa(O_Q_rng, all)));
-          nda::blas::gemm(Ask_Pb, nda::dagger(Xsk_Pa_r(O_Q_rng, all)), O_ikPQ_4D(i, k, O_P_rng, all));
+          if constexpr (aux_on_device) {
+            // Mirror the host scratch + Xsk_Pa_r slice to device, run the
+            // gemm in device space, then copy into the device-typed
+            // O_ikPQ_4D slice.
+            Ask_Pb_dev = Ask_Pb;
+            memory::array<DEVICE_MEMORY, ComplexType, 2> Xr_mem =
+                memory::to_memory_space<DEVICE_MEMORY>(Xsk_Pa_r(O_Q_rng, all));
+            nda::blas::gemm(Ask_Pb_dev, nda::dagger(Xr_mem), O_PQ_dev);
+            O_ikPQ_4D(i, k, O_P_rng, all) = O_PQ_dev;
+          } else {
+            nda::blas::gemm(Ask_Pb, nda::dagger(Xsk_Pa_r(O_Q_rng, all)), O_ikPQ_4D(i, k, O_P_rng, all));
+          }
         }
       }
 
@@ -549,6 +571,13 @@ namespace methods {
         decltype(nda::range::all) all;
 
         constexpr int N = nda::get_rank<Array_primary_t>;
+        // The auxiliary input may live on device while the primary output
+        // (a HOST shared-array slice) lives on the host. The two gemms
+        // below must execute in the same address space as O_iPQ; any
+        // result needed for the host MPI reduce + accumulate is staged
+        // back to host once at the end of each (s, k) iteration.
+        constexpr bool aux_on_device = ::nda::mem::on_device<Array_aux_t>;
+        constexpr MEMORY_SPACE WORK_MEM = aux_on_device ? DEVICE_MEMORY : HOST_MEMORY;
 
         size_t nbnd = O_tskab.shape(N-2);
         size_t ns_loc = O_tskPQ.shape(N-4);
@@ -565,26 +594,43 @@ namespace methods {
         auto O_iPQ_3D = nda::reshape(O_tskPQ, shape_t<3>{dim0, NP_loc, NQ_loc});
         auto O_iab_3D = nda::reshape(O_tskab, shape_t<3>{dim0, nbnd, nbnd});
 
-        nda::array<ComplexType, 2> Ask_aQ(nbnd, NQ_loc);
-        //nda::matrix<ComplexType> Xsk_Pa_conj(NP_loc, nbnd);
-        nda::array<ComplexType, 2> Oab_buffer(nbnd, nbnd);
+        memory::array<WORK_MEM, ComplexType, 2> Ask_aQ(nbnd, NQ_loc);
+        memory::array<WORK_MEM, ComplexType, 2> Oab_buffer(nbnd, nbnd);
+        nda::array<ComplexType, 2> Oab_buffer_host;
+        if constexpr (aux_on_device) Oab_buffer_host.resize(std::array<long,2>{long(nbnd), long(nbnd)});
 
         for (size_t i = 0; i < dim0; ++i) {
           // i = (it * ns_loc + is) * nk_loc + ik
           size_t s = (i / nk_loc) % ns_loc;
           size_t k = i % nk_loc + k_offset;
 
-          // Ask_aQ = conj(Xsk_Pa) * Osk_PQ
-          auto Xsk_Pa_l = thc.X(s, ip, kp_map(k)); 
-          auto Xsk_Pa_r = ( ip==iq ? Xsk_Pa_l : thc.X(s, iq, kp_map(k))); 
-          //Xsk_Pa_conj = nda::conj(Xsk_Pa(P_rng, all));
-          nda::blas::gemm(nda::dagger(Xsk_Pa_l(P_rng, all)), O_iPQ_3D(i, all, all), Ask_aQ);
+          auto Xsk_Pa_l = thc.X(s, ip, kp_map(k));
+          auto Xsk_Pa_r = ( ip==iq ? Xsk_Pa_l : thc.X(s, iq, kp_map(k)));
 
-          // Osk_ab = Ask_aQ * Xsk_Qb
-          nda::blas::gemm(Ask_aQ, Xsk_Pa_r(Q_rng, all), Oab_buffer);
-          dim0_comm.reduce_in_place_n(Oab_buffer.data(), Oab_buffer.size(), std::plus<>{}, 0);
-          if (dim0_comm.root()) {
-            O_iab_3D(i, all, all) += scl*Oab_buffer;
+          if constexpr (aux_on_device) {
+            // Mirror per (s, k); upstream callers should add a cache when
+            // the (s, k) sweep dominates. Two contiguous slices, copied
+            // once each into MEM-typed scratch buffers.
+            memory::array<WORK_MEM, ComplexType, 2> Xl_mem =
+                memory::to_memory_space<WORK_MEM>(Xsk_Pa_l(P_rng, all));
+            memory::array<WORK_MEM, ComplexType, 2> Xr_mem;
+            if (ip == iq) Xr_mem = Xl_mem;
+            else          Xr_mem = memory::to_memory_space<WORK_MEM>(Xsk_Pa_r(Q_rng, all));
+            nda::blas::gemm(nda::dagger(Xl_mem), O_iPQ_3D(i, all, all), Ask_aQ);
+            nda::blas::gemm(Ask_aQ, Xr_mem, Oab_buffer);
+            Oab_buffer_host = nda::to_host(Oab_buffer);
+            dim0_comm.reduce_in_place_n(Oab_buffer_host.data(), Oab_buffer_host.size(), std::plus<>{}, 0);
+            if (dim0_comm.root()) {
+              O_iab_3D(i, all, all) += scl*Oab_buffer_host;
+            }
+          } else {
+            // Host: original code path, bit-identical to baseline.
+            nda::blas::gemm(nda::dagger(Xsk_Pa_l(P_rng, all)), O_iPQ_3D(i, all, all), Ask_aQ);
+            nda::blas::gemm(Ask_aQ, Xsk_Pa_r(Q_rng, all), Oab_buffer);
+            dim0_comm.reduce_in_place_n(Oab_buffer.data(), Oab_buffer.size(), std::plus<>{}, 0);
+            if (dim0_comm.root()) {
+              O_iab_3D(i, all, all) += scl*Oab_buffer;
+            }
           }
         } // i
       } // _aux_to_primary_impl

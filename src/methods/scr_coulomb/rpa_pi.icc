@@ -19,12 +19,13 @@
 namespace methods {
 namespace solvers {
 
+  template<MEMORY_SPACE MEM>
   auto scr_coulomb_t::eval_Pi_rpa_Rspace(
       const nda::MemoryArrayOfRank<5> auto &G_tskij,
       THC_ERI auto &thc)
-  -> memory::darray_t<memory::array<HOST_MEMORY, ComplexType, 4>, mpi3::communicator>
+  -> memory::darray_t<memory::array<MEM, ComplexType, 4>, mpi3::communicator>
   {
-    using local_Array_4D_t = nda::array<ComplexType, 4>;
+    using local_Array_4D_t = memory::array<MEM, ComplexType, 4>;
     using math::nda::make_distributed_array;
     decltype(nda::range::all) all;
 
@@ -68,13 +69,26 @@ namespace solvers {
     auto [t_origin, q_origin, P_origin, Q_origin] = dPi_tqPQ.origin();
     auto [nt_loc, nq_loc, NP_loc, NQ_loc] = dPi_tqPQ.local_shape();
 
-    // prepare Fourier transform matrices between k-space and R-space
+    // prepare Fourier transform matrices between k-space and R-space.
+    // sf_Rk / sf_qR are HOST shared arrays; for device runs we keep a
+    // device-side mirror to avoid host-device gemm dispatch.
     math::shm::shared_array<nda::array_view<ComplexType,2>> sf_Rk(*mpi, {nkpts,nkpts});
     utils::k_to_R_coefficients(mpi->comm, nda::range(nkpts), MF->kpts(), MF->lattv(), MF->kp_grid(), sf_Rk);
-    auto f_Rk = sf_Rk.local();
     math::shm::shared_array<nda::array_view<ComplexType,2>> sf_qR(*mpi,{nqpts_ibz,nkpts});
     utils::R_to_k_coefficients(mpi->comm, nda::range(nkpts), MF->Qpts_ibz(), MF->lattv(), MF->kp_grid(), sf_qR);
-    auto f_qR = sf_qR.local();
+    [[maybe_unused]] auto f_Rk_host = sf_Rk.local();
+    [[maybe_unused]] auto f_qR_host = sf_qR.local();
+    [[maybe_unused]] memory::array<MEM, ComplexType, 2> f_Rk_dev, f_qR_dev;
+    if constexpr (MEM != HOST_MEMORY) {
+      f_Rk_dev = memory::to_memory_space<MEM>(f_Rk_host);
+      f_qR_dev = memory::to_memory_space<MEM>(f_qR_host);
+    }
+    auto get_f_Rk = [&]() -> auto& {
+      if constexpr (MEM == HOST_MEMORY) return f_Rk_host; else return f_Rk_dev;
+    };
+    auto get_f_qR = [&]() -> auto& {
+      if constexpr (MEM == HOST_MEMORY) return f_qR_host; else return f_qR_dev;
+    };
 
     // Setup t_intra_comm
     mpi3::communicator t_intra_comm = mpi->comm.split(t_origin, mpi->comm.rank());
@@ -87,7 +101,7 @@ namespace solvers {
         t_intra_comm, {1, 1, np_P, np_Q}, {ns, nkpts, Np, Np}, {1, 1, 1, 1});
     auto dbuf_skPQ  = make_distributed_array<local_Array_4D_t>(
         t_intra_comm, {1, 1, np_P, np_Q}, {ns, nkpts_no_trev, Np, Np}, {1, 1, 1, 1});
-    nda::matrix<ComplexType> X_R_PQ(nkpts, NP_loc*NQ_loc);
+    memory::array<MEM, ComplexType, 2> X_R_PQ(nkpts, NP_loc*NQ_loc);
     utils::check(dGp_sRPQ.local_shape()[2] == NP_loc, "dGp_sRPQ.local_shape[2] != NP_loc");
     utils::check(dGp_sRPQ.local_shape()[3] == NQ_loc, "dGp_sRPQ.local_shape[3] != NQ_loc");
     _Timer.stop("PI_ALLOC_R");
@@ -106,10 +120,17 @@ namespace solvers {
       //thc_solver_comm::setup_G_thc(it+t_origin, G_tskij, dbuf_skPQ, thc, false,  MF->kp_to_ibz(), MF->kp_trev());
       _Timer.stop("PI_PRIM_TO_AUX");
       for (size_t ik=0; ik<nkpts; ++ik) {
+        auto dst = Gp_sRPQ_loc(all,ik,all,all);
         if (kp_trev(ik)) {
-          Gp_sRPQ_loc(all,ik,all,all) = nda::conj(buf_skPQ_loc(all,kp_trev_pair(ik),all,all));
+          auto src = buf_skPQ_loc(all,kp_trev_pair(ik),all,all);
+          if constexpr (MEM == HOST_MEMORY) {
+            dst = nda::conj(src);
+          } else {
+            dst = src;
+            nda::tensor::scale(ComplexType(1.0), dst, nda::tensor::op::CONJ);
+          }
         } else {
-          Gp_sRPQ_loc(all,ik,all,all) = buf_skPQ_loc(all,ik,all,all);
+          dst = buf_skPQ_loc(all,ik,all,all);
         }
       }
       if (nkpts!=1) {
@@ -117,7 +138,7 @@ namespace solvers {
         for (size_t is=0; is<ns; ++is) {
           auto GpR_2D = nda::reshape(Gp_sRPQ_loc(is, nda::ellipsis{}),
                                      shape_t<2>{nkpts, NP_loc * NQ_loc});
-          nda::blas::gemm(f_Rk, GpR_2D, X_R_PQ);
+          nda::blas::gemm(get_f_Rk(), GpR_2D, X_R_PQ);
           GpR_2D = X_R_PQ;
         }
         _Timer.stop("PI_FT_R");
@@ -130,10 +151,17 @@ namespace solvers {
       //thc_solver_comm::setup_G_thc(it+t_origin, G_tskij, dbuf_skPQ, thc, true, MF->kp_to_ibz(), MF->kp_trev()); // G_PQ(t)
       _Timer.stop("PI_PRIM_TO_AUX");
       for (size_t ik=0; ik<nkpts; ++ik) {
+        auto dst = Gn_sRPQ_loc(all,ik,all,all);
         if (kp_trev(ik)) {
-          Gn_sRPQ_loc(all,ik,all,all) = nda::conj(buf_skPQ_loc(all,kp_trev_pair(ik),all,all));
+          auto src = buf_skPQ_loc(all,kp_trev_pair(ik),all,all);
+          if constexpr (MEM == HOST_MEMORY) {
+            dst = nda::conj(src);
+          } else {
+            dst = src;
+            nda::tensor::scale(ComplexType(1.0), dst, nda::tensor::op::CONJ);
+          }
         } else {
-          Gn_sRPQ_loc(all,ik,all,all) = buf_skPQ_loc(all,ik,all,all);
+          dst = buf_skPQ_loc(all,ik,all,all);
         }
       }
       if (nkpts!=1) {
@@ -141,7 +169,7 @@ namespace solvers {
         for (size_t is=0; is<ns; ++is) {
           auto GnR_2D = nda::reshape(Gn_sRPQ_loc(is, nda::ellipsis{}),
                                      shape_t<2>{nkpts, NP_loc * NQ_loc});
-          nda::blas::gemm(f_Rk, GnR_2D, X_R_PQ);
+          nda::blas::gemm(get_f_Rk(), GnR_2D, X_R_PQ);
           GnR_2D = X_R_PQ;
         }
         _Timer.stop("PI_FT_R");
@@ -153,13 +181,36 @@ namespace solvers {
       auto Gn_RPQ = Gn_sRPQ_loc(0, nda::ellipsis{});
       auto Gp_RPQ = Gp_sRPQ_loc(0, nda::ellipsis{});
       // MAM: reusing memory
-      GG_RPQ = had_prod2(Gp_RPQ, nda::conj(Gn_RPQ));
-      for (long s = 1; s < ns; ++s) {
-        auto Gp_RPQ_s = Gp_sRPQ_loc(s,nda::ellipsis{});
-        auto Gn_RPQ_s = Gn_sRPQ_loc(s,nda::ellipsis{});
-        GG_RPQ += had_prod2(Gp_RPQ_s, nda::conj(Gn_RPQ_s));
+      if constexpr (::nda::mem::on_host<std::decay_t<decltype(GG_RPQ)>>) {
+        GG_RPQ = had_prod2(Gp_RPQ, nda::conj(Gn_RPQ));
+        for (long s = 1; s < ns; ++s) {
+          auto Gp_RPQ_s = Gp_sRPQ_loc(s,nda::ellipsis{});
+          auto Gn_RPQ_s = Gn_sRPQ_loc(s,nda::ellipsis{});
+          GG_RPQ += had_prod2(Gp_RPQ_s, nda::conj(Gn_RPQ_s));
+        }
+        GG_RPQ *= sp_factor;
+      } else {
+        // Device: GG = Gp * conj(Gn) via copy + elementwise(conj, MUL),
+        // then accumulate the remaining spins, then scale by sp_factor.
+        GG_RPQ = Gp_RPQ;
+        nda::tensor::elementwise(ComplexType(1.0), nda::conj(Gn_RPQ), "RPQ",
+                                 ComplexType(1.0), GG_RPQ,            "RPQ",
+                                 nda::tensor::op::MUL);
+        for (long s = 1; s < ns; ++s) {
+          auto Gp_RPQ_s = Gp_sRPQ_loc(s,nda::ellipsis{});
+          auto Gn_RPQ_s = Gn_sRPQ_loc(s,nda::ellipsis{});
+          // tmp = Gp_s * conj(Gn_s); GG += tmp (= Gp_s * conj(Gn_s))
+          memory::array<DEVICE_MEMORY, ComplexType, 3> tmp_RPQ(GG_RPQ.shape());
+          tmp_RPQ() = Gp_RPQ_s;
+          nda::tensor::elementwise(ComplexType(1.0), nda::conj(Gn_RPQ_s), "RPQ",
+                                   ComplexType(1.0), tmp_RPQ,             "RPQ",
+                                   nda::tensor::op::MUL);
+          nda::tensor::elementwise(ComplexType(1.0), tmp_RPQ, "RPQ",
+                                   ComplexType(1.0), GG_RPQ,  "RPQ",
+                                   nda::tensor::op::SUM);
+        }
+        nda::tensor::scale(ComplexType(sp_factor), GG_RPQ);
       }
-      GG_RPQ *= sp_factor;
       _Timer.stop("PI_HADPROD_R");
 
       if (nkpts != 1) {
@@ -168,7 +219,7 @@ namespace solvers {
         auto Piq_2D = nda::reshape(Pi_tqPQ_loc(it,nda::ellipsis{}),
                                    shape_t<2>{nqpts_ibz, NP_loc*NQ_loc});
         auto GGR_2D = nda::reshape(GG_RPQ, shape_t<2>{nkpts, NP_loc*NQ_loc});
-        nda::blas::gemm(f_qR, GGR_2D, Piq_2D);
+        nda::blas::gemm(get_f_qR(), GGR_2D, Piq_2D);
         _Timer.stop("PI_FT_R");
       } else {
         Pi_tqPQ_loc(it,nda::ellipsis{}) = GG_RPQ;
@@ -179,9 +230,13 @@ namespace solvers {
     return dPi_tqPQ;
   }
 
+  template<MEMORY_SPACE MEM>
   auto scr_coulomb_t::eval_Pi_rpa_kspace(const nda::MemoryArrayOfRank<5> auto &G_tskij, THC_ERI auto &thc)
-  -> memory::darray_t<memory::array<HOST_MEMORY, ComplexType, 4>, mpi3::communicator>
+  -> memory::darray_t<memory::array<MEM, ComplexType, 4>, mpi3::communicator>
   {
+    static_assert(MEM == HOST_MEMORY,
+                  "scr_coulomb_t::eval_Pi_rpa_kspace: device path not yet ported; "
+                  "use the R-space algorithm (default) for GPU runs.");
     _Timer.start("EVALUATE_PI_K");
     auto mpi = thc.mpi();
     auto MF = thc.MF();
@@ -319,6 +374,15 @@ namespace solvers {
     auto Pi_qtPQ = dPi_qtPQ.local();
     Pi_qtPQ() = 0.0;
 
+    using Pi_t = std::decay_t<decltype(Pi_qtPQ)>;
+    constexpr bool pi_on_host = ::nda::mem::on_host<Pi_t>;
+    [[maybe_unused]] memory::array<
+        (pi_on_host ? HOST_MEMORY : DEVICE_MEMORY), ComplexType, 3>
+      tmp_tPQ;
+    if constexpr (not pi_on_host) {
+      tmp_tPQ = memory::array<DEVICE_MEMORY, ComplexType, 3>(nt_loc, Np_loc, Nq_loc);
+    }
+
     _Timer.start("PI_HADPROD_K");
     for (size_t qsk = 0; qsk < nqpts*ns*nkpts; ++qsk) {
       // qskt = iq*ns*nkpts + is*nkpts + ik
@@ -330,7 +394,18 @@ namespace solvers {
       auto Gn_k = Gn_sktPQ(is, ik, nda::ellipsis{});
       auto Gp_kmq = Gp_sktPQ_c(is, ikmq, nda::ellipsis{});
       auto Pi = Pi_qtPQ(iq, nda::ellipsis{});
-      Pi += had_prod2(Gp_kmq, Gn_k);
+      if constexpr (pi_on_host) {
+        Pi += had_prod2(Gp_kmq, Gn_k);
+      } else {
+        // Pi += factor * Gp_kmq * Gn_k via tmp staging
+        tmp_tPQ() = Gp_kmq;
+        nda::tensor::elementwise(ComplexType(1.0), Gn_k,    "tPQ",
+                                 ComplexType(1.0), tmp_tPQ, "tPQ",
+                                 nda::tensor::op::MUL);
+        nda::tensor::elementwise(ComplexType(factor), tmp_tPQ, "tPQ",
+                                 ComplexType(1.0),    Pi,     "tPQ",
+                                 nda::tensor::op::SUM);
+      }
     }
     _Timer.stop("PI_HADPROD_K");
   }
@@ -453,7 +528,7 @@ namespace solvers {
       utils::check(false, "embed_eri_t::eval_Pi_active: invalid scheme = {} for polarizability in the active space.", scheme);
     mpi->comm.barrier();
 
-    return eval_Pi_rpa_Rspace(sGG_tskij.local(), thc);
+    return eval_Pi_rpa_Rspace<HOST_MEMORY>(sGG_tskij.local(), thc);
   }
 
 } // solvers
