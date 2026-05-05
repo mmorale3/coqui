@@ -65,6 +65,13 @@ cholesky::cholesky(mf::MF *mf_,
     cutoff( io::get_value_with_default<double>(pt,"tol",1e-10) ),
     default_block_size( io::get_value_with_default<int>(pt,"chol_block_size",32) ),
     ecut( io::get_value_with_default<double>(pt,"ecut",mf->ecutrho()) ),
+    // Default rho_g sits on the smooth (dffts) mesh: this Cholesky path reads
+    // ψ on the smooth real-space grid and FFTs the pair densities on a box
+    // of the same size. Switching to the dense (dfftp / aug) mesh would
+    // require a custom-grid mapping (read 'w', map via swfc_to_rho) — that
+    // path is not yet plumbed here. For NCPP smooth == dense, so this is
+    // already a no-op; for PAW, augmentation contributions to ERIs are a
+    // separate follow-up (use the THC + paw_aug pipeline in the meantime).
     rho_g(ecut,mf->fft_grid_dim(),mf->recv()),
     vG( io::check_child_exists(pt,"potential") ? io::find_child(pt,"potential") : ptree{} ),
     howmany_fft(-1)

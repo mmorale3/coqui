@@ -50,13 +50,16 @@ namespace methods
 namespace detail 
 {
 
-// encapsulates details of construction of rho_g 
+// encapsulates details of construction of rho_g
 auto make_grid(utils::Communicator auto&& comm, double ecut, mf::MF& mf)
 {
-  // until you propagate the change everywhere
-  if(not mf.has_wfc_grid() or (ecut <= 0) or (std::abs(ecut-mf.ecutrho()) < 1e-3) ) 
-    return grids::truncated_g_grid( mf.ecutrho(), mf.fft_grid_dim(), mf.recv() ); 
-  auto mesh = grids::find_fft_mesh(comm,ecut,mf.recv(),mf.symm_list()); 
+  // Default cutoff/mesh: ecutrho on the dense (dfftp / aug) mesh — matches
+  // QE's convention. For NCPP fft_grid_dim_aug() == fft_grid_dim(); for PAW
+  // we need the dense mesh so the rho_g G-list and any augmentation extension
+  // (Y rows, dZ on dense G's) are sized consistently.
+  if(not mf.has_wfc_grid() or (ecut <= 0) or (std::abs(ecut-mf.ecutrho()) < 1e-3) )
+    return grids::truncated_g_grid( mf.ecutrho(), mf.fft_grid_dim_aug(), mf.recv() );
+  auto mesh = grids::find_fft_mesh(comm,ecut,mf.recv(),mf.symm_list());
   auto wfc_mesh = mf.wfc_truncated_grid()->mesh();
   if( mesh[0] < wfc_mesh[0] or
       mesh[1] < wfc_mesh[1] or

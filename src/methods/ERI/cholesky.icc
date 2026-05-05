@@ -77,28 +77,31 @@ void cholesky::evaluate_pair_densities(int iq, dArray_t<memory::array<MEM,Comple
   /**************************************************************************/
   // Pair densities in rho_g, including phase factor! 
   auto Pab = gPab.local();
-  { // Pair densities 
-    long nnr = mf->nnr();
+  { // Pair densities
+    // Sizes are driven by rho_g.mesh(), not mf->fft_grid_dim(): the cutoff
+    // used to build rho_g may have come from the user (independent of mf's
+    // ecutrho), and even at the default it is now ecutrho on the dense mesh.
+    long nnr = rho_g.nnr();
 //    long fft_batch = 1;
     long fft_batch = a_loc_rng.size();
     if constexpr (MEM == HOST_MEMORY) fft_batch=1;
 
     Timer.start("ALLOC");
-    memory::array<MEM, ComplexType, 2> Psia(fft_batch,nnr); 
+    memory::array<MEM, ComplexType, 2> Psia(fft_batch,nnr);
     memory::array<MEM, ComplexType, 2> Psib(b_loc_rng.size(),nnr);
     memory::array<MEM, ComplexType, 4> fft_b(fft_batch*b_loc_rng.size(),
-					     mf->fft_grid_dim(0),
-					     mf->fft_grid_dim(1),
-					     mf->fft_grid_dim(2));
+					     rho_g.mesh()(0),
+					     rho_g.mesh()(1),
+					     rho_g.mesh()(2));
     Psia() = ComplexType(0.0);
     Psib() = ComplexType(0.0);
     fft_b() = ComplexType(0.0);
 
     auto fft_b_2D = nda::reshape(fft_b, shape_t<2>{fft_batch*b_loc_rng.size(),nnr});
     auto fft_b_3D = nda::reshape(fft_b, shape_t<3>{fft_batch,b_loc_rng.size(),nnr});
-    auto phase = memory::unified_array<ComplexType, 3>::zeros({mf->fft_grid_dim(0),
-						    mf->fft_grid_dim(1),
-						    mf->fft_grid_dim(2)});
+    auto phase = memory::unified_array<ComplexType, 3>::zeros({rho_g.mesh()(0),
+						    rho_g.mesh()(1),
+						    rho_g.mesh()(2)});
     auto phase_1D = nda::reshape(phase, shape_t<1>{nnr});
     nda::stack_array<RealType,3> Gab = {0.0,0.0,0.0};
     Timer.stop("ALLOC");
@@ -206,20 +209,22 @@ void cholesky::evaluate_pair_densities(int iq, int ka, dArray_t<memory::array<ME
   /**************************************************************************/
   // Pair densities in rho_g, including phase factor! 
   auto Pab = gPab.local();
-  { // Pair densities 
+  { // Pair densities
 // enable fft_many!!!
-    long nnr = mf->nnr();
+    // Buffer sizes follow rho_g.mesh() — see explanatory comment in the
+    // batched evaluator above.
+    long nnr = rho_g.nnr();
 
     Timer.start("ALLOC");
-    nda::array<ComplexType, 1> Psia(nnr,ComplexType(0.0)); 
+    nda::array<ComplexType, 1> Psia(nnr,ComplexType(0.0));
     auto Psib = nda::array<ComplexType, 2>::zeros({b_loc_rng.size(),nnr});
-    auto fft_b = nda::array<ComplexType, 3>::zeros({mf->fft_grid_dim(0),
-						    mf->fft_grid_dim(1),
-						    mf->fft_grid_dim(2)});
+    auto fft_b = nda::array<ComplexType, 3>::zeros({rho_g.mesh()(0),
+						    rho_g.mesh()(1),
+						    rho_g.mesh()(2)});
     auto fft_b_1D = nda::reshape(fft_b, shape_t<1>{nnr});
-    auto phase = memory::unified_array<ComplexType, 3>::zeros({mf->fft_grid_dim(0),
-							       mf->fft_grid_dim(1),
-							       mf->fft_grid_dim(2)});
+    auto phase = memory::unified_array<ComplexType, 3>::zeros({rho_g.mesh()(0),
+							       rho_g.mesh()(1),
+							       rho_g.mesh()(2)});
     auto phase_1D = nda::reshape(phase, shape_t<1>{nnr});
     nda::stack_array<RealType,3> Gab = {0.0,0.0,0.0};
     Timer.stop("ALLOC");
