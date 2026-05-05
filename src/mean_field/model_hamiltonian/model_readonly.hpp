@@ -70,11 +70,17 @@ public:
   auto const& bz() const { return sys.bz(); }
   // should not be called
   int fft_grid_size() const { _abort_("fft_grid_size"); return 0; }
+  int fft_grid_size_aug() const { _abort_("fft_grid_size_aug"); return 0; }
   int nnr() const { _abort_("nnr"); return 0; }
+  int nnr_aug() const { _abort_("nnr_aug"); return 0; }
   decltype(auto) lattice() const { _abort_("lattice"); return sys.latt(); }
   decltype(auto) recv() const { _abort_("recv"); return sys.recv(); }
   decltype(auto) fft_grid_dim() const {
     _abort_("fft_grid_dim");
+    return fft_mesh();
+  }
+  decltype(auto) fft_grid_dim_aug() const {
+    _abort_("fft_grid_dim_aug");
     return fft_mesh();
   }
   decltype(auto) wfc_truncated_grid() const {

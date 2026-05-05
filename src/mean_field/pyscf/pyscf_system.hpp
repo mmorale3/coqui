@@ -99,6 +99,8 @@ namespace mf {
         h5::h5_write(ogrp, "number_of_bands", nbnd);
         h5::h5_write(ogrp, "ecutrho", ecutrho);
         nda::h5_write(ogrp, "fft_mesh", fft_mesh, false);
+        // PySCF backend has no PAW augmentation; aug grid mirrors the smooth grid.
+        nda::h5_write(ogrp, "fft_mesh_aug", fft_mesh_aug, false);
 
         nda::h5_write(ogrp, "eigval", eigval, false);
         nda::h5_write(ogrp, "occ", occ, false);
@@ -186,6 +188,9 @@ namespace mf {
           // assign dummy values
           ecutrho = 1.0;
         }
+        // PySCF has no PAW augmentation: the dense grid coincides with the smooth grid.
+        fft_mesh_aug = fft_mesh;
+        nnr_aug = nnr;
 
         // TODO Add check if the pyscf input is in AO basis
         h5::group scf_grp = grp.open_group("SCF");
@@ -255,10 +260,14 @@ namespace mf {
       bool orb_on_fft_grid = false;
       // plane-wave cutoff for AOs
       double ecutrho = 0;
-      // fft grid
+      // smooth fft grid (no augmentation in PySCF; mirrors QE's dffts naming)
       nda::stack_array<int, 3> fft_mesh;
-      // number of points in fft grid
+      // dense/augmented fft grid (= fft_mesh for PySCF; mirrors QE's dfftp naming)
+      nda::stack_array<int, 3> fft_mesh_aug;
+      // number of points in fft grid (smooth)
       int nnr = 0;
+      // number of points in augmented fft grid (= nnr for PySCF)
+      int nnr_aug = 0;
 
       // # of dimensions
       int ndims = 3;

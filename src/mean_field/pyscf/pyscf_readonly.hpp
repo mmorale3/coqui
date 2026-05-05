@@ -71,10 +71,13 @@ namespace mf {
       long nbnd() const { return sys.nbnd; }
       long nbnd_aux() const { return sys.nbnd_aux; }
       int nnr() const { return sys.nnr; }
+      int nnr_aug() const { return sys.nnr; }                      // no aug grid in PySCF
       decltype(auto) kpts_crystal() { return sys.bz().kpts_crys(); }
       int nkpts_ibz() const { return sys.bz().nkpts_ibz; }
       int fft_grid_size() const { return fft_mesh(0)*fft_mesh(1)*fft_mesh(2); }
+      int fft_grid_size_aug() const { return fft_grid_size(); }    // aug == smooth for PySCF
       decltype(auto) fft_grid_dim() const { return fft_mesh(); }
+      decltype(auto) fft_grid_dim_aug() const { return fft_mesh(); }
       decltype(auto) lattice() const { return sys.latt(); }
       decltype(auto) recv() const { return sys.recv(); }
       decltype(auto) kpts() { return sys.bz().kpts(); }

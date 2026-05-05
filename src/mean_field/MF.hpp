@@ -159,14 +159,25 @@ class MF
     { return std::visit( [&](auto&& v) { return v.get_sys().orb_on_fft_grid; }, var); }
     auto ecutrho() const 
     { return std::visit( [&](auto&& v) { return v.get_sys().ecutrho; }, var); }
-    auto fft_grid_size() const 
+    // Smooth FFT grid (mirrors QE's dffts; sized by ecutwfc).
+    // Use this for ψ FFTs and pair densities of pseudo-orbitals.
+    auto fft_grid_size() const
     { return std::visit( [&](auto&& v) { return v.fft_grid_size(); }, var); }
-    decltype(auto) fft_grid_dim() const 
+    decltype(auto) fft_grid_dim() const
     { return std::visit( [&](auto&& v) { return v.fft_grid_dim(); }, var ); }
     auto fft_grid_dim(int i) const { return fft_grid_dim()(i); }
-    auto nnr() const { return fft_grid_size(); } 
+    auto nnr() const { return fft_grid_size(); }
+    // Dense / augmented FFT grid (mirrors QE's dfftp; sized by ecutrho).
+    // Use this for V_loc, V_eff, V_xc, ρ_eff, augmentation Q_ij, and any
+    // ecutrho-derived G-vector lists. For NCPP this matches the smooth grid.
+    auto fft_grid_size_aug() const
+    { return std::visit( [&](auto&& v) { return v.fft_grid_size_aug(); }, var); }
+    decltype(auto) fft_grid_dim_aug() const
+    { return std::visit( [&](auto&& v) { return v.fft_grid_dim_aug(); }, var ); }
+    auto fft_grid_dim_aug(int i) const { return fft_grid_dim_aug()(i); }
+    auto nnr_aug() const { return fft_grid_size_aug(); }
     decltype(auto) wfc_truncated_grid() const
-    { return std::visit( [&](auto&& v) { return v.wfc_truncated_grid(); }, var ); }  
+    { return std::visit( [&](auto&& v) { return v.wfc_truncated_grid(); }, var ); }
 
     /* cell */
     // translational vectors

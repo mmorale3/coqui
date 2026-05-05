@@ -82,8 +82,11 @@ public:
   long nbnd() const { return sys.nbnd; }
   long nbnd_aux() const { return sys.nbnd_aux; }
   int fft_grid_size() const { return fft_mesh(0)*fft_mesh(1)*fft_mesh(2); }
+  int fft_grid_size_aug() const { return fft_mesh_aug(0)*fft_mesh_aug(1)*fft_mesh_aug(2); }
   int nnr() const { return fft_grid_size(); }
+  int nnr_aug() const { return fft_grid_size_aug(); }
   decltype(auto) fft_grid_dim() const { return fft_mesh(); }
+  decltype(auto) fft_grid_dim_aug() const { return fft_mesh_aug(); }
   decltype(auto) lattice() const { return sys.latt(); }
   decltype(auto) recv() const { return sys.recv(); }
   decltype(auto) kpts() { return sys.bz().kpts(); }
@@ -116,6 +119,7 @@ public:
     wfc_k2g_list(sys.bz().nkpts,std::nullopt),
     ecut( ecut_>0.0 ? ecut_ : sys.ecutrho ),
     fft_mesh( ecut_>0.0 ? nda::stack_array<int, 3>{grids::find_fft_mesh(sys.mpi->comm,ecut,sys.recv,sys.bz().symm_list)} : sys.fft_mesh),
+    fft_mesh_aug(sys.fft_mesh_aug),
     wfc_g(detail::wfc_grid_from_h5(sys))
   {
     print_metadata();
@@ -128,6 +132,7 @@ public:
     wfc_k2g_list(sys.bz().nkpts,std::nullopt),
     ecut( ecut_>0.0 ? ecut_ : sys.ecutrho ),
     fft_mesh( ecut_>0.0 ? nda::stack_array<int, 3>{grids::find_fft_mesh(sys.mpi->comm,ecut,sys.recv,sys.bz().symm_list)} : sys.fft_mesh),
+    fft_mesh_aug(sys.fft_mesh_aug),
     wfc_g(detail::wfc_grid_from_h5(sys))
   {
     print_metadata();
@@ -140,29 +145,32 @@ public:
     wfc_k2g_list(sys.bz().nkpts,std::nullopt),
     ecut( ecut_>0.0 ? ecut_ : sys.ecutrho ),
     fft_mesh( ecut_>0.0 ? nda::stack_array<int, 3>{grids::find_fft_mesh(sys.mpi->comm, ecut, sys.recv, sys.bz().symm_list)} : sys.fft_mesh),
+    fft_mesh_aug(sys.fft_mesh_aug),
     wfc_g(detail::wfc_grid_from_h5(sys))
   {
     print_metadata();
   }
 
-  qe_readonly(qe_readonly const& other) : 
+  qe_readonly(qe_readonly const& other) :
     sys(other.sys),
     h5files(sys.nspin*sys.bz().nkpts_ibz,std::nullopt),
     k2g_list(sys.bz().nkpts,std::nullopt),
     wfc_k2g_list(sys.bz().nkpts,std::nullopt),
     ecut(other.ecut),
     fft_mesh(other.fft_mesh),
+    fft_mesh_aug(other.fft_mesh_aug),
     wfc_g(other.wfc_g),
     sk_to_n(other.sk_to_n),
     dmat( other.dmat ) {}
 
-  qe_readonly(qe_readonly && other) : 
+  qe_readonly(qe_readonly && other) :
     sys(std::move(other.sys)),
     h5files(sys.nspin*sys.bz().nkpts_ibz,std::nullopt),
     k2g_list(sys.bz().nkpts,std::nullopt),
     wfc_k2g_list(sys.bz().nkpts,std::nullopt),
     ecut( other.ecut ),
     fft_mesh(other.fft_mesh),
+    fft_mesh_aug(other.fft_mesh_aug),
     wfc_g(std::move(other.wfc_g)),
     sk_to_n(std::move(other.sk_to_n)),
     dmat( std::move(other.dmat) ) {}
@@ -177,6 +185,7 @@ public:
     close(); // close files, open on demand
     this->ecut = other.ecut;
     this->fft_mesh = other.fft_mesh;
+    this->fft_mesh_aug = other.fft_mesh_aug;
     this->wfc_g = other.wfc_g;
     return *this;
   }
@@ -189,6 +198,7 @@ public:
     close(); // close files, open on demand
     this->ecut = other.ecut;
     this->fft_mesh = other.fft_mesh;
+    this->fft_mesh_aug = other.fft_mesh_aug;
     this->wfc_g = std::move(other.wfc_g);
     return *this;
   }
@@ -202,9 +212,11 @@ public:
     app_log(1,"  Monkhorst-Pack mesh            = ({},{},{})", sys.bz().kp_grid(0), sys.bz().kp_grid(1), sys.bz().kp_grid(2));
     app_log(1,"  K-points                       = {} total, {} in the IBZ", sys.bz().nkpts, sys.bz().nkpts_ibz);
     app_log(1,"  Number of electrons            = {}", sys.nelec);
-    app_log(1,"  Electron density energy cutoff = {0:.3f} a.u. | FFT mesh = ({1},{2},{3})",
-            ecut, fft_mesh(0),fft_mesh(1),fft_mesh(2));
-    app_log(1,"  Wavefunction energy cutoff     = {0:.3f} a.u. | FFT mesh = ({1},{2},{3}), Number of PWs = {4}\n",
+    app_log(1,"  Smooth FFT mesh (dffts)        = ({},{},{})", fft_mesh(0),fft_mesh(1),fft_mesh(2));
+    app_log(1,"  Dense  FFT mesh (dfftp,aug)    = ({},{},{})", fft_mesh_aug(0),fft_mesh_aug(1),fft_mesh_aug(2));
+    app_log(1,"  Electron density energy cutoff = {0:.3f} a.u.",
+            ecut);
+    app_log(1,"  Wavefunction energy cutoff     = {0:.3f} a.u. | wfc grid = ({1},{2},{3}), Number of PWs = {4}\n",
             wfc_g.ecut(), wfc_g.mesh(0),wfc_g.mesh(1),wfc_g.mesh(2), wfc_g.size());
   }
 
@@ -342,8 +354,12 @@ private:
   // plane wave cutoff for the FFT grid. 
   double ecut;
 
-  // fft mesh compatible with ecut
+  // smooth fft mesh (mirrors QE's dffts; sized by ecutwfc); used for ψ FFTs
   nda::stack_array<int, 3> fft_mesh;
+
+  // dense/augmented fft mesh (mirrors QE's dfftp; sized by ecutrho); used for
+  // V_loc, V_eff, V_xc, ρ_eff, augmentation Q, etc. For NCPP this equals fft_mesh.
+  nda::stack_array<int, 3> fft_mesh_aug;
 
   // truncated wfc g grid
   grids::truncated_g_grid wfc_g;

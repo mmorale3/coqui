@@ -136,10 +136,15 @@ namespace mf {
       bool orb_on_fft_grid = true;
       // plane-wave cutoff for charge density
       double ecutrho;
-      // fft grid
+      // smooth fft grid (mirrors QE's dffts; sized by ecutwfc)
       nda::stack_array<int, 3> fft_mesh;
-      // number of points in fft grid
+      // dense/augmented fft grid (mirrors QE's dfftp; sized by ecutrho)
+      // For NCPP-equivalent backends this matches fft_mesh.
+      nda::stack_array<int, 3> fft_mesh_aug;
+      // number of points in smooth fft grid
       int nnr;
+      // number of points in dense/augmented fft grid
+      int nnr_aug = 0;
 
       // mean-field info
       // # of dimensions
@@ -213,6 +218,7 @@ namespace mf {
         h5::h5_write_attribute(ogrp, "number_of_aux_bands", nbnd_aux);
         h5::h5_write_attribute(ogrp, "ecutrho", ecutrho);
         nda::h5_write(ogrp, "fft_mesh", fft_mesh, false);
+        nda::h5_write(ogrp, "fft_mesh_aug", fft_mesh_aug, false);
 
         nda::h5_write(ogrp, "eigval", eigval, false);
         if(nbnd_aux>0) nda::h5_write(ogrp, "eigval_aux", eigval_aux, false);
@@ -310,10 +316,19 @@ namespace mf {
 //          h5::h5_read_attribute(ogrp, "number_of_aux_bands", nbnd_aux);
         h5::h5_read_attribute(ogrp, "ecutrho", ecutrho);
         nda::h5_read(grp, "Orbitals/fft_mesh", fft_mesh);
-        // adjust ,esh if needed
+        // Dense/augmented mesh: present in current schema, falls back to fft_mesh
+        // for older checkpoints (NCPP-equivalent behavior).
+        if(ogrp.has_dataset("fft_mesh_aug"))
+          nda::h5_read(grp, "Orbitals/fft_mesh_aug", fft_mesh_aug);
+        else
+          fft_mesh_aug = fft_mesh;
+        // adjust meshes if needed
         fft_mesh = utils::generate_consistent_fft_mesh(fft_mesh,_symm.symm_list,1e-4,"bdft_system");
         fft_mesh = utils::generate_consistent_fft_mesh(fft_mesh,_symm.symm_list,1e-4,"bdft_system",true);
-        nnr = fft_mesh(0)*fft_mesh(1)*fft_mesh(2);
+        fft_mesh_aug = utils::generate_consistent_fft_mesh(fft_mesh_aug,_symm.symm_list,1e-4,"bdft_system");
+        fft_mesh_aug = utils::generate_consistent_fft_mesh(fft_mesh_aug,_symm.symm_list,1e-4,"bdft_system",true);
+        nnr     = fft_mesh(0)*fft_mesh(1)*fft_mesh(2);
+        nnr_aug = fft_mesh_aug(0)*fft_mesh_aug(1)*fft_mesh_aug(2);
 
         // MAM: should this be size nspin_in_basis?
         //      In any case, if nspin_in_basis!=nspin, the basis can't be MO
@@ -381,12 +396,16 @@ namespace mf {
         // Orbital info
         nbnd     = mf.nbnd();
         nbnd_aux = mf.nbnd_aux();
-        ecutrho  = mf.ecutrho();
-        fft_mesh = mf.fft_grid_dim();
-        // adjust ,esh if needed
+        ecutrho      = mf.ecutrho();
+        fft_mesh     = mf.fft_grid_dim();
+        fft_mesh_aug = mf.fft_grid_dim_aug();
+        // adjust meshes if needed (smooth and dense are independent)
         fft_mesh = utils::generate_consistent_fft_mesh(fft_mesh,_symm.symm_list,1e-4,"bdft_system");
         fft_mesh = utils::generate_consistent_fft_mesh(fft_mesh,_symm.symm_list,1e-4,"bdft_system",true);
-        nnr = fft_mesh(0)*fft_mesh(1)*fft_mesh(2);
+        fft_mesh_aug = utils::generate_consistent_fft_mesh(fft_mesh_aug,_symm.symm_list,1e-4,"bdft_system");
+        fft_mesh_aug = utils::generate_consistent_fft_mesh(fft_mesh_aug,_symm.symm_list,1e-4,"bdft_system",true);
+        nnr     = fft_mesh(0)*fft_mesh(1)*fft_mesh(2);
+        nnr_aug = fft_mesh_aug(0)*fft_mesh_aug(1)*fft_mesh_aug(2);
 
         eigval     = mf.eigval(); 
         eigval_aux = mf.eigval_aux(); 

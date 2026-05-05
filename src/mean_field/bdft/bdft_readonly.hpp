@@ -154,8 +154,11 @@ public:
   long nbnd() const { return sys.nbnd; }
   long nbnd_aux() const { return sys.nbnd_aux; }
   int fft_grid_size() const { return fft_mesh(0)*fft_mesh(1)*fft_mesh(2); }
+  int fft_grid_size_aug() const { return fft_mesh_aug(0)*fft_mesh_aug(1)*fft_mesh_aug(2); }
   int nnr() const { return fft_grid_size(); }
+  int nnr_aug() const { return fft_grid_size_aug(); }
   decltype(auto) fft_grid_dim() const { return fft_mesh(); }
+  decltype(auto) fft_grid_dim_aug() const { return fft_mesh_aug(); }
   decltype(auto) lattice() const { return sys.latt(); }
   decltype(auto) recv() const { return sys.recv(); }
   decltype(auto) kpts() { return sys.bz().kpts(); }
@@ -177,8 +180,9 @@ public:
                 double ecut_ = 0.0, long n_ = -1):
     sys(std::move(mpi), outdir, prefix, n_),
     h5file(std::nullopt),
-    ecut(ecut_<=0.1?sys.ecutrho:ecut_), 
+    ecut(ecut_<=0.1?sys.ecutrho:ecut_),
     fft_mesh( ecut_>0.0 ? nda::stack_array<int, 3>{grids::find_fft_mesh(sys.mpi->comm,ecut,sys.recv,sys.bz().symm_list)} : sys.fft_mesh),
+    fft_mesh_aug(sys.fft_mesh_aug),
     wfc_g(detail::make_wfc(sys)),
     ksymms(detail::make_ksymms(sys.bz())),
     swfc_maps(detail::make_swfc_maps(sys,ksymms,fft_mesh,wfc_g))
@@ -189,7 +193,7 @@ public:
   bdft_readonly(bdft_system const& bdft_sys):
     sys(bdft_sys),
     h5file(std::nullopt),
-    ecut(sys.ecutrho), fft_mesh(sys.fft_mesh),
+    ecut(sys.ecutrho), fft_mesh(sys.fft_mesh), fft_mesh_aug(sys.fft_mesh_aug),
     wfc_g(detail::make_wfc(sys)),
     ksymms(detail::make_ksymms(sys.bz())),
     swfc_maps(detail::make_swfc_maps(sys,ksymms,fft_mesh,wfc_g))
@@ -200,7 +204,7 @@ public:
   bdft_readonly(bdft_readonly const& other):
     sys(other.sys),
     h5file(std::nullopt),
-    ecut(other.ecut), fft_mesh(other.fft_mesh),
+    ecut(other.ecut), fft_mesh(other.fft_mesh), fft_mesh_aug(other.fft_mesh_aug),
     wfc_g(other.wfc_g),
     ksymms(other.ksymms),
     swfc_maps(other.swfc_maps),
@@ -210,7 +214,7 @@ public:
   bdft_readonly(bdft_system&& bdft_sys):
     sys(std::move(bdft_sys) ),
     h5file(std::nullopt),
-    ecut(sys.ecutrho), fft_mesh(sys.fft_mesh),
+    ecut(sys.ecutrho), fft_mesh(sys.fft_mesh), fft_mesh_aug(sys.fft_mesh_aug),
     wfc_g(detail::make_wfc(sys)),
     ksymms(detail::make_ksymms(sys.bz())),
     swfc_maps(detail::make_swfc_maps(sys,ksymms,fft_mesh,wfc_g))
@@ -225,7 +229,7 @@ public:
                 bool update_eig_occ = false) :
     sys(mf,fn,false),
     h5file(std::nullopt),
-    ecut(sys.ecutrho), fft_mesh(sys.fft_mesh),
+    ecut(sys.ecutrho), fft_mesh(sys.fft_mesh), fft_mesh_aug(sys.fft_mesh_aug),
     wfc_g(*mf.wfc_truncated_grid()),
     ksymms(detail::make_ksymms(sys.bz())),
     swfc_maps(detail::make_swfc_maps(sys,ksymms,fft_mesh,wfc_g))
@@ -326,7 +330,7 @@ public:
     	    nda::array<std::pair<long,double>,2> const& orb_list) :
     sys(mf,fn,false),
     h5file(std::nullopt),
-    ecut(sys.ecutrho), fft_mesh(sys.fft_mesh),
+    ecut(sys.ecutrho), fft_mesh(sys.fft_mesh), fft_mesh_aug(sys.fft_mesh_aug),
     wfc_g(*mf.wfc_truncated_grid()),
     ksymms(detail::make_ksymms(sys.bz())),
     swfc_maps(detail::make_swfc_maps(sys,ksymms,fft_mesh,wfc_g))
@@ -418,9 +422,9 @@ public:
   bdft_readonly(bdft_readonly&& other):
       sys(std::move(other.sys) ),
       h5file(std::nullopt),
-      ecut(other.ecut), fft_mesh(other.fft_mesh), 
+      ecut(other.ecut), fft_mesh(other.fft_mesh), fft_mesh_aug(other.fft_mesh_aug),
       wfc_g(std::move(other.wfc_g)), ksymms(std::move(other.ksymms)),
-      swfc_maps(std::move(other.swfc_maps)), 
+      swfc_maps(std::move(other.swfc_maps)),
       sk_to_n(std::move(other.sk_to_n)), dmat( std::move(other.dmat) ) {}
 
   ~bdft_readonly() { close(); }
@@ -432,6 +436,7 @@ public:
     close();
     this->ecut = other.ecut;
     this->fft_mesh = other.fft_mesh;
+    this->fft_mesh_aug = other.fft_mesh_aug;
     this->wfc_g = other.wfc_g;
     this->ksymms = other.ksymms;
     this->swfc_maps = other.swfc_maps;
@@ -445,6 +450,7 @@ public:
     close();
     this->ecut = other.ecut;
     this->fft_mesh = other.fft_mesh;
+    this->fft_mesh_aug = other.fft_mesh_aug;
     this->ksymms = std::move(other.ksymms);
     this->swfc_maps = std::move(other.swfc_maps);
     this->wfc_g = std::move(other.wfc_g);
@@ -461,9 +467,10 @@ public:
     app_log(1, "  Monkhorst-Pack mesh        = ({},{},{})", sys.bz().kp_grid(0), sys.bz().kp_grid(1), sys.bz().kp_grid(2));
     app_log(1, "  K-points                   = {} total, {} in the IBZ", sys.bz().nkpts, sys.bz().nkpts_ibz);
     app_log(1, "  Number of electrons        = {}", sys.nelec);
-    app_log(1, "  Density energy cutoff      = {0:.3f} a.u. | FFT mesh = ({1},{2},{3})",
-            ecut,fft_mesh(0),fft_mesh(1),fft_mesh(2));
-    app_log(1, "  Wavefunction energy cutoff = {0:.3f} a.u. | FFT mesh = ({1},{2},{3}), Number of PWs = {4}\n",
+    app_log(1, "  Smooth FFT mesh (dffts)    = ({},{},{})", fft_mesh(0),fft_mesh(1),fft_mesh(2));
+    app_log(1, "  Dense  FFT mesh (dfftp,aug)= ({},{},{})", fft_mesh_aug(0),fft_mesh_aug(1),fft_mesh_aug(2));
+    app_log(1, "  Density energy cutoff      = {0:.3f} a.u.", ecut);
+    app_log(1, "  Wavefunction energy cutoff = {0:.3f} a.u. | wfc grid = ({1},{2},{3}), Number of PWs = {4}\n",
             wfc_g.ecut(), wfc_g.mesh(0),wfc_g.mesh(1),wfc_g.mesh(2), wfc_g.size());
   }
 
@@ -605,8 +612,12 @@ public:
   // plane wave cutoff of the FFT grid for AOs
   double ecut = 0.0;
 
-  // fft mesh compatible with ecut
+  // smooth fft mesh (mirrors QE's dffts; sized by ecutwfc); ψ FFTs live here
   nda::stack_array<int, 3> fft_mesh;
+
+  // dense/augmented fft mesh (mirrors QE's dfftp; sized by ecutrho); used for
+  // ρ_eff, V_loc, V_eff, V_xc, augmentation Q, etc. Equals fft_mesh for NCPP.
+  nda::stack_array<int, 3> fft_mesh_aug;
 
   // truncated g grid for wfc.
   // Constructed from the miller indices read from h5.
