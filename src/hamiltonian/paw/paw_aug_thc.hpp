@@ -219,6 +219,230 @@ inline nda::array<ComplexType, 3> build_eta_on_rho_g_at_q(
 }
 
 /**
+ * Distributed-friendly variant of build_eta_on_rho_g_at_q.
+ *
+ *   - Computes only rows λ ∈ la_range of the global flattened (Λ, g) layout
+ *     (Λ = atom_aug_offset[ia] + lam, see paw_aug_layout) and only g ∈ g_range
+ *     of the rho_g grid.
+ *   - Output `eta_out` is shaped (la_range.size(), g_range.size()).
+ *   - Per-rank memory: la_chunk × g_chunk complex doubles.
+ *
+ * Used by the distributed PAW augmentation path: each MPI rank in a q-pool
+ * builds its own (la, g) tile of η^q without ever materialising the full
+ * (N_aug × ngm_rho) tensor on a single rank/node.
+ */
+inline void build_eta_on_rho_g_at_q_chunk(
+    pseudopot const& psp,
+    std::vector<species_local_isdf> const& isdf,
+    paw_aug_layout const& layout,
+    grids::truncated_g_grid const& rho_g,
+    std::array<double, 3> const& q_cart,
+    double omega,
+    aainit_tables const& aatab,
+    std::vector<qrad_tab> const& qrad_tabs,
+    nda::range la_range,
+    nda::range g_range,
+    nda::ArrayOfRank<2> auto& eta_out)
+{
+    long n_la = la_range.size();
+    long n_g  = g_range.size();
+    if (eta_out.shape(0) != n_la || eta_out.shape(1) != n_g) {
+        utils::check(false,
+            "build_eta_on_rho_g_at_q_chunk: eta_out shape ({}, {}) does not match"
+            " la_range ({}) × g_range ({})",
+            eta_out.shape(0), eta_out.shape(1), n_la, n_g);
+    }
+    eta_out() = ComplexType(0.0);
+    if (n_la == 0 || n_g == 0) return;
+
+    auto const& ityp = psp.ityp_view();
+    auto const& sps  = psp.paw_species_view();
+    long nat = ityp.extent(0);
+    auto const& tau    = psp.atom_pos_cart_view();
+    auto const& g_cart = rho_g.g_vectors();
+
+    // Map: for each global la in la_range, find (ia, lam_local).
+    struct la_loc { int ia; int lam; };
+    std::vector<la_loc> la_map(n_la, {-1, -1});
+    for (long ia = 0; ia < nat; ++ia) {
+        int nt = ityp(ia);
+        if (nt >= (int)isdf.size()) continue;
+        int nlam = isdf[nt].nlambda;
+        if (nlam == 0) continue;
+        long row0 = layout.atom_aug_offset[ia];
+        long row1 = row0 + nlam;
+        long o = std::max((long)la_range.first(), row0);
+        long e = std::min((long)la_range.last(),  row1);
+        for (long lg = o; lg < e; ++lg) la_map[lg - la_range.first()] = {(int)ia, (int)(lg - row0)};
+    }
+
+    // Precompute |K| and Y_lp(K̂) at the g_range subset.
+    nda::array<double, 1> Kmod(n_g);
+    nda::array<double, 2> Ylp_q(n_g, aatab.llx);
+    Ylp_q() = 0.0;
+    int Lmax_aux = 2*(aatab.lli - 1);
+    for (long ig = 0; ig < n_g; ++ig) {
+        long g = g_range.first() + ig;
+        double Kx = q_cart[0] + g_cart(g, 0);
+        double Ky = q_cart[1] + g_cart(g, 1);
+        double Kz = q_cart[2] + g_cart(g, 2);
+        double K  = std::sqrt(Kx*Kx + Ky*Ky + Kz*Kz);
+        Kmod(ig) = K;
+        std::array<double,3> dir = (K > 1e-14)
+            ? std::array<double,3>{Kx/K, Ky/K, Kz/K}
+            : std::array<double,3>{0.0, 0.0, 1.0};
+        nda::array<double,1> Yflat(aatab.llx);
+        qe_real_ylm_flat(Lmax_aux, dir, Yflat);
+        if (K <= 1e-14) {
+            for (long lp = 1; lp < aatab.llx; ++lp) Yflat(lp) = 0.0;
+        }
+        for (long lp = 0; lp < aatab.llx; ++lp) Ylp_q(ig, lp) = Yflat(lp);
+    }
+
+    // Per-species qrad cache (only on g_range).
+    long nsp = (long)sps.size();
+    std::vector<nda::array<double, 3>> qrad_g_cache(nsp);
+    for (long nt = 0; nt < nsp; ++nt) {
+        if (nt >= (long)isdf.size()) continue;
+        auto const& s  = isdf[nt];
+        if (s.nlambda == 0) continue;
+        auto const& sp = sps[nt];
+        if (sp.qfuncl.size() == 0 || sp.nhtolm.size() == 0) continue;
+
+        long Lp1   = sp.qfuncl.extent(0);
+        long n_ijv = sp.qfuncl.extent(1);
+        utils::check((long)qrad_tabs.size() > nt && qrad_tabs[nt].n_K > 0,
+                     "build_eta_on_rho_g_at_q_chunk: missing qrad_tab for species nt={}", nt);
+        auto const& Tt = qrad_tabs[nt];
+
+        nda::array<double, 3> qrad_g(Lp1, n_ijv, n_g);
+        qrad_g() = 0.0;
+        for (long ig = 0; ig < n_g; ++ig) {
+            for (long ijv = 0; ijv < n_ijv; ++ijv) {
+                auto qrL = qrad_interp_at_K(Tt, (int)ijv, Kmod(ig));
+                for (long L = 0; L < Lp1; ++L) qrad_g(L, ijv, ig) = qrL(L);
+            }
+        }
+        qrad_g_cache[nt] = std::move(qrad_g);
+    }
+
+    struct lambda_info { int ivl, jvl, ijv, n_lp; };
+    std::vector<std::vector<lambda_info>> linfo_cache(nsp);
+    for (long nt = 0; nt < nsp; ++nt) {
+        if (nt >= (long)isdf.size()) continue;
+        auto const& s  = isdf[nt];
+        if (s.nlambda == 0) continue;
+        auto const& sp = sps[nt];
+        if (sp.qfuncl.size() == 0 || sp.nhtolm.size() == 0) continue;
+        linfo_cache[nt].resize(s.nlambda);
+        for (int lam = 0; lam < s.nlambda; ++lam) {
+            int I = s.lambda_i(lam), J = s.lambda_j(lam);
+            int ivl = sp.nhtolm(I) - 1;
+            int jvl = sp.nhtolm(J) - 1;
+            int nb  = sp.indv(I) - 1;
+            int mb  = sp.indv(J) - 1;
+            int n1 = std::max(nb, mb), n2 = std::min(nb, mb);
+            int ijv = (n1 * (n1 + 1)) / 2 + n2;
+            linfo_cache[nt][lam] = {ivl, jvl, ijv, aatab.lpx(ivl, jvl)};
+        }
+    }
+
+    double pref = 4.0 * M_PI / omega;
+    for (long row = 0; row < n_la; ++row) {
+        auto const& lm = la_map[row];
+        if (lm.ia < 0) continue;
+        int ia = lm.ia;
+        int lam = lm.lam;
+        int nt = ityp(ia);
+        if (nt >= (int)isdf.size() || nt >= (int)sps.size()) continue;
+        auto const& s = isdf[nt];
+        if (s.nlambda == 0) continue;
+        auto const& sp = sps[nt];
+        if (sp.qfuncl.size() == 0 || sp.nhtolm.size() == 0) continue;
+        auto const& qrad_g = qrad_g_cache[nt];
+        auto const& linfo  = linfo_cache[nt];
+        auto const& li = linfo[lam];
+        double sgn = s.lambda_sign(lam);
+        for (long ig = 0; ig < n_g; ++ig) {
+            long g = g_range.first() + ig;
+            ComplexType acc(0.0, 0.0);
+            for (int k = 0; k < li.n_lp; ++k) {
+                int lp = aatab.lpl(li.ivl, li.jvl, k);
+                int L  = (int)std::floor(std::sqrt((double)lp + 1e-9));
+                ComplexType iL_factor;
+                switch (L % 4) {
+                    case 0: iL_factor = ComplexType( 1.0,  0.0); break;
+                    case 1: iL_factor = ComplexType( 0.0, -1.0); break;
+                    case 2: iL_factor = ComplexType(-1.0,  0.0); break;
+                    case 3: iL_factor = ComplexType( 0.0,  1.0); break;
+                }
+                double coeff = aatab.ap(lp, li.ivl, li.jvl)
+                             * Ylp_q(ig, lp) * qrad_g(L, li.ijv, ig);
+                acc += iL_factor * ComplexType(coeff, 0.0);
+            }
+            acc *= ComplexType(pref, 0.0);
+            double Kx = q_cart[0] + g_cart(g, 0);
+            double Ky = q_cart[1] + g_cart(g, 1);
+            double Kz = q_cart[2] + g_cart(g, 2);
+            double ph = -(Kx*tau(ia,0) + Ky*tau(ia,1) + Kz*tau(ia,2));
+            ComplexType sf(std::cos(ph), std::sin(ph));
+            eta_out(row, ig) = sgn * acc * sf;
+        }
+    }
+}
+
+/**
+ * Add the closed-form same-atom K_a contribution to a *tile* of V_LL,
+ * restricted to global (la_rows, la_cols) ranges. Used by the distributed
+ * augmentation path: each rank's local LL tile of _dZ has an irregular
+ * row/col range (intersection of its (P, Q) chunk with [N_smooth, N_total)),
+ * which doesn't match the canonical (np_P, np_Q) chunking on N_aug.
+ *
+ * Block-diagonal in atoms; only entries within an atom's own λ-range get
+ * a non-zero K_a contribution.
+ */
+inline void add_K_a_to_tile(
+    pseudopot const& psp,
+    std::vector<species_local_isdf> const& isdf,
+    paw_aug_layout const& layout,
+    nda::range la_rows,
+    nda::range la_cols,
+    nda::ArrayOfRank<2> auto& V_LL_tile)
+{
+    if (la_rows.size() == 0 || la_cols.size() == 0) return;
+    auto const& ityp = psp.ityp_view();
+    auto const& sps  = psp.paw_species_view();
+    long nat = ityp.extent(0);
+    for (long ia = 0; ia < nat; ++ia) {
+        int nt = ityp(ia);
+        if (nt >= (int)isdf.size() || nt >= (int)sps.size()) continue;
+        auto const& sp_isdf = isdf[nt];
+        auto const& sp_paw  = sps[nt];
+        if (!sp_paw.is_paw || sp_paw.deltaC.size() == 0) continue;
+        if (sp_isdf.nlambda == 0) continue;
+
+        long row0 = layout.atom_aug_offset[ia];
+        long row1 = row0 + sp_isdf.nlambda;
+        long r_o = std::max((long)la_rows.first(), row0);
+        long r_e = std::min((long)la_rows.last(),  row1);
+        long c_o = std::max((long)la_cols.first(), row0);
+        long c_e = std::min((long)la_cols.last(),  row1);
+        if (r_e <= r_o || c_e <= c_o) continue;
+
+        auto K = compute_K_a(sp_isdf, sp_paw.deltaC);
+        for (long la_g = r_o; la_g < r_e; ++la_g) {
+            int lam = (int)(la_g - row0);
+            long ir = la_g - la_rows.first();
+            for (long lb_g = c_o; lb_g < c_e; ++lb_g) {
+                int xi = (int)(lb_g - row0);
+                long ic = lb_g - la_cols.first();
+                V_LL_tile(ir, ic) += ComplexType(K(lam, xi), 0.0);
+            }
+        }
+    }
+}
+
+/**
  * Compute Coulomb weights w(G) = 4π / (Ω |G|²) on the rho_g grid; w(0) = 0
  * (Γ singular term left for the caller's divergence treatment if needed).
  */

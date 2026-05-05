@@ -489,8 +489,25 @@ namespace methods {
     /**
      * Augment the smooth (X_shm, dZ) with PAW atom-local rows. Replaces
      * `_X_shm` and `_dZ` with their augmented counterparts and updates
-     * `_Np = N_smooth + N_aug`. Phase 4.2: V_GL/V_LL filled at q=0 only;
-     * K_a same-atom block added at every q.
+     * `_Np = N_smooth + N_aug`.
+     *
+     * Distributed implementation. Production sizes (N_smooth ~ 4·10^4,
+     * N_aug ~ 3·10^3, nkpts ~ 10^3, ngm_rho ~ 10^5–10^6) make the
+     * V_full_q(_nqpts_ibz, N_total, N_total) tensor of the legacy path
+     * unaffordable on a single node. This routine instead:
+     *
+     *   - allocates the augmented `_dZ` (3-aux distributed) up-front and
+     *     fills it directly, never materialising an intermediate
+     *     replicated 2-aux buffer;
+     *   - copies the smooth GG block via a custom alltoallv that handles
+     *     the (Np_smooth → N_total) chunk-shape change;
+     *   - for each q owned by the local q-pool, builds ζ(μ, g) and η(λ, g)
+     *     fully distributed across the q-pool comm (rows split, all g per
+     *     rank); each rank gathers only the rows it needs to write into
+     *     its own (P, Q) tile of `_dZ` for that iq (V_GL, V_LG, V_LL
+     *     blocks) and does the local GEMM in-place;
+     *   - K_a (q-independent on-site kernel) is added per-atom directly to
+     *     each rank's local LL tile — no full N_aug×N_aug buffer.
      *
      * `dzeta_quG` is the smooth ζ_μ^q(G) on the thc rho_g grid (output of
      * `thc::evaluate_isdf_only`).
@@ -506,31 +523,29 @@ namespace methods {
       auto const& thc_b = _thc_builder_opt.value();
       auto const& rho_g = thc_b.g_grid();
       double omega = thc_b.volume();
+      long ngm_rho = (long)rho_g.size();
 
       _aug_layout = hamilt::paw::make_paw_aug_layout(*_psp, _isdf, _Np_smooth);
       _N_aug = _aug_layout.N_A;
-      int N_total = _Np_smooth + _N_aug;
+      long N_total = (long)_Np_smooth + (long)_N_aug;
       app_log(1, "  paw_aug: N_smooth={}, N_aug={}, N_total={}",
               _Np_smooth, _N_aug, N_total);
 
       if (_N_aug == 0) {
-        // Nothing to augment (no PAW species).
         _Np = _Np_smooth;
         return;
       }
 
-      // ---------------------------------------------------------------
+      utils::check(dzeta_quG.global_shape()[2] == ngm_rho,
+        "thc_reader::augment: dzeta_quG G-dim ({}) != rho_g.size ({}). "
+        "Augmentation requires orb_on_fft_grid mode (ζ in G-space).",
+        dzeta_quG.global_shape()[2], ngm_rho);
+
+      // ----------------------------------------------------------------
       // 1) Lift the IBZ-stored Pskna to the full BZ via View-2 symmetry.
-      //    Pskna in pseudopot has shape (nspin, nkpts_ibz, npol*nkb, nbnd);
-      //    the X augmentation loop below indexes k = 0..nkpts-1, so we
-      //    need a full-BZ-sized projector-overlap table. The symmorphic
-      //    View-2 transform (atom permutation + Wigner-D on the m-index)
-      //    builds it from the IBZ data; see paw_symmetry.hpp +
-      //    notes/paw_symmetry_notes.tex Eq. coef-symm. For nkpts == nkpts_ibz
-      //    (no QE symmetry reduction) the helper still produces the right
-      //    answer (every k is its own IBZ partner with R=identity), so we
-      //    just always go through the helper.
-      // ---------------------------------------------------------------
+      //    Already SHM (one shared copy per node). This is a 4D quantity
+      //    (nspin × nkpts × nkb × nbnd); not an aux index. Kept as-is.
+      // ----------------------------------------------------------------
       _Timer.start("PAW_AUG.Pskna_lift");
       int lmax_proj = 0;
       for (auto const& sp : _psp->paw_species_view())
@@ -550,27 +565,36 @@ namespace methods {
           atom_perm_inv, wigner_d, _npol, *_mpi);
       _Timer.stop("PAW_AUG.Pskna_lift");
 
-      // ---------------------------------------------------------------
+      // ----------------------------------------------------------------
       // 2) Augment X_shm: append Y rows below smooth ζ rows.
-      // ---------------------------------------------------------------
+      //    X_shm has shape (dim_s, nkpts, N_total, x_range). Only one
+      //    aux index (Np), with two large outer axes. SHM is the right
+      //    storage. Fill the new (s, k) × aug-rows in parallel across
+      //    the node-comm so the per-node augmentation cost scales with
+      //    ranks_per_node, not with one rank doing it serially.
+      // ----------------------------------------------------------------
       _Timer.start("PAW_AUG.X_aug");
-      auto X_old = _X_shm;
-      int dim_s = _ns_in_basis * _npol_in_basis;
-      auto X_new = math::shm::make_shared_array<Array_view_t<HOST_MEMORY,4>>(
-          *_mpi, {dim_s, _nkpts, N_total, x_range.size()});
-      X_new.win().fence();
-      if (X_new.node_comm()->root()) {
+      {
+        auto X_old = _X_shm;
+        int dim_s = _ns_in_basis * _npol_in_basis;
+        auto X_new = math::shm::make_shared_array<Array_view_t<HOST_MEMORY,4>>(
+            *_mpi, {(long)dim_s, (long)_nkpts, N_total, (long)x_range.size()});
+        X_new.win().fence();
         auto Xn = X_new.local();
         auto Xo = X_old.local();
         auto Pkfull_loc = Pkfull.local();
-        for (int s = 0; s < dim_s; ++s)
-        for (int k = 0; k < _nkpts; ++k) {
-          // smooth rows
+        long nsk = (long)dim_s * (long)_nkpts;
+        auto* node_comm = X_new.node_comm();
+        long nrank = (long)node_comm->size();
+        long my_rank = (long)node_comm->rank();
+        auto [sk_o, sk_e] = itertools::chunk_range(0, nsk, nrank, my_rank);
+        nda::array<ComplexType,2> Y_buf(_N_aug,
+            x_range.size() * std::max(1, _npol));
+        for (long sk = sk_o; sk < sk_e; ++sk) {
+          int s = (int)(sk / _nkpts);
+          int k = (int)(sk % _nkpts);
           for (int mu = 0; mu < _Np_smooth; ++mu)
             Xn(s, k, mu, range::all) = Xo(s, k, mu, range::all);
-          // Y rows = U · P  (now indexed by full-BZ k via Pkfull)
-          nda::array<ComplexType,2> Y_buf(_N_aug,
-              x_range.size() * std::max(1, _npol));
           hamilt::paw::fill_Y_rows_for_sk(
               *_psp, _isdf, _aug_layout, _npol,
               s, k, Pkfull_loc, Y_buf);
@@ -578,66 +602,48 @@ namespace methods {
             for (int i = 0; i < (int)x_range.size(); ++i)
               Xn(s, k, _Np_smooth + la, i) = Y_buf(la, i);
         }
+        X_new.win().fence();
+        _X_shm = X_new;
       }
-      X_new.win().fence();
-      _X_shm = X_new;
       _Timer.stop("PAW_AUG.X_aug");
 
-      // (For now, if x_range != y_range: also need to augment _Y_shm.
-      //  Phase 4.2 only validates Hartree which uses X = Y; defer.)
       utils::check(x_range == y_range || !_Y_shm.has_value(),
         "thc_reader::augment_thc_with_paw: x_range != y_range augmentation "
         "is a Phase 4.3 follow-up.");
 
-      // ---------------------------------------------------------------
-      // 2) Build augmented dZ: copy smooth GG block, fill GL/LL at q=0,
-      //    add K_a at all q.
-      // ---------------------------------------------------------------
-      _Timer.start("PAW_AUG.gather_smooth");
+      // ----------------------------------------------------------------
+      // 3) Allocate augmented `_dZ` distributed (nqpts_ibz, N_total, N_total).
+      //    Save the smooth one for the GG-block embed below.
+      // ----------------------------------------------------------------
       auto _dZ_smooth = std::move(_dZ);
-      // distribution: keep a single q-pool slab on rank 0 for simplicity
-      // (matches the pattern used in build_from_CD).
-      int np = _mpi->comm.size();
+      long np = (long)_mpi->comm.size();
       long nqpools = utils::find_proc_grid_max_npools(np, _nqpts_ibz, 0.2);
       utils::check(nqpools > 0 && np % nqpools == 0,
                    "thc_reader::augment: bad pgrid (np={}, nqpts_ibz={})",
                    np, _nqpts_ibz);
-      int np_PQ = np / nqpools;
-      int np_P = utils::find_proc_grid_min_diff(np_PQ, 1, 1);
-      int np_Q = np_PQ / np_P;
+      long np_PQ = np / nqpools;
+      long np_P = utils::find_proc_grid_min_diff(np_PQ, 1, 1);
+      long np_Q = np_PQ / np_P;
       _dZ = math::nda::make_distributed_array<Array_t<HOST_MEMORY,3>>(
-          _mpi->comm, {(long)nqpools, np_P, np_Q},
-          {_nqpts_ibz, N_total, N_total});
+          _mpi->comm, {nqpools, np_P, np_Q},
+          {(long)_nqpts_ibz, N_total, N_total});
+      _dZ.local()() = ComplexType(0.0);
 
-      // Gather smooth dZ slab-by-slab on root, build augmented full slab,
-      // scatter back into the distributed _dZ. Acceptable for fixture-
-      // sized N_total (≤ a few hundred) and validated explicitly here.
-      auto rho_g_size = rho_g.size();
-      auto wG = hamilt::paw::coulomb_weights_on_rho_g(rho_g, omega);
-
-      // Bring smooth dZ to a single host array first (q-by-q).
-// MAM: This is unacceptable, N_total can larger than 10000, _nqpts_ibz can be up to a few hundred, so this simply can't be stored on a single node. Need a fully distributed assembly of _dZ.
-      nda::array<ComplexType,3> V_full_q(_nqpts_ibz, N_total, N_total);
-      V_full_q() = ComplexType(0.0);
-      // Smooth GG block (broadcast each iq from its owner)
-      for (int iq = 0; iq < _nqpts_ibz; ++iq) {
-        nda::array<ComplexType,2> Vq_smooth(_Np_smooth, _Np_smooth);
-        for (int ip = 0; ip < _dZ_smooth.communicator()->size(); ++ip) {
-          int iq_at_ip = (ip == _dZ_smooth.communicator()->rank()) ? iq : -1;
-          _dZ_smooth.communicator()->broadcast_n(&iq_at_ip, 1, ip);
-          if (iq_at_ip < 0) continue;
-          math::nda::gather_sub_matrix(iq_at_ip, ip, _dZ_smooth, &Vq_smooth);
-        }
-        for (long u = 0; u < _Np_smooth; ++u)
-          for (long v = 0; v < _Np_smooth; ++v)
-            V_full_q(iq, u, v) = Vq_smooth(u, v);
-      }
+      // ----------------------------------------------------------------
+      // 4) Embed smooth GG block into the new _dZ. The two distributed
+      //    arrays differ both in proc grid and in the per-axis chunk
+      //    sizes (Np_smooth vs N_total), so we cannot reuse `redistribute`
+      //    directly — implement an alltoallv block-into-subblock helper.
+      // ----------------------------------------------------------------
+      _Timer.start("PAW_AUG.gather_smooth");
+      embed_smooth_block_into_aug_dZ(_dZ_smooth, _dZ);
+      _dZ_smooth.reset();
       _Timer.stop("PAW_AUG.gather_smooth");
 
-      // ── Phase 4.3: per-q V_GL / V_LL via CoQui-side qvan2 ─────────────
-      //
-      // Build the angular-coupling tables once (depends only on max l of
-      // any projector across all PAW species).
+      // ----------------------------------------------------------------
+      // 5) Build the small angular-coupling tables (replicated, ~kB) and
+      //    per-species qrad table (replicated, small).
+      // ----------------------------------------------------------------
       _Timer.start("PAW_AUG.aainit");
       int aainit_lli = 1;
       for (auto const& sp : _psp->paw_species_view()) {
@@ -648,15 +654,10 @@ namespace methods {
       auto aatab = hamilt::paw::aainit_tables_build(aainit_lli);
       _Timer.stop("PAW_AUG.aainit");
 
-      // Precompute per-species qrad(K, ijv, L) on a uniform |K|-grid so
-      // each (q, G) becomes a 4-point cubic interpolation rather than a
-      // full radial Bessel transform (analogue of QE's tab_qrad).
-      // K_max = max |q + G| over the full rho_g grid + IBZ q-points,
-      // padded by one dq for safety.
       double K_max_g = 0.0;
       {
         auto const& gv = rho_g.g_vectors();
-        for (long ig = 0; ig < (long)rho_g.size(); ++ig) {
+        for (long ig = 0; ig < ngm_rho; ++ig) {
           double g2 = gv(ig,0)*gv(ig,0) + gv(ig,1)*gv(ig,1) + gv(ig,2)*gv(ig,2);
           K_max_g = std::max(K_max_g, std::sqrt(g2));
         }
@@ -673,148 +674,593 @@ namespace methods {
       _Timer.start("PAW_AUG.qrad_tab");
       std::vector<hamilt::paw::qrad_tab> qrad_tabs;
       qrad_tabs.reserve(_psp->paw_species_view().size());
-      for (auto const& sp : _psp->paw_species_view()) {
+      for (auto const& sp : _psp->paw_species_view())
         qrad_tabs.push_back(hamilt::paw::build_qrad_tab(sp, K_max));
-      }
       _Timer.stop("PAW_AUG.qrad_tab");
       app_log(2, "  paw_aug: built qrad table for {} species, K_max={:.2f} a.u., "
                  "n_K={}", qrad_tabs.size(), K_max,
               qrad_tabs.empty() ? 0L : qrad_tabs.front().n_K);
 
-      // Convention scaling — V_LL needs Ω², V_GL needs Ω. See the
-      // detailed derivation in the q=0 phase note (V_LL_buf carries one
-      // 1/Ω from wG; the smooth ζ_code carries one Ω; bare η_QE has no Ω).
       double omega_sq = omega * omega;
 
-      // K_a injection (PAW only, q-independent — applied at every q in the
-      // loop). Skipped entirely if the user disabled the on-site kernel via
-      // `paw_onsite=false`. add_K_a_to_LL itself iterates over species and
-      // skips non-PAW (USPP / NCPP) entries.
-      nda::array<ComplexType,2> K_LL_buf(_N_aug, _N_aug);
-      K_LL_buf() = ComplexType(0.0);
-      if (_paw_onsite)
-        hamilt::paw::add_K_a_to_LL(*_psp, _isdf, _aug_layout, K_LL_buf);
+      // ----------------------------------------------------------------
+      // 6) q-pool subcommunicator: all ranks at the same i_qpool collaborate
+      //    on the q's owned by that pool. Inside a pool the (np_P, np_Q)
+      //    proc grid splits the (P, Q) axes of `_dZ`.
+      // ----------------------------------------------------------------
+      int q_color = (int)_dZ.origin()[0];
+      mpi3::communicator q_intra = _mpi->comm.split(q_color, _mpi->comm.rank());
+      utils::check((long)q_intra.size() == np_PQ,
+                   "thc_reader::augment: q-pool sub-comm size mismatch (got {}, expected {})",
+                   q_intra.size(), np_PQ);
 
-      // dzeta_quG global shape: (nqpts_ibz, Np_smooth, ngm_rho_or_nnr).
-      long ngm_z = dzeta_quG.global_shape()[2];
-      utils::check(ngm_z == rho_g_size,
-        "thc_reader::augment: dzeta_quG G-dim ({}) != rho_g.size ({}). "
-        "Augmentation requires orb_on_fft_grid mode (ζ in G-space).",
-        ngm_z, rho_g_size);
-      auto dzeta_local = dzeta_quG.local();
-      auto q_rng_owned = dzeta_quG.local_range(0);
-      auto u_rng       = dzeta_quG.local_range(1);
-      auto g_rng       = dzeta_quG.local_range(2);
+      auto Qpts_cart = _MF->Qpts();
+      auto qloc_new  = _dZ.local_range(0);
+      auto Ploc_new  = _dZ.local_range(1);
+      auto Qloc_new  = _dZ.local_range(2);
 
-      auto Qpts_cart = _MF->Qpts();    // (nqpts, 3) cartesian
-      nda::array<ComplexType,2> zeta_mu_g(_Np_smooth, rho_g_size);
-      nda::array<ComplexType,2> V_GL_buf(_Np_smooth, _N_aug);
-      nda::array<ComplexType,2> V_LL_buf(_N_aug, _N_aug);
-      // Hoist V_GL/V_LL gemm scratch out of the q-loop. eta_flat(la, g) is
-      // the per-q η_aλ(G) flattened to (Λ, g); eta_w(la, g) = η × wG is
-      // shared between V_GL and V_LL; eta_conj(la, g) = conj(η) is needed
-      // for V_LL only. All three are (N_A × ngm) — re-used each q.
-      nda::array<ComplexType,2> eta_flat(_N_aug, rho_g_size);
-      nda::array<ComplexType,2> eta_w   (_N_aug, rho_g_size);
-      nda::array<ComplexType,2> eta_conj(_N_aug, rho_g_size);
+      auto intersect = [](nda::range a, nda::range b) {
+        long o = std::max(a.first(), b.first());
+        long e = std::min(a.last(),  b.last());
+        if (e < o) e = o;
+        return nda::range(o, e);
+      };
 
-      for (int iq = 0; iq < _nqpts_ibz; ++iq) {
-        // Add K_a (q-independent) at every q. K_LL_buf is zero when
-        // _paw_onsite is false; the explicit guard below is there to skip
-        // a useless O(N_A^2) add per q in that case.
-        if (_paw_onsite) {
-          _Timer.start("PAW_AUG.K_a");
-          for (long la = 0; la < _N_aug; ++la)
-            for (long lb = 0; lb < _N_aug; ++lb)
-              V_full_q(iq, _Np_smooth + la, _Np_smooth + lb) += K_LL_buf(la, lb);
-          _Timer.stop("PAW_AUG.K_a");
-        }
+      // Sub-tile global ranges this rank is responsible for in `_dZ`:
+      //   smooth μ on the P axis  /  smooth μ on the Q axis  (V_GL, V_LG, V_LG-conj)
+      //   aug    λ on the P axis  /  aug    λ on the Q axis  (V_LL)
+      nda::range P_smooth_rows = intersect(Ploc_new, range(0, _Np_smooth));
+      nda::range Q_smooth_cols = intersect(Qloc_new, range(0, _Np_smooth));
+      nda::range P_aug_rows_g  = intersect(Ploc_new, range(_Np_smooth, N_total));
+      nda::range Q_aug_cols_g  = intersect(Qloc_new, range(_Np_smooth, N_total));
+      nda::range P_aug_rows_la(P_aug_rows_g.first() - _Np_smooth,
+                               P_aug_rows_g.last()  - _Np_smooth);
+      nda::range Q_aug_cols_la(Q_aug_cols_g.first() - _Np_smooth,
+                               Q_aug_cols_g.last()  - _Np_smooth);
 
-        // Smooth-aug Coulomb blocks: build at this q.
-        // q_cart for the augmentation η^q is chosen to match thc's Coulomb
-        // convention (which uses K_eff = G − Q_thc). The ζ for the same iq
-        // is built consistent with this convention by thc.cpp, so the
-        // smooth-aug cross-block uses the same q_cart.
+      // Per-q distributed scratch lives only inside the q-pool comm.
+      // Rows split np_PQ ways, all ngm cols on each rank — keeps the layout
+      // simple for the row-gathers below. Per-rank memory:
+      //   zeta_dist : (Np_smooth/np_PQ) × ngm × 16 B
+      //   eta_dist  : (N_aug   /np_PQ) × ngm × 16 B
+      auto zeta_dist  = math::nda::make_distributed_array<Array_t<HOST_MEMORY,2>>(
+          q_intra, {np_PQ, 1L}, {(long)_Np_smooth, ngm_rho});
+      auto eta_dist   = math::nda::make_distributed_array<Array_t<HOST_MEMORY,2>>(
+          q_intra, {np_PQ, 1L}, {(long)_N_aug,    ngm_rho});
+      auto eta_w_dist = math::nda::make_distributed_array<Array_t<HOST_MEMORY,2>>(
+          q_intra, {np_PQ, 1L}, {(long)_N_aug,    ngm_rho});
+
+      // Rank-local row buffers for this rank's _dZ tile sub-blocks.
+      // Sized to the irregular (P, Q) chunks of the new _dZ. Per-rank
+      // memory: (P/Q chunk) × ngm × 16 B — a 1-aux quantity, fine to keep
+      // in regular memory.
+      nda::array<ComplexType,2> zeta_P_smooth_g(P_smooth_rows.size(), ngm_rho);
+      nda::array<ComplexType,2> zeta_Q_smooth_g(Q_smooth_cols.size(), ngm_rho);
+      nda::array<ComplexType,2> eta_w_Q_aug_g (Q_aug_cols_la.size(),   ngm_rho);
+      nda::array<ComplexType,2> eta_w_P_aug_g (P_aug_rows_la.size(),   ngm_rho);
+      nda::array<ComplexType,2> eta_P_aug_conj(P_aug_rows_la.size(),   ngm_rho);
+
+      for (auto [iq_l, iq] : itertools::enumerate(qloc_new)) {
         std::array<double,3> q_cart = {
             -Qpts_cart(iq, 0), -Qpts_cart(iq, 1), -Qpts_cart(iq, 2)};
 
-        // Gather ζ_μ^q(G) for this iq across MPI.
+        // ---- 6a) Pull this q's ζ slab into zeta_dist (q-pool, row-split). ----
         _Timer.start("PAW_AUG.dzeta");
-        zeta_mu_g() = ComplexType(0.0);
-        for (auto [iq_l, iq_g] : itertools::enumerate(q_rng_owned)) {
-          if (iq_g != iq) continue;
-          for (auto [iu, u] : itertools::enumerate(u_rng))
-            for (auto [ig, g] : itertools::enumerate(g_rng))
-              zeta_mu_g(u, g) = dzeta_local(iq_l, iu, ig);
-        }
-        _mpi->comm.all_reduce_in_place_n(zeta_mu_g.data(), zeta_mu_g.size(),
-                                          std::plus<>{});
+        fill_zeta_for_iq_into_qpool(dzeta_quG, (int)iq, zeta_dist, q_intra);
         _Timer.stop("PAW_AUG.dzeta");
 
-        // η^q on rho_g grid + q-shifted Coulomb weights.
+        // ---- 6b) Build η^q for this rank's la_chunk. ----
         _Timer.start("PAW_AUG.eta_at_q");
-        auto eta_aug = hamilt::paw::build_eta_on_rho_g_at_q(
-            *_psp, _isdf, rho_g, q_cart, omega, aatab, qrad_tabs);
+        {
+          auto la_rng = eta_dist.local_range(0);
+          auto eta_loc = eta_dist.local();
+          hamilt::paw::build_eta_on_rho_g_at_q_chunk(
+              *_psp, _isdf, _aug_layout, rho_g, q_cart, omega,
+              aatab, qrad_tabs,
+              la_rng, range(0, ngm_rho), eta_loc);
+        }
         _Timer.stop("PAW_AUG.eta_at_q");
+
+        // ---- 6c) Coulomb weights wG^q (rank-local copy, ngm doubles). ----
         _Timer.start("PAW_AUG.wG_at_q");
-        auto wG_q = hamilt::paw::coulomb_weights_on_rho_g_at_q(
-            rho_g, q_cart, omega);
+        auto wG_q = hamilt::paw::coulomb_weights_on_rho_g_at_q(rho_g, q_cart, omega);
         _Timer.stop("PAW_AUG.wG_at_q");
 
-        // Build per-q scratch (eta_flat, eta_w, eta_conj) ONCE — V_GL
-        // and V_LL share eta_w, V_LL also needs eta_conj.
+        // ---- 6d) η_w = η * wG (local). ----
         _Timer.start("PAW_AUG.eta_flat");
-        hamilt::paw::flatten_eta(*_psp, _isdf, _aug_layout, eta_aug, eta_flat);
-        for (long la = 0; la < _N_aug; ++la)
-          for (long g = 0; g < (long)rho_g_size; ++g) {
-            eta_w(la, g)    = eta_flat(la, g) * wG_q(g);
-            eta_conj(la, g) = std::conj(eta_flat(la, g));
-          }
+        {
+          auto src = eta_dist.local();
+          auto dst = eta_w_dist.local();
+          for (long la = 0; la < src.shape(0); ++la)
+            for (long g = 0; g < ngm_rho; ++g)
+              dst(la, g) = src(la, g) * wG_q(g);
+        }
         _Timer.stop("PAW_AUG.eta_flat");
 
-        // V_GL and V_LL at this q via single ZGEMM each.
-        V_GL_buf() = ComplexType(0.0);
-        V_LL_buf() = ComplexType(0.0);
-        _Timer.start("PAW_AUG.V_GL");
-        hamilt::paw::compute_VGL_q0_on_rho_g(_aug_layout, zeta_mu_g,
-                                              eta_w, V_GL_buf);
-        _Timer.stop("PAW_AUG.V_GL");
-        _Timer.start("PAW_AUG.V_LL");
-        hamilt::paw::compute_VLL_q0_on_rho_g(_aug_layout, eta_conj,
-                                              eta_w, V_LL_buf);
-        _Timer.stop("PAW_AUG.V_LL");
-        for (auto& v : V_GL_buf) v *= omega;
-        for (auto& v : V_LL_buf) v *= omega_sq;
+        // ---- 6e) Gather rows of ζ / η_w / η that this rank will need. ----
+        // Five row-gathers per q (on q_intra, np_PQ-way).
+        gather_rows_from_dist_qpool(zeta_dist , P_smooth_rows, q_intra, zeta_P_smooth_g);
+        gather_rows_from_dist_qpool(zeta_dist , Q_smooth_cols, q_intra, zeta_Q_smooth_g);
+        gather_rows_from_dist_qpool(eta_w_dist, Q_aug_cols_la, q_intra, eta_w_Q_aug_g);
+        gather_rows_from_dist_qpool(eta_w_dist, P_aug_rows_la, q_intra, eta_w_P_aug_g);
+        gather_rows_from_dist_qpool(eta_dist  , P_aug_rows_la, q_intra, eta_P_aug_conj);
+        // Now eta_P_aug_conj holds η; flip to conj(η) for V_LL / V_LG GEMMs.
+        for (long la = 0; la < eta_P_aug_conj.shape(0); ++la)
+          for (long g = 0; g < ngm_rho; ++g)
+            eta_P_aug_conj(la, g) = std::conj(eta_P_aug_conj(la, g));
 
-        // Stitch into V_full_q[iq].
-        _Timer.start("PAW_AUG.stitch");
-        for (long mu = 0; mu < _Np_smooth; ++mu)
-          for (long la = 0; la < _N_aug; ++la) {
-            ComplexType v = V_GL_buf(mu, la);
-            V_full_q(iq, mu, _Np_smooth + la) += v;
-            V_full_q(iq, _Np_smooth + la, mu) += std::conj(v);
+        auto Z_loc = _dZ.local();
+
+        // ---- 6f) V_GL block: P ∈ smooth, Q ∈ aug.
+        //         V_GL(μ, λ) = Ω · Σ_g ζ(μ, g) · conj(η_w(λ, g)).
+        if (P_smooth_rows.size() > 0 && Q_aug_cols_la.size() > 0) {
+          _Timer.start("PAW_AUG.V_GL");
+          nda::array<ComplexType,2> V_GL_local(P_smooth_rows.size(),
+                                               Q_aug_cols_la.size());
+          V_GL_local() = ComplexType(0.0);
+          nda::blas::gemm(ComplexType(omega), zeta_P_smooth_g,
+                          nda::dagger(eta_w_Q_aug_g),
+                          ComplexType(0.0), V_GL_local);
+          _Timer.stop("PAW_AUG.V_GL");
+          _Timer.start("PAW_AUG.stitch");
+          for (long ir = 0; ir < V_GL_local.shape(0); ++ir) {
+            long P_in_tile = P_smooth_rows.first() + ir - Ploc_new.first();
+            for (long ic = 0; ic < V_GL_local.shape(1); ++ic) {
+              long Q_in_tile = Q_aug_cols_g.first() + ic - Qloc_new.first();
+              Z_loc(iq_l, P_in_tile, Q_in_tile) += V_GL_local(ir, ic);
+            }
           }
-        for (long la = 0; la < _N_aug; ++la)
-          for (long lb = 0; lb < _N_aug; ++lb)
-            V_full_q(iq, _Np_smooth + la, _Np_smooth + lb) += V_LL_buf(la, lb);
-        _Timer.stop("PAW_AUG.stitch");
+          _Timer.stop("PAW_AUG.stitch");
+        }
+
+        // ---- 6g) V_LG block: P ∈ aug, Q ∈ smooth.
+        //         V_LG(λ, μ) = conj(V_GL(μ, λ))
+        //                    = Ω · Σ_g η_w(λ, g) · conj(ζ(μ, g)).
+        if (P_aug_rows_la.size() > 0 && Q_smooth_cols.size() > 0) {
+          _Timer.start("PAW_AUG.V_GL");
+          nda::array<ComplexType,2> V_LG_local(P_aug_rows_la.size(),
+                                               Q_smooth_cols.size());
+          V_LG_local() = ComplexType(0.0);
+          nda::blas::gemm(ComplexType(omega), eta_w_P_aug_g,
+                          nda::dagger(zeta_Q_smooth_g),
+                          ComplexType(0.0), V_LG_local);
+          _Timer.stop("PAW_AUG.V_GL");
+          _Timer.start("PAW_AUG.stitch");
+          for (long ir = 0; ir < V_LG_local.shape(0); ++ir) {
+            long P_in_tile = P_aug_rows_g.first() + ir - Ploc_new.first();
+            for (long ic = 0; ic < V_LG_local.shape(1); ++ic) {
+              long Q_in_tile = Q_smooth_cols.first() + ic - Qloc_new.first();
+              Z_loc(iq_l, P_in_tile, Q_in_tile) += V_LG_local(ir, ic);
+            }
+          }
+          _Timer.stop("PAW_AUG.stitch");
+        }
+
+        // ---- 6h) V_LL block + on-site K_a: P ∈ aug, Q ∈ aug.
+        //         V_LL(λ, ξ) = Ω² · Σ_g conj(η(λ, g)) · η_w(ξ, g).
+        if (P_aug_rows_la.size() > 0 && Q_aug_cols_la.size() > 0) {
+          _Timer.start("PAW_AUG.V_LL");
+          nda::array<ComplexType,2> V_LL_local(P_aug_rows_la.size(),
+                                               Q_aug_cols_la.size());
+          V_LL_local() = ComplexType(0.0);
+          nda::blas::gemm(ComplexType(omega_sq), eta_P_aug_conj,
+                          nda::transpose(eta_w_Q_aug_g),
+                          ComplexType(0.0), V_LL_local);
+          _Timer.stop("PAW_AUG.V_LL");
+
+          if (_paw_onsite) {
+            _Timer.start("PAW_AUG.K_a");
+            hamilt::paw::add_K_a_to_tile(
+                *_psp, _isdf, _aug_layout,
+                P_aug_rows_la, Q_aug_cols_la, V_LL_local);
+            _Timer.stop("PAW_AUG.K_a");
+          }
+
+          _Timer.start("PAW_AUG.stitch");
+          for (long ir = 0; ir < V_LL_local.shape(0); ++ir) {
+            long P_in_tile = P_aug_rows_g.first() + ir - Ploc_new.first();
+            for (long ic = 0; ic < V_LL_local.shape(1); ++ic) {
+              long Q_in_tile = Q_aug_cols_g.first() + ic - Qloc_new.first();
+              Z_loc(iq_l, P_in_tile, Q_in_tile) += V_LL_local(ir, ic);
+            }
+          }
+          _Timer.stop("PAW_AUG.stitch");
+        }
       }
 
-      // Scatter V_full_q into _dZ
-      _Timer.start("PAW_AUG.scatter");
-      auto Z_loc = _dZ.local();
-      auto qloc = _dZ.local_range(0);
-      auto Ploc = _dZ.local_range(1);
-      auto Qloc = _dZ.local_range(2);
-      for (auto [iq_l, iq] : itertools::enumerate(qloc)) {
-        for (auto [iP_l, iP] : itertools::enumerate(Ploc))
-          for (auto [iQ_l, iQ] : itertools::enumerate(Qloc))
-            Z_loc(iq_l, iP_l, iQ_l) = V_full_q(iq, iP, iQ);
-      }
-      _Timer.stop("PAW_AUG.scatter");
-
-      _Np = N_total;
+      _Np = (int)N_total;
     }
+
+    // ------------------------------------------------------------------
+    // PAW augmentation helpers (private, used only by augment_thc_with_paw).
+    // ------------------------------------------------------------------
+
+    /**
+     * Embed a smooth-block distributed array `dZ_NA` (shape: nq, NA, NA)
+     * into the [0:NA, 0:NA] sub-block of `dZ_NB` (shape: nq, NB, NB),
+     * NB ≥ NA. Both arrays live on the same global communicator but in
+     * general have different proc grids and per-rank chunk shapes.
+     *
+     * Implementation: every rank knows its own (q, P, Q) origin/shape in
+     * each array; allgather them and use one alltoallv to move data from
+     * src-rank's local block to the destination ranks whose [0:NA, 0:NA]
+     * subblock intersects it.
+     */
+    template<class DA, class DB>
+    void embed_smooth_block_into_aug_dZ(DA const& dZ_NA, DB& dZ_NB)
+    {
+      auto* comm = dZ_NA.communicator();
+      utils::check(comm == dZ_NB.communicator(),
+        "embed_smooth_block_into_aug_dZ: communicator mismatch");
+      long mpi_size = (long)comm->size();
+      long mpi_rank = (long)comm->rank();
+
+      long NA = dZ_NA.global_shape()[1];
+      utils::check(dZ_NA.global_shape()[1] == dZ_NA.global_shape()[2] &&
+                   dZ_NB.global_shape()[1] == dZ_NB.global_shape()[2] &&
+                   dZ_NA.global_shape()[0] == dZ_NB.global_shape()[0] &&
+                   NA <= dZ_NB.global_shape()[1],
+        "embed_smooth_block_into_aug_dZ: shape mismatch");
+
+      // Allgather (origin, shape) for both A and B from all ranks.
+      // Layout: per-rank 4 rows (A.origin, A.shape, B.origin, B.shape),
+      // each of length 3 → 12 longs per rank.
+      nda::array<long,3> blocks(mpi_size, 4, 3);
+      nda::array<long,2> mine(4, 3);
+      std::copy_n(dZ_NA.origin().data(),       3, mine.data() + 0);
+      std::copy_n(dZ_NA.local_shape().data(),  3, mine.data() + 3);
+      std::copy_n(dZ_NB.origin().data(),       3, mine.data() + 6);
+      std::copy_n(dZ_NB.local_shape().data(),  3, mine.data() + 9);
+      comm->all_gather_n(mine.data(), 12, blocks.data(), 12);
+
+      auto Aloc = dZ_NA.local();
+      auto Bloc = dZ_NB.local();
+
+      // Compute send/recv volumes. For each rank d, my contribution
+      // is the intersection of my A local block with d's B local block
+      // restricted to (q, [0:NA), [0:NA)).
+      auto intersect = [](long a0, long aN, long b0, long bN) -> std::pair<long,long> {
+        long o = std::max(a0, b0);
+        long e = std::min(a0 + aN, b0 + bN);
+        return {o, std::max(o, e)};
+      };
+
+      std::vector<int> send_counts(mpi_size, 0), send_displs(mpi_size, 0);
+      std::vector<int> recv_counts(mpi_size, 0), recv_displs(mpi_size, 0);
+
+      auto compute_overlap = [&](long /*Aorig*/, long /*Ashape*/,
+                                 long ax_q_o, long ax_q_n,
+                                 long ax_P_o, long ax_P_n,
+                                 long ax_Q_o, long ax_Q_n,
+                                 long bx_q_o, long bx_q_n,
+                                 long bx_P_o, long bx_P_n,
+                                 long bx_Q_o, long bx_Q_n,
+                                 std::array<std::pair<long,long>,3>& rngs) -> long {
+        auto [q_o, q_e] = intersect(ax_q_o, ax_q_n, bx_q_o, bx_q_n);
+        // restrict B's P/Q range to [0, NA) before intersecting
+        long bP_o = std::max(0L, bx_P_o);
+        long bP_e = std::min(NA, bx_P_o + bx_P_n);
+        long bQ_o = std::max(0L, bx_Q_o);
+        long bQ_e = std::min(NA, bx_Q_o + bx_Q_n);
+        if (bP_e <= bP_o || bQ_e <= bQ_o) return 0;
+        auto [P_o, P_e] = intersect(ax_P_o, ax_P_n, bP_o, bP_e - bP_o);
+        auto [Q_o, Q_e] = intersect(ax_Q_o, ax_Q_n, bQ_o, bQ_e - bQ_o);
+        long n = (q_e - q_o) * (P_e - P_o) * (Q_e - Q_o);
+        rngs = {std::pair{q_o, q_e}, std::pair{P_o, P_e}, std::pair{Q_o, Q_e}};
+        return n;
+      };
+
+      // Send side: for each dest rank d, fill block (q, P, Q) of my A
+      // into a flat send-buffer.
+      std::vector<std::array<std::pair<long,long>,3>> send_rngs(mpi_size);
+      std::vector<std::array<std::pair<long,long>,3>> recv_rngs(mpi_size);
+
+      for (long d = 0; d < mpi_size; ++d) {
+        long count = compute_overlap(0,0,
+            blocks(mpi_rank,0,0), blocks(mpi_rank,1,0),
+            blocks(mpi_rank,0,1), blocks(mpi_rank,1,1),
+            blocks(mpi_rank,0,2), blocks(mpi_rank,1,2),
+            blocks(d,2,0), blocks(d,3,0),
+            blocks(d,2,1), blocks(d,3,1),
+            blocks(d,2,2), blocks(d,3,2),
+            send_rngs[d]);
+        send_counts[d] = (int)count;
+      }
+      for (long s = 0; s < mpi_size; ++s) {
+        long count = compute_overlap(0,0,
+            blocks(s,0,0), blocks(s,1,0),
+            blocks(s,0,1), blocks(s,1,1),
+            blocks(s,0,2), blocks(s,1,2),
+            blocks(mpi_rank,2,0), blocks(mpi_rank,3,0),
+            blocks(mpi_rank,2,1), blocks(mpi_rank,3,1),
+            blocks(mpi_rank,2,2), blocks(mpi_rank,3,2),
+            recv_rngs[s]);
+        recv_counts[s] = (int)count;
+      }
+      for (long d = 1; d < mpi_size; ++d)
+        send_displs[d] = send_displs[d-1] + send_counts[d-1];
+      for (long s = 1; s < mpi_size; ++s)
+        recv_displs[s] = recv_displs[s-1] + recv_counts[s-1];
+
+      long total_send = (long)send_displs.back() + (long)send_counts.back();
+      long total_recv = (long)recv_displs.back() + (long)recv_counts.back();
+      std::vector<ComplexType> sendbuf(total_send), recvbuf(total_recv);
+
+      // Pack
+      for (long d = 0; d < mpi_size; ++d) {
+        if (send_counts[d] == 0) continue;
+        auto const& r = send_rngs[d];
+        long off = send_displs[d];
+        long Aq0 = blocks(mpi_rank,0,0), AP0 = blocks(mpi_rank,0,1), AQ0 = blocks(mpi_rank,0,2);
+        for (long q = r[0].first; q < r[0].second; ++q)
+          for (long P = r[1].first; P < r[1].second; ++P)
+            for (long Q = r[2].first; Q < r[2].second; ++Q)
+              sendbuf[off++] = Aloc(q - Aq0, P - AP0, Q - AQ0);
+      }
+
+      comm->all_to_all_v_n(
+          sendbuf.data(), send_counts.data(), send_displs.data(),
+          recvbuf.data(), recv_counts.data(), recv_displs.data());
+
+      // Unpack
+      long Bq0 = blocks(mpi_rank,2,0), BP0 = blocks(mpi_rank,2,1), BQ0 = blocks(mpi_rank,2,2);
+      for (long s = 0; s < mpi_size; ++s) {
+        if (recv_counts[s] == 0) continue;
+        auto const& r = recv_rngs[s];
+        long off = recv_displs[s];
+        for (long q = r[0].first; q < r[0].second; ++q)
+          for (long P = r[1].first; P < r[1].second; ++P)
+            for (long Q = r[2].first; Q < r[2].second; ++Q)
+              Bloc(q - Bq0, P - BP0, Q - BQ0) = recvbuf[off++];
+      }
+      comm->barrier();
+    }
+
+    /**
+     * Pull the iq-th smooth ζ slab out of `dzeta_quG` (distributed on the
+     * full mpi communicator, shape (nqpts_ibz, Np_smooth, ngm_rho)) into
+     * `zeta_dist` (distributed on the q-pool subcomm, shape (Np_smooth,
+     * ngm_rho), grid (np_PQ, 1)).
+     *
+     * Implemented with one alltoallv over the global comm so no rank ever
+     * holds the full (Np_smooth × ngm_rho) slab in memory.
+     */
+    template<class dz_dist_t, class Z_dist_t>
+    void fill_zeta_for_iq_into_qpool(
+        dz_dist_t const& dzeta_quG,
+        int iq,
+        Z_dist_t& zeta_dist,
+        mpi3::communicator& q_intra)
+    {
+      auto* gcomm = dzeta_quG.communicator();
+      long gnp   = (long)gcomm->size();
+      long grank = (long)gcomm->rank();
+
+      // src side (dzeta_quG): each rank's (q, u, g) origin/shape.
+      // dst side (zeta_dist): each rank's (mu, g) origin/shape, but only
+      //   ranks of q_intra carry it. Use q_intra's translation to global
+      //   ranks via group/translate.
+      // Simpler: gather src/dst metadata across the global comm and let
+      // ranks not in q_intra contribute zero counts.
+
+      // Per-rank metadata: (src_q_o, src_q_n, src_u_o, src_u_n, src_g_o, src_g_n,
+      //                     dst_in_qpool_flag, dst_mu_o, dst_mu_n, dst_g_o, dst_g_n)
+      // 11 longs per rank.
+      long meta_per = 11;
+      nda::array<long,2> mine(meta_per, 1);
+      mine.data()[0]  = dzeta_quG.origin()[0];
+      mine.data()[1]  = dzeta_quG.local_shape()[0];
+      mine.data()[2]  = dzeta_quG.origin()[1];
+      mine.data()[3]  = dzeta_quG.local_shape()[1];
+      mine.data()[4]  = dzeta_quG.origin()[2];
+      mine.data()[5]  = dzeta_quG.local_shape()[2];
+      // for dst: only ranks of q_intra are valid receivers.
+      // Find global rank of every q_intra member and tag them on the global comm.
+      // Easier: each rank fills its own dst metadata if it belongs to q_intra of
+      // this _dZ pool — checked by the caller's split. Since this routine is
+      // called by all ranks (each in their own q_intra), the q_intra ranks
+      // each own a slab of zeta_dist.
+      mine.data()[6]  = 1;  // every rank participates in some q_intra
+      mine.data()[7]  = zeta_dist.origin()[0];
+      mine.data()[8]  = zeta_dist.local_shape()[0];
+      mine.data()[9]  = zeta_dist.origin()[1];
+      mine.data()[10] = zeta_dist.local_shape()[1];
+
+      nda::array<long,2> meta(gnp, meta_per);
+      gcomm->all_gather_n(mine.data(), meta_per, meta.data(), meta_per);
+
+      // We need to know which q_intra each rank belongs to (so a src rank
+      // sends only to dst ranks in the same q_intra). Identify q_intra by
+      // comparing q_intra.rank() and translating: simpler to broadcast
+      // q_intra-id = our rank in the global comm anchored at q_intra.rank()=0.
+      // Use _dZ.origin()[0] as the canonical q-pool id (gathered via _dZ).
+      // But this routine doesn't have _dZ. Use q_intra's group rank vs gcomm:
+      //   each rank's q-pool id = (its global rank) / (q_intra.size()) *only*
+      // when q_intra was built by `comm.split(color, comm.rank())` with
+      // sequential coloring — which is the case here. To be safe, gather it.
+      long my_pool_color = (long)(grank / q_intra.size()); // assumes contiguous mapping
+      nda::array<long,1> pool_color(gnp);
+      gcomm->all_gather_n(&my_pool_color, 1, pool_color.data(), 1);
+
+      // Compute send_counts: src=this rank, dst=d. Active only if iq is in
+      // src's q-range, dst has the same pool color, and the (mu, g) overlap
+      // is non-empty.
+      bool src_has_iq = (iq >= mine.data()[0]) && (iq < mine.data()[0] + mine.data()[1]);
+      std::vector<int> send_counts(gnp, 0), send_displs(gnp, 0);
+      std::vector<int> recv_counts(gnp, 0), recv_displs(gnp, 0);
+      auto interv = [](long a0, long aN, long b0, long bN) -> std::pair<long,long> {
+        long o = std::max(a0, b0);
+        long e = std::min(a0 + aN, b0 + bN);
+        return {o, std::max(o, e)};
+      };
+
+      // For send: dst rank d must be in same q-pool as me (we send to
+      // every q-pool member that owns part of zeta_dist for iq).
+      std::vector<std::pair<long,long>> send_mu_rngs(gnp), send_g_rngs(gnp);
+      std::vector<std::pair<long,long>> recv_mu_rngs(gnp), recv_g_rngs(gnp);
+      if (src_has_iq) {
+        long s_mu_o = mine.data()[2], s_mu_n = mine.data()[3];
+        long s_g_o  = mine.data()[4], s_g_n  = mine.data()[5];
+        for (long d = 0; d < gnp; ++d) {
+          if (pool_color(d) != my_pool_color) continue;
+          long d_mu_o = meta(d, 7), d_mu_n = meta(d, 8);
+          long d_g_o  = meta(d, 9), d_g_n  = meta(d, 10);
+          auto [mu_o, mu_e] = interv(s_mu_o, s_mu_n, d_mu_o, d_mu_n);
+          auto [g_o,  g_e ] = interv(s_g_o,  s_g_n,  d_g_o,  d_g_n);
+          if (mu_e <= mu_o || g_e <= g_o) continue;
+          send_counts[d] = (int)((mu_e - mu_o) * (g_e - g_o));
+          send_mu_rngs[d] = {mu_o, mu_e};
+          send_g_rngs[d]  = {g_o,  g_e};
+        }
+      }
+
+      // For recv: src rank s must be in same pool, must have iq in its q-range,
+      // and overlap with my (mu, g).
+      long r_mu_o = mine.data()[7], r_mu_n = mine.data()[8];
+      long r_g_o  = mine.data()[9], r_g_n  = mine.data()[10];
+      for (long s = 0; s < gnp; ++s) {
+        if (pool_color(s) != my_pool_color) continue;
+        long s_q_o = meta(s, 0), s_q_n = meta(s, 1);
+        if (iq < s_q_o || iq >= s_q_o + s_q_n) continue;
+        long s_mu_o = meta(s, 2), s_mu_n = meta(s, 3);
+        long s_g_o  = meta(s, 4), s_g_n  = meta(s, 5);
+        auto [mu_o, mu_e] = interv(s_mu_o, s_mu_n, r_mu_o, r_mu_n);
+        auto [g_o,  g_e ] = interv(s_g_o,  s_g_n,  r_g_o,  r_g_n);
+        if (mu_e <= mu_o || g_e <= g_o) continue;
+        recv_counts[s] = (int)((mu_e - mu_o) * (g_e - g_o));
+        recv_mu_rngs[s] = {mu_o, mu_e};
+        recv_g_rngs[s]  = {g_o,  g_e};
+      }
+
+      for (long d = 1; d < gnp; ++d) send_displs[d] = send_displs[d-1] + send_counts[d-1];
+      for (long s = 1; s < gnp; ++s) recv_displs[s] = recv_displs[s-1] + recv_counts[s-1];
+      long total_send = (long)send_displs.back() + (long)send_counts.back();
+      long total_recv = (long)recv_displs.back() + (long)recv_counts.back();
+      std::vector<ComplexType> sbuf(total_send), rbuf(total_recv);
+
+      // Pack
+      auto src_loc = dzeta_quG.local();
+      long s_q_o  = mine.data()[0];
+      long s_mu_o = mine.data()[2];
+      long s_g_o  = mine.data()[4];
+      long iq_loc_in_src = iq - s_q_o;
+      if (src_has_iq) {
+        for (long d = 0; d < gnp; ++d) {
+          if (send_counts[d] == 0) continue;
+          long off = send_displs[d];
+          for (long mu = send_mu_rngs[d].first; mu < send_mu_rngs[d].second; ++mu)
+            for (long g = send_g_rngs[d].first; g < send_g_rngs[d].second; ++g)
+              sbuf[off++] = src_loc(iq_loc_in_src, mu - s_mu_o, g - s_g_o);
+        }
+      }
+
+      gcomm->all_to_all_v_n(
+          sbuf.data(), send_counts.data(), send_displs.data(),
+          rbuf.data(), recv_counts.data(), recv_displs.data());
+
+      // Unpack into zeta_dist.local()
+      auto dst_loc = zeta_dist.local();
+      dst_loc() = ComplexType(0.0);
+      for (long s = 0; s < gnp; ++s) {
+        if (recv_counts[s] == 0) continue;
+        long off = recv_displs[s];
+        for (long mu = recv_mu_rngs[s].first; mu < recv_mu_rngs[s].second; ++mu)
+          for (long g = recv_g_rngs[s].first; g < recv_g_rngs[s].second; ++g)
+            dst_loc(mu - r_mu_o, g - r_g_o) = rbuf[off++];
+      }
+      gcomm->barrier();
+    }
+
+    /**
+     * Gather rows `wanted_rows` (rank-specific global range) out of a
+     * 2D distributed array `A` (shape (Mtot, N), proc grid (np, 1) on
+     * the q-pool comm) into the rank-local `out` buffer of shape
+     * (wanted_rows.size(), N).
+     *
+     * Used by the per-q distributed augmentation to pull only the
+     * (mu / λ) rows this rank needs to fill its own _dZ tile.
+     */
+    template<class A_dist_t, class T>
+    void gather_rows_from_dist_qpool(A_dist_t const& A,
+                                     nda::range wanted_rows,
+                                     mpi3::communicator& comm,
+                                     nda::array<T, 2>& out)
+    {
+      long nproc = (long)comm.size();
+      long N = A.global_shape()[1];
+
+      utils::check(out.shape(0) == wanted_rows.size() && out.shape(1) == N,
+        "gather_rows_from_dist_qpool: out shape ({}, {}) != ({}, {})",
+        out.shape(0), out.shape(1), wanted_rows.size(), N);
+      out() = T(0);
+      if (wanted_rows.size() == 0) return;
+
+      // metadata: (A.origin[0], A.lshape[0], wanted_rows.first, wanted_rows.last)
+      nda::array<long,2> meta(nproc, 4);
+      nda::array<long,1> mine(4);
+      mine(0) = A.origin()[0];
+      mine(1) = A.local_shape()[0];
+      mine(2) = wanted_rows.first();
+      mine(3) = wanted_rows.last();
+      comm.all_gather_n(mine.data(), 4, meta.data(), 4);
+
+      auto interv = [](long a0, long aN, long b0, long bE) -> std::pair<long,long> {
+        long o = std::max(a0, b0);
+        long e = std::min(a0 + aN, bE);
+        return {o, std::max(o, e)};
+      };
+
+      std::vector<int> send_counts(nproc, 0), send_displs(nproc, 0);
+      std::vector<int> recv_counts(nproc, 0), recv_displs(nproc, 0);
+      std::vector<std::pair<long,long>> send_rng(nproc), recv_rng(nproc);
+
+      long my_A_o = mine(0), my_A_n = mine(1);
+      for (long d = 0; d < nproc; ++d) {
+        long w0 = meta(d, 2), w1 = meta(d, 3);
+        auto [o, e] = interv(my_A_o, my_A_n, w0, w1);
+        if (e <= o) continue;
+        send_rng[d] = {o, e};
+        send_counts[d] = (int)((e - o) * N);
+      }
+      long my_w0 = mine(2), my_w1 = mine(3);
+      for (long s = 0; s < nproc; ++s) {
+        long sA_o = meta(s, 0), sA_n = meta(s, 1);
+        auto [o, e] = interv(sA_o, sA_n, my_w0, my_w1);
+        if (e <= o) continue;
+        recv_rng[s] = {o, e};
+        recv_counts[s] = (int)((e - o) * N);
+      }
+      for (long d = 1; d < nproc; ++d) send_displs[d] = send_displs[d-1] + send_counts[d-1];
+      for (long s = 1; s < nproc; ++s) recv_displs[s] = recv_displs[s-1] + recv_counts[s-1];
+      long total_send = (long)send_displs.back() + (long)send_counts.back();
+      long total_recv = (long)recv_displs.back() + (long)recv_counts.back();
+      std::vector<T> sbuf(total_send), rbuf(total_recv);
+
+      auto Aloc = A.local();
+      for (long d = 0; d < nproc; ++d) {
+        if (send_counts[d] == 0) continue;
+        long off = send_displs[d];
+        for (long r = send_rng[d].first; r < send_rng[d].second; ++r)
+          for (long g = 0; g < N; ++g)
+            sbuf[off++] = Aloc(r - my_A_o, g);
+      }
+
+      comm.all_to_all_v_n(
+          sbuf.data(), send_counts.data(), send_displs.data(),
+          rbuf.data(), recv_counts.data(), recv_displs.data());
+
+      for (long s = 0; s < nproc; ++s) {
+        if (recv_counts[s] == 0) continue;
+        long off = recv_displs[s];
+        for (long r = recv_rng[s].first; r < recv_rng[s].second; ++r) {
+          long out_row = r - my_w0;
+          for (long g = 0; g < N; ++g)
+            out(out_row, g) = rbuf[off++];
+        }
+      }
+      comm.barrier();
+    }
+
 
     void build_from_CD() {
       using math::nda::make_distributed_array;
