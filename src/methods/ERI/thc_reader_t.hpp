@@ -45,6 +45,7 @@
 #include "methods/ERI/chol_reader_t.hpp"
 #include "mean_field/MF.hpp"
 #include "hamiltonian/pseudo/pseudopot.h"
+#include "hamiltonian/paw/paw_symmetry.hpp"
 #include "hamiltonian/paw/local_isdf.hpp"
 #include "hamiltonian/paw/local_isdf_compress.hpp"
 #include "hamiltonian/paw/local_isdf_h5.hpp"
@@ -194,7 +195,7 @@ namespace methods {
                      "PAW_AUG.wG_at_q", "PAW_AUG.eta_flat",
                      "PAW_AUG.V_GL", "PAW_AUG.V_LL",
                      "PAW_AUG.K_a", "PAW_AUG.stitch", "PAW_AUG.scatter",
-                     "PAW_AUG.X_aug"})
+                     "PAW_AUG.X_aug", "PAW_AUG.Pskna_lift"})
         _Timer.add(v);
 
       // PAW-aug: lazily acquire pseudopot through MF (shared with other
@@ -518,33 +519,39 @@ namespace methods {
         return;
       }
 
-      // The augmentation Y rows below loop k = 0..nkpts-1 (full BZ) and
-      // read Pskna(s, k, p, i). pseudopot stores Pskna only on the IBZ
-      // k-points (shape (nspin, nkpts_ibz, npol*nkb, nbnd)). For
-      // nkpts > nkpts_ibz this is an out-of-bounds read into the SHM
-      // region — silently-wrong values at np=1 (read garbage in heap)
-      // and a SIGSEGV "Invalid permissions" at np>1 (walk past the
-      // end of the SHM mapping on the node-root). Both surface as
-      // wrong RPA energies / NaN downstream.
-      //
-      // The fix is the symmetry-aware View-2 transformation of the
-      // IBZ Pskna at each full-BZ k (atom permutation + Wigner-D on
-      // the projector m-index + fractional-translation phase). See
-      // notes/paw_symmetry_notes.tex Eq. coef-symm. Until that
-      // helper lands, abort cleanly so the silent-OOB / SIGSEGV
-      // failure mode is loud and actionable.
-      utils::check(_MF->nkpts() == _MF->nkpts_ibz(),
-        "thc_reader_t::augment_thc_with_paw: PAW/USPP augmentation does "
-        "not yet support QE symmetry reduction (nkpts={} != nkpts_ibz={}). "
-        "Y rows of X_shm are computed via Pskna(s, k_full, ...), but "
-        "Pskna is stored only at k_ibz. Until the symmetry-aware View-2 "
-        "Pskna transform is implemented (see notes/paw_symmetry_notes.tex "
-        "for the working equations), rerun the QE inputs with "
-        "nosym=.true., noinv=.true., no_t_rev=.true.",
-        _MF->nkpts(), _MF->nkpts_ibz());
+      // ---------------------------------------------------------------
+      // 1) Lift the IBZ-stored Pskna to the full BZ via View-2 symmetry.
+      //    Pskna in pseudopot has shape (nspin, nkpts_ibz, npol*nkb, nbnd);
+      //    the X augmentation loop below indexes k = 0..nkpts-1, so we
+      //    need a full-BZ-sized projector-overlap table. The symmorphic
+      //    View-2 transform (atom permutation + Wigner-D on the m-index)
+      //    builds it from the IBZ data; see paw_symmetry.hpp +
+      //    notes/paw_symmetry_notes.tex Eq. coef-symm. For nkpts == nkpts_ibz
+      //    (no QE symmetry reduction) the helper still produces the right
+      //    answer (every k is its own IBZ partner with R=identity), so we
+      //    just always go through the helper.
+      // ---------------------------------------------------------------
+      _Timer.start("PAW_AUG.Pskna_lift");
+      int lmax_proj = 0;
+      for (auto const& sp : _psp->paw_species_view())
+        if (sp.lll.size() > 0)
+          for (long b = 0; b < sp.lll.extent(0); ++b)
+            lmax_proj = std::max(lmax_proj, (int)sp.lll(b));
+      auto symm_list_local = _MF->symm_list();
+      auto atom_perm_inv = hamilt::paw::build_atom_permutation_inverse(
+          _psp->atom_pos_cart_view(), _psp->ityp_view(),
+          _MF->lattv(), _MF->recv(), symm_list_local);
+      auto wigner_d = hamilt::paw::build_wigner_d_real(
+          symm_list_local, _MF->lattv(), lmax_proj);
+      auto Pkfull = hamilt::paw::compute_Pskna_full_bz(
+          *_psp,
+          _MF->kp_to_ibz(), _MF->kp_symm(), _MF->kp_trev(),
+          _MF->kpts(), symm_list_local,
+          atom_perm_inv, wigner_d, _npol, *_mpi);
+      _Timer.stop("PAW_AUG.Pskna_lift");
 
       // ---------------------------------------------------------------
-      // 1) Augment X_shm: append Y rows below smooth ζ rows.
+      // 2) Augment X_shm: append Y rows below smooth ζ rows.
       // ---------------------------------------------------------------
       _Timer.start("PAW_AUG.X_aug");
       auto X_old = _X_shm;
@@ -555,17 +562,18 @@ namespace methods {
       if (X_new.node_comm()->root()) {
         auto Xn = X_new.local();
         auto Xo = X_old.local();
+        auto Pkfull_loc = Pkfull.local();
         for (int s = 0; s < dim_s; ++s)
         for (int k = 0; k < _nkpts; ++k) {
           // smooth rows
           for (int mu = 0; mu < _Np_smooth; ++mu)
             Xn(s, k, mu, range::all) = Xo(s, k, mu, range::all);
-          // Y rows = U · P
+          // Y rows = U · P  (now indexed by full-BZ k via Pkfull)
           nda::array<ComplexType,2> Y_buf(_N_aug,
               x_range.size() * std::max(1, _npol));
           hamilt::paw::fill_Y_rows_for_sk(
               *_psp, _isdf, _aug_layout, _npol,
-              s, k, _psp->Pskna_view(), Y_buf);
+              s, k, Pkfull_loc, Y_buf);
           for (int la = 0; la < _N_aug; ++la)
             for (int i = 0; i < (int)x_range.size(); ++i)
               Xn(s, k, _Np_smooth + la, i) = Y_buf(la, i);
