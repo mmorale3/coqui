@@ -11,9 +11,10 @@
  *   V_full = | V_smooth_GG    V_GL          |
  *            | V_LG = V_GL†   V_LL + K_a    |
  *
- * Phase 4.2 covers the q=0 path explicitly (Hartree validation). The
- * q≠0 path uses the radial spherical-Bessel η^q(G) helpers in
- * `eta_to_G.hpp`; a dedicated builder for that case is a follow-up.
+ * Both q=0 and q≠0 paths share the same builder, build_eta_on_rho_g_at_q,
+ * which evaluates η_{a,λ}^q(G) directly on rho_g.g_vectors() via a
+ * precomputed qrad table (see paw_aug_q_eval.hpp). Callers pass q_cart=0
+ * for the q=0 case.
  * ==========================================================================
  */
 #ifndef HAMILTONIAN_PAW_PAW_AUG_THC_HPP
@@ -71,141 +72,6 @@ inline paw_aug_layout make_paw_aug_layout(
     L.N_A = total;
     L.N_Lambda = N_mu + total;
     return L;
-}
-
-/**
- * Build a remap table from the psp dense G grid → the thc's rho_g grid.
- *
- * For each ig ∈ [0, ngm_dense):
- *   psp_to_rho[ig]  = index in rho_g.g_vectors() with matching miller indices,
- *                     or -1 if rho_g doesn't include that G (cutoff mismatch).
- *
- * The convention: use FFT linear index N(m1,m2,m3) = ((m1+Nx)%Nx*Ny + ...
- * ... + (m3+Nz)%Nz) on the rho_g.mesh(); the rho_g exposes the inverse
- * via `fft_to_gv` if available, else we build it from gv_to_fft.
- *
- * If ngm_dense_unmapped > 0 after the pass, a warning is emitted (caller
- * decides whether to abort). For Phase 4.2 we typically expect zero
- * unmapped indices (ecut == ecutrho).
- */
-inline std::vector<long> make_psp_to_rho_g_map(
-    pseudopot const& psp,
-    grids::truncated_g_grid const& rho_g,
-    long& n_unmapped_out)
-{
-    long ngm_dense = psp.ngm_dense_get();
-    std::vector<long> map(ngm_dense, -1);
-    n_unmapped_out = 0;
-    if (ngm_dense == 0) return map;
-
-    long NX = rho_g.mesh(0), NY = rho_g.mesh(1), NZ = rho_g.mesh(2);
-    long nnr = rho_g.nnr();
-    auto const& mill = psp.miller_g_dense_view();
-    utils::check(mill.extent(0) == ngm_dense,
-                 "make_psp_to_rho_g_map: miller_g_dense rows ({}) != ngm_dense ({})",
-                 mill.extent(0), ngm_dense);
-
-    // Principal-zone miller bounds for the rho_g FFT box (matches the
-    // truncated_g_grid construction loop in g_grids.hpp:
-    //     for i = (ni - NX + 1) .. ni  with ni = NX/2 (integer division)).
-    // A dense psp G with miller component outside this range corresponds to
-    // a G-vector that is NOT representable on the smaller rho_g mesh — if we
-    // naively wrap-and-lookup it would silently alias onto a low-|G| rho_g
-    // entry (e.g. m1 = +18 in NX = 33 wraps to position 18 = miller m1 = -15).
-    // Catch that here so the augmentation contributions don't get misplaced.
-    auto princ_zone = [](long N, long m) -> bool {
-        long ni = N / 2;
-        long mlo = ni - N + 1;
-        return (m >= mlo) && (m <= ni);
-    };
-
-    // Build FFT linear → rho_g index (use the existing fft_to_gv if there).
-    std::vector<long> fft_to_g(nnr, -1);
-    auto const& gv_to_fft = rho_g.gv_to_fft();
-    long ngm_rho = rho_g.size();
-    for (long g = 0; g < ngm_rho; ++g) {
-        long N = gv_to_fft(g);
-        if (N >= 0 && N < nnr) fft_to_g[N] = g;
-    }
-
-    for (long ig = 0; ig < ngm_dense; ++ig) {
-        int m1 = mill(ig, 0), m2 = mill(ig, 1), m3 = mill(ig, 2);
-        if (!princ_zone(NX, m1) || !princ_zone(NY, m2) || !princ_zone(NZ, m3)) {
-            ++n_unmapped_out; continue;
-        }
-        long n1 = m1; if (n1 < 0) n1 += NX;
-        long n2 = m2; if (n2 < 0) n2 += NY;
-        long n3 = m3; if (n3 < 0) n3 += NZ;
-        long N = (n1*NY + n2)*NZ + n3;
-        long ig_rho = fft_to_g[N];
-        if (ig_rho < 0) { ++n_unmapped_out; continue; }
-        map[ig] = ig_rho;
-    }
-    return map;
-}
-
-/**
- * Project η_{a,λ}^{q=0}(G) onto the thc rho_g grid. Output shape:
- *   eta_aλ_on_rho(a, λ, g_rho)  with g_rho ∈ [0, rho_g.size()).
- *
- * Atom structure factor e^{-iG·τ_a} is APPLIED here so callers can use the
- * result directly in V_GL / V_LL contractions.
- */
-inline nda::array<ComplexType, 3> build_eta_on_rho_g_q0(
-    pseudopot const& psp,
-    std::vector<species_local_isdf> const& isdf,
-    grids::truncated_g_grid const& rho_g)
-{
-    long ngm_rho = rho_g.size();
-    auto const& ityp = psp.ityp_view();
-    long nat = ityp.extent(0);
-    int nlam_max = 0;
-    for (auto const& s : isdf) nlam_max = std::max(nlam_max, s.nlambda);
-
-    nda::array<ComplexType, 3> eta_aug =
-        nda::array<ComplexType, 3>::zeros({nat, (long)nlam_max, ngm_rho});
-    if (nlam_max == 0) return eta_aug;
-
-    long n_unmapped = 0;
-    auto psp_to_rho = make_psp_to_rho_g_map(psp, rho_g, n_unmapped);
-    if (n_unmapped > 0)
-        app_warning("paw_aug_thc: {} of {} dense-grid G entries fall outside "
-                    "the thc rho_g grid (likely cutoff mismatch). Truncating.",
-                    n_unmapped, psp.ngm_dense_get());
-
-    // Atom structure factor on rho_g.
-    auto const& tau = psp.atom_pos_cart_view();
-    auto const& g_cart = rho_g.g_vectors();   // (ngm_rho, 3)
-    nda::array<double,2> cos_tau(nat, ngm_rho), sin_tau(nat, ngm_rho);
-    for (long ia = 0; ia < nat; ++ia)
-    for (long g = 0; g < ngm_rho; ++g) {
-        double ph = g_cart(g,0)*tau(ia,0) + g_cart(g,1)*tau(ia,1)
-                  + g_cart(g,2)*tau(ia,2);
-        cos_tau(ia, g) = std::cos(ph);
-        sin_tau(ia, g) = std::sin(ph);
-    }
-
-    long ngm_psp = psp.ngm_dense_get();
-    for (long ia = 0; ia < nat; ++ia) {
-        int nt = ityp(ia);
-        if (nt >= (int)isdf.size()) continue;
-        auto const& s = isdf[nt];
-        if (s.nlambda == 0) continue;
-        utils::check(s.eta_qg_q0.extent(1) == ngm_psp,
-            "paw_aug_thc: isdf eta_qg_q0 G dim ({}) != psp ngm_dense ({})",
-            s.eta_qg_q0.extent(1), ngm_psp);
-        for (int lam = 0; lam < s.nlambda; ++lam) {
-            for (long ig = 0; ig < ngm_psp; ++ig) {
-                long ig_rho = psp_to_rho[ig];
-                if (ig_rho < 0) continue;
-                // Apply structure factor e^{-iG·τ_a}
-                ComplexType eta_q0 = s.eta_qg_q0(lam, ig);
-                ComplexType sf(cos_tau(ia, ig_rho), -sin_tau(ia, ig_rho));
-                eta_aug(ia, lam, ig_rho) = eta_q0 * sf;
-            }
-        }
-    }
-    return eta_aug;
 }
 
 /**
@@ -401,7 +267,7 @@ inline nda::array<double, 1> coulomb_weights_on_rho_g_at_q(
  *   zeta_mu_g  : (N_mu, ngm_rho) — smooth ζ_μ^{q=0}(G) (e.g. from
  *                thc.evaluate_isdf_only at q=0)
  *   eta_aug    : (nat, nlam_max, ngm_rho) — η_{aλ}(G)·e^{-iG·τ_a} as
- *                produced by build_eta_on_rho_g_q0
+ *                produced by build_eta_on_rho_g_at_q
  *   wG         : (ngm_rho) — Coulomb weights from coulomb_weights_on_rho_g
  *   layout     : aug layout
  *   psp        : pseudopot (used for ityp + isdf-row counts)
@@ -464,7 +330,7 @@ inline void compute_VGL_q0_on_rho_g(
  *                          ·  4π/(Ω|G|²)
  *
  * eta_aug already carries the e^{-iG·τ} factor from
- * `build_eta_on_rho_g_q0`, so this is a straightforward conj/mult/sum.
+ * `build_eta_on_rho_g_at_q`, so this is a straightforward conj/mult/sum.
  *
  * Output: V_LL_out(N_A, N_A); accumulated additively.
  */

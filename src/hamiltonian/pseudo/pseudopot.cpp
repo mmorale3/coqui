@@ -780,7 +780,7 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
 
     // Broadcast paw_species data to non-root ranks. The h5 read above only
     // executes on comm.root; without this broadcast, downstream consumers
-    // (paw_thc_kernel, paw_aug_q_eval, local_isdf, hartree_xc_energy) get
+    // (paw_aug_thc, paw_aug_q_eval, local_isdf, hartree_xc_energy) get
     // empty species data on non-root ranks and either silently skip work
     // or hang on collective ops triggered by inconsistent metadata.
     auto bcast_array_1 = [this](nda::array<double,1>& a) {

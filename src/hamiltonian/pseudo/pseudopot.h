@@ -351,7 +351,7 @@ class pseudopot
                nda::ArrayOfRank<3> auto const& Dion,
                math::nda::DistributedArrayOfRank<4> auto & Hij);
 
-  // Public PAW/USPP utilities exposed to callers (test code, paw_thc_kernel,
+  // Public PAW/USPP utilities exposed to callers (test code, paw_aug_thc,
   // v_h_paw, etc.). Re-open public scope here.
 public:
 

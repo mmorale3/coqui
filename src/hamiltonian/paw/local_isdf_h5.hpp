@@ -181,7 +181,7 @@ inline std::vector<species_local_isdf> read_local_isdf_h5(
  *
  * The resulting cache lets a downstream calculation avoid the (small but
  * non-trivial) Gram + pivoted-Cholesky cost; the eta_qg_q0 binary is
- * already in the right shape for paw_thc_kernel consumption.
+ * already in the right shape for paw_aug_thc / thc_reader_t consumption.
  */
 inline void cache_compressed_local_isdf_to_h5(
     std::string const& h5_path,

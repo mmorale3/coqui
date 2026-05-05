@@ -1123,7 +1123,8 @@ TEST_CASE("vxc_rho_integral", "[hamilt][energy]")
  * V_ijkl ≈ Σ_ΛΣ X*_Λi X_Λj 𝒱_ΛΣ X*_Σk X_Σl, where X is on |ψ̃|² without
  * augmentation. So for USPP/PAW the THC E_H matches the SMOOTH-only
  * direct E_H, NOT the full QE ehart (the augmentation contribution to E_H
- * is captured by the separate paw_thc_kernel — Phase 4 work).
+ * is captured by the augmented (Y / V_GL / V_LL / K_a) extensions
+ * built in thc_reader_t::augment_thc_with_paw — Phase 4 work).
  *
  * For NCPP (no augmentation): smooth-direct = full-direct = QE ehart.
  * The accuracy of THC is set by `thresh` and `ecut`; for our LiH 222
@@ -2150,7 +2151,7 @@ void test_local_isdf_rho_aug_reconstruction([[maybe_unused]] mpi_context_t& mpi,
  *   E_dC^a  = (1/2) Σ_{IJKL} becsum_{aIJ} ΔC_a(IJKL) becsum_{aKL}
  *
  * Equality follows from the ΔC roundtrip — this is the operationally-relevant
- * assertion that the K_a injection in `assemble_paw_augmented_thc` produces
+ * assertion that the K_a injection in `hamilt::paw::add_K_a_to_LL` produces
  * the correct one-center Hartree contribution.
  */
 template<MEMORY_SPACE MEM>

@@ -22,7 +22,7 @@
  * `exchange_energy_thc`. As an independent check, we also materialize the
  * full V_{ijkl} from (X, 𝒱) and contract with f_i f_j directly. Any
  * disagreement signals a bug in the THC contraction algebra (the
- * X-concatenation or K_a addition in `assemble_paw_augmented_thc`).
+ * X-concatenation or K_a addition in thc_reader_t::augment_thc_with_paw).
  *
  * Real-data validation against a direct PAW Coulomb routine on smooth
  * orbitals + augmentation is a Phase 5 follow-up; this header provides the
@@ -189,7 +189,7 @@ inline double exchange_energy_direct(V4_t const& V4, occ_t const& occ)
  * (X, V) factorization at one (s, k). Throws if violation > tol.
  *
  * This is the algebra-equivalence test: the two evaluation paths must agree
- * to machine epsilon for any (X, V) that came out of `assemble_paw_augmented_thc`
+ * to machine epsilon for any (X, V) that came out of thc_reader_t::augment_thc_with_paw
  * (or any other valid THC factorization). A nonzero violation indicates a
  * bug in the contraction wiring (most likely in `materialize_eri` for the
  * direct path or in the closed-form helpers).

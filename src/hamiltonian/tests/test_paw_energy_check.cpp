@@ -95,7 +95,7 @@ TEST_CASE("PAW THC energy-equivalence (algebra)", "[paw][energy_check]")
         auto V = random_hermitian(N, rng);
         // Add a "K_a-like" same-atom block to the L-L corner: entries on the
         // last N_A × N_A block, additive. Simulates the K_a injection in
-        // assemble_paw_augmented_thc.
+        // hamilt::paw::add_K_a_to_LL (paw_aug_thc.hpp).
         std::uniform_real_distribution<double> u(-0.5, 0.5);
         for (long L=N_mu; L<N; ++L)
         for (long S=N_mu; S<N; ++S) {
@@ -115,7 +115,7 @@ TEST_CASE("PAW THC energy-equivalence (algebra)", "[paw][energy_check]")
         // If we extend a smooth (X_smooth, V_smooth) with N_A zero rows of X
         // and a zero block in V, the energies must equal the smooth-only
         // computation. This validates the X concatenation in
-        // assemble_paw_augmented_thc.
+        // thc_reader_t::augment_thc_with_paw.
         std::mt19937 rng(0x5A001u);
         long N_mu = 5, N_A = 2, nbnd = 3;
         auto X_sm = random_X(N_mu, nbnd, rng);
