@@ -51,8 +51,8 @@ void add_vxc(MF_t& mf, nda::range k_range, nda::range b_range,
   // Vxc is on QE's dfftp (dense) grid. Read it on the dense grid and apply
   // V·ψ on the dense grid as well; for NCPP this matches the smooth grid, and
   // for PAW it correctly accommodates ngm_dense G-vectors.
-  auto fft_mesh = mf.fft_grid_dim_aug();
-  auto swfc_to_rho = detail::make_wfc_to_rho(mpi_context, mf, fft_mesh);
+  auto fft_mesh_aug = mf.fft_grid_dim_aug();
+  auto swfc_to_rho = detail::make_wfc_to_rho(mpi_context, mf, fft_mesh_aug);
   auto svxc = shared_array<nda::array_view<ComplexType,3>>(mpi_context, {nspin, npol*npol, mf.nnr_aug()});
 
   utils::check(k_range.size() == mf.nkpts_ibz() and
@@ -82,7 +82,7 @@ void add_vxc(MF_t& mf, nda::range k_range, nda::range b_range,
     utils::check(false,"Error in hamilt::add_vxc:: Unknown input file type/mf object combination.");
 
   // add vxc to hpsi
-  add_vloc(npol, fft_mesh, swfc_to_rho.local(), svxc.local(), psi, hpsi);
+  add_vloc(npol, fft_mesh_aug, swfc_to_rho.local(), svxc.local(), psi, hpsi);
 }
 
 template<typename MF_t, nda::MemoryArrayOfRank<3> array_t>
@@ -114,7 +114,7 @@ void read_vxc_h5(MF_t &mf, h5::group& grp0, shared_array<array_t> &svxc)
                "Error in pseudopot::read_vxc_h5: Inconsistent vxc shape.");
 
   // Vxc/V_eff h5 datasets store ngm_dense G-vectors and live on dfftp.
-  auto fft_mesh = mf.fft_grid_dim_aug();
+  auto fft_mesh_aug = mf.fft_grid_dim_aug();
   auto vxc = svxc.local();
 
   if(svxc.communicator()->root()) {
@@ -123,13 +123,13 @@ void read_vxc_h5(MF_t &mf, h5::group& grp0, shared_array<array_t> &svxc)
     nda::array<ComplexType,3> vl(nspin,npol*npol,ngm);
     nda::array<long,1> k2g(ngm);
 
-    auto vxc_4D = nda::reshape(vxc,std::array<long,4>{nspin*npol*npol,fft_mesh(0),fft_mesh(1),fft_mesh(2)});
+    auto vxc_4D = nda::reshape(vxc,std::array<long,4>{nspin*npol*npol,fft_mesh_aug(0),fft_mesh_aug(1),fft_mesh_aug(2)});
     math::nda::fft<true> F(vxc_4D);
 
     {
       nda::array<int,2> mill_g(ngm,3);
       nda::h5_read(grp,"miller_g",mill_g);
-      utils::generate_k2g(mill_g,k2g,fft_mesh);
+      utils::generate_k2g(mill_g,k2g,fft_mesh_aug);
     }
 
     // vxc

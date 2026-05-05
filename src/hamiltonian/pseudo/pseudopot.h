@@ -237,9 +237,11 @@ class pseudopot
   // input file, needed for save
   std::string input_file_name = "";
 
-  // basic system info
-  nda::stack_array<int,3> fft_mesh;
-  long nnr = 0;
+  // basic system info — dense (dfftp / augmentation) FFT grid.
+  // Pseudopotential data (V_loc, V_eff, augmentation Q, dense miller_g)
+  // all live on this grid; for NCPP it coincides with the smooth grid.
+  nda::stack_array<int,3> fft_mesh_aug;
+  long nnr_aug = 0;
  
   // reciprocal lattice vectors
   nda::stack_array<double,3,3> recv;

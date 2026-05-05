@@ -58,8 +58,8 @@ using boost::mpi3::shared_communicator;
 template<typename MF_t>
 pseudopot::pseudopot(MF_t &mf, std::string const filename) :
   mpi(mf.mpi()),
-  fft_mesh(mf.fft_grid_dim_aug()),  // dense grid: vsc, vloc, mill_g, all PAW augmentation pieces
-  nnr(mf.nnr_aug()),                // dense FFT box (must hold all dense G-vectors)
+  fft_mesh_aug(mf.fft_grid_dim_aug()),  // dense grid: vsc, vloc, mill_g, all PAW augmentation pieces
+  nnr_aug(mf.nnr_aug()),            // dense FFT box (must hold all dense G-vectors)
   recv(mf.recv()),
   lattv(mf.lattv()),
   nkpts(mf.nkpts()),
@@ -73,7 +73,7 @@ pseudopot::pseudopot(MF_t &mf, std::string const filename) :
   Pskna(make_shared_array<nda::array_view<ComplexType,4>>(*mpi,{1,1,1,1})),   // resize later
   Dnn(make_shared_array<nda::array_view<ComplexType,3>>(*mpi,{1,1,1})),       // resize later
   Dnn_atom(make_shared_array<nda::array_view<ComplexType,3>>(*mpi,{1,1,1})),        // resize later
-  swfc_to_rho(detail::make_wfc_to_rho(*mpi,mf,fft_mesh)),
+  swfc_to_rho(detail::make_wfc_to_rho(*mpi,mf,fft_mesh_aug)),
   svloc(make_shared_array<nda::array_view<ComplexType,3>>(*mpi,{1,1,1})),            // resize later
   svsc(make_shared_array<nda::array_view<ComplexType,3>>(*mpi,{1,1,1})),  // resize later
   qgm(make_shared_array<nda::array_view<ComplexType,3>>(*mpi,{1,1,1})),            // resize later
@@ -288,16 +288,16 @@ void pseudopot::read_vnl_pw2bgw(MF_t &mf, std::string outdir)
 
   // local and self-consistent potentials
   spinorbit_loc = false;
-  svloc = sarray_t<nda::array_view<ComplexType,3>>(*mpi,{nspin,1,nnr}); 
-  svsc = sarray_t<nda::array_view<ComplexType,3>>(*mpi,{nspin,npol*npol,nnr}); 
+  svloc = sarray_t<nda::array_view<ComplexType,3>>(*mpi,{nspin,1,nnr_aug});
+  svsc = sarray_t<nda::array_view<ComplexType,3>>(*mpi,{nspin,npol*npol,nnr_aug});
   if(mpi->comm.root()) {
     if(std::filesystem::exists(outdir+"/VSC")) {
       nda::array<ComplexType,1> v;
       utils::read_qe_plot_file(1,outdir+"/VSC",mf.fft_grid_dim_aug(),v);  // V_eff is on dfftp
-      // MAM: transform to nnr grid...  spin/polarization dependence???
+      // MAM: transform to nnr_aug grid...  spin/polarization dependence???
       // this is wrong if nspin or npol > 1!
       // ignore for now since this is not used anywhere!
-      utils::check(v.extent(0) == nnr, "Error: Dimension mismatch");
+      utils::check(v.extent(0) == nnr_aug, "Error: Dimension mismatch");
       for(int is=0; is<nspin; is++)
         svsc.local()(is,0,all) = v();
       // to Hartree
@@ -310,8 +310,8 @@ void pseudopot::read_vnl_pw2bgw(MF_t &mf, std::string outdir)
     if(std::filesystem::exists(outdir+"/VLTOT")) { 
       nda::array<ComplexType,1> v;
       utils::read_qe_plot_file(2,outdir+"/VLTOT",mf.fft_grid_dim_aug(),v);  // V_loc is on dfftp
-      // MAM: transform to nnr grid...
-      utils::check(v.extent(0) == nnr, "Error: Dimension mismatch");
+      // MAM: transform to nnr_aug grid...
+      utils::check(v.extent(0) == nnr_aug, "Error: Dimension mismatch");
       for(int is=0; is<nspin; is++)
         svloc.local()(is,0,all) = v();
       // to Hartree
@@ -409,8 +409,8 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
   mpi->comm.all_reduce_in_place_n(&nnodes,1,mpi3::max<>{});
 
   // local potential
-  svloc = sarray_t<nda::array_view<ComplexType,3>>(*mpi,{nspin,(spinorbit_loc?npol*npol:1),nnr});
-  svsc = sarray_t<nda::array_view<ComplexType,3>>(*mpi,{nspin,npol*npol,nnr});
+  svloc = sarray_t<nda::array_view<ComplexType,3>>(*mpi,{nspin,(spinorbit_loc?npol*npol:1),nnr_aug});
+  svsc = sarray_t<nda::array_view<ComplexType,3>>(*mpi,{nspin,npol*npol,nnr_aug});
   if(mpi->comm.root()) {
     int ngm;
     h5::h5_read_attribute(grp,"ngm",ngm);
@@ -436,8 +436,8 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
     // vsc
     { 
       auto vr = svsc.local();
-      auto vr2d = nda::reshape(vr,std::array<long,2>{nspin*npol*npol,nnr});
-      auto v4D = nda::reshape(vr,std::array<long,4>{nspin*npol*npol,fft_mesh(0),fft_mesh(1),fft_mesh(2)});
+      auto vr2d = nda::reshape(vr,std::array<long,2>{nspin*npol*npol,nnr_aug});
+      auto v4D = nda::reshape(vr,std::array<long,4>{nspin*npol*npol,fft_mesh_aug(0),fft_mesh_aug(1),fft_mesh_aug(2)});
       math::nda::fft<true> F(v4D);
 
       nda::array<ComplexType,3> vl(nspin, npol*npol, ngm); 
@@ -452,8 +452,8 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
     // vloc
     if(spinorbit_loc) {
       auto vr = svloc.local();
-      auto vr2d = nda::reshape(vr,std::array<long,2>{nspin*npol*npol,nnr});
-      auto v4D = nda::reshape(vr,std::array<long,4>{nspin*npol*npol,fft_mesh(0),fft_mesh(1),fft_mesh(2)});
+      auto vr2d = nda::reshape(vr,std::array<long,2>{nspin*npol*npol,nnr_aug});
+      auto v4D = nda::reshape(vr,std::array<long,4>{nspin*npol*npol,fft_mesh_aug(0),fft_mesh_aug(1),fft_mesh_aug(2)});
       math::nda::fft<true> F(v4D);
 
       nda::array<ComplexType,3> vl(nspin, npol*npol, ngm); 
@@ -467,8 +467,8 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
       F.backward(v4D);
     } else {
       auto vr = svloc.local();
-      auto vr2d = nda::reshape(vr,std::array<long,2>{nspin,nnr});
-      auto v4D = nda::reshape(vr,std::array<long,4>{nspin, fft_mesh(0),fft_mesh(1),fft_mesh(2)});
+      auto vr2d = nda::reshape(vr,std::array<long,2>{nspin,nnr_aug});
+      auto v4D = nda::reshape(vr,std::array<long,4>{nspin, fft_mesh_aug(0),fft_mesh_aug(1),fft_mesh_aug(2)});
       math::nda::fft<true> F(v4D);
 
       nda::array<ComplexType,1> vl_(ngm); 
@@ -937,7 +937,7 @@ void pseudopot::save(std::string fname, bool append)
     APP_ABORT("Failed to open h5 file: {}, mode:{}",fname,mode);
   }
   h5::group grp(file);
-  pseudopot_to_h5(fft_mesh,grp,input_file_name,input_file_type);
+  pseudopot_to_h5(fft_mesh_aug,grp,input_file_name,input_file_type);
 }
 
 // This should only be called by a single task
@@ -945,7 +945,7 @@ void pseudopot::save(std::string fname, bool append)
 void pseudopot::save(h5::group& grp0)
 {
   if(ptype == pp_FILE_t) return; 
-  pseudopot_to_h5(fft_mesh,grp0,input_file_name,input_file_type);
+  pseudopot_to_h5(fft_mesh_aug,grp0,input_file_name,input_file_type);
 }
 
 void pseudopot::add_vnl_impl(nda::range k_range, nda::range b_range, 
@@ -1069,7 +1069,7 @@ void pseudopot::add_vpp_impl(boost::mpi3::communicator& comm,
     auto mpi_local_context = utils::make_mpi_context(comm); 
 
     // local pseudopotential + hartree
-    sarray_t<nda::array_view<ComplexType,1>> svr(mpi_local_context,{nnr}); 
+    sarray_t<nda::array_view<ComplexType,1>> svr(mpi_local_context,{nnr_aug});
     auto vr = svr.local();
     auto vltot = svloc.local();
 
@@ -1082,11 +1082,11 @@ void pseudopot::add_vpp_impl(boost::mpi3::communicator& comm,
     // compensation-charge augmentation Σ_a Σ_IJ becsum_aIJ Q^IJ_nt(G) e^{-iG·τ_a}.
     // For NCPP, v_h_paw is a transparent passthrough.
     if( nii != nullptr)
-      hamilt::paw::v_h_paw(*mpi, vG, *this, npol, fft_mesh, lattv, recv,
+      hamilt::paw::v_h_paw(*mpi, vG, *this, npol, fft_mesh_aug, lattv, recv,
                   swfc_to_rho.local(), kpts, kp_to_ibz,
                   kp_trev, kp_symm, symm_list, *nii, psi, false, svr);
     else
-      hamilt::paw::v_h_paw(*mpi, vG, *this, npol, fft_mesh, lattv, recv,
+      hamilt::paw::v_h_paw(*mpi, vG, *this, npol, fft_mesh_aug, lattv, recv,
                   swfc_to_rho.local(), kpts, kp_to_ibz,
                   kp_trev, kp_symm, symm_list, *nij, psi, false, svr);
 
@@ -1103,7 +1103,7 @@ void pseudopot::add_vpp_impl(boost::mpi3::communicator& comm,
     mpi->node_comm.barrier();
 
     // local potential
-    hamilt::add_vloc(npol,fft_mesh,swfc_to_rho.local(),vltot,psi,hpsi);
+    hamilt::add_vloc(npol,fft_mesh_aug,swfc_to_rho.local(),vltot,psi,hpsi);
 
     mpi->node_comm.barrier();
     // restore vltot (remove vr) 
@@ -1120,7 +1120,7 @@ void pseudopot::add_vpp_impl(boost::mpi3::communicator& comm,
 
     // local potential
     auto vltot = svloc.local();
-    hamilt::add_vloc(npol,fft_mesh,swfc_to_rho.local(),vltot,psi,hpsi);
+    hamilt::add_vloc(npol,fft_mesh_aug,swfc_to_rho.local(),vltot,psi,hpsi);
 
   }
 
@@ -1258,7 +1258,7 @@ void pseudopot::add_Hartree_impl(nda::range k_range,
   utils::check(k_range_loc.first() >= 0 and
                k_range_loc.last()  <= nkpts_ibz, "Range mismatch.");
 
-  auto sv_hartree = make_shared_array<nda::array_view<ComplexType, 1>>(*mpi, {nnr});
+  auto sv_hartree = make_shared_array<nda::array_view<ComplexType, 1>>(*mpi, {nnr_aug});
   auto v_hartree = sv_hartree.local();
 
   // MAM: this must be passed to the routine
@@ -1272,16 +1272,16 @@ void pseudopot::add_Hartree_impl(nda::range k_range,
   // PAW compensation-charge augmentation in G-space; for NCPP it's a
   // transparent passthrough.
   if (nii != nullptr)
-    hamilt::paw::v_h_paw(*mpi, vG, *this, npol, fft_mesh, lattv, recv,
+    hamilt::paw::v_h_paw(*mpi, vG, *this, npol, fft_mesh_aug, lattv, recv,
                 swfc_to_rho.local(), kpts, kp_to_ibz,
                 kp_trev, kp_symm, symm_list, *nii, psi, symmetrize, sv_hartree);
   else
-    hamilt::paw::v_h_paw(*mpi, vG, *this, npol, fft_mesh, lattv, recv,
+    hamilt::paw::v_h_paw(*mpi, vG, *this, npol, fft_mesh_aug, lattv, recv,
                 swfc_to_rho.local(), kpts, kp_to_ibz,
                 kp_trev, kp_symm, symm_list, *nij, psi, symmetrize, sv_hartree);
 
   // add v_hartree to hpsi
-  hamilt::add_vloc(npol, fft_mesh, swfc_to_rho.local(), v_hartree, psi, hpsi);
+  hamilt::add_vloc(npol, fft_mesh_aug, swfc_to_rho.local(), v_hartree, psi, hpsi);
 
 }
 
