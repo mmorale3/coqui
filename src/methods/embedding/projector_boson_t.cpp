@@ -86,7 +86,6 @@ namespace methods {
     nda::array<ComplexType, 2> Cfull_jb(_MF->nbnd(), nImpOrbs);
     nda::array<ComplexType, 2> tmp_ib(_MF->nbnd(), nImpOrbs);
 
-    using math::sparse::T;
     using math::sparse::csrmm;
     sB_qIPab.win().fence();
     for (size_t iq=mpi->comm.rank(); iq<nqpts; iq+=mpi->comm.size()) {
@@ -110,10 +109,10 @@ namespace methods {
             Cfull_jb() = 0.0;
             if(not cjg) {
               Cfull_jb(W_rng[I], nda::range::all) = nda::conj(nda::transpose(C_skIai(is, ik, I, nda::ellipsis{})));
-              csrmm(ComplexType(1.0), *D_ij, Cfull_jb, ComplexType(0.0), tmp_ib);
+              csrmm<'N'>(ComplexType(1.0), *D_ij, Cfull_jb, ComplexType(0.0), tmp_ib);
             } else {
               Cfull_jb(W_rng[I], nda::range::all) = nda::transpose(C_skIai(is, ik, I, nda::ellipsis{}));
-              csrmm(ComplexType(1.0), *D_ij, Cfull_jb, ComplexType(0.0), tmp_ib);
+              csrmm<'N'>(ComplexType(1.0), *D_ij, Cfull_jb, ComplexType(0.0), tmp_ib);
               tmp_ib = nda::conj(tmp_ib);
             }
             // X_Pi * tmp_ib = TskI_Pb

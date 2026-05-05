@@ -297,9 +297,7 @@ namespace methods {
 
           _Timer.start("SIGMA_MULTIPLY_DMAT_K");
           if (!minus_t or it_global != nt_half-1) { // to avoid double counting at it_global == nt_half-1
-            using math::sparse::T;                                    // when nt is an odd number
-            using math::sparse::H;
-            using math::sparse::csrmm;
+            using math::sparse::csrmm;                                // when nt is an odd number
             for (long isk=t_intra_comm.rank(); isk<ns*nkpts_ibz; isk+=t_intra_comm.size()) {
               long is = isk / nkpts_ibz;
               long ik = isk % nkpts_ibz;
@@ -310,10 +308,10 @@ namespace methods {
                 auto [cjg,D] = MF->symmetry_rotation(isym,ik);
                 utils::check(not cjg, "Oh oh.");
                 // Sigma_tskij = sum_ab conj(d[isym,k](a,i)) * Sigma_tskab * d[isym,k](b,j)
-                csrmm(ComplexType(1.0),H(*D),sSigma_tskab.local()(tpool_id,is,ik,all,all),
-                      ComplexType(0.0),Tm);
-                csrmm(ComplexType(1.0),T(*D),nda::transpose(Tm),
-                      ComplexType(1.0),nda::transpose(sSigma_tskij.local()(it_global,is,ik,all,all)));
+                csrmm<'H'>(ComplexType(1.0),*D,sSigma_tskab.local()(tpool_id,is,ik,all,all),
+                           ComplexType(0.0),Tm);
+                csrmm<'T'>(ComplexType(1.0),*D,nda::transpose(Tm),
+                           ComplexType(1.0),nda::transpose(sSigma_tskij.local()(it_global,is,ik,all,all)));
               }
             }
           }
