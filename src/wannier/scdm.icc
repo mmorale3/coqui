@@ -182,7 +182,9 @@ auto scdm(utils::mpi_context_t<mpi3::communicator> &mpi, mf::MF &mf, ptree const
   nda::array<long,1> k2g(wfc_g->size());
   nda::array<ComplexType,1> *Xft = nullptr;
   long isp = 0;
-  auto rho_g = grids::truncated_g_grid( mf.ecutrho(), mf.fft_grid_dim(), mf.recv() );
+  // ecutrho lives on the dense (dfftp / aug) grid; for NCPP this matches
+  // mf.fft_grid_dim() identically.
+  auto rho_g = grids::truncated_g_grid( mf.ecutrho(), mf.fft_grid_dim_aug(), mf.recv() );
   auto mesh = rho_g.mesh();
   long nnr = mesh(0)*mesh(1)*mesh(2);
 
