@@ -279,7 +279,7 @@ compute_Pskna_full_bz(
     nda::ArrayOfRank<1> auto const& kp_symm,          // (nkpts)
     nda::ArrayOfRank<1> auto const& kp_trev,          // (nkpts)
     nda::ArrayOfRank<2> auto const& kpts_cart,        // (nkpts, 3)
-    std::vector<utils::symm_op> const& symm_list,
+    [[maybe_unused]] std::vector<utils::symm_op> const& symm_list,
     nda::ArrayOfRank<2> auto const& atom_perm_inv,    // (nsym, nat)
     std::vector<nda::array<double, 3>> const& wigner_d,
     int npol,
@@ -289,7 +289,6 @@ compute_Pskna_full_bz(
 
     auto Pskna_ibz = psp.Pskna_view();
     long nspin     = Pskna_ibz.extent(0);
-    long nkpts_ibz = Pskna_ibz.extent(1);
     long nkb_pol   = Pskna_ibz.extent(2);
     long nbnd      = Pskna_ibz.extent(3);
     long nkpts     = kp_to_ibz.extent(0);
@@ -298,6 +297,7 @@ compute_Pskna_full_bz(
     auto const& nh_v = psp.nh_view();
     auto const& ofs  = psp.ofs_view();
     auto const& sps  = psp.paw_species_view();
+    auto const& tau  = psp.atom_pos_cart_view();   // (nat, 3) cartesian (Bohr)
     long nat = ityp.extent(0);
 
     auto Pkfull = math::shm::make_shared_array<nda::array_view<ComplexType, 4>>(
@@ -331,6 +331,23 @@ compute_Pskna_full_bz(
                     long p0_dst = ofs(ib)     * npol;
                     long p0_src = ofs(ia_src) * npol;
 
+                    // Bloch phase from the lattice translation L = R^{-1}·τ_ib − τ_ia
+                    // that brings R·τ_ia back into the unit cell:
+                    //     phase = (xk_full · τ_ib) ∓ (xk_ibz · τ_ia)   (− no-trev, + trev)
+                    // (mirrors QE's becp_rotate_k in PW/src/us_exx.f90:1031,
+                    //  with kpts in cartesian inverse-Bohr so no 2π factor).
+                    double phase = 0.0;
+                    for (int d = 0; d < 3; ++d)
+                        phase += kpts_cart(k_full, d) * tau(ib, d);
+                    if (trev) {
+                        for (int d = 0; d < 3; ++d)
+                            phase += kpts_cart(k_ibz, d) * tau(ia_src, d);
+                    } else {
+                        for (int d = 0; d < 3; ++d)
+                            phase -= kpts_cart(k_ibz, d) * tau(ia_src, d);
+                    }
+                    ComplexType tau_fact = std::exp(ComplexType(0.0, phase));
+
                     // For each destination projector channel I (with l, m_dst),
                     // sum over source J of the same (n, l) at the source atom.
                     for (int I = 0; I < nh_a; ++I) {
@@ -350,13 +367,14 @@ compute_Pskna_full_bz(
                             double D = wigner_d[l_I](m_dst, m_src, R_idx);
                             if (D == 0.0) continue;
 
+                            ComplexType D_phase = tau_fact * ComplexType(D);
                             for (int sigma = 0; sigma < npol; ++sigma)
                                 for (long n = 0; n < nbnd; ++n) {
                                     ComplexType c_src =
                                         Pskna_ibz(s, k_ibz, p0_src + J*npol + sigma, n);
                                     if (trev) c_src = std::conj(c_src);
                                     Pdst(s, k_full, p0_dst + I*npol + sigma, n)
-                                        += ComplexType(D) * c_src;
+                                        += D_phase * c_src;
                                 }
                         }
                     }
