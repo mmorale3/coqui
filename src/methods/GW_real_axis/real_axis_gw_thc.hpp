@@ -50,9 +50,9 @@ void evaluate_thc_serial(real_axis_mb_state_t & state,
                          bool verbose = false,
                          bool use_rspace = false)
 {
-  static_assert(MEM == HOST_MEMORY,
-                "evaluate_thc_serial<DEVICE>: device path not yet supported "
-                "in the underlying solver classes.");
+  // Both real_axis_scr_coulomb_t and real_axis_gw_t classes run on host
+  // (state arrays are sArrays / dArrays<HOST_MEMORY>); MEM is a template
+  // marker for callers that template their pipeline uniformly.
   utils::check(state.grid != nullptr,
                "evaluate_thc_serial: state.grid not bound");
   utils::check(state.mpi != nullptr,

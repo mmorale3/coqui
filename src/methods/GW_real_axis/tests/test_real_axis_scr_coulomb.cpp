@@ -212,6 +212,74 @@ namespace bdft_tests {
   // both code paths within NUFFT tolerance. Mirrors the
   // real_axis_thc_g0w0_lih222_kspace_vs_rspace test for the W stage.
   // ===========================================================================
+  // ===========================================================================
+  // MEM=DEVICE_MEMORY instantiation. Gated on ENABLE_DEVICE because nda's
+  // address-space validation rejects Device allocations when the project
+  // is compiled without GPU support. On Rusty with ENABLE_DEVICE this
+  // exercises the real device path; the test asserts agreement between
+  // HOST and DEVICE instantiations of update_w on the same fixture to
+  // NUFFT eps.
+  // ===========================================================================
+#if defined(ENABLE_DEVICE)
+  TEST_CASE("real_axis_scr_coulomb_update_w_lih222_host_vs_device",
+            "[real_axis][scr_coulomb][thc][device]") {
+    auto& mpi_context = utils::make_unit_test_mpi_context();
+
+    auto mf = std::make_shared<mf::MF>(
+                  mf::default_MF(mpi_context, "qe_lih222"));
+    const int nIpts = mf->nbnd() * 8;
+    thc_reader_t thc(mf, make_thc_reader_ptree(nIpts, "", "incore", "",
+                                               "bdft", 1e-8,
+                                               mf->ecutrho(), 1, 1024));
+
+    auto p = derive_grid_params(mf);
+    auto grid_h = real_freq_grid_t::make_uniform(
+                    p.beta, p.mu0, p.w_max, p.N_w,
+                    p.Omega_max, p.N_Omega, p.N_t, p.T_window);
+    auto grid_d = real_freq_grid_t::make_uniform(
+                    p.beta, p.mu0, p.w_max, p.N_w,
+                    p.Omega_max, p.N_Omega, p.N_t, p.T_window);
+    real_axis_mb_state_t state_h(grid_h), state_d(grid_d);
+    state_h.mpi = mpi_context;
+    state_d.mpi = mpi_context;
+    fill_lorentzian_A(mf, grid_h, state_h);
+    fill_lorentzian_A(mf, grid_d, state_d);
+
+    methods::real_axis::real_axis_scr_coulomb_base_t<HOST_MEMORY>
+        scr_h(&grid_h, "rpa", "ignore_g0", 1e-8);
+    methods::real_axis::real_axis_scr_coulomb_base_t<DEVICE_MEMORY>
+        scr_d(&grid_d, "rpa", "ignore_g0", 1e-8);
+    scr_h.update_w(state_h, thc, /*verbose*/ false, /*use_rspace*/ true);
+    scr_d.update_w(state_d, thc, /*verbose*/ false, /*use_rspace*/ true);
+
+    auto ImPi_h_loc = state_h.ImPi_qPQO->local();
+    auto ImPi_d_loc = state_d.ImPi_qPQO->local();
+    auto ImW_h_loc  = state_h.ImW_qPQO->local();
+    auto ImW_d_loc  = state_d.ImW_qPQO->local();
+    auto ReW_h_loc  = state_h.ReW_qPQO->local();
+    auto ReW_d_loc  = state_d.ReW_qPQO->local();
+
+    double max_diff_Pi = 0.0;
+    double max_diff_W  = 0.0;
+    const long size = ImPi_h_loc.size();
+    for (long i = 0; i < size; ++i) {
+      max_diff_Pi = std::max(max_diff_Pi,
+                              std::abs(ImPi_h_loc.data()[i] - ImPi_d_loc.data()[i]));
+      max_diff_W  = std::max(max_diff_W,
+                              std::abs(ImW_h_loc.data()[i] - ImW_d_loc.data()[i]));
+      max_diff_W  = std::max(max_diff_W,
+                              std::abs(ReW_h_loc.data()[i] - ReW_d_loc.data()[i]));
+    }
+    app_log(2, "[scr_coulomb host_vs_device] max diff ImPi = {:.3e}", max_diff_Pi);
+    app_log(2, "[scr_coulomb host_vs_device] max diff W    = {:.3e}", max_diff_W);
+    // For MEM=DEVICE on a build without ENABLE_DEVICE, this should be 0
+    // (same host code path). With ENABLE_DEVICE it tests the device path
+    // against host to NUFFT eps. Use a generous tolerance.
+    REQUIRE(max_diff_Pi < 1e-7);
+    REQUIRE(max_diff_W  < 1e-7);
+  }
+#endif // ENABLE_DEVICE
+
   TEST_CASE("real_axis_scr_coulomb_update_w_lih222_kspace_vs_rspace",
             "[real_axis][scr_coulomb][thc][rspace]") {
     auto& mpi_context = utils::make_unit_test_mpi_context();

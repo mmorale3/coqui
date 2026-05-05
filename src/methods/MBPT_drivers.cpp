@@ -349,6 +349,18 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
                 "Cholesky is not supported in the real-axis pipeline.");
     }
 
+  } else if (solver_type == "real_axis_qpgw") {
+
+    // Real-axis QP-SCF (QSGW or evGW), THC-only. The `mode` ptree key
+    // selects qsgw / evgw. niter==1 with mode=evgw is real-axis G0W0-QP.
+    using corr_t = typename decltype(eri.corr_eri)::value_type::type;
+    if constexpr (THC_ERI<corr_t>) {
+      real_axis::run_real_axis_qpgw(eri.corr_eri->get(), pt);
+    } else {
+      APP_ABORT("mbpt: real_axis_qpgw requires a THC interaction; "
+                "Cholesky is not supported in the real-axis pipeline.");
+    }
+
   } else
     APP_ABORT("mbpt: Unknown solver type: {}",solver_type);
 }

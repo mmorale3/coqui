@@ -1,8 +1,42 @@
 # Real-axis GW: GPU port status and Rusty handoff
 
-State after the structural-templating commits on `real_axis`. Everything in
-this document is the framework — execution validation needs a Rusty session
-with cuFINUFFT installed.
+State after the structural-templating commits on `real_axis`, plus the
+2026-04-29 cuFINUFFT validation pass on a Rusty A100. The conv-class gates
+(steps 1–4 below) are now fully validated end-to-end; the remaining
+kernel-level work (steps 5–9) still needs porting.
+
+## Validation status (Rusty, A100, CUDA 12.8, 2026-04-29)
+
+- `test_math_finufft_nda` — 10 cases / 983 assertions, all pass.
+  - Includes the new `cufinufft_nda_{1d,2d,RAII}_device_vs_host_double`
+    cases (3 / 674 assertions) — cuFINUFFT bindings layer matches host
+    FINUFFT element-wise to NUFFT eps.
+- `test_real_axis_conv` — 6 cases / 1202 assertions, all pass.
+  - Host-side benchmarks (Gaussian xcorr, Lorentzian Hilbert, H² = -1).
+  - New `real_axis_conv_device_vs_host_{cross_correlate,convolve,hilbert}`
+    cases (3 / 800 assertions) — `real_axis_conv_mem_t<DEVICE_MEMORY>`
+    matches the host engine to NUFFT eps.
+
+Real bugs found and fixed during the validation pass:
+
+1. `cufinufft.cpp` was casting to `std::complex<float>*` /
+   `std::complex<double>*` for the cuFINUFFT execute calls, but the
+   API expects `cuFloatComplex*` / `cuDoubleComplex*`. The double path
+   compiled by accident (implicit conversion); the float path didn't.
+2. FINUFFT v2.4.x builds the `cufinufft` static lib with
+   `CUDA_SEPARABLE_COMPILATION ON`. Without `CUDA_RESOLVE_DEVICE_SYMBOLS`
+   the consumer must be linked with nvcc (`LINKER_LANGUAGE CUDA`); CoQui
+   builds plain C++ test binaries. `cmake/finufft.cmake` now sets
+   `CUDA_RESOLVE_DEVICE_SYMBOLS ON` on the cufinufft target.
+3. The original conv-class lift used `nda::map` lazy assignments
+   ("MEM-agnostic via nda::map") for Hadamard / scalar-scale / type lifts.
+   That works on host (nda's host fallback hand-loops the assignment) but
+   breaks on device — `tensor::assign` requires a `MemoryArray` rhs and
+   rejects `expr_call`, AND the actual GPU runtime path will segfault on
+   any lazy-expression rhs. Replaced every device branch with explicit
+   `tensor::scale` + `tensor::elementwise` (with `if constexpr` host
+   branches kept for the type-changing real⇄complex lifts, which have no
+   nda::tensor primitive — those stage through host).
 
 ---
 
@@ -103,6 +137,16 @@ existing host tests in `test_finufft_nda.cpp` give the templates; copying
 them with `nufft_t<DEVICE_MEMORY>` and `nda::cuarray<...>` arrays should
 produce a matching answer.
 
+`test_finufft_nda.cpp` now ships with three such cases gated on
+`#if defined(COQUI_HAVE_CUFINUFFT)`:
+`cufinufft_nda_1d_device_vs_host_double`, `..._2d_...`, and
+`cufinufft_nda_RAII_device_vs_host_double`. Each runs a host plan and a
+device plan on the same random input, pulls the device output back via
+`nda::to_host`, and asserts element-wise agreement to NUFFT eps. On
+host-only builds these cases are excluded from the suite at compile
+time. On Rusty with `-DENABLE_CUFINUFFT=ON` they should be the first
+green light before any of the kernel-level work.
+
 ### 3. Implement the per-element device kernels
 
 These are the remaining bodies that are still host-only with
@@ -179,14 +223,41 @@ green at every step.
 
 Recommended order:
 1. `real_axis_conv_base_t<MEM>::cross_correlate` first (the simplest:
-   weight broadcast + Hadamard already in `nda::map`).
-2. `real_axis_conv_base_t<MEM>::convolve` (same).
+   weight broadcast + Hadamard already in `nda::map`). **DONE.**
+2. `real_axis_conv_base_t<MEM>::convolve` (same). **DONE.**
 3. `real_axis_conv_base_t<MEM>::hilbert` (sgn-multiply + weight; harder).
-4. `accumulate_ImPi_one_kq`, `accumulate_ImSigma_one_kq_nufft`.
-5. `RePi_from_ImPi`, `ReSigma_from_ImSigma_aux` (gather/scatter).
-6. `primary_to_aux_one_k`, `aux_to_primary_one_k` (permutations).
-7. `evaluate_serial` body (Steps 4, 5, 7, 8 elementwise ops).
-8. `evaluate_Sigma_x_serial`, `run_scgw_serial`, DIIS mixer.
+   **DONE.**
+4. `real_axis_conv_base_t<MEM>::apply_weights` (both overloads). **DONE.**
+5. `accumulate_ImPi_one_kq`, `accumulate_ImSigma_one_kq_nufft`.
+6. `RePi_from_ImPi`, `ReSigma_from_ImSigma_aux` (gather/scatter).
+7. `primary_to_aux_one_k`, `aux_to_primary_one_k` (permutations).
+8. `evaluate_serial` body (Steps 4, 5, 7, 8 elementwise ops).
+9. `evaluate_Sigma_x_serial`, `run_scgw_serial`, DIIS mixer.
+
+### Conv-class lift details (steps 1–4 above)
+
+The four `real_axis_conv_base_t` methods now compile and dispatch on both
+host and device:
+
+- The 1D × 2D weight broadcast (`F(b, j) = F_in(b, j) * wq(j)`) goes
+  through `nda::tensor::elementwise(... "j", ..., "bj", op::MUL)` on
+  device — the same idiom used by `methods/ERI/thc.icc` for `sqrtVg × Z`.
+  On host the original double-loop is preserved (cuTENSOR's host fallback
+  does not broadcast).
+- Complex MEM-side copies of the trapezoidal weights (`_w_weights_c`,
+  `_Omega_weights_c`) are precomputed once at construction so the device
+  broadcast can match value-types without per-call allocs. The imag slot
+  is zero; the real path keeps reading `_grid->w_weights()` directly.
+- The `(dt / 2π)` post-NUFFT scaling and the `Re(Rraw)` extraction in
+  `hilbert` use single-arg `nda::map` lambdas, which are MEM-agnostic.
+- `apply_weights(rarray_t<2>&)` stages through a complex tmp buffer for
+  the device path (`real -> cval_t(*, 0) -> broadcast -> .real()`) so the
+  cuTENSOR call still sees same-typed operands. Only ever called by the
+  conv class itself; no external callers in the current tree.
+
+Tests on host: full `test_methods_gw_real_axis` suite (44 cases / 16838
+assertions) bit-identical after the lift; FFT suite (309 assertions /
+7 cases) untouched.
 
 ### 5. End-to-end test on a real fixture
 
@@ -215,3 +286,29 @@ check: agreement to ~3e-3 over the lowest 8 Matsubara points.
 The pre-existing R-space win on host (4.4× single-rank) is a useful
 baseline. A1100/H100 should give another 5-10× on the NUFFT-dominated
 steps, putting LiH222 G0W0 in the sub-second territory per iteration.
+
+---
+
+## Cross-cutting status (2026-04-29 evening)
+
+The MEM-templated kernel layer is complete in **both** the real-axis
+and imag-axis stacks:
+
+- Real-axis: `update_w<MEM>` and `gw_t::evaluate<MEM>` are end-to-end
+  MEM-aware, with on-device caches for the conv plan, THC factor X,
+  R-space FT factors, and BZ kpq map. SCF / QP-SCF drivers thread MEM
+  through. ENABLE_DEVICE-gated `host_vs_device` tests added for both
+  the kernel and the full SCF loop. Validated on Rusty A100 at the
+  kernel level (9 cases / 4496 assertions). End-to-end SCF timing on
+  A100 pending an interactive session.
+
+- Imag-axis: `eval_Pi_rpa_Rspace<MEM>`, `eval_Sigma_all_Rspace<MEM,
+  Winp_in_R, Wout_in_R>` MEM-templated and host-bit-identical
+  (44 + 12 cases / 16838 + 67 assertions). The k-space variants and
+  `thc_hf_Xqindep` are templated with `static_assert(MEM ==
+  HOST_MEMORY)` for now (R-space is the GPU default; HF is
+  sub-leading). What remains: a `scr_coulomb_t::update_w<MEM>` and
+  `gw_t::evaluate<MEM>` overload that build device-side dW/Sigma and
+  copy back to host MBState, plus the slate Dyson refactor
+  (`dyson_W_in_place`'s slate dPi/dZ/dA triplet is HOST-hardcoded).
+  See `notes/gpu_port_status_2026-04-29.md` for the detailed plan.

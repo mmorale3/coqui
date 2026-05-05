@@ -70,11 +70,6 @@ inline void evaluate_Sigma_x_serial(
     memory::array<MEM, ComplexType, 4>       & Sigma_x_skij,
     long iq_gamma = -1)
 {
-  static_assert(MEM == HOST_MEMORY,
-                "evaluate_Sigma_x_serial<DEVICE>: device-side allocation is "
-                "MEM-aware but the inner element-wise loops over (s, k, q, "
-                "P, Q, w) (Sigma_x = -V * n_aux) are still host-only. The "
-                "Hadamard product is a single nda::map call once devicified.");
   const long ns    = A_skwij.shape()[0];
   const long Nk    = A_skwij.shape()[1];
   const long N_w   = A_skwij.shape()[2];
@@ -92,6 +87,32 @@ inline void evaluate_Sigma_x_serial(
                "evaluate_Sigma_x_serial: Sigma_x shape mismatch");
   utils::check(N_w == grid.N_w(),
                "evaluate_Sigma_x_serial: A N_w != grid.N_w()");
+
+  // Static exchange isn't on the inner SCF hot path (called once per
+  // iteration, dominated by O(s*k*q*Naux^2) work). On device we stage the
+  // whole kernel through host: pull A/X/V to host, run the host body,
+  // push Sigma_x back. The inner kernels (primary_to_aux_one_k,
+  // aux_to_primary_one_k) used by the host body are themselves MEM-aware
+  // -- but staging here is simpler and avoids a per-(s, k, q) Hadamard
+  // pattern that would need a large (s, k, q, P, Q) staging tensor.
+  if constexpr (MEM != HOST_MEMORY) {
+    auto A_h = nda::to_host(A_skwij);
+    auto pull_to_host = []<typename T>(T const& t) {
+      if constexpr (::nda::mem::on_host<std::decay_t<T>>) {
+        return t;
+      } else {
+        return nda::to_host(t);
+      }
+    };
+    auto X_h = pull_to_host(X_skPmu);
+    auto V_h = pull_to_host(V_qPQ);
+    nda::array<ComplexType, 4> Sigma_x_h(Sigma_x_skij.shape());
+    Sigma_x_h = ComplexType(0.0, 0.0);
+    evaluate_Sigma_x_serial<HOST_MEMORY>(comm, grid, A_h, X_h, V_h,
+                                         kmq_to_kp, Sigma_x_h, iq_gamma);
+    Sigma_x_skij = Sigma_x_h;
+    return;
+  }
 
   // Step 1: orbital-basis density matrix n_{munu}(k) = int dw f(w) A_{munu}(k, w).
   nda::array<ComplexType, 4> n_skij(ns, Nk, nbnd, nbnd);

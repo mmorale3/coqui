@@ -14,6 +14,7 @@
 
 #include "configuration.hpp"
 #include "nda/nda.hpp"
+#include "nda/tensor.hpp"
 #include "utilities/check.hpp"
 #include "methods/GW_real_axis/real_freq_grid.hpp"
 #include "methods/GW_real_axis/real_axis_conv.hpp"
@@ -32,26 +33,22 @@ namespace real_axis {
  * @param B_PQ_O   (Naux, Naux, N_Omega)  bosonic spectral function on Omega>=0
  * @param B_PQ_w   OUTPUT (Naux, Naux, N_w) bosonic function resampled on w
  */
+// Host implementation of the resampling. Only safe for arrays whose
+// data() lives on the host -- the binary search + per-(P,Q,iw) elementwise
+// indexing has no clean device primitive.
 template <typename BIn, typename BOut>
-inline void resample_bosonic_to_fermionic(real_freq_grid_t const& grid,
-                                          BIn  const& B_PQ_O,
-                                          BOut      & B_PQ_w)
+inline void resample_bosonic_to_fermionic_host(real_freq_grid_t const& grid,
+                                               BIn  const& B_PQ_O,
+                                               BOut      & B_PQ_w)
 {
-  const long Naux = B_PQ_O.shape()[0];
+  const long Naux_P = B_PQ_O.shape()[0];
+  const long Naux_Q = B_PQ_O.shape()[1];
   const long N_w  = grid.N_w();
-  utils::check(B_PQ_O.shape()[1] == Naux,
-               "resample_bosonic_to_fermionic: B not square in (P,Q)");
-  utils::check(B_PQ_O.shape()[2] == grid.N_Omega(),
-               "resample_bosonic_to_fermionic: bosonic length mismatch");
-  utils::check(B_PQ_w.shape()[0] == Naux and B_PQ_w.shape()[1] == Naux and
-               B_PQ_w.shape()[2] == N_w,
-               "resample_bosonic_to_fermionic: output shape mismatch");
-
   auto const& Og = grid.Omega();
   const long N_O = Og.shape()[0];
 
-  for (long P = 0; P < Naux; ++P)
-    for (long Q = 0; Q < Naux; ++Q)
+  for (long P = 0; P < Naux_P; ++P)
+    for (long Q = 0; Q < Naux_Q; ++Q)
       for (long iw = 0; iw < N_w; ++iw) {
         const double w_l = grid.w()(iw);
         const double sign = (w_l >= 0.0 ? 1.0 : -1.0);
@@ -70,6 +67,34 @@ inline void resample_bosonic_to_fermionic(real_freq_grid_t const& grid,
         }
         B_PQ_w(P, Q, iw) = sign * v;
       }
+}
+
+/// MEM-aware wrapper around resample_bosonic_to_fermionic_host. For device
+/// inputs we stage through host (the binary-search + diagonal-odd extension
+/// has no device primitive; the per-call cost is O(Naux^2 * N_w) memcpy +
+/// O(Naux^2 * N_w * log N_O) host work, both small relative to the NUFFT).
+template <typename BIn, typename BOut>
+inline void resample_bosonic_to_fermionic(real_freq_grid_t const& grid,
+                                          BIn  const& B_PQ_O,
+                                          BOut      & B_PQ_w)
+{
+  const long Naux_P = B_PQ_O.shape()[0];
+  const long Naux_Q = B_PQ_O.shape()[1];
+  const long N_w  = grid.N_w();
+  utils::check(B_PQ_O.shape()[2] == grid.N_Omega(),
+               "resample_bosonic_to_fermionic: bosonic length mismatch");
+  utils::check(B_PQ_w.shape()[0] == Naux_P and B_PQ_w.shape()[1] == Naux_Q and
+               B_PQ_w.shape()[2] == N_w,
+               "resample_bosonic_to_fermionic: output shape mismatch");
+
+  if constexpr (::nda::mem::on_host<BIn> and ::nda::mem::on_host<BOut>) {
+    resample_bosonic_to_fermionic_host(grid, B_PQ_O, B_PQ_w);
+  } else {
+    auto B_PQ_O_h = nda::to_host(B_PQ_O);
+    nda::array<ComplexType, 3> B_PQ_w_h(Naux_P, Naux_Q, N_w);
+    resample_bosonic_to_fermionic_host(grid, B_PQ_O_h, B_PQ_w_h);
+    B_PQ_w = B_PQ_w_h;  // host -> device copy via nda assignment
+  }
 }
 
 /**
@@ -93,84 +118,139 @@ inline void accumulate_ImSigma_one_kq_nufft(
     SOut      & ImSigma_PQ_w,
     double q_weight)
 {
-  if constexpr (MEM != HOST_MEMORY) {
-    utils::check(false,
-                 "accumulate_ImSigma_one_kq_nufft<DEVICE>: device kernels "
-                 "for the inner f / n_B weighting and Sigma accumulation "
-                 "are not yet implemented.");
-    return;
-  }
-  const long Naux = A_PQ_kmq.shape()[0];
-  const long N_w  = A_PQ_kmq.shape()[2];
-  const long B    = Naux * Naux;
+  const long Naux_P = A_PQ_kmq.shape()[0];
+  const long Naux_Q = A_PQ_kmq.shape()[1];
+  const long N_w    = A_PQ_kmq.shape()[2];
+  const long B      = Naux_P * Naux_Q;
 
   utils::check(B <= conv.ntrans(),
                "accumulate_ImSigma_one_kq_nufft: ntrans={} too small (need {})",
                conv.ntrans(), B);
 
   auto const& grid = conv.grid();
-  auto const& wq   = grid.w_weights();
+  auto const& wq_h = grid.w_weights();
   const long N_t   = conv.N_t();
 
-  // Resample B onto the fermionic grid (with diagonal odd extension).
-  nda::array<ComplexType, 3> B_PQ_w(Naux, Naux, N_w);
+  // Resample B onto the fermionic grid (with diagonal odd extension). The
+  // resampler dispatches on memory space: host inputs run in place, device
+  // inputs stage through host.
+  memory::array<MEM, ComplexType, 3> B_PQ_w(Naux_P, Naux_Q, N_w);
   resample_bosonic_to_fermionic(grid, B_PQ_q, B_PQ_w);
 
-  // Pre-multiply A by f(eps) -> F1, resampled B by n_B(w) -> G2 (the
-  // n_B factor handles the singular Omega=0 limit using
-  //   lim_{O -> 0} n_B(O) * B(O) = b_1 / beta
-  // via the linear extrapolation already applied to B in the resampler:
-  // for |w| < Omega_min, B is linear in w. We evaluate n_B(w) for w != 0
-  // and set the product to 0 at w=0 (the surrounding integration weights
-  // make that point negligible).
-  // The trapezoidal quadrature weights are absorbed into F1, F2, G1, G2
-  // here so the lower-level NUFFT primitives can run unweighted.
-  nda::array<ComplexType, 2> F1(B, N_w), G1(B, N_w);
-  nda::array<ComplexType, 2> F2(B, N_w), G2(B, N_w);
-  for (long P = 0; P < Naux; ++P)
-    for (long Q = 0; Q < Naux; ++Q) {
-      const long b = P * Naux + Q;
-      for (long iw = 0; iw < N_w; ++iw) {
-        const double w_l = grid.w()(iw);
-        const double f_w = grid.fermi(w_l);
-        const double q_j = wq(iw);
-        F1(b, iw) = q_j * f_w * A_PQ_kmq(P, Q, iw);
-        G1(b, iw) = q_j * B_PQ_w(P, Q, iw);
-        F2(b, iw) = q_j * A_PQ_kmq(P, Q, iw);
-        double nB_w = 0.0;
-        if (std::abs(w_l) > 1e-12) nB_w = grid.bose(w_l);
-        G2(b, iw) = q_j * nB_w * B_PQ_w(P, Q, iw);
+  // Build the four time-space inputs:
+  //   F1(b, iw) = wq*f(w)         * A_kmq(P, Q, iw)
+  //   F2(b, iw) = wq              * A_kmq(P, Q, iw)
+  //   G1(b, iw) = wq              * B_w(P, Q, iw)
+  //   G2(b, iw) = wq*n_B(w)       * B_w(P, Q, iw)   (with n_B(0)*B(0) = 0)
+  // The trapezoidal quadrature weights are absorbed into F1/F2/G1/G2 here
+  // so the lower-level NUFFT primitives can run unweighted.
+  memory::array<MEM, ComplexType, 2> F1(B, N_w), G1(B, N_w);
+  memory::array<MEM, ComplexType, 2> F2(B, N_w), G2(B, N_w);
+
+  if constexpr (MEM == HOST_MEMORY) {
+    for (long P = 0; P < Naux_P; ++P)
+      for (long Q = 0; Q < Naux_Q; ++Q) {
+        const long b = P * Naux_Q + Q;
+        for (long iw = 0; iw < N_w; ++iw) {
+          const double w_l = grid.w()(iw);
+          const double f_w = grid.fermi(w_l);
+          const double q_j = wq_h(iw);
+          F1(b, iw) = q_j * f_w * A_PQ_kmq(P, Q, iw);
+          G1(b, iw) = q_j * B_PQ_w(P, Q, iw);
+          F2(b, iw) = q_j * A_PQ_kmq(P, Q, iw);
+          double nB_w = 0.0;
+          if (std::abs(w_l) > 1e-12) nB_w = grid.bose(w_l);
+          G2(b, iw) = q_j * nB_w * B_PQ_w(P, Q, iw);
+        }
       }
+  } else {
+    // Device: build the four 1D weight vectors on host (small) and push.
+    nda::array<ComplexType, 1> wq_c_h(N_w), wq_f_h(N_w), wq_nB_h(N_w);
+    for (long iw = 0; iw < N_w; ++iw) {
+      const double w_l = grid.w()(iw);
+      const double q_j = wq_h(iw);
+      wq_c_h(iw)  = ComplexType(q_j, 0.0);
+      wq_f_h(iw)  = ComplexType(q_j * grid.fermi(w_l), 0.0);
+      const double nB_w = (std::abs(w_l) > 1e-12) ? grid.bose(w_l) : 0.0;
+      wq_nB_h(iw) = ComplexType(q_j * nB_w, 0.0);
     }
+    auto wq_c  = memory::to_memory_space<MEM>(wq_c_h);
+    auto wq_f  = memory::to_memory_space<MEM>(wq_f_h);
+    auto wq_nB = memory::to_memory_space<MEM>(wq_nB_h);
+
+    auto A_2D = nda::reshape(A_PQ_kmq, std::array<long,2>{B, N_w});
+    auto B_2D = nda::reshape(B_PQ_w,   std::array<long,2>{B, N_w});
+
+    F1 = A_2D;  F2 = A_2D;  G1 = B_2D;  G2 = B_2D;
+    nda::tensor::elementwise(ComplexType(1.0), wq_f,  std::string_view("j"),
+                             ComplexType(1.0), F1, std::string_view("bj"),
+                             nda::tensor::op::MUL);
+    nda::tensor::elementwise(ComplexType(1.0), wq_c,  std::string_view("j"),
+                             ComplexType(1.0), F2, std::string_view("bj"),
+                             nda::tensor::op::MUL);
+    nda::tensor::elementwise(ComplexType(1.0), wq_c,  std::string_view("j"),
+                             ComplexType(1.0), G1, std::string_view("bj"),
+                             nda::tensor::op::MUL);
+    nda::tensor::elementwise(ComplexType(1.0), wq_nB, std::string_view("j"),
+                             ComplexType(1.0), G2, std::string_view("bj"),
+                             nda::tensor::op::MUL);
+  }
 
   // Im Sigma ~ convolve(F1, G1) + convolve(F2, G2). Compute each pair's
   // Hhat in time space, sum (no conjugates for convolve), then a single
   // type-2 NUFFT. Saves one type-2 per call vs two convolve calls.
   using gk = grid_kind;
-  nda::array<ComplexType, 2> F1hat(B, N_t), G1hat(B, N_t);
-  nda::array<ComplexType, 2> F2hat(B, N_t), G2hat(B, N_t);
+  memory::array<MEM, ComplexType, 2> F1hat(B, N_t), G1hat(B, N_t);
+  memory::array<MEM, ComplexType, 2> F2hat(B, N_t), G2hat(B, N_t);
   conv.forward(F1, F1hat, gk::fermionic);
   conv.forward(G1, G1hat, gk::fermionic);
   conv.forward(F2, F2hat, gk::fermionic);
   conv.forward(G2, G2hat, gk::fermionic);
 
-  // Sigma Hadamard kernel: 4-ary elementwise map (host/device-agnostic).
+  // Sigma Hadamard:  Hhat = F1*G1 + F2*G2 (no conjugates).
   memory::array<MEM, ComplexType, 2> Hhat(B, N_t);
-  Hhat = nda::map([](ComplexType f1, ComplexType g1,
-                     ComplexType f2, ComplexType g2) {
-    return f1 * g1 + f2 * g2;
-  })(F1hat, G1hat, F2hat, G2hat);
+  if constexpr (MEM == HOST_MEMORY) {
+    Hhat = nda::map([](ComplexType f1, ComplexType g1,
+                       ComplexType f2, ComplexType g2) {
+      return f1 * g1 + f2 * g2;
+    })(F1hat, G1hat, F2hat, G2hat);
+  } else {
+    memory::array<MEM, ComplexType, 2> tmp(B, N_t);
+    // Hhat = F1 * G1
+    Hhat = F1hat;
+    nda::tensor::elementwise(ComplexType(1.0), G1hat, std::string_view("bk"),
+                             ComplexType(1.0), Hhat,  std::string_view("bk"),
+                             nda::tensor::op::MUL);
+    // tmp = F2 * G2
+    tmp = F2hat;
+    nda::tensor::elementwise(ComplexType(1.0), G2hat, std::string_view("bk"),
+                             ComplexType(1.0), tmp,   std::string_view("bk"),
+                             nda::tensor::op::MUL);
+    // Hhat += tmp
+    nda::tensor::elementwise(ComplexType(1.0), tmp,  std::string_view("bk"),
+                             ComplexType(1.0), Hhat, std::string_view("bk"),
+                             nda::tensor::op::SUM);
+  }
 
-  nda::array<ComplexType, 2> Hraw(B, N_w);
+  memory::array<MEM, ComplexType, 2> Hraw(B, N_w);
   conv.backward(Hhat, Hraw, gk::fermionic);
   const double s_nufft = conv.nufft_scale();
   const double s_sig   = -M_PI * q_weight * s_nufft;
-  for (long P = 0; P < Naux; ++P)
-    for (long Q = 0; Q < Naux; ++Q) {
-      const long b = P * Naux + Q;
-      for (long iw = 0; iw < N_w; ++iw)
-        ImSigma_PQ_w(P, Q, iw) += s_sig * Hraw(b, iw);
-    }
+
+  if constexpr (MEM == HOST_MEMORY) {
+    for (long P = 0; P < Naux_P; ++P)
+      for (long Q = 0; Q < Naux_Q; ++Q) {
+        const long b = P * Naux_Q + Q;
+        for (long iw = 0; iw < N_w; ++iw)
+          ImSigma_PQ_w(P, Q, iw) += s_sig * Hraw(b, iw);
+      }
+  } else {
+    auto Hraw_3D = nda::reshape(Hraw,
+                                std::array<long,3>{Naux_P, Naux_Q, N_w});
+    nda::tensor::elementwise(ComplexType(s_sig), Hraw_3D,      std::string_view("PQw"),
+                             ComplexType(1.0),   ImSigma_PQ_w, std::string_view("PQw"),
+                             nda::tensor::op::SUM);
+  }
 }
 
 /**
@@ -209,23 +289,15 @@ inline void accumulate_ImSigma_one_kq(detail::real_axis_conv_base_t<MEM> & conv,
                                       SOut      & ImSigma_PQ_w,
                                       double q_weight)
 {
-  if constexpr (MEM != HOST_MEMORY) {
-    utils::check(false,
-                 "accumulate_ImSigma_one_kq<DEVICE>: device kernel for the "
-                 "direct-quadrature implementation not yet implemented "
-                 "(prefer the NUFFT variant on device).");
-    return;
-  }
-  const long Naux = A_PQ_kmq.shape()[0];
-  const long N_w  = A_PQ_kmq.shape()[2];
-  const long N_O  = B_PQ_q.shape()[2];
+  const long Naux_P = A_PQ_kmq.shape()[0];
+  const long Naux_Q = A_PQ_kmq.shape()[1];
+  const long N_w    = A_PQ_kmq.shape()[2];
+  const long N_O    = B_PQ_q.shape()[2];
 
-  utils::check(A_PQ_kmq.shape()[1] == Naux,
-               "accumulate_ImSigma_one_kq: A not square in (P,Q)");
-  utils::check(B_PQ_q.shape()[0] == Naux and B_PQ_q.shape()[1] == Naux,
+  utils::check(B_PQ_q.shape()[0] == Naux_P and B_PQ_q.shape()[1] == Naux_Q,
                "accumulate_ImSigma_one_kq: B shape mismatch");
-  utils::check(ImSigma_PQ_w.shape()[0] == Naux and
-               ImSigma_PQ_w.shape()[1] == Naux and
+  utils::check(ImSigma_PQ_w.shape()[0] == Naux_P and
+               ImSigma_PQ_w.shape()[1] == Naux_Q and
                ImSigma_PQ_w.shape()[2] == N_w,
                "accumulate_ImSigma_one_kq: ImSigma shape mismatch");
   utils::check(N_w == conv.N_w() and N_O == conv.N_Omega(),
@@ -234,6 +306,27 @@ inline void accumulate_ImSigma_one_kq(detail::real_axis_conv_base_t<MEM> & conv,
   auto const& grid = conv.grid();
   auto const& w_grid = grid.w();
   auto const& w_wts  = grid.w_weights();
+
+  // Direct quadrature is the slow path (NUFFT variant is preferred). On
+  // device we stage the whole kernel through host: the per-(P, Q, l, j)
+  // binary search + scalar n_B / fermi evaluations have no clean device
+  // primitive, and this routine is used mainly as a regression reference.
+  if constexpr (MEM != HOST_MEMORY) {
+    auto A_h     = nda::to_host(A_PQ_kmq);
+    auto B_h     = nda::to_host(B_PQ_q);
+    nda::array<ComplexType, 3> ImSigma_h = nda::to_host(ImSigma_PQ_w);
+
+    // Need a host conv with the same grid; the direct-quadrature kernel
+    // doesn't actually use the NUFFT plans, only conv.grid(), so a transient
+    // host view is enough. We synthesize one inline.
+    detail::real_axis_conv_base_t<HOST_MEMORY> conv_h(conv.grid(),
+                                                      /*ntrans*/ 1,
+                                                      /*eps*/ 1e-10);
+    accumulate_ImSigma_one_kq<HOST_MEMORY>(conv_h, A_h, B_h, ImSigma_h, q_weight);
+
+    ImSigma_PQ_w = ImSigma_h;
+    return;
+  }
 
   // Helper: linear interpolation of B_{P,Q}(Omega) on the bosonic grid
   // (Omega>=0) extended to Omega<0 via odd-extension on the diagonal and
@@ -259,11 +352,11 @@ inline void accumulate_ImSigma_one_kq(detail::real_axis_conv_base_t<MEM> & conv,
     return sign * v;
   };
 
-  // Per (P, Q) scalar convolution. O(Naux^2 * N_w^2) per (k, q) — direct
-  // quadrature; the NUFFT-accelerated version becomes available once a
-  // generic real-axis convolve primitive (no conjugate) is added.
-  for (long P = 0; P < Naux; ++P)
-    for (long Q = 0; Q < Naux; ++Q)
+  // Per (P, Q) scalar convolution. O(Naux_P * Naux_Q * N_w^2) per (k, q) —
+  // direct quadrature; the NUFFT-accelerated version becomes available once
+  // a generic real-axis convolve primitive (no conjugate) is added.
+  for (long P = 0; P < Naux_P; ++P)
+    for (long Q = 0; Q < Naux_Q; ++Q)
       for (long l = 0; l < N_w; ++l) {
         const double w_l = w_grid(l);
         ComplexType acc(0.0, 0.0);
@@ -306,32 +399,52 @@ inline void ReSigma_from_ImSigma_aux(detail::real_axis_conv_base_t<MEM> & conv,
                                      AIn  const& ImSigma_PQ_w,
                                      AOut      & ReSigma_PQ_w)
 {
-  if constexpr (MEM != HOST_MEMORY) {
-    utils::check(false,
-                 "ReSigma_from_ImSigma_aux<DEVICE>: device kernel for the "
-                 "(P,Q) <-> batch gather/scatter not yet implemented.");
-    return;
-  }
-  const long Naux = ImSigma_PQ_w.shape()[0];
-  const long N_w  = ImSigma_PQ_w.shape()[2];
-  const long B = Naux * Naux;
+  const long Naux_P = ImSigma_PQ_w.shape()[0];
+  const long Naux_Q = ImSigma_PQ_w.shape()[1];
+  const long N_w    = ImSigma_PQ_w.shape()[2];
+  const long B = Naux_P * Naux_Q;
 
   memory::array<MEM, double, 2> ImBuf(B, N_w), ReBuf(B, N_w);
-  for (long P = 0; P < Naux; ++P)
-    for (long Q = 0; Q < Naux; ++Q) {
-      const long b = P * Naux + Q;
-      for (long l = 0; l < N_w; ++l)
-        ImBuf(b, l) = ImSigma_PQ_w(P, Q, l).real();
-    }
+
+  if constexpr (MEM == HOST_MEMORY) {
+    for (long P = 0; P < Naux_P; ++P)
+      for (long Q = 0; Q < Naux_Q; ++Q) {
+        const long b = P * Naux_Q + Q;
+        for (long l = 0; l < N_w; ++l)
+          ImBuf(b, l) = ImSigma_PQ_w(P, Q, l).real();
+      }
+  } else {
+    // Device: complex -> real lift via to_real_view + strided copy. The
+    // input is reinterpreted as a (..., 2) real array; the last axis at
+    // index 0 is the real slot. nda assignment between same-MEM strided
+    // memory views is a device memcpy.
+    auto Im_complex_as_real = memory::to_real_view(ImSigma_PQ_w);
+    auto ImBuf_3D = nda::reshape(ImBuf,
+                                 std::array<long,3>{Naux_P, Naux_Q, N_w});
+    ImBuf_3D = Im_complex_as_real(nda::range::all, nda::range::all,
+                                  nda::range::all, 0);
+  }
 
   conv.hilbert(ImBuf, ReBuf, grid_kind::fermionic);
 
-  for (long P = 0; P < Naux; ++P)
-    for (long Q = 0; Q < Naux; ++Q) {
-      const long b = P * Naux + Q;
-      for (long l = 0; l < N_w; ++l)
-        ReSigma_PQ_w(P, Q, l) = ComplexType(ReBuf(b, l), 0.0);
-    }
+  if constexpr (MEM == HOST_MEMORY) {
+    for (long P = 0; P < Naux_P; ++P)
+      for (long Q = 0; Q < Naux_Q; ++Q) {
+        const long b = P * Naux_Q + Q;
+        for (long l = 0; l < N_w; ++l)
+          ReSigma_PQ_w(P, Q, l) = ComplexType(ReBuf(b, l), 0.0);
+      }
+  } else {
+    // Device: real -> complex lift via to_real_view: zero the destination
+    // first (sets imag=0), then copy ReBuf into the real slot via a
+    // strided view assignment.
+    nda::tensor::scale(ComplexType(0.0, 0.0), ReSigma_PQ_w);
+    auto Re_complex_as_real = memory::to_real_view(ReSigma_PQ_w);
+    auto ReBuf_3D = nda::reshape(ReBuf,
+                                 std::array<long,3>{Naux_P, Naux_Q, N_w});
+    Re_complex_as_real(nda::range::all, nda::range::all,
+                       nda::range::all, 0) = ReBuf_3D;
+  }
 }
 
 } // namespace real_axis

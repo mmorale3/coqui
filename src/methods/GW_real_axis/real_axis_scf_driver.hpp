@@ -100,9 +100,14 @@ inline scgw_result real_axis_scf_loop(real_axis_mb_state_t& state,
                                        nda::array<double, 1> const& k_weights,
                                        double N_elec)
 {
-  static_assert(MEM == HOST_MEMORY,
-                "real_axis_scf_loop<DEVICE>: device path not yet supported "
-                "in the underlying solver classes / Dyson update / mixer.");
+  // The state lives on host (sArrays / dArrays<HOST_MEMORY>) so MEM is a
+  // template marker for this driver. The underlying solver classes
+  // (real_axis_dyson_t, real_axis_scr_coulomb_t, real_axis_gw_t,
+  // real_axis_hf_t) all have host bodies; their MEM template parameters
+  // are no-ops or device-delegating wrappers. Phase-2 device acceleration
+  // would push specific kernels (Pi cross-correlation, Hilbert) onto the
+  // device via the already-MEM-aware accumulate_ImPi_one_kq /
+  // RePi_from_ImPi / primary_to_aux_one_k routines.
   utils::check(state.grid != nullptr,
                "real_axis_scf_loop: state.grid not bound");
   utils::check(state.grid == &dyson.grid(),
@@ -201,15 +206,16 @@ inline scgw_result real_axis_scf_loop(real_axis_mb_state_t& state,
   for (long it = 0; it < cfg.max_iter; ++it) {
     // ---- 1. update W (scr_coulomb) ----
     mb_solver.scr_eri->update_w(state, thc,
-                                /*verbose*/ false, use_rspace);
+                                cfg.verbose, use_rspace);
 
     // ---- 2. Sigma^c (gw) ----
     // Forward the divergence treatment from scr_coulomb so the head
     // correction in gw_t::evaluate sees the same setting that produced
-    // state.eps_inv_head_O.
-    mb_solver.gw->evaluate(state, thc, cfg.eps_nufft,
-                           mb_solver.scr_eri->div_treatment(),
-                           /*verbose*/ false, use_rspace);
+    // state.eps_inv_head_O. Thread MEM through so MEM=DEVICE_MEMORY
+    // routes the GW work to device.
+    mb_solver.gw->template evaluate<MEM>(state, thc, cfg.eps_nufft,
+                                          mb_solver.scr_eri->div_treatment(),
+                                          cfg.verbose, use_rspace);
 
     // Causality projection on Im Sigma_c (skwij layout). Write only on
     // node-root, then node_sync.

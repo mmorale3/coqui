@@ -15,6 +15,7 @@
 #include "nda/nda.hpp"
 #include "methods/GW_real_axis/real_freq_grid.hpp"
 #include "methods/GW_real_axis/real_axis_conv.hpp"
+#include "utilities/test_common.hpp"
 
 #include <cmath>
 #include <complex>
@@ -178,5 +179,143 @@ TEST_CASE("real_axis_conv_hilbert_squared_negates", "[real_axis][conv]")
   }
   REQUIRE(n_pass > (90 * n_checked) / 100);
 }
+
+// =============================================================================
+// Device-vs-host: exercise the cross_correlate / convolve / hilbert paths on
+// the device backend (real_axis_conv_mem_t<DEVICE_MEMORY>) and require
+// element-wise agreement with the host result. Gated on COQUI_HAVE_CUFINUFFT
+// (which subsumes ENABLE_DEVICE / nda::cuarray availability) -- on host-only
+// builds these cases are excluded at compile time.
+//
+// This is the end-to-end check on the lifted static_asserts in conv.hpp:
+//   * weight broadcast (1D × 2D) via nda::tensor::elementwise on cuTENSOR
+//   * forward / backward NUFFT via cuFINUFFT plan
+//   * Hadamard / sgn-multiply via nda::map (MEM-agnostic)
+//   * (dt / 2π) scalar scale via nda::map
+//   * real()-extraction in hilbert via nda::map
+// =============================================================================
+#if defined(COQUI_HAVE_CUFINUFFT)
+
+namespace {
+
+template<methods::real_axis::grid_kind SrcKind,
+         methods::real_axis::grid_kind DstKind>
+void run_cross_correlate_devhost(real_freq_grid_t const& grid, long B)
+{
+  using namespace methods::real_axis;
+  const long N_src = (SrcKind == grid_kind::fermionic ? grid.N_w() : grid.N_Omega());
+  const long N_dst = (DstKind == grid_kind::fermionic ? grid.N_w() : grid.N_Omega());
+
+  nda::array<cval_t,2> F_h(B, N_src), G_h(B, N_src), H_h(B, N_dst);
+  utils::fillRandomArray(F_h);
+  utils::fillRandomArray(G_h);
+
+  detail::real_axis_conv_base_t<HOST_MEMORY> conv_h(grid, B, 1e-10);
+  conv_h.cross_correlate(F_h, G_h, H_h, SrcKind, DstKind);
+
+  auto F_d = memory::to_memory_space<DEVICE_MEMORY>(F_h);
+  auto G_d = memory::to_memory_space<DEVICE_MEMORY>(G_h);
+  memory::array<DEVICE_MEMORY, cval_t, 2> H_d(B, N_dst);
+  detail::real_axis_conv_base_t<DEVICE_MEMORY> conv_d(grid, B, 1e-10);
+  conv_d.cross_correlate(F_d, G_d, H_d, SrcKind, DstKind);
+
+  auto H_d_h = nda::to_host(H_d);
+  for (long b = 0; b < B; ++b)
+    for (long l = 0; l < N_dst; ++l)
+      REQUIRE(std::abs(H_h(b, l) - H_d_h(b, l)) < 1e-6);
+}
+
+void run_convolve_devhost(real_freq_grid_t const& grid, long B,
+                          methods::real_axis::grid_kind kind)
+{
+  using namespace methods::real_axis;
+  const long N = (kind == grid_kind::fermionic ? grid.N_w() : grid.N_Omega());
+
+  nda::array<cval_t,2> F_h(B, N), G_h(B, N), H_h(B, N);
+  utils::fillRandomArray(F_h);
+  utils::fillRandomArray(G_h);
+
+  detail::real_axis_conv_base_t<HOST_MEMORY> conv_h(grid, B, 1e-10);
+  conv_h.convolve(F_h, G_h, H_h, kind);
+
+  auto F_d = memory::to_memory_space<DEVICE_MEMORY>(F_h);
+  auto G_d = memory::to_memory_space<DEVICE_MEMORY>(G_h);
+  memory::array<DEVICE_MEMORY, cval_t, 2> H_d(B, N);
+  detail::real_axis_conv_base_t<DEVICE_MEMORY> conv_d(grid, B, 1e-10);
+  conv_d.convolve(F_d, G_d, H_d, kind);
+
+  auto H_d_h = nda::to_host(H_d);
+  for (long b = 0; b < B; ++b)
+    for (long l = 0; l < N; ++l)
+      REQUIRE(std::abs(H_h(b, l) - H_d_h(b, l)) < 1e-6);
+}
+
+void run_hilbert_devhost(real_freq_grid_t const& grid, long B,
+                         methods::real_axis::grid_kind kind)
+{
+  using namespace methods::real_axis;
+  const long N = (kind == grid_kind::fermionic ? grid.N_w() : grid.N_Omega());
+
+  nda::array<double,2> ImX_h(B, N), ReX_h(B, N);
+  utils::fillRandomArray(ImX_h);
+
+  detail::real_axis_conv_base_t<HOST_MEMORY> conv_h(grid, B, 1e-10);
+  conv_h.hilbert(ImX_h, ReX_h, kind);
+
+  auto ImX_d = memory::to_memory_space<DEVICE_MEMORY>(ImX_h);
+  memory::array<DEVICE_MEMORY, double, 2> ReX_d(B, N);
+  detail::real_axis_conv_base_t<DEVICE_MEMORY> conv_d(grid, B, 1e-10);
+  conv_d.hilbert(ImX_d, ReX_d, kind);
+
+  auto ReX_d_h = nda::to_host(ReX_d);
+  for (long b = 0; b < B; ++b)
+    for (long j = 0; j < N; ++j)
+      REQUIRE(std::abs(ReX_h(b, j) - ReX_d_h(b, j)) < 1e-6);
+}
+
+} // anonymous namespace
+
+TEST_CASE("real_axis_conv_device_vs_host_cross_correlate", "[real_axis][conv][device]")
+{
+  using methods::real_axis::grid_kind;
+  // Modest grid -- the goal is to validate the wiring, not the physics.
+  const double w_max = 8.0;
+  const long N_w = 64, N_Omega = 32, N_t = 128;
+  const double Omega_max = 4.0, T_window = 16.0;
+  auto grid = real_freq_grid_t::make_uniform(
+      /*beta*/ 50.0, /*mu*/ 0.0, w_max, N_w, Omega_max, N_Omega, N_t, T_window);
+
+  // Two batch sizes: 1 (single transform) and 4 (batched).
+  run_cross_correlate_devhost<grid_kind::fermionic, grid_kind::bosonic>(grid, 1);
+  run_cross_correlate_devhost<grid_kind::fermionic, grid_kind::bosonic>(grid, 4);
+}
+
+TEST_CASE("real_axis_conv_device_vs_host_convolve", "[real_axis][conv][device]")
+{
+  using methods::real_axis::grid_kind;
+  const double w_max = 8.0;
+  const long N_w = 64, N_Omega = 32, N_t = 128;
+  const double Omega_max = 4.0, T_window = 16.0;
+  auto grid = real_freq_grid_t::make_uniform(
+      50.0, 0.0, w_max, N_w, Omega_max, N_Omega, N_t, T_window);
+
+  run_convolve_devhost(grid, 1, grid_kind::fermionic);
+  run_convolve_devhost(grid, 4, grid_kind::fermionic);
+}
+
+TEST_CASE("real_axis_conv_device_vs_host_hilbert", "[real_axis][conv][device]")
+{
+  using methods::real_axis::grid_kind;
+  const double w_max = 8.0;
+  const long N_w = 64, N_Omega = 32, N_t = 128;
+  const double Omega_max = 4.0, T_window = 16.0;
+  auto grid = real_freq_grid_t::make_uniform(
+      50.0, 0.0, w_max, N_w, Omega_max, N_Omega, N_t, T_window);
+
+  run_hilbert_devhost(grid, 1, grid_kind::fermionic);
+  run_hilbert_devhost(grid, 4, grid_kind::fermionic);
+}
+
+#endif // COQUI_HAVE_CUFINUFFT
 
 } // namespace gw_real_axis_tests

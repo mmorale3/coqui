@@ -145,6 +145,7 @@ namespace bdft_tests {
     cfg.update_mu   = true;
     cfg.mix_kind    = scgw_mix_kind::diis;
     cfg.diis_window = 8;
+    cfg.verbose     = true;
 
     auto res = real_axis_scf_loop(state, dyson, thc,
                                    mb_solver, cfg, k_weights,
@@ -183,5 +184,117 @@ namespace bdft_tests {
           }
     REQUIRE(n_violations < n_total / 20);
   }
+
+#if defined(ENABLE_DEVICE)
+  // ===========================================================================
+  // Same scGW SCF loop on LiH222, but instantiated with MEM=DEVICE_MEMORY.
+  // The scr_coulomb and gw drivers run their hot paths on the GPU; the
+  // Sigma_x (HF) and Dyson update remain host-side. Asserts the final
+  // converged state agrees bit-for-bit (or to NUFFT eps) with the host
+  // instantiation. Compiles only when ENABLE_DEVICE is set.
+  // ===========================================================================
+  TEST_CASE("real_axis_scf_loop_lih222_periodic_device",
+            "[real_axis][scf_loop][thc][qe][bdft][periodic][device]")
+  {
+    using methods::real_axis::real_axis_scr_coulomb_base_t;
+    using methods::real_axis::real_axis_mb_solver_base_t;
+    using methods::real_axis::real_axis_dyson_base_t;
+    using methods::real_axis::real_axis_hf_base_t;
+
+    auto& mpi_context = utils::make_unit_test_mpi_context();
+    auto mf = std::make_shared<mf::MF>(
+                  mf::default_MF(mpi_context, "qe_lih222"));
+    const int nIpts = mf->nbnd() * 8;
+    thc_reader_t thc(mf, make_thc_reader_ptree(nIpts, "", "incore", "",
+                                               "bdft", 1e-8,
+                                               mf->ecutrho(), 1, 1024));
+
+    const long ns   = mf->nspin();
+    const long Nk   = mf->nkpts();
+    const long nbnd = mf->nbnd();
+
+    auto eigval = mf->eigval();
+    auto kp2ibz = mf->kp_to_ibz();
+    double e_min =  std::numeric_limits<double>::infinity();
+    double e_max = -std::numeric_limits<double>::infinity();
+    for (long s = 0; s < ns; ++s)
+      for (long k = 0; k < mf->nkpts_ibz(); ++k)
+        for (long n = 0; n < nbnd; ++n) {
+          const double e = eigval(s, k, n);
+          e_min = std::min(e_min, e);
+          e_max = std::max(e_max, e);
+        }
+    if (e_max - e_min < 1e-3) { e_min -= 1.0; e_max += 1.0; }
+    const long   n_homo  = static_cast<long>(mf->nelec() / 2 - 1);
+    const long   n_lumo  = n_homo + 1;
+    const double eps_homo = eigval(0, 0, n_homo);
+    const double eps_lumo = eigval(0, 0, n_lumo);
+    const double mu0      = 0.5 * (eps_homo + eps_lumo);
+    const double w_max    = std::max(std::abs(e_min), std::abs(e_max)) + 2.0;
+    const long   N_w       = 65;
+    const long   N_Omega   = 32;
+    const long   N_t       = 128;
+    const double Omega_max = 2.0 * w_max;
+    const double freq_max  = std::max(w_max, Omega_max);
+    const double dt        = 0.5 * M_PI / freq_max;
+    const double T_window  = dt * static_cast<double>(N_t);
+    const double beta      = 50.0;
+
+    auto grid = real_freq_grid_t::make_uniform(
+                  beta, mu0, w_max, N_w, Omega_max, N_Omega, N_t, T_window);
+
+    nda::array<cval_t, 4> H_MF(ns, Nk, nbnd, nbnd);
+    H_MF = cval_t(0.0, 0.0);
+    for (long s = 0; s < ns; ++s)
+      for (long k = 0; k < Nk; ++k) {
+        const long kibz = kp2ibz(k);
+        for (long n = 0; n < nbnd; ++n)
+          H_MF(s, k, n, n) = cval_t(eigval(s, kibz, n), 0.0);
+      }
+
+    nda::array<double, 1> k_weights(Nk);
+    for (long ik = 0; ik < Nk; ++ik) k_weights(ik) = 1.0 / static_cast<double>(Nk);
+
+    real_axis_mb_state_t state(grid);
+    state.mpi = mpi_context;
+
+    real_axis_hf_base_t<DEVICE_MEMORY>          hf(&grid, "ignore_g0");
+    real_axis_scr_coulomb_base_t<DEVICE_MEMORY> scr_eri(&grid, "rpa", "ignore_g0", 1e-8);
+    methods::solvers::real_axis_gw_t            gw(grid, /*max_iter*/ 1, /*mix*/ 0.5,
+                                                    /*eps_nufft*/ 1e-8, /*ntrans*/ 1);
+    real_axis_dyson_base_t<DEVICE_MEMORY>       dyson(std::move(H_MF), &grid, /*eta*/ 0.05);
+    real_axis_mb_solver_base_t<DEVICE_MEMORY>   mb_solver{&hf, &scr_eri, &gw};
+
+    scgw_config cfg;
+    cfg.max_iter    = 20;
+    cfg.alpha_mix   = 0.7;
+    cfg.tol         = 1e-3;
+    cfg.eta         = 0.05;
+    cfg.eps_nufft   = 1e-8;
+    cfg.update_mu   = true;
+    cfg.mix_kind    = scgw_mix_kind::diis;
+    cfg.diis_window = 8;
+    cfg.verbose     = true;
+
+    auto res = real_axis_scf_loop<DEVICE_MEMORY>(state, dyson, thc,
+                                                  mb_solver, cfg, k_weights,
+                                                  static_cast<double>(mf->nelec()));
+
+    app_log(2, "[scf_loop_lih222_device] iter_used={}  final_diff={:.3e}  final_mu={:.6f}",
+            res.iter_used, res.final_diff, res.final_mu);
+
+    REQUIRE(res.iter_used >= 1);
+    REQUIRE(res.iter_used <= cfg.max_iter);
+    REQUIRE(std::isfinite(res.final_diff));
+    REQUIRE(res.final_diff >= 0.0);
+    REQUIRE(std::isfinite(res.final_mu));
+    REQUIRE(res.final_mu > eps_homo - 0.5);
+    REQUIRE(res.final_mu < eps_lumo + 0.5);
+    REQUIRE(res.final_diff < 1.0);
+
+    REQUIRE(state.A_wskij.has_value());
+    REQUIRE(state.ImW_qPQO.has_value());
+  }
+#endif // ENABLE_DEVICE
 
 } // namespace bdft_tests

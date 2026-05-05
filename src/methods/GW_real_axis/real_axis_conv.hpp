@@ -16,6 +16,7 @@
 
 #include "configuration.hpp"
 #include "nda/nda.hpp"
+#include "nda/tensor.hpp"
 #include "utilities/check.hpp"
 #include "numerics/fft/finufft_define.hpp"
 #include "numerics/fft/finufft_nda.hpp"
@@ -152,6 +153,25 @@ public:
       _sgn_t = std::move(sgn_host);
     else
       _sgn_t = memory::to_memory_space<MEM>(sgn_host);
+
+    // Pre-build complex MEM-side copies of the trapezoidal quadrature
+    // weights. The device weight-broadcast uses
+    // `nda::tensor::elementwise(..., op::MUL)` which (via cuTENSOR) requires
+    // matched value-types; the imaginary slot stays zero. The host path
+    // continues to read the real-valued grid weights directly.
+    nda::array<cval_t, 1> wq_w_host(N_w);
+    for (long j = 0; j < N_w; ++j)
+      wq_w_host(j) = cval_t(grid.w_weights()(j), 0.0);
+    nda::array<cval_t, 1> wq_O_host(N_Omega);
+    for (long l = 0; l < N_Omega; ++l)
+      wq_O_host(l) = cval_t(grid.Omega_weights()(l), 0.0);
+    if constexpr (MEM == HOST_MEMORY) {
+      _w_weights_c     = std::move(wq_w_host);
+      _Omega_weights_c = std::move(wq_O_host);
+    } else {
+      _w_weights_c     = memory::to_memory_space<MEM>(wq_w_host);
+      _Omega_weights_c = memory::to_memory_space<MEM>(wq_O_host);
+    }
   }
 
   long N_t()      const { return _grid->N_t(); }
@@ -202,40 +222,60 @@ public:
     utils::check(B <= _ntrans,
                  "cross_correlate: B={} > ntrans={}", B, _ntrans);
 
-    if constexpr (MEM != HOST_MEMORY) {
-      // TODO: device kernels for weight application + Hadamard product.
-      // The host body below uses straight 2D loops; on device this becomes
-      // either a per-row gemv-style scaling + per-element conj()*mul, or a
-      // single fused kernel. The (cu)FINUFFT plan calls already work in
-      // both spaces.
-      utils::check(false,
-                   "real_axis_conv_base_t<DEVICE>::cross_correlate: device "
-                   "kernels for the inner Hadamard loops are not yet implemented.");
-    } else {
+    array_t<2> F(B, N_src), G(B, N_src);
+    if constexpr (MEM == HOST_MEMORY) {
       auto const& wq = (src == grid_kind::fermionic
                         ? _grid->w_weights() : _grid->Omega_weights());
-      array_t<2> F(B, N_src), G(B, N_src);
       for (long b = 0; b < B; ++b)
         for (long j = 0; j < N_src; ++j) {
           F(b, j) = F_in(b, j) * wq(j);
           G(b, j) = G_in(b, j) * wq(j);
         }
-
-      array_t<2> Fhat(B, N_t_);
-      array_t<2> Ghat(B, N_t_);
-      run_forward(F, Fhat, src, B);
-      run_forward(G, Ghat, src, B);
-
-      // 2-arg Hadamard, MEM-agnostic via nda::map.
-      array_t<2> Hhat(B, N_t_);
-      Hhat = nda::map([](cval_t f, cval_t g) { return std::conj(f) * g; })(Fhat, Ghat);
-
-      array_t<2> Hraw(B, N_dst);
-      run_backward(Hhat, Hraw, dst, B);
-
-      const double s = _grid->dt() / (2.0 * M_PI);
-      H = s * Hraw;
+    } else {
+      // Device: copy then 1D × 2D broadcast multiply via cuTENSOR.
+      auto const& wq_c = (src == grid_kind::fermionic
+                          ? _w_weights_c : _Omega_weights_c);
+      F = F_in;
+      G = G_in;
+      nda::tensor::elementwise(cval_t(1.0), wq_c, std::string_view("j"),
+                               cval_t(1.0), F, std::string_view("bj"),
+                               nda::tensor::op::MUL);
+      nda::tensor::elementwise(cval_t(1.0), wq_c, std::string_view("j"),
+                               cval_t(1.0), G, std::string_view("bj"),
+                               nda::tensor::op::MUL);
     }
+
+    array_t<2> Fhat(B, N_t_);
+    array_t<2> Ghat(B, N_t_);
+    run_forward(F, Fhat, src, B);
+    run_forward(G, Ghat, src, B);
+
+    // Hadamard Hhat = conj(F) * G. On host an nda::map lambda is the
+    // shortest path; on device, lazy expr_call is not a MemoryArray and
+    // assigning it routes through tensor::assign (which rejects expr_call).
+    // Plus the host fallback of tensor::elementwise strips conj(), so we
+    // can't simply use that for both. Branch.
+    array_t<2> Hhat(B, N_t_);
+    if constexpr (MEM == HOST_MEMORY) {
+      Hhat = nda::map([](cval_t f, cval_t g) { return std::conj(f) * g; })(Fhat, Ghat);
+    } else {
+      // Device: stage Hhat = conj(Fhat) via tensor::scale(op::CONJ),
+      // then in-place multiply by Ghat via tensor::elementwise(op::MUL).
+      Hhat = Fhat;
+      nda::tensor::scale(cval_t(1.0), Hhat, nda::tensor::op::CONJ);
+      nda::tensor::elementwise(cval_t(1.0), Ghat, std::string_view("bk"),
+                               cval_t(1.0), Hhat, std::string_view("bk"),
+                               nda::tensor::op::MUL);
+    }
+
+    array_t<2> Hraw(B, N_dst);
+    run_backward(Hhat, Hraw, dst, B);
+
+    // Final scaling H = (dt / 2π) Hraw -- in-place after copy is the only
+    // form that works for both host and device.
+    const double s = _grid->dt() / (2.0 * M_PI);
+    H = Hraw;
+    nda::tensor::scale(cval_t(s), H);
   }
 
   /**
@@ -269,33 +309,51 @@ public:
     utils::check(B <= _ntrans,
                  "convolve: B={} > ntrans={}", B, _ntrans);
 
-    if constexpr (MEM != HOST_MEMORY) {
-      utils::check(false,
-                   "real_axis_conv_base_t<DEVICE>::convolve: device kernels "
-                   "for the inner Hadamard loops are not yet implemented.");
-    } else {
+    array_t<2> F(B, N), G(B, N);
+    if constexpr (MEM == HOST_MEMORY) {
       auto const& wq = (kind == grid_kind::fermionic
                         ? _grid->w_weights() : _grid->Omega_weights());
-      array_t<2> F(B, N), G(B, N);
       for (long b = 0; b < B; ++b)
         for (long j = 0; j < N; ++j) {
           F(b, j) = F_in(b, j) * wq(j);
           G(b, j) = G_in(b, j) * wq(j);
         }
-
-      array_t<2> Fhat(B, N_t_), Ghat(B, N_t_);
-      run_forward(F, Fhat, kind, B);
-      run_forward(G, Ghat, kind, B);
-
-      // Convolution Hadamard: NO conjugate. MEM-agnostic via nda::map.
-      array_t<2> Hhat(B, N_t_);
-      Hhat = nda::map([](cval_t f, cval_t g) { return f * g; })(Fhat, Ghat);
-
-      array_t<2> Hraw(B, N);
-      run_backward(Hhat, Hraw, kind, B);
-      const double s = _grid->dt() / (2.0 * M_PI);
-      H = s * Hraw;
+    } else {
+      auto const& wq_c = (kind == grid_kind::fermionic
+                          ? _w_weights_c : _Omega_weights_c);
+      F = F_in;
+      G = G_in;
+      nda::tensor::elementwise(cval_t(1.0), wq_c, std::string_view("j"),
+                               cval_t(1.0), F, std::string_view("bj"),
+                               nda::tensor::op::MUL);
+      nda::tensor::elementwise(cval_t(1.0), wq_c, std::string_view("j"),
+                               cval_t(1.0), G, std::string_view("bj"),
+                               nda::tensor::op::MUL);
     }
+
+    array_t<2> Fhat(B, N_t_), Ghat(B, N_t_);
+    run_forward(F, Fhat, kind, B);
+    run_forward(G, Ghat, kind, B);
+
+    // Convolution Hadamard: Hhat = Fhat * Ghat (no conj). On host this is
+    // an nda::map lambda; on device, lazy expressions segfault, so we use
+    // tensor::elementwise(op::MUL) which works on both -- with no conj
+    // involved the host fallback is correct.
+    array_t<2> Hhat(B, N_t_);
+    if constexpr (MEM == HOST_MEMORY) {
+      Hhat = nda::map([](cval_t f, cval_t g) { return f * g; })(Fhat, Ghat);
+    } else {
+      Hhat = Fhat;
+      nda::tensor::elementwise(cval_t(1.0), Ghat, std::string_view("bk"),
+                               cval_t(1.0), Hhat, std::string_view("bk"),
+                               nda::tensor::op::MUL);
+    }
+
+    array_t<2> Hraw(B, N);
+    run_backward(Hhat, Hraw, kind, B);
+    const double s = _grid->dt() / (2.0 * M_PI);
+    H = Hraw;
+    nda::tensor::scale(cval_t(s), H);
   }
 
   /**
@@ -327,36 +385,58 @@ public:
     utils::check(ReX_w.shape()[0] == B and ReX_w.shape()[1] == N_grid,
                  "hilbert: ReX shape mismatch");
 
-    if constexpr (MEM != HOST_MEMORY) {
-      utils::check(false,
-                   "real_axis_conv_base_t<DEVICE>::hilbert: device kernels "
-                   "for the inner sgn(t)-multiply and weight-application "
-                   "loops are not yet implemented. _sgn_t is already in "
-                   "MEM-space, so the device port is mostly a single fused "
-                   "kernel: Hhat(b, k) = _sgn_t(k) * Chat(b, k).");
-    } else {
+    array_t<2> C(B, N_grid);
+    if constexpr (MEM == HOST_MEMORY) {
       auto const& wq = (kind == grid_kind::fermionic
                         ? _grid->w_weights() : _grid->Omega_weights());
-      array_t<2> C(B, N_grid);
       for (long b = 0; b < B; ++b)
         for (long j = 0; j < N_grid; ++j)
           C(b, j) = cval_t(ImX_in(b, j) * wq(j), 0.0);
+    } else {
+      // Device: real -> complex lift via to_real_view. Reinterpret the
+      // (B, N_grid) complex C as (B, N_grid, 2) real, zero everything,
+      // copy ImX into the real slot via a strided assignment.
+      nda::tensor::scale(cval_t(0.0, 0.0), C);
+      auto C_real_view = memory::to_real_view(C);
+      C_real_view(nda::range::all, nda::range::all, 0) = ImX_in;
 
-      array_t<2> Chat(B, N_t_);
-      run_forward(C, Chat, kind, B);
+      // Apply 1D × 2D weight broadcast on device.
+      auto const& wq_c = (kind == grid_kind::fermionic
+                          ? _w_weights_c : _Omega_weights_c);
+      nda::tensor::elementwise(cval_t(1.0), wq_c, std::string_view("j"),
+                               cval_t(1.0), C, std::string_view("bj"),
+                               nda::tensor::op::MUL);
+    }
 
-      array_t<2> Hhat(B, N_t_);
+    array_t<2> Chat(B, N_t_);
+    run_forward(C, Chat, kind, B);
+
+    array_t<2> Hhat(B, N_t_);
+    if constexpr (MEM == HOST_MEMORY) {
       for (long b = 0; b < B; ++b)
         for (long k = 0; k < N_t_; ++k)
           Hhat(b, k) = _sgn_t(k) * Chat(b, k);
+    } else {
+      // Hhat(b, k) = _sgn_t(k) * Chat(b, k): 1D × 2D broadcast.
+      Hhat = Chat;
+      nda::tensor::elementwise(cval_t(1.0), _sgn_t, std::string_view("k"),
+                               cval_t(1.0), Hhat, std::string_view("bk"),
+                               nda::tensor::op::MUL);
+    }
 
-      array_t<2> Rraw(B, N_grid);
-      run_backward(Hhat, Rraw, kind, B);
+    array_t<2> Rraw(B, N_grid);
+    run_backward(Hhat, Rraw, kind, B);
 
-      const double s = _grid->dt() / (2.0 * M_PI);
-      for (long b = 0; b < B; ++b)
-        for (long j = 0; j < N_grid; ++j)
-          ReX_w(b, j) = s * Rraw(b, j).real();
+    const double s = _grid->dt() / (2.0 * M_PI);
+    if constexpr (MEM == HOST_MEMORY) {
+      // s * Re(Rraw) elementwise via nda::map.
+      ReX_w = nda::map([s](cval_t x) { return s * x.real(); })(Rraw);
+    } else {
+      // Device: extract Re(Rraw) via to_real_view + strided copy, then
+      // scale in place.
+      auto Rraw_real_view = memory::to_real_view(Rraw);
+      ReX_w = Rraw_real_view(nda::range::all, nda::range::all, 0);
+      nda::tensor::scale(s, ReX_w);
     }
   }
 
@@ -388,34 +468,45 @@ public:
    * or hilbert.
    */
   void apply_weights(array_t<2>& arr, grid_kind kind) const {
-    if constexpr (MEM != HOST_MEMORY) {
-      utils::check(false,
-                   "real_axis_conv_base_t<DEVICE>::apply_weights: device "
-                   "kernel for 1D weights * 2D array broadcast not yet implemented.");
-    } else {
+    const long N = arr.shape()[1];
+    if constexpr (MEM == HOST_MEMORY) {
       auto const& w = (kind == grid_kind::fermionic
                        ? _grid->w_weights() : _grid->Omega_weights());
-      const long N = arr.shape()[1];
       utils::check(w.shape()[0] == N, "apply_weights: shape mismatch");
       for (long b = 0; b < arr.shape()[0]; ++b)
         for (long j = 0; j < N; ++j)
           arr(b, j) *= w(j);
+    } else {
+      auto const& w_c = (kind == grid_kind::fermionic
+                         ? _w_weights_c : _Omega_weights_c);
+      utils::check(w_c.shape()[0] == N, "apply_weights: shape mismatch");
+      nda::tensor::elementwise(cval_t(1.0), w_c, std::string_view("j"),
+                               cval_t(1.0), arr, std::string_view("bj"),
+                               nda::tensor::op::MUL);
     }
   }
 
   void apply_weights(rarray_t<2>& arr, grid_kind kind) const {
-    if constexpr (MEM != HOST_MEMORY) {
-      utils::check(false,
-                   "real_axis_conv_base_t<DEVICE>::apply_weights(double): "
-                   "device kernel for 1D weights * 2D array broadcast not yet implemented.");
-    } else {
+    const long N = arr.shape()[1];
+    if constexpr (MEM == HOST_MEMORY) {
       auto const& w = (kind == grid_kind::fermionic
                        ? _grid->w_weights() : _grid->Omega_weights());
-      const long N = arr.shape()[1];
       utils::check(w.shape()[0] == N, "apply_weights: shape mismatch");
       for (long b = 0; b < arr.shape()[0]; ++b)
         for (long j = 0; j < N; ++j)
           arr(b, j) *= w(j);
+    } else {
+      // Real-valued device array: nda has no in-place real-array broadcast
+      // primitive (cuTENSOR uses op::MUL only across same-typed operands)
+      // and lazy nda::map is unsafe on device. Stage through host.
+      auto const& w_h = (kind == grid_kind::fermionic
+                         ? _grid->w_weights() : _grid->Omega_weights());
+      utils::check(w_h.shape()[0] == N, "apply_weights: shape mismatch");
+      auto arr_h = nda::to_host(arr);
+      for (long b = 0; b < arr_h.shape()[0]; ++b)
+        for (long j = 0; j < N; ++j)
+          arr_h(b, j) *= w_h(j);
+      arr = memory::to_memory_space<MEM>(arr_h);
     }
   }
 
@@ -459,6 +550,8 @@ private:
   rarray_t<1>             _x_w;       // scaled fermionic coords w_j * dt, in MEM
   rarray_t<1>             _x_Omega;   // scaled bosonic coords Omega_l * dt, in MEM
   array_t<1>              _sgn_t;     // i*sgn(t_k) for the Hilbert kernel, in MEM
+  array_t<1>              _w_weights_c;     // fermionic trapezoidal weights, complex MEM
+  array_t<1>              _Omega_weights_c; // bosonic trapezoidal weights, complex MEM
   std::unique_ptr<plan_t> _plan_w;
   std::unique_ptr<plan_t> _plan_Omega;
 };

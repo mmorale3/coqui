@@ -373,8 +373,10 @@ real_axis_qp_scf_loop(real_axis_mb_state_t                          & state,
                       double                                         N_elec,
                       long                                           ns_factor)
 {
-  static_assert(MEM == HOST_MEMORY,
-                "real_axis_qp_scf_loop<DEVICE>: device path not yet supported");
+  // State arrays + H_eff are sArrays (host node-shared). The underlying
+  // solver classes have host bodies; MEM is a template marker that lets
+  // future device-accelerated kernels (Pi, Sigma) be plugged in without
+  // changing this driver's signature.
   utils::check(state.grid != nullptr, "real_axis_qp_scf_loop: state.grid not bound");
   utils::check(state.mpi  != nullptr, "real_axis_qp_scf_loop: state.mpi not bound");
   utils::check(mb_solver.scr_eri != nullptr, "real_axis_qp_scf_loop: mb_solver.scr_eri null");
@@ -502,10 +504,10 @@ real_axis_qp_scf_loop(real_axis_mb_state_t                          & state,
       mb_solver.scr_eri->update_w(state, thc, /*verbose*/ false, use_rspace);
     }
 
-    // ---- 6. Sigma_c (gw). ----
-    mb_solver.gw->evaluate(state, thc, cfg.eps_nufft,
-                           mb_solver.scr_eri->div_treatment(),
-                           /*verbose*/ false, use_rspace);
+    // ---- 6. Sigma_c (gw). MEM=DEVICE_MEMORY routes to device. ----
+    mb_solver.gw->template evaluate<MEM>(state, thc, cfg.eps_nufft,
+                                          mb_solver.scr_eri->div_treatment(),
+                                          /*verbose*/ false, use_rspace);
     detail_qp::project_causality_inplace(state);
 
     // ---- 7. V_H(Dm) + Sigma_x(Dm) via the production HF solver. ----

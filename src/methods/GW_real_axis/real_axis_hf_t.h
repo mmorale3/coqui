@@ -53,9 +53,10 @@ public:
     : _grid(grid),
       _div_treatment(std::move(div_treatment))
   {
-    static_assert(MEM == HOST_MEMORY,
-                  "real_axis_hf_t<DEVICE>: device path not yet supported in "
-                  "evaluate_Sigma_x_serial.");
+    // The exchange evaluation runs on host throughout: state.Sigma_x_skij
+    // and state.A_wskij are sArrays (node-shared host memory), and the
+    // marshalled X / V / kmq buffers are local nda::arrays. MEM is a
+    // template marker so the SCF driver can dispatch uniformly on MEM.
     utils::check(_grid != nullptr,
                  "real_axis_hf_t: grid pointer must not be null");
   }

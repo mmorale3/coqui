@@ -14,6 +14,7 @@
 
 #include "configuration.hpp"
 #include "nda/nda.hpp"
+#include "nda/tensor.hpp"
 #include "utilities/check.hpp"
 #include "methods/GW_real_axis/real_freq_grid.hpp"
 #include "methods/GW_real_axis/real_axis_conv.hpp"
@@ -62,13 +63,6 @@ inline void accumulate_ImPi_one_kq(detail::real_axis_conv_base_t<MEM> & conv,
                                    POut      & ImPi_PQ_O,
                                    double k_weight)
 {
-  if constexpr (MEM != HOST_MEMORY) {
-    utils::check(false,
-                 "accumulate_ImPi_one_kq<DEVICE>: device kernels for the "
-                 "weighted A_PQ projection and the auxiliary-index gather "
-                 "are not yet implemented.");
-    return;
-  }
   // A_PQ_k, A_PQ_kq, and ImPi_PQ_O are all (Naux_P, Naux_Q, N_*) views
   // with matching (P, Q) ranges. When (P, Q) is distributed, all three are
   // local blocks of the same shape and rank-ordering, so the kernel runs
@@ -95,7 +89,10 @@ inline void accumulate_ImPi_one_kq(detail::real_axis_conv_base_t<MEM> & conv,
 
   auto const& grid = conv.grid();
   auto const& w    = grid.w();
-  auto const& wq   = grid.w_weights();
+  auto const& wq_h = grid.w_weights();
+
+  const long B   = Naux_P * Naux_Q;
+  const long N_t = conv.N_t();
 
   // Build weighted spectra at k and k+q for the bubble.
   // Layout: (B, N_w) with B = Naux_P * Naux_Q. For index b = iP*Naux_Q + iQ:
@@ -105,60 +102,135 @@ inline void accumulate_ImPi_one_kq(detail::real_axis_conv_base_t<MEM> & conv,
   //                                                      aux hermiticity)
   // The weighted forms also absorb the trapezoidal quadrature weights, so
   // the lower-level NUFFT primitives don't need to apply them again.
-  const long B   = Naux_P * Naux_Q;
-  const long N_t = conv.N_t();
+  memory::array<MEM, ComplexType, 2> Aless_k(B, N_w);
+  memory::array<MEM, ComplexType, 2> Agtr_k(B, N_w);
+  memory::array<MEM, ComplexType, 2> Aless_kq(B, N_w);
+  memory::array<MEM, ComplexType, 2> Agtr_kq(B, N_w);
 
-  nda::array<ComplexType, 2> Aless_k(B, N_w);
-  nda::array<ComplexType, 2> Agtr_k(B, N_w);
-  nda::array<ComplexType, 2> Aless_kq(B, N_w);
-  nda::array<ComplexType, 2> Agtr_kq(B, N_w);
-
-  for (long iP = 0; iP < Naux_P; ++iP) {
-    for (long iQ = 0; iQ < Naux_Q; ++iQ) {
-      const long b = iP * Naux_Q + iQ;
-      for (long j = 0; j < N_w; ++j) {
-        const double f_w  = grid.fermi(w(j));
-        const double fb_w = 1.0 - f_w;
-        const double q_j  = wq(j);
-        Aless_k (b, j) = f_w  * q_j * A_PQ_k (iP, iQ, j);
-        Agtr_k  (b, j) = fb_w * q_j * A_PQ_k (iP, iQ, j);
-        // Second leg "Q, P" at k+q -> conj of LOCAL (iP, iQ) block via
-        // matrix-hermiticity of the symmetrized A_aux (commit 40d91a2).
-        Aless_kq(b, j) = f_w  * q_j * std::conj(A_PQ_kq(iP, iQ, j));
-        Agtr_kq (b, j) = fb_w * q_j * std::conj(A_PQ_kq(iP, iQ, j));
+  if constexpr (MEM == HOST_MEMORY) {
+    for (long iP = 0; iP < Naux_P; ++iP) {
+      for (long iQ = 0; iQ < Naux_Q; ++iQ) {
+        const long b = iP * Naux_Q + iQ;
+        for (long j = 0; j < N_w; ++j) {
+          const double f_w  = grid.fermi(w(j));
+          const double fb_w = 1.0 - f_w;
+          const double q_j  = wq_h(j);
+          Aless_k (b, j) = f_w  * q_j * A_PQ_k (iP, iQ, j);
+          Agtr_k  (b, j) = fb_w * q_j * A_PQ_k (iP, iQ, j);
+          // Second leg "Q, P" at k+q -> conj of LOCAL (iP, iQ) block via
+          // matrix-hermiticity of the symmetrized A_aux (commit 40d91a2).
+          Aless_kq(b, j) = f_w  * q_j * std::conj(A_PQ_kq(iP, iQ, j));
+          Agtr_kq (b, j) = fb_w * q_j * std::conj(A_PQ_kq(iP, iQ, j));
+        }
       }
     }
+  } else {
+    // Device path: build f(w)*wq and (1-f(w))*wq vectors on host (cheap,
+    // N_w is hundreds at most) and push to MEM-side complex 1D arrays so
+    // we can do the broadcast multiply via cuTENSOR.
+    nda::array<ComplexType, 1> f_wq_h(N_w), fb_wq_h(N_w);
+    for (long j = 0; j < N_w; ++j) {
+      const double f_w  = grid.fermi(w(j));
+      const double fb_w = 1.0 - f_w;
+      const double q_j  = wq_h(j);
+      f_wq_h(j)  = ComplexType(f_w  * q_j, 0.0);
+      fb_wq_h(j) = ComplexType(fb_w * q_j, 0.0);
+    }
+    auto f_wq  = memory::to_memory_space<MEM>(f_wq_h);
+    auto fb_wq = memory::to_memory_space<MEM>(fb_wq_h);
+
+    // C-layout (Naux_P, Naux_Q, N_w) is contiguous so reshape to (B, N_w)
+    // is a no-copy view; copy that view into the scratch buffers.
+    auto A_k_2D  = nda::reshape(A_PQ_k,
+                                std::array<long,2>{B, N_w});
+    auto A_kq_2D = nda::reshape(A_PQ_kq,
+                                std::array<long,2>{B, N_w});
+
+    Aless_k  = A_k_2D;
+    Agtr_k   = A_k_2D;
+    Aless_kq = A_kq_2D;
+    nda::tensor::scale(ComplexType(1.0), Aless_kq, nda::tensor::op::CONJ);
+    Agtr_kq  = Aless_kq;  // reuse the conj'd k+q block
+
+    // Multiply each by the appropriate (f or 1-f)*wq broadcast vector.
+    nda::tensor::elementwise(ComplexType(1.0), f_wq,  std::string_view("j"),
+                             ComplexType(1.0), Aless_k,  std::string_view("bj"),
+                             nda::tensor::op::MUL);
+    nda::tensor::elementwise(ComplexType(1.0), fb_wq, std::string_view("j"),
+                             ComplexType(1.0), Agtr_k,   std::string_view("bj"),
+                             nda::tensor::op::MUL);
+    nda::tensor::elementwise(ComplexType(1.0), f_wq,  std::string_view("j"),
+                             ComplexType(1.0), Aless_kq, std::string_view("bj"),
+                             nda::tensor::op::MUL);
+    nda::tensor::elementwise(ComplexType(1.0), fb_wq, std::string_view("j"),
+                             ComplexType(1.0), Agtr_kq,  std::string_view("bj"),
+                             nda::tensor::op::MUL);
   }
 
   // Im Pi ~ cross-correlate(Aless_k, Agtr_kq) - cross-correlate(Agtr_k, Aless_kq).
   // Compute each pair's Hhat in time space, sum (with sign) before a single
   // type-2 NUFFT. Saves one type-2 per call vs two cross_correlate calls.
   using gk = grid_kind;
-  nda::array<ComplexType, 2> Fless_hat(B, N_t), Fgtr_hat(B, N_t);
-  nda::array<ComplexType, 2> Gless_hat(B, N_t), Ggtr_hat(B, N_t);
+  memory::array<MEM, ComplexType, 2> Fless_hat(B, N_t), Fgtr_hat(B, N_t);
+  memory::array<MEM, ComplexType, 2> Gless_hat(B, N_t), Ggtr_hat(B, N_t);
   conv.forward(Aless_k,  Fless_hat, gk::fermionic);
   conv.forward(Agtr_k,   Fgtr_hat,  gk::fermionic);
   conv.forward(Aless_kq, Gless_hat, gk::fermionic);
   conv.forward(Agtr_kq,  Ggtr_hat,  gk::fermionic);
 
-  // Pi Hadamard kernel: a 4-ary elementwise map, MEM-agnostic via nda::map
-  // (lazy expression evaluated on host or device per the array memory space).
+  // Pi Hadamard kernel:  Hhat = conj(Fless)*Ggtr - conj(Fgtr)*Gless.
+  // On host we use a 4-arg nda::map; on device, lazy expressions segfault
+  // so we build it explicitly via tensor::scale(op::CONJ) + elementwise.
   memory::array<MEM, ComplexType, 2> Hhat(B, N_t);
-  Hhat = nda::map([](ComplexType fl, ComplexType gg,
-                     ComplexType fg, ComplexType gl) {
-    return std::conj(fl) * gg - std::conj(fg) * gl;
-  })(Fless_hat, Ggtr_hat, Fgtr_hat, Gless_hat);
+  if constexpr (MEM == HOST_MEMORY) {
+    Hhat = nda::map([](ComplexType fl, ComplexType gg,
+                       ComplexType fg, ComplexType gl) {
+      return std::conj(fl) * gg - std::conj(fg) * gl;
+    })(Fless_hat, Ggtr_hat, Fgtr_hat, Gless_hat);
+  } else {
+    memory::array<MEM, ComplexType, 2> tmp(B, N_t);
 
-  nda::array<ComplexType, 2> Hraw(B, N_O);
+    // tmp = conj(Fless) * Ggtr
+    tmp = Fless_hat;
+    nda::tensor::scale(ComplexType(1.0), tmp, nda::tensor::op::CONJ);
+    nda::tensor::elementwise(ComplexType(1.0), Ggtr_hat, std::string_view("bk"),
+                             ComplexType(1.0), tmp,      std::string_view("bk"),
+                             nda::tensor::op::MUL);
+
+    // Hhat = conj(Fgtr) * Gless
+    Hhat = Fgtr_hat;
+    nda::tensor::scale(ComplexType(1.0), Hhat, nda::tensor::op::CONJ);
+    nda::tensor::elementwise(ComplexType(1.0), Gless_hat, std::string_view("bk"),
+                             ComplexType(1.0), Hhat,      std::string_view("bk"),
+                             nda::tensor::op::MUL);
+
+    // Hhat = tmp - Hhat = conj(Fless)*Ggtr - conj(Fgtr)*Gless
+    nda::tensor::scale(ComplexType(-1.0), Hhat);
+    nda::tensor::elementwise(ComplexType(1.0), tmp,  std::string_view("bk"),
+                             ComplexType(1.0), Hhat, std::string_view("bk"),
+                             nda::tensor::op::SUM);
+  }
+
+  memory::array<MEM, ComplexType, 2> Hraw(B, N_O);
   conv.backward(Hhat, Hraw, gk::bosonic);
   const double s_nufft = conv.nufft_scale();
   const double s_pi    = -M_PI * k_weight * s_nufft;
-  for (long iP = 0; iP < Naux_P; ++iP)
-    for (long iQ = 0; iQ < Naux_Q; ++iQ) {
-      const long b = iP * Naux_Q + iQ;
-      for (long iO = 0; iO < N_O; ++iO)
-        ImPi_PQ_O(iP, iQ, iO) += s_pi * Hraw(b, iO);
-    }
+
+  if constexpr (MEM == HOST_MEMORY) {
+    for (long iP = 0; iP < Naux_P; ++iP)
+      for (long iQ = 0; iQ < Naux_Q; ++iQ) {
+        const long b = iP * Naux_Q + iQ;
+        for (long iO = 0; iO < N_O; ++iO)
+          ImPi_PQ_O(iP, iQ, iO) += s_pi * Hraw(b, iO);
+      }
+  } else {
+    // Device: reshape Hraw (B, N_O) -> (Naux_P, Naux_Q, N_O), then accumulate.
+    auto Hraw_3D = nda::reshape(Hraw,
+                                std::array<long,3>{Naux_P, Naux_Q, N_O});
+    nda::tensor::elementwise(ComplexType(s_pi), Hraw_3D,   std::string_view("PQO"),
+                             ComplexType(1.0),  ImPi_PQ_O, std::string_view("PQO"),
+                             nda::tensor::op::SUM);
+  }
 }
 
 /**
@@ -170,38 +242,30 @@ inline void accumulate_ImPi_one_kq(detail::real_axis_conv_base_t<MEM> & conv,
  *                  local slice from a distributed array.
  * @param RePi_PQ_O OUTPUT Re Pi, same shape as ImPi_PQ_O.
  */
-template<MEMORY_SPACE MEM = HOST_MEMORY>
+template<MEMORY_SPACE MEM = HOST_MEMORY,
+         typename ImIn, typename ReOut>
 inline void RePi_from_ImPi(detail::real_axis_conv_base_t<MEM> & conv,
-                           memory::array<MEM, double, 3> const& ImPi_PQ_O,
-                           memory::array<MEM, double, 3>      & RePi_PQ_O)
+                           ImIn  const& ImPi_PQ_O,
+                           ReOut      & RePi_PQ_O)
 {
-  if constexpr (MEM != HOST_MEMORY) {
-    utils::check(false,
-                 "RePi_from_ImPi<DEVICE>: device kernel for the (P, Q) "
-                 "<-> batch gather/scatter not yet implemented.");
-    return;
-  }
   const long Naux_P = ImPi_PQ_O.shape()[0];
   const long Naux_Q = ImPi_PQ_O.shape()[1];
   const long N_O = ImPi_PQ_O.shape()[2];
   const long B = Naux_P * Naux_Q;
 
+  // Both gather and scatter are pure C-layout reshapes (no data motion); no
+  // host/device branch is needed -- nda::reshape returns a memory-view of
+  // the same storage.
+  auto ImPi_2D = nda::reshape(ImPi_PQ_O,
+                              std::array<long,2>{B, N_O});
+  auto RePi_2D = nda::reshape(RePi_PQ_O,
+                              std::array<long,2>{B, N_O});
+
+  // hilbert takes mutable rarray<2> by reference. Stage through scratch.
   memory::array<MEM, double, 2> ImBuf(B, N_O), ReBuf(B, N_O);
-  for (long P = 0; P < Naux_P; ++P)
-    for (long Q = 0; Q < Naux_Q; ++Q) {
-      const long b = P * Naux_Q + Q;
-      for (long iO = 0; iO < N_O; ++iO)
-        ImBuf(b, iO) = ImPi_PQ_O(P, Q, iO);
-    }
-
+  ImBuf = ImPi_2D;
   conv.hilbert(ImBuf, ReBuf, grid_kind::bosonic);
-
-  for (long P = 0; P < Naux_P; ++P)
-    for (long Q = 0; Q < Naux_Q; ++Q) {
-      const long b = P * Naux_Q + Q;
-      for (long iO = 0; iO < N_O; ++iO)
-        RePi_PQ_O(P, Q, iO) = ReBuf(b, iO);
-    }
+  RePi_2D = ReBuf;
 }
 
 } // namespace real_axis

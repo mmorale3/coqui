@@ -56,9 +56,11 @@ public:
       _eta(eta),
       _mu_tol(mu_tol)
   {
-    static_assert(MEM == HOST_MEMORY,
-                  "real_axis_dyson_t<DEVICE>: device path not yet supported "
-                  "in the underlying dyson_update_A free function.");
+    // The dyson math is small per-(s, k, w) matrix solves on host; state
+    // arrays it reads/writes (Sigma_x, ImSigma_c, ReSigma_c, A) are
+    // sArrays (host node-shared memory) regardless of MEM. The MEM template
+    // parameter is therefore a no-op for this class -- it exists only so
+    // the SCF driver can be templated uniformly on MEM.
     utils::check(_grid != nullptr,
                  "real_axis_dyson_t: grid pointer must not be null");
     utils::check(_H_MF.shape().size() == 4,

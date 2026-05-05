@@ -15,6 +15,7 @@
 #include "configuration.hpp"
 #include "nda/nda.hpp"
 #include "nda/blas.hpp"
+#include "nda/tensor.hpp"
 #include "utilities/check.hpp"
 
 namespace methods {
@@ -53,14 +54,6 @@ inline void primary_to_aux_one_k(XKP  const& X_kP_mu,
                                  AIn  const& A_wmunu,
                                  AOut      & A_aux_PQw)
 {
-  if constexpr (MEM != HOST_MEMORY) {
-    utils::check(false,
-                 "primary_to_aux_one_k<DEVICE>: device kernels for the "
-                 "two intermediate (mu,iw,nu)<->(P,iw,nu) permutations "
-                 "not yet implemented. The two GEMMs themselves go through "
-                 "cuBLAS automatically once arrays are device-allocated.");
-    return;
-  }
   const long Naux_P = X_kP_mu.shape()[0];
   const long Naux_Q = X_kQ_nu.shape()[0];
   const long nbnd = X_kP_mu.shape()[1];
@@ -79,6 +72,24 @@ inline void primary_to_aux_one_k(XKP  const& X_kP_mu,
 
   const ComplexType c_one(1.0, 0.0);
   const ComplexType c_zero(0.0, 0.0);
+
+  if constexpr (MEM != HOST_MEMORY) {
+    // Device path: two cuTENSOR contractions, no manual permutations.
+    //   T(P, w, nu) = sum_mu X_P(P, mu) A(w, mu, nu)
+    //   A_aux(P, Q, w) = sum_nu T(P, w, nu) conj(X_Q)(Q, nu)
+    memory::array<MEM, ComplexType, 3> T_PWN(Naux_P, N_w, nbnd);
+    nda::tensor::contract(c_one, X_kP_mu, std::string_view("Pm"),
+                          A_wmunu, std::string_view("wmn"),
+                          c_zero, T_PWN, std::string_view("Pwn"));
+    nda::tensor::contract(c_one, T_PWN, std::string_view("Pwn"),
+                          nda::conj(X_kQ_nu), std::string_view("Qn"),
+                          c_zero, A_aux_PQw, std::string_view("PQw"));
+    return;
+  }
+
+  // Host path: two GEMMs through nda::blas + manual axis permutations
+  // (host elementwise has no broadcast/permute path; host tensor::contract
+  // would dispatch to TBLIS or fallback, neither validated here).
 
   // Step 1: T(P, w, nu) = sum_mu X_P(P, mu) A(w, mu, nu).
   // Permute A from (w, mu, nu) -> (mu, w, nu) so (w, nu) is the contiguous
@@ -145,13 +156,6 @@ inline void aux_to_primary_one_k(XKP  const& X_kP_mu,
                                  MIn  const& M_aux_PQw,
                                  MOut      & M_wmunu)
 {
-  if constexpr (MEM != HOST_MEMORY) {
-    utils::check(false,
-                 "aux_to_primary_one_k<DEVICE>: device kernels for the "
-                 "two intermediate (P,Q,iw)<->(P,iw,Q) and (mu,iw,nu)<->"
-                 "(iw,mu,nu) permutations not yet implemented.");
-    return;
-  }
   const long Naux_P = X_kP_mu.shape()[0];
   const long Naux_Q = X_kQ_nu.shape()[0];
   const long nbnd = X_kP_mu.shape()[1];
@@ -171,6 +175,21 @@ inline void aux_to_primary_one_k(XKP  const& X_kP_mu,
   const ComplexType c_one(1.0, 0.0);
   const ComplexType c_zero(0.0, 0.0);
 
+  if constexpr (MEM != HOST_MEMORY) {
+    // Device path: two cuTENSOR contractions.
+    //   T(P, w, nu) = sum_Q M_aux(P, Q, w) X_Q(Q, nu)
+    //   M(w, mu, nu) = sum_P conj(X_P(P, mu)) T(P, w, nu)
+    memory::array<MEM, ComplexType, 3> T_PWN(Naux_P, N_w, nbnd);
+    nda::tensor::contract(c_one, M_aux_PQw, std::string_view("PQw"),
+                          X_kQ_nu, std::string_view("Qn"),
+                          c_zero, T_PWN, std::string_view("Pwn"));
+    nda::tensor::contract(c_one, nda::conj(X_kP_mu), std::string_view("Pm"),
+                          T_PWN, std::string_view("Pwn"),
+                          c_zero, M_wmunu, std::string_view("wmn"));
+    return;
+  }
+
+  // Host path: GEMM-based with manual axis permutations.
   // Step 1: T(P, w, nu) = sum_Q M_aux(P, Q, w) X_Q(Q, nu).
   //
   // Permute M_aux from (P, Q, w) -> (P, w, Q) so we can reshape the (P, w)

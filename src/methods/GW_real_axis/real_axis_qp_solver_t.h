@@ -79,9 +79,10 @@ namespace real_axis {
 template<MEMORY_SPACE MEM = HOST_MEMORY>
 class real_axis_qp_solver_base_t {
 public:
-  static_assert(MEM == HOST_MEMORY,
-                "real_axis_qp_solver_t<DEVICE>: device path not yet "
-                "supported.");
+  // The QP solver work is small per-(s, k, n) bisection / linearized
+  // root-finds plus a (nbnd x nbnd) hermitization. State Sigma reads happen
+  // against host sArrays (`state.{Re,Im}Sigma_wskij->local()`). MEM is a
+  // template marker so the QP-SCF driver can dispatch uniformly.
 
   using state_t = real_axis_mb_state_t;
 
@@ -151,8 +152,10 @@ public:
                  sH_eff_skij_loc.shape()[1] == Nk and
                  sH_eff_skij_loc.shape()[2] == nbnd and
                  sH_eff_skij_loc.shape()[3] == nbnd,
-                 "solve_qp_diag: sH_eff shape {} mismatches ({},{},{},{})",
-                 sH_eff_skij_loc.shape(), ns, Nk, nbnd, nbnd);
+                 "solve_qp_diag: sH_eff shape ({},{},{},{}) mismatches ({},{},{},{})",
+                 sH_eff_skij_loc.shape()[0], sH_eff_skij_loc.shape()[1],
+                 sH_eff_skij_loc.shape()[2], sH_eff_skij_loc.shape()[3],
+                 ns, Nk, nbnd, nbnd);
     utils::check(sMO_skia_loc.shape()[0] == ns and
                  sMO_skia_loc.shape()[1] == Nk and
                  sMO_skia_loc.shape()[2] == nbnd and

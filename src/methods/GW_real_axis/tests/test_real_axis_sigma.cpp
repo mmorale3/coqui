@@ -16,6 +16,7 @@
 #include "methods/GW_real_axis/real_freq_grid.hpp"
 #include "methods/GW_real_axis/real_axis_conv.hpp"
 #include "methods/GW_real_axis/real_axis_sigma.hpp"
+#include "utilities/test_common.hpp"
 
 #include <cmath>
 #include <complex>
@@ -242,5 +243,89 @@ TEST_CASE("real_axis_sigma_nufft_matches_direct", "[real_axis][sigma][nufft]")
         REQUIRE(std::abs(ImSigma_nuf(P, Q, iw).imag()) < 1e-4);
       }
 }
+
+// =============================================================================
+// Device-vs-host: lifted gates on the Sigma path.
+// =============================================================================
+#if defined(COQUI_HAVE_CUFINUFFT)
+
+TEST_CASE("real_axis_sigma_accumulate_nufft_device_vs_host",
+          "[real_axis][sigma][device]")
+{
+  using methods::real_axis::detail::real_axis_conv_base_t;
+
+  const double w_max = 6.0;
+  const long N_w = 64, N_Omega = 32, N_t = 128;
+  const double Omega_max = 3.0, T_window = 12.0;
+  auto grid = real_freq_grid_t::make_uniform(
+      50.0, 0.0, w_max, N_w, Omega_max, N_Omega, N_t, T_window);
+
+  const long Naux = 4;
+  const long B = Naux * Naux;
+  using cval_t = std::complex<double>;
+
+  nda::array<cval_t, 3> A_kmq_h(Naux, Naux, N_w);
+  nda::array<cval_t, 3> B_q_h(Naux, Naux, N_Omega);
+  utils::fillRandomArray(A_kmq_h);
+  utils::fillRandomArray(B_q_h);
+
+  nda::array<cval_t, 3> ImSigma_h(Naux, Naux, N_w);
+  ImSigma_h = cval_t(0.0, 0.0);
+  real_axis_conv_base_t<HOST_MEMORY> conv_h(grid, B, 1e-10);
+  accumulate_ImSigma_one_kq_nufft(conv_h, A_kmq_h, B_q_h, ImSigma_h,
+                                  /*q_weight*/ 1.0);
+
+  auto A_d = memory::to_memory_space<DEVICE_MEMORY>(A_kmq_h);
+  auto B_d = memory::to_memory_space<DEVICE_MEMORY>(B_q_h);
+  memory::array<DEVICE_MEMORY, cval_t, 3> ImSigma_d(Naux, Naux, N_w);
+  ImSigma_d = cval_t(0.0, 0.0);
+  real_axis_conv_base_t<DEVICE_MEMORY> conv_d(grid, B, 1e-10);
+  accumulate_ImSigma_one_kq_nufft(conv_d, A_d, B_d, ImSigma_d, 1.0);
+
+  auto ImSigma_dh = nda::to_host(ImSigma_d);
+  for (long P = 0; P < Naux; ++P)
+    for (long Q = 0; Q < Naux; ++Q)
+      for (long iw = 0; iw < N_w; ++iw)
+        REQUIRE(std::abs(ImSigma_h(P, Q, iw) - ImSigma_dh(P, Q, iw)) < 1e-6);
+}
+
+TEST_CASE("real_axis_sigma_ReSigma_from_ImSigma_device_vs_host",
+          "[real_axis][sigma][device]")
+{
+  using methods::real_axis::detail::real_axis_conv_base_t;
+
+  const double w_max = 6.0;
+  const long N_w = 64, N_Omega = 32, N_t = 128;
+  const double Omega_max = 3.0, T_window = 12.0;
+  auto grid = real_freq_grid_t::make_uniform(
+      50.0, 0.0, w_max, N_w, Omega_max, N_Omega, N_t, T_window);
+
+  const long Naux = 4;
+  const long B = Naux * Naux;
+  using cval_t = std::complex<double>;
+
+  // Carry Im in real() slot of complex inputs (matches storage convention).
+  nda::array<cval_t, 3> ImSigma_h(Naux, Naux, N_w), ReSigma_h(Naux, Naux, N_w);
+  for (long P = 0; P < Naux; ++P)
+    for (long Q = 0; Q < Naux; ++Q)
+      for (long iw = 0; iw < N_w; ++iw)
+        ImSigma_h(P, Q, iw) = cval_t(std::sin(0.1*P + 0.2*Q + 0.3*iw), 0.0);
+
+  real_axis_conv_base_t<HOST_MEMORY> conv_h(grid, B, 1e-10);
+  ReSigma_from_ImSigma_aux(conv_h, ImSigma_h, ReSigma_h);
+
+  auto ImSigma_d = memory::to_memory_space<DEVICE_MEMORY>(ImSigma_h);
+  memory::array<DEVICE_MEMORY, cval_t, 3> ReSigma_d(Naux, Naux, N_w);
+  real_axis_conv_base_t<DEVICE_MEMORY> conv_d(grid, B, 1e-10);
+  ReSigma_from_ImSigma_aux(conv_d, ImSigma_d, ReSigma_d);
+
+  auto ReSigma_dh = nda::to_host(ReSigma_d);
+  for (long P = 0; P < Naux; ++P)
+    for (long Q = 0; Q < Naux; ++Q)
+      for (long iw = 0; iw < N_w; ++iw)
+        REQUIRE(std::abs(ReSigma_h(P, Q, iw) - ReSigma_dh(P, Q, iw)) < 1e-6);
+}
+
+#endif // COQUI_HAVE_CUFINUFFT
 
 } // namespace gw_real_axis_tests

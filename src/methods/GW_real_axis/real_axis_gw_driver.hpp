@@ -94,14 +94,32 @@ inline void evaluate_serial(boost::mpi3::communicator& comm,
                             memory::array<MEM, ComplexType, 2> const& f_Rq = memory::array<MEM, ComplexType, 2>{},
                             memory::array<MEM, ComplexType, 2> const& f_kR = memory::array<MEM, ComplexType, 2>{})
 {
-  static_assert(MEM == HOST_MEMORY,
-                "evaluate_serial<DEVICE>: device-side instantiation is not yet "
-                "supported. The conv engine, the (cu)FINUFFT plan layer, and "
-                "the kernel signatures are MEM-aware, but the per-element "
-                "loops inside this driver (Step 4 Dyson Pi assembly, Step 5 "
-                "B = -Im W / pi, Step 7 Hilbert pack/unpack, output repack) "
-                "are still host-only. Replace those with device kernels (or "
-                "to_host round-trips) to enable the device path.");
+  // The lower-level array-API driver runs on host arrays internally and
+  // is reachable from MEM-templated callers. Treat MEM as a template
+  // marker; the body uses memory::array<MEM, ...> for I/O but stages
+  // on-host scratch tensors.
+  if constexpr (MEM != HOST_MEMORY) {
+    auto A_h    = nda::to_host(A_skwij);
+    auto X_h    = nda::to_host(X_skPmu);
+    auto V_h    = nda::to_host(V_qPQ);
+    nda::array<ComplexType, 5> ImSigma_h(ImSigma_c_skwij.shape());
+    nda::array<ComplexType, 5> ReSigma_h(ReSigma_c_skwij.shape());
+    ImSigma_h() = ComplexType(0.0, 0.0);
+    ReSigma_h() = ComplexType(0.0, 0.0);
+    nda::array<ComplexType, 2> f_Rk_h, f_qR_h, f_Rq_h, f_kR_h;
+    if (f_Rk.size() > 0) f_Rk_h = nda::to_host(f_Rk);
+    if (f_qR.size() > 0) f_qR_h = nda::to_host(f_qR);
+    if (f_Rq.size() > 0) f_Rq_h = nda::to_host(f_Rq);
+    if (f_kR.size() > 0) f_kR_h = nda::to_host(f_kR);
+    evaluate_serial<HOST_MEMORY>(comm, grid, A_h, X_h, V_h,
+                                 kpq_to_kp, kmq_to_kp, q_weights,
+                                 ImSigma_h, ReSigma_h,
+                                 eps_nufft, iq_gamma, verbose,
+                                 f_Rk_h, f_qR_h, f_Rq_h, f_kR_h);
+    ImSigma_c_skwij = ImSigma_h;
+    ReSigma_c_skwij = ReSigma_h;
+    return;
+  }
   // Phase-2 R-space options.
   //  - Step 2 (Im Pi) runs in R-space when f_Rk (NR, Nk) and f_qR (Nq, NR)
   //    are supplied. Identity: with the kernel's (P,Q)<->(Q,P) swap on the

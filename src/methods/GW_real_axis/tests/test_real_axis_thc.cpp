@@ -139,7 +139,7 @@ namespace bdft_tests {
     // Run the real-axis G0W0 wrapper.
     // -----------------------------------------------------------------------
     evaluate_thc_serial(state, thc, /*eps_nufft*/ 1e-8,
-                        "ignore_g0", /*verbose*/ false, /*use_rspace*/ true);
+                        "ignore_g0", /*verbose*/ true, /*use_rspace*/ true);
 
     REQUIRE(state.ImSigma_wskij.has_value());
     REQUIRE(state.ReSigma_wskij.has_value());
@@ -266,7 +266,7 @@ namespace bdft_tests {
     evaluate_thc_serial(state_k, thc, /*eps_nufft*/ 1e-8,
                         "ignore_g0", /*verbose*/ false, /*use_rspace*/ false);
     evaluate_thc_serial(state_r, thc, /*eps_nufft*/ 1e-8,
-                        "ignore_g0", /*verbose*/ false, /*use_rspace*/ true);
+                        "ignore_g0", /*verbose*/ true, /*use_rspace*/ true);
 
     REQUIRE(state_k.ImSigma_wskij.has_value());
     REQUIRE(state_r.ImSigma_wskij.has_value());

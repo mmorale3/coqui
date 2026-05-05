@@ -239,7 +239,8 @@ public:
    * @param verbose     emit per-step timings on rank 0.
    * @param use_rspace  when true and Nk>1, run the conv in R-space.
    */
-  template<methods::THC_ERI THC_t>
+  template<MEMORY_SPACE MEM = HOST_MEMORY,
+           methods::THC_ERI THC_t>
   void evaluate(real_axis::real_axis_mb_state_t & state,
                 THC_t const& thc,
                 double eps_nufft = 1e-10,
@@ -253,13 +254,45 @@ private:
   double _mix;
   std::string _output;
   std::shared_ptr<real_axis::real_axis_conv_t> _conv;
+  // SCF iteration caches (MEM-keyed via separate slots; only the slot for
+  // the actually-used MEM gets populated). Mirrors the pattern used in
+  // real_axis_scr_coulomb_t. Lazy-initialized on first evaluate() call
+  // to avoid paying the (cu)FINUFFT plan setup + THC marshaling cost on
+  // every SCF iteration.
+  template<MEMORY_SPACE MEM>
+  struct evaluate_caches_t {
+    std::unique_ptr<real_axis::detail::real_axis_conv_base_t<MEM>> conv;
+    long B_loc = -1;
+    bool use_rspace_cached = false;
+    std::optional<math::shm::shared_array<nda::array_view<ComplexType, 4>>> sX;
+    std::optional<math::shm::shared_array<nda::array_view<long, 2>>>        skmq;
+    std::optional<math::shm::shared_array<nda::array_view<ComplexType, 2>>> sf_Rk;
+    std::optional<math::shm::shared_array<nda::array_view<ComplexType, 2>>> sf_Rq;
+    std::optional<math::shm::shared_array<nda::array_view<ComplexType, 2>>> sf_kR;
+    std::optional<memory::array<MEM, ComplexType, 4>> X_mem;
+    std::optional<memory::array<MEM, ComplexType, 2>> f_Rk_mem;
+    std::optional<memory::array<MEM, ComplexType, 2>> f_Rq_mem;
+    std::optional<memory::array<MEM, ComplexType, 2>> f_kR_mem;
+  };
+  // One cache slot per supported MEM. Adding more is mechanical.
+  mutable evaluate_caches_t<HOST_MEMORY>   _ev_cache_host;
+  mutable evaluate_caches_t<DEVICE_MEMORY> _ev_cache_dev;
+
+  // Helper: return the cache for the requested MEM.
+  template<MEMORY_SPACE MEM>
+  evaluate_caches_t<MEM>& evaluate_cache_for() const {
+    if constexpr (MEM == HOST_MEMORY)
+      return _ev_cache_host;
+    else
+      return _ev_cache_dev;
+  }
 };
 
 // --------------------------------------------------------------------------
 // real_axis_gw_t::evaluate implementation. Body parallels Steps 5-8 of
 // `evaluate_serial`. Header-inline (matches the rest of the real-axis module).
 // --------------------------------------------------------------------------
-template<methods::THC_ERI THC_t>
+template<MEMORY_SPACE MEM, methods::THC_ERI THC_t>
 void real_axis_gw_t::evaluate(real_axis::real_axis_mb_state_t & state,
                               THC_t const& thc,
                               double eps_nufft,
@@ -268,6 +301,7 @@ void real_axis_gw_t::evaluate(real_axis::real_axis_mb_state_t & state,
                               bool use_rspace)
 {
   using namespace methods::real_axis;
+  auto& cache = evaluate_cache_for<MEM>();
   utils::check(state.A_wskij.has_value(),
                "real_axis_gw_t::evaluate: state.A_wskij not allocated");
   utils::check(state.ImW_qPQO.has_value() and state.ReW_qPQO.has_value(),
@@ -338,52 +372,70 @@ void real_axis_gw_t::evaluate(real_axis::real_axis_mb_state_t & state,
   auto ReSigma_out = state.ReSigma_wskij->local();
 
   // Repack A from (N_w, ns, Nk, nbnd, nbnd) to (ns, Nk, N_w, nbnd, nbnd),
-  // taking the matrix-hermitian symmetrization that recovers the physical
-  // matrix-valued spectral function:
-  //
-  //   A_phys_{ij} = 0.5 * (A_wskij_{ij} + conj(A_wskij_{ji}))
-  //
-  // (See the longer comment in real_axis_scr_coulomb_t.h::update_w.)
-  nda::array<ComplexType, 5> A(ns, Nk, N_w, nbnd, nbnd);
-  for (long s = 0; s < ns; ++s)
-    for (long k = 0; k < Nk; ++k)
-      for (long iw = 0; iw < N_w; ++iw)
-        for (long mu = 0; mu < nbnd; ++mu)
-          for (long nu = 0; nu < nbnd; ++nu)
-            A(s, k, iw, mu, nu) =
-                ComplexType(0.5, 0.0) *
-                (A_in(iw, s, k, mu, nu)
-                 + std::conj(A_in(iw, s, k, nu, mu)));
+  // taking the matrix-hermitian symmetrization. For MEM=HOST we fill the
+  // MEM-resident A directly; for MEM=DEVICE we fill a host scratch and
+  // push (one H2D transfer per call).
+  memory::array<MEM, ComplexType, 5> A;
+  if constexpr (MEM == HOST_MEMORY) {
+    A = nda::array<ComplexType, 5>(ns, Nk, N_w, nbnd, nbnd);
+    for (long s = 0; s < ns; ++s)
+      for (long k = 0; k < Nk; ++k)
+        for (long iw = 0; iw < N_w; ++iw)
+          for (long mu = 0; mu < nbnd; ++mu)
+            for (long nu = 0; nu < nbnd; ++nu)
+              A(s, k, iw, mu, nu) =
+                  ComplexType(0.5, 0.0) *
+                  (A_in(iw, s, k, mu, nu)
+                   + std::conj(A_in(iw, s, k, nu, mu)));
+  } else {
+    nda::array<ComplexType, 5> A_h(ns, Nk, N_w, nbnd, nbnd);
+    for (long s = 0; s < ns; ++s)
+      for (long k = 0; k < Nk; ++k)
+        for (long iw = 0; iw < N_w; ++iw)
+          for (long mu = 0; mu < nbnd; ++mu)
+            for (long nu = 0; nu < nbnd; ++nu)
+              A_h(s, k, iw, mu, nu) =
+                  ComplexType(0.5, 0.0) *
+                  (A_in(iw, s, k, mu, nu)
+                   + std::conj(A_in(iw, s, k, nu, mu)));
+    A = memory::to_memory_space<MEM>(A_h);
+  }
 
   // Marshal X(s, k, P, mu) into shared memory: one copy per node.
-  math::shm::shared_array<nda::array_view<ComplexType, 4>>
-      sX(*state.mpi, {ns, Nk, Naux, nbnd});
-  if (sX.node_comm()->root()) {
-    auto X_loc = sX.local();
-    for (long s = 0; s < ns; ++s)
-      for (long k = 0; k < Nk; ++k) {
-        auto Xsk = thc.X(static_cast<int>(s), /*ip*/ 0, static_cast<int>(k));
-        for (long P = 0; P < Naux; ++P)
-          for (long mu = 0; mu < nbnd; ++mu)
-            X_loc(s, k, P, mu) = Xsk(P, mu);
-      }
+  // Cached across SCF iterations.
+  if (!cache.sX.has_value() or
+      cache.sX->shape() != std::array<long,4>{ns, Nk, Naux, nbnd}) {
+    cache.sX.emplace(*state.mpi, std::array<long,4>{ns, Nk, Naux, nbnd});
+    if (cache.sX->node_comm()->root()) {
+      auto X_loc = cache.sX->local();
+      for (long s = 0; s < ns; ++s)
+        for (long k = 0; k < Nk; ++k) {
+          auto Xsk = thc.X(static_cast<int>(s), /*ip*/ 0, static_cast<int>(k));
+          for (long P = 0; P < Naux; ++P)
+            for (long mu = 0; mu < nbnd; ++mu)
+              X_loc(s, k, P, mu) = Xsk(P, mu);
+        }
+    }
+    cache.sX->node_sync();
+    if constexpr (MEM != HOST_MEMORY)
+      cache.X_mem = memory::to_memory_space<MEM>(cache.sX->local());
   }
-  sX.node_sync();
-  auto X = sX.local();
+  auto X = cache.sX->local();
 
-  // BZ closure: kmq(ik, iq) = ik - iq, in shared memory.
-  math::shm::shared_array<nda::array_view<long, 2>> skmq(*state.mpi, {Nk, Nq});
-  {
-    if (skmq.node_comm()->root()) {
-      auto kmq_loc = skmq.local();
+  // BZ closure: kmq(ik, iq) = ik - iq, in shared memory. Cached.
+  if (!cache.skmq.has_value() or
+      cache.skmq->shape() != std::array<long,2>{Nk, Nq}) {
+    cache.skmq.emplace(*state.mpi, std::array<long,2>{Nk, Nq});
+    if (cache.skmq->node_comm()->root()) {
+      auto kmq_loc = cache.skmq->local();
       auto const& qk_to_k2 = MF.qk_to_k2();
       for (long iq = 0; iq < Nq; ++iq)
         for (long ik = 0; ik < Nk; ++ik)
           kmq_loc(ik, iq) = qk_to_k2(iq, ik);
     }
-    skmq.node_sync();
+    cache.skmq->node_sync();
   }
-  auto kmq = skmq.local();
+  auto kmq = cache.skmq->local();
 
   // q-mesh weights (uniform 1/Nq).
   nda::array<double, 1> qw(Nq);
@@ -400,50 +452,60 @@ void real_axis_gw_t::evaluate(real_axis::real_axis_mb_state_t & state,
     }
   }
 
-  // R-space FT matrices for Sigma. One copy per node.
-  std::optional<math::shm::shared_array<nda::array_view<ComplexType, 2>>> sf_Rk_opt;
-  std::optional<math::shm::shared_array<nda::array_view<ComplexType, 2>>> sf_Rq_opt;
-  std::optional<math::shm::shared_array<nda::array_view<ComplexType, 2>>> sf_kR_opt;
+  // R-space FT matrices for Sigma. One copy per node. Cached.
   long NR = 0;
   if (use_rspace and Nk > 1) {
     auto kp_grid = MF.kp_grid();
-    auto lattv   = MF.lattv();
-    const long nx = kp_grid(0);
-    const long ny = kp_grid(1);
-    const long nz = kp_grid(2);
-    NR = nx * ny * nz;
+    NR = kp_grid(0) * kp_grid(1) * kp_grid(2);
     utils::check(NR == Nk,
                  "real_axis_gw_t::evaluate: R-space path expects NR ({}) == Nk ({})",
                  NR, Nk);
+    if (!cache.sf_Rk.has_value() or cache.use_rspace_cached != use_rspace or
+        cache.sf_Rk->shape() != std::array<long,2>{NR, Nk}) {
+      auto lattv   = MF.lattv();
+      const long nx = kp_grid(0);
+      const long ny = kp_grid(1);
+      const long nz = kp_grid(2);
+      nda::array<long, 2> Rpts_idx(NR, 3);
+      for (long p = 0; p < NR; ++p) {
+        long a = p / (ny * nz);
+        long b = (p / nz) % ny;
+        long c = p % nz;
+        if (a > nx / 2) a -= nx;
+        if (b > ny / 2) b -= ny;
+        if (c > nz / 2) c -= nz;
+        Rpts_idx(p, 0) = a;
+        Rpts_idx(p, 1) = b;
+        Rpts_idx(p, 2) = c;
+      }
+      nda::array<long, 1> Rpts_weights(NR);
+      Rpts_weights() = 1;
 
-    nda::array<long, 2> Rpts_idx(NR, 3);
-    for (long p = 0; p < NR; ++p) {
-      long a = p / (ny * nz);
-      long b = (p / nz) % ny;
-      long c = p % nz;
-      if (a > nx / 2) a -= nx;
-      if (b > ny / 2) b -= ny;
-      if (c > nz / 2) c -= nz;
-      Rpts_idx(p, 0) = a;
-      Rpts_idx(p, 1) = b;
-      Rpts_idx(p, 2) = c;
+      cache.sf_Rk.emplace(*state.mpi, std::array<long,2>{NR, Nk});
+      cache.sf_Rq.emplace(*state.mpi, std::array<long,2>{NR, Nq});
+      cache.sf_kR.emplace(*state.mpi, std::array<long,2>{Nk, NR});
+      utils::k_to_R_coefficients(comm, Rpts_idx, MF.kpts(), lattv, *cache.sf_Rk);
+      utils::k_to_R_coefficients(comm, Rpts_idx, MF.Qpts(), lattv, *cache.sf_Rq);
+      utils::R_to_k_coefficients(comm, Rpts_idx, Rpts_weights, MF.kpts(), lattv,
+                                 *cache.sf_kR);
+      cache.use_rspace_cached = use_rspace;
+      if constexpr (MEM != HOST_MEMORY) {
+        cache.f_Rk_mem = memory::to_memory_space<MEM>(cache.sf_Rk->local());
+        cache.f_Rq_mem = memory::to_memory_space<MEM>(cache.sf_Rq->local());
+        cache.f_kR_mem = memory::to_memory_space<MEM>(cache.sf_kR->local());
+      }
     }
-    nda::array<long, 1> Rpts_weights(NR);
-    Rpts_weights() = 1;
-
-    sf_Rk_opt.emplace(*state.mpi, std::array<long,2>{NR, Nk});
-    sf_Rq_opt.emplace(*state.mpi, std::array<long,2>{NR, Nq});
-    sf_kR_opt.emplace(*state.mpi, std::array<long,2>{Nk, NR});
-    utils::k_to_R_coefficients(comm, Rpts_idx, MF.kpts(), lattv, *sf_Rk_opt);
-    utils::k_to_R_coefficients(comm, Rpts_idx, MF.Qpts(), lattv, *sf_Rq_opt);
-    utils::R_to_k_coefficients(comm, Rpts_idx, Rpts_weights, MF.kpts(), lattv,
-                               *sf_kR_opt);
   }
   const bool do_rspace = (NR > 0);
 
-  // NUFFT engine sized to the local (P_loc, Q_loc) block.
+  // NUFFT engine sized to the local (P_loc, Q_loc) block. Cached.
   const auto t_conv0 = t_now();
-  real_axis_conv_t conv(grid, /*ntrans*/ B_loc, eps_nufft);
+  if (!cache.conv or cache.B_loc != B_loc) {
+    cache.conv = std::make_unique<detail::real_axis_conv_base_t<MEM>>(
+        grid, /*ntrans*/ B_loc, eps_nufft);
+    cache.B_loc = B_loc;
+  }
+  auto& conv = *cache.conv;
   const double dt_conv = sec_since(t_conv0);
 
   // ----------------------------------------------------------------
@@ -451,7 +513,7 @@ void real_axis_gw_t::evaluate(real_axis::real_axis_mb_state_t & state,
   // grid as state.W so .local() blocks line up.
   // ----------------------------------------------------------------
   const auto t1 = t_now();
-  using local_5d_t = memory::array<HOST_MEMORY, ComplexType, 5>;
+  using local_5d_t = memory::array<MEM, ComplexType, 5>;
   auto pgrid_4d = state.ImW_qPQO->grid();
   auto bsize_4d = state.ImW_qPQO->block_size();
   std::array<long, 5> pgrid_aux = {1, 1, pgrid_4d[1], pgrid_4d[2], 1};
@@ -460,24 +522,50 @@ void real_axis_gw_t::evaluate(real_axis::real_axis_mb_state_t & state,
   auto dA_aux_skPQw = math::nda::make_distributed_array<local_5d_t>(
       comm, pgrid_aux, shape_aux, bsize_aux);
   auto A_aux_loc = dA_aux_skPQw.local();
-  for (long s = 0; s < ns; ++s)
-    for (long ik = 0; ik < Nk; ++ik) {
-      auto X_P_slice  = X(s, ik, Pr, _);
-      auto X_Q_slice  = X(s, ik, Qr, _);
-      auto A_view     = A(s, ik, _, _, _);
-      auto A_aux_view = A_aux_loc(s, ik, _, _, _);
-      primary_to_aux_one_k(X_P_slice, X_Q_slice, A_view, A_aux_view);
-    }
+  if constexpr (MEM == HOST_MEMORY) {
+    for (long s = 0; s < ns; ++s)
+      for (long ik = 0; ik < Nk; ++ik) {
+        auto X_P_slice  = X(s, ik, Pr, _);
+        auto X_Q_slice  = X(s, ik, Qr, _);
+        auto A_view     = A(s, ik, _, _, _);
+        auto A_aux_view = A_aux_loc(s, ik, _, _, _);
+        primary_to_aux_one_k(X_P_slice, X_Q_slice, A_view, A_aux_view);
+      }
+  } else {
+    auto X_dev = (*cache.X_mem)();
+    for (long s = 0; s < ns; ++s)
+      for (long ik = 0; ik < Nk; ++ik) {
+        auto X_P_slice  = X_dev(s, ik, Pr, _);
+        auto X_Q_slice  = X_dev(s, ik, Qr, _);
+        auto A_view     = A(s, ik, _, _, _);
+        auto A_aux_view = A_aux_loc(s, ik, _, _, _);
+        primary_to_aux_one_k<MEM>(X_P_slice, X_Q_slice, A_view, A_aux_view);
+      }
+  }
   const double dt1 = sec_since(t1);
 
   // ----------------------------------------------------------------
   // Step 5: B = -Im W / pi on the local (P_loc, Q_loc, Omega) block.
+  // For MEM=DEVICE, ImW_loc is host-resident (state lives on host); we
+  // pull to MEM via to_memory_space and apply the scale on device.
   // ----------------------------------------------------------------
   const auto t5 = t_now();
-  nda::array<ComplexType, 4> B_qPQO_loc(Nq, Naux_loc_P, Naux_loc_Q, N_O);
-  B_qPQO_loc = nda::map([](ComplexType w) {
-    return ComplexType(-w.real() / M_PI, 0.0);
-  })(ImW_loc);
+  memory::buffered_array<MEM, ComplexType, 4> B_qPQO_loc(
+      std::array<long,4>{Nq, Naux_loc_P, Naux_loc_Q, N_O});
+  if constexpr (MEM == HOST_MEMORY) {
+    B_qPQO_loc() = nda::map([](ComplexType w) {
+      return ComplexType(-w.real() / M_PI, 0.0);
+    })(ImW_loc);
+  } else {
+    // Push host ImW_loc to MEM, then scale by -1/pi on MEM. ImW_loc per
+    // convention has imag()=0; B inherits that, then scale acts on both
+    // slots (which is correct since 0 * anything = 0).
+    nda::array<ComplexType, 4> ImW_h(ImW_loc.shape());
+    ImW_h = ImW_loc;
+    auto ImW_mem = memory::to_memory_space<MEM>(ImW_h);
+    B_qPQO_loc = ImW_mem;  // memcpy in MEM
+    nda::tensor::scale(ComplexType(-1.0 / M_PI, 0.0), B_qPQO_loc);
+  }
   const double dt5 = sec_since(t5);
 
   // ----------------------------------------------------------------
@@ -485,49 +573,59 @@ void real_axis_gw_t::evaluate(real_axis::real_axis_mb_state_t & state,
   // block for ALL (s, k, q); no allreduce.
   // ----------------------------------------------------------------
   const auto t6 = t_now();
-  nda::array<ComplexType, 5> ImSigma_aux_skPQw_loc(ns, Nk, Naux_loc_P, Naux_loc_Q, N_w);
-  ImSigma_aux_skPQw_loc = ComplexType(0.0, 0.0);
+  memory::buffered_array<MEM, ComplexType, 5> ImSigma_aux_skPQw_loc(
+      std::array<long,5>{ns, Nk, Naux_loc_P, Naux_loc_Q, N_w});
+  ImSigma_aux_skPQw_loc() = ComplexType(0.0, 0.0);
 
   if (do_rspace) {
-    auto f_Rk = sf_Rk_opt->local();
-    auto f_Rq = sf_Rq_opt->local();
-    auto f_kR = sf_kR_opt->local();
-
     if (iq_gamma >= 0) {
       B_qPQO_loc(iq_gamma, nda::ellipsis{}) = ComplexType(0.0, 0.0);
     }
 
     // FT B from q-space to R-space (per-rank on local block).
-    nda::array<ComplexType, 4> B_RPQO_loc(NR, Naux_loc_P, Naux_loc_Q, N_O);
+    memory::buffered_array<MEM, ComplexType, 4> B_RPQO_loc(
+        std::array<long,4>{NR, Naux_loc_P, Naux_loc_Q, N_O});
     {
       auto B_q_2D = nda::reshape(B_qPQO_loc,
                                  std::array<long,2>{Nq, B_loc * N_O});
       auto B_R_2D = nda::reshape(B_RPQO_loc,
                                  std::array<long,2>{NR, B_loc * N_O});
-      nda::blas::gemm(ComplexType(1.0, 0.0), f_Rq, B_q_2D,
-                      ComplexType(0.0, 0.0), B_R_2D);
+      if constexpr (MEM == HOST_MEMORY) {
+        nda::blas::gemm(ComplexType(1.0, 0.0), cache.sf_Rq->local(), B_q_2D,
+                        ComplexType(0.0, 0.0), B_R_2D);
+      } else {
+        nda::blas::gemm(ComplexType(1.0, 0.0), *cache.f_Rq_mem, B_q_2D,
+                        ComplexType(0.0, 0.0), B_R_2D);
+      }
     }
 
     // FT A from k-space to R-space (per-rank on local block).
-    nda::array<ComplexType, 5> A_aux_sRPQw_loc(ns, NR, Naux_loc_P, Naux_loc_Q, N_w);
+    memory::buffered_array<MEM, ComplexType, 5> A_aux_sRPQw_loc(
+        std::array<long,5>{ns, NR, Naux_loc_P, Naux_loc_Q, N_w});
     for (long s = 0; s < ns; ++s) {
       auto A_in_2D  = nda::reshape(A_aux_loc(s, _, _, _, _),
                                    std::array<long,2>{Nk, B_loc * N_w});
       auto A_out_2D = nda::reshape(A_aux_sRPQw_loc(s, _, _, _, _),
                                    std::array<long,2>{NR, B_loc * N_w});
-      nda::blas::gemm(ComplexType(1.0, 0.0), f_Rk, A_in_2D,
-                      ComplexType(0.0, 0.0), A_out_2D);
+      if constexpr (MEM == HOST_MEMORY) {
+        nda::blas::gemm(ComplexType(1.0, 0.0), cache.sf_Rk->local(), A_in_2D,
+                        ComplexType(0.0, 0.0), A_out_2D);
+      } else {
+        nda::blas::gemm(ComplexType(1.0, 0.0), *cache.f_Rk_mem, A_in_2D,
+                        ComplexType(0.0, 0.0), A_out_2D);
+      }
     }
 
     // Per-R Sigma kernel on local (P_loc, Q_loc) blocks. No allreduce.
-    nda::array<ComplexType, 5> ImSigma_aux_sRPQw_loc(ns, NR, Naux_loc_P, Naux_loc_Q, N_w);
-    ImSigma_aux_sRPQw_loc = ComplexType(0.0, 0.0);
+    memory::buffered_array<MEM, ComplexType, 5> ImSigma_aux_sRPQw_loc(
+        std::array<long,5>{ns, NR, Naux_loc_P, Naux_loc_Q, N_w});
+    ImSigma_aux_sRPQw_loc() = ComplexType(0.0, 0.0);
     for (long iR = 0; iR < NR; ++iR) {
       for (long s = 0; s < ns; ++s) {
         auto A_view   = A_aux_sRPQw_loc(s, iR, _, _, _);
         auto B_view   = B_RPQO_loc(iR, _, _, _);
         auto Sig_view = ImSigma_aux_sRPQw_loc(s, iR, _, _, _);
-        accumulate_ImSigma_one_kq_nufft(conv, A_view, B_view, Sig_view, 1.0);
+        accumulate_ImSigma_one_kq_nufft<MEM>(conv, A_view, B_view, Sig_view, 1.0);
       }
     }
 
@@ -537,8 +635,13 @@ void real_axis_gw_t::evaluate(real_axis::real_axis_mb_state_t & state,
                                    std::array<long,2>{NR, B_loc * N_w});
       auto Sig_k_2D = nda::reshape(ImSigma_aux_skPQw_loc(s, _, _, _, _),
                                    std::array<long,2>{Nk, B_loc * N_w});
-      nda::blas::gemm(ComplexType(1.0, 0.0), f_kR, Sig_R_2D,
-                      ComplexType(0.0, 0.0), Sig_k_2D);
+      if constexpr (MEM == HOST_MEMORY) {
+        nda::blas::gemm(ComplexType(1.0, 0.0), cache.sf_kR->local(), Sig_R_2D,
+                        ComplexType(0.0, 0.0), Sig_k_2D);
+      } else {
+        nda::blas::gemm(ComplexType(1.0, 0.0), *cache.f_kR_mem, Sig_R_2D,
+                        ComplexType(0.0, 0.0), Sig_k_2D);
+      }
     }
   } else {
     for (long s = 0; s < ns; ++s) {
@@ -549,7 +652,7 @@ void real_axis_gw_t::evaluate(real_axis::real_axis_mb_state_t & state,
           auto A_view   = A_aux_loc(s, ikmq, _, _, _);
           auto B_view   = B_qPQO_loc(iq, _, _, _);
           auto Sig_view = ImSigma_aux_skPQw_loc(s, ik, _, _, _);
-          accumulate_ImSigma_one_kq_nufft(conv, A_view, B_view, Sig_view, qw(iq));
+          accumulate_ImSigma_one_kq_nufft<MEM>(conv, A_view, B_view, Sig_view, qw(iq));
         }
       }
     }
@@ -560,12 +663,13 @@ void real_axis_gw_t::evaluate(real_axis::real_axis_mb_state_t & state,
   // Step 7: Re Sigma^c via batched Hilbert transform (per-rank on local block).
   // ----------------------------------------------------------------
   const auto t7 = t_now();
-  nda::array<ComplexType, 5> ReSigma_aux_skPQw_loc(ns, Nk, Naux_loc_P, Naux_loc_Q, N_w);
+  memory::buffered_array<MEM, ComplexType, 5> ReSigma_aux_skPQw_loc(
+      std::array<long,5>{ns, Nk, Naux_loc_P, Naux_loc_Q, N_w});
   for (long s = 0; s < ns; ++s)
     for (long ik = 0; ik < Nk; ++ik) {
       auto Im_view = ImSigma_aux_skPQw_loc(s, ik, _, _, _);
       auto Re_view = ReSigma_aux_skPQw_loc(s, ik, _, _, _);
-      ReSigma_from_ImSigma_aux(conv, Im_view, Re_view);
+      ReSigma_from_ImSigma_aux<MEM>(conv, Im_view, Re_view);
     }
   const double dt7 = sec_since(t7);
 
@@ -576,21 +680,48 @@ void real_axis_gw_t::evaluate(real_axis::real_axis_mb_state_t & state,
   // obtained via a single allreduce on the orbital-shape Sigma at the end.
   // ----------------------------------------------------------------
   const auto t8 = t_now();
-  nda::array<ComplexType, 5> ImSigma(ns, Nk, N_w, nbnd, nbnd);
-  nda::array<ComplexType, 5> ReSigma(ns, Nk, N_w, nbnd, nbnd);
-  ImSigma = ComplexType(0.0, 0.0);
-  ReSigma = ComplexType(0.0, 0.0);
-  for (long s = 0; s < ns; ++s)
-    for (long ik = 0; ik < Nk; ++ik) {
-      auto X_P_slice = X(s, ik, Pr, _);
-      auto X_Q_slice = X(s, ik, Qr, _);
-      auto Im_view = ImSigma_aux_skPQw_loc(s, ik, _, _, _);
-      auto Re_view = ReSigma_aux_skPQw_loc(s, ik, _, _, _);
-      auto ImOut   = ImSigma(s, ik, _, _, _);
-      auto ReOut   = ReSigma(s, ik, _, _, _);
-      aux_to_primary_one_k(X_P_slice, X_Q_slice, Im_view, ImOut);
-      aux_to_primary_one_k(X_P_slice, X_Q_slice, Re_view, ReOut);
-    }
+  memory::buffered_array<MEM, ComplexType, 5> ImSigma_mem(
+      std::array<long,5>{ns, Nk, N_w, nbnd, nbnd});
+  memory::buffered_array<MEM, ComplexType, 5> ReSigma_mem(
+      std::array<long,5>{ns, Nk, N_w, nbnd, nbnd});
+  ImSigma_mem() = ComplexType(0.0, 0.0);
+  ReSigma_mem() = ComplexType(0.0, 0.0);
+  if constexpr (MEM == HOST_MEMORY) {
+    for (long s = 0; s < ns; ++s)
+      for (long ik = 0; ik < Nk; ++ik) {
+        auto X_P_slice = X(s, ik, Pr, _);
+        auto X_Q_slice = X(s, ik, Qr, _);
+        auto Im_view = ImSigma_aux_skPQw_loc(s, ik, _, _, _);
+        auto Re_view = ReSigma_aux_skPQw_loc(s, ik, _, _, _);
+        auto ImOut   = ImSigma_mem(s, ik, _, _, _);
+        auto ReOut   = ReSigma_mem(s, ik, _, _, _);
+        aux_to_primary_one_k(X_P_slice, X_Q_slice, Im_view, ImOut);
+        aux_to_primary_one_k(X_P_slice, X_Q_slice, Re_view, ReOut);
+      }
+  } else {
+    auto X_dev = (*cache.X_mem)();
+    for (long s = 0; s < ns; ++s)
+      for (long ik = 0; ik < Nk; ++ik) {
+        auto X_P_slice = X_dev(s, ik, Pr, _);
+        auto X_Q_slice = X_dev(s, ik, Qr, _);
+        auto Im_view = ImSigma_aux_skPQw_loc(s, ik, _, _, _);
+        auto Re_view = ReSigma_aux_skPQw_loc(s, ik, _, _, _);
+        auto ImOut   = ImSigma_mem(s, ik, _, _, _);
+        auto ReOut   = ReSigma_mem(s, ik, _, _, _);
+        aux_to_primary_one_k<MEM>(X_P_slice, X_Q_slice, Im_view, ImOut);
+        aux_to_primary_one_k<MEM>(X_P_slice, X_Q_slice, Re_view, ReOut);
+      }
+  }
+  // Pull MEM-side Sigmas to host for the allreduce + state write.
+  // (The allreduce is over the global comm; orbital basis is small.)
+  nda::array<ComplexType, 5> ImSigma, ReSigma;
+  if constexpr (MEM == HOST_MEMORY) {
+    ImSigma = ImSigma_mem;
+    ReSigma = ReSigma_mem;
+  } else {
+    ImSigma = nda::to_host(ImSigma_mem);
+    ReSigma = nda::to_host(ReSigma_mem);
+  }
   // Allreduce the partial sums across (P, Q) ranks to get the full Sigma.
   if (comm.size() > 1) {
     comm.all_reduce_in_place_n(ImSigma.data(), ImSigma.size(), std::plus<>{});
@@ -625,32 +756,42 @@ void real_axis_gw_t::evaluate(real_axis::real_axis_mb_state_t & state,
   // ----------------------------------------------------------------
   const auto t9 = t_now();
   if (state.eps_inv_head_O.has_value() and div_treatment != "ignore_g0") {
-    const double madelung = MF.madelung();
-    auto chi_head_qP = thc.basis_head();    // (Nq, Naux), local copy
-    nda::array<ComplexType, 2> chi_head_buf(chi_head_qP);  // contiguous local
+    if constexpr (MEM == HOST_MEMORY) {
+      const double madelung = MF.madelung();
+      auto chi_head_qP = thc.basis_head();    // (Nq, Naux), local copy
+      nda::array<ComplexType, 2> chi_head_buf(chi_head_qP);  // contiguous local
 
-    // Snapshot the orbital-basis Sigma into per-rank scratch buffers
-    // (so we can call the in-place updater locally and node-write the
-    // result via the standard pattern).
-    nda::array<ComplexType, 5> ImSig_local(N_w, ns, Nk, nbnd, nbnd);
-    nda::array<ComplexType, 5> ReSig_local(N_w, ns, Nk, nbnd, nbnd);
-    ImSig_local() = state.ImSigma_wskij->local();
-    ReSig_local() = state.ReSigma_wskij->local();
+      // Snapshot the orbital-basis Sigma into per-rank scratch buffers
+      // (so we can call the in-place updater locally and node-write the
+      // result via the standard pattern).
+      nda::array<ComplexType, 5> ImSig_local(N_w, ns, Nk, nbnd, nbnd);
+      nda::array<ComplexType, 5> ReSig_local(N_w, ns, Nk, nbnd, nbnd);
+      ImSig_local() = state.ImSigma_wskij->local();
+      ReSig_local() = state.ReSigma_wskij->local();
 
-    nda::array<ComplexType, 5> A_buf(state.A_wskij->local().shape());
-    A_buf() = state.A_wskij->local();
+      nda::array<ComplexType, 5> A_buf(state.A_wskij->local().shape());
+      A_buf() = state.A_wskij->local();
 
-    real_axis::apply_sigma_head_correction_real_axis(
-        conv, grid, madelung, *state.eps_inv_head_O,
-        chi_head_buf, X, A_buf,
-        ImSig_local, ReSig_local);
+      real_axis::apply_sigma_head_correction_real_axis(
+          conv, grid, madelung, *state.eps_inv_head_O,
+          chi_head_buf, X, A_buf,
+          ImSig_local, ReSig_local);
 
-    if (state.ImSigma_wskij->node_comm()->root()) {
-      state.ImSigma_wskij->local() = ImSig_local;
-      state.ReSigma_wskij->local() = ReSig_local;
+      if (state.ImSigma_wskij->node_comm()->root()) {
+        state.ImSigma_wskij->local() = ImSig_local;
+        state.ReSigma_wskij->local() = ReSig_local;
+      }
+      state.ImSigma_wskij->node_sync();
+      state.ReSigma_wskij->node_sync();
+    } else {
+      // Step 9 div correction not yet device-aware; would require a
+      // device-resident chi_head and an apply_sigma_head_correction
+      // variant on MEM. The standard "ignore_g0" path skips this entirely.
+      utils::check(false,
+                   "real_axis_gw_t::evaluate<DEVICE>: Sigma_div correction "
+                   "(div_treatment != \"ignore_g0\") is host-only. Use "
+                   "ignore_g0 or instantiate the host path.");
     }
-    state.ImSigma_wskij->node_sync();
-    state.ReSigma_wskij->node_sync();
   }
   const double dt9 = sec_since(t9);
 

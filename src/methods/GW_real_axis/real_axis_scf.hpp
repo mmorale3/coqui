@@ -124,10 +124,38 @@ inline scgw_result run_scgw_serial(
     memory::array<MEM, ComplexType, 2> const& f_Rq = memory::array<MEM, ComplexType, 2>{},
     memory::array<MEM, ComplexType, 2> const& f_kR = memory::array<MEM, ComplexType, 2>{})
 {
-  static_assert(MEM == HOST_MEMORY,
-                "run_scgw_serial<DEVICE>: gated on host pending device "
-                "support in evaluate_serial / evaluate_Sigma_x_serial / "
-                "the DIIS mixer / dyson_update_A / find_mu_chem.");
+  // Stage device callers through host: pull arrays once, run the SCF on
+  // host scratch, push final outputs back. The legacy free-function driver
+  // is mostly used by the array-API tests; the class-API SCF
+  // (real_axis_scf_loop) is the canonical path.
+  if constexpr (MEM != HOST_MEMORY) {
+    auto H_h = nda::to_host(H_MF_skij);
+    auto X_h = nda::to_host(X_skPmu);
+    auto V_h = nda::to_host(V_qPQ);
+    nda::array<ComplexType, 5> A_h(A_wskij.shape());
+    nda::array<ComplexType, 4> Sx_h(Sigma_x_skij.shape());
+    nda::array<ComplexType, 5> ImSc_h(ImSigma_c_skwij.shape());
+    nda::array<ComplexType, 5> ReSc_h(ReSigma_c_skwij.shape());
+    A_h    = nda::to_host(A_wskij);
+    Sx_h   = nda::to_host(Sigma_x_skij);
+    ImSc_h = nda::to_host(ImSigma_c_skwij);
+    ReSc_h = nda::to_host(ReSigma_c_skwij);
+    nda::array<ComplexType, 2> f_Rk_h, f_qR_h, f_Rq_h, f_kR_h;
+    if (f_Rk.size() > 0) f_Rk_h = nda::to_host(f_Rk);
+    if (f_qR.size() > 0) f_qR_h = nda::to_host(f_qR);
+    if (f_Rq.size() > 0) f_Rq_h = nda::to_host(f_Rq);
+    if (f_kR.size() > 0) f_kR_h = nda::to_host(f_kR);
+    auto res = run_scgw_serial<HOST_MEMORY>(comm, grid_in, H_h, X_h, V_h,
+                                            kpq_to_kp, kmq_to_kp, q_weights,
+                                            k_weights, N_elec, cfg,
+                                            A_h, Sx_h, ImSc_h, ReSc_h,
+                                            f_Rk_h, f_qR_h, f_Rq_h, f_kR_h);
+    A_wskij        = A_h;
+    Sigma_x_skij   = Sx_h;
+    ImSigma_c_skwij = ImSc_h;
+    ReSigma_c_skwij = ReSc_h;
+    return res;
+  }
   const long ns   = H_MF_skij.shape()[0];
   const long Nk   = H_MF_skij.shape()[1];
   const long nbnd = H_MF_skij.shape()[2];
