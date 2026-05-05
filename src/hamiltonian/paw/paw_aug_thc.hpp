@@ -105,6 +105,20 @@ inline std::vector<long> make_psp_to_rho_g_map(
                  "make_psp_to_rho_g_map: miller_g_dense rows ({}) != ngm_dense ({})",
                  mill.extent(0), ngm_dense);
 
+    // Principal-zone miller bounds for the rho_g FFT box (matches the
+    // truncated_g_grid construction loop in g_grids.hpp:
+    //     for i = (ni - NX + 1) .. ni  with ni = NX/2 (integer division)).
+    // A dense psp G with miller component outside this range corresponds to
+    // a G-vector that is NOT representable on the smaller rho_g mesh — if we
+    // naively wrap-and-lookup it would silently alias onto a low-|G| rho_g
+    // entry (e.g. m1 = +18 in NX = 33 wraps to position 18 = miller m1 = -15).
+    // Catch that here so the augmentation contributions don't get misplaced.
+    auto princ_zone = [](long N, long m) -> bool {
+        long ni = N / 2;
+        long mlo = ni - N + 1;
+        return (m >= mlo) && (m <= ni);
+    };
+
     // Build FFT linear → rho_g index (use the existing fft_to_gv if there).
     std::vector<long> fft_to_g(nnr, -1);
     auto const& gv_to_fft = rho_g.gv_to_fft();
@@ -116,11 +130,12 @@ inline std::vector<long> make_psp_to_rho_g_map(
 
     for (long ig = 0; ig < ngm_dense; ++ig) {
         int m1 = mill(ig, 0), m2 = mill(ig, 1), m3 = mill(ig, 2);
+        if (!princ_zone(NX, m1) || !princ_zone(NY, m2) || !princ_zone(NZ, m3)) {
+            ++n_unmapped_out; continue;
+        }
         long n1 = m1; if (n1 < 0) n1 += NX;
         long n2 = m2; if (n2 < 0) n2 += NY;
         long n3 = m3; if (n3 < 0) n3 += NZ;
-        if (n1 < 0 || n1 >= NX || n2 < 0 || n2 >= NY ||
-            n3 < 0 || n3 >= NZ) { ++n_unmapped_out; continue; }
         long N = (n1*NY + n2)*NZ + n3;
         long ig_rho = fft_to_g[N];
         if (ig_rho < 0) { ++n_unmapped_out; continue; }
