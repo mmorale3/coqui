@@ -58,8 +58,8 @@ using boost::mpi3::shared_communicator;
 template<typename MF_t>
 pseudopot::pseudopot(MF_t &mf, std::string const filename) :
   mpi(mf.mpi()),
-  fft_mesh(mf.fft_grid_dim()),      // customize grid!!!
-  nnr(mf.nnr()),
+  fft_mesh(mf.fft_grid_dim_aug()),  // dense grid: vsc, vloc, mill_g, all PAW augmentation pieces
+  nnr(mf.nnr_aug()),                // dense FFT box (must hold all dense G-vectors)
   recv(mf.recv()),
   lattv(mf.lattv()),
   nkpts(mf.nkpts()),
@@ -293,7 +293,7 @@ void pseudopot::read_vnl_pw2bgw(MF_t &mf, std::string outdir)
   if(mpi->comm.root()) {
     if(std::filesystem::exists(outdir+"/VSC")) {
       nda::array<ComplexType,1> v;
-      utils::read_qe_plot_file(1,outdir+"/VSC",mf.fft_grid_dim(),v);
+      utils::read_qe_plot_file(1,outdir+"/VSC",mf.fft_grid_dim_aug(),v);  // V_eff is on dfftp
       // MAM: transform to nnr grid...  spin/polarization dependence???
       // this is wrong if nspin or npol > 1!
       // ignore for now since this is not used anywhere!
@@ -309,7 +309,7 @@ void pseudopot::read_vnl_pw2bgw(MF_t &mf, std::string outdir)
     }
     if(std::filesystem::exists(outdir+"/VLTOT")) { 
       nda::array<ComplexType,1> v;
-      utils::read_qe_plot_file(2,outdir+"/VLTOT",mf.fft_grid_dim(),v);
+      utils::read_qe_plot_file(2,outdir+"/VLTOT",mf.fft_grid_dim_aug(),v);  // V_loc is on dfftp
       // MAM: transform to nnr grid...
       utils::check(v.extent(0) == nnr, "Error: Dimension mismatch");
       for(int is=0; is<nspin; is++)
@@ -424,7 +424,9 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
     {
       nda::array<int,2> mill_g(ngm,3);
       nda::h5_read(grp,"miller_g",mill_g);
-      utils::generate_k2g(mill_g,k2g,mf.fft_grid_dim());
+      // mill_g lists dense G-vectors (ngm = ngm_dense), so the target FFT box
+      // must be the dense (dfftp / aug) mesh — not the smooth one.
+      utils::generate_k2g(mill_g,k2g,mf.fft_grid_dim_aug());
       // Cache miller_g_dense for v_h_paw augmentation. Only meaningful for
       // USPP/PAW; populated unconditionally here (cheap and harmless).
       miller_g_dense = mill_g;

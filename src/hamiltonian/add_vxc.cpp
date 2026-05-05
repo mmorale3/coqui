@@ -48,9 +48,12 @@ void add_vxc(MF_t& mf, nda::range k_range, nda::range b_range,
 
   int nspin = mf.nspin();
   int npol = mf.npol();
-  auto fft_mesh = mf.fft_grid_dim();
+  // Vxc is on QE's dfftp (dense) grid. Read it on the dense grid and apply
+  // V·ψ on the dense grid as well; for NCPP this matches the smooth grid, and
+  // for PAW it correctly accommodates ngm_dense G-vectors.
+  auto fft_mesh = mf.fft_grid_dim_aug();
   auto swfc_to_rho = detail::make_wfc_to_rho(mpi_context, mf, fft_mesh);
-  auto svxc = shared_array<nda::array_view<ComplexType,3>>(mpi_context, {nspin, npol*npol, mf.nnr()});
+  auto svxc = shared_array<nda::array_view<ComplexType,3>>(mpi_context, {nspin, npol*npol, mf.nnr_aug()});
 
   utils::check(k_range.size() == mf.nkpts_ibz() and
                b_range.size() == mf.nbnd(), "add_vxc: partial k_range/b_range not yet implemented.");
@@ -107,10 +110,11 @@ void read_vxc_h5(MF_t &mf, h5::group& grp0, shared_array<array_t> &svxc)
   utils::check(nk == mf.nkpts_ibz(), "Error in pseudopot::read_vxc_h5: Inconsistent nkpts.");
   utils::check(mf.wfc_truncated_grid()->size() >= npwx,
                "Error in pseudopot::read_vxc_h5: ngm < max_npw");
-  utils::check(svxc.shape() == std::array<long,3>{nspin,npol*npol,mf.nnr()}, 
+  utils::check(svxc.shape() == std::array<long,3>{nspin,npol*npol,mf.nnr_aug()},
                "Error in pseudopot::read_vxc_h5: Inconsistent vxc shape.");
 
-  auto fft_mesh = mf.fft_grid_dim();
+  // Vxc/V_eff h5 datasets store ngm_dense G-vectors and live on dfftp.
+  auto fft_mesh = mf.fft_grid_dim_aug();
   auto vxc = svxc.local();
 
   if(svxc.communicator()->root()) {
@@ -129,7 +133,7 @@ void read_vxc_h5(MF_t &mf, h5::group& grp0, shared_array<array_t> &svxc)
     }
 
     // vxc
-    auto vxc_2D = nda::reshape(vxc,std::array<long,2>{nspin*npol*npol,mf.nnr()});
+    auto vxc_2D = nda::reshape(vxc,std::array<long,2>{nspin*npol*npol,mf.nnr_aug()});
     auto vl_2D = nda::reshape(vl,std::array<long,2>{nspin*npol*npol,ngm});
     vxc_2D() = ComplexType(0.0);
     nda::h5_read(grp,"vxc_with_nlcc",vl);

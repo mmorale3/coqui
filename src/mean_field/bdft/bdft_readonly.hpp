@@ -405,11 +405,12 @@ public:
         } 
       } 
 
-      // if available, write pseudopot
+      // if available, write pseudopot. The pseudopot data lives on the dense
+      // (dfftp) grid (V_loc, mill_g, augmentation Q), so pass the aug mesh.
       if(mf.input_file_type() == mf::xml_input_type and mf.mf_type() == mf::qe_source) {
-        hamilt::pseudopot_to_h5(mf.fft_grid_dim(),grp,mf.outdir(),mf::xml_input_type);
+        hamilt::pseudopot_to_h5(mf.fft_grid_dim_aug(),grp,mf.outdir(),mf::xml_input_type);
       } else if(mf.input_file_type() == mf::h5_input_type and mf.mf_type() != mf::pyscf_source) {
-        hamilt::pseudopot_to_h5(mf.fft_grid_dim(),grp,mf.filename(),mf::h5_input_type);
+        hamilt::pseudopot_to_h5(mf.fft_grid_dim_aug(),grp,mf.filename(),mf::h5_input_type);
       }
     }
     sys.mpi->comm.barrier();
