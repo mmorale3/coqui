@@ -151,6 +151,90 @@ public:
                             N_t, T_window);
   }
 
+  // Non-uniform fermionic grid. Linear-dense block of `N_dense` points
+  // covering [-w_dense, +w_dense] (chemical-potential-relative, so the
+  // dense region surrounds mu_chem in absolute coordinates), with the
+  // remaining `N_w - N_dense` points log-spaced into the two tails out
+  // to ±w_max. The Bosonic grid stays uniform on [dOmega, Omega_max]
+  // (Omega is absolute, not mu-relative; n_B's structure is around 0
+  // not mu).
+  //
+  // Use case: dense sampling of the QP region and the f(w)*A integrand
+  // near mu, sparse in the deep valence / high-conduction tails where
+  // A is essentially zero.
+  static real_freq_grid_t make_nonuniform_log(double beta,
+                                              double mu_chem,
+                                              double w_max,
+                                              long   N_w,
+                                              double w_dense,
+                                              long   N_dense,
+                                              double Omega_max,
+                                              long   N_Omega,
+                                              long   N_t,
+                                              double T_window)
+  {
+    utils::check(w_max > 0.0,    "make_nonuniform_log: w_max must be > 0");
+    utils::check(w_dense > 0.0,
+                 "make_nonuniform_log: w_dense must be > 0 (got {})", w_dense);
+    utils::check(w_dense < w_max,
+                 "make_nonuniform_log: w_dense ({}) must be < w_max ({})",
+                 w_dense, w_max);
+    utils::check(N_w >= 4,       "make_nonuniform_log: N_w must be >= 4");
+    utils::check(N_dense >= 3,
+                 "make_nonuniform_log: N_dense must be >= 3 (got {})", N_dense);
+    utils::check(N_dense + 2 <= N_w,
+                 "make_nonuniform_log: N_dense ({}) leaves no room for tails "
+                 "in N_w ({}); need N_dense + 2 <= N_w.", N_dense, N_w);
+    utils::check((N_w - N_dense) % 2 == 0,
+                 "make_nonuniform_log: N_w - N_dense must be even so tails "
+                 "are symmetric (got N_w={}, N_dense={}, diff={}).",
+                 N_w, N_dense, N_w - N_dense);
+
+    const long n_tail = (N_w - N_dense) / 2;
+
+    // Dense block: uniform on [-w_dense, +w_dense] with N_dense points.
+    const double h_dense = 2.0 * w_dense / static_cast<double>(N_dense - 1);
+
+    // Log-spaced tails: span [w_dense + h_dense, w_max] with n_tail points.
+    // Use the dense-edge spacing as the inner anchor so the grid spacing is
+    // monotone non-decreasing as |w| grows past w_dense.
+    const double w_tail_inner = w_dense + h_dense;
+    utils::check(w_tail_inner < w_max,
+                 "make_nonuniform_log: dense block already reaches w_max "
+                 "(w_dense + h_dense = {} >= w_max = {}); reduce N_dense or "
+                 "w_dense, or increase w_max.", w_tail_inner, w_max);
+    const double log_step = (std::log(w_max) - std::log(w_tail_inner))
+                           / static_cast<double>(n_tail - 1);
+
+    nda::array<double,1> w(N_w);
+    // Negative tail (descending magnitude in w; build then mirror).
+    for (long i = 0; i < n_tail; ++i) {
+      const double mag = std::exp(std::log(w_tail_inner)
+                                  + static_cast<double>(n_tail - 1 - i) * log_step);
+      w(i) = -mag;
+    }
+    // Dense block.
+    for (long j = 0; j < N_dense; ++j)
+      w(n_tail + j) = -w_dense + h_dense * static_cast<double>(j);
+    // Positive tail (ascending magnitude).
+    for (long i = 0; i < n_tail; ++i) {
+      const double mag = std::exp(std::log(w_tail_inner)
+                                  + static_cast<double>(i) * log_step);
+      w(n_tail + N_dense + i) = mag;
+    }
+
+    nda::array<double,1> Omega(N_Omega);
+    {
+      const double h = Omega_max / static_cast<double>(N_Omega);
+      for (long l = 0; l < N_Omega; ++l)
+        Omega(l) = h * static_cast<double>(l + 1);
+    }
+
+    return real_freq_grid_t(beta, mu_chem,
+                            std::move(w), std::move(Omega),
+                            N_t, T_window);
+  }
+
   // -------------------------------------------------------------------
   // Accessors
   // -------------------------------------------------------------------

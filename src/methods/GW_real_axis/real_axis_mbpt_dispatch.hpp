@@ -151,7 +151,14 @@ inline void run_real_axis_gw(THC_t& thc, ptree const& pt)
   auto       mix_kind_s = io::get_value_with_default<std::string>(pt, "mix_kind", "diis");
   const auto alpha_mix  = io::get_value_with_default<double>(pt, "alpha_mix", 0.7);
   const auto diis_win   = io::get_value_with_default<long>  (pt, "diis_window", 8);
+  // Non-uniform fermionic-grid options. grid_kind="uniform" (default,
+  // back-compat) or "nonuniform_log" (linear-dense around mu, log tails).
+  // w_dense / N_dense control the dense block; ignored for uniform.
+  auto       grid_kind_s = io::get_value_with_default<std::string>(pt, "grid_kind", "uniform");
+  const auto w_dense_p   = io::get_value_with_default<double>(pt, "w_dense", 0.0);
+  const auto N_dense_p   = io::get_value_with_default<long>  (pt, "N_dense", 0);
   io::tolower(mix_kind_s);
+  io::tolower(grid_kind_s);
 
   // ---- Validation ---------------------------------------------------------
   // Accepted div_treatment values:
@@ -178,13 +185,30 @@ inline void run_real_axis_gw(THC_t& thc, ptree const& pt)
   utils::check(mix_kind_s == "linear" or mix_kind_s == "diis",
                "real_axis_gw: mix_kind must be \"linear\" or \"diis\" (got \"{}\")",
                mix_kind_s);
+  utils::check(grid_kind_s == "uniform" or grid_kind_s == "nonuniform_log",
+               "real_axis_gw: grid_kind must be \"uniform\" or \"nonuniform_log\" (got \"{}\")",
+               grid_kind_s);
 
   // ---- Grid + state -------------------------------------------------------
   auto p = derive_grid_params(*mf, beta, N_w_p, N_Omega_p, N_t_p,
                               wmax_p, Omegamax_p);
-  auto grid = real_freq_grid_t::make_uniform(
-                p.beta, p.mu0, p.w_max, p.N_w,
-                p.Omega_max, p.N_Omega, p.N_t, p.T_window);
+  // Nonuniform-grid defaults: dense halfwidth defaults to max(8*eta, 0.4 Ha)
+  // (covers the QP / band-edge region for typical solids); N_dense defaults
+  // to ~half of N_w. Both are user-overridable.
+  const double w_dense_eff = (w_dense_p > 0.0)
+                              ? w_dense_p
+                              : std::max(8.0 * eta_p, 0.4);
+  const long   N_dense_eff = (N_dense_p > 0)
+                              ? N_dense_p
+                              : (((p.N_w / 2) | 1) /* odd if N_w even */);
+  auto grid = (grid_kind_s == "nonuniform_log")
+              ? real_freq_grid_t::make_nonuniform_log(
+                  p.beta, p.mu0, p.w_max, p.N_w,
+                  w_dense_eff, N_dense_eff,
+                  p.Omega_max, p.N_Omega, p.N_t, p.T_window)
+              : real_freq_grid_t::make_uniform(
+                  p.beta, p.mu0, p.w_max, p.N_w,
+                  p.Omega_max, p.N_Omega, p.N_t, p.T_window);
 
   real_axis_mb_state_t state(grid);
   state.mpi = mpi;
@@ -207,6 +231,11 @@ inline void run_real_axis_gw(THC_t& thc, ptree const& pt)
     app_log(2, "  alpha_mix   = {}", alpha_mix);
     app_log(2, "  niter       = {}", niter);
     app_log(2, "  conv_thr    = {}", conv_thr);
+    app_log(2, "  grid_kind   = {}", grid_kind_s);
+    if (grid_kind_s == "nonuniform_log") {
+      app_log(2, "  w_dense     = {:.4f}", w_dense_eff);
+      app_log(2, "  N_dense     = {}", N_dense_eff);
+    }
   }
 
   // ---- Build H_MF = diag(eps_KS) ----------------------------------------
@@ -340,6 +369,11 @@ inline void run_real_axis_qpgw(THC_t& thc, ptree const& pt)
   const auto alpha_mix  = io::get_value_with_default<double>(pt, "alpha_mix", 0.7);
   const auto diis_win   = io::get_value_with_default<long>  (pt, "diis_window", 8);
   const auto update_W   = io::get_value_with_default<bool>  (pt, "update_W", true);
+  // Non-uniform fermionic-grid options (see [real_axis_gw] section docs).
+  auto       grid_kind_s = io::get_value_with_default<std::string>(pt, "grid_kind", "uniform");
+  const auto w_dense_p   = io::get_value_with_default<double>(pt, "w_dense", 0.0);
+  const auto N_dense_p   = io::get_value_with_default<long>  (pt, "N_dense", 0);
+  io::tolower(grid_kind_s);
 
   utils::check(mode_s == "qsgw" or mode_s == "evgw",
                "real_axis_qpgw: mode must be \"qsgw\" or \"evgw\" (got \"{}\")", mode_s);
@@ -355,13 +389,26 @@ inline void run_real_axis_qpgw(THC_t& thc, ptree const& pt)
                "real_axis_qpgw: only screen_type=\"rpa\" supported (got \"{}\")", screen_t);
   utils::check(mix_kind_s == "linear" or mix_kind_s == "diis",
                "real_axis_qpgw: mix_kind must be \"linear\" or \"diis\" (got \"{}\")", mix_kind_s);
+  utils::check(grid_kind_s == "uniform" or grid_kind_s == "nonuniform_log",
+               "real_axis_qpgw: grid_kind must be \"uniform\" or \"nonuniform_log\" (got \"{}\")", grid_kind_s);
 
   // ---- Grid + state ------------------------------------------------------
   auto p = derive_grid_params(*mf, beta, N_w_p, N_Omega_p, N_t_p,
                               wmax_p, Omegamax_p);
-  auto grid = real_freq_grid_t::make_uniform(
-                p.beta, p.mu0, p.w_max, p.N_w,
-                p.Omega_max, p.N_Omega, p.N_t, p.T_window);
+  const double w_dense_eff = (w_dense_p > 0.0)
+                              ? w_dense_p
+                              : std::max(8.0 * eta_p, 0.4);
+  const long   N_dense_eff = (N_dense_p > 0)
+                              ? N_dense_p
+                              : (((p.N_w / 2) | 1));
+  auto grid = (grid_kind_s == "nonuniform_log")
+              ? real_freq_grid_t::make_nonuniform_log(
+                  p.beta, p.mu0, p.w_max, p.N_w,
+                  w_dense_eff, N_dense_eff,
+                  p.Omega_max, p.N_Omega, p.N_t, p.T_window)
+              : real_freq_grid_t::make_uniform(
+                  p.beta, p.mu0, p.w_max, p.N_w,
+                  p.Omega_max, p.N_Omega, p.N_t, p.T_window);
 
   real_axis_mb_state_t state(grid);
   state.mpi = mpi;
@@ -384,6 +431,11 @@ inline void run_real_axis_qpgw(THC_t& thc, ptree const& pt)
     app_log(2, "  off_diag    = {}", odm_s);
     app_log(2, "  niter       = {}", niter);
     app_log(2, "  div_treat   = {}", div_treat);
+    app_log(2, "  grid_kind   = {}", grid_kind_s);
+    if (grid_kind_s == "nonuniform_log") {
+      app_log(2, "  w_dense     = {:.4f}", w_dense_eff);
+      app_log(2, "  N_dense     = {}", N_dense_eff);
+    }
   }
 
   // ---- Build sH_0, sS, sFock from MF -------------------------------------

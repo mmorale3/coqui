@@ -110,4 +110,115 @@ TEST_CASE("real_freq_grid_finite_T_kernels", "[real_axis][grid]")
 // so they cannot be exercised from a Catch2 unit test. The validation logic
 // in real_freq_grid_t is exercised at integration time via downstream tests.
 
+TEST_CASE("real_freq_grid_nonuniform_log_construction", "[real_axis][grid]")
+{
+  const double beta      = 100.0;
+  const double mu        = 0.5;
+  const double w_max     = 5.0;
+  const long   N_w       = 65;
+  const double w_dense   = 0.4;     // dense block on [-0.4, +0.4]
+  const long   N_dense   = 21;      // odd, includes 0
+  const double Omega_max = 4.0;
+  const long   N_Omega   = 32;
+  const long   N_t       = 64;
+  const double T_window  = 32.0;
+
+  auto g = real_freq_grid_t::make_nonuniform_log(
+      beta, mu, w_max, N_w, w_dense, N_dense,
+      Omega_max, N_Omega, N_t, T_window);
+
+  REQUIRE(g.N_w() == N_w);
+
+  // Endpoints span the full window.
+  REQUIRE(g.w()(0)        == Approx(-w_max));
+  REQUIRE(g.w()(N_w - 1)  == Approx(+w_max));
+
+  // Strictly monotone increasing.
+  for (long j = 1; j < N_w; ++j) {
+    REQUIRE(g.w()(j) > g.w()(j-1));
+  }
+
+  // Dense block sits at the center, spanning [-w_dense, +w_dense] with
+  // spacing h_dense = 2*w_dense/(N_dense-1).
+  const long n_tail = (N_w - N_dense) / 2;
+  REQUIRE(g.w()(n_tail)              == Approx(-w_dense).margin(1e-12));
+  REQUIRE(g.w()(n_tail + N_dense -1) == Approx(+w_dense).margin(1e-12));
+  const double h_dense = 2.0 * w_dense / static_cast<double>(N_dense - 1);
+  for (long j = 1; j < N_dense; ++j) {
+    REQUIRE((g.w()(n_tail + j) - g.w()(n_tail + j - 1))
+            == Approx(h_dense).epsilon(1e-12));
+  }
+
+  // Tail spacing strictly increases away from the dense edge: log-spaced
+  // tails have monotone-growing cell widths.
+  for (long j = N_w - n_tail; j + 1 < N_w; ++j) {
+    const double dj   = g.w()(j+1)   - g.w()(j);
+    const double djm1 = g.w()(j)     - g.w()(j-1);
+    REQUIRE(dj > djm1);
+  }
+  for (long j = 1; j < n_tail; ++j) {
+    const double dj   = g.w()(j)   - g.w()(j-1);
+    const double djp1 = g.w()(j+1) - g.w()(j);
+    REQUIRE(dj > djp1);
+  }
+
+  // Mirror symmetry around 0.
+  for (long j = 0; j < N_w; ++j) {
+    REQUIRE(g.w()(j) == Approx(-g.w()(N_w - 1 - j)).margin(1e-12));
+  }
+
+  // Trapezoidal weights still sum to grid width (2 * w_max).
+  double sum_w = 0.0;
+  for (long j = 0; j < N_w; ++j) sum_w += g.w_weights()(j);
+  REQUIRE(sum_w == Approx(2.0 * w_max).epsilon(1e-10));
+}
+
+TEST_CASE("real_freq_grid_nonuniform_log_lorentzian_quadrature",
+          "[real_axis][grid]")
+{
+  // Integrate a normalized Lorentzian f(w) = (eta/pi) / (w^2 + eta^2)
+  // (∫f = 1) using the grid's trapezoidal weights. Dense block centered
+  // on the peak should resolve it; sparse tails carry negligible weight.
+  const double eta   = 0.05;
+  const double w_max = 5.0;
+  const long   N_w   = 129;
+  const double w_dense = 0.4;
+  const long   N_dense = 65;
+  const double Omega_max = 4.0;
+  const long   N_Omega   = 32;
+  const long   N_t       = 64;
+  const double T_window  = 32.0;
+
+  auto g_nu = real_freq_grid_t::make_nonuniform_log(
+      100.0, 0.0, w_max, N_w, w_dense, N_dense,
+      Omega_max, N_Omega, N_t, T_window);
+
+  auto integrate = [&](real_freq_grid_t const& gg) {
+    double s = 0.0;
+    for (long j = 0; j < gg.N_w(); ++j) {
+      const double w = gg.w()(j);
+      s += gg.w_weights()(j) * (eta / M_PI) / (w*w + eta*eta);
+    }
+    return s;
+  };
+  const double I_nu = integrate(g_nu);
+
+  // Target: the truncated-window analytic value (2/pi)*arctan(w_max/eta).
+  // Full integral over R is 1; the tail outside ±w_max truncates ~0.006.
+  const double I_exact = (2.0 / M_PI) * std::atan(w_max / eta);
+  REQUIRE(I_nu == Approx(I_exact).margin(5e-4));
+
+  // Same total points on uniform grid: dense-region spacing ~0.078, much
+  // worse for Lorentzian peak resolution; integral biased low because
+  // peak is undersampled. This documents the qualitative win: the
+  // nonuniform grid resolves the peak with the same total point count.
+  auto g_u = real_freq_grid_t::make_uniform(
+      100.0, 0.0, w_max, N_w, Omega_max, N_Omega, N_t, T_window);
+  const double I_u  = integrate(g_u);
+
+  // The nonuniform-log error against the truncated-window value should
+  // not exceed the uniform-grid error by more than rounding noise.
+  REQUIRE(std::abs(I_nu - I_exact) <= std::abs(I_u - I_exact) + 1e-6);
+}
+
 } // namespace gw_real_axis_tests
