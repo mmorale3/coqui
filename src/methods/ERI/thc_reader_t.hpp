@@ -621,10 +621,14 @@ namespace methods {
       //    sizes (Np_smooth vs N_total), so we cannot reuse `redistribute`
       //    directly — implement an alltoallv block-into-subblock helper.
       // ----------------------------------------------------------------
+      if (_mpi->comm.root()) { std::cout << "  paw_aug.dbg: before embed_smooth" << std::endl; std::cout.flush(); }
+      _mpi->comm.barrier();
       _Timer.start("PAW_AUG.gather_smooth");
       embed_smooth_block_into_aug_dZ(_dZ_smooth, _dZ);
       _dZ_smooth.reset();
       _Timer.stop("PAW_AUG.gather_smooth");
+      _mpi->comm.barrier();
+      if (_mpi->comm.root()) { std::cout << "  paw_aug.dbg: after embed_smooth" << std::endl; std::cout.flush(); }
 
       // ----------------------------------------------------------------
       // 5) Build the small angular-coupling tables (replicated, ~kB) and
@@ -726,14 +730,23 @@ namespace methods {
       nda::array<ComplexType,2> eta_w_P_aug_g (P_aug_rows_la.size(),   ngm_rho);
       nda::array<ComplexType,2> eta_P_aug_conj(P_aug_rows_la.size(),   ngm_rho);
 
+      auto dbg = [&](char const* tag) {
+        _mpi->comm.barrier();
+        if (_mpi->comm.root()) { std::cout << "  paw_aug.dbg: " << tag << std::endl; std::cout.flush(); }
+        _mpi->comm.barrier();
+      };
+      dbg("entering q-loop");
+
       for (auto [iq_l, iq] : itertools::enumerate(qloc_new)) {
         std::array<double,3> q_cart = {
             -Qpts_cart(iq, 0), -Qpts_cart(iq, 1), -Qpts_cart(iq, 2)};
 
         // ---- 6a) Pull this q's ζ slab into zeta_dist (q-pool, row-split). ----
+        dbg("before fill_zeta");
         _Timer.start("PAW_AUG.dzeta");
         fill_zeta_for_iq_into_qpool(dzeta_quG, (int)iq, zeta_dist, q_intra);
         _Timer.stop("PAW_AUG.dzeta");
+        dbg("after fill_zeta");
 
         // ---- 6b) Build η^q for this rank's la_chunk. ----
         _Timer.start("PAW_AUG.eta_at_q");
@@ -765,11 +778,17 @@ namespace methods {
 
         // ---- 6e) Gather rows of ζ / η_w / η that this rank will need. ----
         // Five row-gathers per q (on q_intra, np_PQ-way).
+        dbg("before gathers");
         gather_rows_from_dist_qpool(zeta_dist , P_smooth_rows, q_intra, zeta_P_smooth_g);
+        dbg("g1");
         gather_rows_from_dist_qpool(zeta_dist , Q_smooth_cols, q_intra, zeta_Q_smooth_g);
+        dbg("g2");
         gather_rows_from_dist_qpool(eta_w_dist, Q_aug_cols_la, q_intra, eta_w_Q_aug_g);
+        dbg("g3");
         gather_rows_from_dist_qpool(eta_w_dist, P_aug_rows_la, q_intra, eta_w_P_aug_g);
+        dbg("g4");
         gather_rows_from_dist_qpool(eta_dist  , P_aug_rows_la, q_intra, eta_P_aug_conj);
+        dbg("after all gathers");
         // Now eta_P_aug_conj holds η; flip to conj(η) for V_LL / V_LG GEMMs.
         for (long la = 0; la < eta_P_aug_conj.shape(0); ++la)
           for (long g = 0; g < ngm_rho; ++g)
@@ -1003,13 +1022,15 @@ namespace methods {
     }
 
     /**
-     * Pull the iq-th smooth ζ slab out of `dzeta_quG` (distributed on the
-     * full mpi communicator, shape (nqpts_ibz, Np_smooth, ngm_rho)) into
-     * `zeta_dist` (distributed on the q-pool subcomm, shape (Np_smooth,
-     * ngm_rho), grid (np_PQ, 1)).
+     * Pull the iq-th smooth ζ slab out of `dzeta_quG` into `zeta_dist`
+     * (distributed on the q-pool subcomm, grid (np_PQ, 1)).
      *
-     * Implemented with one alltoallv over the global comm so no rank ever
-     * holds the full (Np_smooth × ngm_rho) slab in memory.
+     * Assumes the `dzeta_quG` proc grid's q-axis aligns with the q-pool
+     * partitioning of `_dZ` (true by construction: both come from
+     * `find_proc_grid_max_npools`). Each `q_intra` member therefore
+     * already owns the pool's q-slab inside its `dzeta_quG.local()`,
+     * so the data move is purely intra-pool and uses the standard
+     * `math::nda::redistribute` on `q_intra` (no global-comm collective).
      */
     template<class dz_dist_t, class Z_dist_t>
     void fill_zeta_for_iq_into_qpool(
@@ -1018,143 +1039,33 @@ namespace methods {
         Z_dist_t& zeta_dist,
         mpi3::communicator& q_intra)
     {
-      auto* gcomm = dzeta_quG.communicator();
-      long gnp   = (long)gcomm->size();
-      long grank = (long)gcomm->rank();
+      using local2d_t = memory::array<HOST_MEMORY, ComplexType, 2>;
+      long Np_smooth = zeta_dist.global_shape()[0];
+      long ngm       = zeta_dist.global_shape()[1];
 
-      // src side (dzeta_quG): each rank's (q, u, g) origin/shape.
-      // dst side (zeta_dist): each rank's (mu, g) origin/shape, but only
-      //   ranks of q_intra carry it. Use q_intra's translation to global
-      //   ranks via group/translate.
-      // Simpler: gather src/dst metadata across the global comm and let
-      // ranks not in q_intra contribute zero counts.
+      auto qrng = dzeta_quG.local_range(0);
+      long iq_loc = -1;
+      for (auto [i, q] : itertools::enumerate(qrng))
+        if ((long)q == (long)iq) { iq_loc = (long)i; break; }
+      utils::check(iq_loc >= 0,
+        "fill_zeta_for_iq_into_qpool: iq={} not in this rank's q-range "
+        "[{},{}); dzeta_quG q-axis must be partitioned to match _dZ q-pools.",
+        iq, qrng.first(), qrng.last());
 
-      // Per-rank metadata: (src_q_o, src_q_n, src_u_o, src_u_n, src_g_o, src_g_n,
-      //                     dst_in_qpool_flag, dst_mu_o, dst_mu_n, dst_g_o, dst_g_n)
-      // 11 longs per rank.
-      long meta_per = 11;
-      nda::array<long,2> mine(meta_per, 1);
-      mine.data()[0]  = dzeta_quG.origin()[0];
-      mine.data()[1]  = dzeta_quG.local_shape()[0];
-      mine.data()[2]  = dzeta_quG.origin()[1];
-      mine.data()[3]  = dzeta_quG.local_shape()[1];
-      mine.data()[4]  = dzeta_quG.origin()[2];
-      mine.data()[5]  = dzeta_quG.local_shape()[2];
-      // for dst: only ranks of q_intra are valid receivers.
-      // Find global rank of every q_intra member and tag them on the global comm.
-      // Easier: each rank fills its own dst metadata if it belongs to q_intra of
-      // this _dZ pool — checked by the caller's split. Since this routine is
-      // called by all ranks (each in their own q_intra), the q_intra ranks
-      // each own a slab of zeta_dist.
-      mine.data()[6]  = 1;  // every rank participates in some q_intra
-      mine.data()[7]  = zeta_dist.origin()[0];
-      mine.data()[8]  = zeta_dist.local_shape()[0];
-      mine.data()[9]  = zeta_dist.origin()[1];
-      mine.data()[10] = zeta_dist.local_shape()[1];
+      // Build a 2D distributed_array on q_intra with the same (mu, g)
+      // partitioning that dzeta_quG already uses inside the pool, then
+      // redistribute into zeta_dist's (np_PQ, 1) layout.
+      long np_u = dzeta_quG.grid()[1];
+      long np_g = dzeta_quG.grid()[2];
 
-      nda::array<long,2> meta(gnp, meta_per);
-      gcomm->all_gather_n(mine.data(), meta_per, meta.data(), meta_per);
+      auto src_2d = math::nda::make_distributed_array<local2d_t>(
+          q_intra, {np_u, np_g}, {Np_smooth, ngm});
+      // Copy this rank's iq slab from dzeta_quG.local() into src_2d.local().
+      auto src_3d_loc = dzeta_quG.local();
+      auto src_loc_2d = src_3d_loc(iq_loc, ::nda::ellipsis{});
+      src_2d.local() = src_loc_2d;
 
-      // We need to know which q_intra each rank belongs to (so a src rank
-      // sends only to dst ranks in the same q_intra). Identify q_intra by
-      // comparing q_intra.rank() and translating: simpler to broadcast
-      // q_intra-id = our rank in the global comm anchored at q_intra.rank()=0.
-      // Use _dZ.origin()[0] as the canonical q-pool id (gathered via _dZ).
-      // But this routine doesn't have _dZ. Use q_intra's group rank vs gcomm:
-      //   each rank's q-pool id = (its global rank) / (q_intra.size()) *only*
-      // when q_intra was built by `comm.split(color, comm.rank())` with
-      // sequential coloring — which is the case here. To be safe, gather it.
-      long my_pool_color = (long)(grank / q_intra.size()); // assumes contiguous mapping
-      nda::array<long,1> pool_color(gnp);
-      gcomm->all_gather_n(&my_pool_color, 1, pool_color.data(), 1);
-
-      // Compute send_counts: src=this rank, dst=d. Active only if iq is in
-      // src's q-range, dst has the same pool color, and the (mu, g) overlap
-      // is non-empty.
-      bool src_has_iq = (iq >= mine.data()[0]) && (iq < mine.data()[0] + mine.data()[1]);
-      std::vector<int> send_counts(gnp, 0), send_displs(gnp, 0);
-      std::vector<int> recv_counts(gnp, 0), recv_displs(gnp, 0);
-      auto interv = [](long a0, long aN, long b0, long bN) -> std::pair<long,long> {
-        long o = std::max(a0, b0);
-        long e = std::min(a0 + aN, b0 + bN);
-        return {o, std::max(o, e)};
-      };
-
-      // For send: dst rank d must be in same q-pool as me (we send to
-      // every q-pool member that owns part of zeta_dist for iq).
-      std::vector<std::pair<long,long>> send_mu_rngs(gnp), send_g_rngs(gnp);
-      std::vector<std::pair<long,long>> recv_mu_rngs(gnp), recv_g_rngs(gnp);
-      if (src_has_iq) {
-        long s_mu_o = mine.data()[2], s_mu_n = mine.data()[3];
-        long s_g_o  = mine.data()[4], s_g_n  = mine.data()[5];
-        for (long d = 0; d < gnp; ++d) {
-          if (pool_color(d) != my_pool_color) continue;
-          long d_mu_o = meta(d, 7), d_mu_n = meta(d, 8);
-          long d_g_o  = meta(d, 9), d_g_n  = meta(d, 10);
-          auto [mu_o, mu_e] = interv(s_mu_o, s_mu_n, d_mu_o, d_mu_n);
-          auto [g_o,  g_e ] = interv(s_g_o,  s_g_n,  d_g_o,  d_g_n);
-          if (mu_e <= mu_o || g_e <= g_o) continue;
-          send_counts[d] = (int)((mu_e - mu_o) * (g_e - g_o));
-          send_mu_rngs[d] = {mu_o, mu_e};
-          send_g_rngs[d]  = {g_o,  g_e};
-        }
-      }
-
-      // For recv: src rank s must be in same pool, must have iq in its q-range,
-      // and overlap with my (mu, g).
-      long r_mu_o = mine.data()[7], r_mu_n = mine.data()[8];
-      long r_g_o  = mine.data()[9], r_g_n  = mine.data()[10];
-      for (long s = 0; s < gnp; ++s) {
-        if (pool_color(s) != my_pool_color) continue;
-        long s_q_o = meta(s, 0), s_q_n = meta(s, 1);
-        if (iq < s_q_o || iq >= s_q_o + s_q_n) continue;
-        long s_mu_o = meta(s, 2), s_mu_n = meta(s, 3);
-        long s_g_o  = meta(s, 4), s_g_n  = meta(s, 5);
-        auto [mu_o, mu_e] = interv(s_mu_o, s_mu_n, r_mu_o, r_mu_n);
-        auto [g_o,  g_e ] = interv(s_g_o,  s_g_n,  r_g_o,  r_g_n);
-        if (mu_e <= mu_o || g_e <= g_o) continue;
-        recv_counts[s] = (int)((mu_e - mu_o) * (g_e - g_o));
-        recv_mu_rngs[s] = {mu_o, mu_e};
-        recv_g_rngs[s]  = {g_o,  g_e};
-      }
-
-      for (long d = 1; d < gnp; ++d) send_displs[d] = send_displs[d-1] + send_counts[d-1];
-      for (long s = 1; s < gnp; ++s) recv_displs[s] = recv_displs[s-1] + recv_counts[s-1];
-      long total_send = (long)send_displs.back() + (long)send_counts.back();
-      long total_recv = (long)recv_displs.back() + (long)recv_counts.back();
-      std::vector<ComplexType> sbuf(total_send), rbuf(total_recv);
-
-      // Pack
-      auto src_loc = dzeta_quG.local();
-      long s_q_o  = mine.data()[0];
-      long s_mu_o = mine.data()[2];
-      long s_g_o  = mine.data()[4];
-      long iq_loc_in_src = iq - s_q_o;
-      if (src_has_iq) {
-        for (long d = 0; d < gnp; ++d) {
-          if (send_counts[d] == 0) continue;
-          long off = send_displs[d];
-          for (long mu = send_mu_rngs[d].first; mu < send_mu_rngs[d].second; ++mu)
-            for (long g = send_g_rngs[d].first; g < send_g_rngs[d].second; ++g)
-              sbuf[off++] = src_loc(iq_loc_in_src, mu - s_mu_o, g - s_g_o);
-        }
-      }
-
-      gcomm->all_to_all_v_n(
-          sbuf.data(), send_counts.data(), send_displs.data(),
-          rbuf.data(), recv_counts.data(), recv_displs.data());
-
-      // Unpack into zeta_dist.local()
-      auto dst_loc = zeta_dist.local();
-      dst_loc() = ComplexType(0.0);
-      for (long s = 0; s < gnp; ++s) {
-        if (recv_counts[s] == 0) continue;
-        long off = recv_displs[s];
-        for (long mu = recv_mu_rngs[s].first; mu < recv_mu_rngs[s].second; ++mu)
-          for (long g = recv_g_rngs[s].first; g < recv_g_rngs[s].second; ++g)
-            dst_loc(mu - r_mu_o, g - r_g_o) = rbuf[off++];
-      }
-      gcomm->barrier();
+      math::nda::redistribute(src_2d, zeta_dist);
     }
 
     /**
