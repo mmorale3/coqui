@@ -145,8 +145,18 @@ class pseudopot
     // No consumer ever reads them in steady state, so they are dropped
     // from the in-memory struct. Re-derive at the call site if needed
     // (e.g. by paw_onecenter when the deeq SCF path lands).
-    nda::array<double,1> ae_vloc;      // (mesh)
-    nda::array<double,1> ae_rho_atc;   // (mesh)
+    nda::array<double,1> ae_vloc;      // (mesh) AE radial local potential
+                                       // (= -Z/r screened by frozen AE core
+                                       //  Hartree). Diagonal of T+V_AE_static.
+    nda::array<double,1> ae_rho_atc;   // (mesh) AE atomic core density ρ_core_AE
+    nda::array<double,1> vloc_ps;      // (mesh) PS radial local pseudopotential
+                                       // — paired with ae_vloc, needed for the
+                                       //   PAW static one-center D matrix
+                                       //   (kinetic + ionic, frozen-core).
+    nda::array<double,1> rho_atc_ps;   // (mesh) PS atomic core density ρ_core_PS
+                                       //   (NLCC). Required for the dynamic
+                                       //   one-center Hartree update
+                                       //   (compute_deeq_scf).
     // GIPAW core orbitals (only when species was generated --with-gipaw)
     int  ncore_orbitals = 0;
     nda::array<double,1> core_n;       // principal qno (ncore)

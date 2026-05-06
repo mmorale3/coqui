@@ -950,6 +950,17 @@ SUBROUTINE write_species(h5_f)
         call h5_write_vector_r(h5_paw, upf(nt)%paw%ae_rho_atc, "ae_rho_atc")
       if (allocated(upf(nt)%paw%oc)) &
         call h5_write_vector_r(h5_paw, upf(nt)%paw%oc, "oc")
+      ! PS-side counterparts of ae_vloc / ae_rho_atc, needed by CoQui's
+      ! reconstruction of the PAW static one-center D matrix
+      ! (paw_init_keeq) without depending on QE's ddd_paw at runtime.
+      ! `vloc` is the radial local pseudopotential channel; `rho_atc` is
+      ! the smooth core density used for NLCC. Both are top-level UPF
+      ! fields (not under upf%paw%) but we co-locate them inside the
+      ! `paw` h5 subgroup since they are only consumed by the PAW path.
+      if (allocated(upf(nt)%vloc)) &
+        call h5_write_vector_r(h5_paw, upf(nt)%vloc, "vloc_ps")
+      if (allocated(upf(nt)%rho_atc)) &
+        call h5_write_vector_r(h5_paw, upf(nt)%rho_atc, "rho_atc_ps")
       !
       ! SOC small-component data (only present on relativistic PAW datasets)
       if (lspinorb) then

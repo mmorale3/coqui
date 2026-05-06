@@ -769,6 +769,11 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
             // (see species_paw_t comment) — not loaded.
             try { nda::h5_read(pgrp, "ae_vloc",    sp.ae_vloc); }    catch(...) {}
             try { nda::h5_read(pgrp, "ae_rho_atc", sp.ae_rho_atc); } catch(...) {}
+            // PS-side counterparts (Phase 5: PAW static D + dynamic deeq SCF).
+            // Both are needed to reconstruct paw_init_keeq inside CoQui
+            // (rather than relying on QE's ddd_paw being frozen at ρ_QE).
+            try { nda::h5_read(pgrp, "vloc_ps",    sp.vloc_ps); }    catch(...) {}
+            try { nda::h5_read(pgrp, "rho_atc_ps", sp.rho_atc_ps); } catch(...) {}
           }
           if(sp.is_paw || sp.is_uspp) {
             try { nda::h5_read(nt_grp, "aewfc",  tmp.aewfc); }  catch(...) {}
@@ -901,6 +906,8 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
       bcast_iarray_1(sp.indv);
       bcast_array_1(sp.ae_vloc);
       bcast_array_1(sp.ae_rho_atc);
+      bcast_array_1(sp.vloc_ps);
+      bcast_array_1(sp.rho_atc_ps);
       bcast_array_1(sp.core_n);
       bcast_array_1(sp.core_l);
       // heavy fields → SHM (one copy per node).
