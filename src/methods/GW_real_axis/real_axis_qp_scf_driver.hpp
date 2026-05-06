@@ -71,10 +71,12 @@ struct qp_scgw_config {
 };
 
 struct qp_scgw_result {
-  long   iter_used  = 0;
-  double final_diff = 0.0;
-  double final_mu   = 0.0;
-  bool   converged  = false;
+  long   iter_used    = 0;
+  double final_diff   = 0.0;  // ||dH_eff||_F (the legacy convergence metric).
+  double final_max_de = 0.0;  // max_n |Delta eps_n| from the last iter.
+  double final_dDm_fn = 0.0;  // ||Delta Dm||_F from the last iter.
+  double final_mu     = 0.0;
+  bool   converged    = false;
 };
 
 /**
@@ -454,6 +456,15 @@ real_axis_qp_scf_loop(real_axis_mb_state_t                          & state,
   nda::array<ComplexType, 4> Vc_skij    (ns, Nk, nbnd, nbnd);
   nda::array<ComplexType, 3> E_QP_ska   (ns, Nk, nbnd);
 
+  // Snapshots for rotation-invariant convergence diagnostics: track
+  // max_n |Delta eps| and ||Delta Dm||_F across iterations alongside
+  // ||dH_eff||_F. Both are insensitive to MO-rotation drift in
+  // degenerate / near-degenerate subspaces.
+  nda::array<ComplexType, 3> E_prev_ska (ns, Nk, nbnd);
+  nda::array<ComplexType, 4> Dm_prev_skij(ns, Nk, nbnd, nbnd);
+  E_prev_ska  = ComplexType(0.0, 0.0);
+  Dm_prev_skij = ComplexType(0.0, 0.0);
+
   const bool use_rspace = (Nk > 1);
 
   qp_scgw_result res;
@@ -609,11 +620,54 @@ real_axis_qp_scf_loop(real_axis_mb_state_t                          & state,
     }
     sHe.node_sync();
 
+    // Rotation-invariant diagnostics: max |Delta eps_n| and ||Delta Dm||_F
+    // measured against the previous iter's snapshots. Skip on iter 0
+    // (no previous iter to compare against).
+    double max_de = 0.0;
+    double dDm_fn = 0.0;
+    if (it > 0) {
+      auto sE_loc  = state.E_ska.value().local();
+      auto sDm_loc = state.Dm_skij.value().local();
+      for (long s = 0; s < ns; ++s)
+        for (long k = 0; k < Nk; ++k)
+          for (long n = 0; n < nbnd; ++n) {
+            const double d = std::abs(sE_loc(s, k, n).real()
+                                      - E_prev_ska(s, k, n).real());
+            if (d > max_de) max_de = d;
+          }
+      double acc = 0.0;
+      for (long s = 0; s < ns; ++s)
+        for (long k = 0; k < Nk; ++k)
+          for (long i = 0; i < nbnd; ++i)
+            for (long j = 0; j < nbnd; ++j) {
+              const auto z = sDm_loc(s, k, i, j) - Dm_prev_skij(s, k, i, j);
+              acc += std::norm(z);
+            }
+      dDm_fn = std::sqrt(acc);
+    }
+    // Snapshot current sE and sDm for the next-iter diff.
+    {
+      auto sE_loc  = state.E_ska.value().local();
+      auto sDm_loc = state.Dm_skij.value().local();
+      for (long s = 0; s < ns; ++s)
+        for (long k = 0; k < Nk; ++k)
+          for (long n = 0; n < nbnd; ++n)
+            E_prev_ska(s, k, n) = sE_loc(s, k, n);
+      for (long s = 0; s < ns; ++s)
+        for (long k = 0; k < Nk; ++k)
+          for (long i = 0; i < nbnd; ++i)
+            for (long j = 0; j < nbnd; ++j)
+              Dm_prev_skij(s, k, i, j) = sDm_loc(s, k, i, j);
+    }
+
     res.iter_used  = it + 1;
     res.final_diff = diff;
+    res.final_max_de = max_de;
+    res.final_dDm_fn = dDm_fn;
     if (cfg.verbose and comm.root()) {
-      app_log(1, "  iter {:3}  ||dH_eff||_F = {:.4e}  mu = {:.6f}",
-              it + 1, diff, mu_cur);
+      app_log(1, "  iter {:3}  ||dH_eff||_F = {:.4e}  max|de| = {:.4e}  "
+                  "||dDm||_F = {:.4e}  mu = {:.6f}",
+              it + 1, diff, max_de, dDm_fn, mu_cur);
     }
     if (std::abs(diff) < std::abs(cfg.conv_tol)) {
       res.converged = true;
