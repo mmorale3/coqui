@@ -1063,8 +1063,14 @@ namespace methods {
       long np_g = dzeta_quG.grid()[2];
 
       dbg("pre alloc src_2d");
+      // Match dzeta_quG's block_size on the (mu, g) dims so the local
+      // chunks line up exactly. Defaulting to bsize=1 produces a
+      // *different* chunk_range partition than dzeta_quG used (which is
+      // built with non-trivial block sizes by thc::evaluate).
+      auto dz_bs = dzeta_quG.block_size();
       auto src_2d = math::nda::make_distributed_array<local2d_t>(
-          q_intra, {np_u, np_g}, {Np_smooth, ngm});
+          q_intra, {np_u, np_g}, {Np_smooth, ngm},
+          std::array<long,2>{dz_bs[1], dz_bs[2]});
       dbg("post alloc src_2d");
 
       auto Aloc = dzeta_quG.local();
