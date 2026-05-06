@@ -1040,9 +1040,15 @@ namespace methods {
         mpi3::communicator& q_intra)
     {
       using local2d_t = memory::array<HOST_MEMORY, ComplexType, 2>;
+      auto* gcomm = dzeta_quG.communicator();
+      auto dbg = [&](char const* tag) {
+        std::cerr << "[r" << gcomm->rank() << "] fill_zeta." << iq << ": " << tag << std::endl;
+      };
+
       long Np_smooth = zeta_dist.global_shape()[0];
       long ngm       = zeta_dist.global_shape()[1];
 
+      dbg("entry");
       auto qrng = dzeta_quG.local_range(0);
       long iq_loc = -1;
       for (auto [i, q] : itertools::enumerate(qrng))
@@ -1051,21 +1057,32 @@ namespace methods {
         "fill_zeta_for_iq_into_qpool: iq={} not in this rank's q-range "
         "[{},{}); dzeta_quG q-axis must be partitioned to match _dZ q-pools.",
         iq, qrng.first(), qrng.last());
+      dbg("iq_loc found");
 
-      // Build a 2D distributed_array on q_intra with the same (mu, g)
-      // partitioning that dzeta_quG already uses inside the pool, then
-      // redistribute into zeta_dist's (np_PQ, 1) layout.
       long np_u = dzeta_quG.grid()[1];
       long np_g = dzeta_quG.grid()[2];
 
+      dbg("pre alloc src_2d");
       auto src_2d = math::nda::make_distributed_array<local2d_t>(
           q_intra, {np_u, np_g}, {Np_smooth, ngm});
-      // Copy this rank's iq slab from dzeta_quG.local() into src_2d.local().
-      auto src_3d_loc = dzeta_quG.local();
-      auto src_loc_2d = src_3d_loc(iq_loc, ::nda::ellipsis{});
-      src_2d.local() = src_loc_2d;
+      dbg("post alloc src_2d");
+
+      auto Aloc = dzeta_quG.local();
+      auto Bloc = src_2d.local();
+      utils::check(Aloc.shape(1) == Bloc.shape(0) && Aloc.shape(2) == Bloc.shape(1),
+        "fill_zeta_for_iq_into_qpool: shape mismatch — dzeta local {}x{}x{} vs "
+        "src_2d local {}x{}.",
+        Aloc.shape(0), Aloc.shape(1), Aloc.shape(2),
+        Bloc.shape(0), Bloc.shape(1));
+      dbg("pre copy loop");
+
+      for (long i = 0; i < Bloc.shape(0); ++i)
+        for (long j = 0; j < Bloc.shape(1); ++j)
+          Bloc(i, j) = Aloc(iq_loc, i, j);
+      dbg("post copy loop");
 
       math::nda::redistribute(src_2d, zeta_dist);
+      dbg("post redistribute");
     }
 
     /**
