@@ -552,6 +552,7 @@ namespace methods {
           _MF->kpts(), symm_list_local,
           atom_perm_inv, wigner_d, _npol, *_mpi);
       _Timer.stop("PAW_AUG.Pskna_lift");
+std::cout<<" PAW_AUG.Pskna_lift: " <<_Timer.elapsed("PAW_AUG.Pskna_lift") <<std::endl;
 
       // ----------------------------------------------------------------
       // 2) Augment X_shm: append Y rows below smooth ζ rows.
@@ -594,6 +595,7 @@ namespace methods {
         _X_shm = X_new;
       }
       _Timer.stop("PAW_AUG.X_aug");
+std::cout<<" X_aug: " <<_Timer.elapsed("PAW_AUG.X_aug") <<std::endl;
 
       utils::check(x_range == y_range || !_Y_shm.has_value(),
         "thc_reader::augment_thc_with_paw: x_range != y_range augmentation "
@@ -605,16 +607,17 @@ namespace methods {
       // ----------------------------------------------------------------
       auto _dZ_smooth = std::move(_dZ);
       long np = (long)_mpi->comm.size();
-      long nqpools = utils::find_proc_grid_max_npools(np, _nqpts_ibz, 0.2);
-      utils::check(nqpools > 0 && np % nqpools == 0,
-                   "thc_reader::augment: bad pgrid (np={}, nqpts_ibz={})",
-                   np, _nqpts_ibz);
-      long np_PQ = np / nqpools;
-      long np_P = utils::find_proc_grid_min_diff(np_PQ, 1, 1);
-      long np_Q = np_PQ / np_P;
+      long nqpools = _dZ_smooth.grid()[0]; 
+      long np_P = _dZ_smooth.grid()[1]; 
+      long np_Q = _dZ_smooth.grid()[2];
+      long np_PQ = np_P*np_Q;
+      long bsize = std::min(1024l, std::min(N_total/np_P, N_total/np_Q));
+      utils::check(nqpools > 0 && np % nqpools == 0 && np == nqpools*np_PQ,
+                   "thc_reader::augment: bad pgrid (np={}, nqpts_ibz={}, nqpools:{}, np_PQ:{})",
+                   np, _nqpts_ibz, nqpools, np_PQ);
       _dZ = math::nda::make_distributed_array<Array_t<HOST_MEMORY,3>>(
           _mpi->comm, {nqpools, np_P, np_Q},
-          {(long)_nqpts_ibz, N_total, N_total});
+          {(long)_nqpts_ibz, N_total, N_total},{1,bsize,bsize}); 
       _dZ.local()() = ComplexType(0.0);
 
       // ----------------------------------------------------------------
@@ -630,7 +633,7 @@ namespace methods {
       _dZ_smooth.reset();
       _Timer.stop("PAW_AUG.gather_smooth");
       _mpi->comm.barrier();
-      if (_mpi->comm.root()) { std::cout << "  paw_aug.dbg: after embed_smooth" << std::endl; std::cout.flush(); }
+      if (_mpi->comm.root()) { std::cout << "  paw_aug.dbg: after embed_smooth: " <<_Timer.elapsed("PAW_AUG.gather_smooth") << std::endl; std::cout.flush(); }
 
       // ----------------------------------------------------------------
       // 5) Build the small angular-coupling tables (replicated, ~kB) and
@@ -721,6 +724,7 @@ namespace methods {
           q_intra, {np_PQ, 1L}, {(long)_N_aug,    ngm_rho});
       auto eta_w_dist = math::nda::make_distributed_array<Array_t<HOST_MEMORY,2>>(
           q_intra, {np_PQ, 1L}, {(long)_N_aug,    ngm_rho});
+//MAM: need to check above that np_PQ is smaller than _N_aug
 
       // Rank-local row buffers for this rank's _dZ tile sub-blocks.
       // Sized to the irregular (P, Q) chunks of the new _dZ. Per-rank
@@ -1121,8 +1125,15 @@ namespace methods {
       utils::check(out.shape(0) == wanted_rows.size() && out.shape(1) == N,
         "gather_rows_from_dist_qpool: out shape ({}, {}) != ({}, {})",
         out.shape(0), out.shape(1), wanted_rows.size(), N);
-      out() = T(0);
-      if (wanted_rows.size() == 0) return;
+      if (out.size() > 0) out() = T(0);
+      // NOTE: do NOT early-return when wanted_rows is empty — this rank
+      // still has to participate in the comm.all_gather_n / all_to_all_v_n
+      // / barrier collectives below. With wanted_rows.first()==last() its
+      // mine(2)==mine(3), interv() returns an empty intersection for every
+      // partner, recv_counts[*] stay 0, and the alltoallv is a valid no-op
+      // for this rank. Skipping the collectives would deadlock the other
+      // ranks of `comm` whose tiles do have rows to gather (e.g. ranks
+      // with empty P_aug/Q_aug while others on the same q-pool are not).
 
       // metadata: (A.origin[0], A.lshape[0], wanted_rows.first, wanted_rows.last)
       nda::array<long,2> meta(nproc, 4);
