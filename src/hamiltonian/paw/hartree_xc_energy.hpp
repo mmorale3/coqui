@@ -316,7 +316,7 @@ inline double hartree_energy_paw(
 
 /**
  * Cross-check Hartree energy: build V_H(r) using CoQui's existing
- * v_h_paw pipeline (which is validated by the USPP eigenvalue test), and
+ * pseudopot-aware hamilt::v_h pipeline (validated by the USPP eigenvalue test), and
  * integrate (1/2) ∫ ρ_total(r) V_H(r) dr in r-space.
  *
  * If this matches `hartree_energy_paw` (G-space formula), the discrepancy
@@ -353,12 +353,13 @@ inline double hartree_energy_via_vH(
                                         k2g, kpts, kp_to_ibz, kp_trev,
                                         kp_symm, symm_list, nii, psi, vol);
 
-    // V_H(r) via the existing v_h_paw pipeline (validated for USPP eigenvalues)
+    // V_H(r) via the pseudopot-aware hamilt::v_h pipeline (validated for
+    // USPP eigenvalues; NCPP short-circuits the augmentation step).
     auto svr = math::shm::shared_array<nda::array_view<ComplexType,1>>(
         mpi, {nnr});
     pots::potential_t vG(ptree{});
-    v_h_paw(mpi, vG, psp, npol, mesh, lattv, recv, k2g, kpts, kp_to_ibz,
-            kp_trev, kp_symm, symm_list, nii, psi, false, svr);
+    ::hamilt::v_h(mpi, vG, psp, npol, mesh, lattv, recv, k2g, kpts, kp_to_ibz,
+                  kp_trev, kp_symm, symm_list, nii, psi, false, svr);
 
     double E_H = 0.0;
     if (mpi.comm.root()) {

@@ -2,35 +2,28 @@
  * ==========================================================================
  * CoQuí: Correlated Quantum ínterface
  *
- * PAW-aware Hartree potential evaluators on the dense FFT grid.
+ * Pseudopot-aware Hartree potential entry points on the dense FFT grid.
  *
- * The existing hamilt::v_h routines (src/hamiltonian/v_h.hpp) compute V_H
- * from the smooth pseudo-density ρ̃(r) only. For USPP/PAW, the relevant
- * smooth-grid quantity is the COMPENSATED density
+ * This header provides overloads of `hamilt::v_h(...)` that take a
+ * `pseudopot const&` and dispatch internally on `psp.pp_type()`:
+ *   - NCPP  : delegate to the smooth-only `hamilt::v_h(...)` overload in
+ *             `src/hamiltonian/v_h.hpp` (no augmentation needed).
+ *   - USPP/PAW : run the smooth pipeline, then add the compensation-charge
+ *             contribution Δρ_aug → ΔV_aug to the V_H(r) buffer.
  *
+ * Callers should always use the pseudopot-taking `hamilt::v_h(...)` so that
+ * NCPP-vs-USPP/PAW dispatch is selected correctly without per-callsite
+ * pp_type branches. The smooth-only overload of `hamilt::v_h` is kept for
+ * the internal delegate, but should not be invoked directly from outside
+ * the dispatch wrapper.
+ *
+ * The compensated density is
  *   ρ̄(G) = ρ̃(G) + Σ_a Σ_{IJ} becsum_{a,IJ} Q^{IJ}_{nt(a)}(G) e^{-iG·τ_a}
- *
- * where becsum is built from the projector overlaps Pskna and the input
- * occupations / density matrix:
+ * with
  *   diagonal nii :  becsum_{a,IJ} = Σ_{s,k,n} f_{skn} P*_{n,aI} P_{n,aJ}
  *   full nij     :  becsum_{a,IJ} = Σ_{s,k,a,b} P*_{a,aI} n_{skab} P_{b,aJ}
- *
- * V̄_H(G) = (4π/|G|^2) ρ̄(G), V̄_H(r) = iFFT[V̄_H(G)].
- *
- * The δρ_a one-center residuals (.tex Eq. paw-coulomb-partition) are NOT
- * computed here — they enter via the PAW ΔD_{IJ} correction matrix added to
- * the non-local Hamiltonian (separate code path; not yet in CoQui).
- *
- * Strategy: rather than reimplement the v_h FFT pipeline, this module
- *   (1) calls the existing hamilt::v_h to get the smooth-grid ρ̃(r) folded
- *       into V_H(r),
- *   (2) computes the augmentation contribution Δρ_aug(G) directly from
- *       Pskna + qgm + miller_g_dense, applies 4π/|G|^2 to get ΔV_aug(G),
- *       and FFTs to ΔV_aug(r),
- *   (3) adds ΔV_aug(r) into the V_H(r) buffer.
- *
- * For NCPP this routine is a no-op (qgm is empty); callers can use it
- * unconditionally.
+ * The δρ_a one-center residuals enter via the PAW ΔD_{IJ} correction matrix
+ * (separate code path; tracked in project_paw_deeq_self_consistency_todo).
  * ==========================================================================
  */
 #ifndef HAMILTONIAN_PAW_V_H_PAW_HPP
@@ -339,79 +332,85 @@ inline void add_paw_augmentation_to_VH(
     mpi.comm.barrier();
 }
 
+} // namespace hamilt::paw
+
+namespace hamilt {
+
 /**
- * PAW Hartree potential on the dense FFT mesh from a diagonal occupation.
+ * Pseudopot-aware Hartree potential overload — diagonal-occupation form.
  *
- * Equivalent to hamilt::v_h(...) for NCPP (just delegates). For USPP/PAW,
- * adds the compensation-charge Δρ_aug to ρ̃ before applying 4π/G^2.
+ * Always-correct entry point for NCPP/USPP/PAW. NCPP is handled by
+ * delegating to the smooth-only `hamilt::v_h(... no pseudopot ...)`
+ * overload in v_h.hpp; USPP/PAW additionally adds the compensation-charge
+ * contribution to V_H(r).
  */
 template<nda::ArrayOfRank<1> Arr>
-void v_h_paw(utils::mpi_context_t<boost::mpi3::communicator,
-                                   boost::mpi3::shared_communicator>& mpi,
-             pots::potential_t& vG,
-             pseudopot const& psp,
-             int npol,
-             nda::stack_array<long, 3> const& mesh,
-             nda::stack_array<double, 3, 3> const& lattv,
-             nda::stack_array<double, 3, 3> const& recv,
-             nda::ArrayOfRank<1> auto const& k2g,
-             nda::ArrayOfRank<2> auto const& kpts,
-             nda::ArrayOfRank<1> auto const& kp_to_ibz,
-             nda::ArrayOfRank<1> auto const& kp_trev,
-             nda::ArrayOfRank<1> auto const& kp_symm,
-             std::vector<utils::symm_op> const& symm_list,
-             nda::ArrayOfRank<3> auto const& nii,
-             math::nda::DistributedArrayOfRank<4> auto const& psi,
-             bool symmetrize_rho_r,
-             math::shm::shared_array<Arr>& svr)
+void v_h(utils::mpi_context_t<boost::mpi3::communicator,
+                              boost::mpi3::shared_communicator>& mpi,
+         pots::potential_t& vG,
+         pseudopot const& psp,
+         int npol,
+         nda::stack_array<long, 3> const& mesh,
+         nda::stack_array<double, 3, 3> const& lattv,
+         nda::stack_array<double, 3, 3> const& recv,
+         nda::ArrayOfRank<1> auto const& k2g,
+         nda::ArrayOfRank<2> auto const& kpts,
+         nda::ArrayOfRank<1> auto const& kp_to_ibz,
+         nda::ArrayOfRank<1> auto const& kp_trev,
+         nda::ArrayOfRank<1> auto const& kp_symm,
+         std::vector<utils::symm_op> const& symm_list,
+         nda::ArrayOfRank<3> auto const& nii,
+         math::nda::DistributedArrayOfRank<4> auto const& psi,
+         bool symmetrize_rho_r,
+         math::shm::shared_array<Arr>& svr)
 {
     // Smooth-grid Hartree (existing path). Writes V_H(r) into svr.
     hamilt::v_h(mpi, vG, npol, mesh, lattv, recv, k2g, kpts, kp_to_ibz,
                 kp_trev, kp_symm, symm_list, nii, psi, symmetrize_rho_r, svr);
-    // PAW augmentation correction (no-op for NCPP).
+    // PAW/USPP augmentation correction (no-op for NCPP).
     if (psp.pp_type() == pp_ncpp_t) return;
-    auto becsum = compute_becsum_diagonal(psp.Pskna_view(), nii,
-                                          psp.ityp_view(), psp.nh_view(),
-                                          psp.ofs_view(), npol);
-    add_paw_augmentation_to_VH<Arr>(mpi, psp, becsum, mesh, recv,
-                                     (int)kp_to_ibz.shape(0),
-                                     (int)psi.global_shape()[0], npol, svr);
+    auto becsum = ::hamilt::paw::compute_becsum_diagonal(
+        psp.Pskna_view(), nii, psp.ityp_view(), psp.nh_view(),
+        psp.ofs_view(), npol);
+    ::hamilt::paw::add_paw_augmentation_to_VH<Arr>(
+        mpi, psp, becsum, mesh, recv,
+        (int)kp_to_ibz.shape(0), (int)psi.global_shape()[0], npol, svr);
 }
 
 /**
- * PAW Hartree potential on the dense FFT mesh from a full density matrix.
+ * Pseudopot-aware Hartree potential overload — full density-matrix form.
  */
 template<nda::ArrayOfRank<1> Arr>
-void v_h_paw(utils::mpi_context_t<boost::mpi3::communicator,
-                                   boost::mpi3::shared_communicator>& mpi,
-             pots::potential_t& vG,
-             pseudopot const& psp,
-             int npol,
-             nda::stack_array<long, 3> const& mesh,
-             nda::stack_array<double, 3, 3> const& lattv,
-             nda::stack_array<double, 3, 3> const& recv,
-             nda::ArrayOfRank<1> auto const& k2g,
-             nda::ArrayOfRank<2> auto const& kpts,
-             nda::ArrayOfRank<1> auto const& kp_to_ibz,
-             nda::ArrayOfRank<1> auto const& kp_trev,
-             nda::ArrayOfRank<1> auto const& kp_symm,
-             std::vector<utils::symm_op> const& symm_list,
-             nda::ArrayOfRank<4> auto const& nij,
-             math::nda::DistributedArrayOfRank<4> auto const& psi,
-             bool symmetrize_rho_r,
-             math::shm::shared_array<Arr>& svr)
+void v_h(utils::mpi_context_t<boost::mpi3::communicator,
+                              boost::mpi3::shared_communicator>& mpi,
+         pots::potential_t& vG,
+         pseudopot const& psp,
+         int npol,
+         nda::stack_array<long, 3> const& mesh,
+         nda::stack_array<double, 3, 3> const& lattv,
+         nda::stack_array<double, 3, 3> const& recv,
+         nda::ArrayOfRank<1> auto const& k2g,
+         nda::ArrayOfRank<2> auto const& kpts,
+         nda::ArrayOfRank<1> auto const& kp_to_ibz,
+         nda::ArrayOfRank<1> auto const& kp_trev,
+         nda::ArrayOfRank<1> auto const& kp_symm,
+         std::vector<utils::symm_op> const& symm_list,
+         nda::ArrayOfRank<4> auto const& nij,
+         math::nda::DistributedArrayOfRank<4> auto const& psi,
+         bool symmetrize_rho_r,
+         math::shm::shared_array<Arr>& svr)
 {
     hamilt::v_h(mpi, vG, npol, mesh, lattv, recv, k2g, kpts, kp_to_ibz,
                 kp_trev, kp_symm, symm_list, nij, psi, symmetrize_rho_r, svr);
     if (psp.pp_type() == pp_ncpp_t) return;
-    auto becsum = compute_becsum_full(psp.Pskna_view(), nij,
-                                      psp.ityp_view(), psp.nh_view(),
-                                      psp.ofs_view(), npol);
-    add_paw_augmentation_to_VH<Arr>(mpi, psp, becsum, mesh, recv,
-                                     (int)kp_to_ibz.shape(0),
-                                     (int)psi.global_shape()[0], npol, svr);
+    auto becsum = ::hamilt::paw::compute_becsum_full(
+        psp.Pskna_view(), nij, psp.ityp_view(), psp.nh_view(),
+        psp.ofs_view(), npol);
+    ::hamilt::paw::add_paw_augmentation_to_VH<Arr>(
+        mpi, psp, becsum, mesh, recv,
+        (int)kp_to_ibz.shape(0), (int)psi.global_shape()[0], npol, svr);
 }
 
-} // namespace hamilt::paw
+} // namespace hamilt
 
 #endif // HAMILTONIAN_PAW_V_H_PAW_HPP

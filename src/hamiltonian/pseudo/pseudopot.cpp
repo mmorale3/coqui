@@ -1077,16 +1077,17 @@ void pseudopot::add_vpp_impl(boost::mpi3::communicator& comm,
                   "Error in pseudo::add_vpp_impl: Both nii and nij!!");
     utils::check( k_range.first() == 0 and  k_range.last() == nkpts_ibz, 
                  "Error in add_vloc: add_hartree requires full kpoint range.");
-    // Calculate and add Hartree term. v_h_paw delegates to the existing
-    // hamilt::v_h for the smooth-density Hartree, then adds the PAW
-    // compensation-charge augmentation Σ_a Σ_IJ becsum_aIJ Q^IJ_nt(G) e^{-iG·τ_a}.
-    // For NCPP, v_h_paw is a transparent passthrough.
+    // Calculate and add Hartree term. The pseudopot-taking hamilt::v_h
+    // overload delegates to the smooth-only hamilt::v_h for the
+    // smooth-density Hartree, then (for USPP/PAW) adds the compensation-
+    // charge augmentation Σ_a Σ_IJ becsum_aIJ Q^IJ_nt(G) e^{-iG·τ_a}.
+    // For NCPP, the augmentation step short-circuits to a no-op.
     if( nii != nullptr)
-      hamilt::paw::v_h_paw(*mpi, vG, *this, npol, fft_mesh_aug, lattv, recv,
+      hamilt::v_h(*mpi, vG, *this, npol, fft_mesh_aug, lattv, recv,
                   swfc_to_rho.local(), kpts, kp_to_ibz,
                   kp_trev, kp_symm, symm_list, *nii, psi, false, svr);
     else
-      hamilt::paw::v_h_paw(*mpi, vG, *this, npol, fft_mesh_aug, lattv, recv,
+      hamilt::v_h(*mpi, vG, *this, npol, fft_mesh_aug, lattv, recv,
                   swfc_to_rho.local(), kpts, kp_to_ibz,
                   kp_trev, kp_symm, symm_list, *nij, psi, false, svr);
 
@@ -1268,15 +1269,15 @@ void pseudopot::add_Hartree_impl(nda::range k_range,
                "Error in pseudo::add_Hartree_impl: Both nii and nij exist!");
   utils::check(k_range.first() == 0 and k_range.last() == nkpts_ibz,
                "Error in add_Hartree_impl: add_hartree requires full kpoint range.");
-  // calculate and add hartree term. v_h_paw delegates to v_h then adds the
-  // PAW compensation-charge augmentation in G-space; for NCPP it's a
-  // transparent passthrough.
+  // calculate and add hartree term. The pseudopot-taking hamilt::v_h
+  // delegates to the smooth-only v_h then (for USPP/PAW) adds the
+  // compensation-charge augmentation in G-space; NCPP no-ops the augment.
   if (nii != nullptr)
-    hamilt::paw::v_h_paw(*mpi, vG, *this, npol, fft_mesh_aug, lattv, recv,
+    hamilt::v_h(*mpi, vG, *this, npol, fft_mesh_aug, lattv, recv,
                 swfc_to_rho.local(), kpts, kp_to_ibz,
                 kp_trev, kp_symm, symm_list, *nii, psi, symmetrize, sv_hartree);
   else
-    hamilt::paw::v_h_paw(*mpi, vG, *this, npol, fft_mesh_aug, lattv, recv,
+    hamilt::v_h(*mpi, vG, *this, npol, fft_mesh_aug, lattv, recv,
                 swfc_to_rho.local(), kpts, kp_to_ibz,
                 kp_trev, kp_symm, symm_list, *nij, psi, symmetrize, sv_hartree);
 
