@@ -24,8 +24,6 @@
 
 #include <string>
 #include <optional>
-#include <chrono>
-#include <iomanip>
 
 #include "configuration.hpp"
 #include "IO/ptree/ptree_utilities.hpp"
@@ -552,7 +550,6 @@ namespace methods {
           _MF->kpts(), symm_list_local,
           atom_perm_inv, wigner_d, _npol, *_mpi);
       _Timer.stop("PAW_AUG.Pskna_lift");
-std::cout<<" PAW_AUG.Pskna_lift: " <<_Timer.elapsed("PAW_AUG.Pskna_lift") <<std::endl;
 
       // ----------------------------------------------------------------
       // 2) Augment X_shm: append Y rows below smooth ζ rows.
@@ -595,7 +592,6 @@ std::cout<<" PAW_AUG.Pskna_lift: " <<_Timer.elapsed("PAW_AUG.Pskna_lift") <<std:
         _X_shm = X_new;
       }
       _Timer.stop("PAW_AUG.X_aug");
-std::cout<<" X_aug: " <<_Timer.elapsed("PAW_AUG.X_aug") <<std::endl;
 
       utils::check(x_range == y_range || !_Y_shm.has_value(),
         "thc_reader::augment_thc_with_paw: x_range != y_range augmentation "
@@ -626,14 +622,10 @@ std::cout<<" X_aug: " <<_Timer.elapsed("PAW_AUG.X_aug") <<std::endl;
       //    sizes (Np_smooth vs N_total), so we cannot reuse `redistribute`
       //    directly — implement an alltoallv block-into-subblock helper.
       // ----------------------------------------------------------------
-      if (_mpi->comm.root()) { std::cout << "  paw_aug.dbg: before embed_smooth" << std::endl; std::cout.flush(); }
-      _mpi->comm.barrier();
       _Timer.start("PAW_AUG.gather_smooth");
       embed_smooth_block_into_aug_dZ(_dZ_smooth, _dZ);
       _dZ_smooth.reset();
       _Timer.stop("PAW_AUG.gather_smooth");
-      _mpi->comm.barrier();
-      if (_mpi->comm.root()) { std::cout << "  paw_aug.dbg: after embed_smooth: " <<_Timer.elapsed("PAW_AUG.gather_smooth") << std::endl; std::cout.flush(); }
 
       // ----------------------------------------------------------------
       // 5) Build the small angular-coupling tables (replicated, ~kB) and
@@ -736,30 +728,14 @@ std::cout<<" X_aug: " <<_Timer.elapsed("PAW_AUG.X_aug") <<std::endl;
       nda::array<ComplexType,2> eta_w_P_aug_g (P_aug_rows_la.size(),   ngm_rho);
       nda::array<ComplexType,2> eta_P_aug_conj(P_aug_rows_la.size(),   ngm_rho);
 
-      auto t_start = std::chrono::steady_clock::now();
-      auto dbg = [&](char const* tag) {
-        _mpi->comm.barrier();
-        if (_mpi->comm.root()) {
-          auto now = std::chrono::steady_clock::now();
-          double sec = std::chrono::duration<double>(now - t_start).count();
-          std::cout << "  paw_aug.dbg [t=" << std::fixed << std::setprecision(2)
-                    << sec << "s]: " << tag << std::endl;
-          std::cout.flush();
-        }
-        _mpi->comm.barrier();
-      };
-      dbg("entering q-loop");
-
       for (auto [iq_l, iq] : itertools::enumerate(qloc_new)) {
         std::array<double,3> q_cart = {
             -Qpts_cart(iq, 0), -Qpts_cart(iq, 1), -Qpts_cart(iq, 2)};
 
         // ---- 6a) Pull this q's ζ slab into zeta_dist (q-pool, row-split). ----
-        dbg("before fill_zeta");
         _Timer.start("PAW_AUG.dzeta");
         fill_zeta_for_iq_into_qpool(dzeta_quG, (int)iq, zeta_dist, q_intra);
         _Timer.stop("PAW_AUG.dzeta");
-        dbg("after fill_zeta");
 
         // ---- 6b) Build η^q for this rank's la_chunk. ----
         _Timer.start("PAW_AUG.eta_at_q");
@@ -791,17 +767,11 @@ std::cout<<" X_aug: " <<_Timer.elapsed("PAW_AUG.X_aug") <<std::endl;
 
         // ---- 6e) Gather rows of ζ / η_w / η that this rank will need. ----
         // Five row-gathers per q (on q_intra, np_PQ-way).
-        dbg("before gathers");
         gather_rows_from_dist_qpool(zeta_dist , P_smooth_rows, q_intra, zeta_P_smooth_g);
-        dbg("g1");
         gather_rows_from_dist_qpool(zeta_dist , Q_smooth_cols, q_intra, zeta_Q_smooth_g);
-        dbg("g2");
         gather_rows_from_dist_qpool(eta_w_dist, Q_aug_cols_la, q_intra, eta_w_Q_aug_g);
-        dbg("g3");
         gather_rows_from_dist_qpool(eta_w_dist, P_aug_rows_la, q_intra, eta_w_P_aug_g);
-        dbg("g4");
         gather_rows_from_dist_qpool(eta_dist  , P_aug_rows_la, q_intra, eta_P_aug_conj);
-        dbg("after all gathers");
         // Now eta_P_aug_conj holds η; flip to conj(η) for V_LL / V_LG GEMMs.
         for (long la = 0; la < eta_P_aug_conj.shape(0); ++la)
           for (long g = 0; g < ngm_rho; ++g)
@@ -1053,15 +1023,10 @@ std::cout<<" X_aug: " <<_Timer.elapsed("PAW_AUG.X_aug") <<std::endl;
         mpi3::communicator& q_intra)
     {
       using local2d_t = memory::array<HOST_MEMORY, ComplexType, 2>;
-      auto* gcomm = dzeta_quG.communicator();
-      auto dbg = [&](char const* tag) {
-        std::cerr << "[r" << gcomm->rank() << "] fill_zeta." << iq << ": " << tag << std::endl;
-      };
 
       long Np_smooth = zeta_dist.global_shape()[0];
       long ngm       = zeta_dist.global_shape()[1];
 
-      dbg("entry");
       auto qrng = dzeta_quG.local_range(0);
       long iq_loc = -1;
       for (auto [i, q] : itertools::enumerate(qrng))
@@ -1070,12 +1035,10 @@ std::cout<<" X_aug: " <<_Timer.elapsed("PAW_AUG.X_aug") <<std::endl;
         "fill_zeta_for_iq_into_qpool: iq={} not in this rank's q-range "
         "[{},{}); dzeta_quG q-axis must be partitioned to match _dZ q-pools.",
         iq, qrng.first(), qrng.last());
-      dbg("iq_loc found");
 
       long np_u = dzeta_quG.grid()[1];
       long np_g = dzeta_quG.grid()[2];
 
-      dbg("pre alloc src_2d");
       // Match dzeta_quG's block_size on the (mu, g) dims so the local
       // chunks line up exactly. Defaulting to bsize=1 produces a
       // *different* chunk_range partition than dzeta_quG used (which is
@@ -1084,7 +1047,6 @@ std::cout<<" X_aug: " <<_Timer.elapsed("PAW_AUG.X_aug") <<std::endl;
       auto src_2d = math::nda::make_distributed_array<local2d_t>(
           q_intra, {np_u, np_g}, {Np_smooth, ngm},
           std::array<long,2>{dz_bs[1], dz_bs[2]});
-      dbg("post alloc src_2d");
 
       auto Aloc = dzeta_quG.local();
       auto Bloc = src_2d.local();
@@ -1093,15 +1055,12 @@ std::cout<<" X_aug: " <<_Timer.elapsed("PAW_AUG.X_aug") <<std::endl;
         "src_2d local {}x{}.",
         Aloc.shape(0), Aloc.shape(1), Aloc.shape(2),
         Bloc.shape(0), Bloc.shape(1));
-      dbg("pre copy loop");
 
       for (long i = 0; i < Bloc.shape(0); ++i)
         for (long j = 0; j < Bloc.shape(1); ++j)
           Bloc(i, j) = Aloc(iq_loc, i, j);
-      dbg("post copy loop");
 
       math::nda::redistribute(src_2d, zeta_dist);
-      dbg("post redistribute");
     }
 
     /**
