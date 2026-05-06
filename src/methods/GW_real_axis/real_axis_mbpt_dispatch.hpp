@@ -374,6 +374,10 @@ inline void run_real_axis_qpgw(THC_t& thc, ptree const& pt)
   // ‖dH_eff‖_F as a meaningful metric and DIIS convergence speed.
   const auto align_mo_p   = io::get_value_with_default<bool>  (pt, "align_mo", true);
   const auto dE_cluster_p = io::get_value_with_default<double>(pt, "dE_cluster_align", 1e-3);
+  // Rotation-invariant alternative stopping criteria (in addition to
+  // ||dH_eff||_F < conv_thr). Set to 0 to disable.
+  const auto tol_max_de_p = io::get_value_with_default<double>(pt, "tol_max_de", 1e-3);
+  const auto tol_dDm_p    = io::get_value_with_default<double>(pt, "tol_dDm",    1e-3);
   // Non-uniform fermionic-grid options (see [real_axis_gw] section docs).
   auto       grid_kind_s = io::get_value_with_default<std::string>(pt, "grid_kind", "uniform");
   const auto w_dense_p   = io::get_value_with_default<double>(pt, "w_dense", 0.0);
@@ -444,6 +448,8 @@ inline void run_real_axis_qpgw(THC_t& thc, ptree const& pt)
     app_log(2, "  align_mo    = {}", align_mo_p ? "true" : "false");
     if (align_mo_p)
       app_log(2, "  dE_cluster  = {:.2e}", dE_cluster_p);
+    app_log(2, "  tol_max_de  = {:.1e}", tol_max_de_p);
+    app_log(2, "  tol_dDm     = {:.1e}", tol_dDm_p);
   }
 
   // ---- Build sH_0, sS, sFock from MF -------------------------------------
@@ -518,6 +524,8 @@ inline void run_real_axis_qpgw(THC_t& thc, ptree const& pt)
   cfg.verbose     = verbose;
   cfg.align_mo    = align_mo_p;
   cfg.dE_cluster_align = dE_cluster_p;
+  cfg.tol_max_de  = tol_max_de_p;
+  cfg.tol_dDm     = tol_dDm_p;
 
   // ---- BZ weights, electron count ---------------------------------------
   nda::array<double, 1> k_weights(Nk);

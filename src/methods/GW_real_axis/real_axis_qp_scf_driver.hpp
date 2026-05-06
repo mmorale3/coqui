@@ -73,6 +73,13 @@ struct qp_scgw_config {
   // drift in degenerate / near-degenerate eigenvalue clusters.
   bool          align_mo      = true;
   double        dE_cluster_align = 1e-3;   // cluster ε's within this gap.
+  // Rotation-invariant convergence signals — alternative stopping
+  // criteria. SCF terminates when ||dH_eff||_F < conv_tol OR
+  // (max|Δε| < tol_max_de AND ||ΔDm||_F < tol_dDm). The latter is
+  // gauge-invariant; useful when the H_eff residual is rotation-
+  // dominated. Set to 0 to disable that branch.
+  double        tol_max_de    = 1e-3;
+  double        tol_dDm       = 1e-3;
 };
 
 struct qp_scgw_result {
@@ -806,7 +813,16 @@ real_axis_qp_scf_loop(real_axis_mb_state_t                          & state,
                   "||dDm||_F = {:.4e}  mu = {:.6f}",
               it + 1, diff, max_de, dDm_fn, mu_cur);
     }
-    if (std::abs(diff) < std::abs(cfg.conv_tol)) {
+    // Stopping: legacy ||dH_eff|| < conv_tol  OR  rotation-invariant
+    // (max|Δε| < tol_max_de  AND  ||ΔDm|| < tol_dDm). The latter
+    // requires it > 0 (snapshots are populated only after iter 1).
+    bool stop_legacy = (std::abs(diff) < std::abs(cfg.conv_tol));
+    bool stop_invariant = (it > 0)
+                       and (cfg.tol_max_de > 0.0)
+                       and (cfg.tol_dDm    > 0.0)
+                       and (max_de < cfg.tol_max_de)
+                       and (dDm_fn < cfg.tol_dDm);
+    if (stop_legacy or stop_invariant) {
       res.converged = true;
       break;
     }
