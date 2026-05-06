@@ -76,7 +76,7 @@ namespace hamilt::paw {
 inline nda::array<int,2> build_atom_permutation_inverse(
     nda::ArrayOfRank<2> auto const& atom_pos_cart,         // (nat, 3) cartesian
     nda::ArrayOfRank<1> auto const& ityp,                  // (nat) species
-    nda::ArrayOfRank<2> auto const& latt,                  // (3, 3) lattice vecs (row = primitive a_i)
+    [[maybe_unused]] nda::ArrayOfRank<2> auto const& latt,                  // (3, 3) lattice vecs (row = primitive a_i)
     nda::ArrayOfRank<2> auto const& recv,                  // (3, 3) reciprocal vecs (row = primitive b_i)
     std::vector<utils::symm_op> const& symm_list)
 {

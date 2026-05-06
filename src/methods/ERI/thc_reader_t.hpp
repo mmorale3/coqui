@@ -78,7 +78,7 @@ namespace methods {
     using shape_t = std::array<long,N>;
   public:
     thc_reader_t(std::shared_ptr<mf::MF> MF,
-                 ptree const& pt, bool get_Sinv_Ivec = false,
+                 ptree const& pt, 
                  bool isdf_only = false, bool intialize = true):
       _MF(std::move(MF)), _mpi(_MF->mpi()),
       _MEM_EVAL( io::get_compute_space(pt,"compute") ),
@@ -93,13 +93,11 @@ namespace methods {
       _nqpts(_MF->nqpts()), _nqpts_ibz(_MF->nqpts_ibz()),
       _ns(_MF->nspin()), _ns_in_basis(_MF->nspin_in_basis()), _nbnd(_MF->nbnd()), 
       _npol(_MF->npol()), _npol_in_basis(_MF->npol_in_basis()),
-      _get_Sinv_Ivec(get_Sinv_Ivec),
       x_range( io::get_value_with_default<nda::range>(pt,"X_orbital_range",nda::range(_nbnd)) ), 
       y_range( io::get_value_with_default<nda::range>(pt,"Y_orbital_range",x_range) ), 
       _dZ(math::nda::make_distributed_array<Array_t<HOST_MEMORY,3>>(_mpi->comm, {_mpi->comm.size(), 1, 1}, {_mpi->comm.size(), 1, 1})),
       _X_shm(math::shm::make_shared_array<Array_view_t<HOST_MEMORY,4>>(*_mpi,{1, 1, 1, 1})),
       _Y_shm{std::nullopt},
-      _dSinv_Ivec(std::nullopt),
       _Timer() {
       utils::check(x_range.first() >= 0 and x_range.last() <= _nbnd,
                    "X orbitals out of range: ({},{}), nbnd:{}",x_range.first(),x_range.last(),_nbnd);
@@ -151,7 +149,7 @@ namespace methods {
     thc_reader_t(std::shared_ptr<mf::MF> MF,
                  std::string storage,
                  std::string eri_file = "",
-                 bool get_Sinv_Ivec = false, bool intialize = true):
+                 bool intialize = true):
       _MF(MF), _mpi(_MF->mpi()), _MEM_EVAL( DEFAULT_MEMORY_SPACE ),
       _storage(string_to_eri_storage_enum(storage)), 
       _eri_file(eri_file), 
@@ -162,13 +160,12 @@ namespace methods {
       _Np(read_Np()), _nkpts(_MF->nkpts()), _nkpts_ibz(_MF->nkpts_ibz()), 
       _nqpts(_MF->nqpts()), _nqpts_ibz(_MF->nqpts_ibz()),
       _ns(_MF->nspin()), _ns_in_basis(_MF->nspin_in_basis()), _nbnd(_MF->nbnd()),
-      _npol(_MF->npol()),_npol_in_basis(_MF->npol_in_basis()), _get_Sinv_Ivec(get_Sinv_Ivec),
+      _npol(_MF->npol()),_npol_in_basis(_MF->npol_in_basis()), 
       x_range(0),  // read later
       y_range(0),  // read later
       _dZ(math::nda::make_distributed_array<Array_t<HOST_MEMORY,3>>(_mpi->comm, {_mpi->comm.size(), 1, 1}, {_mpi->comm.size(), 1, 1})),
       _X_shm(math::shm::make_shared_array<Array_view_t<HOST_MEMORY,4>>(*_mpi,{1, 1, 1, 1})),
       _Y_shm{std::nullopt},
-      _dSinv_Ivec(std::nullopt),
       _Chi_head(_nqpts_ibz, _Np), _Chi_bar_head(_nqpts_ibz, _Np),
       _Timer() {
       if (intialize) init(false);
@@ -189,7 +186,6 @@ namespace methods {
 
       for (auto &v: {"BUILD_TOTAL", "BUILD_THC", "BUILD_GATHER", "BUILD_WRITE",
                      "READ_X", "READ_V", "PAW_AUG",
-                     "PAW_AUG.dzeta_build",
                      "PAW_AUG.aainit", "PAW_AUG.qrad_tab", "PAW_AUG.dzeta",
                      "PAW_AUG.gather_smooth", "PAW_AUG.eta_at_q",
                      "PAW_AUG.wG_at_q", "PAW_AUG.eta_flat",
@@ -325,6 +321,13 @@ namespace methods {
     void build() {
       _Timer.start("BUILD_TOTAL");
 
+      bool any_aug_species = false;
+      if (_paw_aug && _psp != nullptr) {
+        for (auto const& sp : _psp->paw_species_view()) {
+          if (sp.is_paw || sp.is_uspp) { any_aug_species = true; break; }
+        }
+      }
+
       _Timer.start("BUILD_THC");
       {
         auto eval = [&]<MEMORY_SPACE MEM>() {
@@ -333,34 +336,58 @@ namespace methods {
           _Np = _rp.size();
           _Timer.stop("BUILD_THC");
 
-          // allocate structures with dynamic _Np
-          //_Chi_head = memory::array<HOST_MEMORY, ComplexType, 2>(_nqpts_ibz, _Np);
-          //_Chi_bar_head = memory::array<HOST_MEMORY, ComplexType, 2>(_nqpts_ibz, _Np);
+          // The intvec_impl multiply/divide recovery of ζ_quG only has a
+          // HOST_MEMORY implementation today (the DEVICE branch is gated
+          // by an explicit utils::check). For non-HOST compute we fall
+          // back to a separate evaluate_isdf_only call below, so we
+          // request the optional only when MEM == HOST_MEMORY.
+          constexpr bool host_mem = (MEM == HOST_MEMORY);
+          bool ret_zeta_in_eval = host_mem && any_aug_species;
 
           _Timer.start("BUILD_THC");
-          auto [_dZ_d, _Chi_head_d, _Chi_bar_head_d, _dSinv_Ivec_d] = _thc_builder_opt.value().evaluate<MEM>(_rp,dXa,dXb,_get_Sinv_Ivec,x_range,y_range);
-          utils::check( _get_Sinv_Ivec == _dSinv_Ivec_d.has_value(), "Error: Inconsistent optional return value.");
+          auto [_dZ_d, _Chi_head_d, _Chi_bar_head_d, dzeta_quG_d] =
+              _thc_builder_opt.value().evaluate<MEM>(
+                  _rp, dXa, dXb, ret_zeta_in_eval, x_range, y_range);
+          utils::check(ret_zeta_in_eval == dzeta_quG_d.has_value(),
+            "Error: Inconsistent optional return value.");
           _Timer.stop("BUILD_THC");
 
           _Np_smooth = (int)_Np;
+
+          // scale by nkpts: thc::intvec_impl divides by Ω·Nk; promote to 1/Ω.
+          nda::tensor::scale(ComplexType(1.0*_nkpts), _dZ_d.local());
 
           // copy to host memory if needed, otherwise just move
           _dZ = std::move(_dZ_d);
           _Chi_head = std::move(_Chi_head_d);
           _Chi_bar_head = std::move(_Chi_bar_head_d());
-          _dSinv_Ivec = std::move(_dSinv_Ivec_d);
 
-          // gather dPa to _X_shm
+          // gather dPa to _X_shm — must run BEFORE augment_thc_with_paw,
+          // which bumps _Np to N_total and reallocates _X_shm with the
+          // appended PAW rows.
           _Timer.start("BUILD_GATHER");
           gather_X_shm(dXa);
           if(dXb.has_value())
             gather_Y_shm(dXb.value());
           else
-            utils::check(x_range == y_range, "thc_reader::build: x_range != y_range with missing dXb value.");
+            utils::check(x_range == y_range,
+              "thc_reader::build: x_range != y_range with missing dXb value.");
           _Timer.stop("BUILD_GATHER");
 
-          // PAW augmentation deferred until after the * Nk scaling below
-          // so smooth and aug blocks share the same (1/Ω) prefactor.
+          // PAW augmentation. For HOST_MEMORY we already have ζ_quG from
+          // the evaluate() call; for DEVICE/UNIFIED we recompute it via
+          // evaluate_isdf_only<MEM> until the device kernel is wired up.
+          if (any_aug_species) {
+            _Timer.start("PAW_AUG");
+            if constexpr (host_mem) {
+              augment_thc_with_paw<MEM>(*dzeta_quG_d);
+            } else {
+              auto dz = _thc_builder_opt.value().template evaluate_isdf_only<MEM>(
+                  _rp, dXa, dXb, x_range, y_range);
+              augment_thc_with_paw<MEM>(dz);
+            }
+            _Timer.stop("PAW_AUG");
+          }
         };
 
         if(_MEM_EVAL == HOST_MEMORY)
@@ -371,46 +398,6 @@ namespace methods {
         else if(_MEM_EVAL == UNIFIED_MEMORY)
           eval.operator()<UNIFIED_MEMORY>();
 #endif
-      }
-
-      // scale by nkpts: thc.cpp's intvec_impl divides by Ω*Nk, so promote to 1/Ω.
-      auto Z_loc = _dZ.local();
-      Z_loc *= _nkpts;
-
-      // ---- PAW augmentation (Phase 4.2: q=0 G-L/L-L; K_a at all q) ----
-      // Done AFTER the * Nk scaling so smooth and aug both end up at (1/Ω).
-      //
-      // Skip the entire augmentation dispatch (including the expensive
-      // `evaluate_isdf_only` re-build of dζ_quG) when no species carries
-      // augmentation data. NCPP-only fixtures hit this path and would
-      // otherwise pay ~20s for the dζ build to drop into a function that
-      // immediately returns at N_A == 0.
-      bool any_aug_species = false;
-      if (_paw_aug && _psp != nullptr) {
-        for (auto const& sp : _psp->paw_species_view()) {
-          if (sp.is_paw || sp.is_uspp) { any_aug_species = true; break; }
-        }
-      }
-      if (_paw_aug && any_aug_species) {
-        _Timer.start("PAW_AUG");
-        auto dispatch = [&]<MEMORY_SPACE MEM>() {
-          _Timer.start("PAW_AUG.dzeta_build");
-// MAM: No need to redo this again, which is expensive. dzeta_quG can be optionally
-//      returned by evaluate. FIX!!!
-          auto [ri,dXa,dXb] = _thc_builder_opt.value().interpolating_points<MEM>(
-              0, _Np_smooth, x_range, y_range);
-          (void)ri;
-          auto dzeta_quG = _thc_builder_opt.value().template evaluate_isdf_only<MEM>(
-              ri, dXa, dXb, x_range, y_range);
-          _Timer.stop("PAW_AUG.dzeta_build");
-          augment_thc_with_paw<MEM>(dzeta_quG);
-        };
-        if (_MEM_EVAL == HOST_MEMORY) dispatch.template operator()<HOST_MEMORY>();
-#if defined(ENABLE_DEVICE)
-        else if (_MEM_EVAL == DEVICE_MEMORY) dispatch.template operator()<DEVICE_MEMORY>();
-        else if (_MEM_EVAL == UNIFIED_MEMORY) dispatch.template operator()<UNIFIED_MEMORY>();
-#endif
-        _Timer.stop("PAW_AUG");
       }
 
       // save if requested
@@ -466,7 +453,6 @@ namespace methods {
         app_log(2, "      - write eri:                   {0:.3f} sec", _Timer.elapsed("BUILD_WRITE"));
       app_log(2, "      - paw augmentation total:      {0:.3f} sec", _Timer.elapsed("PAW_AUG"));
       if (_paw_aug) {
-        app_log(2, "        .  dzeta_quG build:          {0:.3f} sec", _Timer.elapsed("PAW_AUG.dzeta_build"));
         app_log(2, "        .  X aug (Y rows x ks):      {0:.3f} sec", _Timer.elapsed("PAW_AUG.X_aug"));
         app_log(2, "        .  gather smooth GG block:   {0:.3f} sec", _Timer.elapsed("PAW_AUG.gather_smooth"));
         app_log(2, "        .  aainit (ap, lpx, lpl):    {0:.3f} sec", _Timer.elapsed("PAW_AUG.aainit"));
@@ -1273,8 +1259,6 @@ namespace methods {
       _Np = _rp.size();
       _Timer.stop("BUILD_THC");
      
-      utils::check( not _get_Sinv_Ivec, "Finish: SinvIvec not yet written to file. Finish!!!");
-
       // allocate structures with dynamic _Np
       _Chi_head = nda::array<ComplexType, 2>(_nqpts_ibz, _Np);
       _Chi_bar_head = nda::array<ComplexType, 2>(_nqpts_ibz, _Np);
@@ -1408,7 +1392,6 @@ namespace methods {
         app_log(2, "      - write eri:                   {0:.3f} sec", _Timer.elapsed("BUILD_WRITE"));
       app_log(2, "      - paw augmentation total:      {0:.3f} sec", _Timer.elapsed("PAW_AUG"));
       if (_paw_aug) {
-        app_log(2, "        .  dzeta_quG build:          {0:.3f} sec", _Timer.elapsed("PAW_AUG.dzeta_build"));
         app_log(2, "        .  X aug (Y rows x ks):      {0:.3f} sec", _Timer.elapsed("PAW_AUG.X_aug"));
         app_log(2, "        .  gather smooth GG block:   {0:.3f} sec", _Timer.elapsed("PAW_AUG.gather_smooth"));
         app_log(2, "        .  aainit (ap, lpx, lpl):    {0:.3f} sec", _Timer.elapsed("PAW_AUG.aainit"));
@@ -1504,8 +1487,6 @@ namespace methods {
       // Cache precomputed THC ERIs
       h5::file file(_eri_file, 'r');
       h5::group grp(file);
-
-      utils::check( not _get_Sinv_Ivec, "Finish: SinvIvec not yet written to file. Finish!!!");
 
       {
         std::vector<int> arng(2);  
@@ -1937,7 +1918,6 @@ namespace methods {
     int _nbnd;
     int _npol;
     int _npol_in_basis;
-    bool _get_Sinv_Ivec;
     nda::range x_range;
     nda::range y_range;
 
@@ -1949,7 +1929,6 @@ namespace methods {
     sArray_t<memory::array_view<HOST_MEMORY, ComplexType, 4>> _X_shm;
     std::optional<sArray_t<memory::array_view<HOST_MEMORY, ComplexType, 4>>> _Y_shm;
 
-    std::optional<dArray_t<HOST_MEMORY,3>> _dSinv_Ivec; 
     memory::array<HOST_MEMORY, ComplexType, 2> _Chi_head;
     memory::array<HOST_MEMORY, ComplexType, 2> _Chi_bar_head;
     memory::array<HOST_MEMORY, long, 1> _rp;
