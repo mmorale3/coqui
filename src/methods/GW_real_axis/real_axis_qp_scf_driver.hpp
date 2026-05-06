@@ -24,6 +24,7 @@
 #include "nda/nda.hpp"
 #include "nda/blas.hpp"
 #include "nda/linalg.hpp"
+#include "numerics/nda_functions.hpp"
 #include "utilities/check.hpp"
 #include "IO/app_loggers.h"
 
@@ -68,6 +69,10 @@ struct qp_scgw_config {
   double        eps_nufft     = 1e-8;
   bool          update_W      = true;     // false freezes W = W^(0).
   bool          verbose       = false;
+  // Procrustes alignment of MO across iterations to remove rotation
+  // drift in degenerate / near-degenerate eigenvalue clusters.
+  bool          align_mo      = true;
+  double        dE_cluster_align = 1e-3;   // cluster ε's within this gap.
 };
 
 struct qp_scgw_result {
@@ -277,6 +282,124 @@ namespace detail_qp {
   /// In-place causality projection on Im Sigma_c stored as (w, s, k, i, j).
   /// Calls the existing project_causality_ImSigma with a single repack
   /// (matches real_axis_scf_loop).
+  /**
+   * Procrustes-style alignment of MO_new (in place) to MO_prev within
+   * eigenvalue clusters. Eliminates rotation drift inside degenerate /
+   * near-degenerate subspaces — the dominant source of `||dH_eff||_F`
+   * residual once the QP eigenvalues themselves have stopped moving.
+   *
+   * For each (s, k):
+   *   1. Build overlap O = MO_prev^H · MO_new   (size nbnd × nbnd).
+   *   2. Partition columns into ε-clusters: consecutive indices with
+   *      |ε_i - ε_{i-1}| < dE_cluster.
+   *   3. For each cluster c0..c1-1:
+   *        SVD: O[c0:c1, c0:c1] = U_O · Σ · V_O^H   (V_O^H = Vt_O).
+   *        T = U_O · Vt_O   (polar-unitary part of O_block).
+   *        MO_new[:, c0:c1] ← MO_new[:, c0:c1] · T^H.
+   *      A 1×1 cluster reduces to a pure phase fix on the column.
+   *
+   * The alignment is exact when MO_new and MO_prev span the same cluster
+   * subspace (then T = R where MO_new = MO_prev · R, and applying T^H
+   * recovers MO_prev). For non-degenerate columns (1×1) it removes the
+   * arbitrary global-phase ambiguity. After alignment, U^H_new · U_old
+   * is block-diagonal up to numerical noise, so H_full = MO·diag(ε)·MO^H
+   * no longer carries spurious between-iter rotations and ‖dH_eff‖_F
+   * recovers its correctness as a convergence metric.
+   */
+  inline void align_mo_to_prev(
+      nda::ArrayOfRank<4> auto       && sMO_loc,
+      nda::ArrayOfRank<4> auto const  & MO_prev,
+      nda::ArrayOfRank<3> auto const  & sE_loc,
+      double                            dE_cluster,
+      long ns, long Nk, long nbnd)
+  {
+    using nda::matrix;
+    using nda::F_layout;
+    matrix<ComplexType>            O_full(nbnd, nbnd);
+    matrix<ComplexType, F_layout>  O_sub;
+    matrix<ComplexType, F_layout>  U_sub;
+    matrix<ComplexType, F_layout>  Vt_sub;
+    nda::array<double, 1>          Sval;
+    matrix<ComplexType>            T_sub;
+    matrix<ComplexType>            rotated_block;
+
+    for (long s = 0; s < ns; ++s) {
+      for (long k = 0; k < Nk; ++k) {
+        // O[m, n] = sum_i conj(MO_prev[s,k,i,m]) · MO_new[s,k,i,n].
+        for (long m = 0; m < nbnd; ++m) {
+          for (long n = 0; n < nbnd; ++n) {
+            ComplexType acc(0.0, 0.0);
+            for (long i = 0; i < nbnd; ++i)
+              acc += std::conj(MO_prev(s, k, i, m)) * sMO_loc(s, k, i, n);
+            O_full(m, n) = acc;
+          }
+        }
+
+        long c0 = 0;
+        while (c0 < nbnd) {
+          long c1 = c0 + 1;
+          while (c1 < nbnd
+                 && std::abs(sE_loc(s, k, c1).real() - sE_loc(s, k, c0).real())
+                    < dE_cluster) {
+            ++c1;
+          }
+          const long mc = c1 - c0;
+
+          if (mc == 1) {
+            // Phase-only alignment: MO_new[:, c0] ← MO_new[:, c0] · conj(O00/|O00|).
+            const ComplexType O00 = O_full(c0, c0);
+            const double mag = std::abs(O00);
+            if (mag > 0.0) {
+              const ComplexType inv_phase = std::conj(O00 / mag);
+              for (long i = 0; i < nbnd; ++i)
+                sMO_loc(s, k, i, c0) *= inv_phase;
+            }
+          } else {
+            // Procrustes: SVD the m×m sub-overlap, apply T^H on the right
+            // to MO_new[:, c0:c1].
+            O_sub.resize(mc, mc);
+            for (long a = 0; a < mc; ++a)
+              for (long b = 0; b < mc; ++b)
+                O_sub(a, b) = O_full(c0 + a, c0 + b);
+            Sval.resize(mc);
+            U_sub.resize(mc, mc);
+            Vt_sub.resize(mc, mc);
+            int info = nda::lapack::gesvd(O_sub, Sval, U_sub, Vt_sub);
+            utils::check(info == 0,
+                "align_mo_to_prev: gesvd failed (info={}) on cluster of size {} "
+                "at (s={}, k={}, c0={})", info, mc, s, k, c0);
+
+            // T = U · Vt  (polar-unitary part of O_sub).
+            T_sub.resize(mc, mc);
+            for (long a = 0; a < mc; ++a) {
+              for (long b = 0; b < mc; ++b) {
+                ComplexType acc(0.0, 0.0);
+                for (long c = 0; c < mc; ++c) acc += U_sub(a, c) * Vt_sub(c, b);
+                T_sub(a, b) = acc;
+              }
+            }
+
+            // MO_new[:, c0:c1] := MO_new[:, c0:c1] · T^H.
+            rotated_block.resize(nbnd, mc);
+            for (long i = 0; i < nbnd; ++i) {
+              for (long b = 0; b < mc; ++b) {
+                ComplexType acc(0.0, 0.0);
+                for (long a = 0; a < mc; ++a)
+                  acc += sMO_loc(s, k, i, c0 + a) * std::conj(T_sub(b, a));
+                rotated_block(i, b) = acc;
+              }
+            }
+            for (long i = 0; i < nbnd; ++i)
+              for (long b = 0; b < mc; ++b)
+                sMO_loc(s, k, i, c0 + b) = rotated_block(i, b);
+          }
+
+          c0 = c1;
+        }
+      }
+    }
+  }
+
   inline void project_causality_inplace(real_axis_mb_state_t& state)
   {
     auto ImS = state.ImSigma_wskij->local();
@@ -460,10 +583,14 @@ real_axis_qp_scf_loop(real_axis_mb_state_t                          & state,
   // max_n |Delta eps| and ||Delta Dm||_F across iterations alongside
   // ||dH_eff||_F. Both are insensitive to MO-rotation drift in
   // degenerate / near-degenerate subspaces.
-  nda::array<ComplexType, 3> E_prev_ska (ns, Nk, nbnd);
+  nda::array<ComplexType, 3> E_prev_ska  (ns, Nk, nbnd);
   nda::array<ComplexType, 4> Dm_prev_skij(ns, Nk, nbnd, nbnd);
-  E_prev_ska  = ComplexType(0.0, 0.0);
+  // Snapshot of MO from the previous iter, used to align MO_new within
+  // ε-clusters via the Procrustes step (cfg.align_mo).
+  nda::array<ComplexType, 4> MO_prev_skij(ns, Nk, nbnd, nbnd);
+  E_prev_ska   = ComplexType(0.0, 0.0);
   Dm_prev_skij = ComplexType(0.0, 0.0);
+  MO_prev_skij = ComplexType(0.0, 0.0);
 
   const bool use_rspace = (Nk > 1);
 
@@ -489,6 +616,13 @@ real_axis_qp_scf_loop(real_axis_mb_state_t                          & state,
     // ---- 1. Diagonalize H_eff -> MO, E. ----
     if (sMO.node_comm()->root()) {
       detail_qp::diagonalize_H_eff(sHe.local(), sS_skij, sE.local(), sMO.local());
+      // Procrustes-align MO_new to the previous iter's MO inside
+      // ε-clusters to kill rotation-frame drift in degenerate
+      // subspaces. Skip on iter 0 (no prev MO to align against).
+      if (cfg.align_mo and it > 0) {
+        detail_qp::align_mo_to_prev(sMO.local(), MO_prev_skij, sE.local(),
+                                     cfg.dE_cluster_align, ns, Nk, nbnd);
+      }
     }
     sMO.node_sync();
     sE.node_sync();
@@ -645,10 +779,11 @@ real_axis_qp_scf_loop(real_axis_mb_state_t                          & state,
             }
       dDm_fn = std::sqrt(acc);
     }
-    // Snapshot current sE and sDm for the next-iter diff.
+    // Snapshot current sE, sDm, sMO for the next-iter diff / align.
     {
       auto sE_loc  = state.E_ska.value().local();
       auto sDm_loc = state.Dm_skij.value().local();
+      auto sMO_loc = state.MO_skia.value().local();
       for (long s = 0; s < ns; ++s)
         for (long k = 0; k < Nk; ++k)
           for (long n = 0; n < nbnd; ++n)
@@ -656,8 +791,10 @@ real_axis_qp_scf_loop(real_axis_mb_state_t                          & state,
       for (long s = 0; s < ns; ++s)
         for (long k = 0; k < Nk; ++k)
           for (long i = 0; i < nbnd; ++i)
-            for (long j = 0; j < nbnd; ++j)
+            for (long j = 0; j < nbnd; ++j) {
               Dm_prev_skij(s, k, i, j) = sDm_loc(s, k, i, j);
+              MO_prev_skij(s, k, i, j) = sMO_loc(s, k, i, j);
+            }
     }
 
     res.iter_used  = it + 1;

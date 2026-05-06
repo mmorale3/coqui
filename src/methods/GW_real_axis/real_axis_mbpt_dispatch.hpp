@@ -369,6 +369,11 @@ inline void run_real_axis_qpgw(THC_t& thc, ptree const& pt)
   const auto alpha_mix  = io::get_value_with_default<double>(pt, "alpha_mix", 0.7);
   const auto diis_win   = io::get_value_with_default<long>  (pt, "diis_window", 8);
   const auto update_W   = io::get_value_with_default<bool>  (pt, "update_W", true);
+  // MO Procrustes alignment to remove rotation drift across iters in
+  // degenerate / near-degenerate ε-clusters. Default on; helps both
+  // ‖dH_eff‖_F as a meaningful metric and DIIS convergence speed.
+  const auto align_mo_p   = io::get_value_with_default<bool>  (pt, "align_mo", true);
+  const auto dE_cluster_p = io::get_value_with_default<double>(pt, "dE_cluster_align", 1e-3);
   // Non-uniform fermionic-grid options (see [real_axis_gw] section docs).
   auto       grid_kind_s = io::get_value_with_default<std::string>(pt, "grid_kind", "uniform");
   const auto w_dense_p   = io::get_value_with_default<double>(pt, "w_dense", 0.0);
@@ -436,6 +441,9 @@ inline void run_real_axis_qpgw(THC_t& thc, ptree const& pt)
       app_log(2, "  w_dense     = {:.4f}", w_dense_eff);
       app_log(2, "  N_dense     = {}", N_dense_eff);
     }
+    app_log(2, "  align_mo    = {}", align_mo_p ? "true" : "false");
+    if (align_mo_p)
+      app_log(2, "  dE_cluster  = {:.2e}", dE_cluster_p);
   }
 
   // ---- Build sH_0, sS, sFock from MF -------------------------------------
@@ -508,6 +516,8 @@ inline void run_real_axis_qpgw(THC_t& thc, ptree const& pt)
   cfg.eps_nufft   = eps_nufft;
   cfg.update_W    = update_W;
   cfg.verbose     = verbose;
+  cfg.align_mo    = align_mo_p;
+  cfg.dE_cluster_align = dE_cluster_p;
 
   // ---- BZ weights, electron count ---------------------------------------
   nda::array<double, 1> k_weights(Nk);
