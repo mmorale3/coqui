@@ -122,28 +122,62 @@ class pseudopot
     int  iraug = 0;
     nda::array<double,1> r;            // (mesh)
     nda::array<double,1> rab;          // (mesh)
-    nda::array<double,2> aewfc;        // (nbeta, mesh) — row-major from H5
-    nda::array<double,2> pswfc;        // (nbeta, mesh)
-    nda::array<double,3> qfuncl;       // (2*lmax+1, nbeta(nbeta+1)/2, mesh)
-                                       // pseudized augmentation per L channel
+    // Heavy radial tables — stored as views into per-node SHM owned by
+    // pseudopot::paw_species_shm (one copy per node, not per rank). For
+    // a 96-core node this saves ~3 GB/species over the previous per-rank
+    // replication. See species_paw_shm_t below for the backing storage.
+    nda::array_view<double,2> aewfc;     // (nbeta, mesh)
+    nda::array_view<double,2> pswfc;     // (nbeta, mesh)
+    nda::array_view<double,3> qfuncl;    // (2*lmax+1, nbeta(nbeta+1)/2, mesh)
+    nda::array_view<double,4> deltaC;    // (nh, nh, nh, nh) — raw ke%k from QE
+    nda::array_view<double,2> core_aewfc;// (ncore, mesh)
     // Phase 4.3 angular momentum metadata (per-species slices of QE's
     // global uspp tables; ih ∈ [0, nh), nbeta ∈ [0, nbeta)).
     nda::array<int,1> lll;             // (nbeta) — l per beta projector
     nda::array<int,1> nhtol;           // (nh)    — l per ih
     nda::array<int,1> nhtolm;          // (nh)    — lm = l*(l+1)+m+1 (1-based) per ih
     nda::array<int,1> indv;            // (nh)    — beta-channel index per ih (1-based)
-    // Phase 2 fields (populated when present):
-    nda::array<double,4> deltaC;       // (nh, nh, nh, nh) — raw ke%k from QE
-    nda::array<double,3> pfunc;        // (nbeta, nbeta, mesh)  — paw subgroup
-    nda::array<double,3> ptfunc;       // (nbeta, nbeta, mesh)
-    nda::array<double,3> augmom;       // (2*lmax+1, nbeta, nbeta)
+    // pfunc, ptfunc, augmom were previously loaded from QE's `paw` subgroup
+    // but are derivable from aewfc/pswfc and qfuncl on demand:
+    //   pfunc(I,J,r)  = aewfc(I,r) * aewfc(J,r)
+    //   ptfunc(I,J,r) = pswfc(I,r) * pswfc(J,r)
+    //   augmom(L,I,J) = ∫ qfuncl(L, ij(I,J), r) * r^(L+2) dr
+    // No consumer ever reads them in steady state, so they are dropped
+    // from the in-memory struct. Re-derive at the call site if needed
+    // (e.g. by paw_onecenter when the deeq SCF path lands).
     nda::array<double,1> ae_vloc;      // (mesh)
     nda::array<double,1> ae_rho_atc;   // (mesh)
     // GIPAW core orbitals (only when species was generated --with-gipaw)
     int  ncore_orbitals = 0;
     nda::array<double,1> core_n;       // principal qno (ncore)
     nda::array<double,1> core_l;       // l qno (ncore)  (real for QE convention)
-    nda::array<double,2> core_aewfc;   // (ncore, mesh)
+  };
+
+  // Per-node SHM storage backing the heavy `species_paw_t` fields. One
+  // entry per species; aligned with `paw_species`. Each member is loaded
+  // on global root, broadcast across nodes via internode_comm, and shared
+  // within a node via the shared_array's shared-memory window. After
+  // population the corresponding `species_paw_t` view fields are bound
+  // to the `.local()` of the appropriate sarray_t below.
+  //
+  // Construction takes an mpi_t because `sarray_t` has no default
+  // constructor; emplace each instance with a 1-element dummy size and
+  // re-assign at load time once shapes are known (same pattern used for
+  // Pskna/qq_nt_data/Dnn_atom in the pseudopot ctor init list).
+  struct species_paw_shm_t {
+    sarray_t<nda::array_view<double,2>> aewfc;
+    sarray_t<nda::array_view<double,2>> pswfc;
+    sarray_t<nda::array_view<double,3>> qfuncl;
+    sarray_t<nda::array_view<double,4>> deltaC;
+    sarray_t<nda::array_view<double,2>> core_aewfc;
+
+    explicit species_paw_shm_t(mpi_t& m)
+      : aewfc(math::shm::make_shared_array<nda::array_view<double,2>>(m, {1,1})),
+        pswfc(math::shm::make_shared_array<nda::array_view<double,2>>(m, {1,1})),
+        qfuncl(math::shm::make_shared_array<nda::array_view<double,3>>(m, {1,1,1})),
+        deltaC(math::shm::make_shared_array<nda::array_view<double,4>>(m, {1,1,1,1})),
+        core_aewfc(math::shm::make_shared_array<nda::array_view<double,2>>(m, {1,1}))
+    {}
   };
 
   // Read-only access to per-species PAW data. Empty entry for non-PAW
@@ -327,6 +361,13 @@ class pseudopot
   // Per-species PAW data (definition hoisted to public scope, see above).
   // Populated from /Hamiltonian/Species/{nt}/ in read_vnl_h5.
   std::vector<species_paw_t> paw_species;
+
+  // Per-node SHM storage backing the heavy paw_species fields (aewfc,
+  // pswfc, qfuncl, deltaC, core_aewfc). Index aligned with paw_species.
+  // The `nda::array_view` fields in species_paw_t are bound to the
+  // `.local()` of the corresponding sarray here, so consumers see
+  // node-shared memory instead of per-rank replication.
+  std::vector<species_paw_shm_t> paw_species_shm;
 
   // dense-grid G-vector count (read from /Hamiltonian/{type}/ngm attribute);
   // needed to size qgm and to map Q-index space.

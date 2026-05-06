@@ -708,9 +708,32 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
 
   // Phase 0/1: per-species PAW radial data (filled when /Hamiltonian/Species/
   // exists in the h5 file). Phase 2 will additionally read Onecenter/deltaC.
+  // The five heavy radial tables (aewfc, pswfc, qfuncl, deltaC, core_aewfc)
+  // are loaded on global root into per-species temporaries, then placed in
+  // node-shared memory (paw_species_shm) and exposed to consumers as
+  // `nda::array_view` fields of species_paw_t — one node-local copy
+  // instead of a per-rank replication that scaled to ~3 GB/species on a
+  // 96-core node.
   paw_species.clear();
+  paw_species_shm.clear();
   if(ptype == pp_uspp_t or ptype == pp_paw_t) {
     paw_species.resize(nsp);
+    paw_species_shm.reserve(nsp);
+    for (int nt = 0; nt < nsp; ++nt) paw_species_shm.emplace_back(*mpi);
+
+    // Per-species temporaries holding the heavy fields read on root.
+    // These are local to read_vnl_h5 and freed at end of scope, so the
+    // per-rank allocation only lives on the global root for the duration
+    // of this block.
+    struct heavy_tmp {
+      nda::array<double,2> aewfc;
+      nda::array<double,2> pswfc;
+      nda::array<double,3> qfuncl;
+      nda::array<double,4> deltaC;
+      nda::array<double,2> core_aewfc;
+    };
+    std::vector<heavy_tmp> heavy_root(nsp);
+
     if(mpi->comm.root()) {
       bool has_species_grp = grp0.has_subgroup("Hamiltonian") &&
         grp0.open_group("Hamiltonian").has_subgroup("Species");
@@ -726,6 +749,7 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
           if(!sp_grp.has_subgroup(nt_name)) continue;
           h5::group nt_grp = sp_grp.open_group(nt_name);
           auto& sp = paw_species[nt];
+          auto& tmp = heavy_root[nt];
           std::string kind;
           h5::h5_read_attribute(nt_grp, "species_kind", kind);
           sp.is_paw  = (kind == "paw");
@@ -741,16 +765,15 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
             h5::h5_read_attribute(pgrp, "lmax_aug", sp.lmax_aug);
             h5::h5_read_attribute(pgrp, "raug",     sp.raug);
             h5::h5_read_attribute(pgrp, "iraug",    sp.iraug);
-            try { nda::h5_read(pgrp, "pfunc",      sp.pfunc); }      catch(...) {}
-            try { nda::h5_read(pgrp, "ptfunc",     sp.ptfunc); }     catch(...) {}
-            try { nda::h5_read(pgrp, "augmom",     sp.augmom); }     catch(...) {}
+            // pfunc, ptfunc, augmom are derivable from aewfc/pswfc/qfuncl
+            // (see species_paw_t comment) — not loaded.
             try { nda::h5_read(pgrp, "ae_vloc",    sp.ae_vloc); }    catch(...) {}
             try { nda::h5_read(pgrp, "ae_rho_atc", sp.ae_rho_atc); } catch(...) {}
           }
           if(sp.is_paw || sp.is_uspp) {
-            try { nda::h5_read(nt_grp, "aewfc", sp.aewfc); } catch(...) {}
-            try { nda::h5_read(nt_grp, "pswfc", sp.pswfc); } catch(...) {}
-            try { nda::h5_read(nt_grp, "qfuncl", sp.qfuncl); } catch(...) {}
+            try { nda::h5_read(nt_grp, "aewfc",  tmp.aewfc); }  catch(...) {}
+            try { nda::h5_read(nt_grp, "pswfc",  tmp.pswfc); }  catch(...) {}
+            try { nda::h5_read(nt_grp, "qfuncl", tmp.qfuncl); } catch(...) {}
             // Phase 4.3: angular momentum metadata for q+G evaluation of
             // the augmentation function (qvan2 reconstruction in CoQui).
             try { nda::h5_read(nt_grp, "lll",    sp.lll);    } catch(...) {}
@@ -762,7 +785,7 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
           // ke%k from PAW_init_fock_kernel exported by pw2coqui.
           if(sp.is_paw && nt_grp.has_subgroup("Onecenter")) {
             h5::group ogrp = nt_grp.open_group("Onecenter");
-            try { nda::h5_read(ogrp, "deltaC", sp.deltaC); } catch(...) {}
+            try { nda::h5_read(ogrp, "deltaC", tmp.deltaC); } catch(...) {}
           }
           // GIPAW core orbitals (notes §7 — required for explicit
           // core-valence/core-core exchange). Absent for non-GIPAW pseudos.
@@ -771,7 +794,7 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
             h5::h5_read_attribute(cgrp, "ncore_orbitals", sp.ncore_orbitals);
             try { nda::h5_read(cgrp, "n",      sp.core_n); }     catch(...) {}
             try { nda::h5_read(cgrp, "l",      sp.core_l); }     catch(...) {}
-            try { nda::h5_read(cgrp, "ae_wfc", sp.core_aewfc); } catch(...) {}
+            try { nda::h5_read(cgrp, "ae_wfc", tmp.core_aewfc); } catch(...) {}
           }
         }
       }
@@ -789,35 +812,75 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
       if (!mpi->comm.root()) a.resize(sz);
       if (sz > 0) mpi->comm.broadcast_n(a.data(), sz, 0);
     };
-    auto bcast_array_2 = [this](nda::array<double,2>& a) {
-      std::array<long,2> sh{a.shape()[0], a.shape()[1]};
-      mpi->comm.broadcast_n(sh.data(), 2, 0);
-      if (!mpi->comm.root()) a = nda::array<double,2>::zeros({sh[0], sh[1]});
-      long sz = sh[0]*sh[1];
-      if (sz > 0) mpi->comm.broadcast_n(a.data(), sz, 0);
-    };
-    auto bcast_array_3 = [this](nda::array<double,3>& a) {
-      std::array<long,3> sh{a.shape()[0], a.shape()[1], a.shape()[2]};
-      mpi->comm.broadcast_n(sh.data(), 3, 0);
-      if (!mpi->comm.root()) a = nda::array<double,3>::zeros({sh[0], sh[1], sh[2]});
-      long sz = sh[0]*sh[1]*sh[2];
-      if (sz > 0) mpi->comm.broadcast_n(a.data(), sz, 0);
-    };
-    auto bcast_array_4 = [this](nda::array<double,4>& a) {
-      std::array<long,4> sh{a.shape()[0], a.shape()[1], a.shape()[2], a.shape()[3]};
-      mpi->comm.broadcast_n(sh.data(), 4, 0);
-      if (!mpi->comm.root()) a = nda::array<double,4>::zeros({sh[0], sh[1], sh[2], sh[3]});
-      long sz = sh[0]*sh[1]*sh[2]*sh[3];
-      if (sz > 0) mpi->comm.broadcast_n(a.data(), sz, 0);
-    };
     auto bcast_iarray_1 = [this](nda::array<int,1>& a) {
       long sz = a.size();
       mpi->comm.broadcast_value(sz);
       if (!mpi->comm.root()) a.resize(sz);
       if (sz > 0) mpi->comm.broadcast_n(a.data(), sz, 0);
     };
+
+    // Helpers that broadcast a heavy field's shape, allocate a node-shared
+    // SHM segment of that shape (collective on all ranks; sized to the
+    // global root's data), copy on global root, internode-broadcast across
+    // node-roots, and bind the species_paw_t view to the SHM's local().
+    // For empty inputs (size == 0 on root) the SHM is left at its dummy
+    // 1×… shape and the view is set to the empty zero-size sub-view.
+    auto bcast_to_shm_2 = [this](nda::array<double,2>& tmp_root,
+                                  sarray_t<nda::array_view<double,2>>& shm,
+                                  nda::array_view<double,2>& view) {
+      std::array<long,2> sh{0,0};
+      if (mpi->comm.root()) sh = {tmp_root.shape()[0], tmp_root.shape()[1]};
+      mpi->comm.broadcast_n(sh.data(), 2, 0);
+      if (sh[0] == 0 || sh[1] == 0) { view = nda::array_view<double,2>{}; return; }
+      shm = math::shm::make_shared_array<nda::array_view<double,2>>(*mpi, {sh[0],sh[1]});
+      shm.win().fence();
+      if (mpi->comm.root()) shm.local() = tmp_root;
+      shm.win().fence();
+      if (mpi->node_comm.root())
+        mpi->internode_comm.broadcast_n(shm.local().data(), shm.size(), 0);
+      mpi->comm.barrier();
+      view.rebind(shm.local());
+    };
+    auto bcast_to_shm_3 = [this](nda::array<double,3>& tmp_root,
+                                  sarray_t<nda::array_view<double,3>>& shm,
+                                  nda::array_view<double,3>& view) {
+      std::array<long,3> sh{0,0,0};
+      if (mpi->comm.root())
+        sh = {tmp_root.shape()[0], tmp_root.shape()[1], tmp_root.shape()[2]};
+      mpi->comm.broadcast_n(sh.data(), 3, 0);
+      if (sh[0]*sh[1]*sh[2] == 0) { view = nda::array_view<double,3>{}; return; }
+      shm = math::shm::make_shared_array<nda::array_view<double,3>>(*mpi, {sh[0],sh[1],sh[2]});
+      shm.win().fence();
+      if (mpi->comm.root()) shm.local() = tmp_root;
+      shm.win().fence();
+      if (mpi->node_comm.root())
+        mpi->internode_comm.broadcast_n(shm.local().data(), shm.size(), 0);
+      mpi->comm.barrier();
+      view.rebind(shm.local());
+    };
+    auto bcast_to_shm_4 = [this](nda::array<double,4>& tmp_root,
+                                  sarray_t<nda::array_view<double,4>>& shm,
+                                  nda::array_view<double,4>& view) {
+      std::array<long,4> sh{0,0,0,0};
+      if (mpi->comm.root())
+        sh = {tmp_root.shape()[0], tmp_root.shape()[1],
+              tmp_root.shape()[2], tmp_root.shape()[3]};
+      mpi->comm.broadcast_n(sh.data(), 4, 0);
+      if (sh[0]*sh[1]*sh[2]*sh[3] == 0) { view = nda::array_view<double,4>{}; return; }
+      shm = math::shm::make_shared_array<nda::array_view<double,4>>(*mpi, {sh[0],sh[1],sh[2],sh[3]});
+      shm.win().fence();
+      if (mpi->comm.root()) shm.local() = tmp_root;
+      shm.win().fence();
+      if (mpi->node_comm.root())
+        mpi->internode_comm.broadcast_n(shm.local().data(), shm.size(), 0);
+      mpi->comm.barrier();
+      view.rebind(shm.local());
+    };
+
     for (int nt = 0; nt < nsp; ++nt) {
-      auto& sp = paw_species[nt];
+      auto& sp     = paw_species[nt];
+      auto& sp_shm = paw_species_shm[nt];
+      auto& tmp    = heavy_root[nt];
       // scalars
       mpi->comm.broadcast_value(sp.is_paw);
       mpi->comm.broadcast_value(sp.is_uspp);
@@ -829,25 +892,23 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
       mpi->comm.broadcast_value(sp.raug);
       mpi->comm.broadcast_value(sp.iraug);
       mpi->comm.broadcast_value(sp.ncore_orbitals);
-      // mandatory arrays (always present for USPP/PAW; size 0 otherwise)
+      // small per-rank arrays
       bcast_array_1(sp.r);
       bcast_array_1(sp.rab);
-      bcast_array_2(sp.aewfc);
-      bcast_array_2(sp.pswfc);
-      bcast_array_3(sp.qfuncl);
       bcast_iarray_1(sp.lll);
       bcast_iarray_1(sp.nhtol);
       bcast_iarray_1(sp.nhtolm);
       bcast_iarray_1(sp.indv);
-      bcast_array_4(sp.deltaC);
-      bcast_array_3(sp.pfunc);
-      bcast_array_3(sp.ptfunc);
-      bcast_array_3(sp.augmom);
       bcast_array_1(sp.ae_vloc);
       bcast_array_1(sp.ae_rho_atc);
       bcast_array_1(sp.core_n);
       bcast_array_1(sp.core_l);
-      bcast_array_2(sp.core_aewfc);
+      // heavy fields → SHM (one copy per node).
+      bcast_to_shm_2(tmp.aewfc,      sp_shm.aewfc,      sp.aewfc);
+      bcast_to_shm_2(tmp.pswfc,      sp_shm.pswfc,      sp.pswfc);
+      bcast_to_shm_3(tmp.qfuncl,     sp_shm.qfuncl,     sp.qfuncl);
+      bcast_to_shm_4(tmp.deltaC,     sp_shm.deltaC,     sp.deltaC);
+      bcast_to_shm_2(tmp.core_aewfc, sp_shm.core_aewfc, sp.core_aewfc);
     }
     mpi->comm.barrier();
   }
