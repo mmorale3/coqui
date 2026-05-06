@@ -24,6 +24,8 @@
 
 #include <string>
 #include <optional>
+#include <chrono>
+#include <iomanip>
 
 #include "configuration.hpp"
 #include "IO/ptree/ptree_utilities.hpp"
@@ -730,9 +732,16 @@ namespace methods {
       nda::array<ComplexType,2> eta_w_P_aug_g (P_aug_rows_la.size(),   ngm_rho);
       nda::array<ComplexType,2> eta_P_aug_conj(P_aug_rows_la.size(),   ngm_rho);
 
+      auto t_start = std::chrono::steady_clock::now();
       auto dbg = [&](char const* tag) {
         _mpi->comm.barrier();
-        if (_mpi->comm.root()) { std::cout << "  paw_aug.dbg: " << tag << std::endl; std::cout.flush(); }
+        if (_mpi->comm.root()) {
+          auto now = std::chrono::steady_clock::now();
+          double sec = std::chrono::duration<double>(now - t_start).count();
+          std::cout << "  paw_aug.dbg [t=" << std::fixed << std::setprecision(2)
+                    << sec << "s]: " << tag << std::endl;
+          std::cout.flush();
+        }
         _mpi->comm.barrier();
       };
       dbg("entering q-loop");
