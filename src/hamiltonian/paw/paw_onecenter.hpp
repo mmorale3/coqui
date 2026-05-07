@@ -209,15 +209,21 @@ inline paw_oc_hartree_result compute_paw_hartree_atom(
             }
         }
         if (lp == 0) {
+            // Core densities are stored in proper-ρ form (no r² jacobian);
+            // pfunc/ptfunc/qfuncl above are in QE's u-form (already r²-
+            // weighted: pf = u·u = r²·R²). Multiply core by r² so the
+            // u-form Hartree solver below sees a consistent input.
             for (long ir = 0; ir < mesh; ++ir) {
-                rho_AE(ir) += sqrt4pi * rho_core_AE(ir);
-                rho_PS(ir) += sqrt4pi * rho_core_PS(ir);
+                double r2 = sp.r(ir) * sp.r(ir);
+                rho_AE(ir) += sqrt4pi * rho_core_AE(ir) * r2;
+                rho_PS(ir) += sqrt4pi * rho_core_PS(ir) * r2;
             }
         }
 
-        // Radial Hartree per LM channel.
-        radial_hartree_multipole(rho_AE, sp.r, sp.rab, L, V_AE);
-        radial_hartree_multipole(rho_PS, sp.r, sp.rab, L, V_PS);
+        // Radial Hartree per LM channel — u-form (densities carry the
+        // spherical r² jacobian; integrand uses r'^L / r'^{-(L+1)}).
+        radial_hartree_multipole_u_form(rho_AE, sp.r, sp.rab, L, V_AE);
+        radial_hartree_multipole_u_form(rho_PS, sp.r, sp.rab, L, V_PS);
 
         // Integrate (V_AE - V_PS) × pair_density × ap (with q-aug on PS side).
         for (int I = 0; I < nh; ++I)
@@ -339,6 +345,8 @@ inline nda::array<double, 2> compute_paw_static_D(
  * lands).
  * ========================================================================== */
 
+namespace hamilt {
+
 inline void pseudopot::build_paw_scf_caches()
 {
     if (paw_scf_caches_built) return;
@@ -459,5 +467,7 @@ inline void pseudopot::compute_deeq_scf(nij_t const& nij)
                                         Dnn_atom.size(), 0);
     mpi->comm.barrier();
 }
+
+} // namespace hamilt
 
 #endif // HAMILTONIAN_PAW_PAW_ONECENTER_HPP

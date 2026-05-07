@@ -8,6 +8,7 @@ set( TEST_SRCS
      test_pseudo.cpp
      test_paw_energy_check.cpp
      test_paw_radial.cpp
+     test_paw_onecenter.cpp
    )
 
 if(USE_DEVICE_COMPILER)

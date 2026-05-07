@@ -150,6 +150,82 @@ inline void radial_hartree_multipole(
 }
 
 /**
+ * U-FORM variant of the radial Hartree multipole solver. Production-path
+ * convenience for the QE PAW convention where partial waves are stored as
+ * u_n(r) = r · R_n(r) and the "radial density" carried around in code is
+ * actually rho_u(r) = r² · ρ_LM(r) — i.e., the r² jacobian from spherical
+ * integration is baked into the density itself.
+ *
+ *   V_L(r) = (4π / (2L+1)) · [
+ *              (1 / r^{L+1}) ∫₀^r rho_u(r') r'^L dr'
+ *              +  r^L         ∫_r^∞ rho_u(r') r'^{-(L+1)} dr'
+ *            ]
+ *
+ * Differs from `radial_hartree_multipole` only in the integrand factors
+ * (r'^L vs r'^{L+2} in the inner; r'^{-(L+1)} vs r'^{1-L} in the outer)
+ * because the r² jacobian moves from the integrand to the density.
+ *
+ * Numerical robustness at r=0 is the reason this variant exists: with
+ * QE's log mesh r(0) ≈ 1e-6, r(0)^L → very small and the L=0 inner
+ * integrand rho_u(r') · 1 = u² is regular at the origin (u(0)=0 by
+ * boundary condition). Splitting rho_u back into ρ × r² and feeding the
+ * generic solver requires dividing by r²(0) ≈ 1e-12 — fine analytically
+ * but a numerical zero/zero at the origin. This routine integrates
+ * directly in u-form and avoids that division.
+ */
+inline void radial_hartree_multipole_u_form(
+    nda::ArrayOfRank<1> auto const& rho_u,
+    nda::ArrayOfRank<1> auto const& r,
+    nda::ArrayOfRank<1> auto const& rab,
+    int L,
+    nda::ArrayOfRank<1> auto& V_L)
+{
+    long n = rho_u.size();
+    utils::check(r.size() == n && rab.size() == n && V_L.size() == n,
+                 "radial_hartree_multipole_u_form: shape mismatch (rho_u={}, r={}, rab={}, V={})",
+                 n, r.size(), rab.size(), V_L.size());
+    if (n == 0) return;
+
+    // I_in(r_i) = ∫₀^{r_i} rho_u(r') r'^L dr'   (cumulative, trap rule)
+    nda::array<double, 1> I_in(n);
+    I_in(0) = 0.0;
+    for (long i = 1; i < n; ++i) {
+        double r_im1 = r(i - 1), r_i = r(i);
+        double pim1 = rho_u(i - 1) * std::pow(r_im1, L);
+        double pi   = rho_u(i)     * std::pow(r_i,   L);
+        I_in(i) = I_in(i - 1) + 0.5 * (pim1 * rab(i - 1) + pi * rab(i));
+    }
+
+    // I_out(r_i) = ∫_{r_i}^∞ rho_u(r') r'^{-(L+1)} dr'
+    // For r' = 0 with L = 0: rho_u(0) · 1/r' = u²(0)/r' = 0 (since u(0) = 0
+    // by regularity). For L > 0: r'^{-(L+1)} diverges but rho_u ~ r'^{L+2}
+    // for the leading term of u² near 0, so the integrand is regular. We
+    // skip evaluating at r=0 explicitly to avoid the divide-by-zero, since
+    // the contribution there is negligible (regular near 0).
+    nda::array<double, 1> I_out(n);
+    I_out(n - 1) = 0.0;
+    for (long i = n - 2; i >= 0; --i) {
+        double r_ip1 = r(i + 1), r_i = r(i);
+        double pip1 = (r_ip1 > 0.0) ? rho_u(i + 1) * std::pow(r_ip1, -L - 1)
+                                    : 0.0;
+        double pi   = (r_i   > 0.0) ? rho_u(i)     * std::pow(r_i,   -L - 1)
+                                    : 0.0;
+        I_out(i) = I_out(i + 1) + 0.5 * (pip1 * rab(i + 1) + pi * rab(i));
+    }
+
+    double pref = 4.0 * M_PI / (2.0 * L + 1.0);
+    for (long i = 0; i < n; ++i) {
+        if (r(i) <= 0.0) {
+            V_L(i) = (L == 0) ? pref * I_out(i) : 0.0;
+        } else {
+            double inner = I_in(i)  / std::pow(r(i), L + 1);
+            double outer = std::pow(r(i), L) * I_out(i);
+            V_L(i) = pref * (inner + outer);
+        }
+    }
+}
+
+/**
  * Kinetic-energy matrix element ⟨ψ_I | -½∇² | ψ_J⟩ on the radial mesh
  * for a fixed angular-momentum quantum number `l` (channels share l;
  * for I, J in the same beta-channel the l matches).
