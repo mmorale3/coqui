@@ -73,6 +73,7 @@ pseudopot::pseudopot(MF_t &mf, std::string const filename) :
   Pskna(make_shared_array<nda::array_view<ComplexType,4>>(*mpi,{1,1,1,1})),   // resize later
   Dnn(make_shared_array<nda::array_view<ComplexType,3>>(*mpi,{1,1,1})),       // resize later
   Dnn_atom(make_shared_array<nda::array_view<ComplexType,3>>(*mpi,{1,1,1})),        // resize later
+  Dnn_atom_static_paw(make_shared_array<nda::array_view<ComplexType,3>>(*mpi,{1,1,1})), // resize lazily on first compute_deeq_scf call
   swfc_to_rho(detail::make_wfc_to_rho(*mpi,mf,fft_mesh_aug)),
   svloc(make_shared_array<nda::array_view<ComplexType,3>>(*mpi,{1,1,1})),            // resize later
   svsc(make_shared_array<nda::array_view<ComplexType,3>>(*mpi,{1,1,1})),  // resize later

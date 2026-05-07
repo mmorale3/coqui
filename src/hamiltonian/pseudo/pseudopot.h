@@ -342,6 +342,33 @@ class pseudopot
   // PAW with deeq(s=1)≠deeq(s=2) is a documented TODO.
   sarray_t<nda::array_view<ComplexType,3>> Dnn_atom;
 
+  // SCF-invariant ("static") baseline for the per-atom non-local D matrix
+  // under the no-XC frozen-core scGW design:
+  //   D_static^a = dvan(type(a)) + paw_init_keeq(type(a))
+  // where paw_init_keeq carries the kinetic and bare-ionic AE−PS one-center
+  // matrix elements (`hamilt::paw::compute_paw_static_D`, in Ha). For NCPP
+  // species this collapses to the dvan replica.
+  // Same shape and SHM layout as Dnn_atom. Populated lazily on the first
+  // call to `hamilt::paw::compute_deeq_scf`; empty until then.
+  sarray_t<nda::array_view<ComplexType,3>> Dnn_atom_static_paw;
+
+  // Per-species frozen-core radial densities (rho_core_AE, rho_core_PS),
+  // SCF-invariant under the frozen-core approximation. Indexed by species
+  // type. Populated lazily by `hamilt::paw::compute_deeq_scf` on first call;
+  // empty until then.
+  std::vector<std::pair<nda::array<double,1>, nda::array<double,1>>>
+      paw_core_density;
+
+  // aainit `lli` parameter (= 1 + max_l over all PAW betas), needed to size
+  // the angular-momentum coupling tables. Populated lazily alongside the
+  // SCF caches above.
+  int paw_aainit_lli = 0;
+
+  // True after `hamilt::paw::compute_deeq_scf` has built Dnn_atom_static_paw,
+  // paw_core_density, and paw_aainit_lli. Acts as a memoization flag so the
+  // SCF entry point can skip rebuilding the static caches each iteration.
+  bool paw_scf_caches_built = false;
+
   // mapping from wfc_g grid to rho grid. 
   // hard coding ecut in mf now, allow for a custom cutoff later on
   sarray_t<nda::array_view<long,1>> swfc_to_rho;
@@ -405,6 +432,42 @@ class pseudopot
   // Public PAW/USPP utilities exposed to callers (test code, paw_aug_thc,
   // v_h_paw, etc.). Re-open public scope here.
 public:
+
+  /**
+   * Recompute `Dnn_atom` from a current density matrix `nij` for the
+   * frozen-core no-XC scGW framework:
+   *
+   *   D_eff^a(ρ) = D_static^a + ΔD_H^a(becsum^a(ρ), ρ_core_AE, ρ_core_PS)
+   *
+   * Static piece (SCF-invariant): kinetic + bare-ionic AE−PS one-center
+   * matrix elements, computed once from the canonical UPF inputs (no QE
+   * runtime dependency, no frozen-XC residual). Cached in
+   * `Dnn_atom_static_paw`.
+   *
+   * Dynamic piece (Hartree only): per-atom radial Hartree solver via
+   * `compute_paw_hartree_atom` from the current becsum.
+   *
+   * Restrictions: npol = 1 (no SOC), non-magnetic (nspin = 1 path uses
+   * full nij; LSDA averaging is the same path on the spin-summed becsum).
+   * Requires populated `species_paw_t` fields (aewfc, pswfc, ae_vloc,
+   * vloc_ps, qfuncl); throws otherwise.
+   *
+   * Implementation lives out-of-class in `hamiltonian/paw/paw_onecenter.hpp`
+   * — include that header at the call site.
+   */
+  template<typename nij_t>
+  void compute_deeq_scf(nij_t const& nij);
+
+  /**
+   * Build the SCF-invariant caches consumed by `compute_deeq_scf`:
+   * `Dnn_atom_static_paw`, `paw_core_density`, `paw_aainit_lli`. Idempotent;
+   * subsequent calls return immediately. Called automatically from
+   * `compute_deeq_scf`; exposed publicly so callers can pre-build the
+   * caches (e.g., during driver setup, outside the SCF hot loop).
+   *
+   * Implementation lives out-of-class in `hamiltonian/paw/paw_onecenter.hpp`.
+   */
+  void build_paw_scf_caches();
 
   /**
    * Add the smooth-grid USPP/PAW augmentation Σ_a Σ_IJ becsum_aIJ Q^IJ_nt(G) e^{-iG·τ_a}

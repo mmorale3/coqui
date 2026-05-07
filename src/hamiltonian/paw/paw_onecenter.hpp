@@ -41,6 +41,7 @@
 #include "hamiltonian/pseudo/pseudopot.h"
 #include "hamiltonian/paw/paw_radial.hpp"
 #include "hamiltonian/paw/paw_aug_q_eval.hpp"   // for aainit_tables
+#include "hamiltonian/paw/v_h_paw.hpp"          // for compute_becsum_full
 
 namespace hamilt::paw {
 
@@ -324,5 +325,139 @@ inline nda::array<double, 2> compute_paw_static_D(
 }
 
 } // namespace hamilt::paw
+
+/* ==========================================================================
+ * pseudopot::build_paw_scf_caches  +  pseudopot::compute_deeq_scf
+ *
+ * Out-of-class definitions for the methods declared in pseudopot.h. Live
+ * in the `paw_onecenter.hpp` header so the implementation has access to the
+ * `compute_paw_*` helpers above without creating a circular include between
+ * pseudopot.h and the PAW one-center machinery.
+ *
+ * Callers that invoke either method must include this header (transitively
+ * is fine; e.g., `methods/HF/thc_hf.hpp` will pull this in once stage 3.6
+ * lands).
+ * ========================================================================== */
+
+inline void pseudopot::build_paw_scf_caches()
+{
+    if (paw_scf_caches_built) return;
+
+    // 1. Compute the aainit lli (= 1 + max_l over all PAW betas).
+    int lli = 1;
+    for (auto const& sp : paw_species)
+        for (long b = 0; b < (long)sp.lll.size(); ++b)
+            lli = std::max(lli, (int)sp.lll(b) + 1);
+    paw_aainit_lli = lli;
+
+    // 2. Per-species frozen-core radial densities. Cheap (O(mesh × ncore));
+    //    held in heap memory on every rank (small — < few KB per species).
+    paw_core_density.clear();
+    paw_core_density.reserve(paw_species.size());
+    for (auto const& sp : paw_species)
+        paw_core_density.emplace_back(hamilt::paw::compute_paw_core_density(sp));
+
+    // 3. Allocate the SCF-invariant baseline Dnn_atom_static_paw with the
+    //    same shape as Dnn_atom (per-node SHM via sarray_t).
+    long nat = ityp.extent(0);
+    long nD  = (long)Dnn_atom.local().shape()[1];   // nhm*npol from existing Dnn_atom
+    Dnn_atom_static_paw = sarray_t<nda::array_view<ComplexType,3>>(
+        *mpi, {std::max((long)1, nat), nD, nD});
+    mpi->node_comm.barrier();
+
+    // 4. Populate on the node-root: D_static = dvan_replica + paw_init_keeq.
+    //    Mirrors the layout of Dnn_atom (ia, n*npol+p, m*npol+p).
+    if (mpi->node_comm.root()) {
+        auto Dloc_sp = Dnn.local();           // (nsp, nhm*npol, nhm*npol)
+        auto Dloc_st = Dnn_atom_static_paw.local();  // (nat, nhm*npol, nhm*npol)
+        Dloc_st() = ComplexType(0.0);
+
+        for (long ia = 0; ia < nat; ++ia) {
+            int nt = ityp(ia);
+
+            // (a) dvan replica from species-resolved Dnn (already in Ha).
+            for (long n = 0; n < nD; ++n)
+                for (long m = 0; m < nD; ++m)
+                    Dloc_st(ia, n, m) = Dloc_sp(nt, n, m);
+
+            // (b) paw_init_keeq additive piece for PAW species with
+            //     populated radial inputs (non-PAW or empty-fields species
+            //     leave the dvan-only baseline in place).
+            if ((size_t)nt >= paw_species.size()) continue;
+            auto const& sp = paw_species[nt];
+            if (sp.nh == 0) continue;
+            auto Dst = hamilt::paw::compute_paw_static_D(sp);
+            if (Dst.size() == 0) continue;
+            for (int I = 0; I < sp.nh; ++I)
+                for (int J = 0; J < sp.nh; ++J)
+                    for (int p = 0; p < npol; ++p)
+                        Dloc_st(ia, I * npol + p, J * npol + p)
+                            += ComplexType(Dst(I, J), 0.0);
+        }
+    }
+    mpi->node_comm.barrier();
+    if (mpi->node_comm.root())
+        mpi->internode_comm.broadcast_n(Dnn_atom_static_paw.local().data(),
+                                        Dnn_atom_static_paw.size(), 0);
+    mpi->comm.barrier();
+
+    paw_scf_caches_built = true;
+}
+
+template<typename nij_t>
+inline void pseudopot::compute_deeq_scf(nij_t const& nij)
+{
+    utils::check(npol == 1,
+        "pseudopot::compute_deeq_scf: npol > 1 (SOC) is not supported yet");
+
+    // 1. Make sure the static caches are in place.
+    build_paw_scf_caches();
+
+    // 2. Build per-atom becsum from Pskna and the current density matrix.
+    auto becsum = hamilt::paw::compute_becsum_full(
+        Pskna_view(), nij, ityp, nh, ofs, npol);
+    long nat = ityp.extent(0);
+
+    // 3. Build the angular-momentum coupling tables (cheap: nibz tables of
+    //    size O((2 lli − 1)⁴), all PAW species share the same lli).
+    auto aatab = hamilt::paw::aainit_tables_build(paw_aainit_lli);
+
+    // 4. On the node-root: copy the static baseline into Dnn_atom and add
+    //    the per-atom Hartree contribution from `compute_paw_hartree_atom`.
+    if (mpi->node_comm.root()) {
+        auto Dloc_at = Dnn_atom.local();
+        auto Dloc_st = Dnn_atom_static_paw.local();
+        Dloc_at() = Dloc_st();
+
+        for (long ia = 0; ia < nat; ++ia) {
+            int nt = ityp(ia);
+            if ((size_t)nt >= paw_species.size()) continue;
+            auto const& sp = paw_species[nt];
+            if (sp.nh == 0 || sp.aewfc.size() == 0) continue;
+
+            // Slice atom-resolved becsum (nh, nh).
+            auto bs_a = becsum(ia, nda::range(0, sp.nh),
+                                   nda::range(0, sp.nh));
+
+            auto const& cores = paw_core_density[nt];
+            auto const& rho_core_AE = cores.first;
+            auto const& rho_core_PS = cores.second;
+
+            auto res = hamilt::paw::compute_paw_hartree_atom(
+                sp, bs_a, rho_core_AE, rho_core_PS, aatab);
+
+            for (int I = 0; I < sp.nh; ++I)
+                for (int J = 0; J < sp.nh; ++J)
+                    for (int p = 0; p < npol; ++p)
+                        Dloc_at(ia, I * npol + p, J * npol + p)
+                            += ComplexType(res.dDeeq_H(I, J), 0.0);
+        }
+    }
+    mpi->node_comm.barrier();
+    if (mpi->node_comm.root())
+        mpi->internode_comm.broadcast_n(Dnn_atom.local().data(),
+                                        Dnn_atom.size(), 0);
+    mpi->comm.barrier();
+}
 
 #endif // HAMILTONIAN_PAW_PAW_ONECENTER_HPP
