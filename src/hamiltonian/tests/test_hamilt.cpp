@@ -426,7 +426,10 @@ void check_Vxc(mpi_context_t& mpi, mf::MF& mfobj) {
 }
 
 template<MEMORY_SPACE MEM>
-void check_Hartree(mpi_context_t& mpi, std::shared_ptr<mf::MF> &mfobj, bool diag_dm=false) {
+void check_Hartree(mpi_context_t& mpi,
+                    std::shared_ptr<mf::MF>& mfobj,
+                    std::string const& src_name,
+                    bool diag_dm = false) {
   hamilt::pseudopot V(*mfobj);
   long nspin = mfobj->nspin();
   long nkpts_ibz = mfobj->nkpts_ibz();
@@ -438,19 +441,12 @@ void check_Hartree(mpi_context_t& mpi, std::shared_ptr<mf::MF> &mfobj, bool diag
       mpi.comm, mpi.internode_comm, mpi.node_comm, shape);
   get_density_ovlp(mpi, *mfobj, V, 1000, sDm_skij, sS_skij);
 
-  // Hartree from ERI
-  auto sJ_skij = make_shared_array<array_view_4d_t>(
-      mpi.comm, mpi.internode_comm, mpi.node_comm, shape); 
-  methods::thc_reader_t thc(mfobj,
-                            methods::make_thc_reader_ptree(0, "", "incore", "", "coqui", 1e-9,
-                                                           mfobj->ecutrho(), 1, 1024));
-  methods::solvers::hf_t hf;
-  hf.evaluate(sJ_skij, sDm_skij.local(), thc, sS_skij.local(), true, false);
-  mpi.comm.barrier();
-
-  // Hartree from PW
+  // Hartree from PW. The previous THC reference computation has been
+  // replaced with a stored reference loaded from the fixture directory
+  // (see reference IO below), since the THC build is the dominant cost
+  // and not the point of this test.
   auto sJ2_skij = make_shared_array<array_view_4d_t>(
-      mpi.comm, mpi.internode_comm, mpi.node_comm, shape); 
+      mpi.comm, mpi.internode_comm, mpi.node_comm, shape);
   if (diag_dm) {
     memory::array<MEM, ComplexType, 3> Dm_ski(nspin, nkpts_ibz, nbnd);
     for (long s=0; s<mfobj->nspin(); ++s) {
@@ -467,17 +463,21 @@ void check_Hartree(mpi_context_t& mpi, std::shared_ptr<mf::MF> &mfobj, bool diag
   }
   sJ2_skij.communicator()->barrier();
 
-  auto Abs = nda::map([](ComplexType _x_) { return std::abs(_x_); });
-  double norm = -1;
-  if (sJ_skij.node_comm()->root()) {
-    nda::array<RealType,4> res_abs(nspin, nkpts_ibz, nbnd, nbnd);
-    res_abs = Abs(sJ_skij.local() - sJ2_skij.local());
-    norm = nda::max_element(res_abs);
+  // Reference IO: read the stored Hartree tensor and compare.
+  // Stored at <fixture_outdir>/reference_hamiltonian_test_results.h5,
+  // with one dataset per (diag_dm) variant: "J_full" or "J_diag".
+  auto [outdir, prefix] = utils::utest_filename(src_name);
+  std::string ref_file = outdir + "/reference_hamiltonian_test_results.h5";
+  std::string dataset  = diag_dm ? "J_diag" : "J_full";
+  nda::array<ComplexType, 4> J_ref(nspin, nkpts_ibz, nbnd, nbnd);
+  if (mpi.comm.root()) {
+    REQUIRE(std::filesystem::exists(ref_file));
+    h5::file f(ref_file, 'r');
+    h5::group g(f);
+    nda::h5_read(g, dataset, J_ref);
   }
-  sJ_skij.node_comm()->broadcast_n(&norm, 1, 0);
-  app_log(2, "Norm of J - J2 = {}", norm);
-
-  utils::ARRAY_EQUAL(sJ_skij.local(), sJ2_skij.local(), 1e-5);
+  mpi.comm.broadcast_n(J_ref.data(), J_ref.size(), 0);
+  utils::ARRAY_EQUAL(sJ2_skij.local(), J_ref, 1e-5);
 }
 
 // MAM: reenable and add more tests!!!
@@ -697,34 +697,34 @@ template<MEMORY_SPACE MEM>
 void test_hartree_impl(std::shared_ptr<mpi_context_t> &mpi)
 {
 
-  SECTION("lih223") 
+  SECTION("lih223")
   {
     auto qe_h5 = std::make_shared<mf::MF>(mf::default_MF(mpi, "qe_lih223", mf::h5_input_type));
-    check_Hartree<MEM>(*mpi, qe_h5);
+    check_Hartree<MEM>(*mpi, qe_h5, "qe_lih223");
   }
 
-  SECTION("lih223_inv") 
+  SECTION("lih223_inv")
   {
     auto qe_h5 = std::make_shared<mf::MF>(mf::default_MF(mpi, "qe_lih223_inv", mf::h5_input_type));
-    check_Hartree<MEM>(*mpi, qe_h5);
+    check_Hartree<MEM>(*mpi, qe_h5, "qe_lih223_inv");
   }
 
-  SECTION("lih223_sym") 
+  SECTION("lih223_sym")
   {
     auto qe_h5 = std::make_shared<mf::MF>(mf::default_MF(mpi, "qe_lih223_sym", mf::h5_input_type));
-    check_Hartree<MEM>(*mpi, qe_h5);
+    check_Hartree<MEM>(*mpi, qe_h5, "qe_lih223_sym");
   }
 
-  SECTION("lih223_sym_diag") 
+  SECTION("lih223_sym_diag")
   {
     auto qe_h5 = std::make_shared<mf::MF>(mf::default_MF(mpi, "qe_lih223_sym", mf::h5_input_type));
-    check_Hartree<MEM>(*mpi, qe_h5, true); // diagonal density as the input
+    check_Hartree<MEM>(*mpi, qe_h5, "qe_lih223_sym", true); // diagonal density as the input
   }
 
-  SECTION("GaAs222_so") 
+  SECTION("GaAs222_so")
   {
     auto qe_h5 = std::make_shared<mf::MF>(mf::default_MF(mpi, "qe_GaAs222_so", mf::h5_input_type));
-    check_Hartree<MEM>(*mpi, qe_h5, true); // diagonal density as the input
+    check_Hartree<MEM>(*mpi, qe_h5, "qe_GaAs222_so", true); // diagonal density as the input
   }
 }
 
@@ -1361,7 +1361,7 @@ void test_hartree_thc_paw_aug(mpi_context_t& mpi, std::shared_ptr<mf::MF> mf_ptr
  * Y_LM matrix-inverse conditioning + radial Bessel quadrature accuracy).
  */
 template<MEMORY_SPACE MEM>
-void test_paw_aug_q_eval_at_q0([[maybe_unused]] mpi_context_t& mpi, mf::MF& mfobj,
+void test_paw_aug_q_eval_at_q0(mpi_context_t& mpi, mf::MF& mfobj,
                                 double tol = 1e-10)
 {
   hamilt::pseudopot V(mfobj);
@@ -1413,23 +1413,29 @@ void test_paw_aug_q_eval_at_q0([[maybe_unused]] mpi_context_t& mpi, mf::MF& mfob
     double max_err = 0.0;
     double max_qgm = 0.0;
     long ng_check = std::min<long>(ngm_d, 200);   // sample first 200 G
-    for (int ih = 0; ih < nh_a; ++ih)
-    for (int jh = 0; jh < nh_a; ++jh) {
+    // Distribute the (ih, jh, g) flat index space across MPI ranks; reduce maxes.
+    long N_total = (long)nh_a * nh_a * ng_check;
+    long my_rank = mpi.comm.rank();
+    long nproc   = mpi.comm.size();
+    for (long idx = my_rank; idx < N_total; idx += nproc) {
+      long g  = idx % ng_check;
+      int  jh = (int)((idx / ng_check) % nh_a);
+      int  ih = (int)(idx / (ng_check * nh_a));
       long ij = (long)ijtoh(nt, ih, jh) - 1;
       if (ij < 0) continue;
-      for (long g = 0; g < ng_check; ++g) {
-        int m1 = mill(g, 0), m2 = mill(g, 1), m3 = mill(g, 2);
-        double Gx = m1*recv(0,0) + m2*recv(1,0) + m3*recv(2,0);
-        double Gy = m1*recv(0,1) + m2*recv(1,1) + m3*recv(2,1);
-        double Gz = m1*recv(0,2) + m2*recv(1,2) + m3*recv(2,2);
-        ComplexType pred = hamilt::paw::evaluate_Q_IJ_at_K(
-            sp, aatab, ih, jh, {Gx, Gy, Gz}, omega);
-        ComplexType ref  = qgm(nt, ij, g);
-        double e = std::abs(pred - ref);
-        max_err = std::max(max_err, e);
-        max_qgm = std::max(max_qgm, std::abs(ref));
-      }
+      int m1 = mill(g, 0), m2 = mill(g, 1), m3 = mill(g, 2);
+      double Gx = m1*recv(0,0) + m2*recv(1,0) + m3*recv(2,0);
+      double Gy = m1*recv(0,1) + m2*recv(1,1) + m3*recv(2,1);
+      double Gz = m1*recv(0,2) + m2*recv(1,2) + m3*recv(2,2);
+      ComplexType pred = hamilt::paw::evaluate_Q_IJ_at_K(
+          sp, aatab, ih, jh, {Gx, Gy, Gz}, omega);
+      ComplexType ref  = qgm(nt, ij, g);
+      double e = std::abs(pred - ref);
+      max_err = std::max(max_err, e);
+      max_qgm = std::max(max_qgm, std::abs(ref));
     }
+    mpi.comm.all_reduce_in_place_n(&max_err, 1, mpi3::max<>{});
+    mpi.comm.all_reduce_in_place_n(&max_qgm, 1, mpi3::max<>{});
     app_log(2, "paw_aug_q_eval species {}: nh={}, ngm_check={}, "
                "max|Q_pred − Q_ref| = {:.3e}, max|Q_ref| = {:.3e}, "
                "rel = {:.3e}",
@@ -1447,7 +1453,7 @@ void test_paw_aug_q_eval_at_q0([[maybe_unused]] mpi_context_t& mpi, mf::MF& mfob
  * the table for a given fixture.
  */
 template<MEMORY_SPACE MEM>
-void test_paw_isdf_rank_vs_tol([[maybe_unused]] mpi_context_t& mpi, mf::MF& mfobj,
+void test_paw_isdf_rank_vs_tol(mpi_context_t& mpi, mf::MF& mfobj,
                                 std::string const& label)
 {
   hamilt::pseudopot V(mfobj);
@@ -1460,24 +1466,42 @@ void test_paw_isdf_rank_vs_tol([[maybe_unused]] mpi_context_t& mpi, mf::MF& mfob
   double omega = (2.0*M_PI)*(2.0*M_PI)*(2.0*M_PI) / std::abs(det_B);
   long nat = V.ityp_view().extent(0);
 
-  for (auto metric : {hamilt::paw::isdf_metric::Coulomb,
-                       hamilt::paw::isdf_metric::L2}) {
-    auto mname = std::string(hamilt::paw::metric_name(metric));
+  hamilt::paw::isdf_metric metrics[2] = {
+      hamilt::paw::isdf_metric::Coulomb, hamilt::paw::isdf_metric::L2};
+  double tols[4] = {1e-3, 1e-6, 1e-9, 1e-12};
+
+  // Distribute the (mi, nt, ti) triple over MPI ranks; entries this rank doesn't
+  // own stay 0; combine via sum-reduce so every rank sees the full table for
+  // printing on rank 0.
+  int nsp_total = (int)sps.size();
+  long table_size = (long)2 * nsp_total * 4;
+  nda::array<long, 3> nlam(2, nsp_total, 4);
+  nlam() = 0;
+  long my_rank = mpi.comm.rank();
+  long nproc   = mpi.comm.size();
+  for (long flat = my_rank; flat < table_size; flat += nproc) {
+    int mi = (int)(flat / (nsp_total * 4));
+    int nt = (int)((flat / 4) % nsp_total);
+    int ti = (int)(flat % 4);
+    if (!(sps[nt].is_paw || sps[nt].is_uspp)) continue;
+    nlam(mi, nt, ti) = hamilt::paw::build_local_isdf_compressed_by_norm(
+                          V, nt, recv, omega, metrics[mi], tols[ti]).nlambda;
+  }
+  mpi.comm.all_reduce_in_place_n(nlam.data(), nlam.size(), std::plus<>{});
+
+  for (int mi = 0; mi < 2; ++mi) {
+    auto mname = std::string(hamilt::paw::metric_name(metrics[mi]));
     app_log(2, "=== local-ISDF rank vs tol [{} metric] ({}) ===", mname, label);
     app_log(2, "  {:>18} {:>5} {:>10} {:>5} {:>5} {:>5} {:>5} {:>8}",
             "species", "nh", "full-rank", "1e-3", "1e-6", "1e-9", "1e-12", "N_aug");
-    for (int nt = 0; nt < (int)sps.size(); ++nt) {
+    for (int nt = 0; nt < nsp_total; ++nt) {
       if (!(sps[nt].is_paw || sps[nt].is_uspp)) continue;
       int nh_a = (int)V.nh_view()(nt);
       int full = nh_a * nh_a;
-      int n3 = hamilt::paw::build_local_isdf_compressed_by_norm(
-                   V, nt, recv, omega, metric, 1e-3).nlambda;
-      int n6 = hamilt::paw::build_local_isdf_compressed_by_norm(
-                   V, nt, recv, omega, metric, 1e-6).nlambda;
-      int n9 = hamilt::paw::build_local_isdf_compressed_by_norm(
-                   V, nt, recv, omega, metric, 1e-9).nlambda;
-      int n12 = hamilt::paw::build_local_isdf_compressed_by_norm(
-                   V, nt, recv, omega, metric, 1e-12).nlambda;
+      long n3  = nlam(mi, nt, 0);
+      long n6  = nlam(mi, nt, 1);
+      long n9  = nlam(mi, nt, 2);
+      long n12 = nlam(mi, nt, 3);
       int atoms_of_nt = 0;
       for (long ia = 0; ia < nat; ++ia)
         if ((int)V.ityp_view()(ia) == nt) ++atoms_of_nt;
@@ -1557,33 +1581,44 @@ void test_thc_paw_hermiticity(mpi_context_t& mpi,
   thc_pt.put("paw_isdf_tol", 1e-12);
   methods::thc_reader_t thc(mf_ptr, thc_pt);
 
-  // Gather V_full(q, P, Q) for all q on rank 0 for the comparison.
-  // Distribute across q to match comm.size(), then gather to root.
+  // Gather V_full(q, P, Q) for all q to every rank for the comparison.
+  // Distribute across q first (capped at nq_ibz), spill remainder onto P, then
+  // all-gather so every rank can do its slice of the q × P × Q comparison loop.
   long Np = thc.Np();
+  long np_q = utils::find_proc_grid_max_npools(
+      (long)mpi.comm.size(), nq_ibz, 0.2);
+  long np_P = (long)mpi.comm.size() / np_q;
   auto dZ_qPQ = thc.template dZ<HOST_MEMORY>(
-      {(long)mpi.comm.size(), 1, 1}, {0, 0, 0});
-  nda::array<ComplexType, 3> V;
-  if (mpi.comm.root())
-    V = nda::array<ComplexType, 3>(dZ_qPQ.global_shape());
+      {np_q, np_P, 1}, {0, 0, 0});
+  nda::array<ComplexType, 3> V(dZ_qPQ.global_shape());
+  V() = ComplexType(0);
   math::nda::gather(0, dZ_qPQ, &V);
-  if (!mpi.comm.root()) return;
+  mpi.comm.broadcast_n(V.data(), V.size(), 0);
 
+  // Distribute the (iq, P, Q) comparison triple across ranks; max-reduce.
   double max_dev = 0.0;
   double max_val = 0.0;
-  long checked = 0;
-  for (long iq = 0; iq < nq_ibz; ++iq) {
+  long checked_local = 0;
+  long my_rank = mpi.comm.rank();
+  long nproc   = mpi.comm.size();
+  long N_total = nq_ibz * Np * Np;
+  for (long idx = my_rank; idx < N_total; idx += nproc) {
+    long iq = idx / (Np * Np);
+    long P  = (idx / Np) % Np;
+    long Q  = idx % Np;
     long iqm = qminus(iq);
-    if (iqm < 0 || iqm >= nq_ibz) continue;   // qminus may map outside IBZ
-    for (long P = 0; P < Np; ++P)
-    for (long Q = 0; Q < Np; ++Q) {
-      ComplexType a = V(iq,  P, Q);
-      ComplexType b = V(iqm, Q, P);
-      double dev = std::abs(a - std::conj(b));
-      max_dev = std::max(max_dev, dev);
-      max_val = std::max(max_val, std::abs(a));
-      ++checked;
-    }
+    if (iqm < 0 || iqm >= nq_ibz) continue;
+    ComplexType a = V(iq,  P, Q);
+    ComplexType b = V(iqm, Q, P);
+    double dev = std::abs(a - std::conj(b));
+    max_dev = std::max(max_dev, dev);
+    max_val = std::max(max_val, std::abs(a));
+    ++checked_local;
   }
+  mpi.comm.all_reduce_in_place_n(&max_dev, 1, mpi3::max<>{});
+  mpi.comm.all_reduce_in_place_n(&max_val, 1, mpi3::max<>{});
+  long checked = checked_local;
+  mpi.comm.all_reduce_in_place_n(&checked, 1, std::plus<>{});
   app_log(2, "PAW-augmented THC Hermiticity: nq_ibz={}, Np={}, "
              "max |V(q,P,Q) − V*(−q,Q,P)| = {:.3e}, "
              "max |V| = {:.3e}, rel = {:.3e}, checked={}",
@@ -2014,7 +2049,7 @@ void test_local_isdf_deltaC_roundtrip([[maybe_unused]] mpi_context_t& mpi, mf::M
  * Exact in the full-rank limit; any deviation is a U/η bug.
  */
 template<MEMORY_SPACE MEM>
-void test_local_isdf_rho_aug_reconstruction([[maybe_unused]] mpi_context_t& mpi, mf::MF& mfobj,
+void test_local_isdf_rho_aug_reconstruction(mpi_context_t& mpi, mf::MF& mfobj,
                                             double tol = 1e-12)
 {
   auto all = nda::range::all;
@@ -2058,10 +2093,13 @@ void test_local_isdf_rho_aug_reconstruction([[maybe_unused]] mpi_context_t& mpi,
   auto const& tau   = V.atom_pos_cart_view();
   auto recv = mfobj.recv();
 
-  // Direct ρ_aug(G) (with structure factor)
+  // Direct ρ_aug(G) (with structure factor); distribute G across MPI ranks,
+  // then sum-reduce so every rank has the full vector for the comparison.
+  long my_rank = mpi.comm.rank();
+  long nproc   = mpi.comm.size();
   nda::array<ComplexType,1> rho_direct(ngm_d);
   rho_direct() = ComplexType(0.0);
-  for (long g=0; g<ngm_d; ++g) {
+  for (long g = my_rank; g < ngm_d; g += nproc) {
     double Gx = mill(g,0)*recv(0,0) + mill(g,1)*recv(1,0) + mill(g,2)*recv(2,0);
     double Gy = mill(g,0)*recv(0,1) + mill(g,1)*recv(1,1) + mill(g,2)*recv(2,1);
     double Gz = mill(g,0)*recv(0,2) + mill(g,1)*recv(1,2) + mill(g,2)*recv(2,2);
@@ -2083,11 +2121,13 @@ void test_local_isdf_rho_aug_reconstruction([[maybe_unused]] mpi_context_t& mpi,
     }
     rho_direct(g) = acc;
   }
+  mpi.comm.all_reduce_in_place_n(rho_direct.data(), rho_direct.size(),
+                                  std::plus<>{});
 
-  // ISDF-reconstructed ρ_aug(G)
+  // ISDF-reconstructed ρ_aug(G); same distribution + sum-reduce.
   nda::array<ComplexType,1> rho_isdf(ngm_d);
   rho_isdf() = ComplexType(0.0);
-  for (long g=0; g<ngm_d; ++g) {
+  for (long g = my_rank; g < ngm_d; g += nproc) {
     double Gx = mill(g,0)*recv(0,0) + mill(g,1)*recv(1,0) + mill(g,2)*recv(2,0);
     double Gy = mill(g,0)*recv(0,1) + mill(g,1)*recv(1,1) + mill(g,2)*recv(2,1);
     double Gz = mill(g,0)*recv(0,2) + mill(g,1)*recv(1,2) + mill(g,2)*recv(2,2);
@@ -2119,6 +2159,8 @@ void test_local_isdf_rho_aug_reconstruction([[maybe_unused]] mpi_context_t& mpi,
     }
     rho_isdf(g) = acc;
   }
+  mpi.comm.all_reduce_in_place_n(rho_isdf.data(), rho_isdf.size(),
+                                  std::plus<>{});
 
   // Compare: max |ρ_direct(G) − ρ_isdf(G)| across G
   double max_err = 0.0, max_ref = 0.0;
@@ -2352,7 +2394,7 @@ TEST_CASE("local_isdf_K_a_compressed_accuracy", "[hamilt][paw][isdf]")
  * `local_isdf_K_a_one_center`, but here we trace the convergence).
  */
 template<MEMORY_SPACE MEM>
-void test_local_isdf_K_a_one_center_vs_rank([[maybe_unused]] mpi_context_t& mpi, mf::MF& mfobj,
+void test_local_isdf_K_a_one_center_vs_rank(mpi_context_t& mpi, mf::MF& mfobj,
                                              hamilt::paw::isdf_metric metric)
 {
   auto all = nda::range::all;
@@ -2415,11 +2457,20 @@ void test_local_isdf_K_a_one_center_vs_rank([[maybe_unused]] mpi_context_t& mpi,
     app_log(2, "  rank | nλ |   E_K (Ha)   |    |E_K − E_dC|");
     int nh_a = sp_paw.nh;
     double last_err = 0.0;
+    // Distribute the diagnostic for-n loop across ranks; gather (E_K, nlambda)
+    // for printing on rank 0. Each rank owns n if (n % nproc) == rank.
+    long my_rank = mpi.comm.rank();
+    long nproc   = mpi.comm.size();
+    nda::array<double, 1> E_K_table(n_max + 1);
+    nda::array<long,   1> nlam_table(n_max + 1);
+    E_K_table()  = 0.0;
+    nlam_table() = 0;
     for (int n = 0; n <= n_max; ++n) {
+      if ((long)n % nproc != my_rank) continue;
       auto isdf_n = hamilt::paw::build_local_isdf_compressed(
           V, nt, nh_a, rep, n);
-      auto K = hamilt::paw::compute_K_a(isdf_n, sp_paw.deltaC);
       double E_K = 0.0;
+      auto K = hamilt::paw::compute_K_a(isdf_n, sp_paw.deltaC);
       for (long ia = 0; ia < nat; ++ia) {
         if ((int)ityp(ia) != nt) continue;
         nda::array<double,1> nu(isdf_n.nlambda);
@@ -2438,9 +2489,16 @@ void test_local_isdf_K_a_one_center_vs_rank([[maybe_unused]] mpi_context_t& mpi,
         for (int xi =0; xi <isdf_n.nlambda; ++xi)
           E_K += 0.5 * nu(lam) * K(lam, xi) * nu(xi);
       }
+      E_K_table(n)  = E_K;
+      nlam_table(n) = isdf_n.nlambda;
+    }
+    mpi.comm.all_reduce_in_place_n(E_K_table.data(),  E_K_table.size(),  std::plus<>{});
+    mpi.comm.all_reduce_in_place_n(nlam_table.data(), nlam_table.size(), std::plus<>{});
+    for (int n = 0; n <= n_max; ++n) {
+      double E_K = E_K_table(n);
       double err = std::abs(E_K - E_dC);
       app_log(2, "  {:>4} | {:>2} | {:+.10f} | {:.3e}",
-                 n, isdf_n.nlambda, E_K, err);
+                 n, nlam_table(n), E_K, err);
       last_err = err;
     }
     // At pivoted-Cholesky-converged rank some pairs may still be
@@ -2615,7 +2673,7 @@ TEST_CASE("local_isdf_compression_accuracy", "[hamilt][paw][isdf]")
  * confirming the relative error matches the rank-vs-error report.
  */
 template<MEMORY_SPACE MEM>
-void test_local_isdf_compressed_rho_aug([[maybe_unused]] mpi_context_t& mpi, mf::MF& mfobj,
+void test_local_isdf_compressed_rho_aug(mpi_context_t& mpi, mf::MF& mfobj,
                                          double tol_pc, double tol_check)
 {
   auto all = nda::range::all;
@@ -2669,56 +2727,63 @@ void test_local_isdf_compressed_rho_aug([[maybe_unused]] mpi_context_t& mpi, mf:
   auto const& mill  = V.miller_g_dense_view();
   auto const& tau   = V.atom_pos_cart_view();
 
-  // Direct ρ_aug(G) and ISDF-compressed ρ_aug(G); compare in Coulomb norm
+  // Direct ρ_aug(G) and ISDF-compressed ρ_aug(G); compare in Coulomb norm.
+  // Distribute the outer G loop across MPI ranks; sum-reduce both norms.
   double err_C2 = 0.0;
   double ref_C2 = 0.0;
-  for (long g=0; g<ngm_d; ++g) {
-    double Gx = mill(g,0)*recv(0,0) + mill(g,1)*recv(1,0) + mill(g,2)*recv(2,0);
-    double Gy = mill(g,0)*recv(0,1) + mill(g,1)*recv(1,1) + mill(g,2)*recv(2,1);
-    double Gz = mill(g,0)*recv(0,2) + mill(g,1)*recv(1,2) + mill(g,2)*recv(2,2);
-    double G2 = Gx*Gx + Gy*Gy + Gz*Gz;
-    if (G2 < 1e-14) continue;
-    double w = 4.0*M_PI/(omega*G2);
+  {
+    long my_rank = mpi.comm.rank();
+    long nproc   = mpi.comm.size();
+    for (long g = my_rank; g < ngm_d; g += nproc) {
+      double Gx = mill(g,0)*recv(0,0) + mill(g,1)*recv(1,0) + mill(g,2)*recv(2,0);
+      double Gy = mill(g,0)*recv(0,1) + mill(g,1)*recv(1,1) + mill(g,2)*recv(2,1);
+      double Gz = mill(g,0)*recv(0,2) + mill(g,1)*recv(1,2) + mill(g,2)*recv(2,2);
+      double G2 = Gx*Gx + Gy*Gy + Gz*Gz;
+      if (G2 < 1e-14) continue;
+      double w = 4.0*M_PI/(omega*G2);
 
-    ComplexType direct(0.0), compressed(0.0);
-    for (long ia=0; ia<nat; ++ia) {
-      int nt = ityp(ia);
-      int nh_a = nh(nt);
-      if (nh_a == 0) continue;
-      double phase = -(Gx*tau(ia,0) + Gy*tau(ia,1) + Gz*tau(ia,2));
-      ComplexType sf(std::cos(phase), std::sin(phase));
+      ComplexType direct(0.0), compressed(0.0);
+      for (long ia=0; ia<nat; ++ia) {
+        int nt = ityp(ia);
+        int nh_a = nh(nt);
+        if (nh_a == 0) continue;
+        double phase = -(Gx*tau(ia,0) + Gy*tau(ia,1) + Gz*tau(ia,2));
+        ComplexType sf(std::cos(phase), std::sin(phase));
 
-      ComplexType atom_d(0.0);
-      for (int I=0; I<nh_a; ++I)
-      for (int J=0; J<nh_a; ++J) {
-        long ij = ijtoh(nt, I, J) - 1;
-        if (ij < 0) continue;
-        atom_d += ComplexType(becsum(ia, I, J)) * qg(nt, ij, g);
-      }
-      direct += sf * atom_d;
-
-      auto const& s = isdf[nt];
-      if (s.nlambda == 0) continue;
-      ComplexType atom_c(0.0);
-      for (int lam=0; lam<s.nlambda; ++lam) {
-        double nu = 0.0;
-        for (int I=0; I<nh_a; ++I) {
-          double uI = s.U(lam, I);
-          if (uI == 0.0) continue;
-          for (int J=0; J<nh_a; ++J) {
-            double uJ = s.U(lam, J);
-            if (uJ == 0.0) continue;
-            nu += uI * becsum(ia, I, J) * uJ;
-          }
+        ComplexType atom_d(0.0);
+        for (int I=0; I<nh_a; ++I)
+        for (int J=0; J<nh_a; ++J) {
+          long ij = ijtoh(nt, I, J) - 1;
+          if (ij < 0) continue;
+          atom_d += ComplexType(becsum(ia, I, J)) * qg(nt, ij, g);
         }
-        atom_c += ComplexType(nu) * s.eta_qg_q0(lam, g);
+        direct += sf * atom_d;
+
+        auto const& s = isdf[nt];
+        if (s.nlambda == 0) continue;
+        ComplexType atom_c(0.0);
+        for (int lam=0; lam<s.nlambda; ++lam) {
+          double nu = 0.0;
+          for (int I=0; I<nh_a; ++I) {
+            double uI = s.U(lam, I);
+            if (uI == 0.0) continue;
+            for (int J=0; J<nh_a; ++J) {
+              double uJ = s.U(lam, J);
+              if (uJ == 0.0) continue;
+              nu += uI * becsum(ia, I, J) * uJ;
+            }
+          }
+          atom_c += ComplexType(nu) * s.eta_qg_q0(lam, g);
+        }
+        compressed += sf * atom_c;
       }
-      compressed += sf * atom_c;
+      ComplexType d = direct - compressed;
+      err_C2 += w * (std::real(d)*std::real(d) + std::imag(d)*std::imag(d));
+      ref_C2 += w * (std::real(direct)*std::real(direct)
+                    + std::imag(direct)*std::imag(direct));
     }
-    ComplexType d = direct - compressed;
-    err_C2 += w * (std::real(d)*std::real(d) + std::imag(d)*std::imag(d));
-    ref_C2 += w * (std::real(direct)*std::real(direct)
-                  + std::imag(direct)*std::imag(direct));
+    mpi.comm.all_reduce_in_place_n(&err_C2, 1, std::plus<>{});
+    mpi.comm.all_reduce_in_place_n(&ref_C2, 1, std::plus<>{});
   }
   double err_C = std::sqrt(std::max(0.0, err_C2));
   double ref_C = std::sqrt(std::max(0.0, ref_C2));
