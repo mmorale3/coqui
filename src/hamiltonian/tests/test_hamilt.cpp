@@ -51,6 +51,7 @@
 #include "hamiltonian/paw/local_isdf_compress.hpp"
 #include "hamiltonian/paw/local_isdf_h5.hpp"
 #include "hamiltonian/paw/paw_aug_q_eval.hpp"
+#include "hamiltonian/paw/paw_onecenter.hpp"
 #include "hamiltonian/paw/v_h_paw.hpp"
 #include "hamiltonian/add_vxc.h"
 #include "utilities/fortran_utilities.h"
@@ -1355,6 +1356,84 @@ void test_hartree_thc_paw_aug(mpi_context_t& mpi, std::shared_ptr<mf::MF> mf_ptr
              "THC = {:+.8f} Ha, diff = {:+.2e} Ha",
              E_H_direct, E_K_a_direct, E_H_target,
              E_H_thc, E_H_thc - E_H_target);
+
+  // -------- Step-0 absolute diagnostic (deltaC e2² convention audit) -------
+  // Independent reference for the one-center Hartree contribution that uses
+  // hamilt::paw::compute_paw_hartree_atom — the radial Poisson + LM
+  // decomposition path validated to match deltaC×becsum/e2² element-wise in
+  // test_paw_onecenter.cpp at 1.6e-6 Ha. That validation establishes the
+  // radial path lives in proper Ha. We compute E_oc_radial directly
+  // here with zero core densities (matches what the augmented-ERI path
+  // sees on existing fixtures: no core-Hartree contribution to one-center)
+  // and compare three quantities all in nominal Ha:
+  //
+  //   E_H_thc                            (CoQui augmented THC Hartree)
+  //   qe_ehart  = E_H_direct             (smooth-grid Hartree, ≅ qe_ehart per
+  //                                        existing test_hartree_energy 1e-8 cmp)
+  //   E_oc_radial                         (one-center Hartree, proper Ha)
+  //
+  // If the augmented-THC ERI is in proper Ha:
+  //   E_H_thc = qe_ehart + E_oc_radial          (diff_correct ≈ 0)
+  // If the augmented-THC carries the same e2² = 4 factor as deltaC's storage:
+  //   E_H_thc = qe_ehart + 4 × E_oc_radial      (diff_correct ≈ 3·E_oc_radial)
+  //
+  // diff_correct here is *advisory* — surfaces the absolute factor without
+  // gating the test. If/when the deltaC convention is fixed, replace
+  // diff_existing's CHECK with one that asserts diff_correct < tol.
+  double E_oc_radial = 0.0;
+  {
+    auto becsum = hamilt::paw::compute_becsum_diagonal(
+        V.Pskna_view(), nii, V.ityp_view(), V.nh_view(), V.ofs_view(), npol);
+    double ns_scl = (nspin == 1 && npol == 1) ? 2.0 : 1.0;
+    for (long ia = 0; ia < becsum.extent(0); ++ia)
+      for (long I = 0; I < becsum.extent(1); ++I)
+        for (long J = 0; J < becsum.extent(2); ++J)
+          becsum(ia, I, J) *= ns_scl;
+
+    auto const& sps  = V.paw_species_view();
+    auto const& ityp = V.ityp_view();
+    long nat = ityp.extent(0);
+
+    int lli = 1;
+    for (auto const& sp : sps)
+      for (long b = 0; b < (long)sp.lll.size(); ++b)
+        lli = std::max(lli, (int)sp.lll(b) + 1);
+    auto aatab = hamilt::paw::aainit_tables_build(lli);
+
+    for (long ia = 0; ia < nat; ++ia) {
+      int nt = ityp(ia);
+      if ((size_t)nt >= sps.size()) continue;
+      auto const& sp = sps[nt];
+      if (!sp.is_paw || sp.nh == 0 || sp.aewfc.size() == 0) continue;
+
+      long nh_a = sp.nh;
+      auto bs_a = becsum(ia, nda::range(0, nh_a), nda::range(0, nh_a));
+      nda::array<double,1> rho_core_AE_zero =
+          nda::array<double,1>::zeros({(long)sp.mesh});
+      nda::array<double,1> rho_core_PS_zero =
+          nda::array<double,1>::zeros({(long)sp.mesh});
+      auto res = hamilt::paw::compute_paw_hartree_atom(
+          sp, bs_a, rho_core_AE_zero, rho_core_PS_zero, aatab);
+
+      // E_oc_a = ½ Σ_IJ becsum_IJ × dDeeq_H_IJ.
+      for (int I = 0; I < (int)nh_a; ++I)
+        for (int J = 0; J < (int)nh_a; ++J)
+          E_oc_radial += 0.5 * bs_a(I, J) * res.dDeeq_H(I, J);
+    }
+  }
+  double E_H_target_Ha = E_H_direct + E_oc_radial;
+  double diff_correct  = E_H_thc - E_H_target_Ha;
+  double ratio_oc      = (std::abs(E_oc_radial) > 1e-15)
+                       ? (E_K_a_direct / E_oc_radial) : 0.0;
+  app_log(1,
+    "[Step-0 deltaC e2² audit] qe_ehart_proxy={:+.8f} Ha, E_oc_radial={:+.8f} Ha, "
+    "E_K_a_dC={:+.8f} Ha (ratio K_a_dC/E_oc_radial = {:+.4f}, expected 4.0 "
+    "if dC stores 4×Ha), E_H_thc={:+.8f} Ha, diff_correct = E_H_thc − "
+    "(qe_ehart + E_oc_radial) = {:+.3e} Ha (≈3·E_oc_radial = {:+.3e} if THC "
+    "also embeds the e2² factor)",
+    E_H_direct, E_oc_radial, E_K_a_direct, ratio_oc, E_H_thc,
+    diff_correct, 3.0 * E_oc_radial);
+
   CHECK(std::abs(E_H_thc - E_H_target) < tol);
 }
 
