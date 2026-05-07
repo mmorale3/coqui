@@ -148,11 +148,8 @@ static void run_dDeeq_H_matches_deltaC_test(std::string fixture_name,
 
         // -- Path 2: closed-form ΔC × becsum. -----------------------------
         //    deltaC has shape (nh, nh, nh, nh); contract over (K, L).
-        //    pw2coqui's PAW_init_fock_kernel-export divides by e2² before
-        //    writing to the h5, so on-disk deltaC is in proper Ha and
-        //    contracts directly without any unit factor. (Pre-Step-1
-        //    fixtures stored 4×Ha; that audit and fix landed in pw2coqui
-        //    on the `paw` branch.)
+        //    On-disk deltaC is in proper Ha (pw2coqui divides by e2²
+        //    before writing), so the contraction has no unit factor.
         nda::array<double,2> dD_dC =
             nda::array<double,2>::zeros({nh_a, nh_a});
         for (long I = 0; I < nh_a; ++I)

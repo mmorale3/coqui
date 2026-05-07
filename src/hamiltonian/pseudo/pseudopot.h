@@ -131,8 +131,8 @@ class pseudopot
     nda::array_view<double,3> qfuncl;    // (2*lmax+1, nbeta(nbeta+1)/2, mesh)
     nda::array_view<double,4> deltaC;    // (nh, nh, nh, nh) — raw ke%k from QE
     nda::array_view<double,2> core_aewfc;// (ncore, mesh)
-    // Phase 4.3 angular momentum metadata (per-species slices of QE's
-    // global uspp tables; ih ∈ [0, nh), nbeta ∈ [0, nbeta)).
+    // Angular momentum metadata (per-species slices of QE's global uspp
+    // tables; ih ∈ [0, nh), nbeta ∈ [0, nbeta)).
     nda::array<int,1> lll;             // (nbeta) — l per beta projector
     nda::array<int,1> nhtol;           // (nh)    — l per ih
     nda::array<int,1> nhtolm;          // (nh)    — lm = l*(l+1)+m+1 (1-based) per ih
@@ -472,10 +472,8 @@ public:
   /**
    * Add the smooth-grid USPP/PAW augmentation Σ_a Σ_IJ becsum_aIJ Q^IJ_nt(G) e^{-iG·τ_a}
    * to a pair density rhoG already on the dense G grid. NCPP species are
-   * skipped. This is the temporary "raw augmentation" form used in Phase 1
-   * and is replaced by the compensation-charge formulation in Phase 3.
-   * The caller is responsible for building becsum_aIJ from Pskna and the
-   * gvec_phase structure-factor table.
+   * skipped. The caller is responsible for building becsum_aIJ from Pskna
+   * and the gvec_phase structure-factor table.
    */
   void add_augmentation_to_pairdensity(
       nda::ArrayOfRank<2> auto const& becsum_aIJ,

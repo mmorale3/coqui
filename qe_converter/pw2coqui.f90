@@ -531,11 +531,9 @@ subroutine write_pp(h5_f)
     !
   endif
 
-  ! (PAW one-center deltaC and Kcv/Kcc moved to write_species, written under
-  !  /Hamiltonian/Species/{nt}/Onecenter/. The previous "factorized" routine
-  !  was a stub: it computed L = U sqrt(λ) and silently discarded it. Phase 0
-  !  drops the factorization (fits live in CoQui per implementation plan
-  !  decision 1) and exports the raw ke%k tensor.)
+  ! PAW one-center deltaC and Kcv/Kcc are written by write_species under
+  ! /Hamiltonian/Species/{nt}/Onecenter/. Local channel fits are not
+  ! computed here; consumers build them from the raw ke%k tensor.
 
   ALLOCATE ( mill_g ( 3, ngm_g ) )
   mill_g = 0
@@ -823,8 +821,6 @@ SUBROUTINE write_species(h5_f)
 ! For PAW species, also writes /Hamiltonian/Species/{nt}/Onecenter/deltaC
 ! (raw ke%k from PAW_init_fock_kernel) and /Hamiltonian/Species/{nt}/Core/
 ! (GIPAW core orbitals when has_gipaw is true).
-!
-! Schema reference: notes/paw_implementation_plan.md
 !=----------------------------------------------------------------------------=!
   USE kinds, ONLY : DP
   USE constants, ONLY : e2
@@ -976,15 +972,10 @@ SUBROUTINE write_species(h5_f)
       !
       ! One-center Coulomb residual ΔC = K_AE - K_PS, in atomic Hartree.
       !
-      ! QE's `paw_fockrnl = e2 * kexx` (paw_exx.f90 line 388) where `kexx`
-      ! itself is already an `e2`-scaled energy because `PAW_h_potential`
-      ! pre-multiplies its Hartree kernel by `e2*fpi/(2L+1)` (paw_onecenter.f90
-      ! line 1204). Net: `ke%k` carries an `e2^2 = 4` factor on top of the
-      ! Ha-natural Coulomb integral. Divide by `e2*e2` here so consumers
-      ! (CoQui ISDF/THC + augmented Hartree machinery, the PAW deeq-SCF
-      ! pipeline) see the kernel in proper Ha and can combine it with other
-      ! Ha-quoted quantities without an implicit-units footgun.
-      ! See notes/project_paw_deltaC_e2_squared.md for the audit.
+      ! QE's PAW_init_fock_kernel returns ke%k in (e2)^2 × Ha (paw_exx.f90
+      ! line 388 multiplies by e2; paw_onecenter.f90 line 1204 already
+      ! pre-multiplies the kernel by e2). Divide by e2*e2 so that the on-
+      ! disk deltaC is in proper Hartree.
       call qeh5_open_group(h5_nt, "Onecenter", h5_oc)
       ALLOCATE(deltaC_Ha(SIZE(ke(nt)%k, 1), SIZE(ke(nt)%k, 2), &
                         SIZE(ke(nt)%k, 3), SIZE(ke(nt)%k, 4)))

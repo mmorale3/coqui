@@ -6,9 +6,9 @@
  * cartesian K = q + G via radial spherical-Bessel transform of qfuncl
  * combined with the angular-momentum coupling table aainit.
  *
- * Phase 4.3: needed because the cached qgm tensor exported by pw2coqui
- * is computed only on the q=0 dense G grid. For HF exchange and post-HF
- * methods we need V_{GL}/V_{LL} at all q's in the IBZ, hence Q^{IJ}(q+G).
+ * Needed because the cached qgm tensor exported by pw2coqui is computed
+ * only on the q=0 dense G grid. For HF exchange and post-HF methods we
+ * need V_{GL}/V_{LL} at all q's in the IBZ, hence Q^{IJ}(q+G).
  *
  * Mathematical formula (.tex Eq. local-bloch-eta + qvan2 docs):
  *   Q^{IJ}(K) = Σ_{LM} (-i)^L · ap(LM, lm_I, lm_J) · Y_{LM}(K̂) · J_L(|K|)

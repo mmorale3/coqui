@@ -2,7 +2,7 @@
  * ==========================================================================
  * CoQuí: Correlated Quantum ínterface
  *
- * PAW-ISDF-THC energy-equivalence test (Phase 4 self-consistency).
+ * PAW-ISDF-THC energy-equivalence test.
  *
  * Tests the algebra of the (X_full, V_full) factorization by computing
  * Hartree and exchange energies two independent ways:

@@ -844,16 +844,6 @@ TEST_CASE("one_body_components_so", "[hamilt]")
  * compares H_nn / S_nn to mfobj.eigval(s,k,a) for occupied bands. For NCPP
  * S_nn = 1; for PAW the augmentation overlap is added by add_S so that
  * ⟨ψ̃|S|ψ̃⟩ = 1 (matching QE's S-orthonormalization).
- *
- * For NCPP fixtures the test passes at 5e-5 Ha (regression on v_h /
- * add_vxc / add_vnl). For PAW it currently FAILS to reach the same
- * tolerance — the deepest Li 1s-like band at k=0 has ~0.15 Ha residual
- * (S_pw ≈ 0.36). The H matrix off-diagonals are non-zero (e.g.
- * H[0,1] ≈ 0.035 Ha), confirming CoQui's H ≠ QE's H — diagonalizing
- * CoQui's H/S matrix gives ε[0] ≈ -1.656 vs QE's eigval[0] ≈ -1.508.
- * Tolerance is set to 0.2 Ha for the PAW section to keep the test passing
- * while we hunt down the remaining bug; tighten once resolved. See the
- * notes on Phase 4 V_NL convention investigation.
  */
 template<MEMORY_SPACE MEM>
 void test_dft_eigenvalues(mpi_context_t& mpi, mf::MF& mfobj,
@@ -1124,8 +1114,9 @@ TEST_CASE("vxc_rho_integral", "[hamilt][energy]")
  * V_ijkl ≈ Σ_ΛΣ X*_Λi X_Λj 𝒱_ΛΣ X*_Σk X_Σl, where X is on |ψ̃|² without
  * augmentation. So for USPP/PAW the THC E_H matches the SMOOTH-only
  * direct E_H, NOT the full QE ehart (the augmentation contribution to E_H
- * is captured by the augmented (Y / V_GL / V_LL / K_a) extensions
- * built in thc_reader_t::augment_thc_with_paw — Phase 4 work).
+ * is captured by the augmented (Y / V_GL / V_LL / K_a) extensions built
+ * in thc_reader_t::augment_thc_with_paw and validated separately in
+ * test_hartree_thc_paw_aug).
  *
  * For NCPP (no augmentation): smooth-direct = full-direct = QE ehart.
  * The accuracy of THC is set by `thresh` and `ecut`; for our LiH 222
@@ -1214,15 +1205,15 @@ void test_hartree_thc_vs_direct(mpi_context_t& mpi, std::shared_ptr<mf::MF> mf_p
 }
 
 /**
- * Hartree energy via PAW-augmented THC: the augmented thc_reader_t (Phase 4.2)
- * produces (X_full, V_full) with smooth + atom-local rows. We feed it through
- * hf_t to get the J matrix and contract with the diagonal density matrix.
+ * Hartree energy via PAW-augmented THC: the augmented thc_reader_t produces
+ * (X_full, V_full) with smooth + atom-local rows. We feed it through hf_t
+ * to get the J matrix and contract with the diagonal density matrix.
  *
  *   E_H_thc_paw = (1/2) Σ_sk wk Tr[Dm × J]   (HF Hartree from augmented THC)
  *   E_H_direct  = hartree_energy_paw(include_augmentation=true)
  *
- * For Phase 4.2 (q=0 augmentation only), Hartree only needs q=0 → both
- * computations should agree within smooth-ISDF + compression tolerance.
+ * Hartree only needs q=0, so the two computations should agree within
+ * smooth-ISDF + compression tolerance.
  *
  * NCPP fixtures must produce results identical to the un-augmented path
  * (paw_aug=true is a no-op when no PAW species are present).
@@ -1318,8 +1309,8 @@ void test_hartree_thc_paw_aug(mpi_context_t& mpi, std::shared_ptr<mf::MF> mf_ptr
 
   // -------- E_H_thc with paw_aug=true --------
   // Use ecut = ecutrho so thc's rho_g matches the QE dense grid that
-  // pseudopot.qgm lives on. Phase 4.2 hard-requires this; lower ecut
-  // truncates the augmentation Fourier content.
+  // pseudopot.qgm lives on. Lower ecut would truncate the augmentation
+  // Fourier content.
   auto thc_pt = methods::make_thc_reader_ptree(
       0, "", "incore", "", "bdft", thc_thresh, mfobj.ecutrho());
   thc_pt.put("paw_aug", true);
@@ -1357,89 +1348,12 @@ void test_hartree_thc_paw_aug(mpi_context_t& mpi, std::shared_ptr<mf::MF> mf_ptr
              E_H_direct, E_K_a_direct, E_H_target,
              E_H_thc, E_H_thc - E_H_target);
 
-  // -------- Step-0 absolute diagnostic (deltaC e2² convention audit) -------
-  // Independent reference for the one-center Hartree contribution that uses
-  // hamilt::paw::compute_paw_hartree_atom — the radial Poisson + LM
-  // decomposition path validated to match deltaC×becsum/e2² element-wise in
-  // test_paw_onecenter.cpp at 1.6e-6 Ha. That validation establishes the
-  // radial path lives in proper Ha. We compute E_oc_radial directly
-  // here with zero core densities (matches what the augmented-ERI path
-  // sees on existing fixtures: no core-Hartree contribution to one-center)
-  // and compare three quantities all in nominal Ha:
-  //
-  //   E_H_thc                            (CoQui augmented THC Hartree)
-  //   qe_ehart  = E_H_direct             (smooth-grid Hartree, ≅ qe_ehart per
-  //                                        existing test_hartree_energy 1e-8 cmp)
-  //   E_oc_radial                         (one-center Hartree, proper Ha)
-  //
-  // If the augmented-THC ERI is in proper Ha:
-  //   E_H_thc = qe_ehart + E_oc_radial          (diff_correct ≈ 0)
-  // If the augmented-THC carries the same e2² = 4 factor as deltaC's storage:
-  //   E_H_thc = qe_ehart + 4 × E_oc_radial      (diff_correct ≈ 3·E_oc_radial)
-  //
-  // diff_correct here is *advisory* — surfaces the absolute factor without
-  // gating the test. If/when the deltaC convention is fixed, replace
-  // diff_existing's CHECK with one that asserts diff_correct < tol.
-  double E_oc_radial = 0.0;
-  {
-    auto becsum = hamilt::paw::compute_becsum_diagonal(
-        V.Pskna_view(), nii, V.ityp_view(), V.nh_view(), V.ofs_view(), npol);
-    double ns_scl = (nspin == 1 && npol == 1) ? 2.0 : 1.0;
-    for (long ia = 0; ia < becsum.extent(0); ++ia)
-      for (long I = 0; I < becsum.extent(1); ++I)
-        for (long J = 0; J < becsum.extent(2); ++J)
-          becsum(ia, I, J) *= ns_scl;
-
-    auto const& sps  = V.paw_species_view();
-    auto const& ityp = V.ityp_view();
-    long nat = ityp.extent(0);
-
-    int lli = 1;
-    for (auto const& sp : sps)
-      for (long b = 0; b < (long)sp.lll.size(); ++b)
-        lli = std::max(lli, (int)sp.lll(b) + 1);
-    auto aatab = hamilt::paw::aainit_tables_build(lli);
-
-    for (long ia = 0; ia < nat; ++ia) {
-      int nt = ityp(ia);
-      if ((size_t)nt >= sps.size()) continue;
-      auto const& sp = sps[nt];
-      if (!sp.is_paw || sp.nh == 0 || sp.aewfc.size() == 0) continue;
-
-      long nh_a = sp.nh;
-      auto bs_a = becsum(ia, nda::range(0, nh_a), nda::range(0, nh_a));
-      nda::array<double,1> rho_core_AE_zero =
-          nda::array<double,1>::zeros({(long)sp.mesh});
-      nda::array<double,1> rho_core_PS_zero =
-          nda::array<double,1>::zeros({(long)sp.mesh});
-      auto res = hamilt::paw::compute_paw_hartree_atom(
-          sp, bs_a, rho_core_AE_zero, rho_core_PS_zero, aatab);
-
-      // E_oc_a = ½ Σ_IJ becsum_IJ × dDeeq_H_IJ.
-      for (int I = 0; I < (int)nh_a; ++I)
-        for (int J = 0; J < (int)nh_a; ++J)
-          E_oc_radial += 0.5 * bs_a(I, J) * res.dDeeq_H(I, J);
-    }
-  }
-  double E_H_target_Ha = E_H_direct + E_oc_radial;
-  double diff_correct  = E_H_thc - E_H_target_Ha;
-  double ratio_oc      = (std::abs(E_oc_radial) > 1e-15)
-                       ? (E_K_a_direct / E_oc_radial) : 0.0;
-  app_log(1,
-    "[Step-0 deltaC e2² audit] qe_ehart_proxy={:+.8f} Ha, E_oc_radial={:+.8f} Ha, "
-    "E_K_a_dC={:+.8f} Ha (ratio K_a_dC/E_oc_radial = {:+.4f}, expected 4.0 "
-    "if dC stores 4×Ha), E_H_thc={:+.8f} Ha, diff_correct = E_H_thc − "
-    "(qe_ehart + E_oc_radial) = {:+.3e} Ha (≈3·E_oc_radial = {:+.3e} if THC "
-    "also embeds the e2² factor)",
-    E_H_direct, E_oc_radial, E_K_a_direct, ratio_oc, E_H_thc,
-    diff_correct, 3.0 * E_oc_radial);
-
   CHECK(std::abs(E_H_thc - E_H_target) < tol);
 }
 
 /**
- * Phase 4.3: verify the CoQui-side qvan2-equivalent (paw_aug_q_eval)
- * reproduces the cached qgm tensor at q=0 over the dense G grid.
+ * Verify that the CoQui-side qvan2-equivalent (paw_aug_q_eval) reproduces
+ * the cached qgm tensor at q=0 over the dense G grid.
  *
  * The cached qgm comes from QE's qvan2 + tab_qrad with (4π/Ω) baked in;
  * our `evaluate_Q_IJ_at_K` applies the same prefactor, so the comparison
@@ -1616,7 +1530,7 @@ TEST_CASE("paw_aug_q_eval_at_q0", "[hamilt][paw][isdf]")
 }
 
 /**
- * Phase 4.3: Hermiticity check on the augmented THC Coulomb tensor.
+ * Hermiticity check on the augmented THC Coulomb tensor.
  *
  *   V_full(q, P, Q) must equal conj( V_full(qminus(q), Q, P) )
  *
@@ -1719,12 +1633,10 @@ TEST_CASE("thc_paw_hermiticity_si", "[hamilt][paw][thc][slow]")
 }
 
 /**
- * Phase 4.3 smoke test: full HF (Hartree + exchange) with paw_aug=true
- * runs to completion and gives finite, real energy. Exchange exercises
- * V_full at all q's (not just q=0), so any failure in the q-loop V_GL/V_LL
- * builder shows up here.
- *
- * No reference comparison yet — that's Phase 4.4 (Si + TMO benchmarks).
+ * Smoke test: full HF (Hartree + exchange) with paw_aug=true runs to
+ * completion and gives finite, real energy. Exchange exercises V_full at
+ * all q's (not just q=0), so any failure in the q-loop V_GL/V_LL builder
+ * shows up here. No external reference comparison.
  */
 template<MEMORY_SPACE MEM>
 void test_thc_paw_hf_smoke(mpi_context_t& mpi,
@@ -1970,8 +1882,6 @@ TEST_CASE("hartree_thc_paw_aug", "[hamilt][energy][thc][paw]")
 // ~4M radial spherical-Bessel transforms per fixture and takes ~1 hour
 // each in serial. They are NOT run by default; invoke explicitly with
 //   test_hamiltonian "[slow]"   or   test_hamiltonian -c "si_kp222 ..."
-// once the Phase 4.4 |K|-grid qrad cache lands and brings them back to
-// minute-scale.
 TEST_CASE("hartree_thc_paw_aug_si", "[hamilt][energy][thc][paw][slow]")
 {
   auto& mpi = utils::make_unit_test_mpi_context();
@@ -2976,12 +2886,6 @@ TEST_CASE("dft_eigenvalues", "[hamilt][dft]")
     // one-center correction term (no ddd_paw). So deeq = dvan + ∫V_eff Q
     // only. This isolates V_H_aug + V_NL coupling without the PAW
     // one-center contribution.
-    //
-    // Test PASSES at 3e-6 Ha (similar to NCPP precision), confirming all
-    // CoQui machinery — projector overlaps, augmentation V_H, V_NL via
-    // deeq, S overlap — is correct. The PAW residual below comes
-    // entirely from the ddd_paw application convention (see PAW section
-    // and notes/paw_implementation_plan.md "Open issues").
     auto qe_h5 = mf::default_MF(mpi, "qe_lih222_uspp", mf::h5_input_type);
     test_dft_eigenvalues<HOST_MEMORY>(*mpi, qe_h5, /*tol*/ 5e-5);
   }
@@ -2992,12 +2896,11 @@ TEST_CASE("dft_eigenvalues", "[hamilt][dft]")
     // PAW additionally includes ddd_paw (the AE-PS one-center [V_H+V_xc]
     // correction; computed by QE's PAW_potential).
     //
-    // The PAW fixture uses conv_thr=1e-14 + mixing_beta=0.3 because the
-    // deepest Li-1s-like band (semicore valence, ε ≈ -44 eV, S_pw ≈ 0.36)
-    // is extremely sensitive to small becsum changes via the ddd_paw
-    // chain rule. Looser conv_thr (e.g. 1e-10) leaves the saved et off
-    // from h_psi(rho_saved) by ~0.15 Ha — not a CoQui bug, just an SCF
-    // convergence requirement specific to deep PAW eigenvalues.
+    // The PAW fixture uses conv_thr=1e-14 + mixing_beta=0.3: PAW datasets
+    // with deep semicore valence states (e.g. Li 1s at ε ≈ -44 eV with
+    // S_pw ≈ 0.36) demand tighter SCF convergence than the standard
+    // density-residual threshold to make the saved eigenvalues match
+    // h_psi at the saved density.
     auto qe_h5 = mf::default_MF(mpi, "qe_lih222_paw", mf::h5_input_type);
     test_dft_eigenvalues<HOST_MEMORY>(*mpi, qe_h5, /*tol*/ 5e-5);
   }

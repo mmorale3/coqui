@@ -595,7 +595,7 @@ namespace methods {
 
       utils::check(x_range == y_range || !_Y_shm.has_value(),
         "thc_reader::augment_thc_with_paw: x_range != y_range augmentation "
-        "is a Phase 4.3 follow-up.");
+        "is not yet supported.");
 
       // ----------------------------------------------------------------
       // 3) Allocate augmented `_dZ` distributed (nqpts_ibz, N_total, N_total).
@@ -1848,15 +1848,14 @@ namespace methods {
 
     mutable utils::TimerManager _Timer;
 
-    // ====== PAW augmentation state (Phase 4.2) =========================
+    // ====== PAW augmentation state ======================================
     // _paw_aug == true means the X / V arrays in this reader are
     // pre-augmented: rows [N_smooth, N_smooth + N_aug) are atom-local
     // ISDF features rather than smooth ζ. Downstream code consumes the
     // composite (X, V) without distinguishing.
     //
-    // Phase 4.2 fills V_GL / V_LL only at q=0 (Hartree-correct); the K_a
-    // same-atom block is added at every q. Multi-q exchange/SCF awaits
-    // Phase 4.3 which fills q≠0 G-L/L-L blocks via radial-Bessel η^q(G).
+    // V_GL / V_LL are filled at every q via radial-Bessel η^q(G); the K_a
+    // same-atom one-center kernel is added at every q.
     bool _paw_aug = true;
     bool _paw_onsite = true;           // include K_a one-center kernel for PAW species
     int _Np_smooth = 0;                // smooth-only block size

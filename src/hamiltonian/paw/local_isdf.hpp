@@ -2,7 +2,7 @@
  * ==========================================================================
  * CoQuí: Correlated Quantum ínterface
  *
- * Per-species local channel ISDF for PAW (Phase 3, .tex §IV.A) — full-rank
+ * Per-species local channel ISDF for PAW (.tex §IV.A) — full-rank
  * symmetric-pair decomposition in the nh-projector basis.
  *
  * For each PAW species, the augmentation pair-density Q̂_{a,IJ}(s) is
@@ -48,10 +48,10 @@
  * Applying (★) twice gives the closed form:
  *   K_{λξ} = sign(λ) · sign(ξ) · ΔC[i(λ), j(λ), i(ξ), j(ξ)]
  *
- * Compression via pivoted Cholesky / ID over the training set B_{a,αβ} of
- * Eq.(local-training-set), and Coulomb-metric refinement of η_λ, are explicit
- * follow-ups. The data path here lets a consumer transparently swap in those
- * variants without changing the assemble code.
+ * The data path here lets a consumer transparently swap in compression
+ * via pivoted Cholesky / ID over the training set B_{a,αβ} of
+ * Eq.(local-training-set), or Coulomb-metric refinement of η_λ, without
+ * changing the assemble code.
  * ==========================================================================
  */
 #ifndef HAMILTONIAN_PAW_LOCAL_ISDF_HPP

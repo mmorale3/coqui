@@ -561,10 +561,10 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
   }
   mpi->node_comm.barrier();
 
-  // Phase 1+: build atom-resolved effective D for USPP/PAW.
+  // Build atom-resolved effective D for USPP/PAW.
   //
   //   deeq = ∫ V_eff(r) Q^IJ(r) dr  + ΔPAW^Hxc + dvan      (in Rydberg)
-  // Therefore for USPP/PAW we use `deeq` directly (not `dvan + deeq`).
+  // For USPP/PAW we use `deeq` directly (not `dvan + deeq`).
   //
   // pw2coqui writes deeq(nhm, nhm, nat, nspin) (Fortran column-major) so
   // on the C++ side the read shape is (nspin, nat, nhm, nhm). We collapse
@@ -578,7 +578,7 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
     auto Dloc_at = Dnn_atom.local();
     Dloc_at() = ComplexType(0.0);
     if(ptype != pp_ncpp_t) {
-      // Try to read deeq; fall back to dvan if missing (pre-Phase-0 fixture).
+      // Try to read deeq; fall back to dvan if missing.
       bool have_deeq = false;
       nda::array<double,4> deeq_r(nspin, nat, nhm, nhm);
       try {
@@ -628,13 +628,13 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
                                     Dnn_atom.size(), 0);
   mpi->comm.barrier();
 
-  // Phase 1: USPP / PAW augmentation overlap and Q^IJ(G).
+  // USPP / PAW augmentation overlap and Q^IJ(G).
   // qq_nt: per-species ⟨β|Q|β⟩ overlap, shape (nsp, nhm, nhm) on disk.
   // ijtoh: composite (ih,jh) -> ij map, shape (nsp, nhm, nhm), 1-based.
   // augmentation_function_isp{nt}: Q^IJ(G) on the dense grid, complex,
   //   shape (nij(nt), ngm_dense) per species, no structure factor.
-  // For non-collinear/SOC USPP we'd also need qq_so; not implemented here yet
-  // (will warn; SOC USPP path is a follow-up to USPP minimum-viable).
+  // For non-collinear/SOC USPP we'd also need qq_so; not implemented here
+  // yet (will warn).
   qq_nt_data = sarray_t<nda::array_view<ComplexType,3>>(*mpi,
                   {std::max(1L,(long)nsp), std::max(1L,(long)nhm),
                    std::max(1L,(long)nhm)});
@@ -663,7 +663,7 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
         try { nda::h5_read(grp,"qq_nt",qq_r); }
         catch(...) {
           app_warning("USPP/PAW: 'qq_nt' missing from h5 file. "
-                      "Re-run pw2coqui with the Phase 0 schema. "
+                      "Re-run pw2coqui with the latest schema. "
                       "Continuing with zero augmentation overlap.");
         }
         auto Qloc = qq_nt_data.local();
@@ -707,8 +707,8 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
     mpi->comm.broadcast_n(ijtoh.data(), ijtoh.size(), 0);
   mpi->comm.barrier();
 
-  // Phase 0/1: per-species PAW radial data (filled when /Hamiltonian/Species/
-  // exists in the h5 file). Phase 2 will additionally read Onecenter/deltaC.
+  // Per-species PAW radial data (filled when /Hamiltonian/Species/ exists
+  // in the h5 file), including Onecenter/deltaC for PAW species.
   // The five heavy radial tables (aewfc, pswfc, qfuncl, deltaC, core_aewfc)
   // are loaded on global root into per-species temporaries, then placed in
   // node-shared memory (paw_species_shm) and exposed to consumers as
@@ -739,9 +739,9 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
       bool has_species_grp = grp0.has_subgroup("Hamiltonian") &&
         grp0.open_group("Hamiltonian").has_subgroup("Species");
       if(!has_species_grp) {
-        app_warning("/Hamiltonian/Species group missing — h5 file predates "
-                    "Phase 0 schema. Per-species PAW data will be empty; "
-                    "regenerate with the new pw2coqui to enable it.");
+        app_warning("/Hamiltonian/Species group missing in h5 file. "
+                    "Per-species PAW data will be empty; regenerate with "
+                    "the latest pw2coqui to enable it.");
       } else {
         h5::group hgrp = grp0.open_group("Hamiltonian");
         h5::group sp_grp = hgrp.open_group("Species");
@@ -770,9 +770,8 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
             // (see species_paw_t comment) — not loaded.
             try { nda::h5_read(pgrp, "ae_vloc",    sp.ae_vloc); }    catch(...) {}
             try { nda::h5_read(pgrp, "ae_rho_atc", sp.ae_rho_atc); } catch(...) {}
-            // PS-side counterparts (Phase 5: PAW static D + dynamic deeq SCF).
-            // Both are needed to reconstruct paw_init_keeq inside CoQui
-            // (rather than relying on QE's ddd_paw being frozen at ρ_QE).
+            // PS-side counterparts needed to reconstruct paw_init_keeq inside
+            // CoQui (rather than relying on QE's ddd_paw being frozen at ρ_QE).
             try { nda::h5_read(pgrp, "vloc_ps",    sp.vloc_ps); }    catch(...) {}
             try { nda::h5_read(pgrp, "rho_atc_ps", sp.rho_atc_ps); } catch(...) {}
           }
@@ -780,15 +779,15 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
             try { nda::h5_read(nt_grp, "aewfc",  tmp.aewfc); }  catch(...) {}
             try { nda::h5_read(nt_grp, "pswfc",  tmp.pswfc); }  catch(...) {}
             try { nda::h5_read(nt_grp, "qfuncl", tmp.qfuncl); } catch(...) {}
-            // Phase 4.3: angular momentum metadata for q+G evaluation of
-            // the augmentation function (qvan2 reconstruction in CoQui).
+            // Angular momentum metadata for q+G evaluation of the
+            // augmentation function (qvan2 reconstruction in CoQui).
             try { nda::h5_read(nt_grp, "lll",    sp.lll);    } catch(...) {}
             try { nda::h5_read(nt_grp, "nhtol",  sp.nhtol);  } catch(...) {}
             try { nda::h5_read(nt_grp, "nhtolm", sp.nhtolm); } catch(...) {}
             try { nda::h5_read(nt_grp, "indv",   sp.indv);   } catch(...) {}
           }
-          // Phase 2: one-center Coulomb residual ΔC = K_AE − K_PS, raw
-          // ke%k from PAW_init_fock_kernel exported by pw2coqui.
+          // One-center Coulomb residual ΔC = K_AE − K_PS, raw ke%k from
+          // PAW_init_fock_kernel exported by pw2coqui (in proper Hartree).
           if(sp.is_paw && nt_grp.has_subgroup("Onecenter")) {
             h5::group ogrp = nt_grp.open_group("Onecenter");
             try { nda::h5_read(ogrp, "deltaC", tmp.deltaC); } catch(...) {}
@@ -1220,9 +1219,7 @@ void pseudopot::add_vpp_impl(boost::mpi3::communicator& comm,
 //   rhoG       : input density on dense G grid, shape (ngm_dense,);
 //                augmented in place: rhoG += Σ_a Σ_IJ becsum_aIJ Q^IJ_nt(a)(G) e^{-iG·τ_a}
 //
-// Independent of the Hartree/exchange wiring above; will be used by Phase 3
-// once compensation charges are introduced (the formulation switches from
-// raw Q^IJ here to compensated Q̂^IJ + one-center K_a corrections).
+// Independent of the Hartree/exchange wiring above.
 void pseudopot::add_augmentation_to_pairdensity(
     nda::ArrayOfRank<2> auto const& becsum_aIJ,
     nda::ArrayOfRank<2> auto const& gvec_phase,

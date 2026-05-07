@@ -24,9 +24,10 @@
  * disagreement signals a bug in the THC contraction algebra (the
  * X-concatenation or K_a addition in thc_reader_t::augment_thc_with_paw).
  *
- * Real-data validation against a direct PAW Coulomb routine on smooth
- * orbitals + augmentation is a Phase 5 follow-up; this header provides the
- * machinery for the algebra-equivalence test that doesn't need a fixture.
+ * This header provides the machinery for the algebra-equivalence test
+ * that doesn't need a fixture; real-data validation against a direct
+ * PAW Coulomb routine on smooth orbitals + augmentation is performed
+ * separately.
  * ==========================================================================
  */
 #ifndef HAMILTONIAN_PAW_PAW_ENERGY_CHECK_HPP
