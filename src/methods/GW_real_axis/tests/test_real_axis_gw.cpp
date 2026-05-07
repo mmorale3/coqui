@@ -81,6 +81,8 @@ TEST_CASE("real_axis_gw_endtoend_smoke", "[real_axis][gw][e2e]")
   {
     auto fill = [&](nda::array<std::complex<double>, 4> const& src,
                     real_axis_mb_state_t::bosonic_dArray_t& dst) {
+      // State is real-typed (memory-redesign P0'); take .real() of the
+      // complex source which carries Im or Re via the .real() slot.
       auto Pr = dst.local_range(1);
       auto Qr = dst.local_range(2);
       auto loc = dst.local();
@@ -89,7 +91,7 @@ TEST_CASE("real_axis_gw_endtoend_smoke", "[real_axis][gw][e2e]")
           for (long iQ = 0; iQ < Qr.size(); ++iQ)
             for (long iO = 0; iO < N_Omega; ++iO)
               loc(iq, iP, iQ, iO) =
-                  src(iq, Pr.first() + iP, Qr.first() + iQ, iO);
+                  src(iq, Pr.first() + iP, Qr.first() + iQ, iO).real();
     };
     fill(ImPi_full, *state.ImPi_qPQO);
     fill(RePi_full, *state.RePi_qPQO);
@@ -114,16 +116,16 @@ TEST_CASE("real_axis_gw_endtoend_smoke", "[real_axis][gw][e2e]")
     for (long P = 0; P < Naux; ++P)
       for (long Q = 0; Q < Naux; ++Q)
         for (long iO = 0; iO < N_Omega; ++iO) {
-          REQUIRE(std::isfinite(ImW(iq, P, Q, iO).real()));
-          REQUIRE(std::isfinite(ReW(iq, P, Q, iO).real()));
+          REQUIRE(std::isfinite(ImW(iq, P, Q, iO)));
+          REQUIRE(std::isfinite(ReW(iq, P, Q, iO)));
         }
 
   // Sanity: at this Im Pi, ReW should be close to V (~1 on diagonal, ~0 off).
   for (long iq = 0; iq < Nq; ++iq)
     for (long iO = 0; iO < N_Omega; ++iO) {
       for (long P = 0; P < Naux; ++P)
-        REQUIRE(ReW(iq, P, P, iO).real() == Approx(1.0).margin(0.1));
-      REQUIRE(std::abs(ReW(iq, 0, 1, iO).real()) < 0.05);
+        REQUIRE(ReW(iq, P, P, iO) == Approx(1.0).margin(0.1));
+      REQUIRE(std::abs(ReW(iq, 0, 1, iO)) < 0.05);
     }
 }
 

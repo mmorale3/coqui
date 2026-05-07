@@ -898,16 +898,31 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
   // sizes are (Nq, NP_loc, NQ_loc, N_O) per array; small relative to
   // the kernel work above.
   // ----------------------------------------------------------------
-  if constexpr (MEM == HOST_MEMORY) {
-    h_ImPi_loc = ImPi_loc;
-    h_RePi_loc = RePi_loc;
-    h_ImW_loc  = ImW_loc;
-    h_ReW_loc  = ReW_loc;
-  } else {
-    h_ImPi_loc = nda::to_host(ImPi_loc);
-    h_RePi_loc = nda::to_host(RePi_loc);
-    h_ImW_loc  = nda::to_host(ImW_loc);
-    h_ReW_loc  = nda::to_host(ReW_loc);
+  // State arrays are real-typed (memory-redesign step P0'); take .real()
+  // of the complex MEM-side scratch values. By convention the MEM-side
+  // buffers carry .imag()=0 throughout, so .real() captures the data.
+  {
+    auto copy_real = [](auto&& src_complex, auto&& dst_real) {
+      const long N = src_complex.size();
+      auto const* sp = src_complex.data();
+      auto * dp = dst_real.data();
+      for (long i = 0; i < N; ++i) dp[i] = sp[i].real();
+    };
+    if constexpr (MEM == HOST_MEMORY) {
+      copy_real(ImPi_loc, h_ImPi_loc);
+      copy_real(RePi_loc, h_RePi_loc);
+      copy_real(ImW_loc,  h_ImW_loc);
+      copy_real(ReW_loc,  h_ReW_loc);
+    } else {
+      auto ImPi_h = nda::to_host(ImPi_loc);
+      auto RePi_h = nda::to_host(RePi_loc);
+      auto ImW_h  = nda::to_host(ImW_loc);
+      auto ReW_h  = nda::to_host(ReW_loc);
+      copy_real(ImPi_h, h_ImPi_loc);
+      copy_real(RePi_h, h_RePi_loc);
+      copy_real(ImW_h,  h_ImW_loc);
+      copy_real(ReW_h,  h_ReW_loc);
+    }
   }
 
   // ----------------------------------------------------------------
@@ -922,10 +937,10 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
   // (Nq_ibz, N_O) reals (memory-redesign P6).
   // ----------------------------------------------------------------
   if (_div_treatment != "ignore_g0") {
-    auto W_full = math::nda::all_gather_slow<HOST_MEMORY>(*state.ImW_qPQO);
+    auto W_full  = math::nda::all_gather_slow<HOST_MEMORY>(*state.ImW_qPQO);
     auto Re_full = math::nda::all_gather_slow<HOST_MEMORY>(*state.ReW_qPQO);
-    // Combine Re + i Im into the complex W viewed by compute_eps_inv_head_O.
-    // (Re_full and W_full have the same shape; same with ImW_qPQO.)
+    // State arrays are real-typed (P0'); combine into complex W for the
+    // eps_inv_head computation.
     nda::array<ComplexType, 4> W_complex(W_full.shape());
     {
       const long N = W_complex.size();
@@ -933,7 +948,7 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
       auto const* re = Re_full.data();
       auto const* im = W_full.data();
       for (long i = 0; i < N; ++i)
-        dst[i] = ComplexType(re[i].real(), im[i].real());
+        dst[i] = ComplexType(re[i], im[i]);
     }
     auto Qpts = nda::array<double, 2>(MF.Qpts_ibz());
     auto chi_bar = nda::array<ComplexType, 2>(thc.basis_bar_head());

@@ -68,8 +68,14 @@ namespace real_axis {
 struct real_axis_mb_state_t {
 
   using mpi_context_t = utils::mpi_context_t<boost::mpi3::communicator>;
+  // Bosonic aux state (Pi, W) is stored as real-valued dArrays. Each of
+  // the four fields {ImPi, RePi, ImW, ReW} carries one real component of
+  // the corresponding complex bosonic quantity. The kernels work with
+  // complex MEM-side scratch internally (NUFFT / slate) and convert at
+  // the boundaries; storing the state as `double` halves the bosonic
+  // memory footprint (memory-redesign step P0').
   using bosonic_dArray_t = memory::darray_t<
-      memory::array<HOST_MEMORY, ComplexType, 4>,
+      memory::array<HOST_MEMORY, double, 4>,
       boost::mpi3::communicator>;
   template<nda::MemoryArray Array_base_t>
   using sArray_t = math::shm::shared_array<Array_base_t>;
@@ -165,7 +171,7 @@ struct real_axis_mb_state_t {
     long N_O = grid->N_Omega();
     auto pgrid = bosonic_proc_grid(this->mpi->comm.size(), Naux);
     auto bsize = bosonic_block_size(pgrid, nqpts_ibz, Naux, N_O);
-    using local_t = memory::array<HOST_MEMORY, ComplexType, 4>;
+    using local_t = memory::array<HOST_MEMORY, double, 4>;
     std::array<long, 4> shape = {nqpts_ibz, Naux, Naux, N_O};
     ImPi_qPQO.emplace(math::nda::make_distributed_array<local_t>(
         this->mpi->comm, pgrid, shape, bsize));
@@ -175,10 +181,10 @@ struct real_axis_mb_state_t {
         this->mpi->comm, pgrid, shape, bsize));
     ReW_qPQO.emplace(math::nda::make_distributed_array<local_t>(
         this->mpi->comm, pgrid, shape, bsize));
-    ImPi_qPQO->local() = ComplexType(0.0, 0.0);
-    RePi_qPQO->local() = ComplexType(0.0, 0.0);
-    ImW_qPQO->local()  = ComplexType(0.0, 0.0);
-    ReW_qPQO->local()  = ComplexType(0.0, 0.0);
+    ImPi_qPQO->local() = 0.0;
+    RePi_qPQO->local() = 0.0;
+    ImW_qPQO->local()  = 0.0;
+    ReW_qPQO->local()  = 0.0;
   }
 };
 

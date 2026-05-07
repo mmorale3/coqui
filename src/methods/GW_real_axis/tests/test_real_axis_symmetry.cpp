@@ -184,8 +184,7 @@ namespace bdft_tests {
       for (long i = 0; i < ImW.size(); ++i) {
         const auto v = ImW.data()[i];
         sum_abs += std::abs(v);
-        if (!std::isfinite(v.real()) or !std::isfinite(v.imag()))
-          all_finite = false;
+        if (!std::isfinite(v)) all_finite = false;
       }
       REQUIRE(all_finite);
       REQUIRE(sum_abs > 0.0);
@@ -706,8 +705,7 @@ namespace bdft_tests {
       const auto v = ImW.data()[i];
       sum_abs += std::abs(v);
       max_abs = std::max(max_abs, std::abs(v));
-      if (!std::isfinite(v.real()) or !std::isfinite(v.imag()))
-        all_finite = false;
+      if (!std::isfinite(v)) all_finite = false;
     }
     REQUIRE(all_finite);
     REQUIRE(sum_abs > 0.0);
@@ -745,6 +743,27 @@ namespace bdft_tests {
     if (mpi_context->comm.root())
       app_log(2, "[trev_lih223_inv evaluate] qp_trev fired for some q; "
                   "max|Sigma| = {:.3e}", max_abs_S);
+
+    // Run hf::evaluate (Sigma_x with qp_trev branch via pre-conj V).
+    real_axis_hf_t hf(&grid, "ignore_g0");
+    hf.evaluate(state, thc, mu0);
+    REQUIRE(state.Sigma_x_skij.has_value());
+    REQUIRE(state.Sigma_x_skij->shape()[1] == Nk_ibz);
+    auto Sx = state.Sigma_x_skij->local();
+    double max_abs_Sx = 0.0;
+    bool sx_finite = true;
+    for (long i = 0; i < Sx.size(); ++i) {
+      const auto v = Sx.data()[i];
+      max_abs_Sx = std::max(max_abs_Sx, std::abs(v));
+      if (!std::isfinite(v.real()) or !std::isfinite(v.imag()))
+        sx_finite = false;
+    }
+    REQUIRE(sx_finite);
+    REQUIRE(max_abs_Sx > 0.0);
+    REQUIRE(max_abs_Sx < 1.0e3);
+    if (mpi_context->comm.root())
+      app_log(2, "[trev_lih223_inv hf::evaluate] max|Sigma_x| = {:.3e}",
+              max_abs_Sx);
   }
 
 } // namespace bdft_tests

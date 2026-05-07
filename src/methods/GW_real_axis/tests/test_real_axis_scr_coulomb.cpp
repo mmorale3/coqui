@@ -181,9 +181,9 @@ namespace bdft_tests {
       for (long P = 0; P < Naux; ++P)
         for (long Q = 0; Q < Naux; ++Q)
           for (long iO = 0; iO < N_O; ++iO) {
-            if (!std::isfinite(ImPi(iq, P, Q, iO).real()) ||
-                !std::isfinite(ImW (iq, P, Q, iO).real()) ||
-                !std::isfinite(ReW (iq, P, Q, iO).real())) {
+            if (!std::isfinite(ImPi(iq, P, Q, iO)) ||
+                !std::isfinite(ImW (iq, P, Q, iO)) ||
+                !std::isfinite(ReW (iq, P, Q, iO))) {
               all_finite = false;
             }
             if (std::abs(ImPi(iq, P, Q, iO)) > 1e-10) nonzero_Pi = true;
@@ -414,8 +414,8 @@ namespace bdft_tests {
     auto ReW_loc = state_split.ReW_qPQO->local();
     bool all_finite = true;
     for (long i = 0; i < ImW_loc.size(); ++i) {
-      if (!std::isfinite(ImW_loc.data()[i].real()) ||
-          !std::isfinite(ReW_loc.data()[i].real()))
+      if (!std::isfinite(ImW_loc.data()[i]) ||
+          !std::isfinite(ReW_loc.data()[i]))
         all_finite = false;
     }
     REQUIRE(all_finite);

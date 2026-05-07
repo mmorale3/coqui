@@ -171,6 +171,8 @@ public:
     nda::array<ComplexType, 2> Pi(Naux, Naux);
     nda::array<ComplexType, 2> W(Naux, Naux);
 
+    // State arrays are real-typed (memory-redesign P0'); RePi/ImPi store
+    // the corresponding real components directly.
     for (long iq = 0; iq < Nq; ++iq) {
       for (long P = 0; P < Naux; ++P)
         for (long Q = 0; Q < Naux; ++Q)
@@ -178,8 +180,8 @@ public:
       for (long iO = 0; iO < NOm; ++iO) {
         for (long P = 0; P < Naux; ++P)
           for (long Q = 0; Q < Naux; ++Q)
-            Pi(P, Q) = ComplexType(RePi(iq, P, Q, iO).real(),
-                                   ImPi(iq, P, Q, iO).real());
+            Pi(P, Q) = ComplexType(RePi(iq, P, Q, iO),
+                                   ImPi(iq, P, Q, iO));
         real_axis::solve_dyson_W_aux(Vmat, Pi, W);
         for (long P = 0; P < Naux; ++P)
           for (long Q = 0; Q < Naux; ++Q) {
@@ -190,7 +192,7 @@ public:
     }
 
     // Write each rank's local (P_loc, Q_loc) slice into the distributed
-    // state arrays.
+    // state arrays. State is real-typed: take .real() of complex source.
     auto write_slice = [](nda::array<ComplexType, 4> const& src,
                           real_axis::real_axis_mb_state_t::bosonic_dArray_t& dst) {
       auto Pr = dst.local_range(1);
@@ -203,7 +205,7 @@ public:
           for (long iQ = 0; iQ < Qr.size(); ++iQ)
             for (long iO = 0; iO < NOm_; ++iO)
               loc(iq, iP, iQ, iO) =
-                  src(iq, Pr.first() + iP, Qr.first() + iQ, iO);
+                  src(iq, Pr.first() + iP, Qr.first() + iQ, iO).real();
     };
     write_slice(ImW_full, *state.ImW_qPQO);
     write_slice(ReW_full, *state.ReW_qPQO);
@@ -611,18 +613,22 @@ void real_axis_gw_t::evaluate(real_axis::real_axis_mb_state_t & state,
   const auto t5 = t_now();
   memory::buffered_array<MEM, ComplexType, 4> B_qPQO_loc(
       std::array<long,4>{Nq_ibz, Naux_loc_P, Naux_loc_Q, N_O});
+  // ImW_loc is real-typed (memory-redesign P0'). Lift to complex with
+  // imag()=0 and apply the -1/π scale.
   if constexpr (MEM == HOST_MEMORY) {
-    B_qPQO_loc() = nda::map([](ComplexType w) {
-      return ComplexType(-w.real() / M_PI, 0.0);
+    B_qPQO_loc() = nda::map([](double w) {
+      return ComplexType(-w / M_PI, 0.0);
     })(ImW_loc);
   } else {
-    // Push host ImW_loc to MEM, then scale by -1/pi on MEM. ImW_loc per
-    // convention has imag()=0; B inherits that, then scale acts on both
-    // slots (which is correct since 0 * anything = 0).
     nda::array<ComplexType, 4> ImW_h(ImW_loc.shape());
-    ImW_h = ImW_loc;
+    {
+      const long N = ImW_loc.size();
+      auto const* sp = ImW_loc.data();
+      auto * dp = ImW_h.data();
+      for (long i = 0; i < N; ++i) dp[i] = ComplexType(sp[i], 0.0);
+    }
     auto ImW_mem = memory::to_memory_space<MEM>(ImW_h);
-    B_qPQO_loc = ImW_mem;  // memcpy in MEM
+    B_qPQO_loc = ImW_mem;
     nda::tensor::scale(ComplexType(-1.0 / M_PI, 0.0), B_qPQO_loc);
   }
   const double dt5 = sec_since(t5);

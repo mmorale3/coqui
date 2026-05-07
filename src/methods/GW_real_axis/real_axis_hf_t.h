@@ -276,12 +276,19 @@ public:
       }
 
       // Step 3: V at IBZ q (W lives at IBZ q in the symmetry-adapted picture).
+      // Plus a pre-conjugated V_conj for the qp_trev=true branch in the
+      // Sigma_x kernel below (V is genuinely complex in aux basis, so the
+      // qp_trev case needs conj(V); we pre-compute it here).
       nda::array<ComplexType, 3> V_qPQ_loc_ibz(Nq_ibz, NP_loc_hf, NQ_loc_hf);
+      nda::array<ComplexType, 3> V_conj_qPQ_loc_ibz(Nq_ibz, NP_loc_hf, NQ_loc_hf);
       for (long iq = 0; iq < Nq_ibz; ++iq) {
         auto Zq = thc.Z(static_cast<int>(iq));
         for (long iP = 0; iP < NP_loc_hf; ++iP)
-          for (long iQ = 0; iQ < NQ_loc_hf; ++iQ)
-            V_qPQ_loc_ibz(iq, iP, iQ) = Zq(P0_hf + iP, Q0_hf + iQ);
+          for (long iQ = 0; iQ < NQ_loc_hf; ++iQ) {
+            const ComplexType v = Zq(P0_hf + iP, Q0_hf + iQ);
+            V_qPQ_loc_ibz     (iq, iP, iQ) = v;
+            V_conj_qPQ_loc_ibz(iq, iP, iQ) = std::conj(v);
+          }
       }
 
       // Identify Gamma in IBZ q.
@@ -310,6 +317,7 @@ public:
       auto qp_to_ibz_arr = MF.qp_to_ibz();
       auto qp_trev_arr_l = MF.qp_trev();
       auto qk_to_k2_l    = MF.qk_to_k2();
+      auto qminus_arr    = MF.qminus();
       const double inv_Nq = 1.0 / static_cast<double>(Nq);
 
       for (long isym = 0; isym < Nsymq; ++isym) {
@@ -319,20 +327,26 @@ public:
             const long ks = MF.ks_to_k(isym, ik_ibz);
 
             // Accumulate aux Σ_x partial: -1/Nq * V(qs)_loc * n_aux(ksmqs)_loc.
+            // qp_trev branch: contribution at TR-related FBZ q is the conj
+            // of the standard one. n_aux at TR-pair k is already conj-copy
+            // filled, so the only extra work for qp_trev=true is using the
+            // pre-conjugated V buffer + the qminus(qs) variant of the
+            // k-lookup. Pattern from thc_hf.icc / thc_gw.icc.
             SxA_dummy_PQ = ComplexType(0.0, 0.0);
             for (long iq = 0; iq < nqs_isym; ++iq) {
               const long qp = MF.Qs(isym, iq);
               const long qs = qp_to_ibz_arr(qp);
               if (qs == iq_gamma_ibz) continue;
-              utils::check(qp_trev_arr_l(qp) == 0,
-                           "real_axis_hf_t::evaluate (isym): qp_trev(qp={}) "
-                           "!= 0; q-side TR branch not yet implemented.", qp);
-              // kp_trev on ksmqs is handled by the n_aux conj-copy above.
-              const long ksmqs = qk_to_k2_l(qs, ks);
+              const bool   trev  = (qp_trev_arr_l(qp) != 0);
+              const long   ksmqs = trev
+                  ? qk_to_k2_l(qminus_arr(qs), ks)
+                  : qk_to_k2_l(qs, ks);
+              auto const&  V_use = trev ? V_conj_qPQ_loc_ibz
+                                        : V_qPQ_loc_ibz;
               for (long iP = 0; iP < NP_loc_hf; ++iP)
                 for (long iQ = 0; iQ < NQ_loc_hf; ++iQ)
                   SxA_dummy_PQ(iP, iQ, 0) -=
-                      inv_Nq * V_qPQ_loc_ibz(qs, iP, iQ)
+                      inv_Nq * V_use(qs, iP, iQ)
                              * n_aux_skPQ_fbz(s, ksmqs, iP, iQ);
             }
 
