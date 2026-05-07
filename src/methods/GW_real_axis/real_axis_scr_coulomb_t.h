@@ -181,13 +181,21 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
   auto const& grid = *_grid;
   auto const& MF   = *thc.MF();
 
-  const long ns    = MF.nspin();
-  const long nbnd  = MF.nbnd();
-  const long Nk    = MF.nkpts();
-  const long Nq    = MF.nqpts();
-  const long Naux  = thc.Np();
-  const long N_w   = grid.N_w();
-  const long N_O   = grid.N_Omega();
+  const long ns      = MF.nspin();
+  const long nbnd    = MF.nbnd();
+  // Storage scopes: orbital-basis state (A, Sigma) at IBZ k, bosonic aux
+  // state (Pi, W) at IBZ q. The kernel BZ-pair sums still iterate over FBZ
+  // (k, q) pairs (Nk, Nq) — star expansion of orbital quantities happens
+  // inside the kernel via X(FBZ k) and the orbital rotations from
+  // MF.symmetry_rotation. See feedback_realaxis_thc_x_nonsymmetric.md and
+  // notes/realaxis_symmetry_audit.md.
+  const long Nk      = MF.nkpts();
+  const long Nq      = MF.nqpts();
+  const long Nk_ibz  = MF.nkpts_ibz();
+  const long Nq_ibz  = MF.nqpts_ibz();
+  const long Naux    = thc.Np();
+  const long N_w     = grid.N_w();
+  const long N_O     = grid.N_Omega();
 
   utils::check(MF.npol() == 1,
                "real_axis_scr_coulomb_t::update_w: npol={} not supported (need 1)",
@@ -195,12 +203,13 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
 
   auto A_in = state.A_wskij->local();
   utils::check(A_in.shape()[0] == N_w and A_in.shape()[1] == ns and
-               A_in.shape()[2] == Nk and A_in.shape()[3] == nbnd and
+               A_in.shape()[2] == Nk_ibz and A_in.shape()[3] == nbnd and
                A_in.shape()[4] == nbnd,
-               "real_axis_scr_coulomb_t::update_w: state.A_wskij shape mismatch");
+               "real_axis_scr_coulomb_t::update_w: state.A_wskij shape mismatch "
+               "(expected IBZ k = {}, got {})", Nk_ibz, A_in.shape()[2]);
 
-  // (Re)allocate bosonic state dArrays (distributed over (P, Q)).
-  state.allocate_bosonic(Nq, Naux);
+  // (Re)allocate bosonic state dArrays at IBZ q (distributed over (P, Q)).
+  state.allocate_bosonic(Nq_ibz, Naux);
 
   // Local (P_loc, Q_loc) ranges and shapes from the distributed state.
   auto Pr = state.ImPi_qPQO->local_range(1);
@@ -224,12 +233,13 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
   memory::buffered_array<MEM, ComplexType, 4> ImW_loc (h_ImW_loc.shape());
   memory::buffered_array<MEM, ComplexType, 4> ReW_loc (h_ReW_loc.shape());
 
-  // V(iq, P_loc, Q_loc) from THC.Z(iq) -- only this rank's local block.
-  // Cached across SCF iterations since V never changes.
+  // V(iq, P_loc, Q_loc) from THC.Z(iq) at IBZ q -- only this rank's local
+  // block. W lives at IBZ q (Pi at IBZ q, Dyson per-q solve produces W at
+  // the same q grid). Cached across SCF iterations since V never changes.
   if (!_V_qPQ_loc.has_value() or
-      _V_qPQ_loc->shape() != std::array<long,3>{Nq, Naux_loc_P, Naux_loc_Q}) {
-    _V_qPQ_loc = nda::array<ComplexType, 3>(Nq, Naux_loc_P, Naux_loc_Q);
-    for (long iq = 0; iq < Nq; ++iq) {
+      _V_qPQ_loc->shape() != std::array<long,3>{Nq_ibz, Naux_loc_P, Naux_loc_Q}) {
+    _V_qPQ_loc = nda::array<ComplexType, 3>(Nq_ibz, Naux_loc_P, Naux_loc_Q);
+    for (long iq = 0; iq < Nq_ibz; ++iq) {
       auto Zq = thc.Z(static_cast<int>(iq));
       for (long iP = 0; iP < Naux_loc_P; ++iP)
         for (long iQ = 0; iQ < Naux_loc_Q; ++iQ)
@@ -242,46 +252,55 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
   ImW_loc  = ComplexType(0.0, 0.0);
   ReW_loc  = ComplexType(0.0, 0.0);
 
-  // Repack A from (N_w, ns, nkpts, nbnd, nbnd) to driver layout
-  // (ns, nkpts, N_w, nbnd, nbnd) and symmetrize into the matrix-hermitian
-  // physical spectral function:
+  // Repack A from IBZ orbital storage (N_w, ns, Nk_ibz, nbnd, nbnd) to
+  // FBZ-k driver layout (ns, Nk, N_w, nbnd, nbnd), symmetrized into the
+  // matrix-hermitian physical spectral function:
   //
   //   A_phys_{ij} = 0.5 * (A_wskij_{ij} + conj(A_wskij_{ji}))
   //               = -(1/pi) (Im G^R)^matrix_{ij}
   //
   // state.A_wskij stores -(i/pi) G^R componentwise, which is NOT hermitian
   // off-diagonal. The above symmetrization recovers the matrix-valued
-  // hermitian spectral function exactly. Diagonals are unchanged
-  // (.imag(A_wskij_ii) = 0 for the spectral-function-on-diagonal); off-
-  // diagonals pull from both Re and Im of A_wskij. After this, A_aux is
-  // hermitian in (P, Q), and Pi/Sigma kernels see a physically correct
-  // (matrix-hermitian) input.
-  // Hermitize on host (cheap: O(ns*Nk*N_w*nbnd^2)). For MEM=HOST_MEMORY we
-  // fill the MEM-resident A directly; for MEM=DEVICE_MEMORY we fill a host
-  // scratch and push (one H2D transfer per call).
+  // hermitian spectral function exactly.
+  //
+  // The FBZ-k expansion uses kp_to_ibz to look up the IBZ representative.
+  // For the symmetry-adapted ISDF (X factor at FBZ k carries the orbital
+  // rotation implicitly), this is the correct read. For trivial-IBZ
+  // systems kp_to_ibz is identity → bit-identical to the prior behavior.
+  // For kp_trev-flagged k (TR-pair partners): we project for the non-TR
+  // partner only and fill the TR k's aux block by conjugation of the
+  // partner's aux block (post-fix below). The orbital A at TR k positions
+  // is computed-but-unused — small wasted work, much simpler than skipping.
+  auto kp_to_ibz_arr   = MF.kp_to_ibz();
+  auto kp_trev_arr     = MF.kp_trev();
+  auto kp_trev_pair_arr = MF.kp_trev_pair();
   memory::array<MEM, ComplexType, 5> A;
   if constexpr (MEM == HOST_MEMORY) {
     A = nda::array<ComplexType, 5>(ns, Nk, N_w, nbnd, nbnd);
     for (long s = 0; s < ns; ++s)
-      for (long k = 0; k < Nk; ++k)
+      for (long k = 0; k < Nk; ++k) {
+        const long kibz = kp_to_ibz_arr(k);
         for (long iw = 0; iw < N_w; ++iw)
           for (long mu = 0; mu < nbnd; ++mu)
             for (long nu = 0; nu < nbnd; ++nu)
               A(s, k, iw, mu, nu) =
                   ComplexType(0.5, 0.0) *
-                  (A_in(iw, s, k, mu, nu)
-                   + std::conj(A_in(iw, s, k, nu, mu)));
+                  (A_in(iw, s, kibz, mu, nu)
+                   + std::conj(A_in(iw, s, kibz, nu, mu)));
+      }
   } else {
     nda::array<ComplexType, 5> A_h(ns, Nk, N_w, nbnd, nbnd);
     for (long s = 0; s < ns; ++s)
-      for (long k = 0; k < Nk; ++k)
+      for (long k = 0; k < Nk; ++k) {
+        const long kibz = kp_to_ibz_arr(k);
         for (long iw = 0; iw < N_w; ++iw)
           for (long mu = 0; mu < nbnd; ++mu)
             for (long nu = 0; nu < nbnd; ++nu)
               A_h(s, k, iw, mu, nu) =
                   ComplexType(0.5, 0.0) *
-                  (A_in(iw, s, k, mu, nu)
-                   + std::conj(A_in(iw, s, k, nu, mu)));
+                  (A_in(iw, s, kibz, mu, nu)
+                   + std::conj(A_in(iw, s, kibz, nu, mu)));
+      }
     A = memory::to_memory_space<MEM>(A_h);
   }
 
@@ -310,6 +329,9 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
 
   // BZ closure maps in shared memory. kpq(ik, iq) = ik+iq via qk_to_k2(qminus(iq), ik).
   // Cached across SCF iterations since BZ maps never change.
+  // NOTE: this map is sized at FBZ (Nk, Nq) and is currently used only by
+  // the k-space kernel branch (Nk == 1). For non-trivial IBZ with Nk > 1
+  // we go through the R-space path which doesn't use this map.
   if (!_skpq.has_value() or
       _skpq->shape() != std::array<long,2>{Nk, Nq}) {
     _skpq.emplace(*state.mpi, std::array<long,2>{Nk, Nq});
@@ -325,10 +347,11 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
   }
   auto kpq = _skpq->local();
 
-  // Identify the Gamma q-point if div_treatment == "ignore_g0".
+  // Identify the Gamma q-point in IBZ q indexing if div_treatment ==
+  // "ignore_g0". Gamma is conventionally at iq=0 in the IBZ.
   long iq_gamma = -1;
   if (_div_treatment == "ignore_g0") {
-    auto Qp = MF.Qpts();
+    auto Qp = MF.Qpts_ibz();
     if (Qp.shape()[0] >= 1) {
       double norm0 = 0.0;
       for (long c = 0; c < Qp.shape()[1]; ++c) norm0 += std::abs(Qp(0, c));
@@ -366,11 +389,13 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
       nda::array<long, 1> Rpts_weights(NR);
       Rpts_weights() = 1;
 
+      // sf_Rk: FBZ-k -> R FT (full BZ k as input).
+      // sf_qR: R -> IBZ-q FT (output Pi lands at IBZ q).
       _sf_Rk.emplace(*state.mpi, std::array<long,2>{NR, Nk});
-      _sf_qR.emplace(*state.mpi, std::array<long,2>{Nq, NR});
+      _sf_qR.emplace(*state.mpi, std::array<long,2>{Nq_ibz, NR});
       utils::k_to_R_coefficients(comm, Rpts_idx, MF.kpts(), lattv, *_sf_Rk);
-      utils::R_to_k_coefficients(comm, Rpts_idx, Rpts_weights, MF.Qpts(), lattv,
-                                 *_sf_qR);
+      utils::R_to_k_coefficients(comm, Rpts_idx, Rpts_weights,
+                                 MF.Qpts_ibz(), lattv, *_sf_qR);
       _cached_use_rspace = use_rspace;
       if constexpr (MEM != HOST_MEMORY) {
         // Push MEM-side mirrors so the gemms in step 2 can run on device.
@@ -391,7 +416,7 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
       _X_mem = memory::to_memory_space<MEM>(_sX->local());
     }
     if (!_V_qPQ_mem.has_value() or
-        _V_qPQ_mem->shape() != std::array<long,3>{Nq, Naux_loc_P, Naux_loc_Q}) {
+        _V_qPQ_mem->shape() != std::array<long,3>{Nq_ibz, Naux_loc_P, Naux_loc_Q}) {
       _V_qPQ_mem = memory::to_memory_space<MEM>(*_V_qPQ_loc);
     }
   }
@@ -428,9 +453,11 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
   auto dA_aux_skPQw = math::nda::make_distributed_array<local_5d_t>(
       comm, pgrid_aux, shape_aux, bsize_aux);
   auto A_aux_loc = dA_aux_skPQw.local();  // (ns, Nk, Naux_loc_P, Naux_loc_Q, N_w)
+  // Pass 1: project for non-TR k's only. Pass 2: fill TR-pair k's by conj-copy.
   if constexpr (MEM == HOST_MEMORY) {
     for (long s = 0; s < ns; ++s)
       for (long ik = 0; ik < Nk; ++ik) {
+        if (kp_trev_arr(ik) != 0) continue;
         auto X_P_slice  = X(s, ik, Pr, _);
         auto X_Q_slice  = X(s, ik, Qr, _);
         auto A_view     = A(s, ik, _, _, _);
@@ -441,11 +468,38 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
     auto X_dev = (*_X_mem)();
     for (long s = 0; s < ns; ++s)
       for (long ik = 0; ik < Nk; ++ik) {
+        if (kp_trev_arr(ik) != 0) continue;
         auto X_P_slice  = X_dev(s, ik, Pr, _);
         auto X_Q_slice  = X_dev(s, ik, Qr, _);
         auto A_view     = A(s, ik, _, _, _);
         auto A_aux_view = A_aux_loc(s, ik, _, _, _);
         primary_to_aux_one_k<MEM>(X_P_slice, X_Q_slice, A_view, A_aux_view);
+      }
+  }
+  // Pass 2: TR-pair fix-up. aux-A(k) = conj(aux-A(kp_trev_pair(k))) for
+  // k where kp_trev != 0. Pattern from rpa_pi.icc:122-135.
+  if constexpr (MEM == HOST_MEMORY) {
+    for (long s = 0; s < ns; ++s)
+      for (long ik = 0; ik < Nk; ++ik) {
+        if (kp_trev_arr(ik) == 0) continue;
+        const long ik_partner = kp_trev_pair_arr(ik);
+        auto src = A_aux_loc(s, ik_partner, _, _, _);
+        auto dst = A_aux_loc(s, ik,         _, _, _);
+        const long lP = src.shape()[0], lQ = src.shape()[1], lW = src.shape()[2];
+        for (long p = 0; p < lP; ++p)
+          for (long q = 0; q < lQ; ++q)
+            for (long w = 0; w < lW; ++w)
+              dst(p, q, w) = std::conj(src(p, q, w));
+      }
+  } else {
+    for (long s = 0; s < ns; ++s)
+      for (long ik = 0; ik < Nk; ++ik) {
+        if (kp_trev_arr(ik) == 0) continue;
+        const long ik_partner = kp_trev_pair_arr(ik);
+        auto src = A_aux_loc(s, ik_partner, _, _, _);
+        auto dst = A_aux_loc(s, ik,         _, _, _);
+        dst = src;
+        nda::tensor::scale(ComplexType(1.0, 0.0), dst, nda::tensor::op::CONJ);
       }
   }
   const double dt1 = sec_since(t1);
@@ -498,13 +552,13 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
     }
     dt2_kernel += sec_since(t2c);
 
-    // FT ImPi from R-space to q-space. Per-rank gemm on the local block.
+    // FT ImPi from R-space to IBZ q-space. Per-rank gemm on the local block.
     auto t2d = t_now();
     {
       auto ImPi_R_2D = nda::reshape(ImPi_RPQO_loc,
                                     std::array<long,2>{NR, B_loc * N_O});
       auto ImPi_q_2D = nda::reshape(ImPi_loc,
-                                    std::array<long,2>{Nq, B_loc * N_O});
+                                    std::array<long,2>{Nq_ibz, B_loc * N_O});
       if constexpr (MEM == HOST_MEMORY) {
         nda::blas::gemm(ComplexType(1.0, 0.0), _sf_qR->local(), ImPi_R_2D,
                         ComplexType(0.0, 0.0), ImPi_q_2D);
@@ -519,8 +573,14 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
     }
     dt2_ftq += sec_since(t2d);
   } else {
+    // K-space branch: only used for Γ-only fixtures (Nk == 1, IBZ == FBZ).
+    // For non-trivial IBZ the R-space branch is taken.
+    utils::check(Nk == Nq_ibz,
+                 "real_axis_scr_coulomb_t::update_w: k-space Pi branch only "
+                 "supports IBZ == FBZ (got Nk={}, Nq_ibz={}, Nq={})",
+                 Nk, Nq_ibz, Nq);
     const double k_weight = 1.0 / static_cast<double>(Nk);
-    for (long iq = 0; iq < Nq; ++iq) {
+    for (long iq = 0; iq < Nq_ibz; ++iq) {
       if (iq == iq_gamma) continue;
       auto ImPi_q_view = ImPi_loc(iq, _, _, _);
       for (long s = 0; s < ns; ++s) {
@@ -547,7 +607,7 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
         std::array<long,3>{Naux_loc_P, Naux_loc_Q, N_O});
     memory::buffered_array<MEM, double, 3> RePi_loc_real(
         std::array<long,3>{Naux_loc_P, Naux_loc_Q, N_O});
-    for (long iq = 0; iq < Nq; ++iq) {
+    for (long iq = 0; iq < Nq_ibz; ++iq) {
       if (iq == iq_gamma) continue;
       auto ImPi_q_view = ImPi_loc(iq, _, _, _);
       auto RePi_q_view = RePi_loc(iq, _, _, _);
@@ -601,7 +661,7 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
     // residual to (np_P, np_Q). For nproc=1 (Mac unit tests) this collapses
     // to (1, 1, 1, 1) — bit-identical to the previous single-rank path.
     long np = comm.size();
-    long q_pool = utils::find_proc_grid_max_npools(np, Nq, 0.2);
+    long q_pool = utils::find_proc_grid_max_npools(np, Nq_ibz, 0.2);
     long np1    = np / q_pool;
     long w_pool = utils::find_proc_grid_max_npools(np1, N_O, 0.2);
     long np2    = np1 / w_pool;
@@ -626,13 +686,13 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
             dyson_pgrid[0], dyson_pgrid[1], dyson_pgrid[2], dyson_pgrid[3]);
 
     // 4b. Build complex Pi := RePi.real + i*ImPi.real on the current grid,
-    // then redistribute to the Dyson grid.
+    // then redistribute to the Dyson grid. All q-axis sizes are IBZ.
     auto dPi_cur = make_distributed_array<Array_4D_t>(
-        comm, pgrid_cur, {Nq, Naux, Naux, N_O}, bsize_cur);
+        comm, pgrid_cur, {Nq_ibz, Naux, Naux, N_O}, bsize_cur);
     {
       auto Pi_cur = dPi_cur.local();
       if constexpr (MEM == HOST_MEMORY) {
-        for (long iq = 0; iq < Nq; ++iq)
+        for (long iq = 0; iq < Nq_ibz; ++iq)
           for (long iP = 0; iP < Naux_loc_P; ++iP)
             for (long iQ = 0; iQ < Naux_loc_Q; ++iQ)
               for (long iO = 0; iO < N_O; ++iO)
@@ -650,7 +710,7 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
       }
     }
     auto dPi_dyson = make_distributed_array<Array_4D_t>(
-        comm, dyson_pgrid, {Nq, Naux, Naux, N_O}, dyson_bsize);
+        comm, dyson_pgrid, {Nq_ibz, Naux, Naux, N_O}, dyson_bsize);
     math::nda::redistribute(dPi_cur, dPi_dyson);
     dPi_cur.reset();
 
@@ -663,11 +723,11 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
     std::array<long, 4> pgrid_V_cur = {1, pgrid_cur[1], pgrid_cur[2], 1};
     std::array<long, 4> bsize_V_cur = {1, bsize_cur[1], bsize_cur[2], 1};
     auto dV_cur = make_distributed_array<Array_4D_t>(
-        comm, pgrid_V_cur, {Nq, Naux, Naux, w_pool}, bsize_V_cur);
+        comm, pgrid_V_cur, {Nq_ibz, Naux, Naux, w_pool}, bsize_V_cur);
     {
-      auto V_cur = dV_cur.local();   // shape (Nq, NP_loc, NQ_loc, w_pool)
+      auto V_cur = dV_cur.local();   // shape (Nq_ibz, NP_loc, NQ_loc, w_pool)
       if constexpr (MEM == HOST_MEMORY) {
-        for (long iq = 0; iq < Nq; ++iq)
+        for (long iq = 0; iq < Nq_ibz; ++iq)
           for (long iP = 0; iP < Naux_loc_P; ++iP)
             for (long iQ = 0; iQ < Naux_loc_Q; ++iQ)
               for (long iw = 0; iw < w_pool; ++iw)
@@ -680,14 +740,14 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
     std::array<long, 4> dyson_V_pgrid = {q_pool, np_P, np_Q, w_pool};
     std::array<long, 4> dyson_V_bsize = {1, dyson_bsize[1], dyson_bsize[2], 1};
     auto dV_dyson = make_distributed_array<Array_4D_t>(
-        comm, dyson_V_pgrid, {Nq, Naux, Naux, w_pool}, dyson_V_bsize);
+        comm, dyson_V_pgrid, {Nq_ibz, Naux, Naux, w_pool}, dyson_V_bsize);
     math::nda::redistribute(dV_cur, dV_dyson);
     dV_cur.reset();
 
     // Output W on the Dyson grid (filled by local Dyson loop; redistributed
     // back at the end).
     auto dW_dyson = make_distributed_array<Array_4D_t>(
-        comm, dyson_pgrid, {Nq, Naux, Naux, N_O}, dyson_bsize);
+        comm, dyson_pgrid, {Nq_ibz, Naux, Naux, N_O}, dyson_bsize);
 
     // 4d. Slate work arrays on a wq_intra_comm sized (np_P * np_Q). When
     // np_P == np_Q == 1 the intra-comm has size 1 and slate runs as
@@ -797,7 +857,7 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
     // unpack complex W into ReW_loc.real, ImW_loc.real (the Re/Im arrays
     // store real-valued data in the .real() slot of ComplexType).
     auto dW_cur = make_distributed_array<Array_4D_t>(
-        comm, pgrid_cur, {Nq, Naux, Naux, N_O}, bsize_cur);
+        comm, pgrid_cur, {Nq_ibz, Naux, Naux, N_O}, bsize_cur);
     math::nda::redistribute(dW_dyson, dW_cur);
     dPi_dyson.reset();
     dV_dyson.reset();
@@ -806,7 +866,7 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
     {
       auto W_cur = dW_cur.local();
       if constexpr (MEM == HOST_MEMORY) {
-        for (long iq = 0; iq < Nq; ++iq)
+        for (long iq = 0; iq < Nq_ibz; ++iq)
           for (long iP = 0; iP < Naux_loc_P; ++iP)
             for (long iQ = 0; iQ < Naux_loc_Q; ++iQ)
               for (long iO = 0; iO < N_O; ++iO) {
@@ -855,9 +915,11 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
   // Mirrors `g0_div_utils::eps_inv_head_t` on the imag-axis side. Computed
   // unconditionally; gw_t::evaluate only consumes it when div_treatment
   // is not "ignore_g0".
-  // Requires the full (Nq, Naux, Naux, N_Omega) W to project through
+  // Requires the (Nq_ibz, Naux, Naux, N_Omega) W to project through
   // chi_bar_head; gather from the distributed state on each rank since
-  // the cost is small (Nq * N_O scalar accumulations of length Naux^2).
+  // the cost is small (Nq_ibz * N_O scalar accumulations of length Naux^2).
+  // TODO: replace gather with a local (P,Q)-contraction + Allreduce of
+  // (Nq_ibz, N_O) reals (memory-redesign P6).
   // ----------------------------------------------------------------
   if (_div_treatment != "ignore_g0") {
     auto W_full = math::nda::all_gather_slow<HOST_MEMORY>(*state.ImW_qPQO);
@@ -873,9 +935,9 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
       for (long i = 0; i < N; ++i)
         dst[i] = ComplexType(re[i].real(), im[i].real());
     }
-    auto Qpts = nda::array<double, 2>(MF.Qpts());
+    auto Qpts = nda::array<double, 2>(MF.Qpts_ibz());
     auto chi_bar = nda::array<ComplexType, 2>(thc.basis_bar_head());
-    nda::array<ComplexType, 2> eps_inv_qO(Nq, N_O);
+    nda::array<ComplexType, 2> eps_inv_qO(Nq_ibz, N_O);
     if (!state.eps_inv_head_O.has_value())
       state.eps_inv_head_O = nda::array<ComplexType, 1>(N_O);
     compute_eps_inv_head_O(W_complex, Qpts, chi_bar, MF.volume(),

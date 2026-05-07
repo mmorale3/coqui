@@ -23,6 +23,7 @@
 
 #include "mean_field/MF.hpp"
 #include "methods/ERI/detail/concepts.hpp"
+#include "numerics/sparse/csr_blas.hpp"
 #include "methods/GW_real_axis/real_freq_grid.hpp"
 #include "methods/GW_real_axis/real_axis_conv.hpp"
 #include "methods/GW_real_axis/real_axis_mb_state.hpp"
@@ -328,28 +329,44 @@ void real_axis_gw_t::evaluate(real_axis::real_axis_mb_state_t & state,
   auto const& grid = *_grid;
   auto const& MF   = *thc.MF();
 
-  const long ns    = MF.nspin();
-  const long nbnd  = MF.nbnd();
-  const long Nk    = MF.nkpts();
-  const long Nq    = MF.nqpts();
-  const long Naux  = thc.Np();
-  const long N_w   = grid.N_w();
-  const long N_O   = grid.N_Omega();
+  const long ns      = MF.nspin();
+  const long nbnd    = MF.nbnd();
+  // Storage scopes: orbital-basis state (A, Sigma) at IBZ k, bosonic aux
+  // state (W) at IBZ q. The kernel BZ-pair sums iterate over FBZ (k, q)
+  // pairs; star expansion of orbital quantities happens via X(FBZ k) and
+  // the orbital rotations from MF.symmetry_rotation. The current code
+  // path below assumes IBZ == FBZ; the symmetry-adapted isym-loop
+  // refactor (project_realaxis_symmetry.md step 3) is the next commit.
+  const long Nk      = MF.nkpts();
+  const long Nq      = MF.nqpts();
+  const long Nk_ibz  = MF.nkpts_ibz();
+  const long Nq_ibz  = MF.nqpts_ibz();
+  const long Naux    = thc.Np();
+  const long N_w     = grid.N_w();
+  const long N_O     = grid.N_Omega();
 
   utils::check(MF.npol() == 1,
                "real_axis_gw_t::evaluate: npol={} not supported (need 1)",
                MF.npol());
 
+  // The original Sigma kernel below (FBZ direct sum, k- or R-space) only
+  // works when IBZ == FBZ. For non-trivial IBZ the symmetry-adapted
+  // isym-loop kernel is dispatched via `use_isym` further down. Both
+  // paths produce state.{Im,Re}Sigma_wskij at IBZ k.
+  const bool use_isym = (Nk != Nk_ibz);
+
   auto A_in = state.A_wskij->local();
   utils::check(A_in.shape()[0] == N_w and A_in.shape()[1] == ns and
-               A_in.shape()[2] == Nk and A_in.shape()[3] == nbnd and
+               A_in.shape()[2] == Nk_ibz and A_in.shape()[3] == nbnd and
                A_in.shape()[4] == nbnd,
-               "real_axis_gw_t::evaluate: state.A_wskij shape mismatch");
-  utils::check(state.ImW_qPQO->global_shape()[0] == Nq and
+               "real_axis_gw_t::evaluate: state.A_wskij shape mismatch "
+               "(expected IBZ k = {}, got {})", Nk_ibz, A_in.shape()[2]);
+  utils::check(state.ImW_qPQO->global_shape()[0] == Nq_ibz and
                state.ImW_qPQO->global_shape()[1] == Naux and
                state.ImW_qPQO->global_shape()[2] == Naux and
                state.ImW_qPQO->global_shape()[3] == N_O,
-               "real_axis_gw_t::evaluate: state.ImW_qPQO shape mismatch");
+               "real_axis_gw_t::evaluate: state.ImW_qPQO shape mismatch "
+               "(expected IBZ q = {})", Nq_ibz);
 
   // Local (P_loc, Q_loc) ranges and shapes from the distributed state.W.
   auto Pr = state.ImW_qPQO->local_range(1);
@@ -360,44 +377,53 @@ void real_axis_gw_t::evaluate(real_axis::real_axis_mb_state_t & state,
   // Read state.W directly via .local(); no gather, no replicated buffer.
   auto ImW_loc = state.ImW_qPQO->local();
 
-  // Allocate Sigma outputs in state as sArrays (one copy per node) if
+  // Allocate Sigma outputs at IBZ k as sArrays (one copy per node) if
   // not already allocated.
   if (!state.ImSigma_wskij.has_value() or !state.ReSigma_wskij.has_value()) {
     state.ImSigma_wskij.emplace(*state.mpi,
-        std::array<long, 5>{N_w, ns, Nk, nbnd, nbnd});
+        std::array<long, 5>{N_w, ns, Nk_ibz, nbnd, nbnd});
     state.ReSigma_wskij.emplace(*state.mpi,
-        std::array<long, 5>{N_w, ns, Nk, nbnd, nbnd});
+        std::array<long, 5>{N_w, ns, Nk_ibz, nbnd, nbnd});
   }
   auto ImSigma_out = state.ImSigma_wskij->local();
   auto ReSigma_out = state.ReSigma_wskij->local();
 
-  // Repack A from (N_w, ns, Nk, nbnd, nbnd) to (ns, Nk, N_w, nbnd, nbnd),
-  // taking the matrix-hermitian symmetrization. For MEM=HOST we fill the
-  // MEM-resident A directly; for MEM=DEVICE we fill a host scratch and
-  // push (one H2D transfer per call).
+  // Repack A from IBZ-stored (N_w, ns, Nk_ibz, nbnd, nbnd) to FBZ-k driver
+  // layout (ns, Nk, N_w, nbnd, nbnd) with matrix-hermitian symmetrization.
+  // The FBZ-k expansion uses kp_to_ibz; the X factor at FBZ k carries the
+  // orbital rotation in the symmetry-adapted ISDF picture. For TR-pair
+  // k's the aux-A is filled by conj-copy from the trev_pair partner after
+  // the projection loop (Step 1 below).
+  auto kp_to_ibz_arr    = MF.kp_to_ibz();
+  auto kp_trev_arr      = MF.kp_trev();
+  auto kp_trev_pair_arr = MF.kp_trev_pair();
   memory::array<MEM, ComplexType, 5> A;
   if constexpr (MEM == HOST_MEMORY) {
     A = nda::array<ComplexType, 5>(ns, Nk, N_w, nbnd, nbnd);
     for (long s = 0; s < ns; ++s)
-      for (long k = 0; k < Nk; ++k)
+      for (long k = 0; k < Nk; ++k) {
+        const long kibz = kp_to_ibz_arr(k);
         for (long iw = 0; iw < N_w; ++iw)
           for (long mu = 0; mu < nbnd; ++mu)
             for (long nu = 0; nu < nbnd; ++nu)
               A(s, k, iw, mu, nu) =
                   ComplexType(0.5, 0.0) *
-                  (A_in(iw, s, k, mu, nu)
-                   + std::conj(A_in(iw, s, k, nu, mu)));
+                  (A_in(iw, s, kibz, mu, nu)
+                   + std::conj(A_in(iw, s, kibz, nu, mu)));
+      }
   } else {
     nda::array<ComplexType, 5> A_h(ns, Nk, N_w, nbnd, nbnd);
     for (long s = 0; s < ns; ++s)
-      for (long k = 0; k < Nk; ++k)
+      for (long k = 0; k < Nk; ++k) {
+        const long kibz = kp_to_ibz_arr(k);
         for (long iw = 0; iw < N_w; ++iw)
           for (long mu = 0; mu < nbnd; ++mu)
             for (long nu = 0; nu < nbnd; ++nu)
               A_h(s, k, iw, mu, nu) =
                   ComplexType(0.5, 0.0) *
-                  (A_in(iw, s, k, mu, nu)
-                   + std::conj(A_in(iw, s, k, nu, mu)));
+                  (A_in(iw, s, kibz, mu, nu)
+                   + std::conj(A_in(iw, s, kibz, nu, mu)));
+      }
     A = memory::to_memory_space<MEM>(A_h);
   }
 
@@ -481,11 +507,14 @@ void real_axis_gw_t::evaluate(real_axis::real_axis_mb_state_t & state,
       nda::array<long, 1> Rpts_weights(NR);
       Rpts_weights() = 1;
 
+      // sf_Rk, sf_kR: FBZ k. sf_Rq: IBZ q (since W lives at IBZ q in the
+      // symmetry-adapted picture). For trivial-IBZ runs Nq == Nq_ibz, so
+      // sf_Rq is identical in both regimes.
       cache.sf_Rk.emplace(*state.mpi, std::array<long,2>{NR, Nk});
-      cache.sf_Rq.emplace(*state.mpi, std::array<long,2>{NR, Nq});
+      cache.sf_Rq.emplace(*state.mpi, std::array<long,2>{NR, Nq_ibz});
       cache.sf_kR.emplace(*state.mpi, std::array<long,2>{Nk, NR});
-      utils::k_to_R_coefficients(comm, Rpts_idx, MF.kpts(), lattv, *cache.sf_Rk);
-      utils::k_to_R_coefficients(comm, Rpts_idx, MF.Qpts(), lattv, *cache.sf_Rq);
+      utils::k_to_R_coefficients(comm, Rpts_idx, MF.kpts(),     lattv, *cache.sf_Rk);
+      utils::k_to_R_coefficients(comm, Rpts_idx, MF.Qpts_ibz(), lattv, *cache.sf_Rq);
       utils::R_to_k_coefficients(comm, Rpts_idx, Rpts_weights, MF.kpts(), lattv,
                                  *cache.sf_kR);
       cache.use_rspace_cached = use_rspace;
@@ -522,9 +551,11 @@ void real_axis_gw_t::evaluate(real_axis::real_axis_mb_state_t & state,
   auto dA_aux_skPQw = math::nda::make_distributed_array<local_5d_t>(
       comm, pgrid_aux, shape_aux, bsize_aux);
   auto A_aux_loc = dA_aux_skPQw.local();
+  // Pass 1: project for non-TR k's only.
   if constexpr (MEM == HOST_MEMORY) {
     for (long s = 0; s < ns; ++s)
       for (long ik = 0; ik < Nk; ++ik) {
+        if (kp_trev_arr(ik) != 0) continue;
         auto X_P_slice  = X(s, ik, Pr, _);
         auto X_Q_slice  = X(s, ik, Qr, _);
         auto A_view     = A(s, ik, _, _, _);
@@ -535,6 +566,7 @@ void real_axis_gw_t::evaluate(real_axis::real_axis_mb_state_t & state,
     auto X_dev = (*cache.X_mem)();
     for (long s = 0; s < ns; ++s)
       for (long ik = 0; ik < Nk; ++ik) {
+        if (kp_trev_arr(ik) != 0) continue;
         auto X_P_slice  = X_dev(s, ik, Pr, _);
         auto X_Q_slice  = X_dev(s, ik, Qr, _);
         auto A_view     = A(s, ik, _, _, _);
@@ -542,16 +574,43 @@ void real_axis_gw_t::evaluate(real_axis::real_axis_mb_state_t & state,
         primary_to_aux_one_k<MEM>(X_P_slice, X_Q_slice, A_view, A_aux_view);
       }
   }
+  // Pass 2: TR-pair fix-up. aux-A(k) = conj(aux-A(kp_trev_pair(k))) for
+  // k where kp_trev != 0. Pattern from rpa_pi.icc:122-135.
+  if constexpr (MEM == HOST_MEMORY) {
+    for (long s = 0; s < ns; ++s)
+      for (long ik = 0; ik < Nk; ++ik) {
+        if (kp_trev_arr(ik) == 0) continue;
+        const long ik_partner = kp_trev_pair_arr(ik);
+        auto src = A_aux_loc(s, ik_partner, _, _, _);
+        auto dst = A_aux_loc(s, ik,         _, _, _);
+        const long lP = src.shape()[0], lQ = src.shape()[1], lW = src.shape()[2];
+        for (long p = 0; p < lP; ++p)
+          for (long q = 0; q < lQ; ++q)
+            for (long w = 0; w < lW; ++w)
+              dst(p, q, w) = std::conj(src(p, q, w));
+      }
+  } else {
+    for (long s = 0; s < ns; ++s)
+      for (long ik = 0; ik < Nk; ++ik) {
+        if (kp_trev_arr(ik) == 0) continue;
+        const long ik_partner = kp_trev_pair_arr(ik);
+        auto src = A_aux_loc(s, ik_partner, _, _, _);
+        auto dst = A_aux_loc(s, ik,         _, _, _);
+        dst = src;
+        nda::tensor::scale(ComplexType(1.0, 0.0), dst, nda::tensor::op::CONJ);
+      }
+  }
   const double dt1 = sec_since(t1);
 
   // ----------------------------------------------------------------
   // Step 5: B = -Im W / pi on the local (P_loc, Q_loc, Omega) block.
+  // ImW_loc has shape (Nq_ibz, NP_loc, NQ_loc, N_O); B inherits that.
   // For MEM=DEVICE, ImW_loc is host-resident (state lives on host); we
   // pull to MEM via to_memory_space and apply the scale on device.
   // ----------------------------------------------------------------
   const auto t5 = t_now();
   memory::buffered_array<MEM, ComplexType, 4> B_qPQO_loc(
-      std::array<long,4>{Nq, Naux_loc_P, Naux_loc_Q, N_O});
+      std::array<long,4>{Nq_ibz, Naux_loc_P, Naux_loc_Q, N_O});
   if constexpr (MEM == HOST_MEMORY) {
     B_qPQO_loc() = nda::map([](ComplexType w) {
       return ComplexType(-w.real() / M_PI, 0.0);
@@ -568,6 +627,184 @@ void real_axis_gw_t::evaluate(real_axis::real_axis_mb_state_t & state,
   }
   const double dt5 = sec_since(t5);
 
+  // ================================================================
+  // Symmetry-adapted Sigma path (Nk != Nk_ibz). Steps 6-9 below run
+  // only for the trivial-IBZ case; the isym block produces state.Sigma
+  // at IBZ k directly and returns.
+  //
+  // Reference: methods/GW/thc_gw.icc::eval_Sigma_all_kspace +
+  // ::eval_Sigma_all_k_impl.
+  // ================================================================
+  if (use_isym) {
+    if constexpr (MEM != HOST_MEMORY) {
+      utils::check(false,
+                   "real_axis_gw_t::evaluate: symmetry-adapted (isym) Sigma "
+                   "path is host-only in this commit. Use MEM=HOST_MEMORY "
+                   "for non-trivial IBZ runs.");
+    } else {
+      const auto t_isym = t_now();
+      const long Nsymq = static_cast<long>(MF.qsymms().shape()[0]);
+      auto qp_to_ibz_arr = MF.qp_to_ibz();
+      auto qp_trev_arr   = MF.qp_trev();
+      auto qk_to_k2      = MF.qk_to_k2();
+      auto qminus_arr    = MF.qminus();
+      const double qw_per_pair = 1.0 / static_cast<double>(Nq);
+
+      // Per-isym aux Sigma buffers at IBZ k (reused across isym).
+      memory::buffered_array<MEM, ComplexType, 5> ImSig_aux_isym(
+          std::array<long,5>{ns, Nk_ibz, Naux_loc_P, Naux_loc_Q, N_w});
+      memory::buffered_array<MEM, ComplexType, 5> ReSig_aux_isym(
+          std::array<long,5>{ns, Nk_ibz, Naux_loc_P, Naux_loc_Q, N_w});
+
+      // Orbital Sigma per-rank partials at IBZ k, accumulated across isym.
+      // Shape (ns, Nk_ibz, N_w, nbnd, nbnd).
+      nda::array<ComplexType, 5> ImSig_orb(ns, Nk_ibz, N_w, nbnd, nbnd);
+      nda::array<ComplexType, 5> ReSig_orb(ns, Nk_ibz, N_w, nbnd, nbnd);
+      ImSig_orb() = ComplexType(0.0, 0.0);
+      ReSig_orb() = ComplexType(0.0, 0.0);
+
+      // Per-(s, ik_ibz) orbital Sigma scratch at FBZ ks position.
+      nda::array<ComplexType, 3> ImOrb_at_ks(N_w, nbnd, nbnd);
+      nda::array<ComplexType, 3> ReOrb_at_ks(N_w, nbnd, nbnd);
+      nda::array<ComplexType, 2> Tm(nbnd, nbnd);
+
+      for (long isym = 0; isym < Nsymq; ++isym) {
+        const long nqs_isym = MF.nq_per_s(isym);
+
+        // Step 6 (isym): build aux Im Sigma at IBZ k from W(IBZ q) and
+        // A(FBZ k) via the (k, q) pairs in this isym partition.
+        ImSig_aux_isym() = ComplexType(0.0, 0.0);
+        for (long s = 0; s < ns; ++s) {
+          for (long ik_ibz = 0; ik_ibz < Nk_ibz; ++ik_ibz) {
+            const long ks = MF.ks_to_k(isym, ik_ibz);
+            for (long iq = 0; iq < nqs_isym; ++iq) {
+              const long qp = MF.Qs(isym, iq);
+              const long qs = qp_to_ibz_arr(qp);
+              if (qs == iq_gamma) continue;  // ignore_g0
+              // qp_trev branch: for TR-related FBZ q (qp_trev(qp) == 1),
+              // the contribution is kernel(A(k+qs), B(qs)) instead of
+              // kernel(A(k-qs), B(qs)). This is exactly an index swap on
+              // the k lookup since our B (= -ImW/π) is real-valued
+              // (imag()=0 by convention) and B(-q) = B(q) for real B.
+              // The imag-axis pattern's conj_W handling is a no-op for our
+              // real-W storage; only the k-lookup changes.
+              // kp_trev on the resulting k-index is handled by the
+              // conj-copy fix-up of aux-A above.
+              const long ksmqs = (qp_trev_arr(qp) != 0)
+                  ? qk_to_k2(qminus_arr(qs), ks)
+                  : qk_to_k2(qs, ks);
+              auto A_view   = A_aux_loc(s, ksmqs, _, _, _);
+              auto B_view   = B_qPQO_loc(qs, _, _, _);
+              auto Sig_view = ImSig_aux_isym(s, ik_ibz, _, _, _);
+              accumulate_ImSigma_one_kq_nufft<MEM>(conv, A_view, B_view, Sig_view,
+                                                   qw_per_pair);
+            }
+          }
+        }
+
+        // Step 7 (isym): Re Sigma via Hilbert per (s, ik_ibz).
+        for (long s = 0; s < ns; ++s)
+          for (long ik_ibz = 0; ik_ibz < Nk_ibz; ++ik_ibz) {
+            auto Im_view = ImSig_aux_isym(s, ik_ibz, _, _, _);
+            auto Re_view = ReSig_aux_isym(s, ik_ibz, _, _, _);
+            ReSigma_from_ImSigma_aux<MEM>(conv, Im_view, Re_view);
+          }
+
+        // Step 8 (isym): aux -> orbital with X at FBZ ks=ks_to_k(isym, ik_ibz)
+        // then orbital rotation D = MF.symmetry_rotation(isym, ik_ibz) into
+        // orbital Sigma at IBZ k. For isym == 0 D is identity (no rotation).
+        for (long s = 0; s < ns; ++s) {
+          for (long ik_ibz = 0; ik_ibz < Nk_ibz; ++ik_ibz) {
+            const long ks = MF.ks_to_k(isym, ik_ibz);
+            auto X_P_slice = X(s, ks, Pr, _);
+            auto X_Q_slice = X(s, ks, Qr, _);
+            auto Im_aux = ImSig_aux_isym(s, ik_ibz, _, _, _);
+            auto Re_aux = ReSig_aux_isym(s, ik_ibz, _, _, _);
+            aux_to_primary_one_k(X_P_slice, X_Q_slice, Im_aux, ImOrb_at_ks);
+            aux_to_primary_one_k(X_P_slice, X_Q_slice, Re_aux, ReOrb_at_ks);
+
+            if (isym == 0) {
+              // Identity symmetry: direct add.
+              for (long iw = 0; iw < N_w; ++iw)
+                for (long mu = 0; mu < nbnd; ++mu)
+                  for (long nu = 0; nu < nbnd; ++nu) {
+                    ImSig_orb(s, ik_ibz, iw, mu, nu) += ImOrb_at_ks(iw, mu, nu);
+                    ReSig_orb(s, ik_ibz, iw, mu, nu) += ReOrb_at_ks(iw, mu, nu);
+                  }
+            } else {
+              // Apply orbital rotation D: Σ_ij(IBZ k) +=
+              //   sum_{a,b} conj(D_{a,i}) * Sigma_{a,b}(FBZ ks) * D_{b,j}
+              // pattern from thc_gw.icc:347-353.
+              auto [cjg, D] = MF.symmetry_rotation(isym, ik_ibz);
+              utils::check(not cjg,
+                           "real_axis_gw_t::evaluate (isym): "
+                           "symmetry_rotation cjg=true branch not supported "
+                           "(matches imag-axis restriction).");
+              using math::sparse::csrmm;
+              for (long iw = 0; iw < N_w; ++iw) {
+                // Im
+                csrmm<'H'>(ComplexType(1.0, 0.0), *D,
+                           ImOrb_at_ks(iw, _, _),
+                           ComplexType(0.0, 0.0), Tm);
+                csrmm<'T'>(ComplexType(1.0, 0.0), *D, nda::transpose(Tm),
+                           ComplexType(1.0, 0.0),
+                           nda::transpose(ImSig_orb(s, ik_ibz, iw, _, _)));
+                // Re
+                csrmm<'H'>(ComplexType(1.0, 0.0), *D,
+                           ReOrb_at_ks(iw, _, _),
+                           ComplexType(0.0, 0.0), Tm);
+                csrmm<'T'>(ComplexType(1.0, 0.0), *D, nda::transpose(Tm),
+                           ComplexType(1.0, 0.0),
+                           nda::transpose(ReSig_orb(s, ik_ibz, iw, _, _)));
+              }
+            }
+          }
+        }
+      } // for isym
+
+      // Allreduce orbital Sigma partials across (P, Q) ranks.
+      if (comm.size() > 1) {
+        comm.all_reduce_in_place_n(ImSig_orb.data(), ImSig_orb.size(), std::plus<>{});
+        comm.all_reduce_in_place_n(ReSig_orb.data(), ReSig_orb.size(), std::plus<>{});
+      }
+
+      // Write to state.{Im,Re}Sigma_wskij with (N_w, ns, Nk_ibz, nbnd, nbnd) layout.
+      if (state.ImSigma_wskij->node_comm()->root()) {
+        for (long s = 0; s < ns; ++s)
+          for (long ik = 0; ik < Nk_ibz; ++ik)
+            for (long iw = 0; iw < N_w; ++iw)
+              for (long mu = 0; mu < nbnd; ++mu)
+                for (long nu = 0; nu < nbnd; ++nu) {
+                  ImSigma_out(iw, s, ik, mu, nu) = ImSig_orb(s, ik, iw, mu, nu);
+                  ReSigma_out(iw, s, ik, mu, nu) = ReSig_orb(s, ik, iw, mu, nu);
+                }
+      }
+      state.ImSigma_wskij->node_sync();
+      state.ReSigma_wskij->node_sync();
+
+      // Step 9 (div correction) for the isym path is not yet implemented.
+      utils::check(not (state.eps_inv_head_O.has_value() and
+                        div_treatment != "ignore_g0"),
+                   "real_axis_gw_t::evaluate (isym): Sigma_div correction "
+                   "not yet implemented for non-trivial IBZ. Use "
+                   "div_treatment=\"ignore_g0\".");
+
+      if (verbose and comm.root()) {
+        const double dt_isym = sec_since(t_isym);
+        const double dt_total = sec_since(t_total);
+        app_log(2, "[real_axis_gw_t::evaluate (isym)] Naux={}, N_w={}, N_O={}, "
+                    "Nk_ibz={}, Nk={}, Nq_ibz={}, Nq={}, Nsymq={}, ns={}, nbnd={}",
+                Naux, N_w, N_O, Nk_ibz, Nk, Nq_ibz, Nq, Nsymq, ns, nbnd);
+        app_log(2, "[real_axis_gw_t::evaluate (isym)]   conv_t setup     : {0:8.3f}", dt_conv);
+        app_log(2, "[real_axis_gw_t::evaluate (isym)]   step 1 project A : {0:8.3f}", dt1);
+        app_log(2, "[real_axis_gw_t::evaluate (isym)]   step 5 B=-ImW/pi : {0:8.3f}", dt5);
+        app_log(2, "[real_axis_gw_t::evaluate (isym)]   isym Sigma build : {0:8.3f}", dt_isym);
+        app_log(2, "[real_axis_gw_t::evaluate (isym)]   TOTAL            : {0:8.3f}", dt_total);
+      }
+      return;
+    }
+  }
+
   // ----------------------------------------------------------------
   // Step 6: Im Sigma^c_PQ(k, w). Each rank computes its (P_loc, Q_loc)
   // block for ALL (s, k, q); no allreduce.
@@ -582,12 +819,12 @@ void real_axis_gw_t::evaluate(real_axis::real_axis_mb_state_t & state,
       B_qPQO_loc(iq_gamma, nda::ellipsis{}) = ComplexType(0.0, 0.0);
     }
 
-    // FT B from q-space to R-space (per-rank on local block).
+    // FT B from IBZ-q-space to R-space (per-rank on local block).
     memory::buffered_array<MEM, ComplexType, 4> B_RPQO_loc(
         std::array<long,4>{NR, Naux_loc_P, Naux_loc_Q, N_O});
     {
       auto B_q_2D = nda::reshape(B_qPQO_loc,
-                                 std::array<long,2>{Nq, B_loc * N_O});
+                                 std::array<long,2>{Nq_ibz, B_loc * N_O});
       auto B_R_2D = nda::reshape(B_RPQO_loc,
                                  std::array<long,2>{NR, B_loc * N_O});
       if constexpr (MEM == HOST_MEMORY) {

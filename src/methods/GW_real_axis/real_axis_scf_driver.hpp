@@ -132,12 +132,15 @@ inline scgw_result real_axis_scf_loop(real_axis_mb_state_t& state,
   const long nbnd = H_MF.shape()[2];
   const long N_w  = grid_in.N_w();
 
+  // Orbital-basis arrays (A, Sigma, etc.) live at IBZ k. Star expansion to
+  // FBZ happens inside BZ-pair kernels via X(FBZ k). H_MF is IBZ-shaped.
   utils::check(static_cast<long>(MF.nspin()) == ns and
-               static_cast<long>(MF.nkpts()) == Nk and
+               static_cast<long>(MF.nkpts_ibz()) == Nk and
                static_cast<long>(MF.nbnd()) == nbnd,
-               "real_axis_scf_loop: H_MF shape disagrees with MF accessors");
+               "real_axis_scf_loop: H_MF shape disagrees with MF accessors "
+               "(expected IBZ k)");
   utils::check(k_weights.shape()[0] == Nk,
-               "real_axis_scf_loop: k_weights size mismatch");
+               "real_axis_scf_loop: k_weights size mismatch (must be IBZ)");
 
   // ---- Initial A: Lorentzian per H_MF diagonal if state.A_wskij is empty.
   bool A_is_zero = true;

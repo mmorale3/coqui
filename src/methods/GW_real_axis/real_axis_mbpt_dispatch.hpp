@@ -238,20 +238,19 @@ inline void run_real_axis_gw(THC_t& thc, ptree const& pt)
     }
   }
 
-  // ---- Build H_MF = diag(eps_KS) ----------------------------------------
-  const long ns   = mf->nspin();
-  const long Nk   = mf->nkpts();
-  const long nbnd = mf->nbnd();
+  // ---- Build H_MF = diag(eps_KS) at IBZ k. Star expansion to FBZ k
+  //      happens inside the BZ-pair kernels via X(FBZ k); orbital-basis
+  //      arrays live at IBZ k (matches imag-axis pattern).
+  const long ns      = mf->nspin();
+  const long Nk_ibz  = mf->nkpts_ibz();
+  const long nbnd    = mf->nbnd();
   auto eigval = mf->eigval();
-  auto kp2ibz = mf->kp_to_ibz();
-  nda::array<cval_t, 4> H_MF(ns, Nk, nbnd, nbnd);
+  nda::array<cval_t, 4> H_MF(ns, Nk_ibz, nbnd, nbnd);
   H_MF = cval_t(0.0, 0.0);
   for (long s = 0; s < ns; ++s)
-    for (long k = 0; k < Nk; ++k) {
-      const long kibz = kp2ibz(k);
+    for (long k = 0; k < Nk_ibz; ++k)
       for (long n = 0; n < nbnd; ++n)
-        H_MF(s, k, n, n) = cval_t(eigval(s, kibz, n), 0.0);
-    }
+        H_MF(s, k, n, n) = cval_t(eigval(s, k, n), 0.0);
 
   // ---- Solver bundle + Dyson + mixing config ----------------------------
   real_axis_hf_t          hf(&grid, hf_div_t);
@@ -274,9 +273,11 @@ inline void run_real_axis_gw(THC_t& thc, ptree const& pt)
   cfg.diis_window = diis_win;
 
   // ---- BZ weights, electron count ---------------------------------------
-  nda::array<double, 1> k_weights(Nk);
-  for (long ik = 0; ik < Nk; ++ik)
-    k_weights(ik) = 1.0 / static_cast<double>(Nk);
+  // k_weight is IBZ-sized with multiplicity-weighted entries summing to 1.
+  nda::array<double, 1> k_weights(Nk_ibz);
+  auto kw = mf->k_weight();
+  for (long ik = 0; ik < Nk_ibz; ++ik)
+    k_weights(ik) = kw(ik);
   const double N_elec = static_cast<double>(mf->nelec());
 
   // ---- Run SCF ----------------------------------------------------------
@@ -453,10 +454,13 @@ inline void run_real_axis_qpgw(THC_t& thc, ptree const& pt)
   }
 
   // ---- Build sH_0, sS, sFock from MF -------------------------------------
+  // Real-axis stack stores orbital-basis arrays at IBZ k (matches imag-axis
+  // pattern in scf_driver.cpp). Star expansion to the full BZ happens
+  // inside the BZ-pair kernels via X(FBZ k) + MF.symmetry_rotation, never
+  // at the storage layer.
   const long ns      = mf->nspin();
-  const long Nk      = mf->nkpts();
-  const long nbnd    = mf->nbnd();
   const long Nk_ibz  = mf->nkpts_ibz();
+  const long nbnd    = mf->nbnd();
 
   auto sH0_ibz = math::shm::make_shared_array<nda::array_view<ComplexType, 4>>(
       *mpi, std::array<long, 4>{ns, Nk_ibz, nbnd, nbnd});
@@ -470,33 +474,27 @@ inline void run_real_axis_qpgw(THC_t& thc, ptree const& pt)
   hamilt::set_fock(*mf, psp.get(), sF_ibz, /*exclude_H0=*/false);
   mpi->comm.barrier();
 
-  // Replicate IBZ -> FBZ (mirrors the QP-SCF test fixture pattern).
-  auto kp2ibz = mf->kp_to_ibz();
-  nda::array<cval_t, 4> H_0_skij (std::array<long, 4>{ns, Nk, nbnd, nbnd});
-  nda::array<cval_t, 4> S_skij   (std::array<long, 4>{ns, Nk, nbnd, nbnd});
-  nda::array<cval_t, 4> Fock_skij(std::array<long, 4>{ns, Nk, nbnd, nbnd});
-  H_0_skij  = cval_t(0.0, 0.0);
-  S_skij    = cval_t(0.0, 0.0);
-  Fock_skij = cval_t(0.0, 0.0);
+  // Pass IBZ-shaped one-body data to the QP-SCF loop.
+  nda::array<cval_t, 4> H_0_skij (std::array<long, 4>{ns, Nk_ibz, nbnd, nbnd});
+  nda::array<cval_t, 4> S_skij   (std::array<long, 4>{ns, Nk_ibz, nbnd, nbnd});
+  nda::array<cval_t, 4> Fock_skij(std::array<long, 4>{ns, Nk_ibz, nbnd, nbnd});
   auto H0L = sH0_ibz.local();
   auto SL  = sS_ibz.local();
   auto FL  = sF_ibz.local();
   for (long s = 0; s < ns; ++s)
-    for (long k = 0; k < Nk; ++k) {
-      const long kibz = kp2ibz(k);
+    for (long k = 0; k < Nk_ibz; ++k)
       for (long i = 0; i < nbnd; ++i)
         for (long j = 0; j < nbnd; ++j) {
-          H_0_skij (s, k, i, j) = H0L(s, kibz, i, j);
-          S_skij   (s, k, i, j) = SL (s, kibz, i, j);
-          Fock_skij(s, k, i, j) = FL (s, kibz, i, j);
+          H_0_skij (s, k, i, j) = H0L(s, k, i, j);
+          S_skij   (s, k, i, j) = SL (s, k, i, j);
+          Fock_skij(s, k, i, j) = FL (s, k, i, j);
         }
-    }
 
   // Seed state.H_eff = KS Fock so iter-1 diagonalization reproduces KS
   // orbitals (the imag-axis qp_scf_loop convention; required for evGW
   // to be a clean G0W0-QP starting point).
   using sA4 = real_axis_mb_state_t::sArray_t<nda::array_view<ComplexType, 4>>;
-  state.H_eff_skij.emplace(*mpi, std::array<long, 4>{ns, Nk, nbnd, nbnd});
+  state.H_eff_skij.emplace(*mpi, std::array<long, 4>{ns, Nk_ibz, nbnd, nbnd});
   if (state.H_eff_skij->node_comm()->root())
     state.H_eff_skij->local() = Fock_skij;
   state.H_eff_skij->node_sync();
@@ -528,9 +526,10 @@ inline void run_real_axis_qpgw(THC_t& thc, ptree const& pt)
   cfg.tol_dDm     = tol_dDm_p;
 
   // ---- BZ weights, electron count ---------------------------------------
-  nda::array<double, 1> k_weights(Nk);
+  // k_weight is IBZ-sized with multiplicity-weighted entries that sum to 1.
+  nda::array<double, 1> k_weights(Nk_ibz);
   auto kw = mf->k_weight();
-  for (long k = 0; k < Nk; ++k) k_weights(k) = kw(k);
+  for (long k = 0; k < Nk_ibz; ++k) k_weights(k) = kw(k);
   const double N_elec    = mf->nelec();
   const long   ns_factor = (ns == 1 and mf->npol() == 1) ? 2 : 1;
 
@@ -557,7 +556,7 @@ inline void run_real_axis_qpgw(THC_t& thc, ptree const& pt)
       std::ofstream of("E_QP.dat");
       of << "# s  k  HOMO  LUMO\n";
       for (long s = 0; s < ns; ++s) {
-        for (long k = 0; k < Nk; ++k) {
+        for (long k = 0; k < Nk_ibz; ++k) {
           const double e_h = E(s, k, n_homo).real();
           const double e_l = E(s, k, n_lumo).real();
           of << s << "  " << k << "  " << e_h << "  " << e_l << "\n";
