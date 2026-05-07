@@ -148,16 +148,11 @@ static void run_dDeeq_H_matches_deltaC_test(std::string fixture_name,
 
         // -- Path 2: closed-form ΔC × becsum. -----------------------------
         //    deltaC has shape (nh, nh, nh, nh); contract over (K, L).
-        //    Convention note (cross-checked against QE 7.4.1
-        //    `paw_exx.f90::PAW_fock_onecenter` line 388 and
-        //    `paw_onecenter.f90::PAW_h_potential` line 1204):
-        //    pw2coqui exports `ke%k` = paw_fockrnl raw, which equals
-        //    `e2 × kexx`, where kexx itself is built from V_LM = e2 ×
-        //    (proper natural Hartree V) — so the stored deltaC carries
-        //    an `e2² = 4` multiplier on top of the Ha-natural Coulomb
-        //    integral. To compare with `compute_paw_hartree_atom` (which
-        //    works in proper Ha throughout), divide by 4.
-        constexpr double e2_sq = 4.0;
+        //    pw2coqui's PAW_init_fock_kernel-export divides by e2² before
+        //    writing to the h5, so on-disk deltaC is in proper Ha and
+        //    contracts directly without any unit factor. (Pre-Step-1
+        //    fixtures stored 4×Ha; that audit and fix landed in pw2coqui
+        //    on the `paw` branch.)
         nda::array<double,2> dD_dC =
             nda::array<double,2>::zeros({nh_a, nh_a});
         for (long I = 0; I < nh_a; ++I)
@@ -166,7 +161,7 @@ static void run_dDeeq_H_matches_deltaC_test(std::string fixture_name,
             for (long K = 0; K < nh_a; ++K)
             for (long L = 0; L < nh_a; ++L)
                 acc += sp.deltaC(I, J, K, L) * bs_a(K, L);
-            dD_dC(I, J) = acc / e2_sq;
+            dD_dC(I, J) = acc;
         }
 
         // Element-wise check + accumulate diagnostics.

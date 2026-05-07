@@ -827,6 +827,7 @@ SUBROUTINE write_species(h5_f)
 ! Schema reference: notes/paw_implementation_plan.md
 !=----------------------------------------------------------------------------=!
   USE kinds, ONLY : DP
+  USE constants, ONLY : e2
   USE qeh5_base_module, ONLY : qeh5_open_group, qeh5_close, qeh5_add_attribute
   USE ions_base, ONLY : ntyp => nsp
   USE uspp_param, ONLY : nh, upf
@@ -843,6 +844,7 @@ SUBROUTINE write_species(h5_f)
   character(len=8) :: nt_str
   integer :: nt, mesh, ncore
   logical :: any_paw
+  real(DP), allocatable :: deltaC_Ha(:,:,:,:)
   !
   if (.not.ionode) return
   !
@@ -972,11 +974,23 @@ SUBROUTINE write_species(h5_f)
       !
       call qeh5_close(h5_paw)
       !
-      ! One-center Coulomb residual ΔC = K_AE - K_PS (raw ke%k from QE)
-      ! Used as the local-channel correction K_a in the PAW-ISDF-THC kernel
-      ! (notes/paw_isdf_thc_prb.tex Eq. paw-local-correction).
+      ! One-center Coulomb residual ΔC = K_AE - K_PS, in atomic Hartree.
+      !
+      ! QE's `paw_fockrnl = e2 * kexx` (paw_exx.f90 line 388) where `kexx`
+      ! itself is already an `e2`-scaled energy because `PAW_h_potential`
+      ! pre-multiplies its Hartree kernel by `e2*fpi/(2L+1)` (paw_onecenter.f90
+      ! line 1204). Net: `ke%k` carries an `e2^2 = 4` factor on top of the
+      ! Ha-natural Coulomb integral. Divide by `e2*e2` here so consumers
+      ! (CoQui ISDF/THC + augmented Hartree machinery, the PAW deeq-SCF
+      ! pipeline) see the kernel in proper Ha and can combine it with other
+      ! Ha-quoted quantities without an implicit-units footgun.
+      ! See notes/project_paw_deltaC_e2_squared.md for the audit.
       call qeh5_open_group(h5_nt, "Onecenter", h5_oc)
-      call h5_write_tensor4_r(h5_oc, ke(nt)%k, "deltaC")
+      ALLOCATE(deltaC_Ha(SIZE(ke(nt)%k, 1), SIZE(ke(nt)%k, 2), &
+                        SIZE(ke(nt)%k, 3), SIZE(ke(nt)%k, 4)))
+      deltaC_Ha = ke(nt)%k / (e2*e2)
+      call h5_write_tensor4_r(h5_oc, deltaC_Ha, "deltaC")
+      DEALLOCATE(deltaC_Ha)
       call qeh5_close(h5_oc)
     endif
     !
