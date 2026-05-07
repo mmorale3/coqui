@@ -169,6 +169,18 @@ inline paw_oc_hartree_result compute_paw_hartree_atom(
     long Lp1 = sp.qfuncl.extent(0);  // 2*lmax_aug + 1, channels of qfuncl
     long llx = aatab.llx;            // (2*lli - 1)²
 
+    // QE-canonical truncation index: the one-center pair density (and ΔC
+    // contraction) is supported in [0, kkbeta). Outside, the AE and PS
+    // partial waves match by PAW construction, so the integrand
+    //   V_AE × pf − V_PS × (ptf + qf)  =  pf × (V_AE − V_PS)
+    // vanishes analytically. Numerically the cumulative-trap u-form
+    // Poisson at L ≥ 3 amplifies the residual O(eps) cancellation noise
+    // from the [kkbeta, mesh) tail by r^L (observed: 5×10⁵ Ha on Si d-d
+    // L=4 pairs without truncation). Zeroing rho/integrand past kkbeta
+    // matches QE's `simpson(kkbeta, ...)` convention used in its own PAW
+    // one-center code paths and is the lowest-disruption robust fix.
+    long kkbeta = (sp.kkbeta > 0 && sp.kkbeta <= mesh) ? sp.kkbeta : mesh;
+
     nda::array<double, 1> rho_AE(mesh), rho_PS(mesh);
     nda::array<double, 1> V_AE(mesh),   V_PS(mesh);
     nda::array<double, 1> integrand(mesh);
@@ -190,7 +202,7 @@ inline paw_oc_hartree_result compute_paw_hartree_atom(
     for (long lp = 0; lp < llx; ++lp) {
         int L = (int)std::floor(std::sqrt((double)lp + 1e-9));
 
-        // Build ρ_AE(r), ρ_PS(r) for this lp.
+        // Build ρ_AE(r), ρ_PS(r) for this lp on [0, kkbeta); zero past.
         rho_AE() = 0.0;
         rho_PS() = 0.0;
         for (int I = 0; I < nh; ++I)
@@ -200,7 +212,7 @@ inline paw_oc_hartree_result compute_paw_hartree_atom(
             if (cg == 0.0) continue;
             double w = becsum(I, J) * cg;
             if (w == 0.0) continue;
-            for (long ir = 0; ir < mesh; ++ir) {
+            for (long ir = 0; ir < kkbeta; ++ir) {
                 double pf  = sp.aewfc(p.bI, ir) * sp.aewfc(p.bJ, ir);
                 double ptf = sp.pswfc(p.bI, ir) * sp.pswfc(p.bJ, ir);
                 double qf  = (L < Lp1) ? sp.qfuncl(L, p.ij, ir) : 0.0;
@@ -213,7 +225,7 @@ inline paw_oc_hartree_result compute_paw_hartree_atom(
             // pfunc/ptfunc/qfuncl above are in QE's u-form (already r²-
             // weighted: pf = u·u = r²·R²). Multiply core by r² so the
             // u-form Hartree solver below sees a consistent input.
-            for (long ir = 0; ir < mesh; ++ir) {
+            for (long ir = 0; ir < kkbeta; ++ir) {
                 double r2 = sp.r(ir) * sp.r(ir);
                 rho_AE(ir) += sqrt4pi * rho_core_AE(ir) * r2;
                 rho_PS(ir) += sqrt4pi * rho_core_PS(ir) * r2;
@@ -225,13 +237,17 @@ inline paw_oc_hartree_result compute_paw_hartree_atom(
         radial_hartree_multipole_u_form(rho_AE, sp.r, sp.rab, L, V_AE);
         radial_hartree_multipole_u_form(rho_PS, sp.r, sp.rab, L, V_PS);
 
-        // Integrate (V_AE - V_PS) × pair_density × ap (with q-aug on PS side).
+        // Integrate (V_AE - V_PS) × pair_density × ap (with q-aug on PS side)
+        // on [0, kkbeta). Outside, the integrand is analytically zero by PAW
+        // boundary matching; we zero-fill explicitly to avoid noise leakage
+        // when V_AE − V_PS hasn't fully cancelled at finite mesh resolution.
         for (int I = 0; I < nh; ++I)
         for (int J = 0; J < nh; ++J) {
             auto const& p = pinfo[(size_t)I * nh + J];
             double cg = aatab.ap(lp, p.ivl, p.jvl);
             if (cg == 0.0) continue;
-            for (long ir = 0; ir < mesh; ++ir) {
+            integrand() = 0.0;
+            for (long ir = 0; ir < kkbeta; ++ir) {
                 double pf  = sp.aewfc(p.bI, ir) * sp.aewfc(p.bJ, ir);
                 double ptf = sp.pswfc(p.bI, ir) * sp.pswfc(p.bJ, ir);
                 double qf  = (L < Lp1) ? sp.qfuncl(L, p.ij, ir) : 0.0;

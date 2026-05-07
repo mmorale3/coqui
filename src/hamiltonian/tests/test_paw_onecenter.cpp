@@ -54,12 +54,31 @@
 #include "hamiltonian/paw/paw_aug_q_eval.hpp"   // aainit_tables_build
 #include "hamiltonian/paw/paw_onecenter.hpp"    // compute_paw_hartree_atom
 
+// Forward decl of the per-fixture body so we can drive both LiH and Si
+// PAW fixtures from the same TEST_CASE structure.
+static void run_dDeeq_H_matches_deltaC_test(std::string fixture_name,
+                                            double tol);
+
 TEST_CASE("paw_onecenter_dDeeq_H_matches_deltaC_contraction",
           "[hamilt][paw][onecenter]")
 {
+    SECTION("qe_lih222_paw") {
+        run_dDeeq_H_matches_deltaC_test("qe_lih222_paw", 1e-5);
+    }
+    SECTION("qe_si222_paw") {
+        // Si has d-projectors → exercises L up to 4 channels in the
+        // u-form Poisson, which is where the numerical instability
+        // hunt lives.
+        run_dDeeq_H_matches_deltaC_test("qe_si222_paw", 1e-4);
+    }
+}
+
+static void run_dDeeq_H_matches_deltaC_test(std::string fixture_name,
+                                            double tol)
+{
     using nda::range;
     auto& mpi = utils::make_unit_test_mpi_context();
-    auto qe_h5 = mf::default_MF(mpi, "qe_lih222_paw", mf::h5_input_type);
+    auto qe_h5 = mf::default_MF(mpi, fixture_name, mf::h5_input_type);
     auto& mfobj = qe_h5;
 
     long nspin   = mfobj.nspin();
@@ -178,15 +197,14 @@ TEST_CASE("paw_onecenter_dDeeq_H_matches_deltaC_contraction",
 
     REQUIRE(any_paw_atom);
 
-    // Tolerance: PAW_init_fock_kernel and compute_paw_hartree_atom share
-    // the radial mesh and LM decomposition; the only divergence is the
-    // cumulative-trap vs Simpson 4π·V(r)·ρ(r)·dr quadrature. On the LiH
-    // mesh that's well below 1e-5 Ha; tighten once we audit on more
-    // species. Surface the absolute number for diagnostics either way.
-    double tol = 1e-5;
+    // Tolerance is fixture-specific (param). PAW_init_fock_kernel and
+    // compute_paw_hartree_atom share the radial mesh and LM decomposition;
+    // the divergence is the cumulative-trap vs Simpson quadrature, plus
+    // any L-dependent numerical sensitivity that grows with lmax_aug.
     app_log(1,
-        "[paw onecenter matrix-element check] max |ΔD_H_radial − ΔD_H_ΔC| = "
-        "{:.3e} Ha over {} (I,J) pairs (max |element| = {:.3e}, tol = {:.1e})",
-        max_abs_diff, total_pairs, max_abs_val, tol);
+        "[paw onecenter matrix-element check / {}] "
+        "max |ΔD_H_radial − ΔD_H_ΔC| = {:.3e} Ha over {} (I,J) pairs "
+        "(max |element| = {:.3e}, tol = {:.1e})",
+        fixture_name, max_abs_diff, total_pairs, max_abs_val, tol);
     CHECK(max_abs_diff < tol);
 }

@@ -197,19 +197,24 @@ inline void radial_hartree_multipole_u_form(
     }
 
     // I_out(r_i) = ∫_{r_i}^∞ rho_u(r') r'^{-(L+1)} dr'
-    // For r' = 0 with L = 0: rho_u(0) · 1/r' = u²(0)/r' = 0 (since u(0) = 0
-    // by regularity). For L > 0: r'^{-(L+1)} diverges but rho_u ~ r'^{L+2}
-    // for the leading term of u² near 0, so the integrand is regular. We
-    // skip evaluating at r=0 explicitly to avoid the divide-by-zero, since
-    // the contribution there is negligible (regular near 0).
+    // Physically the integrand is regular at r=0 because rho_u ~ r^{2+L_min}
+    // for the leading term of any pair density, so rho_u·r^{-(L+1)} ~ r^{1+L_min-L}
+    // → 0 as r → 0. Numerically the QE log mesh starts at r(0) ≈ 1e-6 with
+    // tiny but nonzero rho_u(0); the factor r(0)^{-(L+1)} grows as 1e6(L+1)
+    // and amplifies floating-point noise into the integral (observed:
+    // -4e12 Ha blowup on Si PAW for L=4 channels). We therefore zero the
+    // integrand at the first mesh point — the missing contribution from
+    // [0, r(1)] is bounded by r(1)·max|rho_u·r^{-L}| and is negligible
+    // for any density that respects the multipole regularity condition.
     nda::array<double, 1> I_out(n);
     I_out(n - 1) = 0.0;
+    long i_start_out = (n > 1) ? 1 : 0;   // skip r(0) tip
     for (long i = n - 2; i >= 0; --i) {
         double r_ip1 = r(i + 1), r_i = r(i);
-        double pip1 = (r_ip1 > 0.0) ? rho_u(i + 1) * std::pow(r_ip1, -L - 1)
-                                    : 0.0;
-        double pi   = (r_i   > 0.0) ? rho_u(i)     * std::pow(r_i,   -L - 1)
-                                    : 0.0;
+        double pip1 = (r_ip1 > 0.0 && (i + 1) >= i_start_out)
+                      ? rho_u(i + 1) * std::pow(r_ip1, -L - 1) : 0.0;
+        double pi   = (r_i   > 0.0 && i >= i_start_out)
+                      ? rho_u(i)     * std::pow(r_i,   -L - 1) : 0.0;
         I_out(i) = I_out(i + 1) + 0.5 * (pip1 * rab(i + 1) + pi * rab(i));
     }
 
