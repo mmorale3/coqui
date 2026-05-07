@@ -342,33 +342,6 @@ TEST_CASE("thc_intpts_pyscf", "[methods]")
   auto [ri,Xa,Xb] = thc.interpolating_points<HOST_MEMORY>(0,npts);
 }
 
-TEST_CASE("thc_test", "[methods]")
-{
-  auto& mpi = utils::make_unit_test_mpi_context();
-
-  auto mf = mf::default_MF(mpi, mf::qe_source);
-  methods::thc thc(std::addressof(mf), *mpi, make_thc_ptree(mf.ecutrho()*0.3,8,1024,1e-5));
-
-  { // reduced cutoff
-#if defined(ENABLE_DEVICE)
-//    thc.reset_timers();
-//    auto [ri_u,Xau,Xbu] = thc.interpolating_points<UNIFIED_MEMORY>();
-//    auto Muv_u = thc.evaluate<UNIFIED_MEMORY>(ri_u,Xau,Xbu);
-//    thc.print_timers();
-
-    thc.reset_timers();
-    auto [ri_d,Xad,Xbd] = thc.interpolating_points<DEVICE_MEMORY>();
-    auto Muv_d = thc.evaluate<DEVICE_MEMORY>(ri_d,Xad,Xbd);
-    thc.print_timers();
-#else
-    thc.reset_timers();
-    auto [ri,Xa,Xb] = thc.interpolating_points<HOST_MEMORY>();
-    auto Muv_h = thc.evaluate<HOST_MEMORY>(ri,Xa,Xb);
-    thc.print_timers();
-#endif
-  }
-}
-
 TEST_CASE("thc", "[methods]")
 {
   auto& mpi = utils::make_unit_test_mpi_context();
@@ -670,74 +643,6 @@ TEST_CASE("thc_ranges", "[methods]")
       app_log(2, "q:{}, ME:{}, Max:{}",q,e/(double(nocc*nocc*nbnd*nbnd*nkpts*nkpts)),mx);
     }
   }
-}
-
-TEST_CASE("thc_svd", "[methods]")
-{  // no need for device test
-  decltype(nda::range::all) all;
-  auto& mpi = utils::make_unit_test_mpi_context();
-
-  auto mf = mf::default_MF(mpi, mf::qe_source);
-
-  nda::array<int,3> Np(20,mf.nqpts_ibz(),3);
-  nda::array<double,2> Vp(20,1300);
-  Np()=0;
-  Vp()=0.0;
-  long Np0;
-
-  for(int i=10; i>=1; i-=3)
-  { 
-    double x(i/10.0);
-    app_log(0," Reducing cutoff by x:{}",x);
-    methods::thc thc(std::addressof(mf), *mpi, make_thc_ptree(x*mf.ecutrho(),8,1024,1e-4));
-    auto [ri,Xa,Xb] = thc.interpolating_points<HOST_MEMORY>();
-    long M = ri.extent(0); 
-    Np(i,all,all) = M;
-    if(i==10) Np0 = M;
-    app_log(0,"  - Np: {}",M); 
-    auto L = thc.evaluate<HOST_MEMORY>(ri,Xa,Xb);
-    auto const& V = std::get<0>(L);
-    nda::array<ComplexType, 3> X;
-    if( mpi->comm.root() ) X = nda::array<ComplexType, 3>(V.global_shape());
-    math::nda::gather(0,V,std::addressof(X));
-    if( mpi->comm.root() ) {
-      nda::matrix<ComplexType,nda::F_layout> U(M,M), Vt(M,M);
-      nda::array<double,1> S(M); 
-      for( auto iq : nda::range(X.extent(0)) ) { 
-        utils::check(nda::lapack::gesvd(nda::transpose(X(iq,all,all)),S,U,Vt)==0, "SVD error.");
-        if(iq==0)
-          Vp(i,all) = S(nda::range(1300));
-        for(int j=0; j<M; ++j) 
-          if(std::abs(S(j)) < 1e-8) {
-            Np(i,iq,0) = j;
-            break;
-          }
-        for(int j=0; j<M; ++j) 
-          if(std::abs(S(j)) < 1e-7) {
-            Np(i,iq,1) = j;
-            break;
-          }
-        for(int j=0; j<M; ++j) 
-          if(std::abs(S(j)) < 1e-6) {
-            Np(i,iq,2) = j;
-            break;
-          }
-      } 
-    } 
-  }
-  app_log(0," Np0: {}",Np0);
-  for(int i=10; i>=1; i-=3)
-  { 
-    double x(i/10.0);
-    app_log(0, "  x: {}",x);
-    for( auto iq : nda::range(Np.extent(1)) ) 
-      app_log(0,"    - iq: {}, Np (1e-6): {}, Np (1e-5): {}, Np (1e-4): {}",
-              iq,Np(i,iq,0),Np(i,iq,1),Np(i,iq,2));
-  }
-  if(mpi->comm.root())
-    for(int i=10; i>=1; i-=3)
-      std::cout<<" Vp: " <<i <<" " <<Vp(i,all) <<std::endl <<std::endl;
-
 }
 
 TEST_CASE("thc_nnr_blk", "[methods]")

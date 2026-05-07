@@ -432,6 +432,7 @@ inline void pseudopot::compute_deeq_scf(nij_t const& nij)
 
     // 4. On the node-root: copy the static baseline into Dnn_atom and add
     //    the per-atom Hartree contribution from `compute_paw_hartree_atom`.
+    // MAM: Parallelize over atoms and reduce at the end!
     if (mpi->node_comm.root()) {
         auto Dloc_at = Dnn_atom.local();
         auto Dloc_st = Dnn_atom_static_paw.local();
