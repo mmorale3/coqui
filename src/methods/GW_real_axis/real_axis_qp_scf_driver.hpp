@@ -37,6 +37,7 @@
 #include "methods/GW_real_axis/real_axis_scr_coulomb_t.h"
 #include "methods/GW_real_axis/real_axis_gw_t.h"
 #include "methods/HF/hf_t.h"
+#include "methods/tools/chkpt_utils.h"
 
 namespace methods {
 namespace real_axis {
@@ -503,7 +504,9 @@ real_axis_qp_scf_loop(real_axis_mb_state_t                          & state,
                       qp_scgw_config                          const& cfg,
                       nda::array<double, 1>                   const& k_weights,
                       double                                         N_elec,
-                      long                                           ns_factor)
+                      long                                           ns_factor,
+                      long                                           init_it = 0,
+                      bool                                           write_chkpt = false)
 {
   // State arrays + H_eff are sArrays (host node-shared). The underlying
   // solver classes have host bodies; MEM is a template marker that lets
@@ -817,6 +820,15 @@ real_axis_qp_scf_loop(real_axis_mb_state_t                          & state,
       app_log(1, "  iter {:3}  ||dH_eff||_F = {:.4e}  max|de| = {:.4e}  "
                   "||dDm||_F = {:.4e}  mu = {:.6f}",
               it + 1, diff, max_de, dDm_fn, mu_cur);
+    }
+    // Per-iter checkpoint: write {Dm, H_eff, MO, E, mu} to the SCF h5 file.
+    // Iter label is offset by init_it (file-derived for restart). Pattern
+    // matches imag-axis qp_scf_loop (scf_driver.cpp:380).
+    if (write_chkpt) {
+      const long it_label = init_it + it + 1;
+      chkpt::dump_scf(comm, it_label, state.Dm_skij.value(),
+                      state.H_eff_skij.value(), state.MO_skia.value(),
+                      state.E_ska.value(), mu_cur, state.coqui_prefix);
     }
     // Stopping: legacy ||dH_eff|| < conv_tol  OR  rotation-invariant
     // (max|Δε| < tol_max_de  AND  ||ΔDm|| < tol_dDm). The latter

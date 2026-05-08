@@ -75,6 +75,55 @@ void write_metadata(communicator_t &comm, const mf::MF &mf, const imag_axes_ft::
   comm.barrier();
 }
 
+template<typename communicator_t>
+void write_metadata_real_axis(communicator_t &comm, const mf::MF &mf,
+                              const real_axis::real_freq_grid_t &grid,
+                              const sArray_t<Array_view_4D_t> &sH0_skij,
+                              const sArray_t<Array_view_4D_t> &sS_skij,
+                              std::string output) {
+  if (comm.root()) {
+    std::string filename = output + ".mbpt.h5";
+    h5::file file(filename, 'w');
+    h5::group grp(file);
+
+    auto sys_grp = grp.create_group("system");
+    h5::h5_write(sys_grp, "number_of_spins", mf.nspin());
+    h5::h5_write(sys_grp, "number_of_kpoints", mf.nkpts());
+    h5::h5_write(sys_grp, "number_of_kpoints_ibz", mf.nkpts_ibz());
+    h5::h5_write(sys_grp, "number_of_orbitals", mf.nbnd());
+    h5::h5_write(sys_grp, "volume", mf.volume());
+    h5::h5_write(sys_grp, "madelung", mf.madelung());
+    nda::h5_write(sys_grp, "kp_grid", mf.kp_grid(), false);
+    nda::h5_write(sys_grp, "kpoints", mf.kpts(), false);
+    nda::h5_write(sys_grp, "kpoints_crys", mf.kpts_crystal(), false);
+    nda::h5_write(sys_grp, "k_weight", mf.k_weight(), false);
+    nda::h5_write(sys_grp, "k_trev", mf.kp_trev(), false);
+    nda::h5_write(sys_grp, "kp_to_ibz", mf.kp_to_ibz(), false);
+    nda::h5_write(sys_grp, "qpoints", mf.Qpts(), false);
+    nda::h5_write(sys_grp, "qk_to_k2", mf.qk_to_k2(), false);
+    nda::h5_write(sys_grp, "qminus", mf.qminus(), false);
+    auto sH0_loc = sH0_skij.local();
+    nda::h5_write(sys_grp, "H0_skij", sH0_loc, false);
+    auto sSloc = sS_skij.local();
+    nda::h5_write(sys_grp, "S_skij", sSloc, false);
+
+    auto mf_grp = grp.create_group("mean_field");
+    nda::h5_write(mf_grp, "eigvals", mf.eigval(), false);
+
+    auto rfg_grp = grp.create_group("real_frequency_grid");
+    h5::h5_write(rfg_grp, "beta", grid.beta());
+    h5::h5_write(rfg_grp, "mu_chem", grid.mu_chem());
+    h5::h5_write(rfg_grp, "N_w", grid.N_w());
+    h5::h5_write(rfg_grp, "N_Omega", grid.N_Omega());
+    h5::h5_write(rfg_grp, "N_t", grid.N_t());
+    h5::h5_write(rfg_grp, "T_window", grid.T_window());
+    nda::h5_write(rfg_grp, "omega", grid.w(), false);
+    nda::h5_write(rfg_grp, "Omega", grid.Omega(), false);
+    nda::h5_write(rfg_grp, "t", grid.t(), false);
+  }
+  comm.barrier();
+}
+
 template<typename communicator_t, typename X_t, typename Xt_t>
 void dump_scf(communicator_t &comm, long iter,
               const X_t &Dm, const Xt_t &G,
@@ -476,6 +525,11 @@ bool read_pi_local(shared_array_t &sPi_imp, shared_array_t &sPi_dc,
 
 template void write_metadata(
     mpi3::communicator&, const mf::MF&, const imag_axes_ft::IAFT&,
+    const sArray_t<Array_view_4D_t>&, const sArray_t<Array_view_4D_t>&,
+    std::string);
+
+template void write_metadata_real_axis(
+    mpi3::communicator&, const mf::MF&, const real_axis::real_freq_grid_t&,
     const sArray_t<Array_view_4D_t>&, const sArray_t<Array_view_4D_t>&,
     std::string);
 

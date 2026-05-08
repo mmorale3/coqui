@@ -384,6 +384,15 @@ inline void run_real_axis_qpgw(THC_t& thc, ptree const& pt)
   const auto w_dense_p   = io::get_value_with_default<double>(pt, "w_dense", 0.0);
   const auto N_dense_p   = io::get_value_with_default<long>  (pt, "N_dense", 0);
   io::tolower(grid_kind_s);
+  // Checkpointing options. write_chkpt: enable per-iter h5 dump
+  // ({prefix}.mbpt.h5). restart: pick up from existing h5 final_iter rather
+  // than starting fresh (and don't overwrite metadata). Both default off so
+  // legacy invocations are unchanged. Outer-SCF wrappers reusing a prefix
+  // MUST set restart=true on calls 2+ to avoid wiping the file.
+  const auto write_chkpt_p = io::get_value_with_default<bool>(pt, "write_chkpt", false);
+  const auto restart_p     = io::get_value_with_default<bool>(pt, "restart", false);
+  const auto output_p      = io::get_value_with_default<std::string>(pt, "output",
+                              "coqui_real_axis");
 
   utils::check(mode_s == "qsgw" or mode_s == "evgw",
                "real_axis_qpgw: mode must be \"qsgw\" or \"evgw\" (got \"{}\")", mode_s);
@@ -422,6 +431,7 @@ inline void run_real_axis_qpgw(THC_t& thc, ptree const& pt)
 
   real_axis_mb_state_t state(grid);
   state.mpi = mpi;
+  state.coqui_prefix = output_p;
 
   if (verbose and mpi->comm.root()) {
     app_log(1, "");
@@ -493,11 +503,22 @@ inline void run_real_axis_qpgw(THC_t& thc, ptree const& pt)
   // Seed state.H_eff = KS Fock so iter-1 diagonalization reproduces KS
   // orbitals (the imag-axis qp_scf_loop convention; required for evGW
   // to be a clean G0W0-QP starting point).
+  // Restart path: read final_iter + Heff from existing h5 instead.
   using sA4 = real_axis_mb_state_t::sArray_t<nda::array_view<ComplexType, 4>>;
   state.H_eff_skij.emplace(*mpi, std::array<long, 4>{ns, Nk_ibz, nbnd, nbnd});
-  if (state.H_eff_skij->node_comm()->root())
-    state.H_eff_skij->local() = Fock_skij;
-  state.H_eff_skij->node_sync();
+  long init_it = 0;
+  double mu_init = 0.0;
+  if (write_chkpt_p and restart_p) {
+    init_it = chkpt::read_qpscf(mpi->node_comm, state.H_eff_skij.value(),
+                                 mu_init, state.coqui_prefix);
+    if (verbose and mpi->comm.root())
+      app_log(1, "real_axis_qpgw: restart from {} at iter {}",
+              state.coqui_prefix + ".mbpt.h5", init_it);
+  } else {
+    if (state.H_eff_skij->node_comm()->root())
+      state.H_eff_skij->local() = Fock_skij;
+    state.H_eff_skij->node_sync();
+  }
 
   // ---- Solver bundle -----------------------------------------------------
   methods::solvers::hf_t        hf(hf_div_t);
@@ -534,9 +555,47 @@ inline void run_real_axis_qpgw(THC_t& thc, ptree const& pt)
   const long   ns_factor = (ns == 1 and mf->npol() == 1) ? 2 : 1;
 
   const qp_mode mode = (mode_s == "qsgw") ? qp_mode::qsgw : qp_mode::evgw;
+
+  // Pre-loop checkpoint: write metadata + iter-0 dump (initial MO/E/Dm
+  // canonicalized from the seeded H_eff). Skipped on restart (file already
+  // has metadata; iter labels continue from final_iter+1). Mirrors imag-axis
+  // qp_scf_loop pattern (scf_driver.cpp:285-294).
+  if (write_chkpt_p and !restart_p) {
+    // Allocate MO/E/Dm sArrays so the initial canonicalize can write into them.
+    state.MO_skia.emplace(*mpi,
+        std::array<long, 4>{ns, Nk_ibz, nbnd, nbnd});
+    state.E_ska.emplace(*mpi,
+        std::array<long, 3>{ns, Nk_ibz, nbnd});
+    state.Dm_skij.emplace(*mpi,
+        std::array<long, 4>{ns, Nk_ibz, nbnd, nbnd});
+    auto& sHe = state.H_eff_skij.value();
+    auto& sMO = state.MO_skia.value();
+    auto& sE  = state.E_ska.value();
+    auto& sDm = state.Dm_skij.value();
+    if (sMO.node_comm()->root()) {
+      detail_qp::diagonalize_H_eff(sHe.local(), S_skij, sE.local(), sMO.local());
+    }
+    sMO.node_sync();
+    sE.node_sync();
+    mu_init = detail_qp::find_mu_from_QP(sE.local(), k_weights,
+                                          grid.beta(), N_elec, ns_factor);
+    if (sDm.node_comm()->root()) {
+      detail_qp::update_Dm_from_QP(sE.local(), sMO.local(), mu_init,
+                                    grid.beta(), sDm.local());
+    }
+    sDm.node_sync();
+
+    chkpt::write_metadata_real_axis(mpi->comm, *mf, grid, sH0_ibz, sS_ibz,
+                                     state.coqui_prefix);
+    chkpt::dump_scf(mpi->comm, /*iter*/ 0, sDm, sHe, sMO, sE, mu_init,
+                    state.coqui_prefix);
+  }
+
   auto res = real_axis_qp_scf_loop(state, H_0_skij, S_skij, thc,
                                    mb_solver, mode, cfg,
-                                   k_weights, N_elec, ns_factor);
+                                   k_weights, N_elec, ns_factor,
+                                   /*init_it*/ init_it,
+                                   /*write_chkpt*/ write_chkpt_p);
 
   if (mpi->comm.root()) {
     app_log(1, "");

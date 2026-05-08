@@ -28,6 +28,7 @@
 #include "numerics/shared_array/nda.hpp"
 #include "mean_field/MF.hpp"
 #include "numerics/imag_axes_ft/IAFT.hpp"
+#include "methods/GW_real_axis/real_freq_grid.hpp"
 
 namespace methods {
   namespace chkpt {
@@ -51,6 +52,24 @@ namespace methods {
   void write_metadata(communicator_t &comm, const mf::MF &mf, const imag_axes_ft::IAFT &ft,
                        const sArray_t<Array_view_4D_t> &sH0_skij, const sArray_t<Array_view_4D_t> &sS_skij,
                        std::string output);
+
+  /**
+   * Write metadata to a SCF checkpoint file for a real-axis SCF run.
+   * Mirrors `write_metadata` except the `imaginary_fourier_transform` group is
+   * replaced by `real_frequency_grid` (omega/Omega/t arrays + beta/mu_chem/N_t/T_window).
+   * @param comm     - [INPUT] MPI communicator
+   * @param mf       - [INPUT] Mean-field instance
+   * @param grid     - [INPUT] Real-frequency grid driver
+   * @param sH0_skij - [INPUT] Non-interacting Hamiltonian (nspins, nkpts_ibz, nbnds, nbnds)
+   * @param sS_skij  - [INPUT] Overlap matrices for the primary basis
+   * @param output   - [INPUT] Prefix for the checkpoint file: output.mbpt.h5.
+   */
+  template<typename communicator_t>
+  void write_metadata_real_axis(communicator_t &comm, const mf::MF &mf,
+                                const real_axis::real_freq_grid_t &grid,
+                                const sArray_t<Array_view_4D_t> &sH0_skij,
+                                const sArray_t<Array_view_4D_t> &sS_skij,
+                                std::string output);
 
   template <typename communicator_t, typename X_t, typename Xt_t>
   void dump_scf(communicator_t &comm, long iter,

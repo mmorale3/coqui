@@ -41,9 +41,12 @@
 #include "methods/GW_real_axis/real_axis_gw_t.h"
 #include "methods/GW_real_axis/real_axis_qp_solver_t.h"
 #include "methods/GW_real_axis/real_axis_qp_scf_driver.hpp"
+#include "methods/tools/chkpt_utils.h"
+#include "h5/h5.hpp"
 
 #include <cmath>
 #include <complex>
+#include <cstdio>
 
 namespace bdft_tests {
 
@@ -391,6 +394,147 @@ namespace bdft_tests {
     // separately. For now we assert finiteness + ordering only on HOMO.
     REQUIRE(std::isfinite(e_h_qp));
     REQUIRE(e_h_qp < e_l_qp);
+  }
+
+  // ===========================================================================
+  // Per-iter checkpoint round-trip on LiH222 (chkpt::write_metadata_real_axis +
+  // dump_scf in qp_scf_loop with write_chkpt=true). Verifies the h5 file is
+  // produced with the expected groups and that iter labels are file-derived
+  // (a second loop call with restart=true continues from final_iter+1).
+  // ===========================================================================
+  TEST_CASE("real_axis_qp_scf_chkpt_lih222",
+            "[real_axis][qp][scf][chkpt][thc][qe][bdft]")
+  {
+    auto& mpi = utils::make_unit_test_mpi_context();
+    if (mpi->comm.size() != 1) return;  // single-rank fixture; skip on >1 rank
+    lih222_qp_scf_fixture f(mpi);
+
+    const std::string prefix = "/tmp/coqui_real_axis_chkpt_test";
+    // Cleanup any leftover from a prior run.
+    std::remove((prefix + ".mbpt.h5").c_str());
+
+    real_axis_mb_state_t state(*f.grid);
+    state.mpi = mpi;
+    state.coqui_prefix = prefix;
+    seed_H_eff_with_KS_fock(state, f);
+
+    // Solver bundle.
+    const std::string div = "ignore_g0";
+    real_axis_scr_coulomb_t  scr(&*f.grid, "rpa", div, 1e-8);
+    real_axis_gw_t           gw (*f.grid, /*max_iter*/ 1, /*mix*/ 0.5,
+                                 /*eps_nufft*/ 1e-8, /*ntrans*/ 1);
+    methods::solvers::hf_t   hf (div);
+    real_axis_qp_context_t   qctx{"bisection", "qp_energy", 1e-3, 1e-8};
+    real_axis_qp_solver_t    qp (&*f.grid, qctx);
+    real_axis_qp_mb_solver_t mb_solver(&hf, &scr, &gw, &qp);
+
+    qp_scgw_config cfg;
+    cfg.max_iter    = 2;
+    cfg.alpha_mix   = 0.7;
+    cfg.conv_tol    = 1e-12;  // force max_iter
+    cfg.mix_kind    = qp_mix_kind::diis;
+    cfg.diis_window = 4;
+    cfg.eta         = 0.05;
+    cfg.eps_nufft   = 1e-8;
+    cfg.update_W    = true;
+    cfg.verbose     = false;
+    cfg.tol_max_de  = 0.0;
+    cfg.tol_dDm     = 0.0;
+
+    // Pre-loop: emulate dispatcher's metadata + iter-0 dump.
+    state.MO_skia.emplace(*mpi,
+        std::array<long, 4>{f.ns, f.Nk, f.nbnd, f.nbnd});
+    state.E_ska.emplace(*mpi,
+        std::array<long, 3>{f.ns, f.Nk, f.nbnd});
+    state.Dm_skij.emplace(*mpi,
+        std::array<long, 4>{f.ns, f.Nk, f.nbnd, f.nbnd});
+    auto& sHe0 = state.H_eff_skij.value();
+    auto& sMO0 = state.MO_skia.value();
+    auto& sE0  = state.E_ska.value();
+    auto& sDm0 = state.Dm_skij.value();
+    if (sMO0.node_comm()->root()) {
+      methods::real_axis::detail_qp::diagonalize_H_eff(
+          sHe0.local(), f.S_skij, sE0.local(), sMO0.local());
+    }
+    sMO0.node_sync();
+    sE0.node_sync();
+    const double mu0 = methods::real_axis::detail_qp::find_mu_from_QP(
+        sE0.local(), f.k_weights, f.grid->beta(), f.N_elec, f.ns_factor);
+    if (sDm0.node_comm()->root()) {
+      methods::real_axis::detail_qp::update_Dm_from_QP(
+          sE0.local(), sMO0.local(), mu0, f.grid->beta(), sDm0.local());
+    }
+    sDm0.node_sync();
+    // Build sH0 / sS sArrays for write_metadata (driver fixture has plain
+    // nda arrays; copy into sArrays for the chkpt API).
+    auto sH0 = math::shm::make_shared_array<nda::array_view<ComplexType, 4>>(
+        *mpi, std::array<long, 4>{f.ns, f.Nk, f.nbnd, f.nbnd});
+    auto sS  = math::shm::make_shared_array<nda::array_view<ComplexType, 4>>(
+        *mpi, std::array<long, 4>{f.ns, f.Nk, f.nbnd, f.nbnd});
+    if (sH0.node_comm()->root()) sH0.local() = f.H_0_skij;
+    if (sS .node_comm()->root()) sS .local() = f.S_skij;
+    sH0.node_sync(); sS.node_sync();
+    methods::chkpt::write_metadata_real_axis(mpi->comm, *f.mf, *f.grid,
+                                              sH0, sS, prefix);
+    methods::chkpt::dump_scf(mpi->comm, /*iter*/ 0, sDm0, sHe0, sMO0, sE0,
+                             mu0, prefix);
+
+    // Run 2 iters with chkpt enabled. Iter labels should be 1, 2.
+    auto res1 = real_axis_qp_scf_loop(state, f.H_0_skij, f.S_skij, *f.thc,
+                                       mb_solver, qp_mode::qsgw, cfg,
+                                       f.k_weights, f.N_elec, f.ns_factor,
+                                       /*init_it*/ 0,
+                                       /*write_chkpt*/ true);
+    REQUIRE(res1.iter_used == 2);
+
+    // Inspect the file: scf/iter{0,1,2} present, system + real_frequency_grid
+    // groups present.
+    {
+      h5::file file(prefix + ".mbpt.h5", 'r');
+      h5::group root(file);
+      REQUIRE(root.has_subgroup("system"));
+      REQUIRE(root.has_subgroup("real_frequency_grid"));
+      REQUIRE(root.has_subgroup("scf"));
+      auto scf_grp = root.open_group("scf");
+      REQUIRE(scf_grp.has_subgroup("iter0"));
+      REQUIRE(scf_grp.has_subgroup("iter1"));
+      REQUIRE(scf_grp.has_subgroup("iter2"));
+      long final_iter = -1;
+      h5::h5_read(scf_grp, "final_iter", final_iter);
+      REQUIRE(final_iter == 2);
+      // Spot-check one dataset shape + a real-axis grid field.
+      auto rfg = root.open_group("real_frequency_grid");
+      double beta_h5 = 0.0;
+      h5::h5_read(rfg, "beta", beta_h5);
+      REQUIRE(std::abs(beta_h5 - f.grid->beta()) < 1e-12);
+    }
+
+    // Restart-style second call: read final_iter from file, set init_it,
+    // run 2 more iters → file should now have iter3, iter4.
+    long init_it = methods::chkpt::read_qpscf(mpi->node_comm,
+                                                state.H_eff_skij.value(),
+                                                /*mu*/ const_cast<double&>(mu0),
+                                                prefix);
+    REQUIRE(init_it == 2);
+    auto res2 = real_axis_qp_scf_loop(state, f.H_0_skij, f.S_skij, *f.thc,
+                                       mb_solver, qp_mode::qsgw, cfg,
+                                       f.k_weights, f.N_elec, f.ns_factor,
+                                       /*init_it*/ init_it,
+                                       /*write_chkpt*/ true);
+    REQUIRE(res2.iter_used == 2);
+    {
+      h5::file file(prefix + ".mbpt.h5", 'r');
+      h5::group root(file);
+      auto scf_grp = root.open_group("scf");
+      REQUIRE(scf_grp.has_subgroup("iter3"));
+      REQUIRE(scf_grp.has_subgroup("iter4"));
+      long final_iter = -1;
+      h5::h5_read(scf_grp, "final_iter", final_iter);
+      REQUIRE(final_iter == 4);
+    }
+
+    // Cleanup.
+    std::remove((prefix + ".mbpt.h5").c_str());
   }
 
 } // namespace bdft_tests
