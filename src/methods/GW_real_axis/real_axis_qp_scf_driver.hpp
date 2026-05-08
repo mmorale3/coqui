@@ -654,6 +654,11 @@ real_axis_qp_scf_loop(real_axis_mb_state_t                          & state,
     // ---- 5. update W (scr_coulomb). ----
     if (cfg.update_W or it == 0) {
       mb_solver.scr_eri->update_w(state, thc, /*verbose*/ false, use_rspace);
+      // P5* lite (memory redesign): free intermediate bosonic state arrays
+      // not needed downstream. gw::evaluate (Sigma_c) reads only ImW; the
+      // production hf::evaluate downstream operates on Dm directly and
+      // doesn't read any bosonic state.
+      state.free_intermediate_bosonic();
     }
 
     // ---- 6. Sigma_c (gw). MEM=DEVICE_MEMORY routes to device. ----

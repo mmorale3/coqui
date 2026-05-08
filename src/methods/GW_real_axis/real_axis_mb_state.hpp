@@ -161,6 +161,22 @@ struct real_axis_mb_state_t {
         std::array<long, 4>{ns, nkpts_ibz, nbnd, nbnd});
   }
 
+  /// Free the intermediate bosonic state arrays {ImPi, RePi, ReW}_qPQO that
+  /// are not needed downstream of update_w. Only ImW_qPQO is consumed by
+  /// gw_t::evaluate; the rest is scratch within update_w (Pi for the Dyson
+  /// solve, ReW for eps_inv_head). Called by the SCF/QP-SCF drivers between
+  /// update_w and evaluate (memory-redesign P5* lite). Reduces resident
+  /// bosonic state from 4 arrays to 1 for the rest of the SCF iteration.
+  ///
+  /// Tests that inspect ImPi/RePi/ReW directly (e.g. test_real_axis_scr_coulomb)
+  /// must NOT call this — the next call to allocate_bosonic re-emplaces all
+  /// four, so the next SCF iteration is unaffected.
+  void free_intermediate_bosonic() {
+    ImPi_qPQO.reset();
+    RePi_qPQO.reset();
+    ReW_qPQO.reset();
+  }
+
   /// Allocate bosonic dArrays for given (nqpts_ibz, Naux) shape.
   /// Proc grid auto-picked: distributes (P, Q) over the full mpi->comm.
   void allocate_bosonic(long nqpts_ibz, long Naux) {

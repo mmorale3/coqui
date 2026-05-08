@@ -307,9 +307,11 @@ void real_axis_gw_t::evaluate(real_axis::real_axis_mb_state_t & state,
   auto& cache = evaluate_cache_for<MEM>();
   utils::check(state.A_wskij.has_value(),
                "real_axis_gw_t::evaluate: state.A_wskij not allocated");
-  utils::check(state.ImW_qPQO.has_value() and state.ReW_qPQO.has_value(),
-               "real_axis_gw_t::evaluate: state.{Im,Re}W_qPQO not allocated; "
+  utils::check(state.ImW_qPQO.has_value(),
+               "real_axis_gw_t::evaluate: state.ImW_qPQO not allocated; "
                "call real_axis_scr_coulomb_t::update_w first");
+  // Note: state.ReW_qPQO may be freed by the SCF driver between update_w
+  // and evaluate (memory-redesign P5* lite). evaluate only reads ImW.
   utils::check(state.mpi != nullptr,
                "real_axis_gw_t::evaluate: state.mpi not bound");
   auto& comm = state.mpi->comm;

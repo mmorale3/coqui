@@ -211,6 +211,13 @@ inline scgw_result real_axis_scf_loop(real_axis_mb_state_t& state,
     mb_solver.scr_eri->update_w(state, thc,
                                 cfg.verbose, use_rspace);
 
+    // P5* lite (memory redesign): free intermediate bosonic state arrays
+    // not needed downstream. evaluate (Sigma_c) and hf::evaluate (Sigma_x)
+    // read only state.ImW_qPQO; ImPi/RePi/ReW were scratch for the Dyson
+    // solve + eps_inv_head and can be released. The next SCF iteration's
+    // update_w reallocates them.
+    state.free_intermediate_bosonic();
+
     // ---- 2. Sigma^c (gw) ----
     // Forward the divergence treatment from scr_coulomb so the head
     // correction in gw_t::evaluate sees the same setting that produced
