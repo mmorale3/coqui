@@ -508,64 +508,104 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
   // (s, k, q) partitioning + allreduce. No comm in Step 2.
   double dt2_alloc = 0.0, dt2_ftR = 0.0, dt2_kernel = 0.0, dt2_ftq = 0.0;
   if (do_rspace) {
-    // Use MEM-side R-space FT factors when device; host views otherwise.
-    // (Note: nda::blas::gemm dispatches on the array memory space; mixing
-    // host f_Rk with device A_aux would not work.)
+    // P0 (memory-redesign): per-R streaming. The previous version allocated
+    // 5D A_aux_sRPQw (ns × NR × NP_loc × NQ_loc × N_w) and 4D ImPi_RPQO
+    // (NR × NP_loc × NQ_loc × N_O) scratches. For each iR we now:
+    //   (a) build A_aux_one_R via a row-vector × matrix GEMM (rank-1
+    //       contraction over k), reusing a 3D scratch.
+    //   (b) run the per-R Pi kernel into a 3D ImPi_one_R scratch.
+    //   (c) update ImPi_loc via an outer-product GEMM (column vector
+    //       sf_qR(:, iR) × row vector ImPi_one_R, accumulate into ImPi_q).
+    // Memory savings at production scale are large (~Nk × per-R-tile
+    // size eliminated). Trade: NR small GEMMs instead of 2 bulk GEMMs;
+    // perf hit acceptable for first cut, can be tuned via R-chunking.
     auto t2a = t_now();
-    memory::buffered_array<MEM, ComplexType, 5> A_aux_sRPQw_loc(
-        std::array<long,5>{ns, NR, Naux_loc_P, Naux_loc_Q, N_w});
-    memory::buffered_array<MEM, ComplexType, 4> ImPi_RPQO_loc(
-        std::array<long,4>{NR, Naux_loc_P, Naux_loc_Q, N_O});
+    memory::buffered_array<MEM, ComplexType, 3> A_aux_one_R(
+        std::array<long, 3>{Naux_loc_P, Naux_loc_Q, N_w});
+    memory::buffered_array<MEM, ComplexType, 3> ImPi_one_R(
+        std::array<long, 3>{Naux_loc_P, Naux_loc_Q, N_O});
+    // Per-iter materialized column of sf_qR for the rank-1 update GEMM
+    // (column-strided slice in row-major storage isnt directly usable
+    // by gemm).
+    nda::array<ComplexType, 1> sf_qR_col_host(Nq_ibz);
+    memory::buffered_array<MEM, ComplexType, 1> sf_qR_col_mem(
+        std::array<long, 1>{Nq_ibz});
     dt2_alloc += sec_since(t2a);
-    auto t2b = t_now();
-    for (long s = 0; s < ns; ++s) {
-      auto A_in_2D  = nda::reshape(A_aux_loc(s, _, _, _, _),
-                                   std::array<long,2>{Nk, B_loc * N_w});
-      auto A_out_2D = nda::reshape(A_aux_sRPQw_loc(s, _, _, _, _),
-                                   std::array<long,2>{NR, B_loc * N_w});
-      if constexpr (MEM == HOST_MEMORY) {
-        nda::blas::gemm(ComplexType(1.0, 0.0), _sf_Rk->local(), A_in_2D,
-                        ComplexType(0.0, 0.0), A_out_2D);
-      } else {
-        nda::blas::gemm(ComplexType(1.0, 0.0), *_f_Rk_mem, A_in_2D,
-                        ComplexType(0.0, 0.0), A_out_2D);
-      }
-    }
-    dt2_ftR += sec_since(t2b);
 
-    // Per-R cross-correlation, into per-rank local (P_loc, Q_loc, N_O) slice.
-    // Kernel reads only LOCAL (P, Q) blocks of A_aux on both legs.
-    auto t2c = t_now();
-    ImPi_RPQO_loc() = ComplexType(0.0, 0.0);
+    ImPi_loc = ComplexType(0.0, 0.0);
+
     for (long iR = 0; iR < NR; ++iR) {
-      for (long s = 0; s < ns; ++s) {
-        auto A_local     = A_aux_sRPQw_loc(s, iR, _, _, _);
-        auto ImPi_R_view = ImPi_RPQO_loc(iR, _, _, _);
-        accumulate_ImPi_one_kq<MEM>(conv, A_local, A_local, ImPi_R_view, 1.0);
-      }
-    }
-    dt2_kernel += sec_since(t2c);
+      ImPi_one_R = ComplexType(0.0, 0.0);
 
-    // FT ImPi from R-space to IBZ q-space. Per-rank gemm on the local block.
-    auto t2d = t_now();
-    {
-      auto ImPi_R_2D = nda::reshape(ImPi_RPQO_loc,
-                                    std::array<long,2>{NR, B_loc * N_O});
-      auto ImPi_q_2D = nda::reshape(ImPi_loc,
-                                    std::array<long,2>{Nq_ibz, B_loc * N_O});
-      if constexpr (MEM == HOST_MEMORY) {
-        nda::blas::gemm(ComplexType(1.0, 0.0), _sf_qR->local(), ImPi_R_2D,
-                        ComplexType(0.0, 0.0), ImPi_q_2D);
-      } else {
-        nda::blas::gemm(ComplexType(1.0, 0.0), *_f_qR_mem, ImPi_R_2D,
-                        ComplexType(0.0, 0.0), ImPi_q_2D);
+      for (long s = 0; s < ns; ++s) {
+        auto t2b = t_now();
+        // (a) A_aux_one_R = sum_k sf_Rk(iR, k) * A_aux_loc(s, k, ...).
+        auto A_aux_loc_2D = nda::reshape(A_aux_loc(s, _, _, _, _),
+                                          std::array<long,2>{Nk, B_loc * N_w});
+        auto A_aux_one_R_2D = nda::reshape(A_aux_one_R(),
+                                            std::array<long,2>{1, B_loc * N_w});
+        if constexpr (MEM == HOST_MEMORY) {
+          auto sf_Rk_loc = _sf_Rk->local();
+          // Row iR of sf_Rk is contiguous (row-major); reshape to (1, Nk).
+          auto sf_row = nda::reshape(sf_Rk_loc(iR, _),
+                                      std::array<long,2>{1, Nk});
+          nda::blas::gemm(ComplexType(1.0, 0.0), sf_row, A_aux_loc_2D,
+                          ComplexType(0.0, 0.0), A_aux_one_R_2D);
+        } else {
+          auto sf_row = nda::reshape((*_f_Rk_mem)(iR, _),
+                                      std::array<long,2>{1, Nk});
+          nda::blas::gemm(ComplexType(1.0, 0.0), sf_row, A_aux_loc_2D,
+                          ComplexType(0.0, 0.0), A_aux_one_R_2D);
+        }
+        dt2_ftR += sec_since(t2b);
+
+        // (b) per-R Pi kernel; accumulates over s.
+        auto t2c = t_now();
+        accumulate_ImPi_one_kq<MEM>(conv, A_aux_one_R, A_aux_one_R,
+                                     ImPi_one_R, 1.0);
+        dt2_kernel += sec_since(t2c);
       }
+
+      // (c) ImPi_loc[:, ...] += sf_qR(:, iR) ⊗ ImPi_one_R via outer-product GEMM.
+      auto t2d = t_now();
+      // Materialize the iR-th column of sf_qR (column-strided in row-major
+      // storage) into a contiguous 1D buffer so it can be reshaped to
+      // (Nq_ibz, 1) for gemm.
+      if constexpr (MEM == HOST_MEMORY) {
+        auto sf_qR_loc = _sf_qR->local();
+        for (long iq = 0; iq < Nq_ibz; ++iq)
+          sf_qR_col_host(iq) = sf_qR_loc(iq, iR);
+        auto sf_col = nda::reshape(sf_qR_col_host,
+                                   std::array<long,2>{Nq_ibz, 1});
+        auto ImPi_one_R_2D = nda::reshape(ImPi_one_R(),
+                                          std::array<long,2>{1, B_loc * N_O});
+        auto ImPi_q_2D = nda::reshape(ImPi_loc,
+                                      std::array<long,2>{Nq_ibz, B_loc * N_O});
+        nda::blas::gemm(ComplexType(1.0, 0.0), sf_col, ImPi_one_R_2D,
+                        ComplexType(1.0, 0.0), ImPi_q_2D);
+      } else {
+        // Read column from the HOST-side _sf_qR shared array (always
+        // available regardless of MEM); push the per-iR column to MEM
+        // for the GEMM. Avoids a per-iR full pull of _f_qR_mem.
+        auto sf_qR_loc = _sf_qR->local();
+        for (long iq = 0; iq < Nq_ibz; ++iq)
+          sf_qR_col_host(iq) = sf_qR_loc(iq, iR);
+        sf_qR_col_mem = memory::to_memory_space<MEM>(sf_qR_col_host);
+        auto sf_col = nda::reshape(sf_qR_col_mem(),
+                                   std::array<long,2>{Nq_ibz, 1});
+        auto ImPi_one_R_2D = nda::reshape(ImPi_one_R(),
+                                          std::array<long,2>{1, B_loc * N_O});
+        auto ImPi_q_2D = nda::reshape(ImPi_loc,
+                                      std::array<long,2>{Nq_ibz, B_loc * N_O});
+        nda::blas::gemm(ComplexType(1.0, 0.0), sf_col, ImPi_one_R_2D,
+                        ComplexType(1.0, 0.0), ImPi_q_2D);
+      }
+      dt2_ftq += sec_since(t2d);
     }
 
     if (iq_gamma >= 0) {
       ImPi_loc(iq_gamma, nda::ellipsis{}) = ComplexType(0.0, 0.0);
     }
-    dt2_ftq += sec_since(t2d);
   } else {
     // K-space branch: only used for Γ-only fixtures (Nk == 1, IBZ == FBZ).
     // For non-trivial IBZ the R-space branch is taken.

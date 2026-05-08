@@ -819,63 +819,113 @@ void real_axis_gw_t::evaluate(real_axis::real_axis_mb_state_t & state,
       B_qPQO_loc(iq_gamma, nda::ellipsis{}) = ComplexType(0.0, 0.0);
     }
 
-    // FT B from IBZ-q-space to R-space (per-rank on local block).
-    memory::buffered_array<MEM, ComplexType, 4> B_RPQO_loc(
-        std::array<long,4>{NR, Naux_loc_P, Naux_loc_Q, N_O});
-    {
-      auto B_q_2D = nda::reshape(B_qPQO_loc,
-                                 std::array<long,2>{Nq_ibz, B_loc * N_O});
-      auto B_R_2D = nda::reshape(B_RPQO_loc,
-                                 std::array<long,2>{NR, B_loc * N_O});
-      if constexpr (MEM == HOST_MEMORY) {
-        nda::blas::gemm(ComplexType(1.0, 0.0), cache.sf_Rq->local(), B_q_2D,
-                        ComplexType(0.0, 0.0), B_R_2D);
-      } else {
+    if constexpr (MEM == HOST_MEMORY) {
+      // P0 (memory-redesign): per-R streaming. Drops the 5D
+      // A_aux_sRPQw_loc (ns·NR·NP_loc·NQ_loc·N_w), 4D B_RPQO_loc
+      // (NR·NP_loc·NQ_loc·N_O) and 5D ImSigma_aux_sRPQw_loc scratches.
+      // Per iR: q->R for B, k->R for A (one s at a time), Sigma kernel,
+      // R->k outer-product update into ImSigma_aux_skPQw_loc.
+      memory::buffered_array<MEM, ComplexType, 3> A_aux_one_R(
+          std::array<long, 3>{Naux_loc_P, Naux_loc_Q, N_w});
+      memory::buffered_array<MEM, ComplexType, 3> B_one_R(
+          std::array<long, 3>{Naux_loc_P, Naux_loc_Q, N_O});
+      memory::buffered_array<MEM, ComplexType, 3> ImSigma_one_R(
+          std::array<long, 3>{Naux_loc_P, Naux_loc_Q, N_w});
+      // Materialized column of sf_kR(k, iR) for the rank-1 update.
+      nda::array<ComplexType, 1> sf_kR_col_host(Nk);
+
+      auto sf_Rk_loc = cache.sf_Rk->local();
+      auto sf_Rq_loc = cache.sf_Rq->local();
+      auto sf_kR_loc = cache.sf_kR->local();
+
+      for (long iR = 0; iR < NR; ++iR) {
+        // (1) B_one_R = sum_q sf_Rq(iR, q) * B_qPQO_loc(q, ...).
+        {
+          auto B_q_2D = nda::reshape(B_qPQO_loc,
+                                      std::array<long,2>{Nq_ibz, B_loc * N_O});
+          auto B_one_R_2D = nda::reshape(B_one_R(),
+                                          std::array<long,2>{1, B_loc * N_O});
+          auto sf_row = nda::reshape(sf_Rq_loc(iR, _),
+                                      std::array<long,2>{1, Nq_ibz});
+          nda::blas::gemm(ComplexType(1.0, 0.0), sf_row, B_q_2D,
+                          ComplexType(0.0, 0.0), B_one_R_2D);
+        }
+
+        // Materialize the iR-th column of sf_kR (column-strided in
+        // row-major) for the rank-1 update GEMM further below.
+        for (long ik = 0; ik < Nk; ++ik)
+          sf_kR_col_host(ik) = sf_kR_loc(ik, iR);
+
+        for (long s = 0; s < ns; ++s) {
+          // (2) A_aux_one_R = sum_k sf_Rk(iR, k) * A_aux_loc(s, k, ...).
+          {
+            auto A_in_2D = nda::reshape(A_aux_loc(s, _, _, _, _),
+                                         std::array<long,2>{Nk, B_loc * N_w});
+            auto A_one_R_2D = nda::reshape(A_aux_one_R(),
+                                            std::array<long,2>{1, B_loc * N_w});
+            auto sf_row = nda::reshape(sf_Rk_loc(iR, _),
+                                        std::array<long,2>{1, Nk});
+            nda::blas::gemm(ComplexType(1.0, 0.0), sf_row, A_in_2D,
+                            ComplexType(0.0, 0.0), A_one_R_2D);
+          }
+
+          // (3) Per-R Sigma kernel.
+          ImSigma_one_R = ComplexType(0.0, 0.0);
+          accumulate_ImSigma_one_kq_nufft<MEM>(conv, A_aux_one_R, B_one_R,
+                                                ImSigma_one_R, 1.0);
+
+          // (4) R->k outer-product update:
+          //     ImSigma_aux_skPQw_loc(s, k, ...) += sf_kR(k, iR) * ImSigma_one_R.
+          auto sf_col = nda::reshape(sf_kR_col_host,
+                                      std::array<long,2>{Nk, 1});
+          auto ImSig_one_R_2D = nda::reshape(ImSigma_one_R(),
+                                              std::array<long,2>{1, B_loc * N_w});
+          auto ImSig_k_2D = nda::reshape(ImSigma_aux_skPQw_loc(s, _, _, _, _),
+                                          std::array<long,2>{Nk, B_loc * N_w});
+          nda::blas::gemm(ComplexType(1.0, 0.0), sf_col, ImSig_one_R_2D,
+                          ComplexType(1.0, 0.0), ImSig_k_2D);
+        }
+      }
+    } else {
+      // Device path: existing 5D-scratch implementation. Streaming on
+      // device requires more careful handling of the strided sf_kR
+      // column extract; retained as a perf followup.
+      memory::buffered_array<MEM, ComplexType, 4> B_RPQO_loc(
+          std::array<long,4>{NR, Naux_loc_P, Naux_loc_Q, N_O});
+      {
+        auto B_q_2D = nda::reshape(B_qPQO_loc,
+                                   std::array<long,2>{Nq_ibz, B_loc * N_O});
+        auto B_R_2D = nda::reshape(B_RPQO_loc,
+                                   std::array<long,2>{NR, B_loc * N_O});
         nda::blas::gemm(ComplexType(1.0, 0.0), *cache.f_Rq_mem, B_q_2D,
                         ComplexType(0.0, 0.0), B_R_2D);
       }
-    }
-
-    // FT A from k-space to R-space (per-rank on local block).
-    memory::buffered_array<MEM, ComplexType, 5> A_aux_sRPQw_loc(
-        std::array<long,5>{ns, NR, Naux_loc_P, Naux_loc_Q, N_w});
-    for (long s = 0; s < ns; ++s) {
-      auto A_in_2D  = nda::reshape(A_aux_loc(s, _, _, _, _),
-                                   std::array<long,2>{Nk, B_loc * N_w});
-      auto A_out_2D = nda::reshape(A_aux_sRPQw_loc(s, _, _, _, _),
-                                   std::array<long,2>{NR, B_loc * N_w});
-      if constexpr (MEM == HOST_MEMORY) {
-        nda::blas::gemm(ComplexType(1.0, 0.0), cache.sf_Rk->local(), A_in_2D,
-                        ComplexType(0.0, 0.0), A_out_2D);
-      } else {
+      memory::buffered_array<MEM, ComplexType, 5> A_aux_sRPQw_loc(
+          std::array<long,5>{ns, NR, Naux_loc_P, Naux_loc_Q, N_w});
+      for (long s = 0; s < ns; ++s) {
+        auto A_in_2D  = nda::reshape(A_aux_loc(s, _, _, _, _),
+                                     std::array<long,2>{Nk, B_loc * N_w});
+        auto A_out_2D = nda::reshape(A_aux_sRPQw_loc(s, _, _, _, _),
+                                     std::array<long,2>{NR, B_loc * N_w});
         nda::blas::gemm(ComplexType(1.0, 0.0), *cache.f_Rk_mem, A_in_2D,
                         ComplexType(0.0, 0.0), A_out_2D);
       }
-    }
-
-    // Per-R Sigma kernel on local (P_loc, Q_loc) blocks. No allreduce.
-    memory::buffered_array<MEM, ComplexType, 5> ImSigma_aux_sRPQw_loc(
-        std::array<long,5>{ns, NR, Naux_loc_P, Naux_loc_Q, N_w});
-    ImSigma_aux_sRPQw_loc() = ComplexType(0.0, 0.0);
-    for (long iR = 0; iR < NR; ++iR) {
-      for (long s = 0; s < ns; ++s) {
-        auto A_view   = A_aux_sRPQw_loc(s, iR, _, _, _);
-        auto B_view   = B_RPQO_loc(iR, _, _, _);
-        auto Sig_view = ImSigma_aux_sRPQw_loc(s, iR, _, _, _);
-        accumulate_ImSigma_one_kq_nufft<MEM>(conv, A_view, B_view, Sig_view, 1.0);
+      memory::buffered_array<MEM, ComplexType, 5> ImSigma_aux_sRPQw_loc(
+          std::array<long,5>{ns, NR, Naux_loc_P, Naux_loc_Q, N_w});
+      ImSigma_aux_sRPQw_loc() = ComplexType(0.0, 0.0);
+      for (long iR = 0; iR < NR; ++iR) {
+        for (long s = 0; s < ns; ++s) {
+          auto A_view   = A_aux_sRPQw_loc(s, iR, _, _, _);
+          auto B_view   = B_RPQO_loc(iR, _, _, _);
+          auto Sig_view = ImSigma_aux_sRPQw_loc(s, iR, _, _, _);
+          accumulate_ImSigma_one_kq_nufft<MEM>(conv, A_view, B_view, Sig_view, 1.0);
+        }
       }
-    }
-
-    // FT Sigma from R-space to k-space (per-rank on local block).
-    for (long s = 0; s < ns; ++s) {
-      auto Sig_R_2D = nda::reshape(ImSigma_aux_sRPQw_loc(s, _, _, _, _),
-                                   std::array<long,2>{NR, B_loc * N_w});
-      auto Sig_k_2D = nda::reshape(ImSigma_aux_skPQw_loc(s, _, _, _, _),
-                                   std::array<long,2>{Nk, B_loc * N_w});
-      if constexpr (MEM == HOST_MEMORY) {
-        nda::blas::gemm(ComplexType(1.0, 0.0), cache.sf_kR->local(), Sig_R_2D,
-                        ComplexType(0.0, 0.0), Sig_k_2D);
-      } else {
+      for (long s = 0; s < ns; ++s) {
+        auto Sig_R_2D = nda::reshape(ImSigma_aux_sRPQw_loc(s, _, _, _, _),
+                                     std::array<long,2>{NR, B_loc * N_w});
+        auto Sig_k_2D = nda::reshape(ImSigma_aux_skPQw_loc(s, _, _, _, _),
+                                     std::array<long,2>{Nk, B_loc * N_w});
         nda::blas::gemm(ComplexType(1.0, 0.0), *cache.f_kR_mem, Sig_R_2D,
                         ComplexType(0.0, 0.0), Sig_k_2D);
       }
