@@ -274,35 +274,23 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
   auto kp_to_ibz_arr   = MF.kp_to_ibz();
   auto kp_trev_arr     = MF.kp_trev();
   auto kp_trev_pair_arr = MF.kp_trev_pair();
-  memory::array<MEM, ComplexType, 5> A;
-  if constexpr (MEM == HOST_MEMORY) {
-    A = nda::array<ComplexType, 5>(ns, Nk, N_w, nbnd, nbnd);
-    for (long s = 0; s < ns; ++s)
-      for (long k = 0; k < Nk; ++k) {
-        const long kibz = kp_to_ibz_arr(k);
-        for (long iw = 0; iw < N_w; ++iw)
-          for (long mu = 0; mu < nbnd; ++mu)
-            for (long nu = 0; nu < nbnd; ++nu)
-              A(s, k, iw, mu, nu) =
-                  ComplexType(0.5, 0.0) *
-                  (A_in(iw, s, kibz, mu, nu)
-                   + std::conj(A_in(iw, s, kibz, nu, mu)));
-      }
-  } else {
-    nda::array<ComplexType, 5> A_h(ns, Nk, N_w, nbnd, nbnd);
-    for (long s = 0; s < ns; ++s)
-      for (long k = 0; k < Nk; ++k) {
-        const long kibz = kp_to_ibz_arr(k);
-        for (long iw = 0; iw < N_w; ++iw)
-          for (long mu = 0; mu < nbnd; ++mu)
-            for (long nu = 0; nu < nbnd; ++nu)
-              A_h(s, k, iw, mu, nu) =
-                  ComplexType(0.5, 0.0) *
-                  (A_in(iw, s, kibz, mu, nu)
-                   + std::conj(A_in(iw, s, kibz, nu, mu)));
-      }
-    A = memory::to_memory_space<MEM>(A_h);
-  }
+  // P1 (memory-redesign): drop the upfront (ns, Nk, N_w, nbnd, nbnd)
+  // replicated A allocation. The projection loop below builds a per-(s, k)
+  // host scratch on demand and pushes to MEM only for non-TR k's; TR-pair
+  // k positions are filled at the aux level via conj-copy. Saves
+  // ~(ns·Nk·N_w·nbnd²) complex per rank.
+  nda::array<ComplexType, 3> A_one_k_host(N_w, nbnd, nbnd);
+  memory::buffered_array<MEM, ComplexType, 3> A_one_k_mem(
+      std::array<long, 3>{N_w, nbnd, nbnd});
+  auto build_A_one_k = [&](long s, long kibz) {
+    for (long iw = 0; iw < N_w; ++iw)
+      for (long mu = 0; mu < nbnd; ++mu)
+        for (long nu = 0; nu < nbnd; ++nu)
+          A_one_k_host(iw, mu, nu) =
+              ComplexType(0.5, 0.0) *
+              (A_in(iw, s, kibz, mu, nu)
+               + std::conj(A_in(iw, s, kibz, nu, mu)));
+  };
 
   // Marshal X(s, k, P, mu) from THC reader into shared memory: one copy
   // per node since X is read-only and moderately large for production.
@@ -454,26 +442,32 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
       comm, pgrid_aux, shape_aux, bsize_aux);
   auto A_aux_loc = dA_aux_skPQw.local();  // (ns, Nk, Naux_loc_P, Naux_loc_Q, N_w)
   // Pass 1: project for non-TR k's only. Pass 2: fill TR-pair k's by conj-copy.
+  // P1: build A per-(s, k) on the fly into a 3D scratch instead of a
+  // pre-built 5D replicated tensor.
   if constexpr (MEM == HOST_MEMORY) {
     for (long s = 0; s < ns; ++s)
       for (long ik = 0; ik < Nk; ++ik) {
         if (kp_trev_arr(ik) != 0) continue;
+        const long kibz = kp_to_ibz_arr(ik);
+        build_A_one_k(s, kibz);
         auto X_P_slice  = X(s, ik, Pr, _);
         auto X_Q_slice  = X(s, ik, Qr, _);
-        auto A_view     = A(s, ik, _, _, _);
         auto A_aux_view = A_aux_loc(s, ik, _, _, _);
-        primary_to_aux_one_k(X_P_slice, X_Q_slice, A_view, A_aux_view);
+        primary_to_aux_one_k(X_P_slice, X_Q_slice, A_one_k_host, A_aux_view);
       }
   } else {
     auto X_dev = (*_X_mem)();
     for (long s = 0; s < ns; ++s)
       for (long ik = 0; ik < Nk; ++ik) {
         if (kp_trev_arr(ik) != 0) continue;
+        const long kibz = kp_to_ibz_arr(ik);
+        build_A_one_k(s, kibz);
+        // Push host scratch to MEM (one transfer per non-TR k).
+        A_one_k_mem = memory::to_memory_space<MEM>(A_one_k_host);
         auto X_P_slice  = X_dev(s, ik, Pr, _);
         auto X_Q_slice  = X_dev(s, ik, Qr, _);
-        auto A_view     = A(s, ik, _, _, _);
         auto A_aux_view = A_aux_loc(s, ik, _, _, _);
-        primary_to_aux_one_k<MEM>(X_P_slice, X_Q_slice, A_view, A_aux_view);
+        primary_to_aux_one_k<MEM>(X_P_slice, X_Q_slice, A_one_k_mem, A_aux_view);
       }
   }
   // Pass 2: TR-pair fix-up. aux-A(k) = conj(aux-A(kp_trev_pair(k))) for
@@ -937,26 +931,68 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
   // (Nq_ibz, N_O) reals (memory-redesign P6).
   // ----------------------------------------------------------------
   if (_div_treatment != "ignore_g0") {
-    auto W_full  = math::nda::all_gather_slow<HOST_MEMORY>(*state.ImW_qPQO);
-    auto Re_full = math::nda::all_gather_slow<HOST_MEMORY>(*state.ReW_qPQO);
-    // State arrays are real-typed (P0'); combine into complex W for the
-    // eps_inv_head computation.
-    nda::array<ComplexType, 4> W_complex(W_full.shape());
-    {
-      const long N = W_complex.size();
-      auto * dst = W_complex.data();
-      auto const* re = Re_full.data();
-      auto const* im = W_full.data();
-      for (long i = 0; i < N; ++i)
-        dst[i] = ComplexType(re[i], im[i]);
-    }
-    auto Qpts = nda::array<double, 2>(MF.Qpts_ibz());
+    // P6: per-rank local (P_loc, Q_loc) contraction + Allreduce of the
+    // small (Nq_ibz, N_O) result, replacing the previous all_gather_slow
+    // of the full ImW/ReW state. Saves 2× full bosonic state in flight
+    // per rank when div_treatment != "ignore_g0".
+    //
+    // Per-q head (formula from compute_eps_inv_head_O):
+    //   eps_inv(q, O) = (|q|² / 4π) · Vol ·
+    //                   sum_{P,Q} χ̄(q, P) · W(q, P, Q, O) · conj(χ̄(q, Q))
+    // Each rank computes its (P_loc, Q_loc) tile partial; allreduce gives
+    // the global sum.
+    auto h_ImW = state.ImW_qPQO->local();   // (Nq_ibz, NP_loc, NQ_loc, N_O), real
+    auto h_ReW = state.ReW_qPQO->local();
     auto chi_bar = nda::array<ComplexType, 2>(thc.basis_bar_head());
+    auto Qpts = nda::array<double, 2>(MF.Qpts_ibz());
+
     nda::array<ComplexType, 2> eps_inv_qO(Nq_ibz, N_O);
+    eps_inv_qO = ComplexType(0.0, 0.0);
+    const double fpi = 4.0 * M_PI;
+    const double vol = MF.volume();
+    for (long iq = 0; iq < Nq_ibz; ++iq) {
+      const double qx = Qpts(iq, 0), qy = Qpts(iq, 1), qz = Qpts(iq, 2);
+      const double q_abs2 = qx*qx + qy*qy + qz*qz;
+      if (q_abs2 < 1e-20) continue;          // Gamma: leave 0
+      const double prefactor = (q_abs2 / fpi) * vol;
+      for (long iO = 0; iO < N_O; ++iO) {
+        ComplexType acc(0.0, 0.0);
+        for (long iP_loc = 0; iP_loc < Naux_loc_P; ++iP_loc) {
+          const long P = Pr.first() + iP_loc;
+          for (long iQ_loc = 0; iQ_loc < Naux_loc_Q; ++iQ_loc) {
+            const long Q = Qr.first() + iQ_loc;
+            const ComplexType W_pqo(h_ReW(iq, iP_loc, iQ_loc, iO),
+                                    h_ImW(iq, iP_loc, iQ_loc, iO));
+            acc += chi_bar(iq, P) * W_pqo * std::conj(chi_bar(iq, Q));
+          }
+        }
+        eps_inv_qO(iq, iO) = prefactor * acc;
+      }
+    }
+    if (comm.size() > 1)
+      comm.all_reduce_in_place_n(eps_inv_qO.data(), eps_inv_qO.size(),
+                                  std::plus<>{});
+
     if (!state.eps_inv_head_O.has_value())
       state.eps_inv_head_O = nda::array<ComplexType, 1>(N_O);
-    compute_eps_inv_head_O(W_complex, Qpts, chi_bar, MF.volume(),
-                           eps_inv_qO, *state.eps_inv_head_O);
+
+    // q->0 estimate via the smallest-non-zero |q| point.
+    long smallest_iq = -1;
+    double smallest_q2 = std::numeric_limits<double>::infinity();
+    for (long iq = 0; iq < Nq_ibz; ++iq) {
+      const double qx = Qpts(iq, 0), qy = Qpts(iq, 1), qz = Qpts(iq, 2);
+      const double q_abs2 = qx*qx + qy*qy + qz*qz;
+      if (q_abs2 < 1e-20) continue;
+      if (q_abs2 < smallest_q2) {
+        smallest_q2 = q_abs2;
+        smallest_iq = iq;
+      }
+    }
+    if (smallest_iq >= 0)
+      for (long iO = 0; iO < N_O; ++iO)
+        (*state.eps_inv_head_O)(iO) = eps_inv_qO(smallest_iq, iO);
+    else
+      *state.eps_inv_head_O = ComplexType(0.0, 0.0);
   }
 
   if (verbose and comm.root()) {

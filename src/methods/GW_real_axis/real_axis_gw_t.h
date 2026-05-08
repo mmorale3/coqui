@@ -399,36 +399,24 @@ void real_axis_gw_t::evaluate(real_axis::real_axis_mb_state_t & state,
   auto kp_to_ibz_arr    = MF.kp_to_ibz();
   auto kp_trev_arr      = MF.kp_trev();
   auto kp_trev_pair_arr = MF.kp_trev_pair();
-  memory::array<MEM, ComplexType, 5> A;
-  if constexpr (MEM == HOST_MEMORY) {
-    A = nda::array<ComplexType, 5>(ns, Nk, N_w, nbnd, nbnd);
-    for (long s = 0; s < ns; ++s)
-      for (long k = 0; k < Nk; ++k) {
-        const long kibz = kp_to_ibz_arr(k);
-        for (long iw = 0; iw < N_w; ++iw)
-          for (long mu = 0; mu < nbnd; ++mu)
-            for (long nu = 0; nu < nbnd; ++nu)
-              A(s, k, iw, mu, nu) =
-                  ComplexType(0.5, 0.0) *
-                  (A_in(iw, s, kibz, mu, nu)
-                   + std::conj(A_in(iw, s, kibz, nu, mu)));
-      }
-  } else {
-    nda::array<ComplexType, 5> A_h(ns, Nk, N_w, nbnd, nbnd);
-    for (long s = 0; s < ns; ++s)
-      for (long k = 0; k < Nk; ++k) {
-        const long kibz = kp_to_ibz_arr(k);
-        for (long iw = 0; iw < N_w; ++iw)
-          for (long mu = 0; mu < nbnd; ++mu)
-            for (long nu = 0; nu < nbnd; ++nu)
-              A_h(s, k, iw, mu, nu) =
-                  ComplexType(0.5, 0.0) *
-                  (A_in(iw, s, kibz, mu, nu)
-                   + std::conj(A_in(iw, s, kibz, nu, mu)));
-      }
-    A = memory::to_memory_space<MEM>(A_h);
-  }
 
+  // P1 (memory-redesign): per-(s, k) host scratch built on demand inside
+  // the projection loop instead of an upfront (ns, Nk, N_w, nbnd, nbnd)
+  // replicated A. For DEVICE_MEMORY a per-iter H2D transfer pushes the
+  // scratch to MEM; same total data movement as the bulk push, just split
+  // across non-TR k's.
+  nda::array<ComplexType, 3> A_one_k_host(N_w, nbnd, nbnd);
+  memory::buffered_array<MEM, ComplexType, 3> A_one_k_mem(
+      std::array<long, 3>{N_w, nbnd, nbnd});
+  auto build_A_one_k = [&](long s, long kibz) {
+    for (long iw = 0; iw < N_w; ++iw)
+      for (long mu = 0; mu < nbnd; ++mu)
+        for (long nu = 0; nu < nbnd; ++nu)
+          A_one_k_host(iw, mu, nu) =
+              ComplexType(0.5, 0.0) *
+              (A_in(iw, s, kibz, mu, nu)
+               + std::conj(A_in(iw, s, kibz, nu, mu)));
+  };
   // Marshal X(s, k, P, mu) into shared memory: one copy per node.
   // Cached across SCF iterations.
   if (!cache.sX.has_value() or
@@ -554,26 +542,30 @@ void real_axis_gw_t::evaluate(real_axis::real_axis_mb_state_t & state,
       comm, pgrid_aux, shape_aux, bsize_aux);
   auto A_aux_loc = dA_aux_skPQw.local();
   // Pass 1: project for non-TR k's only.
+  // P1: build A_one_k_host on demand and push to MEM per-(s, k).
   if constexpr (MEM == HOST_MEMORY) {
     for (long s = 0; s < ns; ++s)
       for (long ik = 0; ik < Nk; ++ik) {
         if (kp_trev_arr(ik) != 0) continue;
+        const long kibz = kp_to_ibz_arr(ik);
+        build_A_one_k(s, kibz);
         auto X_P_slice  = X(s, ik, Pr, _);
         auto X_Q_slice  = X(s, ik, Qr, _);
-        auto A_view     = A(s, ik, _, _, _);
         auto A_aux_view = A_aux_loc(s, ik, _, _, _);
-        primary_to_aux_one_k(X_P_slice, X_Q_slice, A_view, A_aux_view);
+        primary_to_aux_one_k(X_P_slice, X_Q_slice, A_one_k_host, A_aux_view);
       }
   } else {
     auto X_dev = (*cache.X_mem)();
     for (long s = 0; s < ns; ++s)
       for (long ik = 0; ik < Nk; ++ik) {
         if (kp_trev_arr(ik) != 0) continue;
+        const long kibz = kp_to_ibz_arr(ik);
+        build_A_one_k(s, kibz);
+        A_one_k_mem = memory::to_memory_space<MEM>(A_one_k_host);
         auto X_P_slice  = X_dev(s, ik, Pr, _);
         auto X_Q_slice  = X_dev(s, ik, Qr, _);
-        auto A_view     = A(s, ik, _, _, _);
         auto A_aux_view = A_aux_loc(s, ik, _, _, _);
-        primary_to_aux_one_k<MEM>(X_P_slice, X_Q_slice, A_view, A_aux_view);
+        primary_to_aux_one_k<MEM>(X_P_slice, X_Q_slice, A_one_k_mem, A_aux_view);
       }
   }
   // Pass 2: TR-pair fix-up. aux-A(k) = conj(aux-A(kp_trev_pair(k))) for
@@ -923,68 +915,66 @@ void real_axis_gw_t::evaluate(real_axis::real_axis_mb_state_t & state,
   // obtained via a single allreduce on the orbital-shape Sigma at the end.
   // ----------------------------------------------------------------
   const auto t8 = t_now();
-  memory::buffered_array<MEM, ComplexType, 5> ImSigma_mem(
-      std::array<long,5>{ns, Nk, N_w, nbnd, nbnd});
-  memory::buffered_array<MEM, ComplexType, 5> ReSigma_mem(
-      std::array<long,5>{ns, Nk, N_w, nbnd, nbnd});
-  ImSigma_mem() = ComplexType(0.0, 0.0);
-  ReSigma_mem() = ComplexType(0.0, 0.0);
-  if constexpr (MEM == HOST_MEMORY) {
-    for (long s = 0; s < ns; ++s)
-      for (long ik = 0; ik < Nk; ++ik) {
+  // P2 (memory-redesign): chunk the back-projection + allreduce per
+  // (s, ik). aux_to_primary into 3D scratch (N_w, nbnd, nbnd), allreduce
+  // that scratch, write directly to state. Replaces the previous
+  // (ns, Nk, N_w, nbnd², 16) replicated buffers with a single 3D scratch.
+  // Trade: Nk × allreduce calls instead of one bulk allreduce — fine for
+  // small Nk; for larger Nk (production) coalesce later if perf demands.
+  memory::buffered_array<MEM, ComplexType, 3> ImSig_orb_one_k(
+      std::array<long, 3>{N_w, nbnd, nbnd});
+  memory::buffered_array<MEM, ComplexType, 3> ReSig_orb_one_k(
+      std::array<long, 3>{N_w, nbnd, nbnd});
+  nda::array<ComplexType, 3> ImSig_orb_one_k_host(N_w, nbnd, nbnd);
+  nda::array<ComplexType, 3> ReSig_orb_one_k_host(N_w, nbnd, nbnd);
+  // Zero state Sigma on node-root before accumulation.
+  if (state.ImSigma_wskij->node_comm()->root())
+    state.ImSigma_wskij->local() = ComplexType(0.0, 0.0);
+  if (state.ReSigma_wskij->node_comm()->root())
+    state.ReSigma_wskij->local() = ComplexType(0.0, 0.0);
+  state.ImSigma_wskij->node_sync();
+  state.ReSigma_wskij->node_sync();
+
+  for (long s = 0; s < ns; ++s) {
+    for (long ik = 0; ik < Nk; ++ik) {
+      auto Im_view = ImSigma_aux_skPQw_loc(s, ik, _, _, _);
+      auto Re_view = ReSigma_aux_skPQw_loc(s, ik, _, _, _);
+      if constexpr (MEM == HOST_MEMORY) {
         auto X_P_slice = X(s, ik, Pr, _);
         auto X_Q_slice = X(s, ik, Qr, _);
-        auto Im_view = ImSigma_aux_skPQw_loc(s, ik, _, _, _);
-        auto Re_view = ReSigma_aux_skPQw_loc(s, ik, _, _, _);
-        auto ImOut   = ImSigma_mem(s, ik, _, _, _);
-        auto ReOut   = ReSigma_mem(s, ik, _, _, _);
-        aux_to_primary_one_k(X_P_slice, X_Q_slice, Im_view, ImOut);
-        aux_to_primary_one_k(X_P_slice, X_Q_slice, Re_view, ReOut);
-      }
-  } else {
-    auto X_dev = (*cache.X_mem)();
-    for (long s = 0; s < ns; ++s)
-      for (long ik = 0; ik < Nk; ++ik) {
+        aux_to_primary_one_k(X_P_slice, X_Q_slice, Im_view, ImSig_orb_one_k);
+        aux_to_primary_one_k(X_P_slice, X_Q_slice, Re_view, ReSig_orb_one_k);
+        ImSig_orb_one_k_host = ImSig_orb_one_k;
+        ReSig_orb_one_k_host = ReSig_orb_one_k;
+      } else {
+        auto X_dev = (*cache.X_mem)();
         auto X_P_slice = X_dev(s, ik, Pr, _);
         auto X_Q_slice = X_dev(s, ik, Qr, _);
-        auto Im_view = ImSigma_aux_skPQw_loc(s, ik, _, _, _);
-        auto Re_view = ReSigma_aux_skPQw_loc(s, ik, _, _, _);
-        auto ImOut   = ImSigma_mem(s, ik, _, _, _);
-        auto ReOut   = ReSigma_mem(s, ik, _, _, _);
-        aux_to_primary_one_k<MEM>(X_P_slice, X_Q_slice, Im_view, ImOut);
-        aux_to_primary_one_k<MEM>(X_P_slice, X_Q_slice, Re_view, ReOut);
+        aux_to_primary_one_k<MEM>(X_P_slice, X_Q_slice, Im_view, ImSig_orb_one_k);
+        aux_to_primary_one_k<MEM>(X_P_slice, X_Q_slice, Re_view, ReSig_orb_one_k);
+        ImSig_orb_one_k_host = nda::to_host(ImSig_orb_one_k);
+        ReSig_orb_one_k_host = nda::to_host(ReSig_orb_one_k);
       }
-  }
-  // Pull MEM-side Sigmas to host for the allreduce + state write.
-  // (The allreduce is over the global comm; orbital basis is small.)
-  nda::array<ComplexType, 5> ImSigma, ReSigma;
-  if constexpr (MEM == HOST_MEMORY) {
-    ImSigma = ImSigma_mem;
-    ReSigma = ReSigma_mem;
-  } else {
-    ImSigma = nda::to_host(ImSigma_mem);
-    ReSigma = nda::to_host(ReSigma_mem);
-  }
-  // Allreduce the partial sums across (P, Q) ranks to get the full Sigma.
-  if (comm.size() > 1) {
-    comm.all_reduce_in_place_n(ImSigma.data(), ImSigma.size(), std::plus<>{});
-    comm.all_reduce_in_place_n(ReSigma.data(), ReSigma.size(), std::plus<>{});
-  }
-
-  // Repack into state.{Im,Re}Sigma_wskij with (N_w, ns, Nk, nbnd, nbnd) layout.
-  // sArray writes only on node-root (else races on shared memory).
-  if (state.ImSigma_wskij->node_comm()->root()) {
-    for (long s = 0; s < ns; ++s)
-      for (long k = 0; k < Nk; ++k)
+      // Allreduce this (s, ik) chunk across (P, Q) ranks.
+      if (comm.size() > 1) {
+        comm.all_reduce_in_place_n(ImSig_orb_one_k_host.data(),
+                                    ImSig_orb_one_k_host.size(), std::plus<>{});
+        comm.all_reduce_in_place_n(ReSig_orb_one_k_host.data(),
+                                    ReSig_orb_one_k_host.size(), std::plus<>{});
+      }
+      // Write to state on node-root + node_sync (sArray write convention).
+      if (state.ImSigma_wskij->node_comm()->root()) {
         for (long iw = 0; iw < N_w; ++iw)
           for (long mu = 0; mu < nbnd; ++mu)
             for (long nu = 0; nu < nbnd; ++nu) {
-              ImSigma_out(iw, s, k, mu, nu) = ImSigma(s, k, iw, mu, nu);
-              ReSigma_out(iw, s, k, mu, nu) = ReSigma(s, k, iw, mu, nu);
+              ImSigma_out(iw, s, ik, mu, nu) = ImSig_orb_one_k_host(iw, mu, nu);
+              ReSigma_out(iw, s, ik, mu, nu) = ReSig_orb_one_k_host(iw, mu, nu);
             }
+      }
+      state.ImSigma_wskij->node_sync();
+      state.ReSigma_wskij->node_sync();
+    }
   }
-  state.ImSigma_wskij->node_sync();
-  state.ReSigma_wskij->node_sync();
   const double dt8 = sec_since(t8);
 
   // ----------------------------------------------------------------
