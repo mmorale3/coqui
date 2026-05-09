@@ -159,6 +159,15 @@ inline void run_real_axis_gw(THC_t& thc, ptree const& pt)
   const auto N_dense_p   = io::get_value_with_default<long>  (pt, "N_dense", 0);
   io::tolower(mix_kind_s);
   io::tolower(grid_kind_s);
+  // Checkpointing (Phase-2 write-side; read-side is deferred). write_chkpt
+  // toggles per-iter h5 dumps; restart suppresses metadata write so an outer
+  // SCF wrapper can append iters across calls; chkpt_freq>1 thins the dump
+  // (final iter always written). Default off so legacy behavior is unchanged.
+  const auto write_chkpt_p = io::get_value_with_default<bool>(pt, "write_chkpt", false);
+  const auto restart_p     = io::get_value_with_default<bool>(pt, "restart", false);
+  const auto output_p      = io::get_value_with_default<std::string>(pt, "output",
+                              "coqui_real_axis");
+  const auto chkpt_freq_p  = io::get_value_with_default<long>(pt, "chkpt_freq", 1);
 
   // ---- Validation ---------------------------------------------------------
   // Accepted div_treatment values:
@@ -212,6 +221,7 @@ inline void run_real_axis_gw(THC_t& thc, ptree const& pt)
 
   real_axis_mb_state_t state(grid);
   state.mpi = mpi;
+  state.coqui_prefix = output_p;
 
   if (verbose and mpi->comm.root()) {
     app_log(1, "");
@@ -280,9 +290,84 @@ inline void run_real_axis_gw(THC_t& thc, ptree const& pt)
     k_weights(ik) = kw(ik);
   const double N_elec = static_cast<double>(mf->nelec());
 
+  // ---- Pre-SCF: chkpt setup ---------------------------------------------
+  // The scGW driver allocates state.{A_wskij, Sigma_x_skij, ImSigma, ReSigma,
+  // Dm_skij} lazily inside its own loop, but for an iter-0 dump (initial
+  // KS-Lorentzian state, before any GW work) we need them populated here.
+  // Mirrors the imag-axis pattern: write_metadata + iter-0 dump only on
+  // !restart (so an outer wrapper can append iters across calls).
+  long init_it_scgw = 0;
+  if (write_chkpt_p and !restart_p) {
+    using sA4 = real_axis_mb_state_t::sArray_t<nda::array_view<ComplexType, 4>>;
+    using sA5 = real_axis_mb_state_t::sArray_t<nda::array_view<ComplexType, 5>>;
+    // Allocate orbital state at IBZ k.
+    state.A_wskij.emplace(*mpi,
+        std::array<long, 5>{p.N_w, ns, Nk_ibz, nbnd, nbnd});
+    state.ImSigma_wskij.emplace(*mpi,
+        std::array<long, 5>{p.N_w, ns, Nk_ibz, nbnd, nbnd});
+    state.ReSigma_wskij.emplace(*mpi,
+        std::array<long, 5>{p.N_w, ns, Nk_ibz, nbnd, nbnd});
+    state.Sigma_x_skij.emplace(*mpi,
+        std::array<long, 4>{ns, Nk_ibz, nbnd, nbnd});
+    state.Dm_skij.emplace(*mpi,
+        std::array<long, 4>{ns, Nk_ibz, nbnd, nbnd});
+    // Initial A: Lorentzian poles at KS eigenvalues (same recipe the SCF
+    // driver uses internally on its first iter; pre-computing here lets us
+    // dump before iter 1).
+    if (state.A_wskij->node_comm()->root()) {
+      auto A = state.A_wskij->local();
+      A = ComplexType(0.0, 0.0);
+      const double eta_init = std::max(eta_p, 1e-2);
+      for (long s = 0; s < ns; ++s)
+        for (long k = 0; k < Nk_ibz; ++k)
+          for (long n = 0; n < nbnd; ++n) {
+            const double e = eigval(s, k, n);
+            for (long iw = 0; iw < p.N_w; ++iw) {
+              const double wl = grid.w()(iw) + grid.mu_chem();
+              const double v = (1.0 / M_PI) * eta_init
+                             / ((wl - e)*(wl - e) + eta_init*eta_init);
+              A(iw, s, k, n, n) = ComplexType(v, 0.0);
+            }
+          }
+      state.ImSigma_wskij->local() = ComplexType(0.0, 0.0);
+      state.ReSigma_wskij->local() = ComplexType(0.0, 0.0);
+      state.Sigma_x_skij->local()  = ComplexType(0.0, 0.0);
+    }
+    state.A_wskij->node_sync();
+    state.ImSigma_wskij->node_sync();
+    state.ReSigma_wskij->node_sync();
+    state.Sigma_x_skij->node_sync();
+
+    // Compute initial Dm from the seeded A at the grid's mu_chem.
+    detail_scgw::compute_Dm_from_A(grid, state.A_wskij.value(),
+                                    grid.mu_chem(), state.Dm_skij.value());
+
+    // sH0 / sS sArrays for write_metadata (build from MF).
+    auto sH0_ibz = math::shm::make_shared_array<nda::array_view<ComplexType, 4>>(
+        *mpi, std::array<long, 4>{ns, Nk_ibz, nbnd, nbnd});
+    auto sS_ibz = math::shm::make_shared_array<nda::array_view<ComplexType, 4>>(
+        *mpi, std::array<long, 4>{ns, Nk_ibz, nbnd, nbnd});
+    auto psp = hamilt::make_pseudopot(*mf);
+    hamilt::set_H0(*mf, psp.get(), sH0_ibz);
+    hamilt::set_ovlp(*mf, sS_ibz);
+    mpi->comm.barrier();
+
+    chkpt::write_metadata_real_axis(mpi->comm, *mf, grid, sH0_ibz, sS_ibz,
+                                     state.coqui_prefix);
+    chkpt::dump_scf_real_axis(mpi->comm, /*iter*/ 0,
+                               state.Dm_skij.value(), state.A_wskij.value(),
+                               state.Sigma_x_skij.value(),
+                               state.ImSigma_wskij.value(),
+                               state.ReSigma_wskij.value(),
+                               grid.mu_chem(), state.coqui_prefix);
+  }
+
   // ---- Run SCF ----------------------------------------------------------
   auto res = real_axis_scf_loop(state, dyson, thc, mb_solver, cfg,
-                                k_weights, N_elec);
+                                k_weights, N_elec,
+                                /*init_it*/ init_it_scgw,
+                                /*write_chkpt*/ write_chkpt_p,
+                                /*chkpt_freq*/ chkpt_freq_p);
 
   if (mpi->comm.root()) {
     app_log(1, "");

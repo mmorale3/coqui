@@ -40,6 +40,7 @@
 #include "methods/GW_real_axis/real_axis_dyson_G.hpp"
 #include "methods/GW_real_axis/real_axis_diis.hpp"
 #include "methods/GW_real_axis/real_axis_scf.hpp"
+#include "methods/tools/chkpt_utils.h"
 
 namespace methods {
 namespace real_axis {
@@ -72,6 +73,47 @@ struct real_axis_mb_solver_base_t {
 
 using real_axis_mb_solver_t = real_axis_mb_solver_base_t<HOST_MEMORY>;
 
+namespace detail_scgw {
+  /**
+   * Compute orbital-basis density matrix from the spectral function via
+   * the sum-rule integral
+   *     Dm_{ij}(s, k) = sum_w  w_weights(w) * f(w - mu_chem) * A_{ij}(w, s, k)
+   * where w-grid and weights come from the real_freq_grid_t and f is the
+   * Fermi-Dirac factor. A_wskij is stored componentwise (-(i/π) G^R_ij), so
+   * this integral on the real axis recovers the standard definition.
+   * Writes on node-root then node_sync.
+   */
+  template<typename sArray5_t, typename sArray4_t>
+  inline void compute_Dm_from_A(real_freq_grid_t const& grid,
+                                sArray5_t        const& sA_wskij,
+                                double                  mu_chem,
+                                sArray4_t            && sDm_skij)
+  {
+    if (sDm_skij.node_comm()->root()) {
+      auto A   = sA_wskij.local();
+      auto Dm  = sDm_skij.local();
+      const long N_w  = A.shape()[0];
+      const long ns   = A.shape()[1];
+      const long Nk   = A.shape()[2];
+      const long nbnd = A.shape()[3];
+      Dm = ComplexType(0.0, 0.0);
+      auto w_grid = grid.w();
+      auto w_wts  = grid.w_weights();
+      const double beta = grid.beta();
+      for (long iw = 0; iw < N_w; ++iw) {
+        const double f  = real_freq_grid_t::fermi(w_grid(iw), mu_chem, beta);
+        const double cf = f * w_wts(iw);
+        for (long s = 0; s < ns; ++s)
+          for (long k = 0; k < Nk; ++k)
+            for (long i = 0; i < nbnd; ++i)
+              for (long j = 0; j < nbnd; ++j)
+                Dm(s, k, i, j) += ComplexType(cf, 0.0) * A(iw, s, k, i, j);
+      }
+    }
+    sDm_skij.node_sync();
+  }
+} // namespace detail_scgw
+
 /**
  * Real-axis self-consistent GW driver. Mirrors `evaluate(MBState, eri)`
  * dispatch + `update_G` Dyson update of `methods::scf_loop` (imag-axis).
@@ -98,7 +140,10 @@ inline scgw_result real_axis_scf_loop(real_axis_mb_state_t& state,
                                        real_axis_mb_solver_base_t<MEM> mb_solver,
                                        scgw_config const& cfg,
                                        nda::array<double, 1> const& k_weights,
-                                       double N_elec)
+                                       double N_elec,
+                                       long  init_it    = 0,
+                                       bool  write_chkpt = false,
+                                       long  chkpt_freq = 1)
 {
   // The state lives on host (sArrays / dArrays<HOST_MEMORY>) so MEM is a
   // template marker for this driver. The underlying solver classes
@@ -182,6 +227,13 @@ inline scgw_result real_axis_scf_loop(real_axis_mb_state_t& state,
   if (state.Sigma_x_skij->node_comm()->root())
     state.Sigma_x_skij->local() = ComplexType(0.0, 0.0);
   state.Sigma_x_skij->node_sync();
+
+  // Density matrix storage on state. Populated each iter (sum-rule integral
+  // on A) so a per-iter chkpt dump can record it. Cheap (single ω quadrature
+  // on a 5D nbnd² array) compared to the GW work.
+  if (!state.Dm_skij.has_value())
+    state.Dm_skij.emplace(*state.mpi,
+        std::array<long, 4>{ns, Nk, nbnd, nbnd});
 
   // Use R-space if the THC fixture is periodic (Nk > 1).
   const bool use_rspace = (Nk > 1);
@@ -313,7 +365,29 @@ inline scgw_result real_axis_scf_loop(real_axis_mb_state_t& state,
     res.iter_used  = it + 1;
     res.final_diff = diff;
     res.final_mu   = mu_cur;
-    if (diff < cfg.tol) { res.converged = true; break; }
+    const bool stop = (diff < cfg.tol);
+
+    // Per-iter checkpoint: populate Dm from A, then write {Dm, A, Sigma_x,
+    // ImSigma, ReSigma, mu} to the SCF h5 file. Iter label is offset by
+    // init_it (file-derived for restart). Throttled by chkpt_freq; the
+    // final iter (stop=true) is always dumped if write_chkpt is on so the
+    // converged state is persisted.
+    if (write_chkpt) {
+      const long it_label = init_it + it + 1;
+      const bool dump_now = stop or (chkpt_freq > 0 and (it_label % chkpt_freq == 0));
+      if (dump_now) {
+        detail_scgw::compute_Dm_from_A(grid_in, state.A_wskij.value(),
+                                        mu_cur, state.Dm_skij.value());
+        chkpt::dump_scf_real_axis(
+            comm, it_label,
+            state.Dm_skij.value(), state.A_wskij.value(),
+            state.Sigma_x_skij.value(),
+            state.ImSigma_wskij.value(), state.ReSigma_wskij.value(),
+            mu_cur, state.coqui_prefix);
+      }
+    }
+
+    if (stop) { res.converged = true; break; }
   }
 
   return res;

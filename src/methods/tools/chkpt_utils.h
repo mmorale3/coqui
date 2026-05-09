@@ -77,6 +77,26 @@ namespace methods {
                 double mu, std::string output = "bdft",
                 std::string input_grp="scf", long input_iter=-1);
 
+  /**
+   * Real-axis Dyson-style checkpoint dump. Mirrors the imag-axis dump_scf
+   * (Dm, G_tskij, F_skij, Sigma_tskij) but writes real-axis-specific names:
+   *   A_wskij        replaces G_tskij    (spectral function on the real axis)
+   *   ImSigma_wskij  + ReSigma_wskij     (split Im/Re of dynamic self-energy)
+   *   Sigma_x_skij   replaces F_skij     (static-exchange self-energy)
+   * Adds an "axis"="real" string attribute on each iter group so cross-axis
+   * tooling can disambiguate.
+   */
+  template <typename communicator_t, typename X_4D_t, typename X_5D_t>
+  void dump_scf_real_axis(communicator_t &comm, long iter,
+                          const X_4D_t &Dm_skij,
+                          const X_5D_t &A_wskij,
+                          const X_4D_t &Sigma_x_skij,
+                          const X_5D_t &ImSigma_wskij,
+                          const X_5D_t &ReSigma_wskij,
+                          double mu, std::string output = "bdft",
+                          std::string input_grp = "scf",
+                          long input_iter = -1);
+
   template<typename communicator_t, typename X_4D_t, typename X_3D_t>
   void dump_scf(communicator_t &comm, long iter,
                 const X_4D_t &Dm_skij, const X_4D_t &Heff_skij,

@@ -153,6 +153,40 @@ void dump_scf(communicator_t &comm, long iter,
   comm.barrier();
 }
 
+template<typename communicator_t, typename X_4D_t, typename X_5D_t>
+void dump_scf_real_axis(communicator_t &comm, long iter,
+                        const X_4D_t &Dm_skij,
+                        const X_5D_t &A_wskij,
+                        const X_4D_t &Sigma_x_skij,
+                        const X_5D_t &ImSigma_wskij,
+                        const X_5D_t &ReSigma_wskij,
+                        double mu, std::string output,
+                        std::string input_grp, long input_iter) {
+  if (comm.root()) {
+    std::string filename = output + ".mbpt.h5";
+    std::string iter_grp_name = "iter" + std::to_string(iter);
+    h5::file file(filename, 'a');
+    h5::group grp(file);
+    auto scf_grp = (grp.has_subgroup("scf"))? grp.open_group("scf") : grp.create_group("scf");
+    auto iter_grp = (scf_grp.has_subgroup(iter_grp_name) )?
+        scf_grp.open_group(iter_grp_name) : scf_grp.create_group(iter_grp_name);
+
+    if (input_iter==-1) input_iter = iter-1;
+
+    h5::h5_write(scf_grp, "final_iter", iter);
+    h5::h5_write(iter_grp, "axis", std::string("real"));
+    h5::h5_write(iter_grp, "greens_func_source", input_grp);
+    h5::h5_write(iter_grp, "greens_func_iteration", input_iter);
+    nda::h5_write(iter_grp, "Dm_skij",        Dm_skij.local(),       false);
+    nda::h5_write(iter_grp, "A_wskij",        A_wskij.local(),       false);
+    nda::h5_write(iter_grp, "Sigma_x_skij",   Sigma_x_skij.local(),  false);
+    nda::h5_write(iter_grp, "ImSigma_wskij",  ImSigma_wskij.local(), false);
+    nda::h5_write(iter_grp, "ReSigma_wskij",  ReSigma_wskij.local(), false);
+    h5::h5_write(iter_grp, "mu", mu);
+  }
+  comm.barrier();
+}
+
 template<typename communicator_t, typename X_4D_t, typename X_3D_t>
 void dump_scf(communicator_t &comm, long iter,
               const X_4D_t &Dm_skij, const X_4D_t &Heff_skij,
@@ -544,6 +578,13 @@ template void dump_scf(
     const sArray_t<Array_view_4D_t>&, const sArray_t<Array_view_4D_t>&,
     const sArray_t<Array_view_4D_t>&, const sArray_t<Array_view_3D_t>&,
     double, std::string);
+
+template void dump_scf_real_axis(
+    mpi3::communicator&, long,
+    const sArray_t<Array_view_4D_t>&, const sArray_t<Array_view_5D_t>&,
+    const sArray_t<Array_view_4D_t>&, const sArray_t<Array_view_5D_t>&,
+    const sArray_t<Array_view_5D_t>&,
+    double, std::string, std::string, long);
 
 template long read_scf(
     mpi3::shared_communicator, sArray_t<Array_view_4D_t>&,
