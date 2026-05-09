@@ -27,7 +27,8 @@ from .post_proc import (
     dump_vxc,
     dump_hartree
 )
+from .real_axis_chkpt import RealAxisChkpt
 
 __all__ = ["ac", "band_interpolation", "spectral_interpolation",
            "local_dos", "unfold_bz", "dump_vxc", "dump_hartree",
-           "plot_utils"]
+           "plot_utils", "RealAxisChkpt"]
