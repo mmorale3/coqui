@@ -151,10 +151,13 @@ inline void run_real_axis_gw(THC_t& thc, ptree const& pt)
   auto       mix_kind_s = io::get_value_with_default<std::string>(pt, "mix_kind", "diis");
   const auto alpha_mix  = io::get_value_with_default<double>(pt, "alpha_mix", 0.7);
   const auto diis_win   = io::get_value_with_default<long>  (pt, "diis_window", 8);
-  // Non-uniform fermionic-grid options. grid_kind="uniform" (default,
-  // back-compat) or "nonuniform_log" (linear-dense around mu, log tails).
+  // Fermionic-grid options. grid_kind="nonuniform_log" is the default
+  // (linear-dense around mu, log tails) — uniform-grid is also supported
+  // via grid_kind="uniform" but produces a coarse dω≈3.8 eV near the gap
+  // edge at typical N_w=129, which can break scGW convergence on hard
+  // semiconductor fixtures (kp444 nbnd=256 limit cycle, 2026-05-09).
   // w_dense / N_dense control the dense block; ignored for uniform.
-  auto       grid_kind_s = io::get_value_with_default<std::string>(pt, "grid_kind", "uniform");
+  auto       grid_kind_s = io::get_value_with_default<std::string>(pt, "grid_kind", "nonuniform_log");
   const auto w_dense_p   = io::get_value_with_default<double>(pt, "w_dense", 0.0);
   const auto N_dense_p   = io::get_value_with_default<long>  (pt, "N_dense", 0);
   io::tolower(mix_kind_s);
@@ -465,7 +468,7 @@ inline void run_real_axis_qpgw(THC_t& thc, ptree const& pt)
   const auto tol_max_de_p = io::get_value_with_default<double>(pt, "tol_max_de", 1e-3);
   const auto tol_dDm_p    = io::get_value_with_default<double>(pt, "tol_dDm",    1e-3);
   // Non-uniform fermionic-grid options (see [real_axis_gw] section docs).
-  auto       grid_kind_s = io::get_value_with_default<std::string>(pt, "grid_kind", "uniform");
+  auto       grid_kind_s = io::get_value_with_default<std::string>(pt, "grid_kind", "nonuniform_log");
   const auto w_dense_p   = io::get_value_with_default<double>(pt, "w_dense", 0.0);
   const auto N_dense_p   = io::get_value_with_default<long>  (pt, "N_dense", 0);
   io::tolower(grid_kind_s);
