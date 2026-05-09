@@ -210,9 +210,12 @@ inline void run_real_axis_gw(THC_t& thc, ptree const& pt)
   const double w_dense_eff = (w_dense_p > 0.0)
                               ? w_dense_p
                               : std::max(8.0 * eta_p, 0.4);
+  // Auto-rule: N_dense ≈ N_w/2 with the same parity as N_w so that
+  // (N_w - N_dense) is always even (required by make_nonuniform_log so
+  // the log tails on each side of the dense block have equal point count).
   const long   N_dense_eff = (N_dense_p > 0)
                               ? N_dense_p
-                              : (((p.N_w / 2) | 1) /* odd if N_w even */);
+                              : ((p.N_w / 4) * 2 + (p.N_w & 1));
   auto grid = (grid_kind_s == "nonuniform_log")
               ? real_freq_grid_t::make_nonuniform_log(
                   p.beta, p.mu0, p.w_max, p.N_w,
