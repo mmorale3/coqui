@@ -200,12 +200,107 @@ void invnufft(nuplan_t const &p, std::complex<float> *f, std::complex<float> *c)
 }
 
 // =========================================================================
-// destroy_plan — free both type-1 and type-2 plans.
-// Mirrors fftw.cpp: check backend, cast void*, call destroy, delete.
+// Type-3 (NU → NU) plan creation. Stored in nuplan_t::t3; fwd/inv left null.
+// finufft_makeplan(type=3, ...) ignores n_modes (pass nullptr is allowed but
+// some upstream releases require a non-null array; we pass a 1-filled stub
+// to be safe).
+// =========================================================================
+nuplan_t create_plan_t3_impl_(int rank, int64_t npts_in, int64_t npts_out,
+                              int ntrans, double eps, int iflag)
+{
+  nuplan_t p;
+  p.bend        = NUFFT_BACKEND_FINUFFT;
+  p.rank        = rank;
+  p.ntrans      = ntrans;
+  p.npts        = npts_in;
+  p.npts_out    = npts_out;
+  p.nmodes      = {1, 1, 1};
+  p.iflag       = iflag;
+  p.single_prec = false;
+  auto *plan = new finufft_plan{};
+  int ier = finufft_makeplan(/*type*/ 3, rank, p.nmodes.data(),
+                              iflag, ntrans, eps, plan, /*opts*/ nullptr);
+  NUFFT_CHECK(ier, "finufft_makeplan (double, type-3) failed");
+  p.t3 = static_cast<void*>(plan);
+  return p;
+}
+
+nuplan_t create_plan_t3_impl_(int rank, int64_t npts_in, int64_t npts_out,
+                              int ntrans, float eps, int iflag)
+{
+  nuplan_t p;
+  p.bend        = NUFFT_BACKEND_FINUFFT;
+  p.rank        = rank;
+  p.ntrans      = ntrans;
+  p.npts        = npts_in;
+  p.npts_out    = npts_out;
+  p.nmodes      = {1, 1, 1};
+  p.iflag       = iflag;
+  p.single_prec = true;
+  auto *plan = new finufftf_plan{};
+  int ier = finufftf_makeplan(/*type*/ 3, rank, p.nmodes.data(),
+                               iflag, ntrans, eps, plan, /*opts*/ nullptr);
+  NUFFT_CHECK(ier, "finufft_makeplan (float, type-3) failed");
+  p.t3 = static_cast<void*>(plan);
+  return p;
+}
+
+// =========================================================================
+// setpts_t3 — bind source + target NU coordinate arrays to a type-3 plan.
+// =========================================================================
+void setpts_t3(nuplan_t &p,
+               double *x, double *y, double *z,
+               double *s, double *t, double *u)
+{
+  utils::check(p.bend == NUFFT_BACKEND_FINUFFT, "setpts_t3: incorrect NUFFT backend.");
+  utils::check(!p.single_prec, "setpts_t3: double pointers passed to single-precision plan.");
+  auto *pt3 = static_cast<finufft_plan*>(p.t3);
+  utils::check(pt3 != nullptr, "setpts_t3: uninitialised type-3 plan.");
+  int ier = finufft_setpts(*pt3, p.npts, x, y, z, p.npts_out, s, t, u);
+  NUFFT_CHECK(ier, "finufft_setpts (double, type-3) failed");
+}
+
+void setpts_t3(nuplan_t &p,
+               float *x, float *y, float *z,
+               float *s, float *t, float *u)
+{
+  utils::check(p.bend == NUFFT_BACKEND_FINUFFT, "setpts_t3: incorrect NUFFT backend.");
+  utils::check(p.single_prec, "setpts_t3: float pointers passed to double-precision plan.");
+  auto *pt3 = static_cast<finufftf_plan*>(p.t3);
+  utils::check(pt3 != nullptr, "setpts_t3: uninitialised type-3 plan.");
+  int ier = finufftf_setpts(*pt3, p.npts, x, y, z, p.npts_out, s, t, u);
+  NUFFT_CHECK(ier, "finufft_setpts (float, type-3) failed");
+}
+
+// =========================================================================
+// execnufft_t3 — execute the type-3 transform: c[j] (M source NU) → f[k] (N target NU).
+// =========================================================================
+void execnufft_t3(nuplan_t const &p, std::complex<double> *c, std::complex<double> *f)
+{
+  utils::check(p.bend == NUFFT_BACKEND_FINUFFT, "execnufft_t3: incorrect NUFFT backend.");
+  utils::check(!p.single_prec, "execnufft_t3: double pointers passed to single-precision plan.");
+  auto *pt3 = static_cast<finufft_plan*>(p.t3);
+  utils::check(pt3 != nullptr, "execnufft_t3: uninitialised type-3 plan.");
+  int ier = finufft_execute(*pt3, c, f);
+  NUFFT_CHECK(ier, "finufft_execute type-3 (double) failed");
+}
+
+void execnufft_t3(nuplan_t const &p, std::complex<float> *c, std::complex<float> *f)
+{
+  utils::check(p.bend == NUFFT_BACKEND_FINUFFT, "execnufft_t3: incorrect NUFFT backend.");
+  utils::check(p.single_prec, "execnufft_t3: float pointers passed to double-precision plan.");
+  auto *pt3 = static_cast<finufftf_plan*>(p.t3);
+  utils::check(pt3 != nullptr, "execnufft_t3: uninitialised type-3 plan.");
+  int ier = finufftf_execute(*pt3, c, f);
+  NUFFT_CHECK(ier, "finufft_execute type-3 (float) failed");
+}
+
+// =========================================================================
+// destroy_plan — free type-1 / type-2 / type-3 plans (whichever non-null).
 // =========================================================================
 void destroy_plan(nuplan_t &p)
 {
-  if (p.fwd == nullptr && p.inv == nullptr) return;
+  if (p.fwd == nullptr && p.inv == nullptr && p.t3 == nullptr) return;
   utils::check(p.bend == NUFFT_BACKEND_FINUFFT, "destroy_plan: incorrect NUFFT backend.");
 
   if (!p.single_prec) {
@@ -215,6 +310,9 @@ void destroy_plan(nuplan_t &p)
     if (auto *pinv = static_cast<finufft_plan*>(p.inv)) {
       finufft_destroy(*pinv); delete pinv; p.inv = nullptr;
     }
+    if (auto *pt3 = static_cast<finufft_plan*>(p.t3)) {
+      finufft_destroy(*pt3); delete pt3; p.t3 = nullptr;
+    }
   } else {
     if (auto *pfwd = static_cast<finufftf_plan*>(p.fwd)) {
       finufftf_destroy(*pfwd); delete pfwd; p.fwd = nullptr;
@@ -222,8 +320,10 @@ void destroy_plan(nuplan_t &p)
     if (auto *pinv = static_cast<finufftf_plan*>(p.inv)) {
       finufftf_destroy(*pinv); delete pinv; p.inv = nullptr;
     }
+    if (auto *pt3 = static_cast<finufftf_plan*>(p.t3)) {
+      finufftf_destroy(*pt3); delete pt3; p.t3 = nullptr;
+    }
   }
-
 }
 
 } // namespace math::nufft::impl::host

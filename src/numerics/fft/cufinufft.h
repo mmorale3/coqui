@@ -59,6 +59,21 @@ nuplan_t create_plan(int Rank, const int64_t *nmodes, int64_t npts,
 }
 
 // -------------------------------------------------------------------------
+// Type-3 (NU → NU) plan creation. Stored in nuplan_t::t3.
+// -------------------------------------------------------------------------
+nuplan_t create_plan_t3_impl_(int rank, int64_t npts_in, int64_t npts_out,
+                              int ntrans, double eps, int iflag);
+nuplan_t create_plan_t3_impl_(int rank, int64_t npts_in, int64_t npts_out,
+                              int ntrans, float  eps, int iflag);
+
+template<typename EpsType>
+nuplan_t create_plan_t3(int Rank, int64_t npts_in, int64_t npts_out,
+                        int ntrans, EpsType eps, int iflag)
+{
+  return create_plan_t3_impl_(Rank, npts_in, npts_out, ntrans, eps, iflag);
+}
+
+// -------------------------------------------------------------------------
 // setpts -- coordinate arrays must be DEVICE pointers (e.g. data() of an
 // nda::cuarray). Pass nullptr for unused dimensions.
 // -------------------------------------------------------------------------
@@ -66,11 +81,20 @@ nuplan_t create_plan(int Rank, const int64_t *nmodes, int64_t npts,
 void setpts(nuplan_t &p, double *x, double *y, double *z);
 void setpts(nuplan_t &p, float  *x, float  *y, float  *z);
 
+// setpts_t3: source + target NU coords on device.
+void setpts_t3(nuplan_t &p,
+               double *x, double *y, double *z,
+               double *s, double *t, double *u);
+void setpts_t3(nuplan_t &p,
+               float  *x, float  *y, float  *z,
+               float  *s, float  *t, float  *u);
+
 // -------------------------------------------------------------------------
 // Execute transforms.
 //
 // fwdnufft : type-1  NU → U   c[j] (device) → f[k] (device)
 // invnufft : type-2  U  → NU  f[k] (device) → c[j] (device)
+// execnufft_t3 : type-3 NU → NU c[j] (device) → f[k] (device)
 // -------------------------------------------------------------------------
 void fwdnufft(nuplan_t const &p, std::complex<double> *c, std::complex<double> *f);
 void invnufft(nuplan_t const &p, std::complex<double> *f, std::complex<double> *c);
@@ -78,8 +102,11 @@ void invnufft(nuplan_t const &p, std::complex<double> *f, std::complex<double> *
 void fwdnufft(nuplan_t const &p, std::complex<float>  *c, std::complex<float>  *f);
 void invnufft(nuplan_t const &p, std::complex<float>  *f, std::complex<float>  *c);
 
+void execnufft_t3(nuplan_t const &p, std::complex<double> *c, std::complex<double> *f);
+void execnufft_t3(nuplan_t const &p, std::complex<float>  *c, std::complex<float>  *f);
+
 // -------------------------------------------------------------------------
-// Destroy both plans and release cufinufft-internal memory.
+// Destroy plans and release cufinufft-internal memory (handles fwd/inv/t3).
 // -------------------------------------------------------------------------
 void destroy_plan(nuplan_t &p);
 

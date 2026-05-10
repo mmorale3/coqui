@@ -21,6 +21,7 @@ if(ENABLE_FINUFFT)
 
   set(TEST_SRCS
     test_finufft_nda.cpp
+    test_finufft_t3.cpp
   )
 
   add_executable(test_${TEST_ID} ${TEST_SRCS})

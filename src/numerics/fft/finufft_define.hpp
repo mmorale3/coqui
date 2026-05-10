@@ -49,13 +49,15 @@ struct nuplan_t
   NUFFT_BACKEND bend           = NUFFT_BACKEND_UNDEFINED;
   int           rank           = 0;     ///< spatial dimension (1, 2, or 3)
   int           ntrans         = 0;     ///< number of simultaneous transforms
-  int64_t       npts           = 0;     ///< number of nonuniform points M 
-  std::array<int64_t,3> nmodes = {0,0,0}; ///< number of modes in uniform grid 
+  int64_t       npts           = 0;     ///< number of source nonuniform points M
+  int64_t       npts_out       = 0;     ///< number of target nonuniform points N (type-3 only)
+  std::array<int64_t,3> nmodes = {0,0,0}; ///< number of modes in uniform grid (type-1/2 only)
   int           iflag          = +1;    ///< sign convention
   bool          single_prec    = false; ///< true for float plans
 
   void *fwd = nullptr;  ///< type-1 plan (NU → U)
   void *inv = nullptr;  ///< type-2 plan (U  → NU)
+  void *t3  = nullptr;  ///< type-3 plan (NU → NU); only set if create_plan_t3 was called
 };
 
 } // namespace math::nufft

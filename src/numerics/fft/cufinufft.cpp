@@ -245,11 +245,150 @@ void invnufft(nuplan_t const &p, std::complex<float> *f, std::complex<float> *c)
 }
 
 // =========================================================================
-// destroy_plan — free both type-1 and type-2 plans.
+// Type-3 (NU → NU) plan creation. Stored in nuplan_t::t3.
+// =========================================================================
+nuplan_t create_plan_t3_impl_(int rank, int64_t npts_in, int64_t npts_out,
+                              int ntrans, double eps, int iflag)
+{
+  nuplan_t p;
+#if defined(COQUI_HAVE_CUFINUFFT)
+  p.bend        = NUFFT_BACKEND_CUFINUFFT;
+  p.rank        = rank;
+  p.ntrans      = ntrans;
+  p.npts        = npts_in;
+  p.npts_out    = npts_out;
+  p.nmodes      = {1, 1, 1};
+  p.iflag       = iflag;
+  p.single_prec = false;
+  auto *plan = new cufinufft_plan{};
+  int ier = cufinufft_makeplan(/*type*/ 3, rank, p.nmodes.data(),
+                                iflag, ntrans, eps, plan, /*opts*/ nullptr);
+  CUNUFFT_CHECK(ier, "cufinufft_makeplan (double, type-3) failed");
+  p.t3 = static_cast<void*>(plan);
+#else
+  (void)rank; (void)npts_in; (void)npts_out;
+  (void)ntrans; (void)eps; (void)iflag;
+  cufinufft_unavailable("create_plan_t3_impl_(double)");
+#endif
+  return p;
+}
+
+nuplan_t create_plan_t3_impl_(int rank, int64_t npts_in, int64_t npts_out,
+                              int ntrans, float eps, int iflag)
+{
+  nuplan_t p;
+#if defined(COQUI_HAVE_CUFINUFFT)
+  p.bend        = NUFFT_BACKEND_CUFINUFFT;
+  p.rank        = rank;
+  p.ntrans      = ntrans;
+  p.npts        = npts_in;
+  p.npts_out    = npts_out;
+  p.nmodes      = {1, 1, 1};
+  p.iflag       = iflag;
+  p.single_prec = true;
+  auto *plan = new cufinufftf_plan{};
+  int ier = cufinufftf_makeplan(/*type*/ 3, rank, p.nmodes.data(),
+                                 iflag, ntrans, eps, plan, /*opts*/ nullptr);
+  CUNUFFT_CHECK(ier, "cufinufftf_makeplan (float, type-3) failed");
+  p.t3 = static_cast<void*>(plan);
+#else
+  (void)rank; (void)npts_in; (void)npts_out;
+  (void)ntrans; (void)eps; (void)iflag;
+  cufinufft_unavailable("create_plan_t3_impl_(float)");
+#endif
+  return p;
+}
+
+// =========================================================================
+// setpts_t3 — bind source + target NU coordinate arrays (device pointers).
+// =========================================================================
+void setpts_t3(nuplan_t &p,
+               double *x, double *y, double *z,
+               double *s, double *t, double *u)
+{
+#if defined(COQUI_HAVE_CUFINUFFT)
+  utils::check(p.bend == NUFFT_BACKEND_CUFINUFFT,
+               "dev::setpts_t3: incorrect NUFFT backend.");
+  utils::check(!p.single_prec,
+               "dev::setpts_t3: double pointers passed to single-precision plan.");
+  auto *pt3 = static_cast<cufinufft_plan*>(p.t3);
+  utils::check(pt3, "dev::setpts_t3: uninitialised cufinufft type-3 plan.");
+  int ier = cufinufft_setpts(*pt3, p.npts, x, y, z,
+                              static_cast<int>(p.npts_out), s, t, u);
+  CUNUFFT_CHECK(ier, "cufinufft_setpts (double, type-3) failed");
+#else
+  (void)p; (void)x; (void)y; (void)z; (void)s; (void)t; (void)u;
+  cufinufft_unavailable("setpts_t3(double)");
+#endif
+}
+
+void setpts_t3(nuplan_t &p,
+               float *x, float *y, float *z,
+               float *s, float *t, float *u)
+{
+#if defined(COQUI_HAVE_CUFINUFFT)
+  utils::check(p.bend == NUFFT_BACKEND_CUFINUFFT,
+               "dev::setpts_t3: incorrect NUFFT backend.");
+  utils::check(p.single_prec,
+               "dev::setpts_t3: float pointers passed to double-precision plan.");
+  auto *pt3 = static_cast<cufinufftf_plan*>(p.t3);
+  utils::check(pt3, "dev::setpts_t3: uninitialised cufinufftf type-3 plan.");
+  int ier = cufinufftf_setpts(*pt3, p.npts, x, y, z,
+                               static_cast<int>(p.npts_out), s, t, u);
+  CUNUFFT_CHECK(ier, "cufinufftf_setpts (float, type-3) failed");
+#else
+  (void)p; (void)x; (void)y; (void)z; (void)s; (void)t; (void)u;
+  cufinufft_unavailable("setpts_t3(float)");
+#endif
+}
+
+// =========================================================================
+// execnufft_t3 — type-3 execution (NU → NU).
+// =========================================================================
+void execnufft_t3(nuplan_t const &p, std::complex<double> *c, std::complex<double> *f)
+{
+#if defined(COQUI_HAVE_CUFINUFFT)
+  utils::check(p.bend == NUFFT_BACKEND_CUFINUFFT,
+               "dev::execnufft_t3: incorrect NUFFT backend.");
+  utils::check(!p.single_prec,
+               "dev::execnufft_t3: double pointers passed to single-precision plan.");
+  auto *pt3 = static_cast<cufinufft_plan*>(p.t3);
+  utils::check(pt3, "dev::execnufft_t3: uninitialised cufinufft type-3 plan.");
+  int ier = cufinufft_execute(*pt3,
+                               reinterpret_cast<cuDoubleComplex*>(c),
+                               reinterpret_cast<cuDoubleComplex*>(f));
+  CUNUFFT_CHECK(ier, "cufinufft_execute type-3 (double) failed");
+#else
+  (void)p; (void)c; (void)f;
+  cufinufft_unavailable("execnufft_t3(double)");
+#endif
+}
+
+void execnufft_t3(nuplan_t const &p, std::complex<float> *c, std::complex<float> *f)
+{
+#if defined(COQUI_HAVE_CUFINUFFT)
+  utils::check(p.bend == NUFFT_BACKEND_CUFINUFFT,
+               "dev::execnufft_t3: incorrect NUFFT backend.");
+  utils::check(p.single_prec,
+               "dev::execnufft_t3: float pointers passed to double-precision plan.");
+  auto *pt3 = static_cast<cufinufftf_plan*>(p.t3);
+  utils::check(pt3, "dev::execnufft_t3: uninitialised cufinufftf type-3 plan.");
+  int ier = cufinufftf_execute(*pt3,
+                                reinterpret_cast<cuFloatComplex*>(c),
+                                reinterpret_cast<cuFloatComplex*>(f));
+  CUNUFFT_CHECK(ier, "cufinufftf_execute type-3 (float) failed");
+#else
+  (void)p; (void)c; (void)f;
+  cufinufft_unavailable("execnufft_t3(float)");
+#endif
+}
+
+// =========================================================================
+// destroy_plan — free type-1 / type-2 / type-3 plans (whichever non-null).
 // =========================================================================
 void destroy_plan(nuplan_t &p)
 {
-  if (p.fwd == nullptr && p.inv == nullptr) return;
+  if (p.fwd == nullptr && p.inv == nullptr && p.t3 == nullptr) return;
 #if defined(COQUI_HAVE_CUFINUFFT)
   utils::check(p.bend == NUFFT_BACKEND_CUFINUFFT,
                "dev::destroy_plan: incorrect NUFFT backend.");
@@ -260,6 +399,9 @@ void destroy_plan(nuplan_t &p)
     if (auto *pinv = static_cast<cufinufft_plan*>(p.inv)) {
       cufinufft_destroy(*pinv); delete pinv; p.inv = nullptr;
     }
+    if (auto *pt3 = static_cast<cufinufft_plan*>(p.t3)) {
+      cufinufft_destroy(*pt3); delete pt3; p.t3 = nullptr;
+    }
   } else {
     if (auto *pfwd = static_cast<cufinufftf_plan*>(p.fwd)) {
       cufinufftf_destroy(*pfwd); delete pfwd; p.fwd = nullptr;
@@ -267,10 +409,12 @@ void destroy_plan(nuplan_t &p)
     if (auto *pinv = static_cast<cufinufftf_plan*>(p.inv)) {
       cufinufftf_destroy(*pinv); delete pinv; p.inv = nullptr;
     }
+    if (auto *pt3 = static_cast<cufinufftf_plan*>(p.t3)) {
+      cufinufftf_destroy(*pt3); delete pt3; p.t3 = nullptr;
+    }
   }
 #else
-  // The plan must be empty in a no-cuFINUFFT build (no path can populate it).
-  utils::check(p.fwd == nullptr && p.inv == nullptr,
+  utils::check(p.fwd == nullptr && p.inv == nullptr && p.t3 == nullptr,
                "dev::destroy_plan: device plan present but COQUI_HAVE_CUFINUFFT undefined");
 #endif
 }

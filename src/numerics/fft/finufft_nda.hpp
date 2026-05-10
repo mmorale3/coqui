@@ -208,6 +208,34 @@ nuplan_t create_plan(std::array<Itype,rank> nmodes, int64_t npts,
 }
 
 // =========================================================================
+// create_plan_t3 — type-3 (NU → NU) plan.
+//
+// Use when both source AND target frequencies are nonuniform. The
+// uniform-time intermediary is skipped. Internally cuFINUFFT/FINUFFT
+// implement type-3 as an outer type-1 spreading + inner type-2 plan; for
+// 1D batched workloads this is typically slower than the type-1+type-2
+// chain we already use (because the fixed FFT cost amortizes well across
+// `ntrans` batches). The benchmark in tests/test_real_axis_pi_t3.cpp
+// quantifies the trade-off for the real-axis kernel.
+// =========================================================================
+template<MEMORY_SPACE MEM = HOST_MEMORY, typename value_type = double>
+nuplan_t create_plan_t3(int rank, int64_t npts_in, int64_t npts_out,
+                        int ntrans = 1,
+                        value_type eps = impl::default_eps<value_type>(),
+                        int iflag = NUFFT_FORWARD)
+{
+  utils::check(rank >= 1 && rank <= 3,
+               "create_plan_t3: rank must be 1, 2, or 3 (got {})", rank);
+  static_assert(MEM == HOST_MEMORY || MEM == DEVICE_MEMORY,
+                "create_plan_t3: MEMORY_SPACE must be HOST_MEMORY or DEVICE_MEMORY.");
+
+  if constexpr (MEM == HOST_MEMORY)
+    return impl::host::create_plan_t3(rank, npts_in, npts_out, ntrans, eps, iflag);
+  else
+    return impl::dev::create_plan_t3(rank, npts_in, npts_out, ntrans, eps, iflag);
+}
+
+// =========================================================================
 // setpts — attach nonuniform coordinate arrays to a plan.
 //
 // For arrays with fortran ordering:
@@ -297,6 +325,82 @@ void setpts(nuplan_t &p, CoordMat &&x, CoordMat &&y, CoordMat &&z)
                                   const_cast<val_t*>(x.data()),
                                   const_cast<val_t*>(y.data()),
                                   const_cast<val_t*>(z.data()));
+}
+
+// =========================================================================
+// setpts_t3 — bind source AND target NU coordinate arrays to a type-3
+// plan. 1-D variant: `x` is source coords (M points), `s` is target coords
+// (N points).
+// =========================================================================
+namespace detail {
+template<typename val_t>
+inline void setpts_t3_dispatch(nuplan_t &p,
+                                val_t *x, val_t *y, val_t *z,
+                                val_t *s, val_t *t, val_t *u)
+{
+  if (p.bend == NUFFT_BACKEND_FINUFFT)
+    impl::host::setpts_t3(p, x, y, z, s, t, u);
+  else if (p.bend == NUFFT_BACKEND_CUFINUFFT)
+    impl::dev::setpts_t3(p, x, y, z, s, t, u);
+  else
+    utils::check(false, "setpts_t3: unknown NUFFT backend (bend={}).", int(p.bend));
+}
+}
+
+template<::nda::MemoryArrayOfRank<1> CoordMat>
+void setpts_t3(nuplan_t &p, CoordMat &&x, CoordMat &&s)
+{
+  using X_t = std::decay_t<CoordMat>;
+  detail::check_coord_memspace<CoordMat>(p);
+  utils::check(p.rank == 1, "setpts_t3: plan rank={} but only x,s supplied.", p.rank);
+  utils::check(int64_t(x.shape()[0]) == p.npts,
+               "setpts_t3: x.size={} != p.npts={}", x.shape()[0], p.npts);
+  utils::check(int64_t(s.shape()[0]) == p.npts_out,
+               "setpts_t3: s.size={} != p.npts_out={}", s.shape()[0], p.npts_out);
+  using val_t = typename X_t::value_type;
+  detail::setpts_t3_dispatch<val_t>(p,
+      const_cast<val_t*>(x.data()), nullptr, nullptr,
+      const_cast<val_t*>(s.data()), nullptr, nullptr);
+}
+
+// =========================================================================
+// execnufft_t3 — type-3 (NU → NU) execution. Mirrors fwdnufft API.
+//
+// Single transform:    C: rank-1 (M),         F: rank-1 (N)
+// Batched transform:   C: rank-2 (ntrans, M), F: rank-2 (ntrans, N)
+// =========================================================================
+template<::nda::MemoryArray CMat, ::nda::MemoryArray FMat>
+void execnufft_t3(nuplan_t &p, CMat &&C, FMat &&F)
+{
+  using C_t = std::decay_t<CMat>;
+  using F_t = std::decay_t<FMat>;
+  // Shape checks: leading dim must match ntrans; trailing must match
+  // npts (input C) / npts_out (output F).
+  if constexpr (::nda::get_rank<C_t> == 1) {
+    utils::check(p.ntrans == 1,
+                 "execnufft_t3: plan ntrans={} but rank-1 C supplied.", p.ntrans);
+    utils::check(int64_t(C.shape()[0]) == p.npts,
+                 "execnufft_t3: C.size={} != p.npts={}", C.shape()[0], p.npts);
+    utils::check(int64_t(F.shape()[0]) == p.npts_out,
+                 "execnufft_t3: F.size={} != p.npts_out={}", F.shape()[0], p.npts_out);
+  } else if constexpr (::nda::get_rank<C_t> == 2) {
+    utils::check(int64_t(C.shape()[0]) == p.ntrans &&
+                 int64_t(C.shape()[1]) == p.npts,
+                 "execnufft_t3: C shape mismatch with (ntrans, npts) "
+                 "= ({}, {})", p.ntrans, p.npts);
+    utils::check(int64_t(F.shape()[0]) == p.ntrans &&
+                 int64_t(F.shape()[1]) == p.npts_out,
+                 "execnufft_t3: F shape mismatch with (ntrans, npts_out) "
+                 "= ({}, {})", p.ntrans, p.npts_out);
+  } else {
+    static_assert(::nda::get_rank<C_t> == 1 || ::nda::get_rank<C_t> == 2,
+                  "execnufft_t3: C must be rank 1 (single) or 2 (batched).");
+  }
+
+  if constexpr (::nda::mem::on_host<CMat>)
+    impl::host::execnufft_t3(p, C.data(), F.data());
+  else
+    impl::dev::execnufft_t3(p, C.data(), F.data());
 }
 
 // =========================================================================
