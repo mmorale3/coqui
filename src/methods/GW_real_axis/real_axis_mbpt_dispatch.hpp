@@ -254,8 +254,15 @@ inline void run_real_axis_gw(THC_t& thc, ptree const& pt)
     app_log(2, "  conv_thr    = {}", conv_thr);
     app_log(2, "  grid_kind   = {}", grid_kind_s);
     if (grid_kind_s == "nonuniform_log") {
-      app_log(2, "  w_dense     = {:.4f}", w_dense_eff);
-      app_log(2, "  N_dense     = {}", N_dense_eff);
+      app_log(2, "  w_dense       = {:.4f}", w_dense_eff);
+      app_log(2, "  N_dense       = {}", N_dense_eff);
+      if (Omega_dense_p > 0.0 && N_Omega_dense_p > 0) {
+        app_log(2, "  Omega_dense   = {:.4f}", Omega_dense_p);
+        app_log(2, "  N_Omega_dense = {}", N_Omega_dense_p);
+      } else {
+        app_log(2, "  Omega axis    = uniform "
+                   "(set Omega_dense + N_Omega_dense for NU)");
+      }
     }
   }
 
@@ -554,8 +561,15 @@ inline void run_real_axis_qpgw(THC_t& thc, ptree const& pt)
     app_log(2, "  div_treat   = {}", div_treat);
     app_log(2, "  grid_kind   = {}", grid_kind_s);
     if (grid_kind_s == "nonuniform_log") {
-      app_log(2, "  w_dense     = {:.4f}", w_dense_eff);
-      app_log(2, "  N_dense     = {}", N_dense_eff);
+      app_log(2, "  w_dense       = {:.4f}", w_dense_eff);
+      app_log(2, "  N_dense       = {}", N_dense_eff);
+      if (Omega_dense_p > 0.0 && N_Omega_dense_p > 0) {
+        app_log(2, "  Omega_dense   = {:.4f}", Omega_dense_p);
+        app_log(2, "  N_Omega_dense = {}", N_Omega_dense_p);
+      } else {
+        app_log(2, "  Omega axis    = uniform "
+                   "(set Omega_dense + N_Omega_dense for NU)");
+      }
     }
     app_log(2, "  align_mo    = {}", align_mo_p ? "true" : "false");
     if (align_mo_p)
