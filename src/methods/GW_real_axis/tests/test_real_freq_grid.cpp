@@ -221,4 +221,150 @@ TEST_CASE("real_freq_grid_nonuniform_log_lorentzian_quadrature",
   REQUIRE(std::abs(I_nu - I_exact) <= std::abs(I_u - I_exact) + 1e-6);
 }
 
+// ---------------------------------------------------------------------------
+// Bosonic-axis nonuniform construction. Same factory, but with non-default
+// Omega_dense + N_Omega_dense activates a linear-dense + log-tail layout on
+// the half-axis [h_dense, Omega_max].
+// ---------------------------------------------------------------------------
+TEST_CASE("real_freq_grid_nonuniform_log_bosonic_construction",
+          "[real_axis][grid]")
+{
+  const double beta      = 100.0;
+  const double mu        = 0.5;
+  const double w_max     = 5.0;
+  const long   N_w       = 65;
+  const double w_dense   = 0.4;
+  const long   N_dense   = 21;
+  const double Omega_max = 8.0;
+  const long   N_Omega   = 64;
+  const double Omega_dense   = 1.0;     // dense on (h, 1.0]
+  const long   N_Omega_dense = 32;      // dense pts
+  const long   N_t       = 128;
+  const double T_window  = 16.0;
+
+  auto g = real_freq_grid_t::make_nonuniform_log(
+      beta, mu, w_max, N_w, w_dense, N_dense,
+      Omega_max, N_Omega, N_t, T_window,
+      Omega_dense, N_Omega_dense);
+
+  REQUIRE(g.N_Omega() == N_Omega);
+  // Ω = 0 must NOT be on the grid (n_B singular).
+  REQUIRE(g.Omega()(0) > 0.0);
+  // Endpoint reaches Omega_max.
+  REQUIRE(g.Omega()(N_Omega - 1) == Approx(Omega_max).epsilon(1e-12));
+
+  // Strictly monotone increasing.
+  for (long l = 1; l < N_Omega; ++l)
+    REQUIRE(g.Omega()(l) > g.Omega()(l - 1));
+
+  // Dense block: linear with spacing h_dense = Omega_dense / N_Omega_dense.
+  const double h_dense = Omega_dense / static_cast<double>(N_Omega_dense);
+  REQUIRE(g.Omega()(0)                   == Approx(h_dense).epsilon(1e-12));
+  REQUIRE(g.Omega()(N_Omega_dense - 1)   == Approx(Omega_dense).epsilon(1e-12));
+  for (long l = 1; l < N_Omega_dense; ++l) {
+    REQUIRE((g.Omega()(l) - g.Omega()(l - 1))
+            == Approx(h_dense).epsilon(1e-12));
+  }
+
+  // Log tail: spacing strictly increases.
+  for (long l = N_Omega_dense + 1; l + 1 < N_Omega; ++l) {
+    const double d_lo = g.Omega()(l)     - g.Omega()(l - 1);
+    const double d_hi = g.Omega()(l + 1) - g.Omega()(l);
+    REQUIRE(d_hi > d_lo);
+  }
+
+  // Trapezoidal weights are non-negative and sum to the half-axis width.
+  double sum_O = 0.0;
+  for (long l = 0; l < N_Omega; ++l) {
+    REQUIRE(g.Omega_weights()(l) >= 0.0);
+    sum_O += g.Omega_weights()(l);
+  }
+  // First trapezoidal weight covers half of the inner cell, last covers
+  // half of the outer cell; total spans Omega_max - Omega(0).
+  REQUIRE(sum_O == Approx(Omega_max - g.Omega()(0)).epsilon(1e-10));
+
+  // Backward compat: passing Omega_dense=0 / N_Omega_dense=0 (defaults)
+  // should produce the existing uniform-Ω grid.
+  auto g_uniform_O = real_freq_grid_t::make_nonuniform_log(
+      beta, mu, w_max, N_w, w_dense, N_dense,
+      Omega_max, N_Omega, N_t, T_window);
+  const double h_unif = Omega_max / static_cast<double>(N_Omega);
+  for (long l = 0; l < N_Omega; ++l)
+    REQUIRE(g_uniform_O.Omega()(l)
+            == Approx(h_unif * static_cast<double>(l + 1)).epsilon(1e-12));
+}
+
+// ---------------------------------------------------------------------------
+// Bosonic-axis Lorentzian quadrature (peak near small Ω). The nonuniform
+// bosonic grid should resolve a peak at Ω ≈ Omega_dense/4 better than the
+// uniform grid at the same total N_Omega.
+// ---------------------------------------------------------------------------
+TEST_CASE("real_freq_grid_nonuniform_log_bosonic_lorentzian",
+          "[real_axis][grid]")
+{
+  // Lorentzian peaked at Omega_p = 0.5 with width gamma = 0.1.
+  // The peak lives well inside the dense bosonic block.
+  const double Omega_p = 0.5;
+  const double gamma   = 0.1;
+  const double w_max   = 5.0;
+  const long   N_w     = 65;
+  const double w_dense = 0.4;
+  const long   N_dense = 21;
+  const double Omega_max = 8.0;
+  const long   N_Omega   = 32;
+  const long   N_t       = 128;
+  const double T_window  = 16.0;
+
+  // Nonuniform bosonic: dense on (h, 2.0], tail to 8.0.
+  const double Omega_dense_p   = 2.0;
+  const long   N_Omega_dense_p = 16;
+
+  auto g_nu = real_freq_grid_t::make_nonuniform_log(
+      100.0, 0.0, w_max, N_w, w_dense, N_dense,
+      Omega_max, N_Omega, N_t, T_window,
+      Omega_dense_p, N_Omega_dense_p);
+  auto g_un = real_freq_grid_t::make_nonuniform_log(
+      100.0, 0.0, w_max, N_w, w_dense, N_dense,
+      Omega_max, N_Omega, N_t, T_window);
+
+  auto integrate = [&](real_freq_grid_t const& gg) {
+    double s = 0.0;
+    for (long l = 0; l < gg.N_Omega(); ++l) {
+      const double O = gg.Omega()(l);
+      const double v = (gamma / M_PI)
+                     / ((O - Omega_p) * (O - Omega_p) + gamma * gamma);
+      s += gg.Omega_weights()(l) * v;
+    }
+    return s;
+  };
+
+  // Truncated-window analytic Lorentzian half-window integral (one-sided).
+  // ∫_{Omega(0)}^{Omega_max} (γ/π) / ((Ω-Ω_p)² + γ²) dΩ
+  //   = (1/π) [arctan((Ω_max-Ω_p)/γ) - arctan((Ω(0)-Ω_p)/γ)]
+  const double O_lo_nu = g_nu.Omega()(0);
+  const double O_lo_un = g_un.Omega()(0);
+  auto exact = [&](double O_lo) {
+    return (1.0 / M_PI) * (std::atan((Omega_max - Omega_p) / gamma)
+                          - std::atan((O_lo - Omega_p) / gamma));
+  };
+  const double I_nu_exact = exact(O_lo_nu);
+  const double I_un_exact = exact(O_lo_un);
+
+  const double I_nu = integrate(g_nu);
+  const double I_un = integrate(g_un);
+
+  const double err_nu = std::abs(I_nu - I_nu_exact);
+  const double err_un = std::abs(I_un - I_un_exact);
+
+  // Key claim of this test: the nonuniform bosonic axis resolves a
+  // peak near small Ω substantially better than the uniform axis at the
+  // same total N_Omega. The uniform grid here has dΩ = 0.25 ≫ γ = 0.1,
+  // so the peak is heavily under-sampled and err_un is large; the
+  // nonuniform grid (16 points dense on [h, 2.0]) brings dΩ_dense ≈
+  // 0.125 ~ γ and recovers the peak to ≪ 0.1 error.
+  REQUIRE(err_nu < err_un);
+  REQUIRE(err_un > err_nu * 5.0);   // ≥ 5x improvement
+  REQUIRE(err_nu < 2e-2);           // NU absolute bound
+}
+
 } // namespace gw_real_axis_tests

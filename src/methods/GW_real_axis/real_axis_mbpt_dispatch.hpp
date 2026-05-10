@@ -160,6 +160,10 @@ inline void run_real_axis_gw(THC_t& thc, ptree const& pt)
   auto       grid_kind_s = io::get_value_with_default<std::string>(pt, "grid_kind", "nonuniform_log");
   const auto w_dense_p   = io::get_value_with_default<double>(pt, "w_dense", 0.0);
   const auto N_dense_p   = io::get_value_with_default<long>  (pt, "N_dense", 0);
+  // Bosonic Ω can also be made nonuniform (linear-dense + log tail).
+  // 0 / 0 (defaults) keeps the bosonic axis uniform — back-compat.
+  const auto Omega_dense_p   = io::get_value_with_default<double>(pt, "Omega_dense", 0.0);
+  const auto N_Omega_dense_p = io::get_value_with_default<long>  (pt, "N_Omega_dense", 0);
   io::tolower(mix_kind_s);
   io::tolower(grid_kind_s);
   // Checkpointing (Phase-2 write-side; read-side is deferred). write_chkpt
@@ -220,7 +224,8 @@ inline void run_real_axis_gw(THC_t& thc, ptree const& pt)
               ? real_freq_grid_t::make_nonuniform_log(
                   p.beta, p.mu0, p.w_max, p.N_w,
                   w_dense_eff, N_dense_eff,
-                  p.Omega_max, p.N_Omega, p.N_t, p.T_window)
+                  p.Omega_max, p.N_Omega, p.N_t, p.T_window,
+                  Omega_dense_p, N_Omega_dense_p)
               : real_freq_grid_t::make_uniform(
                   p.beta, p.mu0, p.w_max, p.N_w,
                   p.Omega_max, p.N_Omega, p.N_t, p.T_window);
@@ -474,6 +479,10 @@ inline void run_real_axis_qpgw(THC_t& thc, ptree const& pt)
   auto       grid_kind_s = io::get_value_with_default<std::string>(pt, "grid_kind", "nonuniform_log");
   const auto w_dense_p   = io::get_value_with_default<double>(pt, "w_dense", 0.0);
   const auto N_dense_p   = io::get_value_with_default<long>  (pt, "N_dense", 0);
+  // Bosonic Ω can also be made nonuniform (linear-dense + log tail).
+  // 0 / 0 (defaults) keeps the bosonic axis uniform — back-compat.
+  const auto Omega_dense_p   = io::get_value_with_default<double>(pt, "Omega_dense", 0.0);
+  const auto N_Omega_dense_p = io::get_value_with_default<long>  (pt, "N_Omega_dense", 0);
   io::tolower(grid_kind_s);
   // Checkpointing options. write_chkpt: enable per-iter h5 dump
   // ({prefix}.mbpt.h5). restart: pick up from existing h5 final_iter rather
@@ -515,7 +524,8 @@ inline void run_real_axis_qpgw(THC_t& thc, ptree const& pt)
               ? real_freq_grid_t::make_nonuniform_log(
                   p.beta, p.mu0, p.w_max, p.N_w,
                   w_dense_eff, N_dense_eff,
-                  p.Omega_max, p.N_Omega, p.N_t, p.T_window)
+                  p.Omega_max, p.N_Omega, p.N_t, p.T_window,
+                  Omega_dense_p, N_Omega_dense_p)
               : real_freq_grid_t::make_uniform(
                   p.beta, p.mu0, p.w_max, p.N_w,
                   p.Omega_max, p.N_Omega, p.N_t, p.T_window);

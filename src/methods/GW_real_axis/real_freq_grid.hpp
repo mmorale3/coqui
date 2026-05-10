@@ -171,7 +171,9 @@ public:
                                               double Omega_max,
                                               long   N_Omega,
                                               long   N_t,
-                                              double T_window)
+                                              double T_window,
+                                              double Omega_dense = 0.0,
+                                              long   N_Omega_dense = 0)
   {
     utils::check(w_max > 0.0,    "make_nonuniform_log: w_max must be > 0");
     utils::check(w_dense > 0.0,
@@ -224,7 +226,46 @@ public:
     }
 
     nda::array<double,1> Omega(N_Omega);
-    {
+    if (Omega_dense > 0.0 && N_Omega_dense > 0) {
+      // Nonuniform bosonic axis: linear-dense (h_dense, Omega_dense] +
+      // log-stretched tail (Omega_dense, Omega_max]. Ω = 0 is excluded
+      // (n_B singularity), exactly as in the uniform branch.
+      utils::check(Omega_dense < Omega_max,
+                   "make_nonuniform_log: Omega_dense ({}) must be < Omega_max ({})",
+                   Omega_dense, Omega_max);
+      utils::check(N_Omega_dense >= 2,
+                   "make_nonuniform_log: N_Omega_dense must be >= 2 (got {})",
+                   N_Omega_dense);
+      utils::check(N_Omega_dense + 1 <= N_Omega,
+                   "make_nonuniform_log: N_Omega_dense ({}) leaves no room for "
+                   "tail in N_Omega ({}); need N_Omega_dense + 1 <= N_Omega.",
+                   N_Omega_dense, N_Omega);
+
+      const long n_tail_O = N_Omega - N_Omega_dense;
+      const double h_O_dense = Omega_dense / static_cast<double>(N_Omega_dense);
+
+      // Dense block: linear from h_O_dense to Omega_dense.
+      for (long l = 0; l < N_Omega_dense; ++l)
+        Omega(l) = h_O_dense * static_cast<double>(l + 1);
+
+      // Log-spaced tail anchored on Omega_dense + h_O_dense so the spacing
+      // is monotone non-decreasing across the dense → tail boundary.
+      const double Omega_tail_inner = Omega_dense + h_O_dense;
+      utils::check(Omega_tail_inner < Omega_max,
+                   "make_nonuniform_log: dense block already reaches Omega_max "
+                   "(Omega_dense + h_O_dense = {} >= Omega_max = {}); reduce "
+                   "N_Omega_dense or Omega_dense, or increase Omega_max.",
+                   Omega_tail_inner, Omega_max);
+      const double log_step_O =
+          (std::log(Omega_max) - std::log(Omega_tail_inner))
+        / static_cast<double>(n_tail_O - 1);
+      for (long i = 0; i < n_tail_O; ++i) {
+        Omega(N_Omega_dense + i) =
+            std::exp(std::log(Omega_tail_inner)
+                     + static_cast<double>(i) * log_step_O);
+      }
+    } else {
+      // Uniform bosonic axis (back-compat default).
       const double h = Omega_max / static_cast<double>(N_Omega);
       for (long l = 0; l < N_Omega; ++l)
         Omega(l) = h * static_cast<double>(l + 1);
