@@ -586,6 +586,34 @@ template void dump_scf_real_axis(
     const sArray_t<Array_view_5D_t>&,
     double, std::string, std::string, long);
 
+template<typename communicator_t>
+void dump_W_diag_qg(communicator_t &comm, long iter,
+                    nda::array<double, 2> const& ImW_diag,
+                    nda::array<double, 2> const& ReW_diag,
+                    std::string output)
+{
+  if (ImW_diag.size() == 0 || ReW_diag.size() == 0) return;
+  if (comm.root()) {
+    std::string filename = output + ".mbpt.h5";
+    std::string iter_grp_name = "iter" + std::to_string(iter);
+    h5::file file(filename, 'a');
+    h5::group grp(file);
+    auto scf_grp = (grp.has_subgroup("scf"))
+        ? grp.open_group("scf") : grp.create_group("scf");
+    auto iter_grp = (scf_grp.has_subgroup(iter_grp_name))
+        ? scf_grp.open_group(iter_grp_name)
+        : scf_grp.create_group(iter_grp_name);
+    nda::h5_write(iter_grp, "ImW_diag_qg", ImW_diag, false);
+    nda::h5_write(iter_grp, "ReW_diag_qg", ReW_diag, false);
+  }
+  comm.barrier();
+}
+
+template void dump_W_diag_qg(
+    mpi3::communicator&, long,
+    nda::array<double, 2> const&, nda::array<double, 2> const&,
+    std::string);
+
 template long read_scf(
     mpi3::shared_communicator, sArray_t<Array_view_4D_t>&,
     sArray_t<Array_view_5D_t>&, double&, std::string, std::string, long);

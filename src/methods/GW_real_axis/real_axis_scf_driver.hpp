@@ -258,6 +258,11 @@ inline scgw_result real_axis_scf_loop(real_axis_mb_state_t& state,
   res.final_mu   = mu_cur;
   res.converged  = false;
 
+  // When chkpt writing is enabled, ask update_w to snapshot the q=q_gamma
+  // diagonal of W into state. The snapshot survives P5* lite (which frees
+  // the full Pi/W arrays) and is written to the chkpt h5 alongside A/Σ.
+  state.collect_W_diag_qg = write_chkpt;
+
   for (long it = 0; it < cfg.max_iter; ++it) {
     // ---- 1. update W (scr_coulomb) ----
     mb_solver.scr_eri->update_w(state, thc,
@@ -384,6 +389,14 @@ inline scgw_result real_axis_scf_loop(real_axis_mb_state_t& state,
             state.Sigma_x_skij.value(),
             state.ImSigma_wskij.value(), state.ReSigma_wskij.value(),
             mu_cur, state.coqui_prefix);
+        // Optional diagnostic: dump diagonal of W at q=q_gamma (small,
+        // a few MB). state.{Im,Re}W_diag_qg_O are populated by update_w
+        // when state.collect_W_diag_qg is true.
+        if (state.ImW_diag_qg_O.has_value() and state.ReW_diag_qg_O.has_value())
+          chkpt::dump_W_diag_qg(comm, it_label,
+                                state.ImW_diag_qg_O.value(),
+                                state.ReW_diag_qg_O.value(),
+                                state.coqui_prefix);
       }
     }
 

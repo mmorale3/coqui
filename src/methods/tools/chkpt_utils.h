@@ -97,6 +97,18 @@ namespace methods {
                           std::string input_grp = "scf",
                           long input_iter = -1);
 
+  /**
+   * Diagnostic dump for the q=q_gamma diagonal of W in aux basis.
+   * Writes ImW_diag_qg + ReW_diag_qg under the existing /scf/iter{N}/
+   * group of the chkpt h5. Both arrays have shape (Naux, N_Omega) real.
+   * No-op if either array is empty.
+   */
+  template <typename communicator_t>
+  void dump_W_diag_qg(communicator_t &comm, long iter,
+                      nda::array<double, 2> const& ImW_diag,
+                      nda::array<double, 2> const& ReW_diag,
+                      std::string output);
+
   template<typename communicator_t, typename X_4D_t, typename X_3D_t>
   void dump_scf(communicator_t &comm, long iter,
                 const X_4D_t &Dm_skij, const X_4D_t &Heff_skij,

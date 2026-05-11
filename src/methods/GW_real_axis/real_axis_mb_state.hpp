@@ -136,6 +136,17 @@ struct real_axis_mb_state_t {
   // on the imag-axis side.
   std::optional<nda::array<ComplexType, 1>> eps_inv_head_O;
 
+  // Diagnostic snapshot: diagonal of {Im,Re}W at q = q_gamma (IBZ index 0),
+  // shape (Naux, N_Omega) real. Populated by scr_coulomb_t::update_w
+  // (just before P5* lite would otherwise free ReW) when the SCF driver
+  // sets `collect_W_diag_qg = true`. Written into the chkpt h5 by
+  // dump_scf_real_axis as /scf/iter{N}/{ImW_diag_qg, ReW_diag_qg}.
+  // Use case: plotting W along the aux-basis diagonal to inspect the
+  // plasmon pole structure without dumping the full bosonic state.
+  std::optional<nda::array<double, 2>> ImW_diag_qg_O;
+  std::optional<nda::array<double, 2>> ReW_diag_qg_O;
+  bool collect_W_diag_qg = false;
+
   // Default constructor leaves everything in a default-initialized state.
   real_axis_mb_state_t() = default;
 

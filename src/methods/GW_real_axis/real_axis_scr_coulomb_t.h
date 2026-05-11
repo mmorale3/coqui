@@ -1035,6 +1035,50 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
       *state.eps_inv_head_O = ComplexType(0.0, 0.0);
   }
 
+  // -----------------------------------------------------------------------
+  // Diagnostic snapshot: gather the diagonal of W at q = q_gamma (IBZ) into
+  // a (Naux, N_O) array stashed on state. Only fires when the SCF driver
+  // sets state.collect_W_diag_qg = true (typically when write_chkpt is on).
+  // This must happen BEFORE state.free_intermediate_bosonic() — which the
+  // driver calls AFTER update_w returns — because we need ReW which P5*
+  // lite will drop. Cost: 2 * Naux * N_O reals per rank + one allreduce.
+  // -----------------------------------------------------------------------
+  if (state.collect_W_diag_qg and iq_gamma >= 0) {
+    nda::array<double, 2> ImW_diag(Naux, N_O);
+    nda::array<double, 2> ReW_diag(Naux, N_O);
+    ImW_diag() = 0.0;
+    ReW_diag() = 0.0;
+
+    auto h_ImW_loc = state.ImW_qPQO->local();   // (Nq_ibz, NP_loc, NQ_loc, N_O) real
+    auto h_ReW_loc = state.ReW_qPQO->local();
+    auto Pr_d = state.ImW_qPQO->local_range(1);
+    auto Qr_d = state.ImW_qPQO->local_range(2);
+    const long P_start = Pr_d.first();
+    const long NP_loc_d = Pr_d.size();
+    const long Q_start = Qr_d.first();
+    const long NQ_loc_d = Qr_d.size();
+
+    // Diagonal P=Q is present on this rank only where the global P and Q
+    // ranges overlap.
+    const long P_overlap_lo = std::max(P_start, Q_start);
+    const long P_overlap_hi = std::min(P_start + NP_loc_d, Q_start + NQ_loc_d);
+    for (long P_global = P_overlap_lo; P_global < P_overlap_hi; ++P_global) {
+      const long iP_loc = P_global - P_start;
+      const long iQ_loc = P_global - Q_start;
+      for (long iO = 0; iO < N_O; ++iO) {
+        ImW_diag(P_global, iO) = h_ImW_loc(iq_gamma, iP_loc, iQ_loc, iO);
+        ReW_diag(P_global, iO) = h_ReW_loc(iq_gamma, iP_loc, iQ_loc, iO);
+      }
+    }
+
+    if (comm.size() > 1) {
+      comm.all_reduce_in_place_n(ImW_diag.data(), ImW_diag.size(), std::plus<>{});
+      comm.all_reduce_in_place_n(ReW_diag.data(), ReW_diag.size(), std::plus<>{});
+    }
+    state.ImW_diag_qg_O = std::move(ImW_diag);
+    state.ReW_diag_qg_O = std::move(ReW_diag);
+  }
+
   if (verbose and comm.root()) {
     const double dt_total = sec_since(t_total);
     app_log(2, "[real_axis_scr_coulomb::update_w] Naux={}, N_w={}, N_O={}, "
