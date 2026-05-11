@@ -162,8 +162,14 @@ inline void run_real_axis_gw(THC_t& thc, ptree const& pt)
   const auto N_dense_p   = io::get_value_with_default<long>  (pt, "N_dense", 0);
   // Bosonic Ω can also be made nonuniform (linear-dense + log tail).
   // 0 / 0 (defaults) keeps the bosonic axis uniform — back-compat.
+  //   Omega_center = 0 : dense block at low Ω (gap-edge layout).
+  //   Omega_center > 0 : dense block centered at Omega_center, log tails
+  //                      on both sides (plasmon-mode layout — useful when
+  //                      W's plasmon pole sits at finite Omega_pl). For
+  //                      Si, Omega_pl ≈ 0.6 Ha = 16 eV.
   const auto Omega_dense_p   = io::get_value_with_default<double>(pt, "Omega_dense", 0.0);
   const auto N_Omega_dense_p = io::get_value_with_default<long>  (pt, "N_Omega_dense", 0);
+  const auto Omega_center_p  = io::get_value_with_default<double>(pt, "Omega_center", 0.0);
   io::tolower(mix_kind_s);
   io::tolower(grid_kind_s);
   // Checkpointing (Phase-2 write-side; read-side is deferred). write_chkpt
@@ -225,7 +231,8 @@ inline void run_real_axis_gw(THC_t& thc, ptree const& pt)
                   p.beta, p.mu0, p.w_max, p.N_w,
                   w_dense_eff, N_dense_eff,
                   p.Omega_max, p.N_Omega, p.N_t, p.T_window,
-                  Omega_dense_p, N_Omega_dense_p)
+                  Omega_dense_p, N_Omega_dense_p,
+                  Omega_center_p)
               : real_freq_grid_t::make_uniform(
                   p.beta, p.mu0, p.w_max, p.N_w,
                   p.Omega_max, p.N_Omega, p.N_t, p.T_window);
@@ -259,6 +266,12 @@ inline void run_real_axis_gw(THC_t& thc, ptree const& pt)
       if (Omega_dense_p > 0.0 && N_Omega_dense_p > 0) {
         app_log(2, "  Omega_dense   = {:.4f}", Omega_dense_p);
         app_log(2, "  N_Omega_dense = {}", N_Omega_dense_p);
+        if (Omega_center_p > 0.0) {
+          app_log(2, "  Omega_center  = {:.4f}  (plasmon-mode: dense block "
+                     "centered, log tails both sides)", Omega_center_p);
+        } else {
+          app_log(2, "  Omega_center  = 0.0  (dense-at-zero layout)");
+        }
       } else {
         app_log(2, "  Omega axis    = uniform "
                    "(set Omega_dense + N_Omega_dense for NU)");
@@ -488,8 +501,14 @@ inline void run_real_axis_qpgw(THC_t& thc, ptree const& pt)
   const auto N_dense_p   = io::get_value_with_default<long>  (pt, "N_dense", 0);
   // Bosonic Ω can also be made nonuniform (linear-dense + log tail).
   // 0 / 0 (defaults) keeps the bosonic axis uniform — back-compat.
+  //   Omega_center = 0 : dense block at low Ω (gap-edge layout).
+  //   Omega_center > 0 : dense block centered at Omega_center, log tails
+  //                      on both sides (plasmon-mode layout — useful when
+  //                      W's plasmon pole sits at finite Omega_pl). For
+  //                      Si, Omega_pl ≈ 0.6 Ha = 16 eV.
   const auto Omega_dense_p   = io::get_value_with_default<double>(pt, "Omega_dense", 0.0);
   const auto N_Omega_dense_p = io::get_value_with_default<long>  (pt, "N_Omega_dense", 0);
+  const auto Omega_center_p  = io::get_value_with_default<double>(pt, "Omega_center", 0.0);
   io::tolower(grid_kind_s);
   // Checkpointing options. write_chkpt: enable per-iter h5 dump
   // ({prefix}.mbpt.h5). restart: pick up from existing h5 final_iter rather
@@ -532,7 +551,8 @@ inline void run_real_axis_qpgw(THC_t& thc, ptree const& pt)
                   p.beta, p.mu0, p.w_max, p.N_w,
                   w_dense_eff, N_dense_eff,
                   p.Omega_max, p.N_Omega, p.N_t, p.T_window,
-                  Omega_dense_p, N_Omega_dense_p)
+                  Omega_dense_p, N_Omega_dense_p,
+                  Omega_center_p)
               : real_freq_grid_t::make_uniform(
                   p.beta, p.mu0, p.w_max, p.N_w,
                   p.Omega_max, p.N_Omega, p.N_t, p.T_window);
@@ -566,6 +586,12 @@ inline void run_real_axis_qpgw(THC_t& thc, ptree const& pt)
       if (Omega_dense_p > 0.0 && N_Omega_dense_p > 0) {
         app_log(2, "  Omega_dense   = {:.4f}", Omega_dense_p);
         app_log(2, "  N_Omega_dense = {}", N_Omega_dense_p);
+        if (Omega_center_p > 0.0) {
+          app_log(2, "  Omega_center  = {:.4f}  (plasmon-mode: dense block "
+                     "centered, log tails both sides)", Omega_center_p);
+        } else {
+          app_log(2, "  Omega_center  = 0.0  (dense-at-zero layout)");
+        }
       } else {
         app_log(2, "  Omega axis    = uniform "
                    "(set Omega_dense + N_Omega_dense for NU)");

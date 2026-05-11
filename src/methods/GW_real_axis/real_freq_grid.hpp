@@ -162,6 +162,28 @@ public:
   // Use case: dense sampling of the QP region and the f(w)*A integrand
   // near mu, sparse in the deep valence / high-conduction tails where
   // A is essentially zero.
+  // Bosonic axis modes when Omega_dense > 0 & N_Omega_dense > 0:
+  //
+  //   Omega_center = 0  (default):
+  //     Linear-dense block on (h, Omega_dense] + log tail to Omega_max.
+  //     This is the "dense at zero" layout — useful when Pi has gap-edge
+  //     structure starting near Omega = 0 (the Si gap edge ramps up around
+  //     Omega ≈ 2 * gap).
+  //
+  //   Omega_center > 0  (NEW, plasmon mode):
+  //     Linear-dense block on [Omega_center - Omega_dense/2,
+  //                            Omega_center + Omega_dense/2] +
+  //     log-spaced inner tail (small Omega -> dense lower edge) +
+  //     log-spaced outer tail (dense upper edge -> Omega_max).
+  //     This is the "dense at plasmon frequency" layout — useful when
+  //     the dominant bosonic structure (W's plasmon pole, the on-shell
+  //     part of Im Pi) lives at finite Omega = Omega_pl rather than at
+  //     Omega = 0. For solids, Omega_pl is typically a few eV to ~20 eV
+  //     depending on the valence-electron density (Si: ~16 eV).
+  //
+  // Constraint: when Omega_center > 0, the inner + outer tails are split
+  // symmetrically (n_inner == n_outer), so N_Omega - N_Omega_dense must
+  // be even.
   static real_freq_grid_t make_nonuniform_log(double beta,
                                               double mu_chem,
                                               double w_max,
@@ -173,7 +195,8 @@ public:
                                               long   N_t,
                                               double T_window,
                                               double Omega_dense = 0.0,
-                                              long   N_Omega_dense = 0)
+                                              long   N_Omega_dense = 0,
+                                              double Omega_center = 0.0)
   {
     utils::check(w_max > 0.0,    "make_nonuniform_log: w_max must be > 0");
     utils::check(w_dense > 0.0,
@@ -226,10 +249,86 @@ public:
     }
 
     nda::array<double,1> Omega(N_Omega);
-    if (Omega_dense > 0.0 && N_Omega_dense > 0) {
-      // Nonuniform bosonic axis: linear-dense (h_dense, Omega_dense] +
-      // log-stretched tail (Omega_dense, Omega_max]. Ω = 0 is excluded
-      // (n_B singularity), exactly as in the uniform branch.
+    if (Omega_dense > 0.0 && N_Omega_dense > 0 && Omega_center > 0.0) {
+      // ----- Plasmon-mode: dense block centered at Omega_center -----
+      // Layout: log-inner (Omega_min, lower_edge] + linear-dense
+      // [lower_edge, upper_edge] + log-outer [upper_edge, Omega_max].
+      // halfwidth = Omega_dense / 2.
+      utils::check(N_Omega_dense >= 2,
+                   "make_nonuniform_log: N_Omega_dense must be >= 2 (got {})",
+                   N_Omega_dense);
+      utils::check(N_Omega_dense + 2 <= N_Omega,
+                   "make_nonuniform_log: N_Omega_dense ({}) leaves no room "
+                   "for symmetric tails in N_Omega ({}).",
+                   N_Omega_dense, N_Omega);
+      utils::check((N_Omega - N_Omega_dense) % 2 == 0,
+                   "make_nonuniform_log: in plasmon-mode (Omega_center>0), "
+                   "N_Omega - N_Omega_dense must be even so tails are "
+                   "symmetric (got N_Omega={}, N_Omega_dense={}, diff={}).",
+                   N_Omega, N_Omega_dense, N_Omega - N_Omega_dense);
+
+      const double halfwidth = Omega_dense * 0.5;
+      const double lower_edge = Omega_center - halfwidth;
+      const double upper_edge = Omega_center + halfwidth;
+      utils::check(lower_edge > 0.0,
+                   "make_nonuniform_log (plasmon): Omega_center - Omega_dense/2 "
+                   "({}) must be > 0 (Omega_center={}, Omega_dense={}).",
+                   lower_edge, Omega_center, Omega_dense);
+      utils::check(upper_edge < Omega_max,
+                   "make_nonuniform_log (plasmon): Omega_center + Omega_dense/2 "
+                   "({}) must be < Omega_max ({}).",
+                   upper_edge, Omega_max);
+
+      const long n_tail_each = (N_Omega - N_Omega_dense) / 2;
+      const double h_O_dense = Omega_dense / static_cast<double>(N_Omega_dense - 1);
+
+      // Inner anchor: just below lower_edge by one dense-step (keeps spacing
+      // monotone non-decreasing across the lower boundary).
+      const double inner_anchor = lower_edge - h_O_dense;
+      utils::check(inner_anchor > 0.0,
+                   "make_nonuniform_log (plasmon): inner anchor "
+                   "(lower_edge - h_dense = {}) must be > 0.", inner_anchor);
+      // Inner log-tail extends from Omega_min up to inner_anchor.
+      // Choose Omega_min as a small fraction of Omega_max; matches the
+      // smallest-Omega scale we typically need for Pi structure at small Ω.
+      const double Omega_min = std::min(
+          0.01 * Omega_center,
+          Omega_max / (50.0 * static_cast<double>(N_Omega)));
+      utils::check(Omega_min < inner_anchor,
+                   "make_nonuniform_log (plasmon): Omega_min ({}) must be < "
+                   "inner_anchor ({}); reduce N_Omega_dense or Omega_dense.",
+                   Omega_min, inner_anchor);
+      const double log_step_inner =
+          (std::log(inner_anchor) - std::log(Omega_min))
+        / static_cast<double>(n_tail_each - 1);
+      for (long i = 0; i < n_tail_each; ++i) {
+        Omega(i) = std::exp(std::log(Omega_min)
+                            + static_cast<double>(i) * log_step_inner);
+      }
+
+      // Dense block: linear [lower_edge, upper_edge] with N_Omega_dense pts.
+      for (long j = 0; j < N_Omega_dense; ++j)
+        Omega(n_tail_each + j) =
+            lower_edge + h_O_dense * static_cast<double>(j);
+
+      // Outer log-tail from (upper_edge + h_dense) to Omega_max.
+      const double outer_anchor = upper_edge + h_O_dense;
+      utils::check(outer_anchor < Omega_max,
+                   "make_nonuniform_log (plasmon): outer anchor "
+                   "(upper_edge + h_dense = {}) must be < Omega_max ({}).",
+                   outer_anchor, Omega_max);
+      const double log_step_outer =
+          (std::log(Omega_max) - std::log(outer_anchor))
+        / static_cast<double>(n_tail_each - 1);
+      for (long i = 0; i < n_tail_each; ++i) {
+        Omega(n_tail_each + N_Omega_dense + i) =
+            std::exp(std::log(outer_anchor)
+                     + static_cast<double>(i) * log_step_outer);
+      }
+    }
+    else if (Omega_dense > 0.0 && N_Omega_dense > 0) {
+      // Nonuniform bosonic, dense-at-zero: linear-dense (h, Omega_dense]
+      // + log-stretched tail (Omega_dense, Omega_max].
       utils::check(Omega_dense < Omega_max,
                    "make_nonuniform_log: Omega_dense ({}) must be < Omega_max ({})",
                    Omega_dense, Omega_max);
@@ -240,22 +339,13 @@ public:
                    "make_nonuniform_log: N_Omega_dense ({}) leaves no room for "
                    "tail in N_Omega ({}); need N_Omega_dense + 1 <= N_Omega.",
                    N_Omega_dense, N_Omega);
-
       const long n_tail_O = N_Omega - N_Omega_dense;
       const double h_O_dense = Omega_dense / static_cast<double>(N_Omega_dense);
-
-      // Dense block: linear from h_O_dense to Omega_dense.
       for (long l = 0; l < N_Omega_dense; ++l)
         Omega(l) = h_O_dense * static_cast<double>(l + 1);
-
-      // Log-spaced tail anchored on Omega_dense + h_O_dense so the spacing
-      // is monotone non-decreasing across the dense → tail boundary.
       const double Omega_tail_inner = Omega_dense + h_O_dense;
       utils::check(Omega_tail_inner < Omega_max,
-                   "make_nonuniform_log: dense block already reaches Omega_max "
-                   "(Omega_dense + h_O_dense = {} >= Omega_max = {}); reduce "
-                   "N_Omega_dense or Omega_dense, or increase Omega_max.",
-                   Omega_tail_inner, Omega_max);
+                   "make_nonuniform_log: dense block already reaches Omega_max.");
       const double log_step_O =
           (std::log(Omega_max) - std::log(Omega_tail_inner))
         / static_cast<double>(n_tail_O - 1);
@@ -264,7 +354,8 @@ public:
             std::exp(std::log(Omega_tail_inner)
                      + static_cast<double>(i) * log_step_O);
       }
-    } else {
+    }
+    else {
       // Uniform bosonic axis (back-compat default).
       const double h = Omega_max / static_cast<double>(N_Omega);
       for (long l = 0; l < N_Omega; ++l)

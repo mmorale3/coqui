@@ -367,4 +367,137 @@ TEST_CASE("real_freq_grid_nonuniform_log_bosonic_lorentzian",
   REQUIRE(err_nu < 2e-2);           // NU absolute bound
 }
 
+// ---------------------------------------------------------------------------
+// Plasmon-mode bosonic axis: dense block centered at Omega_center > 0.
+// ---------------------------------------------------------------------------
+TEST_CASE("real_freq_grid_nonuniform_log_plasmon_construction",
+          "[real_axis][grid]")
+{
+  const double beta      = 100.0;
+  const double mu        = 0.0;
+  const double w_max     = 5.0;
+  const long   N_w       = 65;
+  const double w_dense   = 0.4;
+  const long   N_dense   = 21;
+  const double Omega_max = 8.0;
+  const long   N_Omega   = 64;
+  const double Omega_dense   = 1.0;    // full width of dense block
+  const long   N_Omega_dense = 32;
+  const double Omega_center  = 2.0;    // dense block centered here
+  const long   N_t       = 256;
+  const double T_window  = 12.0;
+
+  auto g = real_freq_grid_t::make_nonuniform_log(
+      beta, mu, w_max, N_w, w_dense, N_dense,
+      Omega_max, N_Omega, N_t, T_window,
+      Omega_dense, N_Omega_dense, Omega_center);
+
+  REQUIRE(g.N_Omega() == N_Omega);
+  REQUIRE(g.Omega()(0) > 0.0);
+  REQUIRE(g.Omega()(N_Omega - 1) == Approx(Omega_max).epsilon(1e-12));
+
+  // Strictly monotone increasing.
+  for (long l = 1; l < N_Omega; ++l)
+    REQUIRE(g.Omega()(l) > g.Omega()(l - 1));
+
+  // Symmetric tails: N_Omega - N_Omega_dense split equally between
+  // inner and outer tails.
+  const long n_tail = (N_Omega - N_Omega_dense) / 2;
+  REQUIRE(n_tail * 2 + N_Omega_dense == N_Omega);
+
+  // Dense block: linear with spacing h = Omega_dense/(N_Omega_dense-1),
+  // covering [Omega_center - Omega_dense/2, Omega_center + Omega_dense/2].
+  const double halfwidth = Omega_dense * 0.5;
+  const double h_dense = Omega_dense / static_cast<double>(N_Omega_dense - 1);
+  const double lower_edge = Omega_center - halfwidth;
+  const double upper_edge = Omega_center + halfwidth;
+
+  REQUIRE(g.Omega()(n_tail)                       == Approx(lower_edge).epsilon(1e-12));
+  REQUIRE(g.Omega()(n_tail + N_Omega_dense - 1)  == Approx(upper_edge).epsilon(1e-12));
+  for (long j = 1; j < N_Omega_dense; ++j) {
+    REQUIRE((g.Omega()(n_tail + j) - g.Omega()(n_tail + j - 1))
+            == Approx(h_dense).epsilon(1e-12));
+  }
+
+  // Inner tail: log-spaced, spacing strictly increases as Ω → lower_edge.
+  for (long l = 1; l + 1 < n_tail; ++l) {
+    const double d_lo = g.Omega()(l)     - g.Omega()(l - 1);
+    const double d_hi = g.Omega()(l + 1) - g.Omega()(l);
+    REQUIRE(d_hi > d_lo);
+  }
+  // Outer tail: spacing strictly increases as Ω → Omega_max.
+  for (long l = n_tail + N_Omega_dense + 1; l + 1 < N_Omega; ++l) {
+    const double d_lo = g.Omega()(l)     - g.Omega()(l - 1);
+    const double d_hi = g.Omega()(l + 1) - g.Omega()(l);
+    REQUIRE(d_hi > d_lo);
+  }
+
+  // Weights non-negative; sum = span of the grid.
+  double sum_O = 0.0;
+  for (long l = 0; l < N_Omega; ++l) {
+    REQUIRE(g.Omega_weights()(l) >= 0.0);
+    sum_O += g.Omega_weights()(l);
+  }
+  REQUIRE(sum_O == Approx(Omega_max - g.Omega()(0)).epsilon(1e-10));
+}
+
+// ---------------------------------------------------------------------------
+// Plasmon-mode quadrature: a Lorentzian peaked at Omega_pl is resolved much
+// better with Omega_center = Omega_pl than with the dense-at-zero layout.
+// ---------------------------------------------------------------------------
+TEST_CASE("real_freq_grid_nonuniform_log_plasmon_lorentzian",
+          "[real_axis][grid]")
+{
+  // Sharper plasmon-like peak (γ = 0.04, FWHM = 0.08 = 2.2 eV at Si plasmon
+  // energy ~16 eV). Whenever the peak is much narrower than the spacing
+  // of the dense-at-zero log tail at Ω ≈ Omega_pl, only the centered grid
+  // captures it.
+  const double Omega_pl = 3.0;           // simulated plasmon frequency
+  const double gamma   = 0.04;
+  const double w_max   = 5.0;
+  const long   N_w     = 65;
+  const double w_dense = 0.4;
+  const long   N_dense = 21;
+  const double Omega_max = 8.0;
+  const long   N_Omega   = 32;
+  const long   N_t       = 256;
+  const double T_window  = 12.0;
+
+  // (a) dense at zero — wrong place for this peak
+  auto g_zero = real_freq_grid_t::make_nonuniform_log(
+      100.0, 0.0, w_max, N_w, w_dense, N_dense,
+      Omega_max, N_Omega, N_t, T_window,
+      /*Omega_dense*/ 1.0, /*N_Omega_dense*/ 16);
+  // (b) dense at Omega_pl — should resolve the peak
+  auto g_plas = real_freq_grid_t::make_nonuniform_log(
+      100.0, 0.0, w_max, N_w, w_dense, N_dense,
+      Omega_max, N_Omega, N_t, T_window,
+      /*Omega_dense*/ 0.5, /*N_Omega_dense*/ 16,
+      /*Omega_center*/ Omega_pl);
+
+  auto integrate = [&](real_freq_grid_t const& gg) {
+    double s = 0.0;
+    for (long l = 0; l < gg.N_Omega(); ++l) {
+      const double O = gg.Omega()(l);
+      const double v = (gamma / M_PI)
+                     / ((O - Omega_pl) * (O - Omega_pl) + gamma * gamma);
+      s += gg.Omega_weights()(l) * v;
+    }
+    return s;
+  };
+
+  auto exact = [&](double O_lo) {
+    return (1.0 / M_PI) * (std::atan((Omega_max - Omega_pl) / gamma)
+                          - std::atan((O_lo - Omega_pl) / gamma));
+  };
+
+  const double err_zero = std::abs(integrate(g_zero) - exact(g_zero.Omega()(0)));
+  const double err_plas = std::abs(integrate(g_plas) - exact(g_plas.Omega()(0)));
+
+  // The plasmon-centered layout must resolve the peak substantially
+  // better than the dense-at-zero one at the same N_Omega.
+  REQUIRE(err_plas < err_zero);
+  REQUIRE(err_zero > err_plas * 5.0);
+}
+
 } // namespace gw_real_axis_tests
