@@ -47,6 +47,17 @@
 #include <chrono>
 #include <iostream>
 #include <iomanip>
+#include <cstdlib>
+
+// Pull MKL's get_max_threads if linked, so the bench can print which
+// threading layer actually resolved at runtime. Falls back to a stub
+// when MKL headers are unavailable.
+#if __has_include(<mkl_service.h>)
+  #include <mkl_service.h>
+  #define COQUI_BENCH_HAVE_MKL 1
+#else
+  #define COQUI_BENCH_HAVE_MKL 0
+#endif
 
 namespace bdft_tests {
 
@@ -188,8 +199,16 @@ namespace bdft_tests {
     std::cout << "\n--- IAFT tau_to_w_PHsym (cold = per-call mirror) ---\n";
     std::cout << "nt_b=" << ft.nt_b() << " nw_b=" << ft.nw_b()
               << " (beta=1000 wmax=10.0, IR)\n";
+#if COQUI_BENCH_HAVE_MKL
+    std::cout << "MKL max_threads: " << mkl_get_max_threads()
+              << "   (env OMP_NUM_THREADS="
+              << (std::getenv("OMP_NUM_THREADS") ? std::getenv("OMP_NUM_THREADS") : "?")
+              << ", MKL_THREADING_LAYER="
+              << (std::getenv("MKL_THREADING_LAYER") ? std::getenv("MKL_THREADING_LAYER") : "?")
+              << ")\n";
+#endif
 
-    for (long dim : {4096L, 65536L, 262144L, 1048576L, 4194304L, 16777216L}) {
+    for (long dim : {4096L, 65536L, 262144L, 1048576L, 4194304L}) {
       auto bytes = fmt_mb(2L * dim * ft.nt_b() * sizeof(ComplexType));
       auto h = bench_iaft_pHs_cold<HOST_MEMORY>(ft, dim, 5);
 #if defined(ENABLE_DEVICE)
@@ -250,7 +269,9 @@ namespace bdft_tests {
   TEST_CASE("bench_hadamard", "[.bench][hadamard]") {
     std::cout << "\n--- Hadamard tensor::elementwise(MUL) on (nt,P,Q) ---\n";
     long nt = 200;  // production-ish IR/DLR fermion count
-    for (long P : {256L, 512L, 1024L, 2048L, 4096L}) {
+    // P=4096 needs ~150GB working set (4 arrays of (nt,P,P) complex128 each);
+    // cap to 2048 (~40GB) so we fit comfortably in --mem=300G.
+    for (long P : {256L, 512L, 1024L, 2048L}) {
       long Q = P;
       auto bytes = fmt_mb(3L * nt * P * Q * sizeof(ComplexType));
       auto h = bench_hadamard<HOST_MEMORY>(nt, P, Q, 3);
@@ -292,7 +313,8 @@ namespace bdft_tests {
   TEST_CASE("bench_thc_gemm", "[.bench][gemm]") {
     std::cout << "\n--- THC aux<->primary gemm pair ---\n";
     long M = 64;  // production-ish nbnd
-    for (long P : {256L, 512L, 1024L, 2048L, 4096L}) {
+    // Each (P,P) matrix at P=4096 is 0.5 GB; we have 4 of them plus mirror.
+    for (long P : {256L, 512L, 1024L, 2048L}) {
       long Q = P;
       auto bytes = fmt_mb((long)(P*M + P*Q + M*Q + P*Q) * sizeof(ComplexType));
       auto h = bench_thc_gemm<HOST_MEMORY>(P, Q, M, 3);
@@ -411,7 +433,7 @@ namespace bdft_tests {
   TEST_CASE("bench_contract", "[.bench][contract]") {
     std::cout << "\n--- cuTENSOR tensor::contract Z(R,P,Q)=sum_t X(R,P,t)*Y(R,t,Q) ---\n";
     long nt = 200, R = 8;
-    for (long P : {256L, 512L, 1024L, 2048L, 4096L}) {
+    for (long P : {256L, 512L, 1024L, 2048L}) {
       long Q = P;
       auto bytes = fmt_mb((long)R * (P*nt + nt*Q + P*Q) * sizeof(ComplexType));
       auto d = bench_contract<DEVICE_MEMORY>(nt, P, Q, R, 3);
