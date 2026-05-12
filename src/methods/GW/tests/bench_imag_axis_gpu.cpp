@@ -37,8 +37,6 @@
 
 namespace bdft_tests {
 
-  using namespace methods;
-
   // --- helpers ----------------------------------------------------------
 
   template<typename T>
@@ -198,19 +196,17 @@ namespace bdft_tests {
   bench_result bench_hadamard(long nt, long P, long Q, int nruns) {
     nda::array<ComplexType, 3> h_A(nt, P, Q);
     nda::array<ComplexType, 3> h_B(nt, P, Q);
-    nda::array<ComplexType, 3> h_C(nt, P, Q);
     fill_random(h_A);
     fill_random(h_B, 43);
 
     auto A = memory::to_memory_space<MEM>(h_A);
     auto B = memory::to_memory_space<MEM>(h_B);
-    auto C = memory::to_memory_space<MEM>(h_C);
 
     return time_it([&]() {
-      // C(t,P,Q) = A(t,P,Q) * B(t,P,Q) elementwise (the Pi/Sigma Hadamard).
+      // B = A * B (in-place Hadamard MUL on (t,P,Q)).
       nda::tensor::elementwise(ComplexType(1.0), A, "tPQ",
-                               ComplexType(0.0), B, "tPQ",
-                               C, "tPQ", nda::tensor::op::MUL);
+                               ComplexType(1.0), B, "tPQ",
+                               nda::tensor::op::MUL);
     }, nruns);
   }
 
@@ -271,21 +267,20 @@ namespace bdft_tests {
     }
   }
 
-  // --- Tensor contraction (cuTENSOR path) -------------------------------
+  // --- Tensor contraction (cuTENSOR path; DEVICE only because we build
+  //     with TBLIS=OFF and nda::tensor::contract on host needs TBLIS) -----
 
-  template<MEMORY_SPACE MEM>
-  bench_result bench_contract(long nt, long P, long Q, long R, int nruns) {
-    // Models the R-space contraction Sigma(t,R,P,Q) = G(t,R,P,Q) * W(t,R,P,Q)
-    // but more useful: a real contraction X(R,P,a) * Y(R,a,Q) -> Z(R,P,Q).
+#if defined(ENABLE_DEVICE)
+  bench_result bench_contract_device(long nt, long P, long Q, long R, int nruns) {
     nda::array<ComplexType, 3> h_X(R, P, nt);
     nda::array<ComplexType, 3> h_Y(R, nt, Q);
     nda::array<ComplexType, 3> h_Z(R, P, Q);
     fill_random(h_X);
     fill_random(h_Y, 43);
 
-    auto X = memory::to_memory_space<MEM>(h_X);
-    auto Y = memory::to_memory_space<MEM>(h_Y);
-    auto Z = memory::to_memory_space<MEM>(h_Z);
+    auto X = memory::to_memory_space<DEVICE_MEMORY>(h_X);
+    auto Y = memory::to_memory_space<DEVICE_MEMORY>(h_Y);
+    auto Z = memory::to_memory_space<DEVICE_MEMORY>(h_Z);
 
     return time_it([&]() {
       // Z(R,P,Q) = sum_t X(R,P,t) * Y(R,t,Q)
@@ -295,18 +290,18 @@ namespace bdft_tests {
   }
 
   TEST_CASE("bench_contract", "[.bench][contract]") {
-    std::cout << "\n--- Tensor contraction (batched gemm via tensor::contract) ---\n";
+    std::cout << "\n--- nda::tensor::contract (DEVICE; cuTENSOR) ---\n";
+    std::cout << "Host counterpart skipped: build has -DENABLE_TBLIS=OFF.\n";
     long nt = 104, R = 4;
     for (long P : {32L, 128L, 320L, 1024L}) {
       long Q = P;
-      auto h = bench_contract<HOST_MEMORY>(nt, P, Q, R, 3);
-#if defined(ENABLE_DEVICE)
-      auto d = bench_contract<DEVICE_MEMORY>(nt, P, Q, R, 3);
-#else
-      auto d = h;
-#endif
-      print_row("contract (R,P=Q,t)", P, h, d);
+      auto d = bench_contract_device(nt, P, Q, R, 3);
+      std::cout << std::left << std::setw(28) << "contract (R,P=Q,t)"
+                << std::right << std::setw(10) << P
+                << "  dev: " << std::setw(9) << std::fixed
+                << std::setprecision(3) << d.per_call_ms << " ms" << std::endl;
     }
   }
+#endif
 
 } // namespace bdft_tests
