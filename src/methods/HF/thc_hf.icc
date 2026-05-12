@@ -14,11 +14,16 @@
 
 namespace methods {
   namespace solvers {
-    template<nda::MemoryArray AF_t>
+    template<MEMORY_SPACE MEM, nda::MemoryArray AF_t>
     void hf_t::thc_hf_Xqindep(const nda::MemoryArrayOfRank<4> auto &Dm_skij, sArray_t<AF_t> &sF_skij,
                               THC_ERI auto &thc, const nda::MemoryArrayOfRank<4> auto &S_skij,
                               bool compute_hartree, bool compute_exchange) {
-      using local_Array_4D_t = memory::array<HOST_MEMORY, ComplexType, 4>;
+      static_assert(MEM == HOST_MEMORY,
+                    "hf_t::thc_hf_Xqindep: device path not yet ported. "
+                    "Imag-axis HF/Hartree-Fock contribution is sub-leading "
+                    "(<0.1 s/iter on LiH222); plumb MEM through if/when "
+                    "actually exercised on GPU.");
+      using local_Array_4D_t = memory::array<MEM, ComplexType, 4>;
       using math::nda::make_distributed_array;
 
       auto MF = thc.MF();
@@ -217,7 +222,15 @@ namespace methods {
             auto had_prod2 = nda::map([](ComplexType x, ComplexType y) { return -1.0 * (x * y); });
             for (long s = 0; s < ns; ++s) {
               auto Dm_RPQ = dDm_skPQ.local()(s, nda::ellipsis{});
-              Dm_RPQ = had_prod2(Dm_RPQ, dU_qPQ_loc);
+              if constexpr (::nda::mem::on_host<std::decay_t<decltype(Dm_RPQ)>>) {
+                Dm_RPQ = had_prod2(Dm_RPQ, dU_qPQ_loc);
+              } else {
+                // Dm := -Dm * U via in-place tensor::elementwise + scale.
+                nda::tensor::elementwise(ComplexType(1.0), dU_qPQ_loc, "RPQ",
+                                         ComplexType(1.0), Dm_RPQ,     "RPQ",
+                                         nda::tensor::op::MUL);
+                nda::tensor::scale(ComplexType(-1.0), Dm_RPQ);
+              }
             }
 
             if (nkpts != 1) {

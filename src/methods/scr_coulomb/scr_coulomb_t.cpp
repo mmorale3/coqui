@@ -58,6 +58,7 @@ namespace solvers {
     }
   }
 
+  template<MEMORY_SPACE MEM>
   void scr_coulomb_t::update_w(MBState &mb_state, THC_ERI auto &thc, long h5_iter) {
     using math::nda::make_distributed_array;
     using math::shm::make_shared_array;
@@ -92,18 +93,31 @@ namespace solvers {
         }
       }
     }
-    auto dPi_tqPQ = eval_Pi_qdep(mb_state, thc);
+    auto dPi_tqPQ = eval_Pi_qdep<MEM>(mb_state, thc);
 
     // evaluate screened interaction (dW_tqPQ) and reset polarizability (dPi_tqPQ)
     // a) dPi_tqPQ is reset during dyson_W_from_Pi_tau()
     // b) pgrid and bsize of dW_tqPQ are forced to be the same as in dPi_tqPQ
     auto dW_tqPQ = dyson_W_from_Pi_tau<false>(dPi_tqPQ, thc, true);
-    auto [eps_inv_head_q, eps_inv_head] =
-        div_utils::eps_inv_head_t(dW_tqPQ, thc, *thc.MF(), _ft, _div_treatment);
+
+    // div_utils::eps_inv_head_t is host-only; if dW lives on device,
+    // mirror it to host once (one allreduce-shaped array per SCF iter).
+    auto [eps_inv_head_q, eps_inv_head] = [&]() {
+      if constexpr (MEM == HOST_MEMORY) {
+        return div_utils::eps_inv_head_t(dW_tqPQ, thc, *thc.MF(), _ft, _div_treatment);
+      } else {
+        auto t_pgrid_h = dW_tqPQ.grid();
+        auto t_bsize_h = dW_tqPQ.block_size();
+        auto gshape_h  = dW_tqPQ.global_shape();
+        auto dW_host = make_distributed_array<nda::array<ComplexType, 4>>(
+            thc.mpi()->comm, t_pgrid_h, gshape_h, t_bsize_h);
+        dW_host.local() = nda::to_host(dW_tqPQ.local());
+        return div_utils::eps_inv_head_t(dW_host, thc, *thc.MF(), _ft, _div_treatment);
+      }
+    }();
     mb_state.eps_inv_head = eps_inv_head;
 
-    // make routine to transposed distributed arrays over any 2 indices, so should
-    // be easy to template to an array type and to indexes, and replace repeated code
+    // Stage W back to host MBState. mb_state.dW_qtPQ is HOST-typed.
     auto t_pgrid = dW_tqPQ.grid();
     auto t_bsize = dW_tqPQ.block_size();
     auto gshape = dW_tqPQ.global_shape();
@@ -111,14 +125,24 @@ namespace solvers {
                              thc.mpi()->comm, {t_pgrid[1], t_pgrid[0], t_pgrid[2], t_pgrid[3]},
                              {gshape[1], gshape[0], gshape[2], gshape[3]},
                              {t_bsize[1], t_bsize[0], t_bsize[2], t_bsize[3]}));
-    auto W_tqPQ = dW_tqPQ.local();
     auto W_qtPQ = mb_state.dW_qtPQ.value().local();
     long nt_loc = dW_tqPQ.local_shape()[0];
     long nq_loc = dW_tqPQ.local_shape()[1];
-    for (size_t qt = 0; qt < nq_loc * nt_loc; ++qt) {
-      size_t iq = qt / nt_loc;
-      size_t it = qt % nt_loc;
-      W_qtPQ(iq, it, nda::ellipsis{}) = W_tqPQ(it, iq, nda::ellipsis{});
+    if constexpr (MEM == HOST_MEMORY) {
+      auto W_tqPQ = dW_tqPQ.local();
+      for (size_t qt = 0; qt < nq_loc * nt_loc; ++qt) {
+        size_t iq = qt / nt_loc;
+        size_t it = qt % nt_loc;
+        W_qtPQ(iq, it, nda::ellipsis{}) = W_tqPQ(it, iq, nda::ellipsis{});
+      }
+    } else {
+      // Device → host: copy dW_tqPQ to host once, then transpose into W_qtPQ.
+      nda::array<ComplexType, 4> W_tqPQ_h = nda::to_host(dW_tqPQ.local());
+      for (size_t qt = 0; qt < nq_loc * nt_loc; ++qt) {
+        size_t iq = qt / nt_loc;
+        size_t it = qt % nt_loc;
+        W_qtPQ(iq, it, nda::ellipsis{}) = W_tqPQ_h(it, iq, nda::ellipsis{});
+      }
     }
     dW_tqPQ.reset();
 
@@ -183,7 +207,11 @@ namespace solvers {
     mpi3::communicator q_intra_comm = thc.mpi()->comm.split(q_origin, thc.mpi()->comm.rank());
     utils::check(q_intra_comm.size() == pgrid[0]*pgrid[2]*pgrid[3], "q_intra_comm.size() != pgrid[0]*pgrid[2]*pgrid[3]");
 
-    using Array_2D_t = memory::array<HOST_MEMORY, ComplexType, 2>;
+    // MEM is inferred from the input darray; the local slate work
+    // arrays (dPi_PQ / dZ_PQ / dA_PQ) live in the same memory space.
+    constexpr MEMORY_SPACE MEM =
+        ::nda::mem::on_host<Array_4D_t> ? HOST_MEMORY : DEVICE_MEMORY;
+    using Array_2D_t = memory::array<MEM, ComplexType, 2>;
     using math::nda::make_distributed_array;
     auto dPi_PQ = make_distributed_array<Array_2D_t>(wq_intra_comm, {pgrid[2], pgrid[3]}, {NP, NQ}, {block_size[2], block_size[3]}, true);
     auto dZ_PQ  = make_distributed_array<Array_2D_t>(wq_intra_comm, {pgrid[2], pgrid[3]}, {NP, NQ}, {block_size[2], block_size[3]}, true);
@@ -201,13 +229,24 @@ namespace solvers {
       }
     }
 
+    // Precompute the local-block identity matrix once, in MEM, so the
+    // per-element diagonal updates become a single tensor::elementwise
+    // call instead of a host loop (lazy on-device assignment is illegal).
+    [[maybe_unused]] memory::array<MEM, ComplexType, 2> Id_PQ_mem;
+    if constexpr (MEM != HOST_MEMORY) {
+      nda::array<ComplexType, 2> Id_PQ_host(NP_loc, NQ_loc);
+      Id_PQ_host() = ComplexType(0.0);
+      for (auto idx: diag_idx) Id_PQ_host(idx.first, idx.second) = ComplexType(1.0);
+      Id_PQ_mem = memory::to_memory_space<MEM>(Id_PQ_host);
+    }
+
     auto Pi_wqPQ = dPi_wqPQ.local();
     auto Pi_PQ = dPi_PQ.local();
     auto Z_PQ = dZ_PQ.local();
     auto A_PQ = dA_PQ.local();
     for (size_t iq_loc = 0; iq_loc < nq_loc; ++iq_loc) {
       long iq = q_origin + iq_loc;
-      Z_PQ = thc.Z(iq, P_rng, Q_rng, qpool_id, pgrid[1], q_intra_comm);
+      Z_PQ = thc.template Z<MEM>(iq, P_rng, Q_rng, qpool_id, pgrid[1], q_intra_comm);
 
       // W(w) = [ I - Z * Pi(w)]^{-1} * Z - Z
       for (size_t n = 0; n < nw_loc; ++n) {
@@ -215,18 +254,31 @@ namespace solvers {
 
         // A = Z * Pi(w)
         math::nda::slate_ops::multiply(dZ_PQ, dPi_PQ, dA_PQ);
-        // A = I - Z * Pi(w)
-        for (auto idx: diag_idx) {
-          A_PQ(idx.first, idx.second) -= ComplexType(1.0);
+        // A = I - Z * Pi(w) (i.e. A := -A; A_diag += 1)
+        if constexpr (MEM == HOST_MEMORY) {
+          for (auto idx: diag_idx) {
+            A_PQ(idx.first, idx.second) -= ComplexType(1.0);
+          }
+          A_PQ *= -1.0;
+        } else {
+          nda::tensor::scale(ComplexType(-1.0), A_PQ);
+          nda::tensor::elementwise(ComplexType(1.0), Id_PQ_mem, "PQ",
+                                   ComplexType(1.0), A_PQ,     "PQ",
+                                   nda::tensor::op::SUM);
         }
-        A_PQ *= -1.0;
 
         // A = [I - Z*Pi(w)]^{-1}
         math::nda::slate_ops::inverse(dA_PQ);
 
-        // A = [I - Z*Pi(w)]^{-1} - I
-        for (auto idx: diag_idx) {
-          A_PQ(idx.first, idx.second) -= ComplexType(1.0);
+        // A = [I - Z*Pi(w)]^{-1} - I (diag -= 1)
+        if constexpr (MEM == HOST_MEMORY) {
+          for (auto idx: diag_idx) {
+            A_PQ(idx.first, idx.second) -= ComplexType(1.0);
+          }
+        } else {
+          nda::tensor::elementwise(ComplexType(-1.0), Id_PQ_mem, "PQ",
+                                   ComplexType(1.0), A_PQ,     "PQ",
+                                   nda::tensor::op::SUM);
         }
 
         // W = ([I - Z*Pi(w)]^{-1} - I) * Z
@@ -236,7 +288,7 @@ namespace solvers {
     }
     // prevent dead block in thc.Z() in case nq_loc is not the same for all processors
     for (long iq_loc = nq_loc; iq_loc < nq_loc_max; ++iq_loc)
-      Z_PQ = thc.Z(0, P_rng, Q_rng, qpool_id, pgrid[1], q_intra_comm);
+      Z_PQ = thc.template Z<MEM>(0, P_rng, Q_rng, qpool_id, pgrid[1], q_intra_comm);
 
     _Timer.stop("EVALUATE_W");
 
@@ -297,8 +349,9 @@ namespace solvers {
     return dPi_tqPQ;
   }
 
+  template<MEMORY_SPACE MEM>
   auto scr_coulomb_t::eval_Pi_qdep(MBState &mb_state, THC_ERI auto &thc)
-  -> memory::darray_t<memory::array<HOST_MEMORY, ComplexType, 4>, mpi3::communicator>
+  -> memory::darray_t<memory::array<MEM, ComplexType, 4>, mpi3::communicator>
   {
 
     if (_screen_type.find("edmft") == std::string::npos
@@ -313,65 +366,80 @@ namespace solvers {
     }
     utils::check(mb_state.sG_tskij.has_value(),
                  "scr_coulomb_t::eval_Pi_qdep: G_tskij is not set in MBState.");
+    if constexpr (MEM != HOST_MEMORY) {
+      utils::check(_screen_type != "rpa_k" and
+                   _screen_type.find("crpa") == std::string::npos and
+                   _screen_type.find("edmft") == std::string::npos,
+                   "scr_coulomb_t::eval_Pi_qdep: device path only supports the "
+                   "pure RPA (R-space) algorithm; got screen_type='{}'.",
+                   _screen_type);
+    }
 
     auto G_tskij = mb_state.sG_tskij.value().local();
 
-    if (_screen_type == "rpa_k")
-      return eval_Pi_rpa_kspace(G_tskij, thc);
+    if constexpr (MEM == HOST_MEMORY) {
+      // k-space algorithm is HOST-only (eval_Pi_rpa_kspace has a
+      // static_assert against DEVICE_MEMORY); only instantiate the
+      // call here on the host path.
+      if (_screen_type == "rpa_k")
+        return eval_Pi_rpa_kspace<MEM>(G_tskij, thc);
+    }
 
-    // RPA polarizability
-    auto dPi_tqPQ = eval_Pi_rpa_Rspace(G_tskij, thc);
+    // RPA polarizability (R-space; works for both HOST and DEVICE).
+    auto dPi_tqPQ = eval_Pi_rpa_Rspace<MEM>(G_tskij, thc);
     if (_screen_type.find("gw_edmft_rpa")!=std::string::npos or _screen_type=="rpa")
       return dPi_tqPQ;
 
-    // cRPA corrections: Pi_cRPA = Pi_RPA - Pi_active
-    if (_screen_type.find("crpa") != std::string::npos) {
+    if constexpr (MEM == HOST_MEMORY) {
+      // cRPA corrections: Pi_cRPA = Pi_RPA - Pi_active
+      if (_screen_type.find("crpa") != std::string::npos) {
 
-      utils::check(mb_state.proj_boson.has_value(),
-                   "scr_coulomb_t::eval_Pi_qdep: projector is missing in the crpa mode.");
-      int crpa_scheme = (_screen_type.find("crpa_vasp")!=std::string::npos)? 2 :
-                        (_screen_type.find("crpa_ks")!=std::string::npos)? 1 : 0;
-      // Pi_dc and Pi are distributed in the same way among the processors since "eval_Pi_rpa_active" call "eval_Pi_qdep" under the hood.
-      auto& proj_boson = mb_state.proj_boson.value();
-      auto dPi_tqPQ_dc = eval_Pi_rpa_active(G_tskij, thc, proj_boson.proj_fermi(), crpa_scheme);
-      dPi_tqPQ.local() -= dPi_tqPQ_dc.local();
+        utils::check(mb_state.proj_boson.has_value(),
+                     "scr_coulomb_t::eval_Pi_qdep: projector is missing in the crpa mode.");
+        int crpa_scheme = (_screen_type.find("crpa_vasp")!=std::string::npos)? 2 :
+                          (_screen_type.find("crpa_ks")!=std::string::npos)? 1 : 0;
+        // Pi_dc and Pi are distributed in the same way among the processors since "eval_Pi_rpa_active" call "eval_Pi_qdep" under the hood.
+        auto& proj_boson = mb_state.proj_boson.value();
+        auto dPi_tqPQ_dc = eval_Pi_rpa_active(G_tskij, thc, proj_boson.proj_fermi(), crpa_scheme);
+        dPi_tqPQ.local() -= dPi_tqPQ_dc.local();
 
-    }
+      }
 
-    // EDMFT corrections: Pi_edmft = Pi_RPA + (Pi_imp - Pi_dc)
-    if (_screen_type.find("edmft") != std::string::npos) {
+      // EDMFT corrections: Pi_edmft = Pi_RPA + (Pi_imp - Pi_dc)
+      if (_screen_type.find("edmft") != std::string::npos) {
 
-      utils::check(mb_state.proj_boson.has_value(), "scr_coulomb_t::eval_Pi_qdep: projector is missing in edmft mode.");
+        utils::check(mb_state.proj_boson.has_value(), "scr_coulomb_t::eval_Pi_qdep: projector is missing in edmft mode.");
 
-      if (!mb_state.sPi_imp_wabcd or !mb_state.sPi_dc_wabcd) {
-        app_log(1, "");
-        app_log(1, "╔══════════════════════════════════════════════════════╗");
-        app_log(1, "║ [ NOTE ]                                             ║");
-        app_log(1, "║ Screening type is set to \"edmft\", but local        ║");
-        app_log(1, "║ polarization corrections were not found or provided. ║");
-        app_log(1, "║ CoQui will proceed assuming zero correction.         ║");
-        app_log(1, "╚══════════════════════════════════════════════════════╝\n");
+        if (!mb_state.sPi_imp_wabcd or !mb_state.sPi_dc_wabcd) {
+          app_log(1, "");
+          app_log(1, "╔══════════════════════════════════════════════════════╗");
+          app_log(1, "║ [ NOTE ]                                             ║");
+          app_log(1, "║ Screening type is set to \"edmft\", but local        ║");
+          app_log(1, "║ polarization corrections were not found or provided. ║");
+          app_log(1, "║ CoQui will proceed assuming zero correction.         ║");
+          app_log(1, "╚══════════════════════════════════════════════════╝\n");
 
-      } else {
-        auto &proj_boson = mb_state.proj_boson.value();
-        auto nImpOrbs = proj_boson.nImpOrbs();
-        auto Pi_imp_iw = mb_state.sPi_imp_wabcd.value().local();
-        auto Pi_dc_iw = mb_state.sPi_dc_wabcd.value().local();
-        auto sPi_t_correction = math::shm::make_shared_array<Array_view_5D_t>(
-            *thc.mpi(), {dPi_tqPQ.global_shape()[0], nImpOrbs, nImpOrbs, nImpOrbs, nImpOrbs});
-        if (thc.mpi()->node_comm.root()) {
-          _ft->w_to_tau_PHsym(Pi_imp_iw, sPi_t_correction.local());
+        } else {
+          auto &proj_boson = mb_state.proj_boson.value();
+          auto nImpOrbs = proj_boson.nImpOrbs();
+          auto Pi_imp_iw = mb_state.sPi_imp_wabcd.value().local();
+          auto Pi_dc_iw = mb_state.sPi_dc_wabcd.value().local();
+          auto sPi_t_correction = math::shm::make_shared_array<Array_view_5D_t>(
+              *thc.mpi(), {dPi_tqPQ.global_shape()[0], nImpOrbs, nImpOrbs, nImpOrbs, nImpOrbs});
+          if (thc.mpi()->node_comm.root()) {
+            _ft->w_to_tau_PHsym(Pi_imp_iw, sPi_t_correction.local());
 
-          nda::array<ComplexType, 5> pi_t_buffer(sPi_t_correction.shape());
-          _ft->w_to_tau_PHsym(Pi_dc_iw, pi_t_buffer);
-          sPi_t_correction.local() -= pi_t_buffer;
+            nda::array<ComplexType, 5> pi_t_buffer(sPi_t_correction.shape());
+            _ft->w_to_tau_PHsym(Pi_dc_iw, pi_t_buffer);
+            sPi_t_correction.local() -= pi_t_buffer;
+          }
+          thc.mpi()->comm.barrier();
+
+          auto dPi_tqPQ_correction = upfold_pi_local(sPi_t_correction.local(), thc, proj_boson,
+                                                     dPi_tqPQ.grid(), dPi_tqPQ.block_size());
+          dPi_tqPQ.local() += dPi_tqPQ_correction.local();
+          thc.mpi()->comm.barrier();
         }
-        thc.mpi()->comm.barrier();
-
-        auto dPi_tqPQ_correction = upfold_pi_local(sPi_t_correction.local(), thc, proj_boson,
-                                                   dPi_tqPQ.grid(), dPi_tqPQ.block_size());
-        dPi_tqPQ.local() += dPi_tqPQ_correction.local();
-        thc.mpi()->comm.barrier();
       }
     }
 
@@ -558,7 +626,10 @@ namespace solvers {
   using Arrv = nda::array_view<ComplexType, 5>;
   using Arrv2 = nda::array_view<ComplexType, 5, nda::C_layout>;
 
-  template void scr_coulomb_t::update_w(MBState&, thc_reader_t&, long);
+  template void scr_coulomb_t::update_w<HOST_MEMORY>(MBState&, thc_reader_t&, long);
+#if defined(ENABLE_DEVICE)
+  template void scr_coulomb_t::update_w<DEVICE_MEMORY>(MBState&, thc_reader_t&, long);
+#endif
 
   template memory::darray_t<Arr4D, mpi3::communicator>
   scr_coulomb_t::dyson_W_from_Pi_tau<true>(memory::darray_t<Arr4D, mpi3::communicator> &, thc_reader_t&, bool,
@@ -578,7 +649,11 @@ namespace solvers {
                               const Arrv*, const Arrv*);
 
   template memory::darray_t<memory::array<HOST_MEMORY, ComplexType, 4>, mpi3::communicator>
-  scr_coulomb_t::eval_Pi_qdep(MBState&, thc_reader_t&g);
+  scr_coulomb_t::eval_Pi_qdep<HOST_MEMORY>(MBState&, thc_reader_t&);
+#if defined(ENABLE_DEVICE)
+  template memory::darray_t<memory::array<DEVICE_MEMORY, ComplexType, 4>, mpi3::communicator>
+  scr_coulomb_t::eval_Pi_qdep<DEVICE_MEMORY>(MBState&, thc_reader_t&);
+#endif
 
 
   template memory::darray_t<Arr4D, mpi3::communicator>

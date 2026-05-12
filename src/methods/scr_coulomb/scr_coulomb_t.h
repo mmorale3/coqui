@@ -95,9 +95,13 @@ namespace solvers {
 
     /**
      * Compute the dynamic screened interaction and store it in the MBState.
+     * MEM controls whether the Pi/W intermediate compute lives on host or
+     * device. State arrays remain on host; device-side intermediates are
+     * staged back to host once at the end.
      * @param mb_state  - [INPUT/OUTPUT] MBState object to store the results
      * @param thc       - [INPUT] THC bare Coulomb interaction
      */
+    template<MEMORY_SPACE MEM = HOST_MEMORY>
     void update_w(MBState &mb_state, THC_ERI auto &thc, long h5_iter=-1);
     void update_w(MBState &mb_state, Cholesky_ERI auto &chol, long h5_iter=-1);
 
@@ -177,8 +181,9 @@ namespace solvers {
                       const nda::array_view<ComplexType, 5> *pi_dc=nullptr)
     -> memory::darray_t<memory::array<HOST_MEMORY, ComplexType, 4>, mpi3::communicator>;
 
+    template<MEMORY_SPACE MEM = HOST_MEMORY>
     auto eval_Pi_qdep(MBState &mb_state, THC_ERI auto &thc)
-    -> memory::darray_t<memory::array<HOST_MEMORY, ComplexType, 4>, mpi3::communicator>;
+    -> memory::darray_t<memory::array<MEM, ComplexType, 4>, mpi3::communicator>;
 
     // TODO function to return Pi(w) directly
 
@@ -222,8 +227,9 @@ namespace solvers {
      * @param thc      - [INPUT] THC-ERI instance
      * @return - Polarization function in k space: (nts, nqpts_ibz, Np, Np)
      */
+    template<MEMORY_SPACE MEM = HOST_MEMORY>
     auto eval_Pi_rpa_Rspace(const nda::MemoryArrayOfRank<5> auto &G_tskij, THC_ERI auto &thc)
-    -> memory::darray_t<memory::array<HOST_MEMORY, ComplexType, 4>, mpi3::communicator>;
+    -> memory::darray_t<memory::array<MEM, ComplexType, 4>, mpi3::communicator>;
 
     /**
      * Evaluate polarization function by computing the convolution on the k space
@@ -232,8 +238,9 @@ namespace solvers {
      * @param thc      - [INPUT] THC-ERI instance
      * @return - Polarization function in k space: (nts, nqpts_ibz, Np, Np)
      */
+    template<MEMORY_SPACE MEM = HOST_MEMORY>
     auto eval_Pi_rpa_kspace(const nda::MemoryArrayOfRank<5> auto &G_tskij, THC_ERI auto &thc)
-    -> memory::darray_t<memory::array<HOST_MEMORY, ComplexType, 4>, mpi3::communicator>;
+    -> memory::darray_t<memory::array<MEM, ComplexType, 4>, mpi3::communicator>;
 
     // details of eval_Pi_all_kspace
     template<nda::MemoryArray Array_5D_t, nda::MemoryArray Array_4D_t, typename communicator_t>
