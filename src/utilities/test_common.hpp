@@ -29,6 +29,7 @@
 #include<tuple>
 #include<memory>
 #include <filesystem>
+#include <type_traits>
 
 #include "catch2/catch.hpp"
 #include "configuration.hpp"
@@ -60,9 +61,13 @@ inline std::shared_ptr<mpi_context_t<mpi3::communicator>>& make_unit_test_mpi_co
 template<typename T>
 void VALUE_EQUAL(T const& A, T const& B, double m=1e-8, double eps=1e-8)
 {
-  REQUIRE_THAT(A,
-               Catch::Matchers::WithinRel(B, T(eps)) ||
-               Catch::Matchers::WithinAbs(B, T(m)));
+  if constexpr (std::is_integral_v<T>) {
+    REQUIRE(A == B);
+  } else {
+    REQUIRE_THAT(A,
+                 Catch::Matchers::WithinRel(B, T(eps)) ||
+                 Catch::Matchers::WithinAbs(B, T(m)));
+  }
 }
 
 template<typename T>
