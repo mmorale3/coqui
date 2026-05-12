@@ -393,16 +393,16 @@ void inverse(DistributedMatrix auto&& A)
 	);
   } else {
     slate::Pivots pivots ;
-    long info = slate::getrf ( As , pivots, 
+    long info = slate::getrf ( As , pivots,
         // Set execution target to GPU Devices
         {{ slate::Option::Target, slate::Target::Devices },
         { slate::Option::Lookahead, 1 }});
     utils::check(info == 0, "inverse: getrf info: {}.", info);
-    info = slate::getri ( As , pivots,
+    // slate::getri returns void; do not capture into long.
+    slate::getri ( As , pivots,
         // Set execution target to GPU Devices
         {{ slate::Option::Target, slate::Target::Devices },
         { slate::Option::Lookahead, 1 }} );
-    utils::check(info == 0, "inverse: getri info: {}.", info);
   }
 #else
   utils::check(false, "inverse: requires SLATE, compile with ENABLE_SLATE.");

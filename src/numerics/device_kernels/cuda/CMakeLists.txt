@@ -4,7 +4,8 @@
 if(ENABLE_CUDA)
  
   set(DEV_KERNEL_SRCS
-    argmax_min.cu 
+    argmax_min.cu
+    copy_cast.cu
     copy_select.cu
     complex_tools.cu
     symmetry_tools.cu
