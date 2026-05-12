@@ -18,10 +18,19 @@ void IAFT::tau_to_w(ndaArray_A &&X_ti, ndaArray_B &&X_wi, stats_e stats) const {
   long dim1 = std::accumulate(X_ti.shape().begin()+1, X_ti.shape().end(), 1, std::multiplies<>{});
   auto X_ti_2D = nda::reshape(X_ti, shape_t<2>{nt, dim1});
   auto X_wi_2D = nda::reshape(X_wi, shape_t<2>{nw, dim1});
-  if (stats == fermi) {
-    nda::blas::gemm(Twt_ff(), X_ti_2D, X_wi_2D);
+  using A_t = std::decay_t<ndaArray_A>;
+  if constexpr (nda::mem::on_host<A_t>) {
+    if (stats == fermi) nda::blas::gemm(Twt_ff(), X_ti_2D, X_wi_2D);
+    else                nda::blas::gemm(Twt_bb(), X_ti_2D, X_wi_2D);
   } else {
-    nda::blas::gemm(Twt_bb(), X_ti_2D, X_wi_2D);
+    constexpr auto MEM_ = nda::mem::on_unified<A_t> ? UNIFIED_MEMORY : DEVICE_MEMORY;
+    if (stats == fermi) {
+      auto T = memory::to_memory_space<MEM_>(Twt_ff());
+      nda::blas::gemm(T, X_ti_2D, X_wi_2D);
+    } else {
+      auto T = memory::to_memory_space<MEM_>(Twt_bb());
+      nda::blas::gemm(T, X_ti_2D, X_wi_2D);
+    }
   }
 }
 
@@ -69,7 +78,14 @@ void IAFT::tau_to_w_PHsym(Array_tau_t &&X_ti_pos, Array_w_t &&X_wi_pos) const {
     }
   }
   // (w,i) = (w,t) * (t,i)
-  nda::blas::gemm(ComplexType(1.0), Twt_pos, X_ti_2D, ComplexType(0.0), X_wi_2D);
+  using A_t = std::decay_t<Array_tau_t>;
+  if constexpr (nda::mem::on_host<A_t>) {
+    nda::blas::gemm(ComplexType(1.0), Twt_pos, X_ti_2D, ComplexType(0.0), X_wi_2D);
+  } else {
+    constexpr auto MEM_ = nda::mem::on_unified<A_t> ? UNIFIED_MEMORY : DEVICE_MEMORY;
+    auto Twt_pos_mem = memory::to_memory_space<MEM_>(Twt_pos);
+    nda::blas::gemm(ComplexType(1.0), Twt_pos_mem, X_ti_2D, ComplexType(0.0), X_wi_2D);
+  }
 }
 
 /**
@@ -90,10 +106,19 @@ void IAFT::w_to_tau(ndaArray_A &&X_wi, ndaArray_B &&X_ti, stats_e stats) const {
   long dim1 = std::accumulate(X_wi.shape().begin()+1, X_wi.shape().end(), 1, std::multiplies<>{});
   auto X_ti_2D = nda::reshape(X_ti, shape_t<2>{nt, dim1});
   auto X_wi_2D = nda::reshape(X_wi, shape_t<2>{nw, dim1});
-  if (stats == fermi) {
-    nda::blas::gemm(Ttw_ff(), X_wi_2D, X_ti_2D);
+  using A_t = std::decay_t<ndaArray_A>;
+  if constexpr (nda::mem::on_host<A_t>) {
+    if (stats == fermi) nda::blas::gemm(Ttw_ff(), X_wi_2D, X_ti_2D);
+    else                nda::blas::gemm(Ttw_bb(), X_wi_2D, X_ti_2D);
   } else {
-    nda::blas::gemm(Ttw_bb(), X_wi_2D, X_ti_2D);
+    constexpr auto MEM_ = nda::mem::on_unified<A_t> ? UNIFIED_MEMORY : DEVICE_MEMORY;
+    if (stats == fermi) {
+      auto T = memory::to_memory_space<MEM_>(Ttw_ff());
+      nda::blas::gemm(T, X_wi_2D, X_ti_2D);
+    } else {
+      auto T = memory::to_memory_space<MEM_>(Ttw_bb());
+      nda::blas::gemm(T, X_wi_2D, X_ti_2D);
+    }
   }
 }
 
@@ -124,7 +149,14 @@ void IAFT::w_to_tau_PHsym(Array_w_t &&X_wi_pos, Array_tau_t &&X_ti_pos) const {
     }
   }
   // (w,i) = (w,t) * (t,i)
-  nda::blas::gemm(ComplexType(1.0), Ttw_pos, X_wi_2D, ComplexType(0.0), X_ti_2D);
+  using A_t = std::decay_t<Array_w_t>;
+  if constexpr (nda::mem::on_host<A_t>) {
+    nda::blas::gemm(ComplexType(1.0), Ttw_pos, X_wi_2D, ComplexType(0.0), X_ti_2D);
+  } else {
+    constexpr auto MEM_ = nda::mem::on_unified<A_t> ? UNIFIED_MEMORY : DEVICE_MEMORY;
+    auto Ttw_pos_mem = memory::to_memory_space<MEM_>(Ttw_pos);
+    nda::blas::gemm(ComplexType(1.0), Ttw_pos_mem, X_wi_2D, ComplexType(0.0), X_ti_2D);
+  }
 }
 
 template<nda::MemoryArray ndaArray_A_t, nda::MemoryArray ndaArray_B_t>
@@ -260,6 +292,14 @@ void IAFT::tau_to_zero(ndaArray_A &&A_ti, ndaArray_B &&A_zero_i)  const {
 
 template<nda::MemoryArray Array_A, typename comm_t>
 void IAFT::check_leakage(Array_A &&A_ti, stats_e stats, comm_t *comm, std::string A_name) const {
+  // Diagnostic only — stage device input through host (kernel size is small,
+  // and the body uses lazy nda::map / host-only nda::array allocations).
+  using A_t = std::decay_t<Array_A>;
+  if constexpr (not nda::mem::on_host<A_t>) {
+    auto A_ti_host = nda::to_host(A_ti);
+    check_leakage(A_ti_host, stats, comm, A_name);
+    return;
+  } else {
   auto Abs = nda::map([](ComplexType x) { return std::abs(x); });
 
   long nts  = (stats == fermi)? nt_f() : nt_b();
@@ -300,10 +340,18 @@ void IAFT::check_leakage(Array_A &&A_ti, stats_e stats, comm_t *comm, std::strin
                "          Considering increasing \"lambda\" of the IR/DLR grid.\n",
             leakage, coeff_last_max, coeff_first_max);
   }
+  } // end host branch
 }
 
 template<nda::MemoryArray Array_A, typename comm_t>
 void IAFT::check_leakage_PHsym(Array_A &&A_ti, stats_e stats, comm_t *comm, std::string A_name) const {
+  // Stage device input through host — see check_leakage().
+  using A_t = std::decay_t<Array_A>;
+  if constexpr (not nda::mem::on_host<A_t>) {
+    auto A_ti_host = nda::to_host(A_ti);
+    check_leakage_PHsym(A_ti_host, stats, comm, A_name);
+    return;
+  } else {
   auto Abs = nda::map([](ComplexType x) { return std::abs(x); });
 
   long nts  = (stats == fermi)? nt_f() : nt_b();
@@ -354,6 +402,7 @@ void IAFT::check_leakage_PHsym(Array_A &&A_ti, stats_e stats, comm_t *comm, std:
                "          Considering increasing \"lambda\" of the IR/DLR grid.\n",
             leakage, coeff_last_max, coeff_first_max);
   }
+  } // end host branch
 }
 
 template<typename A_t>
