@@ -118,6 +118,46 @@ namespace bdft_tests {
     }
   }
 
+#if defined(ENABLE_DEVICE)
+  // Smoke test for imag-axis GW DEVICE_MEMORY path: after a HOST scf_loop
+  // initializes mb_state, call scr_coulomb_t::update_w<DEVICE> and
+  // gw_t::evaluate<DEVICE> directly to validate the device path runs
+  // end-to-end (no host-vs-device validation in this lightweight smoke).
+  TEST_CASE("thc_gw_qe_device_smoke", "[methods][thc][gw][qe][device]") {
+    auto& mpi_context = utils::make_unit_test_mpi_context();
+
+    auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_lih222"));
+    imag_axes_ft::IAFT ft(1000, 1.2, imag_axes_ft::ir_source);
+    std::string output = "coqui_dev";
+
+    solvers::hf_t hf;
+    solvers::gw_t gw(&ft, "ignore_g0", output);
+    solvers::scr_coulomb_t scr_eri(&ft, "rpa", "ignore_g0");
+    simple_dyson dyson(mf.get(), &ft);
+    MBState mb_state(mpi_context, ft, output);
+
+    thc_reader_t thc(mf, make_thc_reader_ptree(mf->nbnd() * 20, "", "incore", "", "bdft",
+                                               1e-10, mf->ecutrho(), 1, 1024));
+    auto eri = mb_eri_t(thc, thc);
+    iter_scf::iter_scf_t iter_sol("damping");
+
+    // One HOST iter initializes mb_state.
+    scf_loop(mb_state, dyson, eri, ft,
+             solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol,
+             1, false, 1e-9, true);
+
+    // Now drive the DEVICE_MEMORY explicit instantiations.
+    scr_eri.update_w<DEVICE_MEMORY>(mb_state, thc, 0);
+    gw.evaluate<DEVICE_MEMORY>(mb_state, thc, true);
+
+    mpi_context->comm.barrier();
+    if (mpi_context->comm.root()) {
+      remove((output+".mbpt.h5").c_str());
+    }
+    mpi_context->comm.barrier();
+  }
+#endif
+
   TEST_CASE("thc_gw_qe", "[methods][thc][gw][qe]") {
     auto& mpi_context = utils::make_unit_test_mpi_context();
 
