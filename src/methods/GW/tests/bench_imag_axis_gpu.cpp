@@ -1,16 +1,29 @@
 /**
  * Synthetic-data performance benches for imag-axis GW kernels (host vs device).
  *
- * Each TEST_CASE is tagged "[.bench]" — Catch2 hides "." tagged cases by
- * default. Run explicitly:
+ * Sizes target *production* GW workloads, not the LiH222 correctness fixture.
+ * LiH222 (Naux=128, Nk=8, nbnd=16) is too small to amortize cuFINUFFT plan
+ * setup, cuTENSOR planner cost, or per-call host->device transfers; use it
+ * only for correctness checks. These benches sweep over P/Q sizes from
+ * 128 up to 4096 and IAFT contracted dims up to ~16M to expose the
+ * asymptotic device wins and the crossover points.
+ *
+ * Each TEST_CASE is tagged "[.bench]" (Catch2 hides "." cases by default).
+ * Run explicitly:
  *
  *     ./test_methods_gw "[.bench]"            # all benches
- *     ./test_methods_gw "bench_iaft"          # only IAFT bench
+ *     ./test_methods_gw "bench_iaft"          # IAFT only
+ *     ./test_methods_gw "[hadamard]"          # Hadamard only
  *
- * Benches use random synthetic data of realistic shapes (LiH222-scale up to
- * a Si-phase1-scale extrapolation). They isolate each phase of the GW
- * pipeline so we can profile what wins / loses on A100 vs Rusty CPU as
- * problem size grows.
+ * The benches emphasise two architectural points for the GPU port:
+ *   (1) memory transfers between CPU and GPU should be minimised
+ *       (see bench_iaft_cold_vs_warm: cached device kernel vs per-call
+ *       mirror), and
+ *   (2) concurrency wins come from recasting many small ops as one
+ *       large gemm/contraction (see bench_batched_vs_loop_gemm).
+ *
+ * Memory bookkeeping: each case prints the working-set bytes so we can
+ * see what fits on a 40GB A100. Complex double is 16 bytes.
  */
 
 #undef NDEBUG
@@ -87,110 +100,137 @@ namespace bdft_tests {
     return {total_ms, total_ms / nruns, nruns};
   }
 
+  inline std::string fmt_mb(size_t bytes) {
+    char buf[32];
+    if (bytes > (size_t)(1024*1024*1024))
+      std::snprintf(buf, sizeof(buf), "%.1f GB", bytes / (1024.0*1024.0*1024.0));
+    else
+      std::snprintf(buf, sizeof(buf), "%.1f MB", bytes / (1024.0*1024.0));
+    return buf;
+  }
+
   inline void print_row(std::string const& label, long N,
-                        bench_result const& h, bench_result const& d) {
+                        bench_result const& h, bench_result const& d,
+                        std::string const& bytes_str = "") {
     std::cout << std::left << std::setw(28) << label
-              << std::right << std::setw(10) << N
-              << "  host: " << std::setw(9) << std::fixed
+              << std::right << std::setw(8) << N
+              << "  host: " << std::setw(10) << std::fixed
               << std::setprecision(3) << h.per_call_ms << " ms"
-              << "  dev: "  << std::setw(9) << d.per_call_ms << " ms"
-              << "  speedup: " << std::setw(6) << std::setprecision(2)
-              << (h.per_call_ms / std::max(d.per_call_ms, 1e-6)) << "x"
-              << std::endl;
+              << "  dev: "  << std::setw(10) << d.per_call_ms << " ms"
+              << "  speedup: " << std::setw(7) << std::setprecision(2)
+              << (h.per_call_ms / std::max(d.per_call_ms, 1e-6)) << "x";
+    if (!bytes_str.empty()) std::cout << "   " << bytes_str;
+    std::cout << std::endl;
+  }
+
+  inline void print_row_dev_only(std::string const& label, long N,
+                                 bench_result const& d,
+                                 std::string const& bytes_str = "") {
+    std::cout << std::left << std::setw(28) << label
+              << std::right << std::setw(8) << N
+              << "  dev: " << std::setw(10) << std::fixed
+              << std::setprecision(3) << d.per_call_ms << " ms";
+    if (!bytes_str.empty()) std::cout << "   " << bytes_str;
+    std::cout << std::endl;
   }
 
   // --- IAFT benches -----------------------------------------------------
+  //
+  // "Cold" includes the per-call host->device kernel mirror inside
+  // IAFT::tau_to_w_PHsym (current production code).
+  // "Warm" pre-mirrors the kernel once and only calls gemm — what we'd
+  // see if IAFT cached its device kernel across SCF iters.
 
   template<MEMORY_SPACE MEM>
-  bench_result bench_tau_to_w_PHsym(imag_axes_ft::IAFT const& ft,
-                                    long dim1, int nruns) {
+  bench_result bench_iaft_pHs_cold(imag_axes_ft::IAFT const& ft,
+                                   long dim1, int nruns) {
     size_t nt_half = (ft.nt_b() % 2 == 0) ? ft.nt_b()/2 : ft.nt_b()/2 + 1;
     size_t nw_half = (ft.nw_b() % 2 == 0) ? ft.nw_b()/2 : ft.nw_b()/2 + 1;
-
     nda::array<ComplexType, 2> h_in(nt_half, dim1);
     nda::array<ComplexType, 2> h_out(nw_half, dim1);
     fill_random(h_in);
-
     auto X_in  = memory::to_memory_space<MEM>(h_in);
     auto X_out = memory::to_memory_space<MEM>(h_out);
-
-    return time_it([&]() {
-      ft.tau_to_w_PHsym(X_in, X_out);
-    }, nruns);
+    return time_it([&]() { ft.tau_to_w_PHsym(X_in, X_out); }, nruns);
   }
 
   template<MEMORY_SPACE MEM>
-  bench_result bench_w_to_tau_PHsym(imag_axes_ft::IAFT const& ft,
-                                    long dim1, int nruns) {
-    size_t nt_half = (ft.nt_b() % 2 == 0) ? ft.nt_b()/2 : ft.nt_b()/2 + 1;
-    size_t nw_half = (ft.nw_b() % 2 == 0) ? ft.nw_b()/2 : ft.nw_b()/2 + 1;
-
-    nda::array<ComplexType, 2> h_in(nw_half, dim1);
-    nda::array<ComplexType, 2> h_out(nt_half, dim1);
-    fill_random(h_in);
-
-    auto X_in  = memory::to_memory_space<MEM>(h_in);
-    auto X_out = memory::to_memory_space<MEM>(h_out);
-
-    return time_it([&]() {
-      ft.w_to_tau_PHsym(X_in, X_out);
-    }, nruns);
-  }
-
-  template<MEMORY_SPACE MEM>
-  bench_result bench_tau_to_w_fermi(imag_axes_ft::IAFT const& ft,
-                                    long dim1, int nruns) {
-    size_t nt = ft.nt_f();
-    size_t nw = ft.nw_f();
+  bench_result bench_iaft_pHs_warm(imag_axes_ft::IAFT const& ft,
+                                   long dim1, int nruns) {
+    // Build Twt_pos on host (once), mirror to MEM once, then time only gemm.
+    long nt = (ft.nt_b() % 2 == 0) ? ft.nt_b()/2 : ft.nt_b()/2 + 1;
+    long nw = (ft.nw_b() % 2 == 0) ? ft.nw_b()/2 : ft.nw_b()/2 + 1;
+    auto Twt = ft.Twt_bb();
+    nda::matrix<ComplexType> Twt_pos(nw, nt);
+    for (long n = 0; n < nw; ++n) {
+      long iw = ft.nw_b()/2 + n;
+      for (long it = 0; it < nt; ++it) {
+        long imt = ft.nt_b() - it - 1;
+        Twt_pos(n, it) = (it == imt)? Twt(iw, it) : Twt(iw, it) + Twt(iw, imt);
+      }
+    }
+    auto Twt_pos_mem = memory::to_memory_space<MEM>(Twt_pos);
 
     nda::array<ComplexType, 2> h_in(nt, dim1);
     nda::array<ComplexType, 2> h_out(nw, dim1);
     fill_random(h_in);
-
     auto X_in  = memory::to_memory_space<MEM>(h_in);
     auto X_out = memory::to_memory_space<MEM>(h_out);
-
     return time_it([&]() {
-      ft.tau_to_w(X_in, X_out, imag_axes_ft::fermi);
+      nda::blas::gemm(ComplexType(1.0), Twt_pos_mem, X_in,
+                      ComplexType(0.0), X_out);
     }, nruns);
   }
 
   TEST_CASE("bench_iaft", "[.bench][iaft]") {
-    imag_axes_ft::IAFT ft(1000, 1.2, imag_axes_ft::ir_source);
-    std::cout << "\n--- IAFT benches ---\n";
-    std::cout << "nt_f=" << ft.nt_f() << " nw_f=" << ft.nw_f()
-              << " nt_b=" << ft.nt_b() << " nw_b=" << ft.nw_b()
-              << " (beta=1000 wmax=1.2)\n";
-    std::cout << "Each row times one transform with kernel mirror cost included.\n";
+    // beta=1000, wmax=10 gives a larger (nw,nt) — production-scale grid.
+    imag_axes_ft::IAFT ft(1000, 10.0, imag_axes_ft::ir_source);
+    std::cout << "\n--- IAFT tau_to_w_PHsym (cold = per-call mirror) ---\n";
+    std::cout << "nt_b=" << ft.nt_b() << " nw_b=" << ft.nw_b()
+              << " (beta=1000 wmax=10.0, IR)\n";
 
-    for (long dim : {128L, 1024L, 8192L, 65536L, 262144L}) {
-      auto h_pHs = bench_tau_to_w_PHsym<HOST_MEMORY>(ft, dim, 5);
+    for (long dim : {4096L, 65536L, 262144L, 1048576L, 4194304L, 16777216L}) {
+      auto bytes = fmt_mb(2L * dim * ft.nt_b() * sizeof(ComplexType));
+      auto h = bench_iaft_pHs_cold<HOST_MEMORY>(ft, dim, 5);
 #if defined(ENABLE_DEVICE)
-      auto d_pHs = bench_tau_to_w_PHsym<DEVICE_MEMORY>(ft, dim, 5);
+      auto d = bench_iaft_pHs_cold<DEVICE_MEMORY>(ft, dim, 5);
 #else
-      auto d_pHs = h_pHs;
+      auto d = h;
 #endif
-      print_row("tau_to_w_PHsym", dim, h_pHs, d_pHs);
-
-      auto h_wpHs = bench_w_to_tau_PHsym<HOST_MEMORY>(ft, dim, 5);
-#if defined(ENABLE_DEVICE)
-      auto d_wpHs = bench_w_to_tau_PHsym<DEVICE_MEMORY>(ft, dim, 5);
-#else
-      auto d_wpHs = h_wpHs;
-#endif
-      print_row("w_to_tau_PHsym", dim, h_wpHs, d_wpHs);
-
-      auto h_f = bench_tau_to_w_fermi<HOST_MEMORY>(ft, dim, 5);
-#if defined(ENABLE_DEVICE)
-      auto d_f = bench_tau_to_w_fermi<DEVICE_MEMORY>(ft, dim, 5);
-#else
-      auto d_f = h_f;
-#endif
-      print_row("tau_to_w (fermi)", dim, h_f, d_f);
+      print_row("tau_to_w_PHsym (cold)", dim, h, d, bytes);
     }
   }
 
-  // --- Hadamard (Pi inner loop) ----------------------------------------
+  TEST_CASE("bench_iaft_cold_vs_warm", "[.bench][iaft][cache]") {
+    // Same fixture as bench_iaft, but compare cold (per-call kernel mirror)
+    // to warm (kernel pre-mirrored once, just the gemm timed). The diff is
+    // exactly what an IAFT device-kernel cache would buy us per call.
+    imag_axes_ft::IAFT ft(1000, 10.0, imag_axes_ft::ir_source);
+    std::cout << "\n--- IAFT cold vs warm (per-call mirror cost) ---\n";
+
+    for (long dim : {65536L, 262144L, 1048576L, 4194304L}) {
+#if defined(ENABLE_DEVICE)
+      auto cold = bench_iaft_pHs_cold<DEVICE_MEMORY>(ft, dim, 5);
+      auto warm = bench_iaft_pHs_warm<DEVICE_MEMORY>(ft, dim, 5);
+      std::cout << std::left << std::setw(28) << "tau_to_w_PHsym (dim)"
+                << std::right << std::setw(8) << dim
+                << "  cold: " << std::setw(8) << std::fixed
+                << std::setprecision(3) << cold.per_call_ms << " ms"
+                << "  warm: " << std::setw(8) << warm.per_call_ms << " ms"
+                << "  mirror_cost: " << std::setw(8)
+                << (cold.per_call_ms - warm.per_call_ms) << " ms"
+                << "  warm/cold: " << std::setw(5) << std::setprecision(2)
+                << (warm.per_call_ms / std::max(cold.per_call_ms, 1e-6))
+                << "x" << std::endl;
+#endif
+    }
+  }
+
+  // --- Hadamard (Pi/Sigma inner loop) ----------------------------------
+  //
+  // tensor::elementwise(MUL) is bandwidth-bound. On host, MKL serial is
+  // slow on the simple 3-tensor loop; on device the operation is memory
+  // bandwidth-bound and lines up with HBM BW (~1500 GB/s for A100).
 
   template<MEMORY_SPACE MEM>
   bench_result bench_hadamard(long nt, long P, long Q, int nruns) {
@@ -198,12 +238,9 @@ namespace bdft_tests {
     nda::array<ComplexType, 3> h_B(nt, P, Q);
     fill_random(h_A);
     fill_random(h_B, 43);
-
     auto A = memory::to_memory_space<MEM>(h_A);
     auto B = memory::to_memory_space<MEM>(h_B);
-
     return time_it([&]() {
-      // B = A * B (in-place Hadamard MUL on (t,P,Q)).
       nda::tensor::elementwise(ComplexType(1.0), A, "tPQ",
                                ComplexType(1.0), B, "tPQ",
                                nda::tensor::op::MUL);
@@ -211,39 +248,39 @@ namespace bdft_tests {
   }
 
   TEST_CASE("bench_hadamard", "[.bench][hadamard]") {
-    std::cout << "\n--- Hadamard (tensor::elementwise MUL on (nt,P,Q)) ---\n";
-    long nt = 104;  // typical IR fermionic grid
-
-    for (long P : {32L, 128L, 320L, 1024L}) {
+    std::cout << "\n--- Hadamard tensor::elementwise(MUL) on (nt,P,Q) ---\n";
+    long nt = 200;  // production-ish IR/DLR fermion count
+    for (long P : {256L, 512L, 1024L, 2048L, 4096L}) {
       long Q = P;
+      auto bytes = fmt_mb(3L * nt * P * Q * sizeof(ComplexType));
       auto h = bench_hadamard<HOST_MEMORY>(nt, P, Q, 3);
 #if defined(ENABLE_DEVICE)
       auto d = bench_hadamard<DEVICE_MEMORY>(nt, P, Q, 3);
 #else
       auto d = h;
 #endif
-      print_row("Hadamard (nt,P,P)", P, h, d);
+      print_row("Hadamard (nt=200,P=Q)", P, h, d, bytes);
     }
   }
 
-  // --- THC-style batched gemm ------------------------------------------
+  // --- THC aux<->primary gemm pair --------------------------------------
+  //
+  // Models the per-(s,k) two-gemm sequence in thc_solver_comm:
+  //   O(M,Q) = X(P,M)^H * A(P,Q)
+  //   B(P,Q) = X(P,M)   * O(M,Q)
 
   template<MEMORY_SPACE MEM>
   bench_result bench_thc_gemm(long P, long Q, long M, int nruns) {
-    // Models the per-(s,k) gemm pair in thc_solver_comm aux<->primary:
-    // O(a,Q) = X(P,a)^H * A(P,Q), then A'(P,Q) = X(P,a) * O(a,Q).
     nda::array<ComplexType, 2> h_X(P, M);
     nda::array<ComplexType, 2> h_A(P, Q);
     nda::array<ComplexType, 2> h_O(M, Q);
     nda::array<ComplexType, 2> h_B(P, Q);
     fill_random(h_X);
     fill_random(h_A, 43);
-
     auto X = memory::to_memory_space<MEM>(h_X);
     auto A = memory::to_memory_space<MEM>(h_A);
     auto O = memory::to_memory_space<MEM>(h_O);
     auto B = memory::to_memory_space<MEM>(h_B);
-
     return time_it([&]() {
       nda::blas::gemm(ComplexType(1.0), nda::dagger(X), A,
                       ComplexType(0.0), O);
@@ -254,52 +291,131 @@ namespace bdft_tests {
 
   TEST_CASE("bench_thc_gemm", "[.bench][gemm]") {
     std::cout << "\n--- THC aux<->primary gemm pair ---\n";
-    long M = 16;  // ~nbnd
-    for (long P : {32L, 128L, 320L, 1024L}) {
+    long M = 64;  // production-ish nbnd
+    for (long P : {256L, 512L, 1024L, 2048L, 4096L}) {
       long Q = P;
+      auto bytes = fmt_mb((long)(P*M + P*Q + M*Q + P*Q) * sizeof(ComplexType));
       auto h = bench_thc_gemm<HOST_MEMORY>(P, Q, M, 3);
 #if defined(ENABLE_DEVICE)
       auto d = bench_thc_gemm<DEVICE_MEMORY>(P, Q, M, 3);
 #else
       auto d = h;
 #endif
-      print_row("THC gemm pair (P=Q,M)", P, h, d);
+      print_row("THC gemm pair (P=Q,M=64)", P, h, d, bytes);
     }
   }
 
-  // --- Tensor contraction (cuTENSOR path; DEVICE only because we build
-  //     with TBLIS=OFF and nda::tensor::contract on host needs TBLIS) -----
+  // --- Batched vs loop-of-gemms ----------------------------------------
+  //
+  // Demonstrates the "recast small ops as one big op" lesson. We have N
+  // per-step (P,P)*(P,M) gemms (the per-(s,k) THC pattern). The "loop"
+  // form launches one cuBLAS call per step; the "batched" form launches
+  // a single gemm on a flattened (N*P, P)*(P, M) shape with the same
+  // total FLOP count but only one kernel launch and one wave of HBM
+  // traffic.
 
+  template<MEMORY_SPACE MEM>
+  bench_result bench_loop_gemm(long N, long P, long M, int nruns) {
+    nda::array<ComplexType, 3> h_X(N, P, P);
+    nda::array<ComplexType, 3> h_A(N, P, M);
+    nda::array<ComplexType, 3> h_Y(N, P, M);
+    fill_random(h_X);
+    fill_random(h_A, 43);
+    auto X = memory::to_memory_space<MEM>(h_X);
+    auto A = memory::to_memory_space<MEM>(h_A);
+    auto Y = memory::to_memory_space<MEM>(h_Y);
+    return time_it([&]() {
+      for (long n = 0; n < N; ++n) {
+        nda::blas::gemm(ComplexType(1.0),
+                        X(n, nda::range::all, nda::range::all),
+                        A(n, nda::range::all, nda::range::all),
+                        ComplexType(0.0),
+                        Y(n, nda::range::all, nda::range::all));
+      }
+    }, nruns, /*nwarmup=*/1);
+  }
+
+  template<MEMORY_SPACE MEM>
+  bench_result bench_batched_gemm(long N, long P, long M, int nruns) {
+    // Same total FLOP, but the N slices laid out as a single (N*P, P)
+    // matrix multiplied by the same P*M matrix? No — that gives wrong
+    // semantics. Instead model the *block-diagonal recast*: put all
+    // X(n) into a single (N*P, P) and A(n) into (N*P, M), then a single
+    // big gemm over a reshape gives the same per-slice product when
+    // the underlying memory is contiguous and we feed a 3D contract
+    // through cuTENSOR or by reshape+gemm.
+    //
+    // Simplest implementation that's apples-to-apples: build the (N*P,P)
+    // flattened X and (P,M) shared A (broadcast over n) and time one
+    // big gemm. This isn't byte-identical to per-slice gemm but matches
+    // the FLOP count, so the timing comparison is meaningful for the
+    // launch-overhead vs throughput question we care about.
+    nda::array<ComplexType, 2> h_X(N*P, P);   // stack N (P,P) along rows
+    nda::array<ComplexType, 2> h_A(P, M);
+    nda::array<ComplexType, 2> h_Y(N*P, M);
+    fill_random(h_X);
+    fill_random(h_A, 43);
+    auto X = memory::to_memory_space<MEM>(h_X);
+    auto A = memory::to_memory_space<MEM>(h_A);
+    auto Y = memory::to_memory_space<MEM>(h_Y);
+    return time_it([&]() {
+      nda::blas::gemm(ComplexType(1.0), X, A, ComplexType(0.0), Y);
+    }, nruns, /*nwarmup=*/1);
+  }
+
+  TEST_CASE("bench_batched_vs_loop_gemm", "[.bench][batched]") {
+    // N small per-(s,k) gemms vs one big batched gemm of same FLOP count.
+    std::cout << "\n--- Sequential N gemms (loop) vs one big batched gemm ---\n";
+    long M = 64;
+    long P = 1024;
+    std::cout << "Fixed (P=1024, M=64), sweep N (number of (s,k) batches).\n";
+    for (long N : {8L, 16L, 32L, 64L, 128L}) {
 #if defined(ENABLE_DEVICE)
-  bench_result bench_contract_device(long nt, long P, long Q, long R, int nruns) {
+      auto loop = bench_loop_gemm<DEVICE_MEMORY>(N, P, M, 3);
+      auto batch = bench_batched_gemm<DEVICE_MEMORY>(N, P, M, 3);
+      std::cout << std::left << std::setw(28) << "N x (P,P)*(P,M)"
+                << std::right << std::setw(8) << N
+                << "  loop: " << std::setw(8) << std::fixed
+                << std::setprecision(3) << loop.per_call_ms << " ms"
+                << "  batched: " << std::setw(8)
+                << batch.per_call_ms << " ms"
+                << "  speedup: " << std::setw(6) << std::setprecision(2)
+                << (loop.per_call_ms / std::max(batch.per_call_ms, 1e-6))
+                << "x" << std::endl;
+#endif
+    }
+  }
+
+  // --- cuTENSOR contraction --------------------------------------------
+  //
+  // Host counterpart skipped (build has TBLIS=OFF). The contraction
+  // shape models the Sigma R-space step Z(R,P,Q) = sum_t X(R,P,t)*Y(R,t,Q).
+
+  template<MEMORY_SPACE MEM>
+  bench_result bench_contract(long nt, long P, long Q, long R, int nruns) {
     nda::array<ComplexType, 3> h_X(R, P, nt);
     nda::array<ComplexType, 3> h_Y(R, nt, Q);
     nda::array<ComplexType, 3> h_Z(R, P, Q);
     fill_random(h_X);
     fill_random(h_Y, 43);
-
-    auto X = memory::to_memory_space<DEVICE_MEMORY>(h_X);
-    auto Y = memory::to_memory_space<DEVICE_MEMORY>(h_Y);
-    auto Z = memory::to_memory_space<DEVICE_MEMORY>(h_Z);
-
+    auto X = memory::to_memory_space<MEM>(h_X);
+    auto Y = memory::to_memory_space<MEM>(h_Y);
+    auto Z = memory::to_memory_space<MEM>(h_Z);
     return time_it([&]() {
-      // Z(R,P,Q) = sum_t X(R,P,t) * Y(R,t,Q)
       nda::tensor::contract(ComplexType(1.0), X, "RPt", Y, "RtQ",
                             ComplexType(0.0), Z, "RPQ");
     }, nruns);
   }
 
+#if defined(ENABLE_DEVICE)
   TEST_CASE("bench_contract", "[.bench][contract]") {
-    std::cout << "\n--- nda::tensor::contract (DEVICE; cuTENSOR) ---\n";
-    std::cout << "Host counterpart skipped: build has -DENABLE_TBLIS=OFF.\n";
-    long nt = 104, R = 4;
-    for (long P : {32L, 128L, 320L, 1024L}) {
+    std::cout << "\n--- cuTENSOR tensor::contract Z(R,P,Q)=sum_t X(R,P,t)*Y(R,t,Q) ---\n";
+    long nt = 200, R = 8;
+    for (long P : {256L, 512L, 1024L, 2048L, 4096L}) {
       long Q = P;
-      auto d = bench_contract_device(nt, P, Q, R, 3);
-      std::cout << std::left << std::setw(28) << "contract (R,P=Q,t)"
-                << std::right << std::setw(10) << P
-                << "  dev: " << std::setw(9) << std::fixed
-                << std::setprecision(3) << d.per_call_ms << " ms" << std::endl;
+      auto bytes = fmt_mb((long)R * (P*nt + nt*Q + P*Q) * sizeof(ComplexType));
+      auto d = bench_contract<DEVICE_MEMORY>(nt, P, Q, R, 3);
+      print_row_dev_only("contract (R=8,P=Q,t=200)", P, d, bytes);
     }
   }
 #endif
