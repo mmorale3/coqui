@@ -45,7 +45,10 @@ struct op_less_real
   __host__ __device__
   bool operator()(T const& a, T const& b) const
   {
-    return thrust::get<0>(a).real() < thrust::get<0>(b).real();
+    // thrust::get<0>(a) is a device_reference proxy in newer thrust/CCCL
+    // and the proxy has no .real(); strip the proxy first.
+    return thrust::raw_reference_cast(thrust::get<0>(a)).real()
+         < thrust::raw_reference_cast(thrust::get<0>(b)).real();
   }
 };
 
