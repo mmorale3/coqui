@@ -43,7 +43,7 @@ struct op_less_real
 {
   template<typename T>
   __host__ __device__
-  bool operator()(T const& a, T const& b)
+  bool operator()(T const& a, T const& b) const
   {
     return thrust::get<0>(a).real() < thrust::get<0>(b).real();
   }
