@@ -430,9 +430,23 @@ namespace methods {
         // per inner iter to the device-typed O_ikPQ slice.
         [[maybe_unused]] memory::array<DEVICE_MEMORY, ComplexType, 2> O_PQ_dev;
         [[maybe_unused]] memory::array<DEVICE_MEMORY, ComplexType, 2> Ask_Pb_dev;
+        // Device cache of Xr = thc.X(s, iq, k)(O_Q_rng, all). The slice is
+        // (s, k)-dependent only — invariant across dim_i (which carries t)
+        // and the PP batch index. One bulk H->D copy replaces dim_i*nbatch
+        // copies per (s, k) on the GPU path.
+        [[maybe_unused]] memory::array<DEVICE_MEMORY, ComplexType, 4> Xr_cache;
         if constexpr (aux_on_device) {
           O_PQ_dev   = memory::array<DEVICE_MEMORY, ComplexType, 2>(batch_size, NQ_loc);
           Ask_Pb_dev = memory::array<DEVICE_MEMORY, ComplexType, 2>(batch_size, nbnd);
+          nda::range O_Q_rng(Q_offset, Q_offset + NQ_loc);
+          nda::array<ComplexType, 4> Xr_host(ns, nkpts, NQ_loc, nbnd);
+          for (size_t s_ = 0; s_ < ns; ++s_) {
+            for (size_t k_ = 0; k_ < nkpts; ++k_) {
+              auto Xsk_Pa_r = thc.X(s_, iq, k_);
+              Xr_host(s_, k_, all, all) = Xsk_Pa_r(O_Q_rng, all);
+            }
+          }
+          Xr_cache = memory::to_memory_space<DEVICE_MEMORY>(Xr_host);
         }
 
         for (size_t ikP = rank; ikP < dim_i*nkpts*nbatch; ikP += comm_size) {
@@ -447,7 +461,6 @@ namespace methods {
 
           // Ask_Pb = Xsk_Pa * Osk_ab  (host gemm; primary input is HOST)
           auto Xsk_Pa_l = thc.X(s, ip, k);
-          auto Xsk_Pa_r = thc.X(s, iq, k);
 
           if(kp_trev(k)) {
             nda::blas::gemm(Xsk_Pa_l(X_P_rng, all), nda::transpose(O_ikab_4D(i, kp_map(k), all, all)), Ask_Pb);
@@ -457,15 +470,13 @@ namespace methods {
 
           // Osk_PQ = Ask_Pb * conj(Xsk_Qb)
           if constexpr (aux_on_device) {
-            // Mirror the host scratch + Xsk_Pa_r slice to device, run the
-            // gemm in device space, then copy into the device-typed
-            // O_ikPQ_4D slice.
+            // Stage Ask_Pb (host) -> device, use cached Xr, run the
+            // device gemm, then copy into the device-typed O_ikPQ slice.
             Ask_Pb_dev = Ask_Pb;
-            memory::array<DEVICE_MEMORY, ComplexType, 2> Xr_mem =
-                memory::to_memory_space<DEVICE_MEMORY>(Xsk_Pa_r(O_Q_rng, all));
-            nda::blas::gemm(Ask_Pb_dev, nda::dagger(Xr_mem), O_PQ_dev);
+            nda::blas::gemm(Ask_Pb_dev, nda::dagger(Xr_cache(s, k, all, all)), O_PQ_dev);
             O_ikPQ_4D(i, k, O_P_rng, all) = O_PQ_dev;
           } else {
+            auto Xsk_Pa_r = thc.X(s, iq, k);
             nda::blas::gemm(Ask_Pb, nda::dagger(Xsk_Pa_r(O_Q_rng, all)), O_ikPQ_4D(i, k, O_P_rng, all));
           }
         }
@@ -599,34 +610,57 @@ namespace methods {
         nda::array<ComplexType, 2> Oab_buffer_host;
         if constexpr (aux_on_device) Oab_buffer_host.resize(std::array<long,2>{long(nbnd), long(nbnd)});
 
+        // X-factor cache: thc.X(s, ip, kp_map(k))(P_rng, all) is constant
+        // across the t axis in the i sweep (each unique (s, k) appears
+        // dim0 / (ns_loc * nk_loc) = nt times). Materialise it on WORK_MEM
+        // once instead of mirroring per i — one bulk H->D copy replaces
+        // nt copies per (s, k).
+        memory::array<WORK_MEM, ComplexType, 4> Xl_cache;
+        memory::array<WORK_MEM, ComplexType, 4> Xr_cache;
+        {
+          nda::array<ComplexType, 4> Xl_host(ns_loc, nk_loc, NP_loc, nbnd);
+          for (size_t s = 0; s < ns_loc; ++s) {
+            for (size_t k = 0; k < nk_loc; ++k) {
+              auto Xsk_Pa_l = thc.X(s, ip, kp_map(k + k_offset));
+              Xl_host(s, k, all, all) = Xsk_Pa_l(P_rng, all);
+            }
+          }
+          Xl_cache = memory::to_memory_space<WORK_MEM>(Xl_host);
+          if (ip != iq) {
+            nda::array<ComplexType, 4> Xr_host(ns_loc, nk_loc, NQ_loc, nbnd);
+            for (size_t s = 0; s < ns_loc; ++s) {
+              for (size_t k = 0; k < nk_loc; ++k) {
+                auto Xsk_Pa_r = thc.X(s, iq, kp_map(k + k_offset));
+                Xr_host(s, k, all, all) = Xsk_Pa_r(Q_rng, all);
+              }
+            }
+            Xr_cache = memory::to_memory_space<WORK_MEM>(Xr_host);
+          }
+        }
+
         for (size_t i = 0; i < dim0; ++i) {
           // i = (it * ns_loc + is) * nk_loc + ik
           size_t s = (i / nk_loc) % ns_loc;
-          size_t k = i % nk_loc + k_offset;
+          size_t k = i % nk_loc;
 
-          auto Xsk_Pa_l = thc.X(s, ip, kp_map(k));
-          auto Xsk_Pa_r = ( ip==iq ? Xsk_Pa_l : thc.X(s, iq, kp_map(k)));
+          auto Xl_view = Xl_cache(s, k, all, all);
+          auto Xr_view = (ip == iq) ? Xl_cache(s, k, all, all)
+                                    : Xr_cache(s, k, all, all);
 
           if constexpr (aux_on_device) {
-            // Mirror per (s, k); upstream callers should add a cache when
-            // the (s, k) sweep dominates. Two contiguous slices, copied
-            // once each into MEM-typed scratch buffers.
-            memory::array<WORK_MEM, ComplexType, 2> Xl_mem =
-                memory::to_memory_space<WORK_MEM>(Xsk_Pa_l(P_rng, all));
-            memory::array<WORK_MEM, ComplexType, 2> Xr_mem;
-            if (ip == iq) Xr_mem = Xl_mem;
-            else          Xr_mem = memory::to_memory_space<WORK_MEM>(Xsk_Pa_r(Q_rng, all));
-            nda::blas::gemm(nda::dagger(Xl_mem), O_iPQ_3D(i, all, all), Ask_aQ);
-            nda::blas::gemm(Ask_aQ, Xr_mem, Oab_buffer);
+            nda::blas::gemm(nda::dagger(Xl_view), O_iPQ_3D(i, all, all), Ask_aQ);
+            nda::blas::gemm(Ask_aQ, Xr_view, Oab_buffer);
             Oab_buffer_host = nda::to_host(Oab_buffer);
             dim0_comm.reduce_in_place_n(Oab_buffer_host.data(), Oab_buffer_host.size(), std::plus<>{}, 0);
             if (dim0_comm.root()) {
               O_iab_3D(i, all, all) += scl*Oab_buffer_host;
             }
           } else {
-            // Host: original code path, bit-identical to baseline.
-            nda::blas::gemm(nda::dagger(Xsk_Pa_l(P_rng, all)), O_iPQ_3D(i, all, all), Ask_aQ);
-            nda::blas::gemm(Ask_aQ, Xsk_Pa_r(Q_rng, all), Oab_buffer);
+            // Host: bit-identical to baseline; Xl_cache / Xr_cache are
+            // host-typed when WORK_MEM == HOST_MEMORY (just views into a
+            // small host buffer) so the gemms are unchanged.
+            nda::blas::gemm(nda::dagger(Xl_view), O_iPQ_3D(i, all, all), Ask_aQ);
+            nda::blas::gemm(Ask_aQ, Xr_view, Oab_buffer);
             dim0_comm.reduce_in_place_n(Oab_buffer.data(), Oab_buffer.size(), std::plus<>{}, 0);
             if (dim0_comm.root()) {
               O_iab_3D(i, all, all) += scl*Oab_buffer;
