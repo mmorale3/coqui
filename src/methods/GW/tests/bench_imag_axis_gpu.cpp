@@ -1,11 +1,18 @@
 /**
  * Synthetic-data performance benches for imag-axis GW kernels (host vs device).
  *
+ * CoQui uses an MPI-only parallelization model — each rank gets a slice
+ * of loop indices and reduces at the end. There is no thread parallelism.
+ * The apples-to-apples CPU baseline for one A100 is therefore one CPU
+ * **core**, not the whole socket. Expected device speedup at production
+ * scale:
+ *   - compute-bound (gemm, contract):  ~100-300x  (A100 FLOPs / 1-core FLOPs)
+ *   - bandwidth-bound (Hadamard, FT):   ~50-100x  (A100 HBM BW / 1-core BW)
+ *
  * Sizes target *production* GW workloads, not the LiH222 correctness fixture.
- * LiH222 (Naux=128, Nk=8, nbnd=16) is too small to amortize cuFINUFFT plan
- * setup, cuTENSOR planner cost, or per-call host->device transfers; use it
- * only for correctness checks. These benches sweep over P/Q sizes from
- * 128 up to 4096 and IAFT contracted dims up to ~16M to expose the
+ * LiH222 (Naux=128, Nk=8, nbnd=16) is too small to amortize kernel-launch
+ * overhead or cuTENSOR planner cost. These benches sweep over P/Q from
+ * 256 up to 2048 and IAFT contracted dims up to ~4M to expose the
  * asymptotic device wins and the crossover points.
  *
  * Each TEST_CASE is tagged "[.bench]" (Catch2 hides "." cases by default).
