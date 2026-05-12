@@ -106,6 +106,15 @@ public:
   std::optional<sArray_t<nda::array_view<ComplexType, 5> > > sSigma_tskij;
   std::optional<sArray_t<nda::array_view<ComplexType, 4> > > sF_skij;
   std::optional<dArray_t<nda::array<ComplexType, 4> > > dW_qtPQ;
+#if defined(ENABLE_DEVICE)
+  // Device-resident mirror of dW_qtPQ for the GPU GW pipeline. When set,
+  // gw_t::evaluate<DEVICE_MEMORY> reads from this directly and skips the
+  // host->device mirror that would otherwise round-trip the full dW per
+  // SCF iter. scr_coulomb_t::update_w<DEVICE_MEMORY> populates this; the
+  // host mirror dW_qtPQ is also kept up to date for cross-method
+  // consumers (GF2, h5 dump, EDMFT) that don't yet have a device path.
+  std::optional<dArray_t<memory::array<DEVICE_MEMORY, ComplexType, 4> > > dW_qtPQ_dev;
+#endif
   std::optional<nda::array<ComplexType, 1> > eps_inv_head;
   std::string screen_type = "";
   // local quantities for quantum embedding

@@ -318,23 +318,42 @@ namespace methods {
         auto Q_rng = dW_xqPQ.local_range(3);
         auto [nx, nqpts_ibz, NP, NQ] = dW_xqPQ.global_shape();
 
+        // Detect MEM from the local storage of dW. When dW lives on device
+        // we run the per-(ix,iq) gemv/dot on device too — avoids a full
+        // host copy of dW. Result eps_inv_x is tiny (nx*nqpts_ibz scalars),
+        // accumulated on host one slice at a time.
+        constexpr auto MEM = nda::mem::on_host<Array_w_t> ? HOST_MEMORY
+                           : (nda::mem::on_unified<Array_w_t> ? UNIFIED_MEMORY
+                                                              : DEVICE_MEMORY);
+
         nda::array<ComplexType, 2> eps_inv_x(nx, nqpts_ibz);
         eps_inv_x() = 0.0;
-        nda::array<ComplexType, 1> Chi_bar_Q_conj(NQ_loc);
-        nda::array<ComplexType, 1> buffer_P(NP_loc);
+        memory::array<MEM, ComplexType, 1> Chi_bar_Q_conj(NQ_loc);
+        memory::array<MEM, ComplexType, 1> buffer_P(NP_loc);
         const double fpi = 4.0*3.14159265358979323846;
-        auto Chi_bar_qu = thc.basis_bar_head();
+        auto Chi_bar_qu = thc.template basis_bar_head<MEM>();
         auto Wloc = dW_xqPQ.local();
         for (auto [iq, q] : itertools::enumerate(qpt_rng)) {
 
           auto qpts = mf.Qpts_ibz(q);
           double q_abs2 = qpts(0)*qpts(0) + qpts(1)*qpts(1) + qpts(2)*qpts(2);
 
-          Chi_bar_Q_conj = nda::conj(Chi_bar_qu(q, Q_rng));
+          if constexpr (MEM == HOST_MEMORY) {
+            Chi_bar_Q_conj = nda::conj(Chi_bar_qu(q, Q_rng));
+          } else {
+            // Lazy nda::conj is forbidden on device — memcpy then conj-scale.
+            Chi_bar_Q_conj = Chi_bar_qu(q, Q_rng);
+            nda::tensor::scale(ComplexType(1.0), Chi_bar_Q_conj,
+                               nda::tensor::op::CONJ);
+          }
           double factor = (q_abs2 / fpi) * mf.volume();
           for (auto [ix, x_idx] : itertools::enumerate(x_rng)) {
             nda::blas::gemv(Wloc(ix, iq, nda::ellipsis{}), Chi_bar_Q_conj, buffer_P);
-            eps_inv_x(x_idx, q) += factor * nda::blas::dot(Chi_bar_qu(q, P_rng), buffer_P);
+            // nda::blas::dot returns a scalar on host even when its
+            // operands are on device — cuBLAS dot reports the result
+            // through the host pointer.
+            eps_inv_x(x_idx, q) += factor *
+                nda::blas::dot(Chi_bar_qu(q, P_rng), buffer_P);
           }
         }
         dW_xqPQ.communicator()->all_reduce_in_place_n(eps_inv_x.data(), eps_inv_x.size(), std::plus<>{});

@@ -100,50 +100,61 @@ namespace solvers {
     // b) pgrid and bsize of dW_tqPQ are forced to be the same as in dPi_tqPQ
     auto dW_tqPQ = dyson_W_from_Pi_tau<false>(dPi_tqPQ, thc, true);
 
-    // div_utils::eps_inv_head_t is host-only; if dW lives on device,
-    // mirror it to host once (one allreduce-shaped array per SCF iter).
-    auto [eps_inv_head_q, eps_inv_head] = [&]() {
-      if constexpr (MEM == HOST_MEMORY) {
-        return div_utils::eps_inv_head_t(dW_tqPQ, thc, *thc.MF(), _ft, _div_treatment);
-      } else {
-        auto t_pgrid_h = dW_tqPQ.grid();
-        auto t_bsize_h = dW_tqPQ.block_size();
-        auto gshape_h  = dW_tqPQ.global_shape();
-        auto dW_host = make_distributed_array<nda::array<ComplexType, 4>>(
-            thc.mpi()->comm, t_pgrid_h, gshape_h, t_bsize_h);
-        dW_host.local() = nda::to_host(dW_tqPQ.local());
-        return div_utils::eps_inv_head_t(dW_host, thc, *thc.MF(), _ft, _div_treatment);
-      }
-    }();
+    // div_utils::eval_eps_inv_q (called inside eps_inv_head_t) is now
+    // MEM-aware; it runs the per-(ix,iq) gemv/dot on whatever MEM the
+    // dW darray lives in. No full host copy of dW needed.
+    auto [eps_inv_head_q, eps_inv_head] =
+        div_utils::eps_inv_head_t(dW_tqPQ, thc, *thc.MF(), _ft, _div_treatment);
     mb_state.eps_inv_head = eps_inv_head;
 
-    // Stage W back to host MBState. mb_state.dW_qtPQ is HOST-typed.
+    // Stage W into MBState. The on-device pipeline keeps a device-typed
+    // dW_qtPQ_dev so gw_t::evaluate<DEVICE> can read it without a
+    // host->device round-trip. The host mirror dW_qtPQ is also written
+    // for cross-method consumers (GF2, h5 dump, EDMFT) that still run
+    // on host.
     auto t_pgrid = dW_tqPQ.grid();
     auto t_bsize = dW_tqPQ.block_size();
     auto gshape = dW_tqPQ.global_shape();
-    mb_state.dW_qtPQ.emplace(make_distributed_array<nda::array<ComplexType, 4>> (
-                             thc.mpi()->comm, {t_pgrid[1], t_pgrid[0], t_pgrid[2], t_pgrid[3]},
-                             {gshape[1], gshape[0], gshape[2], gshape[3]},
-                             {t_bsize[1], t_bsize[0], t_bsize[2], t_bsize[3]}));
-    auto W_qtPQ = mb_state.dW_qtPQ.value().local();
+    std::array<long,4> q_pgrid = {t_pgrid[1], t_pgrid[0], t_pgrid[2], t_pgrid[3]};
+    std::array<long,4> q_bsize = {t_bsize[1], t_bsize[0], t_bsize[2], t_bsize[3]};
+    std::array<long,4> q_gshape = {gshape[1],  gshape[0],  gshape[2],  gshape[3]};
+
     long nt_loc = dW_tqPQ.local_shape()[0];
     long nq_loc = dW_tqPQ.local_shape()[1];
+
+    mb_state.dW_qtPQ.emplace(make_distributed_array<nda::array<ComplexType, 4>> (
+                             thc.mpi()->comm, q_pgrid, q_gshape, q_bsize));
+    auto W_qtPQ_h = mb_state.dW_qtPQ.value().local();
+
     if constexpr (MEM == HOST_MEMORY) {
       auto W_tqPQ = dW_tqPQ.local();
       for (size_t qt = 0; qt < nq_loc * nt_loc; ++qt) {
         size_t iq = qt / nt_loc;
         size_t it = qt % nt_loc;
-        W_qtPQ(iq, it, nda::ellipsis{}) = W_tqPQ(it, iq, nda::ellipsis{});
+        W_qtPQ_h(iq, it, nda::ellipsis{}) = W_tqPQ(it, iq, nda::ellipsis{});
       }
-    } else {
-      // Device → host: copy dW_tqPQ to host once, then transpose into W_qtPQ.
-      nda::array<ComplexType, 4> W_tqPQ_h = nda::to_host(dW_tqPQ.local());
+    }
+#if defined(ENABLE_DEVICE)
+    else {
+      // Device path:
+      //  (1) allocate a device-typed (q,t,P,Q) darray and transpose on device,
+      //  (2) mirror to the host darray as a single bulk copy (one device->host
+      //      transfer per SCF iter — what host-side consumers still need).
+      using dev_local_t = memory::array<DEVICE_MEMORY, ComplexType, 4>;
+      mb_state.dW_qtPQ_dev.emplace(make_distributed_array<dev_local_t>(
+                                   thc.mpi()->comm, q_pgrid, q_gshape, q_bsize));
+      auto W_qtPQ_d = mb_state.dW_qtPQ_dev.value().local();
+      auto W_tqPQ_d = dW_tqPQ.local();
+      // On-device (t,q) -> (q,t) transpose, P,Q axes preserved.
       for (size_t qt = 0; qt < nq_loc * nt_loc; ++qt) {
         size_t iq = qt / nt_loc;
         size_t it = qt % nt_loc;
-        W_qtPQ(iq, it, nda::ellipsis{}) = W_tqPQ_h(it, iq, nda::ellipsis{});
+        W_qtPQ_d(iq, it, nda::ellipsis{}) = W_tqPQ_d(it, iq, nda::ellipsis{});
       }
+      // Single bulk device->host mirror for the host darray.
+      W_qtPQ_h = nda::to_host(W_qtPQ_d);
     }
+#endif
     dW_tqPQ.reset();
 
     mb_state.screen_type = _screen_type;

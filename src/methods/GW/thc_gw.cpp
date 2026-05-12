@@ -96,8 +96,29 @@ namespace methods {
       }
 
       _Timer.start("TOTAL");
-      thc_gw_Xqindep<MEM>(mb_state.sG_tskij.value().local(), mb_state.sSigma_tskij.value(), thc,
-                          mb_state.dW_qtPQ.value(), mb_state.eps_inv_head.value());
+#if defined(ENABLE_DEVICE)
+      if constexpr (MEM == DEVICE_MEMORY) {
+        // Prefer the device-resident dW set by scr_coulomb_t::update_w<DEVICE>;
+        // this skips a full host->device mirror of dW per SCF iter.
+        if (mb_state.dW_qtPQ_dev.has_value()) {
+          thc_gw_Xqindep<MEM>(mb_state.sG_tskij.value().local(),
+                              mb_state.sSigma_tskij.value(), thc,
+                              mb_state.dW_qtPQ_dev.value(),
+                              mb_state.eps_inv_head.value());
+        } else {
+          thc_gw_Xqindep<MEM>(mb_state.sG_tskij.value().local(),
+                              mb_state.sSigma_tskij.value(), thc,
+                              mb_state.dW_qtPQ.value(),
+                              mb_state.eps_inv_head.value());
+        }
+      } else
+#endif
+      {
+        thc_gw_Xqindep<MEM>(mb_state.sG_tskij.value().local(),
+                            mb_state.sSigma_tskij.value(), thc,
+                            mb_state.dW_qtPQ.value(),
+                            mb_state.eps_inv_head.value());
+      }
       _Timer.stop("TOTAL");
 
       print_thc_gw_timers();
@@ -183,11 +204,15 @@ namespace methods {
         app_log(2, "    - processor grid for G: (t, k, P, Q) = ({}, {}, {}, {})", tpools, qpools, np_P, np_Q);
         app_log(2, "    - processor grid for W: (t, q, P, Q) = ({}, {}, {}, {})\n", tpools, qpools, np_P, np_Q);
 
-        // dW_qtPQ comes from MBState (HOST). Mirror to MEM once for the
-        // two FT round-trips inside eval_Sigma_all_Rspace; the device copy
-        // is discarded on return (the host dW would only have drifted by
-        // FT precision after the in-place R↔k round-trip anyway).
-        if constexpr (MEM == HOST_MEMORY) {
+        // If the input dW is already on the target MEM (the caller passed
+        // mb_state.dW_qtPQ_dev), use it directly. Otherwise — backwards-
+        // compat path — mirror host dW to MEM once for the two FT
+        // round-trips and discard on return.
+        constexpr bool dW_already_on_target =
+            (MEM == HOST_MEMORY && nda::mem::on_host<Array_4D_t>) ||
+            (MEM == DEVICE_MEMORY && nda::mem::on_device<Array_4D_t>) ||
+            (MEM == UNIFIED_MEMORY && nda::mem::on_unified<Array_4D_t>);
+        if constexpr (dW_already_on_target) {
           eval_Sigma_all_Rspace<MEM, false, true>(G_tskij, dW_qtPQ, sSigma_tskij, thc, false);
           eval_Sigma_all_Rspace<MEM, true, false>(G_tskij, dW_qtPQ, sSigma_tskij, thc, true);
         } else {
