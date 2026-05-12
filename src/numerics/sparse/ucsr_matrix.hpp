@@ -47,9 +47,18 @@ namespace math
 namespace sparse
 {
 
+namespace detail
+{
+  template <typename A>
+  concept Vector = requires(A const &a) {
+    { a.size() } -> std::same_as<long>;
+  };
+}
+
 template<typename ValType, MEMORY_SPACE MEM = HOST_MEMORY, typename IndxType = int, typename IntType = long>
 class ucsr_matrix  
 {
+protected:
   template<typename T> 
   using larray = memory::array<MEM, T, 1>;
   using range  = ::nda::range;
@@ -68,8 +77,8 @@ public:
 
 protected:
   // number of rows/columns
-  long size1_;
-  long size2_;
+  long size1_=0;
+  long size2_=0;
   // values
   larray<value_type> data_;
   // columns 
@@ -94,10 +103,11 @@ public:
   }
 
   /* Constructor */
-  template<typename integer_type = long, typename = std::enable_if_t<std::is_integral_v<integer_type>>>
-  ucsr_matrix(std::tuple<long, long> const& dims, integer_type nnzpr = 0)
-      : size1_(std::get<0>(dims)),
-        size2_(std::get<1>(dims)),
+  template<typename IType = long, typename integer_type = long>
+  requires ( std::is_integral_v<IType> and std::is_integral_v<integer_type> )
+  ucsr_matrix(std::tuple<IType, IType> const& dims, integer_type nnzpr = 0)
+      : size1_(long(std::get<0>(dims))),
+        size2_(long(std::get<1>(dims))),
         data_(size1_ * long(nnzpr)),
         jdata_(size1_ * long(nnzpr)),
         row_begin_(size1_+1),
@@ -115,9 +125,11 @@ public:
     row_begin_(size1_) = int_type(size1_ * long(nnzpr));
   }
 
-  ucsr_matrix(std::tuple<long, long> const& dims, ::nda::MemoryArrayOfRank<1> auto const& nnzpr) 
-      : size1_(std::get<0>(dims)),
-        size2_(std::get<1>(dims)),
+  template<typename IType = long>
+  requires ( std::is_integral_v<IType> ) 
+  ucsr_matrix(std::tuple<IType, IType> const& dims, ::nda::MemoryVector auto const& nnzpr) 
+      : size1_(long(std::get<0>(dims))),
+        size2_(long(std::get<1>(dims))),
         data_(long(std::accumulate(nnzpr.begin(), nnzpr.end(), 0))),
         jdata_(data_.size()),
         row_begin_(size1_+1),
@@ -215,11 +227,24 @@ public:
   // accessor functions
   auto shape() const { return std::array<long,2>{size1_,size2_}; } 
   auto shape(long i) const { return (i==0?size1_:size2_); } 
-  auto capacity()  const { return row_begin_(size1_)-row_begin_(0); } 
-  auto capacity(long i)  const { return row_begin_(i+1)-row_begin_(i); } 
+  auto extent(long i) const { return (i==0?size1_:size2_); } 
+  auto capacity()  const { 
+    if(size1_*size2_==0) return int_type(0); 
+    else return row_begin_(size1_)-row_begin_(0);  
+  }
+  auto capacity(long i)  const { 
+    if(size1_*size2_==0) return int_type(0); 
+    else return row_begin_(i+1)-row_begin_(i); 
+  } 
+  auto values(long i) { return data_(i); }
+  auto values() { return data_(); }
+  auto values(long i) const { return data_(i); }
   auto values() const { return data_(); }
+  auto columns(long i) const { return jdata_(i); }
   auto columns() const { return jdata_(); }
+  auto row_begin(long i) const { return row_begin_(i); }
   auto row_begin() const { return row_begin_(); }
+  auto row_end(long i) const { return row_end_(i); }
   auto row_end() const { return row_end_(); }
   auto nnz() const {
     long n=0;
@@ -254,26 +279,14 @@ public:
     else
     {
       // MAM: implement dynamic resizing if needed!
-      APP_ABORT(" Error - ucsr_matrix: row size exceeded the maximum \n\n");
+      utils::check(false," Error - ucsr_matrix: row size exceeded the maximum \n\n");
     }
   }
 
-  template<typename integer_type = IndxType, typename value_type = ValType>
-  void emplace(std::tuple<integer_type, integer_type, value_type> const& val)
-  {
-    using std::get;
-    emplace({get<0>(val), get<1>(val)}, static_cast<ValType>(get<2>(val)));
-  }
   template<class Pair = std::array<IndxType, 2>, class... Args>
   void emplace_back(Pair&& indices, Args&&... args)
   {
     emplace(std::forward<Pair>(indices), std::forward<Args>(args)...);
-  }
-  template<typename integer_type = IndxType, typename value_type = ValType>
-  void emplace_back(std::tuple<integer_type, integer_type, value_type> const& val)
-  {
-    using std::get;
-    emplace({get<0>(val), get<1>(val)}, static_cast<ValType>(get<2>(val)));
   }
   // resets to empty state
   void clear()

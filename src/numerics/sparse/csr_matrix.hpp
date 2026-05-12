@@ -18,10 +18,7 @@
  * ==========================================================================
  */
 
-
-
-#ifndef SPARSE_CSR_MATRIX_HPP
-#define SPARSE_CSR_MATRIX_HPP
+#pragma once
 
 #include <array>
 #include <cassert>
@@ -61,6 +58,11 @@ class csr_matrix : public ucsr_matrix<ValType, MEM, IndxType, IntType>
   using base::row_begin_;
   using base::row_end_;
 
+protected:
+  // device copies, only populated if MEM==DEVICE_MEMORY
+  memory::array<MEM, IntType, 1> row_begin_dev_ = memory::array<MEM, IntType, 1>(0);
+  memory::array<MEM, IntType, 1> row_end_dev_ = memory::array<MEM, IntType, 1>(0);
+
 public:
   using base::reserve;
   using base::shape;
@@ -75,6 +77,8 @@ public:
   using base::serialize;
   using base::deserialize;
   using base::size_of_serialized_in_bytes;
+
+  using regular_type = csr_matrix<ValType, MEM, IndxType, IntType>;
 
   // to be able to reuse ops_tags 
   using Array_t = memory::array<MEM, ValType, 2>; 
@@ -96,13 +100,31 @@ public:
   static constexpr MEMORY_SPACE mem_type = MEM;
 
   csr_matrix() {}
-  template<typename integer_type = long, typename = std::enable_if_t<std::is_integral_v<integer_type>>>
-  csr_matrix(std::tuple<long,long> const& dims, integer_type nnzpr = 0) 
+
+  template<typename IType = long, typename integer_type = long>
+  requires ( std::is_integral_v<IType> and std::is_integral_v<integer_type> )
+  csr_matrix(std::tuple<IType,IType> const& dims, integer_type nnzpr = 0) 
       : base(dims, nnzpr)
-  {}
-  csr_matrix(std::tuple<long, long> const& dims, ::nda::MemoryArrayOfRank<1> auto && nnzpr)
+  {
+    if constexpr (MEM==DEVICE_MEMORY) {
+      row_begin_dev_.resize(size1_+1);
+      row_end_dev_.resize(size1_);
+      row_begin_dev_() = row_begin_(); 
+      row_end_dev_() = row_end_(); 
+    }
+  }
+  template<typename IType = long>
+  requires ( std::is_integral_v<IType> )
+  csr_matrix(std::tuple<IType, IType> const& dims, ::nda::MemoryVector auto && nnzpr)
       : base(dims, nnzpr)
-  {}
+  {
+    if constexpr (MEM==DEVICE_MEMORY) {
+      row_begin_dev_.resize(size1_+1);
+      row_end_dev_.resize(size1_);
+      row_begin_dev_() = row_begin_();
+      row_end_dev_() = row_end_();    
+    }
+  }
 
   ~csr_matrix() = default;
 
@@ -124,6 +146,10 @@ public:
     jdata_ = other.columns();
     row_begin_ = other.row_begin();
     row_end_ = other.row_end();
+    if constexpr (MEM==DEVICE_MEMORY) {
+      row_begin_dev_ = row_begin_();
+      row_end_dev_ = row_end_();
+    }
   }
 
   template<typename val_t, MEMORY_SPACE mem_t, typename indx_t, typename int_t>
@@ -165,6 +191,10 @@ public:
     }
     data_() = data_h();
     jdata_() = jdata_h();
+    if constexpr (MEM==DEVICE_MEMORY) {
+      row_begin_dev_ = row_begin_();
+      row_end_dev_ = row_end_();
+    }
     return *this;
   }
 
@@ -195,6 +225,10 @@ public:
     }
     data_() = data_h();
     jdata_() = jdata_h();
+    if constexpr (MEM==DEVICE_MEMORY) {
+      row_begin_dev_ = row_begin_();
+      row_end_dev_ = row_end_();
+    }
     return *this;
   }
 
@@ -235,6 +269,30 @@ public:
     return data_(row_begin_(get<0>(indices)) + disp);
   }
 
+  template<class Pair = std::array<IndxType, 2>>
+  value_type get_value(Pair&& indices) const
+  {
+    using std::get;
+    assert(get<0>(indices) >= 0);
+    assert(get<0>(indices) < size1_);
+    // need a kernel for this!
+    if constexpr (mem_type == DEVICE_MEMORY)
+      utils::check(false,"Finish csr_matrix::emplace()");
+
+    auto loc   = std::lower_bound(jdata_.data() + row_begin_(get<0>(indices)),
+                                  jdata_.data() + row_end_(get<0>(indices)), get<1>(indices));
+    long disp  = std::distance(jdata_.data() + row_begin_(get<0>(indices)), loc);
+    long disp_ = std::distance(loc, jdata_.data() + row_end_(get<0>(indices)));
+
+    if ( not (disp_ > 0 and *loc == get<1>(indices)) )
+    {
+      utils::check(row_end_(get<0>(indices)) < row_begin_(get<0>(indices) + 1),
+                        "row size exceeded the maximum");
+      return value_type(0);
+    }
+    return data_(row_begin_(get<0>(indices)) + disp);
+  }
+
 public:
   template<class Pair = std::array<IndxType, 2>, class... Args>
   void emplace(Pair&& indices, Args&&... args)
@@ -263,19 +321,6 @@ public:
     data_(row_end_(get<0>(indices))) = value_type(std::forward<Args>(args)...);
     jdata_(row_end_(get<0>(indices))) = index_type(get<1>(indices));
     ++row_end_(get<0>(indices));
-  }
-  // adaptors to emplace/emplace_back 
-  template<typename integer_type = IndxType, typename value_type = ValType>
-  void emplace(std::tuple<integer_type, integer_type, value_type> const& val)
-  {
-    using std::get;
-    emplace({get<0>(val), get<1>(val)}, static_cast<ValType>(get<2>(val)));
-  }
-  template<typename integer_type = IndxType, typename value_type = ValType>
-  void emplace_back(std::tuple<integer_type, integer_type, value_type> const& val)
-  {
-    using std::get;
-    emplace_back({get<0>(val), get<1>(val)}, static_cast<ValType>(get<2>(val)));
   }
 
   template<class Pair = std::array<IndxType, 2>>
@@ -374,7 +419,7 @@ protected:
       }
       operator value_type() const 
       {
-        return self_.self_.get({{self_.i_, j_}});
+        return self_.self_.get_value({{self_.i_, j_}});
       }  
     };
     using reference = element_reference;
@@ -384,6 +429,7 @@ protected:
       return reference{*this, static_cast<IndxType>(i)};
     }
 
+    auto values() { return self_.data_(::nda::range(self_.row_begin_(i_),self_.row_end_(i_))); }
     auto values() const { return self_.data_(::nda::range(self_.row_begin_(i_),self_.row_end_(i_))); }
     auto columns() const { return self_.jdata_(::nda::range(self_.row_begin_(i_),self_.row_end_(i_))); }
     auto nnz() const { return self_.nnz(i_); } 
@@ -410,6 +456,7 @@ protected:
     using element_type = value_type;
     using element_ptr  = typename csr_matrix::element_ptr const;
 
+    auto values() { return self_.data_(::nda::range(self_.row_begin_(i_),self_.row_end_(i_))); }
     auto values() const { return self_.data_(::nda::range(self_.row_begin_(i_),self_.row_end_(i_))); }
     auto columns() const { return self_.jdata_(::nda::range(self_.row_begin_(i_),self_.row_end_(i_))); }
     auto nnz() const { return self_.nnz(i_); }
@@ -440,14 +487,19 @@ public:
   using matrix_view = csr_matrix_view<ValType, MEM, IndxType, IntType>;
   matrix_view sub_matrix(::nda::range r)
   {
+    using ::nda::range;
     assert(r.first() >= 0 && r.last() <= size1_);
     assert(r.first() < r.last());
+    // row_begin_ in host memory 
+    auto r0 = row_begin_(r.first());
+    ::nda::array<int_type, 1> row_b(r.size()+1);
+    row_b(range(r.size())) = row_begin_(r) - r0; 
+    row_b(r.size()) = row_end_(r.last()-1) - r0; 
+    ::nda::array<int_type, 1> row_e = row_end_(r)-r0;
     return matrix_view({r.size(), size2_}, 
-              data_(::nda::range(row_begin_(r.first()),row_end_(r.last()))), 
-              jdata_(::nda::range(row_begin_(r.first() ),row_end_(r.last()))), 
-              row_begin_(::nda::range(r.first(),r.last()+1)),
-              row_end_(r) );
-
+              data_(range(row_begin_(r.first()),row_end_(r.last()-1))), 
+              jdata_(range(row_begin_(r.first() ),row_end_(r.last()-1))), 
+              row_b, row_e);
   }
 
   auto operator()(::nda::range r)
@@ -456,9 +508,35 @@ public:
     return sub_matrix(r);
   }
 
+  template<std::integral Int>
+  auto& operator()(Int i, Int j) {
+    return this->get(std::array<IndxType, 2>{IndxType(i),IndxType(j)});
+  }
+
+  template<std::integral Int>
+  auto operator()(Int i, Int j) const {
+    return this->get_value(std::array<IndxType, 2>{IndxType(i),IndxType(j)});
+  }
+
+  auto operator()() { return *this; }
+  auto operator()() const { return *this; }
+
+  auto row_begin_device() const {
+    if constexpr (MEM==HOST_MEMORY) {
+      return row_begin_();
+    } else {
+      return row_begin_dev_();
+    } 
+  }
+  auto row_end_device() const {
+    if constexpr (MEM==HOST_MEMORY) {
+      return row_end_();
+    } else {
+      return row_end_dev_();
+    }
+  } 
 };
 
 } // namespace sparse
 } // namespace math
 
-#endif

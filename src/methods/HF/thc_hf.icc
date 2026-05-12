@@ -501,8 +501,6 @@ namespace methods {
         thc_solver_comm::aux_to_primary(0,0,ComplexType(1.0),dF_skPQ, sF_skab, thc, ks_to_k(isym,nda::range(nkpts_ibz)));
         sF_skij.win().fence();
         {
-          using math::sparse::T;
-          using math::sparse::H;
           using math::sparse::csrmm;
           nda::array<ComplexType,2> Tm(nbnd,nbnd);
           for( long is=0; is<ns; ++is ) {
@@ -515,10 +513,10 @@ namespace methods {
               } else {
                 auto [cjg,D] = MF->symmetry_rotation(isym,ik);
                 utils::check(not cjg, "Oh oh.");
-                csrmm(ComplexType(1.0),H(*D),sF_skab.local()(is,ik,all,all), 
-                      ComplexType(0.0),Tm);
-                csrmm(ComplexType(1.0),T(*D),nda::transpose(Tm),
-                      ComplexType(1.0),nda::transpose(sF_skij.local()(is,ik,all,all)));
+                csrmm<'H'>(ComplexType(1.0),*D,sF_skab.local()(is,ik,all,all),
+                           ComplexType(0.0),Tm);
+                csrmm<'T'>(ComplexType(1.0),*D,nda::transpose(Tm),
+                           ComplexType(1.0),nda::transpose(sF_skij.local()(is,ik,all,all)));
               }
             }
           }

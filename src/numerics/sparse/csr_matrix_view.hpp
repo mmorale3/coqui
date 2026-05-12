@@ -18,10 +18,7 @@
  * ==========================================================================
  */
 
-
-
-#ifndef SPARSE_CSR_MATRIX_VIEW_HPP
-#define SPARSE_CSR_MATRIX_VIEW_HPP
+#pragma once
 
 #include <array>
 #include <cassert>
@@ -46,6 +43,9 @@ namespace math
 namespace sparse
 {
 
+template<typename ValType, MEMORY_SPACE MEM, typename IndxType, typename IntType>
+class csr_matrix;
+
 template<typename ValType, MEMORY_SPACE MEM = HOST_MEMORY, typename IndxType = int, typename IntType = long>
 class csr_matrix_view  
 {
@@ -65,6 +65,8 @@ public:
   static const int rank           = 2;
   static const bool sorted        = true;
   static const MEMORY_SPACE mem_type = MEM;
+
+  using regular_type = csr_matrix<ValType, MEM, IndxType, IntType>;
 
   // to be able to reuse ops_tags 
   using Array_t = memory::array<MEM, ValType, 2>;
@@ -86,6 +88,9 @@ protected:
   row_array_t row_begin_;
   // location of last element of each row
   row_array_t row_end_;
+  // device copies
+  memory::array<MEM, IntType, 1> row_begin_dev_;
+  memory::array<MEM, IntType, 1> row_end_dev_;
 
 public:
 
@@ -105,9 +110,12 @@ public:
   {
     utils::check(row_begin_.size() == size1_+1, "Size mismatch");
     utils::check(row_end_.size() == size1_, "Size mismatch");
-    auto r0 = row_begin_(0);
-    row_begin_ -= r0;
-    row_end_ -= r0;
+    if constexpr (MEM==DEVICE_MEMORY) {
+      row_begin_dev_.resize(size1_+1);
+      row_end_dev_.resize(size1_);
+      row_begin_dev_() = row_begin_();
+      row_end_dev_() = row_end_();
+    }
   }
 
   ~csr_matrix_view() = default; 
@@ -120,11 +128,24 @@ public:
   // accessor functions
   auto shape() const { return std::array<long,2>{size1_,size2_}; } 
   auto shape(long i) const { return (i==0?size1_:size2_); } 
-  auto capacity()  const { return row_begin_(size1_)-row_begin_(0); } 
-  auto capacity(long i)  const { return row_begin_(i+1)-row_begin_(i); } 
+  auto extent(long i) const { return (i==0?size1_:size2_); }
+  auto capacity()  const { 
+    if(size1_*size2_==0) return int_type(0);
+    else return row_begin_(size1_)-row_begin_(0); 
+  }
+  auto capacity(long i)  const { 
+    if(size1_*size2_==0) return int_type(0);
+    else return row_begin_(i+1)-row_begin_(i); 
+  } 
+  auto values(int i) { return data_(i); }
+  auto values() { return data_(); }
+  auto values(int i) const { return data_(i); }
   auto values() const { return data_(); }
+  auto columns(int i) const { return jdata_(i); }
   auto columns() const { return jdata_(); }
+  auto row_begin(int i) const { return row_begin_(i); }
   auto row_begin() const { return row_begin_(); }
+  auto row_end(int i) const { return row_end_(i); }
   auto row_end() const { return row_end_(); }
   bool compact() const {
     for(long r=0; r<size1_; ++r)
@@ -137,10 +158,21 @@ public:
     return n;
   }
   auto nnz(long i) const { return row_end_(i) - row_begin_(i); }
+  auto row_begin_device() const { 
+    if constexpr (MEM==DEVICE_MEMORY) 
+      return row_begin_dev_(); 
+    else 
+      return row_begin_(); 
+  }
+  auto row_end_device() const { 
+    if constexpr (MEM==DEVICE_MEMORY) 
+      return row_end_dev_(); 
+    else 
+      return row_end_(); 
+  }
 
 };
 
 } // sparse
 } // math
 
-#endif
