@@ -233,7 +233,10 @@ namespace methods {
     template void gw_t::evaluate(const Arrv2 &, sArray_t<Arrv> &, const thc_reader_t &, scr_coulomb_t*, bool);
 
     template void gw_t::evaluate<HOST_MEMORY>(MBState&, const thc_reader_t&, bool);
-#if defined(ENABLE_DEVICE)
+#if defined(ENABLE_DEVICE) && defined(COQUI_GPU_IMAG_FULL)
+    // DEVICE_MEMORY explicit instantiation is gated behind the IAFT MEM-aware
+    // refactor (see scr_coulomb_t.cpp). The eval_Sigma_all device path is
+    // ready; the gating IAFT calls in scr_coulomb update_w must land first.
     template void gw_t::evaluate<DEVICE_MEMORY>(MBState&, const thc_reader_t&, bool);
 #endif
 

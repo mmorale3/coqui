@@ -627,7 +627,13 @@ namespace solvers {
   using Arrv2 = nda::array_view<ComplexType, 5, nda::C_layout>;
 
   template void scr_coulomb_t::update_w<HOST_MEMORY>(MBState&, thc_reader_t&, long);
-#if defined(ENABLE_DEVICE)
+#if defined(ENABLE_DEVICE) && defined(COQUI_GPU_IMAG_FULL)
+  // DEVICE_MEMORY explicit instantiation requires IAFT to be MEM-aware
+  // (tau_to_w / w_to_tau / check_leakage internally do gemm with the host-side
+  // transform kernel matrices). Build with -DCOQUI_GPU_IMAG_FULL=ON once
+  // imag_axes_ft/IAFT.icc has been MEM-templated. Until then the test driver
+  // can still call HOST_MEMORY scr_coulomb on a device-backed state via the
+  // delegate-to-host pattern.
   template void scr_coulomb_t::update_w<DEVICE_MEMORY>(MBState&, thc_reader_t&, long);
 #endif
 
@@ -650,7 +656,8 @@ namespace solvers {
 
   template memory::darray_t<memory::array<HOST_MEMORY, ComplexType, 4>, mpi3::communicator>
   scr_coulomb_t::eval_Pi_qdep<HOST_MEMORY>(MBState&, thc_reader_t&);
-#if defined(ENABLE_DEVICE)
+#if defined(ENABLE_DEVICE) && defined(COQUI_GPU_IMAG_FULL)
+  // See update_w note above; same IAFT dependency.
   template memory::darray_t<memory::array<DEVICE_MEMORY, ComplexType, 4>, mpi3::communicator>
   scr_coulomb_t::eval_Pi_qdep<DEVICE_MEMORY>(MBState&, thc_reader_t&);
 #endif
