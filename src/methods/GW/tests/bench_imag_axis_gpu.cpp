@@ -284,7 +284,7 @@ namespace bdft_tests {
 
     return time_it([&]() {
       // Z(R,P,Q) = sum_t X(R,P,t) * Y(R,t,Q)
-      nda::tensor::contract(ComplexType(1.0), X, "Rpt", Y, "RtQ",
+      nda::tensor::contract(ComplexType(1.0), X, "RPt", Y, "RtQ",
                             ComplexType(0.0), Z, "RPQ");
     }, nruns);
   }
