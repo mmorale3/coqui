@@ -44,7 +44,10 @@ namespace methods {
     //   - Check will q-dependent Np lead to a bug?
     //   - Profiling
 
+    template<MEMORY_SPACE MEM>
     void gw_t::evaluate(MBState &mb_state, Cholesky_ERI auto &chol, bool verbose) {
+      static_assert(MEM == HOST_MEMORY,
+                    "gw_t::evaluate (Cholesky path) is HOST-only");
       using namespace math::shm;
       using Array_3D_t = nda::array_view<ComplexType, 3>;
       if (verbose) {
@@ -384,7 +387,10 @@ namespace methods {
     template void gw_t::evaluate(const Arrv &, sArray_t<Arrv> &, chol_reader_t &, scr_coulomb_t*, bool);
     template void gw_t::evaluate(const Arrv2 &, sArray_t<Arrv> &, chol_reader_t &, scr_coulomb_t*, bool);
 
-    template void gw_t::evaluate(MBState &mb_state, chol_reader_t&, bool);
+    template void gw_t::evaluate<HOST_MEMORY>(MBState &mb_state, chol_reader_t&, bool);
+#if defined(ENABLE_DEVICE)
+    template void gw_t::evaluate<DEVICE_MEMORY>(MBState &mb_state, chol_reader_t&, bool);
+#endif
 
     template void gw_t::evaluate_P0(size_t, const Arr &, sArray_t<Arrv3> &, chol_reader_t &, int , bool);
     template void gw_t::evaluate_P0(size_t, const Arrv &, sArray_t<Arrv3> &, chol_reader_t &, int , bool);
