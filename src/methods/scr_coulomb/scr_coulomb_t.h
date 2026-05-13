@@ -103,6 +103,9 @@ namespace solvers {
      */
     template<MEMORY_SPACE MEM = HOST_MEMORY>
     void update_w(MBState &mb_state, THC_ERI auto &thc, long h5_iter=-1);
+    // Cholesky path is HOST-only; the MEM template parameter is accepted
+    // so scf_loop's `template update_w<MEM>(...)` resolves uniformly.
+    template<MEMORY_SPACE MEM = HOST_MEMORY>
     void update_w(MBState &mb_state, Cholesky_ERI auto &chol, long h5_iter=-1);
 
     /**

@@ -26,6 +26,7 @@
 namespace methods {
 namespace solvers {
 
+  template<MEMORY_SPACE MEM>
   void scr_coulomb_t::update_w(MBState &mb_state, Cholesky_ERI auto &chol, long h5_iter) {
     (void) mb_state; (void) chol; (void) h5_iter;
     app_log(2, "\nscr_coulomb_t::update_w: the new screen interaction interface is not implemented for Choleskky-ERI. "
@@ -34,7 +35,10 @@ namespace solvers {
 
 
   // template instantiations
-  template void scr_coulomb_t::update_w(MBState&, chol_reader_t&, long);
+  template void scr_coulomb_t::update_w<HOST_MEMORY>(MBState&, chol_reader_t&, long);
+#if defined(ENABLE_DEVICE)
+  template void scr_coulomb_t::update_w<DEVICE_MEMORY>(MBState&, chol_reader_t&, long);
+#endif
 
 }  // solvers
 }  // methods
