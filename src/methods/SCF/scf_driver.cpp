@@ -34,7 +34,8 @@
 
 namespace methods {
 
-template<typename dyson_type, typename eri_t, typename corr_solver_t>
+template<MEMORY_SPACE MEM,
+         typename dyson_type, typename eri_t, typename corr_solver_t>
 auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_axes_ft::IAFT& FT,
               solvers::mb_solver_t<corr_solver_t> mb_solver, iter_scf::iter_scf_t *iter_solver,
               int niter, bool restart, double conv_tol, bool const_mu,
@@ -151,10 +152,20 @@ auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_ax
     if (mb_solver.corr != nullptr) {
 
       if (mb_solver.scr_eri != nullptr)
-        mb_solver.scr_eri->update_w(mb_state, mb_eri.corr_eri->get(), output_iter);
+        mb_solver.scr_eri->template update_w<MEM>(
+            mb_state, mb_eri.corr_eri->get(), output_iter);
 
       mb_solver.corr->iter() = output_iter;
-      mb_solver.corr->evaluate(mb_state, mb_eri.corr_eri->get());
+      // gw_t::evaluate is MEM-templated; gf2_t::evaluate is not (its
+      // explicit instantiations below are HOST-only). Use a constexpr
+      // branch on the corr solver type so HOST-only solvers still build.
+      if constexpr (std::is_same_v<corr_solver_t, solvers::gw_t>) {
+        mb_solver.corr->template evaluate<MEM>(mb_state, mb_eri.corr_eri->get());
+      } else {
+        static_assert(MEM == HOST_MEMORY,
+                      "scf_loop: only gw_t supports DEVICE_MEMORY today");
+        mb_solver.corr->evaluate(mb_state, mb_eri.corr_eri->get());
+      }
       mpi->comm.barrier();
     }
 
@@ -398,14 +409,23 @@ double qp_scf_loop(MBState &mb_state, eri_t &mb_eri, const imag_axes_ft::IAFT& F
 
 /** Instantiation of public templates **/
 // standard dyson for gw/hf
-#define GW_SCF_LOOP_INST(HF, HARTREE, EXCHANGE, CORR) \
+#define GW_SCF_LOOP_INST_MEM(MEM, HF, HARTREE, EXCHANGE, CORR) \
 template std::tuple<double, double> \
-scf_loop(MBState&, simple_dyson&, \
+scf_loop<MEM>(MBState&, simple_dyson&, \
          mb_eri_t<HF, HARTREE, EXCHANGE, CORR>&, \
          const imag_axes_ft::IAFT&, \
          solvers::mb_solver_t<solvers::gw_t>, \
          iter_scf::iter_scf_t*, \
          int, bool, double, bool, std::string, int);
+
+#if defined(ENABLE_DEVICE)
+#  define GW_SCF_LOOP_INST(HF, HARTREE, EXCHANGE, CORR) \
+   GW_SCF_LOOP_INST_MEM(HOST_MEMORY, HF, HARTREE, EXCHANGE, CORR) \
+   GW_SCF_LOOP_INST_MEM(DEVICE_MEMORY, HF, HARTREE, EXCHANGE, CORR)
+#else
+#  define GW_SCF_LOOP_INST(HF, HARTREE, EXCHANGE, CORR) \
+   GW_SCF_LOOP_INST_MEM(HOST_MEMORY, HF, HARTREE, EXCHANGE, CORR)
+#endif
 
 // All combinations of thc/chol for 4 eri slots
 GW_SCF_LOOP_INST(thc_reader_t, thc_reader_t, thc_reader_t, thc_reader_t)
@@ -426,6 +446,7 @@ GW_SCF_LOOP_INST(chol_reader_t, chol_reader_t, chol_reader_t, thc_reader_t)
 GW_SCF_LOOP_INST(chol_reader_t, chol_reader_t, chol_reader_t, chol_reader_t)
 
 #undef GW_SCF_LOOP_INST
+#undef GW_SCF_LOOP_INST_MEM
 
 
 // standard dyson for gf2

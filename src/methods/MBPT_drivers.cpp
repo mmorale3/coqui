@@ -104,7 +104,7 @@ inline void ensure_checkpoint(std::shared_ptr<mf::MF> mf, std::string const& out
  *  - restart: "false" Restart from a previous bdft.scf calculation.
  *  - t_prescreen_thresh: "0.0" Threshold for prescreening in time (GF2 only for now)
  */
-template<typename eri_t>
+template<MEMORY_SPACE MEM, typename eri_t>
 void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
 {
   auto mf = eri.corr_eri->get().MF();
@@ -196,9 +196,9 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
       auto trans_home_cell = io::get_value_with_default<bool>(pt,"translate_home_cell",false);
 
       MBState mb_state(ft, output, mf, wannier_file, trans_home_cell);
-      scf_loop(mb_state, dyson, eri, ft, mb_solver_t(&hf, &gw, &scr_eri),
-               iter_solver.get(), niter, restart, conv_thr, const_mu,
-               greens_func_source, greens_func_iteration);
+      scf_loop<MEM>(mb_state, dyson, eri, ft, mb_solver_t(&hf, &gw, &scr_eri),
+                    iter_solver.get(), niter, restart, conv_thr, const_mu,
+                    greens_func_source, greens_func_iteration);
 
       auto dump_w_to_h5 = io::get_value_with_default<bool>(pt,"dump_w_to_h5", false);
       if (dump_w_to_h5) {
@@ -215,9 +215,9 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     } else {
 
       MBState mb_state(mpi, ft, output);
-      scf_loop(mb_state, dyson, eri, ft, mb_solver_t(&hf, &gw, &scr_eri),
-               iter_solver.get(), niter, restart, conv_thr, const_mu,
-               greens_func_source, greens_func_iteration);
+      scf_loop<MEM>(mb_state, dyson, eri, ft, mb_solver_t(&hf, &gw, &scr_eri),
+                    iter_solver.get(), niter, restart, conv_thr, const_mu,
+                    greens_func_source, greens_func_iteration);
 
       auto dump_w_to_h5 = io::get_value_with_default<bool>(pt,"dump_w_to_h5", false);
       if (dump_w_to_h5) {
@@ -337,7 +337,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
 }
 
 
-template<typename eri_t>
+template<MEMORY_SPACE MEM, typename eri_t>
 void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
           nda::array<ComplexType, 5> const& projector_ksIai,
           nda::array<long, 3> const& band_window,
@@ -416,9 +416,9 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
       local_polarizabilities.reset();
     }
 
-    scf_loop(mb_state, dyson, eri, ft, mb_solver_t(&hf, &gw, &scr_eri),
-             iter_solver.get(), niter, restart, conv_thr, const_mu,
-             greens_func_source, greens_func_iteration);
+    scf_loop<MEM>(mb_state, dyson, eri, ft, mb_solver_t(&hf, &gw, &scr_eri),
+                  iter_solver.get(), niter, restart, conv_thr, const_mu,
+                  greens_func_source, greens_func_iteration);
 
   } else
     APP_ABORT("mbpt: Unknown solver type: {}",solver_type);
@@ -881,17 +881,26 @@ template void downfolding_2e(
 template void hf_downfold(thc_reader_t&, ptree const&);
 template void gw_downfold(thc_reader_t&, ptree&);
 
-#define MBPT_INST(HF, HARTREE, EXCHANGE, CORR) \
-template void mbpt(std::string, \
+#define MBPT_INST_MEM(MEM, HF, HARTREE, EXCHANGE, CORR) \
+template void mbpt<MEM>(std::string, \
      mb_eri_t<HF, HARTREE, EXCHANGE, CORR>&,    \
      ptree const&);                             \
-template void mbpt(std::string, \
+template void mbpt<MEM>(std::string, \
      mb_eri_t<HF, HARTREE, EXCHANGE, CORR>&, \
      ptree const&,                             \
      nda::array<ComplexType, 5> const&,  \
      nda::array<long, 3> const&,   \
      nda::array<RealType, 2> const&,           \
      std::optional<std::map<std::string, nda::array<ComplexType, 5> > >);
+
+#if defined(ENABLE_DEVICE)
+#  define MBPT_INST(HF, HARTREE, EXCHANGE, CORR) \
+   MBPT_INST_MEM(HOST_MEMORY, HF, HARTREE, EXCHANGE, CORR) \
+   MBPT_INST_MEM(DEVICE_MEMORY, HF, HARTREE, EXCHANGE, CORR)
+#else
+#  define MBPT_INST(HF, HARTREE, EXCHANGE, CORR) \
+   MBPT_INST_MEM(HOST_MEMORY, HF, HARTREE, EXCHANGE, CORR)
+#endif
 
 // All combinations of thc/chol for 4 eri slots
   MBPT_INST(thc_reader_t, thc_reader_t, thc_reader_t, thc_reader_t)
