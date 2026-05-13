@@ -115,7 +115,10 @@ namespace methods {
                           std::string alg = "R");
 
 
-      // external functions of Chol-GW
+      // external functions of Chol-GW (HOST-only; MEM accepted for
+      // symmetry with the THC overload so scf_loop's template evaluate
+      // <MEM>(...) call resolves uniformly).
+      template<MEMORY_SPACE MEM = HOST_MEMORY>
       void evaluate(MBState &mb_state, Cholesky_ERI auto &chol, bool verbose=true);
 
       /**
