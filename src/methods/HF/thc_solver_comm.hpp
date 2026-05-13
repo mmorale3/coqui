@@ -426,14 +426,15 @@ namespace methods {
         int offset = (rank % nbatch < n_large_batch)? 0 : 0 + n_large_batch;
 
         nda::array<ComplexType, 2> Ask_Pb(batch_size, nbnd);
-        // Device-side scratch for the second gemm output, staged once
-        // per inner iter to the device-typed O_ikPQ slice.
+#if defined(ENABLE_DEVICE)
+        // Device-side scratch for the second gemm output, plus the X-factor
+        // cache, all only referenced when ENABLE_DEVICE is on. Wrapping the
+        // declarations themselves with #if is necessary because nda's
+        // mem::check_adr_sp_valid<Device> static_asserts when GPU support
+        // is not compiled in — even `if constexpr` discarded branches
+        // still get parsed and trigger the assert on a CPU-only build.
         [[maybe_unused]] memory::array<DEVICE_MEMORY, ComplexType, 2> O_PQ_dev;
         [[maybe_unused]] memory::array<DEVICE_MEMORY, ComplexType, 2> Ask_Pb_dev;
-        // Device cache of Xr = thc.X(s, iq, k)(O_Q_rng, all). The slice is
-        // (s, k)-dependent only — invariant across dim_i (which carries t)
-        // and the PP batch index. One bulk H->D copy replaces dim_i*nbatch
-        // copies per (s, k) on the GPU path.
         [[maybe_unused]] memory::array<DEVICE_MEMORY, ComplexType, 4> Xr_cache;
         if constexpr (aux_on_device) {
           O_PQ_dev   = memory::array<DEVICE_MEMORY, ComplexType, 2>(batch_size, NQ_loc);
@@ -448,6 +449,7 @@ namespace methods {
           }
           Xr_cache = memory::to_memory_space<DEVICE_MEMORY>(Xr_host);
         }
+#endif
 
         for (size_t ikP = rank; ikP < dim_i*nkpts*nbatch; ikP += comm_size) {
           // ikP = (i * nkpts + k) * nbatch + PP
@@ -470,11 +472,13 @@ namespace methods {
 
           // Osk_PQ = Ask_Pb * conj(Xsk_Qb)
           if constexpr (aux_on_device) {
+#if defined(ENABLE_DEVICE)
             // Stage Ask_Pb (host) -> device, use cached Xr, run the
             // device gemm, then copy into the device-typed O_ikPQ slice.
             Ask_Pb_dev = Ask_Pb;
             nda::blas::gemm(Ask_Pb_dev, nda::dagger(Xr_cache(s, k, all, all)), O_PQ_dev);
             O_ikPQ_4D(i, k, O_P_rng, all) = O_PQ_dev;
+#endif
           } else {
             auto Xsk_Pa_r = thc.X(s, iq, k);
             nda::blas::gemm(Ask_Pb, nda::dagger(Xsk_Pa_r(O_Q_rng, all)), O_ikPQ_4D(i, k, O_P_rng, all));
