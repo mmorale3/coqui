@@ -36,9 +36,7 @@ namespace solvers {
 
   // template instantiations
   template void scr_coulomb_t::update_w<HOST_MEMORY>(MBState&, chol_reader_t&, long);
-#if defined(ENABLE_DEVICE)
-  template void scr_coulomb_t::update_w<DEVICE_MEMORY>(MBState&, chol_reader_t&, long);
-#endif
+  // DEVICE_MEMORY not instantiated for Cholesky path (no caller).
 
 }  // solvers
 }  // methods
