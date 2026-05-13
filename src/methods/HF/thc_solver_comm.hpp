@@ -606,9 +606,6 @@ namespace methods {
         auto O_iab_3D = nda::reshape(O_tskab, shape_t<3>{dim0, nbnd, nbnd});
 
         memory::array<WORK_MEM, ComplexType, 2> Ask_aQ(nbnd, NQ_loc);
-        memory::array<WORK_MEM, ComplexType, 2> Oab_buffer(nbnd, nbnd);
-        nda::array<ComplexType, 2> Oab_buffer_host;
-        if constexpr (aux_on_device) Oab_buffer_host.resize(std::array<long,2>{long(nbnd), long(nbnd)});
 
         // X-factor cache: thc.X(s, ip, kp_map(k))(P_rng, all) is constant
         // across the t axis in the i sweep (each unique (s, k) appears
@@ -638,6 +635,17 @@ namespace methods {
           }
         }
 
+        // Buffer all Oab outputs in one (dim0, nbnd, nbnd) tensor and do a
+        // single bulk D->H copy + MPI reduce at the end. The per-iter
+        // to_host + reduce we used to do drains the cuBLAS stream every
+        // iter; this version keeps all gemms in-flight on the GPU and
+        // batches the reduce.
+        memory::array<WORK_MEM, ComplexType, 3> Oab_all(dim0, nbnd, nbnd);
+        nda::array<ComplexType, 3> Oab_all_host;
+        if constexpr (aux_on_device) {
+          Oab_all_host.resize(std::array<long,3>{long(dim0), long(nbnd), long(nbnd)});
+        }
+
         for (size_t i = 0; i < dim0; ++i) {
           // i = (it * ns_loc + is) * nk_loc + ik
           size_t s = (i / nk_loc) % ns_loc;
@@ -646,27 +654,34 @@ namespace methods {
           auto Xl_view = Xl_cache(s, k, all, all);
           auto Xr_view = (ip == iq) ? Xl_cache(s, k, all, all)
                                     : Xr_cache(s, k, all, all);
+          auto Oab_i   = Oab_all(i, all, all);
 
-          if constexpr (aux_on_device) {
-            nda::blas::gemm(nda::dagger(Xl_view), O_iPQ_3D(i, all, all), Ask_aQ);
-            nda::blas::gemm(Ask_aQ, Xr_view, Oab_buffer);
-            Oab_buffer_host = nda::to_host(Oab_buffer);
-            dim0_comm.reduce_in_place_n(Oab_buffer_host.data(), Oab_buffer_host.size(), std::plus<>{}, 0);
-            if (dim0_comm.root()) {
-              O_iab_3D(i, all, all) += scl*Oab_buffer_host;
-            }
-          } else {
-            // Host: bit-identical to baseline; Xl_cache / Xr_cache are
-            // host-typed when WORK_MEM == HOST_MEMORY (just views into a
-            // small host buffer) so the gemms are unchanged.
-            nda::blas::gemm(nda::dagger(Xl_view), O_iPQ_3D(i, all, all), Ask_aQ);
-            nda::blas::gemm(Ask_aQ, Xr_view, Oab_buffer);
-            dim0_comm.reduce_in_place_n(Oab_buffer.data(), Oab_buffer.size(), std::plus<>{}, 0);
-            if (dim0_comm.root()) {
-              O_iab_3D(i, all, all) += scl*Oab_buffer;
+          nda::blas::gemm(nda::dagger(Xl_view), O_iPQ_3D(i, all, all), Ask_aQ);
+          nda::blas::gemm(Ask_aQ, Xr_view, Oab_i);
+        } // i
+
+        if constexpr (aux_on_device) {
+          // One bulk device -> host transfer (drains cuBLAS stream once),
+          // one bulk MPI reduce, then per-i host accumulate on root.
+          Oab_all_host = nda::to_host(Oab_all);
+          dim0_comm.reduce_in_place_n(Oab_all_host.data(), Oab_all_host.size(),
+                                      std::plus<>{}, 0);
+          if (dim0_comm.root()) {
+            for (size_t i = 0; i < dim0; ++i) {
+              O_iab_3D(i, all, all) += scl * Oab_all_host(i, all, all);
             }
           }
-        } // i
+        } else {
+          // Host: bulk MPI reduce on Oab_all itself (host buffer), then
+          // accumulate. Bit-identical to per-iter reduce + accumulate.
+          dim0_comm.reduce_in_place_n(Oab_all.data(), Oab_all.size(),
+                                      std::plus<>{}, 0);
+          if (dim0_comm.root()) {
+            for (size_t i = 0; i < dim0; ++i) {
+              O_iab_3D(i, all, all) += scl * Oab_all(i, all, all);
+            }
+          }
+        }
       } // _aux_to_primary_impl
 
     }; // thc_solver_comm
