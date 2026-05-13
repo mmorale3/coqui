@@ -902,16 +902,16 @@ template void mbpt<MEM>(std::string, \
      nda::array<RealType, 2> const&,           \
      std::optional<std::map<std::string, nda::array<ComplexType, 5> > >);
 
-#define MBPT_INST(HF, HARTREE, EXCHANGE, CORR) \
-   MBPT_INST_MEM(HOST_MEMORY, HF, HARTREE, EXCHANGE, CORR)
-
-// DEVICE instantiations only for CORR=thc_reader_t (only THC has a real
-// device path in scr_coulomb_t::update_w / gw_t::evaluate).
+// mbpt internally maps Cholesky-corr to scf_loop<HOST_MEMORY> via SCF_MEM,
+// so DEVICE instantiation is safe for ALL ERI combinations (the body
+// just routes accordingly).
 #if defined(ENABLE_DEVICE)
-#  define MBPT_INST_DEV_THC(HF, HARTREE, EXCHANGE) \
-   MBPT_INST_MEM(DEVICE_MEMORY, HF, HARTREE, EXCHANGE, thc_reader_t)
+#  define MBPT_INST(HF, HARTREE, EXCHANGE, CORR) \
+   MBPT_INST_MEM(HOST_MEMORY, HF, HARTREE, EXCHANGE, CORR) \
+   MBPT_INST_MEM(DEVICE_MEMORY, HF, HARTREE, EXCHANGE, CORR)
 #else
-#  define MBPT_INST_DEV_THC(HF, HARTREE, EXCHANGE)
+#  define MBPT_INST(HF, HARTREE, EXCHANGE, CORR) \
+   MBPT_INST_MEM(HOST_MEMORY, HF, HARTREE, EXCHANGE, CORR)
 #endif
 
 // All combinations of thc/chol for 4 eri slots
