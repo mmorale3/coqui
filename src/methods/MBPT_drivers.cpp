@@ -112,6 +112,12 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
   if (mpi->comm.size()%mpi->node_comm.size()!=0) {
     APP_ABORT("MBPT: number of processors on each node should be the same.");
   }
+  // Only the THC corr-ERI path has a device implementation of update_w /
+  // evaluate. For Cholesky corr-ERI, fall back to HOST_MEMORY so scf_loop
+  // resolves to the host instantiation (which is the only one defined).
+  using corr_t = std::decay_t<decltype(eri.corr_eri->get())>;
+  constexpr MEMORY_SPACE SCF_MEM =
+      std::is_same_v<corr_t, thc_reader_t> ? MEM : HOST_MEMORY;
   std::string err = std::string("mbpt - Incorrect input - ");
   auto div_treatment = io::get_value_with_default<std::string>(pt, "div_treatment", "gygi");
   auto hf_div_treatment = io::get_value_with_default<std::string>(pt, "hf_div_treatment", "gygi");
@@ -196,7 +202,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
       auto trans_home_cell = io::get_value_with_default<bool>(pt,"translate_home_cell",false);
 
       MBState mb_state(ft, output, mf, wannier_file, trans_home_cell);
-      scf_loop<MEM>(mb_state, dyson, eri, ft, mb_solver_t(&hf, &gw, &scr_eri),
+      scf_loop<SCF_MEM>(mb_state, dyson, eri, ft, mb_solver_t(&hf, &gw, &scr_eri),
                     iter_solver.get(), niter, restart, conv_thr, const_mu,
                     greens_func_source, greens_func_iteration);
 
@@ -215,7 +221,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     } else {
 
       MBState mb_state(mpi, ft, output);
-      scf_loop<MEM>(mb_state, dyson, eri, ft, mb_solver_t(&hf, &gw, &scr_eri),
+      scf_loop<SCF_MEM>(mb_state, dyson, eri, ft, mb_solver_t(&hf, &gw, &scr_eri),
                     iter_solver.get(), niter, restart, conv_thr, const_mu,
                     greens_func_source, greens_func_iteration);
 
@@ -349,6 +355,9 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
   if (mpi->comm.size()%mpi->node_comm.size()!=0) {
     APP_ABORT("MBPT: number of processors on each node should be the same.");
   }
+  using corr_t = std::decay_t<decltype(eri.corr_eri->get())>;
+  constexpr MEMORY_SPACE SCF_MEM =
+      std::is_same_v<corr_t, thc_reader_t> ? MEM : HOST_MEMORY;
   std::string err = std::string("mbpt - Incorrect input - ");
   auto div_treatment = io::get_value_with_default<std::string>(pt, "div_treatment", "gygi");
   auto hf_div_treatment = io::get_value_with_default<std::string>(pt, "hf_div_treatment", "gygi");
@@ -416,7 +425,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
       local_polarizabilities.reset();
     }
 
-    scf_loop<MEM>(mb_state, dyson, eri, ft, mb_solver_t(&hf, &gw, &scr_eri),
+    scf_loop<SCF_MEM>(mb_state, dyson, eri, ft, mb_solver_t(&hf, &gw, &scr_eri),
                   iter_solver.get(), niter, restart, conv_thr, const_mu,
                   greens_func_source, greens_func_iteration);
 
@@ -893,13 +902,16 @@ template void mbpt<MEM>(std::string, \
      nda::array<RealType, 2> const&,           \
      std::optional<std::map<std::string, nda::array<ComplexType, 5> > >);
 
-#if defined(ENABLE_DEVICE)
-#  define MBPT_INST(HF, HARTREE, EXCHANGE, CORR) \
-   MBPT_INST_MEM(HOST_MEMORY, HF, HARTREE, EXCHANGE, CORR) \
-   MBPT_INST_MEM(DEVICE_MEMORY, HF, HARTREE, EXCHANGE, CORR)
-#else
-#  define MBPT_INST(HF, HARTREE, EXCHANGE, CORR) \
+#define MBPT_INST(HF, HARTREE, EXCHANGE, CORR) \
    MBPT_INST_MEM(HOST_MEMORY, HF, HARTREE, EXCHANGE, CORR)
+
+// DEVICE instantiations only for CORR=thc_reader_t (only THC has a real
+// device path in scr_coulomb_t::update_w / gw_t::evaluate).
+#if defined(ENABLE_DEVICE)
+#  define MBPT_INST_DEV_THC(HF, HARTREE, EXCHANGE) \
+   MBPT_INST_MEM(DEVICE_MEMORY, HF, HARTREE, EXCHANGE, thc_reader_t)
+#else
+#  define MBPT_INST_DEV_THC(HF, HARTREE, EXCHANGE)
 #endif
 
 // All combinations of thc/chol for 4 eri slots

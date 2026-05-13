@@ -418,16 +418,20 @@ scf_loop<MEM>(MBState&, simple_dyson&, \
          iter_scf::iter_scf_t*, \
          int, bool, double, bool, std::string, int);
 
-#if defined(ENABLE_DEVICE)
-#  define GW_SCF_LOOP_INST(HF, HARTREE, EXCHANGE, CORR) \
-   GW_SCF_LOOP_INST_MEM(HOST_MEMORY, HF, HARTREE, EXCHANGE, CORR) \
-   GW_SCF_LOOP_INST_MEM(DEVICE_MEMORY, HF, HARTREE, EXCHANGE, CORR)
-#else
-#  define GW_SCF_LOOP_INST(HF, HARTREE, EXCHANGE, CORR) \
+#define GW_SCF_LOOP_INST(HF, HARTREE, EXCHANGE, CORR) \
    GW_SCF_LOOP_INST_MEM(HOST_MEMORY, HF, HARTREE, EXCHANGE, CORR)
+
+// DEVICE_MEMORY instantiation only when the corr ERI is THC (the only
+// ERI type whose gw_t::evaluate / scr_coulomb_t::update_w currently has
+// a real device path; the Cholesky overload static_asserts HOST).
+#if defined(ENABLE_DEVICE)
+#  define GW_SCF_LOOP_INST_DEV_THC(HF, HARTREE, EXCHANGE) \
+   GW_SCF_LOOP_INST_MEM(DEVICE_MEMORY, HF, HARTREE, EXCHANGE, thc_reader_t)
+#else
+#  define GW_SCF_LOOP_INST_DEV_THC(HF, HARTREE, EXCHANGE)
 #endif
 
-// All combinations of thc/chol for 4 eri slots
+// All combinations of thc/chol for 4 eri slots (HOST)
 GW_SCF_LOOP_INST(thc_reader_t, thc_reader_t, thc_reader_t, thc_reader_t)
 GW_SCF_LOOP_INST(thc_reader_t, thc_reader_t, thc_reader_t, chol_reader_t)
 GW_SCF_LOOP_INST(thc_reader_t, thc_reader_t, chol_reader_t, thc_reader_t)
@@ -445,7 +449,18 @@ GW_SCF_LOOP_INST(chol_reader_t, chol_reader_t, thc_reader_t, chol_reader_t)
 GW_SCF_LOOP_INST(chol_reader_t, chol_reader_t, chol_reader_t, thc_reader_t)
 GW_SCF_LOOP_INST(chol_reader_t, chol_reader_t, chol_reader_t, chol_reader_t)
 
+// DEVICE instantiations only for CORR=thc_reader_t
+GW_SCF_LOOP_INST_DEV_THC(thc_reader_t, thc_reader_t, thc_reader_t)
+GW_SCF_LOOP_INST_DEV_THC(thc_reader_t, thc_reader_t, chol_reader_t)
+GW_SCF_LOOP_INST_DEV_THC(thc_reader_t, chol_reader_t, thc_reader_t)
+GW_SCF_LOOP_INST_DEV_THC(thc_reader_t, chol_reader_t, chol_reader_t)
+GW_SCF_LOOP_INST_DEV_THC(chol_reader_t, thc_reader_t, thc_reader_t)
+GW_SCF_LOOP_INST_DEV_THC(chol_reader_t, thc_reader_t, chol_reader_t)
+GW_SCF_LOOP_INST_DEV_THC(chol_reader_t, chol_reader_t, thc_reader_t)
+GW_SCF_LOOP_INST_DEV_THC(chol_reader_t, chol_reader_t, chol_reader_t)
+
 #undef GW_SCF_LOOP_INST
+#undef GW_SCF_LOOP_INST_DEV_THC
 #undef GW_SCF_LOOP_INST_MEM
 
 
