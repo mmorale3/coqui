@@ -9,6 +9,7 @@
 
 #include "utilities/mpi_context.h"
 #include "utilities/Timer.hpp"
+#include "utilities/freemem.h"
 #include "IO/app_loggers.h"
 
 #include "mean_field/MF.hpp"
@@ -64,8 +65,12 @@ namespace solvers {
                ntpools, 1, np_P, np_Q);
 
     _Timer.start("PI_ALLOC_R");
+    if constexpr (MEM != HOST_MEMORY)
+      utils::memory_report(2, "eval_Pi_rpa_Rspace: entry");
     auto dPi_tqPQ = make_distributed_array<local_Array_4D_t>(
         mpi->comm, {ntpools, 1, np_P, np_Q}, {nt_half, nqpts_ibz, Np, Np}, {1, 1, 1, 1});
+    if constexpr (MEM != HOST_MEMORY)
+      utils::memory_report(2, "eval_Pi_rpa_Rspace: after dPi_tqPQ");
     auto [t_origin, q_origin, P_origin, Q_origin] = dPi_tqPQ.origin();
     auto [nt_loc, nq_loc, NP_loc, NQ_loc] = dPi_tqPQ.local_shape();
 
@@ -101,7 +106,11 @@ namespace solvers {
         t_intra_comm, {1, 1, np_P, np_Q}, {ns, nkpts, Np, Np}, {1, 1, 1, 1});
     auto dbuf_skPQ  = make_distributed_array<local_Array_4D_t>(
         t_intra_comm, {1, 1, np_P, np_Q}, {ns, nkpts_no_trev, Np, Np}, {1, 1, 1, 1});
+    if constexpr (MEM != HOST_MEMORY)
+      utils::memory_report(2, "eval_Pi_rpa_Rspace: after dGp/dGn/dbuf");
     memory::array<MEM, ComplexType, 2> X_R_PQ(nkpts, NP_loc*NQ_loc);
+    if constexpr (MEM != HOST_MEMORY)
+      utils::memory_report(2, "eval_Pi_rpa_Rspace: after X_R_PQ");
     utils::check(dGp_sRPQ.local_shape()[2] == NP_loc, "dGp_sRPQ.local_shape[2] != NP_loc");
     utils::check(dGp_sRPQ.local_shape()[3] == NQ_loc, "dGp_sRPQ.local_shape[3] != NQ_loc");
     _Timer.stop("PI_ALLOC_R");
