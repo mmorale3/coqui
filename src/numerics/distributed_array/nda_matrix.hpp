@@ -24,7 +24,9 @@
 
 #include <utility>
 #include <tuple>
-#include "utilities/check.hpp" 
+#include "utilities/check.hpp"
+#include "utilities/freemem.h"
+#include "IO/app_loggers.h"
 #include "nda/nda.hpp"
 #include "nda/tensor.hpp"
 #include "nda/mem/address_space.hpp"
@@ -254,21 +256,36 @@ class distributed_array
 		    std::array<long,rank> local_size,
 		    std::array<long,rank> origin_,
                     std::array<long,rank> bsize):
-    base(comm_,grid_,gshape,origin_,bsize,local_size),
-    A(local_size)
+    base(comm_,grid_,gshape,origin_,bsize,local_size)
   {
-    // initialize to zero just in case.
-    //
-    // Lazy nda assignment (`A() = 0`) on a DEVICE-backed array builds
-    // an expression template whose evaluator allocates scratch buffers
-    // and triggers a ~3x blow-up of the device allocation footprint at
-    // large local shapes (observed on A100, 22 GB nominal -> 66 GB on
-    // device for dPi_tqPQ at Naux=4482 in eval_Pi_rpa_Rspace). Use the
-    // device-safe tensor::set value-assign instead.
+    // Diagnostic logging on device for large local allocations only.
+    long bytes = sizeof(value_type);
+    for (int i = 0; i < rank; ++i) bytes *= local_size[i];
+    [[maybe_unused]] bool big = bytes > (1L<<30);
+    if constexpr (!::nda::mem::on_host<Array_t>) {
+      if (big) {
+        std::string ls_str = "(";
+        for (int i = 0; i < rank; ++i) {
+          ls_str += std::to_string(local_size[i]);
+          if (i + 1 < rank) ls_str += ",";
+        }
+        ls_str += ")";
+        app_log(2, "  distributed_array<DEVICE>: local_size={} nominal_bytes={}",
+                ls_str, bytes);
+        utils::memory_report(2, "distributed_array<DEVICE>: before resize");
+      }
+    }
+    A.resize(local_size);
+    if constexpr (!::nda::mem::on_host<Array_t>) {
+      if (big) utils::memory_report(2, "distributed_array<DEVICE>: after resize");
+    }
+    // initialize to zero just in case. Lazy `A() = 0` is host-only;
+    // use tensor::set on device.
     if constexpr (::nda::mem::on_host<Array_t>) {
       A() = 0;
     } else {
       ::nda::tensor::set(value_type(0), A);
+      if (big) utils::memory_report(2, "distributed_array<DEVICE>: after zero-init");
     }
     // enforcing slate compatibility for now
   }
