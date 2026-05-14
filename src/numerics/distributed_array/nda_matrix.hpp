@@ -26,6 +26,7 @@
 #include <tuple>
 #include "utilities/check.hpp" 
 #include "nda/nda.hpp"
+#include "nda/tensor.hpp"
 #include "nda/mem/address_space.hpp"
 #include "numerics/distributed_array/detail/concepts.hpp"
 
@@ -256,8 +257,19 @@ class distributed_array
     base(comm_,grid_,gshape,origin_,bsize,local_size),
     A(local_size)
   {
-    // initialize to zero just in case
-    A() = 0;
+    // initialize to zero just in case.
+    //
+    // Lazy nda assignment (`A() = 0`) on a DEVICE-backed array builds
+    // an expression template whose evaluator allocates scratch buffers
+    // and triggers a ~3x blow-up of the device allocation footprint at
+    // large local shapes (observed on A100, 22 GB nominal -> 66 GB on
+    // device for dPi_tqPQ at Naux=4482 in eval_Pi_rpa_Rspace). Use the
+    // device-safe tensor::set value-assign instead.
+    if constexpr (::nda::mem::on_host<Array_t>) {
+      A() = 0;
+    } else {
+      ::nda::tensor::set(value_type(0), A);
+    }
     // enforcing slate compatibility for now
   }
 
