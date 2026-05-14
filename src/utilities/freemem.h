@@ -33,6 +33,12 @@ std::size_t freemem();
 std::size_t freemem_device();
 void memory_report(int io_lvl = 3, std::string message = {});
 
+// (TEMP) Synchronize the active CUDA/HIP device. Used to make GPU
+// kernel timings accurate (TimerManager.stop measures wall time only,
+// so without a sync we record kernel-launch latency rather than
+// execution time). No-op for CPU builds.
+void device_sync();
+
 }
 
 #endif

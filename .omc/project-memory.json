@@ -1,0 +1,300 @@
+{
+  "version": "1.0.0",
+  "lastScanned": 1778699903420,
+  "projectRoot": "/Users/mmorales/Software/CoQui_GPU",
+  "techStack": {
+    "languages": [
+      {
+        "name": "C/C++",
+        "version": null,
+        "confidence": "high",
+        "markers": [
+          "CMakeLists.txt"
+        ]
+      }
+    ],
+    "frameworks": [],
+    "packageManager": null,
+    "runtime": null
+  },
+  "build": {
+    "buildCommand": null,
+    "testCommand": null,
+    "lintCommand": null,
+    "devCommand": null,
+    "scripts": {}
+  },
+  "conventions": {
+    "namingStyle": null,
+    "importStyle": null,
+    "testPattern": null,
+    "fileOrganization": null
+  },
+  "structure": {
+    "isMonorepo": false,
+    "workspaces": [],
+    "mainDirectories": [
+      "examples",
+      "src",
+      "tests"
+    ],
+    "gitBranches": {
+      "defaultBranch": "main",
+      "branchingStrategy": null
+    }
+  },
+  "customNotes": [],
+  "directoryMap": {
+    "cmake": {
+      "path": "cmake",
+      "purpose": null,
+      "fileCount": 2,
+      "lastAccessed": 1778699903409,
+      "keyFiles": [
+        "FindFFTW.cmake",
+        "unit_test.cmake"
+      ]
+    },
+    "examples": {
+      "path": "examples",
+      "purpose": "Example code",
+      "fileCount": 1,
+      "lastAccessed": 1778699903409,
+      "keyFiles": [
+        "README.md"
+      ]
+    },
+    "extern": {
+      "path": "extern",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1778699903410,
+      "keyFiles": []
+    },
+    "qe_converter": {
+      "path": "qe_converter",
+      "purpose": null,
+      "fileCount": 2,
+      "lastAccessed": 1778699903410,
+      "keyFiles": [
+        "README.md",
+        "pw2coqui.f90"
+      ]
+    },
+    "src": {
+      "path": "src",
+      "purpose": "Source code",
+      "fileCount": 5,
+      "lastAccessed": 1778699903410,
+      "keyFiles": [
+        "CMakeLists.txt",
+        "COQUI.settings",
+        "config.h.cmake.in",
+        "configuration.hpp",
+        "coqui_env.sh.in"
+      ]
+    },
+    "tests": {
+      "path": "tests",
+      "purpose": "Test files",
+      "fileCount": 0,
+      "lastAccessed": 1778699903410,
+      "keyFiles": []
+    }
+  },
+  "hotPaths": [
+    {
+      "path": "src/methods/scr_coulomb/scr_coulomb_t.cpp",
+      "accessCount": 18,
+      "lastAccessed": 1778793737211,
+      "type": "file"
+    },
+    {
+      "path": "src/methods/MBPT_drivers.cpp",
+      "accessCount": 17,
+      "lastAccessed": 1778697998480,
+      "type": "file"
+    },
+    {
+      "path": "src/methods/GW/tests/bench_imag_axis_gpu.cpp",
+      "accessCount": 15,
+      "lastAccessed": 1778624674680,
+      "type": "file"
+    },
+    {
+      "path": "src/numerics/imag_axes_ft/IAFT.icc",
+      "accessCount": 12,
+      "lastAccessed": 1778555058798,
+      "type": "file"
+    },
+    {
+      "path": "src/methods/HF/thc_solver_comm.hpp",
+      "accessCount": 9,
+      "lastAccessed": 1778793638667,
+      "type": "file"
+    },
+    {
+      "path": "src/methods/SCF/scf_driver.cpp",
+      "accessCount": 7,
+      "lastAccessed": 1778696677195,
+      "type": "file"
+    },
+    {
+      "path": "src/main/main.cpp",
+      "accessCount": 6,
+      "lastAccessed": 1778789794623,
+      "type": "file"
+    },
+    {
+      "path": "src/numerics/device_kernels/cuda/argmax_min.cu",
+      "accessCount": 5,
+      "lastAccessed": 1778551288661,
+      "type": "file"
+    },
+    {
+      "path": "src/methods/GW/thc_gw.cpp",
+      "accessCount": 5,
+      "lastAccessed": 1778626647914,
+      "type": "file"
+    },
+    {
+      "path": "src/methods/GW/cholesky_gw.cpp",
+      "accessCount": 5,
+      "lastAccessed": 1778697263351,
+      "type": "file"
+    },
+    {
+      "path": "src/methods/scr_coulomb/rpa_pi.icc",
+      "accessCount": 5,
+      "lastAccessed": 1778780496795,
+      "type": "file"
+    },
+    {
+      "path": "src/utilities/test_common.hpp",
+      "accessCount": 4,
+      "lastAccessed": 1778551974407,
+      "type": "file"
+    },
+    {
+      "path": "src/methods/GW/tests/test_thc_gw.cpp",
+      "accessCount": 3,
+      "lastAccessed": 1778557509513,
+      "type": "file"
+    },
+    {
+      "path": "src/methods/GW/g0_div_utils.hpp",
+      "accessCount": 3,
+      "lastAccessed": 1778626529953,
+      "type": "file"
+    },
+    {
+      "path": "src/methods/scr_coulomb/scr_coulomb_chol.cpp",
+      "accessCount": 3,
+      "lastAccessed": 1778697265602,
+      "type": "file"
+    },
+    {
+      "path": "src/utilities/Timer.hpp",
+      "accessCount": 3,
+      "lastAccessed": 1778793547709,
+      "type": "file"
+    },
+    {
+      "path": "src/methods/mb_state/mb_state.hpp",
+      "accessCount": 2,
+      "lastAccessed": 1778626584720,
+      "type": "file"
+    },
+    {
+      "path": "src/hamiltonian/pseudo/pseudopot.cpp",
+      "accessCount": 2,
+      "lastAccessed": 1778690392996,
+      "type": "file"
+    },
+    {
+      "path": "src/methods/SCF/scf_driver.hpp",
+      "accessCount": 2,
+      "lastAccessed": 1778694832493,
+      "type": "file"
+    },
+    {
+      "path": "src/methods/MBPT_drivers.h",
+      "accessCount": 2,
+      "lastAccessed": 1778694971885,
+      "type": "file"
+    },
+    {
+      "path": "src/methods/scr_coulomb/scr_coulomb_t.h",
+      "accessCount": 2,
+      "lastAccessed": 1778695331969,
+      "type": "file"
+    },
+    {
+      "path": "src/methods/GW/gw_t.h",
+      "accessCount": 2,
+      "lastAccessed": 1778695599695,
+      "type": "file"
+    },
+    {
+      "path": "src/utilities/freemem.h",
+      "accessCount": 2,
+      "lastAccessed": 1778793558122,
+      "type": "file"
+    },
+    {
+      "path": "src/utilities/freemem.cpp",
+      "accessCount": 2,
+      "lastAccessed": 1778793563586,
+      "type": "file"
+    },
+    {
+      "path": "src/arch/CUDA/cuda_sync.cpp",
+      "accessCount": 1,
+      "lastAccessed": 1778587755810,
+      "type": "file"
+    },
+    {
+      "path": "src/methods/GW/tests/CMakeLists.txt",
+      "accessCount": 1,
+      "lastAccessed": 1778587821353,
+      "type": "file"
+    },
+    {
+      "path": "src/arch/arch.cpp",
+      "accessCount": 1,
+      "lastAccessed": 1778587830150,
+      "type": "file"
+    },
+    {
+      "path": "src/methods/ERI/thc_reader_t.hpp",
+      "accessCount": 1,
+      "lastAccessed": 1778626480459,
+      "type": "file"
+    },
+    {
+      "path": "src/methods/SCF/mb_solver_t.h",
+      "accessCount": 1,
+      "lastAccessed": 1778694913022,
+      "type": "file"
+    },
+    {
+      "path": "src/methods/scr_coulomb/edmft_pi.icc",
+      "accessCount": 1,
+      "lastAccessed": 1778783240676,
+      "type": "file"
+    },
+    {
+      "path": "src/arch/CUDA/cuda_init.cpp",
+      "accessCount": 1,
+      "lastAccessed": 1778786709018,
+      "type": "file"
+    },
+    {
+      "path": "src/utilities/catch_main.cpp",
+      "accessCount": 1,
+      "lastAccessed": 1778789768318,
+      "type": "file"
+    }
+  ],
+  "userDirectives": []
+}

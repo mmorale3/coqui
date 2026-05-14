@@ -20,6 +20,7 @@
 
 
 #include <unordered_set>
+#include "utilities/freemem.h"
 #include "methods/ERI/thc_reader_t.hpp"
 #include "methods/HF/thc_solver_comm.hpp"
 #include "methods/GW/g0_div_utils.hpp"
@@ -93,19 +94,31 @@ namespace solvers {
         }
       }
     }
+    // (TEMP) per-phase GPU timers for update_w. Strip together with
+    // the other TEMP_* timers once the perf hot-spots are identified.
+    _Timer.start("TEMP_UW_TOTAL");
+    _Timer.start("TEMP_UW_eval_Pi_qdep");
     auto dPi_tqPQ = eval_Pi_qdep<MEM>(mb_state, thc);
+    utils::device_sync();
+    _Timer.stop("TEMP_UW_eval_Pi_qdep");
 
     // evaluate screened interaction (dW_tqPQ) and reset polarizability (dPi_tqPQ)
     // a) dPi_tqPQ is reset during dyson_W_from_Pi_tau()
     // b) pgrid and bsize of dW_tqPQ are forced to be the same as in dPi_tqPQ
+    _Timer.start("TEMP_UW_dyson_W_from_Pi");
     auto dW_tqPQ = dyson_W_from_Pi_tau<false>(dPi_tqPQ, thc, true);
+    utils::device_sync();
+    _Timer.stop("TEMP_UW_dyson_W_from_Pi");
 
     // div_utils::eval_eps_inv_q (called inside eps_inv_head_t) is now
     // MEM-aware; it runs the per-(ix,iq) gemv/dot on whatever MEM the
     // dW darray lives in. No full host copy of dW needed.
+    _Timer.start("TEMP_UW_eps_inv_head");
     auto [eps_inv_head_q, eps_inv_head] =
         div_utils::eps_inv_head_t(dW_tqPQ, thc, *thc.MF(), _ft, _div_treatment);
     mb_state.eps_inv_head = eps_inv_head;
+    utils::device_sync();
+    _Timer.stop("TEMP_UW_eps_inv_head");
 
     // Stage W into MBState. The on-device pipeline keeps a device-typed
     // dW_qtPQ_dev so gw_t::evaluate<DEVICE> can read it without a
@@ -122,10 +135,14 @@ namespace solvers {
     long nt_loc = dW_tqPQ.local_shape()[0];
     long nq_loc = dW_tqPQ.local_shape()[1];
 
+    _Timer.start("TEMP_UW_dW_qtPQ_alloc");
     mb_state.dW_qtPQ.emplace(make_distributed_array<nda::array<ComplexType, 4>> (
                              thc.mpi()->comm, q_pgrid, q_gshape, q_bsize));
     auto W_qtPQ_h = mb_state.dW_qtPQ.value().local();
+    utils::device_sync();
+    _Timer.stop("TEMP_UW_dW_qtPQ_alloc");
 
+    _Timer.start("TEMP_UW_dW_transpose_and_mirror");
     if constexpr (MEM == HOST_MEMORY) {
       auto W_tqPQ = dW_tqPQ.local();
       for (size_t qt = 0; qt < nq_loc * nt_loc; ++qt) {
@@ -141,29 +158,72 @@ namespace solvers {
       //  (2) mirror to the host darray as a single bulk copy (one device->host
       //      transfer per SCF iter — what host-side consumers still need).
       using dev_local_t = memory::array<DEVICE_MEMORY, ComplexType, 4>;
+      _Timer.start("TEMP_UW_dW_qtPQ_dev_alloc");
       mb_state.dW_qtPQ_dev.emplace(make_distributed_array<dev_local_t>(
                                    thc.mpi()->comm, q_pgrid, q_gshape, q_bsize));
+      utils::device_sync();
+      _Timer.stop("TEMP_UW_dW_qtPQ_dev_alloc");
       auto W_qtPQ_d = mb_state.dW_qtPQ_dev.value().local();
       auto W_tqPQ_d = dW_tqPQ.local();
       // On-device (t,q) -> (q,t) transpose, P,Q axes preserved.
+      _Timer.start("TEMP_UW_dW_dev_transpose");
       for (size_t qt = 0; qt < nq_loc * nt_loc; ++qt) {
         size_t iq = qt / nt_loc;
         size_t it = qt % nt_loc;
         W_qtPQ_d(iq, it, nda::ellipsis{}) = W_tqPQ_d(it, iq, nda::ellipsis{});
       }
+      utils::device_sync();
+      _Timer.stop("TEMP_UW_dW_dev_transpose");
       // Single bulk device->host mirror for the host darray.
+      _Timer.start("TEMP_UW_dW_d2h_mirror");
       W_qtPQ_h = nda::to_host(W_qtPQ_d);
+      utils::device_sync();
+      _Timer.stop("TEMP_UW_dW_d2h_mirror");
     }
 #endif
     dW_tqPQ.reset();
+    utils::device_sync();
+    _Timer.stop("TEMP_UW_dW_transpose_and_mirror");
 
     mb_state.screen_type = _screen_type;
 
+    _Timer.start("TEMP_UW_dump_eps_inv_head");
     if (h5_iter>=0) {
       dump_eps_inv_head(eps_inv_head_q, eps_inv_head,
                         mb_state.coqui_prefix, h5_iter,
                         thc.mpi()->comm, *thc.MF());
     }
+    _Timer.stop("TEMP_UW_dump_eps_inv_head");
+    utils::device_sync();
+    _Timer.stop("TEMP_UW_TOTAL");
+
+    // (TEMP) Phase-by-phase update_w timers. Accumulated across SCF
+    // iterations; divide by iter count or use number_of_calls() to
+    // get per-iter values. Strip when perf hot-spots are nailed.
+    app_log(2, "\n  (TEMP) update_w<{}> phase timers (accumulated):",
+            (MEM == HOST_MEMORY) ? "HOST" : "DEVICE");
+    app_log(2, "    Total:                            {0:.3f} sec  ({1} calls)",
+            _Timer.elapsed("TEMP_UW_TOTAL"), _Timer.number_of_calls("TEMP_UW_TOTAL"));
+    app_log(2, "      eval_Pi_qdep:                   {0:.3f} sec",
+            _Timer.elapsed("TEMP_UW_eval_Pi_qdep"));
+    app_log(2, "      dyson_W_from_Pi_tau:            {0:.3f} sec",
+            _Timer.elapsed("TEMP_UW_dyson_W_from_Pi"));
+    app_log(2, "      eps_inv_head_t:                 {0:.3f} sec",
+            _Timer.elapsed("TEMP_UW_eps_inv_head"));
+    app_log(2, "      dW_qtPQ_alloc:                  {0:.3f} sec",
+            _Timer.elapsed("TEMP_UW_dW_qtPQ_alloc"));
+    app_log(2, "      dW_transpose_and_mirror:        {0:.3f} sec",
+            _Timer.elapsed("TEMP_UW_dW_transpose_and_mirror"));
+    if (_Timer.elapsed("TEMP_UW_dW_qtPQ_dev_alloc") > 0.0) {
+      app_log(2, "        - dW_qtPQ_dev alloc:          {0:.3f} sec",
+              _Timer.elapsed("TEMP_UW_dW_qtPQ_dev_alloc"));
+      app_log(2, "        - on-device (t,q)->(q,t):     {0:.3f} sec",
+              _Timer.elapsed("TEMP_UW_dW_dev_transpose"));
+      app_log(2, "        - bulk D->H mirror:           {0:.3f} sec",
+              _Timer.elapsed("TEMP_UW_dW_d2h_mirror"));
+    }
+    app_log(2, "      dump_eps_inv_head:              {0:.3f} sec\n",
+            _Timer.elapsed("TEMP_UW_dump_eps_inv_head"));
   }
 
   template<bool w_out, nda::MemoryArrayOfRank<4> local_Array_t, typename communicator_t>

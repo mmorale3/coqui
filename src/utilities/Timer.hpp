@@ -131,6 +131,15 @@ public:
     id2pos.clear();
   }
 
+  // (TEMP) iterate over registered timer names; used by TEMP_* timer
+  // dumps. Returns a copy because id2pos is private.
+  std::vector<std::string> timer_names() const {
+    std::vector<std::string> names;
+    names.reserve(id2pos.size());
+    for (auto const& kv : id2pos) names.push_back(kv.first);
+    return names;
+  }
+
   // returns the integer associated with a timer id. If the timer does not exist, it will be added. 
   int add(const std::string& str) { return getOrAdd(str); }
 
