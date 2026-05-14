@@ -1,7 +1,0 @@
-{
-  "tool_name": "Bash",
-  "tool_input_preview": "{\"command\":\"ssh rusty \\\"cd ~/ceph/CoQui/GPU_PORT/src && git pull --ff-only origin gpu && cd build/gpu && sbatch build.sbatch && squeue -u mmorales\\\"\",\"description\":\"Pull + rebuild on Rusty\"}",
-  "error": "Exit code 255\nPermission denied, please try again.\r\nPermission denied, please try again.\r\nmmorales@rusty.flatironinstitute.org: Permission denied (publickey,password).",
-  "timestamp": "2026-05-14T17:41:53.932Z",
-  "retry_count": 1
-}
