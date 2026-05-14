@@ -32,6 +32,7 @@
 #include "mpi3/environment.hpp"
 #include "mpi3/communicator.hpp"
 #include "utilities/mpi_context.h"
+#include "arch/arch.h"
 
 #include "mean_field/MF.hpp"
 #include "mean_field/mf_utils.hpp"
@@ -128,6 +129,11 @@ int main(int argc, char** argv)
 
   // setup output loggers
   setup_loggers(world.root(), output_level, debug_level);
+
+  // Bind each MPI rank to its own GPU (calls cudaSetDevice based on
+  // node-local rank). Without this, all ranks on a node default to
+  // device 0, accumulating their allocations on a single GPU.
+  arch::init(world.root(), output_level, debug_level);
 
   std::string welcome(
       std::string("\n ---------------------------------\n") +
