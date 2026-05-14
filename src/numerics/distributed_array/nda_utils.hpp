@@ -835,40 +835,73 @@ void redistribute_alltoallv(Arr1_t& A, Arr2_t& B, get_value_t<Arr1_t> a = 1, get
   utils::check(sz_buf_A == Aloc.size(), "A Size mismatch.");
   utils::check(sz_buf_B == Bloc.size(), "B Size mismatch.");
 
-  std::vector<value_t> buffer_A(sz_buf_A);
-  std::vector<value_t> buffer_B(sz_buf_B);
-
-  // Address spaces of the local arrays. When DEVICE, sub-block staging
-  // into / out of the host MPI buffers must use cudaMemcpy rather than
-  // a host-side std::copy_n (which would dereference device pointers
-  // on the CPU and segfault).
   constexpr auto A_addr = ::nda::mem::get_addr_space<local_Arr1_t>;
   constexpr auto B_addr = ::nda::mem::get_addr_space<local_Arr2_t>;
 
-  // copy inversections of A with all ranges into a buffer
-  size_t count_sz_check = 0;
-  for( auto p : itertools::range(mpi_size) ) {
-    if(ovlps_from_A[p]) {
-      auto A_ = make_regular(detail::get_sub_matrix<rank>(Aloc,subblocks_from_A[p]));
-      ::nda::mem::memcpy<::nda::mem::Host, A_addr>(
-          buffer_A.data() + A_disp[p], A_.data(),
-          A_.size() * sizeof(value_t));
-      count_sz_check += A_.size();
+  if constexpr (::nda::mem::have_host_compatible_addr_space<local_Arr1_t, local_Arr2_t>) {
+    // ── HOST path ──────────────────────────────────────────────────
+    std::vector<value_t> buffer_A(sz_buf_A);
+    std::vector<value_t> buffer_B(sz_buf_B);
+
+    size_t count_sz_check = 0;
+    for( auto p : itertools::range(mpi_size) ) {
+      if(ovlps_from_A[p]) {
+        auto A_ = make_regular(detail::get_sub_matrix<rank>(Aloc,subblocks_from_A[p]));
+        std::copy_n(A_.data(), A_.size(), buffer_A.data() + A_disp[p]);
+        count_sz_check += A_.size();
+      }
     }
-  }
-  utils::check(count_sz_check == Aloc.size(), "A Size mismatch.");
+    utils::check(count_sz_check == Aloc.size(), "A Size mismatch.");
 
-  comm->all_to_all_v_n(buffer_A.data(), A_counts.data(), A_disp.data(),
-                       buffer_B.data(), B_counts.data(), B_disp.data());
+    comm->all_to_all_v_n(buffer_A.data(), A_counts.data(), A_disp.data(),
+                         buffer_B.data(), B_counts.data(), B_disp.data());
 
+    for( auto p : itertools::range(mpi_size) ) {
+      if(ovlps_from_B[p]) {
+        auto B_ = make_regular(detail::get_sub_matrix<rank>(Bloc,subblocks_from_B[p]));
+        std::copy_n(buffer_B.data()+B_disp[p], B_.size(), B_.data());
+        detail::get_sub_matrix<rank>(Bloc,subblocks_from_B[p]) = B_;
+      }
+    }
+  } else {
+    // ── DEVICE path: avoid the ~2x bulk D<->H staging by keeping the
+    // ── MPI staging buffers on device and using CUDA-aware MPI for
+    // ── the alltoallv. Requires OMPI/UCX built with --with-cuda;
+    // ── Rusty's openmpi/cuda-4.1.8 module satisfies this. ──────────
+    static_assert(::nda::mem::have_device_compatible_addr_space<local_Arr1_t, local_Arr2_t>,
+                  "redistribute_alltoallv: unexpected mixed address spaces");
+    using buf_A_t = ::nda::basic_array<value_t, 1, ::nda::C_layout, 'A',
+        ::nda::heap_basic<::nda::mem::mallocator<A_addr>>>;
+    using buf_B_t = ::nda::basic_array<value_t, 1, ::nda::C_layout, 'A',
+        ::nda::heap_basic<::nda::mem::mallocator<B_addr>>>;
+    buf_A_t buffer_A_d(long(sz_buf_A));
+    buf_B_t buffer_B_d(long(sz_buf_B));
 
-  for( auto p : itertools::range(mpi_size) ) {
-    if(ovlps_from_B[p]) {
-      auto B_ = make_regular(detail::get_sub_matrix<rank>(Bloc,subblocks_from_B[p]));
-      ::nda::mem::memcpy<B_addr, ::nda::mem::Host>(
-          B_.data(), buffer_B.data() + B_disp[p],
-          B_.size() * sizeof(value_t));
-      detail::get_sub_matrix<rank>(Bloc,subblocks_from_B[p]) = B_;
+    size_t count_sz_check = 0;
+    for( auto p : itertools::range(mpi_size) ) {
+      if(ovlps_from_A[p]) {
+        // make_regular gives a contiguous device buffer of the subblock
+        auto A_ = make_regular(detail::get_sub_matrix<rank>(Aloc,subblocks_from_A[p]));
+        ::nda::mem::memcpy<A_addr, A_addr>(
+            buffer_A_d.data() + A_disp[p], A_.data(),
+            A_.size() * sizeof(value_t));
+        count_sz_check += A_.size();
+      }
+    }
+    utils::check(count_sz_check == Aloc.size(), "A Size mismatch.");
+
+    // CUDA-aware MPI: device pointers passed directly to MPI_Alltoallv
+    comm->all_to_all_v_n(buffer_A_d.data(), A_counts.data(), A_disp.data(),
+                         buffer_B_d.data(), B_counts.data(), B_disp.data());
+
+    for( auto p : itertools::range(mpi_size) ) {
+      if(ovlps_from_B[p]) {
+        auto B_ = make_regular(detail::get_sub_matrix<rank>(Bloc,subblocks_from_B[p]));
+        ::nda::mem::memcpy<B_addr, B_addr>(
+            B_.data(), buffer_B_d.data() + B_disp[p],
+            B_.size() * sizeof(value_t));
+        detail::get_sub_matrix<rank>(Bloc,subblocks_from_B[p]) = B_;
+      }
     }
   }
 }
