@@ -22,6 +22,8 @@
 #ifndef AIMBES_UTILITIES_FREEMEM_H
 #define AIMBES_UTILITIES_FREEMEM_H
 
+#include <cstddef>
+#include <string>
 #ifdef __linux__
 #include <sys/sysinfo.h>
 #include <sys/resource.h>
