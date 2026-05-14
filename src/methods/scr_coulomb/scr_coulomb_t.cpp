@@ -208,6 +208,37 @@ namespace solvers {
             _Timer.elapsed("TEMP_UW_eval_Pi_qdep"));
     app_log(2, "      dyson_W_from_Pi_tau:            {0:.3f} sec",
             _Timer.elapsed("TEMP_UW_dyson_W_from_Pi"));
+    if (_Timer.elapsed("TEMP_DWFP_tau_to_w") > 0.0) {
+      app_log(2, "        - tau_to_w:                   {0:.3f} sec",
+              _Timer.elapsed("TEMP_DWFP_tau_to_w"));
+      app_log(2, "        - dyson_W_in_place:           {0:.3f} sec",
+              _Timer.elapsed("TEMP_DWFP_dyson_W_in_place"));
+      app_log(2, "        - w_to_tau:                   {0:.3f} sec",
+              _Timer.elapsed("TEMP_DWFP_w_to_tau"));
+      if (_Timer.elapsed("TEMP_DWiP_inverse") > 0.0) {
+        app_log(2, "          dyson_W_in_place inner (accumulated):");
+        app_log(2, "            alloc dPi/dZ/dA:        {0:.3f} sec",
+                _Timer.elapsed("TEMP_DWiP_alloc"));
+        app_log(2, "            Z load (per-q):         {0:.3f} sec  ({1} calls)",
+                _Timer.elapsed("TEMP_DWiP_Z_load"),
+                _Timer.number_of_calls("TEMP_DWiP_Z_load"));
+        app_log(2, "            Pi load (per-w):        {0:.3f} sec  ({1} calls)",
+                _Timer.elapsed("TEMP_DWiP_Pi_load"),
+                _Timer.number_of_calls("TEMP_DWiP_Pi_load"));
+        app_log(2, "            gemm Z*Pi -> A:         {0:.3f} sec",
+                _Timer.elapsed("TEMP_DWiP_gemm_ZPi"));
+        app_log(2, "            A = I - A:              {0:.3f} sec",
+                _Timer.elapsed("TEMP_DWiP_diag_I_minus_A"));
+        app_log(2, "            inverse(A) [SLATE LU]:  {0:.3f} sec",
+                _Timer.elapsed("TEMP_DWiP_inverse"));
+        app_log(2, "            A = A - I:              {0:.3f} sec",
+                _Timer.elapsed("TEMP_DWiP_diag_A_minus_I"));
+        app_log(2, "            gemm A*Z -> W:          {0:.3f} sec",
+                _Timer.elapsed("TEMP_DWiP_gemm_AZ"));
+        app_log(2, "            writeback to Pi_wqPQ:   {0:.3f} sec",
+                _Timer.elapsed("TEMP_DWiP_writeback"));
+      }
+    }
     app_log(2, "      eps_inv_head_t:                 {0:.3f} sec",
             _Timer.elapsed("TEMP_UW_eps_inv_head"));
     app_log(2, "      dW_qtPQ_alloc:                  {0:.3f} sec",
@@ -240,12 +271,28 @@ namespace solvers {
 
     auto t_pgrid = dPi_tqPQ_pos.grid();
     auto t_bsize = dPi_tqPQ_pos.block_size();
+
+    // (TEMP) split dyson_W_from_Pi_tau into its three phases. This is
+    // currently the dominant cost of update_w (~80% per the TEMP_UW_*
+    // breakdown). Strip when perf hot-spots are localized.
+    _Timer.start("TEMP_DWFP_tau_to_w");
     auto dPi_wqPQ = tau_to_w(dPi_tqPQ_pos, w_pgrid, w_bsize, reset_input);
+    utils::device_sync();
+    _Timer.stop("TEMP_DWFP_tau_to_w");
+
+    _Timer.start("TEMP_DWFP_dyson_W_in_place");
     dyson_W_in_place(dPi_wqPQ, thc);
+    utils::device_sync();
+    _Timer.stop("TEMP_DWFP_dyson_W_in_place");
+
     if constexpr (w_out) {
       return dPi_wqPQ;
     } else {
-      return w_to_tau(dPi_wqPQ, t_pgrid, t_bsize, true);
+      _Timer.start("TEMP_DWFP_w_to_tau");
+      auto dPi_tqPQ = w_to_tau(dPi_wqPQ, t_pgrid, t_bsize, true);
+      utils::device_sync();
+      _Timer.stop("TEMP_DWFP_w_to_tau");
+      return dPi_tqPQ;
     }
   }
 
@@ -284,9 +331,13 @@ namespace solvers {
         ::nda::mem::on_host<Array_4D_t> ? HOST_MEMORY : DEVICE_MEMORY;
     using Array_2D_t = memory::array<MEM, ComplexType, 2>;
     using math::nda::make_distributed_array;
+    // (TEMP) inner-loop perf breakdown of dyson_W_in_place
+    _Timer.start("TEMP_DWiP_alloc");
     auto dPi_PQ = make_distributed_array<Array_2D_t>(wq_intra_comm, {pgrid[2], pgrid[3]}, {NP, NQ}, {block_size[2], block_size[3]}, true);
     auto dZ_PQ  = make_distributed_array<Array_2D_t>(wq_intra_comm, {pgrid[2], pgrid[3]}, {NP, NQ}, {block_size[2], block_size[3]}, true);
     auto dA_PQ  = make_distributed_array<Array_2D_t>(wq_intra_comm, {pgrid[2], pgrid[3]}, {NP, NQ}, {block_size[2], block_size[3]}, true);
+    utils::device_sync();
+    _Timer.stop("TEMP_DWiP_alloc");
     utils::check(dPi_PQ.local_range(0) == P_rng, "Error: local range mismatches!" );
     utils::check(dPi_PQ.local_range(1) == Q_rng, "Error: local range mismatches!");
     utils::check(dPi_PQ.local_shape()[0] == NP_loc and dPi_PQ.local_shape()[1] == NQ_loc, "Error: local shape mismatched!");
@@ -317,15 +368,25 @@ namespace solvers {
     auto A_PQ = dA_PQ.local();
     for (size_t iq_loc = 0; iq_loc < nq_loc; ++iq_loc) {
       long iq = q_origin + iq_loc;
+      _Timer.start("TEMP_DWiP_Z_load");
       Z_PQ = thc.template Z<MEM>(iq, P_rng, Q_rng, qpool_id, pgrid[1], q_intra_comm);
+      utils::device_sync();
+      _Timer.stop("TEMP_DWiP_Z_load");
 
       // W(w) = [ I - Z * Pi(w)]^{-1} * Z - Z
       for (size_t n = 0; n < nw_loc; ++n) {
+        _Timer.start("TEMP_DWiP_Pi_load");
         Pi_PQ = Pi_wqPQ(n, iq_loc, nda::ellipsis{});
+        utils::device_sync();
+        _Timer.stop("TEMP_DWiP_Pi_load");
 
         // A = Z * Pi(w)
+        _Timer.start("TEMP_DWiP_gemm_ZPi");
         math::nda::slate_ops::multiply(dZ_PQ, dPi_PQ, dA_PQ);
+        utils::device_sync();
+        _Timer.stop("TEMP_DWiP_gemm_ZPi");
         // A = I - Z * Pi(w) (i.e. A := -A; A_diag += 1)
+        _Timer.start("TEMP_DWiP_diag_I_minus_A");
         if constexpr (MEM == HOST_MEMORY) {
           for (auto idx: diag_idx) {
             A_PQ(idx.first, idx.second) -= ComplexType(1.0);
@@ -337,11 +398,17 @@ namespace solvers {
                                    ComplexType(1.0), A_PQ,     "PQ",
                                    nda::tensor::op::SUM);
         }
+        utils::device_sync();
+        _Timer.stop("TEMP_DWiP_diag_I_minus_A");
 
         // A = [I - Z*Pi(w)]^{-1}
+        _Timer.start("TEMP_DWiP_inverse");
         math::nda::slate_ops::inverse(dA_PQ);
+        utils::device_sync();
+        _Timer.stop("TEMP_DWiP_inverse");
 
         // A = [I - Z*Pi(w)]^{-1} - I (diag -= 1)
+        _Timer.start("TEMP_DWiP_diag_A_minus_I");
         if constexpr (MEM == HOST_MEMORY) {
           for (auto idx: diag_idx) {
             A_PQ(idx.first, idx.second) -= ComplexType(1.0);
@@ -351,10 +418,18 @@ namespace solvers {
                                    ComplexType(1.0), A_PQ,     "PQ",
                                    nda::tensor::op::SUM);
         }
+        utils::device_sync();
+        _Timer.stop("TEMP_DWiP_diag_A_minus_I");
 
         // W = ([I - Z*Pi(w)]^{-1} - I) * Z
+        _Timer.start("TEMP_DWiP_gemm_AZ");
         math::nda::slate_ops::multiply(dA_PQ, dZ_PQ, dPi_PQ);
+        utils::device_sync();
+        _Timer.stop("TEMP_DWiP_gemm_AZ");
+        _Timer.start("TEMP_DWiP_writeback");
         Pi_wqPQ(n, iq_loc, nda::ellipsis{}) = Pi_PQ;
+        utils::device_sync();
+        _Timer.stop("TEMP_DWiP_writeback");
       }
     }
     // prevent dead block in thc.Z() in case nq_loc is not the same for all processors

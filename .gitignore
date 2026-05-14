@@ -33,3 +33,7 @@
 # IDE files
 .idea/
 *build*/
+
+# OMC plugin scratch state
+.omc/
+.claude/
