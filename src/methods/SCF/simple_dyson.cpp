@@ -153,8 +153,6 @@ namespace methods {
                  "simple_dyson::compute_eigenspectra: Incorrect dimension for spectra.");
     using math::shm::make_shared_array;
     spectra() = 0.0;
-    // TODO shared memory or distributed array!!!
-    nda::array<ComplexType, 4> Sigmaw_skij(_ns, _nkpts_ibz, _nbnd, _nbnd);
     nda::matrix<ComplexType> FpSigma(_nbnd, _nbnd);
     auto sS_inv = make_shared_array<Array_view_4D_t>(*_context, {_ns, _nkpts_ibz, _nbnd, _nbnd});
     nda::matrix<ComplexType> SFS(_nbnd, _nbnd);
@@ -174,13 +172,19 @@ namespace methods {
     }
     sS_inv.win().fence();
 
+    // Batched tau_to_w: one big gemm computes Sigma(w) for ALL w at
+    // once, instead of calling the single-w-slice variant 138 times
+    // (which re-walks the 8.8 GB Sigma host tensor each call).
+    // Memory cost: ~ nw * ns * nkpts * nbnd^2 * 16 bytes on host
+    // (4.4 GB at the n=500 Si scale; well within node RAM).
+    nda::array<ComplexType, 5> Sigmaw_wskij(_nw, _ns, _nkpts_ibz, _nbnd, _nbnd);
+    _FT->tau_to_w(_Sigma_shm.local(), Sigmaw_wskij, imag_axes_ft::fermi);
+
     for (size_t n = _context->comm.rank(); n < _nw; n+=_context->comm.size()) {
-      _FT->tau_to_w(_Sigma_shm.local(), Sigmaw_skij, imag_axes_ft::fermi, n);
       for (size_t i = 0; i < _ns*_nkpts_ibz; ++i) {
         size_t is = i / _nkpts_ibz; // i = is * _nkpts_ibz + ik
         size_t ik = i % _nkpts_ibz;
-        //auto Sigma_ij = Sigma_wskij(n, is, ik, nda::range::all, nda::range::all);
-        auto Sigma_ij = Sigmaw_skij(is, ik, nda::range::all, nda::range::all);
+        auto Sigma_ij = Sigmaw_wskij(n, is, ik, nda::range::all, nda::range::all);
         FpSigma = H0(is, ik, nda::ellipsis{}) + F(is, ik, nda::ellipsis{}) + Sigma_ij;
         nda::blas::gemm(ComplexType(1.0), S_inv(is, ik, nda::range::all, nda::range::all), FpSigma,
                         ComplexType(0.0), SFS);
