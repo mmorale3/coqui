@@ -874,8 +874,8 @@ void redistribute_alltoallv(Arr1_t& A, Arr2_t& B, get_value_t<Arr1_t> a = 1, get
         ::nda::heap_basic<::nda::mem::mallocator<A_addr>>>;
     using buf_B_t = ::nda::basic_array<value_t, 1, ::nda::C_layout, 'A',
         ::nda::heap_basic<::nda::mem::mallocator<B_addr>>>;
-    buf_A_t buffer_A_d{std::array<long, 1>{long(sz_buf_A)}};
-    buf_B_t buffer_B_d{std::array<long, 1>{long(sz_buf_B)}};
+    buf_A_t buffer_A_d(long(sz_buf_A));
+    buf_B_t buffer_B_d(long(sz_buf_B));
 
     size_t count_sz_check = 0;
     for( auto p : itertools::range(mpi_size) ) {
