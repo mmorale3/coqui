@@ -166,176 +166,94 @@ inline nda::array<double,3> compute_becsum_full(
 }
 
 /**
- * Add the augmentation contribution to a V_H(r) buffer already populated
- * with the smooth-density Hartree potential.
+ * Build the USPP/PAW compensation charge ρ_aug(r) at the un-normalized nr(r)
+ * scale used inside hamilt::v_h, so it can be added to the smooth density
+ * before the single Coulomb solve (folded path; no separate augmentation FFT).
  *
- * Workflow:
- *   1. Build ρ_aug(G) on the dense FFT mesh by deposit:
- *        ρ_aug(N(g)) += Σ_a Σ_IJ becsum_{a,IJ} Q^{IJ}_{nt(a)}(g) e^{-iG·τ_a}
- *      where g enumerates the QE dense G-grid, N(g) is the FFT-mesh linear
- *      index, and miller_g_dense gives the integer Miller indices.
- *   2. Apply 4π/|G|^2 in G-space to get V_aug(G).
- *   3. iFFT to V_aug(r).
- *   4. Add V_aug(r) into the input V_H(r) buffer.
+ *   ρ_aug,nr(G) = vol·N_k · Σ_a Σ_IJ becsum_{a,IJ} Q^{IJ}_{nt(a)}(G) e^{-iG·τ_a}
  *
- * Inputs:
- *   psp     : pseudopot holding qgm, ijtoh, ityp, nh, ofs, miller_g_dense,
- *             atom_pos_cart, recv (lattv).
- *   becsum  : (nat, nhm, nhm) real, per-atom IJ pair coefficients.
- *   mesh    : dense FFT mesh dimensions.
- *   recv    : reciprocal lattice vectors (rows = b1, b2, b3).
- *   svr     : V_H(r) buffer in shared memory; modified in place.
- *
- * NCPP no-op: returns immediately if psp.qgm has zero size.
+ * The vol·N_k prefactor cancels v_h's nrm = ns_scl/(vol·N_k) so that, after
+ * v_h applies nrm·v_C(G), the augmentation lands at the same scale the
+ * standalone add_paw_augmentation_to_VH produced (ns_scl·4π/G²·ρ_aug,proper),
+ * provided v_C(G) = 4π/G². NO ns_scl / 4π·G⁻² here — v_h supplies both.
+ * Returns ρ_aug(r) on the comm root (length nnr); empty on other ranks.
  */
-template<typename Arr>
-inline void add_paw_augmentation_to_VH(
+inline nda::array<ComplexType,1> compute_rho_aug_density_r(
     utils::mpi_context_t<boost::mpi3::communicator,
                          boost::mpi3::shared_communicator>& mpi,
     pseudopot const& psp,
     nda::ArrayOfRank<3> auto const& becsum,
-    nda::stack_array<long, 3> const& mesh,
-    nda::stack_array<double, 3, 3> const& recv,
-    int nk_total,
-    int nspin,
-    int npol,
-    math::shm::shared_array<Arr>& svr)
+    nda::stack_array<long,3> const& mesh,
+    nda::stack_array<double,3,3> const& recv,
+    long nk)
 {
-    (void) nk_total;
-    if (psp.pp_type() == pp_ncpp_t) return;
-    if (psp.qgm_view().size() == 0) return;
-
     long nnr = mesh(0)*mesh(1)*mesh(2);
-    long nat = psp.ityp_view().extent(0);
+    nda::array<ComplexType,1> rho_aug_r;
+    if (psp.qgm_view().size() == 0) return rho_aug_r;   // NCPP: empty
     long ngm = psp.ngm_dense_get();
-    utils::check(svr.size() == nnr, "add_paw_augmentation_to_VH: svr.size != nnr");
-    utils::check(psp.miller_g_dense_view().extent(0) == ngm,
-                 "add_paw_augmentation_to_VH: miller_g_dense vs ngm mismatch");
-    utils::check(psp.atom_pos_cart_view().extent(0) == nat,
-                 "add_paw_augmentation_to_VH: atom_pos vs ityp mismatch");
 
-    // cell volume: vol = (2π)^3 / det(recv) — same convention used by v_h
     double vol = recv(0,0)*(recv(1,1)*recv(2,2) - recv(1,2)*recv(2,1))
                - recv(1,0)*(recv(0,1)*recv(2,2) - recv(0,2)*recv(2,1))
                + recv(2,0)*(recv(0,1)*recv(1,2) - recv(0,2)*recv(1,1));
     vol = (2.0*M_PI)*(2.0*M_PI)*(2.0*M_PI) / vol;
 
-    // Build ρ_aug on the dense FFT mesh (root only — small per-process
-    // contribution; this is a sequential build for clarity, not a hot loop).
-    //
-    // qgm from qvan2 has the 4π/Ω factor baked in, so qgm × becsum × sf is
-    // ρ_aug,proper(G) in standard density-Fourier convention. To inject into
-    // v_h's pipeline at the post-forward-FFT stage, we need the same scale
-    // as v_h's `nr(G) = un-normalized FFT[Σ_n f_n |ψ̃|²]`. The relation:
-    //   nr(G) = N_grid × ρ_proper(G)
-    // Hence Δρ_aug,nr(G) = N_grid × becsum × qgm × sf.
-    // double N_grid = (double)mesh(0)*mesh(1)*mesh(2);
-    nda::array<ComplexType,1> rho_aug(nnr);
-    rho_aug() = ComplexType(0.0);
-
     if (mpi.comm.root()) {
-        auto qg = psp.qgm_view();           // (nsp, nij_max, ngm)
-        auto const& ijtoh = psp.ijtoh_view(); // (nsp, nhm, nhm), 1-based
+        nda::array<ComplexType,1> rho_g(nnr);
+        rho_g() = ComplexType(0.0);
+        auto qg = psp.qgm_view();
+        auto const& ijtoh = psp.ijtoh_view();
         auto const& ityp  = psp.ityp_view();
         auto const& nh    = psp.nh_view();
         auto const& mill  = psp.miller_g_dense_view();
         auto const& tau   = psp.atom_pos_cart_view();
-
+        long nat = ityp.extent(0);
         long NX = mesh(0), NY = mesh(1), NZ = mesh(2);
-
+        ComplexType scale(vol * (double)nk, 0.0);
         for (long g=0; g<ngm; ++g) {
-            int m1 = mill(g, 0), m2 = mill(g, 1), m3 = mill(g, 2);
-            // FFT linear index for this Miller triple (matches generate_k2g)
-            long n1 = m1; if (n1 < 0) n1 += NX;
-            long n2 = m2; if (n2 < 0) n2 += NY;
-            long n3 = m3; if (n3 < 0) n3 += NZ;
-            if (n1 < 0 || n1 >= NX || n2 < 0 || n2 >= NY ||
-                n3 < 0 || n3 >= NZ) continue;
+            int m1 = mill(g,0), m2 = mill(g,1), m3 = mill(g,2);
+            long n1 = m1; if (n1<0) n1+=NX;
+            long n2 = m2; if (n2<0) n2+=NY;
+            long n3 = m3; if (n3<0) n3+=NZ;
+            if (n1<0||n1>=NX||n2<0||n2>=NY||n3<0||n3>=NZ) continue;
             long N = (n1*NY + n2)*NZ + n3;
-
-            // G in cartesian: G = m1*recv(0,:) + m2*recv(1,:) + m3*recv(2,:)
-            double Gx = m1*recv(0,0) + m2*recv(1,0) + m3*recv(2,0);
-            double Gy = m1*recv(0,1) + m2*recv(1,1) + m3*recv(2,1);
-            double Gz = m1*recv(0,2) + m2*recv(1,2) + m3*recv(2,2);
-
+            double Gx = m1*recv(0,0)+m2*recv(1,0)+m3*recv(2,0);
+            double Gy = m1*recv(0,1)+m2*recv(1,1)+m3*recv(2,1);
+            double Gz = m1*recv(0,2)+m2*recv(1,2)+m3*recv(2,2);
             ComplexType acc(0.0);
             for (long ia=0; ia<nat; ++ia) {
-                int nt = ityp(ia);
-                int nh_a = nh(nt);
+                int nt = ityp(ia); int nh_a = nh(nt);
                 if (nh_a == 0) continue;
-                double phase = -(Gx*tau(ia,0) + Gy*tau(ia,1) + Gz*tau(ia,2));
-                ComplexType sf(std::cos(phase), std::sin(phase));
+                double ph = -(Gx*tau(ia,0)+Gy*tau(ia,1)+Gz*tau(ia,2));
+                ComplexType sf(std::cos(ph), std::sin(ph));  // e^{-iG·τ}
                 ComplexType atom_acc(0.0);
                 for (int I=0; I<nh_a; ++I)
                 for (int J=0; J<nh_a; ++J) {
-                    long ij = static_cast<long>(ijtoh(nt, I, J)) - 1;
+                    long ij = static_cast<long>(ijtoh(nt,I,J)) - 1;
                     if (ij < 0) continue;
-                    atom_acc += ComplexType(becsum(ia, I, J)) * qg(nt, ij, g);
+                    atom_acc += ComplexType(becsum(ia,I,J)) * qg(nt,ij,g);
                 }
                 acc += sf * atom_acc;
             }
-            // ρ_aug stored on the dense FFT mesh in C row-major linear index
-            rho_aug(N) += acc;
+            rho_g(N) += scale * acc;
         }
-
-        // 4π/|G|^2 per Miller index, in place. G=0 component is left as
-        // the input (typically 0 from ρ_aug — augmentation charges are
-        // designed to integrate to zero on each multipole channel by
-        // construction, so no neutralizing Madelung correction is needed
-        // beyond what v_h already applied to ρ̃).
-        for (long g=0; g<ngm; ++g) {
-            int m1 = mill(g, 0), m2 = mill(g, 1), m3 = mill(g, 2);
-            long n1 = m1; if (n1 < 0) n1 += NX;
-            long n2 = m2; if (n2 < 0) n2 += NY;
-            long n3 = m3; if (n3 < 0) n3 += NZ;
-            long N = (n1*NY + n2)*NZ + n3;
-            double Gx = m1*recv(0,0) + m2*recv(1,0) + m3*recv(2,0);
-            double Gy = m1*recv(0,1) + m2*recv(1,1) + m3*recv(2,1);
-            double Gz = m1*recv(0,2) + m2*recv(1,2) + m3*recv(2,2);
-            double G2 = Gx*Gx + Gy*Gy + Gz*Gz;
-            if (G2 > 1e-14) {
-                // qgm from QE's qvan2 has the 4π/Ω factor baked in (proper
-                // density Fourier convention, matching QE's rho%of_g).
-                // To inject into v_h's pipeline at the post-forward-FFT
-                // stage so that the downstream 4π/G² × ns_scl/(Ω·N_k)
-                // multiplier produces the correct V_H,aug(G), the
-                // augmentation must enter at the same scale as v_h's
-                // nr(G). The required pre-factor is ns_scl × Ω, which
-                // combined with v_h's (1/vol = 1/Ω) leaves the net scale
-                // ns_scl × (4π/G²) on ρ_aug,proper.
-                //
-                // Verified band-by-band against QE's <V_H> values on the
-                // LiH 222 PAW fixture (test_dft_eigenvalues).
-                double w = 4.0*M_PI / G2;
-                double ns_scl = (nspin == 1 && npol == 1) ? 2.0 : 1.0;
-                rho_aug(N) *= ComplexType(ns_scl * w, 0.0);
-            } else {
-                rho_aug(N) = ComplexType(0.0);
-            }
-        }
-
-        // iFFT to r-space
-        auto rho3d = nda::reshape(rho_aug,
-                std::array<long,3>{mesh(0),mesh(1),mesh(2)});
+        // iFFT to r-space (un-normalized backward; matches v_h's nr convention).
+        auto rho3d = nda::reshape(rho_g, std::array<long,3>{NX,NY,NZ});
         math::nda::fft<false> Frev(rho3d);
         Frev.backward(rho3d);
-
-        // Add into V_H(r). svr is shared on the node; root has authoritative
-        // contents (v_h sets it on root and broadcasts).
-        auto vr = svr.local();
-        for (long n=0; n<nnr; ++n) vr(n) += rho_aug(n);
+        rho_aug_r = rho_g;
     }
-
-    // Replicate updated V_H(r) on all ranks (mirrors v_h's broadcast pattern).
-    if (mpi.node_comm.root())
-        mpi.internode_comm.broadcast_n(svr.local().data(), nnr, 0);
     mpi.comm.barrier();
+    return rho_aug_r;
 }
 
 } // namespace hamilt::paw
 
 namespace hamilt {
 
+// MAM: This should not be here, it should be in hamiltonian/v_h.hpp.
+//  Then the v_h routine there should be called something else, e.g. v_h_impl,
+//  the augmentation densit should be added directly to the soft charge inside v_h_impl
+//  and steps involving fft, multiplication of v_coulomb, ifft, should be done once.
 /**
  * Pseudopot-aware Hartree potential overload — diagonal-occupation form.
  *
@@ -364,17 +282,20 @@ void v_h(utils::mpi_context_t<boost::mpi3::communicator,
          bool symmetrize_rho_r,
          math::shm::shared_array<Arr>& svr)
 {
-    // Smooth-grid Hartree (existing path). Writes V_H(r) into svr.
-    hamilt::v_h(mpi, vG, npol, mesh, lattv, recv, k2g, kpts, kp_to_ibz,
-                kp_trev, kp_symm, symm_list, nii, psi, symmetrize_rho_r, svr);
-    // PAW/USPP augmentation correction (no-op for NCPP).
-    if (psp.pp_type() == pp_ncpp_t) return;
-    auto becsum = ::hamilt::paw::compute_becsum_diagonal(
-        psp.Pskna_view(), nii, psp.ityp_view(), psp.nh_view(),
-        psp.ofs_view(), npol);
-    ::hamilt::paw::add_paw_augmentation_to_VH<Arr>(
-        mpi, psp, becsum, mesh, recv,
-        (int)kp_to_ibz.shape(0), (int)psi.global_shape()[0], npol, svr);
+    // Build the USPP/PAW compensation charge ρ_aug(r) (empty for NCPP) and
+    // fold it into the smooth density inside v_h — single Coulomb pass, no
+    // separate post-hoc augmentation FFT.
+    nda::array<ComplexType,1> rho_aug_r;
+    if (psp.pp_type() != pp_ncpp_t) {
+      auto becsum = ::hamilt::paw::compute_becsum_diagonal(
+          psp.Pskna_view(), nii, psp.ityp_view(), psp.nh_view(),
+          psp.ofs_view(), npol);
+      rho_aug_r = ::hamilt::paw::compute_rho_aug_density_r(
+          mpi, psp, becsum, mesh, recv, (long)kp_to_ibz.shape(0));
+    }
+    hamilt::detail::v_h_impl(mpi, vG, npol, mesh, lattv, recv, k2g, kpts, kp_to_ibz,
+                kp_trev, kp_symm, symm_list, nii, psi, symmetrize_rho_r, svr,
+                rho_aug_r);
 }
 
 /**
@@ -400,15 +321,17 @@ void v_h(utils::mpi_context_t<boost::mpi3::communicator,
          bool symmetrize_rho_r,
          math::shm::shared_array<Arr>& svr)
 {
-    hamilt::v_h(mpi, vG, npol, mesh, lattv, recv, k2g, kpts, kp_to_ibz,
-                kp_trev, kp_symm, symm_list, nij, psi, symmetrize_rho_r, svr);
-    if (psp.pp_type() == pp_ncpp_t) return;
-    auto becsum = ::hamilt::paw::compute_becsum_full(
-        psp.Pskna_view(), nij, psp.ityp_view(), psp.nh_view(),
-        psp.ofs_view(), npol);
-    ::hamilt::paw::add_paw_augmentation_to_VH<Arr>(
-        mpi, psp, becsum, mesh, recv,
-        (int)kp_to_ibz.shape(0), (int)psi.global_shape()[0], npol, svr);
+    nda::array<ComplexType,1> rho_aug_r;
+    if (psp.pp_type() != pp_ncpp_t) {
+      auto becsum = ::hamilt::paw::compute_becsum_full(
+          psp.Pskna_view(), nij, psp.ityp_view(), psp.nh_view(),
+          psp.ofs_view(), npol);
+      rho_aug_r = ::hamilt::paw::compute_rho_aug_density_r(
+          mpi, psp, becsum, mesh, recv, (long)kp_to_ibz.shape(0));
+    }
+    hamilt::detail::v_h_impl(mpi, vG, npol, mesh, lattv, recv, k2g, kpts, kp_to_ibz,
+                kp_trev, kp_symm, symm_list, nij, psi, symmetrize_rho_r, svr,
+                rho_aug_r);
 }
 
 } // namespace hamilt

@@ -336,6 +336,65 @@ auto Vhartree(mf::MF &mf, boost::mpi3::communicator &comm, pseudopot *psp,
   }
 }
 
+/**
+ * Compute the matrix elements of the exact-exchange operator K_{ij} (Fock K)
+ * in a distributed array. Sign convention: K is signed so that F = H_core
+ * + V_H + K matches the existing test_dft_eigenvalues / set_fock convention
+ * (K contains its leading minus). NCPP / USPP / PAW dispatch is internal.
+ *
+ * Restricted to diagonal occupations (rank-3 nii) for now; full-density-matrix
+ * support can be added analogously to Vhartree(nij).
+ */
+template<MEMORY_SPACE MEM = HOST_MEMORY, nda::ArrayOfRank<3> Arr3_t>
+auto Vexchange(mf::MF &mf, boost::mpi3::communicator &comm, pseudopot *psp,
+               Arr3_t const& nii,
+               nda::range k_range = {-1,-1}, nda::range b_range = {-1,-1},
+               std::array<long,4> pgrid = {0}, std::array<long,4> bz = {1,1,2048,2048})
+{
+  if(k_range == nda::range{-1,-1}) k_range = nda::range(mf.nkpts_ibz());
+  if(b_range == nda::range{-1,-1}) b_range = nda::range(mf.nbnd());
+  utils::check(mf.mf_type() == mf::qe_source or mf.mf_type() == mf::bdft_source,
+               "Vexchange: only qe_source / bdft_source backends supported");
+  utils::check(psp != nullptr, "Vexchange: Missing pseudopot object.");
+  utils::check(k_range.first() == 0 && k_range.last() == mf.nkpts_ibz(),
+               "Vexchange: requires full IBZ k_range.");
+  utils::check(b_range.first() == 0 && b_range.last() == mf.nbnd(),
+               "Vexchange: requires full nbnd b_range.");
+  using larray = memory::array<MEM,ComplexType,4>;
+  auto psi = mf::read_distributed_orbital_set_ibz<larray>(
+      mf, comm, 'w', pgrid,
+      nda::range(-1, -1), k_range, b_range, bz);
+  return detail::gen_Vexchange<MEM>(mf, comm, psp, k_range, b_range, psi, nii);
+}
+
+template<nda::MemoryArrayOfRank<4> Array_4D_t, nda::ArrayOfRank<3> Arr3_t>
+void set_Vexchange(mf::MF &mf, pseudopot *psp,
+                   Arr3_t const& nii,
+                   math::shm::shared_array<Array_4D_t> &sK_skij) {
+  long np = sK_skij.internode_comm()->size();
+  long np_s = (np % mf.nspin()== 0)? mf.nspin() : 1;
+  long np_k = utils::find_proc_grid_max_npools(np/np_s, (long)mf.nkpts_ibz(), 1.0);
+  long np_i = np / (np_s*np_k);
+  std::array<long, 4> pgrid = {np_s, np_k, np_i, 1};
+  long blk_i = std::min( {(long)1024, (mf.nbnd())/np_i});
+  std::array<long, 4> bsize = {1, 1, blk_i, 2048};
+  app_log(4, "Exchange matrix in distributed array:");
+  app_log(4, "  - pgrid = ({}, {}, {}, {})", np_s, np_k, np_i, 1);
+  app_log(4, "  - bsize = ({}, {}, {}, {})\n", 1, 1, blk_i, 2048);
+
+  if (sK_skij.node_comm()->root()) {
+    auto dK = hamilt::Vexchange<HOST_MEMORY>(
+        mf, *sK_skij.internode_comm(), psp, nii,
+        nda::range(mf.nkpts_ibz()), nda::range(mf.nbnd()),
+        pgrid, bsize);
+    auto K_loc = sK_skij.local();
+    K_loc(dK.local_range(0), dK.local_range(1),
+          dK.local_range(2), dK.local_range(3)) = dK.local();
+  }
+  sK_skij.communicator()->barrier();
+  sK_skij.all_reduce();
+}
+
 template<typename MPI_t>
 void dump_hartree(MPI_t &mpi, mf::MF &mf, pseudopot *psp, std::string coqui_output, int scf_iter) {
   long np = mpi.comm.size();

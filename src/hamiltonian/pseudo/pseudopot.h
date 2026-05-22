@@ -249,6 +249,7 @@ class pseudopot
                    nda::ArrayOfRank<3> auto const& nii,
                    math::nda::DistributedArrayOfRank<4> auto const& psi,
                    math::nda::DistributedArrayOfRank<4> auto & hpsi,
+                   math::nda::DistributedArrayOfRank<4> auto & Vij,
                    bool symmetrize=false);
 
   /**
@@ -265,7 +266,31 @@ class pseudopot
                    nda::ArrayOfRank<4> auto const& nij,
                    math::nda::DistributedArrayOfRank<4> auto const& psi,
                    math::nda::DistributedArrayOfRank<4> auto & hpsi,
+                   math::nda::DistributedArrayOfRank<4> auto & Vij,
                    bool symmetrize=false);
+
+  /**
+   * Build the matrix elements of the exact-exchange operator K_{ij}(s, k_p)
+   * for the diagonal-occupation density matrix.
+   *
+   * Unlike add_Hartree (which outputs an hpsi correction), exchange has no
+   * representation as a local potential acting on a single orbital — the
+   * augmentation cross terms involve band-pair-dependent projector overlaps.
+   * add_exchange therefore writes the full K matrix directly.
+   *
+   * Sign convention: K is the SIGNED contribution to the Fock matrix
+   * (F = H_core + V_H + K, with K already negative), matching CoQui's
+   * existing set_fock / test_dft_eigenvalues convention.
+   *
+   * @param k_range - [input] k-point range (must cover the full IBZ)
+   * @param nii     - [input] occupations (s, k_ibz, n), spin-summed for nspin=1
+   * @param psi     - [input] orbitals on wfc-G grid (s, k_ibz, n, g)
+   * @param Kij     - [output] K_{ij}(s, k_ibz, i, j) — written (overwritten)
+   */
+  void add_exchange(nda::range k_range,
+                    nda::ArrayOfRank<3> auto const& nii,
+                    math::nda::DistributedArrayOfRank<4> auto const& psi,
+                    math::nda::DistributedArrayOfRank<4> auto & Kij);
 
   private:
 
@@ -459,6 +484,28 @@ public:
   void compute_deeq_scf(nij_t const& nij);
 
   /**
+   * Unified native PAW non-local D builder (the single source of truth — no
+   * QE deeq, no XC). Returns a per-atom Dion array (nat, nhm*npol, nhm*npol)
+   * assembled from up to three terms:
+   *   1. static     : dvan + paw_init_keeq (kinetic + bare-ionic AE−PS),
+   *                   included iff `include_static`.
+   *   2. radial     : AE−PS one-center Hartree, compute_paw_hartree_atom from
+   *                   becsum(ρ) (the `ns_scl²` matrix-element normalization is
+   *                   applied here — see implementation note).
+   *   3. G-space    : ∫ Vloc_r(r) Q^IJ_a(r) dr, included iff `Vloc_r` is
+   *                   non-empty (caller passes V_H for the Hartree matrix, or
+   *                   V_eff for the full H).
+   * Callers build Dion then feed it to `add_vnl_impl` — the single code path
+   * that touches Hij/Vij. `nii` is the diagonal density (s,k,n).
+   *
+   * Implementation lives out-of-class in `hamiltonian/paw/paw_onecenter.hpp`.
+   */
+  template<typename nii_t, typename Pot_t>
+  nda::array<ComplexType,3> compute_paw_deeq(nii_t const& nii,
+                                             Pot_t const& Vloc_r,
+                                             bool include_static);
+
+  /**
    * Build the SCF-invariant caches consumed by `compute_deeq_scf`:
    * `Dnn_atom_static_paw`, `paw_core_density`, `paw_aainit_lli`. Idempotent;
    * subsequent calls return immediately. Called automatically from
@@ -588,9 +635,10 @@ public:
    *                          should be provided, not both.
    */
   template<nda::ArrayOfRank<3> Arr3, nda::ArrayOfRank<4> Arr4>
-  void add_Hartree_impl(nda::range k_range,
+  void add_Hartree_impl(nda::range k_range, nda::range b_range,
                         math::nda::DistributedArrayOfRank<4> auto const& psi,
                         math::nda::DistributedArrayOfRank<4> auto & hpsi,
+                        math::nda::DistributedArrayOfRank<4> auto & Vij,
                         const Arr3 *nii, const Arr4 *nij, bool symmetrize=false);
 
 

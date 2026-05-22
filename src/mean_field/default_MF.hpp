@@ -145,6 +145,16 @@ inline decltype(auto) default_MF(std::shared_ptr<utils::mpi_context_t<comm_t>>& 
     auto [outdir,prefix] = utils::utest_filename("qe_lih222_hf");
     return default_MF(comm, mf::qe_source, outdir, prefix, h5_input_type);
 
+  } else if (src == "qe_lih222_paw_hf") {
+
+    auto [outdir,prefix] = utils::utest_filename("qe_lih222_paw_hf");
+    return default_MF(comm, mf::qe_source, outdir, prefix, h5_input_type);
+
+  } else if (src == "qe_lih222_uspp_hf") {
+
+    auto [outdir,prefix] = utils::utest_filename("qe_lih222_uspp_hf");
+    return default_MF(comm, mf::qe_source, outdir, prefix, h5_input_type);
+
   } else if (src == "qe_GaAs222_hf") {
 
     auto [outdir,prefix] = utils::utest_filename("qe_GaAs222_hf");

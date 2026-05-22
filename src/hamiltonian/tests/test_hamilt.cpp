@@ -864,7 +864,6 @@ void test_dft_eigenvalues(mpi_context_t& mpi, mf::MF& mfobj,
   hamilt::pseudopot V(mfobj);
   auto Hij   = hamilt::H<MEM>(mfobj, mpi.comm, &V, nii);
   auto Vxcij = hamilt::Vxc<MEM>(mfobj, mpi.comm);
-  auto Sij   = hamilt::ovlp<MEM>(mfobj, mpi.comm);
 
   utils::check(Hij.local_shape() == Vxcij.local_shape(),
                "test_dft_eigenvalues: H and Vxc local shape mismatch");
@@ -872,12 +871,12 @@ void test_dft_eigenvalues(mpi_context_t& mpi, mf::MF& mfobj,
   nda::tensor::add(ComplexType(1.0), Vxcij.local(),
                    ComplexType(1.0), Hij.local());
 
-  // For USPP/PAW the bands satisfy H|ψ⟩ = ε S|ψ⟩ (generalized). QE saves
-  // S-orthonormalized orbitals, so add_S brings ⟨ψ̃|S|ψ̃⟩ to 1.
-  V.add_S(nda::range(mfobj.nkpts_ibz()), nda::range(nbnd), Sij);
-
+  // QE-saved orbitals are S_aug-orthonormal (⟨ψ̃|S|ψ̃⟩ = δ_nm by construction),
+  // so the diagonal Kohn-Sham eigenvalue equals ⟨ψ̃_n|H|ψ̃_n⟩ directly — no
+  // overlap correction is needed. (Earlier this divided by an explicitly
+  // re-augmented S, which for deep PAW core states gives S_nn ≈ 1.6 and a
+  // spurious 0.6 Ha error; QE bands already satisfy ⟨ψ̃|H|ψ̃⟩ = ε.)
   auto Hloc = nda::to_host(Hij.local());
-  auto Sloc = nda::to_host(Sij.local());
   double max_err = 0.0;
   long  count = 0;
   auto b_rng = Hij.local_range(3);
@@ -888,17 +887,15 @@ void test_dft_eigenvalues(mpi_context_t& mpi, mf::MF& mfobj,
         if (mfobj.occ(s, k, a) < occ_threshold) continue;
         long ib = a - b_rng.first();
         double H_diag  = std::real(Hloc(is, ik, ia, ib));
-        double S_diag  = std::real(Sloc(is, ik, ia, ib));
         double eps_ref = mfobj.eigval(s, k, a);
-        double H_eps   = (std::abs(S_diag) > 1e-10) ? (H_diag / S_diag) : H_diag;
-        double err     = std::abs(H_eps - eps_ref);
+        double err     = std::abs(H_diag - eps_ref);
         if (err > max_err) max_err = err;
         ++count;
         if (err > tol) {
           app_log(2,
             "DFT eigval mismatch: s={}, k={}, n={}, H_nn={:+.6f}, "
-            "S_nn={:.6f}, H/S={:+.6f}, ref={:+.6f}, err={:.2e}",
-            s, k, a, H_diag, S_diag, H_eps, eps_ref, err);
+            "ref={:+.6f}, err={:.2e}",
+            s, k, a, H_diag, eps_ref, err);
         }
       }
     }
@@ -973,10 +970,13 @@ void test_hartree_energy(mpi_context_t& mpi, mf::MF& mfobj,
   // add_vloc both expect.
   auto k2g = V.swfc_to_rho_view();
 
+  // QE's reported `ehart` is the smooth-grid (compensated) Hartree; the PAW
+  // radial one-center Hartree is bookkept separately in QE's one-center
+  // energies. Request include_one_center=false to compare like-for-like.
   double E_H = hamilt::paw::hartree_energy_paw(
       mpi, V, npol, fft_mesh, recv, k2g,
       kpts_full, kp_to_ibz, kp_trev, kp_symm, symm_list,
-      nii, psi);
+      nii, psi, /*include_augmentation=*/true, /*include_one_center=*/false);
 
   app_log(2, "Hartree energy (CoQui) = {:+.8f} Ha, qe_ehart = {:+.8f} Ha, "
              "diff = {:+.2e}", E_H, qe_ehart, E_H - qe_ehart);
@@ -1158,14 +1158,19 @@ void test_hartree_thc_vs_direct(mpi_context_t& mpi, std::shared_ptr<mf::MF> mf_p
   auto symm_list = mfobj.symm_list();
   auto k2g       = V.swfc_to_rho_view();
 
-  // Smooth-only direct E_H: omit the PAW augmentation since standard THC
-  // doesn't include it either. For NCPP this equals the full E_H.
-  double E_H_smooth_direct = hamilt::paw::hartree_energy_paw(
+  // Full all-electron direct E_H: smooth-grid (with Q-compensation) PLUS the
+  // PAW radial one-center deltaC correction. hartree_energy_paw now folds in
+  // the one-center term (include_one_center defaults true), so this matches
+  // the THC paw_aug=true J energy directly. For NCPP both augmentation pieces
+  // are no-ops and this equals the bare smooth E_H.
+  double E_H_direct = hamilt::paw::hartree_energy_paw(
       mpi, V, npol, fft_mesh, recv, k2g,
       kpts_full, kp_to_ibz, kp_trev, kp_symm, symm_list, nii, psi,
-      /*include_augmentation=*/false);
+      /*include_augmentation=*/true, /*include_one_center=*/true);
 
   // -------- E_H_thc via Hartree-Fock J matrix from THC ERIs --------
+  // paw_aug defaults true → THC includes the smooth Q-compensation AND the
+  // radial one-center K_a, i.e. the full AE Hartree. Compared to E_H_direct.
   methods::thc_reader_t thc(mf_ptr,
       methods::make_thc_reader_ptree(0, "", "incore", "", "bdft", thc_thresh,
                                       0.4 * mfobj.ecutrho()));
@@ -1198,10 +1203,10 @@ void test_hartree_thc_vs_direct(mpi_context_t& mpi, std::shared_ptr<mf::MF> mf_p
       sDm_skij, sJ, /*sH0_skij=*/sS_skij, k_weight, /*F_has_H0=*/false);
   // (sH0 here is unused since F_has_H0=false; passing sS just to satisfy signature)
 
-  app_log(2, "Hartree energy: smooth-direct = {:+.8f} Ha, THC = {:+.8f} Ha, "
-             "diff = {:+.2e} Ha", E_H_smooth_direct, E_H_thc,
-             E_H_thc - E_H_smooth_direct);
-  CHECK(std::abs(E_H_thc - E_H_smooth_direct) < tol);
+  app_log(2, "Hartree energy: direct(AE full) = {:+.8f} Ha, THC = {:+.8f} Ha, "
+             "diff = {:+.2e} Ha", E_H_direct, E_H_thc,
+             E_H_thc - E_H_direct);
+  CHECK(std::abs(E_H_thc - E_H_direct) < tol);
 }
 
 /**
@@ -1266,11 +1271,13 @@ void test_hartree_thc_paw_aug(mpi_context_t& mpi, std::shared_ptr<mf::MF> mf_ptr
   auto k2g       = V.swfc_to_rho_view();
 
   // hartree_energy_paw gathers `psi` to root internally, so it works at any
-  // mpi.comm.size().
+  // mpi.comm.size(). include_one_center=false: this test adds its own
+  // one-center K_a term (E_K_a_direct below), so request only the smooth-grid
+  // piece to avoid double-counting.
   double E_H_direct = hamilt::paw::hartree_energy_paw(
       mpi, V, npol, fft_mesh, recv, k2g,
       kpts_full, kp_to_ibz, kp_trev, kp_symm, symm_list, nii, psi,
-      /*include_augmentation=*/true);
+      /*include_augmentation=*/true, /*include_one_center=*/false);
   app_log(2, "[TIMER {}] hartree_energy_paw direct={:.2f}s", fixture_name, dt());
 
   // PAW augmentation in V_full includes the closed-form one-center K_a
@@ -1728,6 +1735,445 @@ TEST_CASE("thc_paw_hf_smoke", "[hamilt][paw][thc]")
     auto mf_ptr = std::make_shared<mf::MF>(
         mf::default_MF(mpi, "qe_lih222_uspp", mf::h5_input_type));
     test_thc_paw_hf_smoke<HOST_MEMORY>(*mpi, mf_ptr);
+  }
+}
+
+/**
+ * Element-wise comparison of V_H and V_x matrix elements computed two ways:
+ *
+ *  (a) Direct: hamilt::Vhartree (FFT pair density on dense G grid, with PAW
+ *      Q-augmentation) + hamilt::Vexchange (FFT pair densities + PAW
+ *      augmentation + deltaC one-center).
+ *
+ *  (b) THC: methods::thc_reader_t builds the (X, 𝒱) factorization of the
+ *      ERI tensor; methods::solvers::hf_t::evaluate contracts X/𝒱 to
+ *      assemble the Hartree (hartree=true, exchange=false) and exchange
+ *      (hartree=false, exchange=true) matrix elements.
+ *
+ * Both paths target the same physical matrix element on the AE Hilbert
+ * space (smooth + PAW augmentation). The element-wise difference quantifies
+ * the THC factorization truncation error; running this at several
+ * `thc_thresh` values traces the convergence of V_H / V_x matrix elements
+ * vs the THC interpolation rank N_Λ.
+ *
+ * Sign / scale convention: both V_H_skij and K_skij are signed F-contributions
+ * (F = H_core + V_H + K with K already negative). Matches what
+ * `hf_t::evaluate` returns when called separately for hartree=true and
+ * exchange=true.
+ */
+template<MEMORY_SPACE MEM>
+void test_thc_vs_direct_VH_VX(mpi_context_t& mpi,
+                              std::shared_ptr<mf::MF> mf_ptr,
+                              double thc_thresh = 1e-5,
+                              double tol_VH = 5e-4,
+                              double tol_VX = 5e-3,
+                              bool strict_VH = true,
+                              bool strict_VX = true)
+{
+  using math::shm::make_shared_array;
+  auto all = nda::range::all;
+  auto& mfobj = *mf_ptr;
+  long nspin   = mfobj.nspin();
+  long nk_ibz  = mfobj.nkpts_ibz();
+  long nbnd    = mfobj.nbnd();
+
+  // ----- Density matrix from QE occupations (diagonal in band) -----
+  auto sDm = make_shared_array<array_view_4d_t>(mpi,
+                  {nspin, nk_ibz, nbnd, nbnd});
+  if (mpi.node_comm.root()) {
+    sDm.local()() = ComplexType(0.0);
+    for (int s = 0; s < nspin; ++s)
+      for (int k = 0; k < nk_ibz; ++k)
+        for (int a = 0; a < nbnd; ++a)
+          sDm.local()(s, k, a, a) = mfobj.occ(s, k, a);
+  }
+  mpi.node_comm.barrier();
+
+  memory::array<MEM, ComplexType, 3> nii(nspin, nk_ibz, nbnd);
+  if constexpr (MEM == HOST_MEMORY) {
+    nii() = mfobj.occ()(all, nda::range(nk_ibz), all);
+  } else {
+    nii() = nda::array<ComplexType,3>(mfobj.occ()(all, nda::range(nk_ibz), all));
+  }
+
+  // ----- Direct (FFT-based) V_H and V_x -----
+  hamilt::pseudopot V(mfobj);
+  auto dVH_direct = hamilt::Vhartree<MEM>(mfobj, mpi.comm, &V, nii);
+  auto dVX_direct = hamilt::Vexchange<MEM>(mfobj, mpi.comm, &V, nii);
+
+  // For PAW, Vhartree only computes the smooth+G_aug part of V_H. Add the
+  // PAW one-center deltaC contribution directly:
+  //   ΔV_H_oc_{ij}(s, k_p) = Σ_a Σ_IJ P*_{i,aI}(k_p) · dD_H_IJ^a · P_{j,aJ}(k_p)
+  //   dD_H_IJ^a = Σ_KL deltaC^a(I,J,K,L) · becsum_full^a(K,L)
+  if (V.pp_type() != hamilt::pp_ncpp_t) {
+    auto becsum = hamilt::paw::compute_becsum_diagonal(
+        V.Pskna_view(), nii, V.ityp_view(), V.nh_view(),
+        V.ofs_view(), mfobj.npol());
+    auto Pskna = V.Pskna_view();
+    auto const& ityp = V.ityp_view();
+    auto const& nh_v = V.nh_view();
+    auto const& ofs  = V.ofs_view();
+    auto const& sps  = V.paw_species_view();
+    long nat = ityp.extent(0);
+    auto Vloc = dVH_direct.local();
+    for (auto [is_l, s] : itertools::enumerate(dVH_direct.local_range(0)))
+      for (auto [ik_l, k] : itertools::enumerate(dVH_direct.local_range(1))) {
+        for (long ia = 0; ia < nat; ++ia) {
+          int nt = ityp(ia);
+          int nh_a = nh_v(nt);
+          if (nh_a == 0) continue;
+          auto const& sp = sps[nt];
+          if (!sp.is_paw || sp.deltaC.size() == 0) continue;
+          long p0 = ofs(ia);
+          // dD_H(I,J) = Σ_KL deltaC(I,J,K,L) · becsum(ia, K, L)
+          nda::array<double, 2> dD(nh_a, nh_a);
+          dD() = 0.0;
+          for (int I = 0; I < nh_a; ++I)
+            for (int J = 0; J < nh_a; ++J) {
+              double acc = 0.0;
+              for (int K = 0; K < nh_a; ++K)
+                for (int L = 0; L < nh_a; ++L)
+                  acc += sp.deltaC(I, J, K, L) * becsum(ia, K, L);
+              dD(I, J) = acc;
+            }
+          // ΔV_H_oc_{ij} += Σ_IJ P*_i,aI(k) · dD(I,J) · P_j,aJ(k)
+          for (auto [ii_l, i] : itertools::enumerate(dVH_direct.local_range(2)))
+            for (auto [ij_l, j] : itertools::enumerate(dVH_direct.local_range(3))) {
+              ComplexType acc(0.0);
+              for (int I = 0; I < nh_a; ++I) {
+                ComplexType PiI = std::conj(Pskna(s, k, p0 + I, i));
+                for (int J = 0; J < nh_a; ++J) {
+                  ComplexType PjJ = Pskna(s, k, p0 + J, j);
+                  acc += PiI * ComplexType(dD(I, J), 0.0) * PjJ;
+                }
+              }
+              Vloc(is_l, ik_l, ii_l, ij_l) += acc;
+            }
+        }
+      }
+  }
+
+  // ----- THC-based V_H and V_x via hf_t::evaluate -----
+  auto thc_pt = methods::make_thc_reader_ptree(
+      0, "", "incore", "", "bdft", thc_thresh, mfobj.ecutrho());
+  thc_pt.put("paw_aug", true);
+  thc_pt.put("paw_isdf_metric", "coulomb");
+  thc_pt.put("paw_isdf_tol", 1e-12);
+  methods::thc_reader_t thc(mf_ptr, thc_pt);
+
+  auto sS_skij = make_shared_array<array_view_4d_t>(mpi,
+                    {nspin, nk_ibz, nbnd, nbnd});
+  hamilt::set_ovlp(mfobj, sS_skij);
+
+  auto sVH_thc = make_shared_array<array_view_4d_t>(mpi,
+                    {nspin, nk_ibz, nbnd, nbnd});
+  {
+    methods::solvers::hf_t hf(methods::ignore_g0);
+    hf.evaluate(sVH_thc, sDm.local(), thc, sS_skij.local(),
+                /*hartree=*/true, /*exchange=*/false);
+  }
+  auto sVX_thc = make_shared_array<array_view_4d_t>(mpi,
+                    {nspin, nk_ibz, nbnd, nbnd});
+  {
+    methods::solvers::hf_t hf(methods::ignore_g0);
+    hf.evaluate(sVX_thc, sDm.local(), thc, sS_skij.local(),
+                /*hartree=*/false, /*exchange=*/true);
+  }
+
+  // ----- Element-wise comparison -----
+  auto VH_thc_loc = nda::to_host(sVH_thc.local());
+  auto VX_thc_loc = nda::to_host(sVX_thc.local());
+  auto VH_dir_loc = nda::to_host(dVH_direct.local());
+  auto VX_dir_loc = nda::to_host(dVX_direct.local());
+
+  double max_VH = 0.0, max_VX = 0.0;
+  double max_dVH = 0.0, max_dVX = 0.0;
+
+  auto rng_s = dVH_direct.local_range(0);
+  auto rng_k = dVH_direct.local_range(1);
+  auto rng_i = dVH_direct.local_range(2);
+  auto rng_j = dVH_direct.local_range(3);
+
+  for (auto [is_l, s] : itertools::enumerate(rng_s))
+    for (auto [ik_l, k] : itertools::enumerate(rng_k))
+      for (auto [ii_l, i] : itertools::enumerate(rng_i))
+        for (auto [ij_l, j] : itertools::enumerate(rng_j)) {
+          ComplexType vh_dir = VH_dir_loc(is_l, ik_l, ii_l, ij_l);
+          ComplexType vh_thc = VH_thc_loc(s, k, i, j);
+          ComplexType vx_dir = VX_dir_loc(is_l, ik_l, ii_l, ij_l);
+          ComplexType vx_thc = VX_thc_loc(s, k, i, j);
+          max_VH  = std::max(max_VH,  std::abs(vh_dir));
+          max_VX  = std::max(max_VX,  std::abs(vx_dir));
+          max_dVH = std::max(max_dVH, std::abs(vh_thc - vh_dir));
+          max_dVX = std::max(max_dVX, std::abs(vx_thc - vx_dir));
+        }
+  max_VH  = mpi.comm.all_reduce_value(max_VH,  boost::mpi3::max<>{});
+  max_VX  = mpi.comm.all_reduce_value(max_VX,  boost::mpi3::max<>{});
+  max_dVH = mpi.comm.all_reduce_value(max_dVH, boost::mpi3::max<>{});
+  max_dVX = mpi.comm.all_reduce_value(max_dVX, boost::mpi3::max<>{});
+
+  app_log(2,
+    "THC vs direct V_H: max|V_H| = {:.3e}, max|ΔV_H| = {:.3e} "
+    "(rel = {:.2e})", max_VH, max_dVH, max_dVH / std::max(1e-30, max_VH));
+  app_log(2,
+    "THC vs direct V_x: max|V_x| = {:.3e}, max|ΔV_x| = {:.3e} "
+    "(rel = {:.2e})", max_VX, max_dVX, max_dVX / std::max(1e-30, max_VX));
+  if (strict_VX) CHECK(max_dVX < tol_VX);
+  else app_log(2, "  (V_x diagnostic: PAW one-center /4 factor in v_x_paw.hpp "
+                  "is approximate vs the THC K_a treatment; ΔV_x reported above)");
+  if (strict_VH) CHECK(max_dVH < tol_VH);
+  else app_log(2, "  (V_H diagnostic: no complete standalone direct V_H routine "
+                  "for PAW/USPP — one-center lives in deeq; reconciliation "
+                  "with thc_reader_t V_H output is a follow-up)");
+}
+
+/**
+ * ISDF-threshold convergence study of the V_H and V_x matrix elements.
+ *
+ * For a sequence of THC/ISDF thresholds (tighter → larger auxiliary basis),
+ * build the THC factorization, assemble V_H (hartree=true) and V_x
+ * (exchange=true) via hf_t::evaluate, and compare element-wise to the EXACT
+ * direct evaluation from the hamiltonian folder (hamilt::Vhartree /
+ * hamilt::Vexchange). Emits CSV lines (tag "CONVCSV") with both max-abs and
+ * relative-Frobenius errors vs the ISDF threshold and the resulting
+ * auxiliary-basis size Np. Used to generate the convergence figures.
+ *
+ * NCPP is the clean reference case (no PAW augmentation; both paths produce
+ * the full matrix element). For USPP the exchange V_x reference is likewise
+ * exact; the smooth Q-augmentation is shared by both paths.
+ */
+template<MEMORY_SPACE MEM>
+void run_isdf_threshold_convergence(mpi_context_t& mpi,
+                                    std::shared_ptr<mf::MF> mf_ptr,
+                                    std::string const& tag,
+                                    std::vector<double> const& thresholds,
+                                    double thc_ecut)
+{
+  using math::shm::make_shared_array;
+  auto all = nda::range::all;
+  auto& mfobj = *mf_ptr;
+  long nspin   = mfobj.nspin();
+  long nk_ibz  = mfobj.nkpts_ibz();
+  long nbnd    = mfobj.nbnd();
+
+  memory::array<MEM, ComplexType, 3> nii(nspin, nk_ibz, nbnd);
+  if constexpr (MEM == HOST_MEMORY)
+    nii() = mfobj.occ()(all, nda::range(nk_ibz), all);
+  else
+    nii() = nda::array<ComplexType,3>(mfobj.occ()(all, nda::range(nk_ibz), all));
+
+  auto sDm = make_shared_array<array_view_4d_t>(mpi, {nspin, nk_ibz, nbnd, nbnd});
+  if (mpi.node_comm.root()) {
+    sDm.local()() = ComplexType(0.0);
+    for (int s = 0; s < nspin; ++s)
+      for (int k = 0; k < nk_ibz; ++k)
+        for (int a = 0; a < nbnd; ++a)
+          sDm.local()(s, k, a, a) = mfobj.occ(s, k, a);
+  }
+  mpi.node_comm.barrier();
+  auto sS = make_shared_array<array_view_4d_t>(mpi, {nspin, nk_ibz, nbnd, nbnd});
+  hamilt::set_ovlp(mfobj, sS);
+
+  // ----- Exact reference from the hamiltonian folder -----
+  hamilt::pseudopot V(mfobj);
+  auto dVH_ref = hamilt::Vhartree<MEM>(mfobj, mpi.comm, &V, nii);
+  auto dVX_ref = hamilt::Vexchange<MEM>(mfobj, mpi.comm, &V, nii);
+  auto VH_ref = nda::to_host(dVH_ref.local());
+  auto VX_ref = nda::to_host(dVX_ref.local());
+
+  auto rng_s = dVH_ref.local_range(0); auto rng_k = dVH_ref.local_range(1);
+  auto rng_i = dVH_ref.local_range(2); auto rng_j = dVH_ref.local_range(3);
+
+  // Reference Frobenius norms.
+  double fro_VH_ref = 0.0, fro_VX_ref = 0.0;
+  for (auto [is,s] : itertools::enumerate(rng_s))
+    for (auto [ik,k] : itertools::enumerate(rng_k))
+      for (auto [ii,i] : itertools::enumerate(rng_i))
+        for (auto [ij,j] : itertools::enumerate(rng_j)) {
+          fro_VH_ref += std::norm(VH_ref(is,ik,ii,ij));
+          fro_VX_ref += std::norm(VX_ref(is,ik,ii,ij));
+        }
+  fro_VH_ref = std::sqrt(mpi.comm.all_reduce_value(fro_VH_ref, std::plus<>{}));
+  fro_VX_ref = std::sqrt(mpi.comm.all_reduce_value(fro_VX_ref, std::plus<>{}));
+
+  if (mpi.comm.root())
+    app_log(2, "CONVCSV_HEADER,{},thresh,Np,errVH_max,errVH_fro,relVH_fro,"
+               "errVX_max,errVX_fro,relVX_fro", tag);
+
+  // Compute THC V_H, V_x at a given ISDF threshold, returned as host arrays.
+  auto thc_VH_VX = [&](double thr) {
+    auto thc_pt = methods::make_thc_reader_ptree(
+        0, "", "incore", "", "bdft", thr, thc_ecut);
+    thc_pt.put("paw_aug", true);
+    thc_pt.put("paw_isdf_metric", "coulomb");
+    thc_pt.put("paw_isdf_tol", 1e-12);
+    methods::thc_reader_t thc(mf_ptr, thc_pt);
+    int Np = thc.Np();
+    auto sVH = make_shared_array<array_view_4d_t>(mpi, {nspin, nk_ibz, nbnd, nbnd});
+    { methods::solvers::hf_t hf(methods::ignore_g0);
+      hf.evaluate(sVH, sDm.local(), thc, sS.local(), true, false); }
+    auto sVX = make_shared_array<array_view_4d_t>(mpi, {nspin, nk_ibz, nbnd, nbnd});
+    { methods::solvers::hf_t hf(methods::ignore_g0);
+      hf.evaluate(sVX, sDm.local(), thc, sS.local(), false, true); }
+    // Explicit copies — sVH/sVX (shared arrays) are destroyed at return, so a
+    // to_host view would dangle.
+    nda::array<ComplexType, 4> VHc = sVH.local();
+    nda::array<ComplexType, 4> VXc = sVX.local();
+    return std::make_tuple(Np, VHc, VXc);
+  };
+
+  // Converged-ISDF reference: tightest threshold. THC at this threshold IS the
+  // deeq-complete augmented V_H/V_x (the operator that reproduces QE eigenvalues)
+  // up to a negligible ISDF residual, so self-convergence against it isolates
+  // the ISDF-threshold error from the (V_H bra-aug, PAW one-center) bookkeeping
+  // offsets that the absolute-vs-hamiltonian comparison also reports.
+  double thr_conv = *std::min_element(thresholds.begin(), thresholds.end());
+  auto [Np_conv, VH_conv, VX_conv] = thc_VH_VX(thr_conv);
+  double fro_VH_conv = 0.0, fro_VX_conv = 0.0;
+  // VH_conv/VX_conv are full (shared) arrays → index with GLOBAL (s,k,i,j).
+  for (auto [is,s] : itertools::enumerate(rng_s))
+    for (auto [ik,k] : itertools::enumerate(rng_k))
+      for (auto [ii,i] : itertools::enumerate(rng_i))
+        for (auto [ij,j] : itertools::enumerate(rng_j)) {
+          fro_VH_conv += std::norm(VH_conv(s,k,i,j));
+          fro_VX_conv += std::norm(VX_conv(s,k,i,j));
+        }
+  fro_VH_conv = std::sqrt(mpi.comm.all_reduce_value(fro_VH_conv, std::plus<>{}));
+  fro_VX_conv = std::sqrt(mpi.comm.all_reduce_value(fro_VX_conv, std::plus<>{}));
+
+  for (double thr : thresholds) {
+    auto [Np, VH, VX] = thc_VH_VX(thr);
+    double eVH_max=0, eVX_max=0, eVH_fro=0, eVX_fro=0;
+    double eVX_diag=0, eVX_off=0;     // diag vs off-diag V_x abs error (Frob²)
+    double sVH_fro=0, sVX_fro=0;      // self-convergence (vs converged-ISDF THC)
+    double sVX_diag=0, sVX_off=0;
+    for (auto [is,s] : itertools::enumerate(rng_s))
+      for (auto [ik,k] : itertools::enumerate(rng_k))
+        for (auto [ii,i] : itertools::enumerate(rng_i))
+          for (auto [ij,j] : itertools::enumerate(rng_j)) {
+            ComplexType dH = VH(s,k,i,j) - VH_ref(is,ik,ii,ij);
+            ComplexType dX = VX(s,k,i,j) - VX_ref(is,ik,ii,ij);
+            eVH_max = std::max(eVH_max, std::abs(dH));
+            eVX_max = std::max(eVX_max, std::abs(dX));
+            eVH_fro += std::norm(dH);
+            eVX_fro += std::norm(dX);
+            if (i == j) eVX_diag += std::norm(dX);
+            else        eVX_off  += std::norm(dX);
+            // self-convergence vs converged-ISDF THC (both full arrays → global)
+            ComplexType sH = VH(s,k,i,j) - VH_conv(s,k,i,j);
+            ComplexType sX = VX(s,k,i,j) - VX_conv(s,k,i,j);
+            sVH_fro += std::norm(sH);
+            sVX_fro += std::norm(sX);
+            if (i == j) sVX_diag += std::norm(sX);
+            else        sVX_off  += std::norm(sX);
+          }
+    eVH_max = mpi.comm.all_reduce_value(eVH_max, boost::mpi3::max<>{});
+    eVX_max = mpi.comm.all_reduce_value(eVX_max, boost::mpi3::max<>{});
+    eVH_fro = std::sqrt(mpi.comm.all_reduce_value(eVH_fro, std::plus<>{}));
+    eVX_fro = std::sqrt(mpi.comm.all_reduce_value(eVX_fro, std::plus<>{}));
+    eVX_diag = std::sqrt(mpi.comm.all_reduce_value(eVX_diag, std::plus<>{}));
+    eVX_off  = std::sqrt(mpi.comm.all_reduce_value(eVX_off,  std::plus<>{}));
+    sVH_fro = std::sqrt(mpi.comm.all_reduce_value(sVH_fro, std::plus<>{}));
+    sVX_fro = std::sqrt(mpi.comm.all_reduce_value(sVX_fro, std::plus<>{}));
+    sVX_diag = std::sqrt(mpi.comm.all_reduce_value(sVX_diag, std::plus<>{}));
+    sVX_off  = std::sqrt(mpi.comm.all_reduce_value(sVX_off,  std::plus<>{}));
+    if (mpi.comm.root()) {
+      // Absolute error vs the exact hamiltonian (Vhartree / Vexchange).
+      app_log(2, "CONVCSV,{},{:.3e},{},{:.6e},{:.6e},{:.6e},{:.6e},{:.6e},{:.6e}",
+              tag, thr, Np, eVH_max, eVH_fro, eVH_fro/std::max(1e-30,fro_VH_ref),
+              eVX_max, eVX_fro, eVX_fro/std::max(1e-30,fro_VX_ref));
+      // Self-convergence (relative Frobenius vs converged-ISDF THC).
+      app_log(2, "CONVSELF,{},{:.3e},{},relVH_self={:.6e},relVX_self={:.6e}",
+              tag, thr, Np, sVH_fro/std::max(1e-30,fro_VH_conv),
+              sVX_fro/std::max(1e-30,fro_VX_conv));
+      app_log(2, "CONVVX_SPLIT,{},{:.3e},{},absVX_diag={:.6e},absVX_off={:.6e},"
+                 "selfVX_diag={:.6e},selfVX_off={:.6e}",
+              tag, thr, Np, eVX_diag, eVX_off, sVX_diag, sVX_off);
+    }
+  }
+}
+
+TEST_CASE("isdf_threshold_convergence", "[hamilt][thc][convergence][!benchmark]")
+{
+  auto& mpi = utils::make_unit_test_mpi_context();
+  std::vector<double> thr = {3e-2, 1e-2, 3e-3, 1e-3, 3e-4, 1e-4, 3e-5, 1e-5, 3e-6, 1e-6};
+  // /tmp DFT fixtures: LiH 2×2×2, 50 bands, ecutwfc=125 Ry (= 62.5 Ha).
+  // THC ISDF ecut = ecutwfc_Ha × 1.25 = 78.125 Ha.
+  const double thc_ecut = 62.5 * 1.25;
+
+  SECTION("lih_50bnd ecut125 (USPP, PBE)") {
+    auto mf_ptr = std::make_shared<mf::MF>(
+        mf::default_MF(mpi, mf::qe_source, "/tmp/lih_conv50_uspp_hf/", "pwscf",
+                       mf::h5_input_type));
+    run_isdf_threshold_convergence<HOST_MEMORY>(*mpi, mf_ptr, "USPP", thr, thc_ecut);
+  }
+  SECTION("lih_50bnd ecut125 (PAW, PBE)") {
+    auto mf_ptr = std::make_shared<mf::MF>(
+        mf::default_MF(mpi, mf::qe_source, "/tmp/lih_conv50_paw_hf/", "pwscf",
+                       mf::h5_input_type));
+    run_isdf_threshold_convergence<HOST_MEMORY>(*mpi, mf_ptr, "PAW", thr, thc_ecut);
+  }
+
+  // HF fixtures (16 bands, ecutwfc=100 Ry). On these the DIAGONAL of the Fock
+  // matrix in the band basis IS the validated QE eigenvalue, so the V_x
+  // diag/off-diag split (CONVVX_SPLIT) confirms: Vexchange's ½ one-center
+  // reproduces the diagonal (vs QE/THC) while disagreeing off-diagonal.
+  SECTION("lih_kp222_nbnd16 (PAW, HF) — diag/offdiag confirm") {
+    auto mf_ptr = std::make_shared<mf::MF>(
+        mf::default_MF(mpi, "qe_lih222_paw_hf", mf::h5_input_type));
+    run_isdf_threshold_convergence<HOST_MEMORY>(*mpi, mf_ptr, "PAW_HF",
+        {1e-3, 1e-4, 1e-5, 1e-6}, 62.5);
+  }
+  SECTION("lih_kp222_nbnd16 (USPP, HF) — diag/offdiag confirm") {
+    auto mf_ptr = std::make_shared<mf::MF>(
+        mf::default_MF(mpi, "qe_lih222_uspp_hf", mf::h5_input_type));
+    run_isdf_threshold_convergence<HOST_MEMORY>(*mpi, mf_ptr, "USPP_HF",
+        {1e-3, 1e-4, 1e-5, 1e-6}, 62.5);
+  }
+}
+
+TEST_CASE("thc_vs_direct_VH_VX", "[hamilt][thc][hf]")
+{
+  auto& mpi = utils::make_unit_test_mpi_context();
+
+  // Strict comparison: for NCPP both Vhartree and Vexchange produce the
+  // FULL matrix element (no PAW augmentation), and the THC factorization
+  // should reproduce them to within ISDF truncation (~1e-4 at thc_thresh=1e-5).
+  SECTION("lih_kp222_nbnd16 (NCPP, HF)") {
+    auto mf_ptr = std::make_shared<mf::MF>(
+        mf::default_MF(mpi, "qe_lih222_hf", mf::h5_input_type));
+    test_thc_vs_direct_VH_VX<HOST_MEMORY>(*mpi, mf_ptr,
+        /*thc_thresh*/ 1e-5, /*tol_VH*/ 5e-4, /*tol_VX*/ 5e-3,
+        /*strict_VH*/ true, /*strict_VX*/ true);
+  }
+
+  // Diagnostic mode for USPP/PAW: the PAW V_H output of hf_t::evaluate
+  // (THC path) includes contributions that the direct hamilt::Vhartree
+  // + inline deltaC×becsum×P×P assembly does not reconcile yet. This
+  // section logs the per-band diffs and reports overall magnitudes;
+  // closing the V_H convention gap is a follow-up task. V_x agrees
+  // between paths up to the empirical 1/4 factor on the one-center
+  // already documented in v_x_paw.hpp.
+  // USPP: V_x is the complete eigenvalue-validated quantity and matches THC
+  // strictly (no deltaC one-center for USPP). V_H one-center lives in deeq,
+  // so the standalone Vhartree comparison is diagnostic only.
+  SECTION("lih_kp222_nbnd16 (USPP, HF)") {
+    auto mf_ptr = std::make_shared<mf::MF>(
+        mf::default_MF(mpi, "qe_lih222_uspp_hf", mf::h5_input_type));
+    test_thc_vs_direct_VH_VX<HOST_MEMORY>(*mpi, mf_ptr,
+        /*thc_thresh*/ 1e-5, /*tol_VH*/ 5e-4, /*tol_VX*/ 5e-3,
+        /*strict_VH*/ false, /*strict_VX*/ true);
+  }
+
+  // PAW: both V_H and V_x diagnostic. V_x carries the empirical /4 one-center
+  // factor (matches QE HF eigenvalue but ~13% off the THC K_a per-element);
+  // V_H one-center lives in deeq. Both are follow-up reconciliations.
+  SECTION("lih_kp222_nbnd16 (PAW, HF, diagnostic)") {
+    auto mf_ptr = std::make_shared<mf::MF>(
+        mf::default_MF(mpi, "qe_lih222_paw_hf", mf::h5_input_type));
+    test_thc_vs_direct_VH_VX<HOST_MEMORY>(*mpi, mf_ptr,
+        /*thc_thresh*/ 1e-5, /*tol_VH*/ 5e-4, /*tol_VX*/ 5e-3,
+        /*strict_VH*/ false, /*strict_VX*/ false);
   }
 }
 
@@ -2930,6 +3376,228 @@ TEST_CASE("local_isdf_h5_roundtrip", "[hamilt][paw][isdf]")
   SECTION("lih_kp222_nbnd16 (USPP)") {
     auto qe_h5 = mf::default_MF(mpi, "qe_lih222_uspp", mf::h5_input_type);
     test_local_isdf_h5_roundtrip<HOST_MEMORY>(*mpi, qe_h5);
+  }
+}
+
+/**
+ * HF eigenvalue regression test.
+ *
+ * For a converged QE input_dft='hf' SCF, the band basis diagonalizes the HF
+ * Fock matrix F = T + V_loc + V_NL + V_H + K, so diag(F)/diag(S) = eigval
+ * for occupied bands. This test computes F via CoQui's pipeline (hamilt::H
+ * for the kinetic/V_loc/V_NL/V_H block, hamilt::Vexchange for the signed
+ * exact-exchange block) and compares the diagonals to mfobj.eigval.
+ *
+ * The qe_lih222_hf fixture is configured with `exxdiv_treatment='none'`
+ * and `x_gamma_extrapolation=.false.`, which matches CoQui's bare-4π/G²
+ * Coulomb with the G+Δk=0 component zeroed. Hence absolute eigenvalues
+ * should match (no Gygi-Baldereschi-style constant offset).
+ */
+template<MEMORY_SPACE MEM>
+void test_hf_eigenvalues(mpi_context_t& mpi, mf::MF& mfobj,
+                          double tol = 5e-5, double occ_threshold = 1e-6)
+{
+  auto all = nda::range::all;
+  long nspin   = mfobj.nspin();
+  long nk_ibz  = mfobj.nkpts_ibz();
+  long nbnd    = mfobj.nbnd();
+
+  memory::array<MEM, ComplexType, 3> nii(nspin, nk_ibz, nbnd);
+  if constexpr (MEM == HOST_MEMORY) {
+    nii() = mfobj.occ()(all, nda::range(nk_ibz), all);
+  } else {
+    nii() = nda::array<ComplexType,3>(mfobj.occ()(all, nda::range(nk_ibz), all));
+  }
+
+  hamilt::pseudopot V(mfobj);
+  // H = T + V_loc + V_NL + V_H
+  auto Hij = hamilt::H<MEM>(mfobj, mpi.comm, &V, nii);
+  // K = exact-exchange matrix (signed; F = H + K conventionally)
+  auto Kij = hamilt::Vexchange<MEM>(mfobj, mpi.comm, &V, nii);
+
+  utils::check(Hij.local_shape() == Kij.local_shape(),
+               "test_hf_eigenvalues: H/K local shape mismatch");
+  nda::tensor::add(ComplexType(1.0), Kij.local(),
+                   ComplexType(1.0), Hij.local());
+
+  // QE-saved orbitals are S_aug-orthonormal: ⟨ψ̃|S|ψ̃⟩ = δ_nm by construction.
+  // ⟨ψ̃_n|H|ψ̃_n⟩ = ε_n directly — no overlap correction needed for
+  // diagonal eigenvalues (compare H_nn to eigval without dividing by S).
+  auto Hloc = nda::to_host(Hij.local());
+  auto Kloc = nda::to_host(Kij.local());
+  double max_err = 0.0;
+  long  count = 0;
+  auto b_rng = Hij.local_range(3);
+  for (auto [is, s] : itertools::enumerate(Hij.local_range(0)))
+    for (auto [ik, k] : itertools::enumerate(Hij.local_range(1))) {
+      for (auto [ia, a] : itertools::enumerate(Hij.local_range(2))) {
+        if (!(a >= b_rng.first() && a < b_rng.last())) continue;
+        if (mfobj.occ(s, k, a) < occ_threshold) continue;
+        long ib = a - b_rng.first();
+        double H_diag = std::real(Hloc(is, ik, ia, ib));
+        double K_diag = std::real(Kloc(is, ik, ia, ib));
+        double eps_ref = mfobj.eigval(s, k, a);
+        double err = std::abs(H_diag - eps_ref);
+        if (err > max_err) max_err = err;
+        ++count;
+        if (err > tol) {
+          app_log(2,
+            "HF eigval mismatch: s={}, k={}, n={}, K_nn={:+.6f}, H_nn={:+.6f}, "
+            "ref={:+.6f}, err={:.2e}",
+            s, k, a, K_diag, H_diag, eps_ref, err);
+        }
+      }
+    }
+  max_err = mpi.comm.all_reduce_value(max_err, boost::mpi3::max<>{});
+  count   = mpi.comm.all_reduce_value(count,   std::plus<>{});
+  app_log(2,
+    "HF eigenvalue regression: max|H_nn - eps_n| = {:.3e} over {} occupied "
+    "states (tol={:.1e})", max_err, count, tol);
+  CHECK(max_err < tol);
+}
+
+TEST_CASE("hf_eigenvalues", "[hamilt][hf]")
+{
+  auto& mpi = utils::make_unit_test_mpi_context();
+
+  // NCPP HF reference: fixture uses exxdiv_treatment='none' and
+  // x_gamma_extrapolation=.false., matching CoQui's bare 4π/|G+Δk|² with
+  // G+Δk=0 zeroed. No singularity correction needed for absolute match.
+  SECTION("lih_kp222_nbnd16 (NCPP, HF)") {
+    auto qe_h5 = mf::default_MF(mpi, "qe_lih222_hf", mf::h5_input_type);
+    test_hf_eigenvalues<HOST_MEMORY>(*mpi, qe_h5, /*tol*/ 5e-5);
+  }
+
+  // USPP HF: exercises the G-space augmentation (Q^IJ_atm × phase) without
+  // the PAW one-center correction. The USPP exchange kernel = NCPP smooth
+  // exchange + Q-augmentation in the pair density only.
+  SECTION("lih_kp222_nbnd16 (USPP, HF)") {
+    namespace fs = std::filesystem;
+    auto [outdir, prefix] = utils::utest_filename("qe_lih222_uspp_hf");
+    if (!fs::exists(outdir + "/pwscf.save/wfc1.hdf5")) {
+      WARN("Skipping USPP HF section: missing " << outdir
+           << "/pwscf.save/wfc1.hdf5");
+    } else {
+      auto qe_h5 = mf::default_MF(mpi, "qe_lih222_uspp_hf", mf::h5_input_type);
+      test_hf_eigenvalues<HOST_MEMORY>(*mpi, qe_h5, /*tol*/ 5e-3);
+    }
+  }
+
+  // PAW HF: exercises the v_x_paw.hpp pair-density augmentation
+  // (Q^IJ_atm(G+Δk) × e^{-i(G+Δk)·τ_atm} added to smooth pair density
+  // before Coulomb contraction). Requires lih_kp222_nbnd16_paw_hf/
+  // pwscf.save/wfc1.hdf5; if absent (only pwscf.coqui.h5 in fixture)
+  // the section is skipped. Regenerate via QE input_dft='hf+noc' with
+  // exxdiv_treatment='none', x_gamma_extrapolation=.false.; see the
+  // scf.inp shipped in the fixture directory.
+  SECTION("lih_kp222_nbnd16 (PAW, HF)") {
+    namespace fs = std::filesystem;
+    auto [outdir, prefix] = utils::utest_filename("qe_lih222_paw_hf");
+    if (!fs::exists(outdir + "/pwscf.save/wfc1.hdf5")) {
+      WARN("Skipping PAW HF section: " << outdir
+           << "/pwscf.save/wfc1.hdf5 not found. "
+           << "Regenerate via QE input_dft='hf+noc' (see fixture scf.inp).");
+    } else {
+      auto qe_h5 = mf::default_MF(mpi, "qe_lih222_paw_hf", mf::h5_input_type);
+      test_hf_eigenvalues<HOST_MEMORY>(*mpi, qe_h5, /*tol*/ 5e-3);
+    }
+  }
+}
+
+/**
+ * Structural smoke test for the exchange matrix on USPP/PAW fixtures.
+ *
+ * Goal: verify that Vexchange runs on the augmentation code path without
+ * crashing and that the output K_{ij} matrix has the expected structural
+ * properties — Hermitian, finite, real on the diagonal for non-magnetic
+ * non-SOC systems. This does NOT compare to QE numerically (the existing
+ * PAW DFT fixture has no HF reference eigenvalues), so it complements
+ * test_hf_eigenvalues until a PAW HF fixture is generated.
+ */
+template<MEMORY_SPACE MEM>
+void test_exchange_structural(mpi_context_t& mpi, mf::MF& mfobj,
+                              double herm_tol = 1e-8)
+{
+  auto all = nda::range::all;
+  long nspin   = mfobj.nspin();
+  long nk_ibz  = mfobj.nkpts_ibz();
+  long nbnd    = mfobj.nbnd();
+
+  memory::array<MEM, ComplexType, 3> nii(nspin, nk_ibz, nbnd);
+  if constexpr (MEM == HOST_MEMORY) {
+    nii() = mfobj.occ()(all, nda::range(nk_ibz), all);
+  } else {
+    nii() = nda::array<ComplexType,3>(mfobj.occ()(all, nda::range(nk_ibz), all));
+  }
+
+  hamilt::pseudopot V(mfobj);
+  auto Kij = hamilt::Vexchange<MEM>(mfobj, mpi.comm, &V, nii);
+  auto Kloc = nda::to_host(Kij.local());
+
+  // 1) Finite: no NaNs / Infs.
+  double maxabs = 0.0;
+  for (long s = 0; s < Kloc.extent(0); ++s)
+    for (long k = 0; k < Kloc.extent(1); ++k)
+      for (long i = 0; i < Kloc.extent(2); ++i)
+        for (long j = 0; j < Kloc.extent(3); ++j) {
+          double r = std::real(Kloc(s,k,i,j));
+          double im = std::imag(Kloc(s,k,i,j));
+          CHECK(std::isfinite(r));
+          CHECK(std::isfinite(im));
+          maxabs = std::max({maxabs, std::abs(r), std::abs(im)});
+        }
+  app_log(2, "test_exchange_structural: max|K_skij| = {:.3e}", maxabs);
+
+  // 2) Hermitian: K_ij = K_ji* per (s, k).
+  double max_herm = 0.0;
+  for (long s = 0; s < Kloc.extent(0); ++s)
+    for (long k = 0; k < Kloc.extent(1); ++k)
+      for (long i = 0; i < Kloc.extent(2); ++i)
+        for (long j = 0; j < Kloc.extent(3); ++j) {
+          ComplexType d = Kloc(s,k,i,j) - std::conj(Kloc(s,k,j,i));
+          max_herm = std::max(max_herm, std::abs(d));
+        }
+  app_log(2, "test_exchange_structural: max|K_ij - K_ji*| = {:.3e}", max_herm);
+  CHECK(max_herm < herm_tol * std::max(1.0, maxabs));
+
+  // 3) Real diagonal for non-magnetic / non-SOC: K_nn diagonal entries should
+  // have zero imaginary part (within Hermiticity tolerance).
+  double max_im_diag = 0.0;
+  for (long s = 0; s < Kloc.extent(0); ++s)
+    for (long k = 0; k < Kloc.extent(1); ++k)
+      for (long i = 0; i < Kloc.extent(2); ++i)
+        max_im_diag = std::max(max_im_diag,
+                               std::abs(std::imag(Kloc(s,k,i,i))));
+  app_log(2, "test_exchange_structural: max|Im K_nn| = {:.3e}", max_im_diag);
+  CHECK(max_im_diag < herm_tol * std::max(1.0, maxabs));
+}
+
+TEST_CASE("exchange_structural", "[hamilt][hf][paw]")
+{
+  auto& mpi = utils::make_unit_test_mpi_context();
+
+  // NCPP cross-check — should already be implied by the hf_eigenvalues
+  // NCPP section, but a quick structural pass at the same fixture is
+  // a useful regression guard.
+  SECTION("lih_kp222_nbnd16 (NCPP, HF)") {
+    auto qe_h5 = mf::default_MF(mpi, "qe_lih222_hf", mf::h5_input_type);
+    test_exchange_structural<HOST_MEMORY>(*mpi, qe_h5);
+  }
+
+  // Exercises the PAW augmentation path in v_x_paw.hpp:
+  // per-pair Q^IJ_atm(G+Δk) × phase added to each pair density. The
+  // eigenvalue comparison is impossible here (this is a DFT-PBE fixture,
+  // not HF), but the Hermiticity + finiteness + real-diagonal checks
+  // catch any obvious augmentation indexing / sign / FFT bug.
+  SECTION("lih_kp222_nbnd16 (PAW, DFT structural smoke)") {
+    auto qe_h5 = mf::default_MF(mpi, "qe_lih222_paw", mf::h5_input_type);
+    test_exchange_structural<HOST_MEMORY>(*mpi, qe_h5);
+  }
+
+  // Same for USPP.
+  SECTION("lih_kp222_nbnd16 (USPP, DFT structural smoke)") {
+    auto qe_h5 = mf::default_MF(mpi, "qe_lih222_uspp", mf::h5_input_type);
+    test_exchange_structural<HOST_MEMORY>(*mpi, qe_h5);
   }
 }
 

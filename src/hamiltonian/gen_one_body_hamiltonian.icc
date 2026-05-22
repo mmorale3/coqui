@@ -110,23 +110,80 @@ auto gen_Vhartree(mf::MF& mf, boost::mpi3::communicator& comm, pseudopot *psp,
   long nkpts = psi.global_shape()[1];
   long nbnd = psi.global_shape()[2];
 
-  // add Hartree potential to hpsi
+  // Vij accumulates the PAW/USPP one-center deeq (radial AE−PS + dynamic
+  // G-space ∫V_H·Q) inside add_Hartree (via add_vnl_impl), then the smooth
+  // bra ⟨ψ̃_i|V_H|ψ̃_j⟩ is added below — exactly mirroring gen_H0's Hij. The
+  // sum is the ALL-ELECTRON V_H matrix element; NCPP contributes zero deeq.
+  auto Vij = math::nda::make_distributed_array<larray>(comm,psi.grid(),{nspin,nkpts,nbnd,nbnd},
+                                                       {psi.block_size()[0],psi.block_size()[1],psi.block_size()[2],psi.block_size()[2]});
+  Vij.local() = ComplexType(0.0);
+
+  // add Hartree potential to hpsi (local), one-center deeq to Vij (non-local)
   if(nii != nullptr)
-    psp->add_Hartree(k_range,*nii,psi,hpsi,symmetrize);
+    psp->add_Hartree(k_range,*nii,psi,hpsi,Vij,symmetrize);
   else if(nij != nullptr)
-    psp->add_Hartree(k_range,*nij,psi,hpsi,symmetrize);
+    psp->add_Hartree(k_range,*nij,psi,hpsi,Vij,symmetrize);
   else
     utils::check(false, "gen_Vhartree: both nii and nij are \"nullptr\". ");
 
-  // Vij = conj(psi(i,:)) * hpsi(j,:) = conj( conj(Vij) + psi(i,:) * conj(hpsi(j,:)) )
-  auto Vij = math::nda::make_distributed_array<larray>(comm,psi.grid(),{nspin,nkpts,nbnd,nbnd},
-                                                       {psi.block_size()[0],psi.block_size()[1],psi.block_size()[2],psi.block_size()[2]});
-
+  // Combine: Vij = Vij_deeq + conj(psi(i,:)) * hpsi(j,:)
+  //              = conj( conj(Vij_deeq) + psi(i,:) * conj(hpsi(j,:)) )
+  nda::tensor::scale(ComplexType(1.0),Vij.local(),nda::tensor::op::CONJ);
   math::nda::slate_ops::multiply(ComplexType(1.0),psi,math::nda::dagger(hpsi),
-                                   ComplexType(0.0),Vij);
+                                   ComplexType(1.0),Vij);
   nda::tensor::scale(ComplexType(1.0),Vij.local(),nda::tensor::op::CONJ);
 
   return Vij;
+}
+
+/**
+ * Compute the matrix elements of the exact-exchange operator K_{ij}(s, k_p)
+ * via FFT pair densities. NCPP / USPP / PAW dispatch is handled inside
+ * pseudopot::add_exchange (which routes through hamilt::paw::v_x → delegates
+ * to hamilt::v_x for NCPP, adds Q-augmented pair density for USPP/PAW).
+ *
+ * Unlike gen_Vhartree this does NOT build an hpsi intermediate. Exact
+ * exchange has no representation as a local potential acting on a single
+ * orbital — the augmentation cross terms are band-pair-dependent, so the
+ * K matrix is built directly.
+ *
+ * Sign: K is the SIGNED contribution to the Fock matrix (F = H_core + V_H + K
+ * with K already negative).
+ */
+template<MEMORY_SPACE MEM, nda::ArrayOfRank<3> Arr3_t>
+auto gen_Vexchange(mf::MF& mf, boost::mpi3::communicator& comm, pseudopot *psp,
+                   nda::range k_range, nda::range b_range,
+                   memory::darray_t<memory::array<MEM,ComplexType,4>, mpi3::communicator>& psi,
+                   Arr3_t const& nii)
+{
+  using larray = memory::array<MEM,ComplexType,4>;
+
+  app_log(2, "Evaluate the exchange matrix using FFT pair densities");
+  app_log(2, "-----------------------------------------------------\n");
+  app_log(2, "  nbnd  = {}", mf.nbnd());
+  app_log(2, "  npol  = {}", mf.npol());
+  app_log(2, "  nspin = {}", mf.nspin());
+  app_log(2, "  nkpts = {}", mf.nkpts());
+  app_log(2, "  nkpts_ibz = {}", mf.nkpts_ibz());
+  app_log(2, "");
+
+  utils::check(psp != nullptr, "gen_Vexchange: Missing pseudopot object.");
+  utils::check(k_range.size() == psi.global_shape()[1], "Shape mismatch.");
+  utils::check(b_range.size() == psi.global_shape()[2], "Shape mismatch.");
+
+  long nspin = psi.global_shape()[0];
+  long nkpts = psi.global_shape()[1];
+  long nbnd  = psi.global_shape()[2];
+
+  auto Kij = math::nda::make_distributed_array<larray>(
+      comm, psi.grid(), {nspin, nkpts, nbnd, nbnd},
+      {psi.block_size()[0], psi.block_size()[1],
+       psi.block_size()[2], psi.block_size()[2]});
+  Kij.local() = ComplexType(0.0);
+
+  psp->add_exchange(k_range, nii, psi, Kij);
+
+  return Kij;
 }
 
 /**

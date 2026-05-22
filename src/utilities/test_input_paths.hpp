@@ -139,6 +139,14 @@ inline std::tuple<std::string,std::string> utest_filename(std::string src)
     return std::make_tuple(std::string(PROJECT_SOURCE_DIR)+
                                "/tests/unit_test_files/qe/lih_kp222_nbnd16_hf/",
                            std::string("pwscf"));
+  } else if (src == "qe_lih222_paw_hf") {
+    return std::make_tuple(std::string(PROJECT_SOURCE_DIR)+
+                               "/tests/unit_test_files/qe/lih_kp222_nbnd16_paw_hf/",
+                           std::string("pwscf"));
+  } else if (src == "qe_lih222_uspp_hf") {
+    return std::make_tuple(std::string(PROJECT_SOURCE_DIR)+
+                               "/tests/unit_test_files/qe/lih_kp222_nbnd16_uspp_hf/",
+                           std::string("pwscf"));
   } else if (src == "qe_GaAs222_hf") {
     return std::make_tuple(std::string(PROJECT_SOURCE_DIR)+
                                "/tests/unit_test_files/qe/GaAs_kp222_hf/",

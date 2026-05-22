@@ -42,7 +42,10 @@
 #include "mean_field/distributed_orbital_readers.hpp"
 #include "hamiltonian/add_vloc.hpp"
 #include "hamiltonian/v_h.hpp"
+#include "hamiltonian/v_x.hpp"
 #include "hamiltonian/paw/v_h_paw.hpp"
+#include "hamiltonian/paw/v_x_paw.hpp"
+#include "hamiltonian/paw/paw_onecenter.hpp"   // compute_paw_deeq / compute_deeq_scf
 #include "hamiltonian/pseudo/pseudopot.h"
 #include "hamiltonian/pseudo/pseudopot_to_h5.hpp"
 #include "numerics/nda_functions.hpp"
@@ -1134,7 +1137,7 @@ void pseudopot::add_vpp_impl(boost::mpi3::communicator& comm,
    */
   if( nii != nullptr or nij != nullptr ) {
 
-    auto mpi_local_context = utils::make_mpi_context(comm); 
+    auto mpi_local_context = utils::make_mpi_context(comm);
 
     // local pseudopotential + hartree
     sarray_t<nda::array_view<ComplexType,1>> svr(mpi_local_context,{nnr_aug});
@@ -1145,11 +1148,7 @@ void pseudopot::add_vpp_impl(boost::mpi3::communicator& comm,
                   "Error in pseudo::add_vpp_impl: Both nii and nij!!");
     utils::check( k_range.first() == 0 and  k_range.last() == nkpts_ibz, 
                  "Error in add_vloc: add_hartree requires full kpoint range.");
-    // Calculate and add Hartree term. The pseudopot-taking hamilt::v_h
-    // overload delegates to the smooth-only hamilt::v_h for the
-    // smooth-density Hartree, then (for USPP/PAW) adds the compensation-
-    // charge augmentation Σ_a Σ_IJ becsum_aIJ Q^IJ_nt(G) e^{-iG·τ_a}.
-    // For NCPP, the augmentation step short-circuits to a no-op.
+    // Calculates hartree potential on the soft+augmentation charge density. 
     if( nii != nullptr)
       hamilt::v_h(*mpi, vG, *this, npol, fft_mesh_aug, lattv, recv,
                   swfc_to_rho.local(), kpts, kp_to_ibz,
@@ -1185,6 +1184,12 @@ void pseudopot::add_vpp_impl(boost::mpi3::communicator& comm,
     }
     mpi->node_comm.barrier();
 
+    // Phase 2 (TODO): build the native non-local D here from vr (=V_H) +
+    // becsum via compute_paw_deeq(*nii, vr, /*include_static=*/true) and feed
+    // it to the single add_vnl_impl below, replacing the QE deeq. Deferred:
+    // it shifts QE eigenvalues by ~2.3 Ha until the static baseline / ns²
+    // factor / Vexchange one-center are reconciled (see add_vnl_impl branch).
+
   } else {
 
     // local potential
@@ -1200,9 +1205,12 @@ void pseudopot::add_vpp_impl(boost::mpi3::communicator& comm,
   if (ptype == pp_ncpp_t)
     add_vnl_impl(k_range, b_range, Dnn.local(),      Hij);
   else {
-    // MAM: In USPP/PAW, we are using the DFT/QE deeq. We need to recalculate
-    //      the augmentation term here (need to make sure to remove any terms from DFT/QE) 
-    //      since we are generally going to be going SCF calculations where Veff changes.
+    // MAM: In USPP/PAW we still use the QE-loaded deeq here. The native
+    //      builder `compute_paw_deeq` exists and is used by Vhartree, but
+    //      routing H through it (Dion_native, include_static=true) shifts the
+    //      QE eigenvalues by ~2.3 Ha — the static baseline + the V_H matrix-
+    //      element ns² factor are not the correct deeq for H, and the
+    //      Vexchange one-center must be re-derived together. TODO: Phase 2.
     app_warning(" PAW implementation of Vnl is not yet complete !!!");
     add_vnl_impl(k_range, b_range, Dnn_atom.local(), Hij);
   }
@@ -1306,9 +1314,10 @@ void pseudopot::add_Vpp(boost::mpi3::communicator& comm,
 
 // MAM: This routine should take an mpi_context and use it, instead of mpi
 template<nda::ArrayOfRank<3> Arr3, nda::ArrayOfRank<4> Arr4>
-void pseudopot::add_Hartree_impl(nda::range k_range,
+void pseudopot::add_Hartree_impl(nda::range k_range, nda::range b_range,
                                  math::nda::DistributedArrayOfRank<4> auto const& psi,
                                  math::nda::DistributedArrayOfRank<4> auto & hpsi,
+                                 math::nda::DistributedArrayOfRank<4> auto & Vij,
                                  const Arr3 *nii, const Arr4 *nij, bool symmetrize) {
   constexpr auto MEM = memory::get_memory_space<std::decay_t<decltype(psi.local())>>();
   constexpr auto MEM1 = memory::get_memory_space<std::decay_t<decltype(hpsi.local())>>();
@@ -1350,24 +1359,74 @@ void pseudopot::add_Hartree_impl(nda::range k_range,
   // add v_hartree to hpsi
   hamilt::add_vloc(npol, fft_mesh_aug, swfc_to_rho.local(), v_hartree, psi, hpsi);
 
+  // PAW/USPP: build the native one-center deeq (radial AE−PS + dynamic
+  // G-space ∫V_H·Q from the smooth V_H(r) just computed; NO static, since
+  // Vij is the pure Hartree matrix) and contract it into Vij via add_vnl_impl
+  // — the single matrix-touching path, mirroring how add_vpp_impl forms Hij.
+  // No QE deeq, no XC. NCPP / non-augmented species → zero Dion (no-op).
+  if (ptype != pp_ncpp_t && nii != nullptr) {
+    auto Dion_H = compute_paw_deeq(*nii, v_hartree, /*include_static=*/false);
+    add_vnl_impl(k_range, b_range, Dion_H, Vij);
+  }
+
 }
 
 void pseudopot::add_Hartree(nda::range k_range,
                             nda::ArrayOfRank<3> auto const& nii,
                             math::nda::DistributedArrayOfRank<4> auto const& psi,
                             math::nda::DistributedArrayOfRank<4> auto & hpsi,
+                            math::nda::DistributedArrayOfRank<4> auto & Vij,
                             bool symmetrize) {
   nda::array<ComplexType, 4>* p4 = nullptr;
-  add_Hartree_impl(k_range, psi, hpsi, std::addressof(nii), p4, symmetrize);
+  nda::range b_range(0, psi.global_shape()[2]);
+  add_Hartree_impl(k_range, b_range, psi, hpsi, Vij, std::addressof(nii), p4, symmetrize);
 }
 
 void pseudopot::add_Hartree(nda::range k_range,
                             nda::ArrayOfRank<4> auto const& nij,
                             math::nda::DistributedArrayOfRank<4> auto const& psi,
                             math::nda::DistributedArrayOfRank<4> auto & hpsi,
+                            math::nda::DistributedArrayOfRank<4> auto & Vij,
                             bool symmetrize) {
   nda::array<ComplexType,3>* p3 = nullptr;
-  add_Hartree_impl(k_range, psi, hpsi, p3, std::addressof(nij), symmetrize);
+  nda::range b_range(0, psi.global_shape()[2]);
+  add_Hartree_impl(k_range, b_range, psi, hpsi, Vij, p3, std::addressof(nij), symmetrize);
+}
+
+// ---------------------------------------------------------------------------
+// Exact-exchange matrix elements K_{ij}(s, k_p) on the IBZ.
+//
+// Builds K via FFT pair densities; for USPP/PAW also adds the per-pair
+// Q^IJ_a(G+Δk) augmentation. Dispatches on pp_type via the v_x_paw header,
+// which delegates to the smooth-only `hamilt::v_x(...)` for NCPP.
+//
+// Unlike add_Hartree, which produces an hpsi correction, exchange has no
+// representation as a local potential acting on a single orbital — the
+// augmentation cross terms involve band-pair-dependent projector overlaps.
+// add_exchange therefore writes the full K matrix directly into Kij.
+// ---------------------------------------------------------------------------
+void pseudopot::add_exchange(nda::range k_range,
+                             nda::ArrayOfRank<3> auto const& nii,
+                             math::nda::DistributedArrayOfRank<4> auto const& psi,
+                             math::nda::DistributedArrayOfRank<4> auto & Kij)
+{
+  constexpr auto MEM  = memory::get_memory_space<std::decay_t<decltype(psi.local())>>();
+  constexpr auto MEM2 = memory::get_memory_space<std::decay_t<decltype(Kij.local())>>();
+  static_assert(MEM == MEM2, "pseudopot::add_exchange: psi/Kij memory mismatch");
+
+  utils::check(k_range.first() == 0 && k_range.last() == nkpts_ibz,
+               "pseudopot::add_exchange: k_range must span the full IBZ");
+  utils::check(psi.global_shape()[1] == nkpts_ibz,
+               "pseudopot::add_exchange: psi must be on the IBZ");
+  utils::check(psi.global_shape()[3] == npol * (long)swfc_to_rho.size(),
+               "pseudopot::add_exchange: psi g-dim mismatch");
+
+  // Coulomb kernel (default: bare 4π/|G+Δk|² with G+Δk=0 zeroed).
+  pots::potential_t vG(ptree{});
+
+  hamilt::paw::v_x(*mpi, vG, *this, npol, fft_mesh_aug, lattv, recv,
+                   swfc_to_rho.local(), kpts, kp_to_ibz,
+                   kp_trev, kp_symm, symm_list, nii, psi, Kij);
 }
 
 
@@ -1411,17 +1470,28 @@ template void pseudopot::add_Vpp(boost::mpi3::communicator&,nda::range,nda::rang
 template void pseudopot::add_Hartree(nda::range k_range,  \
         V1<ComplexType, 3> const&,  \
         darray_t<V2<ComplexType,4>,communicator> const&,  \
+        darray_t<V2<ComplexType,4>,communicator>&,  \
         darray_t<V2<ComplexType,4>,communicator>&, bool);  \
 template void pseudopot::add_Hartree(nda::range k_range,  \
         V1<ComplexType, 4> const&,  \
         darray_t<V2<ComplexType,4>,communicator> const&,  \
-        darray_t<V2<ComplexType,4>,communicator>&, bool);  
+        darray_t<V2<ComplexType,4>,communicator>&,  \
+        darray_t<V2<ComplexType,4>,communicator>&, bool);
+
+#define __add_exchange__(V1,V2)  \
+template void pseudopot::add_exchange(nda::range k_range,  \
+        V1<ComplexType, 3> const&,  \
+        darray_t<V2<ComplexType,4>,communicator> const&,  \
+        darray_t<V2<ComplexType,4>,communicator>&);
 
 __add_Vpp__(host_array)
 __add_Vpp2__(host_array_view,host_array)
 
 __add_hartree__(host_array,host_array)
 __add_hartree__(host_array_view,host_array)
+
+__add_exchange__(host_array,host_array)
+__add_exchange__(host_array_view,host_array)
 
 #if defined(ENABLE_DEVICE)
 using memory::device_array;

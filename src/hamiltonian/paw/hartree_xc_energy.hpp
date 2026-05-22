@@ -244,7 +244,8 @@ inline double hartree_energy_paw(
     std::vector<utils::symm_op> const& symm_list,
     Nii_t const& nii,
     Psi_t const& psi,
-    bool include_augmentation = true)
+    bool include_augmentation = true,
+    bool include_one_center = true)
 {
     long nnr = mesh(0)*mesh(1)*mesh(2);
 
@@ -309,6 +310,58 @@ inline double hartree_energy_paw(
             }
         }
     }
+
+    // ----------------------------------------------------------------------
+    // PAW one-center Hartree correction (radial AE−PS Coulomb of the on-site
+    // densities, not resolved by the dense FFT grid):
+    //   ΔE_H^{oc} = (1/2) Σ_a Σ_{IJKL} becsum^a(I,J) · deltaC^a(I,J,K,L)
+    //                                    · becsum^a(K,L)
+    // with deltaC^a = ⟨φ_I φ_J | v_C | φ_K φ_L⟩^{AE−PS}_a (proper Ha; same
+    // tensor validated element-wise in test_paw_onecenter). USPP species and
+    // atoms without deltaC contribute zero, so NCPP/USPP results are
+    // unchanged. Adding it makes hartree_energy_paw the FULL all-electron
+    // Hartree energy, matching the THC paw_aug=true J energy.
+    // ----------------------------------------------------------------------
+    if (include_augmentation && include_one_center &&
+        psp.pp_type() != pp_ncpp_t) {
+        double E_oc = 0.0;
+        if (mpi.comm.root()) {
+            auto becsum = compute_becsum_diagonal(
+                psp.Pskna_view(), nii, psp.ityp_view(), psp.nh_view(),
+                psp.ofs_view(), npol);
+            // Spin-sum scale: becsum from compute_becsum_diagonal carries the
+            // per-channel f×|P|² average; the on-site Hartree (½ ρ_tot²) needs
+            // the spin-summed density matrix, hence the ns_scl factor (=2 for
+            // nspin=1). Validated against THC in test_hartree_thc_paw_aug.
+            int nspin_p = (int)psp.Pskna_view().extent(0);
+            double ns_scl = (nspin_p == 1 && npol == 1) ? 2.0 : 1.0;
+            for (long ia = 0; ia < becsum.extent(0); ++ia)
+              for (long I = 0; I < becsum.extent(1); ++I)
+                for (long J = 0; J < becsum.extent(2); ++J)
+                  becsum(ia, I, J) *= ns_scl;
+            auto const& ityp = psp.ityp_view();
+            auto const& nh_v = psp.nh_view();
+            auto const& sps  = psp.paw_species_view();
+            long nat = ityp.extent(0);
+            for (long ia = 0; ia < nat; ++ia) {
+                int nt = ityp(ia);
+                int nh_a = nh_v(nt);
+                if (nh_a == 0) continue;
+                auto const& sp = sps[nt];
+                if (!sp.is_paw || sp.deltaC.size() == 0) continue;
+                for (int I = 0; I < nh_a; ++I)
+                for (int J = 0; J < nh_a; ++J)
+                for (int K = 0; K < nh_a; ++K)
+                for (int L = 0; L < nh_a; ++L)
+                    E_oc += 0.5 * becsum(ia, I, J) *
+                            sp.deltaC(I, J, K, L) * becsum(ia, K, L);
+            }
+        }
+        mpi.comm.barrier();
+        mpi.comm.broadcast_n(&E_oc, 1, 0);
+        E_H += E_oc;
+    }
+
     mpi.comm.barrier();
     mpi.comm.broadcast_n(&E_H, 1, 0);
     return E_H;
