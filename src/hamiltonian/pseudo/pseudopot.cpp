@@ -511,12 +511,8 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
   nh.resize(nsp);
   ityp.resize(nat);
   ofs.resize(nat);
-  // for PAW/USPP: 
-  // ijtoh.resize(nhm,nhm,nsp);
-  
   nda::h5_read(grp,"proj_per_atom",nh);
   nda::h5_read(grp,"projector_offset",ofs);
-  //nda::h5_read(grp,"ijtoh",ijtoh);
   nda::h5_read(grp,"npw",npw);
   nda::h5_read(grp,"atomic_id",ityp);
   //ityp = ityp-1;  
@@ -1174,7 +1170,7 @@ void pseudopot::add_vpp_impl(boost::mpi3::communicator& comm,
     hamilt::add_vloc(npol,fft_mesh_aug,swfc_to_rho.local(),vltot,psi,hpsi);
 
     mpi->node_comm.barrier();
-    // restore vltot (remove vr) 
+    // restore vltot (remove vr)
     if(mpi->node_comm.root()) {
       for( auto is: nda::range(vltot.extent(0)) ) {
         for( auto ip: nda::range(vltot.extent(1)) ) {
@@ -1184,11 +1180,28 @@ void pseudopot::add_vpp_impl(boost::mpi3::communicator& comm,
     }
     mpi->node_comm.barrier();
 
-    // Phase 2 (TODO): build the native non-local D here from vr (=V_H) +
-    // becsum via compute_paw_deeq(*nii, vr, /*include_static=*/true) and feed
-    // it to the single add_vnl_impl below, replacing the QE deeq. Deferred:
-    // it shifts QE eigenvalues by ~2.3 Ha until the static baseline / ns²
-    // factor / Vexchange one-center are reconciled (see add_vnl_impl branch).
+    // Native PAW deeq: build the per-channel D from V_eff = V_loc + V_H
+    // (vltot + vr) on the smooth grid, plus the static dvan + paw_init_keeq
+    // baseline and the radial AE−PS one-center Hartree. PerType scaling means
+    // the result lands at QE's Dnn_atom convention (no occupation/N_k folded
+    // into the channel). Built only on PAW/USPP; NCPP falls through to the
+    // bare branch.
+    if (ptype != pp_ncpp_t && nii != nullptr) {
+      sarray_t<nda::array_view<ComplexType,1>> svfull(mpi_local_context,{nnr_aug});
+      auto vfull = svfull.local();
+      if (mpi->node_comm.root()) {
+        // svloc holds V_loc (Ha); vr holds V_H (Ha) for the converged density.
+        // Build V_eff = V_loc + V_H; deeq sees the L=0 spherical part of svloc
+        // automatically, so we collapse the (spin, npol²) axes to scalar.
+        for (long r = 0; r < nnr_aug; ++r)
+          vfull(r) = svloc.local()(0, 0, r) + vr(r);
+      }
+      mpi->node_comm.barrier();
+      auto Dion_native = compute_paw_deeq(*nii, vfull,
+                                          /*include_static=*/true);
+      add_vnl_impl(k_range, b_range, Dion_native, Hij);
+      return;
+    }
 
   } else {
 
@@ -1199,21 +1212,14 @@ void pseudopot::add_vpp_impl(boost::mpi3::communicator& comm,
   }
 
   // Non-local part, directly into Hij. add_vnl_impl indexes Dion(id, ...)
-  // with id = (ncpp ? nt : ia); for NCPP we pass species-resolved Dnn,
-  // for USPP/PAW we pass the atom-resolved effective D = dvan + deeq
-  // (built in read_vnl_h5).
+  // with id = (ncpp ? nt : ia). NCPP → species-resolved Dnn.
+  // PAW/USPP + nii is handled above via the native `compute_paw_deeq` early
+  // return; PAW/USPP + nij uses the QE-loaded Dnn_atom (the native
+  // `compute_becsum_full(nij)` path is not wired through here).
   if (ptype == pp_ncpp_t)
     add_vnl_impl(k_range, b_range, Dnn.local(),      Hij);
-  else {
-    // MAM: In USPP/PAW we still use the QE-loaded deeq here. The native
-    //      builder `compute_paw_deeq` exists and is used by Vhartree, but
-    //      routing H through it (Dion_native, include_static=true) shifts the
-    //      QE eigenvalues by ~2.3 Ha — the static baseline + the V_H matrix-
-    //      element ns² factor are not the correct deeq for H, and the
-    //      Vexchange one-center must be re-derived together. TODO: Phase 2.
-    app_warning(" PAW implementation of Vnl is not yet complete !!!");
+  else
     add_vnl_impl(k_range, b_range, Dnn_atom.local(), Hij);
-  }
 }
 
 // Standalone helper: add the USPP/PAW augmentation to a smooth-grid pair
@@ -1364,9 +1370,19 @@ void pseudopot::add_Hartree_impl(nda::range k_range, nda::range b_range,
   // Vij is the pure Hartree matrix) and contract it into Vij via add_vnl_impl
   // — the single matrix-touching path, mirroring how add_vpp_impl forms Hij.
   // No QE deeq, no XC. NCPP / non-augmented species → zero Dion (no-op).
-  if (ptype != pp_ncpp_t && nii != nullptr) {
-    auto Dion_H = compute_paw_deeq(*nii, v_hartree, /*include_static=*/false);
-    add_vnl_impl(k_range, b_range, Dion_H, Vij);
+  // The deeq is a functional of the supplied density (diagonal nii or full
+  // nij), NOT of the QE mean-field — see notes/paw_deeq_scaling_derivation.md.
+  if (ptype != pp_ncpp_t) {
+    if (nii != nullptr) {
+      auto Dion_H = compute_paw_deeq(*nii, v_hartree, /*include_static=*/false);
+      add_vnl_impl(k_range, b_range, Dion_H, Vij);
+    } else if (nij != nullptr) {
+      // Full density-matrix path: becsum via compute_becsum_full (now folds the
+      // 1/N_k k-weight), so the one-center radial Hartree matches the smooth
+      // compensation charge that hamilt::v_h(*nij,...) already added above.
+      auto Dion_H = compute_paw_deeq(*nij, v_hartree, /*include_static=*/false);
+      add_vnl_impl(k_range, b_range, Dion_H, Vij);
+    }
   }
 
 }
@@ -1429,6 +1445,29 @@ void pseudopot::add_exchange(nda::range k_range,
                    kp_trev, kp_symm, symm_list, nii, psi, Kij);
 }
 
+// Full density-matrix overload (routes to the natural-orbital v_x(nij)).
+void pseudopot::add_exchange(nda::range k_range,
+                             nda::ArrayOfRank<4> auto const& nij,
+                             math::nda::DistributedArrayOfRank<4> auto const& psi,
+                             math::nda::DistributedArrayOfRank<4> auto & Kij)
+{
+  constexpr auto MEM  = memory::get_memory_space<std::decay_t<decltype(psi.local())>>();
+  constexpr auto MEM2 = memory::get_memory_space<std::decay_t<decltype(Kij.local())>>();
+  static_assert(MEM == MEM2, "pseudopot::add_exchange: psi/Kij memory mismatch");
+
+  utils::check(k_range.first() == 0 && k_range.last() == nkpts_ibz,
+               "pseudopot::add_exchange: k_range must span the full IBZ");
+  utils::check(psi.global_shape()[1] == nkpts_ibz,
+               "pseudopot::add_exchange: psi must be on the IBZ");
+  utils::check(psi.global_shape()[3] == npol * (long)swfc_to_rho.size(),
+               "pseudopot::add_exchange: psi g-dim mismatch");
+
+  pots::potential_t vG(ptree{});
+  hamilt::paw::v_x(*mpi, vG, *this, npol, fft_mesh_aug, lattv, recv,
+                   swfc_to_rho.local(), kpts, kp_to_ibz,
+                   kp_trev, kp_symm, symm_list, nij, psi, Kij);
+}
+
 
 using memory::darray_t;
 using memory::host_array;
@@ -1481,6 +1520,10 @@ template void pseudopot::add_Hartree(nda::range k_range,  \
 #define __add_exchange__(V1,V2)  \
 template void pseudopot::add_exchange(nda::range k_range,  \
         V1<ComplexType, 3> const&,  \
+        darray_t<V2<ComplexType,4>,communicator> const&,  \
+        darray_t<V2<ComplexType,4>,communicator>&);  \
+template void pseudopot::add_exchange(nda::range k_range,  \
+        V1<ComplexType, 4> const&,  \
         darray_t<V2<ComplexType,4>,communicator> const&,  \
         darray_t<V2<ComplexType,4>,communicator>&);
 

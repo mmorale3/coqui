@@ -514,32 +514,27 @@ inline void v_x(utils::mpi_context_t<boost::mpi3::communicator,
   // becsum energy formula in test_paw_onecenter). The prefactor scl_oc is
   // derived below. USPP species and atoms without deltaC contribute nothing.
   // ----------------------------------------------------------------------
-  // ----- Prefactor: Blöchl partition + the exchange-specific factor.
+  // ----- One-center exchange prefactor (THC-consistent, derived).
   //
-  // Blöchl PAW partition of the AE exchange integral (real φ, per spin σ):
+  // Blöchl PAW partition of the AE exchange Fock matrix element:
   //   (i n | n j)^AE = (ρ̃_in + n̂_in | ρ̃_nj + n̂_nj)_{FFT, compensated}
   //                  + Σ_a Σ_IJKL P*_{i,I} P_{n,J} ΔC^a(I,J,K,L) P*_{n,K} P_{j,L}
   // with ΔC^a = ⟨φ_Iφ_J|v|φ_Kφ_L⟩^AE − ⟨φ̃_Iφ̃_J+Q̂|v|φ̃_Kφ̃_L+Q̂⟩^PS.
-  // The first term is the smooth+aug contraction done above (the Ω-scaled
-  // Q-augmentation builds the compensated pair density). The exchange Fock
-  // contracts the inner band n with the PER-SPIN density D^σ_{JK}=Σ_n^σ P_{n,J}P*_{n,K};
-  // in CoQui's f^total = n_s·f^σ convention (becsum carries f^total, and the
-  // loop below sums f^total), this clean partition gives −1/(n_s·N_k).
+  // The first term is the smooth+aug contraction above, which carries the Fock
+  // prefactor  scl = −1/(N_k·Ω)  contracted with f = nii directly (NO explicit
+  // spin factor; the Ω is the smooth G-space Coulomb measure). The one-center
+  // is the SAME per-(kq,n) Fock contraction (same f = nii) on the deltaC
+  // integral, which is already in energy units — so it inherits scl WITHOUT the
+  // Ω measure:  scl_oc = −1/N_k.
   //
-  // The clean factor OVERSHOOTS QE by exactly ×2: a prefactor scan against the
-  // lih_kp222_nbnd16_paw_hf HF eigenvalue gives residual 5.9e-2 Ha at the clean
-  // −1/(n_s·N_k), 1.8e-1 at −1/N_k, and 7.8e-4 Ha (= the USPP residual floor) at
-  // half the clean value. So the validated prefactor is
-  //   scl_oc = −1/(2·n_s·N_k) = [clean Blöchl −1/(n_s N_k)] × [geometric ½].
-  // The ½ is a SPIN-INDEPENDENT double-count: the Ω-scaled smooth+aug PAIR
-  // density reaches the AE norm at G=0 (verified pair_g(0): 0.4→1.0), so its
-  // Coulomb integral already absorbs half of the AE−PS one-center weight —
-  // unlike the Hartree TOTAL density, where the Blöchl FFT/radial split is
-  // exact and the one-center adds cleanly (validated 1.898+0.113=2.010). USPP
-  // (no ΔC) is unaffected. nspin=1 is validated; the ½ is geometric so the
-  // n_s-scaling should generalize, but an nspin=2 fixture is the open check.
-  double ns_oc = (nspin == 1 && npol == 1) ? 2.0 : 1.0;
-  const ComplexType scl_oc(-1.0 / (2.0 * ns_oc * double(nk)), 0.0);
+  // Validated against THC's own K_a exchange by test vx_onecenter_vs_thc_Ka,
+  // which isolates THC's one-center Fock via THC_Vx(onsite=true) −
+  // THC_Vx(onsite=false) and fits the scalar prefactor of the raw deltaC
+  // contraction: α = −1/N_k to machine precision. The same value follows from
+  // QE's own paw_exx.f90 kernel (Eq. 32/33, Paier 2005) and VASP's PAW-EXX; see
+  // notes/paw_onecenter_exchange_prefactor.md. No explicit n_s ⇒ generalizes to
+  // nspin=2 like the smooth scl. USPP (no ΔC) is unaffected.
+  const ComplexType scl_oc(-1.0 / double(nk), 0.0);
   for (auto [is_l, s] : itertools::enumerate(Kij.local_range(0))) {
     for (auto [ik_l, k_p_ibz] : itertools::enumerate(Kij.local_range(1))) {
       auto K_sk = Kloc(is_l, ik_l, all, all);
@@ -588,6 +583,302 @@ inline void v_x(utils::mpi_context_t<boost::mpi3::communicator,
                 K_sk(i, j) += scl_oc * ComplexType(f, 0.0) * acc;
               }
             }
+          }
+        }
+      }
+    }
+  }
+
+  mpi.comm.barrier();
+}
+
+// ===========================================================================
+// Full-density-matrix exact exchange (USPP/PAW). Generalizes the diagonal
+// v_x above to a Hermitian density matrix nij(s,k,a,b) via its natural-orbital
+// decomposition at each (s,kq): γ = Σ_p w_p |χ_p⟩⟨χ_p|, χ_p = Σ_a U_ap ψ_a.
+// The inner ("occupied") index runs over natural orbitals — both the
+// real-space orbital AND its projectors ⟨β|χ_p⟩ = Σ_a U_ap ⟨β|ψ_a⟩ are
+// rotated — while the outer (k_p) orbitals and projectors stay canonical.
+// Reuses the exact same smooth + Q-augmentation + deltaC one-center
+// contraction as the diagonal kernel, so K[nij] inherits its conventions
+// (including the one-center prefactor currently under review).
+//
+// Requires a no-symmetry mesh (nk_ibz == nk) so nij(s,kq) is the full-BZ
+// density matrix directly; symmetry-reduced nij is a follow-up.
+// ===========================================================================
+inline void v_x(utils::mpi_context_t<boost::mpi3::communicator,
+                                     boost::mpi3::shared_communicator>& mpi,
+         pots::potential_t& vG,
+         pseudopot const& psp,
+         int npol,
+         nda::stack_array<long, 3> const& mesh,
+         nda::stack_array<double, 3, 3> const& lattv,
+         nda::stack_array<double, 3, 3> const& recv,
+         nda::ArrayOfRank<1> auto const& k2g,
+         nda::ArrayOfRank<2> auto const& kpts,
+         nda::ArrayOfRank<1> auto const& kp_to_ibz,
+         nda::ArrayOfRank<1> auto const& kp_trev,
+         nda::ArrayOfRank<1> auto const& kp_symm,
+         std::vector<utils::symm_op> const& symm_list,
+         nda::ArrayOfRank<4> auto const& nij,
+         math::nda::DistributedArrayOfRank<4> auto const& psi,
+         math::nda::DistributedArrayOfRank<4> auto & Kij)
+{
+  if (psp.pp_type() == pp_ncpp_t) {
+    ::hamilt::v_x(mpi, vG, npol, mesh, lattv, recv, k2g, kpts,
+                  kp_to_ibz, kp_trev, kp_symm, symm_list, nij, psi, Kij);
+    return;
+  }
+
+  decltype(nda::range::all) all;
+  using nda::range;
+
+  utils::check(npol == 1, "v_x_paw(nij): only npol=1 supported");
+  utils::check(psi.grid()[3] == 1, "v_x_paw(nij): psi grid[3] must be 1");
+
+  long nspin   = psi.global_shape()[0];
+  long nk_ibz  = psi.global_shape()[1];
+  long nbnd    = psi.global_shape()[2];
+  long ngm_wfc = k2g.extent(0);
+  long nk      = kp_to_ibz.shape(0);
+  long nnr     = mesh(0)*mesh(1)*mesh(2);
+
+  utils::check(nk == nk_ibz,
+      "v_x_paw(nij): symmetry-reduced k-mesh not supported yet (need "
+      "nk_ibz==nk); the full-BZ density-matrix transform is a follow-up.");
+  utils::check(nij.extent(0) == nspin && nij.extent(1) == nk_ibz &&
+               nij.extent(2) == nbnd && nij.extent(3) == nbnd,
+      "v_x_paw(nij): nij shape mismatch");
+
+  double det_recv = recv(0,0)*(recv(1,1)*recv(2,2) - recv(1,2)*recv(2,1))
+                  - recv(1,0)*(recv(0,1)*recv(2,2) - recv(0,2)*recv(2,1))
+                  + recv(2,0)*(recv(0,1)*recv(1,2) - recv(0,2)*recv(1,1));
+  double Omega = (2.0*M_PI)*(2.0*M_PI)*(2.0*M_PI) / det_recv;
+  const ComplexType scl(-1.0 / (double(nk) * Omega), 0.0);
+
+  // ---- Canonical real-space orbitals (outer index source) ----
+  nda::array<ComplexType, 4> psi_r_full(nspin, nk, nbnd, nnr);
+  psi_r_full() = ComplexType(0.0);
+  {
+    nda::array<ComplexType, 2> pr({1, nnr});
+    auto pr4d = nda::reshape(pr, std::array<long,4>{1, mesh(0), mesh(1), mesh(2)});
+    math::nda::fft<true> F(pr4d);
+    nda::array<long, 1> k2g_rotate(ngm_wfc);
+    nda::stack_array<double, 3> Gs; Gs() = 0.0;
+    nda::array<ComplexType,1> *Xft = nullptr;
+    auto ploc = psi.local();
+    for (auto [is_l, s] : itertools::enumerate(psi.local_range(0))) {
+      for (auto [ik_l, k_ibz] : itertools::enumerate(psi.local_range(1))) {
+        for (long kf = 0; kf < nk; ++kf) {
+          if (kp_to_ibz(kf) != k_ibz) continue;
+          k2g_rotate() = k2g();
+          if (kp_trev(kf) or kp_symm(kf) > 0)
+            utils::transform_k2g(kp_trev(kf), symm_list[kp_symm(kf)], Gs, mesh,
+                                 kpts(k_ibz, all), k2g_rotate, Xft);
+          for (auto [ia_l, a] : itertools::enumerate(psi.local_range(2))) {
+            pr() = ComplexType(0.0);
+            nda::copy_select(true, k2g_rotate, ComplexType(1.0),
+                             ploc(is_l, ik_l, ia_l, range(0, ngm_wfc)),
+                             ComplexType(0.0), pr(0, all));
+            F.backward(pr4d);
+            if (kp_trev(kf))
+              for (long r = 0; r < nnr; ++r) psi_r_full(s, kf, a, r) = std::conj(pr(0, r));
+            else
+              for (long r = 0; r < nnr; ++r) psi_r_full(s, kf, a, r) = pr(0, r);
+          }
+        }
+      }
+    }
+  }
+  mpi.comm.all_reduce_in_place_n(psi_r_full.data(), psi_r_full.size(), std::plus<>{});
+
+  // ---- Canonical projectors at full BZ (outer index source) ----
+  auto const& ityp = psp.ityp_view();
+  auto const& nh_v = psp.nh_view();
+  auto const& ofs  = psp.ofs_view();
+  auto const& sps  = psp.paw_species_view();
+  long nat = ityp.extent(0);
+
+  auto atom_perm_inv = build_atom_permutation_inverse(
+      psp.atom_pos_cart_view(), ityp, lattv, recv, symm_list);
+  int lmax_proj = 0;
+  for (long nt = 0; nt < (long)sps.size(); ++nt)
+    for (long b = 0; b < sps[nt].lll.extent(0); ++b)
+      lmax_proj = std::max(lmax_proj, sps[nt].lll(b));
+  auto wigner_d = build_wigner_d_real(symm_list, lattv, lmax_proj);
+  auto sPfull = compute_Pskna_full_bz(
+      psp, kp_to_ibz, kp_symm, kp_trev, kpts, symm_list,
+      atom_perm_inv, wigner_d, npol, mpi);
+  auto Pfull = sPfull.local();  // (nspin, nk, npol*nkb, nbnd)
+  long nkb = Pfull.extent(2);
+
+  // ---- qrad tables (same bound as the diagonal kernel) ----
+  double Kmax_est = 0.0;
+  {
+    long NX = mesh(0), NY = mesh(1), NZ = mesh(2);
+    long Mx = NX/2, My = NY/2, Mz = NZ/2;
+    double dkmax = 0.0;
+    for (long k1 = 0; k1 < nk; ++k1)
+      for (long k2 = 0; k2 < nk; ++k2) {
+        double dx = kpts(k1,0)-kpts(k2,0), dy = kpts(k1,1)-kpts(k2,1), dz = kpts(k1,2)-kpts(k2,2);
+        dkmax = std::max(dkmax, std::sqrt(dx*dx + dy*dy + dz*dz));
+      }
+    double gx = std::abs(Mx*recv(0,0))+std::abs(My*recv(1,0))+std::abs(Mz*recv(2,0));
+    double gy = std::abs(Mx*recv(0,1))+std::abs(My*recv(1,1))+std::abs(Mz*recv(2,1));
+    double gz = std::abs(Mx*recv(0,2))+std::abs(My*recv(1,2))+std::abs(Mz*recv(2,2));
+    Kmax_est = std::sqrt(gx*gx + gy*gy + gz*gz) + dkmax + 0.1;
+  }
+  std::vector<qrad_tab> qtab_sp(sps.size());
+  int lli_aat = lmax_proj + 1;
+  auto aatab = aainit_tables_build(lli_aat);
+  for (size_t nt = 0; nt < sps.size(); ++nt)
+    if (sps[nt].is_paw || sps[nt].is_uspp)
+      qtab_sp[nt] = build_qrad_tab(sps[nt], Kmax_est);
+
+  long nij_max = 0;
+  for (size_t nt = 0; nt < sps.size(); ++nt)
+    nij_max = std::max(nij_max, (long)nh_v(nt) * ((long)nh_v(nt) + 1) / 2);
+  if (nij_max == 0) nij_max = 1;
+
+  // ---- Natural orbitals (inner index): real-space φ and projectors Pφ ----
+  // φ_all(s,kq,p,r) = Σ_a U_ap ψ_a(kq,r); Pnat(s,kq,idx,p) = Σ_a U_ap P(kq,idx,a).
+  auto nij_host = nda::to_host(nij);
+  nda::array<ComplexType, 4> phi_all(nspin, nk, nbnd, nnr);
+  nda::array<ComplexType, 4> Pnat_all(nspin, nk, nkb, nbnd);
+  nda::array<double, 3> w_all(nspin, nk, nbnd);
+  phi_all() = ComplexType(0.0); Pnat_all() = ComplexType(0.0); w_all() = 0.0;
+  for (long s = 0; s < nspin; ++s)
+    for (long kq = 0; kq < nk; ++kq) {
+      nda::array<ComplexType,2> nblk(nbnd, nbnd);
+      for (long a = 0; a < nbnd; ++a)
+        for (long b = 0; b < nbnd; ++b) nblk(a, b) = nij_host(s, kq, a, b);
+      auto [w, U] = ::hamilt::detail::natural_occupations(nblk);
+      for (long p = 0; p < nbnd; ++p) w_all(s, kq, p) = w(p);
+      for (long p = 0; p < nbnd; ++p)
+        for (long a = 0; a < nbnd; ++a) {
+          ComplexType c = U(a, p);
+          if (std::abs(c) < 1e-300) continue;
+          for (long r = 0; r < nnr; ++r) phi_all(s, kq, p, r) += c * psi_r_full(s, kq, a, r);
+          for (long idx = 0; idx < nkb; ++idx) Pnat_all(s, kq, idx, p) += c * Pfull(s, kq, idx, a);
+        }
+    }
+
+  // ---- Inner loop (mirrors the diagonal kernel; inner uses natural orbitals) ----
+  auto Kloc = Kij.local();
+  Kloc() = ComplexType(0.0);
+  auto const& ijtoh = psp.ijtoh_view();
+
+  nda::array<ComplexType, 2> pair_buf(nbnd, nnr);
+  auto pair4d = nda::reshape(pair_buf, std::array<long,4>{nbnd, mesh(0), mesh(1), mesh(2)});
+  math::nda::fft<true> Fpair(pair4d);
+  nda::array<ComplexType, 1> v_coul(nnr);
+  nda::array<ComplexType, 3> Qfac(nat, nij_max, nnr);
+  nda::array<ComplexType, 1> aug_acc(nnr);
+
+  for (auto [is_l, s] : itertools::enumerate(Kij.local_range(0))) {
+    for (auto [ik_l, k_p_ibz] : itertools::enumerate(Kij.local_range(1))) {
+      auto K_sk = Kloc(is_l, ik_l, all, all);
+      for (long kq = 0; kq < nk; ++kq) {
+        v_coul() = ComplexType(0.0);
+        vG.evaluate_in_mesh(range(0, nnr), v_coul, mesh,
+                            nda::stack_array<double,3,3>{}, recv,
+                            kpts(k_p_ibz, all), kpts(kq, all));
+        build_paw_aug_pair_factor(psp, aatab, qtab_sp, mesh, recv, Omega,
+                                  kpts(k_p_ibz, all), kpts(kq, all), Qfac);
+
+        for (long p = 0; p < nbnd; ++p) {
+          double w = w_all(s, kq, p);
+          if (std::abs(w) < 1e-15) continue;
+
+          // Smooth pair density with the natural inner orbital χ_p.
+          for (long a = 0; a < nbnd; ++a)
+            for (long r = 0; r < nnr; ++r)
+              pair_buf(a, r) = std::conj(phi_all(s, kq, p, r)) *
+                               psi_r_full(s, k_p_ibz, a, r);
+          Fpair.forward(pair4d);
+
+          // PAW augmentation (inner projector rotated to the natural orbital).
+          const ComplexType omega_factor(Omega, 0.0);
+          for (long ia = 0; ia < nat; ++ia) {
+            int nt = ityp(ia);
+            int nh_a = nh_v(nt);
+            if (nh_a == 0) continue;
+            if (!sps[nt].is_paw && !sps[nt].is_uspp) continue;
+            long p0 = ofs(ia);
+            for (long a = 0; a < nbnd; ++a) {
+              for (int I = 0; I < nh_a; ++I) {
+                ComplexType Pn_cI = std::conj(Pnat_all(s, kq, p0 + I, p));
+                aug_acc() = ComplexType(0.0);
+                for (int J = 0; J < nh_a; ++J) {
+                  long ij = static_cast<long>(ijtoh(nt, I, J)) - 1;
+                  if (ij < 0) continue;
+                  ComplexType PaJ = Pfull(s, k_p_ibz, p0 + J, a);
+                  for (long g = 0; g < nnr; ++g) aug_acc(g) += PaJ * Qfac(ia, ij, g);
+                }
+                ComplexType pref = Pn_cI * omega_factor;
+                for (long g = 0; g < nnr; ++g) pair_buf(a, g) += pref * aug_acc(g);
+              }
+            }
+          }
+
+          for (long i = 0; i < nbnd; ++i)
+            for (long j = 0; j < nbnd; ++j) {
+              ComplexType acc(0.0);
+              for (long g = 0; g < nnr; ++g)
+                acc += v_coul(g) * std::conj(pair_buf(i, g)) * pair_buf(j, g);
+              K_sk(i, j) += scl * ComplexType(w, 0.0) * acc;
+            }
+        }
+      }
+    }
+  }
+
+  // ---- PAW one-center exchange (deltaC), inner projectors → natural orbitals.
+  // Same THC-consistent prefactor as the diagonal kernel: scl_oc = −1/N_k,
+  // inheriting the smooth+aug Fock scl = −1/(N_k·Ω) without the Ω G-space
+  // measure (deltaC is already an energy integral). See the diagonal v_x above
+  // and test vx_onecenter_vs_thc_Ka (machine-precision validation vs THC K_a).
+  const ComplexType scl_oc(-1.0 / double(nk), 0.0);
+  for (auto [is_l, s] : itertools::enumerate(Kij.local_range(0))) {
+    for (auto [ik_l, k_p_ibz] : itertools::enumerate(Kij.local_range(1))) {
+      auto K_sk = Kloc(is_l, ik_l, all, all);
+      for (long kq = 0; kq < nk; ++kq) {
+        for (long p = 0; p < nbnd; ++p) {
+          double w = w_all(s, kq, p);
+          if (std::abs(w) < 1e-15) continue;
+          for (long ia = 0; ia < nat; ++ia) {
+            int nt = ityp(ia);
+            int nh_a = nh_v(nt);
+            if (nh_a == 0) continue;
+            auto const& sp = sps[nt];
+            if (!sp.is_paw || sp.deltaC.size() == 0) continue;
+            long p0 = ofs(ia);
+            nda::array<ComplexType, 2> U2(nh_a, nh_a);
+            U2() = ComplexType(0.0);
+            for (int I = 0; I < nh_a; ++I)
+              for (int L = 0; L < nh_a; ++L) {
+                ComplexType acc(0.0);
+                for (int J = 0; J < nh_a; ++J) {
+                  ComplexType PnJ = Pnat_all(s, kq, p0 + J, p);
+                  for (int K = 0; K < nh_a; ++K) {
+                    ComplexType PnK = std::conj(Pnat_all(s, kq, p0 + K, p));
+                    acc += ComplexType(sp.deltaC(I, J, K, L), 0.0) * PnJ * PnK;
+                  }
+                }
+                U2(I, L) = acc;
+              }
+            for (long i = 0; i < nbnd; ++i)
+              for (long j = 0; j < nbnd; ++j) {
+                ComplexType acc(0.0);
+                for (int I = 0; I < nh_a; ++I) {
+                  ComplexType PiI = std::conj(Pfull(s, k_p_ibz, p0 + I, i));
+                  for (int L = 0; L < nh_a; ++L) {
+                    ComplexType PjL = Pfull(s, k_p_ibz, p0 + L, j);
+                    acc += PiI * U2(I, L) * PjL;
+                  }
+                }
+                K_sk(i, j) += scl_oc * ComplexType(w, 0.0) * acc;
+              }
           }
         }
       }

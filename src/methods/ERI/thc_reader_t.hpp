@@ -119,6 +119,11 @@ namespace methods {
       if(_MF->pp_type() == hamilt::pp_paw_t or _MF->pp_type() == hamilt::pp_uspp_t) { 
         _paw_aug = io::get_value_with_default<bool>(pt, "paw_aug", true);
         _paw_onsite = io::get_value_with_default<bool>(pt, "paw_onsite", _MF->pp_type() == hamilt::pp_paw_t);
+        // Diagnostic gates (default true) to isolate the V_GL (smooth-aug
+        // cross) vs V_LL (aug-aug) compensation blocks (used by test
+        // thc_vgl_vll_split). Production runs leave both true.
+        _paw_vgl = io::get_value_with_default<bool>(pt, "paw_vgl", true);
+        _paw_vll = io::get_value_with_default<bool>(pt, "paw_vll", true);
         _paw_isdf_tol = io::get_value_with_default<double>(pt, "paw_isdf_tol", 1e-12);
         _paw_isdf_cache_h5 = io::get_value_with_default<std::string>(pt, "paw_isdf_cache_h5", "");
         {
@@ -779,9 +784,9 @@ namespace methods {
 
         auto Z_loc = _dZ.local();
 
-        // ---- 6f) V_GL block: P ∈ smooth, Q ∈ aug.
+        // ---- 6f) V_GL block: P ∈ smooth, Q ∈ aug.   (diagnostic gate _paw_vgl)
         //         V_GL(μ, λ) = Ω · Σ_g ζ(μ, g) · conj(η_w(λ, g)).
-        if (P_smooth_rows.size() > 0 && Q_aug_cols_la.size() > 0) {
+        if (_paw_vgl && P_smooth_rows.size() > 0 && Q_aug_cols_la.size() > 0) {
           _Timer.start("PAW_AUG.V_GL");
           nda::array<ComplexType,2> V_GL_local(P_smooth_rows.size(),
                                                Q_aug_cols_la.size());
@@ -804,7 +809,7 @@ namespace methods {
         // ---- 6g) V_LG block: P ∈ aug, Q ∈ smooth.
         //         V_LG(λ, μ) = conj(V_GL(μ, λ))
         //                    = Ω · Σ_g η_w(λ, g) · conj(ζ(μ, g)).
-        if (P_aug_rows_la.size() > 0 && Q_smooth_cols.size() > 0) {
+        if (_paw_vgl && P_aug_rows_la.size() > 0 && Q_smooth_cols.size() > 0) {
           _Timer.start("PAW_AUG.V_GL");
           nda::array<ComplexType,2> V_LG_local(P_aug_rows_la.size(),
                                                Q_smooth_cols.size());
@@ -831,9 +836,10 @@ namespace methods {
           nda::array<ComplexType,2> V_LL_local(P_aug_rows_la.size(),
                                                Q_aug_cols_la.size());
           V_LL_local() = ComplexType(0.0);
-          nda::blas::gemm(ComplexType(omega_sq), eta_P_aug_conj,
-                          nda::transpose(eta_w_Q_aug_g),
-                          ComplexType(0.0), V_LL_local);
+          if (_paw_vll)
+            nda::blas::gemm(ComplexType(omega_sq), eta_P_aug_conj,
+                            nda::transpose(eta_w_Q_aug_g),
+                            ComplexType(0.0), V_LL_local);
           _Timer.stop("PAW_AUG.V_LL");
 
           if (_paw_onsite) {
@@ -1858,6 +1864,8 @@ namespace methods {
     // same-atom one-center kernel is added at every q.
     bool _paw_aug = true;
     bool _paw_onsite = true;           // include K_a one-center kernel for PAW species
+    bool _paw_vgl = true;              // diagnostic: include V_GL/V_LG smooth-aug cross
+    bool _paw_vll = true;              // diagnostic: include V_LL aug-aug block
     int _Np_smooth = 0;                // smooth-only block size
     int _N_aug = 0;                    // total atom-local rows
     std::shared_ptr<hamilt::pseudopot> _psp;        // lazy via make_pseudopot

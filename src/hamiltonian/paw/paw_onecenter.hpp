@@ -19,15 +19,11 @@
  * for `ptfunc`, and `G_{LM,IJ}` the real-spherical-harmonic Clebsch-
  * Gordan coupling (= QE's `aatab.ap(lp, nhtolm(I), nhtolm(J))`).
  *
- * Stage 3.2 deliverable: `compute_paw_core_density(sp)` precomputes
- * ρ_core_AE(r), ρ_core_PS(r) once per species (frozen-core, SCF-invariant).
- * These caches feed the LM=00 channel of ρ_AE/ρ_PS in stage 3.3's
- * Hartree-only deeq driver.
- *
- * The valence-density LM builders (per-iter `becsum`-dependent) live
- * with the Hartree integrator in stage 3.3 — putting them here would
- * be premature since the Hartree integral packs the contraction
- * Σ_IJ becsum × pfunc × G into a single radial pass.
+ * `compute_paw_core_density(sp)` precomputes ρ_core_AE(r), ρ_core_PS(r) once
+ * per species (frozen-core, SCF-invariant). These caches feed the LM=00
+ * channel of ρ_AE/ρ_PS in the Hartree-only deeq driver. The valence-density
+ * LM builders (per-iter `becsum`-dependent) live with the Hartree integrator,
+ * which packs the contraction Σ_IJ becsum × pfunc × G into a single radial pass.
  * ==========================================================================
  */
 #ifndef HAMILTONIAN_PAW_PAW_ONECENTER_HPP
@@ -145,10 +141,9 @@ compute_paw_core_density(pseudopot::species_paw_t const& sp)
  *
  *   E_H_oc = ½ Σ_IJ becsum_IJ · ΔD_IJ.
  *
- * Correctness check (validated by the energy-balance test in stage 3.3
- * once fixtures are regenerated): the same total Hartree energy comes
- * out of (smooth-grid v_h on ρ̃_compensated)  +  (this routine summed
- * over atoms) as out of the augmented-ERI J contraction.
+ * Correctness check: the same total Hartree energy comes out of
+ * (smooth-grid v_h on ρ̃_compensated)  +  (this routine summed over atoms)
+ * as out of the augmented-ERI J contraction.
  */
 struct paw_oc_hartree_result {
     nda::array<double, 2> dDeeq_H; // (nh, nh) — Hartree contribution to deeq
@@ -359,8 +354,7 @@ inline nda::array<double, 2> compute_paw_static_D(
  * pseudopot.h and the PAW one-center machinery.
  *
  * Callers that invoke either method must include this header (transitively
- * is fine; e.g., `methods/HF/thc_hf.hpp` will pull this in once stage 3.6
- * lands).
+ * is fine).
  * ========================================================================== */
 
 namespace hamilt {
@@ -406,19 +400,16 @@ inline void pseudopot::build_paw_scf_caches()
                 for (long m = 0; m < nD; ++m)
                     Dloc_st(ia, n, m) = Dloc_sp(nt, n, m);
 
-            // (b) paw_init_keeq additive piece for PAW species with
-            //     populated radial inputs (non-PAW or empty-fields species
-            //     leave the dvan-only baseline in place).
-            if ((size_t)nt >= paw_species.size()) continue;
-            auto const& sp = paw_species[nt];
-            if (sp.nh == 0) continue;
-            auto Dst = hamilt::paw::compute_paw_static_D(sp);
-            if (Dst.size() == 0) continue;
-            for (int I = 0; I < sp.nh; ++I)
-                for (int J = 0; J < sp.nh; ++J)
-                    for (int p = 0; p < npol; ++p)
-                        Dloc_st(ia, I * npol + p, J * npol + p)
-                            += ComplexType(Dst(I, J), 0.0);
+            // (b) NOTE: h5 `dion` (loaded into Dnn) already encodes QE's full
+            //     `dvan` per-channel — i.e. it ALREADY includes the AE−PS
+            //     V_loc baseline that compute_paw_static_D would build from
+            //     the (ae_vloc, vloc_ps) pair. Adding it again would
+            //     double-count the baseline. Validated on LiH kp444 PAW HF
+            //     (canonical pw2coqui, vloc_ps present): adding produced a
+            //     3.4 Ha shift at the Li 1s channel and broke eigenvalues;
+            //     skipping recovers a clean match. compute_paw_static_D is
+            //     kept available for a future fixture format that exports a
+            //     bare-ionic dvan, but it is NOT consumed here.
         }
     }
     mpi->node_comm.barrier();
@@ -440,8 +431,21 @@ inline void pseudopot::compute_deeq_scf(nij_t const& nij)
     build_paw_scf_caches();
 
     // 2. Build per-atom becsum from Pskna and the current density matrix.
+    //    compute_becsum_full already carries the 1/N_k k-weight; apply the
+    //    spin factor ns_scl here so becsum encodes the full (spin-summed)
+    //    electron density — the same (ns_scl/N_k) normalization the smooth-grid
+    //    Hartree applies to the same density matrix (see compute_paw_deeq and
+    //    notes/paw_deeq_scaling_derivation.md). This makes the radial one-center
+    //    Hartree (compute_paw_hartree_atom, solved in proper Ha) land at QE's
+    //    per-channel ddd_paw with NO extra multiplier, for any k-mesh.
     auto becsum = hamilt::paw::compute_becsum_full(
         Pskna_view(), nij, ityp, nh, ofs, npol);
+    long nspin = nij.extent(0);
+    double ns_scl = (nspin == 1 && npol == 1) ? 2.0 : 1.0;
+    for (long ia = 0; ia < becsum.extent(0); ++ia)
+      for (long I = 0; I < becsum.extent(1); ++I)
+        for (long J = 0; J < becsum.extent(2); ++J)
+          becsum(ia, I, J) *= ns_scl;
     long nat = ityp.extent(0);
 
     // 3. Build the angular-momentum coupling tables (cheap: nibz tables of
@@ -487,19 +491,53 @@ inline void pseudopot::compute_deeq_scf(nij_t const& nij)
     mpi->comm.barrier();
 }
 
-// Unified native PAW non-local D builder. Returns Dion (nat, nhm, nhm) for
-// npol=1. See the declaration in pseudopot.h for the term breakdown. The
-// caller hands the result to add_vnl_impl (single matrix-touching path).
-template<typename nii_t, typename Pot_t>
-nda::array<ComplexType,3> pseudopot::compute_paw_deeq(nii_t const& nii,
-                                                      Pot_t const& Vloc_r,
-                                                      bool include_static)
+// nii / nij overloads: build the (ns_scl-scaled) per-atom becsum from the
+// diagonal density or the full density matrix, then delegate to the shared
+// core. ns_scl carries CoQui's spin doubling for nspin=1 (see
+// notes/paw_deeq_scaling_derivation.md); compute_becsum_{diagonal,full} both
+// carry the 1/N_k k-weight, so the result is the same physical becsum the
+// smooth-grid Hartree uses — independent of the QE mean-field occupations.
+template<typename Pot_t>
+nda::array<ComplexType,3> pseudopot::compute_paw_deeq(
+    nda::ArrayOfRank<3> auto const& nii, Pot_t const& Vloc_r, bool include_static)
+{
+    long nspin = nii.extent(0);
+    double ns_scl = (nspin == 1 && npol == 1) ? 2.0 : 1.0;
+    auto becsum = hamilt::paw::compute_becsum_diagonal(
+        Pskna_view(), nii, ityp, nh, ofs, npol);
+    for (long ia = 0; ia < becsum.extent(0); ++ia)
+      for (long I = 0; I < becsum.extent(1); ++I)
+        for (long J = 0; J < becsum.extent(2); ++J)
+          becsum(ia, I, J) *= ns_scl;
+    return compute_paw_deeq_from_becsum(becsum, Vloc_r, include_static);
+}
+
+template<typename Pot_t>
+nda::array<ComplexType,3> pseudopot::compute_paw_deeq(
+    nda::ArrayOfRank<4> auto const& nij, Pot_t const& Vloc_r, bool include_static)
+{
+    long nspin = nij.extent(0);
+    double ns_scl = (nspin == 1 && npol == 1) ? 2.0 : 1.0;
+    auto becsum = hamilt::paw::compute_becsum_full(
+        Pskna_view(), nij, ityp, nh, ofs, npol);
+    for (long ia = 0; ia < becsum.extent(0); ++ia)
+      for (long I = 0; I < becsum.extent(1); ++I)
+        for (long J = 0; J < becsum.extent(2); ++J)
+          becsum(ia, I, J) *= ns_scl;
+    return compute_paw_deeq_from_becsum(becsum, Vloc_r, include_static);
+}
+
+// Unified native PAW non-local D builder core. Returns Dion (nat, nhm, nhm) for
+// npol=1 from an already spin-scaled per-atom becsum. See the declaration in
+// pseudopot.h for the term breakdown. The caller hands the result to
+// add_vnl_impl (single matrix-touching path).
+template<typename Pot_t>
+nda::array<ComplexType,3> pseudopot::compute_paw_deeq_from_becsum(
+    nda::array<double,3> const& becsum, Pot_t const& Vloc_r, bool include_static)
 {
     utils::check(npol == 1,
         "pseudopot::compute_paw_deeq: npol > 1 (SOC) not supported yet");
     long nat = ityp.extent(0);
-    long nspin = nii.extent(0);
-    double ns_scl = (nspin == 1 && npol == 1) ? 2.0 : 1.0;
 
     int nhm = 0;
     for (long ia = 0; ia < nat; ++ia) nhm = std::max(nhm, (int)nh(ityp(ia)));
@@ -519,21 +557,14 @@ nda::array<ComplexType,3> pseudopot::compute_paw_deeq(nii_t const& nii,
               Dion(ia, I, J) += Dst(ia, I, J);
     }
 
-    // ---- (2) radial AE−PS one-center Hartree from becsum(ρ).
-    // becsum: diagonal density, ns_scl-scaled to the spin-summed convention.
-    auto becsum = hamilt::paw::compute_becsum_diagonal(
-        Pskna_view(), nii, ityp, nh, ofs, npol);
-    for (long ia = 0; ia < becsum.extent(0); ++ia)
-      for (long I = 0; I < becsum.extent(1); ++I)
-        for (long J = 0; J < becsum.extent(2); ++J)
-          becsum(ia, I, J) *= ns_scl;
+    // ---- (2) radial AE−PS one-center Hartree from the (ns_scl-scaled) becsum.
     auto aatab = hamilt::paw::aainit_tables_build(paw_aainit_lli);
-    // Bridging factor ns_scl²: the radial deeq matrix element converges the
-    // full PAW V_H to the THC J only with this scale (PAW relVH 0.179→5e-5);
-    // it reflects a becsum-normalization mismatch vs compute_becsum_full. For
-    // the 2×2×2 fixture ns_scl²=4 ≡ N_k/ns_scl=4 — a non-222/nspin=2 fixture
-    // is needed to fix the convention. Only nspin=1 validated.
-    double rad_fac = ns_scl * ns_scl;
+    // Radial-Hartree multiplier: `1` — see `notes/paw_deeq_scaling_derivation.md`.
+    // CoQui's `compute_paw_hartree_atom` solves Poisson directly in Hartree,
+    // and the spin-summed becsum reproduces `ddd_paw_Ha` channel-by-channel (Ry
+    // `e2=2` cancels QE's spin-up-only convention exactly). Matches QE's loaded
+    // Dnn_atom to ~1e-6 Ha at LiH kp222 PAW HF.
+    double rad_fac = 1.0;
     for (long ia = 0; ia < nat; ++ia) {
         int nt = ityp(ia);
         if ((size_t)nt >= paw_species.size()) continue;

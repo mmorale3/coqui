@@ -477,8 +477,17 @@ void v_h_impl(mpi_context_t<communicator,shared_communicator> &mpi,
             // such that no conjugation is needed for nij in the next step
             if (kp_trev(k)) psi_r() = nda::conj(psi_r);
 
-            //accumulate density: Only diagonal components in polarization
-            nda::blas::gemm(nij(s, k_sym, all, all), psi_r, T);
+            //accumulate density: Only diagonal components in polarization.
+            // Convention: ρ(r) = Σ_ab nij_ab ψ_a(r) ψ*_b(r), i.e. nij_ab =
+            // ⟨ψ_a|γ|ψ_b⟩ — the SAME convention CoQui's SCF density matrix
+            // (qp_scf_common::update_Dm) and the THC Fock build use. The gemm
+            // below forms T_a = Σ_b nij_ab ψ_b and the loop contracts ψ*_a,
+            // which yields Σ_ab nij_ab ψ*_a ψ_b (the transposed density); we
+            // therefore pass nijᵀ so the result is Σ_ab nij_ab ψ_a ψ*_b. For
+            // real / diagonal nij this is a no-op; it only corrects the
+            // imaginary off-diagonal part of a complex Hermitian density
+            // matrix (see test thc_vs_direct_nij).
+            nda::blas::gemm(nda::transpose(nij(s, k_sym, all, all)), psi_r, T);
 
             if constexpr ( MEM == HOST_MEMORY ) {
               for (auto ib : nda::range(nbnd) ) {

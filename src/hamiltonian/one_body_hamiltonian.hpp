@@ -342,8 +342,10 @@ auto Vhartree(mf::MF &mf, boost::mpi3::communicator &comm, pseudopot *psp,
  * + V_H + K matches the existing test_dft_eigenvalues / set_fock convention
  * (K contains its leading minus). NCPP / USPP / PAW dispatch is internal.
  *
- * Restricted to diagonal occupations (rank-3 nii) for now; full-density-matrix
- * support can be added analogously to Vhartree(nij).
+ * Two overloads: diagonal occupations (rank-3 nii) and the full density
+ * matrix (rank-4 nij). The nij path generalizes via the natural-orbital
+ * decomposition (see hamilt::v_x / hamilt::paw::v_x nij overloads); it
+ * currently requires a no-symmetry mesh (nk_ibz == nk).
  */
 template<MEMORY_SPACE MEM = HOST_MEMORY, nda::ArrayOfRank<3> Arr3_t>
 auto Vexchange(mf::MF &mf, boost::mpi3::communicator &comm, pseudopot *psp,
@@ -365,6 +367,28 @@ auto Vexchange(mf::MF &mf, boost::mpi3::communicator &comm, pseudopot *psp,
       mf, comm, 'w', pgrid,
       nda::range(-1, -1), k_range, b_range, bz);
   return detail::gen_Vexchange<MEM>(mf, comm, psp, k_range, b_range, psi, nii);
+}
+
+template<MEMORY_SPACE MEM = HOST_MEMORY, nda::ArrayOfRank<4> Arr4_t>
+auto Vexchange(mf::MF &mf, boost::mpi3::communicator &comm, pseudopot *psp,
+               Arr4_t const& nij,
+               nda::range k_range = {-1,-1}, nda::range b_range = {-1,-1},
+               std::array<long,4> pgrid = {0}, std::array<long,4> bz = {1,1,2048,2048})
+{
+  if(k_range == nda::range{-1,-1}) k_range = nda::range(mf.nkpts_ibz());
+  if(b_range == nda::range{-1,-1}) b_range = nda::range(mf.nbnd());
+  utils::check(mf.mf_type() == mf::qe_source or mf.mf_type() == mf::bdft_source,
+               "Vexchange: only qe_source / bdft_source backends supported");
+  utils::check(psp != nullptr, "Vexchange: Missing pseudopot object.");
+  utils::check(k_range.first() == 0 && k_range.last() == mf.nkpts_ibz(),
+               "Vexchange: requires full IBZ k_range.");
+  utils::check(b_range.first() == 0 && b_range.last() == mf.nbnd(),
+               "Vexchange: requires full nbnd b_range.");
+  using larray = memory::array<MEM,ComplexType,4>;
+  auto psi = mf::read_distributed_orbital_set_ibz<larray>(
+      mf, comm, 'w', pgrid,
+      nda::range(-1, -1), k_range, b_range, bz);
+  return detail::gen_Vexchange<MEM>(mf, comm, psp, k_range, b_range, psi, nij);
 }
 
 template<nda::MemoryArrayOfRank<4> Array_4D_t, nda::ArrayOfRank<3> Arr3_t>

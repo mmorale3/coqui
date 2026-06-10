@@ -136,9 +136,8 @@ static void run_dDeeq_H_matches_deltaC_test(std::string fixture_name,
 
         // -- Path 1: radial Hartree, no core densities. -------------------
         //    On qe_lih222_paw the core fields (rho_atc_ps, core_aewfc) are
-        //    not populated yet (stage 3.7 fixture regen pending); pass
-        //    explicit zero buffers so the comparison is core-free on both
-        //    sides regardless of fixture state.
+        //    not populated, so pass explicit zero buffers to keep the
+        //    comparison core-free on both sides regardless of fixture state.
         nda::array<double,1> rho_core_AE_zero =
             nda::array<double,1>::zeros({(long)sp.mesh});
         nda::array<double,1> rho_core_PS_zero =
@@ -199,4 +198,158 @@ static void run_dDeeq_H_matches_deltaC_test(std::string fixture_name,
         "(max |element| = {:.3e}, tol = {:.1e})",
         fixture_name, max_abs_diff, total_pairs, max_abs_val, tol);
     CHECK(max_abs_diff < tol);
+}
+
+// ===========================================================================
+// MF-independent consistency of the becsum / deeq builders.
+//
+// The PAW one-center deeq (and V_H / V_X matrix elements) must be a functional
+// of CoQui's self-consistent one-body density matrix `n`, carrying the SAME
+// (ns_scl/N_k) normalization the smooth-grid Hartree applies to that same `n`.
+// It must NOT depend on the QE mean-field occupations — those only seed the
+// initial state. There are two becsum builders that must agree:
+//
+//   * compute_becsum_diagonal(occ)  — used by the validated paths
+//     (compute_paw_deeq, smooth-Hartree nii overload, the energy path);
+//     carries wk = 1/N_k internally, caller applies ns_scl.
+//   * compute_becsum_full(nij)      — used by the SELF-CONSISTENT paths
+//     (compute_deeq_scf, smooth-Hartree nij overload).
+//
+// Mathematical identity: for a DIAGONAL density matrix n_{skab}=δ_ab occ_ska,
+//   compute_becsum_full(n) == compute_becsum_diagonal(occ)   element-wise.
+// Both carry the same w_k = 1/N_k k-weight and ns_scl spin factor.
+// ===========================================================================
+static void run_becsum_full_matches_diagonal_test(std::string fixture_name,
+                                                  double tol)
+{
+    using nda::range;
+    auto& mpi = utils::make_unit_test_mpi_context();
+    auto qe_h5 = mf::default_MF(mpi, fixture_name, mf::h5_input_type);
+    auto& mfobj = qe_h5;
+
+    long nspin  = mfobj.nspin();
+    long nk_ibz = mfobj.nkpts_ibz();
+    long nbnd   = mfobj.nbnd();
+    int  npol   = mfobj.npol();
+    REQUIRE(npol == 1);
+
+    hamilt::pseudopot V(mfobj);
+
+    // Diagonal occupations nii(s,k,n) and the equivalent diagonal density
+    // matrix nij(s,k,a,b) = δ_ab nii(s,k,a).
+    nda::array<ComplexType,3> nii(nspin, nk_ibz, nbnd);
+    nii() = mfobj.occ()(range::all, range(nk_ibz), range::all);
+
+    nda::array<ComplexType,4> nij(nspin, nk_ibz, nbnd, nbnd);
+    nij() = ComplexType(0.0);
+    for (long s = 0; s < nspin; ++s)
+    for (long k = 0; k < nk_ibz; ++k)
+    for (long n = 0; n < nbnd; ++n)
+        nij(s, k, n, n) = nii(s, k, n);
+
+    auto bec_diag = hamilt::paw::compute_becsum_diagonal(
+        V.Pskna_view(), nii, V.ityp_view(), V.nh_view(), V.ofs_view(), npol);
+    auto bec_full = hamilt::paw::compute_becsum_full(
+        V.Pskna_view(), nij, V.ityp_view(), V.nh_view(), V.ofs_view(), npol);
+
+    REQUIRE(bec_diag.shape() == bec_full.shape());
+
+    double max_abs_diff = 0.0, max_abs_val = 0.0;
+    for (long ia = 0; ia < bec_diag.extent(0); ++ia)
+    for (long I  = 0; I  < bec_diag.extent(1); ++I)
+    for (long J  = 0; J  < bec_diag.extent(2); ++J) {
+        max_abs_diff = std::max(max_abs_diff,
+                                std::abs(bec_full(ia, I, J) - bec_diag(ia, I, J)));
+        max_abs_val  = std::max({max_abs_val,
+                                 std::abs(bec_full(ia, I, J)),
+                                 std::abs(bec_diag(ia, I, J))});
+    }
+    app_log(1,
+        "[paw becsum full-vs-diagonal / {}] max |Δbecsum| = {:.3e} "
+        "(max |element| = {:.3e}, tol = {:.1e})",
+        fixture_name, max_abs_diff, max_abs_val, tol);
+    REQUIRE(max_abs_val > 1e-8);          // becsum is non-trivial
+    CHECK(max_abs_diff < tol);
+}
+
+TEST_CASE("paw_onecenter_becsum_full_matches_diagonal",
+          "[hamilt][paw][onecenter]")
+{
+    SECTION("qe_lih222_paw") {
+        run_becsum_full_matches_diagonal_test("qe_lih222_paw", 1e-10);
+    }
+    SECTION("qe_si222_paw") {
+        run_becsum_full_matches_diagonal_test("qe_si222_paw", 1e-10);
+    }
+}
+
+// ===========================================================================
+// End-to-end: the SELF-CONSISTENT deeq builder compute_deeq_scf(nij) must
+// reproduce the validated compute_paw_deeq(occ) for a diagonal density matrix.
+//
+//   compute_paw_deeq(occ, /*Vloc_r=*/empty, include_static=true)
+//        = D_static + radial_Hartree(ns_scl × becsum_diagonal(occ))   [no G term]
+//   compute_deeq_scf(diag(occ))  → Dnn_atom
+//        = D_static + radial_Hartree(ns_scl × becsum_full(diag(occ)))
+//
+// With the becsum identity above these are element-wise equal. This guards
+// BOTH fixes on the self-consistent path: the 1/N_k in compute_becsum_full
+// AND the ns_scl applied inside compute_deeq_scf. It validates the deeq as a
+// functional of the density matrix `n` — no comparison against mf.occ() as if
+// it were ground truth.
+// ===========================================================================
+TEST_CASE("paw_onecenter_deeq_scf_matches_paw_deeq",
+          "[hamilt][paw][onecenter]")
+{
+    using nda::range;
+    auto& mpi = utils::make_unit_test_mpi_context();
+    auto qe_h5 = mf::default_MF(mpi, "qe_lih222_paw", mf::h5_input_type);
+    auto& mfobj = qe_h5;
+
+    long nspin  = mfobj.nspin();
+    long nk_ibz = mfobj.nkpts_ibz();
+    long nbnd   = mfobj.nbnd();
+    int  npol   = mfobj.npol();
+    REQUIRE(npol == 1);
+
+    hamilt::pseudopot V(mfobj);
+
+    nda::array<ComplexType,3> nii(nspin, nk_ibz, nbnd);
+    nii() = mfobj.occ()(range::all, range(nk_ibz), range::all);
+
+    nda::array<ComplexType,4> nij(nspin, nk_ibz, nbnd, nbnd);
+    nij() = ComplexType(0.0);
+    for (long s = 0; s < nspin; ++s)
+    for (long k = 0; k < nk_ibz; ++k)
+    for (long n = 0; n < nbnd; ++n)
+        nij(s, k, n, n) = nii(s, k, n);
+
+    // Validated diagonal builder: static + one-center radial Hartree, no
+    // G-space term (empty Vloc_r → Vloc_r.size()==0 short-circuits it).
+    nda::array<ComplexType,1> empty_vloc;
+    auto Dion_diag = V.compute_paw_deeq(nii, empty_vloc, /*include_static=*/true);
+
+    // Self-consistent builder writes into Dnn_atom.
+    V.compute_deeq_scf(nij);
+    auto Dscf = V.Dnn_atom_view();
+
+    REQUIRE(Dion_diag.extent(0) == Dscf.extent(0));
+    REQUIRE(Dion_diag.extent(1) == Dscf.extent(1));
+    REQUIRE(Dion_diag.extent(2) == Dscf.extent(2));
+
+    double max_abs_diff = 0.0, max_abs_val = 0.0;
+    for (long ia = 0; ia < Dion_diag.extent(0); ++ia)
+    for (long I  = 0; I  < Dion_diag.extent(1); ++I)
+    for (long J  = 0; J  < Dion_diag.extent(2); ++J) {
+        max_abs_diff = std::max(max_abs_diff,
+                                std::abs(Dscf(ia, I, J) - Dion_diag(ia, I, J)));
+        max_abs_val  = std::max({max_abs_val,
+                                 std::abs(Dscf(ia, I, J)),
+                                 std::abs(Dion_diag(ia, I, J))});
+    }
+    app_log(1,
+        "[paw deeq_scf vs paw_deeq / qe_lih222_paw] max |ΔD| = {:.3e} Ha "
+        "(max |element| = {:.3e})", max_abs_diff, max_abs_val);
+    REQUIRE(max_abs_val > 1e-8);          // deeq is non-trivial
+    CHECK(max_abs_diff < 1e-10);
 }

@@ -23,7 +23,7 @@
  *   diagonal nii :  becsum_{a,IJ} = Σ_{s,k,n} f_{skn} P*_{n,aI} P_{n,aJ}
  *   full nij     :  becsum_{a,IJ} = Σ_{s,k,a,b} P*_{a,aI} n_{skab} P_{b,aJ}
  * The δρ_a one-center residuals enter via the PAW ΔD_{IJ} correction matrix
- * (separate code path; tracked in project_paw_deeq_self_consistency_todo).
+ * (separate code path).
  * ==========================================================================
  */
 #ifndef HAMILTONIAN_PAW_V_H_PAW_HPP
@@ -109,11 +109,21 @@ inline nda::array<double,3> compute_becsum_diagonal(
 
 /**
  * becsum from a full density matrix nij(s,k,a,b):
- *   becsum_{a,IJ} = Σ_{s,k,a,b} P*_{a,aI} n_{skab} P_{b,aJ}
+ *   becsum_{a,IJ} = wk · Σ_{s,k,a,b} P*_{a,aI} n_{skab} P_{b,aJ},   wk = 1/N_k
+ *
+ * The 1/N_k k-weight matches `compute_becsum_diagonal` and CoQui's smooth-grid
+ * density convention (`v_h_impl`: ρ = (ns_scl/N_k) Σ n |ψ|², with the 1/N_k
+ * applied externally to an unweighted n). It is a property of CoQui's own
+ * density matrix, NOT of the QE mean-field — so the resulting deeq / V_H is a
+ * functional of the self-consistent n and is independent of the MF occupations
+ * that merely seed it. Like the diagonal helper this assumes uniform k-weights
+ * (nosym / full-BZ); a symmetry-reduced IBZ would need real per-k weights.
  *
  * Returns a real-valued (nat, nhm, nhm) for non-magnetic; the imaginary
  * residue from the unitary symmetry of n is dropped (warned if exceeds
- * a threshold). Same npol=1 restriction as the diagonal helper.
+ * a threshold). Same npol=1 restriction as the diagonal helper. The spin
+ * factor ns_scl is NOT applied here (callers apply it, mirroring
+ * compute_becsum_diagonal).
  */
 template<typename Pskna_t, typename nij_t>
 inline nda::array<double,3> compute_becsum_full(
@@ -133,6 +143,8 @@ inline nda::array<double,3> compute_becsum_full(
 
     nda::array<double,3> becsum = nda::array<double,3>::zeros({nat, nhm, nhm});
     if (Pskna.size() == 0 || nbnd == 0) return becsum;
+    // Uniform k-weight (matches compute_becsum_diagonal / the smooth density).
+    double wk = 1.0 / (double)nk;
     double max_imag = 0.0;
     for (long ia=0; ia<nat; ++ia) {
         int nt = ityp(ia);
@@ -141,17 +153,24 @@ inline nda::array<double,3> compute_becsum_full(
         long p0 = ofs(ia);
         for (int I=0; I<nh_a; ++I)
         for (int J=0; J<nh_a; ++J) {
+            // becsum_IJ = ⟨p_I|γ|p_J⟩ = Σ_ab ⟨p_I|ψ_a⟩ nij_ab ⟨ψ_b|p_J⟩
+            //           = Σ_ab P_Ia · nij_ab · conj(P_Jb),   P_Ia = ⟨p_I|ψ_a⟩,
+            // matching the convention γ = Σ_ab nij_ab |ψ_a⟩⟨ψ_b| used by the
+            // SCF density matrix, the smooth-grid Hartree, and the THC Fock
+            // build. For real / diagonal nij this equals the conjugate form;
+            // it only fixes the imaginary off-diagonal of a complex Hermitian
+            // density matrix (see test thc_vs_direct_nij).
             ComplexType acc(0.0);
             for (long s=0; s<nspin; ++s)
             for (long k=0; k<nk; ++k)
             for (long a=0; a<nbnd; ++a)
             for (long b=0; b<nbnd; ++b) {
-                acc += std::conj(Pskna(s, k, p0 + I, a)) *
+                acc += Pskna(s, k, p0 + I, a) *
                        nij(s, k, a, b) *
-                       Pskna(s, k, p0 + J, b);
+                       std::conj(Pskna(s, k, p0 + J, b));
             }
-            becsum(ia, I, J) = std::real(acc);
-            max_imag = std::max(max_imag, std::abs(std::imag(acc)));
+            becsum(ia, I, J) = wk * std::real(acc);
+            max_imag = std::max(max_imag, wk * std::abs(std::imag(acc)));
         }
     }
     if (max_imag > 1e-8) {

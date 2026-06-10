@@ -805,7 +805,6 @@ TEST_CASE("one_body_components_so", "[hamilt]")
 {
   auto& mpi = utils::make_unit_test_mpi_context();
 
-  //std::optional<double> Eref;
   auto qe = mf::default_MF(mpi,"qe_GaAs222_so");
 
 // qe_one_body_components
@@ -1768,7 +1767,8 @@ void test_thc_vs_direct_VH_VX(mpi_context_t& mpi,
                               double tol_VH = 5e-4,
                               double tol_VX = 5e-3,
                               bool strict_VH = true,
-                              bool strict_VX = true)
+                              bool strict_VX = true,
+                              bool nonqe_occ = false)
 {
   using math::shm::make_shared_array;
   auto all = nda::range::all;
@@ -1777,81 +1777,49 @@ void test_thc_vs_direct_VH_VX(mpi_context_t& mpi,
   long nk_ibz  = mfobj.nkpts_ibz();
   long nbnd    = mfobj.nbnd();
 
-  // ----- Density matrix from QE occupations (diagonal in band) -----
-  auto sDm = make_shared_array<array_view_4d_t>(mpi,
-                  {nspin, nk_ibz, nbnd, nbnd});
-  if (mpi.node_comm.root()) {
-    sDm.local()() = ComplexType(0.0);
-    for (int s = 0; s < nspin; ++s)
-      for (int k = 0; k < nk_ibz; ++k)
-        for (int a = 0; a < nbnd; ++a)
-          sDm.local()(s, k, a, a) = mfobj.occ(s, k, a);
-  }
-  mpi.node_comm.barrier();
-
+  // ----- Diagonal occupations nii (QE or a deliberately non-QE pattern) -----
+  // The non-QE pattern is a deterministic function of (s,k,n) that is nonzero
+  // on ALL bands and bears no relation to mfobj.occ(). Both the direct path
+  // (hamilt::Vhartree/Vexchange take nii) and the THC path (hf_t::evaluate
+  // takes the diagonal Dm built from this same nii) are fed identical input.
+  // If any code path secretly reaches for mfobj.occ() (or assumes 0/1
+  // occupations, or only the QE-occupied bands), the two paths diverge.
   memory::array<MEM, ComplexType, 3> nii(nspin, nk_ibz, nbnd);
-  if constexpr (MEM == HOST_MEMORY) {
+  if (nonqe_occ) {
+    static_assert(MEM == HOST_MEMORY,
+                  "non-QE occupation pattern only built for HOST_MEMORY tests");
+    for (long s = 0; s < nspin; ++s)
+      for (long k = 0; k < nk_ibz; ++k)
+        for (long n = 0; n < nbnd; ++n)
+          nii(s, k, n) = ComplexType(0.5 + 0.3 * std::cos(1.3 * n + 0.7 * k
+                                                          + 0.2 * s), 0.0);
+  } else if constexpr (MEM == HOST_MEMORY) {
     nii() = mfobj.occ()(all, nda::range(nk_ibz), all);
   } else {
     nii() = nda::array<ComplexType,3>(mfobj.occ()(all, nda::range(nk_ibz), all));
   }
+
+  // ----- Density matrix (diagonal in band) from the SAME nii -----
+  auto sDm = make_shared_array<array_view_4d_t>(mpi,
+                  {nspin, nk_ibz, nbnd, nbnd});
+  if (mpi.node_comm.root()) {
+    sDm.local()() = ComplexType(0.0);
+    for (long s = 0; s < nspin; ++s)
+      for (long k = 0; k < nk_ibz; ++k)
+        for (long a = 0; a < nbnd; ++a)
+          sDm.local()(s, k, a, a) = nii(s, k, a);
+  }
+  mpi.node_comm.barrier();
 
   // ----- Direct (FFT-based) V_H and V_x -----
   hamilt::pseudopot V(mfobj);
   auto dVH_direct = hamilt::Vhartree<MEM>(mfobj, mpi.comm, &V, nii);
   auto dVX_direct = hamilt::Vexchange<MEM>(mfobj, mpi.comm, &V, nii);
 
-  // For PAW, Vhartree only computes the smooth+G_aug part of V_H. Add the
-  // PAW one-center deltaC contribution directly:
-  //   ΔV_H_oc_{ij}(s, k_p) = Σ_a Σ_IJ P*_{i,aI}(k_p) · dD_H_IJ^a · P_{j,aJ}(k_p)
-  //   dD_H_IJ^a = Σ_KL deltaC^a(I,J,K,L) · becsum_full^a(K,L)
-  if (V.pp_type() != hamilt::pp_ncpp_t) {
-    auto becsum = hamilt::paw::compute_becsum_diagonal(
-        V.Pskna_view(), nii, V.ityp_view(), V.nh_view(),
-        V.ofs_view(), mfobj.npol());
-    auto Pskna = V.Pskna_view();
-    auto const& ityp = V.ityp_view();
-    auto const& nh_v = V.nh_view();
-    auto const& ofs  = V.ofs_view();
-    auto const& sps  = V.paw_species_view();
-    long nat = ityp.extent(0);
-    auto Vloc = dVH_direct.local();
-    for (auto [is_l, s] : itertools::enumerate(dVH_direct.local_range(0)))
-      for (auto [ik_l, k] : itertools::enumerate(dVH_direct.local_range(1))) {
-        for (long ia = 0; ia < nat; ++ia) {
-          int nt = ityp(ia);
-          int nh_a = nh_v(nt);
-          if (nh_a == 0) continue;
-          auto const& sp = sps[nt];
-          if (!sp.is_paw || sp.deltaC.size() == 0) continue;
-          long p0 = ofs(ia);
-          // dD_H(I,J) = Σ_KL deltaC(I,J,K,L) · becsum(ia, K, L)
-          nda::array<double, 2> dD(nh_a, nh_a);
-          dD() = 0.0;
-          for (int I = 0; I < nh_a; ++I)
-            for (int J = 0; J < nh_a; ++J) {
-              double acc = 0.0;
-              for (int K = 0; K < nh_a; ++K)
-                for (int L = 0; L < nh_a; ++L)
-                  acc += sp.deltaC(I, J, K, L) * becsum(ia, K, L);
-              dD(I, J) = acc;
-            }
-          // ΔV_H_oc_{ij} += Σ_IJ P*_i,aI(k) · dD(I,J) · P_j,aJ(k)
-          for (auto [ii_l, i] : itertools::enumerate(dVH_direct.local_range(2)))
-            for (auto [ij_l, j] : itertools::enumerate(dVH_direct.local_range(3))) {
-              ComplexType acc(0.0);
-              for (int I = 0; I < nh_a; ++I) {
-                ComplexType PiI = std::conj(Pskna(s, k, p0 + I, i));
-                for (int J = 0; J < nh_a; ++J) {
-                  ComplexType PjJ = Pskna(s, k, p0 + J, j);
-                  acc += PiI * ComplexType(dD(I, J), 0.0) * PjJ;
-                }
-              }
-              Vloc(is_l, ik_l, ii_l, ij_l) += acc;
-            }
-        }
-      }
-  }
+  // Vhartree's PAW path already folds the one-center radial Hartree
+  // contribution into V_H via compute_paw_deeq (matrix-element scaling),
+  // matching the THC V_H to ISDF noise on the LiH kp222 PAW HF fixture
+  // (rel ≈ 7e-5). No separate deltaC×becsum addition is needed here.
 
   // ----- THC-based V_H and V_x via hf_t::evaluate -----
   auto thc_pt = methods::make_thc_reader_ptree(
@@ -1919,12 +1887,9 @@ void test_thc_vs_direct_VH_VX(mpi_context_t& mpi,
     "THC vs direct V_x: max|V_x| = {:.3e}, max|ΔV_x| = {:.3e} "
     "(rel = {:.2e})", max_VX, max_dVX, max_dVX / std::max(1e-30, max_VX));
   if (strict_VX) CHECK(max_dVX < tol_VX);
-  else app_log(2, "  (V_x diagnostic: PAW one-center /4 factor in v_x_paw.hpp "
-                  "is approximate vs the THC K_a treatment; ΔV_x reported above)");
+  else app_log(2, "  (V_x diagnostic mode: ΔV_x reported above, not asserted)");
   if (strict_VH) CHECK(max_dVH < tol_VH);
-  else app_log(2, "  (V_H diagnostic: no complete standalone direct V_H routine "
-                  "for PAW/USPP — one-center lives in deeq; reconciliation "
-                  "with thc_reader_t V_H output is a follow-up)");
+  else app_log(2, "  (V_H diagnostic mode: ΔV_H reported above, not asserted)");
 }
 
 /**
@@ -2147,33 +2112,976 @@ TEST_CASE("thc_vs_direct_VH_VX", "[hamilt][thc][hf]")
         /*strict_VH*/ true, /*strict_VX*/ true);
   }
 
-  // Diagnostic mode for USPP/PAW: the PAW V_H output of hf_t::evaluate
-  // (THC path) includes contributions that the direct hamilt::Vhartree
-  // + inline deltaC×becsum×P×P assembly does not reconcile yet. This
-  // section logs the per-band diffs and reports overall magnitudes;
-  // closing the V_H convention gap is a follow-up task. V_x agrees
-  // between paths up to the empirical 1/4 factor on the one-center
-  // already documented in v_x_paw.hpp.
-  // USPP: V_x is the complete eigenvalue-validated quantity and matches THC
-  // strictly (no deltaC one-center for USPP). V_H one-center lives in deeq,
-  // so the standalone Vhartree comparison is diagnostic only.
+  // USPP: both V_H and V_x reproduce the direct full element to ISDF noise.
   SECTION("lih_kp222_nbnd16 (USPP, HF)") {
     auto mf_ptr = std::make_shared<mf::MF>(
         mf::default_MF(mpi, "qe_lih222_uspp_hf", mf::h5_input_type));
     test_thc_vs_direct_VH_VX<HOST_MEMORY>(*mpi, mf_ptr,
-        /*thc_thresh*/ 1e-5, /*tol_VH*/ 5e-4, /*tol_VX*/ 5e-3,
-        /*strict_VH*/ false, /*strict_VX*/ true);
+        /*thc_thresh*/ 1e-5, /*tol_VH*/ 5e-4, /*tol_VX*/ 5e-4,
+        /*strict_VH*/ true, /*strict_VX*/ true);
   }
 
-  // PAW: both V_H and V_x diagnostic. V_x carries the empirical /4 one-center
-  // factor (matches QE HF eigenvalue but ~13% off the THC K_a per-element);
-  // V_H one-center lives in deeq. Both are follow-up reconciliations.
-  SECTION("lih_kp222_nbnd16 (PAW, HF, diagnostic)") {
+  // PAW: both V_H and V_x reproduce the direct element to ISDF noise (~1e-4).
+  // The one-center exchange uses prefactor scl_oc=-1/N_k (v_x_paw.hpp); see
+  // notes/paw_onecenter_exchange_prefactor.md.
+  SECTION("lih_kp222_nbnd16 (PAW, HF)") {
     auto mf_ptr = std::make_shared<mf::MF>(
         mf::default_MF(mpi, "qe_lih222_paw_hf", mf::h5_input_type));
     test_thc_vs_direct_VH_VX<HOST_MEMORY>(*mpi, mf_ptr,
-        /*thc_thresh*/ 1e-5, /*tol_VH*/ 5e-4, /*tol_VX*/ 5e-3,
-        /*strict_VH*/ false, /*strict_VX*/ false);
+        /*thc_thresh*/ 1e-5, /*tol_VH*/ 5e-4, /*tol_VX*/ 5e-4,
+        /*strict_VH*/ true, /*strict_VX*/ true);
+  }
+
+}
+
+// ===========================================================================
+// MF-INDEPENDENCE: same THC-vs-direct comparison but driven by a deliberately
+// NON-QE diagonal occupation (nonzero on all bands, no relation to mfobj.occ()).
+// Both paths receive identical input (direct ← nii, THC ← diagonal Dm from the
+// same nii). If any routine secretly depends on the QE mean-field state
+// (reaches for mfobj.occ(), assumes 0/1 fillings, or only the QE-occupied
+// bands), the two paths diverge by O(1) relative error rather than THC
+// truncation. Tolerances are ~4x the QE-case values because all 16 bands are
+// now ~half-filled (larger density ⇒ larger absolute THC truncation).
+//
+// All three PP types are strict: the THC path reproduces the direct V_H and V_x
+// to ISDF noise even for the non-QE all-bands occupation. Tolerances are ~4x the
+// QE-case values because all 16 bands are ~half-filled (larger density ⇒ larger
+// THC truncation).
+// ===========================================================================
+TEST_CASE("thc_vs_direct_VH_VX_nonqe", "[hamilt][thc][hf]")
+{
+  auto& mpi = utils::make_unit_test_mpi_context();
+
+  SECTION("lih_kp222_nbnd16 (NCPP, non-QE occ)") {
+    auto mf_ptr = std::make_shared<mf::MF>(
+        mf::default_MF(mpi, "qe_lih222_hf", mf::h5_input_type));
+    test_thc_vs_direct_VH_VX<HOST_MEMORY>(*mpi, mf_ptr,
+        /*thc_thresh*/ 1e-5, /*tol_VH*/ 2e-3, /*tol_VX*/ 2e-3,
+        /*strict_VH*/ true, /*strict_VX*/ true, /*nonqe_occ*/ true);
+  }
+
+  SECTION("lih_kp222_nbnd16 (USPP, non-QE occ)") {
+    auto mf_ptr = std::make_shared<mf::MF>(
+        mf::default_MF(mpi, "qe_lih222_uspp_hf", mf::h5_input_type));
+    test_thc_vs_direct_VH_VX<HOST_MEMORY>(*mpi, mf_ptr,
+        /*thc_thresh*/ 1e-5, /*tol_VH*/ 2e-3, /*tol_VX*/ 2e-3,
+        /*strict_VH*/ true, /*strict_VX*/ true, /*nonqe_occ*/ true);
+  }
+
+  SECTION("lih_kp222_nbnd16 (PAW, non-QE occ)") {
+    auto mf_ptr = std::make_shared<mf::MF>(
+        mf::default_MF(mpi, "qe_lih222_paw_hf", mf::h5_input_type));
+    test_thc_vs_direct_VH_VX<HOST_MEMORY>(*mpi, mf_ptr,
+        /*thc_thresh*/ 1e-5, /*tol_VH*/ 2e-3, /*tol_VX*/ 2e-3,
+        /*strict_VH*/ true, /*strict_VX*/ true, /*nonqe_occ*/ true);
+  }
+}
+
+// ===========================================================================
+// Vhartree(nij) reduces to Vhartree(nii) for a DIAGONAL density matrix.
+// Validates the newly completed full-density-matrix Hartree path: the smooth
+// compensation charge (compute_becsum_full, now with 1/N_k) AND the PAW
+// one-center deeq (compute_paw_deeq(nij), wired into add_Hartree_impl's nij
+// branch) must both reduce to the validated diagonal path when nij = diag(nii).
+// A deliberately non-QE diagonal occupation is used, so this also confirms the
+// nij Hartree path carries no leftover dependence on the QE mean-field state.
+// Difference is pure floating-point summation order ⇒ ~machine precision.
+// ===========================================================================
+template<MEMORY_SPACE MEM>
+void test_vhartree_nij_vs_nii(mpi_context_t& mpi,
+                              std::shared_ptr<mf::MF> mf_ptr, double tol)
+{
+  auto& mfobj = *mf_ptr;
+  long nspin  = mfobj.nspin();
+  long nk_ibz = mfobj.nkpts_ibz();
+  long nbnd   = mfobj.nbnd();
+
+  // Non-QE diagonal occupation (nonzero on all bands).
+  nda::array<ComplexType,3> nii(nspin, nk_ibz, nbnd);
+  for (long s = 0; s < nspin; ++s)
+    for (long k = 0; k < nk_ibz; ++k)
+      for (long n = 0; n < nbnd; ++n)
+        nii(s, k, n) = ComplexType(0.5 + 0.3*std::cos(1.3*n + 0.7*k + 0.2*s), 0.0);
+
+  // Equivalent diagonal density matrix.
+  nda::array<ComplexType,4> nij(nspin, nk_ibz, nbnd, nbnd);
+  nij() = ComplexType(0.0);
+  for (long s = 0; s < nspin; ++s)
+    for (long k = 0; k < nk_ibz; ++k)
+      for (long n = 0; n < nbnd; ++n)
+        nij(s, k, n, n) = nii(s, k, n);
+
+  hamilt::pseudopot V(mfobj);
+  auto dVH_nii = hamilt::Vhartree<MEM>(mfobj, mpi.comm, &V, nii);
+  auto dVH_nij = hamilt::Vhartree<MEM>(mfobj, mpi.comm, &V, nij);
+
+  auto a = nda::to_host(dVH_nii.local());
+  auto b = nda::to_host(dVH_nij.local());
+  double max_d = 0.0, max_v = 0.0;
+  for (long i0 = 0; i0 < a.extent(0); ++i0)
+    for (long i1 = 0; i1 < a.extent(1); ++i1)
+      for (long i2 = 0; i2 < a.extent(2); ++i2)
+        for (long i3 = 0; i3 < a.extent(3); ++i3) {
+          max_d = std::max(max_d, std::abs(b(i0,i1,i2,i3) - a(i0,i1,i2,i3)));
+          max_v = std::max(max_v, std::abs(a(i0,i1,i2,i3)));
+        }
+  max_d = mpi.comm.all_reduce_value(max_d, boost::mpi3::max<>{});
+  max_v = mpi.comm.all_reduce_value(max_v, boost::mpi3::max<>{});
+  app_log(1, "[Vhartree nij-vs-nii] max|ΔV_H| = {:.3e}, max|V_H| = {:.3e}",
+          max_d, max_v);
+  REQUIRE(max_v > 1e-8);
+  CHECK(max_d < tol);
+}
+
+TEST_CASE("vhartree_nij_vs_nii", "[hamilt][paw][hf]")
+{
+  auto& mpi = utils::make_unit_test_mpi_context();
+  SECTION("lih_kp222_nbnd16 (NCPP)") {
+    auto mf_ptr = std::make_shared<mf::MF>(
+        mf::default_MF(mpi, "qe_lih222_hf", mf::h5_input_type));
+    test_vhartree_nij_vs_nii<HOST_MEMORY>(*mpi, mf_ptr, 1e-10);
+  }
+  SECTION("lih_kp222_nbnd16 (USPP)") {
+    auto mf_ptr = std::make_shared<mf::MF>(
+        mf::default_MF(mpi, "qe_lih222_uspp_hf", mf::h5_input_type));
+    test_vhartree_nij_vs_nii<HOST_MEMORY>(*mpi, mf_ptr, 1e-10);
+  }
+  SECTION("lih_kp222_nbnd16 (PAW)") {
+    auto mf_ptr = std::make_shared<mf::MF>(
+        mf::default_MF(mpi, "qe_lih222_paw_hf", mf::h5_input_type));
+    test_vhartree_nij_vs_nii<HOST_MEMORY>(*mpi, mf_ptr, 1e-10);
+  }
+}
+
+// ===========================================================================
+// Vexchange(nij) reduces to Vexchange(nii) for a DIAGONAL density matrix.
+// Validates the new full-density-matrix exchange path: the natural-orbital
+// decomposition of nij = diag(nii) recovers the canonical bands (with
+// eigenvalue occupations), so the smooth + PAW augmentation + deltaC
+// one-center contraction must reproduce the validated diagonal kernel.
+// Non-QE occupations ⇒ doubles as an MF-independence check of the nij path.
+// Tolerance allows for the eigensolver + extra-rotation roundoff.
+// ===========================================================================
+template<MEMORY_SPACE MEM>
+void test_vexchange_nij_vs_nii(mpi_context_t& mpi,
+                               std::shared_ptr<mf::MF> mf_ptr, double tol)
+{
+  auto& mfobj = *mf_ptr;
+  long nspin  = mfobj.nspin();
+  long nk_ibz = mfobj.nkpts_ibz();
+  long nbnd   = mfobj.nbnd();
+
+  nda::array<ComplexType,3> nii(nspin, nk_ibz, nbnd);
+  for (long s = 0; s < nspin; ++s)
+    for (long k = 0; k < nk_ibz; ++k)
+      for (long n = 0; n < nbnd; ++n)
+        nii(s, k, n) = ComplexType(0.5 + 0.3*std::cos(1.3*n + 0.7*k + 0.2*s), 0.0);
+
+  nda::array<ComplexType,4> nij(nspin, nk_ibz, nbnd, nbnd);
+  nij() = ComplexType(0.0);
+  for (long s = 0; s < nspin; ++s)
+    for (long k = 0; k < nk_ibz; ++k)
+      for (long n = 0; n < nbnd; ++n)
+        nij(s, k, n, n) = nii(s, k, n);
+
+  hamilt::pseudopot V(mfobj);
+  auto dVX_nii = hamilt::Vexchange<MEM>(mfobj, mpi.comm, &V, nii);
+  auto dVX_nij = hamilt::Vexchange<MEM>(mfobj, mpi.comm, &V, nij);
+
+  auto a = nda::to_host(dVX_nii.local());
+  auto b = nda::to_host(dVX_nij.local());
+  double max_d = 0.0, max_v = 0.0;
+  for (long i0 = 0; i0 < a.extent(0); ++i0)
+    for (long i1 = 0; i1 < a.extent(1); ++i1)
+      for (long i2 = 0; i2 < a.extent(2); ++i2)
+        for (long i3 = 0; i3 < a.extent(3); ++i3) {
+          max_d = std::max(max_d, std::abs(b(i0,i1,i2,i3) - a(i0,i1,i2,i3)));
+          max_v = std::max(max_v, std::abs(a(i0,i1,i2,i3)));
+        }
+  max_d = mpi.comm.all_reduce_value(max_d, boost::mpi3::max<>{});
+  max_v = mpi.comm.all_reduce_value(max_v, boost::mpi3::max<>{});
+  app_log(1, "[Vexchange nij-vs-nii] max|ΔV_x| = {:.3e}, max|V_x| = {:.3e}",
+          max_d, max_v);
+  REQUIRE(max_v > 1e-8);
+  CHECK(max_d < tol);
+}
+
+TEST_CASE("vexchange_nij_vs_nii", "[hamilt][paw][hf]")
+{
+  auto& mpi = utils::make_unit_test_mpi_context();
+  SECTION("lih_kp222_nbnd16 (NCPP)") {
+    auto mf_ptr = std::make_shared<mf::MF>(
+        mf::default_MF(mpi, "qe_lih222_hf", mf::h5_input_type));
+    test_vexchange_nij_vs_nii<HOST_MEMORY>(*mpi, mf_ptr, 1e-8);
+  }
+  SECTION("lih_kp222_nbnd16 (USPP)") {
+    auto mf_ptr = std::make_shared<mf::MF>(
+        mf::default_MF(mpi, "qe_lih222_uspp_hf", mf::h5_input_type));
+    test_vexchange_nij_vs_nii<HOST_MEMORY>(*mpi, mf_ptr, 1e-8);
+  }
+  SECTION("lih_kp222_nbnd16 (PAW)") {
+    auto mf_ptr = std::make_shared<mf::MF>(
+        mf::default_MF(mpi, "qe_lih222_paw_hf", mf::h5_input_type));
+    test_vexchange_nij_vs_nii<HOST_MEMORY>(*mpi, mf_ptr, 1e-8);
+  }
+}
+
+// ===========================================================================
+// Set 1b — MF-INDEPENDENCE with a genuine NON-DIAGONAL density matrix.
+// Compares direct hamilt::Vhartree(nij)/Vexchange(nij) against THC
+// hf_t::evaluate(Dm=nij) for a Hermitian PSD density matrix that is NOT
+// diagonal and bears no relation to the QE mean field:
+//     nij = A · diag(f) · A†,   f = non-QE base occupations, A near-identity.
+// Both paths receive the identical nij. Agreement to THC truncation error
+// confirms the full-density-matrix V_H/V_x paths are correct and carry no
+// leftover QE-MF dependence. Strict for NCPP, USPP, and PAW.
+// ===========================================================================
+template<MEMORY_SPACE MEM>
+void test_thc_vs_direct_nij(mpi_context_t& mpi, std::shared_ptr<mf::MF> mf_ptr,
+                            double thc_thresh, double tol_VH, double tol_VX,
+                            bool strict_VH, bool strict_VX)
+{
+  using math::shm::make_shared_array;
+  auto& mfobj = *mf_ptr;
+  long nspin = mfobj.nspin(), nk_ibz = mfobj.nkpts_ibz(), nbnd = mfobj.nbnd();
+
+  // Non-diagonal Hermitian PSD density matrix (MF-independent).
+  nda::array<ComplexType,4> nij(nspin, nk_ibz, nbnd, nbnd);
+  nij() = ComplexType(0.0);
+  for (long s = 0; s < nspin; ++s)
+    for (long k = 0; k < nk_ibz; ++k) {
+      std::vector<double> f(nbnd);
+      for (long c = 0; c < nbnd; ++c)
+        f[c] = 0.40 + 0.30 * std::cos(1.1*c + 0.5*k + 0.3*s);   // ∈ (0.1, 0.7)
+      auto A = [&](long a, long c) -> ComplexType {
+        double mag = (a == c) ? 1.0 : 0.2 / (1.0 + std::abs(a - c));
+        double ph  = 0.3 * (a + 1) * (c + 1) + 0.2 * k;
+        return mag * ComplexType(std::cos(ph), std::sin(ph));
+      };
+      for (long a = 0; a < nbnd; ++a)
+        for (long b = 0; b < nbnd; ++b) {
+          ComplexType acc(0.0);
+          for (long c = 0; c < nbnd; ++c) acc += A(a,c) * f[c] * std::conj(A(b,c));
+          nij(s, k, a, b) = acc;
+        }
+    }
+
+  // Direct.
+  hamilt::pseudopot V(mfobj);
+  auto dVH = hamilt::Vhartree<MEM>(mfobj, mpi.comm, &V, nij);
+  auto dVX = hamilt::Vexchange<MEM>(mfobj, mpi.comm, &V, nij);
+
+  // THC density matrix = the same nij.
+  auto sDm = make_shared_array<array_view_4d_t>(mpi, {nspin, nk_ibz, nbnd, nbnd});
+  if (mpi.node_comm.root()) sDm.local()() = nij;
+  mpi.node_comm.barrier();
+
+  auto thc_pt = methods::make_thc_reader_ptree(
+      0, "", "incore", "", "bdft", thc_thresh, mfobj.ecutrho());
+  thc_pt.put("paw_aug", true);
+  thc_pt.put("paw_isdf_metric", "coulomb");
+  thc_pt.put("paw_isdf_tol", 1e-12);
+  methods::thc_reader_t thc(mf_ptr, thc_pt);
+
+  auto sS = make_shared_array<array_view_4d_t>(mpi, {nspin, nk_ibz, nbnd, nbnd});
+  hamilt::set_ovlp(mfobj, sS);
+  auto sVH = make_shared_array<array_view_4d_t>(mpi, {nspin, nk_ibz, nbnd, nbnd});
+  { methods::solvers::hf_t hf(methods::ignore_g0);
+    hf.evaluate(sVH, sDm.local(), thc, sS.local(), true, false); }
+  auto sVX = make_shared_array<array_view_4d_t>(mpi, {nspin, nk_ibz, nbnd, nbnd});
+  { methods::solvers::hf_t hf(methods::ignore_g0);
+    hf.evaluate(sVX, sDm.local(), thc, sS.local(), false, true); }
+
+  auto VH_thc = nda::to_host(sVH.local());
+  auto VX_thc = nda::to_host(sVX.local());
+  auto VH_dir = nda::to_host(dVH.local());
+  auto VX_dir = nda::to_host(dVX.local());
+
+  double max_VH=0, max_VX=0, max_dVH=0, max_dVX=0;
+  auto rs = dVH.local_range(0); auto rk = dVH.local_range(1);
+  auto ri = dVH.local_range(2); auto rj = dVH.local_range(3);
+  for (auto [isl,s] : itertools::enumerate(rs))
+    for (auto [ikl,k] : itertools::enumerate(rk))
+      for (auto [iil,i] : itertools::enumerate(ri))
+        for (auto [ijl,j] : itertools::enumerate(rj)) {
+          max_VH  = std::max(max_VH,  std::abs(VH_dir(isl,ikl,iil,ijl)));
+          max_VX  = std::max(max_VX,  std::abs(VX_dir(isl,ikl,iil,ijl)));
+          max_dVH = std::max(max_dVH, std::abs(VH_thc(s,k,i,j) - VH_dir(isl,ikl,iil,ijl)));
+          max_dVX = std::max(max_dVX, std::abs(VX_thc(s,k,i,j) - VX_dir(isl,ikl,iil,ijl)));
+        }
+  max_VH  = mpi.comm.all_reduce_value(max_VH,  boost::mpi3::max<>{});
+  max_VX  = mpi.comm.all_reduce_value(max_VX,  boost::mpi3::max<>{});
+  max_dVH = mpi.comm.all_reduce_value(max_dVH, boost::mpi3::max<>{});
+  max_dVX = mpi.comm.all_reduce_value(max_dVX, boost::mpi3::max<>{});
+  app_log(1, "[THC-vs-direct nij] V_H: max|V_H|={:.3e} max|ΔV_H|={:.3e} rel={:.2e}",
+          max_VH, max_dVH, max_dVH/std::max(1e-30,max_VH));
+  app_log(1, "[THC-vs-direct nij] V_x: max|V_x|={:.3e} max|ΔV_x|={:.3e} rel={:.2e}",
+          max_VX, max_dVX, max_dVX/std::max(1e-30,max_VX));
+  if (strict_VH) CHECK(max_dVH < tol_VH);
+  if (strict_VX) CHECK(max_dVX < tol_VX);
+}
+
+TEST_CASE("thc_vs_direct_nij", "[hamilt][thc][hf]")
+{
+  auto& mpi = utils::make_unit_test_mpi_context();
+  SECTION("lih_kp222_nbnd16 (NCPP, non-diag nij)") {
+    auto mf_ptr = std::make_shared<mf::MF>(
+        mf::default_MF(mpi, "qe_lih222_hf", mf::h5_input_type));
+    test_thc_vs_direct_nij<HOST_MEMORY>(*mpi, mf_ptr, 1e-5, 2e-3, 2e-2, true, true);
+  }
+  SECTION("lih_kp222_nbnd16 (USPP, non-diag nij)") {
+    auto mf_ptr = std::make_shared<mf::MF>(
+        mf::default_MF(mpi, "qe_lih222_uspp_hf", mf::h5_input_type));
+    test_thc_vs_direct_nij<HOST_MEMORY>(*mpi, mf_ptr, 1e-5, 2e-3, 2e-3, true, true);
+  }
+  SECTION("lih_kp222_nbnd16 (PAW, non-diag nij)") {
+    auto mf_ptr = std::make_shared<mf::MF>(
+        mf::default_MF(mpi, "qe_lih222_paw_hf", mf::h5_input_type));
+    test_thc_vs_direct_nij<HOST_MEMORY>(*mpi, mf_ptr, 1e-5, 2e-3, 2e-3, true, true);
+  }
+}
+
+// ===========================================================================
+// GROUND TRUTH: isolate the THC PAW one-center (K_a) Hartree contribution and
+// compare it to the validated external reference (deltaC×becsum, = QE's ke%k).
+//
+// The THC Hartree V_H = smooth + compensation-aug + K_a one-center. The
+// `paw_onsite` knob gates ONLY the K_a term, so
+//     V_H(onsite=true) − V_H(onsite=false)  =  THC's K_a contribution to V_H,
+// which must equal the closed-form one-center matrix element
+//     ΔV_H^{ref}_{ij}(s,k) = Σ_a Σ_{IJ} P*_{i,aI} [Σ_{KL} deltaC^a(I,J,K,L)
+//                                                   becsum^a(K,L)] P_{j,aJ}
+// with becsum = ns_scl × compute_becsum_diagonal (the same density that feeds
+// the THC Dm). The direct one-center (compute_paw_hartree_atom) is validated
+// == this deltaC contraction to ~1e-5 (test_paw_onecenter), and the K_a tensor
+// == deltaC (test_local_isdf_deltaC_roundtrip); this test confirms the THC K_a
+// contraction/normalization matches the reference, and logs the smooth+comp
+// residual (THC_off vs direct−deltaC) for reference.
+// ===========================================================================
+template<MEMORY_SPACE MEM>
+void test_thc_Ka_onecenter_vs_deltaC(mpi_context_t& mpi,
+                                     std::shared_ptr<mf::MF> mf_ptr,
+                                     double thc_thresh)
+{
+  using math::shm::make_shared_array;
+  auto all = nda::range::all;
+  auto& mfobj = *mf_ptr;
+  long nspin = mfobj.nspin(), nk_ibz = mfobj.nkpts_ibz(), nbnd = mfobj.nbnd();
+  int  npol  = mfobj.npol();
+
+  // Non-QE diagonal occupation (exercises all bands) + matching Dm.
+  memory::array<MEM, ComplexType, 3> nii(nspin, nk_ibz, nbnd);
+  for (long s = 0; s < nspin; ++s) for (long k = 0; k < nk_ibz; ++k)
+    for (long n = 0; n < nbnd; ++n)
+      nii(s,k,n) = ComplexType(0.5 + 0.3*std::cos(1.3*n + 0.7*k + 0.2*s), 0.0);
+  auto sDm = make_shared_array<array_view_4d_t>(mpi, {nspin, nk_ibz, nbnd, nbnd});
+  if (mpi.node_comm.root()) {
+    sDm.local()() = ComplexType(0.0);
+    for (long s = 0; s < nspin; ++s) for (long k = 0; k < nk_ibz; ++k)
+      for (long a = 0; a < nbnd; ++a) sDm.local()(s,k,a,a) = nii(s,k,a);
+  }
+  mpi.node_comm.barrier();
+
+  hamilt::pseudopot V(mfobj);
+
+  // ---- External reference: deltaC × becsum one-center matrix element. ----
+  auto becsum = hamilt::paw::compute_becsum_diagonal(
+      V.Pskna_view(), nii, V.ityp_view(), V.nh_view(), V.ofs_view(), npol);
+  double ns_scl = (nspin == 1 && npol == 1) ? 2.0 : 1.0;
+  for (long ia = 0; ia < becsum.extent(0); ++ia)
+    for (long I = 0; I < becsum.extent(1); ++I)
+      for (long J = 0; J < becsum.extent(2); ++J) becsum(ia,I,J) *= ns_scl;
+  auto Pskna = V.Pskna_view();
+  auto const& ityp = V.ityp_view();
+  auto const& nh_v = V.nh_view();
+  auto const& ofs  = V.ofs_view();
+  auto const& sps  = V.paw_species_view();
+  long nat = ityp.extent(0);
+  nda::array<ComplexType,4> ref(nspin, nk_ibz, nbnd, nbnd);
+  ref() = ComplexType(0.0);
+  for (long s = 0; s < nspin; ++s)
+    for (long k = 0; k < nk_ibz; ++k)
+      for (long ia = 0; ia < nat; ++ia) {
+        int nt = ityp(ia); int nh_a = nh_v(nt);
+        if (nh_a == 0) continue;
+        auto const& sp = sps[nt];
+        if (!sp.is_paw || sp.deltaC.size() == 0) continue;
+        long p0 = ofs(ia);
+        nda::array<double,2> dD(nh_a, nh_a); dD() = 0.0;
+        for (int I = 0; I < nh_a; ++I) for (int J = 0; J < nh_a; ++J) {
+          double acc = 0.0;
+          for (int K = 0; K < nh_a; ++K) for (int L = 0; L < nh_a; ++L)
+            acc += sp.deltaC(I,J,K,L) * becsum(ia,K,L);
+          dD(I,J) = acc;
+        }
+        for (long i = 0; i < nbnd; ++i) for (long j = 0; j < nbnd; ++j) {
+          ComplexType acc(0.0);
+          for (int I = 0; I < nh_a; ++I) {
+            ComplexType PiI = std::conj(Pskna(s,k,p0+I,i));
+            for (int J = 0; J < nh_a; ++J)
+              acc += PiI * ComplexType(dD(I,J),0.0) * Pskna(s,k,p0+J,j);
+          }
+          ref(s,k,i,j) += acc;
+        }
+      }
+
+  // ---- THC K_a contribution = V_H(onsite=true) − V_H(onsite=false). ----
+  auto sS = make_shared_array<array_view_4d_t>(mpi, {nspin, nk_ibz, nbnd, nbnd});
+  hamilt::set_ovlp(mfobj, sS);
+  auto thc_VH = [&](bool onsite) {
+    auto pt = methods::make_thc_reader_ptree(0, "", "incore", "", "bdft",
+                                             thc_thresh, mfobj.ecutrho());
+    pt.put("paw_aug", true);
+    pt.put("paw_isdf_metric", "coulomb");
+    pt.put("paw_isdf_tol", 1e-12);
+    pt.put("paw_onsite", onsite);
+    methods::thc_reader_t thc(mf_ptr, pt);
+    auto sVH = make_shared_array<array_view_4d_t>(mpi, {nspin, nk_ibz, nbnd, nbnd});
+    methods::solvers::hf_t hf(methods::ignore_g0);
+    hf.evaluate(sVH, sDm.local(), thc, sS.local(), true, false);
+    nda::array<ComplexType,4> out = sVH.local();
+    return out;
+  };
+  auto VH_on  = thc_VH(true);
+  auto VH_off = thc_VH(false);
+
+  // Direct full V_H (smooth+comp via v_h + radial one-center + ∫V_H·Q via deeq).
+  auto dVH_dir = hamilt::Vhartree<MEM>(mfobj, mpi.comm, &V, nii);
+  auto VHd = nda::to_host(dVH_dir.local());
+
+  double max_ref=0, max_dKa=0;                    // one-center: THC K_a vs deltaC
+  double max_sm=0, max_dsm=0;                      // smooth+comp: THC_off vs (direct−ref)
+  double dsm_diag=0, dsm_off=0;                    // smooth+comp split: diag vs off-diag
+  double sm_diag=0,  sm_off=0;                     // magnitudes for relative
+  long ws=-1,wk=-1,wi=-1,wj=-1; double worst=0;    // worst smooth+comp element
+  ComplexType worst_thc, worst_dir;
+  auto rs = dVH_dir.local_range(0); auto rk = dVH_dir.local_range(1);
+  auto ri = dVH_dir.local_range(2); auto rj = dVH_dir.local_range(3);
+  for (auto [isl,s] : itertools::enumerate(rs))
+    for (auto [ikl,k] : itertools::enumerate(rk))
+      for (auto [iil,i] : itertools::enumerate(ri))
+        for (auto [ijl,j] : itertools::enumerate(rj)) {
+          ComplexType thc_oc = VH_on(s,k,i,j) - VH_off(s,k,i,j);   // THC K_a
+          ComplexType r      = ref(s,k,i,j);
+          ComplexType dfull  = VHd(isl,ikl,iil,ijl);               // direct full
+          max_ref   = std::max(max_ref,   std::abs(r));
+          max_dKa   = std::max(max_dKa,   std::abs(thc_oc - r));
+          ComplexType sm_thc = VH_off(s,k,i,j);
+          ComplexType sm_dir = dfull - r;              // direct smooth+comp (full − one-center)
+          double d = std::abs(sm_thc - sm_dir);
+          max_sm  = std::max(max_sm,  std::abs(sm_dir));
+          max_dsm = std::max(max_dsm, d);
+          if (i == j) { dsm_diag = std::max(dsm_diag, d); sm_diag = std::max(sm_diag, std::abs(sm_dir)); }
+          else        { dsm_off  = std::max(dsm_off,  d); sm_off  = std::max(sm_off,  std::abs(sm_dir)); }
+          if (d > worst) { worst=d; ws=s; wk=k; wi=i; wj=j; worst_thc=sm_thc; worst_dir=sm_dir; }
+        }
+  app_log(1, "[K_a one-center] THC_Ka vs deltaC: max|ref|={:.4e} max|Δ|={:.4e} rel={:.3e}",
+          max_ref, max_dKa, max_dKa/std::max(1e-30,max_ref));
+  app_log(1, "[smooth+comp]    THC_off vs (direct−deltaC): max|Δ|={:.4e} rel={:.3e}",
+          max_dsm, max_dsm/std::max(1e-30,max_sm));
+  app_log(1, "[smooth+comp DIAG]     max|Δ|={:.4e} rel={:.3e}",
+          dsm_diag, dsm_diag/std::max(1e-30,sm_diag));
+  app_log(1, "[smooth+comp OFF-DIAG] max|Δ|={:.4e} rel={:.3e}",
+          dsm_off,  dsm_off/std::max(1e-30,sm_off));
+  app_log(1, "[worst smooth+comp] (s={},k={},i={},j={}) THC={:+.5e}{:+.5e}i dir={:+.5e}{:+.5e}i ratio={:.4f}",
+          ws,wk,wi,wj, worst_thc.real(),worst_thc.imag(), worst_dir.real(),worst_dir.imag(),
+          std::abs(worst_thc)/std::max(1e-30,std::abs(worst_dir)));
+  REQUIRE(max_ref > 1e-8);  // non-trivial one-center
+}
+
+TEST_CASE("thc_Ka_onecenter_vs_deltaC", "[hamilt][paw][thc][onecenter]")
+{
+  auto& mpi = utils::make_unit_test_mpi_context();
+  SECTION("lih_kp222_nbnd16 (PAW)") {
+    auto mf_ptr = std::make_shared<mf::MF>(
+        mf::default_MF(mpi, "qe_lih222_paw_hf", mf::h5_input_type));
+    test_thc_Ka_onecenter_vs_deltaC<HOST_MEMORY>(*mpi, mf_ptr, 1e-5);
+  }
+}
+
+// ===========================================================================
+// V_x ONE-CENTER PREFACTOR check against THC's K_a exchange (QE-independent).
+//
+// Validates the one-center exchange prefactor scl_oc = -1/N_k in v_x_paw.hpp
+// against THC's own K_a exchange:
+//
+//   THC_Ka_x(s,kp,i,j) = THC_Vx(onsite=true) − THC_Vx(onsite=false)
+//     (Fock contraction of the additive one-center ERI block; the smooth+aug
+//      ERI is identical in both, so the difference is exactly K_a exchange.)
+//
+//   R(s,kp,i,j) = Σ_{kq,n} f_n Σ_a Σ_IL conj(P_iI(kp)) U^a_{IL}(n,kq) P_jL(kp)
+//     U^a_{IL} = Σ_JK deltaC^a(I,J,K,L) P_nJ(kq) conj(P_nK(kq))
+//     (the structure of the v_x_paw one-center loop, with UNIT prefactor)
+//
+// The best-fit real scalar α = Σ Re(THC·conj(R)) / Σ|R|² is the THC Fock
+// prefactor for the one-center block, which must equal the production -1/N_k.
+// nk==nk_ibz (nosym fixture) so Pskna is the full-BZ projector.
+// ===========================================================================
+template<MEMORY_SPACE MEM>
+void test_vx_onecenter_vs_thc_Ka(mpi_context_t& mpi,
+                                 std::shared_ptr<mf::MF> mf_ptr,
+                                 double thc_thresh)
+{
+  using math::shm::make_shared_array;
+  auto all = nda::range::all;
+  auto& mfobj = *mf_ptr;
+  long nspin = mfobj.nspin(), nk_ibz = mfobj.nkpts_ibz(), nbnd = mfobj.nbnd();
+  long nk = mfobj.nkpts();
+  REQUIRE(nk == nk_ibz);  // nosym fixture: Pskna is the full-BZ projector
+
+  // Non-QE diagonal occupation (exercises all bands) + matching diagonal Dm.
+  memory::array<MEM, ComplexType, 3> nii(nspin, nk_ibz, nbnd);
+  for (long s = 0; s < nspin; ++s) for (long k = 0; k < nk_ibz; ++k)
+    for (long n = 0; n < nbnd; ++n)
+      nii(s,k,n) = ComplexType(0.5 + 0.3*std::cos(1.3*n + 0.7*k + 0.2*s), 0.0);
+  auto sDm = make_shared_array<array_view_4d_t>(mpi, {nspin, nk_ibz, nbnd, nbnd});
+  if (mpi.node_comm.root()) {
+    sDm.local()() = ComplexType(0.0);
+    for (long s = 0; s < nspin; ++s) for (long k = 0; k < nk_ibz; ++k)
+      for (long a = 0; a < nbnd; ++a) sDm.local()(s,k,a,a) = nii(s,k,a);
+  }
+  mpi.node_comm.barrier();
+
+  hamilt::pseudopot V(mfobj);
+  auto Pskna = V.Pskna_view();
+  auto const& ityp = V.ityp_view();
+  auto const& nh_v = V.nh_view();
+  auto const& ofs  = V.ofs_view();
+  auto const& sps  = V.paw_species_view();
+  long nat = ityp.extent(0);
+
+  // ---- THC K_a exchange = THC_Vx(onsite=true) − THC_Vx(onsite=false). ----
+  auto sS = make_shared_array<array_view_4d_t>(mpi, {nspin, nk_ibz, nbnd, nbnd});
+  hamilt::set_ovlp(mfobj, sS);
+  auto thc_VX = [&](bool onsite) {
+    auto pt = methods::make_thc_reader_ptree(0, "", "incore", "", "bdft",
+                                             thc_thresh, mfobj.ecutrho());
+    pt.put("paw_aug", true);
+    pt.put("paw_isdf_metric", "coulomb");
+    pt.put("paw_isdf_tol", 1e-12);
+    pt.put("paw_onsite", onsite);
+    methods::thc_reader_t thc(mf_ptr, pt);
+    auto sVX = make_shared_array<array_view_4d_t>(mpi, {nspin, nk_ibz, nbnd, nbnd});
+    methods::solvers::hf_t hf(methods::ignore_g0);
+    hf.evaluate(sVX, sDm.local(), thc, sS.local(), false, true);  // exchange only
+    nda::array<ComplexType,4> out = sVX.local();
+    return out;
+  };
+  auto VX_on  = thc_VX(true);
+  auto VX_off = thc_VX(false);
+
+  // ---- Direct RAW one-center exchange (UNIT prefactor), exact v_x_paw loop. ----
+  nda::array<ComplexType,4> R(nspin, nk_ibz, nbnd, nbnd);
+  R() = ComplexType(0.0);
+  for (long s = 0; s < nspin; ++s)
+    for (long kp = 0; kp < nk_ibz; ++kp)
+      for (long kq = 0; kq < nk_ibz; ++kq)
+        for (long n = 0; n < nbnd; ++n) {
+          double f = std::real(nii(s,kq,n));
+          if (std::abs(f) < 1e-15) continue;
+          for (long ia = 0; ia < nat; ++ia) {
+            int nt = ityp(ia); int nh_a = nh_v(nt);
+            if (nh_a == 0) continue;
+            auto const& sp = sps[nt];
+            if (!sp.is_paw || sp.deltaC.size() == 0) continue;
+            long p0 = ofs(ia);
+            nda::array<ComplexType,2> U(nh_a, nh_a); U() = ComplexType(0.0);
+            for (int I = 0; I < nh_a; ++I) for (int L = 0; L < nh_a; ++L) {
+              ComplexType acc(0.0);
+              for (int J = 0; J < nh_a; ++J) {
+                ComplexType PnJ = Pskna(s,kq,p0+J,n);
+                for (int K = 0; K < nh_a; ++K) {
+                  ComplexType PnK = std::conj(Pskna(s,kq,p0+K,n));
+                  acc += ComplexType(sp.deltaC(I,J,K,L),0.0) * PnJ * PnK;
+                }
+              }
+              U(I,L) = acc;
+            }
+            for (long i = 0; i < nbnd; ++i) for (long j = 0; j < nbnd; ++j) {
+              ComplexType acc(0.0);
+              for (int I = 0; I < nh_a; ++I) {
+                ComplexType PiI = std::conj(Pskna(s,kp,p0+I,i));
+                for (int L = 0; L < nh_a; ++L)
+                  acc += PiI * U(I,L) * Pskna(s,kp,p0+L,j);
+              }
+              R(s,kp,i,j) += ComplexType(f,0.0) * acc;
+            }
+          }
+        }
+
+  // ---- Best-fit real scalar α = Σ Re(THC·conj(R)) / Σ|R|² + candidates. ----
+  double num = 0.0, den = 0.0, max_imag = 0.0, max_thc = 0.0, max_R = 0.0;
+  for (long s = 0; s < nspin; ++s) for (long k = 0; k < nk_ibz; ++k)
+    for (long i = 0; i < nbnd; ++i) for (long j = 0; j < nbnd; ++j) {
+      ComplexType thc = VX_on(s,k,i,j) - VX_off(s,k,i,j);
+      ComplexType r   = R(s,k,i,j);
+      num += std::real(thc * std::conj(r));
+      den += std::real(r * std::conj(r));
+      max_thc = std::max(max_thc, std::abs(thc));
+      max_R   = std::max(max_R,   std::abs(r));
+    }
+  REQUIRE(den > 1e-12);
+  double alpha = num / den;
+  // residual of best-fit imaginary part (THC should be real·R since deltaC real)
+  for (long s = 0; s < nspin; ++s) for (long k = 0; k < nk_ibz; ++k)
+    for (long i = 0; i < nbnd; ++i) for (long j = 0; j < nbnd; ++j) {
+      ComplexType thc = VX_on(s,k,i,j) - VX_off(s,k,i,j);
+      max_imag = std::max(max_imag, std::abs(std::imag(thc - alpha*R(s,k,i,j))));
+    }
+
+  double prod = -1.0 / double(nk);   // production scl_oc
+
+  auto resid = [&](double p) {
+    double mx = 0.0;
+    for (long s = 0; s < nspin; ++s) for (long k = 0; k < nk_ibz; ++k)
+      for (long i = 0; i < nbnd; ++i) for (long j = 0; j < nbnd; ++j)
+        mx = std::max(mx, std::abs((VX_on(s,k,i,j)-VX_off(s,k,i,j)) - p*R(s,k,i,j)));
+    return mx;
+  };
+  double res_prod = resid(prod);
+
+  app_log(1, "[V_x one-center prefactor] best-fit alpha = {:.6e}, "
+             "production scl_oc(-1/N_k) = {:.6e}, alpha/prod = {:.4f}",
+          alpha, prod, alpha/prod);
+  app_log(1, "  max|THC_Ka_x|={:.4e}  max|R|={:.4e}  max|imag resid @alpha|={:.3e}  "
+             "residual @prod={:.3e}", max_thc, max_R, max_imag, res_prod);
+
+  REQUIRE(max_thc > 1e-8);          // non-trivial K_a exchange present
+  REQUIRE(max_imag < 1e-6 * std::max(1e-30, max_thc)); // THC_Ka = real·R
+  // The production prefactor -1/N_k must reproduce THC's K_a exchange to noise.
+  CHECK(res_prod < 1e-4 * std::max(1e-30, max_thc));
+  CHECK(std::abs(alpha - prod) < 1e-4 * std::abs(prod));
+}
+
+TEST_CASE("vx_onecenter_vs_thc_Ka", "[hamilt][paw][thc][onecenter]")
+{
+  auto& mpi = utils::make_unit_test_mpi_context();
+  SECTION("lih_kp222_nbnd16 (PAW)") {
+    auto mf_ptr = std::make_shared<mf::MF>(
+        mf::default_MF(mpi, "qe_lih222_paw_hf", mf::h5_input_type));
+    test_vx_onecenter_vs_thc_Ka<HOST_MEMORY>(*mpi, mf_ptr, 1e-5);
+  }
+}
+
+// ===========================================================================
+// Smooth-only V_H cross-check: the EXACT smooth V_H matrix element by real-space
+// FFT vs THC(paw_aug=false).
+//     V_H^sm_ij = (1/N_r) Σ_r conj(ψ̃_i,unnorm(r)) ψ̃_j,unnorm(r) V_H^sm(r)
+// with V_H^sm(r) = iFFT[4π/|G|² · ρ̃_smooth(G)] (ρ̃ via build_total_density_r,
+// include_augmentation=false). NCPP/USPP (no/low aug) calibrate the
+// normalization, where smooth FFT must equal THC.
+// ===========================================================================
+template<MEMORY_SPACE MEM>
+void test_vh_smooth_fft_vs_thc(mpi_context_t& mpi, std::shared_ptr<mf::MF> mf_ptr,
+                               std::string label)
+{
+  using math::shm::make_shared_array;
+  auto all = nda::range::all; using nda::range;
+  auto& mfobj = *mf_ptr;
+  long nspin = mfobj.nspin(), nk_ibz = mfobj.nkpts_ibz(), nbnd = mfobj.nbnd();
+  int npol = mfobj.npol();
+  REQUIRE(npol == 1);
+
+  hamilt::pseudopot V(mfobj);
+  using larray = memory::array<MEM, ComplexType, 4>;
+  auto psi = mf::read_distributed_orbital_set_ibz<larray>(
+      mfobj, mpi.comm, 'w', std::array<long,4>{0,0,0,0},
+      range(nspin), range(nk_ibz), range(nbnd), std::array<long,4>{1,1,2048,2048});
+  auto fft_mesh  = mfobj.fft_grid_dim();
+  auto recv      = mfobj.recv();
+  auto kpts_full = mfobj.kpts();
+  auto kp_to_ibz = mfobj.kp_to_ibz();
+  auto kp_trev   = mfobj.kp_trev();
+  auto kp_symm   = mfobj.kp_symm();
+  auto symm_list = mfobj.symm_list();
+  auto k2g       = V.swfc_to_rho_view();
+  long nnr = (long)fft_mesh(0)*fft_mesh(1)*fft_mesh(2);
+  double det_B = recv(0,0)*(recv(1,1)*recv(2,2)-recv(1,2)*recv(2,1))
+               - recv(1,0)*(recv(0,1)*recv(2,2)-recv(0,2)*recv(2,1))
+               + recv(2,0)*(recv(0,1)*recv(1,2)-recv(0,2)*recv(1,1));
+  double vol = (2.0*M_PI)*(2.0*M_PI)*(2.0*M_PI)/std::abs(det_B);
+
+  // non-QE occ (exercise all bands)
+  nda::array<ComplexType,3> nii(nspin, nk_ibz, nbnd);
+  for (long s=0;s<nspin;++s) for (long k=0;k<nk_ibz;++k) for (long n=0;n<nbnd;++n)
+    nii(s,k,n) = ComplexType(0.5 + 0.3*std::cos(1.3*n+0.7*k+0.2*s), 0.0);
+
+  // ρ̃_smooth(r) (no augmentation) via the validated builder.
+  auto rho_sm = hamilt::paw::build_total_density_r(mpi, V, npol, fft_mesh, recv,
+      k2g, kpts_full, kp_to_ibz, kp_trev, kp_symm, symm_list, nii, psi, vol,
+      /*include_augmentation=*/false);
+
+  // Build V_H^sm(r) and the matrix elements on root.
+  nda::array<ComplexType,4> VHsm_fft(nspin, nk_ibz, nbnd, nbnd);
+  VHsm_fft() = ComplexType(0.0);
+  if (mpi.comm.root()) {
+    long NX=fft_mesh(0),NY=fft_mesh(1),NZ=fft_mesh(2);
+    // ρ̃(G) (normalized fwd), V_H(G)=4π/|G|² ρ(G), G=0→0, iFFT (unnorm) → V_H(r).
+    nda::array<ComplexType,1> vg(nnr);
+    for (long r=0;r<nnr;++r) vg(r)=ComplexType(rho_sm(r),0.0);
+    auto vg3d = nda::reshape(vg, std::array<long,3>{NX,NY,NZ});
+    math::nda::fft<false> Ff(vg3d); Ff.forward(vg3d);
+    for (long n1=0;n1<NX;++n1){int m1=(n1<=NX/2)?(int)n1:(int)n1-(int)NX;
+     for (long n2=0;n2<NY;++n2){int m2=(n2<=NY/2)?(int)n2:(int)n2-(int)NY;
+      for (long n3=0;n3<NZ;++n3){int m3=(n3<=NZ/2)?(int)n3:(int)n3-(int)NZ;
+        long N=(n1*NY+n2)*NZ+n3;
+        if(m1==0&&m2==0&&m3==0){vg(N)=ComplexType(0.0);continue;}
+        double Gx=m1*recv(0,0)+m2*recv(1,0)+m3*recv(2,0);
+        double Gy=m1*recv(0,1)+m2*recv(1,1)+m3*recv(2,1);
+        double Gz=m1*recv(0,2)+m2*recv(1,2)+m3*recv(2,2);
+        double G2=Gx*Gx+Gy*Gy+Gz*Gz;
+        vg(N) *= ComplexType(4.0*M_PI/G2, 0.0);
+      }}}
+    math::nda::fft<false> Fb(vg3d); Fb.backward(vg3d);  // V_H^sm(r), proper
+    // Orbitals on dense grid (un-normalized backward), per (s,k).
+    auto psi_full = larray(psi.global_shape());
+    math::nda::gather(0, psi, &psi_full);
+    long ngm = k2g.extent(0);
+    nda::array<ComplexType,1> pr(nnr);
+    auto pr3d = nda::reshape(pr, std::array<long,3>{NX,NY,NZ});
+    math::nda::fft<false> Fp(pr3d);
+    nda::array<ComplexType,3> psir(nbnd, nnr, 1);  // reuse per (s,k)
+    for (long s=0;s<nspin;++s) for (long k=0;k<nk_ibz;++k) {
+      nda::array<ComplexType,2> ur(nbnd, nnr); ur()=ComplexType(0.0);
+      for (long n=0;n<nbnd;++n) {
+        pr()=ComplexType(0.0);
+        for (long g=0;g<ngm;++g){ long Nidx=k2g(g); if(Nidx>=0&&Nidx<nnr) pr(Nidx)=psi_full(s,k,n,g); }
+        Fp.backward(pr3d);
+        for (long r=0;r<nnr;++r) ur(n,r)=pr(r);
+      }
+      for (long i=0;i<nbnd;++i) for (long j=0;j<nbnd;++j) {
+        ComplexType acc(0.0);
+        for (long r=0;r<nnr;++r) acc += std::conj(ur(i,r))*ur(j,r)*vg(r);
+        VHsm_fft(s,k,i,j) = acc / ComplexType((double)nnr, 0.0);
+      }
+    }
+  }
+  mpi.comm.broadcast_n(VHsm_fft.data(), VHsm_fft.size(), 0);
+
+  // THC smooth-only V_H (paw_aug=false).
+  auto sDm = make_shared_array<array_view_4d_t>(mpi, {nspin,nk_ibz,nbnd,nbnd});
+  if (mpi.node_comm.root()){ sDm.local()()=ComplexType(0.0);
+    for(long s=0;s<nspin;++s)for(long k=0;k<nk_ibz;++k)for(long a=0;a<nbnd;++a) sDm.local()(s,k,a,a)=nii(s,k,a);}
+  mpi.node_comm.barrier();
+  auto sS = make_shared_array<array_view_4d_t>(mpi, {nspin,nk_ibz,nbnd,nbnd});
+  hamilt::set_ovlp(mfobj, sS);
+  auto pt = methods::make_thc_reader_ptree(0,"","incore","","bdft",1e-5,mfobj.ecutrho());
+  pt.put("paw_aug", false);
+  methods::thc_reader_t thc(mf_ptr, pt);
+  auto sVH = make_shared_array<array_view_4d_t>(mpi, {nspin,nk_ibz,nbnd,nbnd});
+  { methods::solvers::hf_t hf(methods::ignore_g0);
+    hf.evaluate(sVH, sDm.local(), thc, sS.local(), true, false); }
+  auto VHthc = nda::to_host(sVH.local());
+
+  double max_v=0,max_d=0,d_diag=0,worst=0; long wi=-1,wj=-1,wk=-1,ws=-1;
+  ComplexType wfft, wthc;
+  for (long s=0;s<nspin;++s) for (long k=0;k<nk_ibz;++k)
+    for (long i=0;i<nbnd;++i) for (long j=0;j<nbnd;++j) {
+      double d=std::abs(VHsm_fft(s,k,i,j)-VHthc(s,k,i,j));
+      max_v=std::max(max_v,std::abs(VHsm_fft(s,k,i,j)));
+      max_d=std::max(max_d,d);
+      if(i==j) d_diag=std::max(d_diag,d);
+      if(d>worst){worst=d;ws=s;wk=k;wi=i;wj=j;wfft=VHsm_fft(s,k,i,j);wthc=VHthc(s,k,i,j);}
+    }
+  app_log(1,"[{} smooth FFT vs THC(no aug)] max|V_H^sm|={:.4e} max|Δ|={:.4e} rel={:.3e} diagΔ={:.4e}",
+          label, max_v, max_d, max_d/std::max(1e-30,max_v), d_diag);
+  app_log(1,"[{} worst] (s={},k={},i={},j={}) FFT={:+.5e} THC={:+.5e} ratio={:.4f}",
+          label, ws,wk,wi,wj, wfft.real(), wthc.real(),
+          std::abs(wthc)/std::max(1e-30,std::abs(wfft)));
+  REQUIRE(max_v > 1e-8);
+}
+
+TEST_CASE("vh_smooth_fft_vs_thc", "[hamilt][paw][thc][onecenter]")
+{
+  auto& mpi = utils::make_unit_test_mpi_context();
+  SECTION("USPP (calibration)") {
+    auto mf_ptr = std::make_shared<mf::MF>(
+        mf::default_MF(mpi, "qe_lih222_uspp_hf", mf::h5_input_type));
+    test_vh_smooth_fft_vs_thc<HOST_MEMORY>(*mpi, mf_ptr, "USPP");
+  }
+  SECTION("PAW") {
+    auto mf_ptr = std::make_shared<mf::MF>(
+        mf::default_MF(mpi, "qe_lih222_paw_hf", mf::h5_input_type));
+    test_vh_smooth_fft_vs_thc<HOST_MEMORY>(*mpi, mf_ptr, "PAW");
+  }
+}
+
+// ===========================================================================
+// V_GL vs V_LL isolation of the THC compensation assembly, using the diagnostic
+// paw_vgl/paw_vll knobs on the THC side and the exact ∫V·Q decomposition on
+// the direct side:
+//   THC_VGL = THC(vgl=1,vll=0,onsite=0) − THC(0,0,0)   (smooth-aug cross)
+//   THC_VLL = THC(vgl=0,vll=1,onsite=0) − THC(0,0,0)   (aug-aug)
+//   direct comp-comp = Σ conj(P_iI)P_jJ ∫V_comp·Q^IJ
+//                    = Σ conj(P)P [compute_paw_deeq(V_comp) − compute_paw_deeq(∅)]
+// where V_comp = v_C·ρ_comp, ρ_comp = ρ_tot − ρ_smooth (build_total_density_r).
+// Confirms THC_VLL == direct comp-comp (aug-aug block).
+// ===========================================================================
+TEST_CASE("thc_vgl_vll_split", "[hamilt][paw][thc][onecenter]")
+{
+  using math::shm::make_shared_array;
+  auto& mpip = utils::make_unit_test_mpi_context();
+  auto& mpi = *mpip;
+  using nda::range;
+  auto mf_ptr = std::make_shared<mf::MF>(
+      mf::default_MF(mpip, "qe_lih222_paw_hf", mf::h5_input_type));
+  auto& mfobj = *mf_ptr;
+  long nspin = mfobj.nspin(), nk_ibz = mfobj.nkpts_ibz(), nbnd = mfobj.nbnd();
+  int npol = mfobj.npol();
+  hamilt::pseudopot V(mfobj);
+
+  using larray = memory::array<HOST_MEMORY, ComplexType, 4>;
+  auto psi = mf::read_distributed_orbital_set_ibz<larray>(
+      mfobj, mpi.comm, 'w', std::array<long,4>{0,0,0,0},
+      range(nspin), range(nk_ibz), range(nbnd), std::array<long,4>{1,1,2048,2048});
+  auto fft_mesh=mfobj.fft_grid_dim(); auto recv=mfobj.recv();
+  auto kpts_full=mfobj.kpts(); auto kp_to_ibz=mfobj.kp_to_ibz();
+  auto kp_trev=mfobj.kp_trev(); auto kp_symm=mfobj.kp_symm();
+  auto symm_list=mfobj.symm_list(); auto k2g=V.swfc_to_rho_view();
+  long nnr=(long)fft_mesh(0)*fft_mesh(1)*fft_mesh(2);
+  double det_B=recv(0,0)*(recv(1,1)*recv(2,2)-recv(1,2)*recv(2,1))
+             - recv(1,0)*(recv(0,1)*recv(2,2)-recv(0,2)*recv(2,1))
+             + recv(2,0)*(recv(0,1)*recv(1,2)-recv(0,2)*recv(1,1));
+  double vol=(2.0*M_PI)*(2.0*M_PI)*(2.0*M_PI)/std::abs(det_B);
+
+  nda::array<ComplexType,3> nii(nspin,nk_ibz,nbnd);
+  for(long s=0;s<nspin;++s)for(long k=0;k<nk_ibz;++k)for(long n=0;n<nbnd;++n)
+    nii(s,k,n)=ComplexType(0.5+0.3*std::cos(1.3*n+0.7*k+0.2*s),0.0);
+
+  // ρ_smooth, ρ_tot → ρ_comp → V_comp(r) (proper).
+  auto rho_sm=hamilt::paw::build_total_density_r(mpi,V,npol,fft_mesh,recv,k2g,
+      kpts_full,kp_to_ibz,kp_trev,kp_symm,symm_list,nii,psi,vol,false);
+  auto rho_tot=hamilt::paw::build_total_density_r(mpi,V,npol,fft_mesh,recv,k2g,
+      kpts_full,kp_to_ibz,kp_trev,kp_symm,symm_list,nii,psi,vol,true);
+  nda::array<ComplexType,1> Vcomp_r(nnr); Vcomp_r()=ComplexType(0.0);
+  if(mpi.comm.root()){
+    long NX=fft_mesh(0),NY=fft_mesh(1),NZ=fft_mesh(2);
+    nda::array<ComplexType,1> g(nnr);
+    for(long r=0;r<nnr;++r) g(r)=ComplexType(rho_tot(r)-rho_sm(r),0.0);
+    auto g3d=nda::reshape(g,std::array<long,3>{NX,NY,NZ});
+    math::nda::fft<false> Ff(g3d); Ff.forward(g3d);
+    for(long n1=0;n1<NX;++n1){int m1=(n1<=NX/2)?(int)n1:(int)n1-(int)NX;
+     for(long n2=0;n2<NY;++n2){int m2=(n2<=NY/2)?(int)n2:(int)n2-(int)NY;
+      for(long n3=0;n3<NZ;++n3){int m3=(n3<=NZ/2)?(int)n3:(int)n3-(int)NZ;
+        long N=(n1*NY+n2)*NZ+n3;
+        if(m1==0&&m2==0&&m3==0){g(N)=ComplexType(0.0);continue;}
+        double Gx=m1*recv(0,0)+m2*recv(1,0)+m3*recv(2,0);
+        double Gy=m1*recv(0,1)+m2*recv(1,1)+m3*recv(2,1);
+        double Gz=m1*recv(0,2)+m2*recv(1,2)+m3*recv(2,2);
+        g(N)*=ComplexType(4.0*M_PI/(Gx*Gx+Gy*Gy+Gz*Gz),0.0);
+      }}}
+    auto g3d2=nda::reshape(g,std::array<long,3>{NX,NY,NZ});
+    math::nda::fft<false> Fb(g3d2); Fb.backward(g3d2);
+    for(long r=0;r<nnr;++r) Vcomp_r(r)=g(r);
+  }
+  mpi.comm.broadcast_n(Vcomp_r.data(),Vcomp_r.size(),0);
+
+  // direct comp-comp deeq = compute_paw_deeq(V_comp) − compute_paw_deeq(∅).
+  nda::array<ComplexType,1> empty_v;
+  auto dD_Vc = V.compute_paw_deeq(nii, Vcomp_r, false);
+  auto dD_0  = V.compute_paw_deeq(nii, empty_v, false);
+  // direct comp-comp matrix element V_LL-equiv_ij = Σ conj(P_iI)P_jJ (dD_Vc-dD_0).
+  auto Pskna=V.Pskna_view(); auto const& ityp=V.ityp_view();
+  auto const& nh_v=V.nh_view(); auto const& ofs=V.ofs_view();
+  long nat=ityp.extent(0);
+  nda::array<ComplexType,4> dirLL(nspin,nk_ibz,nbnd,nbnd); dirLL()=ComplexType(0.0);
+  for(long s=0;s<nspin;++s)for(long k=0;k<nk_ibz;++k)
+    for(long ia=0;ia<nat;++ia){int nt=ityp(ia);int nh_a=nh_v(nt);if(nh_a==0)continue;long p0=ofs(ia);
+      for(long i=0;i<nbnd;++i)for(long j=0;j<nbnd;++j){ComplexType acc(0.0);
+        for(int I=0;I<nh_a;++I){ComplexType PiI=std::conj(Pskna(s,k,p0+I,i));
+          for(int J=0;J<nh_a;++J) acc+=PiI*(dD_Vc(ia,I,J)-dD_0(ia,I,J))*Pskna(s,k,p0+J,j);}
+        dirLL(s,k,i,j)+=acc;}}
+
+  // THC pieces via knobs.
+  auto sDm=make_shared_array<array_view_4d_t>(mpi,{nspin,nk_ibz,nbnd,nbnd});
+  if(mpi.node_comm.root()){sDm.local()()=ComplexType(0.0);
+    for(long s=0;s<nspin;++s)for(long k=0;k<nk_ibz;++k)for(long a=0;a<nbnd;++a)sDm.local()(s,k,a,a)=nii(s,k,a);}
+  mpi.node_comm.barrier();
+  auto sS=make_shared_array<array_view_4d_t>(mpi,{nspin,nk_ibz,nbnd,nbnd});
+  hamilt::set_ovlp(mfobj,sS);
+  auto thcVH=[&](bool vgl,bool vll,bool onsite){
+    auto pt=methods::make_thc_reader_ptree(0,"","incore","","bdft",1e-5,mfobj.ecutrho());
+    pt.put("paw_aug",true); pt.put("paw_isdf_metric","coulomb"); pt.put("paw_isdf_tol",1e-12);
+    pt.put("paw_vgl",vgl); pt.put("paw_vll",vll); pt.put("paw_onsite",onsite);
+    methods::thc_reader_t thc(mf_ptr,pt);
+    auto sVH=make_shared_array<array_view_4d_t>(mpi,{nspin,nk_ibz,nbnd,nbnd});
+    methods::solvers::hf_t hf(methods::ignore_g0);
+    hf.evaluate(sVH,sDm.local(),thc,sS.local(),true,false);
+    nda::array<ComplexType,4> o=sVH.local(); return o; };
+  auto VH_smooth=thcVH(false,false,false);
+  auto VH_vgl   =thcVH(true,false,false);
+  auto VH_vll   =thcVH(false,true,false);
+
+  double mLL=0,dLL=0; long bi=-1; ComplexType tLL,dLLv,tGL;
+  for(long s=0;s<nspin;++s)for(long k=0;k<nk_ibz;++k)for(long i=0;i<nbnd;++i){
+    ComplexType thc_vll=VH_vll(s,k,i,i)-VH_smooth(s,k,i,i);
+    ComplexType d=dirLL(s,k,i,i);
+    mLL=std::max(mLL,std::abs(d));
+    if(std::abs(thc_vll-d)>dLL){dLL=std::abs(thc_vll-d);bi=i;tLL=thc_vll;dLLv=d;tGL=VH_vgl(s,k,i,i)-VH_smooth(s,k,i,i);}
+  }
+  app_log(1,"[V_LL split] worst diag band={} THC_VLL={:+.5e} direct_compcomp={:+.5e} ratio={:.4f} (max|dir|={:.4e})",
+          bi,tLL.real(),dLLv.real(),std::abs(tLL)/std::max(1e-30,std::abs(dLLv)),mLL);
+  app_log(1,"[V_GL at that band] THC_VGL={:+.5e}",tGL.real());
+  REQUIRE(mLL>1e-8);
+}
+
+// ===========================================================================
+// qrad table (build_qrad_tab + qrad_interp_at_K, used by the THC build_eta /
+// V_GL / V_LL augmentation) vs the EXACT qrad_at_K (used by evaluate_Q == QE
+// qgm, validated to 1e-10 by paw_aug_q_eval_at_q0). Confirms the interpolated
+// table matches the exact transform across L. Reports max rel error PER L so an
+// l-dependent defect would be visible.
+// ===========================================================================
+template<MEMORY_SPACE MEM>
+void test_qrad_tab_vs_exact(mpi_context_t& mpi, mf::MF& mfobj)
+{
+  hamilt::pseudopot V(mfobj);
+  auto const& sps  = V.paw_species_view();
+  auto recv = mfobj.recv();
+  // K_max bound similar to the THC/v_x builders.
+  double Kmax = 25.0;   // generous; covers the dense-grid |G| range for LiH
+  bool any = false;
+  for (long nt = 0; nt < (long)sps.size(); ++nt) {
+    auto const& sp = sps[nt];
+    if (!(sp.is_paw || sp.is_uspp) || sp.qfuncl.size() == 0) continue;
+    any = true;
+    long Lp1   = sp.qfuncl.extent(0);
+    long n_ijv = sp.qfuncl.extent(1);
+    auto T = hamilt::paw::build_qrad_tab(sp, Kmax);
+    nda::array<double,1> max_err(Lp1), max_val(Lp1);
+    max_err() = 0.0; max_val() = 0.0;
+    // Sample K densely (avoid the exact table nodes to exercise interpolation).
+    for (int iK = 0; iK < 400; ++iK) {
+      double K = (iK + 0.37) * (Kmax / 400.0);
+      for (long ijv = 0; ijv < n_ijv; ++ijv) {
+        // qrad_at_K is keyed by ijv (beta-pair index) directly here.
+        auto exact = hamilt::paw::qrad_at_K(sp, (int)ijv, K);
+        auto tab   = hamilt::paw::qrad_interp_at_K(T, (int)ijv, K);
+        for (long L = 0; L < Lp1; ++L) {
+          max_err(L) = std::max(max_err(L), std::abs(tab(L) - exact(L)));
+          max_val(L) = std::max(max_val(L), std::abs(exact(L)));
+        }
+      }
+    }
+    for (long L = 0; L < Lp1; ++L)
+      app_log(1, "[qrad tab-vs-exact nt={} L={}] max|Δ|={:.3e} max|exact|={:.3e} rel={:.3e}",
+              nt, L, max_err(L), max_val(L),
+              max_err(L)/std::max(1e-30, max_val(L)));
+  }
+  REQUIRE(any);
+}
+
+TEST_CASE("qrad_tab_vs_exact", "[hamilt][paw][onecenter]")
+{
+  auto& mpi = utils::make_unit_test_mpi_context();
+  SECTION("lih_kp222_nbnd16 (PAW)") {
+    auto qe_h5 = mf::default_MF(mpi, "qe_lih222_paw", mf::h5_input_type);
+    test_qrad_tab_vs_exact<HOST_MEMORY>(*mpi, qe_h5);
+  }
+  SECTION("si_kp222 (PAW)") {
+    auto qe_h5 = mf::default_MF(mpi, "qe_si222_paw", mf::h5_input_type);
+    test_qrad_tab_vs_exact<HOST_MEMORY>(*mpi, qe_h5);
   }
 }
 
@@ -3502,6 +4410,7 @@ TEST_CASE("hf_eigenvalues", "[hamilt][hf]")
       test_hf_eigenvalues<HOST_MEMORY>(*mpi, qe_h5, /*tol*/ 5e-3);
     }
   }
+
 }
 
 /**

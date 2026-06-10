@@ -36,6 +36,70 @@ using utils::mpi_context_t;
 using boost::mpi3::communicator;
 using boost::mpi3::shared_communicator;
 
+namespace detail {
+
+/**
+ * Natural-orbital decomposition of a Hermitian density-matrix block.
+ *
+ * Given n(a,b) (nbnd×nbnd, Hermitian, PSD for a physical 1-RDM but any
+ * Hermitian block is accepted), returns (w, U) such that
+ *
+ *   n_{ab} = Σ_p w(p) · U(a,p) · conj(U(b,p)).
+ *
+ * The exchange operator is linear in the density matrix and basis-covariant,
+ * so building the natural orbitals χ_p = Σ_a U(a,p) ψ_a and feeding (χ_p, w_p)
+ * into the diagonal-occupation exchange kernel reproduces K[n] exactly. This
+ * is how the full-density-matrix v_x overloads reuse the validated diagonal
+ * contraction (incl. PAW augmentation / one-center) with no extra cost.
+ *
+ * Robust to nda/LAPACK's heev eigenvector layout: both the row and column
+ * interpretations of the returned eigenvector matrix are tried and the
+ * reconstruction n_{ab} is verified; throws if neither matches.
+ */
+inline std::pair<nda::array<double,1>, nda::array<ComplexType,2>>
+natural_occupations(nda::array<ComplexType,2> const& n_in)
+{
+  long nb = n_in.extent(0);
+  utils::check(n_in.extent(1) == nb, "natural_occupations: non-square block");
+  nda::matrix<ComplexType> n_copy(nb, nb);
+  for (long a = 0; a < nb; ++a)
+    for (long b = 0; b < nb; ++b) n_copy(a, b) = n_in(a, b);
+  auto [ev, V] = nda::linalg::eigenelements(n_copy);  // ev ascending
+
+  double nrm = 1.0;
+  for (long a = 0; a < nb; ++a)
+    for (long b = 0; b < nb; ++b) nrm = std::max(nrm, std::abs(n_in(a, b)));
+
+  // residual of n_ab = Σ_p ev(p) U(a,p) conj(U(b,p)) for a candidate U layout.
+  auto residual = [&](bool rows) -> double {
+    double res = 0.0;
+    for (long a = 0; a < nb; ++a)
+      for (long b = 0; b < nb; ++b) {
+        ComplexType acc(0.0);
+        for (long p = 0; p < nb; ++p) {
+          ComplexType Uap = rows ? std::conj(V(p, a)) : V(a, p);
+          ComplexType Ubp = rows ? std::conj(V(p, b)) : V(b, p);
+          acc += ev(p) * Uap * std::conj(Ubp);
+        }
+        res = std::max(res, std::abs(acc - n_in(a, b)));
+      }
+    return res;
+  };
+  bool rows = true;
+  double res = residual(true);
+  if (res > 1e-8 * nrm) { rows = false; res = residual(false); }
+  utils::check(res < 1e-6 * nrm,
+      "natural_occupations: density-matrix reconstruction residual {} "
+      "(scale {}) — eigenvector convention not recognized", res, nrm);
+
+  nda::array<ComplexType,2> U(nb, nb);
+  for (long a = 0; a < nb; ++a)
+    for (long p = 0; p < nb; ++p) U(a, p) = rows ? std::conj(V(p, a)) : V(a, p);
+  return {nda::array<double,1>(ev), U};
+}
+
+}  // namespace detail
+
 /**
  * Smooth-only exact-exchange matrix elements K_{ij}(s, k_p) on the IBZ via
  * FFT pair densities — NCPP version. The PAW/USPP-augmented variant lives
@@ -262,6 +326,154 @@ void v_x(mpi_context_t<communicator,shared_communicator> &mpi,
     }
   }
 
+  mpi.comm.barrier();
+}
+
+/**
+ * Smooth-only exact exchange from a full density matrix nij(s,k,a,b) — NCPP.
+ * Generalizes the diagonal-occupation kernel above via the natural-orbital
+ * decomposition of nij at each (s,k): K[γ] = Σ_p w_p K[|χ_p⟩⟨χ_p|], so the
+ * inner "occupied" index runs over natural orbitals χ_p (occupation w_p)
+ * instead of canonical bands. The outer (k_p) orbitals stay canonical.
+ *
+ * Requires a no-symmetry mesh (nk_ibz == nk) so nij(s,kq) is the density
+ * matrix at the full-BZ point directly; symmetry-reduced nij is a follow-up.
+ */
+void v_x(mpi_context_t<communicator,shared_communicator> &mpi,
+         pots::potential_t& vG,
+         int npol,
+         nda::stack_array<long, 3> const& mesh,
+         nda::stack_array<double, 3, 3> const& /*lattv*/,
+         nda::stack_array<double, 3, 3> const& recv,
+         nda::ArrayOfRank<1> auto const& k2g_,
+         nda::ArrayOfRank<2> auto const& kpts,
+         nda::ArrayOfRank<1> auto const& kp_to_ibz,
+         nda::ArrayOfRank<1> auto const& kp_trev,
+         nda::ArrayOfRank<1> auto const& kp_symm,
+         std::vector<utils::symm_op> const& symm_list,
+         nda::ArrayOfRank<4> auto const& nij_,
+         math::nda::DistributedArrayOfRank<4> auto const& psi,
+         math::nda::DistributedArrayOfRank<4> auto & Kij)
+{
+  decltype(nda::range::all) all;
+  using nda::range;
+
+  utils::check(npol == 1, "v_x(nij): only npol=1 supported");
+  utils::check(psi.grid()[3] == 1, "v_x(nij): psi grid[3] must be 1");
+
+  long nspin   = psi.global_shape()[0];
+  long nk_ibz  = psi.global_shape()[1];
+  long nbnd    = psi.global_shape()[2];
+  long ngm     = k2g_.extent(0);
+  long nk      = kp_to_ibz.shape(0);
+  long nnr     = mesh(0)*mesh(1)*mesh(2);
+
+  utils::check(nk == nk_ibz,
+      "v_x(nij): symmetry-reduced k-mesh not supported yet (need nk_ibz==nk); "
+      "the full-BZ density matrix transform under symmetry is a follow-up.");
+  utils::check(nij_.extent(0) == nspin && nij_.extent(1) == nk_ibz &&
+               nij_.extent(2) == nbnd && nij_.extent(3) == nbnd,
+      "v_x(nij): nij shape mismatch");
+
+  double det_recv = recv(0,0)*(recv(1,1)*recv(2,2) - recv(1,2)*recv(2,1))
+                  - recv(1,0)*(recv(0,1)*recv(2,2) - recv(0,2)*recv(2,1))
+                  + recv(2,0)*(recv(0,1)*recv(1,2) - recv(0,2)*recv(1,1));
+  double Omega = (2.0*M_PI)*(2.0*M_PI)*(2.0*M_PI) / det_recv;
+  const ComplexType scl(-1.0 / (double(nk) * Omega), 0.0);
+
+  // psi_r_full(s, k_full, n, r) — canonical orbitals (outer index source).
+  nda::array<ComplexType, 4> psi_r_full(nspin, nk, nbnd, nnr);
+  psi_r_full() = ComplexType(0.0);
+  {
+    nda::array<ComplexType, 2> pr({1, nnr});
+    auto pr4d = nda::reshape(pr, std::array<long,4>{1, mesh(0), mesh(1), mesh(2)});
+    math::nda::fft<true> F(pr4d);
+    nda::array<long, 1> k2g_rotate(ngm);
+    nda::stack_array<double, 3> Gs; Gs() = 0.0;
+    nda::array<ComplexType,1> *Xft = nullptr;
+    auto ploc = psi.local();
+    for (auto [is_l, s] : itertools::enumerate(psi.local_range(0))) {
+      for (auto [ik_l, k_ibz] : itertools::enumerate(psi.local_range(1))) {
+        for (long kf = 0; kf < nk; ++kf) {
+          if (kp_to_ibz(kf) != k_ibz) continue;
+          k2g_rotate() = k2g_();
+          if (kp_trev(kf) or kp_symm(kf) > 0)
+            utils::transform_k2g(kp_trev(kf), symm_list[kp_symm(kf)], Gs, mesh,
+                                 kpts(k_ibz, all), k2g_rotate, Xft);
+          for (auto [ia_l, a] : itertools::enumerate(psi.local_range(2))) {
+            pr() = ComplexType(0.0);
+            nda::copy_select(true, k2g_rotate, ComplexType(1.0),
+                             ploc(is_l, ik_l, ia_l, range(0, ngm)),
+                             ComplexType(0.0), pr(0, all));
+            F.backward(pr4d);
+            if (kp_trev(kf))
+              for (long r = 0; r < nnr; ++r) psi_r_full(s, kf, a, r) = std::conj(pr(0, r));
+            else
+              for (long r = 0; r < nnr; ++r) psi_r_full(s, kf, a, r) = pr(0, r);
+          }
+        }
+      }
+    }
+  }
+  mpi.comm.all_reduce_in_place_n(psi_r_full.data(), psi_r_full.size(), std::plus<>{});
+
+  // Natural orbitals for the inner index: φ_all(s,kq,p,r) = Σ_a U_ap ψ_a(kq,r),
+  // occupations w_all(s,kq,p). Built for all (s, kq) up front (kq_ibz==kq).
+  auto nij_host = nda::to_host(nij_);
+  nda::array<ComplexType, 4> phi_all(nspin, nk, nbnd, nnr);
+  nda::array<double, 3> w_all(nspin, nk, nbnd);
+  phi_all() = ComplexType(0.0); w_all() = 0.0;
+  for (long s = 0; s < nspin; ++s) {
+    for (long kq = 0; kq < nk; ++kq) {
+      nda::array<ComplexType,2> nblk(nbnd, nbnd);
+      for (long a = 0; a < nbnd; ++a)
+        for (long b = 0; b < nbnd; ++b) nblk(a, b) = nij_host(s, kq, a, b);
+      auto [w, U] = detail::natural_occupations(nblk);
+      for (long p = 0; p < nbnd; ++p) w_all(s, kq, p) = w(p);
+      for (long p = 0; p < nbnd; ++p)
+        for (long a = 0; a < nbnd; ++a) {
+          ComplexType c = U(a, p);
+          if (std::abs(c) < 1e-300) continue;
+          for (long r = 0; r < nnr; ++r)
+            phi_all(s, kq, p, r) += c * psi_r_full(s, kq, a, r);
+        }
+    }
+  }
+
+  auto Kloc = Kij.local();
+  Kloc() = ComplexType(0.0);
+  nda::array<ComplexType, 2> pair_buf(nbnd, nnr);
+  auto pair4d = nda::reshape(pair_buf, std::array<long,4>{nbnd, mesh(0), mesh(1), mesh(2)});
+  math::nda::fft<true> Fpair(pair4d);
+  nda::array<ComplexType, 1> v_coul(nnr);
+
+  for (auto [is_l, s] : itertools::enumerate(Kij.local_range(0))) {
+    for (auto [ik_l, k_p_ibz] : itertools::enumerate(Kij.local_range(1))) {
+      auto K_sk = Kloc(is_l, ik_l, all, all);
+      for (long kq = 0; kq < nk; ++kq) {
+        v_coul() = ComplexType(0.0);
+        vG.evaluate_in_mesh(range(0, nnr), v_coul, mesh,
+                            nda::stack_array<double,3,3>{}, recv,
+                            kpts(k_p_ibz, all), kpts(kq, all));
+        for (long p = 0; p < nbnd; ++p) {
+          double w = w_all(s, kq, p);
+          if (std::abs(w) < 1e-15) continue;
+          for (long a = 0; a < nbnd; ++a)
+            for (long r = 0; r < nnr; ++r)
+              pair_buf(a, r) = std::conj(phi_all(s, kq, p, r)) *
+                               psi_r_full(s, k_p_ibz, a, r);
+          Fpair.forward(pair4d);
+          for (long i = 0; i < nbnd; ++i)
+            for (long j = 0; j < nbnd; ++j) {
+              ComplexType acc(0.0);
+              for (long g = 0; g < nnr; ++g)
+                acc += v_coul(g) * std::conj(pair_buf(i, g)) * pair_buf(j, g);
+              K_sk(i, j) += scl * ComplexType(w, 0.0) * acc;
+            }
+        }
+      }
+    }
+  }
   mpi.comm.barrier();
 }
 

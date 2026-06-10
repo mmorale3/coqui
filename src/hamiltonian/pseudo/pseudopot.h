@@ -98,6 +98,9 @@ class pseudopot
   auto Pskna_view() const { return Pskna.local(); }
   auto Qij_view() const { return qq_nt_data.local(); }
   auto qgm_view() const { return qgm.local(); }
+  // Per-atom effective non-local D (nat, nhm*npol, nhm*npol). Set by
+  // compute_deeq_scf / read_vnl_h5; exposed read-only for tests/validation.
+  auto Dnn_atom_view() const { return Dnn_atom.local(); }
   nda::array<int,3> const& ijtoh_view() const { return ijtoh; }
   nda::array<int,1> const& ityp_view() const { return ityp; }
   nda::array<int,1> const& nh_view() const { return nh; }
@@ -289,6 +292,20 @@ class pseudopot
    */
   void add_exchange(nda::range k_range,
                     nda::ArrayOfRank<3> auto const& nii,
+                    math::nda::DistributedArrayOfRank<4> auto const& psi,
+                    math::nda::DistributedArrayOfRank<4> auto & Kij);
+
+  /**
+   * Exact-exchange K_{ij}(s, k_p) from a FULL density matrix nij(s,k,a,b).
+   * Generalizes add_exchange(nii) via the natural-orbital decomposition of
+   * nij (see hamilt::paw::v_x / hamilt::v_x nij overloads). Same sign/scale
+   * convention as the diagonal version. Currently requires a no-symmetry mesh
+   * (nk_ibz == nk).
+   *
+   * @param nij - [input] density matrix (s, k_ibz, a, b)
+   */
+  void add_exchange(nda::range k_range,
+                    nda::ArrayOfRank<4> auto const& nij,
                     math::nda::DistributedArrayOfRank<4> auto const& psi,
                     math::nda::DistributedArrayOfRank<4> auto & Kij);
 
@@ -487,21 +504,42 @@ public:
    * Unified native PAW non-local D builder (the single source of truth — no
    * QE deeq, no XC). Returns a per-atom Dion array (nat, nhm*npol, nhm*npol)
    * assembled from up to three terms:
-   *   1. static     : dvan + paw_init_keeq (kinetic + bare-ionic AE−PS),
-   *                   included iff `include_static`.
-   *   2. radial     : AE−PS one-center Hartree, compute_paw_hartree_atom from
-   *                   becsum(ρ) (the `ns_scl²` matrix-element normalization is
-   *                   applied here — see implementation note).
-   *   3. G-space    : ∫ Vloc_r(r) Q^IJ_a(r) dr, included iff `Vloc_r` is
-   *                   non-empty (caller passes V_H for the Hartree matrix, or
-   *                   V_eff for the full H).
+   *   1. static     : dvan (h5 `dion` in Ha; already includes the AE−PS
+   *                   V_loc baseline per QE convention), included iff
+   *                   `include_static`.
+   *   2. radial     : AE−PS one-center Hartree, `compute_paw_hartree_atom`
+   *                   from `becsum = ns_scl × compute_becsum_{diagonal,full}`.
+   *                   No additional multiplier — `dDeeq_H` evaluated on the
+   *                   spin-summed becsum equals QE's `ddd_paw` per-channel
+   *                   (Ry/Ha cancellation across QE's `e2=2` convention and
+   *                   CoQui's spin doubling — see
+   *                   `notes/paw_deeq_scaling_derivation.md`).
+   *   3. G-space    : `∫ Vloc_r(r) Q^IJ_a(r) dr`, included iff `Vloc_r` is
+   *                   non-empty (caller passes V_H for the Hartree matrix,
+   *                   or V_eff = V_loc+V_H for the full deeq used in
+   *                   `add_vpp_impl`).
    * Callers build Dion then feed it to `add_vnl_impl` — the single code path
-   * that touches Hij/Vij. `nii` is the diagonal density (s,k,n).
+   * that touches Hij/Vij. Two overloads accept the density either as the
+   * diagonal `nii(s,k,n)` or the full density matrix `nij(s,k,a,b)`; both
+   * funnel through `compute_paw_deeq_from_becsum` so the static / radial /
+   * G-space assembly (and the rad_fac = 1 convention) lives in one place.
    *
    * Implementation lives out-of-class in `hamiltonian/paw/paw_onecenter.hpp`.
    */
-  template<typename nii_t, typename Pot_t>
-  nda::array<ComplexType,3> compute_paw_deeq(nii_t const& nii,
+  template<typename Pot_t>
+  nda::array<ComplexType,3> compute_paw_deeq(nda::ArrayOfRank<3> auto const& nii,
+                                             Pot_t const& Vloc_r,
+                                             bool include_static);
+  template<typename Pot_t>
+  nda::array<ComplexType,3> compute_paw_deeq(nda::ArrayOfRank<4> auto const& nij,
+                                             Pot_t const& Vloc_r,
+                                             bool include_static);
+  // Shared core: assemble Dion from an already spin-scaled per-atom becsum
+  // (nat, nhm, nhm). The two compute_paw_deeq overloads build becsum from
+  // nii / nij respectively and delegate here.
+  template<typename Pot_t>
+  nda::array<ComplexType,3> compute_paw_deeq_from_becsum(
+                                             nda::array<double,3> const& becsum,
                                              Pot_t const& Vloc_r,
                                              bool include_static);
 
