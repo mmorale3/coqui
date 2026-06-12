@@ -158,7 +158,7 @@ void v_x(mpi_context_t<communicator,shared_communicator> &mpi,
          pots::potential_t& vG,
          int npol,
          nda::stack_array<long, 3> const& mesh,
-         nda::stack_array<double, 3, 3> const& /*lattv*/,
+         nda::stack_array<double, 3, 3> const& lattv,
          nda::stack_array<double, 3, 3> const& recv,
          nda::ArrayOfRank<1> auto const& k2g_,
          nda::ArrayOfRank<2> auto const& kpts,
@@ -230,8 +230,33 @@ void v_x(mpi_context_t<communicator,shared_communicator> &mpi,
           if (kp_to_ibz(kf) != k_ibz) continue;
           k2g_rotate() = k2g_();
           if (kp_trev(kf) or kp_symm(kf) > 0) {
+            // Umklapp G-shift: the symmetry op maps k_ibz to kf only up to a
+            // reciprocal-lattice vector (S k_ibz = kf + Gs). Passing Gs=0 leaves
+            // the rotated orbital mislabelled by e^{i Gs.r}, corrupting the
+            // high-G content of the symmetry-reconstructed orbitals -> high-band
+            // exchange error under symmetry. Crystal coords: k_crys = lattv.k_cart/2pi.
+            // Gs = k_crys(kf) - Rinv^T . k_crys(k_ibz) (cf. utils::symmetry_rotations).
+            // NEEDS TESTING: verified == 0 for symmorphic rocksalt 2x2x2 (no-op), so the
+            // Gs != 0 path (non-symmorphic groups / BZ-boundary umklapp folding) is as-yet
+            // UNVALIDATED -- confirm the sign/transpose convention on such a case before
+            // relying on it. transform_k2g asserts G_out is integer, so a wrong Gs aborts
+            // loudly rather than corrupting silently. Same Gs=0 gap exists in qe_readonly.
+            nda::stack_array<double,3> kcf, kci;
+            kcf() = 0.0; kci() = 0.0;
+            for (int u=0; u<3; ++u)
+              for (int v=0; v<3; ++v) {
+                kcf(u) += lattv(u,v) * kpts(kf, v);
+                kci(u) += lattv(u,v) * kpts(k_ibz, v);
+              }
+            auto const& Rv = symm_list[kp_symm(kf)].Rinv;
+            for (int u=0; u<3; ++u) {
+              double rk = 0.0;
+              for (int v=0; v<3; ++v) rk += Rv(v,u) * kci(v);
+              Gs(u) = (kcf(u) - rk) / (2.0*M_PI);
+            }
             utils::transform_k2g(kp_trev(kf), symm_list[kp_symm(kf)], Gs, mesh,
                                  kpts(k_ibz, all), k2g_rotate, Xft);
+            Gs() = 0.0;
           }
           for (auto [ia_l, a] : itertools::enumerate(psi.local_range(2))) {
             pr() = ComplexType(0.0);
