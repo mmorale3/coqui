@@ -510,10 +510,24 @@ auto ovlp(mf::MF& mf, boost::mpi3::communicator& comm,
                                           mf.nspin(), k_range.size(), b_range.size(),
                                           bz);
   } else if (mf.mf_type() == mf::bdft_source) {
-    using larray = memory::array<MEM,ComplexType,4>;
-    auto psi = mf::read_distributed_orbital_set_ibz<larray>(mf,comm,'w',pgrid,
-                               nda::range(-1,-1), k_range, b_range, bz);
-    return detail::gen_ovlp<MEM,false>(comm,psi);
+    // bdft bands (QE/ABINIT-sourced) come from the augmented eigenproblem
+    // H|ψ̃> = ε S_aug|ψ̃> (NCPP/USPP/PAW), so they are S_aug-orthonormal and the
+    // all-electron / physical band-basis overlap is the identity — the basis GW
+    // works in. For NCPP the smooth ⟨ψ̃|ψ̃⟩ is already ≈ I; for PAW it is NOT
+    // (⟨ψ̃|ψ̃⟩ ≠ I), so it MUST be replaced by identity to stay consistent with
+    // the AE PAW basis. Identity is correct for both cases. Same rationale as
+    // the QE branch above.
+    long np0 = std::accumulate(pgrid.cbegin(), pgrid.cend(), long(1), std::multiplies<>{});
+    if(np0 == 0) {
+      long sz = comm.size();
+      long ps = (sz%mf.nspin()==0?mf.nspin():1);
+      long n_ = sz/ps;
+      long pk = utils::find_proc_grid_max_rows(n_,k_range.size());
+      pgrid = {ps,pk,n_/pk,1};
+    }
+    return detail::gen_identity_ovlp<MEM>(comm, pgrid,
+                                          mf.nspin(), k_range.size(), b_range.size(),
+                                          bz);
   } else {
     utils::check(mf.mf_type() == mf::pyscf_source, "Source mismatch");
     utils::check(k_range.size() == mf.nkpts_ibz(), "No k_range with pyscf backend yet.");
@@ -547,11 +561,20 @@ auto ovlp_diagonal(mf::MF& mf, boost::mpi3::communicator& comm,
                                                    mf.nspin(), k_range.size(), b_range.size(),
                                                    bz);
   } else if (mf.mf_type() == mf::bdft_source) {
-    using larray = memory::array<MEM,ComplexType,4>;
-    auto psi = mf::read_distributed_orbital_set_ibz<larray>(mf,comm,'w',
-             {pgrid[0],pgrid[1],pgrid[2],1},nda::range(-1,-1), k_range, b_range,
-             {bz[0],bz[1],bz[2],2048});
-    return detail::gen_ovlp<MEM,true>(comm,psi);
+    // See ovlp(): bdft PAW bands are S_aug-orthonormal, so the physical
+    // band-basis overlap is identity (the AE PAW basis GW works in). The smooth
+    // ⟨ψ̃|ψ̃⟩ ≠ I for PAW must NOT be used.
+    long np0 = std::accumulate(pgrid.cbegin(), pgrid.cend(), long(1), std::multiplies<>{});
+    if(np0 == 0) {
+      long sz = comm.size();
+      long ps = (sz%mf.nspin()==0?mf.nspin():1);
+      long n_ = sz/ps;
+      long pk = utils::find_proc_grid_max_rows(n_,k_range.size());
+      pgrid = {ps,pk,n_/pk};
+    }
+    return detail::gen_identity_ovlp_diagonal<MEM>(comm, pgrid,
+                                                   mf.nspin(), k_range.size(), b_range.size(),
+                                                   bz);
   } else {
     utils::check(mf.mf_type() == mf::pyscf_source, "Source mismatch");
     utils::check(k_range.size() == mf.nkpts_ibz(), "No k_range with pyscf backend yet.");

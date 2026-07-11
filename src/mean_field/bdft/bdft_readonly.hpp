@@ -592,8 +592,29 @@ public:
   void set_pseudopot(std::shared_ptr<hamilt::pseudopot> const& psp_) { psp = psp_; }
   std::shared_ptr<hamilt::pseudopot> get_pseudopot() { return psp; }
 
-  // type of pseudopotential treatment
-  hamilt::pp_type_e pp_type() const { return hamilt::pp_ncpp_t; }
+  // type of pseudopotential treatment. Read from the /Hamiltonian `pp_type`
+  // attribute in the h5 (ncpp if absent/unreadable) and cached. This enables the
+  // PAW/USPP code paths for bdft mean fields (compensation augmentation in the
+  // THC reader, identity band-basis overlap, native deeq) that were previously
+  // disabled by hardcoding ncpp -- the bdft PAW/USPP path had never been
+  // exercised. The pseudopot is attached only after the THC reader builds, so we
+  // cannot route through it; read the type directly from the file instead.
+  hamilt::pp_type_e pp_type() const {
+    if (not _pp_type_cache.has_value()) {
+      hamilt::pp_type_e t = hamilt::pp_ncpp_t;
+      try {
+        h5::file file(sys.filename, 'r');
+        h5::group grp(file);
+        h5::group hgrp = grp.open_group("Hamiltonian");
+        std::string s;
+        h5::h5_read_attribute(hgrp, "pp_type", s);
+        if (s == "paw") t = hamilt::pp_paw_t;
+        else if (s == "uspp") t = hamilt::pp_uspp_t;
+      } catch(...) {}
+      _pp_type_cache = t;
+    }
+    return *_pp_type_cache;
+  }
 
   // close h5 handles 
   void close()
@@ -609,6 +630,9 @@ public:
 
   // h5 handle 
   std::optional<h5::file> h5file;
+
+  // lazily-read + cached /Hamiltonian pp_type (see pp_type()).
+  mutable std::optional<hamilt::pp_type_e> _pp_type_cache;
 
   // plane wave cutoff of the FFT grid for AOs
   double ecut = 0.0;
