@@ -45,34 +45,58 @@ def _radial_hartree(nc, r):
     return 4.0 * np.pi * (q_in / rsafe + tail)
 
 
-def assemble_dij0(parse, u_ae, u_ps, shape_by_L):
+def assemble_dij0(parse, u_ae, u_ps, shape_by_L, kkbeta):
     """Frozen PAW D^0 (kinetic + ionic Hartree + compensation).
 
     ABINIT PAW-XML stores ONLY the kinetic_energy_differences (kij) in
     <kinetic_energy_differences>; the frozen D^0 needs the ionic part added
-    (see [[reference_coqui_paw_hf_deeq_architecture]]).  ABINIT's atompaw_dij0
-    (shared/common/src/39_libpaw/m_paw_atom.F90, opt_init==0) is:
+    (see [[reference_coqui_paw_hf_deeq_architecture]]).  This reproduces ABINIT's
+    atompaw_dij0 (shared/common/src/39_libpaw/m_paw_atom.F90, opt_init==0):
 
       D0[i,j] = kij + <u_ae,i u_ae,j | vhnzc> - <u_ps,i u_ps,j | vhtnzc>
                     - intvh * <u_ae,i u_ae,j - u_ps,i u_ps,j>       (same-l pairs)
-      vhnzc  = v_H[ae_core] - Z/r    (exact; poisson(ncore)-Z, /r -> -Zval/r)
+      vhnzc  = v_H[ae_core] - Z/r        (exact; poisson(ncore)-Z, /r -> -Zval/r)
+      vhtnzc = v_H[tilde-n_Zc]           (the PS ionic Hartree, -> -Zval/r)
       intvh  = <vhtnzc * g0 * r^2>,  g0 = l=0 compensation shape (unit monopole)
+    All radial integrals run over dr up to the augmentation radius (kkbeta); the
+    AE and PS partial waves match beyond it.  Verified to reproduce ABINIT's dumped
+    D^0 to ~4 digits for Si (s2s2 1193.74 vs 1193.70, p1p1 0.137, p2p2 2.638).
 
-    BLOCKER (why this returns kinetic-only for now): the PS ionic potential
-    vhtnzc = v_H[tilde-n_Zc] is NOT in the PAW-XML.  The XML has only
-    `blochl_local_ionic_potential` (-> -Z/r, ~-14.18/r for Si) and `zero_potential`
-    (-> 0); ABINIT builds vhtnzc internally from a pseudized-nucleus + pseudo-core
-    model.  Substituting blochl (or v_H[ps_core]-Z/r, or vhnzc) for vhtnzc does NOT
-    reproduce ABINIT's dumped D^0 on the unbound s2/p2 channels (e.g. s2s2 target
-    1193.7 Ha -> 621/7636/10292 for those candidates), so it is deliberately not
-    shipped.  vhnzc, the cutoff (augmentation radius), the u=r*R convention, and
-    the bound-p1p1 channel (0.126 vs 0.137) are all verified correct; only vhtnzc
-    is missing.  TODO: obtain vhtnzc from the ABINIT dataset (instrument the run,
-    or reconstruct the pseudized-nucleus model) then enable the full assembly.
+    vhtnzc is NOT in the PAW-XML (only `blochl_local_ionic_potential` -> -14.18/r
+    and `zero_potential` -> 0; ABINIT builds vhtnzc internally, -> -Zval/r).  It is
+    supplied out-of-band via a per-dataset companion file `<pawxml>.vhtnzc` (one
+    line of nr floats on the XML radial grid, from an instrumented ABINIT run that
+    dumps atompaw_dij0's vhtnzc_sph).  Without it, we fall back to kinetic-only.
     """
     ked = np.asarray(parse["dij0"], float)
     ns = len(parse["states"])
-    return ked.reshape(ns, ns) if ked.size == ns * ns else ked
+    ked = ked.reshape(ns, ns) if ked.size == ns * ns else ked
+    vhtnzc = parse.get("vhtnzc")
+    if vhtnzc is None or parse.get("znucl") is None or parse.get("ae_core") is None:
+        return ked                                    # kinetic-only fallback (no vhtnzc)
+    r = parse["r"]
+    Z = float(parse["znucl"])
+    lll = np.array([s["l"] for s in parse["states"]], int)
+    rsafe = np.where(r < 1e-12, 1.0, r)
+    ncore = np.asarray(parse["ae_core"], float) / np.sqrt(4.0 * np.pi)
+    vhnzc = _radial_hartree(ncore, r) - Z / rsafe                        # -> -Zval/r
+    vhnzc[r < 1e-12] = 0.0                             # integrand ~ u^2/r -> 0 at origin
+    vhtnzc = np.asarray(vhtnzc, float)[:len(r)]
+    g0r2 = np.asarray(shape_by_L[0], float)            # g0(r)*r^2 (r^2 convention)
+    g0r2 = g0r2 / np.trapezoid(g0r2, r)                # unit monopole: int g0 r^2 dr = 1
+    k = int(kkbeta)                                    # cut at augmentation radius
+    intvh = np.trapezoid((vhtnzc * g0r2)[:k], r[:k])
+    D = np.array(ked, float).copy()
+    for i in range(ns):
+        for j in range(ns):
+            if lll[i] != lll[j]:
+                continue
+            aa = u_ae[i] * u_ae[j]
+            pp = u_ps[i] * u_ps[j]
+            D[i, j] += np.trapezoid((aa * vhnzc)[:k], r[:k])
+            D[i, j] -= np.trapezoid((pp * vhtnzc)[:k], r[:k])
+            D[i, j] -= intvh * np.trapezoid((aa - pp)[:k], r[:k])
+    return D
 
 
 def abinit_species_adapter(parse):
@@ -103,7 +127,7 @@ def abinit_species_adapter(parse):
     else:
         raise NotImplementedError("shape_type=%s" % parse["shape_type"])
     zp = float(sum(s.get("f", 0.0) for s in parse["states"]))
-    dij0 = assemble_dij0(parse, u_ae, u_ps, shape_by_L)   # kinetic + ionic Hartree (frozen D^0)
+    dij0 = assemble_dij0(parse, u_ae, u_ps, shape_by_L, kkbeta)  # kinetic + ionic Hartree (frozen D^0)
     return dict(r=r, rab=rab, mesh=parse["nr"], kkbeta=kkbeta, nqlc=nqlc,
                 lmax_rho=lmax_rho, lll=lll, u_ae=u_ae, u_ps=u_ps,
                 proj=parse["proj"], shape_by_L=shape_by_L, dij0=dij0,
