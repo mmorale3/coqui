@@ -40,6 +40,10 @@ def parse_pawxml(path):
     def findall(tag):
         return root.findall(tag)
 
+    # --- atomic number (nuclear charge Z) ---
+    atom = find("atom")
+    znucl = float(atom.get("Z")) if atom is not None and atom.get("Z") else None
+
     # --- radial grid (assume single grid 'log1') ---
     rg = find("radial_grid")
     a = float(rg.get("a")); d = float(rg.get("d"))
@@ -96,7 +100,7 @@ def parse_pawxml(path):
     exx_cc_el = find("exact_exchange")
     exx_core_core = float(exx_cc_el.get("core-core")) if exx_cc_el is not None else 0.0
 
-    return dict(r=r, a=a, d=d, nr=nr, states=states, ns=ns,
+    return dict(r=r, a=a, d=d, nr=nr, states=states, ns=ns, znucl=znucl,
                 phi_ae=phi_ae, phi_ps=phi_ps, proj=proj,
                 shape_type=shape_type, shape_rc=shape_rc, paw_radius=paw_radius,
                 vbar=vbar, ae_core=ae_core, ps_core=ps_core,

@@ -33,6 +33,48 @@ from paw_qvan import augmentation_function
 from paw_deltaC import compute_deltaC
 
 
+def _radial_hartree(nc, r):
+    """Spherical Hartree potential of a radial density nc(r):
+      V_H(r) = 4*pi [ (1/r) int_0^r nc r'^2 dr' + int_r^inf nc r' dr' ]  ->  Q/r at large r.
+    """
+    dr = np.diff(r)
+    q_in = np.concatenate([[0.0], np.cumsum(0.5 * (nc[1:]*r[1:]**2 + nc[:-1]*r[:-1]**2) * dr)])
+    seg = 0.5 * (nc[1:]*r[1:] + nc[:-1]*r[:-1]) * dr
+    tail = np.concatenate([np.cumsum(seg[::-1])[::-1], [0.0]])
+    rsafe = np.where(r < 1e-12, 1.0, r)
+    return 4.0 * np.pi * (q_in / rsafe + tail)
+
+
+def assemble_dij0(parse, u_ae, u_ps, shape_by_L):
+    """Frozen PAW D^0 (kinetic + ionic Hartree + compensation).
+
+    ABINIT PAW-XML stores ONLY the kinetic_energy_differences (kij) in
+    <kinetic_energy_differences>; the frozen D^0 needs the ionic part added
+    (see [[reference_coqui_paw_hf_deeq_architecture]]).  ABINIT's atompaw_dij0
+    (shared/common/src/39_libpaw/m_paw_atom.F90, opt_init==0) is:
+
+      D0[i,j] = kij + <u_ae,i u_ae,j | vhnzc> - <u_ps,i u_ps,j | vhtnzc>
+                    - intvh * <u_ae,i u_ae,j - u_ps,i u_ps,j>       (same-l pairs)
+      vhnzc  = v_H[ae_core] - Z/r    (exact; poisson(ncore)-Z, /r -> -Zval/r)
+      intvh  = <vhtnzc * g0 * r^2>,  g0 = l=0 compensation shape (unit monopole)
+
+    BLOCKER (why this returns kinetic-only for now): the PS ionic potential
+    vhtnzc = v_H[tilde-n_Zc] is NOT in the PAW-XML.  The XML has only
+    `blochl_local_ionic_potential` (-> -Z/r, ~-14.18/r for Si) and `zero_potential`
+    (-> 0); ABINIT builds vhtnzc internally from a pseudized-nucleus + pseudo-core
+    model.  Substituting blochl (or v_H[ps_core]-Z/r, or vhnzc) for vhtnzc does NOT
+    reproduce ABINIT's dumped D^0 on the unbound s2/p2 channels (e.g. s2s2 target
+    1193.7 Ha -> 621/7636/10292 for those candidates), so it is deliberately not
+    shipped.  vhnzc, the cutoff (augmentation radius), the u=r*R convention, and
+    the bound-p1p1 channel (0.126 vs 0.137) are all verified correct; only vhtnzc
+    is missing.  TODO: obtain vhtnzc from the ABINIT dataset (instrument the run,
+    or reconstruct the pseudized-nucleus model) then enable the full assembly.
+    """
+    ked = np.asarray(parse["dij0"], float)
+    ns = len(parse["states"])
+    return ked.reshape(ns, ns) if ked.size == ns * ns else ked
+
+
 def abinit_species_adapter(parse):
     """Normalize an abinit_pawxml.parse_pawxml() dict into a species dict.
 
@@ -61,9 +103,10 @@ def abinit_species_adapter(parse):
     else:
         raise NotImplementedError("shape_type=%s" % parse["shape_type"])
     zp = float(sum(s.get("f", 0.0) for s in parse["states"]))
+    dij0 = assemble_dij0(parse, u_ae, u_ps, shape_by_L)   # kinetic + ionic Hartree (frozen D^0)
     return dict(r=r, rab=rab, mesh=parse["nr"], kkbeta=kkbeta, nqlc=nqlc,
                 lmax_rho=lmax_rho, lll=lll, u_ae=u_ae, u_ps=u_ps,
-                proj=parse["proj"], shape_by_L=shape_by_L, dij0=parse["dij0"],
+                proj=parse["proj"], shape_by_L=shape_by_L, dij0=dij0,
                 exx_X=parse.get("exx_X"), zp=zp,
                 n_qn=[s.get("n") for s in parse["states"]])
 
@@ -233,19 +276,35 @@ def write_hamiltonian_paw(h5root, w, vtrial, paw_parses, verbose=True):
     nkb = int(nh_atom.sum())
     nhm = int(max(sum(2 * int(l) + 1 for l in s["lll"]) for s in species))
 
-    # pp_local_component from vbar (the short-ranged Bloechl local ionic potential);
-    # scf_local_potential (from vtrial) is the quantity that defines the KS H0.
+    # ---- local ionic potential pp_local_component (QE vltot convention) ----
+    # blochl_local_ionic_potential is Bloechl's v_H[n~_Zc]; it is NOT short-ranged:
+    # it carries the bare -Z/r nuclear Coulomb tail.  The valence electrons see the
+    # frozen ion of charge +Zval, so the local ionic potential must go as -Zval/r.
+    # We (1) add the frozen-core Hartree V_H[n_core] (+Zc/r screening), then (2) do
+    # the standard Coulomb split so the sin-transform integrand is short-ranged and
+    # the -Q/r long range is analytic: V(G!=0)=FT[v+Q/r]-4*pi*Q/(vol*G^2), and the
+    # G=0 term is the finite "alpha" reference.  The previous code FFT'd the bare
+    # -Z/r tail over the whole radial grid, giving a huge divergent V(G=0) that made
+    # the CoQui one-electron energy pathological (~-37000 Ha, ~1/Omega swing).
     vloc_tot = np.zeros(ngm, dtype=complex)
+    small = Gn < 1e-8
+    Gs = np.where(small, 1.0, Gn)
     for a in range(nat):
         p = paw_parses[typat[a] - 1]
         zval = float(sum(s.get("f", 0.0) for s in p["states"]))
         r = p["r"]; vbar = p["vbar"]
-        rvsr = r * vbar                                # vbar short-ranged already
-        small = Gn < 1e-8
-        Gs = np.where(small, 1.0, Gn)
+        nn = min(len(r), len(vbar), len(p["ae_core"]))
+        r = r[:nn]; vion = vbar[:nn].astype(float)
+        # add frozen-core Hartree screening: -Z/r  ->  -Zval/r
+        ncore = p["ae_core"][:nn] / np.sqrt(4.0 * np.pi)   # L=0 moment -> number density
+        vion = vion + _radial_hartree(ncore, r)
+        # asymptotic ionic charge from the r*vion plateau (== Zval up to dataset noise)
+        Qtail = -float((r * vion)[-1])
+        rvsr = r * vion + Qtail                            # short-ranged: -> 0 at large r
         sr = (4 * np.pi / vol) * np.trapezoid(
             rvsr[None, :] * np.sin(np.outer(Gs, r)) / Gs[:, None], r, axis=1)
-        sr[small] = (4 * np.pi / vol) * np.trapezoid(rvsr * r, r)
+        sr -= np.where(small, 0.0, 4.0 * np.pi * Qtail / (vol * Gs**2))
+        sr[small] = (4 * np.pi / vol) * np.trapezoid(rvsr * r, r)   # finite alpha
         vloc_tot += np.exp(-1j * (Gcart @ tau[a])) * sr
 
     # augmentation (validated builders)
