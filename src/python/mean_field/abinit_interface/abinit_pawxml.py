@@ -22,7 +22,6 @@ Returned dict keys:
   exx_core_core (float)  core-core exchange energy (Ha)
 """
 
-import os
 import numpy as np
 import xml.etree.ElementTree as ET
 
@@ -85,6 +84,7 @@ def parse_pawxml(path):
         el = find(tag)
         return _floats(el.text)[:nr] if el is not None else None
     vbar = radial("blochl_local_ionic_potential")
+    zero_potential = radial("zero_potential")
     ae_core = radial("ae_core_density")
     ps_core = radial("pseudo_core_density")
 
@@ -101,19 +101,11 @@ def parse_pawxml(path):
     exx_cc_el = find("exact_exchange")
     exx_core_core = float(exx_cc_el.get("core-core")) if exx_cc_el is not None else 0.0
 
-    # --- optional companion file: PS ionic Hartree v_H[tilde-n_Zc] (vhtnzc) ---
-    # Not in the PAW-XML; supplied out-of-band as `<pawxml>.vhtnzc` (one line of nr
-    # floats on this radial grid, from an instrumented ABINIT run).  Enables the
-    # full frozen-D^0 assembly in the converter; absent -> kinetic-only D^0.
-    vhtnzc = None
-    vpath = path + ".vhtnzc"
-    if os.path.exists(vpath):
-        vhtnzc = _floats(open(vpath).read())[:nr]
-
     return dict(r=r, a=a, d=d, nr=nr, states=states, ns=ns, znucl=znucl,
                 phi_ae=phi_ae, phi_ps=phi_ps, proj=proj,
                 shape_type=shape_type, shape_rc=shape_rc, paw_radius=paw_radius,
-                vbar=vbar, ae_core=ae_core, ps_core=ps_core, vhtnzc=vhtnzc,
+                vbar=vbar, zero_potential=zero_potential,
+                ae_core=ae_core, ps_core=ps_core,
                 dij0=dij0, exx_X=exx_X, exx_core_core=exx_core_core)
 
 

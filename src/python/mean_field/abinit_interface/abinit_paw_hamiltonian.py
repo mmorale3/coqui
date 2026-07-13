@@ -45,6 +45,51 @@ def _radial_hartree(nc, r):
     return 4.0 * np.pi * (q_in / rsafe + tail)
 
 
+def _poisson_over_r(nwk, r):
+    """V_H(r) from nwk = 4*pi*r^2*rho (ABINIT poisson/r convention):
+      V_H(r) = (1/r) int_0^r nwk dr' + int_r^inf nwk/r' dr'.
+    """
+    dr = np.diff(r)
+    cum = np.concatenate([[0.0], np.cumsum(0.5 * (nwk[1:] + nwk[:-1]) * dr)])
+    f = nwk / np.where(r < 1e-12, 1.0, r)
+    seg = 0.5 * (f[1:] + f[:-1]) * dr
+    tail = np.concatenate([np.cumsum(seg[::-1])[::-1], [0.0]])
+    return cum / np.where(r < 1e-12, 1.0, r) + tail
+
+
+def reconstruct_vhtnzc(parse, shape_by_L):
+    """Reconstruct the PS ionic HARTREE potential vhtnzc = v_H[tilde-n_Zc] from
+    PAW-XML data (no instrumented ABINIT dump needed).  Follows the electrostatic
+    part of ABINIT m_pawpsp.F90 (vlocopt==0 'Vbare' path):
+      vhtnzc = zero_potential + vh,
+      vh     = poisson[ tncore*4*pi*r^2 + g0*r^2*(qcore - Z) ] / r,
+      qcore  = int (ncore - tncore) * 4*pi*r^2 dr    (AE - PS core charge),
+      g0     = normalized l=0 compensation shape (int g0 r^2 = 1).
+    The compensation charge (qcore - Z) makes the enclosed charge -> -Zval, so
+    vhtnzc -> -Zval/r.
+
+    This is Hartree-only ON PURPOSE: ABINIT's stored vlocr subtracts a frozen
+    atomic XC potential (vlocr = vbare + vh - vxc1) for its DFT SCF; CoQui's frozen
+    D^0 must be XC-free (GW/HF baseline), so vxc1 is excluded.  Verified: the tail
+    matches ABINIT's dumped vhtnzc exactly (-Zval/r); the interior difference is
+    exactly vxc1 (peaked at the nucleus, 0 beyond the augmentation radius).
+    Returns None if any input is missing.
+    """
+    zpot = parse.get("zero_potential")
+    if (zpot is None or parse.get("ae_core") is None or parse.get("ps_core") is None
+            or parse.get("znucl") is None):
+        return None
+    r = parse["r"]
+    Z = float(parse["znucl"])
+    ncore = np.asarray(parse["ae_core"], float) / np.sqrt(4.0 * np.pi)
+    tncore = np.asarray(parse["ps_core"], float) / np.sqrt(4.0 * np.pi)
+    qcore = np.trapezoid((ncore - tncore) * 4.0 * np.pi * r**2, r)   # AE - PS core charge
+    G = np.asarray(shape_by_L[0], float)
+    G = G / np.trapezoid(G, r)                                       # g0*r^2, unit monopole
+    nwk = tncore * 4.0 * np.pi * r**2 + G * (qcore - Z)
+    return np.asarray(zpot, float) + _poisson_over_r(nwk, r)
+
+
 def assemble_dij0(parse, u_ae, u_ps, shape_by_L, kkbeta):
     """Frozen PAW D^0 (kinetic + ionic Hartree + compensation).
 
@@ -62,18 +107,22 @@ def assemble_dij0(parse, u_ae, u_ps, shape_by_L, kkbeta):
     AE and PS partial waves match beyond it.  Verified to reproduce ABINIT's dumped
     D^0 to ~4 digits for Si (s2s2 1193.74 vs 1193.70, p1p1 0.137, p2p2 2.638).
 
-    vhtnzc is NOT in the PAW-XML (only `blochl_local_ionic_potential` -> -14.18/r
-    and `zero_potential` -> 0; ABINIT builds vhtnzc internally, -> -Zval/r).  It is
-    supplied out-of-band via a per-dataset companion file `<pawxml>.vhtnzc` (one
-    line of nr floats on the XML radial grid, from an instrumented ABINIT run that
-    dumps atompaw_dij0's vhtnzc_sph).  Without it, we fall back to kinetic-only.
+    XC-FREE: vhtnzc here is the PS ionic HARTREE potential v_H[tilde-n_Zc] only
+    (reconstruct_vhtnzc = zero_potential + v_H[tncore + compensation]).  ABINIT's
+    stored local potential additionally subtracts a frozen atomic XC term
+    (vlocr = vbare + vh - vxc1, m_pawpsp.F90) for its DFT SCF bookkeeping; CoQui's
+    frozen D^0 is XC-free by design (it is a self-consistent GW/HF static baseline,
+    no DFT XC -- exchange/correlation come from e_hf + e_rpa), so vxc1 is
+    deliberately EXCLUDED.  Including it would double-count XC against the exact
+    exchange.  This also matches QE's dion convention (XC-free).  If zero_potential
+    or the core densities are missing, we fall back to kinetic-only D^0.
     """
     ked = np.asarray(parse["dij0"], float)
     ns = len(parse["states"])
     ked = ked.reshape(ns, ns) if ked.size == ns * ns else ked
-    vhtnzc = parse.get("vhtnzc")
+    vhtnzc = reconstruct_vhtnzc(parse, shape_by_L)     # XC-free PS ionic Hartree (from XML)
     if vhtnzc is None or parse.get("znucl") is None or parse.get("ae_core") is None:
-        return ked                                    # kinetic-only fallback (no vhtnzc)
+        return ked                                    # kinetic-only fallback
     r = parse["r"]
     Z = float(parse["znucl"])
     lll = np.array([s["l"] for s in parse["states"]], int)
