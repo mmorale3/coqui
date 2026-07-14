@@ -133,6 +133,12 @@ class pseudopot
     nda::array_view<double,2> pswfc;     // (nbeta, mesh)
     nda::array_view<double,3> qfuncl;    // (2*lmax+1, nbeta(nbeta+1)/2, mesh)
     nda::array_view<double,4> deltaC;    // (nh, nh, nh, nh) — raw ke%k from QE
+    nda::array_view<double,2> ex_cvij;   // (nh, nh) — frozen core-valence exact-
+                                         //   exchange kernel (ABINIT ex_cvij =
+                                         //   Σ_c⟨φ_I c|c φ_J⟩, from PAW-XML
+                                         //   <exact_exchange_X_matrix>). Contracts
+                                         //   LINEARLY with becsum (factor 1, no ½);
+                                         //   one-center, frozen. Empty ⇒ omitted.
     nda::array_view<double,2> core_aewfc;// (ncore, mesh)
     // Angular momentum metadata (per-species slices of QE's global uspp
     // tables; ih ∈ [0, nh), nbeta ∈ [0, nbeta)).
@@ -182,6 +188,7 @@ class pseudopot
     sarray_t<nda::array_view<double,2>> pswfc;
     sarray_t<nda::array_view<double,3>> qfuncl;
     sarray_t<nda::array_view<double,4>> deltaC;
+    sarray_t<nda::array_view<double,2>> ex_cvij;
     sarray_t<nda::array_view<double,2>> core_aewfc;
 
     explicit species_paw_shm_t(mpi_t& m)
@@ -189,6 +196,7 @@ class pseudopot
         pswfc(math::shm::make_shared_array<nda::array_view<double,2>>(m, {1,1})),
         qfuncl(math::shm::make_shared_array<nda::array_view<double,3>>(m, {1,1,1})),
         deltaC(math::shm::make_shared_array<nda::array_view<double,4>>(m, {1,1,1,1})),
+        ex_cvij(math::shm::make_shared_array<nda::array_view<double,2>>(m, {1,1})),
         core_aewfc(math::shm::make_shared_array<nda::array_view<double,2>>(m, {1,1}))
     {}
   };

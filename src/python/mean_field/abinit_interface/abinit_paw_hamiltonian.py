@@ -177,11 +177,19 @@ def abinit_species_adapter(parse):
         raise NotImplementedError("shape_type=%s" % parse["shape_type"])
     zp = float(sum(s.get("f", 0.0) for s in parse["states"]))
     dij0 = assemble_dij0(parse, u_ae, u_ps, shape_by_L, kkbeta)  # kinetic + ionic Hartree (frozen D^0)
-    return dict(r=r, rab=rab, mesh=parse["nr"], kkbeta=kkbeta, nqlc=nqlc,
-                lmax_rho=lmax_rho, lll=lll, u_ae=u_ae, u_ps=u_ps,
-                proj=parse["proj"], shape_by_L=shape_by_L, dij0=dij0,
-                exx_X=parse.get("exx_X"), zp=zp,
-                n_qn=[s.get("n") for s in parse["states"]])
+    # Frozen core number densities n_core(r) (= L=0 moment / sqrt(4pi)); feed the
+    # core-valence Hartree (CoQui rho_core_AE / rho_core_PS, LM=00 channel).
+    s4pi = np.sqrt(4.0 * np.pi)
+    ae_rho_atc = np.asarray(parse["ae_core"], float) / s4pi if parse.get("ae_core") is not None else None
+    rho_atc_ps = np.asarray(parse["ps_core"], float) / s4pi if parse.get("ps_core") is not None else None
+    d = dict(r=r, rab=rab, mesh=parse["nr"], kkbeta=kkbeta, nqlc=nqlc,
+             lmax_rho=lmax_rho, lll=lll, u_ae=u_ae, u_ps=u_ps,
+             proj=parse["proj"], shape_by_L=shape_by_L, dij0=dij0,
+             exx_X=parse.get("exx_X"), zp=zp,
+             n_qn=[s.get("n") for s in parse["states"]])
+    if ae_rho_atc is not None: d["ae_rho_atc"] = ae_rho_atc
+    if rho_atc_ps is not None: d["rho_atc_ps"] = rho_atc_ps
+    return d
 
 
 def build_paw_augmentation(species, miller_g, recip, omega):
@@ -291,6 +299,21 @@ def write_species_block(h5root, species, aug, h5py):
         # Onecenter/deltaC
         og = g.create_group("Onecenter")
         wreal(og, "deltaC", aug["per_sp"][nt]["deltaC"], np.float64)
+        # Onecenter/ex_cvij: frozen core-valence exact-exchange kernel. Expand the
+        # ln-basis <exact_exchange_X_matrix> to the nh basis (nonzero only for the
+        # same lm, exactly ABINIT's `if(ilm==jlm) ex_cvij=...`); contracts linearly
+        # with becsum in CoQui (factor 1). ns×ns exx_X is indexed by beta channel.
+        exxln = sp.get("exx_X")
+        if exxln is not None:
+            ch = aug["per_sp"][nt]["ch"]
+            indv = np.asarray(ch["indv"], int); nhtolm = np.asarray(ch["nhtolm"], int)
+            nh_a = int(ch["nh"]); exxln = np.asarray(exxln, float)
+            ex_cv = np.zeros((nh_a, nh_a))
+            for I in range(nh_a):
+                for J in range(nh_a):
+                    if nhtolm[I] == nhtolm[J]:
+                        ex_cv[I, J] = exxln[indv[I] - 1, indv[J] - 1]
+            wreal(og, "ex_cvij", ex_cv, np.float64)
 
 
 def _paw_channels(sp):

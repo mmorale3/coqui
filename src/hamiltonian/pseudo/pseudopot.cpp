@@ -620,6 +620,28 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
             Dloc_at(ia, n, m) = Dloc_sp(nt, n, m);
       }
     }
+    // Frozen core-valence exact exchange (ABINIT ex_cvij): a static one-center
+    // projector Dij contracted LINEARLY with becsum (factor 1). It is disjoint
+    // from the density-dependent valence Fock (v_x/deltaC), so it is added to the
+    // frozen per-atom D here — then e_1e = Tr[Dm·H0] captures it with the correct
+    // factor 1. ex_cvij is in Hartree (PAW-XML), matching Dnn_atom after the
+    // 0.5 Ry→Ha scaling. alpha_x = exchange fraction (1 for HF/GW). Absent ⇒
+    // omitted (warned about at load time); no double-count (QE/ABINIT D^0 have no
+    // core-valence exchange).
+    if(ptype == pp_paw_t) {
+      const double alpha_x = 1.0;
+      for(int ia=0; ia<nat; ++ia) {
+        int nt = ityp(ia);
+        auto const& sp = paw_species[nt];
+        if(!sp.is_paw || sp.ex_cvij.size()==0) continue;
+        int nh_a = sp.nh;
+        for(int p=0; p<npol; ++p)
+          for(int n=0; n<nh_a; ++n)
+            for(int m=0; m<nh_a; ++m)
+              Dloc_at(ia, n*npol+p, m*npol+p) +=
+                  ComplexType(alpha_x * sp.ex_cvij(n,m), 0.0);
+      }
+    }
   }
   mpi->node_comm.barrier();
   if(mpi->node_comm.root())
@@ -730,6 +752,7 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
       nda::array<double,2> pswfc;
       nda::array<double,3> qfuncl;
       nda::array<double,4> deltaC;
+      nda::array<double,2> ex_cvij;
       nda::array<double,2> core_aewfc;
     };
     std::vector<heavy_tmp> heavy_root(nsp);
@@ -790,6 +813,9 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
           if(sp.is_paw && nt_grp.has_subgroup("Onecenter")) {
             h5::group ogrp = nt_grp.open_group("Onecenter");
             try { nda::h5_read(ogrp, "deltaC", tmp.deltaC); } catch(...) {}
+            // Frozen core-valence exact-exchange kernel (ABINIT ex_cvij). Optional:
+            // absent for GIPAW-less / core-valence-free datasets. Warned about below.
+            try { nda::h5_read(ogrp, "ex_cvij", tmp.ex_cvij); } catch(...) {}
           }
           // GIPAW core orbitals (notes §7 — required for explicit
           // core-valence/core-core exchange). Absent for non-GIPAW pseudos.
@@ -914,9 +940,42 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
       bcast_to_shm_2(tmp.pswfc,      sp_shm.pswfc,      sp.pswfc);
       bcast_to_shm_3(tmp.qfuncl,     sp_shm.qfuncl,     sp.qfuncl);
       bcast_to_shm_4(tmp.deltaC,     sp_shm.deltaC,     sp.deltaC);
+      bcast_to_shm_2(tmp.ex_cvij,    sp_shm.ex_cvij,    sp.ex_cvij);
       bcast_to_shm_2(tmp.core_aewfc, sp_shm.core_aewfc, sp.core_aewfc);
     }
     mpi->comm.barrier();
+
+    // ---- Visibility: warn LOUDLY when frozen core-valence contributions are
+    // absent for a PAW species, so they are never silently dropped. The core
+    // charge feeds the core-valence Hartree; ex_cvij is the core-valence exact
+    // exchange (both live entirely inside the augmentation sphere; see notes).
+    for (int nt = 0; nt < nsp; ++nt) {
+      auto const& sp = paw_species[nt];
+      if (!sp.is_paw) continue;
+      bool no_core_charge = (sp.ae_rho_atc.size() == 0) &&
+                            (sp.ncore_orbitals == 0 || sp.core_aewfc.size() == 0);
+      bool no_cv_exchange = (sp.ex_cvij.size() == 0);
+      if (no_core_charge) {
+        app_warning("**************************************************************************");
+        app_warning("**************************************************************************");
+        app_warning("***  WARNING: PAW species nt={} has NO all-electron core charge.", nt);
+        app_warning("***  The CORE-VALENCE HARTREE contribution will be OMITTED (set to 0).");
+        app_warning("***  Provide ae_rho_atc (AE core density) or GIPAW core orbitals in the");
+        app_warning("***  mean-field h5 to include it. Total energies / QP levels are affected.");
+        app_warning("**************************************************************************");
+        app_warning("**************************************************************************");
+      }
+      if (no_cv_exchange) {
+        app_warning("**************************************************************************");
+        app_warning("**************************************************************************");
+        app_warning("***  WARNING: PAW species nt={} has NO core-valence exchange kernel", nt);
+        app_warning("***  (Onecenter/ex_cvij). The CORE-VALENCE EXACT EXCHANGE is OMITTED.");
+        app_warning("***  For HF/GW this underbinds (e.g. Si RPA a0 too large). Supply");
+        app_warning("***  ex_cvij (ABINIT <exact_exchange_X_matrix>) to include it.");
+        app_warning("**************************************************************************");
+        app_warning("**************************************************************************");
+      }
+    }
   }
 
   // calculate projectors
