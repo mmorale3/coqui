@@ -78,13 +78,22 @@ namespace vertex_detail {
    * @param Z_qPQ       - (nq, Np, Np) bare THC core (instantaneous part; may be all-zero)
    * @param k_minus_q   - (nq, nk) index map: k_minus_q(iq,ik) = index of k - q (mod G)
    * @param qminus      - (nq) index map: qminus(iq) = index of -q
-   * @param iq_gamma    - index of q = Gamma. ignore_g0 semantics (v1): BOTH rung
-   *                      transfers skip the Gamma term (qx = Gamma AND qy = Gamma),
-   *                      bare Z and dynamic dW consistently -- the raw W(q->0)
-   *                      Coulomb head is divergent and would otherwise enter both
-   *                      rungs; a dedicated head treatment (GW's gygi analogue) is
-   *                      deferred. Mirrors GW's div_treatment = "ignore_g0";
-   *                      O(1/N_k) finite-size caveat in the design doc.
+   * @param iq_gamma    - index of q = Gamma (always required: used for the q->0
+   *                      policy and diagnostics).
+   * @param skip_rung_gamma - q->0 policy on the rung transfers
+   *                      (notes/q0_head_treatment.md section 3):
+   *                      true  = v1 blanket skip: BOTH rung transfers skip the Gamma
+   *                              term (qx = Gamma AND qy = Gamma), bare Z and dynamic
+   *                              dW consistently. Kept as the runtime-selectable
+   *                              fallback ("v1_skip").
+   *                      false = v2: the Gamma cell is INCLUDED with whatever the
+   *                              caller put in Z_qPQ(Gamma)/Wt_qtPQ(Gamma) -- the
+   *                              stored objects are the regularized body (v(G=0) is
+   *                              zeroed at ERI build time, potentials_impl.hpp:223),
+   *                              matching GW's own "ignore_g0" semantics; under the
+   *                              gygi-class policy the caller has additionally
+   *                              augmented the Gamma cell with the analytic rank-1
+   *                              head insertion (vertex_t.cpp).
    * @param Sigma_C_tskab - (nt_f, ns, nk, nbnd, nbnd) OVERWRITTEN with Sigma^C(tau)
    */
   template<nda::MemoryArrayOfRank<5> GArr_t, nda::MemoryArrayOfRank<5> SArr_t>
@@ -98,10 +107,12 @@ namespace vertex_detail {
                                nda::array<long, 2> const &k_minus_q,
                                nda::array<long, 1> const &qminus,
                                long iq_gamma,
+                               bool skip_rung_gamma,
                                SArr_t &&Sigma_C_tskab) {
 #ifndef ENABLE_DLR
     (void)ft; (void)comm; (void)C_rng; (void)G_tskij; (void)X_skPa; (void)Wt_qtPQ;
-    (void)Z_qPQ; (void)k_minus_q; (void)qminus; (void)iq_gamma; (void)Sigma_C_tskab;
+    (void)Z_qPQ; (void)k_minus_q; (void)qminus; (void)iq_gamma; (void)skip_rung_gamma;
+    (void)Sigma_C_tskab;
     APP_ABORT("vertex_detail::eval_sigma_C_g3w2_nosym: this build has ENABLE_DLR=OFF; "
               "the DLR IAFT backend is required.");
 #else
@@ -281,7 +292,7 @@ namespace vertex_detail {
       const long is  = combo / (nk * nq);
       const long ik  = (combo / nq) % nk;
       const long iqx = combo % nq;
-      if (iqx == iq_gamma) continue;   // ignore_g0: skip the Gamma transfer on the x-rung
+      if (skip_rung_gamma and iqx == iq_gamma) continue;   // v1_skip: drop Gamma on the x-rung
       const long ikmqx = k_minus_q(iqx, ik);
 
       auto X_k    = X_skPa(is, ik, all, all);     // (Np, nbnd)
@@ -303,7 +314,7 @@ namespace vertex_detail {
       }
 
       for (long iqy = 0; iqy < nq; ++iqy) {
-        if (iqy == iq_gamma) continue; // ignore_g0: skip the Gamma transfer on the y-rung
+        if (skip_rung_gamma and iqy == iq_gamma) continue; // v1_skip: drop Gamma on the y-rung
         const long ikpqy    = k_minus_q(qminus(iqy), ik);
         const long ikmqxpqy = k_minus_q(qminus(iqy), ikmqx);
 

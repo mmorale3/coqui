@@ -617,7 +617,32 @@ namespace bdft_tests {
                                                1e-10, mf->ecutrho(), 1, 1024));
     auto eri = mb_eri_t(thc, thc);
 
-    auto run = [&](bool with_vertex) {
+    // isolated Pi^C on the current MBState (dynamic rung, production scale)
+    auto eval_pi_max = [&](solvers::vertex_t& vtx, MBState& mb_state) -> double {
+      long nt_f = ft.nt_f();
+      long nt_half = (nt_f % 2 == 0) ? nt_f / 2 : nt_f / 2 + 1;
+      std::array<long, 4> pgrid = {1, 1, 1, mpi_context->comm.size()};
+      std::array<long, 4> bsize = {1, 1, 1, 1};
+      std::array<long, 4> gshape = {nt_half, (long)mf->nqpts_ibz(), (long)thc.Np(),
+                                    (long)thc.Np()};
+      auto dPiC = vtx.eval_Pi_C(mb_state, thc, pgrid, bsize, gshape);
+      double mx = 0;
+      long n_bad = 0;
+      for (auto const& v : dPiC.local()) {
+        double a = std::abs(v);
+        if (not std::isfinite(a)) ++n_bad;
+        else mx = std::max(mx, a);
+      }
+      REQUIRE(n_bad == 0);
+      // reduce the distributed local maxima so every rank reports the global figure
+      mpi_context->comm.all_reduce_in_place_n(&mx, 1, boost::mpi3::max<>{});
+      return mx;
+    };
+
+    // run one 2-iteration scGW with the vertex under the given q->0 policy ("" = no
+    // vertex). Returns (e_hf, e_corr, isolated dynamic-rung max|Pi^C|[policy],
+    // max|Pi^C|[gygi] measured on the same state when requested).
+    auto run = [&](std::string const& policy, bool also_gygi = false) {
       solvers::hf_t hf;
       solvers::gw_t gw(&ft, "ignore_g0", output);
       solvers::scr_coulomb_t scr_eri(&ft, "rpa", "ignore_g0");
@@ -625,9 +650,11 @@ namespace bdft_tests {
       MBState mb_state(mpi_context, ft, output);
       iter_scf::iter_scf_t iter_sol("damping");
 
+      const bool with_vertex = not policy.empty();
       // C straddles the LiH gap: HOMO = 1, LUMO = 2 (4 electrons, 16 bands)
       solvers::vertex_t vtx(&ft, with_vertex ? "2nd_exchange" : "none",
-                            with_vertex ? nda::range(1, 3) : nda::range(0, 0), mf->nbnd());
+                            with_vertex ? nda::range(1, 3) : nda::range(0, 0), mf->nbnd(),
+                            with_vertex ? policy : "ignore_g0");
       if (vtx.enabled()) {
         // Pi-cut isolation: attach the vertex to the screened-interaction solver only.
         // (Production runs both cuts -- Phi-derivability; MBPT_drivers enforces that.
@@ -640,50 +667,63 @@ namespace bdft_tests {
                                      2, false, 1e-9, true);
       mpi_context->comm.barrier();
 
+      double pi_max = -1.0, pi_max_gygi = -1.0;
       if (with_vertex) {
-        // With an active vertex the scf driver now keeps dW alive across iterations
+        // With an active vertex the scf driver keeps dW alive across iterations
         // (scf_driver.cpp W-lifetime exception), so iteration 2 above already ran the
-        // dynamic rung. Additionally rebuild W from the final G and drive the dynamic-rung
-        // Pi^C path directly at production scale (beta = 1000, DLR "low").
+        // dynamic rung. Additionally rebuild W from the final G and drive the
+        // dynamic-rung Pi^C path directly at production scale (beta = 1000, DLR "low").
         scr_eri.update_w(mb_state, thc, -1);
         REQUIRE(mb_state.dW_qtPQ.has_value());
-        long nt_f = ft.nt_f();
-        long nt_half = (nt_f % 2 == 0) ? nt_f / 2 : nt_f / 2 + 1;
-        std::array<long, 4> pgrid = {1, 1, 1, mpi_context->comm.size()};
-        std::array<long, 4> bsize = {1, 1, 1, 1};
-        std::array<long, 4> gshape = {nt_half, (long)mf->nqpts_ibz(), (long)thc.Np(), (long)thc.Np()};
-        auto dPiC = vtx.eval_Pi_C(mb_state, thc, pgrid, bsize, gshape);
-        double mx = 0;
-        long n_bad = 0;
-        for (auto const& v : dPiC.local()) {
-          double a = std::abs(v);
-          if (not std::isfinite(a)) ++n_bad;
-          else mx = std::max(mx, a);
+        pi_max = eval_pi_max(vtx, mb_state);
+        app_log(1, "vertex_pi_lih_smoke [{}]: dynamic-rung Pi^C max|.| = {}", policy, pi_max);
+        REQUIRE(pi_max > 0.0);
+        // bounded magnitude is the q->0 regression guard (the historic uncontrolled
+        // run reached ~7e15 -- root-caused to wmax headroom, notes/pi_c_kernel_design 4b;
+        // the Gamma cell itself is regular, notes/q0_head_treatment.md section 1)
+        REQUIRE(pi_max < 1e6);
+        if (also_gygi) {
+          REQUIRE(mb_state.eps_inv_head.has_value());
+          vtx.set_div_treatment("gygi");
+          pi_max_gygi = eval_pi_max(vtx, mb_state);
+          app_log(1, "vertex_pi_lih_smoke [gygi, same state]: dynamic-rung Pi^C max|.| = {}",
+                  pi_max_gygi);
+          REQUIRE(pi_max_gygi > 0.0);
+          REQUIRE(pi_max_gygi < 1e6);
         }
-        app_log(1, "vertex_pi_lih_smoke: dynamic-rung Pi^C local max|.| = {}", mx);
-        REQUIRE(n_bad == 0);
-        REQUIRE(mx > 0.0);
-        // q->0 policy (ignore_g0 rung semantics): without the Gamma skip the raw Coulomb
-        // head drives this to ~7e15; a bounded magnitude is the regression guard.
-        REQUIRE(mx < 1e6);
       }
 
       if (mpi_context->comm.root()) remove((output + ".mbpt.h5").c_str());
       mpi_context->comm.barrier();
-      return std::make_pair(e_hf, e_corr);
+      return std::make_tuple(e_hf, e_corr, pi_max, pi_max_gygi);
     };
 
-    auto [e_hf_0, e_corr_0] = run(false);
-    auto [e_hf_1, e_corr_1] = run(true);
+    auto [e_hf_0, e_corr_0, pi0, pig0] = run("");
+    auto [e_hf_1, e_corr_1, pi_v1, pig1] = run("v1_skip");
+    auto [e_hf_2, e_corr_2, pi_v2, pi_gy] = run("ignore_g0", /*also_gygi=*/true);
+    (void)pi0; (void)pig0; (void)pig1;
 
-    app_log(1, "vertex_pi_lih_smoke: no-vertex   e_hf = {}, e_corr = {}", e_hf_0, e_corr_0);
-    app_log(1, "vertex_pi_lih_smoke: with-vertex e_hf = {}, e_corr = {}", e_hf_1, e_corr_1);
+    app_log(1, "vertex_pi_lih_smoke: ---- q->0 policy comparison table (LiH-222 nosym, "
+               "2-iteration scGW, Pi-cut only) ----");
+    app_log(1, "vertex_pi_lih_smoke: no-vertex          e_hf = {}, e_corr = {}", e_hf_0, e_corr_0);
+    app_log(1, "vertex_pi_lih_smoke: vertex v1_skip     e_hf = {}, e_corr = {}, "
+               "max|Pi^C| = {}", e_hf_1, e_corr_1, pi_v1);
+    app_log(1, "vertex_pi_lih_smoke: vertex ignore_g0   e_hf = {}, e_corr = {}, "
+               "max|Pi^C| = {}", e_hf_2, e_corr_2, pi_v2);
+    app_log(1, "vertex_pi_lih_smoke: vertex gygi (isolated on the ignore_g0 state) "
+               "max|Pi^C| = {}", pi_gy);
+    app_log(1, "vertex_pi_lih_smoke: Delta e_corr: v1_skip = {}, ignore_g0 = {}, "
+               "(v2 - v1) = {}", e_corr_1 - e_corr_0, e_corr_2 - e_corr_0, e_corr_2 - e_corr_1);
 
-    REQUIRE(std::isfinite(e_hf_1));
-    REQUIRE(std::isfinite(e_corr_1));
-    // the vertex must change the screined interaction (and thus e_corr), but not blow up
+    for (double e : {e_hf_1, e_corr_1, e_hf_2, e_corr_2}) REQUIRE(std::isfinite(e));
+    // the vertex must change the screened interaction (and thus e_corr), but not blow up
     REQUIRE(std::abs(e_corr_1 - e_corr_0) > 1e-12);
     REQUIRE(std::abs(e_corr_1 - e_corr_0) < 5e-2);
+    REQUIRE(std::abs(e_corr_2 - e_corr_0) > 1e-12);
+    REQUIRE(std::abs(e_corr_2 - e_corr_0) < 5e-2);
+    // the Gamma cell is one of Nq = 8 rung cells: its effect must be a modest correction
+    // on the vertex shift itself, not a new energy scale
+    REQUIRE(std::abs(e_corr_2 - e_corr_1) < 0.5 * std::abs(e_corr_1 - e_corr_0) + 1e-4);
 #endif  // ENABLE_DLR
   }
 

@@ -22,14 +22,17 @@
  * ISDF-Vertex Phase 3: conservation validation (notes/conservation_validation.md).
  *
  * Sigma^C (G^3 W^2) and Pi^C (G^4 W) are the two cuts of ONE generating functional
- * Phi_2^C. With the discrete pairings (derivation: conservation notes section 1)
+ * Phi_2^C. With the discrete pairings (derivation: conservation notes section 1;
+ * q->0 v2 re-inclusion rule: notes/q0_head_treatment.md section 2.6)
  *
  *   S_SigmaG = (1/(Nk beta)) sum_{s,k,w,ab} Sigma^C_ab(k,iw) G~_ba(k,iw)   = +4 Phi^
- *   S_PW     = (1/(Nk beta)) sum_{q!=Gamma,nu} Tr[ Pi^C(q,inu) W(q,inu) ]  = -4 Phi^
+ *   S_PW     = (1/(Nk beta)) sum_{q,nu} Tr[ Pi^C(q,inu) W^(q,inu) ]        = -4 Phi^
  *
- * (G~ = P_C G P_C fed to BOTH kernels; W = Z + W_dyn exactly as the kernels consume
- * it; the external q = Gamma cell excluded to match the kernels' ignore_g0 rung
- * skips), the identity S_SigmaG + S_PW = 0 must hold to kernel accuracy. It pins the
+ * (G~ = P_C G P_C fed to BOTH kernels; W^ = the EXACT rung arrays the kernels consume
+ * -- under the v2 q->0 policy ALL q including Gamma, with the head-augmented
+ * W^(Gamma) under the gygi-class policy; under the v1_skip fallback the rung Gamma
+ * cells are skipped and the external q = Gamma cell is excluded from the trace),
+ * the identity S_SigmaG + S_PW = 0 must hold to kernel accuracy. It pins the
  * RELATIVE sign and normalization of the two kernels independently of the dense
  * references.
  *
@@ -131,8 +134,10 @@ namespace bdft_tests {
 
     // S_PW in BOTH aux-trace directions {sum_MN Pi_MN W_NM, sum_MN Pi_MN W_MN}.
     // Pi_wqMN: notes-convention Pi(inu) on the full bosonic mesh (kernel output);
-    // Z_qPQ + Wt_qtPQ (dynamic W on the FULL tau mesh): the rung exactly as consumed;
-    // iq_skip: external q cell excluded (Gamma; ignore_g0 consistency, notes 1.4).
+    // Z_qPQ + Wt_qtPQ (dynamic W on the FULL tau mesh): the rung exactly as consumed
+    // (head-AUGMENTED arrays under the gygi-class policy);
+    // iq_skip: external q cell excluded from the trace (-1 = include all q, the v2
+    // policy; = iq_gamma for the v1_skip fallback, conservation notes 1.4).
     template<typename ZArr>
     std::pair<cplx, cplx> trace_pi_W(imag_axes_ft::IAFT const& ft, iaft_tools const& tools,
                                      nda::array<cplx, 2> const& T0row,
@@ -478,13 +483,15 @@ namespace bdft_tests {
             Gproj(it, is, ik, C(), C()) = G(it, is, ik, C(), C());
 
       // ---- Sigma^C via the actual kernel, on G and on G~ (invariance check) --------
+      // v2 q->0 policy: rung Gamma cells INCLUDED (skip = false) and the external
+      // q = Gamma cell re-included in S_PW (notes/q0_head_treatment.md section 2.6).
       nda::array<cplx, 5> Sig(nt, ns, nk, nbnd, nbnd), Sig_p(nt, ns, nk, nbnd, nbnd);
       solvers::vertex_detail::eval_sigma_C_g3w2_nosym(ft, comm, C(), G, mdl.X_skPa, Wt,
                                                       mdl.Z_qPQ, mdl.kmq, mdl.qmin,
-                                                      /*iq_gamma*/ 0, Sig);
+                                                      /*iq_gamma*/ 0, /*skip*/ false, Sig);
       solvers::vertex_detail::eval_sigma_C_g3w2_nosym(ft, comm, C(), Gproj, mdl.X_skPa, Wt,
                                                       mdl.Z_qPQ, mdl.kmq, mdl.qmin,
-                                                      /*iq_gamma*/ 0, Sig_p);
+                                                      /*iq_gamma*/ 0, /*skip*/ false, Sig_p);
       double d_inv = 0, s_scale = 0;
       for (long i = 0; i < Sig.size(); ++i) {
         d_inv = std::max(d_inv, std::abs(Sig.data()[i] - Sig_p.data()[i]));
@@ -495,17 +502,17 @@ namespace bdft_tests {
       REQUIRE(s_scale > 1e-10);
       REQUIRE(d_inv < 1e-12 * s_scale);
 
-      // ---- Pi^C via the actual kernel on G~, notes convention, rung Gamma skipped --
+      // ---- Pi^C via the actual kernel on G~, notes convention, all rung q included --
       nda::array<cplx, 4> Pi_w(tools.nw_b, nk, Np, Np);
       Pi_w() = cplx(0.0);
       vertex_pi::pi_c_accumulate_w(ft, tools, Gproj, mdl.X_skPa, mdl.Z_qPQ, &Ww,
                                    mdl.kmq, mdl.kpq, C(), Pi_w, 0, 1,
-                                   /*skip_rung_gamma=*/true);
+                                   /*skip_rung_gamma=*/false);
 
-      // ---- the pairings -------------------------------------------------------------
+      // ---- the pairings (external q = Gamma INCLUDED: iq_skip = -1) -----------------
       auto S_SG_o = cons::trace_sigma_G(tools, Sig_p, Gproj);
       auto [S_PW, S_PW_alt] = cons::trace_pi_W(ft, tools, T0row, Pi_w, mdl.Z_qPQ, Wt,
-                                               /*iq_skip=*/0, nk);
+                                               /*iq_skip=*/-1, nk);
       cplx S_SG = S_SG_o[0];   // same-index pairing: the conserving one (notes 1.8)
 
       double scale = std::max(std::abs(S_SG), std::abs(S_PW));
@@ -544,13 +551,116 @@ namespace bdft_tests {
       // ---- positive control (b): RPA bubble substituted for Pi^C --------------------
       auto Pi_rpa = cons::rpa_pi_notes_w(tools, Gproj, mdl.X_skPa, mdl.kpq);
       auto [S_PW_rpa, S_PW_rpa_alt] = cons::trace_pi_W(ft, tools, T0row, Pi_rpa,
-                                                       mdl.Z_qPQ, Wt, /*iq_skip=*/0, nk);
+                                                       mdl.Z_qPQ, Wt, /*iq_skip=*/-1, nk);
       (void)S_PW_rpa_alt;
       double rel_rpa = cons::rel_residual(S_SG, S_PW_rpa);
       app_log(1, "conservation_toy: control (RPA Pi): S_PW_rpa = ({}, {}), rel = {}",
               S_PW_rpa.real(), S_PW_rpa.imag(), rel_rpa);
       REQUIRE(rel_rpa > 1e3 * std::max(rel, 1e-14));
       REQUIRE(rel_rpa > 1e-2);
+
+      // ---- v1_skip fallback consistency: rung Gamma skipped on both cuts AND the
+      //      external q = Gamma excluded from the trace (conservation notes 1.4) -------
+      {
+        nda::array<cplx, 5> Sig_v1(nt, ns, nk, nbnd, nbnd);
+        solvers::vertex_detail::eval_sigma_C_g3w2_nosym(ft, comm, C(), Gproj, mdl.X_skPa,
+                                                        Wt, mdl.Z_qPQ, mdl.kmq, mdl.qmin,
+                                                        /*iq_gamma*/ 0, /*skip*/ true, Sig_v1);
+        nda::array<cplx, 4> Pi_v1(tools.nw_b, nk, Np, Np);
+        Pi_v1() = cplx(0.0);
+        vertex_pi::pi_c_accumulate_w(ft, tools, Gproj, mdl.X_skPa, mdl.Z_qPQ, &Ww,
+                                     mdl.kmq, mdl.kpq, C(), Pi_v1, 0, 1,
+                                     /*skip_rung_gamma=*/true);
+        auto S_SG_v1 = cons::trace_sigma_G(tools, Sig_v1, Gproj)[0];
+        auto [S_PW_v1, S_PW_v1_alt] = cons::trace_pi_W(ft, tools, T0row, Pi_v1,
+                                                       mdl.Z_qPQ, Wt, /*iq_skip=*/0, nk);
+        (void)S_PW_v1_alt;
+        double rel_v1 = cons::rel_residual(S_SG_v1, S_PW_v1);
+        app_log(1, "conservation_toy [v1_skip]: S_SG = ({}, {}), S_PW = ({}, {}), rel = {}",
+                S_SG_v1.real(), S_SG_v1.imag(), S_PW_v1.real(), S_PW_v1.imag(), rel_v1);
+        REQUIRE(std::max(std::abs(S_SG_v1), std::abs(S_PW_v1)) > 1e-8);
+        REQUIRE(rel_v1 < 1e-8);
+        // cross-policy discrimination: pairing the v2 kernels' Phi^ cut against the
+        // v1-truncated trace (or vice versa) must NOT cancel
+        double rel_x = cons::rel_residual(S_SG, S_PW_v1);
+        app_log(1, "conservation_toy: cross-policy control rel(v2 Sigma vs v1 trace) = {}",
+                rel_x);
+        REQUIRE(rel_x > 1e3 * std::max(rel, 1e-14));
+      }
+
+      // ---- gygi-rule pin: rank-1 head-augmented W^ at the Gamma cell -----------------
+      // (notes/q0_head_treatment.md section 2.6). The insertion here is synthetic
+      // (arbitrary chi, xi, and a frequency profile independent of the toy W): the
+      // identity is algebraic in (G, W^), so it must hold for ANY augmented arrays fed
+      // consistently to both kernels and to the trace -- including at the external
+      // q = Gamma cell.
+      {
+        rng_t rng_h(211);
+        nda::array<cplx, 1> chi(Np);
+        for (auto& v : chi) v = rng_h();
+        const double xi = 0.37;
+        const double OmH = 1.31;   // head profile pole, distinct from OmX
+        nda::array<cplx, 2> H(Np, Np);
+        for (long P = 0; P < Np; ++P)
+          for (long Q = 0; Q < Np; ++Q)
+            H(P, Q) = double(nk) * xi * std::conj(chi(P)) * chi(Q);
+
+        // augmented arrays: Z^(Gamma) += H; Wdyn^(Gamma, nu) += h(nu) H with
+        // h(nu) = 2 OmH / (OmH^2 + nu^2); tau-side via w_to_tau (exactly how the
+        // production glue transforms the augmented nt_half storage)
+        nda::array<cplx, 3> Z_aug(mdl.Z_qPQ);
+        Z_aug(0, c_all, c_all) += H;
+        nda::array<cplx, 4> Ww_aug(Ww);
+        auto wnb = ft.wn_mesh_b();
+        for (long m = 0; m < tools.nw_b; ++m) {
+          double nu = double(wnb(m)) * M_PI / beta;
+          double h = 2.0 * OmH / (OmH * OmH + nu * nu);
+          Ww_aug(0, m, c_all, c_all) += cplx(h) * H;
+        }
+        nda::array<cplx, 4> Wt_aug(Wt);
+        {
+          nda::array<cplx, 2> hw(tools.nw_b, 1), htau(nt, 1);
+          for (long m = 0; m < tools.nw_b; ++m) {
+            double nu = double(wnb(m)) * M_PI / beta;
+            hw(m, 0) = 2.0 * OmH / (OmH * OmH + nu * nu);
+          }
+          ft.w_to_tau(hw, htau, imag_axes_ft::boson);
+          for (long it = 0; it < nt; ++it)
+            Wt_aug(0, it, c_all, c_all) += htau(it, 0) * H;
+        }
+
+        nda::array<cplx, 5> Sig_h(nt, ns, nk, nbnd, nbnd);
+        solvers::vertex_detail::eval_sigma_C_g3w2_nosym(ft, comm, C(), Gproj, mdl.X_skPa,
+                                                        Wt_aug, Z_aug, mdl.kmq, mdl.qmin,
+                                                        /*iq_gamma*/ 0, /*skip*/ false, Sig_h);
+        nda::array<cplx, 4> Pi_h(tools.nw_b, nk, Np, Np);
+        Pi_h() = cplx(0.0);
+        vertex_pi::pi_c_accumulate_w(ft, tools, Gproj, mdl.X_skPa, Z_aug, &Ww_aug,
+                                     mdl.kmq, mdl.kpq, C(), Pi_h, 0, 1,
+                                     /*skip_rung_gamma=*/false);
+        auto S_SG_h = cons::trace_sigma_G(tools, Sig_h, Gproj)[0];
+        auto [S_PW_h, S_PW_h_alt] = cons::trace_pi_W(ft, tools, T0row, Pi_h, Z_aug,
+                                                     Wt_aug, /*iq_skip=*/-1, nk);
+        (void)S_PW_h_alt;
+        double rel_h = cons::rel_residual(S_SG_h, S_PW_h);
+        app_log(1, "conservation_toy [head-augmented W^]: S_SG = ({}, {}), "
+                   "S_PW = ({}, {}), rel = {}",
+                S_SG_h.real(), S_SG_h.imag(), S_PW_h.real(), S_PW_h.imag(), rel_h);
+        REQUIRE(std::max(std::abs(S_SG_h), std::abs(S_PW_h)) > 1e-8);
+        REQUIRE(rel_h < 1e-8);
+        // the augmentation must actually matter (distinct Phi^ from the plain-W one)
+        REQUIRE(std::abs(S_SG_h - S_SG) > 1e-6 * std::abs(S_SG));
+        // and pairing the augmented kernels against the UN-augmented W must break:
+        // the trace must use the same W^ the kernels consumed
+        auto [S_PW_wrongW, S_PW_wrongW_alt] = cons::trace_pi_W(ft, tools, T0row, Pi_h,
+                                                               mdl.Z_qPQ, Wt,
+                                                               /*iq_skip=*/-1, nk);
+        (void)S_PW_wrongW_alt;
+        double rel_wrong = cons::rel_residual(S_SG_h, S_PW_wrongW);
+        app_log(1, "conservation_toy [head-augmented W^]: control (un-augmented trace) "
+                   "rel = {}", rel_wrong);
+        REQUIRE(rel_wrong > 1e3 * std::max(rel_h, 1e-14));
+      }
     }
 
     SECTION("identity_nonhermitian_G") {
@@ -571,19 +681,21 @@ namespace bdft_tests {
 
       auto Wt = mdl_nh.Wdyn_tau(ft);
       auto Ww = mdl_nh.Wdyn_w(tools);
+      // v2 q->0 policy (all q included, external Gamma traced)
       nda::array<cplx, 5> Sig(nt, ns, nk, nbnd, nbnd);
       solvers::vertex_detail::eval_sigma_C_g3w2_nosym(ft, comm, C(), Gproj, mdl_nh.X_skPa,
                                                       Wt, mdl_nh.Z_qPQ, mdl_nh.kmq,
-                                                      mdl_nh.qmin, /*iq_gamma*/ 0, Sig);
+                                                      mdl_nh.qmin, /*iq_gamma*/ 0,
+                                                      /*skip*/ false, Sig);
       nda::array<cplx, 4> Pi_w(tools.nw_b, nk, Np, Np);
       Pi_w() = cplx(0.0);
       vertex_pi::pi_c_accumulate_w(ft, tools, Gproj, mdl_nh.X_skPa, mdl_nh.Z_qPQ, &Ww,
                                    mdl_nh.kmq, mdl_nh.kpq, C(), Pi_w, 0, 1,
-                                   /*skip_rung_gamma=*/true);
+                                   /*skip_rung_gamma=*/false);
 
       auto S_SG_o = cons::trace_sigma_G(tools, Sig, Gproj);
       auto [S_PW, S_PW_alt] = cons::trace_pi_W(ft, tools, T0row, Pi_w, mdl_nh.Z_qPQ, Wt,
-                                               /*iq_skip=*/0, nk);
+                                               /*iq_skip=*/-1, nk);
       (void)S_PW_alt;
 
       double scale = std::max(std::abs(S_SG_o[0]), std::abs(S_PW));
@@ -732,27 +844,27 @@ namespace bdft_tests {
       utils::check(iq_gamma >= 0, "vertex_conservation_lih: no Gamma q-point found.");
     }
 
-    // ------------- the two cuts via the actual kernels --------------------------------
+    // ------------- the two cuts via the actual kernels (v2: all q included) -----------
     nda::array<cplx, 5> Sig(nt, ns, nkpts, nbnd, nbnd);
     solvers::vertex_detail::eval_sigma_C_g3w2_nosym(ft, mpi_context->comm, Crng, Gproj,
                                                     X_skPa, Wt_qtPQ, Z_qPQ, kmq, qmin,
-                                                    iq_gamma, Sig);
+                                                    iq_gamma, /*skip*/ false, Sig);
     nda::array<cplx, 4> Pi_w(tools.nw_b, nqpts, Np, Np);
     Pi_w() = cplx(0.0);
     vertex_pi::pi_c_accumulate_w(ft, tools, Gproj, X_skPa, Z_qPQ, &Wdyn_qwPQ,
                                  kmq, kpq, Crng, Pi_w,
                                  mpi_context->comm.rank(), mpi_context->comm.size(),
-                                 /*skip_rung_gamma=*/true);
+                                 /*skip_rung_gamma=*/false);
     mpi_context->comm.all_reduce_in_place_n(Pi_w.data(), Pi_w.size(), std::plus<>{});
 
-    // ------------- the pairings --------------------------------------------------------
+    // ------------- the pairings (external q = Gamma INCLUDED) --------------------------
     nda::array<double, 1> x0(1);
     x0(0) = -1.0;
     nda::array<cplx, 2> T0row(ft.construct_tau_interpolate_matrix(x0));
 
     auto S_SG_o = cons::trace_sigma_G(tools, Sig, Gproj);
     auto [S_PW, S_PW_alt] = cons::trace_pi_W(ft, tools, T0row, Pi_w, Z_qPQ, Wt_qtPQ,
-                                             iq_gamma, nkpts);
+                                             /*iq_skip=*/-1, nkpts);
     cplx S_SG = S_SG_o[0];   // same-index pairing (conserving; notes section 1.8)
 
     double scale = std::max(std::abs(S_SG), std::abs(S_PW));
@@ -785,13 +897,86 @@ namespace bdft_tests {
     // positive control (b): RPA bubble substituted for Pi^C
     auto Pi_rpa = cons::rpa_pi_notes_w(tools, Gproj, X_skPa, kpq);
     auto [S_PW_rpa, S_PW_rpa_alt] = cons::trace_pi_W(ft, tools, T0row, Pi_rpa, Z_qPQ,
-                                                     Wt_qtPQ, iq_gamma, nkpts);
+                                                     Wt_qtPQ, /*iq_skip=*/-1, nkpts);
     (void)S_PW_rpa_alt;
     double rel_rpa = cons::rel_residual(S_SG, S_PW_rpa);
     app_log(1, "vertex_conservation_lih: control (RPA Pi): S_PW_rpa = ({}, {}), rel = {}",
             S_PW_rpa.real(), S_PW_rpa.imag(), rel_rpa);
     REQUIRE(rel_rpa > 1e2 * rel);
     REQUIRE(rel_rpa > 5e-2);
+
+    // ------------- gygi-class variant: the REAL analytic head insertion ----------------
+    // W^(Gamma) = stored body + (H1): Z^(Gamma) += Nk*madelung*conj(chi)chi^T,
+    // dW^(Gamma,tau) += Nk*madelung*Re[eps_inv_head(tau)]*conj(chi)chi^T
+    // (notes/q0_head_treatment.md sections 1.5/2.6). Both kernels and the trace consume
+    // the SAME augmented arrays: the identity must hold at the same tolerance class.
+    {
+      REQUIRE(mb_state.eps_inv_head.has_value());
+      auto& eps = mb_state.eps_inv_head.value();
+      utils::check(eps.shape(0) == nt_half,
+                   "vertex_conservation_lih: eps_inv_head size mismatch.");
+      const double xi = MF->madelung();
+      auto chi = thc.basis_head();
+      REQUIRE(xi != 0.0);
+      nda::array<cplx, 2> H(Np, Np);
+      for (long P = 0; P < Np; ++P)
+        for (long Q = 0; Q < Np; ++Q)
+          H(P, Q) = double(nkpts) * xi * std::conj(chi(iq_gamma, P)) * chi(iq_gamma, Q);
+      double h_max = 0.0;
+      for (auto const& v : H) h_max = std::max(h_max, std::abs(v));
+      app_log(1, "vertex_conservation_lih [gygi]: madelung = {}, |H|_max = {}, "
+                 "eps_inv_head(tau=0) = {}", xi, h_max, eps(0).real());
+
+      nda::array<cplx, 3> Z_aug(Z_qPQ);
+      Z_aug(iq_gamma, all, all) += H;
+      nda::array<cplx, 4> Wt_aug(Wt_qtPQ);
+      for (long it = 0; it < nt; ++it) {
+        long ith = std::min(it, nt - it - 1);
+        Wt_aug(iq_gamma, it, all, all) += cplx(eps(ith).real()) * H;
+      }
+      // bosonic-mesh rung rebuilt from the augmented nt_half storage (as in eval_Pi_C)
+      nda::array<cplx, 4> Wdyn_aug(Wdyn_qwPQ);
+      {
+        long nw_b = tools.nw_b;
+        long nw_half = (nw_b % 2 == 0) ? nw_b / 2 : nw_b / 2 + 1;
+        nda::array<cplx, 3> W_wpos(nw_half, Np, Np);
+        auto W_t = Wt_aug(iq_gamma, nda::range(0, nt_half), all, all);
+        ft.tau_to_w_PHsym(W_t, W_wpos);
+        for (long l = 0; l < nw_b; ++l) {
+          long lpos = std::max(l, tools.w_mirror_b(l)) - nw_b / 2;
+          Wdyn_aug(iq_gamma, l, all, all) = W_wpos(lpos, all, all);
+        }
+      }
+
+      nda::array<cplx, 5> Sig_g(nt, ns, nkpts, nbnd, nbnd);
+      solvers::vertex_detail::eval_sigma_C_g3w2_nosym(ft, mpi_context->comm, Crng, Gproj,
+                                                      X_skPa, Wt_aug, Z_aug, kmq, qmin,
+                                                      iq_gamma, /*skip*/ false, Sig_g);
+      nda::array<cplx, 4> Pi_g(tools.nw_b, nqpts, Np, Np);
+      Pi_g() = cplx(0.0);
+      vertex_pi::pi_c_accumulate_w(ft, tools, Gproj, X_skPa, Z_aug, &Wdyn_aug,
+                                   kmq, kpq, Crng, Pi_g,
+                                   mpi_context->comm.rank(), mpi_context->comm.size(),
+                                   /*skip_rung_gamma=*/false);
+      mpi_context->comm.all_reduce_in_place_n(Pi_g.data(), Pi_g.size(), std::plus<>{});
+
+      auto S_SG_g = cons::trace_sigma_G(tools, Sig_g, Gproj)[0];
+      auto [S_PW_g, S_PW_g_alt] = cons::trace_pi_W(ft, tools, T0row, Pi_g, Z_aug, Wt_aug,
+                                                   /*iq_skip=*/-1, nkpts);
+      (void)S_PW_g_alt;
+      double rel_g = cons::rel_residual(S_SG_g, S_PW_g);
+      app_log(1, "vertex_conservation_lih [gygi]: S_SG = ({}, {}), S_PW = ({}, {})",
+              S_SG_g.real(), S_SG_g.imag(), S_PW_g.real(), S_PW_g.imag());
+      app_log(1, "vertex_conservation_lih [gygi]: |S_SG + S_PW| = {}, rel = {}",
+              std::abs(S_SG_g + S_PW_g), rel_g);
+      app_log(1, "vertex_conservation_lih [gygi]: head effect on the Phi^ cut: "
+                 "|S_SG(gygi) - S_SG(ignore_g0)| = {} (scale {})",
+              std::abs(S_SG_g - S_SG), std::abs(S_SG));
+      REQUIRE(std::isfinite(rel_g));
+      REQUIRE(rel_g < 1e-3);
+      // the insertion must genuinely act on the functional
+      REQUIRE(std::abs(S_SG_g - S_SG) > 1e-10);
+    }
 
     if (mpi_context->comm.root()) remove((output + ".mbpt.h5").c_str());
     mpi_context->comm.barrier();

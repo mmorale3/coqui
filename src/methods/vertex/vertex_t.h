@@ -80,18 +80,35 @@ namespace solvers {
 
   public:
     /**
-     * @param ft          - [INPUT] imaginary-axis Fourier transform (IAFT) grids
-     * @param vertex_type - [INPUT] type of the vertex correction.
-     *                      {choices: "none", "2nd_exchange"}
-     * @param band_window - [INPUT] contiguous orbital range [first, last) defining
-     *                      the subspace C. An empty range means C = empty set.
-     * @param nbnd        - [INPUT] number of bands in the primary basis
-     *                      (used to validate band_window)
+     * @param ft            - [INPUT] imaginary-axis Fourier transform (IAFT) grids
+     * @param vertex_type   - [INPUT] type of the vertex correction.
+     *                        {choices: "none", "2nd_exchange"}
+     * @param band_window   - [INPUT] contiguous orbital range [first, last) defining
+     *                        the subspace C. An empty range means C = empty set.
+     * @param nbnd          - [INPUT] number of bands in the primary basis
+     *                        (used to validate band_window)
+     * @param div_treatment - [INPUT] q->0 policy on the rung transfers (both kernels;
+     *                        notes/q0_head_treatment.md section 3):
+     *                        "ignore_g0" (default): include the q = Gamma cell of the
+     *                          rung sums with the STORED regularized W(Gamma)
+     *                          (v(G=0) is zeroed at ERI build time), no analytic
+     *                          head -- the exact analogue of GW's "ignore_g0".
+     *                        "gygi" (or any string containing "gygi"): additionally
+     *                          add the analytic rank-1 head insertion at Gamma,
+     *                          dW_PQ(Gamma,tau) += Nk*madelung*Re[eps_inv_head(tau)]
+     *                          *conj(chi_P)chi_Q (+ the bare piece with factor 1 into
+     *                          Z(Gamma)) -- the GW Sigma_div_correction / HF
+     *                          K-correction analogue on the vertex rungs.
+     *                        "v1_skip": the v1 blanket skip of the whole Gamma cell
+     *                          on every rung transfer (kept selectable for
+     *                          comparability; NOT equivalent to GW's ignore_g0 --
+     *                          it also drops the finite body term).
      */
     vertex_t(const imag_axes_ft::IAFT *ft,
              std::string vertex_type,
              nda::range band_window,
-             long nbnd);
+             long nbnd,
+             std::string div_treatment = "ignore_g0");
 
     vertex_t(vertex_t const&) = default;
     vertex_t(vertex_t &&) = default;
@@ -151,9 +168,17 @@ namespace solvers {
     // contiguous orbital range [first, last) defining the subspace C
     nda::range _band_window = nda::range(0, 0);
 
+    // q->0 policy on the rung transfers: "ignore_g0" (v2 default), "gygi"-class,
+    // or "v1_skip" (the v1 blanket Gamma-skip fallback). See the constructor doc
+    // and notes/q0_head_treatment.md.
+    std::string _div_treatment = "ignore_g0";
+
   public:
     std::string vertex_type() const { return _vertex_type; }
     nda::range band_window() const { return _band_window; }
+    std::string div_treatment() const { return _div_treatment; }
+    // runtime-selectable q->0 policy (validated; see constructor doc)
+    void set_div_treatment(std::string div);
 
     // vertex requested in the input
     bool enabled() const { return _vertex_type != "none"; }

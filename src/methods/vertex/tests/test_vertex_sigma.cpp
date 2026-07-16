@@ -329,37 +329,41 @@ namespace bdft_tests {
     const cplx I(0.0, 1.0);
 
     SECTION("fused_vs_batched") {
+      // both q->0 policies are pinned (notes/q0_head_treatment.md section 3):
+      //   skip = true  : v1_skip -- the toy's Gamma (q-index 0) dropped on both rungs
+      //   skip = false : v2 -- all q included (references updated consistently)
       auto Wt = mdl.Wdyn_tau(ft);
-      nda::array<cplx, 5> Sig(nt, ns, nk, nbnd, nbnd);
-      solvers::vertex_detail::eval_sigma_C_g3w2_nosym(ft, comm, C(), G, mdl.X_skPa, Wt,
-                                                      mdl.Z_qPQ, mdl.kmq, mdl.qmin,
-                                                      /*iq_gamma*/ 0, Sig);
-      // reference: batched primitive over orbital tuples, all (k, qx, qy);
-      // ignore_g0 like the kernel: skip the toy's Gamma (q-index 0) on both rungs
-      nda::array<cplx, 5> Sig_ref(nt, ns, nk, nbnd, nbnd);
-      Sig_ref() = cplx(0.0);
-      for (long ik = 0; ik < nk; ++ik)
-        for (long iqx = 0; iqx < nk; ++iqx)
-          for (long iqy = 0; iqy < nk; ++iqy) {
-            if (iqx == 0 or iqy == 0) continue;
-            auto S = combo_reference(ft, mdl, G, ik, iqx, iqy, true, true);
-            for (long it = 0; it < nt; ++it)
-              for (long a = 0; a < nbnd; ++a)
-                for (long b = 0; b < nbnd; ++b)
-                  Sig_ref(it, 0, ik, a, b) += S(it, a, b) / double(nk * nk);
-          }
-      double num = 0, den = 0;
-      for (long it = 0; it < nt; ++it)
+      for (bool skip : {true, false}) {
+        nda::array<cplx, 5> Sig(nt, ns, nk, nbnd, nbnd);
+        solvers::vertex_detail::eval_sigma_C_g3w2_nosym(ft, comm, C(), G, mdl.X_skPa, Wt,
+                                                        mdl.Z_qPQ, mdl.kmq, mdl.qmin,
+                                                        /*iq_gamma*/ 0, skip, Sig);
+        // reference: batched primitive over orbital tuples, all (k, qx, qy)
+        nda::array<cplx, 5> Sig_ref(nt, ns, nk, nbnd, nbnd);
+        Sig_ref() = cplx(0.0);
         for (long ik = 0; ik < nk; ++ik)
-          for (long a = 0; a < nbnd; ++a)
-            for (long b = 0; b < nbnd; ++b) {
-              num = std::max(num, std::abs(Sig(it, 0, ik, a, b) - Sig_ref(it, 0, ik, a, b)));
-              den = std::max(den, std::abs(Sig_ref(it, 0, ik, a, b)));
+          for (long iqx = 0; iqx < nk; ++iqx)
+            for (long iqy = 0; iqy < nk; ++iqy) {
+              if (skip and (iqx == 0 or iqy == 0)) continue;
+              auto S = combo_reference(ft, mdl, G, ik, iqx, iqy, true, true);
+              for (long it = 0; it < nt; ++it)
+                for (long a = 0; a < nbnd; ++a)
+                  for (long b = 0; b < nbnd; ++b)
+                    Sig_ref(it, 0, ik, a, b) += S(it, a, b) / double(nk * nk);
             }
-      app_log(1, "fused_vs_batched: max|fused - batched| = {}, max|batched| = {}, rel = {}",
-              num, den, num / den);
-      REQUIRE(den > 1e-10);
-      REQUIRE(num < 1e-8 * den);
+        double num = 0, den = 0;
+        for (long it = 0; it < nt; ++it)
+          for (long ik = 0; ik < nk; ++ik)
+            for (long a = 0; a < nbnd; ++a)
+              for (long b = 0; b < nbnd; ++b) {
+                num = std::max(num, std::abs(Sig(it, 0, ik, a, b) - Sig_ref(it, 0, ik, a, b)));
+                den = std::max(den, std::abs(Sig_ref(it, 0, ik, a, b)));
+              }
+        app_log(1, "fused_vs_batched (skip_rung_gamma = {}): max|fused - batched| = {}, "
+                   "max|batched| = {}, rel = {}", skip, num, den, num / den);
+        REQUIRE(den > 1e-10);
+        REQUIRE(num < 1e-8 * den);
+      }
     }
 
     SECTION("dense_matsubara_arbiter") {
@@ -465,16 +469,17 @@ namespace bdft_tests {
       // with C(beta-tau) by INDEX reflection on the symmetric tau mesh.
       nda::array<cplx, 4> Wt0(nk, nt, Np, Np);
       Wt0() = cplx(0.0);
+      const bool skip = false;   // v2 policy: all q included (v1_skip is pinned above)
       nda::array<cplx, 5> Sig(nt, ns, nk, nbnd, nbnd);
       solvers::vertex_detail::eval_sigma_C_g3w2_nosym(ft, comm, C(), G, mdl.X_skPa, Wt0,
                                                       mdl.Z_qPQ, mdl.kmq, mdl.qmin,
-                                                      /*iq_gamma*/ 0, Sig);
+                                                      /*iq_gamma*/ 0, skip, Sig);
       nda::array<cplx, 5> Sig_ref(nt, ns, nk, nbnd, nbnd);
       Sig_ref() = cplx(0.0);
       for (long ik = 0; ik < nk; ++ik)
         for (long iqx = 0; iqx < nk; ++iqx)
           for (long iqy = 0; iqy < nk; ++iqy) {
-            if (iqx == 0 or iqy == 0) continue;   // ignore_g0, as in the kernel
+            if (skip and (iqx == 0 or iqy == 0)) continue;
             long ikmqx = mdl.kmq(iqx, ik);
             long ikpqy = mdl.kmq(mdl.qmin(iqy), ik);
             long ikmqxpqy = mdl.kmq(mdl.qmin(iqy), ikmqx);
@@ -522,7 +527,10 @@ namespace bdft_tests {
     SUCCEED("vertex_sigma_lih_smoke skipped: build has ENABLE_DLR=OFF.");
 #else
     auto& mpi_context = utils::make_unit_test_mpi_context();
-    imag_axes_ft::IAFT ft(1000, 1.2, imag_axes_ft::dlr_basis, "low");
+    // wmax = 6.0: the vertex kernels' [A-comp] intermediates need ~3x headroom over the
+    // LiH spectral range (~1.2) once the Gamma cell of the dynamic rung is included
+    // (v2 q->0 policy) -- the pi-design section 4b requirement, applied uniformly.
+    imag_axes_ft::IAFT ft(1000, 6.0, imag_axes_ft::dlr_basis, "low");
     std::string output = "coqui_vertex_sigma_smoke";
 
     auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_lih222"));
@@ -552,37 +560,64 @@ namespace bdft_tests {
     REQUIRE(std::isfinite(e_hf));
     REQUIRE(std::isfinite(e_corr));
 
-    // isolate Sigma^C on the resulting state: rebuild W, snapshot Sigma, add Sigma^C,
-    // and inspect the difference. The vertex is DETACHED from scr_eri for this rebuild
-    // so the isolated check runs against a pure-RPA screened W -- it probes MY Sigma^C
-    // kernel only, independent of the Pi^C kernel's state (the in-loop path above
-    // already exercised the combined both-cuts flow).
+    // isolate Sigma^C on the resulting state: rebuild W, then for each q->0 policy
+    // (notes/q0_head_treatment.md section 3) snapshot Sigma, add Sigma^C, and inspect
+    // the difference -- the v1-skip vs v2 comparison table. The vertex is DETACHED from
+    // scr_eri for this rebuild so the isolated checks run against a pure-RPA screened W
+    // -- they probe MY Sigma^C kernel only, independent of the Pi^C kernel's state
+    // (the in-loop path above already exercised the combined both-cuts flow).
     scr_eri.set_vertex(nullptr);
     scr_eri.update_w(mb_state, thc, -1);
     REQUIRE(mb_state.dW_qtPQ.has_value());
-    nda::array<cplx, 5> Sig_before(mb_state.sSigma_tskij.value().local());
-    vtx.eval_Sigma_C(mb_state, thc);
-    auto Sig_after = mb_state.sSigma_tskij.value().local();
+    REQUIRE(mb_state.eps_inv_head.has_value());   // needed by the gygi head insertion
 
-    auto [nts, nss, nks, nb1, nb2] = Sig_after.shape();
-    double scale = 0, d_herm = 0;
-    long n_bad = 0;
-    for (long it = 0; it < nts; ++it)
-      for (long is = 0; is < nss; ++is)
-        for (long ik = 0; ik < nks; ++ik)
-          for (long a = 0; a < nb1; ++a)
-            for (long b = 0; b < nb2; ++b) {
-              cplx sc = Sig_after(it, is, ik, a, b) - Sig_before(it, is, ik, a, b);
-              cplx sct = Sig_after(it, is, ik, b, a) - Sig_before(it, is, ik, b, a);
-              if (not std::isfinite(std::abs(sc))) ++n_bad;
-              scale = std::max(scale, std::abs(sc));
-              d_herm = std::max(d_herm, std::abs(sc - std::conj(sct)));
-            }
-    app_log(1, "vertex_sigma_lih_smoke: Sigma^C scale = {}, hermiticity deviation "
-               "|S_ab - conj(S_ba)| = {} (hermitize() is downstream)", scale, d_herm);
-    REQUIRE(n_bad == 0);
-    REQUIRE(scale > 0.0);
-    REQUIRE(d_herm < 0.5 * scale);
+    std::vector<std::string> policies = {"v1_skip", "ignore_g0", "gygi"};
+    std::vector<nda::array<cplx, 5>> SigC;
+    for (auto const& pol : policies) {
+      vtx.set_div_treatment(pol);
+      nda::array<cplx, 5> Sig_before(mb_state.sSigma_tskij.value().local());
+      vtx.eval_Sigma_C(mb_state, thc);
+      auto Sig_after = mb_state.sSigma_tskij.value().local();
+
+      auto [nts, nss, nks, nb1, nb2] = Sig_after.shape();
+      nda::array<cplx, 5> dSig(nts, nss, nks, nb1, nb2);
+      double scale = 0, d_herm = 0;
+      long n_bad = 0;
+      for (long it = 0; it < nts; ++it)
+        for (long is = 0; is < nss; ++is)
+          for (long ik = 0; ik < nks; ++ik)
+            for (long a = 0; a < nb1; ++a)
+              for (long b = 0; b < nb2; ++b) {
+                cplx sc = Sig_after(it, is, ik, a, b) - Sig_before(it, is, ik, a, b);
+                cplx sct = Sig_after(it, is, ik, b, a) - Sig_before(it, is, ik, b, a);
+                dSig(it, is, ik, a, b) = sc;
+                if (not std::isfinite(std::abs(sc))) ++n_bad;
+                scale = std::max(scale, std::abs(sc));
+                d_herm = std::max(d_herm, std::abs(sc - std::conj(sct)));
+              }
+      app_log(1, "vertex_sigma_lih_smoke [{}]: Sigma^C scale = {}, hermiticity deviation "
+                 "|S_ab - conj(S_ba)| = {} (hermitize() is downstream)", pol, scale, d_herm);
+      REQUIRE(n_bad == 0);
+      REQUIRE(scale > 0.0);
+      REQUIRE(scale < 1e3);          // bounded: no q->0 blow-up under any policy
+      REQUIRE(d_herm < 0.5 * scale);
+      SigC.emplace_back(std::move(dSig));
+    }
+    // policy deltas for the comparison table (finite-size-correction sized, not O(scale))
+    {
+      auto max_abs_diff = [](auto const& A, auto const& B) {
+        double d = 0;
+        for (long i = 0; i < A.size(); ++i) d = std::max(d, std::abs(A.data()[i] - B.data()[i]));
+        return d;
+      };
+      double d_v2_v1 = max_abs_diff(SigC[1], SigC[0]);
+      double d_gy_v2 = max_abs_diff(SigC[2], SigC[1]);
+      app_log(1, "vertex_sigma_lih_smoke: policy deltas: max|Sigma^C(ignore_g0) - "
+                 "Sigma^C(v1_skip)| = {},", d_v2_v1);
+      app_log(1, "                        max|Sigma^C(gygi) - Sigma^C(ignore_g0)| = {}", d_gy_v2);
+      REQUIRE(d_v2_v1 > 0.0);   // the Gamma body term is really included
+      REQUIRE(d_gy_v2 > 0.0);   // the head insertion really acts
+    }
 
     if (mpi_context->comm.root()) remove((output + ".mbpt.h5").c_str());
     mpi_context->comm.barrier();

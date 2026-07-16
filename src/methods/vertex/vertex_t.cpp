@@ -19,6 +19,7 @@
  */
 
 
+#include <cmath>
 #include <unordered_set>
 
 #include "utilities/check.hpp"
@@ -30,16 +31,68 @@
 namespace methods {
 namespace solvers {
 
+  namespace vertex_head_detail {
+
+    /**
+     * The analytic q->0 head of the rung at the Gamma cell, in the STORED-ARRAY
+     * convention (notes/q0_head_treatment.md, (H1) and section 1.5):
+     *
+     *   H_PQ = N_k * madelung * conj(chi_P(Gamma)) * chi_Q(Gamma)
+     *
+     * with chi = thc.basis_head() (the G = 0 plane-wave components of the aux basis)
+     * and madelung = MF->madelung() (the Gygi-Baldereschi / probe-charge-Ewald
+     * constant, PRB 80, 085114 (2009)). Pinned against existing code: consuming
+     * H_PQ through the GW Hadamard reproduces Sigma_div_correction
+     * (thc_gw.icc:444-525) exactly (dynamic piece, weight Re[eps_inv_head(tau)]),
+     * and through the exchange reproduces HF_K_correction (hf_t.cpp:64-100)
+     * (bare piece, weight 1).
+     *
+     * Returns false (H untouched) when the head data are unusable: madelung == 0
+     * (model systems) or chi_head not populated (some ERI read paths,
+     * thc_reader_t.hpp:380-381). The caller logs and proceeds without insertion.
+     */
+    template<THC_ERI thc_t>
+    bool build_head_rank1(thc_t const& thc, long iq_gamma, long nkpts,
+                          nda::array<ComplexType, 2>& H_PQ) {
+      auto MF = thc.MF();
+      const double xi = MF->madelung();
+      auto chi = thc.basis_head();   // (nqpts_ibz, Np)
+      const long Np = H_PQ.shape(0);
+      utils::check(chi.shape(0) > iq_gamma and chi.shape(1) == Np,
+                   "vertex_head_detail::build_head_rank1: basis_head shape mismatch "
+                   "(({}, {}) vs iq_gamma = {}, Np = {}).",
+                   chi.shape(0), chi.shape(1), iq_gamma, Np);
+      double chi_max = 0.0;
+      for (long P = 0; P < Np; ++P) chi_max = std::max(chi_max, std::abs(chi(iq_gamma, P)));
+      if (xi == 0.0 or chi_max == 0.0) return false;
+      for (long P = 0; P < Np; ++P)
+        for (long Q = 0; Q < Np; ++Q)
+          H_PQ(P, Q) = double(nkpts) * xi * std::conj(chi(iq_gamma, P)) * chi(iq_gamma, Q);
+      return true;
+    }
+
+  } // vertex_head_detail
+
+  void vertex_t::set_div_treatment(std::string div) {
+    const std::unordered_set<std::string> exact = {"ignore_g0", "v1_skip"};
+    utils::check(exact.count(div) > 0 or div.find("gygi") != std::string::npos,
+                 "vertex_t: unknown vertex div_treatment: {}. Valid options are "
+                 "\"ignore_g0\" (v2 default), \"gygi\"-class, and \"v1_skip\".", div);
+    _div_treatment = std::move(div);
+  }
+
   vertex_t::vertex_t(const imag_axes_ft::IAFT *ft,
                      std::string vertex_type,
                      nda::range band_window,
-                     long nbnd):
+                     long nbnd,
+                     std::string div_treatment):
     _ft(ft), _vertex_type(std::move(vertex_type)), _band_window(band_window) {
 
     const std::unordered_set<std::string> valid_vertex_types = {"none", "2nd_exchange"};
     utils::check(valid_vertex_types.find(_vertex_type) != valid_vertex_types.end(),
                  "vertex_t: unknown vertex_type: {}. Valid options are \"none\" and \"2nd_exchange\".",
                  _vertex_type);
+    set_div_treatment(std::move(div_treatment));
     if (not enabled()) return;
 
     utils::check(_ft != nullptr, "vertex_t: IAFT instance is required when the vertex is enabled.");
@@ -59,10 +112,11 @@ namespace solvers {
                  "  Subspace C band window   = [{}, {})\n"
                  "  Subspace C size          = {} orbitals (nbnd = {})\n"
                  "  Cuts                     = Sigma^C (G3W2) + Pi^C (G4W), always both\n"
+                 "  q->0 rung policy         = {} (notes/q0_head_treatment.md)\n"
                  "  Status                   = Pi^C kernel ACTIVE (Phase 1d); Sigma^C status is\n"
                  "                             reported by eval_Sigma_C at evaluation time\n",
               _vertex_type, _band_window.first(), _band_window.last(),
-              _band_window.size(), nbnd);
+              _band_window.size(), nbnd, _div_treatment);
     } else {
       app_log(1, "\nvertex_t: vertex_type = \"{}\" with an empty vertex_band_window: "
                  "C = empty set, so the vertex contributes nothing and the "
@@ -134,42 +188,7 @@ namespace solvers {
       for (long ik = 0; ik < nkpts; ++ik)
         X_skPa(is, ik, all, all) = thc.X(is, 0, ik);
 
-    // ---- bare coulomb Z(q): the instantaneous part of the rungs (collective call) -----
-    nda::array<ComplexType, 3> Z_qPQ(nqpts, Np, Np);
-    for (long iq = 0; iq < nqpts; ++iq)
-      Z_qPQ(iq, all, all) = thc.Z(int(iq));
-
-    // ---- dynamic W(tau): replicate and unfold nt_half storage to the full tau mesh ----
-    // dW_qtPQ is dynamic-only (bare Z subtracted, scr_coulomb_t.cpp:217); W is
-    // PH-symmetric in tau, W(beta-t) = W(t).
-    nda::array<ComplexType, 4> Wt_qtPQ(nqpts, nt, Np, Np);
-    {
-      auto& dW = mb_state.dW_qtPQ.value();
-      auto gs = dW.global_shape();
-      utils::check(gs[0] == nqpts_ibz and gs[1] == nt_half and gs[2] == Np and gs[3] == Np,
-                   "vertex_t::eval_Sigma_C: unexpected dW_qtPQ global shape.");
-      nda::array<ComplexType, 4> W_half(nqpts, nt_half, Np, Np);
-      W_half() = ComplexType(0.0);
-      W_half(dW.local_range(0), dW.local_range(1), dW.local_range(2), dW.local_range(3)) = dW.local();
-      mpi->comm.all_reduce_in_place_n(W_half.data(), W_half.size(), std::plus<>{});
-      for (long it = 0; it < nt; ++it) {
-        long ith = std::min(it, nt - it - 1);
-        Wt_qtPQ(all, it, all, all) = W_half(all, ith, all, all);
-      }
-    }
-
-    // ---- momentum maps (symmetry-free mesh) -------------------------------------------
-    nda::array<long, 2> kmq(nqpts, nkpts);
-    nda::array<long, 1> qmin(nqpts);
-    for (long iq = 0; iq < nqpts; ++iq) {
-      qmin(iq) = MF->qminus()(iq);
-      for (long ik = 0; ik < nkpts; ++ik) kmq(iq, ik) = MF->qk_to_k2(iq, ik);
-    }
-
     // ---- q = Gamma index (crystal coordinates: all components integer mod G) ----------
-    // ignore_g0 (v1): both rung transfers skip the Gamma term -- the raw W(q->0)
-    // Coulomb head is divergent and needs a dedicated head treatment (GW gygi
-    // analogue, deferred). Mirrors GW's default div_treatment = "ignore_g0".
     long iq_gamma = -1;
     {
       auto Qpts = MF->Qpts();
@@ -188,18 +207,110 @@ namespace solvers {
       }
       utils::check(iq_gamma >= 0, "vertex_t::eval_Sigma_C: no Gamma q-point found.");
     }
-    app_log(1, "  [NOTE] Sigma^C long-wavelength treatment: ignore_g0 -- the q = Gamma "
-               "(iq = {}) term is skipped\n"
-               "         on BOTH rung transfers (qx and qy; bare Z and dynamic dW "
-               "consistently). O(1/N_k)\n"
-               "         finite-size error; dedicated head treatment deferred "
-               "(notes/sigma_c_kernel_design.md).\n", iq_gamma);
+
+    // ---- q->0 rung policy (notes/q0_head_treatment.md section 3) ----------------------
+    const bool skip_rung_gamma = (_div_treatment == "v1_skip");
+    bool head_insertion = (_div_treatment.find("gygi") != std::string::npos);
+    if (head_insertion and nqpts_ibz == 1) {
+      app_log(1, "  [WARNING] Sigma^C: nqpts_ibz == 1 while vertex div_treatment is "
+                 "gygi-class; the q->0\n"
+                 "            extrapolation is meaningless on a Gamma-only mesh -- taking "
+                 "\"ignore_g0\" instead\n"
+                 "            (same downgrade as GW's Sigma_div_correction).");
+      head_insertion = false;
+    }
+    if (skip_rung_gamma)
+      app_log(1, "  [NOTE] Sigma^C q->0 policy: v1_skip -- the q = Gamma (iq = {}) cell is "
+                 "DROPPED on both rung\n"
+                 "         transfers (qx and qy; bare Z and dynamic dW). Fallback mode; "
+                 "O(1/N_k) finite-size error.\n", iq_gamma);
+    else
+      app_log(1, "  [NOTE] Sigma^C q->0 policy: {} -- the q = Gamma (iq = {}) cell of both "
+                 "rung transfers is\n"
+                 "         INCLUDED with the stored regularized W(Gamma) (v(G=0) zeroed at "
+                 "ERI build){}.\n", _div_treatment, iq_gamma,
+              head_insertion ? ",\n         PLUS the analytic rank-1 head insertion "
+                               "Nk*madelung*[1 | Re eps_inv_head(tau)]*chi chi^dag"
+                             : "; no analytic head (GW ignore_g0 analogue)");
+
+    // ---- bare coulomb Z(q): the instantaneous part of the rungs (collective call) -----
+    nda::array<ComplexType, 3> Z_qPQ(nqpts, Np, Np);
+    for (long iq = 0; iq < nqpts; ++iq)
+      Z_qPQ(iq, all, all) = thc.Z(int(iq));
+
+    // head insertion, bare piece (weight 1) into Z(Gamma)
+    nda::array<ComplexType, 2> H_PQ(Np, Np);
+    bool head_ok = false;
+    if (head_insertion) {
+      head_ok = vertex_head_detail::build_head_rank1(thc, iq_gamma, nkpts, H_PQ);
+      if (head_ok) {
+        Z_qPQ(iq_gamma, all, all) += H_PQ;
+        double h_max = 0.0;
+        for (auto const& v : H_PQ) h_max = std::max(h_max, std::abs(v));
+        app_log(1, "  Sigma^C head insertion: madelung = {}, |H|_max = {} (bare piece "
+                   "applied to Z(Gamma))", MF->madelung(), h_max);
+      } else {
+        app_log(1, "  [WARNING] Sigma^C: gygi head insertion requested but head data are "
+                   "unusable\n"
+                   "            (madelung == 0 or empty basis_head) -- proceeding WITHOUT "
+                   "the analytic head\n"
+                   "            (equivalent to policy \"ignore_g0\").");
+      }
+    }
+
+    // ---- dynamic W(tau): replicate and unfold nt_half storage to the full tau mesh ----
+    // dW_qtPQ is dynamic-only (bare Z subtracted, scr_coulomb_t.cpp:217); W is
+    // PH-symmetric in tau, W(beta-t) = W(t).
+    nda::array<ComplexType, 4> Wt_qtPQ(nqpts, nt, Np, Np);
+    {
+      auto& dW = mb_state.dW_qtPQ.value();
+      auto gs = dW.global_shape();
+      utils::check(gs[0] == nqpts_ibz and gs[1] == nt_half and gs[2] == Np and gs[3] == Np,
+                   "vertex_t::eval_Sigma_C: unexpected dW_qtPQ global shape.");
+      nda::array<ComplexType, 4> W_half(nqpts, nt_half, Np, Np);
+      W_half() = ComplexType(0.0);
+      W_half(dW.local_range(0), dW.local_range(1), dW.local_range(2), dW.local_range(3)) = dW.local();
+      mpi->comm.all_reduce_in_place_n(W_half.data(), W_half.size(), std::plus<>{});
+
+      // head insertion, dynamic piece (weight Re[eps_inv_head(tau)]) into dW(Gamma, tau).
+      // eps_inv_head = eps^-1_00(q->0, tau) - 1, stored on nt_half by scr_coulomb
+      // (scr_coulomb_t.cpp:106-108); same Re[.] convention as Sigma_div_correction.
+      if (head_ok) {
+        if (mb_state.eps_inv_head.has_value()) {
+          auto& eps = mb_state.eps_inv_head.value();
+          utils::check(eps.shape(0) == nt_half,
+                       "vertex_t::eval_Sigma_C: eps_inv_head size {} != nt_half = {}.",
+                       eps.shape(0), nt_half);
+          for (long it = 0; it < nt_half; ++it)
+            W_half(iq_gamma, it, all, all) += ComplexType(eps(it).real()) * H_PQ;
+          app_log(1, "  Sigma^C head insertion: dynamic piece applied to dW(Gamma, tau) "
+                     "with eps_inv_head(tau=0) = {}", eps(0).real());
+        } else {
+          app_log(1, "  [WARNING] Sigma^C: dW is present but eps_inv_head is not in MBState "
+                     "-- the DYNAMIC head\n"
+                     "            piece is skipped (bare piece applied).");
+        }
+      }
+
+      for (long it = 0; it < nt; ++it) {
+        long ith = std::min(it, nt - it - 1);
+        Wt_qtPQ(all, it, all, all) = W_half(all, ith, all, all);
+      }
+    }
+
+    // ---- momentum maps (symmetry-free mesh) -------------------------------------------
+    nda::array<long, 2> kmq(nqpts, nkpts);
+    nda::array<long, 1> qmin(nqpts);
+    for (long iq = 0; iq < nqpts; ++iq) {
+      qmin(iq) = MF->qminus()(iq);
+      for (long ik = 0; ik < nkpts; ++ik) kmq(iq, ik) = MF->qk_to_k2(iq, ik);
+    }
 
     // ---- fused kernel (round-robin over (s,k,qx); result all-reduced inside) ----------
     nda::array<ComplexType, 5> Sigma_C(nt, ns, nkpts, nbnd, nbnd);
     vertex_detail::eval_sigma_C_g3w2_nosym(*_ft, mpi->comm, _band_window, G_tskij,
                                            X_skPa, Wt_qtPQ, Z_qPQ, kmq, qmin, iq_gamma,
-                                           Sigma_C);
+                                           skip_rung_gamma, Sigma_C);
     {
       double max_abs = 0.0;
       long n_bad = 0;
@@ -280,6 +391,53 @@ namespace solvers {
 
     vertex_pi::iaft_tools tools(*_ft);
 
+    // ---- q = Gamma index (crystal coordinates: all components integer mod G) ----------
+    long iq_gamma = -1;
+    {
+      auto Qpts = MF->Qpts();
+      for (long iq = 0; iq < nqpts_ibz; ++iq) {
+        double d = 0.0;
+        for (long i = 0; i < 3; ++i) {
+          double x = Qpts(iq, i);
+          d += std::abs(x - std::round(x));
+        }
+        if (d < 1e-8) {
+          utils::check(iq_gamma < 0,
+                       "vertex_t::eval_Pi_C: multiple Gamma q-points found ({} and {}).",
+                       iq_gamma, iq);
+          iq_gamma = iq;
+        }
+      }
+      utils::check(iq_gamma >= 0, "vertex_t::eval_Pi_C: no Gamma q-point found.");
+    }
+
+    // ---- q->0 rung policy (notes/q0_head_treatment.md section 3) ----------------------
+    const bool skip_rung_gamma = (_div_treatment == "v1_skip");
+    bool head_insertion = (_div_treatment.find("gygi") != std::string::npos);
+    if (head_insertion and nqpts_ibz == 1) {
+      app_log(1, "  [WARNING] Pi^C: nqpts_ibz == 1 while vertex div_treatment is "
+                 "gygi-class; the q->0\n"
+                 "            extrapolation is meaningless on a Gamma-only mesh -- taking "
+                 "\"ignore_g0\" instead\n"
+                 "            (same downgrade as GW's Sigma_div_correction).");
+      head_insertion = false;
+    }
+    if (skip_rung_gamma)
+      app_log(1, "  [NOTE] Pi^C q->0 policy: v1_skip -- the qx = Gamma (iq = {}) cell of "
+                 "the internal rung\n"
+                 "         transfer is DROPPED (bare Z and dynamic dW). Fallback mode; "
+                 "O(1/N_k) finite-size error.\n", iq_gamma);
+    else
+      app_log(1, "  [NOTE] Pi^C q->0 policy: {} -- the qx = Gamma (iq = {}) cell of the "
+                 "internal rung transfer\n"
+                 "         is INCLUDED with the stored regularized W(Gamma) (v(G=0) zeroed "
+                 "at ERI build){}.\n"
+                 "         The external q axis is regular and computed at all q.\n",
+              _div_treatment, iq_gamma,
+              head_insertion ? ",\n         PLUS the analytic rank-1 head insertion "
+                               "Nk*madelung*[1 | Re eps_inv_head(tau)]*chi chi^dag"
+                             : "; no analytic head (GW ignore_g0 analogue)");
+
     // ---- collocation matrices (q-independent X, polarization 0) -----------------------
     nda::array<ComplexType, 4> X_skPa(ns, nkpts, Np, nbnd);
     for (long is = 0; is < ns; ++is)
@@ -290,6 +448,26 @@ namespace solvers {
     nda::array<ComplexType, 3> Z_qPQ(nqpts_ibz, Np, Np);
     for (long iq = 0; iq < nqpts_ibz; ++iq)
       Z_qPQ(iq, all, all) = thc.Z(int(iq));
+
+    // head insertion, bare piece (weight 1) into Z(Gamma) -- (H1) of the memo
+    nda::array<ComplexType, 2> H_PQ(Np, Np);
+    bool head_ok = false;
+    if (head_insertion) {
+      head_ok = vertex_head_detail::build_head_rank1(thc, iq_gamma, nkpts, H_PQ);
+      if (head_ok) {
+        Z_qPQ(iq_gamma, all, all) += H_PQ;
+        double h_max = 0.0;
+        for (auto const& v : H_PQ) h_max = std::max(h_max, std::abs(v));
+        app_log(1, "  Pi^C head insertion: madelung = {}, |H|_max = {} (bare piece "
+                   "applied to Z(Gamma))", MF->madelung(), h_max);
+      } else {
+        app_log(1, "  [WARNING] Pi^C: gygi head insertion requested but head data are "
+                   "unusable\n"
+                   "            (madelung == 0 or empty basis_head) -- proceeding WITHOUT "
+                   "the analytic head\n"
+                   "            (equivalent to policy \"ignore_g0\").");
+      }
+    }
 
     // ---- dynamic W on the full bosonic Matsubara mesh ---------------------------------
     // mb_state.dW_qtPQ is the dynamic-only screened interaction (bare Z subtracted,
@@ -305,6 +483,26 @@ namespace solvers {
       W_qtPQ() = ComplexType(0.0);
       W_qtPQ(dW.local_range(0), dW.local_range(1), dW.local_range(2), dW.local_range(3)) = dW.local();
       mpi->comm.all_reduce_in_place_n(W_qtPQ.data(), W_qtPQ.size(), std::plus<>{});
+
+      // head insertion, dynamic piece (weight Re[eps_inv_head(tau)]) into dW(Gamma, tau),
+      // BEFORE the tau -> Matsubara transform (so the bosonic-mesh rung inherits it).
+      // Same Re[.] convention as Sigma_div_correction (thc_gw.icc:506).
+      if (head_ok) {
+        if (mb_state.eps_inv_head.has_value()) {
+          auto& eps = mb_state.eps_inv_head.value();
+          utils::check(eps.shape(0) == nt_half,
+                       "vertex_t::eval_Pi_C: eps_inv_head size {} != nt_half = {}.",
+                       eps.shape(0), nt_half);
+          for (long it = 0; it < nt_half; ++it)
+            W_qtPQ(iq_gamma, it, all, all) += ComplexType(eps(it).real()) * H_PQ;
+          app_log(1, "  Pi^C head insertion: dynamic piece applied to dW(Gamma, tau) "
+                     "with eps_inv_head(tau=0) = {}", eps(0).real());
+        } else {
+          app_log(1, "  [WARNING] Pi^C: dW is present but eps_inv_head is not in MBState "
+                     "-- the DYNAMIC head\n"
+                     "            piece is skipped (bare piece applied).");
+        }
+      }
 
       long nw_b = tools.nw_b;
       long nw_half = (nw_b % 2 == 0) ? nw_b / 2 : nw_b / 2 + 1;
@@ -333,15 +531,7 @@ namespace solvers {
     }
 
     // ---- kernel: accumulate Pi^C(inu) over this rank's (s,k,qx) tuples ----------------
-    // q->0 policy: ignore_g0 semantics on the INTERNAL rung transfer -- the qx = Gamma
-    // term is skipped, consistently for the bare-Z and dynamic parts (the rung is one
-    // interaction line; its q->0 cell carries the unregularized Coulomb head that GW tames
-    // with div corrections the vertex does not have yet). O(1/Nq) finite-size error.
-    const bool skip_rung_gamma = true;
-    if (skip_rung_gamma)
-      app_log(1, "  [NOTE] vertex rung uses ignore_g0 semantics (the qx = Gamma term of the\n"
-                 "         internal rung transfer is skipped, bare-Z and dynamic parts alike);\n"
-                 "         proper q->0 head treatment is deferred.\n");
+    // q->0 policy resolved above (skip_rung_gamma / head-augmented inputs).
     nda::array<double, 1> qx_diag(nqpts_ibz);
     nda::array<ComplexType, 4> Pi_wqMN(tools.nw_b, nqpts_ibz, Np, Np);
     Pi_wqMN() = ComplexType(0.0);

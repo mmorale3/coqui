@@ -343,12 +343,17 @@ namespace vertex_pi {
    * @param Wdyn_qwPQ - dynamic W on the FULL bosonic mesh (nq, nw_b, Np, Np), or nullptr
    *                    (first iteration: bare-Z rung only).
    * @param kmq, kpq  - (nq, nk) index maps for k-q and k+q on the full (symmetry-free) mesh.
-   * @param skip_rung_gamma - ignore_g0 semantics on the INTERNAL rung transfer: skip the
-   *                    qx = Gamma term of the rung sum, consistently for the bare-Z and the
-   *                    dynamic parts (the rung is ONE interaction line W(qx) = Z + W_dyn;
-   *                    its q->0 cell carries the unregularized Coulomb head, which GW tames
-   *                    with div corrections the vertex does not have yet). O(1/Nq)
-   *                    finite-size error, same class as GW's "ignore_g0" div treatment.
+   * @param skip_rung_gamma - q->0 policy on the INTERNAL rung transfer
+   *                    (notes/q0_head_treatment.md section 3):
+   *                    true  = v1 blanket skip of the qx = Gamma term, consistently for
+   *                            the bare-Z and dynamic parts (runtime fallback "v1_skip").
+   *                    false = v2: the Gamma cell is included with whatever the caller
+   *                            put in Z_qPQ(Gamma)/Wdyn_qwPQ(Gamma). The stored objects
+   *                            are the regularized body (v(G=0) zeroed at ERI build,
+   *                            potentials_impl.hpp:223) -- GW's own "ignore_g0"
+   *                            semantics; under the gygi-class policy the caller has
+   *                            additionally added the analytic rank-1 head insertion
+   *                            at Gamma (vertex_t.cpp).
    * @param qx_diag   - optional (nq): per-qx max |single contribution| to Pi^C(inu),
    *                    rank-local (for the q->0 diagnostics; logged by the caller).
    */

@@ -127,7 +127,12 @@ inline void ensure_checkpoint(std::shared_ptr<mf::MF> mf, std::string const& out
  *                 screen_type "rpa" or "rpa_k"; no k-point symmetry (full-BZ meshes) yet.
  *                 Note: Pi^C uses the PREVIOUS iteration's screened W (one-iteration lag;
  *                 first iteration uses the bare-Z rung), and dW stays resident across the
- *                 iteration boundary (memory tradeoff).
+ *                 iteration boundary (memory tradeoff). The vertex inherits the run's
+ *                 div_treatment for its q->0 rung policy: "ignore_g0" includes the stored
+ *                 regularized W(Gamma) body; "gygi" additionally applies the analytic
+ *                 rank-1 head insertion (madelung x basis_head x eps_inv_head). At coarse
+ *                 k-meshes the gygi head can dominate the vertex rung sums (O(Nk^-1/3)
+ *                 convergence) -- check mesh convergence of the head fraction.
  */
 template<typename eri_t>
 void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
@@ -223,7 +228,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
 
     // vertex_t must outlive the scf_loop below. Both cuts (Sigma^C and Pi^C)
     // are switched together through this single object -- never one alone.
-    solvers::vertex_t vertex(&ft, vertex_type, vertex_band_window, mf->nbnd());
+    solvers::vertex_t vertex(&ft, vertex_type, vertex_band_window, mf->nbnd(), div_treatment);
     if (vertex.enabled()) {
       utils::check(screen_type == "rpa" or screen_type == "rpa_k",
                    "vertex_type = \"{}\" currently requires screen_type = \"rpa\" or \"rpa_k\" "
@@ -466,7 +471,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
 
     // vertex_t must outlive the scf_loop below. Both cuts (Sigma^C and Pi^C)
     // are switched together through this single object -- never one alone.
-    solvers::vertex_t vertex(&ft, vertex_type, vertex_band_window, mf->nbnd());
+    solvers::vertex_t vertex(&ft, vertex_type, vertex_band_window, mf->nbnd(), div_treatment);
     if (vertex.enabled()) {
       utils::check(screen_type == "rpa" or screen_type == "rpa_k",
                    "vertex_type = \"{}\" currently requires screen_type = \"rpa\" or \"rpa_k\" "
