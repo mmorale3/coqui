@@ -403,6 +403,111 @@ inline qrad_tab build_qrad_tab(
 }
 
 /**
+ * Shape-restored ("Option A") variant of build_qrad_tab.
+ *
+ * Instead of the compensation charge qfuncl (moment × shape function), this
+ * transforms the FULL AE−PS on-site pair density
+ *
+ *   D_ijv(r) = φ_nb(r) φ_mb(r) − φ̃_nb(r) φ̃_mb(r)
+ *            = aewfc(nb,r)·aewfc(mb,r) − pswfc(nb,r)·pswfc(mb,r)
+ *
+ * (u = r·R form, so it already carries r²; no extra r² in the transform, same
+ * as qfuncl). The radial function is L-independent — the L-decomposition is
+ * purely angular via the Gaunt coefficients `ap` applied by the caller — so
+ * tab(iK, ijv, L) = ∫ D_ijv(r) j_L(K r) dr for every L in [0, Lp1).
+ *
+ * Fed into `evaluate_Q_IJ_at_K_fast` in place of the compensation-charge table,
+ * this reproduces ABINIT's `phiphj - tphitphj` oscillator form factor
+ * (m_pawpwij.F90): the resulting augmented pair density is the exact
+ * all-electron pair density (up to the FFT-mesh cutoff), so the smooth+aug
+ * Coulomb contraction alone gives the exact on-site exchange and the separate
+ * `deltaC` one-center correction is dropped. See
+ * notes/paw_onsite_exchange_analysis.{md,pdf}, Route A.
+ *
+ * D → 0 beyond kkbeta (PAW: φ = φ̃ outside r_c), so the kkbeta truncation is
+ * exact here too. PAW-only (requires aewfc/pswfc); returns an empty table
+ * otherwise so callers can fall back.
+ */
+inline qrad_tab build_qrad_tab_full_aeps(
+    pseudopot::species_paw_t const& sp,
+    double K_max,
+    double dq = 0.01)
+{
+    qrad_tab T;
+    T.dq = dq;
+    if (sp.aewfc.size() == 0 || sp.pswfc.size() == 0) return T;
+    long nbeta = sp.nbeta;
+    long n_ijv = nbeta * (nbeta + 1) / 2;
+    long mesh_full = sp.aewfc.extent(1);
+    if (mesh_full == 0 || n_ijv == 0) return T;
+
+    // L-channel count: match the compensation table's Lp1 when present so the
+    // angular sum in evaluate_Q_IJ_at_K_fast indexes the table identically;
+    // else 2*lmax_beta + 1 (the full AE−PS pair density spans |li−lj|..li+lj).
+    long Lp1;
+    if (sp.qfuncl.size() > 0) {
+        Lp1 = sp.qfuncl.extent(0);
+    } else {
+        int lmax_beta = 0;
+        for (long b = 0; b < nbeta; ++b) lmax_beta = std::max(lmax_beta, (int)sp.lll(b));
+        Lp1 = 2 * lmax_beta + 1;
+    }
+
+    long mesh = (sp.kkbeta > 0 && sp.kkbeta <= (int)mesh_full)
+              ? (long)sp.kkbeta : mesh_full;
+    T.n_K = (long)std::ceil(K_max / dq) + 4;
+    T.tab = nda::array<double, 3>::zeros({T.n_K, n_ijv, Lp1});
+
+    long N = (mesh % 2 == 1) ? mesh : mesh - 1;  // odd for Simpson
+    using boost::math::sph_bessel;
+
+    // Simpson weights × rab (same for all iK, L, ijv).
+    nda::array<double, 1> simp(N);
+    {
+        simp(0)     = sp.rab(0);
+        simp(N - 1) = sp.rab(N - 1);
+        double fct = 4.0;
+        int sg = -1;
+        for (long i = 1; i < N - 1; ++i) {
+            simp(i) = fct * sp.rab(i);
+            fct += sg * 2.0;
+            sg = -sg;
+        }
+    }
+
+    // AE−PS pair density D_ijv(r) for every beta pair (nb ≥ mb), indexed by the
+    // same triangular ijv used by qfuncl / evaluate_Q_IJ_at_K.
+    nda::array<double, 2> D(n_ijv, N);
+    D() = 0.0;
+    for (long nb = 0; nb < nbeta; ++nb)
+        for (long mb = 0; mb <= nb; ++mb) {
+            long ijv = nb * (nb + 1) / 2 + mb;
+            for (long i = 0; i < N; ++i)
+                D(ijv, i) = sp.aewfc(nb, i) * sp.aewfc(mb, i)
+                          - sp.pswfc(nb, i) * sp.pswfc(mb, i);
+        }
+
+    nda::array<double, 1> besr(N);
+    for (long iK = 0; iK < T.n_K; ++iK) {
+        double K = (double)iK * dq;
+        for (long L = 0; L < Lp1; ++L) {
+            for (long i = 0; i < N; ++i) {
+                double Kr = K * sp.r(i);
+                besr(i) = (std::abs(Kr) < 1e-30) ? (L == 0 ? 1.0 : 0.0)
+                                                 : sph_bessel((unsigned int)L, Kr);
+            }
+            for (long ijv = 0; ijv < n_ijv; ++ijv) {
+                double F = 0.0;
+                for (long i = 0; i < N; ++i)
+                    F += simp(i) * D(ijv, i) * besr(i);
+                T.tab(iK, ijv, L) = F / 3.0;
+            }
+        }
+    }
+    return T;
+}
+
+/**
  * 4-point cubic interpolation of qrad at arbitrary K, matching the formula
  * in QE/upflib/qvan2.f90 lines 143-157. Returns an array of length Lp1
  * with the per-L radial values for the requested ijv.

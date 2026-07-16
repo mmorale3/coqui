@@ -317,6 +317,19 @@ class pseudopot
                     math::nda::DistributedArrayOfRank<4> auto const& psi,
                     math::nda::DistributedArrayOfRank<4> auto & Kij);
 
+  /**
+   * Option A ("shape-restored" on-site exact exchange). When true, add_exchange
+   * (both the nii and nij overloads) builds the PAW augmentation from the FULL
+   * AE−PS partial-wave pair density (φφ − φ̃φ̃, via build_qrad_tab_full_aeps)
+   * instead of the compensation charge, and drops the deltaC one-center
+   * correction — reproducing ABINIT's phiphj−tphitphj oscillator, i.e. the
+   * exact all-electron on-site exchange (fixes the ~0.05 Ha/Si compensated-PAW
+   * under-count; see notes/paw_onsite_exchange_analysis.{md,pdf}). PAW species
+   * only; USPP is unaffected. Default false = compensation charge + deltaC.
+   */
+  bool paw_exx_shape_restored = false;
+  void set_paw_exx_shape_restored(bool b) { paw_exx_shape_restored = b; }
+
   private:
 
   // mpi communicators

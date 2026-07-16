@@ -257,7 +257,8 @@ inline void v_x(utils::mpi_context_t<boost::mpi3::communicator,
          std::vector<utils::symm_op> const& symm_list,
          nda::ArrayOfRank<3> auto const& nii,
          math::nda::DistributedArrayOfRank<4> auto const& psi,
-         math::nda::DistributedArrayOfRank<4> auto & Kij)
+         math::nda::DistributedArrayOfRank<4> auto & Kij,
+         bool shape_restored = false)
 {
   if (psp.pp_type() == pp_ncpp_t) {
     ::hamilt::v_x(mpi, vG, npol, mesh, lattv, recv, k2g, kpts,
@@ -394,7 +395,12 @@ inline void v_x(utils::mpi_context_t<boost::mpi3::communicator,
   auto aatab = aainit_tables_build(lli_aat);
   for (size_t nt = 0; nt < sps.size(); ++nt) {
     if (sps[nt].is_paw || sps[nt].is_uspp)
-      qtab_sp[nt] = build_qrad_tab(sps[nt], Kmax_est);
+      // Option A (shape_restored): PAW species use the full AE−PS pair-density
+      // form factor (drops the separate deltaC one-center correction below);
+      // USPP always uses the compensation charge.
+      qtab_sp[nt] = (shape_restored && sps[nt].is_paw)
+                      ? build_qrad_tab_full_aeps(sps[nt], Kmax_est)
+                      : build_qrad_tab(sps[nt], Kmax_est);
   }
 
   // ---- nij_max per species (for Qfac packing) ----
@@ -499,6 +505,13 @@ inline void v_x(utils::mpi_context_t<boost::mpi3::communicator,
       }
     }
   }
+
+  // Option A (shape_restored): the full AE−PS on-site pair density is already
+  // carried by the smooth+aug contraction above (build_qrad_tab_full_aeps), so
+  // the exact on-site exchange is complete and the deltaC one-center correction
+  // must NOT be added (it would double count). See
+  // notes/paw_onsite_exchange_analysis.{md,pdf} (Route A).
+  if (shape_restored) { mpi.comm.barrier(); return; }
 
   // ----------------------------------------------------------------------
   // PAW one-center exchange correction (deltaC-mediated AE-PS Coulomb on
@@ -622,7 +635,8 @@ inline void v_x(utils::mpi_context_t<boost::mpi3::communicator,
          std::vector<utils::symm_op> const& symm_list,
          nda::ArrayOfRank<4> auto const& nij,
          math::nda::DistributedArrayOfRank<4> auto const& psi,
-         math::nda::DistributedArrayOfRank<4> auto & Kij)
+         math::nda::DistributedArrayOfRank<4> auto & Kij,
+         bool shape_restored = false)
 {
   if (psp.pp_type() == pp_ncpp_t) {
     ::hamilt::v_x(mpi, vG, npol, mesh, lattv, recv, k2g, kpts,
@@ -733,7 +747,9 @@ inline void v_x(utils::mpi_context_t<boost::mpi3::communicator,
   auto aatab = aainit_tables_build(lli_aat);
   for (size_t nt = 0; nt < sps.size(); ++nt)
     if (sps[nt].is_paw || sps[nt].is_uspp)
-      qtab_sp[nt] = build_qrad_tab(sps[nt], Kmax_est);
+      qtab_sp[nt] = (shape_restored && sps[nt].is_paw)
+                      ? build_qrad_tab_full_aeps(sps[nt], Kmax_est)
+                      : build_qrad_tab(sps[nt], Kmax_est);
 
   long nij_max = 0;
   for (size_t nt = 0; nt < sps.size(); ++nt)
@@ -832,6 +848,10 @@ inline void v_x(utils::mpi_context_t<boost::mpi3::communicator,
       }
     }
   }
+
+  // Option A (shape_restored): full AE−PS pair density already in smooth+aug
+  // above → skip the deltaC one-center correction (would double count).
+  if (shape_restored) { mpi.comm.barrier(); return; }
 
   // ---- PAW one-center exchange (deltaC), inner projectors → natural orbitals.
   // Same THC-consistent prefactor as the diagonal kernel: scl_oc = −1/N_k,

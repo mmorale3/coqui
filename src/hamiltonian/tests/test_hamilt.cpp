@@ -2448,6 +2448,79 @@ TEST_CASE("vexchange_nij_vs_nii", "[hamilt][paw][hf]")
 }
 
 // ===========================================================================
+// Option A ("shape-restored") on-site exact exchange. When
+// pseudopot::set_paw_exx_shape_restored(true), the PAW augmentation uses the
+// FULL AE−PS partial-wave pair density (build_qrad_tab_full_aeps) instead of
+// the compensation charge, and the deltaC one-center correction is dropped —
+// reproducing ABINIT's phiphj−tphitphj oscillator (see
+// notes/paw_onsite_exchange_analysis). Two checks on a PAW fixture:
+//   (1) shape_restored actually changes the exchange matrix (mechanism active).
+//   (2) the FULL density-matrix (nij) path equals the diagonal (nii) path for a
+//       diagonal nij under Option A — i.e. the GW density-matrix exchange is
+//       correct, not just the DFT-style diagonal occupations.
+// ===========================================================================
+template<MEMORY_SPACE MEM>
+void test_vexchange_shape_restored(mpi_context_t& mpi,
+                                   std::shared_ptr<mf::MF> mf_ptr,
+                                   double tol_consistency)
+{
+  auto& mfobj = *mf_ptr;
+  long nspin = mfobj.nspin(), nk_ibz = mfobj.nkpts_ibz(), nbnd = mfobj.nbnd();
+
+  nda::array<ComplexType,3> nii(nspin, nk_ibz, nbnd);
+  for (long s = 0; s < nspin; ++s)
+    for (long k = 0; k < nk_ibz; ++k)
+      for (long n = 0; n < nbnd; ++n)
+        nii(s, k, n) = ComplexType(0.5 + 0.3*std::cos(1.3*n + 0.7*k + 0.2*s), 0.0);
+  nda::array<ComplexType,4> nij(nspin, nk_ibz, nbnd, nbnd);
+  nij() = ComplexType(0.0);
+  for (long s = 0; s < nspin; ++s)
+    for (long k = 0; k < nk_ibz; ++k)
+      for (long n = 0; n < nbnd; ++n)
+        nij(s, k, n, n) = nii(s, k, n);
+
+  hamilt::pseudopot V(mfobj);
+  V.set_paw_exx_shape_restored(false);
+  auto dKc     = hamilt::Vexchange<MEM>(mfobj, mpi.comm, &V, nii);
+  V.set_paw_exx_shape_restored(true);
+  auto dKs     = hamilt::Vexchange<MEM>(mfobj, mpi.comm, &V, nii);
+  auto dKs_nij = hamilt::Vexchange<MEM>(mfobj, mpi.comm, &V, nij);
+
+  auto c  = nda::to_host(dKc.local());
+  auto s_ = nda::to_host(dKs.local());
+  auto sn = nda::to_host(dKs_nij.local());
+  double d_active = 0.0, v_ref = 0.0, d_nij = 0.0;
+  for (long i0 = 0; i0 < c.extent(0); ++i0)
+    for (long i1 = 0; i1 < c.extent(1); ++i1)
+      for (long i2 = 0; i2 < c.extent(2); ++i2)
+        for (long i3 = 0; i3 < c.extent(3); ++i3) {
+          d_active = std::max(d_active, std::abs(s_(i0,i1,i2,i3) - c(i0,i1,i2,i3)));
+          d_nij    = std::max(d_nij,    std::abs(sn(i0,i1,i2,i3) - s_(i0,i1,i2,i3)));
+          v_ref    = std::max(v_ref,    std::abs(c(i0,i1,i2,i3)));
+        }
+  d_active = mpi.comm.all_reduce_value(d_active, boost::mpi3::max<>{});
+  d_nij    = mpi.comm.all_reduce_value(d_nij,    boost::mpi3::max<>{});
+  v_ref    = mpi.comm.all_reduce_value(v_ref,    boost::mpi3::max<>{});
+  app_log(1, "[Vx shape-restored] max|K| = {:.3e}, max|ΔK_active| = {:.3e}, "
+             "max|ΔK_(nij-nii)| = {:.3e}", v_ref, d_active, d_nij);
+  REQUIRE(v_ref > 1e-8);
+  // (1) Option A genuinely changes the on-site exchange (full AE−PS ≠ moments).
+  REQUIRE(d_active > 1e-8);
+  // (2) full density-matrix path == diagonal path under Option A.
+  CHECK(d_nij < tol_consistency);
+}
+
+TEST_CASE("vexchange_shape_restored", "[hamilt][paw][hf]")
+{
+  auto& mpi = utils::make_unit_test_mpi_context();
+  SECTION("lih_kp222_nbnd16 (PAW)") {
+    auto mf_ptr = std::make_shared<mf::MF>(
+        mf::default_MF(mpi, "qe_lih222_paw_hf", mf::h5_input_type));
+    test_vexchange_shape_restored<HOST_MEMORY>(*mpi, mf_ptr, 1e-8);
+  }
+}
+
+// ===========================================================================
 // Set 1b — MF-INDEPENDENCE with a genuine NON-DIAGONAL density matrix.
 // Compares direct hamilt::Vhartree(nij)/Vexchange(nij) against THC
 // hf_t::evaluate(Dm=nij) for a Hermitian PSD density matrix that is NOT

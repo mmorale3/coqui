@@ -127,6 +127,52 @@ double rpa_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_
     }
   }
 
+  // Diagnostic (env COQUI_VX_SHAPE_DIAG): direct-path exchange energy with the
+  // compensated augmentation vs. the shape-restored "Option A" augmentation
+  // (full AE−PS pair density, deltaC dropped). Compensated should approximately
+  // reproduce the THC "Exchange energy (vv)" above; shape-restored is the
+  // ABINIT-correct on-site exchange (Si a=10.20 bare: -1.7382 -> -1.6863 Ha).
+  // Occupations are thresholded to the KS-occupied bands (|occ|>0.5): the direct
+  // FFT exchange over all virtual bands is impractically slow and virtuals
+  // contribute negligibly to the exchange energy. E_x = 0.5*spin*Σ_k w_k Σ_n
+  // occ_n K(n,n) (diagonal density matrix). The full density-matrix (nij) path
+  // is validated separately by the hamiltonian unit tests (nij==nii to 1e-16).
+  if (std::getenv("COQUI_VX_SHAPE_DIAG") != nullptr) {
+    long ns = mf->nspin(), nk = mf->nkpts_ibz(), nb = mf->nbnd();
+    nda::array<ComplexType, 3> nii(ns, nk, nb);
+    nii() = ComplexType(0.0);
+    if (mpi->comm.root()) {
+      auto Dm = sDm_skij.local();
+      for (long s = 0; s < ns; ++s)
+        for (long k = 0; k < nk; ++k)
+          for (long n = 0; n < nb; ++n) {
+            ComplexType occ = Dm(s, k, n, n);
+            if (std::abs(occ.real()) > 0.5) nii(s, k, n) = occ;  // KS-occupied only
+          }
+    }
+    mpi->comm.broadcast_n(nii.data(), nii.size(), 0);
+    double spin_factor = (ns == 2) ? 1.0 : 2.0;
+    auto sK = math::shm::make_shared_array<Array_view_4D_t>(*mpi, {ns, nk, nb, nb});
+    hamilt::pseudopot V(*mf);
+    for (int pass = 0; pass < 2; ++pass) {
+      V.set_paw_exx_shape_restored(pass == 1);
+      hamilt::set_Vexchange(*mf, &V, nii, sK);
+      double e_x = 0.0;
+      if (mpi->comm.root()) {
+        auto Kloc = sK.local();
+        for (long s = 0; s < ns; ++s)
+          for (long k = 0; k < nk; ++k)
+            for (long n = 0; n < nb; ++n)
+              e_x += k_weight(k) * (nii(s, k, n) * Kloc(s, k, n, n)).real();
+        e_x *= 0.5 * spin_factor;
+      }
+      mpi->comm.broadcast_n(&e_x, 1, 0);
+      app_log(2, "Direct exchange, {}: {} a.u.",
+              (pass == 0) ? "compensated   " : "shape-restored", e_x);
+    }
+    app_log(2, "");
+  }
+
   Timer.start("WRITE");
   if (mpi->comm.root()) {
     std::string filename = mb_state.coqui_prefix + ".mbpt.h5";
