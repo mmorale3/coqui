@@ -1,0 +1,341 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{mdframed}
+\usepackage[colorlinks=true,linkcolor=blue,urlcolor=blue]{hyperref}
+\usepackage{enumitem}
+\usepackage{parskip}
+
+\newcommand{\rt}{\tilde{\rho}}
+\newcommand{\vc}{v_C}
+\newcommand{\ket}[1]{\lvert #1 \rangle}
+\newcommand{\bra}[1]{\langle #1 \rvert}
+\newcommand{\avg}[3]{\left\langle #1 \,\middle|\, #2 \,\middle|\, #3 \right\rangle}
+\newcommand{\code}[1]{\texttt{\small #1}}
+
+\newmdenv[
+  linecolor=blue!55!black, linewidth=0.6pt,
+  backgroundcolor=blue!4, roundcorner=3pt,
+  innertopmargin=6pt, innerbottommargin=6pt,
+  skipabove=6pt, skipbelow=6pt
+]{keybox}
+
+\title{\bfseries PAW on-site valence exact exchange:\\
+CoQu\'i vs.\ the correct (all-electron) expression}
+\author{}
+\date{2026-07-16}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+This note documents (i) exactly what CoQu\'i currently computes for the PAW
+on-site valence exchange, term by term, from the source; (ii) what ABINIT
+computes and why it equals the true all-electron (AE) exchange; and (iii) a
+derivation of the difference between the two, which turns out to be a single,
+physically identifiable term that CoQu\'i neglects. The analysis is backed by the
+instrumented Si $a=10.20$ comparison (both codes, finite-size correction off,
+on-site term toggled): CoQu\'i on-site exchange $+0.0414$~Ha vs.\ ABINIT
+$+0.0925$~Ha (converged), a $0.052$~Ha gap that the derived missing term
+accounts for.
+\end{abstract}
+
+\paragraph{Source of record.}
+\begin{itemize}[nosep,leftmargin=1.4em]
+  \item CoQu\'i smooth $+$ augmentation $+$ one-center: \code{src/hamiltonian/paw/v\_x\_paw.hpp}
+  \item CoQu\'i \code{deltaC} kernel: \code{src/python/mean\_field/abinit\_interface/paw\_deltaC.py}
+        (identical definition to QE's \code{pw2coqui}; stored in the mean-field h5
+        and read into \code{species\_paw\_t::deltaC})
+  \item ABINIT on-site oscillator: \code{abinit-10.6.7/src/65\_paw/m\_pawpwij.F90},
+        used by \code{calc\_sigx\_me} (\code{src/70\_gw/m\_sigx.F90})
+\end{itemize}
+
+\section{Notation}
+
+Per $k$-point pair $(m,k_q)$, $(n,k_p)$ the \emph{pair (transition) density} is
+$\rho_{mn}(\mathbf r) = \psi^{*}_{m k_q}(\mathbf r)\,\psi_{n k_p}(\mathbf r)$.
+The exact-exchange energy is the bilinear
+\begin{equation}
+E_x = -\tfrac12 \sum_{s}\sum_{k_q k_p}\sum_{mn}
+      \frac{f_{m k_q}\, f_{n k_p}}{N_k}\;
+      \avg{\rho_{mn}}{\vc}{\rho_{mn}},
+\qquad
+\avg{\rho}{\vc}{\rho'} \equiv \frac{4\pi}{\Omega}\sum_{G}\frac{\rho^{*}(K)\,\rho'(K)}{|K|^2},
+\;\; K = G + k_p - k_q .
+\end{equation}
+The matrix-element form actually built in the code is
+$K_{ij}(s,k_p) = -\frac{1}{N_k}\sum_{k_q}\sum_n f_{n k_q}\,\avg{\rho_{ni}}{\vc}{\rho_{nj}}$,
+with $E_x = \tfrac12\sum_i f_i K_{ii}$.
+
+\paragraph{PAW decomposition of the pair density.}
+With smooth orbitals $\tilde\psi$, projectors $p_I^a$, and AE/PS partial waves
+$\phi_I^a,\tilde\phi_I^a$:
+\begin{equation}
+\rho_{mn}(\mathbf r) = \underbrace{\rt_{mn}(\mathbf r)}_{\text{smooth (grid)}}
+   + \sum_a \underbrace{\big[\rho^{1}_{mn,a}(\mathbf r) - \rt^{1}_{mn,a}(\mathbf r)\big]}_{\displaystyle D_{mn,a}(\mathbf r)\ \text{(on-site, radial)}} ,
+\end{equation}
+\begin{equation}
+\rho^{1}_{mn,a} = \sum_{IJ} P^{a*}_{mI}P^{a}_{nJ}\,\phi_I^a\phi_J^a,\quad
+\rt^{1}_{mn,a} = \sum_{IJ} P^{a*}_{mI}P^{a}_{nJ}\,\tilde\phi_I^a\tilde\phi_J^a,\quad
+P^{a}_{nJ} \equiv \langle p_J^a | \tilde\psi_n\rangle .
+\end{equation}
+The \emph{compensation charge} $\hat n_{mn,a}$ reproduces the \emph{multipole
+moments} of $D_{mn,a}$ but not its shape:
+\begin{equation}
+\hat n_{mn,a}(\mathbf r) = \sum_{IJ} P^{a*}_{mI}P^{a}_{nJ}\sum_{L} q^{L}_{IJ}\,g_L(r)\,\{Y_{LM}\},
+\qquad
+q^{L}_{IJ} = \int \big(\phi_I\phi_J - \tilde\phi_I\tilde\phi_J\big)\,r^{L}\,r^2\,dr ,
+\end{equation}
+with $g_L$ the (Bessel/Gaussian) shape function normalised to unit $L$-moment. By
+construction $\int (D_{mn,a}-\hat n_{mn,a})\, r^L Y_{LM}\, d^3r = 0$ for all $LM$.
+
+Two identities used below (Coulomb bilinearity $+$ the moment property):
+\begin{equation}
+\label{eq:id}
+\avg{D}{\vc}{D} - \avg{\rho^1}{\vc}{\rho^1} + \avg{\rt^1}{\vc}{\rt^1} = -2\avg{\rt^1}{\vc}{D}
+\qquad\text{(expand }D=\rho^1-\rt^1\text{).}
+\end{equation}
+
+\section{What CoQu\'i currently implements}
+
+CoQu\'i builds $K_{ij}$ as \textbf{three} additive pieces (\code{v\_x\_paw.hpp},
+function \code{v\_x}).
+
+\paragraph{(1a) Smooth pair density (grid).} Lines 442--446. For occupied $n$ at
+$k_q$ and every $a$ at $k_p$:
+\begin{equation}
+\rt_{na}(G) = \mathrm{FFT}\big[\, \tilde u^{*}_{n}(k_q,\mathbf r)\,\tilde u_{a}(k_p,\mathbf r)\,\big](G).
+\end{equation}
+
+\paragraph{(1b) Compensation-charge augmentation (grid), lines 448--485.}
+\begin{keybox}
+\vspace{-2pt}
+\begin{equation}
+\rho^{\text{full}}_{na}(G) = \rt_{na}(G)
+   + \Omega\sum_a\sum_{IJ} P^{a*}_{nI}(k_q)\,P^{a}_{aJ}(k_p)\;
+          Q^{IJ}_a(K)\,e^{-iK\cdot\tau_a}
+\end{equation}
+\vspace{-8pt}
+\end{keybox}
+where $Q^{IJ}_a(K)$ is the Fourier transform of the \textbf{compensation charge}
+$\hat n_{IJ}$ (moments $\times$ shape function), carrying the $4\pi/\Omega$ prefactor
+(\code{evaluate\_Q\_IJ\_at\_K\_fast}, l.229; the explicit $\Omega$ on l.461 restores
+the density normalisation). Crucially this is $\hat n$, i.e.\ \textbf{moments only}
+--- it is \emph{not} the AE$-$PS pair density. So on the grid CoQu\'i forms
+$\rho^{\text{full}} = \rt + \hat n$.
+
+\paragraph{(1c) Coulomb contraction (smooth $+$ augmentation), lines 487--497.}
+\begin{equation}
+K^{\text{sm+aug}}_{ij}(s,k_p) = -\frac{1}{N_k\,\Omega}\sum_{k_q}\sum_n f_{n k_q}
+   \sum_G \vc(K)\,\rho^{\text{full}*}_{ni}(G)\,\rho^{\text{full}}_{nj}(G),
+\qquad \Big[\;\mathrm{scl}=-\tfrac{1}{N_k\Omega}\;\Big].
+\end{equation}
+In bilinear form this is
+$-\tfrac{1}{N_k}\sum_{k_q}\sum_n f_n\,\avg{\rt+\hat n}{\vc}{\rt+\hat n}$.
+
+\paragraph{(1d) One-center \code{deltaC} correction, lines 503--590.}
+\begin{equation}
+\Delta K^{\text{oc}}_{ij}(s,k_p) = -\frac{1}{N_k}\sum_{k_q}\sum_n f_{n k_q}
+   \sum_a\!\!\sum_{IJKL} P^{a*}_{iI}(k_p)\,P^{a}_{nJ}(k_q)\,
+   \Delta C^{a}(I,J,K,L)\,P^{a*}_{nK}(k_q)\,P^{a}_{jL}(k_p),
+\end{equation}
+with $\mathrm{scl_{oc}}=-\tfrac{1}{N_k}$ and (\code{paw\_deltaC.py}, l.111--142;
+QE/\code{pw2coqui} identical):
+\begin{keybox}
+\vspace{-2pt}
+\begin{equation}
+\Delta C^{a}(I,J,K,L) = K^{\text{AE}} - K^{\text{PS}},\qquad
+K = \sum_{LM}\int V^{IJ}_{LM}(r)\,\rho^{KL}_{LM}(r)\,dr,
+\end{equation}
+\vspace{-14pt}
+\begin{align}
+\rho^{IJ,\text{AE}}_{LM} &= \sum_{lm}\mathrm{ap}(lm,l_i,l_j)\,\underbrace{\phi_I\phi_J}_{\text{pfunc}},\\
+\rho^{IJ,\text{PS}}_{LM} &= \sum_{lm}\mathrm{ap}(lm,l_i,l_j)\,\big[\underbrace{\tilde\phi_I\tilde\phi_J}_{\text{ptfunc}} + \underbrace{q^{L}_{IJ}g_L(r)}_{\text{qfuncl}=\hat n}\big].
+\end{align}
+\vspace{-10pt}
+\end{keybox}
+\textbf{Read literally:} the AE side is the pure product $\phi_I\phi_J$; the PS side
+is $\tilde\phi_I\tilde\phi_J + \hat n_{IJ}$ (note the \code{+ qfuncl} on l.107/126 of
+\code{paw\_deltaC.py} and l.215 of \code{paw\_onecenter.hpp}). Hence, per atom,
+\begin{equation}
+\Delta C = \avg{\phi\phi}{\vc}{\phi\phi}^{\text{AE}}
+   - \avg{\tilde\phi\tilde\phi + \hat n}{\vc}{\tilde\phi\tilde\phi + \hat n}^{\text{PS}}
+   = \avg{\rho^1}{\vc}{\rho^1} - \avg{\rt^1+\hat n}{\vc}{\rt^1+\hat n} .
+\end{equation}
+
+\paragraph{(1e) CoQu\'i total (compensated PAW).}
+Collecting (1c)$+$(1d) and cancelling the shared $\avg{\hat n}{\vc}{\hat n}$:
+\begin{keybox}
+\vspace{-2pt}
+\begin{equation}
+E^{\text{CoQu\'i}}_x = -\tfrac12\sum \frac{f f}{N_k}\Big[
+   \avg{\rt}{\vc}{\rt}
+ + 2\avg{\rt}{\vc}{\hat n}
+ - 2\avg{\rt^1}{\vc}{\hat n}
+ + \avg{\rho^1}{\vc}{\rho^1}
+ - \avg{\rt^1}{\vc}{\rt^1}
+\Big]
+\end{equation}
+\vspace{-10pt}
+\end{keybox}
+This is the standard \textbf{compensated (moment-matched) PAW} exchange: the smooth
+density interacts with the \emph{multipoles} $\hat n$ of the on-site AE$-$PS
+difference, plus an exact on-site AE$-$(PS$+$comp) Fock correction.
+
+\emph{Prefactor note:} $\mathrm{scl}=-1/(N_k\Omega)$ for the grid Coulomb measure and
+$\mathrm{scl_{oc}}=-1/N_k$ for the already-integrated radial \code{deltaC} are
+internally consistent and validated to machine precision against CoQu\'i's own THC
+$K_a$ (\code{test vx\_onecenter\_vs\_thc\_Ka}). The prefactors are \textbf{not} the
+issue here.
+
+\section{What ABINIT computes (= the correct AE exchange)}
+
+ABINIT builds the \textbf{oscillator} of the \emph{full AE pair density} directly
+(\code{m\_pawpwij.F90}). The on-site addition to
+$\langle\tilde\psi_m|e^{-iK\mathbf r}|\tilde\psi_n\rangle$ is (l.479, 527, 561, 859--918):
+\begin{keybox}
+\vspace{-2pt}
+\begin{equation}
+M^{\text{onsite}}_{mn}(K) = \sum_a\sum_{IJ} P^{a*}_{mI}P^{a}_{nJ}\;
+   q^{a}_{IJ}(K),\qquad
+q^{a}_{IJ}(K) = 4\pi\sum_{LM}(-i)^{L} Y_{LM}(\hat K)\,
+   G^{LM}_{l_i m_i,\,l_j m_j}\; \mathrm{ff}^{aL}_{IJ}(|K|)
+\end{equation}
+\vspace{-10pt}
+\begin{equation}
+\mathrm{ff}^{aL}_{IJ}(K) = \int_0^{r_a} j_L(Kr)\,
+   \big[\,\phi_I\phi_J - \tilde\phi_I\tilde\phi_J\,\big](r)\; dr
+\end{equation}
+\vspace{-8pt}
+\end{keybox}
+i.e.\ the transform of the \textbf{full AE$-$PS on-site pair density $D$, with the
+true radial shape and NO compensation charge} (\code{phiphj - tphitphj}, l.561; the
+\code{use\_pawnhat0 = 0} default in \code{m\_sigx.F90:155}). The exchange is then
+\begin{equation}
+E^{\text{ABINIT}}_x = -\tfrac12\sum \frac{f f}{N_k}\,
+   \avg{\rt + D}{\vc}{\rt + D}
+ = -\tfrac12\sum \frac{f f}{N_k}\Big[
+   \avg{\rt}{\vc}{\rt} + 2\avg{\rt}{\vc}{D} + \avg{D}{\vc}{D} \Big].
+\end{equation}
+Because $\rt + D$ \textbf{is} the exact AE pair density (up to the \code{ecutsigx}
+truncation of the sharp $D$, which we verified converged: on-site moves $<1$~mHa
+from $\code{ecutsigx}=25\to50$), this equals the true AE exchange. This is the
+Arnaud--Alouani / Shishkin--Kresse PAW-GW oscillator.
+
+\section{The difference (derivation)}
+
+Subtract \S\,(1e) from \S3, per pair, using identity~\eqref{eq:id}:
+\begin{equation}
+E^{\text{ABINIT}}_x - E^{\text{CoQu\'i}}_x
+= -\tfrac12\sum\frac{ff}{N_k}\Big[
+   2\avg{\rt}{\vc}{D} - 2\avg{\rt}{\vc}{\hat n}
+ + 2\avg{\rt^1}{\vc}{\hat n} - 2\avg{\rt^1}{\vc}{D} \Big]
+\end{equation}
+\begin{keybox}
+\vspace{-2pt}
+\begin{equation}
+\boxed{\;
+E^{\text{ABINIT}}_x - E^{\text{CoQu\'i}}_x
+= -\sum \frac{f_m f_n}{N_k}\;
+   \avg{\rt_{mn} - \rt^{1}_{mn}}{\vc}{D_{mn} - \hat n_{mn}}
+\;}
+\end{equation}
+\vspace{-10pt}
+\end{keybox}
+
+This is the term CoQu\'i drops. Its two factors are each localised in/near the
+augmentation sphere:
+\begin{itemize}[leftmargin=1.4em]
+  \item $\rt - \rt^1$ --- the smooth pair density minus its on-site PS partial-wave
+    expansion. Vanishes only if the PS partial waves are \emph{complete} inside the
+    sphere (the usual PAW assumption $\rt|_{\rm sphere} = \rt^1$).
+  \item $D - \hat n$ --- the AE$-$PS on-site difference minus its multipole moments:
+    the \textbf{shape of $D$ beyond its moments}. Zero moments by construction,
+    nonzero shape.
+\end{itemize}
+
+The compensated PAW total-energy formalism sets this cross term to zero. That is an
+excellent approximation for the \emph{Hartree/total energy} (long-ranged, moment
+dominated) but \textbf{not} for \textbf{exchange}, which is short-ranged and
+sensitive to the pair-density shape inside the core. For Si the numbers are:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lr}
+\toprule
+quantity (Si $a=10.20$, $4\times4\times4$, finite-size off) & value (Ha)\\
+\midrule
+smooth only, both codes (identical to 6~$\mu$Ha) & $-1.77964$\\
+ABINIT on-site contribution $2\avg{\rt}{\vc}{D}+\avg{D}{\vc}{D}$ & $\mathbf{+0.0925}$\\
+CoQu\'i $\avg{\rt}{\vc}{\hat n}$-type augmentation (1b/1c extra) & $+0.0481$\\
+CoQu\'i \code{deltaC} one-center (1d) & $-0.0067$\\
+CoQu\'i on-site total & $\mathbf{+0.0414}$\\
+\textbf{missing cross term} $-\avg{\rt-\rt^1}{\vc}{D-\hat n}$ & $\mathbf{\approx +0.0511}$\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent
+The sign is consistent: CoQu\'i's on-site is too small (recovers $\sim$44\,\%), so
+its total exchange is too \emph{negative} by $0.052$~Ha (the missing term is
+repulsive/less-binding).
+
+\section{What I believe is the correct expression}
+
+Two mathematically equivalent routes recover the missing term. Both are ``correct'';
+they differ in numerical convenience.
+
+\subsection*{Route A --- shape-restored oscillator (ABINIT/Arnaud--Alouani; recommended)}
+Replace CoQu\'i's compensation-charge augmentation (\S\,1b) with the \textbf{full
+AE$-$PS pair-density form factor}, and then \textbf{drop \code{deltaC} entirely}:
+\begin{equation}
+\rho^{\text{full}}_{na}(G) = \rt_{na}(G)
+   + \sum_a\sum_{IJ} P^{a*}_{nI}(k_q)P^{a}_{aJ}(k_p)\,
+     \mathcal{Q}^{IJ}_a(K)\,e^{-iK\tau_a},
+\quad
+\mathcal{Q}^{IJ}_a(K) = \!\int_0^{r_a}\! j_L(Kr)\,[\phi_I\phi_J - \tilde\phi_I\tilde\phi_J]\,dr \times (\text{ang.}),
+\end{equation}
+i.e.\ use \code{pfunc $-$ ptfunc} (AE$-$PS product) in the radial Hankel transform
+\emph{instead of} \code{qfuncl} (the compensation moments). Structurally this is a
+one-line change to \code{build\_qrad\_tab} / \code{evaluate\_Q\_IJ\_at\_K}: feed
+\code{pfunc $-$ ptfunc} rather than the moment$\times$shape \code{qfuncl}. Then
+$K^{\text{sm+aug}}$ alone equals the exact AE exchange and the \code{deltaC} block
+(\S\,1d) must be removed (it would double count).
+\begin{itemize}[nosep,leftmargin=1.4em]
+  \item \textbf{Pro:} exact, matches ABINIT/VASP, no separate one-center kernel.
+  \item \textbf{Con:} $D$ is sharp; the augmentation FFT mesh (\code{fft\_mesh\_aug})
+    must resolve $\mathrm{ff}^L_{IJ}(K)$ out to the same effective cutoff ABINIT uses
+    (\code{ecutsigx}; here converged by $\sim$50~Ha). This is the reason the
+    compensated route was chosen originally --- $\hat n$ is smooth and grid-friendly.
+\end{itemize}
+
+\subsection*{Route B --- keep compensation, add the missing cross term to \code{deltaC}}
+Keep \S\,1b/1c as is, but redefine the one-center kernel so that it also supplies
+$-\avg{\rt-\rt^1}{\vc}{D-\hat n}$. In practice this means the on-site Fock must be
+evaluated between the \emph{smooth-minus-onsite} density and the \emph{shape residual}
+$D-\hat n$, not only the pure on-site AE/PS products. This is harder to cast as a
+frozen $n_h^4$ matrix because $\rt-\rt^1$ depends on the actual smooth orbitals, not
+just the projector amplitudes --- so Route A is cleaner.
+
+\subsection*{Recommendation}
+Implement \textbf{Route A}: swap the augmentation form factor from the compensation
+charge (\code{qfuncl}, moments) to the full AE$-$PS partial-wave product
+(\code{pfunc $-$ ptfunc}, shape), on a mesh converged like ABINIT's \code{ecutsigx},
+and drop \code{deltaC} from the exchange. Validate against the numbers here (Si
+on-site must go $+0.0414 \to +0.0925$~Ha; total vv exchange
+$-1.7382 \to -1.6863$~Ha; per-band $\Sigma_x$ must match ABINIT \code{iszoff}
+band-for-band). Keep the compensation-charge path for the \textbf{Hartree} deeq
+(where it is correct and grid-friendly).
+
+\paragraph{Caveat / next check.} The identity in \S4 assumes the exchange is the clean
+bilinear $\avg{\rho_{mn}}{\vc}{\rho_{mn}}$ and that CoQu\'i's terms map exactly as
+written above; the $0.052$~Ha numerical closure supports this. Before implementing,
+reproduce the decomposition at a second system (e.g.\ LiH or a 3$d$ oxide, where
+on-site exchange is larger) to confirm the missing-term identity holds beyond Si $sp$.
+
+\end{document}
