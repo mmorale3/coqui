@@ -58,9 +58,10 @@ namespace hamilt
  *           with global shape = (nspin, nkpts, nbnd, nbnd)
  */ 
 template<MEMORY_SPACE MEM = HOST_MEMORY>
-auto H0(mf::MF &mf, boost::mpi3::communicator &comm, pseudopot *psp,  
-        nda::range k_range = {-1,-1}, nda::range b_range = {-1,-1}, 
-        std::array<long,4> pgrid = {0}, std::array<long,4> bz = {1,1,2048,2048})
+auto H0(mf::MF &mf, boost::mpi3::communicator &comm, pseudopot *psp,
+        nda::range k_range = {-1,-1}, nda::range b_range = {-1,-1},
+        std::array<long,4> pgrid = {0}, std::array<long,4> bz = {1,1,2048,2048},
+        bool skip_pp = false)
 {
   if(k_range == nda::range{-1,-1}) k_range = nda::range(mf.nkpts_ibz());
   if(b_range == nda::range{-1,-1}) b_range = nda::range(mf.nbnd());
@@ -69,10 +70,10 @@ auto H0(mf::MF &mf, boost::mpi3::communicator &comm, pseudopot *psp,
     using larray = memory::array<MEM,ComplexType,4>;
     utils::check(psp != nullptr, "Error in H0: Missing pseudopot object.");
     auto psi = mf::read_distributed_orbital_set_ibz<larray>(mf,comm,'w',pgrid,
-                               nda::range(-1,-1), k_range, b_range, bz); 
+                               nda::range(-1,-1), k_range, b_range, bz);
     memory::array_view<MEM,ComplexType,3> *p3=nullptr;
     memory::array_view<MEM,ComplexType,4> *p4=nullptr;
-    return detail::gen_H0<MEM>(mf,comm,psp,k_range,b_range,psi,p3,p4);
+    return detail::gen_H0<MEM>(mf,comm,psp,k_range,b_range,psi,p3,p4,skip_pp);
   } else {
     utils::check(mf.mf_type() == mf::pyscf_source, "Source mismacth");
     utils::check(k_range.size() == mf.nkpts_ibz(), "No k_range with pyscf backend yet.");
@@ -108,6 +109,32 @@ void set_H0(mf::MF &mf, pseudopot *psp, math::shm::shared_array<Array_4D_t> &sH0
   }
   sH0_skij.communicator()->barrier();
   sH0_skij.all_reduce();
+}
+
+/**
+ * Diagnostic: kinetic-only one-body Hamiltonian (skips the pseudopotential /
+ * external + one-center terms). Used to split e_1e = Tr[Dm*H0] into the smooth
+ * kinetic energy Tr[Dm*T] and the remaining external/pseudopotential part, for
+ * component-by-component comparison against other codes (e.g. ABINIT).
+ */
+template<nda::MemoryArrayOfRank<4> Array_4D_t>
+void set_kinetic(mf::MF &mf, pseudopot *psp, math::shm::shared_array<Array_4D_t> &sT_skij) {
+  long np = sT_skij.internode_comm()->size();
+  long np_s = (np % mf.nspin()== 0)? mf.nspin() : 1;
+  long np_k = utils::find_proc_grid_max_npools(np/np_s, (long)mf.nkpts_ibz(), 1.0);
+  long np_i = np / (np_s*np_k);
+  std::array<long, 4> pgrid = {np_s, np_k, np_i, 1};
+  long blk_i = std::min( {(long)1024, (mf.nbnd())/np_i});
+  std::array<long, 4> bsize = {1, 1, blk_i, 2048};
+  if (sT_skij.node_comm()->root()) {
+    auto dT  = hamilt::H0<HOST_MEMORY>(mf, *sT_skij.internode_comm(), psp,
+                                       nda::range(mf.nkpts_ibz()), nda::range(mf.nbnd()),
+                                       pgrid, bsize, /*skip_pp=*/true);
+    auto T_loc = sT_skij.local();
+    T_loc(dT.local_range(0), dT.local_range(1), dT.local_range(2), dT.local_range(3)) = dT.local();
+  }
+  sT_skij.communicator()->barrier();
+  sT_skij.all_reduce();
 }
 
 /**

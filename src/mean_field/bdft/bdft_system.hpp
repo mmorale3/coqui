@@ -36,6 +36,7 @@
 #include "utilities/mpi_context.h"
 #include "utilities/check.hpp"
 #include "utilities/concepts.hpp"
+#include "utilities/madelung_utils.hpp"
 
 #include "mean_field/mf_source.hpp"
 #include "mean_field/symmetry/bz_symmetry.hpp"
@@ -329,6 +330,20 @@ namespace mf {
         fft_mesh_aug = utils::generate_consistent_fft_mesh(fft_mesh_aug,_symm.symm_list,1e-4,"bdft_system",true);
         nnr     = fft_mesh(0)*fft_mesh(1)*fft_mesh(2);
         nnr_aug = fft_mesh_aug(0)*fft_mesh_aug(1)*fft_mesh_aug(2);
+
+        // The Madelung constant is stored in the checkpoint (System group).
+        // External converters (e.g. abinit2coqui) may write 0 as a stub, which
+        // silently disables the q->0 exchange finite-size correction
+        // (HF_K_correction uses -madelung*S*Dm*S). If the stored value is zero,
+        // compute it here from the cell + k-mesh exactly as qe_system does, so
+        // bdft-sourced mean fields get the same finite-size treatment as QE.
+        if( std::abs(madelung) < 1e-12 ) {
+          auto rg = nda::range(ndims);
+          madelung = -2 * utils::madelung(latt(rg,rg), recv(rg,rg),
+                                          _symm.kp_grid(rg), fft_mesh(rg), 1e-10);
+          app_log(2, "  bdft_system: stored madelung_constant was 0; "
+                     "computed from cell/k-mesh = {} Ha", madelung);
+        }
 
         // MAM: should this be size nspin_in_basis?
         //      In any case, if nspin_in_basis!=nspin, the basis can't be MO

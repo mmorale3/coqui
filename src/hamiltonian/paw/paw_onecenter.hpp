@@ -503,8 +503,12 @@ nda::array<ComplexType,3> pseudopot::compute_paw_deeq(
 {
     long nspin = nii.extent(0);
     double ns_scl = (nspin == 1 && npol == 1) ? 2.0 : 1.0;
-    auto becsum = hamilt::paw::compute_becsum_diagonal(
-        Pskna_view(), nii, ityp, nh, ofs, npol);
+    // Full-BZ becsum (symmetry-correct): the one-center radial Hartree must use
+    // the same full-BZ compensation occupation as the smooth/aug path. The
+    // IBZ-only sum gave a residual V_H error on symmetry-reduced meshes.
+    auto becsum = hamilt::paw::compute_becsum_diagonal_symm(
+        *mpi, *this, nii, kp_to_ibz, kp_trev, kp_symm, kpts,
+        lattv, recv, symm_list, npol);
     for (long ia = 0; ia < becsum.extent(0); ++ia)
       for (long I = 0; I < becsum.extent(1); ++I)
         for (long J = 0; J < becsum.extent(2); ++J)

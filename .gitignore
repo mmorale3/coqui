@@ -36,3 +36,7 @@
 
 # OMC tooling state
 .omc/
+
+# large local test artifact / python cache
+test.h5
+**/__pycache__/

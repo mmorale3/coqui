@@ -39,6 +39,7 @@
 #include "numerics/distributed_array/nda.hpp"
 #include "hamiltonian/v_h.hpp"
 #include "hamiltonian/pseudo/pseudopot.h"
+#include "hamiltonian/paw/paw_symmetry.hpp"   // full-BZ projector lift
 
 namespace hamilt::paw {
 
@@ -265,6 +266,58 @@ inline nda::array<ComplexType,1> compute_rho_aug_density_r(
     return rho_aug_r;
 }
 
+/**
+ * Full-BZ becsum (diagonal occupations) — symmetry-correct.
+ *
+ * compute_becsum_diagonal sums only the IBZ k-points with wk = 1/N_ibz, which is
+ * correct ONLY for nosym/full-BZ. For a symmetry-reduced IBZ the compensation
+ * charge must match the smooth density's full-BZ sum (v_h_impl loops the full
+ * BZ via transform_k2g). This helper lifts the projectors to the full BZ — the
+ * same machinery the exchange path already uses (compute_Pskna_full_bz) — and
+ * accumulates over N_full with wk = 1/N_full. Occupations are symmetry-invariant
+ * so they expand by kp_to_ibz indexing. For nosym (IBZ == full BZ) this reduces
+ * to compute_becsum_diagonal unchanged.
+ *
+ * Fixes the symmetry-reduced V_H augmentation error in the DIRECT path
+ * (Vhartree / deeq reference); the THC path was already correct (2026-06-11).
+ */
+template<class MPI_t, typename occ_t, typename kti_t, typename ktr_t,
+         typename ksy_t, typename kp_t>
+inline nda::array<double,3> compute_becsum_diagonal_symm(
+    MPI_t& mpi, pseudopot const& psp, occ_t const& nii,
+    kti_t const& kp_to_ibz, ktr_t const& kp_trev, ksy_t const& kp_symm,
+    kp_t const& kpts,
+    nda::stack_array<double,3,3> const& lattv,
+    nda::stack_array<double,3,3> const& recv,
+    std::vector<utils::symm_op> const& symm_list, int npol)
+{
+    auto const& ityp = psp.ityp_view();
+    auto const& sps  = psp.paw_species_view();
+    auto atom_perm_inv = build_atom_permutation_inverse(
+        psp.atom_pos_cart_view(), ityp, lattv, recv, symm_list);
+    int lmax_proj = 0;
+    for (long nt = 0; nt < (long)sps.size(); ++nt)
+        for (long b = 0; b < sps[nt].lll.extent(0); ++b)
+            lmax_proj = std::max(lmax_proj, (int)sps[nt].lll(b));
+    auto wigner_d = build_wigner_d_real(symm_list, lattv, lmax_proj);
+    auto sPfull = compute_Pskna_full_bz(
+        psp, kp_to_ibz, kp_symm, kp_trev, kpts, symm_list,
+        atom_perm_inv, wigner_d, npol, mpi);
+    auto Pfull = sPfull.local();   // (nspin, nk_full, npol*nkb, nbnd)
+
+    long nspin   = nii.extent(0);
+    long nk_full = (long)kp_to_ibz.extent(0);
+    long nbnd    = nii.extent(2);
+    nda::array<ComplexType,3> nii_full(nspin, nk_full, nbnd);
+    for (long s = 0; s < nspin; ++s)
+        for (long K = 0; K < nk_full; ++K)
+            for (long n = 0; n < nbnd; ++n)
+                nii_full(s, K, n) = nii(s, (long)kp_to_ibz(K), n);
+
+    return compute_becsum_diagonal(Pfull, nii_full, ityp,
+                                   psp.nh_view(), psp.ofs_view(), npol);
+}
+
 } // namespace hamilt::paw
 
 namespace hamilt {
@@ -306,9 +359,12 @@ void v_h(utils::mpi_context_t<boost::mpi3::communicator,
     // separate post-hoc augmentation FFT.
     nda::array<ComplexType,1> rho_aug_r;
     if (psp.pp_type() != pp_ncpp_t) {
-      auto becsum = ::hamilt::paw::compute_becsum_diagonal(
-          psp.Pskna_view(), nii, psp.ityp_view(), psp.nh_view(),
-          psp.ofs_view(), npol);
+      // Full-BZ becsum (symmetry-correct). The IBZ-only sum was wrong for
+      // symmetry-reduced meshes (mismatched 1/N_ibz vs the ×N_full in
+      // compute_rho_aug_density_r), giving a ~3-5% V_H error under symmetry.
+      auto becsum = ::hamilt::paw::compute_becsum_diagonal_symm(
+          mpi, psp, nii, kp_to_ibz, kp_trev, kp_symm, kpts,
+          lattv, recv, symm_list, npol);
       rho_aug_r = ::hamilt::paw::compute_rho_aug_density_r(
           mpi, psp, becsum, mesh, recv, (long)kp_to_ibz.shape(0));
     }

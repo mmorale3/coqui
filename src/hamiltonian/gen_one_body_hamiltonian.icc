@@ -35,10 +35,10 @@ namespace hamilt::detail
  *           with global shape = (nspin, nkpts, nbnd, nbnd)
  */
 template<MEMORY_SPACE MEM, nda::ArrayOfRank<3> Arr3, nda::ArrayOfRank<4> Arr4>
-auto gen_H0(mf::MF& mf, boost::mpi3::communicator& comm, pseudopot *psp, 
+auto gen_H0(mf::MF& mf, boost::mpi3::communicator& comm, pseudopot *psp,
             nda::range k_range, nda::range b_range,
             memory::darray_t<memory::array<MEM,ComplexType,4>, mpi3::communicator>& psi,
-            Arr3 const* p3, Arr4 const* p4)
+            Arr3 const* p3, Arr4 const* p4, bool skip_pp = false)
 {
   decltype(nda::range::all) all;
   using larray = memory::array<MEM,ComplexType,4>;
@@ -62,13 +62,17 @@ auto gen_H0(mf::MF& mf, boost::mpi3::communicator& comm, pseudopot *psp,
   // add kinetic part to hpsi
   hamilt::add_kinetic(npol,kpts,*wfc_g,psi,hpsi);
 
-  // add local pp to hpsi, non-local pp to Hij
-  if(p3 != nullptr)
-    psp->add_Vpp(comm,k_range,b_range,*p3,psi,hpsi,Hij);
-  else if(p4 != nullptr)
-    psp->add_Vpp(comm,k_range,b_range,*p4,psi,hpsi,Hij);
-  else 
-    psp->add_Vpp(comm,k_range,b_range,psi,hpsi,Hij);
+  // add local pp to hpsi, non-local pp to Hij.
+  // skip_pp=true leaves only the kinetic term (diagnostic: split e_1e into
+  // kinetic vs external/pseudopotential + one-center contributions).
+  if(!skip_pp) {
+    if(p3 != nullptr)
+      psp->add_Vpp(comm,k_range,b_range,*p3,psi,hpsi,Hij);
+    else if(p4 != nullptr)
+      psp->add_Vpp(comm,k_range,b_range,*p4,psi,hpsi,Hij);
+    else
+      psp->add_Vpp(comm,k_range,b_range,psi,hpsi,Hij);
+  }
 
   // Combine the local and non-local parts:
   // Hij = Hij + conj(psi(i,:)) * hpsi(j,:) = conj( conj(Hij) + psi(i,:) * conj(hpsi(j,:)) ) 

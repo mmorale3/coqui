@@ -88,6 +88,45 @@ double rpa_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_
   app_log(2, "RPA energy:                {} a.u.", e_rpa);
   app_log(2, "Total energy:              {} a.u.\n", e_1e_new + e_hf_new + e_rpa);
 
+  // Diagnostic: split e_1e = Tr[Dm*H0] into the smooth kinetic energy Tr[Dm*T]
+  // and the remaining external/pseudopotential + one-center part, for
+  // component-by-component comparison against ABINIT (kinetic / local_psp / ...).
+  {
+    auto sT_skij = math::shm::make_shared_array<Array_view_4D_t>(
+        *mpi, {mf->nspin(), mf->nkpts_ibz(), mf->nbnd(), mf->nbnd()});
+    hamilt::set_kinetic(*mf, dyson.PSP(), sT_skij);
+    auto [e_kinetic, e_dummy] = eval_hf_energy(sDm_skij, sF_skij, sT_skij, k_weight, false);
+    app_log(2, "Kinetic energy:            {} a.u.", e_kinetic);
+    app_log(2, "External+1center energy:   {} a.u.\n", e_1e_new - e_kinetic);
+  }
+
+  // Diagnostic Hartree/Exchange split of the Fock energy (for code-vs-code
+  // comparison, e.g. ABINIT "New Exchange energy"). Note: this is the smooth +
+  // valence-valence one-center (K_a) exchange only; PAW core-valence exchange
+  // (ex_cvij) is frozen into H0 and therefore counted in the one-electron term.
+  if (mb_solver.hf != nullptr) {
+    mb_solver.hf->evaluate(sF_skij, sDm_skij.local(), mb_eri.hf_eri->get(),
+                           dyson.sS_skij().local(), true, false);
+    mpi->comm.barrier();
+    auto [e1_h, e_hartree] = eval_hf_energy(sDm_skij, sF_skij, dyson.sH0_skij(), k_weight, false);
+    mb_solver.hf->evaluate(sF_skij, sDm_skij.local(), mb_eri.hf_eri->get(),
+                           dyson.sS_skij().local(), false, true);
+    mpi->comm.barrier();
+    auto [e1_x, e_exchange] = eval_hf_energy(sDm_skij, sF_skij, dyson.sH0_skij(), k_weight, false);
+    app_log(2, "Hartree energy:            {} a.u.", e_hartree);
+    app_log(2, "Exchange energy (vv):      {} a.u.\n", e_exchange);
+    // Per-state exchange self-energy diag at k=0 (Gamma) in eV, for direct
+    // comparison with ABINIT's GW "SigX" column (vv-only; cv is in H0).
+    if (mpi->comm.root()) {
+      auto F = sF_skij.local();
+      int nb = std::min(10, (int)mf->nbnd());
+      app_log(2, "Per-state Sigma_x^vv at k=0 (eV):");
+      for (int n = 0; n < nb; ++n)
+        app_log(2, "   band {}: {:.4f}", n, F(0, 0, n, n).real() * 27.211386245988);
+      app_log(2, "");
+    }
+  }
+
   Timer.start("WRITE");
   if (mpi->comm.root()) {
     std::string filename = mb_state.coqui_prefix + ".mbpt.h5";

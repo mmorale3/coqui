@@ -23,6 +23,7 @@
 
 #include "catch2/catch.hpp"
 #include "stdio.h"
+#include <cstdlib>
 #include <filesystem>
 
 #include "mpi3/environment.hpp"
@@ -2012,6 +2013,14 @@ void run_isdf_threshold_convergence(mpi_context_t& mpi,
     double eVX_diag=0, eVX_off=0;     // diag vs off-diag V_x abs error (Frob²)
     double sVH_fro=0, sVX_fro=0;      // self-convergence (vs converged-ISDF THC)
     double sVX_diag=0, sVX_off=0;
+    // DIAGNOSTIC: localize the V_H error. Split into the low-band block
+    // (i,j < 16, what the 16-band fixture samples) vs any pair touching a high
+    // virtual (>=16); track the single worst V_H element. (single-rank valid)
+    double eVH_low=0, eVH_high=0;
+    long wi=-1, wj=-1; double worstH=-1.0; ComplexType wthc{}, wref{};
+    // Fixed-element probe: V_H[0,0] (s=0,k=0). On nosym THC==direct==truth, so
+    // comparing this across nosym/sym tells us WHICH path is wrong.
+    ComplexType vh00_thc{}, vh00_ref{}; bool have00=false;
     for (auto [is,s] : itertools::enumerate(rng_s))
       for (auto [ik,k] : itertools::enumerate(rng_k))
         for (auto [ii,i] : itertools::enumerate(rng_i))
@@ -2020,6 +2029,12 @@ void run_isdf_threshold_convergence(mpi_context_t& mpi,
             ComplexType dX = VX(s,k,i,j) - VX_ref(is,ik,ii,ij);
             eVH_max = std::max(eVH_max, std::abs(dH));
             eVX_max = std::max(eVX_max, std::abs(dX));
+            { double aH = std::abs(dH);
+              if (i < 16 && j < 16) eVH_low += aH*aH; else eVH_high += aH*aH;
+              if (aH > worstH) { worstH = aH; wi = i; wj = j;
+                wthc = VH(s,k,i,j); wref = VH_ref(is,ik,ii,ij); } }
+            if (s==0 && k==0 && i==0 && j==0) {
+              vh00_thc = VH(s,k,i,j); vh00_ref = VH_ref(is,ik,ii,ij); have00 = true; }
             eVH_fro += std::norm(dH);
             eVX_fro += std::norm(dX);
             if (i == j) eVX_diag += std::norm(dX);
@@ -2042,6 +2057,8 @@ void run_isdf_threshold_convergence(mpi_context_t& mpi,
     sVX_fro = std::sqrt(mpi.comm.all_reduce_value(sVX_fro, std::plus<>{}));
     sVX_diag = std::sqrt(mpi.comm.all_reduce_value(sVX_diag, std::plus<>{}));
     sVX_off  = std::sqrt(mpi.comm.all_reduce_value(sVX_off,  std::plus<>{}));
+    eVH_low  = std::sqrt(mpi.comm.all_reduce_value(eVH_low,  std::plus<>{}));
+    eVH_high = std::sqrt(mpi.comm.all_reduce_value(eVH_high, std::plus<>{}));
     if (mpi.comm.root()) {
       // Absolute error vs the exact hamiltonian (Vhartree / Vexchange).
       app_log(2, "CONVCSV,{},{:.3e},{},{:.6e},{:.6e},{:.6e},{:.6e},{:.6e},{:.6e}",
@@ -2054,7 +2071,87 @@ void run_isdf_threshold_convergence(mpi_context_t& mpi,
       app_log(2, "CONVVX_SPLIT,{},{:.3e},{},absVX_diag={:.6e},absVX_off={:.6e},"
                  "selfVX_diag={:.6e},selfVX_off={:.6e}",
               tag, thr, Np, eVX_diag, eVX_off, sVX_diag, sVX_off);
+      // DIAGNOSTIC: where does the V_H error live?
+      app_log(2, "CONVWORST,{},{:.3e},{},VHlow_fro={:.6e},VHhigh_fro={:.6e},"
+                 "worst|dVH|={:.4e},i={},j={},THC={:+.6e},ref={:+.6e}",
+              tag, thr, Np, eVH_low, eVH_high, worstH, wi, wj,
+              wthc.real(), wref.real());
+      app_log(2, "CONV00,{},{:.3e},{},have={},VH00_THC={:+.8e},VH00_ref={:+.8e}",
+              tag, thr, Np, (int)have00, vh00_thc.real(), vh00_ref.real());
     }
+  }
+}
+
+// Exchange-potential sensitivity probe for the V_x THC-vs-direct floor.
+// NCPP LiH n100 (no augmentation): V_x self-converges but sits ~1.3e-3 from the
+// direct Vexchange regardless of ISDF rank. Vary div_treatment (ignore_g0 vs
+// gygi), ISDF threshold, and THC ecut to localize the origin.
+TEST_CASE("vx_sensitivity_ncpp", "[hamilt][thc][hf][!benchmark]")
+{
+  using math::shm::make_shared_array;
+  auto all = nda::range::all;
+  auto& mpi = utils::make_unit_test_mpi_context();
+  std::string base = std::string(std::getenv("HOME"))
+                   + "/ceph/CoQui/PAW_comparisons_w150/runs/";
+  auto mf_ptr = std::make_shared<mf::MF>(
+      mf::default_MF(mpi, mf::qe_source, base + "oncv/w150_n100/nscf/out/",
+                     "lih", mf::h5_input_type));
+  auto& mfobj = *mf_ptr;
+  long nspin = mfobj.nspin(), nk_ibz = mfobj.nkpts_ibz(), nbnd = mfobj.nbnd();
+  double mad = mfobj.madelung();
+  double ecutrho = mfobj.ecutrho();
+  app_log(2, "VXSENS_INFO madelung={:.6e} ecutrho={:.3f} nbnd={} nk_ibz={}",
+          mad, ecutrho, nbnd, nk_ibz);
+
+  memory::array<HOST_MEMORY, ComplexType, 3> nii(nspin, nk_ibz, nbnd);
+  nii() = mfobj.occ()(all, nda::range(nk_ibz), all);
+  auto sDm = make_shared_array<array_view_4d_t>(mpi, {nspin, nk_ibz, nbnd, nbnd});
+  if (mpi.node_comm.root()) {
+    sDm.local()() = ComplexType(0.0);
+    for (long s = 0; s < nspin; ++s) for (long k = 0; k < nk_ibz; ++k)
+      for (long a = 0; a < nbnd; ++a) sDm.local()(s, k, a, a) = nii(s, k, a);
+  }
+  mpi.node_comm.barrier();
+  hamilt::pseudopot V(mfobj);
+  auto sS = make_shared_array<array_view_4d_t>(mpi, {nspin, nk_ibz, nbnd, nbnd});
+  hamilt::set_ovlp(mfobj, sS);
+  auto dVX = hamilt::Vexchange<HOST_MEMORY>(mfobj, mpi.comm, &V, nii);
+  auto VXref = nda::to_host(dVX.local());
+
+  auto run = [&](std::string lbl, methods::div_treatment_e div, double thr, double ecut) {
+    auto pt = methods::make_thc_reader_ptree(0, "", "incore", "", "bdft", thr, ecut);
+    pt.put("paw_aug", true); pt.put("paw_isdf_metric", "coulomb"); pt.put("paw_isdf_tol", 1e-12);
+    methods::thc_reader_t thc(mf_ptr, pt);
+    int Np = thc.Np();
+    auto sVX = make_shared_array<array_view_4d_t>(mpi, {nspin, nk_ibz, nbnd, nbnd});
+    { methods::solvers::hf_t hf(div);
+      hf.evaluate(sVX, sDm.local(), thc, sS.local(), false, true); }
+    auto VX = nda::to_host(sVX.local());
+    double fro_ref=0, e_fro=0, e_diag=0, e_off=0;
+    auto rs=dVX.local_range(0); auto rk=dVX.local_range(1);
+    auto ri=dVX.local_range(2); auto rj=dVX.local_range(3);
+    for (auto [is,s] : itertools::enumerate(rs))
+      for (auto [ik,k] : itertools::enumerate(rk))
+        for (auto [ii,i] : itertools::enumerate(ri))
+          for (auto [ij,j] : itertools::enumerate(rj)) {
+            ComplexType d = VX(s,k,i,j) - VXref(is,ik,ii,ij);
+            fro_ref += std::norm(VXref(is,ik,ii,ij)); e_fro += std::norm(d);
+            if (i==j) e_diag += std::norm(d); else e_off += std::norm(d);
+          }
+    fro_ref = std::sqrt(mpi.comm.all_reduce_value(fro_ref, std::plus<>{}));
+    e_fro = std::sqrt(mpi.comm.all_reduce_value(e_fro, std::plus<>{}));
+    e_diag = std::sqrt(mpi.comm.all_reduce_value(e_diag, std::plus<>{}));
+    e_off = std::sqrt(mpi.comm.all_reduce_value(e_off, std::plus<>{}));
+    app_log(2, "VXSENS,{},Np={},relVX={:.5e},absdiag={:.5e},absoff={:.5e}",
+            lbl, Np, e_fro/std::max(1e-30,fro_ref), e_diag, e_off);
+  };
+
+  SECTION("ncpp n100 exchange sensitivity") {
+    run("ig0__e90__t1e-6",   methods::ignore_g0, 1e-6, 90.0);
+    run("gygi_e90__t1e-6",   methods::gygi,      1e-6, 90.0);
+    run("ig0__e90__t1e-7",   methods::ignore_g0, 1e-7, 90.0);
+    run("ig0__erho_t1e-6",   methods::ignore_g0, 1e-6, ecutrho);
+    run("gygi_erho_t1e-6",   methods::gygi,      1e-6, ecutrho);
   }
 }
 
@@ -2062,39 +2159,62 @@ TEST_CASE("isdf_threshold_convergence", "[hamilt][thc][convergence][!benchmark]"
 {
   auto& mpi = utils::make_unit_test_mpi_context();
   std::vector<double> thr = {3e-2, 1e-2, 3e-3, 1e-3, 3e-4, 1e-4, 3e-5, 1e-5, 3e-6, 1e-6};
-  // /tmp DFT fixtures: LiH 2×2×2, 50 bands, ecutwfc=125 Ry (= 62.5 Ha).
-  // THC ISDF ecut = ecutwfc_Ha × 1.25 = 78.125 Ha.
-  const double thc_ecut = 62.5 * 1.25;
+  // PAPER RUN: THC ISDF ecut = 1.2 x ecutwfc(150 Ry = 75 Ha) = 90 Ha (spec).
+  // With the full-BZ becsum symmetry fix (v_h_paw + compute_paw_deeq), V_H now
+  // converges under symmetry like V_x (no more 3-5% floor).
 
-  SECTION("lih_50bnd ecut125 (USPP, PBE)") {
-    auto mf_ptr = std::make_shared<mf::MF>(
-        mf::default_MF(mpi, mf::qe_source, "/tmp/lih_conv50_uspp_hf/", "pwscf",
+  // 100- and 250-band LiH MFs at ecutwfc=150 Ry, generated in
+  // PAW_comparisons_w150. ISDF-rank convergence vs alpha = N_mu / N_bnd.
+  // NOTE: path-hardcoded; results-only edit, not for commit.
+  const std::string base = std::string(std::getenv("HOME"))
+                         + "/ceph/CoQui/PAW_comparisons_w150/runs/";
+  auto load = [&](std::string sub) {
+    return std::make_shared<mf::MF>(
+        mf::default_MF(mpi, mf::qe_source, base + sub + "/nscf/out/", "lih",
                        mf::h5_input_type));
-    run_isdf_threshold_convergence<HOST_MEMORY>(*mpi, mf_ptr, "USPP", thr, thc_ecut);
-  }
-  SECTION("lih_50bnd ecut125 (PAW, PBE)") {
-    auto mf_ptr = std::make_shared<mf::MF>(
-        mf::default_MF(mpi, mf::qe_source, "/tmp/lih_conv50_paw_hf/", "pwscf",
-                       mf::h5_input_type));
-    run_isdf_threshold_convergence<HOST_MEMORY>(*mpi, mf_ptr, "PAW", thr, thc_ecut);
-  }
+  };
 
-  // HF fixtures (16 bands, ecutwfc=100 Ry). On these the DIAGONAL of the Fock
-  // matrix in the band basis IS the validated QE eigenvalue, so the V_x
-  // diag/off-diag split (CONVVX_SPLIT) confirms: Vexchange's ½ one-center
-  // reproduces the diagonal (vs QE/THC) while disagreeing off-diagonal.
-  SECTION("lih_kp222_nbnd16 (PAW, HF) — diag/offdiag confirm") {
-    auto mf_ptr = std::make_shared<mf::MF>(
-        mf::default_MF(mpi, "qe_lih222_paw_hf", mf::h5_input_type));
-    run_isdf_threshold_convergence<HOST_MEMORY>(*mpi, mf_ptr, "PAW_HF",
-        {1e-3, 1e-4, 1e-5, 1e-6}, 62.5);
-  }
-  SECTION("lih_kp222_nbnd16 (USPP, HF) — diag/offdiag confirm") {
-    auto mf_ptr = std::make_shared<mf::MF>(
-        mf::default_MF(mpi, "qe_lih222_uspp_hf", mf::h5_input_type));
-    run_isdf_threshold_convergence<HOST_MEMORY>(*mpi, mf_ptr, "USPP_HF",
-        {1e-3, 1e-4, 1e-5, 1e-6}, 62.5);
-  }
+  SECTION("LiH NCPP(oncv) n100") { auto m = load("oncv/w150_n100");
+    run_isdf_threshold_convergence<HOST_MEMORY>(*mpi, m, "LiH_NCPP_n100", thr, 90.0); }
+  SECTION("LiH USPP n100")       { auto m = load("uspp/w150_n100");
+    run_isdf_threshold_convergence<HOST_MEMORY>(*mpi, m, "LiH_USPP_n100", thr, 90.0); }
+  SECTION("LiH PAW n100")        { auto m = load("paw/w150_n100");
+    run_isdf_threshold_convergence<HOST_MEMORY>(*mpi, m, "LiH_PAW_n100", thr, 90.0); }
+  SECTION("LiH NCPP(oncv) n250") { auto m = load("oncv/w150_n250");
+    run_isdf_threshold_convergence<HOST_MEMORY>(*mpi, m, "LiH_NCPP_n250", thr, 90.0); }
+  SECTION("LiH USPP n250")       { auto m = load("uspp/w150_n250");
+    run_isdf_threshold_convergence<HOST_MEMORY>(*mpi, m, "LiH_USPP_n250", thr, 90.0); }
+  SECTION("LiH PAW n250")        { auto m = load("paw/w150_n250");
+    run_isdf_threshold_convergence<HOST_MEMORY>(*mpi, m, "LiH_PAW_n250", thr, 90.0); }
+
+  // ecutwfc scan at n100 (fixed pw2coqui MFs) to isolate the semicore V_H
+  // floor vs the wavefunction cutoff. tag suffix _w<ecutwfc>.
+  SECTION("LiH USPP n100 w100") { auto m = load("uspp/w100_n100");
+    run_isdf_threshold_convergence<HOST_MEMORY>(*mpi, m, "LiH_USPP_n100_w100", thr, 90.0); }
+  SECTION("LiH USPP n100 w200") { auto m = load("uspp/w200_n100");
+    run_isdf_threshold_convergence<HOST_MEMORY>(*mpi, m, "LiH_USPP_n100_w200", thr, 90.0); }
+  SECTION("LiH PAW n100 w100")  { auto m = load("paw/w100_n100");
+    run_isdf_threshold_convergence<HOST_MEMORY>(*mpi, m, "LiH_PAW_n100_w100", thr, 90.0); }
+  SECTION("LiH PAW n100 w200")  { auto m = load("paw/w200_n100");
+    run_isdf_threshold_convergence<HOST_MEMORY>(*mpi, m, "LiH_PAW_n100_w200", thr, 90.0); }
+
+  // 16-band from-scratch control (fresh pw2coqui). Should converge cleanly if
+  // the floor is band-count/cutoff driven; floors if the pipeline itself broke.
+  SECTION("LiH USPP n16 w100") { auto m = load("uspp/w100_n16");
+    run_isdf_threshold_convergence<HOST_MEMORY>(*mpi, m, "LiH_USPP_n16_w100", thr, 90.0); }
+  SECTION("LiH USPP n16 w150") { auto m = load("uspp/w150_n16");
+    run_isdf_threshold_convergence<HOST_MEMORY>(*mpi, m, "LiH_USPP_n16_w150", thr, 90.0); }
+  SECTION("LiH PAW n16 w100")  { auto m = load("paw/w100_n16");
+    run_isdf_threshold_convergence<HOST_MEMORY>(*mpi, m, "LiH_PAW_n16_w100", thr, 90.0); }
+  SECTION("LiH PAW n16 w150")  { auto m = load("paw/w150_n16");
+    run_isdf_threshold_convergence<HOST_MEMORY>(*mpi, m, "LiH_PAW_n16_w150", thr, 90.0); }
+
+  // NOSYM control (only nosym changed vs the floored fresh n16). If this is
+  // clean, the floor is the PAW augmentation under symmetry reduction.
+  SECTION("LiH USPP nosym n16") { auto m = load("uspp/nosym_n16");
+    run_isdf_threshold_convergence<HOST_MEMORY>(*mpi, m, "LiH_USPP_nosym_n16", thr, 90.0); }
+  SECTION("LiH PAW nosym n16")  { auto m = load("paw/nosym_n16");
+    run_isdf_threshold_convergence<HOST_MEMORY>(*mpi, m, "LiH_PAW_nosym_n16", thr, 90.0); }
 }
 
 TEST_CASE("thc_vs_direct_VH_VX", "[hamilt][thc][hf]")

@@ -620,28 +620,9 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
             Dloc_at(ia, n, m) = Dloc_sp(nt, n, m);
       }
     }
-    // Frozen core-valence exact exchange (ABINIT ex_cvij): a static one-center
-    // projector Dij contracted LINEARLY with becsum (factor 1). It is disjoint
-    // from the density-dependent valence Fock (v_x/deltaC), so it is added to the
-    // frozen per-atom D here — then e_1e = Tr[Dm·H0] captures it with the correct
-    // factor 1. ex_cvij is in Hartree (PAW-XML), matching Dnn_atom after the
-    // 0.5 Ry→Ha scaling. alpha_x = exchange fraction (1 for HF/GW). Absent ⇒
-    // omitted (warned about at load time); no double-count (QE/ABINIT D^0 have no
-    // core-valence exchange).
-    if(ptype == pp_paw_t) {
-      const double alpha_x = 1.0;
-      for(int ia=0; ia<nat; ++ia) {
-        int nt = ityp(ia);
-        auto const& sp = paw_species[nt];
-        if(!sp.is_paw || sp.ex_cvij.size()==0) continue;
-        int nh_a = sp.nh;
-        for(int p=0; p<npol; ++p)
-          for(int n=0; n<nh_a; ++n)
-            for(int m=0; m<nh_a; ++m)
-              Dloc_at(ia, n*npol+p, m*npol+p) +=
-                  ComplexType(alpha_x * sp.ex_cvij(n,m), 0.0);
-      }
-    }
+    // NOTE: the frozen core-valence exact exchange (ex_cvij) is added to
+    // Dnn_atom AFTER the heavy paw_species fields are loaded below (ex_cvij is
+    // not yet loaded at this point — its view still binds the dummy SHM here).
   }
   mpi->node_comm.barrier();
   if(mpi->node_comm.root())
@@ -977,6 +958,35 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
       }
     }
   }
+
+  // Frozen core-valence exact exchange (ABINIT ex_cvij) → per-atom D. Done here
+  // (not in the Dnn_atom assembly above) because ex_cvij is only loaded with the
+  // heavy paw_species fields just above. It is a static one-center projector Dij
+  // contracted LINEARLY with becsum (factor 1), disjoint from the density-
+  // dependent valence Fock (v_x/deltaC), so adding it to the frozen per-atom D
+  // makes e_1e = Tr[Dm·H0] capture it with the correct factor 1. ex_cvij is in
+  // Hartree (matches Dnn_atom after 0.5 Ry→Ha). alpha_x = exchange fraction (1
+  // for HF/GW). Each node-root adds the same value (Dnn_atom is internode-synced);
+  // no double-count (QE/ABINIT D^0 carry no core-valence exchange).
+  // Guard on pp type: paw_species is only populated for USPP/PAW (see above),
+  // so this block must NOT dereference paw_species[nt] on the NC path (empty
+  // vector -> out-of-bounds). ex_cvij is PAW-only; USPP simply has size()==0.
+  if((ptype == pp_uspp_t or ptype == pp_paw_t) and mpi->node_comm.root()) {
+    const double alpha_x = 1.0;
+    auto Dloc_at = Dnn_atom.local();
+    for(int ia=0; ia<nat; ++ia) {
+      int nt = ityp(ia);
+      auto const& sp = paw_species[nt];
+      if(!sp.is_paw || sp.ex_cvij.size()==0) continue;
+      int nh_a = sp.nh;
+      for(int p=0; p<npol; ++p)
+        for(int n=0; n<nh_a; ++n)
+          for(int m=0; m<nh_a; ++m)
+            Dloc_at(ia, n*npol+p, m*npol+p) +=
+                ComplexType(alpha_x * sp.ex_cvij(n,m), 0.0);
+    }
+  }
+  mpi->node_comm.barrier();
 
   // calculate projectors
   sarray_t<nda::array_view<long,2>> sk2g(*mpi,{nk,npwx});
