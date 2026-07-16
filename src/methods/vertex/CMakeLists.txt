@@ -2,8 +2,7 @@
 #//////////////////////////////////////////////////////////////////////////////////////
 
 SET(SRCS
-  scr_coulomb_t.cpp
-  scr_coulomb_chol.cpp
+  vertex_t.cpp
   )
 
 if(USE_DEVICE_COMPILER)
@@ -18,12 +17,11 @@ elseif(ENABLE_HIP)
 endif()
 endif()
 
-add_library(scr_coulomb_lib ${SRCS})
-target_link_libraries(scr_coulomb_lib PUBLIC meanfield eri_lib embed_lib vertex_lib)
-install(TARGETS scr_coulomb_lib
+add_library(vertex_lib ${SRCS})
+target_link_libraries(vertex_lib PUBLIC meanfield eri_lib mb_state_lib)
+install(TARGETS vertex_lib
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
 
-
-#if (BUILD_UNIT_TESTS)
-#  add_subdirectory(tests)
-#endif()
+if (BUILD_UNIT_TESTS)
+  add_subdirectory(tests)
+endif()

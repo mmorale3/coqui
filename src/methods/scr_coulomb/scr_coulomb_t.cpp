@@ -23,12 +23,17 @@
 #include "methods/ERI/thc_reader_t.hpp"
 #include "methods/HF/thc_solver_comm.hpp"
 #include "methods/GW/g0_div_utils.hpp"
+#include "methods/vertex/vertex_t.h"
 #include "scr_coulomb_t.h"
 #include "rpa_pi.icc"
 #include "edmft_pi.icc"
 
 namespace methods {
 namespace solvers {
+
+  bool scr_coulomb_t::has_active_vertex() const {
+    return _vertex != nullptr and _vertex->active();
+  }
 
   scr_coulomb_t::scr_coulomb_t(const imag_axes_ft::IAFT *ft,
                                std::string screen_type,
@@ -316,13 +321,31 @@ namespace solvers {
 
     auto G_tskij = mb_state.sG_tskij.value().local();
 
-    if (_screen_type == "rpa_k")
-      return eval_Pi_rpa_kspace(G_tskij, thc);
+    // ISDF-Vertex: additive second-order-exchange polarization cut Pi^C on the
+    // same distributed grid as the RPA polarizability (EDMFT "+=" precedent below).
+    // When no active vertex is attached this is a strict no-op -- no allocation,
+    // no arithmetic -- so the disabled path is bit-identical to plain RPA/scGW.
+    auto add_vertex_Pi_C = [&](auto &dPi) {
+      if (_vertex != nullptr and _vertex->active()) {
+        auto dPi_C_tqPQ = _vertex->eval_Pi_C(mb_state, thc, dPi.grid(),
+                                             dPi.block_size(), dPi.global_shape());
+        dPi.local() += dPi_C_tqPQ.local();
+        thc.mpi()->comm.barrier();
+      }
+    };
+
+    if (_screen_type == "rpa_k") {
+      auto dPi_tqPQ = eval_Pi_rpa_kspace(G_tskij, thc);
+      add_vertex_Pi_C(dPi_tqPQ);
+      return dPi_tqPQ;
+    }
 
     // RPA polarizability
     auto dPi_tqPQ = eval_Pi_rpa_Rspace(G_tskij, thc);
-    if (_screen_type.find("gw_edmft_rpa")!=std::string::npos or _screen_type=="rpa")
+    if (_screen_type.find("gw_edmft_rpa")!=std::string::npos or _screen_type=="rpa") {
+      add_vertex_Pi_C(dPi_tqPQ);
       return dPi_tqPQ;
+    }
 
     // cRPA corrections: Pi_cRPA = Pi_RPA - Pi_active
     if (_screen_type.find("crpa") != std::string::npos) {
@@ -374,6 +397,9 @@ namespace solvers {
         thc.mpi()->comm.barrier();
       }
     }
+
+    // ISDF-Vertex: Pi = Pi_RPA (+ corrections) + Pi^C
+    add_vertex_Pi_C(dPi_tqPQ);
 
     return dPi_tqPQ;
   }

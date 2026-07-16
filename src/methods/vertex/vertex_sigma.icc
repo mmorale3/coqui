@@ -1,0 +1,809 @@
+/**
+ * ==========================================================================
+ * CoQuí: Correlated Quantum ínterface
+ *
+ * Copyright (c) 2022-2026 Simons Foundation & The CoQuí developer team
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ * ==========================================================================
+ */
+
+#ifndef COQUI_VERTEX_SIGMA_ICC
+#define COQUI_VERTEX_SIGMA_ICC
+
+/**
+ * ISDF-Vertex Task 1c: fused G^3 W^2 second-order-exchange self-energy cut.
+ *
+ *   Sigma^{C,s}_ab(k,iw) = + (1/(N_k beta))^2 sum_{qx,qy} sum_{vx,vy} sum_{p in C}
+ *       G_{p3 p2'}(k+qy, iw+ivy) G_{p4 p3'}(k-qx+qy, iw-ivx+ivy) G_{p1 p4'}(k-qx, iw-ivx)
+ *     x W_{(p1 b),(p3 p3')}(qx,ivx) W_{(a p2'),(p4 p4')}(qy,ivy)
+ *
+ * (verified +1 prefactor and crossing, verification/sign_crossing_report.md).
+ * Design: notes/sigma_c_kernel_design.md. The frequency algebra mirrors the
+ * DLR channel algebra of src/numerics/imag_axes_ft/iaft_dconv.hpp (families
+ * I-V + instantaneous cx/cy reductions), generalized from scalar chains to
+ * the C-window orbital ring: the C-restriction makes every aux-dressed
+ * propagator rank-|C|, so the two screened rungs are pre-contracted to
+ * orbital blocks
+ *   Wx_b(p1,p3,p3')(ivx), Wy_a(p2',p4,p4')(ivy)
+ * via the THC collocation vectors (the only Np^2-sized work), and every
+ * family contraction runs on |C|-sized tensors. Exact (to DLR eps) w.r.t.
+ * the batched double_boson_conv over orbital tuples (pinned by tests).
+ *
+ * No-symmetry path only: nkpts == nkpts_ibz == nqpts (checked). Bare Z(q)
+ * enters exclusively through the instantaneous cx/cy reductions (a
+ * frequency-constant is a delta(tau): never through the dynamic machinery).
+ */
+
+#include <cmath>
+#include <complex>
+
+#include "configuration.hpp"
+#include "utilities/check.hpp"
+#include "IO/app_loggers.h"
+#include "nda/nda.hpp"
+#include "nda/blas.hpp"
+
+#include "numerics/imag_axes_ft/IAFT.hpp"
+#include "numerics/imag_axes_ft/iaft_dconv.hpp"  // dconv_detail::stable_nF/nB (+ cppdlr via IAFT)
+
+namespace methods {
+namespace solvers {
+namespace vertex_detail {
+
+  template<int N>
+  using vshape_t = std::array<long, N>;
+
+  /**
+   * Fused Sigma^C kernel, no-symmetry path. All inputs replicated per rank.
+   *
+   * @param ft          - IAFT instance (must hold the DLR backend; aborts on IR)
+   * @param comm        - communicator: (s,k,qx) combos are round-robin distributed;
+   *                      the OUTPUT is all-reduced, i.e. identical on every rank on exit
+   * @param C_rng       - contiguous orbital window C (internal lines)
+   * @param G_tskij     - (nt_f, ns, nk, nbnd, nbnd) G(tau) on the fermionic tau mesh (full BZ)
+   * @param X_skPa      - (ns, nk, Np, nbnd) THC collocation vectors (q-independent, npol=1)
+   * @param Wt_qtPQ     - (nq, nt_f, Np, Np) DYNAMIC screened interaction W(tau) on the FULL
+   *                      tau mesh (caller reflects the nt_half storage: W(beta-t)=W(t))
+   * @param Z_qPQ       - (nq, Np, Np) bare THC core (instantaneous part; may be all-zero)
+   * @param k_minus_q   - (nq, nk) index map: k_minus_q(iq,ik) = index of k - q (mod G)
+   * @param qminus      - (nq) index map: qminus(iq) = index of -q
+   * @param iq_gamma    - index of q = Gamma. ignore_g0 semantics (v1): BOTH rung
+   *                      transfers skip the Gamma term (qx = Gamma AND qy = Gamma),
+   *                      bare Z and dynamic dW consistently -- the raw W(q->0)
+   *                      Coulomb head is divergent and would otherwise enter both
+   *                      rungs; a dedicated head treatment (GW's gygi analogue) is
+   *                      deferred. Mirrors GW's div_treatment = "ignore_g0";
+   *                      O(1/N_k) finite-size caveat in the design doc.
+   * @param Sigma_C_tskab - (nt_f, ns, nk, nbnd, nbnd) OVERWRITTEN with Sigma^C(tau)
+   */
+  template<nda::MemoryArrayOfRank<5> GArr_t, nda::MemoryArrayOfRank<5> SArr_t>
+  void eval_sigma_C_g3w2_nosym(imag_axes_ft::IAFT const &ft,
+                               mpi3::communicator &comm,
+                               nda::range C_rng,
+                               GArr_t const &G_tskij,
+                               nda::array<ComplexType, 4> const &X_skPa,
+                               nda::array<ComplexType, 4> const &Wt_qtPQ,
+                               nda::array<ComplexType, 3> const &Z_qPQ,
+                               nda::array<long, 2> const &k_minus_q,
+                               nda::array<long, 1> const &qminus,
+                               long iq_gamma,
+                               SArr_t &&Sigma_C_tskab) {
+#ifndef ENABLE_DLR
+    (void)ft; (void)comm; (void)C_rng; (void)G_tskij; (void)X_skPa; (void)Wt_qtPQ;
+    (void)Z_qPQ; (void)k_minus_q; (void)qminus; (void)iq_gamma; (void)Sigma_C_tskab;
+    APP_ABORT("vertex_detail::eval_sigma_C_g3w2_nosym: this build has ENABLE_DLR=OFF; "
+              "the DLR IAFT backend is required.");
+#else
+    using imag_axes_ft::dconv_detail::stable_nF;
+    using imag_axes_ft::dconv_detail::stable_nB;
+    decltype(nda::range::all) all;
+
+    utils::check(ft.basis() == imag_axes_ft::dlr_basis,
+                 "eval_sigma_C: requires the DLR IAFT backend; IR is not supported.");
+
+    const long nt   = ft.nt_f();
+    const long nw_f = ft.nw_f();
+    const long nw_b = ft.nw_b();
+    const double beta = ft.beta();
+
+    const long ns   = G_tskij.shape(1);
+    const long nk   = G_tskij.shape(2);
+    const long nbnd = G_tskij.shape(3);
+    const long nq   = Wt_qtPQ.shape(0);
+    const long Np   = Wt_qtPQ.shape(2);
+    const long nc   = C_rng.size();
+    const long C0   = C_rng.first();
+
+    utils::check(G_tskij.shape(0) == nt, "eval_sigma_C: G_tskij leading axis must be nt_f = {}.", nt);
+    utils::check(Wt_qtPQ.shape(1) == nt, "eval_sigma_C: Wt_qtPQ time axis must be nt_f = {} (full tau mesh).", nt);
+    utils::check(nq == nk, "eval_sigma_C: no-symmetry path requires nq == nk.");
+    utils::check(Z_qPQ.shape(0) == nq and Z_qPQ.shape(1) == Np and Z_qPQ.shape(2) == Np,
+                 "eval_sigma_C: Z_qPQ shape mismatch.");
+    utils::check(X_skPa.shape(0) == ns and X_skPa.shape(1) == nk and
+                 X_skPa.shape(2) == Np and X_skPa.shape(3) == nbnd,
+                 "eval_sigma_C: X_skPa shape mismatch.");
+    utils::check(C0 >= 0 and C0 + nc <= nbnd and nc > 0,
+                 "eval_sigma_C: invalid C window [{}, {}).", C0, C0 + nc);
+    utils::check(Sigma_C_tskab.shape() == (vshape_t<5>{nt, ns, nk, nbnd, nbnd}),
+                 "eval_sigma_C: Sigma_C_tskab shape mismatch.");
+    utils::check(iq_gamma >= 0 and iq_gamma < nq,
+                 "eval_sigma_C: invalid iq_gamma = {} (nq = {}).", iq_gamma, nq);
+
+    // ---- backend transforms and grids -----------------------------------
+    auto Ttw_ff = ft.Ttw_ff();  // (nt, nw_f)
+    auto Twt_ff = ft.Twt_ff();  // (nw_f, nt)
+    auto Ttw_bb = ft.Ttw_bb();  // (nt, nw_b)
+    auto Twt_bb = ft.Twt_bb();  // (nw_b, nt)
+
+    auto wnf = ft.wn_mesh_f();
+    auto wnb = ft.wn_mesh_b();
+    nda::array<ComplexType, 1> zf(nw_f), zb(nw_b);
+    for (long n = 0; n < nw_f; ++n) zf(n) = ft.omega(wnf(n));
+    for (long m = 0; m < nw_b; ++m) zb(m) = ft.omega(wnb(m));
+    long m0 = -1;
+    for (long m = 0; m < nw_b; ++m)
+      if (wnb(m) == 0) { m0 = m; break; }
+    utils::check(m0 >= 0, "eval_sigma_C: bosonic Matsubara mesh does not contain iv = 0.");
+
+    // ---- auxiliary NONSYM DLR pole basis (see iaft_dconv.hpp) ------------
+    auto rf = cppdlr::build_dlr_rf(ft.lambda(), ft.eps());
+    auto itops_p = cppdlr::imtime_ops(ft.lambda(), rf);
+    const long np = itops_p.rank();
+
+    nda::array<double, 1> x_p(np);
+    for (long i = 0; i < np; ++i) x_p(i) = 2.0 * cppdlr::rel2abs(itops_p.get_itnodes(i)) - 1.0;
+    auto Tmap_arr = ft.construct_tau_interpolate_matrix(x_p);  // (np, nt)
+    nda::array<ComplexType, 2> Tmap(np, nt);
+    for (long i = 0; i < np; ++i)
+      for (long l = 0; l < nt; ++l) Tmap(i, l) = Tmap_arr(i, l);
+
+    nda::array<double, 1> epsl(np), nF(np), nB(np), th(np);
+    double min_abs = 1e300, min_gap = 1e300;
+    for (long l = 0; l < np; ++l) {
+      epsl(l) = rf(l) / beta;
+      min_abs = std::min(min_abs, std::abs(rf(l)));
+      for (long l2 = 0; l2 < l; ++l2) min_gap = std::min(min_gap, std::abs(rf(l) - rf(l2)));
+    }
+    utils::check(min_abs > 1e-12,
+                 "eval_sigma_C: auxiliary DLR pole grid contains a (near-)zero node "
+                 "(min |hw_l| = {}).", min_abs);
+    for (long l = 0; l < np; ++l) {
+      nF(l) = stable_nF(beta, epsl(l));
+      nB(l) = stable_nB(beta, epsl(l));
+      th(l) = std::tanh(0.5 * rf(l));
+    }
+    app_log(2, "eval_sigma_C: DLR rank = {} (aux pole rank = {}), lambda = {}, eps = {}, "
+               "min|hw_l| = {}, min node gap = {}; C = [{}, {}), nbnd = {}, Np = {}, nk = {}",
+            nt, np, ft.lambda(), ft.eps(), min_abs, min_gap, C0, C0 + nc, nbnd, Np, nk);
+
+    // exact tau -> beta - tau map through the DLR basis
+    nda::array<ComplexType, 2> R(nt, nt);
+    {
+      auto tau = ft.tau_mesh();
+      nda::array<double, 1> xrefl(nt);
+      for (long i = 0; i < nt; ++i) xrefl(i) = -tau(i);
+      auto Rarr = ft.construct_tau_interpolate_matrix(xrefl);
+      for (long i = 0; i < nt; ++i)
+        for (long l = 0; l < nt; ++l) R(i, l) = Rarr(i, l);
+    }
+
+    // ---- W on the bosonic Matsubara nodes --------------------------------
+    // Ww_qwPQ(iq) = Twt_bb * Wt(iq)
+    nda::array<ComplexType, 4> Ww_qwPQ(nq, nw_b, Np, Np);
+    {
+      nda::array<ComplexType, 2> tmp_w(nw_b, Np * Np);
+      for (long iq = 0; iq < nq; ++iq) {
+        auto Wt2 = nda::reshape(Wt_qtPQ(iq, all, all, all), vshape_t<2>{nt, Np * Np});
+        nda::blas::gemm(Twt_bb, Wt2, tmp_w);
+        nda::reshape(Ww_qwPQ(iq, all, all, all), vshape_t<2>{nw_b, Np * Np}) = tmp_w;
+      }
+    }
+
+    // ---- layout helpers ---------------------------------------------------
+    // G blocks (row, col):   B2(t, iG(p3,p2')), C2(t, iG(p4,p3')), D2(t, iG(p1,p4'))
+    // W row pairs:           e_x = iX(b, p1),  e_y = iX(a, p2')      [size dX = nbnd*nc]
+    // W col pairs:           f_x = iG(p3,p3'), f_y = iG(p4,p4')      [size dG = nc*nc]
+    const long dG = nc * nc;
+    const long dX = nbnd * nc;
+    const long dXF = dX * dG;       // flattened orbital W block (e, f)
+    const long nc3 = nc * nc * nc;
+    const long nc4 = dG * dG;
+    auto iG = [nc](long i, long j) { return i * nc + j; };
+    auto iX = [nc](long b, long j) { return b * nc + j; };
+    auto i3 = [nc](long i, long j, long k) { return (i * nc + j) * nc + k; };
+    auto i4 = [nc](long i, long j, long k, long l) { return ((i * nc + j) * nc + k) * nc + l; };
+
+    // ---- persistent work arrays ------------------------------------------
+    nda::array<ComplexType, 2> A_x(Np, dX), A_y(Np, dX);        // row-pair collocations
+    nda::array<ComplexType, 3> half_x(nw_b, Np, dX);            // W(qx)^T A_x  (hoisted over qy)
+    nda::array<ComplexType, 2> halfZ_x(Np, dX), halfZ_y(Np, dX);
+    nda::array<ComplexType, 2> U_Rx(Np, dG), U_Ry(Np, dG);      // col-pair collocations
+    nda::array<ComplexType, 2> tmp_NpdX(Np, dX);
+
+    nda::array<ComplexType, 2> Wx_w(nw_b, dXF), Wx_t(nt, dXF);  // orbital Wx blocks (e_x, f_x)
+    nda::array<ComplexType, 2> Wy_w(nw_b, dXF);                 // orbital Wy blocks (e_y, f_y)
+    nda::array<ComplexType, 2> Y_res(np, dXF);                  // Wy residues (aux NONSYM basis)
+    nda::array<ComplexType, 2> cx_ef(dX, dG), cy_ef(dX, dG);    // instantaneous Z blocks
+
+    nda::array<ComplexType, 2> B2(nt, dG), C2(nt, dG), D2(nt, dG);
+    nda::array<ComplexType, 2> b_res(np, dG), c_res(np, dG);
+    nda::array<ComplexType, 2> D_w(nw_f, dG);
+    nda::array<ComplexType, 2> Crefl(nt, dG), Drefl(nt, dG);
+
+    nda::array<ComplexType, 2> Kf(nw_f, np), Kb(nw_b, np);
+    nda::array<ComplexType, 2> Fu_w(nw_f, dG), Gu_w(nw_f, dG);  // shifted/deflated evaluations
+    nda::array<ComplexType, 2> Til_w(nw_b, dG);
+    nda::array<ComplexType, 2> H4(nw_f, nc4), Ht4(nt, nc4);
+    nda::array<ComplexType, 2> HG(nw_f, dG), HGt(nt, dG);
+    nda::array<ComplexType, 2> P3(nt, nbnd * nc3), conv3(nw_f, nbnd * nc3);
+    nda::array<ComplexType, 2> V3(nw_b, nbnd * nc3), Vt3(nt, nbnd * nc3);
+    nda::array<ComplexType, 2> H3(nw_f, nbnd * nc3), Ht3(nt, nbnd * nc3);
+    nda::array<ComplexType, 2> Pab(nt, nbnd * nbnd * dG), convab(nw_f, nbnd * nbnd * dG);
+    nda::array<ComplexType, 2> Yhat(nw_f, dXF);
+    nda::array<ComplexType, 2> TAn(nw_f, nbnd * nc3);           // n-dependent a-side intermediate
+    nda::array<ComplexType, 1> T1(nc3), T2(nc3);
+    nda::array<ComplexType, 2> T2s(nbnd, nc3);
+    nda::array<ComplexType, 3> Sw_ab(nw_f, nbnd, nbnd);         // per-combo accumulator (dynamic)
+    nda::array<ComplexType, 3> St_ab(nt, nbnd, nbnd);           // per-combo accumulator (instantaneous)
+
+    // instantaneous helpers
+    nda::array<ComplexType, 2> Q4(nt, nc4), Q4w(nw_b, nc4);
+    nda::array<ComplexType, 2> Vi3(nw_b, nbnd * nc3), Vit3(nt, nbnd * nc3), Virefl(nt, nbnd * nc3);
+
+    // rank-local accumulators over combos (isk leading: contiguous per-(s,k) slices)
+    nda::array<ComplexType, 4> AccSw(ns * nk, nw_f, nbnd, nbnd);
+    nda::array<ComplexType, 4> AccSt(ns * nk, nt, nbnd, nbnd);
+    AccSw() = ComplexType(0.0);
+    AccSt() = ComplexType(0.0);
+
+    // per-family running max |contribution| (diagnostics, verbosity 3)
+    std::array<double, 8> fam_max{};  // I..V, S1, S2, S3
+    auto track_max = [](double &m, nda::array<ComplexType, 3> const &A) {
+      for (auto const &v : A) m = std::max(m, std::abs(v));
+    };
+
+    const long rank = comm.rank();
+    const long size = comm.size();
+    const long ncombo = ns * nk * nq;   // (s, k, qx)
+
+    for (long combo = rank; combo < ncombo; combo += size) {
+      const long is  = combo / (nk * nq);
+      const long ik  = (combo / nq) % nk;
+      const long iqx = combo % nq;
+      if (iqx == iq_gamma) continue;   // ignore_g0: skip the Gamma transfer on the x-rung
+      const long ikmqx = k_minus_q(iqx, ik);
+
+      auto X_k    = X_skPa(is, ik, all, all);     // (Np, nbnd)
+      auto X_kmqx = X_skPa(is, ikmqx, all, all);
+
+      // ---- hoisted x-side row pair: e_x = (b @ k [conj], p1 @ k-qx) ------
+      for (long P = 0; P < Np; ++P)
+        for (long b = 0; b < nbnd; ++b)
+          for (long j1 = 0; j1 < nc; ++j1)
+            A_x(P, iX(b, j1)) = std::conj(X_k(P, b)) * X_kmqx(P, C0 + j1);
+      // half_x(m)(Q, e) = sum_P A_x(P,e) W_PQ(qx, m)
+      for (long m = 0; m < nw_b; ++m) {
+        auto Wm = Ww_qwPQ(iqx, m, all, all);
+        nda::blas::gemm(nda::transpose(Wm), A_x, half_x(m, all, all));
+      }
+      {
+        auto Zx = Z_qPQ(iqx, all, all);
+        nda::blas::gemm(nda::transpose(Zx), A_x, halfZ_x);
+      }
+
+      for (long iqy = 0; iqy < nq; ++iqy) {
+        if (iqy == iq_gamma) continue; // ignore_g0: skip the Gamma transfer on the y-rung
+        const long ikpqy    = k_minus_q(qminus(iqy), ik);
+        const long ikmqxpqy = k_minus_q(qminus(iqy), ikmqx);
+
+        auto X_kpqy    = X_skPa(is, ikpqy, all, all);
+        auto X_kmqxpqy = X_skPa(is, ikmqxpqy, all, all);
+
+        // ---- orbital W blocks ------------------------------------------
+        // f_x = (p3 @ k+qy, p3' @ k-qx+qy [conj])
+        for (long Q = 0; Q < Np; ++Q)
+          for (long j3 = 0; j3 < nc; ++j3)
+            for (long j3p = 0; j3p < nc; ++j3p)
+              U_Rx(Q, iG(j3, j3p)) = X_kpqy(Q, C0 + j3) * std::conj(X_kmqxpqy(Q, C0 + j3p));
+        for (long m = 0; m < nw_b; ++m) {
+          auto Wxm = nda::reshape(Wx_w(m, all), vshape_t<2>{dX, dG});
+          nda::blas::gemm(nda::transpose(half_x(m, all, all)), U_Rx, Wxm);
+        }
+        nda::blas::gemm(Ttw_bb, Wx_w, Wx_t);
+        nda::blas::gemm(nda::transpose(halfZ_x), U_Rx, cx_ef);
+
+        // e_y = (a @ k, p2' @ k+qy [conj]);  f_y = (p4 @ k-qx+qy, p4' @ k-qx [conj])
+        for (long P = 0; P < Np; ++P)
+          for (long a = 0; a < nbnd; ++a)
+            for (long j2p = 0; j2p < nc; ++j2p)
+              A_y(P, iX(a, j2p)) = std::conj(X_kpqy(P, C0 + j2p)) * X_k(P, a);
+        for (long Q = 0; Q < Np; ++Q)
+          for (long j4 = 0; j4 < nc; ++j4)
+            for (long j4p = 0; j4p < nc; ++j4p)
+              U_Ry(Q, iG(j4, j4p)) = X_kmqxpqy(Q, C0 + j4) * std::conj(X_kmqx(Q, C0 + j4p));
+        for (long m = 0; m < nw_b; ++m) {
+          auto Wm = Ww_qwPQ(iqy, m, all, all);
+          nda::blas::gemm(nda::transpose(Wm), A_y, tmp_NpdX);
+          auto Wym = nda::reshape(Wy_w(m, all), vshape_t<2>{dX, dG});
+          nda::blas::gemm(nda::transpose(tmp_NpdX), U_Ry, Wym);
+        }
+        {
+          auto Zy = Z_qPQ(iqy, all, all);
+          nda::blas::gemm(nda::transpose(Zy), A_y, tmp_NpdX);
+          nda::blas::gemm(nda::transpose(tmp_NpdX), U_Ry, cy_ef);
+        }
+        // Wy residues on the aux NONSYM pole basis (x tanh(hw/2))
+        {
+          nda::array<ComplexType, 2> Wy_tau(nt, dXF), tmp_p(np, dXF);
+          nda::blas::gemm(Ttw_bb, Wy_w, Wy_tau);
+          nda::blas::gemm(Tmap, Wy_tau, tmp_p);
+          auto ycoef = itops_p.vals2coefs(tmp_p);
+          for (long l = 0; l < np; ++l)
+            for (long j = 0; j < dXF; ++j) Y_res(l, j) = th(l) * ycoef(l, j);
+        }
+
+        // ---- C-window G blocks ------------------------------------------
+        for (long it = 0; it < nt; ++it)
+          for (long i = 0; i < nc; ++i)
+            for (long j = 0; j < nc; ++j) {
+              B2(it, iG(i, j)) = G_tskij(it, is, ikpqy,    C0 + i, C0 + j);  // (p3, p2')
+              C2(it, iG(i, j)) = G_tskij(it, is, ikmqxpqy, C0 + i, C0 + j);  // (p4, p3')
+              D2(it, iG(i, j)) = G_tskij(it, is, ikmqx,    C0 + i, C0 + j);  // (p1, p4')
+            }
+        {
+          nda::array<ComplexType, 2> tmp_p(np, dG);
+          nda::blas::gemm(Tmap, B2, tmp_p);
+          b_res = itops_p.vals2coefs(tmp_p);
+          nda::blas::gemm(Tmap, C2, tmp_p);
+          c_res = itops_p.vals2coefs(tmp_p);
+        }
+        nda::blas::gemm(Twt_ff, D2, D_w);
+        nda::blas::gemm(R, C2, Crefl);
+        nda::blas::gemm(R, D2, Drefl);
+
+        Sw_ab() = ComplexType(0.0);
+        St_ab() = ComplexType(0.0);
+
+        // ================================================================
+        // family (I): per Wy pole u
+        //   S(n) += -nB(u) [B(zf+e_u) . Y_u . T[Wx, D*C(.+e_u)]]_ring
+        // ================================================================
+        for (long u = 0; u < np; ++u) {
+          for (long n = 0; n < nw_f; ++n)
+            for (long l = 0; l < np; ++l) Kf(n, l) = 1.0 / (zf(n) + epsl(u) - epsl(l));
+          nda::blas::gemm(Kf, c_res, Fu_w);   // C(zf + e_u)   (p4, p3')
+          nda::blas::gemm(Kf, b_res, Gu_w);   // B(zf + e_u)   (p3, p2')
+          // H(n')(p1,p3',p4,p4') = D_w(n')(p1,p4') * Cu(n')(p4,p3')
+          for (long n = 0; n < nw_f; ++n)
+            for (long j1 = 0; j1 < nc; ++j1)
+              for (long j3p = 0; j3p < nc; ++j3p)
+                for (long j4 = 0; j4 < nc; ++j4)
+                  for (long j4p = 0; j4p < nc; ++j4p)
+                    H4(n, i4(j1, j3p, j4, j4p)) = D_w(n, iG(j1, j4p)) * Fu_w(n, iG(j4, j3p));
+          nda::blas::gemm(Ttw_ff, H4, Ht4);
+          // P_b(t)(p3,p4,p4') = sum_{p1,p3'} Wx_t(t)(b,p1;p3,p3') Ht(t)(p1,p3',p4,p4')
+          for (long it = 0; it < nt; ++it)
+            for (long b = 0; b < nbnd; ++b)
+              for (long j3 = 0; j3 < nc; ++j3)
+                for (long j4 = 0; j4 < nc; ++j4)
+                  for (long j4p = 0; j4p < nc; ++j4p) {
+                    ComplexType acc(0.0);
+                    for (long j1 = 0; j1 < nc; ++j1)
+                      for (long j3p = 0; j3p < nc; ++j3p)
+                        acc += Wx_t(it, iX(b, j1) * dG + iG(j3, j3p)) * Ht4(it, i4(j1, j3p, j4, j4p));
+                    P3(it, b * nc3 + i3(j3, j4, j4p)) = acc;
+                  }
+          nda::blas::gemm(Twt_ff, P3, conv3);
+          // T_a(n)(p3,p4,p4') = sum_{p2'} Bu(n)(p3,p2') Y_u(a,p2';p4,p4')
+          for (long n = 0; n < nw_f; ++n)
+            for (long a = 0; a < nbnd; ++a)
+              for (long j3 = 0; j3 < nc; ++j3)
+                for (long j4 = 0; j4 < nc; ++j4)
+                  for (long j4p = 0; j4p < nc; ++j4p) {
+                    ComplexType acc(0.0);
+                    for (long j2p = 0; j2p < nc; ++j2p)
+                      acc += Gu_w(n, iG(j3, j2p)) * Y_res(u, iX(a, j2p) * dG + iG(j4, j4p));
+                    TAn(n, a * nc3 + i3(j3, j4, j4p)) = acc;
+                  }
+          const double fac = -nB(u);
+          for (long n = 0; n < nw_f; ++n)
+            for (long a = 0; a < nbnd; ++a)
+              for (long b = 0; b < nbnd; ++b) {
+                ComplexType acc(0.0);
+                for (long j = 0; j < nc3; ++j) acc += TAn(n, a * nc3 + j) * conv3(n, b * nc3 + j);
+                Sw_ab(n, a, b) += fac * acc;
+              }
+        }
+        track_max(fam_max[0], Sw_ab);
+
+        // ================================================================
+        // family (II): per B pole p
+        //   S(n) += nF(p) [b_p . Wy(e_p-iw) . T[Wx*C^{(p-defl)}(e_p-i.), D]]_ring
+        // ================================================================
+        for (long p = 0; p < np; ++p) {
+          for (long m = 0; m < nw_b; ++m)
+            for (long l = 0; l < np; ++l)
+              Kb(m, l) = (l == p) ? ComplexType(0.0) : 1.0 / (epsl(p) - zb(m) - epsl(l));
+          nda::blas::gemm(Kb, c_res, Til_w);   // C^{(p-defl)}(e_p - iv)  (p4, p3')
+          // V_b(m)(p1,p3,p4) = sum_{p3'} Wx_w(m)(b,p1;p3,p3') Ctil(m)(p4,p3')
+          for (long m = 0; m < nw_b; ++m)
+            for (long b = 0; b < nbnd; ++b)
+              for (long j1 = 0; j1 < nc; ++j1)
+                for (long j3 = 0; j3 < nc; ++j3)
+                  for (long j4 = 0; j4 < nc; ++j4) {
+                    ComplexType acc(0.0);
+                    for (long j3p = 0; j3p < nc; ++j3p)
+                      acc += Wx_w(m, iX(b, j1) * dG + iG(j3, j3p)) * Til_w(m, iG(j4, j3p));
+                    V3(m, b * nc3 + i3(j1, j3, j4)) = acc;
+                  }
+          nda::blas::gemm(Ttw_bb, V3, Vt3);
+          // P_b(t)(p3,p4,p4') = sum_{p1} Vt(t)(p1,p3,p4) D2(t)(p1,p4')
+          for (long it = 0; it < nt; ++it)
+            for (long b = 0; b < nbnd; ++b)
+              for (long j3 = 0; j3 < nc; ++j3)
+                for (long j4 = 0; j4 < nc; ++j4)
+                  for (long j4p = 0; j4p < nc; ++j4p) {
+                    ComplexType acc(0.0);
+                    for (long j1 = 0; j1 < nc; ++j1)
+                      acc += Vt3(it, b * nc3 + i3(j1, j3, j4)) * D2(it, iG(j1, j4p));
+                    P3(it, b * nc3 + i3(j3, j4, j4p)) = acc;
+                  }
+          nda::blas::gemm(Twt_ff, P3, conv3);
+          for (long n = 0; n < nw_f; ++n)
+            for (long l = 0; l < np; ++l) Kf(n, l) = 1.0 / (epsl(p) - zf(n) - epsl(l));
+          nda::blas::gemm(Kf, Y_res, Yhat);    // Wy(e_p - iw)  (a,p2';p4,p4')
+          // T_a(n)(p3,p4,p4') = sum_{p2'} b_p(p3,p2') Yhat(n)(a,p2';p4,p4')
+          for (long n = 0; n < nw_f; ++n)
+            for (long a = 0; a < nbnd; ++a)
+              for (long j3 = 0; j3 < nc; ++j3)
+                for (long j4 = 0; j4 < nc; ++j4)
+                  for (long j4p = 0; j4p < nc; ++j4p) {
+                    ComplexType acc(0.0);
+                    for (long j2p = 0; j2p < nc; ++j2p)
+                      acc += b_res(p, iG(j3, j2p)) * Yhat(n, iX(a, j2p) * dG + iG(j4, j4p));
+                    TAn(n, a * nc3 + i3(j3, j4, j4p)) = acc;
+                  }
+          const double fac = nF(p);
+          for (long n = 0; n < nw_f; ++n)
+            for (long a = 0; a < nbnd; ++a)
+              for (long b = 0; b < nbnd; ++b) {
+                ComplexType acc(0.0);
+                for (long j = 0; j < nc3; ++j) acc += TAn(n, a * nc3 + j) * conv3(n, b * nc3 + j);
+                Sw_ab(n, a, b) += fac * acc;
+              }
+        }
+        track_max(fam_max[1], Sw_ab);
+
+        // ================================================================
+        // family (III): per C pole q
+        //   S(n) += nF(q) [c_q . T[Wx*B^{(q-defl)}(e_q+i.), D*Wy(e_q-i.)]]_ring
+        // ================================================================
+        for (long q = 0; q < np; ++q) {
+          for (long m = 0; m < nw_b; ++m)
+            for (long l = 0; l < np; ++l)
+              Kb(m, l) = (l == q) ? ComplexType(0.0) : 1.0 / (epsl(q) + zb(m) - epsl(l));
+          nda::blas::gemm(Kb, b_res, Til_w);   // B^{(q-defl)}(e_q + iv)  (p3, p2')
+          // V_b(m)(p1,p3',p2') = sum_{p3} Wx_w(m)(b,p1;p3,p3') Btil(m)(p3,p2')
+          for (long m = 0; m < nw_b; ++m)
+            for (long b = 0; b < nbnd; ++b)
+              for (long j1 = 0; j1 < nc; ++j1)
+                for (long j3p = 0; j3p < nc; ++j3p)
+                  for (long j2p = 0; j2p < nc; ++j2p) {
+                    ComplexType acc(0.0);
+                    for (long j3 = 0; j3 < nc; ++j3)
+                      acc += Wx_w(m, iX(b, j1) * dG + iG(j3, j3p)) * Til_w(m, iG(j3, j2p));
+                    V3(m, b * nc3 + i3(j1, j3p, j2p)) = acc;
+                  }
+          nda::blas::gemm(Ttw_bb, V3, Vt3);
+          for (long n = 0; n < nw_f; ++n)
+            for (long l = 0; l < np; ++l) Kf(n, l) = 1.0 / (epsl(q) - zf(n) - epsl(l));
+          nda::blas::gemm(Kf, Y_res, Yhat);    // Wy(e_q - iw')  (a,p2';p4,p4')
+          // H_a(n')(p1,p2',p4) = sum_{p4'} D_w(n')(p1,p4') Yhat(n')(a,p2';p4,p4')
+          for (long n = 0; n < nw_f; ++n)
+            for (long a = 0; a < nbnd; ++a)
+              for (long j1 = 0; j1 < nc; ++j1)
+                for (long j2p = 0; j2p < nc; ++j2p)
+                  for (long j4 = 0; j4 < nc; ++j4) {
+                    ComplexType acc(0.0);
+                    for (long j4p = 0; j4p < nc; ++j4p)
+                      acc += D_w(n, iG(j1, j4p)) * Yhat(n, iX(a, j2p) * dG + iG(j4, j4p));
+                    H3(n, a * nc3 + i3(j1, j2p, j4)) = acc;
+                  }
+          nda::blas::gemm(Ttw_ff, H3, Ht3);
+          // P_ab(t)(p3',p4) = sum_{p1,p2'} Vt_b(t)(p1,p3',p2') Ht_a(t)(p1,p2',p4)
+          for (long it = 0; it < nt; ++it)
+            for (long a = 0; a < nbnd; ++a)
+              for (long b = 0; b < nbnd; ++b)
+                for (long j3p = 0; j3p < nc; ++j3p)
+                  for (long j4 = 0; j4 < nc; ++j4) {
+                    ComplexType acc(0.0);
+                    for (long j1 = 0; j1 < nc; ++j1)
+                      for (long j2p = 0; j2p < nc; ++j2p)
+                        acc += Vt3(it, b * nc3 + i3(j1, j3p, j2p)) * Ht3(it, a * nc3 + i3(j1, j2p, j4));
+                    Pab(it, (a * nbnd + b) * dG + iG(j4, j3p)) = acc;
+                  }
+          nda::blas::gemm(Twt_ff, Pab, convab);
+          const double fac = nF(q);
+          for (long n = 0; n < nw_f; ++n)
+            for (long a = 0; a < nbnd; ++a)
+              for (long b = 0; b < nbnd; ++b) {
+                ComplexType acc(0.0);
+                for (long j = 0; j < dG; ++j) acc += c_res(q, j) * convab(n, (a * nbnd + b) * dG + j);
+                Sw_ab(n, a, b) += fac * acc;
+              }
+        }
+        track_max(fam_max[2], Sw_ab);
+
+        // ================================================================
+        // family (IV): per (p, u) -- exactly-removable p=q diagonal
+        //   S(n) += nF(p)/(e_p - zf(n) - e_u) [b_p c_p Y_u . T[Wx, D/(i.-D_pu)]]_ring
+        // ================================================================
+        for (long p = 0; p < np; ++p) {
+          const double facp = nF(p);
+          for (long u = 0; u < np; ++u) {
+            const double Delta = epsl(p) - epsl(u);
+            for (long n = 0; n < nw_f; ++n) {
+              const ComplexType den = 1.0 / (zf(n) - Delta);
+              for (long j = 0; j < dG; ++j) HG(n, j) = D_w(n, j) * den;
+            }
+            nda::blas::gemm(Ttw_ff, HG, HGt);
+            // P_b(t)(p3,p3',p4') = sum_{p1} Wx_t(t)(b,p1;p3,p3') HGt(t)(p1,p4')
+            for (long it = 0; it < nt; ++it)
+              for (long b = 0; b < nbnd; ++b)
+                for (long j3 = 0; j3 < nc; ++j3)
+                  for (long j3p = 0; j3p < nc; ++j3p)
+                    for (long j4p = 0; j4p < nc; ++j4p) {
+                      ComplexType acc(0.0);
+                      for (long j1 = 0; j1 < nc; ++j1)
+                        acc += Wx_t(it, iX(b, j1) * dG + iG(j3, j3p)) * HGt(it, iG(j1, j4p));
+                      P3(it, b * nc3 + i3(j3, j3p, j4p)) = acc;
+                    }
+            nda::blas::gemm(Twt_ff, P3, conv3);
+            // static: T2_a(p3,p3',p4') = sum_{p4} [sum_{p2'} b_p(p3,p2') Y_u(a,p2';p4,p4')] c_p(p4,p3')
+            for (long a = 0; a < nbnd; ++a) {
+              for (long j3 = 0; j3 < nc; ++j3)
+                for (long j4 = 0; j4 < nc; ++j4)
+                  for (long j4p = 0; j4p < nc; ++j4p) {
+                    ComplexType acc(0.0);
+                    for (long j2p = 0; j2p < nc; ++j2p)
+                      acc += b_res(p, iG(j3, j2p)) * Y_res(u, iX(a, j2p) * dG + iG(j4, j4p));
+                    T1(i3(j3, j4, j4p)) = acc;
+                  }
+              for (long j3 = 0; j3 < nc; ++j3)
+                for (long j3p = 0; j3p < nc; ++j3p)
+                  for (long j4p = 0; j4p < nc; ++j4p) {
+                    ComplexType acc(0.0);
+                    for (long j4 = 0; j4 < nc; ++j4)
+                      acc += T1(i3(j3, j4, j4p)) * c_res(p, iG(j4, j3p));
+                    T2s(a, i3(j3, j3p, j4p)) = acc;
+                  }
+            }
+            for (long n = 0; n < nw_f; ++n) {
+              const ComplexType den = facp / (epsl(p) - zf(n) - epsl(u));
+              for (long a = 0; a < nbnd; ++a)
+                for (long b = 0; b < nbnd; ++b) {
+                  ComplexType acc(0.0);
+                  for (long j = 0; j < nc3; ++j) acc += T2s(a, j) * conv3(n, b * nc3 + j);
+                  Sw_ab(n, a, b) += den * acc;
+                }
+            }
+          }
+        }
+        track_max(fam_max[3], Sw_ab);
+
+        // ================================================================
+        // family (V): true double-pole correction at vx = 0
+        //   S(n) += -nF(p)(1-nF(p)) [b_p c_p Wx(0) D(iw) Wy(e_p-iw)]_ring
+        // ================================================================
+        for (long p = 0; p < np; ++p) {
+          const double fac = -nF(p) * (1.0 - nF(p));
+          for (long n = 0; n < nw_f; ++n)
+            for (long l = 0; l < np; ++l) Kf(n, l) = 1.0 / (epsl(p) - zf(n) - epsl(l));
+          nda::blas::gemm(Kf, Y_res, Yhat);    // Wy(e_p - iw)
+          for (long n = 0; n < nw_f; ++n) {
+            for (long a = 0; a < nbnd; ++a) {
+              for (long j3 = 0; j3 < nc; ++j3)
+                for (long j4 = 0; j4 < nc; ++j4)
+                  for (long j4p = 0; j4p < nc; ++j4p) {
+                    ComplexType acc(0.0);
+                    for (long j2p = 0; j2p < nc; ++j2p)
+                      acc += b_res(p, iG(j3, j2p)) * Yhat(n, iX(a, j2p) * dG + iG(j4, j4p));
+                    T1(i3(j3, j4, j4p)) = acc;
+                  }
+              for (long j3 = 0; j3 < nc; ++j3)
+                for (long j3p = 0; j3p < nc; ++j3p)
+                  for (long j4p = 0; j4p < nc; ++j4p) {
+                    ComplexType acc(0.0);
+                    for (long j4 = 0; j4 < nc; ++j4)
+                      acc += T1(i3(j3, j4, j4p)) * c_res(p, iG(j4, j3p));
+                    T2s(a, i3(j3, j3p, j4p)) = acc;
+                  }
+            }
+            // E_b(n)(p3,p3',p4') = sum_{p1} Wx_w(m0)(b,p1;p3,p3') D_w(n)(p1,p4')
+            for (long a = 0; a < nbnd; ++a)
+              for (long b = 0; b < nbnd; ++b) {
+                ComplexType acc(0.0);
+                for (long j3 = 0; j3 < nc; ++j3)
+                  for (long j3p = 0; j3p < nc; ++j3p)
+                    for (long j4p = 0; j4p < nc; ++j4p) {
+                      ComplexType eb(0.0);
+                      for (long j1 = 0; j1 < nc; ++j1)
+                        eb += Wx_w(m0, iX(b, j1) * dG + iG(j3, j3p)) * D_w(n, iG(j1, j4p));
+                      acc += T2s(a, i3(j3, j3p, j4p)) * eb;
+                    }
+                Sw_ab(n, a, b) += fac * acc;
+              }
+          }
+        }
+        track_max(fam_max[4], Sw_ab);
+
+        // ================================================================
+        // instantaneous parts (exact degenerate reductions, cf. iaft_dconv):
+        //   S1(t) = cx . B(t) . V(beta-t),  V = Wy_dyn*Q,  Q(t) = -C(t) D(beta-t)
+        //   S2(t) = cy . D(t) . V'(t),      V' = Wx_dyn*Q', Q'(t) = -B(t) C(beta-t)
+        //   S3(t) = -cx cy . B(t) C(beta-t) D(t)
+        // ================================================================
+        {
+          // S1
+          for (long it = 0; it < nt; ++it)
+            for (long j4 = 0; j4 < nc; ++j4)
+              for (long j3p = 0; j3p < nc; ++j3p)
+                for (long j1 = 0; j1 < nc; ++j1)
+                  for (long j4p = 0; j4p < nc; ++j4p)
+                    Q4(it, i4(j4, j3p, j1, j4p)) = -C2(it, iG(j4, j3p)) * Drefl(it, iG(j1, j4p));
+          nda::blas::gemm(Twt_bb, Q4, Q4w);
+          // V_a(m)(p2',p3',p1) = sum_{p4,p4'} Wy_w(m)(a,p2';p4,p4') Q4w(m)(p4,p3',p1,p4')
+          for (long m = 0; m < nw_b; ++m)
+            for (long a = 0; a < nbnd; ++a)
+              for (long j2p = 0; j2p < nc; ++j2p)
+                for (long j3p = 0; j3p < nc; ++j3p)
+                  for (long j1 = 0; j1 < nc; ++j1) {
+                    ComplexType acc(0.0);
+                    for (long j4 = 0; j4 < nc; ++j4)
+                      for (long j4p = 0; j4p < nc; ++j4p)
+                        acc += Wy_w(m, iX(a, j2p) * dG + iG(j4, j4p)) * Q4w(m, i4(j4, j3p, j1, j4p));
+                    Vi3(m, a * nc3 + i3(j2p, j3p, j1)) = acc;
+                  }
+          nda::blas::gemm(Ttw_bb, Vi3, Vit3);
+          nda::blas::gemm(R, Vit3, Virefl);
+          for (long it = 0; it < nt; ++it)
+            for (long a = 0; a < nbnd; ++a)
+              for (long b = 0; b < nbnd; ++b) {
+                ComplexType acc(0.0);
+                for (long j3 = 0; j3 < nc; ++j3)
+                  for (long j2p = 0; j2p < nc; ++j2p) {
+                    ComplexType inner(0.0);
+                    for (long j1 = 0; j1 < nc; ++j1)
+                      for (long j3p = 0; j3p < nc; ++j3p)
+                        inner += cx_ef(iX(b, j1), iG(j3, j3p)) * Virefl(it, a * nc3 + i3(j2p, j3p, j1));
+                    acc += B2(it, iG(j3, j2p)) * inner;
+                  }
+                St_ab(it, a, b) += acc;
+              }
+          track_max(fam_max[5], St_ab);
+
+          // S2
+          for (long it = 0; it < nt; ++it)
+            for (long j3 = 0; j3 < nc; ++j3)
+              for (long j2p = 0; j2p < nc; ++j2p)
+                for (long j4 = 0; j4 < nc; ++j4)
+                  for (long j3p = 0; j3p < nc; ++j3p)
+                    Q4(it, i4(j3, j2p, j4, j3p)) = -B2(it, iG(j3, j2p)) * Crefl(it, iG(j4, j3p));
+          nda::blas::gemm(Twt_bb, Q4, Q4w);
+          // V'_b(m)(p1,p2',p4) = sum_{p3,p3'} Wx_w(m)(b,p1;p3,p3') Q4w(m)(p3,p2',p4,p3')
+          for (long m = 0; m < nw_b; ++m)
+            for (long b = 0; b < nbnd; ++b)
+              for (long j1 = 0; j1 < nc; ++j1)
+                for (long j2p = 0; j2p < nc; ++j2p)
+                  for (long j4 = 0; j4 < nc; ++j4) {
+                    ComplexType acc(0.0);
+                    for (long j3 = 0; j3 < nc; ++j3)
+                      for (long j3p = 0; j3p < nc; ++j3p)
+                        acc += Wx_w(m, iX(b, j1) * dG + iG(j3, j3p)) * Q4w(m, i4(j3, j2p, j4, j3p));
+                    Vi3(m, b * nc3 + i3(j1, j2p, j4)) = acc;
+                  }
+          nda::blas::gemm(Ttw_bb, Vi3, Vit3);
+          for (long it = 0; it < nt; ++it)
+            for (long a = 0; a < nbnd; ++a)
+              for (long b = 0; b < nbnd; ++b) {
+                ComplexType acc(0.0);
+                for (long j1 = 0; j1 < nc; ++j1)
+                  for (long j2p = 0; j2p < nc; ++j2p)
+                    for (long j4 = 0; j4 < nc; ++j4) {
+                      ComplexType inner(0.0);
+                      for (long j4p = 0; j4p < nc; ++j4p)
+                        inner += cy_ef(iX(a, j2p), iG(j4, j4p)) * D2(it, iG(j1, j4p));
+                      acc += inner * Vit3(it, b * nc3 + i3(j1, j2p, j4));
+                    }
+                St_ab(it, a, b) += acc;
+              }
+          track_max(fam_max[6], St_ab);
+
+          // S3
+          for (long it = 0; it < nt; ++it)
+            for (long a = 0; a < nbnd; ++a) {
+              for (long j3 = 0; j3 < nc; ++j3)
+                for (long j4 = 0; j4 < nc; ++j4)
+                  for (long j4p = 0; j4p < nc; ++j4p) {
+                    ComplexType acc(0.0);
+                    for (long j2p = 0; j2p < nc; ++j2p)
+                      acc += B2(it, iG(j3, j2p)) * cy_ef(iX(a, j2p), iG(j4, j4p));
+                    T1(i3(j3, j4, j4p)) = acc;
+                  }
+              for (long j3 = 0; j3 < nc; ++j3)
+                for (long j3p = 0; j3p < nc; ++j3p)
+                  for (long j4p = 0; j4p < nc; ++j4p) {
+                    ComplexType acc(0.0);
+                    for (long j4 = 0; j4 < nc; ++j4)
+                      acc += T1(i3(j3, j4, j4p)) * Crefl(it, iG(j4, j3p));
+                    T2s(a, i3(j3, j3p, j4p)) = acc;
+                  }
+              for (long b = 0; b < nbnd; ++b) {
+                ComplexType acc(0.0);
+                for (long j3 = 0; j3 < nc; ++j3)
+                  for (long j3p = 0; j3p < nc; ++j3p)
+                    for (long j4p = 0; j4p < nc; ++j4p) {
+                      ComplexType eb(0.0);
+                      for (long j1 = 0; j1 < nc; ++j1)
+                        eb += cx_ef(iX(b, j1), iG(j3, j3p)) * D2(it, iG(j1, j4p));
+                      acc += T2s(a, i3(j3, j3p, j4p)) * eb;
+                    }
+                St_ab(it, a, b) += -acc;
+              }
+            }
+          track_max(fam_max[7], St_ab);
+        }
+
+        // accumulate this (qx, qy) combo into the rank-local (s, k) buffers
+        for (long n = 0; n < nw_f; ++n)
+          for (long a = 0; a < nbnd; ++a)
+            for (long b = 0; b < nbnd; ++b)
+              AccSw(is * nk + ik, n, a, b) += Sw_ab(n, a, b);
+        for (long it = 0; it < nt; ++it)
+          for (long a = 0; a < nbnd; ++a)
+            for (long b = 0; b < nbnd; ++b)
+              AccSt(is * nk + ik, it, a, b) += St_ab(it, a, b);
+      }  // iqy
+    }  // combo
+
+    app_log(3, "eval_sigma_C: rank-local running max |contrib|: fam I = {}, II = {}, III = {}, "
+               "IV = {}, V = {}, S1 = {}, S2 = {}, S3 = {}",
+            fam_max[0], fam_max[1], fam_max[2], fam_max[3], fam_max[4],
+            fam_max[5], fam_max[6], fam_max[7]);
+
+    // ---- dynamic part w -> tau, add instantaneous, normalize, reduce -----
+    Sigma_C_tskab() = ComplexType(0.0);
+    const double norm = 1.0 / double(nk * nk);   // (1/N_k)^2; the two 1/beta live in the algebra
+    {
+      nda::array<ComplexType, 2> St(nt, nbnd * nbnd);
+      for (long isk = 0; isk < ns * nk; ++isk) {
+        const long is = isk / nk, ik = isk % nk;
+        auto Sw2 = nda::reshape(AccSw(isk, all, all, all), vshape_t<2>{nw_f, nbnd * nbnd});
+        nda::blas::gemm(Ttw_ff, Sw2, St);
+        for (long it = 0; it < nt; ++it)
+          for (long a = 0; a < nbnd; ++a)
+            for (long b = 0; b < nbnd; ++b)
+              Sigma_C_tskab(it, is, ik, a, b) =
+                  norm * (St(it, a * nbnd + b) + AccSt(isk, it, a, b));
+      }
+    }
+    comm.all_reduce_in_place_n(Sigma_C_tskab.data(), Sigma_C_tskab.size(), std::plus<>{});
+#endif  // ENABLE_DLR
+  }
+
+}  // vertex_detail
+}  // solvers
+}  // methods
+
+#endif  // COQUI_VERTEX_SIGMA_ICC

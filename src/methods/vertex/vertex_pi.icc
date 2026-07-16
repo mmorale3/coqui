@@ -1,0 +1,657 @@
+#ifndef COQUI_VERTEX_PI_ICC
+#define COQUI_VERTEX_PI_ICC
+
+/**
+ * ISDF-Vertex Phase 1d: second-order-exchange polarization cut Pi^C (G^4 W, single rung).
+ *
+ * Physics (verified, sign_crossing_report.md; theoryB Eq. 13 with prefactor -1):
+ *
+ *   P^C_{ab,cd}(q,inu) = -(1/(Nk*beta)^2) sum_{k,qx} sum_{iw,ivx} sum_{p1,p1',p3,p3' in C} sum_s
+ *       G^s_{p3 b}(k+q, iw+inu) G^s_{c p3'}(k-qx+q, iw-ivx+inu)
+ *       G^s_{p1 d}(k-qx, iw-ivx) G^s_{a p1'}(k, iw)
+ *       * W_{(p1 p1'),(p3 p3')}(qx, ivx)              [W = Z + W_dyn, full rung]
+ *
+ * THC contraction (derived mechanically, notes/pi_c_kernel_design.md sections 2-3):
+ *
+ *   Pi^C_MN(q,inu) = -(spin/Nk^2) (1/beta^2) sum_{s,k,qx} sum_{w,vx} sum_{p1 p1' p3 p3' in C}
+ *      [ zL_{N p1'}(k, iw) zR_{p3 N}(k+q, iw+inu) ]                    <- "T pair", shares N
+ *      * wbar_{(p1 p1'),(p3 p3')}(qx,ivx; k,q)
+ *      * [ zR_{p1 M}(k-qx, iw-ivx) zL_{M p3'}(k-qx+q, iw+inu-ivx) ]   <- "M pair", shares M
+ *
+ *   zL_{mu j}(k',t) = sum_a X_mu,a(k') G^s_{a j}(k',t)   (j in C)      (Np x Nb)
+ *   zR_{j mu}(k',t) = sum_b G^s_{j b}(k',t) X*_mu,b(k')  (j in C)      (Nb x Np)
+ *   wbar = U1^T [Z + W_dyn](qx,ivx) U2,  U1_(P,(p1p1')) = X_P,p1(k-qx) X*_P,p1'(k),
+ *                                        U2_(Q,(p3p3')) = X_Q,p3(k+q) X*_Q,p3'(k-qx+q).
+ *
+ * Imaginary-axis algorithm (exact; design doc section 4). The loop frequency threads both
+ * pairs and each pair has relative shift = the EXTERNAL inu; the rung sum couples the two
+ * pairs with relative shift ivx. Exact evaluation on sparse grids:
+ *
+ *  (a) pairing identity ("star"):
+ *        (1/beta) sum_w A(w+nu) B(w) = - int_0^beta dt e^{i nu t} At(t) Bt(beta-t)
+ *      with At/Bt the exact tau-grid objects; the integral/transform is a row of Twt_bb.
+ *      Used for the instantaneous (Z) part, which decouples exactly into two independent
+ *      pair bubbles b41(nu) (x) wbar_Z (x) b23(nu). Backend-agnostic.
+ *
+ *  (b) dynamic part:
+ *        Pi_dyn(nu) = - int_0^beta ds  Tt_nu(s) . wbar_dyn~(beta-s) . Mt_nu(beta-s)
+ *      where Tt_nu(s) = (1/beta) sum_w e^{-iws} zL4(w) zR1(w+nu) is the tau-resolved
+ *      TWISTED pair (and Mt_nu likewise). Twisted pairs are NOT representable by the
+ *      scalar basis (two-scale objects); they are computed EXACTLY by DLR pole algebra:
+ *        zX(w) = sum_p c_p/(iw - eps_p)  (aux NONSYM DLR pole basis, cf. iaft_dconv.hpp)
+ *        (1/beta) sum_w e^{-iws} 1/((iw-e_p)(iw+inu-e_q))
+ *            = [K_F(s,e_p) - e^{i nu s} E(s,e_q)] / (e_p - e_q + i nu)
+ *        K_F(s,e) = -e^{-es}/(1+e^{-beta e}),  E(s,e) = +e^{-es}/(1+e^{-beta e}).
+ *      The oscillatory e^{+/- i nu s} components are kept SEPARATE (kappa0/kappa1) and the
+ *      final s-integral of each smooth component is read from the exact transform rows:
+ *        int ds F0(s) -> row(nu=0);  int ds e^{i nu s} F+(s) -> row(nu);
+ *        int ds e^{-i nu s} F-(s) -> row(-nu).
+ *      At nu = 0 the merged kernel with the degenerate (e_p = e_q) limit is used.
+ *      The dynamic part therefore requires the DLR backend (as does the sibling
+ *      double_boson_conv); the bare-Z rung (first iteration) is backend-agnostic.
+ *
+ * Remaining representability assumptions [A-comp] (same class as GG/WGG in GW/SOSEX):
+ * products of representable tau-objects (pair products, triple products with wbar~) stay
+ * within the basis span given the instance's wmax headroom.
+ *
+ * Symmetry policy: symmetry-free meshes only (enforced by vertex_t::eval_Pi_C).
+ */
+
+#include <map>
+#include <cmath>
+#include <complex>
+
+#include "configuration.hpp"
+#include "nda/nda.hpp"
+#include "nda/blas.hpp"
+#include "utilities/check.hpp"
+#include "IO/app_loggers.h"
+#include "numerics/imag_axes_ft/IAFT.hpp"
+// under ENABLE_DLR, IAFT.hpp -> dlr_driver.hpp provides the cppdlr headers used below
+// (same pattern as numerics/imag_axes_ft/iaft_dconv.hpp)
+
+namespace methods {
+namespace solvers {
+namespace vertex_pi {
+
+  template<int N>
+  using shape_t = std::array<long, N>;
+
+  /**
+   * Precomputed imaginary-axis machinery for the Pi^C kernel.
+   */
+  struct iaft_tools {
+    const imag_axes_ft::IAFT* ft = nullptr;
+    double beta = 0;
+    long nt_f = 0, nw_b = 0;
+    long m0 = -1;                        // index of nu = 0 in wn_mesh_b
+    nda::array<long, 1> wn_b;            // bosonic Matsubara integer labels (even)
+    nda::array<double, 1> s_phys;        // physical tau values of the (shared) tau mesh
+    nda::array<long, 1> t_mirror;        // index of beta - tau_i
+    nda::array<long, 1> w_mirror_b;      // index of -nu_l in wn_mesh_b
+    nda::array<ComplexType, 2> Twt_bb;   // (nw_b, nt): values(tau) -> values(inu)
+    nda::array<ComplexType, 2> Ttw_bb;   // (nt, nw_b): values(inu) -> values(tau)
+
+    // --- DLR pole machinery for the dynamic part (lazy) -------------------------------
+    bool poles_ready = false;
+    long np = 0;
+    nda::array<double, 1> epsl;          // physical pole energies eps_p
+    nda::array<ComplexType, 2> Tmap;     // (np, nt): backend tau values -> aux tau values
+#ifdef ENABLE_DLR
+    std::unique_ptr<cppdlr::imtime_ops> itops_p;
+#endif
+
+    explicit iaft_tools(imag_axes_ft::IAFT const& ft_) : ft(&ft_) {
+      beta = ft->beta();
+      nt_f = ft->nt_f();
+      nw_b = ft->nw_b();
+      utils::check(ft->nt_b() == nt_f,
+                   "vertex_pi::iaft_tools: nt_b ({}) != nt_f ({}) is not supported.",
+                   ft->nt_b(), nt_f);
+
+      wn_b = nda::array<long, 1>(nw_b);
+      auto wb = ft->wn_mesh_b();
+      for (long l = 0; l < nw_b; ++l) wn_b(l) = wb(l);
+
+      // nu = 0 node and -nu mirror map
+      w_mirror_b = nda::array<long, 1>(nw_b);
+      for (long l = 0; l < nw_b; ++l) {
+        if (wn_b(l) == 0) m0 = l;
+        long lm = -1;
+        for (long l2 = 0; l2 < nw_b; ++l2)
+          if (wn_b(l2) == -wn_b(l)) { lm = l2; break; }
+        utils::check(lm >= 0, "vertex_pi::iaft_tools: bosonic mesh is not +/- symmetric "
+                              "(no partner for n = {}).", wn_b(l));
+        w_mirror_b(l) = lm;
+      }
+      utils::check(m0 >= 0, "vertex_pi::iaft_tools: bosonic Matsubara mesh does not contain nu=0.");
+
+      // tau mirror (beta - tau), requires a PH-symmetric mesh (same check as scr_coulomb_t.cpp:52-59)
+      auto tau = ft->tau_mesh();
+      t_mirror = nda::array<long, 1>(nt_f);
+      s_phys = nda::array<double, 1>(nt_f);
+      for (long i = 0; i < nt_f; ++i) {
+        long im = nt_f - i - 1;
+        utils::check(std::abs(tau(i) + tau(im)) <= 1e-10,
+                     "vertex_pi::iaft_tools: tau mesh is not particle-hole symmetric.");
+        t_mirror(i) = im;
+        s_phys(i) = (tau(i) + 1.0) * 0.5 * beta;   // x in (-1,1) -> tau in (0,beta)
+      }
+
+      Twt_bb = nda::array<ComplexType, 2>(ft->Twt_bb());
+      Ttw_bb = nda::array<ComplexType, 2>(ft->Ttw_bb());
+    }
+
+    // stable K_F(s,e) = -e^{-e s} / (1 + e^{-beta e}),  s in [0, beta]
+    double KF(double s, double e) const {
+      if (e >= 0.0) return -std::exp(-e * s) / (1.0 + std::exp(-beta * e));
+      return -std::exp(e * (beta - s)) / (1.0 + std::exp(beta * e));
+    }
+    // fermionic occupation
+    double nF(double e) const {
+      if (e >= 0.0) { double x = std::exp(-beta * e); return x / (1.0 + x); }
+      return 1.0 / (1.0 + std::exp(beta * e));
+    }
+
+    /** initialize the auxiliary (NONSYM) DLR pole basis; the dynamic-rung path only. */
+    void init_poles() {
+      if (poles_ready) return;
+#ifndef ENABLE_DLR
+      utils::check(false, "vertex_pi: the dynamic-rung Pi^C requires the DLR imaginary-axis "
+                          "backend (build with ENABLE_DLR=ON).");
+#else
+      utils::check(ft->basis() == imag_axes_ft::dlr_basis,
+                   "vertex_pi: the dynamic-rung Pi^C requires the DLR imaginary-axis backend; "
+                   "the IR backend does not expose the needed off-grid evaluations yet. "
+                   "Rerun with iaft basis = \"dlr\".");
+      // NONSYM aux pole grid (well-conditioned interpolatory coefficients; the backend SYM
+      // grid has near-degenerate +/- pairs with huge cancelling coefficients -- see the
+      // discussion in iaft_dconv.hpp).
+      auto rf = cppdlr::build_dlr_rf(ft->lambda(), ft->eps());
+      itops_p = std::make_unique<cppdlr::imtime_ops>(ft->lambda(), rf);
+      np = itops_p->rank();
+      nda::array<double, 1> x_p(np);
+      for (long i = 0; i < np; ++i) x_p(i) = 2.0 * cppdlr::rel2abs(itops_p->get_itnodes(i)) - 1.0;
+      auto Tarr = ft->construct_tau_interpolate_matrix(x_p);   // (np, nt)
+      Tmap = nda::array<ComplexType, 2>(np, nt_f);
+      for (long i = 0; i < np; ++i)
+        for (long l = 0; l < nt_f; ++l) Tmap(i, l) = Tarr(i, l);
+      epsl = nda::array<double, 1>(np);
+      for (long l = 0; l < np; ++l) epsl(l) = rf(l) / beta;
+
+      // self-check of the pole conventions: a single off-grid pole function
+      {
+        double estar = 0.37 * epsl(np - 1) + 0.11 * epsl(0);
+        nda::array<ComplexType, 2> h(nt_f, 1);
+        for (long i = 0; i < nt_f; ++i) h(i, 0) = KF(s_phys(i), estar);
+        auto c = pole_coeffs(h);
+        auto wf = ft->wn_mesh_f();
+        double max_err = 0;
+        for (long n = 0; n < std::min(5L, (long)wf.size()); ++n) {
+          ComplexType z(0.0, double(wf(n)) * M_PI / beta);
+          ComplexType val = 0;
+          for (long p = 0; p < np; ++p) val += c(p, 0) / (z - epsl(p));
+          max_err = std::max(max_err, std::abs(val - 1.0 / (z - estar)));
+        }
+        // a wrong pole convention gives O(1) error; fit accuracy is O(eps)
+        double tol = std::max(1e-8, 1e3 * ft->eps());
+        utils::check(max_err < tol,
+                     "vertex_pi::init_poles: DLR pole-convention self-check failed "
+                     "(err = {}, tol = {}).", max_err, tol);
+      }
+      poles_ready = true;
+#endif
+    }
+
+    /** DLR pole residues of tau-grid data (leading axis nt_f): F(z) = sum_p c_p/(z-eps_p). */
+    nda::array<ComplexType, 2> pole_coeffs(nda::MemoryArrayOfRank<2> auto const& F_td) const {
+#ifndef ENABLE_DLR
+      (void)F_td;
+      utils::check(false, "vertex_pi::pole_coeffs: requires ENABLE_DLR.");
+      return nda::array<ComplexType, 2>(0, 0);
+#else
+      long d = F_td.shape(1);
+      nda::array<ComplexType, 2> tmp(np, d);
+      nda::blas::gemm(Tmap, F_td, tmp);
+      nda::array<ComplexType, 2> c = itops_p->vals2coefs(tmp);
+      return c;
+#endif
+    }
+
+    /**
+     * Twisted-pair kernels for external node m:
+     *   kappa(p,q,s) = (1/beta) sum_w e^{-iws} / ((iw - e_p)(iw + i nu_m - e_q))
+     *                = kappa0(p,q,s) + e^{i nu_m s} kappa1(p,q,s)
+     *   kappa0 = K_F(s,e_p)/D,  kappa1 = E(s,e_q)/D,  D = e_p - e_q + i nu_m,
+     *   E(s,e) = -K_F(s,e) = e^{-es}/(1+e^{-beta e}).
+     * At nu_m = 0 the merged kernel is returned in kappa0 (kappa1 = 0), with the exact
+     * degenerate limit  kappa = -K_F(s,e)[s - beta nF(e)]  at e_p = e_q.
+     */
+    void build_kappa(long m, nda::array<ComplexType, 3>& k0,
+                     nda::array<ComplexType, 3>& k1) const {
+      utils::check(poles_ready, "vertex_pi::build_kappa: poles not initialized.");
+      double nu = double(wn_b(m)) * M_PI / beta;
+      k0.resize(np, np, nt_f);
+      k1.resize(np, np, nt_f);
+      if (wn_b(m) == 0) {
+        for (long p = 0; p < np; ++p)
+          for (long q = 0; q < np; ++q) {
+            double de = epsl(p) - epsl(q);
+            if (std::abs(de) < 1e-10) {
+              for (long s = 0; s < nt_f; ++s) {
+                double kf = KF(s_phys(s), epsl(p));
+                k0(p, q, s) = -kf * (s_phys(s) - beta * nF(epsl(p)));
+                k1(p, q, s) = ComplexType(0.0);
+              }
+            } else {
+              for (long s = 0; s < nt_f; ++s) {
+                k0(p, q, s) = (KF(s_phys(s), epsl(p)) - KF(s_phys(s), epsl(q))) / de;
+                k1(p, q, s) = ComplexType(0.0);
+              }
+            }
+          }
+      } else {
+        for (long p = 0; p < np; ++p)
+          for (long q = 0; q < np; ++q) {
+            ComplexType D(epsl(p) - epsl(q), nu);
+            ComplexType Di = 1.0 / D;
+            for (long s = 0; s < nt_f; ++s) {
+              k0(p, q, s) = KF(s_phys(s), epsl(p)) * Di;
+              k1(p, q, s) = -KF(s_phys(s), epsl(q)) * Di;   // E(s,e_q)/D
+            }
+          }
+      }
+    }
+  };
+
+  namespace detail {
+    /**
+     * One-sided C-restricted aux transforms of G at every (s,k), in imaginary time:
+     *   zL(s,k,t,mu,j) = [X(s,k) G(s,k,t)](mu, j in C)
+     *   zR(s,k,t,j,mu) = [G(s,k,t) X(s,k)^dagger](j in C, mu)
+     */
+    template<nda::MemoryArrayOfRank<5> GArr, nda::MemoryArrayOfRank<4> XArr>
+    void build_z_tau(GArr const& G_tskij, XArr const& X_skPa, nda::range C,
+                     nda::array<ComplexType, 5>& zL_sktMj,
+                     nda::array<ComplexType, 5>& zR_sktjM) {
+      long nt = G_tskij.shape(0), ns = G_tskij.shape(1), nk = G_tskij.shape(2);
+      long nbnd = G_tskij.shape(4);
+      long Np = X_skPa.shape(2);
+      long Nb = C.size();
+      decltype(nda::range::all) all;
+
+      zL_sktMj = nda::array<ComplexType, 5>(ns, nk, nt, Np, Nb);
+      zR_sktjM = nda::array<ComplexType, 5>(ns, nk, nt, Nb, Np);
+
+      nda::matrix<ComplexType> Xd(nbnd, Np);
+      nda::matrix<ComplexType> Gc(nbnd, Nb);
+      nda::matrix<ComplexType> Gr(Nb, nbnd);
+      for (long is = 0; is < ns; ++is)
+        for (long ik = 0; ik < nk; ++ik) {
+          auto Xm = X_skPa(is, ik, all, all);
+          Xd = nda::dagger(Xm);
+          for (long it = 0; it < nt; ++it) {
+            auto Gt = G_tskij(it, is, ik, all, all);
+            Gc = Gt(all, C);
+            Gr = Gt(C, all);
+            auto zl = zL_sktMj(is, ik, it, all, all);
+            auto zr = zR_sktjM(is, ik, it, all, all);
+            nda::blas::gemm(Xm, Gc, zl);
+            nda::blas::gemm(Gr, Xd, zr);
+          }
+        }
+    }
+
+    /**
+     * Twisted-pair components on the tau grid from pole data:
+     *   out_c(s)_{d1,(jA jB)} shared-aux pair
+     *     = sum_{p,q} cA_p(d1,jA) cB_q(jB,d1) kappa_c(p,q,s)
+     * cA: (np, Np, Nb) [aux-major, "left" object], cB: (np, Nb, Np) ["right" object].
+     * Output: (nt, Nb*Nb, Np) with row index (jA*Nb + jB).
+     */
+    inline void build_pair_component(nda::array<ComplexType, 3> const& kap,   // (np,np,nt)
+                                     nda::MemoryArrayOfRank<3> auto const& cA,   // (np, Np, Nb)
+                                     nda::MemoryArrayOfRank<3> auto const& cB,   // (np, Nb, Np)
+                                     nda::array<ComplexType, 3>& out) {       // (nt, Nb2, Np)
+      long np = kap.shape(0), nt = kap.shape(2);
+      long Np = cA.shape(1), Nb = cA.shape(2);
+      out.resize(nt, Nb * Nb, Np);
+      out() = ComplexType(0.0);
+      // W_p(s, jB, mu) = sum_q kappa(p,q,s) cB_q(jB,mu)
+      nda::array<ComplexType, 2> Wp(nt, Nb * Np);
+      auto cB2 = nda::reshape(cB, shape_t<2>{np, Nb * Np});
+      nda::array<ComplexType, 2> kap_st(nt, np);
+      for (long p = 0; p < np; ++p) {
+        for (long s = 0; s < nt; ++s)
+          for (long q = 0; q < np; ++q) kap_st(s, q) = kap(p, q, s);
+        nda::blas::gemm(kap_st, cB2, Wp);
+        auto Wp3 = nda::reshape(Wp, shape_t<3>{nt, Nb, Np});
+        for (long s = 0; s < nt; ++s)
+          for (long jA = 0; jA < Nb; ++jA)
+            for (long jB = 0; jB < Nb; ++jB)
+              for (long mu = 0; mu < Np; ++mu)
+                out(s, jA * Nb + jB, mu) += cA(p, mu, jA) * Wp3(s, jB, mu);
+      }
+    }
+  } // detail
+
+  /**
+   * Accumulate Pi^C(q, inu) on the full bosonic Matsubara mesh, in the *notes* frequency
+   * convention with the code's (M,N) index routing (see file header). Contributions from
+   * the (s,k,qx) tuples with (flat index % nproc == rank) are added to Pi_wqMN.
+   *
+   * @param Wdyn_qwPQ - dynamic W on the FULL bosonic mesh (nq, nw_b, Np, Np), or nullptr
+   *                    (first iteration: bare-Z rung only).
+   * @param kmq, kpq  - (nq, nk) index maps for k-q and k+q on the full (symmetry-free) mesh.
+   * @param skip_rung_gamma - ignore_g0 semantics on the INTERNAL rung transfer: skip the
+   *                    qx = Gamma term of the rung sum, consistently for the bare-Z and the
+   *                    dynamic parts (the rung is ONE interaction line W(qx) = Z + W_dyn;
+   *                    its q->0 cell carries the unregularized Coulomb head, which GW tames
+   *                    with div corrections the vertex does not have yet). O(1/Nq)
+   *                    finite-size error, same class as GW's "ignore_g0" div treatment.
+   * @param qx_diag   - optional (nq): per-qx max |single contribution| to Pi^C(inu),
+   *                    rank-local (for the q->0 diagnostics; logged by the caller).
+   */
+  template<nda::MemoryArrayOfRank<5> GArr, nda::MemoryArrayOfRank<4> XArr,
+           nda::MemoryArrayOfRank<3> ZArr>
+  void pi_c_accumulate_w(imag_axes_ft::IAFT const& ft, iaft_tools& tools,
+                         GArr const& G_tskij, XArr const& X_skPa,
+                         ZArr const& Z_qPQ,
+                         nda::array<ComplexType, 4> const* Wdyn_qwPQ,
+                         nda::array<long, 2> const& kmq,
+                         nda::array<long, 2> const& kpq,
+                         nda::range C,
+                         nda::array<ComplexType, 4>& Pi_wqMN,
+                         long rank, long nproc,
+                         bool skip_rung_gamma = false,
+                         nda::array<double, 1>* qx_diag = nullptr) {
+    (void)ft;
+    decltype(nda::range::all) all;
+    long ns = G_tskij.shape(1), nk = G_tskij.shape(2);
+    long nq = Z_qPQ.shape(0);
+    long Np = X_skPa.shape(2);
+    long Nb = C.size();
+    long nt = tools.nt_f, nw_b = tools.nw_b;
+    long Nb2 = Nb * Nb;
+
+    utils::check(Pi_wqMN.shape(0) == nw_b and Pi_wqMN.shape(1) == nq and
+                 Pi_wqMN.shape(2) == Np and Pi_wqMN.shape(3) == Np,
+                 "vertex_pi::pi_c_accumulate_w: output shape mismatch.");
+
+    // spin factor mirrors rpa_pi.icc:312: external spin sum, ns==1 -> degeneracy 2
+    const ComplexType pref = ComplexType(-((ns == 1) ? 2.0 : 1.0) / double(nk * nk));
+
+    // Gamma index of the transfer mesh, detected index-based: qx = Gamma <=> k-qx = k
+    long iq_gamma = -1;
+    for (long iq = 0; iq < nq; ++iq) {
+      bool g = true;
+      for (long ik = 0; ik < nk; ++ik)
+        if (kmq(iq, ik) != ik) { g = false; break; }
+      if (g) { iq_gamma = iq; break; }
+    }
+    utils::check(not skip_rung_gamma or iq_gamma >= 0,
+                 "vertex_pi::pi_c_accumulate_w: skip_rung_gamma requested but no Gamma point "
+                 "was found in the transfer mesh.");
+    if (qx_diag != nullptr) {
+      utils::check(qx_diag->size() == nq, "vertex_pi::pi_c_accumulate_w: qx_diag size mismatch.");
+      (*qx_diag)() = 0.0;
+    }
+    nda::array<ComplexType, 2> Ctmp(Np, Np);
+    auto track_add = [&](long iqx, auto&& Pi_MN) {
+      if (qx_diag != nullptr) {
+        double mx = 0.0;
+        for (auto const& v : Ctmp) mx = std::max(mx, std::abs(v));
+        (*qx_diag)(iqx) = std::max((*qx_diag)(iqx), mx);
+      }
+      Pi_MN += Ctmp;
+    };
+
+    // tau-domain z objects
+    nda::array<ComplexType, 5> zL, zR;
+    detail::build_z_tau(G_tskij, X_skPa, C, zL, zR);
+
+    long ntuples = ns * nk * nq;
+
+    // ---------------- helper: rung collocations + orbital-projected rung ----------------
+    nda::array<ComplexType, 2> U1(Np, Nb2), U2(Np, Nb2), ZU2(Np, Nb2);
+    auto build_U = [&](long is, long ik, long ikmqx, long ikpq, long ikxq) {
+      for (long P = 0; P < Np; ++P) {
+        for (long j1 = 0; j1 < Nb; ++j1) {
+          auto x1 = X_skPa(is, ikmqx, P, C.first() + j1);
+          for (long j1p = 0; j1p < Nb; ++j1p)
+            U1(P, j1 * Nb + j1p) = x1 * std::conj(X_skPa(is, ik, P, C.first() + j1p));
+        }
+        for (long j3 = 0; j3 < Nb; ++j3) {
+          auto x3 = X_skPa(is, ikpq, P, C.first() + j3);
+          for (long j3p = 0; j3p < Nb; ++j3p)
+            U2(P, j3 * Nb + j3p) = x3 * std::conj(X_skPa(is, ikxq, P, C.first() + j3p));
+        }
+      }
+    };
+    // rearrange wbar[(p1p1'),(p3p3')] -> wmat[(p1'p3),(p1p3')]
+    auto to_wmat = [&](nda::array<ComplexType, 2> const& wbar, auto&& wmat) {
+      for (long j1 = 0; j1 < Nb; ++j1)
+        for (long j1p = 0; j1p < Nb; ++j1p)
+          for (long j3 = 0; j3 < Nb; ++j3)
+            for (long j3p = 0; j3p < Nb; ++j3p)
+              wmat(j1p * Nb + j3, j1 * Nb + j3p) = wbar(j1 * Nb + j1p, j3 * Nb + j3p);
+    };
+
+    // =====================================================================================
+    // PHASE 1: instantaneous rung (Z) -- exact, backend-agnostic pair bubbles.
+    //   b41(m)_{(p1'p3),N} = -[Twt_bb . prod41](m),
+    //     prod41(s) = zR(k+q, s)_{p3 N} * zL(k, beta-s)_{N p1'}
+    //   b23(m)_{(p1p3'),M} = -[Twt_bb . prod23](m),
+    //     prod23(s) = zL(k-qx+q, s)_{M p3'} * zR(k-qx, beta-s)_{p1 M}
+    //   Pi_Z(m,q) += pref * b41(m)^T(N-side) . wZmat . b23(m)
+    // =====================================================================================
+    {
+      nda::array<ComplexType, 2> prod41(nt, Nb2 * Np), prod23(nt, Nb2 * Np);
+      nda::array<ComplexType, 2> b41(nw_b, Nb2 * Np), b23(nw_b, Nb2 * Np);
+      nda::array<ComplexType, 2> wbarZ(Nb2, Nb2), wZmat(Nb2, Nb2);
+      nda::array<ComplexType, 2> ThZ(Nb2, Np);
+      for (long tup = rank; tup < ntuples; tup += nproc) {
+        long is = tup / (nk * nq);
+        long ik = (tup / nq) % nk;
+        long iqx = tup % nq;
+        if (skip_rung_gamma and iqx == iq_gamma) continue;
+        long ikmqx = kmq(iqx, ik);
+        for (long iq = 0; iq < nq; ++iq) {
+          long ikpq = kpq(iq, ik);
+          long ikxq = kmq(iqx, ikpq);
+          build_U(is, ik, ikmqx, ikpq, ikxq);
+          nda::blas::gemm(Z_qPQ(iqx, all, all), U2, ZU2);
+          nda::blas::gemm(nda::transpose(U1), ZU2, wbarZ);
+          to_wmat(wbarZ, wZmat);
+
+          for (long s = 0; s < nt; ++s) {
+            long sm = tools.t_mirror(s);
+            for (long jp = 0; jp < Nb; ++jp)
+              for (long j3 = 0; j3 < Nb; ++j3)
+                for (long N = 0; N < Np; ++N)
+                  prod41(s, (jp * Nb + j3) * Np + N) =
+                      zR(is, ikpq, s, j3, N) * zL(is, ik, sm, N, jp);
+            for (long j1 = 0; j1 < Nb; ++j1)
+              for (long j3p = 0; j3p < Nb; ++j3p)
+                for (long M = 0; M < Np; ++M)
+                  prod23(s, (j1 * Nb + j3p) * Np + M) =
+                      zL(is, ikxq, s, M, j3p) * zR(is, ikmqx, sm, j1, M);
+          }
+          nda::blas::gemm(ComplexType(-1.0), tools.Twt_bb, prod41, ComplexType(0.0), b41);
+          nda::blas::gemm(ComplexType(-1.0), tools.Twt_bb, prod23, ComplexType(0.0), b23);
+
+          for (long m = 0; m < nw_b; ++m) {
+            auto b41m = nda::reshape(b41(m, all), shape_t<2>{Nb2, Np});
+            auto b23m = nda::reshape(b23(m, all), shape_t<2>{Nb2, Np});
+            auto Pi_MN = Pi_wqMN(m, iq, all, all);
+            nda::blas::gemm(wZmat, b23m, ThZ);
+            nda::blas::gemm(pref, nda::transpose(ThZ), b41m, ComplexType(0.0), Ctmp);
+            track_add(iqx, Pi_MN);
+          }
+        }
+      }
+    }
+
+    if (Wdyn_qwPQ == nullptr) return;
+
+    // =====================================================================================
+    // PHASE 2: dynamic rung -- exact DLR pole algebra for the twisted pairs.
+    // =====================================================================================
+    tools.init_poles();
+    long np = tools.np;
+
+    // pole coefficients of all z objects: cL(s,k): (np, Np, Nb); cR(s,k): (np, Nb, Np)
+    nda::array<ComplexType, 5> cL(ns, nk, np, Np, Nb), cR(ns, nk, np, Nb, Np);
+    {
+      nda::array<ComplexType, 2> buf(nt, Np * Nb);
+      for (long is = 0; is < ns; ++is)
+        for (long ik = 0; ik < nk; ++ik) {
+          auto zl2 = nda::reshape(zL(is, ik, nda::ellipsis{}), shape_t<2>{nt, Np * Nb});
+          buf = zl2;
+          auto c = tools.pole_coeffs(buf);
+          auto cv = nda::reshape(cL(is, ik, nda::ellipsis{}), shape_t<2>{np, Np * Nb});
+          cv = c;
+          auto zr2 = nda::reshape(zR(is, ik, nda::ellipsis{}), shape_t<2>{nt, Nb * Np});
+          buf = zr2;
+          auto c2 = tools.pole_coeffs(buf);
+          auto cv2 = nda::reshape(cR(is, ik, nda::ellipsis{}), shape_t<2>{np, Nb * Np});
+          cv2 = c2;
+        }
+    }
+
+    // work arrays for the m-loop
+    nda::array<ComplexType, 3> kap0, kap1;
+    // pair caches over (spin, k', q): components 0/1 of T-type and M-type pairs
+    // T pair at (k,q):  cA = cL(k) [zL4], cB = cR(k+q) [zR1, shifted slot]
+    // M pair at (k',q): cA = cR(k') [zR3] viewed with d1 = M...  (see build below)
+    nda::array<ComplexType, 6> T0(ns, nk, nq, nt, Nb2, Np), T1(ns, nk, nq, nt, Nb2, Np);
+    nda::array<ComplexType, 6> M0(ns, nk, nq, nt, Nb2, Np), M1(ns, nk, nq, nt, Nb2, Np);
+    nda::array<ComplexType, 3> pcomp;
+
+    nda::array<ComplexType, 3> wbarD(nw_b, Nb2, Nb2);
+    nda::array<ComplexType, 2> wq_flat(nw_b, Nb2 * Nb2);
+    nda::array<ComplexType, 2> wt_flat(nt, Nb2 * Nb2);
+    nda::array<ComplexType, 2> Th(Nb2, Np);
+    nda::array<ComplexType, 2> Tf(nt * Nb2, Np), Thf(nt * Nb2, Np);
+
+    // M-pair pole data needs cA with layout (np, Np, Nb) sharing aux M:
+    //   Mt(s)_{M,(p1 p3')} = sum_{p,q} cR3_p(p1,M) cL2_q(M,p3') kappa(p,q,s)
+    // reuse build_pair_component with cA'(p, M, p1) := cR3_p(p1, M), cB'(q, p3', M) := cL2_q(M, p3')
+    nda::array<ComplexType, 3> cAp(np, Np, Nb), cBp(np, Nb, Np);
+
+    for (long m = 0; m < nw_b; ++m) {
+      tools.build_kappa(m, kap0, kap1);
+
+      // ---- build all pair components for this m --------------------------------------
+      for (long is = 0; is < ns; ++is)
+        for (long ik2 = 0; ik2 < nk; ++ik2)
+          for (long iq = 0; iq < nq; ++iq) {
+            long ik2pq = kpq(iq, ik2);
+            // T pair: rows (p1', p3): cA = cL(ik2) (aux N), cB = cR(ik2pq)
+            detail::build_pair_component(kap0, cL(is, ik2, nda::ellipsis{}),
+                                         cR(is, ik2pq, nda::ellipsis{}), pcomp);
+            T0(is, ik2, iq, nda::ellipsis{}) = pcomp;
+            detail::build_pair_component(kap1, cL(is, ik2, nda::ellipsis{}),
+                                         cR(is, ik2pq, nda::ellipsis{}), pcomp);
+            T1(is, ik2, iq, nda::ellipsis{}) = pcomp;
+            // M pair: rows (p1, p3'): cA'(p,M,p1) = cR(ik2)(p,p1,M); cB'(q,p3',M) = cL(ik2pq)(q,M,p3')
+            for (long p = 0; p < np; ++p)
+              for (long M = 0; M < Np; ++M)
+                for (long j = 0; j < Nb; ++j) {
+                  cAp(p, M, j) = cR(is, ik2, p, j, M);
+                  cBp(p, j, M) = cL(is, ik2pq, p, M, j);
+                }
+            detail::build_pair_component(kap0, cAp, cBp, pcomp);
+            M0(is, ik2, iq, nda::ellipsis{}) = pcomp;
+            detail::build_pair_component(kap1, cAp, cBp, pcomp);
+            M1(is, ik2, iq, nda::ellipsis{}) = pcomp;
+          }
+
+      long mbar = tools.w_mirror_b(m);
+      bool is_m0 = (tools.wn_b(m) == 0);
+
+      // ---- contract over this rank's tuples -------------------------------------------
+      for (long tup = rank; tup < ntuples; tup += nproc) {
+        long is = tup / (nk * nq);
+        long ik = (tup / nq) % nk;
+        long iqx = tup % nq;
+        if (skip_rung_gamma and iqx == iq_gamma) continue;
+        long ikmqx = kmq(iqx, ik);
+        for (long iq = 0; iq < nq; ++iq) {
+          long ikpq = kpq(iq, ik);
+          long ikxq = kmq(iqx, ikpq);
+          build_U(is, ik, ikmqx, ikpq, ikxq);
+
+          // wbar_dyn(l) -> wmat layout -> tau form wt(s)[(p1'p3),(p1p3')]
+          for (long l = 0; l < nw_b; ++l) {
+            nda::blas::gemm((*Wdyn_qwPQ)(iqx, l, all, all), U2, ZU2);
+            auto wb = wbarD(l, all, all);
+            nda::blas::gemm(nda::transpose(U1), ZU2, wb);
+          }
+          for (long l = 0; l < nw_b; ++l) {
+            auto wm = nda::reshape(wq_flat(l, all), shape_t<2>{Nb2, Nb2});
+            to_wmat(wbarD(l, all, all), wm);
+          }
+          nda::blas::gemm(tools.Ttw_bb, wq_flat, wt_flat);
+
+          auto Pi_MN = Pi_wqMN(m, iq, all, all);
+          auto Tt0 = T0(is, ik, iq, nda::ellipsis{});
+          auto Tt1 = T1(is, ik, iq, nda::ellipsis{});
+          auto Mt0 = M0(is, ikmqx, iq, nda::ellipsis{});
+          auto Mt1 = M1(is, ikmqx, iq, nda::ellipsis{});
+
+          // Pi_dyn(m) = -pref * sum_s [ row_m0(s) (T0.w~.M0 + T1.w~.M1)(s)
+          //                           + row_m(s)  (T1.w~.M0)(s)
+          //                           + row_mbar(s) (T0.w~.M1)(s) ]
+          // with w~ and the M components evaluated at beta-s.
+          auto add_combo = [&](auto const& Tc, auto const& Mc, long row) {
+            for (long s = 0; s < nt; ++s) {
+              long sm = tools.t_mirror(s);
+              auto wm = nda::reshape(wt_flat(sm, all), shape_t<2>{Nb2, Nb2});
+              auto Mv = Mc(sm, all, all);
+              nda::blas::gemm(wm, Mv, Th);
+              ComplexType wrow = tools.Twt_bb(row, s);
+              for (long r = 0; r < Nb2; ++r)
+                for (long N = 0; N < Np; ++N) {
+                  Tf(s * Nb2 + r, N) = wrow * Tc(s, r, N);
+                  Thf(s * Nb2 + r, N) = Th(r, N);
+                }
+            }
+            nda::blas::gemm(-pref, nda::transpose(Thf), Tf, ComplexType(0.0), Ctmp);
+            track_add(iqx, Pi_MN);
+          };
+
+          add_combo(Tt0, Mt0, tools.m0);
+          if (not is_m0) {
+            add_combo(Tt1, Mt1, tools.m0);
+            add_combo(Tt1, Mt0, m);
+            add_combo(Tt0, Mt1, mbar);
+          }
+        } // iq
+      } // tuples
+    } // m
+  }
+
+  /**
+   * Transform Pi^C(inu) (full bosonic mesh, notes convention) to the code's tau storage:
+   * out(it) = Pi_notes(beta - tau_it) for it in [0, nt_half) (design doc section 2, rule 3).
+   */
+  inline void pi_w_to_code_tau(imag_axes_ft::IAFT const& ft, iaft_tools const& tools,
+                               nda::array<ComplexType, 4> const& Pi_wqMN,
+                               nda::MemoryArrayOfRank<4> auto&& Pi_tqMN_out) {
+    long nq = Pi_wqMN.shape(1), Np = Pi_wqMN.shape(2);
+    long nt = tools.nt_f;
+    long nt_half = (nt % 2 == 0) ? nt / 2 : nt / 2 + 1;
+    utils::check(Pi_tqMN_out.shape(0) == nt_half,
+                 "vertex_pi::pi_w_to_code_tau: output leading axis must be nt_half = {}.", nt_half);
+    nda::array<ComplexType, 4> Pi_t(nt, nq, Np, Np);
+    ft.w_to_tau(Pi_wqMN, Pi_t, imag_axes_ft::boson);
+    for (long it = 0; it < nt_half; ++it)
+      Pi_tqMN_out(it, nda::ellipsis{}) = Pi_t(tools.t_mirror(it), nda::ellipsis{});
+  }
+
+} // vertex_pi
+} // solvers
+} // methods
+
+#endif // COQUI_VERTEX_PI_ICC

@@ -32,6 +32,7 @@
 #include "mean_field/MF.hpp"
 #include "methods/ERI/detail/concepts.hpp"
 #include "methods/ERI/chol_reader_t.hpp"
+#include "methods/vertex/vertex_t.h"
 #include "methods/GW/gw_t.h"
 #include "methods/GW/cholesky_gw.icc"
 
@@ -64,6 +65,9 @@ namespace methods {
                    "gw_t::cholesky_gw::evaluate: sSigma_tskij is not initialized in MBState.");
       utils::check(chol.MF()->nkpts() == chol.MF()->nkpts_ibz(),
                    "gw_t::cholesky_gw::evaluate: Symmetry is not implemented yet.");
+      utils::check(_vertex == nullptr or not _vertex->active(),
+                   "gw_t::cholesky_gw::evaluate: vertex corrections (ISDF-Vertex) are only "
+                   "implemented for THC ERIs.");
       utils::check(_ft->nt_f() == _ft->nt_b(),
                    "chol-gw:: we assume nt_f == nt_b at least for now \n"
                    "(will lift the restriction at some point...)");

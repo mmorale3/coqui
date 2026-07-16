@@ -41,6 +41,7 @@
 
 namespace methods {
 namespace solvers {
+  class vertex_t;
   // TODO
   //    1. timer
   /**
@@ -261,6 +262,10 @@ namespace solvers {
     std::string _div_treatment;
     utils::TimerManager _Timer;
 
+    // optional second-order-exchange vertex correction (ISDF-Vertex, not owned).
+    // nullptr or an inactive vertex leaves the RPA polarizability untouched.
+    vertex_t* _vertex = nullptr;
+
     // optional container for screened interaction
     // TODO Remove these
     std::optional<memory::darray_t<nda::array<ComplexType, 4>, mpi3::communicator> > _dW_qtPQ_opt;
@@ -270,6 +275,14 @@ namespace solvers {
     std::string div_treatment() const { return _div_treatment; }
     std::string& screen_type() { return _screen_type; };
     std::string screen_type() const { return _screen_type; };
+
+    void set_vertex(vertex_t* vertex) { _vertex = vertex; }
+    const vertex_t* vertex() const { return _vertex; }
+    // true iff a vertex correction is attached and active (non-empty subspace C).
+    // Used by the scf driver to keep mb_state.dW_qtPQ alive across the iteration
+    // boundary so Pi^C can use the previous iteration's screened W (defined in the
+    // .cpp: vertex_t is only forward-declared here).
+    bool has_active_vertex() const;
 
     // TODO Remove everything below
     const nda::array<ComplexType, 1>& eps_inv_head() const {

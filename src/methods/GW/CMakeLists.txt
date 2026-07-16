@@ -22,7 +22,7 @@ endif()
 endif()
 
 add_library(gw_lib ${SRCS})
-target_link_libraries(gw_lib PUBLIC meanfield eri_lib scr_coulomb_lib)
+target_link_libraries(gw_lib PUBLIC meanfield eri_lib scr_coulomb_lib vertex_lib)
 install(TARGETS gw_lib
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
 

@@ -41,6 +41,7 @@
 #include "methods/SCF/simple_dyson.h"
 #include "methods/embedding/embed_t.h"
 #include "methods/embedding/embed_eri_t.h"
+#include "methods/vertex/vertex_t.h"
 #include "numerics/imag_axes_ft/IAFT.hpp"
 #include "numerics/iter_scf/iter_scf_utils.hpp"
 
@@ -116,6 +117,17 @@ inline void ensure_checkpoint(std::shared_ptr<mf::MF> mf, std::string const& out
  *  - prefix: "bdft.mbpt" Prefix used when output is not provided.
  *  - restart: "false" Restart from a previous bdft.scf calculation.
  *  - t_prescreen_thresh: "0.0" Threshold for prescreening in time (GF2 only for now)
+ *  - vertex_type: "none" Vertex correction on top of the gw solver.
+ *                 {choices: "none", "2nd_exchange"}. "2nd_exchange" enables BOTH cuts of the
+ *                 Phi-derivable second-order-exchange functional: Sigma^C (G3W2) and Pi^C (G4W).
+ *  - vertex_band_window: [i0, i1) Contiguous 0-based orbital range defining the vertex
+ *                 subspace C (gw solver only). Absent/empty window means C is the empty set,
+ *                 which reproduces plain scGW exactly.
+ *                 Requirements with an active vertex: DLR IAFT backend (iaft basis "dlr");
+ *                 screen_type "rpa" or "rpa_k"; no k-point symmetry (full-BZ meshes) yet.
+ *                 Note: Pi^C uses the PREVIOUS iteration's screened W (one-iteration lag;
+ *                 first iteration uses the bare-Z rung), and dW stays resident across the
+ *                 iteration boundary (memory tradeoff).
  */
 template<typename eri_t>
 void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
@@ -195,6 +207,11 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
   } else if(solver_type == "gw") {
     auto screen_type = io::get_value_with_default<std::string>(pt,"screen_type", "rpa");
 
+    // optional second-order-exchange vertex correction (ISDF-Vertex)
+    auto vertex_type = io::get_value_with_default<std::string>(pt,"vertex_type","none");
+    io::tolower(vertex_type);
+    auto vertex_band_window = io::get_value_with_default<nda::range>(pt,"vertex_band_window",nda::range(0,0));
+
     simple_dyson dyson(mf.get(), &ft, mu_tol, mu_update_alg);
     if (io::get_value_with_default<bool>(pt,"iter_alg.enable", true)) {
       iter_solver = std::make_unique<iter_scf::iter_scf_t>(iter_scf::make_iter_scf(pt));
@@ -203,6 +220,20 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     }
     solvers::scr_coulomb_t scr_eri(&ft, screen_type, div_treatment);
     solvers::gw_t gw(&ft, div_treatment, output);
+
+    // vertex_t must outlive the scf_loop below. Both cuts (Sigma^C and Pi^C)
+    // are switched together through this single object -- never one alone.
+    solvers::vertex_t vertex(&ft, vertex_type, vertex_band_window, mf->nbnd());
+    if (vertex.enabled()) {
+      utils::check(screen_type == "rpa" or screen_type == "rpa_k",
+                   "vertex_type = \"{}\" currently requires screen_type = \"rpa\" or \"rpa_k\" "
+                   "(got \"{}\"): combining the vertex correction with cRPA/EDMFT screening "
+                   "is not validated (Phi-derivability of the combination unestablished).",
+                   vertex.vertex_type(), screen_type);
+      scr_eri.set_vertex(&vertex);
+      gw.set_vertex(&vertex);
+    }
+
     if (screen_type.substr(0,8)=="gw_edmft") {
 
       auto wannier_file = io::get_value<std::string>(pt,"wannier_file",err+"wannier_file");
@@ -419,6 +450,11 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
 
     auto screen_type = io::get_value_with_default<std::string>(pt,"screen_type", "rpa");
 
+    // optional second-order-exchange vertex correction (ISDF-Vertex)
+    auto vertex_type = io::get_value_with_default<std::string>(pt,"vertex_type","none");
+    io::tolower(vertex_type);
+    auto vertex_band_window = io::get_value_with_default<nda::range>(pt,"vertex_band_window",nda::range(0,0));
+
     simple_dyson dyson(mf.get(), &ft, mu_tol, mu_update_alg);
     if (io::get_value_with_default<bool>(pt,"iter_alg.enable", true)) {
       iter_solver = std::make_unique<iter_scf::iter_scf_t>(iter_scf::make_iter_scf(pt));
@@ -427,6 +463,20 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
     }
     solvers::scr_coulomb_t scr_eri(&ft, screen_type, div_treatment);
     solvers::gw_t gw(&ft, div_treatment, output);
+
+    // vertex_t must outlive the scf_loop below. Both cuts (Sigma^C and Pi^C)
+    // are switched together through this single object -- never one alone.
+    solvers::vertex_t vertex(&ft, vertex_type, vertex_band_window, mf->nbnd());
+    if (vertex.enabled()) {
+      utils::check(screen_type == "rpa" or screen_type == "rpa_k",
+                   "vertex_type = \"{}\" currently requires screen_type = \"rpa\" or \"rpa_k\" "
+                   "(got \"{}\"): combining the vertex correction with cRPA/EDMFT screening "
+                   "is not validated (Phi-derivability of the combination unestablished).",
+                   vertex.vertex_type(), screen_type);
+      scr_eri.set_vertex(&vertex);
+      gw.set_vertex(&vertex);
+    }
+
     MBState mb_state(ft, output, mf, projector_ksIai, band_window, kpts_crys, trans_home_cell, false);
     if (local_polarizabilities) {
       mb_state.set_local_polarizabilities(std::move(local_polarizabilities.value()));

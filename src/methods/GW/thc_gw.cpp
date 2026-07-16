@@ -38,6 +38,7 @@
 #include "methods/GW/g0_div_utils.hpp"
 
 #include "methods/ERI/thc_reader_t.hpp"
+#include "methods/vertex/vertex_t.h"
 #include "methods/GW/gw_t.h"
 #include "methods/GW/thc_gw.icc"
 
@@ -97,6 +98,13 @@ namespace methods {
       _Timer.start("TOTAL");
       thc_gw_Xqindep(mb_state.sG_tskij.value().local(), mb_state.sSigma_tskij.value(), thc,
                      mb_state.dW_qtPQ.value(), mb_state.eps_inv_head.value());
+
+      // ISDF-Vertex: second-order-exchange self-energy cut Sigma^C, accumulated
+      // into sSigma_tskij on top of the GW self-energy. When no active vertex is
+      // attached this is a strict no-op -- no allocation, no arithmetic -- so the
+      // disabled path is bit-identical to plain scGW.
+      if (_vertex != nullptr and _vertex->active())
+        _vertex->eval_Sigma_C(mb_state, thc);
       _Timer.stop("TOTAL");
 
       print_thc_gw_timers();

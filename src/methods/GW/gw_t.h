@@ -40,6 +40,8 @@ namespace methods {
   namespace solvers {
     using namespace memory;
 
+    class vertex_t;
+
     /**
      * Solver for computing GW self-energy matrix.
      * One-body Hamiltonian is provided from mf::MF while Green's function
@@ -247,6 +249,10 @@ namespace methods {
 
       std::string _div_treatment = "ignore_g0";
 
+      // optional second-order-exchange vertex correction (ISDF-Vertex, not owned).
+      // nullptr or an inactive vertex leaves the GW self-energy untouched.
+      vertex_t* _vertex = nullptr;
+
       // current iteration in SCF. Modified externally.
       long _iter = 0;
       std::string _output = "coqui";
@@ -256,6 +262,9 @@ namespace methods {
       long& iter() { return _iter; }
       std::string& output() { return _output; }
       std::string& div_treatment() { return _div_treatment; }
+
+      void set_vertex(vertex_t* vertex) { _vertex = vertex; }
+      const vertex_t* vertex() const { return _vertex; }
 
     };
   } // solvers
