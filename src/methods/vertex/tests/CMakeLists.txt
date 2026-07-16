@@ -20,6 +20,17 @@ target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield eri_li
 add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
 set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR})
 
+# ISDF-Vertex Phase 3: conservation validation -- Sigma^C and Pi^C are the two cuts of
+# ONE Phi_2^C:  Tr[Sigma^C G] + Tr[Pi^C W] = 0  (notes/conservation_validation.md)
+set(TEST_ID methods_vertex_conservation)
+
+add_executable(test_${TEST_ID} test_vertex_conservation.cpp)
+target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield eri_lib hf_lib
+                      vertex_lib gw_lib scf_lib)
+
+add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
+set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR})
+
 # ISDF-Vertex Phase 2: C = empty set reproduces plain scGW bit-for-bit (primary gate)
 set(TEST_ID methods_vertex_noop)
 
