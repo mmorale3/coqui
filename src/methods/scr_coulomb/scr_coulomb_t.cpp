@@ -117,6 +117,24 @@ namespace solvers {
         div_utils::eps_inv_head_t(dW_tqPQ, thc, *thc.MF(), _ft, _div_treatment);
     mb_state.eps_inv_head = eps_inv_head;
 
+    // ISDF-Vertex: report the static macroscopic dielectric constant
+    //   epsilon_inf = 1 / Re[ eps^{-1}_head(q->0, i.nu = 0) ],
+    // with eps_inv_head the q->0-extrapolated head of the inverse dielectric (in tau).
+    // The vertex correction P^C enters automatically through Pi -> W -> eps_inv_head, so with
+    // an active vertex this is the vertex-corrected epsilon_inf; without it, the RPA value.
+    // Logged every iteration and written to the h5 checkpoint by dump_eps_inv_head below.
+    {
+      long nw_half = (_ft->nw_b() % 2 == 0) ? _ft->nw_b() / 2 : _ft->nw_b() / 2 + 1;
+      nda::array<ComplexType, 2> eih_w(nw_half, 1);
+      auto eih_t = nda::reshape(eps_inv_head, shape_t<2>{eps_inv_head.shape(0), 1});
+      _ft->tau_to_w_PHsym(eih_t, eih_w);   // i.nu=0 (static) node lives at index 0 of the PH-sym half grid
+      ComplexType eps_inv_static = eih_w(0, 0);
+      double eps_inf = 1.0 / eps_inv_static.real();
+      app_log(1, "  Macroscopic dielectric constant (static, q->0):\n"
+                 "    epsilon_inf = {:.6f}   [eps^-1_head(inu=0) = {:.6e} {:+.6e}i]\n",
+              eps_inf, eps_inv_static.real(), eps_inv_static.imag());
+    }
+
     // make routine to transposed distributed arrays over any 2 indices, so should
     // be easy to template to an array type and to indexes, and replace repeated code
     auto t_pgrid = dW_tqPQ.grid();
@@ -594,6 +612,17 @@ namespace solvers {
       nda::h5_write(iter_grp, "eps_inv_head_tq", eps_inv_head_tq, false);
       nda::h5_write(iter_grp, "eps_inv_head_w", eps_inv_head_w, false);
       nda::h5_write(iter_grp, "eps_inv_head_t", eps_inv_head_t, false);
+
+      // ISDF-Vertex: macroscopic dielectric head eps_head(inu) = 1/eps^{-1}_head(q->0, inu)
+      // and the static macroscopic dielectric constant epsilon_inf = Re[eps_head(inu=0)].
+      // eps_inv_head_w is the q->0-extrapolated inverse-dielectric head on the bosonic
+      // Matsubara half-grid (index 0 = inu=0). With an active vertex this is P^C-corrected.
+      nda::array<ComplexType, 1> eps_head_w(nw_half);
+      for (long iw = 0; iw < nw_half; ++iw)
+        eps_head_w(iw) = ComplexType(1.0) / eps_inv_head_w(iw);
+      double epsilon_inf = eps_head_w(0).real();
+      nda::h5_write(iter_grp, "eps_head_w", eps_head_w, false);
+      h5::h5_write(iter_grp, "epsilon_inf", epsilon_inf);
     }
     comm.barrier();
   }
