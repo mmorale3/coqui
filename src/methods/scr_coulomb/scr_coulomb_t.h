@@ -278,11 +278,16 @@ namespace solvers {
 
     void set_vertex(vertex_t* vertex) { _vertex = vertex; }
     const vertex_t* vertex() const { return _vertex; }
-    // true iff a vertex correction is attached and active (non-empty subspace C).
-    // Used by the scf driver to keep mb_state.dW_qtPQ alive across the iteration
-    // boundary so Pi^C can use the previous iteration's screened W (defined in the
-    // .cpp: vertex_t is only forward-declared here).
+    // true iff a vertex correction is attached and active (non-empty subspace C)
+    // (defined in the .cpp: vertex_t is only forward-declared here).
     bool has_active_vertex() const;
+    // true iff the scf driver must keep mb_state.dW_qtPQ alive across the iteration
+    // boundary so Pi^C can use the previous iteration's screened W: an active vertex
+    // on the GLOBAL auxiliary basis (or with the W-bar cache disabled). With the
+    // SECONDARY basis the downfolded rung is cached at the update_w tail instead
+    // (vertex_t::cache_w, notes/wbar_cache.md) and dW is freed unconditionally --
+    // plain-GW memory profile. Defined in the .cpp.
+    bool needs_dw_retention() const;
 
     // TODO Remove everything below
     const nda::array<ComplexType, 1>& eps_inv_head() const {

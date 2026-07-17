@@ -22,6 +22,10 @@
 #ifndef COQUI_VERTEX_T_H
 #define COQUI_VERTEX_T_H
 
+// Refinement 2 W-bar iteration cache API is available (notes/wbar_cache.md);
+// consumed by tests that must also compile against pre-cache checkouts.
+#define VERTEX_WCACHE_API 1
+
 #include "configuration.hpp"
 #include "nda/nda.hpp"
 #include "numerics/distributed_array/nda.hpp"
@@ -186,6 +190,28 @@ namespace solvers {
                    shape_t<4> pi_pgrid, shape_t<4> pi_bsize, shape_t<4> pi_gshape)
     -> memory::darray_t<memory::array<HOST_MEMORY, ComplexType, 4>, mpi3::communicator>;
 
+    /**
+     * Refinement 2 W-bar iteration cache (secondary path only; notes/wbar_cache.md).
+     *
+     * Folds the CURRENT dynamic screened interaction mb_state.dW_qtPQ into the
+     * N_m x N_m secondary basis and stores it:
+     *   Wbar(q, nu) = t(q) [dW(q, tau) -> PH-sym Matsubara] t(q)^dag,
+     * with the gygi head augmentation of dW(Gamma, tau) applied BEFORE the
+     * transform/fold, using mb_state.eps_inv_head -- i.e. the eps_inv_head of the
+     * SAME iteration as W (both are written by the same scr_coulomb_t::update_w
+     * call, whose tail invokes this).
+     *
+     * The cache is consumed by the NEXT iteration's eval_Pi_C in place of the
+     * retained mb_state.dW_qtPQ (identical one-iteration lag; the scf driver then
+     * frees dW unconditionally -- plain-GW memory profile). The arithmetic is
+     * IDENTICAL to the legacy fold-at-consumption path: same data, same transform,
+     * same fold order -- results are machine-identical (memo section 2).
+     *
+     * Collective on thc.mpi()->comm. Precondition: active() and secondary() and
+     * mb_state.dW_qtPQ present.
+     */
+    void cache_w(MBState &mb_state, THC_ERI auto const &thc);
+
   private:
     const imag_axes_ft::IAFT* _ft = nullptr;
 
@@ -213,6 +239,22 @@ namespace solvers {
                                            // return fewer points than requested)
     nda::array<ComplexType, 4> _Xb_skma;   // secondary collocation (ns, nk, N_m, nc)
     nda::array<ComplexType, 3> _t_qmP;     // Option-A transfer t(q): (nq, N_m, Np)
+
+    // ---- W-bar iteration cache (secondary path; notes/wbar_cache.md) ----------------
+    // Downfolded dynamic rung Wbar(q, nu >= 0): (nq_ibz, nw_half, N_m, N_m), filled by
+    // cache_w at the scr_coulomb_t::update_w tail, consumed by the NEXT iteration's
+    // eval_Pi_C (nu < 0 reconstructed there via the PH mirror W(-nu) = W(nu)).
+    // SYMMETRY EXTENSION HOOK: the cache is KEYED BY q on the first axis. Under the
+    // current nosym restriction nq == nq_ibz; when IBZ symmetry lands, this axis
+    // becomes IBZ-q and reads at symmetry-related q go through the auxiliary-basis
+    // rotation (the same unfolding point as the kernels' planned IBZ support) -- no
+    // layout change needed, only the accessor.
+    std::optional<nda::array<ComplexType, 4>> _Wb_qwmm;
+    // internal/test switch: when false, cache_w is never invoked by scr_coulomb and
+    // the scf driver retains dW (needs_dw_retention), so eval_Pi_C takes the legacy
+    // fold-at-consumption branch -- the pre-cache behavior, kept as the permanent
+    // machine-identity A/B reference (not exposed as an input key).
+    bool _w_cache_enabled = true;
 
     /**
      * Build the secondary ISDF basis and the per-q Option-A transfer maps
@@ -245,6 +287,17 @@ namespace solvers {
     bool secondary() const { return _isdf_mode == "secondary"; }
     // ACTUAL secondary rank N_m (0 until the basis has been built)
     long secondary_rank() const { return _Nm; }
+
+    // W-bar iteration cache accessors (notes/wbar_cache.md)
+    bool has_cached_w() const { return _Wb_qwmm.has_value(); }
+    void reset_w_cache() { _Wb_qwmm.reset(); }
+    // legacy/compat switch (see the _w_cache_enabled comment); disabling also drops
+    // any cached data so the next eval_Pi_C takes the retained-dW branch
+    void set_w_cache_enabled(bool on) {
+      _w_cache_enabled = on;
+      if (not on) reset_w_cache();
+    }
+    bool w_cache_enabled() const { return _w_cache_enabled; }
 
     // vertex requested in the input
     bool enabled() const { return _vertex_type != "none"; }

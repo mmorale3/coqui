@@ -35,6 +35,16 @@ namespace solvers {
     return _vertex != nullptr and _vertex->active();
   }
 
+  bool scr_coulomb_t::needs_dw_retention() const {
+    // GLOBAL-basis vertex: next iteration's eval_Pi_C consumes the retained dW.
+    // SECONDARY-basis vertex with the W-bar cache enabled: the downfolded rung is
+    // cached at the update_w tail (vertex_t::cache_w, notes/wbar_cache.md); dW can
+    // be freed unconditionally. The disabled-cache switch restores the legacy
+    // retained-dW semantics (machine-identity A/B reference).
+    return _vertex != nullptr and _vertex->active() and
+           (not _vertex->secondary() or not _vertex->w_cache_enabled());
+  }
+
   scr_coulomb_t::scr_coulomb_t(const imag_axes_ft::IAFT *ft,
                                std::string screen_type,
                                std::string div):
@@ -134,6 +144,17 @@ namespace solvers {
                         mb_state.coqui_prefix, h5_iter,
                         thc.mpi()->comm, *thc.MF());
     }
+
+    // ISDF-Vertex Refinement 2, W-bar iteration cache (notes/wbar_cache.md): with an
+    // active SECONDARY-basis vertex, fold the freshest W into the N_m x N_m cache now
+    // -- dW is alive here and mb_state.eps_inv_head is the SAME-iteration head (both
+    // stored above), so the gygi Gamma augmentation is captured consistently. The
+    // cache is consumed by the NEXT iteration's eval_Pi_C (identical one-iteration
+    // lag as the retained-dW path); the scf driver then frees dW unconditionally in
+    // this mode (needs_dw_retention() == false -- plain-GW memory profile).
+    if (_vertex != nullptr and _vertex->active() and _vertex->secondary()
+        and _vertex->w_cache_enabled())
+      _vertex->cache_w(mb_state, thc);
   }
 
   template<bool w_out, nda::MemoryArrayOfRank<4> local_Array_t, typename communicator_t>

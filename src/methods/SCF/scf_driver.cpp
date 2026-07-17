@@ -156,11 +156,14 @@ auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_ax
       mb_solver.corr->iter() = output_iter;
       mb_solver.corr->evaluate(mb_state, mb_eri.corr_eri->get());
       // deallocate mb_state.dW_qtPQ after this since it's only used in the corr solver and can be very large for GW.
-      // Exception (ISDF-Vertex): with an active vertex correction, keep W alive across the
-      // iteration boundary so eval_Pi_qdep (which runs BEFORE this iteration's update_w)
-      // can evaluate Pi^C with the previous iteration's screened rung (one-iteration lag;
-      // converges to the same self-consistent fixed point). Memory tradeoff: dW stays resident.
-      if (mb_solver.scr_eri == nullptr or not mb_solver.scr_eri->has_active_vertex())
+      // Exception (ISDF-Vertex): with an active vertex on the GLOBAL auxiliary basis, keep
+      // W alive across the iteration boundary so eval_Pi_qdep (which runs BEFORE this
+      // iteration's update_w) can evaluate Pi^C with the previous iteration's screened rung
+      // (one-iteration lag; converges to the same self-consistent fixed point). With the
+      // SECONDARY basis (Refinement 2) the vertex caches the DOWNFOLDED rung
+      // Wbar = t W t^dag at update_w time instead (vertex_t::cache_w, notes/wbar_cache.md),
+      // so dW is freed unconditionally here -- restoring the plain-GW memory profile.
+      if (mb_solver.scr_eri == nullptr or not mb_solver.scr_eri->needs_dw_retention())
         mb_state.dW_qtPQ.reset();
       mpi->comm.barrier();
     }

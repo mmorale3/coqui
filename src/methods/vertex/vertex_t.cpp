@@ -798,10 +798,26 @@ namespace solvers {
 
     // ---- dynamic W on the full bosonic Matsubara mesh ---------------------------------
     // mb_state.dW_qtPQ is the dynamic-only screened interaction (bare Z subtracted,
-    // scr_coulomb_t.cpp:217) on (nq, nt_half, Np, Np). Absent on the very first
-    // iteration: the rung then reduces to the bare interaction Z.
+    // scr_coulomb_t.cpp:217) on (nq, nt_half, Np, Np). Source selection
+    // (notes/wbar_cache.md):
+    //   - SECONDARY path with a FILLED W-bar cache: the previous iteration's rung was
+    //     already downfolded at update_w time (cache_w) -- the global-basis Wdyn is
+    //     NOT rebuilt here (the scf driver frees dW unconditionally in this mode:
+    //     plain-GW memory profile). Same one-iteration lag as the retained-dW path.
+    //   - otherwise (global path; or secondary with a retained dW -- the legacy /
+    //     compat branch, kept verbatim as the machine-identity reference): fold at
+    //     consumption from mb_state.dW_qtPQ.
+    //   - neither present: FIRST ITERATION -- the rung reduces to the bare
+    //     interaction Z.
+    const bool sec = secondary();
+    const bool use_wcache = sec and _Wb_qwmm.has_value();
     std::optional<nda::array<ComplexType, 4>> Wdyn_qwPQ;
-    if (mb_state.dW_qtPQ.has_value()) {
+    if (use_wcache and mb_state.dW_qtPQ.has_value())
+      app_log(2, "  [NOTE] Pi^C: both the W-bar cache and mb_state.dW_qtPQ are present "
+                 "-- consuming the CACHE\n"
+                 "         (identical content when both were produced by the same "
+                 "update_w).");
+    if (not use_wcache and mb_state.dW_qtPQ.has_value()) {
       auto& dW = mb_state.dW_qtPQ.value();
       auto gs = dW.global_shape();
       utils::check(gs[0] == nqpts_ibz and gs[1] == nt_half and gs[2] == Np and gs[3] == Np,
@@ -845,9 +861,11 @@ namespace solvers {
           Wdyn_qwPQ.value()(iq, l, all, all) = W_wpos(lpos, all, all);
         }
       }
-    } else {
-      app_log(1, "  [NOTE] Pi^C: no dynamic W in MBState (first iteration) -- "
-                 "using the bare-interaction rung W = Z only.\n");
+    } else if (not use_wcache) {
+      // FIRST ITERATION (loud): nothing to screen with yet, in either path.
+      app_log(1, "  [NOTE] Pi^C: no dynamic W in MBState{} (first iteration) -- "
+                 "using the bare-interaction rung W = Z only.\n",
+              sec ? " and no cached Wbar" : "");
     }
 
     // ---- momentum maps (symmetry-free mesh) -------------------------------------------
@@ -863,7 +881,7 @@ namespace solvers {
     // head-augmented Gamma cells above downfold automatically through t. Pibar^C is
     // produced in (N_m x N_m) and UPFOLDED with the adjoint of the same t (Eq. 38) --
     // the no-leak identity (Eq. 39) is checked below as a transposition tripwire.
-    const bool sec = secondary();
+    // (`sec`/`use_wcache` are resolved above, at the dynamic-W source selection.)
     const long nc = _band_window.size();
     nda::array<ComplexType, 3> Zb_qmm;
     std::optional<nda::array<ComplexType, 4>> Wbdyn_qwmm;
@@ -910,6 +928,32 @@ namespace solvers {
           for (long l = 0; l < tools.nw_b; ++l)
             vertex_secondary_detail::fold_core(t_q, Wdyn_qwPQ.value()(iq, l, all, all),
                                                tmp, Wbdyn_qwmm.value()(iq, l, all, all));
+      }
+      // W-bar iteration cache consumption (notes/wbar_cache.md): the dynamic rung was
+      // folded at update_w time on the positive half mesh; reconstruct the kernel's
+      // full bosonic mesh with the SAME mirror map the legacy path applies BEFORE
+      // its fold (W(-nu) = W(nu); the mirror is a pure copy, so fold-then-mirror is
+      // bitwise identical to mirror-then-fold). eta[dW] diagnostics for this rung
+      // were logged at fill time (cache_w); eta[Z] above covers the bare core.
+      if (use_wcache) {
+        auto const& Wbh = _Wb_qwmm.value();
+        const long nw_half = (tools.nw_b % 2 == 0) ? tools.nw_b / 2 : tools.nw_b / 2 + 1;
+        utils::check(Wbh.shape(0) == nqpts_ibz and Wbh.shape(1) == nw_half and
+                     Wbh.shape(2) == _Nm and Wbh.shape(3) == _Nm,
+                     "vertex_t::eval_Pi_C: cached Wbar shape ({}, {}, {}, {}) != "
+                     "(nq, nw_half, N_m, N_m) = ({}, {}, {}, {}).",
+                     Wbh.shape(0), Wbh.shape(1), Wbh.shape(2), Wbh.shape(3),
+                     nqpts_ibz, nw_half, _Nm, _Nm);
+        app_log(1, "  Refinement 2: Pi^C dynamic rung from the CACHED Wbar (previous "
+                   "iteration's W, downfolded\n"
+                   "  at update_w time; the same one-iteration lag as the retained-dW "
+                   "path it replaces).");
+        Wbdyn_qwmm.emplace(nda::array<ComplexType, 4>(nqpts_ibz, tools.nw_b, _Nm, _Nm));
+        for (long iq = 0; iq < nqpts_ibz; ++iq)
+          for (long l = 0; l < tools.nw_b; ++l) {
+            long lpos = std::max(l, tools.w_mirror_b(l)) - tools.nw_b / 2;
+            Wbdyn_qwmm.value()(iq, l, all, all) = Wbh(iq, lpos, all, all);
+          }
       }
     }
 
@@ -1014,8 +1058,191 @@ namespace solvers {
     return dPi_C_tqPQ;
   }
 
+  void vertex_t::cache_w(MBState &mb_state, THC_ERI auto const &thc) {
+    decltype(nda::range::all) all;
+    utils::check(active() and secondary(),
+                 "vertex_t::cache_w: requires an ACTIVE vertex in isdf mode \"secondary\" "
+                 "(the global path retains the full dW instead; notes/wbar_cache.md).");
+    utils::check(mb_state.dW_qtPQ.has_value(),
+                 "vertex_t::cache_w: dW_qtPQ is not initialized in MBState -- cache_w "
+                 "must run at the scr_coulomb_t::update_w tail, after the new W is stored.");
+    utils::check(mb_state.sG_tskij.has_value(),
+                 "vertex_t::cache_w: sG_tskij is not initialized in MBState.");
+
+    auto mpi = thc.mpi();
+    auto MF = thc.MF();
+    const long nkpts = MF->nkpts();
+    const long nqpts = MF->nqpts();
+    const long nqpts_ibz = MF->nqpts_ibz();
+    const long nkpts_ibz = MF->nkpts_ibz();
+    const long Np = thc.Np();
+    const long nbnd = MF->nbnd();
+    const long ns = mb_state.sG_tskij.value().local().shape(1);
+    const long nc = _band_window.size();
+
+    // same symmetry policy as the consumers (nosym only; abort loudly otherwise).
+    // IBZ EXTENSION HOOK: when symmetry lands, the fill below runs over IBZ q only
+    // (the cache is q-keyed on its first axis) and consumption rotates to the star.
+    utils::check(nqpts == nqpts_ibz and nkpts == nkpts_ibz,
+                 "vertex_t::cache_w: vertex + k-space symmetry is not supported yet "
+                 "(nqpts = {}, nqpts_ibz = {}, nkpts = {}, nkpts_ibz = {}).",
+                 nqpts, nqpts_ibz, nkpts, nkpts_ibz);
+
+    vertex_pi::iaft_tools tools(*_ft);
+    const long nw_b = tools.nw_b;
+    const long nw_half = (nw_b % 2 == 0) ? nw_b / 2 : nw_b / 2 + 1;
+    auto gs = mb_state.dW_qtPQ.value().global_shape();
+    const long nt_half = gs[1];
+    utils::check(gs[0] == nqpts_ibz and gs[2] == Np and gs[3] == Np,
+                 "vertex_t::cache_w: unexpected dW_qtPQ global shape ({}, {}, {}, {}).",
+                 gs[0], gs[1], gs[2], gs[3]);
+
+    app_log(1, "\n  Refinement 2: caching the downfolded rung Wbar = t dW t^dag "
+               "(notes/wbar_cache.md)\n"
+               "  -- filled at update_w time from THIS iteration's (dW, eps_inv_head); "
+               "consumed by the NEXT\n"
+               "  iteration's Pi^C (one-iteration lag); dW itself is then freed by the "
+               "scf driver.");
+
+    // ---- collocation + momentum maps (for the lazy basis build + diagnostics) --------
+    nda::array<ComplexType, 4> X_skPa(ns, nkpts, Np, nbnd);
+    for (long is = 0; is < ns; ++is)
+      for (long ik = 0; ik < nkpts; ++ik)
+        X_skPa(is, ik, all, all) = thc.X(is, 0, ik);
+    nda::array<long, 2> kmq(nqpts_ibz, nkpts);
+    for (long iq = 0; iq < nqpts_ibz; ++iq)
+      for (long ik = 0; ik < nkpts; ++ik) kmq(iq, ik) = MF->qk_to_k2(iq, ik);
+
+    // ---- q = Gamma index (crystal coordinates: all components integer mod G) ----------
+    long iq_gamma = -1;
+    {
+      auto Qpts = MF->Qpts();
+      for (long iq = 0; iq < nqpts_ibz; ++iq) {
+        double d = 0.0;
+        for (long i = 0; i < 3; ++i) {
+          double x = Qpts(iq, i);
+          d += std::abs(x - std::round(x));
+        }
+        if (d < 1e-8) {
+          utils::check(iq_gamma < 0,
+                       "vertex_t::cache_w: multiple Gamma q-points found ({} and {}).",
+                       iq_gamma, iq);
+          iq_gamma = iq;
+        }
+      }
+      utils::check(iq_gamma >= 0, "vertex_t::cache_w: no Gamma q-point found.");
+    }
+
+    // (idempotent; in the production flow eval_Pi_C already built it this iteration)
+    build_secondary_basis(thc, X_skPa, kmq, iq_gamma);
+
+    // ---- q->0 rung policy: SAME resolution as eval_Pi_C (q0_head_treatment.md) --------
+    // Only the gygi head insertion matters here (v1_skip acts in the kernel, not on
+    // the stored W content). eps_inv_head is captured NOW -- the same iteration as W.
+    bool head_insertion = (_div_treatment.find("gygi") != std::string::npos);
+    if (head_insertion and nqpts_ibz == 1) {
+      app_log(1, "  [WARNING] cache_w: nqpts_ibz == 1 with a gygi-class vertex "
+                 "div_treatment -- taking \"ignore_g0\" instead (same downgrade as "
+                 "eval_Pi_C).");
+      head_insertion = false;
+    }
+    nda::array<ComplexType, 2> H_PQ(Np, Np);
+    bool head_ok = false;
+    if (head_insertion) {
+      head_ok = vertex_head_detail::build_head_rank1(thc, iq_gamma, nkpts, H_PQ);
+      if (not head_ok)
+        app_log(1, "  [WARNING] cache_w: gygi head insertion requested but head data "
+                   "are unusable\n"
+                   "            (madelung == 0 or empty basis_head) -- caching WITHOUT "
+                   "the analytic head\n"
+                   "            (equivalent to policy \"ignore_g0\").");
+    }
+
+    // ---- replicate dW(tau), augment the Gamma head, transform to the half nu mesh ----
+    // Identical arithmetic to the legacy fold-at-consumption path (eval_Pi_C):
+    // augment BEFORE tau_to_w_PHsym, per-q transform on the same (nt_half, Np, Np)
+    // tau-storage slices.
+    nda::array<ComplexType, 4> W_wq(nqpts_ibz, nw_half, Np, Np);
+    {
+      auto& dW = mb_state.dW_qtPQ.value();
+      nda::array<ComplexType, 4> W_qtPQ(nqpts_ibz, nt_half, Np, Np);
+      W_qtPQ() = ComplexType(0.0);
+      W_qtPQ(dW.local_range(0), dW.local_range(1), dW.local_range(2), dW.local_range(3)) = dW.local();
+      mpi->comm.all_reduce_in_place_n(W_qtPQ.data(), W_qtPQ.size(), std::plus<>{});
+
+      if (head_ok) {
+        if (mb_state.eps_inv_head.has_value()) {
+          auto& eps = mb_state.eps_inv_head.value();
+          utils::check(eps.shape(0) == nt_half,
+                       "vertex_t::cache_w: eps_inv_head size {} != nt_half = {}.",
+                       eps.shape(0), nt_half);
+          for (long it = 0; it < nt_half; ++it)
+            W_qtPQ(iq_gamma, it, all, all) += ComplexType(eps(it).real()) * H_PQ;
+          app_log(1, "  cache_w head insertion: dynamic piece applied to dW(Gamma, tau) "
+                     "with eps_inv_head(tau=0) = {}\n"
+                     "  (SAME-iteration eps_inv_head, captured at fill time)",
+                  eps(0).real());
+        } else {
+          app_log(1, "  [WARNING] cache_w: dW is present but eps_inv_head is not in "
+                     "MBState -- the DYNAMIC head\n"
+                     "            piece is skipped for the cached rung.");
+        }
+      }
+
+      for (long iq = 0; iq < nqpts_ibz; ++iq) {
+        auto W_t = W_qtPQ(iq, nda::ellipsis{});
+        auto W_w = W_wq(iq, nda::ellipsis{});
+        _ft->tau_to_w_PHsym(W_t, W_w);
+      }
+    }
+
+    // ---- eta(q) diagnostics on the rung ACTUALLY cached (test-scale gate) ------------
+    // (moved here from the consumption site: the global-basis Wdyn no longer exists
+    //  at eval time in the cached mode; same labels/slices as before)
+    if (ns * nkpts * nc * nc <= 4096) {
+      const long lpos0 = std::max(tools.m0, tools.w_mirror_b(tools.m0)) - nw_b / 2;
+      const long lposm = std::max(nw_b - 1, tools.w_mirror_b(nw_b - 1)) - nw_b / 2;
+      vertex_secondary_detail::eta_max_over_q(
+          "dW(nu_0)", X_skPa, _band_window.first(), nc, _Xb_skma, _t_qmP, kmq,
+          [&](long iq) { return W_wq(iq, lpos0, all, all); });
+      vertex_secondary_detail::eta_max_over_q(
+          "dW(nu_max)", X_skPa, _band_window.first(), nc, _Xb_skma, _t_qmP, kmq,
+          [&](long iq) { return W_wq(iq, lposm, all, all); });
+    } else {
+      app_log(2, "  Refinement 2: eta diagnostic skipped (N_pair = {} > 4096).",
+              ns * nkpts * nc * nc);
+    }
+
+    // ---- fold on the half mesh: Wbar(q, nu) = t(q) Wdyn(q, nu) t(q)^dag --------------
+    // (same fold_core gemms on the same values as the legacy full-mesh fold; the
+    //  mirrored nu points are pure copies, reconstructed at consumption)
+    _Wb_qwmm.emplace(nda::array<ComplexType, 4>(nqpts_ibz, nw_half, _Nm, _Nm));
+    {
+      nda::array<ComplexType, 2> tmp(_Nm, Np);
+      for (long iq = 0; iq < nqpts_ibz; ++iq) {
+        auto t_q = _t_qmP(iq, all, all);
+        for (long lp = 0; lp < nw_half; ++lp)
+          vertex_secondary_detail::fold_core(t_q, W_wq(iq, lp, all, all), tmp,
+                                             _Wb_qwmm.value()(iq, lp, all, all));
+      }
+    }
+
+    // ---- footprint: the memory point of the exercise ---------------------------------
+    const double to_mb = 16.0 / (1024.0 * 1024.0);   // complex<double>
+    const double cache_mb = double(nqpts_ibz) * double(nw_half) * double(_Nm) * double(_Nm) * to_mb;
+    const double dw_mb = double(nqpts_ibz) * double(nt_half) * double(Np) * double(Np) * to_mb;
+    app_log(2, "  Refinement 2 W-bar cache FILLED: (nq, nw_half, N_m, N_m) = "
+               "({}, {}, {}, {}) = {:.3f} MB (replicated)\n"
+               "  vs the retained dW it replaces: (nq, nt_half, Np, Np) = "
+               "({}, {}, {}, {}) = {:.3f} MB -- ratio {:.3e}\n",
+            nqpts_ibz, nw_half, _Nm, _Nm, cache_mb,
+            nqpts_ibz, nt_half, Np, Np, dw_mb, cache_mb / dw_mb);
+    mpi->comm.barrier();
+  }
+
   // template instantiations
   template void vertex_t::eval_Sigma_C(MBState&, const thc_reader_t&);
+  template void vertex_t::cache_w(MBState&, const thc_reader_t&);
 
   template memory::darray_t<memory::array<HOST_MEMORY, ComplexType, 4>, mpi3::communicator>
   vertex_t::eval_Pi_C(MBState&, const thc_reader_t&,
