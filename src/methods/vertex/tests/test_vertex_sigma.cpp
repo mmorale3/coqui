@@ -519,6 +519,110 @@ namespace bdft_tests {
       REQUIRE(den > 1e-10);
       REQUIRE(num < 1e-7 * den);
     }
+
+    SECTION("wannier_gauge") {
+      // KERNEL-LEVEL complex-U gauge oracle (notes/wannier_projector_theory.md section 6.2).
+      // Sigma^C in the C-block is gauge-COVARIANT: the Sigma kernel emits Sbar(a,b) with the
+      // external band leg a on the NON-conjugated collocation leg and b on the CONJUGATED
+      // leg, so under a Wannier re-mixing U -> U V (Xbar -> Xbar V, Gbar -> V^dag G V) it
+      // transforms as Sbar(V)_ab = sum_cd V_ca Sbar(id)_cd conj(V_db) = (V^T Sbar V*)_ab
+      // (proven exactly by the earlier diagnostic; ratio[a,b] = e^{i(phi_a-phi_b)} for a
+      // diagonal V). The gauge-INVARIANT band-space injection is therefore the CHAIN-RULE
+      // sandwich Sigma^C_ij = sum_ab conj(U_ia) Sbar_ab U_jb = (conj(U) Sbar U^T)_ij
+      // (== vertex_wannier_detail::upfold_Sigma), NOT the naive operator sandwich
+      // U Sbar U^dag (which leaks at O(1e-4) for a COMPLEX off-diagonal V; this was the
+      // bug). This replicates the production vertex_t threading (build_Xbar / downfold_G
+      // feeding the SAME kernel with C = [0,M)) at O(seconds). M == ncw => range(P) is the
+      // whole window, so every unitary V leaves Sigma^C invariant to kernel accuracy.
+      auto Wt = mdl.Wdyn_tau(ft);
+      const long M = ncw;
+      auto run_gauge = [&](nda::array<cplx, 2> const& V, nda::array<cplx, 5>& Sig_block) {
+        nda::array<cplx, 4> Xbar(ns, nk, Np, M);
+        Xbar() = cplx(0.0);
+        for (long ik = 0; ik < nk; ++ik)
+          for (long P = 0; P < Np; ++P)
+            for (long a = 0; a < M; ++a)
+              for (long j = 0; j < ncw; ++j)
+                Xbar(0, ik, P, a) += mdl.X_skPa(0, ik, P, C0 + j) * V(j, a);
+        nda::array<cplx, 5> Gbar(nt, ns, nk, M, M);
+        Gbar() = cplx(0.0);
+        for (long it = 0; it < nt; ++it)
+          for (long ik = 0; ik < nk; ++ik)
+            for (long a = 0; a < M; ++a)
+              for (long b = 0; b < M; ++b)
+                for (long i = 0; i < ncw; ++i)
+                  for (long jj = 0; jj < ncw; ++jj)
+                    Gbar(it, 0, ik, a, b) += std::conj(V(i, a)) *
+                        G(it, 0, ik, C0 + i, C0 + jj) * V(jj, b);
+        Sig_block = nda::array<cplx, 5>(nt, ns, nk, M, M);
+        solvers::vertex_detail::eval_sigma_C_g3w2_nosym(ft, comm, nda::range(0, M), Gbar,
+                                                        Xbar, Wt, mdl.Z_qPQ, mdl.kmq,
+                                                        mdl.qmin, /*iq_gamma*/ 0,
+                                                        /*skip*/ false, Sig_block);
+      };
+      nda::array<cplx, 5> Sbar_ref, Sbar_V;
+      // Back-rotate Sbar_V by the PRODUCTION injection and compare to Sbar_ref (the
+      // injected object for V = id). The Sigma kernel emits Sbar(a,b) with external a on
+      // the NON-conjugated collocation leg and b on the CONJUGATED leg, so its covariance
+      // is Sbar(V)_ab = e^{i(phi_a - phi_b)} Sbar(id)_ab under a diagonal gauge (the
+      // element-wise ratio equals e^{i(phi_a-phi_b)} exactly -- verified during the debug).
+      // The gauge-invariant band injection is therefore the CHAIN-RULE sandwich
+      // Sigma^C_ij = sum_ab conj(U_ia) Sbar_ab U_jb (= vertex_wannier_detail::upfold_Sigma,
+      // conj(U) Sbar U^T), NOT the operator sandwich U Sbar U^dag. In-window (U -> V) the
+      // invariance check is conj(V) Sbar(V) V^T == Sbar(id):
+      auto inject_dev = [&](nda::array<cplx, 5> const& Sbar, nda::array<cplx, 2> const& V) {
+        double num = 0, den = 0;
+        for (long it = 0; it < nt; ++it)
+          for (long ik = 0; ik < nk; ++ik)
+            for (long i = 0; i < M; ++i)
+              for (long jj = 0; jj < M; ++jj) {
+                cplx inj(0.0);
+                for (long a = 0; a < M; ++a)
+                  for (long b = 0; b < M; ++b)
+                    inj += std::conj(V(i, a)) * Sbar(it, 0, ik, a, b) * V(jj, b);
+                num = std::max(num, std::abs(inj - Sbar_ref(it, 0, ik, i, jj)));
+                den = std::max(den, std::abs(Sbar_ref(it, 0, ik, i, jj)));
+              }
+        return std::make_pair(num, den);
+      };
+      // build the test unitaries once
+      nda::array<cplx, 2> Vre(M, M), Vph(M, M), Vco(M, M);
+      {
+        rng_t rr(37);
+        auto Vc = unitary(M, rr);
+        for (long a = 0; a < M; ++a)
+          for (long b = 0; b < M; ++b) Vre(a, b) = cplx(Vc(a, b).real());
+        for (long b = 0; b < M; ++b) {
+          for (long c = 0; c < b; ++c) {
+            cplx ip = 0;
+            for (long a = 0; a < M; ++a) ip += std::conj(Vre(a, c)) * Vre(a, b);
+            for (long a = 0; a < M; ++a) Vre(a, b) -= ip * Vre(a, c);
+          }
+          double nrm = 0;
+          for (long a = 0; a < M; ++a) nrm += std::norm(Vre(a, b));
+          nrm = std::sqrt(nrm);
+          for (long a = 0; a < M; ++a) Vre(a, b) /= nrm;
+        }
+        Vph() = cplx(0.0);
+        for (long a = 0; a < M; ++a) Vph(a, a) = std::exp(cplx(0.0, 0.7 + 0.9 * double(a)));
+        rng_t rr2(61);
+        Vco = unitary(M, rr2);
+      }
+      // reference: V = identity (== the window path, up to the trivial C-slice offset).
+      run_gauge([&]{ nda::array<cplx,2> I(M,M); I()=cplx(0.0);
+                     for (long a=0;a<M;++a) I(a,a)=cplx(1.0); return I; }(), Sbar_ref);
+      auto check = [&](nda::array<cplx, 2> const& V, const char* tag) {
+        run_gauge(V, Sbar_V);
+        auto [num, den] = inject_dev(Sbar_V, V);
+        app_log(1, "sigma wannier_gauge: {} max|dSigma_inj| = {:.3e} (max = {:.3e}, rel = {:.3e})",
+                tag, num, den, num / den);
+        REQUIRE(den > 1e-10);
+        REQUIRE(num / den < 1e-9);
+      };
+      check(Vre, "REAL orthogonal V ");   // real-U sector: exact (degenerate class)
+      check(Vph, "DIAGONAL phase V  ");   // per-orbital phases: the M>=2 diagonal razor
+      check(Vco, "COMPLEX off-diag V");   // genuine complex mixing: the sharp check (the bug)
+    }
 #endif  // ENABLE_DLR
   }
 

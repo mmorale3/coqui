@@ -38,6 +38,7 @@
 #include "methods/mb_state/mb_state.hpp"
 #include "methods/ERI/detail/concepts.hpp"
 #include "methods/vertex/vertex_sym.hpp"
+#include "methods/embedding/projector_t.h"
 
 namespace methods {
 namespace solvers {
@@ -46,8 +47,27 @@ namespace solvers {
    * @brief vertex_t class
    *
    * Phi-derivable second-order-exchange vertex correction on top of scGW,
-   * with all internal lines restricted to a contiguous near-E_F orbital
-   * subspace C = [band_window.first(), band_window.last()).
+   * with all internal lines restricted to a near-E_F orbital subspace C
+   * defined by a FIXED projector P(k) = U(k) U(k)^dag onto M correlated
+   * orbitals per (spin, k) (notes/wannier_projector_theory.md).
+   *
+   * TWO subspace modes, one code path (the kernels are projector-general --
+   * memo section 2.1, zero kernel edits):
+   *   - WINDOW MODE (default): C = the contiguous band window
+   *     [band_window.first(), band_window.last()); U(k) is the trivial 0/1
+   *     column-selection isometry (identity on the window, zero outside).
+   *     The input slices X(:,C) and G_CC and the C-C block injection are used
+   *     directly -- the historic path, BIT-IDENTICAL.
+   *   - WANNIER MODE (set_wannier_projector): C = span of M Wannier orbitals
+   *     |w_a(k)> = sum_i U_ia(k) |psi_i(k)>, U an Norb x M isometry per (s,k)
+   *     read from a TRIQS-compatible wan.h5 via projector_t (memo section 0:
+   *     U = dagger(proj_mat) on rows W_rng, zero elsewhere; nImps == 1). The
+   *     four input-slice sites become X_bar = X.U, G_bar = U^dag G U, the
+   *     secondary C(q) is built from the rotated collocation, and the Sigma^C
+   *     injection is the operator sandwich U Sigma_bar U^dag into the W_rng
+   *     block (memo C2/C3/C4). U is Loewdin-orthonormalized at load (owner
+   *     ruling Q1) and is FIXED for the whole SCF loop (demand D1; changing U
+   *     = a restart, memo section 1.4). Window mode is the U = 1_window limit.
    *
    * One generating functional Phi_2^C, two cuts, evaluated TOGETHER
    * (never one alone -- Phi-derivability / conservation):
@@ -217,14 +237,66 @@ namespace solvers {
      */
     void cache_w(MBState &mb_state, THC_ERI auto const &thc);
 
+    /**
+     * Install the general Wannier projector U(s,k) from a projector_t (WANNIER
+     * MODE; notes/wannier_projector_theory.md section 0, P1). The subspace C
+     * becomes span{ |w_a(k)> = sum_i U_ia(k)|psi_i(k)> }, U an Norb x M isometry
+     * built as U = dagger(proj_mat) on the rows W_rng (zero elsewhere), M =
+     * nImpOrbs. The window-mode _band_window is replaced by W_rng (the injection
+     * support). U is FIXED for the whole SCF loop (demand D1) -- call once at
+     * construction time, before the scf loop.
+     *
+     * Owner ruling Q1: U is Loewdin-orthonormalized per (s,k) so U^dag U = 1_M
+     * exactly; the correction norm ||U^dag U - 1|| is measured and logged BEFORE
+     * orthonormalization. loewdin = false skips it (warn + proceed with raw U;
+     * P then only approximately idempotent, memo section 1.3).
+     *
+     * @param proj - [INPUT] projector_t carrying proj_mat + band_window from wan.h5
+     * @param loewdin - [INPUT] Loewdin-orthonormalize U at load (default true)
+     */
+    void set_wannier_projector(methods::projector_t const &proj, bool loewdin = true);
+
+    // WANNIER MODE predicate: a general U has been installed (window mode = false)
+    bool wannier() const { return _wannier; }
+    // subspace rank M (= _band_window.size() in window mode, = _U.shape(3) in
+    // Wannier mode); the auxiliary orbital dimension both kernels run on
+    long subspace_rank() const {
+      return _wannier ? _M : _band_window.size();
+    }
+    // measured isometry defect max_sk ||U^dag U - 1_M||_F before orthonormalization
+    // (0 in window mode; owner ruling Q1 diagnostic)
+    double isometry_defect() const { return _iso_defect; }
+    // path to the wan.h5 the projector was built from ("" in window mode); used to
+    // enforce the shared-object demand D2 against a coexisting embedding projector
+    std::string wannier_file() const { return _wannier_file; }
+
   private:
     const imag_axes_ft::IAFT* _ft = nullptr;
 
     // type of the vertex correction: "none" or "2nd_exchange"
     std::string _vertex_type = "none";
 
-    // contiguous orbital range [first, last) defining the subspace C
+    // contiguous orbital range [first, last) defining the subspace C. In
+    // WINDOW MODE this is C itself; in WANNIER MODE it is the injection support
+    // W_rng (the band range spanned by the M Wannier orbitals), while the
+    // subspace rank is M <= _band_window.size().
     nda::range _band_window = nda::range(0, 0);
+
+    // ---- WANNIER MODE: general fixed projector P(k) = U(k) U(k)^dag ------------------
+    // (notes/wannier_projector_theory.md). Empty (_wannier = false) => WINDOW MODE:
+    // the trivial 0/1 column-selection isometry, dispatched to the existing slice
+    // code so window-mode results stay BIT-IDENTICAL.
+    bool _wannier = false;
+    long _M = 0;                            // subspace rank (columns of U)
+    // U(s, k) as an Norb(=W_rng.size()) x M isometry on the W_rng rows, restricted to
+    // the injection support (rows outside W_rng are structurally zero and dropped):
+    // _U_skia(is, ik, i, a) = U_{(W_rng.first()+i), a}(s, k), U^dag U = 1_M (Loewdin).
+    // k axis is FULL BZ (per-k projector; demand D4).
+    nda::array<ComplexType, 4> _U_skia;
+    // measured max_sk ||U^dag U - 1_M||_F before Loewdin (owner ruling Q1 diagnostic)
+    double _iso_defect = 0.0;
+    // wan.h5 the projector was built from (shared-object demand D2)
+    std::string _wannier_file;
 
     // q->0 policy on the rung transfers: "ignore_g0" (v2 default), "gygi"-class,
     // or "v1_skip" (the v1 blanket Gamma-skip fallback). See the constructor doc
@@ -277,11 +349,20 @@ namespace solvers {
      * X_w (ns, nk_full, naux, nc): q'-access tables, krot = ks_to_k, effective
      * columns Xhat per (spin, qsymms position, k), and the C-window leakage
      * diagnostic. Collective-safe (pure local reads of MF tables + X_w).
+     *
+     * WANNIER MODE (U_skia != nullptr; notes/wannier_projector_theory.md section 2.8):
+     * the C-sector rotation becomes the M x M Wannier rotation
+     * d(k;S) = U(Sk)^dag D_win(k;S) U(k) (D_win = the W_rng band block of the MF
+     * rotation), so sym + Wannier compose through the SAME Xhat path; the leakage
+     * diagnostic is then the projector-level ||(1 - P(Sk)) D U(k)|| and goes to 0
+     * by construction for a symmetry-closed Wannier set. C0_global is W_rng.first()
+     * and nc = M; X_w = X_bar (the rotated collocation). Window mode = nullptr U.
      */
     void build_sym_ctx(THC_ERI auto const &thc,
                        nda::array<ComplexType, 4> const &X_w,
                        long C0_global,
-                       std::optional<vertex_sym::sym_ctx> &slot);
+                       std::optional<vertex_sym::sym_ctx> &slot,
+                       nda::array<ComplexType, 4> const *U_skia = nullptr);
 
     /**
      * Build the secondary ISDF basis and the per-q Option-A transfer maps
@@ -294,12 +375,16 @@ namespace solvers {
      *     truncated-SVD least-squares solve min || B t - C ||_F.
      * cond(s), effective rank and discarded singular values are logged.
      *
-     * @param X_skPa - [INPUT] replicated GLOBAL collocation (ns, nk, Np, nbnd)
+     * @param X_glob - [INPUT] the GLOBAL collocation the secondary basis fits against:
+     *                 WINDOW mode = the full-band replicated collocation (ns, nk, Np,
+     *                 nbnd) with orb0 = C.first(); WANNIER mode = the rotated collocation
+     *                 X_bar = X.U (ns, nk, Np, M) with orb0 = 0.
+     * @param orb0   - [INPUT] first subspace column of X_glob (C.first() / 0)
      * @param kmq    - [INPUT] (nq, nk) index map of k - q
      * @param iq_gamma - [INPUT] index of q = Gamma
      */
     void build_secondary_basis(THC_ERI auto const &thc,
-                               nda::array<ComplexType, 4> const &X_skPa,
+                               nda::array<ComplexType, 4> const &X_glob, long orb0,
                                nda::array<long, 2> const &kmq, long iq_gamma);
 
   public:
@@ -328,8 +413,11 @@ namespace solvers {
 
     // vertex requested in the input
     bool enabled() const { return _vertex_type != "none"; }
-    // vertex requested AND C is non-empty; C = empty set must be an exact no-op
-    bool active() const { return enabled() and _band_window.size() > 0; }
+    // vertex requested AND C is non-empty; C = empty set must be an exact no-op.
+    // In WANNIER MODE C is non-empty iff M > 0 (the projector has columns).
+    bool active() const {
+      return enabled() and _band_window.size() > 0 and (not _wannier or _M > 0);
+    }
 
     // IBZ symmetry diagnostics (notes/vertex_ibz_symmetry.md section 6):
     // measured C-window D-matrix leakage of the symmetry rotations (0 until the

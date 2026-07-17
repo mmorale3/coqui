@@ -158,6 +158,20 @@ inline void ensure_checkpoint(std::shared_ptr<mf::MF> mf, std::string const& out
  *  - vertex_isdf_svd_tol: "1e-8" Relative SVD cutoff on the secondary pair collocation
  *                 B(q) in the truncated pseudo-inverse solve for t(q) (the secondary
  *                 metric s = B^dag B is regularized at the square of this value).
+ *  - vertex_wannier_file: "" Path to a TRIQS-compatible wan.h5 (proj_mat + band_window;
+ *                 gw solver only). When set, the vertex subspace C becomes the span of
+ *                 the M Wannier orbitals |w_a(k)> = sum_i U_ia(k)|psi_i(k)> read from the
+ *                 file (a general fixed projector P = U U^dag, notes/
+ *                 wannier_projector_theory.md), replacing the vertex_band_window C. The
+ *                 committed theory is already projector-general; window mode is the
+ *                 U = 1_window limit and stays bit-identical. U is FIXED for the whole
+ *                 SCF loop (re-Wannierization = a restart). If a gw_edmft embedding
+ *                 projector is also active it must be the SAME file (demand D2). The
+ *                 rotated point selection of vertex_isdf = "secondary" is nosym-only.
+ *  - vertex_wannier_loewdin: "true" Loewdin-orthonormalize U at load so U^dag U = 1_M
+ *                 exactly (deterministic, gauge-covariant; the correction norm is
+ *                 logged). false = proceed with the raw disentangled U (warn; P then
+ *                 only approximately idempotent).
  */
 template<typename eri_t>
 void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
@@ -246,6 +260,11 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     io::tolower(vertex_isdf);
     auto vertex_isdf_rank = io::get_value_with_default<long>(pt,"vertex_isdf_rank",-1);
     auto vertex_isdf_svd_tol = io::get_value_with_default<double>(pt,"vertex_isdf_svd_tol",1e-8);
+    // Wannier-projector subspace C (notes/wannier_projector_theory.md): when set, the
+    // vertex subspace is span{ w_a(k) } from a TRIQS-compatible wan.h5 (proj_mat +
+    // band_window) instead of the band window; U is Loewdin-orthonormalized at load.
+    auto vertex_wannier_file = io::get_value_with_default<std::string>(pt,"vertex_wannier_file","");
+    auto vertex_wannier_loewdin = io::get_value_with_default<bool>(pt,"vertex_wannier_loewdin",true);
 
     simple_dyson dyson(mf.get(), &ft, mu_tol, mu_update_alg);
     if (io::get_value_with_default<bool>(pt,"iter_alg.enable", true)) {
@@ -266,6 +285,22 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
                    "(got \"{}\"): combining the vertex correction with cRPA/EDMFT screening "
                    "is not validated (Phi-derivability of the combination unestablished).",
                    vertex.vertex_type(), screen_type);
+      // WANNIER MODE (notes/wannier_projector_theory.md P1): build the projector from
+      // wan.h5 and install U. Demand D2 (one U per run): if a gw_edmft embedding
+      // projector is also active, the vertex must consume the SAME wan.h5 or abort.
+      if (not vertex_wannier_file.empty()) {
+        if (screen_type.substr(0,8) == "gw_edmft") {
+          auto embed_file = io::get_value_with_default<std::string>(pt,"wannier_file","");
+          utils::check(embed_file == vertex_wannier_file,
+                       "vertex_wannier_file = \"{}\" differs from the gw_edmft embedding "
+                       "wannier_file = \"{}\": one projector P per run is required (demand "
+                       "D2, notes/wannier_projector_theory.md section 1.5); use the SAME "
+                       "wan.h5 for both.", vertex_wannier_file, embed_file);
+        }
+        auto vtx_trans_home = io::get_value_with_default<bool>(pt,"translate_home_cell",false);
+        methods::projector_t proj(*mf, vertex_wannier_file, vtx_trans_home);
+        vertex.set_wannier_projector(proj, vertex_wannier_loewdin);
+      }
       scr_eri.set_vertex(&vertex);
       gw.set_vertex(&vertex);
     }
@@ -495,6 +530,11 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
     io::tolower(vertex_isdf);
     auto vertex_isdf_rank = io::get_value_with_default<long>(pt,"vertex_isdf_rank",-1);
     auto vertex_isdf_svd_tol = io::get_value_with_default<double>(pt,"vertex_isdf_svd_tol",1e-8);
+    // Wannier-projector subspace C (notes/wannier_projector_theory.md): when set, the
+    // vertex subspace is span{ w_a(k) } from a TRIQS-compatible wan.h5 (proj_mat +
+    // band_window) instead of the band window; U is Loewdin-orthonormalized at load.
+    auto vertex_wannier_file = io::get_value_with_default<std::string>(pt,"vertex_wannier_file","");
+    auto vertex_wannier_loewdin = io::get_value_with_default<bool>(pt,"vertex_wannier_loewdin",true);
 
     simple_dyson dyson(mf.get(), &ft, mu_tol, mu_update_alg);
     if (io::get_value_with_default<bool>(pt,"iter_alg.enable", true)) {
@@ -515,6 +555,22 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
                    "(got \"{}\"): combining the vertex correction with cRPA/EDMFT screening "
                    "is not validated (Phi-derivability of the combination unestablished).",
                    vertex.vertex_type(), screen_type);
+      // WANNIER MODE (notes/wannier_projector_theory.md P1): build the projector from
+      // wan.h5 and install U. Demand D2 (one U per run): if a gw_edmft embedding
+      // projector is also active, the vertex must consume the SAME wan.h5 or abort.
+      if (not vertex_wannier_file.empty()) {
+        if (screen_type.substr(0,8) == "gw_edmft") {
+          auto embed_file = io::get_value_with_default<std::string>(pt,"wannier_file","");
+          utils::check(embed_file == vertex_wannier_file,
+                       "vertex_wannier_file = \"{}\" differs from the gw_edmft embedding "
+                       "wannier_file = \"{}\": one projector P per run is required (demand "
+                       "D2, notes/wannier_projector_theory.md section 1.5); use the SAME "
+                       "wan.h5 for both.", vertex_wannier_file, embed_file);
+        }
+        auto vtx_trans_home = io::get_value_with_default<bool>(pt,"translate_home_cell",false);
+        methods::projector_t proj(*mf, vertex_wannier_file, vtx_trans_home);
+        vertex.set_wannier_projector(proj, vertex_wannier_loewdin);
+      }
       scr_eri.set_vertex(&vertex);
       gw.set_vertex(&vertex);
     }

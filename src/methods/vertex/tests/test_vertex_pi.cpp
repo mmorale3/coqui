@@ -562,6 +562,109 @@ namespace bdft_tests {
       REQUIRE(max_rel < 1e-5);
     }
 
+    SECTION("wannier_gauge") {
+      // KERNEL-LEVEL gauge oracle (notes/wannier_projector_theory.md section 6.2):
+      // the Pi^C output is an aux x aux object (no orbital indices survive). Under a
+      // Wannier re-mixing U -> U V (V an M x M unitary, M == Nb here so range(P) is the
+      // whole window), the kernel INPUTS transform as Xbar -> Xbar V, Gbar -> V^dag G V.
+      // Pi^C depends on range(P) ONLY => Pi_wannier(V) must EQUAL Pi_window bitwise-close
+      // for every unitary V. This replicates the production vertex_t Wannier threading
+      // (build_Xbar / downfold_G feeding the same kernel with C = [0, M)) but at O(seconds).
+      const long M = Nb;                       // full-window rotation (range(P) invariant)
+      auto run_gauge = [&](nda::array<cplx, 2> const& V, nda::array<cplx, 4>& Pi_out) {
+        // Xbar(is,ik,P,a) = sum_{j in C} X(is,ik,P, C.first()+j) V(j,a)     (Np x M)
+        nda::array<cplx, 4> Xbar(ns, nk, Np, M);
+        Xbar() = cplx(0.0);
+        for (long ik = 0; ik < nk; ++ik)
+          for (long P = 0; P < Np; ++P)
+            for (long a = 0; a < M; ++a)
+              for (long j = 0; j < Nb; ++j)
+                Xbar(0, ik, P, a) += mdl.X_skPa(0, ik, P, C().first() + j) * V(j, a);
+        // Gbar(it,is,ik,a,b) = sum_{ij} conj(V(i,a)) G_CC(it,is,ik,i,j) V(j,b)  (M x M)
+        // embedded into a full "band space" of size M with C' = [0, M).
+        nda::array<cplx, 5> Gbar(nt, ns, nk, M, M);
+        Gbar() = cplx(0.0);
+        for (long it = 0; it < nt; ++it)
+          for (long ik = 0; ik < nk; ++ik)
+            for (long a = 0; a < M; ++a)
+              for (long b = 0; b < M; ++b)
+                for (long i = 0; i < Nb; ++i)
+                  for (long jj = 0; jj < Nb; ++jj)
+                    Gbar(it, 0, ik, a, b) += std::conj(V(i, a)) *
+                        G(it, 0, ik, C().first() + i, C().first() + jj) * V(jj, b);
+        Pi_out() = cplx(0.0);
+        vertex_pi::pi_c_accumulate_w(ft, tools, Gbar, Xbar, mdl.Z_qPQ, &Wdyn,
+                                     mdl.kmq, mdl.kpq, nda::range(0, M), Pi_out, 0, 1);
+      };
+      // reference: V = identity (== the window path, up to the trivial C-slice offset).
+      nda::array<cplx, 4> Pi_ref(nw_b, nk, Np, Np), Pi_V(nw_b, nk, Np, Np);
+      {
+        nda::array<cplx, 2> Vid(M, M);
+        Vid() = cplx(0.0);
+        for (long a = 0; a < M; ++a) Vid(a, a) = cplx(1.0);
+        run_gauge(Vid, Pi_ref);
+      }
+      auto max_dev = [&](nda::array<cplx, 4> const& A) {
+        double num = 0, den = 0;
+        for (long l = 0; l < nw_b; ++l)
+          for (long q = 0; q < nk; ++q)
+            for (long P = 0; P < Np; ++P)
+              for (long Q = 0; Q < Np; ++Q) {
+                num = std::max(num, std::abs(A(l, q, P, Q) - Pi_ref(l, q, P, Q)));
+                den = std::max(den, std::abs(Pi_ref(l, q, P, Q)));
+              }
+        return std::make_pair(num, den);
+      };
+      REQUIRE(std::isfinite(nda::sum(nda::abs(Pi_ref))));
+      // (a) real orthogonal V: real-U sector -- must be exact (degenerate-class).
+      {
+        rng_t rr(31);
+        auto Vc = unitary(M, rr);
+        nda::array<cplx, 2> Vre(M, M);
+        for (long a = 0; a < M; ++a)
+          for (long b = 0; b < M; ++b) Vre(a, b) = cplx(Vc(a, b).real());
+        // re-orthonormalize the real part (Gram-Schmidt) so Vre is exactly orthogonal
+        for (long b = 0; b < M; ++b) {
+          for (long c = 0; c < b; ++c) {
+            cplx ip = 0;
+            for (long a = 0; a < M; ++a) ip += std::conj(Vre(a, c)) * Vre(a, b);
+            for (long a = 0; a < M; ++a) Vre(a, b) -= ip * Vre(a, c);
+          }
+          double nrm = 0;
+          for (long a = 0; a < M; ++a) nrm += std::norm(Vre(a, b));
+          nrm = std::sqrt(nrm);
+          for (long a = 0; a < M; ++a) Vre(a, b) /= nrm;
+        }
+        run_gauge(Vre, Pi_V);
+        auto [num, den] = max_dev(Pi_V);
+        app_log(1, "wannier_gauge: REAL orthogonal V  max|dPi| = {:.3e} (max|Pi| = {:.3e}, rel = {:.3e})",
+                num, den, num / den);
+        REQUIRE(num / den < 1e-10);
+      }
+      // (b) 1x1-style diagonal complex phase on each orbital (diagonal unitary).
+      {
+        nda::array<cplx, 2> Vph(M, M);
+        Vph() = cplx(0.0);
+        Vph(0, 0) = std::exp(cplx(0.0, 0.7));
+        for (long a = 1; a < M; ++a) Vph(a, a) = std::exp(cplx(0.0, 1.3 * double(a)));
+        run_gauge(Vph, Pi_V);
+        auto [num, den] = max_dev(Pi_V);
+        app_log(1, "wannier_gauge: DIAGONAL phase V   max|dPi| = {:.3e} (max|Pi| = {:.3e}, rel = {:.3e})",
+                num, den, num / den);
+        REQUIRE(num / den < 1e-10);
+      }
+      // (c) GENUINE off-diagonal COMPLEX unitary V -- the sharp check (the bug).
+      {
+        rng_t rr(53);
+        auto Vc = unitary(M, rr);
+        run_gauge(Vc, Pi_V);
+        auto [num, den] = max_dev(Pi_V);
+        app_log(1, "wannier_gauge: COMPLEX off-diag V  max|dPi| = {:.3e} (max|Pi| = {:.3e}, rel = {:.3e})",
+                num, den, num / den);
+        REQUIRE(num / den < 1e-10);
+      }
+    }
+
     SECTION("structure") {
       nda::array<cplx, 4> Pi_kern(nw_b, nk, Np, Np);
       Pi_kern() = cplx(0.0);

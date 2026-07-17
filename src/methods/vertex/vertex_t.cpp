@@ -23,6 +23,7 @@
 #include <unordered_set>
 
 #include "nda/lapack.hpp"
+#include "nda/linalg/eigenelements.hpp"
 
 #include "utilities/check.hpp"
 #include "numerics/sparse/csr_blas.hpp"   // csrmm for the symmetry D-matrix blocks
@@ -247,13 +248,206 @@ namespace solvers {
 
   } // vertex_ibz_detail
 
+  /**
+   * WANNIER-projector helpers (notes/wannier_projector_theory.md section 0-2).
+   * The whole substitution is the linearity lemma (memo section 2.0): with the
+   * fixed Norb x M isometry U(s,k) the four input-slice sites become
+   *   G_bar = U^dag G U   (M x M),   X_bar = X . U   (Np x M),
+   * fed to the ALREADY projector-general kernels; the Sigma^C cut comes out in
+   * Wannier labels and is injected back as the operator sandwich U Sigma_bar U^dag
+   * (memo C2/C3). All rotations act on the W_rng rows only (U is zero elsewhere),
+   * so the U arrays carry exactly W_rng.size() rows.
+   */
+  namespace vertex_wannier_detail {
+
+    // Loewdin orthonormalization of one Norb x M block: U_orth = U (U^dag U)^{-1/2},
+    // via the Hermitian eig of the M x M Gram s = U^dag U (owner ruling Q1). Returns
+    // ||s - 1_M||_F measured BEFORE the correction. If loewdin == false the block is
+    // left raw (the caller warns). nrow = W_rng.size(), M = columns.
+    inline double loewdin_block(nda::MemoryArrayOfRank<2> auto &&U, bool loewdin) {
+      const long nrow = U.shape(0), M = U.shape(1);
+      nda::matrix<ComplexType> s(M, M);
+      nda::blas::gemm(ComplexType(1.0), nda::dagger(U), U, ComplexType(0.0), s);
+      double defect = 0.0;
+      for (long a = 0; a < M; ++a)
+        for (long b = 0; b < M; ++b)
+          defect += std::norm(s(a, b) - ((a == b) ? ComplexType(1.0) : ComplexType(0.0)));
+      defect = std::sqrt(defect);
+      if (not loewdin) return defect;
+      // s = V diag(lam) V^dag (Hermitian, lam ascending; eigenvectors in COLUMNS,
+      // diis_alg.hpp convention); s^{-1/2} = V diag(lam^{-1/2}) V^dag.
+      auto [lam, V] = nda::linalg::eigenelements(s);
+      utils::check(lam(0) > 1e-12,
+                   "vertex_wannier_detail::loewdin_block: the Wannier Gram U^dag U is "
+                   "numerically singular (min eigenvalue {} <= 1e-12); the projector "
+                   "columns are linearly dependent.", lam(0));
+      nda::matrix<ComplexType> sinvhalf(M, M), tmp(M, M);
+      for (long a = 0; a < M; ++a)
+        for (long b = 0; b < M; ++b)
+          tmp(a, b) = V(a, b) / std::sqrt(lam(b));   // V diag(lam^{-1/2})
+      nda::blas::gemm(ComplexType(1.0), tmp, nda::dagger(V), ComplexType(0.0), sinvhalf);
+      nda::matrix<ComplexType> Uc(nrow, M);
+      Uc() = U;
+      nda::blas::gemm(ComplexType(1.0), Uc, sinvhalf, ComplexType(0.0), U);
+      return defect;
+    }
+
+    // G_bar(s,k) = U(s,k)^dag G(s,k)|_{W_rng,W_rng} U(s,k)  (M x M), one tau slice
+    // handled by the caller. Gw is the (W_rng x W_rng) band-basis block.
+    inline void downfold_G(nda::MemoryArrayOfRank<2> auto const &U,     // (nrow, M)
+                           nda::MemoryArrayOfRank<2> auto const &Gw,    // (nrow, nrow)
+                           nda::array<ComplexType, 2> &tmp,             // (M, nrow)
+                           nda::MemoryArrayOfRank<2> auto &&Gbar) {     // (M, M)
+      nda::blas::gemm(nda::dagger(U), Gw, tmp);       // U^dag G
+      nda::blas::gemm(tmp, U, Gbar);                  // (U^dag G) U
+    }
+
+    // Sigma^C injection (C3, memo section 2.3). CHAIN-RULE form (memo section 1.2),
+    // PINNED-BY-TEST by the gauge check + the kernel-level phase razor (memo section 6.2):
+    //   Sigma^C_ij += sum_ab conj(U_ia) Sigma_bar_ab U_jb = [conj(U) Sigma_bar U^T]_ij
+    // over i,j in W_rng. The Sigma kernel emits Sigma_bar(a,b) with the external index a
+    // carrying the NON-conjugated collocation leg (X_bar, phase phi_a) and b the
+    // CONJUGATED leg (conj(X_bar), phase conj(phi_b)); so under U -> U V the kernel output
+    // transforms as Sigma_bar -> V^T Sigma_bar conj(V), and only the chain-rule sandwich
+    // conj(U) Sigma_bar U^T is invariant (the operator sandwich U Sigma_bar U^dag leaks at
+    // O(1) under a COMPLEX gauge -- the vertex_sigma_toy "wannier_gauge" oracle). This
+    // equals Sigma_bar for U = I, so the window / degenerate-U bit-identity is preserved
+    // (conj(I) Sigma_bar I^T = Sigma_bar; NO transpose of Sigma_bar). Sw is the W_rng
+    // destination block. Implemented as conj(U) . Sigma_bar . transpose(U).
+    inline void upfold_Sigma(nda::MemoryArrayOfRank<2> auto const &U,      // (nrow, M)
+                             nda::MemoryArrayOfRank<2> auto const &Sbar,   // (M, M)
+                             nda::array<ComplexType, 2> &tmp,              // (nrow, M)
+                             nda::MemoryArrayOfRank<2> auto &&Sw) {        // (nrow, nrow)
+      // conj(U) cannot be passed alone to gemm (BLAS has no conj-only op); materialize it.
+      auto Uc = nda::make_regular(nda::conj(U));       // (nrow x M)
+      nda::blas::gemm(Uc, Sbar, tmp);                  // conj(U) Sigma_bar   (nrow x M)
+      nda::blas::gemm(ComplexType(1.0), tmp, nda::transpose(U), ComplexType(1.0), Sw);
+    }
+
+    // X_bar(s,k) = X(s,k) . U(s,k) : the rotated collocation (Np x M). X_skPa carries
+    // the FULL band range on its last axis; U acts on the W_rng rows. k axis is full BZ.
+    inline nda::array<ComplexType, 4>
+    build_Xbar(nda::array<ComplexType, 4> const &X_skPa,   // (ns, nk, Np, nbnd)
+               nda::array<ComplexType, 4> const &U_skia,   // (ns, nk, nW, M)
+               nda::range W_rng) {
+      decltype(nda::range::all) all;
+      const long ns = X_skPa.shape(0), nk = X_skPa.shape(1), Np = X_skPa.shape(2);
+      const long M = U_skia.shape(3);
+      nda::array<ComplexType, 4> Xbar(ns, nk, Np, M);
+      for (long is = 0; is < ns; ++is)
+        for (long ik = 0; ik < nk; ++ik)
+          nda::blas::gemm(X_skPa(is, ik, all, W_rng), U_skia(is, ik, all, all),
+                          Xbar(is, ik, all, all));   // (Np x nW)(nW x M) = (Np x M)
+      return Xbar;
+    }
+
+    // G_bar(t,s,k) = U(s,k)^dag G(t,s,k)|_{W_rng,W_rng} U(s,k) on the FULL BZ k axis.
+    // Under symmetry the band-basis block is sourced with (G1)/(G2): non-trev k is a
+    // pure copy of the IBZ block, trev k the tau-pointwise TRANSPOSE (the same gauge
+    // gather the window path uses; memo section 2.8 / 3.5). G_ibz has the IBZ k axis.
+    inline void build_Gbar_fullbz(nda::MemoryArrayOfRank<5> auto const &G_ibz,  // (nt,ns,nk_src,nbnd,nbnd)
+                                  nda::array<ComplexType, 4> const &U_skia,
+                                  nda::range W_rng, bool sym_mesh,
+                                  nda::ArrayOfRank<1> auto const &kp_to_ibz,
+                                  nda::ArrayOfRank<1> auto const &kp_trev,
+                                  nda::array<ComplexType, 5> &Gbar) {           // (nt,ns,nk,M,M)
+      decltype(nda::range::all) all;
+      const long nt = Gbar.shape(0), ns = Gbar.shape(1), nk = Gbar.shape(2);
+      const long M = Gbar.shape(3), nW = W_rng.size(), W0 = W_rng.first();
+      nda::array<ComplexType, 2> Gw(nW, nW), tmp(M, nW);
+      for (long ik = 0; ik < nk; ++ik) {
+        const long ksrc = sym_mesh ? long(kp_to_ibz(ik)) : ik;
+        const bool trev = sym_mesh and bool(kp_trev(ik));
+        for (long is = 0; is < ns; ++is)
+          for (long it = 0; it < nt; ++it) {
+            auto Gsrc = G_ibz(it, is, ksrc, all, all);
+            if (not trev) {
+              for (long a = 0; a < nW; ++a)
+                for (long b = 0; b < nW; ++b) Gw(a, b) = Gsrc(W0 + a, W0 + b);
+            } else {
+              for (long a = 0; a < nW; ++a)
+                for (long b = 0; b < nW; ++b) Gw(a, b) = Gsrc(W0 + b, W0 + a);  // transpose
+            }
+            downfold_G(U_skia(is, ik, all, all), Gw, tmp, Gbar(it, is, ik, all, all));
+          }
+      }
+    }
+
+  } // vertex_wannier_detail
+
+  void vertex_t::set_wannier_projector(methods::projector_t const &proj, bool loewdin) {
+    utils::check(enabled(),
+                 "vertex_t::set_wannier_projector: the vertex is disabled (vertex_type = "
+                 "\"none\"); nothing to project onto.");
+    utils::check(proj.nImps() == 1,
+                 "vertex_t::set_wannier_projector: only a single impurity is supported "
+                 "(nImps = {}); merge the shells in the wan.h5 reader.", proj.nImps());
+    decltype(nda::range::all) all;
+
+    // U = dagger(proj_mat) on the W_rng rows (memo section 0 pin): the code's
+    // proj_mat _C_skIai(s,k,0,a,i) = C_{a,i} downfolds as O_loc = C O_WW C^dag, so
+    // U_{i,a} = conj(C_{a,i}) is the isometry with O_loc = U^dag O U.
+    auto C = proj.C_skIai();                       // (ns, nk, 1, M, nOrbs_W)
+    auto const &W_rng = proj.W_rng()[0];
+    const long ns = C.shape(0), nk = C.shape(1), M = C.shape(3), nW = C.shape(4);
+    utils::check(nW == W_rng.size(),
+                 "vertex_t::set_wannier_projector: proj_mat window dim {} != W_rng size "
+                 "{}.", nW, long(W_rng.size()));
+    utils::check(M > 0 and M <= nW,
+                 "vertex_t::set_wannier_projector: invalid projector rank M = {} "
+                 "(window size {}).", M, nW);
+
+    _wannier = true;
+    _M = M;
+    _band_window = W_rng;                            // injection/storage support
+    _wannier_file = proj.C_file();
+    _U_skia = nda::array<ComplexType, 4>(ns, nk, nW, M);
+    for (long is = 0; is < ns; ++is)
+      for (long ik = 0; ik < nk; ++ik)
+        for (long i = 0; i < nW; ++i)
+          for (long a = 0; a < M; ++a)
+            _U_skia(is, ik, i, a) = std::conj(C(is, ik, 0, a, i));
+
+    // Loewdin-orthonormalize per (s,k); measure ||U^dag U - 1|| before the correction
+    double defect_max = 0.0;
+    for (long is = 0; is < ns; ++is)
+      for (long ik = 0; ik < nk; ++ik) {
+        double d = vertex_wannier_detail::loewdin_block(_U_skia(is, ik, all, all), loewdin);
+        defect_max = std::max(defect_max, d);
+      }
+    _iso_defect = defect_max;
+
+    app_log(1, "\n  Vertex subspace C = Wannier projector P = U U^dag "
+               "(notes/wannier_projector_theory.md)\n"
+               "  ------------------------------------------------------------------\n"
+               "  Wannier file             = {}\n"
+               "  Subspace rank M          = {} orbitals\n"
+               "  Injection window W_rng   = [{}, {})  ({} bands)\n"
+               "  Isometry defect max_sk ||U^dag U - 1||_F (before Loewdin) = {:.3e}\n"
+               "  Loewdin orthonormalize   = {} (owner ruling Q1)\n",
+            _wannier_file.empty() ? "(in-memory projector)" : _wannier_file,
+            M, _band_window.first(), _band_window.last(), nW, defect_max,
+            loewdin ? "yes" : "no");
+    if (not loewdin and defect_max > 1e-8)
+      app_log(1, "  [WARNING] set_wannier_projector: Loewdin skipped and the raw "
+                 "isometry defect is {:.3e} > 1e-8:\n"
+                 "            P is only approximately idempotent, so the subspace "
+                 "interpretation, the\n"
+                 "            q->0 head delta_ab reduction, and gauge invariance "
+                 "degrade at O(defect)\n"
+                 "            (memo section 1.3). Prefer the default Loewdin path.\n",
+              defect_max);
+  }
+
   void vertex_t::build_sym_ctx(THC_ERI auto const &thc,
                                nda::array<ComplexType, 4> const &X_w,
                                long C0_global,
-                               std::optional<vertex_sym::sym_ctx> &slot) {
+                               std::optional<vertex_sym::sym_ctx> &slot,
+                               nda::array<ComplexType, 4> const *U_skia) {
     if (slot.has_value()) return;   // geometry-fixed
     decltype(nda::range::all) all;
     auto MF = thc.MF();
+    const bool wan = (U_skia != nullptr);
 
     vertex_sym::sym_ctx ctx;
     ctx.active = true;
@@ -263,14 +457,22 @@ namespace solvers {
     ctx.nq_full = MF->nqpts();
     ctx.nq_ibz = MF->nqpts_ibz();
     ctx.naux = X_w.shape(2);
-    ctx.nc = X_w.shape(3);
+    ctx.nc = X_w.shape(3);                 // = M (Wannier) or window size (window mode)
     utils::check(X_w.shape(1) == ctx.nk_full,
                  "vertex_t::build_sym_ctx: X_w must carry the FULL BZ k axis "
                  "({} vs {}).", X_w.shape(1), ctx.nk_full);
     const long nbnd = MF->nbnd();
     const long nc = ctx.nc;
-    utils::check(C0_global >= 0 and C0_global + nc <= nbnd,
-                 "vertex_t::build_sym_ctx: invalid window [{}, {}).", C0_global, C0_global + nc);
+    // nW = the D-window band span. WINDOW: nW = nc (the C rows in band basis).
+    // WANNIER (memo section 2.8): nW = W_rng.size(), the injection support, and the
+    // C-sector rotation is d = U(Sk)^dag D_win U(k) (M x M), NOT the band block.
+    const long nW = wan ? U_skia->shape(2) : nc;
+    utils::check(C0_global >= 0 and C0_global + nW <= nbnd,
+                 "vertex_t::build_sym_ctx: invalid window [{}, {}).", C0_global, C0_global + nW);
+    if (wan)
+      utils::check(U_skia->shape(0) == ctx.ns and U_skia->shape(1) == ctx.nk_full and
+                   U_skia->shape(3) == nc,
+                   "vertex_t::build_sym_ctx: U_skia shape mismatch with X_w.");
 
     auto qsymms = MF->qsymms();
     ctx.nsym = qsymms.extent(0);
@@ -353,41 +555,75 @@ namespace solvers {
     double leak_max = 0.0, leak_sum = 0.0;
     long leak_cnt = 0;
     {
-      // column selector E(nbnd, nc) of the window block; Dcols = D * E
-      nda::array<ComplexType, 2> E(nbnd, nc), Dcols(nbnd, nc);
+      // column selector E(nbnd, nW) of the W-window band block; Dcols = D * E (nbnd, nW)
+      nda::array<ComplexType, 2> E(nbnd, nW), Dcols(nbnd, nW);
       nda::array<ComplexType, 2> base(ctx.naux, nc);
+      // Wannier scratch: DU(nbnd, M) = Dcols . U(k) (rows W_rng), d(M,M) = U(Sk)^dag DU
+      nda::array<ComplexType, 2> DU(nbnd, nc), dW_win(nW, nc);
       E() = ComplexType(0.0);
-      for (long j = 0; j < nc; ++j) E(C0_global + j, j) = ComplexType(1.0);
+      for (long j = 0; j < nW; ++j) E(C0_global + j, j) = ComplexType(1.0);
       using math::sparse::csrmm;
       for (long js = 1; js < ctx.nsym; ++js) {
         for (long ik = 0; ik < ctx.nk_full; ++ik) {
           auto [cj, Dsp] = MF->symmetry_rotation(js, ik);
           ctx.cjg(js, ik) = cj;
           csrmm(ComplexType(1.0), *Dsp, E, ComplexType(0.0), Dcols);
-          // C-window leakage of this rotation (memo (C-leak)); PLAIN block kept --
-          // no extra normalization (consumer precedent, projector_boson_t.cpp:108-121)
-          double m_in = 0.0, m_all = 0.0;
-          for (long a = 0; a < nbnd; ++a)
-            for (long j = 0; j < nc; ++j) {
-              const double w = std::norm(Dcols(a, j));
-              m_all += w;
-              if (a >= C0_global and a < C0_global + nc) m_in += w;
-            }
-          if (m_all > 1e-24) {
-            const double leak = 1.0 - m_in / m_all;
-            leak_max = std::max(leak_max, leak);
-            leak_sum += leak;
-            ++leak_cnt;
-          }
-          auto Dc = ctx.Dc(js, ik, all, all);
-          for (long a = 0; a < nc; ++a)
-            for (long j = 0; j < nc; ++j) Dc(a, j) = Dcols(C0_global + a, j);
-          // effective columns (memo (X-hat)): base collocation at the D-pair point
-          // (the trev pair's rotation for trev k -- the API redirect), conj for trev
           const long ksrc = ctx.krot(js, cj ? long(kp_trev_pair(ik)) : ik);
+          // C-window leakage of this rotation (memo (C-leak)); PLAIN block kept --
+          // no extra normalization (consumer precedent, projector_boson_t.cpp:108-121).
+          // WANNIER: the projector-level leakage ||(1 - P(Sk)) D U(k)|| = mass of D U(k)
+          // falling outside range(P(Sk)); 0 for a symmetry-closed Wannier set (memo 2.8).
+          auto Dc = ctx.Dc(js, ik, all, all);
+          if (not wan) {
+            double m_in = 0.0, m_all = 0.0;
+            for (long a = 0; a < nbnd; ++a)
+              for (long j = 0; j < nc; ++j) {
+                const double w = std::norm(Dcols(a, j));
+                m_all += w;
+                if (a >= C0_global and a < C0_global + nc) m_in += w;
+              }
+            if (m_all > 1e-24) {
+              const double leak = 1.0 - m_in / m_all;
+              leak_max = std::max(leak_max, leak);
+              leak_sum += leak;
+              ++leak_cnt;
+            }
+            for (long a = 0; a < nc; ++a)
+              for (long j = 0; j < nc; ++j) Dc(a, j) = Dcols(C0_global + a, j);
+          }
+          // effective columns (memo (X-hat)): base collocation at the D-pair point
+          // (the trev pair's rotation for trev k -- the API redirect), conj for trev.
+          // WANNIER: base = X_bar(ksrc) . d(k;S), d = U(ksrc)^dag D_win U(ik) (M x M).
+          nda::array<ComplexType, 2> dloc(nc, nc);   // per-spin C-sector rotation
           for (long is = 0; is < ctx.ns; ++is) {
-            nda::blas::gemm(ComplexType(1.0), X_w(is, ksrc, all, all), Dc,
-                            ComplexType(0.0), base);
+            if (wan) {
+              // DU(nbnd, M) = Dcols(nbnd, nW) . U(ik)(nW, M)
+              nda::blas::gemm(Dcols, (*U_skia)(is, ik, all, all), DU);
+              // d(M, M) = U(ksrc)^dag(M, nW) . DU[W_rng rows](nW, M)
+              for (long p = 0; p < nW; ++p)
+                for (long a = 0; a < nc; ++a) dW_win(p, a) = DU(C0_global + p, a);
+              nda::blas::gemm(nda::dagger((*U_skia)(is, ksrc, all, all)), dW_win, dloc);
+              // projector-level leakage: 1 - ||P(ksrc) DU||^2 / ||DU||^2 (memo 2.8)
+              if (is == 0) {
+                Dc = dloc;                               // store the is=0 rotation
+                double m_all = 0.0, m_in = 0.0;
+                for (long a = 0; a < nc; ++a) {
+                  for (long p = 0; p < nbnd; ++p) m_all += std::norm(DU(p, a));
+                  for (long b = 0; b < nc; ++b) m_in += std::norm(dloc(b, a));
+                }
+                if (m_all > 1e-24) {
+                  const double leak = std::max(0.0, 1.0 - m_in / m_all);
+                  leak_max = std::max(leak_max, leak);
+                  leak_sum += leak; ++leak_cnt;
+                }
+              }
+            }
+            if (wan)
+              nda::blas::gemm(ComplexType(1.0), X_w(is, ksrc, all, all), dloc,
+                              ComplexType(0.0), base);
+            else
+              nda::blas::gemm(ComplexType(1.0), X_w(is, ksrc, all, all), Dc,
+                              ComplexType(0.0), base);
             if (cj)
               for (long P = 0; P < ctx.naux; ++P)
                 for (long j = 0; j < nc; ++j)
@@ -414,7 +650,10 @@ namespace solvers {
                "         generate_dmatrix (symmetry.hpp:1084-1092). No abort "
                "(theory-owner ruling).\n",
             ctx.nk_full, ctx.nk_ibz, ctx.nq_full, ctx.nq_ibz, ctx.nsym, ctx.naux,
-            C0_global, C0_global + nc, ctx.leak_max, ctx.leak_mean);
+            C0_global, C0_global + nW, ctx.leak_max, ctx.leak_mean);
+    if (wan)
+      app_log(1, "  (Wannier mode: leakage is the projector-level "
+                 "||(1 - P(Sk)) D U(k)||^2; 0 for a symmetry-closed set, memo 2.8)\n");
     if (ctx.leak_max > 1e-2)
       app_log(1, "  [WARNING] C-window D-matrix leakage max = {:.3e} > 1e-2: the "
                  "window cuts deeply\n"
@@ -496,20 +735,20 @@ namespace solvers {
   }
 
   void vertex_t::build_secondary_basis(THC_ERI auto const &thc,
-                                       nda::array<ComplexType, 4> const &X_skPa,
+                                       nda::array<ComplexType, 4> const &X_glob, long orb0,
                                        nda::array<long, 2> const &kmq, long iq_gamma) {
     if (_secondary_ready) return;
     decltype(nda::range::all) all;
     auto mpi = thc.mpi();
     auto MF = thc.MF();
-    const long ns = X_skPa.shape(0), nkpts = X_skPa.shape(1), Np = X_skPa.shape(2);
+    const long ns = X_glob.shape(0), nkpts = X_glob.shape(1), Np = X_glob.shape(2);
     // t(q) is built at IBZ q ONLY (notes/vertex_ibz_symmetry.md section 3.7): the
     // kernels source non-IBZ transfers from the IBZ-stored folded cores through the
     // symmetry context. On symmetry-free meshes nqpts_ibz == nqpts (historic path).
     const long nqpts = MF->nqpts_ibz();
     utils::check(kmq.shape(0) >= nqpts,
                  "vertex_t::build_secondary_basis: kmq must cover the IBZ q range.");
-    const long nc = _band_window.size();
+    const long nc = subspace_rank();
     const long Npair = ns * nkpts * nc * nc;   // the pair index carries momentum
                                                // (CLAUDE.md section 2, invariant 4)
     const long Nm_req = (_isdf_rank > 0) ? _isdf_rank : nc * nc * nkpts;
@@ -518,10 +757,11 @@ namespace solvers {
                  "subspace pair rank N_pair = ns*nk*nc^2 = {}; the secondary basis "
                  "cannot usefully exceed the space it represents.", Nm_req, Npair);
 
-    app_log(1, "\n  Refinement 2: building the secondary ISDF basis on C = [{}, {}) "
-               "(notes/refinement2_optionA.md)\n"
+    app_log(1, "\n  Refinement 2: building the secondary ISDF basis on the subspace C "
+               "(rank M = {}, {})\n"
                "  requested N_m = {}, svd_tol(B) = {}, N_pair (per q, spin-stacked) = {}\n",
-            _band_window.first(), _band_window.last(), Nm_req, _isdf_svd_tol, Npair);
+            nc, _wannier ? "Wannier projector" : "band window",
+            Nm_req, _isdf_svd_tol, Npair);
 
     // ---- restricted-range ISDF point selection (collective on thc.mpi()->comm) --------
     // Private methods::thc builder on the SAME MF/mpi context; thresh = 1e-13 makes the
@@ -537,9 +777,60 @@ namespace solvers {
       // which is also the exactly-nested greedy order the rank scans rely on
       pt.put("chol_block_size", 1);
       methods::thc builder(MF.get(), *mpi, pt, /*print_metadata*/ false);
-      auto [ipts, dXa, dXb] = builder.interpolating_points<HOST_MEMORY>(
-          int(iq_gamma), int(Nm_req), _band_window, _band_window);
-      (void)dXb;   // empty optional for a_range == b_range at Gamma (single_psi path)
+      // WINDOW: the band-range overload (Wannier=window). WANNIER (owner ruling Q2):
+      // the committed rotated overload interpolating_points(C_skai, iq, max), fed the
+      // zero-padded U as C_skai(s,k,a,i) = conj(U_ia) on the W_rng band columns (memo
+      // C5/section 2.6; the overload rotates the real-space orbitals by conj(C_skai),
+      // thc.icc:831-858, so this yields exactly the Wannier orbitals w_a). Its metric
+      // resolves (Wannier x all-band) pairs -- a superset of the (Wannier x Wannier)
+      // pairs the vertex needs; eta(q,nu) certifies adequacy. The rotated overload
+      // requires nkpts == nkpts_ibz (thc.cpp:207) -- Wannier+secondary is nosym only.
+      nda::array<long, 1> ipts;
+      nda::array<ComplexType, 4> Xa(ns, nkpts, nc, 0);   // (ns, nk, nc, Nm), filled below
+      if (not _wannier) {
+        auto [ip, dXa, dXb] = builder.interpolating_points<HOST_MEMORY>(
+            int(iq_gamma), int(Nm_req), _band_window, _band_window);
+        (void)dXb;   // empty optional for a_range == b_range at Gamma (single_psi path)
+        const long Nm = ip.extent(0);
+        auto gs = dXa.global_shape();
+        utils::check(gs[0] == ns and gs[1] == nkpts and gs[2] == nc and gs[3] == Nm,
+                     "vertex_t::build_secondary_basis: unexpected collocation shape "
+                     "({}, {}, {}, {}); expected ({}, {}, {}, {}).",
+                     gs[0], gs[1], gs[2], gs[3], ns, nkpts, nc, Nm);
+        Xa = nda::array<ComplexType, 4>(ns, nkpts, nc, Nm);
+        Xa() = ComplexType(0.0);
+        Xa(dXa.local_range(0), dXa.local_range(1), dXa.local_range(2), dXa.local_range(3)) =
+            dXa.local();
+        ipts = std::move(ip);
+      } else {
+        utils::check(MF->nkpts() == MF->nkpts_ibz(),
+                     "vertex_t::build_secondary_basis: the Wannier rotated point-selection "
+                     "overload does not support symmetry-reduced k-meshes (thc.cpp:207). "
+                     "Use vertex_isdf = \"global\" for Wannier + symmetry runs.");
+        const long nbnd = MF->nbnd();
+        nda::array<ComplexType, 4> C_skai(ns, nkpts, nc, nbnd);
+        C_skai() = ComplexType(0.0);
+        for (long is = 0; is < ns; ++is)
+          for (long ik = 0; ik < nkpts; ++ik)
+            for (long a = 0; a < nc; ++a)
+              for (long i = 0; i < _band_window.size(); ++i)
+                C_skai(is, ik, a, _band_window.first() + i) =
+                    std::conj(_U_skia(is, ik, i, a));
+        auto [ip, dXa, dXb] =
+            builder.interpolating_points<HOST_MEMORY>(C_skai, int(iq_gamma), int(Nm_req));
+        (void)dXb;
+        const long Nm = ip.extent(0);
+        auto gs = dXa.global_shape();
+        utils::check(gs[0] == ns and gs[1] == nkpts and gs[2] == nc and gs[3] == Nm,
+                     "vertex_t::build_secondary_basis: unexpected rotated collocation "
+                     "shape ({}, {}, {}, {}); expected ({}, {}, {}, {}).",
+                     gs[0], gs[1], gs[2], gs[3], ns, nkpts, nc, Nm);
+        Xa = nda::array<ComplexType, 4>(ns, nkpts, nc, Nm);
+        Xa() = ComplexType(0.0);
+        Xa(dXa.local_range(0), dXa.local_range(1), dXa.local_range(2), dXa.local_range(3)) =
+            dXa.local();
+        ipts = std::move(ip);
+      }
       const long Nm = ipts.extent(0);
       utils::check(Nm > 0,
                    "vertex_t::build_secondary_basis: point selection returned 0 points.");
@@ -549,18 +840,9 @@ namespace solvers {
                    "         the C pair-density metric is numerically rank-deficient below "
                    "thresh = 1e-13;\n"
                    "         using the returned rank.", Nm, Nm_req);
-      auto gs = dXa.global_shape();
-      utils::check(gs[0] == ns and gs[1] == nkpts and gs[2] == nc and gs[3] == Nm,
-                   "vertex_t::build_secondary_basis: unexpected collocation shape "
-                   "({}, {}, {}, {}); expected ({}, {}, {}, {}).",
-                   gs[0], gs[1], gs[2], gs[3], ns, nkpts, nc, Nm);
-      // gather the distributed collocation, then transpose to the kernels' (aux, orb)
-      // layout. Any fixed per-point phase/scale convention of the selection output is
-      // absorbed by the least-squares transfer (memo section 2.4).
-      nda::array<ComplexType, 4> Xa(ns, nkpts, nc, Nm);
-      Xa() = ComplexType(0.0);
-      Xa(dXa.local_range(0), dXa.local_range(1), dXa.local_range(2), dXa.local_range(3)) =
-          dXa.local();
+      // gather the distributed collocation (already assembled into Xa above), then
+      // transpose to the kernels' (aux, orb) layout. Any fixed per-point phase/scale
+      // convention of the selection output is absorbed by the least-squares transfer.
       mpi->comm.all_reduce_in_place_n(Xa.data(), Xa.size(), std::plus<>{});
       _Xb_skma = nda::array<ComplexType, 4>(ns, nkpts, Nm, nc);
       for (long is = 0; is < ns; ++is)
@@ -586,8 +868,7 @@ namespace solvers {
       nda::array<double, 1> sv(std::min(Npair, _Nm));
       for (long iq = 0; iq < nqpts; ++iq) {
         vertex_secondary_detail::build_pair_matrix(_Xb_skma, 0, nc, kmq, iq, B_Im);
-        vertex_secondary_detail::build_pair_matrix(X_skPa, _band_window.first(), nc,
-                                                   kmq, iq, C_IP);
+        vertex_secondary_detail::build_pair_matrix(X_glob, orb0, nc, kmq, iq, C_IP);
         for (long I = 0; I < Npair; ++I) {
           for (long m = 0; m < _Nm; ++m) BT(m, I) = B_Im(I, m);
           for (long P = 0; P < Np; ++P) CT(P, I) = C_IP(I, P);
@@ -825,21 +1106,26 @@ namespace solvers {
     // t H t^dag = (t conj(chi))(t conj(chi))^dag, memo section 3). Sigma^C externals
     // are a, b in C (theoryB 11.5) and land in the C-C block; NO upfold (Eq. 38 text).
     const bool sec = secondary();
-    const long nc = _band_window.size();
+    const bool wan = _wannier;
+    const long nc = subspace_rank();     // = M (Wannier) or _band_window.size() (window)
     nda::array<ComplexType, 3> Zb_qmm;
     nda::array<ComplexType, 4> Wb_qtmm;
     // STRICT C-C EXTERNALS (theory-owner ruling, notes/refinement2_optionA.md
     // DECISION 2): in Phi_2^C ALL FOUR G-lines -- including the cut one -- are
-    // C-restricted, so Sigma^C = dPhi/dG is nonzero ONLY on the C-C block. BOTH paths
-    // run the kernel with C-restricted externals (G_CC + the C columns of the
-    // collocation); the full-range extension of the kernel formula is well-defined but
-    // is NOT dPhi/dG, and accumulating it would break strict Phi-derivability.
-    // G_CC on the FULL BZ (memo (G1)/(G2)): image points are gauge copies of the
-    // IBZ blocks (identity D by convention, symmetry.hpp:910); trev points are the
-    // tau-pointwise TRANSPOSE (the code's own convention, thc_solver_comm.hpp:443-447;
-    // == conj for the hermitian G). No tau-mirror anywhere (memo section 3.5).
+    // C-restricted, so Sigma^C = dPhi/dG is nonzero ONLY on the C-C block (window) /
+    // range(P) (Wannier). BOTH paths run the kernel with C-restricted externals
+    // (G_CC + the C columns of the collocation); the full-range extension of the
+    // kernel formula is well-defined but is NOT dPhi/dG.
+    // WINDOW: G_CC = the W-window block; WANNIER: G_CC = U^dag G U (memo C2/section 2.2).
+    // On the FULL BZ (memo (G1)/(G2)): image points are gauge copies of the IBZ blocks
+    // (identity D by convention, symmetry.hpp:910); trev points are the tau-pointwise
+    // TRANSPOSE (thc_solver_comm.hpp:443-447; == conj for the hermitian G). No tau-mirror
+    // anywhere (memo section 3.5).
     nda::array<ComplexType, 5> G_CC(nt, ns, nkpts, nc, nc);
-    if (not sym_mesh) {
+    if (wan) {
+      vertex_wannier_detail::build_Gbar_fullbz(G_tskij, _U_skia, _band_window, sym_mesh,
+                                               MF->kp_to_ibz(), MF->kp_trev(), G_CC);
+    } else if (not sym_mesh) {
       G_CC = G_tskij(all, all, all, _band_window, _band_window);
     } else {
       auto kp_to_ibz = MF->kp_to_ibz();
@@ -858,26 +1144,35 @@ namespace solvers {
         }
       }
     }
-    app_log(2, "  Sigma^C externals restricted to the C-C block a, b in [{}, {}) "
+    app_log(2, "  Sigma^C externals restricted to {} a, b in [0, {}) "
                "(strict Phi cut; notes/refinement2_optionA.md DECISION 2).",
-            _band_window.first(), _band_window.last());
-    // global-basis window collocation (also the sym-ctx input; secondary uses Xb)
+            wan ? "range(P) (Wannier labels)" : "the C-C block", nc);
+    // effective window collocation: WINDOW = X(:,C); WANNIER = X_bar = X.U (Np x M).
+    // (also the sym-ctx input; secondary uses Xb). orb0 of the pair matrices is 0 in
+    // Wannier mode (X_C already carries exactly the M subspace columns).
     nda::array<ComplexType, 4> X_C(ns, nkpts, Np, nc);
-    X_C = X_skPa(all, all, all, _band_window);
+    if (wan)
+      X_C = vertex_wannier_detail::build_Xbar(X_skPa, _U_skia, _band_window);
+    else
+      X_C = X_skPa(all, all, all, _band_window);
+    // the "global collocation" the secondary C(q)/eta refer to: X_bar (orb0=0) in
+    // Wannier mode, X_skPa (orb0=C.first()) in window mode.
+    nda::array<ComplexType, 4> const &X_glob = wan ? X_C : X_skPa;
+    const long orb0_glob = wan ? 0 : _band_window.first();
     if (sec) {
-      build_secondary_basis(thc, X_skPa, kmq, iq_gamma);
+      build_secondary_basis(thc, X_glob, orb0_glob, kmq, iq_gamma);
       app_log(1, "  Refinement 2: Sigma^C runs in the SECONDARY basis (N_m = {} vs "
                  "Np = {}); externals a, b in C.", _Nm, Np);
       // eta diagnostics (Eq. 40) on the rung arrays ACTUALLY consumed (test-scale gate)
       if (ns * nkpts * nc * nc <= 4096) {
         vertex_secondary_detail::eta_max_over_q(
-            "Z", X_skPa, _band_window.first(), nc, _Xb_skma, _t_qmP, kmq,
+            "Z", X_glob, orb0_glob, nc, _Xb_skma, _t_qmP, kmq,
             [&](long iq) { return Z_qPQ(iq, all, all); });
         vertex_secondary_detail::eta_max_over_q(
-            "dW(tau_0)", X_skPa, _band_window.first(), nc, _Xb_skma, _t_qmP, kmq,
+            "dW(tau_0)", X_glob, orb0_glob, nc, _Xb_skma, _t_qmP, kmq,
             [&](long iq) { return Wt_qtPQ(iq, 0, all, all); });
         vertex_secondary_detail::eta_max_over_q(
-            "dW(tau_mid)", X_skPa, _band_window.first(), nc, _Xb_skma, _t_qmP, kmq,
+            "dW(tau_mid)", X_glob, orb0_glob, nc, _Xb_skma, _t_qmP, kmq,
             [&](long iq) { return Wt_qtPQ(iq, nt / 2, all, all); });
       } else {
         app_log(2, "  Refinement 2: eta diagnostic skipped (N_pair = {} > 4096).",
@@ -899,13 +1194,18 @@ namespace solvers {
     }
 
     // ---- IBZ symmetry context (trivial/null on symmetry-free meshes) ------------------
+    // WANNIER (memo section 2.8): thread U through build_sym_ctx so the C-sector
+    // rotation is d = U(Sk)^dag D U(k) and sym + Wannier compose. Secondary + Wannier +
+    // symmetry is blocked by the rotated point-selection overload (nosym only), so the
+    // secondary sym ctx is never U-rotated here.
     vertex_sym::sym_ctx const* symc = nullptr;
     if (sym_mesh) {
       if (sec) {
         build_sym_ctx(thc, _Xb_skma, _band_window.first(), _sym_secondary);
         symc = &_sym_secondary.value();
       } else {
-        build_sym_ctx(thc, X_C, _band_window.first(), _sym_global);
+        build_sym_ctx(thc, X_C, _band_window.first(), _sym_global,
+                      wan ? &_U_skia : nullptr);
         symc = &_sym_global.value();
       }
       vertex_ibz_detail::g_rotation_check(*symc, G_CC, MF->kp_trev());
@@ -938,9 +1238,27 @@ namespace solvers {
 
     // accumulate on top of the GW self-energy: Sigma <- Sigma + Sigma^C
     // (Sigma_C is identical on every rank after the kernel's all_reduce; hermitization
-    //  stays downstream in scf_driver). Strict Phi cut: the C-C block only, both paths.
-    if (mb_state.mpi->node_comm.root())
-      sSigma_tskij.local()(all, all, all, _band_window, _band_window) += Sigma_C;
+    //  stays downstream in scf_driver).
+    //   WINDOW MODE: Sigma_C is already in band labels on the C-C block -> drop in.
+    //   WANNIER MODE (memo C3/section 2.3): Sigma_C lives in Wannier labels; inject the
+    //     operator sandwich Sigma^C_ij = [U Sigma_bar U^dag]_ij over i,j in W_rng
+    //     (projector_t::upfold primitive). External k axis is IBZ-resident; the IBZ
+    //     k-points are [0, nk_ext), so _U_skia(is, ik_ext) is the right U.
+    if (mb_state.mpi->node_comm.root()) {
+      if (not wan) {
+        sSigma_tskij.local()(all, all, all, _band_window, _band_window) += Sigma_C;
+      } else {
+        const long nW = _band_window.size();
+        nda::array<ComplexType, 2> tmp(nW, nc);
+        auto S = sSigma_tskij.local();
+        for (long it = 0; it < nt; ++it)
+          for (long is = 0; is < ns; ++is)
+            for (long ik = 0; ik < nk_ext; ++ik)
+              vertex_wannier_detail::upfold_Sigma(
+                  _U_skia(is, ik, all, all), Sigma_C(it, is, ik, all, all), tmp,
+                  S(it, is, ik, _band_window, _band_window));
+      }
+    }
     mb_state.mpi->comm.barrier();
   }
 
@@ -1165,22 +1483,25 @@ namespace solvers {
     // produced in (N_m x N_m) and UPFOLDED with the adjoint of the same t (Eq. 38) --
     // the no-leak identity (Eq. 39) is checked below as a transposition tripwire.
     // (`sec`/`use_wcache` are resolved above, at the dynamic-W source selection.)
-    const long nc = _band_window.size();
+    const bool wan = _wannier;
+    const long nc = subspace_rank();
     nda::array<ComplexType, 3> Zb_qmm;
     std::optional<nda::array<ComplexType, 4>> Wbdyn_qwmm;
     // STRICT C-C EXTERNALS (theory-owner ruling, notes/refinement2_optionA.md
-    // DECISION 2): dPhi_2^C/dW vanishes unless ALL FOUR pair orbital indices are in C,
-    // so the external legs of Pi^C (the zL/zR one-sided transforms, which previously
-    // summed the full band range) are C-restricted in BOTH paths via the input
-    // projection (G_CC + C columns of the collocation) -- exactly the kernel on
-    // G~ = P_C G P_C, the exact all-C cut (conservation notes section 1.2).
-    // G_CC on the FULL BZ (memo (G1)/(G2)): image points are gauge copies of the
-    // IBZ blocks; trev points are the tau-pointwise transpose (see eval_Sigma_C).
+    // DECISION 2): dPhi_2^C/dW vanishes unless ALL FOUR pair orbital slots are in
+    // range(P), so the external legs of Pi^C are C-restricted in BOTH paths via the
+    // input projection -- exactly the kernel on G~ = P G P (conservation notes 1.2).
+    // WINDOW: G_CC = the W-window block; WANNIER: G_CC = U^dag G U (memo C2).
+    // On the FULL BZ (memo (G1)/(G2)): image points are gauge copies of the IBZ
+    // blocks; trev points are the tau-pointwise transpose (see eval_Sigma_C).
     utils::check(G_tskij.shape(2) == (sym_mesh ? nkpts_ibz : nkpts),
                  "vertex_t::eval_Pi_C: G_tskij k axis = {} != {}.",
                  G_tskij.shape(2), sym_mesh ? nkpts_ibz : nkpts);
     nda::array<ComplexType, 5> G_CC(nt_f, ns, nkpts, nc, nc);
-    if (not sym_mesh) {
+    if (wan) {
+      vertex_wannier_detail::build_Gbar_fullbz(G_tskij, _U_skia, _band_window, sym_mesh,
+                                               MF->kp_to_ibz(), MF->kp_trev(), G_CC);
+    } else if (not sym_mesh) {
       G_CC = G_tskij(all, all, all, _band_window, _band_window);
     } else {
       auto kp_to_ibz = MF->kp_to_ibz();
@@ -1199,26 +1520,31 @@ namespace solvers {
         }
       }
     }
-    app_log(2, "  Pi^C external legs restricted to C = [{}, {}) (strict Phi cut; "
+    app_log(2, "  Pi^C external legs restricted to {} [0, {}) (strict Phi cut; "
                "notes/refinement2_optionA.md DECISION 2).",
-            _band_window.first(), _band_window.last());
-    // global-basis window collocation (also the sym-ctx input; secondary uses Xb)
+            wan ? "range(P) (Wannier labels)" : "the C window", nc);
+    // effective window collocation: WINDOW = X(:,C); WANNIER = X_bar = X.U (Np x M).
     nda::array<ComplexType, 4> X_C(ns, nkpts, Np, nc);
-    X_C = X_skPa(all, all, all, _band_window);
+    if (wan)
+      X_C = vertex_wannier_detail::build_Xbar(X_skPa, _U_skia, _band_window);
+    else
+      X_C = X_skPa(all, all, all, _band_window);
+    nda::array<ComplexType, 4> const &X_glob = wan ? X_C : X_skPa;
+    const long orb0_glob = wan ? 0 : _band_window.first();
     if (sec) {
-      build_secondary_basis(thc, X_skPa, kmq, iq_gamma);
+      build_secondary_basis(thc, X_glob, orb0_glob, kmq, iq_gamma);
       app_log(1, "  Refinement 2: Pi^C runs in the SECONDARY basis (N_m = {} vs Np = {}); "
                  "upfold Pi^C = t^dag Pibar t.", _Nm, Np);
       if (ns * nkpts * nc * nc <= 4096) {
         vertex_secondary_detail::eta_max_over_q(
-            "Z", X_skPa, _band_window.first(), nc, _Xb_skma, _t_qmP, kmq,
+            "Z", X_glob, orb0_glob, nc, _Xb_skma, _t_qmP, kmq,
             [&](long iq) { return Z_qPQ(iq, all, all); });
         if (Wdyn_qwPQ.has_value()) {
           vertex_secondary_detail::eta_max_over_q(
-              "dW(nu_0)", X_skPa, _band_window.first(), nc, _Xb_skma, _t_qmP, kmq,
+              "dW(nu_0)", X_glob, orb0_glob, nc, _Xb_skma, _t_qmP, kmq,
               [&](long iq) { return Wdyn_qwPQ.value()(iq, tools.m0, all, all); });
           vertex_secondary_detail::eta_max_over_q(
-              "dW(nu_max)", X_skPa, _band_window.first(), nc, _Xb_skma, _t_qmP, kmq,
+              "dW(nu_max)", X_glob, orb0_glob, nc, _Xb_skma, _t_qmP, kmq,
               [&](long iq) { return Wdyn_qwPQ.value()(iq, tools.nw_b - 1, all, all); });
         }
       } else {
@@ -1267,13 +1593,15 @@ namespace solvers {
     }
 
     // ---- IBZ symmetry context (trivial/null on symmetry-free meshes) ------------------
+    // WANNIER (memo section 2.8): thread U so d = U(Sk)^dag D U(k) (sym + Wannier compose).
     vertex_sym::sym_ctx const* symc = nullptr;
     if (sym_mesh) {
       if (sec) {
         build_sym_ctx(thc, _Xb_skma, _band_window.first(), _sym_secondary);
         symc = &_sym_secondary.value();
       } else {
-        build_sym_ctx(thc, X_C, _band_window.first(), _sym_global);
+        build_sym_ctx(thc, X_C, _band_window.first(), _sym_global,
+                      wan ? &_U_skia : nullptr);
         symc = &_sym_global.value();
       }
       vertex_ibz_detail::g_rotation_check(*symc, G_CC, MF->kp_trev());
@@ -1397,7 +1725,8 @@ namespace solvers {
     const long Np = thc.Np();
     const long nbnd = MF->nbnd();
     const long ns = mb_state.sG_tskij.value().local().shape(1);
-    const long nc = _band_window.size();
+    const bool wan = _wannier;
+    const long nc = subspace_rank();
 
     // IBZ symmetry (notes/vertex_ibz_symmetry.md section 3.7): the fill runs over
     // IBZ q only -- which is exactly the cache's q-keyed first axis; consumption at
@@ -1429,6 +1758,11 @@ namespace solvers {
     nda::array<long, 2> kmq(nqpts_ibz, nkpts);
     for (long iq = 0; iq < nqpts_ibz; ++iq)
       for (long ik = 0; ik < nkpts; ++ik) kmq(iq, ik) = MF->qk_to_k2(iq, ik);
+    // effective global collocation for the secondary fit (WANNIER: X_bar = X.U, orb0=0)
+    nda::array<ComplexType, 4> Xbar_glob;
+    if (wan) Xbar_glob = vertex_wannier_detail::build_Xbar(X_skPa, _U_skia, _band_window);
+    nda::array<ComplexType, 4> const &X_glob = wan ? Xbar_glob : X_skPa;
+    const long orb0_glob = wan ? 0 : _band_window.first();
 
     // ---- q = Gamma index (crystal coordinates: all components integer mod G) ----------
     long iq_gamma = -1;
@@ -1451,7 +1785,7 @@ namespace solvers {
     }
 
     // (idempotent; in the production flow eval_Pi_C already built it this iteration)
-    build_secondary_basis(thc, X_skPa, kmq, iq_gamma);
+    build_secondary_basis(thc, X_glob, orb0_glob, kmq, iq_gamma);
 
     // ---- q->0 rung policy: SAME resolution as eval_Pi_C (q0_head_treatment.md) --------
     // Only the gygi head insertion matters here (v1_skip acts in the kernel, not on
@@ -1520,10 +1854,10 @@ namespace solvers {
       const long lpos0 = std::max(tools.m0, tools.w_mirror_b(tools.m0)) - nw_b / 2;
       const long lposm = std::max(nw_b - 1, tools.w_mirror_b(nw_b - 1)) - nw_b / 2;
       vertex_secondary_detail::eta_max_over_q(
-          "dW(nu_0)", X_skPa, _band_window.first(), nc, _Xb_skma, _t_qmP, kmq,
+          "dW(nu_0)", X_glob, orb0_glob, nc, _Xb_skma, _t_qmP, kmq,
           [&](long iq) { return W_wq(iq, lpos0, all, all); });
       vertex_secondary_detail::eta_max_over_q(
-          "dW(nu_max)", X_skPa, _band_window.first(), nc, _Xb_skma, _t_qmP, kmq,
+          "dW(nu_max)", X_glob, orb0_glob, nc, _Xb_skma, _t_qmP, kmq,
           [&](long iq) { return W_wq(iq, lposm, all, all); });
     } else {
       app_log(2, "  Refinement 2: eta diagnostic skipped (N_pair = {} > 4096).",
