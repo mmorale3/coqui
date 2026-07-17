@@ -664,10 +664,33 @@ namespace methods {
       }
       double K_max = K_max_g + q_cart_max;
       _Timer.start("PAW_AUG.qrad_tab");
+      // Option A ("shape-restored" on-site exchange), env-gated for validation:
+      // build the augmentation channels η from the FULL AE−PS partial-wave pair
+      // density (build_qrad_tab_full_aeps) instead of the compensation charge,
+      // and drop the K_a one-center term below. Reproduces ABINIT's
+      // phiphj−tphitphj oscillator. NOTE: this changes the SHARED THC ERI, so it
+      // affects Hartree + correlation too — hence env-gated (default off).
+      //
+      // KNOWN LIMITATION (Si a10.20, measured): the THC augmentation lives on the
+      // SMOOTH collocation grid (dffts, e.g. 18^3 / ~60 Ry), which is too coarse
+      // to resolve the SHARP AE−PS pair density D. It therefore captures only a
+      // few % of the on-site correction (vv exchange -1.7382 -> -1.7350, vs the
+      // dense-grid target -1.6863). The compensation charge works on the smooth
+      // grid only because it is smooth by construction. A CORRECT THC Option A
+      // needs the augmentation on the DENSE grid (dfftp, ecutrho ~ ABINIT's
+      // ecutsigx); the direct v_x_paw path already uses fft_mesh_aug (dense) and
+      // reproduces ABINIT. See notes/paw_onsite_exchange_analysis.
+      bool paw_shape_restored =
+          (std::getenv("COQUI_PAW_SHAPE_RESTORED") != nullptr);
+      if (paw_shape_restored)
+        app_log(1, "  paw_aug: SHAPE-RESTORED (Option A) on-site exchange enabled "
+                   "(full AE−PS oscillator, K_a dropped).");
       std::vector<hamilt::paw::qrad_tab> qrad_tabs;
       qrad_tabs.reserve(_psp->paw_species_view().size());
       for (auto const& sp : _psp->paw_species_view())
-        qrad_tabs.push_back(hamilt::paw::build_qrad_tab(sp, K_max));
+        qrad_tabs.push_back((paw_shape_restored && sp.is_paw)
+            ? hamilt::paw::build_qrad_tab_full_aeps(sp, K_max)
+            : hamilt::paw::build_qrad_tab(sp, K_max));
       _Timer.stop("PAW_AUG.qrad_tab");
       app_log(2, "  paw_aug: built qrad table for {} species, K_max={:.2f} a.u., "
                  "n_K={}", qrad_tabs.size(), K_max,
@@ -842,7 +865,7 @@ namespace methods {
                             ComplexType(0.0), V_LL_local);
           _Timer.stop("PAW_AUG.V_LL");
 
-          if (_paw_onsite) {
+          if (_paw_onsite && !paw_shape_restored) {
             _Timer.start("PAW_AUG.K_a");
             hamilt::paw::add_K_a_to_tile(
                 *_psp, _isdf, _aug_layout,
