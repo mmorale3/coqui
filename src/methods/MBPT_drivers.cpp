@@ -133,6 +133,27 @@ inline void ensure_checkpoint(std::shared_ptr<mf::MF> mf, std::string const& out
  *                 rank-1 head insertion (madelung x basis_head x eps_inv_head). At coarse
  *                 k-meshes the gygi head can dominate the vertex rung sums (O(Nk^-1/3)
  *                 convergence) -- check mesh convergence of the head fraction.
+ *  - vertex_isdf: "global" Auxiliary basis of the vertex kernels (gw solver only;
+ *                 Refinement 2, notes/refinement2_optionA.md). {choices: "global",
+ *                 "secondary"}. "global" (default) runs the kernels in the global THC
+ *                 basis (dimension Np) -- the original path, bit-identical. "secondary"
+ *                 builds a dedicated secondary ISDF basis on the subspace C by re-running
+ *                 the restricted-range point selection (once per geometry) and runs both
+ *                 kernels with the auxiliary dimension N_m = O(nc^2 nk) << Np: the rung
+ *                 cores are downfolded with the frequency-independent Option-A transfer
+ *                 t(q) = s(q)^+ B(q)^dag C(q); Sigma^C lands directly in the C-C block;
+ *                 Pi^C is upfolded with the adjoint of the same t (no-leak). The q->0
+ *                 gygi head insertion downfolds automatically through t. Downfold
+ *                 fidelity is reported per q as eta(q, nu) (theoryB Eq. 40) at verbosity
+ *                 >= 2 (test scale).
+ *  - vertex_isdf_rank: "-1" Secondary basis size N_m ("secondary" only). -1 selects the
+ *                 full subspace pair rank nc^2 * nk (eta -> 0 limit); smaller values
+ *                 trade accuracy (monitored by eta) for cost. The point selection may
+ *                 return fewer points when the C pair-density metric is numerically
+ *                 rank-deficient; the returned count is used and logged.
+ *  - vertex_isdf_svd_tol: "1e-8" Relative SVD cutoff on the secondary pair collocation
+ *                 B(q) in the truncated pseudo-inverse solve for t(q) (the secondary
+ *                 metric s = B^dag B is regularized at the square of this value).
  */
 template<typename eri_t>
 void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
@@ -216,6 +237,11 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     auto vertex_type = io::get_value_with_default<std::string>(pt,"vertex_type","none");
     io::tolower(vertex_type);
     auto vertex_band_window = io::get_value_with_default<nda::range>(pt,"vertex_band_window",nda::range(0,0));
+    // Refinement 2 (secondary ISDF on C; notes/refinement2_optionA.md)
+    auto vertex_isdf = io::get_value_with_default<std::string>(pt,"vertex_isdf","global");
+    io::tolower(vertex_isdf);
+    auto vertex_isdf_rank = io::get_value_with_default<long>(pt,"vertex_isdf_rank",-1);
+    auto vertex_isdf_svd_tol = io::get_value_with_default<double>(pt,"vertex_isdf_svd_tol",1e-8);
 
     simple_dyson dyson(mf.get(), &ft, mu_tol, mu_update_alg);
     if (io::get_value_with_default<bool>(pt,"iter_alg.enable", true)) {
@@ -228,7 +254,8 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
 
     // vertex_t must outlive the scf_loop below. Both cuts (Sigma^C and Pi^C)
     // are switched together through this single object -- never one alone.
-    solvers::vertex_t vertex(&ft, vertex_type, vertex_band_window, mf->nbnd(), div_treatment);
+    solvers::vertex_t vertex(&ft, vertex_type, vertex_band_window, mf->nbnd(), div_treatment,
+                             vertex_isdf, vertex_isdf_rank, vertex_isdf_svd_tol);
     if (vertex.enabled()) {
       utils::check(screen_type == "rpa" or screen_type == "rpa_k",
                    "vertex_type = \"{}\" currently requires screen_type = \"rpa\" or \"rpa_k\" "
@@ -459,6 +486,11 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
     auto vertex_type = io::get_value_with_default<std::string>(pt,"vertex_type","none");
     io::tolower(vertex_type);
     auto vertex_band_window = io::get_value_with_default<nda::range>(pt,"vertex_band_window",nda::range(0,0));
+    // Refinement 2 (secondary ISDF on C; notes/refinement2_optionA.md)
+    auto vertex_isdf = io::get_value_with_default<std::string>(pt,"vertex_isdf","global");
+    io::tolower(vertex_isdf);
+    auto vertex_isdf_rank = io::get_value_with_default<long>(pt,"vertex_isdf_rank",-1);
+    auto vertex_isdf_svd_tol = io::get_value_with_default<double>(pt,"vertex_isdf_svd_tol",1e-8);
 
     simple_dyson dyson(mf.get(), &ft, mu_tol, mu_update_alg);
     if (io::get_value_with_default<bool>(pt,"iter_alg.enable", true)) {
@@ -471,7 +503,8 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
 
     // vertex_t must outlive the scf_loop below. Both cuts (Sigma^C and Pi^C)
     // are switched together through this single object -- never one alone.
-    solvers::vertex_t vertex(&ft, vertex_type, vertex_band_window, mf->nbnd(), div_treatment);
+    solvers::vertex_t vertex(&ft, vertex_type, vertex_band_window, mf->nbnd(), div_treatment,
+                             vertex_isdf, vertex_isdf_rank, vertex_isdf_svd_tol);
     if (vertex.enabled()) {
       utils::check(screen_type == "rpa" or screen_type == "rpa_k",
                    "vertex_type = \"{}\" currently requires screen_type = \"rpa\" or \"rpa_k\" "

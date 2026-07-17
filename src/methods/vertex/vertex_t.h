@@ -103,12 +103,39 @@ namespace solvers {
      *                          on every rung transfer (kept selectable for
      *                          comparability; NOT equivalent to GW's ignore_g0 --
      *                          it also drops the finite body term).
+     * @param isdf_mode     - [INPUT] auxiliary basis of the vertex kernels
+     *                        (Refinement 2, notes/refinement2_optionA.md):
+     *                        "global" (default): the kernels run in the global THC
+     *                          basis (dimension Np) -- the original path, untouched.
+     *                        "secondary": a dedicated secondary ISDF basis on the
+     *                          correlated subspace C replaces the global auxiliary
+     *                          dimension (Np -> N_m) in both kernels, via the
+     *                          frequency-independent Option-A transfer t(q) =
+     *                          s(q)^+ B(q)^dag C(q) (theoryB Eq. 36): the rung cores
+     *                          are DOWNFOLDED, Wbar = t W t^dag; Sigma^C is produced
+     *                          directly in the C-C block (no upfold); Pi^C is
+     *                          UPFOLDED with the adjoint of the same t (no-leak,
+     *                          theoryB Eq. 39). Requires re-running the ISDF
+     *                          point-selection on the restricted range (done lazily,
+     *                          once per geometry).
+     * @param isdf_rank     - [INPUT] secondary basis size N_m ("secondary" mode only).
+     *                        -1 (default): the full subspace pair rank nc^2 * nkpts.
+     *                        The point selection may return fewer points if the
+     *                        pair-density metric is numerically rank-deficient; the
+     *                        returned count is used and logged.
+     * @param isdf_svd_tol  - [INPUT] relative SVD cutoff on the secondary pair
+     *                        collocation B(q) in the truncated pseudo-inverse solve
+     *                        for t(q) (the metric s = B^dag B is regularized at the
+     *                        SQUARE of this value). Default 1e-8.
      */
     vertex_t(const imag_axes_ft::IAFT *ft,
              std::string vertex_type,
              nda::range band_window,
              long nbnd,
-             std::string div_treatment = "ignore_g0");
+             std::string div_treatment = "ignore_g0",
+             std::string isdf_mode = "global",
+             long isdf_rank = -1,
+             double isdf_svd_tol = 1e-8);
 
     vertex_t(vertex_t const&) = default;
     vertex_t(vertex_t &&) = default;
@@ -173,12 +200,51 @@ namespace solvers {
     // and notes/q0_head_treatment.md.
     std::string _div_treatment = "ignore_g0";
 
+    // ---- Refinement 2: secondary ISDF basis (notes/refinement2_optionA.md) ----------
+    // "global" (default) or "secondary"
+    std::string _isdf_mode = "global";
+    // requested secondary rank N_m (-1 = full subspace pair rank nc^2 * nkpts)
+    long _isdf_rank = -1;
+    // relative SVD cutoff on B(q) in the truncated pseudo-inverse for t(q)
+    double _isdf_svd_tol = 1e-8;
+    // geometry-fixed cache (built lazily on the first kernel evaluation)
+    bool _secondary_ready = false;
+    long _Nm = 0;                          // ACTUAL secondary rank (selection may
+                                           // return fewer points than requested)
+    nda::array<ComplexType, 4> _Xb_skma;   // secondary collocation (ns, nk, N_m, nc)
+    nda::array<ComplexType, 3> _t_qmP;     // Option-A transfer t(q): (nq, N_m, Np)
+
+    /**
+     * Build the secondary ISDF basis and the per-q Option-A transfer maps
+     * (lazily; no-op once built). Collective on thc.mpi()->comm.
+     *   - restricted point selection: thc::interpolating_points(iq_gamma, N_m, C, C)
+     *     on a private methods::thc builder (pivoted Cholesky on the C pair-density
+     *     metric; greedy importance order).
+     *   - per q: B(q)/C(q) pair-collocation matrices (pair rows I = (is, ik, o, i),
+     *     k_in = k - q; the kernels' in/out collocation rule), t(q) from the
+     *     truncated-SVD least-squares solve min || B t - C ||_F.
+     * cond(s), effective rank and discarded singular values are logged.
+     *
+     * @param X_skPa - [INPUT] replicated GLOBAL collocation (ns, nk, Np, nbnd)
+     * @param kmq    - [INPUT] (nq, nk) index map of k - q
+     * @param iq_gamma - [INPUT] index of q = Gamma
+     */
+    void build_secondary_basis(THC_ERI auto const &thc,
+                               nda::array<ComplexType, 4> const &X_skPa,
+                               nda::array<long, 2> const &kmq, long iq_gamma);
+
   public:
     std::string vertex_type() const { return _vertex_type; }
     nda::range band_window() const { return _band_window; }
     std::string div_treatment() const { return _div_treatment; }
     // runtime-selectable q->0 policy (validated; see constructor doc)
     void set_div_treatment(std::string div);
+
+    // Refinement 2 accessors
+    std::string isdf_mode() const { return _isdf_mode; }
+    bool secondary() const { return _isdf_mode == "secondary"; }
+    // ACTUAL secondary rank N_m (0 until the basis has been built)
+    long secondary_rank() const { return _Nm; }
 
     // vertex requested in the input
     bool enabled() const { return _vertex_type != "none"; }

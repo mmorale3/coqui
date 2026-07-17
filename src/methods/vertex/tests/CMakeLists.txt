@@ -40,3 +40,15 @@ target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield eri_li
 
 add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
 set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR})
+
+# ISDF-Vertex Refinement 2: secondary ISDF basis + Option-A downfold
+# (notes/refinement2_optionA.md): transfer algebra, no-leak, secondary-vs-global,
+# eta(q, nu) rank scan, conservation identity in the secondary path, end-to-end.
+set(TEST_ID methods_vertex_refinement2)
+
+add_executable(test_${TEST_ID} test_vertex_refinement2.cpp)
+target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield eri_lib hf_lib
+                      vertex_lib gw_lib scf_lib)
+
+add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
+set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR})
