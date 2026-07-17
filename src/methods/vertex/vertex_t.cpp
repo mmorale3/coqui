@@ -25,6 +25,7 @@
 #include "nda/lapack.hpp"
 
 #include "utilities/check.hpp"
+#include "numerics/sparse/csr_blas.hpp"   // csrmm for the symmetry D-matrix blocks
 #include "methods/ERI/thc_reader_t.hpp"
 #include "methods/ERI/thc.h"    // Refinement 2: restricted-range ISDF point selection
 #include "vertex_t.h"
@@ -190,6 +191,241 @@ namespace solvers {
 
   } // vertex_secondary_detail
 
+  /**
+   * IBZ k-point symmetry helpers (notes/vertex_ibz_symmetry.md sections 3-4, 6).
+   */
+  namespace vertex_ibz_detail {
+
+    // crystal-coordinate comparison mod integer G-vectors (same class as the
+    // matching in generate_qsymm_maps, symmetry.hpp:534-549)
+    inline bool same_kpt_mod_G(nda::ArrayOfRank<1> auto const& a,
+                               nda::ArrayOfRank<1> auto const& b) {
+      for (int i = 0; i < 3; ++i) {
+        double d = a(i) - b(i);
+        d -= std::round(d);
+        if (std::abs(d) > 1e-6) return false;
+      }
+      return true;
+    }
+
+    /**
+     * G-rotation consistency diagnostic (memo section 6): for each symmetry
+     * position js >= 1 and a sample of full-BZ k, measure
+     *   || G_CC(k) - Dc(js,k)^dag G_CC(krot(js,k)) Dc(js,k) ||_F / ||G_CC(k)||_F
+     * on one tau slice. O(leakage) is expected (window truncation of the exact
+     * covariance); a much larger value indicates a map/conjugation bug. Non-trev
+     * k only (the trev gauge composition is exercised by the kernels themselves).
+     */
+    inline void g_rotation_check(vertex_sym::sym_ctx const& ctx,
+                                 nda::MemoryArrayOfRank<5> auto const& G_full,
+                                 nda::ArrayOfRank<1> auto const& kp_trev) {
+      decltype(nda::range::all) all;
+      const long nc = ctx.nc;
+      const long it = G_full.shape(0) / 2, is = 0;
+      nda::array<ComplexType, 2> T1(nc, nc), T2(nc, nc);
+      double worst = 0.0;
+      for (long js = 1; js < ctx.nsym; ++js) {
+        for (long k = 0; k < ctx.nk_full; ++k) {
+          if (kp_trev(k) or ctx.cjg(js, k)) continue;
+          auto Dc = ctx.Dc(js, k, all, all);
+          auto Gk = G_full(it, is, k, all, all);
+          auto Gr = G_full(it, is, ctx.krot(js, k), all, all);
+          nda::blas::gemm(ComplexType(1.0), nda::dagger(Dc), Gr, ComplexType(0.0), T1);
+          nda::blas::gemm(ComplexType(1.0), T1, Dc, ComplexType(0.0), T2);
+          double num = 0.0, den = 0.0;
+          for (long a = 0; a < nc; ++a)
+            for (long b = 0; b < nc; ++b) {
+              num += std::norm(T2(a, b) - Gk(a, b));
+              den += std::norm(Gk(a, b));
+            }
+          if (den > 1e-24) worst = std::max(worst, std::sqrt(num / den));
+        }
+      }
+      app_log(2, "  IBZ symmetry: G-rotation consistency residual (C block, one tau "
+                 "slice): max = {} (O(D-leakage) expected)", worst);
+    }
+
+  } // vertex_ibz_detail
+
+  void vertex_t::build_sym_ctx(THC_ERI auto const &thc,
+                               nda::array<ComplexType, 4> const &X_w,
+                               long C0_global,
+                               std::optional<vertex_sym::sym_ctx> &slot) {
+    if (slot.has_value()) return;   // geometry-fixed
+    decltype(nda::range::all) all;
+    auto MF = thc.MF();
+
+    vertex_sym::sym_ctx ctx;
+    ctx.active = true;
+    ctx.ns = X_w.shape(0);
+    ctx.nk_full = MF->nkpts();
+    ctx.nk_ibz = MF->nkpts_ibz();
+    ctx.nq_full = MF->nqpts();
+    ctx.nq_ibz = MF->nqpts_ibz();
+    ctx.naux = X_w.shape(2);
+    ctx.nc = X_w.shape(3);
+    utils::check(X_w.shape(1) == ctx.nk_full,
+                 "vertex_t::build_sym_ctx: X_w must carry the FULL BZ k axis "
+                 "({} vs {}).", X_w.shape(1), ctx.nk_full);
+    const long nbnd = MF->nbnd();
+    const long nc = ctx.nc;
+    utils::check(C0_global >= 0 and C0_global + nc <= nbnd,
+                 "vertex_t::build_sym_ctx: invalid window [{}, {}).", C0_global, C0_global + nc);
+
+    auto qsymms = MF->qsymms();
+    ctx.nsym = qsymms.extent(0);
+    auto kp_trev_pair = MF->kp_trev_pair();
+
+    // ---- q'-access tables ------------------------------------------------------------
+    ctx.q_isym = nda::array<long, 1>(ctx.nq_full);
+    ctx.q_star = nda::array<long, 1>(ctx.nq_full);
+    ctx.q_trev = nda::array<bool, 1>(ctx.nq_full);
+    for (long iq = 0; iq < ctx.nq_full; ++iq) {
+      const int sidx = MF->qp_symm(iq);
+      long js = -1;
+      for (long i = 0; i < ctx.nsym; ++i)
+        if (qsymms(i) == sidx) { js = i; break; }
+      utils::check(js >= 0, "vertex_t::build_sym_ctx: qp_symm({}) = {} not found in "
+                            "qsymms.", iq, sidx);
+      ctx.q_isym(iq) = js;
+      ctx.q_star(iq) = MF->qp_to_ibz(iq);
+      ctx.q_trev(iq) = MF->qp_trev(iq);
+    }
+    for (long iq = 0; iq < ctx.nq_ibz; ++iq)
+      utils::check(ctx.q_star(iq) == iq and not ctx.q_trev(iq) and ctx.q_isym(iq) == 0,
+                   "vertex_t::build_sym_ctx: IBZ q-point {} is not identity-mapped "
+                   "(star = {}, trev = {}, isym = {}).",
+                   iq, ctx.q_star(iq), int(ctx.q_trev(iq)), ctx.q_isym(iq));
+
+    // ---- momentum map: krot = ks_to_k (full-BZ rows; memo (R1) direction pin) --------
+    ctx.krot = nda::array<long, 2>(ctx.nsym, ctx.nk_full);
+    for (long is = 0; is < ctx.nsym; ++is)
+      for (long ik = 0; ik < ctx.nk_full; ++ik)
+        ctx.krot(is, ik) = MF->ks_to_k(int(is), int(ik));
+
+    // direction self-check: the same map on the Q mesh must send q' -> +/- qs.
+    // (Derivation memo section 3.1: slist = find_inverse_symmetry(qsymms) in the MF
+    //  makes the D-pair point of k exactly ks_to_k(js, k); assert rather than trust.)
+    // NOTE: symm_op.R acts on CRYSTAL coordinates (generate_dmatrix works on
+    // kpts_crystal, symmetry.hpp:827+1003); MF->Qpts() is CARTESIAN, so the crystal
+    // q list is built self-consistently from kpts_crystal differences via qk_to_k2
+    // (bz convention Qpts[q] + G = kpts[a] - kpts[b], bz_symmetry.hpp:540-544).
+    {
+      auto slist_ops = MF->symm_list();
+      auto kcrys = MF->kpts_crystal();
+      nda::array<double, 2> qcrys(ctx.nq_full, 3);
+      for (long iq = 0; iq < ctx.nq_full; ++iq) {
+        const long k2 = MF->qk_to_k2(int(iq), 0);   // k0 - q (mod G)
+        for (int i = 0; i < 3; ++i) qcrys(iq, i) = kcrys(0, i) - kcrys(k2, i);
+      }
+      nda::stack_array<double, 3> qrot_v, qtgt;
+      for (long iq = 0; iq < ctx.nq_full; ++iq) {
+        const long js = ctx.q_isym(iq);
+        const long qs = ctx.q_star(iq);
+        if (js == 0 and not ctx.q_trev(iq)) continue;
+        auto const& R = slist_ops[qsymms(js)].R;
+        // image = q' * R (row-vector right action; the generate_qsymm_maps matching,
+        // symmetry.hpp:588)
+        nda::blas::gemv(1.0, nda::transpose(R), qcrys(iq, all), 0.0, qrot_v);
+        const double sgn = ctx.q_trev(iq) ? -1.0 : 1.0;
+        for (int i = 0; i < 3; ++i) qtgt(i) = sgn * qcrys(qs, i);
+        utils::check(vertex_ibz_detail::same_kpt_mod_G(qrot_v, qtgt),
+                     "vertex_t::build_sym_ctx: rung-transfer direction check FAILED at "
+                     "q' = {} (isym pos {}, qs = {}, trev = {}): q'*R (crystal) = "
+                     "({}, {}, {}) vs target ({}, {}, {}). The MF symmetry conventions "
+                     "deviate from the derivation in notes/vertex_ibz_symmetry.md "
+                     "section 3.1 -- refusing to rotate the wrong way.",
+                     iq, js, qs, int(ctx.q_trev(iq)),
+                     qrot_v(0), qrot_v(1), qrot_v(2), qtgt(0), qtgt(1), qtgt(2));
+      }
+    }
+
+    // ---- effective columns Xhat + C-window D blocks + leakage diagnostic -------------
+    ctx.Xhat = nda::array<ComplexType, 5>(ctx.ns, ctx.nsym, ctx.nk_full, ctx.naux, nc);
+    ctx.Dc = nda::array<ComplexType, 4>(ctx.nsym, ctx.nk_full, nc, nc);
+    ctx.Dc() = ComplexType(0.0);
+    ctx.cjg = nda::array<bool, 2>(ctx.nsym, ctx.nk_full);
+    ctx.cjg() = false;
+    for (long is = 0; is < ctx.ns; ++is)
+      for (long ik = 0; ik < ctx.nk_full; ++ik)
+        ctx.Xhat(is, 0, ik, all, all) = X_w(is, ik, all, all);
+
+    double leak_max = 0.0, leak_sum = 0.0;
+    long leak_cnt = 0;
+    {
+      // column selector E(nbnd, nc) of the window block; Dcols = D * E
+      nda::array<ComplexType, 2> E(nbnd, nc), Dcols(nbnd, nc);
+      nda::array<ComplexType, 2> base(ctx.naux, nc);
+      E() = ComplexType(0.0);
+      for (long j = 0; j < nc; ++j) E(C0_global + j, j) = ComplexType(1.0);
+      using math::sparse::csrmm;
+      for (long js = 1; js < ctx.nsym; ++js) {
+        for (long ik = 0; ik < ctx.nk_full; ++ik) {
+          auto [cj, Dsp] = MF->symmetry_rotation(js, ik);
+          ctx.cjg(js, ik) = cj;
+          csrmm(ComplexType(1.0), *Dsp, E, ComplexType(0.0), Dcols);
+          // C-window leakage of this rotation (memo (C-leak)); PLAIN block kept --
+          // no extra normalization (consumer precedent, projector_boson_t.cpp:108-121)
+          double m_in = 0.0, m_all = 0.0;
+          for (long a = 0; a < nbnd; ++a)
+            for (long j = 0; j < nc; ++j) {
+              const double w = std::norm(Dcols(a, j));
+              m_all += w;
+              if (a >= C0_global and a < C0_global + nc) m_in += w;
+            }
+          if (m_all > 1e-24) {
+            const double leak = 1.0 - m_in / m_all;
+            leak_max = std::max(leak_max, leak);
+            leak_sum += leak;
+            ++leak_cnt;
+          }
+          auto Dc = ctx.Dc(js, ik, all, all);
+          for (long a = 0; a < nc; ++a)
+            for (long j = 0; j < nc; ++j) Dc(a, j) = Dcols(C0_global + a, j);
+          // effective columns (memo (X-hat)): base collocation at the D-pair point
+          // (the trev pair's rotation for trev k -- the API redirect), conj for trev
+          const long ksrc = ctx.krot(js, cj ? long(kp_trev_pair(ik)) : ik);
+          for (long is = 0; is < ctx.ns; ++is) {
+            nda::blas::gemm(ComplexType(1.0), X_w(is, ksrc, all, all), Dc,
+                            ComplexType(0.0), base);
+            if (cj)
+              for (long P = 0; P < ctx.naux; ++P)
+                for (long j = 0; j < nc; ++j)
+                  ctx.Xhat(is, js, ik, P, j) = std::conj(base(P, j));
+            else
+              ctx.Xhat(is, js, ik, all, all) = base;
+          }
+        }
+      }
+    }
+    ctx.leak_max = leak_max;
+    ctx.leak_mean = (leak_cnt > 0) ? leak_sum / double(leak_cnt) : 0.0;
+    _sym_leak_max = std::max(_sym_leak_max, ctx.leak_max);
+    _sym_leak_mean = ctx.leak_mean;
+
+    app_log(1, "\n  IBZ symmetry context READY (notes/vertex_ibz_symmetry.md): "
+               "nk {} -> {} IBZ, nq {} -> {} IBZ, {} symmetry ops, naux = {}\n"
+               "  C-window D-matrix leakage out of C = [{}, {}): max = {:.3e}, "
+               "mean = {:.3e}\n"
+               "  [NOTE] expected to be small; symmetry-unfolded vertex quantities "
+               "carry O(leakage)\n"
+               "         relative error -- the C-window analogue of the nbnd "
+               "truncation warning in\n"
+               "         generate_dmatrix (symmetry.hpp:1084-1092). No abort "
+               "(theory-owner ruling).\n",
+            ctx.nk_full, ctx.nk_ibz, ctx.nq_full, ctx.nq_ibz, ctx.nsym, ctx.naux,
+            C0_global, C0_global + nc, ctx.leak_max, ctx.leak_mean);
+    if (ctx.leak_max > 1e-2)
+      app_log(1, "  [WARNING] C-window D-matrix leakage max = {:.3e} > 1e-2: the "
+                 "window cuts deeply\n"
+                 "            through an irreducible/degenerate block; consider a "
+                 "window aligned with\n"
+                 "            degenerate sets if higher symmetry fidelity is needed.\n",
+              ctx.leak_max);
+
+    slot = std::move(ctx);
+  }
+
   void vertex_t::set_div_treatment(std::string div) {
     const std::unordered_set<std::string> exact = {"ignore_g0", "v1_skip"};
     utils::check(exact.count(div) > 0 or div.find("gygi") != std::string::npos,
@@ -267,7 +503,12 @@ namespace solvers {
     auto mpi = thc.mpi();
     auto MF = thc.MF();
     const long ns = X_skPa.shape(0), nkpts = X_skPa.shape(1), Np = X_skPa.shape(2);
-    const long nqpts = kmq.shape(0);
+    // t(q) is built at IBZ q ONLY (notes/vertex_ibz_symmetry.md section 3.7): the
+    // kernels source non-IBZ transfers from the IBZ-stored folded cores through the
+    // symmetry context. On symmetry-free meshes nqpts_ibz == nqpts (historic path).
+    const long nqpts = MF->nqpts_ibz();
+    utils::check(kmq.shape(0) >= nqpts,
+                 "vertex_t::build_secondary_basis: kmq must cover the IBZ q range.");
     const long nc = _band_window.size();
     const long Npair = ns * nkpts * nc * nc;   // the pair index carries momentum
                                                // (CLAUDE.md section 2, invariant 4)
@@ -407,19 +648,19 @@ namespace solvers {
     const long Np = thc.Np();
     const long nbnd = MF->nbnd();
 
-    // SYMMETRY POLICY (Phase 1c): symmetry-free meshes only; abort loudly rather than
-    // produce silently wrong results (the audit-sec.7 IBZ unfolding is a follow-up).
-    utils::check(nqpts == nqpts_ibz and nkpts == nkpts_ibz and nqpts == nkpts,
-                 "vertex_t::eval_Sigma_C: vertex + k-space symmetry is not supported yet "
-                 "(nqpts = {}, nqpts_ibz = {}, nkpts = {}, nkpts_ibz = {}). "
-                 "Rerun with symmetry disabled in the mean-field input.",
-                 nqpts, nqpts_ibz, nkpts, nkpts_ibz);
+    // IBZ SYMMETRY (notes/vertex_ibz_symmetry.md): on symmetry-reduced meshes the
+    // external k axis stays IBZ-resident, all internal sums run over the full BZ,
+    // and the rungs are sourced from the IBZ-stored W/Z through the symmetry
+    // context. Symmetry-free meshes take the historic path bit-identically.
+    bool sym_mesh = (nqpts != nqpts_ibz) or (nkpts != nkpts_ibz);
     {
       auto kp_trev = MF->kp_trev();
       for (long ik = 0; ik < nkpts; ++ik)
-        utils::check(not kp_trev(ik),
-                     "vertex_t::eval_Sigma_C: vertex + time-reversal-reduced meshes are not supported yet.");
+        if (kp_trev(ik)) { sym_mesh = true; break; }
     }
+    utils::check(nqpts == nkpts,
+                 "vertex_t::eval_Sigma_C: expected a full transfer mesh with nqpts == "
+                 "nkpts (got {} vs {}).", nqpts, nkpts);
     utils::check(MF->npol() == 1, "vertex_t::eval_Sigma_C: npol != 1 is not supported.");
     utils::check(_ft->basis() == imag_axes_ft::dlr_basis,
                  "vertex_t::eval_Sigma_C: the fused G3W2 kernel requires the DLR IAFT backend "
@@ -430,6 +671,10 @@ namespace solvers {
     const long nt = G_tskij.shape(0);
     const long ns = G_tskij.shape(1);
     const long nt_half = (nt % 2 == 0) ? nt / 2 : nt / 2 + 1;
+    const long nk_ext = sym_mesh ? nkpts_ibz : nkpts;   // external Sigma^C k axis
+    utils::check(G_tskij.shape(2) == nk_ext,
+                 "vertex_t::eval_Sigma_C: G_tskij k axis = {} != {} ({}).",
+                 G_tskij.shape(2), nk_ext, sym_mesh ? "nkpts_ibz" : "nkpts");
     utils::check(nt == _ft->nt_f(), "vertex_t::eval_Sigma_C: G time axis != nt_f.");
     { // the W(beta-tau)=W(tau) unfolding below requires a tau mesh symmetric about beta/2
       auto tau_mesh = _ft->tau_mesh();
@@ -469,6 +714,9 @@ namespace solvers {
         }
       }
       utils::check(iq_gamma >= 0, "vertex_t::eval_Sigma_C: no Gamma q-point found.");
+      utils::check(iq_gamma < nqpts_ibz,
+                   "vertex_t::eval_Sigma_C: Gamma q-point index {} is outside the IBZ "
+                   "range [0, {}).", iq_gamma, nqpts_ibz);
     }
 
     // ---- q->0 rung policy (notes/q0_head_treatment.md section 3) ----------------------
@@ -497,8 +745,9 @@ namespace solvers {
                              : "; no analytic head (GW ignore_g0 analogue)");
 
     // ---- bare coulomb Z(q): the instantaneous part of the rungs (collective call) -----
-    nda::array<ComplexType, 3> Z_qPQ(nqpts, Np, Np);
-    for (long iq = 0; iq < nqpts; ++iq)
+    // IBZ rows under symmetry (the kernels source non-IBZ transfers via the sym ctx)
+    nda::array<ComplexType, 3> Z_qPQ(nqpts_ibz, Np, Np);
+    for (long iq = 0; iq < nqpts_ibz; ++iq)
       Z_qPQ(iq, all, all) = thc.Z(int(iq));
 
     // head insertion, bare piece (weight 1) into Z(Gamma)
@@ -523,14 +772,14 @@ namespace solvers {
 
     // ---- dynamic W(tau): replicate and unfold nt_half storage to the full tau mesh ----
     // dW_qtPQ is dynamic-only (bare Z subtracted, scr_coulomb_t.cpp:217); W is
-    // PH-symmetric in tau, W(beta-t) = W(t).
-    nda::array<ComplexType, 4> Wt_qtPQ(nqpts, nt, Np, Np);
+    // PH-symmetric in tau, W(beta-t) = W(t). IBZ rows under symmetry.
+    nda::array<ComplexType, 4> Wt_qtPQ(nqpts_ibz, nt, Np, Np);
     {
       auto& dW = mb_state.dW_qtPQ.value();
       auto gs = dW.global_shape();
       utils::check(gs[0] == nqpts_ibz and gs[1] == nt_half and gs[2] == Np and gs[3] == Np,
                    "vertex_t::eval_Sigma_C: unexpected dW_qtPQ global shape.");
-      nda::array<ComplexType, 4> W_half(nqpts, nt_half, Np, Np);
+      nda::array<ComplexType, 4> W_half(nqpts_ibz, nt_half, Np, Np);
       W_half() = ComplexType(0.0);
       W_half(dW.local_range(0), dW.local_range(1), dW.local_range(2), dW.local_range(3)) = dW.local();
       mpi->comm.all_reduce_in_place_n(W_half.data(), W_half.size(), std::plus<>{});
@@ -585,11 +834,36 @@ namespace solvers {
     // run the kernel with C-restricted externals (G_CC + the C columns of the
     // collocation); the full-range extension of the kernel formula is well-defined but
     // is NOT dPhi/dG, and accumulating it would break strict Phi-derivability.
+    // G_CC on the FULL BZ (memo (G1)/(G2)): image points are gauge copies of the
+    // IBZ blocks (identity D by convention, symmetry.hpp:910); trev points are the
+    // tau-pointwise TRANSPOSE (the code's own convention, thc_solver_comm.hpp:443-447;
+    // == conj for the hermitian G). No tau-mirror anywhere (memo section 3.5).
     nda::array<ComplexType, 5> G_CC(nt, ns, nkpts, nc, nc);
-    G_CC = G_tskij(all, all, all, _band_window, _band_window);
+    if (not sym_mesh) {
+      G_CC = G_tskij(all, all, all, _band_window, _band_window);
+    } else {
+      auto kp_to_ibz = MF->kp_to_ibz();
+      auto kp_trev = MF->kp_trev();
+      for (long kp = 0; kp < nkpts; ++kp) {
+        const long kib = kp_to_ibz(kp);
+        if (not kp_trev(kp)) {
+          G_CC(all, all, kp, all, all) = G_tskij(all, all, kib, _band_window, _band_window);
+        } else {
+          for (long it = 0; it < nt; ++it)
+            for (long is = 0; is < ns; ++is)
+              for (long a = 0; a < nc; ++a)
+                for (long b = 0; b < nc; ++b)
+                  G_CC(it, is, kp, a, b) =
+                      G_tskij(it, is, kib, _band_window.first() + b, _band_window.first() + a);
+        }
+      }
+    }
     app_log(2, "  Sigma^C externals restricted to the C-C block a, b in [{}, {}) "
                "(strict Phi cut; notes/refinement2_optionA.md DECISION 2).",
             _band_window.first(), _band_window.last());
+    // global-basis window collocation (also the sym-ctx input; secondary uses Xb)
+    nda::array<ComplexType, 4> X_C(ns, nkpts, Np, nc);
+    X_C = X_skPa(all, all, all, _band_window);
     if (sec) {
       build_secondary_basis(thc, X_skPa, kmq, iq_gamma);
       app_log(1, "  Refinement 2: Sigma^C runs in the SECONDARY basis (N_m = {} vs "
@@ -609,11 +883,12 @@ namespace solvers {
         app_log(2, "  Refinement 2: eta diagnostic skipped (N_pair = {} > 4096).",
                 ns * nkpts * nc * nc);
       }
-      // fold the cores (frequency-slice-wise; t is frequency-independent)
-      Zb_qmm = nda::array<ComplexType, 3>(nqpts, _Nm, _Nm);
-      Wb_qtmm = nda::array<ComplexType, 4>(nqpts, nt, _Nm, _Nm);
+      // fold the cores at IBZ q (frequency-slice-wise; t is frequency-independent;
+      // non-IBZ transfers are sourced through the sym ctx, memo section 3.7)
+      Zb_qmm = nda::array<ComplexType, 3>(nqpts_ibz, _Nm, _Nm);
+      Wb_qtmm = nda::array<ComplexType, 4>(nqpts_ibz, nt, _Nm, _Nm);
       nda::array<ComplexType, 2> tmp(_Nm, Np);
-      for (long iq = 0; iq < nqpts; ++iq) {
+      for (long iq = 0; iq < nqpts_ibz; ++iq) {
         auto t_q = _t_qmP(iq, all, all);
         vertex_secondary_detail::fold_core(t_q, Z_qPQ(iq, all, all), tmp,
                                            Zb_qmm(iq, all, all));
@@ -623,21 +898,31 @@ namespace solvers {
       }
     }
 
+    // ---- IBZ symmetry context (trivial/null on symmetry-free meshes) ------------------
+    vertex_sym::sym_ctx const* symc = nullptr;
+    if (sym_mesh) {
+      if (sec) {
+        build_sym_ctx(thc, _Xb_skma, _band_window.first(), _sym_secondary);
+        symc = &_sym_secondary.value();
+      } else {
+        build_sym_ctx(thc, X_C, _band_window.first(), _sym_global);
+        symc = &_sym_global.value();
+      }
+      vertex_ibz_detail::g_rotation_check(*symc, G_CC, MF->kp_trev());
+    }
+
     // ---- fused kernel (round-robin over (s,k,qx); result all-reduced inside) ----------
     // Both paths: C-restricted externals; the ONLY difference is the auxiliary input
     // set -- (X_C, W, Z, Np) global vs (Xb, Wbar, Zbar, N_m) secondary.
-    nda::array<ComplexType, 5> Sigma_C(nt, ns, nkpts, nc, nc);
+    nda::array<ComplexType, 5> Sigma_C(nt, ns, nk_ext, nc, nc);
     if (sec)
-      vertex_detail::eval_sigma_C_g3w2_nosym(*_ft, mpi->comm, nda::range(0, nc), G_CC,
-                                             _Xb_skma, Wb_qtmm, Zb_qmm, kmq, qmin,
-                                             iq_gamma, skip_rung_gamma, Sigma_C);
-    else {
-      nda::array<ComplexType, 4> X_C(ns, nkpts, Np, nc);
-      X_C = X_skPa(all, all, all, _band_window);
-      vertex_detail::eval_sigma_C_g3w2_nosym(*_ft, mpi->comm, nda::range(0, nc), G_CC,
-                                             X_C, Wt_qtPQ, Z_qPQ, kmq, qmin, iq_gamma,
-                                             skip_rung_gamma, Sigma_C);
-    }
+      vertex_detail::eval_sigma_C_g3w2(*_ft, mpi->comm, nda::range(0, nc), G_CC,
+                                       _Xb_skma, Wb_qtmm, Zb_qmm, kmq, qmin,
+                                       iq_gamma, skip_rung_gamma, symc, Sigma_C);
+    else
+      vertex_detail::eval_sigma_C_g3w2(*_ft, mpi->comm, nda::range(0, nc), G_CC,
+                                       X_C, Wt_qtPQ, Z_qPQ, kmq, qmin, iq_gamma,
+                                       skip_rung_gamma, symc, Sigma_C);
     {
       double max_abs = 0.0;
       long n_bad = 0;
@@ -678,19 +963,15 @@ namespace solvers {
     long Np = thc.Np();
     long nbnd = MF->nbnd();
 
-    // SYMMETRY POLICY (Phase 1d): only symmetry-free meshes are supported; anything else
-    // aborts loudly rather than producing silently wrong results (audit-sec.7 unfolding
-    // is a follow-up).
-    utils::check(nqpts == nqpts_ibz and nkpts == nkpts_ibz,
-                 "vertex_t::eval_Pi_C: vertex + k-space symmetry is not supported yet "
-                 "(nqpts = {}, nqpts_ibz = {}, nkpts = {}, nkpts_ibz = {}). "
-                 "Rerun with symmetry disabled in the mean-field input.",
-                 nqpts, nqpts_ibz, nkpts, nkpts_ibz);
+    // IBZ SYMMETRY (notes/vertex_ibz_symmetry.md): the external q axis of Pi^C is
+    // IBZ-resident (as the output grid already is); the internal (k, qx) sums run
+    // over the full BZ, sourcing the rung from IBZ-stored W/Z via the symmetry
+    // context. Symmetry-free meshes take the historic path bit-identically.
+    bool sym_mesh = (nqpts != nqpts_ibz) or (nkpts != nkpts_ibz);
     {
       auto kp_trev = MF->kp_trev();
       for (long ik = 0; ik < nkpts; ++ik)
-        utils::check(not kp_trev(ik),
-                     "vertex_t::eval_Pi_C: vertex + time-reversal-reduced meshes are not supported yet.");
+        if (kp_trev(ik)) { sym_mesh = true; break; }
     }
 
     auto G_tskij = mb_state.sG_tskij.value().local();
@@ -868,9 +1149,11 @@ namespace solvers {
               sec ? " and no cached Wbar" : "");
     }
 
-    // ---- momentum maps (symmetry-free mesh) -------------------------------------------
-    nda::array<long, 2> kmq(nqpts_ibz, nkpts), kpq(nqpts_ibz, nkpts);
-    for (long iq = 0; iq < nqpts_ibz; ++iq) {
+    // ---- momentum maps on the FULL transfer mesh --------------------------------------
+    // (rows beyond nqpts_ibz feed the internal qx sums under symmetry; on
+    //  symmetry-free meshes nqpts == nqpts_ibz and this is the historic table)
+    nda::array<long, 2> kmq(nqpts, nkpts), kpq(nqpts, nkpts);
+    for (long iq = 0; iq < nqpts; ++iq) {
       for (long ik = 0; ik < nkpts; ++ik) kmq(iq, ik) = MF->qk_to_k2(iq, ik);
       for (long ik = 0; ik < nkpts; ++ik) kpq(iq, kmq(iq, ik)) = ik;   // inverse: (k-q)+q = k
     }
@@ -891,11 +1174,37 @@ namespace solvers {
     // summed the full band range) are C-restricted in BOTH paths via the input
     // projection (G_CC + C columns of the collocation) -- exactly the kernel on
     // G~ = P_C G P_C, the exact all-C cut (conservation notes section 1.2).
+    // G_CC on the FULL BZ (memo (G1)/(G2)): image points are gauge copies of the
+    // IBZ blocks; trev points are the tau-pointwise transpose (see eval_Sigma_C).
+    utils::check(G_tskij.shape(2) == (sym_mesh ? nkpts_ibz : nkpts),
+                 "vertex_t::eval_Pi_C: G_tskij k axis = {} != {}.",
+                 G_tskij.shape(2), sym_mesh ? nkpts_ibz : nkpts);
     nda::array<ComplexType, 5> G_CC(nt_f, ns, nkpts, nc, nc);
-    G_CC = G_tskij(all, all, all, _band_window, _band_window);
+    if (not sym_mesh) {
+      G_CC = G_tskij(all, all, all, _band_window, _band_window);
+    } else {
+      auto kp_to_ibz = MF->kp_to_ibz();
+      auto kp_trev = MF->kp_trev();
+      for (long kp = 0; kp < nkpts; ++kp) {
+        const long kib = kp_to_ibz(kp);
+        if (not kp_trev(kp)) {
+          G_CC(all, all, kp, all, all) = G_tskij(all, all, kib, _band_window, _band_window);
+        } else {
+          for (long it = 0; it < nt_f; ++it)
+            for (long is = 0; is < ns; ++is)
+              for (long a = 0; a < nc; ++a)
+                for (long b = 0; b < nc; ++b)
+                  G_CC(it, is, kp, a, b) =
+                      G_tskij(it, is, kib, _band_window.first() + b, _band_window.first() + a);
+        }
+      }
+    }
     app_log(2, "  Pi^C external legs restricted to C = [{}, {}) (strict Phi cut; "
                "notes/refinement2_optionA.md DECISION 2).",
             _band_window.first(), _band_window.last());
+    // global-basis window collocation (also the sym-ctx input; secondary uses Xb)
+    nda::array<ComplexType, 4> X_C(ns, nkpts, Np, nc);
+    X_C = X_skPa(all, all, all, _band_window);
     if (sec) {
       build_secondary_basis(thc, X_skPa, kmq, iq_gamma);
       app_log(1, "  Refinement 2: Pi^C runs in the SECONDARY basis (N_m = {} vs Np = {}); "
@@ -957,12 +1266,25 @@ namespace solvers {
       }
     }
 
+    // ---- IBZ symmetry context (trivial/null on symmetry-free meshes) ------------------
+    vertex_sym::sym_ctx const* symc = nullptr;
+    if (sym_mesh) {
+      if (sec) {
+        build_sym_ctx(thc, _Xb_skma, _band_window.first(), _sym_secondary);
+        symc = &_sym_secondary.value();
+      } else {
+        build_sym_ctx(thc, X_C, _band_window.first(), _sym_global);
+        symc = &_sym_global.value();
+      }
+      vertex_ibz_detail::g_rotation_check(*symc, G_CC, MF->kp_trev());
+    }
+
     // ---- kernel: accumulate Pi^C(inu) over this rank's (s,k,qx) tuples ----------------
     // q->0 policy resolved above (skip_rung_gamma / head-augmented inputs). Both paths:
     // C-restricted externals; the ONLY difference is the auxiliary input set --
     // (X_C, W, Z, Np) global vs (Xb, Wbar, Zbar, N_m) secondary.
     const long naux = sec ? _Nm : Np;
-    nda::array<double, 1> qx_diag(nqpts_ibz);
+    nda::array<double, 1> qx_diag(nqpts);
     nda::array<ComplexType, 4> Pi_wqMN(tools.nw_b, nqpts_ibz, naux, naux);
     Pi_wqMN() = ComplexType(0.0);
     if (sec)
@@ -970,16 +1292,13 @@ namespace solvers {
                                    Wbdyn_qwmm.has_value() ? &Wbdyn_qwmm.value() : nullptr,
                                    kmq, kpq, nda::range(0, nc), Pi_wqMN,
                                    mpi->comm.rank(), mpi->comm.size(),
-                                   skip_rung_gamma, &qx_diag);
-    else {
-      nda::array<ComplexType, 4> X_C(ns, nkpts, Np, nc);
-      X_C = X_skPa(all, all, all, _band_window);
+                                   skip_rung_gamma, &qx_diag, symc);
+    else
       vertex_pi::pi_c_accumulate_w(*_ft, tools, G_CC, X_C, Z_qPQ,
                                    Wdyn_qwPQ.has_value() ? &Wdyn_qwPQ.value() : nullptr,
                                    kmq, kpq, nda::range(0, nc), Pi_wqMN,
                                    mpi->comm.rank(), mpi->comm.size(),
-                                   skip_rung_gamma, &qx_diag);
-    }
+                                   skip_rung_gamma, &qx_diag, symc);
     mpi->comm.all_reduce_in_place_n(Pi_wqMN.data(), Pi_wqMN.size(), std::plus<>{});
     mpi->comm.all_reduce_in_place_n(qx_diag.data(), qx_diag.size(), std::plus<>{});
 
@@ -987,7 +1306,7 @@ namespace solvers {
     // for the q->0 head pathology; Gamma reads 0 when skipped)
     {
       long iqg = -1;
-      for (long iq = 0; iq < nqpts_ibz; ++iq) {
+      for (long iq = 0; iq < nqpts; ++iq) {
         bool isg = true;
         for (long ik = 0; ik < nkpts; ++ik)
           if (kmq(iq, ik) != ik) { isg = false; break; }
@@ -995,7 +1314,7 @@ namespace solvers {
       }
       double g_val = (iqg >= 0) ? qx_diag(iqg) : -1.0;
       double other = 0.0;
-      for (long iqx = 0; iqx < nqpts_ibz; ++iqx) {
+      for (long iqx = 0; iqx < nqpts; ++iqx) {
         app_log(3, "  Pi^C rung diagnostics: qx = {}  max|contribution| = {}", iqx, qx_diag(iqx));
         if (iqx != iqg) other = std::max(other, qx_diag(iqx));
       }
@@ -1080,13 +1399,11 @@ namespace solvers {
     const long ns = mb_state.sG_tskij.value().local().shape(1);
     const long nc = _band_window.size();
 
-    // same symmetry policy as the consumers (nosym only; abort loudly otherwise).
-    // IBZ EXTENSION HOOK: when symmetry lands, the fill below runs over IBZ q only
-    // (the cache is q-keyed on its first axis) and consumption rotates to the star.
-    utils::check(nqpts == nqpts_ibz and nkpts == nkpts_ibz,
-                 "vertex_t::cache_w: vertex + k-space symmetry is not supported yet "
-                 "(nqpts = {}, nqpts_ibz = {}, nkpts = {}, nkpts_ibz = {}).",
-                 nqpts, nqpts_ibz, nkpts, nkpts_ibz);
+    // IBZ symmetry (notes/vertex_ibz_symmetry.md section 3.7): the fill runs over
+    // IBZ q only -- which is exactly the cache's q-keyed first axis; consumption at
+    // non-IBZ transfers goes through the kernels' symmetry context. No further
+    // change is needed here (the layout anticipated this extension).
+    (void)nqpts; (void)nkpts; (void)nkpts_ibz;
 
     vertex_pi::iaft_tools tools(*_ft);
     const long nw_b = tools.nw_b;

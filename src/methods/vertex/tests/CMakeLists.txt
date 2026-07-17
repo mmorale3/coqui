@@ -53,6 +53,18 @@ target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield eri_li
 add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
 set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR})
 
+# ISDF-Vertex: IBZ k-point symmetry (notes/vertex_ibz_symmetry.md): leakage
+# diagnostic, the sym-vs-nosym gold check, the star-weighted conservation identity
+# on the symmetry-reduced mesh, and the C = empty noop on the sym mesh.
+set(TEST_ID methods_vertex_ibz)
+
+add_executable(test_${TEST_ID} test_vertex_ibz.cpp)
+target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield eri_lib hf_lib
+                      vertex_lib gw_lib scf_lib)
+
+add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
+set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR})
+
 # ISDF-Vertex Refinement 2: W-bar iteration cache (notes/wbar_cache.md): the secondary
 # path caches the downfolded rung at update_w time so the scf driver frees dW
 # unconditionally; machine-identity vs the legacy retained-dW consumption + memory

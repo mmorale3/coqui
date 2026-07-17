@@ -54,12 +54,19 @@
  * products of representable tau-objects (pair products, triple products with wbar~) stay
  * within the basis span given the instance's wmax headroom.
  *
- * Symmetry policy: symmetry-free meshes only (enforced by vertex_t::eval_Pi_C).
+ * Symmetry (notes/vertex_ibz_symmetry.md): with a non-null vertex_sym::sym_ctx the
+ * EXTERNAL q axis runs over the IBZ only while the internal (k, qx) sums cover the
+ * FULL BZ; the rung at a non-IBZ transfer qx is sourced from the IBZ-stored W/Z via
+ * the effective collocation columns Xhat (rotation + trev-leg conj) and, for
+ * trev-mapped transfers, a PQ-transpose of the stored core (memo (P2)). G and the
+ * external zL/zR are full-BZ objects supplied by the caller (gauge gather; memo
+ * (G1)/(G2)). A null ctx reproduces the no-symmetry path bit-identically.
  */
 
 #include <map>
 #include <cmath>
 #include <complex>
+#include <tuple>
 
 #include "configuration.hpp"
 #include "nda/nda.hpp"
@@ -67,6 +74,7 @@
 #include "utilities/check.hpp"
 #include "IO/app_loggers.h"
 #include "numerics/imag_axes_ft/IAFT.hpp"
+#include "methods/vertex/vertex_sym.hpp"
 // under ENABLE_DLR, IAFT.hpp -> dlr_driver.hpp provides the cppdlr headers used below
 // (same pattern as numerics/imag_axes_ft/iaft_dconv.hpp)
 
@@ -354,8 +362,13 @@ namespace vertex_pi {
    *                            semantics; under the gygi-class policy the caller has
    *                            additionally added the analytic rank-1 head insertion
    *                            at Gamma (vertex_t.cpp).
-   * @param qx_diag   - optional (nq): per-qx max |single contribution| to Pi^C(inu),
+   * @param qx_diag   - optional (nq_full): per-qx max |single contribution| to Pi^C(inu),
    *                    rank-local (for the q->0 diagnostics; logged by the caller).
+   * @param symc      - optional IBZ symmetry context (notes/vertex_ibz_symmetry.md).
+   *                    nullptr / !active: the no-symmetry path (all axes full-BZ,
+   *                    bit-identical to the historic kernel). Active: the external
+   *                    q axis of Pi_wqMN is nq_ibz, W/Z carry nq_ibz rows, kmq/kpq
+   *                    carry the FULL transfer mesh, and G/X are full-BZ objects.
    */
   template<nda::MemoryArrayOfRank<5> GArr, nda::MemoryArrayOfRank<4> XArr,
            nda::MemoryArrayOfRank<3> ZArr>
@@ -369,17 +382,44 @@ namespace vertex_pi {
                          nda::array<ComplexType, 4>& Pi_wqMN,
                          long rank, long nproc,
                          bool skip_rung_gamma = false,
-                         nda::array<double, 1>* qx_diag = nullptr) {
+                         nda::array<double, 1>* qx_diag = nullptr,
+                         vertex_sym::sym_ctx const* symc = nullptr) {
     (void)ft;
     decltype(nda::range::all) all;
     long ns = G_tskij.shape(1), nk = G_tskij.shape(2);
-    long nq = Z_qPQ.shape(0);
     long Np = X_skPa.shape(2);
     long Nb = C.size();
     long nt = tools.nt_f, nw_b = tools.nw_b;
     long Nb2 = Nb * Nb;
 
-    utils::check(Pi_wqMN.shape(0) == nw_b and Pi_wqMN.shape(1) == nq and
+    // symmetry bookkeeping (notes/vertex_ibz_symmetry.md section 4):
+    //   nq_w    = rows of the stored W/Z (IBZ under symmetry)
+    //   nq_full = internal transfer mesh (rows of kmq/kpq)
+    //   nq_ext  = external output q axis of Pi_wqMN
+    // no-symmetry: all three coincide (== the historic nq).
+    const bool sym = (symc != nullptr and symc->active);
+    long nq_w = Z_qPQ.shape(0);
+    long nq_full = kmq.shape(0);
+    long nq_ext = Pi_wqMN.shape(1);
+    if (sym) {
+      utils::check(nq_w == symc->nq_ibz and nq_ext == symc->nq_ibz and
+                   nq_full == symc->nq_full and nk == symc->nk_full,
+                   "vertex_pi::pi_c_accumulate_w: symmetry context dimension mismatch "
+                   "(nq_w = {}, nq_ext = {}, nq_full = {}, nk = {} vs ctx {}, {}, {}).",
+                   nq_w, nq_ext, nq_full, nk, symc->nq_ibz, symc->nq_full, symc->nk_full);
+      utils::check(symc->naux == Np and symc->nc == Nb and C.first() == 0,
+                   "vertex_pi::pi_c_accumulate_w: symmetry context Xhat mismatch "
+                   "(naux = {} vs Np = {}, nc = {} vs Nb = {}, C0 = {}).",
+                   symc->naux, Np, symc->nc, Nb, C.first());
+    } else {
+      utils::check(nq_w == nq_full and nq_ext == nq_full,
+                   "vertex_pi::pi_c_accumulate_w: inconsistent q axes without a "
+                   "symmetry context (nq_w = {}, nq_full = {}, nq_ext = {}).",
+                   nq_w, nq_full, nq_ext);
+    }
+    long nq = nq_full;   // internal transfer axis (historic name)
+
+    utils::check(Pi_wqMN.shape(0) == nw_b and
                  Pi_wqMN.shape(2) == Np and Pi_wqMN.shape(3) == Np,
                  "vertex_pi::pi_c_accumulate_w: output shape mismatch.");
 
@@ -418,20 +458,50 @@ namespace vertex_pi {
     long ntuples = ns * nk * nq;
 
     // ---------------- helper: rung collocations + orbital-projected rung ----------------
+    // Under symmetry the four rung legs use the effective columns Xhat(is, jsym, kL)
+    // (rotation to the IBZ transfer frame + trev-leg conj; memo (X-hat)); the leg
+    // k-point INDICES passed in stay the original full-BZ ones -- the rotation is
+    // internal to Xhat. jsym is the qsymms position of the transfer's mapping
+    // symmetry (0 = identity; also the only case without a symmetry context).
     nda::array<ComplexType, 2> U1(Np, Nb2), U2(Np, Nb2), ZU2(Np, Nb2);
-    auto build_U = [&](long is, long ik, long ikmqx, long ikpq, long ikxq) {
-      for (long P = 0; P < Np; ++P) {
-        for (long j1 = 0; j1 < Nb; ++j1) {
-          auto x1 = X_skPa(is, ikmqx, P, C.first() + j1);
-          for (long j1p = 0; j1p < Nb; ++j1p)
-            U1(P, j1 * Nb + j1p) = x1 * std::conj(X_skPa(is, ik, P, C.first() + j1p));
+    auto build_U = [&](long is, long ik, long ikmqx, long ikpq, long ikxq, long jsym) {
+      if (not sym) {
+        for (long P = 0; P < Np; ++P) {
+          for (long j1 = 0; j1 < Nb; ++j1) {
+            auto x1 = X_skPa(is, ikmqx, P, C.first() + j1);
+            for (long j1p = 0; j1p < Nb; ++j1p)
+              U1(P, j1 * Nb + j1p) = x1 * std::conj(X_skPa(is, ik, P, C.first() + j1p));
+          }
+          for (long j3 = 0; j3 < Nb; ++j3) {
+            auto x3 = X_skPa(is, ikpq, P, C.first() + j3);
+            for (long j3p = 0; j3p < Nb; ++j3p)
+              U2(P, j3 * Nb + j3p) = x3 * std::conj(X_skPa(is, ikxq, P, C.first() + j3p));
+          }
         }
-        for (long j3 = 0; j3 < Nb; ++j3) {
-          auto x3 = X_skPa(is, ikpq, P, C.first() + j3);
-          for (long j3p = 0; j3p < Nb; ++j3p)
-            U2(P, j3 * Nb + j3p) = x3 * std::conj(X_skPa(is, ikxq, P, C.first() + j3p));
+      } else {
+        auto Xh = [&](long kk) { return symc->Xhat(is, jsym, kk, all, all); };
+        auto Xin1 = Xh(ikmqx);  // in  p1  @ k-qx
+        auto Xo1  = Xh(ik);     // out p1' @ k
+        auto Xin2 = Xh(ikpq);   // in  p3  @ k+q
+        auto Xo2  = Xh(ikxq);   // out p3' @ k-qx+q
+        for (long P = 0; P < Np; ++P) {
+          for (long j1 = 0; j1 < Nb; ++j1) {
+            auto x1 = Xin1(P, j1);
+            for (long j1p = 0; j1p < Nb; ++j1p)
+              U1(P, j1 * Nb + j1p) = x1 * std::conj(Xo1(P, j1p));
+          }
+          for (long j3 = 0; j3 < Nb; ++j3) {
+            auto x3 = Xin2(P, j3);
+            for (long j3p = 0; j3p < Nb; ++j3p)
+              U2(P, j3 * Nb + j3p) = x3 * std::conj(Xo2(P, j3p));
+          }
         }
       }
+    };
+    // rung-transfer access data: IBZ index + trev(=PQ-transpose) flag + symmetry pos.
+    auto q_access = [&](long iqx) {
+      if (not sym) return std::make_tuple(iqx, false, 0l);
+      return std::make_tuple(symc->q_star(iqx), bool(symc->q_trev(iqx)), symc->q_isym(iqx));
     };
     // rearrange wbar[(p1p1'),(p3p3')] -> wmat[(p1'p3),(p1p3')]
     auto to_wmat = [&](nda::array<ComplexType, 2> const& wbar, auto&& wmat) {
@@ -461,11 +531,17 @@ namespace vertex_pi {
         long iqx = tup % nq;
         if (skip_rung_gamma and iqx == iq_gamma) continue;
         long ikmqx = kmq(iqx, ik);
-        for (long iq = 0; iq < nq; ++iq) {
+        auto [qsx, trx, jsx] = q_access(iqx);
+        for (long iq = 0; iq < nq_ext; ++iq) {
           long ikpq = kpq(iq, ik);
           long ikxq = kmq(iqx, ikpq);
-          build_U(is, ik, ikmqx, ikpq, ikxq);
-          nda::blas::gemm(Z_qPQ(iqx, all, all), U2, ZU2);
+          build_U(is, ik, ikmqx, ikpq, ikxq, jsx);
+          // trev-mapped transfer: the rotated transfer is -qs and the element is
+          // read from the qs storage by the exact side-swap = PQ-transpose (P2).
+          if (trx)
+            nda::blas::gemm(nda::transpose(Z_qPQ(qsx, all, all)), U2, ZU2);
+          else
+            nda::blas::gemm(Z_qPQ(qsx, all, all), U2, ZU2);
           nda::blas::gemm(nda::transpose(U1), ZU2, wbarZ);
           to_wmat(wbarZ, wZmat);
 
@@ -529,8 +605,8 @@ namespace vertex_pi {
     // pair caches over (spin, k', q): components 0/1 of T-type and M-type pairs
     // T pair at (k,q):  cA = cL(k) [zL4], cB = cR(k+q) [zR1, shifted slot]
     // M pair at (k',q): cA = cR(k') [zR3] viewed with d1 = M...  (see build below)
-    nda::array<ComplexType, 6> T0(ns, nk, nq, nt, Nb2, Np), T1(ns, nk, nq, nt, Nb2, Np);
-    nda::array<ComplexType, 6> M0(ns, nk, nq, nt, Nb2, Np), M1(ns, nk, nq, nt, Nb2, Np);
+    nda::array<ComplexType, 6> T0(ns, nk, nq_ext, nt, Nb2, Np), T1(ns, nk, nq_ext, nt, Nb2, Np);
+    nda::array<ComplexType, 6> M0(ns, nk, nq_ext, nt, Nb2, Np), M1(ns, nk, nq_ext, nt, Nb2, Np);
     nda::array<ComplexType, 3> pcomp;
 
     nda::array<ComplexType, 3> wbarD(nw_b, Nb2, Nb2);
@@ -550,7 +626,7 @@ namespace vertex_pi {
       // ---- build all pair components for this m --------------------------------------
       for (long is = 0; is < ns; ++is)
         for (long ik2 = 0; ik2 < nk; ++ik2)
-          for (long iq = 0; iq < nq; ++iq) {
+          for (long iq = 0; iq < nq_ext; ++iq) {
             long ik2pq = kpq(iq, ik2);
             // T pair: rows (p1', p3): cA = cL(ik2) (aux N), cB = cR(ik2pq)
             detail::build_pair_component(kap0, cL(is, ik2, nda::ellipsis{}),
@@ -582,14 +658,19 @@ namespace vertex_pi {
         long iqx = tup % nq;
         if (skip_rung_gamma and iqx == iq_gamma) continue;
         long ikmqx = kmq(iqx, ik);
-        for (long iq = 0; iq < nq; ++iq) {
+        auto [qsx, trx, jsx] = q_access(iqx);
+        for (long iq = 0; iq < nq_ext; ++iq) {
           long ikpq = kpq(iq, ik);
           long ikxq = kmq(iqx, ikpq);
-          build_U(is, ik, ikmqx, ikpq, ikxq);
+          build_U(is, ik, ikmqx, ikpq, ikxq, jsx);
 
           // wbar_dyn(l) -> wmat layout -> tau form wt(s)[(p1'p3),(p1p3')]
+          // (trev-mapped transfer: PQ-transposed read of the IBZ-stored core, (P2))
           for (long l = 0; l < nw_b; ++l) {
-            nda::blas::gemm((*Wdyn_qwPQ)(iqx, l, all, all), U2, ZU2);
+            if (trx)
+              nda::blas::gemm(nda::transpose((*Wdyn_qwPQ)(qsx, l, all, all)), U2, ZU2);
+            else
+              nda::blas::gemm((*Wdyn_qwPQ)(qsx, l, all, all), U2, ZU2);
             auto wb = wbarD(l, all, all);
             nda::blas::gemm(nda::transpose(U1), ZU2, wb);
           }

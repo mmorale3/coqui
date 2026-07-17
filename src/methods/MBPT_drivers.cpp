@@ -124,7 +124,11 @@ inline void ensure_checkpoint(std::shared_ptr<mf::MF> mf, std::string const& out
  *                 subspace C (gw solver only). Absent/empty window means C is the empty set,
  *                 which reproduces plain scGW exactly.
  *                 Requirements with an active vertex: DLR IAFT backend (iaft basis "dlr");
- *                 screen_type "rpa" or "rpa_k"; no k-point symmetry (full-BZ meshes) yet.
+ *                 screen_type "rpa" or "rpa_k". Symmetry-reduced (IBZ) k-meshes are
+ *                 supported (notes/vertex_ibz_symmetry.md): external axes stay
+ *                 IBZ-resident and the rung transfers are sourced from IBZ-stored W/Z;
+ *                 the C-window D-matrix leakage of the symmetry rotations is measured
+ *                 and logged (expected small; O(leakage) relative error on the vertex).
  *                 Note: Pi^C uses the PREVIOUS iteration's screened W (one-iteration lag;
  *                 first iteration uses the bare-Z rung), and dW stays resident across the
  *                 iteration boundary (memory tradeoff). The vertex inherits the run's

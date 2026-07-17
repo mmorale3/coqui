@@ -37,6 +37,7 @@
 #include "numerics/imag_axes_ft/IAFT.hpp"
 #include "methods/mb_state/mb_state.hpp"
 #include "methods/ERI/detail/concepts.hpp"
+#include "methods/vertex/vertex_sym.hpp"
 
 namespace methods {
 namespace solvers {
@@ -65,8 +66,12 @@ namespace solvers {
    *                                    exactly -- active() is false and the
    *                                    entry points are never invoked.
    *
-   * STATUS: both kernels are implemented for symmetry-free meshes
-   * (nkpts == nkpts_ibz == nqpts; anything else aborts loudly):
+   * STATUS: both kernels support symmetry-free AND symmetry-reduced (IBZ)
+   * k-meshes (notes/vertex_ibz_symmetry.md): external axes are IBZ-resident,
+   * internal sums cover the full BZ, and the rung transfers are sourced from
+   * IBZ-stored W/Z through the vertex_sym context (effective collocations +
+   * PQ-transpose for time-reversal-mapped transfers). The C-window D-matrix
+   * leakage of the symmetry rotations is measured and logged (sym_leakage_max).
    *  - Sigma^C: fused G^3 W^2 double-bosonic-convolution kernel, DLR backend
    *    only (vertex_sigma.icc; notes/sigma_c_kernel_design.md)
    *  - Pi^C: G^4 W single-rung kernel (vertex_pi.icc; see its design notes)
@@ -256,6 +261,28 @@ namespace solvers {
     // machine-identity A/B reference (not exposed as an input key).
     bool _w_cache_enabled = true;
 
+    // ---- IBZ k-point symmetry (notes/vertex_ibz_symmetry.md) -------------------------
+    // Geometry-fixed symmetry contexts, built lazily on the first symmetric
+    // evaluation: q'-access tables + effective C-window collocation columns Xhat
+    // for the global (Np) and secondary (N_m) bases. Trivial (unused) on
+    // symmetry-free meshes -- the kernels then take their historic paths.
+    std::optional<vertex_sym::sym_ctx> _sym_global;
+    std::optional<vertex_sym::sym_ctx> _sym_secondary;
+    // measured C-window D-matrix leakage (diagnostic, no gate; memo section 6)
+    double _sym_leak_max = 0.0;
+    double _sym_leak_mean = 0.0;
+
+    /**
+     * Build (lazily) the symmetry context for the given window collocation
+     * X_w (ns, nk_full, naux, nc): q'-access tables, krot = ks_to_k, effective
+     * columns Xhat per (spin, qsymms position, k), and the C-window leakage
+     * diagnostic. Collective-safe (pure local reads of MF tables + X_w).
+     */
+    void build_sym_ctx(THC_ERI auto const &thc,
+                       nda::array<ComplexType, 4> const &X_w,
+                       long C0_global,
+                       std::optional<vertex_sym::sym_ctx> &slot);
+
     /**
      * Build the secondary ISDF basis and the per-q Option-A transfer maps
      * (lazily; no-op once built). Collective on thc.mpi()->comm.
@@ -303,6 +330,12 @@ namespace solvers {
     bool enabled() const { return _vertex_type != "none"; }
     // vertex requested AND C is non-empty; C = empty set must be an exact no-op
     bool active() const { return enabled() and _band_window.size() > 0; }
+
+    // IBZ symmetry diagnostics (notes/vertex_ibz_symmetry.md section 6):
+    // measured C-window D-matrix leakage of the symmetry rotations (0 until the
+    // first symmetric evaluation; 0 on symmetry-free meshes).
+    double sym_leakage_max() const { return _sym_leak_max; }
+    double sym_leakage_mean() const { return _sym_leak_mean; }
 
   }; // vertex_t
 

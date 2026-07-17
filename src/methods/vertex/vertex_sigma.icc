@@ -40,13 +40,22 @@
  * family contraction runs on |C|-sized tensors. Exact (to DLR eps) w.r.t.
  * the batched double_boson_conv over orbital tuples (pinned by tests).
  *
- * No-symmetry path only: nkpts == nkpts_ibz == nqpts (checked). Bare Z(q)
- * enters exclusively through the instantaneous cx/cy reductions (a
+ * Bare Z(q) enters exclusively through the instantaneous cx/cy reductions (a
  * frequency-constant is a delta(tau): never through the dynamic machinery).
+ *
+ * IBZ symmetry (notes/vertex_ibz_symmetry.md): with an active vertex_sym::sym_ctx
+ * the EXTERNAL k axis of Sigma^C runs over the IBZ only while the (qx, qy) double
+ * sum and all internal k-arguments stay FULL-BZ; each rung at a non-IBZ transfer
+ * is sourced from the IBZ-stored W/Z through the effective collocation columns
+ * Xhat (rotation + trev-leg conj) and, for trev-mapped transfers, a PQ-transpose
+ * of the stored core (memo (P2)). G/X inputs are full-BZ objects supplied by the
+ * caller. A null ctx reproduces the historic no-symmetry path bit-identically.
  */
 
 #include <cmath>
 #include <complex>
+#include <tuple>
+#include <utility>
 
 #include "configuration.hpp"
 #include "utilities/check.hpp"
@@ -56,6 +65,7 @@
 
 #include "numerics/imag_axes_ft/IAFT.hpp"
 #include "numerics/imag_axes_ft/iaft_dconv.hpp"  // dconv_detail::stable_nF/nB (+ cppdlr via IAFT)
+#include "methods/vertex/vertex_sym.hpp"
 
 namespace methods {
 namespace solvers {
@@ -94,26 +104,32 @@ namespace vertex_detail {
    *                              gygi-class policy the caller has additionally
    *                              augmented the Gamma cell with the analytic rank-1
    *                              head insertion (vertex_t.cpp).
-   * @param Sigma_C_tskab - (nt_f, ns, nk, nbnd, nbnd) OVERWRITTEN with Sigma^C(tau)
+   * @param symc        - optional IBZ symmetry context (notes/vertex_ibz_symmetry.md).
+   *                      nullptr / !active: the historic no-symmetry path. Active:
+   *                      Sigma_C_tskab's k axis is nkpts_ibz, W/Z carry nq_ibz rows,
+   *                      k_minus_q/qminus carry the FULL transfer mesh, and G/X are
+   *                      full-BZ objects.
+   * @param Sigma_C_tskab - (nt_f, ns, nk_ext, nbnd, nbnd) OVERWRITTEN with Sigma^C(tau)
    */
   template<nda::MemoryArrayOfRank<5> GArr_t, nda::MemoryArrayOfRank<5> SArr_t>
-  void eval_sigma_C_g3w2_nosym(imag_axes_ft::IAFT const &ft,
-                               mpi3::communicator &comm,
-                               nda::range C_rng,
-                               GArr_t const &G_tskij,
-                               nda::array<ComplexType, 4> const &X_skPa,
-                               nda::array<ComplexType, 4> const &Wt_qtPQ,
-                               nda::array<ComplexType, 3> const &Z_qPQ,
-                               nda::array<long, 2> const &k_minus_q,
-                               nda::array<long, 1> const &qminus,
-                               long iq_gamma,
-                               bool skip_rung_gamma,
-                               SArr_t &&Sigma_C_tskab) {
+  void eval_sigma_C_g3w2(imag_axes_ft::IAFT const &ft,
+                         mpi3::communicator &comm,
+                         nda::range C_rng,
+                         GArr_t const &G_tskij,
+                         nda::array<ComplexType, 4> const &X_skPa,
+                         nda::array<ComplexType, 4> const &Wt_qtPQ,
+                         nda::array<ComplexType, 3> const &Z_qPQ,
+                         nda::array<long, 2> const &k_minus_q,
+                         nda::array<long, 1> const &qminus,
+                         long iq_gamma,
+                         bool skip_rung_gamma,
+                         vertex_sym::sym_ctx const *symc,
+                         SArr_t &&Sigma_C_tskab) {
 #ifndef ENABLE_DLR
     (void)ft; (void)comm; (void)C_rng; (void)G_tskij; (void)X_skPa; (void)Wt_qtPQ;
     (void)Z_qPQ; (void)k_minus_q; (void)qminus; (void)iq_gamma; (void)skip_rung_gamma;
-    (void)Sigma_C_tskab;
-    APP_ABORT("vertex_detail::eval_sigma_C_g3w2_nosym: this build has ENABLE_DLR=OFF; "
+    (void)symc; (void)Sigma_C_tskab;
+    APP_ABORT("vertex_detail::eval_sigma_C_g3w2: this build has ENABLE_DLR=OFF; "
               "the DLR IAFT backend is required.");
 #else
     using imag_axes_ft::dconv_detail::stable_nF;
@@ -129,27 +145,58 @@ namespace vertex_detail {
     const double beta = ft.beta();
 
     const long ns   = G_tskij.shape(1);
-    const long nk   = G_tskij.shape(2);
+    const long nk   = G_tskij.shape(2);          // FULL BZ (internal k-arguments)
     const long nbnd = G_tskij.shape(3);
-    const long nq   = Wt_qtPQ.shape(0);
     const long Np   = Wt_qtPQ.shape(2);
     const long nc   = C_rng.size();
     const long C0   = C_rng.first();
 
+    // symmetry bookkeeping (notes/vertex_ibz_symmetry.md section 4):
+    //   nq_w    = rows of the stored W/Z (IBZ under symmetry)
+    //   nq      = internal transfer mesh (rows of k_minus_q; the qx/qy loop range)
+    //   nk_ext  = external k axis of Sigma_C (IBZ under symmetry)
+    // no-symmetry: nq_w == nq == nk and nk_ext == nk (the historic path, bit-identical).
+    const bool sym = (symc != nullptr and symc->active);
+    const long nq_w = Wt_qtPQ.shape(0);
+    const long nq   = k_minus_q.shape(0);
+    const long nk_ext = Sigma_C_tskab.shape(2);
+
     utils::check(G_tskij.shape(0) == nt, "eval_sigma_C: G_tskij leading axis must be nt_f = {}.", nt);
     utils::check(Wt_qtPQ.shape(1) == nt, "eval_sigma_C: Wt_qtPQ time axis must be nt_f = {} (full tau mesh).", nt);
-    utils::check(nq == nk, "eval_sigma_C: no-symmetry path requires nq == nk.");
-    utils::check(Z_qPQ.shape(0) == nq and Z_qPQ.shape(1) == Np and Z_qPQ.shape(2) == Np,
+    utils::check(nq == nk, "eval_sigma_C: transfer mesh must match the full k mesh (nq = {}, nk = {}).", nq, nk);
+    utils::check(qminus.shape(0) == nq, "eval_sigma_C: qminus size mismatch.");
+    if (sym) {
+      utils::check(nq_w == symc->nq_ibz and nq == symc->nq_full and
+                   nk == symc->nk_full and nk_ext == symc->nk_ibz,
+                   "eval_sigma_C: symmetry context dimension mismatch "
+                   "(nq_w = {}, nq = {}, nk = {}, nk_ext = {} vs ctx {}, {}, {}, {}).",
+                   nq_w, nq, nk, nk_ext, symc->nq_ibz, symc->nq_full, symc->nk_full, symc->nk_ibz);
+      utils::check(symc->naux == Np and symc->nc == nc and C0 == 0 and nbnd == nc,
+                   "eval_sigma_C: symmetry context requires strict C-C inputs "
+                   "(naux = {} vs Np = {}, nc = {} vs {}, C0 = {}, nbnd = {}).",
+                   symc->naux, Np, symc->nc, nc, C0, nbnd);
+    } else {
+      utils::check(nq_w == nq and nk_ext == nk,
+                   "eval_sigma_C: inconsistent axes without a symmetry context "
+                   "(nq_w = {}, nq = {}, nk_ext = {}, nk = {}).", nq_w, nq, nk_ext, nk);
+    }
+    utils::check(Z_qPQ.shape(0) == nq_w and Z_qPQ.shape(1) == Np and Z_qPQ.shape(2) == Np,
                  "eval_sigma_C: Z_qPQ shape mismatch.");
     utils::check(X_skPa.shape(0) == ns and X_skPa.shape(1) == nk and
                  X_skPa.shape(2) == Np and X_skPa.shape(3) == nbnd,
                  "eval_sigma_C: X_skPa shape mismatch.");
     utils::check(C0 >= 0 and C0 + nc <= nbnd and nc > 0,
                  "eval_sigma_C: invalid C window [{}, {}).", C0, C0 + nc);
-    utils::check(Sigma_C_tskab.shape() == (vshape_t<5>{nt, ns, nk, nbnd, nbnd}),
+    utils::check(Sigma_C_tskab.shape() == (vshape_t<5>{nt, ns, nk_ext, nbnd, nbnd}),
                  "eval_sigma_C: Sigma_C_tskab shape mismatch.");
     utils::check(iq_gamma >= 0 and iq_gamma < nq,
                  "eval_sigma_C: invalid iq_gamma = {} (nq = {}).", iq_gamma, nq);
+
+    // rung-transfer access: IBZ storage row + trev(=PQ-transpose) flag + qsymms pos.
+    auto q_access = [&](long iqx) {
+      if (not sym) return std::make_tuple(iqx, false, 0l);
+      return std::make_tuple(symc->q_star(iqx), bool(symc->q_trev(iqx)), symc->q_isym(iqx));
+    };
 
     // ---- backend transforms and grids -----------------------------------
     auto Ttw_ff = ft.Ttw_ff();  // (nt, nw_f)
@@ -210,11 +257,11 @@ namespace vertex_detail {
     }
 
     // ---- W on the bosonic Matsubara nodes --------------------------------
-    // Ww_qwPQ(iq) = Twt_bb * Wt(iq)
-    nda::array<ComplexType, 4> Ww_qwPQ(nq, nw_b, Np, Np);
+    // Ww_qwPQ(iq) = Twt_bb * Wt(iq)  [IBZ rows under symmetry]
+    nda::array<ComplexType, 4> Ww_qwPQ(nq_w, nw_b, Np, Np);
     {
       nda::array<ComplexType, 2> tmp_w(nw_b, Np * Np);
-      for (long iq = 0; iq < nq; ++iq) {
+      for (long iq = 0; iq < nq_w; ++iq) {
         auto Wt2 = nda::reshape(Wt_qtPQ(iq, all, all, all), vshape_t<2>{nt, Np * Np});
         nda::blas::gemm(Twt_bb, Wt2, tmp_w);
         nda::reshape(Ww_qwPQ(iq, all, all, all), vshape_t<2>{nw_b, Np * Np}) = tmp_w;
@@ -272,9 +319,10 @@ namespace vertex_detail {
     nda::array<ComplexType, 2> Q4(nt, nc4), Q4w(nw_b, nc4);
     nda::array<ComplexType, 2> Vi3(nw_b, nbnd * nc3), Vit3(nt, nbnd * nc3), Virefl(nt, nbnd * nc3);
 
-    // rank-local accumulators over combos (isk leading: contiguous per-(s,k) slices)
-    nda::array<ComplexType, 4> AccSw(ns * nk, nw_f, nbnd, nbnd);
-    nda::array<ComplexType, 4> AccSt(ns * nk, nt, nbnd, nbnd);
+    // rank-local accumulators over combos (isk leading: contiguous per-(s,k) slices;
+    // the external k axis is IBZ-resident under symmetry)
+    nda::array<ComplexType, 4> AccSw(ns * nk_ext, nw_f, nbnd, nbnd);
+    nda::array<ComplexType, 4> AccSt(ns * nk_ext, nt, nbnd, nbnd);
     AccSw() = ComplexType(0.0);
     AccSt() = ComplexType(0.0);
 
@@ -286,47 +334,72 @@ namespace vertex_detail {
 
     const long rank = comm.rank();
     const long size = comm.size();
-    const long ncombo = ns * nk * nq;   // (s, k, qx)
+    const long ncombo = ns * nk_ext * nq;   // (s, k in IBZ under symmetry, qx full)
 
     for (long combo = rank; combo < ncombo; combo += size) {
-      const long is  = combo / (nk * nq);
-      const long ik  = (combo / nq) % nk;
+      const long is  = combo / (nk_ext * nq);
+      const long ik  = (combo / nq) % nk_ext;
       const long iqx = combo % nq;
       if (skip_rung_gamma and iqx == iq_gamma) continue;   // v1_skip: drop Gamma on the x-rung
       const long ikmqx = k_minus_q(iqx, ik);
+      auto [qsx, trx, jsx] = q_access(iqx);
 
       auto X_k    = X_skPa(is, ik, all, all);     // (Np, nbnd)
       auto X_kmqx = X_skPa(is, ikmqx, all, all);
 
       // ---- hoisted x-side row pair: e_x = (b @ k [conj], p1 @ k-qx) ------
-      for (long P = 0; P < Np; ++P)
-        for (long b = 0; b < nbnd; ++b)
-          for (long j1 = 0; j1 < nc; ++j1)
-            A_x(P, iX(b, j1)) = std::conj(X_k(P, b)) * X_kmqx(P, C0 + j1);
-      // half_x(m)(Q, e) = sum_P A_x(P,e) W_PQ(qx, m)
+      if (not sym) {
+        for (long P = 0; P < Np; ++P)
+          for (long b = 0; b < nbnd; ++b)
+            for (long j1 = 0; j1 < nc; ++j1)
+              A_x(P, iX(b, j1)) = std::conj(X_k(P, b)) * X_kmqx(P, C0 + j1);
+      } else {
+        // effective columns of the x-rung frame (memo (X-hat)); external b in C
+        auto Xh_k    = symc->Xhat(is, jsx, ik, all, all);
+        auto Xh_kmqx = symc->Xhat(is, jsx, ikmqx, all, all);
+        for (long P = 0; P < Np; ++P)
+          for (long b = 0; b < nbnd; ++b)
+            for (long j1 = 0; j1 < nc; ++j1)
+              A_x(P, iX(b, j1)) = std::conj(Xh_k(P, b)) * Xh_kmqx(P, j1);
+      }
+      // half_x(m)(Q, e) = sum_P A_x(P,e) W_PQ(qs_x, m)
+      // (trev-mapped transfer: PQ-transposed read of the IBZ-stored core, (P2) --
+      //  transpose(W^T) = W, hence the plain-gemm branch)
       for (long m = 0; m < nw_b; ++m) {
-        auto Wm = Ww_qwPQ(iqx, m, all, all);
-        nda::blas::gemm(nda::transpose(Wm), A_x, half_x(m, all, all));
+        auto Wm = Ww_qwPQ(qsx, m, all, all);
+        if (trx) nda::blas::gemm(Wm, A_x, half_x(m, all, all));
+        else     nda::blas::gemm(nda::transpose(Wm), A_x, half_x(m, all, all));
       }
       {
-        auto Zx = Z_qPQ(iqx, all, all);
-        nda::blas::gemm(nda::transpose(Zx), A_x, halfZ_x);
+        auto Zx = Z_qPQ(qsx, all, all);
+        if (trx) nda::blas::gemm(Zx, A_x, halfZ_x);
+        else     nda::blas::gemm(nda::transpose(Zx), A_x, halfZ_x);
       }
 
       for (long iqy = 0; iqy < nq; ++iqy) {
         if (skip_rung_gamma and iqy == iq_gamma) continue; // v1_skip: drop Gamma on the y-rung
         const long ikpqy    = k_minus_q(qminus(iqy), ik);
         const long ikmqxpqy = k_minus_q(qminus(iqy), ikmqx);
+        auto [qsy, try_, jsy] = q_access(iqy);
 
         auto X_kpqy    = X_skPa(is, ikpqy, all, all);
         auto X_kmqxpqy = X_skPa(is, ikmqxpqy, all, all);
 
         // ---- orbital W blocks ------------------------------------------
-        // f_x = (p3 @ k+qy, p3' @ k-qx+qy [conj])
-        for (long Q = 0; Q < Np; ++Q)
-          for (long j3 = 0; j3 < nc; ++j3)
-            for (long j3p = 0; j3p < nc; ++j3p)
-              U_Rx(Q, iG(j3, j3p)) = X_kpqy(Q, C0 + j3) * std::conj(X_kmqxpqy(Q, C0 + j3p));
+        // f_x = (p3 @ k+qy, p3' @ k-qx+qy [conj])  -- legs of the x-rung: frame jsx
+        if (not sym) {
+          for (long Q = 0; Q < Np; ++Q)
+            for (long j3 = 0; j3 < nc; ++j3)
+              for (long j3p = 0; j3p < nc; ++j3p)
+                U_Rx(Q, iG(j3, j3p)) = X_kpqy(Q, C0 + j3) * std::conj(X_kmqxpqy(Q, C0 + j3p));
+        } else {
+          auto Xh_kpqy    = symc->Xhat(is, jsx, ikpqy, all, all);
+          auto Xh_kmqxpqy = symc->Xhat(is, jsx, ikmqxpqy, all, all);
+          for (long Q = 0; Q < Np; ++Q)
+            for (long j3 = 0; j3 < nc; ++j3)
+              for (long j3p = 0; j3p < nc; ++j3p)
+                U_Rx(Q, iG(j3, j3p)) = Xh_kpqy(Q, j3) * std::conj(Xh_kmqxpqy(Q, j3p));
+        }
         for (long m = 0; m < nw_b; ++m) {
           auto Wxm = nda::reshape(Wx_w(m, all), vshape_t<2>{dX, dG});
           nda::blas::gemm(nda::transpose(half_x(m, all, all)), U_Rx, Wxm);
@@ -335,23 +408,41 @@ namespace vertex_detail {
         nda::blas::gemm(nda::transpose(halfZ_x), U_Rx, cx_ef);
 
         // e_y = (a @ k, p2' @ k+qy [conj]);  f_y = (p4 @ k-qx+qy, p4' @ k-qx [conj])
-        for (long P = 0; P < Np; ++P)
-          for (long a = 0; a < nbnd; ++a)
-            for (long j2p = 0; j2p < nc; ++j2p)
-              A_y(P, iX(a, j2p)) = std::conj(X_kpqy(P, C0 + j2p)) * X_k(P, a);
-        for (long Q = 0; Q < Np; ++Q)
-          for (long j4 = 0; j4 < nc; ++j4)
-            for (long j4p = 0; j4p < nc; ++j4p)
-              U_Ry(Q, iG(j4, j4p)) = X_kmqxpqy(Q, C0 + j4) * std::conj(X_kmqx(Q, C0 + j4p));
+        // -- legs of the y-rung: frame jsy
+        if (not sym) {
+          for (long P = 0; P < Np; ++P)
+            for (long a = 0; a < nbnd; ++a)
+              for (long j2p = 0; j2p < nc; ++j2p)
+                A_y(P, iX(a, j2p)) = std::conj(X_kpqy(P, C0 + j2p)) * X_k(P, a);
+          for (long Q = 0; Q < Np; ++Q)
+            for (long j4 = 0; j4 < nc; ++j4)
+              for (long j4p = 0; j4p < nc; ++j4p)
+                U_Ry(Q, iG(j4, j4p)) = X_kmqxpqy(Q, C0 + j4) * std::conj(X_kmqx(Q, C0 + j4p));
+        } else {
+          auto Yh_k        = symc->Xhat(is, jsy, ik, all, all);
+          auto Yh_kpqy     = symc->Xhat(is, jsy, ikpqy, all, all);
+          auto Yh_kmqx     = symc->Xhat(is, jsy, ikmqx, all, all);
+          auto Yh_kmqxpqy  = symc->Xhat(is, jsy, ikmqxpqy, all, all);
+          for (long P = 0; P < Np; ++P)
+            for (long a = 0; a < nbnd; ++a)
+              for (long j2p = 0; j2p < nc; ++j2p)
+                A_y(P, iX(a, j2p)) = std::conj(Yh_kpqy(P, j2p)) * Yh_k(P, a);
+          for (long Q = 0; Q < Np; ++Q)
+            for (long j4 = 0; j4 < nc; ++j4)
+              for (long j4p = 0; j4p < nc; ++j4p)
+                U_Ry(Q, iG(j4, j4p)) = Yh_kmqxpqy(Q, j4) * std::conj(Yh_kmqx(Q, j4p));
+        }
         for (long m = 0; m < nw_b; ++m) {
-          auto Wm = Ww_qwPQ(iqy, m, all, all);
-          nda::blas::gemm(nda::transpose(Wm), A_y, tmp_NpdX);
+          auto Wm = Ww_qwPQ(qsy, m, all, all);
+          if (try_) nda::blas::gemm(Wm, A_y, tmp_NpdX);
+          else      nda::blas::gemm(nda::transpose(Wm), A_y, tmp_NpdX);
           auto Wym = nda::reshape(Wy_w(m, all), vshape_t<2>{dX, dG});
           nda::blas::gemm(nda::transpose(tmp_NpdX), U_Ry, Wym);
         }
         {
-          auto Zy = Z_qPQ(iqy, all, all);
-          nda::blas::gemm(nda::transpose(Zy), A_y, tmp_NpdX);
+          auto Zy = Z_qPQ(qsy, all, all);
+          if (try_) nda::blas::gemm(Zy, A_y, tmp_NpdX);
+          else      nda::blas::gemm(nda::transpose(Zy), A_y, tmp_NpdX);
           nda::blas::gemm(nda::transpose(tmp_NpdX), U_Ry, cy_ef);
         }
         // Wy residues on the aux NONSYM pole basis (x tanh(hw/2))
@@ -780,11 +871,11 @@ namespace vertex_detail {
         for (long n = 0; n < nw_f; ++n)
           for (long a = 0; a < nbnd; ++a)
             for (long b = 0; b < nbnd; ++b)
-              AccSw(is * nk + ik, n, a, b) += Sw_ab(n, a, b);
+              AccSw(is * nk_ext + ik, n, a, b) += Sw_ab(n, a, b);
         for (long it = 0; it < nt; ++it)
           for (long a = 0; a < nbnd; ++a)
             for (long b = 0; b < nbnd; ++b)
-              AccSt(is * nk + ik, it, a, b) += St_ab(it, a, b);
+              AccSt(is * nk_ext + ik, it, a, b) += St_ab(it, a, b);
       }  // iqy
     }  // combo
 
@@ -798,8 +889,8 @@ namespace vertex_detail {
     const double norm = 1.0 / double(nk * nk);   // (1/N_k)^2; the two 1/beta live in the algebra
     {
       nda::array<ComplexType, 2> St(nt, nbnd * nbnd);
-      for (long isk = 0; isk < ns * nk; ++isk) {
-        const long is = isk / nk, ik = isk % nk;
+      for (long isk = 0; isk < ns * nk_ext; ++isk) {
+        const long is = isk / nk_ext, ik = isk % nk_ext;
         auto Sw2 = nda::reshape(AccSw(isk, all, all, all), vshape_t<2>{nw_f, nbnd * nbnd});
         nda::blas::gemm(Ttw_ff, Sw2, St);
         for (long it = 0; it < nt; ++it)
@@ -811,6 +902,25 @@ namespace vertex_detail {
     }
     comm.all_reduce_in_place_n(Sigma_C_tskab.data(), Sigma_C_tskab.size(), std::plus<>{});
 #endif  // ENABLE_DLR
+  }
+
+  /** Historic no-symmetry entry point (kept for existing call sites/tests). */
+  template<nda::MemoryArrayOfRank<5> GArr_t, nda::MemoryArrayOfRank<5> SArr_t>
+  void eval_sigma_C_g3w2_nosym(imag_axes_ft::IAFT const &ft,
+                               mpi3::communicator &comm,
+                               nda::range C_rng,
+                               GArr_t const &G_tskij,
+                               nda::array<ComplexType, 4> const &X_skPa,
+                               nda::array<ComplexType, 4> const &Wt_qtPQ,
+                               nda::array<ComplexType, 3> const &Z_qPQ,
+                               nda::array<long, 2> const &k_minus_q,
+                               nda::array<long, 1> const &qminus,
+                               long iq_gamma,
+                               bool skip_rung_gamma,
+                               SArr_t &&Sigma_C_tskab) {
+    eval_sigma_C_g3w2(ft, comm, C_rng, G_tskij, X_skPa, Wt_qtPQ, Z_qPQ, k_minus_q,
+                      qminus, iq_gamma, skip_rung_gamma, nullptr,
+                      std::forward<SArr_t>(Sigma_C_tskab));
   }
 
 }  // vertex_detail
