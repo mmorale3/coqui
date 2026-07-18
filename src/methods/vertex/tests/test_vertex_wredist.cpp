@@ -155,6 +155,71 @@ TEST_CASE("vertex_wredist_roundtrip", "[methods][vertex][wredist]") {
     world.all_reduce_in_place_n(&ndiff, 1, std::plus<>{});
     REQUIRE(ndiff == 0);
   }
+
+  // ---- M3 item #8: reduce-scatter of a PARTIAL into the RPA grid ---------------------
+  // The Pi^C kernel produces a PARTIAL replicated array on every rank (its round-robin
+  // tuple/q_ext contribution to the WHOLE (t,q,P,Q) array). reduce_scatter_into sums the
+  // partials and lands each output block ONLY on its owner. This test replicates that
+  // exact composition (per-owner MPI_Reduce over gathered block boxes) and pins it against
+  // the serial reference: sum over all ranks of the partials == all_reduce of the partial.
+  // At P=1 it is a bit-identical copy; at P>1 the reduce-scatter must reproduce the
+  // all_reduce result on the owned block (a pure integer/exact-sum data movement here).
+  SECTION("reduce_scatter_into_rpa_grid") {
+    // rank-dependent PARTIAL: part_r(q,t,P,Q) = wref(...) * (r+1). The true sum over all
+    // ranks is wref * sum_{r=0}^{P-1}(r+1) = wref * P*(P+1)/2 -- an exact reference.
+    const long r = world.rank();
+    nda::array<ComplexType, 4> part(nq, nt_half, Np, Np);
+    for (long iq = 0; iq < nq; ++iq)
+      for (long it = 0; it < nt_half; ++it)
+        for (long ip = 0; ip < Np; ++ip)
+          for (long jq = 0; jq < Np; ++jq)
+            part(iq, it, ip, jq) =
+                wref(iq, it, ip, jq, Np) * ComplexType(double(r + 1));
+    const double sum_scale = double(P) * double(P + 1) / 2.0;   // sum_{r=1}^{P}(r)
+
+    // target on the RPA grid (t pooled, q unsplit, PxQ split) -- exactly eval_Pi_C's dPi_C.
+    auto dPi = make(src_grid);
+    dPi.local() = ComplexType(0.0);
+
+    // === the reduce_scatter_into composition (mirrors vertex_redist_detail) ===
+    std::array<long, 8> mine{};
+    for (int d = 0; d < 4; ++d) { mine[d] = dPi.origin()[d]; mine[4 + d] = dPi.local_shape()[d]; }
+    nda::array<long, 2> boxes(P, 8);
+    world.all_gather_n(mine.data(), 8, boxes.data());
+    for (long rr = 0; rr < P; ++rr) {
+      nda::range b0(boxes(rr, 0), boxes(rr, 0) + boxes(rr, 4));
+      nda::range b1(boxes(rr, 1), boxes(rr, 1) + boxes(rr, 5));
+      nda::range b2(boxes(rr, 2), boxes(rr, 2) + boxes(rr, 6));
+      nda::range b3(boxes(rr, 3), boxes(rr, 3) + boxes(rr, 7));
+      nda::array<ComplexType, 4> buf = part(b0, b1, b2, b3);
+      world.reduce_in_place_n(buf.data(), buf.size(), std::plus<>{}, int(rr));
+      if (rr == r) dPi.local() = buf;
+    }
+
+    // verify the owned block == wref * sum_scale (exact reduce-scatter result).
+    auto loc = dPi.local();
+    auto [q0, t0, P0, Q0] = dPi.origin();
+    auto ls = dPi.local_shape();
+    long bad = 0;
+    double worst = 0.0;
+    for (long iq = 0; iq < ls[0]; ++iq)
+      for (long it = 0; it < ls[1]; ++it)
+        for (long ip = 0; ip < ls[2]; ++ip)
+          for (long jq = 0; jq < ls[3]; ++jq) {
+            ComplexType ref = wref(q0 + iq, t0 + it, P0 + ip, Q0 + jq, Np) *
+                              ComplexType(sum_scale);
+            double d = std::abs(loc(iq, it, ip, jq) - ref);
+            worst = std::max(worst, d);
+            if (d > 1e-11 * std::max(std::abs(ref), 1e-30)) ++bad;
+          }
+    world.all_reduce_in_place_n(&bad, 1, std::plus<>{});
+    world.all_reduce_in_place_n(&worst, 1, boost::mpi3::max<>{});
+    REQUIRE(bad == 0);
+    if (world.root())
+      app_log(1, "vertex_reduce_scatter[P={}]: partial (rank-scaled) reduce-scattered into "
+                 "the RPA grid == serial sum on every owned block (max|diff| = {}).",
+              P, worst);
+  }
 }
 
 } // namespace bdft_tests

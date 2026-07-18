@@ -50,8 +50,11 @@
  * warning in generate_dmatrix.
  */
 
+#include <memory>
+
 #include "configuration.hpp"
 #include "nda/nda.hpp"
+#include "numerics/shared_array/nda.hpp"
 
 namespace methods {
 namespace solvers {
@@ -75,8 +78,16 @@ namespace vertex_sym {
     // momentum rotation map: krot(js, k) = ks_to_k(js, k) (full-BZ, symmetry.hpp:564)
     nda::array<long, 2> krot;
 
-    // effective C-window collocation columns: (ns, nsym, nk_full, naux, nc)
-    nda::array<ComplexType, 5> Xhat;
+    // effective C-window collocation columns: (ns, nsym, nk_full, naux, nc).
+    // NODE-SHARED (vertex parallelization M3, change-list item #9): the storage is a
+    // per-NUMA-node shared_array (one copy per node, not per rank -- this is the large
+    // sym member, ns*nsym*nk_full*naux*nc); `Xhat` is a VIEW into that window so all
+    // consumers keep the historic `ctx.Xhat(is, jsym, k, all, all)` access unchanged.
+    // The shared_array lives behind a shared_ptr so its MPI window has a STABLE address
+    // and the view survives the `slot = std::move(ctx)` into the optional. On a single
+    // rank per node this is bit-identical to the former replicated nda::array.
+    std::shared_ptr<math::shm::shared_array<nda::array_view<ComplexType, 5>>> Xhat_shm;
+    nda::array_view<ComplexType, 5> Xhat;
 
     // C-window D blocks Dc(js, k, a, j) (js >= 1; identity slot unused) and the
     // conjugation flags from symmetry_rotation (true for trev k) -- kept for the

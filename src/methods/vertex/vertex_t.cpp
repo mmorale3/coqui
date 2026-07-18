@@ -121,6 +121,45 @@ namespace solvers {
       return W_qtPQ;
     }
 
+    /**
+     * REDUCE-SCATTER (vertex parallelization M3, change-list item #8;
+     * notes/vertex_parallelization_M3.md). The Pi^C kernel produces a PARTIAL replicated
+     * `part` (each rank holds its round-robin tuple/q_ext contribution to the WHOLE
+     * (t, q, P, Q) array). The RPA output grid dPi splits t (ntpools) and P,Q (np_P x
+     * np_Q) but NOT q, so every output block is owned by exactly ONE rank. The correct
+     * sum-scatter is therefore a reduce onto each block owner -- an MPI_Reduce_scatter,
+     * which the mpi3 wrapper lacks, so it is composed from per-owner MPI_Reduce.
+     *
+     * This REPLACES the former "all_reduce the full Pi_wqMN + build full replicated
+     * Pi_up/Pi_tqMN + copy the local block": no full-array all_reduce, and only ONE
+     * transient full `part` (freed by the caller) + the owned block survive.
+     *
+     * `part` is the FULL-shape partial (upfolded + tau-converted on the partial -- valid
+     * because upfold+tau are LINEAR and commute with the rank sum). dPi.local() receives
+     * the summed owned block. rank r gets sum_over_ranks part[block_r]. On one rank this
+     * is a bit-identical copy.
+     */
+    template<typename dArray_t, typename comm_t>
+    void reduce_scatter_into(nda::array<ComplexType, 4> const& part, dArray_t& dPi,
+                             comm_t& comm) {
+      const long np = comm.size();
+      // gather every rank's owned block (origin[4] + local_shape[4]) -- 8 longs each.
+      std::array<long, 8> mine{};
+      for (int d = 0; d < 4; ++d) { mine[d] = dPi.origin()[d]; mine[4 + d] = dPi.local_shape()[d]; }
+      nda::array<long, 2> boxes(np, 8);
+      comm.all_gather_n(mine.data(), 8, boxes.data());
+      for (long r = 0; r < np; ++r) {
+        nda::range r0(boxes(r, 0), boxes(r, 0) + boxes(r, 4));
+        nda::range r1(boxes(r, 1), boxes(r, 1) + boxes(r, 5));
+        nda::range r2(boxes(r, 2), boxes(r, 2) + boxes(r, 6));
+        nda::range r3(boxes(r, 3), boxes(r, 3) + boxes(r, 7));
+        // contiguous copy of r's block from THIS rank's partial, reduce onto root r.
+        nda::array<ComplexType, 4> buf = part(r0, r1, r2, r3);
+        comm.reduce_in_place_n(buf.data(), buf.size(), std::plus<>{}, int(r));
+        if (r == comm.rank()) dPi.local() = buf;
+      }
+    }
+
   } // vertex_redist_detail
 
   /**
@@ -588,14 +627,28 @@ namespace solvers {
     }
 
     // ---- effective columns Xhat + C-window D blocks + leakage diagnostic -------------
-    ctx.Xhat = nda::array<ComplexType, 5>(ctx.ns, ctx.nsym, ctx.nk_full, ctx.naux, nc);
+    // M3 item #9 (notes/vertex_parallelization_M3.md): Xhat is NODE-SHARED (one copy per
+    // NUMA node) and the (js, ik) build loop is DISTRIBUTED across node_comm -- each
+    // (js, ik) tile is computed on exactly one node-rank and written into the shared
+    // window (a partition => GATHER, bit-identical to the former serial replicated build).
+    // Dc/cjg stay per-rank (small: nsym*nk*nc^2) but are ALSO filled only on the owning
+    // rank and node-gathered (zero-init + all_reduce = exact). The leakage scalars are a
+    // per-(js,ik) sum, node-reduced. On one rank per node this is bit-identical.
+    auto mpi = thc.mpi();
+    ctx.Xhat_shm = std::make_shared<math::shm::shared_array<nda::array_view<ComplexType, 5>>>(
+        math::shm::make_shared_array<nda::array_view<ComplexType, 5>>(
+            *mpi, std::array<long, 5>{ctx.ns, ctx.nsym, ctx.nk_full, ctx.naux, nc}));
+    ctx.Xhat.rebind(ctx.Xhat_shm->local());   // ctor zero-inits; identity slot filled below
     ctx.Dc = nda::array<ComplexType, 4>(ctx.nsym, ctx.nk_full, nc, nc);
     ctx.Dc() = ComplexType(0.0);
     ctx.cjg = nda::array<bool, 2>(ctx.nsym, ctx.nk_full);
     ctx.cjg() = false;
-    for (long is = 0; is < ctx.ns; ++is)
-      for (long ik = 0; ik < ctx.nk_full; ++ik)
+    // identity slot js = 0: node-shared write, sharded over node_comm ranks by ik.
+    ctx.Xhat_shm->win().fence();
+    for (long ik = mpi->node_comm.rank(); ik < ctx.nk_full; ik += mpi->node_comm.size())
+      for (long is = 0; is < ctx.ns; ++is)
         ctx.Xhat(is, 0, ik, all, all) = X_w(is, ik, all, all);
+    ctx.Xhat_shm->win().fence();
 
     double leak_max = 0.0, leak_sum = 0.0;
     long leak_cnt = 0;
@@ -608,8 +661,14 @@ namespace solvers {
       E() = ComplexType(0.0);
       for (long j = 0; j < nW; ++j) E(C0_global + j, j) = ComplexType(1.0);
       using math::sparse::csrmm;
-      for (long js = 1; js < ctx.nsym; ++js) {
-        for (long ik = 0; ik < ctx.nk_full; ++ik) {
+      // distribute the (js, ik) tiles (js >= 1) over node_comm; write Xhat into the shared
+      // window, Dc/cjg into the (zeroed) per-rank arrays -- each tile touched once.
+      ctx.Xhat_shm->win().fence();
+      const long njk = (ctx.nsym - 1) * ctx.nk_full;
+      for (long jk = mpi->node_comm.rank(); jk < njk; jk += mpi->node_comm.size()) {
+        const long js = 1 + jk / ctx.nk_full;
+        const long ik = jk % ctx.nk_full;
+        {
           auto [cj, Dsp] = MF->symmetry_rotation(js, ik);
           ctx.cjg(js, ik) = cj;
           csrmm(ComplexType(1.0), *Dsp, E, ComplexType(0.0), Dcols);
@@ -678,6 +737,22 @@ namespace solvers {
           }
         }
       }
+      ctx.Xhat_shm->win().fence();   // publish the node-shared Xhat tiles
+    }
+    // node-gather Dc/cjg (each tile written on one rank; zero-init + sum = exact GATHER)
+    // and reduce the leakage scalars over the node (a diagnostic sum -- no gate).
+    if (mpi->node_comm.size() > 1) {
+      mpi->node_comm.all_reduce_in_place_n(ctx.Dc.data(), ctx.Dc.size(), std::plus<>{});
+      // cjg is bool; reduce via an int scratch with logical OR (each tile set once)
+      nda::array<int, 2> cjg_i(ctx.nsym, ctx.nk_full);
+      for (long a = 0; a < ctx.nsym; ++a)
+        for (long b = 0; b < ctx.nk_full; ++b) cjg_i(a, b) = ctx.cjg(a, b) ? 1 : 0;
+      mpi->node_comm.all_reduce_in_place_n(cjg_i.data(), cjg_i.size(), std::plus<>{});
+      for (long a = 0; a < ctx.nsym; ++a)
+        for (long b = 0; b < ctx.nk_full; ++b) ctx.cjg(a, b) = (cjg_i(a, b) != 0);
+      leak_max = mpi->node_comm.all_reduce_value(leak_max, boost::mpi3::max<>{});
+      leak_sum = mpi->node_comm.all_reduce_value(leak_sum, std::plus<>{});
+      leak_cnt = mpi->node_comm.all_reduce_value(leak_cnt, std::plus<>{});
     }
     ctx.leak_max = leak_max;
     ctx.leak_mean = (leak_cnt > 0) ? leak_sum / double(leak_cnt) : 0.0;
@@ -903,15 +978,28 @@ namespace solvers {
     // (numerically equivalent, better conditioned: rcond acts on sv(B); the metric
     // s = B^dag B is thereby regularized at rcond^2). The explicit s^{-1} is REQUIRED:
     // the code's THC body contractions are metric-free (coqui_conventions_confirmed.md).
+    //
+    // M3 item #6 (notes/vertex_parallelization_M3.md): the per-q gelss solve was
+    // FULLY SERIAL AND REDUNDANT (every rank formed the full Npair-row B/C and solved
+    // ALL q identically). Distribute the q loop over mpi->comm -- each rank solves its
+    // q subset (round-robin), zero-init _t_qmP, then a single all_reduce(plus) GATHERS
+    // the rows (a partition: each q written by exactly one rank => bit-identical to the
+    // former serial solve for each q, only WHICH rank computed it changes). Per-rank
+    // solve work (gelss calls) drops ~1/P. _t_qmP stays replicated (its all-q consumers
+    // -- Pi upfold, Sigma, cache_w -- loop every IBZ q); the redundant SOLVE was the
+    // actionable win. Diagnostics (cond/fit/disc maxima) are reduced with max.
     _t_qmP = nda::array<ComplexType, 3>(nqpts, _Nm, Np);
+    _t_qmP() = ComplexType(0.0);
     double cond_s_max = 0.0, fit_max = 0.0;
     long disc_max = 0;
+    long my_nsolve = 0;
     {
       nda::array<ComplexType, 2> B_Im(Npair, _Nm), C_IP(Npair, Np);
       // gelss needs F-layout: keep the TRANSPOSES in C-layout and pass transposed views
       nda::array<ComplexType, 2> BT(_Nm, Npair), CT(Np, Npair), Cf(Npair, Np);
       nda::array<double, 1> sv(std::min(Npair, _Nm));
-      for (long iq = 0; iq < nqpts; ++iq) {
+      for (long iq = mpi->comm.rank(); iq < nqpts; iq += mpi->comm.size()) {
+        ++my_nsolve;
         vertex_secondary_detail::build_pair_matrix(_Xb_skma, 0, nc, kmq, iq, B_Im);
         vertex_secondary_detail::build_pair_matrix(X_glob, orb0, nc, kmq, iq, C_IP);
         for (long I = 0; I < Npair; ++I) {
@@ -947,10 +1035,20 @@ namespace solvers {
         fit_max = std::max(fit_max, fit);
       }
     }
+    // M3 item #6: GATHER the q-distributed t(q) rows (partition => exact, bit-identical
+    // per q to the serial solve) and reduce the diagnostics across ranks.
+    mpi->comm.all_reduce_in_place_n(_t_qmP.data(), _t_qmP.size(), std::plus<>{});
+    cond_s_max = mpi->comm.all_reduce_value(cond_s_max, boost::mpi3::max<>{});
+    fit_max    = mpi->comm.all_reduce_value(fit_max, boost::mpi3::max<>{});
+    disc_max   = mpi->comm.all_reduce_value(disc_max, boost::mpi3::max<>{});
+    const long total_solve = mpi->comm.all_reduce_value(my_nsolve, std::plus<>{});
     app_log(1, "  Refinement 2 secondary basis READY: N_m = {} (pair rank {} per q), "
                "max_q cond(s) = {},\n"
-               "  max_q discarded sv = {}, max_q fit residual ||Bt - C||_F/||C||_F = {}\n",
-            _Nm, Npair, cond_s_max, disc_max, fit_max);
+               "  max_q discarded sv = {}, max_q fit residual ||Bt - C||_F/||C||_F = {}\n"
+               "  t(q) solve distributed over {} ranks: this rank ran {} of {} gelss "
+               "solves (~1/P work)\n",
+            _Nm, Npair, cond_s_max, disc_max, fit_max,
+            mpi->comm.size(), my_nsolve, total_solve);
     _secondary_ready = true;
   }
 
@@ -1719,7 +1817,12 @@ namespace solvers {
                                    kmq, kpq, nda::range(0, nc), Pi_wqMN,
                                    mpi->comm.rank(), mpi->comm.size(),
                                    skip_rung_gamma, &qx_diag, symc);
-    mpi->comm.all_reduce_in_place_n(Pi_wqMN.data(), Pi_wqMN.size(), std::plus<>{});
+    // M3 item #8 (notes/vertex_parallelization_M3.md): DO NOT all_reduce the full partial
+    // Pi_wqMN. It is a PARTIAL (this rank's round-robin tuple/q_ext contribution); the
+    // upfold (t^dag Pibar t) and the tau conversion are LINEAR and commute with the rank
+    // sum, so they are applied to the PARTIAL and the result is REDUCE-SCATTERED directly
+    // into the RPA grid (reduce_scatter_into). This removes the full-array all_reduce and
+    // the persistent full replicated Pi_up / Pi_tqMN. Only qx_diag (tiny) is all_reduced.
     mpi->comm.all_reduce_in_place_n(qx_diag.data(), qx_diag.size(), std::plus<>{});
 
     // per-qx rung diagnostics (sum of rank-local maxima -- order-of-magnitude indicator
@@ -1742,56 +1845,70 @@ namespace solvers {
               iqg, g_val, other);
     }
 
-    // ---- Refinement 2: upfold Pi^C = t^dag Pibar^C t (Eq. 38) + no-leak tripwire ------
+    // ---- no-leak tripwire (Eq. 39; DIAGNOSTIC, no gate) -- needs the REDUCED Pi ---------
+    // The tripwire compares upfolded-vs-downfolded traces at the nu = 0 node, which needs
+    // the SUMMED Pi_bar. all_reduce ONLY the m0 slice (nq * naux^2 -- small), upfold that
+    // one slice, and check. This keeps the diagnostic exact without reducing the full array.
     if (sec) {
-      nda::array<ComplexType, 4> Pi_up(tools.nw_b, nqpts_ibz, Np, Np);
-      nda::array<ComplexType, 2> tmp(Np, _Nm);
+      nda::array<ComplexType, 3> Pibar_m0(nqpts_ibz, _Nm, _Nm);
+      Pibar_m0() = Pi_wqMN(tools.m0, all, all, all);
+      mpi->comm.all_reduce_in_place_n(Pibar_m0.data(), Pibar_m0.size(), std::plus<>{});
+      nda::array<ComplexType, 2> Pi_up0(Np, Np), tmp(Np, _Nm);
       double leak_max = 0.0;
       for (long iq = 0; iq < nqpts_ibz; ++iq) {
-        auto t_q = _t_qmP(iq, all, all);
-        for (long l = 0; l < tools.nw_b; ++l)
-          vertex_secondary_detail::upfold_core(t_q, Pi_wqMN(l, iq, all, all), tmp,
-                                               Pi_up(l, iq, all, all));
-        // no-leak (Eq. 39) at the nu = 0 node, against the bare core (always present):
-        // sum_MN [t^dag Pibar t]_MN Z_NM must equal sum_mn Pibar_mn Zbar_nm EXACTLY --
-        // a residual here means a transposition/conjugation bug in t or the upfold.
+        vertex_secondary_detail::upfold_core(_t_qmP(iq, all, all), Pibar_m0(iq, all, all),
+                                             tmp, Pi_up0);
         ComplexType S_up(0.0), S_bar(0.0);
         for (long M = 0; M < Np; ++M)
-          for (long N = 0; N < Np; ++N)
-            S_up += Pi_up(tools.m0, iq, M, N) * Z_qPQ(iq, N, M);
+          for (long N = 0; N < Np; ++N) S_up += Pi_up0(M, N) * Z_qPQ(iq, N, M);
         for (long m = 0; m < _Nm; ++m)
-          for (long n = 0; n < _Nm; ++n)
-            S_bar += Pi_wqMN(tools.m0, iq, m, n) * Zb_qmm(iq, n, m);
+          for (long n = 0; n < _Nm; ++n) S_bar += Pibar_m0(iq, m, n) * Zb_qmm(iq, n, m);
         leak_max = std::max(leak_max, std::abs(S_up - S_bar) /
                                       std::max(std::abs(S_bar), 1e-300));
       }
       app_log(2, "  Refinement 2 no-leak residual (Eq. 39; nu = 0 node, bare-Z pairing): "
                  "max_q = {}", leak_max);
-      Pi_wqMN = std::move(Pi_up);
     }
 
-    // ---- to the code's tau storage convention -----------------------------------------
+    // ---- upfold (secondary) + tau conversion ON THE PARTIAL (linear -> commutes with the
+    //      rank sum), then REDUCE-SCATTER into the RPA grid (M3 item #8) ------------------
     nda::array<ComplexType, 4> Pi_tqMN(nt_half, nqpts_ibz, Np, Np);
-    vertex_pi::pi_w_to_code_tau(*_ft, tools, Pi_wqMN, Pi_tqMN);
+    if (sec) {
+      // upfold the PARTIAL Pi_bar -> partial Pi_up (Np x Np), then tau-convert the partial
+      nda::array<ComplexType, 4> Pi_up(tools.nw_b, nqpts_ibz, Np, Np);
+      nda::array<ComplexType, 2> tmp(Np, _Nm);
+      for (long iq = 0; iq < nqpts_ibz; ++iq)
+        for (long l = 0; l < tools.nw_b; ++l)
+          vertex_secondary_detail::upfold_core(_t_qmP(iq, all, all), Pi_wqMN(l, iq, all, all),
+                                               tmp, Pi_up(l, iq, all, all));
+      vertex_pi::pi_w_to_code_tau(*_ft, tools, Pi_up, Pi_tqMN);
+    } else {
+      vertex_pi::pi_w_to_code_tau(*_ft, tools, Pi_wqMN, Pi_tqMN);
+    }
+
+    // reduce-scatter the partial Pi_tqMN into the caller's RPA-distributed layout: every
+    // output block is summed across ranks and lands ONLY on its owner (no full-array
+    // all_reduce, no persistent full replicated result -- only the transient partial +
+    // the owned block). On one rank this is a bit-identical copy.
+    auto dPi_C_tqPQ = math::nda::make_distributed_array<memory::array<HOST_MEMORY, ComplexType, 4>>(
+        mpi->comm, pi_pgrid, pi_gshape, pi_bsize);
+    vertex_redist_detail::reduce_scatter_into(Pi_tqMN, dPi_C_tqPQ, mpi->comm);
 
     {
+      // NaN/Inf guard on THIS rank's owned block (the full array is no longer materialized)
       double max_abs = 0.0;
       long n_bad = 0;
-      for (auto const& v : Pi_tqMN) {
+      for (auto const& v : dPi_C_tqPQ.local()) {
         double a = std::abs(v);
         if (not std::isfinite(a)) { ++n_bad; continue; }
         max_abs = std::max(max_abs, a);
       }
+      n_bad = mpi->comm.all_reduce_value(n_bad, std::plus<>{});
+      max_abs = mpi->comm.all_reduce_value(max_abs, boost::mpi3::max<>{});
       utils::check(n_bad == 0,
                    "vertex_t::eval_Pi_C: Pi^C contains {} NaN/Inf entries -- aborting.", n_bad);
       app_log(2, "  Pi^C(tau) max|.| = {}\n", max_abs);
     }
-
-    // ---- scatter into the caller's distributed layout ---------------------------------
-    auto dPi_C_tqPQ = math::nda::make_distributed_array<memory::array<HOST_MEMORY, ComplexType, 4>>(
-        mpi->comm, pi_pgrid, pi_gshape, pi_bsize);
-    dPi_C_tqPQ.local() = Pi_tqMN(dPi_C_tqPQ.local_range(0), dPi_C_tqPQ.local_range(1),
-                                 dPi_C_tqPQ.local_range(2), dPi_C_tqPQ.local_range(3));
     mpi->comm.barrier();
 
     return dPi_C_tqPQ;
@@ -1943,11 +2060,18 @@ namespace solvers {
         }
       }
 
-      for (long iq = 0; iq < nqpts_ibz; ++iq) {
+      // M3 item #7 (notes/vertex_parallelization_M3.md): the per-q tau_to_w_PHsym
+      // transform was SERIAL AND REDUNDANT on every rank. Distribute over mpi->comm
+      // (each rank transforms its q subset), then GATHER W_wq (zero-init + all_reduce =
+      // exact partition gather; the eta diagnostic below reads the full-q W_wq). The fold
+      // is likewise distributed below. Per-rank transform+fold WORK drops ~1/P.
+      W_wq() = ComplexType(0.0);
+      for (long iq = mpi->comm.rank(); iq < nqpts_ibz; iq += mpi->comm.size()) {
         auto W_t = W_qtPQ(iq, nda::ellipsis{});
         auto W_w = W_wq(iq, nda::ellipsis{});
         _ft->tau_to_w_PHsym(W_t, W_w);
       }
+      mpi->comm.all_reduce_in_place_n(W_wq.data(), W_wq.size(), std::plus<>{});
     }
 
     // ---- eta(q) diagnostics on the rung ACTUALLY cached (test-scale gate) ------------
@@ -1972,13 +2096,25 @@ namespace solvers {
     //  mirrored nu points are pure copies, reconstructed at consumption)
     _Wb_qwmm.emplace(nda::array<ComplexType, 4>(nqpts_ibz, nw_half, _Nm, _Nm));
     {
+      // M3 item #7: distribute the per-q fold over mpi->comm; each q is folded on exactly
+      // ONE rank (so the fold reduction is byte-identical to serial FOR THAT q -- no
+      // per-q reassociation), then GATHER (zero-init + all_reduce = exact partition). The
+      // ONLY reduction is the zero-padded gather (bit-identical). Per-rank fold work ~1/P.
+      _Wb_qwmm.value()() = ComplexType(0.0);
       nda::array<ComplexType, 2> tmp(_Nm, Np);
-      for (long iq = 0; iq < nqpts_ibz; ++iq) {
+      long my_nfold = 0;
+      for (long iq = mpi->comm.rank(); iq < nqpts_ibz; iq += mpi->comm.size()) {
+        ++my_nfold;
         auto t_q = _t_qmP(iq, all, all);
         for (long lp = 0; lp < nw_half; ++lp)
           vertex_secondary_detail::fold_core(t_q, W_wq(iq, lp, all, all), tmp,
                                              _Wb_qwmm.value()(iq, lp, all, all));
       }
+      mpi->comm.all_reduce_in_place_n(_Wb_qwmm.value().data(), _Wb_qwmm.value().size(),
+                                      std::plus<>{});
+      const long total_fold = mpi->comm.all_reduce_value(my_nfold, std::plus<>{});
+      app_log(2, "  Refinement 2 W-bar fold distributed over {} ranks: this rank folded "
+                 "{} of {} q-points (~1/P work).", mpi->comm.size(), my_nfold, total_fold);
     }
 
     // ---- footprint: the memory point of the exercise ---------------------------------
@@ -1986,7 +2122,8 @@ namespace solvers {
     const double cache_mb = double(nqpts_ibz) * double(nw_half) * double(_Nm) * double(_Nm) * to_mb;
     const double dw_mb = double(nqpts_ibz) * double(nt_half) * double(Np) * double(Np) * to_mb;
     app_log(2, "  Refinement 2 W-bar cache FILLED: (nq, nw_half, N_m, N_m) = "
-               "({}, {}, {}, {}) = {:.3f} MB (replicated)\n"
+               "({}, {}, {}, {}) = {:.3f} MB (replicated store; fold WORK distributed "
+               "over q, M3 item #7)\n"
                "  vs the retained dW it replaces: (nq, nt_half, Np, Np) = "
                "({}, {}, {}, {}) = {:.3f} MB -- ratio {:.3e}\n",
             nqpts_ibz, nw_half, _Nm, _Nm, cache_mb,
