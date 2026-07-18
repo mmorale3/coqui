@@ -457,6 +457,35 @@ namespace vertex_pi {
 
     long ntuples = ns * nk * nq;
 
+    // ---- M2 item #4: 2D rank split (tuple axis) x (q_ext axis) -----------------------
+    // The (s,k,qx) tuple axis is round-robin over the combo grid (as today); the inner
+    // external-q loop (iq in nq_ext -- the untapped N_qIBZ-sized parallelism, spec
+    // section 3.3) is additionally split across a q_ext grid. Each rank accumulates a
+    // PARTIAL Pi_wqMN over its (tuple, q_ext) subset; the driver's final all_reduce sums
+    // the partials -- associative, so the per-tile twisted-pair pole algebra is
+    // byte-identical and only the q_ext/tuple reduction order changes (~1e-11 rel).
+    // Factorization mirrors eval_sigma_C: pour ranks onto the (large) tuple axis first,
+    // spilling the remainder onto q_ext, so on the target regime (ntuples >> nproc)
+    // qext_size == 1 and this is bit-identical to the historic 1D tuple RR.
+    long qext_size = 1, tup_size = nproc;
+    {
+      for (long d = 1; d <= nproc; ++d) {
+        if (nproc % d != 0) continue;
+        long ts = nproc / d;
+        if (ts <= ntuples and d <= nq_ext) { qext_size = d; tup_size = ts; break; }
+      }
+      if (tup_size > ntuples) {
+        for (long d = nproc; d >= 1; --d) {
+          if (nproc % d != 0) continue;
+          if (d <= nq_ext) { qext_size = d; tup_size = nproc / d; break; }
+        }
+      }
+    }
+    const long tup_rank  = rank / qext_size;   // which (s,k,qx) tuples this rank owns
+    const long qext_rank = rank % qext_size;   // which q_ext subset this rank owns
+    app_log(3, "pi_c_accumulate_w: rank split nproc = {} -> tup_size = {} x qext_size = {} "
+               "(ntuples = {}, nq_ext = {})", nproc, tup_size, qext_size, ntuples, nq_ext);
+
     // ---------------- helper: rung collocations + orbital-projected rung ----------------
     // Under symmetry the four rung legs use the effective columns Xhat(is, jsym, kL)
     // (rotation to the IBZ transfer frame + trev-leg conj; memo (X-hat)); the leg
@@ -525,14 +554,14 @@ namespace vertex_pi {
       nda::array<ComplexType, 2> b41(nw_b, Nb2 * Np), b23(nw_b, Nb2 * Np);
       nda::array<ComplexType, 2> wbarZ(Nb2, Nb2), wZmat(Nb2, Nb2);
       nda::array<ComplexType, 2> ThZ(Nb2, Np);
-      for (long tup = rank; tup < ntuples; tup += nproc) {
+      for (long tup = tup_rank; tup < ntuples; tup += tup_size) {
         long is = tup / (nk * nq);
         long ik = (tup / nq) % nk;
         long iqx = tup % nq;
         if (skip_rung_gamma and iqx == iq_gamma) continue;
         long ikmqx = kmq(iqx, ik);
         auto [qsx, trx, jsx] = q_access(iqx);
-        for (long iq = 0; iq < nq_ext; ++iq) {
+        for (long iq = qext_rank; iq < nq_ext; iq += qext_size) {
           long ikpq = kpq(iq, ik);
           long ikxq = kmq(iqx, ikpq);
           build_U(is, ik, ikmqx, ikpq, ikxq, jsx);
@@ -602,12 +631,18 @@ namespace vertex_pi {
 
     // work arrays for the m-loop
     nda::array<ComplexType, 3> kap0, kap1;
-    // pair caches over (spin, k', q): components 0/1 of T-type and M-type pairs
-    // T pair at (k,q):  cA = cL(k) [zL4], cB = cR(k+q) [zR1, shifted slot]
-    // M pair at (k',q): cA = cR(k') [zR3] viewed with d1 = M...  (see build below)
-    nda::array<ComplexType, 6> T0(ns, nk, nq_ext, nt, Nb2, Np), T1(ns, nk, nq_ext, nt, Nb2, Np);
-    nda::array<ComplexType, 6> M0(ns, nk, nq_ext, nt, Nb2, Np), M1(ns, nk, nq_ext, nt, Nb2, Np);
-    nda::array<ComplexType, 3> pcomp;
+
+    // ---- M2 item #4: recompute pair caches PER TILE (kills the #1 memory wall) --------
+    // OLD: T0/T1/M0/M1 sized (ns, nk, nq_ext, nt, Nb2, Np) -- built for ALL (is,ik,iq)
+    // and REPLICATED on every rank inside the m-loop = 4*ns*nk*nq_ext*nt*Nb2*Np complex,
+    // rebuilt nw_b times. That store dominated per-rank memory (analysis section 1.2b).
+    // NEW: hold only the current tile's four pair components (nt, Nb2, Np) each -- ONE
+    // TILE LIVE. Per (owned tuple, owned q_ext, m) build exactly the T-pair at (is,ik,iq)
+    // and the M-pair at (is,ikmqx,iq) this tile consumes, then contract immediately.
+    // The pole algebra (build_pair_component / build_kappa) is BYTE-IDENTICAL per tile ->
+    // twisted-pair exactness preserved; only the reduction of tile partials reorders.
+    nda::array<ComplexType, 3> Tt0(nt, Nb2, Np), Tt1(nt, Nb2, Np);
+    nda::array<ComplexType, 3> Mt0(nt, Nb2, Np), Mt1(nt, Nb2, Np);
 
     nda::array<ComplexType, 3> wbarD(nw_b, Nb2, Nb2);
     nda::array<ComplexType, 2> wq_flat(nw_b, Nb2 * Nb2);
@@ -620,49 +655,51 @@ namespace vertex_pi {
     // reuse build_pair_component with cA'(p, M, p1) := cR3_p(p1, M), cB'(q, p3', M) := cL2_q(M, p3')
     nda::array<ComplexType, 3> cAp(np, Np, Nb), cBp(np, Nb, Np);
 
-    for (long m = 0; m < nw_b; ++m) {
-      tools.build_kappa(m, kap0, kap1);
-
-      // ---- build all pair components for this m --------------------------------------
-      for (long is = 0; is < ns; ++is)
-        for (long ik2 = 0; ik2 < nk; ++ik2)
-          for (long iq = 0; iq < nq_ext; ++iq) {
-            long ik2pq = kpq(iq, ik2);
-            // T pair: rows (p1', p3): cA = cL(ik2) (aux N), cB = cR(ik2pq)
-            detail::build_pair_component(kap0, cL(is, ik2, nda::ellipsis{}),
-                                         cR(is, ik2pq, nda::ellipsis{}), pcomp);
-            T0(is, ik2, iq, nda::ellipsis{}) = pcomp;
-            detail::build_pair_component(kap1, cL(is, ik2, nda::ellipsis{}),
-                                         cR(is, ik2pq, nda::ellipsis{}), pcomp);
-            T1(is, ik2, iq, nda::ellipsis{}) = pcomp;
-            // M pair: rows (p1, p3'): cA'(p,M,p1) = cR(ik2)(p,p1,M); cB'(q,p3',M) = cL(ik2pq)(q,M,p3')
-            for (long p = 0; p < np; ++p)
-              for (long M = 0; M < Np; ++M)
-                for (long j = 0; j < Nb; ++j) {
-                  cAp(p, M, j) = cR(is, ik2, p, j, M);
-                  cBp(p, j, M) = cL(is, ik2pq, p, M, j);
-                }
-            detail::build_pair_component(kap0, cAp, cBp, pcomp);
-            M0(is, ik2, iq, nda::ellipsis{}) = pcomp;
-            detail::build_pair_component(kap1, cAp, cBp, pcomp);
-            M1(is, ik2, iq, nda::ellipsis{}) = pcomp;
+    // Build the two pair components (kappa0- and kappa1-weighted) of the T pair at
+    // (is,ik2,iq): rows (p1', p3), cA = cL(ik2) (aux N), cB = cR(ik2pq).
+    auto build_T_tile = [&](long is, long ik2, long iq) {
+      long ik2pq = kpq(iq, ik2);
+      detail::build_pair_component(kap0, cL(is, ik2, nda::ellipsis{}),
+                                   cR(is, ik2pq, nda::ellipsis{}), Tt0);
+      detail::build_pair_component(kap1, cL(is, ik2, nda::ellipsis{}),
+                                   cR(is, ik2pq, nda::ellipsis{}), Tt1);
+    };
+    // Build the two pair components of the M pair at (is,ik2,iq): rows (p1, p3'),
+    // cA'(p,M,p1) = cR(ik2)(p,p1,M); cB'(q,p3',M) = cL(ik2pq)(q,M,p3').
+    auto build_M_tile = [&](long is, long ik2, long iq) {
+      long ik2pq = kpq(iq, ik2);
+      for (long p = 0; p < np; ++p)
+        for (long M = 0; M < Np; ++M)
+          for (long j = 0; j < Nb; ++j) {
+            cAp(p, M, j) = cR(is, ik2, p, j, M);
+            cBp(p, j, M) = cL(is, ik2pq, p, M, j);
           }
+      detail::build_pair_component(kap0, cAp, cBp, Mt0);
+      detail::build_pair_component(kap1, cAp, cBp, Mt1);
+    };
+
+    for (long m = 0; m < nw_b; ++m) {
+      tools.build_kappa(m, kap0, kap1);   // (nw_b builds total -- unchanged from OLD)
 
       long mbar = tools.w_mirror_b(m);
       bool is_m0 = (tools.wn_b(m) == 0);
 
-      // ---- contract over this rank's tuples -------------------------------------------
-      for (long tup = rank; tup < ntuples; tup += nproc) {
+      // ---- contract over this rank's (tuple, q_ext) tiles -----------------------------
+      for (long tup = tup_rank; tup < ntuples; tup += tup_size) {
         long is = tup / (nk * nq);
         long ik = (tup / nq) % nk;
         long iqx = tup % nq;
         if (skip_rung_gamma and iqx == iq_gamma) continue;
         long ikmqx = kmq(iqx, ik);
         auto [qsx, trx, jsx] = q_access(iqx);
-        for (long iq = 0; iq < nq_ext; ++iq) {
+        for (long iq = qext_rank; iq < nq_ext; iq += qext_size) {
           long ikpq = kpq(iq, ik);
           long ikxq = kmq(iqx, ikpq);
           build_U(is, ik, ikmqx, ikpq, ikxq, jsx);
+
+          // recompute the four pair components THIS tile needs for THIS m (one tile live)
+          build_T_tile(is, ik, iq);       // T pair at (is, ik,    iq)
+          build_M_tile(is, ikmqx, iq);    // M pair at (is, ikmqx, iq)
 
           // wbar_dyn(l) -> wmat layout -> tau form wt(s)[(p1'p3),(p1p3')]
           // (trev-mapped transfer: PQ-transposed read of the IBZ-stored core, (P2))
@@ -681,10 +718,6 @@ namespace vertex_pi {
           nda::blas::gemm(tools.Ttw_bb, wq_flat, wt_flat);
 
           auto Pi_MN = Pi_wqMN(m, iq, all, all);
-          auto Tt0 = T0(is, ik, iq, nda::ellipsis{});
-          auto Tt1 = T1(is, ik, iq, nda::ellipsis{});
-          auto Mt0 = M0(is, ikmqx, iq, nda::ellipsis{});
-          auto Mt1 = M1(is, ikmqx, iq, nda::ellipsis{});
 
           // Pi_dyn(m) = -pref * sum_s [ row_m0(s) (T0.w~.M0 + T1.w~.M1)(s)
           //                           + row_m(s)  (T1.w~.M0)(s)

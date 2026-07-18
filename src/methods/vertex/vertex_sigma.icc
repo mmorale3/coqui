@@ -111,12 +111,13 @@ namespace vertex_detail {
    *                      full-BZ objects.
    * @param Sigma_C_tskab - (nt_f, ns, nk_ext, nbnd, nbnd) OVERWRITTEN with Sigma^C(tau)
    */
-  template<nda::MemoryArrayOfRank<5> GArr_t, nda::MemoryArrayOfRank<5> SArr_t>
+  template<nda::MemoryArrayOfRank<5> GArr_t, nda::MemoryArrayOfRank<4> XArr_t,
+           nda::MemoryArrayOfRank<5> SArr_t>
   void eval_sigma_C_g3w2(imag_axes_ft::IAFT const &ft,
                          mpi3::communicator &comm,
                          nda::range C_rng,
                          GArr_t const &G_tskij,
-                         nda::array<ComplexType, 4> const &X_skPa,
+                         XArr_t const &X_skPa,
                          nda::array<ComplexType, 4> const &Wt_qtPQ,
                          nda::array<ComplexType, 3> const &Z_qPQ,
                          nda::array<long, 2> const &k_minus_q,
@@ -336,7 +337,42 @@ namespace vertex_detail {
     const long size = comm.size();
     const long ncombo = ns * nk_ext * nq;   // (s, k in IBZ under symmetry, qx full)
 
-    for (long combo = rank; combo < ncombo; combo += size) {
+    // ---- M2 item #3: 2D rank split (combo axis) x (qy axis) --------------------
+    // The (s,k,qx) combo axis (as today) owns whole tiles so the x-side hoist
+    // (A_x / half_x / halfZ_x, built once per (s,k,qx) below) is reused across ALL
+    // of a rank's qy; the INNER iqy loop is additionally split across a qy grid so
+    // the double-bosonic-conv qy axis (the untapped N_k-sized parallelism, spec
+    // section 3.2) is distributed. Each rank accumulates a PARTIAL qy sum into the
+    // rank-local AccSw/AccSt; the final comm.all_reduce (below) sums combo x qy
+    // partials -- associative, so the per-tile DLR channel algebra is byte-identical
+    // and only the qy reduction order changes (~1e-11 rel, spec section 4.1a).
+    // Factorization: pour ranks onto the (large) combo axis first, spilling the
+    // remainder onto qy -- so on the target moderate-Np/large-Nk regime (ncombo >>
+    // size) qy_size == 1 and this reduces bit-identically to the historic 1D RR.
+    long qy_size = 1, combo_size = size;
+    {
+      // largest divisor d of size with size/d <= ncombo and d <= nq (so neither
+      // axis is over-subscribed); prefer the smallest qy_size that keeps combo <= ncombo.
+      for (long d = 1; d <= size; ++d) {
+        if (size % d != 0) continue;
+        long cs = size / d;
+        if (cs <= ncombo and d <= nq) { qy_size = d; combo_size = cs; break; }
+      }
+      // fallback: if ncombo is tiny (toy models) and no divisor keeps combo<=ncombo,
+      // give everything to qy that fits, else leave 1D (extra ranks idle -- still correct).
+      if (combo_size > ncombo) {
+        for (long d = size; d >= 1; --d) {
+          if (size % d != 0) continue;
+          if (d <= nq) { qy_size = d; combo_size = size / d; break; }
+        }
+      }
+    }
+    const long combo_rank = rank / qy_size;   // which combo tiles this rank owns
+    const long qy_rank    = rank % qy_size;   // which qy subset this rank owns
+    app_log(3, "eval_sigma_C: rank split size = {} -> combo_size = {} x qy_size = {} "
+               "(ncombo = {}, nq = {})", size, combo_size, qy_size, ncombo, nq);
+
+    for (long combo = combo_rank; combo < ncombo; combo += combo_size) {
       const long is  = combo / (nk_ext * nq);
       const long ik  = (combo / nq) % nk_ext;
       const long iqx = combo % nq;
@@ -376,7 +412,7 @@ namespace vertex_detail {
         else     nda::blas::gemm(nda::transpose(Zx), A_x, halfZ_x);
       }
 
-      for (long iqy = 0; iqy < nq; ++iqy) {
+      for (long iqy = qy_rank; iqy < nq; iqy += qy_size) {
         if (skip_rung_gamma and iqy == iq_gamma) continue; // v1_skip: drop Gamma on the y-rung
         const long ikpqy    = k_minus_q(qminus(iqy), ik);
         const long ikmqxpqy = k_minus_q(qminus(iqy), ikmqx);
@@ -905,12 +941,13 @@ namespace vertex_detail {
   }
 
   /** Historic no-symmetry entry point (kept for existing call sites/tests). */
-  template<nda::MemoryArrayOfRank<5> GArr_t, nda::MemoryArrayOfRank<5> SArr_t>
+  template<nda::MemoryArrayOfRank<5> GArr_t, nda::MemoryArrayOfRank<4> XArr_t,
+           nda::MemoryArrayOfRank<5> SArr_t>
   void eval_sigma_C_g3w2_nosym(imag_axes_ft::IAFT const &ft,
                                mpi3::communicator &comm,
                                nda::range C_rng,
                                GArr_t const &G_tskij,
-                               nda::array<ComplexType, 4> const &X_skPa,
+                               XArr_t const &X_skPa,
                                nda::array<ComplexType, 4> const &Wt_qtPQ,
                                nda::array<ComplexType, 3> const &Z_qPQ,
                                nda::array<long, 2> const &k_minus_q,

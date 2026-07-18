@@ -141,7 +141,7 @@ namespace solvers {
      * C(q) (from the global collocation, orb0 = C.first()) -- one code path, so the
      * two matrices are convention-consistent by construction.
      */
-    inline void build_pair_matrix(nda::array<ComplexType, 4> const& X_skua,
+    inline void build_pair_matrix(nda::MemoryArrayOfRank<4> auto const& X_skua,
                                   long orb0, long nc,
                                   nda::array<long, 2> const& kmq, long iq,
                                   nda::array<ComplexType, 2>& A_Iu) {
@@ -212,9 +212,9 @@ namespace solvers {
      * head-augmented under the gygi policy). Per-q values at app_log(3), the max at
      * app_log(2). Returns max_q eta.
      */
-    template<typename CoreF>
+    template<nda::MemoryArrayOfRank<4> XArr, typename CoreF>
     double eta_max_over_q(char const* label,
-                          nda::array<ComplexType, 4> const& X_skPa, long orb0, long nc,
+                          XArr const& X_skPa, long orb0, long nc,
                           nda::array<ComplexType, 4> const& Xb_skma,
                           nda::array<ComplexType, 3> const& t_qmP,
                           nda::array<long, 2> const& kmq, CoreF&& core) {
@@ -372,7 +372,7 @@ namespace solvers {
     // X_bar(s,k) = X(s,k) . U(s,k) : the rotated collocation (Np x M). X_skPa carries
     // the FULL band range on its last axis; U acts on the W_rng rows. k axis is full BZ.
     inline nda::array<ComplexType, 4>
-    build_Xbar(nda::array<ComplexType, 4> const &X_skPa,   // (ns, nk, Np, nbnd)
+    build_Xbar(nda::MemoryArrayOfRank<4> auto const &X_skPa,   // (ns, nk, Np, nbnd)
                nda::array<ComplexType, 4> const &U_skia,   // (ns, nk, nW, M)
                nda::range W_rng) {
       decltype(nda::range::all) all;
@@ -485,7 +485,7 @@ namespace solvers {
   }
 
   void vertex_t::build_sym_ctx(THC_ERI auto const &thc,
-                               nda::array<ComplexType, 4> const &X_w,
+                               nda::MemoryArrayOfRank<4> auto const &X_w,
                                long C0_global,
                                std::optional<vertex_sym::sym_ctx> &slot,
                                nda::array<ComplexType, 4> const *U_skia) {
@@ -780,7 +780,7 @@ namespace solvers {
   }
 
   void vertex_t::build_secondary_basis(THC_ERI auto const &thc,
-                                       nda::array<ComplexType, 4> const &X_glob, long orb0,
+                                       nda::MemoryArrayOfRank<4> auto const &X_glob, long orb0,
                                        nda::array<long, 2> const &kmq, long iq_gamma) {
     if (_secondary_ready) return;
     decltype(nda::range::all) all;
@@ -1017,10 +1017,20 @@ namespace solvers {
             nbnd, Np, nkpts);
 
     // ---- collocation matrices (q-independent X, polarization 0) ----------------------
-    nda::array<ComplexType, 4> X_skPa(ns, nkpts, Np, nbnd);
-    for (long is = 0; is < ns; ++is)
-      for (long ik = 0; ik < nkpts; ++ik)
-        X_skPa(is, ik, all, all) = thc.X(is, 0, ik);
+    // M2 item #5-finish: node-share X_skPa (the ns*nk*Np*nbnd collocation, spec section
+    // 1.1's memory wall) -- one copy per NUMA node, not one per rank. Values are copied
+    // from the already-node-shared thc.X (data-location change only => bit-identical).
+    // All downstream X consumers (kernel, build_Xbar, build_sym_ctx, build_secondary_basis,
+    // eta_max_over_q, X_C slice) were templated to bind the shared_array .local() view.
+    auto sX_skPa = math::shm::make_shared_array<nda::array_view<ComplexType, 4>>(
+        *mpi, std::array<long, 4>{ns, nkpts, Np, nbnd});
+    sX_skPa.win().fence();
+    if (mpi->node_comm.root())
+      for (long is = 0; is < ns; ++is)
+        for (long ik = 0; ik < nkpts; ++ik)
+          sX_skPa.local()(is, ik, all, all) = thc.X(is, 0, ik);
+    sX_skPa.win().fence();
+    auto X_skPa = sX_skPa.local();
 
     // ---- q = Gamma index (crystal coordinates: all components integer mod G) ----------
     long iq_gamma = -1;
@@ -1203,14 +1213,24 @@ namespace solvers {
     // effective window collocation: WINDOW = X(:,C); WANNIER = X_bar = X.U (Np x M).
     // (also the sym-ctx input; secondary uses Xb). orb0 of the pair matrices is 0 in
     // Wannier mode (X_C already carries exactly the M subspace columns).
-    nda::array<ComplexType, 4> X_C(ns, nkpts, Np, nc);
-    if (wan)
-      X_C = vertex_wannier_detail::build_Xbar(X_skPa, _U_skia, _band_window);
-    else
-      X_C = X_skPa(all, all, all, _band_window);
+    // M2 item #5-finish: node-share X_C too (one copy per node; built on node root from
+    // the node-shared X_skPa). X_glob is a plain view selecting X_C (Wannier) / X_skPa
+    // (window) -- both are array_view<ComplexType,4> so the ternary binds.
+    auto sX_C = math::shm::make_shared_array<nda::array_view<ComplexType, 4>>(
+        *mpi, std::array<long, 4>{ns, nkpts, Np, nc});
+    sX_C.win().fence();
+    if (mpi->node_comm.root()) {
+      auto X_C_loc = sX_C.local();
+      if (wan)
+        X_C_loc = vertex_wannier_detail::build_Xbar(X_skPa, _U_skia, _band_window);
+      else
+        X_C_loc = X_skPa(all, all, all, _band_window);
+    }
+    sX_C.win().fence();
+    auto X_C = sX_C.local();
     // the "global collocation" the secondary C(q)/eta refer to: X_bar (orb0=0) in
     // Wannier mode, X_skPa (orb0=C.first()) in window mode.
-    nda::array<ComplexType, 4> const &X_glob = wan ? X_C : X_skPa;
+    auto X_glob = wan ? X_C : X_skPa;
     const long orb0_glob = wan ? 0 : _band_window.first();
     if (sec) {
       build_secondary_basis(thc, X_glob, orb0_glob, kmq, iq_gamma);
@@ -1418,10 +1438,16 @@ namespace solvers {
                              : "; no analytic head (GW ignore_g0 analogue)");
 
     // ---- collocation matrices (q-independent X, polarization 0) -----------------------
-    nda::array<ComplexType, 4> X_skPa(ns, nkpts, Np, nbnd);
-    for (long is = 0; is < ns; ++is)
-      for (long ik = 0; ik < nkpts; ++ik)
-        X_skPa(is, ik, all, all) = thc.X(is, 0, ik);
+    // M2 item #5-finish: node-share X_skPa (one copy per node; see eval_Sigma_C).
+    auto sX_skPa = math::shm::make_shared_array<nda::array_view<ComplexType, 4>>(
+        *mpi, std::array<long, 4>{ns, nkpts, Np, nbnd});
+    sX_skPa.win().fence();
+    if (mpi->node_comm.root())
+      for (long is = 0; is < ns; ++is)
+        for (long ik = 0; ik < nkpts; ++ik)
+          sX_skPa.local()(is, ik, all, all) = thc.X(is, 0, ik);
+    sX_skPa.win().fence();
+    auto X_skPa = sX_skPa.local();
 
     // ---- bare coulomb Z(q) (thc.Z is collective: call uniformly on all ranks) ---------
     nda::array<ComplexType, 3> Z_qPQ(nqpts_ibz, Np, Np);
@@ -1582,12 +1608,20 @@ namespace solvers {
                "notes/refinement2_optionA.md DECISION 2).",
             wan ? "range(P) (Wannier labels)" : "the C window", nc);
     // effective window collocation: WINDOW = X(:,C); WANNIER = X_bar = X.U (Np x M).
-    nda::array<ComplexType, 4> X_C(ns, nkpts, Np, nc);
-    if (wan)
-      X_C = vertex_wannier_detail::build_Xbar(X_skPa, _U_skia, _band_window);
-    else
-      X_C = X_skPa(all, all, all, _band_window);
-    nda::array<ComplexType, 4> const &X_glob = wan ? X_C : X_skPa;
+    // M2 item #5-finish: node-share X_C (one copy per node; see eval_Sigma_C).
+    auto sX_C = math::shm::make_shared_array<nda::array_view<ComplexType, 4>>(
+        *mpi, std::array<long, 4>{ns, nkpts, Np, nc});
+    sX_C.win().fence();
+    if (mpi->node_comm.root()) {
+      auto X_C_loc = sX_C.local();
+      if (wan)
+        X_C_loc = vertex_wannier_detail::build_Xbar(X_skPa, _U_skia, _band_window);
+      else
+        X_C_loc = X_skPa(all, all, all, _band_window);
+    }
+    sX_C.win().fence();
+    auto X_C = sX_C.local();
+    auto X_glob = wan ? X_C : X_skPa;
     const long orb0_glob = wan ? 0 : _band_window.first();
     if (sec) {
       build_secondary_basis(thc, X_glob, orb0_glob, kmq, iq_gamma);
@@ -1809,17 +1843,30 @@ namespace solvers {
                "scf driver.");
 
     // ---- collocation + momentum maps (for the lazy basis build + diagnostics) --------
-    nda::array<ComplexType, 4> X_skPa(ns, nkpts, Np, nbnd);
-    for (long is = 0; is < ns; ++is)
-      for (long ik = 0; ik < nkpts; ++ik)
-        X_skPa(is, ik, all, all) = thc.X(is, 0, ik);
+    // M2 item #5-finish: node-share X_skPa (one copy per node; see eval_Sigma_C).
+    auto sX_skPa = math::shm::make_shared_array<nda::array_view<ComplexType, 4>>(
+        *mpi, std::array<long, 4>{ns, nkpts, Np, nbnd});
+    sX_skPa.win().fence();
+    if (mpi->node_comm.root())
+      for (long is = 0; is < ns; ++is)
+        for (long ik = 0; ik < nkpts; ++ik)
+          sX_skPa.local()(is, ik, all, all) = thc.X(is, 0, ik);
+    sX_skPa.win().fence();
+    auto X_skPa = sX_skPa.local();
     nda::array<long, 2> kmq(nqpts_ibz, nkpts);
     for (long iq = 0; iq < nqpts_ibz; ++iq)
       for (long ik = 0; ik < nkpts; ++ik) kmq(iq, ik) = MF->qk_to_k2(iq, ik);
-    // effective global collocation for the secondary fit (WANNIER: X_bar = X.U, orb0=0)
-    nda::array<ComplexType, 4> Xbar_glob;
-    if (wan) Xbar_glob = vertex_wannier_detail::build_Xbar(X_skPa, _U_skia, _band_window);
-    nda::array<ComplexType, 4> const &X_glob = wan ? Xbar_glob : X_skPa;
+    // effective global collocation for the secondary fit (WANNIER: X_bar = X.U, orb0=0).
+    // node-shared so X_glob is a plain view (both branches array_view<ComplexType,4>).
+    auto sXbar_glob = math::shm::make_shared_array<nda::array_view<ComplexType, 4>>(
+        *mpi, std::array<long, 4>{ns, nkpts, Np, wan ? subspace_rank() : 1});
+    if (wan) {
+      sXbar_glob.win().fence();
+      if (mpi->node_comm.root())
+        sXbar_glob.local() = vertex_wannier_detail::build_Xbar(X_skPa, _U_skia, _band_window);
+      sXbar_glob.win().fence();
+    }
+    auto X_glob = wan ? sXbar_glob.local() : X_skPa;
     const long orb0_glob = wan ? 0 : _band_window.first();
 
     // ---- q = Gamma index (crystal coordinates: all components integer mod G) ----------

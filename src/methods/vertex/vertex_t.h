@@ -359,7 +359,7 @@ namespace solvers {
      * and nc = M; X_w = X_bar (the rotated collocation). Window mode = nullptr U.
      */
     void build_sym_ctx(THC_ERI auto const &thc,
-                       nda::array<ComplexType, 4> const &X_w,
+                       nda::MemoryArrayOfRank<4> auto const &X_w,
                        long C0_global,
                        std::optional<vertex_sym::sym_ctx> &slot,
                        nda::array<ComplexType, 4> const *U_skia = nullptr);
@@ -384,7 +384,7 @@ namespace solvers {
      * @param iq_gamma - [INPUT] index of q = Gamma
      */
     void build_secondary_basis(THC_ERI auto const &thc,
-                               nda::array<ComplexType, 4> const &X_glob, long orb0,
+                               nda::MemoryArrayOfRank<4> auto const &X_glob, long orb0,
                                nda::array<long, 2> const &kmq, long iq_gamma);
 
   public:
