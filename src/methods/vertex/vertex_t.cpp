@@ -79,6 +79,51 @@ namespace solvers {
   } // vertex_head_detail
 
   /**
+   * W-redistribution helper (vertex parallelization M1, change-list item #1;
+   * notes/vertex_parallelization_M1.md, notes/vertex_parallelization_analysis.md
+   * section 1.7 / Appendix A).
+   *
+   * The dynamic screened interaction dW lives on the RPA (t,q,P,Q) proc grid
+   * (MBState::dW_qtPQ, a distributed_array). The vertex kernels (eval_sigma_C_g3w2,
+   * pi_c_accumulate_w) consume a FULLY-REPLICATED (nqpts_ibz, nt_half, Np, Np) tau
+   * slab and index arbitrary q -- because in M1 the qy/q_ext inner loops are NOT yet
+   * distributed (that is M2, change-list items #3/#4), each rank still runs the full
+   * serial inner sums and therefore needs every q of W.
+   *
+   * gather_dW_replicated centralizes the three previously-duplicated gather sites
+   * (was: vertex_t.cpp:1066 Sigma, :1427 Pi, :1822 cache_w). dW is a PARTITION of the
+   * global array -- every global element lives on exactly one source rank, the rest is
+   * zero -- so the all_reduce(plus) of the zero-padded local block is a pure GATHER
+   * with no floating-point reassociation: the result is BIT-IDENTICAL on every rank
+   * and bit-identical to the pre-M1 code. (A genuinely q-owned distributed result --
+   * the eventual memory win -- is only useful once the kernels consume q-owned tiles,
+   * i.e. M2; the proven math::nda::redistribute path for that is exercised bit-exactly
+   * by the round-trip unit test, notes section 4.2 #4, test_vertex_wredist.cpp.)
+   */
+  namespace vertex_redist_detail {
+
+    // Gather the RPA-grid distributed dW into a replicated (nq, nt_half, Np, Np) array.
+    // Bit-identical to the former in-line "alloc + zero + copy local_range + all_reduce".
+    template<typename dArray_t, typename comm_t>
+    nda::array<ComplexType, 4>
+    gather_dW_replicated(dArray_t const& dW, comm_t& comm,
+                         long nqpts_ibz, long nt_half, long Np) {
+      auto gs = dW.global_shape();
+      utils::check(gs[0] == nqpts_ibz and gs[1] == nt_half and gs[2] == Np and gs[3] == Np,
+                   "vertex_redist_detail::gather_dW_replicated: unexpected dW global "
+                   "shape ({}, {}, {}, {}); expected ({}, {}, {}, {}).",
+                   gs[0], gs[1], gs[2], gs[3], nqpts_ibz, nt_half, Np, Np);
+      nda::array<ComplexType, 4> W_qtPQ(nqpts_ibz, nt_half, Np, Np);
+      W_qtPQ() = ComplexType(0.0);
+      W_qtPQ(dW.local_range(0), dW.local_range(1), dW.local_range(2), dW.local_range(3)) =
+          dW.local();
+      comm.all_reduce_in_place_n(W_qtPQ.data(), W_qtPQ.size(), std::plus<>{});
+      return W_qtPQ;
+    }
+
+  } // vertex_redist_detail
+
+  /**
    * Refinement 2 helpers (notes/refinement2_optionA.md): the secondary ISDF basis on
    * the correlated subspace C and the per-q Option-A transfer maps
    *   s(q) = B(q)^dag B(q),  t(q) = s(q)^+ B(q)^dag C(q)  (theoryB Eq. 35/36),
@@ -350,7 +395,7 @@ namespace solvers {
                                   nda::range W_rng, bool sym_mesh,
                                   nda::ArrayOfRank<1> auto const &kp_to_ibz,
                                   nda::ArrayOfRank<1> auto const &kp_trev,
-                                  nda::array<ComplexType, 5> &Gbar) {           // (nt,ns,nk,M,M)
+                                  nda::MemoryArrayOfRank<5> auto &&Gbar) {      // (nt,ns,nk,M,M)
       decltype(nda::range::all) all;
       const long nt = Gbar.shape(0), ns = Gbar.shape(1), nk = Gbar.shape(2);
       const long M = Gbar.shape(3), nW = W_rng.size(), W0 = W_rng.first();
@@ -1056,14 +1101,10 @@ namespace solvers {
     // PH-symmetric in tau, W(beta-t) = W(t). IBZ rows under symmetry.
     nda::array<ComplexType, 4> Wt_qtPQ(nqpts_ibz, nt, Np, Np);
     {
-      auto& dW = mb_state.dW_qtPQ.value();
-      auto gs = dW.global_shape();
-      utils::check(gs[0] == nqpts_ibz and gs[1] == nt_half and gs[2] == Np and gs[3] == Np,
-                   "vertex_t::eval_Sigma_C: unexpected dW_qtPQ global shape.");
-      nda::array<ComplexType, 4> W_half(nqpts_ibz, nt_half, Np, Np);
-      W_half() = ComplexType(0.0);
-      W_half(dW.local_range(0), dW.local_range(1), dW.local_range(2), dW.local_range(3)) = dW.local();
-      mpi->comm.all_reduce_in_place_n(W_half.data(), W_half.size(), std::plus<>{});
+      // M1 item #1: gather the RPA-grid dW into the replicated tau slab the kernel
+      // needs (bit-identical to the former in-line allreduce; helper centralizes it).
+      nda::array<ComplexType, 4> W_half = vertex_redist_detail::gather_dW_replicated(
+          mb_state.dW_qtPQ.value(), mpi->comm, nqpts_ibz, nt_half, Np);
 
       // head insertion, dynamic piece (weight Re[eps_inv_head(tau)]) into dW(Gamma, tau).
       // eps_inv_head = eps^-1_00(q->0, tau) - 1, stored on nt_half by scr_coulomb
@@ -1121,29 +1162,41 @@ namespace solvers {
     // (identity D by convention, symmetry.hpp:910); trev points are the tau-pointwise
     // TRANSPOSE (thc_solver_comm.hpp:443-447; == conj for the hermitian G). No tau-mirror
     // anywhere (memo section 3.5).
-    nda::array<ComplexType, 5> G_CC(nt, ns, nkpts, nc, nc);
-    if (wan) {
-      vertex_wannier_detail::build_Gbar_fullbz(G_tskij, _U_skia, _band_window, sym_mesh,
-                                               MF->kp_to_ibz(), MF->kp_trev(), G_CC);
-    } else if (not sym_mesh) {
-      G_CC = G_tskij(all, all, all, _band_window, _band_window);
-    } else {
-      auto kp_to_ibz = MF->kp_to_ibz();
-      auto kp_trev = MF->kp_trev();
-      for (long kp = 0; kp < nkpts; ++kp) {
-        const long kib = kp_to_ibz(kp);
-        if (not kp_trev(kp)) {
-          G_CC(all, all, kp, all, all) = G_tskij(all, all, kib, _band_window, _band_window);
-        } else {
-          for (long it = 0; it < nt; ++it)
-            for (long is = 0; is < ns; ++is)
-              for (long a = 0; a < nc; ++a)
-                for (long b = 0; b < nc; ++b)
-                  G_CC(it, is, kp, a, b) =
-                      G_tskij(it, is, kib, _band_window.first() + b, _band_window.first() + a);
+    // M1 item #5: node-share G_CC (one copy per NUMA node, not one per rank). G_CC is
+    // built from the already node-shared sG_tskij and is READ (never written) by the
+    // kernel and g_rotation_check, which take it via a templated array param -- so the
+    // shared_array .local() view binds without any kernel change. Values are identical
+    // to the per-rank array (data-location change only) => bit-identical outputs.
+    auto sG_CC = math::shm::make_shared_array<nda::array_view<ComplexType, 5>>(
+        *mpi, std::array<long, 5>{nt, ns, nkpts, nc, nc});
+    sG_CC.win().fence();
+    if (mpi->node_comm.root()) {
+      auto G_CC = sG_CC.local();
+      if (wan) {
+        vertex_wannier_detail::build_Gbar_fullbz(G_tskij, _U_skia, _band_window, sym_mesh,
+                                                 MF->kp_to_ibz(), MF->kp_trev(), G_CC);
+      } else if (not sym_mesh) {
+        G_CC = G_tskij(all, all, all, _band_window, _band_window);
+      } else {
+        auto kp_to_ibz = MF->kp_to_ibz();
+        auto kp_trev = MF->kp_trev();
+        for (long kp = 0; kp < nkpts; ++kp) {
+          const long kib = kp_to_ibz(kp);
+          if (not kp_trev(kp)) {
+            G_CC(all, all, kp, all, all) = G_tskij(all, all, kib, _band_window, _band_window);
+          } else {
+            for (long it = 0; it < nt; ++it)
+              for (long is = 0; is < ns; ++is)
+                for (long a = 0; a < nc; ++a)
+                  for (long b = 0; b < nc; ++b)
+                    G_CC(it, is, kp, a, b) =
+                        G_tskij(it, is, kib, _band_window.first() + b, _band_window.first() + a);
+          }
         }
       }
     }
+    sG_CC.win().fence();
+    auto G_CC = sG_CC.local();
     app_log(2, "  Sigma^C externals restricted to {} a, b in [0, {}) "
                "(strict Phi cut; notes/refinement2_optionA.md DECISION 2).",
             wan ? "range(P) (Wannier labels)" : "the C-C block", nc);
@@ -1417,14 +1470,9 @@ namespace solvers {
                  "         (identical content when both were produced by the same "
                  "update_w).");
     if (not use_wcache and mb_state.dW_qtPQ.has_value()) {
-      auto& dW = mb_state.dW_qtPQ.value();
-      auto gs = dW.global_shape();
-      utils::check(gs[0] == nqpts_ibz and gs[1] == nt_half and gs[2] == Np and gs[3] == Np,
-                   "vertex_t::eval_Pi_C: unexpected dW_qtPQ global shape.");
-      nda::array<ComplexType, 4> W_qtPQ(nqpts_ibz, nt_half, Np, Np);
-      W_qtPQ() = ComplexType(0.0);
-      W_qtPQ(dW.local_range(0), dW.local_range(1), dW.local_range(2), dW.local_range(3)) = dW.local();
-      mpi->comm.all_reduce_in_place_n(W_qtPQ.data(), W_qtPQ.size(), std::plus<>{});
+      // M1 item #1: gather the RPA-grid dW into the replicated tau slab (bit-identical).
+      nda::array<ComplexType, 4> W_qtPQ = vertex_redist_detail::gather_dW_replicated(
+          mb_state.dW_qtPQ.value(), mpi->comm, nqpts_ibz, nt_half, Np);
 
       // head insertion, dynamic piece (weight Re[eps_inv_head(tau)]) into dW(Gamma, tau),
       // BEFORE the tau -> Matsubara transform (so the bosonic-mesh rung inherits it).
@@ -1497,29 +1545,39 @@ namespace solvers {
     utils::check(G_tskij.shape(2) == (sym_mesh ? nkpts_ibz : nkpts),
                  "vertex_t::eval_Pi_C: G_tskij k axis = {} != {}.",
                  G_tskij.shape(2), sym_mesh ? nkpts_ibz : nkpts);
-    nda::array<ComplexType, 5> G_CC(nt_f, ns, nkpts, nc, nc);
-    if (wan) {
-      vertex_wannier_detail::build_Gbar_fullbz(G_tskij, _U_skia, _band_window, sym_mesh,
-                                               MF->kp_to_ibz(), MF->kp_trev(), G_CC);
-    } else if (not sym_mesh) {
-      G_CC = G_tskij(all, all, all, _band_window, _band_window);
-    } else {
-      auto kp_to_ibz = MF->kp_to_ibz();
-      auto kp_trev = MF->kp_trev();
-      for (long kp = 0; kp < nkpts; ++kp) {
-        const long kib = kp_to_ibz(kp);
-        if (not kp_trev(kp)) {
-          G_CC(all, all, kp, all, all) = G_tskij(all, all, kib, _band_window, _band_window);
-        } else {
-          for (long it = 0; it < nt_f; ++it)
-            for (long is = 0; is < ns; ++is)
-              for (long a = 0; a < nc; ++a)
-                for (long b = 0; b < nc; ++b)
-                  G_CC(it, is, kp, a, b) =
-                      G_tskij(it, is, kib, _band_window.first() + b, _band_window.first() + a);
+    // M1 item #5: node-share G_CC (one copy per node; see eval_Sigma_C for the rationale
+    // -- built from node-shared sG_tskij, read-only by the templated-param kernel, so
+    // the shared_array view binds and the values are bit-identical).
+    auto sG_CC = math::shm::make_shared_array<nda::array_view<ComplexType, 5>>(
+        *mpi, std::array<long, 5>{nt_f, ns, nkpts, nc, nc});
+    sG_CC.win().fence();
+    if (mpi->node_comm.root()) {
+      auto G_CC = sG_CC.local();
+      if (wan) {
+        vertex_wannier_detail::build_Gbar_fullbz(G_tskij, _U_skia, _band_window, sym_mesh,
+                                                 MF->kp_to_ibz(), MF->kp_trev(), G_CC);
+      } else if (not sym_mesh) {
+        G_CC = G_tskij(all, all, all, _band_window, _band_window);
+      } else {
+        auto kp_to_ibz = MF->kp_to_ibz();
+        auto kp_trev = MF->kp_trev();
+        for (long kp = 0; kp < nkpts; ++kp) {
+          const long kib = kp_to_ibz(kp);
+          if (not kp_trev(kp)) {
+            G_CC(all, all, kp, all, all) = G_tskij(all, all, kib, _band_window, _band_window);
+          } else {
+            for (long it = 0; it < nt_f; ++it)
+              for (long is = 0; is < ns; ++is)
+                for (long a = 0; a < nc; ++a)
+                  for (long b = 0; b < nc; ++b)
+                    G_CC(it, is, kp, a, b) =
+                        G_tskij(it, is, kib, _band_window.first() + b, _band_window.first() + a);
+          }
         }
       }
     }
+    sG_CC.win().fence();
+    auto G_CC = sG_CC.local();
     app_log(2, "  Pi^C external legs restricted to {} [0, {}) (strict Phi cut; "
                "notes/refinement2_optionA.md DECISION 2).",
             wan ? "range(P) (Wannier labels)" : "the C window", nc);
@@ -1815,11 +1873,9 @@ namespace solvers {
     // tau-storage slices.
     nda::array<ComplexType, 4> W_wq(nqpts_ibz, nw_half, Np, Np);
     {
-      auto& dW = mb_state.dW_qtPQ.value();
-      nda::array<ComplexType, 4> W_qtPQ(nqpts_ibz, nt_half, Np, Np);
-      W_qtPQ() = ComplexType(0.0);
-      W_qtPQ(dW.local_range(0), dW.local_range(1), dW.local_range(2), dW.local_range(3)) = dW.local();
-      mpi->comm.all_reduce_in_place_n(W_qtPQ.data(), W_qtPQ.size(), std::plus<>{});
+      // M1 item #1: gather the RPA-grid dW into the replicated tau slab (bit-identical).
+      nda::array<ComplexType, 4> W_qtPQ = vertex_redist_detail::gather_dW_replicated(
+          mb_state.dW_qtPQ.value(), mpi->comm, nqpts_ibz, nt_half, Np);
 
       if (head_ok) {
         if (mb_state.eps_inv_head.has_value()) {

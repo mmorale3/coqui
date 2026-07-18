@@ -91,3 +91,29 @@ target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield eri_li
 
 add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
 set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR})
+
+# Vertex parallelization MILESTONE 1, item #1: the W-redistribution round-trip
+# (notes/vertex_parallelization_M1.md; analysis section 4.2 #4). dW on the RPA (q,t,P,Q)
+# grid -> q-owned layout -> back is pure data movement (math::nda::redistribute) and
+# must be bit-identical. The infra guarantee the M2 kernel re-parallelization rests on.
+set(TEST_ID methods_vertex_wredist)
+
+add_executable(test_${TEST_ID} test_vertex_wredist.cpp)
+target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield eri_lib hf_lib
+                      vertex_lib gw_lib scf_lib)
+
+add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
+set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR})
+
+# Vertex parallelization MILESTONE 1, item #2: rank-cap-lift smoke + rank-invariance at
+# the kernel entry point (notes/vertex_parallelization_M1.md; analysis section 4.2 #1/#2).
+# The Pi^C kernel runs at P > nbnd (toy nbnd = 3) without the reader-side cap abort, and
+# the distributed result reproduces the serial result to the FP-reassociation floor.
+set(TEST_ID methods_vertex_rankinv)
+
+add_executable(test_${TEST_ID} test_vertex_rankinv.cpp)
+target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield eri_lib hf_lib
+                      vertex_lib gw_lib scf_lib)
+
+add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
+set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR})
