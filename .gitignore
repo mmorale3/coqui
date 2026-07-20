@@ -33,3 +33,6 @@
 # IDE files
 .idea/
 *build*/
+.cache/
+.omc/
+vertex_memory_parallelization_report.pdf

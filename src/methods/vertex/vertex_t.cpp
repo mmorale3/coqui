@@ -1587,16 +1587,25 @@ namespace solvers {
     //     interaction Z.
     const bool sec = secondary();
     const bool use_wcache = sec and _Wb_qwmm.has_value();
-    std::optional<nda::array<ComplexType, 4>> Wdyn_qwPQ;
+    // Step 1a (notes/vertex_parallelization_v2_plan.md Step 1): a dynamic-W source is
+    // present iff we are NOT consuming the W-bar cache and mb_state carries dW. In the
+    // GLOBAL path we build the full replicated Wdyn_qwPQ (Np^2) below; in the SECONDARY
+    // path we KEEP only the tau-domain W_qtPQ here (with the head augmented) and DEFER
+    // the tau -> nu transform into the per-q fold loop, reusing one W_wpos(nw_half, Np, Np)
+    // buffer per q -- so the replicated (nq, nw_b, Np, Np) array is never materialized
+    // (16 TB @ production Np=20k).
+    const bool dyn_src = (not use_wcache) and mb_state.dW_qtPQ.has_value();
+    std::optional<nda::array<ComplexType, 4>> W_qtPQ;  // tau-domain, kept for BOTH paths
+    std::optional<nda::array<ComplexType, 4>> Wdyn_qwPQ;  // nu-domain, GLOBAL path only
     if (use_wcache and mb_state.dW_qtPQ.has_value())
       app_log(2, "  [NOTE] Pi^C: both the W-bar cache and mb_state.dW_qtPQ are present "
                  "-- consuming the CACHE\n"
                  "         (identical content when both were produced by the same "
                  "update_w).");
-    if (not use_wcache and mb_state.dW_qtPQ.has_value()) {
+    if (dyn_src) {
       // M1 item #1: gather the RPA-grid dW into the replicated tau slab (bit-identical).
-      nda::array<ComplexType, 4> W_qtPQ = vertex_redist_detail::gather_dW_replicated(
-          mb_state.dW_qtPQ.value(), mpi->comm, nqpts_ibz, nt_half, Np);
+      W_qtPQ.emplace(vertex_redist_detail::gather_dW_replicated(
+          mb_state.dW_qtPQ.value(), mpi->comm, nqpts_ibz, nt_half, Np));
 
       // head insertion, dynamic piece (weight Re[eps_inv_head(tau)]) into dW(Gamma, tau),
       // BEFORE the tau -> Matsubara transform (so the bosonic-mesh rung inherits it).
@@ -1608,7 +1617,7 @@ namespace solvers {
                        "vertex_t::eval_Pi_C: eps_inv_head size {} != nt_half = {}.",
                        eps.shape(0), nt_half);
           for (long it = 0; it < nt_half; ++it)
-            W_qtPQ(iq_gamma, it, all, all) += ComplexType(eps(it).real()) * H_PQ;
+            W_qtPQ.value()(iq_gamma, it, all, all) += ComplexType(eps(it).real()) * H_PQ;
           app_log(1, "  Pi^C head insertion: dynamic piece applied to dW(Gamma, tau) "
                      "with eps_inv_head(tau=0) = {}", eps(0).real());
         } else {
@@ -1618,18 +1627,23 @@ namespace solvers {
         }
       }
 
-      long nw_b = tools.nw_b;
-      long nw_half = (nw_b % 2 == 0) ? nw_b / 2 : nw_b / 2 + 1;
-      Wdyn_qwPQ.emplace(nda::array<ComplexType, 4>(nqpts_ibz, nw_b, Np, Np));
-      nda::array<ComplexType, 3> W_wpos(nw_half, Np, Np);
-      for (long iq = 0; iq < nqpts_ibz; ++iq) {
-        auto W_t = W_qtPQ(iq, nda::ellipsis{});
-        _ft->tau_to_w_PHsym(W_t, W_wpos);
-        // unfold to the full mesh assuming W(-nu) = W(nu) (PH-symmetric storage, same
-        // assumption as the SOSEX cache folding, thc_sosex.icc:970-976)
-        for (long l = 0; l < nw_b; ++l) {
-          long lpos = std::max(l, tools.w_mirror_b(l)) - nw_b / 2;
-          Wdyn_qwPQ.value()(iq, l, all, all) = W_wpos(lpos, all, all);
+      // GLOBAL path only: materialize the full nu-domain Wdyn_qwPQ. In the SECONDARY
+      // path the tau -> nu transform is deferred into the per-q fold loop below (Step 1a),
+      // so the replicated Np^2 nu-array is never built.
+      if (not sec) {
+        long nw_b = tools.nw_b;
+        long nw_half = (nw_b % 2 == 0) ? nw_b / 2 : nw_b / 2 + 1;
+        Wdyn_qwPQ.emplace(nda::array<ComplexType, 4>(nqpts_ibz, nw_b, Np, Np));
+        nda::array<ComplexType, 3> W_wpos(nw_half, Np, Np);
+        for (long iq = 0; iq < nqpts_ibz; ++iq) {
+          auto W_t = W_qtPQ.value()(iq, nda::ellipsis{});
+          _ft->tau_to_w_PHsym(W_t, W_wpos);
+          // unfold to the full mesh assuming W(-nu) = W(nu) (PH-symmetric storage, same
+          // assumption as the SOSEX cache folding, thc_sosex.icc:970-976)
+          for (long l = 0; l < nw_b; ++l) {
+            long lpos = std::max(l, tools.w_mirror_b(l)) - nw_b / 2;
+            Wdyn_qwPQ.value()(iq, l, all, all) = W_wpos(lpos, all, all);
+          }
         }
       }
     } else if (not use_wcache) {
@@ -1725,17 +1739,41 @@ namespace solvers {
       build_secondary_basis(thc, X_glob, orb0_glob, kmq, iq_gamma);
       app_log(1, "  Refinement 2: Pi^C runs in the SECONDARY basis (N_m = {} vs Np = {}); "
                  "upfold Pi^C = t^dag Pibar t.", _Nm, Np);
+      // Step 1a (notes/vertex_parallelization_v2_plan.md Step 1): in the SECONDARY path
+      // the full nu-domain Wdyn_qwPQ (replicated Np^2) is NOT materialized. The tau -> nu
+      // transform is deferred into the per-q fold below, reusing ONE W_wpos(nw_half, Np, Np)
+      // buffer per q. This is bitwise-equivalent to "build full Wdyn_qwPQ then fold": for
+      // each (iq, l) the value folded is exactly W_wpos(lpos) with the SAME PH-unfold map
+      // lpos = max(l, w_mirror_b(l)) - nw_b/2 the global build applies.
+      const long nw_b_sec = tools.nw_b;
+      const long nw_half_sec = (nw_b_sec % 2 == 0) ? nw_b_sec / 2 : nw_b_sec / 2 + 1;
+      // eta W-accessor: returns the Np x Np nu-slice at bosonic index l. Global path reads
+      // the prebuilt Wdyn_qwPQ; secondary path transforms W_qtPQ(iq) on the fly (test-scale
+      // gate only: N_pair <= 4096). Reuses one scratch W_wpos across calls.
+      nda::array<ComplexType, 3> W_wpos_eta(nw_half_sec, Np, Np);
+      long W_wpos_eta_q = -1;
+      auto eta_W_slice = [&](long iq, long l) -> nda::array_view<ComplexType, 2> {
+        const long lpos = std::max(l, tools.w_mirror_b(l)) - nw_b_sec / 2;
+        if (dyn_src) {
+          if (W_wpos_eta_q != iq) {
+            _ft->tau_to_w_PHsym(W_qtPQ.value()(iq, nda::ellipsis{}), W_wpos_eta);
+            W_wpos_eta_q = iq;
+          }
+          return W_wpos_eta(lpos, all, all);
+        }
+        return Wdyn_qwPQ.value()(iq, l, all, all);  // (secondary path never hits this)
+      };
       if (ns * nkpts * nc * nc <= 4096) {
         vertex_secondary_detail::eta_max_over_q(
             "Z", X_glob, orb0_glob, nc, _Xb_skma, _t_qmP, kmq,
             [&](long iq) { return Z_qPQ(iq, all, all); });
-        if (Wdyn_qwPQ.has_value()) {
+        if (dyn_src) {
           vertex_secondary_detail::eta_max_over_q(
               "dW(nu_0)", X_glob, orb0_glob, nc, _Xb_skma, _t_qmP, kmq,
-              [&](long iq) { return Wdyn_qwPQ.value()(iq, tools.m0, all, all); });
+              [&](long iq) { return eta_W_slice(iq, tools.m0); });
           vertex_secondary_detail::eta_max_over_q(
               "dW(nu_max)", X_glob, orb0_glob, nc, _Xb_skma, _t_qmP, kmq,
-              [&](long iq) { return Wdyn_qwPQ.value()(iq, tools.nw_b - 1, all, all); });
+              [&](long iq) { return eta_W_slice(iq, tools.nw_b - 1); });
         }
       } else {
         app_log(2, "  Refinement 2: eta diagnostic skipped (N_pair = {} > 4096).",
@@ -1743,16 +1781,24 @@ namespace solvers {
       }
       Zb_qmm = nda::array<ComplexType, 3>(nqpts_ibz, _Nm, _Nm);
       nda::array<ComplexType, 2> tmp(_Nm, Np);
-      if (Wdyn_qwPQ.has_value())
+      // deferred-transform scratch: ONE W_wpos reused per q for the fold (never the full array)
+      nda::array<ComplexType, 3> W_wpos(nw_half_sec, Np, Np);
+      if (dyn_src)
         Wbdyn_qwmm.emplace(nda::array<ComplexType, 4>(nqpts_ibz, tools.nw_b, _Nm, _Nm));
       for (long iq = 0; iq < nqpts_ibz; ++iq) {
         auto t_q = _t_qmP(iq, all, all);
         vertex_secondary_detail::fold_core(t_q, Z_qPQ(iq, all, all), tmp,
                                            Zb_qmm(iq, all, all));
-        if (Wdyn_qwPQ.has_value())
-          for (long l = 0; l < tools.nw_b; ++l)
-            vertex_secondary_detail::fold_core(t_q, Wdyn_qwPQ.value()(iq, l, all, all),
+        if (dyn_src) {
+          // deferred tau -> nu for THIS q, then fold each l from the PH-unfolded slice
+          // (identical values/order to the old build-full-then-fold path)
+          _ft->tau_to_w_PHsym(W_qtPQ.value()(iq, nda::ellipsis{}), W_wpos);
+          for (long l = 0; l < tools.nw_b; ++l) {
+            const long lpos = std::max(l, tools.w_mirror_b(l)) - nw_b_sec / 2;
+            vertex_secondary_detail::fold_core(t_q, W_wpos(lpos, all, all),
                                                tmp, Wbdyn_qwmm.value()(iq, l, all, all));
+          }
+        }
       }
       // W-bar iteration cache consumption (notes/wbar_cache.md): the dynamic rung was
       // folded at update_w time on the positive half mesh; reconstruct the kernel's
