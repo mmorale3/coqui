@@ -30,6 +30,7 @@
 #include "methods/ERI/thc_reader_t.hpp"
 #include "methods/ERI/thc.h"    // Refinement 2: restricted-range ISDF point selection
 #include "vertex_t.h"
+#include "vertex_secondary_fold.hpp"  // Impl 2: distributed downfold of dW (no full Np^2 gather)
 #include "vertex_pi.icc"
 #include "vertex_sigma.icc"  // ISDF-Vertex Phase 1c: fused G^3 W^2 Sigma^C kernel
 
@@ -1829,27 +1830,43 @@ namespace solvers {
         app_log(2, "  Refinement 2: eta diagnostic skipped (N_pair = {} > 4096).",
                 ns * nkpts * nc * nc);
       }
+      // --- bare core Zbar = t Z t^dag ------------------------------------------------
+      // Z_qPQ is built LOCALLY on each rank from thc.Z(iq) (replicated (nq, Np, Np); see
+      // above) -- it is NOT gathered/folded from a distributed Np^2 block, so its fold
+      // stays the replicated fold_core (per Impl-2 design: "if Z_qPQ is already
+      // small/local, leave it"). The head is already folded into Z_qPQ(iq_gamma) above.
       Zb_qmm = nda::array<ComplexType, 3>(nqpts_ibz, _Nm, _Nm);
-      nda::array<ComplexType, 2> tmp(_Nm, Np);
-      // deferred-transform scratch: ONE W_wpos reused per q for the fold (never the full array)
-      nda::array<ComplexType, 3> W_wpos(nw_half_sec, Np, Np);
-      if (dyn_src)
+      {
+        nda::array<ComplexType, 2> tmpZ(_Nm, Np);
+        for (long iq = 0; iq < nqpts_ibz; ++iq)
+          vertex_secondary_detail::fold_core(_t_qmP(iq, all, all), Z_qPQ(iq, all, all),
+                                             tmpZ, Zb_qmm(iq, all, all));
+      }
+      // --- dynamic rung Wbar = t Wdyn(q,nu) t^dag: DISTRIBUTED downfold (Impl 2) --------
+      // Replaces the former per-q gather+fold of dW (gather_dW_one_q built a full
+      // (nt_half, Np, Np) tau slab per q -- 6.4 GB per (t,q) block @ production). Instead
+      // fold_dW_distributed assembles ONLY this rank's (P,Q) block over all t (a t-pool
+      // all_reduce over the disjoint t-partition -- exact), applies the Gamma head +
+      // tau->nu + PH-unfold on that block, folds it with fold_core_block, and sums the
+      // (P,Q)-block partials with one final comm all_reduce. NO full Np^2 slab is ever
+      // held. At Si test scale (np_P = np_Q = 1) there is one (P,Q) block and this reduces
+      // to the replicated fold BIT-IDENTICALLY (disjoint-block sum is exact). The forced
+      // (P,Q) split is exercised only by test_vertex_dfold. (notes ... section 6b.)
+      if (dyn_src) {
         Wbdyn_qwmm.emplace(nda::array<ComplexType, 4>(nqpts_ibz, tools.nw_b, _Nm, _Nm));
-      for (long iq = 0; iq < nqpts_ibz; ++iq) {
-        auto t_q = _t_qmP(iq, all, all);
-        vertex_secondary_detail::fold_core(t_q, Z_qPQ(iq, all, all), tmp,
-                                           Zb_qmm(iq, all, all));
-        if (dyn_src) {
-          // per-q tau slab gather (Step 1b) + deferred tau -> nu for THIS q, then fold each
-          // l from the PH-unfolded slice (identical values/order to the old build-full-then-
-          // fold path; gather_W_q reuses its cache from the eta sweep above when present)
-          _ft->tau_to_w_PHsym(gather_W_q(iq), W_wpos);
-          for (long l = 0; l < tools.nw_b; ++l) {
-            const long lpos = std::max(l, tools.w_mirror_b(l)) - nw_b_sec / 2;
-            vertex_secondary_detail::fold_core(t_q, W_wpos(lpos, all, all),
-                                               tmp, Wbdyn_qwmm.value()(iq, l, all, all));
-          }
-        }
+        auto head_add = [&](nda::MemoryArrayOfRank<2> auto&& W_bt_block, long it,
+                            nda::range const& P_rng, nda::range const& Q_rng) {
+          auto& eps = mb_state.eps_inv_head.value();
+          W_bt_block += ComplexType(eps(it).real()) * H_PQ(P_rng, Q_rng);
+        };
+        auto xform = [&](nda::MemoryArrayOfRank<3> auto&& W_bt_block,
+                         nda::MemoryArrayOfRank<3> auto&& W_bw_block) {
+          _ft->tau_to_w_PHsym(W_bt_block, W_bw_block);
+        };
+        vertex_secondary_detail::fold_dW_distributed(
+            mb_state.dW_qtPQ.value(), _t_qmP, nqpts_ibz, nt_half, Np, _Nm,
+            tools.nw_b, nw_half_sec, tools.w_mirror_b, iq_gamma, head_dyn_ok,
+            head_add, xform, Wbdyn_qwmm.value(), mpi->comm);
       }
       // W-bar iteration cache consumption (notes/wbar_cache.md): the dynamic rung was
       // folded at update_w time on the positive half mesh; reconstruct the kernel's

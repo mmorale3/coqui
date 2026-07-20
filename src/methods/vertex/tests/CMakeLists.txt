@@ -117,3 +117,18 @@ target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield eri_li
 
 add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
 set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR})
+
+# Vertex parallelization Impl 2: DISTRIBUTED downfold of dW (no full Np^2 gather)
+# (notes/vertex_parallelization_v2_plan.md section 6b). fold_dW_distributed folds the RPA
+# (t,P,Q)-distributed dynamic W to the secondary aux (N_m x N_m) via per-(P,Q)-block
+# partials + reduce, holding no full Np x Np block. The physics tests never split (P,Q)
+# (np_P = np_Q = 1 at Si scale) -- THIS test FORCES a 1x1x2x2 grid (at 4 ranks) and
+# compares to the replicated fold_core reference (<= 1e-12; bit-identical at 1 rank).
+set(TEST_ID methods_vertex_dfold)
+
+add_executable(test_${TEST_ID} test_vertex_dfold.cpp)
+target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield eri_lib hf_lib
+                      vertex_lib gw_lib scf_lib)
+
+add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
+set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR})
