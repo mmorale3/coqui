@@ -121,6 +121,35 @@ namespace solvers {
       return W_qtPQ;
     }
 
+    // Gather ONE global q slice of the RPA-grid distributed dW into a replicated
+    // (nt_half, Np, Np) array (notes/vertex_parallelization_v2_plan.md Step 1: per-q
+    // tau-domain gather). Returns EXACTLY gather_dW_replicated(dW, ...)( iq, :, :, : ):
+    // the q axis (axis 0) is a partition like every other, so this rank owns q=iq iff
+    // iq lies in its local_range(0); if so it writes its (t,P,Q) block at
+    // local_range(1..3) (indexing dW.local() at the local q offset iq - origin(0)),
+    // else it contributes zero. The all_reduce(plus) over the zero-padded buffer is the
+    // pure GATHER of that one slice -- bit-identical on every rank, and to slicing the
+    // all-q replicated array. Lets the secondary fold hold only one q of tau-domain W.
+    template<typename dArray_t, typename comm_t>
+    nda::array<ComplexType, 3>
+    gather_dW_one_q(dArray_t const& dW, comm_t& comm, long iq, long nt_half, long Np) {
+      auto gs = dW.global_shape();
+      utils::check(gs[1] == nt_half and gs[2] == Np and gs[3] == Np and
+                   iq >= 0 and iq < gs[0],
+                   "vertex_redist_detail::gather_dW_one_q: bad dW global shape "
+                   "({}, {}, {}, {}) or iq = {}; expected (*, {}, {}, {}) with 0 <= iq "
+                   "< {}.", gs[0], gs[1], gs[2], gs[3], iq, nt_half, Np, Np, gs[0]);
+      nda::array<ComplexType, 3> W_q(nt_half, Np, Np);
+      W_q() = ComplexType(0.0);
+      const long q0 = dW.origin()[0];
+      const long nq_loc = dW.local_shape()[0];
+      if (iq >= q0 and iq < q0 + nq_loc)
+        W_q(dW.local_range(1), dW.local_range(2), dW.local_range(3)) =
+            dW.local()(iq - q0, nda::ellipsis{});
+      comm.all_reduce_in_place_n(W_q.data(), W_q.size(), std::plus<>{});
+      return W_q;
+    }
+
     /**
      * REDUCE-SCATTER (vertex parallelization M3, change-list item #8;
      * notes/vertex_parallelization_M3.md). The Pi^C kernel produces a PARTIAL replicated
@@ -1595,58 +1624,63 @@ namespace solvers {
     // buffer per q -- so the replicated (nq, nw_b, Np, Np) array is never materialized
     // (16 TB @ production Np=20k).
     const bool dyn_src = (not use_wcache) and mb_state.dW_qtPQ.has_value();
-    std::optional<nda::array<ComplexType, 4>> W_qtPQ;  // tau-domain, kept for BOTH paths
+    std::optional<nda::array<ComplexType, 4>> W_qtPQ;  // tau-domain all-q, GLOBAL path only
     std::optional<nda::array<ComplexType, 4>> Wdyn_qwPQ;  // nu-domain, GLOBAL path only
     if (use_wcache and mb_state.dW_qtPQ.has_value())
       app_log(2, "  [NOTE] Pi^C: both the W-bar cache and mb_state.dW_qtPQ are present "
                  "-- consuming the CACHE\n"
                  "         (identical content when both were produced by the same "
                  "update_w).");
-    if (dyn_src) {
-      // M1 item #1: gather the RPA-grid dW into the replicated tau slab (bit-identical).
+    // Step 1b (notes/vertex_parallelization_v2_plan.md Step 1: per-q tau-domain gather).
+    // head insertion, dynamic piece, into dW(Gamma, tau) for one q's tau slab (weight
+    // Re[eps_inv_head(tau)]; same Re[.] convention as Sigma_div_correction, thc_gw.icc:506):
+    // add eps(it).real()*H_PQ into rows [0,nt_half) IN PLACE. Applied to the all-q slab at
+    // iq_gamma (GLOBAL) or to the per-q gathered slab when iq == iq_gamma (SECONDARY) --
+    // identical arithmetic either way. Returns whether the dynamic piece was actually added.
+    const bool head_dyn_ok = head_ok and dyn_src and mb_state.eps_inv_head.has_value();
+    if (dyn_src and head_ok) {
+      if (mb_state.eps_inv_head.has_value())
+        utils::check(mb_state.eps_inv_head.value().shape(0) == nt_half,
+                     "vertex_t::eval_Pi_C: eps_inv_head size {} != nt_half = {}.",
+                     mb_state.eps_inv_head.value().shape(0), nt_half);
+      else
+        app_log(1, "  [WARNING] Pi^C: dW is present but eps_inv_head is not in MBState "
+                   "-- the DYNAMIC head\n"
+                   "            piece is skipped (bare piece applied).");
+    }
+    // adds the dynamic head into the (nt_half, Np, Np) tau slab of q = iq_gamma, in place.
+    auto add_head_tau = [&](nda::MemoryArrayOfRank<3> auto&& W_t_gamma) {
+      auto& eps = mb_state.eps_inv_head.value();
+      for (long it = 0; it < nt_half; ++it)
+        W_t_gamma(it, all, all) += ComplexType(eps(it).real()) * H_PQ;
+    };
+    if (head_dyn_ok)
+      app_log(1, "  Pi^C head insertion: dynamic piece applied to dW(Gamma, tau) "
+                 "with eps_inv_head(tau=0) = {}", mb_state.eps_inv_head.value()(0).real());
+    if (dyn_src and not sec) {
+      // GLOBAL path: gather the all-q tau slab (bit-identical), head-augment iq_gamma,
+      // then materialize the full nu-domain Wdyn_qwPQ. The SECONDARY path instead gathers
+      // ONE q at a time inside the fold loop below (Step 1b), so neither the all-q tau
+      // slab nor the replicated Np^2 nu-array is built there (16 TB @ production Np=20k).
       W_qtPQ.emplace(vertex_redist_detail::gather_dW_replicated(
           mb_state.dW_qtPQ.value(), mpi->comm, nqpts_ibz, nt_half, Np));
-
-      // head insertion, dynamic piece (weight Re[eps_inv_head(tau)]) into dW(Gamma, tau),
-      // BEFORE the tau -> Matsubara transform (so the bosonic-mesh rung inherits it).
-      // Same Re[.] convention as Sigma_div_correction (thc_gw.icc:506).
-      if (head_ok) {
-        if (mb_state.eps_inv_head.has_value()) {
-          auto& eps = mb_state.eps_inv_head.value();
-          utils::check(eps.shape(0) == nt_half,
-                       "vertex_t::eval_Pi_C: eps_inv_head size {} != nt_half = {}.",
-                       eps.shape(0), nt_half);
-          for (long it = 0; it < nt_half; ++it)
-            W_qtPQ.value()(iq_gamma, it, all, all) += ComplexType(eps(it).real()) * H_PQ;
-          app_log(1, "  Pi^C head insertion: dynamic piece applied to dW(Gamma, tau) "
-                     "with eps_inv_head(tau=0) = {}", eps(0).real());
-        } else {
-          app_log(1, "  [WARNING] Pi^C: dW is present but eps_inv_head is not in MBState "
-                     "-- the DYNAMIC head\n"
-                     "            piece is skipped (bare piece applied).");
+      if (head_dyn_ok)
+        add_head_tau(W_qtPQ.value()(iq_gamma, nda::ellipsis{}));
+      long nw_b = tools.nw_b;
+      long nw_half = (nw_b % 2 == 0) ? nw_b / 2 : nw_b / 2 + 1;
+      Wdyn_qwPQ.emplace(nda::array<ComplexType, 4>(nqpts_ibz, nw_b, Np, Np));
+      nda::array<ComplexType, 3> W_wpos(nw_half, Np, Np);
+      for (long iq = 0; iq < nqpts_ibz; ++iq) {
+        auto W_t = W_qtPQ.value()(iq, nda::ellipsis{});
+        _ft->tau_to_w_PHsym(W_t, W_wpos);
+        // unfold to the full mesh assuming W(-nu) = W(nu) (PH-symmetric storage, same
+        // assumption as the SOSEX cache folding, thc_sosex.icc:970-976)
+        for (long l = 0; l < nw_b; ++l) {
+          long lpos = std::max(l, tools.w_mirror_b(l)) - nw_b / 2;
+          Wdyn_qwPQ.value()(iq, l, all, all) = W_wpos(lpos, all, all);
         }
       }
-
-      // GLOBAL path only: materialize the full nu-domain Wdyn_qwPQ. In the SECONDARY
-      // path the tau -> nu transform is deferred into the per-q fold loop below (Step 1a),
-      // so the replicated Np^2 nu-array is never built.
-      if (not sec) {
-        long nw_b = tools.nw_b;
-        long nw_half = (nw_b % 2 == 0) ? nw_b / 2 : nw_b / 2 + 1;
-        Wdyn_qwPQ.emplace(nda::array<ComplexType, 4>(nqpts_ibz, nw_b, Np, Np));
-        nda::array<ComplexType, 3> W_wpos(nw_half, Np, Np);
-        for (long iq = 0; iq < nqpts_ibz; ++iq) {
-          auto W_t = W_qtPQ.value()(iq, nda::ellipsis{});
-          _ft->tau_to_w_PHsym(W_t, W_wpos);
-          // unfold to the full mesh assuming W(-nu) = W(nu) (PH-symmetric storage, same
-          // assumption as the SOSEX cache folding, thc_sosex.icc:970-976)
-          for (long l = 0; l < nw_b; ++l) {
-            long lpos = std::max(l, tools.w_mirror_b(l)) - nw_b / 2;
-            Wdyn_qwPQ.value()(iq, l, all, all) = W_wpos(lpos, all, all);
-          }
-        }
-      }
-    } else if (not use_wcache) {
+    } else if (not dyn_src and not use_wcache) {
       // FIRST ITERATION (loud): nothing to screen with yet, in either path.
       app_log(1, "  [NOTE] Pi^C: no dynamic W in MBState{} (first iteration) -- "
                  "using the bare-interaction rung W = Z only.\n",
@@ -1739,24 +1773,40 @@ namespace solvers {
       build_secondary_basis(thc, X_glob, orb0_glob, kmq, iq_gamma);
       app_log(1, "  Refinement 2: Pi^C runs in the SECONDARY basis (N_m = {} vs Np = {}); "
                  "upfold Pi^C = t^dag Pibar t.", _Nm, Np);
-      // Step 1a (notes/vertex_parallelization_v2_plan.md Step 1): in the SECONDARY path
-      // the full nu-domain Wdyn_qwPQ (replicated Np^2) is NOT materialized. The tau -> nu
-      // transform is deferred into the per-q fold below, reusing ONE W_wpos(nw_half, Np, Np)
-      // buffer per q. This is bitwise-equivalent to "build full Wdyn_qwPQ then fold": for
-      // each (iq, l) the value folded is exactly W_wpos(lpos) with the SAME PH-unfold map
+      // Step 1a/1b (notes/vertex_parallelization_v2_plan.md Step 1: per-q tau-domain
+      // gather): in the SECONDARY path neither the all-q tau slab W_qtPQ (nq*nt*Np^2) nor
+      // the full nu-domain Wdyn_qwPQ (nq*nw_b*Np^2) is materialized. For each q we gather
+      // ONE tau slab W_q (nt_half, Np, Np) from the distributed dW (bit-identical to the
+      // all-q gather sliced at that q), head-augment it if iq == iq_gamma, then defer the
+      // tau -> nu transform into the fold below (reusing ONE W_wpos per q). Bitwise-
+      // equivalent to "gather all-q + augment iq_gamma + build full Wdyn_qwPQ then fold":
+      // each (iq, l) folds exactly W_wpos(lpos) with the SAME PH-unfold map
       // lpos = max(l, w_mirror_b(l)) - nw_b/2 the global build applies.
       const long nw_b_sec = tools.nw_b;
       const long nw_half_sec = (nw_b_sec % 2 == 0) ? nw_b_sec / 2 : nw_b_sec / 2 + 1;
+      // per-q tau slab source: gather q = iq from the distributed dW into the reused W_q_src
+      // and head-augment at iq_gamma -- the exact tau slab the all-q path fed to tau_to_w.
+      nda::array<ComplexType, 3> W_q_src(nt_half, Np, Np);
+      long W_q_src_q = -1;
+      auto gather_W_q = [&](long iq) -> nda::array_view<ComplexType, 3> {
+        if (W_q_src_q != iq) {
+          W_q_src = vertex_redist_detail::gather_dW_one_q(
+              mb_state.dW_qtPQ.value(), mpi->comm, iq, nt_half, Np);
+          if (head_dyn_ok and iq == iq_gamma) add_head_tau(W_q_src());
+          W_q_src_q = iq;
+        }
+        return W_q_src();
+      };
       // eta W-accessor: returns the Np x Np nu-slice at bosonic index l. Global path reads
-      // the prebuilt Wdyn_qwPQ; secondary path transforms W_qtPQ(iq) on the fly (test-scale
-      // gate only: N_pair <= 4096). Reuses one scratch W_wpos across calls.
+      // the prebuilt Wdyn_qwPQ; secondary path transforms the per-q gathered W_q(iq) on the
+      // fly (test-scale gate only: N_pair <= 4096). Reuses one scratch W_wpos across calls.
       nda::array<ComplexType, 3> W_wpos_eta(nw_half_sec, Np, Np);
       long W_wpos_eta_q = -1;
       auto eta_W_slice = [&](long iq, long l) -> nda::array_view<ComplexType, 2> {
         const long lpos = std::max(l, tools.w_mirror_b(l)) - nw_b_sec / 2;
         if (dyn_src) {
           if (W_wpos_eta_q != iq) {
-            _ft->tau_to_w_PHsym(W_qtPQ.value()(iq, nda::ellipsis{}), W_wpos_eta);
+            _ft->tau_to_w_PHsym(gather_W_q(iq), W_wpos_eta);
             W_wpos_eta_q = iq;
           }
           return W_wpos_eta(lpos, all, all);
@@ -1790,9 +1840,10 @@ namespace solvers {
         vertex_secondary_detail::fold_core(t_q, Z_qPQ(iq, all, all), tmp,
                                            Zb_qmm(iq, all, all));
         if (dyn_src) {
-          // deferred tau -> nu for THIS q, then fold each l from the PH-unfolded slice
-          // (identical values/order to the old build-full-then-fold path)
-          _ft->tau_to_w_PHsym(W_qtPQ.value()(iq, nda::ellipsis{}), W_wpos);
+          // per-q tau slab gather (Step 1b) + deferred tau -> nu for THIS q, then fold each
+          // l from the PH-unfolded slice (identical values/order to the old build-full-then-
+          // fold path; gather_W_q reuses its cache from the eta sweep above when present)
+          _ft->tau_to_w_PHsym(gather_W_q(iq), W_wpos);
           for (long l = 0; l < tools.nw_b; ++l) {
             const long lpos = std::max(l, tools.w_mirror_b(l)) - nw_b_sec / 2;
             vertex_secondary_detail::fold_core(t_q, W_wpos(lpos, all, all),
