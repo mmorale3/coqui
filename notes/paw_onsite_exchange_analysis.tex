@@ -338,4 +338,94 @@ written above; the $0.052$~Ha numerical closure supports this. Before implementi
 reproduce the decomposition at a second system (e.g.\ LiH or a 3$d$ oxide, where
 on-site exchange is larger) to confirm the missing-term identity holds beyond Si $sp$.
 
+\section{Implementation status and open items (update)}
+
+Route A was implemented on the \code{paw} branch. This section records what was
+done, what is verified, and the two issues that remain before it is production-ready
+and numerically confirmed against ABINIT.
+
+\subsection*{What was implemented (committed)}
+\begin{itemize}[leftmargin=1.4em]
+  \item \code{build\_qrad\_tab\_full\_aeps} (\code{paw\_aug\_q\_eval.hpp}): Hankel
+    transform of the \emph{full} AE$-$PS pair density
+    $D_{ijv}(r)=\phi_{n_b}\phi_{m_b}-\tilde\phi_{n_b}\tilde\phi_{m_b}$ per $\beta$
+    pair, reusing the same $ijv$/$L$ layout as the compensation table so it drops
+    into \code{evaluate\_Q\_IJ\_at\_K\_fast} unchanged.
+  \item \code{v\_x\_paw.hpp}: \textbf{both} the diagonal ($nii$) and full
+    density-matrix ($nij$, GW natural-orbital) exchange kernels take a
+    \code{shape\_restored} flag; when set, PAW species use the full-AE$-$PS table
+    and the \code{deltaC} block is skipped. USPP is unaffected.
+  \item \code{pseudopot::set\_paw\_exx\_shape\_restored()} threads the flag through
+    \code{add\_exchange}. \textbf{Default off}, so the compensated path and all
+    existing direct-vs-THC tests are unchanged.
+  \item An env-gated (\code{COQUI\_PAW\_SHAPE\_RESTORED}) analogue in the THC
+    augmentation, and env-gated direct-exchange diagnostics in \code{rpa.cpp}.
+\end{itemize}
+
+\subsection*{What is verified}
+The hamiltonian unit test \code{vexchange\_shape\_restored} passes on a PAW fixture:
+Option A genuinely changes the exchange ($\max|\Delta K| = 5.6\times10^{-4}$), and
+the \textbf{full density-matrix ($nij$) path equals the diagonal ($nii$) path to
+$3.3\times10^{-16}$} (machine precision) under Option A. This validates the
+implementation and the GW density-matrix handling.
+
+\subsection*{Open item 1 --- the augmentation grid (THC vs direct)}
+The sharp AE$-$PS pair density $D$ must be resolved on the \emph{dense} grid. For Si
+$a=10.20$ the smooth grid is $18^3$ ($\sim$60~Ry) and the dense grid is $48^3$
+(ecutrho $=121$~a.u., comparable to ABINIT's \code{ecutsigx}).
+\begin{itemize}[leftmargin=1.4em]
+  \item The \textbf{THC} augmentation runs on the \emph{smooth} grid, so with the
+    full-AE$-$PS form factor it captures only $\sim$6\,\% of the on-site correction:
+    vv exchange $-1.7382 \to -1.7350$ (measured), vs.\ the dense-grid target
+    $-1.6863$. The compensation charge worked on the smooth grid only because it is
+    smooth by construction.
+  \item The \textbf{direct} \code{v\_x\_paw} already uses the dense grid
+    (\code{fft\_mesh\_aug}) and is therefore the correct-grid path.
+\end{itemize}
+\emph{Consequence:} a production THC Option A needs the augmentation migrated to the
+dense grid; the direct path is correct today via \code{set\_paw\_exx\_shape\_restored(true)}.
+
+\subsection*{Open item 2 --- the direct path is too slow (why, vs ABINIT)}
+The direct \code{v\_x} is correct but, as written, intractable for meshes with many
+$k$-points (it timed out at every configuration on Si $a=10.20$, and even on Si
+$2\times2\times2$). ABINIT computes the same physics in seconds. The difference is
+purely implementation:
+\begin{center}
+\begin{tabular}{p{4.6cm}p{4.6cm}}
+\toprule
+\textbf{ABINIT} (\code{m\_pawpwij.F90}) & \textbf{CoQu\'i direct \code{v\_x}} \\
+\midrule
+Radial form-factor spline built \textbf{once} over a \emph{bounded} $q$-grid ($\le$
+ecutsigx $\approx 10$~a.u.) &
+qrad Bessel table \textbf{rebuilt every \code{v\_x} call}, over an oversized
+$K$-range \\
+$K$-range $\sim$ ecutsigx sphere &
+\code{K\_max\_est} $=$ abs-sum of dense FFT-box corners $\approx 77$~a.u.
+($n_K \approx 7700$; $\sim$$4\times10^7$ \code{sph\_bessel} evals per table) \\
+Works over the compact plane-wave sphere $\code{npwx} \approx 1591$--$4477$ &
+Works over the \emph{full} dense FFT grid $nnr = 110592$ (incl.\ box corners outside
+the physical sphere) \\
+One \textbf{vectorized} \code{splfit} over all $npwx$ per $(IJ,L)$; no allocation &
+\textbf{scalar} evaluation per $(g,I,J)$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+Empirically the run hangs in the \code{v\_x} setup phase, consistent with the
+oversized per-call qrad-table build dominating.
+
+\paragraph{Fix (planned/in progress).}
+(1) Bound \code{K\_max} to the physical cutoff (true grid-corner max / ecutrho
+sphere) instead of the abs-sum; (2) restrict the augmentation build $+$ Coulomb sum
+to the $G$-sphere ($\sim$ecutsigx), not the full FFT box; (3) build the form-factor
+table \emph{once} (cache across the two passes) and vectorize the radial evaluation
+(no per-$(g,I,J)$ allocation). With these, the direct path should match ABINIT's cost
+and finally allow the number-vs-number confirmation
+(Si $2\times2\times2$ target: shape-restored $=$ ABINIT full-onsite $-1.316447$~Ha;
+$a=10.20$: $-1.6863$~Ha).
+
+\paragraph{Confirmation status.} \textbf{Not yet numerically confirmed against
+ABINIT.} The $nij$/density-matrix correctness and the by-construction equivalence are
+established; the code-vs-code energy match awaits the direct-path speedup above (or a
+dense-grid THC augmentation).
+
 \end{document}
