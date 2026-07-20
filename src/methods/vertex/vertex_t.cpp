@@ -26,6 +26,7 @@
 #include "nda/linalg/eigenelements.hpp"
 
 #include "utilities/check.hpp"
+#include "utilities/proc_grid_partition.hpp"  // Impl 2b: {1,nP,nQ} grid for distributed Z fold
 #include "numerics/sparse/csr_blas.hpp"   // csrmm for the symmetry D-matrix blocks
 #include "methods/ERI/thc_reader_t.hpp"
 #include "methods/ERI/thc.h"    // Refinement 2: restricted-range ISDF point selection
@@ -1578,17 +1579,31 @@ namespace solvers {
     auto X_skPa = sX_skPa.local();
 
     // ---- bare coulomb Z(q) (thc.Z is collective: call uniformly on all ranks) ---------
-    nda::array<ComplexType, 3> Z_qPQ(nqpts_ibz, Np, Np);
-    for (long iq = 0; iq < nqpts_ibz; ++iq)
-      Z_qPQ(iq, all, all) = thc.Z(int(iq));
+    // GLOBAL path: build the full replicated (nq, Np, Np) Z_qPQ (the kernel + tripwire read
+    // it). SECONDARY path (Impl 2b): do NOT materialize the replicated all-q Z (320 GB @
+    // production Np = 20000) -- it is folded DISTRIBUTED from thc.dZ below. Z_qPQ stays a
+    // default-empty (0-sized) array; the only secondary-path reads of the full Z are the
+    // TEST-SCALE gated diagnostics (eta[Z], no-leak tripwire), which pull the small
+    // replicated thc.Z(iq) locally inside their own gated branches.
+    const bool sec_z = secondary();
+    nda::array<ComplexType, 3> Z_qPQ;
+    if (not sec_z) {
+      Z_qPQ = nda::array<ComplexType, 3>(nqpts_ibz, Np, Np);
+      for (long iq = 0; iq < nqpts_ibz; ++iq)
+        Z_qPQ(iq, all, all) = thc.Z(int(iq));
+    }
 
-    // head insertion, bare piece (weight 1) into Z(Gamma) -- (H1) of the memo
+    // head insertion, bare piece (weight 1) into Z(Gamma) -- (H1) of the memo. H_PQ is built
+    // uniformly on all ranks (build_head_rank1 is collective) in BOTH paths; the GLOBAL path
+    // adds it into Z_qPQ(Gamma) here, the SECONDARY path adds the block into the distributed
+    // Z fold below (fold_Z_distributed head_add). (H_PQ is still the replicated Np^2 head at
+    // Gamma only; rank-1/distributing it is a separate later micro-step.)
     nda::array<ComplexType, 2> H_PQ(Np, Np);
     bool head_ok = false;
     if (head_insertion) {
       head_ok = vertex_head_detail::build_head_rank1(thc, iq_gamma, nkpts, H_PQ);
       if (head_ok) {
-        Z_qPQ(iq_gamma, all, all) += H_PQ;
+        if (not sec_z) Z_qPQ(iq_gamma, all, all) += H_PQ;
         double h_max = 0.0;
         for (auto const& v : H_PQ) h_max = std::max(h_max, std::abs(v));
         app_log(1, "  Pi^C head insertion: madelung = {}, |H|_max = {} (bare piece "
@@ -1814,10 +1829,20 @@ namespace solvers {
         }
         return Wdyn_qwPQ.value()(iq, l, all, all);  // (secondary path never hits this)
       };
+      // TEST-SCALE ONLY diagnostics (eta[Z], no-leak tripwire) still need the full
+      // replicated Z(iq). In the secondary path Z_qPQ is NOT materialized (Impl 2b), so pull
+      // the small replicated thc.Z(iq) locally, head-augmented at Gamma exactly as the global
+      // build did (Z(iq_gamma) += H_PQ). thc.Z(iq) is collective -- these branches are gated
+      // on a GLOBAL condition and loop over all iq uniformly, so every rank calls it in lockstep.
+      auto z_local = [&](long iq) {
+        nda::array<ComplexType, 2> Zq = thc.Z(int(iq));
+        if (head_ok and iq == iq_gamma) Zq += H_PQ;
+        return Zq;
+      };
       if (ns * nkpts * nc * nc <= 4096) {
         vertex_secondary_detail::eta_max_over_q(
             "Z", X_glob, orb0_glob, nc, _Xb_skma, _t_qmP, kmq,
-            [&](long iq) { return Z_qPQ(iq, all, all); });
+            [&](long iq) { return z_local(iq); });
         if (dyn_src) {
           vertex_secondary_detail::eta_max_over_q(
               "dW(nu_0)", X_glob, orb0_glob, nc, _Xb_skma, _t_qmP, kmq,
@@ -1830,17 +1855,31 @@ namespace solvers {
         app_log(2, "  Refinement 2: eta diagnostic skipped (N_pair = {} > 4096).",
                 ns * nkpts * nc * nc);
       }
-      // --- bare core Zbar = t Z t^dag ------------------------------------------------
-      // Z_qPQ is built LOCALLY on each rank from thc.Z(iq) (replicated (nq, Np, Np); see
-      // above) -- it is NOT gathered/folded from a distributed Np^2 block, so its fold
-      // stays the replicated fold_core (per Impl-2 design: "if Z_qPQ is already
-      // small/local, leave it"). The head is already folded into Z_qPQ(iq_gamma) above.
+      // --- bare core Zbar = t Z t^dag: DISTRIBUTED downfold (Impl 2b) ----------------
+      // Replaces the former replicated (nq, Np, Np) Z_qPQ build + fold_core loop (320 GB @
+      // production Np = 20000). thc.dZ({1, nP, nQ}) gives Z distributed over (P,Q) with q
+      // NOT split; fold_Z_distributed folds each rank's own (P,Q) block with fold_core_block
+      // and sums the disjoint-block partials with one final comm all_reduce. No rank ever
+      // holds the full Np^2. Simpler than fold_dW_distributed: Z has no t axis => no t-pool,
+      // no tau->nu, no PH-unfold. At Si test scale (nP = nQ = 1) there is one (P,Q) block ==
+      // the whole array and this is BIT-IDENTICAL to the replicated fold_core (disjoint-block
+      // sum is exact). The Gamma head is added into the gamma block via head_add (same
+      // Z(iq_gamma) += H_PQ semantics; H_PQ is still the replicated Np^2 head, block-sliced --
+      // rank-1/distributing it is a separate later micro-step).
       Zb_qmm = nda::array<ComplexType, 3>(nqpts_ibz, _Nm, _Nm);
       {
-        nda::array<ComplexType, 2> tmpZ(_Nm, Np);
-        for (long iq = 0; iq < nqpts_ibz; ++iq)
-          vertex_secondary_detail::fold_core(_t_qmP(iq, all, all), Z_qPQ(iq, all, all),
-                                             tmpZ, Zb_qmm(iq, all, all));
+        // {1, nP, nQ} grid: q unsplit, (P,Q) balanced over comm; nP*nQ == comm.size().
+        const long np_ranks = mpi->comm.size();
+        std::array<long, 3> z_pgrid = {1, 1, 1};
+        z_pgrid[1] = utils::find_proc_grid_min_diff(np_ranks, Np, Np);
+        z_pgrid[2] = np_ranks / z_pgrid[1];
+        auto dZ = thc.dZ(z_pgrid);
+        auto z_head_add = [&](nda::MemoryArrayOfRank<2> auto&& A_PQ_block,
+                              nda::range const& P_rng, nda::range const& Q_rng) {
+          A_PQ_block += H_PQ(P_rng, Q_rng);   // bare piece, weight 1 (matches global Z += H)
+        };
+        vertex_secondary_detail::fold_Z_distributed(
+            dZ, _t_qmP, nqpts_ibz, Np, _Nm, iq_gamma, head_ok, z_head_add, Zb_qmm, mpi->comm);
       }
       // --- dynamic rung Wbar = t Wdyn(q,nu) t^dag: DISTRIBUTED downfold (Impl 2) --------
       // Replaces the former per-q gather+fold of dW (gather_dW_one_q built a full
@@ -1970,11 +2009,16 @@ namespace solvers {
       nda::array<ComplexType, 2> Pi_up0(Np, Np), tmp(Np, _Nm);
       double leak_max = 0.0;
       for (long iq = 0; iq < nqpts_ibz; ++iq) {
+        // full replicated Z(iq) for the bare-Z pairing: pulled locally (secondary path no
+        // longer materializes Z_qPQ; Impl 2b). thc.Z is collective and this loop is uniform
+        // across ranks. Head-augment at Gamma exactly as the global build (Z += H_PQ).
+        nda::array<ComplexType, 2> Zq = thc.Z(int(iq));
+        if (head_ok and iq == iq_gamma) Zq += H_PQ;
         vertex_secondary_detail::upfold_core(_t_qmP(iq, all, all), Pibar_m0(iq, all, all),
                                              tmp, Pi_up0);
         ComplexType S_up(0.0), S_bar(0.0);
         for (long M = 0; M < Np; ++M)
-          for (long N = 0; N < Np; ++N) S_up += Pi_up0(M, N) * Z_qPQ(iq, N, M);
+          for (long N = 0; N < Np; ++N) S_up += Pi_up0(M, N) * Zq(N, M);
         for (long m = 0; m < _Nm; ++m)
           for (long n = 0; n < _Nm; ++n) S_bar += Pibar_m0(iq, m, n) * Zb_qmm(iq, n, m);
         leak_max = std::max(leak_max, std::abs(S_up - S_bar) /

@@ -177,6 +177,86 @@ void fold_dW_distributed(dArray_t const& dW,
   comm.all_reduce_in_place_n(Wbar_qwmm.data(), Wbar_qwmm.size(), std::plus<>{});
 }
 
+/**
+ * Impl 2b -- DISTRIBUTED downfold of the BARE Coulomb core Z (theoryB Eq. 36) to the
+ * secondary aux (N_m x N_m), WITHOUT ever materializing the replicated (nq, Np, Np) Z_qPQ
+ * (320 GB @ production Np = 20000). This is the fold_dW_distributed sibling, but SIMPLER:
+ * Z has NO t axis, so there is no t-pool, no tau -> nu transform, no PH-unfold. The q axis
+ * is NOT split ({1, nP, nQ}); each (P,Q) block is owned by exactly one rank, so EVERY rank
+ * folds its own block directly (no "t_pool root" guard) and the final comm all_reduce sums
+ * the disjoint (P,Q)-block partials.
+ *
+ *   dZ           : distributed_array, global (nq, Np, Np), grid {1, nP, nQ}
+ *   t_qmP        : replicated (nq, N_m, Np) downfold maps
+ *   iq_gamma     : Gamma q index; head_at_gamma: whether to add the head block there
+ *   head_add     : head_add(A_PQ_block, P_range, Q_range) -- adds the head block into the
+ *                  gamma (P,Q) block in place, mirroring the legacy Z_qPQ(iq_gamma) += H_PQ
+ *                  (bare piece, weight 1). P_range/Q_range are this rank's block ranges into
+ *                  the GLOBAL P,Q. Called at iq_gamma only.
+ *   Zbar_qmm     : OUTPUT (nq, N_m, N_m); zeroed and filled here (fully replicated on comm).
+ *   comm         : the WHOLE communicator dZ is distributed over
+ *
+ * At Si test scale (nP = nQ = 1) there is ONE (P,Q) block == the whole array; fold_core_block
+ * with the full range == fold_core, and the final all_reduce sums one rank's result with zeros
+ * => BIT-IDENTICAL to the replicated fold. The forced (P,Q) split is exercised only by
+ * test_vertex_dfold.
+ */
+template<typename dArray_t, typename TArr, typename HeadFn, typename OutArr>
+void fold_Z_distributed(dArray_t const& dZ,
+                        TArr const& t_qmP,
+                        long nqpts_ibz, long Np, long Nm,
+                        long iq_gamma, bool head_at_gamma,
+                        HeadFn&& head_add,
+                        OutArr&& Zbar_qmm,
+                        boost::mpi3::communicator& comm) {
+  decltype(nda::range::all) all;
+  auto gs = dZ.global_shape();
+  auto grd = dZ.grid();
+  utils::check(gs[0] == nqpts_ibz and gs[1] == Np and gs[2] == Np,
+               "vertex_secondary_detail::fold_Z_distributed: unexpected dZ global shape "
+               "({}, {}, {}); expected ({}, {}, {}).",
+               gs[0], gs[1], gs[2], nqpts_ibz, Np, Np);
+  utils::check(grd[0] == 1,
+               "vertex_secondary_detail::fold_Z_distributed: the q axis of dZ must NOT be "
+               "split (grid[0] = {} != 1).", grd[0]);
+  // Each (P,Q) block is owned exactly once (proper {1,nP,nQ} partition => nP*nQ == comm.size);
+  // every rank folds its own block directly. If a block were replicated we would double count.
+  utils::check(grd[1] * grd[2] == comm.size(),
+               "vertex_secondary_detail::fold_Z_distributed: grid {{1, {}, {}}} does not "
+               "partition comm.size() = {} (would double/under count blocks).",
+               grd[1], grd[2], comm.size());
+
+  const auto org = dZ.origin();          // {q_org(0), P_org, Q_org}
+  const long P_org = org[1], Q_org = org[2];
+  const auto lsh = dZ.local_shape();     // {nq, P_bs, Q_bs}
+  const long P_bs = lsh[1], Q_bs = lsh[2];
+  nda::range P_range(P_org, P_org + P_bs);
+  nda::range Q_range(Q_org, Q_org + Q_bs);
+
+  auto Z_loc = dZ.local();               // (nq, P_bs, Q_bs)
+
+  Zbar_qmm = ComplexType(0.0);
+
+  nda::array<ComplexType, 2> A_PQ(P_bs, Q_bs);           // my block (mutable copy: head add)
+  nda::array<ComplexType, 2> tmp_mQ(Nm, Q_bs);           // fold scratch
+
+  for (long iq = 0; iq < nqpts_ibz; ++iq) {
+    A_PQ() = Z_loc(iq, all, all);
+    // Gamma head into my block BEFORE the fold (same order as the legacy
+    // Z_qPQ(iq_gamma) += H_PQ; block-sliced to my P_range/Q_range).
+    if (head_at_gamma and iq == iq_gamma)
+      head_add(A_PQ(), P_range, Q_range);
+
+    auto t_q = t_qmP(iq, all, all);                       // (N_m x Np)
+    auto t_qP = t_q(all, P_range);                        // (N_m x P_bs)
+    auto t_qQ = t_q(all, Q_range);                        // (N_m x Q_bs)
+    fold_core_block(t_qP, t_qQ, A_PQ, tmp_mQ, Zbar_qmm(iq, all, all));
+  }
+
+  // sum the (P,Q)-block partials -> the fully replicated downfolded bare core.
+  comm.all_reduce_in_place_n(Zbar_qmm.data(), Zbar_qmm.size(), std::plus<>{});
+}
+
 } // vertex_secondary_detail
 } // solvers
 } // methods

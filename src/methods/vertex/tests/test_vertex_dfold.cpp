@@ -261,4 +261,102 @@ TEST_CASE("vertex_dfold_distributed", "[methods][vertex][dfold]") {
   }
 }
 
+// deterministic, distribution-independent global bare-core value Z(q,P,Q). Reuses dwref at a
+// fixed tau slice so the Z fold shares the harness's value generator (Z has no t axis).
+static ComplexType zref(long q, long P, long Q, long Np) { return dwref(q, 0, P, Q, Np); }
+
+/**
+ * Impl 2b -- DISTRIBUTED downfold of the BARE core Z (fold_Z_distributed) unit test.
+ * fold_Z_distributed folds the (q,P,Q)-distributed Z to the secondary aux (N_m x N_m) WITHOUT
+ * gathering any full Np x Np block. The physics tests never exercise the (P,Q) split (at Si
+ * scale the dZ grid is {1,1,1}). THIS test FORCES {1, nP, nQ} grids that split P and Q (4
+ * ranks: 1x2x2, 1x1x4, 1x4x1) so the (P,Q)-block off-diagonal fold_core_block path is driven,
+ * and compares to a fully-REPLICATED reference (gather Z, fold_core each q on the full Np x Np).
+ * The two must agree to <= 1e-12. At 1 rank the grid is 1x1x1 (one (P,Q) block == the whole
+ * array) and the distributed path reduces to the replicated fold BIT-IDENTICALLY.
+ */
+TEST_CASE("vertex_zfold_distributed", "[methods][vertex][dfold]") {
+  using methods::solvers::vertex_secondary_detail::fold_Z_distributed;
+  auto world = boost::mpi3::environment::get_world_instance();
+  const long P = world.size();
+  decltype(nda::range::all) all;
+
+  const long nq = 3, Np = 6, Nm = 3;
+  const long iq_gamma = 1;
+  const bool head_at_gamma = true;
+
+  // replicated downfold maps t(q)(m, P).
+  nda::array<ComplexType, 3> t_qmP(nq, Nm, Np);
+  for (long q = 0; q < nq; ++q)
+    for (long m = 0; m < Nm; ++m)
+      for (long jp = 0; jp < Np; ++jp) t_qmP(q, m, jp) = tref(q, m, jp);
+
+  // head_add closure: adds the head BLOCK H(P,Q) into the gamma block in place (bare piece,
+  // weight 1 -- mirrors the production Z(iq_gamma) += H_PQ). Layout-independent.
+  auto head_add = [&](nda::MemoryArrayOfRank<2> auto&& A_PQ_block,
+                      nda::range const& P_rng, nda::range const& Q_rng) {
+    for (long ip = P_rng.first(); ip < P_rng.last(); ++ip)
+      for (long jq = Q_rng.first(); jq < Q_rng.last(); ++jq)
+        A_PQ_block(ip - P_rng.first(), jq - Q_rng.first()) += href(ip, jq, Np);
+  };
+
+  // --- REPLICATED reference: full Np x Np gather + head + fold_core each q -----------------
+  nda::array<ComplexType, 3> Zbar_ref(nq, Nm, Nm);
+  Zbar_ref() = ComplexType(0.0);
+  {
+    nda::array<ComplexType, 2> A(Np, Np);
+    for (long q = 0; q < nq; ++q) {
+      for (long ip = 0; ip < Np; ++ip)
+        for (long jq = 0; jq < Np; ++jq) A(ip, jq) = zref(q, ip, jq, Np);
+      if (head_at_gamma and q == iq_gamma)
+        for (long ip = 0; ip < Np; ++ip)
+          for (long jq = 0; jq < Np; ++jq) A(ip, jq) += href(ip, jq, Np);
+      ref_fold(t_qmP(q, all, all), A, Zbar_ref(q, all, all));
+    }
+  }
+
+  // --- run the DISTRIBUTED downfold on several forced {1, nP, nQ} grids (q NEVER split) ----
+  using larray = nda::array<ComplexType, 3>;
+  auto run_grid = [&](shape_t<3> grid) {
+    auto dZ = make_distributed_array<larray>(world, grid, {nq, Np, Np}, {1, 1, 1});
+    auto loc = dZ.local();
+    auto [q0, P0, Q0] = dZ.origin();
+    auto ls = dZ.local_shape();
+    for (long iq = 0; iq < ls[0]; ++iq)
+      for (long ip = 0; ip < ls[1]; ++ip)
+        for (long jq = 0; jq < ls[2]; ++jq)
+          loc(iq, ip, jq) = zref(q0 + iq, P0 + ip, Q0 + jq, Np);
+
+    nda::array<ComplexType, 3> Zbar_dist(nq, Nm, Nm);
+    fold_Z_distributed(dZ, t_qmP, nq, Np, Nm, iq_gamma, head_at_gamma, head_add,
+                       Zbar_dist, world);
+
+    double worst = 0.0;
+    for (long q = 0; q < nq; ++q)
+      for (long m = 0; m < Nm; ++m)
+        for (long n = 0; n < Nm; ++n)
+          worst = std::max(worst, std::abs(Zbar_dist(q, m, n) - Zbar_ref(q, m, n)));
+    world.all_reduce_in_place_n(&worst, 1, boost::mpi3::max<>{});
+    if (world.root())
+      app_log(1, "vertex_zfold_distributed[P={} grid=(q,P,Q)=({},{},{})]: distributed "
+                 "downfold == replicated reference (max|diff| = {:.3e}).",
+              P, grid[0], grid[1], grid[2], worst);
+    return worst;
+  };
+
+  // enumerate legal grids {1, nP, nQ} with nP*nQ == P, nP,nQ <= Np. At 4 ranks this is
+  // exactly {1,2,2}, {1,1,4}, {1,4,1} -- the mandated (P,Q)-split coverage.
+  std::vector<shape_t<3>> grids;
+  for (long nP = 1; nP <= P; ++nP) {
+    if (P % nP != 0) continue;
+    long nQ = P / nP;
+    if (nP > Np or nQ > Np) continue;
+    grids.push_back({1, nP, nQ});
+  }
+  REQUIRE(not grids.empty());
+  bool worst_ok = true;
+  for (auto const& g : grids) worst_ok = worst_ok and (run_grid(g) <= 1e-12);
+  REQUIRE(worst_ok);
+}
+
 } // namespace bdft_tests
