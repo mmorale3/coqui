@@ -1593,19 +1593,50 @@ namespace solvers {
         Z_qPQ(iq, all, all) = thc.Z(int(iq));
     }
 
-    // head insertion, bare piece (weight 1) into Z(Gamma) -- (H1) of the memo. H_PQ is built
-    // uniformly on all ranks (build_head_rank1 is collective) in BOTH paths; the GLOBAL path
-    // adds it into Z_qPQ(Gamma) here, the SECONDARY path adds the block into the distributed
-    // Z fold below (fold_Z_distributed head_add). (H_PQ is still the replicated Np^2 head at
-    // Gamma only; rank-1/distributing it is a separate later micro-step.)
-    nda::array<ComplexType, 2> H_PQ(Np, Np);
+    // head insertion, bare piece (weight 1) into Z(Gamma) -- (H1) of the memo. The head is
+    // EXACTLY rank-1 (build_head_rank1): H_PQ = N_k * madelung * conj(chi_g) chi_g^T with
+    // chi_g = thc.basis_head()(iq_gamma, :). The GLOBAL path materializes the dense (Np x Np)
+    // H_PQ and adds it into Z_qPQ(Gamma) here. The SECONDARY path (Impl 2c) NEVER materializes
+    // the dense Np^2 head (6.4 GB @ production Np = 20000): it captures the Np-vector chi_g and
+    // the scalar c = N_k * madelung, and rebuilds each (P,Q) block on the fly from those
+    // (vertex_secondary_detail::head_block_add) inside the distributed W/Z fold closures and
+    // the test-scale diagnostics -- bit-identical per element to the dense-H slice.
+    nda::array<ComplexType, 2> H_PQ;                  // GLOBAL path only (0-sized in secondary)
+    nda::array<ComplexType, 1> chi_g;                 // SECONDARY path: chi(iq_gamma, :)
+    ComplexType head_c = ComplexType(0.0);            // SECONDARY path: c = N_k * madelung
     bool head_ok = false;
     if (head_insertion) {
-      head_ok = vertex_head_detail::build_head_rank1(thc, iq_gamma, nkpts, H_PQ);
+      if (not sec_z) {
+        // GLOBAL path: dense rank-1 head (unchanged from the legacy build).
+        H_PQ = nda::array<ComplexType, 2>(Np, Np);
+        head_ok = vertex_head_detail::build_head_rank1(thc, iq_gamma, nkpts, H_PQ);
+      } else {
+        // SECONDARY path: replicate build_head_rank1's skip logic EXACTLY (madelung == 0 or an
+        // all-zero chi(iq_gamma, :) => head_ok = false, no head) WITHOUT the dense Np^2 matrix.
+        const double xi = MF->madelung();
+        auto chi = thc.basis_head();                 // (nqpts_ibz, Np)
+        utils::check(chi.shape(0) > iq_gamma and chi.shape(1) == Np,
+                     "vertex_t::eval_Pi_C: basis_head shape mismatch (({}, {}) vs iq_gamma = "
+                     "{}, Np = {}).", chi.shape(0), chi.shape(1), iq_gamma, Np);
+        double chi_max = 0.0;
+        for (long P = 0; P < Np; ++P) chi_max = std::max(chi_max, std::abs(chi(iq_gamma, P)));
+        if (xi != 0.0 and chi_max != 0.0) {
+          chi_g = nda::array<ComplexType, 1>(chi(iq_gamma, all));   // Np-vector copy (~KB)
+          head_c = ComplexType(double(nkpts) * xi);
+          head_ok = true;
+        }
+      }
       if (head_ok) {
         if (not sec_z) Z_qPQ(iq_gamma, all, all) += H_PQ;
         double h_max = 0.0;
-        for (auto const& v : H_PQ) h_max = std::max(h_max, std::abs(v));
+        if (not sec_z) {
+          for (auto const& v : H_PQ) h_max = std::max(h_max, std::abs(v));
+        } else {
+          // |H_PQ|_max = |c| * (max_P |chi_g(P)|)^2 (rank-1, no dense matrix needed).
+          double cg_max = 0.0;
+          for (long P = 0; P < Np; ++P) cg_max = std::max(cg_max, std::abs(chi_g(P)));
+          h_max = std::abs(head_c) * cg_max * cg_max;
+        }
         app_log(1, "  Pi^C head insertion: madelung = {}, |H|_max = {} (bare piece "
                    "applied to Z(Gamma))", MF->madelung(), h_max);
       } else {
@@ -1800,6 +1831,18 @@ namespace solvers {
       // lpos = max(l, w_mirror_b(l)) - nw_b/2 the global build applies.
       const long nw_b_sec = tools.nw_b;
       const long nw_half_sec = (nw_b_sec % 2 == 0) ? nw_b_sec / 2 : nw_b_sec / 2 + 1;
+      // SECONDARY-path rank-1 tau head (Impl 2c): adds the dynamic head into the (nt_half, Np,
+      // Np) tau slab of q = iq_gamma from chi_g + head_c, WITHOUT the dense Np^2 H_PQ. Per
+      // element head_block_add reproduces add_head_tau's `+= ComplexType(eps(it).real()) * H_PQ`
+      // bit-for-bit (weight * (c*conj(chi_g)*chi_g) == weight * H_PQ(P,Q)).
+      const nda::range head_all_P(0, Np), head_all_Q(0, Np);
+      auto add_head_tau_sec = [&](nda::MemoryArrayOfRank<3> auto&& W_t_gamma) {
+        auto& eps = mb_state.eps_inv_head.value();
+        for (long it = 0; it < nt_half; ++it)
+          vertex_secondary_detail::head_block_add(
+              chi_g, head_c, ComplexType(eps(it).real()), head_all_P, head_all_Q,
+              W_t_gamma(it, all, all));
+      };
       // per-q tau slab source: gather q = iq from the distributed dW into the reused W_q_src
       // and head-augment at iq_gamma -- the exact tau slab the all-q path fed to tau_to_w.
       nda::array<ComplexType, 3> W_q_src(nt_half, Np, Np);
@@ -1808,7 +1851,7 @@ namespace solvers {
         if (W_q_src_q != iq) {
           W_q_src = vertex_redist_detail::gather_dW_one_q(
               mb_state.dW_qtPQ.value(), mpi->comm, iq, nt_half, Np);
-          if (head_dyn_ok and iq == iq_gamma) add_head_tau(W_q_src());
+          if (head_dyn_ok and iq == iq_gamma) add_head_tau_sec(W_q_src());
           W_q_src_q = iq;
         }
         return W_q_src();
@@ -1836,7 +1879,9 @@ namespace solvers {
       // on a GLOBAL condition and loop over all iq uniformly, so every rank calls it in lockstep.
       auto z_local = [&](long iq) {
         nda::array<ComplexType, 2> Zq = thc.Z(int(iq));
-        if (head_ok and iq == iq_gamma) Zq += H_PQ;
+        if (head_ok and iq == iq_gamma)
+          vertex_secondary_detail::head_block_add(chi_g, head_c, ComplexType(1.0),
+                                                  head_all_P, head_all_Q, Zq());
         return Zq;
       };
       if (ns * nkpts * nc * nc <= 4096) {
@@ -1876,7 +1921,10 @@ namespace solvers {
         auto dZ = thc.dZ(z_pgrid);
         auto z_head_add = [&](nda::MemoryArrayOfRank<2> auto&& A_PQ_block,
                               nda::range const& P_rng, nda::range const& Q_rng) {
-          A_PQ_block += H_PQ(P_rng, Q_rng);   // bare piece, weight 1 (matches global Z += H)
+          // bare piece, weight 1 (matches the global Z += H); Impl 2c rank-1 block, no dense
+          // H_PQ -- head_block_add reproduces H_PQ(P,Q) bit-for-bit per element.
+          vertex_secondary_detail::head_block_add(chi_g, head_c, ComplexType(1.0),
+                                                  P_rng, Q_rng, A_PQ_block);
         };
         vertex_secondary_detail::fold_Z_distributed(
             dZ, _t_qmP, nqpts_ibz, Np, _Nm, iq_gamma, head_ok, z_head_add, Zb_qmm, mpi->comm);
@@ -1895,8 +1943,12 @@ namespace solvers {
         Wbdyn_qwmm.emplace(nda::array<ComplexType, 4>(nqpts_ibz, tools.nw_b, _Nm, _Nm));
         auto head_add = [&](nda::MemoryArrayOfRank<2> auto&& W_bt_block, long it,
                             nda::range const& P_rng, nda::range const& Q_rng) {
+          // dynamic piece, weight Re[eps_inv_head(tau)] (matches the legacy
+          // += ComplexType(eps(it).real()) * H_PQ); Impl 2c rank-1 block, no dense H_PQ.
           auto& eps = mb_state.eps_inv_head.value();
-          W_bt_block += ComplexType(eps(it).real()) * H_PQ(P_rng, Q_rng);
+          vertex_secondary_detail::head_block_add(chi_g, head_c,
+                                                  ComplexType(eps(it).real()),
+                                                  P_rng, Q_rng, W_bt_block);
         };
         auto xform = [&](nda::MemoryArrayOfRank<3> auto&& W_bt_block,
                          nda::MemoryArrayOfRank<3> auto&& W_bw_block) {
@@ -2013,7 +2065,9 @@ namespace solvers {
         // longer materializes Z_qPQ; Impl 2b). thc.Z is collective and this loop is uniform
         // across ranks. Head-augment at Gamma exactly as the global build (Z += H_PQ).
         nda::array<ComplexType, 2> Zq = thc.Z(int(iq));
-        if (head_ok and iq == iq_gamma) Zq += H_PQ;
+        if (head_ok and iq == iq_gamma)
+          vertex_secondary_detail::head_block_add(chi_g, head_c, ComplexType(1.0),
+                                                  nda::range(0, Np), nda::range(0, Np), Zq());
         vertex_secondary_detail::upfold_core(_t_qmP(iq, all, all), Pibar_m0(iq, all, all),
                                              tmp, Pi_up0);
         ComplexType S_up(0.0), S_bar(0.0);
