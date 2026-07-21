@@ -164,7 +164,8 @@ namespace solvers {
              std::string div_treatment = "ignore_g0",
              std::string isdf_mode = "global",
              long isdf_rank = -1,
-             double isdf_svd_tol = 1e-8);
+             double isdf_svd_tol = 1e-8,
+             double isdf_thresh = -1.0);
 
     vertex_t(vertex_t const&) = default;
     vertex_t(vertex_t &&) = default;
@@ -310,6 +311,10 @@ namespace solvers {
     long _isdf_rank = -1;
     // relative SVD cutoff on B(q) in the truncated pseudo-inverse for t(q)
     double _isdf_svd_tol = 1e-8;
+    // secondary-ISDF point-selection threshold override (-1 = default to the global
+    // THC thresh, thc.thresh()). A tighter value than the global thresh pushes the
+    // selected interpolating vectors outside the global-basis span -> ill-conditioned.
+    double _isdf_thresh = -1.0;
     // geometry-fixed cache (built lazily on the first kernel evaluation)
     bool _secondary_ready = false;
     long _Nm = 0;                          // ACTUAL secondary rank (selection may

@@ -831,9 +831,11 @@ namespace solvers {
                      std::string div_treatment,
                      std::string isdf_mode,
                      long isdf_rank,
-                     double isdf_svd_tol):
+                     double isdf_svd_tol,
+                     double isdf_thresh):
     _ft(ft), _vertex_type(std::move(vertex_type)), _band_window(band_window),
-    _isdf_mode(std::move(isdf_mode)), _isdf_rank(isdf_rank), _isdf_svd_tol(isdf_svd_tol) {
+    _isdf_mode(std::move(isdf_mode)), _isdf_rank(isdf_rank), _isdf_svd_tol(isdf_svd_tol),
+    _isdf_thresh(isdf_thresh) {
 
     const std::unordered_set<std::string> valid_vertex_types = {"none", "2nd_exchange"};
     utils::check(valid_vertex_types.find(_vertex_type) != valid_vertex_types.end(),
@@ -902,28 +904,48 @@ namespace solvers {
     const long nc = subspace_rank();
     const long Npair = ns * nkpts * nc * nc;   // the pair index carries momentum
                                                // (CLAUDE.md section 2, invariant 4)
-    const long Nm_req = (_isdf_rank > 0) ? _isdf_rank : nc * nc * nkpts;
+    long Nm_req = (_isdf_rank > 0) ? _isdf_rank : nc * nc * nkpts;
     utils::check(Nm_req <= Npair,
                  "vertex_t::build_secondary_basis: vertex_isdf_rank = {} exceeds the "
                  "subspace pair rank N_pair = ns*nk*nc^2 = {}; the secondary basis "
                  "cannot usefully exceed the space it represents.", Nm_req, Npair);
+    // Cap the secondary rank at the GLOBAL basis size Np: the secondary ISDF lives inside
+    // the span of the global THC basis, so it must never request more interpolating vectors
+    // than the global basis has (out-ranking it selects near-null directions and makes the
+    // secondary metric s = B^dag B ill-conditioned -- the companion guard to sec_thresh below).
+    Nm_req = std::min(Nm_req, (long)thc.Np());
+
+    // Secondary-ISDF point-selection threshold. It DEFAULTS to the SAME thresh used for
+    // the GLOBAL THC basis (thc.thresh()) unless vertex_isdf_thresh (>0) overrides it.
+    // Over-resolving the C pair-density metric (e.g. the old hardcoded 1e-13) selects
+    // interpolating vectors that leave the span of the global basis, so the transfer
+    // t(q) = pinv(B) picks up near-null directions and s becomes ill-conditioned
+    // (kp444/M8: N_m=2075 > global Np=1086, cond(s)~1e25). thc.thresh() is -1.0 when the
+    // global THC was built via the nIpts-only path (no thresh set); fall back to a sane
+    // 1e-6 in that case so the pivoted Cholesky still has a meaningful stop criterion.
+    double sec_thresh = (_isdf_thresh > 0.0) ? _isdf_thresh : thc.thresh();
+    if (sec_thresh <= 0.0) {
+      app_log(1, "  Refinement 2: global THC thresh is unset (nIpts-only path); "
+                 "defaulting secondary-ISDF selection thresh to 1e-6.");
+      sec_thresh = 1e-6;
+    }
 
     app_log(1, "\n  Refinement 2: building the secondary ISDF basis on the subspace C "
                "(rank M = {}, {})\n"
-               "  requested N_m = {}, svd_tol(B) = {}, N_pair (per q, spin-stacked) = {}\n",
+               "  requested N_m = {}, svd_tol(B) = {}, sec_thresh = {} (global THC thresh = {}), "
+               "N_pair (per q, spin-stacked) = {}\n",
             nc, _wannier ? "Wannier projector" : "band window",
-            Nm_req, _isdf_svd_tol, Npair);
+            Nm_req, _isdf_svd_tol, sec_thresh, thc.thresh(), Npair);
 
     // ---- restricted-range ISDF point selection (collective on thc.mpi()->comm) --------
-    // Private methods::thc builder on the SAME MF/mpi context; thresh = 1e-13 makes the
-    // pivoted Cholesky STOP cleanly at the numerical rank of the C pair-density metric
-    // instead of hard-aborting at the 1e-14 guard (memo DECISION 4). The greedy pivot
-    // order also makes rank scans nested (first N of a larger selection = selection of N).
+    // Private methods::thc builder on the SAME MF/mpi context using sec_thresh above; the
+    // greedy pivot order makes rank scans nested (first N of a larger selection = a
+    // selection of N).
     {
       ptree pt;
-      pt.put("thresh", 1e-13);
+      pt.put("thresh", sec_thresh);
       // the blocked pivoted Cholesky is not robust at near-zero thresholds (thc.icc
-      // forces block_size = 1 itself when thresh == 0.0; at thresh = 1e-13 with the
+      // forces block_size = 1 itself when thresh == 0.0; at very tight thresh with the
       // default block 8 it produces NaN residuals) -- use the serial pivot order,
       // which is also the exactly-nested greedy order the rank scans rely on
       pt.put("chol_block_size", 1);

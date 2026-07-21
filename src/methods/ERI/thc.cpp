@@ -157,7 +157,8 @@ void thc::print_metadata()
 }
 
 template<MEMORY_SPACE MEM>
-auto thc::interpolating_points(int iq, int max, nda::range a_range, nda::range b_range)
+auto thc::interpolating_points(int iq, int max, nda::range a_range, nda::range b_range,
+                               double* eff_thresh)
       -> std::tuple<memory::array<MEM,long,1>,
                      _darray_t_<MEM,4>,
                      std::optional<_darray_t_<MEM,4>>
@@ -181,18 +182,19 @@ auto thc::interpolating_points(int iq, int max, nda::range a_range, nda::range b
   auto Q  = mf->Qpts()(iq,nda::range::all);
   bool gamma = (Q(0)*Q(0)+Q(1)*Q(1)+Q(2)*Q(2) < 1e-8);
   if((a_range==b_range) and gamma and (mf->nkpts()!=mf->nkpts_ibz()) ) {
-      auto return_v = chol_metric_impl_ibz<MEM,true,true>(iq,max,a_range,b_range,default_cholesky_block_size);
+      auto return_v = chol_metric_impl_ibz<MEM,true,true>(iq,max,a_range,b_range,default_cholesky_block_size,eff_thresh);
       Timer.stop("TOTAL");
       return return_v;
   } else {
-      auto return_v = chol_metric_impl<MEM,true,true>(iq,max,a_range,b_range,default_cholesky_block_size, C_skai);
+      auto return_v = chol_metric_impl<MEM,true,true>(iq,max,a_range,b_range,default_cholesky_block_size, C_skai, eff_thresh);
       Timer.stop("TOTAL");
-      return return_v; 
+      return return_v;
   }
 }
 
 template<MEMORY_SPACE MEM>
-auto thc::interpolating_points(nda::MemoryArrayOfRank<4> auto const& C_skai, int iq, int max) 
+auto thc::interpolating_points(nda::MemoryArrayOfRank<4> auto const& C_skai, int iq, int max,
+                               double* eff_thresh)
       -> std::tuple<memory::array<MEM,long,1>,
                      _darray_t_<MEM,4>,
                      std::optional<_darray_t_<MEM,4>>
@@ -216,7 +218,7 @@ auto thc::interpolating_points(nda::MemoryArrayOfRank<4> auto const& C_skai, int
 
   nda::range a_range(C_skai.extent(2));
   nda::range b_range(mf->nbnd());
-  auto return_v = chol_metric_impl<MEM,true,true>(iq,max,a_range,b_range,default_cholesky_block_size,std::addressof(C_skai));
+  auto return_v = chol_metric_impl<MEM,true,true>(iq,max,a_range,b_range,default_cholesky_block_size,std::addressof(C_skai),eff_thresh);
   Timer.stop("TOTAL");
   return return_v;
 }
@@ -563,19 +565,19 @@ using mpi3::communicator;
 template std::tuple<array<M,long,1>,  \
     darray_t<array<M,ComplexType,4>,communicator>,   \
     std::optional<darray_t<array<M,ComplexType,4>,communicator>>>  \
-thc::interpolating_points<M>(int,int,range,range);  \
+thc::interpolating_points<M>(int,int,range,range,double*);  \
 template std::tuple<array<M,long,1>,  \
     darray_t<array<M,ComplexType,4>,communicator>,   \
     std::optional<darray_t<array<M,ComplexType,4>,communicator>>>  \
-thc::interpolating_points<M>(array<M,ComplexType,4> const&,int,int);  \
+thc::interpolating_points<M>(array<M,ComplexType,4> const&,int,int,double*);  \
 template std::tuple<array<M,long,1>,  \
     darray_t<array<M,ComplexType,4>,communicator>,   \
     std::optional<darray_t<array<M,ComplexType,4>,communicator>>>  \
-thc::interpolating_points<M>(array_view<M,ComplexType,4> const&,int,int); \
+thc::interpolating_points<M>(array_view<M,ComplexType,4> const&,int,int,double*); \
 template std::tuple<array<M,long,1>,  \
     darray_t<array<M,ComplexType,4>,communicator>,   \
     std::optional<darray_t<array<M,ComplexType,4>,communicator>>>  \
-thc::interpolating_points<M>(array_view<M,ComplexType,4,nda::C_layout> const&,int,int);
+thc::interpolating_points<M>(array_view<M,ComplexType,4,nda::C_layout> const&,int,int,double*);
 
 
 // evaluate

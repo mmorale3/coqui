@@ -158,6 +158,11 @@ inline void ensure_checkpoint(std::shared_ptr<mf::MF> mf, std::string const& out
  *  - vertex_isdf_svd_tol: "1e-8" Relative SVD cutoff on the secondary pair collocation
  *                 B(q) in the truncated pseudo-inverse solve for t(q) (the secondary
  *                 metric s = B^dag B is regularized at the square of this value).
+ *  - vertex_isdf_thresh: "-1" Point-selection threshold for the secondary ISDF pivoted
+ *                 Cholesky ("secondary" only). -1 defaults to the GLOBAL THC thresh
+ *                 ([interaction.thc] thresh) so the selected interpolating vectors stay
+ *                 in the span of the global basis; a tighter override over-resolves the
+ *                 C pair-density metric and yields an ill-conditioned secondary metric.
  *  - vertex_wannier_file: "" Path to a TRIQS-compatible wan.h5 (proj_mat + band_window;
  *                 gw solver only). When set, the vertex subspace C becomes the span of
  *                 the M Wannier orbitals |w_a(k)> = sum_i U_ia(k)|psi_i(k)> read from the
@@ -260,6 +265,8 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     io::tolower(vertex_isdf);
     auto vertex_isdf_rank = io::get_value_with_default<long>(pt,"vertex_isdf_rank",-1);
     auto vertex_isdf_svd_tol = io::get_value_with_default<double>(pt,"vertex_isdf_svd_tol",1e-8);
+    // Secondary-ISDF point-selection thresh (-1 = default to the global THC thresh)
+    auto vertex_isdf_thresh = io::get_value_with_default<double>(pt,"vertex_isdf_thresh",-1.0);
     // Wannier-projector subspace C (notes/wannier_projector_theory.md): when set, the
     // vertex subspace is span{ w_a(k) } from a TRIQS-compatible wan.h5 (proj_mat +
     // band_window) instead of the band window; U is Loewdin-orthonormalized at load.
@@ -278,7 +285,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     // vertex_t must outlive the scf_loop below. Both cuts (Sigma^C and Pi^C)
     // are switched together through this single object -- never one alone.
     solvers::vertex_t vertex(&ft, vertex_type, vertex_band_window, mf->nbnd(), div_treatment,
-                             vertex_isdf, vertex_isdf_rank, vertex_isdf_svd_tol);
+                             vertex_isdf, vertex_isdf_rank, vertex_isdf_svd_tol, vertex_isdf_thresh);
     if (vertex.enabled()) {
       utils::check(screen_type == "rpa" or screen_type == "rpa_k",
                    "vertex_type = \"{}\" currently requires screen_type = \"rpa\" or \"rpa_k\" "
@@ -530,6 +537,8 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
     io::tolower(vertex_isdf);
     auto vertex_isdf_rank = io::get_value_with_default<long>(pt,"vertex_isdf_rank",-1);
     auto vertex_isdf_svd_tol = io::get_value_with_default<double>(pt,"vertex_isdf_svd_tol",1e-8);
+    // Secondary-ISDF point-selection thresh (-1 = default to the global THC thresh)
+    auto vertex_isdf_thresh = io::get_value_with_default<double>(pt,"vertex_isdf_thresh",-1.0);
     // Wannier-projector subspace C (notes/wannier_projector_theory.md): when set, the
     // vertex subspace is span{ w_a(k) } from a TRIQS-compatible wan.h5 (proj_mat +
     // band_window) instead of the band window; U is Loewdin-orthonormalized at load.
@@ -548,7 +557,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
     // vertex_t must outlive the scf_loop below. Both cuts (Sigma^C and Pi^C)
     // are switched together through this single object -- never one alone.
     solvers::vertex_t vertex(&ft, vertex_type, vertex_band_window, mf->nbnd(), div_treatment,
-                             vertex_isdf, vertex_isdf_rank, vertex_isdf_svd_tol);
+                             vertex_isdf, vertex_isdf_rank, vertex_isdf_svd_tol, vertex_isdf_thresh);
     if (vertex.enabled()) {
       utils::check(screen_type == "rpa" or screen_type == "rpa_k",
                    "vertex_type = \"{}\" currently requires screen_type = \"rpa\" or \"rpa_k\" "

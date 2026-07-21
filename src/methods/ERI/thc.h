@@ -122,18 +122,21 @@ class thc
    *         - distributed array for phi^{k}_a on interpolating points: (ns, nkpts, nbnd_a, Np)
    *         - distributed array for phi^{k-q}_b on interpolating points: (ns, nkpts, nbnd_b, Np)
    */
+  // eff_thresh (optional): on return, receives the ACHIEVED residual of the underlying
+  // pivoted-Cholesky point selection (the basis's effective threshold). nullptr = ignored.
   template<MEMORY_SPACE MEM = HOST_MEMORY>
   auto interpolating_points(int iq = 0, int max = -1,
               nda::range a_range = nda::range(-1,-1),
-              nda::range b_range = nda::range(-1,-1))
+              nda::range b_range = nda::range(-1,-1),
+              double* eff_thresh = nullptr)
        -> std::tuple<memory::array<MEM,long,1>,
-                     _darray_t_<MEM,4>, 
+                     _darray_t_<MEM,4>,
                      std::optional<_darray_t_<MEM,4>>
-                    >; 
+                    >;
 
   template<MEMORY_SPACE MEM = HOST_MEMORY>
-  auto interpolating_points(nda::MemoryArrayOfRank<4> auto const& C_skai, 
-              int iq = 0, int max = -1)
+  auto interpolating_points(nda::MemoryArrayOfRank<4> auto const& C_skai,
+              int iq = 0, int max = -1, double* eff_thresh = nullptr)
        -> std::tuple<memory::array<MEM,long,1>,
                      _darray_t_<MEM,4>,
                      std::optional<_darray_t_<MEM,4>>
@@ -565,9 +568,12 @@ class thc
                      std::array<long, 3> pgrid,
                      std::array<long, 3> block_size);
 
+  // eff_thresh (optional): on return, receives the ACHIEVED residual at pivoted-Cholesky
+  // exit (the effective threshold of the selected basis, which differs from the requested
+  // thresh whenever the nIpts/nmax cap stopped the loop first). nullptr = not requested.
   template<MEMORY_SPACE MEM = HOST_MEMORY, bool Ipts_only, bool return_Ruv, typename Tensor_t>
-  auto chol_metric_impl(int iq, int nmax, nda::range a_range, nda::range b_range, int block_size, 
-                        Tensor_t const* C_skai);
+  auto chol_metric_impl(int iq, int nmax, nda::range a_range, nda::range b_range, int block_size,
+                        Tensor_t const* C_skai, double* eff_thresh = nullptr);
 
   /**
    * [symmetry-adapted version]
@@ -600,8 +606,10 @@ class thc
    *             - distributed array for phi^{k}_a on interpolating points: (ns, nkpts, nbnd_a, Np)
    *             - distributed array for phi^{k-q}_b on interpolating points: (ns, nkpts, nbnd_b, Np)
    */
+  // eff_thresh (optional): see chol_metric_impl -- receives the ACHIEVED residual at exit.
   template<MEMORY_SPACE MEM = HOST_MEMORY, bool Ipts_only, bool return_Ruv>
-  auto chol_metric_impl_ibz(int iq, int nmax, nda::range a_range, nda::range b_range, int block_size);
+  auto chol_metric_impl_ibz(int iq, int nmax, nda::range a_range, nda::range b_range, int block_size,
+                            double* eff_thresh = nullptr);
   //auto chol_metric_impl(int iq, int nmax, nda::range a_range, nda::range b_range, int block_size);
 
 

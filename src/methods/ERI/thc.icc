@@ -40,7 +40,8 @@ namespace methods
 {
 
 template<MEMORY_SPACE MEM, bool Ipts_only, bool return_Ruv>
-auto thc::chol_metric_impl_ibz(int iq, int nIpts, nda::range a_range, nda::range b_range, int block_size)
+auto thc::chol_metric_impl_ibz(int iq, int nIpts, nda::range a_range, nda::range b_range, int block_size,
+                               double* eff_thresh)
 {
   if constexpr (Ipts_only) {
     Timer.start("IntPts");
@@ -613,10 +614,15 @@ auto thc::chol_metric_impl_ibz(int iq, int nIpts, nda::range a_range, nda::range
       if (nIpts > 0 and nchol < nIpts) {
         app_log(1, "[WARNING] thresh={} reached after {} interpolating points, before reaching requested nIpts={}.", thresh, nchol, nIpts);
       }
+      old_max = curr_max;  // keep old_max == last residual on this exit path too
       break;
     }
     old_max = find_max();
-  }  
+  }
+  // old_max now holds the ACHIEVED residual at loop exit (every break path: the top-of-
+  // loop thresh break, the nIpts/nmax-exhaustion break, and the mid-body thresh break all
+  // leave old_max == last residual). Report it as the effective threshold of this basis.
+  if (eff_thresh != nullptr) *eff_thresh = old_max;
   Timer.stop("IpIter");
 
   if constexpr (Ipts_only) {
@@ -761,7 +767,7 @@ auto thc::chol_metric_impl_ibz(int iq, int nIpts, nda::range a_range, nda::range
 
 template<MEMORY_SPACE MEM, bool Ipts_only, bool return_Ruv, typename Tensor_t>
 auto thc::chol_metric_impl(int iq, int nIpts, nda::range a_range, nda::range b_range, int block_size,
-                           Tensor_t const* C_skai)
+                           Tensor_t const* C_skai, double* eff_thresh)
 {
   if constexpr (Ipts_only) {
     Timer.start("IntPts");
@@ -1332,9 +1338,13 @@ auto thc::chol_metric_impl(int iq, int nIpts, nda::range a_range, nda::range b_r
           std::string("       Found invalid residual:{}"),curr_max);
 
     // stopping condition when thresh is set
-    if( thresh > 0.0 and thresh > curr_max) break;
+    if( thresh > 0.0 and thresh > curr_max) { old_max = curr_max; break; }
     old_max = curr_max;
   }
+  // old_max now holds the ACHIEVED residual at loop exit (every break path: the top-of-
+  // loop thresh break, the nIpts/nmax-exhaustion break, and the mid-body thresh break all
+  // leave old_max == last residual). Report it as the effective threshold of this basis.
+  if (eff_thresh != nullptr) *eff_thresh = old_max;
   Timer.stop("IpIter");
 
   if constexpr (Ipts_only) {

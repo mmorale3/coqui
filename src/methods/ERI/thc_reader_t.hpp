@@ -104,6 +104,11 @@ namespace methods {
       if (thresh < 0.0) {
         thresh = (_Np > 0) ? 1e-13 : 1e-5;
       }
+      // Seed the EFFECTIVE threshold with the RESOLVED requested thresh so it is meaningful
+      // before/without point selection (e.g. the read-existing path, which never calls
+      // build()). build() overwrites this with the ACHIEVED residual once the global
+      // interpolating points are selected -- see thresh().
+      _effective_thresh = thresh;
       utils::check( _Np>0 or thresh>0.0, "Error in thc_reader_t: Must set nIpts and/or thresh");
       if(_storage == eri_storage_e::outcore and _eri_file == "") 
         _eri_file = "./thc.eri.h5";
@@ -210,8 +215,12 @@ namespace methods {
 
       _Timer.start("BUILD_THC");
       {
-        auto eval = [&]<MEMORY_SPACE MEM>() { 
-          auto [ri,dXa,dXb] = _thc_builder_opt.value().interpolating_points<MEM>(0, _Np, x_range, y_range);
+        auto eval = [&]<MEMORY_SPACE MEM>() {
+          double eff = _effective_thresh;
+          auto [ri,dXa,dXb] = _thc_builder_opt.value().interpolating_points<MEM>(0, _Np, x_range, y_range, &eff);
+          // The pivoted-Cholesky may have stopped on the nIpts cap before reaching the
+          // requested thresh; store the ACHIEVED residual as the effective threshold.
+          _effective_thresh = eff;
           _rp = std::move(ri);
           _Np = _rp.size();
           _Timer.stop("BUILD_THC");
@@ -827,6 +836,13 @@ namespace methods {
     bool initialized() const { return _initialized; }
     bool thc_builder_is_null() const { return _thc_builder_opt == std::nullopt; }
     int Np() const { return _Np; }
+    // The EFFECTIVE threshold of the GLOBAL THC basis: seeded from the resolved requested
+    // thresh at construction, then overwritten in build() with the ACHIEVED pivoted-
+    // Cholesky residual (which is what the requested thresh describes only when thresh --
+    // not the nIpts cap -- stopped point selection). Consumers (e.g. the vertex secondary
+    // ISDF) reuse this so a secondary selection lands in the span of the global basis
+    // rather than over-resolving past its actual resolution.
+    double thresh() const { return _effective_thresh; }
     int nkpts() const { return _nkpts; }
     int nkpts_ibz() const { return _nkpts_ibz; }
     int nqpts() const { return _nqpts; }
@@ -959,6 +975,8 @@ namespace methods {
     std::optional<thc> _thc_builder_opt;
 
     int _Np;
+    double _effective_thresh = -1.0;   // effective global-THC thresh: resolved-requested at
+                                       // construction, ACHIEVED residual after build() (see thresh())
     int _nkpts;
     int _nkpts_ibz;
     int _nqpts;
