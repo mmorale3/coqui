@@ -2104,29 +2104,58 @@ namespace solvers {
                  "max_q = {}", leak_max);
     }
 
-    // ---- upfold (secondary) + tau conversion ON THE PARTIAL (linear -> commutes with the
-    //      rank sum), then REDUCE-SCATTER into the RPA grid (M3 item #8) ------------------
-    nda::array<ComplexType, 4> Pi_tqMN(nt_half, nqpts_ibz, Np, Np);
-    if (sec) {
-      // upfold the PARTIAL Pi_bar -> partial Pi_up (Np x Np), then tau-convert the partial
-      nda::array<ComplexType, 4> Pi_up(tools.nw_b, nqpts_ibz, Np, Np);
-      nda::array<ComplexType, 2> tmp(Np, _Nm);
-      for (long iq = 0; iq < nqpts_ibz; ++iq)
-        for (long l = 0; l < tools.nw_b; ++l)
-          vertex_secondary_detail::upfold_core(_t_qmP(iq, all, all), Pi_wqMN(l, iq, all, all),
-                                               tmp, Pi_up(l, iq, all, all));
-      vertex_pi::pi_w_to_code_tau(*_ft, tools, Pi_up, Pi_tqMN);
-    } else {
-      vertex_pi::pi_w_to_code_tau(*_ft, tools, Pi_wqMN, Pi_tqMN);
-    }
-
-    // reduce-scatter the partial Pi_tqMN into the caller's RPA-distributed layout: every
-    // output block is summed across ranks and lands ONLY on its owner (no full-array
-    // all_reduce, no persistent full replicated result -- only the transient partial +
-    // the owned block). On one rank this is a bit-identical copy.
+    // ---- upfold + tau conversion, then materialize the RPA-distributed Pi^C -------------
+    // The upfold (t^dag Pibar t) and the tau conversion are LINEAR and commute with the
+    // round-robin rank sum, so both may be applied to the PARTIAL Pi_wqMN.
     auto dPi_C_tqPQ = math::nda::make_distributed_array<memory::array<HOST_MEMORY, ComplexType, 4>>(
         mpi->comm, pi_pgrid, pi_gshape, pi_bsize);
-    vertex_redist_detail::reduce_scatter_into(Pi_tqMN, dPi_C_tqPQ, mpi->comm);
+    if (sec) {
+      // SECONDARY: distribute the Np^2 upfold over the RPA (P,Q) grid (adjoint of
+      // fold_dW_distributed). The full Np^2 upfold partial (~5-11 GB/rank at production Np)
+      // is never materialized; each rank upfolds ONLY its owned (P,Q) block directly into
+      // dPi_C_tqPQ.local(). First sum the SMALL N_m^2 partial across comm (upfold+tau are
+      // linear, so the rank sum before the upfold == reduce-scatter after -- same identity
+      // the removed reduce_scatter_into cited).
+      mpi->comm.all_reduce_in_place_n(Pi_wqMN.data(), Pi_wqMN.size(), std::plus<>{});
+
+      // this rank's block ranges into the global (nt_half, nq, Np, Np) grid. q (axis 1) is
+      // NOT split; only t (axis 0) and P,Q (axes 2,3) are.
+      auto grd = dPi_C_tqPQ.grid();
+      utils::check(grd[1] == 1,
+                   "vertex_t::eval_Pi_C: the q axis of the Pi^C grid must NOT be split "
+                   "(grid[1] = {} != 1).", grd[1]);
+      auto t_range = dPi_C_tqPQ.local_range(0);
+      auto P_range = dPi_C_tqPQ.local_range(2);
+      auto Q_range = dPi_C_tqPQ.local_range(3);
+      const long P_bs = dPi_C_tqPQ.local_shape()[2];
+      const long Q_bs = dPi_C_tqPQ.local_shape()[3];
+
+      // upfold ONLY my (P,Q) block over the full bosonic mesh, then tau-convert the block.
+      nda::array<ComplexType, 4> Pi_up_blk(tools.nw_b, nqpts_ibz, P_bs, Q_bs);
+      nda::array<ComplexType, 2> tmp(P_bs, _Nm);
+      for (long iq = 0; iq < nqpts_ibz; ++iq) {
+        auto t_q = _t_qmP(iq, all, all);                 // (N_m x Np)
+        auto t_qP = t_q(all, P_range);                   // (N_m x P_bs)
+        auto t_qQ = t_q(all, Q_range);                   // (N_m x Q_bs)
+        for (long l = 0; l < tools.nw_b; ++l)
+          vertex_secondary_detail::upfold_core_block(t_qP, t_qQ, Pi_wqMN(l, iq, all, all),
+                                                     tmp, Pi_up_blk(l, iq, all, all));
+      }
+      // tau-convert the BLOCK (pi_w_to_code_tau transforms the w<->t axis independent of the
+      // last two dims -- it reads Np from shape(2)/shape(3), so block shapes work as-is).
+      nda::array<ComplexType, 4> Pi_t_blk(nt_half, nqpts_ibz, P_bs, Q_bs);
+      vertex_pi::pi_w_to_code_tau(*_ft, tools, Pi_up_blk, Pi_t_blk);
+      // write my t-slice of the block into the owned local() (q axis is full: local q == 0..nq).
+      dPi_C_tqPQ.local() = Pi_t_blk(t_range, all, all, all);
+    } else {
+      // GLOBAL: Pi_wqMN is already Np^2 (a partial). tau-convert the partial and reduce-
+      // scatter the full Np^2 partial into the RPA grid: every output block is summed across
+      // ranks and lands ONLY on its owner (no full-array all_reduce). On one rank this is a
+      // bit-identical copy.
+      nda::array<ComplexType, 4> Pi_tqMN(nt_half, nqpts_ibz, Np, Np);
+      vertex_pi::pi_w_to_code_tau(*_ft, tools, Pi_wqMN, Pi_tqMN);
+      vertex_redist_detail::reduce_scatter_into(Pi_tqMN, dPi_C_tqPQ, mpi->comm);
+    }
 
     {
       // NaN/Inf guard on THIS rank's owned block (the full array is no longer materialized)

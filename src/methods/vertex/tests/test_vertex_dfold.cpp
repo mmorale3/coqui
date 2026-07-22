@@ -359,4 +359,137 @@ TEST_CASE("vertex_zfold_distributed", "[methods][vertex][dfold]") {
   REQUIRE(worst_ok);
 }
 
+// deterministic replicated secondary-aux value Pibar(w, q, m, n) (partial-summed already;
+// here we drive the block-upfold with the FULL Pibar to mirror the production all_reduce).
+static ComplexType pbref(long w, long q, long m, long n) {
+  double re = 0.23 * double(w) + 0.15 * double(q)
+            - 0.09 * double((m * 5 + n) % 7) + 0.06 * double((n * 3 + m) % 5);
+  double im = 0.11 * double((w * 2 + q) % 6) - 0.14 * double((m + 2 * n) % 4)
+            + 0.04 * double(w);
+  return ComplexType(re, im);
+}
+
+// replicated reference UPFOLD: out(P,Q) = [t^dag Pibar t](P,Q) (the two-gemm upfold_core the
+// distributed block path must reproduce).
+static void ref_upfold(nda::array_view<ComplexType, 2> t_mP,
+                       nda::array_view<ComplexType, 2> Pi_mn,
+                       nda::array_view<ComplexType, 2> out_PQ) {
+  const long Nm = t_mP.shape(0), Np = t_mP.shape(1);
+  nda::array<ComplexType, 2> tmp(Np, Nm);
+  nda::blas::gemm(nda::dagger(t_mP), Pi_mn, tmp);
+  nda::blas::gemm(tmp, t_mP, out_PQ);
+}
+
+/**
+ * DISTRIBUTED block-UPFOLD unit test (adjoint of vertex_dfold_distributed; eval_Pi_C secondary
+ * path). upfold_core_block upfolds the SECONDARY-aux Pi (N_m x N_m) to the global aux (Np x Np)
+ * ONE (P,Q) block at a time, so the full Np x Np upfold partial is never materialized. The
+ * physics tests never exercise the (P,Q) split; THIS test FORCES {1(w), 1(q), nP, nQ} grids
+ * (4 ranks: 1x1x2x2, 1x1x1x4, 1x1x4x1) that split P and Q, upfolds each rank's owned block from
+ * the replicated Pibar with upfold_core_block, and compares the gathered distributed result to a
+ * fully-REPLICATED reference (upfold_core on the full Np x Np). The two must agree to <= 1e-12.
+ * At 1 rank the grid is 1x1x1x1 (one (P,Q) block == the whole array) and the distributed block
+ * path reduces to the replicated upfold BIT-IDENTICALLY.
+ */
+TEST_CASE("vertex_upfold_distributed", "[methods][vertex][dfold]") {
+  using methods::solvers::vertex_secondary_detail::upfold_core_block;
+  auto world = boost::mpi3::environment::get_world_instance();
+  const long P = world.size();
+  decltype(nda::range::all) all;
+
+  const long nw_b = 4, nq = 3, Np = 6, Nm = 3;
+
+  // replicated downfold maps t(q)(m, P).
+  nda::array<ComplexType, 3> t_qmP(nq, Nm, Np);
+  for (long q = 0; q < nq; ++q)
+    for (long m = 0; m < Nm; ++m)
+      for (long jp = 0; jp < Np; ++jp) t_qmP(q, m, jp) = tref(q, m, jp);
+
+  // replicated secondary-aux Pibar(w, q, m, n) (mirrors the production all_reduced partial).
+  nda::array<ComplexType, 4> Pibar_wqmn(nw_b, nq, Nm, Nm);
+  for (long w = 0; w < nw_b; ++w)
+    for (long q = 0; q < nq; ++q)
+      for (long m = 0; m < Nm; ++m)
+        for (long n = 0; n < Nm; ++n) Pibar_wqmn(w, q, m, n) = pbref(w, q, m, n);
+
+  // --- REPLICATED reference: full Np x Np upfold each (w,q) with upfold_core -----------------
+  nda::array<ComplexType, 4> Pi_up_ref(nw_b, nq, Np, Np);
+  Pi_up_ref() = ComplexType(0.0);
+  for (long q = 0; q < nq; ++q)
+    for (long w = 0; w < nw_b; ++w)
+      ref_upfold(t_qmP(q, all, all), Pibar_wqmn(w, q, all, all), Pi_up_ref(w, q, all, all));
+
+  // --- run the DISTRIBUTED block-upfold on forced {1, 1, nP, nQ} grids (w,q NEVER split) -----
+  // Every rank all_reduces the (small) Pibar (here already replicated -- exercises the call),
+  // then upfolds ONLY its owned (P,Q) block into dPi.local() via upfold_core_block.
+  using larray = nda::array<ComplexType, 4>;
+  auto run_grid = [&](shape_t<4> grid) {
+    // all_reduce the replicated Pibar (production step 1: linear -> commutes with rank sum).
+    nda::array<ComplexType, 4> Pibar = Pibar_wqmn;
+    world.all_reduce_in_place_n(Pibar.data(), Pibar.size(), std::plus<>{});
+    Pibar /= ComplexType(double(P));   // undo the P-fold replication so the value is unchanged
+
+    auto dPi = make_distributed_array<larray>(world, grid, {nw_b, nq, Np, Np}, {1, 1, 1, 1});
+    REQUIRE(dPi.grid()[1] == 1);       // q axis must not be split (production invariant)
+    auto P_range = dPi.local_range(2);
+    auto Q_range = dPi.local_range(3);
+    const long P_bs = dPi.local_shape()[2], Q_bs = dPi.local_shape()[3];
+    nda::array<ComplexType, 2> tmp(P_bs, Nm);
+    for (long iq = 0; iq < nq; ++iq) {
+      auto t_q = t_qmP(iq, all, all);
+      auto t_qP = t_q(all, P_range);
+      auto t_qQ = t_q(all, Q_range);
+      for (long w = 0; w < nw_b; ++w)
+        upfold_core_block(t_qP, t_qQ, Pibar(w, iq, all, all), tmp,
+                          dPi.local()(w, iq, all, all));
+    }
+
+    // compare my owned block to the replicated reference (each rank owns a disjoint block).
+    double worst = 0.0;
+    for (long w = 0; w < nw_b; ++w)
+      for (long q = 0; q < nq; ++q)
+        for (long ip = 0; ip < P_bs; ++ip)
+          for (long jq = 0; jq < Q_bs; ++jq)
+            worst = std::max(worst,
+                             std::abs(dPi.local()(w, q, ip, jq) -
+                                      Pi_up_ref(w, q, P_range.first() + ip, Q_range.first() + jq)));
+    world.all_reduce_in_place_n(&worst, 1, boost::mpi3::max<>{});
+    if (world.root())
+      app_log(1, "vertex_upfold_distributed[P={} grid=(w,q,P,Q)=({},{},{},{})]: distributed "
+                 "block-upfold == replicated reference (max|diff| = {:.3e}).",
+              P, grid[0], grid[1], grid[2], grid[3], worst);
+    return worst;
+  };
+
+  // enumerate legal grids {1, 1, nP, nQ} with nP*nQ == P, nP,nQ <= Np. At 4 ranks this is
+  // {1,1,2,2}, {1,1,1,4}, {1,1,4,1} -- the mandated (P,Q)-split coverage.
+  std::vector<shape_t<4>> grids;
+  for (long nP = 1; nP <= P; ++nP) {
+    if (P % nP != 0) continue;
+    long nQ = P / nP;
+    if (nP > Np or nQ > Np) continue;
+    grids.push_back({1, 1, nP, nQ});
+  }
+  REQUIRE(not grids.empty());
+  bool worst_ok = true;
+  for (auto const& g : grids) worst_ok = worst_ok and (run_grid(g) <= 1e-12);
+  REQUIRE(worst_ok);
+
+  // upfold_core_block sanity: on a DIAGONAL FULL-range block (t_qP == t_qQ == full t(q)) it
+  // must equal the plain two-gemm upfold_core (same gemms, same order -> bit-identical).
+  SECTION("upfold_core_block_diag_equals_upfold") {
+    nda::array<ComplexType, 2> Pi(Nm, Nm);
+    for (long m = 0; m < Nm; ++m)
+      for (long n = 0; n < Nm; ++n) Pi(m, n) = pbref(0, 0, m, n);
+    auto t_q = t_qmP(0, all, all);
+    nda::array<ComplexType, 2> tmpA(Np, Nm), o1(Np, Np), o2(Np, Np);
+    ref_upfold(t_q, Pi, o1);
+    upfold_core_block(t_q, t_q, Pi, tmpA, o2);
+    double d = 0.0;
+    for (long ip = 0; ip < Np; ++ip)
+      for (long jq = 0; jq < Np; ++jq) d = std::max(d, std::abs(o1(ip, jq) - o2(ip, jq)));
+    REQUIRE(d == 0.0);
+  }
+}
+
 } // namespace bdft_tests
