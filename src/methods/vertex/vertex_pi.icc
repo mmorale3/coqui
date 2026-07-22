@@ -758,12 +758,15 @@ namespace vertex_pi {
   inline void pi_w_to_code_tau(imag_axes_ft::IAFT const& ft, iaft_tools const& tools,
                                nda::array<ComplexType, 4> const& Pi_wqMN,
                                nda::MemoryArrayOfRank<4> auto&& Pi_tqMN_out) {
-    long nq = Pi_wqMN.shape(1), Np = Pi_wqMN.shape(2);
+    // Support RECTANGULAR trailing dims (P_bs != Q_bs): the distributed Pi^C upfold passes
+    // a (P,Q)-BLOCK (shape(2)=P_bs, shape(3)=Q_bs), not a full square Np x Np. Using shape(2)
+    // for both dims (the old `Np,Np`) overflowed the temp on asymmetric grids -> heap corruption.
+    long nq = Pi_wqMN.shape(1), nP = Pi_wqMN.shape(2), nQ = Pi_wqMN.shape(3);
     long nt = tools.nt_f;
     long nt_half = (nt % 2 == 0) ? nt / 2 : nt / 2 + 1;
     utils::check(Pi_tqMN_out.shape(0) == nt_half,
                  "vertex_pi::pi_w_to_code_tau: output leading axis must be nt_half = {}.", nt_half);
-    nda::array<ComplexType, 4> Pi_t(nt, nq, Np, Np);
+    nda::array<ComplexType, 4> Pi_t(nt, nq, nP, nQ);
     ft.w_to_tau(Pi_wqMN, Pi_t, imag_axes_ft::boson);
     for (long it = 0; it < nt_half; ++it)
       Pi_tqMN_out(it, nda::ellipsis{}) = Pi_t(tools.t_mirror(it), nda::ellipsis{});
