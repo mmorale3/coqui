@@ -30,9 +30,9 @@
  *   `compute_paw_hartree_atom` or a convention drift relative to the
  *   established `deltaC` machinery.
  *
- *   Neither side touches `Dnn_atom` or QE's frozen `deeq` — both are
+ *   Neither side touches the static per-atom D (`Dnn_atom_static`) — both are
  *   computed from radial pseudopot data + becsum, free of any DFT-XC
- *   contamination.
+ *   contamination. (The QE `deeq` read was removed entirely in plan A1.)
  * ==========================================================================
  */
 
@@ -289,14 +289,15 @@ TEST_CASE("paw_onecenter_becsum_full_matches_diagonal",
 //
 //   compute_paw_deeq(occ, /*Vloc_r=*/empty, include_static=true)
 //        = D_static + radial_Hartree(ns_scl × becsum_diagonal(occ))   [no G term]
-//   compute_deeq_scf(diag(occ))  → Dnn_atom
+//   compute_deeq_scf(diag(occ))   [returned; Dnn_atom_static NOT mutated]
 //        = D_static + radial_Hartree(ns_scl × becsum_full(diag(occ)))
 //
 // With the becsum identity above these are element-wise equal. This guards
 // BOTH fixes on the self-consistent path: the 1/N_k in compute_becsum_full
-// AND the ns_scl applied inside compute_deeq_scf. It validates the deeq as a
+// AND the ns_scl applied on the nij becsum path. It validates the deeq as a
 // functional of the density matrix `n` — no comparison against mf.occ() as if
-// it were ground truth.
+// it were ground truth. Additionally guards the plan-A1 non-mutation contract:
+// the static tensor must be bit-identical before and after the call.
 // ===========================================================================
 TEST_CASE("paw_onecenter_deeq_scf_matches_paw_deeq",
           "[hamilt][paw][onecenter]")
@@ -329,9 +330,20 @@ TEST_CASE("paw_onecenter_deeq_scf_matches_paw_deeq",
     nda::array<ComplexType,1> empty_vloc;
     auto Dion_diag = V.compute_paw_deeq(nii, empty_vloc, /*include_static=*/true);
 
-    // Self-consistent builder writes into Dnn_atom.
-    V.compute_deeq_scf(nij);
-    auto Dscf = V.Dnn_atom_view();
+    // Self-consistent builder returns D_static + D^H[n] without mutating the
+    // static tensor (Dnn_atom_view now exposes Dnn_atom_static, plan A1).
+    nda::array<ComplexType,3> Dstatic_before{V.Dnn_atom_view()};
+    auto Dscf = V.compute_deeq_scf(nij);
+    {
+        auto Dstatic_after = V.Dnn_atom_view();
+        double max_mut = 0.0;
+        for (long ia = 0; ia < Dstatic_before.extent(0); ++ia)
+        for (long I  = 0; I  < Dstatic_before.extent(1); ++I)
+        for (long J  = 0; J  < Dstatic_before.extent(2); ++J)
+            max_mut = std::max(max_mut,
+                std::abs(Dstatic_after(ia, I, J) - Dstatic_before(ia, I, J)));
+        REQUIRE(max_mut == 0.0);   // non-mutation contract (plan A1)
+    }
 
     REQUIRE(Dion_diag.extent(0) == Dscf.extent(0));
     REQUIRE(Dion_diag.extent(1) == Dscf.extent(1));

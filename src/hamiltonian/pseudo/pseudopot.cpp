@@ -75,8 +75,7 @@ pseudopot::pseudopot(MF_t &mf, std::string const filename) :
   kp_symm(mf.kp_symm()),
   Pskna(make_shared_array<nda::array_view<ComplexType,4>>(*mpi,{1,1,1,1})),   // resize later
   Dnn(make_shared_array<nda::array_view<ComplexType,3>>(*mpi,{1,1,1})),       // resize later
-  Dnn_atom(make_shared_array<nda::array_view<ComplexType,3>>(*mpi,{1,1,1})),        // resize later
-  Dnn_atom_static_paw(make_shared_array<nda::array_view<ComplexType,3>>(*mpi,{1,1,1})), // resize lazily on first compute_deeq_scf call
+  Dnn_atom_static(make_shared_array<nda::array_view<ComplexType,3>>(*mpi,{1,1,1})), // resized+filled in read_vnl_h5 for USPP/PAW
   swfc_to_rho(detail::make_wfc_to_rho(*mpi,mf,fft_mesh_aug)),
   svloc(make_shared_array<nda::array_view<ComplexType,3>>(*mpi,{1,1,1})),            // resize later
   svsc(make_shared_array<nda::array_view<ComplexType,3>>(*mpi,{1,1,1})),  // resize later
@@ -560,75 +559,12 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
   }
   mpi->node_comm.barrier();
 
-  // Build atom-resolved effective D for USPP/PAW.
-  //
-  //   deeq = ∫ V_eff(r) Q^IJ(r) dr  + ΔPAW^Hxc + dvan      (in Rydberg)
-  // For USPP/PAW we use `deeq` directly (not `dvan + deeq`).
-  //
-  // pw2coqui writes deeq(nhm, nhm, nat, nspin) (Fortran column-major) so
-  // on the C++ side the read shape is (nspin, nat, nhm, nhm). We collapse
-  // to spin=0 (correct for non-magnetic; magnetic LSDA with deeq
-  // spin-dependent is a TODO).
-  Dnn_atom = sarray_t<nda::array_view<ComplexType,3>>(*mpi,
-                {std::max(1,nat), nhm*npol, nhm*npol});
-  mpi->node_comm.barrier();
-  if(mpi->node_comm.root()) {
-    auto Dloc_sp = Dnn.local();
-    auto Dloc_at = Dnn_atom.local();
-    Dloc_at() = ComplexType(0.0);
-    if(ptype != pp_ncpp_t) {
-      // Try to read deeq; fall back to dvan if missing.
-      bool have_deeq = false;
-      nda::array<double,4> deeq_r(nspin, nat, nhm, nhm);
-      try {
-        nda::h5_read(grp, "deeq", deeq_r);
-        have_deeq = true;
-      } catch(...) {
-        app_warning("USPP/PAW: 'deeq' missing from h5 file. Re-run pw2coqui "
-                    "with the latest schema. Falling back to dvan only — "
-                    "eigenvalues won't match QE.");
-      }
-      if(have_deeq) {
-        // deeq is in Rydberg in QE's `uspp::deeq`; convert to Hartree.
-        // After QE's `newd`, deeq already contains dvan + SCF_integral +
-        // PAW_one_center, so it is the full effective D used in
-        // V_NL = Σ_aIJ |β_aI⟩ deeq_aIJ ⟨β_aJ|. We use it directly.
-        for(int ia=0; ia<nat; ++ia)
-          for(int p=0; p<npol; ++p)
-            for(int n=0; n<nhm; ++n)
-              for(int m=0; m<nhm; ++m)
-                Dloc_at(ia, n*npol+p, m*npol+p) =
-                    ComplexType(0.5 * deeq_r(0, ia, n, m), 0.0);
-        // Note: only spin=0 component used (correct for non-magnetic);
-        // magnetic LSDA with spin-dependent deeq is a documented TODO.
-        (void)Dloc_sp; // dvan is fully captured by deeq after newd
-      } else {
-        for(int ia=0; ia<nat; ++ia) {
-          int nt = ityp(ia);
-          for(int n=0; n<nhm*npol; ++n)
-            for(int m=0; m<nhm*npol; ++m)
-              Dloc_at(ia, n, m) = Dloc_sp(nt, n, m);
-        }
-      }
-    } else {
-      // NCPP: replicate species-resolved Dnn into per-atom slots so callers
-      // that prefer the atom-indexed Dion can use Dnn_atom uniformly.
-      for(int ia=0; ia<nat; ++ia) {
-        int nt = ityp(ia);
-        for(int n=0; n<nhm*npol; ++n)
-          for(int m=0; m<nhm*npol; ++m)
-            Dloc_at(ia, n, m) = Dloc_sp(nt, n, m);
-      }
-    }
-    // NOTE: the frozen core-valence exact exchange (ex_cvij) is added to
-    // Dnn_atom AFTER the heavy paw_species fields are loaded below (ex_cvij is
-    // not yet loaded at this point — its view still binds the dummy SHM here).
-  }
-  mpi->node_comm.barrier();
-  if(mpi->node_comm.root())
-    mpi->internode_comm.broadcast_n(Dnn_atom.local().data(),
-                                    Dnn_atom.size(), 0);
-  mpi->comm.barrier();
+  // NOTE (plan A1): QE `deeq` is no longer read — it carries QE's converged
+  // V_H and V_xc content and violates the no-XC static-D contract (plan F1).
+  // The per-atom static tensor Dnn_atom_static (dion replica + ex_cvij) is
+  // assembled after the paw_species fields are loaded below; the
+  // density-dependent Hartree-only terms are rebuilt per evaluation via
+  // compute_paw_deeq (plan I2/I3).
 
   // USPP / PAW augmentation overlap and Q^IJ(G).
   // qq_nt: per-species ⟨β|Q|β⟩ overlap, shape (nsp, nhm, nhm) on disk.
@@ -967,15 +903,23 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
     }
   }
 
-  // Frozen core-valence exact exchange (ABINIT ex_cvij) → per-atom D. Done here
-  // (not in the Dnn_atom assembly above) because ex_cvij is only loaded with the
-  // heavy paw_species fields just above. It is a static one-center projector Dij
-  // contracted LINEARLY with becsum (factor 1), disjoint from the density-
-  // dependent valence Fock (v_x/deltaC), so adding it to the frozen per-atom D
-  // makes e_1e = Tr[Dm·H0] capture it with the correct factor 1. ex_cvij is in
-  // Hartree (matches Dnn_atom after 0.5 Ry→Ha). alpha_x = exchange fraction (1
-  // for HF/GW). Each node-root adds the same value (Dnn_atom is internode-synced);
-  // no double-count (QE/ABINIT D^0 carry no core-valence exchange).
+  // Static (frozen) per-atom D for USPP/PAW (plan I2, assembled eagerly):
+  //
+  //   D_static(a, I, J) = dion(type(a), I, J) + alpha_x * ex_cvij(type(a), I, J)
+  //
+  // dion (h5 `dion`, loaded into Dnn above) is the FULL frozen D^0 per QE
+  // convention (AE−PS kinetic + frozen-core-screened ionic Hartree). ex_cvij
+  // is the frozen core-valence exact exchange (ABINIT <exact_exchange_X_matrix>):
+  // a static one-center projector Dij contracted LINEARLY with becsum (factor
+  // 1), disjoint from the density-dependent valence Fock (v_x/deltaC), so
+  // holding it in the frozen per-atom D makes e_1e = Tr[Dm·H0] capture it with
+  // the correct factor 1. ex_cvij is in Hartree (matches Dnn after 0.5 Ry→Ha).
+  // alpha_x = exchange fraction (1 for HF/GW). Assembled here (not in the
+  // dion read above) because ex_cvij is only loaded with the heavy paw_species
+  // fields just above. This tensor is never mutated after this point;
+  // density-dependent (Hartree-only) terms are rebuilt per evaluation via
+  // compute_paw_deeq (plan I3).
+  //
   // Guard on pp type: paw_species is only populated for USPP/PAW (see above),
   // so this block must NOT dereference paw_species[nt] on the NC path (empty
   // vector -> out-of-bounds). ex_cvij is PAW-only; USPP simply has size()==0.
@@ -984,26 +928,42 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
   // (species_paw_t::cv_exchange, set in the loop above): 'fock' inserts the
   // frozen ex_cvij one-center Dij here; 'none' skips it (omitted, warned above);
   // 'dft_xc' (DFT-based c-v XC, dataset TBD) is NOT YET IMPLEMENTED and aborts.
-  if((ptype == pp_uspp_t or ptype == pp_paw_t) and mpi->node_comm.root()) {
-    const double alpha_x = 1.0;
-    auto Dloc_at = Dnn_atom.local();
-    for(int ia=0; ia<nat; ++ia) {
-      int nt = ityp(ia);
-      auto const& sp = paw_species[nt];
-      if(!sp.is_paw) continue;
-      if(sp.cv_exchange == cv_exchange_e::none) continue;  // omitted (warned above)
-      utils::check(sp.cv_exchange == cv_exchange_e::fock,
-        "pseudopot: core-valence exchange 'dft_xc' (DFT-based core-valence XC) is "
-        "NOT YET IMPLEMENTED for PAW species nt={}: a DFT c-v XC dataset was "
-        "detected in the h5 but cannot be used yet. TODO: implement + unit test.", nt);
-      // fock: insert the frozen ex_cvij one-center Dij (ex_cvij guaranteed present).
-      int nh_a = sp.nh;
-      for(int p=0; p<npol; ++p)
-        for(int n=0; n<nh_a; ++n)
-          for(int m=0; m<nh_a; ++m)
-            Dloc_at(ia, n*npol+p, m*npol+p) +=
-                ComplexType(alpha_x * sp.ex_cvij(n,m), 0.0);
+  if(ptype == pp_uspp_t or ptype == pp_paw_t) {
+    Dnn_atom_static = sarray_t<nda::array_view<ComplexType,3>>(*mpi,
+                        {std::max(1,nat), nhm*npol, nhm*npol});
+    mpi->node_comm.barrier();
+    if(mpi->node_comm.root()) {
+      const double alpha_x = 1.0;
+      auto Dloc_sp = Dnn.local();
+      auto Dloc_st = Dnn_atom_static.local();
+      Dloc_st() = ComplexType(0.0);
+      for(int ia=0; ia<nat; ++ia) {
+        int nt = ityp(ia);
+        // dion replica (already in Ha after the 0.5 Ry→Ha scale above).
+        for(int n=0; n<nhm*npol; ++n)
+          for(int m=0; m<nhm*npol; ++m)
+            Dloc_st(ia, n, m) = Dloc_sp(nt, n, m);
+        auto const& sp = paw_species[nt];
+        if(!sp.is_paw) continue;
+        if(sp.cv_exchange == cv_exchange_e::none) continue;  // omitted (warned above)
+        utils::check(sp.cv_exchange == cv_exchange_e::fock,
+          "pseudopot: core-valence exchange 'dft_xc' (DFT-based core-valence XC) is "
+          "NOT YET IMPLEMENTED for PAW species nt={}: a DFT c-v XC dataset was "
+          "detected in the h5 but cannot be used yet. TODO: implement + unit test.", nt);
+        // fock: insert the frozen ex_cvij one-center Dij (ex_cvij guaranteed present).
+        int nh_a = sp.nh;
+        for(int p=0; p<npol; ++p)
+          for(int n=0; n<nh_a; ++n)
+            for(int m=0; m<nh_a; ++m)
+              Dloc_st(ia, n*npol+p, m*npol+p) +=
+                  ComplexType(alpha_x * sp.ex_cvij(n,m), 0.0);
+      }
     }
+    mpi->node_comm.barrier();
+    if(mpi->node_comm.root())
+      mpi->internode_comm.broadcast_n(Dnn_atom_static.local().data(),
+                                      Dnn_atom_static.size(), 0);
+    mpi->comm.barrier();
   }
   mpi->node_comm.barrier();
 
@@ -1269,12 +1229,13 @@ void pseudopot::add_vpp_impl(boost::mpi3::communicator& comm,
     mpi->node_comm.barrier();
 
     // Native PAW deeq: build the per-channel D from V_eff = V_loc + V_H
-    // (vltot + vr) on the smooth grid, plus the static dvan + paw_init_keeq
+    // (vltot + vr) on the smooth grid, plus the static (dion + ex_cvij)
     // baseline and the radial AE−PS one-center Hartree. PerType scaling means
-    // the result lands at QE's Dnn_atom convention (no occupation/N_k folded
-    // into the channel). Built only on PAW/USPP; NCPP falls through to the
-    // bare branch.
-// MAM FIX FIX FIX: where is nij!=nullptr case???
+    // no occupation/N_k is folded into the channel. Built only on PAW/USPP;
+    // NCPP falls through to the bare branch.
+    // TODO (plan A2/A3): wire the nij overload through compute_paw_deeq(nij)
+    // as well (needs the symmetry-correct full-BZ nij becsum); today nij
+    // falls through to the static-only branch below.
     if (ptype != pp_ncpp_t && nii != nullptr) {
       sarray_t<nda::array_view<ComplexType,1>> svfull(mpi_local_context,{nnr_aug});
       auto vfull = svfull.local();
@@ -1303,12 +1264,15 @@ void pseudopot::add_vpp_impl(boost::mpi3::communicator& comm,
   // Non-local part, directly into Hij. add_vnl_impl indexes Dion(id, ...)
   // with id = (ncpp ? nt : ia). NCPP → species-resolved Dnn.
   // PAW/USPP + nii is handled above via the native `compute_paw_deeq` early
-  // return; PAW/USPP + nij uses the QE-loaded Dnn_atom (the native
-  // `compute_becsum_full(nij)` path is not wired through here).
+  // return. PAW/USPP no-density → static-only H0 per plan I5 (Hartree and
+  // exchange are supplied by the ERI objects in the SCF classes).
+  // PAW/USPP + nij currently ALSO falls through to static-only — the native
+  // `compute_paw_deeq(nij)` wiring (identical operator to the nii overload)
+  // lands with plan A2/A3 (needs the symmetry-correct nij becsum).
   if (ptype == pp_ncpp_t)
-    add_vnl_impl(k_range, b_range, Dnn.local(),      Hij);
+    add_vnl_impl(k_range, b_range, Dnn.local(),             Hij);
   else
-    add_vnl_impl(k_range, b_range, Dnn_atom.local(), Hij);
+    add_vnl_impl(k_range, b_range, Dnn_atom_static.local(), Hij);
 }
 
 // Standalone helper: add the USPP/PAW augmentation to a smooth-grid pair

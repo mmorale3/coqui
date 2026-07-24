@@ -10,14 +10,21 @@ printed into context at session start by a SessionStart hook).
 
 ## STATUS
 
-Last updated: 2026-07-24 — A0 done (working tree stabilized; commits:
-notes 3d6c154, cleanup 17621e3, options+perf 19c24a7, plan/agreement follows).
+Last updated: 2026-07-24 — A1 done. A1 notes: QE fixtures carry no ex_cvij, so
+the whole QE test suite is value-identical; the H0 flip (QE deeq → static-only)
+pins NO stored test reference (only NCPP fixtures have H0 refs) — production
+e_1e re-baselining still lands with A2 per plan. Pre-existing failures found
+while validating (NOT from A1; bit-identical on the pre-A1 tree):
+dft_eigenvalues USPP/PAW sections (max_err 0.749/0.790 Ha at Li 1s semicore —
+broke sometime before A1, needs its own bisect/session; the A-tests item's
+QE-eigenvalue diagnostic rework subsumes it) and vx_sensitivity_ncpp (hidden
+[!benchmark] test, hard-codes ~/ceph data absent on this host).
 Note: test binaries now need KMP_DUPLICATE_LIB_OK=TRUE (homebrew dual-libomp,
-see CLAUDE.md); fast PAW suite green at 13440 assertions / 31 cases.
+see CLAUDE.md); fast PAW suite green at 13441 assertions / 31 cases.
 
 Workstream A — pseudopot D-matrix refactor
 - [x] A0 stabilize working tree (4 coherent commits; .swp gone; .DS_Store gitignored) — 2026-07-24
-- [ ] A1 two-tensor model: Dnn_atom_static = dion + ex_cvij (eager, ctor); remove QE deeq read; compute_deeq_scf stops mutating
+- [x] A1 two-tensor model: Dnn_atom_static = dion + ex_cvij (eager, ctor); remove QE deeq read; compute_deeq_scf stops mutating (thin wrapper, returns by value; non-mutation REQUIREd in test) — 2026-07-24
 - [ ] A2 align add_vpp paths with I5: no-density = static-only; nii/nij identical native build; add_hartree/add_exchange bools
 - [ ] A3 symmetry-correct nij becsum (full-BZ lift) + Hermitian pair symmetrization + nosym guards until it lands
 - [ ] A4 hoist per-call statics (aainit, qrad dq=0.01, Pskna lift, Δk-keyed Qfac); parallelize ∫V·Q loop

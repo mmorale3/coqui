@@ -377,118 +377,31 @@ inline void pseudopot::build_paw_scf_caches()
     for (auto const& sp : paw_species)
         paw_core_density.emplace_back(hamilt::paw::compute_paw_core_density(sp));
 
-    // 3. Allocate the SCF-invariant baseline Dnn_atom_static_paw with the
-    //    same shape as Dnn_atom (per-node SHM via sarray_t).
-    long nat = ityp.extent(0);
-    long nD  = (long)Dnn_atom.local().shape()[1];   // nhm*npol from existing Dnn_atom
-    Dnn_atom_static_paw = sarray_t<nda::array_view<ComplexType,3>>(
-        *mpi, {std::max((long)1, nat), nD, nD});
-    mpi->node_comm.barrier();
-
-    // 4. Populate on the node-root: D_static = dvan_replica + paw_init_keeq.
-    //    Mirrors the layout of Dnn_atom (ia, n*npol+p, m*npol+p).
-    if (mpi->node_comm.root()) {
-        auto Dloc_sp = Dnn.local();           // (nsp, nhm*npol, nhm*npol)
-        auto Dloc_st = Dnn_atom_static_paw.local();  // (nat, nhm*npol, nhm*npol)
-        Dloc_st() = ComplexType(0.0);
-
-        for (long ia = 0; ia < nat; ++ia) {
-            int nt = ityp(ia);
-
-            // (a) dvan replica from species-resolved Dnn (already in Ha).
-            for (long n = 0; n < nD; ++n)
-                for (long m = 0; m < nD; ++m)
-                    Dloc_st(ia, n, m) = Dloc_sp(nt, n, m);
-
-            // (b) NOTE: h5 `dion` (loaded into Dnn) already encodes QE's full
-            //     `dvan` per-channel — i.e. it ALREADY includes the AE−PS
-            //     V_loc baseline that compute_paw_static_D would build from
-            //     the (ae_vloc, vloc_ps) pair. Adding it again would
-            //     double-count the baseline. Validated on LiH kp444 PAW HF
-            //     (canonical pw2coqui, vloc_ps present): adding produced a
-            //     3.4 Ha shift at the Li 1s channel and broke eigenvalues;
-            //     skipping recovers a clean match. compute_paw_static_D is
-            //     kept available for a future fixture format that exports a
-            //     bare-ionic dvan, but it is NOT consumed here.
-        }
-    }
-    mpi->node_comm.barrier();
-    if (mpi->node_comm.root())
-        mpi->internode_comm.broadcast_n(Dnn_atom_static_paw.local().data(),
-                                        Dnn_atom_static_paw.size(), 0);
-    mpi->comm.barrier();
+    // NOTE: the static per-atom tensor Dnn_atom_static (dion + ex_cvij) is
+    // NOT built here — it is assembled eagerly in read_vnl_h5 (plan A1).
+    // h5 `dion` already encodes QE's full frozen D^0 per-channel — i.e. it
+    // ALREADY includes the AE−PS V_loc baseline that compute_paw_static_D
+    // would build from the (ae_vloc, vloc_ps) pair. Adding it again would
+    // double-count the baseline. Validated on LiH kp444 PAW HF (canonical
+    // pw2coqui, vloc_ps present): adding produced a 3.4 Ha shift at the Li 1s
+    // channel and broke eigenvalues; skipping recovers a clean match.
+    // compute_paw_static_D is kept available for a future fixture format that
+    // exports a bare-ionic dvan, but it is NOT consumed in production.
 
     paw_scf_caches_built = true;
 }
 
 template<typename nij_t>
-inline void pseudopot::compute_deeq_scf(nij_t const& nij)
+inline nda::array<ComplexType,3> pseudopot::compute_deeq_scf(nij_t const& nij)
 {
-    utils::check(npol == 1,
-        "pseudopot::compute_deeq_scf: npol > 1 (SOC) is not supported yet");
-
-    // 1. Make sure the static caches are in place.
-    build_paw_scf_caches();
-
-    // 2. Build per-atom becsum from Pskna and the current density matrix.
-    //    compute_becsum_full already carries the 1/N_k k-weight; apply the
-    //    spin factor ns_scl here so becsum encodes the full (spin-summed)
-    //    electron density — the same (ns_scl/N_k) normalization the smooth-grid
-    //    Hartree applies to the same density matrix (see compute_paw_deeq and
-    //    notes/paw_deeq_scaling_derivation.md). This makes the radial one-center
-    //    Hartree (compute_paw_hartree_atom, solved in proper Ha) land at QE's
-    //    per-channel ddd_paw with NO extra multiplier, for any k-mesh.
-    auto becsum = hamilt::paw::compute_becsum_full(
-        Pskna_view(), nij, ityp, nh, ofs, npol);
-    long nspin = nij.extent(0);
-    double ns_scl = (nspin == 1 && npol == 1) ? 2.0 : 1.0;
-    for (long ia = 0; ia < becsum.extent(0); ++ia)
-      for (long I = 0; I < becsum.extent(1); ++I)
-        for (long J = 0; J < becsum.extent(2); ++J)
-          becsum(ia, I, J) *= ns_scl;
-    long nat = ityp.extent(0);
-
-    // 3. Build the angular-momentum coupling tables (cheap: nibz tables of
-    //    size O((2 lli − 1)⁴), all PAW species share the same lli).
-    auto aatab = hamilt::paw::aainit_tables_build(paw_aainit_lli);
-
-    // 4. On the node-root: copy the static baseline into Dnn_atom and add
-    //    the per-atom Hartree contribution from `compute_paw_hartree_atom`.
-    // MAM: Parallelize over atoms and reduce at the end!
-    if (mpi->node_comm.root()) {
-        auto Dloc_at = Dnn_atom.local();
-        auto Dloc_st = Dnn_atom_static_paw.local();
-        Dloc_at() = Dloc_st();
-
-        for (long ia = 0; ia < nat; ++ia) {
-            int nt = ityp(ia);
-            if ((size_t)nt >= paw_species.size()) continue;
-            auto const& sp = paw_species[nt];
-            if (sp.nh == 0 || sp.aewfc.size() == 0) continue;
-
-            // Slice atom-resolved becsum (nh, nh).
-            auto bs_a = becsum(ia, nda::range(0, sp.nh),
-                                   nda::range(0, sp.nh));
-
-            auto const& cores = paw_core_density[nt];
-            auto const& rho_core_AE = cores.first;
-            auto const& rho_core_PS = cores.second;
-
-            auto res = hamilt::paw::compute_paw_hartree_atom(
-                sp, bs_a, rho_core_AE, rho_core_PS, aatab);
-
-            for (int I = 0; I < sp.nh; ++I)
-                for (int J = 0; J < sp.nh; ++J)
-                    for (int p = 0; p < npol; ++p)
-                        Dloc_at(ia, I * npol + p, J * npol + p)
-                            += ComplexType(res.dDeeq_H(I, J), 0.0);
-        }
-    }
-    mpi->node_comm.barrier();
-    if (mpi->node_comm.root())
-        mpi->internode_comm.broadcast_n(Dnn_atom.local().data(),
-                                        Dnn_atom.size(), 0);
-    mpi->comm.barrier();
+    // Thin non-mutating wrapper (plan A1): returns D_static + radial D^H[n]
+    // (no G-space ∫V·Q term — the empty Vloc_r short-circuits it). The static
+    // tensor Dnn_atom_static (dion + ex_cvij, ctor-built) is the baseline and
+    // is never modified. The becsum normalization (1/N_k k-weight + ns_scl
+    // spin factor) lives in the compute_paw_deeq nij overload — see
+    // notes/paw_deeq_scaling_derivation.md.
+    nda::array<ComplexType,1> empty_vloc;
+    return compute_paw_deeq(nij, empty_vloc, /*include_static=*/true);
 }
 
 // nii / nij overloads: build the (ns_scl-scaled) per-atom becsum from the
@@ -552,9 +465,9 @@ nda::array<ComplexType,3> pseudopot::compute_paw_deeq_from_becsum(
 
     build_paw_scf_caches();
 
-    // ---- (1) static baseline: dvan + paw_init_keeq (kinetic + ionic AE−PS).
+    // ---- (1) static baseline: dion + ex_cvij (ctor-built, plan I2).
     if (include_static) {
-        auto Dst = Dnn_atom_static_paw.local();   // (nat, nhm*npol, nhm*npol)
+        auto Dst = Dnn_atom_static.local();       // (nat, nhm*npol, nhm*npol)
         for (long ia = 0; ia < nat; ++ia)
           for (int I = 0; I < nhm; ++I)
             for (int J = 0; J < nhm; ++J)
@@ -566,8 +479,9 @@ nda::array<ComplexType,3> pseudopot::compute_paw_deeq_from_becsum(
     // Radial-Hartree multiplier: `1` — see `notes/paw_deeq_scaling_derivation.md`.
     // CoQui's `compute_paw_hartree_atom` solves Poisson directly in Hartree,
     // and the spin-summed becsum reproduces `ddd_paw_Ha` channel-by-channel (Ry
-    // `e2=2` cancels QE's spin-up-only convention exactly). Matches QE's loaded
-    // Dnn_atom to ~1e-6 Ha at LiH kp222 PAW HF.
+    // `e2=2` cancels QE's spin-up-only convention exactly). Validated to
+    // ~1e-6 Ha against QE's exported deeq at LiH kp222 PAW HF (historical —
+    // the QE deeq read itself was removed in plan A1).
     double rad_fac = 1.0;
     for (long ia = 0; ia < nat; ++ia) {
         int nt = ityp(ia);

@@ -156,9 +156,10 @@ class pseudopot
   auto Pskna_view() const { return Pskna.local(); }
   auto Qij_view() const { return qq_nt_data.local(); }
   auto qgm_view() const { return qgm.local(); }
-  // Per-atom effective non-local D (nat, nhm*npol, nhm*npol). Set by
-  // compute_deeq_scf / read_vnl_h5; exposed read-only for tests/validation.
-  auto Dnn_atom_view() const { return Dnn_atom.local(); }
+  // Static per-atom non-local D (nat, nhm*npol, nhm*npol): dion replica +
+  // alpha_x * ex_cvij, built eagerly in read_vnl_h5 for USPP/PAW (plan I2).
+  // Exposed read-only for tests/validation. Dummy (1,1,1) for NCPP.
+  auto Dnn_atom_view() const { return Dnn_atom_static.local(); }
   nda::array<int,3> const& ijtoh_view() const { return ijtoh; }
   nda::array<int,1> const& ityp_view() const { return ityp; }
   nda::array<int,1> const& nh_view() const { return nh; }
@@ -245,7 +246,7 @@ class pseudopot
   // Construction takes an mpi_t because `sarray_t` has no default
   // constructor; emplace each instance with a 1-element dummy size and
   // re-assign at load time once shapes are known (same pattern used for
-  // Pskna/qq_nt_data/Dnn_atom in the pseudopot ctor init list).
+  // Pskna/qq_nt_data/Dnn_atom_static in the pseudopot ctor init list).
   struct species_paw_shm_t {
     sarray_t<nda::array_view<double,2>> aewfc;
     sarray_t<nda::array_view<double,2>> pswfc;
@@ -474,32 +475,24 @@ class pseudopot
   sarray_t<nda::array_view<ComplexType,4>> Pskna;
 
   // D matrix for local projectors. Species-resolved (nsp, nhm*npol, nhm*npol)
-  // for NCPP. For USPP/PAW the SCF-dependent deeq correction is per-atom and
-  // is held separately in Dnn_atom (below); add_Vpp dispatches between the two.
+  // for NCPP. For USPP/PAW the per-atom static D is held separately in
+  // Dnn_atom_static (below); add_Vpp dispatches between the two.
   //memory::unified_array<ComplexType,3> Dnn;
   sarray_t<nda::array_view<ComplexType,3>> Dnn;
 
-  // Atom-resolved effective non-local D for USPP/PAW:
-  //   D_eff(a, I, J) = dvan(type(a), I, J) + deeq(I, J, a, spin=0)
-  // shape (nat, nhm*npol, nhm*npol). Empty for NCPP. Spin-polarized
-  // calculations would need (nspin, nat, ...); collinear non-magnetic
-  // (nspin=1 or 2 with deeq same on both spins) is supported here. Magnetic
-  // PAW with deeq(s=1)≠deeq(s=2) is a documented TODO.
-  sarray_t<nda::array_view<ComplexType,3>> Dnn_atom;
-
-  // SCF-invariant ("static") baseline for the per-atom non-local D matrix
-  // under the no-XC frozen-core scGW design:
-  //   D_static^a = dvan(type(a)) + paw_init_keeq(type(a))
-  // where paw_init_keeq carries the kinetic and bare-ionic AE−PS one-center
-  // matrix elements (`hamilt::paw::compute_paw_static_D`, in Ha). For NCPP
-  // species this collapses to the dvan replica.
-  // Same shape and SHM layout as Dnn_atom. Populated lazily on the first
-  // call to `hamilt::paw::compute_deeq_scf`; empty until then.
-  sarray_t<nda::array_view<ComplexType,3>> Dnn_atom_static_paw;
+  // Static (frozen) per-atom non-local D for USPP/PAW (plan I2):
+  //   D_static(a, I, J) = dion(type(a), I, J) + alpha_x * ex_cvij(type(a), I, J)
+  // shape (nat, nhm*npol, nhm*npol). Built EAGERLY in read_vnl_h5 (dion is the
+  // full frozen D^0 per QE convention; ex_cvij is the frozen core-valence
+  // exact exchange, contracted with factor 1). Never mutated afterwards —
+  // this is the only persistent per-atom D. Density-dependent (Hartree-only)
+  // terms are rebuilt per evaluation via compute_paw_deeq (plan I3). Dummy
+  // (1,1,1) for NCPP (species-resolved Dnn is used instead).
+  sarray_t<nda::array_view<ComplexType,3>> Dnn_atom_static;
 
   // Per-species frozen-core radial densities (rho_core_AE, rho_core_PS),
   // SCF-invariant under the frozen-core approximation. Indexed by species
-  // type. Populated lazily by `hamilt::paw::compute_deeq_scf` on first call;
+  // type. Populated lazily by `build_paw_scf_caches` on first use;
   // empty until then.
   std::vector<std::pair<nda::array<double,1>, nda::array<double,1>>>
       paw_core_density;
@@ -509,9 +502,9 @@ class pseudopot
   // SCF caches above.
   int paw_aainit_lli = 0;
 
-  // True after `hamilt::paw::compute_deeq_scf` has built Dnn_atom_static_paw,
-  // paw_core_density, and paw_aainit_lli. Acts as a memoization flag so the
-  // SCF entry point can skip rebuilding the static caches each iteration.
+  // True after `build_paw_scf_caches` has built paw_core_density and
+  // paw_aainit_lli. Acts as a memoization flag so the SCF entry point can
+  // skip rebuilding the static caches each iteration.
   bool paw_scf_caches_built = false;
 
   // mapping from wfc_g grid to rho grid. 
@@ -579,18 +572,17 @@ class pseudopot
 public:
 
   /**
-   * Recompute `Dnn_atom` from a current density matrix `nij` for the
-   * frozen-core no-XC scGW framework:
+   * Return the self-consistent per-atom D for a current density matrix `nij`
+   * under the frozen-core no-XC scGW framework:
    *
    *   D_eff^a(ρ) = D_static^a + ΔD_H^a(becsum^a(ρ), ρ_core_AE, ρ_core_PS)
    *
-   * Static piece (SCF-invariant): kinetic + bare-ionic AE−PS one-center
-   * matrix elements, computed once from the canonical UPF inputs (no QE
-   * runtime dependency, no frozen-XC residual). Cached in
-   * `Dnn_atom_static_paw`.
-   *
-   * Dynamic piece (Hartree only): per-atom radial Hartree solver via
-   * `compute_paw_hartree_atom` from the current becsum.
+   * Thin non-mutating wrapper over `compute_paw_deeq(nij, empty_Vloc,
+   * include_static=true)` (plan A1): the static tensor `Dnn_atom_static`
+   * (dion + ex_cvij, built in the ctor) is the baseline and is never
+   * modified; the dynamic piece is the Hartree-only radial one-center term
+   * from the current becsum. No G-space ∫V·Q term (pass a potential to
+   * `compute_paw_deeq` directly for the full KS-like operator).
    *
    * Restrictions: npol = 1 (no SOC), non-magnetic (nspin = 1 path uses
    * full nij; LSDA averaging is the same path on the spin-summed becsum).
@@ -601,7 +593,7 @@ public:
    * — include that header at the call site.
    */
   template<typename nij_t>
-  void compute_deeq_scf(nij_t const& nij);
+  nda::array<ComplexType,3> compute_deeq_scf(nij_t const& nij);
 
   /**
    * Unified native PAW non-local D builder (the single source of truth — no
@@ -647,11 +639,13 @@ public:
                                              bool include_static);
 
   /**
-   * Build the SCF-invariant caches consumed by `compute_deeq_scf`:
-   * `Dnn_atom_static_paw`, `paw_core_density`, `paw_aainit_lli`. Idempotent;
-   * subsequent calls return immediately. Called automatically from
-   * `compute_deeq_scf`; exposed publicly so callers can pre-build the
-   * caches (e.g., during driver setup, outside the SCF hot loop).
+   * Build the SCF-invariant caches consumed by the PAW deeq builders:
+   * `paw_core_density`, `paw_aainit_lli`. (The static per-atom tensor
+   * `Dnn_atom_static` is NOT built here — it is assembled eagerly in
+   * `read_vnl_h5`.) Idempotent; subsequent calls return immediately.
+   * Called automatically from `compute_paw_deeq_from_becsum`; exposed
+   * publicly so callers can pre-build the caches (e.g., during driver
+   * setup, outside the SCF hot loop).
    *
    * Implementation lives out-of-class in `hamiltonian/paw/paw_onecenter.hpp`.
    */
