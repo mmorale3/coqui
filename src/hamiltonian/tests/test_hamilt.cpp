@@ -2375,6 +2375,115 @@ TEST_CASE("vhartree_nij_vs_nii", "[hamilt][paw][hf]")
 }
 
 // ===========================================================================
+// add_Vpp path alignment (plan A2 / invariant I5), all on nosym fixtures
+// (the nij becsum is nosym-only until plan A3):
+//  (1) H(nij) ≡ H(nii) for a diagonal density matrix — both overloads must
+//      build the identical operator via compute_paw_deeq(n, V_loc+V_H,
+//      include_static=true); pre-A2 the nij path silently fell through to
+//      the static-only branch.
+//  (2) H(n, add_hartree=false, add_exchange=false) ≡ H0() — with the
+//      density-dependent terms switched off, the density overload reduces
+//      to the static-only Eq. (h0) assembly.
+//  (3) H(n, add_exchange=true) ≡ H(n) + Vexchange(n) — the add_exchange
+//      flag accumulates the direct-route (SIGNED) K into Hij.
+// ===========================================================================
+template<MEMORY_SPACE MEM>
+void test_add_vpp_i5_alignment(mpi_context_t& mpi,
+                               std::shared_ptr<mf::MF> mf_ptr, double tol)
+{
+  auto& mfobj = *mf_ptr;
+  long nspin  = mfobj.nspin();
+  long nk_ibz = mfobj.nkpts_ibz();
+  long nbnd   = mfobj.nbnd();
+  REQUIRE(mfobj.nkpts() == nk_ibz);  // nosym fixture (plan A3 guard)
+
+  // Non-QE diagonal occupation (nonzero on all bands) + equivalent nij.
+  nda::array<ComplexType,3> nii(nspin, nk_ibz, nbnd);
+  for (long s = 0; s < nspin; ++s)
+    for (long k = 0; k < nk_ibz; ++k)
+      for (long n = 0; n < nbnd; ++n)
+        nii(s, k, n) = ComplexType(0.5 + 0.3*std::cos(1.3*n + 0.7*k + 0.2*s), 0.0);
+  nda::array<ComplexType,4> nij(nspin, nk_ibz, nbnd, nbnd);
+  nij() = ComplexType(0.0);
+  for (long s = 0; s < nspin; ++s)
+    for (long k = 0; k < nk_ibz; ++k)
+      for (long n = 0; n < nbnd; ++n)
+        nij(s, k, n, n) = nii(s, k, n);
+
+  hamilt::pseudopot V(mfobj);
+
+  auto max_abs_diff = [&mpi](auto const& x, auto const& y) {
+    auto a = nda::to_host(x.local());
+    auto b = nda::to_host(y.local());
+    double m = 0.0;
+    for (long i0 = 0; i0 < a.extent(0); ++i0)
+      for (long i1 = 0; i1 < a.extent(1); ++i1)
+        for (long i2 = 0; i2 < a.extent(2); ++i2)
+          for (long i3 = 0; i3 < a.extent(3); ++i3)
+            m = std::max(m, std::abs(b(i0,i1,i2,i3) - a(i0,i1,i2,i3)));
+    return mpi.comm.all_reduce_value(m, boost::mpi3::max<>{});
+  };
+
+  // (1) nii ≡ nij
+  auto dH_nii = hamilt::H<MEM>(mfobj, mpi.comm, &V, nii);
+  auto dH_nij = hamilt::H<MEM>(mfobj, mpi.comm, &V, nij);
+  double d1 = max_abs_diff(dH_nii, dH_nij);
+  app_log(1, "[add_Vpp I5] max|H(nij) - H(nii)| = {:.3e}", d1);
+  CHECK(d1 < tol);
+
+  // (2) density overload with both flags off ≡ static-only H0
+  auto dH_off = hamilt::H<MEM>(mfobj, mpi.comm, &V, nii, {0}, {1,1,2048,2048},
+                               /*add_hartree=*/false, /*add_exchange=*/false);
+  auto dH0 = hamilt::H0<MEM>(mfobj, mpi.comm, &V);
+  double d2 = max_abs_diff(dH_off, dH0);
+  app_log(1, "[add_Vpp I5] max|H(nii, flags off) - H0| = {:.3e}", d2);
+  CHECK(d2 < tol);
+
+  // (3) add_exchange accumulates the direct-route K on top of H(n)
+  auto dH_hx = hamilt::H<MEM>(mfobj, mpi.comm, &V, nii, {0}, {1,1,2048,2048},
+                              /*add_hartree=*/true, /*add_exchange=*/true);
+  auto dK = hamilt::Vexchange<MEM>(mfobj, mpi.comm, &V, nii);
+  auto h_ = nda::to_host(dH_nii.local());
+  auto k_ = nda::to_host(dK.local());
+  auto got = nda::to_host(dH_hx.local());
+  double d3 = 0.0, kmax = 0.0;
+  for (long i0 = 0; i0 < got.extent(0); ++i0)
+    for (long i1 = 0; i1 < got.extent(1); ++i1)
+      for (long i2 = 0; i2 < got.extent(2); ++i2)
+        for (long i3 = 0; i3 < got.extent(3); ++i3) {
+          d3 = std::max(d3, std::abs(got(i0,i1,i2,i3)
+                                     - (h_(i0,i1,i2,i3) + k_(i0,i1,i2,i3))));
+          kmax = std::max(kmax, std::abs(k_(i0,i1,i2,i3)));
+        }
+  d3 = mpi.comm.all_reduce_value(d3, boost::mpi3::max<>{});
+  kmax = mpi.comm.all_reduce_value(kmax, boost::mpi3::max<>{});
+  app_log(1, "[add_Vpp I5] max|H(n,x) - (H(n) + K)| = {:.3e}, max|K| = {:.3e}",
+          d3, kmax);
+  REQUIRE(kmax > 1e-8);  // exchange must actually contribute
+  CHECK(d3 < tol);
+}
+
+TEST_CASE("add_vpp_i5_alignment", "[hamilt][paw][hf]")
+{
+  auto& mpi = utils::make_unit_test_mpi_context();
+  SECTION("lih_kp222_nbnd16 (NCPP)") {
+    auto mf_ptr = std::make_shared<mf::MF>(
+        mf::default_MF(mpi, "qe_lih222_hf", mf::h5_input_type));
+    test_add_vpp_i5_alignment<HOST_MEMORY>(*mpi, mf_ptr, 1e-10);
+  }
+  SECTION("lih_kp222_nbnd16 (USPP)") {
+    auto mf_ptr = std::make_shared<mf::MF>(
+        mf::default_MF(mpi, "qe_lih222_uspp_hf", mf::h5_input_type));
+    test_add_vpp_i5_alignment<HOST_MEMORY>(*mpi, mf_ptr, 1e-10);
+  }
+  SECTION("lih_kp222_nbnd16 (PAW)") {
+    auto mf_ptr = std::make_shared<mf::MF>(
+        mf::default_MF(mpi, "qe_lih222_paw_hf", mf::h5_input_type));
+    test_add_vpp_i5_alignment<HOST_MEMORY>(*mpi, mf_ptr, 1e-10);
+  }
+}
+
+// ===========================================================================
 // Vexchange(nij) reduces to Vexchange(nii) for a DIAGONAL density matrix.
 // Validates the new full-density-matrix exchange path: the natural-orbital
 // decomposition of nij = diag(nii) recovers the canonical bands (with

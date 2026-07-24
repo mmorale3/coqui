@@ -152,8 +152,9 @@ void set_kinetic(mf::MF &mf, pseudopot *psp, math::shm::shared_array<Array_4D_t>
 template<MEMORY_SPACE MEM = HOST_MEMORY>
 auto H(mf::MF &mf, boost::mpi3::communicator &comm, pseudopot *psp,
         nda::ArrayOfRank<4> auto const& nij,
-        std::array<long,4> pgrid = {0}, std::array<long,4> bz = {1,1,2048,2048})
-{ 
+        std::array<long,4> pgrid = {0}, std::array<long,4> bz = {1,1,2048,2048},
+        bool add_hartree = true, bool add_exchange = false)
+{
   using nij_type = decltype(nij);
   static_assert(memory::get_memory_space<nij_type>() == MEM, "Memory Space mismatch.");
   // this is, unfortunately, code dependent, so fork here!
@@ -165,7 +166,8 @@ auto H(mf::MF &mf, boost::mpi3::communicator &comm, pseudopot *psp,
     auto psi = mf::read_distributed_orbital_set_ibz<larray>(mf,comm,'w',pgrid,
                                nda::range(mf.nspin()),k_rng,b_rng,bz);
     memory::array_view<MEM,ComplexType,3> *p3=nullptr;
-    return detail::gen_H0<MEM>(mf,comm,psp,k_rng,b_rng,psi,p3,std::addressof(nij));
+    return detail::gen_H0<MEM>(mf,comm,psp,k_rng,b_rng,psi,p3,std::addressof(nij),
+                               /*skip_pp=*/false,add_hartree,add_exchange);
   } else {
     utils::check(mf.mf_type() == mf::pyscf_source, "Source mismatch");
     return detail::pyscf_read_1B_from_file<MEM>(mf,"H0",comm,pgrid,bz);
@@ -187,7 +189,8 @@ auto H(mf::MF &mf, boost::mpi3::communicator &comm, pseudopot *psp,
 template<MEMORY_SPACE MEM = HOST_MEMORY>
 auto H(mf::MF &mf, boost::mpi3::communicator &comm, pseudopot *psp,
         nda::ArrayOfRank<3> auto const& nii,
-        std::array<long,4> pgrid = {0}, std::array<long,4> bz = {1,1,2048,2048})
+        std::array<long,4> pgrid = {0}, std::array<long,4> bz = {1,1,2048,2048},
+        bool add_hartree = true, bool add_exchange = false)
 {
   // this is, unfortunately, code dependent, so fork here!
   if (mf.mf_type() == mf::qe_source or mf.mf_type() == mf::bdft_source) {
@@ -198,7 +201,8 @@ auto H(mf::MF &mf, boost::mpi3::communicator &comm, pseudopot *psp,
     auto psi = mf::read_distributed_orbital_set_ibz<larray>(mf,comm,'w',pgrid,
                                nda::range(mf.nspin()),k_rng,b_rng,bz);
     memory::array_view<MEM,ComplexType,4> *p4=nullptr;
-    return detail::gen_H0<MEM>(mf,comm,psp,k_rng,b_rng,psi,std::addressof(nii),p4);
+    return detail::gen_H0<MEM>(mf,comm,psp,k_rng,b_rng,psi,std::addressof(nii),p4,
+                               /*skip_pp=*/false,add_hartree,add_exchange);
   } else {
     utils::check(mf.mf_type() == mf::pyscf_source, "Source mismatch");
     return detail::pyscf_read_1B_from_file<MEM>(mf,"H0",comm,pgrid,bz);

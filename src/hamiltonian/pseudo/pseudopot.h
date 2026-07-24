@@ -298,17 +298,34 @@ class pseudopot
                math::nda::DistributedArrayOfRank<4> auto & hpsi,
                math::nda::DistributedArrayOfRank<4> auto & Hij);
 
+  /**
+   * Density-dependent overloads (plan I5): on top of the static assembly
+   * above, the requested density-dependent terms are added under separate
+   * boolean control, so callers (e.g. a future set_H) can mix direct and
+   * ERI routes per term:
+   *   - add_hartree: smooth V_H[n] applied to hpsi, plus (USPP/PAW) the
+   *     one-center D built from V_loc+V_H (∫V·Q̂ + radial AE−PS Hartree)
+   *     contracted into Hij. With add_hartree=false the static-only
+   *     operator of the no-density overload is produced.
+   *   - add_exchange: the band-pair-augmented exact-exchange matrix K
+   *     (direct v_x route, SIGNED: F = H + K with K negative) accumulated
+   *     into Hij. Host memory only.
+   * The nii and nij overloads produce the identical operator for the same
+   * physical density.
+   */
   void add_Vpp(boost::mpi3::communicator& comm, nda::range k_range, nda::range b_range,
                nda::ArrayOfRank<3> auto const& nii,
                math::nda::DistributedArrayOfRank<4> auto const& psi,
                math::nda::DistributedArrayOfRank<4> auto & hpsi,
-               math::nda::DistributedArrayOfRank<4> auto & Hij);
+               math::nda::DistributedArrayOfRank<4> auto & Hij,
+               bool add_hartree = true, bool add_exchange = false);
 
   void add_Vpp(boost::mpi3::communicator& comm, nda::range k_range, nda::range b_range,
                nda::ArrayOfRank<4> auto const& nij,
                math::nda::DistributedArrayOfRank<4> auto const& psi,
                math::nda::DistributedArrayOfRank<4> auto & hpsi,
-               math::nda::DistributedArrayOfRank<4> auto & Hij);
+               math::nda::DistributedArrayOfRank<4> auto & Hij,
+               bool add_hartree = true, bool add_exchange = false);
 
   /**
    * Add the contributions of the Hartree potential to the wavefunctions "hpsi"
@@ -746,14 +763,20 @@ public:
    *                           where Vpp_nl is the non-local part of the pseudopotential
    * @param nii     - [input] Diagonal density matrix (s, k, a)
    * @param nij     - [input] Density matrix (s, k, a, b)
+   * @param add_hartree  - [input] with a density: add smooth V_H to hpsi and
+   *                       the V_loc+V_H one-center D to Hij (plan I5). false
+   *                       reduces to the static-only no-density assembly.
+   * @param add_exchange - [input] with a density: accumulate the direct-route
+   *                       exact-exchange K into Hij (host only).
    */
   template< nda::ArrayOfRank<3> Arr3, nda::ArrayOfRank<4> Arr4>
   void add_vpp_impl(boost::mpi3::communicator& comm,
-               nda::range k_range, nda::range b_range, 
+               nda::range k_range, nda::range b_range,
                math::nda::DistributedArrayOfRank<4> auto const& psi,
                math::nda::DistributedArrayOfRank<4> auto & hpsi,
                math::nda::DistributedArrayOfRank<4> auto & Hij,
-               const Arr3 * nii, const Arr4 * nij);
+               const Arr3 * nii, const Arr4 * nij,
+               bool add_hartree = true, bool add_exchange = false);
 
   /**
    * Add the contributions of the Hartree potential to the wavefunctions "hpsi"

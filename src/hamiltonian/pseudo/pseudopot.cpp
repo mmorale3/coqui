@@ -600,9 +600,11 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
         qq_r() = 0.0;
         try { nda::h5_read(grp,"qq_nt",qq_r); }
         catch(...) {
-          app_warning("USPP/PAW: 'qq_nt' missing from h5 file. "
-                      "Re-run pw2coqui with the latest schema. "
-                      "Continuing with zero augmentation overlap.");
+          utils::check(false,
+              "USPP/PAW: dataset 'qq_nt' missing from the mean-field h5 file "
+              "(old-schema file). The native one-center D build requires it "
+              "(plan A2/A5) — regenerate the h5 with the CoQui-shipped "
+              "converter (pw2coqui / abinit2coqui).");
         }
         auto Qloc = qq_nt_data.local();
         Qloc() = ComplexType(0.0);
@@ -625,9 +627,11 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
           nda::h5_read(grp,ds,qfn);
           qg_loc(nt, nda::range(nij), nda::range(ngm_dense)) = qfn;
         } catch(...) {
-          app_warning("USPP/PAW: missing dataset '{}' in h5 file. "
-                      "Augmentation Q^IJ(G) for species {} set to zero.",
-                      ds, nt);
+          utils::check(false,
+              "USPP/PAW: dataset '{}' (augmentation Q^IJ(G) for species {}) "
+              "missing from the mean-field h5 file (old-schema file). "
+              "Regenerate the h5 with the CoQui-shipped converter "
+              "(pw2coqui / abinit2coqui).", ds, nt);
         }
       }
     }
@@ -678,9 +682,12 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
       bool has_species_grp = grp0.has_subgroup("Hamiltonian") &&
         grp0.open_group("Hamiltonian").has_subgroup("Species");
       if(!has_species_grp) {
-        app_warning("/Hamiltonian/Species group missing in h5 file. "
-                    "Per-species PAW data will be empty; regenerate with "
-                    "the latest pw2coqui to enable it.");
+        utils::check(false,
+            "/Hamiltonian/Species group missing from the mean-field h5 file "
+            "(old-schema file). The native USPP/PAW one-center D build "
+            "requires the per-species radial data (plan A2/A5) — regenerate "
+            "the h5 with the CoQui-shipped converter "
+            "(pw2coqui / abinit2coqui).");
       } else {
         h5::group hgrp = grp0.open_group("Hamiltonian");
         h5::group sp_grp = hgrp.open_group("Species");
@@ -1141,7 +1148,8 @@ void pseudopot::add_vpp_impl(boost::mpi3::communicator& comm,
 		   math::nda::DistributedArrayOfRank<4> auto const& psi,
 		   math::nda::DistributedArrayOfRank<4> auto & hpsi,
 		   math::nda::DistributedArrayOfRank<4> auto & Hij,
-                   const Arr3 * nii, const Arr4 * nij)
+                   const Arr3 * nii, const Arr4 * nij,
+                   bool add_hartree, bool add_exchange)
 {
   pots::potential_t vG(ptree{});
 
@@ -1179,7 +1187,22 @@ void pseudopot::add_vpp_impl(boost::mpi3::communicator& comm,
    *   4. fft to real space
    *   5. add to vloc
    */
-  if( nii != nullptr or nij != nullptr ) {
+  bool const have_density = (nii != nullptr or nij != nullptr);
+  utils::check( nii == nullptr or nij == nullptr,
+                "Error in pseudo::add_vpp_impl: Both nii and nij!!");
+  utils::check( have_density or not add_exchange,
+                "pseudo::add_vpp_impl: add_exchange requires a density (nii or nij).");
+  // Plan A3 pending: every nij becsum consumer (v_h augmentation,
+  // compute_paw_deeq, v_x) uses IBZ k-weights and is only correct without
+  // symmetry reduction. Enforce nosym rather than be silently wrong.
+  if( nij != nullptr and ptype != pp_ncpp_t and (add_hartree or add_exchange) )
+    utils::check(nkpts_ibz == nkpts,
+                 "pseudo::add_vpp_impl(nij): USPP/PAW on a symmetry-reduced "
+                 "k-mesh is not supported until the full-BZ becsum lands "
+                 "(plan A3). Re-run without symmetry (nk_ibz={} nk={}).",
+                 nkpts_ibz, nkpts);
+
+  if( have_density and add_hartree ) {
 
     auto mpi_local_context = utils::make_mpi_context(comm);
 
@@ -1188,9 +1211,7 @@ void pseudopot::add_vpp_impl(boost::mpi3::communicator& comm,
     auto vr = svr.local();
     auto vltot = svloc.local();
 
-    utils::check( nii == nullptr or nij == nullptr, 
-                  "Error in pseudo::add_vpp_impl: Both nii and nij!!");
-    utils::check( k_range.first() == 0 and  k_range.last() == nkpts_ibz, 
+    utils::check( k_range.first() == 0 and  k_range.last() == nkpts_ibz,
                  "Error in add_vloc: add_hartree requires full kpoint range.");
     // Calculates hartree potential on the soft+augmentation charge density. 
     if( nii != nullptr)
@@ -1232,11 +1253,11 @@ void pseudopot::add_vpp_impl(boost::mpi3::communicator& comm,
     // (vltot + vr) on the smooth grid, plus the static (dion + ex_cvij)
     // baseline and the radial AE−PS one-center Hartree. PerType scaling means
     // no occupation/N_k is folded into the channel. Built only on PAW/USPP;
-    // NCPP falls through to the bare branch.
-    // TODO (plan A2/A3): wire the nij overload through compute_paw_deeq(nij)
-    // as well (needs the symmetry-correct full-BZ nij becsum); today nij
-    // falls through to the static-only branch below.
-    if (ptype != pp_ncpp_t && nii != nullptr) {
+    // NCPP takes the species-resolved static Dnn (its Hartree is purely the
+    // smooth vr applied above). nii and nij produce the identical operator
+    // for the same physical density (plan I5); the nij becsum is nosym-only
+    // until plan A3 (guard above).
+    if (ptype != pp_ncpp_t) {
       sarray_t<nda::array_view<ComplexType,1>> svfull(mpi_local_context,{nnr_aug});
       auto vfull = svfull.local();
       if (mpi->node_comm.root()) {
@@ -1247,32 +1268,49 @@ void pseudopot::add_vpp_impl(boost::mpi3::communicator& comm,
           vfull(r) = svloc.local()(0, 0, r) + vr(r);
       }
       mpi->node_comm.barrier();
-      auto Dion_native = compute_paw_deeq(*nii, vfull,
-                                          /*include_static=*/true);
+      auto Dion_native = (nii != nullptr)
+          ? compute_paw_deeq(*nii, vfull, /*include_static=*/true)
+          : compute_paw_deeq(*nij, vfull, /*include_static=*/true);
       add_vnl_impl(k_range, b_range, Dion_native, Hij);
-      return;
+    } else {
+      add_vnl_impl(k_range, b_range, Dnn.local(), Hij);
     }
 
   } else {
 
-    // local potential
+    // No density (or add_hartree=false): static-only assembly, Eq. (h0) of
+    // plan I5 — local potential on hpsi plus the frozen non-local D in Hij.
+    // add_vnl_impl indexes Dion(id, ...) with id = (ncpp ? nt : ia); NCPP →
+    // species-resolved Dnn, USPP/PAW → per-atom Dnn_atom_static
+    // (dion + ex_cvij). Hartree/exchange are supplied elsewhere (today: the
+    // ERI objects in the SCF classes) and must not be double-counted here.
     auto vltot = svloc.local();
     hamilt::add_vloc(npol,fft_mesh_aug,swfc_to_rho.local(),vltot,psi,hpsi);
 
+    if (ptype == pp_ncpp_t)
+      add_vnl_impl(k_range, b_range, Dnn.local(),             Hij);
+    else
+      add_vnl_impl(k_range, b_range, Dnn_atom_static.local(), Hij);
+
   }
 
-  // Non-local part, directly into Hij. add_vnl_impl indexes Dion(id, ...)
-  // with id = (ncpp ? nt : ia). NCPP → species-resolved Dnn.
-  // PAW/USPP + nii is handled above via the native `compute_paw_deeq` early
-  // return. PAW/USPP no-density → static-only H0 per plan I5 (Hartree and
-  // exchange are supplied by the ERI objects in the SCF classes).
-  // PAW/USPP + nij currently ALSO falls through to static-only — the native
-  // `compute_paw_deeq(nij)` wiring (identical operator to the nii overload)
-  // lands with plan A2/A3 (needs the symmetry-correct nij becsum).
-  if (ptype == pp_ncpp_t)
-    add_vnl_impl(k_range, b_range, Dnn.local(),             Hij);
-  else
-    add_vnl_impl(k_range, b_range, Dnn_atom_static.local(), Hij);
+  // Direct-route exact exchange (plan I5/I7 groundwork for set_H): the
+  // band-pair-augmented K has no hpsi representation, so it is built into a
+  // temporary with Hij's distribution and accumulated. K is SIGNED
+  // (F = H + K, K negative) per the add_exchange convention.
+  if( have_density and add_exchange ) {
+    if constexpr (MEM == HOST_MEMORY) {
+      auto Kij = math::nda::make_distributed_array<memory::array<MEM,ComplexType,4>>(
+          comm, Hij.grid(), Hij.global_shape(), Hij.block_size());
+      Kij.local() = ComplexType(0.0);
+      if (nii != nullptr) this->add_exchange(k_range, *nii, psi, Kij);
+      else                this->add_exchange(k_range, *nij, psi, Kij);
+      Hij.local() += Kij.local();
+    } else {
+      utils::check(false, "pseudo::add_vpp_impl: add_exchange direct route "
+                          "is host-memory only; use the ERI route on device.");
+    }
+  }
 }
 
 // Standalone helper: add the USPP/PAW augmentation to a smooth-grid pair
@@ -1340,35 +1378,39 @@ void pseudopot::add_Vpp(boost::mpi3::communicator& comm,
 }
 
 void pseudopot::add_Vpp(boost::mpi3::communicator& comm,
-                   nda::range k_range, nda::range b_range, 
-                   nda::ArrayOfRank<3> auto const& nii, 
+                   nda::range k_range, nda::range b_range,
+                   nda::ArrayOfRank<3> auto const& nii,
                    math::nda::DistributedArrayOfRank<4> auto const& psi,
                    math::nda::DistributedArrayOfRank<4> auto & hpsi,
-                   math::nda::DistributedArrayOfRank<4> auto & Hij)
+                   math::nda::DistributedArrayOfRank<4> auto & Hij,
+                   bool add_hartree, bool add_exchange)
 {
-  constexpr auto MEM = memory::get_memory_space<std::decay_t<decltype(psi.local())>>(); 
+  constexpr auto MEM = memory::get_memory_space<std::decay_t<decltype(psi.local())>>();
   constexpr auto MEM1 = memory::get_memory_space<std::decay_t<decltype(hpsi.local())>>();
   constexpr auto MEM2 = memory::get_memory_space<std::decay_t<decltype(Hij.local())>>();
   static_assert(MEM == MEM1, "Memory mismatch.");
   static_assert(MEM == MEM2, "Memory mismatch.");
   memory::array<MEM,ComplexType,4>* p4 = nullptr;
-  add_vpp_impl(comm,k_range,b_range,psi,hpsi,Hij,std::addressof(nii),p4);
+  add_vpp_impl(comm,k_range,b_range,psi,hpsi,Hij,std::addressof(nii),p4,
+               add_hartree,add_exchange);
 }
 
 void pseudopot::add_Vpp(boost::mpi3::communicator& comm,
-                   nda::range k_range, nda::range b_range, 
+                   nda::range k_range, nda::range b_range,
                    nda::ArrayOfRank<4> auto const& nij,
                    math::nda::DistributedArrayOfRank<4> auto const& psi,
                    math::nda::DistributedArrayOfRank<4> auto & hpsi,
-                   math::nda::DistributedArrayOfRank<4> auto & Hij)
-{ 
-  constexpr auto MEM = memory::get_memory_space<std::decay_t<decltype(psi.local())>>(); 
+                   math::nda::DistributedArrayOfRank<4> auto & Hij,
+                   bool add_hartree, bool add_exchange)
+{
+  constexpr auto MEM = memory::get_memory_space<std::decay_t<decltype(psi.local())>>();
   constexpr auto MEM1 = memory::get_memory_space<std::decay_t<decltype(hpsi.local())>>();
   constexpr auto MEM2 = memory::get_memory_space<std::decay_t<decltype(Hij.local())>>();
   static_assert(MEM == MEM1, "Memory mismatch.");
   static_assert(MEM == MEM2, "Memory mismatch.");
   memory::array<MEM,ComplexType,3>* p3 = nullptr;
-  add_vpp_impl(comm,k_range,b_range,psi,hpsi,Hij,p3,std::addressof(nij));
+  add_vpp_impl(comm,k_range,b_range,psi,hpsi,Hij,p3,std::addressof(nij),
+               add_hartree,add_exchange);
 }
 
 // MAM: This routine should take an mpi_context and use it, instead of mpi
@@ -1541,24 +1583,24 @@ template void pseudopot::add_Vpp(boost::mpi3::communicator&,nda::range,nda::rang
         V<ComplexType,3> const&, \
         darray_t<V<ComplexType,4>,communicator> const&, \
         darray_t<V<ComplexType,4>,communicator>&, \
-        darray_t<V<ComplexType,4>,communicator>&); \
+        darray_t<V<ComplexType,4>,communicator>&,bool,bool); \
 template void pseudopot::add_Vpp(boost::mpi3::communicator&,nda::range,nda::range, \
         V<ComplexType,4> const&,  \
         darray_t<V<ComplexType,4>,communicator> const&,  \
         darray_t<V<ComplexType,4>,communicator>&,  \
-        darray_t<V<ComplexType,4>,communicator>&);  \
+        darray_t<V<ComplexType,4>,communicator>&,bool,bool);  \
 
 #define __add_Vpp2__(V1,V2) \
 template void pseudopot::add_Vpp(boost::mpi3::communicator&,nda::range,nda::range, \
         V1<ComplexType,3> const&, \
         darray_t<V2<ComplexType,4>,communicator> const&, \
         darray_t<V2<ComplexType,4>,communicator>&, \
-        darray_t<V2<ComplexType,4>,communicator>&); \
+        darray_t<V2<ComplexType,4>,communicator>&,bool,bool); \
 template void pseudopot::add_Vpp(boost::mpi3::communicator&,nda::range,nda::range, \
         V1<ComplexType,4> const&, \
         darray_t<V2<ComplexType,4>,communicator> const&, \
         darray_t<V2<ComplexType,4>,communicator>&, \
-        darray_t<V2<ComplexType,4>,communicator>&); 
+        darray_t<V2<ComplexType,4>,communicator>&,bool,bool);
 
 #define __add_hartree__(V1,V2)  \
 template void pseudopot::add_Hartree(nda::range k_range,  \

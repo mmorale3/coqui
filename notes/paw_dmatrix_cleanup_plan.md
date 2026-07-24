@@ -10,25 +10,40 @@ printed into context at session start by a SessionStart hook).
 
 ## STATUS
 
-Last updated: 2026-07-24 — A1 done. A1 notes: QE fixtures carry no ex_cvij, so
-the whole QE test suite is value-identical; the H0 flip (QE deeq → static-only)
-pins NO stored test reference (only NCPP fixtures have H0 refs) — production
-e_1e re-baselining still lands with A2 per plan. Pre-existing failures found
-while validating (NOT from A1; bit-identical on the pre-A1 tree):
-dft_eigenvalues USPP/PAW sections (max_err 0.749/0.790 Ha at Li 1s semicore —
-broke sometime before A1, needs its own bisect/session; the A-tests item's
-QE-eigenvalue diagnostic rework subsumes it) and vx_sensitivity_ncpp (hidden
-[!benchmark] test, hard-codes ~/ceph data absent on this host).
-Note: test binaries now need KMP_DUPLICATE_LIB_OK=TRUE (homebrew dual-libomp,
-see CLAUDE.md); fast PAW suite green at 13441 assertions / 31 cases.
+Last updated: 2026-07-24 — A2 done. A2 notes: nij add_Vpp now builds the same
+native compute_paw_deeq(n, V_loc+V_H, include_static=true) as nii (F2 closed;
+H(nij)≡H(nii) at ≤1e-15 on NCPP/USPP/PAW LiH _hf fixtures, new TEST_CASE
+add_vpp_i5_alignment); add_hartree/add_exchange bools threaded through
+add_vpp_impl → public add_Vpp → gen_H0 → hamilt::H (defaults true/false keep
+all callers unchanged; flags-off ≡ H0 bit-identical; add_exchange ≡ H+K at
+1e-15, host-only, device aborts). nij USPP/PAW guarded nkpts_ibz==nkpts until
+A3. Missing qq_nt / augmentation_function_isp* / Hamiltonian/Species now hard
+errors naming the converter rerun (part of A5 done early). SCF-driver audit
+clean: simple_dyson/scf_driver/qp_scf_common/downfold_1e/pproc all take H0 via
+no-density set_H0 (static-only) + ERI J/K — no double-count/omission, and the
+density overloads have NO production callers, so no reference re-baselining
+was triggered (fast suite value-identical, now 13456 assertions / 32 cases).
+CAUTION for A-tests: the plan identity "nii≡nij≡no-density+Hartree" does NOT
+hold as literally stated — the density path's KS-like D uses ∫(V_loc+V_H)Q̂
+(plan I3) while H0+add_Hartree gives static + ∫V_H·Q̂ only; they differ by the
+static ∫V_loc·Q̂·becpair term. Whether that term belongs in H0 (and hence in
+the ERI-route Fock build, I7) must be settled there against Eq. d0's
+−⟨Q̂|v_H[ñ_Zc]⟩ content of dion before writing the test.
+A1 notes (kept): QE fixtures carry no ex_cvij → QE suite value-identical;
+pre-existing failures (NOT from A1/A2): dft_eigenvalues USPP/PAW sections
+(max_err 0.749/0.790 Ha at Li 1s semicore, needs own bisect; subsumed by
+A-tests QE-eigenvalue diagnostic rework) and vx_sensitivity_ncpp (hidden
+[!benchmark], hard-codes ~/ceph data absent here).
+Note: test binaries need KMP_DUPLICATE_LIB_OK=TRUE (homebrew dual-libomp,
+see CLAUDE.md).
 
 Workstream A — pseudopot D-matrix refactor
 - [x] A0 stabilize working tree (4 coherent commits; .swp gone; .DS_Store gitignored) — 2026-07-24
 - [x] A1 two-tensor model: Dnn_atom_static = dion + ex_cvij (eager, ctor); remove QE deeq read; compute_deeq_scf stops mutating (thin wrapper, returns by value; non-mutation REQUIREd in test) — 2026-07-24
-- [ ] A2 align add_vpp paths with I5: no-density = static-only; nii/nij identical native build; add_hartree/add_exchange bools
+- [x] A2 align add_vpp paths with I5: no-density = static-only; nii/nij identical native build; add_hartree/add_exchange bools — 2026-07-24
 - [ ] A3 symmetry-correct nij becsum (full-BZ lift) + Hermitian pair symmetrization + nosym guards until it lands
 - [ ] A4 hoist per-call statics (aainit, qrad dq=0.01, Pskna lift, Δk-keyed Qfac); parallelize ∫V·Q loop
-- [ ] A5 provenance checks at read time (hard errors, no silent fallbacks)
+- [ ] A5 provenance checks at read time (hard errors, no silent fallbacks) — partial via A2: qq_nt/aug-Q(G)/Species-group missing now hard errors; remaining: dion Hermiticity+scale, proj_per_atom length, required-dataset sweep
 - [ ] A-tests: nii≡nij≡no-density+Hartree; sym≡nosym; ex_cvij factor-1 e_1e; QE-eigenvalue diagnostic
 
 Workstream B — converter parity
