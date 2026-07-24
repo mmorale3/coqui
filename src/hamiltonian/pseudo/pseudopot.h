@@ -43,6 +43,17 @@
 namespace hamilt
 {
 
+namespace paw {
+// Lazily built runtime caches (plan A4): angular aainit tables, per-species
+// qrad interpolation tables, the full-BZ Pskna lift, and the Δk-keyed Qfac
+// cache. Defined in hamiltonian/paw/paw_runtime_caches.hpp (its member types
+// live in paw headers that themselves include pseudopot.h, hence the
+// forward declaration + shared_ptr storage here).
+struct runtime_caches;
+struct aainit_tables;
+struct qrad_tab;
+}
+
 /**
  * Core-valence exchange treatment. This is NOT a user/toml option: it is
  * AUTO-DETECTED per PAW species from the mean-field h5 content in the pseudopot
@@ -430,6 +441,25 @@ class pseudopot
     paw_exx_shape_restored = (o.vv_compensation == vv_compensation_e::shape);
   }
 
+  // ---- Plan A4: lazily built runtime caches. Definitions in
+  // hamiltonian/paw/paw_runtime_caches.hpp; every cached object is a pure
+  // function of the immutable pseudopot state plus the explicit key
+  // arguments, so the cache is shared across pseudopot copies.
+  paw::runtime_caches& paw_rt() const;
+  // Angular-momentum coupling tables at lli = 1 + max l over all projectors.
+  paw::aainit_tables const& paw_aatab() const;
+  // Per-species qrad interpolation tables at the SINGLE project-wide
+  // dq = 0.01 (plan A4); rebuilt only when Kmax grows or the mode
+  // (shape-restored vs moment) / aug_lmax changes. A table built to a larger
+  // Kmax is exact for any smaller request (identical interpolation nodes).
+  std::vector<paw::qrad_tab> const& paw_qrad_tabs(
+      double Kmax, bool shape_restored_paw) const;
+  // Full-BZ View-2 Pskna lift, built once. MPI-COLLECTIVE on this
+  // pseudopot's own communicator at the first call: every rank must reach
+  // it together (all current consumers are themselves collective helpers).
+  math::shm::shared_array<nda::array_view<ComplexType,4>> const&
+      Pskna_full_bz() const;
+
   private:
 
   // mpi communicators
@@ -518,6 +548,10 @@ class pseudopot
   // the angular-momentum coupling tables. Populated lazily alongside the
   // SCF caches above.
   int paw_aainit_lli = 0;
+
+  // Plan A4 runtime caches (see paw_rt() above). Created lazily; shared
+  // between copies of this pseudopot (safe: content is keyed, never stale).
+  mutable std::shared_ptr<paw::runtime_caches> paw_rt_cache;
 
   // True after `build_paw_scf_caches` has built paw_core_density and
   // paw_aainit_lli. Acts as a memoization flag so the SCF entry point can

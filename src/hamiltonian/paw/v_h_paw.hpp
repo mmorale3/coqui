@@ -39,7 +39,8 @@
 #include "numerics/distributed_array/nda.hpp"
 #include "hamiltonian/v_h.hpp"
 #include "hamiltonian/pseudo/pseudopot.h"
-#include "hamiltonian/paw/paw_symmetry.hpp"   // full-BZ projector lift
+#include "hamiltonian/paw/paw_symmetry.hpp"        // full-BZ projector lift
+#include "hamiltonian/paw/paw_runtime_caches.hpp"  // cached lift (plan A4)
 
 namespace hamilt::paw {
 
@@ -293,24 +294,25 @@ inline nda::array<ComplexType,1> compute_rho_aug_density_r(
  * Fixes the symmetry-reduced V_H augmentation error in the DIRECT path
  * (Vhartree / deeq reference); the THC path was already correct (2026-06-11).
  */
-template<class MPI_t, typename occ_t, typename kti_t, typename ktr_t,
-         typename ksy_t, typename kp_t>
+template<typename occ_t, typename kti_t, typename ktr_t>
 inline nda::array<double,3> compute_becsum_diagonal_symm(
-    MPI_t& mpi, pseudopot const& psp, occ_t const& nii,
-    kti_t const& kp_to_ibz, ktr_t const& kp_trev, ksy_t const& kp_symm,
-    kp_t const& kpts,
-    nda::stack_array<double,3,3> const& lattv,
-    nda::stack_array<double,3,3> const& recv,
-    std::vector<utils::symm_op> const& symm_list, int npol)
+    pseudopot const& psp, occ_t const& nii,
+    kti_t const& kp_to_ibz, [[maybe_unused]] ktr_t const& kp_trev, int npol)
+    // kp_trev kept for signature parity with compute_becsum_full_symm:
+    // occupations are trev-invariant so the diagonal expansion needs no conj.
 {
-    auto sPfull = compute_Pskna_full_bz(
-        psp, kp_to_ibz, kp_symm, kp_trev, kpts, lattv, recv, symm_list,
-        npol, mpi);
-    auto Pfull = sPfull.local();   // (nspin, nk_full, npol*nkb, nbnd)
+    // Cached full-BZ lift (plan A4); MPI-collective on psp's communicator at
+    // the first call, cheap view afterwards. The BZ tables (kp_to_ibz,
+    // kp_trev) are still taken from the caller for the band-matrix expansion
+    // and must describe the same mesh psp was built from.
+    auto Pfull = psp.Pskna_full_bz().local();  // (nspin, nk_full, npol*nkb, nbnd)
 
     long nspin   = nii.extent(0);
     long nk_full = (long)kp_to_ibz.extent(0);
     long nbnd    = nii.extent(2);
+    utils::check(Pfull.extent(1) == nk_full,
+        "compute_becsum_diagonal_symm: kp_to_ibz length {} != lifted nk {}",
+        nk_full, Pfull.extent(1));
     nda::array<ComplexType,3> nii_full(nspin, nk_full, nbnd);
     for (long s = 0; s < nspin; ++s)
         for (long K = 0; K < nk_full; ++K)
@@ -336,24 +338,20 @@ inline nda::array<double,3> compute_becsum_diagonal_symm(
  * nosym (IBZ == full BZ, identity symm) this reduces to compute_becsum_full
  * unchanged.
  */
-template<class MPI_t, typename nij_t, typename kti_t, typename ktr_t,
-         typename ksy_t, typename kp_t>
+template<typename nij_t, typename kti_t, typename ktr_t>
 inline nda::array<double,3> compute_becsum_full_symm(
-    MPI_t& mpi, pseudopot const& psp, nij_t const& nij,
-    kti_t const& kp_to_ibz, ktr_t const& kp_trev, ksy_t const& kp_symm,
-    kp_t const& kpts,
-    nda::stack_array<double,3,3> const& lattv,
-    nda::stack_array<double,3,3> const& recv,
-    std::vector<utils::symm_op> const& symm_list, int npol)
+    pseudopot const& psp, nij_t const& nij,
+    kti_t const& kp_to_ibz, ktr_t const& kp_trev, int npol)
 {
-    auto sPfull = compute_Pskna_full_bz(
-        psp, kp_to_ibz, kp_symm, kp_trev, kpts, lattv, recv, symm_list,
-        npol, mpi);
-    auto Pfull = sPfull.local();   // (nspin, nk_full, npol*nkb, nbnd)
+    // Cached full-BZ lift (plan A4) — see compute_becsum_diagonal_symm.
+    auto Pfull = psp.Pskna_full_bz().local();  // (nspin, nk_full, npol*nkb, nbnd)
 
     long nspin   = nij.extent(0);
     long nk_full = (long)kp_to_ibz.extent(0);
     long nbnd    = nij.extent(2);
+    utils::check(Pfull.extent(1) == nk_full,
+        "compute_becsum_full_symm: kp_to_ibz length {} != lifted nk {}",
+        nk_full, Pfull.extent(1));
     nda::array<ComplexType,4> nij_full(nspin, nk_full, nbnd, nbnd);
     for (long s = 0; s < nspin; ++s)
         for (long K = 0; K < nk_full; ++K) {
@@ -415,8 +413,7 @@ void v_h(utils::mpi_context_t<boost::mpi3::communicator,
       // symmetry-reduced meshes (mismatched 1/N_ibz vs the ×N_full in
       // compute_rho_aug_density_r), giving a ~3-5% V_H error under symmetry.
       auto becsum = ::hamilt::paw::compute_becsum_diagonal_symm(
-          mpi, psp, nii, kp_to_ibz, kp_trev, kp_symm, kpts,
-          lattv, recv, symm_list, npol);
+          psp, nii, kp_to_ibz, kp_trev, npol);
       rho_aug_r = ::hamilt::paw::compute_rho_aug_density_r(
           mpi, psp, becsum, mesh, recv, (long)kp_to_ibz.shape(0));
     }
@@ -453,8 +450,7 @@ void v_h(utils::mpi_context_t<boost::mpi3::communicator,
       // Full-BZ becsum (symmetry-correct, plan A3) — same lift as the
       // diagonal overload; reduces to the plain IBZ sum for nosym.
       auto becsum = ::hamilt::paw::compute_becsum_full_symm(
-          mpi, psp, nij, kp_to_ibz, kp_trev, kp_symm, kpts,
-          lattv, recv, symm_list, npol);
+          psp, nij, kp_to_ibz, kp_trev, npol);
       rho_aug_r = ::hamilt::paw::compute_rho_aug_density_r(
           mpi, psp, becsum, mesh, recv, (long)kp_to_ibz.shape(0));
     }

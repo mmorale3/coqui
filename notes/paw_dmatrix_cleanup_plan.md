@@ -10,7 +10,28 @@ printed into context at session start by a SessionStart hook).
 
 ## STATUS
 
-Last updated: 2026-07-24 — A3 done. A3 notes: compute_becsum_full_symm added
+Last updated: 2026-07-24 — A4 done. A4 notes: new
+src/hamiltonian/paw/paw_runtime_caches.hpp — paw::runtime_caches held by
+shared_ptr on pseudopot (mutable, shared across copies; every entry is keyed
+on immutable state + explicit args, so never stale). Accessors: paw_aatab()
+(aainit, lli = 1+max l); paw_qrad_tabs(Kmax, shape_restored) — qrad dq
+UNIFIED to 0.01 project-wide (v_x had a local 0.05; strictly finer, suite
+value-identical within tolerances), keyed (Kmax, mode, aug_lmax), larger-Kmax
+tables reused for smaller requests; Pskna_full_bz() — cached View-2 lift,
+MPI-COLLECTIVE on psp's own communicator at first call (all consumers are
+psp-context collectives). Δk-keyed Qfac cache for direct v_x
+(get_or_build_qfac_pair_factor in v_x_paw.hpp): key = quantized k_p−k_q
+(exact — build adds Δk to every G), first-come-stays under 256 MB/rank
+budget (knob deferred to C3), context (mesh, Gcut, mode) clears on change,
+hits/builds/uncached logged at verbosity 3. becsum symm helpers slimmed to
+(psp, n, kp_to_ibz, kp_trev, npol). ∫V·Q̂ loop in
+compute_paw_deeq_from_becsum parallelized: root FFT + bcast V(G), G strided
+over ALL comm ranks, native flat-double all_reduce (was root-serial).
+NOT switched: thc_reader_t.hpp:572 lift site keeps its explicit-table build
+(its _mpi is not provably psp's communicator; a collective cache on the
+wrong comm deadlocks) — revisit in D1. Fast suite green, value-identical:
+13479 assertions / 33 cases.
+A3 notes (kept): compute_becsum_full_symm added
 (v_h_paw.hpp) — full-BZ Pskna lift shared with the diagonal route via a new
 compute_Pskna_full_bz(psp, …, lattv, recv, symm_list, …) convenience overload
 in paw_symmetry.hpp (builds atom-perm + Wigner-D internally; caching = A4);
@@ -62,7 +83,7 @@ Workstream A — pseudopot D-matrix refactor
 - [x] A1 two-tensor model: Dnn_atom_static = dion + ex_cvij (eager, ctor); remove QE deeq read; compute_deeq_scf stops mutating (thin wrapper, returns by value; non-mutation REQUIREd in test) — 2026-07-24
 - [x] A2 align add_vpp paths with I5: no-density = static-only; nii/nij identical native build; add_hartree/add_exchange bools — 2026-07-24
 - [x] A3 symmetry-correct nij becsum (full-BZ lift via compute_becsum_full_symm) + Hermitian pair symmetrization w/ hard residual check; add_vpp nosym guard removed (v_x(nij) guard kept, different scope) — 2026-07-24
-- [ ] A4 hoist per-call statics (aainit, qrad dq=0.01, Pskna lift, Δk-keyed Qfac); parallelize ∫V·Q loop
+- [x] A4 hoist per-call statics onto pseudopot (paw_runtime_caches.hpp: aainit, qrad @ unified dq=0.01, Pskna lift, Δk-keyed Qfac w/ 256 MB budget); ∫V·Q̂ loop parallelized over G + all_reduce; THC lift site deferred to D1 — 2026-07-24
 - [ ] A5 provenance checks at read time (hard errors, no silent fallbacks) — partial via A2: qq_nt/aug-Q(G)/Species-group missing now hard errors; remaining: dion Hermiticity+scale, proj_per_atom length, required-dataset sweep
 - [ ] A-tests: nii≡nij≡no-density+Hartree; sym≡nosym; ex_cvij factor-1 e_1e; QE-eigenvalue diagnostic
 

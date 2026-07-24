@@ -40,6 +40,7 @@
 #include "hamiltonian/paw/paw_radial.hpp"
 #include "hamiltonian/paw/paw_aug_q_eval.hpp"   // for aainit_tables
 #include "hamiltonian/paw/v_h_paw.hpp"          // for compute_becsum_full
+#include "hamiltonian/paw/paw_runtime_caches.hpp"  // A4 caches (aatab, lift)
 
 namespace hamilt::paw {
 
@@ -420,8 +421,7 @@ nda::array<ComplexType,3> pseudopot::compute_paw_deeq(
     // the same full-BZ compensation occupation as the smooth/aug path. The
     // IBZ-only sum gave a residual V_H error on symmetry-reduced meshes.
     auto becsum = hamilt::paw::compute_becsum_diagonal_symm(
-        *mpi, *this, nii, kp_to_ibz, kp_trev, kp_symm, kpts,
-        lattv, recv, symm_list, npol);
+        *this, nii, kp_to_ibz, kp_trev, npol);
     for (long ia = 0; ia < becsum.extent(0); ++ia)
       for (long I = 0; I < becsum.extent(1); ++I)
         for (long J = 0; J < becsum.extent(2); ++J)
@@ -437,8 +437,7 @@ nda::array<ComplexType,3> pseudopot::compute_paw_deeq(
     double ns_scl = (nspin == 1 && npol == 1) ? 2.0 : 1.0;
     // Full-BZ becsum (symmetry-correct, plan A3) — mirrors the nii overload.
     auto becsum = hamilt::paw::compute_becsum_full_symm(
-        *mpi, *this, nij, kp_to_ibz, kp_trev, kp_symm, kpts,
-        lattv, recv, symm_list, npol);
+        *this, nij, kp_to_ibz, kp_trev, npol);
     for (long ia = 0; ia < becsum.extent(0); ++ia)
       for (long I = 0; I < becsum.extent(1); ++I)
         for (long J = 0; J < becsum.extent(2); ++J)
@@ -477,7 +476,7 @@ nda::array<ComplexType,3> pseudopot::compute_paw_deeq_from_becsum(
     }
 
     // ---- (2) radial AE−PS one-center Hartree from the (ns_scl-scaled) becsum.
-    auto aatab = hamilt::paw::aainit_tables_build(paw_aainit_lli);
+    auto const& aatab = paw_aatab();   // cached (plan A4)
     // Radial-Hartree multiplier: `1` — see `notes/paw_deeq_scaling_derivation.md`.
     // CoQui's `compute_paw_hartree_atom` solves Poisson directly in Hartree,
     // and the spin-summed becsum reproduces `ddd_paw_Ha` channel-by-channel (Ry
@@ -500,24 +499,30 @@ nda::array<ComplexType,3> pseudopot::compute_paw_deeq_from_becsum(
     }
 
     // ---- (3) dynamic G-space ∫ Vloc_r(r) Q^IJ_a(r) dr (proper-FT contraction
-    // with qgm; e^{+iG·τ} phase). Skipped if Vloc_r is empty. Computed on the
-    // comm root and broadcast.
+    // with qgm; e^{+iG·τ} phase). Skipped if Vloc_r is empty. The FFT of V is
+    // done on the comm root (only root is guaranteed valid Vloc_r content)
+    // and broadcast; the G contraction is then strided over ALL comm ranks
+    // and all_reduced (plan A4 — this loop was root-serial).
     if (Vloc_r.size() > 0 && qgm.local().size() > 0) {
       nda::array<ComplexType,3> Dg(nat, nhm, nhm);
       Dg() = ComplexType(0.0);
+      long NX = fft_mesh_aug(0), NY = fft_mesh_aug(1), NZ = fft_mesh_aug(2);
+      nda::array<ComplexType,1> vh_g(nnr_aug);
       if (mpi->comm.root()) {
-        long NX = fft_mesh_aug(0), NY = fft_mesh_aug(1), NZ = fft_mesh_aug(2);
-        nda::array<ComplexType,1> vh_g(nnr_aug);
         for (long r = 0; r < nnr_aug; ++r) vh_g(r) = Vloc_r(r);
         auto vh3d = nda::reshape(vh_g, std::array<long,3>{NX, NY, NZ});
         math::nda::fft<false> Ffwd(vh3d);
         Ffwd.forward(vh3d);                          // 1/N-normalized = proper FT
+      }
+      mpi->comm.broadcast_n(vh_g.data(), vh_g.size(), 0);
+      {
         double det = recv(0,0)*(recv(1,1)*recv(2,2) - recv(1,2)*recv(2,1))
                    - recv(1,0)*(recv(0,1)*recv(2,2) - recv(0,2)*recv(2,1))
                    + recv(2,0)*(recv(0,1)*recv(1,2) - recv(0,2)*recv(1,1));
         double Omega = (2.0*M_PI)*(2.0*M_PI)*(2.0*M_PI) / std::abs(det);
         auto qg = qgm.local();
-        for (long g = 0; g < ngm_dense; ++g) {
+        long np = mpi->comm.size(), r0 = mpi->comm.rank();
+        for (long g = r0; g < ngm_dense; g += np) {
           int m1 = miller_g_dense(g,0), m2 = miller_g_dense(g,1), m3 = miller_g_dense(g,2);
           long n1 = m1; if (n1 < 0) n1 += NX;
           long n2 = m2; if (n2 < 0) n2 += NY;
@@ -544,8 +549,10 @@ nda::array<ComplexType,3> pseudopot::compute_paw_deeq_from_becsum(
           }
         }
       }
-      mpi->comm.barrier();
-      mpi->comm.broadcast_n(Dg.data(), Dg.size(), 0);
+      // Native-MPI_SUM reduction via the flat-double reinterpret (the complex
+      // value type falls onto a serialized path; see v_x_paw psi_r_full note).
+      mpi->comm.all_reduce_in_place_n(
+          reinterpret_cast<double*>(Dg.data()), 2 * Dg.size(), std::plus<>{});
       for (long ia = 0; ia < nat; ++ia)
         for (int I = 0; I < nhm; ++I)
           for (int J = 0; J < nhm; ++J)

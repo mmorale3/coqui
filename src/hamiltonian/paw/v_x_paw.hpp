@@ -51,6 +51,7 @@
 #include "hamiltonian/pseudo/pseudopot.h"
 #include "hamiltonian/paw/paw_aug_q_eval.hpp"
 #include "hamiltonian/paw/paw_symmetry.hpp"
+#include "hamiltonian/paw/paw_runtime_caches.hpp"  // A4 caches (lift/aatab/qtab/Qfac)
 
 namespace hamilt::paw {
 
@@ -238,6 +239,68 @@ inline ComplexType evaluate_Q_IJ_at_K_fast(
 }
 
 /**
+ * Δk-keyed Qfac lookup/build (plan A4). build_paw_aug_pair_factor depends on
+ * (k_p, k_q) only through Δk = k_p − k_q (it adds Δk to every mesh G), so
+ * entries are keyed by Δk quantized at 1e-8 a.u.⁻¹ — far below any k-mesh
+ * spacing, so distinct Δk never collide; the worst quantization outcome is a
+ * redundant rebuild, never a wrong entry. First-come-stays under the byte
+ * budget in psp.paw_rt(): returns a reference to the cached entry on hit or
+ * after an in-budget build, and to `scratch` (freshly built) once the budget
+ * is exhausted. The cache persists across v_x calls (spin loop, SCF
+ * iterations); a change of (mesh, Gcut, mode) clears it.
+ */
+template<typename Psp_t>
+inline nda::array<ComplexType,3> const& get_or_build_qfac_pair_factor(
+    Psp_t const& psp,
+    aainit_tables const& aatab,
+    std::vector<qrad_tab> const& qtab_sp,
+    nda::stack_array<long,3> const& mesh,
+    nda::stack_array<double,3,3> const& recv,
+    double Omega,
+    nda::ArrayOfRank<1> auto const& k_p,
+    nda::ArrayOfRank<1> auto const& k_q,
+    double Gcut,
+    bool shape_restored,
+    nda::array<ComplexType,3>& scratch)
+{
+  auto& rt = psp.paw_rt();
+  std::array<long,3> mkey{mesh(0), mesh(1), mesh(2)};
+  if (rt.qfac_mesh != mkey || rt.qfac_Gcut != Gcut ||
+      rt.qfac_shape_restored != shape_restored) {
+    rt.qfac.clear();
+    rt.qfac_bytes = 0;
+    rt.qfac_mesh = mkey;
+    rt.qfac_Gcut = Gcut;
+    rt.qfac_shape_restored = shape_restored;
+  }
+  auto quant = [](double x) { return std::llround(x * 1e8); };
+  std::array<long,3> key{quant(k_p(0) - k_q(0)),
+                         quant(k_p(1) - k_q(1)),
+                         quant(k_p(2) - k_q(2))};
+  if (auto it = rt.qfac.find(key); it != rt.qfac.end()) {
+    ++rt.qfac_hits;
+    return it->second;
+  }
+  long bytes = (long)scratch.size() * (long)sizeof(ComplexType);
+  if (rt.qfac_bytes + bytes <= rt.qfac_budget_bytes) {
+    ++rt.qfac_builds;
+    auto it = rt.qfac
+                  .emplace(key, nda::array<ComplexType,3>(
+                                    scratch.extent(0), scratch.extent(1),
+                                    scratch.extent(2)))
+                  .first;
+    build_paw_aug_pair_factor(psp, aatab, qtab_sp, mesh, recv, Omega,
+                              k_p, k_q, Gcut, it->second);
+    rt.qfac_bytes += bytes;
+    return it->second;
+  }
+  ++rt.qfac_uncached;
+  build_paw_aug_pair_factor(psp, aatab, qtab_sp, mesh, recv, Omega,
+                            k_p, k_q, Gcut, scratch);
+  return scratch;
+}
+
+/**
  * Pseudopot-aware exact-exchange matrix element K_{ij}(s, k_p) builder.
  *
  * For NCPP this is identical to `hamilt::v_x(...)` (smooth-only). For
@@ -355,27 +418,15 @@ inline void v_x(utils::mpi_context_t<boost::mpi3::communicator,
                                   std::plus<>{});
 
   // ---- Build Pskna at full BZ ----
-  // Re-use the View-2 symmetry lift already used by augment_thc_with_paw.
+  // Cached View-2 symmetry lift (plan A4; collective on psp's communicator
+  // at the first build — v_x is dispatched from pseudopot with that context).
   auto const& ityp = psp.ityp_view();
   auto const& nh_v = psp.nh_view();
   auto const& ofs  = psp.ofs_view();
   auto const& sps  = psp.paw_species_view();
   long nat = ityp.extent(0);
 
-  // Compose the Pskna BZ lift inputs from psp + caller-provided BZ tables.
-  auto atom_perm_inv = build_atom_permutation_inverse(
-      psp.atom_pos_cart_view(), ityp, lattv, recv, symm_list);
-  // lmax for Wigner-D = max(l per beta projector) across species
-  int lmax_proj = 0;
-  for (long nt = 0; nt < (long)sps.size(); ++nt)
-    for (long b = 0; b < sps[nt].lll.extent(0); ++b)
-      lmax_proj = std::max(lmax_proj, sps[nt].lll(b));
-  auto wigner_d = build_wigner_d_real(symm_list, lattv, lmax_proj);
-
-  auto sPfull = compute_Pskna_full_bz(
-      psp, kp_to_ibz, kp_symm, kp_trev, kpts, symm_list,
-      atom_perm_inv, wigner_d, npol, mpi);
-  auto Pfull = sPfull.local();  // (nspin, nk_full, npol*nkb, nbnd)
+  auto Pfull = psp.Pskna_full_bz().local();  // (nspin, nk_full, npol*nkb, nbnd)
 
   // ---- G-sphere cutoff for the augmentation (physical bound) ----
   // Gcut = largest sphere fully inside the dense FFT box = min over reciprocal
@@ -394,23 +445,14 @@ inline void v_x(utils::mpi_context_t<boost::mpi3::communicator,
     Gcut = std::min(Gcut, (double)Mi * brow);
   }
   double Kmax_est = Gcut + 0.1;
-  std::vector<qrad_tab> qtab_sp(sps.size());
-  // lli for aatab: max l across all projectors (across all species) + 1.
-  // Q^IJ angular content goes up to 2*lmax_proj.
-  int lli_aat = lmax_proj + 1;
-  auto aatab = aainit_tables_build(lli_aat);
-  for (size_t nt = 0; nt < sps.size(); ++nt) {
-    if (sps[nt].is_paw || sps[nt].is_uspp)
-      // Option A (shape_restored): PAW species use the full AE−PS pair-density
-      // form factor (drops the separate deltaC one-center correction below);
-      // USPP always uses the compensation charge.
-      // dq=0.05: the radial form factor is smooth in |K| (features on scale
-      // ~pi a.u.), so a 5x-coarser table than the 0.01 default is amply accurate
-      // under the 4-point cubic interpolation and cuts the sph_bessel table cost.
-      qtab_sp[nt] = (shape_restored && sps[nt].is_paw)
-                      ? build_qrad_tab_full_aeps(sps[nt], Kmax_est, 0.05, psp.aug_lmax())
-                      : build_qrad_tab(sps[nt], Kmax_est, 0.05, psp.aug_lmax());
-  }
+  // Cached angular tables + per-species qrad tables (plan A4). The qrad dq
+  // is the project-wide 0.01 (was a local 0.05 here — finer, strictly more
+  // accurate, and shared with every other qrad consumer). Option A
+  // (shape_restored): PAW species use the full AE−PS pair-density form
+  // factor (drops the separate deltaC one-center correction below); USPP
+  // always uses the compensation charge.
+  auto const& aatab = psp.paw_aatab();
+  auto const& qtab_sp = psp.paw_qrad_tabs(Kmax_est, shape_restored);
 
   // ---- nij_max per species (for Qfac packing) ----
   long nij_max = 0;
@@ -445,9 +487,11 @@ inline void v_x(utils::mpi_context_t<boost::mpi3::communicator,
                             nda::stack_array<double,3,3>{}, recv,
                             kpts(k_p_ibz, all), kpts(kq, all));
 
-        // Precompute Q^IJ_atm(G+Δk) × e^{-i(G+Δk)·τ_atm} once for this (k_p, k_q)
-        build_paw_aug_pair_factor(psp, aatab, qtab_sp, mesh, recv, Omega,
-                                  kpts(k_p_ibz, all), kpts(kq, all), Gcut, Qfac);
+        // Q^IJ_atm(G+Δk) × e^{-i(G+Δk)·τ_atm} for this (k_p, k_q), via the
+        // Δk-keyed cache (plan A4; hits across the spin loop and calls).
+        auto const& Qf = get_or_build_qfac_pair_factor(
+            psp, aatab, qtab_sp, mesh, recv, Omega,
+            kpts(k_p_ibz, all), kpts(kq, all), Gcut, shape_restored, Qfac);
 
         for (long n = 0; n < nbnd; ++n) {
           double f = std::real(nii_host(s, kq_ibz, n));
@@ -490,7 +534,7 @@ inline void v_x(utils::mpi_context_t<boost::mpi3::communicator,
                   if (ij < 0) continue;
                   ComplexType PaJ = Pfull(s, k_p_ibz, p0 + J, a);
                   for (long g = 0; g < nnr; ++g)
-                    aug_acc(g) += PaJ * Qfac(ia, ij, g);
+                    aug_acc(g) += PaJ * Qf(ia, ij, g);
                 }
                 ComplexType pref = Pn_cI * omega_factor;
                 for (long g = 0; g < nnr; ++g)
@@ -517,6 +561,13 @@ inline void v_x(utils::mpi_context_t<boost::mpi3::communicator,
         }
       }
     }
+  }
+
+  {
+    auto const& rt = psp.paw_rt();
+    app_log(3, "v_x_paw qfac cache: hits={} builds={} uncached={} ({} MB)",
+            rt.qfac_hits, rt.qfac_builds, rt.qfac_uncached,
+            rt.qfac_bytes >> 20);
   }
 
   // Option A (shape_restored): the full AE−PS on-site pair density is already
@@ -730,17 +781,9 @@ inline void v_x(utils::mpi_context_t<boost::mpi3::communicator,
   auto const& sps  = psp.paw_species_view();
   long nat = ityp.extent(0);
 
-  auto atom_perm_inv = build_atom_permutation_inverse(
-      psp.atom_pos_cart_view(), ityp, lattv, recv, symm_list);
-  int lmax_proj = 0;
-  for (long nt = 0; nt < (long)sps.size(); ++nt)
-    for (long b = 0; b < sps[nt].lll.extent(0); ++b)
-      lmax_proj = std::max(lmax_proj, sps[nt].lll(b));
-  auto wigner_d = build_wigner_d_real(symm_list, lattv, lmax_proj);
-  auto sPfull = compute_Pskna_full_bz(
-      psp, kp_to_ibz, kp_symm, kp_trev, kpts, symm_list,
-      atom_perm_inv, wigner_d, npol, mpi);
-  auto Pfull = sPfull.local();  // (nspin, nk, npol*nkb, nbnd)
+  // Cached View-2 lift (plan A4; collective on psp's communicator at the
+  // first build — see the diagonal kernel).
+  auto Pfull = psp.Pskna_full_bz().local();  // (nspin, nk, npol*nkb, nbnd)
   long nkb = Pfull.extent(2);
 
   // ---- G-sphere cutoff + qrad tables (same bound as the diagonal kernel) ----
@@ -755,14 +798,10 @@ inline void v_x(utils::mpi_context_t<boost::mpi3::communicator,
     Gcut = std::min(Gcut, (double)Mi * brow);
   }
   double Kmax_est = Gcut + 0.1;
-  std::vector<qrad_tab> qtab_sp(sps.size());
-  int lli_aat = lmax_proj + 1;
-  auto aatab = aainit_tables_build(lli_aat);
-  for (size_t nt = 0; nt < sps.size(); ++nt)
-    if (sps[nt].is_paw || sps[nt].is_uspp)
-      qtab_sp[nt] = (shape_restored && sps[nt].is_paw)
-                      ? build_qrad_tab_full_aeps(sps[nt], Kmax_est, 0.05, psp.aug_lmax())
-                      : build_qrad_tab(sps[nt], Kmax_est, 0.05, psp.aug_lmax());
+  // Cached angular + qrad tables at the project-wide dq = 0.01 (plan A4;
+  // see the diagonal kernel).
+  auto const& aatab = psp.paw_aatab();
+  auto const& qtab_sp = psp.paw_qrad_tabs(Kmax_est, shape_restored);
 
   long nij_max = 0;
   for (size_t nt = 0; nt < sps.size(); ++nt)
@@ -812,8 +851,9 @@ inline void v_x(utils::mpi_context_t<boost::mpi3::communicator,
         vG.evaluate_in_mesh(range(0, nnr), v_coul, mesh,
                             nda::stack_array<double,3,3>{}, recv,
                             kpts(k_p_ibz, all), kpts(kq, all));
-        build_paw_aug_pair_factor(psp, aatab, qtab_sp, mesh, recv, Omega,
-                                  kpts(k_p_ibz, all), kpts(kq, all), Gcut, Qfac);
+        auto const& Qf = get_or_build_qfac_pair_factor(
+            psp, aatab, qtab_sp, mesh, recv, Omega,
+            kpts(k_p_ibz, all), kpts(kq, all), Gcut, shape_restored, Qfac);
 
         for (long p = 0; p < nbnd; ++p) {
           double w = w_all(s, kq, p);
@@ -842,7 +882,7 @@ inline void v_x(utils::mpi_context_t<boost::mpi3::communicator,
                   long ij = static_cast<long>(ijtoh(nt, I, J)) - 1;
                   if (ij < 0) continue;
                   ComplexType PaJ = Pfull(s, k_p_ibz, p0 + J, a);
-                  for (long g = 0; g < nnr; ++g) aug_acc(g) += PaJ * Qfac(ia, ij, g);
+                  for (long g = 0; g < nnr; ++g) aug_acc(g) += PaJ * Qf(ia, ij, g);
                 }
                 ComplexType pref = Pn_cI * omega_factor;
                 for (long g = 0; g < nnr; ++g) pair_buf(a, g) += pref * aug_acc(g);

@@ -2400,8 +2400,7 @@ TEST_CASE("vhartree_nij_vs_nii", "[hamilt][paw][hf]")
 // rotations alone), so the trev conjugation branch of the nij lift is not
 // exercised here — flagged for plan A-tests fixture work.
 // ===========================================================================
-void test_becsum_full_symm(mpi_context_t& mpi,
-                           std::shared_ptr<mf::MF> mf_ptr, bool sym_reduced)
+void test_becsum_full_symm(std::shared_ptr<mf::MF> mf_ptr, bool sym_reduced)
 {
   auto& mfobj = *mf_ptr;
   long nspin  = mfobj.nspin();
@@ -2412,13 +2411,8 @@ void test_becsum_full_symm(mpi_context_t& mpi,
   else             REQUIRE(mfobj.nkpts() == nk_ibz);
 
   hamilt::pseudopot V(mfobj);
-  auto lattv     = mfobj.lattv();
-  auto recv      = mfobj.recv();
-  auto kpts      = mfobj.kpts();
   auto kp_to_ibz = mfobj.kp_to_ibz();
   auto kp_trev   = mfobj.kp_trev();
-  auto kp_symm   = mfobj.kp_symm();
-  auto symm_list = mfobj.symm_list();
 
   long n_trev = 0;
   for (long K = 0; K < kp_trev.extent(0); ++K) n_trev += (kp_trev(K) ? 1 : 0);
@@ -2452,11 +2446,9 @@ void test_becsum_full_symm(mpi_context_t& mpi,
         nij(s, k, n, n) = nii(s, k, n);
 
   auto b_ref = hamilt::paw::compute_becsum_diagonal_symm(
-      mpi, V, nii, kp_to_ibz, kp_trev, kp_symm, kpts, lattv, recv,
-      symm_list, npol);
+      V, nii, kp_to_ibz, kp_trev, npol);
   auto b_nij = hamilt::paw::compute_becsum_full_symm(
-      mpi, V, nij, kp_to_ibz, kp_trev, kp_symm, kpts, lattv, recv,
-      symm_list, npol);
+      V, nij, kp_to_ibz, kp_trev, npol);
   double bmax = 0.0;
   double d1 = max_becsum_diff(b_ref, b_nij, bmax);
   app_log(1, "[becsum_full_symm] diag nij: max|Δbecsum| = {:.3e}, "
@@ -2475,8 +2467,7 @@ void test_becsum_full_symm(mpi_context_t& mpi,
         }
   // Runs the hard anti-Hermitian residual check internally (3).
   auto b_herm = hamilt::paw::compute_becsum_full_symm(
-      mpi, V, nij, kp_to_ibz, kp_trev, kp_symm, kpts, lattv, recv,
-      symm_list, npol);
+      V, nij, kp_to_ibz, kp_trev, npol);
   if (!sym_reduced) {
     auto b_plain = hamilt::paw::compute_becsum_full(
         V.Pskna_view(), nij, V.ityp_view(), V.nh_view(), V.ofs_view(), npol);
@@ -2493,22 +2484,22 @@ TEST_CASE("becsum_full_symm", "[hamilt][paw][hf]")
   SECTION("lih_kp222_nbnd16 (PAW, sym)") {
     auto mf_ptr = std::make_shared<mf::MF>(
         mf::default_MF(mpi, "qe_lih222_paw_sym", mf::h5_input_type));
-    test_becsum_full_symm(*mpi, mf_ptr, /*sym_reduced=*/true);
+    test_becsum_full_symm(mf_ptr, /*sym_reduced=*/true);
   }
   SECTION("si_kp222 (PAW, sym)") {
     auto mf_ptr = std::make_shared<mf::MF>(
         mf::default_MF(mpi, "qe_si222_paw_sym", mf::h5_input_type));
-    test_becsum_full_symm(*mpi, mf_ptr, /*sym_reduced=*/true);
+    test_becsum_full_symm(mf_ptr, /*sym_reduced=*/true);
   }
   SECTION("lih_kp222_nbnd16 (PAW, nosym)") {
     auto mf_ptr = std::make_shared<mf::MF>(
         mf::default_MF(mpi, "qe_lih222_paw_hf", mf::h5_input_type));
-    test_becsum_full_symm(*mpi, mf_ptr, /*sym_reduced=*/false);
+    test_becsum_full_symm(mf_ptr, /*sym_reduced=*/false);
   }
   SECTION("lih_kp222_nbnd16 (USPP, nosym)") {
     auto mf_ptr = std::make_shared<mf::MF>(
         mf::default_MF(mpi, "qe_lih222_uspp_hf", mf::h5_input_type));
-    test_becsum_full_symm(*mpi, mf_ptr, /*sym_reduced=*/false);
+    test_becsum_full_symm(mf_ptr, /*sym_reduced=*/false);
   }
 }
 
