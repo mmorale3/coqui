@@ -1,0 +1,57 @@
+% ============================================================================
+% Numerical demonstration section for paw_isdf_thc_prb.tex (AS SHIPPED).
+% Inserted AFTER \section{Error analysis} (sec:error), BEFORE sec:scaling.
+% Fig.~1 = Result B (ISDF-rank convergence).
+% NOTE 2026-06-10: the earlier Result-A ERI-accuracy table (tab:eri-accuracy)
+% and its subsection were REMOVED per user direction (implementation detail,
+% not a fundamental ISDF statement). The A numbers live in paw_results_A.csv
+% as code validation only -- do NOT re-add to the paper.
+% ============================================================================
+\section{Numerical demonstration}
+\label{sec:numerics}
+
+We demonstrate that the PAW-ISDF-THC factorization converges systematically to
+the exact electron repulsion integrals as the ISDF auxiliary basis is enlarged,
+and that the all-electron augmentation preserves this convergence.  All
+calculations use the implementation in the \textsc{CoQu\'i} code, taking
+Quantum~ESPRESSO mean-field data through \texttt{pw2coqui}.  The reference
+system is LiH in the zinc-blende-derived rocksalt structure on a
+\(2\times2\times2\) \(\bk\)-mesh (three irreducible \(\bk\)-points, sixteen
+bands), treated with three pseudization families that share the same valence:
+norm-conserving (NCPP), ultrasoft (USPP), and projector-augmented-wave (PAW).
+This lets us isolate the effect of the augmentation algebra while holding the
+smooth ISDF problem fixed.
+
+Equation~\eqref{eq:error-bound} bounds the ERI error in the Coulomb metric by
+the interpolation error of the compensated smooth pair densities, controlled by
+the number of global interpolation points \(N_\mu\).  Figure~\ref{fig:convergence}
+shows the relative Frobenius error of the Hartree and exchange matrix elements
+against the direct reference as the ISDF threshold is tightened from
+\(3\times10^{-2}\) to \(10^{-6}\), sweeping \(N_\mu\) from roughly \(120\) to
+\(430\).  The error falls smoothly and nearly as a power law in \(N_\mu\),
+spanning about two and a half orders of magnitude for all three pseudization
+families.  Two features are notable.  First, the ultrasoft and PAW curves are
+essentially superimposed: the local augmentation rows in the composite
+auxiliary index converge at the same rate as the smooth problem and do not
+introduce a slower-decaying error channel.  Second, the norm-conserving curve
+is shifted to smaller \(N_\mu\)---it reaches a given accuracy with fewer
+interpolation points---because its pseudo pair densities require no compensation
+charges, whereas the ultrasoft and PAW cases add a modest amount of auxiliary
+content to represent the augmentation.  This is precisely the behavior
+anticipated by Eq.~\eqref{eq:error-bound}: the augmented factorization inherits
+the controlled, tunable convergence of the underlying momentum-resolved ISDF,
+with a small and systematically convergent augmentation overhead.
+
+\begin{figure*}[t]
+  \includegraphics[width=0.92\textwidth]{paw_convergence_B.pdf}
+  \caption{Relative Frobenius error of the tensor-hypercontracted Hartree
+  (left) and exchange (right) matrix elements versus the number of ISDF
+  interpolation points \(N_\mu\), for LiH on a \(2\times2\times2\) mesh with
+  norm-conserving (NCPP), ultrasoft (USPP), and projector-augmented-wave (PAW)
+  pseudization.  Tightening the ISDF threshold from \(3\times10^{-2}\) to
+  \(10^{-6}\) drives the error down by about two and a half orders of
+  magnitude.  PAW converges at the same rate as the ultrasoft case (the two
+  curves overlap), while the norm-conserving case reaches a given accuracy at
+  smaller \(N_\mu\) because it carries no compensation charges.}
+  \label{fig:convergence}
+\end{figure*}

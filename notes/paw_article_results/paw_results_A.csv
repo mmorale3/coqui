@@ -1,0 +1,22 @@
+# Result A: THC vs direct all-electron V_H / V_x matrix elements
+# System: LiH, 2x2x2 k-grid (3 IBZ k-points), 16 bands, ISDF threshold = 1e-5
+# Source: test_hamilt.cpp {thc_vs_direct_VH_VX, _nonqe, thc_vs_direct_nij}
+# rusty build a23a569, run job 6495862, 2026-06-10
+# occ_pattern: qe = QE ground-state occupations (diagonal Dm);
+#              nonqe = deterministic all-bands occupation, no relation to mf.occ();
+#              nij = full off-diagonal (non-diagonal) density matrix
+occ_pattern,pp,max_VH,relVH,max_VX,relVX
+qe,NCPP,1.547,5.42e-05,1.128,6.21e-05
+qe,USPP,1.889,7.25e-05,1.303,6.07e-05
+qe,PAW,2.010,3.37e-05,1.364,4.80e-05
+nonqe,NCPP,0.9956,6.13e-05,0.6926,1.07e-04
+nonqe,USPP,1.113,9.07e-05,0.7536,9.82e-05
+nonqe,PAW,1.167,4.19e-05,0.7879,8.49e-05
+nij,NCPP,0.8287,5.98e-05,0.5692,1.11e-04
+nij,USPP,0.9085,9.48e-05,0.6129,1.04e-04
+nij,PAW,0.9327,4.69e-05,0.6308,8.43e-05
+# --- Internal consistency / one-center checks (PAW, LiH kp222) ---
+# K_a one-center contribution vs closed-form deltaC x becsum : rel = 7.35e-15
+# V_x one-center prefactor best-fit alpha = -0.125 = -1/N_k (N_k=8); residual = 4.86e-16
+# Vhartree(nij) -> Vhartree(nii) reduction (diagonal Dm)     : max|dV_H| = 2.22e-16
+# Vexchange(nij) -> Vexchange(nii) reduction (diagonal Dm)   : max|dV_x| = 3.33e-16

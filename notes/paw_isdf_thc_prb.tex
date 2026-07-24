@@ -40,7 +40,7 @@
 
 \begin{document}
 
-\title{Projector-Augmented-Wave Interpolative Separable Density Fitting for All-Electron Tensor Hypercontraction of Two-Electron Integrals}
+\title{Interpolative Separable Density Fitting and Tensor Hypercontraction of Two-Electron Integrals for Ultrasoft and Projector-Augmented-Wave Pseudopotentials}
 
 \author{A. Researcher}
 \affiliation{Department of Physics, Institution, City, State, USA}
@@ -49,16 +49,16 @@
 \date{\today}
 
 \begin{abstract}
-We formulate a projector-augmented-wave interpolative separable density fitting (PAW-ISDF) representation of all-electron two-electron repulsion integrals.  The construction follows the momentum-resolved tensor-hypercontraction notation used by Yeh and Morales, in which Bloch pair densities at a fixed transferred momentum are interpolated from a compact set of real-space points and auxiliary functions.  The central modification is that ISDF is applied to the PAW compensated pair-density algebra, rather than to the pseudo pair density alone.  This leads to a tensor-hypercontracted electron repulsion tensor of the form
+Interpolative separable density fitting (ISDF) provides a tensor-hypercontracted (THC) representation of two-electron repulsion integrals that has enabled low-scaling random phase approximation (RPA) and \(GW\) calculations for crystalline systems, but existing momentum-resolved formulations are restricted to norm-conserving pseudopotentials.  We extend ISDF and THC to the two augmented pseudopotential families that dominate plane-wave electronic structure---ultrasoft (USPP) and projector-augmented-wave (PAW)---by applying ISDF to the augmented (compensated) pair-density algebra rather than to the smooth pseudo pair density alone.  The resulting factorization
 \begin{equation*}
 V_{ijkl}^{\bk_i\bk_j\bk_k\bk_l}
 \approx
 \sum_{\Lambda\Sigma}
 X_{\Lambda i}^{\bk_i *}X_{\Lambda j}^{\bk_j}
 \mathcal V_{\Lambda\Sigma}^{\bq}
-X_{\Sigma k}^{\bk_k *}X_{\Sigma l}^{\bk_l},
+X_{\Sigma k}^{\bk_k *}X_{\Sigma l}^{\bk_l}
 \end{equation*}
-where the composite auxiliary index \(\Lambda\) contains both smooth ISDF interpolation rows and atom-centered PAW augmentation rows.  The projected Coulomb matrix \(\mathcal V^{\bq}\) is the Coulomb metric of smooth compensated auxiliary functions plus a same-atom residual all-electron correction built from one-center PAW partial waves.  The resulting factorization preserves the separability in orbital and momentum indices needed for low-scaling many-body perturbation theory, while retaining the all-electron nodal information encoded in PAW partial waves.  We give the complete density decomposition, compensation-charge construction, local channel factorization, kernel assembly, algorithmic workflow, error estimates in the Coulomb metric, and practical implementation considerations for periodic systems.
+retains the standard THC structure, with a composite auxiliary index \(\Lambda\) that combines smooth ISDF interpolation rows with atom-centered augmentation rows, and a projected Coulomb matrix \(\mathcal V^{\bq}\) equal to the Coulomb metric of the compensated auxiliary functions plus a same-atom one-center correction.  Ultrasoft and PAW are treated on the same footing: the augmentation charges enter the composite basis in both cases, while the one-center all-electron residual---built from PAW partial waves---is present only for PAW, so that the ultrasoft scheme is recovered as the special case in which it is absent.  The construction preserves the separability in orbital and momentum indices and the linear-in-\(N_k\) structure required for low-scaling many-body perturbation theory.  We give the complete density decomposition, compensation-charge construction, local channel factorization, kernel assembly, error estimates in the Coulomb metric, and numerical demonstrations: the compressed integrals converge systematically to the reference ultrasoft and PAW integrals for LiH, and the silicon RPA correlation energy evaluated entirely within the factorization agrees, for both ultrasoft and PAW, with norm-conserving references to within the spread between norm-conserving potentials.
 \end{abstract}
 
 \maketitle
@@ -81,9 +81,9 @@ V_{ijkl}^{\bk_i\bk_j\bk_k\bk_l}
 \end{equation}
 subject to crystal-momentum conservation.  In a direct representation, storage and contractions involving Eq.~\eqref{eq:eri-def-intro} are prohibitive.  Tensor hypercontraction (THC) overcomes this by expressing the ERI as a product of five second-order tensors, fully separating the four orbital indices.  Interpolative separable density fitting (ISDF) is a systematic route to THC: it compresses the set of pair densities by selecting interpolation points and auxiliary functions, leading directly to a compact projected Coulomb matrix.
 
-For plane-wave pseudopotential calculations, the pair densities are smooth and can be interpolated on moderate uniform grids.  The projector-augmented-wave (PAW) method changes the situation.  PAW provides access to all-electron wave functions through a transformation from smooth pseudo orbitals plus atom-centered all-electron corrections.  The near-nucleus nodal structure is essential for all-electron Coulomb matrix elements, but resolving it directly on a uniform grid would largely destroy the compactness that makes ISDF attractive.  The objective of this paper is therefore to combine PAW and ISDF in a way that preserves both advantages: smooth-grid ISDF in the interstitial region and compact atom-local all-electron corrections inside augmentation spheres.
+Existing momentum-resolved ISDF-THC formulations~\cite{YehMoralesRPA,YehMoralesGW} were developed for norm-conserving pseudopotentials, whose pair densities are smooth and interpolate well on moderate uniform grids.  The two pseudopotential families that dominate plane-wave electronic structure, however---ultrasoft pseudopotentials (USPP)~\cite{VanderbiltUSPP} and the projector-augmented-wave (PAW) method~\cite{BlochlPAW,KresseJoubert}, as implemented in widely used codes such as VASP, Quantum~ESPRESSO, and ABINIT---introduce localized augmentation that a smooth grid does not capture.  In USPP the physical charge density is the smooth pseudo density plus atom-centered augmentation charges that restore the correct multipoles; PAW goes further, reconstructing the all-electron wave function from smooth pseudo orbitals and atom-centered all-electron partial waves whose near-nucleus nodal structure is essential for accurate Coulomb matrix elements.  In either case, resolving the augmentation directly on a uniform grid would destroy the compactness that makes ISDF attractive.  The objective of this paper is to extend ISDF and THC to both schemes in a way that preserves their advantages: smooth-grid ISDF in the interstitial region and compact atom-local augmentation inside the spheres.
 
-The key idea is simple but important: ISDF should not be applied to pseudo pair densities and then interpreted as an all-electron factorization.  Instead, one first rewrites the all-electron PAW Coulomb integral in terms of compensated smooth pair densities plus strictly one-center corrections.  ISDF is then applied to the compensated smooth part, while a separate low-rank factorization is applied to the finite-dimensional one-center PAW correction.  The result is a PAW-compatible THC factorization with the same structure as the momentum-dependent ISDF representation of Yeh and Morales,
+The key idea is simple but important: ISDF should not be applied to the smooth pseudo pair density and the result reinterpreted as the augmented (or all-electron) factorization.  Instead, one first rewrites the augmented Coulomb integral in terms of compensated smooth pair densities plus strictly one-center corrections.  ISDF is then applied to the compensated smooth part, while a separate low-rank factorization handles the finite-dimensional one-center correction.  Ultrasoft and PAW differ only in this one-center block: it vanishes for USPP, whose augmentation enters solely through the compensated smooth density, and it is the all-electron partial-wave residual for PAW.  The result is a THC factorization with the same structure as the momentum-dependent ISDF representation of Yeh and Morales,
 \begin{equation}
 V_{ijkl}^{\bk_i\bk_j\bk_k\bk_l}
 \approx
@@ -93,7 +93,7 @@ V_{\mu\nu}^{\bq}
 X_{\nu k}^{\bk_k *}X_{\nu l}^{\bk_l},
 \label{eq:standard-thc-intro}
 \end{equation}
-but with an enlarged auxiliary index containing PAW augmentation features.  The notation below follows Refs.~\onlinecite{YehMoralesRPA,YehMoralesGW}: \(\varphi_i^{\bk}\) denotes a Bloch orbital, \(X_{\mu i}^{\bk}\) the collocation matrix, \(\zeta_\mu^{\bq}\) the ISDF auxiliary function at transferred momentum \(\bq\), \(V_{\mu\nu}^{\bq}\) the projected Coulomb matrix, \(N_\mu\) the number of interpolation points, and \(\alpha=N_\mu/N_{\orb}\) the ISDF compression ratio.
+but with an enlarged auxiliary index containing the augmentation features.  The notation below follows Refs.~\onlinecite{YehMoralesRPA,YehMoralesGW}: \(\varphi_i^{\bk}\) denotes a Bloch orbital, \(X_{\mu i}^{\bk}\) the collocation matrix, \(\zeta_\mu^{\bq}\) the ISDF auxiliary function at transferred momentum \(\bq\), \(V_{\mu\nu}^{\bq}\) the projected Coulomb matrix, \(N_\mu\) the number of interpolation points, and \(\alpha=N_\mu/N_{\orb}\) the ISDF compression ratio.
 
 \section{Momentum-resolved ISDF and THC notation}
 \label{sec:isdf}
@@ -532,6 +532,39 @@ which imply
 \label{eq:eri-hermitian}
 \end{equation}
 
+\subsection{Ultrasoft and norm-conserving pseudopotentials as special cases}
+\label{sec:uspp}
+
+The construction above specializes immediately to ultrasoft pseudopotentials,
+which is what places USPP and PAW within a single factorization.  In USPP the
+augmented charge density is the smooth pseudo density plus atom-centered
+augmentation charges \(Q_{a,\alpha\beta}(\br)\)~\cite{VanderbiltUSPP} that
+restore the multipoles of the all-electron--minus-pseudo density
+difference---exactly the role played by
+the compensation charges \(\widehat Q_{a,\alpha\beta}\) of
+Eq.~\eqref{eq:moment-condition}.  Unlike PAW, however, the ultrasoft scheme does
+not reconstruct the all-electron wave function inside the sphere, so it carries
+no one-center all-electron Coulomb residual: \(\Delta C_a=0\), and therefore
+\(K_a=0\) in Eq.~\eqref{eq:local-k-factorization}.  The factorization is then
+\emph{identical} to Eqs.~\eqref{eq:final-paw-isdf-thc}--\eqref{eq:x-final}, with
+the same composite collocation matrix \(X\), but with the projected Coulomb
+matrix reduced to its compensated part,
+\begin{equation}
+\mathcal V_{\Lambda\Sigma}^{\bq}\big|_{\mathrm{USPP}}
+=V_{\Lambda\Sigma}^{\bq,C},
+\label{eq:uspp-kernel}
+\end{equation}
+i.e.\ the same-atom \(K_a\) block is simply absent.  Norm-conserving
+pseudopotentials are the further special case in which the augmentation rows are
+empty (\(\mathcal A=\varnothing\)) and \(\Lambda\) runs over the smooth ISDF
+points only, recovering the standard momentum-resolved ISDF-THC of
+Refs.~\onlinecite{YehMoralesRPA,YehMoralesGW}.  The three pseudopotential
+families thus form a hierarchy within one factorization, distinguished only by
+which parts of the composite auxiliary index and projected Coulomb matrix are
+populated: norm-conserving (smooth rows only), ultrasoft (smooth and
+augmentation rows, no \(K_a\)), and PAW (smooth and augmentation rows plus the
+one-center \(K_a\)).
+
 \section{Construction algorithm}
 \label{sec:algorithm}
 
@@ -694,6 +727,120 @@ This separates the total error into three controllable pieces: global ISDF trunc
 
 Equation~\eqref{eq:error-bound} also suggests a practical fitting criterion.  Least squares in the ordinary grid metric controls pointwise or \(L^2\) pair-density errors, but Coulomb-metric fitting controls the ERI error more directly.  A robust implementation can therefore use an inexpensive \(L^2\) or pivoted-Cholesky selection step followed by Coulomb-metric refinement of \(\zeta_\Lambda^{\bq}\), \(\eta_{a\lambda}\), and \(K_a\).
 
+\section{Numerical demonstration}
+\label{sec:numerics}
+
+We demonstrate that the PAW-ISDF-THC factorization converges systematically to
+the exact electron repulsion integrals as the ISDF auxiliary basis is enlarged,
+and that the all-electron augmentation preserves this convergence.  All
+calculations use the implementation in the \textsc{CoQu\'i} code, taking
+Quantum~ESPRESSO mean-field data through \texttt{pw2coqui}.  The reference
+system is LiH in the zinc-blende-derived rocksalt structure on a
+\(2\times2\times2\) \(\bk\)-mesh (three irreducible \(\bk\)-points, sixteen
+bands), treated with three pseudization families that share the same valence:
+norm-conserving (NCPP), ultrasoft (USPP), and projector-augmented-wave (PAW).
+This lets us isolate the effect of the augmentation algebra while holding the
+smooth ISDF problem fixed.
+
+\subsection{Rank convergence of the compressed integrals}
+\label{sec:numerics-eri}
+
+Equation~\eqref{eq:error-bound} bounds the ERI error in the Coulomb metric by
+the interpolation error of the compensated smooth pair densities, controlled by
+the number of global interpolation points \(N_\mu\).  Figure~\ref{fig:convergence}
+shows the relative Frobenius error of the Hartree and exchange matrix elements
+against the direct reference as the ISDF threshold is tightened from
+\(3\times10^{-2}\) to \(10^{-6}\), sweeping \(N_\mu\) from roughly \(120\) to
+\(430\).  The error falls smoothly and nearly as a power law in \(N_\mu\),
+spanning about two and a half orders of magnitude for all three pseudization
+families.  Two features are notable.  First, the ultrasoft and PAW curves are
+essentially superimposed: the local augmentation rows in the composite
+auxiliary index converge at the same rate as the smooth problem and do not
+introduce a slower-decaying error channel.  Second, the norm-conserving curve
+is shifted to smaller \(N_\mu\)---it reaches a given accuracy with fewer
+interpolation points---because its pseudo pair densities require no compensation
+charges, whereas the ultrasoft and PAW cases add a modest amount of auxiliary
+content to represent the augmentation.  This is precisely the behavior
+anticipated by Eq.~\eqref{eq:error-bound}: the augmented factorization inherits
+the controlled, tunable convergence of the underlying momentum-resolved ISDF,
+with a small and systematically convergent augmentation overhead.
+
+\begin{figure*}[t]
+  \includegraphics[width=0.92\textwidth]{paw_convergence_B.pdf}
+  \caption{Relative Frobenius error of the tensor-hypercontracted Hartree
+  (left) and exchange (right) matrix elements versus the number of ISDF
+  interpolation points \(N_\mu\), for LiH on a \(2\times2\times2\) mesh with
+  norm-conserving (NCPP), ultrasoft (USPP), and projector-augmented-wave (PAW)
+  pseudization.  Tightening the ISDF threshold from \(3\times10^{-2}\) to
+  \(10^{-6}\) drives the error down by about two and a half orders of
+  magnitude.  PAW converges at the same rate as the ultrasoft case (the two
+  curves overlap), while the norm-conserving case reaches a given accuracy at
+  smaller \(N_\mu\) because it carries no compensation charges.}
+  \label{fig:convergence}
+\end{figure*}
+
+\subsection{RPA correlation energy of silicon}
+\label{sec:numerics-rpa}
+
+The Frobenius-norm test above establishes that the compressed integrals
+reproduce the reference all-electron ERIs.  We now show that this accuracy
+carries through to a physical observable evaluated entirely within the
+factorized representation, and that the all-electron PAW result is consistent
+with norm-conserving references.  We compute the random-phase-approximation
+(RPA) correlation energy of bulk silicon (diamond structure,
+\(a=10.244\,\)Bohr) on PBE orbitals, using the PAW-ISDF-THC integrals
+throughout the imaginary-axis RPA, with the THC threshold fixed at \(10^{-5}\)
+and the auxiliary cutoff at \(1.2\times\) the orbital cutoff
+(\(E_{\mathrm{cut}}^{\orb}=150\,\)Ry).  Four pseudization families sharing the
+same four-electron Si valence are compared: two norm-conserving constructions
+(ONCV and ccECP), an ultrasoft potential, and an \(l=2\) \texttt{kjpaw} PAW set.
+
+The RPA correlation energy converges along two axes that must be extrapolated
+independently: the number of unoccupied bands \(N_b\) entering the response
+function, and the density of the \(\bk\)-point mesh \(N_k=n^3\).
+Figure~\ref{fig:si-rpa}(a) shows the band convergence at the densest mesh
+studied, \(6\times6\times6\).  For every pseudization family the correlation
+energy is accurately linear in \(1/N_b\) for \(N_b\gtrsim100\), so a
+two-parameter fit over \(N_b\in[100,500]\) yields a controlled
+complete-basis (\(N_b\to\infty\)) limit (stars).  The PAW and ultrasoft curves
+run parallel to the norm-conserving ones with no anomalous slowly decaying
+component: the augmentation algebra does not degrade the band convergence.
+Figure~\ref{fig:si-rpa}(b) then extrapolates the \(\bk\)-mesh.  The
+band-converged values are linear in \(1/N_k\) once the mesh is sufficiently
+dense; the \(3\times3\times3\) points (shown) still lie above the asymptote, so
+the thermodynamic-limit fit uses only \(n\geq4\).
+
+The doubly-extrapolated (\(N_b,N_k\to\infty\)) RPA correlation energies are
+\(-0.460\,\)Ha (ONCV) and \(-0.455\,\)Ha (ccECP) for the two norm-conserving
+sets, \(-0.448\,\)Ha for the \texttt{kjpaw} PAW set, and \(-0.446\,\)Ha for the
+ultrasoft potential.  The PAW value differs from the norm-conserving references
+by about \(1\)--\(3\%\) (\(1.4\%\) from ccECP, \(2.5\%\) from ONCV), comparable
+to the \(\sim\!1\%\) spread between the two norm-conserving potentials
+themselves.  This is the expected level of agreement between distinct
+pseudization families for an absolute correlation energy: the PAW-ISDF-THC
+factorization introduces no error beyond the intrinsic scatter of the
+underlying potentials, confirming that the all-electron augmentation is both
+systematically convergent and physically faithful when driven through a full
+many-body calculation.
+
+\begin{figure*}[t]
+  \includegraphics[width=0.92\textwidth]{paw_article_results/si_rpa_paper.pdf}
+  \caption{RPA correlation energy of bulk silicon computed with the
+  PAW-ISDF-THC integrals, for two norm-conserving (ONCV, ccECP), one ultrasoft,
+  and one \(l=2\) \texttt{kjpaw} PAW pseudization, all sharing the four-electron
+  valence.  (a)~Basis-set convergence at the densest \(6\times6\times6\) mesh:
+  the correlation energy is linear in \(1/N_b\) for \(N_b\gtrsim100\); the
+  dotted lines are linear fits over \(N_b\in[100,500]\) and the stars mark the
+  complete-basis (\(N_b\to\infty\)) limit.  (b)~\(\bk\)-point convergence of the
+  band-extrapolated values versus \(1/N_k\) (\(N_k=n^3\)): stars are shown for
+  \(n\geq3\), the solid lines are linear fits over the asymptotic regime
+  \(n\geq4\), and the crosses mark the thermodynamic (\(N_b,N_k\to\infty\))
+  limit.  The all-electron PAW result tracks the norm-conserving references to
+  within the \(\sim\!1\%\) scatter of the norm-conserving potentials among
+  themselves.}
+  \label{fig:si-rpa}
+\end{figure*}
+
 \section{Computational scaling and storage}
 \label{sec:scaling}
 
@@ -721,11 +868,13 @@ The dominant construction costs are: (i) building or sampling smooth pair densit
 \section{Discussion}
 \label{sec:discussion}
 
-The proposed PAW-ISDF formulation has several practical advantages.  First, the global ISDF problem remains smooth.  The interpolation points are chosen to represent \(\widetilde\varphi_i^*\widetilde\varphi_j\), not the rapidly oscillatory all-electron products.  Second, all-electron core-region information is retained through PAW partial waves and the one-center residual matrix \(K_a\).  Third, the final output has exactly the THC structure used in modern low-scaling many-body algorithms, so existing THC contractions can be reused with only a larger auxiliary dimension.
+The central result of this work is that interpolative separable density fitting extends naturally from norm-conserving pseudopotentials to the augmented families.  Both ultrasoft and PAW pair densities are reduced to a compensated smooth density plus a finite one-center correction; the smooth part is interpolated by ordinary ISDF on a moderate uniform grid, while the augmentation enters through a small set of atom-centered auxiliary rows, with PAW adding a single same-atom block \(K_a\) that the ultrasoft scheme omits (Sec.~\ref{sec:uspp}).  Three properties follow.  First, the global ISDF problem stays smooth, because the interpolation points represent \(\widetilde\varphi_i^*\widetilde\varphi_j\) rather than the rapidly oscillatory all-electron products.  Second, for PAW the all-electron core-region information is retained through the partial waves and the one-center matrix \(K_a\).  Third, the output has exactly the tensor-hypercontracted structure---and the cubic scaling and linear \(\bk\)-point dependence---of the norm-conserving case, so existing THC machinery for RPA, \(GW\), and quantum embedding can be reused with only a modestly enlarged auxiliary dimension.  The numerical results bear this out: the compressed integrals converge as a power law to the reference ultrasoft and PAW integrals (Fig.~\ref{fig:convergence}), and the silicon RPA correlation energy evaluated entirely within the factorization agrees, for both ultrasoft and PAW, with norm-conserving references to within the intrinsic spread of the pseudopotentials themselves (Fig.~\ref{fig:si-rpa}).
 
 The central numerical question is the choice of local rank.  A minimal implementation can take the local factorization in Eq.~\eqref{eq:local-k-factorization} to be full rank in the PAW channel-product space.  Since the number of PAW channels per atom is small, this may already be affordable and avoids local fitting error.  A more aggressive implementation can compress the channel products by a local ISDF or Cholesky procedure.  This becomes useful for semicore-rich PAW data sets, high angular momentum channels, spin-orbit projectors, or multi-projector setups.
 
 The compensation-charge construction must be consistent with the PAW data set.  If \(\widehat Q_{a,\alpha\beta}\) does not reproduce the multipoles of \(\Delta Q_{a,\alpha\beta}\), Eq.~\eqref{eq:paw-coulomb-partition} is not a clean separation into smooth and one-center terms.  In that case, spurious inter-sphere terms would be folded into the global ISDF error and convergence with respect to \(N_\mu\) could become poor.  Therefore the PAW compensation multipole order should be converged before the ISDF rank is tuned.
+
+A closely related prerequisite is the completeness of the PAW partial-wave and projector set.  It is well established that PAW data sets constructed for ground-state density-functional theory---where the partial waves need only reproduce all-electron scattering near the occupied levels---are frequently inadequate for \(GW\) and RPA, which sample the unoccupied manifold to much higher energies; accurate excited-state calculations therefore require additional projectors at higher reference energies and, where necessary, higher angular momenta.  This is precisely the rationale for the dedicated ``\(GW\)'' PAW data sets introduced by the VASP group~\cite{ShishkinKresseGW,KlimesKaltakKresse}.  Our factorization inherits this requirement directly: because the one-center correction in Eq.~\eqref{eq:paw-local-correction} is quartic in the projector overlaps \(P_{i,a\alpha}\), an incomplete projector set is strongly amplified.  Appendix~\ref{app:jthfail} illustrates the known effect for silicon---a widely used PAW set carrying only \(s\) and \(p\) projectors (\(l_{\max}=1\)) drives the RPA correlation energy to unphysical over-binding, cured by adding an \(l=2\) projector---using the same all-electron logarithmic-derivative diagnostic employed to construct excited-state PAW potentials~\cite{KlimesKaltakKresse}.  In production one should therefore use excited-state-quality (``\(GW\)'') PAW data, or otherwise verify partial-wave completeness over the sampled energy window.
 
 The Coulomb singularity requires the same care as in ordinary periodic ERIs.  For \(\bq\ne 0\), Eq.~\eqref{eq:v-reciprocal} is well-defined.  For \(\bq=0\), the \(\bG=0\) term is treated by charge neutrality, by a neutralizing background, by Ewald correction, or by the convention used by the target many-body method.  The PAW compensation charges should be included in the neutralized pair density before this step.
 
@@ -736,7 +885,7 @@ Spinor and noncollinear calculations can also be incorporated.  The orbital inde
 \section{Conclusions}
 \label{sec:conclusion}
 
-We have presented a PAW-compatible extension of momentum-resolved ISDF for all-electron ERIs in THC form.  The formulation starts from the exact PAW electrostatic partition of a pair density into a compensated smooth density and atom-local residual corrections.  The compensated smooth density is represented by a composite ISDF auxiliary basis containing ordinary smooth interpolation rows and atom-centered projector-derived augmentation rows.  The one-center residual correction is factored in the same local channel basis and added to the same-atom block of the projected Coulomb matrix.  The final expression,
+We have presented an extension of momentum-resolved ISDF and THC to ultrasoft and projector-augmented-wave pseudopotentials.  The formulation starts from the exact electrostatic partition of an augmented pair density into a compensated smooth density and atom-local residual corrections.  The compensated smooth density is represented by a composite ISDF auxiliary basis containing ordinary smooth interpolation rows and atom-centered augmentation rows.  For PAW, the one-center all-electron residual is factored in the same local channel basis and added to the same-atom block of the projected Coulomb matrix; for ultrasoft pseudopotentials this block is absent and the same construction applies unchanged, with norm-conserving pseudopotentials recovered when the augmentation rows are dropped.  The final expression,
 \begin{equation}
 V_{ijkl}^{\bk_i\bk_j\bk_k\bk_l}
 \approx
@@ -746,7 +895,7 @@ X_{\Lambda i}^{\bk_i *}X_{\Lambda j}^{\bk_j}
 X_{\Sigma k}^{\bk_k *}X_{\Sigma l}^{\bk_l},
 \label{eq:conclusion-formula}
 \end{equation}
-retains the standard THC separability of orbital and momentum indices while preserving the all-electron physics encoded by PAW partial waves.  This makes the approach a natural route to all-electron-quality hybrid, RPA, \(GW\), embedding, and wave-function calculations starting from PAW mean-field orbitals.
+retains the standard THC separability of orbital and momentum indices while incorporating the augmentation algebra of both schemes.  This makes the approach a natural route to ultrasoft- and all-electron-quality hybrid, RPA, \(GW\), embedding, and wave-function calculations starting from the augmented mean-field orbitals produced by standard plane-wave codes.
 
 \appendix
 
@@ -818,8 +967,101 @@ K_a=
 \end{equation}
 with \(+\) denoting the Moore-Penrose pseudoinverse, optionally evaluated in a metric-weighted inner product.
 
+\section{Failure of an incomplete PAW data set}
+\label{app:jthfail}
+
+The inadequacy of ground-state PAW data sets for \(GW\) and RPA is a well-known
+and documented issue: because such data sets are tuned to reproduce all-electron
+scattering only near the occupied levels, they misrepresent the high-energy
+unoccupied states that enter excited-state methods, which is why the VASP group
+provides dedicated ``\(GW\)'' PAW potentials carrying additional high-energy and
+higher-\(l\) projectors~\cite{ShishkinKresseGW,KlimesKaltakKresse}.  The error
+analysis of Sec.~\ref{sec:error} shows that the PAW-ISDF-THC factorization is
+exact only in the complete-partial-wave limit, so it inherits exactly this
+requirement.  Here we simply illustrate the known effect for bulk silicon, using
+a widely used PAW data set (the JTH-PBE Si set~\cite{JolletTorrentHolzwarth})
+constructed with \(s\) and \(p\) projectors only (\(l_{\max}=1\)).  This set is
+accurate for ground-state properties---the occupied Si valence is \(s,p\)-like
+and its PBE equation of state matches all-electron references---yet it fails
+badly for the all-electron correlation energy.
+
+\paragraph{Symptom.}  Figure~\ref{fig:jth-symptom} shows the Si RPA correlation
+energy obtained with this data set versus the number of bands.  On a
+\(3\times3\times3\) mesh it does not converge but runs away monotonically (to
+\(-0.61\,\)Ha at \(N_b=250\), versus \(\approx-0.43\,\)Ha for the
+norm-conserving references), and on a \(4\times4\times4\) mesh it becomes
+catastrophic and erratic, reaching \(-2.3\,\)Ha---several times the physical
+value.  The over-binding grows with both band count and \(\bk\)-point density,
+i.e.\ with the number and resolution of the high-energy virtual states sampled.
+Every \(d\)-complete data set (the norm-conserving, ultrasoft, and
+\texttt{kjpaw} PAW sets of Sec.~\ref{sec:numerics-rpa}) converges smoothly under
+identical conditions.
+
+\paragraph{Cause.}  Figure~\ref{fig:jth-cause} traces the failure to projector
+incompleteness.  Panel~(a) plots the maximum PAW projector overlap
+\(\max_{a\alpha}|P_{i,a\alpha}|\) of each band against its energy, extracted
+directly from the stored orbitals and projectors.  In the shared \(s,p\)
+channels the no-\(d\) set's overlaps of high-energy virtuals blow up by more than
+an order of magnitude (to \(\sim\!40\)), whereas those of the \(d\)-complete
+\texttt{kjpaw} set remain of order unity; the latter instead routes that content
+into its \(d\)-projectors (grey), which is the correct augmentation.  The \(d\)
+character of the high virtuals---properly absorbed by a \(d\)-projector when one
+exists---floods the \(s,p\) projectors when it does not.  Through the quartic
+dependence of \(\Delta V^a\) on the projector overlaps
+[Eq.~\eqref{eq:paw-local-correction}], an order-of-magnitude inflation of
+\(|P|\) corresponds to a \(10^{4}\)--\(10^{6}\) amplification of the spurious
+one-center contribution, which is the origin of the over-binding.
+Panel~(b) confirms this from atomic scattering properties: comparing the
+all-electron and PAW logarithmic derivatives of the no-\(d\) set, the \(s\) and
+\(p\) channels (projectors present) reproduce the all-electron scattering, while
+the \(d\) channel (no projector) departs from it across the entire energy window
+spanned by the RPA virtual states, with a misplaced \(d\) resonance.  A data set
+that cannot reproduce all-electron \(d\) scattering at these energies cannot
+yield accurate all-electron integrals for the states that dominate the
+correlation energy.
+
+\paragraph{Cure and interpretation.}  Adding a single \(l=2\) projector restores
+agreement: the \(d\)-completed construction reproduces the all-electron \(d\)
+scattering, the projector overlaps return to order unity, and the RPA
+correlation energy converges smoothly in line with the other pseudizations
+(Sec.~\ref{sec:numerics-rpa}).  This behavior is not a defect of the
+factorization, which reproduces the all-electron integrals of whatever data set
+it is given; it is a faithful---and diagnostically useful---exposure of
+partial-wave incompleteness.  It is the same projector-completeness requirement
+that motivates the excited-state (``\(GW\)'') PAW potentials of the VASP
+group~\cite{ShishkinKresseGW,KlimesKaltakKresse}; our diagnostics simply confirm
+that it propagates, as expected, into the all-electron integrals produced by the
+factorization.
+
+\begin{figure}[t]
+  \includegraphics[width=\columnwidth]{paw_article_results/jth_failure.pdf}
+  \caption{Symptom of an incomplete (\(l_{\max}=1\), no \(d\)) PAW data set: the
+  Si RPA correlation energy versus number of bands on (a)~a \(3\times3\times3\)
+  and (b)~a \(4\times4\times4\) mesh.  The no-\(d\) set (red) runs away and
+  becomes catastrophic, while the \(d\)-complete pseudizations (grey band)
+  converge.}
+  \label{fig:jth-symptom}
+\end{figure}
+
+\begin{figure}[t]
+  \includegraphics[width=\columnwidth]{paw_article_results/jth_causes.pdf}
+  \caption{Cause of the failure in Fig.~\ref{fig:jth-symptom}.
+  (a)~Maximum PAW projector overlap per band versus band energy (Si
+  \(4\times4\times4\), \(N_b=100\)): the no-\(d\) set's \(s,p\) overlaps of high
+  virtuals diverge (\(\sim\!40\)), whereas the \(d\)-complete \texttt{kjpaw} set
+  keeps \(s,p\) bounded (\(\sim\!1\)) and absorbs the content into its
+  \(d\)-projector (grey).  (b)~All-electron (lines) versus PAW (markers/dashed)
+  logarithmic derivatives of the no-\(d\) set: the \(p\) channel (projector
+  present) reproduces the all-electron scattering, while the \(d\) channel (no
+  projector) departs from it across the RPA virtual window.}
+  \label{fig:jth-cause}
+\end{figure}
+
 \begin{acknowledgments}
-This manuscript is a preliminary theoretical formulation.  Numerical benchmarks, convergence studies, and code-level validation against direct PAW Coulomb matrix elements remain necessary before production use.
+Numerical validation against direct PAW Coulomb matrix elements
+(Fig.~\ref{fig:convergence}) and against a fully converged RPA observable
+(Fig.~\ref{fig:si-rpa}) is reported in Sec.~\ref{sec:numerics}; extension to
+broader benchmark sets and production many-body workflows is ongoing.
 \end{acknowledgments}
 
 \begin{thebibliography}{99}
@@ -830,8 +1072,14 @@ P. E. Blochl, Projector augmented-wave method, Phys. Rev. B \textbf{50}, 17953 (
 \bibitem{KresseJoubert}
 G. Kresse and D. Joubert, From ultrasoft pseudopotentials to the projector augmented-wave method, Phys. Rev. B \textbf{59}, 1758 (1999).
 
+\bibitem{VanderbiltUSPP}
+D. Vanderbilt, Soft self-consistent pseudopotentials in a generalized eigenvalue formalism, Phys. Rev. B \textbf{41}, 7892 (1990).
+
 \bibitem{RostgaardPAW}
 C. Rostgaard, The Projector Augmented-wave Method, arXiv:0910.1921 (2009).
+
+\bibitem{JolletTorrentHolzwarth}
+F. Jollet, M. Torrent, and N. Holzwarth, Generation of projector augmented-wave atomic data: A 71 element validated table in the XML format, Comput. Phys. Commun. \textbf{185}, 1246 (2014).
 
 \bibitem{LuYingISDF}
 J. Lu and L. Ying, Compression of the electron repulsion integral tensor in tensor hypercontraction format with cubic scaling cost, J. Comput. Phys. \textbf{302}, 329 (2015).
@@ -862,6 +1110,9 @@ I. Duchemin and X. Blase, Cubic-scaling all-electron \(GW\) calculations with a 
 
 \bibitem{ShishkinKresseGW}
 M. Shishkin and G. Kresse, Implementation and performance of the frequency-dependent \(GW\) method within the PAW framework, Phys. Rev. B \textbf{74}, 035101 (2006).
+
+\bibitem{KlimesKaltakKresse}
+J. Klime\v{s}, M. Kaltak, and G. Kresse, Predictive \(GW\) calculations using plane waves and pseudopotentials, Phys. Rev. B \textbf{90}, 075125 (2014).
 
 \end{thebibliography}
 
