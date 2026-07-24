@@ -180,7 +180,9 @@ namespace bdft_tests {
     std::string output = "coqui_vertex_ibz_gold";
 
     // one (variant, run) driver: n_iter scGW, optional vertex window, returns
-    // (e_hf, e_corr, sym_leakage_max)
+    // (e_hf, e_corr, sym_leakage_max). Side channel: last_grot holds the most-recent
+    // run's max G_CC G-rotation residual (see the REPRO block below).
+    double last_grot = 0.0;
     auto run = [&](std::string const& mf_name, nda::range window, long n_iter,
                    std::string const& isdf_mode) {
       auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, mf_name));
@@ -204,6 +206,7 @@ namespace bdft_tests {
                                      n_iter, false, 1e-12, true);
       mpi_context->comm.barrier();
       double leak = vtx.sym_leakage_max();
+      last_grot = vtx.g_rotation_max();
       if (mpi_context->comm.root()) remove((output + ".mbpt.h5").c_str());
       mpi_context->comm.barrier();
       return std::make_tuple(e_hf, e_corr, leak);
@@ -308,6 +311,33 @@ namespace bdft_tests {
       // downfold class (refinement2 memo 10.2: machine-level on the nosym mesh;
       // allow the svd_tol/kernel class here)
       REQUIRE(std::abs(ec_sec - ec_glo) <= 1e-5 + 0.05 * std::abs(ec_glo - ec_p_s));
+    }
+
+    // ---- REPRODUCTION (secondary + sym mesh, TWO iterations): does the self-consistent
+    // G_CC stay symmetry-consistent past iter-1 in the secondary path? C=[1,3) is
+    // symmetry-CLOSED on qe_lih222_sym (D-leak = 0, gold block above) and LiH-222
+    // secondary tracks global to ~1e-5 at 1 iter (block above) -- so BOTH the window-
+    // leakage and the basis-crudeness confounds are removed. A large secondary
+    // G-rotation residual here (vs global's ~machine value) isolates a secondary-path
+    // symmetry-unfolding defect in the self-consistent vertex feedback -- the same
+    // signature seen in the sec_scgwvtx_M8 production run (iter-2 residual 5e-9 -> 0.49).
+    {
+      auto [ehf_sec2, ec_sec2, lsec2] = run("qe_lih222_sym", nda::range(1, 3), 2, "secondary");
+      const double grot_sec2 = last_grot;
+      auto [ehf_glo2, ec_glo2, lglo2] = run("qe_lih222_sym", nda::range(1, 3), 2, "global");
+      const double grot_glo2 = last_grot;
+      (void)ehf_sec2; (void)ehf_glo2; (void)lsec2; (void)lglo2;
+      app_log(1, "ibz REPRO (2-iter, C=[1,3) closed): e_corr secondary {:.12f} vs global "
+                 "{:.12f} (|D| = {:.3e}); G-rotation residual secondary = {:.3e}, global = "
+                 "{:.3e}; window D-leak secondary = {:.3e}, global = {:.3e}",
+              ec_sec2, ec_glo2, std::abs(ec_sec2 - ec_glo2), grot_sec2, grot_glo2, lsec2, lglo2);
+      REQUIRE(std::isfinite(ec_sec2));
+      REQUIRE(std::isfinite(ec_glo2));
+      // EXPECT (if the secondary sym multi-iter path is correct): the secondary
+      // G-rotation residual stays the same small class as global's on this closed window,
+      // and the self-consistent e_corr tracks global to the downfold class it held at 1 iter.
+      REQUIRE(grot_sec2 <= std::max(1e-6, 10.0 * grot_glo2));
+      REQUIRE(std::abs(ec_sec2 - ec_glo2) <= 1e-4 + 0.05 * std::abs(ec_glo2 - ec_p_s));
     }
 #endif  // ENABLE_DLR
   }

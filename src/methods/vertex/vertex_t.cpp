@@ -332,7 +332,7 @@ namespace solvers {
      * covariance); a much larger value indicates a map/conjugation bug. Non-trev
      * k only (the trev gauge composition is exercised by the kernels themselves).
      */
-    inline void g_rotation_check(vertex_sym::sym_ctx const& ctx,
+    inline double g_rotation_check(vertex_sym::sym_ctx const& ctx,
                                  nda::MemoryArrayOfRank<5> auto const& G_full,
                                  nda::ArrayOfRank<1> auto const& kp_trev) {
       decltype(nda::range::all) all;
@@ -359,6 +359,7 @@ namespace solvers {
       }
       app_log(2, "  IBZ symmetry: G-rotation consistency residual (C block, one tau "
                  "slice): max = {} (O(D-leakage) expected)", worst);
+      return worst;
     }
 
   } // vertex_ibz_detail
@@ -1432,7 +1433,8 @@ namespace solvers {
                       wan ? &_U_skia : nullptr);
         symc = &_sym_global.value();
       }
-      vertex_ibz_detail::g_rotation_check(*symc, G_CC, MF->kp_trev());
+      _g_rot_max = std::max(_g_rot_max,
+                            vertex_ibz_detail::g_rotation_check(*symc, G_CC, MF->kp_trev()));
     }
 
     // ---- fused kernel (round-robin over (s,k,qx); result all-reduced inside) ----------
@@ -2021,7 +2023,8 @@ namespace solvers {
                       wan ? &_U_skia : nullptr);
         symc = &_sym_global.value();
       }
-      vertex_ibz_detail::g_rotation_check(*symc, G_CC, MF->kp_trev());
+      _g_rot_max = std::max(_g_rot_max,
+                            vertex_ibz_detail::g_rotation_check(*symc, G_CC, MF->kp_trev()));
     }
 
     // ---- kernel: accumulate Pi^C(inu) over this rank's (s,k,qx) tuples ----------------

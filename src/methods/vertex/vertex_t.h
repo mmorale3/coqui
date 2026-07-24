@@ -348,6 +348,11 @@ namespace solvers {
     // measured C-window D-matrix leakage (diagnostic, no gate; memo section 6)
     double _sym_leak_max = 0.0;
     double _sym_leak_mean = 0.0;
+    // measured G_CC G-rotation consistency residual, running max over this vertex's
+    // eval_Pi_C / eval_Sigma_C calls (diagnostic, no gate; memo section 6). Distinct
+    // from the iteration-independent D-matrix leakage above: this one tracks whether
+    // the self-consistent G_CC itself stays symmetry-consistent across iterations.
+    double _g_rot_max = 0.0;
 
     /**
      * Build (lazily) the symmetry context for the given window collocation
@@ -429,6 +434,9 @@ namespace solvers {
     // first symmetric evaluation; 0 on symmetry-free meshes).
     double sym_leakage_max() const { return _sym_leak_max; }
     double sym_leakage_mean() const { return _sym_leak_mean; }
+    // running max of the G_CC G-rotation consistency residual across this vertex's
+    // eval calls (0 until the first symmetric evaluation; 0 on symmetry-free meshes).
+    double g_rotation_max() const { return _g_rot_max; }
 
   }; // vertex_t
 
