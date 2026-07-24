@@ -96,6 +96,21 @@ namespace solvers {
     }
     // (TEMP) per-phase GPU timers for update_w. Strip together with
     // the other TEMP_* timers once the perf hot-spots are identified.
+    // Pre-register every TEMP_* timer referenced in the dump below:
+    // elapsed()/number_of_calls() abort on unregistered names, and some
+    // timers only ever start on the DEVICE path (e.g. the dev-alloc ones),
+    // which crashed HOST runs at the first dump.
+    for (auto const& name : {"TEMP_UW_TOTAL", "TEMP_UW_eval_Pi_qdep",
+         "TEMP_UW_dyson_W_from_Pi", "TEMP_DWFP_tau_to_w",
+         "TEMP_DWFP_dyson_W_in_place", "TEMP_DWFP_w_to_tau",
+         "TEMP_DWiP_alloc", "TEMP_DWiP_Z_load", "TEMP_DWiP_Pi_load",
+         "TEMP_DWiP_gemm_ZPi", "TEMP_DWiP_diag_I_minus_A",
+         "TEMP_DWiP_inverse", "TEMP_DWiP_diag_A_minus_I",
+         "TEMP_DWiP_gemm_AZ", "TEMP_DWiP_writeback", "TEMP_UW_eps_inv_head",
+         "TEMP_UW_dW_qtPQ_alloc", "TEMP_UW_dW_transpose_and_mirror",
+         "TEMP_UW_dW_qtPQ_dev_alloc", "TEMP_UW_dW_dev_transpose",
+         "TEMP_UW_dW_d2h_mirror", "TEMP_UW_dump_eps_inv_head"})
+      _Timer.add(name);
     _Timer.start("TEMP_UW_TOTAL");
     _Timer.start("TEMP_UW_eval_Pi_qdep");
     auto dPi_tqPQ = eval_Pi_qdep<MEM>(mb_state, thc);
