@@ -40,8 +40,66 @@
 #include "mean_field/mf_source.hpp"
 #include "utilities/symmetry.hpp"
 
-namespace hamilt 
+namespace hamilt
 {
+
+/**
+ * Core-valence exchange treatment. This is NOT a user/toml option: it is
+ * AUTO-DETECTED per PAW species from the mean-field h5 content in the pseudopot
+ * constructor (stored in species_paw_t::cv_exchange) and then controls behaviour
+ * during the calculation. Detection order: ex_cvij present -> fock; else a DFT
+ * core-valence XC dataset present -> dft_xc (dataset TBD); else none (warned).
+ */
+enum class cv_exchange_e {
+  fock,     ///< frozen core-valence exact-exchange (h5 ex_cvij found)
+  dft_xc,   ///< DFT-based core-valence exchange-correlation (h5 dataset TBD; NOT YET IMPLEMENTED)
+  none      ///< no core-valence exchange dataset found (contribution omitted; warned loudly)
+};
+enum class vv_compensation_e {
+  moment,   ///< moment-restored compensation charge (Shishkin-Kresse; build_qrad_tab) (default)
+  shape     ///< shape-restored full AE-PS partial-wave pair density (Arnaud; build_qrad_tab_full_aeps)
+};
+
+/**
+ * PAW valence-valence exchange options (set from the toml). Either compensation
+ * mode is computable from the SAME PAW h5 (qfuncl for 'moment'; aewfc+pswfc for
+ * 'shape'), so this is a genuine methodological choice and is toml-controlled.
+ * Scaffolding: choices not yet implemented ABORT in validate() with a clear
+ * message; defaults reproduce the current validated behaviour. (Core-valence
+ * exchange is NOT here — it is auto-detected from the h5; see cv_exchange_e.)
+ */
+struct paw_exx_options {
+  /// Valence-valence on-site compensation charge. Default: moment-restored.
+  vv_compensation_e vv_compensation = vv_compensation_e::moment;
+  /// Maximum angular momentum L of the compensation-charge multipole expansion.
+  /// Default -1 = full 2*lmax per species (lmax = highest partial-wave l), i.e.
+  /// the complete augmentation with no truncation (cf. VASP LMAXPAW = 2*lmax).
+  /// A value >= 0 caps the multipoles at L <= aug_lmax, trading accuracy for
+  /// speed (cf. VASP LMAXFOCK for the Fock-exchange augmentation).
+  int aug_lmax = -1;
+
+  /**
+   * Abort with a clear message for options declared here but not yet implemented.
+   * `in_thc` selects the THC-ERI restriction: shape-restored compensation is not
+   * yet available in the THC construction (its augmentation lives on the smooth
+   * collocation grid, too coarse for the sharp AE-PS pair density); the direct
+   * v_x path supports both compensation modes.
+   */
+  void validate(bool in_thc, std::string const& ctx = "paw_exx_options") const {
+    if (in_thc)
+      utils::check(vv_compensation != vv_compensation_e::shape,
+        "{}: vv_compensation = 'shape' (shape-restored full AE-PS pair density) "
+        "is NOT YET IMPLEMENTED for the THC ERI construction: the THC "
+        "augmentation is built on the smooth collocation grid, which is too "
+        "coarse to resolve the sharp AE-PS pair density (only a few percent of "
+        "the on-site term is captured). Use vv_compensation = 'moment' (default) "
+        "for THC. TODO: dense-grid THC augmentation + unit test. "
+        "(The direct v_x path already supports 'shape'.)", ctx);
+    utils::check(aug_lmax >= -1,
+      "{}: aug_lmax = {} is invalid (must be >= 0, or -1 for no cap).",
+      ctx, aug_lmax);
+  }
+};
 
 /**
  * @class pseudopot
@@ -139,6 +197,11 @@ class pseudopot
                                          //   <exact_exchange_X_matrix>). Contracts
                                          //   LINEARLY with becsum (factor 1, no ½);
                                          //   one-center, frozen. Empty ⇒ omitted.
+    // Core-valence exchange treatment for this species, AUTO-DETECTED from the
+    // h5 content in the pseudopot constructor (fock if ex_cvij present, else
+    // dft_xc if a DFT c-v XC dataset is present [TBD], else none). Controls the
+    // frozen c-v exchange insertion into H0. See cv_exchange_e.
+    cv_exchange_e cv_exchange = cv_exchange_e::none;
     nda::array_view<double,2> core_aewfc;// (ncore, mesh)
     // Angular momentum metadata (per-species slices of QE's global uspp
     // tables; ih ∈ [0, nh), nbeta ∈ [0, nbeta)).
@@ -328,7 +391,26 @@ class pseudopot
    * only; USPP is unaffected. Default false = compensation charge + deltaC.
    */
   bool paw_exx_shape_restored = false;
-  void set_paw_exx_shape_restored(bool b) { paw_exx_shape_restored = b; }
+  void set_paw_exx_shape_restored(bool b) {
+    paw_exx_shape_restored = b;
+    _exx_opts.vv_compensation = b ? vv_compensation_e::shape
+                                  : vv_compensation_e::moment;
+  }
+
+  /**
+   * PAW exact-exchange options (toml-controlled). Governs the core-valence
+   * exchange source, the valence-valence compensation-charge model, and the
+   * augmentation angular-momentum cutoff for the direct v_x / add_exchange path.
+   * Set via set_exx_options() from the toml-parsing constructor (thc_reader_t).
+   */
+  paw_exx_options _exx_opts;
+  paw_exx_options const& exx_options() const { return _exx_opts; }
+  int aug_lmax() const { return _exx_opts.aug_lmax; }
+  void set_exx_options(paw_exx_options const& o) {
+    o.validate(/*in_thc=*/false, "pseudopot::set_exx_options");
+    _exx_opts = o;
+    paw_exx_shape_restored = (o.vv_compensation == vv_compensation_e::shape);
+  }
 
   private:
 

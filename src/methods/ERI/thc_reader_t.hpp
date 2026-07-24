@@ -131,6 +131,23 @@ namespace methods {
           _paw_isdf_metric = (m == "l2") ? hamilt::paw::isdf_metric::L2
                                          : hamilt::paw::isdf_metric::Coulomb;
         }
+        // PAW valence-valence exchange options (see hamilt::paw_exx_options).
+        // NB: core-valence exchange is NOT a toml option — it is auto-detected
+        // from the h5 content in the pseudopot constructor (see cv_exchange_e).
+        // Scaffolding: shape-restored THC compensation is declared but not yet
+        // implemented; validate() (below) aborts with a clear message if requested.
+        {
+          std::string vv = io::tolower_copy(io::get_value_with_default<std::string>(pt, "vv_compensation", "moment"));
+          utils::check(vv == "moment" || vv == "shape",
+            "thc_reader_t: unknown vv_compensation = '{}' (choices: 'moment', 'shape').", vv);
+          _exx_opts.vv_compensation = (vv == "shape") ? hamilt::vv_compensation_e::shape
+                                                       : hamilt::vv_compensation_e::moment;
+          // Max angular momentum L of the compensation-charge multipoles.
+          // Default -1 = full 2*lmax per species (complete augmentation, cf.
+          // VASP LMAXPAW); a value >= 0 caps it (cf. VASP LMAXFOCK).
+          _exx_opts.aug_lmax = io::get_value_with_default<int>(pt, "aug_lmax", -1);
+          _exx_opts.validate(/*in_thc=*/true, "thc_reader_t [interaction.thc]");
+        }
       } else {
         _paw_aug = false;
         _paw_onsite = false;
@@ -246,6 +263,9 @@ namespace methods {
       if (!_psp) _psp = hamilt::make_pseudopot(*_MF);
       utils::check(_psp != nullptr,
                    "thc_reader_t: paw_aug=true but make_pseudopot returned null.");
+      // Propagate the toml PAW exact-exchange options to the shared pseudopot so
+      // the direct v_x / add_exchange path uses the same settings as the THC ERI.
+      _psp->set_exx_options(_exx_opts);
 
       // Try to load a cached compressed isdf if a path was given.
       if (!_paw_isdf_cache_h5.empty() && std::filesystem::exists(_paw_isdf_cache_h5)) {
@@ -680,8 +700,13 @@ namespace methods {
       // needs the augmentation on the DENSE grid (dfftp, ecutrho ~ ABINIT's
       // ecutsigx); the direct v_x_paw path already uses fft_mesh_aug (dense) and
       // reproduces ABINIT. See notes/paw_onsite_exchange_analysis.
+      // Selected by the toml `vv_compensation` option (see hamilt::paw_exx_options).
+      // NOTE: 'shape' is validated as NOT-YET-IMPLEMENTED for THC in the
+      // constructor (aborts, due to the smooth-grid limitation documented above),
+      // so this is effectively always moment-restored here. The switch is kept
+      // wired for when the dense-grid THC augmentation lands.
       bool paw_shape_restored =
-          (std::getenv("COQUI_PAW_SHAPE_RESTORED") != nullptr);
+          (_exx_opts.vv_compensation == hamilt::vv_compensation_e::shape);
       if (paw_shape_restored)
         app_log(1, "  paw_aug: SHAPE-RESTORED (Option A) on-site exchange enabled "
                    "(full AE−PS oscillator, K_a dropped).");
@@ -689,8 +714,8 @@ namespace methods {
       qrad_tabs.reserve(_psp->paw_species_view().size());
       for (auto const& sp : _psp->paw_species_view())
         qrad_tabs.push_back((paw_shape_restored && sp.is_paw)
-            ? hamilt::paw::build_qrad_tab_full_aeps(sp, K_max)
-            : hamilt::paw::build_qrad_tab(sp, K_max));
+            ? hamilt::paw::build_qrad_tab_full_aeps(sp, K_max, 0.01, _exx_opts.aug_lmax)
+            : hamilt::paw::build_qrad_tab(sp, K_max, 0.01, _exx_opts.aug_lmax));
       _Timer.stop("PAW_AUG.qrad_tab");
       app_log(2, "  paw_aug: built qrad table for {} species, K_max={:.2f} a.u., "
                  "n_K={}", qrad_tabs.size(), K_max,
@@ -1897,6 +1922,10 @@ namespace methods {
     hamilt::paw::isdf_metric _paw_isdf_metric = hamilt::paw::isdf_metric::Coulomb;
     double _paw_isdf_tol = 1e-12;
     std::string _paw_isdf_cache_h5;
+    // PAW exact-exchange options parsed from [interaction.thc] (cv_exchange,
+    // vv_compensation, aug_lmax); see hamilt::paw_exx_options. Propagated to the
+    // shared pseudopot so the direct v_x path uses the same settings.
+    hamilt::paw_exx_options _exx_opts;
   };
 
 } // methods

@@ -931,11 +931,20 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
     // charge feeds the core-valence Hartree; ex_cvij is the core-valence exact
     // exchange (both live entirely inside the augmentation sphere; see notes).
     for (int nt = 0; nt < nsp; ++nt) {
-      auto const& sp = paw_species[nt];
+      auto& sp = paw_species[nt];
       if (!sp.is_paw) continue;
       bool no_core_charge = (sp.ae_rho_atc.size() == 0) &&
                             (sp.ncore_orbitals == 0 || sp.core_aewfc.size() == 0);
-      bool no_cv_exchange = (sp.ex_cvij.size() == 0);
+      // Auto-detect the core-valence exchange treatment from the h5 datasets:
+      //   ex_cvij present            -> frozen Fock c-v exchange (fock)
+      //   else <DFT c-v XC dataset>  -> dft_xc   [TODO: dataset TBD]
+      //   else                       -> none (omitted; warned loudly below)
+      // TODO: when a DFT core-valence XC dataset is defined in the h5, read a
+      // per-species flag in the loading loop above, broadcast it alongside the
+      // other scalars, and set sp.cv_exchange = cv_exchange_e::dft_xc here.
+      sp.cv_exchange = (sp.ex_cvij.size() > 0) ? cv_exchange_e::fock
+                                               : cv_exchange_e::none;
+      bool no_cv_exchange = (sp.cv_exchange == cv_exchange_e::none);
       if (no_core_charge) {
         app_warning("**************************************************************************");
         app_warning("**************************************************************************");
@@ -951,7 +960,6 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
         app_warning("**************************************************************************");
         app_warning("***  WARNING: PAW species nt={} has NO core-valence exchange kernel", nt);
         app_warning("***  (Onecenter/ex_cvij). The CORE-VALENCE EXACT EXCHANGE is OMITTED.");
-        app_warning("***  For HF/GW this underbinds (e.g. Si RPA a0 too large). Supply");
         app_warning("***  ex_cvij (ABINIT <exact_exchange_X_matrix>) to include it.");
         app_warning("**************************************************************************");
         app_warning("**************************************************************************");
@@ -971,13 +979,24 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
   // Guard on pp type: paw_species is only populated for USPP/PAW (see above),
   // so this block must NOT dereference paw_species[nt] on the NC path (empty
   // vector -> out-of-bounds). ex_cvij is PAW-only; USPP simply has size()==0.
+  //
+  // The core-valence exchange treatment is AUTO-DETECTED per species from the h5
+  // (species_paw_t::cv_exchange, set in the loop above): 'fock' inserts the
+  // frozen ex_cvij one-center Dij here; 'none' skips it (omitted, warned above);
+  // 'dft_xc' (DFT-based c-v XC, dataset TBD) is NOT YET IMPLEMENTED and aborts.
   if((ptype == pp_uspp_t or ptype == pp_paw_t) and mpi->node_comm.root()) {
     const double alpha_x = 1.0;
     auto Dloc_at = Dnn_atom.local();
     for(int ia=0; ia<nat; ++ia) {
       int nt = ityp(ia);
       auto const& sp = paw_species[nt];
-      if(!sp.is_paw || sp.ex_cvij.size()==0) continue;
+      if(!sp.is_paw) continue;
+      if(sp.cv_exchange == cv_exchange_e::none) continue;  // omitted (warned above)
+      utils::check(sp.cv_exchange == cv_exchange_e::fock,
+        "pseudopot: core-valence exchange 'dft_xc' (DFT-based core-valence XC) is "
+        "NOT YET IMPLEMENTED for PAW species nt={}: a DFT c-v XC dataset was "
+        "detected in the h5 but cannot be used yet. TODO: implement + unit test.", nt);
+      // fock: insert the frozen ex_cvij one-center Dij (ex_cvij guaranteed present).
       int nh_a = sp.nh;
       for(int p=0; p<npol; ++p)
         for(int n=0; n<nh_a; ++n)
@@ -1255,6 +1274,7 @@ void pseudopot::add_vpp_impl(boost::mpi3::communicator& comm,
     // the result lands at QE's Dnn_atom convention (no occupation/N_k folded
     // into the channel). Built only on PAW/USPP; NCPP falls through to the
     // bare branch.
+// MAM FIX FIX FIX: where is nij!=nullptr case???
     if (ptype != pp_ncpp_t && nii != nullptr) {
       sarray_t<nda::array_view<ComplexType,1>> svfull(mpi_local_context,{nnr_aug});
       auto vfull = svfull.local();

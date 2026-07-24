@@ -119,8 +119,13 @@ inline void qe_real_ylm_flat(int Lmax, std::array<double, 3> const& g,
     // processing pass overwrites in place.
 
     // Use 1-based indexing internally to match QE; final output indexed 0-based.
-    nda::array<double, 1> Y1(lmax2 + 1);   // index 1..lmax2
-    Y1() = 0.0;
+    // Reuse a thread-local scratch buffer: this routine is called once per
+    // dense-grid point in the augmentation build (~10^7 calls), so a fresh
+    // heap allocation here dominates the runtime. Matches ABINIT's
+    // allocation-free form-factor evaluation.
+    thread_local nda::array<double, 1> Y1;
+    if ((long)Y1.extent(0) < lmax2 + 1) Y1.resize(lmax2 + 1);
+    for (int i = 0; i <= lmax2; ++i) Y1(i) = 0.0;   // index 1..lmax2 used
     Y1(1) = 1.0;
     if (Lmax >= 1) {
         Y1(2) = cost;
@@ -164,6 +169,9 @@ inline void qe_real_ylm_flat(int Lmax, std::array<double, 3> const& g,
             Y1(lm)     = c * std::sqrt(2.0) * tmp * std::sin(m * phi); // Y_l,-m
         }
     }
+    utils::check(lmax2 <= (int)Yflat.extent(0),
+        "qe_real_ylm_flat: lmax2={} exceeds Yflat buffer size {} (Lmax={})",
+        lmax2, (int)Yflat.extent(0), Lmax);
     for (int i = 0; i < lmax2; ++i) Yflat(i) = Y1(i + 1);
 }
 
@@ -344,12 +352,18 @@ struct qrad_tab {
 inline qrad_tab build_qrad_tab(
     pseudopot::species_paw_t const& sp,
     double K_max,
-    double dq = 0.01)
+    double dq = 0.01,
+    int aug_lmax = -1)
 {
     qrad_tab T;
     T.dq = dq;
     if (sp.qfuncl.size() == 0) return T;
     long Lp1   = sp.qfuncl.extent(0);
+    // Cap the compensation-charge multipole expansion at L <= aug_lmax (VASP
+    // LMAXFOCK-style truncation; aug_lmax < 0 => full 2*lmax, no cap). Higher-L
+    // table rows are left zero (T.tab is zero-initialised), so they contribute
+    // nothing to the augmentation.
+    long Lp1_use = (aug_lmax >= 0) ? std::min(Lp1, (long)aug_lmax + 1) : Lp1;
     long n_ijv = sp.qfuncl.extent(1);
     long mesh_full = sp.qfuncl.extent(2);
     if (mesh_full == 0) return T;
@@ -384,7 +398,7 @@ inline qrad_tab build_qrad_tab(
     nda::array<double, 1> besr(N);
     for (long iK = 0; iK < T.n_K; ++iK) {
         double K = (double)iK * dq;
-        for (long L = 0; L < Lp1; ++L) {
+        for (long L = 0; L < Lp1_use; ++L) {
             // Cache j_L(K·r) once for this (iK, L) — independent of ijv.
             for (long i = 0; i < N; ++i) {
                 double Kr = K * sp.r(i);
@@ -431,7 +445,8 @@ inline qrad_tab build_qrad_tab(
 inline qrad_tab build_qrad_tab_full_aeps(
     pseudopot::species_paw_t const& sp,
     double K_max,
-    double dq = 0.01)
+    double dq = 0.01,
+    int aug_lmax = -1)
 {
     qrad_tab T;
     T.dq = dq;
@@ -452,6 +467,10 @@ inline qrad_tab build_qrad_tab_full_aeps(
         for (long b = 0; b < nbeta; ++b) lmax_beta = std::max(lmax_beta, (int)sp.lll(b));
         Lp1 = 2 * lmax_beta + 1;
     }
+    // Cap the multipole expansion at L <= aug_lmax (VASP LMAXFOCK-style;
+    // aug_lmax < 0 => full 2*lmax, no cap); higher-L table rows stay zero
+    // (T.tab is zero-initialised) and thus drop out.
+    long Lp1_use = (aug_lmax >= 0) ? std::min(Lp1, (long)aug_lmax + 1) : Lp1;
 
     long mesh = (sp.kkbeta > 0 && sp.kkbeta <= (int)mesh_full)
               ? (long)sp.kkbeta : mesh_full;
@@ -490,7 +509,7 @@ inline qrad_tab build_qrad_tab_full_aeps(
     nda::array<double, 1> besr(N);
     for (long iK = 0; iK < T.n_K; ++iK) {
         double K = (double)iK * dq;
-        for (long L = 0; L < Lp1; ++L) {
+        for (long L = 0; L < Lp1_use; ++L) {
             for (long i = 0; i < N; ++i) {
                 double Kr = K * sp.r(i);
                 besr(i) = (std::abs(Kr) < 1e-30) ? (L == 0 ? 1.0 : 0.0)
@@ -512,13 +531,17 @@ inline qrad_tab build_qrad_tab_full_aeps(
  * in QE/upflib/qvan2.f90 lines 143-157. Returns an array of length Lp1
  * with the per-L radial values for the requested ijv.
  */
-inline nda::array<double, 1> qrad_interp_at_K(
-    qrad_tab const& T, int ijv, double K)
+// Allocation-free variant: writes the interpolated qrad(L) into `out`
+// (resized only when the L-range changes, i.e. once per species). This is the
+// hot-path entry — called ~nnr*nh^2 times per augmentation build — so it must
+// not allocate. Mirrors ABINIT's precomputed-form-factor evaluation.
+inline void qrad_interp_at_K_into(
+    qrad_tab const& T, int ijv, double K, nda::array<double, 1>& out)
 {
     long Lp1 = T.tab.extent(2);
-    nda::array<double, 1> out(Lp1);
-    out() = 0.0;
-    if (T.n_K == 0) return out;
+    if ((long)out.extent(0) != Lp1) out.resize(Lp1);
+    for (long L = 0; L < Lp1; ++L) out(L) = 0.0;
+    if (T.n_K == 0) return;
     double qm = K / T.dq;
     long i0 = (long)std::floor(qm);
     if (i0 < 0) i0 = 0;
@@ -535,6 +558,13 @@ inline nda::array<double, 1> qrad_interp_at_K(
                - T.tab(i0 + 2, ijv, L) * pwx * ux
                + T.tab(i0 + 3, ijv, L) * px * uvx;
     }
+}
+
+inline nda::array<double, 1> qrad_interp_at_K(
+    qrad_tab const& T, int ijv, double K)
+{
+    nda::array<double, 1> out;
+    qrad_interp_at_K_into(T, ijv, K, out);
     return out;
 }
 

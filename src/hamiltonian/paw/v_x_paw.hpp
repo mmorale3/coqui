@@ -85,6 +85,7 @@ inline void build_paw_aug_pair_factor(
     double Omega,
     nda::ArrayOfRank<1> auto const& k_p,
     nda::ArrayOfRank<1> auto const& k_q,
+    double Gcut,
     nda::array<ComplexType, 3>& Qfac)
 {
   auto const& ityp = psp.ityp_view();
@@ -114,6 +115,14 @@ inline void build_paw_aug_pair_factor(
 
     double tx = tau(ia, 0), ty = tau(ia, 1), tz = tau(ia, 2);
 
+    // Y_lm(K̂) buffer, computed ONCE per g below (depends only on the direction
+    // of K, not on the projector pair I,J). Previously it was recomputed inside
+    // evaluate_Q_IJ_at_K_fast for every (g, I, J) — nh^2 redundant trig
+    // recursions that dominated the augmentation cost.
+    nda::array<double, 1> Yflat_g(aatab.llx);
+    int Lmax_ylm = 2 * (aatab.lli - 1);
+    auto const& ijtoh = psp.ijtoh_view();
+
     for (long g = 0; g < nnr; ++g) {
       // Recover Miller index from linear FFT index (matches eval_mesh_3d_impl)
       long iz = g % NZ; if (iz > NZ2) iz -= NZ;
@@ -124,29 +133,36 @@ inline void build_paw_aug_pair_factor(
       double Gy = ix*recv(0,1) + iy*recv(1,1) + iz*recv(2,1) + dky;
       double Gz = ix*recv(0,2) + iy*recv(1,2) + iz*recv(2,2) + dkz;
       double Kmag = std::sqrt(Gx*Gx + Gy*Gy + Gz*Gz);
+      // Restrict the augmentation to the |G+Δk| ≤ Gcut sphere. Beyond Gcut the
+      // smooth pair density is ~0 and the on-site AE−PS contribution is
+      // Coulomb-negligible (ABINIT truncates the same way at ecutsigx). This
+      // skips the FFT-box corners (|G| up to ~2× the inscribed-sphere radius),
+      // which is what made the full-grid augmentation intractable, and lets the
+      // qrad Bessel table be built only up to Gcut.
+      if (Kmag > Gcut) continue;   // Qfac stays 0 here (zeroed above)
 
       // Structure factor e^{-i(G+Δk)·τ_a}
       double phase = -(Gx*tx + Gy*ty + Gz*tz);
       ComplexType sf(std::cos(phase), std::sin(phase));
 
-      // For each upper-triangular (I, J) channel of atom ia (matching qgm's ijv)
-      // we evaluate Q^{IJ}_a(K) and store. To match the ij_packed used by
-      // pseudopot::qgm, we iterate I,J ∈ [0, nh_a) and use ijtoh(nt, I, J) as
-      // the storage index (1-based) — we'll skip ij_packed < 0.
-      auto const& ijtoh = psp.ijtoh_view();
-      // Use the qrad table for fast radial lookup at |K|.
-      // qrad_interp_at_K returns the Lp1-vector of J_L(K) values for one ijv.
-      // But the storage of Q^IJ in qfuncl is by ijv = upper-triangular index
-      // of (nb_I, nb_J). evaluate_Q_IJ_at_K wraps the (nb, mb) → ijv lookup.
+      // Y_lm(K̂) once per g (direction only).
+      std::array<double, 3> dir = (Kmag > 1e-14)
+          ? std::array<double, 3>{Gx / Kmag, Gy / Kmag, Gz / Kmag}
+          : std::array<double, 3>{0.0, 0.0, 1.0};
+      qe_real_ylm_flat(Lmax_ylm, dir, Yflat_g);
+      if (Kmag <= 1e-14)
+        for (int lp = 1; lp < aatab.llx; ++lp) Yflat_g(lp) = 0.0;
+
+      // For each (I, J) channel of atom ia, store Q^{IJ}_a(K) at ijtoh(nt,I,J).
       for (int I = 0; I < nh_a; ++I) {
         for (int J = 0; J < nh_a; ++J) {
           long ij_packed = static_cast<long>(ijtoh(nt, I, J)) - 1;
           if (ij_packed < 0) continue;
-          // Evaluate Q^{IJ}_a(K). The 4π/Ω prefactor is baked in to the
-          // returned value (matches QE's tab_qrad convention).
-          std::array<double, 3> Kv{Gx, Gy, Gz};
+          utils::check(ij_packed < Qfac.extent(1),
+              "build_paw_aug: ij_packed {} >= Qfac dim {} (nt={}, I={}, J={})",
+              ij_packed, Qfac.extent(1), nt, I, J);
           ComplexType q_val =
-              evaluate_Q_IJ_at_K_fast(sp, aatab, qtab, I, J, Kv, Omega, Kmag);
+              evaluate_Q_IJ_at_K_fast(sp, aatab, qtab, I, J, Kmag, Yflat_g, Omega);
           Qfac(ia, ij_packed, g) = q_val * sf;
         }
       }
@@ -165,9 +181,9 @@ inline ComplexType evaluate_Q_IJ_at_K_fast(
     aainit_tables const& aatab,
     qrad_tab const& qtab,
     int ih, int jh,
-    std::array<double, 3> const& K_vec,
-    double omega_volume,
-    double Kmag)
+    double Kmag,
+    nda::array<double, 1> const& Yflat_qe,
+    double omega_volume)
 {
   if (sp.nhtolm.size() == 0 || sp.indv.size() == 0 || sp.lll.size() == 0) {
     return ComplexType(0.0);
@@ -179,30 +195,22 @@ inline ComplexType evaluate_Q_IJ_at_K_fast(
   int n1 = std::max(nb, mb), n2 = std::min(nb, mb);
   int ijv = (n1 * (n1 + 1)) / 2 + n2;
 
-  // Radial Bessel: prefer the precomputed table.
-  nda::array<double, 1> qradL;
+  // Radial Bessel: prefer the precomputed table. Use a thread-local scratch
+  // buffer for the interpolated qrad(L): this function is called ~nnr*nh^2
+  // times per augmentation build, so a per-call heap allocation here (plus the
+  // Ylm buffer) is what made the direct augmentation take hours. The
+  // allocation-free path mirrors ABINIT's precomputed-form-factor hot loop.
+  thread_local nda::array<double, 1> qradL;
   if (qtab.n_K > 0) {
-    qradL = qrad_interp_at_K(qtab, ijv, Kmag);
+    qrad_interp_at_K_into(qtab, ijv, Kmag, qradL);
   } else {
-    qradL = qrad_at_K(sp, ijv, Kmag);
+    qradL = qrad_at_K(sp, ijv, Kmag);   // rare fallback (no table)
   }
 
-  // Y_lp(K̂) in QE flat-LM order
-  int llx = aatab.llx;
-  nda::array<double, 1> Yflat_qe(llx);
-  Yflat_qe() = 0.0;
-  std::array<double, 3> dir;
-  if (Kmag > 1e-14) {
-    dir = {K_vec[0]/Kmag, K_vec[1]/Kmag, K_vec[2]/Kmag};
-  } else {
-    dir = {0.0, 0.0, 1.0};
-  }
-  int Lmax = 2*(aatab.lli - 1);
-  qe_real_ylm_flat(Lmax, dir, Yflat_qe);
-  if (Kmag <= 1e-14) {
-    for (int lp = 1; lp < llx; ++lp) Yflat_qe(lp) = 0.0;
-  }
-
+  // Y_lp(K̂) is precomputed once per g by the caller (build_paw_aug_pair_factor)
+  // and passed in as Yflat_qe — it depends only on the direction of K, not on
+  // (ih, jh), so hoisting it out of the I,J loop removes nh^2 redundant trig
+  // recursions per grid point.
   ComplexType qout(0.0, 0.0);
   int Lp1 = (int)qradL.extent(0);
   int npairs = aatab.lli * aatab.lli;
@@ -336,8 +344,14 @@ inline void v_x(utils::mpi_context_t<boost::mpi3::communicator,
       }
     }
   }
-  mpi.comm.all_reduce_in_place_n(psi_r_full.data(),
-                                  psi_r_full.size(),
+  // Reduce as a flat double buffer: the boost::mpi3 all_reduce for a
+  // std::complex<double> value type does not dispatch to native MPI_SUM and
+  // falls onto a serialized path that is glacial for the ~50-200 MB dense-grid
+  // psi_r_full array (fine for the small unit-test fixtures, catastrophic
+  // here). Reinterpreting as 2*N doubles forces the native reduction — this is
+  // the same trick used in methods/ERI/cholesky.icc.
+  mpi.comm.all_reduce_in_place_n(reinterpret_cast<double*>(psi_r_full.data()),
+                                  2 * psi_r_full.size(),
                                   std::plus<>{});
 
   // ---- Build Pskna at full BZ ----
@@ -363,31 +377,23 @@ inline void v_x(utils::mpi_context_t<boost::mpi3::communicator,
       atom_perm_inv, wigner_d, npol, mpi);
   auto Pfull = sPfull.local();  // (nspin, nk_full, npol*nkb, nbnd)
 
-  // ---- Build per-species qrad tables ----
-  // K_max bound: |G_max + Δk_max| on the dense FFT mesh.
-  // Conservative: use FFT-mesh corner Miller indices to bound G_max.
-  double Kmax_est = 0.0;
-  {
-    long NX = mesh(0), NY = mesh(1), NZ = mesh(2);
-    long Mx = NX/2, My = NY/2, Mz = NZ/2;
-    // ≤ 8 corners of the Miller box + Δk_max
-    double dkmax = 0.0;
-    for (long k1 = 0; k1 < nk; ++k1)
-      for (long k2 = 0; k2 < nk; ++k2) {
-        double dx = kpts(k1, 0) - kpts(k2, 0);
-        double dy = kpts(k1, 1) - kpts(k2, 1);
-        double dz = kpts(k1, 2) - kpts(k2, 2);
-        dkmax = std::max(dkmax, std::sqrt(dx*dx + dy*dy + dz*dz));
-      }
-    double gmaxx = std::abs(Mx*recv(0,0)) + std::abs(My*recv(1,0)) +
-                   std::abs(Mz*recv(2,0));
-    double gmaxy = std::abs(Mx*recv(0,1)) + std::abs(My*recv(1,1)) +
-                   std::abs(Mz*recv(2,1));
-    double gmaxz = std::abs(Mx*recv(0,2)) + std::abs(My*recv(1,2)) +
-                   std::abs(Mz*recv(2,2));
-    double gmax = std::sqrt(gmaxx*gmaxx + gmaxy*gmaxy + gmaxz*gmaxz);
-    Kmax_est = gmax + dkmax + 0.1;
+  // ---- G-sphere cutoff for the augmentation (physical bound) ----
+  // Gcut = largest sphere fully inside the dense FFT box = min over reciprocal
+  // axes of M_i·|b_i| (distance to the nearest box face-center). Beyond Gcut the
+  // grid holds only the anisotropic box corners (|G| up to ~2× Gcut), where the
+  // smooth pair density is ~0 and the on-site AE−PS contribution is
+  // Coulomb-negligible. We therefore (i) build the qrad Bessel table only up to
+  // Gcut (was: abs-sum of the corners, ~2× larger → ~5-8× more K-points), and
+  // (ii) skip |G+Δk| > Gcut in build_paw_aug_pair_factor. This mirrors ABINIT's
+  // ecutsigx-bounded G-sphere and is what makes the direct exchange tractable.
+  double Gcut = 1e30;
+  for (int i = 0; i < 3; ++i) {
+    long Mi = mesh(i) / 2;
+    double brow = std::sqrt(recv(i,0)*recv(i,0) + recv(i,1)*recv(i,1)
+                          + recv(i,2)*recv(i,2));
+    Gcut = std::min(Gcut, (double)Mi * brow);
   }
+  double Kmax_est = Gcut + 0.1;
   std::vector<qrad_tab> qtab_sp(sps.size());
   // lli for aatab: max l across all projectors (across all species) + 1.
   // Q^IJ angular content goes up to 2*lmax_proj.
@@ -398,9 +404,12 @@ inline void v_x(utils::mpi_context_t<boost::mpi3::communicator,
       // Option A (shape_restored): PAW species use the full AE−PS pair-density
       // form factor (drops the separate deltaC one-center correction below);
       // USPP always uses the compensation charge.
+      // dq=0.05: the radial form factor is smooth in |K| (features on scale
+      // ~pi a.u.), so a 5x-coarser table than the 0.01 default is amply accurate
+      // under the 4-point cubic interpolation and cuts the sph_bessel table cost.
       qtab_sp[nt] = (shape_restored && sps[nt].is_paw)
-                      ? build_qrad_tab_full_aeps(sps[nt], Kmax_est)
-                      : build_qrad_tab(sps[nt], Kmax_est);
+                      ? build_qrad_tab_full_aeps(sps[nt], Kmax_est, 0.05, psp.aug_lmax())
+                      : build_qrad_tab(sps[nt], Kmax_est, 0.05, psp.aug_lmax());
   }
 
   // ---- nij_max per species (for Qfac packing) ----
@@ -438,7 +447,7 @@ inline void v_x(utils::mpi_context_t<boost::mpi3::communicator,
 
         // Precompute Q^IJ_atm(G+Δk) × e^{-i(G+Δk)·τ_atm} once for this (k_p, k_q)
         build_paw_aug_pair_factor(psp, aatab, qtab_sp, mesh, recv, Omega,
-                                  kpts(k_p_ibz, all), kpts(kq, all), Qfac);
+                                  kpts(k_p_ibz, all), kpts(kq, all), Gcut, Qfac);
 
         for (long n = 0; n < nbnd; ++n) {
           double f = std::real(nii_host(s, kq_ibz, n));
@@ -491,14 +500,18 @@ inline void v_x(utils::mpi_context_t<boost::mpi3::communicator,
           }
 
           // ---- Contract K_{ij} += scl × f × Σ_g v_C(g) × pair*(i, g) × pair(j, g) ----
-          for (long i = 0; i < nbnd; ++i) {
-            for (long j = 0; j < nbnd; ++j) {
+          // The Kij band dimensions (2,3) may be distributed over the process
+          // grid, so K_sk holds only the LOCAL band block. Iterate the local
+          // band ranges for the K_sk indices (i_l, j_l) while using the GLOBAL
+          // band index (i, j) into pair_buf, which holds all bands.
+          for (auto [i_l, i] : itertools::enumerate(Kij.local_range(2))) {
+            for (auto [j_l, j] : itertools::enumerate(Kij.local_range(3))) {
               ComplexType acc(0.0);
               for (long g = 0; g < nnr; ++g)
                 acc += v_coul(g) *
                        std::conj(pair_buf(i, g)) *
                        pair_buf(j, g);
-              K_sk(i, j) += scl * ComplexType(f, 0.0) * acc;
+              K_sk(i_l, j_l) += scl * ComplexType(f, 0.0) * acc;
             }
           }
         }
@@ -583,8 +596,10 @@ inline void v_x(utils::mpi_context_t<boost::mpi3::communicator,
               }
 
             // Accumulate K_ij += scl_oc · f · Σ_{IL} P*_i,aI(k_p) × U(I,L) × P_j,aL(k_p)
-            for (long i = 0; i < nbnd; ++i) {
-              for (long j = 0; j < nbnd; ++j) {
+            // Global band index (i, j) for Pfull; local index (i_l, j_l) for the
+            // (possibly band-distributed) K_sk block.
+            for (auto [i_l, i] : itertools::enumerate(Kij.local_range(2))) {
+              for (auto [j_l, j] : itertools::enumerate(Kij.local_range(3))) {
                 ComplexType acc(0.0);
                 for (int I = 0; I < nh_a; ++I) {
                   ComplexType PiI = std::conj(Pfull(s, k_p_ibz, p0 + I, i));
@@ -593,7 +608,7 @@ inline void v_x(utils::mpi_context_t<boost::mpi3::communicator,
                     acc += PiI * U(I, L) * PjL;
                   }
                 }
-                K_sk(i, j) += scl_oc * ComplexType(f, 0.0) * acc;
+                K_sk(i_l, j_l) += scl_oc * ComplexType(f, 0.0) * acc;
               }
             }
           }
@@ -704,7 +719,9 @@ inline void v_x(utils::mpi_context_t<boost::mpi3::communicator,
       }
     }
   }
-  mpi.comm.all_reduce_in_place_n(psi_r_full.data(), psi_r_full.size(), std::plus<>{});
+  // Flat-double reduction to force native MPI_SUM (see the nii overload above).
+  mpi.comm.all_reduce_in_place_n(reinterpret_cast<double*>(psi_r_full.data()),
+                                  2 * psi_r_full.size(), std::plus<>{});
 
   // ---- Canonical projectors at full BZ (outer index source) ----
   auto const& ityp = psp.ityp_view();
@@ -726,30 +743,26 @@ inline void v_x(utils::mpi_context_t<boost::mpi3::communicator,
   auto Pfull = sPfull.local();  // (nspin, nk, npol*nkb, nbnd)
   long nkb = Pfull.extent(2);
 
-  // ---- qrad tables (same bound as the diagonal kernel) ----
-  double Kmax_est = 0.0;
-  {
-    long NX = mesh(0), NY = mesh(1), NZ = mesh(2);
-    long Mx = NX/2, My = NY/2, Mz = NZ/2;
-    double dkmax = 0.0;
-    for (long k1 = 0; k1 < nk; ++k1)
-      for (long k2 = 0; k2 < nk; ++k2) {
-        double dx = kpts(k1,0)-kpts(k2,0), dy = kpts(k1,1)-kpts(k2,1), dz = kpts(k1,2)-kpts(k2,2);
-        dkmax = std::max(dkmax, std::sqrt(dx*dx + dy*dy + dz*dz));
-      }
-    double gx = std::abs(Mx*recv(0,0))+std::abs(My*recv(1,0))+std::abs(Mz*recv(2,0));
-    double gy = std::abs(Mx*recv(0,1))+std::abs(My*recv(1,1))+std::abs(Mz*recv(2,1));
-    double gz = std::abs(Mx*recv(0,2))+std::abs(My*recv(1,2))+std::abs(Mz*recv(2,2));
-    Kmax_est = std::sqrt(gx*gx + gy*gy + gz*gz) + dkmax + 0.1;
+  // ---- G-sphere cutoff + qrad tables (same bound as the diagonal kernel) ----
+  // Gcut = largest sphere inside the dense FFT box (min_i M_i·|b_i|); the qrad
+  // table is built only up to Gcut and build_paw_aug_pair_factor skips
+  // |G+Δk| > Gcut. See the diagonal (nii) kernel for the rationale.
+  double Gcut = 1e30;
+  for (int i = 0; i < 3; ++i) {
+    long Mi = mesh(i) / 2;
+    double brow = std::sqrt(recv(i,0)*recv(i,0) + recv(i,1)*recv(i,1)
+                          + recv(i,2)*recv(i,2));
+    Gcut = std::min(Gcut, (double)Mi * brow);
   }
+  double Kmax_est = Gcut + 0.1;
   std::vector<qrad_tab> qtab_sp(sps.size());
   int lli_aat = lmax_proj + 1;
   auto aatab = aainit_tables_build(lli_aat);
   for (size_t nt = 0; nt < sps.size(); ++nt)
     if (sps[nt].is_paw || sps[nt].is_uspp)
       qtab_sp[nt] = (shape_restored && sps[nt].is_paw)
-                      ? build_qrad_tab_full_aeps(sps[nt], Kmax_est)
-                      : build_qrad_tab(sps[nt], Kmax_est);
+                      ? build_qrad_tab_full_aeps(sps[nt], Kmax_est, 0.05, psp.aug_lmax())
+                      : build_qrad_tab(sps[nt], Kmax_est, 0.05, psp.aug_lmax());
 
   long nij_max = 0;
   for (size_t nt = 0; nt < sps.size(); ++nt)
@@ -800,7 +813,7 @@ inline void v_x(utils::mpi_context_t<boost::mpi3::communicator,
                             nda::stack_array<double,3,3>{}, recv,
                             kpts(k_p_ibz, all), kpts(kq, all));
         build_paw_aug_pair_factor(psp, aatab, qtab_sp, mesh, recv, Omega,
-                                  kpts(k_p_ibz, all), kpts(kq, all), Qfac);
+                                  kpts(k_p_ibz, all), kpts(kq, all), Gcut, Qfac);
 
         for (long p = 0; p < nbnd; ++p) {
           double w = w_all(s, kq, p);
@@ -837,12 +850,14 @@ inline void v_x(utils::mpi_context_t<boost::mpi3::communicator,
             }
           }
 
-          for (long i = 0; i < nbnd; ++i)
-            for (long j = 0; j < nbnd; ++j) {
+          // Global band index (i, j) into pair_buf; local index into the
+          // (possibly band-distributed) K_sk block.
+          for (auto [i_l, i] : itertools::enumerate(Kij.local_range(2)))
+            for (auto [j_l, j] : itertools::enumerate(Kij.local_range(3))) {
               ComplexType acc(0.0);
               for (long g = 0; g < nnr; ++g)
                 acc += v_coul(g) * std::conj(pair_buf(i, g)) * pair_buf(j, g);
-              K_sk(i, j) += scl * ComplexType(w, 0.0) * acc;
+              K_sk(i_l, j_l) += scl * ComplexType(w, 0.0) * acc;
             }
         }
       }
@@ -887,8 +902,8 @@ inline void v_x(utils::mpi_context_t<boost::mpi3::communicator,
                 }
                 U2(I, L) = acc;
               }
-            for (long i = 0; i < nbnd; ++i)
-              for (long j = 0; j < nbnd; ++j) {
+            for (auto [i_l, i] : itertools::enumerate(Kij.local_range(2)))
+              for (auto [j_l, j] : itertools::enumerate(Kij.local_range(3))) {
                 ComplexType acc(0.0);
                 for (int I = 0; I < nh_a; ++I) {
                   ComplexType PiI = std::conj(Pfull(s, k_p_ibz, p0 + I, i));
@@ -897,7 +912,7 @@ inline void v_x(utils::mpi_context_t<boost::mpi3::communicator,
                     acc += PiI * U2(I, L) * PjL;
                   }
                 }
-                K_sk(i, j) += scl_oc * ComplexType(w, 0.0) * acc;
+                K_sk(i_l, j_l) += scl_oc * ComplexType(w, 0.0) * acc;
               }
           }
         }
