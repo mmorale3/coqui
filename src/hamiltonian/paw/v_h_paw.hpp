@@ -120,11 +120,16 @@ inline nda::array<double,3> compute_becsum_diagonal(
  * that merely seed it. Like the diagonal helper this assumes uniform k-weights
  * (nosym / full-BZ); a symmetry-reduced IBZ would need real per-k weights.
  *
- * Returns a real-valued (nat, nhm, nhm) for non-magnetic; the imaginary
- * residue from the unitary symmetry of n is dropped (warned if exceeds
- * a threshold). Same npol=1 restriction as the diagonal helper. The spin
- * factor ns_scl is NOT applied here (callers apply it, mirroring
- * compute_becsum_diagonal).
+ * Returns a real-valued (nat, nhm, nhm): the Hermitian pair symmetrization
+ * becsum_IJ ← ½(becsum_IJ + becsum_JI^*). For an exactly Hermitian nij the
+ * anti-Hermitian residual is zero (acc_JI^* == acc_IJ analytically); a large
+ * residual means the INPUT density matrix violates its Hermiticity contract,
+ * so it is a hard error, not a warning. The antisymmetric imaginary part of
+ * the Hermitian becsum (Im ⟨p_I|γ|p_J⟩) is genuine but contracts to zero
+ * against the I↔J-symmetric real Q_IJ(G) and radial-Hartree kernels, so the
+ * stored real part is the exact effective becsum for every consumer. Same
+ * npol=1 restriction as the diagonal helper. The spin factor ns_scl is NOT
+ * applied here (callers apply it, mirroring compute_becsum_diagonal).
  */
 template<typename Pskna_t, typename nij_t>
 inline nda::array<double,3> compute_becsum_full(
@@ -146,21 +151,21 @@ inline nda::array<double,3> compute_becsum_full(
     if (Pskna.size() == 0 || nbnd == 0) return becsum;
     // Uniform k-weight (matches compute_becsum_diagonal / the smooth density).
     double wk = 1.0 / (double)nk;
-    double max_imag = 0.0;
+    double max_resid = 0.0;
+    nda::array<ComplexType,2> acc_c(nhm, nhm);
     for (long ia=0; ia<nat; ++ia) {
         int nt = ityp(ia);
         int nh_a = nh(nt);
         if (nh_a == 0) continue;
         long p0 = ofs(ia);
+        acc_c() = ComplexType(0.0);
         for (int I=0; I<nh_a; ++I)
         for (int J=0; J<nh_a; ++J) {
             // becsum_IJ = ⟨p_I|γ|p_J⟩ = Σ_ab ⟨p_I|ψ_a⟩ nij_ab ⟨ψ_b|p_J⟩
             //           = Σ_ab P_Ia · nij_ab · conj(P_Jb),   P_Ia = ⟨p_I|ψ_a⟩,
             // matching the convention γ = Σ_ab nij_ab |ψ_a⟩⟨ψ_b| used by the
             // SCF density matrix, the smooth-grid Hartree, and the THC Fock
-            // build. For real / diagonal nij this equals the conjugate form;
-            // it only fixes the imaginary off-diagonal of a complex Hermitian
-            // density matrix (see test thc_vs_direct_nij).
+            // build.
             ComplexType acc(0.0);
             for (long s=0; s<nspin; ++s)
             for (long k=0; k<nk; ++k)
@@ -170,18 +175,25 @@ inline nda::array<double,3> compute_becsum_full(
                        nij(s, k, a, b) *
                        std::conj(Pskna(s, k, p0 + J, b));
             }
-            becsum(ia, I, J) = wk * std::real(acc);
-            max_imag = std::max(max_imag, wk * std::abs(std::imag(acc)));
+            acc_c(I, J) = wk * acc;
+        }
+        // Hermitian pair symmetrization (plan A3): becsum_IJ ← ½(b_IJ + b_JI^*).
+        // Re of the Hermitian part is exact for all consumers (the antisym-
+        // metric Im part is inert against symmetric real kernels, see doc);
+        // the anti-Hermitian residual measures Hermiticity violation of the
+        // input nij and is hard-checked below.
+        for (int I=0; I<nh_a; ++I)
+        for (int J=0; J<nh_a; ++J) {
+            max_resid = std::max(max_resid,
+                0.5 * std::abs(acc_c(I, J) - std::conj(acc_c(J, I))));
+            becsum(ia, I, J) =
+                0.5 * (std::real(acc_c(I, J)) + std::real(acc_c(J, I)));
         }
     }
-    if (max_imag > 1e-8) {
-        // For magnetic / off-diagonal density matrices that aren't Hermitian
-        // becsum can carry a real-valued imaginary residue that we drop.
-        // Surface a warning rather than fail — useful diagnostic in tests.
-        app_log(2,
-            "compute_becsum_full: dropped imaginary part up to {} in becsum",
-            max_imag);
-    }
+    utils::check(max_resid <= 1e-8,
+        "compute_becsum_full: anti-Hermitian becsum residual {} > 1e-8 — the "
+        "input density matrix nij violates its Hermiticity contract "
+        "(nij(s,k,a,b) must equal conj(nij(s,k,b,a))).", max_resid);
     return becsum;
 }
 
@@ -291,18 +303,9 @@ inline nda::array<double,3> compute_becsum_diagonal_symm(
     nda::stack_array<double,3,3> const& recv,
     std::vector<utils::symm_op> const& symm_list, int npol)
 {
-    auto const& ityp = psp.ityp_view();
-    auto const& sps  = psp.paw_species_view();
-    auto atom_perm_inv = build_atom_permutation_inverse(
-        psp.atom_pos_cart_view(), ityp, lattv, recv, symm_list);
-    int lmax_proj = 0;
-    for (long nt = 0; nt < (long)sps.size(); ++nt)
-        for (long b = 0; b < sps[nt].lll.extent(0); ++b)
-            lmax_proj = std::max(lmax_proj, (int)sps[nt].lll(b));
-    auto wigner_d = build_wigner_d_real(symm_list, lattv, lmax_proj);
     auto sPfull = compute_Pskna_full_bz(
-        psp, kp_to_ibz, kp_symm, kp_trev, kpts, symm_list,
-        atom_perm_inv, wigner_d, npol, mpi);
+        psp, kp_to_ibz, kp_symm, kp_trev, kpts, lattv, recv, symm_list,
+        npol, mpi);
     auto Pfull = sPfull.local();   // (nspin, nk_full, npol*nkb, nbnd)
 
     long nspin   = nii.extent(0);
@@ -314,8 +317,57 @@ inline nda::array<double,3> compute_becsum_diagonal_symm(
             for (long n = 0; n < nbnd; ++n)
                 nii_full(s, K, n) = nii(s, (long)kp_to_ibz(K), n);
 
-    return compute_becsum_diagonal(Pfull, nii_full, ityp,
+    return compute_becsum_diagonal(Pfull, nii_full, psp.ityp_view(),
                                    psp.nh_view(), psp.ofs_view(), npol);
+}
+
+/**
+ * Full-BZ becsum from a full density matrix — symmetry-correct (plan A3).
+ *
+ * View-2: the full-BZ states are the exactly rotated IBZ states in G-space,
+ * ψ_{K,n} = R ψ_{k_ibz,n}, so γ_K = R γ_{k_ibz} R⁻¹ contracts the SAME
+ * IBZ band-space matrix nij(s,k_ibz,·,·) against the lifted projectors
+ * (compute_Pskna_full_bz; immune to band-truncation since no band-space
+ * rotation is involved). At time-reversal points ψ_K = (Rψ)^*, hence
+ * γ_K = Σ_ab ψ_{K,a} n^*_ab ψ†_{K,b}: the band matrix is complex-conjugated
+ * (a no-op for the real diagonal case, matching compute_becsum_diagonal_symm).
+ * The per-atom Bloch phase of the lift cancels between P(I,·) and
+ * conj(P(J,·)) on the same atom, so becsum is lift-gauge-invariant. For
+ * nosym (IBZ == full BZ, identity symm) this reduces to compute_becsum_full
+ * unchanged.
+ */
+template<class MPI_t, typename nij_t, typename kti_t, typename ktr_t,
+         typename ksy_t, typename kp_t>
+inline nda::array<double,3> compute_becsum_full_symm(
+    MPI_t& mpi, pseudopot const& psp, nij_t const& nij,
+    kti_t const& kp_to_ibz, ktr_t const& kp_trev, ksy_t const& kp_symm,
+    kp_t const& kpts,
+    nda::stack_array<double,3,3> const& lattv,
+    nda::stack_array<double,3,3> const& recv,
+    std::vector<utils::symm_op> const& symm_list, int npol)
+{
+    auto sPfull = compute_Pskna_full_bz(
+        psp, kp_to_ibz, kp_symm, kp_trev, kpts, lattv, recv, symm_list,
+        npol, mpi);
+    auto Pfull = sPfull.local();   // (nspin, nk_full, npol*nkb, nbnd)
+
+    long nspin   = nij.extent(0);
+    long nk_full = (long)kp_to_ibz.extent(0);
+    long nbnd    = nij.extent(2);
+    nda::array<ComplexType,4> nij_full(nspin, nk_full, nbnd, nbnd);
+    for (long s = 0; s < nspin; ++s)
+        for (long K = 0; K < nk_full; ++K) {
+            long k_ibz = (long)kp_to_ibz(K);
+            bool trev  = (bool)kp_trev(K);
+            for (long a = 0; a < nbnd; ++a)
+                for (long b = 0; b < nbnd; ++b)
+                    nij_full(s, K, a, b) = trev
+                        ? std::conj(nij(s, k_ibz, a, b))
+                        : nij(s, k_ibz, a, b);
+        }
+
+    return compute_becsum_full(Pfull, nij_full, psp.ityp_view(),
+                               psp.nh_view(), psp.ofs_view(), npol);
 }
 
 } // namespace hamilt::paw
@@ -398,9 +450,11 @@ void v_h(utils::mpi_context_t<boost::mpi3::communicator,
 {
     nda::array<ComplexType,1> rho_aug_r;
     if (psp.pp_type() != pp_ncpp_t) {
-      auto becsum = ::hamilt::paw::compute_becsum_full(
-          psp.Pskna_view(), nij, psp.ityp_view(), psp.nh_view(),
-          psp.ofs_view(), npol);
+      // Full-BZ becsum (symmetry-correct, plan A3) — same lift as the
+      // diagonal overload; reduces to the plain IBZ sum for nosym.
+      auto becsum = ::hamilt::paw::compute_becsum_full_symm(
+          mpi, psp, nij, kp_to_ibz, kp_trev, kp_symm, kpts,
+          lattv, recv, symm_list, npol);
       rho_aug_r = ::hamilt::paw::compute_rho_aug_density_r(
           mpi, psp, becsum, mesh, recv, (long)kp_to_ibz.shape(0));
     }

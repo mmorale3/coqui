@@ -435,8 +435,10 @@ nda::array<ComplexType,3> pseudopot::compute_paw_deeq(
 {
     long nspin = nij.extent(0);
     double ns_scl = (nspin == 1 && npol == 1) ? 2.0 : 1.0;
-    auto becsum = hamilt::paw::compute_becsum_full(
-        Pskna_view(), nij, ityp, nh, ofs, npol);
+    // Full-BZ becsum (symmetry-correct, plan A3) — mirrors the nii overload.
+    auto becsum = hamilt::paw::compute_becsum_full_symm(
+        *mpi, *this, nij, kp_to_ibz, kp_trev, kp_symm, kpts,
+        lattv, recv, symm_list, npol);
     for (long ia = 0; ia < becsum.extent(0); ++ia)
       for (long I = 0; I < becsum.extent(1); ++I)
         for (long J = 0; J < becsum.extent(2); ++J)

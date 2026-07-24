@@ -10,14 +10,34 @@ printed into context at session start by a SessionStart hook).
 
 ## STATUS
 
-Last updated: 2026-07-24 — A2 done. A2 notes: nij add_Vpp now builds the same
+Last updated: 2026-07-24 — A3 done. A3 notes: compute_becsum_full_symm added
+(v_h_paw.hpp) — full-BZ Pskna lift shared with the diagonal route via a new
+compute_Pskna_full_bz(psp, …, lattv, recv, symm_list, …) convenience overload
+in paw_symmetry.hpp (builds atom-perm + Wigner-D internally; caching = A4);
+same IBZ band matrix at rotated points, complex-CONJUGATED at trev points
+(γ_K = Σ ψ_K n* ψ_K† under time reversal). compute_becsum_full now does
+Hermitian pair symmetrization ½(b_IJ+b*_JI) storing Re (exact for all
+consumers: the antisymmetric Im part is inert against symmetric real Q/radial
+kernels) with a HARD check on the anti-Hermitian residual ≤1e-8 (input-nij
+Hermiticity contract; old warn-and-drop removed). Rerouted: v_h(nij) +
+compute_paw_deeq(nij) (→ compute_deeq_scf transitively); A2 nosym guard in
+add_vpp_impl removed. v_x_paw(nij) guard intentionally KEPT — its full-BZ
+need is the exchange kernel itself (band-space NO route), not becsum.
+Tests: new TEST_CASE becsum_full_symm (diag-nij≡diagonal on sym meshes
+~1e-15; nosym reduction ≡ plain, exact incl. complex Hermitian nij);
+vhartree_nij_vs_nii + add_vpp_i5_alignment extended with qe_lih222_paw_sym /
+qe_si222_paw_sym sections (nk_ibz=3 of 8; H(nij)≡H(nii) ≤4.5e-14). GAP: no
+USPP/PAW fixture populates kp_trev (0 trev points on all), so the trev conj
+branch is unexercised — needs an A-tests fixture (e.g. PAW analogue of
+lih223_inv). Fast suite green, 13479 assertions / 33 cases.
+A2 notes (kept): nij add_Vpp now builds the same
 native compute_paw_deeq(n, V_loc+V_H, include_static=true) as nii (F2 closed;
 H(nij)≡H(nii) at ≤1e-15 on NCPP/USPP/PAW LiH _hf fixtures, new TEST_CASE
 add_vpp_i5_alignment); add_hartree/add_exchange bools threaded through
 add_vpp_impl → public add_Vpp → gen_H0 → hamilt::H (defaults true/false keep
 all callers unchanged; flags-off ≡ H0 bit-identical; add_exchange ≡ H+K at
-1e-15, host-only, device aborts). nij USPP/PAW guarded nkpts_ibz==nkpts until
-A3. Missing qq_nt / augmentation_function_isp* / Hamiltonian/Species now hard
+1e-15, host-only, device aborts). Missing qq_nt / augmentation_function_isp*
+/ Hamiltonian/Species now hard
 errors naming the converter rerun (part of A5 done early). SCF-driver audit
 clean: simple_dyson/scf_driver/qp_scf_common/downfold_1e/pproc all take H0 via
 no-density set_H0 (static-only) + ERI J/K — no double-count/omission, and the
@@ -41,7 +61,7 @@ Workstream A — pseudopot D-matrix refactor
 - [x] A0 stabilize working tree (4 coherent commits; .swp gone; .DS_Store gitignored) — 2026-07-24
 - [x] A1 two-tensor model: Dnn_atom_static = dion + ex_cvij (eager, ctor); remove QE deeq read; compute_deeq_scf stops mutating (thin wrapper, returns by value; non-mutation REQUIREd in test) — 2026-07-24
 - [x] A2 align add_vpp paths with I5: no-density = static-only; nii/nij identical native build; add_hartree/add_exchange bools — 2026-07-24
-- [ ] A3 symmetry-correct nij becsum (full-BZ lift) + Hermitian pair symmetrization + nosym guards until it lands
+- [x] A3 symmetry-correct nij becsum (full-BZ lift via compute_becsum_full_symm) + Hermitian pair symmetrization w/ hard residual check; add_vpp nosym guard removed (v_x(nij) guard kept, different scope) — 2026-07-24
 - [ ] A4 hoist per-call statics (aainit, qrad dq=0.01, Pskna lift, Δk-keyed Qfac); parallelize ∫V·Q loop
 - [ ] A5 provenance checks at read time (hard errors, no silent fallbacks) — partial via A2: qq_nt/aug-Q(G)/Species-group missing now hard errors; remaining: dion Hermiticity+scale, proj_per_atom length, required-dataset sweep
 - [ ] A-tests: nii≡nij≡no-density+Hartree; sym≡nosym; ex_cvij factor-1 e_1e; QE-eigenvalue diagnostic

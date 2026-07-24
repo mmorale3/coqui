@@ -1192,16 +1192,6 @@ void pseudopot::add_vpp_impl(boost::mpi3::communicator& comm,
                 "Error in pseudo::add_vpp_impl: Both nii and nij!!");
   utils::check( have_density or not add_exchange,
                 "pseudo::add_vpp_impl: add_exchange requires a density (nii or nij).");
-  // Plan A3 pending: every nij becsum consumer (v_h augmentation,
-  // compute_paw_deeq, v_x) uses IBZ k-weights and is only correct without
-  // symmetry reduction. Enforce nosym rather than be silently wrong.
-  if( nij != nullptr and ptype != pp_ncpp_t and (add_hartree or add_exchange) )
-    utils::check(nkpts_ibz == nkpts,
-                 "pseudo::add_vpp_impl(nij): USPP/PAW on a symmetry-reduced "
-                 "k-mesh is not supported until the full-BZ becsum lands "
-                 "(plan A3). Re-run without symmetry (nk_ibz={} nk={}).",
-                 nkpts_ibz, nkpts);
-
   if( have_density and add_hartree ) {
 
     auto mpi_local_context = utils::make_mpi_context(comm);
@@ -1255,8 +1245,8 @@ void pseudopot::add_vpp_impl(boost::mpi3::communicator& comm,
     // no occupation/N_k is folded into the channel. Built only on PAW/USPP;
     // NCPP takes the species-resolved static Dnn (its Hartree is purely the
     // smooth vr applied above). nii and nij produce the identical operator
-    // for the same physical density (plan I5); the nij becsum is nosym-only
-    // until plan A3 (guard above).
+    // for the same physical density (plan I5), both via the full-BZ
+    // symmetry-correct becsum (plan A3).
     if (ptype != pp_ncpp_t) {
       sarray_t<nda::array_view<ComplexType,1>> svfull(mpi_local_context,{nnr_aug});
       auto vfull = svfull.local();
@@ -1472,9 +1462,10 @@ void pseudopot::add_Hartree_impl(nda::range k_range, nda::range b_range,
       auto Dion_H = compute_paw_deeq(*nii, v_hartree, /*include_static=*/false);
       add_vnl_impl(k_range, b_range, Dion_H, Vij);
     } else if (nij != nullptr) {
-      // Full density-matrix path: becsum via compute_becsum_full (now folds the
-      // 1/N_k k-weight), so the one-center radial Hartree matches the smooth
-      // compensation charge that hamilt::v_h(*nij,...) already added above.
+      // Full density-matrix path: becsum via compute_becsum_full_symm
+      // (full-BZ lift, 1/N_k k-weight), so the one-center radial Hartree
+      // matches the smooth compensation charge that hamilt::v_h(*nij,...)
+      // already added above — also on symmetry-reduced meshes (plan A3).
       auto Dion_H = compute_paw_deeq(*nij, v_hartree, /*include_static=*/false);
       add_vnl_impl(k_range, b_range, Dion_H, Vij);
     }

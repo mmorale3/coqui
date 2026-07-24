@@ -2372,11 +2372,150 @@ TEST_CASE("vhartree_nij_vs_nii", "[hamilt][paw][hf]")
         mf::default_MF(mpi, "qe_lih222_paw_hf", mf::h5_input_type));
     test_vhartree_nij_vs_nii<HOST_MEMORY>(*mpi, mf_ptr, 1e-10);
   }
+  // Symmetry-reduced meshes (plan A3): the nij route now lifts becsum to the
+  // full BZ (compute_becsum_full_symm) exactly like the nii route.
+  SECTION("lih_kp222_nbnd16 (PAW, sym)") {
+    auto mf_ptr = std::make_shared<mf::MF>(
+        mf::default_MF(mpi, "qe_lih222_paw_sym", mf::h5_input_type));
+    test_vhartree_nij_vs_nii<HOST_MEMORY>(*mpi, mf_ptr, 1e-10);
+  }
+  SECTION("si_kp222 (PAW, sym)") {
+    auto mf_ptr = std::make_shared<mf::MF>(
+        mf::default_MF(mpi, "qe_si222_paw_sym", mf::h5_input_type));
+    test_vhartree_nij_vs_nii<HOST_MEMORY>(*mpi, mf_ptr, 1e-10);
+  }
 }
 
 // ===========================================================================
-// add_Vpp path alignment (plan A2 / invariant I5), all on nosym fixtures
-// (the nij becsum is nosym-only until plan A3):
+// becsum_full_symm identities (plan A3):
+//  (1) For a diagonal density matrix on a symmetry-reduced mesh,
+//      compute_becsum_full_symm ≡ compute_becsum_diagonal_symm (both consume
+//      the same full-BZ Pskna lift; pure summation-order difference).
+//  (2) On a nosym mesh (IBZ == full BZ, identity lift), full_symm reduces to
+//      the plain compute_becsum_full — including for a complex Hermitian nij
+//      with off-diagonal entries.
+//  (3) A complex Hermitian nij passes the anti-Hermitian residual hard check
+//      (Hermitian pair symmetrization) on the symmetry-reduced mesh.
+// NOTE: no USPP/PAW fixture populates kp_trev (LiH/Si meshes are covered by
+// rotations alone), so the trev conjugation branch of the nij lift is not
+// exercised here — flagged for plan A-tests fixture work.
+// ===========================================================================
+void test_becsum_full_symm(mpi_context_t& mpi,
+                           std::shared_ptr<mf::MF> mf_ptr, bool sym_reduced)
+{
+  auto& mfobj = *mf_ptr;
+  long nspin  = mfobj.nspin();
+  long nk_ibz = mfobj.nkpts_ibz();
+  long nbnd   = mfobj.nbnd();
+  int  npol   = (int)mfobj.npol();
+  if (sym_reduced) REQUIRE(mfobj.nkpts() > nk_ibz);
+  else             REQUIRE(mfobj.nkpts() == nk_ibz);
+
+  hamilt::pseudopot V(mfobj);
+  auto lattv     = mfobj.lattv();
+  auto recv      = mfobj.recv();
+  auto kpts      = mfobj.kpts();
+  auto kp_to_ibz = mfobj.kp_to_ibz();
+  auto kp_trev   = mfobj.kp_trev();
+  auto kp_symm   = mfobj.kp_symm();
+  auto symm_list = mfobj.symm_list();
+
+  long n_trev = 0;
+  for (long K = 0; K < kp_trev.extent(0); ++K) n_trev += (kp_trev(K) ? 1 : 0);
+  app_log(1, "[becsum_full_symm] nk={} nk_ibz={} trev points={}",
+          mfobj.nkpts(), nk_ibz, n_trev);
+
+  auto max_becsum_diff = [](nda::array<double,3> const& x,
+                            nda::array<double,3> const& y, double& maxval) {
+    double m = 0.0;
+    maxval = 0.0;
+    for (long ia = 0; ia < x.extent(0); ++ia)
+      for (long I = 0; I < x.extent(1); ++I)
+        for (long J = 0; J < x.extent(2); ++J) {
+          m = std::max(m, std::abs(y(ia,I,J) - x(ia,I,J)));
+          maxval = std::max(maxval, std::abs(x(ia,I,J)));
+        }
+    return m;
+  };
+
+  // ---- (1) diagonal density: nij route ≡ diagonal route (full-BZ lift). ----
+  nda::array<ComplexType,3> nii(nspin, nk_ibz, nbnd);
+  for (long s = 0; s < nspin; ++s)
+    for (long k = 0; k < nk_ibz; ++k)
+      for (long n = 0; n < nbnd; ++n)
+        nii(s, k, n) = ComplexType(0.5 + 0.3*std::cos(1.3*n + 0.7*k + 0.2*s), 0.0);
+  nda::array<ComplexType,4> nij(nspin, nk_ibz, nbnd, nbnd);
+  nij() = ComplexType(0.0);
+  for (long s = 0; s < nspin; ++s)
+    for (long k = 0; k < nk_ibz; ++k)
+      for (long n = 0; n < nbnd; ++n)
+        nij(s, k, n, n) = nii(s, k, n);
+
+  auto b_ref = hamilt::paw::compute_becsum_diagonal_symm(
+      mpi, V, nii, kp_to_ibz, kp_trev, kp_symm, kpts, lattv, recv,
+      symm_list, npol);
+  auto b_nij = hamilt::paw::compute_becsum_full_symm(
+      mpi, V, nij, kp_to_ibz, kp_trev, kp_symm, kpts, lattv, recv,
+      symm_list, npol);
+  double bmax = 0.0;
+  double d1 = max_becsum_diff(b_ref, b_nij, bmax);
+  app_log(1, "[becsum_full_symm] diag nij: max|Δbecsum| = {:.3e}, "
+             "max|becsum| = {:.3e}", d1, bmax);
+  REQUIRE(bmax > 1e-8);   // augmentation channels must be populated
+  CHECK(d1 < 1e-12);
+
+  // ---- (2)+(3) complex Hermitian nij: diag + rank-1 v v† perturbation. ----
+  for (long s = 0; s < nspin; ++s)
+    for (long k = 0; k < nk_ibz; ++k)
+      for (long a = 0; a < nbnd; ++a)
+        for (long b = 0; b < nbnd; ++b) {
+          ComplexType va = 0.2 * std::exp(ComplexType(0.0, 0.4*a + 0.1*k));
+          ComplexType vb = 0.2 * std::exp(ComplexType(0.0, 0.4*b + 0.1*k));
+          nij(s, k, a, b) += va * std::conj(vb);   // Hermitian by construction
+        }
+  // Runs the hard anti-Hermitian residual check internally (3).
+  auto b_herm = hamilt::paw::compute_becsum_full_symm(
+      mpi, V, nij, kp_to_ibz, kp_trev, kp_symm, kpts, lattv, recv,
+      symm_list, npol);
+  if (!sym_reduced) {
+    auto b_plain = hamilt::paw::compute_becsum_full(
+        V.Pskna_view(), nij, V.ityp_view(), V.nh_view(), V.ofs_view(), npol);
+    double d2 = max_becsum_diff(b_plain, b_herm, bmax);
+    app_log(1, "[becsum_full_symm] hermitian nij nosym reduction: "
+               "max|Δbecsum| = {:.3e}", d2);
+    CHECK(d2 < 1e-12);
+  }
+}
+
+TEST_CASE("becsum_full_symm", "[hamilt][paw][hf]")
+{
+  auto& mpi = utils::make_unit_test_mpi_context();
+  SECTION("lih_kp222_nbnd16 (PAW, sym)") {
+    auto mf_ptr = std::make_shared<mf::MF>(
+        mf::default_MF(mpi, "qe_lih222_paw_sym", mf::h5_input_type));
+    test_becsum_full_symm(*mpi, mf_ptr, /*sym_reduced=*/true);
+  }
+  SECTION("si_kp222 (PAW, sym)") {
+    auto mf_ptr = std::make_shared<mf::MF>(
+        mf::default_MF(mpi, "qe_si222_paw_sym", mf::h5_input_type));
+    test_becsum_full_symm(*mpi, mf_ptr, /*sym_reduced=*/true);
+  }
+  SECTION("lih_kp222_nbnd16 (PAW, nosym)") {
+    auto mf_ptr = std::make_shared<mf::MF>(
+        mf::default_MF(mpi, "qe_lih222_paw_hf", mf::h5_input_type));
+    test_becsum_full_symm(*mpi, mf_ptr, /*sym_reduced=*/false);
+  }
+  SECTION("lih_kp222_nbnd16 (USPP, nosym)") {
+    auto mf_ptr = std::make_shared<mf::MF>(
+        mf::default_MF(mpi, "qe_lih222_uspp_hf", mf::h5_input_type));
+    test_becsum_full_symm(*mpi, mf_ptr, /*sym_reduced=*/false);
+  }
+}
+
+// ===========================================================================
+// add_Vpp path alignment (plan A2 / invariant I5); since plan A3 the nij
+// becsum is symmetry-correct (full-BZ lift), so the identities are also
+// checked on symmetry-reduced fixtures:
 //  (1) H(nij) ≡ H(nii) for a diagonal density matrix — both overloads must
 //      build the identical operator via compute_paw_deeq(n, V_loc+V_H,
 //      include_static=true); pre-A2 the nij path silently fell through to
@@ -2395,7 +2534,6 @@ void test_add_vpp_i5_alignment(mpi_context_t& mpi,
   long nspin  = mfobj.nspin();
   long nk_ibz = mfobj.nkpts_ibz();
   long nbnd   = mfobj.nbnd();
-  REQUIRE(mfobj.nkpts() == nk_ibz);  // nosym fixture (plan A3 guard)
 
   // Non-QE diagonal occupation (nonzero on all bands) + equivalent nij.
   nda::array<ComplexType,3> nii(nspin, nk_ibz, nbnd);
@@ -2479,6 +2617,18 @@ TEST_CASE("add_vpp_i5_alignment", "[hamilt][paw][hf]")
   SECTION("lih_kp222_nbnd16 (PAW)") {
     auto mf_ptr = std::make_shared<mf::MF>(
         mf::default_MF(mpi, "qe_lih222_paw_hf", mf::h5_input_type));
+    test_add_vpp_i5_alignment<HOST_MEMORY>(*mpi, mf_ptr, 1e-10);
+  }
+  // Symmetry-reduced fixtures (plan A3): nii and nij must still build the
+  // identical operator, now both via the full-BZ symmetry-correct becsum.
+  SECTION("lih_kp222_nbnd16 (PAW, sym)") {
+    auto mf_ptr = std::make_shared<mf::MF>(
+        mf::default_MF(mpi, "qe_lih222_paw_sym", mf::h5_input_type));
+    test_add_vpp_i5_alignment<HOST_MEMORY>(*mpi, mf_ptr, 1e-10);
+  }
+  SECTION("si_kp222 (PAW, sym)") {
+    auto mf_ptr = std::make_shared<mf::MF>(
+        mf::default_MF(mpi, "qe_si222_paw_sym", mf::h5_input_type));
     test_add_vpp_i5_alignment<HOST_MEMORY>(*mpi, mf_ptr, 1e-10);
   }
 }

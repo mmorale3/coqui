@@ -386,6 +386,39 @@ compute_Pskna_full_bz(
     return Pkfull;
 }
 
+/**
+ * Convenience overload: builds the atom permutation and real Wigner-D tables
+ * from the pseudopot + lattice data before delegating to the base lift.
+ * Callers that need the tables for other contractions (v_x) keep using the
+ * explicit-table overload; becsum-style consumers use this one. Table caching
+ * on pseudopot is plan A4.
+ */
+template<class MPI_t>
+inline math::shm::shared_array<nda::array_view<ComplexType, 4>>
+compute_Pskna_full_bz(
+    pseudopot const& psp,
+    nda::ArrayOfRank<1> auto const& kp_to_ibz,
+    nda::ArrayOfRank<1> auto const& kp_symm,
+    nda::ArrayOfRank<1> auto const& kp_trev,
+    nda::ArrayOfRank<2> auto const& kpts_cart,
+    nda::stack_array<double,3,3> const& lattv,
+    nda::stack_array<double,3,3> const& recv,
+    std::vector<utils::symm_op> const& symm_list,
+    int npol,
+    MPI_t& mpi)
+{
+    auto const& sps = psp.paw_species_view();
+    auto atom_perm_inv = build_atom_permutation_inverse(
+        psp.atom_pos_cart_view(), psp.ityp_view(), lattv, recv, symm_list);
+    int lmax_proj = 0;
+    for (long nt = 0; nt < (long)sps.size(); ++nt)
+        for (long b = 0; b < sps[nt].lll.extent(0); ++b)
+            lmax_proj = std::max(lmax_proj, (int)sps[nt].lll(b));
+    auto wigner_d = build_wigner_d_real(symm_list, lattv, lmax_proj);
+    return compute_Pskna_full_bz(psp, kp_to_ibz, kp_symm, kp_trev, kpts_cart,
+                                 symm_list, atom_perm_inv, wigner_d, npol, mpi);
+}
+
 } // namespace hamilt::paw
 
 #endif // HAMILTONIAN_PAW_PAW_SYMMETRY_HPP
