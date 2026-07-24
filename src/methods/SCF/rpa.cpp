@@ -88,89 +88,15 @@ double rpa_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_
   app_log(2, "RPA energy:                {} a.u.", e_rpa);
   app_log(2, "Total energy:              {} a.u.\n", e_1e_new + e_hf_new + e_rpa);
 
-  // Diagnostic: split e_1e = Tr[Dm*H0] into the smooth kinetic energy Tr[Dm*T]
-  // and the remaining external/pseudopotential + one-center part, for
-  // component-by-component comparison against ABINIT (kinetic / local_psp / ...).
-  {
-    auto sT_skij = math::shm::make_shared_array<Array_view_4D_t>(
-        *mpi, {mf->nspin(), mf->nkpts_ibz(), mf->nbnd(), mf->nbnd()});
-    hamilt::set_kinetic(*mf, dyson.PSP(), sT_skij);
-    auto [e_kinetic, e_dummy] = eval_hf_energy(sDm_skij, sF_skij, sT_skij, k_weight, false);
-    app_log(2, "Kinetic energy:            {} a.u.", e_kinetic);
-    app_log(2, "External+1center energy:   {} a.u.\n", e_1e_new - e_kinetic);
-  }
-
-  // Diagnostic Hartree/Exchange split of the Fock energy (for code-vs-code
-  // comparison, e.g. ABINIT "New Exchange energy"). Note: this is the smooth +
-  // valence-valence one-center (K_a) exchange only; PAW core-valence exchange
-  // (ex_cvij) is frozen into H0 and therefore counted in the one-electron term.
+  // Exact-exchange energy alone (Fock exchange, no Hartree), reported for
+  // code-vs-code comparison (e.g. ABINIT with fock_icutcoul=3, bare Coulomb).
+  // Re-evaluates the Fock matrix with exchange only; sF_skij is unused past here.
   if (mb_solver.hf != nullptr) {
-    mb_solver.hf->evaluate(sF_skij, sDm_skij.local(), mb_eri.hf_eri->get(),
-                           dyson.sS_skij().local(), true, false);
-    mpi->comm.barrier();
-    auto [e1_h, e_hartree] = eval_hf_energy(sDm_skij, sF_skij, dyson.sH0_skij(), k_weight, false);
     mb_solver.hf->evaluate(sF_skij, sDm_skij.local(), mb_eri.hf_eri->get(),
                            dyson.sS_skij().local(), false, true);
     mpi->comm.barrier();
-    auto [e1_x, e_exchange] = eval_hf_energy(sDm_skij, sF_skij, dyson.sH0_skij(), k_weight, false);
-    app_log(2, "Hartree energy:            {} a.u.", e_hartree);
-    app_log(2, "Exchange energy (vv):      {} a.u.\n", e_exchange);
-    // Per-state exchange self-energy diag at k=0 (Gamma) in eV, for direct
-    // comparison with ABINIT's GW "SigX" column (vv-only; cv is in H0).
-    if (mpi->comm.root()) {
-      auto F = sF_skij.local();
-      int nb = std::min(10, (int)mf->nbnd());
-      app_log(2, "Per-state Sigma_x^vv at k=0 (eV):");
-      for (int n = 0; n < nb; ++n)
-        app_log(2, "   band {}: {:.4f}", n, F(0, 0, n, n).real() * 27.211386245988);
-      app_log(2, "");
-    }
-  }
-
-  // Diagnostic (env COQUI_VX_SHAPE_DIAG): direct-path exchange energy with the
-  // compensated augmentation vs. the shape-restored "Option A" augmentation
-  // (full AE−PS pair density, deltaC dropped). Compensated should approximately
-  // reproduce the THC "Exchange energy (vv)" above; shape-restored is the
-  // ABINIT-correct on-site exchange (Si a=10.20 bare: -1.7382 -> -1.6863 Ha).
-  // Occupations are thresholded to the KS-occupied bands (|occ|>0.5): the direct
-  // FFT exchange over all virtual bands is impractically slow and virtuals
-  // contribute negligibly to the exchange energy. E_x = 0.5*spin*Σ_k w_k Σ_n
-  // occ_n K(n,n) (diagonal density matrix). The full density-matrix (nij) path
-  // is validated separately by the hamiltonian unit tests (nij==nii to 1e-16).
-  if (std::getenv("COQUI_VX_SHAPE_DIAG") != nullptr) {
-    long ns = mf->nspin(), nk = mf->nkpts_ibz(), nb = mf->nbnd();
-    nda::array<ComplexType, 3> nii(ns, nk, nb);
-    nii() = ComplexType(0.0);
-    if (mpi->comm.root()) {
-      auto Dm = sDm_skij.local();
-      for (long s = 0; s < ns; ++s)
-        for (long k = 0; k < nk; ++k)
-          for (long n = 0; n < nb; ++n) {
-            ComplexType occ = Dm(s, k, n, n);
-            if (std::abs(occ.real()) > 0.5) nii(s, k, n) = occ;  // KS-occupied only
-          }
-    }
-    mpi->comm.broadcast_n(nii.data(), nii.size(), 0);
-    double spin_factor = (ns == 2) ? 1.0 : 2.0;
-    auto sK = math::shm::make_shared_array<Array_view_4D_t>(*mpi, {ns, nk, nb, nb});
-    hamilt::pseudopot V(*mf);
-    for (int pass = 0; pass < 2; ++pass) {
-      V.set_paw_exx_shape_restored(pass == 1);
-      hamilt::set_Vexchange(*mf, &V, nii, sK);
-      double e_x = 0.0;
-      if (mpi->comm.root()) {
-        auto Kloc = sK.local();
-        for (long s = 0; s < ns; ++s)
-          for (long k = 0; k < nk; ++k)
-            for (long n = 0; n < nb; ++n)
-              e_x += k_weight(k) * (nii(s, k, n) * Kloc(s, k, n, n)).real();
-        e_x *= 0.5 * spin_factor;
-      }
-      mpi->comm.broadcast_n(&e_x, 1, 0);
-      app_log(2, "Direct exchange, {}: {} a.u.",
-              (pass == 0) ? "compensated   " : "shape-restored", e_x);
-    }
-    app_log(2, "");
+    auto e_x = eval_hf_energy(sDm_skij, sF_skij, dyson.sH0_skij(), k_weight, false);
+    app_log(2, "Exchange energy:           {} a.u.\n", std::get<1>(e_x));
   }
 
   Timer.start("WRITE");

@@ -2105,17 +2105,17 @@ TEST_CASE("vx_sensitivity_ncpp", "[hamilt][thc][hf][!benchmark]")
 
   memory::array<HOST_MEMORY, ComplexType, 3> nii(nspin, nk_ibz, nbnd);
   nii() = mfobj.occ()(all, nda::range(nk_ibz), all);
-  auto sDm = make_shared_array<array_view_4d_t>(mpi, {nspin, nk_ibz, nbnd, nbnd});
-  if (mpi.node_comm.root()) {
+  auto sDm = make_shared_array<array_view_4d_t>(*mpi, {nspin, nk_ibz, nbnd, nbnd});
+  if (mpi->node_comm.root()) {
     sDm.local()() = ComplexType(0.0);
     for (long s = 0; s < nspin; ++s) for (long k = 0; k < nk_ibz; ++k)
       for (long a = 0; a < nbnd; ++a) sDm.local()(s, k, a, a) = nii(s, k, a);
   }
-  mpi.node_comm.barrier();
+  mpi->node_comm.barrier();
   hamilt::pseudopot V(mfobj);
-  auto sS = make_shared_array<array_view_4d_t>(mpi, {nspin, nk_ibz, nbnd, nbnd});
+  auto sS = make_shared_array<array_view_4d_t>(*mpi, {nspin, nk_ibz, nbnd, nbnd});
   hamilt::set_ovlp(mfobj, sS);
-  auto dVX = hamilt::Vexchange<HOST_MEMORY>(mfobj, mpi.comm, &V, nii);
+  auto dVX = hamilt::Vexchange<HOST_MEMORY>(mfobj, mpi->comm, &V, nii);
   auto VXref = nda::to_host(dVX.local());
 
   auto run = [&](std::string lbl, methods::div_treatment_e div, double thr, double ecut) {
@@ -2123,7 +2123,7 @@ TEST_CASE("vx_sensitivity_ncpp", "[hamilt][thc][hf][!benchmark]")
     pt.put("paw_aug", true); pt.put("paw_isdf_metric", "coulomb"); pt.put("paw_isdf_tol", 1e-12);
     methods::thc_reader_t thc(mf_ptr, pt);
     int Np = thc.Np();
-    auto sVX = make_shared_array<array_view_4d_t>(mpi, {nspin, nk_ibz, nbnd, nbnd});
+    auto sVX = make_shared_array<array_view_4d_t>(*mpi, {nspin, nk_ibz, nbnd, nbnd});
     { methods::solvers::hf_t hf(div);
       hf.evaluate(sVX, sDm.local(), thc, sS.local(), false, true); }
     auto VX = nda::to_host(sVX.local());
@@ -2138,10 +2138,10 @@ TEST_CASE("vx_sensitivity_ncpp", "[hamilt][thc][hf][!benchmark]")
             fro_ref += std::norm(VXref(is,ik,ii,ij)); e_fro += std::norm(d);
             if (i==j) e_diag += std::norm(d); else e_off += std::norm(d);
           }
-    fro_ref = std::sqrt(mpi.comm.all_reduce_value(fro_ref, std::plus<>{}));
-    e_fro = std::sqrt(mpi.comm.all_reduce_value(e_fro, std::plus<>{}));
-    e_diag = std::sqrt(mpi.comm.all_reduce_value(e_diag, std::plus<>{}));
-    e_off = std::sqrt(mpi.comm.all_reduce_value(e_off, std::plus<>{}));
+    fro_ref = std::sqrt(mpi->comm.all_reduce_value(fro_ref, std::plus<>{}));
+    e_fro = std::sqrt(mpi->comm.all_reduce_value(e_fro, std::plus<>{}));
+    e_diag = std::sqrt(mpi->comm.all_reduce_value(e_diag, std::plus<>{}));
+    e_off = std::sqrt(mpi->comm.all_reduce_value(e_off, std::plus<>{}));
     app_log(2, "VXSENS,{},Np={},relVX={:.5e},absdiag={:.5e},absoff={:.5e}",
             lbl, Np, e_fro/std::max(1e-30,fro_ref), e_diag, e_off);
   };

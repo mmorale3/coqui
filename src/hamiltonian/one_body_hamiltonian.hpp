@@ -387,8 +387,12 @@ auto Vexchange(mf::MF &mf, boost::mpi3::communicator &comm, pseudopot *psp,
   utils::check(psp != nullptr, "Vexchange: Missing pseudopot object.");
   utils::check(k_range.first() == 0 && k_range.last() == mf.nkpts_ibz(),
                "Vexchange: requires full IBZ k_range.");
-  utils::check(b_range.first() == 0 && b_range.last() == mf.nbnd(),
-               "Vexchange: requires full nbnd b_range.");
+  // A contiguous-from-zero partial band range is permitted: the exchange sum
+  // over occupied n is exact as long as b_range covers all occupied bands
+  // (f_n = 0 above the top occupied). Used to restrict the occupied-occupied
+  // exchange energy build to the valence subspace.
+  utils::check(b_range.first() == 0 && b_range.last() <= mf.nbnd(),
+               "Vexchange: requires contiguous-from-zero b_range within nbnd.");
   using larray = memory::array<MEM,ComplexType,4>;
   auto psi = mf::read_distributed_orbital_set_ibz<larray>(
       mf, comm, 'w', pgrid,
@@ -421,13 +425,18 @@ auto Vexchange(mf::MF &mf, boost::mpi3::communicator &comm, pseudopot *psp,
 template<nda::MemoryArrayOfRank<4> Array_4D_t, nda::ArrayOfRank<3> Arr3_t>
 void set_Vexchange(mf::MF &mf, pseudopot *psp,
                    Arr3_t const& nii,
-                   math::shm::shared_array<Array_4D_t> &sK_skij) {
+                   math::shm::shared_array<Array_4D_t> &sK_skij,
+                   long nbnd_max = -1) {
+  // nbnd_max>0 restricts the orbital band range read for the exchange build.
+  // The exchange energy is occupied-occupied only, so capping to the occupied
+  // count is exact for E_x while cutting the O(nbnd^2 nh^2) direct-v_x cost.
+  long nb_use = (nbnd_max > 0) ? std::min<long>(nbnd_max, mf.nbnd()) : (long)mf.nbnd();
   long np = sK_skij.internode_comm()->size();
   long np_s = (np % mf.nspin()== 0)? mf.nspin() : 1;
   long np_k = utils::find_proc_grid_max_npools(np/np_s, (long)mf.nkpts_ibz(), 1.0);
   long np_i = np / (np_s*np_k);
   std::array<long, 4> pgrid = {np_s, np_k, np_i, 1};
-  long blk_i = std::min( {(long)1024, (mf.nbnd())/np_i});
+  long blk_i = std::max<long>(1, std::min<long>(1024, nb_use/np_i));
   std::array<long, 4> bsize = {1, 1, blk_i, 2048};
   app_log(4, "Exchange matrix in distributed array:");
   app_log(4, "  - pgrid = ({}, {}, {}, {})", np_s, np_k, np_i, 1);
@@ -436,7 +445,7 @@ void set_Vexchange(mf::MF &mf, pseudopot *psp,
   if (sK_skij.node_comm()->root()) {
     auto dK = hamilt::Vexchange<HOST_MEMORY>(
         mf, *sK_skij.internode_comm(), psp, nii,
-        nda::range(mf.nkpts_ibz()), nda::range(mf.nbnd()),
+        nda::range(mf.nkpts_ibz()), nda::range(nb_use),
         pgrid, bsize);
     auto K_loc = sK_skij.local();
     K_loc(dK.local_range(0), dK.local_range(1),
