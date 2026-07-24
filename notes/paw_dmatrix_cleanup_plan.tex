@@ -1,0 +1,674 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{mdframed}
+\usepackage[colorlinks=true,linkcolor=blue,urlcolor=blue]{hyperref}
+\usepackage{enumitem}
+\usepackage{parskip}
+
+\newcommand{\ket}[1]{\lvert #1 \rangle}
+\newcommand{\bra}[1]{\langle #1 \rvert}
+\newcommand{\code}[1]{\texttt{\small #1}}
+\newcommand{\file}[1]{\texttt{\small #1}}
+\newcommand{\Dstat}{D^{\mathrm{static}}}
+\newcommand{\Qhat}{\hat{Q}}
+\newcommand{\phit}{\tilde{\phi}}
+\newcommand{\becsum}{\mathrm{becsum}}
+
+\newmdenv[
+  linecolor=blue!55!black, linewidth=0.6pt,
+  backgroundcolor=blue!4, roundcorner=3pt,
+  innertopmargin=6pt, innerbottommargin=6pt,
+  skipabove=6pt, skipbelow=6pt
+]{keybox}
+
+\title{\bfseries PAW/USPP consolidation plan:\\
+D matrix, converters, matrix elements, ERIs}
+\author{}
+\date{2026-07-24 \quad (status: \textsc{proposed})}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+Companion to \file{notes/paw\_implementation\_plan.md} (the phased build-out,
+now historical). This is the \emph{corrective} plan: it defines the target
+design for PAW/USPP in the self-consistent GW framework, records the audit
+findings that motivate it, and sequences the work. All file:line references
+are against the \code{paw} branch working tree on 2026-07-24. The guiding
+requirements: no DFT contributions in the non-local $D$ matrix (except a
+future, optional DFT-$V_{xc}$ core--valence term); a clean separation between
+static (density-independent, built once at initialization) and dynamic
+(density-matrix-dependent, built at matrix-element evaluation) terms; removal
+of the QE \code{deeq} tensor; frozen core--valence exact exchange read from
+file and added to the bare $D$; QE/ABINIT backend parity; both
+moment-restored and shape-restored augmentation densities available and
+correct; and, as the end goal, user-selectable evaluation routes for the
+Hartree and exchange contributions to the HF/GW static self-energies ---
+factorized ERIs (THC/Cholesky, today's only route) vs direct evaluation
+through the \code{hamiltonian} routines --- which requires the two routes to
+be a compatible partitioning of the same matrix elements.
+\end{abstract}
+
+\tableofcontents
+
+%======================================================================
+\section{Design invariants (the contract everything below enforces)}
+\label{sec:invariants}
+
+For every augmented species (USPP and PAW), with projector channels $I,J$ on
+atom $a$ of species $t(a)$, and CoQu\'i's self-consistent density matrix
+$n_{s,\mathbf{k},ab}$ (never \code{mf.occ()}):
+
+\subsection*{I1. One-center density matrix (becsum)}
+
+A \emph{single} becsum definition used by all consumers (Hartree, deeq,
+exchange, energies), symmetry-correct on any $k$-mesh:
+\begin{keybox}
+\begin{equation}
+\becsum_a(I,J) \;=\; \frac{n_s}{N_k}
+\sum_{s}\sum_{\mathbf{k}\in\mathrm{full\ BZ}}\sum_{ab}
+P^{\mathbf{k}\,*}_{a,\,aI}\; n_{s,\mathbf{k},ab}\; P^{\mathbf{k}}_{b,\,aJ},
+\qquad n_s = 2 \ \ (n_{\rm spin}{=}1,\ n_{\rm pol}{=}1),
+\label{eq:becsum}
+\end{equation}
+\end{keybox}
+with the full-BZ lift of the projections $P$ via the existing
+atom-permutation + Wigner-$D$ + Bloch-phase machinery whenever
+$N_k^{\rm IBZ} < N_k$.
+
+\subsection*{I2. Static (frozen) per-atom $D$ --- built once at
+\code{pseudopot} initialization, never mutated}
+
+\begin{keybox}
+\begin{equation}
+\Dstat_{a}(I,J) \;=\; D^{0}_{t(a)}(I,J)
+\;+\; \alpha_x\, E^{cv}_{t(a)}(I,J)
+\;\;\big[\,+\ \text{future: DFT-$V_{xc}$ c--v term}\,\big].
+\label{eq:dstatic}
+\end{equation}
+\end{keybox}
+
+\begin{itemize}[leftmargin=1.6em]
+\item $D^{0}$ is the \emph{full} frozen ionic $d^{0}_{ij}$:
+\begin{equation}
+D^{0}_{IJ} \;=\; \big(T^{\rm AE} - T^{\rm PS}\big)_{IJ}
+\;+\; \big\langle \phi_I\phi_J \,\big|\, v_H[n_{Zc}] \big\rangle
+\;-\; \big\langle \phit_I\phit_J + \Qhat_{IJ} \,\big|\, v_H[\tilde n_{Zc}] \big\rangle ,
+\label{eq:d0}
+\end{equation}
+i.e.\ AE$-$PS kinetic difference plus the frozen-core--screened ionic
+Hartree terms (including the compensation-moment piece on the PS side). QE's
+UPF \code{dion} \emph{is} this object by convention; the ABINIT converter
+assembles it (\code{assemble\_dij0}: \code{kinetic\_energy\_differences} +
+$v_{H}[n_{Zc}]$/$v_{H}[\tilde n_{Zc}]$ matrix elements + moment term).
+CoQu\'i does \emph{not} re-derive $D^0$ when the h5 provides it;
+\code{compute\_paw\_static\_D} remains available as a cross-check tool only.
+\item $E^{cv}$ = frozen core--valence exact exchange (\code{ex\_cvij}),
+contracted with \textbf{factor 1} --- it is linear in the valence density
+matrix and is captured through $e_{1e} = \mathrm{Tr}[D_m H_0]$, \emph{never}
+through $\tfrac12\mathrm{Tr}[D_m K]$. Source order:
+\code{Onecenter/ex\_cvij} if present; else built natively from
+\code{Core/ae\_wfc} (\S\ref{sec:wsB}, item B3); else omitted with a loud
+warning.
+\item The DFT-$V_{xc}$ core--valence option (a DFT c--v XC term added to the
+bare $D$) remains a declared-but-aborting enum value
+(\code{cv\_exchange\_e::dft\_xc}) until implemented.
+\item \textbf{No DFT XC and no QE-density quantities anywhere in
+$\Dstat$.}
+\end{itemize}
+
+\subsection*{I3. Dynamic (density-dependent) per-atom $D$ --- Hartree only,
+rebuilt at every matrix-element evaluation from the current $n$}
+
+\begin{keybox}
+\begin{equation}
+D^{H}_{a}(I,J)[n] \;=\;
+\int \! d^3r\; v_H\big[\bar\rho[n]\big](\mathbf{r})\, \Qhat_{a,IJ}(\mathbf{r})
+\;+\; \Delta D^{H}_{a}(I,J)\big[\becsum[n]\big],
+\label{eq:dh}
+\end{equation}
+\end{keybox}
+where $\bar\rho$ = smooth density + compensation charge, and $\Delta D^{H}$
+is the radial AE$-$PS one-center Hartree
+(\code{compute\_paw\_hartree\_atom}; proper Hartree units,
+$\code{rad\_fac}=1$, frozen-core AE/PS core densities included). For the full
+KS-like operator the $\int V\,\Qhat$ piece uses $V_{\rm loc}+V_H$; for the
+pure Hartree matrix it uses $V_H$ only. Both already exist in
+\code{compute\_paw\_deeq\_from\_becsum}; they become the \emph{only} source
+of density-dependent $D$.
+
+\subsection*{I4. Exchange never enters $D$}
+
+Valence--valence exact exchange lives in $v_x$ / the THC ERI, with two
+selectable augmentation-density modes:
+\begin{keybox}
+\begin{itemize}[leftmargin=1.6em]
+\item \textbf{\code{moment}} (default): moment-restored compensation charge
+$\Qhat$ in the pair densities \emph{plus} the $\Delta C$ one-center
+correction, prefactor $s_{\rm oc} = -1/N_k$. This is the
+Fock-exact-one-center operator (ABINIT \code{pawdijfock} / VASP analogue).
+\item \textbf{\code{shape}}: full AE$-$PS partial-wave pair density
+($\phi\phi - \phit\phit$ form factors, \code{build\_qrad\_tab\_full\_aeps}),
+$\Delta C$ \emph{dropped} (double-count otherwise), evaluated on the dense
+grid. This is the Arnaud / GW-oscillator operator.
+\item In \emph{both} modes core--valence exchange comes from $E^{cv}$ in
+$\Dstat$ (Eq.~\ref{eq:dstatic}).
+\end{itemize}
+\end{keybox}
+Both modes must be available and numerically correct in the direct $v_x$
+path \emph{and} the THC ERI path. Hartree always uses moment restoration
+(compensated smooth + radial one-center is already exact for Hartree ---
+document, don't option-ize).
+
+\subsection*{I5. $H_0$ and evaluation-path semantics}
+
+\begin{keybox}
+\begin{equation}
+H_0 \;=\; T \;+\; V_{\rm loc}(\text{\code{pp\_local}})
+\;+\; \sum_{a,IJ} \ket{\beta_{aI}}\, \Dstat_{a}(I,J)\, \bra{\beta_{aJ}} .
+\label{eq:h0}
+\end{equation}
+\end{keybox}
+$e_{1e} = \mathrm{Tr}[D_m H_0]$ is then purely static + frozen-core.
+The nii/nij-vs-\code{nullptr} asymmetry in \code{add\_vpp\_impl} is
+\emph{by design} and serves route selectability (I7): density-dependent
+terms are added \textbf{if and only if} a density (\code{nii} or
+\code{nij}) is passed.
+\begin{itemize}[leftmargin=1.6em]
+\item \code{nii = nij = nullptr}: Eq.~\eqref{eq:h0} only. Hartree and
+exchange are supplied elsewhere (today: by the ERI objects orchestrated in
+the SCF classes) and must \emph{not} appear here --- no QE deeq, no dynamic
+$D$.
+\item density passed: the requested density-dependent terms are added on
+top of Eq.~\eqref{eq:h0}, under \emph{separate} boolean control for Hartree
+and for exchange (new \code{add\_hartree} / \code{add\_exchange} flags on
+\code{add\_vpp\_impl} and the public \code{add\_Vpp} overloads), so the
+future \code{set\_H} can mix routes --- e.g.\ Hartree direct + exchange via
+THC.
+\item the \code{nii} and \code{nij} overloads must produce the identical
+operator for the same physical density.
+\end{itemize}
+QE-eigenvalue reproduction is a \emph{diagnostic} that assembles
+$\Dstat + D^H[n_{\rm QE}] + \int V_{xc}\Qhat$ explicitly --- it is not a
+production path.
+
+\subsection*{I6. Backend parity}
+
+A QE-converted and an ABINIT-converted h5 for the same system must drive the
+identical CoQu\'i code path, with no per-backend branches in
+\code{pseudopot} beyond dataset presence (\code{ex\_cvij}, \code{Core/}).
+Same datasets, same units, same index conventions.
+
+\subsection*{I7. Evaluation-path equivalence (factorized ERIs vs direct)}
+
+Today the Hartree and exchange contributions to the HF and static-GW
+self-energies are built \emph{exclusively} from ERI objects (THC or
+Cholesky), controlled in the SCF classes. The end goal is user choice: a
+future \code{set\_H} routine will optionally assemble $V_H$ and/or
+$\Sigma_x$ directly from the \code{hamiltonian} routines
+(\code{add\_Vpp} with density + flags, \code{add\_Hartree},
+\code{add\_exchange}), with the ERI route remaining available. The two
+routes must therefore be a \emph{compatible partitioning of the same
+Hamiltonian matrix elements}:
+\begin{keybox}
+\begin{equation}
+J^{\rm ERI}_{ij}(s,\mathbf{k})[n] = J^{\rm direct}_{ij}(s,\mathbf{k})[n],
+\qquad
+K^{\rm ERI}_{ij}(s,\mathbf{k})[n] = K^{\rm direct}_{ij}(s,\mathbf{k})[n],
+\label{eq:path-equiv}
+\end{equation}
+\end{keybox}
+for every spin, $k$-point, and band pair --- up to converged ISDF
+thresholds and compatible cutoffs. E.g.\ the HF build through the
+PAW-enabled THC object must reproduce, element by element, the
+\code{hamiltonian}-routine result. Eq.~\eqref{eq:path-equiv} is the
+acceptance criterion for Workstream D and the gate for the future
+route-selection project.
+
+\subsection*{I8. All-electron orbital basis; identity overlap}
+
+For PAW and USPP, HF and GW operate in the \emph{all-electron} orbital
+basis: every matrix element ($H_0$, $V_H$, $\Sigma_x$, ERIs) is taken with
+respect to the AE orbitals $\ket{\psi_i} = \hat{T}\ket{\tilde\psi_i}$,
+which are orthonormal --- the overlap in all SCF/Dyson algebra is the
+\textbf{identity}. The smooth orbitals + projector augmentation are only
+the \emph{representation} of these AE matrix elements; \code{nii}/\code{nij}
+are AE-basis density matrices, and the becsum of Eq.~\eqref{eq:becsum} is
+the AE one-center density matrix. No $S$-matrix insertions appear in any
+density contraction.
+
+%======================================================================
+\section{Audit findings (what is wrong today)}
+\label{sec:findings}
+
+\subsection{\code{pseudopot} / matrix elements}
+
+\begin{description}[leftmargin=2.6em,style=nextline]
+\item[F1.] \textbf{QE \code{deeq} is read and used as the production $D$.}
+\code{pseudopot.cpp:584} reads \code{deeq} into \code{Dnn\_atom}; QE deeq
+$= d_{\rm van} + \int V_{\rm eff}\Qhat + \code{ddd\_paw}$ with
+$V_{\rm eff} \supset V_{xc}$, and \code{pw2coqui} refreshes \code{ddd\_paw}
+from the converged DFT density before export
+(\file{pw2coqui.f90:213-219, 458-466}). DFT XC therefore enters $H_0$ twice
+over. This is the central violation; removal is directed.
+
+\item[F2.] \textbf{The three \code{add\_vpp} entry points are mutually
+inconsistent} for USPP/PAW:
+\emph{no-density} (production \code{set\_H0} for GW/scGW via
+\file{gen\_one\_body\_hamiltonian.icc}): QE deeq + \code{ex\_cvij}
+(\code{pseudopot.cpp:1308-1311});
+\emph{nii}: native \code{compute\_paw\_deeq(nii, $V_{\rm loc}{+}V_H$,
+include\_static=true)} --- no QE deeq, but also \textbf{no \code{ex\_cvij}}
+(\code{pseudopot.cpp:1278-1293});
+\emph{nij}: falls through to QE deeq again (\code{MAM FIX FIX FIX} at
+\code{pseudopot.cpp:1277}, comment 1303--1307).
+Same density $\Rightarrow$ three different Hamiltonians.
+NB: the \emph{inclusion} asymmetry --- density-dependent terms only when a
+density is passed --- is \emph{intentional} (route selectability, I5/I7).
+The defects are that the tensors disagree: the no-density path must be
+static-only (not QE deeq), and nij must build the same native dynamic $D$
+as nii.
+
+\item[F3.] \textbf{\code{ex\_cvij} placement is split.} Added to
+\code{Dnn\_atom} in the ctor (\code{pseudopot.cpp:987-1007}) but absent from
+\code{Dnn\_atom\_static\_paw} (\file{paw\_onecenter.hpp:388-413}), so (a) the
+native \code{nii} path drops c--v exchange, and (b) \code{compute\_deeq\_scf}
+does $\code{Dnn\_atom} = \text{static} + \text{Hartree}$ and would
+\emph{erase} \code{ex\_cvij} from \code{Dnn\_atom} if ever called in
+production (\file{paw\_onecenter.hpp:459-461}).
+
+\item[F4.] \textbf{becsum symmetry is path-dependent.} The diagonal path uses
+the full-BZ \code{compute\_becsum\_diagonal\_symm}; \emph{all} nij consumers
+(\code{v\_h(nij)}, \code{compute\_paw\_deeq(nij)}, \code{compute\_deeq\_scf})
+use the IBZ-weight \code{compute\_becsum\_full}
+(\file{v\_h\_paw.hpp:147-148}), and \code{add\_Hartree(nij)} has no
+$N_k^{\rm IBZ}{=}N_k$ guard ($v_x$'s nij overload does). Symmetry-reduced
+mesh + full $D_m$ $\Rightarrow$ silently wrong compensation charge.
+\code{compute\_becsum\_full} also truncates the imaginary part with only a
+log (\file{v\_h\_paw.hpp:173-184}) instead of Hermitian pair symmetrization.
+
+\item[F5.] \textbf{Static-ish work recomputed per call}:
+\code{aainit\_tables\_build}, qrad tables, and the full-BZ Pskna lift are
+rebuilt inside every \code{compute\_paw\_deeq} / $v_x$ call
+(\file{paw\_onecenter.hpp:565}; \file{v\_x\_paw.hpp:397-413, 375, 740}); no
+$\Delta k$-keyed Qfac cache. Known perf sink (direct $v_x$ went
+hours~$\to$~27\,s after the uncommitted fixes; caching is the next step).
+
+\item[F6.] \textbf{Spin handling}: deeq spin-collapse to $s{=}0$ and
+$\code{vfull} = \code{svloc}(0,0,\cdot)+v_r$
+(\code{pseudopot.cpp:600-603, 1285-1286}) --- magnetic LSDA $D$ is a
+documented TODO; the refactor must leave a clean seam (per-spin $D^H$)
+rather than bake $n_{\rm pol}{=}1$ deeper in.
+
+\item[F7.] \textbf{Dead/legacy surface}: unused member
+\code{memory::unified\_array qq} (\file{pseudopot.h:471}); \code{svsc} read
+but unused in production paths; \code{skip\_pp} / \code{set\_kinetic}
+diagnostic surface; \code{compute\_paw\_static\_D} unconsumed; stray
+\file{.paw\_onecenter.hpp.swp}; no-op root check \code{pseudopot.cpp:699}.
+The xml/\code{pw2bgw} init path is explicitly out of scope (user directive)
+--- leave untouched.
+\end{description}
+
+\subsection{Converters}
+
+\begin{description}[leftmargin=2.6em,style=nextline]
+\item[F8.] \textbf{QE exports \code{deeq}/\code{deeq\_nc}}
+(\file{pw2coqui.f90:463-466}) --- to be deleted with F1. Everything else QE
+writes for the $D$ chain (\code{dion}, Species radial data,
+\code{vloc\_ps}/\code{rho\_atc\_ps}, \code{Onecenter/deltaC} in proper Ha)
+is XC-free and already sufficient for native reconstruction.
+
+\item[F9.] \textbf{ABINIT h5 is missing datasets the native path needs}:
+\code{Species/paw/\{ae\_vloc, vloc\_ps\}} are computed internally
+($v_H[n_{Zc}]$ / \code{reconstruct\_vhtnzc}) but never written --- so
+CoQu\'i's static/dynamic rebuild cannot run on ABINIT h5 today;
+\code{vxc}/\code{vxc\_with\_nlcc} are written as \emph{zeros} (G$_0$W$_0$
+$\Sigma - V_{xc}$ broken by construction); \code{nuclear\_energy} and
+\code{madelung\_constant} are $0.0$ (madelung patched reader-side);
+\code{Species/beta} absent; no \code{Core/} group; parsed
+\code{exx\_core\_core} dropped.
+
+\item[F10.] \textbf{Cross-backend convention mismatches}:
+\begin{itemize}[leftmargin=1.4em]
+\item \code{proj\_per\_atom}: QE writes per-\textsc{species}
+\code{nh(1:nsp)} (\file{pw2coqui.f90:429}); ABINIT writes a per-\textsc{atom}
+array of length $n_{\rm at}$
+(\file{abinit\_paw\_hamiltonian.py:369-371, 427}). The reader sizes it to
+$n_{\rm sp}$ (\code{pseudopot.cpp:511-514}) --- works only for
+ordering-degenerate cells (Si-type). Latent multi-species breakage.
+\item Units: \code{/Hamiltonian} datasets in Ry (QE convention, reader
+$\times\tfrac12$) but \code{Onecenter/*} in Ha; Species-level \code{dion} is
+Ry on QE, Ha on ABINIT. One standard (Ha on disk + schema version attribute)
+is required.
+\item \code{miller\_g}: ecutrho sphere (QE) vs full FFT box (ABINIT).
+\item \code{qfuncl} provenance: UPF-tabulated (QE) vs moment $\times$
+analytic Bessel shape (ABINIT), with the tabulated
+\code{<shape\_function>} never cross-checked.
+\item \code{ijtoh} leading dimension for modern QE (per-atom?) unverified.
+\end{itemize}
+
+\item[F11.] \textbf{\code{ex\_cvij} exists only on the ABINIT path}; QE-PAW
+datasets get \code{cv\_exchange=none} + warning even when GIPAW
+\code{Core/ae\_wfc} is exported (\file{pw2coqui.f90:991-1005}) and would
+suffice to build it.
+\end{description}
+
+\subsection{Augmentation modes (moment vs shape)}
+
+\begin{description}[leftmargin=2.6em,style=nextline]
+\item[F12.] Shape restoration works in direct $v_x$ (nii and nij, $\Delta C$
+correctly dropped) but: THC aborts on it (smooth-grid capture ${\sim}6\%$ ---
+needs the dense-grid augmentation); the direct path builds qrad tables per
+call with $dq{=}0.05$ while THC uses $dq{=}0.01$; and \emph{two} parallel
+flags (\code{paw\_exx\_shape\_restored} bool +
+\code{\_exx\_opts.vv\_compensation}) are kept in sync by hand
+(\file{pseudopot.h:393-413}). The shape-restored mode is not yet numerically
+confirmed against ABINIT end-to-end (open item; the $-1.316447$ target's
+operator identity, GW vs HF, is itself unconfirmed).
+\end{description}
+
+\subsection{Notes}
+
+\begin{description}[leftmargin=2.6em,style=nextline]
+\item[F13.] The formalism/tracking docs contradict each other in four
+load-bearing places:
+(a) \file{abinit2coqui\_converter\_plan.md} claims ABINIT's
+\code{<exact\_exchange\_X\_matrix>} ``$= \Delta C / K_a$'' --- it is the
+\textsc{core--valence} \code{ex\_cvij};
+(b) ``which operator is the correct AE exchange'' is answered differently by
+\file{paw\_onsite\_exchange\_analysis} (shape-restored) and
+\file{abinit\_exchange\_gw\_vs\_hybrid.md} (compensated + $\Delta C$ +
+\code{ex\_cvij} = rigorous Fock) without the reconciliation --- they are
+\emph{different operators}, and both modes are wanted (that is precisely
+invariant I4);
+(c) the \code{ex\_cvij} factor-1 rule exists only in code comments;
+(d) \file{dmatrix\_paw\_generalization.tex} is the symmetry-rotation note ---
+\textbf{no canonical $D$-matrix decomposition document exists}.
+Also stale: \file{paw\_deeq\_scaling\_derivation.md} (``both becsum builders
+assume uniform $k$-weights'') post-\code{679d7b0}.
+\end{description}
+
+%======================================================================
+\section{Workstream A --- \code{pseudopot} D-matrix refactor (first task)}
+\label{sec:wsA}
+
+\begin{description}[leftmargin=2.6em,style=nextline]
+\item[A0.] \textbf{Stabilize the working tree first.} Commit the current
+uncommitted changes as coherent pieces before refactoring on top:
+(1) perf: \file{paw\_aug\_q\_eval.hpp} thread-local Ylm scratch +
+allocation-free \code{qrad\_interp\_at\_K\_into} + $v_x$ perf fixes (Gcut
+sphere, flat all-reduce, band-range fix);
+(2) options: \code{paw\_exx\_options} / \code{cv\_exchange\_e} scaffolding +
+toml plumbing (\file{pseudopot.h}, \file{thc\_reader\_t.hpp});
+(3) cleanup: \file{rpa.cpp} diagnostic removal, \code{Vexchange}
+partial-band range;
+(4) notes: \file{prb.tex} edits.
+Delete \file{.paw\_onecenter.hpp.swp}; add \file{.DS\_Store} to
+\file{.gitignore}.
+
+\item[A1.] \textbf{Introduce the two-tensor model and delete
+\code{Dnn\_atom}-as-QE-deeq.}
+\begin{itemize}[leftmargin=1.4em]
+\item \code{Dnn\_atom\_static} (rename of \code{Dnn\_atom\_static\_paw}):
+built \emph{eagerly} in the ctor for USPP/PAW $=$ \code{dion} replica
+$+\;\alpha_x\,$\code{ex\_cvij} ($+$ the dft\_xc c--v term when it lands).
+NCPP keeps species \code{Dnn}. This is the only persistent per-atom $D$.
+\item Remove the \code{deeq} read (\code{pseudopot.cpp:580-612}) and the
+ctor-time \code{ex\_cvij} patch of \code{Dnn\_atom}
+(\code{pseudopot.cpp:987-1007}) --- \code{ex\_cvij} moves into the static
+assembly. Keep \code{Dnn\_atom\_view()} returning the static tensor (update
+the two test consumers).
+\item \code{compute\_paw\_deeq\_from\_becsum(include\_static)} pulls the
+static baseline from \code{Dnn\_atom\_static} (thereby inheriting
+\code{ex\_cvij} --- fixes F3).
+\item Delete \code{compute\_deeq\_scf}'s overwrite semantics: it becomes a
+thin wrapper returning/holding $\Dstat + D^H[n]$ without mutating the
+static tensor.
+\end{itemize}
+
+\item[A2.] \textbf{Align the \code{add\_vpp} paths with the I5 contract
+(fixes F2).}
+\begin{itemize}[leftmargin=1.4em]
+\item no-density: \code{add\_vnl\_impl(\ldots, Dnn\_atom\_static)} --- $H_0$
+is static-only per I5; Hartree/exchange come from the ERI objects in the
+SCF classes (today's only route) and must not be double-counted here. This
+\emph{changes} $e_{1e}$ for QE-sourced runs
+(deeq's $V_H$/$V_{xc}$ content leaves $H_0$); the SCF/Dyson drivers already
+add $V_H[n]$ via the ERI route, so total energies move to the
+self-consistent convention. Audit \code{simple\_dyson} /
+\code{scf\_driver} / \code{qp\_scf\_common} / \code{downfold\_1e} for
+double-count or omission when this flips, and re-baseline the reference
+energies in the test suite.
+\item nii and nij: both call \code{compute\_paw\_deeq($n$,
+$V_{\rm loc}{+}V_H$, include\_static=true)} $\Rightarrow$ identical operator
+for identical density. The nij overload needs the symmetric becsum (A3).
+\item add \emph{separate} boolean options \code{add\_hartree} /
+\code{add\_exchange} to \code{add\_vpp\_impl} (threaded through the public
+\code{add\_Vpp} overloads): the Hartree terms (smooth $V_H$ into
+\code{hpsi} $+$ $\int V\Qhat$ $+$ radial $D^H$) are gated by
+\code{add\_hartree}; the exchange contribution (band-pair augmented $K$,
+today only reachable via \code{add\_exchange}) is inserted into \code{Hij}
+when \code{add\_exchange} is set. This is the groundwork for the future
+\code{set\_H} routine that mixes direct and ERI routes per term (I5/I7).
+\item Remove the QE-deeq fallback warning path; a missing dataset now means
+``old h5 file'' $\Rightarrow$ hard error naming the converter rerun.
+\end{itemize}
+
+\item[A3.] \textbf{Symmetry-correct nij becsum (fixes F4).}
+Implement \code{compute\_becsum\_full\_symm} using the existing full-BZ
+Pskna lift (\code{compute\_Pskna\_full\_bz} + Wigner-$D$ + atom
+permutation) --- the machinery already used by $v_x$ and the THC
+augmentation. Route \emph{all} nij consumers through it; until it lands, add
+the $N_k^{\rm IBZ}{=}N_k$ guard to \code{add\_Hartree(nij)} /
+\code{v\_h(nij)} so nosym is enforced rather than silently wrong. Replace
+the imaginary-part truncation with Hermitian pair symmetrization
+$\becsum_{IJ} \leftarrow \tfrac12(\becsum_{IJ} + \becsum_{JI}^{*})$ plus a
+hard check on the residual.
+
+\item[A4.] \textbf{Hoist per-call statics (fixes F5).} Cache on
+\code{pseudopot} (built lazily, keyed): aainit tables, per-species qrad
+tables (one $dq$ for all consumers --- adopt $0.01$), the full-BZ Pskna
+lift, and a $\Delta k$-keyed Qfac table for $v_x$. Parallelize the
+root-serial $\int V \Qhat$ loop (\file{paw\_onecenter.hpp:592-630}) over
+$G$.
+
+\item[A5.] \textbf{Provenance checks at read time.} On load, verify:
+\code{dion} Hermitian and plausible-scale; \code{proj\_per\_atom} length
+$= n_{\rm sp}$ (abort with the ABINIT-fix message otherwise); required
+Species datasets present for USPP/PAW
+(\code{aewfc}/\code{pswfc}/\code{qfuncl}/\code{vloc\_ps}/\code{ae\_vloc}
+for PAW) --- hard errors, not warnings, since silent fallbacks are how the
+current inconsistencies survived.
+\end{description}
+
+\textbf{Deliverable tests (A):}
+(i) nii vs nij vs no-density+\code{add\_Hartree} operator identity on
+LiH/Si PAW fixtures (machine precision);
+(ii) sym vs nosym identity for nij Hartree;
+(iii) $e_{1e}$ decomposition test: $\mathrm{Tr}[D_m H_0]$ contains
+\code{ex\_cvij} with factor 1 (compare against the ABINIT c--v energy
+$-0.521220$\,Ha on si222);
+(iv) QE-eigenvalue reproduction as an explicit diagnostic assembly
+($\Dstat + D^H[n_{\rm QE}] + \int V_{xc}\Qhat$) at the current
+$5\times10^{-5}$ tolerance.
+
+%======================================================================
+\section{Workstream B --- converter parity}
+\label{sec:wsB}
+
+\begin{description}[leftmargin=2.6em,style=nextline]
+\item[B1.] \textbf{QE (\file{qe\_converter/pw2coqui.f90})}: delete
+\code{deeq}/\code{deeq\_nc} writes (f90:463-466) and the schema mention;
+bump a \code{schema\_version} attribute on \code{/Hamiltonian}; keep
+everything else. (Optional later: emit \code{ex\_cvij} from GIPAW cores ---
+superseded by B3, which does it in CoQu\'i once for both backends.)
+
+\item[B2.] \textbf{ABINIT
+(\file{src/python/mean\_field/abinit\_interface/})}:
+\begin{enumerate}[leftmargin=1.8em]
+\item write \code{Species/paw/\{ae\_vloc, vloc\_ps\}} from $v_H[n_{Zc}]$ /
+$v_H[\tilde n_{Zc}]$ (unit-matched to the B4 standard) --- unblocks the
+native $D$ path on ABINIT h5;
+\item write \code{proj\_per\_atom} per-species (fixes F10a) in both NC and
+PAW writers;
+\item write real \code{vxc}/\code{vxc\_with\_nlcc} (DEN + libxc) ---
+prerequisite for G$_0$W$_0$ $\Sigma - V_{xc}$ on ABINIT mean fields;
+\item write real \code{nuclear\_energy} (Ewald) and
+\code{madelung\_constant} (keep the reader-side compute-when-0 as a guard);
+\item write \code{Species/beta} and a \code{Core/} group (core AE orbitals)
+when the XML provides them; write \code{exx\_core\_core} as a total-energy
+attribute;
+\item cross-check the analytic \code{shape\_bessel} against the XML's
+tabulated \code{<shape\_function>} values (STEP3 open item) and fail loudly
+on mismatch.
+\end{enumerate}
+
+\item[B3.] \textbf{Native \code{ex\_cvij} builder in CoQu\'i} (serves QE +
+any backend): from \code{Core/ae\_wfc} + valence \code{aewfc} via Slater
+$R^L$ integrals and Gaunt$^2$,
+\begin{equation}
+E^{cv}(I,J) \;=\; \sum_{c}\sum_{L} G^2(I,c;L)\; R^L(I,c,J,c),
+\end{equation}
+used when \code{Onecenter/ex\_cvij} is absent but \code{Core/} is present.
+Validate against the ABINIT-XML \code{ex\_cvij} (kernels agree to
+${\sim}10^{-15}$ per the Jul~21 comparison). Detection order becomes: h5
+\code{ex\_cvij} $\to$ native-from-\code{Core} $\to$ \code{dft\_xc} (TBD)
+$\to$ none + warn.
+
+\item[B4.] \textbf{Schema standardization}: one units convention on disk
+(Hartree everywhere new; readers keep $\times\tfrac12$ only for legacy Ry
+datasets gated on \code{schema\_version}); \code{miller\_g} as an ecutrho
+sphere on both sides; document the \code{ijtoh} shape and verify against
+modern QE. Write the contract into the schema section of
+\file{notes/paw\_implementation\_plan.md} (single source of truth).
+\end{description}
+
+\textbf{Deliverable tests (B):} same-system Si PAW through \emph{both}
+converters $\Rightarrow$ pseudopot-level dataset diff (\code{dion},
+\code{qq\_nt}, qfuncl-derived $Q(G)$, \code{deltaC}, \code{ex\_cvij})
+within quadrature tolerance, then end-to-end $e_{1e}/e_{\rm hf}/e_{\rm rpa}$
+parity. This test closes (or precisely localizes) the outstanding
+ABINIT-mf $e_{\rm hf}$-weak / $e_{\rm rpa}$-2$\times$ anomaly.
+
+%======================================================================
+\section{Workstream C --- augmentation-density modes (moment \& shape)}
+\label{sec:wsC}
+
+\begin{description}[leftmargin=2.6em,style=nextline]
+\item[C1.] Single mode flag: drop the \code{paw\_exx\_shape\_restored}
+bool; everything reads \code{\_exx\_opts.vv\_compensation} (pseudopot
+setter kept for tests but delegating). $\Delta C$/$K_a$ inclusion is
+\emph{derived} from the mode (moment $\Rightarrow$ include, shape
+$\Rightarrow$ drop) in both direct $v_x$ and THC --- never independently
+toggled (\code{\_paw\_onsite} remains a diagnostic-only knob, documented as
+such).
+
+\item[C2.] Dense-grid THC augmentation for shape mode: evaluate the
+augmentation form factors on the dense (\code{dfftp}) grid in
+\code{augment\_thc\_with\_paw} (the direct path already does), then lift
+the \code{validate(in\_thc=true)} abort. Acceptance: THC shape-mode Si
+$a{=}10.20$ on-site exchange within THC tolerance of the direct
+$-1.6863$\,Ha result.
+
+\item[C3.] Unify qrad $dq$ ($0.01$) and share the cached tables from A4
+between direct and THC paths; add the $\Delta k$-keyed Qfac cache to make
+direct $v_x$ usable in production.
+
+\item[C4.] Close the physics validation: determine whether ABINIT's si222
+$-1.316447$ reference is the GW (Arnaud) or HF (\code{pawdijfock})
+operator, then match CoQu\'i shape mode against the GW number and
+moment($+\Delta C+$\code{ex\_cvij}) mode against the HF number. Both
+comparisons finite-size-off, onsite isolated (the instrumentation recipe
+from the Jul~16 isolation exists).
+\end{description}
+
+%======================================================================
+\section{Workstream D --- ERI/THC consistency (second task, after A--C)}
+\label{sec:wsD}
+
+The purpose of this workstream is invariant I7: the factorized-ERI route
+and the direct \code{hamiltonian} route must be interchangeable,
+element-by-element, as sources of the Hartree and exchange contributions to
+the HF/GW static self-energy --- the prerequisite for the future
+\code{set\_H} route-selection project.
+
+\begin{description}[leftmargin=2.6em,style=nextline]
+\item[D1.] Audit \file{methods/ERI/thc.h}/\file{thc.icc}/%
+\file{thc\_reader\_t.hpp} against the matrix-element conventions fixed in
+A: becsum definition, $n_s/N_k$ normalization, $K_a$ placement and
+prefactor, Hermiticity at every $q$, and the $q{=}0$ divergence treatment
+with compensation-neutral pair densities. All in the AE basis with
+identity overlap (I8).
+
+\item[D2.] Route-equivalence tests per Eq.~\eqref{eq:path-equiv}: $V_H$
+and $V_x$ \emph{matrix elements} (not just energies) built through the
+PAW-enabled THC object vs the \code{hamiltonian} routines, for nii and
+full nij, both augmentation modes where applicable, NCPP/USPP/PAW
+$\times$ sym/nosym --- the strict ${\sim}10^{-4}$ agreement suite already
+exists for moment mode; extend to shape mode once C2 lands, tighten with
+ISDF-threshold convergence, and add an energy-level RPA/HF regression on
+Si (rusty \code{Si\_conv} values as reference).
+
+\item[D3.] Known THC issues to fold in: the $N_{\rm aux} \gtrsim 10$k build
+OOM (distribute the augmentation build intermediates; fix the memory
+estimator), and the $\ell \ge 3$ (f-projector) augmentation path that
+LaNiO$_3$ exercises (add a synthetic $\ell{=}3$ unit test on
+becsum/$Q(G)$ before re-running the campaign point).
+
+\item[D4.] \textbf{Cholesky ERIs are not PAW/USPP-complete}: the Cholesky
+builder still works on the smooth grid with no augmentation (cf.\ the
+smooth/dense grid-split work). Until augmentation lands there, Cholesky +
+USPP/PAW must hard-abort (not silently produce smooth-only ERIs);
+implementing the augmented Cholesky path is a separate follow-on if the
+route is wanted for augmented pseudos.
+\end{description}
+
+%======================================================================
+\section{Workstream E --- notes and documentation}
+\label{sec:wsE}
+
+\begin{description}[leftmargin=2.6em,style=nextline]
+\item[E1.] \textbf{Author the canonical D-matrix document}
+(\file{notes/paw\_dmatrix\_scgw.tex}): the \S\ref{sec:invariants}
+invariants with derivations --- becsum normalization, $D^0$ content per
+backend, the \code{ex\_cvij} factor-1 derivation (Rostgaard-style, frozen
+core), Hartree-only dynamic $D$, the two exchange modes and their operator
+identities (Fock vs Arnaud), and a units ledger. This closes the ``no
+formal write-up exists'' gap; \file{dmatrix\_paw\_generalization.tex} keeps
+its symmetry-rotation scope.
+
+\item[E2.] Corrections to existing notes: fix the
+exx\_X-$=$-$\Delta C$ claim in \file{abinit2coqui\_converter\_plan.md}; add
+the GW-vs-HF reconciliation paragraph to
+\file{paw\_onsite\_exchange\_analysis}; refresh the stale $k$-weight line
+in \file{paw\_deeq\_scaling\_derivation.md}; collapse STEP3's dead schema
+block; mark \file{paw\_lanio3\_unphysical\_rpa.md} retest-pending against
+the post-June fixes.
+\end{description}
+
+%======================================================================
+\section{Sequencing and risk}
+\label{sec:seq}
+
+\textbf{Order:} A0 $\to$ A1--A2 ($+$A5) $\to$ B1--B2 (unblocks
+backend-parity testing of A) $\to$ A3--A4 $\to$ B3--B4 $\to$ C $\to$ D
+$\to$ E throughout (E1 early, alongside A1).
+
+\textbf{Biggest behavior change:} A2 flips production $H_0$ from ``QE
+deeq'' to ``static-only + explicit $V_H[n]$'' --- every stored reference
+energy for USPP/PAW fixtures shifts. Land it behind a single commit with
+the re-baselined test values and a validation table (QE eigenvalue
+diagnostic + LiH/Si HF totals) in the commit message.
+
+\textbf{Open physics items tracked, not blocking:} magnetic (spin-resolved
+$D^H$) seam; SOC (\code{qq\_so}/\code{dion\_so} through the static
+assembly); LaNiO$_3$ $\ell \ge 3$ anomaly; the $-1.316447$ operator
+identity; dense-grid THC memory footprint.
+
+\end{document}
