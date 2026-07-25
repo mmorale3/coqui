@@ -163,6 +163,13 @@ inline void ensure_checkpoint(std::shared_ptr<mf::MF> mf, std::string const& out
  *                 ([interaction.thc] thresh) so the selected interpolating vectors stay
  *                 in the span of the global basis; a tighter override over-resolves the
  *                 C pair-density metric and yields an ill-conditioned secondary metric.
+ *  - vertex_div_treatment: "" q->0 rung policy for the VERTEX only; empty inherits
+ *                 div_treatment. {choices: "ignore_g0", "gygi", "v1_skip"}. Lets the
+ *                 analytic rank-1 head inserted into the vertex rungs be switched off
+ *                 without changing the GW/HF divergence treatment -- that head is the one
+ *                 piece the Sigma^C-vs-GF2-exchange absolute cross-check does not cover,
+ *                 and notes/q0_head_treatment.md measures it at ~2.4x the body scale at
+ *                 N_k = 8.
  *  - vertex_scale: "1.0" Scale BOTH cuts by lambda, i.e. Phi_2^C -> lambda Phi_2^C.
  *                 Conservation stays exact at every lambda because the scaling acts on the
  *                 generating functional, not on the already-cut Sigma/P.
@@ -290,6 +297,15 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     // cuts). vertex_ramp_iters > 0 walks lambda from vertex_scale/ramp up to vertex_scale
     // over that many scf iterations. Used to keep eps = I - Z.Pi positive definite: P^C is
     // not sign-definite (notes/vertex_divergence_diagnosis.md).
+    // q->0 rung policy for the VERTEX, independent of the GW/HF one. The gygi head
+    // inserted into the vertex rungs is a rank-1 Nk*madelung*chi.chi^dag block that the
+    // q0 memo measured at ~2.4x the body scale on LiH-222 (Nk = 8), large enough to flip
+    // the sign of the traced Phi_2^C. It is also the ONE component the Sigma^C-vs-GF2
+    // absolute cross-check does not cover (that test runs "ignore_g0"). Being able to
+    // switch it WITHOUT changing the GW/HF divergence treatment makes it separable.
+    // Empty string = inherit div_treatment (previous behavior).
+    auto vertex_div_treatment = io::get_value_with_default<std::string>(pt,"vertex_div_treatment","");
+    io::tolower(vertex_div_treatment);
     auto vertex_scale = io::get_value_with_default<double>(pt,"vertex_scale",1.0);
     auto vertex_ramp_iters = io::get_value_with_default<long>(pt,"vertex_ramp_iters",0);
     // Wannier-projector subspace C (notes/wannier_projector_theory.md): when set, the
@@ -313,6 +329,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
                              vertex_isdf, vertex_isdf_rank, vertex_isdf_svd_tol, vertex_isdf_thresh,
                              vertex_isdf_cond_max);
     vertex.set_vertex_scale(vertex_scale, vertex_ramp_iters);
+    if (not vertex_div_treatment.empty()) vertex.set_div_treatment(vertex_div_treatment);
     if (vertex.enabled()) {
       utils::check(screen_type == "rpa" or screen_type == "rpa_k",
                    "vertex_type = \"{}\" currently requires screen_type = \"rpa\" or \"rpa_k\" "
@@ -574,6 +591,15 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
     // cuts). vertex_ramp_iters > 0 walks lambda from vertex_scale/ramp up to vertex_scale
     // over that many scf iterations. Used to keep eps = I - Z.Pi positive definite: P^C is
     // not sign-definite (notes/vertex_divergence_diagnosis.md).
+    // q->0 rung policy for the VERTEX, independent of the GW/HF one. The gygi head
+    // inserted into the vertex rungs is a rank-1 Nk*madelung*chi.chi^dag block that the
+    // q0 memo measured at ~2.4x the body scale on LiH-222 (Nk = 8), large enough to flip
+    // the sign of the traced Phi_2^C. It is also the ONE component the Sigma^C-vs-GF2
+    // absolute cross-check does not cover (that test runs "ignore_g0"). Being able to
+    // switch it WITHOUT changing the GW/HF divergence treatment makes it separable.
+    // Empty string = inherit div_treatment (previous behavior).
+    auto vertex_div_treatment = io::get_value_with_default<std::string>(pt,"vertex_div_treatment","");
+    io::tolower(vertex_div_treatment);
     auto vertex_scale = io::get_value_with_default<double>(pt,"vertex_scale",1.0);
     auto vertex_ramp_iters = io::get_value_with_default<long>(pt,"vertex_ramp_iters",0);
     // Wannier-projector subspace C (notes/wannier_projector_theory.md): when set, the
@@ -597,6 +623,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
                              vertex_isdf, vertex_isdf_rank, vertex_isdf_svd_tol, vertex_isdf_thresh,
                              vertex_isdf_cond_max);
     vertex.set_vertex_scale(vertex_scale, vertex_ramp_iters);
+    if (not vertex_div_treatment.empty()) vertex.set_div_treatment(vertex_div_treatment);
     if (vertex.enabled()) {
       utils::check(screen_type == "rpa" or screen_type == "rpa_k",
                    "vertex_type = \"{}\" currently requires screen_type = \"rpa\" or \"rpa_k\" "
