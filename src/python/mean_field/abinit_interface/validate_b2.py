@@ -70,9 +70,12 @@ def run_vxc(path, rho_path):
     vxc_r = vxc_grid(rho, recv, "pbe")
     vg = np.fft.fftn(vxc_r) / vxc_r.size
     mill_g = pp["miller_g"][:]
-    mine = 2.0 * vg[np.mod(mill_g[:, 0], mesh[0]),
-                    np.mod(mill_g[:, 1], mesh[1]),
-                    np.mod(mill_g[:, 2], mesh[2])]          # Ry, pw2coqui units
+    # on-disk units per schema_version: >= 2 -> Ha; legacy/1 -> Ry (x2)
+    sv = int(H.attrs.get("schema_version", 0))
+    unit = 1.0 if sv >= 2 else 2.0
+    mine = unit * vg[np.mod(mill_g[:, 0], mesh[0]),
+                     np.mod(mill_g[:, 1], mesh[1]),
+                     np.mod(mill_g[:, 2], mesh[2])]
     ref = pp["vxc"][:]
     ref = (ref[..., 0] + 1j * ref[..., 1]).reshape(-1)[:mill_g.shape[0]]
     # G=0 aside (QE alpha/constant conventions), compare all components
@@ -182,12 +185,12 @@ def run_synth(tmpdir):
     r = sp["r"]
     zval = 2.0
     for name in ("ae_vloc", "vloc_ps"):
-        tail = (r * sp[name] / 2.0)[-1]              # Ry/2 = Ha; -> -zval
+        tail = (r * sp[name])[-1]                    # Ha (schema 2); -> -zval
         assert abs(tail + zval) < 1e-3, \
-            "%s tail %.6f != -zval (Ry convention broken?)" % (name, tail)
+            "%s tail %.6f != -zval (Ha/schema-2 convention broken?)" % (name, tail)
     assert np.allclose(sp["beta"], p["proj"] * r)
     assert np.allclose(sp["oc"], [2.0, 0.0])
-    print("PASS adapter (beta, oc, ae_vloc/vloc_ps Ry tails -> -zval)")
+    print("PASS adapter (beta, oc, ae_vloc/vloc_ps Ha tails -> -zval)")
 
     # --- tabulated-shape mismatch must fail loudly ---
     p_bad = axml.parse_pawxml(_synth_pawxml(tmpdir, break_shape=True))
@@ -221,12 +224,13 @@ def run_synth(tmpdir):
         assert ppa.shape == (1,) and ppa[0] == 4, \
             "proj_per_atom must be per-SPECIES nh (got %s)" % ppa
         assert int(g.attrs["total_num_of_proj"]) == 4
+        assert int(f["Hamiltonian"].attrs["schema_version"]) == 2
         vxc = g["vxc"][:]
         assert vxc.shape[:1] == (1,) and vxc.shape[-1] == 2
         vxc0 = vxc.reshape(1, 1, -1, 2)[0, 0, :, 0]
-        # uniform rho -> vxc has only a G=0 component = LDA-limit value (Ry)
+        # uniform rho -> vxc has only a G=0 component = LDA-limit value (Ha)
         from xc_functionals import vxc_grid
-        vref = 2.0 * vxc_grid(rho_den, w["recv"], "pbe")[0, 0, 0]
+        vref = vxc_grid(rho_den, w["recv"], "pbe")[0, 0, 0]
         i000 = np.where(np.all(g["miller_g"][:] == 0, axis=1))[0][0]
         assert abs(vxc0[i000] - vref) < 1e-10
         assert np.abs(np.delete(vxc0, i000)).max() < 1e-12

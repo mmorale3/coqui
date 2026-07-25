@@ -421,10 +421,10 @@ inline nda::array<double,2> compute_ex_cvij_from_core(
  *               + ⟨ψ_AE_I | ae_vloc | ψ_AE_J⟩
  *               − ⟨ψ_PS_I | vloc_ps  | ψ_PS_J⟩
  *
- * Output is in Hartree. UPF radial potentials (`ae_vloc`, `vloc_ps`) are
- * Ry by QE convention; we multiply the V-matel integral by ½ to land
- * in Ha. The radial kinetic operator (`radial_kinetic_matel`) is
- * already implemented in Hartree.
+ * Output is in Hartree. The radial potentials (`ae_vloc`, `vloc_ps`) are
+ * HARTREE in memory (plan B4: read_vnl_h5 scales legacy-Ry files at read
+ * time), and the radial kinetic operator (`radial_kinetic_matel`) is
+ * already implemented in Hartree — no unit factors here.
  *
  * Selection rule: with a spherically symmetric static potential and the
  * radial-only matrix element formulation, only `lm_I == lm_J` couples
@@ -475,13 +475,12 @@ inline nda::array<double, 2> compute_paw_static_D(
             double T_AE = radial_kinetic_matel(u_AE_I, u_AE_J, sp.r, sp.rab, l);
             double T_PS = radial_kinetic_matel(u_PS_I, u_PS_J, sp.r, sp.rab, l);
 
-            // V matel — integrand in Ry (UPF convention); ½ converts to Ha.
+            // V matel — ae_vloc/vloc_ps are Ha in memory (plan B4).
             for (long ir = 0; ir < mesh; ++ir) {
                 integrand(ir) = sp.ae_vloc(ir) * u_AE_I(ir) * u_AE_J(ir)
                               - sp.vloc_ps(ir) * u_PS_I(ir) * u_PS_J(ir);
             }
-            double V_IJ_Ry = radial_simpson(integrand, sp.rab);
-            double V_IJ    = 0.5 * V_IJ_Ry;
+            double V_IJ = radial_simpson(integrand, sp.rab);
 
             D(I, J) = (T_AE - T_PS) + V_IJ;
         }

@@ -47,6 +47,7 @@
 #include "hamiltonian/paw/v_x_paw.hpp"
 #include "hamiltonian/paw/paw_onecenter.hpp"   // compute_paw_deeq / compute_deeq_scf
 #include "hamiltonian/pseudo/pseudopot.h"
+#include "hamiltonian/pseudo/pp_schema.hpp"
 #include "hamiltonian/pseudo/pseudopot_to_h5.hpp"
 #include "numerics/nda_functions.hpp"
 
@@ -350,6 +351,14 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
   std::string type("");
 
   h5::group grp1 = grp0.open_group("Hamiltonian");
+  // Plan B4 — on-disk unit convention (schema contract in
+  // notes/paw_implementation_plan.md): energy-valued datasets are Ry for
+  // legacy files (scale 0.5 on read) and HARTREE for schema_version >= 2
+  // (scale 1). In-memory convention is always Hartree.
+  const int    pp_sv  = h5_pp_schema_version(grp1);
+  const double ry2ha  = (pp_sv >= 2) ? 1.0 : 0.5;
+  app_log(3, "  pseudopot::read_vnl_h5: schema_version = {} ({} on disk)",
+          pp_sv, (pp_sv >= 2) ? "Hartree" : "legacy Ry");
   h5::h5_read_attribute(grp1, "pp_type", type);
 
   app_log(2,"  input type: coqui::h5");
@@ -484,9 +493,10 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
       F.backward(v4D);
     }
 
-    // to Hartree unit
-    nda::tensor::scale(ComplexType(0.5),svsc.local());
-    nda::tensor::scale(ComplexType(0.5),svloc.local());
+    // to Hartree unit (legacy Ry files only; schema_version >= 2 is
+    // already Hartree on disk — plan B4)
+    nda::tensor::scale(ComplexType(ry2ha),svsc.local());
+    nda::tensor::scale(ComplexType(ry2ha),svloc.local());
   }
   if(mpi->node_comm.root()) { 
     mpi->internode_comm.broadcast_n(svsc.local().data(),svsc.size(),0);
@@ -592,7 +602,8 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
             for( int m=0; m<nhm; ++m )
               Dloc(s,n*npol+p,m*npol+p) = Dnn_r(s,n,m);
     }
-    nda::tensor::scale(ComplexType(0.5),Dnn.local());
+    // Ry -> Ha for legacy files; schema_version >= 2 is already Ha (plan B4)
+    nda::tensor::scale(ComplexType(ry2ha),Dnn.local());
     // Plan A5: dion must be Hermitian per species block and at a plausible
     // Hartree scale — catches transposed/corrupted exports and unit errors
     // (Ry/eV/e² factors) at read time instead of as finite-but-wrong
@@ -657,6 +668,24 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
       // ijtoh is integer, written as h5_write_tensor_int(ijtoh, "ijtoh") in
       // pw2coqui. Fortran (nhm, nhm, nsp) -> C++ (nsp, nhm, nhm).
       nda::h5_read(grp,"ijtoh",ijtoh);
+      // Plan B4 schema contract: ijtoh must be the sequential upper-triangle
+      // packing `for ih: for jh >= ih: ++ij` (1-based, symmetric — QE
+      // init_us_1, verified against QE 7.4.1). Only the active nh(s) block
+      // is constrained (QE pads with -1, abinit2coqui with 0). A transposed
+      // or rebased export would silently scramble every qfuncl/Q^IJ lookup.
+      for(int s=0; s<nsp; ++s) {
+        int c = 0;
+        for(int ih=0; ih<nh(s); ++ih)
+          for(int jh=ih; jh<nh(s); ++jh) {
+            ++c;
+            utils::check(ijtoh(s,ih,jh) == c && ijtoh(s,jh,ih) == c,
+                "pseudopot::read_vnl_h5: ijtoh(nt={},ih={},jh={}) = {}/{} != "
+                "expected sequential upper-triangle index {} (QE init_us_1 "
+                "convention, plan B4 schema contract) — corrupted or "
+                "non-conforming export.", s, ih, jh,
+                ijtoh(s,ih,jh), ijtoh(s,jh,ih), c);
+          }
+      }
 
       // qq_nt: real on disk for non-SOC. SOC path (qq_so) is a TODO.
       if(spinorbit_nl) {
@@ -810,32 +839,38 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
             // pfunc, ptfunc, augmom are derivable from aewfc/pswfc/qfuncl
             // (see species_paw_t comment) — not loaded.
             //
-            // ae_vloc / vloc_ps: deliberate deviation from the plan-A5
-            // required list — WARNED-optional, not hard errors. Their only
-            // consumer is compute_paw_static_D, which is NOT used in
-            // production since plan A1 (the h5 `dion` already carries the
-            // full frozen D⁰ including the AE−PS V_loc baseline), and the
-            // lih222_paw_hf fixture predates the PS-side export. Promote to
-            // required with the B1/B4 schema standardization.
+            // ae_vloc / vloc_ps: REQUIRED for schema_version >= 2 files
+            // (plan B4 promotion of the A5 deviation); warned-optional for
+            // legacy files (the lih222_paw_hf fixture predates the PS-side
+            // export, and the only consumer, compute_paw_static_D, is not
+            // used in production since plan A1). Normalized to HARTREE in
+            // memory here (legacy files store Ry — scale ry2ha).
             // ae_rho_atc / rho_atc_ps stay silent-optional: absence can be
             // PHYSICAL (no NLCC ⇒ QE writes no PS core), and
             // compute_paw_core_density documents else-zero semantics.
-            auto warn_optional = [&](h5::group& g, std::string const& ds,
-                                     auto& target) {
+            auto read_radial_vpot = [&](h5::group& g, std::string const& ds,
+                                        auto& target) {
               try { nda::h5_read(g, ds, target); }
               catch(...) {
+                utils::check(pp_sv < 2,
+                    "pseudopot::read_vnl_h5: dataset '{}' missing for PAW "
+                    "species nt{} in a schema_version={} h5 — required by "
+                    "the B4 schema contract; regenerate with the current "
+                    "converter (pw2coqui / abinit2coqui).", ds, nt, pp_sv);
                 app_log(1,
                     "WARNING pseudopot::read_vnl_h5: dataset '{}' absent for "
                     "species nt{} (pre-B1 h5 export). Only the unused "
                     "compute_paw_static_D consumes it; regenerate with the "
                     "current pw2coqui when convenient.", ds, nt);
+                return;
               }
+              target *= ry2ha;   // in-memory Hartree (plan B4)
             };
-            warn_optional(pgrp, "ae_vloc", sp.ae_vloc);
+            read_radial_vpot(pgrp, "ae_vloc", sp.ae_vloc);
             try { nda::h5_read(pgrp, "ae_rho_atc", sp.ae_rho_atc); } catch(...) {}
             // PS-side counterparts needed to reconstruct paw_init_keeq inside
             // CoQui (rather than relying on QE's ddd_paw being frozen at ρ_QE).
-            warn_optional(pgrp, "vloc_ps", sp.vloc_ps);
+            read_radial_vpot(pgrp, "vloc_ps", sp.vloc_ps);
             try { nda::h5_read(pgrp, "rho_atc_ps", sp.rho_atc_ps); } catch(...) {}
           }
           if(sp.is_paw || sp.is_uspp) {

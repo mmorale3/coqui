@@ -129,6 +129,22 @@ def dense_grid(ngfft):
     return miller, (I1.ravel(), I2.ravel(), I3.ravel())
 
 
+def dense_sphere(ngfft, rprimd, recv):
+    """G-sphere miller list (plan B4): the largest sphere inscribed in the
+    FFT box [-n/2, n/2). With ABINIT's boxcut >= 2 this contains the full
+    ecutrho = 4*ecut sphere, and matches the QE miller_g convention (an
+    ecutrho G-sphere, never the raw box). Returns (miller (ngm,3),
+    (i1,i2,i3) fft-bin indices of the kept points)."""
+    miller, (I1, I2, I3) = dense_grid(ngfft)
+    Gn = np.linalg.norm(miller @ np.asarray(recv, float), axis=1)
+    # distance from origin to box face d: (n_d/2) * 2*pi/|a_d|
+    gmax = min((ngfft[d] / 2.0) * 2.0 * np.pi / np.linalg.norm(rprimd[d])
+               for d in range(3))
+    keep = Gn < gmax * (1.0 - 1e-9)
+    return (np.ascontiguousarray(miller[keep]),
+            (I1[keep], I2[keep], I3[keep]))
+
+
 def write_hamiltonian_nc(h5root, w, vtrial, psps, rho_den=None, xc_name="pbe"):
     """Write /Hamiltonian (norm-conserving) into an open h5py root group.
     w: WFK dict (kg, npw, kpts_crys, recv, xred, typat, rprimd, nkpt=nkpts_ibz,
@@ -164,9 +180,9 @@ def write_hamiltonian_nc(h5root, w, vtrial, psps, rho_den=None, xc_name="pbe"):
     nkb = int(nh_atom.sum())
     nhm = int(nh_sp.max())
 
-    # dense grid + local potentials
+    # dense grid + local potentials (miller_g = ecutrho-style sphere, plan B4)
     ngfft = tuple(int(x) for x in np.array(vtrial).shape[1:4])
-    miller_g, (I1, I2, I3) = dense_grid(ngfft)
+    miller_g, (I1, I2, I3) = dense_sphere(ngfft, rprimd, recv)
     ngm = miller_g.shape[0]
     v = np.array(vtrial)[0, :, :, :, 0].astype(float)
     Vg = np.fft.fftn(v) / v.size                      # <G|V_KS|G'> = (1/N) sum_r ...
@@ -184,6 +200,10 @@ def write_hamiltonian_nc(h5root, w, vtrial, psps, rho_den=None, xc_name="pbe"):
 
     # ---- write ----
     H = h5root.create_group("Hamiltonian")
+    # schema_version 2: HARTREE on disk for all energy-valued datasets
+    # (contract: notes/paw_implementation_plan.md, plan B4). ABINIT is
+    # natively Ha, so no conversion factors anywhere below.
+    H.attrs.create("schema_version", np.int32(2))
     H.attrs.create("pp_type", "ncpp", dtype=VLEN)
     g = H.create_group("ncpp")
     for k, val in [("number_of_nspins", nspin), ("number_of_polarizations", npol),
@@ -193,15 +213,14 @@ def write_hamiltonian_nc(h5root, w, vtrial, psps, rho_den=None, xc_name="pbe"):
                    ("ngm", ngm), ("lspinorbit_nl", 0), ("lspinorbit_loc", 0)]:
         wattr_i(g, k, val)
     wreal(g, "miller_g", miller_g, np.int32)
-    # Potentials + dion are stored in RYDBERG (QE/pw2coqui convention): CoQui's
-    # read_vnl_h5 multiplies scf_local_potential, pp_local_component, and dion by 0.5
-    # to convert to Hartree.  ABINIT quantities are in Hartree, so write 2x.
-    vloc_ry = 2.0 * vloc_tot                              # (ngm) complex, Rydberg
-    wcplx(g, "pp_local_component", vloc_ry)               # non-SO NC path: complex (ngm)
+    # Hartree on disk (schema_version 2, plan B4): readers skip the legacy
+    # 0.5 Ry->Ha scale for version >= 2, so ABINIT's native-Ha values are
+    # written unmodified.
+    wcplx(g, "pp_local_component", vloc_tot)              # non-SO NC path: complex (ngm)
     wcplx(g, "pp_local_component_nc",                     # SO / newer builds: (nspin,npol^2,ngm)
-          np.tile(vloc_ry, (nspin, npol * npol, 1)))
+          np.tile(vloc_tot, (nspin, npol * npol, 1)))
     wcplx(g, "scf_local_potential",
-          2.0 * vks_flat.reshape(nspin, npol * npol, ngm))
+          vks_flat.reshape(nspin, npol * npol, ngm))
     # vxc / vxc_with_nlcc (Ry on disk, add_vxc scales x0.5): real values when
     # a DEN was provided (plan B2). vxc = f(rho_DEN); vxc_with_nlcc adds the
     # psp8 model core charge (NLCC) when the pseudo carries one.
@@ -238,20 +257,20 @@ def write_hamiltonian_nc(h5root, w, vtrial, psps, rho_den=None, xc_name="pbe"):
             vxc_nlcc_r = vxc_r
         vg = np.fft.fftn(vxc_r) / vxc_r.size
         vgn = np.fft.fftn(vxc_nlcc_r) / vxc_nlcc_r.size
-        wcplx(g, "vxc", 2.0 * vg[I1, I2, I3].reshape(nspin, npol * npol, ngm))
+        wcplx(g, "vxc", vg[I1, I2, I3].reshape(nspin, npol * npol, ngm))
         wcplx(g, "vxc_with_nlcc",
-              2.0 * vgn[I1, I2, I3].reshape(nspin, npol * npol, ngm))
+              vgn[I1, I2, I3].reshape(nspin, npol * npol, ngm))
     wreal(g, "proj_per_atom", nh_sp, np.int32)
     wreal(g, "projector_offset", proj_off, np.int32)
     wreal(g, "npw", np.array(w["npw"][:nk]), np.int32)
     wreal(g, "atomic_id", (typat - 1).astype(np.int32), np.int32)
-    # dion (nsp, nhm, nhm) diagonal
+    # dion (nsp, nhm, nhm) diagonal, Hartree on disk (schema_version 2)
     dion = np.zeros((nsp, nhm, nhm), dtype=np.float64)
     for isp in range(nsp):
         _, meta = build_beta_k(psps[isp], np.zeros((1, 3), int), np.zeros(3), recv,
                                np.zeros(3), vol)
         dd = np.array([m[1] for m in meta])
-        dion[isp, :len(dd), :len(dd)] = np.diag(2.0 * dd)   # Rydberg (CoQui x0.5 -> Ha)
+        dion[isp, :len(dd), :len(dd)] = np.diag(dd)         # psp8 ekb are Ha
     wreal(g, "dion", dion, np.float64)
     # per-k projectors
     for ik in range(nk):

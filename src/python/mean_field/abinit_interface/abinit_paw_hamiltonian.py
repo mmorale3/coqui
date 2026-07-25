@@ -250,18 +250,17 @@ def abinit_species_adapter(parse):
     d["beta"] = parse["proj"] * r
     # occupations of the valence channels (Species/paw/oc)
     d["oc"] = np.array([s.get("f", 0.0) for s in parse["states"]], float)
-    # ae_vloc / vloc_ps: frozen ionic HARTREE potentials, exported in the
-    # UPF/QE on-disk convention (RYDBERG; CoQui's compute_paw_static_D
-    # multiplies the V matel by 1/2). Same arrays assemble_dij0 integrates,
-    # so dion and the exported pair are mutually consistent. XC-free by
-    # design (see reconstruct_vhtnzc); this deviates from QE's UPF ae_vloc
-    # (which carries the frozen atomic XC) deliberately -- CoQui's D-matrix
-    # baseline is XC-free (plan I2).
+    # ae_vloc / vloc_ps: frozen ionic HARTREE potentials, HARTREE on disk
+    # (schema_version 2, plan B4; readers scale only legacy files). Same
+    # arrays assemble_dij0 integrates, so dion and the exported pair are
+    # mutually consistent. XC-free by design (see reconstruct_vhtnzc); this
+    # deviates from QE's UPF ae_vloc (which carries the frozen atomic XC)
+    # deliberately -- CoQui's D-matrix baseline is XC-free (plan I2).
     vhnzc, vhtnzc = ionic_hartree_potentials(parse, shape_by_L)
     if vhnzc is not None:
-        d["ae_vloc"] = 2.0 * vhnzc
+        d["ae_vloc"] = vhnzc
     if vhtnzc is not None:
-        d["vloc_ps"] = 2.0 * vhtnzc
+        d["vloc_ps"] = vhtnzc
     # AE core orbitals for the native ex_cvij builder (plan B3), u = r*R form
     if parse.get("core_ae_wfc") is not None:
         cs = parse.get("core_states") or []
@@ -465,9 +464,10 @@ def write_hamiltonian_paw(h5root, w, vtrial, paw_parses, verbose=True,
 
     species = [abinit_species_adapter(p) for p in paw_parses]
 
-    # dense grid + KS potential (from POT vtrial), same as the norm-conserving path
+    # dense grid + KS potential (from POT vtrial), same as the norm-conserving
+    # path (miller_g = ecutrho-style sphere, plan B4)
     ngfft = tuple(int(x) for x in np.array(vtrial).shape[1:4])
-    miller_g, (I1, I2, I3) = ah.dense_grid(ngfft)
+    miller_g, (I1, I2, I3) = ah.dense_sphere(ngfft, rprimd, recv)
     ngm = miller_g.shape[0]
     vloc = np.array(vtrial)[0, :, :, :, 0].astype(float)
     Vg = np.fft.fftn(vloc) / vloc.size
@@ -522,6 +522,10 @@ def write_hamiltonian_paw(h5root, w, vtrial, paw_parses, verbose=True,
 
     # ---- write /Hamiltonian/paw ----
     H = h5root.create_group("Hamiltonian")
+    # schema_version 2: HARTREE on disk for all energy-valued datasets
+    # (contract: notes/paw_implementation_plan.md, plan B4). ABINIT is
+    # natively Ha, so no conversion factors anywhere below.
+    H.attrs.create("schema_version", np.int32(2))
     H.attrs.create("pp_type", "paw", dtype=VLEN)
     g = H.create_group("paw")
     for k, val in [("number_of_nspins", nspin), ("number_of_polarizations", npol),
@@ -531,8 +535,8 @@ def write_hamiltonian_paw(h5root, w, vtrial, paw_parses, verbose=True,
                    ("ngm", ngm), ("lspinorbit_nl", 0), ("lspinorbit_loc", 0)]:
         g.attrs.create(k, np.int32(val))
     wreal(g, "miller_g", miller_g, np.int32)
-    wcplx(g, "pp_local_component", 2.0 * vloc_tot)              # Rydberg
-    wcplx(g, "scf_local_potential", 2.0 * vks_flat.reshape(nspin, npol * npol, ngm))
+    wcplx(g, "pp_local_component", vloc_tot)                    # Hartree (schema 2)
+    wcplx(g, "scf_local_potential", vks_flat.reshape(nspin, npol * npol, ngm))
     # vxc / vxc_with_nlcc (Ry on disk, add_vxc scales x0.5). Real values when a
     # DEN was provided (plan B2): vxc = f(rho_DEN) and vxc_with_nlcc =
     # f(rho_DEN + sum_a tilde-n_core) -- the pw2coqui valence-only / with-NLCC
@@ -572,9 +576,9 @@ def write_hamiltonian_paw(h5root, w, vtrial, paw_parses, verbose=True,
         vxc_nlcc_r = xcf.vxc_grid(rho_r + core_r, recv, xc_name)
         vg = np.fft.fftn(vxc_r) / vxc_r.size
         vgn = np.fft.fftn(vxc_nlcc_r) / vxc_nlcc_r.size
-        wcplx(g, "vxc", 2.0 * vg[I1, I2, I3].reshape(nspin, npol * npol, ngm))
+        wcplx(g, "vxc", vg[I1, I2, I3].reshape(nspin, npol * npol, ngm))
         wcplx(g, "vxc_with_nlcc",
-              2.0 * vgn[I1, I2, I3].reshape(nspin, npol * npol, ngm))
+              vgn[I1, I2, I3].reshape(nspin, npol * npol, ngm))
     else:
         zc = np.zeros((nspin, npol * npol, ngm), complex)
         wcplx(g, "vxc", zc); wcplx(g, "vxc_with_nlcc", zc)
@@ -582,14 +586,14 @@ def write_hamiltonian_paw(h5root, w, vtrial, paw_parses, verbose=True,
     wreal(g, "projector_offset", proj_off, np.int32)
     wreal(g, "npw", np.array(w["npw"][:nk]), np.int32)
     wreal(g, "atomic_id", atomic_id, np.int32)
-    # dion (nsp,nhm,nhm): D^0 from dij0, m-diagonal, Rydberg
+    # dion (nsp,nhm,nhm): D^0 from dij0, m-diagonal, Hartree (schema 2)
     dion = np.zeros((nsp, nhm, nhm), np.float64)
     for isp, s in enumerate(species):
         ch = aug["per_sp"][isp]["ch"]; nh = ch["nh"]
         for I in range(nh):
             for J in range(nh):
                 if ch["nhtolm"][I] == ch["nhtolm"][J]:
-                    dion[isp, I, J] = 2.0 * s["dij0"][ch["indv"][I] - 1, ch["indv"][J] - 1]
+                    dion[isp, I, J] = s["dij0"][ch["indv"][I] - 1, ch["indv"][J] - 1]
     wreal(g, "dion", dion, np.float64)
     # per-k PAW projectors beta(k+G) = r*proj transform
     for ik in range(nk):

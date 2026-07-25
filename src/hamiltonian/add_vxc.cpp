@@ -24,6 +24,7 @@
 #include "numerics/distributed_array/nda.hpp"
 #include "numerics/shared_array/nda.hpp"
 #include "mean_field/MF.hpp"
+#include "hamiltonian/pseudo/pp_schema.hpp"
 #include "add_vloc.hpp"
 #include "add_vxc.h"
 
@@ -140,8 +141,9 @@ void read_vxc_h5(MF_t &mf, h5::group& grp0, shared_array<array_t> &svxc)
     nda::copy_select(true,1,k2g,ComplexType(1.0),vl_2D,ComplexType(0.0),vxc_2D);
     F.backward(vxc_4D);
 
-    // to Hartree unit
-    nda::tensor::scale(ComplexType(0.5), vxc_2D);
+    // to Hartree unit (legacy Ry files only; schema_version >= 2 is
+    // already Hartree on disk — plan B4)
+    nda::tensor::scale(ComplexType(h5_pp_ry2ha(grp1)), vxc_2D);
   }
   if(svxc.node_comm()->root()) {
     svxc.internode_comm()->broadcast_n(svxc.local().data(), svxc.size(), 0);

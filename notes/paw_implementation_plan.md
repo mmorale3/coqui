@@ -89,6 +89,43 @@ preserved; new ones are additive.
       ae_wfc(mesh, ncore)
 ```
 
+### Schema contract (plan B4, 2026-07-24 — single source of truth)
+
+**`schema_version`** (int attribute on `/Hamiltonian`):
+
+| version  | meaning |
+|----------|---------|
+| (absent) | legacy export: carried QE `deeq`/`deeq_nc`; energy-valued datasets in **Ry** (QE) or Ry-convention ×2 (abinit2coqui ≤ B2) |
+| 1        | deeq-free (B1); units unchanged (Ry convention) |
+| 2        | deeq-free + **Hartree on disk** for every energy-valued `/Hamiltonian` dataset |
+
+**Units.** Energy-valued datasets covered by the rule: `dion`, `dion_so`,
+`Species/{nt}/dion`, `Species/{nt}/paw/{ae_vloc, vloc_ps}`,
+`pp_local_component[_nc]`, `scf_local_potential`, `vxc`, `vxc_with_nlcc`.
+Readers apply the 0.5 Ry→Ha scale **only when `schema_version < 2`**
+(`hamilt::h5_pp_ry2ha`). Always-Hartree regardless of version (never
+scaled): `Onecenter/deltaC`, `Onecenter/ex_cvij`, `/System` energy
+attributes (`nuclear_energy`, `madelung_constant`, `fermi_energy`,
+`exx_core_core`), `/Orbitals/eigval`. Unit-free: projectors/`beta`,
+partial waves, `qfuncl`/`qqq`/`qq_nt`/`qq_so` (charges), densities
+(`*rho_atc*`), channel maps. In-memory convention after read is Hartree
+for everything, including `ae_vloc`/`vloc_ps` (read-time scaled).
+`pseudopot_to_h5.hpp` (pw2bgw plot-file import) still emits legacy-Ry
+files without the attribute — intentionally valid as "legacy".
+
+**`miller_g`** is an **ecutrho G-sphere** on both converters (QE: the
+native `ngm_g` gvect sphere; abinit2coqui ≥ B4: the `ecutrho` sphere
+carved from the FFT box — no longer the full box). Readers map it onto
+`fft_mesh_aug` via `generate_k2g` and make no completeness assumption.
+
+**`ijtoh`** has shape `(nsp, nhm, nhm)` (h5/row-major), 1-based values:
+`ijtoh(nt, ih, jh)` = position of pair (ih, jh) in the sequential
+upper-triangle enumeration `for ih: for jh >= ih: ++ij` (QE `init_us_1`,
+verified against QE 7.4.1). Symmetric; padding beyond `nh(nt)` is
+UNCONSTRAINED (QE writes −1, abinit2coqui writes 0 — readers must only
+touch the active `nh(nt)` block). `read_vnl_h5` recomputes the expected
+packing per species over the active block and hard-errors on mismatch (B4).
+
 CoQui-internal caches (Phase 3+) live under a separate root, e.g.
 `/PAW_Cache/Species/{nt}/{U, eta, K_fit}` keyed by fit parameters. Not part
 of the converter contract.

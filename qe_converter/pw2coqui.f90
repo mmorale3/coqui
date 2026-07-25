@@ -373,6 +373,7 @@ subroutine write_pp(h5_f)
   USE fft_base, ONLY : dfftp, dffts
   USE uspp, ONLY : okvan, vkb, nkb, ofsbeta, ijtoh, dvan, dvan_so, qq_so, qq_nt
   USE uspp_param, ONLY : nhm, nh, upf, lmaxq
+  USE constants, ONLY : e2
   USE scf, ONLY : vltot, v, rho, rho_core, rhog_core
   USE ener, ONLY : etxc, vtxc, ehart, epaw
   USE wavefunctions, ONLY : psic
@@ -395,11 +396,13 @@ subroutine write_pp(h5_f)
   real(dp) :: v3(3,3)
   real(dp), allocatable :: vxc(:,:)
   character(len=12) pp_type
-  logical :: ik_in_range 
+  logical :: ik_in_range
   character(len=8) str_ik
-  complex (DP), allocatable :: vkb_g ( : ), vloc( :, :, : ) 
+  complex (DP), allocatable :: vkb_g ( : ), vloc( :, :, : )
   complex (DP), allocatable :: vkb_g_root ( :, : )
   character(len=2) sp_name
+  real (DP), allocatable :: dvan_ha( :, :, : )        ! Ha copies (schema 2)
+  complex (DP), allocatable :: dvan_so_ha( :, :, :, : )
 
   ns = 1
   if(lsda) ns = 2
@@ -416,10 +419,14 @@ subroutine write_pp(h5_f)
     endif
 
     call qeh5_open_group(h5_f, "Hamiltonian", h5_h)
-    ! CoQui pseudopot schema version:
+    ! CoQui pseudopot schema version (contract: notes/paw_implementation_plan.md):
     !   (absent) : legacy exports (carried QE deeq; QE-native Ry units)
-    !   1        : deeq-free (CoQui builds D natively); units unchanged
-    call qeh5_add_attribute(h5_h%id,"schema_version",1)
+    !   1        : deeq-free (CoQui builds D natively); still Ry on disk
+    !   2        : deeq-free + HARTREE on disk for all /Hamiltonian energy-
+    !              valued datasets (dion[_so], Species dion, ae_vloc, vloc_ps,
+    !              pp_local_component, scf_local_potential, vxc[_with_nlcc]).
+    !              Readers apply the 0.5 Ry->Ha scale ONLY for version < 2.
+    call qeh5_add_attribute(h5_h%id,"schema_version",2)
     call qeh5_add_attribute(h5_h%id,"pp_type",TRIM(pp_type))
     call qeh5_open_group(h5_h, TRIM(pp_type), h5_n)  
 
@@ -449,13 +456,19 @@ subroutine write_pp(h5_f)
     call h5_write_vector_int(h5_n,npw_g(1:nk),"npw")
 
     if(lspinorb) then
-      ! (nhm,nhm,nspin,nsp)
-      call h5_write_tensor4_c(h5_n,dvan_so,"dion_so")
+      ! (nhm,nhm,nspin,nsp), Hartree on disk (schema_version 2)
+      allocate(dvan_so_ha(size(dvan_so,1),size(dvan_so,2),size(dvan_so,3),size(dvan_so,4)))
+      dvan_so_ha = dvan_so / e2
+      call h5_write_tensor4_c(h5_n,dvan_so_ha,"dion_so")
+      deallocate(dvan_so_ha)
       ! qq_so: (nhm,nhm,4,nsp), spinor-coupled augmentation overlap
       if(allocated(qq_so)) call h5_write_tensor4_c(h5_n,qq_so,"qq_so")
     else
-      ! (nhm,nhm,nsp)
-      call h5_write_tensor_r(h5_n,dvan,"dion")
+      ! (nhm,nhm,nsp), Hartree on disk (schema_version 2)
+      allocate(dvan_ha(size(dvan,1),size(dvan,2),size(dvan,3)))
+      dvan_ha = dvan / e2
+      call h5_write_tensor_r(h5_n,dvan_ha,"dion")
+      deallocate(dvan_ha)
     endif
     ! qq_nt(nhm,nhm,nsp): species-resolved augmentation overlap S = 1 + Σ |β⟩q⟨β|
     if(allocated(qq_nt)) call h5_write_tensor_r(h5_n,qq_nt,"qq_nt")
@@ -584,6 +597,7 @@ subroutine write_pp(h5_f)
   CALL mp_sum ( vloc, intra_bgrp_comm )
   if(ionode) then
     call h5_write_mat_int(h5_n,mill_g,"miller_g")
+    vloc = vloc / e2                                ! Hartree (schema 2)
     call h5_write_tensor_c(h5_n,vloc,"scf_local_potential")
   endif
 
@@ -602,6 +616,7 @@ subroutine write_pp(h5_f)
   call qeh5_add_attribute(h5_n%id,"lspinorbit_loc",0)
   CALL mp_sum ( vloc, intra_bgrp_comm )
   if(ionode) then
+    vloc = vloc / e2                                ! Hartree (schema 2)
     call h5_write_vector_c(h5_n,vloc(:,1,1),"pp_local_component")
   endif
   ! pp_local_component_nc for polarization dependent potential, 
@@ -652,6 +667,7 @@ subroutine write_pp(h5_f)
     ENDDO
     CALL mp_sum ( vloc, intra_bgrp_comm )
     if(ionode) then
+      vloc = vloc / e2                              ! Hartree (schema 2)
       call h5_write_tensor_c(h5_n,vloc,"vxc_with_nlcc")
     endif
     !
@@ -698,6 +714,7 @@ subroutine write_pp(h5_f)
     ENDDO
     CALL mp_sum ( vloc, intra_bgrp_comm )
     if(ionode) then
+      vloc = vloc / e2                              ! Hartree (schema 2)
       call h5_write_tensor_c(h5_n,vloc,"vxc")
     endif
     deallocate(vxc)
@@ -840,6 +857,7 @@ SUBROUTINE write_species(h5_f)
   integer :: nt, mesh, ncore
   logical :: any_paw
   real(DP), allocatable :: deltaC_Ha(:,:,:,:)
+  real(DP), allocatable :: dion_ha(:,:), v_ha(:)     ! Ha copies (schema 2)
   !
   if (.not.ionode) return
   !
@@ -886,7 +904,10 @@ SUBROUTINE write_species(h5_f)
     call h5_write_vector_int(h5_nt, upf(nt)%lll(1:upf(nt)%nbeta), "lll")
     call h5_write_vector_int(h5_nt, upf(nt)%kbeta(1:upf(nt)%nbeta), "kbeta")
     call h5_write_mat_r(h5_nt, upf(nt)%beta(1:mesh,1:upf(nt)%nbeta), "beta")
-    call h5_write_mat_r(h5_nt, upf(nt)%dion(1:upf(nt)%nbeta,1:upf(nt)%nbeta), "dion")
+    allocate(dion_ha(upf(nt)%nbeta, upf(nt)%nbeta))
+    dion_ha = upf(nt)%dion(1:upf(nt)%nbeta,1:upf(nt)%nbeta) / e2   ! Ha (schema 2)
+    call h5_write_mat_r(h5_nt, dion_ha, "dion")
+    deallocate(dion_ha)
     !
     ! ih → (l, lm, j) maps - per-species slices of global uspp tables
     if (allocated(nhtolm)) &
@@ -941,8 +962,11 @@ SUBROUTINE write_species(h5_f)
         call h5_write_tensor_r(h5_paw, upf(nt)%paw%ptfunc, "ptfunc")
       if (allocated(upf(nt)%paw%augmom)) &
         call h5_write_tensor_r(h5_paw, upf(nt)%paw%augmom, "augmom")
-      if (allocated(upf(nt)%paw%ae_vloc)) &
-        call h5_write_vector_r(h5_paw, upf(nt)%paw%ae_vloc, "ae_vloc")
+      if (allocated(upf(nt)%paw%ae_vloc)) then
+        v_ha = upf(nt)%paw%ae_vloc / e2                                    ! Ha (schema 2)
+        call h5_write_vector_r(h5_paw, v_ha, "ae_vloc")
+        deallocate(v_ha)
+      endif
       if (allocated(upf(nt)%paw%ae_rho_atc)) &
         call h5_write_vector_r(h5_paw, upf(nt)%paw%ae_rho_atc, "ae_rho_atc")
       if (allocated(upf(nt)%paw%oc)) &
@@ -954,8 +978,11 @@ SUBROUTINE write_species(h5_f)
       ! the smooth core density used for NLCC. Both are top-level UPF
       ! fields (not under upf%paw%) but we co-locate them inside the
       ! `paw` h5 subgroup since they are only consumed by the PAW path.
-      if (allocated(upf(nt)%vloc)) &
-        call h5_write_vector_r(h5_paw, upf(nt)%vloc, "vloc_ps")
+      if (allocated(upf(nt)%vloc)) then
+        v_ha = upf(nt)%vloc / e2                                           ! Ha (schema 2)
+        call h5_write_vector_r(h5_paw, v_ha, "vloc_ps")
+        deallocate(v_ha)
+      endif
       if (allocated(upf(nt)%rho_atc)) &
         call h5_write_vector_r(h5_paw, upf(nt)%rho_atc, "rho_atc_ps")
       !

@@ -43,6 +43,18 @@ Plan-B2 additions (2026-07-24):
   first cluster campaign.
 - The analytic compensation shape is cross-checked against a tabulated
   `<shape_function>` when the XML carries one — hard error on mismatch.
+- `--corewf` (atompaw `.corewf.xml` companions, one per `--pawxml`) populates
+  `Species/Core/` for CoQui's native ex_cvij builder (plan B3).
+
+Plan-B4 schema standardization (2026-07-24):
+
+- `/Hamiltonian@schema_version = 2`: everything energy-valued is written in
+  **Hartree** (ABINIT-native; the old ×2 Ry factors are gone). CoQui readers
+  apply the 0.5 Ry→Ha scale only to legacy files (version < 2). Contract:
+  `notes/paw_implementation_plan.md`, "Schema contract".
+- `miller_g` is now a G-**sphere** (largest sphere inscribed in the FFT box,
+  ⊇ the ecutrho sphere at ABINIT's boxcut ≥ 2), matching the QE convention —
+  no longer the full FFT box.
 
 ## Required ABINIT run settings
 

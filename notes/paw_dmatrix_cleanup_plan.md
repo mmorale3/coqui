@@ -10,7 +10,54 @@ printed into context at session start by a SessionStart hook).
 
 ## STATUS
 
-Last updated: 2026-07-24 — ∫V_loc·Q̂ SETTLED (user directive + derivation;
+Last updated: 2026-07-24 (late) — Workstream B COMPLETE (B1–B4, four
+commits, one per item). B1: pw2coqui drops deeq/deeq_nc, stamps
+schema_version; verified end-to-end on a fresh Si-NCPP conversion (attr
+present, no deeq, check_schema green). B2: all six abinit2coqui items —
+Species/paw/{ae_vloc,vloc_ps} from the same XC-free ionic-Hartree pair
+assemble_dij0 integrates (tails → −zval checked); per-species proj_per_atom
+in both writers (F10a, matches the A5 reader); real vxc/vxc_with_nlcc from
+an ABINIT DEN via new xc_functionals.py (PW92+PBE, FD derivatives, spectral
+grad/div — reproduces QE v_xc from QE's own ρ(G) to 3.4e-11 Ry); real
+nuclear_energy + madelung_constant via new lattice_sums.py (NaCl Madelung 8
+digits, QE ewald 2e-8 Ha α-independent, exact utils::madelung port to 10
+digits); Species/beta + paw/oc + Core/{n,l,ae_wfc} + exx_core_core attrs;
+tabulated-vs-analytic <shape_function> hard check. CAVEAT: DEN/NLCC wiring
+unexercised against real ABINIT files on this host (no WFK/POT/DEN assets)
+— recheck in the B-tests cluster campaign. B3: native ex_cvij
+(paw_onecenter.hpp compute_ex_cvij_from_core): −δ_lm Σ_c Σ_L (2l_c+1)·
+3j000²·R^L, cumulative-Simpson-in-index quadrature (trapezoid loses 2.5e-5
+rel — measured); sign/factor pinned on ABINIT m_pawdij (dijfock_cv =
+ex_cvij, factor 1); validated vs a real atompaw Al-stringent
+<exact_exchange_X_matrix> (~1e-7 rel, validate_ex_cvij.py, local
+abinit-10.6.7 tree) + hydrogenic K(1s,2s)=16Z/729, K(1s,2p)=112Z/6561
+(~3e-11) + new TEST_CASE ex_cvij_native; wired into read_vnl_h5 after the
+Core/ read (detection: h5 ex_cvij → native-from-Core → none+warn);
+abinit2coqui --corewf added (atompaw companion XMLs; ids matched by name or
+document order). B4: schema_version=2 = HARTREE on disk (contract written
+into notes/paw_implementation_plan.md §Schema contract): pw2coqui ÷e2 on
+dion[_so]/Species dion/ae_vloc/vloc_ps/pp_local/scf_local/vxc[_with_nlcc];
+abinit writers drop their ×2 and emit native Ha + miller_g as a G-SPHERE
+(box-inscribed ⊇ ecutrho at boxcut≥2) instead of the full FFT box; readers
+scale ×0.5 ONLY for schema_version<2 (new pp_schema.hpp::h5_pp_ry2ha; sites:
+read_vnl_h5 dion + svsc/svloc, add_vxc) — in-memory convention is now
+Hartree everywhere incl. ae_vloc/vloc_ps (compute_paw_static_D ×½ dropped);
+ae_vloc/vloc_ps promoted to REQUIRED for schema≥2 (A5 deviation closed);
+ijtoh verified at read per species against the QE init_us_1 sequential
+upper-triangle packing (QE 7.4.1 source-verified; padding unconstrained: QE
+−1, abinit 0). VALIDATION: fresh v2 Si conversion vs a synthesized legacy
+twin (same data ×2 + schema 1) → one-body energy Tr[γ(T+Vpp)] BIT-IDENTICAL
+(2.4215026009313685 Ha) through the full reader; writer-level v1 = 2×v2
+bit-exact on dion/Species-dion/pp_local; pw2bgw/VSC/VLTOT plot-file paths
+stay unconditionally ×0.5 (non-h5, always legacy — pseudopot_to_h5 emits
+unstamped legacy files, documented). Fast suite green pre-B4 (13524/35 with
+ex_cvij_native) and post-B4 (value-identical expected — see commit note).
+Python deps installed on this host for the converter work: h5py, scipy,
+netCDF4 (homebrew python 3.14). Remaining Workstream B: B-tests (same-system
+Si PAW via both converters — needs ABINIT data → cluster campaign; closes
+the [[project_si_exx_rpa_abinit_mf_anomaly]]).
+
+Previous update: ∫V_loc·Q̂ SETTLED (user directive + derivation;
 post-A5). The term is the frozen one-body ELECTROSTATIC coupling ∫n̂·V_loc
 — neither exchange nor correlation — and is ALWAYS included. It is NOT in
 dion: Eq. d0's −⟨Q̂|v_H[ñ_Zc]⟩ is the opposite-sign ONE-CENTER descreening
@@ -129,11 +176,11 @@ Workstream A — pseudopot D-matrix refactor
 - [ ] A-tests: (i) nii≡nij≡no-density+Hartree DONE 2026-07-24 (h0_plus_hartree_identity + add_vpp_i5_alignment, after ∫V_loc·Q̂ settlement); (ii) sym≡nosym DONE via A3 (becsum_full_symm + sym fixture sections); remaining: ex_cvij factor-1 e_1e (vs ABINIT −0.521220 Ha si222); QE-eigenvalue diagnostic rework (USPP/PAW 0.749/0.790 Ha semicore)
 
 Workstream B — converter parity
-- [ ] B1 QE: delete deeq/deeq_nc export; schema_version attribute
-- [ ] B2 ABINIT: ae_vloc/vloc_ps export; per-species proj_per_atom; real vxc; Ewald/madelung; beta + Core/; shape_function check
-- [ ] B3 native ex_cvij builder from Core/ae_wfc (Slater R^L + Gaunt²), validated vs ABINIT-XML ex_cvij
-- [ ] B4 schema standardization (Ha on disk, miller_g sphere, ijtoh shape verified)
-- [ ] B-tests: same-system Si PAW via both converters — dataset diff + e_1e/e_hf/e_rpa parity (closes ABINIT-mf anomaly)
+- [x] B1 QE: delete deeq/deeq_nc export; schema_version attribute — 2026-07-24 (079783b)
+- [x] B2 ABINIT: ae_vloc/vloc_ps export; per-species proj_per_atom; real vxc; Ewald/madelung; beta + Core/; shape_function check — 2026-07-24 (445a0b3; DEN/NLCC wiring pending on-cluster recheck)
+- [x] B3 native ex_cvij builder from Core/ae_wfc (Slater R^L + Gaunt²), validated vs ABINIT-XML ex_cvij (~1e-7 rel) + hydrogenic analytics — 2026-07-24 (f451083)
+- [x] B4 schema standardization (schema_version=2 Ha on disk both converters; miller_g sphere on ABINIT side; ijtoh packing verified at read; ae_vloc/vloc_ps required for v2; contract in notes/paw_implementation_plan.md) — 2026-07-24
+- [ ] B-tests: same-system Si PAW via both converters — dataset diff + e_1e/e_hf/e_rpa parity (closes ABINIT-mf anomaly); needs ABINIT WFK/POT/DEN assets (cluster); also recheck B2 DEN layout + psp8 NLCC-block convention there
 
 Workstream C — augmentation-density modes
 - [ ] C1 single mode flag (drop paw_exx_shape_restored bool); deltaC inclusion derived from mode

@@ -76,7 +76,10 @@ The converter writes `<prefix>.coqui.h5` with:
 /System/                    # cell, atoms, k-mesh, symmetries, eigenvalues
 /Orbitals/                  # mesh sizes, eigenvalues, occupations
 /Hamiltonian/
-  schema_version            # attribute: 1 (deeq-free; absent = legacy export)
+  schema_version            # attribute: 2 = deeq-free + HARTREE on disk for all
+                            # energy-valued datasets; 1 = deeq-free, Ry; absent =
+                            # legacy export (readers scale x0.5 only for < 2).
+                            # Contract: notes/paw_implementation_plan.md.
   pp_type                   # attribute: "ncpp" | "uspp" | "paw"
   {ncpp|uspp|paw}/          # plane-wave PP data: dion[_so], qq_so, qq_nt,
                             # vkb projectors, miller indices, local + scf

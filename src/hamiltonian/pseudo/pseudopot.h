@@ -232,11 +232,14 @@ class pseudopot
     nda::array<double,1> ae_vloc;      // (mesh) AE radial local potential
                                        // (= -Z/r screened by frozen AE core
                                        //  Hartree). Diagonal of T+V_AE_static.
+                                       // In-memory HARTREE (plan B4: read-time
+                                       // scaled; legacy h5 stores Ry).
     nda::array<double,1> ae_rho_atc;   // (mesh) AE atomic core density ρ_core_AE
     nda::array<double,1> vloc_ps;      // (mesh) PS radial local pseudopotential
                                        // — paired with ae_vloc, needed for the
                                        //   PAW static one-center D matrix
                                        //   (kinetic + ionic, frozen-core).
+                                       // In-memory HARTREE (plan B4).
     nda::array<double,1> rho_atc_ps;   // (mesh) PS atomic core density ρ_core_PS
                                        //   (NLCC). Required for the dynamic
                                        //   one-center Hartree update
