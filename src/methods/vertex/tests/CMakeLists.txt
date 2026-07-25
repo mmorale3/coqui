@@ -132,3 +132,32 @@ target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield eri_li
 
 add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
 set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR})
+
+# ISDF-Vertex self-consistency diagnostic (missing controls for the Si M8 divergence):
+# the little-group residual of the SELF-CONSISTENT G with the vertex OFF (baseline
+# control the IBZ test never measured), the same with the vertex ON over several
+# iterations, and a sym-vs-nosym e_corr TRAJECTORY (the gold check only looks at
+# 2 iterations with a 25%-of-shift tolerance).
+set(TEST_ID methods_vertex_scdiag)
+
+add_executable(test_${TEST_ID} test_vertex_scdiag.cpp)
+target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield eri_lib hf_lib
+                      vertex_lib gw_lib scf_lib)
+
+add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
+set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR})
+
+# ISDF-Vertex: ABSOLUTE normalization/sign cross-check of Sigma^C against CoQui's own
+# bare second-order exchange (GF2 exchange channel, pyscf-pinned). With C = full band
+# range and W -> Z the vertex functional IS the bare second-order exchange, so the two
+# self-energies must be identical. This is the check verified-cut-verdicts flagged as
+# "recommended before production" and that was never run: it is the only test that
+# constrains the ABSOLUTE prefactor (powers of 1/N_k, 1/beta) and the overall sign.
+set(TEST_ID methods_vertex_gf2xchk)
+
+add_executable(test_${TEST_ID} test_vertex_gf2xchk.cpp)
+target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield eri_lib hf_lib
+                      vertex_lib gw_lib gf2_lib scf_lib)
+
+add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
+set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR})
