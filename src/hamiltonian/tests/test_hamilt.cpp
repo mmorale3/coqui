@@ -2625,6 +2625,101 @@ TEST_CASE("add_vpp_i5_alignment", "[hamilt][paw][hf]")
 }
 
 // ===========================================================================
+// H(n) ≡ H0 + Vhartree(n) — plan A-tests item (i), enabled by the settled
+// ∫V_loc·Q̂ placement (2026-07-24): Eq. (h0)'s static USPP/PAW D now carries
+// the frozen electrostatic compensation term (static_h0_D = dion + ex_cvij
+// + ∫V_loc·Q̂ — always included, it is neither exchange nor correlation and
+// is NOT contained in dion, whose −⟨Q̂|v_H[ñ_Zc]⟩ is the opposite-sign
+// one-center descreening reference). With it, the density path (which
+// integrates (V_loc+V_H)·Q̂ in one pass) and the static + Hartree
+// composition build the identical operator, for both nii and nij, on nosym
+// and symmetry-reduced meshes. Residual = FFT-linearity + summation order.
+// ===========================================================================
+template<MEMORY_SPACE MEM>
+void test_h0_plus_hartree_identity(mpi_context_t& mpi,
+                                   std::shared_ptr<mf::MF> mf_ptr, double tol)
+{
+  auto& mfobj = *mf_ptr;
+  long nspin  = mfobj.nspin();
+  long nk_ibz = mfobj.nkpts_ibz();
+  long nbnd   = mfobj.nbnd();
+
+  // Non-QE diagonal occupation + equivalent nij (as in the I5 test).
+  nda::array<ComplexType,3> nii(nspin, nk_ibz, nbnd);
+  for (long s = 0; s < nspin; ++s)
+    for (long k = 0; k < nk_ibz; ++k)
+      for (long n = 0; n < nbnd; ++n)
+        nii(s, k, n) = ComplexType(0.5 + 0.3*std::cos(1.3*n + 0.7*k + 0.2*s), 0.0);
+  nda::array<ComplexType,4> nij(nspin, nk_ibz, nbnd, nbnd);
+  nij() = ComplexType(0.0);
+  for (long s = 0; s < nspin; ++s)
+    for (long k = 0; k < nk_ibz; ++k)
+      for (long n = 0; n < nbnd; ++n)
+        nij(s, k, n, n) = nii(s, k, n);
+
+  hamilt::pseudopot V(mfobj);
+
+  auto dH0     = hamilt::H0<MEM>(mfobj, mpi.comm, &V);
+  auto dH_nii  = hamilt::H<MEM>(mfobj, mpi.comm, &V, nii);
+  auto dH_nij  = hamilt::H<MEM>(mfobj, mpi.comm, &V, nij);
+  auto dVH_nii = hamilt::Vhartree<MEM>(mfobj, mpi.comm, &V, nii);
+  auto dVH_nij = hamilt::Vhartree<MEM>(mfobj, mpi.comm, &V, nij);
+
+  auto check_sum = [&](auto const& dH, auto const& dVH, char const* lbl) {
+    auto h  = nda::to_host(dH.local());
+    auto h0 = nda::to_host(dH0.local());
+    auto vh = nda::to_host(dVH.local());
+    double d = 0.0, vmax = 0.0;
+    for (long i0 = 0; i0 < h.extent(0); ++i0)
+      for (long i1 = 0; i1 < h.extent(1); ++i1)
+        for (long i2 = 0; i2 < h.extent(2); ++i2)
+          for (long i3 = 0; i3 < h.extent(3); ++i3) {
+            d = std::max(d, std::abs(h(i0,i1,i2,i3)
+                                     - (h0(i0,i1,i2,i3) + vh(i0,i1,i2,i3))));
+            vmax = std::max(vmax, std::abs(vh(i0,i1,i2,i3)));
+          }
+    d = mpi.comm.all_reduce_value(d, boost::mpi3::max<>{});
+    vmax = mpi.comm.all_reduce_value(vmax, boost::mpi3::max<>{});
+    app_log(1, "[H0+VH identity] {}: max|H(n) - (H0 + VH(n))| = {:.3e}, "
+               "max|VH| = {:.3e}", lbl, d, vmax);
+    REQUIRE(vmax > 1e-8);   // Hartree must actually contribute
+    CHECK(d < tol);
+  };
+  check_sum(dH_nii, dVH_nii, "nii");
+  check_sum(dH_nij, dVH_nij, "nij");
+}
+
+TEST_CASE("h0_plus_hartree_identity", "[hamilt][paw][hf]")
+{
+  auto& mpi = utils::make_unit_test_mpi_context();
+  SECTION("lih_kp222_nbnd16 (NCPP)") {
+    auto mf_ptr = std::make_shared<mf::MF>(
+        mf::default_MF(mpi, "qe_lih222_hf", mf::h5_input_type));
+    test_h0_plus_hartree_identity<HOST_MEMORY>(*mpi, mf_ptr, 1e-10);
+  }
+  SECTION("lih_kp222_nbnd16 (USPP)") {
+    auto mf_ptr = std::make_shared<mf::MF>(
+        mf::default_MF(mpi, "qe_lih222_uspp_hf", mf::h5_input_type));
+    test_h0_plus_hartree_identity<HOST_MEMORY>(*mpi, mf_ptr, 1e-10);
+  }
+  SECTION("lih_kp222_nbnd16 (PAW)") {
+    auto mf_ptr = std::make_shared<mf::MF>(
+        mf::default_MF(mpi, "qe_lih222_paw_hf", mf::h5_input_type));
+    test_h0_plus_hartree_identity<HOST_MEMORY>(*mpi, mf_ptr, 1e-10);
+  }
+  SECTION("lih_kp222_nbnd16 (PAW, sym)") {
+    auto mf_ptr = std::make_shared<mf::MF>(
+        mf::default_MF(mpi, "qe_lih222_paw_sym", mf::h5_input_type));
+    test_h0_plus_hartree_identity<HOST_MEMORY>(*mpi, mf_ptr, 1e-10);
+  }
+  SECTION("si_kp222 (PAW, sym)") {
+    auto mf_ptr = std::make_shared<mf::MF>(
+        mf::default_MF(mpi, "qe_si222_paw_sym", mf::h5_input_type));
+    test_h0_plus_hartree_identity<HOST_MEMORY>(*mpi, mf_ptr, 1e-10);
+  }
+}
+
+// ===========================================================================
 // Vexchange(nij) reduces to Vexchange(nii) for a DIAGONAL density matrix.
 // Validates the new full-density-matrix exchange path: the natural-orbital
 // decomposition of nij = diag(nii) recovers the canonical bands (with

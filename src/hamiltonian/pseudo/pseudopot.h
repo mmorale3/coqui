@@ -446,6 +446,24 @@ class pseudopot
   // function of the immutable pseudopot state plus the explicit key
   // arguments, so the cache is shared across pseudopot copies.
   paw::runtime_caches& paw_rt() const;
+  // ∫ V(r) Q̂^a_IJ(r) dr on the dense (augmentation) grid for an arbitrary
+  // local potential V(r) (proper-FT contraction with qgm; e^{+iG·τ} phase).
+  // Returns (nat, nhm, nhm); zero for NCPP / empty V / empty qgm. Only the
+  // comm root needs valid V content (root FFTs and broadcasts V(G); the G
+  // contraction is strided over all ranks). MPI-COLLECTIVE on this
+  // pseudopot's communicator. Defined in paw_onecenter.hpp.
+  template<typename Pot_t>
+  nda::array<ComplexType,3> compute_int_VQ(Pot_t const& V_r) const;
+  // Eq. (h0) static USPP/PAW non-local D:
+  //     D_h0 = Dnn_atom_static (dion + ex_cvij)  +  ∫ V_loc · Q̂
+  // The second term is the frozen one-body ELECTROSTATIC coupling of the
+  // compensation charge to the local potential — neither exchange nor
+  // correlation, so it is ALWAYS included (settled 2026-07-24). It is NOT
+  // contained in dion: Eq. (d0)'s −⟨Q̂|v_H[ñ_Zc]⟩ is the one-center
+  // DESCREENING reference (opposite sign, radial, own-atom), put there
+  // precisely so the solid re-adds the full periodic integral. Lazily
+  // cached (V_loc and Q̂ are frozen); MPI-COLLECTIVE at first call.
+  nda::array<ComplexType,3> const& static_h0_D() const;
   // Angular-momentum coupling tables at lli = 1 + max l over all projectors.
   paw::aainit_tables const& paw_aatab() const;
   // Per-species qrad interpolation tables at the SINGLE project-wide

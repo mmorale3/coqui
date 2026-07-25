@@ -498,61 +498,11 @@ nda::array<ComplexType,3> pseudopot::compute_paw_deeq_from_becsum(
                 Dion(ia, I, J) += ComplexType(rad_fac * res.dDeeq_H(I, J), 0.0);
     }
 
-    // ---- (3) dynamic G-space ∫ Vloc_r(r) Q^IJ_a(r) dr (proper-FT contraction
-    // with qgm; e^{+iG·τ} phase). Skipped if Vloc_r is empty. The FFT of V is
-    // done on the comm root (only root is guaranteed valid Vloc_r content)
-    // and broadcast; the G contraction is then strided over ALL comm ranks
-    // and all_reduced (plan A4 — this loop was root-serial).
+    // ---- (3) dynamic G-space ∫ V(r) Q̂^a_IJ(r) dr — factored into
+    // compute_int_VQ (also used for the frozen ∫V_loc·Q̂ of Eq. (h0)'s
+    // static D, see static_h0_D). Zero when Vloc_r is empty.
     if (Vloc_r.size() > 0 && qgm.local().size() > 0) {
-      nda::array<ComplexType,3> Dg(nat, nhm, nhm);
-      Dg() = ComplexType(0.0);
-      long NX = fft_mesh_aug(0), NY = fft_mesh_aug(1), NZ = fft_mesh_aug(2);
-      nda::array<ComplexType,1> vh_g(nnr_aug);
-      if (mpi->comm.root()) {
-        for (long r = 0; r < nnr_aug; ++r) vh_g(r) = Vloc_r(r);
-        auto vh3d = nda::reshape(vh_g, std::array<long,3>{NX, NY, NZ});
-        math::nda::fft<false> Ffwd(vh3d);
-        Ffwd.forward(vh3d);                          // 1/N-normalized = proper FT
-      }
-      mpi->comm.broadcast_n(vh_g.data(), vh_g.size(), 0);
-      {
-        double det = recv(0,0)*(recv(1,1)*recv(2,2) - recv(1,2)*recv(2,1))
-                   - recv(1,0)*(recv(0,1)*recv(2,2) - recv(0,2)*recv(2,1))
-                   + recv(2,0)*(recv(0,1)*recv(1,2) - recv(0,2)*recv(1,1));
-        double Omega = (2.0*M_PI)*(2.0*M_PI)*(2.0*M_PI) / std::abs(det);
-        auto qg = qgm.local();
-        long np = mpi->comm.size(), r0 = mpi->comm.rank();
-        for (long g = r0; g < ngm_dense; g += np) {
-          int m1 = miller_g_dense(g,0), m2 = miller_g_dense(g,1), m3 = miller_g_dense(g,2);
-          long n1 = m1; if (n1 < 0) n1 += NX;
-          long n2 = m2; if (n2 < 0) n2 += NY;
-          long n3 = m3; if (n3 < 0) n3 += NZ;
-          if (n1 < 0 || n1 >= NX || n2 < 0 || n2 >= NY || n3 < 0 || n3 >= NZ) continue;
-          ComplexType vhg = vh_g((n1*NY + n2)*NZ + n3);
-          double Gx = m1*recv(0,0) + m2*recv(1,0) + m3*recv(2,0);
-          double Gy = m1*recv(0,1) + m2*recv(1,1) + m3*recv(2,1);
-          double Gz = m1*recv(0,2) + m2*recv(1,2) + m3*recv(2,2);
-          for (long ia = 0; ia < nat; ++ia) {
-            int nt = ityp(ia);
-            int nh_a = nh(nt);
-            if (nh_a == 0) continue;
-            double ph = Gx*atom_pos_cart(ia,0) + Gy*atom_pos_cart(ia,1)
-                      + Gz*atom_pos_cart(ia,2);
-            ComplexType pref = ComplexType(Omega,0.0) * vhg
-                             * ComplexType(std::cos(ph), std::sin(ph));
-            for (int I = 0; I < nh_a; ++I)
-            for (int J = 0; J < nh_a; ++J) {
-              long ij = static_cast<long>(ijtoh(nt, I, J)) - 1;
-              if (ij < 0) continue;
-              Dg(ia, I, J) += pref * std::conj(qg(nt, ij, g));
-            }
-          }
-        }
-      }
-      // Native-MPI_SUM reduction via the flat-double reinterpret (the complex
-      // value type falls onto a serialized path; see v_x_paw psi_r_full note).
-      mpi->comm.all_reduce_in_place_n(
-          reinterpret_cast<double*>(Dg.data()), 2 * Dg.size(), std::plus<>{});
+      auto Dg = compute_int_VQ(Vloc_r);
       for (long ia = 0; ia < nat; ++ia)
         for (int I = 0; I < nhm; ++I)
           for (int J = 0; J < nhm; ++J)
@@ -560,6 +510,100 @@ nda::array<ComplexType,3> pseudopot::compute_paw_deeq_from_becsum(
     }
 
     return Dion;
+}
+
+// ∫ V(r) Q̂^a_IJ(r) dr (proper-FT contraction with qgm; e^{+iG·τ} phase).
+// The FFT of V is done on the comm root (only root is guaranteed valid V
+// content) and broadcast; the G contraction is strided over ALL comm ranks
+// and all_reduced (plan A4 — this loop was root-serial). MPI-collective.
+template<typename Pot_t>
+nda::array<ComplexType,3> pseudopot::compute_int_VQ(Pot_t const& V_r) const
+{
+    long nat = ityp.extent(0);
+    int nhm = 0;
+    for (long ia = 0; ia < nat; ++ia) nhm = std::max(nhm, (int)nh(ityp(ia)));
+    if (nhm == 0) nhm = 1;
+    nda::array<ComplexType,3> Dg =
+        nda::array<ComplexType,3>::zeros({nat, nhm, nhm});
+    if (V_r.size() == 0 || qgm.local().size() == 0) return Dg;
+
+    long NX = fft_mesh_aug(0), NY = fft_mesh_aug(1), NZ = fft_mesh_aug(2);
+    nda::array<ComplexType,1> vh_g(nnr_aug);
+    if (mpi->comm.root()) {
+      for (long r = 0; r < nnr_aug; ++r) vh_g(r) = V_r(r);
+      auto vh3d = nda::reshape(vh_g, std::array<long,3>{NX, NY, NZ});
+      math::nda::fft<false> Ffwd(vh3d);
+      Ffwd.forward(vh3d);                          // 1/N-normalized = proper FT
+    }
+    mpi->comm.broadcast_n(vh_g.data(), vh_g.size(), 0);
+    {
+      double det = recv(0,0)*(recv(1,1)*recv(2,2) - recv(1,2)*recv(2,1))
+                 - recv(1,0)*(recv(0,1)*recv(2,2) - recv(0,2)*recv(2,1))
+                 + recv(2,0)*(recv(0,1)*recv(1,2) - recv(0,2)*recv(1,1));
+      double Omega = (2.0*M_PI)*(2.0*M_PI)*(2.0*M_PI) / std::abs(det);
+      auto qg = qgm.local();
+      long np = mpi->comm.size(), r0 = mpi->comm.rank();
+      for (long g = r0; g < ngm_dense; g += np) {
+        int m1 = miller_g_dense(g,0), m2 = miller_g_dense(g,1), m3 = miller_g_dense(g,2);
+        long n1 = m1; if (n1 < 0) n1 += NX;
+        long n2 = m2; if (n2 < 0) n2 += NY;
+        long n3 = m3; if (n3 < 0) n3 += NZ;
+        if (n1 < 0 || n1 >= NX || n2 < 0 || n2 >= NY || n3 < 0 || n3 >= NZ) continue;
+        ComplexType vhg = vh_g((n1*NY + n2)*NZ + n3);
+        double Gx = m1*recv(0,0) + m2*recv(1,0) + m3*recv(2,0);
+        double Gy = m1*recv(0,1) + m2*recv(1,1) + m3*recv(2,1);
+        double Gz = m1*recv(0,2) + m2*recv(1,2) + m3*recv(2,2);
+        for (long ia = 0; ia < nat; ++ia) {
+          int nt = ityp(ia);
+          int nh_a = nh(nt);
+          if (nh_a == 0) continue;
+          double ph = Gx*atom_pos_cart(ia,0) + Gy*atom_pos_cart(ia,1)
+                    + Gz*atom_pos_cart(ia,2);
+          ComplexType pref = ComplexType(Omega,0.0) * vhg
+                           * ComplexType(std::cos(ph), std::sin(ph));
+          for (int I = 0; I < nh_a; ++I)
+          for (int J = 0; J < nh_a; ++J) {
+            long ij = static_cast<long>(ijtoh(nt, I, J)) - 1;
+            if (ij < 0) continue;
+            Dg(ia, I, J) += pref * std::conj(qg(nt, ij, g));
+          }
+        }
+      }
+    }
+    // Native-MPI_SUM reduction via the flat-double reinterpret (the complex
+    // value type falls onto a serialized path; see v_x_paw psi_r_full note).
+    mpi->comm.all_reduce_in_place_n(
+        reinterpret_cast<double*>(Dg.data()), 2 * Dg.size(), std::plus<>{});
+    return Dg;
+}
+
+// Eq. (h0) static USPP/PAW non-local D = Dnn_atom_static + ∫V_loc·Q̂
+// (settled 2026-07-24 — see the declaration in pseudopot.h for the
+// derivation against plan Eq. d0). Lazily cached; MPI-collective at the
+// first call (compute_int_VQ broadcast/all_reduce).
+inline nda::array<ComplexType,3> const& pseudopot::static_h0_D() const
+{
+    auto& rt = paw_rt();
+    if (!rt.h0_static_built) {
+        utils::check(npol == 1,
+            "pseudopot::static_h0_D: npol > 1 (SOC) not supported for "
+            "USPP/PAW");
+        auto Dst = Dnn_atom_static.local();   // (nat, nhm*npol, nhm*npol)
+        rt.h0_static_D = nda::array<ComplexType,3>(
+            Dst.extent(0), Dst.extent(1), Dst.extent(2));
+        for (long ia = 0; ia < Dst.extent(0); ++ia)
+          for (long I = 0; I < Dst.extent(1); ++I)
+            for (long J = 0; J < Dst.extent(2); ++J)
+              rt.h0_static_D(ia, I, J) = Dst(ia, I, J);
+        auto DvQ = compute_int_VQ(
+            svloc.local()(0, 0, nda::range::all));  // frozen V_loc, scalar part
+        for (long ia = 0; ia < DvQ.extent(0); ++ia)
+          for (long I = 0; I < DvQ.extent(1); ++I)
+            for (long J = 0; J < DvQ.extent(2); ++J)
+              rt.h0_static_D(ia, I, J) += DvQ(ia, I, J);
+        rt.h0_static_built = true;
+    }
+    return rt.h0_static_D;
 }
 
 } // namespace hamilt

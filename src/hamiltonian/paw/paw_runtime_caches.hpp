@@ -55,6 +55,13 @@ struct runtime_caches {
     std::shared_ptr<math::shm::shared_array<nda::array_view<ComplexType,4>>>
         Pskna_full;
 
+    // (3b) Eq. (h0) static USPP/PAW D: Dnn_atom_static + ∫V_loc·Q̂ (settled
+    // 2026-07-24 — the frozen electrostatic compensation term is always in
+    // the static assembly; dion holds only the one-center descreening
+    // reference of opposite sign, plan Eq. d0). Built once (V_loc, Q̂ frozen).
+    bool h0_static_built = false;
+    nda::array<ComplexType,3> h0_static_D;
+
     // (4) Δk-keyed Qfac cache. First-come-stays under a byte budget: cached
     // Δk are reused deterministically (spin loop, repeated v_x calls); once
     // the budget is exhausted, further Δk are built into caller scratch (no

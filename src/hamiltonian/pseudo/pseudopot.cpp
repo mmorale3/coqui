@@ -1405,16 +1405,23 @@ void pseudopot::add_vpp_impl(boost::mpi3::communicator& comm,
     // No density (or add_hartree=false): static-only assembly, Eq. (h0) of
     // plan I5 — local potential on hpsi plus the frozen non-local D in Hij.
     // add_vnl_impl indexes Dion(id, ...) with id = (ncpp ? nt : ia); NCPP →
-    // species-resolved Dnn, USPP/PAW → per-atom Dnn_atom_static
-    // (dion + ex_cvij). Hartree/exchange are supplied elsewhere (today: the
-    // ERI objects in the SCF classes) and must not be double-counted here.
+    // species-resolved Dnn, USPP/PAW → per-atom static_h0_D() =
+    // Dnn_atom_static (dion + ex_cvij) + ∫V_loc·Q̂. The ∫V_loc·Q̂ term is
+    // the frozen one-body ELECTROSTATIC compensation-charge coupling —
+    // neither exchange nor correlation, so it is ALWAYS included (settled
+    // 2026-07-24; it is NOT in dion — Eq. d0's −⟨Q̂|v_H[ñ_Zc]⟩ is the
+    // opposite-sign one-center descreening reference). Hartree/exchange are
+    // supplied elsewhere (today: the ERI objects in the SCF classes) and
+    // must not be double-counted here; the density path integrates
+    // (V_loc+V_H)·Q̂ itself and never touches static_h0_D, so the identity
+    // H(n) ≡ H0 + Hartree(n) holds exactly (plan A-tests i).
     auto vltot = svloc.local();
     hamilt::add_vloc(npol,fft_mesh_aug,swfc_to_rho.local(),vltot,psi,hpsi);
 
     if (ptype == pp_ncpp_t)
-      add_vnl_impl(k_range, b_range, Dnn.local(),             Hij);
+      add_vnl_impl(k_range, b_range, Dnn.local(),   Hij);
     else
-      add_vnl_impl(k_range, b_range, Dnn_atom_static.local(), Hij);
+      add_vnl_impl(k_range, b_range, static_h0_D(), Hij);
 
   }
 

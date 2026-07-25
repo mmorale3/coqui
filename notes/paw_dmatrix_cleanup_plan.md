@@ -10,7 +10,29 @@ printed into context at session start by a SessionStart hook).
 
 ## STATUS
 
-Last updated: 2026-07-24 — A5 done. A5 notes (read_vnl_h5 hardening):
+Last updated: 2026-07-24 — ∫V_loc·Q̂ SETTLED (user directive + derivation;
+post-A5). The term is the frozen one-body ELECTROSTATIC coupling ∫n̂·V_loc
+— neither exchange nor correlation — and is ALWAYS included. It is NOT in
+dion: Eq. d0's −⟨Q̂|v_H[ñ_Zc]⟩ is the opposite-sign ONE-CENTER descreening
+reference baked in at dataset generation precisely so the solid re-adds the
+full periodic integral (standard USPP descreening; corroborated: the
+density path, which adds ∫(V_loc+V_H)Q̂ on top of dion, matches QE deeq at
+~1e-6 — impossible if dion contained the smooth-grid piece). Placement:
+Eq. (h0) static D = static_h0_D() = Dnn_atom_static + ∫V_loc·Q̂ (lazily
+cached in runtime_caches, MPI-collective first call; the ∫V·Q̂ block is
+factored out of compute_paw_deeq_from_becsum as compute_int_VQ). Density
+path unchanged (integrates V_loc+V_H itself; no double count) ⇒ the plan
+identity H(n) ≡ H0 + Vhartree(n) now holds EXACTLY — new TEST_CASE
+h0_plus_hartree_identity (nii+nij × NCPP/USPP/PAW/PAW-sym×2, ≤2.5e-13,
+FFT-linearity residual; A-tests item i done; flags-off ≡ H0 still
+bit-identical). CONSEQUENCE: the ERI-route USPP/PAW Fock (H0 + J − K, I7)
+gains this previously-MISSING frozen term — post-A2 H0-based USPP/PAW total
+energies move by it (the QE-deeq-era H0 carried it inside ∫V_eff·Q̂);
+re-baseline any post-A2 USPP/PAW reference numbers on next campaign.
+dft_eigenvalues unchanged (its assembly uses the density path, which always
+had the term; USPP/PAW 0.749/0.790 Ha semicore failure still pending the
+A-tests diagnostic rework). Fast suite green: 13499 assertions / 34 cases.
+A5 notes (kept, read_vnl_h5 hardening):
 proj_per_atom length==nsp (ABINIT-fix message) + max≤nhm + Σ_atoms
 nh(ityp)==total_num_of_proj; dion/dion_so shape checks + per-species
 Hermiticity (≤1e-8 rel, active nh(s)·npol block only — padding
@@ -86,12 +108,9 @@ clean: simple_dyson/scf_driver/qp_scf_common/downfold_1e/pproc all take H0 via
 no-density set_H0 (static-only) + ERI J/K — no double-count/omission, and the
 density overloads have NO production callers, so no reference re-baselining
 was triggered (fast suite value-identical, now 13456 assertions / 32 cases).
-CAUTION for A-tests: the plan identity "nii≡nij≡no-density+Hartree" does NOT
-hold as literally stated — the density path's KS-like D uses ∫(V_loc+V_H)Q̂
-(plan I3) while H0+add_Hartree gives static + ∫V_H·Q̂ only; they differ by the
-static ∫V_loc·Q̂·becpair term. Whether that term belongs in H0 (and hence in
-the ERI-route Fock build, I7) must be settled there against Eq. d0's
-−⟨Q̂|v_H[ñ_Zc]⟩ content of dion before writing the test.
+(The former CAUTION about the ∫V_loc·Q̂ mismatch between the density path
+and H0+add_Hartree is RESOLVED — see the settlement note at the top: the
+term now lives in Eq. (h0)'s static_h0_D and the identity holds exactly.)
 A1 notes (kept): QE fixtures carry no ex_cvij → QE suite value-identical;
 pre-existing failures (NOT from A1/A2): dft_eigenvalues USPP/PAW sections
 (max_err 0.749/0.790 Ha at Li 1s semicore, needs own bisect; subsumed by
@@ -107,7 +126,7 @@ Workstream A — pseudopot D-matrix refactor
 - [x] A3 symmetry-correct nij becsum (full-BZ lift via compute_becsum_full_symm) + Hermitian pair symmetrization w/ hard residual check; add_vpp nosym guard removed (v_x(nij) guard kept, different scope) — 2026-07-24
 - [x] A4 hoist per-call statics onto pseudopot (paw_runtime_caches.hpp: aainit, qrad @ unified dq=0.01, Pskna lift, Δk-keyed Qfac w/ 256 MB budget); ∫V·Q̂ loop parallelized over G + all_reduce; THC lift site deferred to D1 — 2026-07-24
 - [x] A5 provenance checks at read time — dion Hermiticity+scale+shape, proj_per_atom length+Σ==nkb, per-species group/dataset sweep w/ length checks (ae_vloc/vloc_ps warned-optional until B1/B4: unused since A1, _hf fixture predates export) — 2026-07-24
-- [ ] A-tests: nii≡nij≡no-density+Hartree; sym≡nosym; ex_cvij factor-1 e_1e; QE-eigenvalue diagnostic
+- [ ] A-tests: (i) nii≡nij≡no-density+Hartree DONE 2026-07-24 (h0_plus_hartree_identity + add_vpp_i5_alignment, after ∫V_loc·Q̂ settlement); (ii) sym≡nosym DONE via A3 (becsum_full_symm + sym fixture sections); remaining: ex_cvij factor-1 e_1e (vs ABINIT −0.521220 Ha si222); QE-eigenvalue diagnostic rework (USPP/PAW 0.749/0.790 Ha semicore)
 
 Workstream B — converter parity
 - [ ] B1 QE: delete deeq/deeq_nc export; schema_version attribute
