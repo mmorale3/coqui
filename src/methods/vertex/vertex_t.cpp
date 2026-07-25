@@ -682,7 +682,7 @@ namespace solvers {
         ctx.Xhat(is, 0, ik, all, all) = X_w(is, ik, all, all);
     ctx.Xhat_shm->win().fence();
 
-    double leak_max = 0.0, leak_sum = 0.0;
+    double leak_max = 0.0, leak_sum = 0.0, dunit_max = 0.0;
     long leak_cnt = 0;
     {
       // column selector E(nbnd, nW) of the W-window band block; Dcols = D * E (nbnd, nW)
@@ -726,6 +726,24 @@ namespace solvers {
             }
             for (long a = 0; a < nc; ++a)
               for (long j = 0; j < nc; ++j) Dc(a, j) = Dcols(C0_global + a, j);
+          }
+          // UNITARITY defect of the C-sector rotation actually used, ||Dc^dag Dc - 1||_F.
+          // This is NOT the same as the leakage above: leak measures how much of D.E
+          // falls outside the window among the RETAINED nbnd rows and is normalized by
+          // that retained mass, so it is blind to weight lost past the nbnd truncation
+          // and to the row-renormalization generate_dmatrix applies there
+          // (symmetry.hpp:1067-1092). Xhat = X(ksrc).Dc enters EIGHT collocation legs of
+          // Sigma^C and four of Pi^C, so this defect is the accuracy floor of the whole
+          // symmetry path -- and it was previously unmeasured.
+          {
+            double d2 = 0.0;
+            for (long a = 0; a < nc; ++a)
+              for (long b = 0; b < nc; ++b) {
+                ComplexType s(0.0, 0.0);
+                for (long p = 0; p < nc; ++p) s += std::conj(Dc(p, a)) * Dc(p, b);
+                d2 += std::norm(s - ((a == b) ? ComplexType(1.0) : ComplexType(0.0)));
+              }
+            dunit_max = std::max(dunit_max, std::sqrt(d2));
           }
           // effective columns (memo (X-hat)): base collocation at the D-pair point
           // (the trev pair's rotation for trev k -- the API redirect), conj for trev.
@@ -783,9 +801,12 @@ namespace solvers {
       for (long a = 0; a < ctx.nsym; ++a)
         for (long b = 0; b < ctx.nk_full; ++b) ctx.cjg(a, b) = (cjg_i(a, b) != 0);
       leak_max = mpi->node_comm.all_reduce_value(leak_max, boost::mpi3::max<>{});
+      dunit_max = mpi->node_comm.all_reduce_value(dunit_max, boost::mpi3::max<>{});
       leak_sum = mpi->node_comm.all_reduce_value(leak_sum, std::plus<>{});
       leak_cnt = mpi->node_comm.all_reduce_value(leak_cnt, std::plus<>{});
     }
+    ctx.d_unitarity_max = dunit_max;
+    _sym_d_unitarity_max = std::max(_sym_d_unitarity_max, dunit_max);
     ctx.leak_max = leak_max;
     ctx.leak_mean = (leak_cnt > 0) ? leak_sum / double(leak_cnt) : 0.0;
     _sym_leak_max = std::max(_sym_leak_max, ctx.leak_max);
@@ -803,6 +824,11 @@ namespace solvers {
                "(theory-owner ruling).\n",
             ctx.nk_full, ctx.nk_ibz, ctx.nq_full, ctx.nq_ibz, ctx.nsym, ctx.naux,
             C0_global, C0_global + nW, ctx.leak_max, ctx.leak_mean);
+    app_log(1, "  C-sector rotation UNITARITY defect max ||Dc^dag Dc - 1||_F = {:.3e}\n"
+               "  [NOTE] Xhat = X(ksrc).Dc feeds 8 collocation legs of Sigma^C and 4 of "
+               "Pi^C, so this is\n"
+               "         the accuracy floor of the symmetry path (distinct from the "
+               "leakage above).\n", ctx.d_unitarity_max);
     if (wan)
       app_log(1, "  (Wannier mode: leakage is the projector-level "
                  "||(1 - P(Sk)) D U(k)||^2; 0 for a symmetry-closed set, memo 2.8)\n");

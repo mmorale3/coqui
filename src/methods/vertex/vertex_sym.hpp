@@ -98,6 +98,9 @@ namespace vertex_sym {
     // measured C-window leakage diagnostic (memo section 6)
     double leak_max = 0.0;
     double leak_mean = 0.0;
+    // measured unitarity defect max ||Dc^dag Dc - 1||_F of the C-sector rotation that
+    // Xhat is built from -- the accuracy floor of the whole symmetry path.
+    double d_unitarity_max = 0.0;
   };
 
 } // vertex_sym

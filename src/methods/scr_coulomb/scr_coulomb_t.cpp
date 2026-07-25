@@ -290,6 +290,16 @@ namespace solvers {
     auto Pi_PQ = dPi_PQ.local();
     auto Z_PQ = dZ_PQ.local();
     auto A_PQ = dA_PQ.local();
+    // ---- DIELECTRIC POSITIVITY MONITOR (ISDF-Vertex) --------------------------------
+    // On the imaginary axis the RPA polarization is negative semi-definite, so
+    // eps = I - Z.Pi is positive definite and ||eps^{-1}|| = O(1). A vertex correction
+    // P^C = -2 dPhi_2^C/dW carries NO such sign guarantee: once Pi is large enough that
+    // eps loses positivity at some (q, i.nu), the inverse below silently returns garbage
+    // and W acquires a spurious pole. That is exactly how the scGW+vertex runs fail --
+    // several smoothly converging iterations (max |d.Sigma| shrinking 0.19 -> 0.05) and
+    // then a single step with max |d.Sigma| ~ 6.5e4. Track ||eps^{-1}||_max over all
+    // (q, i.nu) so the failure is DIAGNOSED instead of silently propagating.
+    double epsinv_max = 0.0;
     for (size_t iq_loc = 0; iq_loc < nq_loc; ++iq_loc) {
       long iq = q_origin + iq_loc;
       Z_PQ = thc.Z(iq, P_rng, Q_rng, qpool_id, pgrid[1], q_intra_comm);
@@ -308,6 +318,7 @@ namespace solvers {
 
         // A = [I - Z*Pi(w)]^{-1}
         math::nda::slate_ops::inverse(dA_PQ);
+        for (auto const &v : A_PQ) epsinv_max = std::max(epsinv_max, std::abs(v));
 
         // A = [I - Z*Pi(w)]^{-1} - I
         for (auto idx: diag_idx) {
@@ -322,6 +333,21 @@ namespace solvers {
     // prevent dead block in thc.Z() in case nq_loc is not the same for all processors
     for (long iq_loc = nq_loc; iq_loc < nq_loc_max; ++iq_loc)
       Z_PQ = thc.Z(0, P_rng, Q_rng, qpool_id, pgrid[1], q_intra_comm);
+
+    epsinv_max = dPi_wqPQ.communicator()->all_reduce_value(epsinv_max, boost::mpi3::max<>{});
+    app_log(1, "    - dielectric conditioning: max_(q, i.nu) || [I - Z.Pi]^-1 ||_max = "
+               "{:.4e}", epsinv_max);
+    if (epsinv_max > 1e3)
+      app_log(1, "    [WARNING] I - Z.Pi is close to SINGULAR. On the imaginary axis the RPA\n"
+                 "              polarization is negative semi-definite, so this cannot happen "
+                 "for plain\n"
+                 "              RPA/scGW; a vertex-corrected Pi carries no such sign guarantee. "
+                 "The\n"
+                 "              inverse above is then numerically meaningless and W acquires a "
+                 "spurious\n"
+                 "              pole -- the self-energy will blow up on the NEXT iteration. "
+                 "Reduce the\n"
+                 "              correlated window C, or ramp the vertex in more slowly.");
 
     _Timer.stop("EVALUATE_W");
 
