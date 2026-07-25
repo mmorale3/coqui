@@ -300,6 +300,7 @@ namespace solvers {
     // then a single step with max |d.Sigma| ~ 6.5e4. Track ||eps^{-1}||_max over all
     // (q, i.nu) so the failure is DIAGNOSED instead of silently propagating.
     double epsinv_max = 0.0;
+    long epsinv_q = -1, epsinv_w = -1;
     for (size_t iq_loc = 0; iq_loc < nq_loc; ++iq_loc) {
       long iq = q_origin + iq_loc;
       Z_PQ = thc.Z(iq, P_rng, Q_rng, qpool_id, pgrid[1], q_intra_comm);
@@ -318,7 +319,12 @@ namespace solvers {
 
         // A = [I - Z*Pi(w)]^{-1}
         math::nda::slate_ops::inverse(dA_PQ);
-        for (auto const &v : A_PQ) epsinv_max = std::max(epsinv_max, std::abs(v));
+        for (auto const &v : A_PQ)
+          if (std::abs(v) > epsinv_max) {
+            epsinv_max = std::abs(v);
+            epsinv_q = iq;                      // WHERE it is worst: transfer q ...
+            epsinv_w = long(n) + long(w_origin);// ... and bosonic Matsubara index
+          }
 
         // A = [I - Z*Pi(w)]^{-1} - I
         for (auto idx: diag_idx) {
@@ -334,9 +340,21 @@ namespace solvers {
     for (long iq_loc = nq_loc; iq_loc < nq_loc_max; ++iq_loc)
       Z_PQ = thc.Z(0, P_rng, Q_rng, qpool_id, pgrid[1], q_intra_comm);
 
-    epsinv_max = dPi_wqPQ.communicator()->all_reduce_value(epsinv_max, boost::mpi3::max<>{});
-    app_log(1, "    - dielectric conditioning: max_(q, i.nu) || [I - Z.Pi]^-1 ||_max = "
-               "{:.4e}", epsinv_max);
+    {
+      // reduce the VALUE and carry its (q, i.nu) location along, so the worst cell is
+      // identifiable: the Gamma head, a specific transfer, or a high-frequency tail all
+      // mean different things about where a vertex-corrected Pi goes wrong.
+      double gmax = dPi_wqPQ.communicator()->all_reduce_value(epsinv_max,
+                                                              boost::mpi3::max<>{});
+      long q_of_max = (epsinv_max == gmax) ? epsinv_q : -1;
+      long w_of_max = (epsinv_max == gmax) ? epsinv_w : -1;
+      q_of_max = dPi_wqPQ.communicator()->all_reduce_value(q_of_max, boost::mpi3::max<>{});
+      w_of_max = dPi_wqPQ.communicator()->all_reduce_value(w_of_max, boost::mpi3::max<>{});
+      epsinv_max = gmax;
+      app_log(1, "    - dielectric conditioning: max_(q, i.nu) || [I - Z.Pi]^-1 ||_max = "
+                 "{:.4e}   (worst cell: q = {}, i.nu index = {} of {})",
+              epsinv_max, q_of_max, w_of_max, nw);
+    }
     if (epsinv_max > 1e3)
       app_log(1, "    [WARNING] I - Z.Pi is close to SINGULAR. On the imaginary axis the RPA\n"
                  "              polarization is negative semi-definite, so this cannot happen "
