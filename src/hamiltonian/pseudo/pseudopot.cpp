@@ -507,14 +507,33 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
     }
   }
 
-  nh.resize(nsp);
   ityp.resize(nat);
   ofs.resize(nat);
-  nda::h5_read(grp,"proj_per_atom",nh);
+  {
+    // Plan A5: proj_per_atom is per-SPECIES (length nsp). A wrong length
+    // (e.g. per-atom, an ABINIT-converter gap — plan B2) silently resizes
+    // nh and mis-indexes every augmentation consumer, so it is a hard error.
+    nda::array<int,1> nh_read;
+    nda::h5_read(grp,"proj_per_atom",nh_read);
+    utils::check(nh_read.extent(0) == nsp,
+                 "pseudopot::read_vnl_h5: 'proj_per_atom' has length {} but "
+                 "number_of_species = {} — it must be per-species (plan A5). "
+                 "Regenerate the h5 with the CoQui-shipped converter "
+                 "(pw2coqui / abinit2coqui; the ABINIT converter needs the "
+                 "per-species proj_per_atom fix, plan B2).",
+                 nh_read.extent(0), nsp);
+    nh = nh_read;
+    int nh_max = 0;
+    for (int s = 0; s < nsp; ++s) nh_max = std::max(nh_max, nh(s));
+    utils::check(nh_max <= nhm,
+                 "pseudopot::read_vnl_h5: max(proj_per_atom) = {} exceeds "
+                 "max_proj_per_atom = {} — inconsistent h5 (plan A5).",
+                 nh_max, nhm);
+  }
   nda::h5_read(grp,"projector_offset",ofs);
   nda::h5_read(grp,"npw",npw);
   nda::h5_read(grp,"atomic_id",ityp);
-  //ityp = ityp-1;  
+  //ityp = ityp-1;
   // MAM: temporary fix until new pw2coqui.f90 is in place, remove eventually
   // should be 0-based indexing always
   {
@@ -522,6 +541,17 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
     utils::check(id_min==0 or id_min==1,
                  "qe_interface::read_h5 Invalid atomic_ids array: min id:{}.",id_min);
     ityp() -= id_min;
+  }
+  {
+    // Plan A5: Σ_atoms proj_per_atom(type) must reproduce total_num_of_proj
+    // (order-independent; catches per-atom/per-species confusion the length
+    // check above might miss for nat == nsp systems).
+    long nkb_sum = 0;
+    for (int ia = 0; ia < nat; ++ia) nkb_sum += nh(ityp(ia));
+    utils::check(nkb_sum == nkb,
+                 "pseudopot::read_vnl_h5: sum over atoms of proj_per_atom "
+                 "({}) != total_num_of_proj ({}) — inconsistent h5 (plan A5).",
+                 nkb_sum, nkb);
   }
 
   // Dnn = dvan
@@ -536,6 +566,10 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
     if(spinorbit_nl) {
       nda::array<ComplexType,4> Dnn_c(nsp,npol*npol,nhm,nhm);
       nda::h5_read(grp,"dion_so",Dnn_c);
+      utils::check(Dnn_c.extent(0) == nsp && Dnn_c.extent(1) == npol*npol &&
+                   Dnn_c.extent(2) == nhm && Dnn_c.extent(3) == nhm,
+                   "pseudopot::read_vnl_h5: 'dion_so' shape mismatch "
+                   "(plan A5).");
       auto Dloc = Dnn.local();
       // dion_so was written in column-major; reorder.
       for( int s=0; s<nsp; ++s )
@@ -547,6 +581,9 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
     } else {
       nda::array<double,3> Dnn_r(nsp,nhm,nhm);
       nda::h5_read(grp,"dion",Dnn_r);
+      utils::check(Dnn_r.extent(0) == nsp && Dnn_r.extent(1) == nhm &&
+                   Dnn_r.extent(2) == nhm,
+                   "pseudopot::read_vnl_h5: 'dion' shape mismatch (plan A5).");
       auto Dloc = Dnn.local();
       Dloc() = ComplexType(0.0);
       for( int s=0; s<nsp; ++s )
@@ -556,6 +593,37 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
               Dloc(s,n*npol+p,m*npol+p) = Dnn_r(s,n,m);
     }
     nda::tensor::scale(ComplexType(0.5),Dnn.local());
+    // Plan A5: dion must be Hermitian per species block and at a plausible
+    // Hartree scale — catches transposed/corrupted exports and unit errors
+    // (Ry/eV/e² factors) at read time instead of as finite-but-wrong
+    // energies downstream. Only the active nh(s)×npol block is checked
+    // (padding beyond nh(s) is unconstrained).
+    {
+      auto Dloc = Dnn.local();
+      double dmax = 0.0, herm = 0.0;
+      for (int s = 0; s < nsp; ++s) {
+        int nch = nh(s) * npol;
+        for (int i = 0; i < nch; ++i)
+          for (int j = 0; j < nch; ++j) {
+            dmax = std::max(dmax, std::abs(Dloc(s,i,j)));
+            herm = std::max(herm,
+                            std::abs(Dloc(s,i,j) - std::conj(Dloc(s,j,i))));
+          }
+      }
+      utils::check(herm <= 1e-8 * std::max(1.0, dmax),
+                   "pseudopot::read_vnl_h5: 'dion' is not Hermitian (max "
+                   "residual {}, max element {} Ha) — corrupted or transposed "
+                   "export (plan A5); regenerate the h5 with the CoQui-shipped "
+                   "converter.", herm, dmax);
+      utils::check(dmax <= 1.0e3,
+                   "pseudopot::read_vnl_h5: max|dion| = {} Ha is implausibly "
+                   "large — likely a unit/scale error in the converter "
+                   "(plan A5).", dmax);
+      if (ptype != pp_ncpp_t)
+        utils::check(dmax > 0.0,
+                     "pseudopot::read_vnl_h5: 'dion' is identically zero for "
+                     "a USPP/PAW pseudopotential — broken export (plan A5).");
+    }
   }
   mpi->node_comm.barrier();
 
@@ -691,9 +759,27 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
       } else {
         h5::group hgrp = grp0.open_group("Hamiltonian");
         h5::group sp_grp = hgrp.open_group("Species");
+        // Plan A5: required datasets are HARD errors — silent fallbacks are
+        // how the historical inconsistencies survived.
+        auto require_read = [](h5::group& g, std::string const& ds,
+                               auto& target, int nt_i, char const* why) {
+          bool ok = true;
+          try { nda::h5_read(g, ds, target); } catch(...) { ok = false; }
+          utils::check(ok,
+              "pseudopot::read_vnl_h5: required dataset '{}' missing or "
+              "unreadable for species nt{} ({}) — old-schema or incomplete "
+              "h5 (plan A5); regenerate with the CoQui-shipped converter "
+              "(pw2coqui / abinit2coqui).", ds, nt_i, why);
+        };
         for(int nt=0; nt<nsp; ++nt) {
           std::string nt_name = "nt"+std::to_string(nt);
-          if(!sp_grp.has_subgroup(nt_name)) continue;
+          // The CoQui-shipped converters write a species group (with
+          // species_kind paw|uspp|ncpp) for EVERY species; a missing group
+          // is an old-schema file (plan A5).
+          utils::check(sp_grp.has_subgroup(nt_name),
+              "pseudopot::read_vnl_h5: /Hamiltonian/Species/{} missing — "
+              "old-schema h5 (plan A5); regenerate with the CoQui-shipped "
+              "converter (pw2coqui / abinit2coqui).", nt_name);
           h5::group nt_grp = sp_grp.open_group(nt_name);
           auto& sp = paw_species[nt];
           auto& tmp = heavy_root[nt];
@@ -707,30 +793,78 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
           h5::h5_read_attribute(nt_grp, "nh",     sp.nh);
           sp.r.resize(sp.mesh);   nda::h5_read(nt_grp, "r",   sp.r);
           sp.rab.resize(sp.mesh); nda::h5_read(nt_grp, "rab", sp.rab);
-          if(sp.is_paw && nt_grp.has_subgroup("paw")) {
+          if(sp.is_paw || sp.is_uspp)
+            utils::check((int)nh(nt) == sp.nh,
+                "pseudopot::read_vnl_h5: species nt{} 'nh' attribute ({}) != "
+                "proj_per_atom ({}) — inconsistent h5 (plan A5).",
+                nt, sp.nh, (int)nh(nt));
+          if(sp.is_paw) {
+            utils::check(nt_grp.has_subgroup("paw"),
+                "pseudopot::read_vnl_h5: species nt{} is PAW but has no "
+                "'paw' subgroup — old-schema h5 (plan A5); regenerate with "
+                "the CoQui-shipped converter.", nt);
             h5::group pgrp = nt_grp.open_group("paw");
             h5::h5_read_attribute(pgrp, "lmax_aug", sp.lmax_aug);
             h5::h5_read_attribute(pgrp, "raug",     sp.raug);
             h5::h5_read_attribute(pgrp, "iraug",    sp.iraug);
             // pfunc, ptfunc, augmom are derivable from aewfc/pswfc/qfuncl
             // (see species_paw_t comment) — not loaded.
-            try { nda::h5_read(pgrp, "ae_vloc",    sp.ae_vloc); }    catch(...) {}
+            //
+            // ae_vloc / vloc_ps: deliberate deviation from the plan-A5
+            // required list — WARNED-optional, not hard errors. Their only
+            // consumer is compute_paw_static_D, which is NOT used in
+            // production since plan A1 (the h5 `dion` already carries the
+            // full frozen D⁰ including the AE−PS V_loc baseline), and the
+            // lih222_paw_hf fixture predates the PS-side export. Promote to
+            // required with the B1/B4 schema standardization.
+            // ae_rho_atc / rho_atc_ps stay silent-optional: absence can be
+            // PHYSICAL (no NLCC ⇒ QE writes no PS core), and
+            // compute_paw_core_density documents else-zero semantics.
+            auto warn_optional = [&](h5::group& g, std::string const& ds,
+                                     auto& target) {
+              try { nda::h5_read(g, ds, target); }
+              catch(...) {
+                app_log(1,
+                    "WARNING pseudopot::read_vnl_h5: dataset '{}' absent for "
+                    "species nt{} (pre-B1 h5 export). Only the unused "
+                    "compute_paw_static_D consumes it; regenerate with the "
+                    "current pw2coqui when convenient.", ds, nt);
+              }
+            };
+            warn_optional(pgrp, "ae_vloc", sp.ae_vloc);
             try { nda::h5_read(pgrp, "ae_rho_atc", sp.ae_rho_atc); } catch(...) {}
             // PS-side counterparts needed to reconstruct paw_init_keeq inside
             // CoQui (rather than relying on QE's ddd_paw being frozen at ρ_QE).
-            try { nda::h5_read(pgrp, "vloc_ps",    sp.vloc_ps); }    catch(...) {}
+            warn_optional(pgrp, "vloc_ps", sp.vloc_ps);
             try { nda::h5_read(pgrp, "rho_atc_ps", sp.rho_atc_ps); } catch(...) {}
           }
           if(sp.is_paw || sp.is_uspp) {
-            try { nda::h5_read(nt_grp, "aewfc",  tmp.aewfc); }  catch(...) {}
-            try { nda::h5_read(nt_grp, "pswfc",  tmp.pswfc); }  catch(...) {}
-            try { nda::h5_read(nt_grp, "qfuncl", tmp.qfuncl); } catch(...) {}
+            if(sp.is_paw) {
+              require_read(nt_grp, "aewfc", tmp.aewfc, nt, "AE partial waves");
+              require_read(nt_grp, "pswfc", tmp.pswfc, nt, "PS partial waves");
+            } else {
+              // USPP carries no partial waves; keep optional.
+              try { nda::h5_read(nt_grp, "aewfc",  tmp.aewfc); }  catch(...) {}
+              try { nda::h5_read(nt_grp, "pswfc",  tmp.pswfc); }  catch(...) {}
+            }
+            require_read(nt_grp, "qfuncl", tmp.qfuncl, nt,
+                         "augmentation radial Q_L");
             // Angular momentum metadata for q+G evaluation of the
             // augmentation function (qvan2 reconstruction in CoQui).
-            try { nda::h5_read(nt_grp, "lll",    sp.lll);    } catch(...) {}
-            try { nda::h5_read(nt_grp, "nhtol",  sp.nhtol);  } catch(...) {}
-            try { nda::h5_read(nt_grp, "nhtolm", sp.nhtolm); } catch(...) {}
-            try { nda::h5_read(nt_grp, "indv",   sp.indv);   } catch(...) {}
+            require_read(nt_grp, "lll",    sp.lll,    nt, "beta l metadata");
+            require_read(nt_grp, "nhtol",  sp.nhtol,  nt, "channel l metadata");
+            require_read(nt_grp, "nhtolm", sp.nhtolm, nt, "channel lm metadata");
+            require_read(nt_grp, "indv",   sp.indv,   nt, "channel→beta map");
+            utils::check(sp.lll.extent(0) == sp.nbeta,
+                "pseudopot::read_vnl_h5: species nt{} 'lll' length ({}) != "
+                "nbeta ({}) (plan A5).", nt, sp.lll.extent(0), sp.nbeta);
+            utils::check(sp.nhtol.extent(0) == sp.nh &&
+                         sp.nhtolm.extent(0) == sp.nh &&
+                         sp.indv.extent(0) == sp.nh,
+                "pseudopot::read_vnl_h5: species nt{} nhtol/nhtolm/indv "
+                "lengths ({}/{}/{}) != nh ({}) (plan A5).", nt,
+                sp.nhtol.extent(0), sp.nhtolm.extent(0), sp.indv.extent(0),
+                sp.nh);
           }
           // One-center Coulomb residual ΔC = K_AE − K_PS, raw ke%k from
           // PAW_init_fock_kernel exported by pw2coqui (in proper Hartree).

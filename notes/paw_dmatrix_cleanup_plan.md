@@ -10,7 +10,29 @@ printed into context at session start by a SessionStart hook).
 
 ## STATUS
 
-Last updated: 2026-07-24 — A4 done. A4 notes: new
+Last updated: 2026-07-24 — A5 done. A5 notes (read_vnl_h5 hardening):
+proj_per_atom length==nsp (ABINIT-fix message) + max≤nhm + Σ_atoms
+nh(ityp)==total_num_of_proj; dion/dion_so shape checks + per-species
+Hermiticity (≤1e-8 rel, active nh(s)·npol block only — padding
+unconstrained) + scale (max|dion|≤1e3 Ha, >0 for USPP/PAW); Species sweep:
+per-species nt{} group + species 'nh'==proj_per_atom + PAW 'paw' subgroup
+required; require_read hard errors for aewfc/pswfc (PAW), qfuncl +
+lll/nhtol/nhtolm/indv (USPP+PAW) with length checks (lll==nbeta, channel
+maps==nh). DELIBERATE DEVIATION from the plan-A5 list: ae_vloc/vloc_ps are
+WARNED-optional, not hard — their only consumer compute_paw_static_D is
+unused in production since A1 (dion already carries the frozen D⁰ V_loc
+baseline) and lih222_paw_hf predates the PS-side export (both species warn);
+promote to required with B1/B4. ae_rho_atc/rho_atc_ps stay silent-optional
+(absence can be physical — no NLCC; else-zero documented). Validated:
+[paw]~[slow] 13479/33 green (value-identical); [hamilt]~[slow]~[thc]~[dft]
+~[paw] 97442/9 green (NCPP + GaAs SOC exercise the dion_so Hermiticity
+convention); [pseudo]~[slow] green; dft_eigenvalues re-confirmed at its
+documented pre-existing failure (USPP/PAW 0.749/0.790 Ha, NCPP 5.8e-07 ok).
+Test-hygiene finding: isdf_threshold_convergence ([!benchmark], ceph-path
+data) HARD-ABORTS the whole binary via utils::check when its data is absent
+— a bare "~[slow]" sweep dies there silently mid-run and skips everything
+declared after it (invalid as a gate; use tag-positive filters).
+A4 notes (kept): new
 src/hamiltonian/paw/paw_runtime_caches.hpp — paw::runtime_caches held by
 shared_ptr on pseudopot (mutable, shared across copies; every entry is keyed
 on immutable state + explicit args, so never stale). Accessors: paw_aatab()
@@ -84,7 +106,7 @@ Workstream A — pseudopot D-matrix refactor
 - [x] A2 align add_vpp paths with I5: no-density = static-only; nii/nij identical native build; add_hartree/add_exchange bools — 2026-07-24
 - [x] A3 symmetry-correct nij becsum (full-BZ lift via compute_becsum_full_symm) + Hermitian pair symmetrization w/ hard residual check; add_vpp nosym guard removed (v_x(nij) guard kept, different scope) — 2026-07-24
 - [x] A4 hoist per-call statics onto pseudopot (paw_runtime_caches.hpp: aainit, qrad @ unified dq=0.01, Pskna lift, Δk-keyed Qfac w/ 256 MB budget); ∫V·Q̂ loop parallelized over G + all_reduce; THC lift site deferred to D1 — 2026-07-24
-- [ ] A5 provenance checks at read time (hard errors, no silent fallbacks) — partial via A2: qq_nt/aug-Q(G)/Species-group missing now hard errors; remaining: dion Hermiticity+scale, proj_per_atom length, required-dataset sweep
+- [x] A5 provenance checks at read time — dion Hermiticity+scale+shape, proj_per_atom length+Σ==nkb, per-species group/dataset sweep w/ length checks (ae_vloc/vloc_ps warned-optional until B1/B4: unused since A1, _hf fixture predates export) — 2026-07-24
 - [ ] A-tests: nii≡nij≡no-density+Hartree; sym≡nosym; ex_cvij factor-1 e_1e; QE-eigenvalue diagnostic
 
 Workstream B — converter parity
