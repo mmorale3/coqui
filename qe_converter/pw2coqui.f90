@@ -371,7 +371,7 @@ subroutine write_pp(h5_f)
   USE lsda_mod, ONLY: lsda, nspin
   USE noncollin_module, ONLY : noncolin, npol, lspinorb
   USE fft_base, ONLY : dfftp, dffts
-  USE uspp, ONLY : okvan, vkb, nkb, ofsbeta, ijtoh, dvan, dvan_so, deeq, deeq_nc, qq_so, qq_nt
+  USE uspp, ONLY : okvan, vkb, nkb, ofsbeta, ijtoh, dvan, dvan_so, qq_so, qq_nt
   USE uspp_param, ONLY : nhm, nh, upf, lmaxq
   USE scf, ONLY : vltot, v, rho, rho_core, rhog_core
   USE ener, ONLY : etxc, vtxc, ehart, epaw
@@ -415,7 +415,11 @@ subroutine write_pp(h5_f)
       pp_type = "ncpp"
     endif
 
-    call qeh5_open_group(h5_f, "Hamiltonian", h5_h)   
+    call qeh5_open_group(h5_f, "Hamiltonian", h5_h)
+    ! CoQui pseudopot schema version:
+    !   (absent) : legacy exports (carried QE deeq; QE-native Ry units)
+    !   1        : deeq-free (CoQui builds D natively); units unchanged
+    call qeh5_add_attribute(h5_h%id,"schema_version",1)
     call qeh5_add_attribute(h5_h%id,"pp_type",TRIM(pp_type))
     call qeh5_open_group(h5_h, TRIM(pp_type), h5_n)  
 
@@ -455,15 +459,10 @@ subroutine write_pp(h5_f)
     endif
     ! qq_nt(nhm,nhm,nsp): species-resolved augmentation overlap S = 1 + Σ |β⟩q⟨β|
     if(allocated(qq_nt)) call h5_write_tensor_r(h5_n,qq_nt,"qq_nt")
-    ! deeq(nhm,nhm,nat,nspin): SCF correction to D — for USPP, ∫ V_eff(r) Q^IJ(r)dr;
-    ! for PAW, additionally the one-center Hxc multipole differences
-    ! (filled by QE's add_paw_to_deeq during read_file/hinit0).
-    ! Effective non-local D for the non-local Hamiltonian:
-    !   D_eff(s, a, I, J) = dvan(type(a), I, J) + deeq(I, J, a, s)
-    if(allocated(deeq) .and. (okvan .or. okpaw)) &
-      call h5_write_tensor4_r(h5_n,deeq,"deeq")
-    if(lspinorb .and. allocated(deeq_nc)) &
-      call h5_write_tensor4_c(h5_n,deeq_nc,"deeq_nc")
+    ! NOTE: QE's SCF-screened deeq/deeq_nc are deliberately NOT exported.
+    ! CoQui builds the density-dependent D natively (static dion + ex_cvij
+    ! plus Hartree-only screening from its own density); a DFT-screened D
+    ! from QE would double-count and carry V_xc (plan I2/I3).
     !
   endif ! ionode
 
