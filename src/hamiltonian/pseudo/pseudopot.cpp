@@ -626,7 +626,11 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
                    "residual {}, max element {} Ha) — corrupted or transposed "
                    "export (plan A5); regenerate the h5 with the CoQui-shipped "
                    "converter.", herm, dmax);
-      utils::check(dmax <= 1.0e3,
+      // Bound must admit legitimate datasets: JTH-v2.0 (atompaw-4.0.x) XMLs
+      // store unnormalized completeness partial waves with ||phi||^2 ~ 1e4,
+      // and dij0 scales as ||phi||^2 (measured: Si Psdj max|dij0| = 6.4e3 Ha,
+      // same physics as the atompaw-4.2 regeneration at 1.7e2).
+      utils::check(dmax <= 1.0e5,
                    "pseudopot::read_vnl_h5: max|dion| = {} Ha is implausibly "
                    "large — likely a unit/scale error in the converter "
                    "(plan A5).", dmax);

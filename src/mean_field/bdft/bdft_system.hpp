@@ -264,7 +264,12 @@ namespace mf {
         utils::check( npol_in_basis <= npol and npol_in_basis > 0, "Error: nspin_in_basis: {}",nspin_in_basis);
 
         h5::h5_read_attribute(sgrp, "number_of_elec", nelec);
-        h5::h5_read_attribute(sgrp, "madelung_constant", madelung);
+        // madelung_constant is absent from pw2coqui-written files (QE-sourced
+        // bdft); absent == 0 == "compute from cell/k-mesh" below.
+        if(H5Aexists(h5::hid_t(sgrp),"madelung_constant"))
+          h5::h5_read_attribute(sgrp, "madelung_constant", madelung);
+        else
+          madelung = 0.0;
         h5::h5_read_attribute(sgrp, "nuclear_energy", enuc);
         if( H5Aexists(h5::hid_t(sgrp),"fermi_energy") )
           h5::h5_read_attribute(sgrp, "fermi_energy", efermi);
