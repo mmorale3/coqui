@@ -180,11 +180,14 @@ namespace bdft_tests {
     std::string output = "coqui_vertex_ibz_gold";
 
     // one (variant, run) driver: n_iter scGW, optional vertex window, returns
-    // (e_hf, e_corr, sym_leakage_max). Side channel: last_grot holds the most-recent
-    // run's max G_CC G-rotation residual (see the REPRO block below).
+    // (e_hf, e_corr, sym_leakage_max). Side channels (most-recent run): last_grot = max
+    // G_CC G-rotation residual (REPRO block); last_Nm / last_cond = secondary basis size
+    // and achieved max_q cond(s) (COND-CAP block). cond_max<=0 keeps the legacy behavior.
     double last_grot = 0.0;
+    long last_Nm = 0;
+    double last_cond = 0.0;
     auto run = [&](std::string const& mf_name, nda::range window, long n_iter,
-                   std::string const& isdf_mode) {
+                   std::string const& isdf_mode, double cond_max = -1.0) {
       auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, mf_name));
       thc_reader_t thc(mf, make_thc_reader_ptree(mf->nbnd() * 8, "", "incore", "", "bdft",
                                                  1e-10, mf->ecutrho(), 1, 1024));
@@ -196,7 +199,7 @@ namespace bdft_tests {
       MBState mb_state(mpi_context, ft, output);
       iter_scf::iter_scf_t iter_sol("damping");
       solvers::vertex_t vtx(&ft, window.size() > 0 ? "2nd_exchange" : "none", window,
-                            mf->nbnd(), "ignore_g0", isdf_mode, 32, 1e-8);
+                            mf->nbnd(), "ignore_g0", isdf_mode, 32, 1e-8, -1.0, cond_max);
       if (vtx.enabled()) {
         scr_eri.set_vertex(&vtx);
         gw.set_vertex(&vtx);
@@ -207,6 +210,8 @@ namespace bdft_tests {
       mpi_context->comm.barrier();
       double leak = vtx.sym_leakage_max();
       last_grot = vtx.g_rotation_max();
+      last_Nm = vtx.secondary_Nm();
+      last_cond = vtx.secondary_cond_s_max();
       if (mpi_context->comm.root()) remove((output + ".mbpt.h5").c_str());
       mpi_context->comm.barrier();
       return std::make_tuple(e_hf, e_corr, leak);
@@ -338,6 +343,32 @@ namespace bdft_tests {
       // and the self-consistent e_corr tracks global to the downfold class it held at 1 iter.
       REQUIRE(grot_sec2 <= std::max(1e-6, 10.0 * grot_glo2));
       REQUIRE(std::abs(ec_sec2 - ec_glo2) <= 1e-4 + 0.05 * std::abs(ec_glo2 - ec_p_s));
+    }
+
+    // ---- CONDITIONING CAP (vertex_isdf_cond_max): bound the per-q downfold conditioning
+    // by regularizing the least-squares solve (rcond = 1/sqrt(cond_max)). last_cond is the
+    // REGULARIZED conditioning (max_q, smallest RETAINED singular value). The blowup is
+    // q-specific with a SHARED point set, so the cap bites in the SOLVE and leaves N_m
+    // unchanged (pruning shared points cannot touch the worst q). We cap BELOW the uncapped
+    // regularized conditioning to force the truncation to engage; the real payoff is Si
+    // production (raw cond(s) ~ 5e7). The disabled path (cond_max <= 0) uses svd_tol only
+    // and is covered bit-identically by every other secondary run in the suite. ---------
+    {
+      auto [ehf0, ec0, l0] = run("qe_lih222_sym", nda::range(1, 3), 1, "secondary");
+      const long Nm0 = last_Nm; const double cond0 = last_cond;
+      const double cap = std::max(1e3, cond0 / 1e3);   // cap well below the uncapped cond
+      auto [ehf1, ec1, l1] = run("qe_lih222_sym", nda::range(1, 3), 1, "secondary", cap);
+      const long Nm1 = last_Nm; const double cond1 = last_cond;
+      (void)ehf0; (void)ehf1; (void)l0; (void)l1;
+      app_log(1, "ibz COND-CAP: uncapped cond(s)_eff = {:.3e} (N_m = {}); cap = {:.3e} -> "
+                 "cond(s)_eff = {:.3e} (N_m = {}); e_corr {:.10f} -> {:.10f}",
+              cond0, Nm0, cap, cond1, Nm1, ec0, ec1);
+      REQUIRE(std::isfinite(ec1));
+      REQUIRE(Nm1 == Nm0);                       // the per-q rcond cap does NOT change N_m
+      if (cond0 > 2.0 * cap) {                   // cap genuinely below the uncapped cond
+        REQUIRE(cond1 <= 2.0 * cap);             // ... so the regularized cond is bounded
+        REQUIRE(cond1 < cond0);                  // ... and strictly improved
+      }
     }
 #endif  // ENABLE_DLR
   }

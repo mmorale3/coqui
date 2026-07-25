@@ -163,6 +163,12 @@ inline void ensure_checkpoint(std::shared_ptr<mf::MF> mf, std::string const& out
  *                 ([interaction.thc] thresh) so the selected interpolating vectors stay
  *                 in the span of the global basis; a tighter override over-resolves the
  *                 C pair-density metric and yields an ill-conditioned secondary metric.
+ *  - vertex_isdf_cond_max: "-1" Per-q conditioning cap on the secondary downfold
+ *                 ("secondary" only). <=0 disables it (solve uses vertex_isdf_svd_tol). >0
+ *                 sets the per-q least-squares rcond = 1/sqrt(cond_max) so each transfer q's
+ *                 downfold is conditioned to <= cond_max. The ill-conditioning is q-specific
+ *                 (not at Gamma) with a shared point set, so it is capped in the SOLVE, not
+ *                 by pruning interpolating vectors.
  *  - vertex_wannier_file: "" Path to a TRIQS-compatible wan.h5 (proj_mat + band_window;
  *                 gw solver only). When set, the vertex subspace C becomes the span of
  *                 the M Wannier orbitals |w_a(k)> = sum_i U_ia(k)|psi_i(k)> read from the
@@ -267,6 +273,9 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     auto vertex_isdf_svd_tol = io::get_value_with_default<double>(pt,"vertex_isdf_svd_tol",1e-8);
     // Secondary-ISDF point-selection thresh (-1 = default to the global THC thresh)
     auto vertex_isdf_thresh = io::get_value_with_default<double>(pt,"vertex_isdf_thresh",-1.0);
+    // Conditioning cap on the secondary metric s(q) (<=0 = disabled). >0 prunes the
+    // near-dependent tail of the selected basis so cond(s) stays under this value.
+    auto vertex_isdf_cond_max = io::get_value_with_default<double>(pt,"vertex_isdf_cond_max",-1.0);
     // Wannier-projector subspace C (notes/wannier_projector_theory.md): when set, the
     // vertex subspace is span{ w_a(k) } from a TRIQS-compatible wan.h5 (proj_mat +
     // band_window) instead of the band window; U is Loewdin-orthonormalized at load.
@@ -285,7 +294,8 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     // vertex_t must outlive the scf_loop below. Both cuts (Sigma^C and Pi^C)
     // are switched together through this single object -- never one alone.
     solvers::vertex_t vertex(&ft, vertex_type, vertex_band_window, mf->nbnd(), div_treatment,
-                             vertex_isdf, vertex_isdf_rank, vertex_isdf_svd_tol, vertex_isdf_thresh);
+                             vertex_isdf, vertex_isdf_rank, vertex_isdf_svd_tol, vertex_isdf_thresh,
+                             vertex_isdf_cond_max);
     if (vertex.enabled()) {
       utils::check(screen_type == "rpa" or screen_type == "rpa_k",
                    "vertex_type = \"{}\" currently requires screen_type = \"rpa\" or \"rpa_k\" "
@@ -539,6 +549,9 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
     auto vertex_isdf_svd_tol = io::get_value_with_default<double>(pt,"vertex_isdf_svd_tol",1e-8);
     // Secondary-ISDF point-selection thresh (-1 = default to the global THC thresh)
     auto vertex_isdf_thresh = io::get_value_with_default<double>(pt,"vertex_isdf_thresh",-1.0);
+    // Conditioning cap on the secondary metric s(q) (<=0 = disabled). >0 prunes the
+    // near-dependent tail of the selected basis so cond(s) stays under this value.
+    auto vertex_isdf_cond_max = io::get_value_with_default<double>(pt,"vertex_isdf_cond_max",-1.0);
     // Wannier-projector subspace C (notes/wannier_projector_theory.md): when set, the
     // vertex subspace is span{ w_a(k) } from a TRIQS-compatible wan.h5 (proj_mat +
     // band_window) instead of the band window; U is Loewdin-orthonormalized at load.
@@ -557,7 +570,8 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
     // vertex_t must outlive the scf_loop below. Both cuts (Sigma^C and Pi^C)
     // are switched together through this single object -- never one alone.
     solvers::vertex_t vertex(&ft, vertex_type, vertex_band_window, mf->nbnd(), div_treatment,
-                             vertex_isdf, vertex_isdf_rank, vertex_isdf_svd_tol, vertex_isdf_thresh);
+                             vertex_isdf, vertex_isdf_rank, vertex_isdf_svd_tol, vertex_isdf_thresh,
+                             vertex_isdf_cond_max);
     if (vertex.enabled()) {
       utils::check(screen_type == "rpa" or screen_type == "rpa_k",
                    "vertex_type = \"{}\" currently requires screen_type = \"rpa\" or \"rpa_k\" "

@@ -833,10 +833,11 @@ namespace solvers {
                      std::string isdf_mode,
                      long isdf_rank,
                      double isdf_svd_tol,
-                     double isdf_thresh):
+                     double isdf_thresh,
+                     double isdf_cond_max):
     _ft(ft), _vertex_type(std::move(vertex_type)), _band_window(band_window),
     _isdf_mode(std::move(isdf_mode)), _isdf_rank(isdf_rank), _isdf_svd_tol(isdf_svd_tol),
-    _isdf_thresh(isdf_thresh) {
+    _isdf_thresh(isdf_thresh), _isdf_cond_max(isdf_cond_max) {
 
     const std::unordered_set<std::string> valid_vertex_types = {"none", "2nd_exchange"};
     utils::check(valid_vertex_types.find(_vertex_type) != valid_vertex_types.end(),
@@ -1027,6 +1028,17 @@ namespace solvers {
       _Nm = Nm;
     }
 
+    // ---- conditioning cap (vertex_isdf_cond_max): applied PER Q in the transfer solve ---
+    // The cond(s) blowup is Q-SPECIFIC and NOT at Gamma (measured: Gamma cond ~1e4 but
+    // max_q cond ~1e19 at a non-Gamma transfer). The interpolating POINTS are shared across
+    // all q, so pruning the shared set CANNOT bound the worst-q conditioning -- pruning only
+    // removes points redundant at EVERY q, while the worst q's ill-conditioning comes from
+    // points that nearly coincide THERE but separate elsewhere (why both were selected). The
+    // robust cap is therefore applied per q in the least-squares solve below: the gelss
+    // rcond truncates B(q)'s near-null directions so each q's downfold t(q) is conditioned
+    // to <= _isdf_cond_max (rcond_eff = 1/sqrt(cond_max), floored by _isdf_svd_tol).
+    // Disabled (_isdf_cond_max <= 0) => rcond_eff = _isdf_svd_tol => BIT-IDENTICAL legacy.
+
     // ---- per-q Option-A transfer t(q) = s(q)^+ B(q)^dag C(q) (theoryB Eq. 36) ---------
     // Solved as the truncated-SVD least squares min || B t - C ||_F directly on B
     // (numerically equivalent, better conditioned: rcond acts on sv(B); the metric
@@ -1044,9 +1056,14 @@ namespace solvers {
     // actionable win. Diagnostics (cond/fit/disc maxima) are reduced with max.
     _t_qmP = nda::array<ComplexType, 3>(nqpts, _Nm, Np);
     _t_qmP() = ComplexType(0.0);
-    double cond_s_max = 0.0, fit_max = 0.0;
+    double cond_s_max = 0.0, cond_eff_max = 0.0, fit_max = 0.0;
     long disc_max = 0;
     long my_nsolve = 0;
+    // conditioning cap: rcond truncates B(q)'s near-null directions so each q's downfold is
+    // conditioned to <= _isdf_cond_max. Floored by _isdf_svd_tol; disabled => svd_tol only.
+    const double rcond_eff = (_isdf_cond_max > 0.0)
+        ? std::max(_isdf_svd_tol, 1.0 / std::sqrt(_isdf_cond_max))
+        : _isdf_svd_tol;
     {
       nda::array<ComplexType, 2> B_Im(Npair, _Nm), C_IP(Npair, Np);
       // gelss needs F-layout: keep the TRANSPOSES in C-layout and pass transposed views
@@ -1062,16 +1079,20 @@ namespace solvers {
         }
         int rank = 0;
         int info = nda::lapack::gelss(nda::transpose(BT), nda::transpose(CT), sv,
-                                      _isdf_svd_tol, rank);
+                                      rcond_eff, rank);
         utils::check(info == 0, "vertex_t::build_secondary_basis: gelss failed "
                                 "(info = {}) at iq = {}.", info, iq);
         // solution rows live in the first N_m rows of the (transposed-view) rhs
         for (long m = 0; m < _Nm; ++m)
           for (long P = 0; P < Np; ++P) _t_qmP(iq, m, P) = CT(P, m);
-        // diagnostics: cond(s) = cond(B)^2, discarded sv, fit residual ||Bt-C||/||C||
+        // diagnostics: cond_s = raw metric cond(B)^2; cond_eff = conditioning the
+        // regularized solve actually sees (smallest RETAINED sv) <= 1/rcond_eff^2 = the cap
         const double smax = sv(0), smin = sv(sv.size() - 1);   // descending order
         const double cond_s = (smax / std::max(smin, 1e-300)) *
                               (smax / std::max(smin, 1e-300));
+        const double smin_kept = (rank > 0) ? sv(rank - 1) : smin;
+        const double cond_eff = (smax / std::max(smin_kept, 1e-300)) *
+                                (smax / std::max(smin_kept, 1e-300));
         const long discarded = _Nm - rank;
         double num = 0.0, den = 0.0;
         nda::blas::gemm(B_Im, _t_qmP(iq, all, all), Cf);
@@ -1085,6 +1106,7 @@ namespace solvers {
                    "rank = {}/{}, discarded = {}, ||Bt - C||_F/||C||_F = {}",
                 iq, smin, smax, cond_s, rank, _Nm, discarded, fit);
         cond_s_max = std::max(cond_s_max, cond_s);
+        cond_eff_max = std::max(cond_eff_max, cond_eff);
         disc_max = std::max(disc_max, discarded);
         fit_max = std::max(fit_max, fit);
       }
@@ -1093,16 +1115,24 @@ namespace solvers {
     // per q to the serial solve) and reduce the diagnostics across ranks.
     mpi->comm.all_reduce_in_place_n(_t_qmP.data(), _t_qmP.size(), std::plus<>{});
     cond_s_max = mpi->comm.all_reduce_value(cond_s_max, boost::mpi3::max<>{});
+    cond_eff_max = mpi->comm.all_reduce_value(cond_eff_max, boost::mpi3::max<>{});
     fit_max    = mpi->comm.all_reduce_value(fit_max, boost::mpi3::max<>{});
     disc_max   = mpi->comm.all_reduce_value(disc_max, boost::mpi3::max<>{});
     const long total_solve = mpi->comm.all_reduce_value(my_nsolve, std::plus<>{});
     app_log(1, "  Refinement 2 secondary basis READY: N_m = {} (pair rank {} per q), "
-               "max_q cond(s) = {},\n"
+               "max_q cond(s) = {} (raw metric), {} (regularized solve, rcond = {}),\n"
                "  max_q discarded sv = {}, max_q fit residual ||Bt - C||_F/||C||_F = {}\n"
                "  t(q) solve distributed over {} ranks: this rank ran {} of {} gelss "
                "solves (~1/P work)\n",
-            _Nm, Npair, cond_s_max, disc_max, fit_max,
+            _Nm, Npair, cond_s_max, cond_eff_max, rcond_eff, disc_max, fit_max,
             mpi->comm.size(), my_nsolve, total_solve);
+    // store the REGULARIZED conditioning (what the cap controls); cond_eff_max <= the cap.
+    _cond_s_max = cond_eff_max;
+    if (_isdf_cond_max > 0.0)
+      app_log(1, "  Refinement 2: conditioning cap vertex_isdf_cond_max = {} -> per-q "
+                 "downfold conditioning bounded to max_q {} (rcond = {}); the raw metric "
+                 "cond(s) = {} is regularized in the solve.",
+              _isdf_cond_max, cond_eff_max, rcond_eff, cond_s_max);
     _secondary_ready = true;
   }
 

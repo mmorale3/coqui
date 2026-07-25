@@ -156,6 +156,17 @@ namespace solvers {
      *                        collocation B(q) in the truncated pseudo-inverse solve
      *                        for t(q) (the metric s = B^dag B is regularized at the
      *                        SQUARE of this value). Default 1e-8.
+     * @param isdf_cond_max - [INPUT] per-q conditioning cap on the secondary downfold
+     *                        ("secondary" mode only). <= 0 (default): disabled, the solve
+     *                        uses isdf_svd_tol only (legacy behavior). > 0: the per-q
+     *                        least-squares solve for t(q) truncates B(q)'s near-null
+     *                        directions (gelss rcond = 1/sqrt(cond_max), floored by
+     *                        isdf_svd_tol) so each transfer q's downfold is conditioned to
+     *                        <= cond_max. NOTE: the ill-conditioning is q-specific (NOT at
+     *                        Gamma) and the interpolating points are shared across q, so it
+     *                        is bounded per q in the SOLVE, not by pruning the shared point
+     *                        set -- pruning can only drop globally-redundant vectors, which
+     *                        does not touch the worst q. eta(q,nu) certifies the accuracy.
      */
     vertex_t(const imag_axes_ft::IAFT *ft,
              std::string vertex_type,
@@ -165,7 +176,8 @@ namespace solvers {
              std::string isdf_mode = "global",
              long isdf_rank = -1,
              double isdf_svd_tol = 1e-8,
-             double isdf_thresh = -1.0);
+             double isdf_thresh = -1.0,
+             double isdf_cond_max = -1.0);
 
     vertex_t(vertex_t const&) = default;
     vertex_t(vertex_t &&) = default;
@@ -315,10 +327,15 @@ namespace solvers {
     // THC thresh, thc.thresh()). A tighter value than the global thresh pushes the
     // selected interpolating vectors outside the global-basis span -> ill-conditioned.
     double _isdf_thresh = -1.0;
+    // per-q conditioning cap on the secondary downfold; <= 0 disables it (the solve uses
+    // isdf_svd_tol only). > 0 sets the per-q gelss rcond = 1/sqrt(cond_max). See ctor doc.
+    double _isdf_cond_max = -1.0;
     // geometry-fixed cache (built lazily on the first kernel evaluation)
     bool _secondary_ready = false;
     long _Nm = 0;                          // ACTUAL secondary rank (selection may
                                            // return fewer points than requested)
+    double _cond_s_max = 0.0;              // max_q REGULARIZED downfold conditioning
+                                           // (bounded by the cond cap; diagnostic)
     nda::array<ComplexType, 4> _Xb_skma;   // secondary collocation (ns, nk, N_m, nc)
     nda::array<ComplexType, 3> _t_qmP;     // Option-A transfer t(q): (nq, N_m, Np)
 
@@ -437,6 +454,9 @@ namespace solvers {
     // running max of the G_CC G-rotation consistency residual across this vertex's
     // eval calls (0 until the first symmetric evaluation; 0 on symmetry-free meshes).
     double g_rotation_max() const { return _g_rot_max; }
+    // secondary-basis diagnostics (0 until build_secondary_basis has run):
+    long secondary_Nm() const { return _Nm; }                    // actual secondary rank N_m
+    double secondary_cond_s_max() const { return _cond_s_max; }  // max_q regularized downfold cond
 
   }; // vertex_t
 
