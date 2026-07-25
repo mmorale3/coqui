@@ -288,6 +288,11 @@ namespace solvers {
     // (vertex_t::cache_w, notes/wbar_cache.md) and dW is freed unconditionally --
     // plain-GW memory profile. Defined in the .cpp.
     bool needs_dw_retention() const;
+    // true iff an attached active vertex already has a SCREENED rung available for
+    // Pi^C -- a retained dW (global path) or a folded W-bar cache (secondary path).
+    // False only on the very first update_w of a run, which is what the bootstrap in
+    // update_w keys on. Defined in the .cpp.
+    bool vertex_has_rung(MBState const &mb_state) const;
 
     // TODO Remove everything below
     const nda::array<ComplexType, 1>& eps_inv_head() const {

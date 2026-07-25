@@ -45,6 +45,13 @@ namespace solvers {
            (not _vertex->secondary() or not _vertex->w_cache_enabled());
   }
 
+  bool scr_coulomb_t::vertex_has_rung(MBState const &mb_state) const {
+    if (_vertex == nullptr or not _vertex->active()) return false;
+    if (_vertex->secondary() and _vertex->w_cache_enabled())
+      return _vertex->has_cached_w();
+    return mb_state.dW_qtPQ.has_value();
+  }
+
   scr_coulomb_t::scr_coulomb_t(const imag_axes_ft::IAFT *ft,
                                std::string screen_type,
                                std::string div):
@@ -93,6 +100,36 @@ namespace solvers {
 
     utils::check(thc.mpi() == mb_state.mpi,
                  "scr_coulomb_t::update_w: THC_ERI and MBState should have the same MPI context.");
+
+    // ---- ISDF-Vertex BOOTSTRAP: a SCREENED rung for Pi^C on the first update ---------
+    // Pi^C = -2 dPhi_2^C/dW is a functional of the SCREENED interaction, but on the very
+    // first update of a run no W exists yet -- neither a retained dW (global path) nor a
+    // folded W-bar cache (secondary path) -- and eval_Pi_C falls back to the BARE rung
+    // W = Z. That is not a benign startup detail: on Si kp444 with C = [0, 8) it drives
+    // iteration 1 to epsilon_inf = 19.6 against a converged RPA value of 5.35, and the
+    // resulting grossly over-screened W feeds Sigma^GW, Sigma^C and hence G for every
+    // subsequent iteration -- the observed trajectory never recovers.
+    // FIX: on that first update only, solve the RPA problem FIRST with the vertex
+    // detached and publish its W, then redo the update with the vertex attached so Pi^C
+    // starts from a physically screened rung. The self-consistent FIXED POINT is
+    // unchanged (there Pi^C already consumes the converged W); only the starting point
+    // of the iteration moves. Cost: one extra RPA polarization + Dyson solve, once.
+    if (has_active_vertex() and not vertex_has_rung(mb_state)) {
+      app_log(1, "  [ISDF-Vertex] bootstrap: no screened W is available yet, so Pi^C would "
+                 "use the BARE\n"
+                 "                rung W = Z. Solving the RPA problem first and re-running "
+                 "this update\n"
+                 "                with the vertex attached (one extra RPA + Dyson solve, "
+                 "this iteration only).\n");
+      auto *vtx = _vertex;
+      _vertex = nullptr;                      // RPA-only pass (no Pi^C, no cache_w)
+      update_w(mb_state, thc, -1);            // publishes dW + eps_inv_head
+      _vertex = vtx;
+      // secondary path: fold the freshly published RPA W into the N_m x N_m rung cache,
+      // exactly as the update_w tail would have done had the vertex been attached.
+      if (_vertex->secondary() and _vertex->w_cache_enabled())
+        _vertex->cache_w(mb_state, thc);
+    }
 
     if (_screen_type.find("edmft") != std::string::npos) {
       if (!mb_state.sPi_imp_wabcd or !mb_state.sPi_dc_wabcd) {
