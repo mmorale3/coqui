@@ -435,6 +435,25 @@ namespace solvers {
       if (_vertex != nullptr and _vertex->active()) {
         auto dPi_C_tqPQ = _vertex->eval_Pi_C(mb_state, thc, dPi.grid(),
                                              dPi.block_size(), dPi.global_shape());
+        // SIZE OF THE CORRECTION. Pi^C is meant to be a correction to Pi_RPA; if it is
+        // comparable to or larger than what it corrects, the second-order-exchange
+        // truncation is outside its regime and eps = I - Z.Pi is at risk of losing
+        // positivity (notes/vertex_divergence_diagnosis.md section 2). Report the ratio
+        // so "large but controlled" is distinguishable from "runaway" at a glance.
+        double nC = 0.0, nR = 0.0;
+        for (auto const &v : dPi_C_tqPQ.local()) nC = std::max(nC, std::abs(v));
+        for (auto const &v : dPi.local()) nR = std::max(nR, std::abs(v));
+        nC = thc.mpi()->comm.all_reduce_value(nC, boost::mpi3::max<>{});
+        nR = thc.mpi()->comm.all_reduce_value(nR, boost::mpi3::max<>{});
+        app_log(1, "  [ISDF-Vertex] ||Pi^C||_max = {:.4e} vs ||Pi_RPA||_max = {:.4e} "
+                   "(ratio {:.3e})", nC, nR, nC / std::max(nR, 1e-300));
+        if (nC > nR)
+          app_log(1, "  [WARNING] the vertex polarization EXCEEDS the RPA polarization it "
+                     "corrects.\n"
+                     "            The second-order-exchange truncation is outside its "
+                     "regime here; expect\n"
+                     "            eps = I - Z.Pi to lose positivity (see the dielectric "
+                     "conditioning below).");
         dPi.local() += dPi_C_tqPQ.local();
         thc.mpi()->comm.barrier();
       }

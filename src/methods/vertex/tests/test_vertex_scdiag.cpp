@@ -323,4 +323,39 @@ namespace bdft_tests {
     }
   }
 
+
+  // ====================================================================================
+  // LOCAL REPRODUCTION of the Si divergence.
+  //
+  // The Si failure has been expensive to study because the only systems that showed it
+  // were cluster-scale. The mechanism (notes/vertex_divergence_diagnosis.md section 2) is
+  // that P^C -- unlike the RPA polarization, which is negative semi-definite on the
+  // imaginary axis -- can push eps = I - Z.Pi through zero, after which
+  // dyson_W_in_place's inverse is meaningless and Sigma explodes on the NEXT iteration.
+  // If that is right, the failure is driven by the SIZE of the vertex, so widening C on
+  // LiH-222 should reproduce it on a laptop.
+  //
+  // Reports, per window and per iteration: e_corr, and (from the update_w log) the
+  // dielectric conditioning max_(q,i.nu) ||[I - Z.Pi]^-1||_max. A window that stays
+  // O(1) is inside the stable envelope; one that blows up is outside it.
+  // ====================================================================================
+  TEST_CASE("vertex_scdiag_dielectric_stability", "[methods][vertex][scdiag]") {
+    auto &mpi_context = utils::make_unit_test_mpi_context();
+    imag_axes_ft::IAFT ft(1000, 6.0, imag_axes_ft::dlr_basis, "low");
+
+    // widen C on the SAME system: the vertex grows, everything else is held fixed
+    for (auto w : std::vector<nda::range>{nda::range(0, 0), nda::range(1, 3),
+                                          nda::range(0, 4), nda::range(0, 6)}) {
+      auto r = scdiag_detail::run_scf(mpi_context, ft, "qe_lih222", w, 5, "global",
+                                      nda::range(1, 3));
+      app_log(1, "scdiag DIELECTRIC-STABILITY C = [{}, {}) (nc = {}), 5 iterations: "
+                 "e_corr = {:.12f} {}",
+              w.first(), w.last(), w.size(), r.e_corr,
+              std::isfinite(r.e_corr) ? "" : "  <-- NOT FINITE");
+      // the run must not produce NaN/Inf; a genuinely indefinite eps shows up as a
+      // huge but finite e_corr, which the per-iteration log above attributes
+      REQUIRE(std::isfinite(r.e_corr));
+    }
+  }
+
 } // bdft_tests
