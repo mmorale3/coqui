@@ -616,6 +616,14 @@ namespace methods {
         // dim0 / (ns_loc * nk_loc) = nt times). Materialise it on WORK_MEM
         // once instead of mirroring per i — one bulk H->D copy replaces
         // nt copies per (s, k).
+        //
+        // The left factor is sliced with P_rng, the right factor with
+        // Q_rng. They coincide only when ip == iq AND this rank's local
+        // (P, Q) block is diagonal (P_rng == Q_rng); sharing the cache on
+        // ip == iq alone silently used X(P_rng) as the right factor on
+        // ranks with off-diagonal or rectangular blocks (wrong data, and
+        // mismatched gemm dims for NP_loc != NQ_loc).
+        const bool same_lr = (ip == iq) and (P_offset == Q_offset) and (NP_loc == NQ_loc);
         memory::array<WORK_MEM, ComplexType, 4> Xl_cache;
         memory::array<WORK_MEM, ComplexType, 4> Xr_cache;
         {
@@ -627,7 +635,7 @@ namespace methods {
             }
           }
           Xl_cache = memory::to_memory_space<WORK_MEM>(Xl_host);
-          if (ip != iq) {
+          if (not same_lr) {
             nda::array<ComplexType, 4> Xr_host(ns_loc, nk_loc, NQ_loc, nbnd);
             for (size_t s = 0; s < ns_loc; ++s) {
               for (size_t k = 0; k < nk_loc; ++k) {
@@ -656,8 +664,8 @@ namespace methods {
           size_t k = i % nk_loc;
 
           auto Xl_view = Xl_cache(s, k, all, all);
-          auto Xr_view = (ip == iq) ? Xl_cache(s, k, all, all)
-                                    : Xr_cache(s, k, all, all);
+          auto Xr_view = same_lr ? Xl_cache(s, k, all, all)
+                                 : Xr_cache(s, k, all, all);
           auto Oab_i   = Oab_all(i, all, all);
 
           nda::blas::gemm(nda::dagger(Xl_view), O_iPQ_3D(i, all, all), Ask_aQ);
