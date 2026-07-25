@@ -163,6 +163,15 @@ inline void ensure_checkpoint(std::shared_ptr<mf::MF> mf, std::string const& out
  *                 ([interaction.thc] thresh) so the selected interpolating vectors stay
  *                 in the span of the global basis; a tighter override over-resolves the
  *                 C pair-density metric and yields an ill-conditioned secondary metric.
+ *  - vertex_scale: "1.0" Scale BOTH cuts by lambda, i.e. Phi_2^C -> lambda Phi_2^C.
+ *                 Conservation stays exact at every lambda because the scaling acts on the
+ *                 generating functional, not on the already-cut Sigma/P.
+ *  - vertex_ramp_iters: "0" If > 0, walk lambda up to vertex_scale over this many scf
+ *                 iterations (lambda_n = vertex_scale * min(1, n/ramp)). P^C carries no
+ *                 sign guarantee, so a full-strength vertex can drive eps = I - Z.Pi
+ *                 through zero and break the W-Dyson solve; ramping locates the largest
+ *                 lambda whose solution still has a positive-definite eps. Watch the
+ *                 "dielectric conditioning" line in the update_w log.
  *  - vertex_isdf_cond_max: "-1" Per-q conditioning cap on the secondary downfold
  *                 ("secondary" only). <=0 disables it (solve uses vertex_isdf_svd_tol). >0
  *                 sets the per-q least-squares rcond = 1/sqrt(cond_max) so each transfer q's
@@ -276,6 +285,13 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     // Conditioning cap on the secondary metric s(q) (<=0 = disabled). >0 prunes the
     // near-dependent tail of the selected basis so cond(s) stays under this value.
     auto vertex_isdf_cond_max = io::get_value_with_default<double>(pt,"vertex_isdf_cond_max",-1.0);
+    // Phi-scaling of the vertex: BOTH cuts by the same lambda == Phi_2^C -> lambda Phi_2^C,
+    // so conservation is exact at every lambda (the approximation acts on Phi, not on the
+    // cuts). vertex_ramp_iters > 0 walks lambda from vertex_scale/ramp up to vertex_scale
+    // over that many scf iterations. Used to keep eps = I - Z.Pi positive definite: P^C is
+    // not sign-definite (notes/vertex_divergence_diagnosis.md).
+    auto vertex_scale = io::get_value_with_default<double>(pt,"vertex_scale",1.0);
+    auto vertex_ramp_iters = io::get_value_with_default<long>(pt,"vertex_ramp_iters",0);
     // Wannier-projector subspace C (notes/wannier_projector_theory.md): when set, the
     // vertex subspace is span{ w_a(k) } from a TRIQS-compatible wan.h5 (proj_mat +
     // band_window) instead of the band window; U is Loewdin-orthonormalized at load.
@@ -296,6 +312,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     solvers::vertex_t vertex(&ft, vertex_type, vertex_band_window, mf->nbnd(), div_treatment,
                              vertex_isdf, vertex_isdf_rank, vertex_isdf_svd_tol, vertex_isdf_thresh,
                              vertex_isdf_cond_max);
+    vertex.set_vertex_scale(vertex_scale, vertex_ramp_iters);
     if (vertex.enabled()) {
       utils::check(screen_type == "rpa" or screen_type == "rpa_k",
                    "vertex_type = \"{}\" currently requires screen_type = \"rpa\" or \"rpa_k\" "
@@ -552,6 +569,13 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
     // Conditioning cap on the secondary metric s(q) (<=0 = disabled). >0 prunes the
     // near-dependent tail of the selected basis so cond(s) stays under this value.
     auto vertex_isdf_cond_max = io::get_value_with_default<double>(pt,"vertex_isdf_cond_max",-1.0);
+    // Phi-scaling of the vertex: BOTH cuts by the same lambda == Phi_2^C -> lambda Phi_2^C,
+    // so conservation is exact at every lambda (the approximation acts on Phi, not on the
+    // cuts). vertex_ramp_iters > 0 walks lambda from vertex_scale/ramp up to vertex_scale
+    // over that many scf iterations. Used to keep eps = I - Z.Pi positive definite: P^C is
+    // not sign-definite (notes/vertex_divergence_diagnosis.md).
+    auto vertex_scale = io::get_value_with_default<double>(pt,"vertex_scale",1.0);
+    auto vertex_ramp_iters = io::get_value_with_default<long>(pt,"vertex_ramp_iters",0);
     // Wannier-projector subspace C (notes/wannier_projector_theory.md): when set, the
     // vertex subspace is span{ w_a(k) } from a TRIQS-compatible wan.h5 (proj_mat +
     // band_window) instead of the band window; U is Loewdin-orthonormalized at load.
@@ -572,6 +596,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
     solvers::vertex_t vertex(&ft, vertex_type, vertex_band_window, mf->nbnd(), div_treatment,
                              vertex_isdf, vertex_isdf_rank, vertex_isdf_svd_tol, vertex_isdf_thresh,
                              vertex_isdf_cond_max);
+    vertex.set_vertex_scale(vertex_scale, vertex_ramp_iters);
     if (vertex.enabled()) {
       utils::check(screen_type == "rpa" or screen_type == "rpa_k",
                    "vertex_type = \"{}\" currently requires screen_type = \"rpa\" or \"rpa_k\" "

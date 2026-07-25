@@ -368,6 +368,13 @@ namespace solvers {
     // measured unitarity defect max ||Dc^dag Dc - 1||_F of the C-sector symmetry
     // rotation Xhat is built from -- the accuracy floor of the symmetry path.
     double _sym_d_unitarity_max = 0.0;
+    // VERTEX RAMP: Phi_2^C -> lambda Phi_2^C. _scale is the target strength, _ramp_iters
+    // the number of scf iterations over which lambda is walked from 1/_ramp_iters up to
+    // _scale (0 = no ramp, lambda = _scale immediately). _vertex_iter counts eval_Pi_C
+    // calls = scf iterations with an active vertex.
+    double _scale = 1.0;
+    long _ramp_iters = 0;
+    long _vertex_iter = 0;
     // measured G_CC G-rotation consistency residual, running max over this vertex's
     // eval_Pi_C / eval_Sigma_C calls (diagnostic, no gate; memo section 6). Distinct
     // from the iteration-independent D-matrix leakage above: this one tracks whether
@@ -454,6 +461,25 @@ namespace solvers {
     // first symmetric evaluation; 0 on symmetry-free meshes).
     double sym_leakage_max() const { return _sym_leak_max; }
     double sym_d_unitarity_max() const { return _sym_d_unitarity_max; }
+
+    // Phi-scaling controls. Setting BOTH cuts by the same factor is Phi_2^C ->
+    // lambda Phi_2^C, so conservation (Tr[Sigma^C G] + Tr[P^C W] = 0) is exact at
+    // every lambda -- the approximation acts on Phi, never on the cuts.
+    void set_vertex_scale(double s, long ramp_iters = 0) {
+      utils::check(s >= 0.0, "vertex_t::set_vertex_scale: lambda must be >= 0 (got {}).", s);
+      utils::check(ramp_iters >= 0,
+                   "vertex_t::set_vertex_scale: ramp_iters must be >= 0 (got {}).",
+                   ramp_iters);
+      _scale = s;
+      _ramp_iters = ramp_iters;
+    }
+    // lambda in force for the CURRENT scf iteration
+    double vertex_scale() const {
+      if (_ramp_iters <= 0) return _scale;
+      const long n = std::max(1l, _vertex_iter);
+      return _scale * std::min(1.0, double(n) / double(_ramp_iters));
+    }
+    long vertex_iter() const { return _vertex_iter; }
     double sym_leakage_mean() const { return _sym_leak_mean; }
     // running max of the G_CC G-rotation consistency residual across this vertex's
     // eval calls (0 until the first symmetric evaluation; 0 on symmetry-free meshes).

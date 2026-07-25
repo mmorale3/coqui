@@ -1526,6 +1526,13 @@ namespace solvers {
     //     operator sandwich Sigma^C_ij = [U Sigma_bar U^dag]_ij over i,j in W_rng
     //     (projector_t::upfold primitive). External k axis is IBZ-resident; the IBZ
     //     k-points are [0, nk_ext), so _U_skia(is, ik_ext) is the right U.
+    const double lam_s = vertex_scale();
+    if (lam_s != 1.0) {
+      Sigma_C *= ComplexType(lam_s);
+      app_log(1, "  [ISDF-Vertex] Sigma^C scaled by lambda = {:.4f} (Phi_2^C -> lambda "
+                 "Phi_2^C; BOTH cuts carry the same lambda, so conservation is exact).",
+              lam_s);
+    }
     if (mb_state.mpi->node_comm.root()) {
       if (not wan) {
         sSigma_tskij.local()(all, all, all, _band_window, _band_window) += Sigma_C;
@@ -1551,6 +1558,9 @@ namespace solvers {
     decltype(nda::range::all) all;
     utils::check(active(), "vertex_t::eval_Pi_C: called while the vertex is inactive. "
                            "Callers must guard vertex calls with vertex_t::active().");
+    // one scf iteration = one eval_Pi_C followed by one eval_Sigma_C, so counting here
+    // and READING (not advancing) in eval_Sigma_C gives both cuts the same lambda.
+    ++_vertex_iter;
     utils::check(mb_state.sG_tskij.has_value(),
                  "vertex_t::eval_Pi_C: sG_tskij is not initialized in MBState.");
 
@@ -2216,6 +2226,22 @@ namespace solvers {
       vertex_redist_detail::reduce_scatter_into(Pi_tqMN, dPi_C_tqPQ, mpi->comm);
     }
 
+    {
+      // VERTEX RAMP / SCALE. Both cuts carry the SAME lambda, which is exactly
+      // Phi_2^C -> lambda Phi_2^C: the approximation acts on the GENERATING FUNCTIONAL,
+      // not on the already-cut Sigma/P, so Phi-derivability and the conservation
+      // identity survive at every lambda (notes/CLAUDE.md section 12 / section 8).
+      // Used to walk the vertex in continuously: P^C is not sign-definite, so a full-
+      // strength vertex can push eps = I - Z.Pi through zero and break the W-Dyson
+      // solve (notes/vertex_divergence_diagnosis.md section 2). Ramping finds the
+      // largest lambda whose solution still has a positive-definite eps.
+      const double lam = vertex_scale();
+      if (lam != 1.0) {
+        dPi_C_tqPQ.local() *= ComplexType(lam);
+        app_log(1, "  [ISDF-Vertex] Pi^C scaled by lambda = {:.4f} (ramp iteration {} of "
+                   "{})", lam, _vertex_iter, _ramp_iters);
+      }
+    }
     {
       // NaN/Inf guard on THIS rank's owned block (the full array is no longer materialized)
       double max_abs = 0.0;
