@@ -462,10 +462,10 @@ class pseudopot
   paw::runtime_caches& paw_rt() const;
   // ∫ V(r) Q̂^a_IJ(r) dr on the dense (augmentation) grid for an arbitrary
   // local potential V(r) (proper-FT contraction with qgm; e^{+iG·τ} phase).
-  // Returns (nat, nhm, nhm); zero for NCPP / empty V / empty qgm. Only the
-  // comm root needs valid V content (root FFTs and broadcasts V(G); the G
-  // contraction is strided over all ranks). MPI-COLLECTIVE on this
-  // pseudopot's communicator. Defined in paw_onecenter.hpp.
+  // Returns (nat, nhm, nhm); zero for NCPP / empty V / empty qgm. Purely
+  // RANK-LOCAL (no MPI): the calling rank must hold valid V content and does
+  // the FFT + full G contraction itself — safe from node-root-only shm
+  // builders (set_H0). Defined in paw_onecenter.hpp.
   template<typename Pot_t>
   nda::array<ComplexType,3> compute_int_VQ(Pot_t const& V_r) const;
   // Eq. (h0) static USPP/PAW non-local D:
@@ -476,7 +476,8 @@ class pseudopot
   // contained in dion: Eq. (d0)'s −⟨Q̂|v_H[ñ_Zc]⟩ is the one-center
   // DESCREENING reference (opposite sign, radial, own-atom), put there
   // precisely so the solid re-adds the full periodic integral. Lazily
-  // cached (V_loc and Q̂ are frozen); MPI-COLLECTIVE at first call.
+  // cached (V_loc and Q̂ are frozen); the first-call build is rank-local,
+  // so calls are safe from any context (incl. node-root-only builders).
   nda::array<ComplexType,3> const& static_h0_D() const;
   // Angular-momentum coupling tables at lli = 1 + max l over all projectors.
   paw::aainit_tables const& paw_aatab() const;

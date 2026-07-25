@@ -657,9 +657,16 @@ nda::array<ComplexType,3> pseudopot::compute_paw_deeq_from_becsum(
 }
 
 // ∫ V(r) Q̂^a_IJ(r) dr (proper-FT contraction with qgm; e^{+iG·τ} phase).
-// The FFT of V is done on the comm root (only root is guaranteed valid V
-// content) and broadcast; the G contraction is strided over ALL comm ranks
-// and all_reduced (plan A4 — this loop was root-serial). MPI-collective.
+// Purely RANK-LOCAL — no MPI. The caller's V_r is used as-is (every live
+// call site reads node-shared arrays valid on the calling rank after its
+// builder's barriers), and the FFT + full dense-G contraction run on the
+// calling rank. This must stay communicator-free: static_h0_D() builds a
+// lazy cache through here, and the shm builders (set_H0 & co.) reach it on
+// node roots only — a collective on mpi->comm here deadlocks those callers
+// against the ranks waiting at the builder barrier (rusty np=16 hang,
+// 2026-07-25). The one-shot cost (one FFT + ~ngm·nat·nh² sum) is
+// negligible; if profiling ever says otherwise, parallelize over an
+// explicitly PASSED communicator that all callers are collectively inside.
 template<typename Pot_t>
 nda::array<ComplexType,3> pseudopot::compute_int_VQ(Pot_t const& V_r) const
 {
@@ -673,21 +680,19 @@ nda::array<ComplexType,3> pseudopot::compute_int_VQ(Pot_t const& V_r) const
 
     long NX = fft_mesh_aug(0), NY = fft_mesh_aug(1), NZ = fft_mesh_aug(2);
     nda::array<ComplexType,1> vh_g(nnr_aug);
-    if (mpi->comm.root()) {
+    {
       for (long r = 0; r < nnr_aug; ++r) vh_g(r) = V_r(r);
       auto vh3d = nda::reshape(vh_g, std::array<long,3>{NX, NY, NZ});
       math::nda::fft<false> Ffwd(vh3d);
       Ffwd.forward(vh3d);                          // 1/N-normalized = proper FT
     }
-    mpi->comm.broadcast_n(vh_g.data(), vh_g.size(), 0);
     {
       double det = recv(0,0)*(recv(1,1)*recv(2,2) - recv(1,2)*recv(2,1))
                  - recv(1,0)*(recv(0,1)*recv(2,2) - recv(0,2)*recv(2,1))
                  + recv(2,0)*(recv(0,1)*recv(1,2) - recv(0,2)*recv(1,1));
       double Omega = (2.0*M_PI)*(2.0*M_PI)*(2.0*M_PI) / std::abs(det);
       auto qg = qgm.local();
-      long np = mpi->comm.size(), r0 = mpi->comm.rank();
-      for (long g = r0; g < ngm_dense; g += np) {
+      for (long g = 0; g < ngm_dense; ++g) {
         int m1 = miller_g_dense(g,0), m2 = miller_g_dense(g,1), m3 = miller_g_dense(g,2);
         long n1 = m1; if (n1 < 0) n1 += NX;
         long n2 = m2; if (n2 < 0) n2 += NY;
@@ -714,17 +719,14 @@ nda::array<ComplexType,3> pseudopot::compute_int_VQ(Pot_t const& V_r) const
         }
       }
     }
-    // Native-MPI_SUM reduction via the flat-double reinterpret (the complex
-    // value type falls onto a serialized path; see v_x_paw psi_r_full note).
-    mpi->comm.all_reduce_in_place_n(
-        reinterpret_cast<double*>(Dg.data()), 2 * Dg.size(), std::plus<>{});
     return Dg;
 }
 
 // Eq. (h0) static USPP/PAW non-local D = Dnn_atom_static + ∫V_loc·Q̂
 // (settled 2026-07-24 — see the declaration in pseudopot.h for the
-// derivation against plan Eq. d0). Lazily cached; MPI-collective at the
-// first call (compute_int_VQ broadcast/all_reduce).
+// derivation against plan Eq. d0). Lazily cached; the first-call build is
+// purely rank-local (compute_int_VQ has no MPI), so it is safe from ANY
+// calling context, including node-root-only shm builders (set_H0).
 inline nda::array<ComplexType,3> const& pseudopot::static_h0_D() const
 {
     auto& rt = paw_rt();
