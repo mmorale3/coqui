@@ -5274,5 +5274,81 @@ TEST_CASE("ex_cvij_native", "[paw]")
       if (I != J) REQUIRE(ex(I, J) == 0.0);
 }
 
+// ===========================================================================
+// Plan C4 — augmentation-mode exchange-energy baseline (direct dense-grid
+// path, finite-size off). Computes E_X = (2/ns)·Σ_k w_k·½Tr[Dm K] from the
+// direct Vexchange in BOTH vv_compensation modes and logs the mode split.
+// The default bare-Coulomb kernel zeroes the G+Δk=0 term (ignore_g0), i.e.
+// the finite-size-off convention of the 2026-07-21 ABINIT si222 accounting
+// (notes/paw_article_results/abinit_exchange_gw_vs_hybrid.md):
+//   moment+deltaC(+ex_cvij)  <->  ABINIT hybrid/HF pawdijfock operator
+//   shape (Arnaud)           <->  ABINIT GW Sigma_x operator
+// Purpose: a reproducible CURRENT-CODE baseline pair for the C4 cluster
+// campaign. NOTE: the ABINIT references (−1.316447 GW / HF accounting) were
+// produced on the rusty cmp si222 mf (Γ eigvals −0.23437/0.21250…); the
+// local qe_si222_paw fixture is a different cell (−0.20204/0.24111…), so
+// these numbers are baselines, not the cross-code comparison itself.
+// [slow]: two direct v_x builds per fixture.
+// ===========================================================================
+template<MEMORY_SPACE MEM>
+void test_vexchange_mode_energies(mpi_context_t& mpi,
+                                  std::shared_ptr<mf::MF> mf_ptr,
+                                  std::string const& tag)
+{
+  auto all = nda::range::all;
+  auto& mfobj = *mf_ptr;
+  long nspin = mfobj.nspin(), nk_ibz = mfobj.nkpts_ibz(), nbnd = mfobj.nbnd();
+
+  nda::array<ComplexType,3> nii(nspin, nk_ibz, nbnd);
+  nii() = mfobj.occ()(all, nda::range(nk_ibz), all);
+  auto k_weight = mfobj.k_weight();
+
+  hamilt::pseudopot V(mfobj);
+  auto EX = [&](bool shape) {
+    V.set_paw_exx_shape_restored(shape);
+    auto dK = hamilt::Vexchange<MEM>(mfobj, mpi.comm, &V, nii);
+    // Same convention as methods::eval_hf_energy with band-diagonal Dm=occ:
+    // E_X = spin_factor · Σ_k w_k · ½ Σ_n f_n Re K_nn.
+    auto K = nda::to_host(dK.local());
+    auto rs = dK.local_range(0); auto rk = dK.local_range(1);
+    auto ri = dK.local_range(2); auto rj = dK.local_range(3);
+    double e = 0.0;
+    for (auto [il_s, s] : itertools::enumerate(rs))
+      for (auto [il_k, k] : itertools::enumerate(rk))
+        for (auto [il_i, i] : itertools::enumerate(ri))
+          for (auto [il_j, j] : itertools::enumerate(rj))
+            if (i == j)
+              e += k_weight(k) * std::real(nii(s, k, i)) *
+                   std::real(K(il_s, il_k, il_i, il_j));
+    e = mpi.comm.all_reduce_value(e, std::plus<>{});
+    double spin_factor = (nspin == 2) ? 1.0 : 2.0;
+    return 0.5 * spin_factor * e;
+  };
+
+  double E_m = EX(false);   // moment + deltaC (ABINIT HF pawdijfock side)
+  double E_s = EX(true);    // shape / Arnaud   (ABINIT GW Sigma_x side)
+  app_log(1, "[C4 mode energies {}] E_X(moment+deltaC) = {:+.8f} Ha, "
+             "E_X(shape) = {:+.8f} Ha, mode split = {:+.6e} Ha",
+          tag, E_m, E_s, E_s - E_m);
+  CHECK(std::isfinite(E_m));
+  CHECK(std::isfinite(E_s));
+  REQUIRE(std::abs(E_s - E_m) > 1e-8);   // modes genuinely differ
+}
+
+TEST_CASE("vexchange_mode_energies", "[hamilt][paw][hf][slow]")
+{
+  auto& mpi = utils::make_unit_test_mpi_context();
+  SECTION("lih_kp222_nbnd16 (PAW)") {
+    auto mf_ptr = std::make_shared<mf::MF>(
+        mf::default_MF(mpi, "qe_lih222_paw_hf", mf::h5_input_type));
+    test_vexchange_mode_energies<HOST_MEMORY>(*mpi, mf_ptr, "qe_lih222_paw_hf");
+  }
+  SECTION("si_kp222 (PAW psl 1.0.0)") {
+    auto mf_ptr = std::make_shared<mf::MF>(
+        mf::default_MF(mpi, "qe_si222_paw", mf::h5_input_type));
+    test_vexchange_mode_energies<HOST_MEMORY>(*mpi, mf_ptr, "qe_si222_paw");
+  }
+}
+
 }
 

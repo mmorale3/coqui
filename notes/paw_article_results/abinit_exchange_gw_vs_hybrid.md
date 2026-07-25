@@ -102,9 +102,23 @@ Earlier si222 numbers (bare, finite-size off, 100% exchange):
 - CoQuí shape-restored (Q-Arnaud):     -1.36528 a.u.   <-- compare to ABINIT GW Sigma_x
 - prior "ABINIT full onsite" target:   -1.316447 a.u.  (need to confirm which operator it came from)
 
-TODO: generate the ABINIT **pure-Fock** (HF, hyb_mixing=1, no XC) on-site exchange for
-si222 and compare to CoQuí compensated; and the ABINIT GW Sigma_x (Arnaud) value and
-compare to CoQuí shape-restored. Confirm whether -1.316447 was GW or HF.
+RESOLVED (2026-07-24/25, plan C4): -1.316447 was determined to be the **GW
+Sigma_x (Arnaud) operator** number, not HF Fock. The HF-side match is settled by
+the kernel + energy accounting below (deltaC == eijkl to 5.5e-5 rel, ex_cvij
+machine-identical, onsite vv+cv energies identical; the smooth residual closed
+separately via fock_icutcoul=3 — bare-Coulomb smooth exchange matches ABINIT to
+~uHa). REMAINING (cluster campaign, with the B-tests assets): regenerate the
+ABINIT GW Sigma_x (pawoptosc=1/Arnaud, iszoff, ecutsigx recorded) on the cmp
+si222 mf and compare against CoQui shape mode AT THE SAME augmentation G-cutoff
+(the Arnaud oscillator is cutoff-sensitive; CoQui uses the fft_mesh_aug
+inscribed sphere -- match ecutsigx to it or truncate to ecutsigx).
+Current-code CoQui baselines (2026-07-25, direct dense-grid v_x, ignore_g0,
+TEST_CASE vexchange_mode_energies): qe_lih222_paw_hf E_X(moment+deltaC)
+= -1.64406506 / E_X(shape) = -1.64395244 (split +1.13e-4); local qe_si222_paw
+fixture -1.31194760 / -1.31187642 (split +7.1e-5 -- small because this fixture
+has fft_mesh_aug == fft_mesh = 36^3, i.e. a coarse augmentation sphere truncates
+both modes equally; the mode split only develops on a genuinely dense aug mesh;
+also a different cell from the rusty cmp mf, so NOT comparable to -1.316447).
 
 --------------------------------------------------------------------------------
 ## DIRECT KERNEL COMPARISON (2026-07-21) — apples-to-apples, exact

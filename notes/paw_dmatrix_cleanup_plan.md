@@ -10,7 +10,21 @@ printed into context at session start by a SessionStart hook).
 
 ## STATUS
 
-Last updated: 2026-07-24 (late) — Workstream B COMPLETE (B1–B4, four
+Last updated: 2026-07-25 — Workstream C COMPLETE (C1–C4 host-side, four
+commits, one per item; see the C checklist below for details). C1: single
+mode flag (vv_compensation the only source; deltaC/K_a strictly
+mode-derived; _paw_onsite diagnostic-only). C2: THC LL block on the dense
+augmentation sphere whenever rho_g doesn't cover it → shape mode usable in
+THC, in_thc abort lifted; TEST_CASE thc_shape_mode_vs_direct (mode-difference
+THC≡direct at 2.8e-6/6.3e-7). C3: THC shares psp.paw_aatab()/paw_qrad_tabs()
+with direct v_x; qfac_cache_mb knob live. C4: −1.316447 = GW/Arnaud settled,
+HF side matched (kernel+energy, icutcoul µHa); current-code mode-energy
+baselines in TEST_CASE vexchange_mode_energies; shape-vs-GW number = cluster
+campaign at matched aug cutoff. Fast suite 13532/36 green (value-identical +
+the new C2 test). DEFERRED to cluster (with B-tests): Si a=10.20 THC-shape
+acceptance vs direct −1.6863; ABINIT GW-side regeneration on the cmp mf.
+
+Previous update: 2026-07-24 (late) — Workstream B COMPLETE (B1–B4, four
 commits, one per item). B1: pw2coqui drops deeq/deeq_nc, stamps
 schema_version; verified end-to-end on a fresh Si-NCPP conversion (attr
 present, no deeq, check_schema green). B2: all six abinit2coqui items —
@@ -186,7 +200,7 @@ Workstream C — augmentation-density modes
 - [x] C1 single mode flag: pseudopot bool dropped — paw_shape_restored() derives from _exx_opts.vv_compensation (single source; setter kept for tests, delegating); deltaC/K_a inclusion derived from mode in both routes (direct v_x skip-on-shape; THC `_paw_onsite && !shape`); _paw_onsite documented DIAGNOSTIC-ONLY at both sites — 2026-07-25
 - [x] C2 dense-sphere THC LL block (aug-aug Coulomb sum on the fft_grid_dim_aug inscribed-Gcut sphere, G-chunked, whenever rho_g doesn't cover it — ζ blocks stay on rho_g, exactly band-limited there; PSD Gram preserved; default configs bit-identical, branch self-disables); in_thc shape abort lifted; new TEST_CASE thc_shape_mode_vs_direct (THC-vs-direct shape V_x 7.6e-5 default / 6.8e-5 half-ecut; mode-difference cross-check 2.8e-6/6.3e-7; dense branch log-confirmed firing) — 2026-07-25. Si a=10.20 acceptance vs direct −1.6863 deferred to the cluster campaign (a10.20 mf not on this host)
 - [x] C3 shared caches + Qfac knob: THC augment now uses psp.paw_aatab() + psp.paw_qrad_tabs(K_max, mode) (same dq=0.01/aug_lmax/per-species selection as its local build — one table set shared with direct v_x; THC's larger Kmax means direct reuses without rebuild); new paw_exx_options::qfac_cache_mb (toml `qfac_cache_mb`, default 256, 0=off) read live in get_or_build_qfac_pair_factor. dq unification itself landed in A4. Value-neutral (C4 mode energies bit-identical across the change) — 2026-07-25
-- [ ] C4 physics validation: −1.316447 operator identity (GW vs HF); match both modes vs ABINIT
+- [x] C4 physics validation (host-side portion): operator identity SETTLED — −1.316447 is the GW Sigma_x (Arnaud) operator, NOT HF Fock (2026-07-21 instrumented-ABINIT work, notes/paw_article_results/abinit_exchange_gw_vs_hybrid.md, updated). HF-side match DONE: deltaC ≡ ABINIT eijkl 5.5e-5 rel + ex_cvij machine-identical (kernels), onsite vv+cv energies identical, smooth residual closed via fock_icutcoul=3 (µHa). Current-code baselines recorded via new [slow] TEST_CASE vexchange_mode_energies (direct dense-grid, ignore_g0): lih222_paw_hf −1.64406506/−1.64395244 (moment+deltaC / shape, split +1.13e-4); local si222_paw −1.31194760/−1.31187642 (split +7.1e-5 — this fixture has fft_mesh_aug==fft_mesh=36³: a coarse aug sphere truncates both modes equally, AND it is a different cell from the rusty cmp mf, so NOT comparable to −1.316447). REMAINING (cluster campaign, alongside B-tests): regenerate ABINIT GW Sigma_x (pawoptosc=1, iszoff, ecutsigx recorded) on the cmp si222 mf and match CoQui shape mode at the SAME augmentation cutoff (Arnaud oscillator is cutoff-sensitive) — 2026-07-25
 
 Workstream D — ERI/THC route equivalence (Eq. path-equiv)
 - [ ] D1 audit thc.h/thc.icc/thc_reader_t vs A conventions (AE basis, identity overlap)
