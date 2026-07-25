@@ -10,6 +10,33 @@ printed into context at session start by a SessionStart hook).
 
 ## STATUS
 
+REMAINING TO COMPLETE THE PHASE (2026-07-25, post pin-down; next session = D):
+1. Workstream D (the critical path, untouched): D1–D4 below. D2 MUST include
+   an ABINIT-sourced-mf fixture in the test matrix — the real_ylm bug survived
+   every audit precisely because no route-equivalence test ran on an AB mf.
+2. Cluster follow-through (one short session, mechanical):
+   (a) properly reconvert mf_abinit.h5 / mf_v2.h5 (+ nocv) with the fixed
+       converter (WFK + --pot --den --pawxml --corewf), verify ≡ the
+       *_ylmfix.h5 row-flip stopgaps, retire the stopgaps; regenerate any
+       pre-3956b45 ABINIT-sourced paw_aug numbers (eos_conv500-era exchange);
+   (b) C2 acceptance closure: rerun the DIRECT-route exchange on the a10.20
+       mf with the CURRENT binary at matched settings and compare to
+       THC-shape −1.7349632 — the recorded "direct −1.6863" is not a usable
+       reference (old binary; C1 static-D moved e_1e −73 mHa on that system).
+3. A-tests residual: QE-eigenvalue diagnostic rework (USPP/PAW 0.749/0.790 Ha
+   semicore) — last unchecked A sub-item.
+4. Hardening debt exposed this week (add as explicit items):
+   (a) np>1 regression test for the shm-builder path (set_H0 had zero
+       multi-rank coverage — how the compute_int_VQ deadlock shipped);
+   (b) bdft reader: clear error on orbital-less (pw2coqui) files and on
+       missing Core attrs instead of the HDF5 crash cascade; document
+       pw2coqui = qe-reader companion (NOT a standalone bdft file).
+5. Workstream E: E1 canonical doc; E2 stale-notes sweep now also includes
+   retracting the C4 "−47.6 mHa operator difference" anywhere quoted and
+   the pw2coqui-role documentation.
+6. Asset-gated: psp8-NLCC block-convention recheck (needs an NC psp8+NLCC
+   asset; none on rusty or host).
+
 Last updated: 2026-07-25 (pin-down, commit 3956b45) — the B-tests 51.8 mHa
 exchange gap is ROOT-CAUSED AND FIXED: abinit2coqui real_ylm wrote plain
 real harmonics into projector_k while QE ylmr2 / CoQui aainit / the
@@ -241,7 +268,7 @@ Workstream A — pseudopot D-matrix refactor
 - [x] A3 symmetry-correct nij becsum (full-BZ lift via compute_becsum_full_symm) + Hermitian pair symmetrization w/ hard residual check; add_vpp nosym guard removed (v_x(nij) guard kept, different scope) — 2026-07-24
 - [x] A4 hoist per-call statics onto pseudopot (paw_runtime_caches.hpp: aainit, qrad @ unified dq=0.01, Pskna lift, Δk-keyed Qfac w/ 256 MB budget); ∫V·Q̂ loop parallelized over G + all_reduce; THC lift site deferred to D1 — 2026-07-24
 - [x] A5 provenance checks at read time — dion Hermiticity+scale+shape, proj_per_atom length+Σ==nkb, per-species group/dataset sweep w/ length checks (ae_vloc/vloc_ps warned-optional until B1/B4: unused since A1, _hf fixture predates export) — 2026-07-24
-- [ ] A-tests: (i) nii≡nij≡no-density+Hartree DONE 2026-07-24 (h0_plus_hartree_identity + add_vpp_i5_alignment, after ∫V_loc·Q̂ settlement); (ii) sym≡nosym DONE via A3 (becsum_full_symm + sym fixture sections); remaining: ex_cvij factor-1 e_1e (vs ABINIT −0.521220 Ha si222); QE-eigenvalue diagnostic rework (USPP/PAW 0.749/0.790 Ha semicore)
+- [ ] A-tests: (i) nii≡nij≡no-density+Hartree DONE 2026-07-24 (h0_plus_hartree_identity + add_vpp_i5_alignment, after ∫V_loc·Q̂ settlement); (ii) sym≡nosym DONE via A3 (becsum_full_symm + sym fixture sections); ex_cvij factor-1 e_1e DONE 2026-07-25 (cluster c4 nocv: Δe_1e(cv) −0.5212248 vs ABINIT −0.521220 → 4.8 µHa); remaining: QE-eigenvalue diagnostic rework (USPP/PAW 0.749/0.790 Ha semicore)
 
 Workstream B — converter parity
 - [x] B1 QE: delete deeq/deeq_nc export; schema_version attribute — 2026-07-24 (079783b)
@@ -258,10 +285,10 @@ Workstream C — augmentation-density modes
 
 Workstream D — ERI/THC route equivalence (Eq. path-equiv)
 - [ ] D1 audit thc.h/thc.icc/thc_reader_t vs A conventions (AE basis, identity overlap)
-- [ ] D2 route-equivalence matrix-element tests (THC vs hamiltonian), both modes, NCPP/USPP/PAW × sym/nosym
+- [ ] D2 route-equivalence matrix-element tests (THC vs hamiltonian), both modes, NCPP/USPP/PAW × sym/nosym; MUST include an ABINIT-sourced-mf fixture (the real_ylm bug was invisible to QE-only route tests — 2026-07-25)
 - [ ] D3 THC OOM at N_aux≳10k + synthetic l=3 augmentation unit test
 - [ ] D4 Cholesky+USPP/PAW hard-abort (no augmentation yet)
 
 Workstream E — notes/documentation
 - [ ] E1 author canonical D-matrix doc (notes/paw_dmatrix_scgw.tex)
-- [ ] E2 corrections to stale notes (converter plan exx_X claim, GW-vs-HF reconciliation, k-weight line, STEP3, LaNiO3 retest-pending)
+- [ ] E2 corrections to stale notes (converter plan exx_X claim, GW-vs-HF reconciliation, k-weight line, STEP3, LaNiO3 retest-pending; 2026-07-25 additions: retract the C4 "−47.6 mHa Fock-vs-Arnaud operator difference" wherever quoted — it was the real_ylm bug, true agreement 0.10 mHa; document pw2coqui = qe-reader companion file, not standalone bdft)
