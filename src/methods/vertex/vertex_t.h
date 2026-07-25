@@ -372,6 +372,9 @@ namespace solvers {
     // the number of scf iterations over which lambda is walked from 1/_ramp_iters up to
     // _scale (0 = no ramp, lambda = _scale immediately). _vertex_iter counts eval_Pi_C
     // calls = scf iterations with an active vertex.
+    // number of times eval_Pi_C had to fall back to the BARE rung. Must stay 0 in any
+    // scf loop that goes through scr_coulomb_t::update_w (which bootstraps an RPA W).
+    long _bare_rung_uses = 0;
     double _scale = 1.0;
     long _ramp_iters = 0;
     long _vertex_iter = 0;
@@ -480,6 +483,7 @@ namespace solvers {
       return _scale * std::min(1.0, double(n) / double(_ramp_iters));
     }
     long vertex_iter() const { return _vertex_iter; }
+    long bare_rung_uses() const { return _bare_rung_uses; }
     double sym_leakage_mean() const { return _sym_leak_mean; }
     // running max of the G_CC G-rotation consistency residual across this vertex's
     // eval calls (0 until the first symmetric evaluation; 0 on symmetry-free meshes).

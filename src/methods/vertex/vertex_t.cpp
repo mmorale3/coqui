@@ -1818,9 +1818,21 @@ namespace solvers {
         }
       }
     } else if (not dyn_src and not use_wcache) {
-      // FIRST ITERATION (loud): nothing to screen with yet, in either path.
-      app_log(1, "  [NOTE] Pi^C: no dynamic W in MBState{} (first iteration) -- "
-                 "using the bare-interaction rung W = Z only.\n",
+      // NO SCREENED RUNG AVAILABLE. This used to happen on the first update of every
+      // run and was treated as a harmless startup caveat; it is not (Si kp444 C = [0,8):
+      // iteration-1 eps_inf 19.6 against a converged RPA 5.35, and the trajectory never
+      // recovers). scr_coulomb_t::update_w now bootstraps an RPA W before the first
+      // vertex-attached pass, so reaching this branch means the bootstrap did NOT run --
+      // e.g. a caller invoking eval_Pi_C outside update_w. COUNTED so a test can assert
+      // it never happens in a normal scf loop (notes/vertex_divergence_diagnosis.md s3).
+      ++_bare_rung_uses;
+      app_log(1, "  [WARNING] Pi^C: no dynamic W in MBState{} -- falling back to the "
+                 "BARE-interaction rung W = Z.\n"
+                 "            Pi^C is a functional of the SCREENED W; this fallback is a "
+                 "large, uncontrolled\n"
+                 "            perturbation, not a small startup detail. Expected only if "
+                 "the update_w\n"
+                 "            RPA bootstrap was bypassed.\n",
               sec ? " and no cached Wbar" : "");
     }
 

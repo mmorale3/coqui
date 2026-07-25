@@ -141,6 +141,7 @@ namespace bdft_tests {
       double grot_full;     // little-group residual, full band block
       double grot_win;      // little-group residual, C window
       double vtx_grot;      // the vertex's own C-block diagnostic (running max)
+      long bare_rung;       // times Pi^C fell back to the BARE rung (must be 0)
     };
 
     // one scGW run; vertex active iff window.size() > 0.
@@ -169,7 +170,7 @@ namespace bdft_tests {
                                      solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol,
                                      n_iter, false, 1e-12, true);
       mpi_context->comm.barrier();
-      scf_result r{e_hf, e_corr, 0.0, 0.0, vtx.g_rotation_max()};
+      scf_result r{e_hf, e_corr, 0.0, 0.0, vtx.g_rotation_max(), vtx.bare_rung_uses()};
       if (mf->nkpts() != mf->nkpts_ibz()) {
         auto G = mb_state.sG_tskij.value().local();
         r.grot_full = little_group_residual(*mf, G, 0, mf->nbnd());
@@ -290,6 +291,11 @@ namespace bdft_tests {
                  "running max = {:.3e}",
               nit, r.e_corr, r.grot_full, r.grot_win, r.vtx_grot);
       REQUIRE(std::isfinite(r.e_corr));
+      // BOOTSTRAP GATE. Pi^C is a functional of the SCREENED W; before the update_w
+      // bootstrap it silently used the BARE rung on the first iteration of every run,
+      // which on Si kp444 C = [0,8) put iteration 1 at eps_inf 19.6 against a converged
+      // RPA 5.35 and poisoned the whole trajectory. Zero tolerance.
+      REQUIRE(r.bare_rung == 0);
       resid.push_back(r.grot_full);
     }
     // the vertex must not manufacture a symmetry violation ORDERS above the plain-scGW
