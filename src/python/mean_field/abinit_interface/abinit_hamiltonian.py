@@ -29,12 +29,22 @@ _USE_MINUS_I = True   # projector phase (-i)^l (QE init_us_2)  [VALIDATED]
 
 
 # --------------------------------------------------------------------------
-# Real spherical harmonics in QE ylmr2 ordering
-# lm index within an l-shell: m = 0, +1, -1, +2, -2, ... (QE convention)
+# Real spherical harmonics in QE ylmr2 ordering AND sign convention
+# lm index within an l-shell: m = 0, +1, -1, +2, -2, ... QE builds the real
+# pair from the (-1)^m (Condon-Shortley) complex harmonics, so every ODD-m
+# component carries an extra minus sign relative to plain real harmonics
+# (l=1: -x, -y; l=2: -xz, -yz; m=+/-2 unchanged). CoQui contracts the
+# stored projector_k with Q_IJ(G) built from its OWN QE-convention
+# aainit/ylm tables (and this converter's qfuncl already follows QE), so
+# beta MUST use these signs: the plain-harmonics version sign-flips the
+# odd-m projector rows, which cancels out of everything channel-diagonal
+# or site-symmetric (dion, Hartree becsum, onsite) but decoheres the
+# off-diagonal k-pair augmentation in exchange (measured -51.7 mHa on
+# b_tests si222, 2026-07-25 pin-down).
 # --------------------------------------------------------------------------
 def real_ylm(l, ghat):
-    """Real spherical harmonics Y_lm(ghat) for one l, all m, QE ordering.
-    ghat: (n,3) unit vectors. Returns (n, 2l+1)."""
+    """Real spherical harmonics Y_lm(ghat) for one l, all m, QE ylmr2
+    ordering and signs. ghat: (n,3) unit vectors. Returns (n, 2l+1)."""
     x, y, z = ghat[:, 0], ghat[:, 1], ghat[:, 2]
     n = ghat.shape[0]
     out = np.empty((n, 2 * l + 1), dtype=float)
@@ -43,15 +53,15 @@ def real_ylm(l, ghat):
     elif l == 1:
         c = np.sqrt(3.0 / (4.0 * np.pi))
         out[:, 0] = c * z            # m=0  (pz)
-        out[:, 1] = c * x            # m=+1 (px)
-        out[:, 2] = c * y            # m=-1 (py)
+        out[:, 1] = -c * x           # m=+1 (QE: -px)
+        out[:, 2] = -c * y           # m=-1 (QE: -py)
     elif l == 2:
         c0 = np.sqrt(5.0 / (16.0 * np.pi))
         c1 = np.sqrt(15.0 / (4.0 * np.pi))
         c2 = np.sqrt(15.0 / (16.0 * np.pi))
         out[:, 0] = c0 * (3.0 * z * z - 1.0)   # m=0   (3z^2-r^2)
-        out[:, 1] = c1 * x * z                 # m=+1  (xz)
-        out[:, 2] = c1 * y * z                 # m=-1  (yz)
+        out[:, 1] = -c1 * x * z                # m=+1  (QE: -xz)
+        out[:, 2] = -c1 * y * z                # m=-1  (QE: -yz)
         out[:, 3] = c2 * (x * x - y * y)       # m=+2  (x^2-y^2)
         out[:, 4] = c1 * x * y                 # m=-2  (xy)
     else:
