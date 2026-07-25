@@ -250,11 +250,21 @@ namespace bdft_tests {
     // the two variants must agree on the vertex physics: the sym-vs-nosym deviation
     // is bounded by (cross-variant baseline) + (leakage scale on the vertex shift)
     // + kernel headroom. A conjugation/rotation bug shows up at O(shift) instead.
-    REQUIRE(d_vert_ec <= d_plain_ec + std::max(0.25 * shift_ns, 5.0 * lv_s * shift_s) + 1e-6);
-    REQUIRE(d_vert_hf <= d_plain_hf + std::max(0.25 * shift_ns, 5.0 * lv_s * shift_s) + 1e-6);
+    //
+    // TIGHTENED 2026-07-25. The old margin was 0.25 * shift -- it accepted a sym-vs-nosym
+    // disagreement of a QUARTER of the whole vertex effect, i.e. ~350x the value actually
+    // observed, so it could not have caught a moderate symmetry defect. Measured on this
+    // case: d_vert_ec = 3.93e-6 against d_plain_ec = 3.41e-6 and shift = 7.05e-4, i.e. the
+    // symmetry path costs ~0.07% of the vertex signal. 0.05 * shift keeps ~10x headroom
+    // over that while being 5x tighter. (For the record of why this matters: the symmetry
+    // path was the leading suspect for the Si divergence for most of a session, and the
+    // reason it could not be dismissed quickly is that no gate here was sharp enough to
+    // say how accurate it actually is -- notes/vertex_divergence_diagnosis.md section 4.2.)
+    const double gold_margin = std::max(0.05 * shift_ns, 5.0 * lv_s * shift_s) + 1e-8;
+    REQUIRE(d_vert_ec <= d_plain_ec + gold_margin);
+    REQUIRE(d_vert_hf <= d_plain_hf + gold_margin);
     // the shifts themselves must agree to the same class
-    REQUIRE(std::abs(shift_ns - shift_s) <=
-            d_plain_ec + std::max(0.25 * shift_ns, 5.0 * lv_s * shift_s) + 1e-6);
+    REQUIRE(std::abs(shift_ns - shift_s) <= d_plain_ec + gold_margin);
 
     // NOTE (measured, vertex_ibz_leakage_diag): C = [1,3) is EXACTLY symmetry-closed
     // on qe_lih222_sym (leak = 0) -- the gold comparison above is therefore the
@@ -298,9 +308,12 @@ namespace bdft_tests {
               d3_plain, ec3_v_ns, ec3_v_s, d3_vert, shift3, l3d);
       for (double e : {ehf3_v_ns, ec3_v_ns, ehf3_v_s, ec3_v_s}) REQUIRE(std::isfinite(e));
       REQUIRE(shift3 > 1e-7);
-      REQUIRE(d3_vert <= d3_plain + std::max(0.25 * shift3, 5.0 * l3d * shift3) + 1e-6);
+      // TIGHTENED with the same reasoning as the gold block above: measured
+      // d3_vert = 2.21e-5 against d3_plain = 2.62e-5 and shift3 = 1.34e-3.
+      const double t3_margin = std::max(0.05 * shift3, 5.0 * l3d * shift3) + 1e-8;
+      REQUIRE(d3_vert <= d3_plain + t3_margin);
       REQUIRE(std::abs(ehf3_v_ns - ehf3_v_s) <=
-              std::abs(ehf3_p_ns - ehf3_p_s) + 0.25 * shift3 + 1e-6);
+              std::abs(ehf3_p_ns - ehf3_p_s) + t3_margin);
     }
 
     // ---- secondary basis on the sym mesh (Refinement 2 under symmetry) ---------------
