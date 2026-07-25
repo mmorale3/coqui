@@ -413,18 +413,26 @@ class pseudopot
                     math::nda::DistributedArrayOfRank<4> auto & Kij);
 
   /**
-   * Option A ("shape-restored" on-site exact exchange). When true, add_exchange
-   * (both the nii and nij overloads) builds the PAW augmentation from the FULL
-   * AE−PS partial-wave pair density (φφ − φ̃φ̃, via build_qrad_tab_full_aeps)
-   * instead of the compensation charge, and drops the deltaC one-center
-   * correction — reproducing ABINIT's phiphj−tphitphj oscillator, i.e. the
-   * exact all-electron on-site exchange (fixes the ~0.05 Ha/Si compensated-PAW
+   * Option A ("shape-restored" on-site exact exchange), derived from the
+   * single mode source _exx_opts.vv_compensation (plan C1 — no independent
+   * bool). When shape mode is selected, add_exchange (both the nii and nij
+   * overloads) builds the PAW augmentation from the FULL AE−PS partial-wave
+   * pair density (φφ − φ̃φ̃, via build_qrad_tab_full_aeps) instead of the
+   * compensation charge, and drops the deltaC one-center correction —
+   * reproducing ABINIT's phiphj−tphitphj oscillator, i.e. the exact
+   * all-electron on-site exchange (fixes the ~0.05 Ha/Si compensated-PAW
    * under-count; see notes/paw_onsite_exchange_analysis.{md,pdf}). PAW species
-   * only; USPP is unaffected. Default false = compensation charge + deltaC.
+   * only; USPP is unaffected. Default moment = compensation charge + deltaC.
+   * The deltaC/K_a inclusion is ALWAYS derived from this mode (moment =>
+   * include, shape => drop) in both the direct v_x and THC paths; it is never
+   * independently toggled.
    */
-  bool paw_exx_shape_restored = false;
+  bool paw_shape_restored() const {
+    return _exx_opts.vv_compensation == vv_compensation_e::shape;
+  }
+  /// Test convenience: select the vv_compensation mode as a bool. Delegates
+  /// to _exx_opts (the single source of truth).
   void set_paw_exx_shape_restored(bool b) {
-    paw_exx_shape_restored = b;
     _exx_opts.vv_compensation = b ? vv_compensation_e::shape
                                   : vv_compensation_e::moment;
   }
@@ -441,7 +449,6 @@ class pseudopot
   void set_exx_options(paw_exx_options const& o) {
     o.validate(/*in_thc=*/false, "pseudopot::set_exx_options");
     _exx_opts = o;
-    paw_exx_shape_restored = (o.vv_compensation == vv_compensation_e::shape);
   }
 
   // ---- Plan A4: lazily built runtime caches. Definitions in

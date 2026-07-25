@@ -183,7 +183,7 @@ Workstream B — converter parity
 - [ ] B-tests: same-system Si PAW via both converters — dataset diff + e_1e/e_hf/e_rpa parity (closes ABINIT-mf anomaly); needs ABINIT WFK/POT/DEN assets (cluster); also recheck B2 DEN layout + psp8 NLCC-block convention there
 
 Workstream C — augmentation-density modes
-- [ ] C1 single mode flag (drop paw_exx_shape_restored bool); deltaC inclusion derived from mode
+- [x] C1 single mode flag: pseudopot bool dropped — paw_shape_restored() derives from _exx_opts.vv_compensation (single source; setter kept for tests, delegating); deltaC/K_a inclusion derived from mode in both routes (direct v_x skip-on-shape; THC `_paw_onsite && !shape`); _paw_onsite documented DIAGNOSTIC-ONLY at both sites — 2026-07-25
 - [ ] C2 dense-grid THC augmentation for shape mode; lift the in_thc abort; Si a=10.20 acceptance
 - [ ] C3 unify qrad dq + shared caches; Δk Qfac cache for production direct v_x
 - [ ] C4 physics validation: −1.316447 operator identity (GW vs HF); match both modes vs ABINIT

@@ -114,9 +114,14 @@ namespace methods {
       //   - PAW species   : compensation-charge augmentation + on-site K_a
       // The per-species discrimination is enforced in make_paw_aug_layout
       // (NCPP entries get 0 ISDF rows) and in add_K_a_to_LL (skips non-PAW).
-      // `paw_onsite` lets the user disable just the K_a contribution for
-      // PAW species while still keeping their compensation augmentation.
-      if(_MF->pp_type() == hamilt::pp_paw_t or _MF->pp_type() == hamilt::pp_uspp_t) { 
+      // `paw_onsite` is a DIAGNOSTIC-ONLY knob (plan C1): it lets one disable
+      // just the K_a contribution for PAW species while keeping their
+      // compensation augmentation, to isolate the on-site term in studies.
+      // Whether K_a belongs at all is NOT this knob's job — it is derived
+      // from the vv_compensation mode (moment => include, shape => drop,
+      // since the shape-restored eta already carries the full AE-PS pair
+      // density). Production runs leave paw_onsite at its default (true).
+      if(_MF->pp_type() == hamilt::pp_paw_t or _MF->pp_type() == hamilt::pp_uspp_t) {
         _paw_aug = io::get_value_with_default<bool>(pt, "paw_aug", true);
         _paw_onsite = io::get_value_with_default<bool>(pt, "paw_onsite", _MF->pp_type() == hamilt::pp_paw_t);
         // Diagnostic gates (default true) to isolate the V_GL (smooth-aug
@@ -1911,7 +1916,10 @@ namespace methods {
     // V_GL / V_LL are filled at every q via radial-Bessel η^q(G); the K_a
     // same-atom one-center kernel is added at every q.
     bool _paw_aug = true;
-    bool _paw_onsite = true;           // include K_a one-center kernel for PAW species
+    bool _paw_onsite = true;           // DIAGNOSTIC-ONLY (plan C1): gate on the K_a
+                                       // one-center kernel for PAW species; whether K_a
+                                       // belongs is derived from vv_compensation
+                                       // (moment => include, shape => drop)
     bool _paw_vgl = true;              // diagnostic: include V_GL/V_LG smooth-aug cross
     bool _paw_vll = true;              // diagnostic: include V_LL aug-aug block
     int _Np_smooth = 0;                // smooth-only block size
