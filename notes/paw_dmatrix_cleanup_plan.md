@@ -10,7 +10,28 @@ printed into context at session start by a SessionStart hook).
 
 ## STATUS
 
-Last updated: 2026-07-25 (cluster harvest) — campaign landed after fixing a
+Last updated: 2026-07-25 (pin-down, commit 3956b45) — the B-tests 51.8 mHa
+exchange gap is ROOT-CAUSED AND FIXED: abinit2coqui real_ylm wrote plain
+real harmonics into projector_k while QE ylmr2 / CoQui aainit / the
+converter's own qfuncl carry the (−1)^m Condon–Shortley sign on odd-m
+components (l=1 −x,−y; l=2 −xz,−yz) — the l=1 m=±1 projector rows were
+exactly −1×. Channel-diagonal + T_d-site-symmetric quantities are immune
+(dion, Hartree becsum, onsite, same-k nonlocal — precisely the µHa set);
+off-diagonal (k,k−q) pair-density augmentation decoheres (aug E_X term
++19.2 vs +69.8 mHa). Established by elimination: noaug collapse
+51.8→1.2 mHa; matched 48³ aug grids move 51 µHa; +0.5-k-list rep test
+3.4 µHa; stored-projector ratio ±1 per nhtolm row. POST-FIX PARITY
+(row-flip validation): ΔE_X 87 µHa, ΔRPA 23 µHa, ΔHF 128 µHa; remaining
+Δe_1e = 4 occ × 35.71 mHa uniform vloc-G=0 gauge constant (bands agree
+~3 µHa beyond it) — B-tests CLOSED. C4 REVISED on fixed mf:
+E_X(shape) = −1.3175731 vs converged GW Σx −1.31747 → **0.10 mHa** (the
+earlier −47.6 mHa "operator difference" was this bug); moment −1.3178007
+(shape−moment now −0.23 mHa); Δe_1e(cv) 4.8 µHa unchanged. WARNING: every
+pre-3956b45 ABINIT-sourced paw_aug result is contaminated — reconvert
+(mf_v2/mf_abinit row-flip copies *_ylmfix.h5 are stopgaps; regenerate
+with the fixed converter before publication-grade use).
+
+Previous update: 2026-07-25 (cluster harvest) — campaign landed after fixing a
 np>1 deadlock (fff6d4e): static_h0_D's lazy build ran compute_int_VQ's
 collectives on the GLOBAL comm while shm builders (set_H0) call on node
 roots only; compute_int_VQ is now purely rank-local (contract documented in
@@ -227,13 +248,13 @@ Workstream B — converter parity
 - [x] B2 ABINIT: ae_vloc/vloc_ps export; per-species proj_per_atom; real vxc; Ewald/madelung; beta + Core/; shape_function check — 2026-07-24 (445a0b3; DEN/NLCC wiring pending on-cluster recheck)
 - [x] B3 native ex_cvij builder from Core/ae_wfc (Slater R^L + Gaunt²), validated vs ABINIT-XML ex_cvij (~1e-7 rel) + hydrogenic analytics — 2026-07-24 (f451083)
 - [x] B4 schema standardization (schema_version=2 Ha on disk both converters; miller_g sphere on ABINIT side; ijtoh packing verified at read; ae_vloc/vloc_ps required for v2; contract in notes/paw_implementation_plan.md) — 2026-07-24
-- [ ] B-tests: same-system Si PAW via both converters — dataset diff + e_1e/e_hf/e_rpa parity (closes ABINIT-mf anomaly); needs ABINIT WFK/POT/DEN assets (cluster); also recheck B2 DEN layout + psp8 NLCC-block convention there. 2026-07-25 cluster: level a+b+c DONE (numbers + nocv/no-onsite attribution in STATUS header); DEN wiring exercised on a real DEN; psp8-NLCC still unchecked (no NC asset). REMAINING to close: the +51.8 mHa smooth pair-density ΔE_X (k-representative/BZ-map suspect) and the +141.7 mHa e_1e gauge residual need a mechanism-level resolution
+- [ ] B-tests: same-system Si PAW via both converters — dataset diff + e_1e/e_hf/e_rpa parity (closes ABINIT-mf anomaly); needs ABINIT WFK/POT/DEN assets (cluster); also recheck B2 DEN layout + psp8 NLCC-block convention there. 2026-07-25 cluster: level a+b+c DONE (numbers + nocv/no-onsite attribution in STATUS header); DEN wiring exercised on a real DEN; psp8-NLCC still unchecked (no NC asset). CLOSED 2026-07-25 (pin-down): ΔE_X = real_ylm odd-m sign bug (3956b45, post-fix 87 µHa); Δe_1e = benign vloc-G=0 gauge constant (35.71 mHa/band uniform, bands agree ~3 µHa beyond it)
 
 Workstream C — augmentation-density modes
 - [x] C1 single mode flag: pseudopot bool dropped — paw_shape_restored() derives from _exx_opts.vv_compensation (single source; setter kept for tests, delegating); deltaC/K_a inclusion derived from mode in both routes (direct v_x skip-on-shape; THC `_paw_onsite && !shape`); _paw_onsite documented DIAGNOSTIC-ONLY at both sites — 2026-07-25
 - [x] C2 dense-sphere THC LL block (aug-aug Coulomb sum on the fft_grid_dim_aug inscribed-Gcut sphere, G-chunked, whenever rho_g doesn't cover it — ζ blocks stay on rho_g, exactly band-limited there; PSD Gram preserved; default configs bit-identical, branch self-disables); in_thc shape abort lifted; new TEST_CASE thc_shape_mode_vs_direct (THC-vs-direct shape V_x 7.6e-5 default / 6.8e-5 half-ecut; mode-difference cross-check 2.8e-6/6.3e-7; dense branch log-confirmed firing) — 2026-07-25. Si a=10.20 acceptance vs direct −1.6863 deferred to the cluster campaign (a10.20 mf not on this host). 2026-07-25 cluster: THC-shape E_X(vv) −1.7349632 at 16 kpt (shape−moment +3.19 mHa, matches si222 +3.38 mHa); reconciliation vs the −1.6863 direct reference still open (operator content of that number)
 - [x] C3 shared caches + Qfac knob: THC augment now uses psp.paw_aatab() + psp.paw_qrad_tabs(K_max, mode) (same dq=0.01/aug_lmax/per-species selection as its local build — one table set shared with direct v_x; THC's larger Kmax means direct reuses without rebuild); new paw_exx_options::qfac_cache_mb (toml `qfac_cache_mb`, default 256, 0=off) read live in get_or_build_qfac_pair_factor. dq unification itself landed in A4. Value-neutral (C4 mode energies bit-identical across the change) — 2026-07-25
-- [x] C4 physics validation (host-side portion): operator identity SETTLED — −1.316447 is the GW Sigma_x (Arnaud) operator, NOT HF Fock (2026-07-21 instrumented-ABINIT work, notes/paw_article_results/abinit_exchange_gw_vs_hybrid.md, updated). HF-side match DONE: deltaC ≡ ABINIT eijkl 5.5e-5 rel + ex_cvij machine-identical (kernels), onsite vv+cv energies identical, smooth residual closed via fock_icutcoul=3 (µHa). Current-code baselines recorded via new [slow] TEST_CASE vexchange_mode_energies (direct dense-grid, ignore_g0): lih222_paw_hf −1.64406506/−1.64395244 (moment+deltaC / shape, split +1.13e-4); local si222_paw −1.31194760/−1.31187642 (split +7.1e-5 — this fixture has fft_mesh_aug==fft_mesh=36³: a coarse aug sphere truncates both modes equally, AND it is a different cell from the rusty cmp mf, so NOT comparable to −1.316447). CLUSTER PORTION DONE 2026-07-25: ABINIT GW Σx regenerated (pawoptosc=1, ISZ off; ecutsigx 25→−1.316447 exact provenance match, converged −1.31747); CoQui E_X(shape) −1.36508 on the same mf → Fock-vs-Arnaud operator difference −47.6 mHa at matched aug cutoff; Δe_1e(cv) 4.8 µHa vs ABINIT −0.521220. C4 CLOSED — 2026-07-25
+- [x] C4 physics validation (host-side portion): operator identity SETTLED — −1.316447 is the GW Sigma_x (Arnaud) operator, NOT HF Fock (2026-07-21 instrumented-ABINIT work, notes/paw_article_results/abinit_exchange_gw_vs_hybrid.md, updated). HF-side match DONE: deltaC ≡ ABINIT eijkl 5.5e-5 rel + ex_cvij machine-identical (kernels), onsite vv+cv energies identical, smooth residual closed via fock_icutcoul=3 (µHa). Current-code baselines recorded via new [slow] TEST_CASE vexchange_mode_energies (direct dense-grid, ignore_g0): lih222_paw_hf −1.64406506/−1.64395244 (moment+deltaC / shape, split +1.13e-4); local si222_paw −1.31194760/−1.31187642 (split +7.1e-5 — this fixture has fft_mesh_aug==fft_mesh=36³: a coarse aug sphere truncates both modes equally, AND it is a different cell from the rusty cmp mf, so NOT comparable to −1.316447). CLUSTER PORTION DONE 2026-07-25: ABINIT GW Σx regenerated (pawoptosc=1, ISZ off; ecutsigx 25→−1.316447 exact provenance match, converged −1.31747); Δe_1e(cv) 4.8 µHa vs ABINIT −0.521220. REVISED post-3956b45 (the mf carried the real_ylm bug): E_X(shape) = −1.3175731 on the fixed mf → agrees with converged GW Σx to 0.10 mHa (the earlier −47.6 mHa was the converter bug, NOT an operator difference); moment −1.3178007, shape−moment −0.23 mHa. C4 CLOSED — 2026-07-25
 
 Workstream D — ERI/THC route equivalence (Eq. path-equiv)
 - [ ] D1 audit thc.h/thc.icc/thc_reader_t vs A conventions (AE basis, identity overlap)
