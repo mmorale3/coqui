@@ -151,6 +151,10 @@ namespace methods {
           // Default -1 = full 2*lmax per species (complete augmentation, cf.
           // VASP LMAXPAW); a value >= 0 caps it (cf. VASP LMAXFOCK).
           _exx_opts.aug_lmax = io::get_value_with_default<int>(pt, "aug_lmax", -1);
+          // Δk-keyed Qfac cache budget for the direct v_x path (plan C3);
+          // propagated to the shared pseudopot with the rest of the options.
+          _exx_opts.qfac_cache_mb =
+              io::get_value_with_default<int>(pt, "qfac_cache_mb", 256);
           _exx_opts.validate(/*in_thc=*/true, "thc_reader_t [interaction.thc]");
         }
       } else {
@@ -662,13 +666,10 @@ namespace methods {
       //    per-species qrad table (replicated, small).
       // ----------------------------------------------------------------
       _Timer.start("PAW_AUG.aainit");
-      int aainit_lli = 1;
-      for (auto const& sp : _psp->paw_species_view()) {
-        if (sp.lll.size() == 0) continue;
-        for (long b = 0; b < sp.lll.extent(0); ++b)
-          aainit_lli = std::max(aainit_lli, sp.lll(b) + 1);
-      }
-      auto aatab = hamilt::paw::aainit_tables_build(aainit_lli);
+      // Shared A4 runtime cache (plan C3): same lli formula (1 + max l over
+      // all projectors) as the local build this replaces; built once per
+      // pseudopot and reused by every consumer (direct v_x, becsum, here).
+      auto const& aatab = _psp->paw_aatab();
       _Timer.stop("PAW_AUG.aainit");
 
       double K_max_g = 0.0;
@@ -745,15 +746,15 @@ namespace methods {
       if (paw_shape_restored)
         app_log(1, "  paw_aug: SHAPE-RESTORED (Option A) on-site exchange enabled "
                    "(full AE−PS oscillator, K_a dropped).");
-      std::vector<hamilt::paw::qrad_tab> qrad_tabs;
-      qrad_tabs.reserve(_psp->paw_species_view().size());
-      for (auto const& sp : _psp->paw_species_view())
-        qrad_tabs.push_back((paw_shape_restored && sp.is_paw)
-            ? hamilt::paw::build_qrad_tab_full_aeps(sp, K_max, 0.01, _exx_opts.aug_lmax)
-            : hamilt::paw::build_qrad_tab(sp, K_max, 0.01, _exx_opts.aug_lmax));
+      // Shared A4 runtime cache (plan C3): same per-species selection
+      // ((shape && is_paw) -> full-AEPS table, else compensation), same
+      // project-wide dq = 0.01, same aug_lmax (the reader's _exx_opts were
+      // propagated to the psp in prepare_paw_isdf). Tables built to a larger
+      // Kmax are reused; the direct v_x path shares this exact table set.
+      auto const& qrad_tabs = _psp->paw_qrad_tabs(K_max, paw_shape_restored);
       _Timer.stop("PAW_AUG.qrad_tab");
-      app_log(2, "  paw_aug: built qrad table for {} species, K_max={:.2f} a.u., "
-                 "n_K={}", qrad_tabs.size(), K_max,
+      app_log(2, "  paw_aug: qrad tables (shared cache) for {} species, "
+                 "K_max={:.2f} a.u., n_K={}", qrad_tabs.size(), K_max,
               qrad_tabs.empty() ? 0L : qrad_tabs.front().n_K);
 
       double omega_sq = omega * omega;

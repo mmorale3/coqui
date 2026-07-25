@@ -88,6 +88,12 @@ struct paw_exx_options {
   /// A value >= 0 caps the multipoles at L <= aug_lmax, trading accuracy for
   /// speed (cf. VASP LMAXFOCK for the Fock-exchange augmentation).
   int aug_lmax = -1;
+  /// Per-rank byte budget (in MB) of the Δk-keyed Qfac pair-factor cache used
+  /// by the direct v_x path (plan A4/C3; paw_runtime_caches). Δk entries are
+  /// cached first-come-stays until the budget is exhausted; further Δk are
+  /// built into caller scratch each call (correct, just slower). 0 disables
+  /// caching. Sizing: one entry is nat × nij_max × nnr_dense × 16 B.
+  int qfac_cache_mb = 256;
 
   /**
    * Abort with a clear message for invalid / not-yet-implemented options.
@@ -104,6 +110,9 @@ struct paw_exx_options {
     utils::check(aug_lmax >= -1,
       "{}: aug_lmax = {} is invalid (must be >= 0, or -1 for no cap).",
       ctx, aug_lmax);
+    utils::check(qfac_cache_mb >= 0,
+      "{}: qfac_cache_mb = {} is invalid (must be >= 0; 0 disables the cache).",
+      ctx, qfac_cache_mb);
   }
 };
 

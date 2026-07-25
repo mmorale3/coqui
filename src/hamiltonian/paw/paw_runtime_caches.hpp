@@ -71,7 +71,9 @@ struct runtime_caches {
     double qfac_Gcut = -1.0;
     bool qfac_shape_restored = false;
     long qfac_bytes = 0;
-    long qfac_budget_bytes = 256l << 20;   // 256 MB/rank default (knob: C3)
+    // Per-rank budget; refreshed from paw_exx_options::qfac_cache_mb (toml
+    // `qfac_cache_mb`, plan C3) at every get_or_build_qfac_pair_factor call.
+    long qfac_budget_bytes = 256l << 20;
     long qfac_hits = 0, qfac_builds = 0, qfac_uncached = 0;
     std::map<std::array<long,3>, nda::array<ComplexType,3>> qfac;
 };

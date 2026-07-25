@@ -185,7 +185,7 @@ Workstream B — converter parity
 Workstream C — augmentation-density modes
 - [x] C1 single mode flag: pseudopot bool dropped — paw_shape_restored() derives from _exx_opts.vv_compensation (single source; setter kept for tests, delegating); deltaC/K_a inclusion derived from mode in both routes (direct v_x skip-on-shape; THC `_paw_onsite && !shape`); _paw_onsite documented DIAGNOSTIC-ONLY at both sites — 2026-07-25
 - [x] C2 dense-sphere THC LL block (aug-aug Coulomb sum on the fft_grid_dim_aug inscribed-Gcut sphere, G-chunked, whenever rho_g doesn't cover it — ζ blocks stay on rho_g, exactly band-limited there; PSD Gram preserved; default configs bit-identical, branch self-disables); in_thc shape abort lifted; new TEST_CASE thc_shape_mode_vs_direct (THC-vs-direct shape V_x 7.6e-5 default / 6.8e-5 half-ecut; mode-difference cross-check 2.8e-6/6.3e-7; dense branch log-confirmed firing) — 2026-07-25. Si a=10.20 acceptance vs direct −1.6863 deferred to the cluster campaign (a10.20 mf not on this host)
-- [ ] C3 unify qrad dq + shared caches; Δk Qfac cache for production direct v_x
+- [x] C3 shared caches + Qfac knob: THC augment now uses psp.paw_aatab() + psp.paw_qrad_tabs(K_max, mode) (same dq=0.01/aug_lmax/per-species selection as its local build — one table set shared with direct v_x; THC's larger Kmax means direct reuses without rebuild); new paw_exx_options::qfac_cache_mb (toml `qfac_cache_mb`, default 256, 0=off) read live in get_or_build_qfac_pair_factor. dq unification itself landed in A4. Value-neutral (C4 mode energies bit-identical across the change) — 2026-07-25
 - [ ] C4 physics validation: −1.316447 operator identity (GW vs HF); match both modes vs ABINIT
 
 Workstream D — ERI/THC route equivalence (Eq. path-equiv)

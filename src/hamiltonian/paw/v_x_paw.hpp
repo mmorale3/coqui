@@ -264,6 +264,9 @@ inline nda::array<ComplexType,3> const& get_or_build_qfac_pair_factor(
     nda::array<ComplexType,3>& scratch)
 {
   auto& rt = psp.paw_rt();
+  // Budget knob (plan C3): read from the live exx options so a toml/setter
+  // change takes effect without touching the cache struct directly.
+  rt.qfac_budget_bytes = (long)psp.exx_options().qfac_cache_mb << 20;
   std::array<long,3> mkey{mesh(0), mesh(1), mesh(2)};
   if (rt.qfac_mesh != mkey || rt.qfac_Gcut != Gcut ||
       rt.qfac_shape_restored != shape_restored) {
