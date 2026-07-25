@@ -265,6 +265,151 @@ inline paw_oc_hartree_result compute_paw_hartree_atom(
     return out;
 }
 
+/* ==========================================================================
+ * Native core-valence exact exchange (plan B3)
+ *
+ * Frozen c-v exchange Dij from AE core orbitals + AE valence partial waves:
+ *
+ *   ex_cvij(I,J) = −δ_{lm_I,lm_J} Σ_c Σ_L (2 l_c + 1) [3j(l_I L l_c;000)]²
+ *                                        R^L(u_I u_c ; u_J u_c)      [Ha]
+ *
+ * (Condon–Shortley closed-shell exchange; the m_c/M shell sum collapses to
+ * the (2l_c+1)·3j² coefficient, making the kernel lm-diagonal — exactly
+ * ABINIT's `if (ilm==jlm)` expansion of <exact_exchange_X_matrix>.) The
+ * sign matches ABINIT m_pawdij pawdijfock, which copies pawtab%ex_cvij into
+ * dijfock_cv with factor 1, so the stored matrix IS the (attractive) Dij
+ * contribution. Slater integral
+ *   R^L(f;g) = ∫ g(r) [ r^{−(L+1)} ∫_0^r f s^L ds + r^L ∫_r^∞ f s^{−(L+1)} ds ] dr
+ * with u = r·R radial functions; quadrature is cumulative Simpson in the
+ * radial-grid index (weight rab = dr/di), the same scheme as QE's simpson.
+ *
+ * Validated against ABINIT-XML <exact_exchange_X_matrix> (atompaw Al
+ * "stringent" dataset + its .corewf companion): all 12 ln-diagonal entries
+ * reproduced to ~1e-7 relative (quadrature-limited), and against analytic
+ * hydrogenic exchange integrals K(1s,2s) = 16Z/729, K(1s,2p) = 112Z/6561
+ * to ~3e-11 (see validate_ex_cvij.py and TEST_CASE ex_cvij_native).
+ * ========================================================================== */
+
+/** Cumulative Simpson of an index-space integrand F(i) (unit spacing):
+ *  out(k) = ∫_0^k F di. First segment trapezoid; even k via the Simpson
+ *  triple; odd k via the [k−1,k] segment of the parabola through
+ *  (k−2,k−1,k). Mirrors validate_ex_cvij.py::_cumsimp0 exactly. */
+inline void radial_cumsimpson(nda::array<double,1> const& F,
+                              nda::array<double,1>& out)
+{
+    long n = F.size();
+    out.resize(n);
+    if (n == 0) return;
+    out(0) = 0.0;
+    for (long k = 1; k < n; ++k) {
+        if (k == 1)
+            out(1) = 0.5 * (F(0) + F(1));
+        else if (k % 2 == 0)
+            out(k) = out(k - 2) + (F(k - 2) + 4.0 * F(k - 1) + F(k)) / 3.0;
+        else
+            out(k) = out(k - 1) + (-F(k - 2) + 8.0 * F(k - 1) + 5.0 * F(k)) / 12.0;
+    }
+}
+
+/** [3j(l1 l2 l3; 0 0 0)]² — Racah closed form; 0 unless the triangle rule
+ *  holds and l1+l2+l3 is even. lgamma-based (exact to double precision). */
+inline double w3j000_sq(int l1, int l2, int l3)
+{
+    int J = l1 + l2 + l3;
+    if (J % 2 != 0 || l3 < std::abs(l1 - l2) || l3 > l1 + l2) return 0.0;
+    int g = J / 2;
+    double ln_pref = std::lgamma(g + 1) - std::lgamma(g - l1 + 1)
+                   - std::lgamma(g - l2 + 1) - std::lgamma(g - l3 + 1);
+    double ln_rad = std::lgamma(J - 2 * l1 + 1) + std::lgamma(J - 2 * l2 + 1)
+                  + std::lgamma(J - 2 * l3 + 1) - std::lgamma(J + 2);
+    return std::exp(2.0 * ln_pref + ln_rad);
+}
+
+/** Slater radial integral R^L(f; g) on the species log grid (r, rab).
+ *  f, g are u-form pair densities (vanish ~r² at the origin). */
+inline double slater_RL(nda::array<double,1> const& f,
+                        nda::array<double,1> const& g,
+                        nda::array<double,1> const& r,
+                        nda::array<double,1> const& rab, int L)
+{
+    long n = r.size();
+    nda::array<double,1> F(n), inner(n), tail_cum(n), V(n);
+    // ∫_0^r f s^L ds
+    for (long i = 0; i < n; ++i) F(i) = f(i) * std::pow(r(i), L) * rab(i);
+    radial_cumsimpson(F, inner);
+    // ∫_r^∞ f s^{−(L+1)} ds  (u-forms ⇒ integrand → 0 at the origin)
+    for (long i = 0; i < n; ++i)
+        F(i) = (r(i) < 1e-30) ? 0.0 : f(i) / std::pow(r(i), L + 1) * rab(i);
+    radial_cumsimpson(F, tail_cum);
+    double tail_tot = tail_cum(n - 1);
+    for (long i = 0; i < n; ++i) {
+        if (r(i) < 1e-30) { V(i) = 0.0; continue; }
+        V(i) = inner(i) / std::pow(r(i), L + 1)
+             + std::pow(r(i), L) * (tail_tot - tail_cum(i));
+    }
+    for (long i = 0; i < n; ++i) F(i) = g(i) * V(i) * rab(i);
+    radial_cumsimpson(F, inner);          // reuse as scratch
+    return inner(n - 1);
+}
+
+/** Native ex_cvij (nh, nh) in Hartree, ABINIT sign convention (−K,
+ *  lm-diagonal). Inputs: AE valence partial waves aewfc (nbeta, mesh) and
+ *  AE core orbitals core_aewfc (ncore, mesh), both u = r·R on the same
+ *  radial grid; channel maps as read from the h5 (indv 1-based). */
+inline nda::array<double,2> compute_ex_cvij_from_core(
+    nda::array<double,2> const& aewfc,
+    nda::array<double,2> const& core_aewfc,
+    nda::array<int,1>    const& lll,
+    nda::array<double,1> const& core_l,
+    nda::array<int,1>    const& indv,
+    nda::array<int,1>    const& nhtolm,
+    nda::array<double,1> const& r,
+    nda::array<double,1> const& rab)
+{
+    long mesh  = r.size();
+    long nbeta = aewfc.extent(0);
+    long ncore = core_aewfc.extent(0);
+    int  nh    = (int)indv.size();
+    utils::check(aewfc.extent(1) == mesh && core_aewfc.extent(1) == mesh &&
+                 rab.size() == mesh,
+        "compute_ex_cvij_from_core: aewfc/core_aewfc/rab mesh mismatch "
+        "({}/{}/{} vs r {}).", aewfc.extent(1), core_aewfc.extent(1),
+        rab.size(), mesh);
+    utils::check(lll.size() == nbeta && core_l.size() == ncore,
+        "compute_ex_cvij_from_core: channel metadata length mismatch.");
+
+    // ln-basis kernel X (nbeta, nbeta), l-diagonal
+    nda::array<double,2> X = nda::array<double,2>::zeros({nbeta, nbeta});
+    nda::array<double,1> f(mesh), gg(mesh);
+    for (long i = 0; i < nbeta; ++i) {
+        for (long j = 0; j < nbeta; ++j) {
+            if (lll(i) != lll(j)) continue;
+            double acc = 0.0;
+            for (long c = 0; c < ncore; ++c) {
+                int lc = (int)std::lround(core_l(c));
+                for (int L = std::abs(lll(i) - lc); L <= lll(i) + lc; ++L) {
+                    double w = w3j000_sq(lll(i), L, lc);
+                    if (w == 0.0) continue;
+                    for (long ir = 0; ir < mesh; ++ir) {
+                        f(ir)  = aewfc(i, ir) * core_aewfc(c, ir);
+                        gg(ir) = aewfc(j, ir) * core_aewfc(c, ir);
+                    }
+                    acc += (2 * lc + 1) * w * slater_RL(f, gg, r, rab, L);
+                }
+            }
+            X(i, j) = -acc;
+        }
+    }
+
+    // expand to the nh projector basis, lm-diagonal (ABINIT ilm==jlm)
+    nda::array<double,2> ex = nda::array<double,2>::zeros({(long)nh, (long)nh});
+    for (int I = 0; I < nh; ++I)
+        for (int J = 0; J < nh; ++J)
+            if (nhtolm(I) == nhtolm(J))
+                ex(I, J) = X(indv(I) - 1, indv(J) - 1);
+    return ex;
+}
+
 /**
  * SCF-invariant ("static") one-center contribution to the PAW deeq matrix
  * for one species — kinetic + frozen-core-screened ionic potential, on

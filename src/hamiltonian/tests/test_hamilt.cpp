@@ -5086,5 +5086,62 @@ TEST_CASE("dft_eigenvalues", "[hamilt][dft]")
   }
 }
 
+// Plan B3: native core-valence exact-exchange builder (Slater R^L +
+// closed-shell Gaunt² sum) — hydrogenic analytic checks. The same routine
+// is validated against a real ABINIT-XML <exact_exchange_X_matrix> (atompaw
+// Al "stringent" + .corewf companion, all 12 ln-diagonal entries to ~1e-7
+// rel) in src/python/mean_field/abinit_interface/validate_ex_cvij.py; the
+// hardcoded cross-language references below come from that (validated)
+// python implementation on the identical synthetic input.
+TEST_CASE("ex_cvij_native", "[paw]")
+{
+  // 3j(l1 l2 l3; 000)² closed form
+  REQUIRE(hamilt::paw::w3j000_sq(0, 0, 0) == Approx(1.0).epsilon(1e-13));
+  REQUIRE(hamilt::paw::w3j000_sq(1, 1, 0) == Approx(1.0 / 3.0).epsilon(1e-13));
+  REQUIRE(hamilt::paw::w3j000_sq(2, 2, 0) == Approx(1.0 / 5.0).epsilon(1e-13));
+  REQUIRE(hamilt::paw::w3j000_sq(1, 2, 1) == Approx(2.0 / 15.0).epsilon(1e-13));
+  REQUIRE(hamilt::paw::w3j000_sq(1, 1, 1) == 0.0);   // odd sum
+  REQUIRE(hamilt::paw::w3j000_sq(0, 2, 1) == 0.0);   // triangle violation
+
+  // hydrogenic Z=2: core = 1s; valence = 2s (l=0) + 2p (l=1), u = r·R on a
+  // log grid r = a(e^{d i}−1) — identical formulas to the python reference.
+  long mesh = 1800;
+  double a = 6.4e-4, d = 6.0e-3, Z = 2.0;
+  nda::array<double,1> r(mesh), rab(mesh);
+  nda::array<double,2> aewfc(2, mesh), core(1, mesh);
+  for (long i = 0; i < mesh; ++i) {
+    r(i) = a * (std::exp(d * i) - 1.0);
+    rab(i) = a * d * std::exp(d * i);
+    double x = r(i);
+    core(0, i)  = 2.0 * std::pow(Z, 1.5) * x * std::exp(-Z * x);
+    aewfc(0, i) = (std::pow(Z, 1.5) / (2.0 * std::sqrt(2.0)))
+                  * (2.0 - Z * x) * std::exp(-Z * x / 2.0) * x;
+    aewfc(1, i) = (std::pow(Z, 1.5) / (2.0 * std::sqrt(6.0)))
+                  * (Z * x) * std::exp(-Z * x / 2.0) * x;
+  }
+  nda::array<int,1> lll = {0, 1};
+  nda::array<double,1> core_l = {0.0};
+  nda::array<int,1> indv   = {1, 2, 2, 2};       // 1-based beta channel
+  nda::array<int,1> nhtolm = {1, 2, 3, 4};       // lm = l²+1+m (1-based)
+
+  auto ex = hamilt::paw::compute_ex_cvij_from_core(
+      aewfc, core, lll, core_l, indv, nhtolm, r, rab);
+  REQUIRE(ex.extent(0) == 4);
+
+  // analytic hydrogenic exchange integrals (quadrature-limited agreement):
+  //   K(1s,2s) = 16 Z/729,   K(1s,2p) = 112 Z/6561;  stored = −K.
+  REQUIRE(ex(0, 0) == Approx(-16.0 * Z / 729.0).margin(5e-9));
+  REQUIRE(ex(1, 1) == Approx(-112.0 * Z / 6561.0).margin(5e-9));
+  // cross-language reference (same quadrature in python; tight)
+  REQUIRE(ex(0, 0) == Approx(-0.04389574756808).margin(2e-11));
+  REQUIRE(ex(1, 1) == Approx(-0.03414113700755).margin(2e-11));
+  // structure: m-degenerate p diagonal, strictly lm-diagonal otherwise
+  REQUIRE(ex(2, 2) == ex(1, 1));
+  REQUIRE(ex(3, 3) == ex(1, 1));
+  for (int I = 0; I < 4; ++I)
+    for (int J = 0; J < 4; ++J)
+      if (I != J) REQUIRE(ex(I, J) == 0.0);
+}
+
 }
 

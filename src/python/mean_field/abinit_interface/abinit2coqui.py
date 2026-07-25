@@ -417,7 +417,7 @@ def write_bz(sgrp, bz):
 # Top-level driver
 # --------------------------------------------------------------------------
 def convert(wfk_path, outdir="./", prefix="abinit", nbnd_out=None, verbose=True,
-            pot=None, psp8=None, pawxml=None, den=None, xc=None):
+            pot=None, psp8=None, pawxml=None, den=None, xc=None, corewf=None):
     _require_h5py()
     w = read_wfk(wfk_path)
     if w["nspinor"] != 1:
@@ -435,6 +435,13 @@ def convert(wfk_path, outdir="./", prefix="abinit", nbnd_out=None, verbose=True,
         import abinit_pawxml as axml
         xml_paths = [pawxml] if isinstance(pawxml, str) else list(pawxml)
         paw_parses = [axml.parse_pawxml(p) for p in xml_paths]
+        if corewf is not None:
+            cw_paths = [corewf] if isinstance(corewf, str) else list(corewf)
+            if len(cw_paths) != len(xml_paths):
+                sys.exit("abinit2coqui: --corewf needs one file per --pawxml "
+                         "(got %d vs %d)." % (len(cw_paths), len(xml_paths)))
+            for p, cw in zip(paw_parses, cw_paths):
+                axml.attach_corewf(p, cw)
         zion_sp = []
         for p in paw_parses:
             ncore_el = np.trapezoid(
@@ -637,9 +644,13 @@ def main():
                     help="ABINIT DEN netCDF (prtden 1) -> real vxc/vxc_with_nlcc")
     ap.add_argument("--xc", default=None, choices=["pbe", "lda_pw"],
                     help="XC functional for --den (default: from the WFK ixc)")
+    ap.add_argument("--corewf", nargs="+", default=None,
+                    help="atompaw .corewf.xml companion(s), one per --pawxml "
+                         "-> Species/Core AE core orbitals (native ex_cvij)")
     args = ap.parse_args()
     convert(args.wfk, args.outdir, args.prefix, args.nbnd, pot=args.pot,
-            psp8=args.psp8, pawxml=args.pawxml, den=args.den, xc=args.xc)
+            psp8=args.psp8, pawxml=args.pawxml, den=args.den, xc=args.xc,
+            corewf=args.corewf)
 
 
 if __name__ == "__main__":

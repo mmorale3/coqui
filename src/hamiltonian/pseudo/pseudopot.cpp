@@ -884,6 +884,24 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
             try { nda::h5_read(cgrp, "l",      sp.core_l); }     catch(...) {}
             try { nda::h5_read(cgrp, "ae_wfc", tmp.core_aewfc); } catch(...) {}
           }
+          // Plan B3 — native ex_cvij: when the h5 carries no Onecenter/
+          // ex_cvij but DOES carry AE core orbitals, build the frozen
+          // core-valence exact exchange here (Slater R^L + closed-shell
+          // Gaunt² sum, hamilt::paw::compute_ex_cvij_from_core; validated
+          // vs ABINIT-XML <exact_exchange_X_matrix> and analytic hydrogenic
+          // integrals). Detection order: h5 ex_cvij → native-from-Core →
+          // [dft_xc TBD] → none + loud warning below. Serves the QE path
+          // (GIPAW cores, pw2coqui exports Core/ but no ex_cvij).
+          if(sp.is_paw && tmp.ex_cvij.size() == 0 &&
+             tmp.core_aewfc.size() > 0 && sp.core_l.size() > 0 &&
+             tmp.aewfc.size() > 0) {
+            tmp.ex_cvij = hamilt::paw::compute_ex_cvij_from_core(
+                tmp.aewfc, tmp.core_aewfc, sp.lll, sp.core_l,
+                sp.indv, sp.nhtolm, sp.r, sp.rab);
+            app_log(2, "  pseudopot: species nt{} — ex_cvij built natively "
+                       "from Core/ae_wfc ({} core orbitals, plan B3).",
+                    nt, sp.core_l.size());
+          }
         }
       }
     }
@@ -1012,8 +1030,11 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
       if (!sp.is_paw) continue;
       bool no_core_charge = (sp.ae_rho_atc.size() == 0) &&
                             (sp.ncore_orbitals == 0 || sp.core_aewfc.size() == 0);
-      // Auto-detect the core-valence exchange treatment from the h5 datasets:
-      //   ex_cvij present            -> frozen Fock c-v exchange (fock)
+      // Auto-detect the core-valence exchange treatment (plan B3 order):
+      //   h5 Onecenter/ex_cvij       -> frozen Fock c-v exchange (fock)
+      //   else Core/ae_wfc present   -> ex_cvij built NATIVELY at read time
+      //                                 (compute_ex_cvij_from_core, above)
+      //                                 -> fock via the same sp.ex_cvij
       //   else <DFT c-v XC dataset>  -> dft_xc   [TODO: dataset TBD]
       //   else                       -> none (omitted; warned loudly below)
       // TODO: when a DFT core-valence XC dataset is defined in the h5, read a
@@ -1036,8 +1057,10 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
         app_warning("**************************************************************************");
         app_warning("**************************************************************************");
         app_warning("***  WARNING: PAW species nt={} has NO core-valence exchange kernel", nt);
-        app_warning("***  (Onecenter/ex_cvij). The CORE-VALENCE EXACT EXCHANGE is OMITTED.");
-        app_warning("***  ex_cvij (ABINIT <exact_exchange_X_matrix>) to include it.");
+        app_warning("***  (no Onecenter/ex_cvij AND no Core/ae_wfc to build one natively).");
+        app_warning("***  The CORE-VALENCE EXACT EXCHANGE is OMITTED. Provide ex_cvij");
+        app_warning("***  (ABINIT <exact_exchange_X_matrix>) or AE core orbitals (Core/,");
+        app_warning("***  GIPAW-enabled pseudo / --corewf XML) to include it.");
         app_warning("**************************************************************************");
         app_warning("**************************************************************************");
       }

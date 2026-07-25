@@ -161,10 +161,12 @@ def parse_pawxml(path):
     cw_els = findall("ae_core_wavefunction")
     if cw_els:
         if core_states is not None and len(core_states) == len(cw_els):
+            # ids can differ between the blocks in atompaw output
+            # ("Al_core1" vs "Al1s") -- id map when possible, order otherwise.
             cid = {st["id"]: k for k, st in enumerate(core_states)}
             core_ae_wfc = np.zeros((len(cw_els), nr))
-            for el in cw_els:
-                core_ae_wfc[cid[el.get("state")]] = _floats(el.text)[:nr]
+            for k, el in enumerate(cw_els):
+                core_ae_wfc[cid.get(el.get("state"), k)] = _floats(el.text)[:nr]
         else:
             # no (usable) metadata block: keep document order, synthesize ids
             core_ae_wfc = np.stack([_floats(el.text)[:nr] for el in cw_els])
@@ -182,6 +184,42 @@ def parse_pawxml(path):
                 ae_core=ae_core, ps_core=ps_core,
                 dij0=dij0, exx_X=exx_X, exx_core_core=exx_core_core,
                 core_states=core_states, core_ae_wfc=core_ae_wfc)
+
+
+def parse_corewf(path):
+    """Parse an atompaw '.corewf.xml' companion file: <core_states> metadata
+    + <ae_core_wavefunction> blocks (R-form). atompaw's ids differ between
+    the two blocks ("Al_core1" vs "Al1s"), so match by id when possible and
+    by document order otherwise. Returns dict(r, states, wfc(ncore, nr))."""
+    root = ET.parse(path).getroot()
+    r = _grid_r(root.find("radial_grid"))
+    states = [dict(n=(int(s.get("n")) if s.get("n") else None),
+                   l=int(s.get("l")),
+                   f=(float(s.get("f")) if s.get("f") else 0.0),
+                   e=(float(s.get("e")) if s.get("e") else 0.0), id=s.get("id"))
+              for s in root.find("core_states").findall("state")]
+    els = root.findall("ae_core_wavefunction")
+    if len(els) != len(states):
+        raise RuntimeError("parse_corewf: %d core states but %d "
+                           "ae_core_wavefunction blocks in %s"
+                           % (len(states), len(els), path))
+    idx = {st["id"]: k for k, st in enumerate(states)}
+    wfc = np.zeros((len(states), r.size))
+    for k, el in enumerate(els):
+        wfc[idx.get(el.get("state"), k)] = _floats(el.text)[:r.size]
+    return dict(r=r, states=states, wfc=wfc)
+
+
+def attach_corewf(parse, corewf_path):
+    """Attach a companion corewf parse to a parse_pawxml dict (in place):
+    fills core_states / core_ae_wfc after checking the radial grids agree."""
+    c = parse_corewf(corewf_path)
+    if c["r"].size != parse["r"].size or not np.allclose(c["r"], parse["r"]):
+        raise RuntimeError("attach_corewf: %s radial grid differs from the "
+                           "valence PAW-XML grid" % corewf_path)
+    parse["core_states"] = c["states"]
+    parse["core_ae_wfc"] = c["wfc"]
+    return parse
 
 
 if __name__ == "__main__":
