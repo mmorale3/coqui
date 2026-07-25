@@ -90,22 +90,17 @@ struct paw_exx_options {
   int aug_lmax = -1;
 
   /**
-   * Abort with a clear message for options declared here but not yet implemented.
-   * `in_thc` selects the THC-ERI restriction: shape-restored compensation is not
-   * yet available in the THC construction (its augmentation lives on the smooth
-   * collocation grid, too coarse for the sharp AE-PS pair density); the direct
-   * v_x path supports both compensation modes.
+   * Abort with a clear message for invalid / not-yet-implemented options.
+   * Both compensation modes are supported by both routes: the direct v_x
+   * path evaluates the augmentation on the dense fft_mesh_aug sphere, and
+   * the THC construction (plan C2) evaluates its atom-local LL Coulomb
+   * block on the same dense sphere regardless of the (possibly ecut-reduced)
+   * smooth THC collocation grid — which is what makes 'shape' (the sharp
+   * AE-PS pair density) resolvable in THC. `in_thc` is kept for future
+   * route-specific restrictions (currently none).
    */
-  void validate(bool in_thc, std::string const& ctx = "paw_exx_options") const {
-    if (in_thc)
-      utils::check(vv_compensation != vv_compensation_e::shape,
-        "{}: vv_compensation = 'shape' (shape-restored full AE-PS pair density) "
-        "is NOT YET IMPLEMENTED for the THC ERI construction: the THC "
-        "augmentation is built on the smooth collocation grid, which is too "
-        "coarse to resolve the sharp AE-PS pair density (only a few percent of "
-        "the on-site term is captured). Use vv_compensation = 'moment' (default) "
-        "for THC. TODO: dense-grid THC augmentation + unit test. "
-        "(The direct v_x path already supports 'shape'.)", ctx);
+  void validate([[maybe_unused]] bool in_thc,
+                std::string const& ctx = "paw_exx_options") const {
     utils::check(aug_lmax >= -1,
       "{}: aug_lmax = {} is invalid (must be >= 0, or -1 for no cap).",
       ctx, aug_lmax);

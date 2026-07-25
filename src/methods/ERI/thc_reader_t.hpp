@@ -687,29 +687,59 @@ namespace methods {
           q_cart_max = std::max(q_cart_max, std::sqrt(q2));
         }
       }
-      double K_max = K_max_g + q_cart_max;
+
+      // ---- Plan C2: dense-sphere G-grid for the atom-local (LL) Coulomb block.
+      // The LL block integrates conj(η)·w·η over G. η (the compensation charge
+      // in moment mode; the SHARP full AE−PS pair density in shape mode) is NOT
+      // band-limited to the thc rho_g sphere — an ecut-reduced rho_g is a
+      // legitimate cost knob for the smooth/ISDF machinery, but truncating the
+      // LL sum there loses the on-site physics (measured for shape mode on
+      // Si a10.20: a ~60 Ry rho_g captured only ~6% of the on-site correction;
+      // see notes/paw_onsite_exchange_analysis). The ζ-coupled blocks (GG, GL,
+      // LG) stay on rho_g: ζ is built by FFT from the rho_g collocation grid
+      // and is therefore EXACTLY band-limited to that sphere, so those sums are
+      // already complete for the THC representation — computing every block on
+      // the dense sphere would change nothing but the LL block. The composite V
+      // thus remains a genuine Coulomb Gram matrix over {ζ (band-limited), η
+      // (dense)} — PSD by construction. K_a is grid-free. The dense sphere is
+      // the inscribed sphere of the augmentation FFT box (fft_grid_dim_aug),
+      // the same Gcut bound the direct v_x path uses (v_x_paw.hpp), which
+      // makes the two routes consistent (plan I7). When rho_g already covers
+      // it, the existing single-grid path is used unchanged.
+      double Gcut_aug = 1e30;
+      {
+        auto mesh_aug = _MF->fft_grid_dim_aug();
+        auto recv = _MF->recv();
+        for (int i = 0; i < 3; ++i) {
+          long Mi = mesh_aug(i) / 2;
+          double brow = std::sqrt(recv(i,0)*recv(i,0) + recv(i,1)*recv(i,1)
+                                + recv(i,2)*recv(i,2));
+          Gcut_aug = std::min(Gcut_aug, (double)Mi * brow);
+        }
+      }
+      double ecut_dense = 0.5 * Gcut_aug * Gcut_aug;
+      bool dense_LL = ecut_dense > rho_g.ecut() * (1.0 + 1e-8);
+      std::optional<grids::truncated_g_grid> dense_g_opt;
+      if (dense_LL) {
+        dense_g_opt.emplace(ecut_dense, _MF->fft_grid_dim_aug(), _MF->recv());
+        app_log(1, "  paw_aug: LL block on the DENSE augmentation sphere "
+                   "(Gcut={:.2f} a.u., ngm={}; rho_g ecut={:.2f} Ha, ngm={})",
+                Gcut_aug, dense_g_opt->size(), rho_g.ecut(), ngm_rho);
+      }
+      double K_max = (dense_LL ? Gcut_aug : K_max_g) + q_cart_max;
+
       _Timer.start("PAW_AUG.qrad_tab");
-      // Option A ("shape-restored" on-site exchange), env-gated for validation:
-      // build the augmentation channels η from the FULL AE−PS partial-wave pair
-      // density (build_qrad_tab_full_aeps) instead of the compensation charge,
-      // and drop the K_a one-center term below. Reproduces ABINIT's
-      // phiphj−tphitphj oscillator. NOTE: this changes the SHARED THC ERI, so it
-      // affects Hartree + correlation too — hence env-gated (default off).
-      //
-      // KNOWN LIMITATION (Si a10.20, measured): the THC augmentation lives on the
-      // SMOOTH collocation grid (dffts, e.g. 18^3 / ~60 Ry), which is too coarse
-      // to resolve the SHARP AE−PS pair density D. It therefore captures only a
-      // few % of the on-site correction (vv exchange -1.7382 -> -1.7350, vs the
-      // dense-grid target -1.6863). The compensation charge works on the smooth
-      // grid only because it is smooth by construction. A CORRECT THC Option A
-      // needs the augmentation on the DENSE grid (dfftp, ecutrho ~ ABINIT's
-      // ecutsigx); the direct v_x_paw path already uses fft_mesh_aug (dense) and
-      // reproduces ABINIT. See notes/paw_onsite_exchange_analysis.
-      // Selected by the toml `vv_compensation` option (see hamilt::paw_exx_options).
-      // NOTE: 'shape' is validated as NOT-YET-IMPLEMENTED for THC in the
-      // constructor (aborts, due to the smooth-grid limitation documented above),
-      // so this is effectively always moment-restored here. The switch is kept
-      // wired for when the dense-grid THC augmentation lands.
+      // Compensation-density mode for the augmentation channels η, selected by
+      // the toml `vv_compensation` option (see hamilt::paw_exx_options):
+      //   moment (default) — moment-restored compensation charge
+      //                      (build_qrad_tab) + K_a one-center kernel;
+      //   shape            — full AE−PS partial-wave pair density
+      //                      (build_qrad_tab_full_aeps, ABINIT's
+      //                      phiphj−tphitphj oscillator), K_a dropped below
+      //                      (the on-site exchange is already complete).
+      // NOTE: the mode changes the SHARED THC ERI, so it affects Hartree and
+      // correlation too, not just exchange. Shape mode requires the dense-
+      // sphere LL treatment above whenever rho_g is ecut-reduced.
       bool paw_shape_restored =
           (_exx_opts.vv_compensation == hamilt::vv_compensation_e::shape);
       if (paw_shape_restored)
@@ -824,16 +854,20 @@ namespace methods {
         _Timer.stop("PAW_AUG.eta_flat");
 
         // ---- 6e) Gather rows of ζ / η_w / η that this rank will need. ----
-        // Five row-gathers per q (on q_intra, np_PQ-way).
+        // Row-gathers on q_intra (np_PQ-way); ALL ranks must take the same
+        // branch (dense_LL is a pure function of the grids — uniform).
         gather_rows_from_dist_qpool(zeta_dist , P_smooth_rows, q_intra, zeta_P_smooth_g);
         gather_rows_from_dist_qpool(zeta_dist , Q_smooth_cols, q_intra, zeta_Q_smooth_g);
         gather_rows_from_dist_qpool(eta_w_dist, Q_aug_cols_la, q_intra, eta_w_Q_aug_g);
         gather_rows_from_dist_qpool(eta_w_dist, P_aug_rows_la, q_intra, eta_w_P_aug_g);
-        gather_rows_from_dist_qpool(eta_dist  , P_aug_rows_la, q_intra, eta_P_aug_conj);
-        // Now eta_P_aug_conj holds η; flip to conj(η) for V_LL / V_LG GEMMs.
-        for (long la = 0; la < eta_P_aug_conj.shape(0); ++la)
-          for (long g = 0; g < ngm_rho; ++g)
-            eta_P_aug_conj(la, g) = std::conj(eta_P_aug_conj(la, g));
+        if (!dense_LL) {
+          // η rows for the rho_g V_LL GEMM (dense_LL builds its own tiles).
+          gather_rows_from_dist_qpool(eta_dist, P_aug_rows_la, q_intra, eta_P_aug_conj);
+          // Now eta_P_aug_conj holds η; flip to conj(η) for the V_LL GEMM.
+          for (long la = 0; la < eta_P_aug_conj.shape(0); ++la)
+            for (long g = 0; g < ngm_rho; ++g)
+              eta_P_aug_conj(la, g) = std::conj(eta_P_aug_conj(la, g));
+        }
 
         auto Z_loc = _dZ.local();
 
@@ -883,16 +917,59 @@ namespace methods {
         }
 
         // ---- 6h) V_LL block + on-site K_a: P ∈ aug, Q ∈ aug.
-        //         V_LL(λ, ξ) = Ω² · Σ_g conj(η(λ, g)) · η_w(ξ, g).
+        //         V_LL(λ, ξ) = Ω² · Σ_g conj(η(λ, g)) · η_w(ξ, g),
+        // over the DENSE augmentation sphere when dense_LL (plan C2): η is
+        // not band-limited to rho_g, so the Coulomb sum must run to the
+        // physical Gcut of the augmentation mesh (built in G-chunks, each
+        // rank evaluating exactly the (row, col) × g tiles it needs — the
+        // η builder is a cheap replicated interpolation, no comm).
         if (P_aug_rows_la.size() > 0 && Q_aug_cols_la.size() > 0) {
           _Timer.start("PAW_AUG.V_LL");
           nda::array<ComplexType,2> V_LL_local(P_aug_rows_la.size(),
                                                Q_aug_cols_la.size());
           V_LL_local() = ComplexType(0.0);
-          if (_paw_vll)
+          if (_paw_vll && dense_LL) {
+            auto const& dense_g = *dense_g_opt;
+            long ngm_d = dense_g.size();
+            auto const& gv_d = dense_g.g_vectors();
+            const long gchunk = 8192;
+            long gbuf = std::min(gchunk, ngm_d);
+            nda::array<ComplexType,2> etaP_c (P_aug_rows_la.size(), gbuf);
+            nda::array<ComplexType,2> etaQ_w (Q_aug_cols_la.size(), gbuf);
+            for (long g0 = 0; g0 < ngm_d; g0 += gchunk) {
+              nda::range g_rng(g0, std::min(g0 + gchunk, ngm_d));
+              long ng_c = g_rng.size();
+              auto etaP_v = etaP_c(nda::range::all, nda::range(0, ng_c));
+              auto etaQ_v = etaQ_w(nda::range::all, nda::range(0, ng_c));
+              hamilt::paw::build_eta_on_rho_g_at_q_chunk(
+                  *_psp, _isdf, _aug_layout, dense_g, q_cart, omega,
+                  aatab, qrad_tabs, P_aug_rows_la, g_rng, etaP_v);
+              hamilt::paw::build_eta_on_rho_g_at_q_chunk(
+                  *_psp, _isdf, _aug_layout, dense_g, q_cart, omega,
+                  aatab, qrad_tabs, Q_aug_cols_la, g_rng, etaQ_v);
+              // conj(η_P); η_Q × w(q+G) with w = 4π/(Ω|q+G|²), w(0)=0
+              // (same singular-term convention as the rho_g path).
+              for (long ig = 0; ig < ng_c; ++ig) {
+                long g = g_rng.first() + ig;
+                double Kx = q_cart[0] + gv_d(g, 0);
+                double Ky = q_cart[1] + gv_d(g, 1);
+                double Kz = q_cart[2] + gv_d(g, 2);
+                double K2 = Kx*Kx + Ky*Ky + Kz*Kz;
+                double w = (K2 > 1e-14) ? (4.0*M_PI/(omega*K2)) : 0.0;
+                for (long la = 0; la < etaP_v.shape(0); ++la)
+                  etaP_v(la, ig) = std::conj(etaP_v(la, ig));
+                for (long la = 0; la < etaQ_v.shape(0); ++la)
+                  etaQ_v(la, ig) *= w;
+              }
+              nda::blas::gemm(ComplexType(omega_sq), etaP_v,
+                              nda::transpose(etaQ_v),
+                              ComplexType(1.0), V_LL_local);
+            }
+          } else if (_paw_vll) {
             nda::blas::gemm(ComplexType(omega_sq), eta_P_aug_conj,
                             nda::transpose(eta_w_Q_aug_g),
                             ComplexType(0.0), V_LL_local);
+          }
           _Timer.stop("PAW_AUG.V_LL");
 
           if (_paw_onsite && !paw_shape_restored) {

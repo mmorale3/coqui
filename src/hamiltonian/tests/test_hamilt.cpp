@@ -2866,6 +2866,137 @@ TEST_CASE("vexchange_shape_restored", "[hamilt][paw][hf]")
 }
 
 // ===========================================================================
+// Plan C2 — THC shape-mode augmentation on the dense sphere.
+// The THC LL (aug-aug) Coulomb block is evaluated on the dense augmentation
+// sphere (fft_grid_dim_aug inscribed Gcut) regardless of the thc `ecut`
+// collocation grid; this is what makes vv_compensation='shape' (the SHARP
+// AE−PS pair density) resolvable in THC. Checks, per (ecut) configuration:
+//   (a) THC shape-mode V_x matches the direct (dense-grid) shape-mode V_x
+//       element-wise to ISDF truncation;
+//   (b) the mode signal is active (direct shape ≠ moment);
+//   (c) SHARP: the mode DIFFERENCE (shape − moment) agrees between THC and
+//       direct — THC factorization noise largely cancels in the difference,
+//       isolating exactly the augmentation-mode physics C2 implements. With
+//       a reduced thc ecut this fails without the dense-sphere LL treatment
+//       (the smooth-sphere sum captures only a few % of the on-site term).
+// ===========================================================================
+template<MEMORY_SPACE MEM>
+void test_thc_shape_mode_vs_direct(mpi_context_t& mpi,
+                                   std::shared_ptr<mf::MF> mf_ptr,
+                                   double thc_thresh,
+                                   double ecut_frac,
+                                   double tol_VX,
+                                   double tol_mode)
+{
+  using math::shm::make_shared_array;
+  auto all = nda::range::all;
+  auto& mfobj = *mf_ptr;
+  long nspin = mfobj.nspin(), nk_ibz = mfobj.nkpts_ibz(), nbnd = mfobj.nbnd();
+
+  memory::array<MEM, ComplexType, 3> nii(nspin, nk_ibz, nbnd);
+  nii() = mfobj.occ()(all, nda::range(nk_ibz), all);
+
+  auto sDm = make_shared_array<array_view_4d_t>(mpi, {nspin, nk_ibz, nbnd, nbnd});
+  if (mpi.node_comm.root()) {
+    sDm.local()() = ComplexType(0.0);
+    for (long s = 0; s < nspin; ++s)
+      for (long k = 0; k < nk_ibz; ++k)
+        for (long a = 0; a < nbnd; ++a)
+          sDm.local()(s, k, a, a) = nii(s, k, a);
+  }
+  mpi.node_comm.barrier();
+  auto sS = make_shared_array<array_view_4d_t>(mpi, {nspin, nk_ibz, nbnd, nbnd});
+  hamilt::set_ovlp(mfobj, sS);
+
+  // ---- Direct (dense fft_mesh_aug) references, both modes ----
+  hamilt::pseudopot V(mfobj);
+  V.set_paw_exx_shape_restored(false);
+  auto dVX_dir_m = hamilt::Vexchange<MEM>(mfobj, mpi.comm, &V, nii);
+  V.set_paw_exx_shape_restored(true);
+  auto dVX_dir_s = hamilt::Vexchange<MEM>(mfobj, mpi.comm, &V, nii);
+
+  // ---- THC exchange, both modes, at the requested collocation ecut ----
+  double thc_ecut = ecut_frac * mfobj.ecutrho();
+  auto thc_vx = [&](std::string const& mode) {
+    auto pt = methods::make_thc_reader_ptree(
+        0, "", "incore", "", "bdft", thc_thresh, thc_ecut);
+    pt.put("paw_aug", true);
+    pt.put("paw_isdf_metric", "coulomb");
+    pt.put("paw_isdf_tol", 1e-12);
+    pt.put("vv_compensation", mode);
+    methods::thc_reader_t thc(mf_ptr, pt);
+    auto sVX = make_shared_array<array_view_4d_t>(mpi,
+                   {nspin, nk_ibz, nbnd, nbnd});
+    methods::solvers::hf_t hf(methods::ignore_g0);
+    hf.evaluate(sVX, sDm.local(), thc, sS.local(),
+                /*hartree=*/false, /*exchange=*/true);
+    return nda::array<ComplexType,4>(sVX.local());
+  };
+  auto VX_thc_m = thc_vx("moment");
+  auto VX_thc_s = thc_vx("shape");
+
+  // ---- Element-wise comparison on this rank's tile of the direct arrays ----
+  auto dir_m = nda::to_host(dVX_dir_m.local());
+  auto dir_s = nda::to_host(dVX_dir_s.local());
+  auto rng_s = dVX_dir_m.local_range(0); auto rng_k = dVX_dir_m.local_range(1);
+  auto rng_i = dVX_dir_m.local_range(2); auto rng_j = dVX_dir_m.local_range(3);
+
+  double max_ref = 0.0, max_d_shape = 0.0, max_mode_dir = 0.0, max_d_mode = 0.0;
+  for (auto [is_l, s] : itertools::enumerate(rng_s))
+    for (auto [ik_l, k] : itertools::enumerate(rng_k))
+      for (auto [ii_l, i] : itertools::enumerate(rng_i))
+        for (auto [ij_l, j] : itertools::enumerate(rng_j)) {
+          ComplexType vd_m = dir_m(is_l, ik_l, ii_l, ij_l);
+          ComplexType vd_s = dir_s(is_l, ik_l, ii_l, ij_l);
+          ComplexType vt_m = VX_thc_m(s, k, i, j);
+          ComplexType vt_s = VX_thc_s(s, k, i, j);
+          max_ref    = std::max(max_ref,    std::abs(vd_s));
+          max_d_shape= std::max(max_d_shape, std::abs(vt_s - vd_s));
+          max_mode_dir = std::max(max_mode_dir, std::abs(vd_s - vd_m));
+          max_d_mode = std::max(max_d_mode,
+                                std::abs((vt_s - vt_m) - (vd_s - vd_m)));
+        }
+  max_ref     = mpi.comm.all_reduce_value(max_ref,     boost::mpi3::max<>{});
+  max_d_shape = mpi.comm.all_reduce_value(max_d_shape, boost::mpi3::max<>{});
+  max_mode_dir= mpi.comm.all_reduce_value(max_mode_dir,boost::mpi3::max<>{});
+  max_d_mode  = mpi.comm.all_reduce_value(max_d_mode,  boost::mpi3::max<>{});
+
+  app_log(1, "[THC shape-mode C2] ecut={:.1f} Ha ({}x ecutrho): max|V_x^dir,s| = {:.3e}, "
+             "max|VX_thc_s - VX_dir_s| = {:.3e}, mode signal (direct) = {:.3e}, "
+             "max|Δmode(THC - dir)| = {:.3e}",
+          thc_ecut, ecut_frac, max_ref, max_d_shape, max_mode_dir, max_d_mode);
+
+  REQUIRE(max_ref > 1e-8);
+  // (b) the two modes genuinely differ in the direct reference.
+  REQUIRE(max_mode_dir > 1e-8);
+  // (a) THC shape mode reproduces the direct dense-grid shape-mode V_x.
+  CHECK(max_d_shape < tol_VX);
+  // (c) the augmentation-mode difference agrees route-to-route (sharp).
+  CHECK(max_d_mode < tol_mode);
+}
+
+TEST_CASE("thc_shape_mode_vs_direct", "[hamilt][paw][thc][hf]")
+{
+  auto& mpi = utils::make_unit_test_mpi_context();
+  // Measured 2026-07-25 (this fixture): default ecut ΔV_x 7.6e-5 / Δmode
+  // 2.8e-6; reduced ecut ΔV_x 6.8e-5 / Δmode 6.3e-7. Tolerances ~10x.
+  SECTION("lih_kp222_nbnd16 (PAW, default ecut)") {
+    auto mf_ptr = std::make_shared<mf::MF>(
+        mf::default_MF(mpi, "qe_lih222_paw_hf", mf::h5_input_type));
+    test_thc_shape_mode_vs_direct<HOST_MEMORY>(*mpi, mf_ptr,
+        /*thc_thresh*/ 1e-5, /*ecut_frac*/ 1.0,
+        /*tol_VX*/ 5e-4, /*tol_mode*/ 3e-5);
+  }
+  SECTION("lih_kp222_nbnd16 (PAW, reduced ecut — dense-LL split grid)") {
+    auto mf_ptr = std::make_shared<mf::MF>(
+        mf::default_MF(mpi, "qe_lih222_paw_hf", mf::h5_input_type));
+    test_thc_shape_mode_vs_direct<HOST_MEMORY>(*mpi, mf_ptr,
+        /*thc_thresh*/ 1e-5, /*ecut_frac*/ 0.5,
+        /*tol_VX*/ 5e-4, /*tol_mode*/ 3e-5);
+  }
+}
+
+// ===========================================================================
 // Set 1b — MF-INDEPENDENCE with a genuine NON-DIAGONAL density matrix.
 // Compares direct hamilt::Vhartree(nij)/Vexchange(nij) against THC
 // hf_t::evaluate(Dm=nij) for a Hermitian PSD density matrix that is NOT
