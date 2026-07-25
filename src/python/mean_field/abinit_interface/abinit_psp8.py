@@ -81,6 +81,18 @@ def parse_psp8(path):
         rloc[i] = _f(tok[1])
         vloc[i] = _f(tok[2])
 
+    # model core charge (NLCC) block, present when fchrg > 0: mmax rows of
+    # idx, r, rhoc(, derivatives). psp8 stores 4*pi*n_c(r) (ABINIT psp8
+    # convention; NOT r^2-weighted) -- consumers divide by 4*pi for the
+    # number density. NOTE (plan B2): convention unverified against a real
+    # NLCC psp8 on this machine; recheck on the first NLCC pseudo.
+    rhoc = None
+    if fchrg > 0.0:
+        idx += mmax
+        rhoc = np.empty(mmax, dtype=float)
+        for i in range(mmax):
+            rhoc[i] = _f(lines[idx + i].split()[2])
+
     # shared radial grid (all channels + vloc share the same r in psp8)
     r = channels[0]["r"] if channels else rloc
 
@@ -89,7 +101,8 @@ def parse_psp8(path):
     nh = sum(nproj[l] * (2 * l + 1) for l in range(len(nproj)))
 
     return dict(zatom=zatom, zion=zion, lmax=lmax, lloc=lloc, mmax=mmax,
-                fchrg=fchrg, nproj=nproj, r=r, vloc=vloc, channels=channels, nh=nh)
+                fchrg=fchrg, nproj=nproj, r=r, vloc=vloc, channels=channels,
+                nh=nh, rhoc=rhoc)
 
 
 def dion_diag(psp):

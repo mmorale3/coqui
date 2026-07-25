@@ -190,6 +190,7 @@ def read_wfk(path):
         nelec = float(round(occ[0].sum() / nkpt))
     efermi = float(np.array(V["fermi_energy"][:]).ravel()[0]) if has("fermi_energy") else 0.0
     usepaw = int(np.array(V["usepaw"][:]).ravel()[0]) if has("usepaw") else 0
+    ixc = int(np.array(V["ixc"][:]).ravel()[0]) if has("ixc") else None
 
     ds.close()
 
@@ -201,7 +202,31 @@ def read_wfk(path):
                 nkpt=nkpt, kp_grid=kp_grid, eig=eig, occ=occ, nsppol=nsppol,
                 mband=mband, nspinor=nspinor, kg=kg, npwarr=npwarr, cg=cg,
                 symrel=symrel, tnons=tnons, nelec=nelec, efermi=efermi,
-                usepaw=usepaw, ngfft=None)
+                usepaw=usepaw, ixc=ixc, ngfft=None)
+
+
+def read_den(path):
+    """Read the real-space density from an ABINIT DEN netCDF (prtden 1,
+    iomode 3). Returns (n1,n2,n3) float64 (electrons/bohr^3; for PAW this is
+    ABINIT's smooth rhor = tilde-n + nhat). nsppol=1 only."""
+    _require_netcdf()
+    ds = _NCDataset(path, "r")
+    name = next((n for n in ("density", "rhor") if n in ds.variables), None)
+    if name is None:
+        sys.exit("abinit2coqui: no 'density' variable in %s (need an ABINIT "
+                 "DEN netCDF, prtden 1 + iomode 3)." % path)
+    rho = np.array(ds.variables[name][:])
+    ds.close()
+    # layout mirrors the POT vtrial: (nspin, n1, n2, n3[, ncomp])
+    if rho.ndim == 5:
+        rho = rho[..., 0]
+    if rho.ndim != 4:
+        sys.exit("abinit2coqui: unexpected DEN 'density' shape %s" % (rho.shape,))
+    if rho.shape[0] != 1:
+        raise NotImplementedError(
+            "abinit2coqui: nsppol=%d DEN not supported (vxc export is "
+            "spin-unpolarized only in v1)." % rho.shape[0])
+    return rho[0].astype(float)
 
 
 # --------------------------------------------------------------------------
@@ -392,7 +417,7 @@ def write_bz(sgrp, bz):
 # Top-level driver
 # --------------------------------------------------------------------------
 def convert(wfk_path, outdir="./", prefix="abinit", nbnd_out=None, verbose=True,
-            pot=None, psp8=None, pawxml=None):
+            pot=None, psp8=None, pawxml=None, den=None, xc=None):
     _require_h5py()
     w = read_wfk(wfk_path)
     if w["nspinor"] != 1:
@@ -401,6 +426,45 @@ def convert(wfk_path, outdir="./", prefix="abinit", nbnd_out=None, verbose=True,
         raise NotImplementedError(
             "usepaw=1 requires --pawxml (one PAW-XML dataset per species in znucl "
             "order) plus --pot, so the PAW /Hamiltonian augmentation can be emitted.")
+
+    # --- pseudopotential parses up front: needed for the /System lattice
+    # sums (ionic charges) as well as the /Hamiltonian blocks ---
+    paw_parses = psp_parses = None
+    zion_sp = None                       # per-species ionic (valence) charge
+    if pawxml is not None:
+        import abinit_pawxml as axml
+        xml_paths = [pawxml] if isinstance(pawxml, str) else list(pawxml)
+        paw_parses = [axml.parse_pawxml(p) for p in xml_paths]
+        zion_sp = []
+        for p in paw_parses:
+            ncore_el = np.trapezoid(
+                np.asarray(p["ae_core"], float) / np.sqrt(4.0 * np.pi)
+                * 4.0 * np.pi * p["r"] ** 2, p["r"]) if p.get("ae_core") is not None else 0.0
+            zval = round(float(p["znucl"]) - ncore_el)
+            f_sum = sum(s.get("f", 0.0) for s in p["states"])
+            if f_sum > 0 and abs(zval - f_sum) > 1e-6:
+                print("# WARNING abinit2coqui: species Z=%g zval from core "
+                      "integral (%g) != sum of state occupations (%g); using %g"
+                      % (p["znucl"], zval, f_sum, zval))
+            zion_sp.append(float(zval))
+    elif psp8 is not None:
+        from abinit_psp8 import parse_psp8
+        psp_paths = [psp8] if isinstance(psp8, str) else list(psp8)
+        psp_parses = [parse_psp8(p) for p in psp_paths]
+        zion_sp = [float(p["zion"]) for p in psp_parses]
+
+    # --- density (for real vxc) + functional ---
+    rho_den = read_den(den) if den is not None else None
+    xc_name = None
+    if rho_den is not None:
+        if xc is not None:
+            xc_name = xc
+        elif w.get("ixc") is not None:
+            from xc_functionals import functional_from_ixc
+            xc_name = functional_from_ixc(w["ixc"])
+        else:
+            sys.exit("abinit2coqui: --den given but no functional: the WFK "
+                     "carries no ixc; pass --xc {pbe,lda_pw}.")
 
     nspin = w["nsppol"]
     npol = 1
@@ -462,8 +526,31 @@ def convert(wfk_path, outdir="./", prefix="abinit", nbnd_out=None, verbose=True,
         _w_attr_int(S, "number_of_polarizations_in_basis", npol)
         _w_attr_int(S, "number_of_bands", nbnd)
         _w_attr_dbl(S, "number_of_elec", w["nelec"])
-        _w_attr_dbl(S, "madelung_constant", 0.0)
-        _w_attr_dbl(S, "nuclear_energy", 0.0)
+        # madelung constant (Ha): same value bdft_system would compute from
+        # cell + k-mesh when the stored one is 0 (its compute-when-0 guard
+        # stays as a fallback); -2 * utils::madelung port.
+        from lattice_sums import madelung_bdft, ewald_energy
+        madelung = -2.0 * madelung_bdft(w["rprimd"], w["recv"],
+                                        bz["kp_grid"], fft_mesh, 1e-10)
+        _w_attr_dbl(S, "madelung_constant", madelung)
+        # nuclear (Ewald) energy in Ha, ions = valence point charges in a
+        # neutralizing background (QE nuclear_energy convention). Needs the
+        # ionic charges, i.e. a --psp8/--pawxml parse; else 0 + warning.
+        if zion_sp is not None:
+            zion_at = np.array([zion_sp[t - 1] for t in typat], float)
+            enuc = ewald_energy(w["rprimd"], at_pos_bohr, zion_at)
+        else:
+            enuc = 0.0
+            print("# WARNING abinit2coqui: no --psp8/--pawxml -> ionic charges "
+                  "unknown; writing nuclear_energy = 0.")
+        _w_attr_dbl(S, "nuclear_energy", enuc)
+        # frozen core-core exact-exchange total (Ha, additive constant):
+        # sum over atoms of the species' PAW-XML core-core energy (plan B2).
+        if paw_parses is not None:
+            exx_cc = sum(paw_parses[t - 1].get("exx_core_core", 0.0) or 0.0
+                         for t in typat)
+            if exx_cc != 0.0:
+                _w_attr_dbl(S, "exx_core_core", exx_cc)
         _w_attr_dbl(S, "fermi_energy", w["efermi"])
         _w_strings(S, "species", species)
         _w_real(S, "atomic_id", atomic_id, np.int32)
@@ -504,20 +591,17 @@ def convert(wfk_path, outdir="./", prefix="abinit", nbnd_out=None, verbose=True,
         ham_w = dict(kg=w["kg"], npw=w["npwarr"], kpts_crys=w["kpts_crys"],
                      recv=w["recv"], xred=w["xred"], typat=w["typat"],
                      rprimd=w["rprimd"], nkpt=nk, nsppol=nspin, nspinor=1)
-        if pot is not None and pawxml is not None:
+        if pot is not None and paw_parses is not None:
             import abinit_paw_hamiltonian as aph
-            import abinit_pawxml as axml
-            xml_paths = [pawxml] if isinstance(pawxml, str) else list(pawxml)
-            parses = [axml.parse_pawxml(p) for p in xml_paths]
             vtrial = np.array(_NCDataset(pot, "r").variables["vtrial"][:])
-            info = aph.write_hamiltonian_paw(root, ham_w, vtrial, parses, verbose=verbose)
-        elif pot is not None and psp8 is not None:
+            info = aph.write_hamiltonian_paw(root, ham_w, vtrial, paw_parses,
+                                             verbose=verbose, rho_den=rho_den,
+                                             xc_name=xc_name)
+        elif pot is not None and psp_parses is not None:
             import abinit_hamiltonian as ah
-            from abinit_psp8 import parse_psp8
-            psp_paths = [psp8] if isinstance(psp8, str) else list(psp8)
-            psps = [parse_psp8(p) for p in psp_paths]
             vtrial = np.array(_NCDataset(pot, "r").variables["vtrial"][:])
-            info = ah.write_hamiltonian_nc(root, ham_w, vtrial, psps)
+            info = ah.write_hamiltonian_nc(root, ham_w, vtrial, psp_parses,
+                                           rho_den=rho_den, xc_name=xc_name)
             if verbose:
                 print("#   /Hamiltonian(ncpp): ngm=%d nkb=%d nhm=%d ngfft=%s"
                       % (info["ngm"], info["nkb"], info["nhm"], info["ngfft"]))
@@ -549,9 +633,13 @@ def main():
                     help="psp8 pseudopotential(s), one per species in znucl order (NC)")
     ap.add_argument("--pawxml", nargs="+", default=None,
                     help="PAW-XML dataset(s), one per species in znucl order (PAW)")
+    ap.add_argument("--den", default=None,
+                    help="ABINIT DEN netCDF (prtden 1) -> real vxc/vxc_with_nlcc")
+    ap.add_argument("--xc", default=None, choices=["pbe", "lda_pw"],
+                    help="XC functional for --den (default: from the WFK ixc)")
     args = ap.parse_args()
     convert(args.wfk, args.outdir, args.prefix, args.nbnd, pot=args.pot,
-            psp8=args.psp8, pawxml=args.pawxml)
+            psp8=args.psp8, pawxml=args.pawxml, den=args.den, xc=args.xc)
 
 
 if __name__ == "__main__":

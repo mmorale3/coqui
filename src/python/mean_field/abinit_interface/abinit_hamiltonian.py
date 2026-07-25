@@ -129,10 +129,12 @@ def dense_grid(ngfft):
     return miller, (I1.ravel(), I2.ravel(), I3.ravel())
 
 
-def write_hamiltonian_nc(h5root, w, vtrial, psps):
+def write_hamiltonian_nc(h5root, w, vtrial, psps, rho_den=None, xc_name="pbe"):
     """Write /Hamiltonian (norm-conserving) into an open h5py root group.
     w: WFK dict (kg, npw, kpts_crys, recv, xred, typat, rprimd, nkpt=nkpts_ibz,
        nsppol, nspinor). psps: list of parsed psp8 dicts, indexed by (species-1).
+    rho_den: real-space density (n1,n2,n3) from the ABINIT DEN (optional) --
+    enables real vxc/vxc_with_nlcc export (plan B2) with functional xc_name.
     Conventions validated to 5.6e-9 Ha (validate_h0.py).
     """
     import h5py
@@ -154,11 +156,13 @@ def write_hamiltonian_nc(h5root, w, vtrial, psps):
     nspin = w["nsppol"]; npol = 1
     nk = w["nkpt"]                                    # nkpts_ibz (nosym: all k)
 
-    # projector bookkeeping
-    nh_atom = np.array([psps[typat[a] - 1]["nh"] for a in range(nat)], dtype=np.int32)
+    # projector bookkeeping. proj_per_atom is per-SPECIES (length nsp, QE
+    # nh(1:nsp) convention, plan B2 / F10a); projector_offset stays per-atom.
+    nh_sp = np.array([p["nh"] for p in psps], dtype=np.int32)
+    nh_atom = np.array([nh_sp[typat[a] - 1] for a in range(nat)], dtype=np.int32)
     proj_off = np.concatenate([[0], np.cumsum(nh_atom)[:-1]]).astype(np.int32)
     nkb = int(nh_atom.sum())
-    nhm = int(max(p["nh"] for p in psps))
+    nhm = int(nh_sp.max())
 
     # dense grid + local potentials
     ngfft = tuple(int(x) for x in np.array(vtrial).shape[1:4])
@@ -198,7 +202,46 @@ def write_hamiltonian_nc(h5root, w, vtrial, psps):
           np.tile(vloc_ry, (nspin, npol * npol, 1)))
     wcplx(g, "scf_local_potential",
           2.0 * vks_flat.reshape(nspin, npol * npol, ngm))
-    wreal(g, "proj_per_atom", nh_atom, np.int32)
+    # vxc / vxc_with_nlcc (Ry on disk, add_vxc scales x0.5): real values when
+    # a DEN was provided (plan B2). vxc = f(rho_DEN); vxc_with_nlcc adds the
+    # psp8 model core charge (NLCC) when the pseudo carries one.
+    if rho_den is not None:
+        import xc_functionals as xcf
+        rho_r = np.asarray(rho_den, float)
+        if rho_r.ndim != 3:
+            raise NotImplementedError(
+                "abinit2coqui NC vxc: nsppol=1 only (got shape %s)" % (rho_r.shape,))
+        if tuple(rho_r.shape) != tuple(ngfft):
+            raise RuntimeError("abinit2coqui: DEN grid %s != POT grid %s"
+                               % (rho_r.shape, ngfft))
+        vxc_r = xcf.vxc_grid(rho_r, recv, xc_name)
+        core_g = np.zeros(ngm, complex)
+        Gs = np.where(Gn < 1e-8, 1.0, Gn)
+        for a in range(nat):
+            p = psps[typat[a] - 1]
+            if p.get("rhoc") is None:
+                continue
+            rr = p["r"]
+            nc = p["rhoc"] / (4.0 * np.pi)      # psp8 stores 4*pi*n_c(r)
+            ft = (4 * np.pi / vol) * np.trapezoid(
+                nc[None, :] * np.sin(np.outer(Gs, rr)) * rr[None, :]
+                / Gs[:, None], rr, axis=1)
+            ft[Gn < 1e-8] = (4 * np.pi / vol) * np.trapezoid(nc * rr * rr, rr)
+            core_g += np.exp(-1j * (Gcart @ tau[a])) * ft
+        if np.any(core_g != 0.0):
+            box = np.zeros(tuple(int(n) for n in ngfft), complex)
+            idx = [np.mod(miller_g[:, d], ngfft[d]) for d in range(3)]
+            box[idx[0], idx[1], idx[2]] = core_g
+            core_r = np.real(np.fft.ifftn(box)) * rho_r.size
+            vxc_nlcc_r = xcf.vxc_grid(rho_r + core_r, recv, xc_name)
+        else:
+            vxc_nlcc_r = vxc_r
+        vg = np.fft.fftn(vxc_r) / vxc_r.size
+        vgn = np.fft.fftn(vxc_nlcc_r) / vxc_nlcc_r.size
+        wcplx(g, "vxc", 2.0 * vg[I1, I2, I3].reshape(nspin, npol * npol, ngm))
+        wcplx(g, "vxc_with_nlcc",
+              2.0 * vgn[I1, I2, I3].reshape(nspin, npol * npol, ngm))
+    wreal(g, "proj_per_atom", nh_sp, np.int32)
     wreal(g, "projector_offset", proj_off, np.int32)
     wreal(g, "npw", np.array(w["npw"][:nk]), np.int32)
     wreal(g, "atomic_id", (typat - 1).astype(np.int32), np.int32)

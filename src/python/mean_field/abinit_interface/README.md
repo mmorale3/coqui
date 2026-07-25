@@ -24,6 +24,26 @@ CoQuí's many-body methods.
   radial block, and the one-center exact-exchange kernel `Onecenter/deltaC` recomputed
   from the AE/PS partial waves.
 
+Plan-B2 additions (2026-07-24):
+
+- `proj_per_atom` is per-**species** (QE `nh(1:nsp)` convention) in both writers.
+- `Species/nt*/paw/{ae_vloc, vloc_ps}` — frozen ionic **Hartree** potentials
+  (XC-free by design, Ry/UPF on-disk convention), the same pair `dion` is
+  assembled from; plus `beta` (u = r·proj) and `paw/oc`.
+- `Species/nt*/Core/` (AE core orbitals, pw2coqui GIPAW schema) when the XML
+  provides them; `exx_core_core` per-species attribute and a summed
+  `/System@exx_core_core` total-energy attribute.
+- Real `/System@nuclear_energy` (Ewald, Ha; validated vs QE to 2e-8 Ha) and
+  `/System@madelung_constant` (exact port of `utils::madelung`).
+- Real `vxc`/`vxc_with_nlcc` from an ABINIT DEN (`--den <run>o_DEN.nc`,
+  functional from the WFK `ixc` or `--xc {pbe,lda_pw}`); the PBE evaluator
+  reproduces QE `v_xc` to ~3e-11 Ry (validate_b2.py). NOTE: the DEN-side
+  wiring (netCDF layout, PAW smooth-ρ semantics, psp8 NLCC block) has not yet
+  been exercised against real ABINIT files on this machine — recheck on the
+  first cluster campaign.
+- The analytic compensation shape is cross-checked against a tabulated
+  `<shape_function>` when the XML carries one — hard error on mismatch.
+
 ## Required ABINIT run settings
 
 Produce the WFK with the full G-sphere at every k and no symmetry reduction:
@@ -54,6 +74,8 @@ With the `/Hamiltonian` block, pass the POT file and the pseudopotential(s):
 python abinit2coqui.py  <run>o_WFK.nc  --pot <run>o_POT.nc  --psp8   Si.psp8   ...
 # PAW
 python abinit2coqui.py  <run>o_WFK.nc  --pot <run>o_POT.nc  --pawxml Si.xml    ...
+# + real vxc/vxc_with_nlcc (add prtden 1 to the ABINIT run)
+python abinit2coqui.py  <run>o_WFK.nc  --pot <run>o_POT.nc  --den <run>o_DEN.nc  --pawxml Si.xml ...
 ```
 
 Writes `./<prefix>.h5`. Point CoQuí at it with `mf_source = bdft`, `outdir`/`prefix`
