@@ -155,6 +155,19 @@ def dense_sphere(ngfft, rprimd, recv):
             (I1[keep], I2[keep], I3[keep]))
 
 
+def dense_sphere_ecut(ngfft, rprimd):
+    """Kinetic cutoff (Ha) of the largest G-sphere inscribed in the FFT box
+    [-n/2, n/2) — exactly the sphere dense_sphere() keeps. This is the value
+    written to /Orbitals@ecutrho (schema-3 unit pin: HARTREE on disk), so a
+    reader building a truncated grid with |G|^2 <= 2*ecut on fft_mesh_aug
+    reproduces the miller_g sphere. Replaces the old 2x/4x wfc_ecut
+    heuristic (2026-07 converter audit: the attribute's meaning was
+    backend-dependent)."""
+    gmax = min((ngfft[d] / 2.0) * 2.0 * np.pi / np.linalg.norm(rprimd[d])
+               for d in range(3))
+    return 0.5 * (gmax * (1.0 - 1e-9)) ** 2
+
+
 def write_hamiltonian_nc(h5root, w, vtrial, psps, rho_den=None, xc_name="pbe"):
     """Write /Hamiltonian (norm-conserving) into an open h5py root group.
     w: WFK dict (kg, npw, kpts_crys, recv, xred, typat, rprimd, nkpt=nkpts_ibz,
@@ -210,10 +223,13 @@ def write_hamiltonian_nc(h5root, w, vtrial, psps, rho_den=None, xc_name="pbe"):
 
     # ---- write ----
     H = h5root.create_group("Hamiltonian")
-    # schema_version 2: HARTREE on disk for all energy-valued datasets
-    # (contract: notes/paw_implementation_plan.md, plan B4). ABINIT is
-    # natively Ha, so no conversion factors anywhere below.
-    H.attrs.create("schema_version", np.int32(2))
+    # schema_version 3 (contract: notes/paw_implementation_plan.md +
+    # notes/converter_h5_contract.md). v2 = HARTREE on disk for all
+    # energy-valued datasets (plan B4; ABINIT is natively Ha, so no
+    # conversion factors anywhere below). v3 additionally pins
+    # /Orbitals@ecutrho to HARTREE (exact inscribed-sphere cutoff) and
+    # drops the dead core-zeroed vxc dataset (2026-07 audit).
+    H.attrs.create("schema_version", np.int32(3))
     H.attrs.create("pp_type", "ncpp", dtype=VLEN)
     g = H.create_group("ncpp")
     for k, val in [("number_of_nspins", nspin), ("number_of_polarizations", npol),
@@ -231,9 +247,12 @@ def write_hamiltonian_nc(h5root, w, vtrial, psps, rho_den=None, xc_name="pbe"):
           np.tile(vloc_tot, (nspin, npol * npol, 1)))
     wcplx(g, "scf_local_potential",
           vks_flat.reshape(nspin, npol * npol, ngm))
-    # vxc / vxc_with_nlcc (Ry on disk, add_vxc scales x0.5): real values when
-    # a DEN was provided (plan B2). vxc = f(rho_DEN); vxc_with_nlcc adds the
-    # psp8 model core charge (NLCC) when the pseudo carries one.
+    # vxc_with_nlcc (HARTREE on disk, schema >= 2 -- add_vxc applies no scale;
+    # the old "Ry on disk" comment here was stale, the values were always the
+    # Ha-native vxc_grid output): written only when a DEN was provided (plan
+    # B2); adds the psp8 model core charge (NLCC) when the pseudo carries one.
+    # (schema 3) The valence-only "vxc" variant is dead at read and no longer
+    # written.
     if rho_den is not None:
         import xc_functionals as xcf
         rho_r = np.asarray(rho_den, float)
@@ -265,9 +284,7 @@ def write_hamiltonian_nc(h5root, w, vtrial, psps, rho_den=None, xc_name="pbe"):
             vxc_nlcc_r = xcf.vxc_grid(rho_r + core_r, recv, xc_name)
         else:
             vxc_nlcc_r = vxc_r
-        vg = np.fft.fftn(vxc_r) / vxc_r.size
         vgn = np.fft.fftn(vxc_nlcc_r) / vxc_nlcc_r.size
-        wcplx(g, "vxc", vg[I1, I2, I3].reshape(nspin, npol * npol, ngm))
         wcplx(g, "vxc_with_nlcc",
               vgn[I1, I2, I3].reshape(nspin, npol * npol, ngm))
     wreal(g, "proj_per_atom", nh_sp, np.int32)

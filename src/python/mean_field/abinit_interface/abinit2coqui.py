@@ -504,13 +504,16 @@ def convert(wfk_path, outdir="./", prefix="abinit", nbnd_out=None, verbose=True,
     # /Orbitals/fft_mesh_aug matches the /Hamiltonian dense grid (miller_g) that
     # read_vnl_h5 maps onto fft_grid_dim_aug.  Without POT, fall back to the wfc mesh.
     fft_mesh_aug = fft_mesh.copy()
-    ecutrho = 2.0 * wfc_ecut                                # density cutoff (Ha)
     if pot is not None:
         _ds = _NCDataset(pot, "r")
         _sh = _ds.variables["vtrial"].shape                 # (nspin, n1, n2, n3, ncomp)
         _ds.close()
         fft_mesh_aug = np.array(_sh[1:4], dtype=np.int32)
-        ecutrho = 4.0 * wfc_ecut
+    # /Orbitals@ecutrho (HARTREE, schema-3 pin): the exact inscribed-sphere
+    # cutoff of the dense/aug grid, i.e. the sphere dense_sphere() keeps for
+    # miller_g when --pot is given. Replaces the 2x/4x wfc_ecut heuristic.
+    from abinit_hamiltonian import dense_sphere_ecut
+    ecutrho = float(dense_sphere_ecut(fft_mesh_aug, w["rprimd"]))
 
     if not os.path.exists(outdir):
         os.makedirs(outdir)

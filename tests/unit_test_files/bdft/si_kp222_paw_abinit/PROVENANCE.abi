@@ -27,3 +27,8 @@ iomode 3
 
 pp_dirpath "/Users/mmorales/abinit_local/abinit-10.6.7/tests/Pspdir"
 pseudos "Si_paw_pw_12el.xml"
+
+# 2026-07-26: reconverted with the schema-3 abinit2coqui (converter audit):
+# dead datasets dropped, /Orbitals@ecutrho = exact inscribed-sphere cutoff
+# (121.509 Ha on the 36^3 POT grid), core-zeroed vxc no longer written.
+# Same WFK/POT/DEN sources; kept datasets bit-identical (deltaC 1e-13).

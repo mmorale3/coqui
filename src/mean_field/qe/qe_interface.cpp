@@ -35,6 +35,7 @@
 #include "utilities/concepts.hpp"
 #include "mean_field/symmetry/bz_symmetry.hpp"
 #include "mean_field/mf_source.hpp"
+#include "hamiltonian/pseudo/pp_schema.hpp"
 #include <hdf5.h>
 #include <hdf5_hl.h>
 
@@ -453,6 +454,19 @@ qe_system read_h5(std::shared_ptr<utils::mpi_context_t<mpi3::communicator>> mpi,
 
   h5::h5_read_attribute(ogrp, "number_of_bands", nbnd);
   h5::h5_read_attribute(ogrp, "ecutrho", ecrho);
+  // Unit pin (converter-audit 2026-07, schema 3): /Orbitals@ecutrho is
+  // HARTREE for pw2coqui files with /Hamiltonian@schema_version >= 3.
+  // Older pw2coqui files wrote QE's ecutrho in raw Ry — scale x0.5 so this
+  // init path matches the XML path (which is Hartree and reproduces QE's
+  // dense G-sphere exactly; the unscaled Ry value inflated the sphere 2x).
+  {
+    int sv = 0;
+    if (grp.has_subgroup("Hamiltonian")) {
+      h5::group hgrp = grp.open_group("Hamiltonian");
+      sv = hamilt::h5_pp_schema_version(hgrp);
+    }
+    if (sv < 3) ecrho *= 0.5;
+  }
   // Smooth (dffts) FFT mesh: written as "fft_mesh" by both pw2coqui and the
   // CoQui qe_system::save() path.
   nda::h5_read(grp, "Orbitals/fft_mesh", fft_mesh);

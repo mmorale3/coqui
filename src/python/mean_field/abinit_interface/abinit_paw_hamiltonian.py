@@ -341,45 +341,32 @@ def write_species_block(h5root, species, aug, h5py):
         g.attrs.create("species_kind", "paw", dtype=VLEN)
         ch = aug["per_sp"][nt]["ch"]
         nbeta = len(sp["lll"])
+        # (schema 3, 2026-07 converter audit) dead-at-read data is no longer
+        # written: kbeta/qqq/species-dion datasets, q_with_l/nqf/nqlc/lmax/
+        # lmax_rho/zp attrs, paw pfunc/ptfunc/augmom/oc. `beta` is KEPT
+        # (enabler for a future native projector build).
         for k, v in [("mesh", sp["mesh"]), ("kkbeta", sp["kkbeta"]), ("nbeta", nbeta),
-                     ("nh", ch["nh"]), ("lmax", int(max(sp["lll"]))),
-                     ("lmax_rho", sp["lmax_rho"]), ("nqlc", sp["nqlc"]),
-                     ("q_with_l", 1), ("nqf", 0)]:
+                     ("nh", ch["nh"])]:
             g.attrs.create(k, np.int32(v))
-        g.attrs.create("zp", np.float64(sp.get("zp", 0.0)))
         wreal(g, "r", sp["r"], np.float64)
         wreal(g, "rab", sp["rab"], np.float64)
         wreal(g, "lll", np.asarray(sp["lll"], np.int32), np.int32)
         wreal(g, "indv", ch["indv"].astype(np.int32), np.int32)
         wreal(g, "nhtol", ch["nhtol"].astype(np.int32), np.int32)
         wreal(g, "nhtolm", ch["nhtolm"].astype(np.int32), np.int32)
-        wreal(g, "kbeta", np.full(nbeta, sp["kkbeta"], np.int32), np.int32)
         wreal(g, "aewfc", sp["u_ae"], np.float64)
         wreal(g, "pswfc", sp["u_ps"], np.float64)
-        wreal(g, "qqq", aug["per_sp"][nt]["qqq"], np.float64)
         wreal(g, "qfuncl", aug["per_sp"][nt]["qfuncl"], np.float64)
         if "beta" in sp:
             wreal(g, "beta", sp["beta"], np.float64)
-        if "dij0" in sp:
-            wreal(g, "dion", sp["dij0"], np.float64)
-        # paw/ subgroup (pair densities + moments; radial local pots are optional)
+        # paw/ subgroup (radial local pots + core densities)
         pg = g.create_group("paw")
         # mandatory augmentation attrs (pseudopot.cpp read_vnl_h5:765-767):
         #   lmax_aug = lmax_rho ; raug = -1.0 (sentinel -> use iraug) ; iraug = kkbeta
         pg.attrs.create("lmax_aug", np.int32(sp["lmax_rho"]))
         pg.attrs.create("raug", np.float64(-1.0))
         pg.attrs.create("iraug", np.int32(sp["kkbeta"]))
-        wreal(pg, "pfunc", aug["per_sp"][nt]["pfunc"], np.float64)
-        wreal(pg, "ptfunc", aug["per_sp"][nt]["ptfunc"], np.float64)
-        augmom = np.zeros((sp["nqlc"], nbeta, nbeta))
-        mom = aug["per_sp"][nt]["moments"]
-        for mb in range(1, nbeta + 1):
-            for nb in range(1, mb + 1):
-                ijv = pr.beta_pair_index(nb, mb)
-                augmom[:, nb - 1, mb - 1] = mom[:, ijv]
-                augmom[:, mb - 1, nb - 1] = mom[:, ijv]
-        wreal(pg, "augmom", augmom, np.float64)
-        for key in ("ae_vloc", "vloc_ps", "ae_rho_atc", "rho_atc_ps", "oc"):
+        for key in ("ae_vloc", "vloc_ps", "ae_rho_atc", "rho_atc_ps"):
             if key in sp:
                 wreal(pg, key, sp[key], np.float64)
         # Core/ group (AE core orbitals, pw2coqui GIPAW schema: float64 n/l,
@@ -522,10 +509,15 @@ def write_hamiltonian_paw(h5root, w, vtrial, paw_parses, verbose=True,
 
     # ---- write /Hamiltonian/paw ----
     H = h5root.create_group("Hamiltonian")
-    # schema_version 2: HARTREE on disk for all energy-valued datasets
-    # (contract: notes/paw_implementation_plan.md, plan B4). ABINIT is
-    # natively Ha, so no conversion factors anywhere below.
-    H.attrs.create("schema_version", np.int32(2))
+    # schema_version 3 (contract: notes/paw_implementation_plan.md +
+    # notes/converter_h5_contract.md). v2 = HARTREE on disk for all
+    # energy-valued datasets (plan B4; ABINIT is natively Ha, so no
+    # conversion factors anywhere below). v3 additionally pins
+    # /Orbitals@ecutrho to HARTREE (exact inscribed-sphere cutoff) and drops
+    # datasets with no CoQui consumer (2026-07 audit): core-zeroed vxc,
+    # species kbeta/qqq/dion/q_with_l/nqf/nqlc/lmax/lmax_rho/zp,
+    # paw pfunc/ptfunc/augmom/oc.
+    H.attrs.create("schema_version", np.int32(3))
     H.attrs.create("pp_type", "paw", dtype=VLEN)
     g = H.create_group("paw")
     for k, val in [("number_of_nspins", nspin), ("number_of_polarizations", npol),
@@ -537,13 +529,16 @@ def write_hamiltonian_paw(h5root, w, vtrial, paw_parses, verbose=True,
     wreal(g, "miller_g", miller_g, np.int32)
     wcplx(g, "pp_local_component", vloc_tot)                    # Hartree (schema 2)
     wcplx(g, "scf_local_potential", vks_flat.reshape(nspin, npol * npol, ngm))
-    # vxc / vxc_with_nlcc (Ry on disk, add_vxc scales x0.5). Real values when a
-    # DEN was provided (plan B2): vxc = f(rho_DEN) and vxc_with_nlcc =
-    # f(rho_DEN + sum_a tilde-n_core) -- the pw2coqui valence-only / with-NLCC
-    # split. For PAW, rho_DEN is ABINIT's smooth rhor (tilde-n + nhat); the
-    # smooth-grid vxc is the operator the G0W0 Sigma - Vxc subtraction needs
-    # (one-center XC lives in Dij, outside the plane-wave dataset, exactly as
-    # in the QE PAW path). Zeros otherwise (pre-B2 behavior).
+    # vxc_with_nlcc (HARTREE on disk, schema >= 2 -- add_vxc applies no scale;
+    # the old "Ry on disk" comment here was stale, the values were always the
+    # Ha-native vxc_grid output). Written only when a DEN was provided (plan
+    # B2): vxc_with_nlcc = f(rho_DEN + sum_a tilde-n_core). For PAW, rho_DEN
+    # is ABINIT's smooth rhor (tilde-n + nhat); the smooth-grid vxc is the
+    # operator the G0W0 Sigma - Vxc subtraction needs (one-center XC lives in
+    # Dij, outside the plane-wave dataset, exactly as in the QE PAW path).
+    # (schema 3) Without --den the datasets are OMITTED -- the pre-audit
+    # zeros were indistinguishable from a genuine XC-free source. The
+    # valence-only "vxc" variant is dead at read and no longer written.
     if rho_den is not None:
         import xc_functionals as xcf
         rho_r = np.asarray(rho_den, float)
@@ -553,9 +548,7 @@ def write_hamiltonian_paw(h5root, w, vtrial, paw_parses, verbose=True,
         if tuple(rho_r.shape) != tuple(ngfft):
             raise RuntimeError("abinit2coqui: DEN grid %s != POT grid %s"
                                % (rho_r.shape, ngfft))
-        vxc_r = xcf.vxc_grid(rho_r, recv, xc_name)
         # add the frozen PS core densities (NLCC analogue) in G space
-        rho_g = np.fft.fftn(rho_r) / rho_r.size
         core_g = np.zeros(ngm, complex)
         for a in range(nat):
             p = paw_parses[typat[a] - 1]
@@ -574,14 +567,12 @@ def write_hamiltonian_paw(h5root, w, vtrial, paw_parses, verbose=True,
         core_r = np.real(np.fft.ifftn(
             _scatter_to_box(core_g, miller_g, rho_r.shape))) * rho_r.size
         vxc_nlcc_r = xcf.vxc_grid(rho_r + core_r, recv, xc_name)
-        vg = np.fft.fftn(vxc_r) / vxc_r.size
         vgn = np.fft.fftn(vxc_nlcc_r) / vxc_nlcc_r.size
-        wcplx(g, "vxc", vg[I1, I2, I3].reshape(nspin, npol * npol, ngm))
         wcplx(g, "vxc_with_nlcc",
               vgn[I1, I2, I3].reshape(nspin, npol * npol, ngm))
     else:
-        zc = np.zeros((nspin, npol * npol, ngm), complex)
-        wcplx(g, "vxc", zc); wcplx(g, "vxc_with_nlcc", zc)
+        print("# abinit2coqui: no --den -> vxc_with_nlcc omitted "
+              "(GW@DFT Sigma - Vxc subtraction unavailable from this file)")
     wreal(g, "proj_per_atom", nh_sp, np.int32)
     wreal(g, "projector_offset", proj_off, np.int32)
     wreal(g, "npw", np.array(w["npw"][:nk]), np.int32)

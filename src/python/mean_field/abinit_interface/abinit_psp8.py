@@ -84,8 +84,12 @@ def parse_psp8(path):
     # model core charge (NLCC) block, present when fchrg > 0: mmax rows of
     # idx, r, rhoc(, derivatives). psp8 stores 4*pi*n_c(r) (ABINIT psp8
     # convention; NOT r^2-weighted) -- consumers divide by 4*pi for the
-    # number density. NOTE (plan B2): convention unverified against a real
-    # NLCC psp8 on this machine; recheck on the first NLCC pseudo.
+    # number density. CONVENTION SOURCE-VERIFIED (2026-07-26) against
+    # ABINIT's own reader: m_psp8.F90::psp8cc rescales the file values by
+    # pi4i = 1/(4*pi) with the comment "The input functions contain the
+    # 4pi factor, and must be rescaled" -- i.e. file = 4*pi*n_c(r), exactly
+    # this parser's assumption. (End-to-end numeric exercise on a real
+    # NLCC psp8 remains asset-gated.)
     rhoc = None
     if fchrg > 0.0:
         idx += mmax

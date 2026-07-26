@@ -34,14 +34,21 @@ namespace hamilt
  *     absent : legacy export (QE deeq era) — energy datasets in Ry
  *     1      : deeq-free (plan B1) — still Ry
  *     >= 2   : deeq-free + HARTREE on disk — no scaling on read
+ *     >= 3   : additionally /Orbitals@ecutrho is HARTREE (older pw2coqui
+ *              wrote raw Ry — qe_interface::read_h5 scales x0.5 below v3)
+ *              and datasets with no CoQui consumer are dropped by the
+ *              converters (2026-07 audit, notes/converter_h5_contract.md).
+ *              /Hamiltonian dataset units are unchanged from v2.
  *
  * Returns the version (0 when the attribute is absent).
  */
 inline int h5_pp_schema_version(h5::group& hamil_grp)
 {
+  // Probe with H5Aexists instead of try/catch: the catch path made every
+  // legacy-file open dump an HDF5-DIAG error stack to stderr.
   int sv = 0;
-  try { h5::h5_read_attribute(hamil_grp, "schema_version", sv); }
-  catch (...) { sv = 0; }
+  if (H5Aexists(h5::hid_t(hamil_grp), "schema_version") > 0)
+    h5::h5_read_attribute(hamil_grp, "schema_version", sv);
   return sv;
 }
 

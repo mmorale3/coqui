@@ -1,6 +1,17 @@
 !
+! pw2coqui — QE post-processor writing <prefix>.coqui.h5 for CoQui's *qe*
+! mean-field backend.
 !
+! ROLE (contract, notes/converter_h5_contract.md §0): this file is a
+! qe-backend COMPANION — CoQui reads it TOGETHER WITH the QE
+! data-file-schema.xml and the QE-native wfc*.hdf5 orbital files. It writes
+! /System, /Orbitals (metadata only — NO wavefunctions; the add_orbs flag is
+! dead) and /Hamiltonian. It is NOT a standalone bdft file: feeding it to
+! CoQui's bdft backend is a user error (the bdft reader now names it).
+! The self-contained single-file route is abinit2coqui (bdft schema).
 !
+! Canonical source: qe_converter/pw2coqui.f90 in the CoQui repository —
+! never the QE-bundled copy (resync PP/src before rebuilding QE).
 !-------------------------------------------------------------------------------
 
 PROGRAM pw2coqui
@@ -302,7 +313,9 @@ subroutine write_system(h5_f)
     deallocate(wgt)
 
     call qeh5_add_attribute(h5_o%id,"number_of_bands",nbnd)
-    call qeh5_add_attribute(h5_o%id,"ecutrho",ecutrho)
+    ! ecutrho in HARTREE (schema 3 pin; QE gvect%ecutrho is Ry). Readers treat
+    ! the attribute as Ry for files with /Hamiltonian@schema_version < 3.
+    call qeh5_add_attribute(h5_o%id,"ecutrho",ecutrho/e2)
 
     ! pw per kpoint
     call h5_write_vector_int(h5_o,npw_g(1:nk),"npw")
@@ -419,14 +432,22 @@ subroutine write_pp(h5_f)
     endif
 
     call qeh5_open_group(h5_f, "Hamiltonian", h5_h)
-    ! CoQui pseudopot schema version (contract: notes/paw_implementation_plan.md):
+    ! CoQui pseudopot schema version (contract: notes/paw_implementation_plan.md
+    ! + notes/converter_h5_contract.md):
     !   (absent) : legacy exports (carried QE deeq; QE-native Ry units)
     !   1        : deeq-free (CoQui builds D natively); still Ry on disk
     !   2        : deeq-free + HARTREE on disk for all /Hamiltonian energy-
     !              valued datasets (dion[_so], Species dion, ae_vloc, vloc_ps,
-    !              pp_local_component, scf_local_potential, vxc[_with_nlcc]).
+    !              pp_local_component, scf_local_potential, vxc_with_nlcc).
     !              Readers apply the 0.5 Ry->Ha scale ONLY for version < 2.
-    call qeh5_add_attribute(h5_h%id,"schema_version",2)
+    !   3        : /Orbitals@ecutrho in HARTREE (was raw QE Ry; readers scale
+    !              x0.5 for version < 3), and datasets with no CoQui consumer
+    !              dropped (2026-07 converter audit): core-zeroed vxc, species
+    !              kbeta/qqq/dion/qfunc/q_with_l/nqf/nqlc/lmax/lmax_rho/zp/
+    !              jjj/nhtoj, paw pfunc/ptfunc/augmom/oc/augshape/
+    !              pfunc_rel/aewfc_rel. `beta` is KEPT (enabler for a future
+    !              native projector build).
+    call qeh5_add_attribute(h5_h%id,"schema_version",3)
     call qeh5_add_attribute(h5_h%id,"pp_type",TRIM(pp_type))
     call qeh5_open_group(h5_h, TRIM(pp_type), h5_n)  
 
@@ -612,10 +633,10 @@ subroutine write_pp(h5_f)
     vloc ( ig_l2g ( ig ), 1, 1 ) = psic ( dfftp%nl ( ig ) )
   enddo
 
-  ! MAM: if local potential has polarization dependence, modify below! 
-  call qeh5_add_attribute(h5_n%id,"lspinorbit_loc",0)
+  ! MAM: if local potential has polarization dependence, modify below!
   CALL mp_sum ( vloc, intra_bgrp_comm )
   if(ionode) then
+    call qeh5_add_attribute(h5_n%id,"lspinorbit_loc",0)
     vloc = vloc / e2                                ! Hartree (schema 2)
     call h5_write_vector_c(h5_n,vloc(:,1,1),"pp_local_component")
   endif
@@ -671,52 +692,10 @@ subroutine write_pp(h5_f)
       call h5_write_tensor_c(h5_n,vloc,"vxc_with_nlcc")
     endif
     !
-    !
-    ! is it ok to just zero out these? Otherwise allocate a new array
-    rho_core ( : ) = 0.0D0
-    rhog_core ( : ) = ( 0.0D0, 0.0D0 )
-    CALL v_xc ( rho, rho_core, rhog_core, etxc, vtxc, vxc )
-    !
-    vloc(:,:,:) = (0.d0,0.d0)
-    DO is = 1, nspin
-      psic(:) = (0.d0,0.d0)
-      if( nspin == 4 ) then
-        if(is==1) then
-          do ir = 1, dfftp%nnr
-            psic ( ir ) = CMPLX ( vxc(ir,1) + vxc(ir,4), 0.0D0, KIND=dp )
-          enddo
-        elseif(is==2) then
-          do ir = 1, dfftp%nnr
-            psic ( ir ) = CMPLX ( vxc(ir,2) - (0.d0,1.d0) * vxc(ir,3), KIND=dp )
-          enddo
-        elseif(is==3) then
-          do ir = 1, dfftp%nnr
-            psic ( ir ) = CMPLX ( vxc(ir,2) + (0.d0,1.d0) * vxc(ir,3), KIND=dp )
-          enddo
-        elseif(is==4) then
-          do ir = 1, dfftp%nnr
-            psic ( ir ) = CMPLX ( vxc(ir,1) - vxc(ir,4), 0.0D0, KIND=dp )
-          enddo
-        endif
-        CALL fwfft ( 'Rho', psic, dfftp )
-        DO ig = 1, ngm
-          vloc ( ig_l2g ( ig ), is, 1 ) = psic ( dfftp%nl ( ig ) )
-        ENDDO
-      else
-        DO ir = 1, dfftp%nnr
-          psic ( ir ) = CMPLX ( vxc ( ir, is ), 0.0D0, KIND=dp )
-        ENDDO
-        CALL fwfft ( 'Rho', psic, dfftp )
-        DO ig = 1, ngm
-          vloc ( ig_l2g ( ig ), 1, is ) = psic ( dfftp%nl ( ig ) )
-        ENDDO
-      endif
-    ENDDO
-    CALL mp_sum ( vloc, intra_bgrp_comm )
-    if(ionode) then
-      vloc = vloc / e2                              ! Hartree (schema 2)
-      call h5_write_tensor_c(h5_n,vloc,"vxc")
-    endif
+    ! NOTE (schema 3): the core-zeroed "vxc" dataset is no longer written —
+    ! CoQui's add_vxc consumes only vxc_with_nlcc (2026-07 converter audit).
+    ! This also removes the destructive rho_core/rhog_core zeroing the second
+    ! v_xc evaluation required.
     deallocate(vxc)
     !
   endif
@@ -843,7 +822,7 @@ SUBROUTINE write_species(h5_f)
   USE qeh5_base_module, ONLY : qeh5_open_group, qeh5_close, qeh5_add_attribute
   USE ions_base, ONLY : ntyp => nsp
   USE uspp_param, ONLY : nh, upf
-  USE uspp, ONLY : indv, nhtol, nhtolm, nhtoj
+  USE uspp, ONLY : indv, nhtol, nhtolm
   USE atom, ONLY : g => rgrid
   USE paw_variables, ONLY : okpaw
   USE paw_exx, ONLY : ke, PAW_init_fock_kernel, PAW_clean_fock_kernel
@@ -857,7 +836,7 @@ SUBROUTINE write_species(h5_f)
   integer :: nt, mesh, ncore
   logical :: any_paw
   real(DP), allocatable :: deltaC_Ha(:,:,:,:)
-  real(DP), allocatable :: dion_ha(:,:), v_ha(:)     ! Ha copies (schema 2)
+  real(DP), allocatable :: v_ha(:)                   ! Ha copies (schema 2)
   !
   if (.not.ionode) return
   !
@@ -890,52 +869,33 @@ SUBROUTINE write_species(h5_f)
     mesh = g(nt)%mesh
     call qeh5_add_attribute(h5_nt%id, "mesh", mesh)
     call qeh5_add_attribute(h5_nt%id, "kkbeta", upf(nt)%kkbeta)
-    call qeh5_add_attribute(h5_nt%id, "lmax", upf(nt)%lmax)
-    call qeh5_add_attribute(h5_nt%id, "lmax_rho", upf(nt)%lmax_rho)
     call qeh5_add_attribute(h5_nt%id, "nbeta", upf(nt)%nbeta)
     call qeh5_add_attribute(h5_nt%id, "nh", nh(nt))
-    call qeh5_add_attribute(h5_nt%id, "zp", upf(nt)%zp)
     !
     ! Radial grid
     call h5_write_vector_r(h5_nt, g(nt)%r(1:mesh), "r")
     call h5_write_vector_r(h5_nt, g(nt)%rab(1:mesh), "rab")
     !
-    ! Projector / partial-wave bookkeeping
+    ! Projector / partial-wave bookkeeping.
+    ! `beta` (radial u-form projectors) has no CoQui consumer TODAY but is
+    ! deliberately kept: it is the enabler for a native init_us_2-style
+    ! projector build (2026-07 converter audit). Dead-at-read datasets
+    ! (kbeta, species dion, qqq, qfunc, jjj, nhtoj + q_with_l/nqf/nqlc/
+    ! lmax/lmax_rho/zp attrs) are no longer written (schema 3).
     call h5_write_vector_int(h5_nt, upf(nt)%lll(1:upf(nt)%nbeta), "lll")
-    call h5_write_vector_int(h5_nt, upf(nt)%kbeta(1:upf(nt)%nbeta), "kbeta")
     call h5_write_mat_r(h5_nt, upf(nt)%beta(1:mesh,1:upf(nt)%nbeta), "beta")
-    allocate(dion_ha(upf(nt)%nbeta, upf(nt)%nbeta))
-    dion_ha = upf(nt)%dion(1:upf(nt)%nbeta,1:upf(nt)%nbeta) / e2   ! Ha (schema 2)
-    call h5_write_mat_r(h5_nt, dion_ha, "dion")
-    deallocate(dion_ha)
     !
-    ! ih → (l, lm, j) maps - per-species slices of global uspp tables
+    ! ih → (l, lm) maps - per-species slices of global uspp tables
     if (allocated(nhtolm)) &
       call h5_write_vector_int(h5_nt, nhtolm(1:nh(nt), nt), "nhtolm")
     if (allocated(nhtol)) &
       call h5_write_vector_int(h5_nt, nhtol(1:nh(nt), nt), "nhtol")
     if (allocated(indv)) &
       call h5_write_vector_int(h5_nt, indv(1:nh(nt), nt), "indv")
-    if (lspinorb .and. allocated(nhtoj)) &
-      call h5_write_vector_r(h5_nt, nhtoj(1:nh(nt), nt), "nhtoj")
     !
     ! Augmentation (USPP and PAW)
-    if (upf(nt)%tvanp .or. upf(nt)%tpawp) then
-      call h5_write_mat_r(h5_nt, &
-        upf(nt)%qqq(1:upf(nt)%nbeta,1:upf(nt)%nbeta), "qqq")
-      call qeh5_add_attribute(h5_nt%id, "q_with_l", &
-        merge(1, 0, upf(nt)%q_with_l))
-      call qeh5_add_attribute(h5_nt%id, "nqf", upf(nt)%nqf)
-      call qeh5_add_attribute(h5_nt%id, "nqlc", upf(nt)%nqlc)
-      if (allocated(upf(nt)%qfuncl)) &
-        call h5_write_tensor_r(h5_nt, upf(nt)%qfuncl, "qfuncl")
-      if (allocated(upf(nt)%qfunc)) &
-        call h5_write_mat_r(h5_nt, upf(nt)%qfunc, "qfunc")
-    endif
-    !
-    ! Spin-orbit per-species j_b
-    if (lspinorb .and. allocated(upf(nt)%jjj)) &
-      call h5_write_vector_r(h5_nt, upf(nt)%jjj(1:upf(nt)%nbeta), "jjj")
+    if ((upf(nt)%tvanp .or. upf(nt)%tpawp) .and. allocated(upf(nt)%qfuncl)) &
+      call h5_write_tensor_r(h5_nt, upf(nt)%qfuncl, "qfuncl")
     !
     ! AE/PS partial waves (PAW always; USPP only when generated --with-ae-wfc)
     if (upf(nt)%tpawp .or. upf(nt)%has_wfc) then
@@ -953,15 +913,10 @@ SUBROUTINE write_species(h5_f)
       call qeh5_add_attribute(h5_paw%id, "raug", upf(nt)%paw%raug)
       call qeh5_add_attribute(h5_paw%id, "iraug", upf(nt)%paw%iraug)
       call qeh5_add_attribute(h5_paw%id, "lmax_aug", upf(nt)%paw%lmax_aug)
-      call qeh5_add_attribute(h5_paw%id, "augshape", &
-        TRIM(upf(nt)%paw%augshape))
+      ! (schema 3) pfunc/ptfunc/augmom/oc/augshape/pfunc_rel/aewfc_rel are
+      ! no longer written: CoQui builds pair products and moments natively
+      ! from aewfc/pswfc/qfuncl (2026-07 converter audit).
       !
-      if (allocated(upf(nt)%paw%pfunc)) &
-        call h5_write_tensor_r(h5_paw, upf(nt)%paw%pfunc, "pfunc")
-      if (allocated(upf(nt)%paw%ptfunc)) &
-        call h5_write_tensor_r(h5_paw, upf(nt)%paw%ptfunc, "ptfunc")
-      if (allocated(upf(nt)%paw%augmom)) &
-        call h5_write_tensor_r(h5_paw, upf(nt)%paw%augmom, "augmom")
       if (allocated(upf(nt)%paw%ae_vloc)) then
         v_ha = upf(nt)%paw%ae_vloc / e2                                    ! Ha (schema 2)
         call h5_write_vector_r(h5_paw, v_ha, "ae_vloc")
@@ -969,8 +924,6 @@ SUBROUTINE write_species(h5_f)
       endif
       if (allocated(upf(nt)%paw%ae_rho_atc)) &
         call h5_write_vector_r(h5_paw, upf(nt)%paw%ae_rho_atc, "ae_rho_atc")
-      if (allocated(upf(nt)%paw%oc)) &
-        call h5_write_vector_r(h5_paw, upf(nt)%paw%oc, "oc")
       ! PS-side counterparts of ae_vloc / ae_rho_atc, needed by CoQui's
       ! reconstruction of the PAW static one-center D matrix
       ! (paw_init_keeq) without depending on QE's ddd_paw at runtime.
@@ -985,14 +938,6 @@ SUBROUTINE write_species(h5_f)
       endif
       if (allocated(upf(nt)%rho_atc)) &
         call h5_write_vector_r(h5_paw, upf(nt)%rho_atc, "rho_atc_ps")
-      !
-      ! SOC small-component data (only present on relativistic PAW datasets)
-      if (lspinorb) then
-        if (allocated(upf(nt)%paw%pfunc_rel)) &
-          call h5_write_tensor_r(h5_paw, upf(nt)%paw%pfunc_rel, "pfunc_rel")
-        if (allocated(upf(nt)%paw%aewfc_rel)) &
-          call h5_write_mat_r(h5_paw, upf(nt)%paw%aewfc_rel, "aewfc_rel")
-      endif
       !
       call qeh5_close(h5_paw)
       !
