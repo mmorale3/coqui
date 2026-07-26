@@ -79,6 +79,25 @@ cholesky::cholesky(mf::MF *mf_,
   utils::check(mf != nullptr, "cholesky::Null pointer.");
   utils::check(mf->has_orbital_set(), "Error in cholesky: Invalid mf type. ");
 
+  // Plan D4: this builder factorizes SMOOTH-grid pair densities only — no
+  // augmentation-charge (Q_ij) contribution — so for USPP/PAW the resulting
+  // ERIs silently miss the augmentation physics. Hard-abort until an
+  // augmented Cholesky path lands; use the THC ERI path (paw_aug) instead.
+  // Diagnostics that WANT the smooth-only reference (e.g. the paw_aug
+  // exchange tests) must opt in explicitly — nothing smooth-only ships
+  // silently.
+  if (mf->pp_type() == hamilt::pp_uspp_t or mf->pp_type() == hamilt::pp_paw_t) {
+    bool allow = io::get_value_with_default<bool>(pt, "allow_smooth_only_aug_pp", false);
+    utils::check(allow,
+                 "cholesky: Cholesky ERIs do not include USPP/PAW augmentation "
+                 "(smooth-grid pair densities only) and would be silently wrong "
+                 "for this mean-field. Use the THC ERI path (paw_aug) instead. "
+                 "(Diagnostic override: allow_smooth_only_aug_pp = true.)");
+    app_warning("cholesky: allow_smooth_only_aug_pp=true on a USPP/PAW "
+                "mean-field — the resulting ERIs are SMOOTH-ONLY (no "
+                "augmentation) and are for diagnostics, not production.");
+  }
+
   // maximize size of pool communicator for now, change if needed later
   utils::check( npools > 0 and npools <= mf->nkpts(), "Error: npools > nkpts");
   utils::check( mpi->comm.size()%npools == 0, "Oh-oh, bug.");
