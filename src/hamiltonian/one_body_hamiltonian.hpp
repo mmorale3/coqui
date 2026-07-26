@@ -426,6 +426,41 @@ auto Vexchange(mf::MF &mf, boost::mpi3::communicator &comm, pseudopot *psp,
   return detail::gen_Vexchange<MEM>(mf, comm, psp, k_range, b_range, psi, nij);
 }
 
+/**
+ * psi-taking overloads (full density matrix): identical to the nij overloads
+ * above but reuse a caller-provided distributed orbital set instead of
+ * re-reading it. Used by the SCF static-route evaluator (hamilt_eval_t),
+ * which caches psi across iterations. k_range/b_range must match the ranges
+ * psi was read with (full IBZ, full bands).
+ */
+template<MEMORY_SPACE MEM = HOST_MEMORY, nda::ArrayOfRank<4> Arr4_t>
+auto Vhartree(mf::MF &mf, boost::mpi3::communicator &comm, pseudopot *psp,
+              memory::darray_t<memory::array<MEM,ComplexType,4>, mpi3::communicator>& psi,
+              Arr4_t const& nij, nda::range k_range, nda::range b_range)
+{
+  utils::check(psp != nullptr, "Vhartree(psi): Missing pseudopot object.");
+  utils::check(k_range.first() == 0 && k_range.last() == mf.nkpts_ibz(),
+               "Vhartree(psi): requires full IBZ k_range.");
+  utils::check(b_range.first() == 0 && b_range.last() == mf.nbnd(),
+               "Vhartree(psi): requires full nbnd b_range.");
+  memory::array_view<MEM,ComplexType,3> *p3=nullptr;
+  return detail::gen_Vhartree<MEM>(mf,comm,psp,k_range,b_range,psi,p3,
+                                   std::addressof(nij),false);
+}
+
+template<MEMORY_SPACE MEM = HOST_MEMORY, nda::ArrayOfRank<4> Arr4_t>
+auto Vexchange(mf::MF &mf, boost::mpi3::communicator &comm, pseudopot *psp,
+               memory::darray_t<memory::array<MEM,ComplexType,4>, mpi3::communicator>& psi,
+               Arr4_t const& nij, nda::range k_range, nda::range b_range)
+{
+  utils::check(psp != nullptr, "Vexchange(psi): Missing pseudopot object.");
+  utils::check(k_range.first() == 0 && k_range.last() == mf.nkpts_ibz(),
+               "Vexchange(psi): requires full IBZ k_range.");
+  utils::check(b_range.first() == 0 && b_range.last() == mf.nbnd(),
+               "Vexchange(psi): requires full nbnd b_range.");
+  return detail::gen_Vexchange<MEM>(mf, comm, psp, k_range, b_range, psi, nij);
+}
+
 template<nda::MemoryArrayOfRank<4> Array_4D_t, nda::ArrayOfRank<3> Arr3_t>
 void set_Vexchange(mf::MF &mf, pseudopot *psp,
                    Arr3_t const& nii,

@@ -1,0 +1,111 @@
+/**
+ * ==========================================================================
+ * CoQuí: Correlated Quantum ínterface
+ *
+ * Copyright (c) 2022-2025 Simons Foundation & The CoQuí developer team
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ * ==========================================================================
+ */
+
+namespace methods {
+  namespace solvers {
+
+    /*
+     * Direct (hamiltonian-route) static build: V_H and/or exact-exchange K
+     * from the current density matrix via hamilt::Vhartree / hamilt::Vexchange
+     * (notes/static_route_selection_plan.md, invariants I5/I7).
+     *
+     * Contract identical to the THC/Cholesky overloads: sF_skij is
+     * zero-initialized and receives ONLY the requested static terms; K is
+     * SIGNED (F = H0 + V_H + K); the gygi finite-size correction is the
+     * shared, route-free HF_K_correction (notes/static_route_gygi_note.md).
+     * Dm_skij is the same array the ERI overloads consume — route
+     * equivalence holds for identical input by I7.
+     */
+    template<nda::MemoryArray AF_t>
+    void hf_t::evaluate(sArray_t<AF_t> &sF_skij, const nda::MemoryArrayOfRank<4> auto &Dm_skij,
+                        Hamilt_ERI auto &&heval, const nda::MemoryArrayOfRank<4> auto &S_skij,
+                        bool hartree, bool exchange) {
+      auto MF = heval.MF();
+      auto mpi = heval.mpi();
+      auto& comm = mpi->comm;
+
+      long ns = MF->nspin();
+      long nkpts_ibz = MF->nkpts_ibz();
+      long nbnd = MF->nbnd();
+      utils::check(Dm_skij.extent(0) == ns and Dm_skij.extent(1) == nkpts_ibz and
+                   Dm_skij.extent(2) == nbnd and Dm_skij.extent(3) == nbnd,
+                   "hamilt-hf: Shape mismatch: Dm_skij");
+      utils::check(sF_skij.shape()[1] == nkpts_ibz, "hamilt-hf: Shape mismatch: sF_skij");
+      utils::check(S_skij.extent(1) == nkpts_ibz, "hamilt-hf: Shape mismatch: S_skij");
+      utils::check(MF->npol() == 1, "hamilt-hf: only npol == 1 is supported.");
+
+      sF_skij.set_zero();
+      if (not hartree and not exchange) return;
+
+      // The direct v_x(nij) requires a no-symmetry mesh (plan phase 4 lifts
+      // this); the Hartree path handles symmetry via the full-BZ becsum lift.
+      if (exchange)
+        utils::check(nkpts_ibz == MF->nkpts(),
+            "hamilt-hf: direct-route exchange (interaction_hf/interaction_exchange "
+            "of type 'hamilt') requires a no-symmetry k-mesh (nkpts_ibz == nkpts); "
+            "use the ERI route on symmetry-reduced meshes.");
+
+      app_log(2, "Evaluation of J/K matrix (direct hamiltonian route)\n");
+
+      _Timer.start("TOTAL");
+      auto* psp = heval.psp();
+      auto& psi = heval.psi(comm);
+      nda::range k_rng(nkpts_ibz), b_rng(nbnd);
+
+      // Accumulate a distributed (s,k,i,j) result into sF_skij: the disjoint
+      // local blocks land in a zeroed temp shm window (disjoint also within a
+      // node), the windows are summed across nodes, and node roots add into
+      // sF — mirroring the scf_loop hartree/exchange slot composition.
+      auto add_dist = [&](auto const& dV) {
+        auto sT = math::shm::make_shared_array<AF_t>(
+            *sF_skij.communicator(), *sF_skij.internode_comm(),
+            *sF_skij.node_comm(), sF_skij.shape());
+        sT.set_zero();
+        sT.win().fence();
+        auto loc = sT.local();
+        loc(dV.local_range(0), dV.local_range(1), dV.local_range(2), dV.local_range(3))
+            += dV.local();
+        sT.win().fence();
+        sT.all_reduce();
+        if (sF_skij.node_comm()->root())
+          sF_skij.local() += sT.local();
+        sF_skij.communicator()->barrier();
+      };
+
+      if (hartree) {
+        _Timer.start("HARTREE");
+        auto dJ = hamilt::Vhartree<HOST_MEMORY>(*MF, comm, psp, psi, Dm_skij,
+                                                k_rng, b_rng);
+        add_dist(dJ);
+        _Timer.stop("HARTREE");
+      }
+      if (exchange) {
+        _Timer.start("EXCHANGE");
+        auto dK = hamilt::Vexchange<HOST_MEMORY>(*MF, comm, psp, psi, Dm_skij,
+                                                 k_rng, b_rng);
+        add_dist(dK);   // K is SIGNED: F = H0 + V_H + K
+        HF_K_correction(sF_skij, Dm_skij, S_skij, MF->madelung());
+        _Timer.stop("EXCHANGE");
+      }
+      _Timer.stop("TOTAL");
+    }
+
+  } // solvers
+} // methods

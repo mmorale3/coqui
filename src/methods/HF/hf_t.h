@@ -89,6 +89,24 @@ namespace methods {
                     const nda::MemoryArrayOfRank<4> auto &S_skij,
                     bool hartree=true, bool exchange=true);
 
+      /* Direct (hamiltonian-route) static build */
+      /**
+       * V_H and/or exact-exchange K via hamilt::Vhartree / hamilt::Vexchange
+       * (the "hamilt" interaction type, notes/static_route_selection_plan.md).
+       * Same contract as the ERI overloads: sF_skij is zero-initialized and
+       * receives only the requested static terms (K SIGNED); gygi finite-size
+       * correction via the shared HF_K_correction. Requires a no-symmetry
+       * k-mesh for the exchange term (plan phase 4 lifts this) and npol==1.
+       * @param Dm_skij - [INPUT] density matrix in the primary basis (same
+       *                  array the ERI overloads consume; route equivalence I7)
+       * @param heval   - [INPUT] hamilt_eval_t (shared pseudopot + cached psi)
+       */
+      template<nda::MemoryArray AF_t>
+      void evaluate(sArray_t<AF_t> &sF_skij,
+                    const nda::MemoryArrayOfRank<4> auto &Dm_skij, Hamilt_ERI auto &&heval,
+                    const nda::MemoryArrayOfRank<4> auto &S_skij,
+                    bool hartree=true, bool exchange=true);
+
       /**
        * Coulomb matrix J from Cholesky-type ERIs
        * @param Dm_skij - [INPUT] density matrix in the primary basis

@@ -42,6 +42,7 @@
 
 #include "methods/ERI/detail/concepts.hpp"
 #include "methods/ERI/eri_storage_e.hpp"
+#include "methods/ERI/paw_exx_options_parse.hpp"
 #include "methods/ERI/thc.h"
 #include "methods/ERI/chol_reader_t.hpp"
 #include "mean_field/MF.hpp"
@@ -137,27 +138,10 @@ namespace methods {
           _paw_isdf_metric = (m == "l2") ? hamilt::paw::isdf_metric::L2
                                          : hamilt::paw::isdf_metric::Coulomb;
         }
-        // PAW valence-valence exchange options (see hamilt::paw_exx_options).
-        // NB: core-valence exchange is NOT a toml option — it is auto-detected
-        // from the h5 content in the pseudopot constructor (see cv_exchange_e).
-        // Scaffolding: shape-restored THC compensation is declared but not yet
-        // implemented; validate() (below) aborts with a clear message if requested.
-        {
-          std::string vv = io::tolower_copy(io::get_value_with_default<std::string>(pt, "vv_compensation", "moment"));
-          utils::check(vv == "moment" || vv == "shape",
-            "thc_reader_t: unknown vv_compensation = '{}' (choices: 'moment', 'shape').", vv);
-          _exx_opts.vv_compensation = (vv == "shape") ? hamilt::vv_compensation_e::shape
-                                                       : hamilt::vv_compensation_e::moment;
-          // Max angular momentum L of the compensation-charge multipoles.
-          // Default -1 = full 2*lmax per species (complete augmentation, cf.
-          // VASP LMAXPAW); a value >= 0 caps it (cf. VASP LMAXFOCK).
-          _exx_opts.aug_lmax = io::get_value_with_default<int>(pt, "aug_lmax", -1);
-          // Δk-keyed Qfac cache budget for the direct v_x path (plan C3);
-          // propagated to the shared pseudopot with the rest of the options.
-          _exx_opts.qfac_cache_mb =
-              io::get_value_with_default<int>(pt, "qfac_cache_mb", 256);
-          _exx_opts.validate(/*in_thc=*/true, "thc_reader_t [interaction.thc]");
-        }
+        // PAW valence-valence exchange options: shared toml surface with the
+        // [interaction.hamilt] block (see paw_exx_options_parse.hpp).
+        _exx_opts = parse_paw_exx_options(pt, /*in_thc=*/true,
+                                          "thc_reader_t [interaction.thc]");
       } else {
         _paw_aug = false;
         _paw_onsite = false;
