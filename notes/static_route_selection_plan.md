@@ -29,15 +29,25 @@ out of the existing slot structure.
   direct K. Derive; short note in notes/; acceptance = matched-div exchange
   ERI-vs-direct on the Si fixture to THC tolerance. **The correct gygi
   implementation for the direct route is a DELIVERABLE of this plan**
-  (lands in phase 1.2 + parity test 3.6); the `ignore_g0`-only state with a
-  gygi error is an interim development guard only, not an accepted end
-  state.
+  (lands in phase 1.2 + parity test 3.6).
+  **RESOLVED 2026-07-26** (`static_route_gygi_note.md`): gygi in the ERI
+  route is applied entirely at the operator level by the shared
+  `hf_t::HF_K_correction` (−madelung·S·Dm·S, div-gated, route-free);
+  ERI heads are ignore_g0 by convention and I7 certifies head parity.
+  ⇒ the direct route calls the SAME correction unmodified — gygi works
+  from day one, no interim gygi guard needed.
 - **0.2 pseudopot sharing.** `simple_dyson` owns a `pseudopot`;
   `thc_reader_t` builds one too. `hamilt_eval_t` must share (shared_ptr)
   rather than rebuild — duplicate PAW runtime caches are expensive and the
   exx options must have a single source (`pseudopot::set_exx_options`).
   Decide the passing pattern by inspecting how thc_reader/dyson obtain
   theirs today.
+  **RESOLVED 2026-07-26**: `hamilt::make_pseudopot(*MF)` is already the
+  lazy shared-acquisition path (MF::get/set_pseudopot, MF.hpp:378;
+  simple_dyson.h:66 and thc_reader_t.hpp:268–278 both use it).
+  `hamilt_eval_t` uses the same call; on exx options it must CHECK
+  against already-set options on the shared pseudopot and error on
+  conflict (no last-writer-wins).
 
 ## Phase 1 — `hamilt_eval_t` + `hf_t` overload
 
@@ -81,7 +91,7 @@ out of the existing slot structure.
   dynamics bit-identical.
 - **3.4** Per-term mixing: hartree=thc + exchange=hamilt, and the inverse.
 - **3.5** Guard tests: symmetric-mesh error (interim, retired by phase 4);
-  corr-slot rejection; gygi rejection pre-0.1.
+  corr-slot rejection; exx-options conflict rejection (0.2).
 - **3.6** gygi-parity test (required deliverable, closes 0.1): direct-route
   gygi vs ERI-route gygi, F_skij and energies to THC tolerance.
 
