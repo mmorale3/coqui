@@ -331,14 +331,23 @@ namespace bdft_tests {
       REQUIRE(std::abs(ec_sec - ec_glo) <= 1e-5 + 0.05 * std::abs(ec_glo - ec_p_s));
     }
 
-    // ---- REPRODUCTION (secondary + sym mesh, TWO iterations): does the self-consistent
-    // G_CC stay symmetry-consistent past iter-1 in the secondary path? C=[1,3) is
-    // symmetry-CLOSED on qe_lih222_sym (D-leak = 0, gold block above) and LiH-222
-    // secondary tracks global to ~1e-5 at 1 iter (block above) -- so BOTH the window-
-    // leakage and the basis-crudeness confounds are removed. A large secondary
-    // G-rotation residual here (vs global's ~machine value) isolates a secondary-path
-    // symmetry-unfolding defect in the self-consistent vertex feedback -- the same
-    // signature seen in the sec_scgwvtx_M8 production run (iter-2 residual 5e-9 -> 0.49).
+    // ---- SECONDARY vs GLOBAL past iteration 1 (secondary + sym mesh, TWO iterations).
+    // C = [1,3) is symmetry-CLOSED on qe_lih222_sym (D-leak = 0, gold block above) and
+    // LiH-222 secondary tracks global to ~1e-5 at 1 iteration, so both the window-leakage
+    // and basis-crudeness confounds are removed: this isolates the secondary path itself.
+    //
+    // HISTORICAL NOTE (2026-07-25) -- this block was written to chase the Si production
+    // signature "iter-2 G-rotation residual 5e-9 -> 0.49", on the hypothesis that it was a
+    // secondary-path symmetry-unfolding defect. That hypothesis is REFUTED, and the
+    // residual it keys on is NOT a defect indicator at all:
+    //   * the residual has a plain-scGW baseline of the same order (LiH-222 1.6e-3 with the
+    //     vertex OFF; Si M8 3.3e-4 on the converged no-vertex G) -- it is a D-matrix
+    //     accuracy floor, and 0.49 is a CONSEQUENCE of the blow-up, not its cause;
+    //   * the divergence reproduces identically on a symmetry-FREE mesh, and on a
+    //     symmetry-reduced twin of the same mesh the two agree to 3.5e-6.
+    // See notes/vertex_divergence_diagnosis.md section 4.2. The block is kept because
+    // secondary-vs-global agreement past one iteration is worth pinning on its own -- but
+    // do not read a large residual here as evidence of a symmetry bug.
     {
       auto [ehf_sec2, ec_sec2, lsec2] = run("qe_lih222_sym", nda::range(1, 3), 2, "secondary");
       const double grot_sec2 = last_grot;
