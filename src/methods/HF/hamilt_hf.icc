@@ -54,14 +54,6 @@ namespace methods {
       sF_skij.set_zero();
       if (not hartree and not exchange) return;
 
-      // The direct v_x(nij) requires a no-symmetry mesh (plan phase 4 lifts
-      // this); the Hartree path handles symmetry via the full-BZ becsum lift.
-      if (exchange)
-        utils::check(nkpts_ibz == MF->nkpts(),
-            "hamilt-hf: direct-route exchange (interaction_hf/interaction_exchange "
-            "of type 'hamilt') requires a no-symmetry k-mesh (nkpts_ibz == nkpts); "
-            "use the ERI route on symmetry-reduced meshes.");
-
       app_log(2, "Evaluation of J/K matrix (direct hamiltonian route)\n");
 
       _Timer.start("TOTAL");

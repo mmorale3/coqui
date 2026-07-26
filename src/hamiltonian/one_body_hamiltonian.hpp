@@ -375,8 +375,9 @@ auto Vhartree(mf::MF &mf, boost::mpi3::communicator &comm, pseudopot *psp,
  *
  * Two overloads: diagonal occupations (rank-3 nii) and the full density
  * matrix (rank-4 nij). The nij path generalizes via the natural-orbital
- * decomposition (see hamilt::v_x / hamilt::paw::v_x nij overloads); it
- * currently requires a no-symmetry mesh (nk_ibz == nk).
+ * decomposition (see hamilt::v_x / hamilt::paw::v_x nij overloads);
+ * symmetry-reduced meshes are handled by the View-2 band-matrix lift
+ * (notes/static_route_nij_symmetry_note.md).
  */
 template<MEMORY_SPACE MEM = HOST_MEMORY, nda::ArrayOfRank<3> Arr3_t>
 auto Vexchange(mf::MF &mf, boost::mpi3::communicator &comm, pseudopot *psp,

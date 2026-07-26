@@ -685,8 +685,11 @@ inline void v_x(utils::mpi_context_t<boost::mpi3::communicator,
 // contraction as the diagonal kernel, so K[nij] inherits its conventions
 // (including the one-center prefactor currently under review).
 //
-// Requires a no-symmetry mesh (nk_ibz == nk) so nij(s,kq) is the full-BZ
-// density matrix directly; symmetry-reduced nij is a follow-up.
+// Symmetry-reduced meshes: the full-BZ inner states are the exactly rotated
+// IBZ states (psi_r_full G-space lift + cached Pskna_full_bz), so the band
+// matrix at kq = S·k̃ is the UNCHANGED IBZ matrix nij(s,k̃), conjugated at
+// time-reversal points — same View-2 rule as compute_becsum_full_symm;
+// derivation in notes/static_route_nij_symmetry_note.md.
 // ===========================================================================
 inline void v_x(utils::mpi_context_t<boost::mpi3::communicator,
                                      boost::mpi3::shared_communicator>& mpi,
@@ -726,9 +729,6 @@ inline void v_x(utils::mpi_context_t<boost::mpi3::communicator,
   long nk      = kp_to_ibz.shape(0);
   long nnr     = mesh(0)*mesh(1)*mesh(2);
 
-  utils::check(nk == nk_ibz,
-      "v_x_paw(nij): symmetry-reduced k-mesh not supported yet (need "
-      "nk_ibz==nk); the full-BZ density-matrix transform is a follow-up.");
   utils::check(nij.extent(0) == nspin && nij.extent(1) == nk_ibz &&
                nij.extent(2) == nbnd && nij.extent(3) == nbnd,
       "v_x_paw(nij): nij shape mismatch");
@@ -820,9 +820,15 @@ inline void v_x(utils::mpi_context_t<boost::mpi3::communicator,
   phi_all() = ComplexType(0.0); Pnat_all() = ComplexType(0.0); w_all() = 0.0;
   for (long s = 0; s < nspin; ++s)
     for (long kq = 0; kq < nk; ++kq) {
+      // Band matrix at full-BZ kq: IBZ matrix in the lifted-state basis,
+      // conjugated at trev points (View-2, as in compute_becsum_full_symm).
+      long kq_ibz = (long)kp_to_ibz(kq);
+      bool trev_q = (bool)kp_trev(kq);
       nda::array<ComplexType,2> nblk(nbnd, nbnd);
       for (long a = 0; a < nbnd; ++a)
-        for (long b = 0; b < nbnd; ++b) nblk(a, b) = nij_host(s, kq, a, b);
+        for (long b = 0; b < nbnd; ++b)
+          nblk(a, b) = trev_q ? std::conj(nij_host(s, kq_ibz, a, b))
+                              : nij_host(s, kq_ibz, a, b);
       auto [w, U] = ::hamilt::detail::natural_occupations(nblk);
       for (long p = 0; p < nbnd; ++p) w_all(s, kq, p) = w(p);
       for (long p = 0; p < nbnd; ++p)

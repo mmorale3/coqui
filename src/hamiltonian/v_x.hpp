@@ -361,8 +361,11 @@ void v_x(mpi_context_t<communicator,shared_communicator> &mpi,
  * inner "occupied" index runs over natural orbitals χ_p (occupation w_p)
  * instead of canonical bands. The outer (k_p) orbitals stay canonical.
  *
- * Requires a no-symmetry mesh (nk_ibz == nk) so nij(s,kq) is the density
- * matrix at the full-BZ point directly; symmetry-reduced nij is a follow-up.
+ * Symmetry-reduced meshes: since the full-BZ states here ARE the exactly
+ * rotated IBZ states (the psi_r_full G-space lift below), the band matrix at
+ * kq = S·k̃ is the UNCHANGED IBZ matrix nij(s,k̃), complex-conjugated at
+ * time-reversal points — same View-2 rule as compute_becsum_full_symm;
+ * derivation in notes/static_route_nij_symmetry_note.md.
  */
 void v_x(mpi_context_t<communicator,shared_communicator> &mpi,
          pots::potential_t& vG,
@@ -393,9 +396,6 @@ void v_x(mpi_context_t<communicator,shared_communicator> &mpi,
   long nk      = kp_to_ibz.shape(0);
   long nnr     = mesh(0)*mesh(1)*mesh(2);
 
-  utils::check(nk == nk_ibz,
-      "v_x(nij): symmetry-reduced k-mesh not supported yet (need nk_ibz==nk); "
-      "the full-BZ density matrix transform under symmetry is a follow-up.");
   utils::check(nij_.extent(0) == nspin && nij_.extent(1) == nk_ibz &&
                nij_.extent(2) == nbnd && nij_.extent(3) == nbnd,
       "v_x(nij): nij shape mismatch");
@@ -443,16 +443,23 @@ void v_x(mpi_context_t<communicator,shared_communicator> &mpi,
   mpi.comm.all_reduce_in_place_n(psi_r_full.data(), psi_r_full.size(), std::plus<>{});
 
   // Natural orbitals for the inner index: φ_all(s,kq,p,r) = Σ_a U_ap ψ_a(kq,r),
-  // occupations w_all(s,kq,p). Built for all (s, kq) up front (kq_ibz==kq).
+  // occupations w_all(s,kq,p). Built for all (s, kq) up front. The band
+  // matrix at full-BZ kq is the IBZ matrix in the lifted-state basis,
+  // conjugated at time-reversal points (View-2; same rule as
+  // compute_becsum_full_symm, notes/static_route_nij_symmetry_note.md).
   auto nij_host = nda::to_host(nij_);
   nda::array<ComplexType, 4> phi_all(nspin, nk, nbnd, nnr);
   nda::array<double, 3> w_all(nspin, nk, nbnd);
   phi_all() = ComplexType(0.0); w_all() = 0.0;
   for (long s = 0; s < nspin; ++s) {
     for (long kq = 0; kq < nk; ++kq) {
+      long kq_ibz = (long)kp_to_ibz(kq);
+      bool trev_q = (bool)kp_trev(kq);
       nda::array<ComplexType,2> nblk(nbnd, nbnd);
       for (long a = 0; a < nbnd; ++a)
-        for (long b = 0; b < nbnd; ++b) nblk(a, b) = nij_host(s, kq, a, b);
+        for (long b = 0; b < nbnd; ++b)
+          nblk(a, b) = trev_q ? std::conj(nij_host(s, kq_ibz, a, b))
+                              : nij_host(s, kq_ibz, a, b);
       auto [w, U] = detail::natural_occupations(nblk);
       for (long p = 0; p < nbnd; ++p) w_all(s, kq, p) = w(p);
       for (long p = 0; p < nbnd; ++p)

@@ -1,5 +1,16 @@
 # Static-route selection: ERI vs hamiltonian for Hartree/exchange in SCF
 
+STATUS 2026-07-26: ALL PHASES LANDED. Phase 1 b966bae, phase 2 1692c98,
+phase 3 9ce5018 (in-SCF I7 acceptance: route equivalence at THC scale on
+PAW/USPP/NCPP, mixing, gygi parity, GW hf-slot with BIT-IDENTICAL dynamics;
+plan-3.5 abort guards not assertable in-process — positive complements
+covered), phase 4 (this commit): View-2 general-nij lift in v_x(nij)
+smooth+PAW (derivation notes/static_route_nij_symmetry_note.md), interim
+sym-mesh exchange guard retired, sym-mesh route equivalence + sym-vs-nosym
+invariance green. NOTE: phase-4.1 as written was STALE — the general-nij
+full-BZ becsum (compute_becsum_full_symm) was already implemented; only its
+certifying tests were missing.
+
 Decided 2026-07-26 (mechanism option 1 of 3, user-selected): the direct
 (`hamiltonian`) route becomes a **new interaction type** filling the existing
 static ERI slots. This is the "future `set_H` route-selection project" of

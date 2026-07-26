@@ -11,6 +11,19 @@ printed into context at session start by a SessionStart hook).
 ## STATUS
 
 REMAINING TO COMPLETE THE PHASE (2026-07-26 session):
+- **Static-route selection COMPLETE (2026-07-26, phases 0-4)**: the
+  "future set_H route-selection project" (I5/I7, workstream-D preamble) is
+  done — new `[interaction.hamilt]` interaction type fills the static ERI
+  slots (interaction_hf/hartree/exchange; hard-rejected in the dynamic
+  slot); hf_t direct-route overload via hamilt::Vhartree/Vexchange with
+  the shared route-free gygi HF_K_correction; in-SCF I7 acceptance at THC
+  scale on PAW/USPP/NCPP + per-term mixing + GW hf-slot (dynamics
+  bit-identical); View-2 general-nij symmetry lift in v_x(nij) (derivation
+  notes/static_route_nij_symmetry_note.md) — sym meshes fully supported in
+  the direct route (the "nij becsum still open" note was stale:
+  compute_becsum_full_symm already handled general nij; tests now certify
+  it). Plan: notes/static_route_selection_plan.md; commits b966bae,
+  1692c98, 9ce5018, +phase-4.
 - **Converter-audit implementation LANDED (2026-07-26, schema 3)**: both
   converters stop writing dead-at-read data (species kbeta/qqq/dion/qfunc/
   q_with_l/nqf/nqlc/lmax/lmax_rho/zp/jjj/nhtoj attrs+datasets, paw pfunc/

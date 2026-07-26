@@ -95,8 +95,9 @@ namespace methods {
        * (the "hamilt" interaction type, notes/static_route_selection_plan.md).
        * Same contract as the ERI overloads: sF_skij is zero-initialized and
        * receives only the requested static terms (K SIGNED); gygi finite-size
-       * correction via the shared HF_K_correction. Requires a no-symmetry
-       * k-mesh for the exchange term (plan phase 4 lifts this) and npol==1.
+       * correction via the shared HF_K_correction. Symmetry-reduced meshes
+       * are supported (View-2 nij lift, static_route_nij_symmetry_note.md);
+       * requires npol==1.
        * @param Dm_skij - [INPUT] density matrix in the primary basis (same
        *                  array the ERI overloads consume; route equivalence I7)
        * @param heval   - [INPUT] hamilt_eval_t (shared pseudopot + cached psi)

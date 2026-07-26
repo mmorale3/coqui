@@ -51,13 +51,17 @@
  * of K, div correction) are all gross by comparison.
  *
  * Guard behavior (plan 3.5) that ends in utils::check -> APP_ABORT -> MPI_Abort
- * (sym-mesh exchange rejection, exx-options conflict, hamilt in the dynamic
- * slot) is NOT testable in-process — consistent with the codebase-wide absence
- * of THROWS-style tests. The positive complements are covered here instead:
- * sym-mesh direct HARTREE is admissible and route-equivalent, and identical
- * exx options share a single pseudopot. The dynamic-slot rejection lives in
- * main.cpp (utils::check on eri_type=="hamilt") and is additionally enforced
- * at compile time: no scf_loop instantiation has hamilt_eval_t in corr.
+ * (exx-options conflict, hamilt in the dynamic slot) is NOT testable
+ * in-process — consistent with the codebase-wide absence of THROWS-style
+ * tests. The positive complements are covered here instead; the dynamic-slot
+ * rejection lives in main.cpp (utils::check on eri_type=="hamilt") and is
+ * additionally enforced at compile time: no scf_loop instantiation has
+ * hamilt_eval_t in corr.
+ *
+ * Phase 4 (symmetry in the nij path): the interim sym-mesh exchange guard is
+ * RETIRED — the route-equivalence battery runs on the symmetric mesh too, and
+ * hamilt_hf_sym_vs_nosym pins the View-2 general-nij lift (becsum + v_x,
+ * notes/static_route_nij_symmetry_note.md) against the nosym fixture.
  */
 
 namespace bdft_tests {
@@ -170,6 +174,37 @@ namespace bdft_tests {
     SECTION("lih222_paw")  { check_routes("qe_lih222_paw",  1e-4); }
     SECTION("lih222_uspp") { check_routes("qe_lih222_uspp", 1e-4); }
     SECTION("lih222_ncpp") { check_routes("qe_lih222",      1e-4); }
+    // Symmetry-reduced mesh (plan 4.3b): same battery; iterations >= 2 have a
+    // non-diagonal Dm, exercising the View-2 general-nij lift in BOTH the
+    // direct Hartree (becsum) and the direct exchange.
+    SECTION("lih222_paw_sym") { check_routes("qe_lih222_paw_sym", 1e-4); }
+  }
+
+  TEST_CASE("hamilt_hf_sym_vs_nosym", "[methods][hamilt][hf][qe][paw]") {
+    // Plan 4.3a: sym-vs-nosym invariance of the PURELY direct static route
+    // (hf slot = hamilt; the thc corr slot is typed but never evaluated by the
+    // HF-only solver). Same physical system, symmetry on/off — e_hf must
+    // agree to the cross-fixture consistency of the two QE runs (1e-5, the
+    // same scale the THC tests use for shared sym/nosym references).
+    auto& mpi_context = utils::make_unit_test_mpi_context();
+    imag_axes_ft::IAFT ft(1000, 1.2, imag_axes_ft::ir_source);
+    int const niter = 3;
+
+    auto run_direct = [&](std::string mf_id, std::string prefix) {
+      auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, mf_id));
+      thc_reader_t thc(mf, make_thc_reader_ptree(mf->nbnd()*20, "", "incore", "", "bdft",
+                                                 1e-10, mf->ecutrho(), 1, 1024));
+      hamilt_eval_t heval(mf, ptree{});
+      solvers::hf_t hf(methods::ignore_g0);
+      auto eri = mb_eri_t(heval, thc);
+      return run_hf_scf(mpi_context, mf, eri, hf, ft, prefix, niter).e_hf;
+    };
+
+    double e_nosym = run_direct("qe_lih222_paw",     "cq_dir_nosym");
+    double e_sym   = run_direct("qe_lih222_paw_sym", "cq_dir_sym");
+    app_log(1, "[sym-vs-nosym direct] e_hf nosym = {:.10f}  sym = {:.10f}  |diff| = {:.3e}",
+            e_nosym, e_sym, std::abs(e_nosym - e_sym));
+    VALUE_EQUAL(e_sym, e_nosym, 1e-5);
   }
 
   TEST_CASE("hamilt_hf_gygi_parity", "[methods][hamilt][hf][qe][paw]") {
@@ -199,10 +234,10 @@ namespace bdft_tests {
   }
 
   TEST_CASE("hamilt_hf_sym_hartree", "[methods][hamilt][hf][qe][paw]") {
-    // Positive scope test for the phase-1 guard: on a symmetry-reduced mesh
-    // the direct-route HARTREE term is admissible (full-BZ becsum lift,
-    // compute_becsum_full_symm) and must match the THC Hartree; the direct
-    // EXCHANGE stays guarded (APP_ABORT) until plan phase 4 lifts it.
+    // Component-level route equivalence on a symmetry-reduced mesh with a
+    // diagonal (occupation) density matrix: direct HARTREE (full-BZ becsum
+    // lift) and — since the phase-4 View-2 nij lift — direct EXCHANGE must
+    // both match their THC counterparts.
     auto& mpi_context = utils::make_unit_test_mpi_context();
     auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_lih222_paw_sym"));
     REQUIRE(mf->nkpts_ibz() < mf->nkpts());
@@ -232,6 +267,15 @@ namespace bdft_tests {
     nda::array<ComplexType,4> J_thc(sJ_thc.local()), J_ham(sJ_ham.local());
     app_log(1, "[sym hartree] max|dJ| = {:.3e}", max_abs_diff(J_thc, J_ham));
     ARRAY_EQUAL(J_ham, J_thc, 1e-4);
+
+    auto sK_thc = make_shared_array<array_view_4d_t>(*mpi_context, {ns, nk, nb, nb});
+    auto sK_ham = make_shared_array<array_view_4d_t>(*mpi_context, {ns, nk, nb, nb});
+    hf.evaluate(sK_thc, occ4d, thc, sS_skij.local(), false, true);
+    hf.evaluate(sK_ham, occ4d, heval, sS_skij.local(), false, true);
+
+    nda::array<ComplexType,4> K_thc(sK_thc.local()), K_ham(sK_ham.local());
+    app_log(1, "[sym exchange] max|dK| = {:.3e}", max_abs_diff(K_thc, K_ham));
+    ARRAY_EQUAL(K_ham, K_thc, 1e-4);
   }
 
   TEST_CASE("hamilt_exx_options_sharing", "[methods][hamilt][hf][qe][paw]") {
