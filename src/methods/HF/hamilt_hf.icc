@@ -69,6 +69,13 @@ namespace methods {
       auto& psi = heval.psi(comm);
       nda::range k_rng(nkpts_ibz), b_rng(nbnd);
 
+      // Normalize the density matrix to a concrete owning array: the
+      // pseudopot::add_Hartree/add_exchange member templates are explicitly
+      // instantiated (pseudopot.cpp) for the owning-array density type, not
+      // for every shm-view flavor reaching this overload. One O(ns·nk·nbnd²)
+      // copy per call — negligible next to the FFT work.
+      nda::array<ComplexType,4> Dm_copy(Dm_skij);
+
       // Accumulate a distributed (s,k,i,j) result into sF_skij: the disjoint
       // local blocks land in a zeroed temp shm window (disjoint also within a
       // node), the windows are summed across nodes, and node roots add into
@@ -91,14 +98,14 @@ namespace methods {
 
       if (hartree) {
         _Timer.start("HARTREE");
-        auto dJ = hamilt::Vhartree<HOST_MEMORY>(*MF, comm, psp, psi, Dm_skij,
+        auto dJ = hamilt::Vhartree<HOST_MEMORY>(*MF, comm, psp, psi, Dm_copy,
                                                 k_rng, b_rng);
         add_dist(dJ);
         _Timer.stop("HARTREE");
       }
       if (exchange) {
         _Timer.start("EXCHANGE");
-        auto dK = hamilt::Vexchange<HOST_MEMORY>(*MF, comm, psp, psi, Dm_skij,
+        auto dK = hamilt::Vexchange<HOST_MEMORY>(*MF, comm, psp, psi, Dm_copy,
                                                  k_rng, b_rng);
         add_dist(dK);   // K is SIGNED: F = H0 + V_H + K
         HF_K_correction(sF_skij, Dm_skij, S_skij, MF->madelung());

@@ -319,6 +319,61 @@ namespace methods {
 
 
   /*
+   * Register a direct-route static evaluator from an [interaction.hamilt]
+   * block (notes/static_route_selection_plan.md). Mirrors add_thc; the
+   * evaluator holds only the mf + exx options (pseudopot/orbitals lazy).
+   */
+  template<typename comm_t>
+  std::string add_hamilt(const std::shared_ptr<utils::mpi_context_t<comm_t>> &mpi, ptree const& pt,
+                         std::map<std::string, std::shared_ptr<mf::MF>> &mf_list,
+                         std::map<std::string,std::tuple<std::string,std::unique_ptr<hamilt_eval_t>>> &hamilt_list)
+  {
+    static int unique_id = 0;
+    std::string name;
+    name = io::get_value_with_default<std::string>(pt,"name", "hamilt_AaBbCcDd_"+std::to_string(++unique_id));
+    utils::check(not hamilt_list.contains(name), "interaction::hamilt: Unique name are required: {}",name);
+    auto mf_name = mf::get_mf(mpi, pt, mf_list);
+    hamilt_list.emplace(name,std::make_tuple(
+        mf_name, std::move(std::make_unique<hamilt_eval_t>(mf_list[mf_name], pt))));
+    return name;
+  };
+
+  template<typename comm_t>
+  std::optional<std::string> get_hamilt(
+      const std::shared_ptr<utils::mpi_context_t<comm_t>> &mpi,
+      ptree const& base_pt, std::map<std::string, std::shared_ptr<mf::MF>> &mf_list,
+      std::map<std::string,std::tuple<std::string,std::unique_ptr<hamilt_eval_t>>> &hamilt_list,
+      std::string eri_tag="interaction")
+  {
+    bool found = false;
+    std::string name;
+    for(auto const& it : base_pt)
+    {
+      if (it.first == eri_tag) {
+        ptree pt = it.second;
+        auto v = pt.get_value_optional<std::string>();
+        if(v.has_value() and *v != "") {
+          name = *v;
+          if(hamilt_list.contains(name)) {
+            found = true;
+            break;
+          }
+        } else {
+          auto type = io::get_value<std::string>(pt,"type",
+			"interaction - missing input element: type");
+          if(type=="hamilt") {
+            utils::check(not found, "Error: Only 1 interaction input block allowed.");
+            name = add_hamilt(mpi,pt,mf_list,hamilt_list);
+            found=true;
+            break;
+          }
+        }
+      }
+    }
+    return found ? std::optional<std::string>{name} : std::nullopt;
+  };
+
+  /*
    * Get the name and the type of the integral block
    * @return std::tuple(eri_name, eri_type)
    */
@@ -330,10 +385,32 @@ namespace methods {
                      std::string eri_tag = "interaction")
   -> std::tuple<std::string, std::string>
   {
-    if (auto eri_name = get_thc(mpi, pt, mf_list, thc_list, eri_tag)) 
+    if (auto eri_name = get_thc(mpi, pt, mf_list, thc_list, eri_tag))
       return std::make_tuple(*eri_name, std::string("thc") );
-    else if (auto eri_name_ = get_cholesky(mpi, pt, mf_list, chol_list, eri_tag)) 
+    else if (auto eri_name_ = get_cholesky(mpi, pt, mf_list, chol_list, eri_tag))
       return std::make_tuple(*eri_name_, std::string("cholesky") );
+    return std::tuple(std::string(""), std::string("") );
+  }
+
+  /*
+   * Overload aware of the "hamilt" interaction type (static slots only —
+   * the caller is responsible for rejecting it in the dynamic slot).
+   */
+  template<typename comm_t>
+  auto get_eri_block(const std::shared_ptr<utils::mpi_context_t<comm_t>> &mpi, ptree const& pt,
+                     std::map<std::string, std::shared_ptr<mf::MF>> &mf_list,
+                     std::map<std::string,std::tuple<std::string,std::unique_ptr<thc_reader_t>>> &thc_list,
+                     std::map<std::string,std::tuple<std::string,std::unique_ptr<chol_reader_t>>> &chol_list,
+                     std::map<std::string,std::tuple<std::string,std::unique_ptr<hamilt_eval_t>>> &hamilt_list,
+                     std::string eri_tag = "interaction")
+  -> std::tuple<std::string, std::string>
+  {
+    if (auto eri_name = get_thc(mpi, pt, mf_list, thc_list, eri_tag))
+      return std::make_tuple(*eri_name, std::string("thc") );
+    else if (auto eri_name_ = get_cholesky(mpi, pt, mf_list, chol_list, eri_tag))
+      return std::make_tuple(*eri_name_, std::string("cholesky") );
+    else if (auto eri_name__ = get_hamilt(mpi, pt, mf_list, hamilt_list, eri_tag))
+      return std::make_tuple(*eri_name__, std::string("hamilt") );
     return std::tuple(std::string(""), std::string("") );
   }
 } // methods

@@ -1129,6 +1129,14 @@ template void mbpt(std::string, \
   MBPT_INST(chol_reader_t, chol_reader_t, thc_reader_t, chol_reader_t)
   MBPT_INST(chol_reader_t, chol_reader_t, chol_reader_t, thc_reader_t)
   MBPT_INST(chol_reader_t, chol_reader_t, chol_reader_t, chol_reader_t)
+// hamilt (direct-route) static slots — constructible combos only (main.cpp)
+  MBPT_INST(hamilt_eval_t, thc_reader_t, thc_reader_t, thc_reader_t)
+  MBPT_INST(hamilt_eval_t, thc_reader_t, thc_reader_t, chol_reader_t)
+  MBPT_INST(thc_reader_t, hamilt_eval_t, hamilt_eval_t, thc_reader_t)
+  MBPT_INST(thc_reader_t, hamilt_eval_t, thc_reader_t, thc_reader_t)
+  MBPT_INST(thc_reader_t, thc_reader_t, hamilt_eval_t, thc_reader_t)
+  MBPT_INST(thc_reader_t, hamilt_eval_t, chol_reader_t, thc_reader_t)
+  MBPT_INST(thc_reader_t, chol_reader_t, hamilt_eval_t, thc_reader_t)
 
 #undef MBPT_INST
 

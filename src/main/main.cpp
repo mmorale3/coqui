@@ -185,6 +185,7 @@ void run(mpi3::communicator &comm, InputParser &parser)
   std::map<std::string, std::shared_ptr<mf::MF>> mf_list;
   std::map<std::string, std::tuple<std::string,std::unique_ptr<thc_reader_t>>> thc_list;
   std::map<std::string, std::tuple<std::string,std::unique_ptr<chol_reader_t>>> chol_list;
+  std::map<std::string, std::tuple<std::string,std::unique_ptr<methods::hamilt_eval_t>>> hamilt_list;
 
   auto mpi_context = std::make_shared<utils::mpi_context_t<>>(utils::make_mpi_context(comm));
 
@@ -216,6 +217,8 @@ void run(mpi3::communicator &comm, InputParser &parser)
           auto name = methods::add_thc(mpi_context, int_pt, mf_list, thc_list);
         } else if (int_type == "cholesky") {
           auto name = methods::add_cholesky(mpi_context, int_pt, mf_list, chol_list);
+        } else if (int_type == "hamilt") {
+          auto name = methods::add_hamilt(mpi_context, int_pt, mf_list, hamilt_list);
         } else
           APP_ABORT("Error: Invalid interaction type: {}",int_type);
       }
@@ -243,15 +246,20 @@ void run(mpi3::communicator &comm, InputParser &parser)
       // all based on mbpt, lump together
       ptree pt = it.second;
       auto [eri_name, eri_type] = methods::get_eri_block(mpi_context, pt, mf_list,
-                                                         thc_list, chol_list, "interaction");
-      utils::check(eri_name != "" and eri_type != "", 
+                                                         thc_list, chol_list, hamilt_list, "interaction");
+      utils::check(eri_name != "" and eri_type != "",
                    "Error: Failed to find interaction block needed by {}",cname);
+      utils::check(eri_type != "hamilt",
+                   "Error ({}): 'interaction' (the dynamic/correlation slot) cannot be of "
+                   "type 'hamilt' — the direct route provides only the STATIC Hartree/"
+                   "exchange terms (use it in interaction_hf / interaction_hartree / "
+                   "interaction_exchange); 'interaction' needs a thc/cholesky block.", cname);
       auto [hf_eri_name, hf_eri_type] = methods::get_eri_block(mpi_context, pt, mf_list,
-                                                               thc_list, chol_list, "interaction_hf");
+                                                               thc_list, chol_list, hamilt_list, "interaction_hf");
       auto [hartree_eri_name, hartree_eri_type] = methods::get_eri_block(mpi_context, pt, mf_list,
-                                                               thc_list, chol_list, "interaction_hartree");
+                                                               thc_list, chol_list, hamilt_list, "interaction_hartree");
       auto [exchange_eri_name, exchange_eri_type] = methods::get_eri_block(mpi_context, pt, mf_list,
-                                                               thc_list, chol_list, "interaction_exchange");
+                                                               thc_list, chol_list, hamilt_list, "interaction_exchange");
 
       auto mf_name = (eri_type=="thc")? std::get<0>(thc_list[eri_name]) : std::get<0>(chol_list[eri_name]);
 
@@ -276,6 +284,12 @@ void run(mpi3::communicator &comm, InputParser &parser)
           methods::mbpt(cname, mb_eri, pt);
         } else if (hf_eri_type=="cholesky" and eri_type=="thc") {
           auto mb_eri = methods::mb_eri_t(*std::get<1>(chol_list[hf_eri_name]), *std::get<1>(thc_list[eri_name]));
+          methods::mbpt(cname, mb_eri, pt);
+        } else if (hf_eri_type=="hamilt" and eri_type=="thc") {
+          auto mb_eri = methods::mb_eri_t(*std::get<1>(hamilt_list[hf_eri_name]), *std::get<1>(thc_list[eri_name]));
+          methods::mbpt(cname, mb_eri, pt);
+        } else if (hf_eri_type=="hamilt" and eri_type=="cholesky") {
+          auto mb_eri = methods::mb_eri_t(*std::get<1>(hamilt_list[hf_eri_name]), *std::get<1>(chol_list[eri_name]));
           methods::mbpt(cname, mb_eri, pt);
         } else {
           auto mb_eri = methods::mb_eri_t(*std::get<1>(chol_list[hf_eri_name]), *std::get<1>(chol_list[eri_name]));
@@ -307,6 +321,36 @@ void run(mpi3::communicator &comm, InputParser &parser)
           auto mb_eri = methods::mb_eri_t(
               *std::get<1>(chol_list[hartree_eri_name]),
               *std::get<1>(chol_list[exchange_eri_name]),
+              *std::get<1>(thc_list[eri_name]));
+          methods::mbpt(cname, mb_eri, pt);
+        } else if (hartree_eri_type=="hamilt" and exchange_eri_type=="hamilt" and eri_type=="thc") {
+          auto mb_eri = methods::mb_eri_t(
+              *std::get<1>(hamilt_list[hartree_eri_name]),
+              *std::get<1>(hamilt_list[exchange_eri_name]),
+              *std::get<1>(thc_list[eri_name]));
+          methods::mbpt(cname, mb_eri, pt);
+        } else if (hartree_eri_type=="hamilt" and exchange_eri_type=="thc" and eri_type=="thc") {
+          auto mb_eri = methods::mb_eri_t(
+              *std::get<1>(hamilt_list[hartree_eri_name]),
+              *std::get<1>(thc_list[exchange_eri_name]),
+              *std::get<1>(thc_list[eri_name]));
+          methods::mbpt(cname, mb_eri, pt);
+        } else if (hartree_eri_type=="thc" and exchange_eri_type=="hamilt" and eri_type=="thc") {
+          auto mb_eri = methods::mb_eri_t(
+              *std::get<1>(thc_list[hartree_eri_name]),
+              *std::get<1>(hamilt_list[exchange_eri_name]),
+              *std::get<1>(thc_list[eri_name]));
+          methods::mbpt(cname, mb_eri, pt);
+        } else if (hartree_eri_type=="hamilt" and exchange_eri_type=="cholesky" and eri_type=="thc") {
+          auto mb_eri = methods::mb_eri_t(
+              *std::get<1>(hamilt_list[hartree_eri_name]),
+              *std::get<1>(chol_list[exchange_eri_name]),
+              *std::get<1>(thc_list[eri_name]));
+          methods::mbpt(cname, mb_eri, pt);
+        } else if (hartree_eri_type=="cholesky" and exchange_eri_type=="hamilt" and eri_type=="thc") {
+          auto mb_eri = methods::mb_eri_t(
+              *std::get<1>(chol_list[hartree_eri_name]),
+              *std::get<1>(hamilt_list[exchange_eri_name]),
               *std::get<1>(thc_list[eri_name]));
           methods::mbpt(cname, mb_eri, pt);
         } else {

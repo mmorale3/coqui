@@ -424,6 +424,14 @@ GW_SCF_LOOP_INST(chol_reader_t, chol_reader_t, thc_reader_t, thc_reader_t)
 GW_SCF_LOOP_INST(chol_reader_t, chol_reader_t, thc_reader_t, chol_reader_t)
 GW_SCF_LOOP_INST(chol_reader_t, chol_reader_t, chol_reader_t, thc_reader_t)
 GW_SCF_LOOP_INST(chol_reader_t, chol_reader_t, chol_reader_t, chol_reader_t)
+// hamilt (direct-route) static slots — constructible combos only (main.cpp)
+GW_SCF_LOOP_INST(hamilt_eval_t, thc_reader_t, thc_reader_t, thc_reader_t)
+GW_SCF_LOOP_INST(hamilt_eval_t, thc_reader_t, thc_reader_t, chol_reader_t)
+GW_SCF_LOOP_INST(thc_reader_t, hamilt_eval_t, hamilt_eval_t, thc_reader_t)
+GW_SCF_LOOP_INST(thc_reader_t, hamilt_eval_t, thc_reader_t, thc_reader_t)
+GW_SCF_LOOP_INST(thc_reader_t, thc_reader_t, hamilt_eval_t, thc_reader_t)
+GW_SCF_LOOP_INST(thc_reader_t, hamilt_eval_t, chol_reader_t, thc_reader_t)
+GW_SCF_LOOP_INST(thc_reader_t, chol_reader_t, hamilt_eval_t, thc_reader_t)
 
 #undef GW_SCF_LOOP_INST
 
@@ -455,6 +463,14 @@ GF2_SCF_LOOP_INST(chol_reader_t, chol_reader_t, thc_reader_t, thc_reader_t)
 GF2_SCF_LOOP_INST(chol_reader_t, chol_reader_t, thc_reader_t, chol_reader_t)
 GF2_SCF_LOOP_INST(chol_reader_t, chol_reader_t, chol_reader_t, thc_reader_t)
 GF2_SCF_LOOP_INST(chol_reader_t, chol_reader_t, chol_reader_t, chol_reader_t)
+// hamilt (direct-route) static slots — constructible combos only (main.cpp)
+GF2_SCF_LOOP_INST(hamilt_eval_t, thc_reader_t, thc_reader_t, thc_reader_t)
+GF2_SCF_LOOP_INST(hamilt_eval_t, thc_reader_t, thc_reader_t, chol_reader_t)
+GF2_SCF_LOOP_INST(thc_reader_t, hamilt_eval_t, hamilt_eval_t, thc_reader_t)
+GF2_SCF_LOOP_INST(thc_reader_t, hamilt_eval_t, thc_reader_t, thc_reader_t)
+GF2_SCF_LOOP_INST(thc_reader_t, thc_reader_t, hamilt_eval_t, thc_reader_t)
+GF2_SCF_LOOP_INST(thc_reader_t, hamilt_eval_t, chol_reader_t, thc_reader_t)
+GF2_SCF_LOOP_INST(thc_reader_t, chol_reader_t, hamilt_eval_t, thc_reader_t)
 
 #undef GF2_SCF_LOOP_INST
 
@@ -536,6 +552,14 @@ EVSCF_LOOP_INST(chol_reader_t, chol_reader_t, thc_reader_t, thc_reader_t)
 EVSCF_LOOP_INST(chol_reader_t, chol_reader_t, thc_reader_t, chol_reader_t)
 EVSCF_LOOP_INST(chol_reader_t, chol_reader_t, chol_reader_t, thc_reader_t)
 EVSCF_LOOP_INST(chol_reader_t, chol_reader_t, chol_reader_t, chol_reader_t)
+// hamilt (direct-route) static slots — constructible combos only (main.cpp)
+EVSCF_LOOP_INST(hamilt_eval_t, thc_reader_t, thc_reader_t, thc_reader_t)
+EVSCF_LOOP_INST(hamilt_eval_t, thc_reader_t, thc_reader_t, chol_reader_t)
+EVSCF_LOOP_INST(thc_reader_t, hamilt_eval_t, hamilt_eval_t, thc_reader_t)
+EVSCF_LOOP_INST(thc_reader_t, hamilt_eval_t, thc_reader_t, thc_reader_t)
+EVSCF_LOOP_INST(thc_reader_t, thc_reader_t, hamilt_eval_t, thc_reader_t)
+EVSCF_LOOP_INST(thc_reader_t, hamilt_eval_t, chol_reader_t, thc_reader_t)
+EVSCF_LOOP_INST(thc_reader_t, chol_reader_t, hamilt_eval_t, thc_reader_t)
 
 #undef EVSCF_LOOP_INST
 
@@ -567,6 +591,14 @@ QPSCF_LOOP_INST(chol_reader_t, chol_reader_t, thc_reader_t, thc_reader_t)
 QPSCF_LOOP_INST(chol_reader_t, chol_reader_t, thc_reader_t, chol_reader_t)
 QPSCF_LOOP_INST(chol_reader_t, chol_reader_t, chol_reader_t, thc_reader_t)
 QPSCF_LOOP_INST(chol_reader_t, chol_reader_t, chol_reader_t, chol_reader_t)
+// hamilt (direct-route) static slots — constructible combos only (main.cpp)
+QPSCF_LOOP_INST(hamilt_eval_t, thc_reader_t, thc_reader_t, thc_reader_t)
+QPSCF_LOOP_INST(hamilt_eval_t, thc_reader_t, thc_reader_t, chol_reader_t)
+QPSCF_LOOP_INST(thc_reader_t, hamilt_eval_t, hamilt_eval_t, thc_reader_t)
+QPSCF_LOOP_INST(thc_reader_t, hamilt_eval_t, thc_reader_t, thc_reader_t)
+QPSCF_LOOP_INST(thc_reader_t, thc_reader_t, hamilt_eval_t, thc_reader_t)
+QPSCF_LOOP_INST(thc_reader_t, hamilt_eval_t, chol_reader_t, thc_reader_t)
+QPSCF_LOOP_INST(thc_reader_t, chol_reader_t, hamilt_eval_t, thc_reader_t)
 
 #undef QPSCF_LOOP_INST
 
