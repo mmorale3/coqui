@@ -5,25 +5,25 @@
  * One-center radial charge densities for the PAW deeq SCF self-consistency.
  *
  * The Hartree-only correction to the PAW non-local D matrix needs, per
- * SCF iteration, the LM-decomposed all-electron and pseudo charge
+ * SCF iteration, the LM-decomposed all-electron and pseudo VALENCE charge
  * densities on each atom's radial mesh:
  *
  *   ρ_AE^a(r, LM) = Σ_IJ  becsum_aIJ · pfunc_IJ(r)  · G_{LM,IJ}
- *                 + ρ_core_AE(r) · δ_{LM,00}
  *
  *   ρ_PS^a(r, LM) = Σ_IJ  becsum_aIJ · ptfunc_IJ(r) · G_{LM,IJ}
  *                 + Σ_IJ  becsum_aIJ · Σ_L qfuncl_L,IJ(r) · G_{LM,IJ}'_L
- *                 + ρ_core_PS(r) · δ_{LM,00}
  *
  * with `pfunc_IJ(r) = ψ_AE_{indv(I)}(r) · ψ_AE_{indv(J)}(r)` and analogous
  * for `ptfunc`, and `G_{LM,IJ}` the real-spherical-harmonic Clebsch-
  * Gordan coupling (= QE's `aatab.ap(lp, nhtolm(I), nhtolm(J))`).
  *
- * `compute_paw_core_density(sp)` precomputes ρ_core_AE(r), ρ_core_PS(r) once
- * per species (frozen-core, SCF-invariant). These caches feed the LM=00
- * channel of ρ_AE/ρ_PS in the Hartree-only deeq driver. The valence-density
- * LM builders (per-iter `becsum`-dependent) live with the Hartree integrator,
- * which packs the contraction Σ_IJ becsum × pfunc × G into a single radial pass.
+ * NO frozen-core density enters here (plan I2/I3): the frozen core–valence
+ * one-center electrostatics is already inside the static D⁰ (`dion`), so a
+ * ρ_core term in the dynamic Hartree double-counts it (the D2 AB direct-V_H
+ * +19.98 Ha defect — see compute_paw_hartree_atom's docstring). The
+ * valence-density LM builders (per-iter `becsum`-dependent) live with the
+ * Hartree integrator, which packs the contraction Σ_IJ becsum × pfunc × G
+ * into a single radial pass.
  * ==========================================================================
  */
 #ifndef HAMILTONIAN_PAW_PAW_ONECENTER_HPP
@@ -45,90 +45,27 @@
 namespace hamilt::paw {
 
 /**
- * Frozen-core radial charge densities on the species's radial mesh.
- *
- * AE side: ρ_core_AE(r) = (1/4π) Σ_n occ_n · (u_n(r) / r)² , where
- *   u_n(r) = sp.core_aewfc(n, r) is the core all-electron orbital
- *   stored as u(r) = r · R(r). The closed-shell occupation occ_n =
- *   2 · (2 l_n + 1) (filled subshell).
- *
- * PS side: ρ_core_PS(r) = sp.rho_atc_ps(r)  — already in radial form
- *   on the same mesh, used by QE for non-linear-core-correction (NLCC)
- *   on the smooth side. We treat it as the "frozen-core PS density"
- *   here (consistent with QE's PAW formalism).
- *
- * Both are SCF-invariant under the frozen-core approximation; build once
- * at pseudopot init, cache, reuse every SCF iteration. Returns
- * (ρ_core_AE, ρ_core_PS) — both shape (mesh) on the radial mesh.
- *
- * If the GIPAW core data is absent (`sp.ncore_orbitals == 0` or
- * `sp.core_aewfc.size() == 0`), ρ_core_AE is left zeroed (no
- * core-valence Hartree contribution from the AE side). ρ_core_PS uses
- * `rho_atc_ps` if present, else zero.
- */
-inline std::pair<nda::array<double,1>, nda::array<double,1>>
-compute_paw_core_density(pseudopot::species_paw_t const& sp)
-{
-    long mesh = (long)sp.mesh;
-    nda::array<double,1> rho_core_AE = nda::array<double,1>::zeros({mesh});
-    nda::array<double,1> rho_core_PS = nda::array<double,1>::zeros({mesh});
-
-    // PS side: copy directly from rho_atc_ps.
-    if (sp.rho_atc_ps.size() > 0) {
-        utils::check((long)sp.rho_atc_ps.size() == mesh,
-            "compute_paw_core_density: rho_atc_ps.size ({}) != mesh ({})",
-            sp.rho_atc_ps.size(), mesh);
-        for (long i = 0; i < mesh; ++i)
-            rho_core_PS(i) = sp.rho_atc_ps(i);
-    }
-
-    // AE side: build from core orbitals. core_aewfc stores u_n(r) = r·R_n(r);
-    // ρ_core_AE(r) = (1/4π) Σ_n occ_n · R_n(r)² = (1/4π) Σ_n occ_n · (u_n/r)².
-    // For r=0 we fall back to ρ_core_AE(0) = ρ_core_AE(r_1) (the first
-    // mesh point's value), since u_n(0) = 0 by regularity but the limit
-    // (u_n/r)² is finite — extrapolating from the next point is good
-    // enough for a typical log mesh where r(0) ≈ 1e-6.
-    if (sp.ncore_orbitals > 0 && sp.core_aewfc.size() > 0 &&
-        sp.core_l.size() > 0) {
-        long ncore = sp.ncore_orbitals;
-        utils::check((long)sp.core_aewfc.shape(0) == ncore &&
-                     (long)sp.core_aewfc.shape(1) == mesh,
-            "compute_paw_core_density: core_aewfc shape ({},{}) != ({},{})",
-            sp.core_aewfc.shape(0), sp.core_aewfc.shape(1), ncore, mesh);
-        utils::check((long)sp.core_l.size() == ncore,
-            "compute_paw_core_density: core_l.size ({}) != ncore ({})",
-            sp.core_l.size(), ncore);
-
-        double inv4pi = 1.0 / (4.0 * M_PI);
-        for (long n = 0; n < ncore; ++n) {
-            int l_n = (int)std::lround(sp.core_l(n));
-            double occ_n = 2.0 * (2.0 * (double)l_n + 1.0);  // closed-shell
-            for (long i = 1; i < mesh; ++i) {
-                double u = sp.core_aewfc(n, i);
-                double R = u / sp.r(i);
-                rho_core_AE(i) += inv4pi * occ_n * R * R;
-            }
-        }
-        // r=0 extrapolation. With a log mesh r(0) is tiny; copying
-        // r(1)'s value is accurate to leading order.
-        if (mesh > 1) rho_core_AE(0) = rho_core_AE(1);
-    }
-
-    return {std::move(rho_core_AE), std::move(rho_core_PS)};
-}
-
-/**
  * Per-atom Hartree-only contribution to the PAW deeq matrix from a current
  * `becsum`, plus the matching one-center Hartree energy. SCF-driver-facing.
+ *
+ * VALENCE ONLY (plan I2/I3). The one-center density here is the valence
+ * pair density from `becsum` — NO frozen-core density enters. The frozen
+ * core–valence one-center electrostatics is already contained in the static
+ * D⁰ (`dion`: QE by construction, ABINIT dij0 likewise); injecting ρ_core
+ * into this dynamic driver double-counts it. That was the D2 AB direct-V_H
+ * defect: on the semicore ABINIT fixture (core wfc exported ⇒ nonzero
+ * ρ_core_AE) the spurious core term added +19.98 Ha to the V_H trace,
+ * while every QE fixture carried empty core fields and hid it. This also
+ * matches QE's own PAW_h_potential (rho_lm from becsum only; core enters
+ * QE one-center only through XC, which CoQui drops) and makes the driver
+ * consistent with the deltaC 4-index kernel THC ships.
  *
  * Algorithm (Hartree only — XC dropped per CoQui's no-DFT scGW design):
  *
  *   For each LM channel `lp` allowed by `aatab.lpx/lpl/ap`:
  *     1. ρ_AE(r, lp) = Σ_IJ becsum_IJ · pfunc_IJ(r) · ap(lp, ivl, jvl)
- *                    + δ_{lp,0} · √(4π) · ρ_core_AE(r)
  *        ρ_PS(r, lp) = Σ_IJ becsum_IJ · [ ptfunc_IJ(r)
  *                                        + qfuncl(L, ij(I,J), r) · ap(lp, ivl, jvl) ]
- *                    + δ_{lp,0} · √(4π) · ρ_core_PS(r)
  *        with pfunc_IJ(r)  = aewfc(beta_I, r) · aewfc(beta_J, r)
  *             ptfunc_IJ(r) = pswfc(beta_I, r) · pswfc(beta_J, r)
  *             ij           = upper-triangle (beta_I, beta_J) index
@@ -154,8 +91,6 @@ struct paw_oc_hartree_result {
 inline paw_oc_hartree_result compute_paw_hartree_atom(
     pseudopot::species_paw_t const& sp,
     nda::ArrayOfRank<2> auto const& becsum,         // (nh, nh)
-    nda::ArrayOfRank<1> auto const& rho_core_AE,    // (mesh)
-    nda::ArrayOfRank<1> auto const& rho_core_PS,    // (mesh)
     aainit_tables const& aatab)
 {
     long mesh = (long)sp.mesh;
@@ -182,8 +117,6 @@ inline paw_oc_hartree_result compute_paw_hartree_atom(
     nda::array<double, 1> rho_AE(mesh), rho_PS(mesh);
     nda::array<double, 1> V_AE(mesh),   V_PS(mesh);
     nda::array<double, 1> integrand(mesh);
-
-    double sqrt4pi = std::sqrt(4.0 * M_PI);
 
     // Precompute for each (I, J): (ivl, jvl, beta_I, beta_J, ij_pair)
     struct pair_info { int ivl, jvl, bI, bJ, ij; };
@@ -218,18 +151,6 @@ inline paw_oc_hartree_result compute_paw_hartree_atom(
                 rho_PS(ir) += w * (ptf + qf);
             }
         }
-        if (lp == 0) {
-            // Core densities are stored in proper-ρ form (no r² jacobian);
-            // pfunc/ptfunc/qfuncl above are in QE's u-form (already r²-
-            // weighted: pf = u·u = r²·R²). Multiply core by r² so the
-            // u-form Hartree solver below sees a consistent input.
-            for (long ir = 0; ir < kkbeta; ++ir) {
-                double r2 = sp.r(ir) * sp.r(ir);
-                rho_AE(ir) += sqrt4pi * rho_core_AE(ir) * r2;
-                rho_PS(ir) += sqrt4pi * rho_core_PS(ir) * r2;
-            }
-        }
-
         // Radial Hartree per LM channel — u-form (densities carry the
         // spherical r² jacobian; integrand uses r'^L / r'^{-(L+1)}).
         radial_hartree_multipole_u_form(rho_AE, sp.r, sp.rab, L, V_AE);
@@ -508,19 +429,12 @@ inline void pseudopot::build_paw_scf_caches()
 {
     if (paw_scf_caches_built) return;
 
-    // 1. Compute the aainit lli (= 1 + max_l over all PAW betas).
+    // Compute the aainit lli (= 1 + max_l over all PAW betas).
     int lli = 1;
     for (auto const& sp : paw_species)
         for (long b = 0; b < (long)sp.lll.size(); ++b)
             lli = std::max(lli, (int)sp.lll(b) + 1);
     paw_aainit_lli = lli;
-
-    // 2. Per-species frozen-core radial densities. Cheap (O(mesh × ncore));
-    //    held in heap memory on every rank (small — < few KB per species).
-    paw_core_density.clear();
-    paw_core_density.reserve(paw_species.size());
-    for (auto const& sp : paw_species)
-        paw_core_density.emplace_back(hamilt::paw::compute_paw_core_density(sp));
 
     // NOTE: the static per-atom tensor Dnn_atom_static (dion + ex_cvij) is
     // NOT built here — it is assembled eagerly in read_vnl_h5 (plan A1).
@@ -634,9 +548,7 @@ nda::array<ComplexType,3> pseudopot::compute_paw_deeq_from_becsum(
         auto const& sp = paw_species[nt];
         if (sp.nh == 0 || sp.aewfc.size() == 0) continue;
         auto bs_a = becsum(ia, nda::range(0, sp.nh), nda::range(0, sp.nh));
-        auto const& cores = paw_core_density[nt];
-        auto res = hamilt::paw::compute_paw_hartree_atom(
-            sp, bs_a, cores.first, cores.second, aatab);
+        auto res = hamilt::paw::compute_paw_hartree_atom(sp, bs_a, aatab);
         for (int I = 0; I < sp.nh; ++I)
             for (int J = 0; J < sp.nh; ++J)
                 Dion(ia, I, J) += ComplexType(rad_fac * res.dDeeq_H(I, J), 0.0);

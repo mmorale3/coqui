@@ -140,16 +140,12 @@ static void run_dDeeq_H_matches_deltaC_test(std::string fixture_name,
         long nh_a = sp.nh;
         auto bs_a = becsum(ia, range(0, nh_a), range(0, nh_a));
 
-        // -- Path 1: radial Hartree, no core densities. -------------------
-        //    On qe_lih222_paw the core fields (rho_atc_ps, core_aewfc) are
-        //    not populated, so pass explicit zero buffers to keep the
-        //    comparison core-free on both sides regardless of fixture state.
-        nda::array<double,1> rho_core_AE_zero =
-            nda::array<double,1>::zeros({(long)sp.mesh});
-        nda::array<double,1> rho_core_PS_zero =
-            nda::array<double,1>::zeros({(long)sp.mesh});
-        auto res = hamilt::paw::compute_paw_hartree_atom(
-            sp, bs_a, rho_core_AE_zero, rho_core_PS_zero, aatab);
+        // -- Path 1: radial Hartree. The driver is valence-only by contract
+        //    (plan I2/I3: frozen-core one-center electrostatics lives in the
+        //    static D⁰/dion — the pre-fix core injection was the D2 AB
+        //    direct-V_H +19.98 Ha double-count), so it matches the ΔC
+        //    valence kernel with no core zeroing needed on either side.
+        auto res = hamilt::paw::compute_paw_hartree_atom(sp, bs_a, aatab);
 
         // -- Path 2: closed-form ΔC × becsum. -----------------------------
         //    deltaC has shape (nh, nh, nh, nh); contract over (K, L).

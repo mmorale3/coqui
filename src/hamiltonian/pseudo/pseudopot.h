@@ -570,13 +570,6 @@ class pseudopot
   // (1,1,1) for NCPP (species-resolved Dnn is used instead).
   sarray_t<nda::array_view<ComplexType,3>> Dnn_atom_static;
 
-  // Per-species frozen-core radial densities (rho_core_AE, rho_core_PS),
-  // SCF-invariant under the frozen-core approximation. Indexed by species
-  // type. Populated lazily by `build_paw_scf_caches` on first use;
-  // empty until then.
-  std::vector<std::pair<nda::array<double,1>, nda::array<double,1>>>
-      paw_core_density;
-
   // aainit `lli` parameter (= 1 + max_l over all PAW betas), needed to size
   // the angular-momentum coupling tables. Populated lazily alongside the
   // SCF caches above.
@@ -586,9 +579,9 @@ class pseudopot
   // between copies of this pseudopot (safe: content is keyed, never stale).
   mutable std::shared_ptr<paw::runtime_caches> paw_rt_cache;
 
-  // True after `build_paw_scf_caches` has built paw_core_density and
-  // paw_aainit_lli. Acts as a memoization flag so the SCF entry point can
-  // skip rebuilding the static caches each iteration.
+  // True after `build_paw_scf_caches` has built paw_aainit_lli. Acts as a
+  // memoization flag so the SCF entry point can skip rebuilding the static
+  // caches each iteration.
   bool paw_scf_caches_built = false;
 
   // mapping from wfc_g grid to rho grid. 
@@ -724,7 +717,7 @@ public:
 
   /**
    * Build the SCF-invariant caches consumed by the PAW deeq builders:
-   * `paw_core_density`, `paw_aainit_lli`. (The static per-atom tensor
+   * `paw_aainit_lli`. (The static per-atom tensor
    * `Dnn_atom_static` is NOT built here — it is assembled eagerly in
    * `read_vnl_h5`.) Idempotent; subsequent calls return immediately.
    * Called automatically from `compute_paw_deeq_from_becsum`; exposed

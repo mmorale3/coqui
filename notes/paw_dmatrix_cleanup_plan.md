@@ -11,18 +11,23 @@ printed into context at session start by a SessionStart hook).
 ## STATUS
 
 REMAINING TO COMPLETE THE PHASE (2026-07-25 late, post-D session):
-1. **AB direct-Hartree OPEN DEFECT (from D2, highest priority)**: on the new
-   ABINIT-sourced fixture (bdft_si222_paw_ab, 12-el semicore, split mesh
-   14³/36³, sphere miller_g) the PRODUCTION add_Hartree_impl V_H matrix is
-   wrong: trace +60.98 Ha vs the independently-established +41.005 (ABINIT
-   smooth 58.4283/2 + deltaC one-center 11.79); THC V_H is EXACT (energy
-   test agrees with the AE target to 4.9e-4 Ha; trace matches prediction to
-   1e-4). V_x route-equivalent at 3.7e-5 on the same mf. Ruled out: stored
-   qgm (2e-11 vs runtime), deltaC-vs-radial (1e-7), test-side mesh mixups
-   (fixed). See the FIXME at test_hamilt.cpp thc_vs_direct_VH_VX AB section
-   (strict_VH=false until root-caused). Every QE fixture passes — the
-   defect needs the AB mf traits to manifest. Suspect space: v_h smooth+aug
-   assembly / add_vloc / compute_paw_deeq interaction with the bdft reader.
+1. **AB direct-Hartree defect — RESOLVED (2026-07-25 late session)**: the
+   +19.98 Ha V_H trace excess was the frozen-core density
+   (ρ_core_AE/ρ_core_PS) injected into the DYNAMIC one-center radial
+   Hartree (compute_paw_hartree_atom lp=0 core block) — a double count of
+   the core–valence electrostatics already inside the static D⁰/dion (I2).
+   Invisible on every QE fixture (empty core fields); activated on the AB
+   semicore fixture by its exported core wfc. Root-caused by a trace
+   decomposition against the numpy probe bilinears (smooth-bra 3.7615 ✓,
+   dyn ∫V·Q 25.4505 ✓, radial oc 31.77 ✗ vs 11.793 = +19.98). Fix: core
+   densities removed from the dynamic Hartree driver entirely (valence-only
+   by contract; compute_paw_core_density deleted). Post-fix direct trace
+   +41.0055 vs target +41.005; AB VH_VX strict both V_H (2e-3 abs = 1e-4
+   rel, THC-truncation scale) and V_x; regression guard
+   ab_direct_vh_trace_split pins all four pieces. Full [paw]~[slow] suite
+   green (13552 assertions / 38 cases). NOTE: plan tex I3's parenthetical
+   "frozen-core AE/PS core densities included" is SUPERSEDED by this
+   resolution — amend the tex on next edit (I2 owns core electrostatics).
 2. Cluster follow-through (one short session, mechanical):
    (a) properly reconvert mf_abinit.h5 / mf_v2.h5 (+ nocv) with the fixed
        converter (WFK + --pot --den --pawxml --corewf), verify ≡ the

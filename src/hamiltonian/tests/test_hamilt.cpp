@@ -54,6 +54,7 @@
 #include "hamiltonian/paw/paw_aug_q_eval.hpp"
 #include "hamiltonian/paw/paw_onecenter.hpp"
 #include "hamiltonian/paw/v_h_paw.hpp"
+#include "hamiltonian/add_vloc.hpp"
 #include "hamiltonian/add_vxc.h"
 #include "utilities/fortran_utilities.h"
 #include "utilities/qe_utilities.hpp"
@@ -2313,26 +2314,178 @@ TEST_CASE("thc_vs_direct_VH_VX", "[hamilt][thc][hf]")
   SECTION("si_kp222 (PAW, ABINIT-sourced mf)") {
     auto mf_ptr = std::make_shared<mf::MF>(
         mf::default_MF(mpi, "bdft_si222_paw_ab", mf::h5_input_type));
-    // FIXME(D2 OPEN DEFECT, 2026-07-25): V_x is route-equivalent at 3.7e-5
-    // but the DIRECT V_H matrix disagrees with THC at 33% rel on this mf.
-    // Established: THC is the correct side — its trace energy (+41.005 Ha
-    // at the stored half-occupancy nii) equals the independent prediction
-    // from ABINIT's own smooth Hartree (58.4283 → /2 = 29.21) plus the
-    // deltaC one-center (11.79), and the energy-level test
-    // hartree_thc_paw_aug agrees with the AE target to 4.9e-4 Ha. The
-    // direct route traces to +60.98 Ha (+19.98 excess). Ruled out:
-    // stored-qgm conventions (paw_aug_q_eval_at_q0 AB section, 2e-11),
-    // deltaC-vs-radial one-center (AB section of
-    // paw_onecenter_dDeeq_H_matches_deltaC_contraction, 1e-7), test-side
-    // mesh mismatch (fixed in the energy helpers). The defect is in the
-    // production add_Hartree_impl assembly and only manifests on this
-    // semicore/split-mesh/sphere-miller AB mf — invisible to every QE
-    // fixture. V_H strictness OFF until root-caused; V_x stays strict.
+    // D2 defect RESOLVED (2026-07-25): the direct V_H excess (+19.98 Ha
+    // trace vs the THC/ABINIT-verified +41.005) was the frozen-core
+    // density injected into the DYNAMIC one-center Hartree deeq
+    // (compute_paw_hartree_atom lp=0 core term) — a double count of the
+    // core–valence electrostatics already inside the static D⁰/dion (plan
+    // I2/I3). Invisible on QE fixtures (empty core fields); activated
+    // here by the semicore dataset's exported core wfc. Bisection lives
+    // in ab_direct_vh_trace_split. Both V_H and V_x strict.
+    //
+    // tol_VH is scaled to this fixture's element magnitude: max|V_H| ≈ 9.9
+    // (12-el semicore) vs the LiH sections' ~O(1), so 2e-3 absolute is the
+    // same ~1e-4 RELATIVE strictness (post-fix measured: max|ΔV_H| =
+    // 1.16e-3, rel 1.2e-4, both signs on the diagonal; trace Δ = 2.4e-4 Ha
+    // — pure THC/ISDF truncation, consistent with the THC-side energy
+    // agreement of 4.9e-4 Ha on this mf).
     test_thc_vs_direct_VH_VX<HOST_MEMORY>(*mpi, mf_ptr,
-        /*thc_thresh*/ 1e-5, /*tol_VH*/ 5e-4, /*tol_VX*/ 5e-4,
-        /*strict_VH*/ false, /*strict_VX*/ true);
+        /*thc_thresh*/ 1e-5, /*tol_VH*/ 2e-3, /*tol_VX*/ 5e-4,
+        /*strict_VH*/ true, /*strict_VX*/ true);
   }
 
+}
+
+// ===========================================================================
+// D2 V_H trace decomposition on the ABINIT-sourced mf: split the DIRECT V_H
+// trace into its three assembly pieces and pin each against the independent
+// numpy probe (tests/unit_test_files/bdft/si_kp222_paw_abinit/
+// probe_hartree.py) bilinears at the file's half-occupancy nii:
+//   smooth-bra   ½∫v_H·ñ  (add_vloc)     → B(t,t)+B(t,h) = +3.7615
+//   deeq-dynamic ½∫v_H·n̂  (∫V·Q)         → B(t,h)+B(h,h) = +25.4505
+//   one-center radial (deltaC-equiv)                       = +11.7930
+//   total (THC-verified)                                   = +41.005
+// This bisection found the D2 defect (2026-07-25): T_oc read +31.77 — the
+// frozen-core density injected into the dynamic radial Hartree, a +19.98 Ha
+// double count of core–valence electrostatics already in the static
+// D⁰/dion. Kept as a regression guard: it pins each assembly piece
+// separately, and traces the deeq through TWO independent contractions
+// (becsum/Pskna vs the production add_vnl_impl route implicit in
+// Vhartree − smooth-bra), so a reintroduced piece-level defect is localized
+// immediately.
+// ===========================================================================
+TEST_CASE("ab_direct_vh_trace_split", "[hamilt][paw][hf]")
+{
+  using math::shm::make_shared_array;
+  auto all = nda::range::all; using nda::range;
+  auto& mpip = utils::make_unit_test_mpi_context();
+  auto& mpi = *mpip;
+  auto mf_ptr = std::make_shared<mf::MF>(
+      mf::default_MF(mpip, "bdft_si222_paw_ab", mf::h5_input_type));
+  auto& mfobj = *mf_ptr;
+  long nspin = mfobj.nspin(), nk_ibz = mfobj.nkpts_ibz(), nbnd = mfobj.nbnd();
+  long nk_full = mfobj.nkpts();
+  int npol = mfobj.npol();
+  hamilt::pseudopot V(mfobj);
+
+  nda::array<ComplexType,3> nii(nspin, nk_ibz, nbnd);
+  nii() = mfobj.occ()(all, range(nk_ibz), all);
+
+  using larray = memory::array<HOST_MEMORY, ComplexType, 4>;
+  auto psi = mf::read_distributed_orbital_set_ibz<larray>(
+      mfobj, mpi.comm, 'w', std::array<long,4>{0,0,0,0},
+      range(nspin), range(nk_ibz), range(nbnd), std::array<long,4>{1,1,2048,2048});
+
+  auto mesh_aug  = mfobj.fft_grid_dim_aug();
+  auto lattv     = mfobj.lattv();
+  auto recv      = mfobj.recv();
+  auto kpts_full = mfobj.kpts();
+  auto kp_to_ibz = mfobj.kp_to_ibz();
+  auto kp_trev   = mfobj.kp_trev();
+  auto kp_symm   = mfobj.kp_symm();
+  auto symm_list = mfobj.symm_list();
+  auto k2g       = V.swfc_to_rho_view();
+  long nnr_aug = (long)mesh_aug(0)*mesh_aug(1)*mesh_aug(2);
+
+  // v_hartree(r) on the aug mesh: the EXACT production path (same call as
+  // add_Hartree_impl — smooth density + folded compensation charge).
+  auto sv = make_shared_array<nda::array_view<ComplexType,1>>(mpi, {nnr_aug});
+  pots::potential_t vG(ptree{});
+  hamilt::v_h(mpi, vG, V, npol, mesh_aug, lattv, recv, k2g, kpts_full,
+              kp_to_ibz, kp_trev, kp_symm, symm_list, nii, psi,
+              /*symmetrize_rho_r=*/false, sv);
+
+  // ---- piece 1: smooth-bra ½·Tr[n ⟨ψ̃|v_H|ψ̃⟩]/N_k via production add_vloc.
+  auto hpsi = math::nda::make_distributed_array<larray>(
+      mpi.comm, psi.grid(), psi.global_shape(), psi.block_size());
+  hpsi.local() = ComplexType(0.0);
+  hamilt::add_vloc(npol, mesh_aug, k2g, sv.local(), psi, hpsi);
+  double T_S = 0.0;
+  {
+    auto ploc = psi.local(); auto hloc = hpsi.local();
+    for (auto [is,s] : itertools::enumerate(psi.local_range(0)))
+      for (auto [ik,k] : itertools::enumerate(psi.local_range(1)))
+        for (auto [ib,b] : itertools::enumerate(psi.local_range(2))) {
+          ComplexType acc(0.0);
+          for (long g = 0; g < ploc.extent(3); ++g)
+            acc += std::conj(ploc(is,ik,ib,g)) * hloc(is,ik,ib,g);
+          T_S += 0.5 * std::real(nii(s,k,b)) * std::real(acc);
+        }
+    T_S = mpi.comm.all_reduce_value(T_S, std::plus<>{}) / (double)nk_full;
+  }
+
+  // ---- pieces 2+3: deeq radial (empty V) and dynamic (∫v_H·Q), contracted
+  // with the same half-occupancy becsum the trace convention implies. becsum
+  // already carries the 1/N_k k-weight — no further normalization.
+  auto bec = hamilt::paw::compute_becsum_diagonal_symm(
+      V, nii, kp_to_ibz, kp_trev, npol);
+  nda::array<ComplexType,1> empty_v;
+  auto dD_0 = V.compute_paw_deeq(nii, empty_v,   /*include_static=*/false);
+  auto dD_V = V.compute_paw_deeq(nii, sv.local(), /*include_static=*/false);
+  double T_oc = 0.0, T_dyn = 0.0;
+  for (long ia = 0; ia < bec.extent(0); ++ia)
+    for (long I = 0; I < bec.extent(1); ++I)
+      for (long J = 0; J < bec.extent(2); ++J) {
+        T_oc  += 0.5 * bec(ia,J,I) * std::real(dD_0(ia,I,J));
+        T_dyn += 0.5 * bec(ia,J,I) * std::real(dD_V(ia,I,J) - dD_0(ia,I,J));
+      }
+
+  // ---- alternative deeq trace through Pskna (THC-verified projector path);
+  // should equal T_oc + T_dyn identically if becsum ↔ Pskna are consistent.
+  double T_P = 0.0;
+  {
+    auto Pskna = V.Pskna_view(); auto const& ityp = V.ityp_view();
+    auto const& nh_v = V.nh_view(); auto const& ofs = V.ofs_view();
+    for (long s = 0; s < nspin; ++s)
+      for (long k = 0; k < nk_ibz; ++k)
+        for (long ia = 0; ia < ityp.extent(0); ++ia) {
+          int nt = ityp(ia); int nh_a = nh_v(nt); if (nh_a == 0) continue;
+          long p0 = ofs(ia);
+          for (long i = 0; i < nbnd; ++i) {
+            ComplexType acc(0.0);
+            for (int I = 0; I < nh_a; ++I) {
+              ComplexType PiI = std::conj(Pskna(s,k,p0+I,i));
+              for (int J = 0; J < nh_a; ++J)
+                acc += PiI * dD_V(ia,I,J) * Pskna(s,k,p0+J,i);
+            }
+            T_P += 0.5 * std::real(nii(s,k,i)) * std::real(acc);
+          }
+        }
+    T_P /= (double)nk_full;
+  }
+
+  // ---- production full matrix (add_vloc bra + add_vnl_impl deeq).
+  auto dVH = hamilt::Vhartree<HOST_MEMORY>(mfobj, mpi.comm, &V, nii);
+  double T_full = 0.0;
+  {
+    auto loc = nda::to_host(dVH.local());
+    for (auto [a,s] : itertools::enumerate(dVH.local_range(0)))
+      for (auto [b,k] : itertools::enumerate(dVH.local_range(1)))
+        for (auto [c,i] : itertools::enumerate(dVH.local_range(2)))
+          for (auto [d,j] : itertools::enumerate(dVH.local_range(3)))
+            if (i == j)
+              T_full += 0.5 * std::real(nii(s,k,i)) * std::real(loc(a,b,c,d));
+    T_full = mpi.comm.all_reduce_value(T_full, std::plus<>{}) / (double)nk_full;
+  }
+
+  app_log(1, "[AB V_H split] smooth-bra   T_S    = {:+.6f}  (probe +3.7615)", T_S);
+  app_log(1, "[AB V_H split] radial oc    T_oc   = {:+.6f}  (probe +11.7930)", T_oc);
+  app_log(1, "[AB V_H split] dyn ∫V·Q     T_dyn  = {:+.6f}  (probe +25.4505)", T_dyn);
+  app_log(1, "[AB V_H split] Pskna deeq   T_P    = {:+.6f}  (becsum route {:+.6f})",
+          T_P, T_oc + T_dyn);
+  app_log(1, "[AB V_H split] production   T_full = {:+.6f}  (target +41.005)",
+          T_full);
+  app_log(1, "[AB V_H split] vnl-vs-Pskna residue T_full-T_S-T_P = {:+.6f}",
+          T_full - T_S - T_P);
+  // Probe-anchored guards (tolerances ≳ the probe's own 3.6 mHa agreement
+  // with ABINIT plus radial-vs-deltaC quadrature differences). The pre-fix
+  // core-density double count showed up here as T_oc = +31.77.
+  CHECK(std::abs(T_S   -  3.7615) < 5e-3);
+  CHECK(std::abs(T_oc  - 11.7930) < 5e-3);
+  CHECK(std::abs(T_dyn - 25.4505) < 5e-3);
+  CHECK(std::abs(T_full - 41.005) < 1e-2);
+  // add_vnl_impl must reproduce the Pskna contraction of the same deeq.
+  CHECK(std::abs(T_full - T_S - T_P) < 1e-6);
 }
 
 // ===========================================================================

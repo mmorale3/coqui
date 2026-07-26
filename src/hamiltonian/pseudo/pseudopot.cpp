@@ -850,8 +850,9 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
             // used in production since plan A1). Normalized to HARTREE in
             // memory here (legacy files store Ry — scale ry2ha).
             // ae_rho_atc / rho_atc_ps stay silent-optional: absence can be
-            // PHYSICAL (no NLCC ⇒ QE writes no PS core), and
-            // compute_paw_core_density documents else-zero semantics.
+            // PHYSICAL (no NLCC ⇒ QE writes no PS core); no production
+            // consumer today (the one-center Hartree driver is valence-only
+            // per plan I2/I3 — core electrostatics lives in dion).
             auto read_radial_vpot = [&](h5::group& g, std::string const& ds,
                                         auto& target) {
               try { nda::h5_read(g, ds, target); }
