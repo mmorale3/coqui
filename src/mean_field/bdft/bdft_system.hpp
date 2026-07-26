@@ -235,8 +235,23 @@ namespace mf {
         h5::file file = h5::file(filename, 'r');
         h5::group grp(file);
 
-        h5::group sgrp = grp.open_group("System"); 
-        h5::group ogrp = grp.open_group("Orbitals"); 
+        h5::group sgrp = grp.open_group("System");
+        h5::group ogrp = grp.open_group("Orbitals");
+
+        // Hardening (STATUS 4b): a pw2coqui .coqui.h5 is a qe-backend
+        // COMPANION file — it has /System + /Hamiltonian but writes NO
+        // orbitals (no psi/miller_wfc/wfc_ecut) and only a skeleton
+        // /System/BZ. Feeding it to the bdft reader used to die in an HDF5
+        // exception cascade (first at the BZ table read, then at psi);
+        // identify the situation up front instead. Checked BEFORE the BZ
+        // init below — that is where the cascade used to start.
+        utils::check(ogrp.has_dataset("miller_wfc") && ogrp.has_dataset("wfc_ecut"),
+            "bdft_system: /Orbitals in '{}' has no wavefunction data "
+            "(miller_wfc / wfc_ecut / psi_s*_k* missing). This looks like a "
+            "pw2coqui companion file for the QE backend — it is NOT a "
+            "standalone bdft file. Use mf_source \"qe\" with the QE outdir/"
+            "prefix, or produce a bdft file with abinit2coqui / CoQui's "
+            "converter.", filename);
 
         // unit cell
         h5::h5_read_attribute(sgrp, "number_of_atoms", natoms);
@@ -283,7 +298,16 @@ namespace mf {
         nda::h5_read(grp, "System/reciprocal_vectors", recv);
 
         // BZ
-        _symm.initialize_from_h5(sgrp);  
+        // Hardening: the bdft reader needs the FULL BZ/symmetry table set
+        // (19 datasets incl. q-point maps); a partial /System/BZ used to
+        // cascade an HDF5 attribute exception here. Name the problem.
+        utils::check(bz_symm::can_init_from_h5(sgrp),
+            "bdft_system: /System/BZ in '{}' is missing part of the full "
+            "BZ/symmetry table set the bdft reader requires (kp/q maps, "
+            "trev tables, ...). Regenerate the file with the current "
+            "abinit2coqui (write_bz), or use the reader matching the file's "
+            "producer.", filename);
+        _symm.initialize_from_h5(sgrp);
 
         int nkpts = _symm.nkpts;
         int nkpts_ibz = _symm.nkpts_ibz;
@@ -293,7 +317,7 @@ namespace mf {
         if( std::abs( nda::sum(k_weight) - 1.0 ) > 1e-6 and mpi->comm.root() )
           app_warning(" k_weight is not normalized. sum(k_weight): {}",nda::sum(k_weight)); 
 
-        // Orbitals 
+        // Orbitals
         { // some checks
           int dummy;
           h5::h5_read_attribute(ogrp, "number_of_spins", dummy);

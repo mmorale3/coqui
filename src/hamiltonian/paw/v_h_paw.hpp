@@ -247,7 +247,14 @@ inline nda::array<ComplexType,1> compute_rho_aug_density_r(
             long n1 = m1; if (n1<0) n1+=NX;
             long n2 = m2; if (n2<0) n2+=NY;
             long n3 = m3; if (n3<0) n3+=NZ;
-            if (n1<0||n1>=NX||n2<0||n2>=NY||n3<0||n3>=NZ) continue;
+            // contract (converter audit): every miller_g entry is single-wrap
+            // representable in the aug mesh. A violation means silently
+            // DROPPED Fourier coefficients (the D2 energy-helper bug class),
+            // so abort instead of skipping.
+            utils::check(n1>=0 && n1<NX && n2>=0 && n2<NY && n3>=0 && n3<NZ,
+                "compute_rho_aug_density_r: miller_g entry ({},{},{}) not "
+                "representable in fft_mesh_aug ({},{},{}) — mesh/miller_g "
+                "mismatch in the converted h5.", m1,m2,m3,NX,NY,NZ);
             long N = (n1*NY + n2)*NZ + n3;
             double Gx = m1*recv(0,0)+m2*recv(1,0)+m3*recv(2,0);
             double Gy = m1*recv(0,1)+m2*recv(1,1)+m3*recv(2,1);

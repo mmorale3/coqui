@@ -609,7 +609,12 @@ nda::array<ComplexType,3> pseudopot::compute_int_VQ(Pot_t const& V_r) const
         long n1 = m1; if (n1 < 0) n1 += NX;
         long n2 = m2; if (n2 < 0) n2 += NY;
         long n3 = m3; if (n3 < 0) n3 += NZ;
-        if (n1 < 0 || n1 >= NX || n2 < 0 || n2 >= NY || n3 < 0 || n3 >= NZ) continue;
+        // contract (converter audit): miller_g must be representable in the
+        // aug mesh; dropping G's here silently corrupts ∫V·Q̂ (D2 bug class).
+        utils::check(n1 >= 0 && n1 < NX && n2 >= 0 && n2 < NY && n3 >= 0 && n3 < NZ,
+            "compute_int_VQ: miller_g entry ({},{},{}) not representable in "
+            "fft_mesh_aug ({},{},{}) — mesh/miller_g mismatch in the "
+            "converted h5.", m1, m2, m3, NX, NY, NZ);
         ComplexType vhg = vh_g((n1*NY + n2)*NZ + n3);
         double Gx = m1*recv(0,0) + m2*recv(1,0) + m3*recv(2,0);
         double Gy = m1*recv(0,1) + m2*recv(1,1) + m3*recv(2,1);

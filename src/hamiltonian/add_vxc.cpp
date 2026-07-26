@@ -137,6 +137,16 @@ void read_vxc_h5(MF_t &mf, h5::group& grp0, shared_array<array_t> &svxc)
     auto vxc_2D = nda::reshape(vxc,std::array<long,2>{nspin*npol*npol,mf.nnr_aug()});
     auto vl_2D = nda::reshape(vl,std::array<long,2>{nspin*npol*npol,ngm});
     vxc_2D() = ComplexType(0.0);
+    // Hardening (converter audit): schema-3 converters OMIT vxc_with_nlcc
+    // when the source run carried no density (abinit2coqui without --den) —
+    // pre-audit files wrote silent ZEROS instead. Name the situation rather
+    // than cascading an HDF5 read exception.
+    utils::check(grp.has_dataset("vxc_with_nlcc"),
+        "add_vxc: 'vxc_with_nlcc' is absent from the /Hamiltonian/{} block. "
+        "The h5 was converted without XC-potential data (e.g. abinit2coqui "
+        "without --den), so the GW@DFT Sigma - Vxc subtraction cannot run. "
+        "Reconvert with the density file, or use a starting point that does "
+        "not require vxc.", type);
     nda::h5_read(grp,"vxc_with_nlcc",vl);
     nda::copy_select(true,1,k2g,ComplexType(1.0),vl_2D,ComplexType(0.0),vxc_2D);
     F.backward(vxc_4D);
@@ -159,6 +169,9 @@ using memory::host_array_view;
 template void add_vxc(mf::MF&, nda::range, nda::range,
     darray_t<host_array<ComplexType,4>,communicator> const&,
     darray_t<host_array<ComplexType,4>,communicator>&);
+// NOTE: read_vxc_h5<mf::MF, array_view<ComplexType,3>> is already
+// instantiated through the add_vxc body above; the QE-eigenvalue diagnostic
+// (plan A-tests iv) links against that instantiation.
 #if defined(ENABLE_DEVICE)
 using memory::device_array;
 using memory::unified_array;

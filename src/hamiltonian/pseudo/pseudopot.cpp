@@ -919,6 +919,15 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
           // core-valence/core-core exchange). Absent for non-GIPAW pseudos.
           if(sp.is_paw && nt_grp.has_subgroup("Core")) {
             h5::group cgrp = nt_grp.open_group("Core");
+            // Hardening (STATUS 4b): an attr-less Core/ group (hand-injected
+            // cores, pre-B2 files) used to die in an unclear HDF5 exception
+            // cascade here. Name the problem and the fix instead.
+            utils::check(H5Aexists(h5::hid_t(cgrp), "ncore_orbitals") > 0,
+                "read_vnl_h5: Species nt{} has a Core/ group without the "
+                "'ncore_orbitals' attribute. Core/ requires attrs+datasets "
+                "(ncore_orbitals, n, l, ae_wfc) — regenerate the h5 with the "
+                "current converter (pw2coqui --with-gipaw pseudo / "
+                "abinit2coqui --corewf).", nt);
             h5::h5_read_attribute(cgrp, "ncore_orbitals", sp.ncore_orbitals);
             try { nda::h5_read(cgrp, "n",      sp.core_n); }     catch(...) {}
             try { nda::h5_read(cgrp, "l",      sp.core_l); }     catch(...) {}
