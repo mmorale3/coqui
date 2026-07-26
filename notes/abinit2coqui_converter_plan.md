@@ -1,5 +1,27 @@
 # abinit2coqui converter — design plan
 
+> **CORRECTIONS (2026-07-26, plan E2) — read before trusting this note.**
+> This is the ORIGINAL design plan; the converter has long since shipped and
+> the normative description of what it writes is
+> `notes/converter_h5_contract.md` (+ the per-line inventories). Known-wrong
+> claims below, kept for history but corrected here:
+> 1. **`<exact_exchange_X_matrix>` is NOT deltaC/K_a.** It is `ex_cvij` —
+>    the frozen CORE–VALENCE exchange matrix (lm-diagonal, contracted with
+>    factor 1 through H0/e_1e). The valence–valence one-center kernel
+>    `deltaC = K_AE − K_PS` is COMPUTED by the converter (paw_deltaC.py, a
+>    QE `PAW_init_fock_kernel` port), never taken from the XML. Every
+>    "= deltaC/K_a!" annotation below is wrong.
+> 2. **The /Hamiltonian schema sketches below are dead** (they predate
+>    schema_version: `deeq` is deliberately NOT exported at schema ≥ 1, all
+>    energy data is Hartree on disk at schema ≥ 2, and the dead datasets
+>    (kbeta/qqq/species-dion/qfunc/pfunc/ptfunc/augmom/oc/... ) were dropped
+>    at schema 3 — see the contract note). Step 3's schema block in
+>    particular is superseded wholesale.
+> 3. A pw2coqui `.coqui.h5` is a **qe-backend companion** (no orbitals); the
+>    abinit2coqui output is a self-contained **bdft** file. They are not the
+>    "identical structure" the Goal paragraph hoped for — /Hamiltonian
+>    matches, /System//Orbitals differ by design.
+
 Goal: use ABINIT (mature PAW code) as CoQui's base DFT instead of QE, by writing a converter
 that produces the SAME data CoQui's mean-field reader consumes — ideally without modifying
 ABINIT source, and (per user) producing an h5 with the identical structure to pw2coqui.x's.

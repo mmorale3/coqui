@@ -1,6 +1,18 @@
 # LaNiO3 PAW path: unphysical positive RPA correlation energy
 
-**Status:** open bug (2026-05-07).
+**Status:** RETEST-PENDING (2026-07-26, plan E2). Originally an open bug
+(2026-05-07); every layer this symptom could live in has since been fixed or
+validated, so the recorded numbers below are stale until the case is rerun
+with the current binary + reconverted h5:
+TR-pair conjugation in G (7fdf99f), JTH d-channel resolution (the projector
+completeness mechanism — LaNiO3's La f/spdf datasets are the same class),
+becsum symmetry k-weights (A3), static-D rebuild (A1/A2: QE deeq removed),
+one-center prefactor −1/N_k, THC aug q=0 head vectors (D1), and the ℓ=3
+augmentation chain is now machine-precision-validated synthetically
+(paw_q_eval_synthetic_l3, D3). If the rerun still shows positive E_c^RPA,
+the remaining suspect is the projector-completeness limit documented in
+[[project_paw_si_rpa_projector_recheck]] / the JTH failure diagnostics
+(f-channel analogue), not a CoQui code bug.
 **Path affected:** PAW augmented-THC ERI → RPA correlation, specifically for
 metallic systems with f-electron PAW datasets.
 **Other PPs unaffected:** ONCV, USPP, ccECP all give physical (negative)

@@ -10,7 +10,62 @@ printed into context at session start by a SessionStart hook).
 
 ## STATUS
 
-REMAINING TO COMPLETE THE PHASE (2026-07-25 late, post-D session):
+REMAINING TO COMPLETE THE PHASE (2026-07-26 session):
+- **Converter-audit implementation LANDED (2026-07-26, schema 3)**: both
+  converters stop writing dead-at-read data (species kbeta/qqq/dion/qfunc/
+  q_with_l/nqf/nqlc/lmax/lmax_rho/zp/jjj/nhtoj attrs+datasets, paw pfunc/
+  ptfunc/augmom/oc/augshape/pfunc_rel/aewfc_rel, core-zeroed vxc; `beta`
+  KEPT as the native-projector enabler); /Orbitals@ecutrho PINNED to
+  HARTREE at schema 3 (pw2coqui ÷e2; abinit2coqui writes the exact
+  inscribed-sphere cutoff replacing the 2×/4× heuristic; qe read_h5 scales
+  ×0.5 below v3 — the raw-Ry attr silently inflated the h5-init dense
+  sphere 2×); AB PAW path OMITS vxc_with_nlcc without --den (was silent
+  zeros); pw2coqui lspinorbit_loc moved inside the ionode guard; stale "Ry
+  on disk" AB comments fixed. VALIDATION: AB reconversion from the D2
+  WFK/POT/DEN ≡ old fixture on every kept dataset (deltaC 1e-13 jitter;
+  exactly the 15 intended removals; ecutrho 68.255→121.509 = 36³ inscribed
+  sphere) and the checked-in bdft fixture REFRESHED to schema 3; fresh
+  pw2coqui.x LiH-PAW conversion verified (schema 3, ecutrho 400 Ry→200 Ha
+  ≡ XML, dead data absent, kept-set exact). notes/converter_h5_contract.md
+  + the two write inventories committed as the normative contract.
+- **STATUS item 4 hardening LANDED (2026-07-26)**: (a) TEST_CASE
+  set_h0_shm ([shm_h0]) — shm set_H0 ≡ distributed H0 on
+  NCPP/USPP/PAW/AB-split-mesh, machine precision at np=1/2, plus a
+  DEDICATED np=2 ctest entry test_hamiltonian_np2_shm (TIMEOUT 900) so the
+  compute_int_VQ deadlock class fails instead of hanging and never again
+  ships unexercised (CTEST_NPROC defaults to 1 — that was the hole);
+  (b) bdft reader names orbital-less pw2coqui companion files with a clear
+  error; Core/ without ncore_orbitals attr errors with the converter fix
+  named; add_vxc errors clearly when vxc_with_nlcc is absent (schema-3 AB
+  no-DEN files omit it); miller_g out-of-box silent `continue` in
+  compute_rho_aug_density_r / compute_int_VQ is now a HARD ABORT (dropped
+  Fourier coefficients = the D2 energy-helper bug class).
+- **A-tests residual CLOSED (2026-07-26)**: dft_eigenvalues reworked per
+  plan A-tests(iv) — the diagnostic now assembles D_stat + D^H[n_QE] +
+  ∫V_xc·Q̂ explicitly (read_vxc_h5 aug-mesh V_xc → compute_int_VQ →
+  Pskna contraction, test-side only). USPP 0.749 Ha → **2.9e-6 STRICT
+  PASS** (operator complete — closes the semicore mystery); PAW 0.790 Ha
+  → 4.13e-2, concentrated on Li 1s = the radial one-center XC of QE's
+  ddd_paw that CoQui deliberately never assembles (no DFT XC in D);
+  pinned TWO-SIDED [3.5e-2, 4.8e-2] so silently gaining one-center XC (an
+  I2/I3 violation) fails too. NCPP untouched 5.8e-7. Workstream A fully
+  checked.
+- **Workstream E LANDED (2026-07-26)**: E1 canonical doc authored
+  (notes/paw_dmatrix_scgw.tex/.pdf — invariants with derivations: becsum
+  normalization, D⁰ per backend, ∫V_loc·Q̂ descreening settlement,
+  ex_cvij factor-1, valence-only dynamic Hartree incl. the D2 contract,
+  moment/shape operator identities with the Fock-vs-Arnaud measurements,
+  units/schema ledger, validation anchors). E2 sweep: plan tex I3
+  parenthetical amended (valence-only supersedes "core densities
+  included"); −47.6 mHa retracted at every quote (plan.md historical
+  entry, gw_vs_hybrid addendum, onsite-analysis addendum); converter-plan
+  exx_X=deltaC claim corrected (it is ex_cvij; banner + inline);
+  STEP3 schema block marked superseded by the contract note;
+  deeq-scaling k-weight limitation marked resolved-by-A3;
+  LaNiO3 note marked RETEST-PENDING with the post-June fix list;
+  pw2coqui role documented in the source header + contract + bdft error.
+
+REMAINING (older numbering, 2026-07-25 post-D session):
 1. **AB direct-Hartree defect — RESOLVED (2026-07-25 late session)**: the
    +19.98 Ha V_H trace excess was the frozen-core density
    (ρ_core_AE/ρ_core_PS) injected into the DYNAMIC one-center radial
@@ -28,28 +83,38 @@ REMAINING TO COMPLETE THE PHASE (2026-07-25 late, post-D session):
    green (13552 assertions / 38 cases). NOTE: plan tex I3's parenthetical
    "frozen-core AE/PS core densities included" is SUPERSEDED by this
    resolution — amend the tex on next edit (I2 owns core electrostatics).
-2. Cluster follow-through (one short session, mechanical):
-   (a) properly reconvert mf_abinit.h5 / mf_v2.h5 (+ nocv) with the fixed
-       converter (WFK + --pot --den --pawxml --corewf), verify ≡ the
-       *_ylmfix.h5 row-flip stopgaps, retire the stopgaps; regenerate any
-       pre-3956b45 ABINIT-sourced paw_aug numbers (eos_conv500-era exchange);
+2. Cluster follow-through:
+   (a) **RECONVERSIONS + RETIREMENT DONE 2026-07-26**: mf_abinit.h5 and
+       mf_v2.h5 (+ nocv) reconverted on rusty with the schema-3 converter
+       (sources/XMLs fingerprint-identified: b_tests = pair_gen/vB pair +
+       corewf; c4 = Psdj_paw_pbe_std/Si.xml; see
+       ~/ceph/CoQui/abinit/cmp/si222/RECONVERT_2026-07-26.md). VERIFIED
+       dataset-identical to the *_ylmfix row-flip stopgaps (161/157 shared
+       paths; only schema_version 2→3 + ecutrho 115.354→218.566 differ;
+       old nocv originals confirmed still bug-carrying). Stopgaps retired
+       (.retired), pre-fix mfs kept as .pre3956b45_bak; canonical names
+       now = schema-3 files. Remaining: post-build validation reruns
+       (parity/c4 numbers on the reconverted mfs; expect ~50 µHa-scale
+       shifts from the denser rho/aug sphere) and regeneration of any
+       OTHER pre-3956b45 ABINIT-sourced paw_aug numbers before quoting
+       (eos_conv500-era exchange — publication-gated).
    (b) C2 acceptance closure: rerun the DIRECT-route exchange on the a10.20
        mf with the CURRENT binary at matched settings and compare to
        THC-shape −1.7349632 — the recorded "direct −1.6863" is not a usable
-       reference (old binary; C1 static-D moved e_1e −73 mHa on that system).
-3. A-tests residual: QE-eigenvalue diagnostic rework (USPP/PAW 0.749/0.790 Ha
-   semicore) — last unchecked A sub-item.
-4. Hardening debt exposed this week (add as explicit items):
-   (a) np>1 regression test for the shm-builder path (set_H0 had zero
-       multi-rank coverage — how the compute_int_VQ deadlock shipped);
-   (b) bdft reader: clear error on orbital-less (pw2coqui) files and on
-       missing Core attrs instead of the HDF5 crash cascade; document
-       pw2coqui = qe-reader companion (NOT a standalone bdft file).
-5. Workstream E: E1 canonical doc; E2 stale-notes sweep now also includes
-   retracting the C4 "−47.6 mHa operator difference" anywhere quoted and
-   the pw2coqui-role documentation.
-6. Asset-gated: psp8-NLCC block-convention recheck (needs an NC psp8+NLCC
-   asset; none on rusty or host).
+       reference (old binary; C1 static-D moved e_1e −73 mHa on that
+       system). Tooling landed 2026-07-26: vexchange_mode_energies "env
+       bdft mf" section (COQUI_VEXCHANGE_MF_DIR/PREFIX) +
+       staging_conv_v3/run_c2_direct.sbatch on rusty; run after the
+       cluster rebuild.
+3. ~~A-tests residual~~ DONE 2026-07-26 (see the session block above).
+4. ~~Hardening debt (a)+(b)~~ DONE 2026-07-26 (see above).
+5. ~~Workstream E (E1+E2)~~ DONE 2026-07-26 (see above).
+6. psp8-NLCC block convention: **SOURCE-VERIFIED 2026-07-26** against
+   ABINIT's own reader (m_psp8.F90::psp8cc rescales by 1/(4π): "The input
+   functions contain the 4pi factor" ⇒ file = 4π·n_c(r) = exactly the
+   abinit_psp8.py assumption; comment updated). Only the end-to-end
+   numeric exercise on a real NLCC psp8 remains asset-gated — the
+   convention risk it guarded is closed.
 
 Last updated: 2026-07-25 (late) — Workstream D LANDED (D1–D4, host session).
 D1 audit (notes/paw_thc_d1_audit.md): normalization chain / q=0 kernel-zero +
@@ -116,7 +181,9 @@ paw_onecenter.hpp/pseudopot.h). Campaign results, all runs <2 min on ccq:
 - C4 CLOSED: Δe_1e(cv) = −0.5212248 vs ABINIT cv −0.521220 (4.8 µHa);
   E_X(shape) −1.36508 vs converged GW Σx (Arnaud, ISZ off, pawoptosc 1)
   −1.31747 → measured Fock-vs-Arnaud operator difference −47.6 mHa at
-  matched aug cutoff. Mode invariants verified on-cluster: e_1e identical
+  matched aug cutoff. [RETRACTED next day — that mf carried the real_ylm
+  odd-m sign bug (3956b45); true shape-vs-GW agreement is 0.10 mHa, see
+  the pin-down entry above.] Mode invariants verified on-cluster: e_1e identical
   moment/shape; E_X/RPA identical moment/nocv (cv strictly in e_1e).
 - C2 acceptance number: THC-shape E_X(vv) −1.7349632 (a10.20, 16 kpt);
   shape−moment +3.19 mHa (si222: +3.38 mHa, consistent). OPEN: reconcile
@@ -318,7 +385,7 @@ Workstream A — pseudopot D-matrix refactor
 - [x] A3 symmetry-correct nij becsum (full-BZ lift via compute_becsum_full_symm) + Hermitian pair symmetrization w/ hard residual check; add_vpp nosym guard removed (v_x(nij) guard kept, different scope) — 2026-07-24
 - [x] A4 hoist per-call statics onto pseudopot (paw_runtime_caches.hpp: aainit, qrad @ unified dq=0.01, Pskna lift, Δk-keyed Qfac w/ 256 MB budget); ∫V·Q̂ loop parallelized over G + all_reduce; THC lift site deferred to D1 — 2026-07-24
 - [x] A5 provenance checks at read time — dion Hermiticity+scale+shape, proj_per_atom length+Σ==nkb, per-species group/dataset sweep w/ length checks (ae_vloc/vloc_ps warned-optional until B1/B4: unused since A1, _hf fixture predates export) — 2026-07-24
-- [ ] A-tests: (i) nii≡nij≡no-density+Hartree DONE 2026-07-24 (h0_plus_hartree_identity + add_vpp_i5_alignment, after ∫V_loc·Q̂ settlement); (ii) sym≡nosym DONE via A3 (becsum_full_symm + sym fixture sections); ex_cvij factor-1 e_1e DONE 2026-07-25 (cluster c4 nocv: Δe_1e(cv) −0.5212248 vs ABINIT −0.521220 → 4.8 µHa); remaining: QE-eigenvalue diagnostic rework (USPP/PAW 0.749/0.790 Ha semicore)
+- [x] A-tests: (i) nii≡nij≡no-density+Hartree DONE 2026-07-24 (h0_plus_hartree_identity + add_vpp_i5_alignment, after ∫V_loc·Q̂ settlement); (ii) sym≡nosym DONE via A3 (becsum_full_symm + sym fixture sections); ex_cvij factor-1 e_1e DONE 2026-07-25 (cluster c4 nocv: Δe_1e(cv) −0.5212248 vs ABINIT −0.521220 → 4.8 µHa); (iv) QE-eigenvalue diagnostic rework DONE 2026-07-26 — explicit ∫V_xc·Q̂ assembly: USPP 0.749 Ha → 2.9e-6 STRICT, PAW 0.790 → 4.13e-2 = pure one-center XC, pinned two-sided [3.5e-2, 4.8e-2] — WORKSTREAM A COMPLETE
 
 Workstream B — converter parity
 - [x] B1 QE: delete deeq/deeq_nc export; schema_version attribute — 2026-07-24 (079783b)
@@ -340,5 +407,5 @@ Workstream D — ERI/THC route equivalence (Eq. path-equiv)
 - [x] D4 Cholesky+USPP/PAW hard-abort (builder ctor + read-only reader; diagnostic opt-in allow_smooth_only_aug_pp for the smooth-reference test) — 2026-07-25
 
 Workstream E — notes/documentation
-- [ ] E1 author canonical D-matrix doc (notes/paw_dmatrix_scgw.tex)
-- [ ] E2 corrections to stale notes (converter plan exx_X claim, GW-vs-HF reconciliation, k-weight line, STEP3, LaNiO3 retest-pending; 2026-07-25 additions: retract the C4 "−47.6 mHa Fock-vs-Arnaud operator difference" wherever quoted — it was the real_ylm bug, true agreement 0.10 mHa; document pw2coqui = qe-reader companion file, not standalone bdft)
+- [x] E1 author canonical D-matrix doc (notes/paw_dmatrix_scgw.tex/.pdf) — 2026-07-26
+- [x] E2 corrections to stale notes (converter plan exx_X claim corrected — it is ex_cvij; GW-vs-HF reconciliation addendum in paw_onsite_exchange_analysis.md; deeq-scaling k-weight line marked resolved-by-A3; STEP3 schema block superseded-marked; LaNiO3 marked retest-pending with fix list; −47.6 mHa retracted at every quote; pw2coqui-role documented in source header + contract + bdft error; plan tex I3 parenthetical amended to valence-only) — 2026-07-26

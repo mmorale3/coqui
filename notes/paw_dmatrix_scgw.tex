@@ -1,0 +1,429 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1.05in]{geometry}
+\usepackage{amsmath,amssymb,bm}
+\usepackage{enumitem}
+\usepackage[most]{tcolorbox}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{hyperref}
+
+\newtcolorbox{keybox}{colback=blue!4!white,colframe=blue!35!black,
+  boxrule=0.6pt,left=6pt,right=6pt,top=4pt,bottom=4pt}
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\file}[1]{\texttt{#1}}
+\newcommand{\Dstat}{D^{\rm stat}}
+\newcommand{\ket}[1]{|#1\rangle}
+\newcommand{\bra}[1]{\langle#1|}
+\newcommand{\Qhat}{\hat{Q}}
+\newcommand{\becsum}{\mathrm{becsum}}
+\newcommand{\phit}{\tilde\phi}
+
+\title{The CoQu\'i PAW/USPP $D$-matrix for self-consistent HF/GW:\\
+canonical conventions, derivations, and units ledger}
+\author{CoQu\'i PAW workstream (plan E1 deliverable)}
+\date{2026-07-26}
+
+\begin{document}
+\maketitle
+
+\noindent\textbf{Scope.} This is the canonical statement of the
+non-local $D$-matrix architecture used by CoQu\'i for ultrasoft (USPP) and
+PAW pseudopotentials in a Hartree--Fock / self-consistent-GW framework:
+what is frozen, what is density-dependent, where exchange lives, the
+normalization and unit conventions, and the derivations behind each choice.
+It supersedes the scattered statements in the working notes; the corrective
+plan (\file{notes/paw\_dmatrix\_cleanup\_plan.tex}) remains the project
+history, and \file{dmatrix\_paw\_generalization.tex} keeps its
+symmetry-rotation scope. The on-disk converter contract lives in
+\file{notes/converter\_h5\_contract.md}.
+
+\medskip
+\noindent\textbf{Setting.} Augmented species carry AE/PS partial-wave pairs
+$\phi_I,\phit_I$ (stored in $u=rR$ form), projectors $\beta_I$ with
+$\langle\beta_I|\phit_J\rangle=\delta_{IJ}$, and the $L$-decomposed
+compensation functions $Q^L_{ij}(r)$ (\code{qfuncl}, $r^2$-weighted).
+$I,J$ run over projector channels ($nh = \sum_b (2l_b{+}1)$ per species) on
+atom $a$; $n_{s,\mathbf{k},ab}$ is CoQu\'i's self-consistent density matrix
+in the band basis (never \code{mf.occ()} in production paths). Hartree
+atomic units ($e^2=1$) everywhere in memory; see the units ledger
+(\S\ref{sec:units}) for the on-disk story.
+
+%======================================================================
+\section{The partition}
+\label{sec:partition}
+
+\begin{keybox}
+\begin{equation}
+D_a(I,J)\;=\;\underbrace{\Dstat_a(I,J)}_{\text{frozen, built once}}
+\;+\;\underbrace{D^{H}_a(I,J)[n]}_{\text{Hartree only, rebuilt from the
+current }n}\,,
+\qquad\text{exchange is \emph{never} in } D .
+\end{equation}
+\end{keybox}
+
+\noindent This partition is what makes the operator HF/GW-compatible by
+construction: the static piece contains no DFT XC and no generator-density
+screening beyond the frozen core; every density-dependent Coulomb piece is
+rebuilt from CoQu\'i's own $n$; exact exchange enters only through
+$\Sigma_x$/$K$ built from ERIs or the direct $v_x$ routine (valence--valence),
+and through the frozen linear core--valence term inside $\Dstat$.
+
+%======================================================================
+\section{I1 --- the one-center density matrix (becsum) and its
+normalization}
+\label{sec:becsum}
+
+A \emph{single} becsum definition serves all consumers (Hartree, deeq,
+exchange, energies):
+\begin{keybox}
+\begin{equation}
+\becsum_a(I,J) \;=\; \frac{n_s}{N_k}
+\sum_{s}\sum_{\mathbf{k}\in\mathrm{full\ BZ}}\sum_{ab}
+P^{\mathbf{k}\,*}_{a,\,aI}\; n_{s,\mathbf{k},ab}\; P^{\mathbf{k}}_{b,\,aJ},
+\qquad n_s = \frac{2}{n_{\rm spin}}\ \ (n_{\rm pol}{=}1),
+\label{eq:becsum}
+\end{equation}
+\end{keybox}
+with $P^{\mathbf{k}}_{n,aI}=\langle\beta_{aI}|\tilde\psi_{n\mathbf{k}}\rangle$.
+
+\paragraph{Normalization derivation.} The valence density is
+\begin{equation}
+n(\mathbf r) = \frac{n_s}{N_k}\sum_{s}\sum_{\mathbf k}^{\rm BZ}\sum_{ab}
+n_{s,\mathbf{k},ab}\,\tilde\psi^*_{a\mathbf k}(\mathbf r)
+\tilde\psi_{b\mathbf k}(\mathbf r)\,,
+\end{equation}
+because CoQu\'i stores per-spin-channel occupations ($\code{occ}\in[0,1]$;
+converter contract \S1.5) and equal $k$-weights $w_k=1/N_k$ on the full BZ;
+the spin degeneracy $n_s$ is applied by the \emph{consumer}
+(\code{ns\_scl} in \code{v\_h}/becsum), never baked into \code{occ} on disk.
+The augmentation (compensation) density is by definition
+$\rho_{\rm aug}(\mathbf r)=\sum_{a,IJ}\becsum_a(I,J)\,
+\Qhat_{a,IJ}(\mathbf r)$; substituting the PAW expansion
+$\tilde\psi = \sum_I \phit_I \langle\beta_I|\tilde\psi\rangle$ inside the
+augmentation spheres forces exactly the prefactor of
+Eq.~\eqref{eq:becsum} --- the same $n_s/N_k$ that the smooth density
+carries. Any consumer that re-weights (e.g.\ the pre-A3 direct-path
+$w_k=1/N_k^{\rm IBZ}$ on a symmetry-reduced mesh) silently breaks the
+smooth/augmentation consistency of $V_H$.
+
+\paragraph{Symmetry.} When $N_k^{\rm IBZ}<N_k$ the projections are lifted to
+the full BZ by the atom-permutation + Wigner-$D$ + Bloch-phase machinery
+(View-2: full-BZ states are exactly rotated IBZ states in $G$-space; at
+time-reversal points the band matrix is complex-conjugated). The lift is
+cached on the \code{pseudopot} (\code{Pskna\_full\_bz}). Hermitian pair
+symmetrization $\tfrac12(b_{IJ}+b^*_{JI})$ stores the real part exactly
+(the anti-Hermitian imaginary part is inert against symmetric real
+$Q$/radial kernels); the anti-Hermitian residual is hard-checked
+$\le 10^{-8}$.
+
+%======================================================================
+\section{I2 --- the static $D$: frozen ionic $D^0$ plus frozen core--valence
+exchange}
+\label{sec:static}
+
+\begin{keybox}
+\begin{equation}
+\Dstat_{a}(I,J) \;=\; D^{0}_{t(a)}(I,J)
+\;+\; \alpha_x\, E^{cv}_{t(a)}(I,J)\,,
+\qquad \text{built once at \code{pseudopot} init, never mutated.}
+\label{eq:dstatic}
+\end{equation}
+\end{keybox}
+
+\subsection{$D^0$: content and backend provenance}
+\begin{equation}
+D^{0}_{IJ} \;=\; \big(T^{\rm AE} - T^{\rm PS}\big)_{IJ}
+\;+\; \big\langle \phi_I\phi_J \,\big|\, v_H[n_{Zc}] \big\rangle
+\;-\; \big\langle \phit_I\phit_J + \Qhat_{IJ} \,\big|\, v_H[\tilde n_{Zc}]
+\big\rangle .
+\label{eq:d0}
+\end{equation}
+AE$-$PS kinetic difference plus the frozen-core--screened ionic Hartree
+terms, including the compensation-moment piece on the PS side. XC-free by
+construction: no generator $V_{xc}$, no valence screening.
+\begin{itemize}[leftmargin=1.6em]
+\item \textbf{QE}: the UPF \code{dion} \emph{is} Eq.~\eqref{eq:d0} by
+generator convention; \code{pw2coqui} copies it verbatim ($\div e^2$ at
+schema $\ge 2$). CoQu\'i adds nothing at read.
+\item \textbf{ABINIT}: the PAW-XML stores only
+\code{kinetic\_energy\_differences}; the converter \emph{assembles}
+Eq.~\eqref{eq:d0} (\code{assemble\_dij0}): $v_H[n_{Zc}] = v_H[n_{\rm core}]
+- Z/r$ and $v_H[\tilde n_{Zc}]$ reconstructed from
+\code{zero\_potential} + Poisson of $\tilde n_{\rm core} + g_0(q_{\rm core}
+- Z)$, same-$l$ pairs, trapezoid to \code{kkbeta}, deliberately
+\emph{excluding} ABINIT's frozen atomic $V_{xc1}$ (ABINIT's stored
+$v_{loc}$ is \code{vbare}$+v_H-v_{xc1}$ for its DFT SCF; a GW/HF frozen
+$D^0$ must not carry it). Validated $\approx$4 digits against ABINIT's own
+dumped $D^0$.
+\end{itemize}
+
+\subsection{Why $\int V_{\rm loc}\Qhat$ is \emph{not} in $D^0$ (the
+descreening settlement)}
+\label{sec:vlocq}
+Eq.~\eqref{eq:d0} carries $-\langle\Qhat_{IJ}|v_H[\tilde n_{Zc}]\rangle$:
+the \emph{one-center, atomic} reference of the compensation--local-potential
+coupling, subtracted at dataset generation (standard USPP descreening).
+In the solid, the full periodic integral must be re-added:
+\begin{keybox}
+\begin{equation}
+H_0 = T + V_{\rm loc}
++ \sum_{a,IJ}\ket{\beta_{aI}}
+\Big[\Dstat_a(I,J) + \textstyle\int V_{\rm loc}\,\Qhat_{a,IJ}\Big]
+\bra{\beta_{aJ}}\,.
+\label{eq:h0}
+\end{equation}
+\end{keybox}
+The $\int V_{\rm loc}\Qhat$ term is the frozen one-body \emph{electrostatic}
+coupling of the compensation charge to the local potential --- neither
+exchange nor correlation --- and is ALWAYS included
+(\code{static\_h0\_D()}, lazily cached). Corroboration: the density path,
+which adds $\int(V_{\rm loc}+V_H)\Qhat$ on top of \code{dion}, reproduces
+QE's \code{deeq} to $\sim$$10^{-6}$ --- impossible if \code{dion} already
+contained the smooth-grid piece. With this placement the operator identity
+$H(n)\equiv H_0 + V_H(n)$ holds \emph{exactly}
+(\code{h0\_plus\_hartree\_identity}, $\le 2.5\times10^{-13}$).
+
+\subsection{$E^{cv}$: frozen core--valence exact exchange, factor 1}
+\label{sec:excv}
+With frozen core orbitals $\{\varphi_c\}$ the core--valence Fock exchange
+energy is
+\begin{equation}
+E_x^{cv} = -\sum_{v}\,f_v \sum_{c}
+\big\langle \psi_v \varphi_c \big|\, r_{12}^{-1} \big|\,
+\varphi_c \psi_v \big\rangle
+\;=\; \mathrm{Tr}\big[\,D_m\, X^{cv}\,\big],
+\end{equation}
+i.e.\ \emph{linear} in the valence density matrix because the core is not
+varied (Rostgaard-style frozen-core exchange). A linear-in-$D_m$ term is a
+\textbf{one-body operator}: it belongs in $H_0$ and is captured through
+$e_{1e}=\mathrm{Tr}[D_m H_0]$ with \textbf{factor 1}. The $\tfrac12$ of
+$\tfrac12\mathrm{Tr}[D_m K]$ applies only to terms \emph{quadratic} in
+$D_m$ (valence--valence); routing $E^{cv}$ through $K$ would halve it.
+In the projector representation, expanding $\psi_v$ in AE partial waves
+inside the sphere and carrying out the closed-shell angular sum,
+\begin{equation}
+E^{cv}_{IJ} \;=\; -\,\delta_{l_I l_J}\delta_{m_I m_J}
+\sum_c \sum_L (2l_c+1)
+\begin{pmatrix} l_I & L & l_c \\ 0&0&0 \end{pmatrix}^{\!2}
+R^L\!\big(\phi_I\varphi_c;\varphi_c\phi_J\big)\,,
+\label{eq:excv}
+\end{equation}
+$lm$-diagonal, with $R^L$ the Slater radial integral. Validation anchors:
+hydrogenic $K(1s,2s)=16Z/729$, $K(1s,2p)=112Z/6561$ ($\sim 3\times
+10^{-11}$); atompaw \code{<exact\_exchange\_X\_matrix>} for Al-stringent
+($\sim 10^{-7}$ rel); factor 1 pinned end-to-end against ABINIT
+\code{m\_pawdij} (\code{dijfock\_cv}): $\Delta e_{1e}(cv) = -0.5212248$ vs
+ABINIT $-0.521220$ Ha (4.8\,$\mu$Ha) on si222. Source order at read:
+\code{Onecenter/ex\_cvij} (ABINIT-XML) $\to$ native build from
+\code{Core/ae\_wfc} (\code{compute\_ex\_cvij\_from\_core}, both backends)
+$\to$ absent with a loud warning. $\alpha_x$ is the hybrid mixing (1 for
+HF/GW; the DFT-$V_{xc}$ c--v option remains a declared-but-aborting enum).
+
+%======================================================================
+\section{I3 --- the dynamic $D$: Hartree only, valence only}
+\label{sec:dynamic}
+
+\begin{keybox}
+\begin{equation}
+D^{H}_{a}(I,J)[n] \;=\;
+\int \! d^3r\; v_H\big[\bar\rho[n]\big](\mathbf{r})\, \Qhat_{a,IJ}(\mathbf{r})
+\;+\; \Delta D^{H}_{a}(I,J)\big[\becsum[n]\big],
+\label{eq:dh}
+\end{equation}
+\end{keybox}
+with $\bar\rho[n]$ = smooth valence density + compensation charge, and
+$\Delta D^H$ the radial AE$-$PS one-center \emph{valence} Hartree
+(\code{compute\_paw\_hartree\_atom}, $\code{rad\_fac}=1$). For the KS-like
+operator the $\int V \Qhat$ piece uses $V_{\rm loc}+V_H$ (with the
+$V_{\rm loc}$ part already frozen into Eq.~\eqref{eq:h0}); for the pure
+Hartree matrix it uses $V_H$ only. Rebuilt from the \emph{current} $n$ at
+every evaluation; no QE-density quantity survives anywhere.
+
+\paragraph{Valence-only contract (D2 resolution, 2026-07-25).}
+No frozen-core density enters Eq.~\eqref{eq:dh}. The core--valence
+one-center electrostatics is already inside $D^0$
+(Eq.~\eqref{eq:d0}: $v_H[n_{Zc}]$ vs $v_H[\tilde n_{Zc}]$ contain the core
+Hartree). Injecting $\rho_{\rm core}^{\rm AE/PS}$ into the dynamic radial
+Hartree double-counts it. Measured consequence on the ABINIT semicore
+fixture (whose species export core wavefunctions; every QE fixture has
+empty core fields and is blind to this): $+19.98$ Ha excess in the $V_H$
+trace, isolated by a term-by-term trace decomposition against an
+independent numpy probe (smooth-bra $3.7615$ \checkmark, dynamic
+$\int V\Qhat$ $25.4505$ \checkmark, radial one-center $31.77$ vs the
+$11.793$ target). Regression guard: \code{ab\_direct\_vh\_trace\_split}
+pins all four pieces; post-fix direct trace $+41.0055$ vs target
+$+41.005$.
+
+\paragraph{XC.} No DFT XC anywhere in $D$ (static or dynamic). The QE
+\code{deeq} (which carries $\int V_{xc}\Qhat$ and one-center XC) is
+neither exported by the converters (schema $\ge 1$) nor readable by
+CoQu\'i. QE-eigenvalue reproduction is a \emph{diagnostic} that assembles
+$\Dstat + D^H[n_{\rm QE}] + \int V_{xc}\Qhat$ explicitly test-side
+(\code{dft\_eigenvalues}); the PAW residual of that diagnostic is the
+radial one-center XC of QE's \code{ddd\_paw}, deliberately unassembled.
+
+%======================================================================
+\section{I4 --- exchange: two augmentation modes, one prefactor}
+\label{sec:exchange}
+
+Valence--valence exact exchange lives in the direct $v_x$ routine and in
+the THC/Cholesky ERIs, never in $D$. Two selectable augmentation-density
+modes (single source of truth: \code{vv\_compensation} in
+\code{paw\_exx\_options}; \code{deltaC}/$K_a$ inclusion is mode-derived):
+
+\begin{keybox}
+\begin{itemize}[leftmargin=1.6em]
+\item \textbf{\code{moment}} (default): moment-restored compensation charge
+$\Qhat$ in the pair densities \emph{plus} the one-center residual
+$\Delta C = K_{\rm AE}-K_{\rm PS}$ contracted with prefactor
+$s_{\rm oc}=-1/N_k$. Operator identity: the exact one-center Fock operator
+--- ABINIT \code{pawdijfock} ($e_{ijkl}$ + \code{ex\_cvij}) / VASP $K_a$
+analogue.
+\item \textbf{\code{shape}}: the full AE$-$PS partial-wave pair density
+($\phi_I\phi_J-\phit_I\phit_J$ form factors,
+\code{build\_qrad\_tab\_full\_aeps}) on the dense grid, $\Delta C$
+\emph{dropped} (it would double count). Operator identity: the Arnaud
+plane-wave / GW-oscillator operator (ABINIT GW $\Sigma_x$,
+\code{pawoptosc}).
+\item In \emph{both} modes core--valence exchange comes from $E^{cv}$ in
+$\Dstat$ (\S\ref{sec:excv}); core--core is the additive constant
+\code{exx\_core\_core}.
+\end{itemize}
+\end{keybox}
+
+\paragraph{The $-1/N_k$ prefactor (derivation summary).} The Fock-operator
+matrix element carries no $\tfrac12$ (it is the functional derivative of
+the quadratic exchange energy); per $k$-point sums enter through
+$w_k=1/N_k$, and the one-center $\Delta C$ contraction is already an energy
+integral (no volume measure), giving $s_{\rm oc}=-1/N_k$ exactly ---
+\emph{no spin factor, no} $\tfrac12$. Confirmed four independent ways
+(from-scratch HF derivation; QE \code{paw\_exx.f90} unit-converted; VASP
+PAW-EXX; THC $K_a$ to machine precision). The historical empirical value
+$-1/(4N_k)$ was the classic two-wrongs fit: it cancelled a stale fixture
+whose \code{deltaC} was $4\times$ too large (pre-\code{/e2$^2$}
+\code{pw2coqui}). Full derivation:
+\file{notes/paw\_onecenter\_exchange\_prefactor.md}.
+
+\paragraph{Fock vs Arnaud, measured.} The two modes are different
+\emph{operators} and must not be conflated when validating against ABINIT:
+hybrid-DFT Fock (\code{pawdijfock}) is exact one-center exchange; the GW
+$\Sigma_x$ (Arnaud oscillators) is the plane-wave/shape-restored form. On
+the corrected ABINIT-converted Si mf (post \code{real\_ylm} fix 3956b45):
+$E_X(\code{shape}) = -1.3175731$ vs converged GW $\Sigma_x$ $-1.31747$
+$\Rightarrow$ \textbf{0.10 mHa} agreement; \code{moment} $-1.3178007$
+(mode split $-0.23$ mHa on that system; $+3.2$--$3.4$ mHa on the
+16-kpt/si222 pair). The earlier ``$-47.6$ mHa Fock-vs-Arnaud operator
+difference'' is \textbf{retracted} --- it was the converter's missing
+odd-$m$ Condon--Shortley signs, not physics. Hartree always uses moment
+restoration (compensated smooth + radial one-center is already exact for
+Hartree --- documented, not option-ized).
+
+%======================================================================
+\section{I5--I8 --- evaluation semantics, parity, and basis}
+\label{sec:i5678}
+
+\paragraph{I5 (route selectability).} \code{nii}/\code{nij} vs no-density
+in \code{add\_vpp\_impl} is by design: no density $\Rightarrow$
+Eq.~\eqref{eq:h0} only (ERIs supply Hartree/exchange); density passed
+$\Rightarrow$ the requested dynamic terms are added under separate
+\code{add\_hartree}/\code{add\_exchange} flags; \code{nii} and \code{nij}
+overloads produce the identical operator for the same physical density
+($\le 10^{-15}$, \code{add\_vpp\_i5\_alignment}).
+
+\paragraph{I6 (backend parity).} A QE- and an ABINIT-converted h5 for the
+same system drive the identical CoQu\'i code path; the only tolerated
+divergence is dataset \emph{presence} (\code{ex\_cvij}, \code{Core/},
+\code{exx\_core\_core}, \code{madelung\_constant}). Known semantic
+asymmetries (dion provenance, \code{ae\_vloc} content, $\Delta C$
+quadrature domain) are catalogued in
+\file{notes/converter\_h5\_contract.md} \S4. Post-fix converter parity on
+Si PAW: $\Delta E_X$ 87\,$\mu$Ha, $\Delta$RPA 23\,$\mu$Ha; the residual
+$\Delta e_{1e}$ is a benign uniform $v_{\rm loc}(G{=}0)$ gauge constant.
+
+\paragraph{I7 (path equivalence).} The ERI route (THC/Cholesky) and the
+direct route are a compatible partitioning of the same Hamiltonian:
+$J^{\rm ERI}=J^{\rm direct}$, $K^{\rm ERI}=K^{\rm direct}$ element-wise up
+to converged ISDF thresholds. Acceptance (Workstream D): V$_x$
+route-equivalence STRICT on QE and ABINIT fixtures
+(\code{thc\_vs\_direct\_VH\_VX}; AB $3.7\times10^{-5}$), $V_H$ at the
+THC-truncation scale, Hartree energy THC $\equiv$ ABINIT+one-center AE
+target to $4.9\times10^{-4}$ Ha. Smooth-only ERIs can never ship silently
+for augmented species (Cholesky hard-abort, D4).
+
+\paragraph{I8 (AE basis, identity overlap).} HF/GW algebra operates in the
+AE orbital basis $\ket{\psi}=\hat T\ket{\tilde\psi}$: every matrix element
+is an AE matrix element represented through smooth orbitals + projector
+augmentation, and the overlap in all SCF/Dyson algebra is the
+\textbf{identity}. \code{nii}/\code{nij} are AE density matrices; the
+$S$-orthonormality of the smooth orbitals is a property of the
+representation, not an extra metric in the theory.
+
+%======================================================================
+\section{Units and schema ledger}
+\label{sec:units}
+
+\textbf{In memory: Hartree everywhere} (since plan B4), including
+\code{dion}, \code{ae\_vloc}/\code{vloc\_ps}, $\Delta C$, \code{ex\_cvij},
+local potentials. Lengths in Bohr, reciprocal in Bohr$^{-1}$.
+
+\begin{center}
+\begin{tabular}{@{}llll@{}}
+\toprule
+\code{schema\_version} & energy datasets & \code{/Orbitals@ecutrho} & notes\\
+\midrule
+absent & Ry (legacy, QE deeq era) & Ry & readers scale $\times\tfrac12$\\
+1 & Ry, deeq-free & Ry & B1\\
+2 & \textbf{Hartree} & Ry (QE) / Ha (AB) & B4; readers stop scaling\\
+3 & Hartree & \textbf{Hartree} (pinned) & 2026-07 audit; dead data dropped\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent QE-side conversions at write: $/e^2$ on all energy data,
+$/e^{2\,2}$ on \code{deltaC} (QE's \code{PAW\_init\_fock\_kernel} returns
+$e^{2\,2}$-scaled values). ABINIT is natively Ha (no factors).
+At schema 3, \code{ecutrho} is the exact inscribed-sphere cutoff of the
+dense/aug FFT box ($|G|^2 \le 2\,e_{\rm cut}$ reproduces \code{miller\_g});
+the pre-pin QE attribute was raw Ry (a $2\times$ inflated sphere on the
+h5-init path --- fixed reader-side for all older files). \code{occ} is
+per-spin-channel $\in[0,1]$; \code{kpoint\_weights} sum to 1. Real
+harmonics follow QE \code{ylmr2} everywhere, \emph{including} the odd-$m$
+Condon--Shortley signs --- channel-diagonal quantities are blind to a sign
+error there; only off-diagonal $(\mathbf k,\mathbf k{-}\mathbf q)$ pair
+quantities expose it (the 3956b45 lesson).
+
+%======================================================================
+\section{Validation ledger (anchors)}
+\label{sec:validation}
+
+\begin{itemize}[leftmargin=1.6em,itemsep=2pt]
+\item $H(n)\equiv H_0+V_H(n)$: $\le 2.5\times10^{-13}$
+(nii/nij $\times$ NCPP/USPP/PAW/PAW-sym).
+\item becsum symmetry: diag-nij $\equiv$ diagonal $\sim 10^{-15}$;
+nosym reduction exact.
+\item deeq self-consistency vs QE (historic, density path):
+$\sim 10^{-6}$.
+\item \code{ex\_cvij}: hydrogenic $3\times10^{-11}$; atompaw X-matrix
+$10^{-7}$; end-to-end $\Delta e_{1e}(cv)$ 4.8\,$\mu$Ha vs ABINIT.
+\item One-center prefactor: THC $K_a$ $\equiv$ direct $\Delta C$
+contraction to machine precision at $s_{\rm oc}=-1/N_k$.
+\item Mode identities: $E_X(\code{shape})$ vs ABINIT GW $\Sigma_x$
+0.10 mHa; smooth exchange vs ABINIT bare-Coulomb (\code{fock\_icutcoul=3})
+$\mu$Ha.
+\item Converter parity (Si PAW, post-3956b45): $\Delta E_X$ 87\,$\mu$Ha,
+$\Delta$RPA 23\,$\mu$Ha, $\Delta$HF 128\,$\mu$Ha.
+\item Route equivalence: $V_x$ strict on QE+AB; synthetic $\ell=3$
+augmentation chain at machine precision
+(\code{paw\_q\_eval\_synthetic\_l3}).
+\item AB direct-$V_H$ trace split pinned
+(\code{ab\_direct\_vh\_trace\_split}); D2 valence-only contract.
+\end{itemize}
+
+\medskip
+\noindent\textbf{Open, tracked, non-blocking:} spin-resolved $D^H$ seam
+(magnetics), SOC through the static assembly
+(\code{qq\_so}/\code{dion\_so}), LaNiO$_3$ $\ell\ge3$ anomaly follow-up,
+dense-grid THC memory footprint, psp8-NLCC block convention
+(asset-gated).
+
+\end{document}

@@ -103,10 +103,16 @@ After the fix, all four consumers — {diagonal, full} × {radial-direct,
 smooth-grid} — use `becsum = (ns_scl/N_k) Σ P* n P`, and `rad_fac = 1`
 holds universally and MF-independently.
 
-Both builders still assume **uniform k-weights** (nosym / full BZ); a
+~~Both builders still assume **uniform k-weights** (nosym / full BZ); a
 symmetry-reduced IBZ would need real per-k weights threaded through both
-helpers. This is a pre-existing limitation shared by the diagonal helper, not
-introduced here.
+helpers.~~ **[STALE — refreshed 2026-07-26, plan E2]** Resolved by plan A3
+(2026-07-24): both becsum builders are now symmetry-correct on any k-mesh via
+the full-BZ projector lift (`compute_becsum_diagonal_symm` /
+`compute_becsum_full_symm`, View-2 atom-perm + Wigner-D + Bloch phase, trev
+conjugation) with the uniform full-BZ weight `1/N_k` applied AFTER the lift —
+no per-k IBZ weights are ever needed. Verified: `becsum_full_symm` TEST_CASE
++ sym-fixture sections of `vhartree_nij_vs_nii` (H(nij)≡H(nii) ≤ 4.5e-14 on
+qe_lih222_paw_sym / qe_si222_paw_sym).
 
 ## 5. Validation that is MF-independent
 

@@ -137,7 +137,14 @@ D^{H}_{a}(I,J)[n] \;=\;
 where $\bar\rho$ = smooth density + compensation charge, and $\Delta D^{H}$
 is the radial AE$-$PS one-center Hartree
 (\code{compute\_paw\_hartree\_atom}; proper Hartree units,
-$\code{rad\_fac}=1$, frozen-core AE/PS core densities included). For the full
+$\code{rad\_fac}=1$, \textbf{valence-only}: no frozen-core densities enter
+the dynamic radial Hartree --- the core--valence one-center electrostatics
+is already inside $D^0$ (I2), and injecting $\rho_{\rm core}$ here
+double-counts it ($+19.98$\,Ha $V_H$ trace excess on the AB semicore
+fixture; root-caused and resolved 2026-07-25, guard
+\code{ab\_direct\_vh\_trace\_split}). An earlier revision of this
+parenthetical said ``frozen-core AE/PS core densities included'' --- that
+is SUPERSEDED by the D2 resolution). For the full
 KS-like operator the $\int V\,\Qhat$ piece uses $V_{\rm loc}+V_H$; for the
 pure Hartree matrix it uses $V_H$ only. Both already exist in
 \code{compute\_paw\_deeq\_from\_becsum}; they become the \emph{only} source

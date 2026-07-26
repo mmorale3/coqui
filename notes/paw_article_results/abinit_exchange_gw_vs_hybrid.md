@@ -188,3 +188,17 @@ tail. => the 78 mHa is smooth-pair-density GRID CONVERGENCE (closes on CoQuI's d
 path), not the exact-exchange operator. ABINIT per-band (Ha, Gamma, nonhat=raw psi~psi~):
 b0 -0.46734, b1-3 -0.34071, b4-5 -0.19095. CoQuI (Ha): b0 -0.42885, b1 -0.32193, b2 -0.31468,
 b3 -0.32270, b4 -0.18968, b5 -0.18442.
+
+---
+
+UPDATE (2026-07-25/26, C4 closure + E2 retraction): the cluster regeneration
+was done. ABINIT GW Sigma_x regenerated on the cmp mf (pawoptosc=1, ISZ off):
+ecutsigx=25 reproduces -1.316447 exactly (provenance confirmed), converged
+value -1.31747. First comparison on the then-current mf gave a "-47.6 mHa
+Fock-vs-Arnaud operator difference" at matched aug cutoff — that number is
+RETRACTED: the mf carried the abinit2coqui real_ylm odd-m Condon-Shortley
+sign bug (fixed 3956b45). On the corrected mf: CoQui E_X(shape) = -1.3175731
+vs converged GW Sigma_x -1.31747 → agreement to 0.10 mHa; E_X(moment+deltaC)
+= -1.3178007 (shape-moment split -0.23 mHa on this system). Both operator
+identities (moment ≡ pawdijfock Fock, shape ≡ Arnaud GW Sigma_x) are
+therefore confirmed numerically on matching sides. C4 CLOSED.

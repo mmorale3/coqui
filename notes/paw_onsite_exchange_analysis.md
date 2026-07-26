@@ -287,3 +287,32 @@ bilinear `⟨ρ_{mn}|v|ρ_{mn}⟩` and that CoQuí's terms map exactly as writte
 the `0.052 Ha` numerical closure supports this. Before implementing, reproduce the
 decomposition at a second system (e.g. LiH or a 3d oxide, where on‑site exchange is
 larger) to confirm the missing‑term identity holds beyond Si sp.
+
+---
+
+## Addendum (2026-07-26, plan E2): GW-vs-HF reconciliation — how this note resolved
+
+The "correct (all-electron)" ABINIT on-site target used throughout this note
+(`+0.0925 Ha`, and the si222 `-1.316447 Ha` family) came from ABINIT's **GW
+Sigma_x** pipeline (`calc_sigx_me` / `m_pawpwij` Arnaud–Alouani oscillators)
+— which is a DIFFERENT operator from ABINIT's hybrid-DFT Fock
+(`pawdijfock`: exact one-center `eijkl` + `ex_cvij`). The reconciliation
+(plan C4, 2026-07-21→25; see
+`notes/paw_article_results/abinit_exchange_gw_vs_hybrid.md`):
+
+- CoQuí **moment+deltaC** mode ≡ ABINIT **HF Fock** side: deltaC ≡ `eijkl`
+  to 5.5e-5 rel, `ex_cvij` machine-identical, on-site vv+cv energies
+  identical; the smooth residual closed via bare-Coulomb
+  (`fock_icutcoul=3`) at the µHa level.
+- CoQuí **shape** mode (full AE−PS form factors,
+  `build_qrad_tab_full_aeps` — i.e. exactly the "missing term" this note
+  derived, landed as Option A) ≡ ABINIT **GW Sigma_x**: on the corrected
+  ABINIT-converted mf, E_X(shape) = −1.3175731 vs converged GW Σx −1.31747
+  → **0.10 mHa**.
+- The interim "−47.6 mHa Fock-vs-Arnaud operator difference" reported from
+  the first cluster campaign is **RETRACTED** — it was the abinit2coqui
+  `real_ylm` odd-m Condon–Shortley sign bug (fixed 3956b45), not physics.
+
+So the `0.052 Ha` gap analyzed here was real, was the shape-restored
+pair-density term, and is now a selectable mode validated against the
+matching ABINIT operator on both sides.
