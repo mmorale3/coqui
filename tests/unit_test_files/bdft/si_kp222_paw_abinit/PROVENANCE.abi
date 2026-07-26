@@ -1,0 +1,29 @@
+# Si diamond, PAW (LDA-PW 12-electron dataset), 2x2x2 full-BZ nosym grid.
+# D2 route-equivalence fixture source: WFK+DEN+POT converted via abinit2coqui
+# (--pawxml --corewf --pot --den --xc lda_pw).
+acell 3*10.26
+rprim  0.0 0.5 0.5   0.5 0.0 0.5   0.5 0.5 0.0
+ntypat 1  znucl 14  natom 2  typat 1 1
+xred  0.0 0.0 0.0   0.25 0.25 0.25
+
+ecut 15.0
+pawecutdg 30.0
+ngkpt 2 2 2
+nshiftk 1
+shiftk 0.0 0.0 0.0
+kptopt 3          # full BZ (8 k-points), no symmetry reduction
+nsym 1            # nosym
+istwfk *1
+
+occopt 1
+nband 16          # 24 valence electrons -> 12 occupied + buffer
+tolvrs 1.0d-12
+nstep 100
+
+prtwf 1
+prtden 1
+prtpot 1
+iomode 3
+
+pp_dirpath "/Users/mmorales/abinit_local/abinit-10.6.7/tests/Pspdir"
+pseudos "Si_paw_pw_12el.xml"

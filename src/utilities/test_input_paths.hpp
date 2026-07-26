@@ -167,6 +167,15 @@ inline std::tuple<std::string,std::string> utest_filename(std::string src)
     return std::make_tuple(std::string(PROJECT_SOURCE_DIR)+
                                "/tests/unit_test_files/bdft/lih_kp222_nbnd16_sym/",
                            std::string("bdft"));
+  } else if (src == "bdft_si222_paw_ab") {
+    // ABINIT-sourced Si PAW mf (abinit2coqui: WFK+POT+DEN+pawxml+corewf,
+    // LDA-PW 12-electron dataset, 2x2x2 full-BZ nosym). Plan D2: the
+    // route-equivalence matrix MUST include an ABINIT-sourced mf — the
+    // real_ylm converter bug was invisible to QE-only route tests.
+    // Generation input: PROVENANCE.abi in the fixture directory.
+    return std::make_tuple(std::string(PROJECT_SOURCE_DIR)+
+                               "/tests/unit_test_files/bdft/si_kp222_paw_abinit/",
+                           std::string("bdft"));
 /*
   } else if (src == "bdft_si222") {
     return std::make_tuple(std::string(PROJECT_SOURCE_DIR)+

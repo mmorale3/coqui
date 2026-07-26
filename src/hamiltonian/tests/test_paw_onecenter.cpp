@@ -71,6 +71,12 @@ TEST_CASE("paw_onecenter_dDeeq_H_matches_deltaC_contraction",
         // hunt lives.
         run_dDeeq_H_matches_deltaC_test("qe_si222_paw", 1e-4);
     }
+    SECTION("bdft_si222_paw_ab") {
+        // Plan D2: converter-written deltaC vs the radial one-center
+        // machinery on an ABINIT-sourced mf (12-electron semicore
+        // dataset; referees the direct-route V_H matrix discrepancy).
+        run_dDeeq_H_matches_deltaC_test("bdft_si222_paw_ab", 1e-4);
+    }
 }
 
 static void run_dDeeq_H_matches_deltaC_test(std::string fixture_name,

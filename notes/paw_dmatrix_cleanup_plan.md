@@ -10,10 +10,19 @@ printed into context at session start by a SessionStart hook).
 
 ## STATUS
 
-REMAINING TO COMPLETE THE PHASE (2026-07-25, post pin-down; next session = D):
-1. Workstream D (the critical path, untouched): D1–D4 below. D2 MUST include
-   an ABINIT-sourced-mf fixture in the test matrix — the real_ylm bug survived
-   every audit precisely because no route-equivalence test ran on an AB mf.
+REMAINING TO COMPLETE THE PHASE (2026-07-25 late, post-D session):
+1. **AB direct-Hartree OPEN DEFECT (from D2, highest priority)**: on the new
+   ABINIT-sourced fixture (bdft_si222_paw_ab, 12-el semicore, split mesh
+   14³/36³, sphere miller_g) the PRODUCTION add_Hartree_impl V_H matrix is
+   wrong: trace +60.98 Ha vs the independently-established +41.005 (ABINIT
+   smooth 58.4283/2 + deltaC one-center 11.79); THC V_H is EXACT (energy
+   test agrees with the AE target to 4.9e-4 Ha; trace matches prediction to
+   1e-4). V_x route-equivalent at 3.7e-5 on the same mf. Ruled out: stored
+   qgm (2e-11 vs runtime), deltaC-vs-radial (1e-7), test-side mesh mixups
+   (fixed). See the FIXME at test_hamilt.cpp thc_vs_direct_VH_VX AB section
+   (strict_VH=false until root-caused). Every QE fixture passes — the
+   defect needs the AB mf traits to manifest. Suspect space: v_h smooth+aug
+   assembly / add_vloc / compute_paw_deeq interaction with the bdft reader.
 2. Cluster follow-through (one short session, mechanical):
    (a) properly reconvert mf_abinit.h5 / mf_v2.h5 (+ nocv) with the fixed
        converter (WFK + --pot --den --pawxml --corewf), verify ≡ the
@@ -37,7 +46,43 @@ REMAINING TO COMPLETE THE PHASE (2026-07-25, post pin-down; next session = D):
 6. Asset-gated: psp8-NLCC block-convention recheck (needs an NC psp8+NLCC
    asset; none on rusty or host).
 
-Last updated: 2026-07-25 (pin-down, commit 3956b45) — the B-tests 51.8 mHa
+Last updated: 2026-07-25 (late) — Workstream D LANDED (D1–D4, host session).
+D1 audit (notes/paw_thc_d1_audit.md): normalization chain / q=0 kernel-zero +
+analytic madelung·S·D·S / K_a placement / Hermiticity / AE-basis X rows all
+verified consistent with anchors; three fixes: F1 smooth-only q=0 HEAD
+VECTORS (_Chi_head/_Chi_bar_head never extended by augmentation — OOB reads
+in GW Sigma_div_correction / g0_div_utils / embed_eri whenever PAW aug +
+gygi; aug rows now carry conj(Ω·η^q(G=0)), χ̄ zero-padded = the still-valid
+smooth LS representation of the G=0 plane wave); F2 augmented-ERI file
+read-back aborted on rp!=Np (allow rp<=Np, recover the smooth/aug split,
+hard-check head columns); F3 A4-deferred Pskna lift site now uses the shared
+psp cache (contexts provably identical via make_pseudopot; explicit build
+kept as fallback). D3: gather buffers in the aug q-loop G-chunked (8192 —
+the N_aux≳10k OOM driver was (tile rows)×ngm); aug-stage per-rank memory
+estimator + freemem warning (thc.icc's predates augmentation); synthetic
+l=3 TEST_CASE paw_q_eval_synthetic_l3 (test_paw_radial.cpp): QE-ylmr2
+recursion at L≤6 vs boost 3e-15, aainit ap vs quadrature Gaunt 5e-14, qrad
+interp 4e-13, full evaluate_Q_IJ_at_K s⊗s/s⊗f/f⊗f vs independent assembly
+6e-18 — the LaNiO3 f-channel chain is validated. D4: cholesky ctor +
+read-only chol_reader_t hard-abort on USPP/PAW (smooth-only ERIs never ship
+silently); diagnostic opt-in allow_smooth_only_aug_pp=true used by the
+paw_aug exchange test. D2: NEW ABINIT-SOURCED FIXTURE
+tests/unit_test_files/bdft/si_kp222_paw_abinit (Si_paw_pw_12el.xml+corewf,
+LDA-PW semicore, 2x2x2 full-BZ nosym, generated with the host abinit build,
+PROVENANCE.abi included; wired as bdft_si222_paw_ab). AB sections added to
+thc_vs_direct_VH_VX (V_x STRICT-PASSES 3.7e-5 — the real_ylm bug class is
+now gated), thc_shape_mode_vs_direct, paw_aug_q_eval_at_q0 (stored qgm ≡
+runtime 2e-11), paw_onecenter_dDeeq_H_matches_deltaC_contraction (1e-7),
+hartree_thc_paw_aug (THC ≡ ABINIT+one-center AE target to 4.9e-4 Ha after
+fixing a TEST-HELPER bug: hartree/exchange energy helpers passed the SMOOTH
+fft mesh while swfc_to_rho maps to the AUG mesh — silent coefficient drops
++ miller aliasing, hidden by every equal-mesh QE fixture). D2 CATCH: the
+production direct-route V_H matrix is WRONG on this mf (see item 1 above)
+— exactly the class of defect the AB fixture was mandated to expose.
+Deferred: RPA/HF energy regression vs rusty Si_conv (cluster); sym×AB
+fixture (QE covers sym; AB adds the converter dimension nosym-first).
+
+Previous update: 2026-07-25 (pin-down, commit 3956b45) — the B-tests 51.8 mHa
 exchange gap is ROOT-CAUSED AND FIXED: abinit2coqui real_ylm wrote plain
 real harmonics into projector_k while QE ylmr2 / CoQui aainit / the
 converter's own qfuncl carry the (−1)^m Condon–Shortley sign on odd-m
@@ -284,10 +329,10 @@ Workstream C — augmentation-density modes
 - [x] C4 physics validation (host-side portion): operator identity SETTLED — −1.316447 is the GW Sigma_x (Arnaud) operator, NOT HF Fock (2026-07-21 instrumented-ABINIT work, notes/paw_article_results/abinit_exchange_gw_vs_hybrid.md, updated). HF-side match DONE: deltaC ≡ ABINIT eijkl 5.5e-5 rel + ex_cvij machine-identical (kernels), onsite vv+cv energies identical, smooth residual closed via fock_icutcoul=3 (µHa). Current-code baselines recorded via new [slow] TEST_CASE vexchange_mode_energies (direct dense-grid, ignore_g0): lih222_paw_hf −1.64406506/−1.64395244 (moment+deltaC / shape, split +1.13e-4); local si222_paw −1.31194760/−1.31187642 (split +7.1e-5 — this fixture has fft_mesh_aug==fft_mesh=36³: a coarse aug sphere truncates both modes equally, AND it is a different cell from the rusty cmp mf, so NOT comparable to −1.316447). CLUSTER PORTION DONE 2026-07-25: ABINIT GW Σx regenerated (pawoptosc=1, ISZ off; ecutsigx 25→−1.316447 exact provenance match, converged −1.31747); Δe_1e(cv) 4.8 µHa vs ABINIT −0.521220. REVISED post-3956b45 (the mf carried the real_ylm bug): E_X(shape) = −1.3175731 on the fixed mf → agrees with converged GW Σx to 0.10 mHa (the earlier −47.6 mHa was the converter bug, NOT an operator difference); moment −1.3178007, shape−moment −0.23 mHa. C4 CLOSED — 2026-07-25
 
 Workstream D — ERI/THC route equivalence (Eq. path-equiv)
-- [ ] D1 audit thc.h/thc.icc/thc_reader_t vs A conventions (AE basis, identity overlap)
-- [ ] D2 route-equivalence matrix-element tests (THC vs hamiltonian), both modes, NCPP/USPP/PAW × sym/nosym; MUST include an ABINIT-sourced-mf fixture (the real_ylm bug was invisible to QE-only route tests — 2026-07-25)
-- [ ] D3 THC OOM at N_aux≳10k + synthetic l=3 augmentation unit test
-- [ ] D4 Cholesky+USPP/PAW hard-abort (no augmentation yet)
+- [x] D1 audit thc.h/thc.icc/thc_reader_t vs A conventions — verified-consistent ledger + 3 fixes (aug q=0 head vectors; augmented-ERI read-back; Pskna lift → shared cache) in notes/paw_thc_d1_audit.md — 2026-07-25
+- [x] D2 route-equivalence matrix-element tests: AB fixture bdft_si222_paw_ab added + AB sections in VH_VX/shape-mode/q_eval/dDeeq_H/hartree-energy tests; V_x route-equivalence STRICT on QE+AB; energy-helper aug-mesh bug fixed. CAUGHT an open direct-route V_H defect on the AB mf (STATUS item 1; strict_VH off there until root-caused). Deferred: Si_conv RPA/HF regression (cluster), sym×AB — 2026-07-25
+- [x] D3 aug-build gather buffers G-chunked (the N_aux≳10k OOM driver) + aug-stage memory estimator + synthetic l=3 unit test (paw_q_eval_synthetic_l3, machine-precision) — 2026-07-25
+- [x] D4 Cholesky+USPP/PAW hard-abort (builder ctor + read-only reader; diagnostic opt-in allow_smooth_only_aug_pp for the smooth-reference test) — 2026-07-25
 
 Workstream E — notes/documentation
 - [ ] E1 author canonical D-matrix doc (notes/paw_dmatrix_scgw.tex)

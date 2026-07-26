@@ -184,6 +184,10 @@ inline decltype(auto) default_MF(std::shared_ptr<utils::mpi_context_t<comm_t>>& 
 
     auto [outdir,prefix] = utils::utest_filename("bdft_si222");
     return default_MF(comm, mf::bdft_source, outdir, prefix);
+  } else if (src == "bdft_si222_paw_ab") {
+
+    auto [outdir,prefix] = utils::utest_filename("bdft_si222_paw_ab");
+    return default_MF(comm, mf::bdft_source, outdir, prefix, ftype);
   } else if (src == "pyscf_si222") {
 
     auto [outdir,prefix] = utils::utest_filename("pyscf_si222");
