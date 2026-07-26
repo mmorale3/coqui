@@ -29,6 +29,7 @@
 #include "IO/ptree/ptree_utilities.hpp"
 #include "utilities/Timer.hpp"
 #include "utilities/proc_grid_partition.hpp"
+#include "utilities/freemem.h"
 #include "mpi3/communicator.hpp"
 #include "utilities/mpi_context.h"
 #include "nda/nda.hpp"
@@ -556,6 +557,44 @@ namespace methods {
         return;
       }
 
+      // Plan D3: augmentation-stage memory estimate. The smooth-stage
+      // estimator (thc.icc get_ZquG_Cquv) predates augmentation and knows
+      // nothing about the (N_total/Np_smooth)²-larger augmented _dZ, the
+      // q-pool η/ζ slabs, or the gather buffers. Report the per-rank
+      // footprint and warn (not abort — the estimate is an upper bound)
+      // when it exceeds the free-memory snapshot.
+      const long gchunk_rho = 8192;   // G-chunk width of the gather buffers
+      {
+        long nqp  = std::max(1l, _dZ.grid()[0]);
+        long npP  = std::max(1l, _dZ.grid()[1]);
+        long npQ  = std::max(1l, _dZ.grid()[2]);
+        long npPQ = npP * npQ;
+        auto ceild = [](long a, long b) { return (a + b - 1) / b; };
+        double B  = (double)sizeof(ComplexType);
+        double gB = 1.0 / (1024.0 * 1024.0 * 1024.0);
+        double m_dZ_aug = (double)ceild(_nqpts_ibz, nqp) * ceild(N_total, npP)
+                        * ceild(N_total, npQ) * B;
+        double m_dZ_sm  = (double)ceild(_nqpts_ibz, nqp) * ceild(_Np_smooth, npP)
+                        * ceild(_Np_smooth, npQ) * B;   // alive during the embed
+        double m_slab   = ((double)ceild(_Np_smooth, npPQ)
+                        + 2.0 * ceild(_N_aug, npPQ)) * (double)ngm_rho * B;
+        double m_gath   = ((double)ceild(_Np_smooth, npP) + ceild(_Np_smooth, npQ)
+                        + 3.0 * ceild(_N_aug, std::min(npP, npQ)))
+                        * (double)std::min(gchunk_rho, ngm_rho) * B;
+        double m_Xshm   = (double)(_ns_in_basis * _npol_in_basis) * _nkpts
+                        * N_total * (double)x_range.size() * B;  // per NODE (shm)
+        double peak = m_dZ_aug + m_dZ_sm + m_slab + m_gath;
+        app_log(2, "  paw_aug: per-rank memory estimate: _dZ(aug) {:.2f} GB "
+                   "(+{:.2f} GB smooth during embed), q-pool slabs {:.2f} GB, "
+                   "gather buffers {:.2f} GB; X_shm per node {:.2f} GB",
+                m_dZ_aug*gB, m_dZ_sm*gB, m_slab*gB, m_gath*gB, m_Xshm*gB);
+        double have_gb = (double)utils::freemem() / 1024.0;  // freemem() is MB
+        if (peak * gB > have_gb)
+          app_warning("paw_aug: estimated per-rank augmentation peak "
+                      "({:.2f} GB) exceeds available memory ({:.2f} GB).",
+                      peak*gB, have_gb);
+      }
+
       utils::check(dzeta_quG.global_shape()[2] == ngm_rho,
         "thc_reader::augment: dzeta_quG G-dim ({}) != rho_g.size ({}). "
         "Augmentation requires orb_on_fft_grid mode (ζ in G-space).",
@@ -567,22 +606,22 @@ namespace methods {
       //    (nspin × nkpts × nkb × nbnd); not an aux index. Kept as-is.
       // ----------------------------------------------------------------
       _Timer.start("PAW_AUG.Pskna_lift");
-      int lmax_proj = 0;
-      for (auto const& sp : _psp->paw_species_view())
-        if (sp.lll.size() > 0)
-          for (long b = 0; b < sp.lll.extent(0); ++b)
-            lmax_proj = std::max(lmax_proj, (int)sp.lll(b));
-      auto symm_list_local = _MF->symm_list();
-      auto atom_perm_inv = hamilt::paw::build_atom_permutation_inverse(
-          _psp->atom_pos_cart_view(), _psp->ityp_view(),
-          _MF->lattv(), _MF->recv(), symm_list_local);
-      auto wigner_d = hamilt::paw::build_wigner_d_real(
-          symm_list_local, _MF->lattv(), lmax_proj);
-      auto Pkfull = hamilt::paw::compute_Pskna_full_bz(
-          *_psp,
-          _MF->kp_to_ibz(), _MF->kp_symm(), _MF->kp_trev(),
-          _MF->kpts(), symm_list_local,
-          atom_perm_inv, wigner_d, _npol, *_mpi);
+      // A4 deferral resolved (plan D1): _psp comes from make_pseudopot(*_MF)
+      // and pseudopot stores mf.mpi(), so whenever the two context handles
+      // are the same object the psp's shm-backed Pskna cache is collective
+      // on exactly this communicator — use it (one shared lift for THC,
+      // direct v_x and becsum). A psp injected on a different context (none
+      // today) falls back to the explicit build on _mpi.
+      std::optional<math::shm::shared_array<nda::array_view<ComplexType,4>>>
+          Pk_fallback;
+      if (_psp->get_mpi_context() != _mpi) {
+        auto symm_list_local = _MF->symm_list();
+        Pk_fallback.emplace(hamilt::paw::compute_Pskna_full_bz(
+            *_psp, _MF->kp_to_ibz(), _MF->kp_symm(), _MF->kp_trev(),
+            _MF->kpts(), _MF->lattv(), _MF->recv(), symm_list_local,
+            _npol, *_mpi));
+      }
+      auto const& Pkfull = Pk_fallback ? *Pk_fallback : _psp->Pskna_full_bz();
       _Timer.stop("PAW_AUG.Pskna_lift");
 
       // ----------------------------------------------------------------
@@ -807,15 +846,22 @@ namespace methods {
           q_intra, {np_PQ, 1L}, {(long)_N_aug,    ngm_rho});
 //MAM: need to check above that np_PQ is smaller than _N_aug
 
-      // Rank-local row buffers for this rank's _dZ tile sub-blocks.
-      // Sized to the irregular (P, Q) chunks of the new _dZ. Per-rank
-      // memory: (P/Q chunk) × ngm × 16 B — a 1-aux quantity, fine to keep
-      // in regular memory.
-      nda::array<ComplexType,2> zeta_P_smooth_g(P_smooth_rows.size(), ngm_rho);
-      nda::array<ComplexType,2> zeta_Q_smooth_g(Q_smooth_cols.size(), ngm_rho);
-      nda::array<ComplexType,2> eta_w_Q_aug_g (Q_aug_cols_la.size(),   ngm_rho);
-      nda::array<ComplexType,2> eta_w_P_aug_g (P_aug_rows_la.size(),   ngm_rho);
-      nda::array<ComplexType,2> eta_P_aug_conj(P_aug_rows_la.size(),   ngm_rho);
+      // Rank-local row buffers for this rank's _dZ tile sub-blocks,
+      // G-CHUNKED (plan D3): (P/Q chunk rows) × gchunk instead of × ngm.
+      // At production sizes (tile rows ~10³–10⁴, ngm ~10⁵–10⁶) the
+      // full-width buffers were the N_aug ≳ 10k OOM; the GEMMs below
+      // accumulate over the g-chunks instead. Same 8192 chunk the dense-LL
+      // branch uses (gchunk_rho defined with the memory estimate above).
+      const long gbuf_rho = std::min(gchunk_rho, ngm_rho);
+      nda::array<ComplexType,2> zeta_P_smooth_g(P_smooth_rows.size(), gbuf_rho);
+      nda::array<ComplexType,2> zeta_Q_smooth_g(Q_smooth_cols.size(), gbuf_rho);
+      nda::array<ComplexType,2> eta_w_Q_aug_g (Q_aug_cols_la.size(),   gbuf_rho);
+      nda::array<ComplexType,2> eta_w_P_aug_g (P_aug_rows_la.size(),   gbuf_rho);
+      nda::array<ComplexType,2> eta_P_aug_conj(P_aug_rows_la.size(),   gbuf_rho);
+      // Accumulation tiles for this rank's _dZ sub-blocks (small: rows×cols).
+      nda::array<ComplexType,2> V_GL_local(P_smooth_rows.size(), Q_aug_cols_la.size());
+      nda::array<ComplexType,2> V_LG_local(P_aug_rows_la.size(), Q_smooth_cols.size());
+      nda::array<ComplexType,2> V_LL_local(P_aug_rows_la.size(), Q_aug_cols_la.size());
 
       for (auto [iq_l, iq] : itertools::enumerate(qloc_new)) {
         std::array<double,3> q_cart = {
@@ -854,35 +900,63 @@ namespace methods {
         }
         _Timer.stop("PAW_AUG.eta_flat");
 
-        // ---- 6e) Gather rows of ζ / η_w / η that this rank will need. ----
-        // Row-gathers on q_intra (np_PQ-way); ALL ranks must take the same
-        // branch (dense_LL is a pure function of the grids — uniform).
-        gather_rows_from_dist_qpool(zeta_dist , P_smooth_rows, q_intra, zeta_P_smooth_g);
-        gather_rows_from_dist_qpool(zeta_dist , Q_smooth_cols, q_intra, zeta_Q_smooth_g);
-        gather_rows_from_dist_qpool(eta_w_dist, Q_aug_cols_la, q_intra, eta_w_Q_aug_g);
-        gather_rows_from_dist_qpool(eta_w_dist, P_aug_rows_la, q_intra, eta_w_P_aug_g);
-        if (!dense_LL) {
-          // η rows for the rho_g V_LL GEMM (dense_LL builds its own tiles).
-          gather_rows_from_dist_qpool(eta_dist, P_aug_rows_la, q_intra, eta_P_aug_conj);
-          // Now eta_P_aug_conj holds η; flip to conj(η) for the V_LL GEMM.
-          for (long la = 0; la < eta_P_aug_conj.shape(0); ++la)
-            for (long g = 0; g < ngm_rho; ++g)
-              eta_P_aug_conj(la, g) = std::conj(eta_P_aug_conj(la, g));
+        // ---- 6e) G-chunked row-gathers + GEMM accumulation (plan D3). ----
+        // Row-gathers on q_intra (np_PQ-way) one g-chunk at a time; ALL
+        // ranks run the same chunk loop (the gathers are collective) and
+        // take the same dense_LL branch (pure function of the grids —
+        // uniform).
+        V_GL_local() = ComplexType(0.0);
+        V_LG_local() = ComplexType(0.0);
+        V_LL_local() = ComplexType(0.0);
+        for (long gr0 = 0; gr0 < ngm_rho; gr0 += gchunk_rho) {
+          nda::range g_rng(gr0, std::min(gr0 + gchunk_rho, ngm_rho));
+          long ng_c = g_rng.size();
+          auto zP  = zeta_P_smooth_g(range::all, range(0, ng_c));
+          auto zQ  = zeta_Q_smooth_g(range::all, range(0, ng_c));
+          auto ewQ = eta_w_Q_aug_g (range::all, range(0, ng_c));
+          auto ewP = eta_w_P_aug_g (range::all, range(0, ng_c));
+          auto ePc = eta_P_aug_conj(range::all, range(0, ng_c));
+          gather_rows_from_dist_qpool(zeta_dist , P_smooth_rows, q_intra, zP,  g_rng);
+          gather_rows_from_dist_qpool(zeta_dist , Q_smooth_cols, q_intra, zQ,  g_rng);
+          gather_rows_from_dist_qpool(eta_w_dist, Q_aug_cols_la, q_intra, ewQ, g_rng);
+          gather_rows_from_dist_qpool(eta_w_dist, P_aug_rows_la, q_intra, ewP, g_rng);
+          if (!dense_LL) {
+            // η rows for the rho_g V_LL GEMM (dense_LL builds its own tiles).
+            gather_rows_from_dist_qpool(eta_dist, P_aug_rows_la, q_intra, ePc, g_rng);
+            // ePc holds η; flip to conj(η) for the V_LL GEMM.
+            for (long la = 0; la < ePc.shape(0); ++la)
+              for (long g = 0; g < ng_c; ++g)
+                ePc(la, g) = std::conj(ePc(la, g));
+          }
+
+          // V_GL(μ, λ) = Ω · Σ_g ζ(μ, g) · conj(η_w(λ, g)).  (gate _paw_vgl)
+          if (_paw_vgl && zP.shape(0) > 0 && ewQ.shape(0) > 0) {
+            _Timer.start("PAW_AUG.V_GL");
+            nda::blas::gemm(ComplexType(omega), zP, nda::dagger(ewQ),
+                            ComplexType(1.0), V_GL_local);
+            _Timer.stop("PAW_AUG.V_GL");
+          }
+          // V_LG(λ, μ) = conj(V_GL(μ, λ)) = Ω · Σ_g η_w(λ, g) · conj(ζ(μ, g)).
+          if (_paw_vgl && ewP.shape(0) > 0 && zQ.shape(0) > 0) {
+            _Timer.start("PAW_AUG.V_GL");
+            nda::blas::gemm(ComplexType(omega), ewP, nda::dagger(zQ),
+                            ComplexType(1.0), V_LG_local);
+            _Timer.stop("PAW_AUG.V_GL");
+          }
+          // V_LL rho_g branch: Ω² · Σ_g conj(η(λ, g)) · η_w(ξ, g)
+          // (the dense_LL branch below builds its own G-chunked tiles).
+          if (_paw_vll && !dense_LL && ePc.shape(0) > 0 && ewQ.shape(0) > 0) {
+            _Timer.start("PAW_AUG.V_LL");
+            nda::blas::gemm(ComplexType(omega_sq), ePc, nda::transpose(ewQ),
+                            ComplexType(1.0), V_LL_local);
+            _Timer.stop("PAW_AUG.V_LL");
+          }
         }
 
         auto Z_loc = _dZ.local();
 
-        // ---- 6f) V_GL block: P ∈ smooth, Q ∈ aug.   (diagnostic gate _paw_vgl)
-        //         V_GL(μ, λ) = Ω · Σ_g ζ(μ, g) · conj(η_w(λ, g)).
-        if (_paw_vgl && P_smooth_rows.size() > 0 && Q_aug_cols_la.size() > 0) {
-          _Timer.start("PAW_AUG.V_GL");
-          nda::array<ComplexType,2> V_GL_local(P_smooth_rows.size(),
-                                               Q_aug_cols_la.size());
-          V_GL_local() = ComplexType(0.0);
-          nda::blas::gemm(ComplexType(omega), zeta_P_smooth_g,
-                          nda::dagger(eta_w_Q_aug_g),
-                          ComplexType(0.0), V_GL_local);
-          _Timer.stop("PAW_AUG.V_GL");
+        // ---- 6f) Stitch V_GL: P ∈ smooth, Q ∈ aug.
+        if (_paw_vgl && V_GL_local.shape(0) > 0 && V_GL_local.shape(1) > 0) {
           _Timer.start("PAW_AUG.stitch");
           for (long ir = 0; ir < V_GL_local.shape(0); ++ir) {
             long P_in_tile = P_smooth_rows.first() + ir - Ploc_new.first();
@@ -897,15 +971,7 @@ namespace methods {
         // ---- 6g) V_LG block: P ∈ aug, Q ∈ smooth.
         //         V_LG(λ, μ) = conj(V_GL(μ, λ))
         //                    = Ω · Σ_g η_w(λ, g) · conj(ζ(μ, g)).
-        if (_paw_vgl && P_aug_rows_la.size() > 0 && Q_smooth_cols.size() > 0) {
-          _Timer.start("PAW_AUG.V_GL");
-          nda::array<ComplexType,2> V_LG_local(P_aug_rows_la.size(),
-                                               Q_smooth_cols.size());
-          V_LG_local() = ComplexType(0.0);
-          nda::blas::gemm(ComplexType(omega), eta_w_P_aug_g,
-                          nda::dagger(zeta_Q_smooth_g),
-                          ComplexType(0.0), V_LG_local);
-          _Timer.stop("PAW_AUG.V_GL");
+        if (_paw_vgl && V_LG_local.shape(0) > 0 && V_LG_local.shape(1) > 0) {
           _Timer.start("PAW_AUG.stitch");
           for (long ir = 0; ir < V_LG_local.shape(0); ++ir) {
             long P_in_tile = P_aug_rows_g.first() + ir - Ploc_new.first();
@@ -926,9 +992,6 @@ namespace methods {
         // η builder is a cheap replicated interpolation, no comm).
         if (P_aug_rows_la.size() > 0 && Q_aug_cols_la.size() > 0) {
           _Timer.start("PAW_AUG.V_LL");
-          nda::array<ComplexType,2> V_LL_local(P_aug_rows_la.size(),
-                                               Q_aug_cols_la.size());
-          V_LL_local() = ComplexType(0.0);
           if (_paw_vll && dense_LL) {
             auto const& dense_g = *dense_g_opt;
             long ngm_d = dense_g.size();
@@ -966,11 +1029,8 @@ namespace methods {
                               nda::transpose(etaQ_v),
                               ComplexType(1.0), V_LL_local);
             }
-          } else if (_paw_vll) {
-            nda::blas::gemm(ComplexType(omega_sq), eta_P_aug_conj,
-                            nda::transpose(eta_w_Q_aug_g),
-                            ComplexType(0.0), V_LL_local);
           }
+          // (rho_g V_LL branch already accumulated in the 6e chunk loop.)
           _Timer.stop("PAW_AUG.V_LL");
 
           if (_paw_onsite && !paw_shape_restored) {
@@ -991,6 +1051,57 @@ namespace methods {
           }
           _Timer.stop("PAW_AUG.stitch");
         }
+      }
+
+      // ----------------------------------------------------------------
+      // 7) Extend the G=0 head vectors with the augmentation rows (plan
+      //    D1). The smooth _Chi_head(q,u) stores conj(ζ^q_u(G=0)) (see
+      //    thc.icc intvec_impl); the matching aug entry is
+      //    conj(Ω·η^q_Λ(G=0)) — Ω·η is the aug object in ζ units
+      //    (V_GL = (1/Ω)·Σ_g ζ·v·conj(Ω·η), same −q convention).
+      //    Without these rows every consumer that pairs basis_head() with
+      //    Np() (GW Sigma_div_correction, embed_eri/g0_div head builds)
+      //    indexes past the smooth-only array once augmentation bumps Np,
+      //    and the pair-density monopole of the compensation charges is
+      //    dropped from the q→0 head (under I8 the head reconstructs the
+      //    AE δ_ij only as smooth+aug).
+      //    _Chi_bar_head (dual of the FIT basis): aug rows stay ZERO — the
+      //    G=0 plane wave is exactly band-limited to the smooth sphere, so
+      //    its smooth-only LS representation remains a valid representation
+      //    in the enlarged basis (exact up to the smooth ISDF fit residual);
+      //    zero aug coefficients preserve it.
+      // ----------------------------------------------------------------
+      {
+        auto const& gv_to_fft = rho_g.gv_to_fft();
+        long g0_idx = -1;
+        for (long ig = 0; ig < ngm_rho; ++ig)
+          if (gv_to_fft(ig) == 0) { g0_idx = ig; break; }
+        utils::check(g0_idx >= 0,
+                     "thc_reader::augment: G=0 not found on the rho_g grid.");
+        auto g0_vec = rho_g.g_vectors(g0_idx);
+        utils::check(g0_vec(0) == 0.0 and g0_vec(1) == 0.0 and g0_vec(2) == 0.0,
+                     "thc_reader::augment: gv_to_fft==0 entry is not G=(0,0,0).");
+
+        nda::array<ComplexType,2> Chi_new(_nqpts_ibz, N_total);
+        nda::array<ComplexType,2> Chi_bar_new(_nqpts_ibz, N_total);
+        Chi_new() = ComplexType(0.0);
+        Chi_bar_new() = ComplexType(0.0);
+        Chi_new(range::all, range(0, _Np_smooth)) = _Chi_head;
+        Chi_bar_new(range::all, range(0, _Np_smooth)) = _Chi_bar_head;
+
+        nda::array<ComplexType,2> eta_g0(_N_aug, 1);
+        for (long iq = 0; iq < _nqpts_ibz; ++iq) {
+          std::array<double,3> q_cart = {
+              -Qpts_cart(iq, 0), -Qpts_cart(iq, 1), -Qpts_cart(iq, 2)};
+          hamilt::paw::build_eta_on_rho_g_at_q_chunk(
+              *_psp, _isdf, _aug_layout, rho_g, q_cart, omega,
+              aatab, qrad_tabs,
+              range(0, _N_aug), range(g0_idx, g0_idx + 1), eta_g0);
+          for (long la = 0; la < _N_aug; ++la)
+            Chi_new(iq, _Np_smooth + la) = std::conj(omega * eta_g0(la, 0));
+        }
+        _Chi_head = std::move(Chi_new);
+        _Chi_bar_head = std::move(Chi_bar_new);
       }
 
       _Np = (int)N_total;
@@ -1209,14 +1320,22 @@ namespace methods {
      * Used by the per-q distributed augmentation to pull only the
      * (mu / λ) rows this rank needs to fill its own _dZ tile.
      */
-    template<class A_dist_t, class T>
+    template<class A_dist_t, class Out_t>
     void gather_rows_from_dist_qpool(A_dist_t const& A,
                                      nda::range wanted_rows,
                                      mpi3::communicator& comm,
-                                     nda::array<T, 2>& out)
+                                     Out_t&& out,
+                                     nda::range g_rng)
     {
+      using T = typename std::decay_t<Out_t>::value_type;
       long nproc = (long)comm.size();
-      long N = A.global_shape()[1];
+      // Column slice [g_rng) of the row-distributed slab (plan D3: callers
+      // G-chunk so the gather target is rows × chunk, not rows × ngm).
+      // ALL ranks of `comm` must pass the same g_rng (collective).
+      long N = g_rng.size();
+      utils::check(g_rng.first() >= 0 && g_rng.last() <= A.global_shape()[1],
+        "gather_rows_from_dist_qpool: g_rng [{}, {}) outside [0, {})",
+        g_rng.first(), g_rng.last(), A.global_shape()[1]);
 
       utils::check(out.shape(0) == wanted_rows.size() && out.shape(1) == N,
         "gather_rows_from_dist_qpool: out shape ({}, {}) != ({}, {})",
@@ -1273,12 +1392,13 @@ namespace methods {
       std::vector<T> sbuf(total_send), rbuf(total_recv);
 
       auto Aloc = A.local();
+      long g0 = g_rng.first();
       for (long d = 0; d < nproc; ++d) {
         if (send_counts[d] == 0) continue;
         long off = send_displs[d];
         for (long r = send_rng[d].first; r < send_rng[d].second; ++r)
           for (long g = 0; g < N; ++g)
-            sbuf[off++] = Aloc(r - my_A_o, g);
+            sbuf[off++] = Aloc(r - my_A_o, g0 + g);
       }
 
       comm.all_to_all_v_n(
@@ -1552,8 +1672,19 @@ namespace methods {
       nda::h5_read(grp, "interpolating_points", _rp);
       nda::h5_read(grp, "interpolating_vectors_G0", _Chi_head);
       nda::h5_read(grp, "dual_interpolating_vectors_G0", _Chi_bar_head);
-      utils::check(_rp.shape(0) == _Np,
-                   "thc_reader_t::build: rp.shape() != Np. Inconsistent dimensions from the precomputed THC-ERI.");
+      // PAW/USPP-augmented files carry Np = N_smooth + N_aug while the
+      // interpolating points are a smooth-grid object: allow rp < Np and
+      // recover the split (plan D1; pre-D1 equality check aborted on any
+      // augmented file).
+      utils::check(_rp.shape(0) <= _Np,
+                   "thc_reader_t::build: rp.shape() > Np. Inconsistent dimensions from the precomputed THC-ERI.");
+      _Np_smooth = (int)_rp.shape(0);
+      _N_aug = (int)(_Np - _Np_smooth);
+      utils::check(_Chi_head.extent(1) == _Np and _Chi_bar_head.extent(1) == _Np,
+                   "thc_reader_t::build: interpolating_vectors_G0 has {} columns "
+                   "but Np={}. Files written before the D1 augmented-head fix "
+                   "store smooth-only head vectors — regenerate the THC ERI file.",
+                   _Chi_head.extent(1), _Np);
 
       if(_X_shm.shape() != std::array<long,4>{_ns_in_basis*_npol_in_basis, _nkpts, _Np, x_range.size()}) {
         _X_shm = math::shm::make_shared_array<Array_view_t<HOST_MEMORY,4>>(
