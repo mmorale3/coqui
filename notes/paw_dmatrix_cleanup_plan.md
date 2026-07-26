@@ -93,19 +93,30 @@ REMAINING (older numbering, 2026-07-25 post-D session):
        paths; only schema_version 2→3 + ecutrho 115.354→218.566 differ;
        old nocv originals confirmed still bug-carrying). Stopgaps retired
        (.retired), pre-fix mfs kept as .pre3956b45_bak; canonical names
-       now = schema-3 files. Remaining: post-build validation reruns
-       (parity/c4 numbers on the reconverted mfs; expect ~50 µHa-scale
-       shifts from the denser rho/aug sphere) and regeneration of any
-       OTHER pre-3956b45 ABINIT-sourced paw_aug numbers before quoting
-       (eos_conv500-era exchange — publication-gated).
-   (b) C2 acceptance closure: rerun the DIRECT-route exchange on the a10.20
-       mf with the CURRENT binary at matched settings and compare to
-       THC-shape −1.7349632 — the recorded "direct −1.6863" is not a usable
-       reference (old binary; C1 static-D moved e_1e −73 mHa on that
-       system). Tooling landed 2026-07-26: vexchange_mode_energies "env
-       bdft mf" section (COQUI_VEXCHANGE_MF_DIR/PREFIX) +
-       staging_conv_v3/run_c2_direct.sbatch on rusty; run after the
-       cluster rebuild.
+       now = schema-3 files. **VALIDATION RERUNS DONE (chain 6676841-44,
+       binary @02c1fbe)**: b_tests parity on the reconverted mfs IMPROVED
+       — Δ(QE−AB) E_X +39.7 µHa (was 87), RPA −1.6 µHa (was 23), HF
+       +44.9 µHa (was 128), Δe_1e +141.74 mHa = the known benign
+       vloc-G=0 gauge constant unchanged (QE side now reads the correct
+       115.354 Ha ecutrho through the schema gate; AB side on the
+       218.566 Ha inscribed sphere). c4 modes on reconverted mf_v2
+       REPRODUCE the ylmfix-run values to ~1e-10: E_X(shape) −1.3175731
+       (0.10 mHa vs converged GW Σx), moment −1.3178007, nocv ≡ moment
+       to 5e-12 — the stopgap equivalence is confirmed at the ENERGY
+       level too. Remaining: regeneration of OTHER pre-3956b45
+       ABINIT-sourced paw_aug numbers before quoting (eos_conv500-era
+       exchange — publication-gated).
+   (b) **C2 ACCEPTANCE CLOSED 2026-07-26** (job 6676844, direct
+       dense-grid vexchange_mode_energies on the a10.20 mf, np=16,
+       ignore_g0 = the same div convention as the THC run):
+       E_X(shape, direct) = −1.73509011 vs THC-shape −1.7349632 →
+       **Δ = 0.127 mHa = the THC/ISDF-truncation scale** (thresh 1e-5;
+       same order as the D2 route-equivalence tolerances) — Eq.
+       (path-equiv) PASSES on the C2 system. Also: E_X(moment, direct)
+       −1.73825524 (vs Jul-17 THC-moment −1.7381526: 0.10 mHa), direct
+       mode split +3.165 mHa ≡ THC +3.19 mHa. The recorded "direct
+       −1.6863" is RETIRED as a reference: no current-operator run
+       reproduces it (old-binary artifact; pre-C1 static-D era).
 3. ~~A-tests residual~~ DONE 2026-07-26 (see the session block above).
 4. ~~Hardening debt (a)+(b)~~ DONE 2026-07-26 (see above).
 5. ~~Workstream E (E1+E2)~~ DONE 2026-07-26 (see above).
@@ -396,7 +407,7 @@ Workstream B — converter parity
 
 Workstream C — augmentation-density modes
 - [x] C1 single mode flag: pseudopot bool dropped — paw_shape_restored() derives from _exx_opts.vv_compensation (single source; setter kept for tests, delegating); deltaC/K_a inclusion derived from mode in both routes (direct v_x skip-on-shape; THC `_paw_onsite && !shape`); _paw_onsite documented DIAGNOSTIC-ONLY at both sites — 2026-07-25
-- [x] C2 dense-sphere THC LL block (aug-aug Coulomb sum on the fft_grid_dim_aug inscribed-Gcut sphere, G-chunked, whenever rho_g doesn't cover it — ζ blocks stay on rho_g, exactly band-limited there; PSD Gram preserved; default configs bit-identical, branch self-disables); in_thc shape abort lifted; new TEST_CASE thc_shape_mode_vs_direct (THC-vs-direct shape V_x 7.6e-5 default / 6.8e-5 half-ecut; mode-difference cross-check 2.8e-6/6.3e-7; dense branch log-confirmed firing) — 2026-07-25. Si a=10.20 acceptance vs direct −1.6863 deferred to the cluster campaign (a10.20 mf not on this host). 2026-07-25 cluster: THC-shape E_X(vv) −1.7349632 at 16 kpt (shape−moment +3.19 mHa, matches si222 +3.38 mHa); reconciliation vs the −1.6863 direct reference still open (operator content of that number)
+- [x] C2 dense-sphere THC LL block (aug-aug Coulomb sum on the fft_grid_dim_aug inscribed-Gcut sphere, G-chunked, whenever rho_g doesn't cover it — ζ blocks stay on rho_g, exactly band-limited there; PSD Gram preserved; default configs bit-identical, branch self-disables); in_thc shape abort lifted; new TEST_CASE thc_shape_mode_vs_direct (THC-vs-direct shape V_x 7.6e-5 default / 6.8e-5 half-ecut; mode-difference cross-check 2.8e-6/6.3e-7; dense branch log-confirmed firing) — 2026-07-25. Si a=10.20 acceptance vs direct −1.6863 deferred to the cluster campaign (a10.20 mf not on this host). 2026-07-25 cluster: THC-shape E_X(vv) −1.7349632 at 16 kpt (shape−moment +3.19 mHa, matches si222 +3.38 mHa). CLOSED 2026-07-26: direct dense-grid E_X(shape) −1.73509011 at matched ignore_g0 settings → THC ≡ direct at 0.127 mHa (ISDF-truncation scale); the "−1.6863" was an old-binary artifact, retired
 - [x] C3 shared caches + Qfac knob: THC augment now uses psp.paw_aatab() + psp.paw_qrad_tabs(K_max, mode) (same dq=0.01/aug_lmax/per-species selection as its local build — one table set shared with direct v_x; THC's larger Kmax means direct reuses without rebuild); new paw_exx_options::qfac_cache_mb (toml `qfac_cache_mb`, default 256, 0=off) read live in get_or_build_qfac_pair_factor. dq unification itself landed in A4. Value-neutral (C4 mode energies bit-identical across the change) — 2026-07-25
 - [x] C4 physics validation (host-side portion): operator identity SETTLED — −1.316447 is the GW Sigma_x (Arnaud) operator, NOT HF Fock (2026-07-21 instrumented-ABINIT work, notes/paw_article_results/abinit_exchange_gw_vs_hybrid.md, updated). HF-side match DONE: deltaC ≡ ABINIT eijkl 5.5e-5 rel + ex_cvij machine-identical (kernels), onsite vv+cv energies identical, smooth residual closed via fock_icutcoul=3 (µHa). Current-code baselines recorded via new [slow] TEST_CASE vexchange_mode_energies (direct dense-grid, ignore_g0): lih222_paw_hf −1.64406506/−1.64395244 (moment+deltaC / shape, split +1.13e-4); local si222_paw −1.31194760/−1.31187642 (split +7.1e-5 — this fixture has fft_mesh_aug==fft_mesh=36³: a coarse aug sphere truncates both modes equally, AND it is a different cell from the rusty cmp mf, so NOT comparable to −1.316447). CLUSTER PORTION DONE 2026-07-25: ABINIT GW Σx regenerated (pawoptosc=1, ISZ off; ecutsigx 25→−1.316447 exact provenance match, converged −1.31747); Δe_1e(cv) 4.8 µHa vs ABINIT −0.521220. REVISED post-3956b45 (the mf carried the real_ylm bug): E_X(shape) = −1.3175731 on the fixed mf → agrees with converged GW Σx to 0.10 mHa (the earlier −47.6 mHa was the converter bug, NOT an operator difference); moment −1.3178007, shape−moment −0.23 mHa. C4 CLOSED — 2026-07-25
 
