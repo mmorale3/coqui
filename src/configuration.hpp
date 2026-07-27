@@ -23,7 +23,9 @@
 #define COQUI_TOP_CONFIGURATION_HPP
 
 #include<complex>
+#include<cstddef>
 #include<cstdlib>
+#include<memory>
 #include "config.h"
 
 #include "nda/nda.hpp"
@@ -169,8 +171,75 @@ auto to_memory_space(auto &&A)
 namespace detail
 {
 
+  /**
+   * TEMPORARY local replacement for nda::mem::static_fallback.
+   *
+   * nda's version leaks the primary allocator's release accounting on the
+   * fallback path: dynamic_bucket::allocate() adds the request to
+   * _total_requested *before* discovering it cannot serve it (it returns
+   * {nullptr,0} after the counter is already bumped), but nda's
+   * static_fallback::deallocate() sends non-owned blocks straight to the
+   * secondary allocator without ever telling the primary. _total_released
+   * therefore misses every fallback block, and the pool's high-water mark
+   * (maximum_memory(), i.e. _total_requested - _total_released) drifts
+   * upward without bound as soon as any allocation spills past the pool.
+   * That statistic is exactly what we need to size the pool, so it has to
+   * be trustworthy.
+   *
+   * Fix: hand the block to the primary on the fallback path too.
+   * dynamic_bucket::deallocate() recognizes a pointer outside its pool and
+   * only accounts the release. The primary must see the block *before* the
+   * secondary frees it, since it inspects b.ptr to classify it.
+   *
+   * Remove this class and revert static_allocator_t to
+   * nda::mem::static_fallback once the upstream nda fix lands.
+   */
+  template<typename Primary>
+  class corrected_static_fallback
+  {
+    inline static Primary alloc = {};
+    using Secondary = nda::mem::mallocator<Primary::address_space>;
+
+  public:
+    static constexpr auto address_space = Primary::address_space;
+
+    corrected_static_fallback()                                            = default;
+    corrected_static_fallback(corrected_static_fallback const&)            = delete;
+    corrected_static_fallback(corrected_static_fallback&&)                 = default;
+    corrected_static_fallback& operator=(corrected_static_fallback const&) = delete;
+    corrected_static_fallback& operator=(corrected_static_fallback&&)      = default;
+
+    auto get_primary()       { return std::addressof(alloc); }
+    auto get_primary() const { return std::addressof(alloc); }
+
+    nda::mem::blk_t allocate(std::size_t s) noexcept
+    {
+      nda::mem::blk_t b = alloc.allocate(s);
+      if (b.ptr) return b;
+      return Secondary::allocate(s);
+    }
+
+    nda::mem::blk_t allocate_zero(std::size_t s) noexcept
+    {
+      nda::mem::blk_t b = this->allocate(s);
+      if (b.ptr and b.s > 0) nda::mem::memset<address_space>(b.ptr, 0, b.s);
+      return b;
+    }
+
+    void deallocate(nda::mem::blk_t b) noexcept
+    {
+      if (alloc.owns(b)) {
+        alloc.deallocate(b);
+      } else {
+        // account the release in the primary's counters, then free via the secondary
+        alloc.deallocate(b);
+        Secondary::deallocate(b);
+      }
+    }
+  };
+
   template<MEMORY_SPACE MEM>
-  using static_allocator_t = nda::mem::static_fallback<nda::mem::dynamic_bucket<to_nda_address_space(MEM)>>;
+  using static_allocator_t = corrected_static_fallback<nda::mem::dynamic_bucket<to_nda_address_space(MEM)>>;
 
   template<MEMORY_SPACE MEM>
   using buffered_handle_t = nda::heap_basic<static_allocator_t<MEM>>;
