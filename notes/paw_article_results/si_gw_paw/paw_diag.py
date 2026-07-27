@@ -103,6 +103,60 @@ def norm_violations(path):
     return rows
 
 
+def qij_matrix(dirpath):
+    """PP_Q (nbeta x nbeta augmentation charges) from the UPF in `dirpath`, or None.
+
+    max|q_ij| is the practical conditioning gate: an inflated partial wave (see
+    `ae_poles` below) shows up as a huge diagonal entry, and QE's density then goes
+    negative.  Reference scale: the library kjpaw dataset has all |q_ij| < 0.08.
+
+    It is a strong but NOT sufficient predictor, so report it together with the PS/AE
+    interior-norm ratio: 0.48 (N9) and 0.53 (P1) are healthy, 3.47 (P4) still converges
+    with a trace of negative rho, but 0.79 at an inflation ratio of 2.0 (the 2-wave
+    VANDERBILT dataset) diverges to -759 Ry.  The ratio is what separates that last case.
+    """
+    upfs = [f for f in os.listdir(dirpath) if f.endswith(".UPF")]
+    if not upfs:
+        return None
+    txt = open(os.path.join(dirpath, upfs[0]), errors="replace").read()
+    m = re.search(r"<PP_Q type[^>]*>(.*?)</PP_Q>", txt, re.S)
+    if not m:
+        return None
+    v = _floats(m.group(1))
+    n = int(round(len(v) ** 0.5))
+    return v.reshape(n, n)
+
+
+def ae_poles(dirpath, emax=None):
+    """{l: [E_Ry, ...]} — energies where the AE log-derivative at r_c diverges.
+
+    A pole is `psi(r_c) = 0`.  atompaw normalizes each partial wave to unit amplitude
+    at r_c, so a reference energy near a pole inflates the interior of the wave without
+    bound (D3's p@20Ry has AE norm 52.7 with the l=1 pole at 19.3 Ry).  Zeros of the
+    log-derivative -- `psi'(r_c) = 0` -- are harmless and are excluded: only the
+    -inf -> +inf crossings count, which is what the |L| > 2 guard on both sides selects.
+    """
+    out = {}
+    for fn in sorted(os.listdir(dirpath)):
+        m = re.fullmatch(r"logderiv\.(\d+)", fn)
+        if not m:
+            continue
+        dat = np.loadtxt(os.path.join(dirpath, fn))
+        e, L = dat[:, 0], dat[:, 1]
+        p = [0.5 * (e[i] + e[i + 1]) for i in range(len(e) - 1)
+             if L[i] < -2.0 and L[i + 1] > 2.0
+             and (emax is None or e[i] <= emax)]
+        out[int(m.group(1))] = p
+    return out
+
+
+def safe_windows(poles, emin=0.0, emax=30.0):
+    """Intervals between consecutive poles, with their midpoints — the off-resonance
+    reference energies available in [emin, emax] for one channel."""
+    edges = [emin] + [p for p in poles if emin < p < emax] + [emax]
+    return [(lo, hi, 0.5 * (lo + hi)) for lo, hi in zip(edges[:-1], edges[1:])]
+
+
 def logderiv_error(dirpath, emin=0.0, emax=30.0):
     """Max/RMS scattering-phase mismatch per l over [emin, emax] Ry.
 
@@ -149,6 +203,21 @@ def report(dirpath):
     print(f"  Q_occ = sum_a f_a q_a = {q_occ:+.6f} e   "
           f"(occupancy-weighted norm defect -> wrong RPA limit)")
     print(f"  sum |q_aa| over occupied waves = {q_val:.6f}")
+
+    q = qij_matrix(dirpath)
+    if q is not None:
+        infl = max(w["n_ps"] / w["n_ae"] for w in rows)
+        print(f"  max |q_ij| = {np.abs(q).max():.4f}   max PS/AE interior norm = {infl:.2f}"
+              f"   (kjpaw library reference: |q_ij| < 0.08)")
+
+    pol = ae_poles(dirpath)
+    if pol:
+        print("  AE log-derivative poles / off-resonance reference energies (Ry):")
+        for l in sorted(pol):
+            wins = safe_windows(pol[l])
+            print(f"    l={l} ({LNAME.get(l, l)}): poles "
+                  + " ".join(f"{p:.2f}" for p in pol[l])
+                  + "   | safe mid-points " + " ".join(f"{m:.1f}" for (_lo, _hi, m) in wins))
 
     # Energy-resolved scattering fidelity: the KKK failure is a *high-energy* one, so a
     # single [0,30] Ry number hides exactly the trend we are trying to expose.

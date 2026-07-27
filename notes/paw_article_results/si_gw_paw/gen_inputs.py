@@ -221,10 +221,98 @@ def norm_series_spec(rc_s, rc_p, e_s, e_p=10.0):
                 vloc_l=2, vloc_e=0.0)
 
 
+# --------------------------------------------------------------------------------------
+# FLEXIBLE SPEC — the search space for a norm-matched *and* d-complete dataset.
+#
+# The N-series is norm-matched but has lmax=1: no d channel at all, and Si RPA is known to
+# blow up without l=2 completeness (the JTH no-d projector runaway, si_rpa_proj.csv).  The
+# D-ladder is d-complete but carries a THIRD partial wave per channel, and that third wave
+# is what destroys the dataset at norm-matched radii: it is either inflated by an AE
+# log-derivative pole (D3 p@20Ry: AE norm 52.7, pole at 19.3) or by the pseudization of a
+# wave nearly parallel to its neighbour inside r_c (D3 s@14Ry: AE 0.63 -> PS 3.81).  Both
+# show up as max|q_ij| >> 0.08 and both break the QE SCF.
+#
+# So the untried region is 2 partial waves per channel WITH a d channel, at norm-matched
+# radii, with every reference energy placed off-resonance (paw_diag.ae_poles).
+# --------------------------------------------------------------------------------------
+
+# THE PRODUCTION SERIES P0-P2 -- norm-conserving AND d-complete AND QE-stable, which is
+# the combination neither earlier family had (N0-N9 are norm-matched but lmax=1; D3 is
+# d-complete but unusable in a solid).  The unlock is NOT the pseudization scheme: it is
+# dropping the unbound s/p partial waves.  With one (norm-matched, bound) wave per s/p
+# channel the occupied augmentation charges nearly vanish, and the same construction then
+# succeeds under BOTH schemes -- including MODRRKJ at exactly the radii where the
+# 2-wave-per-l version aborts on positive-definiteness.
+#
+# VANDERBILT still earns its place: its norm root sits at r_c = 1.70/1.90 instead of
+# MODRRKJ's 1.555/1.796, i.e. a substantially softer dataset at equal norm conservation,
+# and it is the only scheme that builds d-complete datasets at its root with the extra
+# waves still present (12/12 configurations).
+#
+# Verified end-to-end: atompaw -> UPF -> QE SCF, PBE, a=10.26 bohr, 4x4x4 k, 60 Ry,
+# ecutrho=8x.  Reference: library Si.pbe-n-kjpaw_psl.1.0.0.UPF gives -93.439419 Ry.
+#
+# P3/P4 restore the second s/p wave on top of that, which is what buys back the
+# high-energy s/p scattering the minimal datasets give up (RMS[15,30] 0.63 -> 0.17).  P3
+# is N9's own QE-validated s/p construction with the d channel it was missing: the three
+# earlier attempts at this exact dataset aborted only because they used E_s = 12/14 rather
+# than N9's 18, i.e. the second s wave, not the d channel, was the obstruction.
+#
+#  name  scheme       rc_s   rc_p  s@   p@    d refs      Q_occ(e)  max|q_ij|  E_QE(Ry)    dE vs kjpaw
+PROD_SERIES = [
+    ("P0", "MODRRKJ",    1.555, 1.796, [],      [],      [2.0, 10.0], -0.001184, 0.157, -93.449913, "-10.5 mRy"),
+    ("P1", "VANDERBILT", 1.700, 1.900, [],      [],      [2.0,  9.0], +0.000306, 0.533, -93.448121,  "-8.7 mRy"),
+    ("P2", "VANDERBILT", 1.700, 1.900, [],      [],      [2.0, 22.0], +0.000306, 0.997, -93.439028,  "+0.4 mRy"),
+    ("P3", "MODRRKJ",    1.555, 1.796, [18.0],  [10.0],  [2.0, 10.0], -0.001184, 0.477, -93.724550, "-285 mRy"),
+    ("P4", "VANDERBILT", 1.700, 1.900, [26.0],  [24.0],  [2.0, 22.0], +0.000306, 3.471, -93.448501,  "-9.1 mRy"),
+]
+
+
+def prod_spec(name):
+    """One member of the production series, by name."""
+    for (nm, scheme, rc_s, rc_p, se, pe, d_extras, *_rest) in PROD_SERIES:
+        if nm == name:
+            return flex_spec(rc_s, rc_p, se, pe, d_extras=d_extras, scheme=scheme)
+    raise KeyError(name)
+
+
+def flex_spec(rc_s, rc_p, s_extras, p_extras, d_extras=(), rc_d=None,
+              scheme="MODRRKJ", ortho="VANDERBILTORTHO"):
+    """Frozen-core Si dataset with arbitrary per-channel reference energies and radii.
+
+    Radii are channel-uniform (all waves of one l share its r_c), and the augmentation
+    radius is pinned to the largest channel radius — leaving r_aug > max(r_c) creates a
+    shell no projector covers and degrades the p scattering by an order of magnitude.
+    """
+    rc_d = rc_p if rc_d is None else rc_d
+    lmax = 2 if len(d_extras) else 1
+    m = max([rc_s, rc_p] + ([rc_d] if lmax == 2 else []))
+    rc = {0: [rc_s] * (1 + len(s_extras)), 1: [rc_p] * (1 + len(p_extras))}
+    extras = {0: list(s_extras), 1: list(p_extras)}
+    if lmax == 2:
+        rc[2] = [rc_d] * len(d_extras)
+        extras[2] = list(d_extras)
+    return dict(ld_min=-12.0, ld_max=30.0, ld_n=1000,
+                valence=[(3, 0), (3, 1)], lmax=lmax, extras=extras, rc=rc,
+                rc_max=m, rc_shape=min(1.60, m * 0.86), rc_vloc=min(1.50, m * 0.84),
+                rc_core=1.30, vloc_l=lmax + 1, vloc_e=0.0,
+                scheme=scheme, ortho=ortho)
+
+
 if __name__ == "__main__":
     import sys
     positional = [a for a in sys.argv[1:] if not a.startswith("-")]
     root = positional[0] if positional else os.path.expanduser("~/Projects/PAW_GW/si_gw_paw")
+    if "--prod" in sys.argv:
+        for (name, scheme, rc_s, rc_p, se, pe, d_extras, q, qij, e, de) in PROD_SERIES:
+            d = os.path.join(root, name)
+            os.makedirs(d, exist_ok=True)
+            write_input(prod_spec(name), os.path.join(d, "Si.input"))
+            waves = ("1 wave/l" if not se else
+                     f"s@{se[0]:g}/p@{pe[0]:g}") + ", d@" + "/".join(f"{x:g}" for x in d_extras)
+            print(f"{name}: {scheme:10s} rc={rc_s:.3f}/{rc_p:.3f}  {waves:22s} "
+                  f"Q_occ={q:+.6f}  max|q_ij|={qij:.3f}  E_QE={e:.6f} ({de})")
+        raise SystemExit(0)
     if "--series" in sys.argv:
         for (name, rc_s, rc_p, e_s, q, ratio, _e) in NORM_SERIES:
             d = os.path.join(root, name)

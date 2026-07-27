@@ -154,6 +154,10 @@ no-op because the scheme was hardcoded, so this is genuinely untested. The prior
 `*_kkk` runs used `vanderbilt besselshape` successfully with 3 waves/l at comparable radii,
 which is weak evidence it may behave better at small r_c.
 
+> **Superseded by §8.** The scheme was the right thing to look at but the wrong culprit:
+> what blocks a norm-matched dataset is the *number* of partial waves per s/p channel, and
+> the reference energies of the unbound ones relative to the AE log-derivative poles.
+
 ## 7. The norm series N0-N9 — production datasets
 
 The D-ladder answered the *attribution* question but only D0 survived contact with QE. What
@@ -191,8 +195,108 @@ Note on VANDERBILT: it shifts the norm-matching root itself (Q_occ = +0.0437 at 
 where MODRRKJ gives -0.0012), so `q_aa` depends on the pseudization scheme as well as r_c,
 and its q_ij scale worse. MODRRKJ retained.
 
+> **Corrected in §8.** Judging VANDERBILT at *MODRRKJ's* radii was the wrong test — a
+> scheme that moves the root has to be evaluated at its own root. VANDERBILT's root is
+> r_c = 1.70/1.90, and there it is norm-conserving to +3e-4 e in a much softer dataset.
+
+## 8. The production series P0-P4 — norm-conserving AND d-complete
+
+The N-series settles the norm question but every member has `lmax=1`: no d channel at all.
+Si RPA is known to run away without l=2 completeness (the JTH no-d projector diagnostics,
+`si_rpa_proj.csv`), so an lmax=1 dataset cannot be the production answer however good its
+norm is. The dataset this campaign actually needs is norm-matched **and** d-complete
+**and** stable in a solid, and until now nothing satisfied all three.
+
+### 8.1 Two distinct inflation mechanisms, and the diagnostic for each
+
+`paw_diag.py` gained two metrics that make the failures legible instead of empirical:
+`qij_matrix` (max|q_ij| from the UPF's `PP_Q`, the conditioning gate — the kjpaw library
+dataset has all |q_ij| < 0.08) and `ae_poles` (the energies where the AE log-derivative at
+r_c diverges, read off the `logderiv.l` files; only the -inf -> +inf crossings count, the
+zeros of L are harmless). The pole map at the norm-matched radii is:
+
+| channel | r_c | AE poles (Ry) | off-resonance mid-points |
+|---------|-----|---------------|--------------------------|
+| s | 1.563 | 3.45, 19.68 | 11.6, 24.8 |
+| p | 1.797 | 4.38, 19.30 | 11.8, 24.7 |
+| d | 1.797 | 4.59, 16.48 | 10.5, 23.2 |
+| s | 1.90 | 2.57, 16.69 | 9.6, 23.3 |
+| p | 1.90 | 3.53, 16.57 | 10.1, 23.3 |
+| d | 1.90 | 4.00, 14.46 | 9.2, 22.2 |
+
+With that map the earlier failures separate into two mechanisms, distinguishable by
+*which* norm is large:
+
+* **AE-resonance inflation** — the reference energy sits on a pole, `psi(r_c) -> 0`, and
+  unit-amplitude normalization blows up the interior of the AE wave. D3's `p@20Ry` has AE
+  norm **52.7** against the l=1 pole at 19.30; `SC2_VANDERBILT_18`'s `s@18Ry` has AE 9.14
+  and `p@18Ry` AE 16.34 (poles at 19.68/19.30). This is §6's resonance rule, which had
+  been applied to the *mid* reference energies but never to the high-energy third wave.
+* **Pseudization inflation** — the AE wave is fine but the pseudo wave is not, because an
+  unbound wave nearly parallel to its neighbour inside r_c leaves a tiny residual after
+  orthogonalization and is then renormalized. D3's `s@14Ry`: AE 0.63 -> PS 3.81.
+  `SC2_VANDERBILT_25`'s `s@25Ry`: AE 1.17 -> PS 12.14. This one is invisible to the pole
+  map and is the reason `max|q_ij|` has to be checked independently.
+
+### 8.2 The (r_c, E_ref) band is scheme-dependent, and the two schemes are complementary
+
+Mapping build success over the grid (`sweep.py band`) shows the positive-definite band is
+not a fixed property of the element — the two schemes occupy *opposite* corners. At
+E_ref = 11 Ry, MODRRKJ builds only for r_c >= 1.80 while VANDERBILT builds only for
+r_c <= 1.58. `q_aa` is confirmed invariant to the reference energies (identical to 5
+digits across every E in a row) and depends only on its own wave, its r_c and the scheme.
+
+VANDERBILT's norm root is therefore reachable and lies at **r_c(3s) = 1.70** (q = -1e-4)
+and **r_c(3p) = 1.90** (q = +2.5e-4), i.e. Q_occ = +0.000306 e — four times better than
+N9's -0.001184 e, in a dataset 0.15/0.10 bohr *softer* per channel. And at that root
+VANDERBILT builds d-complete datasets in **12 of 12** configurations tried, where MODRRKJ
+aborts on positive-definiteness at its own root.
+
+### 8.3 What actually unlocks it: the unbound s/p waves, not the scheme
+
+The decisive test is dropping the unbound s/p partial waves altogether, leaving one
+norm-matched bound wave per s/p channel plus a two-wave d channel. The occupied
+augmentation charges then nearly vanish, and the construction succeeds under **both**
+schemes — including MODRRKJ at exactly the radii where its 2-wave-per-l version aborts.
+All QE numbers below: PBE, a = 10.26 bohr, 4x4x4 k, 60 Ry, ecutrho = 8x; the library
+`Si.pbe-n-kjpaw_psl.1.0.0.UPF` control is -93.439419 Ry.
+
+| name | scheme | r_c(s)/r_c(p) | s/p waves | d refs | Q_occ (e) | max abs q_ij | E_QE (Ry) | neg. rho | RMS[15,30] l0/l1/l2 |
+|------|--------|---------------|-----------|--------|-----------|--------------|-----------|----------|---------------------|
+| P0 | MODRRKJ | 1.555/1.796 | 1 each | 2, 10 | -0.001184 | **0.157** | -93.449913 | none | 0.61/0.77/0.57 |
+| P1 | VANDERBILT | 1.700/1.900 | 1 each | 2, 9 | +0.000306 | 0.533 | -93.448121 | none | 0.58/0.76/0.09 |
+| P2 | VANDERBILT | 1.700/1.900 | 1 each | 2, 22 | +0.000306 | 0.997 | **-93.439028** | none | 0.58/0.76/0.04 |
+| P3 | MODRRKJ | 1.555/1.796 | s@18, p@10 | 2, 10 | -0.001184 | 0.477 | -93.724550 | none | 0.63/0.66/0.57 |
+| P4 | VANDERBILT | 1.700/1.900 | s@26, p@24 | 2, 22 | +0.000306 | 3.471 | -93.448501 | 1.3e-2 | **0.17/0.19/0.04** |
+
+`gen_inputs.py --prod` regenerates all five; each reproduces its `Q_occ` and `max|q_ij|`
+exactly on rebuild. Reading the table:
+
+* **P0-P2** are the minimal form. `infl = 1.00` — not a single pseudo wave exceeds its AE
+  norm — and P2 lands **0.4 mRy** from the library kjpaw control. What they give up is
+  s/p scattering above 15 Ry (one reference energy per channel).
+* **P3 is N9's own s/p construction plus the d channel it was missing.** The three earlier
+  attempts at this exact dataset (`NM2_23_*`) aborted only because they used E_s = 12/14
+  instead of N9's 18 — the second s wave was the obstruction, never the d channel. This is
+  the "full package": norm-matched, d-complete, two waves in s/p, no negative rho.
+* **P4** buys the high-energy s/p scattering back (0.63/0.66 -> 0.17/0.19 rad) by putting
+  the second wave in the *upper* off-resonance window, at the cost of max|q_ij| = 3.5 and a
+  small residual negative rho — usable but the one to watch.
+
+Two rules of thumb fall out, both of which contradict what §6 concluded. `max|q_ij|` is a
+strong but not sufficient predictor of QE stability: 0.48 (N9) and 0.53 (P1) are fine,
+3.47 (P4) converges with a trace of negative rho, but 0.79 with `infl = 2.0`
+(VANDERBILT 2-wave, no d) diverges to -759 Ry — the *inflation ratio* discriminates the
+last case, so both are worth reporting. And a scheme comparison is only meaningful at each
+scheme's own norm root.
+
 ## 5. Open / next
 
+0. **Retry D5 with the §8 findings.** The semicore rung was abandoned against the old
+   assumption that positive-definiteness was a hard wall; §8 shows the wall is set by the
+   unbound waves and the pole map, neither of which was controlled in the D5 attempts. A
+   minimal-form D5 (bound 2s/2p/3s/3p only, plus a two-wave d channel, at each scheme's
+   own root) is the version that has not been tried.
 1. **D4, D5 blocked** on atompaw's positive-definiteness check. D4/D5 need `vloc_l=4`
    (l=4 local potential, since f projectors occupy l=3); every f-reference variant tried
    (single at 10 or 20 Ry, pair at 4+20) aborts. The first D5 attempt at KKK Table I radii
@@ -201,10 +305,13 @@ and its q_ij scale worse. MODRRKJ retained.
    scanning r_c(2s,2p) in 0.9-1.4 at lmax=2 also failed, so the vloc/shape radii need
    re-tuning together rather than one at a time. D5 matters (KKK put 2p in valence for Si);
    D4 is low value given the f finding above.
-2. Solid-state validation, not yet started: QE SCF with each UPF -> CoQui RPA vs `nbnd`
-   (50/100/150/250/500) at 2 volumes, extrapolated in `1/nbnd` against the ONCV/ccECP
-   references already in `si_rpa_proj.csv`; then the full EOS for the winner. Cross-check
-   the XML path through `abinit2coqui` on the same dataset.
+2. Solid-state validation: QE SCF is now done for N0-N9 and P0-P4 (§7, §8). Still to run:
+   CoQui RPA vs `nbnd` (50/100/150/250/500) at 2 volumes via `run_rpa.py`, extrapolated in
+   `1/nbnd` against the ONCV/ccECP references already in `si_rpa_proj.csv`; then the full
+   EOS for the winner. Cross-check the XML path through `abinit2coqui` on the same dataset.
+   The P-series is the production candidate set — P3 for the all-round dataset, P2 for the
+   softest/best-DFT one, P4 if high-energy s/p scattering turns out to matter; N0-N9 stay
+   as the norm-defect lever for the mechanism plot.
 3. The expected correlation to plot for the paper: extrapolated RPA-limit error vs `Q_occ`,
    which should separate D0/D1/D2 (identical `Q_occ`) from D3 regardless of their differing
    scattering quality.
