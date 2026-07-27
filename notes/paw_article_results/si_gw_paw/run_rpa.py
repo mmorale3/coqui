@@ -34,6 +34,11 @@ COQUI = os.environ.get(
 LADDER = os.environ.get("SIPAW_LADDER", os.path.expanduser("~/Projects/PAW_GW/si_gw_paw"))
 WORK = os.environ.get("SIPAW_WORK", os.path.join(LADDER, "_rpa"))
 MPI = os.environ.get("SIPAW_MPI", "").split()
+# pw2coqui.x gets its OWN launcher: at 32 ranks on rusty it wedges after "Reading
+# collected, re-writing distributed wavefunctions" with every rank spinning at 100% CPU
+# (MPI busy-wait, not I/O) on a step that takes seconds serially.  It is cheap, so the
+# default for the cluster is to run it on one rank.
+MPI_P2C = os.environ.get("SIPAW_MPI_P2C", os.environ.get("SIPAW_MPI", "")).split()
 UPF = "Si.GGA-PBE-paw.UPF"
 
 ALAT = 10.26
@@ -145,7 +150,7 @@ def run_chain(rung, nbnds=NBNDS, alat=ALAT):
     # 3. pw2coqui companion file
     with open(os.path.join(d, "p2c.in"), "w") as f:
         f.write("&input_pw2coqui\n  prefix = 'si'\n  outdir = './out'\n/\n")
-    sh(MPI + [os.path.join(QE_BIN, "pw2coqui.x"), "-in", "p2c.in"], d, "p2c.out")
+    sh(MPI_P2C + [os.path.join(QE_BIN, "pw2coqui.x"), "-in", "p2c.in"], d, "p2c.out")
 
     # 4. CoQui RPA at each band count
     out = {}
