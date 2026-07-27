@@ -25,10 +25,15 @@ import shutil
 import subprocess
 import sys
 
-QE_BIN = os.path.expanduser("~/Software/qe-7.4.1/build/cpu/bin")
-COQUI = os.path.expanduser("~/Software/CoQui_Separate_Development/build/cpu/bin/coqui")
-LADDER = os.path.expanduser("~/Projects/PAW_GW/si_gw_paw")
-WORK = os.path.expanduser("~/Projects/PAW_GW/si_gw_paw/_rpa")
+# Paths and launcher are overridable so the same driver runs on this host (serial) and
+# on rusty (srun), rather than maintaining a divergent cluster copy.  SIPAW_MPI is the
+# launcher prefix, e.g. "srun -n 64"; empty means run the binary directly.
+QE_BIN = os.environ.get("SIPAW_QE_BIN", os.path.expanduser("~/Software/qe-7.4.1/build/cpu/bin"))
+COQUI = os.environ.get(
+    "SIPAW_COQUI", os.path.expanduser("~/Software/CoQui_Separate_Development/build/cpu/bin/coqui"))
+LADDER = os.environ.get("SIPAW_LADDER", os.path.expanduser("~/Projects/PAW_GW/si_gw_paw"))
+WORK = os.environ.get("SIPAW_WORK", os.path.join(LADDER, "_rpa"))
+MPI = os.environ.get("SIPAW_MPI", "").split()
 UPF = "Si.GGA-PBE-paw.UPF"
 
 ALAT = 10.26
@@ -127,7 +132,7 @@ def run_chain(rung, nbnds=NBNDS, alat=ALAT):
     with open(os.path.join(d, "scf.in"), "w") as f:
         f.write(PW.format(calc="scf", pseudo=pseudo, alat=alat, ecutwfc=ECUTWFC,
                           ecutrho=ECUTRHO, nbnd="", upf=UPF, nk=NK))
-    sh([os.path.join(QE_BIN, "pw.x"), "-in", "scf.in"], d, "scf.out")
+    sh(MPI + [os.path.join(QE_BIN, "pw.x"), "-in", "scf.in"], d, "scf.out")
     if "convergence NOT" in open(os.path.join(d, "scf.out"), errors="replace").read():
         return {"error": "scf not converged"}
 
@@ -135,12 +140,12 @@ def run_chain(rung, nbnds=NBNDS, alat=ALAT):
     with open(os.path.join(d, "nscf.in"), "w") as f:
         f.write(PW.format(calc="nscf", pseudo=pseudo, alat=alat, ecutwfc=ECUTWFC,
                           ecutrho=ECUTRHO, nbnd=f"nbnd = {max(nbnds)}", upf=UPF, nk=NK))
-    sh([os.path.join(QE_BIN, "pw.x"), "-in", "nscf.in"], d, "nscf.out")
+    sh(MPI + [os.path.join(QE_BIN, "pw.x"), "-in", "nscf.in"], d, "nscf.out")
 
     # 3. pw2coqui companion file
     with open(os.path.join(d, "p2c.in"), "w") as f:
         f.write("&input_pw2coqui\n  prefix = 'si'\n  outdir = './out'\n/\n")
-    sh([os.path.join(QE_BIN, "pw2coqui.x"), "-in", "p2c.in"], d, "p2c.out")
+    sh(MPI + [os.path.join(QE_BIN, "pw2coqui.x"), "-in", "p2c.in"], d, "p2c.out")
 
     # 4. CoQui RPA at each band count
     out = {}
@@ -148,7 +153,7 @@ def run_chain(rung, nbnds=NBNDS, alat=ALAT):
         toml = f"rpa_n{nb}.toml"
         with open(os.path.join(d, toml), "w") as f:
             f.write(RPA_TOML.format(nbnd=nb, tag=os.path.basename(d)))
-        sh([COQUI, "--filenames", toml], d, f"rpa_n{nb}.out")
+        sh(MPI + [COQUI, "--filenames", toml], d, f"rpa_n{nb}.out")
         txt = open(os.path.join(d, f"rpa_n{nb}.out"), errors="replace").read()
         m = re.search(r"RPA energy:\s+(-?[\d.eE+]+)", txt)
         out[nb] = float(m.group(1)) if m else None
