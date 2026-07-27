@@ -65,6 +65,7 @@
 
 #include "numerics/imag_axes_ft/IAFT.hpp"
 #include "numerics/imag_axes_ft/iaft_dconv.hpp"  // dconv_detail::stable_nF/nB (+ cppdlr via IAFT)
+#include "numerics/imag_axes_ft/dlr_pole_fit.hpp"
 #include "methods/vertex/vertex_sym.hpp"
 
 namespace methods {
@@ -215,36 +216,24 @@ namespace vertex_detail {
       if (wnb(m) == 0) { m0 = m; break; }
     utils::check(m0 >= 0, "eval_sigma_C: bosonic Matsubara mesh does not contain iv = 0.");
 
-    // ---- auxiliary NONSYM DLR pole basis (see iaft_dconv.hpp) ------------
-    auto rf = cppdlr::build_dlr_rf(ft.lambda(), ft.eps());
-    auto itops_p = cppdlr::imtime_ops(ft.lambda(), rf);
-    const long np = itops_p.rank();
+    // ---- auxiliary DLR pole basis, REGULARIZED fit (numerics/imag_axes_ft/dlr_pole_fit.hpp)
+    // Was: interpolate the backend tau data onto the aux tau nodes (Tmap) and run a square
+    // interpolatory vals2coefs there. That composite is a fixed linear map of 2-norm 9.4e6 at
+    // the production grid and it is what turned O(eps) unrepresentable content into residues
+    // hundreds of times the data, which families I-V then multiply pairwise.
+    imag_axes_ft::dlr_pole_fit pfit(ft);
+    const long np = pfit.np;
+    auto const& epsl = pfit.epsl;
 
-    nda::array<double, 1> x_p(np);
-    for (long i = 0; i < np; ++i) x_p(i) = 2.0 * cppdlr::rel2abs(itops_p.get_itnodes(i)) - 1.0;
-    auto Tmap_arr = ft.construct_tau_interpolate_matrix(x_p);  // (np, nt)
-    nda::array<ComplexType, 2> Tmap(np, nt);
-    for (long i = 0; i < np; ++i)
-      for (long l = 0; l < nt; ++l) Tmap(i, l) = Tmap_arr(i, l);
-
-    nda::array<double, 1> epsl(np), nF(np), nB(np), th(np);
-    double min_abs = 1e300, min_gap = 1e300;
-    for (long l = 0; l < np; ++l) {
-      epsl(l) = rf(l) / beta;
-      min_abs = std::min(min_abs, std::abs(rf(l)));
-      for (long l2 = 0; l2 < l; ++l2) min_gap = std::min(min_gap, std::abs(rf(l) - rf(l2)));
-    }
-    utils::check(min_abs > 1e-12,
-                 "eval_sigma_C: auxiliary DLR pole grid contains a (near-)zero node "
-                 "(min |hw_l| = {}).", min_abs);
+    nda::array<double, 1> nF(np), nB(np), th(np);
     for (long l = 0; l < np; ++l) {
       nF(l) = stable_nF(beta, epsl(l));
       nB(l) = stable_nB(beta, epsl(l));
-      th(l) = std::tanh(0.5 * rf(l));
+      th(l) = std::tanh(0.5 * pfit.rf(l));
     }
-    app_log(2, "eval_sigma_C: DLR rank = {} (aux pole rank = {}), lambda = {}, eps = {}, "
-               "min|hw_l| = {}, min node gap = {}; C = [{}, {}), nbnd = {}, Np = {}, nk = {}",
-            nt, np, ft.lambda(), ft.eps(), min_abs, min_gap, C0, C0 + nc, nbnd, Np, nk);
+    pfit.log(2, "eval_sigma_C");
+    app_log(2, "eval_sigma_C: lambda = {}, eps = {}; C = [{}, {}), nbnd = {}, Np = {}, nk = {}",
+            ft.lambda(), ft.eps(), C0, C0 + nc, nbnd, Np, nk);
 
     // exact tau -> beta - tau map through the DLR basis
     nda::array<ComplexType, 2> R(nt, nt);
@@ -329,6 +318,10 @@ namespace vertex_detail {
 
     // per-family running max |contribution| (diagnostics, verbosity 3)
     std::array<double, 8> fam_max{};  // I..V, S1, S2, S3
+    // worst relative reconstruction error of the auxiliary pole fit over every object it is
+    // applied to (Wy, and the C-window G blocks B/C). Hard-gated after the loop: families
+    // I-V multiply residues pairwise, so this error enters Sigma^C squared.
+    double fit_err_max = 0.0;
     auto track_max = [](double &m, nda::array<ComplexType, 3> const &A) {
       for (auto const &v : A) m = std::max(m, std::abs(v));
     };
@@ -481,12 +474,14 @@ namespace vertex_detail {
           else      nda::blas::gemm(nda::transpose(Zy), A_y, tmp_NpdX);
           nda::blas::gemm(nda::transpose(tmp_NpdX), U_Ry, cy_ef);
         }
-        // Wy residues on the aux NONSYM pole basis (x tanh(hw/2))
+        // Wy residues on the aux pole basis (x tanh(hw/2)); bosonic convention as in
+        // iaft_dconv.hpp: W(z) = sum_l [w_l tanh(hw_l/2)]/(z - eps_l) with w_l the
+        // FERMIONIC-kernel residues of W(tau).
         {
-          nda::array<ComplexType, 2> Wy_tau(nt, dXF), tmp_p(np, dXF);
+          nda::array<ComplexType, 2> Wy_tau(nt, dXF);
           nda::blas::gemm(Ttw_bb, Wy_w, Wy_tau);
-          nda::blas::gemm(Tmap, Wy_tau, tmp_p);
-          auto ycoef = itops_p.vals2coefs(tmp_p);
+          auto ycoef = pfit.coeffs(Wy_tau);
+          fit_err_max = std::max(fit_err_max, pfit.fit_error(Wy_tau, ycoef));
           for (long l = 0; l < np; ++l)
             for (long j = 0; j < dXF; ++j) Y_res(l, j) = th(l) * ycoef(l, j);
         }
@@ -500,11 +495,10 @@ namespace vertex_detail {
               D2(it, iG(i, j)) = G_tskij(it, is, ikmqx,    C0 + i, C0 + j);  // (p1, p4')
             }
         {
-          nda::array<ComplexType, 2> tmp_p(np, dG);
-          nda::blas::gemm(Tmap, B2, tmp_p);
-          b_res = itops_p.vals2coefs(tmp_p);
-          nda::blas::gemm(Tmap, C2, tmp_p);
-          c_res = itops_p.vals2coefs(tmp_p);
+          b_res = pfit.coeffs(B2);
+          c_res = pfit.coeffs(C2);
+          fit_err_max = std::max(fit_err_max, pfit.fit_error(B2, b_res));
+          fit_err_max = std::max(fit_err_max, pfit.fit_error(C2, c_res));
         }
         nda::blas::gemm(Twt_ff, D2, D_w);
         nda::blas::gemm(R, C2, Crefl);
@@ -570,6 +564,13 @@ namespace vertex_detail {
         //   S(n) += nF(p) [b_p . Wy(e_p-iw) . T[Wx*C^{(p-defl)}(e_p-i.), D]]_ring
         // ================================================================
         for (long p = 0; p < np; ++p) {
+          // The l == p term is DEFLATED BY INDEX, not by value, and that is correct: it is
+          // restored exactly by family (V) as a true double pole. A value-based guard
+          // (|eps_p - eps_l| < tol -> 0), as build_kappa uses for its DIVIDED DIFFERENCE,
+          // would be wrong here -- it would zero distinct-node terms that family (V) does not
+          // compensate. The two are different objects, not an inconsistency. What the index
+          // form does require is a well-separated grid, so that no distinct pair leaves a
+          // large 1/(eps_p - eps_l); dlr_pole_fit asserts min node gap > 1e-6 for exactly this.
           for (long m = 0; m < nw_b; ++m)
             for (long l = 0; l < np; ++l)
               Kb(m, l) = (l == p) ? ComplexType(0.0) : 1.0 / (epsl(p) - zb(m) - epsl(l));
@@ -628,6 +629,7 @@ namespace vertex_detail {
         //   S(n) += nF(q) [c_q . T[Wx*B^{(q-defl)}(e_q+i.), D*Wy(e_q-i.)]]_ring
         // ================================================================
         for (long q = 0; q < np; ++q) {
+          // deflated BY INDEX; see the note in family (II) -- family (V) restores this term.
           for (long m = 0; m < nw_b; ++m)
             for (long l = 0; l < np; ++l)
               Kb(m, l) = (l == q) ? ComplexType(0.0) : 1.0 / (epsl(q) + zb(m) - epsl(l));
@@ -915,11 +917,11 @@ namespace vertex_detail {
       }  // iqy
     }  // combo
 
-    // PROMOTED to level 1 for the 2026-07-27 divergence hunt, and reduced across ranks.
-    // These are running maxima of the ACCUMULATED Sigma after each family, so the family
-    // that introduces the blow-up is the one where consecutive entries jump. Sigma^C reached
-    // 1.78e6 from a bounded G (max|G_CC| = 0.982) and a healthy W in the kp444 C=[0,4)
-    // restart, so exactly one of these eight is producing it.
+    // Running maxima of the ACCUMULATED Sigma after each family, reduced across ranks. Large,
+    // nearly cancelling families are the NORMAL operating mode here (a healthy kp444/M4 run
+    // has I/II/III at ~4e4 cancelling to 8 and returning a correct max|Sigma| = 0.218), so
+    // never read family magnitude alone as a defect -- read the JUMP between consecutive
+    // entries, and read it together with the pole-fit error below.
     {
       std::array<double, 8> fm = fam_max;
       comm.all_reduce_in_place_n(fm.data(), fm.size(), boost::mpi3::max<>{});
@@ -927,6 +929,12 @@ namespace vertex_detail {
                  "II = {:.4e}, III = {:.4e}, IV = {:.4e}, V = {:.4e}, S1 = {:.4e}, "
                  "S2 = {:.4e}, S3 = {:.4e}",
               fm[0], fm[1], fm[2], fm[3], fm[4], fm[5], fm[6], fm[7]);
+    }
+    {
+      comm.all_reduce_in_place_n(&fit_err_max, 1, boost::mpi3::max<>{});
+      app_log(1, "  eval_sigma_C: auxiliary pole-fit reconstruction error (max over Wy and "
+                 "the C-window G blocks) = {:.4e}", fit_err_max);
+      imag_axes_ft::dlr_pole_fit_gate(fit_err_max, "vertex_sigma::eval_sigma_C");
     }
 
     // ---- dynamic part w -> tau, add instantaneous, normalize, reduce -----

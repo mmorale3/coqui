@@ -74,6 +74,7 @@
 #include "utilities/check.hpp"
 #include "IO/app_loggers.h"
 #include "numerics/imag_axes_ft/IAFT.hpp"
+#include "numerics/imag_axes_ft/dlr_pole_fit.hpp"
 #include "methods/vertex/vertex_sym.hpp"
 // under ENABLE_DLR, IAFT.hpp -> dlr_driver.hpp provides the cppdlr headers used below
 // (same pattern as numerics/imag_axes_ft/iaft_dconv.hpp)
@@ -103,11 +104,8 @@ namespace vertex_pi {
     // --- DLR pole machinery for the dynamic part (lazy) -------------------------------
     bool poles_ready = false;
     long np = 0;
-    nda::array<double, 1> epsl;          // physical pole energies eps_p
-    nda::array<ComplexType, 2> Tmap;     // (np, nt): backend tau values -> aux tau values
-#ifdef ENABLE_DLR
-    std::unique_ptr<cppdlr::imtime_ops> itops_p;
-#endif
+    nda::array<double, 1> epsl;              // physical pole energies eps_p
+    imag_axes_ft::dlr_pole_fit pfit;         // REGULARIZED tau -> residue map (dlr_pole_fit.hpp)
 
     explicit iaft_tools(imag_axes_ft::IAFT const& ft_) : ft(&ft_) {
       beta = ft->beta();
@@ -151,106 +149,91 @@ namespace vertex_pi {
     }
 
     // stable K_F(s,e) = -e^{-e s} / (1 + e^{-beta e}),  s in [0, beta]
-    double KF(double s, double e) const {
-      if (e >= 0.0) return -std::exp(-e * s) / (1.0 + std::exp(-beta * e));
-      return -std::exp(e * (beta - s)) / (1.0 + std::exp(beta * e));
-    }
+    double KF(double s, double e) const { return imag_axes_ft::dlr_kF(beta, s, e); }
     // fermionic occupation
     double nF(double e) const {
       if (e >= 0.0) { double x = std::exp(-beta * e); return x / (1.0 + x); }
       return 1.0 / (1.0 + std::exp(beta * e));
     }
 
-    /** initialize the auxiliary (NONSYM) DLR pole basis; the dynamic-rung path only. */
-    void init_poles() {
+    /**
+     * Initialize the auxiliary DLR pole basis (dynamic-rung path only).
+     *
+     * The residues now come from the REGULARIZED least-squares fit in dlr_pole_fit.hpp --
+     * see that file for the measurements. The old route (interpolate the backend tau data
+     * onto the aux tau nodes, then run a square interpolatory vals2coefs there) is a fixed
+     * linear map of 2-norm 9.4e6 at the production grid, and it is what turned O(eps)
+     * unrepresentable content in z into residues 384x the data.
+     */
+    void init_poles(double rtol = imag_axes_ft::dlr_pole_fit_default_rtol) {
       if (poles_ready) return;
-#ifndef ENABLE_DLR
-      utils::check(false, "vertex_pi: the dynamic-rung Pi^C requires the DLR imaginary-axis "
-                          "backend (build with ENABLE_DLR=ON).");
-#else
-      utils::check(ft->basis() == imag_axes_ft::dlr_basis,
-                   "vertex_pi: the dynamic-rung Pi^C requires the DLR imaginary-axis backend; "
-                   "the IR backend does not expose the needed off-grid evaluations yet. "
-                   "Rerun with iaft basis = \"dlr\".");
-      // NONSYM aux pole grid (well-conditioned interpolatory coefficients; the backend SYM
-      // grid has near-degenerate +/- pairs with huge cancelling coefficients -- see the
-      // discussion in iaft_dconv.hpp).
-      auto rf = cppdlr::build_dlr_rf(ft->lambda(), ft->eps());
-      itops_p = std::make_unique<cppdlr::imtime_ops>(ft->lambda(), rf);
-      np = itops_p->rank();
-      nda::array<double, 1> x_p(np);
-      for (long i = 0; i < np; ++i) x_p(i) = 2.0 * cppdlr::rel2abs(itops_p->get_itnodes(i)) - 1.0;
-      auto Tarr = ft->construct_tau_interpolate_matrix(x_p);   // (np, nt)
-      Tmap = nda::array<ComplexType, 2>(np, nt_f);
-      for (long i = 0; i < np; ++i)
-        for (long l = 0; l < nt_f; ++l) Tmap(i, l) = Tarr(i, l);
-      epsl = nda::array<double, 1>(np);
-      for (long l = 0; l < np; ++l) epsl(l) = rf(l) / beta;
+      pfit.build(*ft, rtol);
+      np = pfit.np;
+      epsl = pfit.epsl;
 
-      // self-check of the pole conventions: a single off-grid pole function
+      // Self-check of the pole CONVENTION -- that a tau fit continues to sum_p c_p/(z-eps_p).
+      // Two cases: a single off-grid pole, and a multi-pole Lehmann object spanning the grid.
+      // (The single-pole case alone is far too weak to catch a representation failure -- it is
+      // trivially in the span, which is why it passed through every divergence. The runtime
+      // gate on fit_error against the ACTUAL data is what does that job now.)
       {
-        double estar = 0.37 * epsl(np - 1) + 0.11 * epsl(0);
-        nda::array<ComplexType, 2> h(nt_f, 1);
-        for (long i = 0; i < nt_f; ++i) h(i, 0) = KF(s_phys(i), estar);
-        auto c = pole_coeffs(h);
         auto wf = ft->wn_mesh_f();
-        double max_err = 0;
-        for (long n = 0; n < std::min(5L, (long)wf.size()); ++n) {
-          ComplexType z(0.0, double(wf(n)) * M_PI / beta);
-          ComplexType val = 0;
-          for (long p = 0; p < np; ++p) val += c(p, 0) / (z - epsl(p));
-          max_err = std::max(max_err, std::abs(val - 1.0 / (z - estar)));
+        auto check_case = [&](nda::array<double, 1> const& es, nda::array<double, 1> const& ws,
+                              const char* what) {
+          nda::array<ComplexType, 2> h(nt_f, 1);
+          for (long i = 0; i < nt_f; ++i) {
+            double v = 0;
+            for (long a = 0; a < es.size(); ++a) v += ws(a) * KF(s_phys(i), es(a));
+            h(i, 0) = v;
+          }
+          auto c = pole_coeffs(h);
+          double max_err = 0, ref_scale = 0;
+          for (long n = 0; n < std::min(5L, (long)wf.size()); ++n) {
+            ComplexType z(0.0, double(wf(n)) * M_PI / beta);
+            ComplexType val = 0, ref = 0;
+            for (long p = 0; p < np; ++p) val += c(p, 0) / (z - epsl(p));
+            for (long a = 0; a < es.size(); ++a) ref += ws(a) / (z - es(a));
+            max_err = std::max(max_err, std::abs(val - ref));
+            ref_scale = std::max(ref_scale, std::abs(ref));
+          }
+          // a wrong convention gives an O(1) RELATIVE error; the fit itself is O(eps)
+          double rel = (ref_scale > 0) ? max_err / ref_scale : max_err;
+          double tol = std::max(1e-6, 1e4 * ft->eps());
+          utils::check(rel < tol,
+                       "vertex_pi::init_poles: DLR pole-convention self-check failed on the "
+                       "{} case (rel err = {}, tol = {}).", what, rel, tol);
+        };
+        nda::array<double, 1> e1(1), w1(1);
+        e1(0) = 0.37 * epsl(np - 1) + 0.11 * epsl(0);
+        w1(0) = 1.0;
+        check_case(e1, w1, "single-pole");
+
+        const long nmp = 6;
+        nda::array<double, 1> em(nmp), wm(nmp);
+        for (long a = 0; a < nmp; ++a) {
+          double f = (double(a) + 0.5) / double(nmp);            // spread over the grid range
+          em(a) = (1.0 - f) * epsl(0) + f * epsl(np - 1);
+          wm(a) = ((a % 2) ? -1.0 : 1.0) * (1.0 + 0.3 * double(a));
         }
-        // a wrong pole convention gives O(1) error; fit accuracy is O(eps)
-        double tol = std::max(1e-8, 1e3 * ft->eps());
-        utils::check(max_err < tol,
-                     "vertex_pi::init_poles: DLR pole-convention self-check failed "
-                     "(err = {}, tol = {}).", max_err, tol);
+        check_case(em, wm, "multi-pole Lehmann");
       }
+      pfit.log(2, "vertex_pi::eval_Pi_C");
       poles_ready = true;
-#endif
     }
 
     /** DLR pole residues of tau-grid data (leading axis nt_f): F(z) = sum_p c_p/(z-eps_p). */
     nda::array<ComplexType, 2> pole_coeffs(nda::MemoryArrayOfRank<2> auto const& F_td) const {
-#ifndef ENABLE_DLR
-      (void)F_td;
-      utils::check(false, "vertex_pi::pole_coeffs: requires ENABLE_DLR.");
-      return nda::array<ComplexType, 2>(0, 0);
-#else
-      long d = F_td.shape(1);
-      nda::array<ComplexType, 2> tmp(np, d);
-      nda::blas::gemm(Tmap, F_td, tmp);
-      nda::array<ComplexType, 2> c = itops_p->vals2coefs(tmp);
-      return c;
-#endif
+      return pfit.coeffs(F_td);
     }
 
     /**
-     * Relative max-norm error of the DLR pole fit, evaluated back on the SAME tau grid the
-     * data came from:  err = max|F - sum_p c_p K_F(s, eps_p)| / max|F|.
-     *
-     * init_poles self-checks only a single SYNTHETIC pole (see above), never the real data.
-     * Measured 2026-07-27: a 2.4% change in the bounded z objects (max|z| 3.5925 -> 3.6774)
-     * changed their residues by 530x (2.66 -> 1411). pole_coeffs is a FIXED linear map, so
-     * that can only happen if the map is ill-conditioned and the data rotated into the
-     * amplified direction. If the fit also stops REPRODUCING the data when the residues
-     * blow up, the aux pole representation is confirmed as the defect.
+     * Relative max-norm error of the pole fit, evaluated back on the SAME tau grid the data
+     * came from:  err = max|F - sum_p c_p K_F(s, eps_p)| / max|F|.  This is the honest
+     * accuracy of the representation for THIS data, and the quantity eval_Pi_C gates on.
      */
     double fit_error(nda::MemoryArrayOfRank<2> auto const& F_td,
                      nda::array<ComplexType, 2> const& c) const {
-      long nt = F_td.shape(0), d = F_td.shape(1);
-      double num = 0.0, den = 0.0;
-      for (long s = 0; s < nt; ++s) {
-        const double ss = s_phys(s);
-        for (long j = 0; j < d; ++j) {
-          ComplexType rec(0.0);
-          for (long p = 0; p < np; ++p) rec += c(p, j) * KF(ss, epsl(p));
-          num = std::max(num, std::abs(F_td(s, j) - rec));
-          den = std::max(den, std::abs(F_td(s, j)));
-        }
-      }
-      return (den > 0.0) ? num / den : 0.0;
+      return pfit.fit_error(F_td, c);
     }
 
     /**
@@ -653,7 +636,11 @@ namespace vertex_pi {
     long np = tools.np;
 
     // pole coefficients of all z objects: cL(s,k): (np, Np, Nb); cR(s,k): (np, Nb, Np)
+    // The fit error is now measured UNCONDITIONALLY (it is O(nt.np.Np.Nb) per k, negligible
+    // against the kappa algebra) and hard-gated below: it is the only quantity that detects
+    // the z data leaving the representable class, and it must not depend on a diagnostic flag.
     nda::array<ComplexType, 5> cL(ns, nk, np, Np, Nb), cR(ns, nk, np, Nb, Np);
+    double fit_err_max = 0.0;
     {
       nda::array<ComplexType, 2> buf(nt, Np * Nb);
       for (long is = 0; is < ns; ++is)
@@ -661,22 +648,23 @@ namespace vertex_pi {
           auto zl2 = nda::reshape(zL(is, ik, nda::ellipsis{}), shape_t<2>{nt, Np * Nb});
           buf = zl2;
           auto c = tools.pole_coeffs(buf);
-          if (phase_diag != nullptr)
-            (*phase_diag)(3) = std::max((*phase_diag)(3), tools.fit_error(buf, c));
+          fit_err_max = std::max(fit_err_max, tools.fit_error(buf, c));
           auto cv = nda::reshape(cL(is, ik, nda::ellipsis{}), shape_t<2>{np, Np * Nb});
           cv = c;
           auto zr2 = nda::reshape(zR(is, ik, nda::ellipsis{}), shape_t<2>{nt, Nb * Np});
           buf = zr2;
           auto c2 = tools.pole_coeffs(buf);
-          if (phase_diag != nullptr)
-            (*phase_diag)(3) = std::max((*phase_diag)(3), tools.fit_error(buf, c2));
+          fit_err_max = std::max(fit_err_max, tools.fit_error(buf, c2));
           auto cv2 = nda::reshape(cR(is, ik, nda::ellipsis{}), shape_t<2>{np, Nb * Np});
           cv2 = c2;
         }
     }
-    // DLR pole residues of the z objects. zL/zR are bounded (they are X.G products of a
-    // bounded G), but pole_coeffs FITS them to the aux pole basis -- if that fit is what
-    // amplifies, these residues are where it first shows, before any of the kappa algebra.
+    if (phase_diag != nullptr) (*phase_diag)(3) = std::max((*phase_diag)(3), fit_err_max);
+    imag_axes_ft::dlr_pole_fit_gate(fit_err_max, "vertex_pi::eval_Pi_C (z objects)");
+    // DLR pole residues of the z objects. zL/zR are bounded (X.G products of a bounded G);
+    // with the unregularized fit these residues were where the divergence first showed,
+    // BEFORE any of the kappa algebra (3.0 -> 9.4 -> 1411 over three iterations while every
+    // input stayed flat). Keep watching them -- they remain the earliest warning.
     if (phase_diag != nullptr) {
       double mc = 0.0;
       for (auto const& v : cL) mc = std::max(mc, std::abs(v));

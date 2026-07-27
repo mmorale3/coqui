@@ -72,6 +72,7 @@
 #include "nda/blas.hpp"
 
 #include "numerics/imag_axes_ft/IAFT.hpp"
+#include "numerics/imag_axes_ft/dlr_pole_fit.hpp"
 
 namespace imag_axes_ft {
 
@@ -155,43 +156,27 @@ namespace imag_axes_ft {
       auto Ttw_bb = ft.Ttw_bb();  // (nt, nw_b)
       auto Twt_bb = ft.Twt_bb();  // (nw_b, nt)
 
-      // ---- auxiliary (NONSYM) DLR pole basis ------------------------------
-      // The backend's SYM grid contains near-degenerate +/- node pairs whose
-      // interpolatory coefficients are huge and cancelling -- fatal for the
-      // residue algebra in double precision. The pole DATA is therefore built
-      // on cppdlr's NONSYM grid (greedy-pivoted, well-conditioned
-      // interpolation, O(1) coefficients); the values are converted exactly
-      // through the backend basis (value-space maps stay well-conditioned).
-      auto rf = cppdlr::build_dlr_rf(ft.lambda(), ft.eps());  // dimensionless nodes hw_l = beta*eps_l
-      auto itops_p = cppdlr::imtime_ops(ft.lambda(), rf);
-      const long np = itops_p.rank();
+      // ---- auxiliary DLR pole basis, REGULARIZED fit ----------------------
+      // The pole DATA lives on cppdlr's NONSYM grid: the backend's SYM grid contains
+      // near-degenerate +/- node pairs whose interpolatory coefficients are huge and
+      // cancelling (cond(cf2it) 6.2e10 vs 6.7e6, measured), and this algebra divides by
+      // node gaps. What CHANGED (2026-07-28, see dlr_pole_fit.hpp for the measurements):
+      // the residues used to come from an interpolation onto the aux tau nodes followed by
+      // a square interpolatory solve there. That composite has 2-norm 9.4e6, so O(eps)
+      // content the pole basis cannot resolve came back as residues hundreds of times the
+      // data -- and this algebra is bilinear in them. They now come from a truncated-SVD
+      // least-squares fit against the backend tau grid directly.
+      imag_axes_ft::dlr_pole_fit pfit(ft);
+      const long np = pfit.np;
+      auto const& epsl = pfit.epsl;
 
-      nda::array<double, 1> x_p(np);
-      for (long i = 0; i < np; ++i) x_p(i) = 2.0 * cppdlr::rel2abs(itops_p.get_itnodes(i)) - 1.0;
-      auto Tmap_arr = ft.construct_tau_interpolate_matrix(x_p);  // (np, nt): backend tau values -> aux tau values
-      nda::array<ComplexType, 2> Tmap(np, nt);
-      for (long i = 0; i < np; ++i)
-        for (long l = 0; l < nt; ++l) Tmap(i, l) = Tmap_arr(i, l);
-
-      nda::array<double, 1> epsl(np), nF(np), nB(np), th(np);
-      double min_abs = 1e300, min_gap = 1e300;
-      for (long l = 0; l < np; ++l) {
-        epsl(l) = rf(l) / beta;
-        min_abs = std::min(min_abs, std::abs(rf(l)));
-        for (long l2 = 0; l2 < l; ++l2) min_gap = std::min(min_gap, std::abs(rf(l) - rf(l2)));
-      }
-      utils::check(min_abs > 1e-12,
-                   "double_boson_conv: auxiliary DLR pole grid contains a (near-)zero node "
-                   "(min |hw_l| = {}); the bosonic residue map is singular there.", min_abs);
-      app_log(2, "double_boson_conv: DLR rank = {} (aux pole rank = {}), lambda = {}, eps = {}, "
-                 "min|hw_l| = {}, min node gap = {}",
-              nt, np, ft.lambda(), ft.eps(), min_abs, min_gap);
-
+      nda::array<double, 1> nF(np), nB(np), th(np);
       for (long l = 0; l < np; ++l) {
         nF(l) = stable_nF(beta, epsl(l));
         nB(l) = stable_nB(beta, epsl(l));
-        th(l) = std::tanh(0.5 * rf(l));
+        th(l) = std::tanh(0.5 * pfit.rf(l));
       }
+      pfit.log(2, "double_boson_conv");
 
       // Matsubara frequencies (physical, imaginary values)
       auto wnf = ft.wn_mesh_f();
@@ -205,17 +190,22 @@ namespace imag_axes_ft {
       // additionally carry tanh(hw_l/2)
       nda::array<ComplexType, 2> b_res(np, d), c_res(np, d), Y(np, d);
       {
-        nda::array<ComplexType, 2> tmp(np, d);
-        nda::blas::gemm(Tmap, B2, tmp);
-        b_res = itops_p.vals2coefs(tmp);
-        nda::blas::gemm(Tmap, C2, tmp);
-        c_res = itops_p.vals2coefs(tmp);
+        double fit_err = 0.0;
+        b_res = pfit.coeffs(B2);
+        fit_err = std::max(fit_err, pfit.fit_error(B2, b_res));
+        c_res = pfit.coeffs(C2);
+        fit_err = std::max(fit_err, pfit.fit_error(C2, c_res));
         nda::array<ComplexType, 2> Wy_t(nt, d);
         nda::blas::gemm(Ttw_bb, Wy2, Wy_t);
-        nda::blas::gemm(Tmap, Wy_t, tmp);
-        auto ycoef = itops_p.vals2coefs(tmp);
+        auto ycoef = pfit.coeffs(Wy_t);
+        fit_err = std::max(fit_err, pfit.fit_error(Wy_t, ycoef));
         for (long l = 0; l < np; ++l)
           for (long j = 0; j < d; ++j) Y(l, j) = th(l) * ycoef(l, j);
+        // The residue algebra below is bilinear in b_res/c_res/Y, so this error enters the
+        // result squared. Past the hard gate the pole representation has failed outright.
+        app_log(3, "  double_boson_conv: auxiliary pole-fit reconstruction error = {:.4e}",
+                fit_err);
+        imag_axes_ft::dlr_pole_fit_gate(fit_err, "imag_axes_ft::double_boson_conv");
       }
       // D on the fermionic frequency nodes; Wx on the tau nodes
       nda::array<ComplexType, 2> D_w(nw_f, d), Wx_t(nt, d);

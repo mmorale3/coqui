@@ -1,0 +1,303 @@
+/**
+ * ==========================================================================
+ * CoQuí: Correlated Quantum ínterface
+ *
+ * Copyright (c) 2022-2026 Simons Foundation & The CoQuí developer team
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ * ==========================================================================
+ */
+
+#ifndef COQUI_DLR_POLE_FIT_HPP
+#define COQUI_DLR_POLE_FIT_HPP
+
+/**
+ * REGULARIZED auxiliary DLR pole fit.
+ *
+ * The residue algebras that close Matsubara sums analytically (iaft_dconv's double bosonic
+ * convolution, Pi^C's twisted pairs, Sigma^C's families I-V) all need the same primitive:
+ * given a propagator-like object sampled on the backend's tau nodes, produce residues c_p
+ * with
+ *          F(z) = sum_p c_p / (z - eps_p).
+ *
+ * WHY THIS FILE EXISTS (measured 2026-07-27/28, notes/vertex_divergence_diagnosis.md section 0)
+ * -------------------------------------------------------------------------------------------
+ * Three call sites previously built those residues as
+ *
+ *      c = vals2coefs_NONSYM( Tmap . F ),   Tmap = interpolate(backend tau nodes -> aux nodes)
+ *
+ * i.e. a square interpolatory solve on an auxiliary grid, fed by an interpolation from the
+ * backend grid. As one fixed linear map that composite has 2-norm 9.4e6 at the production
+ * (lambda = 3959.84, eps = 1e-6) -- singular values spanning 9.4e6 down to 0.098. It is well
+ * behaved on data that is exactly Lehmann-class, which is why it worked for years, but the
+ * z objects are Lehmann only to the backend's OWN representation accuracy: they carry O(eps)
+ * content in directions no pole basis resolves, and the square solve reproduces that content
+ * by emitting enormous compensating residues. The downstream algebras are BILINEAR in the
+ * residues, so the damage is squared.
+ *
+ * Measured, injecting a perturbation of relative size delta along the worst-conditioned
+ * direction of the old composite (probe over the production grid):
+ *
+ *      delta     old max|c|/max|F|   old fit err     this map   fit err
+ *      0                   0.83         2.2e-05         0.86    5.1e-06
+ *      1e-6                3.81         2.4e-05         0.86    5.1e-06
+ *      1e-5               37.8          2.4e-04         0.86    7.1e-06
+ *      1e-4              379            2.4e-03         0.86    7.1e-05
+ *
+ * The delta = 1e-4 row reproduces the observed scGW+vertex blow-up (max|c|/max|z| = 383,
+ * fit error 3.19e-03) to a few percent. Every physical input was flat across that break:
+ * max|G_CC| 0.98212 -> 0.98246 -> 0.98259, max|Wbar| 1.417e-2 -> 1.406e-2 -> 1.401e-2,
+ * max|z| 3.6834 -> 3.6904 -> 3.6774, and the pole-free part of Pi^C 3.2e-2 -> 2.9e-2 -> 1.2e-1,
+ * while the residues went 3.0 -> 9.4 -> 1411 and Pibar went 0.33 -> 11 -> 1.2e10.
+ *
+ * WHAT THIS DOES INSTEAD
+ * ----------------------
+ * Fit the auxiliary poles DIRECTLY to the backend tau data by regularized least squares:
+ *
+ *      minimize ||K c - F||,   K(i,p) = K_F(tau_i, eps_p),   solved by truncated SVD
+ *
+ * Two independent improvements, both measured:
+ *   (1) no Tmap. The interpolation detour contributed a gratuitous factor ||Tmap|| = 45 and
+ *       was also the less accurate of the two (it interpolates, then interpolates again).
+ *   (2) SVD truncation at `rel_tol` caps the residue amplification at 1/s_min_kept. Directions
+ *       below the cut are UNRESOLVABLE at the instance's (lambda, eps) -- fitting them is
+ *       pure noise amplification that the bilinear algebra then squares.
+ *
+ * Two REJECTED alternatives, recorded so they are not retried (both measured on the same grid):
+ *   - "match the aux pole rank to the backend DLR rank" (i.e. use the backend's own SYM basis).
+ *     cond(cf2it_SYM) = 6.2e10 against cond(cf2it_NONSYM) = 6.7e6, and on realistic Lehmann
+ *     data the SYM basis emits residues 30-200x LARGER. The rank mismatch 38 < 40 is real but
+ *     is not the defect; the SYM grid's near-degenerate +/- node pairs make it strictly worse.
+ *     The NONSYM grid is retained here for exactly the reason it was chosen originally
+ *     (min node gap 2.17 vs 0.0041 dimensionless -- the residue algebra divides by node gaps).
+ *   - dropping the pole route entirely. The dynamic rung genuinely needs it; only the
+ *     instantaneous rung is representable without poles.
+ *
+ * The fit is exact-to-eps on Lehmann-class data (that is what the DLR is), and its ACTUAL
+ * error is measurable per call via fit_error() -- callers gate on it.
+ */
+
+#include <cmath>
+#include <complex>
+#include <algorithm>
+
+#include "configuration.hpp"
+#include "utilities/check.hpp"
+#include "IO/app_loggers.h"
+#include "nda/nda.hpp"
+#include "nda/blas.hpp"
+#include "nda/lapack.hpp"
+
+#include "numerics/imag_axes_ft/IAFT.hpp"
+
+#ifdef ENABLE_DLR
+// same subset dlr_driver.hpp pulls in: cppdlr.hpp drags dlr_dyson.hpp -> nda/linalg/eigh.hpp,
+// which this nda does not ship.
+#include "numerics/imag_axes_ft/dlr/nda_linalg_compat.hpp"
+#include "cppdlr/dlr_build.hpp"
+#endif
+
+namespace imag_axes_ft {
+
+  /** default SVD truncation, relative to the largest singular value of the pole kernel. */
+  inline constexpr double dlr_pole_fit_default_rtol = 1e-6;
+
+  /** stable analytic-continuation kernel K_F(s,e) = -e^{-e s}/(1 + e^{-beta e}), s in [0,beta]. */
+  inline double dlr_kF(double beta, double s, double e) {
+    if (e >= 0.0) return -std::exp(-e * s) / (1.0 + std::exp(-beta * e));
+    return -std::exp(e * (beta - s)) / (1.0 + std::exp(beta * e));
+  }
+
+  /**
+   * Auxiliary pole basis + regularized tau -> residue map. Build once per (IAFT, rel_tol).
+   */
+  struct dlr_pole_fit {
+    long np = 0;                         // number of auxiliary poles
+    long nt = 0;                         // backend fermionic tau nodes
+    long n_kept = 0;                     // singular values retained by the truncation
+    double beta = 0.0;
+    double rel_tol = 0.0;
+    double s_max = 0.0, s_min_kept = 0.0;
+    double amplification = 0.0;          // ||Pinv||_2 = worst-case ||c|| / ||F||
+    double min_abs_node = 0.0;           // min |hw_l|, dimensionless
+    double min_node_gap = 0.0;           // min |hw_l - hw_l'|, dimensionless
+
+    nda::array<double, 1> rf;            // dimensionless nodes hw_l = beta * eps_l
+    nda::array<double, 1> epsl;          // physical pole energies
+    nda::array<double, 1> s_phys;        // physical tau values of the backend mesh
+    nda::array<ComplexType, 2> Pinv;     // (np, nt) backend tau values -> residues
+    nda::array<double, 2> Kmat;          // (nt, np) reconstruction kernel
+
+    dlr_pole_fit() = default;
+
+    dlr_pole_fit(IAFT const& ft, double rtol = dlr_pole_fit_default_rtol) { build(ft, rtol); }
+
+    void build(IAFT const& ft, double rtol = dlr_pole_fit_default_rtol) {
+#ifndef ENABLE_DLR
+      (void)ft; (void)rtol;
+      utils::check(false, "imag_axes_ft::dlr_pole_fit: requires the DLR backend "
+                          "(build with ENABLE_DLR=ON).");
+#else
+      utils::check(ft.basis() == imag_axes_ft::dlr_basis,
+                   "imag_axes_ft::dlr_pole_fit: requires the DLR imaginary-axis backend; "
+                   "the IR backend does not expose the needed off-grid evaluations. "
+                   "Rerun with iaft basis = \"dlr\".");
+      utils::check(rtol > 0.0 and rtol < 1.0,
+                   "imag_axes_ft::dlr_pole_fit: rel_tol = {} must be in (0,1).", rtol);
+      beta = ft.beta();
+      nt = ft.nt_f();
+      rel_tol = rtol;
+
+      // --- auxiliary NONSYM pole grid ------------------------------------------------
+      // Kept deliberately: the residue algebras divide by node gaps, and the NONSYM grid's
+      // min gap is ~500x larger than the backend SYM grid's (2.17 vs 0.0041 dimensionless).
+      auto rf_v = cppdlr::build_dlr_rf(ft.lambda(), ft.eps());
+      np = rf_v.size();
+      rf = nda::array<double, 1>(np);
+      epsl = nda::array<double, 1>(np);
+      min_abs_node = 1e300;
+      min_node_gap = 1e300;
+      for (long l = 0; l < np; ++l) {
+        rf(l) = rf_v(l);
+        epsl(l) = rf_v(l) / beta;
+        min_abs_node = std::min(min_abs_node, std::abs(rf_v(l)));
+        for (long l2 = 0; l2 < l; ++l2)
+          min_node_gap = std::min(min_node_gap, std::abs(rf_v(l) - rf_v(l2)));
+      }
+      utils::check(min_abs_node > 1e-12,
+                   "imag_axes_ft::dlr_pole_fit: auxiliary pole grid contains a (near-)zero "
+                   "node (min |hw_l| = {}); the bosonic residue map is singular there.",
+                   min_abs_node);
+      // The residue algebras deflate the SHARED-NODE diagonal by INDEX (the deflated term is
+      // restored analytically as a true double pole). That is only equivalent to deflating by
+      // VALUE while distinct nodes stay well separated: two nearly-equal-but-distinct nodes
+      // would keep a 1/(eps_p - eps_q) term that no analytic piece compensates.
+      utils::check(min_node_gap > 1e-6,
+                   "imag_axes_ft::dlr_pole_fit: auxiliary pole grid has near-degenerate "
+                   "distinct nodes (min gap = {} dimensionless). The residue algebras deflate "
+                   "by node INDEX, which is only valid for a well-separated grid.",
+                   min_node_gap);
+
+      // --- physical tau values of the backend mesh -------------------------------------
+      auto tau = ft.tau_mesh();
+      s_phys = nda::array<double, 1>(nt);
+      for (long i = 0; i < nt; ++i) s_phys(i) = (tau(i) + 1.0) * 0.5 * beta;
+
+      // --- pole kernel on the backend tau grid ------------------------------------------
+      Kmat = nda::array<double, 2>(nt, np);
+      for (long i = 0; i < nt; ++i)
+        for (long p = 0; p < np; ++p) Kmat(i, p) = dlr_kF(beta, s_phys(i), epsl(p));
+
+      // --- truncated-SVD pseudo-inverse --------------------------------------------------
+      nda::matrix<double, nda::F_layout> A(nt, np);
+      A() = Kmat;
+      long ms = std::min(nt, np);
+      nda::vector<double> sig(ms);
+      nda::matrix<double, nda::F_layout> U(nt, nt), VT(np, np);
+      int info = nda::lapack::gesvd(A, sig, U, VT);
+      utils::check(info == 0, "imag_axes_ft::dlr_pole_fit: gesvd failed (info = {}).", info);
+
+      s_max = sig(0);
+      n_kept = 0;
+      while (n_kept < ms and sig(n_kept) > rel_tol * s_max) ++n_kept;
+      utils::check(n_kept > 0, "imag_axes_ft::dlr_pole_fit: truncation kept no singular "
+                               "values (rel_tol = {}).", rel_tol);
+      s_min_kept = sig(n_kept - 1);
+      amplification = 1.0 / s_min_kept;
+
+      Pinv = nda::array<ComplexType, 2>(np, nt);
+      Pinv() = ComplexType(0.0);
+      for (long k = 0; k < n_kept; ++k) {
+        double inv = 1.0 / sig(k);
+        for (long p = 0; p < np; ++p) {
+          double vp = VT(k, p) * inv;
+          if (vp == 0.0) continue;
+          for (long i = 0; i < nt; ++i) Pinv(p, i) += vp * U(i, k);
+        }
+      }
+#endif
+    }
+
+    /**
+     * Residues of tau-grid data (leading axis nt, trailing axis a flat batch).
+     * F(z) = sum_p c_p / (z - eps_p).
+     */
+    nda::array<ComplexType, 2> coeffs(nda::MemoryArrayOfRank<2> auto const& F_td) const {
+      utils::check(F_td.shape(0) == nt,
+                   "imag_axes_ft::dlr_pole_fit::coeffs: leading axis {} != nt = {}.",
+                   F_td.shape(0), nt);
+      nda::array<ComplexType, 2> c(np, F_td.shape(1));
+      nda::blas::gemm(Pinv, F_td, c);
+      return c;
+    }
+
+    /**
+     * Relative max-norm reconstruction error on the SAME tau grid the data came from:
+     *   err = max|F - sum_p c_p K_F(s, eps_p)| / max|F|.
+     * This is the honest accuracy of the pole representation for THIS data. It is the
+     * quantity callers gate on: the old single-synthetic-pole self-check passed through
+     * every divergence because a single pole is trivially in the span.
+     */
+    double fit_error(nda::MemoryArrayOfRank<2> auto const& F_td,
+                     nda::array<ComplexType, 2> const& c) const {
+      long d = F_td.shape(1);
+      double num = 0.0, den = 0.0;
+      for (long s = 0; s < nt; ++s)
+        for (long j = 0; j < d; ++j) {
+          ComplexType rec(0.0);
+          for (long p = 0; p < np; ++p) rec += c(p, j) * Kmat(s, p);
+          num = std::max(num, std::abs(F_td(s, j) - rec));
+          den = std::max(den, std::abs(F_td(s, j)));
+        }
+      return (den > 0.0) ? num / den : 0.0;
+    }
+
+    /** one-line provenance for the run log. */
+    void log(int level, std::string_view who) const {
+      app_log(level, "  {}: DLR rank = {} (aux pole rank = {}), regularized pole fit keeps "
+                     "{}/{} singular values at rel_tol = {}\n"
+                     "    -> residue amplification <= {:.4g} (untruncated {:.4g}), "
+                     "min|hw_l| = {:.4g}, min node gap = {:.4g}",
+              who, nt, np, n_kept, std::min(nt, np), rel_tol, amplification,
+              1.0 / std::max(s_min_kept, 1e-300), min_abs_node, min_node_gap);
+    }
+  };
+
+  /**
+   * Hard gate on the measured reconstruction error.  `warn_at` only logs; past `abort_at` the
+   * pole representation has demonstrably failed and every downstream residue product is
+   * meaningless, so continuing would silently poison the self-consistency loop.
+   */
+  inline void dlr_pole_fit_gate(double err, std::string_view who,
+                                double warn_at = 1e-3, double abort_at = 1e-2) {
+    if (err <= warn_at) return;
+    if (err <= abort_at) {
+      app_log(1, "  [WARNING] {}: auxiliary DLR pole fit reconstruction error = {:.4g} "
+                 "(warn threshold {:.1g}).\n"
+                 "            The tau data is drifting out of the representable class; the "
+                 "residue algebra is bilinear\n"
+                 "            in the residues, so this error enters downstream squared.",
+              who, err, warn_at);
+      return;
+    }
+    utils::check(false,
+                 "{}: auxiliary DLR pole fit FAILED -- reconstruction error = {:.4g} exceeds "
+                 "the hard gate {:.1g}.\nThe tau data is not representable by the auxiliary "
+                 "pole basis at this (lambda, eps); every downstream residue product is "
+                 "meaningless.\nRaise the IAFT precision (prec/eps) or the frequency cutoff "
+                 "wmax, or lower the pole-fit rel_tol.", who, err, abort_at);
+  }
+
+} // namespace imag_axes_ft
+
+#endif // COQUI_DLR_POLE_FIT_HPP
