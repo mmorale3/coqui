@@ -1,0 +1,334 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{microtype}
+\usepackage[colorlinks=true,linkcolor=teal!60!black,urlcolor=teal!60!black]{hyperref}
+\usepackage{float}
+\usepackage{caption}
+\captionsetup{font=small,labelfont=bf}
+\emergencystretch=3em
+
+\definecolor{gpu}{HTML}{0E7286}
+\definecolor{cpuc}{HTML}{A06A1C}
+\definecolor{bad}{HTML}{B3382E}
+\definecolor{good}{HTML}{2E7D43}
+
+\newcommand{\statusfixed}[1]{\textcolor{good}{\textbf{fixed} (\texttt{#1})}}
+\newcommand{\statusopen}{\textcolor{bad}{\textbf{open}}}
+\newcommand{\statuswkr}{\textcolor{cpuc}{\textbf{workaround in place}}}
+
+\title{\textbf{CoQu\'i scGW on GPU: Performance Diagnosis and Optimization Plan}\\
+\large Why the port runs at CPU speed --- and the path to 5--8$\times$}
+\author{Miguel Morales (with Claude)\\ \small Flatiron Institute --- rusty cluster --- branch \texttt{gpu}, \texttt{ad9bc48}$\rightarrow$\texttt{765754c}}
+\date{July 26, 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+We benchmarked CoQu\'i's THC-based self-consistent GW on rusty CPU (Genoa) and GPU
+(A100, H100) nodes using Si supercell problems up to $\Pi \approx 1.4$\,TB
+($4{\times}4{\times}4$ $k$-grid, 500 bands). The GPU compute kernels are excellent ---
+the screened-interaction Dyson solve runs $16$--$23\times$ faster than the CPU code and
+sits at its roofline --- but end-to-end the port shows essentially no speedup
+($1.0$--$1.5\times$ at equal node count). The cause is quantified precisely:
+$\sim$70\% of GPU wall time is data movement --- host-staged all-to-all redistributions
+in the $\tau\!\leftrightarrow\!\omega$ transforms, a host-resident gemm in the THC basis
+transform, per-iteration re-gathers of iteration-invariant data, raw \texttt{cudaMalloc}
+churn, and host-only SCF phases. A single-node (network-free) GPU run proves the cost is
+PCIe staging, not the interconnect. No algorithmic change is required: the existing
+transpose-based transform is communication-optimal. We propose a prioritized engineering
+plan (device-direct chunked NCCL redistribution, device memory pool, device-resident
+basis transforms, invariant caching, device Dyson stage) with a projected
+$\approx 5\times$ node-for-node speedup at the $2{\times}2{\times}2$/500-band scale,
+growing to 5--8$\times$ at production scale. During the study we also found and fixed a
+correctness regression that had made the THC-HF Fock matrix processor-count-dependent on
+\emph{both} CPU and GPU since 2026-05-12; all configurations now agree to $10^{-13}$.
+\end{abstract}
+
+\section{Methodology}
+All runs use one source tree (branch \texttt{gpu}, HEAD \texttt{765754c}) and three
+binaries: CPU (icelake SLATE), CUDA sm80 (A100), CUDA sm90 (H100/H200). Identical
+physics inputs throughout: $\beta=2000$, $\Lambda=1200$, IR grid ``high''
+($n_\tau = n_\omega = 137$), THC \texttt{ecut}=150, \texttt{thresh}=$10^{-5}$,
+damping mixing 0.7; three SCF iterations (two at kp444). Phase timers are
+device-synchronized. Because THC interpolating-point selection depends on the processor
+grid (finding R1), all cross-configuration comparisons load a single pre-built ERI file
+(\texttt{save=} mechanism). Every timed configuration was validated against a serial CPU
+reference energy.
+
+\begin{table}[H]\small\centering
+\begin{tabular}{@{}llll@{}}
+\toprule
+Node type & Configuration & FP64 DGEMM/node & Host RAM \\
+\midrule
+CPU (ccq, Genoa) & $2\times 48$c AMD Genoa, 96 ranks & $\approx 4.5$ TF & 1.5 TB \\
+GPU A100 & $4\times$ A100-SXM4-80GB (NVLink) & 39 TF vec / $\approx$78 TF TC & 1 TB \\
+GPU H100 & $8\times$ H100-PCIe-80GB & $\approx$270 TF TC & 1 TB \\
+\bottomrule
+\end{tabular}
+\caption{Hardware. Fair yardstick: gemm-dominated phases should run $\approx$10--17$\times$
+faster on an A100 node than a Genoa node ($\approx$25--60$\times$ on 8$\times$H100), minus communication.}
+\end{table}
+
+\section{Correctness findings}
+Timing data is only meaningful on correct code; the study began by validating physics
+and found the following.
+
+\begin{table}[H]\small
+\begin{tabularx}{\textwidth}{@{}clXX@{}}
+\toprule
+\# & Status & Defect & Impact \\
+\midrule
+B1 & \statusfixed{765754c} &
+\texttt{\_aux\_to\_primary\_impl} X-factor cache (introduced \texttt{734ae79},
+May 12) reused the $P$-sliced cache as the right gemm factor when $ip{=}iq$; the right
+factor must be sliced with \texttt{Q\_rng}. &
+THC-HF Fock processor-count dependent on CPU \emph{and} GPU since May~12
+($\|\Delta F\|_\infty$ up to 0.3\,a.u. between rank counts; GPU total energies off
+$\times 1000$). GW $\Sigma$ provably unaffected (its grid keeps $np_P{=}np_Q{=}1$;
+bit-identical across ranks). All May benchmark energies were wrong. Post-fix: CPU
+1/2/4/8 ranks and GPU A100(16r)/H100(1--16r) agree to $10^{-13}$. \\
+B2 & \statusfixed{80f4a5d} &
+\texttt{TimerManager} aborts in \texttt{update\_w<HOST>}: the timer dump queries
+DEVICE-only timer names. & Every freshly built CPU binary crashed in iteration 1. \\
+B3 & \statusopen{} / \statuswkr{} &
+Device ISDF/THC builder segfaults at $\geq$16 ranks: UCX ``invalid permissions for
+mapped object'' in the \texttt{Zqur} stage (device buffer reaches a host-only MPI path;
+forcing UCX CUDA transports does not help). Pre-existing (May 16-rank run died
+identically). &
+Blocks all large GPU runs. Workaround: pre-build the ERI at $\leq$8 GPU ranks or on CPU,
+\texttt{save=}, load everywhere (also guarantees identical integrals across runs). \\
+B4 & \statusopen{} &
+$\mu$-search bracketing walk (\texttt{scf\_common.cpp:190-202}) is silent and uncapped
+(0.2 a.u.\ steps, no iteration limit, no logging). &
+Turned B1's wrong $\Sigma$ into a 4\,h wall-limit hang. Needs a cap + diagnostics. \\
+B5 & \statusopen{} &
+\texttt{compute\_eigenspectra} allocates the full $\Sigma(\omega)$
+($n_\omega n_s n_k n_b^2$) \emph{per rank}: 35\,GB/rank at kp444/500b. &
+kp444 CPU jobs OOM at full rank density (forced to 24 ranks/node). Distribute or chunk
+over $\omega$. \\
+R1 & \textcolor{cpuc}{\textbf{reproducibility}} &
+THC interpolating-point selection depends on the processor grid ($N_p$ = 4482/4483/4471
+across rank counts). &
+$\sim$$10^{-4}$\,a.u.\ total-energy spread between rank counts at thresh $10^{-5}$.
+Comparisons must share a saved ERI. \\
+\bottomrule
+\end{tabularx}
+\caption{Defects found during the study.}
+\end{table}
+
+\section{Measured performance (corrected code)}
+\subsection{Si $2{\times}2{\times}2$, 500 bands ($N_p{\approx}4483$, $\Pi\approx 177$ GB)}
+
+\begin{table}[H]\small\centering
+\begin{tabular}{@{}lrrrrr@{}}
+\toprule
+& \multicolumn{2}{c}{\textcolor{cpuc}{CPU}} & \multicolumn{3}{c}{\textcolor{gpu}{GPU}} \\
+\cmidrule(lr){2-3}\cmidrule(lr){4-6}
+Seconds per SCF iteration & 1n$\cdot$96r & 2n$\cdot$192r & 1n$\cdot$8$\times$H100 & 2n$\cdot$8$\times$A100 & 4n$\cdot$16$\times$A100 \\
+\midrule
+\textbf{update\_w} ($\Pi \rightarrow W$) & 343 & 235 & 185 & 162 & 91 \\
+\quad eval $\Pi$ (RPA) & 32 & 21 & 21 & 20 & 11 \\
+\quad $\tau\!\leftrightarrow\!\omega$ FTs (redistributes) & 37 & 24 & \textcolor{bad}{\textbf{133}} & \textcolor{bad}{\textbf{111}} & \textcolor{bad}{\textbf{60}} \\
+\quad W-Dyson solve (LU + gemms) & 273 & 191 & \textcolor{good}{\textbf{11.6}} & \textcolor{good}{\textbf{17}} & \textcolor{good}{\textbf{12.8}} \\
+\quad W D$\rightarrow$H mirror + allocs & 1 & 2 & 17.5 & 13.4 & 6.8 \\
+\textbf{THC-GW} $\Sigma$ & 88 & 55 & 45 & 50 & 33 \\
+\quad $G_{ij}\!\rightarrow\!G_{uv}$ (host-bound gemm) & 27 & 19 & \textcolor{bad}{\textbf{17.5}} & \textcolor{bad}{\textbf{18}} & \textcolor{bad}{\textbf{9.7}} \\
+\midrule
+\textbf{Wall, 3 iters + setup} & 1423 & 1018 & 941 & 1009 & 632 \\
+\quad host-only phases (Dyson/$\mu$, mix, write) & 109 & 132 & 215 & 337 & 240 \\
+\bottomrule
+\end{tabular}
+\caption{kp222/500b phase breakdown. Single node, \emph{no network}: 8$\times$H100 vs.\
+96-core Genoa is 1.5$\times$ wall while its W-solve alone is 23$\times$ faster ---
+the 133\,s of ``communication'' is pure PCIe staging + intra-node host MPI.
+The staging, not the wire, is the problem.}
+\end{table}
+
+\subsection{Where a GPU iteration goes (2n$\cdot$8$\times$A100, 215 s solver time)}
+\begin{table}[H]\small\centering
+\begin{tabular}{@{}lrl@{}}
+\toprule
+Component & s/iter & class \\
+\midrule
+$\tau\!\leftrightarrow\!\omega$ redistributes (host-staged) & 111 & transfer waste \\
+Necessary device compute (W solve, $\Pi$, $\Sigma$ gemms, FTs) & $\approx$50 & device compute \\
+$G_{ij}\!\rightarrow\!G_{uv}$ host gemm + per-$(t,s,k)$ H2D & 18 & host-bound compute \\
+W D$\rightarrow$H mirror + 23 GB device allocations & 13 & transfer/alloc waste \\
+$\Sigma$ host reduce + shm accumulate & $\approx$12 & host-bound \\
+Z re-gather (12.5 s at 16r; 187 s/iter at kp444) & 4 & transfer waste \\
+\bottomrule
+\end{tabular}
+\caption{Waste decomposition. In addition, each run carries $\approx$200--300\,s of
+host-only SCF machinery (Dyson $G$-solve, $\mu$ search, eigenspectra, mixing, rank-0
+serial HDF5 of a 35 GB checkpoint) that a 192-rank CPU job hides but an 8-rank GPU
+job cannot.}
+\end{table}
+
+\subsection{Anatomy of one redistribute}
+Each \texttt{tau\_to\_w}/\texttt{w\_to\_tau} performs two full redistributions of the
+$\Pi/W$ tensor ($t$-distributed $\rightarrow$ $PQ$-distributed $\rightarrow$
+$\omega$-distributed); four per iteration. For device arrays,
+\texttt{redistribute\_alltoallv} (\texttt{nda\_utils.hpp:715}) does, per peer: strided
+pack into a fresh device temporary (raw \texttt{cudaMalloc}) $\rightarrow$ bulk D2H into
+a host vector $\rightarrow$ host \texttt{MPI\_Alltoallv} $\rightarrow$ H2D $\rightarrow$
+device read-modify-write unpack. That is four PCIe crossings of $\sim$22 GB/rank per
+transform pair, $O(n_{\mathrm{ranks}})$ device allocations each, and $\sim$4 s per 23 GB
+buffer allocation. The May CUDA-aware attempt (\texttt{0e8fc80}) was reverted for the
+right symptom and the wrong reason: it kept \emph{unchunked} full-size device staging
+buffers, doubling device memory $\rightarrow$ OOM. The pattern is sound; it needs
+chunking and a pool.
+
+\subsection{Production scale: Si $4{\times}4{\times}4$, 500 bands ($\Pi\approx 1.42$ TB)}
+CPU reference (8 nodes, 192 ranks, 24/node $\times$ 4 threads):
+\textbf{update\_w 1427 s/iter} (W-solve 944, \textcolor{bad}{Z re-gather 187}, FTs 134),
+\textbf{THC-GW 383 s/iter} ($G_{ij}{\rightarrow}G_{uv}$ 118, $\Sigma_{uv}{\rightarrow}\Sigma_{ij}$ 146);
+wall 4213 s for 2 iterations. Roofline: the W solve is 12.7 Pflop/iter
+$\rightarrow \approx 82$ s on 64 A100. Every overhead term scales \emph{worse} than
+compute at kp444 (redistribute volume $\times 8$; Z-gather $\times 8$ with a full-$N_p^2$
+allreduce per $q$-point). GPU runs at this scale (64$\times$A100, 48$\times$H200, on
+pre-built ERIs) are queued as before/after validation; they do not change the plan.
+
+\section{Improvement plan}
+Ordered by impact $\div$ risk. Gains quoted against the 2n$\cdot$8$\times$A100
+kp222/500b iteration (215 s solver + $\sim$110 s/iter-equivalent host phases);
+P1/P4/P6 gains are larger at kp444.
+
+\begin{description}[leftmargin=1.6em,style=nextline]
+\item[P1 --- Device-direct chunked redistribute (NCCL). \textcolor{good}{$-$95--100 s/iter.}] (Effort M, risk M.)
+DEVICE specialization of \texttt{redistribute\_alltoallv}: pack sub-blocks on device
+into fixed-size per-peer chunks (1--2 GB workspace from the P2 pool), exchange via
+\texttt{ncclGroupStart}/\texttt{ncclSend}/\texttt{ncclRecv} on the existing
+\texttt{mpi3::nccl} device communicator (already used by the ERI builder), unpack on
+device. Chunking bounds the extra device memory --- fixing exactly what killed the May
+attempt. Remove the unpack read-modify-write. Fallback: chunked CUDA-aware
+\texttt{MPI\_Alltoallv} behind the same interface. At NVLink + GPUDirect rates,
+$4\times 22$ GB/rank moves in 8--15 s vs.\ today's 111 s. Validate with the shared-ERI
+harness (energies to $10^{-13}$).
+\item[P2 --- Activate nda's existing pooled allocator (no new allocator). \textcolor{good}{$-$12--15 s/iter; removes OOM fragility.}] (Effort S, risk L.)
+Every device scratch array is currently a raw \texttt{cudaMalloc}/\texttt{cudaFree}
+(\texttt{nda::cuarray} = \texttt{heap<Device>} = \texttt{mallocator}); a 23 GB allocation
+costs $\sim$4 s and each redistribute makes $O(n_{\mathrm{ranks}})$ of them. CoQu\'i
+already exposes the remedy --- \texttt{memory::buffered\_array<MEM,\ldots>}, backed by
+\texttt{static\_fallback<dynamic\_bucket<Device>>} (\texttt{configuration.hpp:169-211}) --- a first-fit pool with free-list coalescing, a
+process-wide static instance, and graceful fallback to \texttt{mallocator} on a pool
+miss. \emph{No new allocator is needed.}
+\textbf{Why it isn't already helping:} the pool is inert ---
+\texttt{dynamic\_bucket}'s default capacity is \textbf{8000 bytes} and nothing in the
+tree ever calls \texttt{resize()}, so even the four existing \texttt{buffered\_array}
+uses (cuSPARSE glue) fall straight through to \texttt{cudaMalloc}. Work: (i) size the
+pool once at startup via \texttt{get\_primary()->resize()} from a config knob (fraction
+of free VRAM); (ii) route the hot paths --- either flip \texttt{device\_array}
+(\texttt{configuration.hpp:105}) to the buffered handle
+\texttt{detail::}\linebreak[1]\texttt{buffered\_handle\_t<DEVICE\_MEMORY>},
+which pools every \texttt{memory::array<DEVICE\_MEMORY,\ldots>} with no call-site type
+churn, or opt in per hot path to keep the giant per-iteration darrays on the plain heap.
+\textbf{Constraints:} \texttt{resize()} throws if any block is live (size before the
+first device allocation, never mid-run); first-fit with coalescing has no
+defragmentation, so mixing 20 GB darrays with thousands of small scratch blocks can
+fragment the pool and silently revert to \texttt{cudaMalloc} --- log capacity and
+\texttt{maximum\_memory()} to catch it; the static pool is neither thread-safe nor
+stream-ordered, which is fine today (one rank per GPU, single stream) but would require
+per-stream pools or \texttt{cudaMallocAsync} if P1's chunking later overlaps
+pack/send/unpack across streams (the one case where \texttt{cudaMallocAsync} retains an
+edge). Note also that reserving a large pool shrinks the \texttt{cudaMemGetInfo} free
+memory the ISDF builder reads to choose its blocking (\texttt{thc\_aux.icc:1189}): size
+the pool after ERI construction, or make that query pool-aware.
+\item[P3 --- Device-resident basis transforms. \textcolor{good}{$-$25--30 s/iter.}] (Effort M, risk L.)
+In \texttt{\_primary\_to\_aux\_impl} the first gemm ($X\!\cdot\!G$) runs on the host
+(one core per rank) with a small H2D per $(t,s,k)$ --- which is why
+$G_{ij}{\rightarrow}G_{uv}$ costs the same 18 s on 8 GPUs as on 192 CPU cores. Stage $G$
+(4.4 GB at kp222; chunked over $k/t$ at kp444) and the $X$ collocation blocks to device
+once per iteration and run both gemms there. Same change serves $\Pi$ and $\Sigma$; drop
+the per-$i$ host accumulate on the output side.
+\item[P4 --- Cache iteration-invariant THC data. \textcolor{good}{$-$5 s/iter (kp222); $-$180 s/iter (kp444).}] (Effort S, risk L.)
+\texttt{thc\_reader\_t::Z()} re-gathers each $q$ block every iteration with two scalar
+all-reduces, a barrier-bearing gather, a full-$N_p^2$ allreduce (only the local block is
+kept), and a fresh H2D. $Z$ never changes during SCF: cache the device slice per local
+$q$ (LRU if tight). Also cache the small IAFT transform matrices (rebuilt + re-uploaded
+per call) and the $k\!\leftrightarrow\!R$ coefficients (recomputed up to 8$\times$/iter,
+each with a global barrier + internode allreduce).
+\item[P5 --- Lazy W host mirror. \textcolor{good}{$-$13 s/iter; $-$180 GB host RAM/node.}] (Effort S, risk L.)
+\texttt{update\_w} keeps \texttt{dW\_qtPQ\_dev} for the GPU $\Sigma$ path yet still
+materializes the full host mirror each iteration for consumers absent in a pure scGW
+run. Make it lazy; batch the $(t,q)\rightarrow(q,t)$ transpose into one kernel.
+\item[P6 --- Device Dyson stage; eigenspectra memory; $\mu$ cap. \textcolor{good}{$-$60--80 s/iter-equiv.}] (Effort M/L, risk M.)
+\texttt{simple\_dyson} has no MEM template: $n_\omega n_k$ inversions of $n_b^2$
+matrices, the $\mu$ search, and eigenspectra run on host across 8--64 ranks. Add a
+DEVICE path for the Dyson loop (batched \texttt{getrf}/\texttt{getrs} over $\omega$),
+distribute/chunk the per-rank $\Sigma(\omega)$ buffer (B5), cap and log the $\mu$ walk
+(B4). The host \texttt{geev} is cheap once the redundant allocation is gone.
+\item[P7 --- LU-solve instead of explicit inverse in the W solve. \textcolor{good}{$-$6--7 s/iter.}] (Effort S, risk L.)
+$W = [1-Z\Pi]^{-1}Z - Z$ currently does \texttt{getrf}+\texttt{getri}+gemm; solving
+$[1-Z\Pi]W' = Z$ with \texttt{getrf}+\texttt{getrs} removes $\sim$40\% of the flops and
+one gemm. When the $(\omega,q)$ block is rank-local (the common case) call cuSOLVER
+directly, skipping the per-call SLATE object construction (7 per $(\omega,q)$ pair).
+Remove the diagnostic \texttt{device\_sync()} serialization in production builds.
+\item[P8 --- Fix the device ISDF builder $\geq$16 ranks (B3); $\Sigma$ divergence correction.] (Effort M, risk M.)
+Trace the \texttt{Zqur}-stage device pointer that reaches a host-only MPI path; route
+through NCCL like the builder's other collectives, or stage that single exchange. Until
+then the \texttt{save=}/load workaround stands. \texttt{Sigma\_div\_correction} is
+host-only scalar $O(n_s n_k n_b^2 N_p)$ per iteration --- port or thread before
+kp444-scale GPU production.
+\item[P9 --- Write path. \textcolor{good}{$-$20--30 s/iter-equiv.}] (Effort S, risk L.)
+Rank-0 serial HDF5 of $\sim$35 GB per iteration (85--90 s per kp222 GPU run). Parallel
+HDF5 or an async writer thread; optionally checkpoint every $N$ iterations.
+\end{description}
+
+\subsection{Projected outcome (kp222/500b, 2 nodes $\cdot$ 8$\times$A100)}
+\begin{table}[H]\footnotesize
+\begin{tabularx}{\textwidth}{@{}lrrX@{}}
+\toprule
+Per SCF iteration & today & after P1--P7 & change \\
+\midrule
+update\_w & 162 s & $\approx$38 s & redistributes 111$\to$12, W-solve 17$\to$11, mirror/allocs 13$\to$1, $\Pi$ 20$\to$14 \\
+THC-GW $\Sigma$ & 50 s & $\approx$15 s & $G_{ij}{\rightarrow}G_{uv}$ 18$\to$2; host reduce partially remains \\
+Host phases (/iter-equiv.) & $\sim$110 s & $\approx$45 s & device Dyson, capped $\mu$, async write \\
+\midrule
+\textbf{Total per iteration} & \textbf{$\approx$320 s} & \textbf{$\approx$100 s} &
+\textbf{vs.\ CPU 2n $\approx$340 s $\Rightarrow$ $\approx$3.5$\times$ wall, $\approx$5$\times$ solver} \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\noindent At kp444 the removed terms scale with $n_q$ and rank count, so the
+node-for-node advantage grows; the W-solve roofline alone bounds it at $\approx$11$\times$
+(16 A100 nodes vs.\ 16 Genoa nodes). A realistic production target is
+\textbf{5--8$\times$ node-for-node}, at which point the remaining gap is irreducible
+communication.
+
+\subsection{Suggested sequencing}
+\begin{enumerate}[leftmargin=1.6em]
+\item \textbf{Week 1:} P2 (activate the nda pool: size at startup, route the device handle) $\rightarrow$ P1 (NCCL redistribute) behind a runtime
+switch; validate with the correctness harness; re-run the kp222 matrix.
+\item \textbf{Week 2:} P3 + P4 + P5 (transfer hygiene); B4 $\mu$-walk cap. Re-run kp222;
+launch kp444 GPU.
+\item \textbf{Week 3+:} P6 (device Dyson + eigenspectra memory), P7, P9, then P8
+(builder fix) to retire the ERI-prebuild workaround.
+\end{enumerate}
+
+\section{Run inventory}
+Under \texttt{\char`~/ceph/CoQui/GPU\_PORT\_run/} on rusty:
+\begin{itemize}[leftmargin=1.6em]
+\item \texttt{si\_kp222\_n500\_e125/bench\_\{cpu,gpu\}\_*} --- kp222/500b matrix: CPU 1n/2n;
+A100 2n/4n; H100 1n/2n (post-fix logs: jobs 6674560--62, 6676687, 6678589--90);
+\texttt{eri\_n500.h5} (2.9 GB).
+\item \texttt{si\_kp222\_n250\_e125/}, \texttt{si\_kp444\_n500\_e125/} --- 250-band
+single-node pair; kp444 CPU 8n (6671589); \texttt{eri\_n500.h5} (23 GB); pending GPU:
+64$\times$A100 (6678594), 48$\times$H200 (6678593).
+\item \texttt{correctness/} --- shared-ERI validation matrix, CPU 1/2/4/8 ranks + GPU
+H100 1/4 ranks; all $E = 0.5146018573397(1\text{--}4)$ a.u.
+\item \texttt{GPU\_PORT/src} --- branch \texttt{gpu}; binaries \texttt{build/cpu},
+\texttt{build/gpu} (sm80), \texttt{build/gpu90} (sm90); fixes \texttt{80f4a5d},
+\texttt{765754c} pushed to \texttt{origin/gpu}.
+\end{itemize}
+
+\end{document}

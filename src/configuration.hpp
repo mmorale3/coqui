@@ -212,10 +212,20 @@ namespace detail
     auto get_primary()       { return std::addressof(alloc); }
     auto get_primary() const { return std::addressof(alloc); }
 
+    // The pool is a shared static, so it is reachable without an instance.
+    // Used to size/release it (see utils::device_pool_guard) and to report
+    // how much of it is in use.
+    static Primary& pool() noexcept { return alloc; }
+    static std::size_t bytes_live()   noexcept { return _live; }
+    static std::size_t pool_hits()    noexcept { return _hits; }
+    static std::size_t pool_misses()  noexcept { return _misses; }
+    static void reset_counters()      noexcept { _hits = 0; _misses = 0; }
+
     nda::mem::blk_t allocate(std::size_t s) noexcept
     {
       nda::mem::blk_t b = alloc.allocate(s);
-      if (b.ptr) return b;
+      if (b.ptr) { _live += b.s; ++_hits; return b; }
+      ++_misses;
       return Secondary::allocate(s);
     }
 
@@ -229,6 +239,7 @@ namespace detail
     void deallocate(nda::mem::blk_t b) noexcept
     {
       if (alloc.owns(b)) {
+        _live -= std::min(_live, b.s);
         alloc.deallocate(b);
       } else {
         // account the release in the primary's counters, then free via the secondary
@@ -236,6 +247,15 @@ namespace detail
         Secondary::deallocate(b);
       }
     }
+
+    private:
+    // Bytes currently served from the pool, and pool hit/miss counts.
+    // Approximate to within the pool's internal alignment rounding, which
+    // is not visible through dynamic_bucket's interface. Not atomic: the
+    // allocator itself is not thread-safe (one rank per device today).
+    inline static std::size_t _live   = 0;
+    inline static std::size_t _hits   = 0;
+    inline static std::size_t _misses = 0;
   };
 
   template<MEMORY_SPACE MEM>
@@ -244,7 +264,38 @@ namespace detail
   template<MEMORY_SPACE MEM>
   using buffered_handle_t = nda::heap_basic<static_allocator_t<MEM>>;
 
+  // Largest allocation the pool is allowed to serve. Anything above this
+  // goes straight to the raw allocator, so the pool never has to be sized
+  // for the multi-GB per-iteration tensors (Pi/W/G/Sigma and the imaginary
+  // -axis FT buffers are 18-23 GB each at Si 2x2x2/500b). Those want reuse
+  // across iterations, not pooling; pooling them would mean reserving tens
+  // of GB and starving phases that allocate through the raw allocator
+  // (ERI/THC construction in particular). The recurring scratch this is
+  // meant to capture sits at 0.27-2.6 GB.
+  inline static constexpr std::size_t pool_max_block_size =
+#if defined(COQUI_DEVICE_POOL_MAX_BLOCK)
+      COQUI_DEVICE_POOL_MAX_BLOCK;
+#else
+      std::size_t(3) << 30; // 3 GiB
+#endif
+
+  template<MEMORY_SPACE MEM>
+  using pooled_allocator_t = nda::mem::segregator<pool_max_block_size,
+                                                  static_allocator_t<MEM>,
+                                                  nda::mem::mallocator<to_nda_address_space(MEM)>>;
+
+  template<MEMORY_SPACE MEM>
+  using pooled_handle_t = nda::heap_basic<pooled_allocator_t<MEM>>;
+
 }
+
+  // Arrays whose allocations are served from the shared device pool when the
+  // request is at or below detail::pool_max_block_size, and by the raw
+  // allocator otherwise. The pool is inert (capacity 0) unless a
+  // utils::device_pool_guard is in scope, so these behave exactly like the
+  // plain arrays outside a guarded region.
+  template<MEMORY_SPACE MEM, typename T, int N, typename Layout = nda::C_layout>
+  using pooled_array = nda::array<T,N,Layout,detail::pooled_handle_t<MEM>>;
 
   template<typename T, int N, typename Layout = nda::C_layout>
   using host_buffered_array = nda::array<T,N,Layout,detail::buffered_handle_t<HOST_MEMORY>>;

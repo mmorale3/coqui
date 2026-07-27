@@ -27,6 +27,7 @@
 #include "utilities/proc_grid_partition.hpp"
 #include "utilities/functions.hpp"
 #include "utilities/kpoint_utils.hpp"
+#include "utilities/device_pool.h"
 #include "numerics/nda_functions.hpp"
 #include "mean_field/properties.hpp"
 #include "mean_field/distributed_orbital_readers.hpp"
@@ -1164,7 +1165,9 @@ auto thc::get_ZquG_Cquv_fft(nda::MemoryArrayOfRank<1> auto const& IPts,
     if constexpr (MEM==HOST_MEMORY) {
       mem0 = long(utils::freemem());
     } else {
-      mem0 = long(utils::freemem_device());
+      // pool-aware: the unused part of a live device pool is reclaimable,
+      // and blocks too large for the pool bypass it entirely.
+      mem0 = long(utils::freemem_device_effective());
     }
     double mem=0.0;
     // the largest memory usage is in get_ZquG_Cquv, so using just that
@@ -1277,7 +1280,7 @@ auto thc::get_ZquG_Cquv_fft(nda::MemoryArrayOfRank<1> auto const& IPts,
     if constexpr (MEM==HOST_MEMORY) {
       mem = long(utils::freemem());
     } else {
-      mem = long(utils::freemem_device());
+      mem = long(utils::freemem_device_effective());
     }
     // 75% of available memory in units of ComplexType
     mem *= memory_frac * 1024.0 * 1024.0 / sizeof(ComplexType);        
