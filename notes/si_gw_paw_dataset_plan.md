@@ -283,6 +283,24 @@ exactly on rebuild. Reading the table:
   the second wave in the *upper* off-resonance window, at the cost of max|q_ij| = 3.5 and a
   small residual negative rho — usable but the one to watch.
 
+### 8.4 Cutoff convergence
+
+`run_qe.py cutoff P0 P1 P2 P3 P4`, total energy in Ry (a = 10.26 bohr, 4x4x4 k,
+ecutrho = 8x):
+
+| rung | 40 | 60 | 80 | 100 | 120 | dE(120-100) mRy/atom |
+|------|----|----|----|-----|-----|----------------------|
+| P0 | -93.448531 | -93.449913 | -93.451107 | -93.451126 | -93.451157 | 0.015 |
+| P1 | -93.447133 | -93.448121 | -93.448714 | -93.448796 | -93.448809 | 0.007 |
+| P2 | -93.435267 | -93.439028 | -93.439866 | -93.439964 | -93.439980 | 0.008 |
+| P3 | -93.723089 | -93.724550 | -93.724884 | -93.724899 | -93.724901 | 0.001 |
+| P4 | -93.444706 | -93.448501 | -93.448754 | -93.448794 | -93.448800 | 0.003 |
+
+All five are soft despite r_c(3s) = 1.555 in P0/P3 — the minimal form carries few
+projectors, and dropping the unbound s/p waves costs nothing in hardness. At the
+`run_rpa.py` setting of 80 Ry every dataset is within 0.03 mRy/atom of its own converged
+value, so no basis-set error can masquerade as the PAW completeness error being measured.
+
 Two rules of thumb fall out, both of which contradict what §6 concluded. `max|q_ij|` is a
 strong but not sufficient predictor of QE stability: 0.48 (N9) and 0.53 (P1) are fine,
 3.47 (P4) converges with a trace of negative rho, but 0.79 with `infl = 2.0`
