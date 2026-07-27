@@ -68,7 +68,10 @@ PW = """&CONTROL
 /
 &ELECTRONS
    conv_thr = 1d-10
-   mixing_beta = 0.3
+   electron_maxstep = 200
+   mixing_beta = {beta}
+   mixing_ndim = {ndim}
+   mixing_mode = '{mmode}'
    diagonalization = 'david'
    diago_full_acc = .true.
 /
@@ -127,24 +130,40 @@ def sh(cmd, cwd, logname, stdin=None):
     return r.returncode
 
 
+# SCF mixing ladder.  The minimal-form datasets (one partial wave per s/p channel: P0,
+# P1, P2) stall around 3e-5 Ry at beta=0.3 on the 2x2x2 grid and then oscillate, so drop
+# to conservative mixing rather than proceed on an unconverged density.  P3/P4, which
+# carry a second s/p wave, converge on the first attempt.
+SCF_ATTEMPTS = [(0.3, 8, "plain"), (0.1, 12, "plain"), (0.1, 12, "local-TF")]
+
+
 def run_chain(rung, nbnds=NBNDS, alat=ALAT):
     # One directory per (dataset, volume): the EOS needs both volumes kept side by side.
     d = os.path.join(WORK, rung if alat == ALAT else f"{rung}_a{alat:g}")
     os.makedirs(d, exist_ok=True)
     pseudo = os.path.join(LADDER, rung)
 
-    # 1. SCF
-    with open(os.path.join(d, "scf.in"), "w") as f:
-        f.write(PW.format(calc="scf", pseudo=pseudo, alat=alat, ecutwfc=ECUTWFC,
-                          ecutrho=ECUTRHO, nbnd="", upf=UPF, nk=NK))
-    sh(MPI + [os.path.join(QE_BIN, "pw.x"), "-in", "scf.in"], d, "scf.out")
-    if "convergence NOT" in open(os.path.join(d, "scf.out"), errors="replace").read():
-        return {"error": "scf not converged"}
+    # 1. SCF, retrying with progressively safer mixing
+    for attempt, (beta, ndim, mmode) in enumerate(SCF_ATTEMPTS):
+        with open(os.path.join(d, "scf.in"), "w") as f:
+            f.write(PW.format(calc="scf", pseudo=pseudo, alat=alat, ecutwfc=ECUTWFC,
+                              ecutrho=ECUTRHO, nbnd="", upf=UPF, nk=NK,
+                              beta=beta, ndim=ndim, mmode=mmode))
+        sh(MPI + [os.path.join(QE_BIN, "pw.x"), "-in", "scf.in"], d, "scf.out")
+        txt = open(os.path.join(d, "scf.out"), errors="replace").read()
+        if "convergence NOT" not in txt:
+            if attempt:
+                print(f"  {rung} a={alat:g}: scf converged on attempt {attempt + 1} "
+                      f"(beta={beta}, ndim={ndim}, {mmode})", flush=True)
+            break
+    else:
+        return {"error": f"scf not converged after {len(SCF_ATTEMPTS)} mixing attempts"}
 
     # 2. NSCF at the largest band count; CoQui then truncates via [mean_field.qe] nbnd
     with open(os.path.join(d, "nscf.in"), "w") as f:
         f.write(PW.format(calc="nscf", pseudo=pseudo, alat=alat, ecutwfc=ECUTWFC,
-                          ecutrho=ECUTRHO, nbnd=f"nbnd = {max(nbnds)}", upf=UPF, nk=NK))
+                          ecutrho=ECUTRHO, nbnd=f"nbnd = {max(nbnds)}", upf=UPF, nk=NK,
+                          beta=beta, ndim=ndim, mmode=mmode))
     sh(MPI + [os.path.join(QE_BIN, "pw.x"), "-in", "nscf.in"], d, "nscf.out")
 
     # 3. pw2coqui companion file
