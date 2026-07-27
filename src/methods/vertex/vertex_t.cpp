@@ -2133,6 +2133,33 @@ namespace solvers {
     // the persistent full replicated Pi_up / Pi_tqMN. Only qx_diag (tiny) is all_reduced.
     mpi->comm.all_reduce_in_place_n(qx_diag.data(), qx_diag.size(), std::plus<>{});
 
+    // ---- KERNEL SCALES (2026-07-27 divergence hunt) -----------------------------------
+    // Pi^C is MULTILINEAR in (G,G,G,G,W): bounded inputs => Lipschitz, so a ~1e-4 change in
+    // G cannot produce a 1e8 change in Pi^C. Measured on the Si kp444 C=[0,4) break, the
+    // checkpointed G feeding the exploding iteration has max|G_CC| = 0.98259 against
+    // 0.98246 the iteration before, and W is bounded there (||eps^-1|| = 1.11). The
+    // explosion is therefore INTERNAL to this routine. These norms split it three ways:
+    //   Zbar/Wbar huge  => the DOWNFOLD (t W t^dag) is at fault
+    //   Pibar huge with bounded inputs => the CONTRACTION is
+    //   only the upfolded Pi^C huge => t / the UPFOLD is
+    // NB Pibar is this rank's round-robin PARTIAL, so the reduction is a max over partials,
+    // not the max of the sum -- fine for spotting an explosion, not a physical norm.
+    {
+      auto amax = [](auto const &A) {
+        double m = 0.0;
+        for (auto const &v : A) m = std::max(m, std::abs(v));
+        return m;
+      };
+      double g_m = amax(G_CC), t_m = amax(_t_qmP), pib = amax(Pi_wqMN);
+      double zb_m = sec ? amax(Zb_qmm) : 0.0;
+      double wb_m = (sec and Wbdyn_qwmm.has_value()) ? amax(Wbdyn_qwmm.value()) : 0.0;
+      pib = mpi->comm.all_reduce_value(pib, boost::mpi3::max<>{});
+      g_m = mpi->comm.all_reduce_value(g_m, boost::mpi3::max<>{});
+      app_log(1, "  [ISDF-Vertex] kernel scales: max|G_CC| = {:.4e}  max|t| = {:.4e}  "
+                 "max|Zbar| = {:.4e}  max|Wbar| = {:.4e}  max|Pibar(partial)| = {:.4e}",
+              g_m, t_m, zb_m, wb_m, pib);
+    }
+
     // per-qx rung diagnostics (sum of rank-local maxima -- order-of-magnitude indicator
     // for the q->0 head pathology; Gamma reads 0 when skipped)
     {
