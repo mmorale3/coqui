@@ -256,22 +256,32 @@ namespace imag_axes_ft {
     double fit_error(nda::MemoryArrayOfRank<2> auto const& F_td,
                      nda::array<ComplexType, 2> const& c) const {
       // BLOCKED GEMM, not a scalar triple loop. This runs on every object the fit touches,
-      // inside Sigma^C's per-tuple loop; the naive form (rec += c(p,j)*Kmat(s,p), strided in
-      // p over c) has the same flop count as the reconstruction gemm but ~100x the runtime,
-      // and cost test_methods_vertex_sigma a 16x slowdown before it was caught.
-      // Blocking over the batch axis keeps the temp in cache instead of allocating an
-      // nt x d array, which at production dXF would be tens of MB per call.
+      // including inside Sigma^C's per-tuple loop, so it is written for the PRODUCTION batch
+      // width (dXF ~ 3e4 at nbnd = 60, nc = 8): the naive form (rec += c(p,j)*Kmat(s,p),
+      // strided in p over c) has the same flop count as the reconstruction gemm but a far
+      // worse access pattern. Blocking keeps the temp in cache instead of allocating an
+      // nt x d array, which would be tens of MB per call at that width.
+      //   Measured honestly: at the SMALL batch widths of the unit tests this costs nothing
+      //   either way -- ablating the fit_error calls entirely moves test_methods_vertex_sigma
+      //   from 234.5 s to 235.0 s. (An earlier note here claimed the scalar form caused a 16x
+      //   slowdown; that was a misreading of a stale CTestCostData average from when the test
+      //   was smaller, and is retracted.)
       long d = F_td.shape(1);
       if (d == 0) return 0.0;
-      constexpr long BJ = 512;
-      nda::array<ComplexType, 2> rec(nt, std::min(d, BJ));
+      constexpr long BJ = 256;
+      const long nb = std::min(d, BJ);
+      // CONTIGUOUS buffers. A column slice of `c` is strided, and handing that straight to
+      // gemm segfaults; the tail block is zero-padded so every gemm sees full-width
+      // contiguous operands.
+      nda::array<ComplexType, 2> cb(np, nb), rb(nt, nb);
       double num = 0.0, den = 0.0;
-      for (long j0 = 0; j0 < d; j0 += BJ) {
-        long nj = std::min(BJ, d - j0);
-        auto cb = c(nda::range::all, nda::range(j0, j0 + nj));
-        auto rb = rec(nda::range::all, nda::range(0, nj));
-        nda::blas::gemm(ComplexType(1.0), Kc, nda::matrix_const_view<ComplexType>(cb),
-                        ComplexType(0.0), rb);
+      for (long j0 = 0; j0 < d; j0 += nb) {
+        const long nj = std::min(nb, d - j0);
+        for (long p = 0; p < np; ++p) {
+          for (long j = 0; j < nj; ++j) cb(p, j) = c(p, j0 + j);
+          for (long j = nj; j < nb; ++j) cb(p, j) = ComplexType(0.0);
+        }
+        nda::blas::gemm(ComplexType(1.0), Kc, cb, ComplexType(0.0), rb);
         for (long s = 0; s < nt; ++s)
           for (long j = 0; j < nj; ++j) {
             num = std::max(num, std::abs(F_td(s, j0 + j) - rb(s, j)));
