@@ -107,6 +107,53 @@ Incidental finding: Si does not need an f channel. The l=3 phase error is 0.0002
 magnitude below the s/p/d errors. KKK carry `r_f=2.00` for Si, but for this element it buys
 nothing.
 
+## 6. Solid-state validation — the resonance rule
+
+Harness: `run_qe.py` (QE 7.4.1 `pw.x`, Si diamond a=10.26 bohr, PBE, 4x4x4 k, ecutrho=8x).
+Control first: the library `Si.pbe-n-kjpaw_psl.1.0.0.UPF` gives **E = -93.439419 Ry** with
+zero negative rho, so the harness is sound.
+
+The first atompaw UPFs all **diverged**: SCF fell to 3.6e-4 Ry, then blew up with "negative
+rho" growing 1.5e-2 -> 3.7e-2 and IEEE_INVALID from XC. Not a cutoff effect — the negative
+rho got *worse* at higher cutoff (tested 40-120 Ry, ecutrho 8-16x, beta 0.2-0.4). Section
+structure of the UPF is identical to the library dataset, so the defect is in the values:
+
+    D0   PP_Q contains 168.17          kjpaw   all |q_ij| < 0.08
+
+**Cause: a reference energy sitting on a log-derivative pole.** At a resonance the AE
+solution has `psi(r_c) -> 0`; normalizing it to unit amplitude at `r_c` inflates the
+interior without bound. `E_s = 2.5 Ry` is essentially on Si's s resonance (the AE s
+log-derivative has its pole between 1.45 and 4.82 Ry) and gives `int|phi|^2 = 1053`, hence
+the 168 in `PP_Q`. `E_p = 3.0 Ry` — which had the *best* log-derivative fidelity — sits
+near the p resonance at 3.6 Ry for the same reason. Choosing reference energies off
+resonance fixes it:
+
+| E_s | E_p | max abs q_ij | p[0,5] | QE |
+|-----|-----|--------------|--------|-----|
+| 2.5 | 3.0 | 168.17 | 0.006 | diverged |
+| 12 | 10 | **0.240** | 0.007 | **E = -93.441373 Ry** |
+
+D0 now agrees with the kjpaw reference to **2 mRy** — the baseline rung is validated
+end-to-end (atompaw -> UPF -> QE). Reference-energy selection therefore has *two*
+competing criteria: log-derivative fidelity AND distance from resonance; the second was
+missing from the first pass and is now recorded in `gen_inputs.py`.
+
+**Still blocked: the norm-matched rungs.** At r_c(3s)=1.555 / r_c(3p)=1.796 the dataset
+cannot yet be made to work in QE. With 2 waves/l atompaw fails positive-definiteness at
+every (vloc_l, r_c_vloc, E) tried — the 20 Ry wave is what keeps the small-r_c basis
+conditioned, so it cannot simply be dropped. With 3 waves/l it builds (Q_occ = -0.001184,
+as reported in §4) but the high-energy wave is itself badly scaled (max|q_ij| = 3.2 at
+E_hi=18, 27.5 at E_hi=30 — here it is the *pseudo* norm that is large, 6.58 vs AE 2.49),
+and QE returns garbage total energies (-90338 Ry). E_hi = 15/20/22/25 fail to build at all.
+So §4's `Q_occ` ladder numbers stand as dataset diagnostics, but only D0 is so far usable
+in a solid.
+
+Next lever to try: the pseudization scheme itself. `gen_inputs.py` now takes a `scheme`
+key (MODRRKJ / VANDERBILT / BLOECHL / CUSTOM); an earlier attempt to compare schemes was a
+no-op because the scheme was hardcoded, so this is genuinely untested. The prior Ga/Zn
+`*_kkk` runs used `vanderbilt besselshape` successfully with 3 waves/l at comparable radii,
+which is weak evidence it may behave better at small r_c.
+
 ## 5. Open / next
 
 1. **D4, D5 blocked** on atompaw's positive-definiteness check. D4/D5 need `vloc_l=4`

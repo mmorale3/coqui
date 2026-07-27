@@ -73,7 +73,8 @@ def write_input(spec, path):
             L.append(f"{e:g}")
         L.append("n")
 
-    L.append(f"MODRRKJ {spec.get('ortho', 'VANDERBILTORTHO')} BESSELSHAPE")
+    L.append(f"{spec.get('scheme', 'MODRRKJ')} "
+             f"{spec.get('ortho', 'VANDERBILTORTHO')} BESSELSHAPE")
     L.append(f"{spec['vloc_l']} {spec['vloc_e']:g} VPSMATCHNC")
     for (_l, _lab, _e, rc) in layout:
         L.append(f"{rc:.4f}")
@@ -101,9 +102,16 @@ def rung(name):
     common = dict(ld_min=-12.0, ld_max=30.0, ld_n=1000,
                   rc_shape=1.60, rc_vloc=1.50, rc_core=1.30)
 
-    if name == "D0":   # standard-PAW baseline: sp, frozen core, low-energy 2nd reference
+    # RESONANCE RULE (learned the hard way, see notes/si_gw_paw_dataset_plan.md §6):
+    # a reference energy must NOT sit on a log-derivative pole.  At a resonance the AE
+    # solution has psi(r_c) -> 0, so normalizing it to unit amplitude at r_c inflates the
+    # interior enormously: E_s=2.5 Ry (on Si's s resonance) gave int|phi|^2 = 1053 and a
+    # PP_Q entry of 168, versus |q_ij| < 0.08 in the kjpaw library dataset.  QE then drives
+    # the density negative and the SCF diverges.  E_s=12 / E_p=10 are off-resonance and
+    # give max|q_ij| = 0.240 with a converged QE total energy.
+    if name == "D0":   # standard-PAW baseline: sp, frozen core, 2 partial waves per l
         return dict(common, valence=[(3, 0), (3, 1)], lmax=1,
-                    extras={0: [2.5], 1: [3.0]},
+                    extras={0: [12.0], 1: [10.0]},
                     rc={0: [1.90, 1.90], 1: [1.90, 1.90]},
                     rc_max=1.90, vloc_l=2, vloc_e=0.0)
 
