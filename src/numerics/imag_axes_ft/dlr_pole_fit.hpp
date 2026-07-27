@@ -306,6 +306,12 @@ namespace imag_axes_ft {
    * Hard gate on the measured reconstruction error.  `warn_at` only logs; past `abort_at` the
    * pole representation has demonstrably failed and every downstream residue product is
    * meaningless, so continuing would silently poison the self-consistency loop.
+   *
+   * NOT collective, and it does not need to be: utils::check -> APP_ABORT -> MPI_Abort on
+   * MPI_COMM_WORLD, so a gate that fires on any subset of ranks tears the whole job down
+   * rather than deadlocking the ranks that passed. Callers may still reduce first when they
+   * want the REPORTED number to be the global max (eval_sigma_C does; eval_Pi_C does not need
+   * to, because it measures replicated z data and every rank computes the same value).
    */
   inline void dlr_pole_fit_gate(double err, std::string_view who,
                                 double warn_at = 1e-3, double abort_at = 1e-2) {
