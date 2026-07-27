@@ -289,13 +289,39 @@ namespace detail
 
 }
 
-  // Arrays whose allocations are served from the shared device pool when the
-  // request is at or below detail::pool_max_block_size, and by the raw
-  // allocator otherwise. The pool is inert (capacity 0) unless a
-  // utils::device_pool_guard is in scope, so these behave exactly like the
-  // plain arrays outside a guarded region.
+  // Arrays whose allocations are served from the shared pool when the request
+  // is at or below detail::pool_max_block_size, and by the raw allocator
+  // otherwise. The pool is inert unless a utils::device_pool_guard is in
+  // scope, so these behave exactly like the plain arrays outside a guarded
+  // region. Structured like the buffered_array family above: the DEVICE and
+  // UNIFIED handles must not be named at all on a CPU-only build, since
+  // instantiating them trips nda's check_adr_sp_valid static_assert.
+  template<typename T, int N, typename Layout = nda::C_layout>
+  using host_pooled_array = nda::array<T,N,Layout,detail::pooled_handle_t<HOST_MEMORY>>;
+
+#if defined(ENABLE_DEVICE)
+
+  template<typename T, int N, typename Layout = nda::C_layout>
+  using device_pooled_array = nda::array<T,N,Layout,detail::pooled_handle_t<DEVICE_MEMORY>>;
+
+  template<typename T, int N, typename Layout = nda::C_layout>
+  using unified_pooled_array = nda::array<T,N,Layout,detail::pooled_handle_t<UNIFIED_MEMORY>>;
+
+#else
+
+  template<typename T, int N, typename Layout = nda::C_layout>
+  using device_pooled_array = host_pooled_array<T,N,Layout>;
+
+  template<typename T, int N, typename Layout = nda::C_layout>
+  using unified_pooled_array = host_pooled_array<T,N,Layout>;
+
+#endif
+
   template<MEMORY_SPACE MEM, typename T, int N, typename Layout = nda::C_layout>
-  using pooled_array = nda::array<T,N,Layout,detail::pooled_handle_t<MEM>>;
+  using pooled_array = std::conditional_t<MEM==HOST_MEMORY,    host_pooled_array<T,N,Layout>,
+                       std::conditional_t<MEM==DEVICE_MEMORY,  device_pooled_array<T,N,Layout>,
+                       std::conditional_t<MEM==UNIFIED_MEMORY, unified_pooled_array<T,N,Layout>,
+                                                               device_pooled_array<T,N,Layout>>>>;
 
   template<typename T, int N, typename Layout = nda::C_layout>
   using host_buffered_array = nda::array<T,N,Layout,detail::buffered_handle_t<HOST_MEMORY>>;

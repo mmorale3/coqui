@@ -31,16 +31,26 @@ namespace utils {
 namespace {
 
   // The pool serving memory::pooled_array<DEVICE_MEMORY,...>. On a CPU-only
-  // build DEVICE_MEMORY maps to the host address space, so the same guard
-  // works there (and is equally inert by default).
+  // build the device address space cannot even be named (nda's
+  // check_adr_sp_valid static_asserts), and pooled_array<DEVICE_MEMORY>
+  // falls back to the host handle, so the guard manages the host pool there.
+#if defined(ENABLE_DEVICE)
   using pool_alloc_t = memory::detail::static_allocator_t<DEVICE_MEMORY>;
+#else
+  using pool_alloc_t = memory::detail::static_allocator_t<HOST_MEMORY>;
+#endif
 
   constexpr double to_mb = 1.0 / (1024.0 * 1024.0);
   constexpr double to_gb = 1.0 / (1024.0 * 1024.0 * 1024.0);
 
+  // Capacity we last reserved, and the authority on whether the pool is
+  // inert. dynamic_bucket::size() cannot be used for this: it never reports
+  // zero, since resize(s) always keeps an alignment-sized backing block.
+  std::size_t g_capacity = 0;
+
 }
 
-std::size_t device_pool_capacity() { return std::size_t(pool_alloc_t::pool().size()); }
+std::size_t device_pool_capacity() { return g_capacity; }
 std::size_t device_pool_live()     { return pool_alloc_t::bytes_live(); }
 std::size_t device_pool_hits()     { return pool_alloc_t::pool_hits(); }
 std::size_t device_pool_misses()   { return pool_alloc_t::pool_misses(); }
@@ -107,6 +117,7 @@ device_pool_guard::device_pool_guard(std::size_t bytes, std::string name):
     return;
   }
   pool_alloc_t::reset_counters();
+  g_capacity = bytes;
   _active = true;
   app_log(2, "  device pool ({}): reserved {:.2f} GB; blocks larger than {:.2f} GB "
              "bypass it. Free device memory now {} MB.",
@@ -133,6 +144,7 @@ device_pool_guard::~device_pool_guard()
 
   try {
     pool_alloc_t::pool().resize(0);
+    g_capacity = 0;
     app_log(2, "  device pool ({}): released. Free device memory now {} MB.",
             _name, freemem_device());
   } catch (std::bad_alloc const&) {
