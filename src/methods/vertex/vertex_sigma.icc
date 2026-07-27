@@ -915,10 +915,19 @@ namespace vertex_detail {
       }  // iqy
     }  // combo
 
-    app_log(3, "eval_sigma_C: rank-local running max |contrib|: fam I = {}, II = {}, III = {}, "
-               "IV = {}, V = {}, S1 = {}, S2 = {}, S3 = {}",
-            fam_max[0], fam_max[1], fam_max[2], fam_max[3], fam_max[4],
-            fam_max[5], fam_max[6], fam_max[7]);
+    // PROMOTED to level 1 for the 2026-07-27 divergence hunt, and reduced across ranks.
+    // These are running maxima of the ACCUMULATED Sigma after each family, so the family
+    // that introduces the blow-up is the one where consecutive entries jump. Sigma^C reached
+    // 1.78e6 from a bounded G (max|G_CC| = 0.982) and a healthy W in the kp444 C=[0,4)
+    // restart, so exactly one of these eight is producing it.
+    {
+      std::array<double, 8> fm = fam_max;
+      comm.all_reduce_in_place_n(fm.data(), fm.size(), boost::mpi3::max<>{});
+      app_log(1, "  eval_sigma_C: running max |Sigma| after each family: I = {:.4e}, "
+                 "II = {:.4e}, III = {:.4e}, IV = {:.4e}, V = {:.4e}, S1 = {:.4e}, "
+                 "S2 = {:.4e}, S3 = {:.4e}",
+              fm[0], fm[1], fm[2], fm[3], fm[4], fm[5], fm[6], fm[7]);
+    }
 
     // ---- dynamic part w -> tau, add instantaneous, normalize, reduce -----
     Sigma_C_tskab() = ComplexType(0.0);
