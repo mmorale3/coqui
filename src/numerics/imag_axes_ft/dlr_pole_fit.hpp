@@ -137,6 +137,7 @@ namespace imag_axes_ft {
     nda::array<double, 1> s_phys;        // physical tau values of the backend mesh
     nda::array<ComplexType, 2> Pinv;     // (np, nt) backend tau values -> residues
     nda::array<double, 2> Kmat;          // (nt, np) reconstruction kernel
+    nda::array<ComplexType, 2> Kc;       // (nt, np) same, complex, for the fit_error gemm
 
     dlr_pole_fit() = default;
 
@@ -195,8 +196,12 @@ namespace imag_axes_ft {
 
       // --- pole kernel on the backend tau grid ------------------------------------------
       Kmat = nda::array<double, 2>(nt, np);
+      Kc = nda::array<ComplexType, 2>(nt, np);
       for (long i = 0; i < nt; ++i)
-        for (long p = 0; p < np; ++p) Kmat(i, p) = dlr_kF(beta, s_phys(i), epsl(p));
+        for (long p = 0; p < np; ++p) {
+          Kmat(i, p) = dlr_kF(beta, s_phys(i), epsl(p));
+          Kc(i, p) = ComplexType(Kmat(i, p));
+        }
 
       // --- truncated-SVD pseudo-inverse --------------------------------------------------
       nda::matrix<double, nda::F_layout> A(nt, np);
@@ -250,15 +255,29 @@ namespace imag_axes_ft {
      */
     double fit_error(nda::MemoryArrayOfRank<2> auto const& F_td,
                      nda::array<ComplexType, 2> const& c) const {
+      // BLOCKED GEMM, not a scalar triple loop. This runs on every object the fit touches,
+      // inside Sigma^C's per-tuple loop; the naive form (rec += c(p,j)*Kmat(s,p), strided in
+      // p over c) has the same flop count as the reconstruction gemm but ~100x the runtime,
+      // and cost test_methods_vertex_sigma a 16x slowdown before it was caught.
+      // Blocking over the batch axis keeps the temp in cache instead of allocating an
+      // nt x d array, which at production dXF would be tens of MB per call.
       long d = F_td.shape(1);
+      if (d == 0) return 0.0;
+      constexpr long BJ = 512;
+      nda::array<ComplexType, 2> rec(nt, std::min(d, BJ));
       double num = 0.0, den = 0.0;
-      for (long s = 0; s < nt; ++s)
-        for (long j = 0; j < d; ++j) {
-          ComplexType rec(0.0);
-          for (long p = 0; p < np; ++p) rec += c(p, j) * Kmat(s, p);
-          num = std::max(num, std::abs(F_td(s, j) - rec));
-          den = std::max(den, std::abs(F_td(s, j)));
-        }
+      for (long j0 = 0; j0 < d; j0 += BJ) {
+        long nj = std::min(BJ, d - j0);
+        auto cb = c(nda::range::all, nda::range(j0, j0 + nj));
+        auto rb = rec(nda::range::all, nda::range(0, nj));
+        nda::blas::gemm(ComplexType(1.0), Kc, nda::matrix_const_view<ComplexType>(cb),
+                        ComplexType(0.0), rb);
+        for (long s = 0; s < nt; ++s)
+          for (long j = 0; j < nj; ++j) {
+            num = std::max(num, std::abs(F_td(s, j0 + j) - rb(s, j)));
+            den = std::max(den, std::abs(F_td(s, j0 + j)));
+          }
+      }
       return (den > 0.0) ? num / den : 0.0;
     }
 
