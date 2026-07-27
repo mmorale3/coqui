@@ -178,9 +178,61 @@ def rung(name):
     raise KeyError(name)
 
 
+# --------------------------------------------------------------------------------------
+# THE NORM SERIES (N0..N9) -- the production datasets.
+#
+# The six-rung D-ladder answered the attribution question (adding d channels and +20 Ry
+# projectors leaves Q_occ bit-identical), but only D0 survived contact with QE.  What is
+# actually needed to test the KKK mechanism is a family of datasets that differ ONLY in
+# how badly the occupied partial waves violate the norm, all of them well conditioned and
+# QE-validated.  Shrinking r_c walks q_aa through zero, so the series below spans a 137x
+# range in Q_occ while keeping every dataset usable in a solid.
+#
+# E_s must be re-tuned at each radius: it has to stay off the s resonance (else q_ij
+# explodes and QE's density goes negative) AND inside atompaw's narrow positive-definite
+# band, and both move with r_c.  E_s=14 at r_c=1.555 is near-resonant (max|q|=3.19);
+# E_s=18 is clean (0.477); E_s=20 breaks QE again (-4666 Ry).  All entries below were
+# verified end-to-end: atompaw -> UPF -> QE SCF, PBE, a=10.26 bohr, 4x4x4 k, 60 Ry.
+#
+#   name  rc_s   rc_p   E_s   Q_occ(e)    reduction   E_QE(Ry)      negative rho
+NORM_SERIES = [
+    ("N0", 1.900, 1.900, 12.0, -0.162399, "1.0x",  -93.441373),
+    ("N1", 1.850, 1.900, 12.0, -0.133559, "1.2x",  -93.474136),
+    ("N2", 1.800, 1.850, 12.0, -0.107830, "1.5x",  -93.457336),
+    ("N3", 1.750, 1.850, 12.0, -0.082139, "2.0x",  -93.507778),
+    ("N4", 1.700, 1.800, 16.0, -0.055340, "2.9x",  -93.524997),
+    ("N5", 1.650, 1.800, 16.0, -0.034071, "4.8x",  -93.563716),
+    ("N6", 1.600, 1.796, 16.0, -0.014425, "11.3x", -93.590701),
+    ("N7", 1.580, 1.796, 18.0, -0.007600, "21.4x", -93.707718),
+    ("N8", 1.570, 1.780, 18.0, -0.003514, "46.2x", -93.663905),
+    ("N9", 1.555, 1.796, 18.0, -0.001184, "137x",  -93.729401),
+]
+
+
+def norm_series_spec(rc_s, rc_p, e_s, e_p=10.0):
+    """One member of the norm series: D0's 2-waves-per-l structure at tuned radii."""
+    common = dict(ld_min=-12.0, ld_max=30.0, ld_n=1000)
+    m = max(rc_s, rc_p)
+    return dict(common, valence=[(3, 0), (3, 1)], lmax=1,
+                extras={0: [e_s], 1: [e_p]},
+                rc={0: [rc_s] * 2, 1: [rc_p] * 2},
+                rc_max=m, rc_shape=min(1.60, m * 0.86),
+                rc_vloc=min(1.50, m * 0.84), rc_core=1.30,
+                vloc_l=2, vloc_e=0.0)
+
+
 if __name__ == "__main__":
     import sys
-    root = sys.argv[1] if len(sys.argv) > 1 else os.path.expanduser("~/Projects/PAW_GW/si_gw_paw")
+    positional = [a for a in sys.argv[1:] if not a.startswith("-")]
+    root = positional[0] if positional else os.path.expanduser("~/Projects/PAW_GW/si_gw_paw")
+    if "--series" in sys.argv:
+        for (name, rc_s, rc_p, e_s, q, ratio, _e) in NORM_SERIES:
+            d = os.path.join(root, name)
+            os.makedirs(d, exist_ok=True)
+            write_input(norm_series_spec(rc_s, rc_p, e_s), os.path.join(d, "Si.input"))
+            print(f"{name}: rc_s={rc_s:.3f} rc_p={rc_p:.3f} E_s={e_s:g}  "
+                  f"Q_occ={q:+.6f} ({ratio})")
+        raise SystemExit(0)
     for name in ["D0", "D1", "D2", "D3", "D4", "D5"]:
         d = os.path.join(root, name)
         os.makedirs(d, exist_ok=True)

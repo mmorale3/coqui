@@ -154,6 +154,43 @@ no-op because the scheme was hardcoded, so this is genuinely untested. The prior
 `*_kkk` runs used `vanderbilt besselshape` successfully with 3 waves/l at comparable radii,
 which is weak evidence it may behave better at small r_c.
 
+## 7. The norm series N0-N9 — production datasets
+
+The D-ladder answered the *attribution* question but only D0 survived contact with QE. What
+the KKK mechanism actually needs is a family differing ONLY in how badly the occupied waves
+violate the norm, every member well conditioned and QE-validated. Shrinking r_c walks
+`q_aa` through zero, giving a continuous lever:
+
+| name | r_c(s) | r_c(p) | E_s | Q_occ (e) | reduction | E_QE (Ry) |
+|------|--------|--------|-----|-----------|-----------|-----------|
+| N0 | 1.900 | 1.900 | 12 | -0.162399 | 1.0x | -93.441373 |
+| N1 | 1.850 | 1.900 | 12 | -0.133559 | 1.2x | -93.474136 |
+| N2 | 1.800 | 1.850 | 12 | -0.107830 | 1.5x | -93.457336 |
+| N3 | 1.750 | 1.850 | 12 | -0.082139 | 2.0x | -93.507778 |
+| N4 | 1.700 | 1.800 | 16 | -0.055340 | 2.9x | -93.524997 |
+| N5 | 1.650 | 1.800 | 16 | -0.034071 | 4.8x | -93.563716 |
+| N6 | 1.600 | 1.796 | 16 | -0.014425 | 11.3x | -93.590701 |
+| N7 | 1.580 | 1.796 | 18 | -0.007600 | 21.4x | -93.707718 |
+| N8 | 1.570 | 1.780 | 18 | -0.003514 | 46.2x | -93.663905 |
+| N9 | 1.555 | 1.796 | 18 | -0.001184 | **137x** | -93.729401 |
+
+**137x range in the norm defect, all ten converging in QE** (N6-N9 with zero negative rho),
+with low-energy phase errors of 0.01-0.03 rad. `gen_inputs.py --series` regenerates them;
+all ten reproduce their `Q_occ` to <1e-6 on rebuild.
+
+`E_s` must be retuned at every radius — it has to stay off the s resonance *and* inside
+atompaw's narrow positive-definite band, and both move with r_c. This is what blocked §6:
+at r_c=1.555, E_s=14 is near-resonant (max|q_ij| = 3.19, QE returns -90338 Ry), E_s=18 is
+clean (0.477, -93.729401 Ry), and E_s=20 breaks it again (-4666 Ry). Nothing about the
+norm-matched radii was wrong; the reference energy was.
+
+Absolute total energies are *not* comparable across the series (different pseudization and
+frozen-core treatment); only nbnd-converged correlation energies are.
+
+Note on VANDERBILT: it shifts the norm-matching root itself (Q_occ = +0.0437 at the radii
+where MODRRKJ gives -0.0012), so `q_aa` depends on the pseudization scheme as well as r_c,
+and its q_ij scale worse. MODRRKJ retained.
+
 ## 5. Open / next
 
 1. **D4, D5 blocked** on atompaw's positive-definiteness check. D4/D5 need `vloc_l=4`
