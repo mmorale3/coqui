@@ -227,6 +227,33 @@ namespace vertex_pi {
     }
 
     /**
+     * Relative max-norm error of the DLR pole fit, evaluated back on the SAME tau grid the
+     * data came from:  err = max|F - sum_p c_p K_F(s, eps_p)| / max|F|.
+     *
+     * init_poles self-checks only a single SYNTHETIC pole (see above), never the real data.
+     * Measured 2026-07-27: a 2.4% change in the bounded z objects (max|z| 3.5925 -> 3.6774)
+     * changed their residues by 530x (2.66 -> 1411). pole_coeffs is a FIXED linear map, so
+     * that can only happen if the map is ill-conditioned and the data rotated into the
+     * amplified direction. If the fit also stops REPRODUCING the data when the residues
+     * blow up, the aux pole representation is confirmed as the defect.
+     */
+    double fit_error(nda::MemoryArrayOfRank<2> auto const& F_td,
+                     nda::array<ComplexType, 2> const& c) const {
+      long nt = F_td.shape(0), d = F_td.shape(1);
+      double num = 0.0, den = 0.0;
+      for (long s = 0; s < nt; ++s) {
+        const double ss = s_phys(s);
+        for (long j = 0; j < d; ++j) {
+          ComplexType rec(0.0);
+          for (long p = 0; p < np; ++p) rec += c(p, j) * KF(ss, epsl(p));
+          num = std::max(num, std::abs(F_td(s, j) - rec));
+          den = std::max(den, std::abs(F_td(s, j)));
+        }
+      }
+      return (den > 0.0) ? num / den : 0.0;
+    }
+
+    /**
      * Twisted-pair kernels for external node m:
      *   kappa(p,q,s) = (1/beta) sum_w e^{-iws} / ((iw - e_p)(iw + i nu_m - e_q))
      *                = kappa0(p,q,s) + e^{i nu_m s} kappa1(p,q,s)
@@ -385,7 +412,8 @@ namespace vertex_pi {
                          nda::array<double, 1>* qx_diag = nullptr,
                          vertex_sym::sym_ctx const* symc = nullptr,
                          // [0] Pibar after the pole-free Phase 1, [1] max DLR pole residue
-                         // of the z objects, [2] max |z| itself. Diagnostic (2026-07-27).
+                         // of the z objects, [2] max |z| itself, [3] relative error of the
+                         // pole fit reconstructed on the tau grid. Diagnostic (2026-07-27).
                          nda::array<double, 1>* phase_diag = nullptr) {
     (void)ft;
     decltype(nda::range::all) all;
@@ -633,11 +661,15 @@ namespace vertex_pi {
           auto zl2 = nda::reshape(zL(is, ik, nda::ellipsis{}), shape_t<2>{nt, Np * Nb});
           buf = zl2;
           auto c = tools.pole_coeffs(buf);
+          if (phase_diag != nullptr)
+            (*phase_diag)(3) = std::max((*phase_diag)(3), tools.fit_error(buf, c));
           auto cv = nda::reshape(cL(is, ik, nda::ellipsis{}), shape_t<2>{np, Np * Nb});
           cv = c;
           auto zr2 = nda::reshape(zR(is, ik, nda::ellipsis{}), shape_t<2>{nt, Nb * Np});
           buf = zr2;
           auto c2 = tools.pole_coeffs(buf);
+          if (phase_diag != nullptr)
+            (*phase_diag)(3) = std::max((*phase_diag)(3), tools.fit_error(buf, c2));
           auto cv2 = nda::reshape(cR(is, ik, nda::ellipsis{}), shape_t<2>{np, Nb * Np});
           cv2 = c2;
         }

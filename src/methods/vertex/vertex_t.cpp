@@ -2113,7 +2113,7 @@ namespace solvers {
     nda::array<double, 1> qx_diag(nqpts);
     nda::array<ComplexType, 4> Pi_wqMN(tools.nw_b, nqpts_ibz, naux, naux);
     Pi_wqMN() = ComplexType(0.0);
-    nda::array<double, 1> phase_diag(3);
+    nda::array<double, 1> phase_diag(4);
     phase_diag() = 0.0;
     if (sec)
       vertex_pi::pi_c_accumulate_w(*_ft, tools, G_CC, _Xb_skma, Zb_qmm,
@@ -2167,8 +2167,16 @@ namespace solvers {
       // bubble contraction; if it is small there and huge at the end, it is the pole algebra
       // -- and then max|z| vs max|pole residue| says whether pole_coeffs is the amplifier.
       app_log(1, "  [ISDF-Vertex] phase split: max|Pibar after Phase 1 (pole-free)| = {:.4e}  "
-                 "max|z| = {:.4e}  max|DLR residue of z| = {:.4e}  -> final = {:.4e}",
-              phase_diag(0), phase_diag(2), phase_diag(1), pib);
+                 "max|z| = {:.4e}  max|DLR residue of z| = {:.4e}  pole-fit rel err = {:.4e}"
+                 "  -> final = {:.4e}",
+              phase_diag(0), phase_diag(2), phase_diag(1), phase_diag(3), pib);
+      if (phase_diag(3) > 1e-3)
+        app_log(1, "  [WARNING] the auxiliary DLR pole fit is NOT reproducing the z objects "
+                   "(rel err {:.2e}).\n"
+                   "            Its residues then enter the twisted-pair algebra as products, "
+                   "so this is\n"
+                   "            squared into Pi^C. See notes/vertex_divergence_diagnosis.md.",
+                phase_diag(3));
     }
 
     // per-qx rung diagnostics (sum of rank-local maxima -- order-of-magnitude indicator
