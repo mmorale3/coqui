@@ -2113,18 +2113,20 @@ namespace solvers {
     nda::array<double, 1> qx_diag(nqpts);
     nda::array<ComplexType, 4> Pi_wqMN(tools.nw_b, nqpts_ibz, naux, naux);
     Pi_wqMN() = ComplexType(0.0);
+    nda::array<double, 1> phase_diag(3);
+    phase_diag() = 0.0;
     if (sec)
       vertex_pi::pi_c_accumulate_w(*_ft, tools, G_CC, _Xb_skma, Zb_qmm,
                                    Wbdyn_qwmm.has_value() ? &Wbdyn_qwmm.value() : nullptr,
                                    kmq, kpq, nda::range(0, nc), Pi_wqMN,
                                    mpi->comm.rank(), mpi->comm.size(),
-                                   skip_rung_gamma, &qx_diag, symc);
+                                   skip_rung_gamma, &qx_diag, symc, &phase_diag);
     else
       vertex_pi::pi_c_accumulate_w(*_ft, tools, G_CC, X_C, Z_qPQ,
                                    Wdyn_qwPQ.has_value() ? &Wdyn_qwPQ.value() : nullptr,
                                    kmq, kpq, nda::range(0, nc), Pi_wqMN,
                                    mpi->comm.rank(), mpi->comm.size(),
-                                   skip_rung_gamma, &qx_diag, symc);
+                                   skip_rung_gamma, &qx_diag, symc, &phase_diag);
     // M3 item #8 (notes/vertex_parallelization_M3.md): DO NOT all_reduce the full partial
     // Pi_wqMN. It is a PARTIAL (this rank's round-robin tuple/q_ext contribution); the
     // upfold (t^dag Pibar t) and the tau conversion are LINEAR and commute with the rank
@@ -2155,9 +2157,18 @@ namespace solvers {
       double wb_m = (sec and Wbdyn_qwmm.has_value()) ? amax(Wbdyn_qwmm.value()) : 0.0;
       pib = mpi->comm.all_reduce_value(pib, boost::mpi3::max<>{});
       g_m = mpi->comm.all_reduce_value(g_m, boost::mpi3::max<>{});
+      mpi->comm.all_reduce_in_place_n(phase_diag.data(), phase_diag.size(),
+                                      boost::mpi3::max<>{});
       app_log(1, "  [ISDF-Vertex] kernel scales: max|G_CC| = {:.4e}  max|t| = {:.4e}  "
                  "max|Zbar| = {:.4e}  max|Wbar| = {:.4e}  max|Pibar(partial)| = {:.4e}",
               g_m, t_m, zb_m, wb_m, pib);
+      // Phase 1 is the pole-free instantaneous Z rung; Phase 2 is the ONLY part running the
+      // DLR pole algebra. If Pibar is already huge after Phase 1 the fault is in the exact
+      // bubble contraction; if it is small there and huge at the end, it is the pole algebra
+      // -- and then max|z| vs max|pole residue| says whether pole_coeffs is the amplifier.
+      app_log(1, "  [ISDF-Vertex] phase split: max|Pibar after Phase 1 (pole-free)| = {:.4e}  "
+                 "max|z| = {:.4e}  max|DLR residue of z| = {:.4e}  -> final = {:.4e}",
+              phase_diag(0), phase_diag(2), phase_diag(1), pib);
     }
 
     // per-qx rung diagnostics (sum of rank-local maxima -- order-of-magnitude indicator

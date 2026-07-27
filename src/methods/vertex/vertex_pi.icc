@@ -383,7 +383,10 @@ namespace vertex_pi {
                          long rank, long nproc,
                          bool skip_rung_gamma = false,
                          nda::array<double, 1>* qx_diag = nullptr,
-                         vertex_sym::sym_ctx const* symc = nullptr) {
+                         vertex_sym::sym_ctx const* symc = nullptr,
+                         // [0] Pibar after the pole-free Phase 1, [1] max DLR pole residue
+                         // of the z objects, [2] max |z| itself. Diagnostic (2026-07-27).
+                         nda::array<double, 1>* phase_diag = nullptr) {
     (void)ft;
     decltype(nda::range::all) all;
     long ns = G_tskij.shape(1), nk = G_tskij.shape(2);
@@ -602,6 +605,17 @@ namespace vertex_pi {
       }
     }
 
+    // PHASE-1 SNAPSHOT (2026-07-27 divergence hunt). Phase 1 is the instantaneous Z rung:
+    // exact, backend-agnostic, and POLE-FREE. Phase 2 is the only part that runs the DLR
+    // pole algebra. Measured: with G, t, Zbar and Wbar all bounded and agreeing to four
+    // significant figures between a healthy and an exploding iteration, Pibar still moved
+    // 4.35 -> 3.22e9. Recording Pibar after Phase 1 splits that cleanly in two.
+    if (phase_diag != nullptr) {
+      double m1 = 0.0;
+      for (auto const& v : Pi_wqMN) m1 = std::max(m1, std::abs(v));
+      (*phase_diag)(0) = m1;
+    }
+
     if (Wdyn_qwPQ == nullptr) return;
 
     // =====================================================================================
@@ -627,6 +641,19 @@ namespace vertex_pi {
           auto cv2 = nda::reshape(cR(is, ik, nda::ellipsis{}), shape_t<2>{np, Nb * Np});
           cv2 = c2;
         }
+    }
+    // DLR pole residues of the z objects. zL/zR are bounded (they are X.G products of a
+    // bounded G), but pole_coeffs FITS them to the aux pole basis -- if that fit is what
+    // amplifies, these residues are where it first shows, before any of the kappa algebra.
+    if (phase_diag != nullptr) {
+      double mc = 0.0;
+      for (auto const& v : cL) mc = std::max(mc, std::abs(v));
+      for (auto const& v : cR) mc = std::max(mc, std::abs(v));
+      (*phase_diag)(1) = mc;
+      double mz = 0.0;
+      for (auto const& v : zL) mz = std::max(mz, std::abs(v));
+      for (auto const& v : zR) mz = std::max(mz, std::abs(v));
+      (*phase_diag)(2) = mz;
     }
 
     // work arrays for the m-loop
