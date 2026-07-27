@@ -20,6 +20,8 @@
 
 
 #include <unordered_set>
+#include <sstream>
+#include <iomanip>
 #include "methods/ERI/thc_reader_t.hpp"
 #include "methods/HF/thc_solver_comm.hpp"
 #include "methods/GW/g0_div_utils.hpp"
@@ -465,6 +467,37 @@ namespace solvers {
         nR = thc.mpi()->comm.all_reduce_value(nR, boost::mpi3::max<>{});
         app_log(1, "  [ISDF-Vertex] ||Pi^C||_max = {:.4e} vs ||Pi_RPA||_max = {:.4e} "
                    "(ratio {:.3e})", nC, nR, nC / std::max(nR, 1e-300));
+        // PER-q BREAKDOWN. The analytic q->0 head is inserted ONLY at Gamma, yet the worst
+        // dielectric cell in the diverging Si kp444 C=[0,4) run was a NON-Gamma transfer
+        // (q = 4), never q = 0. That is not a contradiction: Pi^C's INTERNAL rung sum runs
+        // over all transfers, so the Gamma rung -- the one carrying the head -- feeds EVERY
+        // external q. Resolving ||Pi^C||_max by external transfer says whether a head-on run
+        // deviates from head-off uniformly in q (the head entering through the internal sum,
+        // as the construction intends) or concentrates on particular cells (which would point
+        // at the Gamma insertion itself). Cheap: nq_ibz values, once per update_w.
+        {
+          auto Pi_C_loc = dPi_C_tqPQ.local();
+          auto ls = Pi_C_loc.shape();
+          long nq_g = dPi_C_tqPQ.global_shape()[1];
+          std::vector<double> qmax(size_t(nq_g), 0.0);
+          long iq_loc = 0;
+          for (auto gq : dPi_C_tqPQ.local_range(1)) {
+            double m = 0.0;
+            for (long it = 0; it < ls[0]; ++it)
+              for (long P = 0; P < ls[2]; ++P)
+                for (long Q = 0; Q < ls[3]; ++Q)
+                  m = std::max(m, std::abs(Pi_C_loc(it, iq_loc, P, Q)));
+            qmax[size_t(gq)] = std::max(qmax[size_t(gq)], m);
+            ++iq_loc;
+          }
+          thc.mpi()->comm.all_reduce_in_place_n(qmax.data(), qmax.size(),
+                                                boost::mpi3::max<>{});
+          std::ostringstream oss;
+          oss << std::scientific << std::setprecision(2);
+          for (long q = 0; q < nq_g; ++q) oss << (q ? " " : "") << qmax[size_t(q)];
+          app_log(1, "  [ISDF-Vertex] ||Pi^C||_max by transfer q (q=0 is Gamma): {}",
+                  oss.str());
+        }
         if (nC > nR)
           app_log(1, "  [WARNING] the vertex polarization EXCEEDS the RPA polarization it "
                      "corrects.\n"
