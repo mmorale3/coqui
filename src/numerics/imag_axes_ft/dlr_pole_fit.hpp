@@ -318,6 +318,36 @@ namespace imag_axes_ft {
     }
 
     /**
+     * max|c| / max|F| -- the residue amplification actually realised on THIS data.
+     *
+     * WATCH THIS, NOT ONLY fit_error. Measured on Si kp222/M12 head-on (2026-07-28), the one
+     * window that still diverges with the regularized fit in place:
+     *
+     *     iter   max|z|   max|residue|   res/z    fit err     Pibar
+     *      1     3.7519      3.1885       0.85    9.7e-06    3.2e+03
+     *      2     3.4301     54.30        15.8     4.5e-05    2.5e+05     <- fit still "healthy"
+     *      3     3.4487   6306.8       1829       4.6e-03    2.0e+13
+     *
+     * The ratio moves a FULL ITERATION before the fit error does. That is the signature of the
+     * post-fix failure mode and it is qualitatively different from the pre-fix one: least
+     * squares reports an accurate fit (4.5e-05) while the data genuinely REQUIRES residues 16x
+     * its own size, i.e. it is a near-cancelling combination of poles. The fit is not lying --
+     * the downstream algebra is bilinear in these residues and squares them.
+     *
+     * Healthy values are 0.70-0.91 across every converged window and both meshes, so a warning
+     * at 50 has ~50x headroom. Deliberately NOT a hard gate: a legitimately near-cancelling
+     * object is possible, the threshold has not been calibrated across systems, and a false
+     * abort costs a multi-hour run. fit_error remains the hard gate.
+     */
+    double residue_ratio(nda::MemoryArrayOfRank<2> auto const& F_td,
+                         nda::array<ComplexType, 2> const& c) const {
+      double cm = 0.0, fm = 0.0;
+      for (auto const& v : c) cm = std::max(cm, std::abs(v));
+      for (auto const& v : F_td) fm = std::max(fm, std::abs(v));
+      return (fm > 0.0) ? cm / fm : 0.0;
+    }
+
+    /**
      * Relative max-norm reconstruction error on the SAME tau grid the data came from:
      *   err = max|F - sum_p c_p K_F(s, eps_p)| / max|F|.
      * This is the honest accuracy of the pole representation for THIS data. It is the
@@ -385,7 +415,20 @@ namespace imag_axes_ft {
    * to, because it measures replicated z data and every rank computes the same value).
    */
   inline void dlr_pole_fit_gate(double err, std::string_view who,
-                                double warn_at = 1e-3, double abort_at = 1e-2) {
+                                double warn_at = 1e-3, double abort_at = 1e-2,
+                                double res_ratio = -1.0, double ratio_warn_at = 50.0) {
+    // EARLY WARNING: the residue ratio leads the fit error by about one scf iteration in the
+    // post-fix failure mode (see dlr_pole_fit::residue_ratio). Report it first, because by the
+    // time `err` trips, the bilinear algebra has already squared these residues.
+    if (res_ratio > ratio_warn_at)
+      app_log(1, "  [WARNING] {}: auxiliary pole residues are {:.4g}x the data they represent "
+                 "(healthy 0.7-0.9).\n"
+                 "            The fit may still look accurate -- the data genuinely needs these "
+                 "residues, and the\n"
+                 "            downstream algebra is BILINEAR in them. This usually leads the "
+                 "reconstruction error by\n"
+                 "            one iteration; if it is climbing, the run is on its way out.",
+              who, res_ratio);
     if (err <= warn_at) return;
     if (err <= abort_at) {
       app_log(1, "  [WARNING] {}: auxiliary DLR pole fit reconstruction error = {:.4g} "

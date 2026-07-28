@@ -322,6 +322,7 @@ namespace vertex_detail {
     // applied to (Wy, and the C-window G blocks B/C). Hard-gated after the loop: families
     // I-V multiply residues pairwise, so this error enters Sigma^C squared.
     double fit_err_max = 0.0;
+    double res_ratio_max = 0.0;   // max|residue|/max|data|; leads fit_err_max by ~1 iteration
     auto track_max = [](double &m, nda::array<ComplexType, 3> const &A) {
       for (auto const &v : A) m = std::max(m, std::abs(v));
     };
@@ -482,6 +483,7 @@ namespace vertex_detail {
           nda::blas::gemm(Ttw_bb, Wy_w, Wy_tau);
           auto ycoef = pfit.coeffs(Wy_tau);
           fit_err_max = std::max(fit_err_max, pfit.fit_error(Wy_tau, ycoef));
+          res_ratio_max = std::max(res_ratio_max, pfit.residue_ratio(Wy_tau, ycoef));
           for (long l = 0; l < np; ++l)
             for (long j = 0; j < dXF; ++j) Y_res(l, j) = th(l) * ycoef(l, j);
         }
@@ -499,6 +501,8 @@ namespace vertex_detail {
           c_res = pfit.coeffs(C2);
           fit_err_max = std::max(fit_err_max, pfit.fit_error(B2, b_res));
           fit_err_max = std::max(fit_err_max, pfit.fit_error(C2, c_res));
+          res_ratio_max = std::max(res_ratio_max, pfit.residue_ratio(B2, b_res));
+          res_ratio_max = std::max(res_ratio_max, pfit.residue_ratio(C2, c_res));
         }
         nda::blas::gemm(Twt_ff, D2, D_w);
         nda::blas::gemm(R, C2, Crefl);
@@ -932,9 +936,12 @@ namespace vertex_detail {
     }
     {
       comm.all_reduce_in_place_n(&fit_err_max, 1, boost::mpi3::max<>{});
+      comm.all_reduce_in_place_n(&res_ratio_max, 1, boost::mpi3::max<>{});
       app_log(1, "  eval_sigma_C: auxiliary pole-fit reconstruction error (max over Wy and "
-                 "the C-window G blocks) = {:.4e}", fit_err_max);
-      imag_axes_ft::dlr_pole_fit_gate(fit_err_max, "vertex_sigma::eval_sigma_C");
+                 "the C-window G blocks) = {:.4e}, residue/data = {:.4e}",
+              fit_err_max, res_ratio_max);
+      imag_axes_ft::dlr_pole_fit_gate(fit_err_max, "vertex_sigma::eval_sigma_C",
+                                      1e-3, 1e-2, res_ratio_max);
     }
 
     // ---- dynamic part w -> tau, add instantaneous, normalize, reduce -----

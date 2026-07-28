@@ -643,7 +643,7 @@ namespace vertex_pi {
     // against the kappa algebra) and hard-gated below: it is the only quantity that detects
     // the z data leaving the representable class, and it must not depend on a diagnostic flag.
     nda::array<ComplexType, 5> cL(ns, nk, np, Np, Nb), cR(ns, nk, np, Nb, Np);
-    double fit_err_max = 0.0;
+    double fit_err_max = 0.0, res_ratio_max = 0.0;
     {
       nda::array<ComplexType, 2> buf(nt, Np * Nb);
       for (long is = 0; is < ns; ++is)
@@ -652,18 +652,21 @@ namespace vertex_pi {
           buf = zl2;
           auto c = tools.pole_coeffs(buf);
           fit_err_max = std::max(fit_err_max, tools.fit_error(buf, c));
+          res_ratio_max = std::max(res_ratio_max, tools.pfit.residue_ratio(buf, c));
           auto cv = nda::reshape(cL(is, ik, nda::ellipsis{}), shape_t<2>{np, Np * Nb});
           cv = c;
           auto zr2 = nda::reshape(zR(is, ik, nda::ellipsis{}), shape_t<2>{nt, Nb * Np});
           buf = zr2;
           auto c2 = tools.pole_coeffs(buf);
           fit_err_max = std::max(fit_err_max, tools.fit_error(buf, c2));
+          res_ratio_max = std::max(res_ratio_max, tools.pfit.residue_ratio(buf, c2));
           auto cv2 = nda::reshape(cR(is, ik, nda::ellipsis{}), shape_t<2>{np, Nb * Np});
           cv2 = c2;
         }
     }
     if (phase_diag != nullptr) (*phase_diag)(3) = std::max((*phase_diag)(3), fit_err_max);
-    imag_axes_ft::dlr_pole_fit_gate(fit_err_max, "vertex_pi::eval_Pi_C (z objects)");
+    imag_axes_ft::dlr_pole_fit_gate(fit_err_max, "vertex_pi::eval_Pi_C (z objects)",
+                                    1e-3, 1e-2, res_ratio_max);
     // DLR pole residues of the z objects. zL/zR are bounded (X.G products of a bounded G);
     // with the unregularized fit these residues were where the divergence first showed,
     // BEFORE any of the kappa algebra (3.0 -> 9.4 -> 1411 over three iterations while every
