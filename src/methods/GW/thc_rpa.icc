@@ -123,6 +123,11 @@ namespace methods {
         }
       }
 
+      // Worst-conditioned (q, w) block seen over the whole sweep; reported once
+      // at the end so a near-singular RPA is visible without -v4.
+      double cond_worst = 0.0, cond_worst_resid = 0.0, cond_worst_tr = 0.0;
+      long   cond_worst_iq = -1, cond_worst_iw = -1;
+
       auto Pi_loc = dPi_wqPQ.local();
       auto Pi_PQ_loc = dPi_PQ.local();
       auto Z_PQ_loc = dZ_PQ.local();
@@ -179,6 +184,37 @@ namespace methods {
                     iq, wn, log_det, tr_PiZ.real());
           }
 
+          // Conditioning trace. E_c = Tr(Pi*Z) + ln|det(I - Pi*Z)|, and the two
+          // terms cancel to leading order: for SMALL Pi*Z,
+          // ln det(I - Pi*Z) = -Tr(Pi*Z) - Tr((Pi*Z)^2)/2 - ..., so their sum
+          // is second order and E_c is a perturbative quantity. That stops
+          // being true once eigenvalues of Pi*Z approach 1, where ln det is
+          // dominated by ln(1 - lambda) and the response to a small change in
+          // Pi is exponential rather than quadratic. `resid` below is exactly
+          // that sum, so resid / (Tr(Pi*Z)^2 / 2) ~ 1 means well conditioned
+          // and >> 1 means the (q, w) block is running into the singularity.
+          //
+          // This is the regime the PAW nbnd=500 runs appear to be in: their
+          // polarizability TRACE differs from the correct one by 7.6%
+          // (measured independently by paw_thc_vs_exact_eri) while E_c differs
+          // by 220%, which no perturbative sensitivity can produce.
+          double resid = tr_PiZ.real() + log_det;
+          double quad  = 0.5 * tr_PiZ.real() * tr_PiZ.real();
+          if (dA_PQ.communicator()->root())
+            app_log(4, "  thc_rpa cond: iq={} iw={} Tr(Pi*Z)={:.6e} "
+                       "ln|det|={:.6e} sum={:.6e} sum/(Tr^2/2)={:.4e}",
+                    iq, wn, tr_PiZ.real(), log_det, resid,
+                    quad > 0.0 ? resid/quad : 0.0);
+          if (dA_PQ.communicator()->root()) {
+            cond_worst = std::max(cond_worst, quad > 0.0 ?
+                                  std::abs(resid)/quad : 0.0);
+            if (std::abs(resid) > std::abs(cond_worst_resid)) {
+              cond_worst_resid = resid;
+              cond_worst_iq = iq; cond_worst_iw = wn;
+              cond_worst_tr = tr_PiZ.real();
+            }
+          }
+
           if (dA_PQ.communicator()->root()) {
             e_rpa_w(wn, 0) += double(q_weight) * log_det;
             if (mwn != wn) e_rpa_w(mwn, 0) += double(q_weight) * log_det;
@@ -189,6 +225,19 @@ namespace methods {
       for (long iq_loc = nq_loc; iq_loc < nq_loc_max; ++iq_loc)
         Z_PQ_loc = thc.Z(0, P_rng, Q_rng, qpool_id, pgrid[1], q_intra_comm);
 
+      {
+        double cw[2] = {cond_worst, std::abs(cond_worst_resid)};
+        dPi_wqPQ.communicator()->all_reduce_in_place_n(cw, 2, mpi3::max<>{});
+        if (mpi->comm.root())
+          app_log(2, "  RPA conditioning: worst sum/(Tr^2/2) = {:.4e} over all "
+                     "(q, w); largest |Tr(Pi*Z) + ln|det||= {:.6e} at iq={} "
+                     "iw={} (Tr there {:.6e}). Values ~1 mean E_c is the usual "
+                     "second-order cancellation; >> 1 means eigenvalues of "
+                     "Pi*Z are approaching 1 and E_c is exponentially "
+                     "sensitive to Pi.",
+                  cw[0], cond_worst_resid, cond_worst_iq, cond_worst_iw,
+                  cond_worst_tr);
+      }
       dPi_wqPQ.communicator()->all_reduce_in_place_n(e_rpa_w.data(), e_rpa_w.size(), std::plus<>{});
       _ft->w_to_tau(e_rpa_w, e_rpa_t, imag_axes_ft::boson);
       _ft->tau_to_beta(e_rpa_t, e_rpa);

@@ -273,9 +273,100 @@ cleanly — gate 0.990652 / calibration 1.000049 for +1 versus gate 1.014059 /
 calibration 1.323530 for -1 — so the discriminator works; it simply has no
 purchase on a 2x2x2 mesh.
 
-Status: queued, not yet run. Do not record this as the cause until the Si
-q != 0 numbers are in — the same "everything fits" reasoning has been wrong
-here before (§3b, §3c).
+Status: **REFUTED.** Si 4x4x4, nbnd=250, a=10.05:
+
+| k_virt | \|q\| | qsign | gate | calibration | THC/exact |
+|---|---|---|---|---|---|
+| 1 | 0.271 | **+1** | 1.021258 | 1.000022 | 0.999881 |
+| 5 | 0.313 | **+1** | 1.020984 | 1.000016 | 0.999772 |
+| 1 | 0.271 | −1 | 1.072055 | 1.007445 | 0.993853 |
+| 5 | 0.313 | −1 | 1.244305 | 1.021090 | 0.987228 |
+
+`+1` wins on all three independent measures and the THC matches it, so the sign
+in `augment_thc_with_paw` is CORRECT — as the derivation says it should be
+(`coulomb_t::evaluate` forms `dk = kp - kq`, `thc.icc` passes `kp=0, kq=Q`, so
+the kernel really is at `|G - Q|` and `q_cart = -Q` matches). The violation is
+also flat in \|q\| (1.021258 vs 1.020984), where a missing `e^{-iq.tau}` phase
+would grow as \|q.tau\|^2, so it is not a phase error either.
+
+## 6. The compression defect (REAL, but worth only ~14 mHa)
+
+The q != 0 gate violation IS the lambda compression. Same q, same everything
+else, only `paw_isdf_tol` changed:
+
+    paw_isdf_tol = 5e-5  (production)   gate = 1.021258
+    paw_isdf_tol = 1e-12 (full rank)    gate = 0.999054
+
+Mechanism: `build_local_isdf_compressed_by_norm` keeps (ij) pairs by their
+Coulomb-metric norm evaluated at **q = 0**. A pair with l_i != l_j has no L=0
+component, so Q_ij(G) -> 0 as G -> 0 and its q=0 Coulomb-metric norm is small —
+it gets dropped. But at q != 0 the smallest wavevector on the mesh is
+\|q\| = 0.271, not 0, and there those channels are NOT small. Hence: exact at
+q=0, violated at q!=0, invisible to every q=0 test. This is the physical
+characterization of the previously unexplained "V_LL carries ~29% relative
+error at production tolerance" (§3b corollary).
+
+It is a genuine defect and production settings should not be used, but it is
+**not** the instability: the converged RPA run below uses `paw_isdf_tol = 1e-8`
+(essentially full rank) and is unchanged.
+
+## 7. ISDF convergence — EXCLUDED quantitatively
+
+| thresh | paw_isdf_tol | Np | E_c (Ha) | vs ABINIT |
+|---|---|---|---|---|
+| 1e-4 | 5e-5 | 4301 | −0.596300 | −165.18 mHa |
+| 1e-5 | 5e-6 | 4947 | −0.582610 | −151.49 mHa |
+| 1e-6 | 1e-8 | 6205 | −0.582622 | −151.50 mHa |
+
+A full decade of `thresh` (Np 4947 -> 6205) moves E_c by **0.01 mHa**. The RPA
+is converged in the ISDF basis and in the lambda basis, and remains 151 mHa
+from ABINIT. `nIpts` does not help: it does not override the threshold-driven
+Cholesky rank (both the `thresh=1e-6` and `nIpts=8000` runs landed on
+Np = 6205).
+
+## 8. The ERI is EXACT — and that is the surprise
+
+`paw_thc_vs_exact_eri`, full lambda rank, Si a=10.05:
+
+| q | nbnd | gate | calibration | **THC AE / exact AE** |
+|---|---|---|---|---|
+| 0 | 250 | (exact by identity) | 1.000000 | **1.000001** |
+| 0 | 500 | (exact by identity) | 0.999996 | **0.999996** |
+| \|q\|=0.271 | 250 | 0.999054 | 1.000022 | **0.999882** |
+| \|q\|=0.271 | 500 | 1.003246 | 0.999995 | **0.999875** |
+
+Every band decile agrees to ~1e-4, including the 250->500 window. So at
+converged settings the augmented oscillators satisfy completeness AND the
+assembled THC ERI reproduces the exact AE answer — yet E_c is still 151 mHa
+wrong. Neither the oscillators nor the ERI assembly is the defect.
+
+**The resolution is conditioning, not accuracy.** Two ratios from the same
+data:
+
+    polarizability trace   D_smooth / D_AE    = 34.96 / 32.49 = 1.076   (7.6%)
+    correlation energy     E_c(sm) / E_c(AE)  = 1.36  / 0.43  = 3.2     (220%)
+
+E_c = Tr(Pi*Z) + ln\|det(I - Pi*Z)\| is a SECOND-ORDER quantity: for small Pi*Z
+the two terms cancel to leading order and the sum is -Tr((Pi*Z)^2)/2. A 7.6%
+change in Pi should move E_c by ~16%. Producing 220% requires eigenvalues of
+Pi*Z approaching 1, where ln det is dominated by ln(1 - lambda) and the
+response to Pi is exponential rather than quadratic. That also explains why
+bands 250->500 add only 0.9% to the trace while moving E_c by −149 mHa, and
+why no tolerance ever helped: **the input is correct; the conditioning is not.**
+
+Instrument added (`thc_rpa.icc`): a `RPA conditioning:` line reporting
+`sum/(Tr^2/2)` where `sum = Tr(Pi*Z) + ln|det|`. ~1 is the ordinary
+second-order cancellation; >> 1 means the block is running into the
+singularity.
+
+Open question, and the next measurement: NC at nbnd=500 has a comparable basis
+size and does NOT blow up, so what puts PAW's Pi*Z near the singularity? One
+structural candidate is that the augmentation basis is EXACTLY rank-deficient
+by construction — the polarization-identity split gives eta_+ = -eta_- for
+every off-diagonal (I,J) pair, so Z_LL is singular with a null space of
+dimension ~(nlambda - n_pairs) per atom, and Pi's numerical content in those
+directions is unprotected. `rpa_cond/` runs PAW n=250, PAW n=500 and NC n=500
+through the same solver with the new diagnostic to test it.
 
 Constructing it is harder than the V_LL reference, and the asymmetry is the
 reason it was not done first. V_LL is a pure one-center object, so
