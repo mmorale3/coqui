@@ -454,6 +454,60 @@ auto determinant(DistributedMatrix auto&&A, std::vector<std::pair<long,long>> &d
   return det_A;
 }
 
+/**
+ * log|det(A)|, computed in place from the LU factorization as
+ * sum_i log|u_ii| instead of the raw product of the diagonal.
+ *
+ * Two reasons to prefer this over log(determinant(...)):
+ *
+ *  - The raw product of N diagonal entries over/underflows once N is large
+ *    (N ~ 5000 in the THC-RPA, where a mean |u_ii| of 1.01 already puts the
+ *    product at 1e21 while log|det| is a perfectly ordinary 49). The sum of
+ *    logs has no such range problem, and each rank contributes an additive
+ *    partial that is itself well scaled.
+ *
+ *  - It sidesteps the permutation sign entirely. `determinant` above tries to
+ *    recover it from slate's pivot tiles and gets it wrong often enough that
+ *    its caller had to special-case a negative result; a permutation only ever
+ *    contributes a sign, never a magnitude, so log|det| is exact regardless.
+ *
+ * Callers that need the sign must establish it from the problem (e.g. an
+ * RPA (I - Pi*Z) is positive definite for a physical Pi, so det > 0), not
+ * from the pivots.
+ */
+auto log_abs_determinant(DistributedMatrix auto&&A, std::vector<std::pair<long,long>> &diag_idx) {
+  using dA_t = typename std::decay_t<decltype(A)>;
+  using local_Array_t = typename dA_t::Array_t;
+  using value_type = typename dA_t::value_type;
+  double log_det = 0.0;
+
+  if constexpr (::nda::mem::on_host<local_Array_t>) {
+    if (A.communicator()->size() == 1) {
+      auto A_loc = A.local();
+      ::nda::matrix_view <value_type> Am(A_loc);
+      return std::log(std::abs(::nda::determinant_in_place(Am)));
+    }
+  }
+
+#if defined(ENABLE_SLATE)
+  if constexpr (::nda::mem::on_host<local_Array_t>) {
+    auto As = detail::to_slate_view<dA_t::is_stride_order_C()>(A);
+    slate::Pivots pivots ;
+    slate::getrf ( As , pivots );
+
+    auto A_loc = A.local();
+    for (auto idx: diag_idx)
+      log_det += std::log(std::abs(A_loc(idx.first, idx.second)));
+    A.communicator()->all_reduce_in_place_n(&log_det, 1, std::plus<>{});
+  } else {
+    utils::check(false, "log_abs_determinant: requires GPU supports.");
+  }
+#else
+  utils::check(false, "log_abs_determinant: requires SLATE, compile with ENABLE_SLATE.");
+#endif
+  return log_det;
+}
+
 /*
 void cholesky(DistributedMatrix auto&& A, char UPLO = "L")
 {

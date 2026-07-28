@@ -140,26 +140,48 @@ namespace methods {
           // A = Pi(w) * Z
           math::nda::slate_ops::multiply(dPi_PQ, dZ_PQ, dA_PQ);
 
+          ComplexType tr_PiZ(0.0);
           for (auto idx: diag_idx) {
+            tr_PiZ += A_loc(idx.first, idx.second);
             e_rpa_w(wn, 0) += double(q_weight) * A_loc(idx.first, idx.second);
             if (mwn != wn) e_rpa_w(mwn, 0) += double(q_weight) * A_loc(idx.first, idx.second);
             A_loc(idx.first, idx.second) -= ComplexType(1.0);
           }
           A_loc *= -1.0; // A = I - A now
+          dA_PQ.communicator()->all_reduce_in_place_n(&tr_PiZ, 1, std::plus<>{});
 
-          // Tr{ln(B)} = ln(det(B))
-          ComplexType det_A = math::nda::slate_ops::determinant(dA_PQ, diag_idx);
-          if (det_A.real() < 0) {
-            if (dA_PQ.communicator()->root())
-              std::cout << "[WARNING] thc_rpa:: determinant of (I - Pi*Z) < 0. "
-                           "This is likely due to our API of determinant from SLATE "
-                           "which miscounts the number of pivoting..." << std::endl;
-            det_A *= -1.0;
+          // Tr{ln(I - Pi*Z)} = ln|det(I - Pi*Z)|.
+          //
+          // The absolute value is not a workaround here, it is the answer:
+          // on the imaginary axis Pi(iw) is negative semi-definite and Z is a
+          // Coulomb Gram matrix (positive semi-definite), so every eigenvalue
+          // of Pi*Z is <= 0, every eigenvalue of (I - Pi*Z) is >= 1, and hence
+          //     det(I - Pi*Z) >= 1   and   Tr(Pi*Z) <= 0
+          // exactly. Taking log|det| is therefore correct whenever the input is
+          // physical, and it removes the dependence on slate's pivot-sign count
+          // (which the previous `determinant` path got wrong often enough that
+          // it printed a warning and flipped the sign by hand) as well as the
+          // over/underflow of a raw product of NP ~ 5000 diagonal entries.
+          double log_det = math::nda::slate_ops::log_abs_determinant(dA_PQ, diag_idx);
+
+          // Both inequalities above are PHYSICAL, not numerical, so violating
+          // them means Pi or Z is not what the derivation assumes — not that
+          // the linear algebra slipped. This is the signature the PAW n=500
+          // blow-up presents with, so report it loudly and per (q, w) rather
+          // than swallowing it.
+          if (dA_PQ.communicator()->root() and
+              (log_det < -1e-8 or tr_PiZ.real() > 1e-8)) {
+            app_log(1, "** WARNING ** thc_rpa: unphysical polarizability at "
+                       "iq={}, iw={}: ln|det(I-Pi*Z)| = {:.6e} (must be >= 0) "
+                       ", Tr(Pi*Z) = {:.6e} (must be <= 0). Pi(iw) is not "
+                       "negative semi-definite against this Z — the correlation "
+                       "energy from this (q, w) is not trustworthy.",
+                    iq, wn, log_det, tr_PiZ.real());
           }
 
           if (dA_PQ.communicator()->root()) {
-            e_rpa_w(wn, 0) += double(q_weight) * std::log(det_A.real());
-            if (mwn != wn) e_rpa_w(mwn, 0) += double(q_weight) * std::log(det_A.real());
+            e_rpa_w(wn, 0) += double(q_weight) * log_det;
+            if (mwn != wn) e_rpa_w(mwn, 0) += double(q_weight) * log_det;
           }
         }
       }
