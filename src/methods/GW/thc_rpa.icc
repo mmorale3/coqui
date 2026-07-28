@@ -229,11 +229,19 @@ namespace methods {
                     quad > 0.0 ? resid/quad : 0.0);
           if (dA_PQ.communicator()->root()) {
             // Track WHERE the most concentrated block is, not just its value.
-            // Measured: PAW n=500 hits 4.65e-01 while NC n=500 (1.99e-02) and
-            // PAW n=250 (2.21e-02) do not, so a single mode carries that block
-            // in exactly the case that misbehaves — and identifying (q, w) is
-            // the whole point of the number.
-            double ipr = (quad > 0.0) ? std::abs(resid)/quad : 0.0;
+            //
+            // MAGNITUDE FLOOR, and it is not optional: the ratio is
+            // |resid|/(Tr^2/2) with both parts -> 0 at high frequency, so an
+            // empty block returns a garbage O(1) ratio from noise/noise^2.
+            // Without the floor this reported 4.65e-01 for PAW n=500 at
+            // iq=21 iw=135 where Tr = -8.3e-04 and resid = -1.6e-07 -- pure
+            // round-off -- while the controls happened to peak on real blocks
+            // (Tr ~ -27), making a cross-run comparison look like a
+            // PAW-specific anomaly when it was an artifact of this metric.
+            // Only blocks carrying real weight are eligible.
+            constexpr double TR_FLOOR = 1e-2;
+            double ipr = (quad > 0.0 and std::abs(tr_PiZ.real()) > TR_FLOOR)
+                       ? std::abs(resid)/quad : 0.0;
             if (ipr > cond_worst) {
               cond_worst = ipr;
               cond_worst_iq = iq; cond_worst_iw = wn;
@@ -277,11 +285,11 @@ namespace methods {
                      "at iq={} iw={} (Tr there {:.6e}, resid {:.6e}). This is "
                      "the inverse participation ratio of Pi*Z -- small = weight "
                      "spread over many modes, ~1 = a single mode carries the "
-                     "block. Reference values on Si a=10.05: NC n=500 "
-                     "1.99e-02, PAW n=250 2.21e-02, PAW n=500 4.65e-01, i.e. "
-                     "the concentration is specific to PAW at high band count. "
-                     "Proximity to the ln(1-lambda) singularity is a DIFFERENT "
-                     "question, tested exactly by the log_det<0 / Tr>0 warning.",
+                     "block. Only blocks with |Tr| above a floor are eligible "
+                     "-- an empty high-frequency block otherwise returns a "
+                     "garbage O(1) ratio from noise/noise^2. Proximity to the "
+                     "ln(1-lambda) singularity is a DIFFERENT question, tested "
+                     "exactly by the log_det<0 / Tr>0 warning.",
                   cw[0], cond_worst_iq, cond_worst_iw, cond_worst_tr,
                   cond_worst_resid);
       }

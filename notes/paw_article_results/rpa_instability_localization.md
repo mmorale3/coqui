@@ -388,6 +388,55 @@ Two corrections to the diagnostic itself:
   0.2% between n=250 and n=500 while E_c moves 34% — so that block is not
   where the change lives.
 
+## 9b. The "PAW-specific spectral anomaly" — RETRACTED (metric artifact)
+
+Reported and then withdrawn within the same session. With block identification
+fixed, the maxima are:
+
+| run | max 1/n_eff | at | Tr there | resid there |
+|---|---|---|---|---|
+| PAW n=250 | 2.21e-02 | iq=21 iw=68 | −2.64e+01 | −7.70e+00 |
+| NC n=500 | 1.99e-02 | iq=3 iw=68 | −2.80e+01 | −7.78e+00 |
+| PAW n=500 | 4.65e-01 | iq=21 **iw=135** | **−8.30e-04** | **−1.60e-07** |
+
+`iw=135` of 137 is the top of the frequency range, where Pi -> 0. The ratio is
+`|resid|/(Tr^2/2)` with BOTH parts vanishing, so an empty block returns a
+garbage O(1) value from noise/noise^2 — 1.6e-7/(8.3e-4^2/2) = 0.465. The
+controls happened to peak on real blocks (Tr ~ −27), which made the cross-run
+comparison look like a PAW-specific anomaly. It was an artifact of a missing
+magnitude floor in my own metric. Floor added (`|Tr| > 1e-2` to be eligible).
+
+## 9c. THE TERM SPLIT — the actual result, and it reframes the accuracy target
+
+| run | Tr(Pi*Z) | ln\|det\| | E_c |
+|---|---|---|---|
+| PAW n=250 | −7.5289 | +7.0957 | −0.4332 |
+| PAW n=500 | −10.1383 | +9.5557 | −0.5826 |
+| NC n=500 | −10.2291 | +9.7822 | −0.4469 |
+
+**E_c is a ~1.4% residual of two ~10 Ha terms.** Two consequences:
+
+**(i) The accuracy requirement is ~1e-3 relative on each term, not 1e-2.** A
+1.3% error in Tr(Pi*Z) alone reproduces the entire 136 mHa gap to NC.
+
+**(ii) The first term carries NO 1/Delta weight, and that invalidates the
+metric used in sec 8.** Tr(Pi*Z) is `(1/2pi) int dw Tr[chi0(iw) v]` with
+`chi0(iw) = sum_ia 2*Delta/(Delta^2+w^2)|rho_ia><rho_ia|`, and
+`int dw 2*Delta/(Delta^2+w^2) = 2*pi` INDEPENDENT of Delta. So that term is
+just `-sum_ia (ia|ai)` — an exchange-like sum weighting high-energy
+transitions exactly as much as low-energy ones.
+
+Every ERI number in sec 8 used `D1(v) = sum_c (vc|cv)/(eps_c - eps_v)`, which
+de-weights precisely the bands that dominate Tr(Pi*Z). That is why bands
+250->500 add only 0.9% to D1 but **+2.61 Ha (35%) to Tr(Pi*Z)** — and it
+dissolves the "1% vs 34% contradiction" of sec 10 without needing any anomaly:
+the contradiction was an artifact of measuring with the wrong weight.
+
+`paw_thc_vs_exact_eri` now reports BOTH: D1 and `D0(v) = sum_c (vc|cv)` with no
+denominator. D0 is the one that matters. Validated on LiH: calibration
+0.999853, measurement 0.999790, and the smooth excess is visibly larger under
+D0 (1.598x) than D1 (1.367x) as expected.
+
 ## 10. THE REMAINING GAP — the ERI is verified in AGGREGATE, not at the HEAD
 
 This is the honest state of the investigation and the next thing to test.

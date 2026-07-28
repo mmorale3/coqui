@@ -4818,9 +4818,26 @@ TEST_CASE("paw_thc_vs_exact_eri", "[hamilt][paw_erichk][!benchmark]")
             std::real(fft0), ref0, ref0 != 0.0 ? std::real(fft0)/ref0 : 0.0);
   }
 
+  // TWO weightings, and the unweighted one is the important one.
+  //
+  //   D1(v) = sum_c (vc|cv)/(eps_c - eps_v)   static polarizability weight
+  //   D0(v) = sum_c (vc|cv)                   NO energy denominator
+  //
+  // E_c = Tr(Pi*Z) + ln|det(I - Pi*Z)|, and the first term is
+  // (1/2pi) int dw Tr[chi0(iw) v] with chi0(iw) = sum_ia 2*Delta/(Delta^2+w^2)
+  // |rho_ia><rho_ia|. Since int dw 2*Delta/(Delta^2 + w^2) = 2*pi INDEPENDENT
+  // of Delta, that term is just -sum_ia (ia|ai): an exchange-like sum with NO
+  // 1/Delta suppression, so high-energy transitions count as much as low ones.
+  // Measured on Si a=10.05: bands 250->500 add 0.9% to D1 but +2.61 Ha (35%)
+  // to Tr(Pi*Z), and E_c is a ~1.4% residual of two ~10 Ha terms -- so a 6%
+  // error in that increment is the whole 149 mHa discrepancy.
+  //
+  // D1 alone therefore CANNOT test the accuracy the RPA needs; it de-weights
+  // precisely the bands that dominate. D0 is the matching probe.
   const int NBIN = 10;
   nda::array<double,2> Dex(nocc, NBIN), Dsm(nocc, NBIN);
-  Dex() = 0.0; Dsm() = 0.0;
+  nda::array<double,2> Dex0(nocc, NBIN), Dsm0(nocc, NBIN);
+  Dex() = 0.0; Dsm() = 0.0; Dex0() = 0.0; Dsm0() = 0.0;
   nda::array<ComplexType,2> rho_sm_c(nbnd, ngm), rho_aug_c(nbnd, ngm);
   nda::array<ComplexType,2> A(nbnd, N_aug);
   // Completeness gate, evaluated over EVERY G of rho_g rather than a sample:
@@ -4861,6 +4878,8 @@ TEST_CASE("paw_thc_vs_exact_eri", "[hamilt][paw_erichk][!benchmark]")
       int b = (int)std::min((long)NBIN-1, (c*NBIN)/std::max(1L,nbnd));
       Dsm(v,b) += esm/de;
       Dex(v,b) += eae/de;
+      Dsm0(v,b) += esm;
+      Dex0(v,b) += eae;
     }
     for (long g = 0; g < ngm; ++g)
       if (csum(g) > gate_max) {
@@ -4881,7 +4900,8 @@ TEST_CASE("paw_thc_vs_exact_eri", "[hamilt][paw_erichk][!benchmark]")
   auto sS = make_shared_array<array_view_4d_t>(mpi, {nspin,nk_ibz,nbnd,nbnd});
   hamilt::set_ovlp(mfobj, sS);
   auto sDm = make_shared_array<array_view_4d_t>(mpi, {nspin,nk_ibz,nbnd,nbnd});
-  auto thc_D = [&](bool aug) {
+  // `wgt`: true = 1/(eps_c - eps_v) weighting (D1), false = unit weight (D0).
+  auto thc_D = [&](bool aug, bool wgt) {
     auto pt = methods::make_thc_reader_ptree(nIpts,"","incore","","bdft",
                                              thresh, mfobj.ecutrho());
     pt.put("paw_aug", aug); pt.put("paw_isdf_metric","coulomb");
@@ -4889,7 +4909,8 @@ TEST_CASE("paw_thc_vs_exact_eri", "[hamilt][paw_erichk][!benchmark]")
     if (aug_ecut > 0.0) pt.put("paw_aug_ecut", aug_ecut);
     methods::thc_reader_t thc(mf_ptr, pt);
     methods::solvers::hf_t hf(methods::ignore_g0);
-    nda::array<double,2> D(nocc, NBIN); D() = 0.0;
+    nda::array<double,2> D(nocc, NBIN), D0(nocc, NBIN);
+    D() = 0.0; D0() = 0.0;
     for (long v = 0; v < nocc; ++v)
       for (int b = 0; b < NBIN; ++b) {
         long lo = (b*nbnd)/NBIN, hi = ((b+1)*nbnd)/NBIN;
@@ -4901,7 +4922,7 @@ TEST_CASE("paw_thc_vs_exact_eri", "[hamilt][paw_erichk][!benchmark]")
             // Density matrix lives at the VIRTUAL k-point, so hf_t's exchange
             // sum over k' collapses to k'=kc and F(k0,v,v) is exactly the
             // q = k(kc)-k(k0) transition sum the exact side computed.
-            sDm.local()(0,kc,c,c) = ComplexType(1.0/de, 0.0);
+            sDm.local()(0,kc,c,c) = ComplexType(wgt ? 1.0/de : 1.0, 0.0);
           }
         }
         mpi.node_comm.barrier();
@@ -4914,8 +4935,10 @@ TEST_CASE("paw_thc_vs_exact_eri", "[hamilt][paw_erichk][!benchmark]")
         D(v,b) = -std::real(sF.local()(0,k0,v,v)) * (double)mfobj.nkpts();
       }
     return D; };
-  auto Dthc_ae = thc_D(true);
-  auto Dthc_sm = thc_D(false);
+  auto Dthc_ae  = thc_D(true,  true);
+  auto Dthc_sm  = thc_D(false, true);
+  auto Dthc_ae0 = thc_D(true,  false);
+  auto Dthc_sm0 = thc_D(false, false);
 
   // ---- Report. The smooth pair anchors the convention; the AE pair is the
   // measurement. Cumulative over deciles so the band-count trend is visible.
@@ -4933,24 +4956,41 @@ TEST_CASE("paw_thc_vs_exact_eri", "[hamilt][paw_erichk][!benchmark]")
               ((b+1)*nbnd)/NBIN, sae, ssm,
               ssm != 0.0 ? sae/ssm : 0.0);
     } };
-  row("EXACT (reference)", Dex, Dsm);
-  row("THC (as assembled)", Dthc_ae, Dthc_sm);
+  row("D1 = sum_c (vc|cv)/(eps_c-eps_v)  EXACT", Dex, Dsm);
+  row("D1 = sum_c (vc|cv)/(eps_c-eps_v)  THC", Dthc_ae, Dthc_sm);
+  // D0 is what Tr(Pi*Z) actually sums -- see the comment at its declaration.
+  row("D0 = sum_c (vc|cv)  [NO energy denominator]  EXACT", Dex0, Dsm0);
+  row("D0 = sum_c (vc|cv)  [NO energy denominator]  THC", Dthc_ae0, Dthc_sm0);
 
-  double tot_ex = 0.0, tot_sm = 0.0, tot_tae = 0.0, tot_tsm = 0.0;
-  for (long v = 0; v < nocc; ++v)
-    for (int b = 0; b < NBIN; ++b) {
-      tot_ex += Dex(v,b); tot_sm += Dsm(v,b);
-      tot_tae += Dthc_ae(v,b); tot_tsm += Dthc_sm(v,b);
-    }
-  app_log(1, "[erichk] CALIBRATION  THC smooth / exact smooth = {:.6f}  "
-             "(must be ~1: fixes the prefactor and contraction convention; "
-             "any other value invalidates the AE line below)",
-          tot_sm != 0.0 ? tot_tsm/tot_sm : 0.0);
-  app_log(1, "[erichk] MEASUREMENT  THC AE / exact AE = {:.6f}   "
-             "(exact AE {:.6f}, THC AE {:.6f}); excess the augmentation "
-             "should have cancelled but did not = {:.6f} of the smooth excess",
-          tot_ex != 0.0 ? tot_tae/tot_ex : 0.0, tot_ex, tot_tae,
-          (tot_sm - tot_ex) != 0.0 ? (tot_tae - tot_ex)/(tot_sm - tot_ex) : 0.0);
+  auto totals = [&](nda::array<double,2> const& A) {
+    double s = 0.0;
+    for (long v = 0; v < nocc; ++v)
+      for (int b = 0; b < NBIN; ++b) s += A(v,b);
+    return s; };
+  double tot_ex = totals(Dex),  tot_sm = totals(Dsm);
+  double tot_tae = totals(Dthc_ae), tot_tsm = totals(Dthc_sm);
+  double tot_ex0 = totals(Dex0), tot_sm0 = totals(Dsm0);
+  double tot_tae0 = totals(Dthc_ae0), tot_tsm0 = totals(Dthc_sm0);
+
+  app_log(1, "[erichk] CALIBRATION  THC smooth / exact smooth = {:.6f} (D1), "
+             "{:.6f} (D0)  (must be ~1: fixes the prefactor and contraction "
+             "convention; any other value invalidates the AE lines below)",
+          tot_sm  != 0.0 ? tot_tsm/tot_sm   : 0.0,
+          tot_sm0 != 0.0 ? tot_tsm0/tot_sm0 : 0.0);
+  app_log(1, "[erichk] MEASUREMENT D1  THC AE / exact AE = {:.6f}   "
+             "(exact {:.6f}, THC {:.6f})",
+          tot_ex != 0.0 ? tot_tae/tot_ex : 0.0, tot_ex, tot_tae);
+  app_log(1, "[erichk] MEASUREMENT D0  THC AE / exact AE = {:.6f}   "
+             "(exact {:.6f}, THC {:.6f})  <-- THIS is the accuracy the RPA "
+             "needs: Tr(Pi*Z) = -sum_ia (ia|ai) carries NO 1/Delta weight, so "
+             "D1 systematically de-weights the high bands that dominate it. "
+             "E_c is a ~1.4%% residual of two ~10 Ha terms, so ~1e-3 relative "
+             "here is the requirement, not 1e-2.",
+          tot_ex0 != 0.0 ? tot_tae0/tot_ex0 : 0.0, tot_ex0, tot_tae0);
+  app_log(1, "[erichk] smooth excess: D1 {:.4f}x, D0 {:.4f}x  (how much the "
+             "augmentation has to cancel under each weighting)",
+          tot_ex  != 0.0 ? tot_sm/tot_ex   : 0.0,
+          tot_ex0 != 0.0 ? tot_sm0/tot_ex0 : 0.0);
   REQUIRE(nbnd > 0);
 }
 
