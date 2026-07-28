@@ -117,13 +117,90 @@ RPA instability, since removing it changes nothing.
 (5.0 vs 0.72 at the top decile), so a relative error an order of magnitude
 smaller than V_LL's would still dominate. No direct reference for it exists yet.
 
+## 3c. Oscillator completeness sum rule — the physics is SOUND (2026-07-28)
+
+`paw_oscillator_sum_rule` (test_hamilt.cpp) uses an exact, reference-free
+identity: for a complete set of AE bands at a given k,
+
+    sum_c |rho_vc(G)|^2 = <psi_v| e^{-iGr} (sum_c |psi_c><psi_c|) e^{iGr} |psi_v>
+                        = 1     for EVERY G and every v,
+
+so a partial sum can only approach 1 from below. Exceeding it proves the
+summed oscillators are not AE oscillators of an orthonormal set. The test
+self-validates at G=0, where rho_vc(0) = <psi~_v|S|psi~_c> = delta_vc must hold
+exactly; on the QE LiH fixture the gate lands at 4e-12 while the deliberately
+reversed conj ordering lands at 0.76, so the conventions are pinned rather than
+assumed. On the ABINIT-converted Si MF the gate sits at 8e-7 (residual mismatch
+between ABINIT's own S and the q_ij reconstructed from the converted dataset).
+
+Si jth_with_d, a=10.05, nbnd=500, k=0, max over the 4 occupied v:
+
+| \|G\| (a.u.) | G^2/2 (Ha) | smooth N=125 | smooth N=250 | smooth N=500 | **AE N=500** |
+|---|---|---|---|---|---|
+| 0.000 | 0.00 | 1.1100 | 1.2456 | **2.9805** | **1.0000** |
+| 1.083 | 0.59 | 1.0994 | 1.2135 | 2.5943 | 0.9869 |
+| 2.074 | 2.15 | 1.0621 | 1.1609 | 1.8022 | 0.9704 |
+| 3.063 | 4.69 | 0.5125 | 1.0477 | 1.2749 | 0.9839 |
+| 3.954 | 7.82 | 0.1767 | 0.4759 | 1.0951 | 0.9986 |
+| 5.002 | 12.51 | 0.0027 | 0.1406 | 0.4932 | 0.4494 |
+| >= 8.0 | >= 32 | 0.0000 | 0.0000 | 0.0001 | 0.0003 |
+
+**The exact PAW augmented oscillators are sound at 500 bands** — every value at
+or below 1, approached monotonically, at every \|G\|. On-site incompleteness is
+therefore NOT the mechanism, and the dataset is exonerated a second time by an
+argument that does not go through ABINIT at all.
+
+Two consequences, both eliminating candidate fixes:
+
+- **A high-\|G\| augmentation cutoff cannot be the fix.** Above \|G\| = 8 a.u.
+  the augmented oscillators are identically zero, so there is nothing spurious
+  up there for CoQui's larger rho_g sphere (\|G\| to 21 a.u.) to pick up that
+  ABINIT's `ecuteps` truncation avoids. The `paw_aug_ecut` knob added in this
+  session (thc_reader_t, defaults OFF, cuts eta itself so Z stays a PSD Gram
+  matrix of {zeta, eta_cut}) is retained as a control but is not the answer.
+- **What the augmentation has to do is now quantified.** The SMOOTH oscillators
+  carry an excess reaching 2.98 at G=0 that grows steeply with band count
+  (1.11 -> 1.25 -> 2.98 for N=125/250/500). The augmentation must cancel a
+  factor of three, and the physics supports it exactly.
+
+**The excess tracks the volume dependence of the error.** At a=10.55 the G=0
+smooth value is 1.9528 (vs 2.9805 at a=10.05), i.e. an excess to cancel of 0.95
+vs 1.98, ratio 2.1 — against a CoQui error ratio of 165/61 = 2.7 at those same
+two volumes (§1). The over-binding scales with the SIZE OF THE CANCELLATION,
+which is what a fixed missed FRACTION of it would produce.
+
 ## 4. Recommended next step (code-level, not another sweep)
 
-Superseded by §3b, which answered the question it posed: the joint smooth+aug
-basis CAN represent the blocks accurately (V_LL to 5e-5 relative at tight
-tolerance), and doing so does not fix the RPA. The next step is a direct
-reference for **V_GL**, the only block still unverified and the largest one at
-high band index.
+Superseded twice. §3b killed the V_LL-representation hypothesis; §3c killed
+both the dataset/on-site-completeness hypothesis and the high-\|G\| cutoff fix,
+and reframed the question: the exact AE ERI is right, the smooth one is a
+factor ~3 too big, and the only open question is what fraction of that
+cancellation the ASSEMBLED THC ERI actually realizes. Every probe so far
+compared one augmentation BLOCK against a direct reference; none compared the
+assembled ERI against the exact answer.
+
+`paw_thc_vs_exact_eri` (test_hamilt.cpp) is that measurement. Per occupied v,
+restricted to q=0 so the exact side stays tractable, it compares
+
+    D(v) = sum_c (v c | c v) / (eps_c - eps_v)     [the RPA's own integrand]
+
+in four columns: exact AE, exact smooth, THC AE, THC smooth. The smooth pair is
+the CALIBRATION — it fixes the prefactor and the contraction convention
+independently, and if it does not read ~1 nothing in the AE columns can be
+believed. Two traps it caught while being built, both recorded because they are
+the same class of error that produced four plausible-but-meaningless references
+earlier in this investigation: (1) `math::nda::fft` normalizes on the FORWARD
+transform, so the natural-looking extra 1/nnr is wrong — anchored by requiring
+rho~_vv(G=0) = sum_g |C(v,g)|^2, which fails by exactly nnr if you get it
+wrong; (2) `hf_t`'s K carries the 1/N_k BZ factor, which showed up as the
+calibration reading exactly 0.124971 = 1/8 on the 8-k LiH fixture. With both
+fixed it reads calibration 0.999766 / measurement 0.999703 on LiH.
+
+Historical note, superseded: the previous recommendation here was a direct
+reference for **V_GL**, on the grounds that it was the only block never checked
+and the largest at high band index (5.0 vs V_LL's 0.72 at the top decile).
+`paw_thc_vs_exact_eri` subsumes it — it checks the whole assembled ERI,
+V_GL included, against the exact answer rather than block by block.
 
 Constructing it is harder than the V_LL reference, and the asymmetry is the
 reason it was not done first. V_LL is a pure one-center object, so

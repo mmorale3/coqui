@@ -133,6 +133,27 @@ namespace methods {
         _paw_vll = io::get_value_with_default<bool>(pt, "paw_vll", true);
         _paw_isdf_tol = io::get_value_with_default<double>(pt, "paw_isdf_tol", 1e-12);
         _paw_isdf_cache_h5 = io::get_value_with_default<std::string>(pt, "paw_isdf_cache_h5", "");
+        // Cutoff (Ha, on |q+G|^2/2) applied to the augmentation channels eta.
+        // The one-center oscillator Q_ij(q+G) that eta carries is built on the
+        // frozen partial-wave basis, so it is only as good as the on-site
+        // completeness of that basis, |psi~> ~ sum_i |phi~_i><p_i|psi~>. That
+        // holds where the projectors were fitted and degrades at high |q+G|,
+        // where Q_ij does not decay but the true AE oscillator does — so the
+        // augmentation there is spurious and grows as |<p_i|psi~_n>|^2 with
+        // band index. Every PAW response code carries the same control
+        // (ABINIT `ecuteps`, VASP ENCUTGW); the THC/ISDF basis has no implicit
+        // one, hence this knob.
+        //
+        // The cutoff is applied to eta ITSELF (not to the Coulomb weights), so
+        // the assembled Z stays the exact Coulomb Gram matrix of the function
+        // set {zeta (band-limited to rho_g), eta (cut at this Gcut)} and is
+        // therefore still PSD. Cutting the kernel instead would leave the GG
+        // block on the full v while GL/LL saw a truncated one, which is not a
+        // Gram matrix of anything.
+        //
+        // 0 (default) = off, i.e. eta carried to the full grid, unchanged
+        // behaviour. Note K_a is grid-free and is NOT truncated by this knob.
+        _paw_aug_ecut = io::get_value_with_default<double>(pt, "paw_aug_ecut", 0.0);
         {
           std::string m = io::tolower_copy(io::get_value_with_default<std::string>(pt, "paw_isdf_metric", "coulomb"));
           _paw_isdf_metric = (m == "l2") ? hamilt::paw::isdf_metric::L2
@@ -750,6 +771,17 @@ namespace methods {
                    "(Gcut={:.2f} a.u., ngm={}; rho_g ecut={:.2f} Ha, ngm={})",
                 Gcut_aug, dense_g_opt->size(), rho_g.ecut(), ngm_rho);
       }
+      // Optional |q+G| cutoff on the augmentation channels (see the
+      // _paw_aug_ecut comment at the option parse). Applied to eta on every
+      // grid it is built on, so {zeta, eta_cut} stays a consistent function
+      // set and Z stays its Coulomb Gram matrix.
+      const bool aug_cut = (_paw_aug_ecut > 0.0);
+      const double aug_K2_max = aug_cut ? 2.0 * _paw_aug_ecut : 0.0;
+      if (aug_cut)
+        app_log(1, "  paw_aug: eta TRUNCATED at |q+G|^2/2 <= {:.3f} Ha "
+                   "(|q+G| <= {:.3f} a.u.)", _paw_aug_ecut,
+                std::sqrt(aug_K2_max));
+
       double K_max = (dense_LL ? Gcut_aug : K_max_g) + q_cart_max;
 
       _Timer.start("PAW_AUG.qrad_tab");
@@ -865,6 +897,17 @@ namespace methods {
               *_psp, _isdf, _aug_layout, rho_g, q_cart, omega,
               aatab, qrad_tabs,
               la_rng, range(0, ngm_rho), eta_loc);
+          if (aug_cut) {
+            auto const& gv = rho_g.g_vectors();
+            for (long g = 0; g < ngm_rho; ++g) {
+              double Kx = q_cart[0] + gv(g, 0);
+              double Ky = q_cart[1] + gv(g, 1);
+              double Kz = q_cart[2] + gv(g, 2);
+              if (Kx*Kx + Ky*Ky + Kz*Kz <= aug_K2_max) continue;
+              for (long la = 0; la < eta_loc.shape(0); ++la)
+                eta_loc(la, g) = ComplexType(0.0);
+            }
+          }
         }
         _Timer.stop("PAW_AUG.eta_at_q");
 
@@ -1004,8 +1047,14 @@ namespace methods {
                 double Kz = q_cart[2] + gv_d(g, 2);
                 double K2 = Kx*Kx + Ky*Ky + Kz*Kz;
                 double w = (K2 > 1e-14) ? (4.0*M_PI/(omega*K2)) : 0.0;
+                // Same eta truncation as the rho_g branch above: zero the
+                // channel itself, not the kernel, so both tiles describe the
+                // identical cut function set.
+                if (aug_cut and K2 > aug_K2_max) w = 0.0;
                 for (long la = 0; la < etaP_v.shape(0); ++la)
-                  etaP_v(la, ig) = std::conj(etaP_v(la, ig));
+                  etaP_v(la, ig) = (aug_cut and K2 > aug_K2_max)
+                                 ? ComplexType(0.0)
+                                 : std::conj(etaP_v(la, ig));
                 for (long la = 0; la < etaQ_v.shape(0); ++la)
                   etaQ_v(la, ig) *= w;
               }
@@ -2115,6 +2164,7 @@ namespace methods {
                                        // (moment => include, shape => drop)
     bool _paw_vgl = true;              // diagnostic: include V_GL/V_LG smooth-aug cross
     bool _paw_vll = true;              // diagnostic: include V_LL aug-aug block
+    double _paw_aug_ecut = 0.0;        // Ha; |q+G|^2/2 cutoff on eta (0 = off)
     int _Np_smooth = 0;                // smooth-only block size
     int _N_aug = 0;                    // total atom-local rows
     std::shared_ptr<hamilt::pseudopot> _psp;        // lazy via make_pseudopot

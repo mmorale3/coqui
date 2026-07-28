@@ -4270,6 +4270,610 @@ TEST_CASE("thc_vgl_vll_band_scan", "[hamilt][thc][bandscan][!benchmark]")
 }
 
 // ===========================================================================
+// PAW oscillator completeness sum rule.
+//
+// The AE oscillator rho_vc(G) = <psi_v|e^{-iGr}|psi_c> obeys an EXACT,
+// reference-free identity: for a COMPLETE set of AE bands at a given k,
+//
+//     sum_c |rho_vc(G)|^2 = <psi_v| e^{-iGr} (sum_c |psi_c><psi_c|) e^{iGr}
+//                           |psi_v> = <psi_v|psi_v> = 1
+//
+// for EVERY G and every v. Truncating the band sum can only approach 1 from
+// below — monotonically. So a partial sum that EXCEEDS 1 is proof that the
+// oscillators being summed are not AE oscillators of an orthonormal set.
+//
+// PAW evaluates rho_vc(G) as rho~_vc(G) + sum_ij conj(P_vi) P_cj Q_ij(G),
+// which equals <psi_v|e^{-iGr}|psi_c> only where the on-site expansion
+// |psi~> ~ sum_i |phi~_i><p_i|psi~> holds. That expansion is fitted over the
+// valence energy window; high-energy virtuals sit outside it (max|<p|psi~>|
+// grows 3.6 -> 11.1 going from 250 to 500 bands on Si/jth_with_d), and the
+// one-center term then over-counts by ~|P|^2 while the true oscillator
+// decays. This test measures exactly that, resolved in |G| and in band count,
+// so the |G| range where the augmented oscillator stops being physical is
+// visible directly.
+//
+// SELF-VALIDATION: the same machinery evaluated at G=0 must give
+// rho_vc(0) = <psi~_v|S|psi~_c> = delta_vc to machine precision. That gate
+// pins every convention this test could get wrong at once (orbital
+// normalization, the conj ordering of the P contraction, the structure-factor
+// sign, and the q_ij monopole), and it hard-fails before any table is printed.
+// Prior rounds of this investigation produced plausible-but-meaningless
+// references four separate times; this gate is what makes the numbers below
+// trustworthy.
+//
+// Tagged [!benchmark] and NOT [paw], so it stays out of the "[paw]~[slow]"
+// pre-commit filter (same convention as thc_vgl_vll_band_scan).
+// ===========================================================================
+TEST_CASE("paw_oscillator_sum_rule", "[hamilt][paw_sumrule][!benchmark]")
+{
+  auto& mpip = utils::make_unit_test_mpi_context();
+  auto& mpi = *mpip;
+  using nda::range;
+
+  auto env_s = [](char const* k, std::string d) {
+    char const* v = std::getenv(k); return v ? std::string(v) : d; };
+  auto env_d = [&](char const* k, double d) {
+    char const* v = std::getenv(k); return v ? std::stod(v) : d; };
+  auto env_i = [&](char const* k, int d) {
+    char const* v = std::getenv(k); return v ? std::stoi(v) : d; };
+
+  std::string dir  = env_s("COQUI_SUMRULE_DIR", "");
+  int    nbnd_req  = env_i("COQUI_SUMRULE_NBND", -1);
+  int    k0        = env_i("COQUI_SUMRULE_K", 0);
+  double isdf_tol  = env_d("COQUI_SUMRULE_ISDF_TOL", 1e-12);
+  bool   shape     = (env_i("COQUI_SUMRULE_SHAPE", 0) != 0);
+
+  std::shared_ptr<mf::MF> mf_ptr;
+  if (dir.empty()) {
+    mf_ptr = std::make_shared<mf::MF>(
+        mf::default_MF(mpip, "qe_lih222_paw_hf", mf::h5_input_type));
+  } else {
+    auto src = (env_s("COQUI_SUMRULE_SRC", "bdft") == "qe") ? mf::qe_source
+                                                            : mf::bdft_source;
+    mf_ptr = std::make_shared<mf::MF>(
+        mf::make_MF(mpip, src, dir, env_s("COQUI_SUMRULE_PREFIX", "mf"),
+                    mf::h5_input_type, 0.0, nbnd_req));
+  }
+  auto& mfobj = *mf_ptr;
+  long nbnd = mfobj.nbnd();
+  int  npol = mfobj.npol();
+  utils::check(npol == 1,
+      "paw_oscillator_sum_rule: npol>1 not supported by this diagnostic.");
+  utils::check(k0 >= 0 and k0 < mfobj.nkpts_ibz(),
+      "paw_oscillator_sum_rule: COQUI_SUMRULE_K={} out of IBZ range [0,{})",
+      k0, mfobj.nkpts_ibz());
+
+  hamilt::pseudopot V(mfobj);
+  auto recv = mfobj.recv();
+  auto mesh = mfobj.fft_grid_dim_aug();
+  long NX = mesh(0), NY = mesh(1), NZ = mesh(2);
+  double det_B = recv(0,0)*(recv(1,1)*recv(2,2)-recv(1,2)*recv(2,1))
+               - recv(1,0)*(recv(0,1)*recv(2,2)-recv(0,2)*recv(2,1))
+               + recv(2,0)*(recv(0,1)*recv(1,2)-recv(0,2)*recv(1,1));
+  double vol = (2.0*M_PI)*(2.0*M_PI)*(2.0*M_PI)/std::abs(det_B);
+
+  // ---- wfc G-sphere: miller indices, recovered from the wfc->aug-FFT map.
+  // swfc_to_rho is k-INDEPENDENT (one G sphere shared by all k, the k
+  // dependence living in the phase), which is what lets the shift map below
+  // be built once.
+  auto k2g = V.swfc_to_rho_view();
+  long ngw = k2g.extent(0);
+  nda::array<int,2> mw(ngw, 3);
+  for (long g = 0; g < ngw; ++g) {
+    long N = k2g(g);
+    utils::check(N >= 0 and N < NX*NY*NZ,
+        "paw_oscillator_sum_rule: wfc->fft index {} out of range", N);
+    long i3 = N % NZ, i2 = (N / NZ) % NY, i1 = N / (NZ*NY);
+    mw(g,0) = (int)((i1 <= NX/2) ? i1 : i1 - NX);
+    mw(g,1) = (int)((i2 <= NY/2) ? i2 : i2 - NY);
+    mw(g,2) = (int)((i3 <= NZ/2) ? i3 : i3 - NZ);
+  }
+  auto enc = [&](int a, int b, int c) {
+    return ((long)(a + NX) * (2*NY+1) + (long)(b + NY)) * (2*NZ+1) + (c + NZ); };
+  std::unordered_map<long,long> mill_to_gw;
+  mill_to_gw.reserve(2*ngw);
+  for (long g = 0; g < ngw; ++g)
+    mill_to_gw[enc(mw(g,0), mw(g,1), mw(g,2))] = g;
+
+  // ---- Target G shells. Pick, from the aug G grid, the representative whose
+  // |G| is closest to each requested value, so the table samples the whole
+  // range the THC rho_g sphere actually spans.
+  auto const& mill_d = V.miller_g_dense_view();
+  long ngm_d = mill_d.extent(0);
+  std::vector<double> want = {0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0,
+                              10.0, 12.0, 15.0, 18.0, 21.0, 25.0};
+  std::vector<std::array<int,3>>    sel_mill;
+  std::vector<double>               sel_Gmod;
+  for (double w : want) {
+    long best = -1; double bestd = 1e30, bestG = 0.0;
+    for (long p = 0; p < ngm_d; ++p) {
+      int m1 = mill_d(p,0), m2 = mill_d(p,1), m3 = mill_d(p,2);
+      double Gx = m1*recv(0,0)+m2*recv(1,0)+m3*recv(2,0);
+      double Gy = m1*recv(0,1)+m2*recv(1,1)+m3*recv(2,1);
+      double Gz = m1*recv(0,2)+m2*recv(1,2)+m3*recv(2,2);
+      double G = std::sqrt(Gx*Gx+Gy*Gy+Gz*Gz);
+      if (std::abs(G - w) < bestd) { bestd = std::abs(G - w); best = p; bestG = G; }
+    }
+    if (best < 0) continue;
+    std::array<int,3> m = {mill_d(best,0), mill_d(best,1), mill_d(best,2)};
+    bool dup = false;
+    for (auto const& s : sel_mill) if (s == m) { dup = true; break; }
+    if (dup) continue;
+    sel_mill.push_back(m);
+    sel_Gmod.push_back(bestG);
+  }
+  long nsel = (long)sel_mill.size();
+  utils::check(nsel > 0, "paw_oscillator_sum_rule: no G vectors selected.");
+  double Gmax = 0.0;
+  for (double g : sel_Gmod) Gmax = std::max(Gmax, g);
+
+  // ---- Local ISDF + aug layout + eta(lambda, G) at q = 0.
+  auto const& sps = V.paw_species_view();
+  int nsp = (int)sps.size();
+  std::vector<hamilt::paw::species_local_isdf> isdf;
+  isdf.reserve(nsp);
+  for (int nt = 0; nt < nsp; ++nt) {
+    if (!(sps[nt].is_paw || sps[nt].is_uspp)) { isdf.emplace_back(); continue; }
+    isdf.push_back(hamilt::paw::build_local_isdf_compressed_by_norm(
+        V, nt, recv, vol, hamilt::paw::isdf_metric::Coulomb, isdf_tol));
+  }
+  auto layout = hamilt::paw::make_paw_aug_layout(V, isdf, 0);
+  long N_aug = layout.N_A;
+  utils::check(N_aug > 0,
+      "paw_oscillator_sum_rule: N_aug == 0 — the MF has no augmenting species, "
+      "so there is nothing for this diagnostic to test.");
+
+  nda::array<int,2> sel_m(nsel, 3);
+  for (long p = 0; p < nsel; ++p)
+    for (int d = 0; d < 3; ++d) sel_m(p,d) = sel_mill[p][d];
+  grids::truncated_g_grid gsel(sel_m, 0.5*Gmax*Gmax*(1.0+1e-8), mesh, recv);
+
+  auto const& aatab = V.paw_aatab();
+  auto const& qtabs = V.paw_qrad_tabs(Gmax*(1.0+1e-6) + 1e-3, shape);
+  nda::array<ComplexType,2> eta(N_aug, nsel);
+  std::array<double,3> q0 = {0.0, 0.0, 0.0};
+  hamilt::paw::build_eta_on_rho_g_at_q_chunk(
+      V, isdf, layout, gsel, q0, vol, aatab, qtabs,
+      range(0, N_aug), range(0, nsel), eta);
+
+  // ---- Y rows (the aug half of the THC X matrix) at this k.
+  auto Pskna = V.Pskna_view();
+  nda::array<ComplexType,2> Y(N_aug, nbnd);
+  hamilt::paw::fill_Y_rows_for_sk(V, isdf, layout, npol, 0, k0, Pskna, Y);
+
+  // ---- Orbital coefficients at k0 (G space, wfc sphere).
+  nda::array<ComplexType,2> C(nbnd, ngw);
+  mfobj.get_orbital_set('w', 0, k0, {0, nbnd}, C);
+
+  auto occ = mfobj.occ();
+  auto eig = mfobj.eigval();
+  long nocc = 0;
+  for (long n = 0; n < nbnd; ++n) if (std::abs(occ(0,k0,n)) > 1e-6) nocc = n+1;
+  nocc = std::max(1L, nocc);
+
+  app_log(1, "[sumrule] nbnd={} k={} nocc={} N_aug={} ngw={} isdf_tol={:.1e} "
+             "mode={}", nbnd, k0, nocc, N_aug, ngw, isdf_tol,
+          shape ? "shape" : "moment");
+
+  // rho_vc(G) for every (v<nocc, c<nbnd, G in sel): smooth + augmented.
+  // rho~_vc(G) = sum_g conj(C_v(g)) C_c(g+G)  — evaluated in G space via the
+  // miller shift map, so no FFT convention enters at all.
+  nda::array<ComplexType,3> rho_sm(nsel, nocc, nbnd), rho_ae(nsel, nocc, nbnd);
+  rho_sm() = ComplexType(0.0); rho_ae() = ComplexType(0.0);
+  nda::array<long,1> shift(ngw);
+  for (long p = 0; p < nsel; ++p) {
+    for (long g = 0; g < ngw; ++g) {
+      auto it = mill_to_gw.find(enc(mw(g,0)+sel_mill[p][0],
+                                    mw(g,1)+sel_mill[p][1],
+                                    mw(g,2)+sel_mill[p][2]));
+      shift(g) = (it == mill_to_gw.end()) ? -1 : it->second;
+    }
+    for (long v = 0; v < nocc; ++v)
+      for (long c = 0; c < nbnd; ++c) {
+        ComplexType acc(0.0);
+        for (long g = 0; g < ngw; ++g) {
+          long gp = shift(g);
+          if (gp < 0) continue;
+          acc += std::conj(C(v,g)) * C(c,gp);
+        }
+        ComplexType aug(0.0);
+        for (long la = 0; la < N_aug; ++la)
+          aug += std::conj(Y(la,v)) * Y(la,c) * eta(la,p);
+        rho_sm(p,v,c) = acc;
+        rho_ae(p,v,c) = acc + vol * aug;
+      }
+  }
+
+  // ---- G=0 gate. rho_vc(0) = <psi~_v|S|psi~_c> = delta_vc, exactly.
+  long p0 = -1;
+  for (long p = 0; p < nsel; ++p)
+    if (sel_mill[p][0]==0 && sel_mill[p][1]==0 && sel_mill[p][2]==0) p0 = p;
+  utils::check(p0 >= 0, "paw_oscillator_sum_rule: G=0 not among the selected G.");
+  double gate_diag = 0.0, gate_off = 0.0, gate_off_swapped = 0.0;
+  for (long v = 0; v < nocc; ++v)
+    for (long c = 0; c < nbnd; ++c) {
+      // swapped-order control: if the conj ordering of the P contraction were
+      // reversed, the diagonal gate would still pass but this one would not.
+      ComplexType aug_sw(0.0);
+      for (long la = 0; la < N_aug; ++la)
+        aug_sw += Y(la,v) * std::conj(Y(la,c)) * eta(la,p0);
+      ComplexType sw = rho_sm(p0,v,c) + vol * aug_sw;
+      if (v == c) gate_diag = std::max(gate_diag, std::abs(rho_ae(p0,v,c) - 1.0));
+      else {
+        gate_off = std::max(gate_off, std::abs(rho_ae(p0,v,c)));
+        gate_off_swapped = std::max(gate_off_swapped, std::abs(sw));
+      }
+    }
+  // The gate exists to catch CONVENTION errors, which show up as O(1)
+  // failures (the swapped-conj control above lands at 0.76 on the QE LiH
+  // fixture). A QE-sourced MF passes at ~1e-12; an ABINIT-converted one sits
+  // near 1e-4, the residual mismatch between ABINIT's own S and the q_ij this
+  // path reconstructs from the converted dataset. That residual is reported
+  // rather than hidden, since it bounds how small a sum-rule violation can be
+  // believed below.
+  double gate_tol = env_d("COQUI_SUMRULE_GATE_TOL", 1e-3);
+  app_log(1, "[sumrule] G=0 gate: max|rho_vv(0)-1| = {:.3e}, "
+             "max_{{v!=c}}|rho_vc(0)| = {:.3e}  (swapped-conj control {:.3e}; "
+             "tol {:.1e})",
+          gate_diag, gate_off, gate_off_swapped, gate_tol);
+  utils::check(gate_diag < gate_tol and gate_off < gate_tol,
+      "paw_oscillator_sum_rule: the G=0 identity rho_vc(0)=delta_vc FAILS "
+      "(diag {:.3e}, offdiag {:.3e}, tol {:.1e}). A convention is wrong — "
+      "refusing to print a sum-rule table built on it.",
+      gate_diag, gate_off, gate_tol);
+
+  // ---- Completeness sums and the static-polarizability weight, vs band
+  // count, per |G|. Three band cut-offs (quarter / half / all) so the trend
+  // with band count is readable in one row.
+  utils::check(nbnd >= 8,
+      "paw_oscillator_sum_rule: needs nbnd >= 8 to resolve a band trend.");
+  const long N1 = nbnd/4, N2 = nbnd/2, N3 = nbnd;
+  // weighted=false -> completeness sum; weighted=true -> 2|rho|^2/(de).
+  auto accum = [&](long p, long N, bool ae, bool weighted) {
+    double m = 0.0;
+    for (long v = 0; v < nocc; ++v) {
+      double s = 0.0;
+      for (long c = (weighted ? nocc : 0); c < N; ++c) {
+        double w2 = ae ? std::norm(rho_ae(p,v,c)) : std::norm(rho_sm(p,v,c));
+        if (weighted) {
+          double de = eig(0,k0,c) - eig(0,k0,v);
+          if (de < 1e-6) continue;
+          s += 2.0*w2/de;
+        } else s += w2;
+      }
+      m = std::max(m, s);
+    }
+    return m; };
+
+  app_log(1, "[sumrule] --- completeness  S_v(G,N) = sum_{{c<N}} |rho_vc(G)|^2, "
+             "max over v (exact complete-set limit = 1; partial sums must "
+             "approach it from BELOW) ---");
+  app_log(1, "[sumrule] {:>8} {:>9} | {:>9} {:>9} | {:>9} {:>9} | {:>9} {:>9}",
+          "|G|", "G^2/2", "sm N/4", "AE N/4", "sm N/2", "AE N/2",
+          "sm N", "AE N");
+  double worst = 0.0, worst_G = 0.0;
+  for (long p = 0; p < nsel; ++p) {
+    double a3 = accum(p, N3, true, false);
+    app_log(1, "[sumrule] {:8.3f} {:9.2f} | {:9.4f} {:9.4f} | {:9.4f} {:9.4f} "
+               "| {:9.4f} {:9.4f}",
+            sel_Gmod[p], 0.5*sel_Gmod[p]*sel_Gmod[p],
+            accum(p,N1,false,false), accum(p,N1,true,false),
+            accum(p,N2,false,false), accum(p,N2,true,false),
+            accum(p,N3,false,false), a3);
+    if (a3 > worst) { worst = a3; worst_G = sel_Gmod[p]; }
+  }
+  // The bound to test against is 1 + (how far the G=0 identity itself missed),
+  // since that residual is the noise floor of the whole construction. A bare
+  // `> 1 + 1e-6` flagged the G=0 row itself on an ABINIT-converted MF, where
+  // the gate sits near 1e-6 rather than 1e-12 — a false alarm on the one row
+  // that is exactly 1 by construction.
+  double bound = 1.0 + std::max(gate_diag, 1e-9) * 10.0;
+  app_log(1, "[sumrule] worst AE completeness sum at N={}: {:.6f} at |G|={:.3f} "
+             "a.u.  ({} vs bound {:.6f} — a value above it is impossible for "
+             "true AE oscillators)",
+          N3, worst, worst_G,
+          worst > bound ? "SUM RULE VIOLATED" : "within bound", bound);
+
+  // What the RPA actually integrates: Pi_v(G,N) = sum_{nocc<=c<N}
+  // 2|rho_vc(G)|^2/(eps_c - eps_v). The AE column growing without bound as N
+  // grows, where the smooth one saturates, is the blow-up in its own units.
+  app_log(1, "[sumrule] --- static polarizability weight  Pi_v(G,N) = "
+             "sum_{{c<N}} 2|rho_vc|^2/(eps_c-eps_v)  [Ha^-1], max over v ---");
+  app_log(1, "[sumrule] {:>8} {:>9} | {:>9} {:>9} | {:>9} {:>9} | {:>9} {:>9}",
+          "|G|", "G^2/2", "sm N/4", "AE N/4", "sm N/2", "AE N/2",
+          "sm N", "AE N");
+  for (long p = 0; p < nsel; ++p)
+    app_log(1, "[sumrule] {:8.3f} {:9.2f} | {:9.4f} {:9.4f} | {:9.4f} {:9.4f} "
+               "| {:9.4f} {:9.4f}",
+            sel_Gmod[p], 0.5*sel_Gmod[p]*sel_Gmod[p],
+            accum(p,N1,false,true), accum(p,N1,true,true),
+            accum(p,N2,false,true), accum(p,N2,true,true),
+            accum(p,N3,false,true), accum(p,N3,true,true));
+  REQUIRE(nbnd > 0);
+}
+
+// ===========================================================================
+// THC-assembled ERI vs the EXACT AE reference, on the occupied->virtual
+// transitions the RPA integrates.
+//
+// paw_oscillator_sum_rule establishes that at nbnd=500 the exact PAW
+// augmented oscillators are sound: sum_c |rho_vc(G)|^2 <= 1 at every |G|,
+// while the SMOOTH ones reach ~3 at G=0 and grow with band count. So the
+// augmentation has a factor-of-3 excess to cancel, the physics supports it,
+// and the question is only whether the THC ERI actually realizes that
+// cancellation. Nothing measured so far answers that: every prior probe
+// compared one augmentation BLOCK against a direct reference, never the
+// assembled ERI against the exact answer.
+//
+// Diagnostic, per occupied v, restricted to q=0 (transitions within one k so
+// the exact side stays tractable):
+//
+//     D(v) = sum_c  (v c | c v) / (eps_c - eps_v)
+//
+// which is the static polarizability weight -- the RPA's own integrand.
+// Four columns:
+//   exact AE     : sum_{G!=0} 4pi/(Omega |G|^2) |rho_vc(G)|^2 with rho_vc the
+//                  exact augmented oscillator (G=0 dropped, matching the ERI's
+//                  ignore_g0 divergence handling)
+//   exact smooth : the same with the augmentation switched off
+//   THC AE       : the assembled THC ERI, read through hf_t's exchange
+//   THC smooth   : the same with paw_aug=false
+//
+// The smooth pair (exact smooth vs THC smooth) is the CALIBRATION: it fixes
+// the prefactor and the contraction convention independently, and if it does
+// not come out at ratio ~1 then nothing in the AE columns can be believed.
+// With that anchored, "THC AE / exact AE" is the number this whole
+// investigation has been trying to get at.
+// ===========================================================================
+TEST_CASE("paw_thc_vs_exact_eri", "[hamilt][paw_erichk][!benchmark]")
+{
+  using math::shm::make_shared_array;
+  auto& mpip = utils::make_unit_test_mpi_context();
+  auto& mpi = *mpip;
+  using nda::range;
+
+  auto env_s = [](char const* k, std::string d) {
+    char const* v = std::getenv(k); return v ? std::string(v) : d; };
+  auto env_d = [&](char const* k, double d) {
+    char const* v = std::getenv(k); return v ? std::stod(v) : d; };
+  auto env_i = [&](char const* k, int d) {
+    char const* v = std::getenv(k); return v ? std::stoi(v) : d; };
+
+  std::string dir  = env_s("COQUI_ERICHK_DIR", "");
+  int    nbnd_req  = env_i("COQUI_ERICHK_NBND", -1);
+  int    k0        = env_i("COQUI_ERICHK_K", 0);
+  double isdf_tol  = env_d("COQUI_ERICHK_ISDF_TOL", 1e-12);
+  double thresh    = env_d("COQUI_ERICHK_THRESH", 1e-4);
+  int    nIpts     = env_i("COQUI_ERICHK_NIPTS", 0);
+
+  std::shared_ptr<mf::MF> mf_ptr;
+  if (dir.empty()) {
+    mf_ptr = std::make_shared<mf::MF>(
+        mf::default_MF(mpip, "qe_lih222_paw_hf", mf::h5_input_type));
+  } else {
+    auto src = (env_s("COQUI_ERICHK_SRC", "bdft") == "qe") ? mf::qe_source
+                                                           : mf::bdft_source;
+    mf_ptr = std::make_shared<mf::MF>(
+        mf::make_MF(mpip, src, dir, env_s("COQUI_ERICHK_PREFIX", "mf"),
+                    mf::h5_input_type, 0.0, nbnd_req));
+  }
+  auto& mfobj = *mf_ptr;
+  long nspin = mfobj.nspin(), nk_ibz = mfobj.nkpts_ibz(), nbnd = mfobj.nbnd();
+  int  npol = mfobj.npol();
+  utils::check(npol == 1, "paw_thc_vs_exact_eri: npol>1 not supported.");
+
+  hamilt::pseudopot V(mfobj);
+  auto recv = mfobj.recv();
+  auto mesh = mfobj.fft_grid_dim_aug();
+  long NX = mesh(0), NY = mesh(1), NZ = mesh(2), nnr = NX*NY*NZ;
+  double det_B = recv(0,0)*(recv(1,1)*recv(2,2)-recv(1,2)*recv(2,1))
+               - recv(1,0)*(recv(0,1)*recv(2,2)-recv(0,2)*recv(2,1))
+               + recv(2,0)*(recv(0,1)*recv(1,2)-recv(0,2)*recv(1,1));
+  double vol = (2.0*M_PI)*(2.0*M_PI)*(2.0*M_PI)/std::abs(det_B);
+
+  // Same rho_g sphere the THC builder uses, so the exact Coulomb sum runs
+  // over exactly the G set the ERI was assembled on.
+  grids::truncated_g_grid rho_g(mfobj.ecutrho(), mesh, recv);
+  long ngm = rho_g.size();
+  auto const& g2fft = rho_g.gv_to_fft();
+  auto const& gv = rho_g.g_vectors();
+
+  auto occ = mfobj.occ();
+  auto eig = mfobj.eigval();
+  long nocc = 0;
+  for (long n = 0; n < nbnd; ++n) if (std::abs(occ(0,k0,n)) > 1e-6) nocc = n+1;
+  nocc = std::max(1L, nocc);
+  app_log(1, "[erichk] nbnd={} k={} nocc={} ngm_rho={} mesh={}x{}x{} "
+             "thresh={:.1e} isdf_tol={:.1e} nIpts={}",
+          nbnd, k0, nocc, ngm, NX, NY, NZ, thresh, isdf_tol, nIpts);
+
+  // ---- Augmentation channels at q=0 on rho_g, and the Y rows.
+  auto const& sps = V.paw_species_view();
+  std::vector<hamilt::paw::species_local_isdf> isdf;
+  for (int nt = 0; nt < (int)sps.size(); ++nt) {
+    if (!(sps[nt].is_paw || sps[nt].is_uspp)) { isdf.emplace_back(); continue; }
+    isdf.push_back(hamilt::paw::build_local_isdf_compressed_by_norm(
+        V, nt, recv, vol, hamilt::paw::isdf_metric::Coulomb, isdf_tol));
+  }
+  auto layout = hamilt::paw::make_paw_aug_layout(V, isdf, 0);
+  long N_aug = layout.N_A;
+  utils::check(N_aug > 0, "paw_thc_vs_exact_eri: N_aug == 0 (no PAW/USPP species).");
+
+  double Gmax = 0.0;
+  for (long g = 0; g < ngm; ++g)
+    Gmax = std::max(Gmax, std::sqrt(gv(g,0)*gv(g,0)+gv(g,1)*gv(g,1)+gv(g,2)*gv(g,2)));
+  auto const& aatab = V.paw_aatab();
+  auto const& qtabs = V.paw_qrad_tabs(Gmax*(1.0+1e-6) + 1e-3, false);
+  nda::array<ComplexType,2> eta(N_aug, ngm);
+  {
+    std::array<double,3> q0 = {0.0, 0.0, 0.0};
+    const long gch = 8192;
+    for (long g0 = 0; g0 < ngm; g0 += gch) {
+      range gr(g0, std::min(g0+gch, ngm));
+      auto sub = eta(range::all, gr);
+      hamilt::paw::build_eta_on_rho_g_at_q_chunk(
+          V, isdf, layout, rho_g, q0, vol, aatab, qtabs,
+          range(0, N_aug), gr, sub);
+    }
+  }
+  auto Pskna = V.Pskna_view();
+  nda::array<ComplexType,2> Y(N_aug, nbnd);
+  hamilt::paw::fill_Y_rows_for_sk(V, isdf, layout, npol, 0, k0, Pskna, Y);
+
+  // ---- Exact side. rho~_vc(G) by FFT on the aug mesh (the mesh holds the
+  // product of two wfc-sphere orbitals), augmentation by one GEMM per v.
+  auto k2g = V.swfc_to_rho_view();
+  long ngw = k2g.extent(0);
+  nda::array<ComplexType,2> C(nbnd, ngw);
+  mfobj.get_orbital_set('w', 0, k0, {0, nbnd}, C);
+
+  nda::array<double,1> wG(ngm);
+  for (long g = 0; g < ngm; ++g) {
+    double G2 = gv(g,0)*gv(g,0)+gv(g,1)*gv(g,1)+gv(g,2)*gv(g,2);
+    wG(g) = (G2 > 1e-12) ? (4.0*M_PI/(vol*G2)) : 0.0;   // G=0 dropped: ignore_g0
+  }
+
+  nda::array<ComplexType,1> ur(nnr), uv(nnr), pr(nnr);
+  auto ur3 = nda::reshape(ur, std::array<long,3>{NX,NY,NZ});
+  auto uv3 = nda::reshape(uv, std::array<long,3>{NX,NY,NZ});
+  auto pr3 = nda::reshape(pr, std::array<long,3>{NX,NY,NZ});
+  math::nda::fft<false> Fu(ur3), Fv(uv3), Fp(pr3);
+  auto to_r = [&](long n, nda::array<ComplexType,1>& out,
+                  nda::array_view<ComplexType,3> out3,
+                  math::nda::fft<false>& F) {
+    out() = ComplexType(0.0);
+    for (long g = 0; g < ngw; ++g) { long N = k2g(g); if (N>=0 && N<nnr) out(N) = C(n,g); }
+    F.backward(out3); };
+
+  // FFT-path probe: rho~_vv(G=0) must equal <psi~_v|psi~_v> = sum_g |C(v,g)|^2,
+  // which is computable straight from the coefficients. Catches an FFT scale,
+  // sign, or index-map mistake before it reaches the table.
+  {
+    long ig0 = -1;
+    for (long g = 0; g < ngm; ++g)
+      if (std::abs(gv(g,0))+std::abs(gv(g,1))+std::abs(gv(g,2)) < 1e-12) ig0 = g;
+    utils::check(ig0 >= 0, "paw_thc_vs_exact_eri: G=0 not on rho_g.");
+    to_r(0, uv, uv3, Fv);
+    for (long r = 0; r < nnr; ++r) pr(r) = std::conj(uv(r)) * uv(r);
+    Fp.forward(pr3);
+    ComplexType fft0 = pr(g2fft(ig0));
+    double ref0 = 0.0;
+    for (long g = 0; g < ngw; ++g) ref0 += std::norm(C(0,g));
+    app_log(1, "[erichk] FFT probe: rho~_00(G=0) = {:.8e} (FFT) vs {:.8e} "
+               "(sum_g |C|^2); ratio {:.6f}",
+            std::real(fft0), ref0, ref0 != 0.0 ? std::real(fft0)/ref0 : 0.0);
+  }
+
+  const int NBIN = 10;
+  nda::array<double,2> Dex(nocc, NBIN), Dsm(nocc, NBIN);
+  Dex() = 0.0; Dsm() = 0.0;
+  nda::array<ComplexType,2> rho_sm_c(nbnd, ngm), rho_aug_c(nbnd, ngm);
+  nda::array<ComplexType,2> A(nbnd, N_aug);
+  for (long v = 0; v < nocc; ++v) {
+    to_r(v, uv, uv3, Fv);
+    for (long c = 0; c < nbnd; ++c) {
+      to_r(c, ur, ur3, Fu);
+      for (long r = 0; r < nnr; ++r) pr(r) = std::conj(uv(r)) * ur(r);
+      Fp.forward(pr3);
+      // math::nda::fft normalizes on the FORWARD transform (1/nnr) and leaves
+      // backward unscaled, so pr(G) IS rho~_vc(G) = int conj(psi~_v) psi~_c
+      // e^{-iGr} dr with no further factor. Anchored by the FFT probe above:
+      // at G=0 it reproduces sum_g |C(v,g)|^2 = <psi~_v|psi~_v> exactly.
+      for (long g = 0; g < ngm; ++g) rho_sm_c(c, g) = pr(g2fft(g));
+      for (long la = 0; la < N_aug; ++la)
+        A(c, la) = std::conj(Y(la,v)) * Y(la,c);
+    }
+    nda::blas::gemm(ComplexType(vol), A, eta, ComplexType(0.0), rho_aug_c);
+    for (long c = 0; c < nbnd; ++c) {
+      double de = eig(0,k0,c) - eig(0,k0,v);
+      if (de < 1e-6) continue;
+      double esm = 0.0, eae = 0.0;
+      for (long g = 0; g < ngm; ++g) {
+        esm += wG(g) * std::norm(rho_sm_c(c,g));
+        eae += wG(g) * std::norm(rho_sm_c(c,g) + rho_aug_c(c,g));
+      }
+      int b = (int)std::min((long)NBIN-1, (c*NBIN)/std::max(1L,nbnd));
+      Dsm(v,b) += esm/de;
+      Dex(v,b) += eae/de;
+    }
+  }
+
+  // ---- THC side, through hf_t's exchange with a diagonal, energy-weighted
+  // density matrix restricted to k0 and to one band decile. ignore_g0 so no
+  // gygi finite-size term contaminates the comparison, matching wG(0)=0.
+  auto sS = make_shared_array<array_view_4d_t>(mpi, {nspin,nk_ibz,nbnd,nbnd});
+  hamilt::set_ovlp(mfobj, sS);
+  auto sDm = make_shared_array<array_view_4d_t>(mpi, {nspin,nk_ibz,nbnd,nbnd});
+  auto thc_D = [&](bool aug) {
+    auto pt = methods::make_thc_reader_ptree(nIpts,"","incore","","bdft",
+                                             thresh, mfobj.ecutrho());
+    pt.put("paw_aug", aug); pt.put("paw_isdf_metric","coulomb");
+    pt.put("paw_isdf_tol", isdf_tol); pt.put("paw_onsite", false);
+    methods::thc_reader_t thc(mf_ptr, pt);
+    methods::solvers::hf_t hf(methods::ignore_g0);
+    nda::array<double,2> D(nocc, NBIN); D() = 0.0;
+    for (long v = 0; v < nocc; ++v)
+      for (int b = 0; b < NBIN; ++b) {
+        long lo = (b*nbnd)/NBIN, hi = ((b+1)*nbnd)/NBIN;
+        if (mpi.node_comm.root()) {
+          sDm.local()() = ComplexType(0.0);
+          for (long c = lo; c < hi; ++c) {
+            double de = eig(0,k0,c) - eig(0,k0,v);
+            if (de < 1e-6) continue;
+            sDm.local()(0,k0,c,c) = ComplexType(1.0/de, 0.0);
+          }
+        }
+        mpi.node_comm.barrier();
+        auto sF = make_shared_array<array_view_4d_t>(mpi, {nspin,nk_ibz,nbnd,nbnd});
+        hf.evaluate(sF, sDm.local(), thc, sS.local(), false, true);
+        // hf_t's K carries the 1/N_k Brillouin-zone factor; the exact side
+        // above is a bare (vc|cv), so undo it here. Confirmed by the
+        // CALIBRATION line: without this the smooth ratio comes out at
+        // exactly 1/nkpts (0.124971 on the 8-k LiH fixture).
+        D(v,b) = -std::real(sF.local()(0,k0,v,v)) * (double)mfobj.nkpts();
+      }
+    return D; };
+  auto Dthc_ae = thc_D(true);
+  auto Dthc_sm = thc_D(false);
+
+  // ---- Report. The smooth pair anchors the convention; the AE pair is the
+  // measurement. Cumulative over deciles so the band-count trend is visible.
+  auto row = [&](char const* what, nda::array<double,2> const& Dae,
+                 nda::array<double,2> const& Dsmo) {
+    app_log(1, "[erichk] --- {} : D(v) = sum_c (vc|cv)/(eps_c-eps_v), "
+               "cumulative over band deciles ---", what);
+    app_log(1, "[erichk] {:>9} {:>13} {:>13} {:>10}",
+            "bands<", "AE", "smooth", "AE/smooth");
+    for (int b = 0; b < NBIN; ++b) {
+      double sae = 0.0, ssm = 0.0;
+      for (long v = 0; v < nocc; ++v)
+        for (int bb = 0; bb <= b; ++bb) { sae += Dae(v,bb); ssm += Dsmo(v,bb); }
+      app_log(1, "[erichk] {:9} {:13.6f} {:13.6f} {:10.4f}",
+              ((b+1)*nbnd)/NBIN, sae, ssm,
+              ssm != 0.0 ? sae/ssm : 0.0);
+    } };
+  row("EXACT (reference)", Dex, Dsm);
+  row("THC (as assembled)", Dthc_ae, Dthc_sm);
+
+  double tot_ex = 0.0, tot_sm = 0.0, tot_tae = 0.0, tot_tsm = 0.0;
+  for (long v = 0; v < nocc; ++v)
+    for (int b = 0; b < NBIN; ++b) {
+      tot_ex += Dex(v,b); tot_sm += Dsm(v,b);
+      tot_tae += Dthc_ae(v,b); tot_tsm += Dthc_sm(v,b);
+    }
+  app_log(1, "[erichk] CALIBRATION  THC smooth / exact smooth = {:.6f}  "
+             "(must be ~1: fixes the prefactor and contraction convention; "
+             "any other value invalidates the AE line below)",
+          tot_sm != 0.0 ? tot_tsm/tot_sm : 0.0);
+  app_log(1, "[erichk] MEASUREMENT  THC AE / exact AE = {:.6f}   "
+             "(exact AE {:.6f}, THC AE {:.6f}); excess the augmentation "
+             "should have cancelled but did not = {:.6f} of the smooth excess",
+          tot_ex != 0.0 ? tot_tae/tot_ex : 0.0, tot_ex, tot_tae,
+          (tot_sm - tot_ex) != 0.0 ? (tot_tae - tot_ex)/(tot_sm - tot_ex) : 0.0);
+  REQUIRE(nbnd > 0);
+}
+
+// ===========================================================================
 // qrad table (build_qrad_tab + qrad_interp_at_K, used by the THC build_eta /
 // V_GL / V_LL augmentation) vs the EXACT qrad_at_K (used by evaluate_Q == QE
 // qgm, validated to 1e-10 by paw_aug_q_eval_at_q0). Confirms the interpolated
