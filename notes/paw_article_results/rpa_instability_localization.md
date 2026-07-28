@@ -80,14 +80,72 @@ channel basis — but the two near-cancelling blocks therefore carry very
 differently scaling fidelity as bands grow, and high virtuals carry huge
 projector amplitudes (max|P| ≈ 38, see `jth_proj_amplitude.pdf`).
 
+## 3b. Code-level band scan — V_LL is EXONERATED
+
+`thc_vgl_vll_band_scan` (test_hamilt.cpp) compares the THC V_LL block against the
+direct, non-factorized comp-comp reference, resolved by band decile, on the real
+a=10.05 MF. Two results, both against the hypothesis that motivated it.
+
+**(i) Relative accuracy is FLAT with band index.** `rel@max` is the same in the
+lowest and highest decile at both n=250 and n=500 (~0.29 at production
+tolerance, 4.8e-5 at tight). The joint smooth+aug basis does not represent high
+virtuals any less faithfully than low ones.
+
+**(ii) What grows is the blocks themselves.** Across deciles at n=500:
+max|V_LL| 9.0e-3 → 7.2e-1, max|V_GL| 5.9e-2 → 5.0e+0, max abs err 2.6e-3 →
+2.1e-1 — all ~80x. Driver is visible in the log: max|Pskna| = 3.62 at nbnd=250,
+11.13 at nbnd=500. Projector amplitudes grow with band index (cf.
+jth_proj_amplitude.pdf), |V_LL| follows as ~P^4, and a CONSTANT fractional error
+on a quantity growing 80x gives an absolute error growing 80x. The mechanism is
+a constant-quality representation of a quantity that explodes — not a degrading
+representation.
+
+**(iii) DECISIVE: V_LL is not the culprit.** Run at `isdf_tol=5e-6, thresh=1e-5`
+— the EXACT tolerances of the `tight` RPA run in §2 — the V_LL block is accurate
+to rel 4.8e-5 / abs 3.4e-5 (vs 0.29 / 2.1e-1 at production tolerance, a ~4-order
+improvement). Yet the RPA at those identical settings still gave E_c = −0.58261,
+increment −149.4 mHa against ABINIT's −6.0. **V_LL is represented accurately
+precisely where the blow-up persists undiminished, so its representation error
+is not the cause.**
+
+Corollary worth noting separately: at PRODUCTION tolerance the V_LL block does
+carry a ~29% relative error (abs 2.1e-1 at the top decile). That is a genuine
+accuracy defect in the production settings — it just is not what drives the
+RPA instability, since removing it changes nothing.
+
+**Remaining suspect: V_GL.** It is ~7x larger than V_LL at high band index
+(5.0 vs 0.72 at the top decile), so a relative error an order of magnitude
+smaller than V_LL's would still dominate. No direct reference for it exists yet.
+
 ## 4. Recommended next step (code-level, not another sweep)
 
-Every exposed toml knob has been swept. Compare CoQui's assembled augmented pair
-density ρ_mn(G) = ρ̃_mn(G) + Σ_ij Q_ij(G) P*_mi P_nj against the same quantity
-built directly (non-factorized) from the same h5, for a few (m,n) at large band
-index. The THC form is algebraically equivalent only if the factorization is
-exact; the open question is whether the joint smooth+aug basis can represent the
-near-cancellation at high band index, where each block is ~400× the residual.
+Superseded by §3b, which answered the question it posed: the joint smooth+aug
+basis CAN represent the blocks accurately (V_LL to 5e-5 relative at tight
+tolerance), and doing so does not fix the RPA. The next step is a direct
+reference for **V_GL**, the only block still unverified and the largest one at
+high band index.
+
+Constructing it is harder than the V_LL reference, and the asymmetry is the
+reason it was not done first. V_LL is a pure one-center object, so
+`compute_paw_deeq(V_comp)` contracted with the projectors captures it entirely.
+The V_GL cross term has two pieces:
+  (a) band i's augmentation charge against V[ρ_smooth] — available the same way,
+      as `compute_paw_deeq(nii, V_smooth_r)` contracted with projectors;
+  (b) band i's SMOOTH pair density against V[ρ_comp] — needs
+      ⟨ψ̃_i|V_comp(r)|ψ̃_i⟩ evaluated on the real-space grid, which the deeq
+      machinery does not provide.
+Both must be derived against what `hf_t` actually assembles for the
+`paw_vgl=true` path (thc_reader_t.hpp:916-960, the V_GL/V_LG GEMMs and their
+stitch blocks) before coding — a wrong split would silently produce a
+plausible-but-meaningless reference, which is exactly the failure mode this
+investigation has already hit three times.
+
+Two traps recorded for whoever does it. (1) `compute_paw_deeq` expects the local
+potential on the DENSE aug mesh (`nnr_aug`); `thc_vgl_vll_split` passes the
+smooth mesh and is only correct because its QE fixture has both meshes equal —
+on an ABINIT MF they are 18³ vs 48³ and the short array yields an all-NaN deeq.
+(2) Report ABSOLUTE error as primary: relative error against near-zero elements
+produced apparent 0.27–16 discrepancies here that were 1e-8 in absolute terms.
 
 ## Reproduction
 
