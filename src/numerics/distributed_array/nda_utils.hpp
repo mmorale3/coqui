@@ -41,6 +41,12 @@
 #include "mpi3/communicator.hpp"
 #include "mpi3/request.hpp"
 
+// MPIX_Query_cuda_support: the only portable way to ask whether this MPI can be
+// handed device pointers. Needs mpi.h first, hence its position here.
+#if __has_include(<mpi-ext.h>)
+#include <mpi-ext.h>
+#endif
+
 namespace math::nda 
 {
 
@@ -722,12 +728,13 @@ namespace detail
 /**
  * Backend for the DEVICE path of redistribute_alltoallv, from
  * COQUI_REDIST_DEVICE (read once, on first use):
- *   0  host staging (default): pack sub-blocks on device, bulk D2H, host
- *      MPI_Alltoallv, H2D, unpack on device.
+ *   0  host staging: pack sub-blocks on device, bulk D2H, host MPI_Alltoallv,
+ *      H2D, unpack on device.
  *   1  device-direct: pairwise rounds of CUDA-aware MPI on device buffers.
- * An environment knob rather than an input option while the two are being
- * compared; the device-direct path becomes the default once the kp222/kp444
- * matrix has been re-run against it.
+ * Unset, the default is 1 whenever the MPI reports device-pointer support and 0
+ * otherwise. The knob stays as an escape hatch (and to A/B the two paths); it
+ * is deliberately an environment variable rather than an input option, since it
+ * selects a transport rather than any physics.
  */
 /**
  * Byte budget for one staging buffer of the device-direct path
@@ -749,16 +756,41 @@ inline std::size_t redistribute_chunk_bytes()
   return bytes;
 }
 
+/**
+ * Whether this MPI can be handed device pointers. Both OpenMPI and MPICH answer
+ * through the MPIX extension; when the query is not available the answer has to
+ * be "no", since passing device memory to an MPI without support for it faults
+ * inside the send.
+ */
+inline bool mpi_supports_device_pointers()
+{
+#if defined(ENABLE_DEVICE) && defined(MPIX_CUDA_AWARE_SUPPORT) && MPIX_CUDA_AWARE_SUPPORT
+  static const bool ok = (MPIX_Query_cuda_support() == 1);
+  return ok;
+#else
+  return false;
+#endif
+}
+
 inline int redistribute_device_mode()
 {
   // Reported once, so a log always says which path a run took (a mistyped
-  // variable would otherwise look exactly like the default).
+  // variable, or an MPI without device support, would otherwise be invisible).
   static const int mode = []() {
     const char* v = std::getenv("COQUI_REDIST_DEVICE");
-    int m = (v == nullptr) ? 0 : int(std::strtol(v, nullptr, 10));
-    if (m != 0)
+    const bool cuda_aware = mpi_supports_device_pointers();
+    int m = (v != nullptr) ? int(std::strtol(v, nullptr, 10)) : (cuda_aware ? 1 : 0);
+    if (m != 0) {
       app_log(2, "  redistribute (DEVICE): direct device-to-device exchange, "
                  "chunk budget {:.0f} MB", double(redistribute_chunk_bytes())/(1024.0*1024.0));
+      if (not cuda_aware)
+        app_warning("redistribute (DEVICE): device-direct exchange requested but this MPI does "
+                    "not report device-pointer support; expect a fault inside MPI. Unset "
+                    "COQUI_REDIST_DEVICE to stage through the host instead.");
+    } else if (not cuda_aware) {
+      app_log(2, "  redistribute (DEVICE): staging through host memory; this MPI does not "
+                 "report device-pointer support.");
+    }
     return m;
   }();
   return mode;
