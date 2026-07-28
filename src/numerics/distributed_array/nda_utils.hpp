@@ -24,8 +24,12 @@
 
 #include <utility>
 #include <tuple>
+#include <cstdlib>
+#include <optional>
 #include "configuration.hpp"
-#include "utilities/check.hpp" 
+#include "utilities/check.hpp"
+#include "utilities/freemem.h"
+#include "IO/app_loggers.h"
 #include "nda/nda.hpp"
 #include "nda/tensor.hpp"
 #include "nda/device.hpp"
@@ -712,7 +716,218 @@ void redistribute_no_order(Arr1_t& A, Arr2_t& B, get_value_t<Arr1_t> a = 1, get_
 
 }
 
-template<DistributedArray Arr1_t, DistributedArray Arr2_t> 
+namespace detail
+{
+
+/**
+ * Backend for the DEVICE path of redistribute_alltoallv, from
+ * COQUI_REDIST_DEVICE (read once, on first use):
+ *   0  host staging (default): pack sub-blocks on device, bulk D2H, host
+ *      MPI_Alltoallv, H2D, unpack on device.
+ *   1  device-direct: pairwise rounds of CUDA-aware MPI on device buffers.
+ * An environment knob rather than an input option while the two are being
+ * compared; the device-direct path becomes the default once the kp222/kp444
+ * matrix has been re-run against it.
+ */
+/**
+ * Byte budget for one staging buffer of the device-direct path
+ * (COQUI_REDIST_CHUNK_MB, default 1024 MB). Two buffers are held per call, so
+ * this bounds the extra device memory at twice the budget regardless of the
+ * tensor size or the rank count.
+ */
+inline std::size_t redistribute_chunk_bytes()
+{
+  static const std::size_t bytes = []() -> std::size_t {
+    double mb = 1024.0;
+    const char* v = std::getenv("COQUI_REDIST_CHUNK_MB");
+    if (v != nullptr) {
+      double x = std::strtod(v, nullptr);
+      if (x > 0.0) mb = x;
+    }
+    return std::size_t(mb * 1024.0 * 1024.0);
+  }();
+  return bytes;
+}
+
+inline int redistribute_device_mode()
+{
+  // Reported once, so a log always says which path a run took (a mistyped
+  // variable would otherwise look exactly like the default).
+  static const int mode = []() {
+    const char* v = std::getenv("COQUI_REDIST_DEVICE");
+    int m = (v == nullptr) ? 0 : int(std::strtol(v, nullptr, 10));
+    if (m != 0)
+      app_log(2, "  redistribute (DEVICE): direct device-to-device exchange, "
+                 "chunk budget {:.0f} MB", double(redistribute_chunk_bytes())/(1024.0*1024.0));
+    return m;
+  }();
+  return mode;
+}
+
+/**
+ * Device-direct all-to-all for redistribute_alltoallv.
+ *
+ * The host-staging path moves the whole local block through host memory (D2H,
+ * host MPI_Alltoallv, H2D). With four redistributes per SCF iteration on
+ * ~22 GB/rank tensors that is the single largest cost in the GPU port. Here
+ * the peers are walked in a fixed pairwise schedule --- in round r every rank
+ * sends to (rank+r) and receives from (rank-r) --- and the device buffers are
+ * handed straight to CUDA-aware MPI.
+ *
+ * Only one peer block is in flight, so the extra device memory is bounded by
+ * the chunk budget instead of by the tensor size. That is what killed the
+ * earlier attempt (0e8fc80): it kept full-size device staging buffers, which
+ * doubled device memory and ran the card out. Blocks larger than the budget
+ * are split along their slowest dimension; sender and receiver describe the
+ * same global index box, so both derive the same shape and the same split with
+ * no extra metadata exchange. Chunking also keeps every MPI count well inside
+ * the int range that mpi3 (and MPI-3 itself) imposes.
+ *
+ * The staging buffers come from the shared device pool when one is reserved
+ * (utils::device_pool_guard), so the two allocations per call are free after
+ * the first iteration; without a pool they are two raw cudaMallocs per call
+ * rather than the O(n_ranks) the host path makes.
+ *
+ * Implements the a=1, b=0 case only --- the sole case redistribute_alltoallv
+ * itself supports --- and assumes the caller has already zeroed B.
+ */
+template<long rank, typename comm_t, typename Aloc_t, typename Bloc_t>
+void redistribute_pairwise_device(comm_t& comm, Aloc_t const& Aloc, Bloc_t& Bloc,
+    std::vector<std::vector<::nda::range>> const& subblocks_from_A,
+    std::vector<std::vector<::nda::range>> const& subblocks_from_B,
+    std::vector<bool> const& ovlps_from_A,
+    std::vector<bool> const& ovlps_from_B)
+{
+  using value_t = typename std::decay_t<Bloc_t>::value_type;
+  constexpr MEMORY_SPACE MEM_A = memory::get_memory_space<std::decay_t<Aloc_t>>();
+  constexpr MEMORY_SPACE MEM_B = memory::get_memory_space<std::decay_t<Bloc_t>>();
+
+  const long mpi_size = comm.size();
+  const long mpi_rank = comm.rank();
+
+  // The shared index box with a peer, as extents of the sub-block ranges.
+  auto box_shape = [](std::vector<::nda::range> const& sub) {
+    std::array<long,rank> s;
+    for (long r = 0; r < rank; ++r) s[r] = sub[r].size();
+    return s;
+  };
+  auto n_elem = [](std::array<long,rank> const& s) {
+    long n = 1; for (long r = 0; r < rank; ++r) n *= s[r]; return n;
+  };
+  auto inner_elem = [](std::array<long,rank> const& s) {
+    long n = 1; for (long r = 1; r < rank; ++r) n *= s[r]; return n;
+  };
+
+  const long budget = std::max(1l, long(redistribute_chunk_bytes()/sizeof(value_t)));
+
+  // Rows of the slowest dimension per chunk (at least one, even if a single
+  // row exceeds the budget), and the resulting number of chunks.
+  auto rows_per_chunk = [&](std::array<long,rank> const& s) -> long {
+    long inner = inner_elem(s);
+    if (s[0] == 0 or inner == 0) return 0;
+    return std::clamp(budget/inner, 1l, s[0]);
+  };
+  auto n_chunks = [&](std::array<long,rank> const& s) -> long {
+    long rows = rows_per_chunk(s);
+    return (rows == 0) ? 0 : (s[0] + rows - 1)/rows;
+  };
+  // Sub-block ranges narrowed to rows [r0,r1) of the slowest dimension.
+  auto chunk_ranges = [](std::vector<::nda::range> const& sub, long r0, long r1) {
+    auto rr = sub;
+    rr[0] = ::nda::range(sub[0].first()+r0, sub[0].first()+r1);
+    return rr;
+  };
+
+  long send_buf_sz = 0, recv_buf_sz = 0;
+  for (long p = 0; p < mpi_size; ++p) {
+    if (p == mpi_rank) continue;  // the self block is copied device-to-device
+    if (ovlps_from_A[p]) {
+      auto s = box_shape(subblocks_from_A[p]);
+      send_buf_sz = std::max(send_buf_sz, rows_per_chunk(s)*inner_elem(s));
+    }
+    if (ovlps_from_B[p]) {
+      auto s = box_shape(subblocks_from_B[p]);
+      recv_buf_sz = std::max(recv_buf_sz, rows_per_chunk(s)*inner_elem(s));
+    }
+  }
+
+  memory::pooled_array<MEM_A,value_t,1> send_buf(std::array<long,1>{send_buf_sz});
+  memory::pooled_array<MEM_B,value_t,1> recv_buf(std::array<long,1>{recv_buf_sz});
+  // Both sides stage through a C-ordered view of the shared box, so the linear
+  // order of a packed chunk agrees regardless of the local arrays' layouts.
+  using send_view_t = memory::array_view<MEM_A,value_t,int(rank),::nda::C_layout>;
+  using recv_view_t = memory::array_view<MEM_B,value_t,int(rank),::nda::C_layout>;
+
+  for (long r = 0; r < mpi_size; ++r) {
+    const long sp = (mpi_rank + r) % mpi_size;              // send to
+    const long rp = (mpi_rank - r + mpi_size) % mpi_size;   // receive from
+
+    if (r == 0) {
+      if (ovlps_from_A[mpi_rank]) {
+        utils::check(ovlps_from_B[mpi_rank], "redistribute_pairwise_device: self block mismatch.");
+        get_sub_matrix<rank>(Bloc,subblocks_from_B[mpi_rank]) =
+            get_sub_matrix<rank>(Aloc,subblocks_from_A[mpi_rank]);
+      }
+      continue;
+    }
+
+    std::array<long,rank> ss{}, rs{};
+    long n_send_chunks = 0, n_recv_chunks = 0, send_rows = 0, recv_rows = 0;
+    if (ovlps_from_A[sp]) {
+      ss = box_shape(subblocks_from_A[sp]);
+      send_rows = rows_per_chunk(ss);
+      n_send_chunks = n_chunks(ss);
+    }
+    if (ovlps_from_B[rp]) {
+      rs = box_shape(subblocks_from_B[rp]);
+      recv_rows = rows_per_chunk(rs);
+      n_recv_chunks = n_chunks(rs);
+    }
+
+    // Chunk c of a given ordered pair is the same message on both sides, so
+    // posting the receive before blocking on the send keeps every rank ahead
+    // of its partner's send and the cycle of pairwise exchanges cannot stall.
+    for (long c = 0, nc = std::max(n_send_chunks,n_recv_chunks); c < nc; ++c) {
+
+      std::optional<boost::mpi3::request> req_recv;
+      std::array<long,rank> rcs = rs;
+      long r0 = 0, r1 = 0;
+      if (c < n_recv_chunks) {
+        r0 = c*recv_rows;
+        r1 = std::min(rs[0], r0+recv_rows);
+        rcs[0] = r1-r0;
+        req_recv = comm.ireceive_n(recv_buf.data(), n_elem(rcs), int(rp), int(c));
+      }
+
+      if (c < n_send_chunks) {
+        const long s0 = c*send_rows;
+        const long s1 = std::min(ss[0], s0+send_rows);
+        std::array<long,rank> scs = ss;
+        scs[0] = s1-s0;
+        send_view_t sview(scs, send_buf.data());
+        sview = get_sub_matrix<rank>(Aloc,chunk_ranges(subblocks_from_A[sp],s0,s1));
+        // The pack is a kernel/async copy on the default stream; MPI reads the
+        // buffer outside that stream, so it has to be complete first.
+        utils::device_sync();
+        comm.isend_n(send_buf.data(), n_elem(scs), int(sp), int(c)).wait();
+      }
+
+      if (c < n_recv_chunks) {
+        req_recv->wait();
+        recv_view_t rview(rcs, recv_buf.data());
+        get_sub_matrix<rank>(Bloc,chunk_ranges(subblocks_from_B[rp],r0,r1)) = rview;
+        // The unpack reads recv_buf asynchronously on the default stream while
+        // the next chunk's receive would write it from outside that stream, so
+        // the buffer can only be handed back to MPI once the unpack is done.
+        utils::device_sync();
+      }
+    }
+  }
+}
+
+}
+
+template<DistributedArray Arr1_t, DistributedArray Arr2_t>
 void redistribute_alltoallv(Arr1_t& A, Arr2_t& B, get_value_t<Arr1_t> a = 1, get_value_t<Arr2_t> b = 0) {
   using value_t = typename std::decay_t<Arr2_t>::Array_t::value_type;
   using local_Arr1_t = typename std::decay_t<Arr1_t>::Array_t::regular_type;
@@ -829,11 +1044,21 @@ void redistribute_alltoallv(Arr1_t& A, Arr2_t& B, get_value_t<Arr1_t> a = 1, get
   }
 
 
-  size_t sz_buf_A = std::accumulate(A_counts.begin(), A_counts.end(), 0, std::plus<>());
-  size_t sz_buf_B = std::accumulate(B_counts.begin(), B_counts.end(), 0, std::plus<>());
+  size_t sz_buf_A = std::accumulate(A_counts.begin(), A_counts.end(), size_t{0}, std::plus<>());
+  size_t sz_buf_B = std::accumulate(B_counts.begin(), B_counts.end(), size_t{0}, std::plus<>());
 
   utils::check(sz_buf_A == Aloc.size(), "A Size mismatch.");
   utils::check(sz_buf_B == Bloc.size(), "B Size mismatch.");
+
+  // Device arrays can skip the host round trip entirely; see
+  // detail::redistribute_pairwise_device.
+  if constexpr ( ::nda::mem::have_device_compatible_addr_space<local_Arr1_t,local_Arr2_t> ) {
+    if (detail::redistribute_device_mode() != 0) {
+      detail::redistribute_pairwise_device<rank>(*comm, Aloc, Bloc,
+          subblocks_from_A, subblocks_from_B, ovlps_from_A, ovlps_from_B);
+      return;
+    }
+  }
 
   std::vector<value_t> buffer_A(sz_buf_A);
   std::vector<value_t> buffer_B(sz_buf_B);

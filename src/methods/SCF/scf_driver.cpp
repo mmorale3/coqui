@@ -20,11 +20,14 @@
 
 
 
+#include <optional>
+
 #include "nda/nda.hpp"
 #include "numerics/distributed_array/nda.hpp"
 #include "numerics/shared_array/nda.hpp"
 
 #include "IO/app_loggers.h"
+#include "utilities/device_pool.h"
 
 #include "methods/ERI/mb_eri_context.h"
 #include "methods/tools/chkpt_utils.h"
@@ -122,6 +125,20 @@ auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_ax
       chkpt::read_input_iterations(mb_state.coqui_prefix+".mbpt.h5");
   long output_iter_init = mb_state.mbpt_iter+1;
   long output_iter = output_iter_init;
+
+  // Reserve the shared device pool for the duration of the SCF loop, so the
+  // scratch that recurs every iteration (the redistribute staging buffers
+  // above all) is served without a cudaMalloc/cudaFree per use. It is taken
+  // here rather than at startup because ERI/THC construction sizes its own
+  // blocking from the free device memory it observes and allocates through the
+  // raw allocator; by now that is done. Inert unless COQUI_DEVICE_POOL_GB is
+  // set, and released when the loop ends.
+  std::optional<utils::device_pool_guard> pool_guard;
+  if constexpr (MEM != HOST_MEMORY) {
+    if (std::size_t pool_bytes = utils::device_pool_size_from_env(); pool_bytes > 0)
+      pool_guard.emplace(pool_bytes, "scf");
+  }
+
   // start SCF iteration
   do {
     app_log(1, "\n** Iteration # {} **", output_iter);
@@ -226,6 +243,7 @@ auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_ax
     Timer.stop("WRITE");
     output_iter++;
   } while (output_iter<output_iter_init+niter and not converged());
+  pool_guard.reset();
   Timer.stop("SCF_TOTAL");
 
   app_log(2, "\n  Dyson-SCF timers");
