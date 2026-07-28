@@ -4101,9 +4101,20 @@ TEST_CASE("thc_vgl_vll_band_scan", "[hamilt][thc][bandscan][!benchmark]")
              + recv(2,0)*(recv(0,1)*recv(1,2)-recv(0,2)*recv(1,1));
   double vol=(2.0*M_PI)*(2.0*M_PI)*(2.0*M_PI)/std::abs(det_B);
 
+  // PHYSICAL occupations. thc_vgl_vll_split uses a synthetic 0.5+0.3cos pattern,
+  // which is harmless at 16 bands but declares ~0.65 occupancy on EVERY band —
+  // at nbnd=250/500 that is a density ~1000x the physical one, and the resulting
+  // one-center density makes compute_paw_deeq overflow (max|dirLL| ~ 1e241).
+  // The band-index probe does not need a synthetic n_ii: dirLL(i) takes its band
+  // dependence from the projectors P_i, not from the occupations, so the
+  // physical density gives a physical V_comp and still probes every band.
+  auto occ = mfobj.occ();
   nda::array<ComplexType,3> nii(nspin,nk_ibz,nbnd);
-  for(long s=0;s<nspin;++s)for(long k=0;k<nk_ibz;++k)for(long n=0;n<nbnd;++n)
-    nii(s,k,n)=ComplexType(0.5+0.3*std::cos(1.3*n+0.7*k+0.2*s),0.0);
+  double ntot=0.0;
+  for(long s=0;s<nspin;++s)for(long k=0;k<nk_ibz;++k)for(long n=0;n<nbnd;++n){
+    nii(s,k,n)=ComplexType(occ(s,k,n),0.0); ntot+=occ(s,k,n); }
+  app_log(1,"[band scan] sum of occupations over (s,k,n) = {:.4f} (nelec={:.2f})",
+          ntot/std::max(1L,nk_ibz), mfobj.nelec());
 
   // ρ_smooth, ρ_tot → ρ_comp → V_comp(r), exactly as in thc_vgl_vll_split.
   auto rho_sm=hamilt::paw::build_total_density_r(mpi,V,npol,fft_mesh,recv,k2g,
