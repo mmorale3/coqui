@@ -202,6 +202,81 @@ and the largest at high band index (5.0 vs V_LL's 0.72 at the top decile).
 `paw_thc_vs_exact_eri` subsumes it — it checks the whole assembled ERI,
 V_GL included, against the exact answer rather than block by block.
 
+## 5. The q-sign hypothesis (OPEN — test queued)
+
+`paw_thc_vs_exact_eri` at **q = 0**, Si jth_with_d:
+
+| case | calibration (THC sm / exact sm) | **THC AE / exact AE** |
+|---|---|---|
+| a=10.05, nbnd=250 | 1.000000 | **1.000001** |
+| a=10.05, nbnd=500 | 0.999996 | **0.999996** |
+| a=10.55, nbnd=500 | 0.999998 | **0.999998** |
+
+Every band decile matches to 5–6 digits. **The assembled THC ERI is exact at
+q = 0, including at 500 bands, at both volumes.** V_GL, V_LL and the smooth
+ISDF all reproduce the exact AE answer there. That does NOT close the case —
+and combined with one older datum it becomes close to a deduction that the
+defect lives at q != 0:
+
+- `paw_aug=false` at n=500 gives E_c = −1.36 Ha, ~3x the correct −0.43, which
+  is exactly the factor the smooth oscillators are too large by (§3c). So the
+  RPA machinery converts oscillator strength into E_c faithfully; it is not
+  the solver.
+- With augmentation on, E_c = −0.596, i.e. the augmentation removes 83% of
+  that excess (§3c).
+- But the ERI test says the augmentation is **100%** effective at q = 0.
+
+E_c is dominated by the 63 q != 0 points, so an augmentation that is fully
+effective at q = 0 and 83% effective overall must be losing ground at q != 0.
+The q = 0 table above also shows WHY it cannot be otherwise: the
+Coulomb-weighted q = 0 sum shows only a 7% smooth excess (AE/smooth 0.9293 at
+n=500), not the 3x the sum rule shows at G = 0, because `ignore_g0` zeroes
+precisely the G -> 0 region where the excess concentrates. At q != 0 that
+region is present, non-singular, and carries the largest Coulomb weight in
+the problem.
+
+`augment_thc_with_paw` rebuilds the augmentation channels at every q,
+
+    q_cart = { -Qpts_cart(iq, 0), -Qpts_cart(iq, 1), -Qpts_cart(iq, 2) }
+
+and the sign is justified in `build_eta_on_rho_g_at_q`'s header as chosen "to
+match the Coulomb kernel convention used in V_GG (thc.icc evaluates the kernel
+at \|G - Q_thc\|, so q_cart = -Q_thc(iq) here)". **That criterion cannot
+constrain what it is being used to justify.** \|G - Q\| is a magnitude; the
+Coulomb kernel is identical for K and -K. eta is not: it carries
+Y_lp(K_hat) and the structure factor e^{-iK.tau_a}, so eta^q(G) at K = G - Q
+and at K = G + Q are different complex numbers. The sign was fixed against a
+quantity blind to it.
+
+A wrong sign here would have exactly the fingerprint that has resisted every
+sweep:
+
+- **exact at q=0** (the sign is moot there) — consistent with 1.000001 above;
+- **invisible on the LiH 2x2x2 fixture**, where q and -q differ by a
+  reciprocal lattice vector, so the two conventions agree identically. The
+  q!=0 LiH check reads 1.000012 and is therefore NOT evidence against this;
+- **corrupts V_GL at general q** on the 4x4x4 Si mesh (V_LL is more forgiving:
+  the phases cancel on its diagonal), which is the block estimated at ~10%
+  deficient and the only one never checked;
+- **band-count independent as a FRACTION**, matching the constant 84.5% /
+  82.2% cancellation at n=250 / n=500;
+- **tolerance independent**, matching the immunity to thresh and paw_isdf_tol;
+- **absent for NC** (no augmentation at all).
+
+Test: `paw_thc_vs_exact_eri` with COQUI_ERICHK_K2 != 0 on the Si 4x4x4 mesh,
+run at BOTH COQUI_ERICHK_QSIGN = +1 and -1. The exact reference is built
+independently of the THC for each sign, and the completeness gate
+sum_c |rho_{v k0, c kc}(q+G)|^2 <= 1 (exact at any q, evaluated over every G of
+rho_g) says which sign is physical. If the THC matches the reference built
+with the UNPHYSICAL sign, that is the defect. On LiH the two signs separate
+cleanly — gate 0.990652 / calibration 1.000049 for +1 versus gate 1.014059 /
+calibration 1.323530 for -1 — so the discriminator works; it simply has no
+purchase on a 2x2x2 mesh.
+
+Status: queued, not yet run. Do not record this as the cause until the Si
+q != 0 numbers are in — the same "everything fits" reasoning has been wrong
+here before (§3b, §3c).
+
 Constructing it is harder than the V_LL reference, and the asymmetry is the
 reason it was not done first. V_LL is a pure one-center object, so
 `compute_paw_deeq(V_comp)` contracted with the projectors captures it entirely.
