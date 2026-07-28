@@ -184,20 +184,26 @@ namespace methods {
                     iq, wn, log_det, tr_PiZ.real());
           }
 
-          // Conditioning trace. E_c = Tr(Pi*Z) + ln|det(I - Pi*Z)|, and the two
-          // terms cancel to leading order: for SMALL Pi*Z,
-          // ln det(I - Pi*Z) = -Tr(Pi*Z) - Tr((Pi*Z)^2)/2 - ..., so their sum
-          // is second order and E_c is a perturbative quantity. That stops
-          // being true once eigenvalues of Pi*Z approach 1, where ln det is
-          // dominated by ln(1 - lambda) and the response to a small change in
-          // Pi is exponential rather than quadratic. `resid` below is exactly
-          // that sum, so resid / (Tr(Pi*Z)^2 / 2) ~ 1 means well conditioned
-          // and >> 1 means the (q, w) block is running into the singularity.
+          // E_c = Tr(Pi*Z) + ln|det(I - Pi*Z)|, and the two terms cancel to
+          // leading order: with eigenvalues lambda_i of Pi*Z (all <= 0 for a
+          // negative semi-definite Pi against a PSD Z),
+          //     resid = sum_i [ lambda_i + ln(1 - lambda_i) ] ~ -sum_i lambda_i^2 / 2
+          // so this (q, w) block's contribution to E_c is second order.
           //
-          // This is the regime the PAW nbnd=500 runs appear to be in: their
-          // polarizability TRACE differs from the correct one by 7.6%
-          // (measured independently by paw_thc_vs_exact_eri) while E_c differs
-          // by 220%, which no perturbative sensitivity can produce.
+          // The ratio below is therefore
+          //     |resid| / (Tr^2/2) ~ sum lambda_i^2 / (sum lambda_i)^2 = 1/n_eff
+          // i.e. an INVERSE PARTICIPATION RATIO: how few modes of Pi*Z carry
+          // the block. It is NOT a distance to the ln(1 - lambda) singularity
+          // (an earlier revision of this comment claimed it was; measurement
+          // said otherwise). Small means the weight is spread over many modes,
+          // ~1 means one or two modes dominate. The near-singular case is
+          // caught separately and directly by the log_det < 0 / tr > 0 test
+          // above, which is exact rather than indicative.
+          //
+          // Measured on Si jth_with_d a=10.05: 2.21e-02 at nbnd=250 and
+          // 4.65e-01 at nbnd=500, so the n=500 spectrum is dominated by ~2
+          // modes where n=250 spreads over ~45 -- while neither is anywhere
+          // near the singularity.
           double resid = tr_PiZ.real() + log_det;
           double quad  = 0.5 * tr_PiZ.real() * tr_PiZ.real();
           if (dA_PQ.communicator()->root())
@@ -229,12 +235,14 @@ namespace methods {
         double cw[2] = {cond_worst, std::abs(cond_worst_resid)};
         dPi_wqPQ.communicator()->all_reduce_in_place_n(cw, 2, mpi3::max<>{});
         if (mpi->comm.root())
-          app_log(2, "  RPA conditioning: worst sum/(Tr^2/2) = {:.4e} over all "
-                     "(q, w); largest |Tr(Pi*Z) + ln|det||= {:.6e} at iq={} "
-                     "iw={} (Tr there {:.6e}). Values ~1 mean E_c is the usual "
-                     "second-order cancellation; >> 1 means eigenvalues of "
-                     "Pi*Z are approaching 1 and E_c is exponentially "
-                     "sensitive to Pi.",
+          app_log(2, "  RPA spectrum: max 1/n_eff = |resid|/(Tr^2/2) = {:.4e} "
+                     "over all (q, w) [inverse participation ratio of Pi*Z: "
+                     "small = weight spread over many modes, ~1 = one or two "
+                     "dominate]. Largest single-block |Tr(Pi*Z)+ln|det|| = "
+                     "{:.6e} at iq={} iw={} (Tr there {:.6e}). NOTE the two "
+                     "are maxima over DIFFERENT blocks. Proximity to the "
+                     "ln(1-lambda) singularity is not measured here -- the "
+                     "exact test for that is the log_det<0 / Tr>0 warning.",
                   cw[0], cond_worst_resid, cond_worst_iq, cond_worst_iw,
                   cond_worst_tr);
       }
