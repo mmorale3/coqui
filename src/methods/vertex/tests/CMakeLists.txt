@@ -1,3 +1,9 @@
+# ctest's default 1500 s TIMEOUT is too tight for this directory: test_methods_vertex alone
+# takes ~1806 s uncontended on an M-series laptop, so the suite reports a SPURIOUS failure
+# with the stock timeout (and worse on anything slower, or when another job shares the box).
+# Raise it here rather than per-test so a slow machine does not report phantom regressions.
+set(COQUI_VERTEX_TEST_TIMEOUT 5400 CACHE STRING "ctest timeout (s) for the vertex tests")
+
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${PROJECT_UNIT_TEST_DIR})
 
@@ -8,7 +14,8 @@ target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield eri_li
                       vertex_lib gw_lib scf_lib)
 
 add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
-set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR})
+set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
+                    TIMEOUT ${COQUI_VERTEX_TEST_TIMEOUT})
 
 # ISDF-Vertex Phase 1c: Sigma^C (G3W2) kernel tests
 set(TEST_ID methods_vertex_sigma)
@@ -18,7 +25,8 @@ target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield eri_li
                       vertex_lib gw_lib scf_lib)
 
 add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
-set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR})
+set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
+                    TIMEOUT ${COQUI_VERTEX_TEST_TIMEOUT})
 
 # ISDF-Vertex Phase 3: conservation validation -- Sigma^C and Pi^C are the two cuts of
 # ONE Phi_2^C:  Tr[Sigma^C G] + Tr[Pi^C W] = 0  (notes/conservation_validation.md)
@@ -29,7 +37,8 @@ target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield eri_li
                       vertex_lib gw_lib scf_lib)
 
 add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
-set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR})
+set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
+                    TIMEOUT ${COQUI_VERTEX_TEST_TIMEOUT})
 
 # ISDF-Vertex Phase 2: C = empty set reproduces plain scGW bit-for-bit (primary gate)
 set(TEST_ID methods_vertex_noop)
@@ -39,7 +48,8 @@ target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield eri_li
                       vertex_lib gw_lib scf_lib)
 
 add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
-set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR})
+set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
+                    TIMEOUT ${COQUI_VERTEX_TEST_TIMEOUT})
 
 # ISDF-Vertex Refinement 2: secondary ISDF basis + Option-A downfold
 # (notes/refinement2_optionA.md): transfer algebra, no-leak, secondary-vs-global,
@@ -51,7 +61,8 @@ target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield eri_li
                       vertex_lib gw_lib scf_lib)
 
 add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
-set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR})
+set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
+                    TIMEOUT ${COQUI_VERTEX_TEST_TIMEOUT})
 
 # ISDF-Vertex: IBZ k-point symmetry (notes/vertex_ibz_symmetry.md): leakage
 # diagnostic, the sym-vs-nosym gold check, the star-weighted conservation identity
@@ -63,7 +74,8 @@ target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield eri_li
                       vertex_lib gw_lib scf_lib)
 
 add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
-set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR})
+set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
+                    TIMEOUT ${COQUI_VERTEX_TEST_TIMEOUT})
 
 # ISDF-Vertex Refinement 2: W-bar iteration cache (notes/wbar_cache.md): the secondary
 # path caches the downfolded rung at update_w time so the scf driver frees dW
@@ -76,7 +88,8 @@ target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield eri_li
                       vertex_lib gw_lib scf_lib)
 
 add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
-set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR})
+set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
+                    TIMEOUT ${COQUI_VERTEX_TEST_TIMEOUT})
 
 # ISDF-Vertex: Wannier-projector generalization of the subspace C
 # (notes/wannier_projector_theory.md): degenerate-U bit-identity vs the window path,
@@ -90,7 +103,8 @@ target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield eri_li
                       vertex_lib gw_lib scf_lib embed_lib)
 
 add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
-set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR})
+set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
+                    TIMEOUT ${COQUI_VERTEX_TEST_TIMEOUT})
 
 # Vertex parallelization MILESTONE 1, item #1: the W-redistribution round-trip
 # (notes/vertex_parallelization_M1.md; analysis section 4.2 #4). dW on the RPA (q,t,P,Q)
@@ -103,7 +117,8 @@ target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield eri_li
                       vertex_lib gw_lib scf_lib)
 
 add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
-set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR})
+set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
+                    TIMEOUT ${COQUI_VERTEX_TEST_TIMEOUT})
 
 # Vertex parallelization MILESTONE 1, item #2: rank-cap-lift smoke + rank-invariance at
 # the kernel entry point (notes/vertex_parallelization_M1.md; analysis section 4.2 #1/#2).
@@ -116,7 +131,8 @@ target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield eri_li
                       vertex_lib gw_lib scf_lib)
 
 add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
-set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR})
+set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
+                    TIMEOUT ${COQUI_VERTEX_TEST_TIMEOUT})
 
 # Vertex parallelization Impl 2: DISTRIBUTED downfold of dW (no full Np^2 gather)
 # (notes/vertex_parallelization_v2_plan.md section 6b). fold_dW_distributed folds the RPA
@@ -131,7 +147,8 @@ target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield eri_li
                       vertex_lib gw_lib scf_lib)
 
 add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
-set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR})
+set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
+                    TIMEOUT ${COQUI_VERTEX_TEST_TIMEOUT})
 
 # ISDF-Vertex self-consistency diagnostic (missing controls for the Si M8 divergence):
 # the little-group residual of the SELF-CONSISTENT G with the vertex OFF (baseline
@@ -145,7 +162,8 @@ target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield eri_li
                       vertex_lib gw_lib scf_lib)
 
 add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
-set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR})
+set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
+                    TIMEOUT ${COQUI_VERTEX_TEST_TIMEOUT})
 
 # ISDF-Vertex: ABSOLUTE normalization/sign cross-check of Sigma^C against CoQui's own
 # bare second-order exchange (GF2 exchange channel, pyscf-pinned). With C = full band
@@ -160,4 +178,5 @@ target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield eri_li
                       vertex_lib gw_lib gf2_lib scf_lib)
 
 add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
-set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR})
+set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
+                    TIMEOUT ${COQUI_VERTEX_TEST_TIMEOUT})
