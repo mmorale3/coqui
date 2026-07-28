@@ -152,6 +152,67 @@ namespace bdft_tests {
       }
     }
 
+    // ---- 3c. GAUGE COVARIANCE: the fit must commute with a unitary mixing of columns ----
+    // Physical results depend on range(P) only: under U(k) -> U(k) V(k) the vertex cuts are
+    // exactly invariant (CLAUDE.md section 8), and test_methods_vertex_wannier pins that. The
+    // pole fit is applied to a batch whose columns carry the C-orbital index, so a gauge
+    // rotation MIXES those columns. If the fit is a fixed linear map it commutes with the
+    // mixing exactly; if the rank is chosen from the data it need not, because the mixed data
+    // has a different residual-vs-rank curve.
+    {
+      const long nc = 4;
+      // Columns must genuinely DIFFER in how many directions they need, or the test cannot
+      // discriminate: identical-spectrum columns select identical ranks and any rank rule
+      // commutes with mixing trivially. Column 0 is a single soft pole (low rank); column 1
+      // carries content at the grid extremes (high rank); 2 and 3 are in between.
+      nda::array<cplx, 2> F(pf.nt, nc);
+      F() = cplx(0.0);
+      for (long i = 0; i < pf.nt; ++i) {
+        double s = pf.s_phys(i);
+        F(i, 0) = imag_axes_ft::dlr_kF(pf.beta, s, 0.15);
+        double v1 = 0;
+        for (size_t k = 0; k < e.size(); ++k) v1 += w[k] * imag_axes_ft::dlr_kF(pf.beta, s, e[k]);
+        v1 += 0.9 * imag_axes_ft::dlr_kF(pf.beta, s, pf.epsl(0));
+        v1 += 0.9 * imag_axes_ft::dlr_kF(pf.beta, s, pf.epsl(pf.np - 1));
+        F(i, 1) = v1;
+        F(i, 2) = imag_axes_ft::dlr_kF(pf.beta, s, -0.4) + 0.5 * imag_axes_ft::dlr_kF(pf.beta, s, 2.2);
+        F(i, 3) = v1 - 0.3 * F(i, 0);
+      }
+      // a unitary column mixing (real orthogonal is enough to exhibit the effect)
+      nda::array<cplx, 2> V(nc, nc);
+      double th = 0.7;
+      V() = cplx(0.0);
+      V(0, 0) = std::cos(th); V(0, 1) = -std::sin(th);
+      V(1, 0) = std::sin(th); V(1, 1) =  std::cos(th);
+      V(2, 2) = cplx(1.0);    V(3, 3) = cplx(1.0);
+
+      nda::array<cplx, 2> FV(pf.nt, nc);
+      FV() = cplx(0.0);
+      for (long i = 0; i < pf.nt; ++i)
+        for (long a = 0; a < nc; ++a)
+          for (long b = 0; b < nc; ++b) FV(i, a) += F(i, b) * V(b, a);
+
+      auto cF  = pf.coeffs(F);    // then rotate
+      auto cFV = pf.coeffs(FV);   // rotate then fit
+      double dev = 0.0, scale = 0.0;
+      for (long p = 0; p < pf.np; ++p)
+        for (long a = 0; a < nc; ++a) {
+          cplx rot(0.0);
+          for (long b = 0; b < nc; ++b) rot += cF(p, b) * V(b, a);
+          dev = std::max(dev, std::abs(cFV(p, a) - rot));
+          scale = std::max(scale, std::abs(rot));
+        }
+      app_log(1, "gauge covariance: dev = {:.6e}, scale = {:.6e}, n_kept = {}/{}, ampl = {:.4e}",
+              dev, scale, pf.n_kept, pf.ns_max, pf.amplification);
+      REQUIRE(std::isfinite(scale));
+      REQUIRE(std::isfinite(dev));
+      // A fixed map is covariant EXACTLY, so all that is left is roundoff, floored by
+      // machine eps times the residue amplification (~6e5 here). Measured: 1.6e-12 relative.
+      // The broken per-column adaptive rule sat at 1.9e-01 relative, so 1e-9 separates them
+      // by eight orders while leaving three orders of roundoff headroom.
+      REQUIRE(dev <= 1e-9 * std::max(scale, 1.0));
+    }
+
     // ---- 4. REGRESSION: unrepresentable content must NOT explode the residues -----------
     // Perturb Lehmann data along the direction the pole kernel resolves LEAST (its smallest
     // retained right-singular direction is inside the span, so use the tau-space direction

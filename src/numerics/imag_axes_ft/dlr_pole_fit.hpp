@@ -74,9 +74,9 @@
  * Dropping Tmap also removes a gratuitous factor ||Tmap|| = 45 and is strictly more accurate
  * (it interpolated, then interpolated again).
  *
- * The rank is then chosen PER CALL by the discrepancy principle rather than by any fixed
- * threshold -- see dlr_pole_fit_accuracy_factor for the measurements showing that no constant
- * satisfies both the dconv accuracy gate and the conservation gate.
+ * The rank is FIXED at build() from the singular spectrum -- see dlr_pole_fit_rel_tol for the
+ * three requirements (gauge covariance, MPI invariance, elementwise batch semantics) that
+ * rule out every data-dependent rule.
  *
  * Two REJECTED alternatives, recorded so they are not retried (both measured on the same grid):
  *   - "match the aux pole rank to the backend DLR rank" (i.e. use the backend's own SYM basis).
@@ -115,30 +115,31 @@
 namespace imag_axes_ft {
 
   /**
-   * Target relative accuracy of the pole representation, as a multiple of the instance's eps.
+   * SVD truncation threshold, relative to the largest singular value of the pole kernel.
    *
-   * THE RANK IS CHOSEN PER CALL FROM THE DATA (discrepancy principle), not from a fixed
-   * threshold, because no fixed threshold works. Measured, all on the same build:
+   * THE RANK IS FIXED AT build() FROM THE SPECTRUM ALONE -- never from the data. Three
+   * independent requirements force this, and any data-dependent rule violates at least one:
    *
-   *   fixed rel_tol   dconv vs brute force   conservation (LiH, head-augmented, gate 1e-3)
-   *   ------------------------------------------------------------------------------------
-   *   1e-6            passes                 0.0011990   FAILS
-   *   1e-12           5.42e-07  FAILS        (better)
-   *   old code        1.14e-08  (baseline)   passes
+   *  1. GAUGE COVARIANCE. Physical results depend on range(P) only: under U(k) -> U(k)V(k)
+   *     both vertex cuts are exactly invariant (CLAUDE.md section 8), pinned by
+   *     test_methods_vertex_wannier. The fit is applied to a batch whose columns carry the
+   *     C-orbital index, so a gauge rotation MIXES those columns. Only a fixed linear map
+   *     commutes with that mixing. Measured: a per-column data-adaptive rank gives a gauge
+   *     deviation of 0.246 (test_dlr_pole_fit case 3c) and breaks the vertex gauge test at
+   *     |D e_hf| = 4.8e-08 against its 1e-10 threshold.
+   *  2. MPI INVARIANCE. In production the batch axis is distributed over ranks. A rank chosen
+   *     from batch-summed quantities would make the physics depend on the processor grid.
+   *  3. ELEMENTWISE BATCH SEMANTICS. double_boson_conv is documented elementwise in the
+   *     trailing axis and test_iaft_dconv pins batched == per-element exactly.
    *
-   * Cutting hard regularizes the bilinear residue algebra but throws away representation
-   * accuracy; cutting softly keeps accuracy but lets ill-conditioned directions through.
-   * The two gates pull in opposite directions and there is no constant that satisfies both.
+   * Requirements 2 and 3 together kill batch-wide rules; requirement 1 kills per-column rules.
+   * What is left is a fixed threshold, and the value below was chosen by sweeping it against
+   * both accuracy gates (see the table in notes/vertex_divergence_diagnosis.md section 8).
    *
-   * What resolves it: use the FEWEST singular directions that reach the requested accuracy.
-   * For genuinely representable data the residual keeps falling as directions are added, so
-   * essentially all are used and the fit matches the old interpolatory route. For data with
-   * unrepresentable content the residual PLATEAUS -- extra directions buy nothing and only
-   * inflate the residues -- so the rank stops there and the blow-up never happens. That is
-   * exactly "do not chase what you cannot represent", stated as a stopping rule instead of a
-   * magic constant.
+   * Note this is NOT tied to the instance's eps: an eps-multiple would give a 0.1 cut at the
+   * production setting (eps = 1e-6), which is absurd. It is an absolute conditioning cut.
    */
-  inline constexpr double dlr_pole_fit_accuracy_factor = 10.0;
+  inline constexpr double dlr_pole_fit_rel_tol = 1e-8;
 
   /** floor on the singular-value cut, relative to s_max: below this a direction is roundoff. */
   inline constexpr double dlr_pole_fit_smin_floor = 1e-14;
@@ -178,7 +179,7 @@ namespace imag_axes_ft {
 
     dlr_pole_fit(IAFT const& ft, double rtol = -1.0) { build(ft, rtol); }
 
-    /** rtol < 0 selects the default target, `dlr_pole_fit_accuracy_factor * ft.eps()`. */
+    /** rtol < 0 selects the default, `dlr_pole_fit_rel_tol`. */
     void build(IAFT const& ft, double rtol = -1.0) {
 #ifndef ENABLE_DLR
       (void)ft; (void)rtol;
@@ -191,7 +192,7 @@ namespace imag_axes_ft {
                    "Rerun with iaft basis = \"dlr\".");
       // The accuracy TARGET for the per-call rank choice: a small multiple of the accuracy
       // the caller asked the DLR for. Not a singular-value threshold -- see the header.
-      if (rtol < 0.0) rtol = dlr_pole_fit_accuracy_factor * ft.eps();
+      if (rtol < 0.0) rtol = dlr_pole_fit_rel_tol;
       utils::check(rtol > 0.0 and rtol < 1.0,
                    "imag_axes_ft::dlr_pole_fit: rel_tol = {} must be in (0,1).", rtol);
       beta = ft.beta();
@@ -256,9 +257,14 @@ namespace imag_axes_ft {
       while (ns_max < ms and sig(ns_max) > dlr_pole_fit_smin_floor * s_max) ++ns_max;
       utils::check(ns_max > 0, "imag_axes_ft::dlr_pole_fit: the pole kernel has no usable "
                                "singular directions.");
-      s_min_kept = sig(ns_max - 1);
+      // The rank is fixed HERE, from the spectrum and the instance's target only -- never
+      // from the data. See the class comment.
+      n_kept = 0;
+      while (n_kept < ns_max and sig(n_kept) > rel_tol * s_max) ++n_kept;
+      utils::check(n_kept > 0, "imag_axes_ft::dlr_pole_fit: truncation kept no singular "
+                               "values (rel_tol = {}).", rel_tol);
+      s_min_kept = sig(n_kept - 1);
       amplification = 1.0 / s_min_kept;
-      n_kept = ns_max;   // updated per call by coeffs()
 
       sval = nda::array<double, 1>(ns_max);
       Ut = nda::array<ComplexType, 2>(ns_max, nt);
@@ -291,29 +297,18 @@ namespace imag_axes_ft {
       nda::array<ComplexType, 2> c(np, d);
       if (d == 0) return c;
 
-      nda::array<ComplexType, 2> g(ns_max, d);
-      nda::blas::gemm(Ut, F_td, g);
+      // FIXED RANK, decided at build() from the singular spectrum alone. The map must not
+      // depend on the data -- see the class comment for the three requirements that forces.
+      nda::array<ComplexType, 2> g(n_kept, d);
+      auto Utk = Ut(nda::range(0, n_kept), nda::range::all);
+      nda::array<ComplexType, 2> Utk_c(n_kept, nt);
+      Utk_c() = Utk;
+      nda::blas::gemm(Utk_c, F_td, g);
 
-      // PER COLUMN, not per batch. double_boson_conv and the vertex kernels are documented
-      // ELEMENTWISE in the trailing axis, so a batched call must reproduce per-element calls
-      // exactly; a rank chosen from batch-summed norms would silently couple the columns.
-      long k_max_used = 0;
-      for (long j = 0; j < d; ++j) {
-        double f2 = 0.0;
-        for (long i = 0; i < nt; ++i) f2 += std::norm(F_td(i, j));
-        const double target2 = rel_tol * rel_tol * f2;
-        double acc = 0.0;
-        long k_use = ns_max;
-        for (long k = 0; k < ns_max; ++k) {
-          acc += std::norm(g(k, j));
-          if (f2 - acc <= target2) { k_use = k + 1; break; }
-        }
-        for (long k = k_use; k < ns_max; ++k) g(k, j) = ComplexType(0.0);
-        k_max_used = std::max(k_max_used, k_use);
-      }
-      const_cast<dlr_pole_fit*>(this)->n_kept = k_max_used;
-
-      nda::blas::gemm(Vs, g, c);
+      auto Vk = Vs(nda::range::all, nda::range(0, n_kept));
+      nda::array<ComplexType, 2> Vk_c(np, n_kept);
+      Vk_c() = Vk;
+      nda::blas::gemm(Vk_c, g, c);
       return c;
     }
 
