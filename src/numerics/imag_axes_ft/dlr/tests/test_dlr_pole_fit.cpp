@@ -121,11 +121,35 @@ namespace bdft_tests {
       REQUIRE(err / scale < 1e-4);
     }
 
-    // ---- 3. the truncation is a real cap, and it is honest about it ---------------------
+    // ---- 3. a looser accuracy target really does use fewer directions -------------------
+    // n_kept is per-call state (the rank is chosen from the data), so compare AFTER fitting
+    // the same object with two different targets.
     {
       imag_axes_ft::dlr_pole_fit coarse(ft, 1e-2);
-      REQUIRE(coarse.n_kept < pf.n_kept);
-      REQUIRE(coarse.amplification < pf.amplification);
+      auto F = lehmann_tau(pf, e, w, 1);
+      auto c_fine = pf.coeffs(F);
+      long k_fine = pf.n_kept;
+      auto c_coarse = coarse.coeffs(F);
+      REQUIRE(coarse.n_kept < k_fine);
+      // and the loose fit is correspondingly less accurate, but still meets its own target
+      REQUIRE(coarse.fit_error(F, c_coarse) > pf.fit_error(F, c_fine));
+      REQUIRE(coarse.fit_error(F, c_coarse) < 1e-1);
+    }
+
+    // ---- 3b. BATCH SEMANTICS: batched must equal per-element, bit for bit ---------------
+    // The rank is data-dependent, so it must be chosen per COLUMN; a rank derived from
+    // batch-summed norms would couple independent columns.
+    {
+      auto Fb = lehmann_tau(pf, e, w, 4);
+      auto cb = pf.coeffs(Fb);
+      for (long j = 0; j < 4; ++j) {
+        nda::array<cplx, 2> Fj(pf.nt, 1);
+        for (long i = 0; i < pf.nt; ++i) Fj(i, 0) = Fb(i, j);
+        auto cj = pf.coeffs(Fj);
+        double d = 0;
+        for (long p = 0; p < pf.np; ++p) d = std::max(d, std::abs(cb(p, j) - cj(p, 0)));
+        REQUIRE(d == 0.0);
+      }
     }
 
     // ---- 4. REGRESSION: unrepresentable content must NOT explode the residues -----------

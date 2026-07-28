@@ -165,7 +165,7 @@ namespace vertex_pi {
      * linear map of 2-norm 9.4e6 at the production grid, and it is what turned O(eps)
      * unrepresentable content in z into residues 384x the data.
      */
-    void init_poles(double rtol = imag_axes_ft::dlr_pole_fit_default_rtol) {
+    void init_poles(double rtol = -1.0) {
       if (poles_ready) return;
       pfit.build(*ft, rtol);
       np = pfit.np;
@@ -196,9 +196,12 @@ namespace vertex_pi {
             max_err = std::max(max_err, std::abs(val - ref));
             ref_scale = std::max(ref_scale, std::abs(ref));
           }
-          // a wrong convention gives an O(1) RELATIVE error; the fit itself is O(eps)
+          // A wrong convention gives an O(1) RELATIVE error, so the tolerance only has to be
+          // small compared to 1 -- it must NOT be so tight that it doubles as an accuracy
+          // assertion. The fit itself resolves to ~the instance's eps (the truncation is tied
+          // to it), so scale with eps and floor generously.
           double rel = (ref_scale > 0) ? max_err / ref_scale : max_err;
-          double tol = std::max(1e-6, 1e4 * ft->eps());
+          double tol = std::max(1e-8, 1e3 * ft->eps());
           utils::check(rel < tol,
                        "vertex_pi::init_poles: DLR pole-convention self-check failed on the "
                        "{} case (rel err = {}, tol = {}).", what, rel, tol);

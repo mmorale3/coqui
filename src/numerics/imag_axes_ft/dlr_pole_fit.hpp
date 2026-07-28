@@ -66,12 +66,17 @@
  *
  *      minimize ||K c - F||,   K(i,p) = K_F(tau_i, eps_p),   solved by truncated SVD
  *
- * Two independent improvements, both measured:
- *   (1) no Tmap. The interpolation detour contributed a gratuitous factor ||Tmap|| = 45 and
- *       was also the less accurate of the two (it interpolates, then interpolates again).
- *   (2) SVD truncation at `rel_tol` caps the residue amplification at 1/s_min_kept. Directions
- *       below the cut are UNRESOLVABLE at the instance's (lambda, eps) -- fitting them is
- *       pure noise amplification that the bilinear algebra then squares.
+ * WHAT ACTUALLY DOES THE WORK is LEAST SQUARES, not the SVD cut. A least-squares fit is free
+ * to leave unrepresentable content in the residual; the old SQUARE interpolatory solve had to
+ * reproduce it exactly at its nodes, and could only do that by emitting huge residues. Measured
+ * at the amplitude that reproduces the production break, with the truncation switched off
+ * entirely (all 38 directions kept), the residue ratio is 1.95 against the old route's 379.
+ * Dropping Tmap also removes a gratuitous factor ||Tmap|| = 45 and is strictly more accurate
+ * (it interpolated, then interpolated again).
+ *
+ * The rank is then chosen PER CALL by the discrepancy principle rather than by any fixed
+ * threshold -- see dlr_pole_fit_accuracy_factor for the measurements showing that no constant
+ * satisfies both the dconv accuracy gate and the conservation gate.
  *
  * Two REJECTED alternatives, recorded so they are not retried (both measured on the same grid):
  *   - "match the aux pole rank to the backend DLR rank" (i.e. use the backend's own SYM basis).
@@ -109,8 +114,34 @@
 
 namespace imag_axes_ft {
 
-  /** default SVD truncation, relative to the largest singular value of the pole kernel. */
-  inline constexpr double dlr_pole_fit_default_rtol = 1e-6;
+  /**
+   * Target relative accuracy of the pole representation, as a multiple of the instance's eps.
+   *
+   * THE RANK IS CHOSEN PER CALL FROM THE DATA (discrepancy principle), not from a fixed
+   * threshold, because no fixed threshold works. Measured, all on the same build:
+   *
+   *   fixed rel_tol   dconv vs brute force   conservation (LiH, head-augmented, gate 1e-3)
+   *   ------------------------------------------------------------------------------------
+   *   1e-6            passes                 0.0011990   FAILS
+   *   1e-12           5.42e-07  FAILS        (better)
+   *   old code        1.14e-08  (baseline)   passes
+   *
+   * Cutting hard regularizes the bilinear residue algebra but throws away representation
+   * accuracy; cutting softly keeps accuracy but lets ill-conditioned directions through.
+   * The two gates pull in opposite directions and there is no constant that satisfies both.
+   *
+   * What resolves it: use the FEWEST singular directions that reach the requested accuracy.
+   * For genuinely representable data the residual keeps falling as directions are added, so
+   * essentially all are used and the fit matches the old interpolatory route. For data with
+   * unrepresentable content the residual PLATEAUS -- extra directions buy nothing and only
+   * inflate the residues -- so the rank stops there and the blow-up never happens. That is
+   * exactly "do not chase what you cannot represent", stated as a stopping rule instead of a
+   * magic constant.
+   */
+  inline constexpr double dlr_pole_fit_accuracy_factor = 10.0;
+
+  /** floor on the singular-value cut, relative to s_max: below this a direction is roundoff. */
+  inline constexpr double dlr_pole_fit_smin_floor = 1e-14;
 
   /** stable analytic-continuation kernel K_F(s,e) = -e^{-e s}/(1 + e^{-beta e}), s in [0,beta]. */
   inline double dlr_kF(double beta, double s, double e) {
@@ -135,15 +166,20 @@ namespace imag_axes_ft {
     nda::array<double, 1> rf;            // dimensionless nodes hw_l = beta * eps_l
     nda::array<double, 1> epsl;          // physical pole energies
     nda::array<double, 1> s_phys;        // physical tau values of the backend mesh
-    nda::array<ComplexType, 2> Pinv;     // (np, nt) backend tau values -> residues
     nda::array<double, 2> Kmat;          // (nt, np) reconstruction kernel
     nda::array<ComplexType, 2> Kc;       // (nt, np) same, complex, for the fit_error gemm
+    // thin SVD of Kmat, kept so the rank can be chosen PER CALL from the data
+    nda::array<ComplexType, 2> Ut;       // (ns, nt)  U^T   (ns = min(nt,np) usable directions)
+    nda::array<ComplexType, 2> Vs;       // (np, ns)  V * diag(1/s), columns pre-scaled
+    nda::array<double, 1> sval;          // (ns) singular values, descending
+    long ns_max = 0;                     // usable directions after the roundoff floor
 
     dlr_pole_fit() = default;
 
-    dlr_pole_fit(IAFT const& ft, double rtol = dlr_pole_fit_default_rtol) { build(ft, rtol); }
+    dlr_pole_fit(IAFT const& ft, double rtol = -1.0) { build(ft, rtol); }
 
-    void build(IAFT const& ft, double rtol = dlr_pole_fit_default_rtol) {
+    /** rtol < 0 selects the default target, `dlr_pole_fit_accuracy_factor * ft.eps()`. */
+    void build(IAFT const& ft, double rtol = -1.0) {
 #ifndef ENABLE_DLR
       (void)ft; (void)rtol;
       utils::check(false, "imag_axes_ft::dlr_pole_fit: requires the DLR backend "
@@ -153,6 +189,9 @@ namespace imag_axes_ft {
                    "imag_axes_ft::dlr_pole_fit: requires the DLR imaginary-axis backend; "
                    "the IR backend does not expose the needed off-grid evaluations. "
                    "Rerun with iaft basis = \"dlr\".");
+      // The accuracy TARGET for the per-call rank choice: a small multiple of the accuracy
+      // the caller asked the DLR for. Not a singular-value threshold -- see the header.
+      if (rtol < 0.0) rtol = dlr_pole_fit_accuracy_factor * ft.eps();
       utils::check(rtol > 0.0 and rtol < 1.0,
                    "imag_axes_ft::dlr_pole_fit: rel_tol = {} must be in (0,1).", rtol);
       beta = ft.beta();
@@ -203,7 +242,7 @@ namespace imag_axes_ft {
           Kc(i, p) = ComplexType(Kmat(i, p));
         }
 
-      // --- truncated-SVD pseudo-inverse --------------------------------------------------
+      // --- thin SVD, kept whole: the rank is a per-call decision -------------------------
       nda::matrix<double, nda::F_layout> A(nt, np);
       A() = Kmat;
       long ms = std::min(nt, np);
@@ -213,22 +252,22 @@ namespace imag_axes_ft {
       utils::check(info == 0, "imag_axes_ft::dlr_pole_fit: gesvd failed (info = {}).", info);
 
       s_max = sig(0);
-      n_kept = 0;
-      while (n_kept < ms and sig(n_kept) > rel_tol * s_max) ++n_kept;
-      utils::check(n_kept > 0, "imag_axes_ft::dlr_pole_fit: truncation kept no singular "
-                               "values (rel_tol = {}).", rel_tol);
-      s_min_kept = sig(n_kept - 1);
+      ns_max = 0;
+      while (ns_max < ms and sig(ns_max) > dlr_pole_fit_smin_floor * s_max) ++ns_max;
+      utils::check(ns_max > 0, "imag_axes_ft::dlr_pole_fit: the pole kernel has no usable "
+                               "singular directions.");
+      s_min_kept = sig(ns_max - 1);
       amplification = 1.0 / s_min_kept;
+      n_kept = ns_max;   // updated per call by coeffs()
 
-      Pinv = nda::array<ComplexType, 2>(np, nt);
-      Pinv() = ComplexType(0.0);
-      for (long k = 0; k < n_kept; ++k) {
+      sval = nda::array<double, 1>(ns_max);
+      Ut = nda::array<ComplexType, 2>(ns_max, nt);
+      Vs = nda::array<ComplexType, 2>(np, ns_max);
+      for (long k = 0; k < ns_max; ++k) {
+        sval(k) = sig(k);
+        for (long i = 0; i < nt; ++i) Ut(k, i) = ComplexType(U(i, k));
         double inv = 1.0 / sig(k);
-        for (long p = 0; p < np; ++p) {
-          double vp = VT(k, p) * inv;
-          if (vp == 0.0) continue;
-          for (long i = 0; i < nt; ++i) Pinv(p, i) += vp * U(i, k);
-        }
+        for (long p = 0; p < np; ++p) Vs(p, k) = ComplexType(VT(k, p) * inv);
       }
 #endif
     }
@@ -236,13 +275,45 @@ namespace imag_axes_ft {
     /**
      * Residues of tau-grid data (leading axis nt, trailing axis a flat batch).
      * F(z) = sum_p c_p / (z - eps_p).
+     *
+     * DISCREPANCY PRINCIPLE. In the SVD basis the least-squares residual after keeping k
+     * directions is  ||F||^2 - sum_{j<k} |g_j|^2  with g = U^T F, so the whole residual-vs-rank
+     * curve is available from one gemm. Keep the smallest k whose residual is already at the
+     * requested accuracy; adding directions past that point cannot improve a fit that has
+     * plateaued and only inflates the residues, which the bilinear residue algebra squares.
+     * `n_kept` records the rank actually used, for the log.
      */
     nda::array<ComplexType, 2> coeffs(nda::MemoryArrayOfRank<2> auto const& F_td) const {
       utils::check(F_td.shape(0) == nt,
                    "imag_axes_ft::dlr_pole_fit::coeffs: leading axis {} != nt = {}.",
                    F_td.shape(0), nt);
-      nda::array<ComplexType, 2> c(np, F_td.shape(1));
-      nda::blas::gemm(Pinv, F_td, c);
+      const long d = F_td.shape(1);
+      nda::array<ComplexType, 2> c(np, d);
+      if (d == 0) return c;
+
+      nda::array<ComplexType, 2> g(ns_max, d);
+      nda::blas::gemm(Ut, F_td, g);
+
+      // PER COLUMN, not per batch. double_boson_conv and the vertex kernels are documented
+      // ELEMENTWISE in the trailing axis, so a batched call must reproduce per-element calls
+      // exactly; a rank chosen from batch-summed norms would silently couple the columns.
+      long k_max_used = 0;
+      for (long j = 0; j < d; ++j) {
+        double f2 = 0.0;
+        for (long i = 0; i < nt; ++i) f2 += std::norm(F_td(i, j));
+        const double target2 = rel_tol * rel_tol * f2;
+        double acc = 0.0;
+        long k_use = ns_max;
+        for (long k = 0; k < ns_max; ++k) {
+          acc += std::norm(g(k, j));
+          if (f2 - acc <= target2) { k_use = k + 1; break; }
+        }
+        for (long k = k_use; k < ns_max; ++k) g(k, j) = ComplexType(0.0);
+        k_max_used = std::max(k_max_used, k_use);
+      }
+      const_cast<dlr_pole_fit*>(this)->n_kept = k_max_used;
+
+      nda::blas::gemm(Vs, g, c);
       return c;
     }
 
@@ -293,12 +364,12 @@ namespace imag_axes_ft {
 
     /** one-line provenance for the run log. */
     void log(int level, std::string_view who) const {
-      app_log(level, "  {}: DLR rank = {} (aux pole rank = {}), regularized pole fit keeps "
-                     "{}/{} singular values at rel_tol = {}\n"
-                     "    -> residue amplification <= {:.4g} (untruncated {:.4g}), "
-                     "min|hw_l| = {:.4g}, min node gap = {:.4g}",
-              who, nt, np, n_kept, std::min(nt, np), rel_tol, amplification,
-              1.0 / std::max(s_min_kept, 1e-300), min_abs_node, min_node_gap);
+      app_log(level, "  {}: DLR rank = {} (aux pole rank = {}), least-squares pole fit, rank "
+                     "chosen per call to reach rel accuracy {:.2g}\n"
+                     "    -> {} of {} usable directions on the last call, worst-case residue "
+                     "amplification {:.4g}, min|hw_l| = {:.4g}, min node gap = {:.4g}",
+              who, nt, np, rel_tol, n_kept, ns_max, amplification,
+              min_abs_node, min_node_gap);
     }
   };
 
