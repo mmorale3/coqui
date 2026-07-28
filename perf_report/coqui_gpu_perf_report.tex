@@ -45,10 +45,13 @@ transform, per-iteration re-gathers of iteration-invariant data, raw \texttt{cud
 churn, and host-only SCF phases. A single-node (network-free) GPU run proves the cost is
 PCIe staging, not the interconnect. No algorithmic change is required: the existing
 transpose-based transform is communication-optimal. We propose a prioritized engineering
-plan (device-direct chunked NCCL redistribution, device memory pool, device-resident
+plan (device-direct chunked redistribution, device memory pool, device-resident
 basis transforms, invariant caching, device Dyson stage) with a projected
 $\approx 5\times$ node-for-node speedup at the $2{\times}2{\times}2$/500-band scale,
-growing to 5--8$\times$ at production scale. During the study we also found and fixed a
+growing to 5--8$\times$ at production scale. The first and largest item is now
+implemented and measured: a device-direct pairwise exchange cuts \texttt{update\_w} from
+163 to 99 s/iter at 8 A100 and from 92 to 62 s/iter at 16, with energies unchanged digit
+for digit. During the study we also found and fixed a
 correctness regression that had made the THC-HF Fock matrix processor-count-dependent on
 \emph{both} CPU and GPU since 2026-05-12; all configurations now agree to $10^{-13}$.
 \end{abstract}
@@ -208,23 +211,66 @@ compute at kp444 (redistribute volume $\times 8$; Z-gather $\times 8$ with a ful
 allreduce per $q$-point). GPU runs at this scale (64$\times$A100, 48$\times$H200, on
 pre-built ERIs) are queued as before/after validation; they do not change the plan.
 
+\section{Result of the first fix (P1, measured)}
+\begin{table}[H]\small\centering
+\begin{tabular}{@{}lrrrrr@{}}
+\toprule
+& \multicolumn{2}{c}{2 nodes $\cdot$ 8$\times$A100} & \multicolumn{2}{c}{4 nodes $\cdot$ 16$\times$A100} \\
+\cmidrule(lr){2-3}\cmidrule(lr){4-5}
+Seconds per SCF iteration & host staging & device-direct & host staging & device-direct \\
+\midrule
+\textbf{update\_w} & 163.1 & \textcolor{good}{\textbf{99.6}} & 92.2 & \textcolor{good}{\textbf{61.6}} \\
+\quad $\tau\rightarrow\omega$ & 52.0 & \textcolor{good}{21.0} & 27.1 & \textcolor{good}{13.6} \\
+\quad $\omega\rightarrow\tau$ & 57.2 & \textcolor{good}{25.5} & 32.2 & \textcolor{good}{17.5} \\
+\quad W-Dyson solve & 17.6 & 17.4 & --- & --- \\
+\quad eval $\Pi$ (RPA) & 22.0 & 21.4 & --- & --- \\
+\midrule
+SCF loop, 2 iterations & 682.8 & \textcolor{good}{\textbf{548.5}} & 429.2 & \textcolor{good}{\textbf{370.5}} \\
+\bottomrule
+\end{tabular}
+\caption{\label{tab:p1}P1 measured: Si $2{\times}2{\times}2$/500 bands, shared ERI, two SCF
+iterations, identical binary with only the transport switched. Energies agree digit for
+digit ($0.48305038078408613$, then $0.5300765029178911$ at 8 ranks). The phases that
+should not move do not. What remains in the transform phase is the IAFT gemms plus an
+exchange that still serializes pack/send/unpack per chunk.}
+\end{table}
+
 \section{Improvement plan}
 Ordered by impact $\div$ risk. Gains quoted against the 2n$\cdot$8$\times$A100
 kp222/500b iteration (215 s solver + $\sim$110 s/iter-equivalent host phases);
 P1/P4/P6 gains are larger at kp444.
 
 \begin{description}[leftmargin=1.6em,style=nextline]
-\item[P1 --- Device-direct chunked redistribute (NCCL). \textcolor{good}{$-$95--100 s/iter.}] (Effort M, risk M.)
-DEVICE specialization of \texttt{redistribute\_alltoallv}: pack sub-blocks on device
-into fixed-size per-peer chunks (1--2 GB workspace from the P2 pool), exchange via
-\texttt{ncclGroupStart}/\texttt{ncclSend}/\texttt{ncclRecv} on the existing
-\texttt{mpi3::nccl} device communicator (already used by the ERI builder), unpack on
-device. Chunking bounds the extra device memory --- fixing exactly what killed the May
-attempt. Remove the unpack read-modify-write. Fallback: chunked CUDA-aware
-\texttt{MPI\_Alltoallv} behind the same interface. At NVLink + GPUDirect rates,
-$4\times 22$ GB/rank moves in 8--15 s vs.\ today's 111 s. Validate with the shared-ERI
-harness (energies to $10^{-13}$).
-\item[P2 --- Activate nda's existing pooled allocator (no new allocator). \textcolor{good}{$-$12--15 s/iter; removes OOM fragility.}] (Effort S, risk L.)
+\item[P1 --- Device-direct chunked redistribute. \statusfixed{9860888,\,c2f8e71} \textcolor{good}{measured $-$64 s/iter at 8 ranks, $-$31 s/iter at 16.}]
+Implemented and now the default wherever the MPI advertises device-pointer support
+(\texttt{MPIX\_Query\_cuda\_support}; \texttt{COQUI\_REDIST\_DEVICE} forces either path).
+The DEVICE path walks peers in a fixed pairwise schedule --- round $r$ sends to
+\texttt{rank}$+r$ and receives from \texttt{rank}$-r$ --- and hands device pointers
+straight to CUDA-aware MPI. Only one peer block is in flight, so the extra device memory
+is bounded by a chunk budget (\texttt{COQUI\_REDIST\_CHUNK\_MB}, default 1 GB per buffer)
+rather than by the tensor size: exactly the bound the May attempt lacked. Over-budget
+blocks split along their slowest dimension, and both sides stage through a C-ordered view
+of the same global index box, so they derive the same split with no extra metadata
+exchange. Measured (kp222/500b, shared ERI, A100): see
+Table~\ref{tab:p1}. Bit-identical to host staging in every controlled comparison but
+one, which differed by $3\times10^{-15}$ (round-off; total energies matched to all 16
+digits). \textbf{NCCL was not needed} --- and is not available in these builds
+(\texttt{NCCL\_LIBRARIES-NOTFOUND}); plain CUDA-aware MPI over UCX suffices, including at
+16 ranks, where the ISDF builder's device-MPI crash (B3) notably does \emph{not} appear.
+Remaining headroom: the exchange still serializes pack/send/unpack per chunk with a device
+synchronize between them, so the phase sits at 47 s (8 ranks) rather than the 12 s a
+bandwidth estimate allows; double-buffering across two streams is the next step.
+\item[P2 --- Activate nda's existing pooled allocator. \textcolor{cpuc}{\textbf{built, opt-in, not usable at this scale}} (\texttt{ae0486f}, \texttt{975c912}, \texttt{9860888}).]
+Built as described below and wired into the SCF loop as a scoped reservation
+(\texttt{utils::device\_pool\_guard}, sized from \texttt{COQUI\_DEVICE\_POOL\_GB}), with
+the ISDF builder's free-memory query made pool-aware. It serves the redistribute staging
+buffers correctly (16 requests, zero fall-backs, $10^{-13}$-identical energies), but
+reserving 3 GB inside the SCF loop at kp222/500b turned iteration 2 into a
+\texttt{cudaErrorMemoryAllocation} while allocating an 18.5 GB tensor with 36.5 GB
+reported free --- the failure mode the design notes below warn about. With 18.5 GB
+tensors on an 80 GB card the headroom is simply not there, and P1's gain does not depend
+on it, so the pool stays off by default until the peak footprint shrinks. The analysis
+below stands and is worth keeping for that point.
 Every device scratch array is currently a raw \texttt{cudaMalloc}/\texttt{cudaFree}
 (\texttt{nda::cuarray} = \texttt{heap<Device>} = \texttt{mallocator}); a 23 GB allocation
 costs $\sim$4 s and each redistribute makes $O(n_{\mathrm{ranks}})$ of them. CoQu\'i
@@ -300,7 +346,7 @@ HDF5 or an async writer thread; optionally checkpoint every $N$ iterations.
 \toprule
 Per SCF iteration & today & after P1--P7 & change \\
 \midrule
-update\_w & 162 s & $\approx$38 s & redistributes 111$\to$12, W-solve 17$\to$11, mirror/allocs 13$\to$1, $\Pi$ 20$\to$14 \\
+update\_w & 162 s & $\approx$38 s & redistributes 111$\to$\textbf{47 measured (P1)}$\to$12 with double-buffering, W-solve 17$\to$11, mirror/allocs 13$\to$1, $\Pi$ 20$\to$14 \\
 THC-GW $\Sigma$ & 50 s & $\approx$15 s & $G_{ij}{\rightarrow}G_{uv}$ 18$\to$2; host reduce partially remains \\
 Host phases (/iter-equiv.) & $\sim$110 s & $\approx$45 s & device Dyson, capped $\mu$, async write \\
 \midrule
@@ -318,8 +364,11 @@ communication.
 
 \subsection{Suggested sequencing}
 \begin{enumerate}[leftmargin=1.6em]
-\item \textbf{Week 1:} P2 (activate the nda pool: size at startup, route the device handle) $\rightarrow$ P1 (NCCL redistribute) behind a runtime
-switch; validate with the correctness harness; re-run the kp222 matrix.
+\item \textbf{Week 1 --- \textcolor{good}{done}:} P2 pool built and wired (opt-in; not usable at
+kp222/500b, see P2) $\rightarrow$ P1 device-direct redistribute implemented, validated
+bit-identical, benchmarked at 8 and 16 ranks, and made the default where the MPI supports
+it. Next in this line: double-buffer the exchange across two streams to close the
+remaining 47\,s$\rightarrow$12\,s.
 \item \textbf{Week 2:} P3 + P4 + P5 (transfer hygiene); B4 $\mu$-walk cap. Re-run kp222;
 launch kp444 GPU.
 \item \textbf{Week 3+:} P6 (device Dyson + eigenspectra memory), P7, P9, then P8
