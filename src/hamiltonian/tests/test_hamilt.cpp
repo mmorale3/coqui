@@ -4699,38 +4699,69 @@ TEST_CASE("paw_thc_vs_exact_eri", "[hamilt][paw_erichk][!benchmark]")
   long N_aug = layout.N_A;
   utils::check(N_aug > 0, "paw_thc_vs_exact_eri: N_aug == 0 (no PAW/USPP species).");
 
+  // ---- q. The occupied band sits at k0, the virtuals at kc; the transition
+  // wavevector is q = k(kc) - k(k0). COQUI_ERICHK_K2 < 0 keeps kc = k0, i.e.
+  // q = 0. Probing q != 0 matters because 63 of the 64 q-points carry
+  // essentially all of E_c, and the augmentation channels eta are rebuilt at
+  // every q -- a q-dependent defect in that rebuild is invisible at q = 0.
+  int kc = env_i("COQUI_ERICHK_K2", -1);
+  if (kc < 0) kc = k0;
+  utils::check(kc < mfobj.nkpts_ibz(),
+      "paw_thc_vs_exact_eri: COQUI_ERICHK_K2={} outside the IBZ [0,{})",
+      kc, mfobj.nkpts_ibz());
+  // Sign convention for eta's q argument is fixed by measurement, not by
+  // guesswork: the completeness gate below is exact at any q, and the wrong
+  // sign violates it grossly. COQUI_ERICHK_QSIGN flips it for the check.
+  double qsgn = (double)env_i("COQUI_ERICHK_QSIGN", 1);
+  auto kpts = mfobj.kpts();
+  std::array<double,3> q_cart = {
+      qsgn*(kpts(kc,0) - kpts(k0,0)),
+      qsgn*(kpts(kc,1) - kpts(k0,1)),
+      qsgn*(kpts(kc,2) - kpts(k0,2))};
+  double qmod = std::sqrt(q_cart[0]*q_cart[0]+q_cart[1]*q_cart[1]
+                        + q_cart[2]*q_cart[2]);
+  app_log(1, "[erichk] k_occ={} k_virt={} q=({:.5f},{:.5f},{:.5f}) |q|={:.5f} "
+             "(qsign {:+.0f})", k0, kc, q_cart[0], q_cart[1], q_cart[2],
+          qmod, qsgn);
+
   double Gmax = 0.0;
   for (long g = 0; g < ngm; ++g)
     Gmax = std::max(Gmax, std::sqrt(gv(g,0)*gv(g,0)+gv(g,1)*gv(g,1)+gv(g,2)*gv(g,2)));
   auto const& aatab = V.paw_aatab();
-  auto const& qtabs = V.paw_qrad_tabs(Gmax*(1.0+1e-6) + 1e-3, false);
+  auto const& qtabs = V.paw_qrad_tabs(Gmax + qmod + 1e-3, false);
   nda::array<ComplexType,2> eta(N_aug, ngm);
   {
-    std::array<double,3> q0 = {0.0, 0.0, 0.0};
     const long gch = 8192;
     for (long g0 = 0; g0 < ngm; g0 += gch) {
       range gr(g0, std::min(g0+gch, ngm));
       auto sub = eta(range::all, gr);
       hamilt::paw::build_eta_on_rho_g_at_q_chunk(
-          V, isdf, layout, rho_g, q0, vol, aatab, qtabs,
+          V, isdf, layout, rho_g, q_cart, vol, aatab, qtabs,
           range(0, N_aug), gr, sub);
     }
   }
   auto Pskna = V.Pskna_view();
-  nda::array<ComplexType,2> Y(N_aug, nbnd);
+  nda::array<ComplexType,2> Y(N_aug, nbnd), Yc(N_aug, nbnd);
   hamilt::paw::fill_Y_rows_for_sk(V, isdf, layout, npol, 0, k0, Pskna, Y);
+  hamilt::paw::fill_Y_rows_for_sk(V, isdf, layout, npol, 0, kc, Pskna, Yc);
 
   // ---- Exact side. rho~_vc(G) by FFT on the aug mesh (the mesh holds the
   // product of two wfc-sphere orbitals), augmentation by one GEMM per v.
+  // With k_virt != k_occ the FFT of conj(u_v) u_c is indexed by G'' = G'-G and
+  // the physical wavevector of that component is q + G''; the Bloch factors
+  // e^{ikr} are exactly what supplies the q, so they must NOT be put into u.
   auto k2g = V.swfc_to_rho_view();
   long ngw = k2g.extent(0);
-  nda::array<ComplexType,2> C(nbnd, ngw);
+  nda::array<ComplexType,2> C(nbnd, ngw), Cc(nbnd, ngw);
   mfobj.get_orbital_set('w', 0, k0, {0, nbnd}, C);
+  if (kc == k0) Cc = C;
+  else mfobj.get_orbital_set('w', 0, kc, {0, nbnd}, Cc);
 
   nda::array<double,1> wG(ngm);
   for (long g = 0; g < ngm; ++g) {
-    double G2 = gv(g,0)*gv(g,0)+gv(g,1)*gv(g,1)+gv(g,2)*gv(g,2);
-    wG(g) = (G2 > 1e-12) ? (4.0*M_PI/(vol*G2)) : 0.0;   // G=0 dropped: ignore_g0
+    double Kx = q_cart[0]+gv(g,0), Ky = q_cart[1]+gv(g,1), Kz = q_cart[2]+gv(g,2);
+    double K2 = Kx*Kx + Ky*Ky + Kz*Kz;
+    wG(g) = (K2 > 1e-12) ? (4.0*M_PI/(vol*K2)) : 0.0;  // q+G=0 dropped: ignore_g0
   }
 
   nda::array<ComplexType,1> ur(nnr), uv(nnr), pr(nnr);
@@ -4738,11 +4769,12 @@ TEST_CASE("paw_thc_vs_exact_eri", "[hamilt][paw_erichk][!benchmark]")
   auto uv3 = nda::reshape(uv, std::array<long,3>{NX,NY,NZ});
   auto pr3 = nda::reshape(pr, std::array<long,3>{NX,NY,NZ});
   math::nda::fft<false> Fu(ur3), Fv(uv3), Fp(pr3);
-  auto to_r = [&](long n, nda::array<ComplexType,1>& out,
+  auto to_r = [&](nda::array<ComplexType,2> const& Cf, long n,
+                  nda::array<ComplexType,1>& out,
                   nda::array_view<ComplexType,3> out3,
                   math::nda::fft<false>& F) {
     out() = ComplexType(0.0);
-    for (long g = 0; g < ngw; ++g) { long N = k2g(g); if (N>=0 && N<nnr) out(N) = C(n,g); }
+    for (long g = 0; g < ngw; ++g) { long N = k2g(g); if (N>=0 && N<nnr) out(N) = Cf(n,g); }
     F.backward(out3); };
 
   // FFT-path probe: rho~_vv(G=0) must equal <psi~_v|psi~_v> = sum_g |C(v,g)|^2,
@@ -4753,7 +4785,7 @@ TEST_CASE("paw_thc_vs_exact_eri", "[hamilt][paw_erichk][!benchmark]")
     for (long g = 0; g < ngm; ++g)
       if (std::abs(gv(g,0))+std::abs(gv(g,1))+std::abs(gv(g,2)) < 1e-12) ig0 = g;
     utils::check(ig0 >= 0, "paw_thc_vs_exact_eri: G=0 not on rho_g.");
-    to_r(0, uv, uv3, Fv);
+    to_r(C, 0, uv, uv3, Fv);
     for (long r = 0; r < nnr; ++r) pr(r) = std::conj(uv(r)) * uv(r);
     Fp.forward(pr3);
     ComplexType fft0 = pr(g2fft(ig0));
@@ -4769,10 +4801,19 @@ TEST_CASE("paw_thc_vs_exact_eri", "[hamilt][paw_erichk][!benchmark]")
   Dex() = 0.0; Dsm() = 0.0;
   nda::array<ComplexType,2> rho_sm_c(nbnd, ngm), rho_aug_c(nbnd, ngm);
   nda::array<ComplexType,2> A(nbnd, N_aug);
+  // Completeness gate, evaluated over EVERY G of rho_g rather than a sample:
+  // sum_c |rho_{v k0, c kc}(q+G)|^2 = 1 for a complete band set at kc, at any
+  // q. This is what pins the sign of eta's q argument -- the wrong sign leaves
+  // it grossly violated -- and it re-checks the exact side on the same grid
+  // the ERI is summed over.
+  double gate_max = 0.0; double gate_at_K = 0.0;
+  nda::array<double,1> csum(ngm);
+  csum() = 0.0;
+
   for (long v = 0; v < nocc; ++v) {
-    to_r(v, uv, uv3, Fv);
+    to_r(C, v, uv, uv3, Fv);
     for (long c = 0; c < nbnd; ++c) {
-      to_r(c, ur, ur3, Fu);
+      to_r(Cc, c, ur, ur3, Fu);
       for (long r = 0; r < nnr; ++r) pr(r) = std::conj(uv(r)) * ur(r);
       Fp.forward(pr3);
       // math::nda::fft normalizes on the FORWARD transform (1/nnr) and leaves
@@ -4781,11 +4822,14 @@ TEST_CASE("paw_thc_vs_exact_eri", "[hamilt][paw_erichk][!benchmark]")
       // at G=0 it reproduces sum_g |C(v,g)|^2 = <psi~_v|psi~_v> exactly.
       for (long g = 0; g < ngm; ++g) rho_sm_c(c, g) = pr(g2fft(g));
       for (long la = 0; la < N_aug; ++la)
-        A(c, la) = std::conj(Y(la,v)) * Y(la,c);
+        A(c, la) = std::conj(Y(la,v)) * Yc(la,c);
     }
     nda::blas::gemm(ComplexType(vol), A, eta, ComplexType(0.0), rho_aug_c);
+    csum() = 0.0;
     for (long c = 0; c < nbnd; ++c) {
-      double de = eig(0,k0,c) - eig(0,k0,v);
+      double de = eig(0,kc,c) - eig(0,k0,v);
+      for (long g = 0; g < ngm; ++g)
+        csum(g) += std::norm(rho_sm_c(c,g) + rho_aug_c(c,g));
       if (de < 1e-6) continue;
       double esm = 0.0, eae = 0.0;
       for (long g = 0; g < ngm; ++g) {
@@ -4796,7 +4840,18 @@ TEST_CASE("paw_thc_vs_exact_eri", "[hamilt][paw_erichk][!benchmark]")
       Dsm(v,b) += esm/de;
       Dex(v,b) += eae/de;
     }
+    for (long g = 0; g < ngm; ++g)
+      if (csum(g) > gate_max) {
+        gate_max = csum(g);
+        double Kx = q_cart[0]+gv(g,0), Ky = q_cart[1]+gv(g,1), Kz = q_cart[2]+gv(g,2);
+        gate_at_K = std::sqrt(Kx*Kx+Ky*Ky+Kz*Kz);
+      }
   }
+  app_log(1, "[erichk] completeness gate: max over ALL {} G of "
+             "sum_c |rho_vc(q+G)|^2 = {:.6f} at |q+G|={:.3f} a.u. "
+             "(exact limit 1, partial sums approach from below; a large "
+             "violation means the q sign fed to eta is wrong)",
+          ngm, gate_max, gate_at_K);
 
   // ---- THC side, through hf_t's exchange with a diagonal, energy-weighted
   // density matrix restricted to k0 and to one band decile. ignore_g0 so no
@@ -4818,9 +4873,12 @@ TEST_CASE("paw_thc_vs_exact_eri", "[hamilt][paw_erichk][!benchmark]")
         if (mpi.node_comm.root()) {
           sDm.local()() = ComplexType(0.0);
           for (long c = lo; c < hi; ++c) {
-            double de = eig(0,k0,c) - eig(0,k0,v);
+            double de = eig(0,kc,c) - eig(0,k0,v);
             if (de < 1e-6) continue;
-            sDm.local()(0,k0,c,c) = ComplexType(1.0/de, 0.0);
+            // Density matrix lives at the VIRTUAL k-point, so hf_t's exchange
+            // sum over k' collapses to k'=kc and F(k0,v,v) is exactly the
+            // q = k(kc)-k(k0) transition sum the exact side computed.
+            sDm.local()(0,kc,c,c) = ComplexType(1.0/de, 0.0);
           }
         }
         mpi.node_comm.barrier();
