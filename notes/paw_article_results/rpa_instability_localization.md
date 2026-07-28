@@ -340,8 +340,8 @@ converged settings the augmented oscillators satisfy completeness AND the
 assembled THC ERI reproduces the exact AE answer — yet E_c is still 151 mHa
 wrong. Neither the oscillators nor the ERI assembly is the defect.
 
-**The resolution is conditioning, not accuracy.** Two ratios from the same
-data:
+**A conditioning explanation was proposed here and is now REFUTED** (see §9).
+The argument was: two ratios from the same data,
 
     polarizability trace   D_smooth / D_AE    = 34.96 / 32.49 = 1.076   (7.6%)
     correlation energy     E_c(sm) / E_c(AE)  = 1.36  / 0.43  = 3.2     (220%)
@@ -359,14 +359,58 @@ Instrument added (`thc_rpa.icc`): a `RPA conditioning:` line reporting
 second-order cancellation; >> 1 means the block is running into the
 singularity.
 
-Open question, and the next measurement: NC at nbnd=500 has a comparable basis
-size and does NOT blow up, so what puts PAW's Pi*Z near the singularity? One
-structural candidate is that the augmentation basis is EXACTLY rank-deficient
-by construction — the polarization-identity split gives eta_+ = -eta_- for
-every off-diagonal (I,J) pair, so Z_LL is singular with a null space of
-dimension ~(nlambda - n_pairs) per atom, and Pi's numerical content in those
-directions is unprotected. `rpa_cond/` runs PAW n=250, PAW n=500 and NC n=500
-through the same solver with the new diagnostic to test it.
+## 9. Conditioning — REFUTED by its own diagnostic
+
+`rpa_cond/`, Si a=10.05, thresh 1e-5, paw_isdf_tol 1e-8:
+
+| run | max \|resid\|/(Tr^2/2) | log_det<0 / Tr>0 | E_c (Ha) |
+|---|---|---|---|
+| PAW n=250 | 2.21e-02 | none | −0.433243 |
+| PAW n=500 | 4.65e-01 | none | −0.582623 |
+
+Both well under 1, no physical violations anywhere. **E_c is squarely in the
+second-order regime; the RPA is not near the ln(1 − lambda) singularity.** The
+"220% from 7.6%" argument in §8 does not hold and is withdrawn.
+
+It was weak on its own terms and should have been flagged as such when written:
+the 7.6% is an AGGREGATE over all 40821 G, dominated by large \|q+G\| where the
+smooth excess is small, while the sum rule shows the excess reaching 2.98 at
+G = 0. The Pi error in the region E_c actually weights may well be ~200%,
+which needs no conditioning story at all.
+
+Two corrections to the diagnostic itself:
+- `|resid|/(Tr^2/2) ~ sum lambda^2/(sum lambda)^2 = 1/n_eff` is an INVERSE
+  PARTICIPATION RATIO (how few modes of Pi*Z carry a block), not a distance to
+  the singularity. What it does show, and this is real: the n=500 spectrum is
+  dominated by ~2 modes where n=250 spreads over ~45.
+- the report conflated two maxima over DIFFERENT (q, w) blocks. At the
+  largest-\|resid\| block (iq=0, iw=68) Tr moves only 5.6% and \|resid\| only
+  0.2% between n=250 and n=500 while E_c moves 34% — so that block is not
+  where the change lives.
+
+## 10. THE REMAINING GAP — the ERI is verified in AGGREGATE, not at the HEAD
+
+This is the honest state of the investigation and the next thing to test.
+
+Every ERI number in §8 is `D(v) = sum_c (vc|cv)/(eps_c - eps_v)` summed over
+ALL 40821 G of rho_g. That aggregate is dominated by large \|q+G\|, where the
+smooth excess is only ~7% (AE/smooth 0.9294) — so "THC = exact to 1e-4"
+establishes accuracy where the cancellation is MILD. It does not establish it
+at \|q+G\| -> 0, where the sum rule says the cancellation is 3:1 and where
+4pi/(Omega \|q+G\|^2) puts essentially all of E_c's weight. The q=0 runs are
+blind there by construction (`ignore_g0` removes G=0), and the q!=0 runs
+average it away.
+
+Test: `erichk_head.sbatch` sweeps `COQUI_ERICHK_AUGECUT` over
+0.05 / 0.2 / 1.0 / 4.0 / off at n=500, q!=0, full lambda rank. Restricting eta
+to \|q+G\|^2/2 <= AE on BOTH sides isolates the head's augmentation, so the
+THC/exact ratio at small AE is the head accuracy the aggregate never tested.
+
+CAUTION recorded because it already cost one run: the first attempt
+(job 6690036) returned byte-identical numbers for every cutoff INCLUDING
+"off", because rusty's test binary predated the `COQUI_ERICHK_AUGECUT`
+handling. If the sweep does not move `exact AE`, and the `eta truncated at ...`
+line is absent, the binary is stale — the result is void, not null.
 
 Constructing it is harder than the V_LL reference, and the asymmetry is the
 reason it was not done first. V_LL is a pure one-center object, so
