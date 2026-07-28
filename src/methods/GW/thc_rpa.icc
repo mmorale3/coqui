@@ -128,6 +128,20 @@ namespace methods {
       double cond_worst = 0.0, cond_worst_resid = 0.0, cond_worst_tr = 0.0;
       long   cond_worst_iq = -1, cond_worst_iw = -1;
 
+      // E_c = Tr(Pi*Z) + ln|det(I - Pi*Z)| accumulated SEPARATELY, then each
+      // put through the same transform, so the split is reported in energy
+      // units rather than as a raw frequency sum. The two are individually
+      // large and of opposite sign (E_c is their near-cancellation), so which
+      // one moves between two runs localizes a change far better than E_c
+      // does. Needed because the ERI is measured to add only ~1% to the
+      // polarizability over the 250->500 band window while E_c moves 34%,
+      // and conditioning is excluded -- so the two terms must be moving in a
+      // way the trace alone does not show.
+      nda::array<ComplexType, 2> e_tr_w(_ft->nw_b(), 1), e_ld_w(_ft->nw_b(), 1);
+      nda::array<ComplexType, 2> e_tr_t(_ft->nt_b(), 1), e_ld_t(_ft->nt_b(), 1);
+      nda::array<ComplexType, 1> e_tr(1), e_ld(1);
+      e_tr_w() = ComplexType(0.0); e_ld_w() = ComplexType(0.0);
+
       auto Pi_loc = dPi_wqPQ.local();
       auto Pi_PQ_loc = dPi_PQ.local();
       auto Z_PQ_loc = dZ_PQ.local();
@@ -148,6 +162,8 @@ namespace methods {
           ComplexType tr_PiZ(0.0);
           for (auto idx: diag_idx) {
             tr_PiZ += A_loc(idx.first, idx.second);
+            e_tr_w(wn, 0) += double(q_weight) * A_loc(idx.first, idx.second);
+            if (mwn != wn) e_tr_w(mwn, 0) += double(q_weight) * A_loc(idx.first, idx.second);
             e_rpa_w(wn, 0) += double(q_weight) * A_loc(idx.first, idx.second);
             if (mwn != wn) e_rpa_w(mwn, 0) += double(q_weight) * A_loc(idx.first, idx.second);
             A_loc(idx.first, idx.second) -= ComplexType(1.0);
@@ -212,16 +228,23 @@ namespace methods {
                     iq, wn, tr_PiZ.real(), log_det, resid,
                     quad > 0.0 ? resid/quad : 0.0);
           if (dA_PQ.communicator()->root()) {
-            cond_worst = std::max(cond_worst, quad > 0.0 ?
-                                  std::abs(resid)/quad : 0.0);
-            if (std::abs(resid) > std::abs(cond_worst_resid)) {
-              cond_worst_resid = resid;
+            // Track WHERE the most concentrated block is, not just its value.
+            // Measured: PAW n=500 hits 4.65e-01 while NC n=500 (1.99e-02) and
+            // PAW n=250 (2.21e-02) do not, so a single mode carries that block
+            // in exactly the case that misbehaves — and identifying (q, w) is
+            // the whole point of the number.
+            double ipr = (quad > 0.0) ? std::abs(resid)/quad : 0.0;
+            if (ipr > cond_worst) {
+              cond_worst = ipr;
               cond_worst_iq = iq; cond_worst_iw = wn;
               cond_worst_tr = tr_PiZ.real();
+              cond_worst_resid = resid;
             }
           }
 
           if (dA_PQ.communicator()->root()) {
+            e_ld_w(wn, 0) += double(q_weight) * log_det;
+            if (mwn != wn) e_ld_w(mwn, 0) += double(q_weight) * log_det;
             e_rpa_w(wn, 0) += double(q_weight) * log_det;
             if (mwn != wn) e_rpa_w(mwn, 0) += double(q_weight) * log_det;
           }
@@ -232,24 +255,55 @@ namespace methods {
         Z_PQ_loc = thc.Z(0, P_rng, Q_rng, qpool_id, pgrid[1], q_intra_comm);
 
       {
+        // The maximum is global but (iq, iw, Tr, resid) are per-rank, so a
+        // plain max on the value would be printed next to whichever block the
+        // ROOT happened to see. Reduce the value first, then let only the rank
+        // holding it contribute its identifying data (losers send sentinels
+        // that lose every elementwise max).
         double cw[2] = {cond_worst, std::abs(cond_worst_resid)};
         dPi_wqPQ.communicator()->all_reduce_in_place_n(cw, 2, mpi3::max<>{});
+        constexpr double LOSE = -std::numeric_limits<double>::max();
+        double who[4] = {LOSE, LOSE, LOSE, LOSE};
+        if (cond_worst == cw[0] && cond_worst > 0.0)
+          who[0] = (double)cond_worst_iq, who[1] = (double)cond_worst_iw,
+          who[2] = cond_worst_tr,         who[3] = cond_worst_resid;
+        dPi_wqPQ.communicator()->all_reduce_in_place_n(who, 4, mpi3::max<>{});
+        cond_worst_iq = (who[0] == LOSE) ? -1 : (long)who[0];
+        cond_worst_iw = (who[1] == LOSE) ? -1 : (long)who[1];
+        cond_worst_tr = (who[2] == LOSE) ? 0.0 : who[2];
+        cond_worst_resid = (who[3] == LOSE) ? 0.0 : who[3];
         if (mpi->comm.root())
           app_log(2, "  RPA spectrum: max 1/n_eff = |resid|/(Tr^2/2) = {:.4e} "
-                     "over all (q, w) [inverse participation ratio of Pi*Z: "
-                     "small = weight spread over many modes, ~1 = one or two "
-                     "dominate]. Largest single-block |Tr(Pi*Z)+ln|det|| = "
-                     "{:.6e} at iq={} iw={} (Tr there {:.6e}). NOTE the two "
-                     "are maxima over DIFFERENT blocks. Proximity to the "
-                     "ln(1-lambda) singularity is not measured here -- the "
-                     "exact test for that is the log_det<0 / Tr>0 warning.",
-                  cw[0], cond_worst_resid, cond_worst_iq, cond_worst_iw,
-                  cond_worst_tr);
+                     "at iq={} iw={} (Tr there {:.6e}, resid {:.6e}). This is "
+                     "the inverse participation ratio of Pi*Z -- small = weight "
+                     "spread over many modes, ~1 = a single mode carries the "
+                     "block. Reference values on Si a=10.05: NC n=500 "
+                     "1.99e-02, PAW n=250 2.21e-02, PAW n=500 4.65e-01, i.e. "
+                     "the concentration is specific to PAW at high band count. "
+                     "Proximity to the ln(1-lambda) singularity is a DIFFERENT "
+                     "question, tested exactly by the log_det<0 / Tr>0 warning.",
+                  cw[0], cond_worst_iq, cond_worst_iw, cond_worst_tr,
+                  cond_worst_resid);
       }
       dPi_wqPQ.communicator()->all_reduce_in_place_n(e_rpa_w.data(), e_rpa_w.size(), std::plus<>{});
       _ft->w_to_tau(e_rpa_w, e_rpa_t, imag_axes_ft::boson);
       _ft->tau_to_beta(e_rpa_t, e_rpa);
       e_rpa /= (2.0 * thc.MF()->nkpts());
+
+      dPi_wqPQ.communicator()->all_reduce_in_place_n(e_tr_w.data(), e_tr_w.size(), std::plus<>{});
+      dPi_wqPQ.communicator()->all_reduce_in_place_n(e_ld_w.data(), e_ld_w.size(), std::plus<>{});
+      _ft->w_to_tau(e_tr_w, e_tr_t, imag_axes_ft::boson);
+      _ft->w_to_tau(e_ld_w, e_ld_t, imag_axes_ft::boson);
+      _ft->tau_to_beta(e_tr_t, e_tr);
+      _ft->tau_to_beta(e_ld_t, e_ld);
+      e_tr /= (2.0 * thc.MF()->nkpts());
+      e_ld /= (2.0 * thc.MF()->nkpts());
+      app_log(2, "  RPA term split: Tr(Pi*Z) = {:.8f}, ln|det(I-Pi*Z)| = "
+                 "{:.8f}, sum = {:.8f} Ha. The two are individually large and "
+                 "opposite in sign; E_c is what survives their cancellation, "
+                 "so comparing the split across runs localizes a change that "
+                 "E_c alone hides.",
+              e_tr(0).real(), e_ld(0).real(), e_rpa(0).real());
       if (e_rpa(0).imag()/e_rpa(0).real() >= 1e-10) {
         app_log(2, "** Warning **: e_rpa.imag()/e_rpa.real() = {}, e_rpa.real() = {}, e_rpa.imag() = {}",
                 e_rpa(0).imag()/e_rpa(0).real(), e_rpa(0).real(), e_rpa(0).imag());
