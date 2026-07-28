@@ -2,7 +2,11 @@
 # takes ~1806 s uncontended on an M-series laptop, so the suite reports a SPURIOUS failure
 # with the stock timeout (and worse on anything slower, or when another job shares the box).
 # Raise it here rather than per-test so a slow machine does not report phantom regressions.
-set(COQUI_VERTEX_TEST_TIMEOUT 5400 CACHE STRING "ctest timeout (s) for the vertex tests")
+# 2026-07-28: raised again to 14400 s -- test_methods_vertex_gf2xchk exceeded 5400 s while still
+# working (it had already passed its key assertion, lambda = 1.0000000000 with residual 9.7e-13).
+# NOTE a per-test TIMEOUT property OVERRIDES ctest --timeout, so raising it here is the only
+# thing that actually takes effect.
+set(COQUI_VERTEX_TEST_TIMEOUT 14400 CACHE STRING "ctest timeout (s) for the vertex tests")
 
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${PROJECT_UNIT_TEST_DIR})
