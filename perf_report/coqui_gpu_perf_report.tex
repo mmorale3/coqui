@@ -106,6 +106,17 @@ forcing UCX CUDA transports does not help). Pre-existing (May 16-rank run died
 identically). &
 Blocks all large GPU runs. Workaround: pre-build the ERI at $\leq$8 GPU ranks or on CPU,
 \texttt{save=}, load everywhere (also guarantees identical integrals across runs). \\
+B6 & \statusopen{} / \statuswkr{} &
+Device ISDF interpolating-point selection
+(\texttt{chol\_metric\_impl<DEVICE\_MEMORY>}, \texttt{thc.icc:1073}) selects \emph{zero}
+Cholesky vectors on \textbf{sm90/H100} and aborts; identical source and input on
+sm80/A100 build normally. &
+Blocks THC/ERI construction on H100. Attribution is controlled: A100 yields $N_p$=1275
+and $E$=0.514582271575844 \emph{bit-identically} before and after the allocator/pool
+commits, and the CPU path agrees --- the failure tracks architecture, not code version.
+Unseen until now because every H100 run loaded a prebuilt ERI. Workaround: build the ERI
+on A100 or CPU (\texttt{save=}) and load it on H100. Suspects: cuSOLVER / SLATE
+(GPU\_H100 build) / cuTENSOR behaviour on sm90. \\
 B4 & \statusopen{} &
 $\mu$-search bracketing walk (\texttt{scf\_common.cpp:190-202}) is silent and uncapped
 (0.2 a.u.\ steps, no iteration limit, no logging). &
