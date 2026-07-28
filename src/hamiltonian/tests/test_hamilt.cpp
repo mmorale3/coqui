@@ -4150,15 +4150,30 @@ TEST_CASE("thc_vgl_vll_band_scan", "[hamilt][thc][bandscan][!benchmark]")
   auto Pskna=V.Pskna_view(); auto const& ityp=V.ityp_view();
   auto const& nh_v=V.nh_view(); auto const& ofs=V.ofs_view();
   long nat=ityp.extent(0);
-  // Direct (non-factorized) comp-comp diagonal only — the off-diagonals are not
-  // needed and nbnd^2 would be wasteful at nbnd=500.
+  // Occupied-band count: the RPA polarizability is built from occupied->virtual
+  // TRANSITION pair densities rho_vc, not from band densities rho_ii. V_H is
+  // multiplicative, so <v|V_H|c> IS rho_vc contracted with the potential — that
+  // is the object the blow-up actually involves, so probe it as well as the
+  // diagonal. nocc is small (4 for Si), so the (v,c) block costs nocc*nbnd.
+  long nocc=0;
+  for(long n=0;n<nbnd;++n) if(std::abs(occ(0,0,n))>1e-6) nocc=n+1;
+  nocc=std::max(1L,nocc);
+  app_log(1,"[band scan] nocc={} — probing diagonal (i,i) and occ->virt (v,i) v<{}",nocc,nocc);
+
+  // Direct (non-factorized) comp-comp: diagonal (i,i) and the occ->virt rows
+  // (v,i), v < nocc. Full nbnd^2 would be wasteful at nbnd=500.
   nda::array<ComplexType,3> dirLL(nspin,nk_ibz,nbnd); dirLL()=ComplexType(0.0);
+  nda::array<ComplexType,4> dirOV(nspin,nk_ibz,nocc,nbnd); dirOV()=ComplexType(0.0);
   for(long s=0;s<nspin;++s)for(long k=0;k<nk_ibz;++k)
     for(long ia=0;ia<nat;++ia){int nt=ityp(ia);int nh_a=nh_v(nt);if(nh_a==0)continue;long p0=ofs(ia);
       for(long i=0;i<nbnd;++i){ComplexType acc(0.0);
         for(int I=0;I<nh_a;++I){ComplexType PiI=std::conj(Pskna(s,k,p0+I,i));
           for(int J=0;J<nh_a;++J) acc+=PiI*(dD_Vc(ia,I,J)-dD_0(ia,I,J))*Pskna(s,k,p0+J,i);}
-        dirLL(s,k,i)+=acc;}}
+        dirLL(s,k,i)+=acc;}
+      for(long v=0;v<nocc;++v)for(long i=0;i<nbnd;++i){ComplexType acc(0.0);
+        for(int I=0;I<nh_a;++I){ComplexType PvI=std::conj(Pskna(s,k,p0+I,v));
+          for(int J=0;J<nh_a;++J) acc+=PvI*(dD_Vc(ia,I,J)-dD_0(ia,I,J))*Pskna(s,k,p0+J,i);}
+        dirOV(s,k,v,i)+=acc;}}
 
   auto sDm=make_shared_array<array_view_4d_t>(mpi,{nspin,nk_ibz,nbnd,nbnd});
   if(mpi.node_comm.root()){sDm.local()()=ComplexType(0.0);
@@ -4175,9 +4190,11 @@ TEST_CASE("thc_vgl_vll_band_scan", "[hamilt][thc][bandscan][!benchmark]")
     auto sVH=make_shared_array<array_view_4d_t>(mpi,{nspin,nk_ibz,nbnd,nbnd});
     methods::solvers::hf_t hf(methods::ignore_g0);
     hf.evaluate(sVH,sDm.local(),thc,sS.local(),true,false);
-    nda::array<ComplexType,3> o(nspin,nk_ibz,nbnd);
-    for(long s=0;s<nspin;++s)for(long k=0;k<nk_ibz;++k)for(long i=0;i<nbnd;++i)
-      o(s,k,i)=sVH.local()(s,k,i,i);
+    // diagonal (i,i) packed at v=nocc, occ->virt rows (v,i) at v<nocc
+    nda::array<ComplexType,4> o(nspin,nk_ibz,nocc+1,nbnd);
+    for(long s=0;s<nspin;++s)for(long k=0;k<nk_ibz;++k)for(long i=0;i<nbnd;++i){
+      o(s,k,nocc,i)=sVH.local()(s,k,i,i);
+      for(long v=0;v<nocc;++v) o(s,k,v,i)=sVH.local()(s,k,v,i); }
     return o; };
   auto VH_smooth=thcVH(false,false);
   auto VH_vgl   =thcVH(true,false);
@@ -4186,26 +4203,35 @@ TEST_CASE("thc_vgl_vll_band_scan", "[hamilt][thc][bandscan][!benchmark]")
   // Bin by band index: relative error of the THC V_LL block against direct,
   // plus the magnitudes of both aug blocks so the cancellation is visible.
   const int NBIN=10;
-  std::vector<double> mx(NBIN,0.0), sum(NBIN,0.0), mLL(NBIN,0.0), mGL(NBIN,0.0);
-  std::vector<long> cnt(NBIN,0);
-  for(long s=0;s<nspin;++s)for(long k=0;k<nk_ibz;++k)for(long i=0;i<nbnd;++i){
-    int b=(int)std::min((long)NBIN-1,(i*NBIN)/std::max(1L,nbnd));
-    ComplexType t=VH_vll(s,k,i)-VH_smooth(s,k,i);
-    ComplexType g=VH_vgl(s,k,i)-VH_smooth(s,k,i);
-    ComplexType d=dirLL(s,k,i);
-    double rel=std::abs(t-d)/std::max(1e-12,std::abs(d));
-    mx[b]=std::max(mx[b],rel); sum[b]+=rel; ++cnt[b];
-    mLL[b]=std::max(mLL[b],std::abs(d)); mGL[b]=std::max(mGL[b],std::abs(g));
-  }
-  app_log(1,"[band scan] nbnd={} — relative error of THC V_LL vs direct comp-comp, by band decile",nbnd);
-  app_log(1,"[band scan] {:>10} {:>12} {:>12} {:>12} {:>12}",
-          "bands","max rel","mean rel","max|V_LL|","max|V_GL|");
-  for(int b=0;b<NBIN;++b){
-    if(cnt[b]==0) continue;
-    long lo=(b*nbnd)/NBIN, hi=((b+1)*nbnd)/NBIN-1;
-    app_log(1,"[band scan] {:>4}-{:<5} {:12.4e} {:12.4e} {:12.4e} {:12.4e}",
-            lo,hi,mx[b],sum[b]/cnt[b],mLL[b],mGL[b]);
-  }
+  auto report=[&](char const* what, long vlo, long vhi){
+    std::vector<double> mx(NBIN,0.0), sum(NBIN,0.0), mLL(NBIN,0.0), mGL(NBIN,0.0);
+    std::vector<long> cnt(NBIN,0);
+    for(long s=0;s<nspin;++s)for(long k=0;k<nk_ibz;++k)
+      for(long v=vlo;v<vhi;++v)for(long i=0;i<nbnd;++i){
+        int b=(int)std::min((long)NBIN-1,(i*NBIN)/std::max(1L,nbnd));
+        ComplexType t=VH_vll(s,k,v,i)-VH_smooth(s,k,v,i);
+        ComplexType g=VH_vgl(s,k,v,i)-VH_smooth(s,k,v,i);
+        ComplexType d=(v==nocc)?dirLL(s,k,i):dirOV(s,k,v,i);
+        // Skip elements where the reference is numerically absent: a relative
+        // error against ~0 is meaningless, not a defect.
+        if(std::abs(d)<1e-10) continue;
+        double rel=std::abs(t-d)/std::abs(d);
+        mx[b]=std::max(mx[b],rel); sum[b]+=rel; ++cnt[b];
+        mLL[b]=std::max(mLL[b],std::abs(d)); mGL[b]=std::max(mGL[b],std::abs(g));
+      }
+    app_log(1,"[band scan] --- {} : relative error of THC V_LL vs direct comp-comp, by band decile ---",what);
+    app_log(1,"[band scan] {:>10} {:>12} {:>12} {:>12} {:>12} {:>8}",
+            "bands","max rel","mean rel","max|V_LL|","max|V_GL|","n");
+    for(int b=0;b<NBIN;++b){
+      if(cnt[b]==0) continue;
+      long lo=(b*nbnd)/NBIN, hi=((b+1)*nbnd)/NBIN-1;
+      app_log(1,"[band scan] {:>4}-{:<5} {:12.4e} {:12.4e} {:12.4e} {:12.4e} {:8}",
+              lo,hi,mx[b],sum[b]/cnt[b],mLL[b],mGL[b],cnt[b]);
+    }
+  };
+  app_log(1,"[band scan] nbnd={}",nbnd);
+  report("diagonal (i,i)", nocc, nocc+1);
+  report("occ->virt (v,i), v<nocc — the RPA transition pair densities", 0, nocc);
   REQUIRE(nbnd>0);
 }
 
