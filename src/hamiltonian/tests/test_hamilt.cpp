@@ -4091,11 +4091,21 @@ TEST_CASE("thc_vgl_vll_band_scan", "[hamilt][thc][bandscan][!benchmark]")
   auto psi = mf::read_distributed_orbital_set_ibz<larray>(
       mfobj, mpi.comm, 'w', std::array<long,4>{0,0,0,0},
       range(nspin), range(nk_ibz), range(nbnd), std::array<long,4>{1,1,2048,2048});
-  auto fft_mesh=mfobj.fft_grid_dim(); auto recv=mfobj.recv();
+  // The DENSE augmentation mesh, not the smooth one. pseudopot is constructed
+  // with fft_mesh_aug (pseudopot.cpp:65 "dense grid: vsc, vloc, mill_g, all PAW
+  // augmentation pieces"), so compute_paw_deeq expects a local potential of
+  // length nnr_aug. thc_vgl_vll_split passes the smooth mesh, which is only
+  // correct when the two coincide (they do for the QE LiH fixture); on an
+  // ABINIT-converted MF they differ, the short array reads out of bounds, and
+  // deeq comes back all-NaN. Same convention as ab_direct_vh_trace_split.
+  auto fft_mesh=mfobj.fft_grid_dim_aug(); auto recv=mfobj.recv();
   auto kpts_full=mfobj.kpts(); auto kp_to_ibz=mfobj.kp_to_ibz();
   auto kp_trev=mfobj.kp_trev(); auto kp_symm=mfobj.kp_symm();
   auto symm_list=mfobj.symm_list(); auto k2g=V.swfc_to_rho_view();
   long nnr=(long)fft_mesh(0)*fft_mesh(1)*fft_mesh(2);
+  app_log(1,"[band scan] smooth mesh {}x{}x{} | aug mesh {}x{}x{} (nnr_aug={})",
+          mfobj.fft_grid_dim(0),mfobj.fft_grid_dim(1),mfobj.fft_grid_dim(2),
+          fft_mesh(0),fft_mesh(1),fft_mesh(2),nnr);
   double det_B=recv(0,0)*(recv(1,1)*recv(2,2)-recv(1,2)*recv(2,1))
              - recv(1,0)*(recv(0,1)*recv(2,2)-recv(0,2)*recv(2,1))
              + recv(2,0)*(recv(0,1)*recv(1,2)-recv(0,2)*recv(1,1));
@@ -4144,11 +4154,29 @@ TEST_CASE("thc_vgl_vll_band_scan", "[hamilt][thc][bandscan][!benchmark]")
   }
   mpi.comm.broadcast_n(Vcomp_r.data(),Vcomp_r.size(),0);
 
+  // A non-finite reference silently produces a table of "0 / nan" (NaN defeats
+  // both the <1e-10 skip and std::max), which reads like a clean result. Check
+  // each intermediate and name the first one that goes bad.
+  auto chk=[&](char const* name, auto const& a){
+    double mx=0.0; long nbad=0;
+    for(auto const& z : a){ double m=std::abs(z);
+      if(!std::isfinite(m)) ++nbad; else mx=std::max(mx,m); }
+    app_log(1,"[band scan] {:<22} max|.|={:.4e} non-finite={}",name,mx,nbad);
+    return nbad; };
+  long bad=0;
+  bad+=chk("rho_smooth",rho_sm); bad+=chk("rho_total",rho_tot);
+  bad+=chk("V_comp(r)",Vcomp_r);
+
   nda::array<ComplexType,1> empty_v;
   auto dD_Vc = V.compute_paw_deeq(nii, Vcomp_r, false);
   auto dD_0  = V.compute_paw_deeq(nii, empty_v, false);
+  bad+=chk("deeq[V_comp]",dD_Vc); bad+=chk("deeq[0]",dD_0);
   auto Pskna=V.Pskna_view(); auto const& ityp=V.ityp_view();
   auto const& nh_v=V.nh_view(); auto const& ofs=V.ofs_view();
+  bad+=chk("Pskna",Pskna);
+  utils::check(bad==0,"thc_vgl_vll_band_scan: the direct reference is non-finite "
+      "(see the [band scan] max|.| lines above for the first bad intermediate). "
+      "Refusing to report a relative-error table built on it.");
   long nat=ityp.extent(0);
   // Occupied-band count: the RPA polarizability is built from occupied->virtual
   // TRANSITION pair densities rho_vc, not from band densities rho_ii. V_H is
@@ -4204,7 +4232,14 @@ TEST_CASE("thc_vgl_vll_band_scan", "[hamilt][thc][bandscan][!benchmark]")
   // plus the magnitudes of both aug blocks so the cancellation is visible.
   const int NBIN=10;
   auto report=[&](char const* what, long vlo, long vhi){
-    std::vector<double> mx(NBIN,0.0), sum(NBIN,0.0), mLL(NBIN,0.0), mGL(NBIN,0.0);
+    // Report ABSOLUTE error as the primary metric: it is what propagates into
+    // the energy, and it cannot be inflated by a near-zero reference the way a
+    // relative error can. `rel@max` is the relative error AT the worst-absolute
+    // element (not a max over a different element), and |ref|@max its
+    // reference, so the three columns describe one element and can be read
+    // together honestly.
+    std::vector<double> mabs(NBIN,0.0), sabs(NBIN,0.0), relAt(NBIN,0.0),
+                        refAt(NBIN,0.0), mLL(NBIN,0.0), mGL(NBIN,0.0);
     std::vector<long> cnt(NBIN,0);
     for(long s=0;s<nspin;++s)for(long k=0;k<nk_ibz;++k)
       for(long v=vlo;v<vhi;++v)for(long i=0;i<nbnd;++i){
@@ -4212,21 +4247,20 @@ TEST_CASE("thc_vgl_vll_band_scan", "[hamilt][thc][bandscan][!benchmark]")
         ComplexType t=VH_vll(s,k,v,i)-VH_smooth(s,k,v,i);
         ComplexType g=VH_vgl(s,k,v,i)-VH_smooth(s,k,v,i);
         ComplexType d=(v==nocc)?dirLL(s,k,i):dirOV(s,k,v,i);
-        // Skip elements where the reference is numerically absent: a relative
-        // error against ~0 is meaningless, not a defect.
-        if(std::abs(d)<1e-10) continue;
-        double rel=std::abs(t-d)/std::abs(d);
-        mx[b]=std::max(mx[b],rel); sum[b]+=rel; ++cnt[b];
-        mLL[b]=std::max(mLL[b],std::abs(d)); mGL[b]=std::max(mGL[b],std::abs(g));
+        double ae=std::abs(t-d), ad=std::abs(d);
+        if(ae>mabs[b]){ mabs[b]=ae; refAt[b]=ad;
+                        relAt[b]=ae/std::max(1e-30,ad); }
+        sabs[b]+=ae; ++cnt[b];
+        mLL[b]=std::max(mLL[b],ad); mGL[b]=std::max(mGL[b],std::abs(g));
       }
-    app_log(1,"[band scan] --- {} : relative error of THC V_LL vs direct comp-comp, by band decile ---",what);
-    app_log(1,"[band scan] {:>10} {:>12} {:>12} {:>12} {:>12} {:>8}",
-            "bands","max rel","mean rel","max|V_LL|","max|V_GL|","n");
+    app_log(1,"[band scan] --- {} : THC V_LL vs direct comp-comp, by band decile ---",what);
+    app_log(1,"[band scan] {:>10} {:>12} {:>12} {:>12} {:>12} {:>12} {:>12} {:>8}",
+            "bands","max |abs|","mean |abs|","rel@max","|ref|@max","max|V_LL|","max|V_GL|","n");
     for(int b=0;b<NBIN;++b){
       if(cnt[b]==0) continue;
       long lo=(b*nbnd)/NBIN, hi=((b+1)*nbnd)/NBIN-1;
-      app_log(1,"[band scan] {:>4}-{:<5} {:12.4e} {:12.4e} {:12.4e} {:12.4e} {:8}",
-              lo,hi,mx[b],sum[b]/cnt[b],mLL[b],mGL[b],cnt[b]);
+      app_log(1,"[band scan] {:>4}-{:<5} {:12.4e} {:12.4e} {:12.4e} {:12.4e} {:12.4e} {:12.4e} {:8}",
+              lo,hi,mabs[b],sabs[b]/cnt[b],relAt[b],refAt[b],mLL[b],mGL[b],cnt[b]);
     }
   };
   app_log(1,"[band scan] nbnd={}",nbnd);
