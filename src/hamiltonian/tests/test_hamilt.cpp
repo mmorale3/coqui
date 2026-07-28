@@ -4740,6 +4740,28 @@ TEST_CASE("paw_thc_vs_exact_eri", "[hamilt][paw_erichk][!benchmark]")
           range(0, N_aug), gr, sub);
     }
   }
+  // |q+G| resolution on BOTH sides. hf_t returns only the total, so the THC
+  // side cannot be split by G directly -- but paw_aug_ecut truncates eta at a
+  // |q+G| cutoff inside the THC, and applying the SAME cut to eta here makes
+  // "THC with eta cut at Gc" vs "exact with eta cut at Gc" a well-posed
+  // G-resolved comparison. Sweeping Gc then localizes any discrepancy in
+  // |q+G|, which matters because the cancellation the augmentation has to
+  // perform is mild at large |q+G| and severe as q+G -> 0, where the smooth
+  // oscillator tends to <psi~_v|psi~_c> != 0 while the AE one tends to 0.
+  double aug_ecut = env_d("COQUI_ERICHK_AUGECUT", 0.0);
+  if (aug_ecut > 0.0) {
+    double K2cut = 2.0*aug_ecut;
+    long ncut = 0;
+    for (long g = 0; g < ngm; ++g) {
+      double Kx = q_cart[0]+gv(g,0), Ky = q_cart[1]+gv(g,1), Kz = q_cart[2]+gv(g,2);
+      if (Kx*Kx+Ky*Ky+Kz*Kz <= K2cut) continue;
+      ++ncut;
+      for (long la = 0; la < N_aug; ++la) eta(la, g) = ComplexType(0.0);
+    }
+    app_log(1, "[erichk] eta truncated at |q+G|^2/2 <= {:.3f} Ha "
+               "(|q+G| <= {:.3f} a.u.): {} of {} G zeroed",
+            aug_ecut, std::sqrt(K2cut), ncut, ngm);
+  }
   auto Pskna = V.Pskna_view();
   nda::array<ComplexType,2> Y(N_aug, nbnd), Yc(N_aug, nbnd);
   hamilt::paw::fill_Y_rows_for_sk(V, isdf, layout, npol, 0, k0, Pskna, Y);
@@ -4864,6 +4886,7 @@ TEST_CASE("paw_thc_vs_exact_eri", "[hamilt][paw_erichk][!benchmark]")
                                              thresh, mfobj.ecutrho());
     pt.put("paw_aug", aug); pt.put("paw_isdf_metric","coulomb");
     pt.put("paw_isdf_tol", isdf_tol); pt.put("paw_onsite", false);
+    if (aug_ecut > 0.0) pt.put("paw_aug_ecut", aug_ecut);
     methods::thc_reader_t thc(mf_ptr, pt);
     methods::solvers::hf_t hf(methods::ignore_g0);
     nda::array<double,2> D(nocc, NBIN); D() = 0.0;
