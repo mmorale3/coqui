@@ -4023,6 +4023,182 @@ TEST_CASE("thc_vgl_vll_split", "[hamilt][paw][thc][onecenter]")
 }
 
 // ===========================================================================
+// BAND-RESOLVED THC-vs-direct check of the PAW augmentation blocks.
+//
+// Motivation (notes/paw_article_results/rpa_instability_localization.md): the
+// CoQui RPA blow-up on Si/jth_with_d is a near-cancellation, not a missing
+// term. V_GL and V_LL are each ~2.3-2.4 Ha in the n=250->500 band increment
+// and cancel to a 153 mHa residual where ABINIT, on a bit-identical mean
+// field, leaves 6 mHa. A ~6% relative error in either block reproduces the
+// entire residual, and no toml knob moves it (one-center, ISDF/THC tolerance,
+// compensation mode and aug_lmax are each worth <=4 mHa).
+//
+// So measure that relative error DIRECTLY, resolved by band index. Reference
+// is the same direct, non-factorized comp-comp element that thc_vgl_vll_split
+// validates to ratio 1.0000 at 16 bands: compute_paw_deeq(V_comp) contracted
+// with the projectors. If the relative error grows with band index, the joint
+// smooth+aug basis cannot represent the cancellation at high virtuals and the
+// mechanism is confirmed; if it is flat, the defect lies elsewhere.
+//
+// MF, band count and tolerances are env-parameterized so one binary serves the
+// checked-in fixture locally and the 500-band Si MF on the cluster:
+//   COQUI_BANDSCAN_DIR      outdir holding the MF (default: LiH PAW fixture)
+//   COQUI_BANDSCAN_PREFIX   MF prefix
+//   COQUI_BANDSCAN_SRC      "qe" | "bdft"
+//   COQUI_BANDSCAN_NBND     band count (-1 = all)
+//   COQUI_BANDSCAN_ISDF_TOL paw_isdf_tol   (default 1e-12, as in the split test)
+//   COQUI_BANDSCAN_THRESH   THC thresh     (default 1e-5)
+// ===========================================================================
+TEST_CASE("thc_vgl_vll_band_scan", "[hamilt][thc][bandscan][!benchmark]")
+{
+  using math::shm::make_shared_array;
+  auto& mpip = utils::make_unit_test_mpi_context();
+  auto& mpi = *mpip;
+  using nda::range;
+
+  auto env_s = [](char const* k, std::string d) {
+    char const* v = std::getenv(k); return v ? std::string(v) : d; };
+  auto env_d = [&](char const* k, double d) {
+    char const* v = std::getenv(k); return v ? std::stod(v) : d; };
+  auto env_i = [&](char const* k, int d) {
+    char const* v = std::getenv(k); return v ? std::stoi(v) : d; };
+
+  std::string dir = env_s("COQUI_BANDSCAN_DIR", "");
+  int    nbnd_req = env_i("COQUI_BANDSCAN_NBND", -1);
+  double isdf_tol = env_d("COQUI_BANDSCAN_ISDF_TOL", 1e-12);
+  double thresh   = env_d("COQUI_BANDSCAN_THRESH", 1e-5);
+
+  std::shared_ptr<mf::MF> mf_ptr;
+  if (dir.empty()) {
+    // Default: the same fixture thc_vgl_vll_split validates against.
+    mf_ptr = std::make_shared<mf::MF>(
+        mf::default_MF(mpip, "qe_lih222_paw_hf", mf::h5_input_type));
+  } else {
+    auto src = (env_s("COQUI_BANDSCAN_SRC", "bdft") == "qe") ? mf::qe_source
+                                                             : mf::bdft_source;
+    mf_ptr = std::make_shared<mf::MF>(
+        mf::make_MF(mpip, src, dir, env_s("COQUI_BANDSCAN_PREFIX", "mf"),
+                    mf::h5_input_type, 0.0, nbnd_req));
+  }
+  auto& mfobj = *mf_ptr;
+  long nspin = mfobj.nspin(), nk_ibz = mfobj.nkpts_ibz(), nbnd = mfobj.nbnd();
+  int npol = mfobj.npol();
+  app_log(1, "[band scan] nbnd={} nk_ibz={} isdf_tol={:.1e} thresh={:.1e}",
+          nbnd, nk_ibz, isdf_tol, thresh);
+  hamilt::pseudopot V(mfobj);
+
+  using larray = memory::array<HOST_MEMORY, ComplexType, 4>;
+  auto psi = mf::read_distributed_orbital_set_ibz<larray>(
+      mfobj, mpi.comm, 'w', std::array<long,4>{0,0,0,0},
+      range(nspin), range(nk_ibz), range(nbnd), std::array<long,4>{1,1,2048,2048});
+  auto fft_mesh=mfobj.fft_grid_dim(); auto recv=mfobj.recv();
+  auto kpts_full=mfobj.kpts(); auto kp_to_ibz=mfobj.kp_to_ibz();
+  auto kp_trev=mfobj.kp_trev(); auto kp_symm=mfobj.kp_symm();
+  auto symm_list=mfobj.symm_list(); auto k2g=V.swfc_to_rho_view();
+  long nnr=(long)fft_mesh(0)*fft_mesh(1)*fft_mesh(2);
+  double det_B=recv(0,0)*(recv(1,1)*recv(2,2)-recv(1,2)*recv(2,1))
+             - recv(1,0)*(recv(0,1)*recv(2,2)-recv(0,2)*recv(2,1))
+             + recv(2,0)*(recv(0,1)*recv(1,2)-recv(0,2)*recv(1,1));
+  double vol=(2.0*M_PI)*(2.0*M_PI)*(2.0*M_PI)/std::abs(det_B);
+
+  nda::array<ComplexType,3> nii(nspin,nk_ibz,nbnd);
+  for(long s=0;s<nspin;++s)for(long k=0;k<nk_ibz;++k)for(long n=0;n<nbnd;++n)
+    nii(s,k,n)=ComplexType(0.5+0.3*std::cos(1.3*n+0.7*k+0.2*s),0.0);
+
+  // ρ_smooth, ρ_tot → ρ_comp → V_comp(r), exactly as in thc_vgl_vll_split.
+  auto rho_sm=hamilt::paw::build_total_density_r(mpi,V,npol,fft_mesh,recv,k2g,
+      kpts_full,kp_to_ibz,kp_trev,kp_symm,symm_list,nii,psi,vol,false);
+  auto rho_tot=hamilt::paw::build_total_density_r(mpi,V,npol,fft_mesh,recv,k2g,
+      kpts_full,kp_to_ibz,kp_trev,kp_symm,symm_list,nii,psi,vol,true);
+  nda::array<ComplexType,1> Vcomp_r(nnr); Vcomp_r()=ComplexType(0.0);
+  if(mpi.comm.root()){
+    long NX=fft_mesh(0),NY=fft_mesh(1),NZ=fft_mesh(2);
+    nda::array<ComplexType,1> g(nnr);
+    for(long r=0;r<nnr;++r) g(r)=ComplexType(rho_tot(r)-rho_sm(r),0.0);
+    auto g3d=nda::reshape(g,std::array<long,3>{NX,NY,NZ});
+    math::nda::fft<false> Ff(g3d); Ff.forward(g3d);
+    for(long n1=0;n1<NX;++n1){int m1=(n1<=NX/2)?(int)n1:(int)n1-(int)NX;
+     for(long n2=0;n2<NY;++n2){int m2=(n2<=NY/2)?(int)n2:(int)n2-(int)NY;
+      for(long n3=0;n3<NZ;++n3){int m3=(n3<=NZ/2)?(int)n3:(int)n3-(int)NZ;
+        long N=(n1*NY+n2)*NZ+n3;
+        if(m1==0&&m2==0&&m3==0){g(N)=ComplexType(0.0);continue;}
+        double Gx=m1*recv(0,0)+m2*recv(1,0)+m3*recv(2,0);
+        double Gy=m1*recv(0,1)+m2*recv(1,1)+m3*recv(2,1);
+        double Gz=m1*recv(0,2)+m2*recv(1,2)+m3*recv(2,2);
+        g(N)*=ComplexType(4.0*M_PI/(Gx*Gx+Gy*Gy+Gz*Gz),0.0);
+      }}}
+    auto g3d2=nda::reshape(g,std::array<long,3>{NX,NY,NZ});
+    math::nda::fft<false> Fb(g3d2); Fb.backward(g3d2);
+    for(long r=0;r<nnr;++r) Vcomp_r(r)=g(r);
+  }
+  mpi.comm.broadcast_n(Vcomp_r.data(),Vcomp_r.size(),0);
+
+  nda::array<ComplexType,1> empty_v;
+  auto dD_Vc = V.compute_paw_deeq(nii, Vcomp_r, false);
+  auto dD_0  = V.compute_paw_deeq(nii, empty_v, false);
+  auto Pskna=V.Pskna_view(); auto const& ityp=V.ityp_view();
+  auto const& nh_v=V.nh_view(); auto const& ofs=V.ofs_view();
+  long nat=ityp.extent(0);
+  // Direct (non-factorized) comp-comp diagonal only — the off-diagonals are not
+  // needed and nbnd^2 would be wasteful at nbnd=500.
+  nda::array<ComplexType,3> dirLL(nspin,nk_ibz,nbnd); dirLL()=ComplexType(0.0);
+  for(long s=0;s<nspin;++s)for(long k=0;k<nk_ibz;++k)
+    for(long ia=0;ia<nat;++ia){int nt=ityp(ia);int nh_a=nh_v(nt);if(nh_a==0)continue;long p0=ofs(ia);
+      for(long i=0;i<nbnd;++i){ComplexType acc(0.0);
+        for(int I=0;I<nh_a;++I){ComplexType PiI=std::conj(Pskna(s,k,p0+I,i));
+          for(int J=0;J<nh_a;++J) acc+=PiI*(dD_Vc(ia,I,J)-dD_0(ia,I,J))*Pskna(s,k,p0+J,i);}
+        dirLL(s,k,i)+=acc;}}
+
+  auto sDm=make_shared_array<array_view_4d_t>(mpi,{nspin,nk_ibz,nbnd,nbnd});
+  if(mpi.node_comm.root()){sDm.local()()=ComplexType(0.0);
+    for(long s=0;s<nspin;++s)for(long k=0;k<nk_ibz;++k)for(long a=0;a<nbnd;++a)sDm.local()(s,k,a,a)=nii(s,k,a);}
+  mpi.node_comm.barrier();
+  auto sS=make_shared_array<array_view_4d_t>(mpi,{nspin,nk_ibz,nbnd,nbnd});
+  hamilt::set_ovlp(mfobj,sS);
+  auto thcVH=[&](bool vgl,bool vll){
+    auto pt=methods::make_thc_reader_ptree(0,"","incore","","bdft",thresh,mfobj.ecutrho());
+    pt.put("paw_aug",true); pt.put("paw_isdf_metric","coulomb");
+    pt.put("paw_isdf_tol",isdf_tol);
+    pt.put("paw_vgl",vgl); pt.put("paw_vll",vll); pt.put("paw_onsite",false);
+    methods::thc_reader_t thc(mf_ptr,pt);
+    auto sVH=make_shared_array<array_view_4d_t>(mpi,{nspin,nk_ibz,nbnd,nbnd});
+    methods::solvers::hf_t hf(methods::ignore_g0);
+    hf.evaluate(sVH,sDm.local(),thc,sS.local(),true,false);
+    nda::array<ComplexType,3> o(nspin,nk_ibz,nbnd);
+    for(long s=0;s<nspin;++s)for(long k=0;k<nk_ibz;++k)for(long i=0;i<nbnd;++i)
+      o(s,k,i)=sVH.local()(s,k,i,i);
+    return o; };
+  auto VH_smooth=thcVH(false,false);
+  auto VH_vgl   =thcVH(true,false);
+  auto VH_vll   =thcVH(false,true);
+
+  // Bin by band index: relative error of the THC V_LL block against direct,
+  // plus the magnitudes of both aug blocks so the cancellation is visible.
+  const int NBIN=10;
+  std::vector<double> mx(NBIN,0.0), sum(NBIN,0.0), mLL(NBIN,0.0), mGL(NBIN,0.0);
+  std::vector<long> cnt(NBIN,0);
+  for(long s=0;s<nspin;++s)for(long k=0;k<nk_ibz;++k)for(long i=0;i<nbnd;++i){
+    int b=(int)std::min((long)NBIN-1,(i*NBIN)/std::max(1L,nbnd));
+    ComplexType t=VH_vll(s,k,i)-VH_smooth(s,k,i);
+    ComplexType g=VH_vgl(s,k,i)-VH_smooth(s,k,i);
+    ComplexType d=dirLL(s,k,i);
+    double rel=std::abs(t-d)/std::max(1e-12,std::abs(d));
+    mx[b]=std::max(mx[b],rel); sum[b]+=rel; ++cnt[b];
+    mLL[b]=std::max(mLL[b],std::abs(d)); mGL[b]=std::max(mGL[b],std::abs(g));
+  }
+  app_log(1,"[band scan] nbnd={} — relative error of THC V_LL vs direct comp-comp, by band decile",nbnd);
+  app_log(1,"[band scan] {:>10} {:>12} {:>12} {:>12} {:>12}",
+          "bands","max rel","mean rel","max|V_LL|","max|V_GL|");
+  for(int b=0;b<NBIN;++b){
+    if(cnt[b]==0) continue;
+    long lo=(b*nbnd)/NBIN, hi=((b+1)*nbnd)/NBIN-1;
+    app_log(1,"[band scan] {:>4}-{:<5} {:12.4e} {:12.4e} {:12.4e} {:12.4e}",
+            lo,hi,mx[b],sum[b]/cnt[b],mLL[b],mGL[b]);
+  }
+  REQUIRE(nbnd>0);
+}
+
+// ===========================================================================
 // qrad table (build_qrad_tab + qrad_interp_at_K, used by the THC build_eta /
 // V_GL / V_LL augmentation) vs the EXACT qrad_at_K (used by evaluate_Q == QE
 // qgm, validated to 1e-10 by paw_aug_q_eval_at_q0). Confirms the interpolated
