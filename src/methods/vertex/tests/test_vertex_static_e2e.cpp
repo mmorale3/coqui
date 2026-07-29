@@ -230,6 +230,20 @@ namespace bdft_tests {
     // the symmetry path must not add deviation beyond the dataset baseline, up to the
     // C-window leakage margin (same tolerance structure as vertex_ibz_gold)
     REQUIRE(d_vert <= d_plain + 0.05 * shift + 1e-8);
+
+    // B-L must clear the same bar: it adds the P^{C,L} injection (which goes through the
+    // Pi^C symmetry path) on top of B-S's Sigma^{C,r}.
+    auto [hfl_ns, ecl_ns] = run("qe_lih222", nda::range(1, 3), "linear");
+    auto [hfl_s, ecl_s]   = run("qe_lih222_sym", nda::range(1, 3), "linear");
+    const double d_lin = std::abs(ecl_ns - ecl_s);
+    const double shift_l = std::abs(ecl_ns - ec_ns);
+    app_log(1, "static ibz gold: B-L C=[1,3)  e_corr {:.12f} (nosym) vs {:.12f} (sym), "
+               "|D| = {:.3e}; vertex shift = {:.3e}; excess = {:.3e} ({:.2f}% of shift)",
+            ecl_ns, ecl_s, d_lin, shift_l, d_lin - d_plain,
+            100.0 * (d_lin - d_plain) / std::max(shift_l, 1e-30));
+    REQUIRE(std::isfinite(ecl_s));
+    REQUIRE(shift_l > 1e-9);
+    REQUIRE(d_lin <= d_plain + 0.05 * shift_l + 1e-8);
 #endif
   }
 
