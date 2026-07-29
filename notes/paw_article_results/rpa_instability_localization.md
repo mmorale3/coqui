@@ -835,9 +835,12 @@ that apply a non-linear matrix function to it, are not.
   argument does NOT extend to it. With A_P = conj(X_nP) X_iP the second factor
   is conj(X_iQ) X_n'Q, which equals conj(A_Q) only when n = n'. So the
   exchange ENERGY (a trace over the diagonal) is invariant while the exchange
-  SELF-ENERGY MATRIX is not. Anything consuming off-diagonal Sigma_x — a
-  non-diagonal QP treatment, self-consistency in a rotated basis — must be
-  regenerated even though E_X was fine.
+  SELF-ENERGY MATRIX is not. This is not hypothetical in CoQui: `qp_approx`
+  (scf_common.hpp:153) explicitly forms off-diagonal V_corr_ab in BOTH modes
+  ("qp_energy" averages V_corr_ab at e_a/e_b; "fermi" uses V_corr(w=0)), and
+  scGW carries the full Sigma_skij in the primary basis. So every PAW/USPP
+  quasiparticle and self-consistent-GW result is affected, not just the
+  correlation energy — even though E_X itself came out fine.
 - Any EOS built from the above — including all six volumes of
   `eos_conv500_coqui` and the a0/B0 fitted from them (§15).
 
