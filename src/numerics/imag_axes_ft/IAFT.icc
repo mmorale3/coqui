@@ -290,14 +290,59 @@ void IAFT::tau_to_zero(ndaArray_A &&A_ti, ndaArray_B &&A_zero_i)  const {
   nda::blas::gemv(A_it_2D, T_zero_t_ff(), A_zero_i_1D);
 }
 
+template<typename comm_t>
+void IAFT::report_leakage(double coeff_first, double coeff_last,
+                          comm_t *comm, std::string A_name) const {
+  comm->barrier();
+  double coeff_first_max = comm->max(coeff_first);
+  double coeff_last_max  = comm->max(coeff_last);
+  double leakage = coeff_last_max / coeff_first_max;
+  app_log(2, "IAFT leakage of {}: {}", A_name, leakage);
+  if (leakage > 1e-5) {
+    app_log(1, "\n[WARNING] A large IAFT leakage is found: coeff_last/coeff_first = {} > 1e-5, coeff_last = {}, coeff_first = {}.\n"
+               "          The leakage is roughly the accuracy of the grids used to represent the imaginary axes. \n"
+               "          Considering increasing \"lambda\" of the IR/DLR grid.\n",
+            leakage, coeff_last_max, coeff_first_max);
+  }
+}
+
 template<nda::MemoryArray Array_A, typename comm_t>
 void IAFT::check_leakage(Array_A &&A_ti, stats_e stats, comm_t *comm, std::string A_name) const {
-  // Diagnostic only — stage device input through host (kernel size is small,
-  // and the body uses lazy nda::map / host-only nda::array allocations).
   using A_t = std::decay_t<Array_A>;
   if constexpr (not nda::mem::on_host<A_t>) {
-    auto A_ti_host = nda::to_host(A_ti);
-    check_leakage(A_ti_host, stats, comm, A_name);
+    // The transform rows are small, but A_ti is a whole tensor -- 18.5 GB per
+    // rank in scGW at Si 2x2x2/500b. Staging it to the host to run a diagnostic
+    // cost ~7 s per call, more than the redistribute next to it (28 s of a
+    // 100 s update_w iteration). Contract on the device instead and bring back
+    // only the three coefficient rows, which are 1/nts of the tensor.
+    long nts  = (stats == fermi)? nt_f() : nt_b();
+    long dim1 = std::accumulate(A_ti.shape().begin()+1, A_ti.shape().end(), 1l, std::multiplies<>{});
+    utils::check(A_ti.shape()[0] == nts, "check_FT_leakage: nts mismatches");
+    auto A_ti_2D = nda::reshape(A_ti, shape_t<2>{nts, dim1});
+
+    auto T_ct = (stats == fermi)? Tct_ff() : Tct_bb();
+    long nIR = T_ct.shape(0);
+    // Row 0 gives the leading IR coefficient, the last two the trailing ones;
+    // one gemm covers all three.
+    nda::array<ComplexType, 2> T_rows_host(3, nts);
+    T_rows_host(0, nda::range::all) = T_ct(0, nda::range::all);
+    T_rows_host(1, nda::range::all) = T_ct(nIR-2, nda::range::all);
+    T_rows_host(2, nda::range::all) = T_ct(nIR-1, nda::range::all);
+
+    constexpr MEMORY_SPACE MEM = memory::get_memory_space<A_t>();
+    memory::array<MEM, ComplexType, 2> T_rows(3, nts);
+    T_rows = T_rows_host;
+    memory::array<MEM, ComplexType, 2> A_ci(3, dim1);
+    nda::blas::gemm(T_rows, A_ti_2D, A_ci);
+
+    nda::array<ComplexType, 2> A_ci_host = nda::to_host(A_ci);
+    double coeff_first = 0.0, coeff_last = 0.0;
+    for (long i = 0; i < dim1; ++i) {
+      coeff_first = std::max(coeff_first, std::abs(A_ci_host(0,i)));
+      coeff_last  = std::max(coeff_last,  std::max(std::abs(A_ci_host(1,i)),
+                                                   std::abs(A_ci_host(2,i))));
+    }
+    report_leakage(coeff_first, coeff_last, comm, A_name);
     return;
   } else {
   auto Abs = nda::map([](ComplexType x) { return std::abs(x); });
@@ -328,28 +373,48 @@ void IAFT::check_leakage(Array_A &&A_ti, stats_e stats, comm_t *comm, std::strin
     A_ci_abs = Abs(A_ci);
     coeff_last = nda::max_element(A_ci_abs);
   }
-  comm->barrier();
-
-  double coeff_first_max = comm->max(coeff_first);
-  double coeff_last_max  = comm->max(coeff_last);
-  double leakage = coeff_last_max / coeff_first_max;
-  app_log(2, "IAFT leakage of {}: {}", A_name, leakage);
-  if (leakage > 1e-5) {
-    app_log(1, "\n[WARNING] A large IAFT leakage is found: coeff_last/coeff_first = {} > 1e-5, coeff_last = {}, coeff_first = {}.\n"
-               "          The leakage is roughly the accuracy of the grids used to represent the imaginary axes. \n"
-               "          Considering increasing \"lambda\" of the IR/DLR grid.\n",
-            leakage, coeff_last_max, coeff_first_max);
-  }
+  report_leakage(coeff_first, coeff_last, comm, A_name);
   } // end host branch
 }
 
 template<nda::MemoryArray Array_A, typename comm_t>
 void IAFT::check_leakage_PHsym(Array_A &&A_ti, stats_e stats, comm_t *comm, std::string A_name) const {
-  // Stage device input through host — see check_leakage().
   using A_t = std::decay_t<Array_A>;
   if constexpr (not nda::mem::on_host<A_t>) {
-    auto A_ti_host = nda::to_host(A_ti);
-    check_leakage_PHsym(A_ti_host, stats, comm, A_name);
+    // Contract on the device and return only the coefficient rows; see
+    // check_leakage() for why staging the whole tensor to the host is too dear.
+    long nts  = (stats == fermi)? nt_f() : nt_b();
+    long nt_half = (nts%2==0)? nts/2 : nts/2 + 1;
+    long dim1 = std::accumulate(A_ti.shape().begin()+1, A_ti.shape().end(), 1l, std::multiplies<>{});
+    utils::check(A_ti.shape()[0] == nt_half, "check_FT_leakage_PHsym: nts mismatches");
+    auto A_ti_2D = nda::reshape(A_ti, shape_t<2>{nt_half, dim1});
+
+    auto T_ct = (stats == fermi)? Tct_ff() : Tct_bb();
+    long nIR = T_ct.shape(0);
+    // Fold each transform row onto the positive-tau half, exactly as the host
+    // path does, then contract all three at once.
+    nda::array<ComplexType, 2> T_rows_host(3, nt_half);
+    for (long it = 0; it < nt_half; ++it) {
+      long imt = nts - it - 1;
+      T_rows_host(0, it) = (it == imt)? T_ct(0, it)      : T_ct(0, it)      + T_ct(0, imt);
+      T_rows_host(1, it) = (it == imt)? T_ct(nIR-2, it)  : T_ct(nIR-2, it)  + T_ct(nIR-2, imt);
+      T_rows_host(2, it) = (it == imt)? T_ct(nIR-1, it)  : T_ct(nIR-1, it)  + T_ct(nIR-1, imt);
+    }
+
+    constexpr MEMORY_SPACE MEM = memory::get_memory_space<A_t>();
+    memory::array<MEM, ComplexType, 2> T_rows(3, nt_half);
+    T_rows = T_rows_host;
+    memory::array<MEM, ComplexType, 2> A_ci(3, dim1);
+    nda::blas::gemm(T_rows, A_ti_2D, A_ci);
+
+    nda::array<ComplexType, 2> A_ci_host = nda::to_host(A_ci);
+    double coeff_first = 0.0, coeff_last = 0.0;
+    for (long i = 0; i < dim1; ++i) {
+      coeff_first = std::max(coeff_first, std::abs(A_ci_host(0,i)));
+      coeff_last  = std::max(coeff_last,  std::max(std::abs(A_ci_host(1,i)),
+                                                   std::abs(A_ci_host(2,i))));
+    }
+    report_leakage(coeff_first, coeff_last, comm, A_name);
     return;
   } else {
   auto Abs = nda::map([](ComplexType x) { return std::abs(x); });
@@ -390,18 +455,7 @@ void IAFT::check_leakage_PHsym(Array_A &&A_ti, stats_e stats, comm_t *comm, std:
     A_ci_abs = Abs(A_ci);
     coeff_last = nda::max_element(A_ci_abs);
   }
-  comm->barrier();
-
-  double coeff_first_max = comm->max(coeff_first);
-  double coeff_last_max  = comm->max(coeff_last);
-  double leakage = coeff_last_max / coeff_first_max;
-  app_log(2, "IAFT leakage of {}: {}", A_name, leakage);
-  if (leakage > 1e-5) {
-    app_log(1, "\n[WARNING] A large IAFT leakage is found: coeff_last/coeff_first = {} > 1e-5, coeff_last = {}, coeff_first = {}.\n"
-               "          The leakage is roughly the accuracy of the grids used to represent the imaginary axes. \n"
-               "          Considering increasing \"lambda\" of the IR/DLR grid.\n",
-            leakage, coeff_last_max, coeff_first_max);
-  }
+  report_leakage(coeff_first, coeff_last, comm, A_name);
   } // end host branch
 }
 

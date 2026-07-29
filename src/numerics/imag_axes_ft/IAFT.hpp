@@ -163,7 +163,16 @@ namespace imag_axes_ft {
  
     template<typename A_t>
     void check_leakage(A_t &&A_ti, stats_e stats, std::string A_name, bool PHsym=false) const;
- 
+
+    /**
+     * Reduce the leading/trailing IR coefficient magnitudes over the
+     * communicator, report the resulting leakage and warn when it is large.
+     * Shared by the host and device paths of both leakage checks.
+     */
+    template<typename comm_t>
+    void report_leakage(double coeff_first, double coeff_last,
+                        comm_t *comm, std::string A_name) const;
+
   private:
     std::variant<ir::IR> grid_var;
 
