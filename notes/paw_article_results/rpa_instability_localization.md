@@ -830,7 +830,14 @@ that apply a non-linear matrix function to it, are not.
 - **RPA correlation energies** on any PAW/USPP system. `ln|det(I - Pi*Z)|`
   applies a matrix function to Z and carried the entire 145 mHa.
 - **GW**: W = Z(I - Pi*Z)^-1 inherits it, so Sigma_c and every quasiparticle
-  energy from a PAW/USPP THC run are affected. Sigma_x is not (see E_X above).
+  energy from a PAW/USPP THC run are affected.
+- **Off-diagonal Sigma_x(n,n') for n != n'.** Careful here — the invariance
+  argument does NOT extend to it. With A_P = conj(X_nP) X_iP the second factor
+  is conj(X_iQ) X_n'Q, which equals conj(A_Q) only when n = n'. So the
+  exchange ENERGY (a trace over the diagonal) is invariant while the exchange
+  SELF-ENERGY MATRIX is not. Anything consuming off-diagonal Sigma_x — a
+  non-diagonal QP treatment, self-consistency in a rotated basis — must be
+  regenerated even though E_X was fine.
 - Any EOS built from the above — including all six volumes of
   `eos_conv500_coqui` and the a0/B0 fitted from them (§15).
 
