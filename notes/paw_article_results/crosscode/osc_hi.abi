@@ -1,0 +1,41 @@
+# Oscillator dump for cross-code comparison with CoQui.
+# Minimal screening run: ONE q-point, few bands. The frequency mesh is
+# irrelevant here -- rhotwg is built before any frequency work -- so this is
+# as cheap as ABINIT will go while still exercising cchi0 (the q/=0 path).
+#
+# q = (0.25, 0, 0) reduced = 0.25*b1 = (-0.15630, 0.15630, 0.15630) cartesian,
+# |q| = 0.27072 a.u., which is exactly the q CoQui's paw_thc_vs_exact_eri used
+# (k_occ = Gamma, k_virt = k(1)). In ABINIT's convention rhotwg pairs
+# band1 at k-q = Gamma with band2 at k = (0.25,0,0) -- the same pair.
+
+# ---- structure / basis / k-mesh: must match the WFK header ----
+acell 3*10.05
+rprim 0.0 0.5 0.5  0.5 0.0 0.5  0.5 0.5 0.0
+ntypat 1 znucl 14 natom 2 typat 1 1
+xred 0.0 0.0 0.0  0.25 0.25 0.25
+ecut 25.0
+pawecutdg 50.0
+ngkpt 4 4 4
+nshiftk 1
+shiftk 0.0 0.0 0.0
+kptopt 3
+nsym 1
+istwfk *1
+iomode 3
+occopt 1
+ixc 11
+
+optdriver 3          # screening driver -> cchi0
+nband 420
+ecuteps 12.0
+nqptdm 1
+qptdm 0.25 0.0 0.0
+gw_icutcoul 7
+awtr 0
+symchi 0
+gwpara 1
+pawcross 0           # on-site completeness assumed, as in the CoQui comparison
+getwfk_filepath "/mnt/home/mmorales/ceph/CoQui/abinit/eos_jthd/a10.05/sio_DS2_WFK.nc"
+
+pp_dirpath "/mnt/home/mmorales/ceph/CoQui/abinit/pseudos"
+pseudos "jth_with_d/Si.xml"

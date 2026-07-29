@@ -25,6 +25,8 @@
 #include "stdio.h"
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <iomanip>
 
 #include "mpi3/environment.hpp"
 #include "mpi3/communicator.hpp"
@@ -4645,6 +4647,10 @@ TEST_CASE("paw_thc_vs_exact_eri", "[hamilt][paw_erichk][!benchmark]")
   double isdf_tol  = env_d("COQUI_ERICHK_ISDF_TOL", 1e-12);
   double thresh    = env_d("COQUI_ERICHK_THRESH", 1e-4);
   int    nIpts     = env_i("COQUI_ERICHK_NIPTS", 0);
+  // Cross-code dump (see the write block below). Empty path = off.
+  std::string dump_path = env_s("COQUI_ERICHK_DUMP", "");
+  long   dump_v    = env_i("COQUI_ERICHK_DUMP_V", 0);
+  long   dump_c    = env_i("COQUI_ERICHK_DUMP_C", 5);
 
   std::shared_ptr<mf::MF> mf_ptr;
   if (dir.empty()) {
@@ -4864,6 +4870,36 @@ TEST_CASE("paw_thc_vs_exact_eri", "[hamilt][paw_erichk][!benchmark]")
         A(c, la) = std::conj(Y(la,v)) * Yc(la,c);
     }
     nda::blas::gemm(ComplexType(vol), A, eta, ComplexType(0.0), rho_aug_c);
+
+    // Cross-code dump: rho_{v k0, c kc}(q+G) on the rho_g grid, smooth and AE
+    // separately, for direct comparison against ABINIT's rhotwg (dumped either
+    // side of paw_rho_tw_g in m_chi0.F90/cchi0). Miller indices are written so
+    // the two G orderings can be matched by VALUE rather than by position --
+    // the codes have no reason to agree on ordering.
+    // ABINIT band indices are 1-based: its band1=1,band2=6 is v=0,c=5 here.
+    if (!dump_path.empty() && v == dump_v) {
+      std::ofstream fo(dump_path);
+      fo << "# CoQui rho_{v,c}(q+G): v=" << dump_v << " c=" << dump_c
+         << "  q=(" << q_cart[0] << "," << q_cart[1] << "," << q_cart[2] << ")"
+         << "  ngm=" << ngm << "\n";
+      fo << "# gx gy gz  Re(smooth) Im(smooth)  Re(AE) Im(AE)\n";
+      fo << std::scientific << std::setprecision(16);
+      for (long g = 0; g < ngm; ++g) {
+        long N = g2fft(g);
+        long i3 = N % NZ, i2 = (N / NZ) % NY, i1 = N / (NZ*NY);
+        long m1 = (i1 <= NX/2) ? i1 : i1 - NX;
+        long m2 = (i2 <= NY/2) ? i2 : i2 - NY;
+        long m3 = (i3 <= NZ/2) ? i3 : i3 - NZ;
+        ComplexType sm = rho_sm_c(dump_c, g);
+        ComplexType ae = sm + rho_aug_c(dump_c, g);
+        fo << m1 << " " << m2 << " " << m3 << " "
+           << std::real(sm) << " " << std::imag(sm) << " "
+           << std::real(ae) << " " << std::imag(ae) << "\n";
+      }
+      app_log(1, "[erichk] wrote cross-code dump to {} (v={}, c={}, ngm={})",
+              dump_path, dump_v, dump_c, ngm);
+    }
+
     csum() = 0.0;
     for (long c = 0; c < nbnd; ++c) {
       double de = eig(0,kc,c) - eig(0,k0,v);
