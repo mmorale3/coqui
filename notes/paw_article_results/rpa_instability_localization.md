@@ -895,3 +895,51 @@ The added off-diagonal V_x assertion is still worth keeping — it covers
 off-diagonal route-equivalence defects that DO manifest on these fixtures — but
 it must not be cited as protection against a mis-conjugated Z. Its own comment
 says so.
+
+## 18. The EOS figures expose a SECOND defect — in E_1e+E_HF, not E_c
+
+Making the two comparison figures (`eos_exxrpa_plot.py`) produced a result more
+important than the figures. Slope decomposition over a = 10.05..10.35 Bohr,
+Ha/Bohr:
+
+    series   E_1e+E_HF      E_c        Ewald      TOTAL
+    pre-fix   -0.86435    +0.03468    +0.82860   -0.00106
+    post-fix  -0.88485    +0.00883    +0.82860   -0.04743
+    ABINIT E_c            +0.00857
+
+**E_c is now right**: post-fix +0.00883 against ABINIT's +0.00857, agreeing to
+3%, and the offset is flat to 0.08 mHa across the range (pre-fix varied 11.5).
+
+**But the TOTAL slope is -0.047 Ha/Bohr, nowhere near zero** — the minimum has
+left the sampled range entirely. And the reason the PRE-fix total looked healthy
+is now visible: its E_c slope was +0.0347, FOUR TIMES ABINIT's, and that error
+very nearly cancelled the E_1e+E_HF slope, leaving TOTAL = -0.00106 and a
+minimum at a = 10.23.
+
+**The pre-fix a0 = 10.2293 was error cancellation, not agreement.** §15 read it
+as "a0 was accidentally close"; the mechanism is now identified, and it is worse
+than accidental closeness — the E_c defect was actively propping the curve up.
+
+The residual is definitively NOT in the correlation: substituting ABINIT's E_c
+into CoQui's own decomposition (the green band in Fig. 1, same WFK so E_1e and
+E_HF are common) reproduces the same steep curve. So a second, independent
+defect sits in the PAW one-body + exact-exchange part, which the V_LL fix does
+not touch.
+
+Prime suspect, already a known open item rather than a new mystery: the
+incomplete one-center exchange. `project_paw_exx_onsite_isolated` records that
+with finite-size and onsite terms switched off the smooth EXX matches to 6 uHa
+while CoQui recovers only ~44% of the onsite term (short 0.052 Ha), and
+`reference_paw_exx_onecenter_vasp` has the K_a rewrite plan. A shortfall of that
+size, if volume-dependent, is the right order to explain 0.047 Ha/Bohr.
+
+Caveats held explicitly: (a) the pre/post series differ in thresh and
+paw_isdf_tol as well, contributing -0.0205 of the -0.0464 slope change, so the
+E_c effect (-0.0259) is the larger but not the only part; (b) the "ONCV gives
+10.228" reference is from campaign memory, not re-measured here — re-running the
+NC EOS through this same tooling is the clean way to confirm the PAW-vs-NC
+contrast; (c) two volumes (10.45, 10.55) were still running when this was
+written, but they cannot change slopes already measured at 10.05..10.35.
+
+Next step is therefore NOT more RPA runs. It is to test E_1e+E_HF alone against
+an external EXX reference across the volume series.
