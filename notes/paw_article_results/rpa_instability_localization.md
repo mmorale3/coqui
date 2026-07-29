@@ -470,6 +470,25 @@ Tr(Pi*Z) is built from DIAGONAL ERIs and is untouched. ln|det| is built from
 the full matrix, including the off-diagonal elements that were transposed, and
 carries the entire 145 mHa. Nothing else in the calculation moved.
 
+### Off-diagonal ERI, before vs after — why n=500 failed and n=250 did not
+
+`paw_thc_vs_exact_eri` OFFDIAG probe, Si a=10.05, paw_isdf_tol 1e-8:
+
+| nbnd | thresh | **pre-fix** | **post-fix** |
+|---|---|---|---|
+| 250 | 1e-4 | 1.390937 | 0.999942 |
+| 250 | 1e-5 | 1.390985 | 0.999990 |
+| **500** | **1e-4** | **168.30** | **1.001326** |
+
+**A 16,730% error at n=500**, against 39% at n=250. That is the quantitative
+reason the instability was a band-count runaway: at n=500 the exact AE
+off-diagonal is 1.368e-03 against a smooth part of 1.841e+00 -- a **1345x
+cancellation** -- so the transposed V_LL does not perturb the answer, it swamps
+it. At n=250 the same cancellation is only ~2.4x.
+
+Post-fix the residual is ordinary ISDF error that converges with thresh
+(5.8e-5 -> 1.0e-5 at n=250), not a systematic term.
+
 ### EOS spread — the original symptom, resolved
 
 | a (Bohr), n=500 | ABINIT | CoQui pre-fix | **CoQui post-fix** |
