@@ -169,4 +169,68 @@ namespace bdft_tests {
 #endif
   }
 
+  // ======================================================================================
+  // THE GOLD CHECK for the symmetry-adapted Sigma^{C,r}: the SAME physical LiH-222 state
+  // driven through the nosym (qe_lih222) and sym (qe_lih222_sym) variants. Plain scGW
+  // supplies the cross-variant baseline (the two datasets are not bit-identical), and the
+  // B-S vertex must not add deviation beyond it -- mirroring vertex_ibz_gold, which does
+  // the same for the dynamic vertex.
+  TEST_CASE("vertex_static_ibz_gold", "[methods][vertex][static][ibz][smoke]") {
+#ifndef ENABLE_DLR
+    SUCCEED("vertex_static_ibz_gold skipped: build has ENABLE_DLR=OFF.");
+#else
+    auto &mpi_context = utils::make_unit_test_mpi_context();
+    imag_axes_ft::IAFT ft(1000, 6.0, imag_axes_ft::dlr_basis, "low");
+    std::string output = "coqui_vertex_static_gold";
+
+    auto run = [&](std::string const &mf_name, nda::range C, std::string const &rung) {
+      auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, mf_name));
+      thc_reader_t thc(mf, make_thc_reader_ptree(mf->nbnd() * 8, "", "incore", "", "bdft",
+                                                 1e-10, mf->ecutrho(), 1, 1024));
+      auto eri = mb_eri_t(thc, thc);
+      solvers::hf_t hf;
+      solvers::gw_t gw(&ft, "ignore_g0", output);
+      solvers::scr_coulomb_t scr_eri(&ft, "rpa", "ignore_g0");
+      simple_dyson dyson(mf.get(), &ft);
+      MBState mb_state(mpi_context, ft, output);
+      iter_scf::iter_scf_t iter_sol("damping");
+      const bool with_vertex = (C.size() > 0);
+      solvers::vertex_t vtx(&ft, with_vertex ? "2nd_exchange" : "none", C, mf->nbnd(),
+                            "ignore_g0", "global", -1, 1e-8, -1.0, -1.0,
+                            with_vertex ? rung : "dynamic");
+      if (vtx.enabled()) { scr_eri.set_vertex(&vtx); gw.set_vertex(&vtx); }
+      auto [e_hf, e_corr] = scf_loop(mb_state, dyson, eri, ft,
+                                     solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol,
+                                     2, false, 1e-9, true);
+      mpi_context->comm.barrier();
+      return std::make_pair(e_hf, e_corr);
+    };
+
+    // cross-variant baseline: plain scGW on the two datasets
+    auto [hf_ns, ec_ns] = run("qe_lih222", nda::range(0, 0), "dynamic");
+    auto [hf_s, ec_s]   = run("qe_lih222_sym", nda::range(0, 0), "dynamic");
+    const double d_plain = std::abs(ec_ns - ec_s);
+    app_log(1, "static ibz gold: PLAIN scGW  e_corr {:.12f} (nosym) vs {:.12f} (sym), "
+               "|D| = {:.3e}", ec_ns, ec_s, d_plain);
+
+    // B-S with C = [1,3) on both
+    auto [hfv_ns, ecv_ns] = run("qe_lih222", nda::range(1, 3), "static");
+    auto [hfv_s, ecv_s]   = run("qe_lih222_sym", nda::range(1, 3), "static");
+    const double d_vert = std::abs(ecv_ns - ecv_s);
+    const double shift = std::abs(ecv_ns - ec_ns);
+    app_log(1, "static ibz gold: B-S C=[1,3)  e_corr {:.12f} (nosym) vs {:.12f} (sym), "
+               "|D| = {:.3e}; vertex shift = {:.3e}", ecv_ns, ecv_s, d_vert, shift);
+    app_log(1, "static ibz gold: attribution -- |D e_corr(B-S)| = {:.3e} vs baseline "
+               "{:.3e}; excess = {:.3e} ({:.2f}% of the vertex shift)",
+            d_vert, d_plain, d_vert - d_plain,
+            100.0 * (d_vert - d_plain) / std::max(shift, 1e-30));
+    REQUIRE(std::isfinite(ecv_ns));
+    REQUIRE(std::isfinite(ecv_s));
+    REQUIRE(shift > 1e-9);            // the vertex must be doing something
+    // the symmetry path must not add deviation beyond the dataset baseline, up to the
+    // C-window leakage margin (same tolerance structure as vertex_ibz_gold)
+    REQUIRE(d_vert <= d_plain + 0.05 * shift + 1e-8);
+#endif
+  }
+
 } // bdft_tests

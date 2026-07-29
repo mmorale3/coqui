@@ -85,6 +85,8 @@
 #include "IO/app_loggers.h"
 #include "nda/nda.hpp"
 #include "nda/blas.hpp"
+#include "numerics/sparse/csr_blas.hpp"
+#include "methods/HF/thc_solver_comm.hpp"
 
 namespace methods {
 namespace solvers {
@@ -101,10 +103,21 @@ namespace vertex_detail {
    * @param qminus    - [INPUT]  (nq) index map q -> -q
    * @param Dw_qPQ    - [OUTPUT] (nq, N, N) the response rung; overwritten
    */
+  /**
+   * @param assume_reflection - IBZ meshes only. The symmetrized middle factor
+   *   1/2[Pi(q)^T + Pi(-q)] needs Pi at -q, which an IBZ-stored Pi does not carry (a
+   *   rotated transfer relates to its IBZ representative through the collocation
+   *   rotation, not a plain index map). Under the crystal symmetries Pi(-q) = Pi(q)^T
+   *   EXACTLY (measured 2e-15 by verify_static_cuts.py), so on an IBZ mesh the
+   *   symmetrization collapses to a transpose and no -q lookup is required. The
+   *   symmetrization is kept for the symmetry-free path, where the identity does not
+   *   hold and both terms are genuinely needed.
+   */
   template<nda::MemoryArrayOfRank<3> WArr_t, nda::MemoryArrayOfRank<3> PArr_t,
            nda::MemoryArrayOfRank<3> DArr_t>
   void build_delta_w(WArr_t const &W0_qPQ, PArr_t const &Pi0_qPQ,
-                     nda::array<long, 1> const &qminus, DArr_t &&Dw_qPQ) {
+                     nda::array<long, 1> const &qminus, DArr_t &&Dw_qPQ,
+                     bool assume_reflection = false) {
     decltype(nda::range::all) all;
     const long nq = W0_qPQ.shape(0), N = W0_qPQ.shape(1);
     utils::check(W0_qPQ.shape(2) == N, "build_delta_w: W0 is not square.");
@@ -112,18 +125,21 @@ namespace vertex_detail {
                  Pi0_qPQ.shape(2) == N,
                  "build_delta_w: Pi^(C,0) shape ({}, {}, {}) != W0 shape ({}, {}, {}).",
                  Pi0_qPQ.shape(0), Pi0_qPQ.shape(1), Pi0_qPQ.shape(2), nq, N, N);
-    utils::check(qminus.shape(0) == nq, "build_delta_w: qminus size {} != nq = {}.",
-                 qminus.shape(0), nq);
+    utils::check(assume_reflection or qminus.shape(0) == nq,
+                 "build_delta_w: qminus size {} != nq = {}.", qminus.shape(0), nq);
     utils::check(Dw_qPQ.shape(0) == nq and Dw_qPQ.shape(1) == N and
                  Dw_qPQ.shape(2) == N, "build_delta_w: Dw shape mismatch.");
 
     nda::array<ComplexType, 2> Psym(N, N), tmp(N, N);
     for (long iq = 0; iq < nq; ++iq) {
-      const long iqm = qminus(iq);
-      // (1/2)[ Pi(q)^T + Pi(-q) ]   -- the SYMMETRIZED middle factor
+      const long iqm = assume_reflection ? iq : qminus(iq);
+      // (1/2)[ Pi(q)^T + Pi(-q) ]  -- the SYMMETRIZED middle factor; on an IBZ mesh
+      // Pi(-q) = Pi(q)^T and this collapses to the transpose.
       for (long P = 0; P < N; ++P)
         for (long Q = 0; Q < N; ++Q)
-          Psym(P, Q) = 0.5 * (Pi0_qPQ(iq, Q, P) + Pi0_qPQ(iqm, P, Q));
+          Psym(P, Q) = assume_reflection
+                           ? Pi0_qPQ(iq, Q, P)
+                           : 0.5 * (Pi0_qPQ(iq, Q, P) + Pi0_qPQ(iqm, P, Q));
       // W0^T . Psym . W0^T   -- TRANSPOSED sandwiches
       auto W0q = W0_qPQ(iq, all, all);
       nda::blas::gemm(nda::transpose(W0q), Psym, tmp);
@@ -142,6 +158,31 @@ namespace vertex_detail {
    * @param qminus      - [INPUT] (nq) index map -q  (used to reach k + q)
    * @param Sigma_r_tskab - [OUTPUT] (nt, ns, nk, nbnd, nbnd), OVERWRITTEN
    */
+  /**
+   * FOLD the +-q pair into ONE effective rung:
+   *
+   *   sum_q [ Dw(q)_AB Gt(k-q)_BA + Dw(q)_BA Gt(k+q)_BA ]
+   *       = sum_q [ Dw(q) + Dw(-q)^T ]_AB  Gt(k-q)_BA
+   *
+   * (relabel q -> -q in the second term). After this fold Sigma^{C,r} is a SINGLE
+   * Hadamard over ONE transfer -- structurally identical to Sigma^GW with W -> Dw_eff.
+   * That is what makes the symmetry-adapted path a near-copy of the GW kernel: one
+   * two-body object read at IBZ q only, one Gt leg at k-q.
+   */
+  template<nda::MemoryArrayOfRank<3> DArr_t, nda::MemoryArrayOfRank<3> EArr_t>
+  void fold_delta_w(DArr_t const &Dw_qPQ, nda::array<long, 1> const &qminus,
+                    EArr_t &&Dw_eff_qPQ) {
+    const long nq = Dw_qPQ.shape(0), N = Dw_qPQ.shape(1);
+    utils::check(Dw_eff_qPQ.shape(0) == nq and Dw_eff_qPQ.shape(1) == N and
+                 Dw_eff_qPQ.shape(2) == N, "fold_delta_w: shape mismatch.");
+    for (long iq = 0; iq < nq; ++iq) {
+      const long iqm = qminus(iq);
+      for (long P = 0; P < N; ++P)
+        for (long Q = 0; Q < N; ++Q)
+          Dw_eff_qPQ(iq, P, Q) = Dw_qPQ(iq, P, Q) + Dw_qPQ(iqm, Q, P);
+    }
+  }
+
   template<nda::MemoryArrayOfRank<5> GArr_t, nda::MemoryArrayOfRank<4> XArr_t,
            nda::MemoryArrayOfRank<3> DArr_t, nda::MemoryArrayOfRank<5> SArr_t>
   void eval_sigma_C_response(mpi3::communicator &comm,
@@ -222,6 +263,189 @@ namespace vertex_detail {
       for (long a = 0; a < nbnd; ++a)
         for (long b = 0; b < nbnd; ++b)
           Sigma_r_tskab(it, is, ik, a, b) = -res(a, b) / double(2 * nk);
+    }
+    comm.all_reduce_in_place_n(Sigma_r_tskab.data(), Sigma_r_tskab.size(), std::plus<>{});
+  }
+
+  /**
+   * Sigma^{C,r} from the FOLDED rung: one Hadamard, one transfer. Must reproduce
+   * eval_sigma_C_response exactly (pinned by test_vertex_fdoracle).
+   */
+  template<nda::MemoryArrayOfRank<5> GArr_t, nda::MemoryArrayOfRank<4> XArr_t,
+           nda::MemoryArrayOfRank<3> DArr_t, nda::MemoryArrayOfRank<5> SArr_t>
+  void eval_sigma_C_response_folded(mpi3::communicator &comm,
+                                    GArr_t const &G_tskij, XArr_t const &X_skPa,
+                                    DArr_t const &Dw_eff_qPQ,
+                                    nda::array<long, 2> const &k_minus_q,
+                                    SArr_t &&Sigma_r_tskab) {
+    decltype(nda::range::all) all;
+    const long nt = G_tskij.shape(0), ns = G_tskij.shape(1), nk = G_tskij.shape(2);
+    const long nbnd = G_tskij.shape(3), N = X_skPa.shape(2), nq = k_minus_q.shape(0);
+    Sigma_r_tskab() = ComplexType(0.0);
+    nda::array<ComplexType, 2> Gt(N, N), M(N, N), half(nbnd, N), Gtmp(N, nbnd);
+    nda::array<ComplexType, 2> Xc(N, nbnd), Xd(nbnd, N), res(nbnd, nbnd);
+    const long rank = comm.rank(), size = comm.size();
+    for (long combo = rank; combo < ns * nk * nt; combo += size) {
+      const long is = combo / (nk * nt), ik = (combo / nt) % nk, it = combo % nt;
+      M() = ComplexType(0.0);
+      for (long iq = 0; iq < nq; ++iq) {
+        const long ikmq = k_minus_q(iq, ik);
+        auto Xk2 = X_skPa(is, ikmq, all, all);
+        auto Gk = G_tskij(it, is, ikmq, all, all);
+        for (long P = 0; P < N; ++P)
+          for (long a = 0; a < nbnd; ++a) Xd(a, P) = std::conj(Xk2(P, a));
+        nda::blas::gemm(Xk2, Gk, Gtmp);
+        nda::blas::gemm(Gtmp, Xd, Gt);
+        auto D = Dw_eff_qPQ(iq, all, all);
+        for (long A = 0; A < N; ++A)
+          for (long B = 0; B < N; ++B) M(A, B) += D(A, B) * Gt(B, A);
+      }
+      auto Xk = X_skPa(is, ik, all, all);
+      for (long P = 0; P < N; ++P)
+        for (long a = 0; a < nbnd; ++a) Xc(P, a) = std::conj(Xk(P, a));
+      nda::blas::gemm(nda::transpose(Xk), M, half);
+      nda::blas::gemm(half, Xc, res);
+      for (long a = 0; a < nbnd; ++a)
+        for (long b = 0; b < nbnd; ++b)
+          Sigma_r_tskab(it, is, ik, a, b) = -res(a, b) / double(2 * nk);
+    }
+    comm.all_reduce_in_place_n(Sigma_r_tskab.data(), Sigma_r_tskab.size(), std::plus<>{});
+  }
+
+  /**
+   * SYMMETRY-ADAPTED Sigma^{C,r} (IBZ meshes), following gw_t::eval_Sigma_all_k_impl
+   * (thc_gw.icc:341-397) and the symmetry-adapted ISDF construction of
+   * "Low-Scaling algorithms for GW and constrained RPA using symmetry-adapted ISDF".
+   *
+   * The design goal of that construction is that NO two-body object (W, Pi, v, and here
+   * Delta w) is ever computed or stored outside the IBZ. Two facts make it work:
+   *   * the ORBITAL-resolved G is symmetric, so it is stored on the IBZ only -- which is
+   *     also why Sigma is only ever needed at IBZ k;
+   *   * the aux-dressed Gt = X G X^dag is NOT symmetric and must be built explicitly on
+   *     the full BZ. primary_to_aux(..., kp_to_ibz, kp_trev) does exactly that: at each
+   *     full-BZ k it contracts the collocation AT THAT k with the orbital G at its IBZ
+   *     representative (transposed for a trev point).
+   * The collocation is not symmetric either; the symmetry is carried by the D matrices,
+   * which here rotate the BAND indices of the finished self-energy rather than the
+   * collocation legs (the vertex's Xhat trick cannot be used: Xhat carries C-window
+   * columns only, and Sigma^{C,r} has full-space legs).
+   *
+   * This is possible for Sigma^{C,r} -- and not for Sigma^C / Pi^C -- because after
+   * fold_delta_w it carries a SINGLE transfer q and both external legs sit at the same
+   * k, so one D^dag . D on the output suffices. Sigma^C's four rung legs sit at four
+   * different k-points, which is precisely why it must rotate collocations instead.
+   *
+   *   Sigma^{C,r}(k in IBZ) = sum_isym  D^dag(isym,k) [ aux->prim at ks ] D(isym,k)
+   *   M_AB(is,ik,isym) = -(1/(2 Nk)) sum_{qp in Qs(isym)}
+   *                        [ Dw_AB(qs) Gt_BA(ks - qs) + Dw_BA(qs) Gt_BA(ks + qs) ]
+   *
+   * with ks = ks_to_k(isym,ik), qs = qp_to_ibz(qp), and the trev branches of the GW
+   * kernel. Gt is rebuilt per tau (never held for all tau at once), matching GW.
+   *
+   * @param comm    - communicator; (s,k) round-robin, OUTPUT all-reduced
+   * @param thc     - THC-ERI (collocation + MF symmetry maps)
+   * @param G_tskij - [INPUT] (nt, ns, nk_IBZ, nbnd, nbnd) orbital G on the IBZ
+   * @param Dw_eff_qPQ - [INPUT] (nq_ibz, Np, Np) response rung Dw at IBZ q (UNfolded)
+   * @param Sigma_r_tskab - [OUTPUT] (nt, ns, nk_IBZ, nbnd, nbnd), OVERWRITTEN
+   */
+  template<THC_ERI thc_t, nda::MemoryArrayOfRank<5> GArr_t,
+           nda::MemoryArrayOfRank<3> DArr_t, nda::MemoryArrayOfRank<5> SArr_t>
+  void eval_sigma_C_response_sym(mpi3::communicator &comm, thc_t &thc,
+                                 GArr_t const &G_tskij, DArr_t const &Dw_eff_qPQ,
+                                 SArr_t &&Sigma_r_tskab) {
+    decltype(nda::range::all) all;
+    auto MF = thc.MF();
+    const long nt = G_tskij.shape(0), ns = G_tskij.shape(1);
+    const long nk_ibz = G_tskij.shape(2), nbnd = G_tskij.shape(3);
+    const long nkpts = MF->nkpts(), nq_ibz = Dw_eff_qPQ.shape(0);
+    const long Np = Dw_eff_qPQ.shape(1);
+    const long nsym = long(MF->qsymms().size());
+    auto kp_trev = MF->kp_trev();
+    auto kp_trev_pair = MF->kp_trev_pair();
+    auto kp_to_ibz = MF->kp_to_ibz();
+    auto qp_trev = MF->qp_trev();
+    auto qminus = MF->qminus();
+
+    utils::check(Sigma_r_tskab.shape(0) == nt and Sigma_r_tskab.shape(2) == nk_ibz,
+                 "eval_sigma_C_response_sym: output shape mismatch.");
+    utils::check(nq_ibz == MF->nqpts_ibz(),
+                 "eval_sigma_C_response_sym: Dw_eff carries {} transfers, expected "
+                 "nqpts_ibz = {}.", nq_ibz, MF->nqpts_ibz());
+
+    Sigma_r_tskab() = ComplexType(0.0);
+
+    // Gt on the FULL BZ, one tau at a time (never all tau at once -- the GW pattern).
+    nda::array<ComplexType, 4> Gt_skPQ(ns, nkpts, Np, Np);
+    nda::array<ComplexType, 5> G_1skij(1, ns, nk_ibz, nbnd, nbnd);
+    nda::array<ComplexType, 2> M(Np, Np), half(nbnd, Np), Xc(Np, nbnd), res(nbnd, nbnd);
+    nda::array<ComplexType, 2> Tm(nbnd, nbnd);
+
+    for (long it = 0; it < nt; ++it) {
+      G_1skij(0, all, all, all, all) = G_tskij(it, all, all, all, all);
+      auto Gt_1skPQ = nda::reshape(Gt_skPQ, std::array<long, 5>{1, ns, nkpts, Np, Np});
+      Gt_skPQ() = ComplexType(0.0);
+      thc_solver_comm::primary_to_aux(0, 0, G_1skij, Gt_1skPQ, thc, kp_to_ibz, kp_trev);
+
+      for (long isym = 0; isym < nsym; ++isym) {
+        const long nqs = MF->nq_per_s(isym);
+        for (long isk = comm.rank(); isk < ns * nk_ibz; isk += comm.size()) {
+          const long is = isk / nk_ibz, ik = isk % nk_ibz;
+          const long ks = MF->ks_to_k(isym, ik);
+          M() = ComplexType(0.0);
+          // BOTH +-q terms are kept explicit here. The nosym path may fold them into one
+          // effective rung Dw(q) + Dw(-q)^T (verified identical, test_vertex_fdoracle),
+          // but that fold is NOT available under symmetry: it needs Dw at -q, and the
+          // IBZ-stored rung relates to a rotated transfer only through the collocation
+          // rotation, not a plain index map. The sector loop already carries the transfer
+          // correctly, so each term simply reads its own.
+          for (long iq = 0; iq < nqs; ++iq) {
+            const long qp = MF->Qs(isym, iq);
+            const long qs = MF->qp_to_ibz(qp);
+            auto Dw = Dw_eff_qPQ(qs, all, all);
+            // transfer applied to ks and the trev branch, exactly as in
+            // gw_t::eval_Sigma_all_k_impl; term 2 carries the OPPOSITE transfer.
+            const long kmq = qp_trev(qp) ? MF->qk_to_k2(qminus(qs), ks)
+                                         : MF->qk_to_k2(qs, ks);
+            const long kpq = qp_trev(qp) ? MF->qk_to_k2(qs, ks)
+                                         : MF->qk_to_k2(qminus(qs), ks);
+            for (int term = 0; term < 2; ++term) {
+              const long kk = (term == 0) ? kmq : kpq;
+              const bool ktr = kp_trev(kk);
+              auto Gt = Gt_skPQ(is, ktr ? kp_trev_pair(kk) : kk, all, all);
+              const bool cj = (qp_trev(qp) != ktr);   // one conjugation, not two
+              for (long A = 0; A < Np; ++A)
+                for (long B = 0; B < Np; ++B) {
+                  const ComplexType g = cj ? std::conj(Gt(B, A)) : Gt(B, A);
+                  M(A, B) += (term == 0 ? Dw(A, B) : Dw(B, A)) * g;
+                }
+            }
+          }
+          // aux -> primary AT THE ROTATED k, in the vertex kernels' SAME-INDEX
+          // dictionary (row unconjugated, column conjugated)
+          auto Xks = thc.X(is, 0, ks);                       // (Np, nbnd)
+          for (long P = 0; P < Np; ++P)
+            for (long a = 0; a < nbnd; ++a) Xc(P, a) = std::conj(Xks(P, a));
+          nda::blas::gemm(nda::transpose(Xks), M, half);
+          nda::blas::gemm(half, Xc, res);
+          res *= ComplexType(-1.0 / double(2 * nkpts));
+          // rotate the BAND indices back to k (identity for isym = 0)
+          if (isym == 0) {
+            for (long a = 0; a < nbnd; ++a)
+              for (long b = 0; b < nbnd; ++b)
+                Sigma_r_tskab(it, is, ik, a, b) += res(a, b);
+          } else {
+            using math::sparse::T;
+            using math::sparse::H;
+            using math::sparse::csrmm;
+            auto [cjg, D] = MF->symmetry_rotation(isym, ik);
+            utils::check(not cjg, "eval_sigma_C_response_sym: unexpected conjugated "
+                                  "symmetry rotation at (isym = {}, ik = {}).", isym, ik);
+            csrmm(ComplexType(1.0), H(*D), res, ComplexType(0.0), Tm);
+            csrmm(ComplexType(1.0), T(*D), nda::transpose(Tm), ComplexType(1.0),
+                  nda::transpose(Sigma_r_tskab(it, is, ik, all, all)));
+          }
+        }
+      }
     }
     comm.all_reduce_in_place_n(Sigma_r_tskab.data(), Sigma_r_tskab.size(), std::plus<>{});
   }

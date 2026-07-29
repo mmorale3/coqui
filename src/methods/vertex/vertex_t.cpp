@@ -1689,36 +1689,14 @@ namespace solvers {
     // sandwich) and pinned end-to-end by test_vertex_fdoracle.
     nda::array<ComplexType, 5> Sigma_r;
     if (stat) {
-      // IBZ: NOT YET IMPLEMENTED for Sigma^{C,r}. What is missing is NOT an "upfold":
-      // Sigma^C needs none either -- its externals are C bands by construction, so it is
-      // block-copied into the C-C block of the IBZ-resident Sigma below, and the
-      // IBZ -> full-BZ unfolding of the TOTAL self-energy is downstream machinery that
-      // already uses the full-band D. Xhat exists for a different job: sourcing the RUNG
-      // at non-IBZ TRANSFERS inside the (qx,qy) double sum.
-      //
-      // Sigma^{C,r} is structurally a GW-CLASS term, not a vertex-class one: a single
-      // transfer q, one Hadamard against a static rung, full-space Gt, the same
-      // aux_to_primary. Two things break under symmetry as this kernel is written:
-      //   (1) the rung Dw would have to be sourced at non-IBZ transfers, and the vertex's
-      //       trick for that (Xhat) carries C-window columns only;
-      //   (2) more fundamentally, it consumes FULL-BAND G at FULL-BZ k-+q. The vertex can
-      //       expand G_CC from IBZ to the full BZ only because inside the C window the
-      //       image points are gauge copies (identity D by convention) with a transpose at
-      //       trev points -- a C-window gauge convention that is NOT valid over the full
-      //       band range.
-      // The fix is to follow gw_t::eval_Sigma_all_kspace (thc_gw.icc:287-316), which
-      // dodges BOTH: keep G in the aux basis at IBZ (primary_to_aux with kp_to_ibz /
-      // kp_trev), keep the rung at IBZ q, loop isym over MF->qsymms(), map the
-      // collocation with MF->ks_to_k(isym) in aux_to_primary, and rotate the BAND-SPACE
-      // output with the sparse full-band D of MF->symmetry_rotation. No full-band Xhat is
-      // ever needed. Gate: sym-vs-nosym agreement, the vertex_ibz gold pattern.
-      utils::check(not sym_mesh,
-                   "vertex_t::eval_Sigma_C: vertex_rung = \"{}\" on a SYMMETRY-REDUCED "
-                   "mesh is not supported yet. Sigma^(C,r) has FULL-SPACE legs, so it "
-                   "cannot use the vertex symmetry context (whose Xhat is C-window only); "
-                   "it needs the plain GW unfolding path. Run on a symmetry-free mesh "
-                   "(nosym = noinv = .true. in the QE nscf) until that lands.",
-                   rung_str());
+      // IBZ (symmetry-adapted): Sigma^{C,r} follows the GW construction --
+      // gw_t::eval_Sigma_all_k_impl / "Low-Scaling algorithms for GW and cRPA using
+      // symmetry-adapted ISDF". The two-body rung Delta w is built and stored at IBZ q
+      // ONLY; the aux-dressed Gt (which is NOT symmetric) is rebuilt on the full BZ per
+      // tau from the IBZ orbital G; and the D matrices rotate the BAND indices of the
+      // finished self-energy. This works for Sigma^{C,r} -- unlike Sigma^C / Pi^C, which
+      // must rotate collocation legs via Xhat -- because it carries a single transfer and
+      // both external legs sit at the same k.
       auto const& W0b_r = _W0b_qmm.value();
       vertex_pi::iaft_tools tools(*_ft);
       nda::array<long, 2> kpq(nqpts, nkpts);
@@ -1732,14 +1710,19 @@ namespace solvers {
       const long Naux_pi = sec ? _Nm : Np;
       nda::array<ComplexType, 4> Pi_wq(tools.nw_b, nqpts_ibz, Naux_pi, Naux_pi);
       Pi_wq() = ComplexType(0.0);
+      // symc MUST be threaded through: on an IBZ mesh the kernel's external q axis is
+      // nqpts_ibz while kmq/kpq carry the FULL transfer mesh, and it sources non-IBZ
+      // rung transfers through Xhat.
       if (sec)
         vertex_pi::pi_c_accumulate_w(*_ft, tools, G_CC, _Xb_skma, W0b_r, nullptr,
                                      kmq, kpq, nda::range(0, nc), Pi_wq,
-                                     mpi->comm.rank(), mpi->comm.size());
+                                     mpi->comm.rank(), mpi->comm.size(),
+                                     skip_rung_gamma, nullptr, symc);
       else
         vertex_pi::pi_c_accumulate_w(*_ft, tools, G_CC, X_C, W0b_r, nullptr,
                                      kmq, kpq, nda::range(0, nc), Pi_wq,
-                                     mpi->comm.rank(), mpi->comm.size());
+                                     mpi->comm.rank(), mpi->comm.size(),
+                                     skip_rung_gamma, nullptr, symc);
       mpi->comm.all_reduce_in_place_n(Pi_wq.data(), Pi_wq.size(), std::plus<>{});
 
       // (2) the tau = 0 row (the LEGAL evaluation of (1/beta) sum_nu; sparse nodes are
@@ -1791,11 +1774,13 @@ namespace solvers {
         if (sec)
           vertex_pi::pi_c_accumulate_w(*_ft, tools, G_CC, _Xb_skma, Zb_qmm, &Wdyn_w,
                                        kmq, kpq, nda::range(0, nc), Pid_wq,
-                                       mpi->comm.rank(), mpi->comm.size());
+                                       mpi->comm.rank(), mpi->comm.size(),
+                                       skip_rung_gamma, nullptr, symc);
         else
           vertex_pi::pi_c_accumulate_w(*_ft, tools, G_CC, X_C, Z_qPQ, &Wdyn_w,
                                        kmq, kpq, nda::range(0, nc), Pid_wq,
-                                       mpi->comm.rank(), mpi->comm.size());
+                                       mpi->comm.rank(), mpi->comm.size(),
+                                       skip_rung_gamma, nullptr, symc);
         mpi->comm.all_reduce_in_place_n(Pid_wq.data(), Pid_wq.size(), std::plus<>{});
         nda::array<ComplexType, 3> PiDyn0(nqpts_ibz, Naux_pi, Naux_pi);
         tau0_of(Pid_wq, PiDyn0);
@@ -1839,10 +1824,13 @@ namespace solvers {
 
       // (4) the response rung and the +-q Hadamard pair
       nda::array<ComplexType, 3> Dw(nqpts_ibz, Np, Np);
-      vertex_detail::build_delta_w(W0g, Pi0g, qmin, Dw);
-      Sigma_r = nda::array<ComplexType, 5>(nt, ns, nkpts, nbnd, nbnd);
-      vertex_detail::eval_sigma_C_response(mpi->comm, G_tskij, X_skPa, Dw, kmq, qmin,
-                                           Sigma_r);
+      vertex_detail::build_delta_w(W0g, Pi0g, qmin, Dw, /*assume_reflection*/ sym_mesh);
+      Sigma_r = nda::array<ComplexType, 5>(nt, ns, nk_ext, nbnd, nbnd);
+      if (sym_mesh)
+        vertex_detail::eval_sigma_C_response_sym(mpi->comm, thc, G_tskij, Dw, Sigma_r);
+      else
+        vertex_detail::eval_sigma_C_response(mpi->comm, G_tskij, X_skPa, Dw, kmq, qmin,
+                                             Sigma_r);
       double rmax = 0.0, xmax = 0.0;
       for (auto const& v : Sigma_r) rmax = std::max(rmax, std::abs(v));
       for (auto const& v : Sigma_C) xmax = std::max(xmax, std::abs(v));

@@ -519,6 +519,32 @@ namespace bdft_tests {
     // with the DLR precision. (It does if dG is per-node noise instead of a representable
     // tau-function -- which is exactly how the first draft of this test was wrong.)
 
+    // --- the FOLDED single-transfer form must be IDENTICAL -------------------------------
+    // sum_q [Dw(q)_AB Gt(k-q)_BA + Dw(q)_BA Gt(k+q)_BA] = sum_q [Dw(q)+Dw(-q)^T]_AB Gt(k-q)_BA
+    // This is what turns Sigma^{C,r} into a Sigma^GW-shaped kernel (ONE two-body object,
+    // read at IBZ q only; ONE Gt leg) and hence what makes the symmetry-adapted path a
+    // near-copy of gw_t::eval_Sigma_all_k_impl.
+    {
+      nda::array<cplx, 3> Dw_eff(nk, Np, Np);
+      solvers::vertex_detail::fold_delta_w(Dw, mdl.qmin, Dw_eff);
+      nda::array<cplx, 5> Sr_f(nt, ns, nk, nbnd, nbnd);
+      solvers::vertex_detail::eval_sigma_C_response_folded(comm, G0, mdl.X_skPa, Dw_eff,
+                                                           mdl.kmq, Sr_f);
+      double num = 0.0, den = 0.0;
+      for (long it = 0; it < nt; ++it)
+        for (long s = 0; s < ns; ++s)
+          for (long k = 0; k < nk; ++k)
+            for (long a = 0; a < nbnd; ++a)
+              for (long b = 0; b < nbnd; ++b) {
+                num = std::max(num, std::abs(Sr_f(it, s, k, a, b) - Sr(it, s, k, a, b)));
+                den = std::max(den, std::abs(Sr(it, s, k, a, b)));
+              }
+      app_log(1, "vertex_fdoracle_bs: folded single-transfer Sigma^(C,r) vs the +-q pair: "
+                 "max|d| = {:.3e} (scale {:.3e}, rel {:.3e})", num, den, num / den);
+      REQUIRE(den > 1e-12);
+      REQUIRE(num < 1e-13 * den);
+    }
+
     // --- EULER IDENTITIES (i)-(iii)  [O6] ------------------------------------------------
     // These tie the THREE kernels together (Sigma^x, Pi^{C,0}, Sigma^{C,r}) through one
     // Phi, so they are cross-kernel checks, not restatements of the oracle. Trace
