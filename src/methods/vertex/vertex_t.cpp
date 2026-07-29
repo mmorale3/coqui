@@ -926,8 +926,7 @@ namespace solvers {
                  "  Cuts                     = Sigma^C (G3W2) + Pi^C (G4W), always both\n"
                  "  q->0 rung policy         = {} (notes/q0_head_treatment.md)\n"
                  "  Auxiliary basis          = {}{}\n"
-                 "  Status                   = Pi^C kernel ACTIVE (Phase 1d); Sigma^C status is\n"
-                 "                             reported by eval_Sigma_C at evaluation time\n",
+                 "  Status                   = kernels ACTIVE for this rung mode\n",
               _vertex_type, rung_str(), _band_window.first(), _band_window.last(),
               _band_window.size(), nbnd, _div_treatment, _isdf_mode,
               secondary() ? std::string(" (Refinement 2: requested N_m = ") +
@@ -936,21 +935,21 @@ namespace solvers {
                             ", svd_tol(B) = " + std::to_string(_isdf_svd_tol) +
                             "; notes/refinement2_optionA.md)"
                           : std::string(" (global THC, dimension Np)"));
-      // INCREMENT S2: the static theories' shared W0[G] rung infrastructure exists and
-      // runs (inside update_w, plan section 2.2), but their KERNELS do not. Announce it
-      // here and let the run abort at the first kernel entry point
-      // (check_rung_implemented), which is inside the first iteration either way.
+      // Announce which theory is active. All three rung modes are implemented
+      // (increments S3-S9); each assembles ALL of its own cuts, so a half-theory cannot
+      // be configured.
       if (_rung != dynamic_rung)
-        app_log(1, "  [NOTE] vertex_rung = \"{}\": increment S2 has landed the shared "
-                   "W0[G] rung\n"
-                   "         infrastructure only. update_w WILL build W0 / W0bar for this "
-                   "run, and the\n"
-                   "         first {} evaluation will then ABORT -- the {} kernels arrive "
-                   "at S3+\n"
-                   "         (notes/static_vertex_implementation_plan.md section 4).\n",
+        app_log(1, "  [NOTE] vertex_rung = \"{}\": {}. P = {}, and the self-energy "
+                   "carries\n"
+                   "         {} -- always together (Phi-derivability).\n",
                 rung_str(),
-                (_rung == static_rung ? "Sigma^C" : "P^{C,L}"),
-                (_rung == static_rung ? "B-S" : "B-L"));
+                (_rung == static_rung ? "B-S, the iv = 0 statically screened truncation"
+                                      : "B-L, the tangent completion, first order in "
+                                        "dW = W - W0"),
+                (_rung == static_rung ? "P_RPA (no Pi^C injection at all)"
+                                      : "P_RPA + P^{C,L} at full weight"),
+                (_rung == static_rung ? "Sigma^{C,x} + Sigma^{C,r}"
+                                      : "three explicit terms + Sigma^{L,r}"));
     } else {
       app_log(1, "\nvertex_t: vertex_type = \"{}\" (vertex_rung = \"{}\") with an empty "
                  "vertex_band_window: C = empty set, so the vertex contributes nothing in "
