@@ -211,7 +211,44 @@ compute at kp444 (redistribute volume $\times 8$; Z-gather $\times 8$ with a ful
 allreduce per $q$-point). GPU runs at this scale (64$\times$A100, 48$\times$H200, on
 pre-built ERIs) are queued as before/after validation; they do not change the plan.
 
-\section{Result of the first fix (P1, measured)}
+\section{Results of the first fixes (measured)}
+\subsection{P1 and the leakage diagnostic}
+Two changes account for a $2.2\times$ reduction of \texttt{update\_w} at 8 A100 ranks.
+P1 (below) removed the host staging from the redistribute. Instrumenting what remained
+then showed that the largest term in the $\tau\!\leftrightarrow\!\omega$ phases was not
+communication at all but \texttt{IAFT::check\_leakage}, a \emph{diagnostic}: on device
+input it began with \texttt{nda::to\_host} of the whole tensor (18.5 GB/rank) and then ran
+two gemms over it on one host core, four times per iteration --- 28 s/iter. Its output is
+three coefficient rows, $3/n_\tau$ of the tensor, so it now contracts on the device and
+returns only those rows (\texttt{817df17}): 28.0 $\rightarrow$ 2.3 s/iter, diagnostic
+value unchanged. Note the same \texttt{to\_host}-the-tensor pattern remains in
+\texttt{simple\_dyson}, \texttt{scf\_common}, \texttt{thc\_sosex} and the embedding code.
+
+\begin{table}[H]\small\centering
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+Per SCF iteration, 2 nodes $\cdot$ 8$\times$A100 & host staging & +P1 & +device leakage \\
+\midrule
+\textbf{update\_w} & 163.1 & 99.6 & \textcolor{good}{\textbf{74.3}} \\
+\quad $\tau\rightarrow\omega$ & 52.0 & 21.0 & \textcolor{good}{10.8} \\
+\quad $\omega\rightarrow\tau$ & 57.2 & 25.5 & \textcolor{good}{10.7} \\
+\quad\quad of which redistribute (4 calls) & --- & 18.7 & 18.2 \\
+\quad\quad of which \texttt{check\_leakage} & --- & 28.0 & \textcolor{good}{2.3} \\
+\midrule
+SCF loop, 2 iterations & 682.8 & 548.5 & \textcolor{good}{\textbf{493.5}} \\
+\bottomrule
+\end{tabular}
+\caption{Cumulative effect of the two fixes. Energies are unchanged throughout
+($0.48305038078408613$, then $0.5300765029178911$).}
+\end{table}
+
+\noindent Within the exchange itself, pack and unpack cost 0.02 s each per call and the
+rest is time on the wire at 7.5--9.7 GB/s; a depth-2 software pipeline over the chunks
+changed nothing (100.1 vs 99.9 s/iter), confirming the exchange is bandwidth-bound rather
+than stalled. NCCL remains worth testing here, on the theory that it drives the same
+hardware better than UCX does for this pattern.
+
+\subsection{P1 in detail}
 \begin{table}[H]\small\centering
 \begin{tabular}{@{}lrrrrr@{}}
 \toprule
