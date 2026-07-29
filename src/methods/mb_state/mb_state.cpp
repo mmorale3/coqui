@@ -136,6 +136,24 @@ namespace methods {
     return Sigma_imp_wsIab.has_value() and Sigma_dc_wsIab.has_value() and Vhf_imp_sIab.has_value() and Vhf_dc_sIab.has_value();
   }
 
+  auto MBState::W_host() -> dArray_t<nda::array<ComplexType, 4> >& {
+    if (dW_qtPQ.has_value()) return dW_qtPQ.value();
+#if defined(ENABLE_DEVICE)
+    // The device path skips the host mirror during the SCF loop, so build it
+    // once here from the device copy for whoever asked.
+    utils::check(dW_qtPQ_dev.has_value(),
+                 "MBState::W_host: neither a host nor a device copy of W is available.");
+    auto& Wd = dW_qtPQ_dev.value();
+    dW_qtPQ.emplace(math::nda::make_distributed_array<nda::array<ComplexType, 4>>(
+        *Wd.communicator(), Wd.grid(), Wd.global_shape(), Wd.block_size()));
+    dW_qtPQ.value().local() = nda::to_host(Wd.local());
+    return dW_qtPQ.value();
+#else
+    utils::check(false, "MBState::W_host: no copy of W is available.");
+    return dW_qtPQ.value();
+#endif
+  }
+
 
 
   /** Instantiation of public template **/

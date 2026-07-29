@@ -152,15 +152,24 @@ namespace solvers {
     long nt_loc = dW_tqPQ.local_shape()[0];
     long nq_loc = dW_tqPQ.local_shape()[1];
 
-    _Timer.start("TEMP_UW_dW_qtPQ_alloc");
-    mb_state.dW_qtPQ.emplace(make_distributed_array<nda::array<ComplexType, 4>> (
-                             thc.mpi()->comm, q_pgrid, q_gshape, q_bsize));
-    auto W_qtPQ_h = mb_state.dW_qtPQ.value().local();
-    utils::device_sync();
-    _Timer.stop("TEMP_UW_dW_qtPQ_alloc");
+    // On the device path the host mirror is only needed by consumers that run
+    // on the host (GF2, EDMFT, the optional W h5 dump), and a pure scGW run has
+    // none of them: gw_t::evaluate<DEVICE> reads dW_qtPQ_dev. Materializing it
+    // anyway cost 4.2 s to allocate and zero 18.5 GB plus 9.2 s to copy it back
+    // per iteration, for data nothing read. Skip it here; MBState builds it on
+    // demand from the device array (see MBState::W_host()).
+    const bool need_host_W = (MEM == HOST_MEMORY) or mb_state.keep_host_W;
+    if (need_host_W) {
+      _Timer.start("TEMP_UW_dW_qtPQ_alloc");
+      mb_state.dW_qtPQ.emplace(make_distributed_array<nda::array<ComplexType, 4>> (
+                               thc.mpi()->comm, q_pgrid, q_gshape, q_bsize));
+      utils::device_sync();
+      _Timer.stop("TEMP_UW_dW_qtPQ_alloc");
+    }
 
     _Timer.start("TEMP_UW_dW_transpose_and_mirror");
     if constexpr (MEM == HOST_MEMORY) {
+      auto W_qtPQ_h = mb_state.dW_qtPQ.value().local();
       auto W_tqPQ = dW_tqPQ.local();
       for (size_t qt = 0; qt < nq_loc * nt_loc; ++qt) {
         size_t iq = qt / nt_loc;
@@ -191,11 +200,13 @@ namespace solvers {
       }
       utils::device_sync();
       _Timer.stop("TEMP_UW_dW_dev_transpose");
-      // Single bulk device->host mirror for the host darray.
-      _Timer.start("TEMP_UW_dW_d2h_mirror");
-      W_qtPQ_h = nda::to_host(W_qtPQ_d);
-      utils::device_sync();
-      _Timer.stop("TEMP_UW_dW_d2h_mirror");
+      // Only when a host consumer asked for it; see need_host_W above.
+      if (need_host_W) {
+        _Timer.start("TEMP_UW_dW_d2h_mirror");
+        mb_state.dW_qtPQ.value().local() = nda::to_host(W_qtPQ_d);
+        utils::device_sync();
+        _Timer.stop("TEMP_UW_dW_d2h_mirror");
+      }
     }
 #endif
     dW_tqPQ.reset();

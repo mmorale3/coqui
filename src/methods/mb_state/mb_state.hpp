@@ -87,6 +87,15 @@ public:
   void set_local_selfenergies(std::map<std::string, nda::array<ComplexType, 5>> local_selfenergies);
   bool has_local_selfenergies();
 
+  /**
+   * The screened interaction as a host darray, materialized from the device
+   * copy if that is where it lives. For one-off host consumers after the SCF
+   * loop (the optional W h5 dump); keeping the mirror up to date every
+   * iteration instead costs 13.4 s/iter, so use this rather than keep_host_W
+   * unless a consumer really needs it each iteration.
+   */
+  dArray_t<nda::array<ComplexType, 4> >& W_host();
+
 public:
   std::shared_ptr<mpi_context_t> mpi;
   imag_axes_ft::IAFT* ft = nullptr;
@@ -106,13 +115,20 @@ public:
   std::optional<sArray_t<nda::array_view<ComplexType, 5> > > sSigma_tskij;
   std::optional<sArray_t<nda::array_view<ComplexType, 4> > > sF_skij;
   std::optional<dArray_t<nda::array<ComplexType, 4> > > dW_qtPQ;
+  /**
+   * Whether the host mirror dW_qtPQ has to be maintained on the device path.
+   * A pure scGW run reads W only through dW_qtPQ_dev, so keeping the mirror
+   * costs 13.4 s and 18.5 GB of host memory per iteration for data nothing
+   * touches. Set this when a host-side consumer needs W every iteration; for a
+   * one-off consumer after the SCF loop, prefer W_host() below.
+   */
+  bool keep_host_W = false;
 #if defined(ENABLE_DEVICE)
-  // Device-resident mirror of dW_qtPQ for the GPU GW pipeline. When set,
+  // Device-resident W for the GPU GW pipeline. When set,
   // gw_t::evaluate<DEVICE_MEMORY> reads from this directly and skips the
   // host->device mirror that would otherwise round-trip the full dW per
-  // SCF iter. scr_coulomb_t::update_w<DEVICE_MEMORY> populates this; the
-  // host mirror dW_qtPQ is also kept up to date for cross-method
-  // consumers (GF2, h5 dump, EDMFT) that don't yet have a device path.
+  // SCF iter. scr_coulomb_t::update_w<DEVICE_MEMORY> populates this, and the
+  // host mirror dW_qtPQ is built only if keep_host_W or W_host() asks for it.
   std::optional<dArray_t<memory::array<DEVICE_MEMORY, ComplexType, 4> > > dW_qtPQ_dev;
 #endif
   std::optional<nda::array<ComplexType, 1> > eps_inv_head;

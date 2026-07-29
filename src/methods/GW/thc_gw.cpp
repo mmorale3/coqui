@@ -68,8 +68,16 @@ namespace methods {
                    "gw_t::evaluate: sG_tskij is not initialized in MBState.");
       utils::check(mb_state.sSigma_tskij.has_value(),
                      "gw_t::evaluate: sSigma_tskij is not initialized in MBState.");
+      // Either copy of W will do: the device path keeps only dW_qtPQ_dev and
+      // skips the host mirror (which nothing here reads), so requiring the host
+      // one aborted every device run.
+#if defined(ENABLE_DEVICE)
+      utils::check(mb_state.dW_qtPQ.has_value() or mb_state.dW_qtPQ_dev.has_value(),
+                   "gw_t::evaluate: neither dW_qtPQ nor dW_qtPQ_dev is initialized in MBState.");
+#else
       utils::check(mb_state.dW_qtPQ.has_value(),
                    "gw_t::evaluate: dW_qtPQ is not initialized in MBState.");
+#endif
       utils::check(_ft->nt_f() == _ft->nt_b(),
                    "thc-gw: We assume nt_f == nt_b at least for now. \n"
                    "        And we assume tau sampling for fermions and bosons are the same.");

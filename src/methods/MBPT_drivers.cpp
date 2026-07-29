@@ -208,7 +208,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
 
       auto dump_w_to_h5 = io::get_value_with_default<bool>(pt,"dump_w_to_h5", false);
       if (dump_w_to_h5) {
-        auto& W_qtPQ = mb_state.dW_qtPQ.value();
+        auto& W_qtPQ = mb_state.W_host();
         if (mb_state.mpi->comm.root()) {
           h5::file file("thc_screened_interaction.h5", 'w');
           h5::group grp(file);
@@ -227,7 +227,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
 
       auto dump_w_to_h5 = io::get_value_with_default<bool>(pt,"dump_w_to_h5", false);
       if (dump_w_to_h5) {
-        auto& W_qtPQ = mb_state.dW_qtPQ.value();
+        auto& W_qtPQ = mb_state.W_host();
         if (mb_state.mpi->comm.root()) {
           h5::file file("thc_screened_interaction.h5", 'w');
           h5::group grp(file);
