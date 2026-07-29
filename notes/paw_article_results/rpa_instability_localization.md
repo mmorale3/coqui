@@ -470,6 +470,18 @@ Tr(Pi*Z) is built from DIAGONAL ERIs and is untouched. ln|det| is built from
 the full matrix, including the off-diagonal elements that were transposed, and
 carries the entire 145 mHa. Nothing else in the calculation moved.
 
+### EOS spread — the original symptom, resolved
+
+| a (Bohr), n=500 | ABINIT | CoQui pre-fix | **CoQui post-fix** |
+|---|---|---|---|
+| 10.05 | −0.43112 | −0.59630 | **−0.437371** |
+| 10.55 | −0.42755 | −0.48914 | **−0.433617** |
+| **spread** | **3.57 mHa** | **107.16 mHa** | **3.75 mHa** |
+
+NC reference spread is 4.2 mHa. **107.16 -> 3.75 mHa, matching ABINIT to
+0.2 mHa.** The residual offset is FLAT in volume (6.25 mHa at a=10.05, 6.07 at
+a=10.55), so it cancels out of the EOS entirely.
+
 Residual 6 mHa: within the spread of method differences (ABINIT truncates the
 dielectric matrix at ecuteps 12 Ha while CoQui uses the full THC basis; PAW
 forces inclvkb=0 there). Not investigated further -- it is flat in band count,
