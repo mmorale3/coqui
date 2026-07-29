@@ -24,6 +24,7 @@
 
 #include <utility>
 #include <tuple>
+#include <chrono>
 #include <cstdlib>
 #include <optional>
 #include "configuration.hpp"
@@ -726,17 +727,6 @@ namespace detail
 {
 
 /**
- * Backend for the DEVICE path of redistribute_alltoallv, from
- * COQUI_REDIST_DEVICE (read once, on first use):
- *   0  host staging: pack sub-blocks on device, bulk D2H, host MPI_Alltoallv,
- *      H2D, unpack on device.
- *   1  device-direct: pairwise rounds of CUDA-aware MPI on device buffers.
- * Unset, the default is 1 whenever the MPI reports device-pointer support and 0
- * otherwise. The knob stays as an escape hatch (and to A/B the two paths); it
- * is deliberately an environment variable rather than an input option, since it
- * selects a transport rather than any physics.
- */
-/**
  * Byte budget for one staging buffer of the device-direct path
  * (COQUI_REDIST_CHUNK_MB, default 1024 MB). Two buffers are held per call, so
  * this bounds the extra device memory at twice the budget regardless of the
@@ -772,6 +762,32 @@ inline bool mpi_supports_device_pointers()
 #endif
 }
 
+/**
+ * Whether to log a per-call breakdown of the device-direct exchange
+ * (COQUI_REDIST_TIMERS=1). The sections are already bracketed by the device
+ * synchronizes the path needs, so the measurement itself costs nothing; it is
+ * off by default only to keep production logs quiet.
+ */
+inline bool redistribute_timers_enabled()
+{
+  static const bool on = []() {
+    const char* v = std::getenv("COQUI_REDIST_TIMERS");
+    return v != nullptr and std::strtol(v, nullptr, 10) != 0;
+  }();
+  return on;
+}
+
+/**
+ * Backend for the DEVICE path of redistribute_alltoallv, from
+ * COQUI_REDIST_DEVICE (read once, on first use):
+ *   0  host staging: pack sub-blocks on device, bulk D2H, host MPI_Alltoallv,
+ *      H2D, unpack on device.
+ *   1  device-direct: pairwise rounds of CUDA-aware MPI on device buffers.
+ * Unset, the default is 1 whenever the MPI reports device-pointer support and 0
+ * otherwise. The knob stays as an escape hatch (and to A/B the two paths); it
+ * is deliberately an environment variable rather than an input option, since it
+ * selects a transport rather than any physics.
+ */
 inline int redistribute_device_mode()
 {
   // Reported once, so a log always says which path a run took (a mistyped
@@ -890,6 +906,17 @@ void redistribute_pairwise_device(comm_t& comm, Aloc_t const& Aloc, Bloc_t& Bloc
   using send_view_t = memory::array_view<MEM_A,value_t,int(rank),::nda::C_layout>;
   using recv_view_t = memory::array_view<MEM_B,value_t,int(rank),::nda::C_layout>;
 
+  // Where the time goes, to tell a wire-limited exchange from a stalled one.
+  // The sections coincide with the synchronizes the path already performs, so
+  // the accounting is honest without adding any of its own.
+  using clock_t = std::chrono::steady_clock;
+  auto since = [](clock_t::time_point t0) {
+    return std::chrono::duration<double>(clock_t::now()-t0).count();
+  };
+  const auto t_call = clock_t::now();
+  double t_self = 0.0, t_pack = 0.0, t_send = 0.0, t_recv = 0.0, t_unpack = 0.0;
+  std::size_t bytes_send = 0, bytes_recv = 0;
+
   for (long r = 0; r < mpi_size; ++r) {
     const long sp = (mpi_rank + r) % mpi_size;              // send to
     const long rp = (mpi_rank - r + mpi_size) % mpi_size;   // receive from
@@ -897,8 +924,11 @@ void redistribute_pairwise_device(comm_t& comm, Aloc_t const& Aloc, Bloc_t& Bloc
     if (r == 0) {
       if (ovlps_from_A[mpi_rank]) {
         utils::check(ovlps_from_B[mpi_rank], "redistribute_pairwise_device: self block mismatch.");
+        const auto t0 = clock_t::now();
         get_sub_matrix<rank>(Bloc,subblocks_from_B[mpi_rank]) =
             get_sub_matrix<rank>(Aloc,subblocks_from_A[mpi_rank]);
+        if (redistribute_timers_enabled()) utils::device_sync();
+        t_self += since(t0);
       }
       continue;
     }
@@ -929,6 +959,7 @@ void redistribute_pairwise_device(comm_t& comm, Aloc_t const& Aloc, Bloc_t& Bloc
         r1 = std::min(rs[0], r0+recv_rows);
         rcs[0] = r1-r0;
         req_recv = comm.ireceive_n(recv_buf.data(), n_elem(rcs), int(rp), int(c));
+        bytes_recv += std::size_t(n_elem(rcs))*sizeof(value_t);
       }
 
       if (c < n_send_chunks) {
@@ -936,24 +967,45 @@ void redistribute_pairwise_device(comm_t& comm, Aloc_t const& Aloc, Bloc_t& Bloc
         const long s1 = std::min(ss[0], s0+send_rows);
         std::array<long,rank> scs = ss;
         scs[0] = s1-s0;
+        auto t0 = clock_t::now();
         send_view_t sview(scs, send_buf.data());
         sview = get_sub_matrix<rank>(Aloc,chunk_ranges(subblocks_from_A[sp],s0,s1));
         // The pack is a kernel/async copy on the default stream; MPI reads the
         // buffer outside that stream, so it has to be complete first.
         utils::device_sync();
+        t_pack += since(t0);
+        t0 = clock_t::now();
         comm.isend_n(send_buf.data(), n_elem(scs), int(sp), int(c)).wait();
+        t_send += since(t0);
+        bytes_send += std::size_t(n_elem(scs))*sizeof(value_t);
       }
 
       if (c < n_recv_chunks) {
+        auto t0 = clock_t::now();
         req_recv->wait();
+        t_recv += since(t0);
+        t0 = clock_t::now();
         recv_view_t rview(rcs, recv_buf.data());
         get_sub_matrix<rank>(Bloc,chunk_ranges(subblocks_from_B[rp],r0,r1)) = rview;
         // The unpack reads recv_buf asynchronously on the default stream while
         // the next chunk's receive would write it from outside that stream, so
         // the buffer can only be handed back to MPI once the unpack is done.
         utils::device_sync();
+        t_unpack += since(t0);
       }
     }
+  }
+
+  if (redistribute_timers_enabled()) {
+    const double total = since(t_call);
+    const double gb = 1.0/(1024.0*1024.0*1024.0);
+    app_log(3, "  redistribute (DEVICE): {:.2f} s = pack {:.2f} + send {:.2f} + recv {:.2f} "
+               "+ unpack {:.2f} + self {:.2f}; {:.1f} GB out / {:.1f} GB in, "
+               "{:.1f} GB/s while on the wire, {:.1f} GB/s over the call",
+            total, t_pack, t_send, t_recv, t_unpack, t_self,
+            double(bytes_send)*gb, double(bytes_recv)*gb,
+            (t_send+t_recv > 0.0) ? double(bytes_send+bytes_recv)*gb/(t_send+t_recv) : 0.0,
+            (total > 0.0) ? double(bytes_send+bytes_recv)*gb/total : 0.0);
   }
 }
 

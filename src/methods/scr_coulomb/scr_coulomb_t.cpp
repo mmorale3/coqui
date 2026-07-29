@@ -109,7 +109,9 @@ namespace solvers {
          "TEMP_DWiP_gemm_AZ", "TEMP_DWiP_writeback", "TEMP_UW_eps_inv_head",
          "TEMP_UW_dW_qtPQ_alloc", "TEMP_UW_dW_transpose_and_mirror",
          "TEMP_UW_dW_qtPQ_dev_alloc", "TEMP_UW_dW_dev_transpose",
-         "TEMP_UW_dW_d2h_mirror", "TEMP_UW_dump_eps_inv_head"})
+         "TEMP_UW_dW_d2h_mirror", "TEMP_UW_dump_eps_inv_head",
+         "TEMP_FT_alloc", "TEMP_FT_redist", "TEMP_FT_leakage",
+         "TEMP_FT_gemm", "TEMP_FT_reset", "TEMP_FT_barrier"})
       _Timer.add(name);
     _Timer.start("TEMP_UW_TOTAL");
     _Timer.start("TEMP_UW_eval_Pi_qdep");
@@ -230,6 +232,22 @@ namespace solvers {
               _Timer.elapsed("TEMP_DWFP_dyson_W_in_place"));
       app_log(2, "        - w_to_tau:                   {0:.3f} sec",
               _Timer.elapsed("TEMP_DWFP_w_to_tau"));
+      if (_Timer.elapsed("TEMP_FT_alloc") > 0.0) {
+        // tau_to_w + w_to_tau inner sections, both directions together.
+        app_log(2, "          FT inner (both directions, accumulated):");
+        app_log(2, "            darray alloc+zero:      {0:.3f} sec  ({1} calls)",
+                _Timer.elapsed("TEMP_FT_alloc"), _Timer.number_of_calls("TEMP_FT_alloc"));
+        app_log(2, "            redistribute:           {0:.3f} sec  ({1} calls)",
+                _Timer.elapsed("TEMP_FT_redist"), _Timer.number_of_calls("TEMP_FT_redist"));
+        app_log(2, "            FT gemm (PHsym):        {0:.3f} sec",
+                _Timer.elapsed("TEMP_FT_gemm"));
+        app_log(2, "            check_leakage:          {0:.3f} sec",
+                _Timer.elapsed("TEMP_FT_leakage"));
+        app_log(2, "            darray reset (free):    {0:.3f} sec  ({1} calls)",
+                _Timer.elapsed("TEMP_FT_reset"), _Timer.number_of_calls("TEMP_FT_reset"));
+        app_log(2, "            barriers:               {0:.3f} sec",
+                _Timer.elapsed("TEMP_FT_barrier"));
+      }
       if (_Timer.elapsed("TEMP_DWiP_inverse") > 0.0) {
         app_log(2, "          dyson_W_in_place inner (accumulated):");
         app_log(2, "            alloc dPi/dZ/dA:        {0:.3f} sec",
@@ -647,33 +665,66 @@ namespace solvers {
         APP_ABORT("scr_coulomb_t::tau_to_w: Error finding proper pgrid: gshape[2]*gshape[3] < np.");
       }
     }
+    // (TEMP) The redistributes are only part of this phase: each call also
+    // creates three tensor-sized distributed arrays and frees two. Time every
+    // section so the cost is attributed rather than assumed.
+    _Timer.start("TEMP_FT_alloc");
     auto buffer_ti  = make_distributed_array<local_Array_t>(
         *comm, b_pgrid, t_gshape, dPi_tqPQ_pos.block_size());
+    utils::device_sync();
+    _Timer.stop("TEMP_FT_alloc");
     _Timer.start("FT_REDISTRIBUTE");
+    _Timer.start("TEMP_FT_redist");
     math::nda::redistribute(dPi_tqPQ_pos, buffer_ti);
+    _Timer.stop("TEMP_FT_redist");
     _Timer.stop("FT_REDISTRIBUTE");
+    _Timer.start("TEMP_FT_reset");
     if (reset_input) dPi_tqPQ_pos.reset();
+    _Timer.stop("TEMP_FT_reset");
+    _Timer.start("TEMP_FT_leakage");
     _ft->check_leakage(buffer_ti, imag_axes_ft::boson, "polarizability", true);
+    _Timer.stop("TEMP_FT_leakage");
+    _Timer.start("TEMP_FT_barrier");
     buffer_ti.communicator()->barrier();
+    _Timer.stop("TEMP_FT_barrier");
 
+    _Timer.start("TEMP_FT_alloc");
     auto buffer_wi  = make_distributed_array<local_Array_t>(
         *comm, b_pgrid, w_gshape, buffer_ti.block_size());
+    utils::device_sync();
+    _Timer.stop("TEMP_FT_alloc");
+    _Timer.start("TEMP_FT_gemm");
     {
       auto buf_ti_loc = buffer_ti.local();
       auto buf_wi_loc = buffer_wi.local();
       _ft->tau_to_w_PHsym(buf_ti_loc, buf_wi_loc);
     }
+    utils::device_sync();
+    _Timer.stop("TEMP_FT_gemm");
+    _Timer.start("TEMP_FT_reset");
     buffer_ti.reset();
+    _Timer.stop("TEMP_FT_reset");
+    _Timer.start("TEMP_FT_barrier");
     buffer_wi.communicator()->barrier();
+    _Timer.stop("TEMP_FT_barrier");
 
+    _Timer.start("TEMP_FT_alloc");
     auto dPi_wqPQ = make_distributed_array<local_Array_t>(
         *comm, w_pgrid_out, w_gshape, w_bsize_out);
+    utils::device_sync();
+    _Timer.stop("TEMP_FT_alloc");
 
     _Timer.start("FT_REDISTRIBUTE");
+    _Timer.start("TEMP_FT_redist");
     math::nda::redistribute(buffer_wi, dPi_wqPQ);
+    _Timer.stop("TEMP_FT_redist");
     _Timer.stop("FT_REDISTRIBUTE");
+    _Timer.start("TEMP_FT_reset");
     buffer_wi.reset();
+    _Timer.stop("TEMP_FT_reset");
+    _Timer.start("TEMP_FT_barrier");
     dPi_wqPQ.communicator()->barrier();
+    _Timer.stop("TEMP_FT_barrier");
 
     _Timer.stop("IMAG_FT_TtoW");
     return dPi_wqPQ;
@@ -720,30 +771,54 @@ namespace solvers {
         APP_ABORT("scr_coulomb_t::W_w_to_tau: Error finding proper pgrid: gshape[2]*gshape[3] < np.");
       }
     }
+    _Timer.start("TEMP_FT_alloc");
     auto buffer_wi  = make_distributed_array<local_Array_t>(
         *comm, b_pgrid, w_gshape, dW_wqPQ_pos.block_size());
+    utils::device_sync();
+    _Timer.stop("TEMP_FT_alloc");
     _Timer.start("FT_REDISTRIBUTE");
+    _Timer.start("TEMP_FT_redist");
     math::nda::redistribute(dW_wqPQ_pos, buffer_wi);
+    _Timer.stop("TEMP_FT_redist");
     _Timer.stop("FT_REDISTRIBUTE");
+    _Timer.start("TEMP_FT_reset");
     if (reset_input) dW_wqPQ_pos.reset();
+    _Timer.stop("TEMP_FT_reset");
 
+    _Timer.start("TEMP_FT_alloc");
     auto buffer_ti  = make_distributed_array<local_Array_t>(
         *comm, b_pgrid, t_gshape, buffer_wi.block_size());
+    utils::device_sync();
+    _Timer.stop("TEMP_FT_alloc");
+    _Timer.start("TEMP_FT_gemm");
     {
       auto buf_ti_loc = buffer_ti.local();
       auto buf_wi_loc = buffer_wi.local();
       _ft->w_to_tau_PHsym(buf_wi_loc, buf_ti_loc);
     }
+    utils::device_sync();
+    _Timer.stop("TEMP_FT_gemm");
+    _Timer.start("TEMP_FT_reset");
     buffer_wi.reset();
+    _Timer.stop("TEMP_FT_reset");
+    _Timer.start("TEMP_FT_leakage");
     _ft->check_leakage(buffer_ti, imag_axes_ft::boson, "screened interaction", true);
+    _Timer.stop("TEMP_FT_leakage");
 
+    _Timer.start("TEMP_FT_alloc");
     auto dW_tqPQ = make_distributed_array<local_Array_t>(
         *comm, t_pgrid_out, t_gshape, t_bsize_out);
+    utils::device_sync();
+    _Timer.stop("TEMP_FT_alloc");
 
     _Timer.start("FT_REDISTRIBUTE");
+    _Timer.start("TEMP_FT_redist");
     math::nda::redistribute(buffer_ti, dW_tqPQ);
+    _Timer.stop("TEMP_FT_redist");
     _Timer.stop("FT_REDISTRIBUTE");
+    _Timer.start("TEMP_FT_reset");
     buffer_ti.reset();
+    _Timer.stop("TEMP_FT_reset");
 
     _Timer.stop("IMAG_FT_WtoT");
     return dW_tqPQ;
