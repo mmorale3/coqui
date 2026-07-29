@@ -442,11 +442,29 @@ inline qrad_tab build_qrad_tab(
  * exact here too. PAW-only (requires aewfc/pswfc); returns an empty table
  * otherwise so callers can fall back.
  */
+/**
+ * Which on-site radial pair density the table carries.
+ *
+ * `aeps_diff` is the historical behaviour (phi*phi - phit*phit). The split
+ * variants exist for the ISDF cancellation fix: the THC currently fits rho~
+ * with the ISDF and adds (AE-PS) exactly, so the ISDF error -- which is
+ * relative to |rho~| -- lands on the AE pair density amplified by the
+ * smooth/AE cancellation ratio (measured 46x for off-diagonal contractions
+ * vs 1.6x for the diagonal, notes sec 11). Regrouping as
+ *
+ *     rho_AE = [rho~ - sum YY.(ps_only)] + sum YY.(ae_only)
+ *
+ * is exact -- ae_only minus ps_only is aeps_diff -- but leaves the ISDF a
+ * target that is small inside the spheres, removing the amplification.
+ */
+enum class onsite_pair_mode { aeps_diff, ps_only, ae_only };
+
 inline qrad_tab build_qrad_tab_full_aeps(
     pseudopot::species_paw_t const& sp,
     double K_max,
     double dq = 0.01,
-    int aug_lmax = -1)
+    int aug_lmax = -1,
+    onsite_pair_mode mode = onsite_pair_mode::aeps_diff)
 {
     qrad_tab T;
     T.dq = dq;
@@ -501,10 +519,22 @@ inline qrad_tab build_qrad_tab_full_aeps(
     for (long nb = 0; nb < nbeta; ++nb)
         for (long mb = 0; mb <= nb; ++mb) {
             long ijv = nb * (nb + 1) / 2 + mb;
-            for (long i = 0; i < N; ++i)
-                D(ijv, i) = sp.aewfc(nb, i) * sp.aewfc(mb, i)
-                          - sp.pswfc(nb, i) * sp.pswfc(mb, i);
+            for (long i = 0; i < N; ++i) {
+                double ae = sp.aewfc(nb, i) * sp.aewfc(mb, i);
+                double ps = sp.pswfc(nb, i) * sp.pswfc(mb, i);
+                switch (mode) {
+                    case onsite_pair_mode::aeps_diff: D(ijv, i) = ae - ps; break;
+                    case onsite_pair_mode::ps_only:   D(ijv, i) = ps;      break;
+                    case onsite_pair_mode::ae_only:   D(ijv, i) = ae;      break;
+                }
+            }
         }
+    // NOTE for the split modes: `D -> 0 beyond kkbeta` holds for the DIFFERENCE
+    // (phi = phit outside r_c) but NOT for ps_only/ae_only individually, which
+    // stay finite out to the full radial mesh. The kkbeta truncation below is
+    // therefore exact only in aeps_diff mode; the split tables are cut at the
+    // same radius and each carries a tail error that CANCELS between them.
+    // Any consumer must use them as a pair, never one alone.
 
     nda::array<double, 1> besr(N);
     for (long iK = 0; iK < T.n_K; ++iK) {

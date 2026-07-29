@@ -949,11 +949,11 @@ namespace methods {
           gather_rows_from_dist_qpool(eta_w_dist, P_aug_rows_la, q_intra, ewP, g_rng);
           if (!dense_LL) {
             // η rows for the rho_g V_LL GEMM (dense_LL builds its own tiles).
+            // Kept UNCONJUGATED: the V_LL GEMM below conjugates the second
+            // index via dagger(ewQ), matching the GG/GL convention. (It used
+            // to be conjugated here and paired with transpose(ewQ), which
+            // stored the transpose of V_LL.)
             gather_rows_from_dist_qpool(eta_dist, P_aug_rows_la, q_intra, ePc, g_rng);
-            // ePc holds η; flip to conj(η) for the V_LL GEMM.
-            for (long la = 0; la < ePc.shape(0); ++la)
-              for (long g = 0; g < ng_c; ++g)
-                ePc(la, g) = std::conj(ePc(la, g));
           }
 
           // V_GL(μ, λ) = Ω · Σ_g ζ(μ, g) · conj(η_w(λ, g)).  (gate _paw_vgl)
@@ -970,11 +970,22 @@ namespace methods {
                             ComplexType(1.0), V_LG_local);
             _Timer.stop("PAW_AUG.V_GL");
           }
-          // V_LL rho_g branch: Ω² · Σ_g conj(η(λ, g)) · η_w(ξ, g)
-          // (the dense_LL branch below builds its own G-chunked tiles).
+          // V_LL rho_g branch: Ω² · Σ_g η(λ, g) · w(g) · conj(η(ξ, g)).
+          //
+          // CONJUGATE THE SECOND INDEX. That is the convention the rest of Z
+          // uses -- the smooth block is multiply(Z_quG, dagger(Z_quG)) in
+          // thc.icc, i.e. Z_uv = Σ_G ζ_u v conj(ζ_v), and V_GL above follows
+          // it with gemm(ω, zP, dagger(ewQ)). This block used to conjugate the
+          // FIRST index instead, which (V_LL being Hermitian) silently stored
+          // its TRANSPOSE: diagonal elements are real so they were unaffected,
+          // and every diagonal-only test passed, but off-diagonal ERIs (ia|bj)
+          // came out transposed. Tr(Pi*Z) uses only the diagonal and was fine;
+          // ln|det(I-Pi*Z)| uses the whole matrix and carried the error --
+          // measured at 39% on Si a=10.05 n=250, and thresh-independent
+          // because V_LL contains no ζ.
           if (_paw_vll && !dense_LL && ePc.shape(0) > 0 && ewQ.shape(0) > 0) {
             _Timer.start("PAW_AUG.V_LL");
-            nda::blas::gemm(ComplexType(omega_sq), ePc, nda::transpose(ewQ),
+            nda::blas::gemm(ComplexType(omega_sq), ePc, nda::dagger(ewQ),
                             ComplexType(1.0), V_LL_local);
             _Timer.stop("PAW_AUG.V_LL");
           }
@@ -1051,15 +1062,18 @@ namespace methods {
                 // channel itself, not the kernel, so both tiles describe the
                 // identical cut function set.
                 if (aug_cut and K2 > aug_K2_max) w = 0.0;
-                for (long la = 0; la < etaP_v.shape(0); ++la)
-                  etaP_v(la, ig) = (aug_cut and K2 > aug_K2_max)
-                                 ? ComplexType(0.0)
-                                 : std::conj(etaP_v(la, ig));
+                // etaP stays UNCONJUGATED; the GEMM conjugates the second
+                // index via dagger(etaQ_v), matching the GG/GL convention.
+                if (aug_cut and K2 > aug_K2_max)
+                  for (long la = 0; la < etaP_v.shape(0); ++la)
+                    etaP_v(la, ig) = ComplexType(0.0);
                 for (long la = 0; la < etaQ_v.shape(0); ++la)
                   etaQ_v(la, ig) *= w;
               }
+              // V_LL(λ,ξ) = Ω² Σ_g η(λ,g) w(g) conj(η(ξ,g)) -- see the rho_g
+              // branch above for why the conjugation sits on the SECOND index.
               nda::blas::gemm(ComplexType(omega_sq), etaP_v,
-                              nda::transpose(etaQ_v),
+                              nda::dagger(etaQ_v),
                               ComplexType(1.0), V_LL_local);
             }
           }

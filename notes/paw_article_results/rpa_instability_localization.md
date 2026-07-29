@@ -437,6 +437,46 @@ denominator. D0 is the one that matters. Validated on LiH: calibration
 0.999853, measurement 0.999790, and the smooth excess is visibly larger under
 D0 (1.598x) than D1 (1.367x) as expected.
 
+## 12. THE BUG — V_LL conjugates the wrong index of Z
+
+`thc_reader_t.hpp`, both V_LL branches (rho_g ~line 973, dense ~line 1054).
+
+The convention is set by the smooth block, `thc.icc:1608`:
+
+    multiply(Z_quG, dagger(Z_quG))   ->   Z_uv = sum_G zeta_u v conj(zeta_v)
+
+i.e. **conjugate the SECOND (column) index**. V_GL follows it:
+`gemm(omega, zP, dagger(ewQ))` -> `Omega sum_g zeta_u conj(eta_lambda) w`.
+
+Both V_LL branches conjugated the **FIRST** index instead:
+
+    rho_g:  ePc = conj(eta_P);        gemm(omega^2, ePc,    transpose(ewQ))
+    dense:  etaP_v = conj(etaP_v);    gemm(omega^2, etaP_v, transpose(etaQ_v))
+
+V_LL is Hermitian, so conjugating the wrong index stores exactly its
+**TRANSPOSE**.
+
+### Why nine months of testing never saw it
+
+- **Diagonal elements of a Hermitian matrix are real**, so every diagonal ERI
+  is unaffected. D1, D0, the head-resolved sweep, `thc_vgl_vll_split`, the band
+  scan — all diagonal.
+- **V_LL_old is itself Hermitian** (`V_LL_old(l,x)* = V_LL_old(x,l)`), so the
+  assembled Z stays Hermitian and the 1e-8 Hermiticity check cannot see it.
+- **The pair densities are untouched** — only Z is wrong — so the ABINIT
+  oscillator comparison still matches to 1e-5 (sec: crosscode/README.md).
+- **V_LL contains no zeta**, so the error is thresh-independent: measured
+  1.390937 at thresh 1e-4 and 1.390985 at 1e-5, frozen to four digits.
+- **Tr(Pi*Z) uses only the diagonal** and was right (PAW −10.138 vs NC −10.229);
+  **ln|det(I-Pi*Z)| uses the whole matrix** and carried the 30%.
+- **eta is nearly real on the LiH fixture** (2 atoms, high symmetry) so the
+  transpose is nearly a no-op there — the fix moves LiH by <1e-5. On Si
+  jth_with_d, with two atoms at (0,0,0) and (1/4,1/4,1/4) and d-channels, eta
+  is strongly complex and the error is 39%.
+
+Fix: `dagger` on the second index in both branches, with `ePc`/`etaP_v` left
+unconjugated.
+
 ## 11. THE DIAGNOSIS — off-diagonal ERIs, and why every earlier test missed them
 
 `Tr(Pi*Z)` and `ln|det(I - Pi*Z)|` depend on DIFFERENT classes of ERI:
