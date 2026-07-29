@@ -154,6 +154,49 @@ add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${C
 set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
                     TIMEOUT ${COQUI_VERTEX_TEST_TIMEOUT})
 
+# Static vertex (B-S) increment S6: end-to-end on LiH-222 (nosym) -- the whole loop with
+# vertex_rung = "static": W0 built inside update_w, P stays RPA, Sigma carries BOTH cuts.
+set(TEST_ID methods_vertex_static_e2e)
+
+add_executable(test_${TEST_ID} test_vertex_static_e2e.cpp)
+target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield eri_lib hf_lib
+                      vertex_lib gw_lib scf_lib)
+
+add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
+set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
+                    TIMEOUT ${COQUI_VERTEX_TEST_TIMEOUT})
+
+# Static vertex (B-S) increment S5: the FUNCTIONAL-DERIVATIVE ORACLE -- the test with
+# teeth for Formulation B-S. Verifies "one total derivative of one Phi":
+#   d/dl Phi[G + l dG] = T[Sigma^{C,x}, P_C dG P_C] + T[Sigma^{C,r}, dG]
+# on a reality-symmetric toy with a NON-Hermitian dG, plus the drop / sign-flip /
+# notes'-sandwich positive controls. Pure toy: no MF, no scGW, seconds to run.
+set(TEST_ID methods_vertex_fdoracle)
+
+add_executable(test_${TEST_ID} test_vertex_fdoracle.cpp)
+target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield eri_lib hf_lib
+                      vertex_lib gw_lib scf_lib)
+
+add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
+set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
+                    TIMEOUT ${COQUI_VERTEX_TEST_TIMEOUT})
+
+# Static vertex (B-S/B-L) increment S2: the W0[G] rung infrastructure
+# (notes/static_vertex_implementation_plan.md section 2.2). Pins (i) the plain-GW
+# SELF-SLICE identity W0 == the i.nu = 0 row of the fully solved W, (ii) the three
+# q->0 head policies at i.nu = 0, (iii) the update_w seam (a static-rung vertex gets
+# W0 built and leaves the RPA W bit-identical; no bootstrap, no Pi^C injection) and
+# (iv) the distributed W0bar fold against a replicated t W0 t^dag reference.
+set(TEST_ID methods_vertex_w0)
+
+add_executable(test_${TEST_ID} test_vertex_w0.cpp)
+target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield eri_lib hf_lib
+                      vertex_lib gw_lib scf_lib)
+
+add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
+set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
+                    TIMEOUT ${COQUI_VERTEX_TEST_TIMEOUT})
+
 # ISDF-Vertex self-consistency diagnostic (missing controls for the Si M8 divergence):
 # the little-group residual of the SELF-CONSISTENT G with the vertex OFF (baseline
 # control the IBZ test never measured), the same with the vertex ON over several

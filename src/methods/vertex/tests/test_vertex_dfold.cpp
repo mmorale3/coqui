@@ -56,6 +56,7 @@
 #include "utilities/test_common.hpp"
 
 #include "methods/vertex/vertex_secondary_fold.hpp"
+#include "methods/vertex/vertex_t.h"   // S2: vertex_w0_detail::extract_nu0_row
 
 namespace bdft_tests {
 
@@ -357,6 +358,159 @@ TEST_CASE("vertex_zfold_distributed", "[methods][vertex][dfold]") {
   bool worst_ok = true;
   for (auto const& g : grids) worst_ok = worst_ok and (run_grid(g) <= 1e-12);
   REQUIRE(worst_ok);
+}
+
+/**
+ * STATIC VERTEX increment S2 -- GATE (iii): the W0 ONE-ROW distributed build + fold
+ * (notes/static_vertex_implementation_plan.md sections 2.2, 4 "S2", 5 "vertex_dfold (W0
+ * fold forced-(P,Q)-split case)").
+ *
+ * The W0 build has to bridge two DIFFERENT (P,Q) block layouts: the RPA polarizability
+ * lives on {nt_procs, 1, np_P, np_Q} (rpa_pi.icc:66), whose (P,Q) partition covers only
+ * np_P*np_Q ranks, while W0 must be (P,Q)-block-distributed over ALL ranks with q unsplit
+ * (the thc.dZ({1,nP,nQ}) layout fold_Z_distributed and the slate 2D ops both take). The
+ * physics tests never split (P,Q) at all -- at Si/LiH scale the RPA puts every rank on t.
+ * THIS case FORCES both splits:
+ *   (a) vertex_w0_detail::extract_nu0_row on every legal SOURCE grid {1, nt, nP, nQ} into
+ *       every legal OUTPUT grid {1, 1, nP', nQ'} vs a replicated sum_t R(t) Pi(t,q,P,Q);
+ *   (b) fold_Z_distributed of that i.nu = 0 row (the "one-row variant" of the dW fold --
+ *       W0 has exactly Z's shape, so the fold IS fold_Z_distributed) vs the replicated
+ *       two-gemm t W0 t^dag.
+ * Both to <= 1e-12; bit-identical at 1 rank (one (P,Q) block == the whole array).
+ */
+TEST_CASE("vertex_w0_row_fold_distributed", "[methods][vertex][dfold][w0]") {
+  using methods::solvers::vertex_secondary_detail::fold_Z_distributed;
+  using methods::solvers::vertex_w0_detail::extract_nu0_row;
+  auto world = boost::mpi3::environment::get_world_instance();
+  const long P = world.size();
+  decltype(nda::range::all) all;
+
+  // same toy dims as the folds above (the point is the two (P,Q) splits, not scale)
+  const long nq = 3, nt_half = 4, Np = 6, Nm = 3;
+  const long iq_gamma = 1;
+
+  // deterministic i.nu = 0 transform row (stands in for nu0_transform_row; the identity
+  // "that row == index 0 of tau_to_w_PHsym" is pinned separately by
+  // test_vertex_w0.cpp::vertex_w0_transform_row).
+  nda::array<ComplexType, 1> R_t(nt_half);
+  for (long t = 0; t < nt_half; ++t) R_t(t) = twtref(0, t);
+
+  // replicated downfold maps t(q)(m, P).
+  nda::array<ComplexType, 3> t_qmP(nq, Nm, Np);
+  for (long q = 0; q < nq; ++q)
+    for (long m = 0; m < Nm; ++m)
+      for (long jp = 0; jp < Np; ++jp) t_qmP(q, m, jp) = tref(q, m, jp);
+
+  // --- REPLICATED reference: the i.nu = 0 row, then the full Np x Np fold -------------
+  nda::array<ComplexType, 3> W0_ref(nq, Np, Np);
+  nda::array<ComplexType, 3> W0bar_ref(nq, Nm, Nm);
+  {
+    W0_ref() = ComplexType(0.0);
+    for (long q = 0; q < nq; ++q)
+      for (long t = 0; t < nt_half; ++t)
+        for (long ip = 0; ip < Np; ++ip)
+          for (long jq = 0; jq < Np; ++jq)
+            W0_ref(q, ip, jq) += R_t(t) * dwref(q, t, ip, jq, Np);
+    for (long q = 0; q < nq; ++q)
+      ref_fold(t_qmP(q, all, all), W0_ref(q, all, all), W0bar_ref(q, all, all));
+  }
+
+  using larray4 = nda::array<ComplexType, 4>;
+  using larray3 = nda::array<ComplexType, 3>;
+  auto run_grids = [&](shape_t<4> src_grid, shape_t<3> out_grid) {
+    // source: the RPA-class tau-domain array on {1(q), nt, nP, nQ} -- NOTE the axis order
+    // the production Pi carries is (t, q, P, Q), so the "q unsplit" axis is axis 1 there;
+    // here we drive the general routine, which makes no assumption about the source grid.
+    auto dPi = make_distributed_array<larray4>(world, src_grid, {nt_half, nq, Np, Np},
+                                               {1, 1, 1, 1});
+    {
+      auto loc = dPi.local();
+      auto [t0, q0, P0, Q0] = dPi.origin();
+      auto ls = dPi.local_shape();
+      for (long it = 0; it < ls[0]; ++it)
+        for (long iq = 0; iq < ls[1]; ++iq)
+          for (long ip = 0; ip < ls[2]; ++ip)
+            for (long jq = 0; jq < ls[3]; ++jq)
+              loc(it, iq, ip, jq) = dwref(q0 + iq, t0 + it, P0 + ip, Q0 + jq, Np);
+    }
+
+    // (a) the i.nu = 0 row on the {1, 1, nP', nQ'} layout
+    shape_t<4> row_grid = {1, 1, out_grid[1], out_grid[2]};
+    auto dW0_1q = make_distributed_array<larray4>(world, row_grid, {1, nq, Np, Np},
+                                                  {1, 1, 1, 1});
+    extract_nu0_row(dPi, R_t, dW0_1q);
+
+    double worst_row = 0.0;
+    {
+      auto loc = dW0_1q.local();
+      auto Pr = dW0_1q.local_range(2);
+      auto Qr = dW0_1q.local_range(3);
+      for (long iq = 0; iq < nq; ++iq)
+        for (long ip = 0; ip < loc.shape(2); ++ip)
+          for (long jq = 0; jq < loc.shape(3); ++jq)
+            worst_row = std::max(worst_row,
+                                 std::abs(loc(0, iq, ip, jq) -
+                                          W0_ref(iq, Pr.first() + ip, Qr.first() + jq)));
+    }
+    world.all_reduce_in_place_n(&worst_row, 1, boost::mpi3::max<>{});
+
+    // (b) the one-row fold. The 3D W0 handle the production code builds must share the
+    //     (P,Q) partition of the rank-4 row above -- that is the assumption build_w0
+    //     relies on when it copies Z + dW0 into the {1, nP, nQ} array, so assert it.
+    auto dW0 = make_distributed_array<larray3>(world, out_grid, {nq, Np, Np}, {1, 1, 1});
+    REQUIRE(dW0.local_range(1) == dW0_1q.local_range(2));
+    REQUIRE(dW0.local_range(2) == dW0_1q.local_range(3));
+    dW0.local() = dW0_1q.local()(0, nda::ellipsis{});
+
+    nda::array<ComplexType, 3> W0bar_dist(nq, Nm, Nm);
+    auto no_head = [](nda::MemoryArrayOfRank<2> auto&&, nda::range const&,
+                      nda::range const&) {};
+    fold_Z_distributed(dW0, t_qmP, nq, Np, Nm, iq_gamma, false, no_head, W0bar_dist, world);
+
+    double worst_fold = 0.0;
+    for (long q = 0; q < nq; ++q)
+      for (long m = 0; m < Nm; ++m)
+        for (long n = 0; n < Nm; ++n)
+          worst_fold = std::max(worst_fold,
+                                std::abs(W0bar_dist(q, m, n) - W0bar_ref(q, m, n)));
+    world.all_reduce_in_place_n(&worst_fold, 1, boost::mpi3::max<>{});
+
+    if (world.root())
+      app_log(1, "vertex_w0_row_fold_distributed[P={} src=({},{},{},{}) out=({},{},{})]: "
+                 "max|row - ref| = {:.3e}, max|W0bar - t W0 t^dag| = {:.3e}",
+              P, src_grid[0], src_grid[1], src_grid[2], src_grid[3],
+              out_grid[0], out_grid[1], out_grid[2], worst_row, worst_fold);
+    return std::max(worst_row, worst_fold);
+  };
+
+  // legal SOURCE grids {1(t-unsplit-allowed), nt, nP, nQ}: the RPA layout is
+  // {nt, 1, nP, nQ}, i.e. t on axis 0 and q unsplit, so enumerate exactly that shape.
+  std::vector<shape_t<4>> src_grids;
+  for (long nt = 1; nt <= P; ++nt) {
+    if (P % nt != 0 or nt > nt_half) continue;
+    long rem = P / nt;
+    for (long nP = 1; nP <= rem; ++nP) {
+      if (rem % nP != 0) continue;
+      long nQ = rem / nP;
+      if (nP > Np or nQ > Np) continue;
+      src_grids.push_back({nt, 1, nP, nQ});
+    }
+  }
+  // legal OUTPUT grids {1, nP', nQ'} with nP'*nQ' == P (fold_Z_distributed's requirement)
+  std::vector<shape_t<3>> out_grids;
+  for (long nP = 1; nP <= P; ++nP) {
+    if (P % nP != 0) continue;
+    long nQ = P / nP;
+    if (nP > Np or nQ > Np) continue;
+    out_grids.push_back({1, nP, nQ});
+  }
+  REQUIRE(not src_grids.empty());
+  REQUIRE(not out_grids.empty());
+
+  bool ok = true;
+  for (auto const& sg : src_grids)
+    for (auto const& og : out_grids) ok = ok and (run_grids(sg, og) <= 1e-12);
+  REQUIRE(ok);
 }
 
 // deterministic replicated secondary-aux value Pibar(w, q, m, n) (partial-summed already;

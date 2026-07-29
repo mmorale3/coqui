@@ -1,0 +1,233 @@
+/**
+ * ==========================================================================
+ * CoQuí: Correlated Quantum ínterface
+ *
+ * Copyright (c) 2022-2026 Simons Foundation & The CoQuí developer team
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ * ==========================================================================
+ */
+
+#ifndef COQUI_VERTEX_SIGMA_R_ICC
+#define COQUI_VERTEX_SIGMA_R_ICC
+
+/**
+ * INCREMENT S5 -- the SCREENING-RESPONSE cut Sigma^{C,r} of the static-vertex theories
+ * (notes/static_vertex_implementation_plan.md section 2; theoryB_static.pdf
+ * section "The response cut"). This is the term that makes B-S conserving: within the
+ * self-consistent theory W0 is rebuilt from the current G every iteration, so
+ * Sigma^{C,x} alone is not the derivative of any functional. The invariant is
+ * "Sigma^{C,x} and Sigma^{C,r} TOGETHER or neither".
+ *
+ * It arises purely by the chain rule through W0[G]:
+ *
+ *   Sigma^r_cd = sum_q sum_{AB} (dP0_AB(q)/dG_cd) . [W0(q)^T X(q) W0(q)^T]_AB ,
+ *   X(q) := dPhi/dW0(q).
+ *
+ * ROUTING -- verified mechanically, NOT transcribed from the notes
+ * (verification/static_vertex_routing_report.md sections 3.1-3.2; the arbiter is
+ * verification/verify_static_cuts.py, 97 checks). Two corrections to the notes' boxed
+ * equations, both of which survive the crystal symmetries and are therefore real:
+ *
+ *  (1) the W0 sandwiches are TRANSPOSED -- the chain rule contracts the OUTER indices
+ *      of the two W0's, not the inner ones. The notes' W0 . Pi . W0 fails the
+ *      finite-difference oracle by 56 %.
+ *  (2) the middle factor is the SYMMETRIZED tau=0 polarization. dPhi/dW0(q) is
+ *      -(1/4)[PiBar(q)^T + PiBar(-q)], not -(1/2) PiBar(q): Phi's rung slot is
+ *      ((a,b),(c,d)) while the Pi kernel emits (M,N) = ((c,d),(a,b)) -- the opposite
+ *      order -- so one transpose is the price of the pinned (M,N) convention.
+ *
+ *  It is a TRANSPOSE, not a dagger: on generic complex data ^dag is rejected (6.9e-01)
+ *  while ^T is exact. NOTE that under the crystal symmetries ^T and conj become
+ *  DEGENERATE (W0 and PiBar are Hermitian there), so only asymmetric data separates
+ *  them -- which is why the FD oracle test must not use a fully symmetric toy.
+ *
+ * Hence, with beta cancelling between PiBar = beta Pi^{C,0}(tau=0) and the explicit
+ * 1/beta of dP0/dG:
+ *
+ *   Dw(q) = W0(q)^T . (1/2)[ Pi^{C,0}(q,tau=0)^T + Pi^{C,0}(-q,tau=0) ] . W0(q)^T
+ *
+ *   Sigma^{r,s}_cd(k,tau) = -(1/(2 Nk)) sum_q [ X^T(k) M_q(k,tau) X^*(k) ]_cd ,
+ *   M_q = Dw(q) (.) Gt^s(k-q,tau)^T  +  ( Dw(q) (.) Gt^s(k+q,tau) )^T      [(.) = Hadamard]
+ *
+ * Structural properties (each verified by the arbiter):
+ *  - FREQUENCY-DIAGONAL: Sigma^r(k,iw) depends on iw only through G(k-+q,iw), so in
+ *    imaginary time it is tau-LOCAL -- one GW-class static Hadamard per q. No
+ *    convolution, no pole algebra, nothing two-scale. This is why B-S is cheap.
+ *  - FULL-SPACE externals and full-space Gt: the differentiated G's live in W0's RPA
+ *    bubble, which carries no projector. Unlike Sigma^{C,x} (strict C-C), c and d here
+ *    run over the whole band range.
+ *  - BOTH +-q terms are kept explicit: they are independent objects for generic data
+ *    (measured), term 2 being term 1 at -q with the sandwich transposed.
+ *  - SPIN: dP0/dG^{s'} selects the s' bubble, so Sigma^r is per-spin with a
+ *    SPIN-INDEPENDENT Dw. The spin sum of P0 lives inside Pi^{C,0}/W0 already.
+ *
+ * SCOPE OF THIS FILE (S5): replicated (per-rank) arrays, mirroring the no-symmetry
+ * entry point of vertex_sigma.icc. The production (P,Q)-distributed sandwich is a
+ * separate concern -- plan section 3 leaves the choice (SLATE on the RPA grid vs the
+ * fold_core_block pattern) to be made on whichever grid the consumer sits on.
+ */
+
+#include <complex>
+
+#include "configuration.hpp"
+#include "utilities/check.hpp"
+#include "IO/app_loggers.h"
+#include "nda/nda.hpp"
+#include "nda/blas.hpp"
+
+namespace methods {
+namespace solvers {
+namespace vertex_detail {
+
+  /**
+   * Build the response rung Dw(q) from the static screen and the equal-time static-rung
+   * exchange polarization. See the file header for why the sandwich is transposed and
+   * the middle factor symmetrized.
+   *
+   * @param W0_qPQ    - [INPUT]  (nq, N, N) static screen W0 (head policy already applied)
+   * @param Pi0_qPQ   - [INPUT]  (nq, N, N) Pi^{C,0}(q, tau = 0), the tau=0 row already
+   *                             applied (vertex_w0_detail::tau0_transform_row)
+   * @param qminus    - [INPUT]  (nq) index map q -> -q
+   * @param Dw_qPQ    - [OUTPUT] (nq, N, N) the response rung; overwritten
+   */
+  template<nda::MemoryArrayOfRank<3> WArr_t, nda::MemoryArrayOfRank<3> PArr_t,
+           nda::MemoryArrayOfRank<3> DArr_t>
+  void build_delta_w(WArr_t const &W0_qPQ, PArr_t const &Pi0_qPQ,
+                     nda::array<long, 1> const &qminus, DArr_t &&Dw_qPQ) {
+    decltype(nda::range::all) all;
+    const long nq = W0_qPQ.shape(0), N = W0_qPQ.shape(1);
+    utils::check(W0_qPQ.shape(2) == N, "build_delta_w: W0 is not square.");
+    utils::check(Pi0_qPQ.shape(0) == nq and Pi0_qPQ.shape(1) == N and
+                 Pi0_qPQ.shape(2) == N,
+                 "build_delta_w: Pi^(C,0) shape ({}, {}, {}) != W0 shape ({}, {}, {}).",
+                 Pi0_qPQ.shape(0), Pi0_qPQ.shape(1), Pi0_qPQ.shape(2), nq, N, N);
+    utils::check(qminus.shape(0) == nq, "build_delta_w: qminus size {} != nq = {}.",
+                 qminus.shape(0), nq);
+    utils::check(Dw_qPQ.shape(0) == nq and Dw_qPQ.shape(1) == N and
+                 Dw_qPQ.shape(2) == N, "build_delta_w: Dw shape mismatch.");
+
+    nda::array<ComplexType, 2> Psym(N, N), tmp(N, N);
+    for (long iq = 0; iq < nq; ++iq) {
+      const long iqm = qminus(iq);
+      // (1/2)[ Pi(q)^T + Pi(-q) ]   -- the SYMMETRIZED middle factor
+      for (long P = 0; P < N; ++P)
+        for (long Q = 0; Q < N; ++Q)
+          Psym(P, Q) = 0.5 * (Pi0_qPQ(iq, Q, P) + Pi0_qPQ(iqm, P, Q));
+      // W0^T . Psym . W0^T   -- TRANSPOSED sandwiches
+      auto W0q = W0_qPQ(iq, all, all);
+      nda::blas::gemm(nda::transpose(W0q), Psym, tmp);
+      nda::blas::gemm(tmp, nda::transpose(W0q), Dw_qPQ(iq, all, all));
+    }
+  }
+
+  /**
+   * Sigma^{C,r}(tau): the +-q pair of static Hadamard contractions with the rung Dw.
+   *
+   * @param comm        - communicator; (s,k) combos round-robin, OUTPUT all-reduced
+   * @param G_tskij     - [INPUT] (nt, ns, nk, nbnd, nbnd) G(tau), FULL band range
+   * @param X_skPa      - [INPUT] (ns, nk, N, nbnd) collocation
+   * @param Dw_qPQ      - [INPUT] (nq, N, N) response rung from build_delta_w
+   * @param k_minus_q   - [INPUT] (nq, nk) index map k - q
+   * @param qminus      - [INPUT] (nq) index map -q  (used to reach k + q)
+   * @param Sigma_r_tskab - [OUTPUT] (nt, ns, nk, nbnd, nbnd), OVERWRITTEN
+   */
+  template<nda::MemoryArrayOfRank<5> GArr_t, nda::MemoryArrayOfRank<4> XArr_t,
+           nda::MemoryArrayOfRank<3> DArr_t, nda::MemoryArrayOfRank<5> SArr_t>
+  void eval_sigma_C_response(mpi3::communicator &comm,
+                             GArr_t const &G_tskij,
+                             XArr_t const &X_skPa,
+                             DArr_t const &Dw_qPQ,
+                             nda::array<long, 2> const &k_minus_q,
+                             nda::array<long, 1> const &qminus,
+                             SArr_t &&Sigma_r_tskab) {
+    decltype(nda::range::all) all;
+    const long nt   = G_tskij.shape(0);
+    const long ns   = G_tskij.shape(1);
+    const long nk   = G_tskij.shape(2);
+    const long nbnd = G_tskij.shape(3);
+    const long N    = X_skPa.shape(2);
+    const long nq   = k_minus_q.shape(0);
+
+    utils::check(G_tskij.shape(4) == nbnd, "eval_sigma_C_response: G is not square in ab.");
+    utils::check(X_skPa.shape(0) == ns and X_skPa.shape(1) == nk and
+                 X_skPa.shape(3) == nbnd,
+                 "eval_sigma_C_response: X_skPa shape mismatch.");
+    utils::check(Dw_qPQ.shape(0) == nq and Dw_qPQ.shape(1) == N and
+                 Dw_qPQ.shape(2) == N,
+                 "eval_sigma_C_response: Dw shape ({}, {}, {}) != (nq, N, N) = "
+                 "({}, {}, {}).", Dw_qPQ.shape(0), Dw_qPQ.shape(1), Dw_qPQ.shape(2),
+                 nq, N, N);
+    utils::check(nq == nk, "eval_sigma_C_response: transfer mesh nq = {} != nk = {}.",
+                 nq, nk);
+    utils::check(qminus.shape(0) == nq, "eval_sigma_C_response: qminus size mismatch.");
+    utils::check(Sigma_r_tskab.shape(0) == nt and Sigma_r_tskab.shape(1) == ns and
+                 Sigma_r_tskab.shape(2) == nk and Sigma_r_tskab.shape(3) == nbnd and
+                 Sigma_r_tskab.shape(4) == nbnd,
+                 "eval_sigma_C_response: output shape mismatch.");
+
+    Sigma_r_tskab() = ComplexType(0.0);
+
+    nda::array<ComplexType, 2> Gt_m(N, N), Gt_p(N, N), M(N, N), half(nbnd, N);
+    nda::array<ComplexType, 2> Gtmp(N, nbnd), Xc(N, nbnd), Xd(nbnd, N), res(nbnd, nbnd);
+
+    // aux-dressed propagator: Gt_PQ(k) = [X G X^dag]_PQ  (primary_to_aux), FULL space
+    auto dress = [&](long is, long ik, long it, nda::array<ComplexType, 2> &out) {
+      auto Xk = X_skPa(is, ik, all, all);              // (N, nbnd)
+      auto Gk = G_tskij(it, is, ik, all, all);         // (nbnd, nbnd)
+      for (long P = 0; P < N; ++P)
+        for (long a = 0; a < nbnd; ++a) Xd(a, P) = std::conj(Xk(P, a));   // X^dag
+      nda::blas::gemm(Xk, Gk, Gtmp);                   // (N, nbnd)
+      nda::blas::gemm(Gtmp, Xd, out);                  // (N, N)
+    };
+
+    const long rank = comm.rank(), size = comm.size();
+    const long ncombo = ns * nk * nt;
+    for (long combo = rank; combo < ncombo; combo += size) {
+      const long is = combo / (nk * nt);
+      const long ik = (combo / nt) % nk;
+      const long it = combo % nt;
+
+      M() = ComplexType(0.0);
+      for (long iq = 0; iq < nq; ++iq) {
+        const long ikmq = k_minus_q(iq, ik);
+        const long ikpq = k_minus_q(qminus(iq), ik);
+        dress(is, ikmq, it, Gt_m);
+        dress(is, ikpq, it, Gt_p);
+        auto D = Dw_qPQ(iq, all, all);
+        // M += Dw (.) Gt(k-q)^T  +  ( Dw (.) Gt(k+q) )^T
+        for (long A = 0; A < N; ++A)
+          for (long B = 0; B < N; ++B)
+            M(A, B) += D(A, B) * Gt_m(B, A) + D(B, A) * Gt_p(B, A);
+      }
+      // aux -> primary in the vertex kernels' SAME-INDEX dictionary:
+      //   Sigma_cd = sum_AB X_{A,c} M_AB conj(X_{B,d}) = [X^T M X^*]_cd
+      // (row UNconjugated, column conjugated -- the transpose-conjugate of Sigma^GW's
+      //  X^dag . Sigma . X, and the same convention vertex_sigma.icc uses.)
+      auto Xk = X_skPa(is, ik, all, all);
+      for (long P = 0; P < N; ++P)
+        for (long a = 0; a < nbnd; ++a) Xc(P, a) = std::conj(Xk(P, a));
+      nda::blas::gemm(nda::transpose(Xk), M, half);          // (nbnd, N)
+      nda::blas::gemm(half, Xc, res);                        // (nbnd, nbnd)
+      for (long a = 0; a < nbnd; ++a)
+        for (long b = 0; b < nbnd; ++b)
+          Sigma_r_tskab(it, is, ik, a, b) = -res(a, b) / double(2 * nk);
+    }
+    comm.all_reduce_in_place_n(Sigma_r_tskab.data(), Sigma_r_tskab.size(), std::plus<>{});
+  }
+
+} // vertex_detail
+} // solvers
+} // methods
+
+#endif // COQUI_VERTEX_SIGMA_R_ICC

@@ -43,7 +43,12 @@ namespace solvers {
     // cached at the update_w tail (vertex_t::cache_w, notes/wbar_cache.md); dW can
     // be freed unconditionally. The disabled-cache switch restores the legacy
     // retained-dW semantics (machine-identity A/B reference).
+    // STATIC/LINEAR rung modes (increment S2, plan section 2.1): the dW-retention
+    // exception AND the W-bar cache are RETIRED -- every rung those theories consume
+    // (W0[G] and, in B-L, the same-iteration dW) is produced inside the iteration that
+    // consumes it, so nothing crosses the boundary and the memory profile is plain GW's.
     return _vertex != nullptr and _vertex->active() and
+           _vertex->rung() == dynamic_rung and
            (not _vertex->secondary() or not _vertex->w_cache_enabled());
   }
 
@@ -116,7 +121,15 @@ namespace solvers {
     // starts from a physically screened rung. The self-consistent FIXED POINT is
     // unchanged (there Pi^C already consumes the converged W); only the starting point
     // of the iteration moves. Cost: one extra RPA polarization + Dyson solve, once.
-    if (has_active_vertex() and not vertex_has_rung(mb_state)) {
+    // The bootstrap is a DYNAMIC-rung device only. In the static modes (increment S2,
+    // plan section 2.2 "Bonus") the rung is W0[G], built below from THIS iteration's RPA
+    // polarizability BEFORE any vertex piece runs -- so a physically screened rung exists
+    // from iteration 1 by construction, the bare-rung basin the bootstrap was added to
+    // escape is structurally absent, and the extra RPA + Dyson solve would be pure waste.
+    // The seam itself stays (it is what the dynamic theory needs, and B-L's mixed terms
+    // still consume the same-iteration dW).
+    if (has_active_vertex() and _vertex->rung() == dynamic_rung
+        and not vertex_has_rung(mb_state)) {
       app_log(1, "  [ISDF-Vertex] bootstrap: no screened W is available yet, so Pi^C would "
                  "use the BARE\n"
                  "                rung W = Z. Solving the RPA problem first and re-running "
@@ -213,8 +226,9 @@ namespace solvers {
     // cache is consumed by the NEXT iteration's eval_Pi_C (identical one-iteration
     // lag as the retained-dW path); the scf driver then frees dW unconditionally in
     // this mode (needs_dw_retention() == false -- plain-GW memory profile).
-    if (_vertex != nullptr and _vertex->active() and _vertex->secondary()
-        and _vertex->w_cache_enabled())
+    // (dynamic rung only: the static modes retired the cache -- see needs_dw_retention)
+    if (_vertex != nullptr and _vertex->active() and _vertex->rung() == dynamic_rung
+        and _vertex->secondary() and _vertex->w_cache_enabled())
       _vertex->cache_w(mb_state, thc);
   }
 
@@ -447,11 +461,31 @@ namespace solvers {
 
     auto G_tskij = mb_state.sG_tskij.value().local();
 
+    // ISDF-Vertex INCREMENT S2 (notes/static_vertex_implementation_plan.md section 2.2,
+    // decision D2): the STATIC rung W0[G] = [1 - v P^0_RPA[G]]^{-1} v at i.nu = 0 is a
+    // functional of the RPA polarizability ONLY, so it must be built at exactly this
+    // point -- right after Pi_RPA(q, tau) is assembled and BEFORE any vertex/cRPA/EDMFT
+    // correction is added (ordering, plan section 2.3). Called immediately after every
+    // eval_Pi_rpa_* below and NOWHERE else, so no other Pi contribution can leak into it.
+    // No-op unless the attached vertex is active AND its rung mode is static/linear:
+    // the dynamic theory (Formulation B) has no W0, and this path then executes zero new
+    // arithmetic and allocates nothing.
+    auto build_vertex_W0 = [&](auto &dPi_rpa) {
+      if (_vertex != nullptr and _vertex->needs_w0())
+        _vertex->build_w0(mb_state, thc, dPi_rpa);
+    };
+
     // ISDF-Vertex: additive second-order-exchange polarization cut Pi^C on the
     // same distributed grid as the RPA polarizability (EDMFT "+=" precedent below).
     // When no active vertex is attached this is a strict no-op -- no allocation,
     // no arithmetic -- so the disabled path is bit-identical to plain RPA/scGW.
     auto add_vertex_Pi_C = [&](auto &dPi) {
+      // B-S (vertex_rung = "static") has NO polarization injection at all: P = RPA by
+      // construction (plan section 2.1), and the ONE vertex_t drives every cut of the
+      // selected mode, so the forbidden hybrid "static Sigma^C with a Pi^C injection"
+      // must be unrepresentable rather than merely discouraged. B-L keeps the seam (its
+      // P^{C,L} is injected here, increment S7).
+      if (_vertex != nullptr and _vertex->rung() == static_rung) return;
       if (_vertex != nullptr and _vertex->active()) {
         auto dPi_C_tqPQ = _vertex->eval_Pi_C(mb_state, thc, dPi.grid(),
                                              dPi.block_size(), dPi.global_shape());
@@ -512,12 +546,14 @@ namespace solvers {
 
     if (_screen_type == "rpa_k") {
       auto dPi_tqPQ = eval_Pi_rpa_kspace(G_tskij, thc);
+      build_vertex_W0(dPi_tqPQ);            // RPA-only Pi: before ANY correction
       add_vertex_Pi_C(dPi_tqPQ);
       return dPi_tqPQ;
     }
 
     // RPA polarizability
     auto dPi_tqPQ = eval_Pi_rpa_Rspace(G_tskij, thc);
+    build_vertex_W0(dPi_tqPQ);              // RPA-only Pi: before ANY correction
     if (_screen_type.find("gw_edmft_rpa")!=std::string::npos or _screen_type=="rpa") {
       add_vertex_Pi_C(dPi_tqPQ);
       return dPi_tqPQ;

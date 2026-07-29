@@ -120,6 +120,17 @@ inline void ensure_checkpoint(std::shared_ptr<mf::MF> mf, std::string const& out
  *  - vertex_type: "none" Vertex correction on top of the gw solver.
  *                 {choices: "none", "2nd_exchange"}. "2nd_exchange" enables BOTH cuts of the
  *                 Phi-derivable second-order-exchange functional: Sigma^C (G3W2) and Pi^C (G4W).
+ *  - vertex_rung: "dynamic" Rung mode of the vertex correction (gw solver only;
+ *                 notes/static_vertex_implementation_plan.md section 2.1).
+ *                 {choices: "dynamic", "linear", "static"}. "dynamic" (default) is the
+ *                 parent Formulation B (dynamic W rungs, G3W2 + G4W). "static" (B-S) and
+ *                 "linear" (B-L) are the two conserving static-rung truncations, in which
+ *                 the rungs are the iv = 0 statically screened W0[G]. ONE vertex_t drives
+ *                 all cuts of the selected mode, so mixed half-theories cannot be
+ *                 configured. All other vertex_* keys apply to every mode. The static
+ *                 modes' kernels are NOT implemented yet: selecting one with a non-empty
+ *                 vertex_band_window aborts (increment S2+); an empty window is a no-op in
+ *                 every mode.
  *  - vertex_band_window: [i0, i1) Contiguous 0-based orbital range defining the vertex
  *                 subspace C (gw solver only). Absent/empty window means C is the empty set,
  *                 which reproduces plain scGW exactly.
@@ -281,6 +292,12 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     // optional second-order-exchange vertex correction (ISDF-Vertex)
     auto vertex_type = io::get_value_with_default<std::string>(pt,"vertex_type","none");
     io::tolower(vertex_type);
+    // Rung mode of the vertex (notes/static_vertex_implementation_plan.md section 2.1):
+    // "dynamic" (default) = the parent Formulation B; "static"/"linear" = the B-S/B-L
+    // static-rung truncations. Validated in the vertex_t constructor, which also aborts
+    // for an ACTIVE static/linear vertex until its kernels land (increment S2+).
+    auto vertex_rung = io::get_value_with_default<std::string>(pt,"vertex_rung","dynamic");
+    io::tolower(vertex_rung);
     auto vertex_band_window = io::get_value_with_default<nda::range>(pt,"vertex_band_window",nda::range(0,0));
     // Refinement 2 (secondary ISDF on C; notes/refinement2_optionA.md)
     auto vertex_isdf = io::get_value_with_default<std::string>(pt,"vertex_isdf","global");
@@ -327,7 +344,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     // are switched together through this single object -- never one alone.
     solvers::vertex_t vertex(&ft, vertex_type, vertex_band_window, mf->nbnd(), div_treatment,
                              vertex_isdf, vertex_isdf_rank, vertex_isdf_svd_tol, vertex_isdf_thresh,
-                             vertex_isdf_cond_max);
+                             vertex_isdf_cond_max, vertex_rung);
     vertex.set_vertex_scale(vertex_scale, vertex_ramp_iters);
     if (not vertex_div_treatment.empty()) vertex.set_div_treatment(vertex_div_treatment);
     if (vertex.enabled()) {
@@ -575,6 +592,12 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
     // optional second-order-exchange vertex correction (ISDF-Vertex)
     auto vertex_type = io::get_value_with_default<std::string>(pt,"vertex_type","none");
     io::tolower(vertex_type);
+    // Rung mode of the vertex (notes/static_vertex_implementation_plan.md section 2.1):
+    // "dynamic" (default) = the parent Formulation B; "static"/"linear" = the B-S/B-L
+    // static-rung truncations. Validated in the vertex_t constructor, which also aborts
+    // for an ACTIVE static/linear vertex until its kernels land (increment S2+).
+    auto vertex_rung = io::get_value_with_default<std::string>(pt,"vertex_rung","dynamic");
+    io::tolower(vertex_rung);
     auto vertex_band_window = io::get_value_with_default<nda::range>(pt,"vertex_band_window",nda::range(0,0));
     // Refinement 2 (secondary ISDF on C; notes/refinement2_optionA.md)
     auto vertex_isdf = io::get_value_with_default<std::string>(pt,"vertex_isdf","global");
@@ -621,7 +644,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
     // are switched together through this single object -- never one alone.
     solvers::vertex_t vertex(&ft, vertex_type, vertex_band_window, mf->nbnd(), div_treatment,
                              vertex_isdf, vertex_isdf_rank, vertex_isdf_svd_tol, vertex_isdf_thresh,
-                             vertex_isdf_cond_max);
+                             vertex_isdf_cond_max, vertex_rung);
     vertex.set_vertex_scale(vertex_scale, vertex_ramp_iters);
     if (not vertex_div_treatment.empty()) vertex.set_div_treatment(vertex_div_treatment);
     if (vertex.enabled()) {

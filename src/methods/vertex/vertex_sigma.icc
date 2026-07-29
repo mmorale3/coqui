@@ -105,6 +105,39 @@ namespace vertex_detail {
    *                              gygi-class policy the caller has additionally
    *                              augmented the Gamma cell with the analytic rank-1
    *                              head insertion (vertex_t.cpp).
+   * @param rung_mode  - which theory's rung structure to evaluate:
+   *
+   *     0 = DYNAMIC (Formulation B): everything -- families I-V + S1 + S2 + S3.
+   *         Bit-identical to the historic path.
+   *
+   *     1 = STATIC (B-S, increment S3): both rungs are the frequency-independent W0
+   *         handed in through Z_qPQ, so only S3 survives.
+   *
+   *     2 = LINEAR (B-L, increment S8): the TANGENT functional. Writing W = W0 + dW,
+   *           W0_x W_y + W_x W0_y - W0_x W0_y  =  W0_x W0_y + W0_x dW_y + dW_x W0_y,
+   *         i.e. EXACTLY {S3, S1, S2} of this kernel's own decomposition when the
+   *         caller passes Z_qPQ = W0bar and Wt_qtPQ = dW = W - W0. Families I-V are
+   *         precisely the dropped dW_x dW_y term (Phi^(2)), the ONLY place the double
+   *         bosonic convolution lives -- so B-L needs no new contraction and no pole
+   *         algebra: S1/S2 use only the ordinary tau<->nu transform rows.
+   *         (This is why the "one genuinely new kernel" of the plan turned out not to
+   *          be new: the mixed terms ARE the kernel's existing mixed reductions.)
+   *
+   * @param static_rung_UNUSED - INCREMENT S3 (notes/static_vertex_implementation_plan.md
+   *                      section 1): B-S/B-L STATIC-RUNG mode. Both rungs are the
+   *                      frequency-independent W0 handed in through Z_qPQ, so only the
+   *                      doubly-instantaneous reduction S3 survives:
+   *                        Sigma^{C,x}(tau) = -(1/N_k^2) sum_{qx,qy}
+   *                             cx_b . cy_a . B(tau) C(beta-tau) D(tau)
+   *                      which is exactly eq:sigmaxtau of theoryB_static.pdf and, term
+   *                      for term, the independently coded tau-contraction reference of
+   *                      sigma_c_kernel_design.md section 4 test 3 (pinned at 3.0e-14).
+   *                      Families I-V and the mixed reductions S1/S2 all carry at least
+   *                      one DYNAMIC rung and are therefore identically zero: they are
+   *                      SKIPPED, together with every pole-fit call (the aux pole basis
+   *                      is never touched -- no residue algebra exists in B-S). Wt_qtPQ
+   *                      is then unused and the caller passes a (nq_w, 0, Np, Np) stub.
+   *                      false = the historic dynamic path, bit-identical.
    * @param symc        - optional IBZ symmetry context (notes/vertex_ibz_symmetry.md).
    *                      nullptr / !active: the historic no-symmetry path. Active:
    *                      Sigma_C_tskab's k axis is nkpts_ibz, W/Z carry nq_ibz rows,
@@ -125,12 +158,14 @@ namespace vertex_detail {
                          nda::array<long, 1> const &qminus,
                          long iq_gamma,
                          bool skip_rung_gamma,
+                         int rung_mode,
+                         nda::array<ComplexType, 4> const *Ww_override,
                          vertex_sym::sym_ctx const *symc,
                          SArr_t &&Sigma_C_tskab) {
 #ifndef ENABLE_DLR
     (void)ft; (void)comm; (void)C_rng; (void)G_tskij; (void)X_skPa; (void)Wt_qtPQ;
     (void)Z_qPQ; (void)k_minus_q; (void)qminus; (void)iq_gamma; (void)skip_rung_gamma;
-    (void)symc; (void)Sigma_C_tskab;
+    (void)rung_mode; (void)Ww_override; (void)symc; (void)Sigma_C_tskab;
     APP_ABORT("vertex_detail::eval_sigma_C_g3w2: this build has ENABLE_DLR=OFF; "
               "the DLR IAFT backend is required.");
 #else
@@ -138,7 +173,17 @@ namespace vertex_detail {
     using imag_axes_ft::dconv_detail::stable_nB;
     decltype(nda::range::all) all;
 
-    utils::check(ft.basis() == imag_axes_ft::dlr_basis,
+    // rung_mode: 0 = dynamic, 1 = static (B-S), 2 = linear (B-L)
+    const bool static_rung = (rung_mode == 1);        // S3 only
+    const bool no_families = (rung_mode != 0);        // drop the dW_x dW_y channel algebra
+    utils::check(rung_mode >= 0 and rung_mode <= 2,
+                 "eval_sigma_C: unknown rung_mode {}.", rung_mode);
+
+    // The DLR requirement belongs to the pole/residue algebra of the dynamic families.
+    // The static-rung path never touches the aux pole basis (see `static_rung`), so it
+    // is backend-agnostic here; the caller's own guard (vertex_t::check_iaft_backend)
+    // still decides what the MODE as a whole supports (decision D3, increment S4).
+    utils::check(static_rung or ft.basis() == imag_axes_ft::dlr_basis,
                  "eval_sigma_C: requires the DLR IAFT backend; IR is not supported.");
 
     const long nt   = ft.nt_f();
@@ -164,7 +209,9 @@ namespace vertex_detail {
     const long nk_ext = Sigma_C_tskab.shape(2);
 
     utils::check(G_tskij.shape(0) == nt, "eval_sigma_C: G_tskij leading axis must be nt_f = {}.", nt);
-    utils::check(Wt_qtPQ.shape(1) == nt, "eval_sigma_C: Wt_qtPQ time axis must be nt_f = {} (full tau mesh).", nt);
+    if (not static_rung and Ww_override == nullptr)
+      utils::check(Wt_qtPQ.shape(1) == nt,
+                   "eval_sigma_C: Wt_qtPQ time axis must be nt_f = {} (full tau mesh).", nt);
     utils::check(nq == nk, "eval_sigma_C: transfer mesh must match the full k mesh (nq = {}, nk = {}).", nq, nk);
     utils::check(qminus.shape(0) == nq, "eval_sigma_C: qminus size mismatch.");
     if (sym) {
@@ -248,8 +295,24 @@ namespace vertex_detail {
 
     // ---- W on the bosonic Matsubara nodes --------------------------------
     // Ww_qwPQ(iq) = Twt_bb * Wt(iq)  [IBZ rows under symmetry]
-    nda::array<ComplexType, 4> Ww_qwPQ(nq_w, nw_b, Np, Np);
-    {
+    // LINEAR mode takes its dynamic rung ALREADY IN FREQUENCY. Reason: B-L's dynamic
+    // rung is dW(i.nu) = W(i.nu) - W0, which VANISHES at nu = 0 but is not the transform
+    // of any tau-function reachable from this slot -- W0 = Z + dW(0) differs from the
+    // bare core Z by the CONSTANT dW(0), and a nu-constant is a delta(tau), not a
+    // representable tau object. Passing the frequency array directly is exact and avoids
+    // inventing a fictitious tau representation.
+    nda::array<ComplexType, 4> Ww_qwPQ(
+        (static_rung or Ww_override != nullptr) ? 0 : nq_w, nw_b, Np, Np);
+    if (Ww_override != nullptr) {
+      utils::check(rung_mode == 2,
+                   "eval_sigma_C: Ww_override is only meaningful for rung_mode = 2 "
+                   "(B-L linear); got {}.", rung_mode);
+      auto ws = Ww_override->shape();
+      utils::check(ws[0] == nq_w and ws[1] == nw_b and ws[2] == Np and ws[3] == Np,
+                   "eval_sigma_C: Ww_override shape ({}, {}, {}, {}) != (nq_w, nw_b, Np, "
+                   "Np) = ({}, {}, {}, {}).", ws[0], ws[1], ws[2], ws[3], nq_w, nw_b, Np, Np);
+    }
+    if (not static_rung and Ww_override == nullptr) {
       nda::array<ComplexType, 2> tmp_w(nw_b, Np * Np);
       for (long iq = 0; iq < nq_w; ++iq) {
         auto Wt2 = nda::reshape(Wt_qtPQ(iq, all, all, all), vshape_t<2>{nt, Np * Np});
@@ -257,6 +320,12 @@ namespace vertex_detail {
         nda::reshape(Ww_qwPQ(iq, all, all, all), vshape_t<2>{nw_b, Np * Np}) = tmp_w;
       }
     }
+
+    // single accessor for the bosonic-frequency rung, whichever slot supplied it
+    auto Ww = [&](long iq, long m) {
+      return (Ww_override != nullptr) ? (*Ww_override)(iq, m, all, all)
+                                      : Ww_qwPQ(iq, m, all, all);
+    };
 
     // ---- layout helpers ---------------------------------------------------
     // G blocks (row, col):   B2(t, iG(p3,p2')), C2(t, iG(p4,p3')), D2(t, iG(p1,p4'))
@@ -274,7 +343,7 @@ namespace vertex_detail {
 
     // ---- persistent work arrays ------------------------------------------
     nda::array<ComplexType, 2> A_x(Np, dX), A_y(Np, dX);        // row-pair collocations
-    nda::array<ComplexType, 3> half_x(nw_b, Np, dX);            // W(qx)^T A_x  (hoisted over qy)
+    nda::array<ComplexType, 3> half_x(static_rung ? 0 : nw_b, Np, dX);  // W(qx)^T A_x (hoisted over qy)
     nda::array<ComplexType, 2> halfZ_x(Np, dX), halfZ_y(Np, dX);
     nda::array<ComplexType, 2> U_Rx(Np, dG), U_Ry(Np, dG);      // col-pair collocations
     nda::array<ComplexType, 2> tmp_NpdX(Np, dX);
@@ -395,11 +464,12 @@ namespace vertex_detail {
       // half_x(m)(Q, e) = sum_P A_x(P,e) W_PQ(qs_x, m)
       // (trev-mapped transfer: PQ-transposed read of the IBZ-stored core, (P2) --
       //  transpose(W^T) = W, hence the plain-gemm branch)
-      for (long m = 0; m < nw_b; ++m) {
-        auto Wm = Ww_qwPQ(qsx, m, all, all);
-        if (trx) nda::blas::gemm(Wm, A_x, half_x(m, all, all));
-        else     nda::blas::gemm(nda::transpose(Wm), A_x, half_x(m, all, all));
-      }
+      if (not static_rung)
+        for (long m = 0; m < nw_b; ++m) {
+          auto Wm = Ww(qsx, m);
+          if (trx) nda::blas::gemm(Wm, A_x, half_x(m, all, all));
+          else     nda::blas::gemm(nda::transpose(Wm), A_x, half_x(m, all, all));
+        }
       {
         auto Zx = Z_qPQ(qsx, all, all);
         if (trx) nda::blas::gemm(Zx, A_x, halfZ_x);
@@ -430,11 +500,13 @@ namespace vertex_detail {
               for (long j3p = 0; j3p < nc; ++j3p)
                 U_Rx(Q, iG(j3, j3p)) = Xh_kpqy(Q, j3) * std::conj(Xh_kmqxpqy(Q, j3p));
         }
-        for (long m = 0; m < nw_b; ++m) {
-          auto Wxm = nda::reshape(Wx_w(m, all), vshape_t<2>{dX, dG});
-          nda::blas::gemm(nda::transpose(half_x(m, all, all)), U_Rx, Wxm);
+        if (not static_rung) {
+          for (long m = 0; m < nw_b; ++m) {
+            auto Wxm = nda::reshape(Wx_w(m, all), vshape_t<2>{dX, dG});
+            nda::blas::gemm(nda::transpose(half_x(m, all, all)), U_Rx, Wxm);
+          }
+          nda::blas::gemm(Ttw_bb, Wx_w, Wx_t);
         }
-        nda::blas::gemm(Ttw_bb, Wx_w, Wx_t);
         nda::blas::gemm(nda::transpose(halfZ_x), U_Rx, cx_ef);
 
         // e_y = (a @ k, p2' @ k+qy [conj]);  f_y = (p4 @ k-qx+qy, p4' @ k-qx [conj])
@@ -462,13 +534,14 @@ namespace vertex_detail {
               for (long j4p = 0; j4p < nc; ++j4p)
                 U_Ry(Q, iG(j4, j4p)) = Yh_kmqxpqy(Q, j4) * std::conj(Yh_kmqx(Q, j4p));
         }
-        for (long m = 0; m < nw_b; ++m) {
-          auto Wm = Ww_qwPQ(qsy, m, all, all);
-          if (try_) nda::blas::gemm(Wm, A_y, tmp_NpdX);
-          else      nda::blas::gemm(nda::transpose(Wm), A_y, tmp_NpdX);
-          auto Wym = nda::reshape(Wy_w(m, all), vshape_t<2>{dX, dG});
-          nda::blas::gemm(nda::transpose(tmp_NpdX), U_Ry, Wym);
-        }
+        if (not static_rung)
+          for (long m = 0; m < nw_b; ++m) {
+            auto Wm = Ww(qsy, m);
+            if (try_) nda::blas::gemm(Wm, A_y, tmp_NpdX);
+            else      nda::blas::gemm(nda::transpose(Wm), A_y, tmp_NpdX);
+            auto Wym = nda::reshape(Wy_w(m, all), vshape_t<2>{dX, dG});
+            nda::blas::gemm(nda::transpose(tmp_NpdX), U_Ry, Wym);
+          }
         {
           auto Zy = Z_qPQ(qsy, all, all);
           if (try_) nda::blas::gemm(Zy, A_y, tmp_NpdX);
@@ -478,7 +551,7 @@ namespace vertex_detail {
         // Wy residues on the aux pole basis (x tanh(hw/2)); bosonic convention as in
         // iaft_dconv.hpp: W(z) = sum_l [w_l tanh(hw_l/2)]/(z - eps_l) with w_l the
         // FERMIONIC-kernel residues of W(tau).
-        {
+        if (not no_families) {
           nda::array<ComplexType, 2> Wy_tau(nt, dXF);
           nda::blas::gemm(Ttw_bb, Wy_w, Wy_tau);
           auto ycoef = pfit.coeffs(Wy_tau);
@@ -496,21 +569,28 @@ namespace vertex_detail {
               C2(it, iG(i, j)) = G_tskij(it, is, ikmqxpqy, C0 + i, C0 + j);  // (p4, p3')
               D2(it, iG(i, j)) = G_tskij(it, is, ikmqx,    C0 + i, C0 + j);  // (p1, p4')
             }
-        {
+        if (not no_families) {
           b_res = pfit.coeffs(B2);
           c_res = pfit.coeffs(C2);
           fit_err_max = std::max(fit_err_max, pfit.fit_error(B2, b_res));
           fit_err_max = std::max(fit_err_max, pfit.fit_error(C2, c_res));
           res_ratio_max = std::max(res_ratio_max, pfit.residue_ratio(B2, b_res));
           res_ratio_max = std::max(res_ratio_max, pfit.residue_ratio(C2, c_res));
+          nda::blas::gemm(Twt_ff, D2, D_w);
         }
-        nda::blas::gemm(Twt_ff, D2, D_w);
         nda::blas::gemm(R, C2, Crefl);
         nda::blas::gemm(R, D2, Drefl);
 
         Sw_ab() = ComplexType(0.0);
         St_ab() = ComplexType(0.0);
 
+        // ================================================================
+        // Families I-V are the DYNAMIC-rung channel algebra: each contracts at least
+        // one pole residue of Wx/Wy, so all five vanish identically when both rungs are
+        // the frequency-independent W0. Skipped wholesale in static-rung mode -- which
+        // is also what keeps the aux pole basis (and its conditioning) out of B-S.
+        // ================================================================
+        if (not no_families) {
         // ================================================================
         // family (I): per Wy pole u
         //   S(n) += -nB(u) [B(zf+e_u) . Y_u . T[Wx, D*C(.+e_u)]]_ring
@@ -791,6 +871,7 @@ namespace vertex_detail {
           }
         }
         track_max(fam_max[4], Sw_ab);
+        }  // not no_families (families I-V)
 
         // ================================================================
         // instantaneous parts (exact degenerate reductions, cf. iaft_dconv):
@@ -799,6 +880,10 @@ namespace vertex_detail {
         //   S3(t) = -cx cy . B(t) C(beta-t) D(t)
         // ================================================================
         {
+          // S1 and S2 each carry exactly ONE dynamic rung (Wy_dyn resp. Wx_dyn) and so
+          // vanish identically in static-rung mode; S3 (both rungs instantaneous) is
+          // the whole of Sigma^{C,x}.
+          if (not static_rung) {
           // S1
           for (long it = 0; it < nt; ++it)
             for (long j4 = 0; j4 < nc; ++j4)
@@ -873,6 +958,7 @@ namespace vertex_detail {
                 St_ab(it, a, b) += acc;
               }
           track_max(fam_max[6], St_ab);
+          }  // not static_rung (S1, S2)
 
           // S3
           for (long it = 0; it < nt; ++it)
@@ -929,12 +1015,22 @@ namespace vertex_detail {
     {
       std::array<double, 8> fm = fam_max;
       comm.all_reduce_in_place_n(fm.data(), fm.size(), boost::mpi3::max<>{});
-      app_log(1, "  eval_sigma_C: running max |Sigma| after each family: I = {:.4e}, "
-                 "II = {:.4e}, III = {:.4e}, IV = {:.4e}, V = {:.4e}, S1 = {:.4e}, "
-                 "S2 = {:.4e}, S3 = {:.4e}",
-              fm[0], fm[1], fm[2], fm[3], fm[4], fm[5], fm[6], fm[7]);
+      if (static_rung)
+        app_log(1, "  eval_sigma_C [STATIC rung]: running max |Sigma^(C,x)| = {:.4e} "
+                   "(families I-V and S1/S2 are identically zero and were skipped)",
+                fm[7]);
+      else if (no_families)
+        app_log(1, "  eval_sigma_C [LINEAR rung]: running max |Sigma| after the mixed "
+                   "reductions: S1 = {:.4e}, S2 = {:.4e}, S3 = {:.4e} (families I-V are "
+                   "the dropped dW_x dW_y term of Phi^(2) and were skipped)",
+                fm[5], fm[6], fm[7]);
+      else
+        app_log(1, "  eval_sigma_C: running max |Sigma| after each family: I = {:.4e}, "
+                   "II = {:.4e}, III = {:.4e}, IV = {:.4e}, V = {:.4e}, S1 = {:.4e}, "
+                   "S2 = {:.4e}, S3 = {:.4e}",
+                fm[0], fm[1], fm[2], fm[3], fm[4], fm[5], fm[6], fm[7]);
     }
-    {
+    if (not no_families) {
       comm.all_reduce_in_place_n(&fit_err_max, 1, boost::mpi3::max<>{});
       comm.all_reduce_in_place_n(&res_ratio_max, 1, boost::mpi3::max<>{});
       app_log(1, "  eval_sigma_C: auxiliary pole-fit reconstruction error (max over Wy and "
@@ -979,8 +1075,10 @@ namespace vertex_detail {
                                long iq_gamma,
                                bool skip_rung_gamma,
                                SArr_t &&Sigma_C_tskab) {
+    // rung_mode = 0: this legacy wrapper is the DYNAMIC path only. The static/linear
+    // modes call eval_sigma_C_g3w2 directly (they always know their rung mode).
     eval_sigma_C_g3w2(ft, comm, C_rng, G_tskij, X_skPa, Wt_qtPQ, Z_qPQ, k_minus_q,
-                      qminus, iq_gamma, skip_rung_gamma, nullptr,
+                      qminus, iq_gamma, skip_rung_gamma, /*rung_mode*/ 0, nullptr, nullptr,
                       std::forward<SArr_t>(Sigma_C_tskab));
   }
 

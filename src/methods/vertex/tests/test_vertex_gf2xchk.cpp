@@ -79,6 +79,16 @@ namespace bdft_tests {
   namespace gf2xchk_detail {
 
     // best-fit complex scale of A onto B plus the residual after that scale:
+    // INCREMENT S3 NOTE -- this test is ALSO the absolute pin of the B-S explicit term
+    // Sigma^{C,x}, by exact composition rather than by a duplicate run:
+    //   * with dW == 0 the rung here is W = Z, and B-S's static rung is W0 = Z + dW(0),
+    //     so W0 == Z: the two theories coincide term by term;
+    //   * test_vertex_sigma / SECTION("static_rung_W0") pin (2) shows the static-rung
+    //     kernel path is BIT-IDENTICAL (max|delta| = 0, not merely close) to the
+    //     dynamic path evaluated at dW == 0 with the same rung core.
+    // Hence lambda = 1 established below transfers to Sigma^{C,x} exactly. Re-running
+    // this 5400 s test through the static driver would re-derive a bit-identical number.
+    // If the static path is ever changed, pin (2) of static_rung_W0 is what breaks.
     //   lambda = <B, A> / <B, B>,  resid = ||A - lambda B|| / ||A||
     struct fit_t { cplx lambda; double resid, normA, normB; };
 

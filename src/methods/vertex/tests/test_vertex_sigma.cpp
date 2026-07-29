@@ -520,6 +520,109 @@ namespace bdft_tests {
       REQUIRE(num < 1e-7 * den);
     }
 
+    SECTION("static_rung_W0") {
+      // INCREMENT S3 (notes/static_vertex_implementation_plan.md; O1 closed by
+      // verification/static_vertex_routing_report.md section 2.1).
+      //
+      // B-S's explicit term is the DOUBLY-INSTANTANEOUS reduction of this same kernel
+      // with both rungs equal to the static screen W0bar:
+      //     Sigma^{C,x}(tau) = -(1/Nk^2) sum_{qx,qy} cx_b cy_a B(tau) C(beta-tau) D(tau)
+      // (eq:sigmaxtau). Two independent pins:
+      //   (1) against the SAME independently-coded tau-contraction reference used by
+      //       "instantaneous_reduction" above, with the rung Z -> W0bar;
+      //   (2) static_rung == the dynamic path run with dW == 0 and Z = W0bar. This is
+      //       the structural pin that families I-V and S1/S2 really are identically
+      //       zero for a frequency-independent rung -- i.e. that skipping them (and all
+      //       the pole machinery with them) is EXACT, not an approximation.
+      //
+      // W0bar is a deterministic Hermitian core, independent of mdl.Z_qPQ, so this is
+      // not an accidental re-run of the Z-only test.
+      nda::array<cplx, 3> W0_qPQ(nk, Np, Np);
+      for (long iq = 0; iq < nk; ++iq) {
+        nda::array<cplx, 2> A(Np, Np);
+        for (long P = 0; P < Np; ++P)
+          for (long Q = 0; Q < Np; ++Q)
+            A(P, Q) = cplx(std::cos(1.7 * double((P + 1) * (Q + 2)) + 0.37 * double(iq)),
+                           std::sin(0.9 * double(P + 1) - 0.61 * double(Q + 1)
+                                    + 0.11 * double(iq)));
+        for (long P = 0; P < Np; ++P)
+          for (long Q = 0; Q < Np; ++Q)
+            W0_qPQ(iq, P, Q) = 0.5 * (A(P, Q) + std::conj(A(Q, P)));
+      }
+      const bool skip = false;
+      nda::array<cplx, 4> Wstub(nk, 0, Np, Np);        // no dynamic rung at all
+      nda::array<cplx, 5> Sig(nt, ns, nk, nbnd, nbnd);
+      solvers::vertex_detail::eval_sigma_C_g3w2(ft, comm, C(), G, mdl.X_skPa, Wstub,
+                                                W0_qPQ, mdl.kmq, mdl.qmin,
+                                                /*iq_gamma*/ 0, skip,
+                                                /*rung_mode*/ 1, nullptr, nullptr, Sig);
+
+      // ---- (1) independent tau-contraction reference, rung = W0bar ------------------
+      nda::array<cplx, 5> Sig_ref(nt, ns, nk, nbnd, nbnd);
+      Sig_ref() = cplx(0.0);
+      for (long ik = 0; ik < nk; ++ik)
+        for (long iqx = 0; iqx < nk; ++iqx)
+          for (long iqy = 0; iqy < nk; ++iqy) {
+            long ikmqx = mdl.kmq(iqx, ik);
+            long ikpqy = mdl.kmq(mdl.qmin(iqy), ik);
+            long ikmqxpqy = mdl.kmq(mdl.qmin(iqy), ikmqx);
+            auto ZX = orb_Wx(mdl, nda::array<cplx, 2>(W0_qPQ(iqx, s_all, s_all)),
+                             ik, ikmqx, ikpqy, ikmqxpqy);
+            auto ZY = orb_Wy(mdl, nda::array<cplx, 2>(W0_qPQ(iqy, s_all, s_all)),
+                             ik, ikmqx, ikpqy, ikmqxpqy);
+            for (long it = 0; it < nt; ++it) {
+              long itr = nt - it - 1;   // beta - tau by index reflection
+              for (long a = 0; a < nbnd; ++a)
+                for (long b = 0; b < nbnd; ++b) {
+                  cplx acc(0.0);
+                  for (long j1 = 0; j1 < ncw; ++j1)
+                    for (long j2p = 0; j2p < ncw; ++j2p)
+                      for (long j3 = 0; j3 < ncw; ++j3)
+                        for (long j3p = 0; j3p < ncw; ++j3p)
+                          for (long j4 = 0; j4 < ncw; ++j4)
+                            for (long j4p = 0; j4p < ncw; ++j4p)
+                              acc += ZX(b, j1, j3, j3p) * ZY(a, j2p, j4, j4p) *
+                                     G(it, 0, ikpqy, C0 + j3, C0 + j2p) *
+                                     G(itr, 0, ikmqxpqy, C0 + j4, C0 + j3p) *
+                                     G(it, 0, ikmqx, C0 + j1, C0 + j4p);
+                  Sig_ref(it, 0, ik, a, b) += -acc / double(nk * nk);
+                }
+            }
+          }
+      double num = 0, den = 0;
+      for (long it = 0; it < nt; ++it)
+        for (long ik = 0; ik < nk; ++ik)
+          for (long a = 0; a < nbnd; ++a)
+            for (long b = 0; b < nbnd; ++b) {
+              num = std::max(num, std::abs(Sig(it, 0, ik, a, b) - Sig_ref(it, 0, ik, a, b)));
+              den = std::max(den, std::abs(Sig_ref(it, 0, ik, a, b)));
+            }
+      app_log(1, "static_rung_W0 (1) vs tau-ref: max|d| = {}, max|ref| = {}, rel = {}",
+              num, den, num / den);
+      REQUIRE(den > 1e-10);
+      REQUIRE(num < 1e-13 * den);
+
+      // ---- (2) static path == dynamic path with dW = 0 and Z = W0bar ----------------
+      nda::array<cplx, 4> Wt0(nk, nt, Np, Np);
+      Wt0() = cplx(0.0);
+      nda::array<cplx, 5> Sig_dyn(nt, ns, nk, nbnd, nbnd);
+      solvers::vertex_detail::eval_sigma_C_g3w2_nosym(ft, comm, C(), G, mdl.X_skPa, Wt0,
+                                                      W0_qPQ, mdl.kmq, mdl.qmin,
+                                                      /*iq_gamma*/ 0, skip, Sig_dyn);
+      double num2 = 0, den2 = 0;
+      for (long it = 0; it < nt; ++it)
+        for (long ik = 0; ik < nk; ++ik)
+          for (long a = 0; a < nbnd; ++a)
+            for (long b = 0; b < nbnd; ++b) {
+              num2 = std::max(num2, std::abs(Sig(it, 0, ik, a, b) - Sig_dyn(it, 0, ik, a, b)));
+              den2 = std::max(den2, std::abs(Sig_dyn(it, 0, ik, a, b)));
+            }
+      app_log(1, "static_rung_W0 (2) static vs dynamic-with-dW=0: max|d| = {}, rel = {} "
+                 "(pins families I-V and S1/S2 identically zero)", num2, num2 / den2);
+      REQUIRE(den2 > 1e-10);
+      REQUIRE(num2 < 1e-12 * den2);
+    }
+
     SECTION("wannier_gauge") {
       // KERNEL-LEVEL complex-U gauge oracle (notes/wannier_projector_theory.md section 6.2).
       // Sigma^C in the C-block is gauge-COVARIANT: the Sigma kernel emits Sbar(a,b) with the

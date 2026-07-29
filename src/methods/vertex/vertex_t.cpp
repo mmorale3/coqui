@@ -30,10 +30,12 @@
 #include "numerics/sparse/csr_blas.hpp"   // csrmm for the symmetry D-matrix blocks
 #include "methods/ERI/thc_reader_t.hpp"
 #include "methods/ERI/thc.h"    // Refinement 2: restricted-range ISDF point selection
+#include "methods/GW/g0_div_utils.hpp"  // S2: eps_inv_head_w at i.nu = 0 (the v2 head machinery)
 #include "vertex_t.h"
 #include "vertex_secondary_fold.hpp"  // Impl 2: distributed downfold of dW (no full Np^2 gather)
 #include "vertex_pi.icc"
 #include "vertex_sigma.icc"  // ISDF-Vertex Phase 1c: fused G^3 W^2 Sigma^C kernel
+#include "vertex_sigma_r.icc" // INCREMENT S5: the static-vertex response cut Sigma^{C,r}
 
 namespace methods {
 namespace solvers {
@@ -843,6 +845,29 @@ namespace solvers {
     slot = std::move(ctx);
   }
 
+  void vertex_t::check_rung_implemented(std::string_view where) const {
+    // As of increment S3 the STATIC path of Sigma^C is wired and unit-tested (the
+    // doubly-instantaneous reduction with both rungs = W0bar). The guard nonetheless
+    // stays CLOSED, and for a stronger reason than "not implemented": B-S's
+    // non-negotiable invariant is "Sigma^{C,x} and Sigma^{C,r} TOGETHER or neither"
+    // (theoryB_static.pdf section 6.4). Sigma^{C,x} alone is not the derivative of any
+    // functional once W0 is rebuilt from the current G each iteration, so a run
+    // producing it alone would be silently non-conserving -- exactly the failure mode
+    // the parent theory's "both cuts or neither" rule exists to prevent. The gate opens
+    // at S5 (static) / S9 (linear), when the response term lands.
+    // B-S (static_rung) is COMPLETE as of increment S5: Sigma = Sigma^{C,x} + Sigma^{C,r},
+    // both cuts always together (they are assembled in one place, eval_Sigma_C, so the
+    // half-theory is structurally unrepresentable), and P = P_RPA with the Pi^C injection
+    // switched off at the update_w seam. B-L (linear_rung) still lacks its mixed Sigma
+    // terms and its own response term (increments S8/S9).
+    // All three modes are implemented as of increment S9. Each assembles ALL of its own
+    // cuts in one place, so the non-conserving half-theories remain unrepresentable:
+    //   dynamic : Sigma^C (G^3W^2) + Pi^C (G^4W)
+    //   static  : Sigma^{C,x} + Sigma^{C,r};  P = P_RPA (no injection)
+    //   linear  : the three explicit terms + Sigma^{L,r};  P = P_RPA + P^{C,L}
+    (void)where;
+  }
+
   void vertex_t::set_div_treatment(std::string div) {
     const std::unordered_set<std::string> exact = {"ignore_g0", "v1_skip"};
     utils::check(exact.count(div) > 0 or div.find("gygi") != std::string::npos,
@@ -860,8 +885,10 @@ namespace solvers {
                      long isdf_rank,
                      double isdf_svd_tol,
                      double isdf_thresh,
-                     double isdf_cond_max):
-    _ft(ft), _vertex_type(std::move(vertex_type)), _band_window(band_window),
+                     double isdf_cond_max,
+                     std::string rung):
+    _ft(ft), _vertex_type(std::move(vertex_type)), _rung(string_to_vertex_rung_enum(rung)),
+    _band_window(band_window),
     _isdf_mode(std::move(isdf_mode)), _isdf_rank(isdf_rank), _isdf_svd_tol(isdf_svd_tol),
     _isdf_thresh(isdf_thresh), _isdf_cond_max(isdf_cond_max) {
 
@@ -893,6 +920,7 @@ namespace solvers {
                  "  Second-order exchange vertex correction (ISDF-Vertex)\n"
                  "  ------------------------------------------------------\n"
                  "  Vertex type              = {}\n"
+                 "  Rung mode                = {} (notes/static_vertex_implementation_plan.md)\n"
                  "  Subspace C band window   = [{}, {})\n"
                  "  Subspace C size          = {} orbitals (nbnd = {})\n"
                  "  Cuts                     = Sigma^C (G3W2) + Pi^C (G4W), always both\n"
@@ -900,7 +928,7 @@ namespace solvers {
                  "  Auxiliary basis          = {}{}\n"
                  "  Status                   = Pi^C kernel ACTIVE (Phase 1d); Sigma^C status is\n"
                  "                             reported by eval_Sigma_C at evaluation time\n",
-              _vertex_type, _band_window.first(), _band_window.last(),
+              _vertex_type, rung_str(), _band_window.first(), _band_window.last(),
               _band_window.size(), nbnd, _div_treatment, _isdf_mode,
               secondary() ? std::string(" (Refinement 2: requested N_m = ") +
                             (_isdf_rank > 0 ? std::to_string(_isdf_rank)
@@ -908,10 +936,26 @@ namespace solvers {
                             ", svd_tol(B) = " + std::to_string(_isdf_svd_tol) +
                             "; notes/refinement2_optionA.md)"
                           : std::string(" (global THC, dimension Np)"));
+      // INCREMENT S2: the static theories' shared W0[G] rung infrastructure exists and
+      // runs (inside update_w, plan section 2.2), but their KERNELS do not. Announce it
+      // here and let the run abort at the first kernel entry point
+      // (check_rung_implemented), which is inside the first iteration either way.
+      if (_rung != dynamic_rung)
+        app_log(1, "  [NOTE] vertex_rung = \"{}\": increment S2 has landed the shared "
+                   "W0[G] rung\n"
+                   "         infrastructure only. update_w WILL build W0 / W0bar for this "
+                   "run, and the\n"
+                   "         first {} evaluation will then ABORT -- the {} kernels arrive "
+                   "at S3+\n"
+                   "         (notes/static_vertex_implementation_plan.md section 4).\n",
+                rung_str(),
+                (_rung == static_rung ? "Sigma^C" : "P^{C,L}"),
+                (_rung == static_rung ? "B-S" : "B-L"));
     } else {
-      app_log(1, "\nvertex_t: vertex_type = \"{}\" with an empty vertex_band_window: "
-                 "C = empty set, so the vertex contributes nothing and the "
-                 "calculation reduces to plain scGW exactly.\n", _vertex_type);
+      app_log(1, "\nvertex_t: vertex_type = \"{}\" (vertex_rung = \"{}\") with an empty "
+                 "vertex_band_window: C = empty set, so the vertex contributes nothing in "
+                 "ANY rung mode and the calculation reduces to plain scGW exactly.\n",
+              _vertex_type, rung_str());
     }
   }
 
@@ -1162,15 +1206,52 @@ namespace solvers {
     _secondary_ready = true;
   }
 
+  void vertex_t::check_iaft_backend(std::string_view where) const {
+    if (_ft->basis() == imag_axes_ft::dlr_basis) return;
+    if (_rung == dynamic_rung) {
+      utils::check(false,
+                   "{}: the fused G3W2 kernel requires the DLR IAFT backend "
+                   "(iaft basis = \"dlr\"); the IR backend is not supported.", where);
+    } else {
+      // Decision D3 (notes/static_vertex_implementation_plan.md section 6): the static
+      // rungs need no pole algebra, so this requirement is NOT structural like the
+      // dynamic one -- it stands only until the tau = 0 interpolation row (section 2.4)
+      // is shown to be available on the IR driver, which is checked at increment S4.
+      utils::check(false,
+                   "{}: vertex_rung = \"{}\" also requires the DLR IAFT backend "
+                   "(iaft basis = \"dlr\") for now. The static rungs themselves need no "
+                   "pole algebra; what is missing on IR is the Pi^{{C,0}}(tau = 0) "
+                   "interpolation row (decision D3, open until increment S4).",
+                   where, rung_str());
+    }
+  }
+
   void vertex_t::eval_Sigma_C(MBState &mb_state, THC_ERI auto const &thc) {
     utils::check(active(), "vertex_t::eval_Sigma_C: called while the vertex is inactive. "
                            "Callers must guard vertex calls with vertex_t::active().");
+    // this file only implements the DYNAMIC-rung (Formulation B) kernel; B-S/B-L land at S3+
+    check_rung_implemented("vertex_t::eval_Sigma_C");
+    // INCREMENT S3: STATIC-rung mode (B-S). Sigma^{C,x} is the doubly-instantaneous
+    // reduction of the SAME kernel with both rungs = W0bar (plan section 1). Nothing
+    // dynamical is consumed: no Z build, no head re-insertion (build_w0 already applied
+    // the policy to W0 -- "one policy, one W0, every appearance"), no dW gather, no
+    // secondary fold of Z/dW, and no pole machinery.
+    const bool stat = (_rung != dynamic_rung);
+    // B-L still consumes the SAME-ITERATION dynamic W: its two mixed terms are
+    // W0_x dW_y + dW_x W0_y with dW = W - W0. So the bare core and dW are built for
+    // "dynamic" and "linear", and skipped only for B-S (which is purely tau-local).
+    const bool lin = (_rung == linear_rung);
+    const bool need_dyn = (_rung != static_rung);
     utils::check(mb_state.sG_tskij.has_value(),
                  "vertex_t::eval_Sigma_C: sG_tskij is not initialized in MBState.");
     utils::check(mb_state.sSigma_tskij.has_value(),
                  "vertex_t::eval_Sigma_C: sSigma_tskij is not initialized in MBState.");
-    utils::check(mb_state.dW_qtPQ.has_value(),
+    utils::check(stat or mb_state.dW_qtPQ.has_value(),
                  "vertex_t::eval_Sigma_C: dW_qtPQ is not initialized in MBState.");
+    utils::check(not stat or _W0b_qmm.has_value(),
+                 "vertex_t::eval_Sigma_C: vertex_rung = \"{}\" needs the static rung "
+                 "W0bar, which update_w builds (vertex_t::build_w0). It is absent -- the "
+                 "update_w seam did not run for this iteration.", rung_str());
 
     decltype(nda::range::all) all;
     auto mpi = thc.mpi();
@@ -1196,9 +1277,7 @@ namespace solvers {
                  "vertex_t::eval_Sigma_C: expected a full transfer mesh with nqpts == "
                  "nkpts (got {} vs {}).", nqpts, nkpts);
     utils::check(MF->npol() == 1, "vertex_t::eval_Sigma_C: npol != 1 is not supported.");
-    utils::check(_ft->basis() == imag_axes_ft::dlr_basis,
-                 "vertex_t::eval_Sigma_C: the fused G3W2 kernel requires the DLR IAFT backend "
-                 "(iaft basis = \"dlr\"); the IR backend is not supported.");
+    check_iaft_backend("vertex_t::eval_Sigma_C");
 
     auto G_tskij = mb_state.sG_tskij.value().local();
     auto& sSigma_tskij = mb_state.sSigma_tskij.value();
@@ -1290,14 +1369,17 @@ namespace solvers {
 
     // ---- bare coulomb Z(q): the instantaneous part of the rungs (collective call) -----
     // IBZ rows under symmetry (the kernels source non-IBZ transfers via the sym ctx)
-    nda::array<ComplexType, 3> Z_qPQ(nqpts_ibz, Np, Np);
-    for (long iq = 0; iq < nqpts_ibz; ++iq)
-      Z_qPQ(iq, all, all) = thc.Z(int(iq));
+    nda::array<ComplexType, 3> Z_qPQ(need_dyn ? nqpts_ibz : 0, Np, Np);
+    if (need_dyn)
+      for (long iq = 0; iq < nqpts_ibz; ++iq)
+        Z_qPQ(iq, all, all) = thc.Z(int(iq));
 
-    // head insertion, bare piece (weight 1) into Z(Gamma)
-    nda::array<ComplexType, 2> H_PQ(Np, Np);
+    // head insertion, bare piece (weight 1) into Z(Gamma). STATIC modes: the head policy
+    // was already applied to W0 inside build_w0 (section 2.2 step 3), so re-applying it
+    // here would double-count it.
+    nda::array<ComplexType, 2> H_PQ(need_dyn ? Np : 0, need_dyn ? Np : 0);
     bool head_ok = false;
-    if (head_insertion) {
+    if (head_insertion and need_dyn) {
       head_ok = vertex_head_detail::build_head_rank1(thc, iq_gamma, nkpts, H_PQ);
       if (head_ok) {
         Z_qPQ(iq_gamma, all, all) += H_PQ;
@@ -1317,8 +1399,8 @@ namespace solvers {
     // ---- dynamic W(tau): replicate and unfold nt_half storage to the full tau mesh ----
     // dW_qtPQ is dynamic-only (bare Z subtracted, scr_coulomb_t.cpp:217); W is
     // PH-symmetric in tau, W(beta-t) = W(t). IBZ rows under symmetry.
-    nda::array<ComplexType, 4> Wt_qtPQ(nqpts_ibz, nt, Np, Np);
-    {
+    nda::array<ComplexType, 4> Wt_qtPQ(need_dyn ? nqpts_ibz : 0, nt, Np, Np);
+    if (need_dyn) {
       // M1 item #1: gather the RPA-grid dW into the replicated tau slab the kernel
       // needs (bit-identical to the former in-line allreduce; helper centralizes it).
       nda::array<ComplexType, 4> W_half = vertex_redist_detail::gather_dW_replicated(
@@ -1445,7 +1527,10 @@ namespace solvers {
       app_log(1, "  Refinement 2: Sigma^C runs in the SECONDARY basis (N_m = {} vs "
                  "Np = {}); externals a, b in C.", _Nm, Np);
       // eta diagnostics (Eq. 40) on the rung arrays ACTUALLY consumed (test-scale gate)
-      if (ns * nkpts * nc * nc <= 4096) {
+      if (not need_dyn) {
+        app_log(2, "  Refinement 2: eta diagnostic skipped in static-rung mode "
+                   "(the only rung is W0bar, downfolded by build_w0).");
+      } else if (ns * nkpts * nc * nc <= 4096) {
         vertex_secondary_detail::eta_max_over_q(
             "Z", X_glob, orb0_glob, nc, _Xb_skma, _t_qmP, kmq,
             [&](long iq) { return Z_qPQ(iq, all, all); });
@@ -1460,7 +1545,12 @@ namespace solvers {
                 ns * nkpts * nc * nc);
       }
       // fold the cores at IBZ q (frequency-slice-wise; t is frequency-independent;
-      // non-IBZ transfers are sourced through the sym ctx, memo section 3.7)
+      // non-IBZ transfers are sourced through the sym ctx, memo section 3.7).
+      // STATIC modes: W0bar is ALREADY the downfolded rung (build_w0 step 4), and no
+      // dynamic core exists -- nothing to fold here.
+      if (not need_dyn) {
+        // nothing to fold
+      } else {
       Zb_qmm = nda::array<ComplexType, 3>(nqpts_ibz, _Nm, _Nm);
       Wb_qtmm = nda::array<ComplexType, 4>(nqpts_ibz, nt, _Nm, _Nm);
       nda::array<ComplexType, 2> tmp(_Nm, Np);
@@ -1471,6 +1561,7 @@ namespace solvers {
         for (long it = 0; it < nt; ++it)
           vertex_secondary_detail::fold_core(t_q, Wt_qtPQ(iq, it, all, all), tmp,
                                              Wb_qtmm(iq, it, all, all));
+      }
       }
     }
 
@@ -1497,14 +1588,88 @@ namespace solvers {
     // Both paths: C-restricted externals; the ONLY difference is the auxiliary input
     // set -- (X_C, W, Z, Np) global vs (Xb, Wbar, Zbar, N_m) secondary.
     nda::array<ComplexType, 5> Sigma_C(nt, ns, nk_ext, nc, nc);
-    if (sec)
+    if (stat) {
+      // B-S: BOTH rungs are W0bar. The kernel's doubly-instantaneous reduction S3 is
+      // Sigma^{C,x} (eq:sigmaxtau); families I-V and S1/S2 are identically zero and are
+      // skipped, as is every pole-fit call. W0bar carries N_m (secondary) or Np (global)
+      // -- the same array serves both paths -- and the dynamic W stub is empty.
+      auto const& W0b = _W0b_qmm.value();
+      const long naux = W0b.shape(1);
+      utils::check(W0b.shape(0) == nqpts_ibz and W0b.shape(2) == naux,
+                   "vertex_t::eval_Sigma_C: W0bar shape ({}, {}, {}) is inconsistent with "
+                   "nqpts_ibz = {}.", W0b.shape(0), naux, W0b.shape(2), nqpts_ibz);
+      nda::array<ComplexType, 4> Wstub(nqpts_ibz, 0, naux, naux);
+      const int rmode = lin ? 2 : 1;
+      // ---- B-L: the DYNAMIC FLUCTUATION rung, handed over in FREQUENCY --------------
+      //   dW(q, i.nu) := W(q, i.nu) - W0(q) = [Zbar + dWbar(i.nu)] - W0bar
+      // It vanishes at nu = 0 by construction (W0 IS the nu = 0 slice) and cannot be
+      // routed through the kernel's tau slot: W0 differs from the bare core Zbar by the
+      // CONSTANT dWbar(0), and a nu-constant is a delta(tau). With Z_slot = W0bar and
+      // this as the dynamic rung, the kernel's own reductions ARE B-L's three terms:
+      //   S3 = W0_x W0_y,  S1 = W0_x dW_y,  S2 = dW_x W0_y,
+      // and families I-V are precisely the dropped dW_x dW_y of Phi^(2).
+      nda::array<ComplexType, 4> dWw_lin;
+      nda::array<ComplexType, 4> const *wwp = nullptr;
+      if (lin) {
+        vertex_pi::iaft_tools tls(*_ft);
+        dWw_lin = nda::array<ComplexType, 4>(nqpts_ibz, tls.nw_b, naux, naux);
+        dWw_lin() = ComplexType(0.0);
+        for (long iq = 0; iq < nqpts_ibz; ++iq)
+          for (long m = 0; m < tls.nw_b; ++m)
+            for (long M = 0; M < naux; ++M)
+              for (long N = 0; N < naux; ++N) {
+                ComplexType acc(0.0);
+                for (long it = 0; it < nt; ++it)
+                  acc += tls.Twt_bb(m, it) * (sec ? Wb_qtmm(iq, it, M, N)
+                                                  : Wt_qtPQ(iq, it, M, N));
+                dWw_lin(iq, m, M, N) = acc
+                    + (sec ? Zb_qmm(iq, M, N) : Z_qPQ(iq, M, N)) - W0b(iq, M, N);
+              }
+        wwp = &dWw_lin;
+        double z0 = 0.0, zs = 0.0;
+        for (long iq = 0; iq < nqpts_ibz; ++iq)
+          for (long M = 0; M < naux; ++M)
+            for (long N = 0; N < naux; ++N) {
+              z0 = std::max(z0, std::abs(dWw_lin(iq, tls.m0, M, N)));
+              zs = std::max(zs, std::abs(W0b(iq, M, N)));
+            }
+        // |dW(i.nu = 0)| = |W(q,0) - W0(q)| is the VERTEX CORRECTION TO THE STATIC
+        // SCREEN, and in B-L it is nonzero BY DESIGN: the kernel W0[G] is the RPA-static
+        // screen, while the run's own W carries P^{C,L}. The self-slice identity
+        // W(q,0) == W0(q) holds in B-S (where P = P_RPA) but NOT in B-L -- see
+        // theoryB_static.pdf, "Kernel choice, heads, and lifetimes": this is a
+        // definition matching standard BSE practice (the BSE kernel is the RPA-screened
+        // static W, not a self-consistently excitonic-screened one), and the difference
+        // is O(vertex^2), beyond the order of the theory. Reported as a diagnostic; a
+        // LARGE value means the vertex is strongly reshaping its own kernel and the
+        // tangent expansion is being pushed.
+        app_log(1, "  Sigma^C [rung = linear]: vertex correction to the static screen "
+                   "|W(q,0) - W0(q)|_max = {:.3e} (|W0| = {:.3e}, ratio {:.4f}). Nonzero "
+                   "by design in B-L (W0 is RPA-static); it is identically zero in B-S.",
+                z0, zs, (zs > 0.0 ? z0 / zs : 0.0));
+        app_log(1, "  Sigma^C [rung = linear]: three explicit terms "
+                   "W0_x W_y + W_x W0_y - W0_x W0_y via the kernel's S1/S2/S3 reductions "
+                   "(ONE bosonic convolution each; families I-V = Phi^(2) skipped).");
+      } else {
+        app_log(1, "  Sigma^C [rung = static]: Sigma^(C,x) only "
+                   "(tau-local G^3 (W0)^2; no convolution at all).");
+      }
+      if (sec)
+        vertex_detail::eval_sigma_C_g3w2(*_ft, mpi->comm, nda::range(0, nc), G_CC,
+                                         _Xb_skma, Wstub, W0b, kmq, qmin, iq_gamma,
+                                         skip_rung_gamma, rmode, wwp, symc, Sigma_C);
+      else
+        vertex_detail::eval_sigma_C_g3w2(*_ft, mpi->comm, nda::range(0, nc), G_CC,
+                                         X_C, Wstub, W0b, kmq, qmin, iq_gamma,
+                                         skip_rung_gamma, rmode, wwp, symc, Sigma_C);
+    } else if (sec)
       vertex_detail::eval_sigma_C_g3w2(*_ft, mpi->comm, nda::range(0, nc), G_CC,
                                        _Xb_skma, Wb_qtmm, Zb_qmm, kmq, qmin,
-                                       iq_gamma, skip_rung_gamma, symc, Sigma_C);
+                                       iq_gamma, skip_rung_gamma, 0, nullptr, symc, Sigma_C);
     else
       vertex_detail::eval_sigma_C_g3w2(*_ft, mpi->comm, nda::range(0, nc), G_CC,
                                        X_C, Wt_qtPQ, Z_qPQ, kmq, qmin, iq_gamma,
-                                       skip_rung_gamma, symc, Sigma_C);
+                                       skip_rung_gamma, 0, nullptr, symc, Sigma_C);
     {
       double max_abs = 0.0;
       long n_bad = 0;
@@ -1516,6 +1681,153 @@ namespace solvers {
       utils::check(n_bad == 0,
                    "vertex_t::eval_Sigma_C: Sigma^C contains {} NaN/Inf entries -- aborting.", n_bad);
       app_log(2, "  Sigma^C(tau) max|.| = {}\n", max_abs);
+    }
+
+    // ---- INCREMENT S5: the RESPONSE cut Sigma^{C,r} -----------------------------------
+    // Phi-derivability of B-S requires Sigma^{C,x} and Sigma^{C,r} TOGETHER: W0 is an
+    // explicit functional of the CURRENT G, so differentiating Phi produces this chain-
+    // rule term as well. Routing verified mechanically (the transposed, symmetrized
+    // sandwich) and pinned end-to-end by test_vertex_fdoracle.
+    nda::array<ComplexType, 5> Sigma_r;
+    if (stat) {
+      utils::check(not sym_mesh,
+                   "vertex_t::eval_Sigma_C: vertex_rung = \"{}\" on a SYMMETRY-REDUCED "
+                   "mesh is not supported yet (Sigma^(C,r) has a single transfer q and "
+                   "takes the plain GW symmetry pattern -- increment S6). Run with a "
+                   "symmetry-free mesh for now.", rung_str());
+      auto const& W0b_r = _W0b_qmm.value();
+      vertex_pi::iaft_tools tools(*_ft);
+      nda::array<long, 2> kpq(nqpts, nkpts);
+      for (long iq = 0; iq < nqpts; ++iq)
+        for (long ik = 0; ik < nkpts; ++ik) kpq(iq, ik) = kmq(qmin(iq), ik);
+
+      // (1) Pi^{C,0}(q, i.nu): the pinned instantaneous (Z) phase with the rung W0bar and
+      //     NO dynamic rung -- pi_c_accumulate_w returns right after phase 1 on nullptr.
+      //     Fed the C-C block: the kernel CONTRACTS its external orbital legs into the aux
+      //     indices, so their range is part of the object (all eight labels of Phi are in C).
+      const long Naux_pi = sec ? _Nm : Np;
+      nda::array<ComplexType, 4> Pi_wq(tools.nw_b, nqpts_ibz, Naux_pi, Naux_pi);
+      Pi_wq() = ComplexType(0.0);
+      if (sec)
+        vertex_pi::pi_c_accumulate_w(*_ft, tools, G_CC, _Xb_skma, W0b_r, nullptr,
+                                     kmq, kpq, nda::range(0, nc), Pi_wq,
+                                     mpi->comm.rank(), mpi->comm.size());
+      else
+        vertex_pi::pi_c_accumulate_w(*_ft, tools, G_CC, X_C, W0b_r, nullptr,
+                                     kmq, kpq, nda::range(0, nc), Pi_wq,
+                                     mpi->comm.rank(), mpi->comm.size());
+      mpi->comm.all_reduce_in_place_n(Pi_wq.data(), Pi_wq.size(), std::plus<>{});
+
+      // (2) the tau = 0 row (the LEGAL evaluation of (1/beta) sum_nu; sparse nodes are
+      //     fitting nodes, not Fourier points)
+      auto R0 = vertex_w0_detail::tau0_transform_row(*_ft);
+      auto tau0_of = [&](nda::array<ComplexType, 4> const &Pw,
+                         nda::array<ComplexType, 3> &out) {
+        for (long iq = 0; iq < nqpts_ibz; ++iq)
+          for (long M = 0; M < Naux_pi; ++M)
+            for (long N = 0; N < Naux_pi; ++N) {
+              ComplexType acc(0.0);
+              for (long m = 0; m < tools.nw_b; ++m) acc += R0(m) * Pw(m, iq, M, N);
+              out(iq, M, N) = acc;
+            }
+      };
+      nda::array<ComplexType, 3> Pi0(nqpts_ibz, Naux_pi, Naux_pi);
+      tau0_of(Pi_wq, Pi0);
+
+      // ---- INCREMENT S9: B-L's response middle factor -------------------------------
+      // B-S sandwiches Pi^{C,0}(tau=0); B-L sandwiches the DIFFERENCE
+      //     Pi^L = pi^dyn - Pi^{C,0}(tau = 0),   pi^dyn = Pi^{C,dyn}(q, tau = 0),
+      // because the rung derivative of the tangent functional is
+      //     X^L = -(1/2)[PiBar^dyn - PiBar^0]  (transposed/symmetrized as in S5).
+      // X^L therefore VANISHES when the screening is genuinely static: it is a built-in,
+      // per-q meter of the static-kernel approximation itself, logged below.
+      //
+      // NOTE (performance, not correctness): pi^dyn is obtained here from the FULL
+      // dynamic-rung Pi^C kernel and then evaluated at tau = 0. Theory eq:pibardynfact
+      // shows the frequency SUM factorizes into a single bosonic pairing of two bubbles
+      // against W -- much cheaper, and it would avoid invoking the twisted-pair pole
+      // algebra (whose conditioning is the parent theory's open issue) for what is only
+      // an equal-time value. Implementing that factorized primitive is the natural
+      // follow-up; correctness is unaffected.
+      if (lin) {
+        nda::array<ComplexType, 4> Wdyn_w(nqpts_ibz, tools.nw_b, Naux_pi, Naux_pi);
+        Wdyn_w() = ComplexType(0.0);
+        for (long iq = 0; iq < nqpts_ibz; ++iq)
+          for (long m = 0; m < tools.nw_b; ++m)
+            for (long M = 0; M < Naux_pi; ++M)
+              for (long N = 0; N < Naux_pi; ++N) {
+                ComplexType acc(0.0);
+                for (long it = 0; it < nt; ++it)
+                  acc += tools.Twt_bb(m, it) * (sec ? Wb_qtmm(iq, it, M, N)
+                                                    : Wt_qtPQ(iq, it, M, N));
+                Wdyn_w(iq, m, M, N) = acc;
+              }
+        nda::array<ComplexType, 4> Pid_wq(tools.nw_b, nqpts_ibz, Naux_pi, Naux_pi);
+        Pid_wq() = ComplexType(0.0);
+        if (sec)
+          vertex_pi::pi_c_accumulate_w(*_ft, tools, G_CC, _Xb_skma, Zb_qmm, &Wdyn_w,
+                                       kmq, kpq, nda::range(0, nc), Pid_wq,
+                                       mpi->comm.rank(), mpi->comm.size());
+        else
+          vertex_pi::pi_c_accumulate_w(*_ft, tools, G_CC, X_C, Z_qPQ, &Wdyn_w,
+                                       kmq, kpq, nda::range(0, nc), Pid_wq,
+                                       mpi->comm.rank(), mpi->comm.size());
+        mpi->comm.all_reduce_in_place_n(Pid_wq.data(), Pid_wq.size(), std::plus<>{});
+        nda::array<ComplexType, 3> PiDyn0(nqpts_ibz, Naux_pi, Naux_pi);
+        tau0_of(Pid_wq, PiDyn0);
+        double xl = 0.0, p0 = 0.0;
+        for (long iq = 0; iq < nqpts_ibz; ++iq)
+          for (long M = 0; M < Naux_pi; ++M)
+            for (long N = 0; N < Naux_pi; ++N) {
+              const ComplexType d = PiDyn0(iq, M, N) - Pi0(iq, M, N);
+              xl = std::max(xl, std::abs(d));
+              p0 = std::max(p0, std::abs(Pi0(iq, M, N)));
+              Pi0(iq, M, N) = d;              // Pi^L = pi^dyn - Pi^{C,0}(tau = 0)
+            }
+        app_log(1, "  X^L diagnostic: max|pi^dyn - Pi^(C,0)(tau=0)| = {:.4e}, "
+                   "relative to max|Pi^(C,0)(tau=0)| = {:.4e}  -> X^L/Pi^0 = {:.4f} "
+                   "(vanishes iff the screening is truly static; theory diagnostic O3)",
+                xl, p0, (p0 > 0.0 ? xl / p0 : 0.0));
+      }
+
+      // (3) Sigma^{C,r} is a GLOBAL-aux object (its Gt and externals are full-space), so
+      //     the secondary-basis Pi is upfolded, Pi_hat = t^dag Pibar t (Eq. 38).
+      nda::array<ComplexType, 3> Pi0g(nqpts_ibz, Np, Np), W0g(nqpts_ibz, Np, Np);
+      if (sec) {
+        nda::array<ComplexType, 2> tmp_Pn(Np, _Nm);
+        for (long iq = 0; iq < nqpts_ibz; ++iq)
+          vertex_secondary_detail::upfold_core(_t_qmP(iq, all, all), Pi0(iq, all, all),
+                                               tmp_Pn, Pi0g(iq, all, all));
+        // the global static screen: zero-pad + all_reduce GATHER of the (P,Q)-distributed
+        // W0 (the gather_dW_replicated pattern; every element lives on exactly one rank,
+        // so this is a pure gather with no reassociation).
+        // NOTE (production): this replicates an (nq, Np, Np) object. At Np = 20k that is
+        // the 320 GB class the v2 rule forbids -- the distributed (P,Q) sandwich of plan
+        // section 3 is the S11 hardening item. Validation scales are unaffected.
+        auto const& dW0 = _W0_qPQ.value();
+        W0g() = ComplexType(0.0);
+        W0g(dW0.local_range(0), dW0.local_range(1), dW0.local_range(2)) = dW0.local();
+        mpi->comm.all_reduce_in_place_n(W0g.data(), W0g.size(), std::plus<>{});
+      } else {
+        Pi0g = Pi0;
+        W0g = W0b_r;         // global path: W0bar IS the global W0 (N_m == Np)
+      }
+
+      // (4) the response rung and the +-q Hadamard pair
+      nda::array<ComplexType, 3> Dw(nqpts_ibz, Np, Np);
+      vertex_detail::build_delta_w(W0g, Pi0g, qmin, Dw);
+      Sigma_r = nda::array<ComplexType, 5>(nt, ns, nkpts, nbnd, nbnd);
+      vertex_detail::eval_sigma_C_response(mpi->comm, G_tskij, X_skPa, Dw, kmq, qmin,
+                                           Sigma_r);
+      double rmax = 0.0, xmax = 0.0;
+      for (auto const& v : Sigma_r) rmax = std::max(rmax, std::abs(v));
+      for (auto const& v : Sigma_C) xmax = std::max(xmax, std::abs(v));
+      utils::check(std::isfinite(rmax),
+                   "vertex_t::eval_Sigma_C: Sigma^(C,r) contains NaN/Inf -- aborting.");
+      app_log(1, "  Sigma^({}): max|.| = {:.4e}; response share "
+                 "||Sigma^(C,r)||/||Sigma^(C,x)|| = {:.4f} (large => the deleted rung "
+                 "dynamics likely matters; theory diagnostic O3)",
+              (lin ? "L,r" : "C,r"), rmax, (xmax > 0.0 ? rmax / xmax : 0.0));
     }
 
     // accumulate on top of the GW self-energy: Sigma <- Sigma + Sigma^C
@@ -1533,7 +1845,11 @@ namespace solvers {
                  "Phi_2^C; BOTH cuts carry the same lambda, so conservation is exact).",
               lam_s);
     }
+    if (stat and lam_s != 1.0) Sigma_r *= ComplexType(lam_s);
     if (mb_state.mpi->node_comm.root()) {
+      // Sigma^{C,r} is FULL-SPACE (its lines live in W0's unprojected RPA bubble), so it
+      // is added over the whole band range -- unlike Sigma^{C,x}, which is strictly C-C.
+      if (stat) sSigma_tskij.local() += Sigma_r;
       if (not wan) {
         sSigma_tskij.local()(all, all, all, _band_window, _band_window) += Sigma_C;
       } else {
@@ -1558,6 +1874,21 @@ namespace solvers {
     decltype(nda::range::all) all;
     utils::check(active(), "vertex_t::eval_Pi_C: called while the vertex is inactive. "
                            "Callers must guard vertex calls with vertex_t::active().");
+    // this file only implements the DYNAMIC-rung (Formulation B) G^4W cut. B-S has NO
+    // Pi^C injection at all (plan section 2.1 -- scr_coulomb_t never calls us in that
+    // mode); B-L's P^{C,L} is the static-rung Z-phase and lands at S7.
+    check_rung_implemented("vertex_t::eval_Pi_C");
+    // THE FORBIDDEN HYBRID (theoryB_static.pdf, the W-cut section): B-S's W-cut vanishes
+    // identically, so P = P_RPA. Injecting a static-rung Pi^C while using B-S's Sigma
+    // would pair the G-cut of Phi_2^{C,0} with the W-cut of a DIFFERENT functional and
+    // break conservation exactly as "Sigma^C without P^C" did in the parent theory. The
+    // update_w seam already returns before reaching here (scr_coulomb_t), so this is a
+    // structural tripwire, not a user-facing path.
+    utils::check(_rung != static_rung,
+                 "vertex_t::eval_Pi_C: reached with vertex_rung = \"static\". B-S has NO "
+                 "polarization injection (P = P_RPA); combining it with Sigma^{C,x} is the "
+                 "forbidden hybrid. This is an internal wiring bug -- the update_w seam "
+                 "should have skipped the Pi^C hook.");
     // one scf iteration = one eval_Pi_C followed by one eval_Sigma_C, so counting here
     // and READING (not advancing) in eval_Sigma_C gives both cuts the same lambda.
     ++_vertex_iter;
@@ -1760,7 +2091,10 @@ namespace solvers {
     // the tau -> nu transform into the per-q fold loop, reusing one W_wpos(nw_half, Np, Np)
     // buffer per q -- so the replicated (nq, nw_b, Np, Np) array is never materialized
     // (16 TB @ production Np=20k).
-    const bool dyn_src = (not use_wcache) and mb_state.dW_qtPQ.has_value();
+    // INCREMENT S7: B-L's rung is the STATIC screen W0bar, so no dynamic rung is folded
+    // here at all (the mixed Sigma terms consume dW separately, in eval_Sigma_C).
+    const bool dyn_src = (_rung == dynamic_rung) and (not use_wcache)
+                         and mb_state.dW_qtPQ.has_value();
     std::optional<nda::array<ComplexType, 4>> W_qtPQ;  // tau-domain all-q, GLOBAL path only
     std::optional<nda::array<ComplexType, 4>> Wdyn_qwPQ;  // nu-domain, GLOBAL path only
     if (use_wcache and mb_state.dW_qtPQ.has_value())
@@ -2115,7 +2449,37 @@ namespace solvers {
     Pi_wqMN() = ComplexType(0.0);
     nda::array<double, 1> phase_diag(4);
     phase_diag() = 0.0;
-    if (sec)
+    // INCREMENT S7 -- B-L's W-cut. The tangent functional's dynamical W appears LINEARLY,
+    // so its W-derivative kills BOTH the momentum and the frequency sum of the cut rung:
+    //     P^{C,L}(q, i.nu) = -2 dPhi^L/dW = Pi^{C,0}(q, i.nu)
+    // at FULL parent-normalized weight, with complete external frequency dependence. That
+    // full weight is the whole point: the naive "make one rung static" functional has only
+    // ONE W appearance and gives HALF the weight -- the Variant-F trap, which ONLY the
+    // W-side oracle detects (verified: it breaks that oracle by exactly 2,
+    // verification/static_vertex_routing_report.md section 2.3).
+    // Mechanically this is the SAME kernel with the rung Z -> W0bar and NO dynamic rung:
+    // the internal convolution collapses into two decoupled bubbles (the already-pinned
+    // instantaneous Z-phase), so B-L needs no pole algebra here either.
+    const bool lin = (_rung == linear_rung);
+    if (lin) {
+      auto const& W0b_r = _W0b_qmm.value();
+      utils::check(W0b_r.shape(0) == nqpts_ibz and W0b_r.shape(1) == naux,
+                   "vertex_t::eval_Pi_C: W0bar shape ({}, {}, {}) does not match the "
+                   "kernel basis (nq = {}, naux = {}).", W0b_r.shape(0), W0b_r.shape(1),
+                   W0b_r.shape(2), nqpts_ibz, naux);
+      app_log(1, "  Pi^C [rung = linear]: P^(C,L) = Pi^(C,0) with the STATIC rung W0bar "
+                 "at FULL parent weight (instantaneous phase only; no pole algebra).");
+      if (sec)
+        vertex_pi::pi_c_accumulate_w(*_ft, tools, G_CC, _Xb_skma, W0b_r, nullptr,
+                                     kmq, kpq, nda::range(0, nc), Pi_wqMN,
+                                     mpi->comm.rank(), mpi->comm.size(),
+                                     skip_rung_gamma, &qx_diag, symc, &phase_diag);
+      else
+        vertex_pi::pi_c_accumulate_w(*_ft, tools, G_CC, X_C, W0b_r, nullptr,
+                                     kmq, kpq, nda::range(0, nc), Pi_wqMN,
+                                     mpi->comm.rank(), mpi->comm.size(),
+                                     skip_rung_gamma, &qx_diag, symc, &phase_diag);
+    } else if (sec)
       vertex_pi::pi_c_accumulate_w(*_ft, tools, G_CC, _Xb_skma, Zb_qmm,
                                    Wbdyn_qwmm.has_value() ? &Wbdyn_qwmm.value() : nullptr,
                                    kmq, kpq, nda::range(0, nc), Pi_wqMN,
@@ -2537,9 +2901,324 @@ namespace solvers {
     mpi->comm.barrier();
   }
 
+  long vertex_t::ensure_secondary_basis(MBState &mb_state, THC_ERI auto const &thc) {
+    decltype(nda::range::all) all;
+    auto mpi = thc.mpi();
+    auto MF = thc.MF();
+    const long nkpts = MF->nkpts();
+    const long nqpts_ibz = MF->nqpts_ibz();
+    const long Np = thc.Np();
+    const long nbnd = MF->nbnd();
+    utils::check(mb_state.sG_tskij.has_value(),
+                 "vertex_t::ensure_secondary_basis: sG_tskij is not initialized in MBState.");
+    const long ns = mb_state.sG_tskij.value().local().shape(1);
+    const bool wan = _wannier;
+
+    // ---- q = Gamma index (crystal coordinates: all components integer mod G) ----------
+    long iq_gamma = -1;
+    {
+      auto Qpts = MF->Qpts();
+      for (long iq = 0; iq < nqpts_ibz; ++iq) {
+        double d = 0.0;
+        for (long i = 0; i < 3; ++i) {
+          double x = Qpts(iq, i);
+          d += std::abs(x - std::round(x));
+        }
+        if (d < 1e-8) {
+          utils::check(iq_gamma < 0,
+                       "vertex_t::ensure_secondary_basis: multiple Gamma q-points found "
+                       "({} and {}).", iq_gamma, iq);
+          iq_gamma = iq;
+        }
+      }
+      utils::check(iq_gamma >= 0,
+                   "vertex_t::ensure_secondary_basis: no Gamma q-point found.");
+    }
+    if (_secondary_ready or not secondary()) return iq_gamma;
+
+    // ---- collocation + momentum maps for the lazy secondary build (as in cache_w) -----
+    auto sX_skPa = math::shm::make_shared_array<nda::array_view<ComplexType, 4>>(
+        *mpi, std::array<long, 4>{ns, nkpts, Np, nbnd});
+    sX_skPa.win().fence();
+    if (mpi->node_comm.root())
+      for (long is = 0; is < ns; ++is)
+        for (long ik = 0; ik < nkpts; ++ik)
+          sX_skPa.local()(is, ik, all, all) = thc.X(is, 0, ik);
+    sX_skPa.win().fence();
+    auto X_skPa = sX_skPa.local();
+    nda::array<long, 2> kmq(nqpts_ibz, nkpts);
+    for (long iq = 0; iq < nqpts_ibz; ++iq)
+      for (long ik = 0; ik < nkpts; ++ik) kmq(iq, ik) = MF->qk_to_k2(iq, ik);
+    // effective global collocation the secondary basis fits against (WANNIER: X_bar = X.U)
+    auto sXbar_glob = math::shm::make_shared_array<nda::array_view<ComplexType, 4>>(
+        *mpi, std::array<long, 4>{ns, nkpts, Np, wan ? subspace_rank() : 1});
+    if (wan) {
+      sXbar_glob.win().fence();
+      if (mpi->node_comm.root())
+        sXbar_glob.local() = vertex_wannier_detail::build_Xbar(X_skPa, _U_skia, _band_window);
+      sXbar_glob.win().fence();
+    }
+    auto X_glob = wan ? sXbar_glob.local() : X_skPa;
+    const long orb0_glob = wan ? 0 : _band_window.first();
+
+    build_secondary_basis(thc, X_glob, orb0_glob, kmq, iq_gamma);
+    return iq_gamma;
+  }
+
+  template<typename dArray_t>
+  void vertex_t::build_w0(MBState &mb_state, THC_ERI auto const &thc,
+                          dArray_t const &dPi_rpa_tqPQ) {
+    decltype(nda::range::all) all;
+    using Arr3 = nda::array<ComplexType, 3>;
+    using Arr4 = nda::array<ComplexType, 4>;
+    using Arr2 = nda::array<ComplexType, 2>;
+    using math::nda::make_distributed_array;
+    utils::check(active(),
+                 "vertex_t::build_w0: called while the vertex is inactive. Callers must "
+                 "guard with vertex_t::active() (or needs_w0()).");
+    utils::check(_ft != nullptr, "vertex_t::build_w0: IAFT instance is required.");
+
+    auto mpi = thc.mpi();
+    auto MF = thc.MF();
+    const long nkpts = MF->nkpts();
+    const long nqpts_ibz = MF->nqpts_ibz();
+    const long Np = thc.Np();
+    auto gs = dPi_rpa_tqPQ.global_shape();
+    const long nt_half_ft = (_ft->nt_b() % 2 == 0) ? _ft->nt_b() / 2 : _ft->nt_b() / 2 + 1;
+    utils::check(gs[1] == nqpts_ibz and gs[2] == Np and gs[3] == Np and gs[0] == nt_half_ft,
+                 "vertex_t::build_w0: unexpected Pi_RPA global shape ({}, {}, {}, {}); "
+                 "expected ({}, {}, {}, {}).",
+                 gs[0], gs[1], gs[2], gs[3], nt_half_ft, nqpts_ibz, Np, Np);
+
+    // ITERATION-LOCAL lifetime (plan section 2.3): drop last iteration's objects up
+    // front, so no static-rung state can ever be read across an iteration boundary
+    // (a stale W0 would silently break the FD oracles of S5/S9).
+    reset_w0();
+
+    app_log(1, "\n  [ISDF-Vertex] static rung W0[G] (increment S2; "
+               "notes/static_vertex_implementation_plan.md section 2.2)\n"
+               "  W0(q) = Z(q) + dW(q, i.nu = 0) from the SAME-ITERATION RPA "
+               "polarizability -- no lag,\n"
+               "  no Pi^C content (decision D2). Grid (nt_half, nq, Np) = ({}, {}, {}), "
+               "rung mode = {}.",
+            gs[0], nqpts_ibz, Np, rung_str());
+
+    // ---- (P,Q)-block layout: q unsplit, (P,Q) over ALL ranks (thc.dZ({1,nP,nQ}) ------
+    // layout; the one fold_Z_distributed and the slate 2D ops both accept, and the one
+    // the plan's section 3 mandates for a 320 GB-class nq*Np^2 object).
+    const long np_ranks = mpi->comm.size();
+    std::array<long, 3> w0_pgrid = {1, 1, 1};
+    w0_pgrid[1] = utils::find_proc_grid_min_diff(np_ranks, Np, Np);
+    w0_pgrid[2] = np_ranks / w0_pgrid[1];
+    const std::array<long, 3> w0_bsize = {1, 1, 1};
+    const std::array<long, 4> f0_pgrid = {1, 1, w0_pgrid[1], w0_pgrid[2]};
+    const std::array<long, 4> f0_bsize = {1, 1, w0_bsize[1], w0_bsize[2]};
+
+    // ---- step 1: the i.nu = 0 row of Pi_RPA on that layout ---------------------------
+    auto dW0_1qPQ = make_distributed_array<Arr4>(
+        mpi->comm, f0_pgrid, {1, nqpts_ibz, Np, Np}, f0_bsize);
+    {
+      auto R_t = vertex_w0_detail::nu0_transform_row(*_ft);
+      vertex_w0_detail::extract_nu0_row(dPi_rpa_tqPQ, R_t, dW0_1qPQ);
+    }
+
+    // ---- step 2: the SINGLE-FREQUENCY THC Dyson, per q ------------------------------
+    // dW0(q) = ([I - Z(q).Pi0(q)]^{-1} - I) Z(q): the scr_coulomb_t::dyson_W_in_place
+    // algebra (scr_coulomb_t.cpp:310-338) with the frequency loop removed. Same slate
+    // primitives, same operand order, same in-place convention (the array that came in
+    // holding Pi0 goes out holding dW0), so the plain-GW self-slice identity holds to
+    // machine precision -- that is the S2 gate (i).
+    auto dZ = thc.dZ(w0_pgrid, w0_bsize);
+    auto P_rng = dW0_1qPQ.local_range(2);
+    auto Q_rng = dW0_1qPQ.local_range(3);
+    utils::check(dZ.local_range(1) == P_rng and dZ.local_range(2) == Q_rng,
+                 "vertex_t::build_w0: Z and Pi0 do not share the (P,Q) block partition.");
+    {
+      auto pgrid2 = std::array<long, 2>{w0_pgrid[1], w0_pgrid[2]};
+      auto bsize2 = std::array<long, 2>{w0_bsize[1], w0_bsize[2]};
+      auto dPi_PQ = make_distributed_array<Arr2>(mpi->comm, pgrid2, {Np, Np}, bsize2, true);
+      auto dZ_PQ = make_distributed_array<Arr2>(mpi->comm, pgrid2, {Np, Np}, bsize2, true);
+      auto dA_PQ = make_distributed_array<Arr2>(mpi->comm, pgrid2, {Np, Np}, bsize2, true);
+      utils::check(dPi_PQ.local_range(0) == P_rng and dPi_PQ.local_range(1) == Q_rng,
+                   "vertex_t::build_w0: the 2D solve grid does not match the (P,Q) blocks.");
+      auto Pi_PQ = dPi_PQ.local();
+      auto Z_PQ = dZ_PQ.local();
+      auto A_PQ = dA_PQ.local();
+      // diagonal entries owned by this rank (the "-I" of I - Z.Pi and of eps^{-1} - I)
+      std::vector<std::pair<long, long> > diag_idx;
+      for (long iP = 0; iP < Pi_PQ.shape(0); ++iP)
+        for (long iQ = 0; iQ < Pi_PQ.shape(1); ++iQ)
+          if (P_rng.first() + iP == Q_rng.first() + iQ) diag_idx.push_back({iP, iQ});
+
+      double epsinv_max = 0.0;
+      long epsinv_q = -1;
+      auto W0_loc = dW0_1qPQ.local();
+      for (long iq = 0; iq < nqpts_ibz; ++iq) {     // q is NOT split: every rank loops all q
+        Z_PQ = dZ.local()(iq, all, all);
+        Pi_PQ = W0_loc(0, iq, all, all);
+        math::nda::slate_ops::multiply(dZ_PQ, dPi_PQ, dA_PQ);           // A = Z.Pi0
+        for (auto idx : diag_idx) A_PQ(idx.first, idx.second) -= ComplexType(1.0);
+        A_PQ *= -1.0;                                                   // A = I - Z.Pi0
+        math::nda::slate_ops::inverse(dA_PQ);                           // A = eps^{-1}
+        for (auto const &v : A_PQ)
+          if (std::abs(v) > epsinv_max) { epsinv_max = std::abs(v); epsinv_q = iq; }
+        for (auto idx : diag_idx) A_PQ(idx.first, idx.second) -= ComplexType(1.0);
+        math::nda::slate_ops::multiply(dA_PQ, dZ_PQ, dPi_PQ);           // dW0 = (eps^-1 - I) Z
+        W0_loc(0, iq, all, all) = Pi_PQ;
+      }
+      {
+        double gmax = mpi->comm.all_reduce_value(epsinv_max, boost::mpi3::max<>{});
+        long q_of_max = (epsinv_max == gmax) ? epsinv_q : -1;
+        q_of_max = mpi->comm.all_reduce_value(q_of_max, boost::mpi3::max<>{});
+        app_log(2, "  [ISDF-Vertex] W0 conditioning: max_q ||[I - Z.Pi_RPA(i.nu=0)]^-1||_max "
+                   "= {:.4e} (worst q = {})", gmax, q_of_max);
+      }
+    }
+
+    // ---- step 3: the q->0 head policy AT i.nu = 0 (q0_head_treatment.md section 3) ---
+    // ONE policy, ONE W0, so every later appearance of the rung carries the same head
+    // (plan section 2.2). "v1_skip"/"ignore_g0" store the regularized body only; the
+    // gygi class additionally inserts the analytic rank-1 head, whose i.nu = 0 dynamic
+    // weight Re[eps^{-1}_head(i.nu=0)] is extracted from THIS RPA dW0 -- so the rung and
+    // its head factor carry the same iteration tag by construction (memo section 1.6),
+    // instead of the previous iteration's mb_state.eps_inv_head that is still standing
+    // at this point of update_w.
+    // the Gamma index + (in the secondary path) the lazy Option-A transfer maps. Built
+    // HERE, not at the first kernel call: update_w runs before any kernel, so this is
+    // the earliest point the fold below can rely on _t_qmP existing.
+    const long iq_gamma = ensure_secondary_basis(mb_state, thc);
+
+    bool head_insertion = (_div_treatment.find("gygi") != std::string::npos);
+    if (head_insertion and nqpts_ibz == 1) {
+      app_log(1, "  [WARNING] W0: nqpts_ibz == 1 with a gygi-class vertex div_treatment -- "
+                 "taking \"ignore_g0\"\n"
+                 "            instead (same downgrade as eval_Pi_C / cache_w).");
+      head_insertion = false;
+    }
+    nda::array<ComplexType, 1> chi_g;
+    if (head_insertion) {
+      // SAME skip logic as vertex_head_detail::build_head_rank1 (madelung == 0 or an
+      // all-zero chi(Gamma, :) => no head), rank-1 form, no dense Np^2 head.
+      const double xi = MF->madelung();
+      auto chi = thc.basis_head();                              // (nqpts_ibz, Np)
+      utils::check(chi.shape(0) > iq_gamma and chi.shape(1) == Np,
+                   "vertex_t::build_w0: basis_head shape mismatch (({}, {}) vs iq_gamma = "
+                   "{}, Np = {}).", chi.shape(0), chi.shape(1), iq_gamma, Np);
+      double chi_max = 0.0;
+      for (long P = 0; P < Np; ++P) chi_max = std::max(chi_max, std::abs(chi(iq_gamma, P)));
+      if (xi != 0.0 and chi_max != 0.0) {
+        chi_g = nda::array<ComplexType, 1>(chi(iq_gamma, all));
+        _w0_head_c = ComplexType(double(nkpts) * xi);            // build_head_rank1's c
+        _w0_head_applied = true;
+      } else {
+        app_log(1, "  [WARNING] W0: gygi head insertion requested but the head data are "
+                   "unusable\n"
+                   "            (madelung == 0 or empty basis_head) -- proceeding WITHOUT "
+                   "the analytic head\n"
+                   "            (equivalent to policy \"ignore_g0\").");
+      }
+      if (_w0_head_applied) {
+        // the DYNAMIC head weight at i.nu = 0, from the freshly built RPA dW0 (the v2
+        // machinery evaluated at one frequency: eps_inv_head_w takes a (nw, nq, Np, Np)
+        // distributed array, and ours has nw == 1).
+        auto [eps_inv_w, eps_inv_q0_w] =
+            div_utils::eps_inv_head_w(dW0_1qPQ, thc, *MF, _div_treatment);
+        (void)eps_inv_w;
+        _w0_eps_head = eps_inv_q0_w(0).real();
+        app_log(1, "  [ISDF-Vertex] W0 head insertion at i.nu = 0: madelung = {}, "
+                   "Nk*madelung = {:.6e},\n"
+                   "  Re[eps^-1_head(i.nu=0) - 1] = {:.6e}  =>  epsilon_inf(RPA, W0) = "
+                   "{:.6f}",
+                xi, _w0_head_c.real(), _w0_eps_head, 1.0 / (1.0 + _w0_eps_head));
+      }
+    }
+    if (not head_insertion)
+      app_log(1, "  [ISDF-Vertex] W0 q->0 policy: {} -- W0(Gamma) is the stored regularized "
+                 "body\n"
+                 "  Z(Gamma) + dW0(Gamma) (v(G=0) zeroed at ERI build); no analytic head{}.",
+              _div_treatment,
+              w0_skip_gamma() ? ", and the Gamma cell of the rung transfer will be "
+                                "DROPPED by the S3+ kernels (v1_skip fallback)"
+                              : " (GW ignore_g0 analogue)");
+
+    // ---- W0 = Z + dW0 (+ head at Gamma), (P,Q)-block-distributed ---------------------
+    _W0_qPQ.emplace(make_distributed_array<Arr3>(
+        mpi->comm, w0_pgrid, {nqpts_ibz, Np, Np}, w0_bsize));
+    {
+      auto W0 = _W0_qPQ.value().local();
+      auto dW0 = dW0_1qPQ.local();
+      auto Zl = dZ.local();
+      for (long iq = 0; iq < nqpts_ibz; ++iq)
+        for (long ip = 0; ip < W0.shape(1); ++ip)
+          for (long jq = 0; jq < W0.shape(2); ++jq)
+            W0(iq, ip, jq) = Zl(iq, ip, jq) + dW0(0, iq, ip, jq);
+      if (_w0_head_applied) {
+        // (H1) in the memo's two pieces, applied in the same order and with the same
+        // per-element arithmetic as the pinned Z / dW augmentations: bare weight 1 into
+        // the Z part, dynamic weight Re[eps^{-1}_head(i.nu=0)] into the dW0 part.
+        vertex_secondary_detail::head_block_add(chi_g, _w0_head_c, ComplexType(1.0),
+                                                P_rng, Q_rng, W0(iq_gamma, all, all));
+        vertex_secondary_detail::head_block_add(chi_g, _w0_head_c,
+                                                ComplexType(_w0_eps_head),
+                                                P_rng, Q_rng, W0(iq_gamma, all, all));
+      }
+    }
+    dW0_1qPQ.reset();
+
+    // ---- W0bar = t W0 t^dag: the DISTRIBUTED one-row fold ---------------------------
+    // fold_Z_distributed IS the one-row variant of fold_dW_distributed (Z has no tau
+    // axis => no t-pool, no tau->nu, no PH-unfold), and W0 has exactly Z's shape and
+    // layout, so the "restricted to the single i.nu = 0 row" fold of plan section 2.2 is
+    // this call verbatim. head_at_gamma = false: the head is ALREADY inside W0 (one W0,
+    // one policy), so re-adding it here would double count.
+    auto no_head = [](nda::MemoryArrayOfRank<2> auto&&, nda::range const&,
+                      nda::range const&) {};
+    if (secondary()) {
+      _W0b_qmm.emplace(Arr3(nqpts_ibz, _Nm, _Nm));
+      vertex_secondary_detail::fold_Z_distributed(
+          _W0_qPQ.value(), _t_qmP, nqpts_ibz, Np, _Nm, iq_gamma, false, no_head,
+          _W0b_qmm.value(), mpi->comm);
+    } else {
+      // GLOBAL-aux reference path (small scale only, plan section 2.5): the "secondary"
+      // rung IS the global one, N_m == Np, t = identity. Gather the distributed blocks
+      // (zero-pad + all_reduce over a PARTITION = an exact gather, no reassociation) --
+      // the same replication class this path already accepts for its Z_qPQ.
+      _W0b_qmm.emplace(Arr3(nqpts_ibz, Np, Np));
+      auto &Wb = _W0b_qmm.value();
+      Wb() = ComplexType(0.0);
+      Wb(_W0_qPQ.value().local_range(0), P_rng, Q_rng) = _W0_qPQ.value().local();
+      mpi->comm.all_reduce_in_place_n(Wb.data(), Wb.size(), std::plus<>{});
+    }
+
+    {
+      double w0_max = 0.0, wb_max = 0.0;
+      for (auto const &v : _W0_qPQ.value().local()) w0_max = std::max(w0_max, std::abs(v));
+      w0_max = mpi->comm.all_reduce_value(w0_max, boost::mpi3::max<>{});
+      for (auto const &v : _W0b_qmm.value()) wb_max = std::max(wb_max, std::abs(v));
+      const long Nm_eff = _W0b_qmm.value().shape(1);
+      const double to_mb = 16.0 / (1024.0 * 1024.0);
+      app_log(1, "  [ISDF-Vertex] W0 BUILT: max|W0| = {:.4e} (distributed {} x {} x {}, "
+                 "{:.3f} MB total),\n"
+                 "  max|W0bar| = {:.4e} (replicated {} x {} x {}, {:.3f} MB/rank); "
+                 "iteration-local -- both\n"
+                 "  are dropped at the next build (plan section 2.3).\n",
+              w0_max, nqpts_ibz, Np, Np,
+              double(nqpts_ibz) * double(Np) * double(Np) * to_mb,
+              wb_max, nqpts_ibz, Nm_eff, Nm_eff,
+              double(nqpts_ibz) * double(Nm_eff) * double(Nm_eff) * to_mb);
+      utils::check(std::isfinite(w0_max) and std::isfinite(wb_max),
+                   "vertex_t::build_w0: the static rung contains NaN/Inf -- aborting.");
+    }
+    mpi->comm.barrier();
+  }
+
   // template instantiations
   template void vertex_t::eval_Sigma_C(MBState&, const thc_reader_t&);
   template void vertex_t::cache_w(MBState&, const thc_reader_t&);
+  template long vertex_t::ensure_secondary_basis(MBState&, const thc_reader_t&);
+  template void vertex_t::build_w0(
+      MBState&, const thc_reader_t&,
+      memory::darray_t<memory::array<HOST_MEMORY, ComplexType, 4>, mpi3::communicator> const&);
 
   template memory::darray_t<memory::array<HOST_MEMORY, ComplexType, 4>, mpi3::communicator>
   vertex_t::eval_Pi_C(MBState&, const thc_reader_t&,

@@ -562,6 +562,77 @@ namespace bdft_tests {
       REQUIRE(max_rel < 1e-5);
     }
 
+    SECTION("static_rung_W0") {
+      // INCREMENT S4 (notes/static_vertex_implementation_plan.md section 2.4).
+      //
+      // B-S/B-L's polarization object is Pi^{C,0}: the SAME kernel with the rung matrix
+      // Z -> W0bar and NO dynamic rung. The kernel already supports this exactly --
+      // Wdyn_qwPQ is a pointer and phase 2 returns immediately when it is null -- so the
+      // static rung is a call-site change, not a new contraction.
+      //
+      // Pin (the S3 pattern): the static path (Wdyn = nullptr) must agree with the FULL
+      // kernel run at an explicitly ZERO dynamic rung and the same core. That composes
+      // with the dense_cross_check arbiter above -- which pins the kernel's algebra
+      // against a brute-force orbital/pole-space evaluation of Eq. 13 -- to carry that
+      // arbiter's authority onto the static-rung case, without a second dense reference.
+      nda::array<cplx, 3> W0_qPQ(nk, Np, Np);
+      for (long iq = 0; iq < nk; ++iq) {
+        nda::array<cplx, 2> A(Np, Np);
+        for (long P = 0; P < Np; ++P)
+          for (long Q = 0; Q < Np; ++Q)
+            A(P, Q) = cplx(std::cos(1.3 * double((P + 1) * (Q + 3)) + 0.29 * double(iq)),
+                           std::sin(0.7 * double(P + 1) - 0.43 * double(Q + 1)
+                                    + 0.17 * double(iq)));
+        for (long P = 0; P < Np; ++P)
+          for (long Q = 0; Q < Np; ++Q)
+            W0_qPQ(iq, P, Q) = 0.5 * (A(P, Q) + std::conj(A(Q, P)));   // Hermitian
+      }
+
+      nda::array<cplx, 4> Pi_stat(nw_b, nk, Np, Np), Pi_dyn0(nw_b, nk, Np, Np);
+      Pi_stat() = cplx(0.0);
+      Pi_dyn0() = cplx(0.0);
+      // (1) STATIC path: no dynamic rung at all
+      vertex_pi::pi_c_accumulate_w(ft, tools, G, mdl.X_skPa, W0_qPQ,
+                                   /*Wdyn*/ nullptr, mdl.kmq, mdl.kpq, C(),
+                                   Pi_stat, 0, 1);
+      // (2) the full kernel with an explicitly ZERO dynamic rung, same core
+      nda::array<cplx, 4> Wzero(nk, nw_b, Np, Np);
+      Wzero() = cplx(0.0);
+      vertex_pi::pi_c_accumulate_w(ft, tools, G, mdl.X_skPa, W0_qPQ, &Wzero,
+                                   mdl.kmq, mdl.kpq, C(), Pi_dyn0, 0, 1);
+
+      double num = 0.0, den = 0.0;
+      for (long m = 0; m < nw_b; ++m)
+        for (long iq = 0; iq < nk; ++iq)
+          for (long P = 0; P < Np; ++P)
+            for (long Q = 0; Q < Np; ++Q) {
+              num = std::max(num, std::abs(Pi_stat(m, iq, P, Q) - Pi_dyn0(m, iq, P, Q)));
+              den = std::max(den, std::abs(Pi_dyn0(m, iq, P, Q)));
+            }
+      app_log(1, "static_rung_W0 (Pi): max|Pi_static - Pi_dyn(W_dyn=0)| = {}, "
+                 "max|Pi| = {} (pins the twisted-pair phase identically zero for a "
+                 "frequency-independent rung)", num, den);
+      REQUIRE(den > 1e-10);
+      REQUIRE(num <= 1e-14 * den);
+
+      // the tau = 0 row of the S4 primitive, applied to Pi^{C,0}: finite, and equal to the
+      // bosonic w -> tau transform evaluated at tau = 0 (the object Delta w consumes).
+      auto Rt0 = solvers::vertex_w0_detail::tau0_transform_row(ft);
+      REQUIRE(Rt0.shape(0) == nw_b);
+      double pmax = 0.0;
+      for (long iq = 0; iq < nk; ++iq)
+        for (long P = 0; P < Np; ++P)
+          for (long Q = 0; Q < Np; ++Q) {
+            cplx acc(0.0);
+            for (long m = 0; m < nw_b; ++m) acc += Rt0(m) * Pi_stat(m, iq, P, Q);
+            REQUIRE(std::isfinite(acc.real()));
+            REQUIRE(std::isfinite(acc.imag()));
+            pmax = std::max(pmax, std::abs(acc));
+          }
+      app_log(1, "static_rung_W0 (Pi): max|Pi^(C,0)(q, tau=0)| = {}", pmax);
+      REQUIRE(pmax > 1e-12);
+    }
+
     SECTION("wannier_gauge") {
       // KERNEL-LEVEL gauge oracle (notes/wannier_projector_theory.md section 6.2):
       // the Pi^C output is an aux x aux object (no orbital indices survive). Under a
