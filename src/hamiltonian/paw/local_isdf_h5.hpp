@@ -50,6 +50,12 @@
 namespace hamilt::paw {
 
 inline char const* kLocalISDFGroup = "PAW_LocalISDF";
+// Tag identifying the channel-SELECTION rule a cache was built under. Caches
+// carrying a different tag must be rebuilt, not reused: the same `tol` under a
+// different rule yields a different set of kept (I,J) pairs.
+//   qaware-maxq-v1 : rank by max over the full q-mesh of the Coulomb norm
+//   (pre-v1 caches, written with no tag, ranked at q=0 only)
+inline char const* kISDFSelectionTag = "qaware-maxq-v1";
 
 namespace detail {
 
@@ -84,6 +90,10 @@ inline void write_local_isdf_h5(
     h5::group root = detail::ensure_group(parent, kLocalISDFGroup);
     h5::h5_write_attribute(root, "metric", std::string(metric_name(metric)));
     h5::h5_write_attribute(root, "tol",    tol);
+    // Which criterion picked the channels. Bump this whenever the selection
+    // rule changes: a cache built under a different rule holds a different
+    // channel set at the SAME tol, and reusing it is silently wrong.
+    h5::h5_write_attribute(root, "selection", std::string(kISDFSelectionTag));
     int nsp = (int)isdf.size();
     h5::h5_write_attribute(root, "nsp",    nsp);
 

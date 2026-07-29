@@ -1633,6 +1633,66 @@ TEST_CASE("paw_isdf_rank_vs_tol", "[hamilt][paw][isdf]")
   }
 }
 
+/**
+ * Guards `thc_reader_t::select_aug_channels_qaware`, which replaced the old
+ * q=0-only channel ranking (see notes/paw_article_results/
+ * rpa_instability_localization.md §6, §14).
+ *
+ * Two properties, both of which the old path could violate silently:
+ *
+ *  (a) FIDELITY. At a tolerance small enough to drop nothing, the selection
+ *      path must reproduce the tol=0 (selection skipped entirely) object
+ *      exactly. This is the check that the pair -> lambda -> rebuild round
+ *      trip through the synthesized `isdf_compression_report` is faithful; a
+ *      bug there would silently reorder or lose channels at EVERY tolerance.
+ *
+ *  (b) MONOTONICITY. Raising the tolerance must not grow the basis.
+ *
+ * Np is the observable: at fixed `thresh` the smooth block is fixed, so all
+ * variation in Np is the augmentation block.
+ */
+template<MEMORY_SPACE MEM>
+void test_paw_isdf_qaware_selection(mpi_context_t& mpi,
+                                     std::shared_ptr<mf::MF> mf_ptr,
+                                     std::string const& label)
+{
+  auto& mfobj = *mf_ptr;
+  auto np_at = [&](double tol) {
+    auto pt = methods::make_thc_reader_ptree(
+        0, "", "incore", "", "bdft", 1e-4, mfobj.ecutrho());
+    pt.put("paw_aug", true);
+    pt.put("paw_isdf_metric", "coulomb");
+    pt.put("paw_isdf_tol", tol);
+    methods::thc_reader_t thc(mf_ptr, pt);
+    return thc.Np();
+  };
+
+  long np_full  = np_at(0.0);     // selection skipped -> full rank
+  long np_tiny  = np_at(1e-14);   // selection runs, must drop nothing
+  long np_loose = np_at(1e-3);
+
+  app_log(2, "q-aware aug selection ({}): Np(full)={}, Np(1e-14)={}, "
+             "Np(1e-3)={}", label, np_full, np_tiny, np_loose);
+
+  CHECK(np_tiny == np_full);      // (a)
+  CHECK(np_loose <= np_full);     // (b)
+}
+
+TEST_CASE("paw_isdf_qaware_selection", "[hamilt][paw][isdf][thc]")
+{
+  auto& mpi = utils::make_unit_test_mpi_context();
+  SECTION("LiH PAW") {
+    auto mf = std::make_shared<mf::MF>(
+        mf::default_MF(mpi, "qe_lih222_paw", mf::h5_input_type));
+    test_paw_isdf_qaware_selection<HOST_MEMORY>(*mpi, mf, "LiH PAW");
+  }
+  SECTION("LiH USPP") {
+    auto mf = std::make_shared<mf::MF>(
+        mf::default_MF(mpi, "qe_lih222_uspp", mf::h5_input_type));
+    test_paw_isdf_qaware_selection<HOST_MEMORY>(*mpi, mf, "LiH USPP");
+  }
+}
+
 TEST_CASE("paw_aug_q_eval_at_q0", "[hamilt][paw][isdf]")
 {
   auto& mpi = utils::make_unit_test_mpi_context();

@@ -667,3 +667,134 @@ Generators/harvesters in this directory; runs on rusty under `~/ceph/CoQui/abini
 Not available: the `pawcross 1` probe (on-site completeness in ABINIT's
 oscillator strengths) aborts with heap corruption in this ABINIT 10.6.7 build at
 both 64 and 16 ranks.
+
+## 14. Channel selection made q-aware (2026-07-29) — §6 defect FIXED
+
+§6 identified the mechanism but left it in place, on the grounds that the
+converged runs use `paw_isdf_tol = 1e-8` where nothing is dropped. That is true
+for Si (nh=18 gives `kept nlambda = 324 (full-rank cap = 324)`), but it left a
+loaded gun for any system or tolerance where the cap is not saturated. The
+criterion is now fixed rather than avoided.
+
+`build_local_isdf_compressed_by_norm` is still used to build the channels, but
+at **tol = 0** (full rank). Selection then happens in
+`thc_reader_t::select_aug_channels_qaware`, which ranks each (I,J) pair by
+
+    d_IJ = max over q on the FULL mesh of  sum_G w_q(G) |eta_IJ(q+G)|^2
+    w_q(G) = 4pi / (Omega |q+G|^2),  the |q+G| -> 0 term dropped
+
+and keeps it when `sqrt(d_IJ / max_IJ d_IJ) > paw_isdf_tol`. The tolerance is
+therefore RELATIVE and system-independent. eta is evaluated with the same
+interpolated tables (`build_eta_on_rho_g_at_q_chunk`) the augmentation itself
+uses, over the same rho_g sphere, so this is the production path and not a
+parallel approximation of it. Cost is one eta build per q — O(nq * N_aug * ngm)
+— done redundantly on every rank (it is pure local table evaluation, not
+collective, and is deterministic so all ranks agree). Not separately timed on
+Si; on the LiH fixture it is not resolvable against the 9.6 s THC build. If it
+ever shows up on a large mesh, the fix is to rank on a strided subset of q
+rather than to go back to q=0.
+
+Max-over-q, not q=0, is the point: the ERI sums over the whole mesh, and a pair
+with no L=0 component has Q_IJ(G) -> 0 like G^L as G -> 0. At q=0 it collects
+none of the 1/G^2 enhancement and looks negligible; at the smallest wavevector
+the mesh actually contains (|q| = 0.271 a.u. for Si 4x4x4) it is not small.
+
+Ranking is over `Qpts()`, the full q-mesh, which is a superset of the
+symmetry-distinct set — conservative by construction, so no symmetry argument
+is needed for correctness.
+
+Two things that were silent are now logged, because this defect's whole
+character is that it is invisible to diagonal tests:
+  - how many pairs were dropped, and the largest dropped one as a fraction of
+    the largest kept;
+  - how many KEPT pairs the old q=0-only ranking would have discarded, and the
+    largest factor by which it under-ranked them.
+
+Cache staleness closed at the same time: the local-ISDF h5 now carries a
+`selection` attribute (`kISDFSelectionTag = "qaware-maxq-v1"`). A cache written
+under a different rule is rejected with a warning and rebuilt — the same `tol`
+under a different rule yields a different channel set, so reusing it silently
+would reintroduce exactly the bug being fixed. Pre-v1 caches carry no tag and
+are treated as stale.
+
+On the tolerance question: for Si at 1e-8 the cap is saturated, so nothing is
+dropped and smaller values change nothing. The robust check is not the number
+itself but the logged `kept nlambda == full-rank cap`. Since the aug block is a
+small fraction of the basis (648 of Np = 5588 for Si, so full rank costs ~2% in
+Np and ~4% in Pi memory over a compressed set), the default `paw_isdf_tol =
+1e-12` is deliberately conservative: at that relative threshold a pair must be
+~1e-24 in squared norm to be dropped, i.e. effectively full rank.
+
+CAUTION for anyone re-deriving the §6 numbers: the 1.021258/0.999054 gate is the
+**Si q!=0** gate. The LiH `paw_oscillator_sum_rule` **G=0** gate reads 4.1e-12 at
+both tolerances and does NOT reproduce them — it is a different quantity, and
+confusing the two will make the defect look nonexistent. On LiH the visible
+signature is instead the off-diagonal residual max_{v!=c}|rho_vc(0)|, 8.9e-16 at
+full rank vs 4.1e-9 at 5e-5.
+
+## 15. Si EXX+RPA lattice constant — the pre-fix curve, and why a0 hid the bug
+
+Redoing the EOS with the V_LL fix required re-running the whole series, so the
+pre-fix series (`~/ceph/CoQui/abinit/eos_conv500_coqui`, n=500, thresh=1e-4,
+paw_isdf_tol=5e-5 — i.e. carrying BOTH the transpose and the q=0 selection
+defect) was fitted first, as the "before" datum.
+
+    a (Bohr)   CoQui Total      E_Ewald        E_total      E_c(RPA)
+      10.05     0.20297847   -8.57599689    -8.37301842   -0.61862873
+      10.15     0.11802472   -8.49150431    -8.37347958   -0.61461430
+      10.25     0.03508032   -8.40866036    -8.37358004   -0.61116651
+      10.35    -0.04592027   -8.32741727    -8.37333754   -0.60822378
+      10.45    -0.12501516   -8.24772906    -8.37274422   -0.60570501
+      10.55    -0.20227051   -8.16955154    -8.37182205   -0.60357906
+
+Birch-Murnaghan (3rd order, 6 points, max residual 0.002 mHa):
+
+    a0 = 10.2293 Bohr      B0 = 45.0 GPa      B' = 1.63
+
+against the unaffected references — VASP/PAW RPA@PBE (Harl 2010) 10.244 Bohr /
+98 GPa, and CoQui's own ONCV RPA@PBE kp4/n500 10.228 Bohr / 101 GPa (ONCV has
+no augmentation, so no V_LL block, so the bug cannot touch it).
+
+**a0 was right to 0.015 Bohr while B0 was wrong by a factor of 2.2 and B' by a
+factor of 2.5.** That is the whole reason this survived so long. a0 depends on
+where the derivative crosses zero; the transpose error is smooth and slowly
+varying in volume, so it shifts the curve far more than it tilts it, and the
+minimum barely moves. B0 is the curvature, and the curvature is destroyed. Any
+future validation of an augmentation change must look at B0/B', not a0 — an
+EOS that reproduces the literature lattice constant is NOT evidence that the
+two-particle terms are right.
+
+The fit residual being 0.002 mHa is worth noting too: the corrupted data is
+beautifully described by a Birch-Murnaghan form. Goodness of fit was never
+going to catch this.
+
+Tooling: `eos_exxrpa_harvest.sh` (rusty -> json; skips any run without an
+`RPA energy:` line, so a job that died in the Pi stage cannot silently
+contribute a truncated `Total energy`) and `eos_exxrpa_fit.py`, both in this
+directory. The fitter self-tests against a synthetic BM curve and recovers
+a0/B0/B' exactly.
+
+Unit trap, recorded because it is worth ~4 Ha per point: the campaign memory's
+recipe "CoQui_Total + 0.5 * E_Ewald" has that 1/2 as a **Rydberg-to-Hartree
+conversion**, because that campaign read Ewald from a QE SCF. Ewald taken from
+an ABINIT `.abo` is already in Hartree and takes NO factor. CoQui's own
+`Total energy` line omits Ewald entirely in either case.
+
+### 14a. `paw_isdf_tol` changed meaning (absolute -> relative)
+
+Recorded separately because it silently reinterprets existing input files.
+`build_local_isdf_compressed_by_norm` tested `d > tol^2` on the RAW q=0
+Coulomb-metric norm — an ABSOLUTE threshold. `select_aug_channels_qaware` tests
+`d / max_IJ d > tol^2` — RELATIVE to the largest pair.
+
+Absolute was the wrong choice on its own terms, independently of the q=0 bias:
+d carries the 4pi/Omega of the Coulomb metric, so a fixed numeric tolerance is a
+different physical threshold at every cell volume. In an EOS series that means
+the aug basis could change size from one volume to the next for no physical
+reason — a volume-dependent basis-set artifact sitting directly on top of the
+quantity being differentiated to get B0.
+
+A given numeric `paw_isdf_tol` is therefore NOT equivalent between the two
+rules, and old inputs should be re-read with that in mind. The default (1e-12)
+is safe under either reading: relative-1e-12 requires a pair to be 1e-24 of the
+largest in squared norm before it is dropped, i.e. effectively full rank.

@@ -284,16 +284,42 @@ namespace methods {
 
       // Try to load a cached compressed isdf if a path was given.
       if (!_paw_isdf_cache_h5.empty() && std::filesystem::exists(_paw_isdf_cache_h5)) {
+        // A cache is only reusable if it was built under the SAME selection
+        // rule. Pre-v1 caches carry no tag and were ranked at q=0 only; their
+        // channel set differs from ours at the same tol, so they are rebuilt
+        // rather than silently trusted.
+        std::string sel_back;
+        {
+          h5::file f(_paw_isdf_cache_h5, 'r');
+          h5::group root(f);
+          if (root.has_subgroup(hamilt::paw::kLocalISDFGroup)) {
+            h5::group g = root.open_group(hamilt::paw::kLocalISDFGroup);
+            // Absent attribute leaves sel_back empty -- that IS the pre-v1 case.
+            h5::h5_read_attribute(g, "selection", sel_back);
+          }
+        }
+        if (sel_back != hamilt::paw::kISDFSelectionTag) {
+          app_warning("paw_aug: ignoring local-ISDF cache {} -- it was built "
+                      "with channel selection '{}' but this build uses '{}'. "
+                      "Rebuilding. (Pre-v1 caches ranked channels at q=0 only, "
+                      "which under-ranks every pair with no L=0 component.)",
+                      _paw_isdf_cache_h5,
+                      sel_back.empty() ? "<untagged, pre-v1>" : sel_back,
+                      hamilt::paw::kISDFSelectionTag);
+          _isdf.clear();
+        } else {
         hamilt::paw::isdf_metric m_back = hamilt::paw::isdf_metric::Coulomb;
         double tol_back = 0.0;
         _isdf = hamilt::paw::load_compressed_local_isdf_from_h5(
             _paw_isdf_cache_h5, &m_back, &tol_back);
         if (!_isdf.empty()) {
           app_log(1, "  paw_aug: loaded compressed local-ISDF from {} "
-                     "(metric={}, tol={:.1e})",
-                     _paw_isdf_cache_h5, hamilt::paw::metric_name(m_back), tol_back);
+                     "(metric={}, tol={:.1e}) [selection {}]",
+                     _paw_isdf_cache_h5, hamilt::paw::metric_name(m_back), tol_back,
+                     sel_back);
           _Timer.stop("PAW_AUG");
           return;
+        }
         }
       }
 
@@ -308,6 +334,30 @@ namespace methods {
         - recv(1,0)*(recv(0,1)*recv(2,2) - recv(0,2)*recv(2,1))
         + recv(2,0)*(recv(0,1)*recv(1,2) - recv(0,2)*recv(1,1));
       double omega = (2.0*M_PI)*(2.0*M_PI)*(2.0*M_PI) / std::abs(det_B);
+      // Channel selection. `build_local_isdf_compressed_by_norm` ranks (I,J)
+      // pairs by their Coulomb-metric norm evaluated at **q = 0 only**, with
+      // w(G) = 4pi/(Omega |G|^2). That criterion is biased: a pair containing
+      // an L=0 component has Q_IJ(G) -> const as G -> 0 and collects the full
+      // 1/G^2 enhancement, while a pair with l_i != l_j has Q_IJ(G) -> 0 like
+      // G^L and collects none. The latter therefore look negligible and get
+      // dropped -- yet on the q-mesh the smallest wavevector is |q|, not 0
+      // (0.271 a.u. on the Si 4x4x4 mesh), where those channels are NOT small.
+      // Measured cost of the bias (Si, JTH-d, notes/paw_article_results/
+      // rpa_instability_localization.md §6-§7): the q!=0 completeness gate
+      // reads 1.021258 at paw_isdf_tol=5e-5 versus 0.999054 at full rank, and
+      // E_c moves ~14 mHa between those two settings while a full decade of
+      // `thresh` at fixed tol moves it 0.01 mHa. Note the gate is violated
+      // ONLY at q!=0 -- it is exact at q=0 by construction, which is why every
+      // q=0 test passed. On the LiH fixture the same signature shows up in the
+      // OFF-DIAGONAL completeness residual max_{v!=c}|rho_vc(0)|, which
+      // degrades 8.9e-16 -> 4.1e-9 between full rank and 5e-5 while the
+      // DIAGONAL gate |rho_vv(0)-1| sits at 4.1e-12 either way: dropped
+      // channels corrupt the off-diagonal, which is what ln|det(I-Pi*Z)| sums
+      // over and what no diagonal test can see.
+      //
+      // The fix ranks each pair by its worst case over the q-mesh actually
+      // used, which is what the ERI sums over. eta is built with the same
+      // interpolated machinery the augmentation uses, so this costs ~1 s.
       _isdf.clear(); _isdf.reserve(nsp);
       for (int nt = 0; nt < nsp; ++nt) {
         bool has_aug = sps[nt].is_paw || sps[nt].is_uspp;
@@ -315,10 +365,14 @@ namespace methods {
           _isdf.emplace_back();
           continue;
         }
+        // Start from FULL rank (tol=0 keeps every pair with a valid (I,J)),
+        // then decide what to drop using the q-aware norm below.
         auto isdf_nt = hamilt::paw::build_local_isdf_compressed_by_norm(
-            *_psp, nt, recv, omega, _paw_isdf_metric, _paw_isdf_tol);
+            *_psp, nt, recv, omega, _paw_isdf_metric, 0.0);
         _isdf.push_back(std::move(isdf_nt));
       }
+      if (_paw_isdf_tol > 0.0)
+        select_aug_channels_qaware(recv, omega);
       app_log(1, "  paw_aug: built compressed local-ISDF (metric={}, tol={:.1e}, nsp={})",
               hamilt::paw::metric_name(_paw_isdf_metric), _paw_isdf_tol, nsp);
       // Per-species size breakdown — clarifies where N_aug comes from.
@@ -734,7 +788,8 @@ namespace methods {
       }
 
       // ---- Plan C2: dense-sphere G-grid for the atom-local (LL) Coulomb block.
-      // The LL block integrates conj(η)·w·η over G. η (the compensation charge
+      // The LL block integrates η·w·conj(η) over G (conjugate on the SECOND
+      // index — see 6h). η (the compensation charge
       // in moment mode; the SHARP full AE−PS pair density in shape mode) is NOT
       // band-limited to the thc rho_g sphere — an ecut-reduced rho_g is a
       // legitimate cost knob for the smooth/ISDF machinery, but truncating the
@@ -1022,7 +1077,15 @@ namespace methods {
         }
 
         // ---- 6h) V_LL block + on-site K_a: P ∈ aug, Q ∈ aug.
-        //         V_LL(λ, ξ) = Ω² · Σ_g conj(η(λ, g)) · η_w(ξ, g),
+        //         V_LL(λ, ξ) = Ω² · Σ_g η(λ, g) · w(g) · conj(η(ξ, g)).
+        // The conjugate sits on the SECOND index, matching GG and GL. Getting
+        // this backwards stores Z^T, which is invisible to every diagonal test
+        // (the diagonal of a Hermitian matrix is real) and to a Hermiticity
+        // check (the transposed block is itself Hermitian) — it corrupts only
+        // the off-diagonal (ia|bj), i.e. only ln|det(I-Pi*Z)|. That was the
+        // RPA blow-up; see notes/paw_article_results/
+        // rpa_instability_localization.md §11-§13. Do not "restore" the old
+        // ordering to match a stale comment.
         // over the DENSE augmentation sphere when dense_LL (plan C2): η is
         // not band-limited to rho_g, so the Coulomb sum must run to the
         // physical Gcut of the augmentation mesh (built in G-chunks, each
@@ -1049,8 +1112,9 @@ namespace methods {
               hamilt::paw::build_eta_on_rho_g_at_q_chunk(
                   *_psp, _isdf, _aug_layout, dense_g, q_cart, omega,
                   aatab, qrad_tabs, Q_aug_cols_la, g_rng, etaQ_v);
-              // conj(η_P); η_Q × w(q+G) with w = 4π/(Ω|q+G|²), w(0)=0
-              // (same singular-term convention as the rho_g path).
+              // η_Q × w(q+G) with w = 4π/(Ω|q+G|²), w(0)=0 (same singular-term
+              // convention as the rho_g path). η_P is NOT conjugated here —
+              // the dagger below puts the conjugate on the second index.
               for (long ig = 0; ig < ng_c; ++ig) {
                 long g = g_rng.first() + ig;
                 double Kx = q_cart[0] + gv_d(g, 0);
@@ -1157,6 +1221,174 @@ namespace methods {
     // ------------------------------------------------------------------
     // PAW augmentation helpers (private, used only by augment_thc_with_paw).
     // ------------------------------------------------------------------
+
+    /**
+     * Re-select the augmentation channels using a q-AWARE criterion.
+     *
+     * `_isdf` comes in at full rank. For every (I,J) pair we form
+     *
+     *     d_IJ = max over q on the mesh of  sum_G w_q(G) |eta_IJ(q+G)|^2,
+     *     w_q(G) = 4pi / (Omega |q+G|^2),  the |q+G| -> 0 term dropped,
+     *
+     * and keep the pair when sqrt(d_IJ / max_IJ d_IJ) exceeds `_paw_isdf_tol`.
+     *
+     * NOTE this changes what `paw_isdf_tol` MEANS. The old criterion in
+     * `build_local_isdf_compressed_by_norm` was ABSOLUTE (`d > tol^2` on the
+     * raw q=0 norm); this one is RELATIVE to the largest pair. Absolute is not
+     * transferable — d carries 4pi/Omega, so the same number means different
+     * things at different cell volumes, which is precisely the wrong property
+     * for a knob used across an EOS volume series. Relative is
+     * system-independent. Consequence for anyone reading old inputs: a given
+     * numeric tol is not equivalent between the two rules.
+     *
+     * Why max-over-q rather than the q=0 value: the ERI sums over the whole
+     * q-mesh, and a channel that is negligible at q=0 purely because
+     * Q_IJ(G) -> 0 as G -> 0 (any pair with no L=0 component) is NOT
+     * negligible at finite q, where the smallest wavevector is |q| rather than
+     * zero. Ranking on q=0 alone silently drops exactly those channels.
+     *
+     * eta is evaluated with the same interpolated tables the augmentation
+     * uses, over the same rho_g sphere, so this reuses the production path
+     * rather than a parallel approximation of it.
+     */
+    void select_aug_channels_qaware(nda::stack_array<double,3,3> const& recv,
+                                    double omega)
+    {
+      auto const& sps = _psp->paw_species_view();
+      int nsp = (int)sps.size();
+      // Full-rank layout, so lambda rows map onto the pairs we are ranking.
+      auto layout = hamilt::paw::make_paw_aug_layout(*_psp, _isdf, 0);
+      long N_aug = layout.N_A;
+      if (N_aug == 0) return;
+
+      grids::truncated_g_grid rho_g(_MF->ecutrho(), _MF->fft_grid_dim_aug(), recv);
+      long ngm = rho_g.size();
+      auto const& gv = rho_g.g_vectors();
+      double Gmax = 0.0;
+      for (long g = 0; g < ngm; ++g)
+        Gmax = std::max(Gmax, std::sqrt(gv(g,0)*gv(g,0)+gv(g,1)*gv(g,1)+gv(g,2)*gv(g,2)));
+
+      auto Qpts = _MF->Qpts();
+      long nq = Qpts.extent(0);
+      double qmax = 0.0;
+      for (long iq = 0; iq < nq; ++iq)
+        qmax = std::max(qmax, std::sqrt(Qpts(iq,0)*Qpts(iq,0) +
+                                        Qpts(iq,1)*Qpts(iq,1) +
+                                        Qpts(iq,2)*Qpts(iq,2)));
+      auto const& aatab = _psp->paw_aatab();
+      auto const& qtabs = _psp->paw_qrad_tabs(Gmax + qmax + 1e-3, false);
+
+      // Worst-case (over q) Coulomb norm of every lambda row. `dzero` keeps the
+      // q=0 value alone so we can report how badly the old q=0-only ranking
+      // would have mis-ordered the channels on THIS system.
+      nda::array<double,1> dmax(N_aug), dzero(N_aug);
+      dmax() = 0.0; dzero() = 0.0;
+      {
+        const long gch = 8192;
+        nda::array<ComplexType,2> eta(N_aug, std::min(gch, ngm));
+        for (long iq = 0; iq < nq; ++iq) {
+          std::array<double,3> q_cart = {-Qpts(iq,0), -Qpts(iq,1), -Qpts(iq,2)};
+          nda::array<double,1> acc(N_aug);
+          acc() = 0.0;
+          for (long g0 = 0; g0 < ngm; g0 += gch) {
+            nda::range gr(g0, std::min(g0+gch, ngm));
+            auto sub = eta(nda::range::all, nda::range(0, gr.size()));
+            hamilt::paw::build_eta_on_rho_g_at_q_chunk(
+                *_psp, _isdf, layout, rho_g, q_cart, omega, aatab, qtabs,
+                nda::range(0, N_aug), gr, sub);
+            for (long ig = 0; ig < gr.size(); ++ig) {
+              long g = gr.first() + ig;
+              double Kx = q_cart[0]+gv(g,0), Ky = q_cart[1]+gv(g,1), Kz = q_cart[2]+gv(g,2);
+              double K2 = Kx*Kx + Ky*Ky + Kz*Kz;
+              if (K2 <= 1e-14) continue;
+              double w = 4.0*M_PI/(omega*K2);
+              for (long la = 0; la < N_aug; ++la)
+                acc(la) += w * std::norm(sub(la, ig));
+            }
+          }
+          double q2 = Qpts(iq,0)*Qpts(iq,0) + Qpts(iq,1)*Qpts(iq,1)
+                    + Qpts(iq,2)*Qpts(iq,2);
+          for (long la = 0; la < N_aug; ++la) {
+            dmax(la) = std::max(dmax(la), acc(la));
+            if (q2 <= 1e-14) dzero(la) = acc(la);
+          }
+        }
+      }
+
+      // Collapse lambda -> (I,J) pair (the +/- rows of a pair share a norm),
+      // then rebuild each species keeping the pairs above a RELATIVE tolerance.
+      std::vector<hamilt::paw::species_local_isdf> out;
+      out.reserve(nsp);
+      long dropped_total = 0, kept_total = 0, rescued_total = 0;
+      double worst_dropped_rel = 0.0, worst_rescued_ratio = 1.0;
+      for (int nt = 0; nt < nsp; ++nt) {
+        auto const& s = _isdf[nt];
+        if (s.nlambda == 0) { out.emplace_back(); continue; }
+        // First atom of this species gives the row offset.
+        long row0 = -1;
+        auto const& ityp = _psp->ityp_view();
+        for (long ia = 0; ia < ityp.extent(0); ++ia)
+          if (ityp(ia) == nt) { row0 = layout.atom_aug_offset[ia]; break; }
+        utils::check(row0 >= 0, "select_aug_channels_qaware: no atom for species {}", nt);
+
+        int nh_a = s.nh;
+        long nij = (long)nh_a*(nh_a+1)/2;
+        std::vector<double> dpair(nij, 0.0), zpair(nij, 0.0);
+        for (int lam = 0; lam < s.nlambda; ++lam) {
+          dpair[s.lambda_ij(lam)] = std::max(dpair[s.lambda_ij(lam)],
+                                             dmax(row0 + lam));
+          zpair[s.lambda_ij(lam)] = std::max(zpair[s.lambda_ij(lam)],
+                                             dzero(row0 + lam));
+        }
+        double dbig = 0.0, zbig = 0.0;
+        for (long ij = 0; ij < nij; ++ij) {
+          dbig = std::max(dbig, dpair[ij]);
+          zbig = std::max(zbig, zpair[ij]);
+        }
+
+        hamilt::paw::isdf_compression_report rep;
+        rep.nij = (int)nij;
+        hamilt::paw::detail::make_pair_map(nt, nh_a, _psp->ijtoh_view(),
+                                           (int)nij, rep.ij_to_IJ_i, rep.ij_to_IJ_j);
+        double thr2 = _paw_isdf_tol * _paw_isdf_tol * dbig;
+        for (long ij = 0; ij < nij; ++ij) {
+          if (rep.ij_to_IJ_i[ij] < 0) continue;      // selection-rule zero
+          if (dpair[ij] > thr2) {
+            rep.pair_pivot_order.push_back((int)ij); ++kept_total;
+            // Would the q=0-only ranking have thrown this one away?
+            if (zpair[ij] <= _paw_isdf_tol*_paw_isdf_tol*zbig) {
+              ++rescued_total;
+              worst_rescued_ratio = std::max(worst_rescued_ratio,
+                  std::sqrt((dpair[ij]/std::max(dbig,1e-300)) /
+                            std::max(zpair[ij]/std::max(zbig,1e-300), 1e-300)));
+            }
+          }
+          else if (dpair[ij] > 0.0) {
+            ++dropped_total;
+            worst_dropped_rel = std::max(worst_dropped_rel,
+                                         std::sqrt(dpair[ij]/std::max(dbig,1e-300)));
+          }
+        }
+        out.push_back(hamilt::paw::build_local_isdf_compressed(
+            *_psp, nt, nh_a, rep, (int)rep.pair_pivot_order.size()));
+      }
+      _isdf = std::move(out);
+      // Never let truncation be silent: report what went and how big it was.
+      app_log(1, "  paw_aug: q-aware channel selection over the full {}-point q "
+                 "mesh -- kept {} (I,J) pairs, dropped {}; largest dropped is "
+                 "{:.3e} of the largest kept (relative tol {:.1e}). Ranking is "
+                 "max over q of the Coulomb norm, not the q=0 value: a pair "
+                 "with no L=0 component has Q_IJ(G) -> 0 as G -> 0 and is "
+                 "under-ranked at q=0, yet the ERI's smallest wavevector is "
+                 "|q|, not 0.",
+              nq, kept_total, dropped_total, worst_dropped_rel, _paw_isdf_tol);
+      if (rescued_total > 0)
+        app_log(1, "  paw_aug: {} of those pairs would have been DROPPED by the "
+                   "old q=0-only ranking (largest under-ranked by {:.1f}x). "
+                   "Those are the channels whose absence corrupts the "
+                   "off-diagonal (ia|bj) that ln|det(I-Pi*Z)| sums over.",
+                rescued_total, worst_rescued_ratio);
+    }
 
     /**
      * Embed a smooth-block distributed array `dZ_NA` (shape: nq, NA, NA)
