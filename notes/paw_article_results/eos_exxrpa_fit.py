@@ -40,6 +40,37 @@ def birch_murnaghan(V, E0, V0, B0, Bp):
     return E0 + (9.0 * V0 * B0 / 16.0) * (t**3 * Bp + t**2 * (6.0 - 4.0 * (V0 / V) ** (2.0 / 3.0)))
 
 
+def check_fittable(a_bohr, E_ha):
+    """Refuse fits that cannot mean anything. Returns a list of fatal reasons.
+
+    Learned the hard way 2026-07-29: a 4-point 3rd-order BM fit on a still-
+    descending E(V) segment returned a0 = 10.98 Bohr with 'max fit residual
+    0.000 mHa'. Both numbers were artifacts -- 4 parameters through 4 points is
+    exactly determined, so the residual is zero BY CONSTRUCTION and says nothing
+    about fit quality, and the minimum was pure extrapolation 0.6 Bohr beyond
+    the sampled range. Neither scipy nor the residual flags this; only these
+    checks do.
+    """
+    a = np.asarray(a_bohr, float)
+    E = np.asarray(E_ha, float)
+    bad = []
+    NPAR = 4                                   # E0, V0, B0, Bp
+    if len(a) <= NPAR:
+        bad.append(f"{len(a)} points for {NPAR} parameters -- exactly determined "
+                   f"or underdetermined; the residual would be 0 by construction. "
+                   f"Need >= {NPAR+2} for a meaningful fit.")
+    d = np.diff(E)
+    if np.all(d < 0):
+        bad.append(f"E(a) is monotonically DECREASING across the whole sampled "
+                   f"range (a = {a.min()}..{a.max()}): the minimum is not "
+                   f"bracketed and lies at LARGER a. Extend the volume grid "
+                   f"upward.")
+    if np.all(d > 0):
+        bad.append(f"E(a) is monotonically INCREASING across the whole sampled "
+                   f"range: the minimum lies at SMALLER a. Extend downward.")
+    return bad
+
+
 def fit(a_bohr, E_ha):
     from scipy.optimize import curve_fit
     a = np.asarray(a_bohr, float)
@@ -54,8 +85,13 @@ def fit(a_bohr, E_ha):
     a0 = (4.0 * V0) ** (1.0 / 3.0)
     B0_GPa = B0 * 29421.02648438959      # Ha/Bohr^3 -> GPa
     resid = E - birch_murnaghan(V, *p)
+    # Extrapolated minima are not results. Flag when V0 falls outside the data.
+    extrap = not (V.min() <= V0 <= V.max())
     return dict(a0_bohr=a0, B0_GPa=B0_GPa, Bp=Bp, E0_Ha=E0,
-                max_resid_Ha=float(np.abs(resid).max()))
+                max_resid_Ha=float(np.abs(resid).max()),
+                extrapolated=extrap,
+                a_range=(float(a.min()), float(a.max())),
+                dof=len(a) - 4)
 
 
 def main(path):
@@ -75,11 +111,24 @@ def main(path):
         print(f"{a:10.2f} {tot - EWALD_HA[a]:16.8f} {EWALD_HA[a]:14.8f} "
               f"{tot:16.8f} {'' if ec is None else f'{ec:14.8f}'}")
 
-    if len(rows) < 4:
-        sys.exit(f"\nonly {len(rows)} points -- need >=4 for a 3rd-order BM fit")
+    aa = [x[0] for x in rows]
+    EE = [x[1] for x in rows]
+    bad = check_fittable(aa, EE)
+    if bad:
+        print("\nNOT FITTED — the data cannot support a Birch-Murnaghan fit:")
+        for b in bad:
+            print(f"  * {b}")
+        print("\n(Reporting a0/B0 from this data would be an artifact, not a "
+              "result. Wait for the remaining volumes.)")
+        sys.exit(1)
 
-    r = fit([x[0] for x in rows], [x[1] for x in rows])
-    print(f"\nBirch-Murnaghan (3rd order), {len(rows)} points:")
+    r = fit(aa, EE)
+    print(f"\nBirch-Murnaghan (3rd order), {len(rows)} points "
+          f"({r['dof']} dof):")
+    if r["extrapolated"]:
+        print(f"  *** WARNING: fitted minimum a0 = {r['a0_bohr']:.4f} lies OUTSIDE "
+              f"the sampled range {r['a_range'][0]}..{r['a_range'][1]} Bohr. "
+              f"This is extrapolation — extend the grid, do not quote it. ***")
     print(f"  a0 = {r['a0_bohr']:.4f} Bohr   ({r['a0_bohr']*0.529177210903:.4f} Ang)")
     print(f"  B0 = {r['B0_GPa']:.1f} GPa      B' = {r['Bp']:.2f}")
     print(f"  max fit residual = {r['max_resid_Ha']*1e3:.3f} mHa")
