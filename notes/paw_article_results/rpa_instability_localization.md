@@ -437,6 +437,44 @@ denominator. D0 is the one that matters. Validated on LiH: calibration
 0.999853, measurement 0.999790, and the smooth excess is visibly larger under
 D0 (1.598x) than D1 (1.367x) as expected.
 
+## 13. RESOLVED — post-fix RPA vs ABINIT
+
+Si jth_with_d, a=10.05, thresh 1e-5, paw_isdf_tol 1e-8:
+
+| nbnd | ABINIT | CoQui pre-fix | **CoQui post-fix** | residual |
+|---|---|---|---|---|
+| 250 | −0.42509 | −0.433243 | **−0.430864** | 5.77 mHa |
+| 500 | −0.43112 | −0.582623 | **−0.437371** | 6.25 mHa |
+
+**The band-count runaway is gone.** The 250->500 increment, which was the
+disease:
+
+    ABINIT           -6.03 mHa
+    CoQui pre-fix  -149.4  mHa
+    CoQui post-fix   -6.51 mHa      <- matches ABINIT to 0.5 mHa
+
+E_c at n=500 went from 151.5 mHa off to 6.3 mHa off, and the residual is now
+essentially band-count independent (5.77 at n=250 vs 6.25 at n=500) instead of
+exploding. Post-fix PAW (−0.4374) sits between ABINIT-PAW (−0.4311) and
+CoQui-NC (−0.4469), as it should.
+
+The term split isolates the mechanism beyond doubt:
+
+| | Tr(Pi*Z) | ln\|det\| | E_c |
+|---|---|---|---|
+| pre-fix | −10.1383195 | +9.5556973 | −0.582622 |
+| post-fix | −10.1380636 | +9.7006923 | −0.437371 |
+| change | +0.00026 (0.003%) | +0.14499 (1.5%) | +145 mHa |
+
+Tr(Pi*Z) is built from DIAGONAL ERIs and is untouched. ln|det| is built from
+the full matrix, including the off-diagonal elements that were transposed, and
+carries the entire 145 mHa. Nothing else in the calculation moved.
+
+Residual 6 mHa: within the spread of method differences (ABINIT truncates the
+dielectric matrix at ecuteps 12 Ha while CoQui uses the full THC basis; PAW
+forces inclvkb=0 there). Not investigated further -- it is flat in band count,
+so it does not touch the EOS.
+
 ## 12. THE BUG — V_LL conjugates the wrong index of Z
 
 `thc_reader_t.hpp`, both V_LL branches (rho_g ~line 973, dense ~line 1054).
