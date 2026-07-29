@@ -436,18 +436,37 @@ namespace methods {
         [[maybe_unused]] memory::array<DEVICE_MEMORY, ComplexType, 2> O_PQ_dev;
         [[maybe_unused]] memory::array<DEVICE_MEMORY, ComplexType, 2> Ask_Pb_dev;
         [[maybe_unused]] memory::array<DEVICE_MEMORY, ComplexType, 4> Xr_cache;
+        [[maybe_unused]] memory::array<DEVICE_MEMORY, ComplexType, 4> Xl_cache;
+        [[maybe_unused]] memory::array<DEVICE_MEMORY, ComplexType, 2> Oab_dev;
         if constexpr (aux_on_device) {
           O_PQ_dev   = memory::array<DEVICE_MEMORY, ComplexType, 2>(batch_size, NQ_loc);
           Ask_Pb_dev = memory::array<DEVICE_MEMORY, ComplexType, 2>(batch_size, nbnd);
+          // Both X factors are staged once per call so that the first gemm can
+          // run on the device too. It used to run on the host -- one core per
+          // rank at ~100 GF/s against ~14 TF/s device-resident -- and then push
+          // its result across PCIe per (t,s,k). Uploading the (nbnd x nbnd)
+          // input block instead of the (batch x nbnd) result moves the same
+          // order of bytes, so the transform becomes device-resident for free.
+          //
+          // The two caches are kept separate even when ip == iq and the ranges
+          // coincide: sharing the P-sliced factor as the right operand is
+          // exactly the bug fixed in 765754c, and 287 MB per cache here
+          // (nk*Np*nbnd*16 at Si 2x2x2/500b) is not worth the risk.
+          nda::range O_P_rng_all(P_offset, P_offset + NP_loc);
           nda::range O_Q_rng(Q_offset, Q_offset + NQ_loc);
           nda::array<ComplexType, 4> Xr_host(ns, nkpts, NQ_loc, nbnd);
+          nda::array<ComplexType, 4> Xl_host(ns, nkpts, NP_loc, nbnd);
           for (size_t s_ = 0; s_ < ns; ++s_) {
             for (size_t k_ = 0; k_ < nkpts; ++k_) {
               auto Xsk_Pa_r = thc.X(s_, iq, k_);
               Xr_host(s_, k_, all, all) = Xsk_Pa_r(O_Q_rng, all);
+              auto Xsk_Pa_l = thc.X(s_, ip, k_);
+              Xl_host(s_, k_, all, all) = Xsk_Pa_l(O_P_rng_all, all);
             }
           }
           Xr_cache = memory::to_memory_space<DEVICE_MEMORY>(Xr_host);
+          Xl_cache = memory::to_memory_space<DEVICE_MEMORY>(Xl_host);
+          Oab_dev  = memory::array<DEVICE_MEMORY, ComplexType, 2>(nbnd, nbnd);
         }
 #endif
 
@@ -461,25 +480,30 @@ namespace methods {
           nda::range O_P_rng(PP*batch_size + offset, (PP+1)*batch_size + offset);
           nda::range O_Q_rng(Q_offset, Q_offset + NQ_loc);
 
-          // Ask_Pb = Xsk_Pa * Osk_ab  (host gemm; primary input is HOST)
-          auto Xsk_Pa_l = thc.X(s, ip, k);
-
-          if(kp_trev(k)) {
-            nda::blas::gemm(Xsk_Pa_l(X_P_rng, all), nda::transpose(O_ikab_4D(i, kp_map(k), all, all)), Ask_Pb);
-          } else {
-            nda::blas::gemm(Xsk_Pa_l(X_P_rng, all), O_ikab_4D(i, kp_map(k), all, all), Ask_Pb);
-          }
-
-          // Osk_PQ = Ask_Pb * conj(Xsk_Qb)
           if constexpr (aux_on_device) {
 #if defined(ENABLE_DEVICE)
-            // Stage Ask_Pb (host) -> device, use cached Xr, run the
-            // device gemm, then copy into the device-typed O_ikPQ slice.
-            Ask_Pb_dev = Ask_Pb;
+            // Both gemms on the device: stage this (i,k) block of the primary
+            // input, contract with the cached left factor, then with the right.
+            // The cache rows for X_P_rng are exactly O_P_rng, since the cache
+            // holds rows [P_offset, P_offset+NP_loc).
+            Oab_dev = O_ikab_4D(i, kp_map(k), all, all);
+            auto Xl = Xl_cache(s, k, O_P_rng, all);
+            if (kp_trev(k)) {
+              nda::blas::gemm(Xl, nda::transpose(Oab_dev), Ask_Pb_dev);
+            } else {
+              nda::blas::gemm(Xl, Oab_dev, Ask_Pb_dev);
+            }
             nda::blas::gemm(Ask_Pb_dev, nda::dagger(Xr_cache(s, k, all, all)), O_PQ_dev);
             O_ikPQ_4D(i, k, O_P_rng, all) = O_PQ_dev;
 #endif
           } else {
+            // HOST path unchanged: Ask_Pb = Xsk_Pa * Osk_ab, then * conj(Xsk_Qb)
+            auto Xsk_Pa_l = thc.X(s, ip, k);
+            if(kp_trev(k)) {
+              nda::blas::gemm(Xsk_Pa_l(X_P_rng, all), nda::transpose(O_ikab_4D(i, kp_map(k), all, all)), Ask_Pb);
+            } else {
+              nda::blas::gemm(Xsk_Pa_l(X_P_rng, all), O_ikab_4D(i, kp_map(k), all, all), Ask_Pb);
+            }
             auto Xsk_Pa_r = thc.X(s, iq, k);
             nda::blas::gemm(Ask_Pb, nda::dagger(Xsk_Pa_r(O_Q_rng, all)), O_ikPQ_4D(i, k, O_P_rng, all));
           }

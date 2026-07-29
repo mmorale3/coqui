@@ -559,17 +559,25 @@ namespace methods {
         auto T_skia_loc = T_skia.local();
         auto chi_head = thc.basis_head()(0, nda::range::all);
         // T^{k}_{ia} = conj(X^{k}_{Pi}) * X^{k}_{Pa} * conj(chi_head(P) )
+        // T^{k}_{ia} = sum_P conj(X^{k}_{Pi}) X^{k}_{Pa} conj(chi_head(P))
+        //            = (Y^T X)_{ia}  with  Y_{Pi} = conj(chi_head(P)) conj(X^{k}_{Pi}),
+        // i.e. one gemm per (s,k). It used to be a scalar loop over (i,a,P):
+        // 9e9 terms at Si 2x2x2/500b, and for fixed (i,a) it walked X(P,i) with
+        // stride nbnd, so it missed cache on essentially every term. Same
+        // arithmetic, expressed as BLAS3: each rank still writes only the (s,k)
+        // blocks it owns and the all-reduce below combines them unchanged.
         T_skia.win().fence();
-        for (size_t skia = rank; skia < ns * nkpts * nbnd * nbnd; skia += size) {
-          // skia = is * nkpts*nbnd*nbnd + ik * nbnd*nbnd + i * nbnd + a
-          size_t is = skia / (nkpts * nbnd * nbnd);
-          size_t ik = (skia / (nbnd * nbnd)) % nkpts;
-          size_t i = (skia / nbnd) % nbnd;
-          size_t a = skia % nbnd;
-
-          auto Xsk = thc.X(is, 0, ik);
-          for (size_t P = 0; P < NP; ++P) {
-            T_skia_loc(is, ik, i, a) += nda::conj(Xsk(P, i)) * Xsk(P, a) * nda::conj(chi_head(P));
+        {
+          nda::array<ComplexType, 2> Y_Pi(NP, nbnd);
+          for (size_t sk = rank; sk < ns * nkpts; sk += size) {
+            size_t is = sk / nkpts;
+            size_t ik = sk % nkpts;
+            auto Xsk = thc.X(is, 0, ik);                       // (NP, nbnd)
+            for (size_t P = 0; P < NP; ++P) {
+              auto cP = nda::conj(chi_head(P));
+              for (size_t i_ = 0; i_ < nbnd; ++i_) Y_Pi(P, i_) = cP * nda::conj(Xsk(P, i_));
+            }
+            nda::blas::gemm(nda::transpose(Y_Pi), Xsk, T_skia_loc(is, ik, nda::ellipsis{}));
           }
         }
         T_skia.win().fence();
