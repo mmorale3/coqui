@@ -437,6 +437,72 @@ denominator. D0 is the one that matters. Validated on LiH: calibration
 0.999853, measurement 0.999790, and the smooth excess is visibly larger under
 D0 (1.598x) than D1 (1.367x) as expected.
 
+## 11. THE DIAGNOSIS — off-diagonal ERIs, and why every earlier test missed them
+
+`Tr(Pi*Z)` and `ln|det(I - Pi*Z)|` depend on DIFFERENT classes of ERI:
+
+    Tr(Pi*Z)        = sum_ia w_ia (ia|ai)      -> DIAGONAL elements only
+    ln|det(I-Pi*Z)| -> Pi*Z as a MATRIX        -> general (ia|bj), (i,a)!=(j,b)
+
+and the term split says the trace is right (PAW −10.138 vs NC −10.229, 0.89%)
+while E_c is 30% off. **Every ERI number in this campaign — D1, D0, the
+head-resolved sweep, even the ABINIT oscillator comparison — constrains only
+the diagonal.** The off-diagonal class had never been measured.
+
+New probe (`OFFDIAG` lines in `paw_thc_vs_exact_eri`): a Hermitian NON-diagonal
+density matrix on the top band decile, giving `sum_cd Dm_cd (vc|dv)`. On the QE
+LiH fixture, THC vs the exact reference:
+
+| thresh | Np | diagonal (D0) | **off-diagonal** |
+|---|---|---|---|
+| 1e-3 | 175 | 1.50e-3 | 5.62e-3 |
+| 1e-4 | 220 | 2.10e-4 | **2.70e-3** |
+| 1e-5 | 280 | 9.7e-5 | 4.39e-3 |
+| 1e-6 | 375 | 5.0e-6 | 6.26e-4 |
+| 1e-7 | 542 | 1.6e-5 | 2.75e-4 |
+| 1e-8 | 779 | 2.0e-6 | 1.1e-5 |
+
+The diagonal converges cleanly (300x over three decades). **The off-diagonal is
+10-100x worse at the same thresh, non-monotonic, and needs Np = 779 — 3.5x the
+production basis — to reach the accuracy the diagonal has at Np = 375.**
+
+That is the missing piece, and it explains the observation that killed every
+earlier hypothesis: **tightening `thresh` does not move E_c** (1e-5 -> 1e-6 gave
+0.01 mHa) because the error that drives E_c is not the one the diagonal-based
+convergence criterion measures.
+
+Mechanism: the probe's exact AE value is −4.573e-03 against a smooth part of
+−2.123e-01 — a **46x cancellation**, versus 1.6x for the diagonal. The ISDF
+error is relative to the SMOOTH magnitude and the augmentation is added
+exactly, so the error lands on the AE quantity amplified by the cancellation
+ratio. Diagonal ERIs are norm-like and forgiving; off-diagonal ones are not.
+
+### The fix direction
+
+Out-resolving it is not viable: matching the diagonal's accuracy needs ~3.5x
+the basis, i.e. Np ~ 15-20k on Si against a production 4301, and the RPA solve
+is O(Np^3).
+
+The amplification has to be removed instead, by an EXACT regrouping that shrinks
+what the ISDF must fit:
+
+    current:   rho_AE = rho~                + sum YY.eta       eta   ~ (phi*phi - phit*phit)
+    proposed:  rho_AE = [rho~ - sum YY.etat] + sum YY.eta_AE   etat  ~ phit*phit
+                                                                eta_AE ~ phi*phi
+
+Identical rho_AE (eta_AE - etat = eta), but the ISDF target becomes
+`rho~ - conj(chi_a) chi_b` with `chi_a = sum_i P_ai phit_i` the on-site PS
+expansion — which is SMALL inside the spheres by PAW completeness and equals
+rho~ outside. Both ingredients exist in the species data (`sp.aewfc`,
+`sp.pswfc`); `build_qrad_tab_full_aeps` already forms `phi*phi - phit*phit` and
+needs only PS-only / AE-only variants.
+
+The cost is that this changes what the THC builder fits, which is a deeper
+change than any knob: the target `conj(psit_a)psit_b - conj(chi_a)chi_b` is a
+DIFFERENCE of two products, so it does not fit the single-product collocation
+ansatz directly and needs the same +/- polarization split the aug channels
+already use.
+
 ## 10. THE REMAINING GAP — the ERI is verified in AGGREGATE, not at the HEAD
 
 This is the honest state of the investigation and the next thing to test.

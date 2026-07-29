@@ -4844,6 +4844,38 @@ TEST_CASE("paw_thc_vs_exact_eri", "[hamilt][paw_erichk][!benchmark]")
   nda::array<double,2> Dex(nocc, NBIN), Dsm(nocc, NBIN);
   nda::array<double,2> Dex0(nocc, NBIN), Dsm0(nocc, NBIN);
   Dex() = 0.0; Dsm() = 0.0; Dex0() = 0.0; Dsm0() = 0.0;
+
+  // ---- OFF-DIAGONAL ERI probe. This is the element class the campaign has
+  // never tested, and the term split says it is exactly where the error is:
+  //
+  //   Tr(Pi*Z)      = sum_ia w_ia (ia|ai)      -> DIAGONAL ERIs only
+  //   ln|det(I-PiZ)| uses Pi*Z as a MATRIX     -> general (ia|bj), i,a != j,b
+  //
+  // and measured (Si a=10.05, n=500): Tr agrees with NC to 0.89% while E_c
+  // differs 30%, i.e. the trace is fine and ln|det| is not. Every ERI number
+  // verified so far -- D1, D0, the ABINIT oscillator comparison -- constrains
+  // only the diagonal. A Hermitian NON-diagonal density matrix on the top
+  // band decile probes sum_cd Dm_cd (vc|dv), which is the off-diagonal set.
+  //
+  // Diagonal elements are norm-like (positive, forgiving); off-diagonal ones
+  // involve cancellation, and an ISDF least-squares fit is far less accurate
+  // for those. So this can fail while everything measured so far passes.
+  const long off_lo = ((NBIN-1)*nbnd)/NBIN, off_hi = nbnd, off_n = off_hi-off_lo;
+  nda::array<ComplexType,2> Dmoff(nbnd, nbnd);
+  Dmoff() = ComplexType(0.0);
+  {
+    // Deterministic (no RNG: identical across ranks and reruns), Hermitian.
+    nda::array<ComplexType,2> A(off_n, off_n);
+    for (long c = 0; c < off_n; ++c)
+      for (long d = 0; d < off_n; ++d)
+        A(c,d) = ComplexType(std::cos(0.7*double(c) + 1.3*double(d)),
+                             std::sin(0.4*double(c) - 0.9*double(d)));
+    for (long c = 0; c < off_n; ++c)
+      for (long d = 0; d < off_n; ++d)
+        Dmoff(off_lo+c, off_lo+d) = 0.5*(A(c,d) + std::conj(A(d,c)));
+  }
+  nda::array<double,1> Xoff_ex(nocc), Xoff_sm(nocc);
+  Xoff_ex() = 0.0; Xoff_sm() = 0.0;
   nda::array<ComplexType,2> rho_sm_c(nbnd, ngm), rho_aug_c(nbnd, ngm);
   nda::array<ComplexType,2> A(nbnd, N_aug);
   // Completeness gate, evaluated over EVERY G of rho_g rather than a sample:
@@ -4898,6 +4930,31 @@ TEST_CASE("paw_thc_vs_exact_eri", "[hamilt][paw_erichk][!benchmark]")
       }
       app_log(1, "[erichk] wrote cross-code dump to {} (v={}, c={}, ngm={})",
               dump_path, dump_v, dump_c, ngm);
+    }
+
+    // Exact off-diagonal probe: sum_cd Dm_cd sum_G w(G) rho_vc(G) conj(rho_vd(G)),
+    // over the top band decile. Done as one GEMM plus a contraction rather than
+    // an O(n^2 * ngm) double loop.
+    {
+      nda::array<ComplexType,2> Mae(off_n, ngm), Msm(off_n, ngm), Bt(off_n, ngm);
+      nda::array<ComplexType,2> Dsub(off_n, off_n);
+      for (long c = 0; c < off_n; ++c)
+        for (long d = 0; d < off_n; ++d) Dsub(c,d) = Dmoff(off_lo+c, off_lo+d);
+      for (long c = 0; c < off_n; ++c)
+        for (long g = 0; g < ngm; ++g) {
+          Msm(c,g) = rho_sm_c(off_lo+c, g);
+          Mae(c,g) = rho_sm_c(off_lo+c, g) + rho_aug_c(off_lo+c, g);
+        }
+      auto probe = [&](nda::array<ComplexType,2> const& M) {
+        nda::blas::gemm(ComplexType(1.0), nda::transpose(Dsub), M,
+                        ComplexType(0.0), Bt);          // Bt(d,g) = sum_c Dm_cd M(c,g)
+        double s = 0.0;
+        for (long d = 0; d < off_n; ++d)
+          for (long g = 0; g < ngm; ++g)
+            s += wG(g) * std::real(Bt(d,g) * std::conj(M(d,g)));
+        return s; };
+      Xoff_sm(v) = probe(Msm);
+      Xoff_ex(v) = probe(Mae);
     }
 
     csum() = 0.0;
@@ -4976,6 +5033,31 @@ TEST_CASE("paw_thc_vs_exact_eri", "[hamilt][paw_erichk][!benchmark]")
   auto Dthc_ae0 = thc_D(true,  false);
   auto Dthc_sm0 = thc_D(false, false);
 
+  // THC side of the off-diagonal probe: the SAME Hermitian non-diagonal Dm.
+  auto thc_off = [&](bool aug) {
+    auto pt = methods::make_thc_reader_ptree(nIpts,"","incore","","bdft",
+                                             thresh, mfobj.ecutrho());
+    pt.put("paw_aug", aug); pt.put("paw_isdf_metric","coulomb");
+    pt.put("paw_isdf_tol", isdf_tol); pt.put("paw_onsite", false);
+    if (aug_ecut > 0.0) pt.put("paw_aug_ecut", aug_ecut);
+    methods::thc_reader_t thc(mf_ptr, pt);
+    methods::solvers::hf_t hf(methods::ignore_g0);
+    nda::array<double,1> D(nocc); D() = 0.0;
+    if (mpi.node_comm.root()) {
+      sDm.local()() = ComplexType(0.0);
+      for (long c = off_lo; c < off_hi; ++c)
+        for (long d = off_lo; d < off_hi; ++d)
+          sDm.local()(0,kc,c,d) = Dmoff(c,d);
+    }
+    mpi.node_comm.barrier();
+    auto sF = make_shared_array<array_view_4d_t>(mpi, {nspin,nk_ibz,nbnd,nbnd});
+    hf.evaluate(sF, sDm.local(), thc, sS.local(), false, true);
+    for (long v = 0; v < nocc; ++v)
+      D(v) = -std::real(sF.local()(0,k0,v,v)) * (double)mfobj.nkpts();
+    return D; };
+  auto Xthc_ex = thc_off(true);
+  auto Xthc_sm = thc_off(false);
+
   // ---- Report. The smooth pair anchors the convention; the AE pair is the
   // measurement. Cumulative over deciles so the band-count trend is visible.
   auto row = [&](char const* what, nda::array<double,2> const& Dae,
@@ -5027,6 +5109,23 @@ TEST_CASE("paw_thc_vs_exact_eri", "[hamilt][paw_erichk][!benchmark]")
              "augmentation has to cancel under each weighting)",
           tot_ex  != 0.0 ? tot_sm/tot_ex   : 0.0,
           tot_ex0 != 0.0 ? tot_sm0/tot_ex0 : 0.0);
+
+  double xo_ex = 0.0, xo_sm = 0.0, xo_tex = 0.0, xo_tsm = 0.0;
+  for (long v = 0; v < nocc; ++v) {
+    xo_ex += Xoff_ex(v); xo_sm += Xoff_sm(v);
+    xo_tex += Xthc_ex(v); xo_tsm += Xthc_sm(v);
+  }
+  app_log(1, "[erichk] --- OFF-DIAGONAL ERI probe, bands [{},{}) ---", off_lo, off_hi);
+  app_log(1, "[erichk] OFFDIAG calib  THC smooth / exact smooth = {:.6f}   "
+             "(exact {:.6e}, THC {:.6e})",
+          xo_sm != 0.0 ? xo_tsm/xo_sm : 0.0, xo_sm, xo_tsm);
+  app_log(1, "[erichk] OFFDIAG MEAS   THC AE / exact AE = {:.6f}   "
+             "(exact {:.6e}, THC {:.6e})  <-- sum_cd Dm_cd (vc|dv) with a "
+             "Hermitian NON-diagonal Dm. Tr(Pi*Z) uses only the diagonal "
+             "(ia|ai) and is measured fine; ln|det(I-Pi*Z)| uses the full "
+             "matrix, and that is where the 30%% sits. This is the only ERI "
+             "class never tested.",
+          xo_ex != 0.0 ? xo_tex/xo_ex : 0.0, xo_ex, xo_tex);
   REQUIRE(nbnd > 0);
 }
 
