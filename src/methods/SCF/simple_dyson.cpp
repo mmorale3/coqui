@@ -152,6 +152,7 @@ namespace methods {
     utils::check(spectra.shape() == std::array<long, 4>{_nw, _ns, _nkpts_ibz, _nbnd},
                  "simple_dyson::compute_eigenspectra: Incorrect dimension for spectra.");
     using math::shm::make_shared_array;
+    _Timer.start("EIGSPEC");
     spectra() = 0.0;
     nda::matrix<ComplexType> FpSigma(_nbnd, _nbnd);
     auto sS_inv = make_shared_array<Array_view_4D_t>(*_context, {_ns, _nkpts_ibz, _nbnd, _nbnd});
@@ -163,6 +164,7 @@ namespace methods {
 
     int node_rank = _context->node_comm.rank();
     int node_size = _context->node_comm.size();
+    _Timer.start("EIGSPEC_SINV");
     sS_inv.win().fence();
     for (size_t sk = node_rank; sk < _ns*_nkpts_ibz; sk+=node_size) {
       size_t is = sk / _nkpts_ibz;
@@ -171,15 +173,22 @@ namespace methods {
       S_inv(is, ik, nda::ellipsis{}) = nda::inverse(S_ij);
     }
     sS_inv.win().fence();
+    _Timer.stop("EIGSPEC_SINV");
 
     // Batched tau_to_w: one big gemm computes Sigma(w) for ALL w at
     // once, instead of calling the single-w-slice variant 138 times
     // (which re-walks the 8.8 GB Sigma host tensor each call).
     // Memory cost: ~ nw * ns * nkpts * nbnd^2 * 16 bytes on host
     // (4.4 GB at the n=500 Si scale; well within node RAM).
+    // NOTE: every rank builds the whole Sigma(w) here, so this transform is
+    // done n_ranks times over redundantly, unlike the geev loop below which is
+    // distributed over w. Timed separately to size that redundancy.
+    _Timer.start("EIGSPEC_SIGMA_FT");
     nda::array<ComplexType, 5> Sigmaw_wskij(_nw, _ns, _nkpts_ibz, _nbnd, _nbnd);
     _FT->tau_to_w(_Sigma_shm.local(), Sigmaw_wskij, imag_axes_ft::fermi);
+    _Timer.stop("EIGSPEC_SIGMA_FT");
 
+    _Timer.start("EIGSPEC_GEEV");
     for (size_t n = _context->comm.rank(); n < _nw; n+=_context->comm.size()) {
       for (size_t i = 0; i < _ns*_nkpts_ibz; ++i) {
         size_t is = i / _nkpts_ibz; // i = is * _nkpts_ibz + ik
@@ -194,7 +203,11 @@ namespace methods {
         eigvals = nda::linalg::geigenvalues(SFS);
       }
     }
+    _Timer.stop("EIGSPEC_GEEV");
+    _Timer.start("EIGSPEC_REDUCE");
     _context->comm.all_reduce_in_place_n(spectra.data(), spectra.size(), std::plus<>{});
+    _Timer.stop("EIGSPEC_REDUCE");
+    _Timer.stop("EIGSPEC");
   }
 
 

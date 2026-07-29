@@ -30,7 +30,10 @@ namespace methods {
                               const nda::MemoryArrayOfRank<1> auto &eps_inv_head) {
       eval_Sigma_all<MEM>(G_tskij, dW_qtPQ, sSigma_tskij, thc,
                           (thc.MF()->nqpts() == thc.MF()->nqpts_ibz()? "R" : "k"));
+      // Untimed until now, and the whole gap between TOTAL and EVALUATE_SIGMA_*.
+      _Timer.start("SIGMA_DIV_CORR");
       Sigma_div_correction(sSigma_tskij, G_tskij, thc, eps_inv_head);
+      _Timer.stop("SIGMA_DIV_CORR");
     }
 
     template<nda::MemoryArray Array_primary_t, nda::MemoryArray Array_aux_t, typename communicator_t>

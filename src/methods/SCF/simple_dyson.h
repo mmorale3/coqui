@@ -78,7 +78,9 @@ public:
       hermitize(_sS_skij.local());
     }
 
-    for( auto& v: {"DYSON", "SIGMA_TAU_TO_W", "DYSON_LOOP", "REDISTRIBUTE", "DYSON_GATHER"} ) {
+    for( auto& v: {"DYSON", "SIGMA_TAU_TO_W", "DYSON_LOOP", "REDISTRIBUTE", "DYSON_GATHER",
+                     "EIGSPEC", "EIGSPEC_SINV", "EIGSPEC_SIGMA_FT", "EIGSPEC_GEEV",
+                     "EIGSPEC_REDUCE"} ) {
       _Timer.add(v);
     }
     _context->comm.barrier();
@@ -100,7 +102,9 @@ public:
     chkpt::read_ovlp(_context->node_comm, H0_S_chkpt, _sS_skij);
     _context->comm.barrier();
 
-    for( auto& v: {"DYSON", "SIGMA_TAU_TO_W", "DYSON_LOOP", "REDISTRIBUTE", "DYSON_GATHER"} ) {
+    for( auto& v: {"DYSON", "SIGMA_TAU_TO_W", "DYSON_LOOP", "REDISTRIBUTE", "DYSON_GATHER",
+                     "EIGSPEC", "EIGSPEC_SINV", "EIGSPEC_SIGMA_FT", "EIGSPEC_GEEV",
+                     "EIGSPEC_REDUCE"} ) {
       _Timer.add(v);
     }
     _context->comm.barrier();
@@ -135,7 +139,15 @@ public:
     app_log(2, "      - Sigma(t)->Sigma(w):         {0:.3f} sec", _Timer.elapsed("SIGMA_TAU_TO_W"));
     app_log(2, "      - Dyson loop:                 {0:.3f} sec", _Timer.elapsed("DYSON_LOOP"));
     app_log(2, "      - Redistribute                {0:.3f} sec", _Timer.elapsed("REDISTRIBUTE"));
-    app_log(2, "      - Gather:                     {0:.3f} sec\n", _Timer.elapsed("DYSON_GATHER"));
+    app_log(2, "      - Gather:                     {0:.3f} sec", _Timer.elapsed("DYSON_GATHER"));
+    // compute_eigenspectra was untimed while costing ~19% of the SCF loop:
+    // it is called once per update_G to give the mu search its spectrum.
+    app_log(2, "    compute_eigenspectra:           {0:.3f} sec  ({1} calls)",
+            _Timer.elapsed("EIGSPEC"), _Timer.number_of_calls("EIGSPEC"));
+    app_log(2, "      - S^-1 per (s,k):             {0:.3f} sec", _Timer.elapsed("EIGSPEC_SINV"));
+    app_log(2, "      - Sigma(t)->Sigma(w):         {0:.3f} sec", _Timer.elapsed("EIGSPEC_SIGMA_FT"));
+    app_log(2, "      - geigenvalues loop:          {0:.3f} sec", _Timer.elapsed("EIGSPEC_GEEV"));
+    app_log(2, "      - allreduce:                  {0:.3f} sec\n", _Timer.elapsed("EIGSPEC_REDUCE"));
   }
 
 private:

@@ -74,6 +74,7 @@ namespace methods {
         app_log(2, "      - Hadamard product:    {0:.3f} sec", _Timer.elapsed("SIGMA_HADPROD_R"));
         app_log(2, "      - Sigma_uv -> Sigma_ij {0:.3f} sec", _Timer.elapsed("SIGMA_AUX_TO_PRIM"));
       }
+      app_log(2, "    Sigma_div_correction:    {0:.3f} sec", _Timer.elapsed("SIGMA_DIV_CORR"));
       app_log(2, "    Imaginary FT tau->w:     {0:.3f} sec", _Timer.elapsed("IMAG_FT_TtoW"));
       app_log(2, "    Imaginary FT w->tau:     {0:.3f} sec", _Timer.elapsed("IMAG_FT_WtoT"));
       app_log(2, "      - FT_REDISTRIBUTE:     {0:.3f} sec\n", _Timer.elapsed("FT_REDISTRIBUTE"));

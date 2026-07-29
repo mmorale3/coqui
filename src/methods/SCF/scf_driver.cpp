@@ -51,7 +51,10 @@ auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_ax
                "SCF loop: mpi context of mb_state and mb_eri should be the same!");
   utils::check(&FT == mb_state.ft,
                "SCF loop: imag_axes_ft of mb_state and scf_loop should be the same!");
-  for( auto& v: {"SCF_TOTAL", "DYSON", "MBPT_SOLVERS", "ITERATIVE", "WRITE"} ) {
+  // HERMITIZE and ENERGY exist so the children sum to SCF_TOTAL: without them
+  // ~2% of the loop sat in the gap between the four phase timers.
+  for( auto& v: {"SCF_TOTAL", "DYSON", "MBPT_SOLVERS", "ITERATIVE", "WRITE",
+                 "HERMITIZE", "ENERGY"} ) {
     Timer.add(v);
   }
   // http://patorjk.com/software/taag/#p=display&f=Calvin%20S&t=COQUI%20dyson-scf
@@ -186,11 +189,13 @@ auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_ax
       mpi->comm.barrier();
     }
 
+    Timer.start("HERMITIZE");
     if (mpi->node_comm.root()) {
       hermitize(sF_skij.local(), "Fock matrix");
       hermitize(sSigma_tskij.local(), "dynamic self-energy");
     }
     mpi->comm.barrier();
+    Timer.stop("HERMITIZE");
     Timer.stop("MBPT_SOLVERS");
 
 
@@ -205,17 +210,21 @@ auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_ax
     Timer.start("DYSON");
     // whether to update mu depends on const_mu
     update_G(dyson, *mf, FT, sDm_skij, sG_tskij, sF_skij, sSigma_tskij, mu, const_mu);
+    Timer.start("HERMITIZE");
     if (mpi->node_comm.root()) {
       hermitize(sDm_skij.local(), "density matrix");
       hermitize(sG_tskij.local(), "Green's function");
     }
     mpi->comm.barrier();
+    Timer.stop("HERMITIZE");
     Timer.stop("DYSON");
 
 
+    Timer.start("ENERGY");
     auto k_weight = mf->k_weight();
     auto [e_1e, e_hf] = eval_hf_energy(sDm_skij, sF_skij, dyson.sH0_skij(), k_weight, false);
     double e_corr = (mb_solver.corr != nullptr)? eval_corr_energy(mpi->comm, FT, sG_tskij, sSigma_tskij, k_weight) : 0.0;
+    Timer.stop("ENERGY");
     energies_diff = {e_1e - energies[0], e_hf - energies[1], e_corr - energies[2]};
     energies = {e_1e, e_hf, e_corr, e_1e+e_hf+e_corr};
 
@@ -252,7 +261,13 @@ auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_ax
   app_log(2, "    Dyson:                {0:.3f} sec", Timer.elapsed("DYSON"));
   app_log(2, "    MBPT solvers:         {0:.3f} sec", Timer.elapsed("MBPT_SOLVERS"));
   app_log(2, "    Iterative alg:        {0:.3f} sec", Timer.elapsed("ITERATIVE"));
-  app_log(2, "    Write:                {0:.3f} sec\n", Timer.elapsed("WRITE"));
+  app_log(2, "    Write:                {0:.3f} sec", Timer.elapsed("WRITE"));
+  app_log(2, "    Energies:             {0:.3f} sec", Timer.elapsed("ENERGY"));
+  // Nested inside DYSON / MBPT_SOLVERS, so not part of the residual below.
+  app_log(2, "    (of which hermitize:  {0:.3f} sec)", Timer.elapsed("HERMITIZE"));
+  app_log(2, "    (unaccounted):        {0:.3f} sec\n",
+          Timer.elapsed("SCF_TOTAL") - Timer.elapsed("DYSON") - Timer.elapsed("MBPT_SOLVERS")
+          - Timer.elapsed("ITERATIVE") - Timer.elapsed("WRITE") - Timer.elapsed("ENERGY"));
 
   app_log(1, "####### SCF routines end #######\n");
   return std::make_tuple(energies[0]+energies[1], energies[2]);
