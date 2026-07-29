@@ -10,6 +10,34 @@ printed into context at session start by a SessionStart hook).
 
 ## STATUS
 
+**RPA INSTABILITY RESOLVED (2026-07-29).** The Si PAW RPA blow-up at large band
+count was `V_LL` conjugating the FIRST index of Z instead of the second, storing
+its transpose (commit 86ace47). EOS spread 107.16 -> 3.75 mHa against ABINIT's
+3.57. Follow-up 44c79e9 replaced the q=0-only augmentation-channel ranking with
+a max-over-q-mesh criterion and made `paw_isdf_tol` RELATIVE rather than
+absolute. Details: notes/paw_article_results/rpa_instability_localization.md
+§11-§15.
+
+Two testing invariants this exposed, which apply to ANY future change to the
+ERI representation:
+- **Off-diagonal ERIs must be tested.** The entire suite probed only diagonal
+  (vc|cv); the diagonal of a Hermitian matrix is real, so a transposed block is
+  invisible there, to a Hermiticity check, and to an oscillator comparison.
+  `Tr(Pi*Z)` uses only the diagonal; `ln|det(I-Pi*Z)|` uses the whole matrix.
+- **Validate an EOS on B0/B', not a0.** Pre-fix a0 was 10.2293 Bohr — within
+  0.015 of the reference — while B0 was 45 GPa against 98 and B' 1.63 against
+  ~4, at a 0.002 mHa Birch-Murnaghan residual. A smooth-in-volume error shifts
+  the curve far more than it tilts it, and goodness of fit says nothing.
+- **LiH fixtures cannot see this class of bug** (eta is nearly real there); it
+  needs a multi-atom d-channel system such as Si jth_with_d.
+
+REMAINING: harvest + fit the 6-volume Si EXX+RPA EOS
+(`~/ceph/CoQui/abinit/eos_exxrpa`, tooling in notes/paw_article_results/
+eos_exxrpa_{harvest.sh,fit.py}); a10.05 done at E_c = -0.437371. Regenerate any
+EOS/GW number produced before 86ace47. Sync the rusty tree past 44c79e9 once
+the series finishes (not mid-campaign — it would make volumes inconsistent,
+though at paw_isdf_tol=1e-8 the selection change is a no-op).
+
 REMAINING TO COMPLETE THE PHASE (2026-07-26 session):
 - **Static-route selection COMPLETE (2026-07-26, phases 0-4)**: the
   "future set_H route-selection project" (I5/I7, workstream-D preamble) is
