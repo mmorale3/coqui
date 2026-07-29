@@ -798,3 +798,46 @@ A given numeric `paw_isdf_tol` is therefore NOT equivalent between the two
 rules, and old inputs should be re-read with that in mind. The default (1e-12)
 is safe under either reading: relative-1e-12 requires a pair to be 1e-24 of the
 largest in squared norm before it is dropped, i.e. effectively full rank.
+
+## 16. Which pre-86ace47 numbers are actually invalid (regeneration triage)
+
+"Regenerate everything" is the wrong instruction — most of the campaign is
+untouched, and knowing why is the same argument that explains the nine-month
+blindness.
+
+**Criterion.** Z is Hermitian, so storing Z^T maps any quantity to its complex
+conjugate that has the form of a Hermitian quadratic form
+
+    S = sum_PQ A_P Z_PQ conj(A_Q)        (real, hence S -> S: INVARIANT)
+
+Anything built from a single vector contracted against Z on both sides is
+therefore unaffected. Quantities that contract Z between DIFFERENT vectors, or
+that apply a non-linear matrix function to it, are not.
+
+**INVARIANT — do not regenerate:**
+- All diagonal ERIs (vc|cv), hence every D0/D1-style accuracy number.
+- `Tr(Pi*Z) = -sum_ia (ia|ai)` — measured drift 0.003%.
+- E_Hartree.
+- E_X. The exchange integral (ij|ji) = int int rho_ij v conj(rho_ij) is a
+  Hermitian quadratic form in rho_ij, real and non-negative, so it is invariant
+  even for i != j. This is why the cross-converter E_X parity (40 uHa) and the
+  ABINIT smooth-exchange agreement held all along WITH the bug present.
+- Everything static: deeq, becsum, V_H/V_x route equivalence, the I1-I8
+  acceptance tests, the whole fast PAW suite (bit-identical across the fix).
+- The ABINIT oscillator comparison — pair densities were never touched.
+
+**INVALID — must be regenerated:**
+- **RPA correlation energies** on any PAW/USPP system. `ln|det(I - Pi*Z)|`
+  applies a matrix function to Z and carried the entire 145 mHa.
+- **GW**: W = Z(I - Pi*Z)^-1 inherits it, so Sigma_c and every quasiparticle
+  energy from a PAW/USPP THC run are affected. Sigma_x is not (see E_X above).
+- Any EOS built from the above — including all six volumes of
+  `eos_conv500_coqui` and the a0/B0 fitted from them (§15).
+
+**UNAFFECTED BY CONSTRUCTION:** all NCPP/ONCV results. There is no augmentation
+block, hence no V_LL, hence nothing to transpose. That is precisely what makes
+the ONCV RPA@PBE 10.228 Bohr / 101 GPa a usable reference for judging the
+post-fix PAW EOS rather than a co-contaminated one.
+
+Practical consequence: the regeneration list is "PAW/USPP RPA and GW", not "the
+campaign". The static/exchange/converter validation work stands.
