@@ -1689,16 +1689,29 @@ namespace solvers {
     // sandwich) and pinned end-to-end by test_vertex_fdoracle.
     nda::array<ComplexType, 5> Sigma_r;
     if (stat) {
-      // IBZ: NOT YET IMPLEMENTED for Sigma^{C,r}, and note WHY the obvious route does
-      // not work. Every other vertex kernel is C-restricted, so the vertex symmetry
-      // context carries only the C-WINDOW effective collocation columns
-      // (vertex_sym::sym_ctx::Xhat is (ns, nsym, nk, naux, nc)). Sigma^{C,r} is the one
-      // object with FULL-SPACE legs -- its Gt and its externals live in W0's unprojected
-      // RPA bubble -- so Xhat is the wrong tool for it. It needs the PLAIN GW pattern
-      // instead (gw_t::eval_Sigma_all_kspace: accumulate at IBZ k in the aux basis, then
-      // unfold with MF->symmetry_rotation over MF->qsymms()), which is cheap here because
-      // Sigma^{C,r} carries a SINGLE transfer q -- no two-rung unfolding.
-      // Gate for that work: sym-vs-nosym agreement, the vertex_ibz gold pattern.
+      // IBZ: NOT YET IMPLEMENTED for Sigma^{C,r}. What is missing is NOT an "upfold":
+      // Sigma^C needs none either -- its externals are C bands by construction, so it is
+      // block-copied into the C-C block of the IBZ-resident Sigma below, and the
+      // IBZ -> full-BZ unfolding of the TOTAL self-energy is downstream machinery that
+      // already uses the full-band D. Xhat exists for a different job: sourcing the RUNG
+      // at non-IBZ TRANSFERS inside the (qx,qy) double sum.
+      //
+      // Sigma^{C,r} is structurally a GW-CLASS term, not a vertex-class one: a single
+      // transfer q, one Hadamard against a static rung, full-space Gt, the same
+      // aux_to_primary. Two things break under symmetry as this kernel is written:
+      //   (1) the rung Dw would have to be sourced at non-IBZ transfers, and the vertex's
+      //       trick for that (Xhat) carries C-window columns only;
+      //   (2) more fundamentally, it consumes FULL-BAND G at FULL-BZ k-+q. The vertex can
+      //       expand G_CC from IBZ to the full BZ only because inside the C window the
+      //       image points are gauge copies (identity D by convention) with a transpose at
+      //       trev points -- a C-window gauge convention that is NOT valid over the full
+      //       band range.
+      // The fix is to follow gw_t::eval_Sigma_all_kspace (thc_gw.icc:287-316), which
+      // dodges BOTH: keep G in the aux basis at IBZ (primary_to_aux with kp_to_ibz /
+      // kp_trev), keep the rung at IBZ q, loop isym over MF->qsymms(), map the
+      // collocation with MF->ks_to_k(isym) in aux_to_primary, and rotate the BAND-SPACE
+      // output with the sparse full-band D of MF->symmetry_rotation. No full-band Xhat is
+      // ever needed. Gate: sym-vs-nosym agreement, the vertex_ibz gold pattern.
       utils::check(not sym_mesh,
                    "vertex_t::eval_Sigma_C: vertex_rung = \"{}\" on a SYMMETRY-REDUCED "
                    "mesh is not supported yet. Sigma^(C,r) has FULL-SPACE legs, so it "
