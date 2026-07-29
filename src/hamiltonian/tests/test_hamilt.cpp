@@ -1928,7 +1928,8 @@ void test_thc_vs_direct_VH_VX(mpi_context_t& mpi,
                               double tol_VX = 5e-3,
                               bool strict_VH = true,
                               bool strict_VX = true,
-                              bool nonqe_occ = false)
+                              bool nonqe_occ = false,
+                              double tol_VX_off_rel = 5e-3)
 {
   using math::shm::make_shared_array;
   auto all = nda::range::all;
@@ -2019,6 +2020,38 @@ void test_thc_vs_direct_VH_VX(mpi_context_t& mpi,
   // Off-diagonal ΔV_H and the spread of the diagonal Δ (a k-independent
   // constant diagonal shift = pure G=0/monopole accounting difference).
   double max_dVH_off = 0.0, diag_re_min = 1e300, diag_re_max = -1e300;
+  // OFF-DIAGONAL V_x, tracked separately from the full max.
+  //
+  // Why this needs its own metric even though max_dVX already covers every
+  // (i,j): V_x(i,j) = -sum_a n_a (ia|aj) is a Hermitian quadratic form ONLY
+  // when i == j, so a Z stored as its transpose leaves the diagonal (and hence
+  // E_x, E_H, and every diagonal ERI) exactly invariant while corrupting the
+  // off-diagonal. That is precisely the V_LL bug of 2026-07-29, and the
+  // diagonal outnumbers nothing here — a single global max is dominated by the
+  // large diagonal elements, so an off-diagonal defect can hide inside a
+  // passing max_dVX. Resolving it separately, and normalising to the
+  // off-diagonal scale, is what makes this sensitive.
+  //
+  // Off-diagonal self-energy is genuinely consumed downstream: qp_approx
+  // (scf_common.hpp) forms off-diagonal V_corr_ab in both modes and scGW
+  // carries the full Sigma_skij, so this is not a cosmetic check.
+  //
+  // HONEST SCOPE — measured 2026-07-29, do not overstate what this guards.
+  // The V_LL transpose was deliberately re-injected into BOTH gemm sites and
+  // this comparison was rerun: every number below came back BYTE-IDENTICAL on
+  // all four sections, LiH and the ABINIT Si fixture alike. The known-sensitive
+  // OFFDIAG probe in paw_thc_vs_exact_eri also stayed at 0.999526. So on every
+  // fixture available locally the transpose is genuinely a no-op — eta is
+  // (near-)real there — and NO local test can catch it, this one included.
+  // It showed up as 1.390937 only on the rusty Si jth_with_d dataset (4x4x4,
+  // 500 bands, d-channels), where eta is strongly complex.
+  //
+  // What this assertion therefore buys: general off-diagonal route-equivalence
+  // coverage against defects that DO manifest on these fixtures. What it does
+  // NOT buy: protection against a transposed/mis-conjugated Z. That guard is
+  // paw_thc_vs_exact_eri's OFFDIAG probe run on a strongly-complex-eta system,
+  // which is [!benchmark] and must be run explicitly on the cluster.
+  double max_dVX_off = 0.0, max_VX_off = 0.0;
 
   auto rng_s = dVH_direct.local_range(0);
   auto rng_k = dVH_direct.local_range(1);
@@ -2037,9 +2070,11 @@ void test_thc_vs_direct_VH_VX(mpi_context_t& mpi,
           max_VX  = std::max(max_VX,  std::abs(vx_dir));
           max_dVH = std::max(max_dVH, std::abs(vh_thc - vh_dir));
           max_dVX = std::max(max_dVX, std::abs(vx_thc - vx_dir));
-          if (i != j)
+          if (i != j) {
             max_dVH_off = std::max(max_dVH_off, std::abs(vh_thc - vh_dir));
-          else {
+            max_dVX_off = std::max(max_dVX_off, std::abs(vx_thc - vx_dir));
+            max_VX_off  = std::max(max_VX_off,  std::abs(vx_dir));
+          } else {
             diag_re_min = std::min(diag_re_min, (vh_thc - vh_dir).real());
             diag_re_max = std::max(diag_re_max, (vh_thc - vh_dir).real());
           }
@@ -2049,6 +2084,8 @@ void test_thc_vs_direct_VH_VX(mpi_context_t& mpi,
   max_dVH = mpi.comm.all_reduce_value(max_dVH, boost::mpi3::max<>{});
   max_dVX = mpi.comm.all_reduce_value(max_dVX, boost::mpi3::max<>{});
   max_dVH_off = mpi.comm.all_reduce_value(max_dVH_off, boost::mpi3::max<>{});
+  max_dVX_off = mpi.comm.all_reduce_value(max_dVX_off, boost::mpi3::max<>{});
+  max_VX_off  = mpi.comm.all_reduce_value(max_VX_off,  boost::mpi3::max<>{});
   diag_re_min = mpi.comm.all_reduce_value(diag_re_min, boost::mpi3::min<>{});
   diag_re_max = mpi.comm.all_reduce_value(diag_re_max, boost::mpi3::max<>{});
 
@@ -2080,7 +2117,17 @@ void test_thc_vs_direct_VH_VX(mpi_context_t& mpi,
   app_log(2,
     "THC vs direct V_x: max|V_x| = {:.3e}, max|ΔV_x| = {:.3e} "
     "(rel = {:.2e})", max_VX, max_dVX, max_dVX / std::max(1e-30, max_VX));
-  if (strict_VX) CHECK(max_dVX < tol_VX);
+  app_log(2,
+    "  V_x OFF-DIAGONAL: max|V_x(i≠j)| = {:.3e}, max|ΔV_x(i≠j)| = {:.3e} "
+    "(rel = {:.2e})", max_VX_off, max_dVX_off,
+    max_dVX_off / std::max(1e-30, max_VX_off));
+  if (strict_VX) {
+    CHECK(max_dVX < tol_VX);
+    // Relative to the OFF-DIAGONAL scale, not the global one: the diagonal is
+    // typically orders of magnitude larger, so normalising by max|V_x| would
+    // make this assertion vacuous.
+    CHECK(max_dVX_off < tol_VX_off_rel * std::max(1e-30, max_VX_off));
+  }
   else app_log(2, "  (V_x diagnostic mode: ΔV_x reported above, not asserted)");
   if (strict_VH) CHECK(max_dVH < tol_VH);
   else app_log(2, "  (V_H diagnostic mode: ΔV_H reported above, not asserted)");

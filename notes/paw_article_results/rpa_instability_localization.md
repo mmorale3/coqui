@@ -851,3 +851,47 @@ post-fix PAW EOS rather than a co-contaminated one.
 
 Practical consequence: the regeneration list is "PAW/USPP RPA and GW", not "the
 campaign". The static/exchange/converter validation work stands.
+
+## 17. The local test suite CANNOT catch the transpose — measured, not assumed
+
+Adding an off-diagonal self-energy guard was the obvious follow-up to §16, since
+`qp_approx` and scGW both consume off-diagonal Sigma. It was added
+(`test_thc_vs_direct_VH_VX` now resolves `max|ΔV_x(i≠j)|` against the
+off-diagonal scale rather than burying it under the much larger diagonal). But
+the important result is the validation, not the test.
+
+**Experiment.** The V_LL transpose was deliberately re-injected into BOTH gemm
+sites — `conj` on the first index, `transpose` on the second, i.e. exactly the
+pre-86ace47 code — and the suite rerun.
+
+**Result: byte-identical.** All four sections of `thc_vs_direct_VH_VX` (three
+LiH, one ABINIT Si) returned the same numbers to every printed digit, and the
+known-sensitive `paw_thc_vs_exact_eri` OFFDIAG probe stayed at 0.999526.
+
+    fixture                          OFFDIAG / dVX_off   with bug   without bug
+    qe_lih222_{hf,uspp_hf,paw_hf}    rel 1.9e-4..6.4e-4  identical  identical
+    bdft_si222_paw_ab                rel 1.89e-4         identical  identical
+
+So on every fixture that exists locally the transpose is a genuine no-op: eta is
+(near-)real on all of them. The 1.390937 -> 0.999942 signal appeared ONLY on the
+rusty Si `jth_with_d` dataset (4x4x4, 500 bands, d-channels, two atoms at
+inequivalent positions), where eta is strongly complex.
+
+**Consequences, which matter more than the test itself:**
+
+1. "The fast PAW suite was bit-identical across the fix" was never evidence that
+   the fix was inert — it is evidence that the suite is BLIND to this class of
+   defect. Do not read a green local suite as coverage of Z's conjugation.
+2. The only real guard is `paw_thc_vs_exact_eri`'s OFFDIAG probe run on a
+   strongly-complex-eta system. It is `[!benchmark]`, so it does NOT run in
+   `"[paw]~[slow]"` and must be launched explicitly on the cluster after any
+   change to the ERI representation.
+3. A fixture with strongly complex eta (Si jth_with_d or equivalent: multi-atom,
+   d-channels, atoms off a real-structure-factor origin) is the single most
+   valuable addition the local suite could get. Until then, local green is a
+   weaker statement than it looks.
+
+The added off-diagonal V_x assertion is still worth keeping — it covers
+off-diagonal route-equivalence defects that DO manifest on these fixtures — but
+it must not be cited as protection against a mis-conjugated Z. Its own comment
+says so.
