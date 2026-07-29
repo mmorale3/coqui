@@ -1689,11 +1689,23 @@ namespace solvers {
     // sandwich) and pinned end-to-end by test_vertex_fdoracle.
     nda::array<ComplexType, 5> Sigma_r;
     if (stat) {
+      // IBZ: NOT YET IMPLEMENTED for Sigma^{C,r}, and note WHY the obvious route does
+      // not work. Every other vertex kernel is C-restricted, so the vertex symmetry
+      // context carries only the C-WINDOW effective collocation columns
+      // (vertex_sym::sym_ctx::Xhat is (ns, nsym, nk, naux, nc)). Sigma^{C,r} is the one
+      // object with FULL-SPACE legs -- its Gt and its externals live in W0's unprojected
+      // RPA bubble -- so Xhat is the wrong tool for it. It needs the PLAIN GW pattern
+      // instead (gw_t::eval_Sigma_all_kspace: accumulate at IBZ k in the aux basis, then
+      // unfold with MF->symmetry_rotation over MF->qsymms()), which is cheap here because
+      // Sigma^{C,r} carries a SINGLE transfer q -- no two-rung unfolding.
+      // Gate for that work: sym-vs-nosym agreement, the vertex_ibz gold pattern.
       utils::check(not sym_mesh,
                    "vertex_t::eval_Sigma_C: vertex_rung = \"{}\" on a SYMMETRY-REDUCED "
-                   "mesh is not supported yet (Sigma^(C,r) has a single transfer q and "
-                   "takes the plain GW symmetry pattern -- increment S6). Run with a "
-                   "symmetry-free mesh for now.", rung_str());
+                   "mesh is not supported yet. Sigma^(C,r) has FULL-SPACE legs, so it "
+                   "cannot use the vertex symmetry context (whose Xhat is C-window only); "
+                   "it needs the plain GW unfolding path. Run on a symmetry-free mesh "
+                   "(nosym = noinv = .true. in the QE nscf) until that lands.",
+                   rung_str());
       auto const& W0b_r = _W0b_qmm.value();
       vertex_pi::iaft_tools tools(*_ft);
       nda::array<long, 2> kpq(nqpts, nkpts);
