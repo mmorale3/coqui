@@ -21,12 +21,59 @@
 
 #include <cmath>
 
+#include <cstdlib>
+#include <map>
+#include <thread>
+#include <vector>
+
 #include "methods/SCF/simple_dyson.h"
 #include "nda/h5.hpp"
 #include "nda/linalg.hpp"
 #include "nda/nda.hpp"
 
 namespace methods {
+
+namespace {
+
+  /**
+   * Threads for the eigenvalue loop in compute_eigenspectra.
+   *
+   * The eigensolves are independent and they are the only thing running at that
+   * point, while a GPU rank typically owns many more cores than it uses: with
+   * one rank per GPU the job holds 16 cores per rank and 15 sit idle. Measured
+   * on an A100 node (n=500, 137 problems = one rank's share at 8 ranks):
+   * 27.5 s on one core, 1.9 s on sixteen. The device is not the answer here --
+   * cuSOLVER's Xgeev is 1.6x one core and 4.4 s across four streams, MAGMA's
+   * hybrid zgeev 1.15x -- because non-symmetric eigensolves do not map to GPUs
+   * and the CUDA stack has no batched form of them at this size.
+   *
+   * std::thread rather than OpenMP: the build sets ENABLE_OPENMP=OFF, so a
+   * pragma would silently do nothing. LAPACK inside each thread must stay
+   * sequential, which OMP_NUM_THREADS=1 (what every run script sets) ensures;
+   * the count is divided by OMP_NUM_THREADS otherwise, so a threaded BLAS
+   * cannot oversubscribe.
+   */
+  int eigenspectra_threads()
+  {
+    static const int nthreads = []() {
+      auto env_int = [](const char* name) -> long {
+        const char* v = std::getenv(name);
+        if (v == nullptr) return 0;
+        long n = std::strtol(v, nullptr, 10);
+        return (n > 0) ? n : 0;
+      };
+      long n = env_int("COQUI_EIG_THREADS");
+      if (n > 0) return int(n);
+      long budget = env_int("SLURM_CPUS_PER_TASK");
+      if (budget <= 0) return 1;
+      long per_blas = env_int("OMP_NUM_THREADS");
+      if (per_blas > 1) budget /= per_blas;
+      return int((budget > 0) ? budget : 1);
+    }();
+    return nthreads;
+  }
+
+}
 
   template<typename G_t, typename F_t, typename Sigma_t>
   void simple_dyson::solve_dyson(G_t &_G_shm,
@@ -154,9 +201,7 @@ namespace methods {
     using math::shm::make_shared_array;
     _Timer.start("EIGSPEC");
     spectra() = 0.0;
-    nda::matrix<ComplexType> FpSigma(_nbnd, _nbnd);
     auto sS_inv = make_shared_array<Array_view_4D_t>(*_context, {_ns, _nkpts_ibz, _nbnd, _nbnd});
-    nda::matrix<ComplexType> SFS(_nbnd, _nbnd);
     auto S  = _sS_skij.local();
     auto H0 = _sH0_skij.local();
     auto F  = _sF_skij.local();
@@ -175,32 +220,100 @@ namespace methods {
     sS_inv.win().fence();
     _Timer.stop("EIGSPEC_SINV");
 
-    // Batched tau_to_w: one big gemm computes Sigma(w) for ALL w at
-    // once, instead of calling the single-w-slice variant 138 times
-    // (which re-walks the 8.8 GB Sigma host tensor each call).
-    // Memory cost: ~ nw * ns * nkpts * nbnd^2 * 16 bytes on host
-    // (4.4 GB at the n=500 Si scale; well within node RAM).
-    // NOTE: every rank builds the whole Sigma(w) here, so this transform is
-    // done n_ranks times over redundantly, unlike the geev loop below which is
-    // distributed over w. Timed separately to size that redundancy.
+    // Sigma(tau) is Hermitian -- scf_loop hermitizes it every iteration -- and
+    // the fermionic Matsubara mesh is symmetric, so Sigma(-iw) = Sigma(iw)^H.
+    // With S, H0 and F Hermitian, A(-iw) = S^-1 (H0+F+Sigma(iw)^H) is similar
+    // to A(iw)^H (S^-1 B and B S^-1 are similar), so its eigenvalues are the
+    // conjugates of A(iw)'s. Diagonalizing the positive half of the mesh and
+    // conjugating therefore halves the work exactly. Verified against the full
+    // loop before this was switched on; if a grid ever turns up that is not
+    // symmetric (or contains w=0) we fall back to every frequency.
+    nda::array<long, 1> mirror(_nw);
+    bool symmetric_mesh = true;
+    {
+      auto wn = _FT->wn_mesh();
+      std::map<long, long> pos_of;
+      for (long n = 0; n < long(_nw); ++n) pos_of[wn(n)] = n;
+      for (long n = 0; n < long(_nw); ++n) {
+        auto it = pos_of.find(-wn(n));
+        if (wn(n) == 0 or it == pos_of.end()) { symmetric_mesh = false; break; }
+        mirror(n) = it->second;
+      }
+    }
+
+    // Frequencies this rank owns: the positive half, strided over ranks. Each
+    // (n,is,ik) is written by exactly one rank, so the all-reduce below still
+    // just sums disjoint contributions.
+    std::vector<long> local_w;
+    {
+      auto wn = _FT->wn_mesh();
+      long j = 0;
+      for (long n = 0; n < long(_nw); ++n) {
+        if (symmetric_mesh and wn(n) < 0) continue;   // covered by its mirror
+        if (j % _context->comm.size() == _context->comm.rank()) local_w.push_back(n);
+        ++j;
+      }
+    }
+    const long nwl = long(local_w.size());
+
+    // Transform only this rank's frequencies. tau_to_w is one gemm against the
+    // (nw x nt) transform matrix, so a row subset gives a partial transform:
+    // the buffer drops from nw to nwl (4.4 GB -> ~0.3 GB per rank at 8 ranks,
+    // which is also most of B5) and the gemm from nw to nwl rows. Every rank
+    // used to build the entire Sigma(w) and then use 1/n_ranks of it.
     _Timer.start("EIGSPEC_SIGMA_FT");
-    nda::array<ComplexType, 5> Sigmaw_wskij(_nw, _ns, _nkpts_ibz, _nbnd, _nbnd);
-    _FT->tau_to_w(_Sigma_shm.local(), Sigmaw_wskij, imag_axes_ft::fermi);
+    nda::array<ComplexType, 5> Sigmaw_wskij(std::max(nwl, 1l), _ns, _nkpts_ibz, _nbnd, _nbnd);
+    if (nwl > 0) {
+      auto Twt = _FT->Twt_ff();
+      nda::array<ComplexType, 2> Twt_loc(nwl, Twt.shape(1));
+      for (long j = 0; j < nwl; ++j)
+        Twt_loc(j, nda::range::all) = Twt(local_w[j], nda::range::all);
+      long dim1 = long(_ns)*_nkpts_ibz*_nbnd*_nbnd;
+      auto S_ti_2D = nda::reshape(_Sigma_shm.local(), std::array<long,2>{long(_FT->nt_f()), dim1});
+      auto S_wi_2D = nda::reshape(Sigmaw_wskij, std::array<long,2>{nwl, dim1});
+      nda::blas::gemm(Twt_loc, S_ti_2D, S_wi_2D);
+    }
     _Timer.stop("EIGSPEC_SIGMA_FT");
 
     _Timer.start("EIGSPEC_GEEV");
-    for (size_t n = _context->comm.rank(); n < _nw; n+=_context->comm.size()) {
-      for (size_t i = 0; i < _ns*_nkpts_ibz; ++i) {
-        size_t is = i / _nkpts_ibz; // i = is * _nkpts_ibz + ik
-        size_t ik = i % _nkpts_ibz;
-        auto Sigma_ij = Sigmaw_wskij(n, is, ik, nda::range::all, nda::range::all);
-        FpSigma = H0(is, ik, nda::ellipsis{}) + F(is, ik, nda::ellipsis{}) + Sigma_ij;
-        nda::blas::gemm(ComplexType(1.0), S_inv(is, ik, nda::range::all, nda::range::all), FpSigma,
-                        ComplexType(0.0), SFS);
-
-        auto eigvals = spectra(n, is, ik, nda::range::all);
-        // Matsubara quantities are not Hermitian!
-        eigvals = nda::linalg::geigenvalues(SFS);
+    {
+      const long ntask = nwl*long(_ns*_nkpts_ibz);
+      const int nthreads = std::max(1, std::min<int>(eigenspectra_threads(),
+                                                     int(std::min<long>(ntask, 1024))));
+      auto worker = [&](int tid) {
+        // Per-thread scratch: nda's geigenvalues copies into its own workspace,
+        // so the only sharing is the read-only S_inv/H0/F and disjoint writes
+        // into spectra.
+        nda::matrix<ComplexType> FpSigma_t(_nbnd, _nbnd), SFS_t(_nbnd, _nbnd);
+        for (long task = tid; task < ntask; task += nthreads) {
+          long j = task / long(_ns*_nkpts_ibz);
+          long i = task % long(_ns*_nkpts_ibz);
+          long n = local_w[j];
+          size_t is = size_t(i) / _nkpts_ibz;  // i = is * _nkpts_ibz + ik
+          size_t ik = size_t(i) % _nkpts_ibz;
+          auto Sigma_ij = Sigmaw_wskij(j, is, ik, nda::range::all, nda::range::all);
+          FpSigma_t = H0(is, ik, nda::ellipsis{}) + F(is, ik, nda::ellipsis{}) + Sigma_ij;
+          nda::blas::gemm(ComplexType(1.0), S_inv(is, ik, nda::range::all, nda::range::all),
+                          FpSigma_t, ComplexType(0.0), SFS_t);
+          // Matsubara quantities are not Hermitian: Sigma(iw)^H = Sigma(-iw),
+          // and S^-1 (H0+F+Sigma) is not Hermitian even where the sum is, so
+          // this is a general eigenvalue problem and heev/hegv do not apply.
+          auto eigvals = nda::linalg::geigenvalues(SFS_t);
+          spectra(n, is, ik, nda::range::all) = eigvals;
+          if (symmetric_mesh) {
+            long nm = mirror(n);
+            for (long b = 0; b < long(_nbnd); ++b)
+              spectra(nm, is, ik, b) = std::conj(eigvals(b));
+          }
+        }
+      };
+      if (nthreads <= 1) {
+        worker(0);
+      } else {
+        std::vector<std::thread> pool;
+        pool.reserve(nthreads);
+        for (int tid = 0; tid < nthreads; ++tid) pool.emplace_back(worker, tid);
+        for (auto& th : pool) th.join();
       }
     }
     _Timer.stop("EIGSPEC_GEEV");
