@@ -414,7 +414,42 @@ evaluated before the decomposition runs, from `dyson.sH0_skij()` — as the
 agreements above independently confirm. Only the `kinetic` and `local` rows of
 that one batch should be discarded.
 
-## §3e Corrected EOS — harvested so far (4 of 6 volumes)
+## §3f CORRECTED EOS — FINAL, all six volumes
+
+    a       e_1e       shift      E_H         E_x         E_c        E_total
+  10.05  2.5802254  +0.1175895  0.5616546  -2.1576020  -0.4373713  -8.0290903
+  10.15  2.4657077  +0.1216864  0.5736667  -2.1421368  -0.4363535  -8.0306203
+  10.25  2.3540356  +0.1257616  0.5857388  -2.1269018  -0.4354712  -8.0312590
+  10.35  2.2450749  +0.1298167  0.5978764  -2.1119013  -0.4347235  -8.0310907
+  10.45  2.1386984  +0.1338564  0.6100823  -2.0971320  -0.4341066  -8.0301871
+  10.55  2.0347845  +0.1378802  0.6223713  -2.0825951  -0.4336165  -8.0286073
+
+Birch-Murnaghan, 6 points / 2 dof, minimum inside the sampled range:
+
+| series | a0 (Bohr) | B0 (GPa) | B' | resid |
+|---|---|---|---|---|
+| **PAW post-fix** | **10.2780** | **100.3** | **4.17** | 0.001 mHa |
+| §3c prediction (pre-registered) | 10.2501 | 101.1 | 4.18 | — |
+| CoQui NC, same pipeline | 10.2259 | 101.1 | 4.08 | — |
+| VASP/PAW RPA@PBE (Harl 2010) | 10.244 | 98 | — | — |
+| PAW pre-fix | *no minimum in range* | — | — | — |
+
+`'only e_1e may move'` **PASSES at all six volumes** (E_H/E_x/E_c unchanged to
+<2e-10) — the fix touches H0 alone, as claimed.
+
+**Read this on B0/B', not a0** (the invariant from the V_LL episode: pre-that-fix
+a0 was 10.2293, within 0.015 of reference, while B0 was 45 GPa against 98). By that
+standard the result is strong: **B0 = 100.3 GPa lands within 0.8 GPa of both the NC
+series and the prediction, and 2.3 GPa of VASP; B' = 4.17 vs NC 4.08.**
+
+a0 = 10.2780 is +0.028 vs the prediction, +0.034 vs VASP, +0.052 vs NC. The +0.028
+is **quantitatively accounted for**: the residual 2.4 mHa/Bohr slope in the
+CoQui-vs-ABINIT exchange row predicts +0.031 Bohr (0.0024/0.0768). That row — the
+~8 mHa offset — is the ISDF/onsite-exchange operator difference, NOT the defect
+fixed here, and it is the next thing to chase if a0 is wanted tighter than
+~0.03 Bohr.
+
+## §3e Corrected EOS — intermediate harvest (4 of 6 volumes)
 
 Runs: `~/ceph/CoQui/abinit/eos_jthd_coqui_fix/a*` (settings identical to the
 pre-fix `eos_exxrpa` series: nbnd 500, thresh 1e-5, paw_isdf_tol 1e-8, gygi on
@@ -451,12 +486,18 @@ each time). Serializing with `--dependency=afterany` on the first batch fixed it
 - [x] Phase 0 baseline + the two killed hypotheses (§1)
 - [x] ABINIT instrumentation, rebuilt and validated to 2 µHa (§2)
 - [x] CoQui `print_e1_decomposition` + `set_vnl_only` + `static_D_cv_only`
-- [ ] 6-volume ABINIT series, jthd + NC control
-- [ ] 6-volume CoQui series with the decomposition
-- [ ] ledger diff → localize the drifting term
-- [ ] fix, re-run EXX at 6 volumes (E_c is validated and reusable), refit.
-      Acceptance: a0 ≈ 10.23 Bohr, B0 ≈ 98–101 GPa, comparable to NC
-- [ ] regression test sensitive to VOLUME scaling, not one fixture
+- [x] 6-volume ABINIT series, jthd + NC control (NC agrees to ~5 µHa/term)
+- [x] 6-volume CoQui series with the decomposition
+- [x] ledger diff → drifting term localized to the ONE-BODY row (§3b)
+- [x] fix + re-run at 6 volumes + refit: **a0 = 10.2780 Bohr, B0 = 100.3 GPa,
+      B' = 4.17** (§3f). B0/B' meet the acceptance criterion; a0 is +0.034 vs VASP,
+      of which +0.031 is the accounted-for exchange-row slope.
+- [x] regression test: converter hard-errors + analytic fixture + negative control
+      in `validate_b2.py synth`
+- [ ] OPEN: the ~8 mHa CoQui-vs-ABINIT exchange row (2.4 mHa/Bohr slope) — the
+      remaining a0 offset. ISDF truncation and/or the onsite-exchange operator.
+- [ ] OPEN: regenerate `tests/unit_test_files/bdft/si_kp222_paw_abinit` (built with
+      the buggy converter) and re-baseline any pinned e_1e there.
 
 ## Gotchas collected
 

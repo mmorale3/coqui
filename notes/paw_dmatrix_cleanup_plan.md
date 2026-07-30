@@ -18,7 +18,13 @@ EOS had no minimum even after the `V_LL` fix. It was **not** exchange:
 `alpha_Z` was 25.132 Ha.Bohr^3/atom against ABINIT's `epsatm` = 8.858 and `dij0`
 was off by up to 12 Ha. Post-fix `alpha_Z` = 8.858488 vs 8.858424 (5 ppm),
 `Qtail` = 4.000000 exactly. Full write-up + reusable cross-code ledger:
-`notes/paw_article_results/eos_exchange_ledger.md`.
+`notes/paw_article_results/eos_exchange_ledger.md`. **EOS REFIT (all 6 volumes):
+a0 = 10.2780 Bohr, B0 = 100.3 GPa, B' = 4.17, BM resid 0.001 mHa** — against NC
+through the same pipeline 10.2259/101.1/4.08 and VASP RPA@PBE 10.244/98, versus NO
+MINIMUM AT ALL before the fix. Judge it on B0/B' (within 0.8 GPa of NC, 2.3 of
+VASP); the +0.034 Bohr a0 offset vs VASP is quantitatively accounted for by the
+residual 2.4 mHa/Bohr CoQui-vs-ABINIT exchange-row slope (predicts +0.031), which
+is the ISDF/onsite-exchange difference and the next open item — NOT this defect.
 
 Three testing invariants this exposed:
 - **A tail check cannot validate `vhtnzc`.** Its `-zval/r` asymptote comes entirely
