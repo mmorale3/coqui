@@ -731,6 +731,165 @@ mf itself (`vexchange_mode_energies`, `COQUI_VEXCHANGE_MF_DIR/PREFIX` point at
 `eos_jthd_coqui_fix/a10.25`), which isolates the ISDF step with everything else
 held fixed.
 
+## §3h The residual 0.83 mHa is ABINIT too — the `eijkl` triangle (2026-07-30)
+
+§3g left 0.83 mHa, attributed to a "THC-route K_a deficit" because the on/off
+split gave K_a/reference = 0.884 on the production run against 0.994 for the
+exact direct route on the 12-electron fixture. Both halves of that framing were
+wrong: the THC route is fine, and the *reference* was 12% too large.
+
+### The THC route is not truncating anything
+
+`thresh` sets the THC rank directly (4300 / 4928 / 6273 interpolating points at
+1e-4 / 1e-5 / 1e-6). Re-running the K_a on/off pair at 1e-4:
+
+    thresh   E_x(K_a on)        E_x(K_a off)       K_a
+    1e-5    -2.1154385746      -2.1088514186      -0.0065871560
+    1e-4    -2.1154393164      -2.1088521605      -0.0065871559
+
+**K_a is thresh-independent to 1e-10 Ha** (and E_x itself moves only 0.74 µHa
+for a 15% change in rank), so it is not a truncation artifact. The one-centre
+ISDF block is also uncompressed at `paw_isdf_tol = 1e-8`
+("kept nlambda=324 (full-rank cap=324)") and the interpolating-point set is
+identical with K_a on and off, so the differencing is clean.
+
+### `pawinit` never fills the lower triangle of `eijkl`, and `pawdijfock` reads it
+
+`m_paw_init.F90:610` loops `k1min=klmn`, so `eijkl(klmn,klmn1)` is filled only
+for `klmn <= klmn1`. `pawdijfock` (`m_pawdij.F90:1223`) then accesses
+`eijkl(klmn_il, klmn_kj)` — built from `pack(i,l)` and `pack(k,j)` — with no
+guarantee that the first index is the smaller. When it is not, the read returns
+a structural zero and the term is silently dropped.
+
+Emulating `pawdijfock`'s exact indexing in python on the dumped `eijkl`/`rhoij`
+reproduces ABINIT's printed `efockdc` **exactly** in every case, which is what
+makes the comparison against the symmetrised tensor meaningful:
+
+    run                    natom  emulated (raw)   printed          sym/raw
+    jth_with_d, gamma        2     -0.013574043    -0.013574043     1.00000
+    jth_with_d, 2x2x2        2     -0.014949162    -0.014949162     0.87934
+    12-electron fixture      2    -13.394629907   -13.394629907     0.99419
+
+The loss depends on which `rho_ij` are non-zero, not on the dataset alone: it
+vanishes at Γ (where symmetry zeroes the affected elements), is 0.6% for the
+s,p 12-electron dataset, and is **12%** for `jth_with_d` on a 2x2x2 mesh — the
+d channels populate exactly the off-diagonal pairs whose partners fall in the
+unfilled triangle.
+
+### CoQui does NOT inherit either defect
+
+Worth stating explicitly, because the reference being wrong twice invites the
+question. `abinit2coqui` never reads `pawtab%eijkl`; it builds `deltaC` natively
+(`paw_deltaC.py`, a dense einsum over the full 4-index space). Checked three
+ways on `jth_with_d`:
+
+- structurally: CoQui's pair matrix has a fully populated strictly-lower
+  triangle (max 10.4, symmetric to 7e-8), while ABINIT's stored array has
+  **14535/14535 of its strictly-lower entries exactly zero**;
+- element-wise, on invariants that can see the dropped terms:
+  `sum K(i,i,j,j)` = 126.969 (CoQui) vs 126.971 symmetrised / 82.017 raw, and
+  `sum |K|` = 985.50 vs 985.50 / 571.92 — CoQui/symmetrised 1.00000,
+  CoQui/raw 1.55 and 1.72;
+- at the energy level, K_a matches the symmetrised reference to 0.15-0.4% and
+  is 12% from ABINIT's printed value. The `vexchange_mode_energies` anchor pins
+  CoQui to the symmetrised constant −6.658384 at 0.2%, so inheriting the
+  truncation would fail the test outright.
+
+**A trap in the earlier check.** The §3g comparison used `T_X = sum K(I,J,J,I)`
+and the pair-matrix spectrum, and concluded "deltaC ≡ eijkl to 1e-5". `T_X`
+contracts `pack(I,J)` with `pack(J,I)` — the SAME packed index — so it only
+touches the pair matrix's DIAGONAL, which is always filled. It returns the
+identical value on the raw and symmetrised tensors and is structurally blind to
+this bug; that is why the triangle was first filed as a 0.6% footnote. `T_H` and
+`sum|K|` see it. `cmp_onecenter_kernel.py` now reports the unfilled count up
+front and carries this caveat.
+
+### CoQui matches the corrected reference
+
+On the same local `jth_with_d` 2x2x2 state, with the mf converted from that very
+ABINIT run (`abinit2coqui --pot --den --corewf`):
+
+    CoQui direct-route K_a                        -0.00659819 Ha
+    physical reference (symmetrised eijkl,
+      ABINIT's own rhoij, the 1/4 same-spin factor) -0.00657272 Ha   -> 0.4%
+    ABINIT printed efockdc / 2                    -0.00747458 Ha   -> 0.883
+
+So CoQui's one-centre exchange is right to 0.4% on a d-containing dataset, and
+0.883 is the triangle artifact — the same 0.884 seen on the production run.
+
+### Measured at the production geometry
+
+Re-run locally at the production cell and mesh (a = 10.25, 4x4x4, `jth_with_d`)
+with the Fock heavily downsampled (`fockdownsampling2 4 4 4`) — `fock0`/`efock`
+are then meaningless but `rhoij` comes from the DS1 density and `eijkl` from
+`pawinit`, which is all the triangle ratio needs. Two checks that this is the
+production state: the raw emulation gives −0.014903358 against the production
+ledger's `efockdc` = −0.0149033583, and DS1 `e1t10` = 1.6182165 matches the
+production ledger's value (DS2 drifts by only 1.1e-6, so the guard passes).
+
+    production triangle factor          0.88533
+    reference efockdc/2                -7.4517 mHa
+    x 0.88533                          -6.5972 mHa
+    CoQui THC K_a                      -6.5872 mHa    -> 0.15%
+
+and the exchange row at a = 10.25 closes from **+0.833 mHa to −0.022 mHa**, at
+the level of the ledger's other agreements (cv 6 µHa, E_H sub-µHa). Both codes'
+one-centre exchange agree; ABINIT's *printed* value does not equal what its own
+kernel and density matrix imply.
+
+The factor depends on `rho_ij` and so varies with volume; it was measured at
+a = 10.05 / 10.25 / 10.55 (0.87601 / 0.88538 / 0.89943, linear in a to better
+than 1e-4, so the other three volumes are interpolated). Each of those three
+runs reproduces the production ledger's `efockdc` exactly, which is what makes
+them usable as the production reference:
+
+    a       resid_old   triangle   resid_new   corrected ref (mHa)
+    10.05     0.9456     0.9691     -0.0235          -6.8467
+    10.15     0.8855     0.9099     -0.0244          -6.7167
+    10.25     0.8329     0.8541     -0.0212          -6.5976
+    10.35     0.7813     0.8015     -0.0202          -6.4888
+    10.45     0.7327     0.7517     -0.0190          -6.3898
+    10.55     0.6850     0.7045     -0.0195          -6.3002
+
+    slope  -0.521 -> +0.008 mHa/Bohr      da0  +0.0068 -> -0.0001 Bohr
+
+**The exchange row's SLOPE is closed** — +0.008 mHa/Bohr, a0 impact
+−0.0001 Bohr — and the slope is what an EOS sees. The +0.028 Bohr this campaign
+started from is fully accounted for: ~76% the `nsppol=1` spin double count
+(§3g) and the rest the `eijkl` triangle, both on the ABINIT side, with CoQui's
+one-centre exchange matching the corrected reference to 0.15%.
+
+### Caveat on the ABSOLUTE offset: an ISDF band-set systematic
+
+The −0.021 mHa constant above uses the EOS runs' own THC exchange, at
+`nbnd = 500`. That absolute value carries a separate systematic:
+
+    nbnd   interpolating pts   E_x (beta=100 settings)
+     100         —             -2.1148286
+     250        2620           -2.1148301
+     500        4928           -2.1154386
+
+`nbnd` 100 and 250 agree to **1.4 µHa** while 500 sits **0.61 mHa** away from
+both, so 500 is the outlier, not the converged point: with 500 bands the
+interpolating-point selection is driven by high-energy pair densities and the
+occupied block — the only block exchange uses — is fitted worse. If the exact
+(direct-route) exchange sits on the 100/250 plateau, the EOS runs' E_x is
+0.61 mHa too negative and the constant offset is nearer +0.6 mHa than −0.021.
+
+This does NOT touch the one-centre conclusion: K_a from the on/off split is
+independent of `nbnd` to **2.3 µHa** (−6.58484 at 250 vs −6.58716 at 500) and of
+`thresh` to 1e-10 Ha, so the term this section is about is unaffected. And a
+systematic that is smooth in volume shifts the row without tilting it, which is
+why the slope result stands. But "CoQui's exchange agrees with ABINIT to
+0.021 mHa" is a statement at the EOS's own THC settings, **not** an absolute
+accuracy claim.
+
+Open: the direct route on the production mf (exact, occupied bands only —
+`COQUI_VEXCHANGE_MF_NBND=8`) is the arbiter for which nbnd is right, and the
+nbnd comparison should be repeated at a second volume, because an ISDF error
+that is itself volume-dependent would feed a0 directly and the whole EOS was run
+at nbnd = 500.
+
 ## §4 Status / next
 
 - [x] Phase 0 baseline + the two killed hypotheses (§1)
@@ -751,9 +910,13 @@ held fixed.
       while `e1t10`/`eh2`/`fock0`/core-valence are identical to 1e-9. Against the
       corrected reference the residual is 0.83 mHa / −0.52 mHa/Bohr (+0.007 Bohr
       in a0). CoQui's EOS numbers are unchanged.
-- [ ] OPEN (sub-mHa): the 0.83 mHa residual and the direct-vs-THC K_a spread
-      (0.994 vs 0.884 of the corrected reference) — i.e. the THC/ISDF treatment
-      of the one-centre block.
+- [x] the 0.83 mHa residual (§3h): **RESOLVED, also ABINIT.** The THC K_a is
+      thresh-independent to 1e-10 (4300 vs 4928 interpolating points) and the
+      one-centre ISDF block is uncompressed, so the THC route was never the
+      problem; the reference was 12% too large because `pawinit` leaves the
+      lower triangle of `eijkl` unfilled and `pawdijfock` reads it. With the
+      measured per-volume correction the exchange row is a constant
+      −0.021 ± 0.002 mHa with slope +0.008 mHa/Bohr (a0 impact −0.0001 Bohr).
 - [ ] OPEN: report the `nsppol=1` `pawdijfock` double count upstream to ABINIT.
 - [ ] OPEN: regenerate `tests/unit_test_files/bdft/si_kp222_paw_abinit` (built with
       the buggy converter) and re-baseline any pinned e_1e there.
@@ -778,6 +941,11 @@ held fixed.
 - **Never compare two codes' one-centre kernels element-wise.** Their real-Ylm
   conventions differ; use rotation invariants (`cmp_onecenter_kernel.py`).
   Element-wise reports 2-3% disagreement where the invariants agree to 1e-5.
+- **...but pick invariants that touch the off-diagonal pair blocks.**
+  `T_X = sum K(I,J,J,I)` contracts a packed pair index with itself, so it reads
+  only the pair matrix's diagonal and is blind to anything stored (or not
+  stored) off it — it agrees to 1e-5 on a tensor whose entire lower triangle is
+  zero. `T_H` and `sum|K|` are the ones that caught ABINIT's unfilled `eijkl`.
 - **A cheap-RPA variant changes E_x** — not through the ERI but through the KS
   density matrix it is evaluated on (`beta`, `wmax`, `iaft_prec`). Always carry
   a `base` variant that must reproduce the reference series' E_x.

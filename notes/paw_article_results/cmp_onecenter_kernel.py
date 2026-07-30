@@ -23,6 +23,14 @@ convention is:
   shell-resolved T_X over (shell(I), shell(J)) blocks
   spectrum of the pair matrix M[(IJ),(KL)] = K(I,J,K,L)
 
+CAUTION on T_X: it contracts pack(I,J) with pack(J,I), which is the SAME packed
+pair index, so it only ever touches the DIAGONAL of the pair matrix. That makes
+it blind to anything living in the off-diagonal pair blocks -- including
+ABINIT's unfilled `eijkl` triangle, which T_X reproduces identically whether or
+not the tensor has been symmetrised. T_H and sum|K| do see it (for jth_with_d:
+T_H raw 82.02 vs symmetrised 126.97). Do not conclude "the kernels agree" from
+T_X alone.
+
 Usage:
     python3 cmp_onecenter_kernel.py PAWKERNEL.dat coqui_kernel_nt0.npz
 """
@@ -56,7 +64,21 @@ def read_abinit_kernel(path):
             excv[int(f[1]) - 1] = float(f[2])
         elif tag == "RHOIJ":
             rhoij.append((int(f[2]) - 1, float(f[3])))
-    # pawinit fills only klmn <= klmn1; the tensor is symmetric on pair indices.
+    # pawinit fills only klmn <= klmn1 (m_paw_init.F90:610, `k1min=klmn`); the
+    # tensor is symmetric on the pair indices, so symmetrising recovers the
+    # PHYSICAL kernel. Report how much was missing: `pawdijfock` indexes eijkl
+    # without ordering the pair indices and therefore reads those unfilled
+    # entries back as structural zeros, which is a real energy error in ABINIT
+    # (0% at Gamma, 0.6% for an s,p dataset, 12% for s,p,d) -- see
+    # eos_exchange_ledger.md §3h. Anything compared against ABINIT's PRINTED
+    # efockdc must account for it; anything compared against the tensor below
+    # is comparing against the correct operator.
+    low = np.tril(np.ones(eijkl.shape, dtype=bool), -1)
+    n_unfilled = int((eijkl[low] == 0.0).sum())
+    n_lower = int(low.sum())
+    print("  eijkl as stored: %d/%d strictly-lower entries are zero "
+          "(pawinit fills only the upper triangle); symmetrising."
+          % (n_unfilled, n_lower))
     eijkl = eijkl + eijkl.T - np.diag(np.diag(eijkl))
     ind = np.array([indlmn[i + 1] for i in range(lmn_size)])
     return dict(lmn_size=lmn_size, lmn2=lmn2, eijkl=eijkl, ex_cvij=excv,

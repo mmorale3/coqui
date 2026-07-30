@@ -6942,9 +6942,13 @@ void test_vexchange_mode_energies(mpi_context_t& mpi,
   // E_x = -1/2 sum_sigma D^sigma D^sigma K.
   //
   // ABINIT's own printed `efockdc` does NOT equal this and must not be
-  // substituted: at nsppol=1 it is 2x (pawdijfock treats the spin-summed
-  // pawrhoij as per-spin), and at nsppol=2 it is still 0.6% off because
-  // pawinit fills only the klmn<=klmn1 triangle of eijkl.
+  // substituted, for two independent reasons: at nsppol=1 it is 2x (pawdijfock
+  // treats the spin-summed pawrhoij as per-spin), and pawinit fills only the
+  // klmn<=klmn1 triangle of eijkl (m_paw_init.F90:610) while pawdijfock indexes
+  // it without ordering the pair indices, so terms landing in the unfilled half
+  // read back as structural zeros. That second loss is 0.6% for this s,p
+  // dataset but 12% for an s,p,d one -- it scales with how many off-diagonal
+  // rho_ij are populated, so it is NOT a small correction in general.
   // Tolerance 0.2%; measured 3e-5 (the residual is CoQui's becsum vs ABINIT's
   // rhoij, which come from different SCF paths).
   if (tag == "bdft_si222_paw_ab") {
@@ -6979,17 +6983,27 @@ TEST_CASE("vexchange_mode_energies", "[hamilt][paw][hf][slow]")
         mf::default_MF(mpi, "bdft_si222_paw_ab", mf::h5_input_type));
     test_vexchange_mode_energies<HOST_MEMORY>(*mpi, mf_ptr, "bdft_si222_paw_ab");
   }
-  // Direct-route mode energies on an ARBITRARY bdft mf (cluster diagnostics,
-  // e.g. the C2 a10.20 acceptance run): point COQUI_VEXCHANGE_MF_DIR /
-  // COQUI_VEXCHANGE_MF_PREFIX at a bdft h5 and run this section alone:
+  // Direct-route mode energies on an ARBITRARY bdft mf: point
+  // COQUI_VEXCHANGE_MF_DIR / COQUI_VEXCHANGE_MF_PREFIX at a bdft h5 and run
+  // this section alone:
   //   test_hamiltonian "vexchange_mode_energies" -c "env bdft mf"
+  // COQUI_VEXCHANGE_MF_NBND truncates the band set. The direct-route exchange
+  // ENERGY is nbnd-independent (only occupied bands contribute), while the
+  // cost of building K_ij is O(nbnd^2), so a production mf with hundreds of
+  // bands is only tractable here when truncated — and the truncated run still
+  // yields the exact exchange to compare a THC run against.
+  // CAUTION: nbnd must still cover every OCCUPIED band. Truncating below that
+  // silently drops occupied states from the exchange sum and the energy is
+  // simply wrong, with nothing to flag it — on the 24-electron fixture below,
+  // nbnd=8 loses 4 of the 12 occupied bands and E_X moves by 1.8 Ha.
   SECTION("env bdft mf") {
     const char* d = std::getenv("COQUI_VEXCHANGE_MF_DIR");
     const char* p = std::getenv("COQUI_VEXCHANGE_MF_PREFIX");
+    const char* nb = std::getenv("COQUI_VEXCHANGE_MF_NBND");
     if (d != nullptr && p != nullptr) {
-      auto mf_ptr = std::make_shared<mf::MF>(
-          mf::default_MF(mpi, mf::bdft_source, std::string(d), std::string(p),
-                         mf::h5_input_type));
+      int nbnd = (nb != nullptr) ? std::atoi(nb) : -1;
+      auto mf_ptr = std::make_shared<mf::MF>(mf::MF(mf::bdft::bdft_readonly(
+          mpi, std::string(d), std::string(p), 0.0, nbnd)));
       test_vexchange_mode_energies<HOST_MEMORY>(*mpi, mf_ptr, std::string(p));
     } else {
       SUCCEED("COQUI_VEXCHANGE_MF_DIR/PREFIX not set — section skipped");

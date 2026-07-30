@@ -11,19 +11,28 @@ printed into context at session start by a SessionStart hook).
 ## OPEN ITEMS
 
 Physics / correctness
-1. **THC-route K_a deficit (the only known open accuracy gap).** The direct
-   route reproduces the external one-centre reference to 0.994; the THC route
-   reads 0.884 at both a = 10.25 and 10.55. That 11% is the whole remaining
-   0.83 mHa exchange-row residual and is worth +0.007 Bohr in the Si a0.
-   Suspect: `add_K_a_to_LL` / the local-ISDF compression of the one-centre
-   block (`paw_isdf_tol`, the symmetric-pair basis), NOT the operator.
-   Next probe: `vexchange_mode_energies` with `COQUI_VEXCHANGE_MF_DIR/PREFIX`
-   pointed at `eos_jthd_coqui_fix/a10.25` gives direct-vs-THC K_a on the
-   production mf with everything else fixed.
-2. **Report the ABINIT `nsppol=1` `pawdijfock` double count upstream**, plus
-   the smaller `eijkl` upper-triangle issue (`m_paw_init.F90:610` fills only
-   `klmn<=klmn1`; `pawdijfock`'s index construction does not always land in
-   it — 0.6% of the one-centre term).
+1. ~~THC-route K_a deficit~~ **RESOLVED 2026-07-30 — there was no deficit.**
+   See the STATUS block below and `eos_exchange_ledger.md` §3h: the reference
+   was 12% too large, not CoQui 12% short.
+1b. **NEW, open: ISDF band-set systematic on the ABSOLUTE exchange.** E_x at
+   `nbnd` 100 and 250 agree to 1.4 µHa while `nbnd = 500` — the setting the
+   whole EOS series used — sits 0.61 mHa away from both (interpolating points
+   2620 vs 4928). 500 looks like the outlier: with that many bands the point
+   selection is driven by high-energy pair densities and the occupied block is
+   fitted worse. K_a itself is untouched (nbnd-independent to 2.3 µHa), and a
+   volume-smooth systematic cannot tilt the EOS, but two things are needed:
+   (a) the direct route on the production mf as the arbiter for which nbnd is
+   right (`COQUI_VEXCHANGE_MF_NBND=8`, running); (b) the nbnd comparison at a
+   SECOND volume — if the error is volume-dependent it feeds a0 directly.
+2. **Report BOTH ABINIT one-centre Fock defects upstream.** (a) the `nsppol=1`
+   spin double count in `pawdijfock`; (b) `pawinit` (`m_paw_init.F90:610`)
+   fills only the `klmn<=klmn1` triangle of `eijkl` while `pawdijfock`
+   (`m_pawdij.F90:1223`) indexes it without ordering the pair indices, so terms
+   landing in the unfilled half are silently dropped. (b) is **not** the small
+   effect first recorded: 0.6% on an s,p dataset but **12% on s,p,d**, and it
+   vanishes at Γ — it scales with how many off-diagonal `rho_ij` are populated.
+   Both are reproduced exactly (<=2e-15) by the python emulation of
+   `pawdijfock` in the session notes.
 3. psp8-NLCC end-to-end exercise remains asset-gated (the convention risk it
    guarded is closed by source inspection).
 
@@ -38,11 +47,9 @@ Test / infrastructure debt
    built with the pre-sqrt(4pi) converter, so its `pp_local` / `dion` /
    `vloc_ps` are mis-normalized; re-baseline any pinned `e_1e`. `E_H`/`E_x`
    tests (including the new anchor) are unaffected — they use none of those.
-6. The anchor constant `-6.658384` is derived by contracting ABINIT's dumped
-   `eijkl`/`rhoij`; the dump site is committed (`abinit_ene_instr.py`,
-   `ABI_DUMP_PAWKERNEL`) but the contraction that produces the number lives
-   only in the session notes. Commit that script if the constant is ever to be
-   re-derived.
+6. ~~The anchor constant is not re-derivable~~ DONE — `emul_pawdijfock.py`
+   reproduces ABINIT's `efockdc` from the dump to <=2e-15 and prints the
+   physical value, i.e. the test's `-6.658384` constant.
 
 Campaign / data hygiene
 7. The rusty tree is behind this branch; sync before the next production run.
@@ -54,6 +61,41 @@ Campaign / data hygiene
    quoting them (publication-gated).
 
 ## STATUS
+
+**EXCHANGE ROW FULLY CLOSED (2026-07-30, second half).** The 0.83 mHa left by
+the `nsppol=1` finding below was ALSO the reference, not CoQui — a *second*
+ABINIT defect in the same routine. `pawinit` (`m_paw_init.F90:610`, `k1min=klmn`)
+fills only the `klmn<=klmn1` triangle of `eijkl`; `pawdijfock`
+(`m_pawdij.F90:1223`) then indexes it as `eijkl(pack(i,l), pack(k,j))` without
+ordering the two pair indices, so every term that lands in the unfilled half
+reads back as a structural zero.
+
+The THC route was cleared first, three ways: K_a is **thresh-independent to
+1e-10 Ha** (−0.0065871560 at thresh 1e-5 / 4928 interpolating points vs
+−0.0065871559 at 1e-4 / 4300 — E_x itself moves 0.74 µHa for a 15% rank change),
+the one-centre ISDF block is uncompressed at `paw_isdf_tol = 1e-8`
+("kept nlambda=324 (full-rank cap=324)"), and the interpolating-point set is
+identical with K_a on and off. So the on/off differencing was clean and the
+deficit had to be in the reference.
+
+Emulating `pawdijfock`'s exact indexing in python reproduces ABINIT's printed
+`efockdc` to <=2e-15 on six runs, which is what licenses comparing it against
+the symmetrised tensor. The loss depends on how many off-diagonal `rho_ij` are
+populated, NOT on the dataset alone: **0% at Γ, 0.6% for the s,p 12-electron
+dataset, 12% for `jth_with_d`** (the d channels populate exactly the pairs whose
+partners fall in the unfilled half).
+
+CoQui matches the corrected reference: direct-route K_a = −6.59819 mHa against
+−6.57272 mHa on a local `jth_with_d` 2x2x2 state converted from that very ABINIT
+run (**0.4%**), and THC K_a = −6.5872 mHa against −6.5976 mHa at the production
+geometry (**0.15%**). The triangle factor was measured at a = 10.05/10.25/10.55
+(0.87601/0.88538/0.89943) on local 4x4x4 reruns that reproduce the production
+ledger's `efockdc` exactly. With it the exchange row becomes a **constant
+−0.021 ± 0.002 mHa with slope +0.008 mHa/Bohr — a0 impact −0.0001 Bohr**. A
+constant cannot move an EOS: the row is closed and `a0 = 10.2780` stands.
+
+The +0.028 Bohr this campaign started from is now fully accounted for: ~76% the
+`nsppol=1` spin double count, the rest the `eijkl` triangle, both ABINIT-side.
 
 **EXCHANGE-ROW DISCREPANCY RESOLVED — IT WAS ABINIT (2026-07-30).** The last
 CoQui-vs-ABINIT gap (the ~8 mHa exchange row with a −2.14 mHa/Bohr slope, held
@@ -82,14 +124,15 @@ uses, ratio 0.50000).
 `efockdc` changes, by **exactly 2.000000** (−13.394629907 → −6.697314956). Only
 the term quadratic in ρ doubles ⇒ `pawdijfock` (`m_pawdij.F90:1223`,
 `nsp = pawrhoij%nsppol`) contracts the spin-summed `rhoij` twice at `nsppol=1`.
-CoQui's K_a = −6.658166 vs the correct −6.697315 → **0.6%**. Report upstream.
+CoQui's K_a = −6.658166 vs the nsppol=2 value −6.697315 → 0.6%; that last 0.6%
+is the `eijkl` triangle (this fixture's loss), and against the fully corrected
+−6.658384 CoQui is exact to 3e-5. Report upstream.
 
 Consequences: the pre-registered §3c prediction a0 = 10.2501 is **superseded**
-(it used the doubled exchange); against the corrected reference the residual is
-0.83 mHa / −0.52 mHa/Bohr = **+0.007 Bohr in a0**, so CoQui's 10.2780 matches a
-corrected-ABINIT 10.2712. The whole remaining 0.83 mHa is the **THC-route K_a
-deficit** (direct route 0.994 of reference, THC route 0.884) — i.e.
-`add_K_a_to_LL`/local-ISDF compression, not operator physics.
+(it used the doubled exchange). The 0.83 mHa that remained at this point was
+initially attributed to a THC-route K_a deficit; the block above supersedes that
+— it is the `eijkl` triangle, also ABINIT-side, and the exchange row closes to a
+constant −0.021 mHa.
 
 Testing invariants this exposed:
 - **The one-centre exchange is the only genuine rank-4 PAW contraction, and it
