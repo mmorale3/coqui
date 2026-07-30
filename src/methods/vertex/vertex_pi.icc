@@ -54,6 +54,12 @@
  * products of representable tau-objects (pair products, triple products with wbar~) stay
  * within the basis span given the instance's wmax headroom.
  *
+ * ALSO IN THIS FILE: pi_dyn_factorized (eq:pibardynfact). B-L needs only the EQUAL-TIME
+ * value of the dynamic-rung polarization, pi^dyn(q) = (1/beta) sum_nu Pi^{C,dyn}(q,inu).
+ * Summing the external frequency away closes the (12)/(34) pairs instead of (14)/(23) and
+ * leaves ONE bosonic pairing of two ordinary bubbles against W -- so that quantity needs
+ * NEITHER twisted pairs NOR the pole algebra above. See that function's own comment block.
+ *
  * Symmetry (notes/vertex_ibz_symmetry.md): with a non-null vertex_sym::sym_ctx the
  * EXTERNAL q axis runs over the IBZ only while the internal (k, qx) sums cover the
  * FULL BZ; the rung at a non-IBZ transfer qx is sourced from the IBZ-stored W/Z via
@@ -326,6 +332,58 @@ namespace vertex_pi {
     }
 
     /**
+     * The rung's two collocation pair-legs at one tile. This is the SINGLE source of the
+     * Xhat symmetry routing -- shared verbatim by pi_c_accumulate_w (both phases) and by
+     * pi_dyn_factorized, so the two can never drift apart on the part O7 flags as risky:
+     *   U1(P, p1*Nb + p1')  = X(k-qx)_{P,p1}  conj(X(k)_{P,p1'})
+     *   U2(P, p3*Nb + p3')  = X(k+q)_{P,p3}   conj(X(k-qx+q)_{P,p3'})
+     * With an active sym_ctx the four legs read the EFFECTIVE columns Xhat(is, jsym, k)
+     * (rotation into the IBZ transfer frame + trev-leg conj; memo (X-hat)); the k-point
+     * INDICES passed in stay the original full-BZ ones -- the rotation is internal to Xhat.
+     * jsym is the qsymms position of the transfer's mapping symmetry (0 = identity, and
+     * the only case without a symmetry context).
+     */
+    template<nda::MemoryArrayOfRank<4> XArr>
+    void build_U_legs(XArr const& X_skPa, vertex_sym::sym_ctx const* symc, nda::range C,
+                      long is, long ik, long ikmqx, long ikpq, long ikxq, long jsym,
+                      nda::array<ComplexType, 2>& U1, nda::array<ComplexType, 2>& U2) {
+      decltype(nda::range::all) all;
+      const long Np = U1.shape(0), Nb = C.size();
+      if (symc == nullptr or not symc->active) {
+        for (long P = 0; P < Np; ++P) {
+          for (long j1 = 0; j1 < Nb; ++j1) {
+            auto x1 = X_skPa(is, ikmqx, P, C.first() + j1);
+            for (long j1p = 0; j1p < Nb; ++j1p)
+              U1(P, j1 * Nb + j1p) = x1 * std::conj(X_skPa(is, ik, P, C.first() + j1p));
+          }
+          for (long j3 = 0; j3 < Nb; ++j3) {
+            auto x3 = X_skPa(is, ikpq, P, C.first() + j3);
+            for (long j3p = 0; j3p < Nb; ++j3p)
+              U2(P, j3 * Nb + j3p) = x3 * std::conj(X_skPa(is, ikxq, P, C.first() + j3p));
+          }
+        }
+      } else {
+        auto Xh = [&](long kk) { return symc->Xhat(is, jsym, kk, all, all); };
+        auto Xin1 = Xh(ikmqx);  // in  p1  @ k-qx
+        auto Xo1  = Xh(ik);     // out p1' @ k
+        auto Xin2 = Xh(ikpq);   // in  p3  @ k+q
+        auto Xo2  = Xh(ikxq);   // out p3' @ k-qx+q
+        for (long P = 0; P < Np; ++P) {
+          for (long j1 = 0; j1 < Nb; ++j1) {
+            auto x1 = Xin1(P, j1);
+            for (long j1p = 0; j1p < Nb; ++j1p)
+              U1(P, j1 * Nb + j1p) = x1 * std::conj(Xo1(P, j1p));
+          }
+          for (long j3 = 0; j3 < Nb; ++j3) {
+            auto x3 = Xin2(P, j3);
+            for (long j3p = 0; j3p < Nb; ++j3p)
+              U2(P, j3 * Nb + j3p) = x3 * std::conj(Xo2(P, j3p));
+          }
+        }
+      }
+    }
+
+    /**
      * Twisted-pair components on the tau grid from pole data:
      *   out_c(s)_{d1,(jA jB)} shared-aux pair
      *     = sum_{p,q} cA_p(d1,jA) cB_q(jB,d1) kappa_c(p,q,s)
@@ -513,38 +571,7 @@ namespace vertex_pi {
     // symmetry (0 = identity; also the only case without a symmetry context).
     nda::array<ComplexType, 2> U1(Np, Nb2), U2(Np, Nb2), ZU2(Np, Nb2);
     auto build_U = [&](long is, long ik, long ikmqx, long ikpq, long ikxq, long jsym) {
-      if (not sym) {
-        for (long P = 0; P < Np; ++P) {
-          for (long j1 = 0; j1 < Nb; ++j1) {
-            auto x1 = X_skPa(is, ikmqx, P, C.first() + j1);
-            for (long j1p = 0; j1p < Nb; ++j1p)
-              U1(P, j1 * Nb + j1p) = x1 * std::conj(X_skPa(is, ik, P, C.first() + j1p));
-          }
-          for (long j3 = 0; j3 < Nb; ++j3) {
-            auto x3 = X_skPa(is, ikpq, P, C.first() + j3);
-            for (long j3p = 0; j3p < Nb; ++j3p)
-              U2(P, j3 * Nb + j3p) = x3 * std::conj(X_skPa(is, ikxq, P, C.first() + j3p));
-          }
-        }
-      } else {
-        auto Xh = [&](long kk) { return symc->Xhat(is, jsym, kk, all, all); };
-        auto Xin1 = Xh(ikmqx);  // in  p1  @ k-qx
-        auto Xo1  = Xh(ik);     // out p1' @ k
-        auto Xin2 = Xh(ikpq);   // in  p3  @ k+q
-        auto Xo2  = Xh(ikxq);   // out p3' @ k-qx+q
-        for (long P = 0; P < Np; ++P) {
-          for (long j1 = 0; j1 < Nb; ++j1) {
-            auto x1 = Xin1(P, j1);
-            for (long j1p = 0; j1p < Nb; ++j1p)
-              U1(P, j1 * Nb + j1p) = x1 * std::conj(Xo1(P, j1p));
-          }
-          for (long j3 = 0; j3 < Nb; ++j3) {
-            auto x3 = Xin2(P, j3);
-            for (long j3p = 0; j3p < Nb; ++j3p)
-              U2(P, j3 * Nb + j3p) = x3 * std::conj(Xo2(P, j3p));
-          }
-        }
-      }
+      detail::build_U_legs(X_skPa, symc, C, is, ik, ikmqx, ikpq, ikxq, jsym, U1, U2);
     };
     // rung-transfer access data: IBZ index + trev(=PQ-transpose) flag + symmetry pos.
     auto q_access = [&](long iqx) {
@@ -821,6 +848,308 @@ namespace vertex_pi {
             add_combo(Tt0, Mt1, mbar);
           }
         } // m
+      } // iq
+    } // tuples
+  }
+
+  /**
+   * eq:pibardynfact -- the FACTORIZED equal-time dynamic-rung polarization.
+   *
+   * Computes, directly and without ever forming Pi^C(q, i nu) on the frequency mesh,
+   *
+   *   pi^dyn(q)_{MN} = (1/beta) sum_nu Pi^{C,dyn}(q, i nu)_{MN} = Pi^{C,dyn}(q, tau = 0)_{MN}
+   *
+   * which is what B-L's response middle factor needs (eq:deltawL / eq:XL). The current
+   * production route runs the FULL dynamic-rung kernel over all nw_b frequencies -- twisted
+   * pairs, DLR pole algebra and all -- and then keeps only the tau = 0 row, which measured
+   * 98.9 % of B-L's vertex time (notes/vertex_optimization_plan.md P2.1).
+   *
+   * WHY IT FACTORIZES (notes/pibardynfact_increment.md section 1; theoryB_static
+   * eq:pibardynfact). Summing the EXTERNAL nu away closes the two G-pairs (12) and (34) --
+   * NOT the (14)/(23) pairs of the instantaneous phase -- and leaves ONE bosonic sum over
+   * the RUNG frequency nu_x of a product of two ordinary particle-hole bubbles against W:
+   *
+   *   pi^dyn(q) = -sum_s (1/beta) sum_{nu_x} (1/Nk^2) sum_{k,qx}
+   *                  b34(i nu_x)^T . W(qx, i nu_x) . b12(i nu_x)
+   *   b34_{(a p1'),(p1 d)}(i nu_x) = (1/beta) sum_w G_{a p1'}(k, iw) G_{p1 d}(k-qx, iw-i nu_x)
+   *   b12_{(p3 b),(c p3')}(i nu_x) = (1/beta) sum_w G_{p3 b}(k+q, iw)
+   *                                                 G_{c p3'}(k-qx+q, iw-i nu_x)
+   *
+   * The rung's row pair (p1 p1') lands ENTIRELY inside b34 and its column pair (p3 p3')
+   * ENTIRELY inside b12; the externals left open are a, d (from b34) and b, c (from b12).
+   * Note the slot REVERSAL in each bubble ((a p1') vs (p1 d); (p3 b) vs (c p3')) -- that is
+   * where a transpose error would hide, and it is exactly what the routing pin discriminates.
+   *
+   * ROUTING PINNED to machine precision, notes/pins/pin_pibardynfact.py: on a cyclic
+   * Matsubara model with a random DENSE rung (no pair symmetry, so every transpose reading
+   * is separated) the brute-force triple-frequency sum_nu Pi^{C,dyn} and this factorized
+   * form agree to rel 1.5e-15 at three transfers, while all five plausible mis-readings
+   * (swapped bubbles, either bubble transposed, the (14)/(23) grouping, bubbles at q
+   * instead of qx) are rejected at O(1). O7's mechanical-verification requirement is met.
+   *
+   * This is NOT "phase 1 with a dynamic rung": phase 1 pairs (14)/(23) at the EXTERNAL
+   * frequency, this pairs (12)/(34) at the RUNG frequency. Looping phase 1 over nu_x does
+   * not produce pi^dyn -- the pin rejects that reading at 1.55.
+   *
+   * IMPLEMENTATION -- the cost trap. The (12)/(34) grouping puts BOTH external aux indices
+   * in BOTH bubbles, so building the bubbles in the AUXILIARY basis would give Np^3
+   * intermediates and an Np^4 contraction, i.e. slower than what it replaces. The bubbles
+   * are therefore kept in ORBITAL pairs (Nb2 x nbnd^2, tiny) and the externals are folded
+   * onto (M, N) ONCE per tile, AFTER the nu_x sum -- legal because the fold is linear and
+   * nu_x-independent, and it is what saves the extra factor nw_b on the fold. Per tile the
+   * dominant term is then the nw_b rung folds (~nw_b Np^2 Nb2), the same block the existing
+   * kernel already pays, with the whole tau-grid factor of the twisted-pair algebra gone.
+   *
+   * The (1/beta) sum_{nu_x} is taken through the tau = 0 transform row R0 (the caller's
+   * vertex_w0_detail::tau0_transform_row). A plain sum over the sampled nodes would be
+   * WRONG: DLR/IR nodes are FITTING nodes, not Fourier points.
+   *
+   * No pole algebra, no DLR requirement, no aux pole basis -- so this also removes B-L's
+   * only exposure to the parent project's open pole-conditioning defect (O7: "nothing in
+   * section BL needs pole algebra").
+   *
+   * Rank split, Gamma policy, symmetry handling and the qx diagnostic all mirror
+   * pi_c_accumulate_w exactly; the caller all-reduces the partials as before.
+   *
+   * @param Z_qPQ       - instantaneous rung core (nq_w, Np, Np).
+   * @param Wdyn_qwPQ   - dynamic rung on the full bosonic mesh (nq_w, nw_b, Np, Np), or
+   *                      nullptr. The rung used at node l is Z + Wdyn(l); with nullptr it
+   *                      is the STATIC rung Z, for which this must reproduce
+   *                      R0-contracted phase-1-only Pi^C exactly (the pole-free refactor
+   *                      gate -- both sides backend-agnostic).
+   * @param R0          - the nw_b tau = 0 transform row.
+   * @param Pi0_qMN     - [OUTPUT, accumulated] (nq_ext, Np, Np).
+   */
+  template<nda::MemoryArrayOfRank<5> GArr, nda::MemoryArrayOfRank<4> XArr,
+           nda::MemoryArrayOfRank<3> ZArr>
+  void pi_dyn_factorized(iaft_tools const& tools,
+                         GArr const& G_tskij, XArr const& X_skPa,
+                         ZArr const& Z_qPQ,
+                         nda::array<ComplexType, 4> const* Wdyn_qwPQ,
+                         nda::array<long, 2> const& kmq,
+                         nda::array<long, 2> const& kpq,
+                         nda::range C,
+                         nda::array<ComplexType, 1> const& R0,
+                         nda::array<ComplexType, 3>& Pi0_qMN,
+                         long rank, long nproc,
+                         bool skip_rung_gamma = false,
+                         nda::array<double, 1>* qx_diag = nullptr,
+                         vertex_sym::sym_ctx const* symc = nullptr) {
+    decltype(nda::range::all) all;
+    const long ns = G_tskij.shape(1), nk = G_tskij.shape(2);
+    const long nbnd = G_tskij.shape(3);
+    const long Np = X_skPa.shape(2);
+    const long Nb = C.size();
+    const long nt = tools.nt_f, nw_b = tools.nw_b;
+    const long Nb2 = Nb * Nb, Ne2 = nbnd * nbnd;
+    const long C0 = C.first();
+
+    utils::check(G_tskij.shape(0) == nt and G_tskij.shape(4) == nbnd,
+                 "vertex_pi::pi_dyn_factorized: G shape ({}, ., ., {}, {}) is inconsistent "
+                 "with nt = {}.", G_tskij.shape(0), nbnd, G_tskij.shape(4), nt);
+    utils::check(R0.shape(0) == nw_b,
+                 "vertex_pi::pi_dyn_factorized: R0 length {} != nw_b = {}.",
+                 R0.shape(0), nw_b);
+    utils::check(C0 + Nb <= nbnd,
+                 "vertex_pi::pi_dyn_factorized: C = [{}, {}) exceeds the band range {}.",
+                 C0, C0 + Nb, nbnd);
+
+    // symmetry bookkeeping -- identical contract to pi_c_accumulate_w
+    const bool sym = (symc != nullptr and symc->active);
+    const long nq_w = Z_qPQ.shape(0);
+    const long nq = kmq.shape(0);            // internal transfer mesh
+    const long nq_ext = Pi0_qMN.shape(0);    // external q axis
+    if (sym) {
+      utils::check(nq_w == symc->nq_ibz and nq_ext == symc->nq_ibz and
+                   nq == symc->nq_full and nk == symc->nk_full,
+                   "vertex_pi::pi_dyn_factorized: symmetry context dimension mismatch "
+                   "(nq_w = {}, nq_ext = {}, nq_full = {}, nk = {} vs ctx {}, {}, {}).",
+                   nq_w, nq_ext, nq, nk, symc->nq_ibz, symc->nq_full, symc->nk_full);
+      utils::check(symc->naux == Np and symc->nc == Nb and C0 == 0,
+                   "vertex_pi::pi_dyn_factorized: symmetry context Xhat mismatch "
+                   "(naux = {} vs Np = {}, nc = {} vs Nb = {}, C0 = {}).",
+                   symc->naux, Np, symc->nc, Nb, C0);
+    } else {
+      utils::check(nq_w == nq and nq_ext == nq,
+                   "vertex_pi::pi_dyn_factorized: inconsistent q axes without a symmetry "
+                   "context (nq_w = {}, nq_full = {}, nq_ext = {}).", nq_w, nq, nq_ext);
+    }
+    utils::check(Pi0_qMN.shape(1) == Np and Pi0_qMN.shape(2) == Np,
+                 "vertex_pi::pi_dyn_factorized: output shape mismatch.");
+    if (Wdyn_qwPQ != nullptr)
+      utils::check((*Wdyn_qwPQ).shape(0) == nq_w and (*Wdyn_qwPQ).shape(1) == nw_b and
+                   (*Wdyn_qwPQ).shape(2) == Np and (*Wdyn_qwPQ).shape(3) == Np,
+                   "vertex_pi::pi_dyn_factorized: Wdyn shape mismatch.");
+
+    // same spin/Nk^2 prefactor as the kernel (rpa_pi.icc:312); the two 1/beta of the
+    // bubbles come from the pairing identity, the (1/beta) sum_{nu_x} from R0.
+    const ComplexType pref = ComplexType(-((ns == 1) ? 2.0 : 1.0) / double(nk * nk));
+
+    // Gamma index of the transfer mesh, detected index-based: qx = Gamma <=> k-qx = k
+    long iq_gamma = -1;
+    for (long iqx = 0; iqx < nq; ++iqx) {
+      bool g = true;
+      for (long ik = 0; ik < nk; ++ik)
+        if (kmq(iqx, ik) != ik) { g = false; break; }
+      if (g) { iq_gamma = iqx; break; }
+    }
+    utils::check(not skip_rung_gamma or iq_gamma >= 0,
+                 "vertex_pi::pi_dyn_factorized: skip_rung_gamma requested but no Gamma "
+                 "point was found in the transfer mesh.");
+    if (qx_diag != nullptr) {
+      utils::check(qx_diag->size() == nq,
+                   "vertex_pi::pi_dyn_factorized: qx_diag size mismatch.");
+      (*qx_diag)() = 0.0;
+    }
+
+    // ---- 2D rank split, identical factorization to pi_c_accumulate_w -------------------
+    const long ntuples = ns * nk * nq;
+    long qext_size = 1, tup_size = nproc;
+    {
+      for (long d = 1; d <= nproc; ++d) {
+        if (nproc % d != 0) continue;
+        long ts = nproc / d;
+        if (ts <= ntuples and d <= nq_ext) { qext_size = d; tup_size = ts; break; }
+      }
+      if (tup_size > ntuples) {
+        for (long d = nproc; d >= 1; --d) {
+          if (nproc % d != 0) continue;
+          if (d <= nq_ext) { qext_size = d; tup_size = nproc / d; break; }
+        }
+      }
+    }
+    const long tup_rank  = rank / qext_size;
+    const long qext_rank = rank % qext_size;
+    app_log(3, "pi_dyn_factorized: rank split nproc = {} -> tup_size = {} x qext_size = {} "
+               "(ntuples = {}, nq_ext = {})", nproc, tup_size, qext_size, ntuples, nq_ext);
+
+    // ---- work arrays (all tile-local; nothing scales with nw_b * Np^2) -----------------
+    nda::array<ComplexType, 2> U1(Np, Nb2), U2(Np, Nb2), WU2(Np, Nb2);
+    nda::array<ComplexType, 2> P34(nt, Nb2 * Ne2), P12(nt, Nb2 * Ne2);
+    nda::array<ComplexType, 2> B34(nw_b, Nb2 * Ne2), B12(nw_b, Nb2 * Ne2);
+    nda::array<ComplexType, 2> wbar(Nb2, Nb2), Tmid(Ne2, Nb2);
+    nda::array<ComplexType, 2> Facc(Ne2, Ne2), Fr(Ne2, Ne2);
+    nda::array<ComplexType, 2> KRN(Np, Ne2), KRM(Np, Ne2), H(Np, Ne2);
+    nda::array<ComplexType, 2> Ctmp(Np, Np), Wl;
+    nda::array<ComplexType, 1> gcol(nbnd);
+    if (Wdyn_qwPQ != nullptr) Wl = nda::array<ComplexType, 2>(Np, Np);
+
+    for (long tup = tup_rank; tup < ntuples; tup += tup_size) {
+      const long is  = tup / (nk * nq);
+      const long ik  = (tup / nq) % nk;
+      const long iqx = tup % nq;
+      if (skip_rung_gamma and iqx == iq_gamma) continue;
+      const long ikmqx = kmq(iqx, ik);
+      const long qsx = sym ? symc->q_star(iqx) : iqx;
+      const bool  trx = sym ? bool(symc->q_trev(iqx)) : false;
+      const long  jsx = sym ? symc->q_isym(iqx) : 0l;
+
+      // ---- b34: the NO-q side. Depends on (is, ik, qx) only -> hoisted out of the iq
+      //      loop. b34(i nu_x)_{(a p1'),(p1 d)} = -int ds e^{i nu_x s} G_{a p1'}(k, s)
+      //      G_{p1 d}(k-qx, beta-s)  (the pairing identity; a row of Twt_bb).
+      //      Packed [(p1, p1')][(a, d)] -- the reversal that makes the rung contraction
+      //      two plain gemms.
+      for (long it = 0; it < nt; ++it) {
+        const long im = tools.t_mirror(it);
+        for (long p1 = 0; p1 < Nb; ++p1) {
+          auto grow = G_tskij(im, is, ikmqx, C0 + p1, all);       // (d), contiguous
+          for (long p1p = 0; p1p < Nb; ++p1p) {
+            const long row = (p1 * Nb + p1p) * Ne2;
+            for (long a = 0; a < nbnd; ++a) {
+              const ComplexType ga = G_tskij(it, is, ik, a, C0 + p1p);
+              for (long d = 0; d < nbnd; ++d)
+                P34(it, row + a * nbnd + d) = ga * grow(d);
+            }
+          }
+        }
+      }
+      nda::blas::gemm(ComplexType(-1.0), tools.Twt_bb, P34, ComplexType(0.0), B34);
+
+      for (long iq = qext_rank; iq < nq_ext; iq += qext_size) {
+        const long ikpq = kpq(iq, ik);
+        const long ikxq = kmq(iqx, ikpq);
+
+        // ---- b12: the +q side, packed [(p3, p3')][(b, c)] ----------------------------
+        for (long it = 0; it < nt; ++it) {
+          const long im = tools.t_mirror(it);
+          for (long p3p = 0; p3p < Nb; ++p3p) {
+            for (long c = 0; c < nbnd; ++c) gcol(c) = G_tskij(im, is, ikxq, c, C0 + p3p);
+            for (long p3 = 0; p3 < Nb; ++p3) {
+              const long row = (p3 * Nb + p3p) * Ne2;
+              for (long b = 0; b < nbnd; ++b) {
+                const ComplexType gb = G_tskij(it, is, ikpq, C0 + p3, b);
+                for (long c = 0; c < nbnd; ++c)
+                  P12(it, row + b * nbnd + c) = gb * gcol(c);
+              }
+            }
+          }
+        }
+        nda::blas::gemm(ComplexType(-1.0), tools.Twt_bb, P12, ComplexType(0.0), B12);
+
+        detail::build_U_legs(X_skPa, symc, C, is, ik, ikmqx, ikpq, ikxq, jsx, U1, U2);
+
+        // ---- the single bosonic pairing:  Facc = sum_l R0(l) B34(l)^T wbar(l) B12(l) --
+        // trev-mapped transfer: the rotated transfer is -qs and the element is read from
+        // the qs storage by the exact side-swap = PQ-transpose (memo (P2)).
+        if (Wdyn_qwPQ == nullptr) {
+          // STATIC rung: wbar is l-independent -> hoisted entirely out of the l loop.
+          if (trx) nda::blas::gemm(nda::transpose(Z_qPQ(qsx, all, all)), U2, WU2);
+          else     nda::blas::gemm(Z_qPQ(qsx, all, all), U2, WU2);
+          nda::blas::gemm(nda::transpose(U1), WU2, wbar);
+        }
+        for (long l = 0; l < nw_b; ++l) {
+          if (Wdyn_qwPQ != nullptr) {
+            if (trx)
+              for (long P = 0; P < Np; ++P)
+                for (long Q = 0; Q < Np; ++Q)
+                  Wl(P, Q) = Z_qPQ(qsx, Q, P) + (*Wdyn_qwPQ)(qsx, l, Q, P);
+            else
+              for (long P = 0; P < Np; ++P)
+                for (long Q = 0; Q < Np; ++Q)
+                  Wl(P, Q) = Z_qPQ(qsx, P, Q) + (*Wdyn_qwPQ)(qsx, l, P, Q);
+            nda::blas::gemm(Wl, U2, WU2);
+            nda::blas::gemm(nda::transpose(U1), WU2, wbar);
+          }
+          auto B34l = nda::reshape(B34(l, all), shape_t<2>{Nb2, Ne2});
+          auto B12l = nda::reshape(B12(l, all), shape_t<2>{Nb2, Ne2});
+          nda::blas::gemm(ComplexType(1.0), nda::transpose(B34l), wbar,
+                          ComplexType(0.0), Tmid);
+          nda::blas::gemm(R0(l), Tmid, B12l,
+                          ComplexType((l == 0) ? 0.0 : 1.0), Facc);
+        }
+
+        // ---- fold the externals onto (M, N): a, b -> N and c, d -> M, exactly the
+        //      zL/zR collocation staging of the kernel (which contracts a @ k and b @ k+q
+        //      into the shared N, and c @ k-qx+q and d @ k-qx into the shared M). Done
+        //      ONCE, after the nu_x sum, and via row-wise (Khatri-Rao) pair columns so
+        //      neither intermediate is bigger than Np * nbnd^2.
+        for (long P = 0; P < Np; ++P) {
+          for (long a = 0; a < nbnd; ++a) {
+            const ComplexType xa = X_skPa(is, ik, P, a);
+            for (long b = 0; b < nbnd; ++b)
+              KRN(P, a * nbnd + b) = xa * std::conj(X_skPa(is, ikpq, P, b));
+          }
+          for (long d = 0; d < nbnd; ++d) {
+            const ComplexType xd = std::conj(X_skPa(is, ikmqx, P, d));
+            for (long c = 0; c < nbnd; ++c)
+              KRM(P, d * nbnd + c) = xd * X_skPa(is, ikxq, P, c);
+          }
+        }
+        // Facc[(a,d)][(b,c)] -> Fr[(a,b)][(d,c)] so both folds are single gemms
+        for (long a = 0; a < nbnd; ++a)
+          for (long d = 0; d < nbnd; ++d)
+            for (long b = 0; b < nbnd; ++b)
+              for (long c = 0; c < nbnd; ++c)
+                Fr(a * nbnd + b, d * nbnd + c) = Facc(a * nbnd + d, b * nbnd + c);
+        nda::blas::gemm(KRN, Fr, H);                       // H(N, (d,c))
+        nda::blas::gemm(pref, KRM, nda::transpose(H), ComplexType(0.0), Ctmp);
+
+        if (qx_diag != nullptr) {
+          double mx = 0.0;
+          for (auto const& v : Ctmp) mx = std::max(mx, std::abs(v));
+          (*qx_diag)(iqx) = std::max((*qx_diag)(iqx), mx);
+        }
+        Pi0_qMN(iq, all, all) += Ctmp;
       } // iq
     } // tuples
   }

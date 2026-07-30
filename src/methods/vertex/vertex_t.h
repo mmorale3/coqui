@@ -710,6 +710,25 @@ namespace solvers {
     double _scale = 1.0;
     long _ramp_iters = 0;
     long _vertex_iter = 0;
+    // B-L's pi^dyn route (eq:pibardynfact, notes/pibardynfact_increment.md). 0 =
+    // FACTORIZED (default): the single-bosonic-pairing primitive, no pole algebra.
+    // 1 = KERNEL: the historic route -- the full dynamic-rung Pi^C over all nw_b
+    // frequencies, of which only the tau = 0 row is kept (98.9 % of B-L's vertex time,
+    // and B-L's only contact with the aux pole basis). 2 = CHECK: run BOTH and log the
+    // deviation, aborting past _pidyn_check_tol. Kept reachable because a production-scale
+    // disagreement is the one thing the toy gate (test_vertex_pibardynfact) cannot see.
+    int _pidyn_mode = 0;
+    // CHECK-mode ABORT bar; <= 0 uses 0.25. Deliberately an O(1) ROUTING bar and NOT tied to
+    // the DLR tolerance: the two routes are exact Matsubara sums of different integrands read
+    // through the same tau = 0 row, so their agreement floor is a representability floor whose
+    // prefactor grows with beta*wmax (MEASURED ~30*eps at 160, ~2000*eps at 6000) AND is data
+    // dependent (LiH-222 at prec = "low": 3.6e-03 in scf iteration 1, 2.1e-02 in iteration 2).
+    // Any eps-derived abort is flaky by construction. Exceeding max(1e-8, 100*eps) warns
+    // instead -- that IS the actionable statement, since the floor bounds pi^dyn by EITHER
+    // route. The check's real discriminating power is against a routing/plumbing break, and
+    // the closest mis-routing the routing pin rejects sits at 1.24.
+    double _pidyn_check_tol = -1.0;
+    double _pidyn_check_max = 0.0;   // running max relative deviation seen in CHECK mode
     // measured G_CC G-rotation consistency residual, running max over this vertex's
     // eval_Pi_C / eval_Sigma_C calls (diagnostic, no gate; memo section 6). Distinct
     // from the iteration-independent D-matrix leakage above: this one tracks whether
@@ -940,6 +959,30 @@ namespace solvers {
       const long n = std::max(1l, _vertex_iter);
       return _scale * std::min(1.0, double(n) / double(_ramp_iters));
     }
+    /**
+     * B-L's pi^dyn route (eq:pibardynfact). "factorized" (default) evaluates the
+     * equal-time dynamic-rung polarization directly as ONE bosonic pairing of two bubbles
+     * against W -- pole-free, and the item that was 98.9 % of B-L's vertex time. "kernel"
+     * restores the historic route (full dynamic-rung Pi^C over all nw_b frequencies, tau=0
+     * row kept). "check" runs both and gates their agreement, for confirming the refactor
+     * at production scale rather than only on the toy (test_vertex_pibardynfact).
+     *
+     * check_tol <= 0 uses an O(1) ROUTING abort bar (0.25) with a separate grid-derived
+     * WARNING at max(1e-8, 100*eps) -- see _pidyn_check_tol for why an eps-derived abort
+     * would be flaky by construction.
+     */
+    void set_pidyn_mode(std::string m, double check_tol = -1.0) {
+      if (m == "factorized") _pidyn_mode = 0;
+      else if (m == "kernel") _pidyn_mode = 1;
+      else if (m == "check") _pidyn_mode = 2;
+      else utils::check(false, "vertex_t::set_pidyn_mode: unknown vertex_pidyn \"{}\". "
+                               "Valid options are \"factorized\", \"kernel\", \"check\".", m);
+      if (check_tol > 0.0) _pidyn_check_tol = check_tol;
+    }
+    int pidyn_mode() const { return _pidyn_mode; }
+    // running max relative deviation |factorized - kernel| / |kernel| over this vertex's
+    // CHECK-mode evaluations (0 unless vertex_pidyn = "check" has run).
+    double pidyn_check_max() const { return _pidyn_check_max; }
     long vertex_iter() const { return _vertex_iter; }
     long bare_rung_uses() const { return _bare_rung_uses; }
     double sym_leakage_mean() const { return _sym_leak_mean; }

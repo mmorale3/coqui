@@ -1312,6 +1312,7 @@ namespace solvers {
     // inclusive sub-stages of SIG_RESPONSE -- indented further and NOT part of the sum
     row("|- Pi^{C,0} (no poles)",  "SIG_RESP_PI0",    6);
     row("|- Wdyn tau->inu",        "SIG_RESP_WDYNW",  6);
+    row("|- pi^dyn factorized",    "SIG_RESP_PIDYNF", 6);
     row("|- Pi^{C,dyn} @tau=0 *",  "SIG_RESP_PIDYN",  6);
     row("barrier (skew)",      "SIG_BARRIER",   4);
     {
@@ -1363,9 +1364,16 @@ namespace solvers {
       row("secondary ISDF basis", "SEC_BASIS", 4);
       row("IBZ symmetry ctx",     "SYM_CTX",   4);
     }
-    if (T("SIG_RESP_PIDYN") > 0.0)
+    if (T("SIG_RESP_PIDYN") > 0.0) {
       app_log(2, "  * Pi^{{C,dyn}} @tau=0 runs the FULL dynamic kernel (incl. the aux pole\n"
-                 "    algebra) and keeps only the tau = 0 row -- the eq:pibardynfact item.");
+                 "    algebra) and keeps only the tau = 0 row. It is REPLACED by the\n"
+                 "    factorized eq:pibardynfact row above unless vertex_pidyn = \"kernel\"\n"
+                 "    or \"check\"; when both rows are present their ratio IS the win.");
+      if (T("SIG_RESP_PIDYNF") > 0.0 and T("SIG_RESP_PIDYN") > 0.0)
+        app_log(2, "    measured pi^dyn speedup: {:.1f}x (kernel {:.3f} s vs factorized "
+                   "{:.3f} s)", T("SIG_RESP_PIDYN") / T("SIG_RESP_PIDYNF"),
+                T("SIG_RESP_PIDYN"), T("SIG_RESP_PIDYNF"));
+    }
     app_log(2, "  ----------------------------------------------------------------------\n");
     app_log_flush();
   }
@@ -1772,18 +1780,34 @@ namespace solvers {
       if (lin) {
         vertex_pi::iaft_tools tls(*_ft);
         dWw_lin = nda::array<ComplexType, 4>(nqpts_ibz, tls.nw_b, naux, naux);
-        dWw_lin() = ComplexType(0.0);
-        for (long iq = 0; iq < nqpts_ibz; ++iq)
-          for (long m = 0; m < tls.nw_b; ++m)
+        // P2.4 (notes/vertex_optimization_plan.md): this is a per-q GEMM, not a 5-deep
+        // scalar loop with the reduction on the STRIDED `it` axis. Both sources are
+        // contiguous C-order (nq, nt, naux, naux), so a q-slice reshapes to (nt, naux^2)
+        // legally, and the m-INDEPENDENT (Z - W0) term is a broadcast add AFTER the gemm
+        // instead of being recomputed inside the innermost loop.
+        // NOT bit-identical: the gemm reorders the it-sum (FP reassociation, ~1e-16 rel).
+        {
+          const long n2 = naux * naux;
+          nda::array<ComplexType, 2> cq(naux, naux);
+          for (long iq = 0; iq < nqpts_ibz; ++iq) {
+            auto out = nda::reshape(dWw_lin(iq, all, all, all),
+                                    std::array<long, 2>{tls.nw_b, n2});
+            if (sec) {
+              auto src = nda::reshape(Wb_qtmm(iq, all, all, all),
+                                      std::array<long, 2>{nt, n2});
+              nda::blas::gemm(tls.Twt_bb, src, out);
+            } else {
+              auto src = nda::reshape(Wt_qtPQ(iq, all, all, all),
+                                      std::array<long, 2>{nt, n2});
+              nda::blas::gemm(tls.Twt_bb, src, out);
+            }
             for (long M = 0; M < naux; ++M)
-              for (long N = 0; N < naux; ++N) {
-                ComplexType acc(0.0);
-                for (long it = 0; it < nt; ++it)
-                  acc += tls.Twt_bb(m, it) * (sec ? Wb_qtmm(iq, it, M, N)
-                                                  : Wt_qtPQ(iq, it, M, N));
-                dWw_lin(iq, m, M, N) = acc
-                    + (sec ? Zb_qmm(iq, M, N) : Z_qPQ(iq, M, N)) - W0b(iq, M, N);
-              }
+              for (long N = 0; N < naux; ++N)
+                cq(M, N) = (sec ? Zb_qmm(iq, M, N) : Z_qPQ(iq, M, N)) - W0b(iq, M, N);
+            for (long m = 0; m < tls.nw_b; ++m)
+              dWw_lin(iq, m, all, all) += cq;
+          }
+        }
         wwp = &dWw_lin;
         double z0 = 0.0, zs = 0.0;
         for (long iq = 0; iq < nqpts_ibz; ++iq)
@@ -1896,15 +1920,17 @@ namespace solvers {
       // (2) the tau = 0 row (the LEGAL evaluation of (1/beta) sum_nu; sparse nodes are
       //     fitting nodes, not Fourier points)
       auto R0 = vertex_w0_detail::tau0_transform_row(*_ft);
+      // P2.5: the reduction runs over the LEADING axis of Pw, i.e. inner stride
+      // nqpts_ibz * Naux_pi^2 -- the worst possible access pattern. Written as ONE gemm on
+      // the (nw_b, nq * Naux_pi^2) reshape, with R0 as a 1 x nw_b row so no transpose is
+      // needed. NOT bit-identical: reorders the m-sum.
+      const long tau0_ncol = nqpts_ibz * Naux_pi * Naux_pi;
+      auto R0row = nda::reshape(R0, std::array<long, 2>{1, tools.nw_b});
       auto tau0_of = [&](nda::array<ComplexType, 4> const &Pw,
                          nda::array<ComplexType, 3> &out) {
-        for (long iq = 0; iq < nqpts_ibz; ++iq)
-          for (long M = 0; M < Naux_pi; ++M)
-            for (long N = 0; N < Naux_pi; ++N) {
-              ComplexType acc(0.0);
-              for (long m = 0; m < tools.nw_b; ++m) acc += R0(m) * Pw(m, iq, M, N);
-              out(iq, M, N) = acc;
-            }
+        auto A = nda::reshape(Pw, std::array<long, 2>{tools.nw_b, tau0_ncol});
+        auto y = nda::reshape(out, std::array<long, 2>{1, tau0_ncol});
+        nda::blas::gemm(R0row, A, y);
       };
       nda::array<ComplexType, 3> Pi0(nqpts_ibz, Naux_pi, Naux_pi);
       tau0_of(Pi_wq, Pi0);
@@ -1917,53 +1943,142 @@ namespace solvers {
       // X^L therefore VANISHES when the screening is genuinely static: it is a built-in,
       // per-q meter of the static-kernel approximation itself, logged below.
       //
-      // NOTE (performance, not correctness): pi^dyn is obtained here from the FULL
-      // dynamic-rung Pi^C kernel and then evaluated at tau = 0. Theory eq:pibardynfact
-      // shows the frequency SUM factorizes into a single bosonic pairing of two bubbles
-      // against W -- much cheaper, and it would avoid invoking the twisted-pair pole
-      // algebra (whose conditioning is the parent theory's open issue) for what is only
-      // an equal-time value. Implementing that factorized primitive is the natural
-      // follow-up; correctness is unaffected.
+      // pi^dyn IS THE EQUAL-TIME VALUE ONLY, so it is evaluated by eq:pibardynfact: the
+      // external frequency sum closes the (12)/(34) G-pairs and leaves ONE bosonic pairing
+      // of two ordinary bubbles against W, with no twisted pairs and no pole algebra at
+      // all (vertex_pi::pi_dyn_factorized; notes/pibardynfact_increment.md). The historic
+      // route -- run the FULL dynamic-rung Pi^C over every nw_b frequency, then keep the
+      // tau = 0 row -- measured 98.9 % of B-L's vertex time and was B-L's only contact
+      // with the aux pole basis; it stays reachable as vertex_pidyn = "kernel", and
+      // "check" runs both and gates their agreement at production scale.
       if (lin) {
         // SUB-STAGE (inclusive in SIG_RESPONSE): the tau -> i.nu transform of the dynamic
         // rung. This is a per-q GEMM written as a 5-deep scalar loop with the reduction on
         // the STRIDED it axis; timed separately so the BLAS rewrite can be verified.
         _Timer.start("SIG_RESP_WDYNW");
         nda::array<ComplexType, 4> Wdyn_w(nqpts_ibz, tools.nw_b, Naux_pi, Naux_pi);
-        Wdyn_w() = ComplexType(0.0);
-        for (long iq = 0; iq < nqpts_ibz; ++iq)
-          for (long m = 0; m < tools.nw_b; ++m)
-            for (long M = 0; M < Naux_pi; ++M)
-              for (long N = 0; N < Naux_pi; ++N) {
-                ComplexType acc(0.0);
-                for (long it = 0; it < nt; ++it)
-                  acc += tools.Twt_bb(m, it) * (sec ? Wb_qtmm(iq, it, M, N)
-                                                    : Wt_qtPQ(iq, it, M, N));
-                Wdyn_w(iq, m, M, N) = acc;
-              }
+        // P2.4, same rewrite as dWw_lin above: per-q gemm on the (nt, Naux_pi^2) reshape.
+        // This slot was 0.1 % of B-L before eq:pibardynfact landed and 12.5 % after, which
+        // is exactly why the plan says to re-measure before optimizing anything.
+        // NOT bit-identical: the gemm reorders the it-sum.
+        {
+          const long n2 = Naux_pi * Naux_pi;
+          for (long iq = 0; iq < nqpts_ibz; ++iq) {
+            auto out = nda::reshape(Wdyn_w(iq, all, all, all),
+                                    std::array<long, 2>{tools.nw_b, n2});
+            if (sec) {
+              auto src = nda::reshape(Wb_qtmm(iq, all, all, all),
+                                      std::array<long, 2>{nt, n2});
+              nda::blas::gemm(tools.Twt_bb, src, out);
+            } else {
+              auto src = nda::reshape(Wt_qtPQ(iq, all, all, all),
+                                      std::array<long, 2>{nt, n2});
+              nda::blas::gemm(tools.Twt_bb, src, out);
+            }
+          }
+        }
         _Timer.stop("SIG_RESP_WDYNW");
-        // SUB-STAGE (inclusive in SIG_RESPONSE): THE eq:pibardynfact ITEM. This runs the
-        // FULL dynamic-rung Pi^C -- including phase 2's twisted-pair pole algebra over all
-        // nw_b frequencies -- and the very next statement (tau0_of) keeps only the tau = 0
-        // row. Whatever this slot reads is the upper bound on what the factorized
-        // primitive would save, and it is also B-L's ONLY exposure to the aux pole basis.
-        _Timer.start("SIG_RESP_PIDYN");
-        nda::array<ComplexType, 4> Pid_wq(tools.nw_b, nqpts_ibz, Naux_pi, Naux_pi);
-        Pid_wq() = ComplexType(0.0);
-        if (sec)
-          vertex_pi::pi_c_accumulate_w(*_ft, tools, G_CC, _Xb_skma, Zb_qmm, &Wdyn_w,
-                                       kmq, kpq, nda::range(0, nc), Pid_wq,
-                                       mpi->comm.rank(), mpi->comm.size(),
-                                       skip_rung_gamma, nullptr, symc);
-        else
-          vertex_pi::pi_c_accumulate_w(*_ft, tools, G_CC, X_C, Z_qPQ, &Wdyn_w,
-                                       kmq, kpq, nda::range(0, nc), Pid_wq,
-                                       mpi->comm.rank(), mpi->comm.size(),
-                                       skip_rung_gamma, nullptr, symc);
-        mpi->comm.all_reduce_in_place_n(Pid_wq.data(), Pid_wq.size(), std::plus<>{});
-        _Timer.stop("SIG_RESP_PIDYN");
         nda::array<ComplexType, 3> PiDyn0(nqpts_ibz, Naux_pi, Naux_pi);
-        tau0_of(Pid_wq, PiDyn0);
+        // ---- ROUTE A: eq:pibardynfact, the factorized equal-time primitive (default) ---
+        // SUB-STAGE (inclusive in SIG_RESPONSE). Pole-free: two bubble builds and one
+        // bosonic pairing per (q, k, qx), with the externals folded onto (M, N) ONCE after
+        // the nu_x sum. Routing pinned to 1.5e-15 on a cyclic Matsubara model with five
+        // mis-readings rejected at O(1) (notes/pins/pin_pibardynfact.py), and gated against
+        // ROUTE B on identical inputs by test_methods_vertex_pibardynfact.
+        if (_pidyn_mode != 1) {
+          _Timer.start("SIG_RESP_PIDYNF");
+          PiDyn0() = ComplexType(0.0);
+          if (sec)
+            vertex_pi::pi_dyn_factorized(tools, G_CC, _Xb_skma, Zb_qmm, &Wdyn_w,
+                                         kmq, kpq, nda::range(0, nc), R0, PiDyn0,
+                                         mpi->comm.rank(), mpi->comm.size(),
+                                         skip_rung_gamma, nullptr, symc);
+          else
+            vertex_pi::pi_dyn_factorized(tools, G_CC, X_C, Z_qPQ, &Wdyn_w,
+                                         kmq, kpq, nda::range(0, nc), R0, PiDyn0,
+                                         mpi->comm.rank(), mpi->comm.size(),
+                                         skip_rung_gamma, nullptr, symc);
+          mpi->comm.all_reduce_in_place_n(PiDyn0.data(), PiDyn0.size(), std::plus<>{});
+          _Timer.stop("SIG_RESP_PIDYNF");
+        }
+        // ---- ROUTE B: the historic route, kept for the production-scale refactor gate --
+        // Runs the FULL dynamic-rung Pi^C -- including phase 2's twisted-pair pole algebra
+        // over all nw_b frequencies -- and keeps only the tau = 0 row. What this slot reads
+        // against SIG_RESP_PIDYNF is the measured size of the eq:pibardynfact win, and it
+        // is the ONLY thing that exposes B-L to the aux pole basis.
+        if (_pidyn_mode != 0) {
+          _Timer.start("SIG_RESP_PIDYN");
+          nda::array<ComplexType, 4> Pid_wq(tools.nw_b, nqpts_ibz, Naux_pi, Naux_pi);
+          Pid_wq() = ComplexType(0.0);
+          if (sec)
+            vertex_pi::pi_c_accumulate_w(*_ft, tools, G_CC, _Xb_skma, Zb_qmm, &Wdyn_w,
+                                         kmq, kpq, nda::range(0, nc), Pid_wq,
+                                         mpi->comm.rank(), mpi->comm.size(),
+                                         skip_rung_gamma, nullptr, symc);
+          else
+            vertex_pi::pi_c_accumulate_w(*_ft, tools, G_CC, X_C, Z_qPQ, &Wdyn_w,
+                                         kmq, kpq, nda::range(0, nc), Pid_wq,
+                                         mpi->comm.rank(), mpi->comm.size(),
+                                         skip_rung_gamma, nullptr, symc);
+          mpi->comm.all_reduce_in_place_n(Pid_wq.data(), Pid_wq.size(), std::plus<>{});
+          _Timer.stop("SIG_RESP_PIDYN");
+          if (_pidyn_mode == 1) {
+            tau0_of(Pid_wq, PiDyn0);
+          } else {
+            // CHECK: both routes ran. WHAT THIS CAN AND CANNOT GATE (measured, see below):
+            // the two routes are exact Matsubara sums of DIFFERENT integrands read through
+            // the same tau = 0 row, so their agreement floor is the bosonic
+            // REPRESENTABILITY of each integrand. That floor is NOT a fixed multiple of eps:
+            // its prefactor grows with beta*wmax (~30*eps at 160, ~2000*eps at 6000;
+            // test_vertex_pibardynfact/production_grid_attribution) AND it is data
+            // dependent -- on LiH-222 at prec = "low" it measures 3.6e-03 in scf iteration 1
+            // and 2.1e-02 in iteration 2. So an eps-derived ABORT threshold is unreachable
+            // by construction and would only produce flaky failures.
+            //
+            // What this check really discriminates is a ROUTING or PLUMBING break, and every
+            // mis-routing the pin rejects is O(1) (the closest control is 1.24). So: WARN
+            // whenever the deviation exceeds the grid floor (that is a real and actionable
+            // statement -- pi^dyn is grid-limited, tighten iaft prec), and ABORT only above
+            // a hard O(1) bar that no representability effect can reach. An explicit
+            // vertex_pidyn_tol overrides the abort bar for callers who want it strict.
+            const double warn_at = std::max(1e-8, 1e2 * _ft->eps());
+            const double ctol = (_pidyn_check_tol > 0.0) ? _pidyn_check_tol : 0.25;
+            nda::array<ComplexType, 3> PiK(nqpts_ibz, Naux_pi, Naux_pi);
+            tau0_of(Pid_wq, PiK);
+            double dnum = 0.0, dden = 0.0;
+            for (long iq = 0; iq < nqpts_ibz; ++iq)
+              for (long M = 0; M < Naux_pi; ++M)
+                for (long N = 0; N < Naux_pi; ++N) {
+                  dnum = std::max(dnum, std::abs(PiDyn0(iq, M, N) - PiK(iq, M, N)));
+                  dden = std::max(dden, std::abs(PiK(iq, M, N)));
+                }
+            const double drel = (dden > 0.0) ? dnum / dden : dnum;
+            _pidyn_check_max = std::max(_pidyn_check_max, drel);
+            app_log(1, "  vertex_pidyn = check: |pi^dyn(factorized) - pi^dyn(kernel)| = "
+                       "{:.4e}, max|pi^dyn(kernel)| = {:.4e}, rel = {:.3e} "
+                       "(warn > {:.1e}, abort > {:.1e}; iaft eps = {:.1e})",
+                    dnum, dden, drel, warn_at, ctol, _ft->eps());
+            if (drel > warn_at)
+              app_warning("vertex_t::eval_Sigma_C: pi^dyn is GRID-LIMITED -- the factorized "
+                          "and kernel routes agree only to rel = {:.3e} at iaft eps = {:.1e}. "
+                          "Both are exact in the continuum, so this is the DLR "
+                          "representability floor of the tau = 0 read, and it bounds pi^dyn's "
+                          "accuracy BY EITHER ROUTE, not just the factorized one. If B-L "
+                          "needs pi^dyn tighter, the lever is iaft prec (\"medium\" = 1e-10, "
+                          "\"high\" = 1e-13), NOT vertex_pidyn.", drel, _ft->eps());
+            utils::check(drel <= ctol,
+                         "vertex_t::eval_Sigma_C: the eq:pibardynfact factorized pi^dyn "
+                         "disagrees with the dynamic-rung kernel at tau = 0 by rel = {}, "
+                         "above the O(1) abort bar {} (iaft eps = {}). This is too large to be "
+                         "the representability floor -- the closest mis-routing the routing "
+                         "pin rejects sits at 1.24 -- so suspect a ROUTING or PLUMBING break, "
+                         "not the grid. Do NOT raise this bar to make a run proceed: confirm "
+                         "first with test_methods_vertex_pibardynfact, whose "
+                         "production_grid_attribution section separates the two (the floor "
+                         "FALLS with iaft eps; a routing bug does not).",
+                         drel, ctol, _ft->eps());
+          }
+        }
         double xl = 0.0, p0 = 0.0;
         for (long iq = 0; iq < nqpts_ibz; ++iq)
           for (long M = 0; M < Naux_pi; ++M)

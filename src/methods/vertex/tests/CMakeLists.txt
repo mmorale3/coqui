@@ -197,6 +197,22 @@ add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${C
 set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
                     TIMEOUT ${COQUI_VERTEX_TEST_TIMEOUT})
 
+# P2.1 / eq:pibardynfact: the FACTORIZED equal-time dynamic-rung polarization
+# (vertex_pi::pi_dyn_factorized) against R0-contracted output of the existing kernel, on
+# identical inputs. Makes the switch-over a provable REFACTOR: pole-free and dynamic-rung
+# gates, a rung with no pair symmetry (the O7 transpose-discriminating case), rung
+# linearity, rank-split invariance, and the structural assertion that the new primitive
+# never initializes the aux DLR pole basis. Pure toy: seconds to run.
+set(TEST_ID methods_vertex_pibardynfact)
+
+add_executable(test_${TEST_ID} test_vertex_pibardynfact.cpp)
+target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield eri_lib hf_lib
+                      vertex_lib gw_lib scf_lib)
+
+add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
+set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
+                    TIMEOUT ${COQUI_VERTEX_TEST_TIMEOUT})
+
 # ISDF-Vertex self-consistency diagnostic (missing controls for the Si M8 divergence):
 # the little-group residual of the SELF-CONSISTENT G with the vertex OFF (baseline
 # control the IBZ test never measured), the same with the vertex ON over several

@@ -181,6 +181,30 @@ inline void ensure_checkpoint(std::shared_ptr<mf::MF> mf, std::string const& out
  *                 piece the Sigma^C-vs-GF2-exchange absolute cross-check does not cover,
  *                 and notes/q0_head_treatment.md measures it at ~2.4x the body scale at
  *                 N_k = 8.
+ *  - vertex_pidyn: "factorized" Route for B-L's equal-time dynamic-rung polarization
+ *                 pi^dyn (vertex_rung = "linear" only; ignored otherwise).
+ *                 {choices: "factorized", "kernel", "check"}. "factorized" evaluates
+ *                 eq:pibardynfact directly -- ONE bosonic pairing of two bubbles against W,
+ *                 no twisted pairs, no pole algebra. "kernel" restores the historic route
+ *                 (run the full dynamic-rung Pi^C over every bosonic node, keep only the
+ *                 tau = 0 row): it measured 98.9 % of B-L's vertex time and is B-L's only
+ *                 contact with the aux pole basis, so it is a diagnostic, not a
+ *                 recommendation. "check" runs BOTH and aborts if they disagree by more
+ *                 than vertex_pidyn_tol -- the production-scale version of the refactor
+ *                 gate that test_methods_vertex_pibardynfact runs on a toy.
+ *  - vertex_pidyn_tol: "-1" ABORT bar for vertex_pidyn = "check". <=0 uses 0.25, an O(1)
+ *                 routing bar. It is deliberately NOT tied to iaft eps: the two routes are
+ *                 exact Matsubara sums of DIFFERENT integrands read through the same tau = 0
+ *                 row, so their agreement floor is a REPRESENTABILITY floor whose prefactor
+ *                 grows with beta*wmax (MEASURED ~30*eps at 160, ~2000*eps at 6000) AND is
+ *                 data dependent (LiH-222 at prec = "low": 3.6e-03 in scf iteration 1,
+ *                 2.1e-02 in iteration 2). An eps-derived abort would therefore be flaky by
+ *                 construction. What the check DOES discriminate is a routing/plumbing break,
+ *                 and every mis-routing the routing pin rejects is O(1) (closest control
+ *                 1.24). Exceeding max(1e-8, 100*iaft eps) instead emits a WARNING, which is
+ *                 the actionable statement: pi^dyn is grid-limited -- at prec = "low" it is
+ *                 only good to ~1e-2 BY EITHER ROUTE -- and the lever is iaft prec, not
+ *                 vertex_pidyn.
  *  - vertex_scale: "1.0" Scale BOTH cuts by lambda, i.e. Phi_2^C -> lambda Phi_2^C.
  *                 Conservation stays exact at every lambda because the scaling acts on the
  *                 generating functional, not on the already-cut Sigma/P.
@@ -325,6 +349,11 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     io::tolower(vertex_div_treatment);
     auto vertex_scale = io::get_value_with_default<double>(pt,"vertex_scale",1.0);
     auto vertex_ramp_iters = io::get_value_with_default<long>(pt,"vertex_ramp_iters",0);
+    // B-L's pi^dyn route (eq:pibardynfact). "factorized" is the production route; "kernel"
+    // restores the historic full-dynamic-Pi^C-then-tau=0 path; "check" runs both and gates.
+    auto vertex_pidyn = io::get_value_with_default<std::string>(pt,"vertex_pidyn","factorized");
+    io::tolower(vertex_pidyn);
+    auto vertex_pidyn_tol = io::get_value_with_default<double>(pt,"vertex_pidyn_tol",-1.0);
     // Wannier-projector subspace C (notes/wannier_projector_theory.md): when set, the
     // vertex subspace is span{ w_a(k) } from a TRIQS-compatible wan.h5 (proj_mat +
     // band_window) instead of the band window; U is Loewdin-orthonormalized at load.
@@ -346,6 +375,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
                              vertex_isdf, vertex_isdf_rank, vertex_isdf_svd_tol, vertex_isdf_thresh,
                              vertex_isdf_cond_max, vertex_rung);
     vertex.set_vertex_scale(vertex_scale, vertex_ramp_iters);
+    vertex.set_pidyn_mode(vertex_pidyn, vertex_pidyn_tol);
     if (not vertex_div_treatment.empty()) vertex.set_div_treatment(vertex_div_treatment);
     if (vertex.enabled()) {
       utils::check(screen_type == "rpa" or screen_type == "rpa_k",
@@ -625,6 +655,11 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
     io::tolower(vertex_div_treatment);
     auto vertex_scale = io::get_value_with_default<double>(pt,"vertex_scale",1.0);
     auto vertex_ramp_iters = io::get_value_with_default<long>(pt,"vertex_ramp_iters",0);
+    // B-L's pi^dyn route (eq:pibardynfact). "factorized" is the production route; "kernel"
+    // restores the historic full-dynamic-Pi^C-then-tau=0 path; "check" runs both and gates.
+    auto vertex_pidyn = io::get_value_with_default<std::string>(pt,"vertex_pidyn","factorized");
+    io::tolower(vertex_pidyn);
+    auto vertex_pidyn_tol = io::get_value_with_default<double>(pt,"vertex_pidyn_tol",-1.0);
     // Wannier-projector subspace C (notes/wannier_projector_theory.md): when set, the
     // vertex subspace is span{ w_a(k) } from a TRIQS-compatible wan.h5 (proj_mat +
     // band_window) instead of the band window; U is Loewdin-orthonormalized at load.
@@ -646,6 +681,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
                              vertex_isdf, vertex_isdf_rank, vertex_isdf_svd_tol, vertex_isdf_thresh,
                              vertex_isdf_cond_max, vertex_rung);
     vertex.set_vertex_scale(vertex_scale, vertex_ramp_iters);
+    vertex.set_pidyn_mode(vertex_pidyn, vertex_pidyn_tol);
     if (not vertex_div_treatment.empty()) vertex.set_div_treatment(vertex_div_treatment);
     if (vertex.enabled()) {
       utils::check(screen_type == "rpa" or screen_type == "rpa_k",

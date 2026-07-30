@@ -132,8 +132,8 @@ namespace bdft_tests {
     // the full-weight P^{C,L} injection into the Dyson equation -- so unlike B-S, B-L's
     // screening IS vertex-corrected. Its response term sandwiches pi^dyn - Pi^{C,0}(tau=0),
     // whose size is the built-in X^L meter of the static-kernel approximation.
+    auto bl = run("linear", "ignore_g0");
     {
-      auto bl = run("linear", "ignore_g0");
       app_log(1, "vertex_static_e2e: B-L [ignore_g0]  e_hf = {:.12f}, e_corr = {:.12f}, "
                  "d(e_corr) vs scGW = {:+.3e}", bl.e_hf, bl.e_corr, bl.e_corr - ref.e_corr);
       REQUIRE(std::isfinite(bl.e_hf));
@@ -141,6 +141,100 @@ namespace bdft_tests {
       REQUIRE(std::abs(bl.e_hf - ref.e_hf) < 1e-3 * std::abs(ref.e_hf));
       REQUIRE(std::abs(bl.e_corr - ref.e_corr) > 1e-9);
       REQUIRE(std::abs(bl.e_corr - ref.e_corr) < 0.5 * std::abs(ref.e_corr));
+    }
+
+    // ---- THE PRODUCTION-SCALE REFACTOR GATE for eq:pibardynfact --------------------------
+    // B-L again with vertex_pidyn = "check": BOTH pi^dyn routes -- the factorized single
+    // bosonic pairing and the historic full-dynamic-Pi^C-then-tau=0 kernel -- run on
+    // IDENTICAL inputs every iteration, and vertex_t gates their agreement internally.
+    // test_vertex_pibardynfact pins the algebra on a toy; this pins it on the real LiH path
+    // (real DLR grid, real Zbar/W0bar rungs, the real response chain, both scf iterations),
+    // which is where a representability failure of either integrand would first show. The
+    // timer table this run prints carries the measured speedup (both rows present).
+    {
+      solvers::hf_t hf;
+      solvers::gw_t gw(&ft, "ignore_g0", output);
+      solvers::scr_coulomb_t scr_eri(&ft, "rpa", "ignore_g0");
+      simple_dyson dyson(mf.get(), &ft);
+      MBState mb_state(mpi_context, ft, output);
+      iter_scf::iter_scf_t iter_sol("damping");
+      solvers::vertex_t vtx(&ft, "2nd_exchange", nda::range(1, 3), mf->nbnd(),
+                            "ignore_g0", "global", -1, 1e-8, -1.0, -1.0, "linear");
+      vtx.set_pidyn_mode("check");
+      REQUIRE(vtx.pidyn_mode() == 2);
+      scr_eri.set_vertex(&vtx);
+      gw.set_vertex(&vtx);
+      auto [e_hf, e_corr] = scf_loop(mb_state, dyson, eri, ft,
+                                     solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol,
+                                     2, false, 1e-9, true);
+      mpi_context->comm.barrier();
+      const double dev = vtx.pidyn_check_max();
+      app_log(1, "vertex_static_e2e: B-L pidyn CHECK  e_corr = {:.12f}, "
+                 "max rel |pi^dyn(factorized) - pi^dyn(kernel)| = {:.4e}", e_corr, dev);
+      // liveness: both routes really ran and really are different code. Exact zero here
+      // would mean one route silently supplied the other's answer -- and in this project
+      // suspiciously exact agreement across a supposed code change has twice been the tell
+      // for a stale artifact, so it is a failure, not a pass.
+      REQUIRE(dev > 0.0);
+      // MEASURED 2026-07-30 at this grid (beta = 1000, wmax = 6, prec = "low", eps = 1e-6):
+      // 3.58e-03 in scf iteration 1 and 2.11e-02 in iteration 2. That is the DLR
+      // representability floor of reading two different exact Matsubara sums through the same
+      // tau = 0 row, and it is DATA DEPENDENT -- which is exactly why vertex_t warns on it
+      // instead of aborting, and why the abort bar is an O(1) routing bar. It is NOT the pole
+      // algebra: test_vertex_pibardynfact/production_grid_attribution measures the pole
+      // contribution at a factor 0.80, i.e. none.
+      //
+      // So gate here only on what is meaningful: the deviation must stay far below the O(1)
+      // scale at which a mis-routing would show (the closest control the routing pin rejects
+      // is 1.24). The PHYSICS statement is the shift assertion in the next block.
+      REQUIRE(dev < 0.25);
+      // ... and record when pi^dyn is grid-limited, which at prec = "low" it is.
+      if (dev > 1e2 * ft.eps())
+        app_log(1, "vertex_static_e2e: NOTE pi^dyn is grid-limited at iaft eps = {:.1e} "
+                   "(dev = {:.3e} >> 100*eps). This bounds pi^dyn BY EITHER ROUTE; the lever "
+                   "is iaft prec, not vertex_pidyn.", ft.eps(), dev);
+      // the two routes must also give the same PHYSICS: check mode consumes the factorized
+      // value, so e_corr must reproduce the default B-L run exactly.
+      REQUIRE(e_corr == bl.e_corr);
+      REQUIRE(e_hf == bl.e_hf);
+    }
+
+    // ---- and the historic route must land on the same physics ----------------------------
+    // vertex_pidyn = "kernel" is what every B-L number before 2026-07-30 was computed with.
+    // It must agree with the factorized route to the same floor -- this is the statement
+    // "the switch-over did not move B-L's answer", made as an assertion on e_corr rather
+    // than an assertion on an intermediate.
+    {
+      solvers::hf_t hf;
+      solvers::gw_t gw(&ft, "ignore_g0", output);
+      solvers::scr_coulomb_t scr_eri(&ft, "rpa", "ignore_g0");
+      simple_dyson dyson(mf.get(), &ft);
+      MBState mb_state(mpi_context, ft, output);
+      iter_scf::iter_scf_t iter_sol("damping");
+      solvers::vertex_t vtx(&ft, "2nd_exchange", nda::range(1, 3), mf->nbnd(),
+                            "ignore_g0", "global", -1, 1e-8, -1.0, -1.0, "linear");
+      vtx.set_pidyn_mode("kernel");
+      scr_eri.set_vertex(&vtx);
+      gw.set_vertex(&vtx);
+      auto [e_hf, e_corr] = scf_loop(mb_state, dyson, eri, ft,
+                                     solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol,
+                                     2, false, 1e-9, true);
+      mpi_context->comm.barrier();
+      const double shift_f = bl.e_corr - ref.e_corr;
+      const double shift_k = e_corr - ref.e_corr;
+      app_log(1, "vertex_static_e2e: B-L pidyn KERNEL e_corr = {:.12f} (factorized "
+                 "{:.12f}); vertex shift {:+.4e} vs {:+.4e}, rel diff of the SHIFT = {:.3e}",
+              e_corr, bl.e_corr, shift_k, shift_f,
+              std::abs(shift_k - shift_f) / std::max(std::abs(shift_k), 1e-30));
+      REQUIRE(std::isfinite(e_corr));
+      // BOTH bars are relative to the VERTEX SHIFT, never to e_corr's own magnitude. e_corr
+      // is ~84x the shift here (0.095 vs 1.13e-03), so an e_corr-relative bar is a bar three
+      // orders TIGHTER on the quantity actually under test -- tighter than the measured DLR
+      // floor of the object feeding it, hence meaningless. MEASURED 2026-07-30:
+      //   e_corr  -0.095078681891 (kernel) vs -0.095078649549 (factorized) => 3.23e-08
+      //   vertex shift  +1.1343e-03 both ways => rel diff of the SHIFT = 2.85e-05
+      REQUIRE(std::abs(e_corr - bl.e_corr) <= 1e-3 * std::abs(shift_k));
+      REQUIRE(std::abs(shift_k - shift_f) <= 1e-4 * std::abs(shift_k));
     }
 
     // ---- C = empty set must reproduce plain scGW EXACTLY in static mode -----------------
