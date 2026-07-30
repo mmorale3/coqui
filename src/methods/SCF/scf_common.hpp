@@ -290,17 +290,25 @@ double solve_iterative(utils::mpi_context_t<comm_t> &context, iter_scf::iter_scf
  * @param restart      - [INPUT] whether this is a restart SCF
  * @return - maximum norm of the SCF error for F and Sigma
  */
+/**
+ * @param sF_prev      - [INPUT] previous iterate of F, if the caller still has it
+ * @param sSigma_prev  - [INPUT] previous iterate of Sigma, likewise
+ * When both are given, simple mixing uses them instead of reading them back from
+ * the checkpoint (4.4 GB of serial HDF5 per iteration at Si 2x2x2/500b).
+ */
 template<typename comm_t, typename X_t, typename Xt_t>
 auto solve_iterative(utils::mpi_context_t<comm_t> &context, iter_scf::iter_scf_t& iter_solver,
                      long iteration, std::string h5_prefix, X_t &sF_skij, Xt_t &sSigma_tskij,
                      const imag_axes_ft::IAFT *FT,
-                     std::array<std::string,3> dataset={"scf", "F_skij", "Sigma_tskij"})
+                     std::array<std::string,3> dataset={"scf", "F_skij", "Sigma_tskij"},
+                     X_t const* sF_prev = nullptr, Xt_t const* sSigma_prev = nullptr)
   -> std::tuple<double, double>;
 
 template<typename MPI_Context_t, typename X_t, typename Xt_t>
 auto damping_impl(MPI_Context_t &context, iter_scf::iter_scf_t& iter_solver,
                   long iteration, std::string h5_prefix, X_t &sF_skij, Xt_t &sSigma_tskij,
-                  std::array<std::string,3> datasets={"scf", "F_skij", "Sigma_tskij"})
+                  std::array<std::string,3> datasets={"scf", "F_skij", "Sigma_tskij"},
+                  X_t const* sF_prev = nullptr, Xt_t const* sSigma_prev = nullptr)
 -> std::tuple<double, double>;
 
 template<typename MPI_Context_t, typename X_t, typename Xt_t>

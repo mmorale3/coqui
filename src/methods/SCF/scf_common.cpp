@@ -248,12 +248,24 @@ template<typename MPI_Context_t, typename X_t, typename Xt_t>
 auto damping_impl(MPI_Context_t &context, iter_scf::iter_scf_t& iter_solver,
                   long iteration, std::string h5_prefix,
                   X_t &sF_skij, Xt_t &sSigma_tskij,
-                  std::array<std::string,3> datasets)
+                  std::array<std::string,3> datasets,
+                  X_t const* sF_prev, Xt_t const* sSigma_prev)
   -> std::tuple<double, double> {
   double conv_F = 0;
   double conv_Sigma = 0;
   if (iteration == 1) {
     utils::check(false, "damping_impl: it = 1 is not allowed.");
+  } else if (sF_prev != nullptr and sSigma_prev != nullptr) {
+    // Previous iterate handed in from memory: no checkpoint read at all. The
+    // read it replaces is 4.4 GB of serial HDF5 at Si 2x2x2/500b and was ~40 s
+    // of the 43 s ITERATIVE phase, for data this process wrote itself.
+    iter_solver.metadata_log();
+    if (context.node_comm.root()) {
+      conv_F     = iter_solver.solve(sF_skij.local(), sF_prev->local());
+      conv_Sigma = iter_solver.solve(sSigma_tskij.local(), sSigma_prev->local());
+    }
+    context.node_comm.broadcast_n(&conv_F, 1, 0);
+    context.node_comm.broadcast_n(&conv_Sigma, 1, 0);
   } else {
     iter_solver.metadata_log();
     if (context.node_comm.root()) {
@@ -324,7 +336,8 @@ template<typename comm_t, typename X_t, typename Xt_t>
 auto solve_iterative(utils::mpi_context_t<comm_t> &context, iter_scf::iter_scf_t& iter_solver,
                      long iteration, std::string h5_prefix,
                      X_t &sF_skij, Xt_t &sSigma_tskij, const imag_axes_ft::IAFT *FT,
-                     std::array<std::string,3> datasets)
+                     std::array<std::string,3> datasets,
+                     X_t const* sF_prev, Xt_t const* sSigma_prev)
   -> std::tuple<double, double> {
   double conv_F = 0;
   double conv_Sigma = 0;
@@ -365,7 +378,7 @@ auto solve_iterative(utils::mpi_context_t<comm_t> &context, iter_scf::iter_scf_t
 
     if (iter_solver.iter_alg() == iter_scf::damping) {
       std::tie(conv_F, conv_Sigma) = damping_impl(context, iter_solver, iteration, h5_prefix,
-                                                  sF_skij, sSigma_tskij, datasets);
+                                                  sF_skij, sSigma_tskij, datasets, sF_prev, sSigma_prev);
     } else if (iter_solver.iter_alg() == iter_scf::DIIS) {
       std::tie(conv_F, conv_Sigma) = diis_impl(context, iter_solver, iteration, h5_prefix,
                                                sF_skij, sSigma_tskij, FT, datasets);
@@ -481,7 +494,8 @@ template double update_mu(double, dca_dyson &, const mf::MF &, const imag_axes_f
 
 template auto solve_iterative(utils::mpi_context_t<mpi3::communicator>&, iter_scf::iter_scf_t&, long, std::string,
                               sArray_t<Array_view_4D_t>&, sArray_t<Array_view_5D_t>&, const imag_axes_ft::IAFT*,
-                              std::array<std::string,3>)
+                              std::array<std::string,3>,
+                              sArray_t<Array_view_4D_t> const*, sArray_t<Array_view_5D_t> const*)
          -> std::tuple<double, double>;
 
 template void write_mf_data(mf::MF&, const imag_axes_ft::IAFT&, simple_dyson&,

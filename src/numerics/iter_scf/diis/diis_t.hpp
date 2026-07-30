@@ -83,6 +83,19 @@ namespace iter_scf {
         initialized = true;
     }
 
+    /**
+     * Present only so that iter_scf_t's variant visit compiles for damping's
+     * in-memory fast path; DIIS needs the whole iterate history rather than just
+     * the previous one, so it always goes through the checkpoint. Never reached:
+     * damping_impl only takes that path when the algorithm is simple damping.
+     */
+    template<nda::MemoryArray Array_H_t, nda::MemoryArray Array_P_t>
+    double solve(Array_H_t &&, Array_P_t const&) {
+      utils::check(false, "diis_t::solve: mixing against an in-memory previous iterate is "
+                          "only implemented for simple damping.");
+      return 0.0;
+    }
+
     template<nda::MemoryArray Array_H_t>
     double solve(Array_H_t &&H, std::string dataset, h5::group &grp, long iter) {
         (void) H; (void) dataset; (void) grp; (void) iter;

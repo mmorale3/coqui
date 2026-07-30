@@ -51,6 +51,21 @@ namespace iter_scf {
 
     ~damp_t(){}
 
+    /**
+     * Mix against a previous iterate already in memory. The h5 overload below
+     * reads it from the checkpoint instead, which at Si 2x2x2/500b means 4.4 GB
+     * of serial HDF5 per iteration for data written moments earlier.
+     */
+    template<nda::MemoryArray Array_H_t, nda::MemoryArray Array_P_t>
+    double solve(Array_H_t &&H, Array_P_t const& H_prev) {
+      auto H_previous = nda::make_regular(H_prev);
+      H = mixing*H + (1.0-mixing)*H_previous;
+      H_previous -= H;
+      auto max_iter = max_element(H_previous.data(), H_previous.data()+H_previous.size(),
+                              [](auto a, auto b) { return std::abs(a) < std::abs(b); });
+      return std::abs((*max_iter));
+    }
+
     template<nda::MemoryArray Array_H_t>
     double solve(Array_H_t &&H, std::string dataset, h5::group &grp, long iter) {
       utils::check(grp.has_subgroup("iter" + std::to_string(iter-1)), "damp: h5 group /scf/iter{} does not exist.", iter-1);

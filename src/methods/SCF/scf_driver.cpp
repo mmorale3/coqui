@@ -20,6 +20,7 @@
 
 
 
+#include <cstdlib>
 #include <optional>
 
 #include "nda/nda.hpp"
@@ -28,6 +29,7 @@
 
 #include "IO/app_loggers.h"
 #include "utilities/device_pool.h"
+#include "utilities/freemem.h"
 
 #include "methods/ERI/mb_eri_context.h"
 #include "methods/tools/chkpt_utils.h"
@@ -142,9 +144,50 @@ auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_ax
       pool_guard.emplace(pool_bytes, "scf");
   }
 
+  // Snapshot of the previous iteration's F and Sigma, so simple mixing does not
+  // read them back from the checkpoint it just wrote: that read is 4.4 GB of
+  // serial HDF5 at Si 2x2x2/500b and was ~40 s of the 43 s ITERATIVE phase. One
+  // shm copy per iteration replaces it. Skipped when node memory is tight (the
+  // arrays are 35 GB at kp444/500b), in which case mixing falls back to the
+  // checkpoint read as before. DIIS is unaffected: it needs a history, not just
+  // the previous iterate, and keeps reading the checkpoint.
+  std::optional<sArray_t<Array_view_4D_t>> sF_prev;
+  std::optional<sArray_t<Array_view_5D_t>> sSigma_prev;
+  // COQUI_NO_PREV_SNAPSHOT=1 forces the old behaviour (read the previous iterate
+  // back from the checkpoint), so the two paths can be compared directly.
+  const bool snapshot_disabled = [] {
+    const char* v = std::getenv("COQUI_NO_PREV_SNAPSHOT");
+    return v != nullptr and std::strtol(v, nullptr, 10) != 0;
+  }();
+  if (iter_solver != nullptr and iter_solver->iter_alg() == iter_scf::damping
+      and not snapshot_disabled) {
+    double need_mb = double(sSigma_tskij.local().size() + sF_skij.local().size())
+                     * sizeof(ComplexType) / (1024.0*1024.0);
+    if (double(utils::freemem()) > 3.0*need_mb) {
+      sF_prev.emplace(math::shm::make_shared_array<Array_view_4D_t>(*mpi, sF_skij.shape()));
+      sSigma_prev.emplace(math::shm::make_shared_array<Array_view_5D_t>(*mpi, sSigma_tskij.shape()));
+      app_log(2, "  keeping the previous F/Sigma in memory for mixing ({:.1f} GB/node); "
+                 "the checkpoint read is skipped.", need_mb/1024.0);
+    } else {
+      app_log(2, "  not keeping the previous F/Sigma in memory for mixing: would need "
+                 "{:.1f} GB/node with {:.1f} GB free.", need_mb/1024.0, utils::freemem()/1024.0);
+    }
+  }
+
   // start SCF iteration
   do {
     app_log(1, "\n** Iteration # {} **", output_iter);
+    // Take the snapshot before the solvers overwrite F and Sigma in place.
+    if (sSigma_prev.has_value()) {
+      sF_prev.value().win().fence();
+      sSigma_prev.value().win().fence();
+      if (mpi->node_comm.root()) {
+        sF_prev.value().local()     = sF_skij.local();
+        sSigma_prev.value().local() = sSigma_tskij.local();
+      }
+      sF_prev.value().win().fence();
+      sSigma_prev.value().win().fence();
+    }
     Timer.start("MBPT_SOLVERS");
     // HF
     if (mb_solver.hf != nullptr) {
@@ -201,9 +244,14 @@ auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_ax
 
     Timer.start("ITERATIVE");
     if (iter_solver != nullptr) {
+      // Hand the in-memory previous iterate to mixing when we kept one; it
+      // falls back to the checkpoint read when we did not.
       std::tie(F_conv, Sigma_conv) = solve_iterative(*mpi, *iter_solver, output_iter,
                                                      mb_state.coqui_prefix,
-                                                     sF_skij, sSigma_tskij, &FT);
+                                                     sF_skij, sSigma_tskij, &FT,
+                                                     {"scf", "F_skij", "Sigma_tskij"},
+                                                     sF_prev.has_value() ? &sF_prev.value() : nullptr,
+                                                     sSigma_prev.has_value() ? &sSigma_prev.value() : nullptr);
     }
     Timer.stop("ITERATIVE");
 
