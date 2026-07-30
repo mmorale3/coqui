@@ -81,6 +81,14 @@ void print_e1_decomposition(mf::MF &mf, hamilt::pseudopot *psp,
 
   hamilt::set_kinetic(mf, psp, sScratch);
   double e_kin = trace_with_dm(sScratch);
+  // Tr[Dm*T] is positive definite. This fired once, at -61.6 Ha, when sScratch
+  // arrived still holding a Fock matrix that set_kinetic did not zero and
+  // all_reduce then summed once per node -- a silent, plausible-looking number
+  // in every other respect.
+  utils::check(e_kin > 0.0,
+      "print_e1_decomposition: Tr[Dm*T] = {} is not positive. The kinetic energy "
+      "is positive definite, so the T matrix or the scratch array is corrupt "
+      "(e.g. workspace not zeroed before a per-node write + all_reduce).", e_kin);
 
   double e_dion = 0.0, e_cv = 0.0, e_vq = 0.0;
   if (psp->pp_type() == hamilt::pp_ncpp_t) {

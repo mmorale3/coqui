@@ -376,6 +376,44 @@ value to 0.006 Bohr, at an identical B0. Harvest + check with
 **unchanged** (the fix touches H0 only, so only e_1e may move — if anything else
 moved, the comparison is invalid).
 
+## §3d First corrected volume (a = 10.05) — the fix confirmed
+
+**The invariance check passes at machine precision.** The fix touches `pp_local` /
+`dion` / `vloc_ps`, i.e. H0 only, so only `e_1e` may move:
+
+    E_HF  -1.5959474265072 -> -1.5959474265065   diff +7.1e-13
+    E_x   -2.1576020148605 -> -2.1576020148607   diff -1.5e-13
+    E_H   +0.5616545883534 -> +0.5616545883542   diff +8.5e-13
+    E_c   -0.4373713234777 -> -0.4373713236407   diff -1.6e-10  (RPA solver noise)
+    e_1e  +2.4626358      -> +2.5802254          SHIFT +0.1175895 Ha
+
+**And the one-body term now agrees with instrumented ABINIT:**
+
+    CoQui e_1e - Tr[g ex_cvij]      3.1103694
+    ABINIT kin + (loc+aZ) + e1t10   3.1102141
+    -> 0.155 mHa   (pre-fix: -125.6 mHa, an 800x reduction)
+
+    CoQui Tr[g dion]  1.6465363  vs ABINIT e1t10       1.6463871  -> 0.149 mHa
+    CoQui kin+local+int_VQ  1.4638332  vs ABINIT kin+(loc+aZ) 1.4638270 -> 6.2 uHa
+
+### CAVEAT: the kinetic/local rows of the FIRST corrected batch are invalid
+
+That batch printed `Tr[Dm*T] = -61.6 Ha`, which is impossible — the kinetic energy
+is positive definite. Cause: `hamilt::set_kinetic` has each node root write only
+**its own slice** and then `all_reduce()`s, so it requires a zeroed target;
+`set_H0` is only ever handed a freshly constructed (zero-initialised) array, but
+this diagnostic reuses `sF_skij` as scratch, which still held the exchange Fock
+matrix. That leftover was summed once per node: Tr[Dm*F] ~ -4.32 x 16 nodes ~ -69,
+plus T ~ +3.1, giving the observed -61.6. `set_vnl_only` already called
+`set_zero()`, which is exactly why the dion / ex_cvij / int_VQ rows above are
+correct.
+
+Fixed by zeroing in `set_kinetic`, plus a hard `Tr[Dm*T] > 0` check in the
+diagnostic. **Nothing else is affected**: `e_1e`, `E_H`, `E_x` and `E_c` are all
+evaluated before the decomposition runs, from `dyson.sH0_skij()` — as the
+agreements above independently confirm. Only the `kinetic` and `local` rows of
+that one batch should be discarded.
+
 ## §4 Status / next
 
 - [x] Phase 0 baseline + the two killed hypotheses (§1)

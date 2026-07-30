@@ -126,6 +126,13 @@ void set_kinetic(mf::MF &mf, pseudopot *psp, math::shm::shared_array<Array_4D_t>
   std::array<long, 4> pgrid = {np_s, np_k, np_i, 1};
   long blk_i = std::min( {(long)1024, (mf.nbnd())/np_i});
   std::array<long, 4> bsize = {1, 1, blk_i, 2048};
+  // Each node root writes only ITS OWN slice, and all_reduce() then sums across
+  // nodes -- so anything already in sT_skij outside that slice is summed once per
+  // node rather than overwritten. set_H0 gets away without this because it is
+  // handed a freshly constructed (zero-initialised) array; a caller reusing a
+  // matrix as scratch is not. Measured cost of omitting it: a reused Fock matrix
+  // turned Tr[Dm*T] into -61.6 Ha (16 nodes x Tr[Dm*F]) on a 128-rank run.
+  sT_skij.set_zero();
   if (sT_skij.node_comm()->root()) {
     auto dT  = hamilt::H0<HOST_MEMORY>(mf, *sT_skij.internode_comm(), psp,
                                        nda::range(mf.nkpts_ibz()), nda::range(mf.nbnd()),
