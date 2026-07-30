@@ -55,7 +55,7 @@ for a in %(avals)s; do
        "corepsp=$(g1 corepsp) ewald=$(g1 ewald) etotal1=$(g1 etotal)" \
        "e1t10=$(q1 e1t10) eh2=$(q1 eh2)" \
        "fock0=$(g2 fock0) fock=$(g2 fock) efock=$(q2 efock)" \
-       "e1t10_2=$(q2 e1t10)"
+       "efockdc=$(q2 efockdc) e1t10_2=$(q2 e1t10)"
 done
 """
 
@@ -157,8 +157,18 @@ def report(tag, ab, cq=None):
             "e1t10":    d.get("e1t10"),
             "E_H":      None if None in (d.get("hartree"), d.get("eh2"))
                         else d["hartree"] + 0.5 * d["eh2"],
-            "E_x":      None if None in (d.get("fock0"), d.get("efock"))
-                        else d["fock0"] + d["efock"],
+            # fock0 = smooth Fock INCLUDING nhat; efock = one-centre (vv + cv).
+            # HALF of efockdc is removed: ABINIT's nsppol=1 PAW one-centre
+            # valence-valence Fock term is double counted -- pawdijfock
+            # (m_pawdij.F90:1223) sets nsp = pawrhoij%nsppol, so it contracts
+            # the SPIN-SUMMED rhoij twice. Verified by running the same
+            # non-magnetic state at nsppol=2: e1t10 / eh2 / fock0 / core-valence
+            # identical to 1e-9, efockdc exactly halved. See
+            # eos_exchange_ledger.md §3g. Without this the ABINIT exchange row
+            # is ~7.5 mHa too negative with a spurious +1.6 mHa/Bohr slope.
+            "E_x":      None if None in (d.get("fock0"), d.get("efock"),
+                                         d.get("efockdc"))
+                        else d["fock0"] + d["efock"] - 0.5 * d["efockdc"],
         }[k]
 
     rows = ["kinetic", "loc+aZ", "e1t10", "E_H", "E_x"]

@@ -442,12 +442,27 @@ class pseudopot
   }
 
   /**
+   * Drop the deltaC one-center Fock correction from add_exchange while keeping
+   * the compensation augmentation, so that the on-site term can be isolated as
+   * E_x(true) − E_x(false). This is the direct-route counterpart of
+   * thc_reader_t's `paw_onsite` knob and exists so the one-center exchange can
+   * be compared against an external reference; whether K_a belongs at all is
+   * derived from vv_compensation (moment => include, shape => drop) and is
+   * never overridden here. Not settable from the toml; production leaves it
+   * true.
+   */
+  bool paw_onsite_diag() const { return _paw_onsite_diag; }
+  void set_paw_onsite_diag(bool b) { _paw_onsite_diag = b; }
+
+  /**
    * PAW exact-exchange options (toml-controlled). Governs the core-valence
    * exchange source, the valence-valence compensation-charge model, and the
    * augmentation angular-momentum cutoff for the direct v_x / add_exchange path.
    * Set via set_exx_options() from the toml-parsing constructor (thc_reader_t).
    */
   paw_exx_options _exx_opts;
+  /// Backing store for paw_onsite_diag().
+  bool _paw_onsite_diag = true;
   paw_exx_options const& exx_options() const { return _exx_opts; }
   int aug_lmax() const { return _exx_opts.aug_lmax; }
   void set_exx_options(paw_exx_options const& o) {

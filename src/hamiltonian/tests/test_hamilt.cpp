@@ -6861,8 +6861,9 @@ void test_vexchange_mode_energies(mpi_context_t& mpi,
   auto k_weight = mfobj.k_weight();
 
   hamilt::pseudopot V(mfobj);
-  auto EX = [&](bool shape) {
+  auto EX = [&](bool shape, bool onsite = true) {
     V.set_paw_exx_shape_restored(shape);
+    V.set_paw_onsite_diag(onsite);
     auto dK = hamilt::Vexchange<MEM>(mfobj, mpi.comm, &V, nii);
     // Same convention as methods::eval_hf_energy with band-diagonal Dm=occ:
     // E_X = spin_factor · Σ_k w_k · ½ Σ_n f_n Re K_nn.
@@ -6884,12 +6885,76 @@ void test_vexchange_mode_energies(mpi_context_t& mpi,
 
   double E_m = EX(false);   // moment + deltaC (ABINIT HF pawdijfock side)
   double E_s = EX(true);    // shape / Arnaud   (ABINIT GW Sigma_x side)
+  // Moment with the deltaC one-center switched off: E_m - E_m0 is the K_a
+  // energy. The q+G=0 divergence term cancels in the difference, so it is
+  // directly comparable to an external one-center reference.
+  double E_m0 = EX(false, /*onsite=*/false);
+  V.set_paw_onsite_diag(true);
+
+  // Closed-form value of the same quantity, straight from the definition
+  //   E_x^{1c,vv} = - sum_a sum_{IJKL} D_IL D_KJ dC^a(I,J,K,L),
+  // D being the PER-SPIN one-center density matrix (which is exactly what
+  // compute_becsum_diagonal returns: sum_k w_k occ P* P, w_k = 1/N_k, no spin
+  // factor). Separates a wrong contraction in v_x from wrong inputs to it.
+  double E_ref = 0.0;
+  {
+    auto becsum = hamilt::paw::compute_becsum_diagonal(
+        V.Pskna_view(), nii, V.ityp_view(), V.nh_view(), V.ofs_view(),
+        mfobj.npol());
+    auto const& ityp = V.ityp_view();
+    auto const& nh_v = V.nh_view();
+    for (long ia = 0; ia < ityp.extent(0); ++ia) {
+      auto const& sp = V.paw_species_view()[ityp(ia)];
+      if (!sp.is_paw || sp.deltaC.size() == 0) continue;
+      long nh_a = nh_v(ityp(ia));
+      for (long I = 0; I < nh_a; ++I)
+        for (long J = 0; J < nh_a; ++J)
+          for (long K = 0; K < nh_a; ++K)
+            for (long L = 0; L < nh_a; ++L)
+              E_ref -= std::real(becsum(ia, I, L)) * std::real(becsum(ia, K, J))
+                       * sp.deltaC(I, J, K, L);
+    }
+  }
   app_log(1, "[C4 mode energies {}] E_X(moment+deltaC) = {:+.8f} Ha, "
              "E_X(shape) = {:+.8f} Ha, mode split = {:+.6e} Ha",
           tag, E_m, E_s, E_s - E_m);
+  app_log(1, "[C4 onsite split {}] E_X(moment, no K_a) = {:+.8f} Ha, "
+             "K_a = {:+.8f} Ha, closed form = {:+.8f} Ha",
+          tag, E_m0, E_m - E_m0, E_ref);
   CHECK(std::isfinite(E_m));
   CHECK(std::isfinite(E_s));
   REQUIRE(std::abs(E_s - E_m) > 1e-8);   // modes genuinely differ
+  // An identity, not a tolerance: v_x's one-center block IS this contraction.
+  REQUIRE(std::abs(E_ref) > 1e-12);
+  CHECK(std::abs((E_m - E_m0) / E_ref - 1.0) < 1e-6);
+
+  // EXTERNAL anchor for the one-center exchange. This is the only genuine
+  // rank-4 PAW contraction in the code: every other on-site quantity
+  // (ex_cvij, dij0, the one-center Hartree) contracts the density matrix with
+  // a matrix that is spherical within each (l,n) shell, so those are rank-2
+  // and blind to the structure this term depends on; and vx_onecenter_vs_thc_Ka
+  // feeds the SAME deltaC to both of its sides, so it is blind to magnitude.
+  //
+  // Reference: -1/4 sum_a sum_IJKL rho_IL rho_KJ eijkl(I,J,K,L), evaluated on
+  // ABINIT's own pawrhoij and pawtab%eijkl for this fixture's cell, dataset
+  // and k-mesh (one-shot Fock, ixc 40, on the LDA-PW orbitals). The 1/4 is the
+  // closed-shell same-spin factor: D^sigma = rho/2 in
+  // E_x = -1/2 sum_sigma D^sigma D^sigma K.
+  //
+  // ABINIT's own printed `efockdc` does NOT equal this and must not be
+  // substituted: at nsppol=1 it is 2x (pawdijfock treats the spin-summed
+  // pawrhoij as per-spin), and at nsppol=2 it is still 0.6% off because
+  // pawinit fills only the klmn<=klmn1 triangle of eijkl.
+  // Tolerance 0.2%; measured 3e-5 (the residual is CoQui's becsum vs ABINIT's
+  // rhoij, which come from different SCF paths).
+  if (tag == "bdft_si222_paw_ab") {
+    const double Ex_1c_reference = -6.658384;
+    double K_a = E_m - E_m0;
+    app_log(1, "[C4 onsite vs ABINIT {}] K_a = {:+.8f} Ha, reference = "
+               "{:+.8f} Ha, ratio = {:.6f}",
+            tag, K_a, Ex_1c_reference, K_a / Ex_1c_reference);
+    CHECK(std::abs(K_a / Ex_1c_reference - 1.0) < 2e-3);
+  }
 }
 
 TEST_CASE("vexchange_mode_energies", "[hamilt][paw][hf][slow]")
@@ -6904,6 +6969,15 @@ TEST_CASE("vexchange_mode_energies", "[hamilt][paw][hf][slow]")
     auto mf_ptr = std::make_shared<mf::MF>(
         mf::default_MF(mpi, "qe_si222_paw", mf::h5_input_type));
     test_vexchange_mode_energies<HOST_MEMORY>(*mpi, mf_ptr, "qe_si222_paw");
+  }
+  // The 12-electron ABINIT dataset puts the 2s/2p semicore in the valence, so
+  // its one-center exchange is Ha-scale (-6.6584) instead of the ~7 mHa of a
+  // 4-electron Si. A prefactor error in K_a that hides in the mHa noise
+  // elsewhere is unmissable here; this section carries the external anchor.
+  SECTION("si_kp222_paw_abinit (PAW, bdft, 12-electron)") {
+    auto mf_ptr = std::make_shared<mf::MF>(
+        mf::default_MF(mpi, "bdft_si222_paw_ab", mf::h5_input_type));
+    test_vexchange_mode_energies<HOST_MEMORY>(*mpi, mf_ptr, "bdft_si222_paw_ab");
   }
   // Direct-route mode energies on an ARBITRARY bdft mf (cluster diagnostics,
   // e.g. the C2 a10.20 acceptance run): point COQUI_VEXCHANGE_MF_DIR /

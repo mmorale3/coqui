@@ -8,7 +8,107 @@ The canonical plan is the LaTeX/PDF document (content lives there, not here):
 This file holds only the live STATUS checklist below (cheap to read/update;
 printed into context at session start by a SessionStart hook).
 
+## OPEN ITEMS
+
+Physics / correctness
+1. **THC-route K_a deficit (the only known open accuracy gap).** The direct
+   route reproduces the external one-centre reference to 0.994; the THC route
+   reads 0.884 at both a = 10.25 and 10.55. That 11% is the whole remaining
+   0.83 mHa exchange-row residual and is worth +0.007 Bohr in the Si a0.
+   Suspect: `add_K_a_to_LL` / the local-ISDF compression of the one-centre
+   block (`paw_isdf_tol`, the symmetric-pair basis), NOT the operator.
+   Next probe: `vexchange_mode_energies` with `COQUI_VEXCHANGE_MF_DIR/PREFIX`
+   pointed at `eos_jthd_coqui_fix/a10.25` gives direct-vs-THC K_a on the
+   production mf with everything else fixed.
+2. **Report the ABINIT `nsppol=1` `pawdijfock` double count upstream**, plus
+   the smaller `eijkl` upper-triangle issue (`m_paw_init.F90:610` fills only
+   `klmn<=klmn1`; `pawdijfock`'s index construction does not always land in
+   it — 0.6% of the one-centre term).
+3. psp8-NLCC end-to-end exercise remains asset-gated (the convention risk it
+   guarded is closed by source inspection).
+
+Test / infrastructure debt
+4. **The external one-centre anchor does not run pre-commit.**
+   `vexchange_mode_energies` is `[slow]` (~8 min for the 12-electron section,
+   three full direct Vexchange builds), so `[paw]~[slow]` does not cover it.
+   Either promote a cheaper variant or add it to a nightly/CI target — as it
+   stands the guard against the exact class of bug this campaign chased is
+   opt-in.
+5. **Regenerate `tests/unit_test_files/bdft/si_kp222_paw_abinit`.** It was
+   built with the pre-sqrt(4pi) converter, so its `pp_local` / `dion` /
+   `vloc_ps` are mis-normalized; re-baseline any pinned `e_1e`. `E_H`/`E_x`
+   tests (including the new anchor) are unaffected — they use none of those.
+6. The anchor constant `-6.658384` is derived by contracting ABINIT's dumped
+   `eijkl`/`rhoij`; the dump site is committed (`abinit_ene_instr.py`,
+   `ABI_DUMP_PAWKERNEL`) but the contraction that produces the number lives
+   only in the session notes. Commit that script if the constant is ever to be
+   re-derived.
+
+Campaign / data hygiene
+7. The rusty tree is behind this branch; sync before the next production run.
+8. The `exx_split` runs used `beta=100 / iaft_prec=low` to make the RPA cheap,
+   which moves the KS density matrix and shifts absolute E_x by +11.5 mHa.
+   Their on/off DIFFERENCES are valid; their absolute values are not. Rerun
+   with the EOS settings if absolute smooth+aug numbers are wanted.
+9. Regenerate any pre-`3956b45` ABINIT-sourced `paw_aug` numbers before
+   quoting them (publication-gated).
+
 ## STATUS
+
+**EXCHANGE-ROW DISCREPANCY RESOLVED — IT WAS ABINIT (2026-07-30).** The last
+CoQui-vs-ABINIT gap (the ~8 mHa exchange row with a −2.14 mHa/Bohr slope, held
+responsible for +0.028 Bohr of a0) is **an ABINIT `nsppol=1` double count, not a
+CoQui error. No CoQui physics changed; the published EOS a0 = 10.2780,
+B0 = 100.3 GPa, B' = 4.17 stands unaltered.**
+
+Split of the exchange row (`eos_exchange_ledger.md` §3g), all measured:
+core-valence agrees to **6 µHa at all six volumes**; smooth+compensation agrees
+with ABINIT's `fock0` to **0.9 mHa**; the entire residual is the one-centre
+valence-valence term. `efock` is NOT the cv term — `m_paw_denpot.F90:1094-1097`
+makes `efockdc` the one-centre vv exchange and `efock − efockdc` the cv part, and
+`fock0` already contains n̂ (`m_fock_getghc.F90:663`).
+
+The one-centre term was then cleared on both halves: CoQui's `deltaC` ≡ ABINIT's
+`pawtab%eijkl` to **1e-5** (compared via rotation invariants — the two codes'
+real-Ylm conventions differ, so element-wise comparison is meaningless), and
+`v_x`'s one-centre block reproduces its own closed form
+`−Σ_a Σ_IJKL D_IL D_KJ ΔC` to **ratio 1.000000**. What was left was a clean
+factor of 2 in the density matrix: ABINIT's `rhoij` = 2 × CoQui's `becsum`, and
+`rhoij` is provably the spin-summed matrix (`½Σρρ K` = `eh2/2`, the value `epaw`
+uses, ratio 0.50000).
+
+**ARBITER — the same non-magnetic state run `nsppol=1` vs `nsppol=2`:**
+`e1t10`, `eh2`, `fock0` and the core-valence term are identical to 1e-9; only
+`efockdc` changes, by **exactly 2.000000** (−13.394629907 → −6.697314956). Only
+the term quadratic in ρ doubles ⇒ `pawdijfock` (`m_pawdij.F90:1223`,
+`nsp = pawrhoij%nsppol`) contracts the spin-summed `rhoij` twice at `nsppol=1`.
+CoQui's K_a = −6.658166 vs the correct −6.697315 → **0.6%**. Report upstream.
+
+Consequences: the pre-registered §3c prediction a0 = 10.2501 is **superseded**
+(it used the doubled exchange); against the corrected reference the residual is
+0.83 mHa / −0.52 mHa/Bohr = **+0.007 Bohr in a0**, so CoQui's 10.2780 matches a
+corrected-ABINIT 10.2712. The whole remaining 0.83 mHa is the **THC-route K_a
+deficit** (direct route 0.994 of reference, THC route 0.884) — i.e.
+`add_K_a_to_LL`/local-ISDF compression, not operator physics.
+
+Testing invariants this exposed:
+- **The one-centre exchange is the only genuine rank-4 PAW contraction, and it
+  had no external anchor.** Every previously validated on-site quantity
+  (`ex_cvij`, `dij0`, one-centre Hartree) contracts the density matrix with a
+  matrix that is spherical within each (l,n) shell — rank-2 and invariant under
+  both the real-Ylm convention and the rank-4 structure. `vx_onecenter_vs_thc_Ka`
+  feeds the SAME `deltaC` to both sides, so it is blind to magnitude by
+  construction. Now anchored: `vexchange_mode_energies` pins K_a to instrumented
+  ABINIT (nsppol=2) at 1%.
+- **Cross-code references need an internal-consistency arbiter.** Reading the
+  reference code's source was not enough to settle the spin convention; running
+  the SAME physical state two ways (`nsppol` 1 vs 2) settled it in one shot, by
+  showing which terms moved and which did not.
+- New diagnostics kept: `pseudopot::set_paw_onsite_diag` (direct-route twin of
+  the THC `paw_onsite`, so K_a = E_x(on) − E_x(off) is measurable),
+  `notes/paw_article_results/cmp_onecenter_kernel.py`, and the
+  `ABI_DUMP_PAWKERNEL` site in `abinit_ene_instr.py` (dumps `eijkl`, `ex_cvij`,
+  `indlmn`, `rhoij`).
 
 **EOS ONE-BODY DEFECT RESOLVED (2026-07-29, later session).** The Si PAW EXX+RPA
 EOS had no minimum even after the `V_LL` fix. It was **not** exchange:

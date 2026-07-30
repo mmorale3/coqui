@@ -106,9 +106,10 @@ C_DUMP_ADD = (
 
 P_DECL_ANCHOR = " real(dp) :: intvh,intg,eshift,eh2dc,ehpw\n"
 P_DECL_ADD = (
-    "!" + MARKER + ": locals for the env-gated on-site energy dump\n"
+    "!" + MARKER + ": locals for the env-gated on-site energy / kernel dumps\n"
     " character(len=16) :: coqui_env_\n"
     " integer :: coqui_st_\n"
+    " integer :: coqui_iu_,coqui_k1_,coqui_k2_\n"
     " real(dp) :: coqui_arr_(10)\n"
 )
 
@@ -148,13 +149,78 @@ P_DUMP_ADD = (
     " end if\n\n"
 )
 
+# --- site 3: m_paw_denpot.F90 :: pawdenpot, one-center Fock KERNEL ----------
+#
+# `efock`/`efockdc` give the on-site Fock ENERGY split (efockdc = the vv
+# one-centre exchange, efock = vv + cv), but not why it differs from CoQui's.
+# This dumps the operator itself:
+#
+#   pawtab%eijkl(klmn,klmn1) = <phi_i phi_j|v|phi_k phi_l>^AE
+#                            - <phit_i phit_j + Qhat|v|phit_k phit_l + Qhat>
+#
+# built in 65_paw/m_paw_init.F90:586-655 -- the SAME tensor as CoQui's
+# `Onecenter/deltaC`, on packed pairs klmn = jlmn*(jlmn-1)/2 + ilmn (ilmn<=jlmn)
+# instead of the unpacked (nh,nh,nh,nh).  NOTE pawinit fills only klmn<=klmn1
+# (`k1min=klmn`), so the lower triangle reads back as zero -- symmetrize before
+# comparing.  `ex_cvij` (core-valence) and ABINIT's own `rhoijp` are dumped
+# alongside so the kernel can be contracted with ABINIT's density matrix, which
+# separates a kernel error from a becsum error.
+#
+# Gate: ABI_DUMP_PAWKERNEL.  Writes PAWKERNEL.dat in the run directory.
+
+K_DUMP_ANCHOR = ("       paw_ij(iatom)%dijfock(:,:)="
+                 "dijfock_vv(:,:)+dijfock_cv(:,:)\n")
+
+K_DUMP_ADD = (
+    "!" + MARKER + ": env-gated dump of the one-centre Fock kernel\n"
+    "!(ABI_DUMP_PAWKERNEL).  Pure output.\n"
+    "       call get_environment_variable(\"ABI_DUMP_PAWKERNEL\","
+    "coqui_env_,status=coqui_st_)\n"
+    "       if (coqui_st_<=0) then\n"
+    "         open(newunit=coqui_iu_,file='PAWKERNEL.dat',"
+    "position='append',action='write')\n"
+    "         write(coqui_iu_,'(a,4i8)') 'ATOM ',iatom,itypat,"
+    "pawtab(itypat)%lmn_size,pawtab(itypat)%lmn2_size\n"
+    "         do coqui_k1_=1,pawtab(itypat)%lmn_size\n"
+    "           write(coqui_iu_,'(a,7i6)') 'INDLMN ',coqui_k1_,"
+    "pawtab(itypat)%indlmn(1:6,coqui_k1_)\n"
+    "         end do\n"
+    "         do coqui_k1_=1,pawtab(itypat)%lmn2_size\n"
+    "           write(coqui_iu_,'(a,3i6,es24.16)') 'PAIR ',coqui_k1_,"
+    "pawtab(itypat)%indklmn(7,coqui_k1_),pawtab(itypat)%indklmn(8,coqui_k1_),"
+    "pawtab(itypat)%dltij(coqui_k1_)\n"
+    "         end do\n"
+    "         do coqui_k1_=1,pawtab(itypat)%lmn2_size\n"
+    "           do coqui_k2_=1,pawtab(itypat)%lmn2_size\n"
+    "             write(coqui_iu_,'(a,2i6,es24.16)') 'EIJKL ',coqui_k1_,"
+    "coqui_k2_,pawtab(itypat)%eijkl(coqui_k1_,coqui_k2_)\n"
+    "           end do\n"
+    "         end do\n"
+    "         if (allocated(pawtab(itypat)%ex_cvij)) then\n"
+    "           do coqui_k1_=1,pawtab(itypat)%lmn2_size\n"
+    "             write(coqui_iu_,'(a,i6,es24.16)') 'EXCVIJ ',coqui_k1_,"
+    "pawtab(itypat)%ex_cvij(coqui_k1_)\n"
+    "           end do\n"
+    "         end if\n"
+    "         write(coqui_iu_,'(a,2i8)') 'NRHOIJSEL ',"
+    "pawrhoij(iatom)%nrhoijsel,pawrhoij(iatom)%cplex_rhoij\n"
+    "         do coqui_k1_=1,pawrhoij(iatom)%nrhoijsel\n"
+    "           write(coqui_iu_,'(a,2i6,es24.16)') 'RHOIJ ',coqui_k1_,"
+    "pawrhoij(iatom)%rhoijselect(coqui_k1_),"
+    "pawrhoij(iatom)%rhoijp(pawrhoij(iatom)%cplex_rhoij*(coqui_k1_-1)+1,1)\n"
+    "         end do\n"
+    "         close(coqui_iu_)\n"
+    "       end if\n"
+)
+
 SITES = [
     ("src/67_common/m_common.F90",
      [(C_DECL_ANCHOR, C_DECL_ADD, "after"),
       (C_DUMP_ANCHOR, C_DUMP_ADD, "after")]),
     ("src/65_paw/m_paw_denpot.F90",
      [(P_DECL_ANCHOR, P_DECL_ADD, "after"),
-      (P_DUMP_ANCHOR, P_DUMP_ADD, "before")]),
+      (P_DUMP_ANCHOR, P_DUMP_ADD, "before"),
+      (K_DUMP_ANCHOR, K_DUMP_ADD, "after")]),
 ]
 
 

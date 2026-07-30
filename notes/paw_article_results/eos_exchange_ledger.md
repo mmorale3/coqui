@@ -363,6 +363,10 @@ cannot touch a0/B0/B'.
 
     a0 = 10.2501 Bohr    B0 = 101.1 GPa    B' = 4.18    BM resid = 0.001 mHa
 
+> **SUPERSEDED by §3g (2026-07-30):** this prediction takes ABINIT's exchange at
+> face value, and its one-centre vv term is double counted at `nsppol=1`. With
+> that corrected the prediction becomes **a0 ≈ 10.2712**.
+
 | series | a0 (Bohr) | B0 (GPa) |
 |---|---|---|
 | **PAW, predicted post-fix** | **10.2501** | **101.1** |
@@ -449,6 +453,13 @@ CoQui-vs-ABINIT exchange row predicts +0.031 Bohr (0.0024/0.0768). That row — 
 fixed here, and it is the next thing to chase if a0 is wanted tighter than
 ~0.03 Bohr.
 
+> **SUPERSEDED by §3g (2026-07-30).** That exchange row is 76% an ABINIT
+> `nsppol=1` double count of the one-centre vv Fock term, not a CoQui error, and
+> the §3c prediction of 10.2501 inherits it. Against the corrected reference the
+> residual slope is −0.52 mHa/Bohr (+0.007 Bohr), and the corrected prediction is
+> **10.2712 against CoQui's 10.2780**. The a0/B0/B' values in this table are
+> CoQui's own and are unchanged.
+
 ## §3e Corrected EOS — intermediate harvest (4 of 6 volumes)
 
 Runs: `~/ceph/CoQui/abinit/eos_jthd_coqui_fix/a*` (settings identical to the
@@ -481,6 +492,245 @@ Cluster note: six concurrent 16-node jobs reliably trigger
 alongside an already-running set; node exclusion does not help (different nodes
 each time). Serializing with `--dependency=afterany` on the first batch fixed it.
 
+## §3g The exchange row, split — it is ENTIRELY the one-centre vv term (2026-07-30)
+
+The §3f open item ("the ~8 mHa exchange row, ISDF truncation and/or the onsite
+operator") is now split all the way down. Every number below is measured, on two
+systems, with the divergence conventions of §2b removed on both sides.
+
+### The ABINIT side needed no new runs
+
+`efock` is NOT the core-valence term. `m_paw_denpot.F90:1094-1097` does
+
+    dijfock_vv = half*dijfock_vv ; dijfock_cv = dijfock_vv + dijfock_cv
+    pawaccenergy(efock  , rhoij, dijfock_cv)   ! = 1/2 sum rho dij_vv + sum rho dij_cv
+    pawaccenergy(efockdc, rhoij, dijfock_vv)   ! = 1/2 sum rho dij_vv
+
+so **`efockdc` is the one-centre VALENCE-VALENCE exchange and `efock − efockdc` is
+the core-valence part** — both already in the `eos_ledger_jthd` dumps. Likewise
+`fock0` is the smooth Fock energy *including* the compensation charge
+(`m_fock_getghc.F90:663` calls `pawmknhat_psipsi`), so it maps onto CoQui's
+smooth+`paw_aug`, not onto the bare smooth term.
+
+### Row by row (Ha)
+
+| row | CoQui | ABINIT | verdict |
+|---|---|---|---|
+| core-valence | `Tr[γ ex_cvij]` | `efock − efockdc` | **6 µHa at all 6 volumes** |
+| smooth + compensation | `E_x(paw_onsite=false)` | `fock0` | **0.9 mHa** (12-el fixture) |
+| one-centre vv | `E_x(on) − E_x(off)` | `efockdc` | **ratio 0.44–0.50** — and this is the ABINIT `nsppol=1` double count, see below |
+
+and the residual closes exactly: at a = 10.25, `efockdc − K_a` = −8.316 mHa
+against the §3b exchange-row residual of +8.285 mHa. **The whole remaining EOS
+discrepancy is the one-centre valence-valence exchange, and nothing else.**
+
+CoQui's side is split by `gen_exx_split.py` / `harvest_exx_split.py`
+(`~/ceph/CoQui/abinit/exx_split`, four variants per volume with EVERYTHING else
+held fixed — the earlier `rpa_localize_jthd` probes varied `thresh` and
+`paw_isdf_tol` at the same time as `paw_onsite`, so their K_a is contaminated):
+
+    a      smooth(bare)      aug          K_a      K_a/(ABINIT/2)   shape-moment
+    10.25   -1.7576092    +0.0960614   -0.0065872      0.88398        3.6e-05
+    10.55   -1.7265725    +0.0954723   -0.0062977      0.89907        3.6e-05
+
+`shape` and `moment+K_a` agree to **36 µHa** — two structurally independent
+on-site routes, so neither is the outlier.
+
+**A `base` control is mandatory in this kind of split.** These runs used
+`beta=100 / wmax=4 / iaft_prec=low` to make the RPA cheap; E_x does not depend on
+the RPA grid, but the KS *density matrix* it is evaluated on does, and `base`
+came out +11.5 mHa off the EOS series' E_x. That shift lives entirely in the
+smooth part and cancels in the on/off differences (`aug`, `K_a` share one Dm), so
+the split above is valid — but the absolute `CoQui smooth+aug` vs `fock0`
+comparison must be taken from the 12-electron fixture (0.9 mHa) or from the EOS
+runs themselves, not from these.
+
+### The kernel and the contraction are both correct
+
+- CoQui's `Onecenter/deltaC` and ABINIT's `pawtab%eijkl` are the *same tensor*
+  (`m_paw_init.F90:586` builds `vh1 − Vhat − B − C`, i.e. AE minus PS-plus-Qhat,
+  exactly `paw_deltaC.py`). Compared via `cmp_onecenter_kernel.py` on quantities
+  invariant under the two codes' differing real-Ylm conventions (T_H, T_X,
+  shell-resolved T_X blocks, the full pair-matrix spectrum): **agree to 1e-5 on
+  both datasets.** A raw element-by-element comparison is meaningless here and
+  reports a spurious 2-3%.
+- CoQui's `v_x` one-centre block reproduces its own closed-form definition
+  `-sum_a sum_IJKL D_IL D_KJ dC(I,J,K,L)` (D = per-spin `compute_becsum_diagonal`)
+  to **ratio 1.000000**.
+
+So the disagreement is neither the kernel nor the contraction: it is a factor of
+2 in the density-matrix convention, and it is a clean factor of 2.
+
+- ABINIT's `rhoij` = **2 × CoQui's `becsum`**, element-wise (verified directly).
+- That `rhoij` is the SPIN-SUMMED matrix is provable from ABINIT alone: the
+  one-centre Hartree energy is unambiguously ½ρ_tot·K·ρ_tot, and
+  `½ sum rho rho K` = `eh2/2` = the value `epaw` uses, **ratio 0.50000 on both
+  systems**.
+- Hence `efockdc` = −½ sum ρ_tot ρ_tot K = **−2 sum D^σ D^σ K**, while the
+  textbook same-spin exchange is −sum D^σ D^σ K. (Check on He: one orbital,
+  ρ_tot=2, D^σ=1 ⇒ E_H = ½·4·K = 2K and E_x = −K, so E_H+E_x = K = the physical
+  two-electron repulsion. The −½ρ_totρ_tot form would give −2K.)
+
+### THE ARBITER: nsppol=1 vs nsppol=2 on the SAME non-magnetic state
+
+Run the 12-electron fixture twice, `nsppol 1` and `nsppol 2` +
+`spinmagntarget 0.0` (`/tmp/.../kadiag/{fx,sp2}`). With `nsppol=2` the `rhoij`
+handed to `pawdijfock` is unambiguously per-spin (`nsp = pawrhoij%nsppol = 2`),
+so the same-spin restriction cannot be lost:
+
+| term | nsppol=1 | nsppol=2 | ratio |
+|---|---|---|---|
+| `e1t10` | −22.763097880 | −22.763097879 | 1.000000 |
+| `eh2` | +47.174294449 | +47.174294452 | 1.000000 |
+| `fock0` | −14.741246893 | −14.741246899 | 1.000000 |
+| core-valence (`efock−efockdc`) | −2.108468977 | −2.108468977 | 1.000000 |
+| **`efockdc`** | **−13.394629907** | **−6.697314956** | **2.000000** |
+
+The physical state, the smooth Fock, the one-centre Hartree and the *linear*-in-ρ
+core-valence term are all identical to 1e-9. Only the term that is *quadratic* in
+ρ changes, and by exactly 2 — the unmistakable signature of contracting the
+spin-summed ρ twice.
+
+**Conclusion: ABINIT's `nsppol=1` PAW one-centre valence-valence Fock term is 2×
+too large; the `nsppol=2` value is the correct one, and CoQui was right all
+along.**
+
+### The derivation, and an exact reproduction of ABINIT's number
+
+With `K(I,J,K,L) = ∫∫ φ_Iφ_J(r) v φ_Kφ_L(r')` (AE minus PS+Q̂; the subtraction is
+common to both codes and irrelevant here) and `D^σ_IJ = Σ_nk w_k f^σ_nk P*_nkI P_nkJ`:
+
+    Hartree  (total density):   E_H^1c = +1/2 Σ_IJKL D_tot,IJ D_tot,KL K(I,J,K,L)
+    exchange (SAME SPIN only):  E_x^1c = -1/2 Σ_σ Σ_IJKL D^σ_IL D^σ_KJ K(I,J,K,L)
+                                       = -1/4 Σ_IJKL D_tot,IL D_tot,KJ K(I,J,K,L)
+
+the last step for a closed shell (`D^σ = D_tot/2`, spin sum = 2). Sanity check on
+He — one channel, `D_tot=2`, `K=J`: `E_H = ½·4·J = 2J`, `E_x = -¼·4·J = -J`, so
+`E_H+E_x = J`, the true repulsion of two electrons in one orbital.
+
+ABINIT's chain, each link read from source:
+
+- `pawaccrhoij` (`m_paw_occupancies.F90:pawaccrhoij`): `weight = wtk_k*occ_k`,
+  `rhoij_(klmn,isppol) += weight*P*P`. The runs print `occ = 2.000000` at
+  nsppol=1 and `1.000000` at nsppol=2 ⇒ **`rhoij` = D_tot at nsppol=1, D^σ at
+  nsppol=2.**
+- `pawdijfock` (`m_pawdij.F90:1223`): `nsp = pawrhoij%nsppol`;
+  `dijfock_vv(I,J) = -Σ_KL rhoij_KL K(I,L,K,J)` — i.e. it treats `rhoij` as
+  per-spin unconditionally.
+- `pawaccenergy` (`m_paw_denpot.F90:2099`): `epaw += rhoij*dij*dltij` summed over
+  `nsploop = nspden_rhoij`.
+
+so `efockdc = nsploop · ½ Σ rhoij·dijfock_vv` gives
+
+    nsppol=1 :  -1/2 Σ D_tot D_tot K   = 2 x correct
+    nsppol=2 :  -1/2 Σ_σ D^σ D^σ K     = -1/4 Σ D_tot D_tot K = correct
+
+**Emulating `pawdijfock`'s exact indexing in python on the dumped `eijkl` and
+`rhoij` reproduces ABINIT's printed number to 5e-8:**
+
+    pawdijfock emulation, raw triangle   -13.394629956   (ABINIT: -13.394629907)
+    same, on the symmetrised tensor       -13.316769
+    /2 (the same-spin factor)              -6.658384     <- the physical value
+    CoQui K_a                              -6.658166     -> 3e-5
+
+The 0.6% between `efockdc(nsppol=2)` = −6.697315 and −6.658384 is a **second,
+much smaller ABINIT artifact**: `pawinit` fills only the `klmn<=klmn1` triangle
+of `eijkl` (`m_paw_init.F90:610`, `k1min=klmn`) and `pawdijfock`'s index
+construction does not always land in it, so some terms read back as zero. It is
+0.04 mHa on the 4-electron jth_with_d system and does not affect any conclusion
+here, but it is why the ledger's corrected reference (`efockdc/2`) is good only
+to ~0.6% of the one-centre term.
+
+**A physical observable settles it independently of any derivation:** the total
+energy of this non-magnetic system changes with `nsppol`.
+
+    term        nsppol=1        nsppol=2       difference
+    etotal   -207.980874786  -201.285955091   -6.694919695
+    epaw      -14.679049540    -7.981734587   -6.697314953
+    efockdc   -13.394629907    -6.697314956   -6.697314951
+    fock0     -14.741246893   -14.741246899   +0.000000006
+
+`epaw` inherits the `efockdc` gap exactly (2e-9), and `etotal` inherits `epaw`;
+the residual 2.4 mHa is the `kinetic`/`e_fock` difference of the one-step DS2
+orbitals. **A 6.7 Ha `nsppol` dependence in a non-magnetic total energy is a
+bug, whichever branch one prefers** — and the derivation says it is the
+`nsppol=1` branch.
+
+Why only this term: the one-centre Hartree escapes because `eh2` is accumulated
+by `pawaccenergy_**nospin**` (`m_paw_denpot.F90:893`), which contracts a
+spin-independent `dijhartree` built from the total density, and the core-valence
+term escapes because it is *linear* in ρ (`Σ_σ Σ ρ^σ X = Σ D_tot X` either way).
+Both are measured identical at nsppol 1 and 2 to 1e-9. Only the quadratic
+same-spin term is exposed.
+
+`pawdijfock` (`m_pawdij.F90:1223`) sets `nsp = pawrhoij%nsppol`, so at
+`nsppol=1` it contracts the spin-summed `rhoij` — the Hartree convention, not the
+same-spin exchange one. Worth reporting upstream. **For this project the
+consequence is that the ABINIT one-centre vv reference must come from an
+`nsppol=2` run (or be halved); `fock0`, `eh2`, `e1t10` and the core-valence term
+are unaffected.**
+
+### Why every earlier check missed it
+
+Everything that WAS validated — `ex_cvij`, `dij0`/`e1t10`, the one-centre Hartree —
+is a contraction of the density matrix with a matrix that is **spherical within
+each (l,n) shell**, and is therefore invariant under both the real-Ylm convention
+and, being rank-2, insensitive to the rank-4 structure. The one-centre exchange is
+the only PAW quantity in the code that is a genuine rank-4 contraction, and it was
+the only one never checked against an external reference: `vx_onecenter_vs_thc_Ka`
+compares THC's K_a against the direct contraction, and *both sides use the same
+deltaC*, so it is blind to the kernel's magnitude by construction (this was already
+flagged in `notes/paw_onecenter_exchange_prefactor.md`).
+
+### What this does to the EOS
+
+Correcting the reference (halving `efockdc` at each volume) shrinks the
+exchange-row residual by an order of magnitude and almost removes its slope:
+
+    a       resid (mHa)   ABINIT double-count   corrected resid
+    10.05      8.7614            7.8158              0.9456
+    10.15      8.5121            7.6266              0.8855
+    10.25      8.2846            7.4517              0.8329
+    10.35      8.0715            7.2902              0.7813
+    10.45      7.8741            7.1414              0.7327
+    10.55      7.6896            7.0046              0.6850
+
+    slope  -2.144 -> -0.521 mHa/Bohr      da0  +0.028 -> +0.0068 Bohr
+
+So **CoQui's a0 = 10.2780 agrees with a corrected-ABINIT prediction of 10.2712 to
+0.007 Bohr**, at B0 = 100.3 vs 101.1 GPa. The pre-registered §3c prediction of
+10.2501 was computed from the doubled ABINIT exchange and is **superseded**; the
+"+0.031 Bohr accounted for by the exchange-row slope" statement in §3f is
+likewise superseded — that slope was 76% ABINIT-side double counting.
+
+**The EOS numbers themselves do not change.** Nothing in CoQui was wrong, so
+`a0 = 10.2780, B0 = 100.3 GPa, B' = 4.17` stands exactly as published in §3f;
+what changes is the cross-code reference it is judged against.
+
+### Residual, and what is left
+
+0.83 mHa at a = 10.25 with a −0.52 mHa/Bohr slope (worth +0.007 Bohr in a0). It
+is **entirely the K_a deficit on the THC route**, and the accounting closes to
+0.03 mHa:
+
+    a        corrected resid    K_a deficit (ABINIT/2 − CoQui)
+    10.25        0.8329                 0.8645
+    10.55        0.6850                 0.7069
+
+    CoQui K_a / (corrected reference):
+      THC route,   jth_with_d, nbnd 500, thresh 1e-5   0.884 (10.25), 0.899 (10.55)
+      direct route, 12-el fixture, exact               0.994
+
+The direct route gets the one-centre term right to 0.6%; the THC route is ~11%
+short of it. So the remaining item is `add_K_a_to_LL` / the local-ISDF
+compression of the one-centre block (`paw_isdf_tol`, the symmetric-pair basis),
+NOT the physics of the operator. Sub-mHa, and no longer EOS-limiting.
+
+The obvious next probe is the direct-vs-THC K_a comparison on the production
+mf itself (`vexchange_mode_energies`, `COQUI_VEXCHANGE_MF_DIR/PREFIX` point at
+`eos_jthd_coqui_fix/a10.25`), which isolates the ISDF step with everything else
+held fixed.
+
 ## §4 Status / next
 
 - [x] Phase 0 baseline + the two killed hypotheses (§1)
@@ -494,8 +744,17 @@ each time). Serializing with `--dependency=afterany` on the first batch fixed it
       of which +0.031 is the accounted-for exchange-row slope.
 - [x] regression test: converter hard-errors + analytic fixture + negative control
       in `validate_b2.py synth`
-- [ ] OPEN: the ~8 mHa CoQui-vs-ABINIT exchange row (2.4 mHa/Bohr slope) — the
-      remaining a0 offset. ISDF truncation and/or the onsite-exchange operator.
+- [x] the ~8 mHa exchange row (§3g): split into cv (6 µHa), smooth+aug (0.9 mHa)
+      and one-centre vv, and **RESOLVED — the one-centre vv gap is an ABINIT
+      `nsppol=1` double count, not a CoQui error.** Proved by nsppol=1 vs
+      nsppol=2 on the same non-magnetic state: `efockdc` ratio exactly 2.000000
+      while `e1t10`/`eh2`/`fock0`/core-valence are identical to 1e-9. Against the
+      corrected reference the residual is 0.83 mHa / −0.52 mHa/Bohr (+0.007 Bohr
+      in a0). CoQui's EOS numbers are unchanged.
+- [ ] OPEN (sub-mHa): the 0.83 mHa residual and the direct-vs-THC K_a spread
+      (0.994 vs 0.884 of the corrected reference) — i.e. the THC/ISDF treatment
+      of the one-centre block.
+- [ ] OPEN: report the `nsppol=1` `pawdijfock` double count upstream to ABINIT.
 - [ ] OPEN: regenerate `tests/unit_test_files/bdft/si_kp222_paw_abinit` (built with
       the buggy converter) and re-baseline any pinned e_1e there.
 
@@ -509,3 +768,23 @@ each time). Serializing with `--dependency=afterany` on the first batch fixed it
   Trust the refusal — it caught a bogus a0 = 10.98 at "0.000 mHa residual".
 - Validate an EOS on **B0/B'**, never a0: pre-`V_LL`-fix a0 was 10.2293 (within
   0.015 of reference) while B0 was 45 GPa against 98.
+- **`efock` is the one-centre vv + cv, `efockdc` is the vv alone.** The names
+  invert the intuition ("dc" here is not a double-counting total). Reading
+  `efock` as "the core-valence term" mis-attributes ~15 mHa.
+- **ABINIT's `nsppol=1` PAW one-centre vv Fock term is 2× too large**
+  (`m_pawdij.F90:1223`, `nsp = pawrhoij%nsppol` ⇒ the spin-summed `rhoij` is
+  contracted twice). `fock0`, `eh2`, `e1t10` and the core-valence term are fine.
+  Take the one-centre vv reference from an `nsppol=2` run, or halve it.
+- **Never compare two codes' one-centre kernels element-wise.** Their real-Ylm
+  conventions differ; use rotation invariants (`cmp_onecenter_kernel.py`).
+  Element-wise reports 2-3% disagreement where the invariants agree to 1e-5.
+- **A cheap-RPA variant changes E_x** — not through the ERI but through the KS
+  density matrix it is evaluated on (`beta`, `wmax`, `iaft_prec`). Always carry
+  a `base` variant that must reproduce the reference series' E_x.
+- **Pick the fixture for sensitivity.** The 12-electron Si dataset has a Ha-scale
+  one-centre exchange; the 4-electron one has ~7 mHa. The same relative error is
+  a screaming failure on one and invisible noise on the other.
+- **When source-reading cannot settle a convention, make the code contradict
+  itself.** Running the same non-magnetic state at `nsppol` 1 and 2 settled the
+  spin convention in one shot: everything linear in ρ held to 1e-9, the one
+  quadratic term moved by exactly 2.

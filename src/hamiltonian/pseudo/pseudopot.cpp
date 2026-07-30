@@ -1740,7 +1740,7 @@ void pseudopot::add_exchange(nda::range k_range,
   hamilt::paw::v_x(*mpi, vG, *this, npol, fft_mesh_aug, lattv, recv,
                    swfc_to_rho.local(), kpts, kp_to_ibz,
                    kp_trev, kp_symm, symm_list, nii, psi, Kij,
-                   paw_shape_restored());
+                   paw_shape_restored(), paw_onsite_diag());
 }
 
 // Full density-matrix overload (routes to the natural-orbital v_x(nij)).
@@ -1764,7 +1764,7 @@ void pseudopot::add_exchange(nda::range k_range,
   hamilt::paw::v_x(*mpi, vG, *this, npol, fft_mesh_aug, lattv, recv,
                    swfc_to_rho.local(), kpts, kp_to_ibz,
                    kp_trev, kp_symm, symm_list, nij, psi, Kij,
-                   paw_shape_restored());
+                   paw_shape_restored(), paw_onsite_diag());
 }
 
 

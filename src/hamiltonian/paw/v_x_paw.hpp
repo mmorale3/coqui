@@ -332,7 +332,8 @@ inline void v_x(utils::mpi_context_t<boost::mpi3::communicator,
          nda::ArrayOfRank<3> auto const& nii,
          math::nda::DistributedArrayOfRank<4> auto const& psi,
          math::nda::DistributedArrayOfRank<4> auto & Kij,
-         bool shape_restored = false)
+         bool shape_restored = false,
+         bool onsite = true)
 {
   if (psp.pp_type() == pp_ncpp_t) {
     ::hamilt::v_x(mpi, vG, npol, mesh, lattv, recv, k2g, kpts,
@@ -579,6 +580,8 @@ inline void v_x(utils::mpi_context_t<boost::mpi3::communicator,
   // must NOT be added (it would double count). See
   // notes/paw_onsite_exchange_analysis.{md,pdf} (Route A).
   if (shape_restored) { mpi.comm.barrier(); return; }
+  // `onsite=false` isolates the one-center term (pseudopot::paw_onsite_diag).
+  if (!onsite) { mpi.comm.barrier(); return; }
 
   // ----------------------------------------------------------------------
   // PAW one-center exchange correction (deltaC-mediated AE-PS Coulomb on
@@ -708,7 +711,8 @@ inline void v_x(utils::mpi_context_t<boost::mpi3::communicator,
          nda::ArrayOfRank<4> auto const& nij,
          math::nda::DistributedArrayOfRank<4> auto const& psi,
          math::nda::DistributedArrayOfRank<4> auto & Kij,
-         bool shape_restored = false)
+         bool shape_restored = false,
+         bool onsite = true)
 {
   if (psp.pp_type() == pp_ncpp_t) {
     ::hamilt::v_x(mpi, vG, npol, mesh, lattv, recv, k2g, kpts,
@@ -916,6 +920,8 @@ inline void v_x(utils::mpi_context_t<boost::mpi3::communicator,
   // Option A (shape_restored): full AE−PS pair density already in smooth+aug
   // above → skip the deltaC one-center correction (would double count).
   if (shape_restored) { mpi.comm.barrier(); return; }
+  // `onsite=false` isolates the one-center term (pseudopot::paw_onsite_diag).
+  if (!onsite) { mpi.comm.barrier(); return; }
 
   // ---- PAW one-center exchange (deltaC), inner projectors → natural orbitals.
   // Same THC-consistent prefactor as the diagonal kernel: scl_oc = −1/N_k,
