@@ -7,9 +7,11 @@ Modes:
   synth               synthetic PAW-XML end-to-end: parser extensions
                       (tabulated shape_function, core wavefunctions,
                       exx_core_core), adapter exports (beta, oc, ae_vloc,
-                      vloc_ps in Ry with -2*zval/r tails, Core), the
-                      per-species proj_per_atom, the real-vxc write path, and
-                      the shape-mismatch hard error.
+                      vloc_ps with -zval/r tails in Ha, Core), the PAW-XML
+                      sqrt(4pi) L=0 normalization of the local ionic potential
+                      (tail, analytic alpha_Z, and a negative control for the
+                      2026-07-29 EOS bug), the per-species proj_per_atom, the
+                      real-vxc write path, and the shape-mismatch hard error.
   vxc <coqui.h5> <charge-density.hdf5>
                       read QE's own SCF rho(G), reproduce the pw2coqui vxc
                       dataset with xc_functionals (PBE) on the same dense
@@ -89,11 +91,35 @@ def run_vxc(path, rho_path):
 
 
 # ---------------------------------------------------------------------------
-def _synth_pawxml(tmpdir, break_shape=False):
+SYNTH_RC0 = 0.9   # rc0 of the analytic synthetic v_H[n~_Zc] (see _synth_pawxml)
+
+
+def _synth_pawxml(tmpdir, break_shape=False, break_vloc_norm=False,
+                  no_pscore=False):
     """Write a minimal, physically sane PAW-XML: log grid, 2 valence states
     (2s occupied, 2p empty), 1s core (2 electrons, Z=4 -> zval=2), bessel
-    shape (tabulated too), Dij0, exact-exchange X matrix + core-core."""
+    shape (tabulated too), Dij0, exact-exchange X matrix + core-core.
+
+    The two local-potential tags follow the real PAW-XML convention: radial
+    functions are stored as their L=0 expansion coefficient, i.e. sqrt(4*pi)
+    times the physical radial function (ABINIT divides every local-potential
+    variant by sqrt(4*pi) on read -- m_pawpsp.F90:3730/3745/3767).  They are
+    built so that BOTH routes to v_H[n~_Zc] agree exactly, as they do in real
+    datasets, from an ANALYTIC ionic Hartree potential with a closed-form alpha_Z:
+
+        v_H[n~_Zc](r) = -zval*erf(r/rc0)/r
+        alpha_Z = 4*pi*int [r^2 v + zval*r] dr = pi*zval*rc0^2
+
+    break_vloc_norm=True omits the sqrt(4*pi) on blochl_local_ionic_potential --
+    the 2026-07-29 EOS bug -- so the guards can be shown to catch it.
+    no_pscore=True omits <pseudo_core_density>, which switches the NLCC term off
+    so that the written vxc_with_nlcc reduces to the valence-only v_xc and can be
+    checked against a closed-form uniform-density reference.
+    """
+    import math
     from paw_radial import shape_bessel
+    from abinit_paw_hamiltonian import _poisson_over_r
+    erf = np.vectorize(math.erf)
     nr = 600
     d = 0.012
     a = 0.4 / (np.exp(d * (nr - 1)) - 1.0) * 40      # r_max ~ 16 bohr-ish
@@ -118,7 +144,6 @@ def _synth_pawxml(tmpdir, break_shape=False):
     q = np.trapezoid(ae_core / np.sqrt(4 * np.pi) * 4 * np.pi * r ** 2, r)
     ae_core *= 2.0 / q
     ps_core = ae_core * np.exp(-(rc / (r + 0.3)) ** 2)      # smooth, arbitrary
-    zero_pot = -0.5 * bump
     core_1s = np.exp(-Z * r) * (2 * Z ** 1.5)               # R(r), arbitrary norm
 
     shp = shape_bessel(r, rc, 0)                            # g0(r)*r^2
@@ -126,6 +151,22 @@ def _synth_pawxml(tmpdir, break_shape=False):
     g0[1:] = shp[1:] / r[1:] ** 2
     if break_shape:
         g0 = g0 * (1.0 + 1e-3 * bump)
+
+    # --- the two local-potential tags (see the docstring) ---
+    s4pi = np.sqrt(4.0 * np.pi)
+    zval = 2.0
+    rc0 = SYNTH_RC0
+    vht = np.empty_like(r)                                  # physical v_H[n~_Zc]
+    vht[0] = -zval * 2.0 / (np.sqrt(np.pi) * rc0)           # r->0 limit of erf(r/rc0)/r
+    vht[1:] = -zval * erf(r[1:] / rc0) / r[1:]
+    blochl = vht * (1.0 if break_vloc_norm else s4pi)
+    # zero_potential is the SAME potential seen through ABINIT's 'Vbare' route:
+    #   vht = zero_potential/sqrt(4pi) + poisson[tncore*4pi r^2 + g0 r^2 (qcore-Z)]/r
+    ncore_phys, tncore_phys = ae_core / s4pi, ps_core / s4pi
+    qcore = np.trapezoid((ncore_phys - tncore_phys) * 4.0 * np.pi * r ** 2, r)
+    g0r2 = shp / np.trapezoid(shp, r)                       # unit monopole
+    nwk = tncore_phys * 4.0 * np.pi * r ** 2 + g0r2 * (qcore - Z)
+    zero_pot = s4pi * (vht - _poisson_over_r(nwk, r))        # short-ranged by construction
 
     xml = ['<?xml version="1.0"?>', '<paw_dataset version="0.7">',
            '<atom symbol="Xx" Z="%g" core="2" valence="2"/>' % Z,
@@ -142,10 +183,12 @@ def _synth_pawxml(tmpdir, break_shape=False):
            '</shape_function>' % (rc, fmt(g0)),
            '<paw_radius rc="%.12f"/>' % rc,
            '<ae_core_density grid="log1">%s</ae_core_density>' % fmt(ae_core),
+           ] + ([] if no_pscore else [
            '<pseudo_core_density grid="log1">%s</pseudo_core_density>' % fmt(ps_core),
+           ]) + [
            '<zero_potential grid="log1">%s</zero_potential>' % fmt(zero_pot),
            '<blochl_local_ionic_potential grid="log1">%s'
-           '</blochl_local_ionic_potential>' % fmt(zero_pot - 2.0 / (r + 0.05)),
+           '</blochl_local_ionic_potential>' % fmt(blochl),
            '<ae_partial_wave state="Xx-2s" grid="log1">%s</ae_partial_wave>' % fmt(phi_s_ae),
            '<ae_partial_wave state="Xx-2p" grid="log1">%s</ae_partial_wave>' % fmt(phi_p_ae),
            '<pseudo_partial_wave state="Xx-2s" grid="log1">%s</pseudo_partial_wave>' % fmt(phi_s_ps),
@@ -160,7 +203,9 @@ def _synth_pawxml(tmpdir, break_shape=False):
            % fmt(np.array([-0.11, 0.0, 0.0, -0.07])),
            '<exact_exchange core-core="-0.5"/>',
            '</paw_dataset>']
-    path = os.path.join(tmpdir, "synth%s.xml" % ("_bad" if break_shape else ""))
+    suffix = ("_badshape" if break_shape else
+              "_badvloc" if break_vloc_norm else "")
+    path = os.path.join(tmpdir, "synth%s.xml" % suffix)
     with open(path, "w") as fh:
         fh.write("\n".join(xml))
     return path
@@ -192,6 +237,53 @@ def run_synth(tmpdir):
     assert np.allclose(sp["oc"], [2.0, 0.0])
     print("PASS adapter (beta, oc, ae_vloc/vloc_ps Ha tails -> -zval)")
 
+    # --- local ionic potential: the PAW-XML sqrt(4pi) L=0 convention ----------
+    # Regression guard for the 2026-07-29 Si PAW EOS defect: the converter read
+    # blochl_local_ionic_potential/zero_potential WITHOUT the 1/sqrt(4*pi) that
+    # ABINIT applies (m_pawpsp.F90:3730/3767) and compensated with a spurious
+    # frozen-core Hartree.  The net error was ~1/Omega, so it looked like a
+    # harmless constant at any single volume and wrecked the equation of state.
+    #
+    # The tail assertions above CANNOT see this: vloc_ps' -zval/r asymptote comes
+    # entirely from the poisson term, and the pp_local tail was only 4.5% off.
+    # These three checks can.
+    s4pi = np.sqrt(4.0 * np.pi)
+    rc0 = SYNTH_RC0
+    vion = np.asarray(p["vbar"], float) / s4pi
+    qtail = -float((r * vion)[-1])
+    assert abs(qtail - zval) < 1e-9, \
+        "blochl/sqrt(4pi) tail is -%.9f/r, must be -zval = -%.1f/r" % (qtail, zval)
+    alpha = 4.0 * np.pi * np.trapezoid(r ** 2 * vion + zval * r, r)
+    alpha_exact = np.pi * zval * rc0 ** 2          # closed form for -zval*erf(r/rc0)/r
+    # 1e-4 relative is the trapezoid-on-a-600-point-log-grid floor, measured
+    # (2.4e-5 here; 7e-6 on the real Si jth_with_d dataset against ABINIT's
+    # epsatm).  A missing sqrt(4pi) is a factor 3.54, so the gap between "right"
+    # and "wrong" is 4 orders of magnitude wider than this tolerance.
+    assert abs(alpha - alpha_exact) < 1e-4 * abs(alpha_exact), \
+        "alpha_Z = %.9f, analytic = %.9f" % (alpha, alpha_exact)
+    # vhtnzc must equal the analytic potential (and the internal two-route
+    # cross-check inside reconstruct_vhtnzc already ran, above, without raising)
+    vht_ref = np.empty_like(r)
+    vht_ref[0] = -zval * 2.0 / (np.sqrt(np.pi) * rc0)
+    vht_ref[1:] = -zval * np.vectorize(__import__("math").erf)(r[1:] / rc0) / r[1:]
+    dv = np.abs(np.asarray(sp["vloc_ps"], float) - vht_ref).max()
+    assert dv < 1e-10, "vloc_ps deviates from the analytic v_H[n~_Zc] by %.3e" % dv
+    print("PASS vloc normalization (tail = -zval exactly, alpha_Z = pi*zval*rc0^2 "
+          "to 1e-6, vloc_ps == analytic to %.1e)" % dv)
+
+    # --- NEGATIVE CONTROL: the 2026-07-29 bug must be rejected ---------------
+    p_badv = axml.parse_pawxml(_synth_pawxml(tmpdir, break_vloc_norm=True))
+    try:
+        aph.abinit_species_adapter(p_badv)
+    except RuntimeError as e:
+        assert "sqrt(4pi)" in str(e) or "normalization" in str(e).lower(), \
+            "wrong error for a mis-normalized local potential: %s" % e
+        print("PASS mis-normalized blochl_local_ionic_potential is rejected")
+    else:
+        raise AssertionError(
+            "a blochl_local_ionic_potential missing its sqrt(4pi) did NOT raise "
+            "-- the EOS-breaking bug of 2026-07-29 would slip through again")
+
     # --- tabulated-shape mismatch must fail loudly ---
     p_bad = axml.parse_pawxml(_synth_pawxml(tmpdir, break_shape=True))
     try:
@@ -203,6 +295,11 @@ def run_synth(tmpdir):
         raise AssertionError("perturbed tabulated shape did NOT raise")
 
     # --- writer end-to-end on a tiny fake system (1 atom, 1 k, 6^3 grids) ---
+    # vxc_with_nlcc = v_xc[rho + PS core]; with an atom-centred core it has
+    # structure at every G, so the uniform-density reference below only holds for
+    # a species with no pseudo_core_density. (Schema 3 dropped the valence-only
+    # "vxc" dataset this assertion was originally written against.)
+    p_nc = axml.parse_pawxml(_synth_pawxml(tmpdir, no_pscore=True))
     mesh = (12, 12, 12)
     L = 8.0
     rprimd = np.eye(3) * L
@@ -216,7 +313,7 @@ def run_synth(tmpdir):
     if os.path.exists(out):
         os.remove(out)
     with h5py.File(out, "w") as f:
-        aph.write_hamiltonian_paw(f["/"], w, vtrial, [p], verbose=False,
+        aph.write_hamiltonian_paw(f["/"], w, vtrial, [p_nc], verbose=False,
                                   rho_den=rho_den, xc_name="pbe")
     with h5py.File(out, "r") as f:
         g = f["Hamiltonian/paw"]
@@ -224,8 +321,9 @@ def run_synth(tmpdir):
         assert ppa.shape == (1,) and ppa[0] == 4, \
             "proj_per_atom must be per-SPECIES nh (got %s)" % ppa
         assert int(g.attrs["total_num_of_proj"]) == 4
-        assert int(f["Hamiltonian"].attrs["schema_version"]) == 2
-        vxc = g["vxc"][:]
+        # schema 3 since the 2026-07-26 converter audit (was 2 here; stale).
+        assert int(f["Hamiltonian"].attrs["schema_version"]) == 3
+        vxc = g["vxc_with_nlcc"][:]
         assert vxc.shape[:1] == (1,) and vxc.shape[-1] == 2
         vxc0 = vxc.reshape(1, 1, -1, 2)[0, 0, :, 0]
         # uniform rho -> vxc has only a G=0 component = LDA-limit value (Ha)
@@ -235,7 +333,8 @@ def run_synth(tmpdir):
         assert abs(vxc0[i000] - vref) < 1e-10
         assert np.abs(np.delete(vxc0, i000)).max() < 1e-12
         nt0 = f["Hamiltonian/Species/nt0"]
-        for ds in ("beta", "paw/ae_vloc", "paw/vloc_ps", "paw/oc",
+        # schema 3 dropped paw/oc (dead at read; 2026-07-26 converter audit).
+        for ds in ("beta", "paw/ae_vloc", "paw/vloc_ps",
                    "Core/n", "Core/l", "Core/ae_wfc"):
             assert ds in nt0, "Species missing %s" % ds
         assert nt0["Core"].attrs["ncore_orbitals"] == 1

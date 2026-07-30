@@ -58,36 +58,77 @@ def _poisson_over_r(nwk, r):
 
 
 def reconstruct_vhtnzc(parse, shape_by_L):
-    """Reconstruct the PS ionic HARTREE potential vhtnzc = v_H[tilde-n_Zc] from
-    PAW-XML data (no instrumented ABINIT dump needed).  Follows the electrostatic
-    part of ABINIT m_pawpsp.F90 (vlocopt==0 'Vbare' path):
-      vhtnzc = zero_potential + vh,
-      vh     = poisson[ tncore*4*pi*r^2 + g0*r^2*(qcore - Z) ] / r,
-      qcore  = int (ncore - tncore) * 4*pi*r^2 dr    (AE - PS core charge),
-      g0     = normalized l=0 compensation shape (int g0 r^2 = 1).
-    The compensation charge (qcore - Z) makes the enclosed charge -> -Zval, so
-    vhtnzc -> -Zval/r.
+    """The PS ionic HARTREE potential vhtnzc = v_H[tilde-n_Zc] (Ha), -> -zval/r.
 
-    This is Hartree-only ON PURPOSE: ABINIT's stored vlocr subtracts a frozen
-    atomic XC potential (vlocr = vbare + vh - vxc1) for its DFT SCF; CoQui's frozen
-    D^0 must be XC-free (GW/HF baseline), so vxc1 is excluded.  Verified: the tail
-    matches ABINIT's dumped vhtnzc exactly (-Zval/r); the interior difference is
-    exactly vxc1 (peaked at the nucleus, 0 beyond the augmentation radius).
-    Returns None if any input is missing.
+    Two routes, both following ABINIT:
+
+    1. PREFERRED, and what ABINIT actually does when the dataset provides it
+       (m_pawpsp.F90:3716-3730, vlocopt=2): vhtnzc IS
+       blochl_local_ionic_potential / sqrt(4*pi).  PAW-XML stores radial functions
+       as L=0 expansion coefficients, i.e. sqrt(4*pi) times the physical function.
+
+    2. FALLBACK for datasets carrying only zero_potential (m_pawpsp.F90:3749-3767
+       + :2233-2282, vlocopt=0 'Vbare' -> VH(tnzc) conversion):
+         vhtnzc = zero_potential/sqrt(4*pi) + vh,
+         vh     = poisson[ tncore*4*pi*r^2 + g0*r^2*(qcore - Z) ] / r,
+         qcore  = int (ncore - tncore) * 4*pi*r^2 dr    (AE - PS core charge),
+         g0     = normalized l=0 compensation shape (int g0 r^2 = 1).
+       The compensation charge (qcore - Z) makes the enclosed charge -> -zval.
+
+    Hartree-only ON PURPOSE: ABINIT's own vlocr may additionally subtract a frozen
+    atomic XC term for its DFT SCF bookkeeping; CoQui's frozen D^0 is XC-free by
+    design (GW/HF baseline), so vxc1 is excluded.
+
+    CAUTION, learned 2026-07-29: the 1/sqrt(4*pi) on zero_potential was missing
+    here, and the resulting vhtnzc was wrong by up to 6 Ha (131%) INSIDE the
+    augmentation sphere while its TAIL stayed correct -- the -zval/r asymptote comes
+    entirely from the poisson term, so it is completely insensitive to the bug.
+    A tail check therefore cannot validate this function; the two routes above are
+    independent and must be compared against each other, which is what the
+    cross-check below does (they agree to 2e-5 relative on Si jth_with_d and
+    Psdj_paw_pbe_std).  This fed dion via assemble_dij0.
+
+    Returns None if the inputs for both routes are missing.
     """
-    zpot = parse.get("zero_potential")
-    if (zpot is None or parse.get("ae_core") is None or parse.get("ps_core") is None
-            or parse.get("znucl") is None):
-        return None
     r = parse["r"]
-    Z = float(parse["znucl"])
-    ncore = np.asarray(parse["ae_core"], float) / np.sqrt(4.0 * np.pi)
-    tncore = np.asarray(parse["ps_core"], float) / np.sqrt(4.0 * np.pi)
-    qcore = np.trapezoid((ncore - tncore) * 4.0 * np.pi * r**2, r)   # AE - PS core charge
-    G = np.asarray(shape_by_L[0], float)
-    G = G / np.trapezoid(G, r)                                       # g0*r^2, unit monopole
-    nwk = tncore * 4.0 * np.pi * r**2 + G * (qcore - Z)
-    return np.asarray(zpot, float) + _poisson_over_r(nwk, r)
+    s4pi = np.sqrt(4.0 * np.pi)
+    direct = None
+    if parse.get("vbar") is not None:
+        v = np.asarray(parse["vbar"], float)
+        nn = min(len(r), len(v))
+        if nn == len(r):
+            direct = v / s4pi
+
+    recon = None
+    zpot = parse.get("zero_potential")
+    if not (zpot is None or parse.get("ae_core") is None or parse.get("ps_core") is None
+            or parse.get("znucl") is None):
+        Z = float(parse["znucl"])
+        ncore = np.asarray(parse["ae_core"], float) / s4pi
+        tncore = np.asarray(parse["ps_core"], float) / s4pi
+        qcore = np.trapezoid((ncore - tncore) * 4.0 * np.pi * r**2, r)  # AE - PS core charge
+        G = np.asarray(shape_by_L[0], float)
+        G = G / np.trapezoid(G, r)                                      # g0*r^2, unit monopole
+        nwk = tncore * 4.0 * np.pi * r**2 + G * (qcore - Z)
+        recon = np.asarray(zpot, float) / s4pi + _poisson_over_r(nwk, r)
+
+    if direct is not None and recon is not None:
+        # Independent cross-check inside the augmentation sphere, where dij0 and
+        # every one-center integral actually sample this potential.
+        rc = parse.get("paw_radius")
+        k = len(r) if rc is None else min(len(r), int(np.searchsorted(r, rc)) + 1)
+        sl = slice(1, k)
+        scale = max(1e-30, np.abs(direct[sl]).max())
+        rel = np.abs(direct[sl] - recon[sl]).max() / scale
+        if rel > 1e-3:
+            raise RuntimeError(
+                "abinit2coqui: the two independent constructions of v_H[n~_Zc] "
+                "disagree by %.3e relative inside r < rpaw. Route 1 = "
+                "blochl_local_ionic_potential/sqrt(4pi); route 2 = "
+                "zero_potential/sqrt(4pi) + poisson[tncore + (qcore-Z)g0]. "
+                "One of the two radial functions has an unexpected normalization."
+                % rel)
+    return direct if direct is not None else recon
 
 
 def ionic_hartree_potentials(parse, shape_by_L):
@@ -473,15 +514,29 @@ def write_hamiltonian_paw(h5root, w, vtrial, paw_parses, verbose=True,
     nhm = int(nh_sp.max())
 
     # ---- local ionic potential pp_local_component (QE vltot convention) ----
-    # blochl_local_ionic_potential is Bloechl's v_H[n~_Zc]; it is NOT short-ranged:
-    # it carries the bare -Z/r nuclear Coulomb tail.  The valence electrons see the
-    # frozen ion of charge +Zval, so the local ionic potential must go as -Zval/r.
-    # We (1) add the frozen-core Hartree V_H[n_core] (+Zc/r screening), then (2) do
-    # the standard Coulomb split so the sin-transform integrand is short-ranged and
-    # the -Q/r long range is analytic: V(G!=0)=FT[v+Q/r]-4*pi*Q/(vol*G^2), and the
-    # G=0 term is the finite "alpha" reference.  The previous code FFT'd the bare
-    # -Z/r tail over the whole radial grid, giving a huge divergent V(G=0) that made
-    # the CoQui one-electron energy pathological (~-37000 Ha, ~1/Omega swing).
+    # PAW-XML stores every radial function as its L=0 spherical-harmonic expansion
+    # coefficient, i.e. sqrt(4*pi) TIMES the physical radial function.  ABINIT
+    # divides each local-potential variant by sqrt(4*pi) on read
+    # (m_pawpsp.F90:3730 blochl, :3745 kresse_joubert, :3767 zero_potential), and
+    # blochl_local_ionic_potential/sqrt(4*pi) IS v_H[n~_Zc]: it already carries the
+    # VALENCE-only -zval/r tail, with the frozen core screening included.
+    #
+    # HISTORY (2026-07-29, the Si PAW EOS exchange defect): omitting that 1/sqrt(4*pi)
+    # made the tail read -zval*sqrt(4*pi)/r = -4.17957/r for Si once a *second*,
+    # compensating error was applied -- the missing factor made the raw tail look like
+    # -14.1796/r ~ -Z_nuc/r, which motivated adding a frozen-core Hartree screening
+    # that must not be there.  The two errors nearly cancelled in the long range
+    # (leaving 4.17957 instead of 4) but not at short range or at G=0, giving an
+    # alpha_Z of 25.132 Ha.Bohr^3/atom against ABINIT's epsatm = 8.858, and a
+    # one-body energy with the wrong volume dependence -- which destroyed the
+    # equation of state while leaving a0 plausible.  Verified after the fix:
+    # Qtail = 4.000000 exactly, and alpha_Z = 8.858468 vs ABINIT 8.858424 (5 ppm).
+    # See notes/paw_article_results/eos_exchange_ledger.md.
+    #
+    # The Coulomb split then makes the sin-transform integrand short-ranged and the
+    # -Q/r long range analytic: V(G!=0) = FT[v+Q/r] - 4*pi*Q/(vol*G^2), with the G=0
+    # term the finite "alpha" reference.  Q is the EXACT zval, not the numerical
+    # plateau: a dataset-noise-driven Q leaks a spurious monopole into every G.
     vloc_tot = np.zeros(ngm, dtype=complex)
     small = Gn < 1e-8
     Gs = np.where(small, 1.0, Gn)
@@ -489,17 +544,23 @@ def write_hamiltonian_paw(h5root, w, vtrial, paw_parses, verbose=True,
         p = paw_parses[typat[a] - 1]
         zval = float(sum(s.get("f", 0.0) for s in p["states"]))
         r = p["r"]; vbar = p["vbar"]
-        nn = min(len(r), len(vbar), len(p["ae_core"]))
-        r = r[:nn]; vion = vbar[:nn].astype(float)
-        # add frozen-core Hartree screening: -Z/r  ->  -Zval/r
-        ncore = p["ae_core"][:nn] / np.sqrt(4.0 * np.pi)   # L=0 moment -> number density
-        vion = vion + _radial_hartree(ncore, r)
-        # asymptotic ionic charge from the r*vion plateau (== Zval up to dataset noise)
+        nn = min(len(r), len(vbar))
+        r = r[:nn]
+        vion = np.asarray(vbar, float)[:nn] / np.sqrt(4.0 * np.pi)
+        # The tail MUST be -zval/r. A mis-normalized or core-unscreened potential
+        # shows up here, and nowhere else that any other check looks.
         Qtail = -float((r * vion)[-1])
-        rvsr = r * vion + Qtail                            # short-ranged: -> 0 at large r
+        if abs(Qtail - zval) > 1e-3 * max(1.0, zval):
+            raise RuntimeError(
+                "abinit2coqui: blochl_local_ionic_potential/sqrt(4pi) has tail "
+                "-%.6f/r but the dataset's valence charge is %.6f. The PAW-XML "
+                "local ionic potential must go as -zval/r (core screening "
+                "included). Check the L=0 sqrt(4pi) convention of this dataset."
+                % (Qtail, zval))
+        rvsr = r * vion + zval                             # short-ranged: -> 0 at large r
         sr = (4 * np.pi / vol) * np.trapezoid(
             rvsr[None, :] * np.sin(np.outer(Gs, r)) / Gs[:, None], r, axis=1)
-        sr -= np.where(small, 0.0, 4.0 * np.pi * Qtail / (vol * Gs**2))
+        sr -= np.where(small, 0.0, 4.0 * np.pi * zval / (vol * Gs**2))
         sr[small] = (4 * np.pi / vol) * np.trapezoid(rvsr * r, r)   # finite alpha
         vloc_tot += np.exp(-1j * (Gcart @ tau[a])) * sr
 

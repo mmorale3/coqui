@@ -10,6 +10,37 @@ printed into context at session start by a SessionStart hook).
 
 ## STATUS
 
+**EOS ONE-BODY DEFECT RESOLVED (2026-07-29, later session).** The Si PAW EXX+RPA
+EOS had no minimum even after the `V_LL` fix. It was **not** exchange:
+`abinit2coqui` omitted the PAW-XML L=0 `1/sqrt(4pi)` on
+`blochl_local_ionic_potential` and `zero_potential` (ABINIT applies it at
+`m_pawpsp.F90:3730/3767`) and compensated with a spurious frozen-core Hartree, so
+`alpha_Z` was 25.132 Ha.Bohr^3/atom against ABINIT's `epsatm` = 8.858 and `dij0`
+was off by up to 12 Ha. Post-fix `alpha_Z` = 8.858488 vs 8.858424 (5 ppm),
+`Qtail` = 4.000000 exactly. Full write-up + reusable cross-code ledger:
+`notes/paw_article_results/eos_exchange_ledger.md`.
+
+Three testing invariants this exposed:
+- **A tail check cannot validate `vhtnzc`.** Its `-zval/r` asymptote comes entirely
+  from the poisson term, so it is insensitive to a `sqrt(4pi)` error inside the
+  augmentation sphere (131% wrong there while the tail read correct). The B2
+  validation checked exactly that tail.
+- **"Benign constant" is the wrong verdict for anything going as 1/Omega.** This was
+  recorded as a benign vloc-G=0 gauge constant because it is constant at fixed
+  volume — which is precisely a slope error across a volume series. Validate an
+  EOS-relevant quantity at >= 2 volumes against an external reference.
+- **Cross-code term-by-term ledgers need a control that is known-good.** The NC
+  series (psp8 reader, immune to this bug) agrees with instrumented ABINIT to
+  ~5 uHa per term at every volume; running it first proved the mapping, converter
+  and both divergence conventions before the PAW numbers were trusted.
+
+Guards added: hard error if the local-potential tail != zval; hard error if the two
+independent `v_H[n~_Zc]` routes disagree; regression test + negative control in
+`validate_b2.py synth`. OWED: regenerate the checked-in AB fixture
+`tests/unit_test_files/bdft/si_kp222_paw_abinit` (built with the buggy converter,
+so its `pp_local`/`dion`/`vloc_ps` are mis-normalized) and re-baseline any pinned
+`e_1e` there; `E_H`/`E_x` AB tests are unaffected (they use neither).
+
 **RPA INSTABILITY RESOLVED (2026-07-29).** The Si PAW RPA blow-up at large band
 count was `V_LL` conjugating the FIRST index of Z instead of the second, storing
 its transpose (commit 86ace47). EOS spread 107.16 -> 3.75 mHa against ABINIT's
