@@ -100,7 +100,8 @@ namespace methods {
                      "EVALUATE_SIGMA_K", "SIGMA_ALLOC_K", "SIGMA_HADPROD_K", "SIGMA_MULTIPLY_DMAT_K",
                      "EVALUATE_SIGMA_R", "SIGMA_ALLOC_R", "SIGMA_FT_R", "SIGMA_HADPROD_R",
                      "IMAG_FT_TtoW", "IMAG_FT_WtoT", "FT_REDISTRIBUTE",
-                     "SIGMA_DIV_CORR"} ) {
+                     "SIGMA_DIV_CORR", "SIGMA_DIV_T", "SIGMA_DIV_ALLOC", "SIGMA_DIV_GEMM",
+                     "SIGMA_DIV_REDUCE", "SIGMA_DIV_ADD"} ) {
         _Timer.add(v);
       }
 
@@ -180,7 +181,8 @@ namespace methods {
                      "EVALUATE_SIGMA_K", "SIGMA_ALLOC_K", "SIGMA_HADPROD_K", "SIGMA_MULTIPLY_DMAT_K",
                      "EVALUATE_SIGMA_R", "SIGMA_ALLOC_R", "SIGMA_FT_R", "SIGMA_HADPROD_R",
                      "IMAG_FT_TtoW", "IMAG_FT_WtoT", "FT_REDISTRIBUTE",
-                     "SIGMA_DIV_CORR"} ) {
+                     "SIGMA_DIV_CORR", "SIGMA_DIV_T", "SIGMA_DIV_ALLOC", "SIGMA_DIV_GEMM",
+                     "SIGMA_DIV_REDUCE", "SIGMA_DIV_ADD"} ) {
         _Timer.add(v);
       }
 

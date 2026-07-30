@@ -1,6 +1,9 @@
 #ifndef COQUI_THC_GW_ICC
 #define COQUI_THC_GW_ICC
 
+#include <optional>
+
+#include "itertools/itertools.hpp"
 #include "mpi3/communicator.hpp"
 #include "nda/nda.hpp"
 #include "nda/blas.hpp"
@@ -566,6 +569,7 @@ namespace methods {
         // stride nbnd, so it missed cache on essentially every term. Same
         // arithmetic, expressed as BLAS3: each rank still writes only the (s,k)
         // blocks it owns and the all-reduce below combines them unchanged.
+        _Timer.start("SIGMA_DIV_T");
         T_skia.win().fence();
         {
           nda::array<ComplexType, 2> Y_Pi(NP, nbnd);
@@ -582,12 +586,30 @@ namespace methods {
         }
         T_skia.win().fence();
         T_skia.all_reduce();
+        _Timer.stop("SIGMA_DIV_T");
 
         nda::array<ComplexType, 2> buffer_ib(nbnd, nbnd);
 
-        auto sDelta_tskij = make_shared_array<Array_view_5D_t>(*mpi, sSigma_tskij.shape());
-        auto Delta_loc = sDelta_tskij.local();
-        sDelta_tskij.win().fence();
+        // Every (t,s,k) block below is written by exactly one rank, so on a
+        // single node the node's shm copy already holds the complete
+        // correction: the Sigma-sized (4.4 GB at Si 2x2x2/500b) staging buffer,
+        // its all-reduce and the final add are all pure overhead there, and we
+        // accumulate straight into Sigma instead (beta = 1 rather than 0).
+        // Across nodes the buffer is still needed, because each node computes
+        // only its own share and every node needs the whole correction.
+        _Timer.start("SIGMA_DIV_ALLOC");
+        const bool stage_delta = (sSigma_tskij.internode_comm()->size() > 1);
+        std::optional<sArray_t<Array_view_5D_t>> sDelta_tskij;
+        if (stage_delta)
+          sDelta_tskij.emplace(make_shared_array<Array_view_5D_t>(*mpi, sSigma_tskij.shape()));
+        _Timer.stop("SIGMA_DIV_ALLOC");
+
+        auto Delta_loc = (stage_delta)? sDelta_tskij.value().local() : sSigma_tskij.local();
+        auto& out_win = (stage_delta)? sDelta_tskij.value().win() : sSigma_tskij.win();
+        const ComplexType beta = (stage_delta)? ComplexType(0.0) : ComplexType(1.0);
+
+        _Timer.start("SIGMA_DIV_GEMM");
+        out_win.fence();
         for (size_t tsk = rank; tsk < nts * ns * nkpts; tsk += size) {
           // tsk = it * ns*nkpts + is * nkpts + ik
           size_t it = tsk / (ns * nkpts);
@@ -601,14 +623,31 @@ namespace methods {
           auto Delta_ij = Delta_loc(it, is, ik, nda::ellipsis{});
           auto T_ia = T_skia_loc(is, ik, nda::ellipsis{});
           nda::blas::gemm(T_ia, G_ab, buffer_ib);
-          nda::blas::gemm(ComplexType(factor), buffer_ib, nda::dagger(T_skia_loc(is, ik, nda::ellipsis{})), 
-                     ComplexType(0.0), Delta_ij);
+          nda::blas::gemm(ComplexType(factor), buffer_ib, nda::dagger(T_skia_loc(is, ik, nda::ellipsis{})),
+                     beta, Delta_ij);
         }
-        sDelta_tskij.win().fence();
-        sDelta_tskij.all_reduce();
+        out_win.fence();
+        _Timer.stop("SIGMA_DIV_GEMM");
 
-        if (sSigma_tskij.node_comm()->root())
-          sSigma_tskij.local() += sDelta_tskij.local();
+        if (stage_delta) {
+          _Timer.start("SIGMA_DIV_REDUCE");
+          sDelta_tskij.value().all_reduce();
+          _Timer.stop("SIGMA_DIV_REDUCE");
+
+          // Sum into Sigma with every rank on the node, not just its root:
+          // this touches ~13 GB at Si 2x2x2/500b and used to run on one core.
+          _Timer.start("SIGMA_DIV_ADD");
+          int node_rank = sSigma_tskij.node_comm()->rank();
+          int node_size = sSigma_tskij.node_comm()->size();
+          long nelem = long(sSigma_tskij.local().size());
+          auto [i0, i1] = itertools::chunk_range(0, nelem, node_size, node_rank);
+          auto Sigma_1D = nda::reshape(sSigma_tskij.local(), std::array<long, 1>{nelem});
+          auto Delta_1D = nda::reshape(sDelta_tskij.value().local(), std::array<long, 1>{nelem});
+          sSigma_tskij.win().fence();
+          Sigma_1D(nda::range(i0, i1)) += Delta_1D(nda::range(i0, i1));
+          sSigma_tskij.win().fence();
+          _Timer.stop("SIGMA_DIV_ADD");
+        }
         sSigma_tskij.communicator()->barrier();
       } else {
         utils::check(false, "Unsupported divergence treatment: {}", div_treatment);

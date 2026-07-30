@@ -75,6 +75,13 @@ namespace methods {
         app_log(2, "      - Sigma_uv -> Sigma_ij {0:.3f} sec", _Timer.elapsed("SIGMA_AUX_TO_PRIM"));
       }
       app_log(2, "    Sigma_div_correction:    {0:.3f} sec", _Timer.elapsed("SIGMA_DIV_CORR"));
+      if (_Timer.elapsed("SIGMA_DIV_CORR") > 0.0) {
+        app_log(2, "      - Build T_skia:        {0:.3f} sec", _Timer.elapsed("SIGMA_DIV_T"));
+        app_log(2, "      - Alloc:               {0:.3f} sec", _Timer.elapsed("SIGMA_DIV_ALLOC"));
+        app_log(2, "      - Gemms:               {0:.3f} sec", _Timer.elapsed("SIGMA_DIV_GEMM"));
+        app_log(2, "      - All-reduce:          {0:.3f} sec", _Timer.elapsed("SIGMA_DIV_REDUCE"));
+        app_log(2, "      - Add into Sigma:      {0:.3f} sec", _Timer.elapsed("SIGMA_DIV_ADD"));
+      }
       app_log(2, "    Imaginary FT tau->w:     {0:.3f} sec", _Timer.elapsed("IMAG_FT_TtoW"));
       app_log(2, "    Imaginary FT w->tau:     {0:.3f} sec", _Timer.elapsed("IMAG_FT_WtoT"));
       app_log(2, "      - FT_REDISTRIBUTE:     {0:.3f} sec\n", _Timer.elapsed("FT_REDISTRIBUTE"));
