@@ -655,4 +655,674 @@ namespace bdft_tests {
 #endif
   }
 
+  /**
+   * INCREMENT S9 -- the W-SIDE FUNCTIONAL-DERIVATIVE ORACLE for Formulation B-L.
+   *
+   * WHY THIS EXISTS (and why its absence mattered). S9 shipped WITHOUT its mandated gate:
+   * the file above covers B-S only (its W-cut vanishes identically), so until now NOTHING
+   * verified that B-L's two cuts are consistent cuts of one functional. Every other B-L
+   * test in the suite is loose (finiteness / magnitude bands), relative (sym-vs-nosym) or
+   * trivial (C = empty). A wrong WEIGHT in P^{C,L} -- the one term that distinguishes B-L
+   * from B-S -- passes all of them, and shows up only as bad physics in production. It did:
+   * on Si kp222 B-L departs from B-S by 7.5x with the opposite sign and goes unstable at
+   * iteration 8, while B-S (which is gated) converges cleanly.
+   *
+   * THE IDENTITY (theoryB_static eq:Woracle):
+   *
+   *   d/dl Phi_2^{C,L}[G, W + l dW]|_0
+   *       = -1/2 * (1/(Nk beta)) sum_{q,nu} sum_{IJ} P^{C,L}_{IJ}(q,inu) dW_{JI}(q,inu)
+   *
+   * It "pins the FULL weight of P^{C,L} -- the discriminator against the half-weight trap
+   * (the naive Variant-F functional fails it by exactly a factor 2)".
+   *
+   * WHAT MAKES IT SHARP. The two sides come from DIFFERENT kernels: the left from the
+   * Sigma kernel (eval_sigma_C_g3w2, rung_mode = 2) through the Euler identity
+   * eq:eulerBL1, T[Sigma^{C,L}, G] = 4 Phi; the right from the Pi kernel
+   * (pi_c_accumulate_w with the static rung W0 and NO dynamic rung, which is exactly what
+   * vertex_t::eval_Pi_C injects for B-L). Nothing forces them to agree unless the relative
+   * normalization of the two cuts is right.
+   *
+   * TWO STRUCTURAL SIMPLIFICATIONS, both exact:
+   *  (1) Phi_2^{C,L} is AFFINE in W (degree 1 + degree 0, eq:hierarchy), so the identity
+   *      holds with NO finite-difference truncation at all: Phi(l) - Phi(0) = l * dPhi/dl
+   *      exactly, for any l. The residual is pure basis-eps, not h^2. Affinity is itself
+   *      asserted below -- if it ever fails, the W-dependence is not what the theory says.
+   *  (2) The W-derivative holds W0[G] FIXED (W0 is a functional of G, not of W), so the
+   *      identity must hold for ANY fixed kernel. The toy therefore uses the model's own
+   *      Hermitian Z as the static kernel instead of reconstructing W0[G] -- fewer moving
+   *      parts, and it keeps this case independent of the B-S helpers above.
+   *
+   * The perturbation dW is built as a bosonic Lorentzian 2*Om/(Om^2+nu^2) times a
+   * q-resolved Hermitian matrix obeying dW(-q) = dW(q)^T -- i.e. a genuine representable
+   * tau-function with the reality symmetry the kernel assumes, for the same reason the
+   * B-S case builds dG from pole data rather than from per-node noise.
+   */
+  TEST_CASE("vertex_fdoracle_bl_wside", "[methods][vertex][fdoracle][bl]") {
+#ifndef ENABLE_DLR
+    SUCCEED("vertex_fdoracle_bl_wside skipped: build has ENABLE_DLR=OFF.");
+#else
+    using namespace fdo;
+    auto &mpi_context = utils::make_unit_test_mpi_context();
+    auto comm = mpi_context->comm;
+
+    std::string prec = GENERATE(std::string("medium"), std::string("high"));
+    imag_axes_ft::IAFT ft(beta, wmax, imag_axes_ft::dlr_basis, prec);
+    iaft_tools tools(ft);
+    const long nt = ft.nt_f(), nw_b = ft.nw_b();
+    model_t mdl;
+    auto G0 = mdl.G_tau(ft);
+
+    // int_0^beta dtau f(tau) = f(i.nu = 0), via the bosonic transform row
+    auto tau_integral = [&](nda::array<cplx, 1> const &f_t) {
+      cplx acc(0.0);
+      for (long it = 0; it < nt; ++it) acc += tools.Twt_bb(tools.m0, it) * f_t(it);
+      return acc;
+    };
+
+    // the pinned SAME-INDEX FERMIONIC pairing (as above):
+    //   T[A,B] = (1/(Nk beta)) sum_{s,k,w,ab} A_ab B_ab
+    //          = -(1/Nk) sum_{s,k,ab} int dtau A_ab(tau) B_ab(beta - tau)
+    // (the minus is fermionic antiperiodicity; the BOSONIC pairing below has none)
+    auto pairing = [&](nda::array<cplx, 5> const &A, nda::array<cplx, 5> const &B,
+                       long nrow, long ncol) {
+      cplx tot(0.0);
+      nda::array<cplx, 1> f_t(nt);
+      for (long s = 0; s < ns; ++s)
+        for (long k = 0; k < nk; ++k)
+          for (long a = 0; a < nrow; ++a)
+            for (long b = 0; b < ncol; ++b) {
+              for (long it = 0; it < nt; ++it)
+                f_t(it) = A(it, s, k, a, b) * B(tools.t_mirror(it), s, k, a, b);
+              tot += -tau_integral(f_t) / double(nk);
+            }
+      return tot;
+    };
+
+    // the STATIC KERNEL. Any fixed Hermitian rung with Z(-q) = Z(q)^T is legal here (see
+    // simplification (2) above); the model's Z already carries exactly that symmetry.
+    auto const &W0 = mdl.Z_qPQ;
+
+    // ---- Sigma^{C,L}: the THREE explicit terms of eq:sigmaBL --------------------------
+    //   W_x W_y -> W0_x W_y + W_x W0_y - W0_x W0_y,
+    // which is what rung_mode = 2 computes from (Z-slot = W0, dynamic rung = dW = W - W0):
+    // its S3/S1/S2 reductions are W0_x W0_y, W0_x dW_y, dW_x W0_y. Externals stay FREE
+    // (as for Sigma^x); the C-block pairing is applied afterwards.
+    auto sigma_BL = [&](nda::array<cplx, 5> const &G,
+                        nda::array<cplx, 4> const &dW_qw) {
+      nda::array<cplx, 4> Wstub(nk, 0, Np, Np);
+      nda::array<cplx, 5> S(nt, ns, nk, nbnd, nbnd);
+      solvers::vertex_detail::eval_sigma_C_g3w2(ft, comm, C(), G, mdl.X_skPa, Wstub, W0,
+                                                mdl.kmq, mdl.qmin, /*iq_gamma*/ 0,
+                                                /*skip_rung_gamma*/ false,
+                                                /*rung_mode*/ 2, &dW_qw, nullptr, S);
+      return S;
+    };
+
+    // Phi_2^{C,L} from the Euler identity eq:eulerBL1: T[Sigma^{C,L}, G] = 4 Phi.
+    // Uses the SAME kernel the production path uses, so the two sides of the oracle share
+    // one normalization by construction -- as in the B-S case.
+    auto phi_BL = [&](nda::array<cplx, 4> const &dW_qw) {
+      auto S = sigma_BL(G0, dW_qw);
+      return 0.25 * pairing(S, G0, ncw, ncw);
+    };
+
+    // ---- P^{C,L}(q, i.nu) = the static-rung Pi^C at FULL weight (eq:PCL) --------------
+    // EXACTLY the call vertex_t::eval_Pi_C makes for vertex_rung = "linear": rung W0bar,
+    // Wdyn = nullptr. Fed the C-C block, because the Pi kernel contracts its external
+    // orbital legs into the aux indices (all eight labels of Phi are in C).
+    nda::array<cplx, 4> PCL_w(nw_b, nk, Np, Np);
+    {
+      nda::array<cplx, 5> G_CC(nt, ns, nk, ncw, ncw);
+      nda::array<cplx, 4> X_C(ns, nk, Np, ncw);
+      for (long it = 0; it < nt; ++it)
+        for (long s = 0; s < ns; ++s)
+          for (long k = 0; k < nk; ++k)
+            for (long a = 0; a < ncw; ++a)
+              for (long b = 0; b < ncw; ++b) G_CC(it, s, k, a, b) = G0(it, s, k, a, b);
+      for (long s = 0; s < ns; ++s)
+        for (long k = 0; k < nk; ++k)
+          for (long P = 0; P < Np; ++P)
+            for (long a = 0; a < ncw; ++a) X_C(s, k, P, a) = mdl.X_skPa(s, k, P, a);
+      PCL_w() = cplx(0.0);
+      vertex_pi::pi_c_accumulate_w(ft, tools, G_CC, X_C, W0, /*Wdyn*/ nullptr,
+                                   mdl.kmq, mdl.kpq, nda::range(0, ncw), PCL_w,
+                                   comm.rank(), comm.size());
+      comm.all_reduce_in_place_n(PCL_w.data(), PCL_w.size(), std::plus<>{});
+    }
+
+    // ---- the perturbation dW: a representable bosonic tau-function -------------------
+    // Lorentzian 2*Om/(Om^2 + nu^2) (a single bosonic pole, hence exactly representable)
+    // times a q-resolved Hermitian matrix with dW(-q) = dW(q)^T, matching the symmetry
+    // the rung objects carry. Built in BOTH layouts: (nq, nw_b, .) for the Sigma kernel's
+    // Ww_override, (nw_b, nq, .) for w_to_tau.
+    const double Om = 0.83;
+    nda::array<cplx, 4> dW_qw(nk, nw_b, Np, Np), dW_wq(nw_b, nk, Np, Np);
+    {
+      rng_t rg(4242);
+      nda::array<cplx, 3> M(nk, Np, Np);
+      M() = cplx(0.0);
+      for (long q = 0; q < nk; ++q) {
+        if (kminus(q) < q) continue;
+        const long qm = kminus(q);
+        for (long P = 0; P < Np; ++P)
+          for (long Q = P; Q < Np; ++Q) {
+            cplx v = rg.z();
+            if (P == Q) v = cplx(v.real(), 0.0);        // Hermitian diagonal is real
+            M(q, P, Q) = v;   M(q, Q, P) = std::conj(v);
+            M(qm, Q, P) = v;  M(qm, P, Q) = std::conj(v);   // dW(-q) = dW(q)^T
+          }
+      }
+      for (long q = 0; q < nk; ++q)
+        for (long l = 0; l < nw_b; ++l) {
+          const double nu = double(tools.wn_b(l)) * M_PI / beta;
+          const double s = 2.0 * Om / (Om * Om + nu * nu);
+          for (long P = 0; P < Np; ++P)
+            for (long Q = 0; Q < Np; ++Q) {
+              dW_qw(q, l, P, Q) = M(q, P, Q) * s;
+              dW_wq(l, q, P, Q) = M(q, P, Q) * s;
+            }
+        }
+      // the perturbation must be nontrivial, else the oracle is vacuous
+      double mx = 0.0;
+      for (auto const &v : dW_qw) mx = std::max(mx, std::abs(v));
+      REQUIRE(mx > 1e-3);
+    }
+
+    // ---- the BOSONIC pairing of the RHS ----------------------------------------------
+    //   (1/(Nk beta)) sum_{q,nu} sum_{IJ} P_{IJ}(q,inu) dW_{JI}(q,inu)
+    // = (1/Nk) sum_q sum_{IJ} int_0^beta dtau P_{IJ}(q,tau) dW_{JI}(q, beta - tau).
+    // NO minus: for two BOSONIC functions e^{-i nu beta} = +1 (contrast the fermionic
+    // pairing above). And NOT a sum over the sampled nodes -- DLR nodes are fitting
+    // nodes, not Fourier points.
+    auto w_pairing = [&](nda::array<cplx, 4> const &P_w) {
+      nda::array<cplx, 4> P_t(nt, nk, Np, Np), dW_t(nt, nk, Np, Np);
+      ft.w_to_tau(P_w, P_t, imag_axes_ft::boson);
+      ft.w_to_tau(dW_wq, dW_t, imag_axes_ft::boson);
+      cplx tot(0.0);
+      nda::array<cplx, 1> f_t(nt);
+      for (long q = 0; q < nk; ++q)
+        for (long I = 0; I < Np; ++I)
+          for (long J = 0; J < Np; ++J) {
+            for (long it = 0; it < nt; ++it)
+              f_t(it) = P_t(it, q, I, J) * dW_t(tools.t_mirror(it), q, J, I);
+            tot += tau_integral(f_t) / double(nk);
+          }
+      return tot;
+    };
+
+    // ---- THE ORACLE ------------------------------------------------------------------
+    nda::array<cplx, 4> dW_base(nk, nw_b, Np, Np);
+    {   // a nonzero base point, so the test is not secretly evaluated at dW = 0 (the B-S
+        // limit) where the mixed terms vanish and the W-dependence would be untested
+      rng_t rg(1717);
+      nda::array<cplx, 3> B(nk, Np, Np);
+      B() = cplx(0.0);
+      for (long q = 0; q < nk; ++q) {
+        if (kminus(q) < q) continue;
+        const long qm = kminus(q);
+        for (long P = 0; P < Np; ++P)
+          for (long Q = P; Q < Np; ++Q) {
+            cplx v = 0.4 * rg.z();
+            if (P == Q) v = cplx(v.real(), 0.0);
+            B(q, P, Q) = v;   B(q, Q, P) = std::conj(v);
+            B(qm, Q, P) = v;  B(qm, P, Q) = std::conj(v);
+          }
+      }
+      const double Ob = 1.31;
+      for (long q = 0; q < nk; ++q)
+        for (long l = 0; l < nw_b; ++l) {
+          const double nu = double(tools.wn_b(l)) * M_PI / beta;
+          const double s = 2.0 * Ob / (Ob * Ob + nu * nu);
+          for (long P = 0; P < Np; ++P)
+            for (long Q = 0; Q < Np; ++Q) dW_base(q, l, P, Q) = B(q, P, Q) * s;
+        }
+    }
+    auto shifted_W = [&](double lam) {
+      nda::array<cplx, 4> A(nk, nw_b, Np, Np);
+      for (long i = 0; i < A.size(); ++i)
+        A.data()[i] = dW_base.data()[i] + lam * dW_qw.data()[i];
+      return A;
+    };
+
+    const cplx phi0 = phi_BL(dW_base);
+    const cplx rhs = -0.5 * w_pairing(PCL_w);
+
+    // AFFINITY: Phi must be exactly linear in lambda. Checked FIRST -- if it fails, the
+    // W-dependence is not degree-1 and the oracle statement itself does not apply.
+    const cplx lhs1 = phi_BL(shifted_W(1.0)) - phi0;
+    const cplx lhs2 = phi_BL(shifted_W(2.0)) - phi0;
+    const double affine = std::abs(lhs2 - 2.0 * lhs1) / std::max(std::abs(lhs1), 1e-30);
+    app_log(1, "fdoracle_bl_wside [{}]: affinity |Phi(2l)-Phi(0) - 2(Phi(l)-Phi(0))| / "
+               "|Phi(l)-Phi(0)| = {:.3e}", prec, affine);
+    REQUIRE(affine < 1e-8);
+
+    const double rel = std::abs(lhs1 - rhs) / std::max(std::abs(rhs), 1e-30);
+    app_log(1, "fdoracle_bl_wside [{}]: dPhi/dl = {:.12e} {:+.12e}i   "
+               "-1/2 T_W[P^(C,L), dW] = {:.12e} {:+.12e}i   rel = {:.3e}",
+            prec, lhs1.real(), lhs1.imag(), rhs.real(), rhs.imag(), rel);
+    REQUIRE(std::abs(rhs) > 1e-10);          // the RHS must not be vacuously zero
+    REQUIRE(rel < 1e-6);
+
+    // ---- POSITIVE CONTROLS (theoryB_static section BLconservation) -------------------
+    // "replace P^{C,L} -> 1/2 P^{C,L} -> the W-oracle breaks by 2". If this control does
+    // NOT break, the test is blind to the very trap it exists to catch.
+    {
+      nda::array<cplx, 4> Phalf(PCL_w);
+      Phalf() *= 0.5;
+      const cplx rhs_half = -0.5 * w_pairing(Phalf);
+      const double r_half = std::abs(lhs1 / rhs_half);
+      app_log(1, "fdoracle_bl_wside [{}]: CONTROL half-weight P^(C,L) -> ratio "
+                 "dPhi / RHS = {:.6f} (must be 2)", prec, r_half);
+      REQUIRE(std::abs(r_half - 2.0) < 1e-5);
+    }
+    // sign flip must also break it
+    {
+      nda::array<cplx, 4> Pneg(PCL_w);
+      Pneg() *= -1.0;
+      const cplx rhs_neg = -0.5 * w_pairing(Pneg);
+      const double r_neg = std::abs(lhs1 - rhs_neg) / std::max(std::abs(rhs_neg), 1e-30);
+      app_log(1, "fdoracle_bl_wside [{}]: CONTROL sign-flipped P^(C,L) -> rel = {:.3e} "
+                 "(must be O(1))", prec, r_neg);
+      REQUIRE(r_neg > 1.0);
+    }
+#endif
+  }
+
+  /**
+   * INCREMENT S9 -- the G-SIDE FUNCTIONAL-DERIVATIVE ORACLE for Formulation B-L.
+   *
+   * The companion to the W-side oracle above. That one pins P^{C,L}'s weight against the
+   * explicit Sigma terms; this one pins the REMAINING B-L object, the response self-energy
+   *
+   *   Delta w^L(q) := W0(q) [ pi^dyn(q) - Pi^C(q, tau=0) ] W0(q)     (eq:deltawL)
+   *
+   * which the W-side oracle cannot see at all (it is a G-side object, born from the chain
+   * rule through W0[G]). theoryB_static eq:eulerBL1 + the G-side oracle:
+   *
+   *   d/dl Phi_2^{C,L}[G + l dG, W]|_0
+   *       = T[ Sigma^{C,L}, P_C dG P_C ]  +  T[ Sigma^{L,r}, dG ]
+   *
+   * with Sigma^{C,L} the THREE explicit terms of eq:sigmaBL and Sigma^{L,r} the response.
+   *
+   * THE ESSENTIAL SUBTLETY, and the reason this test has teeth: W (the physical screened
+   * interaction) is held FIXED while G varies, but the KERNEL W0[G] is a functional of G,
+   * so the fluctuation dW = W - W0[G] VARIES WITH G. Every place W0 appears -- the two
+   * mixed rungs, the -W0 W0 term, and dW itself -- contributes to the chain rule, and
+   * X^L (eq:XL) is exactly the sum of those rung derivatives. If Delta w^L had the wrong
+   * sign, the wrong factor, or the wrong Pi combination, the residual here is O(1).
+   *
+   * This is also the ONLY test that exercises pi^dyn inside a conservation statement
+   * rather than against another implementation of itself.
+   */
+  TEST_CASE("vertex_fdoracle_bl_gside", "[methods][vertex][fdoracle][bl]") {
+#ifndef ENABLE_DLR
+    SUCCEED("vertex_fdoracle_bl_gside skipped: build has ENABLE_DLR=OFF.");
+#else
+    using namespace fdo;
+    auto &mpi_context = utils::make_unit_test_mpi_context();
+    auto comm = mpi_context->comm;
+
+    std::string prec = GENERATE(std::string("medium"), std::string("high"));
+    imag_axes_ft::IAFT ft(beta, wmax, imag_axes_ft::dlr_basis, prec);
+    iaft_tools tools(ft);
+    const long nt = ft.nt_f(), nw_b = ft.nw_b();
+    model_t mdl;
+    auto G0 = mdl.G_tau(ft);
+    auto R0row = solvers::vertex_w0_detail::tau0_transform_row(ft);
+
+    auto tau_integral = [&](nda::array<cplx, 1> const &f_t) {
+      cplx acc(0.0);
+      for (long it = 0; it < nt; ++it) acc += tools.Twt_bb(tools.m0, it) * f_t(it);
+      return acc;
+    };
+    auto pairing = [&](nda::array<cplx, 5> const &A, nda::array<cplx, 5> const &B,
+                       long nrow, long ncol) {
+      cplx tot(0.0);
+      nda::array<cplx, 1> f_t(nt);
+      for (long s = 0; s < ns; ++s)
+        for (long k = 0; k < nk; ++k)
+          for (long a = 0; a < nrow; ++a)
+            for (long b = 0; b < ncol; ++b) {
+              for (long it = 0; it < nt; ++it)
+                f_t(it) = A(it, s, k, a, b) * B(tools.t_mirror(it), s, k, a, b);
+              tot += -tau_integral(f_t) / double(nk);
+            }
+      return tot;
+    };
+    auto dress_all = [&](nda::array<cplx, 5> const &G) {
+      nda::array<cplx, 5> Gt(nt, ns, nk, Np, Np);
+      Gt() = cplx(0.0);
+      for (long it = 0; it < nt; ++it)
+        for (long s = 0; s < ns; ++s)
+          for (long k = 0; k < nk; ++k)
+            for (long P = 0; P < Np; ++P)
+              for (long Q = 0; Q < Np; ++Q) {
+                cplx acc(0.0);
+                for (long a = 0; a < nbnd; ++a)
+                  for (long b = 0; b < nbnd; ++b)
+                    acc += mdl.X_skPa(s, k, P, a) * G(it, s, k, a, b)
+                           * std::conj(mdl.X_skPa(s, k, Q, b));
+                Gt(it, s, k, P, Q) = acc;
+              }
+      return Gt;
+    };
+    // W0[G] = [1 - Z P0]^{-1} Z at i.nu = 0 (identical to the B-S case)
+    auto W0_from_G = [&](nda::array<cplx, 5> const &G) {
+      auto Gt = dress_all(G);
+      nda::array<cplx, 3> P0(nk, Np, Np), W0(nk, Np, Np);
+      P0() = cplx(0.0);
+      nda::array<cplx, 1> f_t(nt);
+      for (long q = 0; q < nk; ++q)
+        for (long P = 0; P < Np; ++P)
+          for (long Q = 0; Q < Np; ++Q) {
+            f_t() = cplx(0.0);
+            for (long s = 0; s < ns; ++s)
+              for (long k = 0; k < nk; ++k) {
+                const long kpq = mdl.kpq(q, k);
+                for (long it = 0; it < nt; ++it)
+                  f_t(it) += Gt(it, s, kpq, P, Q) * Gt(tools.t_mirror(it), s, k, Q, P);
+              }
+            P0(q, P, Q) = -tau_integral(f_t) / double(nk);
+          }
+      for (long q = 0; q < nk; ++q) {
+        nda::matrix<cplx> A(Np, Np), B(Np, Np);
+        for (long P = 0; P < Np; ++P)
+          for (long Q = 0; Q < Np; ++Q) {
+            cplx zp(0.0);
+            for (long r = 0; r < Np; ++r) zp += mdl.Z_qPQ(q, P, r) * P0(q, r, Q);
+            A(P, Q) = ((P == Q) ? cplx(1.0) : cplx(0.0)) - zp;
+            B(P, Q) = mdl.Z_qPQ(q, P, Q);
+          }
+        auto Ainv = nda::inverse(A);
+        for (long P = 0; P < Np; ++P)
+          for (long Q = 0; Q < Np; ++Q) {
+            cplx acc(0.0);
+            for (long r = 0; r < Np; ++r) acc += Ainv(P, r) * B(r, Q);
+            W0(q, P, Q) = acc;
+          }
+      }
+      return W0;
+    };
+
+    // C-C block extractors for the Pi kernels
+    auto GCC_of = [&](nda::array<cplx, 5> const &G) {
+      nda::array<cplx, 5> G_CC(nt, ns, nk, ncw, ncw);
+      for (long it = 0; it < nt; ++it)
+        for (long s = 0; s < ns; ++s)
+          for (long k = 0; k < nk; ++k)
+            for (long a = 0; a < ncw; ++a)
+              for (long b = 0; b < ncw; ++b) G_CC(it, s, k, a, b) = G(it, s, k, a, b);
+      return G_CC;
+    };
+    nda::array<cplx, 4> X_C(ns, nk, Np, ncw);
+    for (long s = 0; s < ns; ++s)
+      for (long k = 0; k < nk; ++k)
+        for (long P = 0; P < Np; ++P)
+          for (long a = 0; a < ncw; ++a) X_C(s, k, P, a) = mdl.X_skPa(s, k, P, a);
+
+    // ---- the FIXED physical W(q, i.nu). Held constant as G varies; a bosonic Lorentzian
+    //      around the bare core, with W(-q) = W(q)^T Hermitian, so it is representable and
+    //      carries the reality symmetry the kernels assume.
+    const double Om = 1.07;
+    nda::array<cplx, 4> W_qw(nk, nw_b, Np, Np);
+    {
+      rng_t rg(31337);
+      nda::array<cplx, 3> M(nk, Np, Np);
+      M() = cplx(0.0);
+      for (long q = 0; q < nk; ++q) {
+        if (kminus(q) < q) continue;
+        const long qm = kminus(q);
+        for (long P = 0; P < Np; ++P)
+          for (long Q = P; Q < Np; ++Q) {
+            cplx v = 0.5 * rg.z();
+            if (P == Q) v = cplx(v.real(), 0.0);
+            M(q, P, Q) = v;   M(q, Q, P) = std::conj(v);
+            M(qm, Q, P) = v;  M(qm, P, Q) = std::conj(v);
+          }
+      }
+      for (long q = 0; q < nk; ++q)
+        for (long l = 0; l < nw_b; ++l) {
+          const double nu = double(tools.wn_b(l)) * M_PI / beta;
+          const double s = 2.0 * Om / (Om * Om + nu * nu);
+          for (long P = 0; P < Np; ++P)
+            for (long Q = 0; Q < Np; ++Q)
+              W_qw(q, l, P, Q) = mdl.Z_qPQ(q, P, Q) + M(q, P, Q) * s;
+        }
+    }
+
+    // dW(G) = W - W0[G]: the fluctuation VARIES with G through the kernel
+    auto dW_of = [&](nda::array<cplx, 3> const &W0) {
+      nda::array<cplx, 4> dW(nk, nw_b, Np, Np);
+      for (long q = 0; q < nk; ++q)
+        for (long l = 0; l < nw_b; ++l)
+          for (long P = 0; P < Np; ++P)
+            for (long Q = 0; Q < Np; ++Q)
+              dW(q, l, P, Q) = W_qw(q, l, P, Q) - W0(q, P, Q);
+      return dW;
+    };
+
+    auto sigma_BL = [&](nda::array<cplx, 5> const &G, nda::array<cplx, 3> const &W0,
+                        nda::array<cplx, 4> const &dW) {
+      nda::array<cplx, 4> Wstub(nk, 0, Np, Np);
+      nda::array<cplx, 5> S(nt, ns, nk, nbnd, nbnd);
+      solvers::vertex_detail::eval_sigma_C_g3w2(ft, comm, C(), G, mdl.X_skPa, Wstub, W0,
+                                                mdl.kmq, mdl.qmin, 0, false,
+                                                /*rung_mode*/ 2, &dW, nullptr, S);
+      return S;
+    };
+
+    // Phi_2^{C,L}[G, W] via Euler (eq:eulerBL1), with W0 and dW BOTH following G
+    auto phi_BL_of = [&](nda::array<cplx, 5> const &G) {
+      auto W0 = W0_from_G(G);
+      auto S = sigma_BL(G, W0, dW_of(W0));
+      return 0.25 * pairing(S, G, ncw, ncw);
+    };
+
+    // ---- Pi^{C,0}(q, tau=0): static rung W0, and pi^dyn(q): full dynamic rung W -------
+    auto piC0_tau0 = [&](nda::array<cplx, 5> const &G, nda::array<cplx, 3> const &W0) {
+      auto G_CC = GCC_of(G);
+      nda::array<cplx, 4> Pi_wq(nw_b, nk, Np, Np);
+      Pi_wq() = cplx(0.0);
+      vertex_pi::pi_c_accumulate_w(ft, tools, G_CC, X_C, W0, nullptr,
+                                   mdl.kmq, mdl.kpq, nda::range(0, ncw), Pi_wq,
+                                   comm.rank(), comm.size());
+      comm.all_reduce_in_place_n(Pi_wq.data(), Pi_wq.size(), std::plus<>{});
+      nda::array<cplx, 3> Pi0(nk, Np, Np);
+      for (long q = 0; q < nk; ++q)
+        for (long P = 0; P < Np; ++P)
+          for (long Q = 0; Q < Np; ++Q) {
+            cplx acc(0.0);
+            for (long m = 0; m < nw_b; ++m) acc += R0row(m) * Pi_wq(m, q, P, Q);
+            Pi0(q, P, Q) = acc;
+          }
+      return Pi0;
+    };
+    auto pidyn = [&](nda::array<cplx, 5> const &G) {
+      auto G_CC = GCC_of(G);
+      nda::array<cplx, 3> Zzero(nk, Np, Np);      // rung = Z + Wdyn(l) = W(i.nu_l)
+      Zzero() = cplx(0.0);
+      nda::array<cplx, 3> out(nk, Np, Np);
+      out() = cplx(0.0);
+      vertex_pi::pi_dyn_factorized(tools, G_CC, X_C, Zzero, &W_qw,
+                                   mdl.kmq, mdl.kpq, nda::range(0, ncw), R0row, out,
+                                   comm.rank(), comm.size());
+      comm.all_reduce_in_place_n(out.data(), out.size(), std::plus<>{});
+      return out;
+    };
+
+    // ---- the perturbation dG: non-Hermitian, k-reality-symmetric (as in the B-S case)
+    nda::array<cplx, 5> dG(nt, ns, nk, nbnd, nbnd);
+    {
+      rng_t rg(90210);
+      const double de[3] = {-0.33, 0.19, 0.71};
+      nda::array<cplx, 5> Amp(ns, nk, nbnd, nbnd, nbnd);
+      Amp() = cplx(0.0);
+      for (long s = 0; s < ns; ++s)
+        for (long k = 0; k < nk; ++k) {
+          if (kminus(k) < k) continue;
+          const long km = kminus(k);
+          for (long r = 0; r < nbnd; ++r)
+            for (long a = 0; a < nbnd; ++a)
+              for (long b = 0; b < nbnd; ++b) {
+                if (km == k) {
+                  if (b < a) continue;
+                  cplx v = rg.z();
+                  Amp(s, k, r, a, b) = v;  Amp(s, k, r, b, a) = v;
+                } else {
+                  cplx v = rg.z();
+                  Amp(s, k, r, a, b) = v;  Amp(s, km, r, b, a) = v;
+                }
+              }
+        }
+      auto xm = ft.tau_mesh();
+      dG() = cplx(0.0);
+      for (long it = 0; it < nt; ++it) {
+        const double tau = (xm(it) + 1.0) * 0.5 * beta;
+        for (long s = 0; s < ns; ++s)
+          for (long k = 0; k < nk; ++k)
+            for (long r = 0; r < nbnd; ++r) {
+              const double g = g_tau(de[r], tau);
+              for (long a = 0; a < nbnd; ++a)
+                for (long b = 0; b < nbnd; ++b)
+                  dG(it, s, k, a, b) += g * Amp(s, k, r, a, b);
+            }
+      }
+      double herm = 0.0, sc = 0.0;
+      for (long it = 0; it < nt; ++it)
+        for (long s = 0; s < ns; ++s)
+          for (long k = 0; k < nk; ++k)
+            for (long a = 0; a < nbnd; ++a)
+              for (long b = 0; b < nbnd; ++b) {
+                herm = std::max(herm, std::abs(dG(it, s, k, a, b)
+                                               - std::conj(dG(it, s, k, b, a))));
+                sc = std::max(sc, std::abs(dG(it, s, k, a, b)));
+              }
+      REQUIRE(herm > 0.1 * sc);
+    }
+    auto shifted = [&](double lam) {
+      nda::array<cplx, 5> G(nt, ns, nk, nbnd, nbnd);
+      for (long i = 0; i < G.size(); ++i) G.data()[i] = G0.data()[i] + lam * dG.data()[i];
+      return G;
+    };
+
+    // ---- THE ORACLE ------------------------------------------------------------------
+    const double h = 1e-6;
+    const cplx dphi_fd = (phi_BL_of(shifted(h)) - phi_BL_of(shifted(-h))) / (2.0 * h);
+
+    auto W0 = W0_from_G(G0);
+    auto SL = sigma_BL(G0, W0, dW_of(W0));
+    auto Pi0 = piC0_tau0(G0, W0);
+    auto Pdyn = pidyn(G0);
+
+    // Pi^L = pi^dyn - Pi^{C,0}(tau=0), then Delta w^L = W0 Pi^L W0 (eq:deltawL)
+    nda::array<cplx, 3> PiL(nk, Np, Np);
+    for (long q = 0; q < nk; ++q)
+      for (long P = 0; P < Np; ++P)
+        for (long Q = 0; Q < Np; ++Q) PiL(q, P, Q) = Pdyn(q, P, Q) - Pi0(q, P, Q);
+    {
+      double xl = 0.0, p0 = 0.0;
+      for (auto const &v : PiL) xl = std::max(xl, std::abs(v));
+      for (auto const &v : Pi0) p0 = std::max(p0, std::abs(v));
+      app_log(1, "fdoracle_bl_gside [{}]: X^L meter max|pi^dyn - Pi^0| = {:.4e}, "
+                 "max|Pi^0| = {:.4e}, ratio {:.4f}", prec, xl, p0, xl / p0);
+      REQUIRE(xl > 1e-10);     // the response must be non-trivial, else the test is blind
+    }
+    nda::array<cplx, 3> DwL(nk, Np, Np);
+    solvers::vertex_detail::build_delta_w(W0, PiL, mdl.qmin, DwL);
+    nda::array<cplx, 5> SLr(nt, ns, nk, nbnd, nbnd);
+    solvers::vertex_detail::eval_sigma_C_response(comm, G0, mdl.X_skPa, DwL, mdl.kmq,
+                                                  mdl.qmin, SLr);
+
+    const cplx t_expl = pairing(SL, dG, ncw, ncw);     // C-block: P_C dG P_C
+    const cplx t_resp = pairing(SLr, dG, nbnd, nbnd);  // full space
+    const cplx pred = t_expl + t_resp;
+
+    // ---- SPLIT (the B-S diagnostic, applied to B-L): freeze the KERNEL so only the
+    //      explicit lines vary. Its derivative must be exactly T[Sigma^{C,L}, P_C dG P_C];
+    //      whatever is left over is the response, and must equal T[Sigma^{L,r}, dG].
+    //      This localizes any discrepancy to ONE of the two cuts.
+    auto phi_frozen = [&](nda::array<cplx, 5> const &G) {
+      auto S = sigma_BL(G, W0, dW_of(W0));      // W0 AND dW held at their G0 values
+      return 0.25 * pairing(S, G, ncw, ncw);
+    };
+    const cplx dphi_expl = (phi_frozen(shifted(h)) - phi_frozen(shifted(-h))) / (2.0 * h);
+    const cplx remainder = dphi_fd - dphi_expl;
+    app_log(1, "fdoracle_bl_gside [{}] SPLIT: T[Sigma^(C,L),dG_C] = {:.10e}{:+.10e}i, "
+               "dPhi_frozenW0/dl = {:.10e}{:+.10e}i (rel {:.3e});  "
+               "T[Sigma^(L,r),dG] = {:.10e}{:+.10e}i, remainder = {:.10e}{:+.10e}i "
+               "(ratio {:.6f})", prec,
+            t_expl.real(), t_expl.imag(), dphi_expl.real(), dphi_expl.imag(),
+            std::abs(t_expl - dphi_expl) / std::max(std::abs(dphi_expl), 1e-30),
+            t_resp.real(), t_resp.imag(), remainder.real(), remainder.imag(),
+            std::abs(t_resp) / std::max(std::abs(remainder), 1e-30));
+    // ---- ISOLATION: with dW == 0 only S3 = Sigma^x survives, so the explicit split MUST
+    //      fall back to the B-S result (which passes at ~1e-10). If the zero-dW split is
+    //      clean while the full one is not, the discrepancy is entirely in the MIXED terms
+    //      S1/S2 -- i.e. eq:mixgw, which open item O7 flags as hand-derived, O1 risk class.
+    double rel_S3 = 0.0;
+    {
+      nda::array<cplx, 4> dWz(nk, nw_b, Np, Np);
+      dWz() = cplx(0.0);
+      auto phi_S3 = [&](nda::array<cplx, 5> const &G) {
+        auto S = sigma_BL(G, W0, dWz);
+        return 0.25 * pairing(S, G, ncw, ncw);
+      };
+      auto S3 = sigma_BL(G0, W0, dWz);
+      const cplx t3 = pairing(S3, dG, ncw, ncw);
+      const cplx d3 = (phi_S3(shifted(h)) - phi_S3(shifted(-h))) / (2.0 * h);
+      rel_S3 = std::abs(t3 - d3) / std::max(std::abs(d3), 1e-30);
+      app_log(1, "fdoracle_bl_gside [{}] ISOLATION: dW == 0 (S3 only) -> explicit split "
+                 "rel = {:.3e}   [vs {:.3e} with the mixed terms on]", prec, rel_S3,
+              std::abs(t_expl - dphi_expl) / std::max(std::abs(dphi_expl), 1e-30));
+      // S3 alone is B-S's Sigma^x, whose gradient property is pinned by vertex_fdoracle_bs
+      REQUIRE(rel_S3 < 1e-6);
+    }
+
+    const double rel = std::abs(dphi_fd - pred) / std::max(std::abs(dphi_fd), 1e-30);
+    app_log(1, "fdoracle_bl_gside [{}]: dPhi/dl(FD) = {:.10e} {:+.10e}i   "
+               "T[Sigma^(C,L),dG]_C = {:.10e}   T[Sigma^(L,r),dG] = {:.10e}   rel = {:.3e}",
+            prec, dphi_fd.real(), dphi_fd.imag(), t_expl.real(), t_resp.real(), rel);
+    REQUIRE(std::abs(dphi_fd) > 1e-8);
+    REQUIRE(rel < 1e-4);
+
+    // ---- POSITIVE CONTROLS -----------------------------------------------------------
+    // "drop the -Sx term of eq:sigmaBL -> the G-oracle breaks" and the response controls.
+    {
+      const double r_drop = std::abs(dphi_fd - t_expl) / std::abs(dphi_fd);
+      app_log(1, "fdoracle_bl_gside [{}]: CONTROL drop Sigma^(L,r) -> rel = {:.3e} "
+                 "(response share {:.4f})", prec, r_drop,
+              std::abs(t_resp) / std::abs(t_expl));
+      REQUIRE(r_drop > 1e-3);
+    }
+    {
+      const cplx pred_flip = t_expl - t_resp;
+      const double r_flip = std::abs(dphi_fd - pred_flip) / std::abs(dphi_fd);
+      app_log(1, "fdoracle_bl_gside [{}]: CONTROL sign-flip Sigma^(L,r) -> rel = {:.3e}",
+              prec, r_flip);
+      REQUIRE(r_flip > 1e-3);
+    }
+    {   // the notes' UNTRANSPOSED sandwich: Delta w^L built from Pi^L without the
+        // transpose/symmetrization -- the S0 routing correction, re-checked for B-L
+      nda::array<cplx, 3> DwNT(nk, Np, Np);
+      DwNT() = cplx(0.0);
+      for (long q = 0; q < nk; ++q)
+        for (long P = 0; P < Np; ++P)
+          for (long Q = 0; Q < Np; ++Q) {
+            cplx acc(0.0);
+            for (long r = 0; r < Np; ++r)
+              for (long t = 0; t < Np; ++t)
+                acc += W0(q, P, r) * PiL(q, r, t) * W0(q, t, Q);
+            DwNT(q, P, Q) = acc;
+          }
+      nda::array<cplx, 5> SNT(nt, ns, nk, nbnd, nbnd);
+      solvers::vertex_detail::eval_sigma_C_response(comm, G0, mdl.X_skPa, DwNT, mdl.kmq,
+                                                    mdl.qmin, SNT);
+      const cplx pred_nt = t_expl + pairing(SNT, dG, nbnd, nbnd);
+      const double r_nt = std::abs(dphi_fd - pred_nt) / std::abs(dphi_fd);
+      app_log(1, "fdoracle_bl_gside [{}]: CONTROL untransposed W0.Pi^L.W0 sandwich -> "
+                 "rel = {:.3e}", prec, r_nt);
+    }
+#endif
+  }
+
 } // bdft_tests
