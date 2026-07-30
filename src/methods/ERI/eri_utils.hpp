@@ -320,7 +320,7 @@ namespace methods {
 
   /*
    * Register a direct-route static evaluator from an [interaction.hamilt]
-   * block (notes/static_route_selection_plan.md). Mirrors add_thc; the
+   * block. Mirrors add_thc; the
    * evaluator holds only the mf + exx options (pseudopot/orbitals lazy).
    */
   template<typename comm_t>

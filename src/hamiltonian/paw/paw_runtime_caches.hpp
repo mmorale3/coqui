@@ -7,7 +7,7 @@
  *
  *   1. aainit angular-coupling tables            (paw_aatab)
  *   2. per-species qrad interpolation tables     (paw_qrad_tabs; ONE dq=0.01
- *      for all consumers, plan A4)
+ *      for all consumers)
  *   3. the full-BZ View-2 Pskna lift             (Pskna_full_bz; shm-backed,
  *      MPI-collective on the pseudopot's communicator at first build)
  *   4. the Δk-keyed Qfac pair-factor cache       (get_or_build_qfac_pair_factor)
@@ -43,7 +43,7 @@ struct runtime_caches {
     aainit_tables aatab;
 
     // (2) per-species qrad tables. Key: (Kmax, shape_restored, aug_lmax);
-    // dq is pinned project-wide to 0.01 (plan A4). A table built to a larger
+    // dq is pinned project-wide to 0.01. A table built to a larger
     // Kmax is exact for smaller requests (same uniform interpolation nodes).
     double qtab_Kmax = -1.0;
     bool qtab_shape_restored = false;
@@ -55,10 +55,10 @@ struct runtime_caches {
     std::shared_ptr<math::shm::shared_array<nda::array_view<ComplexType,4>>>
         Pskna_full;
 
-    // (3b) Eq. (h0) static USPP/PAW D: Dnn_atom_static + ∫V_loc·Q̂ (settled
-    // 2026-07-24 — the frozen electrostatic compensation term is always in
-    // the static assembly; dion holds only the one-center descreening
-    // reference of opposite sign, plan Eq. d0). Built once (V_loc, Q̂ frozen).
+    // (3b) Eq. (h0) static USPP/PAW D: Dnn_atom_static + ∫V_loc·Q̂. The
+    // frozen electrostatic compensation term is always in the static
+    // assembly; dion holds only the one-center descreening reference of
+    // opposite sign (Eq. d0). Built once (V_loc, Q̂ frozen).
     bool h0_static_built = false;
     nda::array<ComplexType,3> h0_static_D;
 
@@ -72,7 +72,7 @@ struct runtime_caches {
     bool qfac_shape_restored = false;
     long qfac_bytes = 0;
     // Per-rank budget; refreshed from paw_exx_options::qfac_cache_mb (toml
-    // `qfac_cache_mb`, plan C3) at every get_or_build_qfac_pair_factor call.
+    // `qfac_cache_mb`) at every get_or_build_qfac_pair_factor call.
     long qfac_budget_bytes = 256l << 20;
     long qfac_hits = 0, qfac_builds = 0, qfac_uncached = 0;
     std::map<std::array<long,3>, nda::array<ComplexType,3>> qfac;
@@ -108,7 +108,7 @@ inline std::vector<paw::qrad_tab> const& pseudopot::paw_qrad_tabs(
     double Kmax, bool shape_restored_paw) const
 {
     auto& rt = paw_rt();
-    constexpr double dq = 0.01;   // plan A4: one dq for ALL consumers
+    constexpr double dq = 0.01;   // one dq for ALL consumers
     if (rt.qtab_Kmax < Kmax ||
         rt.qtab_shape_restored != shape_restored_paw ||
         rt.qtab_aug_lmax != aug_lmax()) {

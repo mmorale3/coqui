@@ -32,7 +32,7 @@
  *
  *   Neither side touches the static per-atom D (`Dnn_atom_static`) — both are
  *   computed from radial pseudopot data + becsum, free of any DFT-XC
- *   contamination. (The QE `deeq` read was removed entirely in plan A1.)
+ *   contamination. (The QE `deeq` read was removed entirely.)
  * ==========================================================================
  */
 
@@ -141,7 +141,7 @@ static void run_dDeeq_H_matches_deltaC_test(std::string fixture_name,
         auto bs_a = becsum(ia, range(0, nh_a), range(0, nh_a));
 
         // -- Path 1: radial Hartree. The driver is valence-only by contract
-        //    (plan I2/I3: frozen-core one-center electrostatics lives in the
+        //    (frozen-core one-center electrostatics lives in the
         //    static D⁰/dion — the pre-fix core injection was the D2 AB
         //    direct-V_H +19.98 Ha double-count), so it matches the ΔC
         //    valence kernel with no core zeroing needed on either side.
@@ -333,7 +333,7 @@ TEST_CASE("paw_onecenter_deeq_scf_matches_paw_deeq",
     auto Dion_diag = V.compute_paw_deeq(nii, empty_vloc, /*include_static=*/true);
 
     // Self-consistent builder returns D_static + D^H[n] without mutating the
-    // static tensor (Dnn_atom_view now exposes Dnn_atom_static, plan A1).
+    // static tensor (Dnn_atom_view now exposes Dnn_atom_static).
     nda::array<ComplexType,3> Dstatic_before{V.Dnn_atom_view()};
     auto Dscf = V.compute_deeq_scf(nij);
     {
@@ -344,7 +344,7 @@ TEST_CASE("paw_onecenter_deeq_scf_matches_paw_deeq",
         for (long J  = 0; J  < Dstatic_before.extent(2); ++J)
             max_mut = std::max(max_mut,
                 std::abs(Dstatic_after(ia, I, J) - Dstatic_before(ia, I, J)));
-        REQUIRE(max_mut == 0.0);   // non-mutation contract (plan A1)
+        REQUIRE(max_mut == 0.0);   // non-mutation contract
     }
 
     REQUIRE(Dion_diag.extent(0) == Dscf.extent(0));

@@ -92,7 +92,7 @@ namespace methods {
       /* Direct (hamiltonian-route) static build */
       /**
        * V_H and/or exact-exchange K via hamilt::Vhartree / hamilt::Vexchange
-       * (the "hamilt" interaction type, notes/static_route_selection_plan.md).
+       * (the "hamilt" interaction type).
        * Same contract as the ERI overloads: sF_skij is zero-initialized and
        * receives only the requested static terms (K SIGNED); gygi finite-size
        * correction via the shared HF_K_correction. Symmetry-reduced meshes

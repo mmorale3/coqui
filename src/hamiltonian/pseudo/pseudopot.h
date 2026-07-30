@@ -44,7 +44,7 @@ namespace hamilt
 {
 
 namespace paw {
-// Lazily built runtime caches (plan A4): angular aainit tables, per-species
+// Lazily built runtime caches: angular aainit tables, per-species
 // qrad interpolation tables, the full-BZ Pskna lift, and the Δk-keyed Qfac
 // cache. Defined in hamiltonian/paw/paw_runtime_caches.hpp (its member types
 // live in paw headers that themselves include pseudopot.h, hence the
@@ -89,7 +89,7 @@ struct paw_exx_options {
   /// speed (cf. VASP LMAXFOCK for the Fock-exchange augmentation).
   int aug_lmax = -1;
   /// Per-rank byte budget (in MB) of the Δk-keyed Qfac pair-factor cache used
-  /// by the direct v_x path (plan A4/C3; paw_runtime_caches). Δk entries are
+  /// by the direct v_x path (see paw_runtime_caches). Δk entries are
   /// cached first-come-stays until the budget is exhausted; further Δk are
   /// built into caller scratch each call (correct, just slower). 0 disables
   /// caching. Sizing: one entry is nat × nij_max × nnr_dense × 16 B.
@@ -99,7 +99,7 @@ struct paw_exx_options {
    * Abort with a clear message for invalid / not-yet-implemented options.
    * Both compensation modes are supported by both routes: the direct v_x
    * path evaluates the augmentation on the dense fft_mesh_aug sphere, and
-   * the THC construction (plan C2) evaluates its atom-local LL Coulomb
+   * the THC construction evaluates its atom-local LL Coulomb
    * block on the same dense sphere regardless of the (possibly ecut-reduced)
    * smooth THC collocation grid — which is what makes 'shape' (the sharp
    * AE-PS pair density) resolvable in THC. `in_thc` is kept for future
@@ -172,7 +172,7 @@ class pseudopot
   auto Qij_view() const { return qq_nt_data.local(); }
   auto qgm_view() const { return qgm.local(); }
   // Static per-atom non-local D (nat, nhm*npol, nhm*npol): dion replica +
-  // alpha_x * ex_cvij, built eagerly in read_vnl_h5 for USPP/PAW (plan I2).
+  // alpha_x * ex_cvij, built eagerly in read_vnl_h5 for USPP/PAW.
   // Exposed read-only for tests/validation. Dummy (1,1,1) for NCPP.
   auto Dnn_atom_view() const { return Dnn_atom_static.local(); }
   nda::array<int,3> const& ijtoh_view() const { return ijtoh; }
@@ -236,14 +236,14 @@ class pseudopot
     nda::array<double,1> ae_vloc;      // (mesh) AE radial local potential
                                        // (= -Z/r screened by frozen AE core
                                        //  Hartree). Diagonal of T+V_AE_static.
-                                       // In-memory HARTREE (plan B4: read-time
+                                       // In-memory HARTREE (read-time
                                        // scaled; legacy h5 stores Ry).
     nda::array<double,1> ae_rho_atc;   // (mesh) AE atomic core density ρ_core_AE
     nda::array<double,1> vloc_ps;      // (mesh) PS radial local pseudopotential
                                        // — paired with ae_vloc, needed for the
                                        //   PAW static one-center D matrix
                                        //   (kinetic + ionic, frozen-core).
-                                       // In-memory HARTREE (plan B4).
+                                       // In-memory HARTREE.
     nda::array<double,1> rho_atc_ps;   // (mesh) PS atomic core density ρ_core_PS
                                        //   (NLCC). Required for the dynamic
                                        //   one-center Hartree update
@@ -317,7 +317,7 @@ class pseudopot
                math::nda::DistributedArrayOfRank<4> auto & Hij);
 
   /**
-   * Density-dependent overloads (plan I5): on top of the static assembly
+   * Density-dependent overloads: on top of the static assembly
    * above, the requested density-dependent terms are added under separate
    * boolean control, so callers (e.g. a future set_H) can mix direct and
    * ERI routes per term:
@@ -418,7 +418,7 @@ class pseudopot
 
   /**
    * Option A ("shape-restored" on-site exact exchange), derived from the
-   * single mode source _exx_opts.vv_compensation (plan C1 — no independent
+   * single mode source _exx_opts.vv_compensation (no independent
    * bool). When shape mode is selected, add_exchange (both the nii and nij
    * overloads) builds the PAW augmentation from the FULL AE−PS partial-wave
    * pair density (φφ − φ̃φ̃, via build_qrad_tab_full_aeps) instead of the
@@ -472,7 +472,7 @@ class pseudopot
   //     D_h0 = Dnn_atom_static (dion + ex_cvij)  +  ∫ V_loc · Q̂
   // The second term is the frozen one-body ELECTROSTATIC coupling of the
   // compensation charge to the local potential — neither exchange nor
-  // correlation, so it is ALWAYS included (settled 2026-07-24). It is NOT
+  // correlation, so it is ALWAYS included. It is NOT
   // contained in dion: Eq. (d0)'s −⟨Q̂|v_H[ñ_Zc]⟩ is the one-center
   // DESCREENING reference (opposite sign, radial, own-atom), put there
   // precisely so the solid re-adds the full periodic integral. Lazily
@@ -482,7 +482,7 @@ class pseudopot
   // Angular-momentum coupling tables at lli = 1 + max l over all projectors.
   paw::aainit_tables const& paw_aatab() const;
   // Per-species qrad interpolation tables at the SINGLE project-wide
-  // dq = 0.01 (plan A4); rebuilt only when Kmax grows or the mode
+  // dq = 0.01; rebuilt only when Kmax grows or the mode
   // (shape-restored vs moment) / aug_lmax changes. A table built to a larger
   // Kmax is exact for any smaller request (identical interpolation nodes).
   std::vector<paw::qrad_tab> const& paw_qrad_tabs(
@@ -560,13 +560,13 @@ class pseudopot
   //memory::unified_array<ComplexType,3> Dnn;
   sarray_t<nda::array_view<ComplexType,3>> Dnn;
 
-  // Static (frozen) per-atom non-local D for USPP/PAW (plan I2):
+  // Static (frozen) per-atom non-local D for USPP/PAW:
   //   D_static(a, I, J) = dion(type(a), I, J) + alpha_x * ex_cvij(type(a), I, J)
   // shape (nat, nhm*npol, nhm*npol). Built EAGERLY in read_vnl_h5 (dion is the
   // full frozen D^0 per QE convention; ex_cvij is the frozen core-valence
   // exact exchange, contracted with factor 1). Never mutated afterwards —
   // this is the only persistent per-atom D. Density-dependent (Hartree-only)
-  // terms are rebuilt per evaluation via compute_paw_deeq (plan I3). Dummy
+  // terms are rebuilt per evaluation via compute_paw_deeq. Dummy
   // (1,1,1) for NCPP (species-resolved Dnn is used instead).
   sarray_t<nda::array_view<ComplexType,3>> Dnn_atom_static;
 
@@ -690,7 +690,7 @@ public:
    *   D_eff^a(ρ) = D_static^a + ΔD_H^a(becsum^a(ρ), ρ_core_AE, ρ_core_PS)
    *
    * Thin non-mutating wrapper over `compute_paw_deeq(nij, empty_Vloc,
-   * include_static=true)` (plan A1): the static tensor `Dnn_atom_static`
+   * include_static=true)`: the static tensor `Dnn_atom_static`
    * (dion + ex_cvij, built in the ctor) is the baseline and is never
    * modified; the dynamic piece is the Hartree-only radial one-center term
    * from the current becsum. No G-space ∫V·Q term (pass a potential to
@@ -859,7 +859,7 @@ public:
    * @param nii     - [input] Diagonal density matrix (s, k, a)
    * @param nij     - [input] Density matrix (s, k, a, b)
    * @param add_hartree  - [input] with a density: add smooth V_H to hpsi and
-   *                       the V_loc+V_H one-center D to Hij (plan I5). false
+   *                       the V_loc+V_H one-center D to Hij. false
    *                       reduces to the static-only no-density assembly.
    * @param add_exchange - [input] with a density: accumulate the direct-route
    *                       exact-exchange K into Hij (host only).

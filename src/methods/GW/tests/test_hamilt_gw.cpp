@@ -63,12 +63,12 @@ namespace bdft_tests {
   }
 
   TEST_CASE("hamilt_gw_hf_slot", "[methods][hamilt][gw][qe][paw]") {
-    // Static-route plan phase 3.3: one Dyson GW iteration with the hf slot on
+    // One Dyson GW iteration with the hf slot on
     // the direct route vs THC. The static Σ (F_skij) must agree to the THC
     // fitting tolerance; the DYNAMIC self-energy at iteration 1 is built from
     // the mean-field G with the SAME thc corr object in both runs, so it must
     // be identical to numerical determinism (route independence of the
-    // dynamics, invariant I7).
+    // dynamics).
     auto& mpi_context = utils::make_unit_test_mpi_context();
     imag_axes_ft::IAFT ft(1000, 1.2, imag_axes_ft::ir_source);
 

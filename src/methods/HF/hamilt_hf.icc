@@ -24,7 +24,6 @@ namespace methods {
     /*
      * Direct (hamiltonian-route) static build: V_H and/or exact-exchange K
      * from the current density matrix via hamilt::Vhartree / hamilt::Vexchange
-     * (notes/static_route_selection_plan.md, invariants I5/I7).
      *
      * Contract identical to the THC/Cholesky overloads: sF_skij is
      * zero-initialized and receives ONLY the requested static terms; K is

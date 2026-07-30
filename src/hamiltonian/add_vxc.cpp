@@ -152,7 +152,7 @@ void read_vxc_h5(MF_t &mf, h5::group& grp0, shared_array<array_t> &svxc)
     F.backward(vxc_4D);
 
     // to Hartree unit (legacy Ry files only; schema_version >= 2 is
-    // already Hartree on disk — plan B4)
+    // already Hartree on disk)
     nda::tensor::scale(ComplexType(h5_pp_ry2ha(grp1)), vxc_2D);
   }
   if(svxc.node_comm()->root()) {
@@ -171,7 +171,7 @@ template void add_vxc(mf::MF&, nda::range, nda::range,
     darray_t<host_array<ComplexType,4>,communicator>&);
 // NOTE: read_vxc_h5<mf::MF, array_view<ComplexType,3>> is already
 // instantiated through the add_vxc body above; the QE-eigenvalue diagnostic
-// (plan A-tests iv) links against that instantiation.
+// links against that instantiation.
 #if defined(ENABLE_DEVICE)
 using memory::device_array;
 using memory::unified_array;

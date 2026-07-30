@@ -17,7 +17,7 @@
  * for `ptfunc`, and `G_{LM,IJ}` the real-spherical-harmonic Clebsch-
  * Gordan coupling (= QE's `aatab.ap(lp, nhtolm(I), nhtolm(J))`).
  *
- * NO frozen-core density enters here (plan I2/I3): the frozen core–valence
+ * NO frozen-core density enters here: the frozen core–valence
  * one-center electrostatics is already inside the static D⁰ (`dion`), so a
  * ρ_core term in the dynamic Hartree double-counts it (the D2 AB direct-V_H
  * +19.98 Ha defect — see compute_paw_hartree_atom's docstring). The
@@ -48,7 +48,7 @@ namespace hamilt::paw {
  * Per-atom Hartree-only contribution to the PAW deeq matrix from a current
  * `becsum`, plus the matching one-center Hartree energy. SCF-driver-facing.
  *
- * VALENCE ONLY (plan I2/I3). The one-center density here is the valence
+ * VALENCE ONLY. The one-center density here is the valence
  * pair density from `becsum` — NO frozen-core density enters. The frozen
  * core–valence one-center electrostatics is already contained in the static
  * D⁰ (`dion`: QE by construction, ABINIT dij0 likewise); injecting ρ_core
@@ -187,7 +187,7 @@ inline paw_oc_hartree_result compute_paw_hartree_atom(
 }
 
 /* ==========================================================================
- * Native core-valence exact exchange (plan B3)
+ * Native core-valence exact exchange
  *
  * Frozen c-v exchange Dij from AE core orbitals + AE valence partial waves:
  *
@@ -343,7 +343,7 @@ inline nda::array<double,2> compute_ex_cvij_from_core(
  *               − ⟨ψ_PS_I | vloc_ps  | ψ_PS_J⟩
  *
  * Output is in Hartree. The radial potentials (`ae_vloc`, `vloc_ps`) are
- * HARTREE in memory (plan B4: read_vnl_h5 scales legacy-Ry files at read
+ * HARTREE in memory (read_vnl_h5 scales legacy-Ry files at read
  * time), and the radial kinetic operator (`radial_kinetic_matel`) is
  * already implemented in Hartree — no unit factors here.
  *
@@ -396,7 +396,7 @@ inline nda::array<double, 2> compute_paw_static_D(
             double T_AE = radial_kinetic_matel(u_AE_I, u_AE_J, sp.r, sp.rab, l);
             double T_PS = radial_kinetic_matel(u_PS_I, u_PS_J, sp.r, sp.rab, l);
 
-            // V matel — ae_vloc/vloc_ps are Ha in memory (plan B4).
+            // V matel — ae_vloc/vloc_ps are Ha in memory.
             for (long ir = 0; ir < mesh; ++ir) {
                 integrand(ir) = sp.ae_vloc(ir) * u_AE_I(ir) * u_AE_J(ir)
                               - sp.vloc_ps(ir) * u_PS_I(ir) * u_PS_J(ir);
@@ -437,7 +437,7 @@ inline void pseudopot::build_paw_scf_caches()
     paw_aainit_lli = lli;
 
     // NOTE: the static per-atom tensor Dnn_atom_static (dion + ex_cvij) is
-    // NOT built here — it is assembled eagerly in read_vnl_h5 (plan A1).
+    // NOT built here — it is assembled eagerly in read_vnl_h5.
     // h5 `dion` already encodes QE's full frozen D^0 per-channel — i.e. it
     // ALREADY includes the AE−PS V_loc baseline that compute_paw_static_D
     // would build from the (ae_vloc, vloc_ps) pair. Adding it again would
@@ -453,7 +453,7 @@ inline void pseudopot::build_paw_scf_caches()
 template<typename nij_t>
 inline nda::array<ComplexType,3> pseudopot::compute_deeq_scf(nij_t const& nij)
 {
-    // Thin non-mutating wrapper (plan A1): returns D_static + radial D^H[n]
+    // Thin non-mutating wrapper: returns D_static + radial D^H[n]
     // (no G-space ∫V·Q term — the empty Vloc_r short-circuits it). The static
     // tensor Dnn_atom_static (dion + ex_cvij, ctor-built) is the baseline and
     // is never modified. The becsum normalization (1/N_k k-weight + ns_scl
@@ -493,7 +493,7 @@ nda::array<ComplexType,3> pseudopot::compute_paw_deeq(
 {
     long nspin = nij.extent(0);
     double ns_scl = (nspin == 1 && npol == 1) ? 2.0 : 1.0;
-    // Full-BZ becsum (symmetry-correct, plan A3) — mirrors the nii overload.
+    // Full-BZ becsum (symmetry-correct) — mirrors the nii overload.
     auto becsum = hamilt::paw::compute_becsum_full_symm(
         *this, nij, kp_to_ibz, kp_trev, npol);
     for (long ia = 0; ia < becsum.extent(0); ++ia)
@@ -524,7 +524,7 @@ nda::array<ComplexType,3> pseudopot::compute_paw_deeq_from_becsum(
 
     build_paw_scf_caches();
 
-    // ---- (1) static baseline: dion + ex_cvij (ctor-built, plan I2).
+    // ---- (1) static baseline: dion + ex_cvij (ctor-built).
     if (include_static) {
         auto Dst = Dnn_atom_static.local();       // (nat, nhm*npol, nhm*npol)
         for (long ia = 0; ia < nat; ++ia)
@@ -534,13 +534,13 @@ nda::array<ComplexType,3> pseudopot::compute_paw_deeq_from_becsum(
     }
 
     // ---- (2) radial AE−PS one-center Hartree from the (ns_scl-scaled) becsum.
-    auto const& aatab = paw_aatab();   // cached (plan A4)
+    auto const& aatab = paw_aatab();   // cached
     // Radial-Hartree multiplier: `1` — see `notes/paw_deeq_scaling_derivation.md`.
     // CoQui's `compute_paw_hartree_atom` solves Poisson directly in Hartree,
     // and the spin-summed becsum reproduces `ddd_paw_Ha` channel-by-channel (Ry
     // `e2=2` cancels QE's spin-up-only convention exactly). Validated to
     // ~1e-6 Ha against QE's exported deeq at LiH kp222 PAW HF (historical —
-    // the QE deeq read itself was removed in plan A1).
+    // the QE deeq read itself was removed).
     double rad_fac = 1.0;
     for (long ia = 0; ia < nat; ++ia) {
         int nt = ityp(ia);
@@ -575,8 +575,8 @@ nda::array<ComplexType,3> pseudopot::compute_paw_deeq_from_becsum(
 // calling rank. This must stay communicator-free: static_h0_D() builds a
 // lazy cache through here, and the shm builders (set_H0 & co.) reach it on
 // node roots only — a collective on mpi->comm here deadlocks those callers
-// against the ranks waiting at the builder barrier (rusty np=16 hang,
-// 2026-07-25). The one-shot cost (one FFT + ~ngm·nat·nh² sum) is
+// against the ranks waiting at the builder barrier. The one-shot cost
+// (one FFT + ~ngm·nat·nh² sum) is
 // negligible; if profiling ever says otherwise, parallelize over an
 // explicitly PASSED communicator that all callers are collectively inside.
 template<typename Pot_t>
@@ -640,8 +640,8 @@ nda::array<ComplexType,3> pseudopot::compute_int_VQ(Pot_t const& V_r) const
 }
 
 // Eq. (h0) static USPP/PAW non-local D = Dnn_atom_static + ∫V_loc·Q̂
-// (settled 2026-07-24 — see the declaration in pseudopot.h for the
-// derivation against plan Eq. d0). Lazily cached; the first-call build is
+// (see the declaration in pseudopot.h for the derivation against
+// Eq. d0). Lazily cached; the first-call build is
 // purely rank-local (compute_int_VQ has no MPI), so it is safe from ANY
 // calling context, including node-root-only shm builders (set_H0).
 inline nda::array<ComplexType,3> const& pseudopot::static_h0_D() const

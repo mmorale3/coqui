@@ -40,7 +40,7 @@
 #include "hamiltonian/v_h.hpp"
 #include "hamiltonian/pseudo/pseudopot.h"
 #include "hamiltonian/paw/paw_symmetry.hpp"        // full-BZ projector lift
-#include "hamiltonian/paw/paw_runtime_caches.hpp"  // cached lift (plan A4)
+#include "hamiltonian/paw/paw_runtime_caches.hpp"  // cached lift
 
 namespace hamilt::paw {
 
@@ -178,7 +178,7 @@ inline nda::array<double,3> compute_becsum_full(
             }
             acc_c(I, J) = wk * acc;
         }
-        // Hermitian pair symmetrization (plan A3): becsum_IJ ← ½(b_IJ + b_JI^*).
+        // Hermitian pair symmetrization: becsum_IJ ← ½(b_IJ + b_JI^*).
         // Re of the Hermitian part is exact for all consumers (the antisym-
         // metric Im part is inert against symmetric real kernels, see doc);
         // the anti-Hermitian residual measures Hermiticity violation of the
@@ -298,8 +298,8 @@ inline nda::array<ComplexType,1> compute_rho_aug_density_r(
  * so they expand by kp_to_ibz indexing. For nosym (IBZ == full BZ) this reduces
  * to compute_becsum_diagonal unchanged.
  *
- * Fixes the symmetry-reduced V_H augmentation error in the DIRECT path
- * (Vhartree / deeq reference); the THC path was already correct (2026-06-11).
+ * Required for a symmetry-correct V_H augmentation in the DIRECT path
+ * (Vhartree / deeq reference); the THC path does its own full-BZ lift.
  */
 template<typename occ_t, typename kti_t, typename ktr_t>
 inline nda::array<double,3> compute_becsum_diagonal_symm(
@@ -308,7 +308,7 @@ inline nda::array<double,3> compute_becsum_diagonal_symm(
     // kp_trev kept for signature parity with compute_becsum_full_symm:
     // occupations are trev-invariant so the diagonal expansion needs no conj.
 {
-    // Cached full-BZ lift (plan A4); MPI-collective on psp's communicator at
+    // Cached full-BZ lift; MPI-collective on psp's communicator at
     // the first call, cheap view afterwards. The BZ tables (kp_to_ibz,
     // kp_trev) are still taken from the caller for the band-matrix expansion
     // and must describe the same mesh psp was built from.
@@ -331,7 +331,7 @@ inline nda::array<double,3> compute_becsum_diagonal_symm(
 }
 
 /**
- * Full-BZ becsum from a full density matrix — symmetry-correct (plan A3).
+ * Full-BZ becsum from a full density matrix — symmetry-correct.
  *
  * View-2: the full-BZ states are the exactly rotated IBZ states in G-space,
  * ψ_{K,n} = R ψ_{k_ibz,n}, so γ_K = R γ_{k_ibz} R⁻¹ contracts the SAME
@@ -350,7 +350,7 @@ inline nda::array<double,3> compute_becsum_full_symm(
     pseudopot const& psp, nij_t const& nij,
     kti_t const& kp_to_ibz, ktr_t const& kp_trev, int npol)
 {
-    // Cached full-BZ lift (plan A4) — see compute_becsum_diagonal_symm.
+    // Cached full-BZ lift — see compute_becsum_diagonal_symm.
     auto Pfull = psp.Pskna_full_bz().local();  // (nspin, nk_full, npol*nkb, nbnd)
 
     long nspin   = nij.extent(0);
@@ -454,7 +454,7 @@ void v_h(utils::mpi_context_t<boost::mpi3::communicator,
 {
     nda::array<ComplexType,1> rho_aug_r;
     if (psp.pp_type() != pp_ncpp_t) {
-      // Full-BZ becsum (symmetry-correct, plan A3) — same lift as the
+      // Full-BZ becsum (symmetry-correct) — same lift as the
       // diagonal overload; reduces to the plain IBZ sum for nosym.
       auto becsum = ::hamilt::paw::compute_becsum_full_symm(
           psp, nij, kp_to_ibz, kp_trev, npol);

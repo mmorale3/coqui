@@ -391,7 +391,7 @@ compute_Pskna_full_bz(
  * from the pseudopot + lattice data before delegating to the base lift.
  * Callers that need the tables for other contractions (v_x) keep using the
  * explicit-table overload; becsum-style consumers use this one. Table caching
- * on pseudopot is plan A4.
+ * on pseudopot is provided by paw_runtime_caches.
  */
 template<class MPI_t>
 inline math::shm::shared_array<nda::array_view<ComplexType, 4>>

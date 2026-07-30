@@ -239,7 +239,7 @@ inline ComplexType evaluate_Q_IJ_at_K_fast(
 }
 
 /**
- * Δk-keyed Qfac lookup/build (plan A4). build_paw_aug_pair_factor depends on
+ * Δk-keyed Qfac lookup/build. build_paw_aug_pair_factor depends on
  * (k_p, k_q) only through Δk = k_p − k_q (it adds Δk to every mesh G), so
  * entries are keyed by Δk quantized at 1e-8 a.u.⁻¹ — far below any k-mesh
  * spacing, so distinct Δk never collide; the worst quantization outcome is a
@@ -264,7 +264,7 @@ inline nda::array<ComplexType,3> const& get_or_build_qfac_pair_factor(
     nda::array<ComplexType,3>& scratch)
 {
   auto& rt = psp.paw_rt();
-  // Budget knob (plan C3): read from the live exx options so a toml/setter
+  // Budget knob: read from the live exx options so a toml/setter
   // change takes effect without touching the cache struct directly.
   rt.qfac_budget_bytes = (long)psp.exx_options().qfac_cache_mb << 20;
   std::array<long,3> mkey{mesh(0), mesh(1), mesh(2)};
@@ -421,7 +421,7 @@ inline void v_x(utils::mpi_context_t<boost::mpi3::communicator,
                                   std::plus<>{});
 
   // ---- Build Pskna at full BZ ----
-  // Cached View-2 symmetry lift (plan A4; collective on psp's communicator
+  // Cached View-2 symmetry lift (collective on psp's communicator
   // at the first build — v_x is dispatched from pseudopot with that context).
   auto const& ityp = psp.ityp_view();
   auto const& nh_v = psp.nh_view();
@@ -448,7 +448,7 @@ inline void v_x(utils::mpi_context_t<boost::mpi3::communicator,
     Gcut = std::min(Gcut, (double)Mi * brow);
   }
   double Kmax_est = Gcut + 0.1;
-  // Cached angular tables + per-species qrad tables (plan A4). The qrad dq
+  // Cached angular tables + per-species qrad tables. The qrad dq
   // is the project-wide 0.01 (was a local 0.05 here — finer, strictly more
   // accurate, and shared with every other qrad consumer). Option A
   // (shape_restored): PAW species use the full AE−PS pair-density form
@@ -491,7 +491,7 @@ inline void v_x(utils::mpi_context_t<boost::mpi3::communicator,
                             kpts(k_p_ibz, all), kpts(kq, all));
 
         // Q^IJ_atm(G+Δk) × e^{-i(G+Δk)·τ_atm} for this (k_p, k_q), via the
-        // Δk-keyed cache (plan A4; hits across the spin loop and calls).
+        // Δk-keyed cache (hits across the spin loop and calls).
         auto const& Qf = get_or_build_qfac_pair_factor(
             psp, aatab, qtab_sp, mesh, recv, Omega,
             kpts(k_p_ibz, all), kpts(kq, all), Gcut, shape_restored, Qfac);
@@ -784,7 +784,7 @@ inline void v_x(utils::mpi_context_t<boost::mpi3::communicator,
   auto const& sps  = psp.paw_species_view();
   long nat = ityp.extent(0);
 
-  // Cached View-2 lift (plan A4; collective on psp's communicator at the
+  // Cached View-2 lift (collective on psp's communicator at the
   // first build — see the diagonal kernel).
   auto Pfull = psp.Pskna_full_bz().local();  // (nspin, nk, npol*nkb, nbnd)
   long nkb = Pfull.extent(2);
@@ -801,8 +801,8 @@ inline void v_x(utils::mpi_context_t<boost::mpi3::communicator,
     Gcut = std::min(Gcut, (double)Mi * brow);
   }
   double Kmax_est = Gcut + 0.1;
-  // Cached angular + qrad tables at the project-wide dq = 0.01 (plan A4;
-  // see the diagonal kernel).
+  // Cached angular + qrad tables at the project-wide dq = 0.01
+  // (see the diagonal kernel).
   auto const& aatab = psp.paw_aatab();
   auto const& qtab_sp = psp.paw_qrad_tabs(Kmax_est, shape_restored);
 

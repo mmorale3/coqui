@@ -47,7 +47,7 @@ parse_paw_exx_options(ptree const& pt, bool in_thc, std::string const& where) {
   // Default -1 = full 2*lmax per species (complete augmentation, cf. VASP
   // LMAXPAW); a value >= 0 caps it (cf. VASP LMAXFOCK).
   o.aug_lmax = io::get_value_with_default<int>(pt, "aug_lmax", -1);
-  // Δk-keyed Qfac cache budget for the direct v_x path (plan C3).
+  // Δk-keyed Qfac cache budget for the direct v_x path.
   o.qfac_cache_mb = io::get_value_with_default<int>(pt, "qfac_cache_mb", 256);
   o.validate(in_thc, where);
   return o;

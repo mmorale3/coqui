@@ -110,7 +110,7 @@ void print_e1_decomposition(mf::MF &mf, hamilt::pseudopot *psp,
     hamilt::set_vnl_only(mf, psp, D_dion, sScratch);
     e_dion = trace_with_dm(sScratch);
 
-    // ∫V_loc·Q̂ = static_h0_D - Dnn_atom_static (Eq. (h0), settled 2026-07-24).
+    // ∫V_loc·Q̂ = static_h0_D - Dnn_atom_static (Eq. (h0)).
     auto const &D_h0 = psp->static_h0_D();
     nda::array<ComplexType, 3> D_vq(D_st.shape());
     for (long a = 0; a < D_st.extent(0); ++a)

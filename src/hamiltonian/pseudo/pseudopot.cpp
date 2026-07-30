@@ -351,8 +351,8 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
   std::string type("");
 
   h5::group grp1 = grp0.open_group("Hamiltonian");
-  // Plan B4 — on-disk unit convention (schema contract in
-  // notes/paw_implementation_plan.md): energy-valued datasets are Ry for
+  // On-disk unit convention (schema contract in
+  // notes/converter_h5_contract.md): energy-valued datasets are Ry for
   // legacy files (scale 0.5 on read) and HARTREE for schema_version >= 2
   // (scale 1). In-memory convention is always Hartree.
   const int    pp_sv  = h5_pp_schema_version(grp1);
@@ -494,7 +494,7 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
     }
 
     // to Hartree unit (legacy Ry files only; schema_version >= 2 is
-    // already Hartree on disk — plan B4)
+    // already Hartree on disk)
     nda::tensor::scale(ComplexType(ry2ha),svsc.local());
     nda::tensor::scale(ComplexType(ry2ha),svloc.local());
   }
@@ -521,23 +521,23 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
   ofs.resize(nat);
   {
     // Plan A5: proj_per_atom is per-SPECIES (length nsp). A wrong length
-    // (e.g. per-atom, an ABINIT-converter gap — plan B2) silently resizes
+    // (e.g. per-atom, an ABINIT-converter gap) silently resizes
     // nh and mis-indexes every augmentation consumer, so it is a hard error.
     nda::array<int,1> nh_read;
     nda::h5_read(grp,"proj_per_atom",nh_read);
     utils::check(nh_read.extent(0) == nsp,
                  "pseudopot::read_vnl_h5: 'proj_per_atom' has length {} but "
-                 "number_of_species = {} — it must be per-species (plan A5). "
+                 "number_of_species = {} — it must be per-species. "
                  "Regenerate the h5 with the CoQui-shipped converter "
                  "(pw2coqui / abinit2coqui; the ABINIT converter needs the "
-                 "per-species proj_per_atom fix, plan B2).",
+                 "per-species proj_per_atom fix).",
                  nh_read.extent(0), nsp);
     nh = nh_read;
     int nh_max = 0;
     for (int s = 0; s < nsp; ++s) nh_max = std::max(nh_max, nh(s));
     utils::check(nh_max <= nhm,
                  "pseudopot::read_vnl_h5: max(proj_per_atom) = {} exceeds "
-                 "max_proj_per_atom = {} — inconsistent h5 (plan A5).",
+                 "max_proj_per_atom = {} — inconsistent h5.",
                  nh_max, nhm);
   }
   nda::h5_read(grp,"projector_offset",ofs);
@@ -560,7 +560,7 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
     for (int ia = 0; ia < nat; ++ia) nkb_sum += nh(ityp(ia));
     utils::check(nkb_sum == nkb,
                  "pseudopot::read_vnl_h5: sum over atoms of proj_per_atom "
-                 "({}) != total_num_of_proj ({}) — inconsistent h5 (plan A5).",
+                 "({}) != total_num_of_proj ({}) — inconsistent h5.",
                  nkb_sum, nkb);
   }
 
@@ -578,8 +578,7 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
       nda::h5_read(grp,"dion_so",Dnn_c);
       utils::check(Dnn_c.extent(0) == nsp && Dnn_c.extent(1) == npol*npol &&
                    Dnn_c.extent(2) == nhm && Dnn_c.extent(3) == nhm,
-                   "pseudopot::read_vnl_h5: 'dion_so' shape mismatch "
-                   "(plan A5).");
+                   "pseudopot::read_vnl_h5: 'dion_so' shape mismatch.");
       auto Dloc = Dnn.local();
       // dion_so was written in column-major; reorder.
       for( int s=0; s<nsp; ++s )
@@ -593,7 +592,7 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
       nda::h5_read(grp,"dion",Dnn_r);
       utils::check(Dnn_r.extent(0) == nsp && Dnn_r.extent(1) == nhm &&
                    Dnn_r.extent(2) == nhm,
-                   "pseudopot::read_vnl_h5: 'dion' shape mismatch (plan A5).");
+                   "pseudopot::read_vnl_h5: 'dion' shape mismatch.");
       auto Dloc = Dnn.local();
       Dloc() = ComplexType(0.0);
       for( int s=0; s<nsp; ++s )
@@ -602,7 +601,7 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
             for( int m=0; m<nhm; ++m )
               Dloc(s,n*npol+p,m*npol+p) = Dnn_r(s,n,m);
     }
-    // Ry -> Ha for legacy files; schema_version >= 2 is already Ha (plan B4)
+    // Ry -> Ha for legacy files; schema_version >= 2 is already Ha
     nda::tensor::scale(ComplexType(ry2ha),Dnn.local());
     // Plan A5: dion must be Hermitian per species block and at a plausible
     // Hartree scale — catches transposed/corrupted exports and unit errors
@@ -624,7 +623,7 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
       utils::check(herm <= 1e-8 * std::max(1.0, dmax),
                    "pseudopot::read_vnl_h5: 'dion' is not Hermitian (max "
                    "residual {}, max element {} Ha) — corrupted or transposed "
-                   "export (plan A5); regenerate the h5 with the CoQui-shipped "
+                   "export; regenerate the h5 with the CoQui-shipped "
                    "converter.", herm, dmax);
       // Bound must admit legitimate datasets: JTH-v2.0 (atompaw-4.0.x) XMLs
       // store unnormalized completeness partial waves with ||phi||^2 ~ 1e4,
@@ -632,22 +631,21 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
       // same physics as the atompaw-4.2 regeneration at 1.7e2).
       utils::check(dmax <= 1.0e5,
                    "pseudopot::read_vnl_h5: max|dion| = {} Ha is implausibly "
-                   "large — likely a unit/scale error in the converter "
-                   "(plan A5).", dmax);
+                   "large — likely a unit/scale error in the converter.", dmax);
       if (ptype != pp_ncpp_t)
         utils::check(dmax > 0.0,
                      "pseudopot::read_vnl_h5: 'dion' is identically zero for "
-                     "a USPP/PAW pseudopotential — broken export (plan A5).");
+                     "a USPP/PAW pseudopotential — broken export.");
     }
   }
   mpi->node_comm.barrier();
 
-  // NOTE (plan A1): QE `deeq` is no longer read — it carries QE's converged
+  // NOTE: QE `deeq` is no longer read — it carries QE's converged
   // V_H and V_xc content and violates the no-XC static-D contract (plan F1).
   // The per-atom static tensor Dnn_atom_static (dion replica + ex_cvij) is
   // assembled after the paw_species fields are loaded below; the
   // density-dependent Hartree-only terms are rebuilt per evaluation via
-  // compute_paw_deeq (plan I2/I3).
+  // compute_paw_deeq.
 
   // USPP / PAW augmentation overlap and Q^IJ(G).
   // qq_nt: per-species ⟨β|Q|β⟩ overlap, shape (nsp, nhm, nhm) on disk.
@@ -685,7 +683,7 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
             utils::check(ijtoh(s,ih,jh) == c && ijtoh(s,jh,ih) == c,
                 "pseudopot::read_vnl_h5: ijtoh(nt={},ih={},jh={}) = {}/{} != "
                 "expected sequential upper-triangle index {} (QE init_us_1 "
-                "convention, plan B4 schema contract) — corrupted or "
+                "convention, per the schema contract) — corrupted or "
                 "non-conforming export.", s, ih, jh,
                 ijtoh(s,ih,jh), ijtoh(s,jh,ih), c);
           }
@@ -704,7 +702,7 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
           utils::check(false,
               "USPP/PAW: dataset 'qq_nt' missing from the mean-field h5 file "
               "(old-schema file). The native one-center D build requires it "
-              "(plan A2/A5) — regenerate the h5 with the CoQui-shipped "
+              "— regenerate the h5 with the CoQui-shipped "
               "converter (pw2coqui / abinit2coqui).");
         }
         auto Qloc = qq_nt_data.local();
@@ -786,7 +784,7 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
         utils::check(false,
             "/Hamiltonian/Species group missing from the mean-field h5 file "
             "(old-schema file). The native USPP/PAW one-center D build "
-            "requires the per-species radial data (plan A2/A5) — regenerate "
+            "requires the per-species radial data — regenerate "
             "the h5 with the CoQui-shipped converter "
             "(pw2coqui / abinit2coqui).");
       } else {
@@ -801,17 +799,17 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
           utils::check(ok,
               "pseudopot::read_vnl_h5: required dataset '{}' missing or "
               "unreadable for species nt{} ({}) — old-schema or incomplete "
-              "h5 (plan A5); regenerate with the CoQui-shipped converter "
+              "h5; regenerate with the CoQui-shipped converter "
               "(pw2coqui / abinit2coqui).", ds, nt_i, why);
         };
         for(int nt=0; nt<nsp; ++nt) {
           std::string nt_name = "nt"+std::to_string(nt);
           // The CoQui-shipped converters write a species group (with
           // species_kind paw|uspp|ncpp) for EVERY species; a missing group
-          // is an old-schema file (plan A5).
+          // is an old-schema file.
           utils::check(sp_grp.has_subgroup(nt_name),
               "pseudopot::read_vnl_h5: /Hamiltonian/Species/{} missing — "
-              "old-schema h5 (plan A5); regenerate with the CoQui-shipped "
+              "old-schema h5; regenerate with the CoQui-shipped "
               "converter (pw2coqui / abinit2coqui).", nt_name);
           h5::group nt_grp = sp_grp.open_group(nt_name);
           auto& sp = paw_species[nt];
@@ -829,12 +827,12 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
           if(sp.is_paw || sp.is_uspp)
             utils::check((int)nh(nt) == sp.nh,
                 "pseudopot::read_vnl_h5: species nt{} 'nh' attribute ({}) != "
-                "proj_per_atom ({}) — inconsistent h5 (plan A5).",
+                "proj_per_atom ({}) — inconsistent h5.",
                 nt, sp.nh, (int)nh(nt));
           if(sp.is_paw) {
             utils::check(nt_grp.has_subgroup("paw"),
                 "pseudopot::read_vnl_h5: species nt{} is PAW but has no "
-                "'paw' subgroup — old-schema h5 (plan A5); regenerate with "
+                "'paw' subgroup — old-schema h5; regenerate with "
                 "the CoQui-shipped converter.", nt);
             h5::group pgrp = nt_grp.open_group("paw");
             h5::h5_read_attribute(pgrp, "lmax_aug", sp.lmax_aug);
@@ -844,15 +842,15 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
             // (see species_paw_t comment) — not loaded.
             //
             // ae_vloc / vloc_ps: REQUIRED for schema_version >= 2 files
-            // (plan B4 promotion of the A5 deviation); warned-optional for
-            // legacy files (the lih222_paw_hf fixture predates the PS-side
-            // export, and the only consumer, compute_paw_static_D, is not
-            // used in production since plan A1). Normalized to HARTREE in
+            // warned-optional for legacy files (the lih222_paw_hf fixture
+            // predates the PS-side export, and the only consumer,
+            // compute_paw_static_D, is not used in production).
+            // Normalized to HARTREE in
             // memory here (legacy files store Ry — scale ry2ha).
             // ae_rho_atc / rho_atc_ps stay silent-optional: absence can be
             // PHYSICAL (no NLCC ⇒ QE writes no PS core); no production
             // consumer today (the one-center Hartree driver is valence-only
-            // per plan I2/I3 — core electrostatics lives in dion).
+            // core electrostatics lives in dion).
             auto read_radial_vpot = [&](h5::group& g, std::string const& ds,
                                         auto& target) {
               try { nda::h5_read(g, ds, target); }
@@ -869,7 +867,7 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
                     "current pw2coqui when convenient.", ds, nt);
                 return;
               }
-              target *= ry2ha;   // in-memory Hartree (plan B4)
+              target *= ry2ha;   // in-memory Hartree
             };
             read_radial_vpot(pgrp, "ae_vloc", sp.ae_vloc);
             try { nda::h5_read(pgrp, "ae_rho_atc", sp.ae_rho_atc); } catch(...) {}
@@ -897,12 +895,12 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
             require_read(nt_grp, "indv",   sp.indv,   nt, "channel→beta map");
             utils::check(sp.lll.extent(0) == sp.nbeta,
                 "pseudopot::read_vnl_h5: species nt{} 'lll' length ({}) != "
-                "nbeta ({}) (plan A5).", nt, sp.lll.extent(0), sp.nbeta);
+                "nbeta ({}).", nt, sp.lll.extent(0), sp.nbeta);
             utils::check(sp.nhtol.extent(0) == sp.nh &&
                          sp.nhtolm.extent(0) == sp.nh &&
                          sp.indv.extent(0) == sp.nh,
                 "pseudopot::read_vnl_h5: species nt{} nhtol/nhtolm/indv "
-                "lengths ({}/{}/{}) != nh ({}) (plan A5).", nt,
+                "lengths ({}/{}/{}) != nh ({}).", nt,
                 sp.nhtol.extent(0), sp.nhtolm.extent(0), sp.indv.extent(0),
                 sp.nh);
           }
@@ -948,7 +946,7 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
                 tmp.aewfc, tmp.core_aewfc, sp.lll, sp.core_l,
                 sp.indv, sp.nhtolm, sp.r, sp.rab);
             app_log(2, "  pseudopot: species nt{} — ex_cvij built natively "
-                       "from Core/ae_wfc ({} core orbitals, plan B3).",
+                       "from Core/ae_wfc ({} core orbitals).",
                     nt, sp.core_l.size());
           }
         }
@@ -1079,7 +1077,7 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
       if (!sp.is_paw) continue;
       bool no_core_charge = (sp.ae_rho_atc.size() == 0) &&
                             (sp.ncore_orbitals == 0 || sp.core_aewfc.size() == 0);
-      // Auto-detect the core-valence exchange treatment (plan B3 order):
+      // Auto-detect the core-valence exchange treatment (detection order):
       //   h5 Onecenter/ex_cvij       -> frozen Fock c-v exchange (fock)
       //   else Core/ae_wfc present   -> ex_cvij built NATIVELY at read time
       //                                 (compute_ex_cvij_from_core, above)
@@ -1116,7 +1114,7 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
     }
   }
 
-  // Static (frozen) per-atom D for USPP/PAW (plan I2, assembled eagerly):
+  // Static (frozen) per-atom D for USPP/PAW (assembled eagerly):
   //
   //   D_static(a, I, J) = dion(type(a), I, J) + alpha_x * ex_cvij(type(a), I, J)
   //
@@ -1131,7 +1129,7 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
   // dion read above) because ex_cvij is only loaded with the heavy paw_species
   // fields just above. This tensor is never mutated after this point;
   // density-dependent (Hartree-only) terms are rebuilt per evaluation via
-  // compute_paw_deeq (plan I3).
+  // compute_paw_deeq.
   //
   // Guard on pp type: paw_species is only populated for USPP/PAW (see above),
   // so this block must NOT dereference paw_species[nt] on the NC path (empty
@@ -1451,8 +1449,8 @@ void pseudopot::add_vpp_impl(boost::mpi3::communicator& comm,
     // no occupation/N_k is folded into the channel. Built only on PAW/USPP;
     // NCPP takes the species-resolved static Dnn (its Hartree is purely the
     // smooth vr applied above). nii and nij produce the identical operator
-    // for the same physical density (plan I5), both via the full-BZ
-    // symmetry-correct becsum (plan A3).
+    // for the same physical density, both via the full-BZ
+    // symmetry-correct becsum.
     if (ptype != pp_ncpp_t) {
       sarray_t<nda::array_view<ComplexType,1>> svfull(mpi_local_context,{nnr_aug});
       auto vfull = svfull.local();
@@ -1475,18 +1473,18 @@ void pseudopot::add_vpp_impl(boost::mpi3::communicator& comm,
   } else {
 
     // No density (or add_hartree=false): static-only assembly, Eq. (h0) of
-    // plan I5 — local potential on hpsi plus the frozen non-local D in Hij.
+    // Local potential on hpsi plus the frozen non-local D in Hij.
     // add_vnl_impl indexes Dion(id, ...) with id = (ncpp ? nt : ia); NCPP →
     // species-resolved Dnn, USPP/PAW → per-atom static_h0_D() =
     // Dnn_atom_static (dion + ex_cvij) + ∫V_loc·Q̂. The ∫V_loc·Q̂ term is
     // the frozen one-body ELECTROSTATIC compensation-charge coupling —
-    // neither exchange nor correlation, so it is ALWAYS included (settled
-    // 2026-07-24; it is NOT in dion — Eq. d0's −⟨Q̂|v_H[ñ_Zc]⟩ is the
+    // neither exchange nor correlation, so it is ALWAYS included (it is
+    // NOT in dion — Eq. d0's −⟨Q̂|v_H[ñ_Zc]⟩ is the
     // opposite-sign one-center descreening reference). Hartree/exchange are
     // supplied elsewhere (today: the ERI objects in the SCF classes) and
     // must not be double-counted here; the density path integrates
     // (V_loc+V_H)·Q̂ itself and never touches static_h0_D, so the identity
-    // H(n) ≡ H0 + Hartree(n) holds exactly (plan A-tests i).
+    // H(n) ≡ H0 + Hartree(n) holds exactly.
     auto vltot = svloc.local();
     hamilt::add_vloc(npol,fft_mesh_aug,swfc_to_rho.local(),vltot,psi,hpsi);
 
@@ -1497,7 +1495,7 @@ void pseudopot::add_vpp_impl(boost::mpi3::communicator& comm,
 
   }
 
-  // Direct-route exact exchange (plan I5/I7 groundwork for set_H): the
+  // Direct-route exact exchange: the
   // band-pair-augmented K has no hpsi representation, so it is built into a
   // temporary with Hij's distribution and accumulated. K is SIGNED
   // (F = H + K, K negative) per the add_exchange convention.
@@ -1678,7 +1676,7 @@ void pseudopot::add_Hartree_impl(nda::range k_range, nda::range b_range,
       // Full density-matrix path: becsum via compute_becsum_full_symm
       // (full-BZ lift, 1/N_k k-weight), so the one-center radial Hartree
       // matches the smooth compensation charge that hamilt::v_h(*nij,...)
-      // already added above — also on symmetry-reduced meshes (plan A3).
+      // already added above — also on symmetry-reduced meshes.
       auto Dion_H = compute_paw_deeq(*nij, v_hartree, /*include_static=*/false);
       add_vnl_impl(k_range, b_range, Dion_H, Vij);
     }

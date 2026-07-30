@@ -43,14 +43,14 @@
 #include "methods/SCF/scf_driver.hpp"
 
 /*
- * Static-route selection plan, phase 3 (notes/static_route_selection_plan.md):
- * in-SCF I7 acceptance — the direct ("hamilt") route in the static ERI slots
- * must reproduce the factorized-ERI route through the UNTOUCHED scf_loop seam.
+ * In-SCF route equivalence: the direct ("hamilt") route in the static ERI
+ * slots must reproduce the factorized-ERI route through the UNTOUCHED
+ * scf_loop seam.
  * The route difference is bounded by the THC fitting error; the wiring errors
  * this battery pins (double normalization, ns_scl/N_k, slot composition, sign
  * of K, div correction) are all gross by comparison.
  *
- * Guard behavior (plan 3.5) that ends in utils::check -> APP_ABORT -> MPI_Abort
+ * Guard behavior that ends in utils::check -> APP_ABORT -> MPI_Abort
  * (exx-options conflict, hamilt in the dynamic slot) is NOT testable
  * in-process — consistent with the codebase-wide absence of THROWS-style
  * tests. The positive complements are covered here instead; the dynamic-slot
@@ -58,8 +58,8 @@
  * additionally enforced at compile time: no scf_loop instantiation has
  * hamilt_eval_t in corr.
  *
- * Phase 4 (symmetry in the nij path): the interim sym-mesh exchange guard is
- * RETIRED — the route-equivalence battery runs on the symmetric mesh too, and
+ * Symmetry in the nij path: the route-equivalence battery runs on the
+ * symmetric mesh too, and
  * hamilt_hf_sym_vs_nosym pins the View-2 general-nij lift (becsum + v_x,
  * notes/static_route_nij_symmetry_note.md) against the nosym fixture.
  */

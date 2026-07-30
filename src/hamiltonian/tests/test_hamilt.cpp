@@ -839,7 +839,7 @@ TEST_CASE("one_body_components_so", "[hamilt]")
 }
 
 /**
- * DFT eigenvalue regression test (plan A-tests iv: explicit diagnostic
+ * DFT eigenvalue regression test (explicit diagnostic
  * assembly D_stat + D^H[n_QE] + ∫V_xc·Q̂).
  *
  * For converged QE Kohn-Sham orbitals the band basis diagonalizes H, so the
@@ -847,7 +847,7 @@ TEST_CASE("one_body_components_so", "[hamilt]")
  * computes H = T + V_loc + V_H + V_NL via CoQui's (XC-free-D) pipeline, adds
  * the smooth-grid V_xc band matrix AND the XC-augmentation integral ∫V_xc·Q̂
  * (both of which QE keeps inside its screened deeq / V_xc, and CoQui's
- * production D excludes by design — plan I2/I3), then compares H_nn to
+ * production D excludes by design), then compares H_nn to
  * mfobj.eigval(s,k,a) for occupied bands. QE-saved orbitals are
  * S_aug-orthonormal, so no overlap division is needed.
  *
@@ -884,10 +884,10 @@ void test_dft_eigenvalues(mpi_context_t& mpi, mf::MF& mfobj,
   nda::tensor::add(ComplexType(1.0), Vxcij.local(),
                    ComplexType(1.0), Hij.local());
 
-  // Plan A-tests (iv): the diagnostic assembles D_stat + D^H[n_QE] + ∫V_xc·Q̂
+  // The diagnostic assembles D_stat + D^H[n_QE] + ∫V_xc·Q̂
   // EXPLICITLY. QE's screened deeq carries the XC-augmentation integral
   // ∫V_xc·Q̂ (and, for PAW, additionally the radial one-center XC inside
-  // ddd_paw); CoQui's production D is XC-free BY DESIGN (plan I2/I3), so the
+  // ddd_paw); CoQui's production D is XC-free BY DESIGN, so the
   // smooth-grid XC-augmentation term is added here, test-side only.
   //   NCPP: Q̂ = 0 → exact no-op.  USPP: the operator is now COMPLETE vs QE.
   //   PAW: the radial one-center XC remains (deliberately) missing — the
@@ -974,7 +974,7 @@ void test_dft_eigenvalues(mpi_context_t& mpi, mf::MF& mfobj,
     // PAW: the residual is the KNOWN-MISSING radial one-center XC of QE's
     // ddd_paw (see the function doc). Pin its measured magnitude two-sided:
     // shrinking below the band means the one-center XC accidentally entered
-    // CoQui's D (I2/I3 violation); growing means a real regression elsewhere.
+    // CoQui's D; growing means a real regression elsewhere.
     app_log(2,
       "DFT eigenvalue regression: max|H_nn - eps_n| = {:.3e} over {} occupied "
       "states (pinned one-center-XC band [{:.1e}, {:.1e}])",
@@ -2026,7 +2026,7 @@ void test_thc_vs_direct_VH_VX(mpi_context_t& mpi,
   // (i,j): V_x(i,j) = -sum_a n_a (ia|aj) is a Hermitian quadratic form ONLY
   // when i == j, so a Z stored as its transpose leaves the diagonal (and hence
   // E_x, E_H, and every diagonal ERI) exactly invariant while corrupting the
-  // off-diagonal. That is precisely the V_LL bug of 2026-07-29, and the
+  // off-diagonal. That is precisely the V_LL transpose class of bug, and the
   // diagonal outnumbers nothing here — a single global max is dominated by the
   // large diagonal elements, so an off-diagonal defect can hide inside a
   // passing max_dVX. Resolving it separately, and normalising to the
@@ -2036,7 +2036,7 @@ void test_thc_vs_direct_VH_VX(mpi_context_t& mpi,
   // (scf_common.hpp) forms off-diagonal V_corr_ab in both modes and scGW
   // carries the full Sigma_skij, so this is not a cosmetic check.
   //
-  // HONEST SCOPE — measured 2026-07-29, do not overstate what this guards.
+  // HONEST SCOPE — do not overstate what this guards.
   // The V_LL transpose was deliberately re-injected into BOTH gemm sites and
   // this comparison was rerun: every number below came back BYTE-IDENTICAL on
   // all four sections, LiH and the ABINIT Si fixture alike. The known-sensitive
@@ -2492,7 +2492,7 @@ TEST_CASE("thc_vs_direct_VH_VX", "[hamilt][thc][hf]")
         /*strict_VH*/ true, /*strict_VX*/ true);
   }
 
-  // ABINIT-sourced PAW mf (plan D2 requirement): the abinit2coqui real_ylm
+  // ABINIT-sourced PAW mf: the abinit2coqui real_ylm
   // odd-m sign bug (3956b45) was invisible to every QE-only route test —
   // channel-diagonal quantities were immune while the off-diagonal (k,k−q)
   // pair-density augmentation decohered. Route equivalence on an AB mf
@@ -2502,12 +2502,12 @@ TEST_CASE("thc_vs_direct_VH_VX", "[hamilt][thc][hf]")
   SECTION("si_kp222 (PAW, ABINIT-sourced mf)") {
     auto mf_ptr = std::make_shared<mf::MF>(
         mf::default_MF(mpi, "bdft_si222_paw_ab", mf::h5_input_type));
-    // D2 defect RESOLVED (2026-07-25): the direct V_H excess (+19.98 Ha
-    // trace vs the THC/ABINIT-verified +41.005) was the frozen-core
-    // density injected into the DYNAMIC one-center Hartree deeq
+    // Guards a direct-V_H excess (+19.98 Ha trace against the
+    // THC/ABINIT-verified +41.005) caused by the frozen-core density
+    // being injected into the DYNAMIC one-center Hartree deeq
     // (compute_paw_hartree_atom lp=0 core term) — a double count of the
-    // core–valence electrostatics already inside the static D⁰/dion (plan
-    // I2/I3). Invisible on QE fixtures (empty core fields); activated
+    // core–valence electrostatics already inside the static D⁰/dion.
+    // Invisible on QE fixtures (empty core fields); activated
     // here by the semicore dataset's exported core wfc. Bisection lives
     // in ab_direct_vh_trace_split. Both V_H and V_x strict.
     //
@@ -2533,9 +2533,9 @@ TEST_CASE("thc_vs_direct_VH_VX", "[hamilt][thc][hf]")
 //   deeq-dynamic ½∫v_H·n̂  (∫V·Q)         → B(t,h)+B(h,h) = +25.4505
 //   one-center radial (deltaC-equiv)                       = +11.7930
 //   total (THC-verified)                                   = +41.005
-// This bisection found the D2 defect (2026-07-25): T_oc read +31.77 — the
-// frozen-core density injected into the dynamic radial Hartree, a +19.98 Ha
-// double count of core–valence electrostatics already in the static
+// The failure mode this bisects: T_oc reading +31.77 — the frozen-core
+// density injected into the dynamic radial Hartree, a +19.98 Ha double
+// count of core–valence electrostatics already in the static
 // D⁰/dion. Kept as a regression guard: it pins each assembly piece
 // separately, and traces the deeq through TWO independent contractions
 // (becsum/Pskna vs the production add_vnl_impl route implicit in
@@ -2794,7 +2794,7 @@ TEST_CASE("vhartree_nij_vs_nii", "[hamilt][paw][hf]")
         mf::default_MF(mpi, "qe_lih222_paw_hf", mf::h5_input_type));
     test_vhartree_nij_vs_nii<HOST_MEMORY>(*mpi, mf_ptr, 1e-10);
   }
-  // Symmetry-reduced meshes (plan A3): the nij route now lifts becsum to the
+  // Symmetry-reduced meshes: the nij route now lifts becsum to the
   // full BZ (compute_becsum_full_symm) exactly like the nii route.
   SECTION("lih_kp222_nbnd16 (PAW, sym)") {
     auto mf_ptr = std::make_shared<mf::MF>(
@@ -2809,7 +2809,7 @@ TEST_CASE("vhartree_nij_vs_nii", "[hamilt][paw][hf]")
 }
 
 // ===========================================================================
-// becsum_full_symm identities (plan A3):
+// becsum_full_symm identities:
 //  (1) For a diagonal density matrix on a symmetry-reduced mesh,
 //      compute_becsum_full_symm ≡ compute_becsum_diagonal_symm (both consume
 //      the same full-BZ Pskna lift; pure summation-order difference).
@@ -2820,7 +2820,7 @@ TEST_CASE("vhartree_nij_vs_nii", "[hamilt][paw][hf]")
 //      (Hermitian pair symmetrization) on the symmetry-reduced mesh.
 // NOTE: no USPP/PAW fixture populates kp_trev (LiH/Si meshes are covered by
 // rotations alone), so the trev conjugation branch of the nij lift is not
-// exercised here — flagged for plan A-tests fixture work.
+// exercised here — needs a dedicated fixture.
 // ===========================================================================
 void test_becsum_full_symm(std::shared_ptr<mf::MF> mf_ptr, bool sym_reduced)
 {
@@ -2926,7 +2926,7 @@ TEST_CASE("becsum_full_symm", "[hamilt][paw][hf]")
 }
 
 // ===========================================================================
-// add_Vpp path alignment (plan A2 / invariant I5); since plan A3 the nij
+// add_Vpp path alignment; the nij
 // becsum is symmetry-correct (full-BZ lift), so the identities are also
 // checked on symmetry-reduced fixtures:
 //  (1) H(nij) ≡ H(nii) for a diagonal density matrix — both overloads must
@@ -3032,7 +3032,7 @@ TEST_CASE("add_vpp_i5_alignment", "[hamilt][paw][hf]")
         mf::default_MF(mpi, "qe_lih222_paw_hf", mf::h5_input_type));
     test_add_vpp_i5_alignment<HOST_MEMORY>(*mpi, mf_ptr, 1e-10);
   }
-  // Symmetry-reduced fixtures (plan A3): nii and nij must still build the
+  // Symmetry-reduced fixtures: nii and nij must still build the
   // identical operator, now both via the full-BZ symmetry-correct becsum.
   SECTION("lih_kp222_nbnd16 (PAW, sym)") {
     auto mf_ptr = std::make_shared<mf::MF>(
@@ -3047,8 +3047,7 @@ TEST_CASE("add_vpp_i5_alignment", "[hamilt][paw][hf]")
 }
 
 // ===========================================================================
-// H(n) ≡ H0 + Vhartree(n) — plan A-tests item (i), enabled by the settled
-// ∫V_loc·Q̂ placement (2026-07-24): Eq. (h0)'s static USPP/PAW D now carries
+// H(n) ≡ H0 + Vhartree(n). Eq. (h0)'s static USPP/PAW D carries
 // the frozen electrostatic compensation term (static_h0_D = dion + ex_cvij
 // + ∫V_loc·Q̂ — always included, it is neither exchange nor correlation and
 // is NOT contained in dion, whose −⟨Q̂|v_H[ñ_Zc]⟩ is the opposite-sign
@@ -3400,7 +3399,7 @@ void test_thc_shape_mode_vs_direct(mpi_context_t& mpi,
 TEST_CASE("thc_shape_mode_vs_direct", "[hamilt][paw][thc][hf]")
 {
   auto& mpi = utils::make_unit_test_mpi_context();
-  // Measured 2026-07-25 (this fixture): default ecut ΔV_x 7.6e-5 / Δmode
+  // Measured on these fixtures: default ecut ΔV_x 7.6e-5 / Δmode
   // 2.8e-6; reduced ecut ΔV_x 6.8e-5 / Δmode 6.3e-7. Tolerances ~10x.
   SECTION("lih_kp222_nbnd16 (PAW, default ecut)") {
     auto mf_ptr = std::make_shared<mf::MF>(
@@ -3419,7 +3418,7 @@ TEST_CASE("thc_shape_mode_vs_direct", "[hamilt][paw][thc][hf]")
   // Plan D2: both augmentation modes route-equivalent on an ABINIT-sourced
   // mf too (the shape-mode difference lives entirely in the LL/one-center
   // blocks, exactly where the converter's odd-m Ylm conventions enter).
-  // Measured 2026-07-25: ΔV_x(shape) 2.96e-4, mode signal 8.4e-3, Δmode
+  // Measured on this fixture: ΔV_x(shape) 2.96e-4, mode signal 8.4e-3, Δmode
   // 2.96e-4 (the 12-el semicore density carries a larger ISDF truncation
   // than the LiH sections at the same thc_thresh). Tolerances ~3x measured;
   // the mode check still discriminates at signal/tol ≈ 8.
@@ -6755,10 +6754,10 @@ TEST_CASE("dft_eigenvalues", "[hamilt][dft]")
 
   SECTION("lih_kp222_nbnd16 (PAW, PBE, no exact exchange)") {
     // Exercises pseudopot::add_Vpp → v_h_paw augmentation and the native
-    // XC-free D + explicit ∫V_xc·Q̂ assembly (plan A-tests iv). What
+    // XC-free D + explicit ∫V_xc·Q̂ assembly. What
     // remains deliberately unassembled vs QE is the RADIAL ONE-CENTER XC
     // inside QE's ddd_paw (CoQui carries no radial DFT-XC machinery — no
-    // DFT XC in D, plan I2/I3). Measured on this fixture (2026-07-26):
+    // DFT XC in D). Measured on this fixture:
     // max err 4.13e-2 Ha, concentrated on the Li 1s semicore (valence
     // bands 4e-4..1.8e-3). Pinned two-sided as the one-center-XC band —
     // this was 0.790 Ha before the ∫V_xc·Q̂ term was added.
@@ -6837,7 +6836,7 @@ TEST_CASE("ex_cvij_native", "[paw]")
 // path, finite-size off). Computes E_X = (2/ns)·Σ_k w_k·½Tr[Dm K] from the
 // direct Vexchange in BOTH vv_compensation modes and logs the mode split.
 // The default bare-Coulomb kernel zeroes the G+Δk=0 term (ignore_g0), i.e.
-// the finite-size-off convention of the 2026-07-21 ABINIT si222 accounting
+// the finite-size-off convention of the ABINIT si222 accounting
 // (notes/paw_article_results/abinit_exchange_gw_vs_hybrid.md):
 //   moment+deltaC(+ex_cvij)  <->  ABINIT hybrid/HF pawdijfock operator
 //   shape (Arnaud)           <->  ABINIT GW Sigma_x operator

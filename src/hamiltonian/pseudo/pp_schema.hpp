@@ -27,17 +27,17 @@ namespace hamilt
 {
 
 /**
- * Plan B4 — on-disk unit convention of the /Hamiltonian pseudopotential
- * datasets (contract: notes/paw_implementation_plan.md, "Schema contract").
+ * On-disk unit convention of the /Hamiltonian pseudopotential datasets
+ * (contract: notes/converter_h5_contract.md).
  *
  *   schema_version (int attribute on /Hamiltonian):
  *     absent : legacy export (QE deeq era) — energy datasets in Ry
- *     1      : deeq-free (plan B1) — still Ry
+ *     1      : deeq-free — still Ry
  *     >= 2   : deeq-free + HARTREE on disk — no scaling on read
  *     >= 3   : additionally /Orbitals@ecutrho is HARTREE (older pw2coqui
  *              wrote raw Ry — qe_interface::read_h5 scales x0.5 below v3)
  *              and datasets with no CoQui consumer are dropped by the
- *              converters (2026-07 audit, notes/converter_h5_contract.md).
+ *              converters (notes/converter_h5_contract.md).
  *              /Hamiltonian dataset units are unchanged from v2.
  *
  * Returns the version (0 when the attribute is absent).

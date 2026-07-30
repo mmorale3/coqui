@@ -116,7 +116,7 @@ namespace methods {
       //   - PAW species   : compensation-charge augmentation + on-site K_a
       // The per-species discrimination is enforced in make_paw_aug_layout
       // (NCPP entries get 0 ISDF rows) and in add_K_a_to_LL (skips non-PAW).
-      // `paw_onsite` is a DIAGNOSTIC-ONLY knob (plan C1): it lets one disable
+      // `paw_onsite` is a DIAGNOSTIC-ONLY knob: it lets one disable
       // just the K_a contribution for PAW species while keeping their
       // compensation augmentation, to isolate the on-site term in studies.
       // Whether K_a belongs at all is NOT this knob's job — it is derived
@@ -665,7 +665,7 @@ namespace methods {
       //    (nspin × nkpts × nkb × nbnd); not an aux index. Kept as-is.
       // ----------------------------------------------------------------
       _Timer.start("PAW_AUG.Pskna_lift");
-      // A4 deferral resolved (plan D1): _psp comes from make_pseudopot(*_MF)
+      // A4 deferral resolved: _psp comes from make_pseudopot(*_MF)
       // and pseudopot stores mf.mpi(), so whenever the two context handles
       // are the same object the psp's shm-backed Pskna cache is collective
       // on exactly this communicator — use it (one shared lift for THC,
@@ -764,7 +764,7 @@ namespace methods {
       //    per-species qrad table (replicated, small).
       // ----------------------------------------------------------------
       _Timer.start("PAW_AUG.aainit");
-      // Shared A4 runtime cache (plan C3): same lli formula (1 + max l over
+      // Shared A4 runtime cache: same lli formula (1 + max l over
       // all projectors) as the local build this replaces; built once per
       // pseudopot and reused by every consumer (direct v_x, becsum, here).
       auto const& aatab = _psp->paw_aatab();
@@ -804,7 +804,7 @@ namespace methods {
       // (dense)} — PSD by construction. K_a is grid-free. The dense sphere is
       // the inscribed sphere of the augmentation FFT box (fft_grid_dim_aug),
       // the same Gcut bound the direct v_x path uses (v_x_paw.hpp), which
-      // makes the two routes consistent (plan I7). When rho_g already covers
+      // makes the two routes consistent. When rho_g already covers
       // it, the existing single-grid path is used unchanged.
       double Gcut_aug = 1e30;
       {
@@ -856,7 +856,7 @@ namespace methods {
       if (paw_shape_restored)
         app_log(1, "  paw_aug: SHAPE-RESTORED (Option A) on-site exchange enabled "
                    "(full AE−PS oscillator, K_a dropped).");
-      // Shared A4 runtime cache (plan C3): same per-species selection
+      // Shared A4 runtime cache: same per-species selection
       // ((shape && is_paw) -> full-AEPS table, else compensation), same
       // project-wide dq = 0.01, same aug_lmax (the reader's _exx_opts were
       // propagated to the psp in prepare_paw_isdf). Tables built to a larger
@@ -918,7 +918,7 @@ namespace methods {
 //MAM: need to check above that np_PQ is smaller than _N_aug
 
       // Rank-local row buffers for this rank's _dZ tile sub-blocks,
-      // G-CHUNKED (plan D3): (P/Q chunk rows) × gchunk instead of × ngm.
+      // G-CHUNKED: (P/Q chunk rows) × gchunk instead of × ngm.
       // At production sizes (tile rows ~10³–10⁴, ngm ~10⁵–10⁶) the
       // full-width buffers were the N_aug ≳ 10k OOM; the GEMMs below
       // accumulate over the g-chunks instead. Same 8192 chunk the dense-LL
@@ -982,7 +982,7 @@ namespace methods {
         }
         _Timer.stop("PAW_AUG.eta_flat");
 
-        // ---- 6e) G-chunked row-gathers + GEMM accumulation (plan D3). ----
+        // ---- 6e) G-chunked row-gathers + GEMM accumulation. ----
         // Row-gathers on q_intra (np_PQ-way) one g-chunk at a time; ALL
         // ranks run the same chunk loop (the gathers are collective) and
         // take the same dense_LL branch (pure function of the grids —
@@ -1086,7 +1086,7 @@ namespace methods {
         // RPA blow-up; see notes/paw_article_results/
         // rpa_instability_localization.md §11-§13. Do not "restore" the old
         // ordering to match a stale comment.
-        // over the DENSE augmentation sphere when dense_LL (plan C2): η is
+        // over the DENSE augmentation sphere when dense_LL: η is
         // not band-limited to rho_g, so the Coulomb sum must run to the
         // physical Gcut of the augmentation mesh (built in G-chunks, each
         // rank evaluating exactly the (row, col) × g tiles it needs — the
@@ -1608,7 +1608,7 @@ namespace methods {
     {
       using T = typename std::decay_t<Out_t>::value_type;
       long nproc = (long)comm.size();
-      // Column slice [g_rng) of the row-distributed slab (plan D3: callers
+      // Column slice [g_rng) of the row-distributed slab (callers
       // G-chunk so the gather target is rows × chunk, not rows × ngm).
       // ALL ranks of `comm` must pass the same g_rng (collective).
       long N = g_rng.size();
@@ -1953,7 +1953,7 @@ namespace methods {
       nda::h5_read(grp, "dual_interpolating_vectors_G0", _Chi_bar_head);
       // PAW/USPP-augmented files carry Np = N_smooth + N_aug while the
       // interpolating points are a smooth-grid object: allow rp < Np and
-      // recover the split (plan D1; pre-D1 equality check aborted on any
+      // recover the split (an equality check would abort on any
       // augmented file).
       utils::check(_rp.shape(0) <= _Np,
                    "thc_reader_t::build: rp.shape() > Np. Inconsistent dimensions from the precomputed THC-ERI.");
@@ -2404,7 +2404,7 @@ namespace methods {
     // V_GL / V_LL are filled at every q via radial-Bessel η^q(G); the K_a
     // same-atom one-center kernel is added at every q.
     bool _paw_aug = true;
-    bool _paw_onsite = true;           // DIAGNOSTIC-ONLY (plan C1): gate on the K_a
+    bool _paw_onsite = true;           // DIAGNOSTIC-ONLY: gate on the K_a
                                        // one-center kernel for PAW species; whether K_a
                                        // belongs is derived from vv_compensation
                                        // (moment => include, shape => drop)

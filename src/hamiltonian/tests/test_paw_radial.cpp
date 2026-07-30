@@ -216,7 +216,7 @@ inline void gauss_legendre(int n, std::vector<double>& x, std::vector<double>& w
 } // namespace
 
 /**
- * Synthetic l=3 (f-projector) augmentation test — plan D3. The LaNiO3-class
+ * Synthetic l=3 (f-projector) augmentation test. The LaNiO3-class
  * path (projector pairs up to L = 2·l = 6) has no fixture coverage on this
  * host; every l-dependent ingredient of the becsum/Q(G) augmentation chain
  * is validated here against implementation-independent references:

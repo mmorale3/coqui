@@ -40,11 +40,11 @@ namespace methods {
 
 /**
  * Direct-route ("hamilt") static-term evaluator — the `[interaction.hamilt]`
- * toml block (notes/static_route_selection_plan.md). Fills the STATIC slots
+ * toml block. Fills the STATIC slots
  * of mb_eri_t (interaction_hf / interaction_hartree / interaction_exchange)
  * so that hf_t builds V_H and/or the exact-exchange K through the
- * hamiltonian routines (hamilt::Vhartree / hamilt::Vexchange, invariants
- * I5/I7) instead of factorized ERIs. Never valid as the dynamic
+ * hamiltonian routines (hamilt::Vhartree / hamilt::Vexchange) instead of
+ * factorized ERIs. Never valid as the dynamic
  * (`interaction`) slot — dynamic self-energies always need factorized ERIs.
  *
  * The heavy state is (a) the shared pseudopot, acquired lazily through
