@@ -414,6 +414,38 @@ evaluated before the decomposition runs, from `dyson.sH0_skij()` — as the
 agreements above independently confirm. Only the `kinetic` and `local` rows of
 that one batch should be discarded.
 
+## §3e Corrected EOS — harvested so far (4 of 6 volumes)
+
+Runs: `~/ceph/CoQui/abinit/eos_jthd_coqui_fix/a*` (settings identical to the
+pre-fix `eos_exxrpa` series: nbnd 500, thresh 1e-5, paw_isdf_tol 1e-8, gygi on
+both slots -- only the mf.h5 differs). Harvest with `harvest_eos_fix.py`.
+
+           e_1e     e_1e shift      E_H         E_x         E_c        E_total
+  10.05  2.5802254   +0.1175895  0.5616546  -2.1576020  -0.4373713  -8.0290903
+  10.15  2.4657077   +0.1216864  0.5736667  -2.1421368  -0.4363535  -8.0306203
+  10.25  2.3540356   +0.1257616  0.5857388  -2.1269018  -0.4354712  -8.0312590
+  10.35  2.2450749   +0.1298167  0.5978764  -2.1119013  -0.4347235  -8.0310907
+  10.45  pending (cluster: repeated IB "Transport retry count exceeded")
+  10.55  pending
+
+- `'only e_1e may move'` check **PASSES** on all four (E_H / E_x / E_c unchanged
+  to <5 uHa; measured <2e-10).
+- **E_total turns over between 10.25 and 10.35** -- pre-fix it fell monotonically
+  across the whole range. A three-point parabola on the last three gives
+  a0 ~ 10.279, curvature 0.0807 Ha/Bohr^2 (B0 ~ 103 GPa). NOT a substitute for the
+  six-point Birch-Murnaghan fit; the fitter refuses <= 4 points for good reason
+  (it produced a confident a0 = 10.9796 from a 4-point fit earlier in this campaign).
+- That a0 sits ~0.03 Bohr above the §3c prediction of 10.2501, which is exactly
+  what the residual 2.4 mHa/Bohr slope in the CoQui-vs-ABINIT exchange row
+  predicts (0.0024/0.0768 = 0.031 Bohr). Self-consistent, and the next thing to
+  chase if a0 is wanted tighter than ~0.03 Bohr: it is the ISDF/onsite-exchange
+  difference (the ~8 mHa exchange row), NOT the defect fixed here.
+
+Cluster note: six concurrent 16-node jobs reliably trigger
+`ib_mlx5_log.c:179 Transport retry count exceeded` on whichever jobs start
+alongside an already-running set; node exclusion does not help (different nodes
+each time). Serializing with `--dependency=afterany` on the first batch fixed it.
+
 ## §4 Status / next
 
 - [x] Phase 0 baseline + the two killed hypotheses (§1)
