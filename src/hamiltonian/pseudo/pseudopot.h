@@ -649,6 +649,41 @@ class pseudopot
 public:
 
   /**
+   * Diagnostic: contract a caller-supplied non-local D tensor into a band-space
+   * matrix and NOTHING else — no kinetic, no local potential, no Hartree. Hij
+   * is accumulated into, so the caller must zero it first.
+   *
+   * Exists to split e_1e = Tr[γ H0] into its individual one-center pieces so
+   * each can be compared against the matching term of another code's PAW energy
+   * decomposition (ABINIT's e1t10 = Σ_ij ρ_ij dij0, etc.). Uses only the stored
+   * projectors Pskna, so it needs no orbital I/O and is cheap.
+   *
+   * Indexing follows add_vnl_impl: the leading index of `Dion` is the SPECIES
+   * for NCPP and the ATOM for USPP/PAW.
+   * See notes/paw_article_results/eos_exchange_ledger.md.
+   */
+  void add_Vnl(nda::range k_range, nda::range b_range,
+               nda::ArrayOfRank<3> auto const& Dion,
+               math::nda::DistributedArrayOfRank<4> auto & Hij)
+  { add_vnl_impl(k_range, b_range, Dion, Hij); }
+
+  // Species-resolved frozen dion (nsp, nhm*npol, nhm*npol), Hartree. For NCPP
+  // this IS the entire non-local pseudopotential (ABINIT's non_local_psp); for
+  // USPP/PAW it is the dion part replicated into Dnn_atom_static.
+  auto Dnn_view() const { return Dnn.local(); }
+
+  /**
+   * Diagnostic: the per-atom static-D contribution of the frozen core-valence
+   * exact-exchange kernel ALONE (alpha_x * ex_cvij) — i.e. the ex_cvij half of
+   * Dnn_atom_static. Zero for NCPP, and for PAW species whose dataset carries
+   * no core-valence exchange. Subtracting it from Dnn_atom_view() leaves the
+   * pure dion replica, which is what maps onto ABINIT's e1t10; ex_cvij itself
+   * maps onto ABINIT's dijfock_cv, i.e. it belongs with EXCHANGE, not with the
+   * one-body term where CoQui's static D keeps it.
+   */
+  nda::array<ComplexType,3> static_D_cv_only() const;
+
+  /**
    * Return the self-consistent per-atom D for a current density matrix `nij`
    * under the frozen-core no-XC scGW framework:
    *

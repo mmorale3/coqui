@@ -30,6 +30,7 @@
 #include "methods/tools/chkpt_utils.h"
 #include "simple_dyson.h"
 #include "scf_driver.hpp"
+#include "energy_decomposition.hpp"
 
 
 namespace methods {
@@ -97,7 +98,13 @@ double rpa_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_
     mpi->comm.barrier();
     auto e_x = eval_hf_energy(sDm_skij, sF_skij, dyson.sH0_skij(), k_weight, false);
     app_log(2, "Exchange energy:           {} a.u.\n", std::get<1>(e_x));
+    app_log(2, "Hartree energy:            {} a.u. (= E_HF - E_x)\n",
+            e_hf_new - std::get<1>(e_x));
   }
+
+  // Term-by-term split of e_1e, for the cross-code PAW energy ledger. sF_skij
+  // is dead past the exchange evaluation above, so it doubles as workspace.
+  print_e1_decomposition(*mf, dyson.PSP(), sDm_skij, sF_skij, k_weight, e_1e_new);
 
   Timer.start("WRITE");
   if (mpi->comm.root()) {

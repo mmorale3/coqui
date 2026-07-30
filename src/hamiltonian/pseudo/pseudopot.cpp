@@ -1828,8 +1828,21 @@ template void pseudopot::add_exchange(nda::range k_range,  \
         darray_t<V2<ComplexType,4>,communicator> const&,  \
         darray_t<V2<ComplexType,4>,communicator>&);
 
+// add_vnl_impl is a template defined in this TU, so the header-inline add_Vnl
+// wrapper (used by hamilt::set_vnl_only for the cross-code energy ledger) needs
+// its instantiations here. Both D flavours occur: a view, from Dnn_view() /
+// Dnn_atom_view(), and an owning array, from static_D_cv_only() / static_h0_D()
+// and the differences taken between them.
+#define __add_vnl__(V1,V2) \
+template void pseudopot::add_vnl_impl(nda::range,nda::range, \
+        V1<ComplexType,3> const&, \
+        darray_t<V2<ComplexType,4>,communicator>&);
+
 __add_Vpp__(host_array)
 __add_Vpp2__(host_array_view,host_array)
+
+__add_vnl__(host_array,host_array)
+__add_vnl__(host_array_view,host_array)
 
 __add_hartree__(host_array,host_array)
 __add_hartree__(host_array_view,host_array)

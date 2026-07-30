@@ -669,6 +669,36 @@ inline nda::array<ComplexType,3> const& pseudopot::static_h0_D() const
     return rt.h0_static_D;
 }
 
+// Diagnostic: the ex_cvij-only part of Dnn_atom_static, assembled exactly as
+// the pseudopot ctor does (read_vnl_h5, alpha_x = 1). Declared in pseudopot.h.
+// Needed because CoQui keeps the frozen core-valence exact exchange inside the
+// static D (so it lands in e_1e) while ABINIT accounts it as dijfock_cv, i.e.
+// with the Fock energy — the two ledgers only line up once this piece is moved
+// across. Not cached: it is a small (nat, nhm, nhm) array built on demand by a
+// diagnostic, never in a hot loop.
+inline nda::array<ComplexType,3> pseudopot::static_D_cv_only() const
+{
+    auto Dst = Dnn_atom_static.local();
+    nda::array<ComplexType,3> D(Dst.extent(0), Dst.extent(1), Dst.extent(2));
+    D() = ComplexType(0.0);
+    if (ptype != pp_uspp_t and ptype != pp_paw_t) return D;
+    const double alpha_x = 1.0;
+    // `nat` is a read_vnl_h5 local, not a member; ityp is per-atom.
+    for (int ia = 0; ia < ityp.extent(0); ++ia) {
+      int nt = ityp(ia);
+      auto const& sp = paw_species[nt];
+      if (!sp.is_paw) continue;
+      if (sp.cv_exchange != cv_exchange_e::fock) continue;
+      int nh_a = sp.nh;
+      for (int p = 0; p < npol; ++p)
+        for (int n = 0; n < nh_a; ++n)
+          for (int m = 0; m < nh_a; ++m)
+            D(ia, n*npol+p, m*npol+p) +=
+                ComplexType(alpha_x * sp.ex_cvij(n, m), 0.0);
+    }
+    return D;
+}
+
 } // namespace hamilt
 
 #endif // HAMILTONIAN_PAW_PAW_ONECENTER_HPP

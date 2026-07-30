@@ -138,6 +138,50 @@ void set_kinetic(mf::MF &mf, pseudopot *psp, math::shm::shared_array<Array_4D_t>
 }
 
 /**
+ * Diagnostic: shared-memory band-space matrix of a caller-supplied non-local D
+ * tensor ONLY — no kinetic, no local potential, no Hartree. Contracting it with
+ * the density matrix gives that single term's contribution to
+ * e_1e = Tr[Dm*H0], which is how e_1e gets split for the cross-code PAW energy
+ * ledger (ABINIT's e1t10, dijfock_cv, and the descreening ∫V_loc·Q̂).
+ *
+ * Cheap: add_Vnl works off the stored projectors, so unlike set_H0/set_kinetic
+ * this reads no orbitals.
+ *
+ * Convention note: gen_H0 conjugates Hij, adds the local part, then conjugates
+ * again — so the non-local block passes through UNCHANGED, and what add_Vnl
+ * returns here is already in H0's final convention. Do not conjugate it.
+ *
+ * `D`'s leading index is the species for NCPP and the atom for USPP/PAW, as in
+ * add_vnl_impl. See notes/paw_article_results/eos_exchange_ledger.md.
+ */
+template<nda::MemoryArrayOfRank<4> Array_4D_t>
+void set_vnl_only(mf::MF &mf, pseudopot *psp, nda::ArrayOfRank<3> auto const& D,
+                  math::shm::shared_array<Array_4D_t> &sV_skij) {
+  utils::check(psp != nullptr, "Error in set_vnl_only: Missing pseudopot object.");
+  long np = sV_skij.internode_comm()->size();
+  long np_s = (np % mf.nspin()== 0)? mf.nspin() : 1;
+  long np_k = utils::find_proc_grid_max_npools(np/np_s, (long)mf.nkpts_ibz(), 1.0);
+  long np_i = np / (np_s*np_k);
+  std::array<long, 4> pgrid = {np_s, np_k, np_i, 1};
+  long blk_i = std::min( {(long)1024, (mf.nbnd())/np_i});
+  std::array<long, 4> bsize = {1, 1, blk_i, 2048};
+  sV_skij.set_zero();
+  if (sV_skij.node_comm()->root()) {
+    using larray = memory::array<HOST_MEMORY,ComplexType,4>;
+    auto dV = math::nda::make_distributed_array<larray>(
+                  *sV_skij.internode_comm(), pgrid,
+                  {(long)mf.nspin(), (long)mf.nkpts_ibz(), (long)mf.nbnd(), (long)mf.nbnd()},
+                  bsize);
+    dV.local() = ComplexType(0.0);
+    psp->add_Vnl(nda::range(mf.nkpts_ibz()), nda::range(mf.nbnd()), D, dV);
+    auto V_loc = sV_skij.local();
+    V_loc(dV.local_range(0), dV.local_range(1), dV.local_range(2), dV.local_range(3)) = dV.local();
+  }
+  sV_skij.communicator()->barrier();
+  sV_skij.all_reduce();
+}
+
+/**
  * One-body hamiltonian associated with MF object in a distributed array
  * Includes kinetic, hartree and pseudo-potential/external potential contributions.
  * @param mf    [input] - mean-field object
