@@ -884,11 +884,38 @@ why the slope result stands. But "CoQui's exchange agrees with ABINIT to
 0.021 mHa" is a statement at the EOS's own THC settings, **not** an absolute
 accuracy claim.
 
-Open: the direct route on the production mf (exact, occupied bands only —
-`COQUI_VEXCHANGE_MF_NBND=8`) is the arbiter for which nbnd is right, and the
-nbnd comparison should be repeated at a second volume, because an ISDF error
-that is itself volume-dependent would feed a0 directly and the whole EOS was run
-at nbnd = 500.
+**MEASURED AT A SECOND VOLUME — the systematic IS volume-dependent:**
+
+    a        E_x nbnd500      E_x nbnd250      delta
+    10.25   -2.115438575     -2.114830065     -0.6085 mHa
+    10.55   -2.071982056     -2.071887897     -0.0942 mHa
+                                 slope        +1.715 mHa/Bohr
+
+so it does NOT cancel from the slope. If nbnd = 250 is the converged setting,
+the EOS — run entirely at nbnd = 500 — carries **da0 = −0.0223 Bohr**
+(a0 10.2780 → 10.2557), and the exchange-row residual against corrected ABINIT
+goes from flat (+0.006 mHa/Bohr) to **−1.709 mHa/Bohr**: the flat agreement in
+the table above would then be an accident of this error cancelling a real
+discrepancy, not evidence of agreement.
+
+K_a is unaffected either way (nbnd-independent to 2.3 µHa at a = 10.25 and
+0.4 µHa at 10.55), so §3g/§3h's one-centre conclusions stand regardless.
+
+**This is the open item that matters.** The direct route on the production mf
+(exact, occupied bands only — `COQUI_VEXCHANGE_MF_NBND=8`) is the arbiter for
+which nbnd is right; it is expensive (three Vexchange builds, >1 h at np=1 for
+64 k-points on a 48³ mesh, and only the first is needed for this question).
+Caveats on the numbers above: both nbnd runs used `beta = 100`, so the
+comparison is internally consistent but δ(a) is assumed to carry to the EOS's
+`beta = 1000`; and a = 10.55 has no plateau confirmation yet (nbnd = 100 is
+queued).
+
+A likely resolution if nbnd = 500 is indeed the bad setting: exchange and RPA
+have opposite nbnd requirements (exchange needs only the occupied block; RPA
+needed 500 bands), and CoQui already has the machinery to satisfy both — the
+`[interaction.hamilt]` static-slot route computes V_H/K by the exact
+hamiltonian path while the dynamic slot keeps the factorized THC ERI. Routing
+exchange through it would remove this systematic by construction.
 
 ## §4 Status / next
 

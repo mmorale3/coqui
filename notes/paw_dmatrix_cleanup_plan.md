@@ -14,16 +14,24 @@ Physics / correctness
 1. ~~THC-route K_a deficit~~ **RESOLVED 2026-07-30 — there was no deficit.**
    See the STATUS block below and `eos_exchange_ledger.md` §3h: the reference
    was 12% too large, not CoQui 12% short.
-1b. **NEW, open: ISDF band-set systematic on the ABSOLUTE exchange.** E_x at
-   `nbnd` 100 and 250 agree to 1.4 µHa while `nbnd = 500` — the setting the
-   whole EOS series used — sits 0.61 mHa away from both (interpolating points
-   2620 vs 4928). 500 looks like the outlier: with that many bands the point
-   selection is driven by high-energy pair densities and the occupied block is
-   fitted worse. K_a itself is untouched (nbnd-independent to 2.3 µHa), and a
-   volume-smooth systematic cannot tilt the EOS, but two things are needed:
-   (a) the direct route on the production mf as the arbiter for which nbnd is
-   right (`COQUI_VEXCHANGE_MF_NBND=8`, running); (b) the nbnd comparison at a
-   SECOND volume — if the error is volume-dependent it feeds a0 directly.
+1b. **OPEN AND SERIOUS: a volume-dependent ISDF band-set systematic that may
+   move a0 by −0.022 Bohr.** E_x at `nbnd` 100 and 250 agree to 1.4 µHa while
+   `nbnd = 500` — the setting the WHOLE EOS series used — sits 0.61 mHa away at
+   a = 10.25 (2620 vs 4928 interpolating points). Measured at a second volume,
+   that offset is only 0.094 mHa at a = 10.55, i.e. **it varies with volume,
+   slope +1.715 mHa/Bohr, so it does NOT cancel from the EOS slope**. If
+   nbnd = 250 is the converged setting then a0 = 10.2780 → 10.2557 and the
+   exchange row's agreement with corrected ABINIT (+0.006 mHa/Bohr, reported as
+   "closed") is an accident of this error cancelling a real −1.709 mHa/Bohr
+   discrepancy. K_a is unaffected either way (nbnd-independent to 2.3/0.4 µHa),
+   so the one-centre conclusions stand.
+   Needed: (a) the direct route on the production mf as arbiter for which nbnd
+   is right (running, >1 h — and only 1 of its 3 Vexchange builds is needed, so
+   it is worth adding a switch); (b) nbnd = 100 at a = 10.55 to confirm the
+   plateau there (queued); (c) if nbnd = 500 is the bad setting, re-run the EOS
+   — noting exchange and RPA have OPPOSITE nbnd needs, which the existing
+   `[interaction.hamilt]` static-slot route already resolves by computing K on
+   the exact hamiltonian path while the dynamic slot keeps THC.
 2. **Report BOTH ABINIT one-centre Fock defects upstream.** (a) the `nsppol=1`
    spin double count in `pawdijfock`; (b) `pawinit` (`m_paw_init.F90:610`)
    fills only the `klmn<=klmn1` triangle of `eijkl` while `pawdijfock`
