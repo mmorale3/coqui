@@ -20,6 +20,7 @@
 
 
 #include "scf_common.hpp"
+#include "utilities/h5_background_writer.hpp"
 #include "dca_dyson.h"
 #include "hamiltonian/one_body_hamiltonian.hpp"
 #include "mean_field/MF.hpp"
@@ -227,6 +228,7 @@ auto diis_init(iter_scf::iter_scf_t& iter_solver,
                long iteration, std::string output,
                X_t &sF_skij, Xt_t &sSigma_tskij, const imag_axes_ft::IAFT *FT) {
   utils::check(iter_solver.iter_alg() == iter_scf::DIIS, "diis_init: iter_solver is not DIIS type.");
+  utils::h5_quiesce();  // see h5_background_writer.hpp
   h5::file file(output+".mbpt.h5", 'r');
   h5::group grp(file);
   utils::check(grp.has_subgroup("scf"), "Simulation HDF5 file does not have an scf group");
@@ -268,6 +270,10 @@ auto damping_impl(MPI_Context_t &context, iter_scf::iter_scf_t& iter_solver,
     context.node_comm.broadcast_n(&conv_Sigma, 1, 0);
   } else {
     iter_solver.metadata_log();
+    // This reads the checkpoint on every node root, not just the rank that
+    // writes it, so the local join is not enough -- the other node roots have
+    // no writer thread to wait on and would race a checkpoint still in flight.
+    utils::h5_quiesce_collective(context.comm);
     if (context.node_comm.root()) {
       std::string filename = h5_prefix + ".mbpt.h5";
       h5::file file(filename, 'r');
@@ -307,6 +313,7 @@ auto diis_impl(MPI_Context_t &context, iter_scf::iter_scf_t& iter_solver,
       }
 
       std::string filename = h5_prefix + ".mbpt.h5";
+      utils::h5_quiesce();  // see h5_background_writer.hpp
       h5::file file(filename, 'r');
       h5::group grp(file);
       std::string grp_name = datasets[0]+"/iter"+std::to_string(iteration-1);
@@ -345,6 +352,7 @@ auto solve_iterative(utils::mpi_context_t<comm_t> &context, iter_scf::iter_scf_t
     // Just check changes w.r.t. mf
     if (context.node_comm.root()) {
       auto F_mf = nda::make_regular(sF_skij.local());
+      utils::h5_quiesce();  // see h5_background_writer.hpp
       h5::file file(h5_prefix+".mbpt.h5", 'r');
       h5::group grp(file);
       if (grp.has_subgroup("scf/iter0")) {
@@ -418,6 +426,7 @@ auto read_greens_function(MPI_Context_t &context, mf::MF *mf,
 -> sArray_t<Array_view_5D_t> {
   using math::shm::make_shared_array;
 
+  utils::h5_quiesce();  // see h5_background_writer.hpp
   h5::file file(filename, 'r');
   h5::group grp(file);
 

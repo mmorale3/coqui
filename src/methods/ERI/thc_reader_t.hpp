@@ -23,6 +23,7 @@
 #define COQUI_THC_READER_T_HPP
 
 #include <string>
+#include "utilities/h5_background_writer.hpp"
 #include <optional>
 
 #include "configuration.hpp"
@@ -255,6 +256,7 @@ namespace methods {
       if (_eri_file != "") {
         _Timer.start("BUILD_WRITE");
         if (_mpi->comm.root()) {
+          utils::h5_quiesce();  // see h5_background_writer.hpp
           h5::file file(_eri_file, 'w');
           h5::group grp(file);
           // MAM: write thc meta-data to into a "metadata" dataset. Useful for external codes/afqmc
@@ -406,6 +408,7 @@ namespace methods {
       if (_eri_file != "") {
         _Timer.start("BUILD_WRITE");
         if (_mpi->comm.root()) {
+          utils::h5_quiesce();  // see h5_background_writer.hpp
           h5::file file(_eri_file, 'w');
           h5::group grp(file);
           if (_format == "bdft") {
@@ -486,6 +489,7 @@ namespace methods {
       if (_eri_file != "") {
         _Timer.start("BUILD_WRITE");
         if (_mpi->comm.root()) {
+          utils::h5_quiesce();  // see h5_background_writer.hpp
           h5::file file(_eri_file, 'w');
           h5::group grp(file);
           if (_format == "bdft") {
@@ -529,6 +533,7 @@ namespace methods {
     void read() {
       _Timer.start("BUILD_TOTAL");
       // Cache precomputed THC ERIs
+      utils::h5_quiesce();  // see h5_background_writer.hpp
       h5::file file(_eri_file, 'r');
       h5::group grp(file);
 
@@ -597,6 +602,7 @@ namespace methods {
 
     int read_Np() {
       int Np;
+      utils::h5_quiesce();  // see h5_background_writer.hpp
       h5::file file(_eri_file, 'r');
       h5::group grp(file);
       h5::h5_read(grp, "Np", Np);
@@ -688,6 +694,7 @@ namespace methods {
         _dZ.communicator()->all_reduce_in_place_n(Zq.data(), Zq.size(), std::plus<>{});
       } else {
         if (_dZ.communicator()->rank()==0) {
+          utils::h5_quiesce();  // see h5_background_writer.hpp
           h5::file file(_eri_file, 'r');
           h5::group grp(file);
           nda::h5_read(grp, "coulomb_matrix", Zq,
@@ -718,6 +725,7 @@ namespace methods {
           math::nda::gather_sub_matrix(iq_at_ip, ip, _dZ, &Zq);
         }
       } else {
+        utils::h5_quiesce();  // see h5_background_writer.hpp
         h5::file file(_eri_file, 'r');
         h5::group grp(file);
         nda::h5_read(grp, "coulomb_matrix", Zq,
@@ -759,6 +767,7 @@ namespace methods {
           }
         }
       } else {
+        utils::h5_quiesce();  // see h5_background_writer.hpp
         h5::file file(_eri_file, 'r');
         h5::group grp(file);
         nda::h5_read(grp, "coulomb_matrix", Z_PQ, std::tuple{iq, P_rng, Q_rng});

@@ -29,6 +29,7 @@
 
 #include "IO/app_loggers.h"
 #include "utilities/device_pool.h"
+#include "utilities/h5_background_writer.hpp"
 #include "utilities/freemem.h"
 
 #include "methods/ERI/mb_eri_context.h"
@@ -126,6 +127,11 @@ auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_ax
   // Determine output iteration
   // 1) The output h5 group is always "scf"
   // 2) The output iteration is scf/final_iter + 1
+  // Every rank reads the file here, but the iteration-0 checkpoint above may
+  // still be in flight on the writing rank, so the join has to be collective:
+  // with only a local join the other ranks sailed past and aborted with
+  // 'h5 group "scf" does not exist'.
+  utils::h5_quiesce_collective(mpi->comm);
   std::tie(mb_state.mbpt_iter, mb_state.df_1e_iter, mb_state.df_2e_iter, mb_state.embed_iter) =
       chkpt::read_input_iterations(mb_state.coqui_prefix+".mbpt.h5");
   long output_iter_init = mb_state.mbpt_iter+1;
@@ -300,6 +306,12 @@ auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_ax
     Timer.stop("WRITE");
     output_iter++;
   } while (output_iter<output_iter_init+niter and not converged());
+  // The last checkpoint may still be in flight. Everything downstream --
+  // post-processing, embedding, the next driver -- reads this file, and with a
+  // non-threadsafe HDF5 none of it may run concurrently with the writer.
+  Timer.start("WRITE");
+  utils::h5_quiesce_collective(mpi->comm);
+  Timer.stop("WRITE");
   pool_guard.reset();
   Timer.stop("SCF_TOTAL");
 

@@ -20,6 +20,7 @@
 
 
 #include <unordered_set>
+#include "utilities/h5_background_writer.hpp"
 #include "utilities/freemem.h"
 #include "methods/ERI/thc_reader_t.hpp"
 #include "methods/HF/thc_solver_comm.hpp"
@@ -217,6 +218,12 @@ namespace solvers {
 
     _Timer.start("TEMP_UW_dump_eps_inv_head");
     if (h5_iter>=0) {
+      // This writes the same file, the same scf/iter<N> group and from the same
+      // rank as the checkpoint, so it is the one place a background checkpoint
+      // write would collide with certainty. Joining here is also what makes the
+      // overlap worth having: it sits at the end of update_w, ~50 s into a
+      // 141 s iteration, which is long enough to hide a 30 s write.
+      utils::h5_quiesce();
       dump_eps_inv_head(eps_inv_head_q, eps_inv_head,
                         mb_state.coqui_prefix, h5_iter,
                         thc.mpi()->comm, *thc.MF());
@@ -852,6 +859,7 @@ namespace solvers {
 
       std::string filename = coqui_h5_prefix + ".mbpt.h5";
       std::string grp_name = "iter" + std::to_string(iter);
+      utils::h5_quiesce();  // see h5_background_writer.hpp
       h5::file file(filename, 'a');
       h5::group grp(file);
       auto scf_grp = (grp.has_subgroup("scf")) ? grp.open_group("scf") : grp.create_group("scf");

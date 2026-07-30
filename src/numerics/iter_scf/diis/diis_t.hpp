@@ -23,6 +23,7 @@
 #define COQUI_DIIS_T_HPP
 
 #include "configuration.hpp"
+#include "utilities/h5_background_writer.hpp"
 #include "utilities/check.hpp"
 
 #include "h5/h5.hpp"
@@ -189,6 +190,7 @@ namespace iter_scf {
     double get_mu() {
         long iter_from_file;
         std::string filename = mbpt_output + ".mbpt.h5";
+        utils::h5_quiesce();  // see h5_background_writer.hpp
         h5::file file(filename, 'r');
         h5::group grp(file);
         utils::check(grp.has_subgroup("scf"), "Simulation HDF5 file does not have an scf group");

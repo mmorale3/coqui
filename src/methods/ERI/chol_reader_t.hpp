@@ -23,6 +23,7 @@
 #define COQUI_CHOLESKY_READER_HPP
 
 #include <string>
+#include "utilities/h5_background_writer.hpp"
 
 #include "mpi3/communicator.hpp"
 #include "utilities/mpi_context.h"
@@ -180,6 +181,7 @@ namespace methods {
     void init() {
       _Np = read_Np();
       std::string filename = _eri_dir+"/"+_eri_filename;
+      utils::h5_quiesce();  // see h5_background_writer.hpp
       h5::file file = h5::file(filename, 'r');
       h5::group grp(file);
       h5::group sgrp = grp.open_group("Interaction"); 
@@ -216,6 +218,7 @@ namespace methods {
       std::string filename = _eri_dir + "/" + (_write_type==multi_file       ?
                                               "Vq"+std::to_string(iq)+".h5" :
                                               _eri_filename);
+      utils::h5_quiesce();  // see h5_background_writer.hpp
       h5::file file = h5::file(filename, 'r');
       h5::group grp(file);
       h5::group sgrp = grp.open_group("Interaction");
@@ -246,6 +249,7 @@ namespace methods {
       //int Np;
 
       decltype(nda::range::all) all;
+      utils::h5_quiesce();  // see h5_background_writer.hpp
       h5::file file = h5::file(filename, 'r');
       h5::group grp(file);
       h5::group sgrp = grp.open_group("Interaction");
@@ -265,6 +269,7 @@ namespace methods {
       int Np;
       if( iq == -1) { // read from meta_data
         std::string filename = _eri_dir+"/"+_eri_filename;
+        utils::h5_quiesce();  // see h5_background_writer.hpp
         h5::file file = h5::file(filename, 'r');
         h5::group grp(file);
         auto sgrp = grp.open_group("Interaction");
@@ -273,6 +278,7 @@ namespace methods {
         std::string filename = _eri_dir + "/" + (_write_type==multi_file       ?
                                                 "Vq"+std::to_string(iq)+".h5" :
                                                 _eri_filename);
+        utils::h5_quiesce();  // see h5_background_writer.hpp
         h5::file file = h5::file(filename, 'r');
         h5::group grp(file);
         auto sgrp = grp.open_group("Interaction");
@@ -361,6 +367,7 @@ namespace methods {
     {
       if(!std::filesystem::exists(path+"/"+output)) return false;
       std::string filename = path+"/"+output;
+      utils::h5_quiesce();  // see h5_background_writer.hpp
       h5::file file = h5::file(filename, 'r');
       h5::group grp(file);
       if( not grp.has_subgroup("Interaction") ) return false;
@@ -373,6 +380,7 @@ namespace methods {
         for (size_t iq = 0; iq < nq; ++iq) {
           std::string Vq_file = path+"/Vq"+std::to_string(iq)+".h5";
           if(!std::filesystem::exists(Vq_file)) return false;
+          utils::h5_quiesce();  // see h5_background_writer.hpp
           h5::file f = h5::file(Vq_file, 'r');
           h5::group g(f);
           if( not g.has_subgroup("Interaction") ) return false;
@@ -386,6 +394,7 @@ namespace methods {
     /* a temporary interface between methods::cholesky and methods::chol_reader_t */
     static void write_meta_data(std::string outdir, std::string eri_filename, int Np, mf::MF *mf, double tol) {
       std::string filename = outdir + "/" + eri_filename;
+      utils::h5_quiesce();  // see h5_background_writer.hpp
       h5::file file(filename, 'a');
       h5::group grp(file);
 
@@ -411,6 +420,7 @@ namespace methods {
       int nkpts = Vq_Qskij.shape(2);
 
       std::string dataset;
+      utils::h5_quiesce();  // see h5_background_writer.hpp
       h5::file file(filename, 'a');
       h5::group grp(file);
       h5::group sgrp = (grp.has_subgroup("Interaction") ?
@@ -444,6 +454,7 @@ namespace methods {
         Vq_buffer = nda::array<ComplexType, 5>(Vq_Qskij.global_shape());
         math::nda::gather(0, Vq_Qskij, &Vq_buffer);
 
+        utils::h5_quiesce();  // see h5_background_writer.hpp
         h5::file file(filename, 'a');
         h5::group grp(file);
         h5::group sgrp = (grp.has_subgroup("Interaction") ?
@@ -458,6 +469,7 @@ namespace methods {
 
       // Disable distributed hdf5 write temporarily. It's too slow!
       /*if (Vq_Qskij.communicator()->root()) {
+        utils::h5_quiesce();  // see h5_background_writer.hpp
         h5::file file(filename, 'a');
         h5::group grp(file);
         h5::group sgrp = (grp.has_subgroup("Interaction") ?

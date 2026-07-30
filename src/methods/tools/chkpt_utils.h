@@ -31,6 +31,14 @@
 
 namespace methods {
   namespace chkpt {
+
+  /**
+   * Whether dump_scf hands the checkpoint to a background thread instead of
+   * blocking the SCF loop on it (COQUI_ASYNC_CHKPT=1; off by default).
+   * See utilities/h5_background_writer.hpp for the invariant this depends on.
+   */
+  bool async_checkpoint_enabled();
+
   template<nda::Array Array_base_t>
   using sArray_t = math::shm::shared_array<Array_base_t>;
   using Array_view_2D_t = nda::array_view<ComplexType, 2>;
