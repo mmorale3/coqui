@@ -109,6 +109,15 @@ namespace methods {
 
       print_thc_gw_timers();
       thc.print_timers();
+      // ISDF-Vertex breakdown. Printed here so it sits next to the GW/THC tables it must
+      // be compared against. Timers ACCUMULATE across scf iterations (never reset), so
+      // "elapsed" is the running total and "avg" is the per-iteration cost -- which is the
+      // number to watch, since the vertex cost per iteration is what sets the wall time.
+      // Only eval_Sigma_C is driven from here; eval_Pi_C / cache_w / build_w0 are called
+      // from the scr_coulomb update_w seam, and their slots on the SAME vertex object are
+      // filled by the time this prints on the next iteration.
+      if (_vertex != nullptr and _vertex->active())
+        _vertex->print_vertex_timers();
       mb_state.mpi->comm.barrier();
     }
 

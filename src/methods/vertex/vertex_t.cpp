@@ -40,6 +40,35 @@
 namespace methods {
 namespace solvers {
 
+  namespace vertex_timer_detail {
+
+    /**
+     * RAII scope timer over a utils::TimerManager slot.
+     *
+     * Used instead of bare start/stop pairs so a stage cannot be left running when a
+     * branch is added later: the four vertex entry points have no early returns today,
+     * but they are long (650-820 lines) and actively edited, and a mismatched stop
+     * silently corrupts every subsequent reading of that slot rather than failing loudly.
+     *
+     * The slot id is resolved ONCE in the constructor (TimerManager::add is a map lookup);
+     * start/stop then go through the integer overloads, so the per-call overhead is two
+     * steady_clock reads. That matters because the finest stage timed here (SIG_KERNEL's
+     * per-call wrapper) is entered once per eval, not per tuple -- nothing in an inner
+     * contraction loop is timed, deliberately: instrumenting the tuple loop would cost
+     * more than it measures.
+     */
+    struct scoped_timer {
+      utils::TimerManager& tm;
+      const int id;
+      scoped_timer(utils::TimerManager& t, std::string const& name)
+        : tm(t), id(t.add(name)) { tm.start(id); }
+      ~scoped_timer() { tm.stop(id); }
+      scoped_timer(scoped_timer const&) = delete;
+      scoped_timer& operator=(scoped_timer const&) = delete;
+    };
+
+  }  // namespace vertex_timer_detail
+
   namespace vertex_head_detail {
 
     /**
@@ -563,6 +592,10 @@ namespace solvers {
                                std::optional<vertex_sym::sym_ctx> &slot,
                                nda::array<ComplexType, 4> const *U_skia) {
     if (slot.has_value()) return;   // geometry-fixed
+    // After the lazy guard (see SEC_BASIS): counts REAL builds only. INCLUSIVE in the
+    // entry point that triggered it. Note build_sym_ctx is called for TWO slots (global
+    // and secondary), so ncalls up to 2 per run is expected, not a leak.
+    vertex_timer_detail::scoped_timer _tm_total(_Timer, "SYM_CTX");
     decltype(nda::range::all) all;
     auto MF = thc.MF();
     const bool wan = (U_skia != nullptr);
@@ -962,6 +995,10 @@ namespace solvers {
                                        nda::MemoryArrayOfRank<4> auto const &X_glob, long orb0,
                                        nda::array<long, 2> const &kmq, long iq_gamma) {
     if (_secondary_ready) return;
+    // Placed AFTER the lazy guard on purpose: this slot should count REAL builds only, so
+    // its ncalls is the number of times the geometry-fixed basis was actually constructed
+    // (expected 1 per run). It is INCLUSIVE in whichever entry point triggered it.
+    vertex_timer_detail::scoped_timer _tm_total(_Timer, "SEC_BASIS");
     decltype(nda::range::all) all;
     auto mpi = thc.mpi();
     auto MF = thc.MF();
@@ -1225,7 +1262,122 @@ namespace solvers {
     }
   }
 
+  void vertex_t::print_vertex_timers() const {
+    // getOrAdd, NOT getPos: TimerManager::elapsed(name) APP_ABORTs on an unregistered
+    // slot, and a run legitimately skips whole stages (SIG_RESP_* are linear-only;
+    // SIG_W_GATHER is dynamic-only; CACHE_W only exists on the secondary path). Reading
+    // through add() materializes a zeroed slot instead of aborting the run from inside a
+    // diagnostic printer -- a printer must never be able to kill a multi-hour job.
+    auto T = [&](const char* n) { return _Timer.elapsed(_Timer.add(n)); };
+    auto A = [&](const char* n) { return _Timer.average(_Timer.add(n)); };
+    auto N = [&](const char* n) { return _Timer.number_of_calls(_Timer.add(n)); };
+
+    // The four TOP-LEVEL entry points are disjoint (none calls another), so their sum is
+    // this rank's total time inside vertex routines -- the accounting the caller asked
+    // for. SEC_BASIS / SYM_CTX are nested inside them and are reported separately below.
+    const double t_sig = T("SIGMA_C"), t_pi = T("PI_C");
+    const double t_cw  = T("CACHE_W"), t_w0 = T("BUILD_W0");
+    const double total = t_sig + t_pi + t_cw + t_w0;
+    if (total <= 0.0) return;   // vertex never ran (C = empty, or inactive)
+    const double sc = 100.0 / total;
+
+    auto row = [&](const char* label, const char* slot, int indent) {
+      const double e = T(slot);
+      if (e <= 0.0 and N(slot) == 0) return;   // stage not exercised in this rung mode
+      app_log(2, "  {:{}}{:<26}{:>12.3f}{:>12.4f}{:>8d}{:>8.1f}", "", indent,
+              label, e, A(slot), N(slot), e * sc);
+    };
+    // A negative remainder would mean overlapping start/stop pairs; print it either way
+    // rather than clamping, because the sign is the diagnostic.
+    auto remainder = [&](double parent, std::initializer_list<const char*> parts) {
+      double s = 0.0;
+      for (auto p : parts) s += T(p);
+      return parent - s;
+    };
+
+    app_log(2, "\n  ISDF-Vertex timers  (rung = {}, rank-local wall time)", rung_str());
+    app_log(2, "  ----------------------------------------------------------------------");
+    app_log(2, "  {:<28}{:>12}{:>12}{:>8}{:>8}",
+            "operation", "elapsed(s)", "avg(s)", "calls", "% vtx");
+    app_log(2, "  {:<28}{:>12.3f}{:>12}{:>8}{:>8.1f}", "TOTAL (vertex routines)",
+            total, "-", "-", 100.0);
+
+    row("eval_Sigma_C", "SIGMA_C", 2);
+    row("setup + Z(q)",        "SIG_SETUP",     4);
+    row("dW gather/unfold",    "SIG_W_GATHER",  4);
+    row("secondary fold",      "SIG_SECONDARY", 4);
+    row("IBZ sym ctx",         "SIG_SYMCTX",    4);
+    row("KERNEL (G^3W^2)",     "SIG_KERNEL",    4);
+    row("response Sigma^{C,r}","SIG_RESPONSE",  4);
+    // inclusive sub-stages of SIG_RESPONSE -- indented further and NOT part of the sum
+    row("|- Pi^{C,0} (no poles)",  "SIG_RESP_PI0",    6);
+    row("|- Wdyn tau->inu",        "SIG_RESP_WDYNW",  6);
+    row("|- Pi^{C,dyn} @tau=0 *",  "SIG_RESP_PIDYN",  6);
+    row("barrier (skew)",      "SIG_BARRIER",   4);
+    {
+      const double r = remainder(t_sig, {"SIG_SETUP", "SIG_W_GATHER", "SIG_SECONDARY",
+                                         "SIG_SYMCTX", "SIG_KERNEL", "SIG_RESPONSE",
+                                         "SIG_BARRIER"});
+      if (std::abs(r) > 1e-6)
+        app_log(2, "  {:4}{:<26}{:>12.3f}{:>12}{:>8}{:>8.1f}", "", "(unattributed)",
+                r, "-", "-", r * sc);
+    }
+
+    row("eval_Pi_C", "PI_C", 2);
+    row("setup + W materialize","PI_SETUP",         4);
+    row("secondary fold",       "PI_SECONDARY",     4);
+    row("IBZ sym ctx",          "PI_SYMCTX",        4);
+    row("KERNEL (G^4W)",        "PI_KERNEL",        4);
+    row("upfold + reduce",      "PI_UPFOLD_REDUCE", 4);
+    row("barrier (skew)",       "PI_BARRIER",       4);
+    {
+      const double r = remainder(t_pi, {"PI_SETUP", "PI_SECONDARY", "PI_SYMCTX",
+                                        "PI_KERNEL", "PI_UPFOLD_REDUCE", "PI_BARRIER"});
+      if (std::abs(r) > 1e-6)
+        app_log(2, "  {:4}{:<26}{:>12.3f}{:>12}{:>8}{:>8.1f}", "", "(unattributed)",
+                r, "-", "-", r * sc);
+    }
+
+    row("cache_w",  "CACHE_W",  2);
+
+    row("build_w0", "BUILD_W0", 2);
+    row("(P,Q) layout",        "W0_LAYOUT",   4);
+    row("Pi_RPA i.nu=0 row",   "W0_PI0_ROW",  4);
+    row("1-freq THC Dyson",    "W0_DYSON",    4);
+    row("q->0 head policy",    "W0_HEAD",     4);
+    row("W0 = Z + dW0",        "W0_ASSEMBLE", 4);
+    row("W0bar = t W0 t^dag",  "W0_FOLD",     4);
+    row("barrier (skew)",      "W0_BARRIER",  4);
+    {
+      const double r = remainder(t_w0, {"W0_LAYOUT", "W0_PI0_ROW", "W0_DYSON", "W0_HEAD",
+                                        "W0_ASSEMBLE", "W0_FOLD", "W0_BARRIER"});
+      if (std::abs(r) > 1e-6)
+        app_log(2, "  {:4}{:<26}{:>12.3f}{:>12}{:>8}{:>8.1f}", "", "(unattributed)",
+                r, "-", "-", r * sc);
+    }
+
+    // Lazy, geometry-fixed, built once: already counted inside whichever entry point
+    // triggered them, so they are listed for visibility and NOT added to TOTAL.
+    if (T("SEC_BASIS") > 0.0 or T("SYM_CTX") > 0.0) {
+      app_log(2, "  {:<28}", "lazy builds (incl. above, not re-added):");
+      row("secondary ISDF basis", "SEC_BASIS", 4);
+      row("IBZ symmetry ctx",     "SYM_CTX",   4);
+    }
+    if (T("SIG_RESP_PIDYN") > 0.0)
+      app_log(2, "  * Pi^{{C,dyn}} @tau=0 runs the FULL dynamic kernel (incl. the aux pole\n"
+                 "    algebra) and keeps only the tau = 0 row -- the eq:pibardynfact item.");
+    app_log(2, "  ----------------------------------------------------------------------\n");
+    app_log_flush();
+  }
+
   void vertex_t::eval_Sigma_C(MBState &mb_state, THC_ERI auto const &thc) {
+    vertex_timer_detail::scoped_timer _tm_total(_Timer, "SIGMA_C");
+    // Stage timers PARTITION SIGMA_C: each stop is immediately followed by the next
+    // start, so the six SIG_* slots sum to SIGMA_C up to the print's rounding. They are
+    // explicit start/stop (not scoped_timer) because the stages are sequential regions of
+    // one flat function body -- brace-scoping them would break the variable lifetimes the
+    // later stages depend on.
+    _Timer.start("SIG_SETUP");
     utils::check(active(), "vertex_t::eval_Sigma_C: called while the vertex is inactive. "
                            "Callers must guard vertex calls with vertex_t::active().");
     // this file only implements the DYNAMIC-rung (Formulation B) kernel; B-S/B-L land at S3+
@@ -1395,6 +1547,8 @@ namespace solvers {
       }
     }
 
+    _Timer.stop("SIG_SETUP");
+    _Timer.start("SIG_W_GATHER");
     // ---- dynamic W(tau): replicate and unfold nt_half storage to the full tau mesh ----
     // dW_qtPQ is dynamic-only (bare Z subtracted, scr_coulomb_t.cpp:217); W is
     // PH-symmetric in tau, W(beta-t) = W(t). IBZ rows under symmetry.
@@ -1439,6 +1593,8 @@ namespace solvers {
       for (long ik = 0; ik < nkpts; ++ik) kmq(iq, ik) = MF->qk_to_k2(iq, ik);
     }
 
+    _Timer.stop("SIG_W_GATHER");
+    _Timer.start("SIG_SECONDARY");
     // ---- Refinement 2: optional secondary-basis substitution --------------------------
     // (notes/refinement2_optionA.md section 4). The SAME kernel runs on the input set
     // (Xb, Zbar = t Z t^dag, Wbar = t dW t^dag, G_CC, window [0, nc)) -- fold-the-core;
@@ -1564,6 +1720,8 @@ namespace solvers {
       }
     }
 
+    _Timer.stop("SIG_SECONDARY");
+    _Timer.start("SIG_SYMCTX");
     // ---- IBZ symmetry context (trivial/null on symmetry-free meshes) ------------------
     // WANNIER (memo section 2.8): thread U through build_sym_ctx so the C-sector
     // rotation is d = U(Sk)^dag D U(k) and sym + Wannier compose. Secondary + Wannier +
@@ -1583,6 +1741,8 @@ namespace solvers {
                             vertex_ibz_detail::g_rotation_check(*symc, G_CC, MF->kp_trev()));
     }
 
+    _Timer.stop("SIG_SYMCTX");
+    _Timer.start("SIG_KERNEL");
     // ---- fused kernel (round-robin over (s,k,qx); result all-reduced inside) ----------
     // Both paths: C-restricted externals; the ONLY difference is the auxiliary input
     // set -- (X_C, W, Z, Np) global vs (Xb, Wbar, Zbar, N_m) secondary.
@@ -1682,6 +1842,8 @@ namespace solvers {
       app_log(2, "  Sigma^C(tau) max|.| = {}\n", max_abs);
     }
 
+    _Timer.stop("SIG_KERNEL");
+    _Timer.start("SIG_RESPONSE");
     // ---- INCREMENT S5: the RESPONSE cut Sigma^{C,r} -----------------------------------
     // Phi-derivability of B-S requires Sigma^{C,x} and Sigma^{C,r} TOGETHER: W0 is an
     // explicit functional of the CURRENT G, so differentiating Phi produces this chain-
@@ -1713,6 +1875,11 @@ namespace solvers {
       // symc MUST be threaded through: on an IBZ mesh the kernel's external q axis is
       // nqpts_ibz while kmq/kpq carry the FULL transfer mesh, and it sources non-IBZ
       // rung transfers through Xhat.
+      // SUB-STAGE (inclusive in SIG_RESPONSE): the pinned INSTANTANEOUS phase. Wdyn is
+      // nullptr, so pi_c_accumulate_w returns after phase 1 and never touches the aux
+      // pole basis. Compare against SIG_RESP_PIDYN below -- the ratio is the cost of the
+      // dynamic phase, i.e. the size of the eq:pibardynfact win.
+      _Timer.start("SIG_RESP_PI0");
       if (sec)
         vertex_pi::pi_c_accumulate_w(*_ft, tools, G_CC, _Xb_skma, W0b_r, nullptr,
                                      kmq, kpq, nda::range(0, nc), Pi_wq,
@@ -1724,6 +1891,7 @@ namespace solvers {
                                      mpi->comm.rank(), mpi->comm.size(),
                                      skip_rung_gamma, nullptr, symc);
       mpi->comm.all_reduce_in_place_n(Pi_wq.data(), Pi_wq.size(), std::plus<>{});
+      _Timer.stop("SIG_RESP_PI0");
 
       // (2) the tau = 0 row (the LEGAL evaluation of (1/beta) sum_nu; sparse nodes are
       //     fitting nodes, not Fourier points)
@@ -1757,6 +1925,10 @@ namespace solvers {
       // an equal-time value. Implementing that factorized primitive is the natural
       // follow-up; correctness is unaffected.
       if (lin) {
+        // SUB-STAGE (inclusive in SIG_RESPONSE): the tau -> i.nu transform of the dynamic
+        // rung. This is a per-q GEMM written as a 5-deep scalar loop with the reduction on
+        // the STRIDED it axis; timed separately so the BLAS rewrite can be verified.
+        _Timer.start("SIG_RESP_WDYNW");
         nda::array<ComplexType, 4> Wdyn_w(nqpts_ibz, tools.nw_b, Naux_pi, Naux_pi);
         Wdyn_w() = ComplexType(0.0);
         for (long iq = 0; iq < nqpts_ibz; ++iq)
@@ -1769,6 +1941,13 @@ namespace solvers {
                                                     : Wt_qtPQ(iq, it, M, N));
                 Wdyn_w(iq, m, M, N) = acc;
               }
+        _Timer.stop("SIG_RESP_WDYNW");
+        // SUB-STAGE (inclusive in SIG_RESPONSE): THE eq:pibardynfact ITEM. This runs the
+        // FULL dynamic-rung Pi^C -- including phase 2's twisted-pair pole algebra over all
+        // nw_b frequencies -- and the very next statement (tau0_of) keeps only the tau = 0
+        // row. Whatever this slot reads is the upper bound on what the factorized
+        // primitive would save, and it is also B-L's ONLY exposure to the aux pole basis.
+        _Timer.start("SIG_RESP_PIDYN");
         nda::array<ComplexType, 4> Pid_wq(tools.nw_b, nqpts_ibz, Naux_pi, Naux_pi);
         Pid_wq() = ComplexType(0.0);
         if (sec)
@@ -1782,6 +1961,7 @@ namespace solvers {
                                        mpi->comm.rank(), mpi->comm.size(),
                                        skip_rung_gamma, nullptr, symc);
         mpi->comm.all_reduce_in_place_n(Pid_wq.data(), Pid_wq.size(), std::plus<>{});
+        _Timer.stop("SIG_RESP_PIDYN");
         nda::array<ComplexType, 3> PiDyn0(nqpts_ibz, Naux_pi, Naux_pi);
         tau0_of(Pid_wq, PiDyn0);
         double xl = 0.0, p0 = 0.0;
@@ -1876,13 +2056,21 @@ namespace solvers {
                   S(it, is, ik, _band_window, _band_window));
       }
     }
+    _Timer.stop("SIG_RESPONSE");
+    // Timed separately: this barrier absorbs the load imbalance of everything above, so
+    // folding it into SIG_RESPONSE would misattribute other ranks' skew to the response
+    // cut. A large SIG_BARRIER is the signal that the (s,k,qx) x qy split is uneven.
+    _Timer.start("SIG_BARRIER");
     mb_state.mpi->comm.barrier();
+    _Timer.stop("SIG_BARRIER");
   }
 
   auto vertex_t::eval_Pi_C(MBState &mb_state, THC_ERI auto const &thc,
                            shape_t<4> pi_pgrid, shape_t<4> pi_bsize, shape_t<4> pi_gshape)
   -> memory::darray_t<memory::array<HOST_MEMORY, ComplexType, 4>, mpi3::communicator>
   {
+    vertex_timer_detail::scoped_timer _tm_total(_Timer, "PI_C");
+    _Timer.start("PI_SETUP");
     decltype(nda::range::all) all;
     utils::check(active(), "vertex_t::eval_Pi_C: called while the vertex is inactive. "
                            "Callers must guard vertex calls with vertex_t::active().");
@@ -2191,6 +2379,8 @@ namespace solvers {
       for (long ik = 0; ik < nkpts; ++ik) kpq(iq, kmq(iq, ik)) = ik;   // inverse: (k-q)+q = k
     }
 
+    _Timer.stop("PI_SETUP");
+    _Timer.start("PI_SECONDARY");
     // ---- Refinement 2: optional secondary-basis substitution --------------------------
     // (notes/refinement2_optionA.md section 4). The SAME kernel runs on the input set
     // (Xb, Zbar = t Z t^dag, Wbar_dyn = t dW t^dag, G_CC, window [0, nc)); the
@@ -2435,6 +2625,8 @@ namespace solvers {
       }
     }
 
+    _Timer.stop("PI_SECONDARY");
+    _Timer.start("PI_SYMCTX");
     // ---- IBZ symmetry context (trivial/null on symmetry-free meshes) ------------------
     // WANNIER (memo section 2.8): thread U so d = U(Sk)^dag D U(k) (sym + Wannier compose).
     vertex_sym::sym_ctx const* symc = nullptr;
@@ -2451,6 +2643,8 @@ namespace solvers {
                             vertex_ibz_detail::g_rotation_check(*symc, G_CC, MF->kp_trev()));
     }
 
+    _Timer.stop("PI_SYMCTX");
+    _Timer.start("PI_KERNEL");
     // ---- kernel: accumulate Pi^C(inu) over this rank's (s,k,qx) tuples ----------------
     // q->0 policy resolved above (skip_rung_gamma / head-augmented inputs). Both paths:
     // C-restricted externals; the ONLY difference is the auxiliary input set --
@@ -2503,6 +2697,8 @@ namespace solvers {
                                    kmq, kpq, nda::range(0, nc), Pi_wqMN,
                                    mpi->comm.rank(), mpi->comm.size(),
                                    skip_rung_gamma, &qx_diag, symc, &phase_diag);
+    _Timer.stop("PI_KERNEL");
+    _Timer.start("PI_UPFOLD_REDUCE");
     // M3 item #8 (notes/vertex_parallelization_M3.md): DO NOT all_reduce the full partial
     // Pi_wqMN. It is a PARTIAL (this rank's round-robin tuple/q_ext contribution); the
     // upfold (t^dag Pibar t) and the tau conversion are LINEAR and commute with the rank
@@ -2691,12 +2887,17 @@ namespace solvers {
                    "vertex_t::eval_Pi_C: Pi^C contains {} NaN/Inf entries -- aborting.", n_bad);
       app_log(2, "  Pi^C(tau) max|.| = {}\n", max_abs);
     }
+    _Timer.stop("PI_UPFOLD_REDUCE");
+    // See SIG_BARRIER: timed apart so cross-rank skew is not charged to the upfold.
+    _Timer.start("PI_BARRIER");
     mpi->comm.barrier();
+    _Timer.stop("PI_BARRIER");
 
     return dPi_C_tqPQ;
   }
 
   void vertex_t::cache_w(MBState &mb_state, THC_ERI auto const &thc) {
+    vertex_timer_detail::scoped_timer _tm_total(_Timer, "CACHE_W");
     decltype(nda::range::all) all;
     utils::check(active() and secondary(),
                  "vertex_t::cache_w: requires an ACTIVE vertex in isdf mode \"secondary\" "
@@ -2980,6 +3181,7 @@ namespace solvers {
   template<typename dArray_t>
   void vertex_t::build_w0(MBState &mb_state, THC_ERI auto const &thc,
                           dArray_t const &dPi_rpa_tqPQ) {
+    vertex_timer_detail::scoped_timer _tm_total(_Timer, "BUILD_W0");
     decltype(nda::range::all) all;
     using Arr3 = nda::array<ComplexType, 3>;
     using Arr4 = nda::array<ComplexType, 4>;
@@ -3015,6 +3217,10 @@ namespace solvers {
                "rung mode = {}.",
             gs[0], nqpts_ibz, Np, rung_str());
 
+    // Stage timers PARTITION BUILD_W0 (see the SIG_* note in eval_Sigma_C). build_w0 came
+    // back as 29 % of all vertex time in the first profile with no internal breakdown, so
+    // these six exist to find out where that goes before anything here is touched.
+    _Timer.start("W0_LAYOUT");
     // ---- (P,Q)-block layout: q unsplit, (P,Q) over ALL ranks (thc.dZ({1,nP,nQ}) ------
     // layout; the one fold_Z_distributed and the slate 2D ops both accept, and the one
     // the plan's section 3 mandates for a 320 GB-class nq*Np^2 object).
@@ -3022,10 +3228,38 @@ namespace solvers {
     std::array<long, 3> w0_pgrid = {1, 1, 1};
     w0_pgrid[1] = utils::find_proc_grid_min_diff(np_ranks, Np, Np);
     w0_pgrid[2] = np_ranks / w0_pgrid[1];
-    const std::array<long, 3> w0_bsize = {1, 1, 1};
+    // BLOCK SIZE: mirror scr_coulomb_t::W_omega_proc_grid (scr_coulomb_t.h:148-149) -- a
+    // SQUARE block of min(1024, Np/nP, Np/nQ) on the (P,Q) axes.
+    //
+    // This was {1, 1, 1}, i.e. 1x1 SLATE tiles. slate_ops::multiply / ::inverse below then
+    // paid per-tile overhead Np^2 times (16384 tiles at Np = 128) to perform an O(Np^3)
+    // ~2 MFlop solve. MEASURED before the fix: W0_DYSON = 80.126 s of build_w0's 80.129 s
+    // (99.2 %), which was ~29 % of ALL vertex time -- for eight 128x128 solves. The
+    // reference path (scr_coulomb_t::dyson_W_in_place, which this code deliberately
+    // mirrors) never had this because W_omega_proc_grid sizes its blocks properly.
+    //
+    // max(1, ...) guards Np < grid (tiny/toy meshes), where Np/grid truncates to 0 and a
+    // zero block size is invalid.
+    std::array<long, 3> w0_bsize = {1, 1, 1};
+    w0_bsize[1] = std::min({static_cast<long>(1024),
+                            std::max(1l, Np / w0_pgrid[1]),
+                            std::max(1l, Np / w0_pgrid[2])});
+    w0_bsize[2] = w0_bsize[1];
+    // VERIFIED BIT-IDENTICAL (2026-07-29, serialized runs): plain scGW, B-S and B-L all
+    // reproduce their pre-change gold digit-for-digit (B-L shift 1.134e-03, B-S 1.153e-03),
+    // and the W0 self-slice gate agrees to rel 2.7e-16 (tol 1e-11). Same algebra, different
+    // SLATE tiling.
+    //   ⚠ An intermediate measurement suggested this line shifted B-L by +8.5 %. That was
+    // an ARTIFACT of two test runs executing CONCURRENTLY in build/tests/bin and clobbering
+    // each other's shared HDF5 checkpoints (coqui_vertex_static_gold.mbpt.h5). Retracted.
+    // When timing or A/B-ing these tests, RUN THEM STRICTLY SERIALLY -- they share fixed
+    // checkpoint filenames in the working directory and give plausible-but-wrong physics
+    // when overlapped.
     const std::array<long, 4> f0_pgrid = {1, 1, w0_pgrid[1], w0_pgrid[2]};
     const std::array<long, 4> f0_bsize = {1, 1, w0_bsize[1], w0_bsize[2]};
 
+    _Timer.stop("W0_LAYOUT");
+    _Timer.start("W0_PI0_ROW");
     // ---- step 1: the i.nu = 0 row of Pi_RPA on that layout ---------------------------
     auto dW0_1qPQ = make_distributed_array<Arr4>(
         mpi->comm, f0_pgrid, {1, nqpts_ibz, Np, Np}, f0_bsize);
@@ -3034,6 +3268,8 @@ namespace solvers {
       vertex_w0_detail::extract_nu0_row(dPi_rpa_tqPQ, R_t, dW0_1qPQ);
     }
 
+    _Timer.stop("W0_PI0_ROW");
+    _Timer.start("W0_DYSON");
     // ---- step 2: the SINGLE-FREQUENCY THC Dyson, per q ------------------------------
     // dW0(q) = ([I - Z(q).Pi0(q)]^{-1} - I) Z(q): the scr_coulomb_t::dyson_W_in_place
     // algebra (scr_coulomb_t.cpp:310-338) with the frequency loop removed. Same slate
@@ -3087,6 +3323,8 @@ namespace solvers {
       }
     }
 
+    _Timer.stop("W0_DYSON");
+    _Timer.start("W0_HEAD");
     // ---- step 3: the q->0 head policy AT i.nu = 0 (q0_head_treatment.md section 3) ---
     // ONE policy, ONE W0, so every later appearance of the rung carries the same head
     // (plan section 2.2). "v1_skip"/"ignore_g0" store the regularized body only; the
@@ -3153,6 +3391,8 @@ namespace solvers {
                                 "DROPPED by the S3+ kernels (v1_skip fallback)"
                               : " (GW ignore_g0 analogue)");
 
+    _Timer.stop("W0_HEAD");
+    _Timer.start("W0_ASSEMBLE");
     // ---- W0 = Z + dW0 (+ head at Gamma), (P,Q)-block-distributed ---------------------
     _W0_qPQ.emplace(make_distributed_array<Arr3>(
         mpi->comm, w0_pgrid, {nqpts_ibz, Np, Np}, w0_bsize));
@@ -3177,6 +3417,8 @@ namespace solvers {
     }
     dW0_1qPQ.reset();
 
+    _Timer.stop("W0_ASSEMBLE");
+    _Timer.start("W0_FOLD");
     // ---- W0bar = t W0 t^dag: the DISTRIBUTED one-row fold ---------------------------
     // fold_Z_distributed IS the one-row variant of fold_dW_distributed (Z has no tau
     // axis => no t-pool, no tau->nu, no PH-unfold), and W0 has exactly Z's shape and
@@ -3221,7 +3463,11 @@ namespace solvers {
       utils::check(std::isfinite(w0_max) and std::isfinite(wb_max),
                    "vertex_t::build_w0: the static rung contains NaN/Inf -- aborting.");
     }
+    _Timer.stop("W0_FOLD");
+    // See SIG_BARRIER: skew charged to its own slot, not to the fold.
+    _Timer.start("W0_BARRIER");
     mpi->comm.barrier();
+    _Timer.stop("W0_BARRIER");
   }
 
   // template instantiations

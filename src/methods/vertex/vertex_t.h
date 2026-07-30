@@ -37,6 +37,7 @@
 #include "numerics/shared_array/nda.hpp"
 
 #include "utilities/mpi_context.h"
+#include "utilities/Timer.hpp"
 #include "IO/app_loggers.h"
 
 #include "numerics/imag_axes_ft/IAFT.hpp"
@@ -715,6 +716,21 @@ namespace solvers {
     // the self-consistent G_CC itself stays symmetry-consistent across iterations.
     double _g_rot_max = 0.0;
 
+    // ---- PERFORMANCE INSTRUMENTATION -------------------------------------------------
+    // Flat timer over the vertex's high-level operations. Names are grouped by entry
+    // point so print_vertex_timers() can show a partition:
+    //   top level (disjoint, called from the scf loop): SIGMA_C, PI_C, CACHE_W, BUILD_W0
+    //   sub-stages: SIG_*, PI_* -- these PARTITION their parent, and the printer reports
+    //               the unattributed remainder explicitly so the breakdown is honest.
+    //   lazy sub-builds: SEC_BASIS, SYM_CTX -- INCLUSIVE in whichever parent first
+    //               triggered them (they are built once per geometry, not per iteration),
+    //               so they are reported separately and NOT added into the total.
+    // Timings are rank-local wall time; the printer runs on the root logger only. Vertex
+    // work is round-robin over tuples, so rank 0 is representative only to the extent the
+    // tuple split is balanced -- load imbalance shows up as a large SIG_KERNEL spread,
+    // which is why the reduce/all_reduce stages are timed separately (they absorb skew).
+    mutable utils::TimerManager _Timer;
+
     /**
      * Build (lazily) the symmetry context for the given window collocation
      * X_w (ns, nk_full, naux, nc): q'-access tables, krot = ks_to_k, effective
@@ -802,6 +818,28 @@ namespace solvers {
     void check_iaft_backend(std::string_view where) const;
 
   public:
+    /**
+     * Print the vertex performance breakdown (utilities/Timer.hpp, the hf_t idiom).
+     *
+     * Layout: the four TOP-LEVEL entry points the scf loop calls (eval_Sigma_C, eval_Pi_C,
+     * cache_w, build_w0) are DISJOINT, so their sum is the total time this rank spent
+     * inside vertex routines. Each is then broken into its high-level stages, and the
+     * printer reports the UNATTRIBUTED remainder per entry point rather than silently
+     * letting the parts fail to add up -- an unattributed row that is large means a stage
+     * boundary is missing, which is exactly what we want to see.
+     *
+     * The two lazy geometry-fixed builds (secondary ISDF basis, IBZ symmetry context) are
+     * INCLUSIVE in whichever entry point first triggered them, so they are printed in a
+     * separate block and NOT re-added to the total.
+     *
+     * Wall time is rank-local. Call collectively if you want it on every rank; the
+     * app_log filter means only the root actually emits.
+     */
+    void print_vertex_timers() const;
+
+    /** Reset every vertex timer (e.g. to profile a single scf iteration in isolation). */
+    void reset_vertex_timers() { _Timer.reset_all(); }
+
     std::string vertex_type() const { return _vertex_type; }
     // rung mode of the active theory (section 2.1 of the static-vertex plan)
     vertex_rung_e rung() const { return _rung; }

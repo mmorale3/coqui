@@ -733,44 +733,63 @@ namespace vertex_pi {
       detail::build_pair_component(kap1, cAp, cBp, Mt1);
     };
 
-    for (long m = 0; m < nw_b; ++m) {
-      tools.build_kappa(m, kap0, kap1);   // (nw_b builds total -- unchanged from OLD)
+    // ---- LOOP ORDER: tiles OUTER, m INNER (was m outer) -------------------------------
+    // The chain build_U -> wbarD -> wq_flat -> wt_flat depends ONLY on the tile
+    // (is,ik,ikmqx,ikpq,ikxq,jsx,iq) and on l -- never on m. With m outer it was rebuilt
+    // nw_b times per tile with identical results, and it is the DOMINANT block: nw_b gemms
+    // of Np x Np x Nb2 (~nw_b*Np^2*Nb2 flops, 5.7e9 at Np=1063/Nb2=64/nw_b=79) against
+    // build_kappa's ~np^2*nt_f (~1e6 at np=79) -- a factor ~570 apart. Interchanging trades
+    // build_kappa from nw_b total to nw_b*ntiles (cheap) for hoisting the W-fold from
+    // nw_b*ntiles to ntiles (expensive) => ~nw_b-fold saving on phase 2 overall.
+    // (Precomputing all nw_b kappas instead is NOT viable: 2*np^2*nt_f complex each is
+    //  ~15.6 MB, x nw_b ~ 1.2 GB at the production point.)
+    //
+    // BIT-IDENTICAL, not merely within tolerance. The only accumulator is
+    // `Pi_MN += Ctmp` on Pi_wqMN(m, iq, .., ..) via track_add, and for each FIXED (m, iq)
+    // cell the interchange leaves the tup sequence (ascending, stride tup_size) and the
+    // add_combo call order untouched -- so every cell receives the same additions in the
+    // same order. The other tracked quantity, qx_diag, is a max() reduction and is
+    // order-free. fit_err_max / res_ratio_max are finalized before this loop.
+    // The per-tile pole algebra (build_kappa / build_pair_component / add_combo) is itself
+    // unchanged, so twisted-pair exactness is preserved per tile.
+    for (long tup = tup_rank; tup < ntuples; tup += tup_size) {
+      long is = tup / (nk * nq);
+      long ik = (tup / nq) % nk;
+      long iqx = tup % nq;
+      if (skip_rung_gamma and iqx == iq_gamma) continue;
+      long ikmqx = kmq(iqx, ik);
+      auto [qsx, trx, jsx] = q_access(iqx);
+      for (long iq = qext_rank; iq < nq_ext; iq += qext_size) {
+        long ikpq = kpq(iq, ik);
+        long ikxq = kmq(iqx, ikpq);
+        build_U(is, ik, ikmqx, ikpq, ikxq, jsx);          // m-invariant: ONCE per tile
 
-      long mbar = tools.w_mirror_b(m);
-      bool is_m0 = (tools.wn_b(m) == 0);
+        // wbar_dyn(l) -> wmat layout -> tau form wt(s)[(p1'p3),(p1p3')]
+        // (trev-mapped transfer: PQ-transposed read of the IBZ-stored core, (P2))
+        // m-invariant: HOISTED out of the m loop (was recomputed nw_b times).
+        for (long l = 0; l < nw_b; ++l) {
+          if (trx)
+            nda::blas::gemm(nda::transpose((*Wdyn_qwPQ)(qsx, l, all, all)), U2, ZU2);
+          else
+            nda::blas::gemm((*Wdyn_qwPQ)(qsx, l, all, all), U2, ZU2);
+          auto wb = wbarD(l, all, all);
+          nda::blas::gemm(nda::transpose(U1), ZU2, wb);
+        }
+        for (long l = 0; l < nw_b; ++l) {
+          auto wm = nda::reshape(wq_flat(l, all), shape_t<2>{Nb2, Nb2});
+          to_wmat(wbarD(l, all, all), wm);
+        }
+        nda::blas::gemm(tools.Ttw_bb, wq_flat, wt_flat);
 
-      // ---- contract over this rank's (tuple, q_ext) tiles -----------------------------
-      for (long tup = tup_rank; tup < ntuples; tup += tup_size) {
-        long is = tup / (nk * nq);
-        long ik = (tup / nq) % nk;
-        long iqx = tup % nq;
-        if (skip_rung_gamma and iqx == iq_gamma) continue;
-        long ikmqx = kmq(iqx, ik);
-        auto [qsx, trx, jsx] = q_access(iqx);
-        for (long iq = qext_rank; iq < nq_ext; iq += qext_size) {
-          long ikpq = kpq(iq, ik);
-          long ikxq = kmq(iqx, ikpq);
-          build_U(is, ik, ikmqx, ikpq, ikxq, jsx);
+        for (long m = 0; m < nw_b; ++m) {
+          tools.build_kappa(m, kap0, kap1);   // now nw_b * ntiles builds (see above)
+
+          long mbar = tools.w_mirror_b(m);
+          bool is_m0 = (tools.wn_b(m) == 0);
 
           // recompute the four pair components THIS tile needs for THIS m (one tile live)
           build_T_tile(is, ik, iq);       // T pair at (is, ik,    iq)
           build_M_tile(is, ikmqx, iq);    // M pair at (is, ikmqx, iq)
-
-          // wbar_dyn(l) -> wmat layout -> tau form wt(s)[(p1'p3),(p1p3')]
-          // (trev-mapped transfer: PQ-transposed read of the IBZ-stored core, (P2))
-          for (long l = 0; l < nw_b; ++l) {
-            if (trx)
-              nda::blas::gemm(nda::transpose((*Wdyn_qwPQ)(qsx, l, all, all)), U2, ZU2);
-            else
-              nda::blas::gemm((*Wdyn_qwPQ)(qsx, l, all, all), U2, ZU2);
-            auto wb = wbarD(l, all, all);
-            nda::blas::gemm(nda::transpose(U1), ZU2, wb);
-          }
-          for (long l = 0; l < nw_b; ++l) {
-            auto wm = nda::reshape(wq_flat(l, all), shape_t<2>{Nb2, Nb2});
-            to_wmat(wbarD(l, all, all), wm);
-          }
-          nda::blas::gemm(tools.Ttw_bb, wq_flat, wt_flat);
 
           auto Pi_MN = Pi_wqMN(m, iq, all, all);
 
@@ -801,9 +820,9 @@ namespace vertex_pi {
             add_combo(Tt1, Mt0, m);
             add_combo(Tt0, Mt1, mbar);
           }
-        } // iq
-      } // tuples
-    } // m
+        } // m
+      } // iq
+    } // tuples
   }
 
   /**
