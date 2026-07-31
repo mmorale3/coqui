@@ -62,7 +62,10 @@ def dataset_ecut(pspdir, species):
 
 def common(mat, m, ecut, pawecutdg, ngkpt, pspdir):
     znucl = " ".join("%d" % Z[s] for s in m["species"])
-    pseudos = ", ".join('"%s.GGA_PBE-JTH.xml"' % s for s in m["species"])
+    # ABINIT wants ONE quoted string with comma-separated names, not a list of
+    # quoted strings -- with the latter it reads only the first and aborts with
+    # "Not enough pseudopotentials in input `pseudos` string".
+    pseudos = '"%s"' % ", ".join("%s.GGA_PBE-JTH.xml" % s for s in m["species"])
     return f"""# {mat}: {m['gap']}, a = {m['a']} Ang = {m['a'] * ANG:.5f} Bohr
 acell 3*{m['a'] * ANG:.6f}
 rprim  {FCC}
