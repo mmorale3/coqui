@@ -785,18 +785,22 @@ with a small and systematically convergent augmentation overhead.
 % 2026-07-29 (commit 86ace47), which sat in the augmentation path and so could
 % only move the ultrasoft and PAW curves. Rerun on the fixed binary at kp6:
 %
-%   oncv (NC control)  -0.4507567150 -> -0.4507569284   -0.0002 mHa
-%   paw  n=500         -0.4390938337 -> -0.4389662702   +0.1276 mHa
-%   uspp n=500         -0.4366091547 -> -0.4364093172   +0.1998 mHa
-%   paw  n=100         -0.4109115548 -> -0.4108076203   +0.1039 mHa
+%   oncv (NC control) n=500  -0.4507567150 -> -0.4507569284   -0.0002 mHa
+%   paw               n=100  -0.4109115548 -> -0.4108076203   +0.1039 mHa
+%   paw               n=250  -0.4326310780 -> -0.4325082722   +0.1228 mHa
+%   paw               n=500  -0.4390938337 -> -0.4389662702   +0.1276 mHa
+%   uspp              n=250  -0.4299505395 -> -0.4297588419   +0.1917 mHa
+%   uspp              n=500  -0.4366091547 -> -0.4364093172   +0.1998 mHa
 %
 % The norm-conserving control reproducing to 2e-7 Ha is what licenses the
 % comparison -- it rules out drift from the 60 intervening commits and the
 % rebuilt toolchain, leaving the shifts attributable to the fix alone. They are
 % 0.03-0.05% of E_c, two orders of magnitude below the 1-3% pseudopotential
-% spread this subsection argues from, and nearly uniform in band count (0.024
-% mHa variation over a 5x range in N_b), so the 1/N_b extrapolated limits move
-% by <0.03 mHa. The quoted -0.448 and -0.446 are unchanged at their precision.
+% spread this subsection argues from. The shift also SATURATES with band count
+% (paw 0.104/0.123/0.128 mHa at n=100/250/500, uspp 0.192/0.200 at n=250/500;
+% spreads of 0.024 and 0.008 mHa), and a shift constant in N_b cannot move a
+% 1/N_b extrapolated limit -- those move by <0.03 mHa. The quoted -0.448 and
+% -0.446 are unchanged at their precision.
 %
 % This is consistent with, not contrary to, the large EOS effect of the same
 % bug: it shifts E_c at a FIXED geometry by ~0.2 mHa, while its VOLUME
