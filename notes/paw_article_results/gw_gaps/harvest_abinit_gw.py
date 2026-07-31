@@ -44,7 +44,13 @@ def parse_abo(path, nocc):
         for line in m.group("tab").strip().split("\n"):
             f = line.split()
             if len(f) >= 10 and f[0].isdigit():
-                rows[int(f[0])] = (float(f[1]), float(f[9]))   # E0(KS), E(QP)
+                b = int(f[0])
+                # gwcalctyp 1/2 print TWO rows per band: the real part, then the
+                # imaginary part (which starts E0 = 0.000). Keep the first only
+                # -- letting the second overwrite it yields KS gaps of exactly
+                # 0.000 and negative QP gaps.
+                if b not in rows:
+                    rows[b] = (float(f[1]), float(f[9]))       # E0(KS), E(QP)
         if nocc not in rows or nocc + 1 not in rows:
             continue
         nk += 1
