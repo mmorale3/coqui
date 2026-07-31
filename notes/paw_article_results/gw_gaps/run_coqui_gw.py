@@ -63,7 +63,11 @@ Nfit          = 26
 """
 
 SBATCH = """#!/bin/bash
-#SBATCH -J {job} -p ccq -N {nodes} -n {ranks} -c 1 --mem=0 -t {walltime}
+# -C icelake|genoa: both CoQui and ABINIT are built -march=native on an
+# AVX-512 node. The rome (Zen 2) partition has no AVX-512 and kills the binary
+# with SIGILL at startup, which surfaces as a 3-second job failure on a random
+# subset of runs.
+#SBATCH -J {job} -C icelake|genoa -p ccq -N {nodes} -n {ranks} -c 1 --mem=0 -t {walltime}
 #SBATCH -o coqui.%j.out -e coqui.%j.err
 set -e
 cd $SLURM_SUBMIT_DIR
