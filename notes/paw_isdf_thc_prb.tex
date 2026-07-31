@@ -779,6 +779,13 @@ with a small and systematically convergent augmentation overhead.
   \label{fig:convergence}
 \end{figure*}
 
+% DATA PROVENANCE -- DO NOT SUBMIT AS IS.
+% The numbers and figure in this subsection (si_rpa_paper.pdf, si_rpa_vs_k.pdf,
+% si_rpa_proj.csv) were generated 2026-06-12, before the V_LL transpose fix of
+% 2026-07-29 (commit 86ace47). That defect was in the augmentation path, so the
+% ultrasoft and PAW values quoted below (-0.446 and -0.448 Ha) are affected,
+% while the two norm-conserving ones are not -- i.e. exactly the comparison this
+% subsection rests on. Regenerate on the fixed code before submission.
 \subsection{RPA correlation energy of silicon}
 \label{sec:numerics-rpa}
 
@@ -874,7 +881,7 @@ The central numerical question is the choice of local rank.  A minimal implement
 
 The compensation-charge construction must be consistent with the PAW data set.  If \(\widehat Q_{a,\alpha\beta}\) does not reproduce the multipoles of \(\Delta Q_{a,\alpha\beta}\), Eq.~\eqref{eq:paw-coulomb-partition} is not a clean separation into smooth and one-center terms.  In that case, spurious inter-sphere terms would be folded into the global ISDF error and convergence with respect to \(N_\mu\) could become poor.  Therefore the PAW compensation multipole order should be converged before the ISDF rank is tuned.
 
-A closely related prerequisite is the completeness of the PAW partial-wave and projector set.  It is well established that PAW data sets constructed for ground-state density-functional theory---where the partial waves need only reproduce all-electron scattering near the occupied levels---are frequently inadequate for \(GW\) and RPA, which sample the unoccupied manifold to much higher energies; accurate excited-state calculations therefore require additional projectors at higher reference energies and, where necessary, higher angular momenta.  This is precisely the rationale for the dedicated ``\(GW\)'' PAW data sets introduced by the VASP group~\cite{ShishkinKresseGW,KlimesKaltakKresse}.  Our factorization inherits this requirement directly: because the one-center correction in Eq.~\eqref{eq:paw-local-correction} is quartic in the projector overlaps \(P_{i,a\alpha}\), an incomplete projector set is strongly amplified.  Appendix~\ref{app:jthfail} illustrates the known effect for silicon---a widely used PAW set carrying only \(s\) and \(p\) projectors (\(l_{\max}=1\)) drives the RPA correlation energy to unphysical over-binding, cured by adding an \(l=2\) projector---using the same all-electron logarithmic-derivative diagnostic employed to construct excited-state PAW potentials~\cite{KlimesKaltakKresse}.  In production one should therefore use excited-state-quality (``\(GW\)'') PAW data, or otherwise verify partial-wave completeness over the sampled energy window.
+A closely related prerequisite is the completeness of the PAW partial-wave and projector set.  It is well established that PAW data sets constructed for ground-state density-functional theory---where the partial waves need only reproduce all-electron scattering near the occupied levels---are frequently inadequate for \(GW\) and RPA, which sample the unoccupied manifold to much higher energies; accurate excited-state calculations therefore require additional projectors at higher reference energies and, where necessary, higher angular momenta.  This is precisely the rationale for the dedicated ``\(GW\)'' PAW data sets introduced by the VASP group~\cite{ShishkinKresseGW,KlimesKaltakKresse}.  Our factorization inherits this requirement directly: the construction reproduces the all-electron integrals of whatever data set it is given, so any partial-wave incompleteness of that data set propagates into the integrals, and the one-center correction in Eq.~\eqref{eq:paw-local-correction} is quartic in the projector overlaps \(P_{i,a\alpha}\).  In production one should therefore use excited-state-quality (``\(GW\)'') PAW data, or otherwise verify partial-wave completeness over the energy window sampled by the method.
 
 The Coulomb singularity requires the same care as in ordinary periodic ERIs.  For \(\bq\ne 0\), Eq.~\eqref{eq:v-reciprocal} is well-defined.  For \(\bq=0\), the \(\bG=0\) term is treated by charge neutrality, by a neutralizing background, by Ewald correction, or by the convention used by the target many-body method.  The PAW compensation charges should be included in the neutralized pair density before this step.
 
@@ -967,95 +974,30 @@ K_a=
 \end{equation}
 with \(+\) denoting the Moore-Penrose pseudoinverse, optionally evaluated in a metric-weighted inner product.
 
-\section{Failure of an incomplete PAW data set}
-\label{app:jthfail}
-
-The inadequacy of ground-state PAW data sets for \(GW\) and RPA is a well-known
-and documented issue: because such data sets are tuned to reproduce all-electron
-scattering only near the occupied levels, they misrepresent the high-energy
-unoccupied states that enter excited-state methods, which is why the VASP group
-provides dedicated ``\(GW\)'' PAW potentials carrying additional high-energy and
-higher-\(l\) projectors~\cite{ShishkinKresseGW,KlimesKaltakKresse}.  The error
-analysis of Sec.~\ref{sec:error} shows that the PAW-ISDF-THC factorization is
-exact only in the complete-partial-wave limit, so it inherits exactly this
-requirement.  Here we simply illustrate the known effect for bulk silicon, using
-a widely used PAW data set (the JTH-PBE Si set~\cite{JolletTorrentHolzwarth})
-constructed with \(s\) and \(p\) projectors only (\(l_{\max}=1\)).  This set is
-accurate for ground-state properties---the occupied Si valence is \(s,p\)-like
-and its PBE equation of state matches all-electron references---yet it fails
-badly for the all-electron correlation energy.
-
-\paragraph{Symptom.}  Figure~\ref{fig:jth-symptom} shows the Si RPA correlation
-energy obtained with this data set versus the number of bands.  On a
-\(3\times3\times3\) mesh it does not converge but runs away monotonically (to
-\(-0.61\,\)Ha at \(N_b=250\), versus \(\approx-0.43\,\)Ha for the
-norm-conserving references), and on a \(4\times4\times4\) mesh it becomes
-catastrophic and erratic, reaching \(-2.3\,\)Ha---several times the physical
-value.  The over-binding grows with both band count and \(\bk\)-point density,
-i.e.\ with the number and resolution of the high-energy virtual states sampled.
-Every \(d\)-complete data set (the norm-conserving, ultrasoft, and
-\texttt{kjpaw} PAW sets of Sec.~\ref{sec:numerics-rpa}) converges smoothly under
-identical conditions.
-
-\paragraph{Cause.}  Figure~\ref{fig:jth-cause} traces the failure to projector
-incompleteness.  Panel~(a) plots the maximum PAW projector overlap
-\(\max_{a\alpha}|P_{i,a\alpha}|\) of each band against its energy, extracted
-directly from the stored orbitals and projectors.  In the shared \(s,p\)
-channels the no-\(d\) set's overlaps of high-energy virtuals blow up by more than
-an order of magnitude (to \(\sim\!40\)), whereas those of the \(d\)-complete
-\texttt{kjpaw} set remain of order unity; the latter instead routes that content
-into its \(d\)-projectors (grey), which is the correct augmentation.  The \(d\)
-character of the high virtuals---properly absorbed by a \(d\)-projector when one
-exists---floods the \(s,p\) projectors when it does not.  Through the quartic
-dependence of \(\Delta V^a\) on the projector overlaps
-[Eq.~\eqref{eq:paw-local-correction}], an order-of-magnitude inflation of
-\(|P|\) corresponds to a \(10^{4}\)--\(10^{6}\) amplification of the spurious
-one-center contribution, which is the origin of the over-binding.
-Panel~(b) confirms this from atomic scattering properties: comparing the
-all-electron and PAW logarithmic derivatives of the no-\(d\) set, the \(s\) and
-\(p\) channels (projectors present) reproduce the all-electron scattering, while
-the \(d\) channel (no projector) departs from it across the entire energy window
-spanned by the RPA virtual states, with a misplaced \(d\) resonance.  A data set
-that cannot reproduce all-electron \(d\) scattering at these energies cannot
-yield accurate all-electron integrals for the states that dominate the
-correlation energy.
-
-\paragraph{Cure and interpretation.}  Adding a single \(l=2\) projector restores
-agreement: the \(d\)-completed construction reproduces the all-electron \(d\)
-scattering, the projector overlaps return to order unity, and the RPA
-correlation energy converges smoothly in line with the other pseudizations
-(Sec.~\ref{sec:numerics-rpa}).  This behavior is not a defect of the
-factorization, which reproduces the all-electron integrals of whatever data set
-it is given; it is a faithful---and diagnostically useful---exposure of
-partial-wave incompleteness.  It is the same projector-completeness requirement
-that motivates the excited-state (``\(GW\)'') PAW potentials of the VASP
-group~\cite{ShishkinKresseGW,KlimesKaltakKresse}; our diagnostics simply confirm
-that it propagates, as expected, into the all-electron integrals produced by the
-factorization.
-
-\begin{figure}[t]
-  \includegraphics[width=\columnwidth]{paw_article_results/jth_failure.pdf}
-  \caption{Symptom of an incomplete (\(l_{\max}=1\), no \(d\)) PAW data set: the
-  Si RPA correlation energy versus number of bands on (a)~a \(3\times3\times3\)
-  and (b)~a \(4\times4\times4\) mesh.  The no-\(d\) set (red) runs away and
-  becomes catastrophic, while the \(d\)-complete pseudizations (grey band)
-  converge.}
-  \label{fig:jth-symptom}
-\end{figure}
-
-\begin{figure}[t]
-  \includegraphics[width=\columnwidth]{paw_article_results/jth_causes.pdf}
-  \caption{Cause of the failure in Fig.~\ref{fig:jth-symptom}.
-  (a)~Maximum PAW projector overlap per band versus band energy (Si
-  \(4\times4\times4\), \(N_b=100\)): the no-\(d\) set's \(s,p\) overlaps of high
-  virtuals diverge (\(\sim\!40\)), whereas the \(d\)-complete \texttt{kjpaw} set
-  keeps \(s,p\) bounded (\(\sim\!1\)) and absorbs the content into its
-  \(d\)-projector (grey).  (b)~All-electron (lines) versus PAW (markers/dashed)
-  logarithmic derivatives of the no-\(d\) set: the \(p\) channel (projector
-  present) reproduces the all-electron scattering, while the \(d\) channel (no
-  projector) departs from it across the RPA virtual window.}
-  \label{fig:jth-cause}
-\end{figure}
+% ---------------------------------------------------------------------------
+% REMOVED 2026-07-31: appendix "Failure of an incomplete PAW data set"
+% (\label{app:jthfail}) together with figures jth_failure.pdf (fig:jth-symptom)
+% and jth_causes.pdf (fig:jth-cause).
+%
+% Its "symptom" -- the Si RPA correlation energy running away with band count
+% and k-density for the l_max=1 JTH set -- was NOT partial-wave incompleteness.
+% It was a CoQui defect: V_LL conjugated the first index of Z and therefore
+% stored its transpose (fixed 2026-07-29, commit 86ace47). That defect sits in
+% the augmentation path, so its magnitude tracks the number of augmentation
+% channels and grows with nbnd and k-point density -- precisely the pattern the
+% appendix read as projector failure, and the reason data sets with different
+% augmentation content appeared to behave differently.
+%
+% The two "cause" diagnostics are computed without the ERI path (projector
+% amplitudes from stored orbitals/projectors; atompaw logarithmic derivatives)
+% and are individually still correct, but they were evidence for a mechanism
+% whose symptom no longer exists, so they are not reinstated on their own.
+%
+% Missing d / high-energy projectors do remain a real effect -- they BIAS
+% excited-state results such as quasiparticle gaps rather than destabilizing
+% them. Quantifying that bias on the fixed code is the correct replacement, and
+% is being measured in the G0W0 band-gap campaign via a d-complete Si control.
+% ---------------------------------------------------------------------------
 
 \begin{acknowledgments}
 Numerical validation against direct PAW Coulomb matrix elements
@@ -1078,6 +1020,8 @@ D. Vanderbilt, Soft self-consistent pseudopotentials in a generalized eigenvalue
 \bibitem{RostgaardPAW}
 C. Rostgaard, The Projector Augmented-wave Method, arXiv:0910.1921 (2009).
 
+% Currently uncited: its only \cite was in the removed appendix. Keep -- the
+% G0W0 band-gap results use the JTH v2.0 table and will cite it again.
 \bibitem{JolletTorrentHolzwarth}
 F. Jollet, M. Torrent, and N. Holzwarth, Generation of projector augmented-wave atomic data: A 71 element validated table in the XML format, Comput. Phys. Commun. \textbf{185}, 1246 (2014).
 
