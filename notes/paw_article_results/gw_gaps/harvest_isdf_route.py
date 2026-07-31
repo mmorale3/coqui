@@ -38,8 +38,14 @@ import h5py
 import numpy as np
 
 HA = 27.211386245988
-# <route>_<thresh>, with an optional leading tag (e.g. "pilot_")
-TAG = re.compile(r"^(?:[A-Za-z0-9]+_)?(?P<route>isdf|direct)_(?P<thresh>[0-9.eE+-]+)$")
+# Strictly <route>_<thresh>. Deliberately NOT tolerant of a leading tag: an
+# earlier version accepted one so that differently-sized pilot runs could sit in
+# the same tree, and "pilot_isdf_1e-4" then collided with "isdf_1e-4" on the
+# (route, thresh) key. The dict silently kept whichever was read last, mixing a
+# kp3/n250 run into a kp2/n100 table -- visible only because its N_mu and gap
+# were wildly out of line with their neighbours. Keep runs of different size in
+# separate roots.
+TAG = re.compile(r"^(?P<route>isdf|direct)_(?P<thresh>[0-9.eE+-]+)$")
 
 
 def _decomplex(a):
