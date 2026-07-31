@@ -118,8 +118,18 @@ prtpot2  1
 """
 
 
-def gw_input(mat, m, ecut, pawecutdg, ngkpt, nband, ecuteps, pspdir):
+def gw_input(mat, m, ecut, pawecutdg, ngkpt, nband, ecuteps, pspdir,
+             gwcalctyp=1, nfreqim=16):
     nocc = m["nelec"] // 2
+    # gwcalctyp selects how Sigma_c is evaluated in frequency, and it has to
+    # match what CoQui does or the comparison is meaningless:
+    #   0 = plasmon-pole (ABINIT default) -- a DIFFERENT approximation from
+    #       CoQui's, and worth 0.3-0.5 eV on these materials.
+    #   1 = analytic continuation from imaginary frequencies (Pade), which is
+    #       what CoQui's evgw0 does. This is the apples-to-apples setting.
+    #   2 = contour deformation, the numerically exact reference both should
+    #       converge to.
+    ppm = "" if gwcalctyp == 0 else "\nnfreqim%d   %d" % (3, nfreqim)
     return common(mat, m, ecut, pawecutdg, ngkpt, pspdir) + f"""
 # ABINIT's own PAW G0W0 -- the head-to-head reference.
 # Symmetry is left at ABINIT's default here: this run never goes through
@@ -130,6 +140,7 @@ occopt 1
 nstep 100
 iomode 3
 inclvkb 0              # forced for PAW
+gwcalctyp {gwcalctyp}{ppm}
 
 ndtset 4
 
@@ -170,8 +181,13 @@ def main():
     ap.add_argument("--ecut-scale", type=float, nargs="+", default=[1.0])
     ap.add_argument("--dg-factor", type=float, default=2.0,
                     help="pawecutdg = dg_factor * ecut")
-    ap.add_argument("--ecuteps-frac", type=float, default=0.4,
+    ap.add_argument("--ecuteps-frac", type=float, default=0.75,
                     help="ABINIT ecuteps as a fraction of ecut")
+    ap.add_argument("--gwcalctyp", type=int, default=1,
+                    help="0=plasmon-pole, 1=analytic continuation (matches "
+                         "CoQui), 2=contour deformation")
+    ap.add_argument("--nfreqim", type=int, default=16,
+                    help="imaginary frequencies for gwcalctyp 1/2")
     args = ap.parse_args()
 
     made = 0
@@ -191,7 +207,9 @@ def main():
                         f.write(mf_input(mat, m, ecut, dg, nk, nb, args.pspdir))
                     with open(os.path.join(d, "gw.abi"), "w") as f:
                         f.write(gw_input(mat, m, ecut, dg, nk, nb,
-                                         ecut * args.ecuteps_frac, args.pspdir))
+                                         ecut * args.ecuteps_frac, args.pspdir,
+                                         gwcalctyp=args.gwcalctyp,
+                                         nfreqim=args.nfreqim))
                     made += 1
     print("wrote %d input pairs under %s" % (made, args.outdir))
 
