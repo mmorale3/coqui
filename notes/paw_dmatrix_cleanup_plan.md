@@ -14,33 +14,18 @@ Physics / correctness
 1. ~~THC-route K_a deficit~~ **RESOLVED 2026-07-30 — there was no deficit.**
    See the STATUS block below and `eos_exchange_ledger.md` §3h: the reference
    was 12% too large, not CoQui 12% short.
-1b. **OPEN AND SERIOUS: a volume-dependent ISDF band-set systematic that may
-   move a0 by −0.022 Bohr.** E_x at `nbnd` 100 and 250 agree to 1.4 µHa while
-   `nbnd = 500` — the setting the WHOLE EOS series used — sits 0.61 mHa away at
-   a = 10.25 (2620 vs 4928 interpolating points). Measured at a second volume,
-   that offset is only 0.094 mHa at a = 10.55, i.e. **it varies with volume,
-   slope +1.715 mHa/Bohr, so it does NOT cancel from the EOS slope**. If
-   nbnd = 250 is the converged setting then a0 = 10.2780 → 10.2557 and the
-   exchange row's agreement with corrected ABINIT (+0.006 mHa/Bohr, reported as
-   "closed") is an accident of this error cancelling a real −1.709 mHa/Bohr
-   discrepancy. K_a is unaffected either way (nbnd-independent to 2.3/0.4 µHa),
-   so the one-centre conclusions stand.
-   Needed: (a) the direct route on the production mf as arbiter for which nbnd
-   is right (running, >1 h — and only 1 of its 3 Vexchange builds is needed, so
-   it is worth adding a switch); (b) nbnd = 100 at a = 10.55 to confirm the
-   plateau there (queued); (c) if nbnd = 500 is the bad setting, re-run the EOS
-   — noting exchange and RPA have OPPOSITE nbnd needs, which the existing
-   `[interaction.hamilt]` static-slot route already resolves by computing K on
-   the exact hamiltonian path while the dynamic slot keeps THC.
-2. **Report BOTH ABINIT one-centre Fock defects upstream.** (a) the `nsppol=1`
-   spin double count in `pawdijfock`; (b) `pawinit` (`m_paw_init.F90:610`)
-   fills only the `klmn<=klmn1` triangle of `eijkl` while `pawdijfock`
-   (`m_pawdij.F90:1223`) indexes it without ordering the pair indices, so terms
-   landing in the unfilled half are silently dropped. (b) is **not** the small
-   effect first recorded: 0.6% on an s,p dataset but **12% on s,p,d**, and it
-   vanishes at Γ — it scales with how many off-diagonal `rho_ij` are populated.
-   Both are reproduced exactly (<=2e-15) by the python emulation of
-   `pawdijfock` in the session notes.
+1b. ~~volume-dependent ISDF systematic~~ **RETRACTED — it was an artefact of
+   the probe.** The nbnd scan that produced it ran at `beta = 100 /
+   iaft_prec = low`, settings that put E_x 11.5 mHa from the exact answer, i.e.
+   19x the 0.61 mHa effect being measured; differences between nbnd values
+   inside that regime say nothing about production. Checked against the exact
+   direct route on the production mf: **the EOS THC exchange (nbnd 500,
+   beta 1000) is exact to 0.58 uHa**, and a0 = 10.2780 stands with no re-run
+   needed. The direct route also confirms K_a = -6.61389 mHa against the
+   corrected ABINIT reference -6.59720 (ratio 1.0025) with an exact method, and
+   shape vs moment agree to 35 uHa at the production geometry.
+   Lesson kept in eos_exchange_ledger.md §3h: vary one thing at a time from the
+   PRODUCTION point, never from a cheap surrogate.
 3. psp8-NLCC end-to-end exercise remains asset-gated (the convention risk it
    guarded is closed by source inspection).
 

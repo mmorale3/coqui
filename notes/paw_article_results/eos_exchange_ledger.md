@@ -859,63 +859,44 @@ started from is fully accounted for: ~76% the `nsppol=1` spin double count
 (§3g) and the rest the `eijkl` triangle, both on the ABINIT side, with CoQui's
 one-centre exchange matching the corrected reference to 0.15%.
 
-### Caveat on the ABSOLUTE offset: an ISDF band-set systematic
+### The absolute value, settled by the exact direct route
 
-The −0.021 mHa constant above uses the EOS runs' own THC exchange, at
-`nbnd = 500`. That absolute value carries a separate systematic:
+The THC exchange was checked against the exact direct route on the production
+mf itself (occupied bands only, so `COQUI_VEXCHANGE_MF_NBND=8` gives the exact
+answer at 1/4000 of the nbnd=500 cost; runs under MPI, np=8 bit-identical to
+np=1):
 
-    nbnd   interpolating pts   E_x (beta=100 settings)
-     100         —             -2.1148286
-     250        2620           -2.1148301
-     500        4928           -2.1154386
+    a = 10.25, bare (G+dk=0 dropped on both sides)
+      direct route, exact          -1.67959882 Ha
+      EOS THC, nbnd 500 beta 1000  -1.67959824 Ha     ->  0.58 uHa
 
-`nbnd` 100 and 250 agree to **1.4 µHa** while 500 sits **0.61 mHa** away from
-both, so 500 is the outlier, not the converged point: with 500 bands the
-interpolating-point selection is driven by high-energy pair densities and the
-occupied block — the only block exchange uses — is fitted worse. If the exact
-(direct-route) exchange sits on the 100/250 plateau, the EOS runs' E_x is
-0.61 mHa too negative and the constant offset is nearer +0.6 mHa than −0.021.
+**The EOS's THC exchange is exact to 0.58 µHa.** There is no ISDF error in the
+production series, and the −0.021 mHa constant above is a real comparison, not
+an artefact.
 
-This does NOT touch the one-centre conclusion: K_a from the on/off split is
-independent of `nbnd` to **2.3 µHa** (−6.58484 at 250 vs −6.58716 at 500) and of
-`thresh` to 1e-10 Ha, so the term this section is about is unaffected. And a
-systematic that is smooth in volume shifts the row without tilting it, which is
-why the slope result stands. But "CoQui's exchange agrees with ABINIT to
-0.021 mHa" is a statement at the EOS's own THC settings, **not** an absolute
-accuracy claim.
+The direct route also confirms the one-centre term with an exact method at the
+production geometry:
 
-**MEASURED AT A SECOND VOLUME — the systematic IS volume-dependent:**
+      K_a direct                   -6.61389 mHa
+      corrected ABINIT reference   -6.59720 mHa      ->  ratio 1.0025
+      shape vs moment split                              35 uHa
 
-    a        E_x nbnd500      E_x nbnd250      delta
-    10.25   -2.115438575     -2.114830065     -0.6085 mHa
-    10.55   -2.071982056     -2.071887897     -0.0942 mHa
-                                 slope        +1.715 mHa/Bohr
+**RETRACTED — an ISDF "volume-dependent systematic" that was an artefact of the
+probe.** An earlier revision of this section reported E_x moving 0.61 mHa
+between nbnd 500 and 250 at a = 10.25 but only 0.09 mHa at a = 10.55, and
+concluded a0 might be wrong by −0.023 Bohr. That scan was run at
+`beta = 100 / iaft_prec = low` to make the RPA cheap. Those settings put E_x
+**11.5 mHa** away from the exact answer — nineteen times the effect being
+measured — so differences between nbnd values inside that regime say nothing
+about the production setting. At the EOS's own `beta = 1000` the THC exchange is
+exact to 0.58 uHa, and a0 = 10.2780 stands.
 
-so it does NOT cancel from the slope. If nbnd = 250 is the converged setting,
-the EOS — run entirely at nbnd = 500 — carries **da0 = −0.0223 Bohr**
-(a0 10.2780 → 10.2557), and the exchange-row residual against corrected ABINIT
-goes from flat (+0.006 mHa/Bohr) to **−1.709 mHa/Bohr**: the flat agreement in
-the table above would then be an accident of this error cancelling a real
-discrepancy, not evidence of agreement.
-
-K_a is unaffected either way (nbnd-independent to 2.3 µHa at a = 10.25 and
-0.4 µHa at 10.55), so §3g/§3h's one-centre conclusions stand regardless.
-
-**This is the open item that matters.** The direct route on the production mf
-(exact, occupied bands only — `COQUI_VEXCHANGE_MF_NBND=8`) is the arbiter for
-which nbnd is right; it is expensive (three Vexchange builds, >1 h at np=1 for
-64 k-points on a 48³ mesh, and only the first is needed for this question).
-Caveats on the numbers above: both nbnd runs used `beta = 100`, so the
-comparison is internally consistent but δ(a) is assumed to carry to the EOS's
-`beta = 1000`; and a = 10.55 has no plateau confirmation yet (nbnd = 100 is
-queued).
-
-A likely resolution if nbnd = 500 is indeed the bad setting: exchange and RPA
-have opposite nbnd requirements (exchange needs only the occupied block; RPA
-needed 500 bands), and CoQui already has the machinery to satisfy both — the
-`[interaction.hamilt]` static-slot route computes V_H/K by the exact
-hamiltonian path while the dynamic slot keeps the factorized THC ERI. Routing
-exchange through it would remove this systematic by construction.
+**The lesson, which is the reusable part:** a convergence scan run at cheap
+settings measures convergence *of the cheap calculation*. Before trusting a
+difference between two settings, check that the regime they share is close to
+the answer — here `base` was already known to be 11.5 mHa off the EOS value, and
+that number alone should have vetoed the inference. Vary one thing at a time
+from the PRODUCTION point, not from a cheap surrogate.
 
 ## §4 Status / next
 
