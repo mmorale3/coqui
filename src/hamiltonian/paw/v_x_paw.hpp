@@ -417,9 +417,13 @@ inline void v_x(utils::mpi_context_t<boost::mpi3::communicator,
   // psi_r_full array (fine for the small unit-test fixtures, catastrophic
   // here). Reinterpreting as 2*N doubles forces the native reduction — this is
   // the same trick used in methods/ERI/cholesky.icc.
-  mpi.comm.all_reduce_in_place_n(reinterpret_cast<double*>(psi_r_full.data()),
-                                  2 * psi_r_full.size(),
-                                  std::plus<>{});
+  //
+  // Chunked: 2*size() overflows the int count MPI_Allreduce takes once the
+  // array gets large (Si 3x3x3, 250 bands, ecutwfc 150 Ry -> ~3.5e9 doubles),
+  // which MPI rejects with MPI_ERR_COUNT rather than silently truncating.
+  all_reduce_doubles_chunked(mpi.comm,
+                             reinterpret_cast<double*>(psi_r_full.data()),
+                             2 * psi_r_full.size());
 
   // ---- Build Pskna at full BZ ----
   // Cached View-2 symmetry lift (collective on psp's communicator
@@ -777,9 +781,13 @@ inline void v_x(utils::mpi_context_t<boost::mpi3::communicator,
       }
     }
   }
-  // Flat-double reduction to force native MPI_SUM (see the nii overload above).
-  mpi.comm.all_reduce_in_place_n(reinterpret_cast<double*>(psi_r_full.data()),
-                                  2 * psi_r_full.size(), std::plus<>{});
+  // Flat-double reduction to force native MPI_SUM (see the nii overload above),
+  // chunked because 2*size() overflows MPI_Allreduce's int count at production
+  // sizes. This is the nij (full density matrix) overload, which is the one the
+  // direct static route reaches from GW.
+  all_reduce_doubles_chunked(mpi.comm,
+                             reinterpret_cast<double*>(psi_r_full.data()),
+                             2 * psi_r_full.size());
 
   // ---- Canonical projectors at full BZ (outer index source) ----
   auto const& ityp = psp.ityp_view();

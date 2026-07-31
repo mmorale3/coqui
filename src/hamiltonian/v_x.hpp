@@ -18,6 +18,8 @@
 #define HAMILTONIAN_V_X_HPP
 
 #include <cmath>
+#include <algorithm>
+#include <functional>
 #include "configuration.hpp"
 #include "nda/nda.hpp"
 #include "utilities/mpi_context.h"
@@ -35,6 +37,29 @@ namespace hamilt
 using utils::mpi_context_t;
 using boost::mpi3::communicator;
 using boost::mpi3::shared_communicator;
+
+/**
+ * In-place sum-reduction of a flat double buffer, split so no single MPI call
+ * carries more than INT_MAX elements.
+ *
+ * MPI_Allreduce takes an `int` count. The exchange routines reduce psi_r_full,
+ * which spans spin x FULL-BZ k x band x real-space point and is reinterpreted
+ * as 2N doubles to reach the native (non-serialized) reduction path. At
+ * production sizes that count overflows: Si on a 3x3x3 mesh with 250 bands at
+ * ecutwfc = 150 Ry gives ~3.5e9 doubles, and MPI rejects the call outright with
+ *
+ *   MPI_ERR_COUNT: invalid count argument
+ *
+ * The buffer length is identical on every rank, so every rank runs the same
+ * number of iterations and the loop stays collective-safe.
+ */
+template<class Comm>
+void all_reduce_doubles_chunked(Comm& comm, double* p, long n)
+{
+  constexpr long max_chunk = 1L << 30;   // 2^30 < INT_MAX
+  for (long off = 0; off < n; off += max_chunk)
+    comm.all_reduce_in_place_n(p + off, std::min(max_chunk, n - off), std::plus<>{});
+}
 
 namespace detail {
 
@@ -278,9 +303,11 @@ void v_x(mpi_context_t<communicator,shared_communicator> &mpi,
       }
     }
   }
-  mpi.comm.all_reduce_in_place_n(psi_r_full.data(),
-                                  psi_r_full.size(),
-                                  std::plus<>{});
+  // Flat-double + chunked: the complex all_reduce falls onto a serialized path
+  // (see v_x_paw.hpp), and a single call cannot carry more than INT_MAX.
+  all_reduce_doubles_chunked(mpi.comm,
+                             reinterpret_cast<double*>(psi_r_full.data()),
+                             2 * psi_r_full.size());
 
   // -------------------------------------------------------------------------
   // Step 2: build pair densities and contract into K_ij.
@@ -440,7 +467,9 @@ void v_x(mpi_context_t<communicator,shared_communicator> &mpi,
       }
     }
   }
-  mpi.comm.all_reduce_in_place_n(psi_r_full.data(), psi_r_full.size(), std::plus<>{});
+  all_reduce_doubles_chunked(mpi.comm,
+                             reinterpret_cast<double*>(psi_r_full.data()),
+                             2 * psi_r_full.size());
 
   // Natural orbitals for the inner index: φ_all(s,kq,p,r) = Σ_a U_ap ψ_a(kq,r),
   // occupations w_all(s,kq,p). Built for all (s, kq) up front. The band
