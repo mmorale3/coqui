@@ -298,16 +298,50 @@ namespace mf {
         nda::h5_read(grp, "System/reciprocal_vectors", recv);
 
         // BZ
-        // Hardening: the bdft reader needs the FULL BZ/symmetry table set
-        // (19 datasets incl. q-point maps); a partial /System/BZ used to
-        // cascade an HDF5 attribute exception here. Name the problem.
-        utils::check(bz_symm::can_init_from_h5(sgrp),
-            "bdft_system: /System/BZ in '{}' is missing part of the full "
-            "BZ/symmetry table set the bdft reader requires (kp/q maps, "
-            "trev tables, ...). Regenerate the file with the current "
-            "abinit2coqui (write_bz), or use the reader matching the file's "
-            "producer.", filename);
-        _symm.initialize_from_h5(sgrp);
+        // Two accepted layouts:
+        //  - the full table set (19 datasets incl. q-point maps), read verbatim;
+        //  - the minimal set (MP grid + IBZ kpoints + symmetry operations), from
+        //    which the maps are rebuilt by the bz_symm constructor. The minimal
+        //    form is what a converter can write straight off a symmetry-reduced
+        //    mean-field run, and it reuses the same map-building code the QE
+        //    reader goes through instead of duplicating it converter-side.
+        if(bz_symm::can_init_from_h5(sgrp)) {
+          _symm.initialize_from_h5(sgrp);
+        } else if(bz_symm::can_init_from_h5_minimal(sgrp)) {
+          auto bgrp = sgrp.open_group("BZ");
+
+          nda::array<double, 1> kp_grid_(3);
+          nda::array<double, 2> kpts_ibz_;
+          nda::h5_read(bgrp, "kp_grid", kp_grid_);
+          nda::h5_read(bgrp, "kpoints_ibz", kpts_ibz_);
+          utils::check(kpts_ibz_.extent(1) == 3,
+              "bdft_system: /System/BZ/kpoints_ibz in '{}' has {} columns, expected 3.",
+              filename, kpts_ibz_.extent(1));
+
+          auto symm_list_ = bz_symm::read_symm_list_from_h5(sgrp);
+
+          // Symmetry-exploitation levels. Both are correctness-neutral when the
+          // symmetry data are right, so they stay overridable from the file.
+          int no_q_sym_i = 0, use_trev_i = 0;
+          if(H5Aexists(h5::hid_t(bgrp),"no_q_sym"))
+            h5::h5_read_attribute(bgrp, "no_q_sym", no_q_sym_i);
+          if(H5Aexists(h5::hid_t(bgrp),"use_trev"))
+            h5::h5_read_attribute(bgrp, "use_trev", use_trev_i);
+
+          app_log(2, "  bdft_system: rebuilding BZ maps from {} symmetry operation(s) "
+                     "and {} IBZ k-points (no_q_sym={}, use_trev={}).",
+                  symm_list_.size(), kpts_ibz_.extent(0), no_q_sym_i, use_trev_i);
+
+          _symm = bz_symm(mpi->comm, bool(no_q_sym_i), latt, recv, kp_grid_,
+                          kpts_ibz_, symm_list_, bool(use_trev_i));
+        } else {
+          utils::check(false,
+              "bdft_system: /System/BZ in '{}' matches neither the full "
+              "BZ/symmetry table set (kp/q maps, trev tables, ...) nor the "
+              "minimal set (kp_grid + kpoints + Symmetries). Regenerate the "
+              "file with the current abinit2coqui, or use the reader matching "
+              "the file's producer.", filename);
+        }
 
         int nkpts = _symm.nkpts;
         int nkpts_ibz = _symm.nkpts_ibz;

@@ -24,14 +24,36 @@ single self-contained HDF5 file in the CoQuí "bdft" backend schema, so that CoQ
 consume an ABINIT SCF as its mean field via  `mf_source = bdft`  --  NO QE, NO
 pw2coqui, NO QE-native wfc files, and NO modification of ABINIT or CoQuí.
 
-Supports norm-conserving (--psp8) and PAW (--pawxml) pseudopotentials with **no
-symmetry reduction** of the k-mesh.  Run ABINIT with:
+Supports norm-conserving (--psp8) and PAW (--pawxml) pseudopotentials, with or
+without symmetry reduction of the k-mesh.  Which of the two is written is decided
+automatically from the WFK: a k-list shorter than the file's own Monkhorst-Pack
+grid means the run was symmetry-reduced.
 
-    nsym    1          # no symmetry reduction  (every k is its own IBZ point)
     istwfk  *1         # store the full G-sphere at every k (no TR half-packing)
-    kptopt  3          # full Monkhorst-Pack grid, all k explicit
     prtwf   1
     iomode  3          # netCDF WFK/GSR/DEN
+
+  nosym (every k explicit; the full bz_symm block is written out):
+
+    kptopt  3
+    nsym    1
+
+  symmetry-reduced (IBZ + operations; CoQuí rebuilds the maps):
+
+    kptopt     4       # spatial symmetries only -- NOT 1.  abinit2coqui writes
+                       # use_trev=0, and an IBZ reduced with time reversal does
+                       # not tile the grid under the stored operations (the
+                       # star check in build_bz_minimal refuses it).  Pass
+                       # --use-trev only if that is deliberately changed.
+    symmorphi  0       # REQUIRED for PAW: CoQuí's PAW symmetry
+                       # (hamilt::paw::build_atom_permutation_inverse) rejects
+                       # non-symmorphic ft, which is also why the QE path runs
+                       # force_symmorphic.  Diamond is non-symmorphic in the
+                       # 2-atom cell, so Si/C drop from 48 to 24 operations.
+
+Validated by converting the same ABINIT run both ways: the CoQuí total energy
+difference falls monotonically with the ISDF threshold (2.8e-3 Ha at 1e-4 down to
+7.8e-6 Ha at 1e-8 on Si 2x2x2), i.e. it is THC rank error, not a symmetry defect.
 
 The bdft schema reproduced here (verified against src/mean_field/bdft/bdft_system.hpp,
 bdft_readonly.hpp and src/mean_field/symmetry/bz_symmetry.hpp):
@@ -44,9 +66,15 @@ bdft_readonly.hpp and src/mean_field/symmetry/bz_symmetry.hpp):
             data : species (nspecies vlen str), atomic_id (natoms, 0-based species
                    index), atomic_positions (natoms,3 Bohr), lattice_vectors (3,3 Bohr,
                    rows a_n), reciprocal_vectors (3,3, rows b_n with a.b=2pi),
-                   kpoint_weights (nkpts)
-  /System/BZ  full bz_symm block (see write_bz) incl. qk_to_k2, qminus, qsymms,
-              nq_per_s, ks_to_k, Qs, qs_to_q, and Symmetries/s{i}/{R,ft}
+                   kpoint_weights (nkpts_ibz, star multiplicities normalized to 1)
+  /System/BZ  nosym: the full bz_symm block (see write_bz) incl. qk_to_k2,
+              qminus, qsymms, nq_per_s, ks_to_k, Qs, qs_to_q, Symmetries/s{i}/{R,ft}
+              symmetric: the minimal block (see write_bz_minimal) -- kp_grid,
+              kpoints_ibz (cartesian), Symmetries/s{i}/{R,ft} and the attrs
+              no_q_sym/use_trev.  bdft_system rebuilds every map from these with
+              the bz_symm constructor, the same code the QE reader goes through.
+              NOTE "kpoints_ibz", not "kpoints": in the full block "kpoints" is
+              the FULL BZ list, so the two layouts must not share a name.
   /Orbitals  attrs: number_of_spins(_in_basis), number_of_polarizations(_in_basis),
                     number_of_kpoints, number_of_kpoints_ibz, number_of_bands,
                     number_of_aux_bands, ecutrho
@@ -232,13 +260,22 @@ def read_den(path):
 # --------------------------------------------------------------------------
 # Shared truncated G-grid (union of per-k Miller lists)
 # --------------------------------------------------------------------------
-def build_shared_grid(w):
+def build_shared_grid(w, symm_R=None):
     """Build the shared wfc grid: union of all per-k Miller triples.
 
     CoQuí's bdft backend uses ONE truncated_g_grid for all IBZ k-points; the
     coefficient array psi_s_k(nbnd,ngm) is ordered by this shared grid, with 0
     where a given k has no plane wave.  We take the union of ABINIT's per-k
     G-vectors (which ARE the G Miller indices of e^{i(k+G).r}).
+
+    symm_R: when the run is symmetry-reduced, the rotations of the group.  The
+    union then covers only the IBZ, and bdft_readonly::make_swfc_maps rotates
+    Miller indices into it (w2g), so it MUST additionally be closed under the
+    group or those lookups fall off the grid.  Closing needs a single pass: the
+    union of the group-orbits of a set is already group-closed.  The G added
+    this way carry zero coefficients at every stored k, which is exactly the
+    sparse-union semantics the format already uses.
+
     Returns (miller_wfc (ngm,3) int, kg_index list per k, wfc_ecut, wfc_mesh).
     """
     nkpt = w["nkpt"]
@@ -258,8 +295,33 @@ def build_shared_grid(w):
             if key not in seen:
                 seen[key] = len(order)
                 order.append(key)
+    n_union = len(order)
+    if symm_R is not None:
+        # G' = G . Rinv, matching utils::transform_miller_indices' index order
+        # (G'_j = sum_i G_i Rinv(i,j)) so the closure is the same set CoQuí
+        # will look up.
+        Rinvs = [np.linalg.inv(np.asarray(S, dtype=float)) for S in symm_R]
+        base = list(order)
+        for Ri in Rinvs:
+            Gs = np.array(base, dtype=float) @ Ri
+            Gr = np.rint(Gs)
+            if np.abs(Gs - Gr).max() > 1e-6:
+                raise ValueError(
+                    "abinit2coqui: a symmetry rotation maps a Miller index to a "
+                    "non-integer triple (max deviation %.2e); the symmetry "
+                    "operations are not compatible with the reciprocal lattice."
+                    % np.abs(Gs - Gr).max())
+            for g in Gr.astype(np.int64):
+                key = (int(g[0]), int(g[1]), int(g[2]))
+                if key not in seen:
+                    seen[key] = len(order)
+                    order.append(key)
+
     miller = np.array(order, dtype=np.int32)          # (ngm,3)
     ngm = miller.shape[0]
+    if symm_R is not None and ngm != n_union:
+        print("#   shared G grid closed under symmetry: %d -> %d vectors"
+              % (n_union, ngm))
 
     # per-k index map: position in `miller` of each of k's plane waves
     kg_idx = []
@@ -294,6 +356,81 @@ def scatter_coeffs(w, kg_idx, ngm, is_, ik):
     coeff = block[..., 0] + 1j * block[..., 1]          # (nband, n)
     psik[:, kg_idx[ik]] = coeff
     return psik
+
+
+# --------------------------------------------------------------------------
+# Symmetry orientation
+# --------------------------------------------------------------------------
+# CoQuí's symm_op.R is the rotation acting on reduced (crystal) REAL-space
+# coordinates: utils::transform_miller_indices computes
+#     G'_j = sum_i G_i Rinv(i,j),
+# i.e. G' = R^{-T} G, which is the reciprocal-space action induced by
+# r -> R r + ft.  ABINIT's symrel is that same real-space reduced rotation, so
+# R = symrel and ft = tnons.
+#
+# What is NOT fixed by that derivation is the index order coming out of the
+# netCDF file: ETSF declares reduced_symmetry_matrices with the Fortran dims
+# reversed, so python[isym] may be symrel(:,:,isym) or its transpose depending
+# on the writer.  The two differ only by a transpose, and the pairing of a
+# rotation with ITS OWN tnons settles it: {R, ft} is a space-group operation
+# only if it maps every atom onto an atom of the same species.  R^T paired with
+# the same ft fails that unless R is symmetric, so the test below is decisive
+# per operation rather than merely set-wise.
+def _atoms_are_permuted(R, ft, xred, typat, tol=1e-5):
+    """True if r -> R r + ft maps every atom onto a same-species atom (mod 1)."""
+    for a in range(xred.shape[0]):
+        y = R @ xred[a] + ft
+        hit = False
+        for b in range(xred.shape[0]):
+            if typat[b] != typat[a]:
+                continue
+            d = y - xred[b]
+            if np.all(np.abs(d - np.round(d)) < tol):
+                hit = True
+                break
+        if not hit:
+            return False
+    return True
+
+
+def orient_symmetries(symrel_nc, tnons, xred, typat):
+    """Return (R_list, ft_list) with R in CoQuí's convention.
+
+    symrel_nc is the array as read from the WFK, shape (nsym,3,3).  Tries the
+    array as-is and transposed, and keeps whichever makes every {R,ft} a real
+    space-group operation of the given structure.
+    """
+    symrel_nc = np.asarray(symrel_nc, dtype=float).reshape(-1, 3, 3)
+    tnons = np.asarray(tnons, dtype=float).reshape(-1, 3)
+    nsym = symrel_nc.shape[0]
+    if tnons.shape[0] != nsym:
+        raise ValueError("abinit2coqui: %d symmetry matrices but %d translations"
+                         % (nsym, tnons.shape[0]))
+
+    cands = {"as-read": symrel_nc,
+             "transposed": np.transpose(symrel_nc, (0, 2, 1))}
+    ok = {}
+    for name, arr in cands.items():
+        ok[name] = all(_atoms_are_permuted(arr[i], tnons[i], xred, typat)
+                       for i in range(nsym))
+
+    good = [n for n, v in ok.items() if v]
+    if not good:
+        raise ValueError(
+            "abinit2coqui: neither orientation of reduced_symmetry_matrices maps "
+            "the atoms onto themselves; the symmetry data or the structure in the "
+            "WFK are inconsistent (nsym=%d)." % nsym)
+    if len(good) == 2:
+        # Only possible when every symrel is symmetric, in which case the two
+        # orientations are the same data and the choice does not matter.
+        diff = max(np.abs(cands["as-read"][i] - cands["transposed"][i]).max()
+                   for i in range(nsym))
+        if diff > 1e-12:
+            raise ValueError(
+                "abinit2coqui: both orientations of reduced_symmetry_matrices pass "
+                "the atom-permutation test but differ; cannot pin the convention.")
+    choice = good[0]
+    return cands[choice].copy(), tnons.copy(), choice
 
 
 # --------------------------------------------------------------------------
@@ -414,10 +551,99 @@ def write_bz(sgrp, bz):
 
 
 # --------------------------------------------------------------------------
+# Minimal Brillouin-zone block (symmetry-reduced runs)
+# --------------------------------------------------------------------------
+def build_bz_minimal(kpts_crys_ibz, recv, symrel, tnons, kp_grid,
+                     no_q_sym=False, use_trev=False):
+    """Assemble the minimal /System/BZ payload for a symmetry-reduced run.
+
+    Writes only the MP grid, the IBZ k-points and the symmetry operations;
+    bz_symm's constructor rebuilds every k/q map on the CoQuí side (the same
+    code path the QE reader uses), so the map conventions are not duplicated
+    here.
+
+    Guard: the star of the IBZ under the given operations must reproduce the
+    full MP grid exactly.  That catches a wrong symmetry orientation, an IBZ
+    that was reduced with time reversal while use_trev is off, and a k-set that
+    is not a complete regular grid -- all of which would otherwise surface much
+    later as a confusing failure inside the constructor.
+    """
+    kc = np.asarray(kpts_crys_ibz, dtype=float)
+    kp_grid = np.asarray(kp_grid, dtype=np.int64).reshape(3)
+    nk_full = int(np.prod(kp_grid))
+    R = np.asarray(symrel, dtype=float).reshape(-1, 3, 3)
+    ft = np.asarray(tnons, dtype=float).reshape(-1, 3)
+    nsym = R.shape[0]
+
+    def canon(v):
+        return tuple(np.round(np.mod(np.round(v, 8), 1.0), 6))
+
+    # reciprocal reduced coords transform as k -> R^{-T} k
+    star = set()
+    for S in R:
+        M = np.linalg.inv(S).T
+        for k in kc:
+            star.add(canon(M @ k))
+    if use_trev:
+        for S in R:
+            M = np.linalg.inv(S).T
+            for k in kc:
+                star.add(canon(-(M @ k)))
+
+    if len(star) != nk_full:
+        raise ValueError(
+            "abinit2coqui: the %d IBZ k-points under %d symmetry operation(s) "
+            "generate %d distinct points, but the Monkhorst-Pack grid %s has %d. "
+            "The IBZ and the symmetry list are inconsistent (if ABINIT reduced "
+            "with time reversal, e.g. kptopt 1, either rerun with kptopt 4 or "
+            "convert with use_trev enabled)."
+            % (kc.shape[0], nsym, len(star), tuple(int(x) for x in kp_grid), nk_full))
+
+    # and the generated points must BE the MP grid, not merely as many points
+    grid = set()
+    for i in range(kp_grid[0]):
+        for j in range(kp_grid[1]):
+            for k in range(kp_grid[2]):
+                grid.add(canon(np.array([i / kp_grid[0], j / kp_grid[1],
+                                         k / kp_grid[2]])))
+    if star != grid:
+        raise ValueError(
+            "abinit2coqui: the symmetry star of the IBZ has the right count but "
+            "does not coincide with the Gamma-centered Monkhorst-Pack grid %s; "
+            "shifted grids (shiftk /= 0) are not supported."
+            % (tuple(int(x) for x in kp_grid),))
+
+    return dict(kp_grid=kp_grid.astype(np.float64),
+                kpts=kc @ recv, kpts_crys=kc,
+                R=R, ft=ft, nsym=nsym,
+                no_q_sym=bool(no_q_sym), use_trev=bool(use_trev))
+
+
+def write_bz_minimal(sgrp, bz):
+    g = sgrp.create_group("BZ")
+    _w_real(g, "kp_grid", bz["kp_grid"], np.float64)
+    # "kpoints_ibz", NOT "kpoints": in the full BZ layout "kpoints" holds the
+    # FULL BZ list while bz_symm's constructor takes the IBZ list, so the two
+    # layouts must not share a name.  Cartesian, as the constructor expects.
+    _w_real(g, "kpoints_ibz", bz["kpts"], np.float64)
+    _w_real(g, "kpoints_ibz_crystal", bz["kpts_crys"], np.float64)  # informational
+    _w_attr_int(g, "no_q_sym", 1 if bz["no_q_sym"] else 0)
+    _w_attr_int(g, "use_trev", 1 if bz["use_trev"] else 0)
+
+    sym = g.create_group("Symmetries")
+    _w_attr_int(sym, "number_of_symmetries", bz["nsym"])
+    for i in range(bz["nsym"]):
+        si = sym.create_group("s%d" % i)
+        _w_real(si, "R", bz["R"][i], np.float64)
+        _w_real(si, "ft", bz["ft"][i], np.float64)
+
+
+# --------------------------------------------------------------------------
 # Top-level driver
 # --------------------------------------------------------------------------
 def convert(wfk_path, outdir="./", prefix="abinit", nbnd_out=None, verbose=True,
-            pot=None, psp8=None, pawxml=None, den=None, xc=None, corewf=None):
+            pot=None, psp8=None, pawxml=None, den=None, xc=None, corewf=None,
+            no_q_sym=False, use_trev=False):
     _require_h5py()
     w = read_wfk(wfk_path)
     if w["nspinor"] != 1:
@@ -487,9 +713,29 @@ def convert(wfk_path, outdir="./", prefix="abinit", nbnd_out=None, verbose=True,
     atomic_id = (typat - 1).astype(np.int32)       # 0-based species index
     at_pos_bohr = w["xred"] @ w["rprimd"]          # crystal -> cartesian (Bohr)
 
-    # BZ (nosym) + shared grid
-    bz = build_bz_nosym(w["kpts_crys"], w["recv"], kp_grid=w.get("kp_grid"))
-    miller, kg_idx, wfc_ecut, wfc_mesh = build_shared_grid(w)
+    # BZ + shared grid.  A WFK whose k-list is shorter than its own MP grid came
+    # from a symmetry-reduced run (kptopt /= 3): emit the minimal BZ block and let
+    # CoQuí rebuild the maps.  Otherwise every k is explicit and the nosym block
+    # is written as before.
+    kp_grid_in = w.get("kp_grid")
+    have_grid = (kp_grid_in is not None and int(np.prod(kp_grid_in)) > 0)
+    nk_full = int(np.prod(kp_grid_in)) if have_grid else w["nkpt"]
+    symmetric = have_grid and (w["nkpt"] < nk_full)
+
+    if symmetric:
+        R_sym, ft_sym, orient = orient_symmetries(
+            w["symrel"], w["tnons"], w["xred"], w["typat"])
+        bz = build_bz_minimal(w["kpts_crys"], w["recv"], R_sym, ft_sym, kp_grid_in,
+                              no_q_sym=no_q_sym, use_trev=use_trev)
+        if verbose:
+            print("#   symmetry-reduced: %d IBZ k-points -> %d in the full grid, "
+                  "%d operations (%s), no_q_sym=%d use_trev=%d"
+                  % (w["nkpt"], nk_full, bz["nsym"], orient,
+                     int(no_q_sym), int(use_trev)))
+    else:
+        bz = build_bz_nosym(w["kpts_crys"], w["recv"], kp_grid=kp_grid_in)
+    miller, kg_idx, wfc_ecut, wfc_mesh = build_shared_grid(
+        w, symm_R=(bz["R"] if symmetric else None))
     ngm = miller.shape[0]
 
     # eigenvalues / occupations (Ha). CoQuí occ in [0,1] per spin channel;
@@ -541,7 +787,8 @@ def convert(wfk_path, outdir="./", prefix="abinit", nbnd_out=None, verbose=True,
         # stays as a fallback); -2 * utils::madelung port.
         from lattice_sums import madelung_bdft, ewald_energy
         madelung = -2.0 * madelung_bdft(w["rprimd"], w["recv"],
-                                        bz["kp_grid"], fft_mesh, 1e-10)
+                                        np.asarray(bz["kp_grid"], dtype=np.int32),
+                                        fft_mesh, 1e-10)
         _w_attr_dbl(S, "madelung_constant", madelung)
         # nuclear (Ewald) energy in Ha, ions = valence point charges in a
         # neutralizing background (QE nuclear_energy convention). Needs the
@@ -567,8 +814,19 @@ def convert(wfk_path, outdir="./", prefix="abinit", nbnd_out=None, verbose=True,
         _w_real(S, "atomic_positions", at_pos_bohr, np.float64)
         _w_real(S, "lattice_vectors", w["rprimd"], np.float64)
         _w_real(S, "reciprocal_vectors", w["recv"], np.float64)
+        # kpoint_weights is indexed by the IBZ and carries the star
+        # multiplicities, normalized to 1 (the lih_kp222_nbnd16_sym checkpoint
+        # stores 1/8, 4/8, 3/8 on its three IBZ points).  ABINIT's wtk is
+        # already exactly that for any kptopt, and for a nosym grid it
+        # degenerates to the uniform 1/nk.  Writing uniform FULL-BZ weights
+        # instead makes the weights sum to nkpts_ibz/nkpts, which starves the
+        # electron count and sends the chemical-potential search off to
+        # infinity.
         _w_real(S, "kpoint_weights", w["wtk"] / w["wtk"].sum(), np.float64)
-        write_bz(S, bz)
+        if symmetric:
+            write_bz_minimal(S, bz)
+        else:
+            write_bz(S, bz)
 
         # ---- /Orbitals ----
         O = root.create_group("Orbitals")
@@ -576,7 +834,13 @@ def convert(wfk_path, outdir="./", prefix="abinit", nbnd_out=None, verbose=True,
         _w_attr_int(O, "number_of_spins_in_basis", nspin)
         _w_attr_int(O, "number_of_polarizations", npol)
         _w_attr_int(O, "number_of_polarizations_in_basis", npol)
-        _w_attr_int(O, "number_of_kpoints", nk)
+        # number_of_kpoints counts the FULL BZ, number_of_kpoints_ibz the
+        # irreducible set the orbitals are actually stored on.  eigval/occ stay
+        # IBZ-sized: bdft_system reads them with extent >= nkpts_ibz and fills
+        # the remaining k from kp_to_ibz itself, so the full-BZ ordering (which
+        # only CoQuí knows, since it rebuilds the maps) never has to be
+        # reproduced here.
+        _w_attr_int(O, "number_of_kpoints", nk_full if symmetric else nk)
         _w_attr_int(O, "number_of_kpoints_ibz", nk)
         _w_attr_int(O, "number_of_bands", nbnd)
         _w_attr_int(O, "number_of_aux_bands", 0)
@@ -650,10 +914,16 @@ def main():
     ap.add_argument("--corewf", nargs="+", default=None,
                     help="atompaw .corewf.xml companion(s), one per --pawxml "
                          "-> Species/Core AE core orbitals (native ex_cvij)")
+    ap.add_argument("--no-q-sym", action="store_true",
+                    help="symmetry-reduced input only: do not symmetry-reduce the "
+                         "q-points (k-points are still reduced)")
+    ap.add_argument("--use-trev", action="store_true",
+                    help="symmetry-reduced input only: the IBZ was reduced with "
+                         "time reversal as well (ABINIT kptopt 1/2)")
     args = ap.parse_args()
     convert(args.wfk, args.outdir, args.prefix, args.nbnd, pot=args.pot,
             psp8=args.psp8, pawxml=args.pawxml, den=args.den, xc=args.xc,
-            corewf=args.corewf)
+            corewf=args.corewf, no_q_sym=args.no_q_sym, use_trev=args.use_trev)
 
 
 if __name__ == "__main__":
