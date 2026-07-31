@@ -150,6 +150,12 @@ occopt 1
 nstep 100
 iomode 3
 inclvkb 0              # forced for PAW
+gw_icutcoul 7          # Gygi-Baldereschi == CoQui div_treatment="gygi".
+                       # ABINIT's DEFAULT IS 6 (Carrier auxiliary function), a
+                       # different q->0 convention, which shifts Sigma_x and so
+                       # moves occupied and empty states by different amounts --
+                       # i.e. a systematic gap offset. It is not echoed to the
+                       # .abo, so the mismatch is silent.
 gwcalctyp {gwcalctyp}{ppm}
 
 ndtset 4
