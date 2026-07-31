@@ -129,7 +129,17 @@ def gw_input(mat, m, ecut, pawecutdg, ngkpt, nband, ecuteps, pspdir,
     #       what CoQui's evgw0 does. This is the apples-to-apples setting.
     #   2 = contour deformation, the numerically exact reference both should
     #       converge to.
-    ppm = "" if gwcalctyp == 0 else "\nnfreqim%d   %d" % (3, nfreqim)
+    if gwcalctyp == 0:
+        ppm = ""
+    elif gwcalctyp == 2:
+        # Contour deformation needs a real-frequency grid for W as well. This
+        # is the numerically exact reference: unlike analytic continuation it
+        # has no Pade fit to go unstable, which Si's AC does (1.331 / 1.031 /
+        # 1.136 eV at nfreqim 16 / 32 / 64 -- non-monotonic).
+        ppm = ("\nnfreqim%d   %d\nnfreqre%d   %d\nfreqremax%d  %s"
+               % (3, nfreqim, 3, 100, 3, "1.5 Ha"))
+    else:
+        ppm = "\nnfreqim%d   %d" % (3, nfreqim)
     return common(mat, m, ecut, pawecutdg, ngkpt, pspdir) + f"""
 # ABINIT's own PAW G0W0 -- the head-to-head reference.
 # Symmetry is left at ABINIT's default here: this run never goes through
