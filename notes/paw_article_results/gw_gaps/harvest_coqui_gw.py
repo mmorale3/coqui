@@ -28,10 +28,34 @@ NOCC = {"si": 4, "c": 4, "sic": 4, "alp": 4, "mgo": 8}
 TAG = re.compile(r"^(?P<mat>[a-z]+)_k(?P<k>\d+)_n(?P<nb>\d+)_e(?P<ec>[\d.]+)$")
 
 
+def _decomplex(a):
+    """nda writes complex arrays with a trailing (2,) real/imag axis."""
+    a = np.asarray(a)
+    if a.ndim >= 1 and a.shape[-1] == 2 and not np.iscomplexobj(a):
+        return a[..., 0] + 1j * a[..., 1]
+    return a
+
+
+def _gap_from(e, nocc):
+    """(indirect, smallest-vertical) gap in eV from a real (nk, nbnd) array."""
+    vb, cb = e[:, nocc - 1], e[:, nocc]
+    return float((np.min(cb) - np.max(vb)) * HA), float(np.min(cb - vb) * HA)
+
+
 def read_gaps(h5path, nocc):
     with h5py.File(h5path, "r") as f:
         if "scf" not in f:
             return None
+        # KS eigenvalues of the converted mean field, on the FULL BZ.  Comparing
+        # this against ABINIT's own KS gap is the check that the conversion
+        # preserved the mean field: any disagreement there means the QP
+        # comparison is meaningless.
+        ks_ind = ks_dir = None
+        if "mean_field/eigvals" in f:
+            ks = _decomplex(f["mean_field/eigvals"][...])
+            ks = ks.real if np.iscomplexobj(ks) else ks
+            if ks.ndim == 3 and ks.shape[2] > nocc:
+                ks_ind, ks_dir = _gap_from(ks[0], nocc)
         scf = f["scf"]
         it = int(np.array(scf["final_iter"]).ravel()[0]) if "final_iter" in scf else None
         grp = None
@@ -43,24 +67,25 @@ def read_gaps(h5path, nocc):
                 return None
             it = iters[-1]
             grp = scf["iter%d" % it]
+        # iter0 is the KS starting point, NOT a quasiparticle result.  A run that
+        # is still going has only iter0, and reporting it silently yields the
+        # mean-field gap labelled as G0W0 -- numbers that look entirely
+        # plausible and are simply the DFT answer.  Refuse it.
+        if it is not None and it < 1:
+            return None
         if "E_ska" not in grp:
             return None
-        E = np.array(grp["E_ska"])             # (nspin, nk, nbnd), Hartree
+        E = _decomplex(grp["E_ska"][...])       # (nspin, nk, nbnd), Hartree
         mu = float(np.array(grp["mu"]).ravel()[0]) if "mu" in grp else None
     if E.ndim != 3 or E.shape[0] < 1:
         return None
     e = E[0].real if np.iscomplexobj(E) else E[0]          # (nk, nbnd)
     if e.shape[1] <= nocc:
         return None
-    vb = e[:, nocc - 1]
-    cb = e[:, nocc]
-    ik_v = int(np.argmax(vb))
-    ik_c = int(np.argmin(cb))
-    direct = float(np.min(cb - vb))                        # smallest vertical gap
-    return dict(indirect_qp=float((cb[ik_c] - vb[ik_v]) * HA),
-                direct_min_qp=float(direct * HA),
-                mu=mu, nk=int(e.shape[0]), nbnd=int(e.shape[1]),
-                iter=it, vbm_ik=ik_v, cbm_ik=ik_c)
+    ind, direct = _gap_from(e, nocc)
+    return dict(indirect_qp=ind, direct_min_qp=direct,
+                ks_indirect=ks_ind, ks_direct=ks_dir,
+                mu=mu, nk=int(e.shape[0]), nbnd=int(e.shape[1]), iter=it)
 
 
 def main():
@@ -105,22 +130,28 @@ def main():
         print("no CoQui results under %s" % args.root, file=sys.stderr)
         return 1
 
-    print("%-5s %-5s %-6s %-7s %-4s %10s %10s %10s"
-          % ("mat", "ngkpt", "nband", "ecut", "nk",
-             "CoQui_ind", "ABINIT_ind", "diff(eV)"))
+    print("%-5s %-5s %-6s %-7s | %9s %9s %8s | %9s %9s %8s"
+          % ("mat", "ngkpt", "nband", "ecut",
+             "KS CoQui", "KS ABINIT", "dKS",
+             "QP CoQui", "QP ABINIT", "dQP"))
+    print("-" * 92)
     for r in sorted(rows, key=lambda x: (x["material"], x["ngkpt"], x["nband"], x["ecut"])):
         a = ref.get(r["run"])
-        av = float(a["indirect_qp"]) if a and a.get("indirect_qp") else None
-        d = (r["indirect_qp"] - av) if av is not None else None
-        print("%-5s %-5d %-6d %-7.1f %-4d %10.3f %10s %10s"
-              % (r["material"], r["ngkpt"], r["nband"], r["ecut"], r["nk"],
-                 r["indirect_qp"],
-                 "%.3f" % av if av is not None else "-",
-                 "%+.3f" % d if d is not None else "-"))
+        aq = float(a["indirect_qp"]) if a and a.get("indirect_qp") else None
+        ak = float(a["indirect_ks"]) if a and a.get("indirect_ks") else None
+        ck, cq = r.get("ks_indirect"), r["indirect_qp"]
+        dk = (ck - ak) if (ak is not None and ck is not None) else None
+        dq = (cq - aq) if aq is not None else None
+        fmt = lambda v, p="%.3f": (p % v) if v is not None else "-"      # noqa: E731
+        print("%-5s %-5d %-6d %-7.1f | %9s %9s %8s | %9s %9s %8s"
+              % (r["material"], r["ngkpt"], r["nband"], r["ecut"],
+                 fmt(ck), fmt(ak), fmt(dk, "%+.3f"),
+                 fmt(cq), fmt(aq), fmt(dq, "%+.3f")))
 
     if args.csv:
         cols = ["material", "ngkpt", "nband", "ecut", "nk", "nbnd", "iter",
-                "indirect_qp", "direct_min_qp", "mu", "run"]
+                "ks_indirect", "ks_direct", "indirect_qp", "direct_min_qp",
+                "mu", "run"]
         with open(args.csv, "w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=cols)
             w.writeheader()
