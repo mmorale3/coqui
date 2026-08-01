@@ -1712,7 +1712,7 @@ TEST_CASE("paw_aug_q_eval_at_q0", "[hamilt][paw][isdf]")
     auto qe_h5 = mf::default_MF(mpi, "qe_si222_paw", mf::h5_input_type);
     test_paw_aug_q_eval_at_q0<HOST_MEMORY>(*mpi, qe_h5);
   }
-  // Plan D2: stored converter qgm vs runtime evaluator on an ABINIT mf.
+  // Stored converter qgm vs runtime evaluator on an ABINIT mf.
   SECTION("si_kp222 (PAW, ABINIT-sourced mf)") {
     auto ab_h5 = mf::default_MF(mpi, "bdft_si222_paw_ab", mf::h5_input_type);
     test_paw_aug_q_eval_at_q0<HOST_MEMORY>(*mpi, ab_h5);
@@ -3287,7 +3287,7 @@ TEST_CASE("vexchange_shape_restored", "[hamilt][paw][hf]")
 }
 
 // ===========================================================================
-// Plan C2 — THC shape-mode augmentation on the dense sphere.
+// THC shape-mode augmentation on the dense sphere.
 // The THC LL (aug-aug) Coulomb block is evaluated on the dense augmentation
 // sphere (fft_grid_dim_aug inscribed Gcut) regardless of the thc `ecut`
 // collocation grid; this is what makes vv_compensation='shape' (the SHARP
@@ -3415,7 +3415,7 @@ TEST_CASE("thc_shape_mode_vs_direct", "[hamilt][paw][thc][hf]")
         /*thc_thresh*/ 1e-5, /*ecut_frac*/ 0.5,
         /*tol_VX*/ 5e-4, /*tol_mode*/ 3e-5);
   }
-  // Plan D2: both augmentation modes route-equivalent on an ABINIT-sourced
+  // Both augmentation modes route-equivalent on an ABINIT-sourced
   // mf too (the shape-mode difference lives entirely in the LL/one-center
   // blocks, exactly where the converter's odd-m Ylm conventions enter).
   // Measured on this fixture: ΔV_x(shape) 2.96e-4, mode signal 8.4e-3, Δmode
@@ -5477,7 +5477,7 @@ TEST_CASE("hartree_thc_paw_aug", "[hamilt][energy][thc][paw]")
                                            /*thc_thresh*/1e-5, /*tol*/5e-3);
   }
 
-  // Plan D2: energy-level Hartree route equivalence on an ABINIT-sourced mf.
+  // Energy-level Hartree route equivalence on an ABINIT-sourced mf.
   SECTION("si_kp222 (PAW, ABINIT-sourced mf)") {
     auto mf_ptr = std::make_shared<mf::MF>(
         mf::default_MF(mpi, "bdft_si222_paw_ab", mf::h5_input_type));
@@ -6774,7 +6774,7 @@ TEST_CASE("dft_eigenvalues", "[hamilt][dft]")
   }
 }
 
-// Plan B3: native core-valence exact-exchange builder (Slater R^L +
+// Native core-valence exact-exchange builder (Slater R^L +
 // closed-shell Gaunt² sum) — hydrogenic analytic checks. The same routine
 // is validated against a real ABINIT-XML <exact_exchange_X_matrix> (atompaw
 // Al "stringent" + .corewf companion, all 12 ln-diagonal entries to ~1e-7
@@ -6832,7 +6832,7 @@ TEST_CASE("ex_cvij_native", "[paw]")
 }
 
 // ===========================================================================
-// Plan C4 — augmentation-mode exchange-energy baseline (direct dense-grid
+// Augmentation-mode exchange-energy baseline (direct dense-grid
 // path, finite-size off). Computes E_X = (2/ns)·Σ_k w_k·½Tr[Dm K] from the
 // direct Vexchange in BOTH vv_compensation modes and logs the mode split.
 // The default bare-Coulomb kernel zeroes the G+Δk=0 term (ignore_g0), i.e.

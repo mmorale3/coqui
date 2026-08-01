@@ -79,7 +79,7 @@ cholesky::cholesky(mf::MF *mf_,
   utils::check(mf != nullptr, "cholesky::Null pointer.");
   utils::check(mf->has_orbital_set(), "Error in cholesky: Invalid mf type. ");
 
-  // Plan D4: this builder factorizes SMOOTH-grid pair densities only — no
+  // This builder factorizes SMOOTH-grid pair densities only — no
   // augmentation-charge (Q_ij) contribution — so for USPP/PAW the resulting
   // ERIs silently miss the augmentation physics. Hard-abort until an
   // augmented Cholesky path lands; use the THC ERI path (paw_aug) instead.

@@ -1,7 +1,7 @@
 /**
  * @file paw_runtime_caches.hpp
  *
- * Plan A4: lazily built, keyed runtime caches for the PAW/USPP augmentation
+ * Lazily built, keyed runtime caches for the PAW/USPP augmentation
  * machinery, hoisting work that used to be rebuilt inside every
  * compute_paw_deeq / v_x / becsum-symm call (audit finding F5):
  *

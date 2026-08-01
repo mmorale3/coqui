@@ -134,7 +134,7 @@ namespace bdft_tests {
     int const niter = 3;
 
     // ERI-static vs hamilt-static with matched div treatment (ignore_g0,
-    // plan 3.1); tolerance = THC fitting scale for these fixtures/ranks.
+    // tolerance = THC fitting scale for these fixtures/ranks.
     auto check_routes = [&](std::string mf_id, double tol) {
       auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, mf_id));
       thc_reader_t thc(mf, make_thc_reader_ptree(mf->nbnd()*20, "", "incore", "", "bdft",
@@ -157,7 +157,7 @@ namespace bdft_tests {
       ARRAY_EQUAL(ham.F_first, ref.F_first, tol);   // first iteration ...
       ARRAY_EQUAL(ham.F_final, ref.F_final, tol);   // ... and end of the run
 
-      // Per-term mixing (plan 3.4) falls out of the slot structure: hartree
+      // Per-term mixing falls out of the slot structure: hartree
       // direct + exchange THC, and the inverse, against the all-THC reference.
       auto eri_mixJ = mb_eri_t(heval, thc, thc);  // hartree = hamilt
       auto mixJ = run_hf_scf(mpi_context, mf, eri_mixJ, hf, ft, "cq_mixJ", niter);
@@ -174,14 +174,14 @@ namespace bdft_tests {
     SECTION("lih222_paw")  { check_routes("qe_lih222_paw",  1e-4); }
     SECTION("lih222_uspp") { check_routes("qe_lih222_uspp", 1e-4); }
     SECTION("lih222_ncpp") { check_routes("qe_lih222",      1e-4); }
-    // Symmetry-reduced mesh (plan 4.3b): same battery; iterations >= 2 have a
+    // Symmetry-reduced mesh: same battery; iterations >= 2 have a
     // non-diagonal Dm, exercising the View-2 general-nij lift in BOTH the
     // direct Hartree (becsum) and the direct exchange.
     SECTION("lih222_paw_sym") { check_routes("qe_lih222_paw_sym", 1e-4); }
   }
 
   TEST_CASE("hamilt_hf_sym_vs_nosym", "[methods][hamilt][hf][qe][paw]") {
-    // Plan 4.3a: sym-vs-nosym invariance of the PURELY direct static route
+    // sym-vs-nosym invariance of the PURELY direct static route
     // (hf slot = hamilt; the thc corr slot is typed but never evaluated by the
     // HF-only solver). Same physical system, symmetry on/off — e_hf must
     // agree to the cross-fixture consistency of the two QE runs (1e-5, the
@@ -208,7 +208,7 @@ namespace bdft_tests {
   }
 
   TEST_CASE("hamilt_hf_gygi_parity", "[methods][hamilt][hf][qe][paw]") {
-    // Plan 3.6 (closes 0.1): the gygi finite-size treatment is applied at the
+    // The gygi finite-size treatment is applied at the
     // operator level by the shared, route-free HF_K_correction
     // (notes/static_route_gygi_note.md) — direct-route gygi must match
     // ERI-route gygi to the same THC tolerance as the ignore_g0 battery.
@@ -279,7 +279,7 @@ namespace bdft_tests {
   }
 
   TEST_CASE("hamilt_exx_options_sharing", "[methods][hamilt][hf][qe][paw]") {
-    // Plan 0.2 positive direction: two hamilt evaluators with IDENTICAL
+    // Positive direction: two hamilt evaluators with IDENTICAL
     // non-default exx options must share the one pseudopot instance without
     // tripping the conflict check (the conflict direction is APP_ABORT and
     // cannot be exercised in-process).

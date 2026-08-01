@@ -470,7 +470,7 @@ class pseudopot
     _exx_opts = o;
   }
 
-  // ---- Plan A4: lazily built runtime caches. Definitions in
+  // ---- Lazily built runtime caches. Definitions in
   // hamiltonian/paw/paw_runtime_caches.hpp; every cached object is a pure
   // function of the immutable pseudopot state plus the explicit key
   // arguments, so the cache is shared across pseudopot copies.
@@ -590,7 +590,7 @@ class pseudopot
   // SCF caches above.
   int paw_aainit_lli = 0;
 
-  // Plan A4 runtime caches (see paw_rt() above). Created lazily; shared
+  // Runtime caches (see paw_rt() above). Created lazily; shared
   // between copies of this pseudopot (safe: content is keyed, never stale).
   mutable std::shared_ptr<paw::runtime_caches> paw_rt_cache;
 

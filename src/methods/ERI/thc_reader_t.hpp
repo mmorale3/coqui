@@ -616,7 +616,7 @@ namespace methods {
         return;
       }
 
-      // Plan D3: augmentation-stage memory estimate. The smooth-stage
+      // Augmentation-stage memory estimate. The smooth-stage
       // estimator (thc.icc get_ZquG_Cquv) predates augmentation and knows
       // nothing about the (N_total/Np_smooth)²-larger augmented _dZ, the
       // q-pool η/ζ slabs, or the gather buffers. Report the per-rank
@@ -787,7 +787,7 @@ namespace methods {
         }
       }
 
-      // ---- Plan C2: dense-sphere G-grid for the atom-local (LL) Coulomb block.
+      // ---- Dense-sphere G-grid for the atom-local (LL) Coulomb block.
       // The LL block integrates η·w·conj(η) over G (conjugate on the SECOND
       // index — see 6h). η (the compensation charge
       // in moment mode; the SHARP full AE−PS pair density in shape mode) is NOT

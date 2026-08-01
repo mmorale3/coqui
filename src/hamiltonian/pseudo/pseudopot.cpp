@@ -520,7 +520,7 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
   ityp.resize(nat);
   ofs.resize(nat);
   {
-    // Plan A5: proj_per_atom is per-SPECIES (length nsp). A wrong length
+    // proj_per_atom is per-SPECIES (length nsp). A wrong length
     // (e.g. per-atom, an ABINIT-converter gap) silently resizes
     // nh and mis-indexes every augmentation consumer, so it is a hard error.
     nda::array<int,1> nh_read;
@@ -553,7 +553,7 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
     ityp() -= id_min;
   }
   {
-    // Plan A5: Σ_atoms proj_per_atom(type) must reproduce total_num_of_proj
+    // Σ_atoms proj_per_atom(type) must reproduce total_num_of_proj
     // (order-independent; catches per-atom/per-species confusion the length
     // check above might miss for nat == nsp systems).
     long nkb_sum = 0;
@@ -603,7 +603,7 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
     }
     // Ry -> Ha for legacy files; schema_version >= 2 is already Ha
     nda::tensor::scale(ComplexType(ry2ha),Dnn.local());
-    // Plan A5: dion must be Hermitian per species block and at a plausible
+    // dion must be Hermitian per species block and at a plausible
     // Hartree scale — catches transposed/corrupted exports and unit errors
     // (Ry/eV/e² factors) at read time instead of as finite-but-wrong
     // energies downstream. Only the active nh(s)×npol block is checked
@@ -670,7 +670,7 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
       // ijtoh is integer, written as h5_write_tensor_int(ijtoh, "ijtoh") in
       // pw2coqui. Fortran (nhm, nhm, nsp) -> C++ (nsp, nhm, nhm).
       nda::h5_read(grp,"ijtoh",ijtoh);
-      // Plan B4 schema contract: ijtoh must be the sequential upper-triangle
+      // Schema contract: ijtoh must be the sequential upper-triangle
       // packing `for ih: for jh >= ih: ++ij` (1-based, symmetric — QE
       // init_us_1, verified against QE 7.4.1). Only the active nh(s) block
       // is constrained (QE pads with -1, abinit2coqui with 0). A transposed
@@ -790,7 +790,7 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
       } else {
         h5::group hgrp = grp0.open_group("Hamiltonian");
         h5::group sp_grp = hgrp.open_group("Species");
-        // Plan A5: required datasets are HARD errors — silent fallbacks are
+        // Required datasets are HARD errors — silent fallbacks are
         // how the historical inconsistencies survived.
         auto require_read = [](h5::group& g, std::string const& ds,
                                auto& target, int nt_i, char const* why) {
@@ -931,7 +931,7 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
             try { nda::h5_read(cgrp, "l",      sp.core_l); }     catch(...) {}
             try { nda::h5_read(cgrp, "ae_wfc", tmp.core_aewfc); } catch(...) {}
           }
-          // Plan B3 — native ex_cvij: when the h5 carries no Onecenter/
+          // Native ex_cvij: when the h5 carries no Onecenter/
           // ex_cvij but DOES carry AE core orbitals, build the frozen
           // core-valence exact exchange here (Slater R^L + closed-shell
           // Gaunt² sum, hamilt::paw::compute_ex_cvij_from_core; validated

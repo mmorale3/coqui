@@ -169,7 +169,7 @@ inline std::tuple<std::string,std::string> utest_filename(std::string src)
                            std::string("bdft"));
   } else if (src == "bdft_si222_paw_ab") {
     // ABINIT-sourced Si PAW mf (abinit2coqui: WFK+POT+DEN+pawxml+corewf,
-    // LDA-PW 12-electron dataset, 2x2x2 full-BZ nosym). Plan D2: the
+    // LDA-PW 12-electron dataset, 2x2x2 full-BZ nosym). The
     // route-equivalence matrix MUST include an ABINIT-sourced mf — the
     // real_ylm converter bug was invisible to QE-only route tests.
     // Generation input: PROVENANCE.abi in the fixture directory.

@@ -127,7 +127,7 @@ namespace bdft_tests {
     };
 
     SECTION("lih222_paw")     { check_gw("qe_lih222_paw"); }
-    // Symmetric mesh (static-route plan 4.3b; phase-4 View-2 nij lift).
+    // Symmetric mesh (View-2 nij lift).
     SECTION("lih222_paw_sym") { check_gw("qe_lih222_paw_sym"); }
   }
 
