@@ -1,0 +1,10 @@
+# Si diamond, PAW (kjpaw), 4x4x4, 250 bands, ecutwfc 150 Ry / ecutrho 600 Ry
+# G0W0 (evgw0 niter=1), THC thresh 1e-5, aux ecut 90 Ha, beta 1000, wmax 12.0
+# mean field: Si_rpa_proj/runs_kp4/paw/w150_n250 (QE, force_symmorphic)
+# div_treatment    = q->0 treatment for the SCREENED Coulomb kernel
+# hf_div_treatment = q->0 treatment for the EXCHANGE (bare Coulomb) kernel
+run,div_treatment,hf_div_treatment,ks_gap_eV,qp_gap_eV
+both_gygi,gygi,gygi,0.4005,0.9869
+both_none,ignore_g0,ignore_g0,0.4005,0.6229
+hf_only,ignore_g0,gygi,0.4005,3.0884
+corr_only,gygi,ignore_g0,0.4005,-1.3536
