@@ -46,10 +46,30 @@ def parse_psp8(path):
     assert pspcod == 8, "not a psp8 file (pspcod=%d)" % pspcod
     t4 = lines[3].split()
     fchrg = _f(t4[1]) if len(t4) > 1 else 0.0
-    nproj = [int(x) for x in lines[4].split()[:5]]
+    # The nproj row carries lmax+1 counts, but generators pad it differently
+    # (ONCVPSP-3.3.1 writes 5, PseudoDojo writes lmax+2), so take numeric
+    # tokens until the trailing "nproj" label rather than a fixed slice --
+    # lines[4].split()[:5] swallowed the label and raised on int("nproj").
+    def _lead_ints(line):
+        out = []
+        for tok in line.split():
+            try:
+                out.append(int(tok))
+            except ValueError:
+                break
+        return out
 
-    # locate the first data block: line 5 is extension_switch; blocks start at line 6
-    idx = 6
+    nproj = _lead_ints(lines[4])
+
+    # line 5 is extension_switch. Values >= 2 mean the file also carries
+    # spin-orbit projectors, and ONCVPSP then writes an extra "nprojso" row
+    # before the first data block. Those blocks live after vloc and are simply
+    # not read: a scalar CoQui run uses the same scalar (j-averaged) projectors
+    # ABINIT uses at nspinor 1, so ignoring the SO part is the correct scalar
+    # reduction, not an approximation introduced here.
+    ext = _lead_ints(lines[5])
+    ext = ext[0] if ext else 1
+    idx = 7 if ext >= 2 else 6
     channels = []
     for l in range(len(nproj)):
         npl = nproj[l]
