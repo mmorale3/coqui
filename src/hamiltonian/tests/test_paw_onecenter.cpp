@@ -72,11 +72,97 @@ TEST_CASE("paw_onecenter_dDeeq_H_matches_deltaC_contraction",
         run_dDeeq_H_matches_deltaC_test("qe_si222_paw", 1e-4);
     }
     SECTION("bdft_si222_paw_ab") {
-        // Plan D2: converter-written deltaC vs the radial one-center
+        // Converter-written deltaC vs the radial one-center
         // machinery on an ABINIT-sourced mf (12-electron semicore
         // dataset; referees the direct-route V_H matrix discrepancy).
         run_dDeeq_H_matches_deltaC_test("bdft_si222_paw_ab", 1e-4);
     }
+}
+
+/*
+ * ==========================================================================
+ * EXTERNAL anchor for the PAW one-centre valence-valence exchange.
+ *
+ *   E_x^{1c,vv} = - Σ_a Σ_{IJKL} D_IL D_KJ ΔC^a(I,J,K,L)
+ *
+ * with D the PER-SPIN one-centre density matrix. This is the only genuine
+ * rank-4 contraction in the PAW path, and it is the one quantity that no other
+ * test can constrain from inside CoQuí:
+ *
+ *   - every other on-site quantity (ex_cvij, dij0, the one-centre Hartree) is a
+ *     rank-2 contraction of the density matrix with a matrix that is spherical
+ *     within each (l,n) shell, hence blind to the rank-4 structure;
+ *   - paw_onecenter_dDeeq_H_matches_deltaC (above) checks the radial machinery
+ *     against deltaC, but both sides share the same deltaC;
+ *   - vx_onecenter_vs_thc_Ka compares THC's K_a against the direct contraction,
+ *     and again both sides share deltaC — so it is blind to its magnitude.
+ *
+ * Reference: -6.658384 Ha, obtained as -1/4 Σ_a Σ rho_IL rho_KJ eijkl(I,J,K,L)
+ * from ABINIT's OWN pawrhoij and pawtab%eijkl for this fixture's cell, dataset
+ * and k-mesh, dumped by the ABI_DUMP_PAWKERNEL site of
+ * notes/paw_article_results/abinit_ene_instr.py and contracted by
+ * notes/paw_article_results/emul_pawdijfock.py (which also reproduces ABINIT's
+ * printed efockdc to <=2e-15, so the dump is being read correctly).
+ *
+ * Do NOT replace it with ABINIT's printed `efockdc`: that value carries two
+ * defects, a 2x spin double count at nsppol=1 and the terms pawdijfock reads
+ * from the never-filled lower triangle of eijkl. The constant above is the
+ * physical value with both removed. See eos_exchange_ledger.md §3g-§3h.
+ *
+ * The companion test vexchange_mode_energies checks that v_x's production
+ * one-centre block reproduces this same closed form; that one is [slow]
+ * because it needs full Vexchange builds. This test is cheap -- becsum plus an
+ * nh^4 loop -- so the external constant is guarded on every commit.
+ * ==========================================================================
+ */
+TEST_CASE("paw_onecenter_exchange_vs_abinit", "[hamilt][paw][onecenter]")
+{
+    using nda::range;
+    auto& mpi = utils::make_unit_test_mpi_context();
+    auto mfobj = mf::default_MF(mpi, "bdft_si222_paw_ab", mf::h5_input_type);
+
+    long nspin  = mfobj.nspin();
+    long nk_ibz = mfobj.nkpts_ibz();
+    long nbnd   = mfobj.nbnd();
+    int  npol   = mfobj.npol();
+    REQUIRE(npol == 1);
+
+    hamilt::pseudopot V(mfobj);
+    auto const& ityp = V.ityp_view();
+    auto const& nh_v = V.nh_view();
+
+    nda::array<ComplexType,3> nii(nspin, nk_ibz, nbnd);
+    nii() = mfobj.occ()(range::all, range(nk_ibz), range::all);
+
+    // PER-SPIN density matrix: deliberately NO ns_scl. Exchange is same-spin
+    // only, so the contraction below wants D^sigma = Σ_k w_k f^sigma P* P,
+    // which is exactly what compute_becsum_diagonal returns. Applying ns_scl
+    // here -- as the Hartree tests above correctly do, because the Hartree
+    // potential sees the TOTAL density -- would inflate E_x by 4x. That
+    // total-vs-per-spin conflation is precisely the ABINIT nsppol=1 defect
+    // this anchor exists to catch.
+    auto D = hamilt::paw::compute_becsum_diagonal(
+        V.Pskna_view(), nii, ityp, nh_v, V.ofs_view(), npol);
+
+    double E = 0.0;
+    for (long ia = 0; ia < ityp.extent(0); ++ia) {
+        auto const& sp = V.paw_species_view()[ityp(ia)];
+        if (!sp.is_paw || sp.deltaC.size() == 0) continue;
+        long nh = nh_v(ityp(ia));
+        for (long I = 0; I < nh; ++I)
+        for (long J = 0; J < nh; ++J)
+        for (long K = 0; K < nh; ++K)
+        for (long L = 0; L < nh; ++L)
+            E -= std::real(D(ia, I, L)) * std::real(D(ia, K, J))
+                 * sp.deltaC(I, J, K, L);
+    }
+
+    const double E_ref = -6.658384;
+    app_log(1, "PAW one-centre exchange: E_x^1c = {:+.8f} Ha, ABINIT-derived "
+               "reference = {:+.8f} Ha, ratio = {:.6f}", E, E_ref, E / E_ref);
+    // 0.2%: the reference uses ABINIT's own rho_ij while CoQuí uses its becsum
+    // from the converted orbitals, i.e. two different SCF paths. Measured 3e-5.
+    CHECK(std::abs(E / E_ref - 1.0) < 2e-3);
 }
 
 static void run_dDeeq_H_matches_deltaC_test(std::string fixture_name,
