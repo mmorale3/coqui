@@ -949,7 +949,7 @@ void hf_downfold(eri_t &eri, ptree const& pt) {
  *  - factorization_type: "cholesky", Type of factorization. {choices: "none", "cholesky", "cholesky_high_memory", "choleksy_from_4index", "thc"}
  *  - thresh: 1e-6. Threshold used if factorization is requested.
  *  Parameters used by quasiparticle algorithm:
- *  - ac_alg: Algorithm for analytic continuation, default:pade {choices: pade}
+ *  - ac_alg: Algorithm for analytic continuation, default:pade {choices: pade, pade_updated}
  *  - eta: Smearing parameter: default:1e-6
  *  - Nfit: Number of terms in AC fit, default: 30
  *  - off_diag_mode: Off diagonal treatment, default: qp_energy. {choices: fermi, qp_energy} 

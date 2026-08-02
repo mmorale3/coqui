@@ -28,7 +28,7 @@ namespace analyt_cont {
 
 struct ac_context_t {
   std::string ac_alg = "pade";
-  imag_axes_ft::stats_e stats = imag_axes_ft::fermion;
+  imag_axes_ft::stats_e stats = imag_axes_ft::fermi;
   int Nfit = -1;
   double eta = 0.0001;
   // params for real w mesh

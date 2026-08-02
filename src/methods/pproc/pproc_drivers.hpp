@@ -48,7 +48,7 @@ namespace methods {
    * Optional arguments:
    *   - outdir: location of directory with files
    * Optional arguments for pp_type = ac (analytical continuation):
-   *   - ac_alg: algorithm for analytical continuation, allowed options: pade
+   *   - ac_alg: algorithm for analytical continuation, allowed options: pade, pade_updated
    *   - dataset: input dataset
    *   - stats: statistics, allowed options: fermi, boson
    *   - w_min: minimum real frequency
