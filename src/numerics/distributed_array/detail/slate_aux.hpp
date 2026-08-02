@@ -60,6 +60,7 @@ auto make_slate(DMat& A_)
   static_assert( (transpose_layout and Array_t::layout_t::is_stride_order_C()) or
 		 (not transpose_layout and Array_t::layout_t::is_stride_order_Fortran()),
 		"Layout mismatch.");  
+  // view onto a slate tile; only used by the owning (non-view) path, which is host-only
   using arr_t = ::nda::array_view<value_type, 2, ::nda::F_stride_layout>;
   using lay_t = typename arr_t::layout_t;
 
@@ -104,9 +105,19 @@ auto make_slate(DMat& A_)
   [[maybe_unused]] int dev_ = 0;
 #if defined(ENABLE_CUDA)
   cudaGetDevice(&dev_);
-  if constexpr (not ::nda::mem::on_host<Array_t>) dev = dev_; 
+  if constexpr (not ::nda::mem::on_host<Array_t>) dev = dev_;
 #endif
   std::function<int (ij_tuple ij)> tileDevice = [dev]([[maybe_unused]] ij_tuple ij) { return int{dev}; };
+
+  // Slate needs to be told which address space a user-owned tile lives in: it keeps a
+  // per-device MOSI state for every tile and stages copies (device workspace for compute,
+  // host workspace for MPI and for the host panels of getrf/getri) off that. Tagging a
+  // device pointer as a host tile makes slate skip those copies and hand the raw device
+  // pointer to CPU BLAS/LAPACK and to MPI -- which "works" only with unified memory,
+  // where the host can dereference it anyway. Only ::nda::mem::Device needs the tag;
+  // Unified is host-dereferenceable, so leaving it on the host is both valid and what
+  // the working unified path has always done.
+  constexpr bool tiles_on_device = ::nda::mem::on_device<Array_t>;
 
   slate::Matrix<value_type> R(A.global_shape()[row_index], A.global_shape()[col_index],
 			      tileMb, tileNb, tileRank, tileDevice,
@@ -114,13 +125,18 @@ auto make_slate(DMat& A_)
 #if defined(ENABLE_CUDA)
   cudaSetDevice(dev_);  // in case slate changes the active device (e.g. initialization of quues, etc)
 #endif
-  
+  if constexpr (tiles_on_device)
+    utils::check(dev < R.num_devices(), "make_slate: device {} not visible to slate (num_devices:{}).",
+                 dev, R.num_devices());
+
   if constexpr (not view) {
-    if constexpr (::nda::mem::on_host<Array_t>) {
-      R.insertLocalTiles();
-    } else {
-      R.insertLocalTiles( slate::Target::Devices );
-    }
+    // to_slate() copies into tiles slate owns. Only the host case is implemented: the
+    // copy below goes through an nda host view of the tile. to_slate_view() is what
+    // every caller uses and it handles device memory, so this was never finished.
+    static_assert(::nda::mem::on_host<Array_t>,
+                  "to_slate(): owning copy is only implemented for host memory, "
+                  "use to_slate_view().");
+    R.insertLocalTiles();
   }
   // copy data to R 
   auto Aloc = A.local();
@@ -137,22 +153,22 @@ auto make_slate(DMat& A_)
 		y,A.local_shape()[row_index],j,nb,A.origin()[col_index]);
       
         if constexpr (view) {
-          if constexpr (transpose_layout) {
-            if constexpr (::nda::mem::on_host<Array_t>) {
-              R.tileInsert(i,j,std::addressof(Aloc(y,x)),lld);
+          // no dereference of Aloc when it is not on the host, hence the explicit offset
+          auto* ptr = [&]() {
+            if constexpr (transpose_layout) {
+              if constexpr (::nda::mem::on_host<Array_t>) return std::addressof(Aloc(y,x));
+              else                                        return Aloc.data() + (y*lld+x);
             } else {
-              R.tileInsert(i,j,Aloc.data() + (y*lld+x),lld);
+              if constexpr (::nda::mem::on_host<Array_t>) return std::addressof(Aloc(x,y));
+              else                                        return Aloc.data() + (x*lld+y);
             }
+          }();
+          if constexpr (tiles_on_device) {
+            R.tileInsert(i,j,dev,ptr,lld);
           } else {
-            if constexpr (::nda::mem::on_host<Array_t>) { 
-              R.tileInsert(i,j,std::addressof(Aloc(x,y)),lld);
-            } else {
-              R.tileInsert(i,j,Aloc.data() + (x*lld+y),lld);
-            }
+            R.tileInsert(i,j,ptr,lld);
           }
         } else {
-          if constexpr (not ::nda::mem::on_host<Array_t>)
-            utils::check(false," FIX: Still have problems retrieting tiles from device memory!!!");
           auto tile = R(i,j);
           auto Rloc = arr_t(lay_t{{tile.mb(),tile.nb()},{1,tile.stride()}},tile.data());
           if constexpr (transpose_layout) {

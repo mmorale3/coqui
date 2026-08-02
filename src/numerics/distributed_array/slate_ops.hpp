@@ -378,31 +378,36 @@ void inverse(DistributedMatrix auto&& A)
 
   auto As = detail::to_slate_view<dA_t::is_stride_order_C()>(A);
   if constexpr (::nda::mem::on_host<local_Array_t>) {
+    slate::Options const opts = {
+#if defined(USE_SLATE_HOSTBATCH)
+	{ slate::Option::Target, slate::Target::HostBatch }
+#endif
+	};
     slate::Pivots pivots;
-    long info = slate::getrf ( As , pivots
-#if defined(USE_SLATE_HOSTBATCH)
-	,{ { slate::Option::Target, slate::Target::HostBatch} }
-#endif
-	);
+    long info = slate::getrf ( As , pivots, opts );
     utils::check(info == 0, "inverse: getrf info: {}.", info);
-    slate::getri ( As , pivots 
-#if defined(USE_SLATE_HOSTBATCH)
-	,{ { slate::Option::Target, slate::Target::HostBatch} }
-    utils::check(info == 0, "inverse: getri info: {}.", info);
-#endif
-	);
+    // slate::getri returns void; there is no info to check.
+    slate::getri ( As , pivots, opts );
   } else {
+    slate::Options const opts = {
+        // Set execution target to GPU Devices
+        { slate::Option::Target, slate::Target::Devices },
+        { slate::Option::Lookahead, 1 }};
     slate::Pivots pivots ;
-    long info = slate::getrf ( As , pivots,
-        // Set execution target to GPU Devices
-        {{ slate::Option::Target, slate::Target::Devices },
-        { slate::Option::Lookahead, 1 }});
+    long info = slate::getrf ( As , pivots, opts );
     utils::check(info == 0, "inverse: getrf info: {}.", info);
-    // slate::getri returns void; do not capture into long.
-    slate::getri ( As , pivots,
-        // Set execution target to GPU Devices
-        {{ slate::Option::Target, slate::Target::Devices },
-        { slate::Option::Lookahead, 1 }} );
+    // The in-place slate::getri does NOT run on the GPU whatever Target is asked for:
+    // every internal op in impl::getri is hardcoded to Target::HostTask, and it reaches
+    // tiles through A(i,j) == at(i,j,HostNum), which does not exist for a device-resident
+    // matrix. Slate says so itself ("This routine is in-place and does not support GPUs.
+    // There is another one (out-of-place) that does"). So use the out-of-place form,
+    // which is just set(I) + getrs -- both of which have real Target::Devices paths --
+    // and copy the result back over A. Bs mirrors As' distribution exactly (emptyLike)
+    // and slate allocates its tiles from its own device pool.
+    auto Bs = As.emptyLike();
+    Bs.insertLocalTiles( slate::Target::Devices );
+    slate::getri ( As , pivots, Bs, opts );  // Bs = As^{-1}; As keeps its LU factors
+    slate::copy ( Bs, As, opts );            // back into the caller's device memory
   }
 #else
   utils::check(false, "inverse: requires SLATE, compile with ENABLE_SLATE.");

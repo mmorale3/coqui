@@ -22,6 +22,7 @@
 #ifndef METHODS_ERI_THC_THC_H
 #define METHODS_ERI_THC_THC_H
 
+#include <cstdlib>
 #include <tuple>
 #include <iomanip>
 #include <optional>
@@ -43,6 +44,9 @@
 #include "nda/nda.hpp"
 #include "numerics/fft/nda.hpp"
 #include "numerics/distributed_array/nda.hpp"
+#include "numerics/distributed_array/matrix_array.hpp"
+#include "numerics/distributed_array/slate_ops_matrix_array.hpp"
+#include "numerics/distributed_array/matrix_array_redistribute.hpp"
 #include "numerics/distributed_array/h5.hpp"
 #include "numerics/shared_array/nda.hpp"
 

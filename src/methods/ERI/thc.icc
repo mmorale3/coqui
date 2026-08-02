@@ -1513,9 +1513,6 @@ auto thc::intvec_impl(nda::MemoryArrayOfRank<1> auto const& IPts,
 {
   Timer.start("IntVecs");
   using local_Array_t = memory::array<MEM,ComplexType,3>;
-  // MAM: temporary HACK until I figure out why slate::lu_solve seg faults with device memory
-  using local_uArray_t = std::conditional_t<MEM==HOST_MEMORY, memory::host_array<ComplexType,3>,
-          						  memory::unified_array<ComplexType,3>>; 
   app_log(1,"*********************************************************************");
   app_log(1,"  ISDF - fitting interpolating vectors to pair densities ");
   app_log(1,"*********************************************************************");
@@ -1580,11 +1577,76 @@ auto thc::intvec_impl(nda::MemoryArrayOfRank<1> auto const& IPts,
   Timer.start("LSSolve");
   // ls-solve IVecs = ls_solve( (C^H*C), (C^H*Z) )
   // conjugate and use transposed (e.g. in column-major)
-  using lArray_t = std::conditional_t<MEM==HOST_MEMORY, memory::host_array<ComplexType,2>,
-                                      memory::unified_array<ComplexType,2>>;
-  {
-    mpi3::communicator q_intra_comm = mpi->comm.split(C_quv.origin()[0],mpi->comm.rank());   
-    for( auto [iq,q] : itertools::enumerate(Z_quG.local_range(0)) ) { 
+  // Was forced to unified memory while slate::lu_solve/least_squares_solve seg faulted on
+  // device memory. The cause was in make_slate: it handed slate the device pointer tagged as
+  // a HostNum tile, so slate ran its host-side work and its non-GPU-aware MPI straight on
+  // device memory -- which only survives when the pointer happens to be host-dereferenceable.
+  // Slate is told the correct address space now, so these stay in MEM.
+  using lArray_t = memory::array<MEM,ComplexType,2>;
+
+  // ---- COQUI_THC_SOLVE_DEBUG: compare the two solve paths on identical input -------------
+  // Valid only when the (u,v)/(u,G) axes are NOT distributed (pgrid3D[1]==pgrid3D[2]==1), which
+  // is the case at the rank counts where both paths run: each rank then holds the full matrix
+  // for its own q's, so the residual ||C*X - Z|| can be formed with a purely local gemm.
+  const bool thc_solve_dbg = (std::getenv("COQUI_THC_SOLVE_DEBUG") != nullptr)
+                             and pgrid3D[1] == 1 and pgrid3D[2] == 1;
+  memory::array<MEM,ComplexType,2> dbg_C, dbg_Z;
+  if (thc_solve_dbg and Z_quG.local_shape()[0] > 0) {
+    dbg_C = memory::array<MEM,ComplexType,2>(nIpts, nIpts);
+    dbg_Z = memory::array<MEM,ComplexType,2>(nIpts, Z_quG.global_shape()[2]);
+    dbg_C() = C_quv.local()(0,all,all);
+    dbg_Z() = Z_quG.local()(0,all,all);
+    auto Ch = nda::to_host(dbg_C);
+    double herm = 0.0, cmax = 0.0, zmax = 0.0;
+    for (long i = 0; i < nIpts; ++i)
+      for (long j = 0; j < nIpts; ++j) {
+        herm = std::max(herm, std::abs(Ch(i,j) - std::conj(Ch(j,i))));
+        cmax = std::max(cmax, std::abs(Ch(i,j)));
+      }
+    auto Zh = nda::to_host(dbg_Z);
+    for (long i = 0; i < Zh.extent(0); ++i)
+      for (long j = 0; j < Zh.extent(1); ++j) zmax = std::max(zmax, std::abs(Zh(i,j)));
+    app_log(1, "  [THC_SOLVE_DEBUG] pre-solve q0: max|C|={:.10e} max|Z|={:.10e} "
+               "max|C-C^H|={:.6e}  (block_cyclic={})",
+            cmax, zmax, herm, int(math::nda::use_block_cyclic_slate()));
+  }
+
+  if( math::nda::use_block_cyclic_slate() ) {
+
+    // Block-cyclic path. C_quv/Z_quG are redistributed into 2D block-cyclic, tile-major
+    // storage (distributed_matrix_array) before the solve. Two reasons:
+    //  - slate's batched device path requires one leading dimension per operand within a
+    //    (mb,nb) region; tiles that are views into a single large local block do not satisfy
+    //    that, which is what aborts in device_regions_build at any grid with np_u*np_v > 1.
+    //  - block cyclic is the distribution slate is tuned for, on host as well as device: the
+    //    single-large-block layout load-balances a distributed factorization poorly.
+    // See perf_report/slate_array_design.md.
+    using ma_t = memory::dmatrix_array_t<MEM,ComplexType,1,mpi3::communicator>;
+    Timer.start("LSSolve_REDIST");
+    ma_t Cma(mpi->comm, pgrid3D, {C_quv.global_shape()[0],nIpts,nIpts},
+             {block_size[1],block_size[1]});
+    ma_t Zma(mpi->comm, pgrid3D, {Z_quG.global_shape()[0],nIpts,Z_quG.global_shape()[2]},
+             {block_size[1],block_size[2]});
+    math::nda::redistribute_to_matrix_array(C_quv, Cma);
+    math::nda::redistribute_to_matrix_array(Z_quG, Zma);
+    Timer.stop("LSSolve_REDIST");
+
+    if (use_least_squares) {
+      long info = math::nda::slate_ops::least_squares_solve(Cma,Zma);
+      utils::check(info==0,"  thc::evaluate::least_squares_solve returned info={}.",info);
+    } else {
+      long info = math::nda::slate_ops::lu_solve(Cma,Zma);
+      utils::check(info==0,"  thc::evaluate::lu_solve returned info={}.",info);
+    }
+
+    // the solution replaces Z_quG; C_quv is not read again before it is overwritten below
+    Timer.start("LSSolve_REDIST");
+    math::nda::redistribute_from_matrix_array(Zma, Z_quG);
+    Timer.stop("LSSolve_REDIST");
+
+  } else {
+    mpi3::communicator q_intra_comm = mpi->comm.split(C_quv.origin()[0],mpi->comm.rank());
+    for( auto [iq,q] : itertools::enumerate(Z_quG.local_range(0)) ) {
 
       // this should be a standalone function, for slicing distributed arrays
       auto C2D = C_quv.local()(iq,all,all);
@@ -1593,28 +1655,113 @@ auto thc::intvec_impl(nda::MemoryArrayOfRank<1> auto const& IPts,
                 {pgrid3D[1],pgrid3D[2]}, {nIpts,nIpts}, {C_quv.origin()[1], C_quv.origin()[2]},
                 {block_size[1],block_size[1]}, C2D);
       memory::darray_view_t<lArray_t,mpi3::communicator> Ziq(std::addressof(q_intra_comm),
-                {pgrid3D[1],pgrid3D[2]}, {nIpts,Z_quG.global_shape()[2]}, 
+                {pgrid3D[1],pgrid3D[2]}, {nIpts,Z_quG.global_shape()[2]},
                 {Z_quG.origin()[1], Z_quG.origin()[2]},
                 {block_size[1],block_size[2]}, Z2D);
 
       if (use_least_squares) {
         long info = math::nda::slate_ops::least_squares_solve<true>(Ciq,Ziq);
         utils::check(info==0,"  thc::evaluate::least_squares_solve returned info={}.",info);
-      } else { 
+      } else {
         long info = math::nda::slate_ops::lu_solve<true>(Ciq,Ziq);
         utils::check(info==0,"  thc::evaluate::lu_solve returned info={}.",info);
       }
-    } 
+    }
+  }
+  if (thc_solve_dbg and Z_quG.local_shape()[0] > 0) {
+    // R = C*X - Z_orig, formed locally (the axes are not distributed here)
+    auto X = memory::array<MEM,ComplexType,2>(nIpts, Z_quG.global_shape()[2]);
+    X() = Z_quG.local()(0,all,all);
+    auto R = memory::array<MEM,ComplexType,2>(nIpts, Z_quG.global_shape()[2]);
+    nda::blas::gemm(ComplexType(1.0), dbg_C, X, ComplexType(0.0), R);
+    auto Rh = nda::to_host(R);
+    auto Zh = nda::to_host(dbg_Z);
+    auto Xh = nda::to_host(X);
+    double rmax = 0.0, xmax = 0.0, xsum = 0.0;
+    for (long i = 0; i < Rh.extent(0); ++i)
+      for (long j = 0; j < Rh.extent(1); ++j) {
+        rmax = std::max(rmax, std::abs(Rh(i,j) - Zh(i,j)));
+        xmax = std::max(xmax, std::abs(Xh(i,j)));
+        xsum += std::abs(Xh(i,j));
+      }
+    app_log(1, "  [THC_SOLVE_DEBUG] post-solve q0: ||C*X-Z||_max={:.6e}  max|X|={:.10e}  "
+               "sum|X|={:.10e}  (block_cyclic={})",
+            rmax, xmax, xsum, int(math::nda::use_block_cyclic_slate()));
+
+    // Dump C, and the first columns of Z and X, so the two paths can be compared exactly
+    // offline: which system each X actually solves, and whether C is singular.
+    char const* dump = std::getenv("COQUI_THC_SOLVE_DUMP");
+    if (dump != nullptr and mpi->comm.rank() == 0) {
+      long ncol = std::min(64l, Zh.extent(1));
+      nda::array<ComplexType,2> Zc(Zh.extent(0), ncol), Xc(Xh.extent(0), ncol);
+      for (long i = 0; i < Zh.extent(0); ++i)
+        for (long j = 0; j < ncol; ++j) { Zc(i,j) = Zh(i,j); Xc(i,j) = Xh(i,j); }
+      auto Ch2 = nda::to_host(dbg_C);
+      h5::file f(std::string(dump), 'w');
+      h5::group g(f);
+      nda::h5_write(g, "C",  Ch2, false);
+      nda::h5_write(g, "Z",  Zc,  false);
+      nda::h5_write(g, "X",  Xc,  false);
+      app_log(1, "  [THC_SOLVE_DEBUG] dumped C({},{}) Z/X({},{}) to {}",
+              Ch2.extent(0), Ch2.extent(1), Zc.extent(0), ncol, dump);
+    }
   }
   Timer.stop("LSSolve");
   Timer.stop("IntVecs"); 
 
   if constexpr (return_coul_matrix) {
 
+    // C_quv = Z_quG * Z_quG^H, routed through the block-cyclic container when it is enabled.
+    // The legacy single-block layout cannot be used for this gemm at any grid with
+    // pgrid3D[1]*pgrid3D[2] > 1: its tiles are views into one large local block, so their
+    // leading dimension is the block's lld rather than mb, and slate's device_regions_build
+    // asserts on the mismatch. Both call sites below need it, hence the lambda.
+    using ma_t = memory::dmatrix_array_t<MEM,ComplexType,1,mpi3::communicator>;
+    auto multiply_ZZh_into_C = [&]() {
+      if( math::nda::use_block_cyclic_slate() ) {
+        Timer.start("ZBAR_REDIST");
+        ma_t Zma(mpi->comm, pgrid3D, Z_quG.global_shape(), {block_size[1],block_size[2]});
+        ma_t Cma(mpi->comm, pgrid3D, C_quv.global_shape(), {block_size[1],block_size[1]});
+        math::nda::redistribute_to_matrix_array(Z_quG, Zma);
+        Timer.stop("ZBAR_REDIST");
+        math::nda::slate_ops::multiply(Zma, math::nda::dagger(Zma), Cma);
+        Timer.start("ZBAR_REDIST");
+        math::nda::redistribute_from_matrix_array(Cma, C_quv);
+        Timer.stop("ZBAR_REDIST");
+      } else {
+        math::nda::slate_ops::multiply(Z_quG, dagger(Z_quG), C_quv);
+      }
+    };
+
     // First compute the inverse of overlap matrices
     Timer.start("ZBAR");
-    math::nda::slate_ops::multiply(Z_quG, dagger(Z_quG), C_quv);
-    {
+    multiply_ZZh_into_C();
+    if( math::nda::use_block_cyclic_slate() ) {
+
+      // C := C^{-1}, all q's at once rather than the round-robin over local q below.
+      Timer.start("ZBAR_REDIST");
+      ma_t Cma(mpi->comm, pgrid3D, C_quv.global_shape(), {block_size[1],block_size[1]});
+      math::nda::redistribute_to_matrix_array(C_quv, Cma);
+      Timer.stop("ZBAR_REDIST");
+
+      if (use_least_squares) {
+        // mirror the legacy path exactly: solve C X = I instead of factorizing and inverting
+        ma_t Bma(mpi->comm, pgrid3D, C_quv.global_shape(), {block_size[1],block_size[1]});
+        Bma.set_identity();
+        long info = math::nda::slate_ops::least_squares_solve(Cma,Bma);
+        utils::check(info==0,"  thc::evaluate::least_squares_solve returned info={}.",info);
+        // Bma holds the inverse; the two containers have identical shape, tiling and grid,
+        // so their buffers are element-for-element equivalent.
+        Cma.buffer() = Bma.buffer();
+      } else {
+        math::nda::slate_ops::inverse(Cma);
+      }
+
+      Timer.start("ZBAR_REDIST");
+      math::nda::redistribute_from_matrix_array(Cma, C_quv);
+      Timer.stop("ZBAR_REDIST");
+
+    } else {
       std::vector<std::pair<long,long> > diag_idx;
       for (auto [iu, u] : itertools::enumerate(C_quv.local_range(1))) {
         for (auto [iv, v] : itertools::enumerate(C_quv.local_range(2))) {
@@ -1627,11 +1774,18 @@ auto thc::intvec_impl(nda::MemoryArrayOfRank<1> auto const& IPts,
                                                      {nIpts,nIpts},{block_size[1],block_size[1]});
       Timer.stop("ALLOC");
       auto buf_loc = buffer.local();
+      // Build the local identity block once on the host and mirror it into MEM. Filling
+      // the diagonal element by element is a host store through operator(), which is
+      // invalid on device memory -- the reason this buffer used to be forced to unified.
+      memory::array<MEM,ComplexType,2> Id_loc;
+      {
+        nda::array<ComplexType,2> Id_h(buf_loc.extent(0), buf_loc.extent(1));
+        Id_h() = ComplexType(0.0);
+        for (auto idx: diag_idx) Id_h(idx.first, idx.second) = ComplexType(1.0);
+        Id_loc = memory::to_memory_space<MEM>(Id_h);
+      }
       for (auto [iq, q]: itertools::enumerate(C_quv.local_range(0))) {
-        buf_loc() = ComplexType(0.0);
-        for (auto idx: diag_idx) {
-          buf_loc(idx.first, idx.second) = ComplexType(1.0);
-        }
+        buf_loc = Id_loc;
         auto C2D = C_quv.local()(iq, all, all);
 
         memory::darray_view_t <lArray_t, mpi3::communicator> Ciq(std::addressof(q_intra_comm),
@@ -1652,10 +1806,24 @@ auto thc::intvec_impl(nda::MemoryArrayOfRank<1> auto const& IPts,
     if( return_Sinv_Ivec ) {
       // construct IquG
       Timer.start("ALLOC");
-      IquG = make_distributed_array<local_uArray_t>(mpi->comm,pgrid3D,Z_quG.global_shape(),
-                  Z_quG.block_size());  
+      IquG = make_distributed_array<local_Array_t>(mpi->comm,pgrid3D,Z_quG.global_shape(),
+                  Z_quG.block_size());
       Timer.stop("ALLOC");
-      math::nda::slate_ops::multiply(C_quv, Z_quG, *IquG);
+      if( math::nda::use_block_cyclic_slate() ) {
+        Timer.start("ZBAR_REDIST");
+        ma_t Cma(mpi->comm, pgrid3D, C_quv.global_shape(), {block_size[1],block_size[1]});
+        ma_t Zma(mpi->comm, pgrid3D, Z_quG.global_shape(), {block_size[1],block_size[2]});
+        ma_t Ima(mpi->comm, pgrid3D, Z_quG.global_shape(), {block_size[1],block_size[2]});
+        math::nda::redistribute_to_matrix_array(C_quv, Cma);
+        math::nda::redistribute_to_matrix_array(Z_quG, Zma);
+        Timer.stop("ZBAR_REDIST");
+        math::nda::slate_ops::multiply(Cma, Zma, Ima);
+        Timer.start("ZBAR_REDIST");
+        math::nda::redistribute_from_matrix_array(Ima, *IquG);
+        Timer.stop("ZBAR_REDIST");
+      } else {
+        math::nda::slate_ops::multiply(C_quv, Z_quG, *IquG);
+      }
     }    
 
     auto Zloc = Z_quG.local();
@@ -1713,7 +1881,7 @@ auto thc::intvec_impl(nda::MemoryArrayOfRank<1> auto const& IPts,
                                  ComplexType(1.0),Zloc(iq,all,all),"ug",nda::tensor::op::MUL);
       }
     }
-    math::nda::slate_ops::multiply(Z_quG,dagger(Z_quG),C_quv);
+    multiply_ZZh_into_C();
     nda::tensor::scale(ComplexType(1.0)/mf->volume()/mf->nkpts(), C_quv.local());
     Timer.stop("VCoul");
     if constexpr (MEM==DEVICE_MEMORY) {
@@ -1812,6 +1980,11 @@ auto thc::intvec_impl(int iq, nda::MemoryArrayOfRank<1> auto const& IPts,
     auto Tl_1D = nda::reshape(Tl.local(),shape_t<1>{Tl.local().size()});
     auto Tr_1D = nda::reshape(Tr.local(),shape_t<1>{Tr.local().size()});
 
+    // scratch for the device accumulation below; tensor::elementwise is binary, so
+    // conj(Tl)*Tr has to land somewhere before being added into ChC_uv
+    [[maybe_unused]] memory::array<MEM,ComplexType,1> Tacc;
+    if constexpr (MEM!=HOST_MEMORY) Tacc = memory::array<MEM,ComplexType,1>(Tl_1D.extent(0));
+
     for( int is=0; is<nspins; ++is )
     {
       for( int k=0; k<nkpts; ++k )
@@ -1829,8 +2002,15 @@ auto thc::intvec_impl(int iq, nda::MemoryArrayOfRank<1> auto const& IPts,
         }
 
         // (C^H*C)(u,v) += sum_k conj(Ta(k,p,u)) * Tb(k,p,v)
-        for (int uv = 0; uv < ChC_uv_1D.extent(0); ++uv)
-          ChC_uv_1D(uv) += std::conj(Tl_1D(uv)) * Tr_1D(uv);
+        if constexpr (MEM==HOST_MEMORY) {
+          for (int uv = 0; uv < ChC_uv_1D.extent(0); ++uv)
+            ChC_uv_1D(uv) += std::conj(Tl_1D(uv)) * Tr_1D(uv);
+        } else {
+          Tacc = Tr_1D;
+          nda::tensor::elementwise(ComplexType(1.0),nda::conj(Tl_1D),"u",
+                                   ComplexType(1.0),Tacc,"u",nda::tensor::op::MUL);
+          nda::tensor::add(ComplexType(1.0),Tacc,"u",ComplexType(1.0),ChC_uv_1D,"u");
+        }
       }
     }
   }
@@ -1853,7 +2033,11 @@ auto thc::intvec_impl(int iq, nda::MemoryArrayOfRank<1> auto const& IPts,
     Sloc() = 0.0;
 
     // conjugate Pb, to avoid needing to dispatch the unary operation later
-    for( auto& v: Pb ) v = std::conj(v);
+    if constexpr (MEM==HOST_MEMORY) {
+      for( auto& v: Pb ) v = std::conj(v);
+    } else {
+      nda::tensor::scale(ComplexType(1.0),Pb,nda::tensor::op::CONJ);
+    }
 
     // batch over kpoints later!!! 
     memory::array<MEM,ComplexType,3> A(1,a_rg.size(),nIpts);
@@ -1868,9 +2052,17 @@ auto thc::intvec_impl(int iq, nda::MemoryArrayOfRank<1> auto const& IPts,
         for( auto [ik,k] : itertools::enumerate(kp_rg) ) {
           nda::blas::gemm(Bloc(in,is,ik,all,all),Pb(is,ik,all,all),A(0,all,all));
           // this becomes batched Ci = sum_j Aij * Bij --> contract(A,01,B,01,C,0);
-          for( auto [ia,a] : itertools::enumerate(a_rg) )
-            for( auto v : itertools::range(nIpts) )
-              Sloc(in,v) += Pa(is,ik,ia,v) * A(0,ia,v);
+          if constexpr (MEM==HOST_MEMORY) {
+            for( auto [ia,a] : itertools::enumerate(a_rg) )
+              for( auto v : itertools::range(nIpts) )
+                Sloc(in,v) += Pa(is,ik,ia,v) * A(0,ia,v);
+          } else {
+            // S(n,v) += sum_a Pa(is,ik,a,v) * A(0,a,v)
+            auto S_n = Sloc(in,all);
+            auto A_2D = A(0,all,all);
+            nda::tensor::contract(ComplexType(1.0),Pa(is,ik,all,all),"av",
+                                  A_2D,"av",ComplexType(1.0),S_n,"v");
+          }
         }
       }
     }
@@ -1885,7 +2077,11 @@ auto thc::intvec_impl(int iq, nda::MemoryArrayOfRank<1> auto const& IPts,
   {    
     long info=0;
     // simple trick to avoid transposing into F_layout arrays, works because ChC is hermitian
-    for( auto& v: ChC_uv.local() ) v = std::conj(v); // conjugate
+    if constexpr (MEM==HOST_MEMORY) {
+      for( auto& v: ChC_uv.local() ) v = std::conj(v); // conjugate
+    } else {
+      nda::tensor::scale(ComplexType(1.0),ChC_uv.local(),nda::tensor::op::CONJ);
+    }
 #if defined(ENABLE_SLATE)
     auto As = math::nda::slate_ops::detail::to_slate_view<true>(ChC_uv);
     auto Bs = math::nda::slate_ops::detail::to_slate_view<true>(Snv);
@@ -1931,7 +2127,11 @@ auto thc::intvec_impl(int iq, nda::MemoryArrayOfRank<1> auto const& IPts,
     // return coulomb matrix
     // V = transpose(Snv) * conj(Snv) => dagger(conj(Snv)) * conj(Snv)
     Timer.start("GEMM");
-    for( auto& v: Snv.local() ) v = std::conj(v); // conjugate
+    if constexpr (MEM==HOST_MEMORY) {
+      for( auto& v: Snv.local() ) v = std::conj(v); // conjugate
+    } else {
+      nda::tensor::scale(ComplexType(1.0),Snv.local(),nda::tensor::op::CONJ);
+    }
     math::nda::slate_ops::multiply(math::nda::dagger(Snv),Snv,ChC_uv);
     Timer.stop("GEMM");
     return ChC_uv;
