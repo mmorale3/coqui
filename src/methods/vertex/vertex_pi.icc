@@ -444,11 +444,12 @@ namespace vertex_pi {
    *                    carry the FULL transfer mesh, and G/X are full-BZ objects.
    */
   template<nda::MemoryArrayOfRank<5> GArr, nda::MemoryArrayOfRank<4> XArr,
-           nda::MemoryArrayOfRank<3> ZArr>
+           nda::MemoryArrayOfRank<3> ZArr,
+           nda::MemoryArrayOfRank<4> WdynArr = nda::array<ComplexType, 4>>
   void pi_c_accumulate_w(imag_axes_ft::IAFT const& ft, iaft_tools& tools,
                          GArr const& G_tskij, XArr const& X_skPa,
                          ZArr const& Z_qPQ,
-                         nda::array<ComplexType, 4> const* Wdyn_qwPQ,
+                         WdynArr const* Wdyn_qwPQ,
                          nda::array<long, 2> const& kmq,
                          nda::array<long, 2> const& kpq,
                          nda::range C,
@@ -921,11 +922,12 @@ namespace vertex_pi {
    * @param Pi0_qMN     - [OUTPUT, accumulated] (nq_ext, Np, Np).
    */
   template<nda::MemoryArrayOfRank<5> GArr, nda::MemoryArrayOfRank<4> XArr,
-           nda::MemoryArrayOfRank<3> ZArr>
+           nda::MemoryArrayOfRank<3> ZArr,
+           nda::MemoryArrayOfRank<4> WdynArr = nda::array<ComplexType, 4>>
   void pi_dyn_factorized(iaft_tools const& tools,
                          GArr const& G_tskij, XArr const& X_skPa,
                          ZArr const& Z_qPQ,
-                         nda::array<ComplexType, 4> const* Wdyn_qwPQ,
+                         WdynArr const* Wdyn_qwPQ,
                          nda::array<long, 2> const& kmq,
                          nda::array<long, 2> const& kpq,
                          nda::range C,

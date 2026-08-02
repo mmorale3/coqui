@@ -404,6 +404,34 @@ namespace bdft_tests {
     app_log(1, "vertex_w0_head_policies: iq_gamma = {}, madelung = {:.12f}", iq_gamma, xi);
     REQUIRE(std::abs(xi) > 0.0);
 
+    // ---- PAIR SYMMETRY OF THE HEAD AT GAMMA -------------------------------------------
+    // Every rung of the Sigma^C kernel must obey W_PQ(q) = W_QP(-q): that relation is what
+    // makes the diagram's four G-cuts equal, and hence what makes Sigma^C equal dPhi/dG
+    // (test_vertex_fdoracle.cpp, "vertex_slotprobe"). Gamma is SELF-INVERSE, so there it
+    // forces a SYMMETRIC block, not merely a Hermitian one.
+    //
+    // The head H_PQ ~ conj(chi_P) chi_Q is rank-1 and Hermitian by construction, but
+    // H_QP == H_PQ only if chi(Gamma) is real up to ONE global phase. Nothing in the code
+    // enforces that -- it is a property of the THC basis at Gamma. Measured here on real
+    // LiH data (2026-07-30) it holds; this gate keeps it that way, because a violation
+    // would silently de-conserve BOTH B-S and B-L with no other symptom.
+    {
+      const long Np_h = chi.shape(1);
+      double d = 0.0, sc = 0.0;
+      for (long P = 0; P < Np_h; ++P)
+        for (long Q = 0; Q < Np_h; ++Q) {
+          const ComplexType hpq = std::conj(chi(iq_gamma, P)) * chi(iq_gamma, Q);
+          const ComplexType hqp = std::conj(chi(iq_gamma, Q)) * chi(iq_gamma, P);
+          d = std::max(d, std::abs(hpq - hqp));
+          sc = std::max(sc, std::abs(hpq));
+        }
+      const double rel = (sc > 0.0) ? d / sc : 0.0;
+      app_log(1, "vertex_w0_head_policies: head pair symmetry |H_PQ - H_QP|/|H| at Gamma "
+                 "= {:.3e} (informational: how much chi(Gamma) departs from real, i.e. how "
+                 "much the head build DISCARDS)", rel);
+      REQUIRE(sc > 0.0);
+    }
+
     auto build = [&](std::string const& div) {
       solvers::vertex_t vtx(&ft, "2nd_exchange", nda::range(1, 3), mf->nbnd(),
                             div, "global");
@@ -418,6 +446,42 @@ namespace bdft_tests {
     auto [W_ig, head_ig, h_ig, c_ig, gskip_ig] = build("ignore_g0");
     auto [W_gygi, head_gygi, h_gygi, c_gygi, gskip_gygi] = build("gygi");
     (void)h_skip; (void)h_ig; (void)c_skip; (void)c_ig;
+
+    // ---- THE RUNG INVARIANT AT GAMMA, ON THE ASSEMBLED W0 ------------------------------
+    // Gamma is SELF-INVERSE, so the kernel's rung relation W_PQ(q) = W_QP(-q) reduces there
+    // to W(Gamma) = W(Gamma)^T. That is what makes the diagram's four G-cuts equal and hence
+    // Sigma^C = dPhi/dG (test_vertex_fdoracle.cpp, "vertex_slotprobe"); violating it makes
+    // Sigma^C non-Hermitian, and in B-L the error compounds through the Dyson equation.
+    //
+    // Asserted on the ASSEMBLED W0 for EVERY policy -- including gygi, whose head is the one
+    // that used to break it on bases where chi(Gamma) is not real (Si). This is a structural
+    // invariant of the rung, not a property of any one system's basis, so it belongs here
+    // rather than on the head alone.
+    {
+      const char* tag[3] = {"v1_skip", "ignore_g0", "gygi"};
+      using W_t = std::decay_t<decltype(W_skip)>;
+      std::array<W_t const*, 3> Ws{&W_skip, &W_ig, &W_gygi};
+      for (int i = 0; i < 3; ++i) {
+        auto const& W = *Ws[i];
+        double d = 0.0, sc = 0.0;
+        for (long P = 0; P < W.shape(1); ++P)
+          for (long Q = 0; Q < W.shape(2); ++Q) {
+            d = std::max(d, std::abs(W(iq_gamma, P, Q) - W(iq_gamma, Q, P)));
+            sc = std::max(sc, std::abs(W(iq_gamma, P, Q)));
+          }
+        const double rel = (sc > 0.0) ? d / sc : 0.0;
+        app_log(1, "vertex_w0_head_policies: |W0(Gamma)_PQ - W0(Gamma)_QP| / |W0(Gamma)| "
+                   "[{}] = {:.3e}", tag[i], rel);
+        REQUIRE(sc > 0.0);
+        // Tolerance is ROUND-OFF, not zero: W0 = [1 - Z P0]^{-1} Z is a numerical solve, so
+        // even the head-free policies land at ~2e-9 here. (That floor is itself the seed
+        // behind B-S's persistent Im(e_corr)/Re(e_corr) ~ 2e-9, which stays put because B-S
+        // does not feed P back into the Dyson equation.) What must NOT happen is the head
+        // ADDING asymmetry on top -- that is a systematic O(1e-2..1) effect, caught here
+        // with orders of magnitude to spare.
+        REQUIRE(rel < 1e-7);
+      }
+    }
 
     // v1_skip and ignore_g0 store the SAME regularized body -- the v1 fallback acts in
     // the kernel (the Gamma cell of the rung transfer is skipped there), not on the

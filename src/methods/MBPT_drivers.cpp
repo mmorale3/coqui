@@ -330,6 +330,9 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     auto vertex_isdf_svd_tol = io::get_value_with_default<double>(pt,"vertex_isdf_svd_tol",1e-8);
     // Secondary-ISDF point-selection thresh (-1 = default to the global THC thresh)
     auto vertex_isdf_thresh = io::get_value_with_default<double>(pt,"vertex_isdf_thresh",-1.0);
+    // distr_tol for the SECONDARY basis' private thc builder (rank-cap lift; <= 0 =
+    // builder default 0.2, today's behavior). 1.0 lifts kp444/M8 to 260 ranks.
+    auto vertex_isdf_distr_tol = io::get_value_with_default<double>(pt,"vertex_isdf_distr_tol",-1.0);
     // Conditioning cap on the secondary metric s(q) (<=0 = disabled). >0 prunes the
     // near-dependent tail of the selected basis so cond(s) stays under this value.
     auto vertex_isdf_cond_max = io::get_value_with_default<double>(pt,"vertex_isdf_cond_max",-1.0);
@@ -354,6 +357,40 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     auto vertex_pidyn = io::get_value_with_default<std::string>(pt,"vertex_pidyn","factorized");
     io::tolower(vertex_pidyn);
     auto vertex_pidyn_tol = io::get_value_with_default<double>(pt,"vertex_pidyn_tol",-1.0);
+    // Project the rank-1 head channel out of the response middle factor at q = Gamma.
+    // 🚨 DEFAULT false SINCE 2026-07-31: it BREAKS PHI-DERIVABILITY (the B-L G-side oracle
+    // goes from 3.3e-11 to 1.6e-01 when only 20 % of the channel is removed) and is applied
+    // to the Sigma cut only, leaving eval_Pi_C's P^{C,L} untouched. It does control the
+    // COLD-START basin, so it survives as a diagnostic. See vertex_t.h and
+    // notes/bl_head_channel_diagnosis.md.
+    auto vertex_bl_head_projection =
+        io::get_value_with_default<bool>(pt,"vertex_bl_head_projection",false);
+    // DIAGNOSTIC, default false, NOT physical: freeze pi^dyn's Gamma rung head at its
+    // i.nu = 0 weight. Tests whether the head's retardation is what breaks pi^dyn's
+    // q -> 0 head suppression (which Pi^{C,0}, whose head IS frozen, satisfies exactly).
+    auto vertex_bl_static_head =
+        io::get_value_with_default<bool>(pt,"vertex_bl_static_head",false);
+    // DIAGNOSTIC, default false, changes the KERNEL DEFINITION: take W0's Gamma head
+    // weight from the same (vertex-corrected) eps^-1 that W's head uses, instead of from
+    // W0's own RPA-only Dyson. Makes the head part of W(Gamma,0) - W0(Gamma) vanish; that
+    // head residue is 94 % of the whole measured |W(q,0) - W0(q)| on Si. See vertex_t.h.
+    auto vertex_bl_w0_head_from_w =
+        io::get_value_with_default<bool>(pt,"vertex_bl_w0_head_from_w",false);
+    // DIAGNOSTIC, default false, NOT physical: THE CONSTANT-RUNG ABSOLUTE PIN. Replaces
+    // pi^dyn's dynamic rung by the frequency-independent W0bar - Z, so pi^dyn's rung IS
+    // Pi^{C,0}'s rung and X^L must collapse to the DLR representability floor. A residual
+    // O(1) X^L convicts the equal-time path itself. See vertex_t.h.
+    auto vertex_bl_pidyn_const_rung =
+        io::get_value_with_default<bool>(pt,"vertex_bl_pidyn_const_rung",false);
+    // H1, the BALANCED FIRST-ORDER HEAD (default false pending the Gate-0/Gate-1 record
+    // and a defaults ruling; notes/bl_head_balance_theory_and_plan.md). In B-L only:
+    // every W input of the vertex functional carries W0's STATIC Gamma-head weight
+    // (instantaneous slot, 1 + eps_inv_head(i.nu=0); no dynamic-slot head), so the
+    // fluctuation dW = W - W0 carries no analytic head. CONSERVING (a modified
+    // interaction in Phi -- both cuts differentiate). B-S is bit-identical; the parent
+    // theory keeps its retarded head.
+    auto vertex_bl_head_static_all =
+        io::get_value_with_default<bool>(pt,"vertex_bl_head_static_all",false);
     // Wannier-projector subspace C (notes/wannier_projector_theory.md): when set, the
     // vertex subspace is span{ w_a(k) } from a TRIQS-compatible wan.h5 (proj_mat +
     // band_window) instead of the band window; U is Loewdin-orthonormalized at load.
@@ -376,6 +413,12 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
                              vertex_isdf_cond_max, vertex_rung);
     vertex.set_vertex_scale(vertex_scale, vertex_ramp_iters);
     vertex.set_pidyn_mode(vertex_pidyn, vertex_pidyn_tol);
+    vertex.set_bl_head_projection(vertex_bl_head_projection);
+    vertex.set_bl_static_head(vertex_bl_static_head);
+    vertex.set_bl_w0_head_from_w(vertex_bl_w0_head_from_w);
+    vertex.set_bl_pidyn_const_rung(vertex_bl_pidyn_const_rung);
+    vertex.set_bl_head_static_all(vertex_bl_head_static_all);
+    vertex.set_isdf_distr_tol(vertex_isdf_distr_tol);
     if (not vertex_div_treatment.empty()) vertex.set_div_treatment(vertex_div_treatment);
     if (vertex.enabled()) {
       utils::check(screen_type == "rpa" or screen_type == "rpa_k",
@@ -636,6 +679,9 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
     auto vertex_isdf_svd_tol = io::get_value_with_default<double>(pt,"vertex_isdf_svd_tol",1e-8);
     // Secondary-ISDF point-selection thresh (-1 = default to the global THC thresh)
     auto vertex_isdf_thresh = io::get_value_with_default<double>(pt,"vertex_isdf_thresh",-1.0);
+    // distr_tol for the SECONDARY basis' private thc builder (rank-cap lift; <= 0 =
+    // builder default 0.2, today's behavior). 1.0 lifts kp444/M8 to 260 ranks.
+    auto vertex_isdf_distr_tol = io::get_value_with_default<double>(pt,"vertex_isdf_distr_tol",-1.0);
     // Conditioning cap on the secondary metric s(q) (<=0 = disabled). >0 prunes the
     // near-dependent tail of the selected basis so cond(s) stays under this value.
     auto vertex_isdf_cond_max = io::get_value_with_default<double>(pt,"vertex_isdf_cond_max",-1.0);
@@ -660,6 +706,40 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
     auto vertex_pidyn = io::get_value_with_default<std::string>(pt,"vertex_pidyn","factorized");
     io::tolower(vertex_pidyn);
     auto vertex_pidyn_tol = io::get_value_with_default<double>(pt,"vertex_pidyn_tol",-1.0);
+    // Project the rank-1 head channel out of the response middle factor at q = Gamma.
+    // 🚨 DEFAULT false SINCE 2026-07-31: it BREAKS PHI-DERIVABILITY (the B-L G-side oracle
+    // goes from 3.3e-11 to 1.6e-01 when only 20 % of the channel is removed) and is applied
+    // to the Sigma cut only, leaving eval_Pi_C's P^{C,L} untouched. It does control the
+    // COLD-START basin, so it survives as a diagnostic. See vertex_t.h and
+    // notes/bl_head_channel_diagnosis.md.
+    auto vertex_bl_head_projection =
+        io::get_value_with_default<bool>(pt,"vertex_bl_head_projection",false);
+    // DIAGNOSTIC, default false, NOT physical: freeze pi^dyn's Gamma rung head at its
+    // i.nu = 0 weight. Tests whether the head's retardation is what breaks pi^dyn's
+    // q -> 0 head suppression (which Pi^{C,0}, whose head IS frozen, satisfies exactly).
+    auto vertex_bl_static_head =
+        io::get_value_with_default<bool>(pt,"vertex_bl_static_head",false);
+    // DIAGNOSTIC, default false, changes the KERNEL DEFINITION: take W0's Gamma head
+    // weight from the same (vertex-corrected) eps^-1 that W's head uses, instead of from
+    // W0's own RPA-only Dyson. Makes the head part of W(Gamma,0) - W0(Gamma) vanish; that
+    // head residue is 94 % of the whole measured |W(q,0) - W0(q)| on Si. See vertex_t.h.
+    auto vertex_bl_w0_head_from_w =
+        io::get_value_with_default<bool>(pt,"vertex_bl_w0_head_from_w",false);
+    // DIAGNOSTIC, default false, NOT physical: THE CONSTANT-RUNG ABSOLUTE PIN. Replaces
+    // pi^dyn's dynamic rung by the frequency-independent W0bar - Z, so pi^dyn's rung IS
+    // Pi^{C,0}'s rung and X^L must collapse to the DLR representability floor. A residual
+    // O(1) X^L convicts the equal-time path itself. See vertex_t.h.
+    auto vertex_bl_pidyn_const_rung =
+        io::get_value_with_default<bool>(pt,"vertex_bl_pidyn_const_rung",false);
+    // H1, the BALANCED FIRST-ORDER HEAD (default false pending the Gate-0/Gate-1 record
+    // and a defaults ruling; notes/bl_head_balance_theory_and_plan.md). In B-L only:
+    // every W input of the vertex functional carries W0's STATIC Gamma-head weight
+    // (instantaneous slot, 1 + eps_inv_head(i.nu=0); no dynamic-slot head), so the
+    // fluctuation dW = W - W0 carries no analytic head. CONSERVING (a modified
+    // interaction in Phi -- both cuts differentiate). B-S is bit-identical; the parent
+    // theory keeps its retarded head.
+    auto vertex_bl_head_static_all =
+        io::get_value_with_default<bool>(pt,"vertex_bl_head_static_all",false);
     // Wannier-projector subspace C (notes/wannier_projector_theory.md): when set, the
     // vertex subspace is span{ w_a(k) } from a TRIQS-compatible wan.h5 (proj_mat +
     // band_window) instead of the band window; U is Loewdin-orthonormalized at load.
@@ -682,6 +762,12 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
                              vertex_isdf_cond_max, vertex_rung);
     vertex.set_vertex_scale(vertex_scale, vertex_ramp_iters);
     vertex.set_pidyn_mode(vertex_pidyn, vertex_pidyn_tol);
+    vertex.set_bl_head_projection(vertex_bl_head_projection);
+    vertex.set_bl_static_head(vertex_bl_static_head);
+    vertex.set_bl_w0_head_from_w(vertex_bl_w0_head_from_w);
+    vertex.set_bl_pidyn_const_rung(vertex_bl_pidyn_const_rung);
+    vertex.set_bl_head_static_all(vertex_bl_head_static_all);
+    vertex.set_isdf_distr_tol(vertex_isdf_distr_tol);
     if (not vertex_div_treatment.empty()) vertex.set_div_treatment(vertex_div_treatment);
     if (vertex.enabled()) {
       utils::check(screen_type == "rpa" or screen_type == "rpa_k",

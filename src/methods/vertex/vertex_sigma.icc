@@ -76,6 +76,48 @@ namespace vertex_detail {
   using vshape_t = std::array<long, N>;
 
   /**
+   * TEST-ONLY hook, backing the slot-resolved cut-symmetry gate
+   * (test_vertex_fdoracle.cpp, "vertex_slotprobe"). Never set by production code.
+   *
+   * When a pointer is non-null the corresponding INTERNAL line of the Sigma^C pattern is
+   * read from it instead of from G_tskij:
+   *   B = G(k+qy)_{p3,p2'},  C = G(k-qx+qy)_{p4,p3'},  D = G(k-qx)_{p1,p4'}.
+   * This lets a test place a perturbation dG in ONE slot of the quartic form
+   *   F(g_A0, g_B, g_C, g_D) := T[ Sigma^C(g_B, g_C, g_D), g_A0 ]
+   * and so decide whether the kernel's Sigma really is dPhi/dG (which requires F to be
+   * invariant under the diagram's C4 rotation of the four slots) -- which no aggregate
+   * oracle can decide, because it only ever sees the AVERAGE of the four cuts.
+   * `only_term` likewise restricts the instantaneous reductions to one of S1/S2/S3, so a
+   * break can be attributed to a single term. Null/0 everywhere in production: the branch
+   * is hoisted out of the fill loops and the term gates are all open.
+   */
+  struct sigma_C_slot_probe_t {
+    nda::array<ComplexType, 5> const *B = nullptr;
+    nda::array<ComplexType, 5> const *C = nullptr;
+    nda::array<ComplexType, 5> const *D = nullptr;
+    int only_term = 0;   // 0 = all; 1 = S1 only; 2 = S2 only; 3 = S3 only
+    // T1 step 1, the per-q_x meter (notes/bl_head_balance_theory_and_plan.md section 5e
+    // item 4): when non-null the kernel RESIZES this to (nq, ns*nk_ext, nt, nbnd, nbnd),
+    // zeroes it at ENTRY (so after a run it holds the LAST evaluation only -- the same
+    // convention as the diag_* meters), and adds every combo's INSTANTANEOUS
+    // contribution St_ab into its (iqx, is*nk_ext+ik) slice. Rank-LOCAL partial sums
+    // over (combo, qy) tiles: the caller must all_reduce before reading. Summed over
+    // (iqx, isk) and scaled by the kernel's 1/nk^2 this reproduces the instantaneous
+    // part of Sigma^C summed over (s, k) exactly; per-iqx it is the q_x-resolved
+    // decomposition of whichever S-terms only_term leaves enabled.
+    nda::array<ComplexType, 5> *qx_St = nullptr;
+    // when non-null: overwritten at entry with the G_tskij the kernel consumed (the
+    // replicated input, so no reduction) -- the matching leg for any trace against
+    // qx_St. Without it a caller would contract against the POST-update_G G (trap 8).
+    nda::array<ComplexType, 5> *gA = nullptr;
+    void clear() {
+      B = nullptr; C = nullptr; D = nullptr; only_term = 0;
+      qx_St = nullptr; gA = nullptr;
+    }
+  };
+  inline sigma_C_slot_probe_t sigma_C_slot_probe{};
+
+  /**
    * Fused Sigma^C kernel, no-symmetry path. All inputs replicated per rank.
    *
    * @param ft          - IAFT instance (must hold the DLR backend; aborts on IR)
@@ -146,7 +188,8 @@ namespace vertex_detail {
    * @param Sigma_C_tskab - (nt_f, ns, nk_ext, nbnd, nbnd) OVERWRITTEN with Sigma^C(tau)
    */
   template<nda::MemoryArrayOfRank<5> GArr_t, nda::MemoryArrayOfRank<4> XArr_t,
-           nda::MemoryArrayOfRank<5> SArr_t>
+           nda::MemoryArrayOfRank<5> SArr_t,
+           nda::MemoryArrayOfRank<4> WwArr_t = nda::array<ComplexType, 4>>
   void eval_sigma_C_g3w2(imag_axes_ft::IAFT const &ft,
                          mpi3::communicator &comm,
                          nda::range C_rng,
@@ -159,7 +202,7 @@ namespace vertex_detail {
                          long iq_gamma,
                          bool skip_rung_gamma,
                          int rung_mode,
-                         nda::array<ComplexType, 4> const *Ww_override,
+                         WwArr_t const *Ww_override,
                          vertex_sym::sym_ctx const *symc,
                          SArr_t &&Sigma_C_tskab) {
 #ifndef ENABLE_DLR
@@ -247,6 +290,51 @@ namespace vertex_detail {
       return std::make_tuple(symc->q_star(iqx), bool(symc->q_trev(iqx)), symc->q_isym(iqx));
     };
 
+    // ---- RUNG PAIR SYMMETRY: W_{PQ}(q) == W_{QP}(-q) ----------------------
+    // Sigma^C is the Eq.-(10) pattern -- ONE of the four ways to cut a G line out of
+    // Phi_2. It equals dPhi/dG only because the diagram's C4 rotation makes all four cuts
+    // equal, and that rotation TRANSPOSES a rung's (row pair, col pair). So EVERY mode
+    // (B-S included) needs the rung to obey the relation above; it BINDS at a self-inverse
+    // transfer (q = -q: Gamma, and the zone-boundary points of an even mesh), where it
+    // forces the block to be SYMMETRIC and not merely Hermitian.
+    //
+    // A violation is invisible to every other check in the suite -- the W-side oracle, the
+    // Euler identities and the Sigma-vs-reference pins all still pass -- and shows up only
+    // as an O(10%) break of the G-side functional-derivative oracle, i.e. as a silently
+    // non-conserving self-energy. It is worth one O(nq Np^2) pass to say so out loud.
+    // (Only measurable on the full transfer mesh; under IBZ symmetry the stored rows are
+    // the irreducible ones and the -q partner is reconstructed inside the loop.)
+    if (sym)
+      app_log(2, "  eval_sigma_C: rung pair-symmetry check SKIPPED (IBZ storage: the -q "
+                 "partner is not a stored row).\n"
+                 "               Absence of a warning below is NOT evidence the rung is "
+                 "legal -- cross-check on a nosym mesh.");
+    auto rung_pair_asym = [&](auto const &Aq, const char *what) {
+      if (sym) return;                       // IBZ storage: -q is not a stored row
+      double d = 0.0, sc = 0.0;
+      for (long iq = 0; iq < nq_w; ++iq) {
+        const long iqm = qminus(iq);
+        for (long P = 0; P < Np; ++P)
+          for (long Q = 0; Q < Np; ++Q) {
+            d = std::max(d, std::abs(Aq(iq, P, Q) - Aq(iqm, Q, P)));
+            sc = std::max(sc, std::abs(Aq(iq, P, Q)));
+          }
+      }
+      const double rel = (sc > 0.0) ? d / sc : 0.0;
+      app_log(3, "  eval_sigma_C: rung pair symmetry |{}_PQ(q) - {}_QP(-q)|/|{}| = {:.3e}",
+              what, what, what, rel);
+      if (rel > 1e-8)
+        app_log(1, "  [WARNING] eval_sigma_C: the {} rung violates W_PQ(q) = W_QP(-q) by "
+                   "{:.3e} (relative).\n"
+                   "            The four G-cuts of Phi_2 are then NOT equal, so Sigma^C is "
+                   "NOT dPhi/dG and the\n"
+                   "            result is not conserving. Check the q = -q transfers "
+                   "(Gamma / zone boundary), where\n"
+                   "            the relation forces a SYMMETRIC block, not merely a "
+                   "Hermitian one.", what, rel);
+    };
+    rung_pair_asym(Z_qPQ, "Z");
+
     // ---- backend transforms and grids -----------------------------------
     auto Ttw_ff = ft.Ttw_ff();  // (nt, nw_f)
     auto Twt_ff = ft.Twt_ff();  // (nw_f, nt)
@@ -327,6 +415,35 @@ namespace vertex_detail {
                                       : Ww_qwPQ(iq, m, all, all);
     };
 
+    // The dynamic rung needs the same pair symmetry as Z (see rung_pair_asym above).
+    // Sampled at TWO bosonic nodes, not all nw_b of them: the symmetry is structural in
+    // the rung's construction, so it either holds at every frequency or at none, and a
+    // full sweep would cost nw_b x the Z pass -- which is not affordable at production Np.
+    if (not static_rung and not sym) {
+      double d = 0.0, sc = 0.0;
+      const std::array<long, 2> mprobe{m0, nw_b - 1};
+      for (long iq = 0; iq < nq_w; ++iq) {
+        const long iqm = qminus(iq);
+        for (long m : mprobe) {
+          auto Wm = Ww(iq, m);
+          auto Wmm = Ww(iqm, m);
+          for (long P = 0; P < Np; ++P)
+            for (long Q = 0; Q < Np; ++Q) {
+              d = std::max(d, std::abs(Wm(P, Q) - Wmm(Q, P)));
+              sc = std::max(sc, std::abs(Wm(P, Q)));
+            }
+        }
+      }
+      const double rel = (sc > 0.0) ? d / sc : 0.0;
+      app_log(3, "  eval_sigma_C: rung pair symmetry |W_PQ(q,inu) - W_QP(-q,inu)|/|W| = "
+                 "{:.3e}", rel);
+      if (rel > 1e-8)
+        app_log(1, "  [WARNING] eval_sigma_C: the DYNAMIC rung violates "
+                   "W_PQ(q,inu) = W_QP(-q,inu) by {:.3e} (relative).\n"
+                   "            Sigma^C is then NOT dPhi/dG -- see the Z-rung warning "
+                   "above for what this costs.", rel);
+    }
+
     // ---- layout helpers ---------------------------------------------------
     // G blocks (row, col):   B2(t, iG(p3,p2')), C2(t, iG(p4,p3')), D2(t, iG(p1,p4'))
     // W row pairs:           e_x = iX(b, p1),  e_y = iX(a, p2')      [size dX = nbnd*nc]
@@ -384,6 +501,13 @@ namespace vertex_detail {
     nda::array<ComplexType, 4> AccSt(ns * nk_ext, nt, nbnd, nbnd);
     AccSw() = ComplexType(0.0);
     AccSt() = ComplexType(0.0);
+
+    // ---- T1 per-q_x slot-probe meter (test-only; both pointers null in production) ----
+    if (sigma_C_slot_probe.qx_St != nullptr) {
+      sigma_C_slot_probe.qx_St->resize(nq, ns * nk_ext, nt, nbnd, nbnd);
+      (*sigma_C_slot_probe.qx_St)() = ComplexType(0.0);
+    }
+    if (sigma_C_slot_probe.gA != nullptr) *sigma_C_slot_probe.gA = G_tskij;
 
     // per-family running max |contribution| (diagnostics, verbosity 3)
     std::array<double, 8> fam_max{};  // I..V, S1, S2, S3
@@ -562,12 +686,19 @@ namespace vertex_detail {
         }
 
         // ---- C-window G blocks ------------------------------------------
+        // (the slot pointers are null in production: hoisted so the branch is loop-invariant)
+        auto const *pB = sigma_C_slot_probe.B;
+        auto const *pC = sigma_C_slot_probe.C;
+        auto const *pD = sigma_C_slot_probe.D;
         for (long it = 0; it < nt; ++it)
           for (long i = 0; i < nc; ++i)
             for (long j = 0; j < nc; ++j) {
-              B2(it, iG(i, j)) = G_tskij(it, is, ikpqy,    C0 + i, C0 + j);  // (p3, p2')
-              C2(it, iG(i, j)) = G_tskij(it, is, ikmqxpqy, C0 + i, C0 + j);  // (p4, p3')
-              D2(it, iG(i, j)) = G_tskij(it, is, ikmqx,    C0 + i, C0 + j);  // (p1, p4')
+              B2(it, iG(i, j)) = pB ? (*pB)(it, is, ikpqy, C0 + i, C0 + j)
+                                    : ComplexType(G_tskij(it, is, ikpqy,    C0 + i, C0 + j));  // (p3, p2')
+              C2(it, iG(i, j)) = pC ? (*pC)(it, is, ikmqxpqy, C0 + i, C0 + j)
+                                    : ComplexType(G_tskij(it, is, ikmqxpqy, C0 + i, C0 + j));  // (p4, p3')
+              D2(it, iG(i, j)) = pD ? (*pD)(it, is, ikmqx, C0 + i, C0 + j)
+                                    : ComplexType(G_tskij(it, is, ikmqx,    C0 + i, C0 + j));  // (p1, p4')
             }
         if (not no_families) {
           b_res = pfit.coeffs(B2);
@@ -883,7 +1014,8 @@ namespace vertex_detail {
           // S1 and S2 each carry exactly ONE dynamic rung (Wy_dyn resp. Wx_dyn) and so
           // vanish identically in static-rung mode; S3 (both rungs instantaneous) is
           // the whole of Sigma^{C,x}.
-          if (not static_rung) {
+          const int probe_term = sigma_C_slot_probe.only_term;   // 0 in production
+          if (not static_rung and (probe_term == 0 or probe_term == 1)) {
           // S1
           for (long it = 0; it < nt; ++it)
             for (long j4 = 0; j4 < nc; ++j4)
@@ -921,7 +1053,8 @@ namespace vertex_detail {
                 St_ab(it, a, b) += acc;
               }
           track_max(fam_max[5], St_ab);
-
+          }  // not static_rung (S1)
+          if (not static_rung and (probe_term == 0 or probe_term == 2)) {
           // S2
           for (long it = 0; it < nt; ++it)
             for (long j3 = 0; j3 < nc; ++j3)
@@ -958,8 +1091,9 @@ namespace vertex_detail {
                 St_ab(it, a, b) += acc;
               }
           track_max(fam_max[6], St_ab);
-          }  // not static_rung (S1, S2)
+          }  // not static_rung (S2)
 
+          if (probe_term == 0 or probe_term == 3) {
           // S3
           for (long it = 0; it < nt; ++it)
             for (long a = 0; a < nbnd; ++a) {
@@ -992,6 +1126,7 @@ namespace vertex_detail {
                 St_ab(it, a, b) += -acc;
               }
             }
+          }  // S3
           track_max(fam_max[7], St_ab);
         }
 
@@ -1004,6 +1139,13 @@ namespace vertex_detail {
           for (long a = 0; a < nbnd; ++a)
             for (long b = 0; b < nbnd; ++b)
               AccSt(is * nk_ext + ik, it, a, b) += St_ab(it, a, b);
+        if (sigma_C_slot_probe.qx_St != nullptr) {
+          auto &qxS = *sigma_C_slot_probe.qx_St;
+          for (long it = 0; it < nt; ++it)
+            for (long a = 0; a < nbnd; ++a)
+              for (long b = 0; b < nbnd; ++b)
+                qxS(iqx, is * nk_ext + ik, it, a, b) += St_ab(it, a, b);
+        }
       }  // iqy
     }  // combo
 
@@ -1078,7 +1220,8 @@ namespace vertex_detail {
     // rung_mode = 0: this legacy wrapper is the DYNAMIC path only. The static/linear
     // modes call eval_sigma_C_g3w2 directly (they always know their rung mode).
     eval_sigma_C_g3w2(ft, comm, C_rng, G_tskij, X_skPa, Wt_qtPQ, Z_qPQ, k_minus_q,
-                      qminus, iq_gamma, skip_rung_gamma, /*rung_mode*/ 0, nullptr, nullptr,
+                      qminus, iq_gamma, skip_rung_gamma, /*rung_mode*/ 0,
+                      static_cast<nda::array<ComplexType, 4> const*>(nullptr), nullptr,
                       std::forward<SArr_t>(Sigma_C_tskab));
   }
 

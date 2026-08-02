@@ -413,7 +413,7 @@ namespace bdft_tests {
         iaft_tools tk(f), tf(f);
         nda::array<cplx, 4> Pi_wq(nwb, nk, Np, Np);
         Pi_wq() = cplx(0.0);
-        vertex_pi::pi_c_accumulate_w(f, tk, Ge, mdl.X_skPa, mdl.Zns_qPQ, nullptr,
+        vertex_pi::pi_c_accumulate_w(f, tk, Ge, mdl.X_skPa, mdl.Zns_qPQ, static_cast<nda::array<ComplexType, 4> const*>(nullptr),
                                      mdl.kmq, mdl.kpq, C(), Pi_wq, 0, 1);
         nda::array<cplx, 3> ref(nk, Np, Np), got(nk, Np, Np);
         for (long iq = 0; iq < nk; ++iq)
@@ -424,7 +424,7 @@ namespace bdft_tests {
               ref(iq, P, Q) = acc;
             }
         got() = cplx(0.0);
-        vertex_pi::pi_dyn_factorized(tf, Ge, mdl.X_skPa, mdl.Zns_qPQ, nullptr,
+        vertex_pi::pi_dyn_factorized(tf, Ge, mdl.X_skPa, mdl.Zns_qPQ, static_cast<nda::array<ComplexType, 4> const*>(nullptr),
                                      mdl.kmq, mdl.kpq, C(), Re, got, 0, 1);
         double n, d;
         double r = rel_dev(got, ref, n, d);

@@ -97,19 +97,27 @@ inline void upfold_core_block(nda::MemoryArrayOfRank<2> auto const& t_qP,
 }
 
 /**
- * Rank-1 Gamma-head block ADD (Impl 2c): adds weight * H_PQ(P_range, Q_range) into out_block
- * IN PLACE, WITHOUT ever materializing the dense (Np x Np) head. The head is exactly rank-1
- * (vertex_head_detail::build_head_rank1):
- *   H_PQ(P, Q) = c * conj(chi_g(P)) * chi_g(Q),  c = N_k * madelung,
- * so the (P_range x Q_range) block equals the outer product of two chi slices scaled by c.
- * Per element this reproduces the dense-H arithmetic BIT-FOR-BIT: build_head_rank1 computes
- * H_PQ(P,Q) = double(nkpts) * xi * conj(chi(P)) * chi(Q) with the same left-to-right operand
- * order as `c * std::conj(chi_g(P)) * chi_g(Q)` (c == double(nkpts) * xi), and the caller
- * applies its weight exactly as the legacy folds did (Z: weight = 1; W: weight =
- * ComplexType(eps(it).real())) so `weight * H_PQ(P,Q)` matches `weight * H_PQ` term by term.
+ * Gamma-head block ADD (Impl 2c): adds weight * H_PQ(P_range, Q_range) into out_block
+ * IN PLACE, WITHOUT ever materializing the dense (Np x Np) head. The head factorizes through
+ * the single Np-vector chi_g (vertex_head_detail::build_head_rank1):
+ *   H_PQ(P, Q) = c * Re[ conj(chi_g(P)) * chi_g(Q) ],   c = N_k * madelung,
+ * so the (P_range x Q_range) block is still built from two chi slices and a scalar -- no
+ * dense head, no extra storage, one extra std::real per element.
+ *
+ * The `Re` is REQUIRED, not cosmetic: Gamma is a SELF-INVERSE transfer, where the kernel's
+ * rung relation W_PQ(q) = W_QP(-q) reduces to W(q) = W(q)^T and, with Hermiticity, forces
+ * the block to be REAL. Dropping it makes Sigma^C non-Hermitian; in B-L that error compounds
+ * through the Dyson equation (measured on Si: Im(e_corr)/Re(e_corr) growing 3-4x per
+ * iteration). Full argument in vertex_t.cpp::build_head_rank1 and notes/rung_pair_symmetry.md.
+ *
+ * Per element this still reproduces the dense-H arithmetic BIT-FOR-BIT: build_head_rank1
+ * computes double(nkpts) * xi * std::real(conj(chi(P)) * chi(Q)) and this computes
+ * c * std::real(conj(chi_g(P)) * chi_g(Q)) with c == double(nkpts) * xi and the same operand
+ * order; the caller applies its weight exactly as the legacy folds did (Z: weight = 1; W:
+ * weight = ComplexType(eps(it).real())).
  *
  *   chi_g   : Np-vector chi(iq_gamma, :) = thc.basis_head()(iq_gamma, all)
- *   c       : N_k * madelung (the build_head_rank1 prefactor double(nkpts) * xi)
+ *   c       : N_k * madelung (the build_head_rank1 prefactor double(nkpts) * xi; REAL)
  *   weight  : per-block scalar (ComplexType(1) for the bare Z fold; ComplexType(eps(it).real())
  *             for the dynamic W fold at tau-index it)
  *   P_range/Q_range : this block's ranges into the GLOBAL P,Q aux index
@@ -122,9 +130,9 @@ inline void head_block_add(nda::MemoryArrayOfRank<1> auto const& chi_g,
   const long P_bs = P_range.size();
   const long Q_bs = Q_range.size();
   for (long p = 0; p < P_bs; ++p) {
-    const ComplexType cp = c * std::conj(chi_g(P_range.first() + p));
+    const ComplexType chip = std::conj(chi_g(P_range.first() + p));
     for (long q = 0; q < Q_bs; ++q)
-      out_block(p, q) += weight * (cp * chi_g(Q_range.first() + q));
+      out_block(p, q) += weight * (c * std::real(chip * chi_g(Q_range.first() + q)));
   }
 }
 

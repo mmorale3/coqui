@@ -89,11 +89,20 @@ namespace solvers {
      * (model systems) or chi_head not populated (some ERI read paths,
      * thc_reader_t.hpp:380-381). The caller logs and proceeds without insertion.
      */
+    /**
+     * `scale` is the P0.3 head-strength lambda (vertex_t::_bl_head_scale), applied to xi.
+     * lambda = 1 is the untouched head. lambda = 0 makes xi vanish and therefore trips the
+     * SAME `xi == 0.0` guard below that a system without a madelung constant does, so the
+     * caller takes exactly the no-head ("ignore_g0") branch -- structurally, not merely
+     * numerically. Every other head site in vertex_t applies the identical factor; scaling
+     * some but not all of them would re-create the already-refuted W0-vs-W head-weight
+     * mismatch instead of the one-rung/two-rung separation the scan is for.
+     */
     template<THC_ERI thc_t>
     bool build_head_rank1(thc_t const& thc, long iq_gamma, long nkpts,
-                          nda::array<ComplexType, 2>& H_PQ) {
+                          nda::array<ComplexType, 2>& H_PQ, double scale = 1.0) {
       auto MF = thc.MF();
-      const double xi = MF->madelung();
+      const double xi = MF->madelung() * scale;
       auto chi = thc.basis_head();   // (nqpts_ibz, Np)
       const long Np = H_PQ.shape(0);
       utils::check(chi.shape(0) > iq_gamma and chi.shape(1) == Np,
@@ -105,7 +114,54 @@ namespace solvers {
       if (xi == 0.0 or chi_max == 0.0) return false;
       for (long P = 0; P < Np; ++P)
         for (long Q = 0; Q < Np; ++Q)
-          H_PQ(P, Q) = double(nkpts) * xi * std::conj(chi(iq_gamma, P)) * chi(iq_gamma, Q);
+          H_PQ(P, Q) = double(nkpts) * xi
+                       * std::real(std::conj(chi(iq_gamma, P)) * chi(iq_gamma, Q));
+
+      // ---- WHY THE REAL PART (the `Re` above is the fix, not a safeguard) ---------------
+      // Gamma is a SELF-INVERSE transfer, and every rung of the Sigma^C kernel must obey
+      // W_PQ(q) = W_QP(-q) -- that relation is what makes the diagram's four G-cuts equal,
+      // hence what makes Sigma^C equal dPhi/dG. At q = -q it reads W(q) = W(q)^T, which
+      // TOGETHER WITH Hermiticity forces the block to be REAL. The exact Coulomb matrix
+      // obeys this identically: Z_PQ(0) = sum_G v(G) conj(chi_P(G)) chi_Q(G) satisfies
+      // Z_QP(0) = conj(Z_PQ(0)) and Z_PQ(0) = Z_QP(-0) = Z_QP(0), so Z(Gamma) IS real.
+      //
+      // The rank-1 head conj(chi_P) chi_Q is Hermitian but is real only when chi(Gamma) is
+      // real up to ONE global phase -- a property of the auxiliary basis that nothing
+      // enforces. It holds for LiH (measured: exactly 0 imaginary part) and NOT for Si.
+      // Taking the real part is also exactly the +-q microcell average the Gygi /
+      // probe-charge construction already implies: the Gamma cell is inversion symmetric
+      // and chi_P(-q) = conj(chi_P(q)) for a real basis, so averaging conj(chi_P(q))chi_Q(q)
+      // over +-q gives Re[conj(chi_P) chi_Q]. It stays positive semidefinite
+      // (Re = a a^T + b b^T with chi = a + i b), so the head keeps its sign.
+      //
+      // WHAT THE OLD FORM COST (Si, kp222/nb60/M8, vertex_div_treatment = "gygi"):
+      // Im(e_corr)/Re(e_corr) -- which must be 0 -- sat at ~2e-9 in B-S but GREW by 3-4x
+      // per iteration in B-L (7.3e-8 -> 1.1e-5 over five iterations, 1.9e-2 by the end),
+      // because B-L feeds P^{C,L} back into the Dyson equation for W and B-S does not. The
+      // same run with the head off (vertex_div_treatment = "ignore_g0") shows no imaginary
+      // part at all. LiH never showed it because its head is already real.
+      // See notes/rung_pair_symmetry.md.
+      {
+        double d = 0.0, sc = 0.0;
+        for (long P = 0; P < Np; ++P)
+          for (long Q = 0; Q < Np; ++Q) {
+            const ComplexType raw = std::conj(chi(iq_gamma, P)) * chi(iq_gamma, Q);
+            d = std::max(d, std::abs(raw.imag()));
+            sc = std::max(sc, std::abs(raw));
+          }
+        const double rel = (sc > 0.0) ? d / sc : 0.0;
+        app_log(2, "  vertex head: discarded antisymmetric part |Im conj(chi_P)chi_Q| / "
+                   "|conj(chi_P)chi_Q| at Gamma = {:.3e}", rel);
+        if (rel > 1e-8)
+          app_log(1, "  vertex head: chi(Gamma) is NOT real up to a global phase "
+                     "(|Im| / |.| = {:.3e}).\n"
+                     "            The antisymmetric part is DISCARDED -- it is illegal at a "
+                     "self-inverse transfer\n"
+                     "            (it would make Sigma^C non-Hermitian and, in B-L, "
+                     "compound through the Dyson\n"
+                     "            equation). Keeping it is what made Im(e_corr) grow on Si.",
+                  rel);
+      }
       return true;
     }
 
@@ -1057,6 +1113,13 @@ namespace solvers {
       // default block 8 it produces NaN residuals) -- use the serial pivot order,
       // which is also the exactly-nested greedy order the rank scans rely on
       pt.put("chol_block_size", 1);
+      // RANK-CAP FIX (2026-08-02): this private builder never saw the toml's distr_tol
+      // and used the class default 0.2, capping the secondary path at nproc <= nc-class
+      // rank counts (measured aborts at 52/104 on kp444/M8; legal max 60). The abort's
+      // own advice ("increase distr_tol") was a NO-OP on this path. When the new
+      // vertex_isdf_distr_tol is set (> 0), plumb it through: at 1.0 the kp444 maxima
+      // move to 208 (M4) / 260 (M8). Default (-1) preserves today's behavior exactly.
+      if (_isdf_distr_tol > 0.0) pt.put("distr_tol", _isdf_distr_tol);
       methods::thc builder(MF.get(), *mpi, pt, /*print_metadata*/ false);
       // WINDOW: the band-range overload (Wannier=window). WANNIER (owner ruling Q2):
       // the committed rotated overload interpolating_points(C_skai, iq, max), fed the
@@ -1539,13 +1602,36 @@ namespace solvers {
     nda::array<ComplexType, 2> H_PQ(need_dyn ? Np : 0, need_dyn ? Np : 0);
     bool head_ok = false;
     if (head_insertion and need_dyn) {
-      head_ok = vertex_head_detail::build_head_rank1(thc, iq_gamma, nkpts, H_PQ);
+      head_ok = vertex_head_detail::build_head_rank1(thc, iq_gamma, nkpts, H_PQ,
+                                                                    _bl_head_scale);
       if (head_ok) {
+        if (_bl_head_static_all and lin) {
+          // ---- H1, THE BALANCED FIRST-ORDER HEAD (see _bl_head_static_all) ----------
+          // The FULL STATIC-weight head c*(1 + eps_inv_head(i.nu=0)) goes into the
+          // INSTANTANEOUS slot, using build_w0's OWN weight so it cancels against
+          // W0(Gamma)'s head in the fluctuation dW = [Z + dW(i.nu)] - W0 (dWw_lin's
+          // broadcast term below) AND in pi^dyn's rung difference against Pi^{C,0}.
+          // The dynamic-slot piece is then NOT added (the branch below), so dW carries
+          // no analytic head at all: delta W_head == 0, the head is part of the
+          // expansion point instead of the fluctuation.
+          utils::check(_w0_head_applied,
+                       "vertex_t::eval_Sigma_C: vertex_bl_head_static_all requires "
+                       "build_w0's head weight (_w0_eps_head), but build_w0 did not "
+                       "apply a head this iteration -- inconsistent q->0 policy state.");
+          Z_qPQ(iq_gamma, all, all) += ComplexType(1.0 + _w0_eps_head) * H_PQ;
+          double h_max = 0.0;
+          for (auto const& v : H_PQ) h_max = std::max(h_max, std::abs(v));
+          app_log(1, "  Sigma^C head insertion [H1 STATIC]: madelung = {}, |H|_max = {}, "
+                     "weight 1 + eps_inv_head(i.nu=0) = {:.6e} applied to Z(Gamma); the "
+                     "dynamic piece is NOT added (dW = W - W0 is analytic-head-free).",
+                  MF->madelung(), h_max, 1.0 + _w0_eps_head);
+        } else {
         Z_qPQ(iq_gamma, all, all) += H_PQ;
         double h_max = 0.0;
         for (auto const& v : H_PQ) h_max = std::max(h_max, std::abs(v));
         app_log(1, "  Sigma^C head insertion: madelung = {}, |H|_max = {} (bare piece "
                    "applied to Z(Gamma))", MF->madelung(), h_max);
+        }
       } else {
         app_log(1, "  [WARNING] Sigma^C: gygi head insertion requested but head data are "
                    "unusable\n"
@@ -1560,8 +1646,24 @@ namespace solvers {
     // ---- dynamic W(tau): replicate and unfold nt_half storage to the full tau mesh ----
     // dW_qtPQ is dynamic-only (bare Z subtracted, scr_coulomb_t.cpp:217); W is
     // PH-symmetric in tau, W(beta-t) = W(t). IBZ rows under symmetry.
-    nda::array<ComplexType, 4> Wt_qtPQ(need_dyn ? nqpts_ibz : 0, nt, Np, Np);
-    if (need_dyn) {
+    //
+    // LEAN PATH (global B-L): this slab -- and the two nu-domain all-q Np^2 arrays
+    // derived from it (dWw_lin, Wdyn_w) -- were REPLICATED PER RANK: ~140 GB/rank at Si
+    // kp666 (nq_ibz=32, nt=78, Np=1080), the measured OOM of the G4 campaign. But the
+    // kernel never consumes W(tau) at all (its ONLY use is staging the tau->nu
+    // transform: vertex_sigma.icc builds/receives the nu-domain rung), so for B-L on
+    // the global path the slab is skipped entirely and ONE node-shared nu window is
+    // staged per-q straight from the DISTRIBUTED mb_state.dW_qtPQ (gather_dW_one_q is
+    // a collective pure gather -- bit-identical to slicing the all-q gather). The
+    // per-element op chain (head-add on the tau-half slice -> mirror unfold -> tau->nu
+    // gemm -> +(Z - W0)) is IDENTICAL to the historic one, so every pinned energy
+    // reproduces exactly. The window is staged TWICE per eval -- with the (Z - W0)
+    // broadcast for the kernel rung, without it for the response's pi^dyn rung --
+    // trading one extra per-q gather sweep (~seconds) for never holding two copies.
+    // The parent (dynamic) and secondary paths keep the historic slab for now.
+    const bool lean = lin and not secondary();
+    nda::array<ComplexType, 4> Wt_qtPQ((need_dyn and not lean) ? nqpts_ibz : 0, nt, Np, Np);
+    if (need_dyn and not lean) {
       // M1 item #1: gather the RPA-grid dW into the replicated tau slab the kernel
       // needs (bit-identical to the former in-line allreduce; helper centralizes it).
       nda::array<ComplexType, 4> W_half = vertex_redist_detail::gather_dW_replicated(
@@ -1571,7 +1673,15 @@ namespace solvers {
       // eps_inv_head = eps^-1_00(q->0, tau) - 1, stored on nt_half by scr_coulomb
       // (scr_coulomb_t.cpp:106-108); same Re[.] convention as Sigma_div_correction.
       if (head_ok) {
-        if (mb_state.eps_inv_head.has_value()) {
+        if (_bl_head_static_all and lin) {
+          // H1: NO dynamic-slot head. The full static-weight head already sits in the
+          // instantaneous slot (Z(Gamma) above), so the fluctuation dW = W - W0 -- and
+          // with it dWw_lin, pi^dyn's rung, and every downstream consumer -- carries no
+          // analytic head. See _bl_head_static_all.
+          app_log(1, "  Sigma^C head insertion [H1 STATIC]: dynamic piece SKIPPED "
+                     "(the static-weight head is in the instantaneous slot; dW is "
+                     "analytic-head-free).");
+        } else if (mb_state.eps_inv_head.has_value()) {
           auto& eps = mb_state.eps_inv_head.value();
           utils::check(eps.shape(0) == nt_half,
                        "vertex_t::eval_Sigma_C: eps_inv_head size {} != nt_half = {}.",
@@ -1592,6 +1702,75 @@ namespace solvers {
         Wt_qtPQ(all, it, all, all) = W_half(all, ith, all, all);
       }
     }
+
+    // ---- LEAN staging: the node-shared nu window + its builder ------------------------
+    // ONE (nq_ibz, nw_b, Np, Np) window per NUMA node (46.6 GB/node at kp666 -- vs
+    // 3 x 46.6 GB/rank before). Builder: for each q, ALL ranks run the collective
+    // per-q gather (bit-identical to slicing the all-q gather); exactly one writer
+    // per node per q head-augments Gamma, mirror-unfolds, tau->nu gemms into the
+    // window row, and (with_cq) broadcast-adds the nu-constant (Z - W0). Content is
+    // deterministic, so every node's window is identical.
+    std::optional<vertex_pi::iaft_tools> wtls;
+    std::optional<math::shm::shared_array<nda::array_view<ComplexType, 4>>> sWw;
+    const bool lean_head_dyn = lean and head_ok and not _bl_head_static_all
+                               and mb_state.eps_inv_head.has_value();
+    if (lean) {
+      wtls.emplace(*_ft);
+      sWw.emplace(math::shm::make_shared_array<nda::array_view<ComplexType, 4>>(
+          *mpi, std::array<long, 4>{nqpts_ibz, wtls->nw_b, Np, Np}));
+      if (head_ok) {
+        if (_bl_head_static_all) {
+          app_log(1, "  Sigma^C head insertion [H1 STATIC]: dynamic piece SKIPPED "
+                     "(the static-weight head is in the instantaneous slot; dW is "
+                     "analytic-head-free).");
+        } else if (mb_state.eps_inv_head.has_value()) {
+          utils::check(mb_state.eps_inv_head.value().shape(0) == nt_half,
+                       "vertex_t::eval_Sigma_C: eps_inv_head size {} != nt_half = {}.",
+                       mb_state.eps_inv_head.value().shape(0), nt_half);
+          app_log(1, "  Sigma^C head insertion: dynamic piece applied to dW(Gamma, tau) "
+                     "with eps_inv_head(tau=0) = {}",
+                  mb_state.eps_inv_head.value()(0).real());
+        } else {
+          app_log(1, "  [WARNING] Sigma^C: dW is present but eps_inv_head is not in MBState "
+                     "-- the DYNAMIC head\n"
+                     "            piece is skipped (bare piece applied).");
+        }
+      }
+    }
+    auto stage_lean_Ww = [&](bool with_cq) {
+      auto W = sWw->local();
+      auto& tl = wtls.value();
+      auto const& W0b_l = _W0b_qmm.value();
+      const long n2 = Np * Np;
+      sWw->win().fence();
+      nda::array<ComplexType, 2> Wt2;   // per-q unfolded tau slice, writer ranks only
+      nda::array<ComplexType, 2> cq;
+      for (long iq = 0; iq < nqpts_ibz; ++iq) {
+        auto W_q = vertex_redist_detail::gather_dW_one_q(
+            mb_state.dW_qtPQ.value(), mpi->comm, iq, nt_half, Np);   // COLLECTIVE
+        if (iq % mpi->node_comm.size() != mpi->node_comm.rank()) continue;
+        if (lean_head_dyn and iq == iq_gamma) {
+          auto& eps = mb_state.eps_inv_head.value();
+          for (long it = 0; it < nt_half; ++it)
+            W_q(it, all, all) += ComplexType(eps(it).real()) * H_PQ;
+        }
+        if (Wt2.size() == 0) Wt2 = nda::array<ComplexType, 2>(nt, n2);
+        for (long it = 0; it < nt; ++it) {
+          const long ith = std::min(it, nt - it - 1);
+          Wt2(it, all) = nda::reshape(W_q(ith, all, all), std::array<long, 1>{n2});
+        }
+        auto out = nda::reshape(W(iq, all, all, all), std::array<long, 2>{tl.nw_b, n2});
+        nda::blas::gemm(tl.Twt_bb, Wt2, out);
+        if (with_cq) {
+          if (cq.size() == 0) cq = nda::array<ComplexType, 2>(Np, Np);
+          for (long M = 0; M < Np; ++M)
+            for (long N = 0; N < Np; ++N)
+              cq(M, N) = Z_qPQ(iq, M, N) - W0b_l(iq, M, N);
+          for (long m = 0; m < tl.nw_b; ++m) W(iq, m, all, all) += cq;
+        }
+      }
+      sWw->win().fence();
+    };
 
     // ---- momentum maps (symmetry-free mesh) -------------------------------------------
     nda::array<long, 2> kmq(nqpts, nkpts);
@@ -1775,9 +1954,16 @@ namespace solvers {
       // this as the dynamic rung, the kernel's own reductions ARE B-L's three terms:
       //   S3 = W0_x W0_y,  S1 = W0_x dW_y,  S2 = dW_x W0_y,
       // and families I-V are precisely the dropped dW_x dW_y of Phi^(2).
-      nda::array<ComplexType, 4> dWw_lin;
-      nda::array<ComplexType, 4> const *wwp = nullptr;
-      if (lin) {
+      nda::array<ComplexType, 4> dWw_lin;   // SECONDARY path only (N_m^2 -- small)
+      std::optional<nda::array_view<ComplexType, 4>> Ww_v;
+      nda::array_view<ComplexType, 4> const *wwp = nullptr;
+      if (lin and not sec) {
+        // LEAN: pass 1 of the node-shared window -- dW(nu) + (Z - W0), the kernel rung.
+        stage_lean_Ww(/*with_cq=*/true);
+        Ww_v.emplace(sWw->local());
+        wwp = &Ww_v.value();
+      }
+      if (lin and sec) {
         vertex_pi::iaft_tools tls(*_ft);
         dWw_lin = nda::array<ComplexType, 4>(nqpts_ibz, tls.nw_b, naux, naux);
         // P2.4 (notes/vertex_optimization_plan.md): this is a per-q GEMM, not a 5-deep
@@ -1808,14 +1994,214 @@ namespace solvers {
               dWw_lin(iq, m, all, all) += cq;
           }
         }
-        wwp = &dWw_lin;
-        double z0 = 0.0, zs = 0.0;
+        Ww_v.emplace(dWw_lin());
+        wwp = &Ww_v.value();
+      }
+      if (lin) {
+        vertex_pi::iaft_tools tls(*_ft);
+        auto const& Wdw = *wwp;   // the nu-domain rung, whichever storage backs it
+        double z0 = 0.0, zs = 0.0, zmax = 0.0;
         for (long iq = 0; iq < nqpts_ibz; ++iq)
           for (long M = 0; M < naux; ++M)
             for (long N = 0; N < naux; ++N) {
-              z0 = std::max(z0, std::abs(dWw_lin(iq, tls.m0, M, N)));
+              z0 = std::max(z0, std::abs(Wdw(iq, tls.m0, M, N)));
               zs = std::max(zs, std::abs(W0b(iq, M, N)));
             }
+        // THE EXPANSION PARAMETER, measured over ALL frequencies -- not the i.nu = 0 slice
+        // reported below it. B-L is first order in dW, so |dW|/|W0| is what says whether
+        // the tangent expansion is controlled, and the nu = 0 value CANNOT answer that:
+        // W0 IS the nu = 0 slice, so dW is small there BY CONSTRUCTION and for a reason
+        // that has nothing to do with convergence. dW(i.nu -> infinity) -> v - W0, i.e.
+        // the whole of the screening. Added after the S1/S2/S3 split measured the mixed
+        // (first-order) terms at 3.23x the static (zeroth-order) one while the nu = 0
+        // meter read 0.02-0.06 -- a ~100x discrepancy that meter was structurally unable
+        // to show. See test_vertex_static_e2e "vertex_bl_mixed_term_split".
+        for (long iq = 0; iq < nqpts_ibz; ++iq)
+          for (long m = 0; m < tls.nw_b; ++m)
+            for (long M = 0; M < naux; ++M)
+              for (long N = 0; N < naux; ++N)
+                zmax = std::max(zmax, std::abs(Wdw(iq, m, M, N)));
+        _diag_dw_rel = (zs > 0.0 ? zmax / zs : -1.0);
+        app_log(1, "  Sigma^C [rung = linear]: EXPANSION PARAMETER max_nu |dW|/|W0| = "
+                   "{:.4f}  (max_nu |dW| = {:.3e}, |W0| = {:.3e}). B-L is FIRST ORDER in "
+                   "dW, so this -- not the i.nu = 0 value below -- is the validity meter; "
+                   "dW is small at nu = 0 by construction (W0 is that slice) and tends to "
+                   "v - W0 at large nu. A value near or above 1 means the tangent "
+                   "expansion is NOT controlled.",
+                _diag_dw_rel, zmax, zs);
+
+        // ---- P0.1: dW's OWN HEAD CHANNEL ------------------------------------------
+        // The meter above is a MAX-NORM, and trap 2 of this project says a max-norm
+        // cannot see a rank-1 head: three separate diagnostics have now been passed by
+        // objects differing ~10x in the chi channel. The S1/S2/S3 split
+        // (test_vertex_static_e2e "vertex_bl_mixed_term_split") showed the gygi Gamma head
+        // FLIPS the first-order mixed terms and moves |S1+S2|/|S3| by 93x while moving
+        // max|dW|/|W0| by only 1.81x -- so the question is NOT how big dW is, it is
+        // whether the head SURVIVES the W - W0 subtraction. Measure that directly, in the
+        // channel the head lives in:
+        //     h_A(q) := chi(q)^dag A(q) chi(q) / ||chi(q)||^2 ,  chi = thc.basis_head()
+        //     ratio(q) := max_nu |h_dW(q, i.nu)| / |h_W0(q)|
+        // ⚠ MEASURED 2026-07-31 (LiH-222, 2 cold iterations) -- AND THE RATIO IS NOT THE
+        // ANSWER. The prior was that the head enters W with weight eps^-1_00(q->0, i.nu)
+        // but W0 with only its STATIC weight, so the ratio would run to eps_M - 1 >> 1 at
+        // large nu. It does not: 0.408 at Gamma with the head, 0.016 without -- but the
+        // HEAD-FREE control at q != Gamma reads 0.39-0.41 at BOTH policies. 0.4 is simply
+        // what dW/W0 looks like in the G = 0 channel anywhere on the mesh, so the head does
+        // NOT make the ratio anomalous. What ignore_g0 does is make Gamma anomalously QUIET
+        // (0.016), because with v(G = 0) zeroed there is barely any G = 0 content to
+        // fluctuate. So read the two ABSOLUTE meters instead:
+        //   _diag_dw_head_abs -- how much dW sits in that one direction, in a.u., which is
+        //     directly comparable across q -> 0 policies (a ratio is not);
+        //   _diag_dw_head_coh -- |h_dW| / max|dW(Gamma)|, the ALIGNMENT with the rank-1
+        //     direction, against the chi-aligned ceiling. This is the quantity a max-norm
+        //     gate is structurally blind to, and it is the mechanism shared with the
+        //     [SANDWICH] and head-projection findings: a perturbation that is small
+        //     element-wise but coherent, summed by the kernel over N_p^2 terms in phase.
+        // The worst q != Gamma is a WITHIN-RUN head-free control -- no head is ever inserted
+        // there, so it is the same channel at the same G in the same iteration.
+        _diag_dw_head_rel = -1.0;
+        _diag_dw_head_bg = -1.0;
+        _diag_dw_head_abs = -1.0;
+        _diag_dw_head_coh = -1.0;
+        _diag_dw_head_nu0 = -1.0;
+        {
+          auto chi_h = thc.basis_head();            // (nqpts_ibz, Np)
+          if (chi_h.shape(0) < nqpts_ibz or chi_h.shape(1) != Np
+              or (not sec and naux != Np)) {
+            app_log(2, "  Sigma^C [rung = linear]: head-channel meter SKIPPED -- "
+                       "basis_head shape ({}, {}) is unusable for nqpts_ibz = {}, Np = {}.",
+                    chi_h.shape(0), chi_h.shape(1), nqpts_ibz, Np);
+          } else {
+            // the largest |nu| on the bosonic mesh: where dW -> v - W0 and the head is at
+            // its most bare. Reported so the nu-DEPENDENCE of the survival is visible and
+            // not just its max.
+            long mhi = 0;
+            for (long m = 0; m < tls.nw_b; ++m)
+              if (std::abs(tls.wn_b(m)) > std::abs(tls.wn_b(mhi))) mhi = m;
+            nda::array<ComplexType, 1> p(naux);
+            auto quad = [&](auto const& A) {                // chi^dag A chi (unnormalized)
+              ComplexType s(0.0, 0.0);
+              for (long M = 0; M < naux; ++M) {
+                const ComplexType pm = std::conj(p(M));
+                for (long N = 0; N < naux; ++N) s += pm * A(M, N) * p(N);
+              }
+              return s;
+            };
+            long bg_q = -1;
+            for (long iq = 0; iq < nqpts_ibz; ++iq) {
+              // the probe vector, expressed in the basis dW ACTUALLY lives in.
+              //   GLOBAL   : chi itself.
+              //   SECONDARY: the fold is Abar = t A t^dag, so w^dag Abar w =
+              //              (t^dag w)^dag A (t^dag w). The probe representing chi is
+              //              therefore w = t chi, which lands on the projection of chi
+              //              onto the row space of t -- the only part of chi the
+              //              secondary basis retains, which is the honest thing to
+              //              measure since it is also the only part the kernel sees.
+              //   (NOTE: this is NOT the head fold t conj(chi) of head_block_add. That is
+              //    the image of the head MATRIX; this is a probe VECTOR and carries the
+              //    opposite conjugation. Mixing them up silently measures nothing.)
+              if (sec) {
+                auto t_q = _t_qmP(iq, all, all);
+                for (long m = 0; m < naux; ++m) {
+                  ComplexType s(0.0, 0.0);
+                  for (long P = 0; P < Np; ++P) s += t_q(m, P) * chi_h(iq, P);
+                  p(m) = s;
+                }
+              } else {
+                for (long P = 0; P < Np; ++P) p(P) = chi_h(iq, P);
+              }
+              double pn = 0.0, pinf = 0.0;
+              for (long M = 0; M < naux; ++M) {
+                pn += std::norm(p(M));
+                pinf = std::max(pinf, std::abs(p(M)));
+              }
+              if (pn <= 0.0) continue;                      // no G = 0 content at this q
+              const double hw0 = std::abs(quad(W0b(iq, all, all))) / pn;
+              if (hw0 <= 0.0) continue;
+              double hmax = 0.0, h0 = 0.0, hhi = 0.0, dwmax = 0.0;
+              long m_at = -1;
+              for (long m = 0; m < tls.nw_b; ++m) {
+                // the quadratic form and the per-q max in ONE pass over the slice. dWw_lin
+                // is the largest array in this routine; a diagnostic that sweeps it twice
+                // is the [SANDWICH] mistake (a second build_delta_w call, purely to print a
+                // ratio, inflated every timing measured since it landed).
+                ComplexType s(0.0, 0.0);
+                for (long M = 0; M < naux; ++M) {
+                  const ComplexType pm = std::conj(p(M));
+                  for (long N = 0; N < naux; ++N) {
+                    const ComplexType a = Wdw(iq, m, M, N);
+                    s += pm * a * p(N);
+                    dwmax = std::max(dwmax, std::abs(a));
+                  }
+                }
+                const double h = std::abs(s) / pn;
+                if (h > hmax) { hmax = h; m_at = m; }
+                if (m == tls.m0) h0 = h;
+                if (m == mhi) hhi = h;
+              }
+              // COHERENCE. For a chi-aligned rank-1 matrix c p p^dag the channel value is
+              // |c| ||p||^2 while the max element is |c| max_M|p_M|^2, so the ratio hits the
+              // ceiling ||p||^2 / max_M|p_M|^2 (<= naux, = naux for a flat p). A matrix with
+              // no preferred alignment gives O(1). This is the quantity a max-norm gate
+              // cannot see, and it is what makes a "small" perturbation dominate a kernel
+              // that sums N_p^2 terms in phase.
+              const double coh = (dwmax > 0.0 ? hmax / dwmax : 0.0);
+              const double coh_ceil = (pinf > 0.0 ? pn / (pinf * pinf) : 0.0);
+              if (iq == iq_gamma) {
+                _diag_dw_head_rel = hmax / hw0;
+                _diag_dw_head_abs = hmax;
+                _diag_dw_head_coh = (coh_ceil > 0.0 ? coh / coh_ceil : 0.0);
+                _diag_dw_head_nu0 = h0;
+                double w0max = 0.0;
+                for (long M = 0; M < naux; ++M)
+                  for (long N = 0; N < naux; ++N)
+                    w0max = std::max(w0max, std::abs(W0b(iq, M, N)));
+                app_log(1, "  Sigma^C [rung = linear]: HEAD CHANNEL at q = Gamma "
+                           "(h_A := chi^dag A chi / ||chi||^2, the G = 0 / rank-1 head "
+                           "direction):\n"
+                           "      h_W0 = {:.4e}  (max|W0(Gamma)| = {:.4e}; the channel "
+                           "carries {:.1f} % of the block)\n"
+                           "      h_dW : nu = 0 {:.4e} | MAX {:.4e} (n = {}) | largest "
+                           "|nu| (n = {}) {:.4e}   -> the nu = 0 slice understates by "
+                           "{:.1f}x\n"
+                           "      ratio max_nu |h_dW| / |h_W0| = {:.4f}   vs the max-norm "
+                           "meter {:.4f} ({:.2f}x)\n"
+                           "      COHERENCE |h_dW| / max|dW(Gamma)| = {:.2f} of the "
+                           "chi-aligned rank-1 ceiling {:.2f}  ->  {:.3f}\n"
+                           "      Read the ABSOLUTE and the COHERENCE, not the ratio: the "
+                           "ratio is ~0.4 at EVERY q\n"
+                           "      (see the control below), so it is not what the head "
+                           "changes. What the head changes is\n"
+                           "      how much sits in ONE rank-1 direction that the kernel "
+                           "then sums over N_p^2 terms in phase.\n"
+                           "      COHERENCE -> 1 means dW(Gamma) IS c chi chi^dag, i.e. the "
+                           "head did not cancel in W - W0 at all.",
+                        hw0, w0max, (w0max > 0.0 ? 100.0 * hw0 / w0max : 0.0),
+                        h0, hmax, tls.wn_b(m_at >= 0 ? m_at : 0), tls.wn_b(mhi), hhi,
+                        (h0 > 0.0 ? hmax / h0 : 0.0),
+                        _diag_dw_head_rel, _diag_dw_rel,
+                        (_diag_dw_rel > 0.0 ? (hmax / hw0) / _diag_dw_rel : 0.0),
+                        coh, coh_ceil, _diag_dw_head_coh);
+              } else {
+                app_log(2, "  Sigma^C [rung = linear]: head channel q = {}: h_W0 = {:.4e}, "
+                           "max_nu |h_dW| = {:.4e}, ratio {:.4f}, coherence {:.2f} / {:.2f}",
+                        iq, hw0, hmax, hmax / hw0, coh, coh_ceil);
+                if (hmax / hw0 > _diag_dw_head_bg) {
+                  _diag_dw_head_bg = hmax / hw0;
+                  bg_q = iq;
+                }
+              }
+            }
+            if (bg_q >= 0)
+              app_log(1, "  Sigma^C [rung = linear]: head-channel CONTROL, worst q != "
+                         "Gamma (q = {}): max_nu |h_dW| / |h_W0| = {:.4f}. No head is "
+                         "inserted at q != Gamma,\n"
+                         "      so this is the same channel WITHOUT the analytic head, at "
+                         "the same G and the same iteration.",
+                      bg_q, _diag_dw_head_bg);
+          }
+        }
+
         // |dW(i.nu = 0)| = |W(q,0) - W0(q)| is the VERTEX CORRECTION TO THE STATIC
         // SCREEN, and in B-L it is nonzero BY DESIGN: the kernel W0[G] is the RPA-static
         // screen, while the run's own W carries P^{C,L}. The self-slice identity
@@ -1848,11 +2234,15 @@ namespace solvers {
     } else if (sec)
       vertex_detail::eval_sigma_C_g3w2(*_ft, mpi->comm, nda::range(0, nc), G_CC,
                                        _Xb_skma, Wb_qtmm, Zb_qmm, kmq, qmin,
-                                       iq_gamma, skip_rung_gamma, 0, nullptr, symc, Sigma_C);
+                                       iq_gamma, skip_rung_gamma, 0,
+                                       static_cast<nda::array<ComplexType, 4> const*>(nullptr),
+                                       symc, Sigma_C);
     else
       vertex_detail::eval_sigma_C_g3w2(*_ft, mpi->comm, nda::range(0, nc), G_CC,
                                        X_C, Wt_qtPQ, Z_qPQ, kmq, qmin, iq_gamma,
-                                       skip_rung_gamma, 0, nullptr, symc, Sigma_C);
+                                       skip_rung_gamma, 0,
+                                       static_cast<nda::array<ComplexType, 4> const*>(nullptr),
+                                       symc, Sigma_C);
     {
       double max_abs = 0.0;
       long n_bad = 0;
@@ -1905,12 +2295,12 @@ namespace solvers {
       // dynamic phase, i.e. the size of the eq:pibardynfact win.
       _Timer.start("SIG_RESP_PI0");
       if (sec)
-        vertex_pi::pi_c_accumulate_w(*_ft, tools, G_CC, _Xb_skma, W0b_r, nullptr,
+        vertex_pi::pi_c_accumulate_w(*_ft, tools, G_CC, _Xb_skma, W0b_r, static_cast<nda::array<ComplexType, 4> const*>(nullptr),
                                      kmq, kpq, nda::range(0, nc), Pi_wq,
                                      mpi->comm.rank(), mpi->comm.size(),
                                      skip_rung_gamma, nullptr, symc);
       else
-        vertex_pi::pi_c_accumulate_w(*_ft, tools, G_CC, X_C, W0b_r, nullptr,
+        vertex_pi::pi_c_accumulate_w(*_ft, tools, G_CC, X_C, W0b_r, static_cast<nda::array<ComplexType, 4> const*>(nullptr),
                                      kmq, kpq, nda::range(0, nc), Pi_wq,
                                      mpi->comm.rank(), mpi->comm.size(),
                                      skip_rung_gamma, nullptr, symc);
@@ -1935,6 +2325,7 @@ namespace solvers {
       nda::array<ComplexType, 3> Pi0(nqpts_ibz, Naux_pi, Naux_pi);
       tau0_of(Pi_wq, Pi0);
 
+      nda::array<ComplexType, 3> PiStat;   // DIAGNOSTIC: B-S middle factor, kept for §8.2
       // ---- INCREMENT S9: B-L's response middle factor -------------------------------
       // B-S sandwiches Pi^{C,0}(tau=0); B-L sandwiches the DIFFERENCE
       //     Pi^L = pi^dyn - Pi^{C,0}(tau = 0),   pi^dyn = Pi^{C,dyn}(q, tau = 0),
@@ -1956,28 +2347,129 @@ namespace solvers {
         // rung. This is a per-q GEMM written as a 5-deep scalar loop with the reduction on
         // the STRIDED it axis; timed separately so the BLAS rewrite can be verified.
         _Timer.start("SIG_RESP_WDYNW");
-        nda::array<ComplexType, 4> Wdyn_w(nqpts_ibz, tools.nw_b, Naux_pi, Naux_pi);
+        nda::array<ComplexType, 4> Wdyn_w;   // SECONDARY path only (N_m^2 -- small)
+        std::optional<nda::array_view<ComplexType, 4>> Wdyn_v;
         // P2.4, same rewrite as dWw_lin above: per-q gemm on the (nt, Naux_pi^2) reshape.
-        // This slot was 0.1 % of B-L before eq:pibardynfact landed and 12.5 % after, which
-        // is exactly why the plan says to re-measure before optimizing anything.
         // NOT bit-identical: the gemm reorders the it-sum.
-        {
+        // LEAN (global): pass 2 of the node-shared window -- the SAME per-q staging
+        // WITHOUT the (Z - W0) broadcast, overwriting pass 1 in place. This is the pure
+        // tau->nu transform of the (head-augmented) dW, i.e. exactly the old Wdyn_w
+        // content, at zero additional memory.
+        if (sec) {
+          Wdyn_w = nda::array<ComplexType, 4>(nqpts_ibz, tools.nw_b, Naux_pi, Naux_pi);
           const long n2 = Naux_pi * Naux_pi;
           for (long iq = 0; iq < nqpts_ibz; ++iq) {
             auto out = nda::reshape(Wdyn_w(iq, all, all, all),
                                     std::array<long, 2>{tools.nw_b, n2});
-            if (sec) {
-              auto src = nda::reshape(Wb_qtmm(iq, all, all, all),
-                                      std::array<long, 2>{nt, n2});
-              nda::blas::gemm(tools.Twt_bb, src, out);
-            } else {
-              auto src = nda::reshape(Wt_qtPQ(iq, all, all, all),
-                                      std::array<long, 2>{nt, n2});
-              nda::blas::gemm(tools.Twt_bb, src, out);
-            }
+            auto src = nda::reshape(Wb_qtmm(iq, all, all, all),
+                                    std::array<long, 2>{nt, n2});
+            nda::blas::gemm(tools.Twt_bb, src, out);
           }
+          Wdyn_v.emplace(Wdyn_w());
+        } else {
+          stage_lean_Ww(/*with_cq=*/false);
+          Wdyn_v.emplace(sWw->local());
         }
+        auto& Wdyn = Wdyn_v.value();
         _Timer.stop("SIG_RESP_WDYNW");
+
+        // ---- DIAGNOSTIC KNOB: freeze the Gamma head's frequency dependence -------------
+        // The Gamma rung head is inserted as Re[eps^-1_head(tau)] * H into dW(Gamma,tau),
+        // so in frequency its weight runs from eps^-1(i.nu=0) (fully screened) to 1
+        // (unscreened) -- it is the MOST frequency-dependent part of the whole rung. Pi^0
+        // uses a rung whose head is FROZEN at eps^-1(i.nu=0) (W0), and Pi^0 satisfies the
+        // q->0 head suppression exactly; pi^dyn uses the varying one and does NOT. This
+        // knob replaces the varying weight by the constant i.nu=0 value inside pi^dyn's
+        // rung ONLY, which is precisely the difference between the two objects.
+        //
+        // If <H, pi^dyn> collapses under this, the head insertion's nu-dependence is what
+        // breaks conservation, and the head-channel projection is masking a real defect
+        // rather than cleaning a residue. Diagnostic only -- freezing the head is NOT
+        // physical (W's head really is strongly retarded); default OFF.
+        // (interlock: under H1 (_bl_head_static_all) no dynamic head was ever inserted,
+        //  so there is nothing to freeze -- adding the difference here would CREATE a
+        //  spurious head. The two knobs are mutually exclusive by construction.)
+        if (_bl_static_head and head_ok and not sec and not _bl_head_static_all and
+            mb_state.eps_inv_head.has_value()) {
+          auto& eps = mb_state.eps_inv_head.value();
+          nda::array<ComplexType, 2> epst(nt, 1), epsw(tools.nw_b, 1);
+          for (long it = 0; it < nt; ++it) {
+            const long ith = std::min(it, nt - it - 1);
+            epst(it, 0) = ComplexType(eps(ith).real());
+          }
+          nda::blas::gemm(tools.Twt_bb, epst, epsw);       // tau -> i.nu, same map as W
+          const ComplexType w0v = epsw(tools.m0, 0);
+          double dmax = 0.0;
+          // this knob is global-path only (`not sec` above), so Wdyn is the node-shared
+          // window: exactly one writer per node, fenced.
+          if (sWw.has_value()) sWw->win().fence();
+          for (long l = 0; l < tools.nw_b; ++l) {
+            const ComplexType d = w0v - epsw(l, 0);        // freeze at the i.nu=0 value
+            dmax = std::max(dmax, std::abs(d));
+            if (not mpi->node_comm.root()) continue;
+            for (long P = 0; P < Np; ++P)
+              for (long Q = 0; Q < Np; ++Q)
+                Wdyn(iq_gamma, l, P, Q) += d * H_PQ(P, Q);
+          }
+          if (sWw.has_value()) sWw->win().fence();
+          app_log(1, "  [STATICHEAD] pi^dyn's Gamma head FROZEN at its i.nu=0 weight "
+                     "{:.6e}; max|eps^-1(i.nu=0) - eps^-1(i.nu)| = {:.4e} (DIAGNOSTIC -- "
+                     "not physical; tests whether the head's nu-dependence is what breaks "
+                     "the q->0 head suppression of pi^dyn)",
+                  w0v.real(), dmax);
+        }
+        // ---- DIAGNOSTIC KNOB: THE CONSTANT-RUNG ABSOLUTE PIN --------------------------
+        // Overwrite the dynamic rung with the frequency-INDEPENDENT  W0bar - Z, so that
+        // pi^dyn's total rung  Z + Wdyn_w(i.nu)  becomes exactly W0bar at every i.nu --
+        // bit-for-bit the rung Pi^{C,0} was built with a few dozen lines above. The two
+        // objects are then the same integral evaluated by two different routes, and
+        //     X^L -> 0        <H, pi^dyn> -> <H, Pi^{C,0}>
+        // must follow to the DLR representability floor. Anything O(1) surviving here is a
+        // defect in the equal-time path that Pi^{C,0} does not share.
+        //
+        // ⚠ NOT "zero the dynamic rung": that would leave pi^dyn with the BARE rung Z
+        // while Pi^{C,0} keeps W0, so X^L would stay O(1) for a reason that says nothing
+        // about the equal-time path. See _bl_pidyn_const_rung.
+        if (_bl_pidyn_const_rung) {
+          utils::check(W0b_r.shape(0) == nqpts_ibz and W0b_r.shape(1) == Naux_pi
+                           and W0b_r.shape(2) == Naux_pi,
+                       "vertex_t::eval_Sigma_C: const-rung pin: W0bar shape ({}, {}, {}) "
+                       "does not match pi^dyn's rung ({}, {}, {}).",
+                       W0b_r.shape(0), W0b_r.shape(1), W0b_r.shape(2),
+                       nqpts_ibz, Naux_pi, Naux_pi);
+          double dmax = 0.0, w0max = 0.0;
+          // sec: per-rank array, every rank writes its own copy (historic behavior).
+          // lean: node-shared window -- one writer per node, fenced; the scalars are
+          // computed on every rank (deterministic) so rank 0 always has them to log.
+          if (sWw.has_value()) sWw->win().fence();
+          const bool wmut = sec or mpi->node_comm.root();
+          for (long iq = 0; iq < nqpts_ibz; ++iq)
+            for (long M = 0; M < Naux_pi; ++M)
+              for (long N = 0; N < Naux_pi; ++N) {
+                const ComplexType d =
+                    W0b_r(iq, M, N) - (sec ? Zb_qmm(iq, M, N) : Z_qPQ(iq, M, N));
+                dmax = std::max(dmax, std::abs(d));
+                w0max = std::max(w0max, std::abs(W0b_r(iq, M, N)));
+                // Total rung becomes Z + (W0bar - Z) = W0bar at every frequency. Which
+                // slot carries the static content is provably irrelevant -- the rung enters
+                // as Zc + Wd(i.nu) -- and was verified bit-identical; see the header.
+                if (wmut)
+                  for (long l = 0; l < tools.nw_b; ++l) Wdyn(iq, l, M, N) = d;
+              }
+          if (sWw.has_value()) sWw->win().fence();
+          app_log(1, "  [CONSTRUNG] pi^dyn's rung forced STATIC and equal to W0bar at "
+                     "every i.nu:\n"
+                     "            max|W0bar - Z| = {:.4e}, max|W0bar| = {:.4e}. "
+                     "DIAGNOSTIC -- not physical.\n"
+                     "            THE PIN: pi^dyn and Pi^(C,0) are now ONE integral by two "
+                     "routes, so the X^L line\n"
+                     "            below must collapse to the grid's representability floor "
+                     "and [HEADPROJ] must show\n"
+                     "            |<H,pi^dyn>| ~ |<H,Pi^0>|. Anything larger is a defect in "
+                     "the equal-time path.",
+                  dmax, w0max);
+        }
+        nda::array<ComplexType, 3> const& Zpi_rung = (sec ? Zb_qmm : Z_qPQ);
         nda::array<ComplexType, 3> PiDyn0(nqpts_ibz, Naux_pi, Naux_pi);
         // ---- ROUTE A: eq:pibardynfact, the factorized equal-time primitive (default) ---
         // SUB-STAGE (inclusive in SIG_RESPONSE). Pole-free: two bubble builds and one
@@ -1989,12 +2481,12 @@ namespace solvers {
           _Timer.start("SIG_RESP_PIDYNF");
           PiDyn0() = ComplexType(0.0);
           if (sec)
-            vertex_pi::pi_dyn_factorized(tools, G_CC, _Xb_skma, Zb_qmm, &Wdyn_w,
+            vertex_pi::pi_dyn_factorized(tools, G_CC, _Xb_skma, Zpi_rung, &Wdyn,
                                          kmq, kpq, nda::range(0, nc), R0, PiDyn0,
                                          mpi->comm.rank(), mpi->comm.size(),
                                          skip_rung_gamma, nullptr, symc);
           else
-            vertex_pi::pi_dyn_factorized(tools, G_CC, X_C, Z_qPQ, &Wdyn_w,
+            vertex_pi::pi_dyn_factorized(tools, G_CC, X_C, Zpi_rung, &Wdyn,
                                          kmq, kpq, nda::range(0, nc), R0, PiDyn0,
                                          mpi->comm.rank(), mpi->comm.size(),
                                          skip_rung_gamma, nullptr, symc);
@@ -2011,12 +2503,12 @@ namespace solvers {
           nda::array<ComplexType, 4> Pid_wq(tools.nw_b, nqpts_ibz, Naux_pi, Naux_pi);
           Pid_wq() = ComplexType(0.0);
           if (sec)
-            vertex_pi::pi_c_accumulate_w(*_ft, tools, G_CC, _Xb_skma, Zb_qmm, &Wdyn_w,
+            vertex_pi::pi_c_accumulate_w(*_ft, tools, G_CC, _Xb_skma, Zpi_rung, &Wdyn,
                                          kmq, kpq, nda::range(0, nc), Pid_wq,
                                          mpi->comm.rank(), mpi->comm.size(),
                                          skip_rung_gamma, nullptr, symc);
           else
-            vertex_pi::pi_c_accumulate_w(*_ft, tools, G_CC, X_C, Z_qPQ, &Wdyn_w,
+            vertex_pi::pi_c_accumulate_w(*_ft, tools, G_CC, X_C, Zpi_rung, &Wdyn,
                                          kmq, kpq, nda::range(0, nc), Pid_wq,
                                          mpi->comm.rank(), mpi->comm.size(),
                                          skip_rung_gamma, nullptr, symc);
@@ -2079,6 +2571,35 @@ namespace solvers {
                          drel, ctol, _ft->eps());
           }
         }
+        // ---- DIAGNOSTIC (temporary, issue: B-L response 34x too large on Si) -----------
+        // build_delta_w's assume_reflection path takes the PLAIN TRANSPOSE Pi(q)^T in
+        // place of 1/2[Pi(q)^T + Pi(-q)], justified by Pi(-q) = Pi(q)^T. At a SELF-INVERSE
+        // transfer (every q of a Gamma-centred even mesh, e.g. Si 2x2x2) that identity
+        // reads Pi(q) = Pi(q)^T, i.e. the block must be SYMMETRIC. It was verified for
+        // Pi^{C,0}; it has never been checked for pi^dyn, which comes from a DIFFERENT
+        // algorithm (eq:pibardynfact's (12)/(34) rung-frequency grouping) than Pi^0's
+        // (14)/(23) external-frequency kernel. Measure both, per q.
+        {
+          auto qm_map = MF->qminus();
+          for (long iq = 0; iq < nqpts_ibz; ++iq) {
+            double a0 = 0.0, s0 = 0.0, ad = 0.0, sd = 0.0;
+            for (long M = 0; M < Naux_pi; ++M)
+              for (long N = 0; N < Naux_pi; ++N) {
+                a0 = std::max(a0, std::abs(Pi0(iq, M, N) - Pi0(iq, N, M)));
+                s0 = std::max(s0, std::abs(Pi0(iq, M, N)));
+                ad = std::max(ad, std::abs(PiDyn0(iq, M, N) - PiDyn0(iq, N, M)));
+                sd = std::max(sd, std::abs(PiDyn0(iq, M, N)));
+              }
+            app_log(1, "  [PAIRSYM] q = {} (qminus = {}, self-inverse = {}): "
+                       "asym(Pi^0) = {:.3e} / {:.3e} = {:.3e};  "
+                       "asym(pi^dyn) = {:.3e} / {:.3e} = {:.3e}",
+                    iq, qm_map(iq), (qm_map(iq) == iq ? "YES" : "no"),
+                    a0, s0, (s0 > 0.0 ? a0 / s0 : 0.0),
+                    ad, sd, (sd > 0.0 ? ad / sd : 0.0));
+          }
+        }
+        // keep the B-S middle factor so the two sandwiches can be compared below
+        PiStat = nda::array<ComplexType, 3>(Pi0);
         double xl = 0.0, p0 = 0.0;
         for (long iq = 0; iq < nqpts_ibz; ++iq)
           for (long M = 0; M < Naux_pi; ++M)
@@ -2088,6 +2609,7 @@ namespace solvers {
               p0 = std::max(p0, std::abs(Pi0(iq, M, N)));
               Pi0(iq, M, N) = d;              // Pi^L = pi^dyn - Pi^{C,0}(tau = 0)
             }
+        _diag_xl_rel = (p0 > 0.0 ? xl / p0 : 0.0);
         app_log(1, "  X^L diagnostic: max|pi^dyn - Pi^(C,0)(tau=0)| = {:.4e}, "
                    "relative to max|Pi^(C,0)(tau=0)| = {:.4e}  -> X^L/Pi^0 = {:.4f} "
                    "(vanishes iff the screening is truly static; theory diagnostic O3)",
@@ -2119,7 +2641,117 @@ namespace solvers {
 
       // (4) the response rung and the +-q Hadamard pair
       nda::array<ComplexType, 3> Dw(nqpts_ibz, Np, Np);
+      // ---- ENFORCE THE q -> 0 HEAD SUPPRESSION OF THE RESPONSE MIDDLE FACTOR -----------
+      // Delta w(q) = W0(q) Pi(q) W0(q) with W0 ~ v0 ~ 1/q^2 is finite as q -> 0 ONLY
+      // because a CONSERVING polarization has a head that vanishes like q^2 (f-sum rule /
+      // Ward). Without that suppression the Gamma microcell of the external q-sum behaves
+      // like 1/q^4, whose cell integral DIVERGES in 3D -- unlike the 1/q^2 of an ordinary
+      // rung sum, which is integrable (notes/head_corrections.pdf sections 2-3).
+      //
+      // MEASURED (Si kp222/nb60/M8, gygi, iteration 1 -- the only iteration whose G is not
+      // yet contaminated by the feedback):
+      //     |<H, Pi^{C,0}>| = 3.562e-09      <- B-S's middle factor: suppressed, exact
+      //     |<H, Pi^L>|     = 1.121e+00      <- B-L's: O(1), i.e. NOT suppressed
+      // The offending component is  (<H,Pi>/||H||_F^2) H, whose largest element is ~4.2
+      // against max|pi^dyn| ~ 10 -- about 41 % of the object, not a round-off residue.
+      // It is carried entirely by pi^dyn (Pi^{C,0} contributes 1.3e-08), and it survives
+      // BOTH pi^dyn routes identically (vertex_pidyn = "factorized" and "kernel" agree to
+      // seven digits), so it is NOT the eq:pibardynfact factorization.
+      //
+      // WHAT THIS DOES AND DOES NOT CLAIM. Removing the chi chi^dag component enforces a
+      // property the exact object HAS and that the sandwich REQUIRES; it is the same class
+      // of exact-symmetry projection as build_delta_w's +-q symmetrization and eval_Pi_C's
+      // pair-symmetry projection. It is NOT a repair of whatever upstream defect lets
+      // pi^dyn acquire the component in the first place -- that is still open, and the
+      // amount removed is logged every call so it stays visible rather than silent.
+      // B-S is unaffected by construction (it removes 1.3e-08 of a 7.4 object).
+      if (head_ok and _bl_head_projection) {
+        ComplexType hp(0.0, 0.0);
+        double hn = 0.0, pmax = 0.0;
+        for (long P = 0; P < Np; ++P)
+          for (long Q = 0; Q < Np; ++Q) {
+            hp += std::conj(H_PQ(P, Q)) * Pi0g(iq_gamma, P, Q);
+            hn += std::norm(H_PQ(P, Q));
+            pmax = std::max(pmax, std::abs(Pi0g(iq_gamma, P, Q)));
+          }
+        if (hn > 0.0) {
+          const ComplexType c = hp / ComplexType(hn);
+          double dmax = 0.0;
+          for (long P = 0; P < Np; ++P)
+            for (long Q = 0; Q < Np; ++Q) {
+              const ComplexType d = c * H_PQ(P, Q);
+              dmax = std::max(dmax, std::abs(d));
+              Pi0g(iq_gamma, P, Q) -= d;
+            }
+          _diag_head_removed = (pmax > 0.0 ? dmax / pmax : 0.0);
+          app_log(1, "  [WARNING] {} head-channel projection at q = Gamma is ENABLED: "
+                     "removed |<H,Pi>|/||H||^2 = {:.4e},\n"
+                     "            max|removed| = {:.4e} vs max|Pi(Gamma)| = {:.4e} "
+                     "({:.2f} %).\n"
+                     "            🚨 THIS BREAKS PHI-DERIVABILITY. The B-L G-side oracle "
+                     "shows that deleting only\n"
+                     "            20 % of this channel takes the eq:eulerBL1 residual from "
+                     "3.3e-11 to 1.6e-01 --\n"
+                     "            worse than the untransposed-sandwich control the same "
+                     "test exists to reject.\n"
+                     "            It is also applied to the SIGMA CUT ONLY (eval_Pi_C's "
+                     "P^{{C,L}} keeps its head),\n"
+                     "            so Sigma and P are no longer two cuts of one Phi. "
+                     "DIAGNOSTIC USE ONLY -- the\n"
+                     "            resulting energies are NOT conserving. See "
+                     "notes/bl_head_channel_diagnosis.md.",
+                  (lin ? "Sigma^(L,r)" : "Sigma^(C,r)"), std::abs(c), dmax, pmax,
+                  (pmax > 0.0 ? 100.0 * dmax / pmax : 0.0));
+        }
+      }
+
       vertex_detail::build_delta_w(W0g, Pi0g, qmin, Dw, /*assume_reflection*/ sym_mesh);
+
+      // ---- DIAGNOSTIC (temporary): WHERE does B-L's response excess come from? --------
+      // Sigma^r is exactly linear in the middle factor and B-S/B-L share this code, so
+      // max|Dw^L(q)| / max|Dw^S(q)| must track X^L/Pi^0 (~0.35) at EVERY q. If it does
+      // not, the excess is produced by the SANDWICH -- i.e. by how the rank-1 Gamma head
+      // of W0 projects the two middle factors -- and not by Pi^L itself. Also reports the
+      // head projection chi^dag Pi chi directly, which is the scalar the head amplifies.
+      if (lin and not sec and PiStat.shape(0) == nqpts_ibz) {
+        nda::array<ComplexType, 3> DwS(nqpts_ibz, Np, Np);
+        vertex_detail::build_delta_w(W0g, PiStat, qmin, DwS, sym_mesh);
+        for (long iq = 0; iq < nqpts_ibz; ++iq) {
+          double dl = 0.0, ds = 0.0, pl = 0.0, ps = 0.0;
+          for (long P = 0; P < Np; ++P)
+            for (long Q = 0; Q < Np; ++Q) {
+              dl = std::max(dl, std::abs(Dw(iq, P, Q)));
+              ds = std::max(ds, std::abs(DwS(iq, P, Q)));
+              pl = std::max(pl, std::abs(Pi0g(iq, P, Q)));
+              ps = std::max(ps, std::abs(PiStat(iq, P, Q)));
+            }
+          app_log(1, "  [SANDWICH] q = {}: max|Pi^L| / max|Pi^0| = {:.4f}   ||   "
+                     "max|Dw^L| = {:.4e}, max|Dw^S| = {:.4e}, RATIO = {:.4f}",
+                  iq, (ps > 0.0 ? pl / ps : 0.0), dl, ds, (ds > 0.0 ? dl / ds : 0.0));
+        }
+        // The scalar the rank-1 head actually picks out: the overlap of Pi with the head
+        // direction, <H, Pi> = sum_PQ conj(H_PQ) Pi_PQ. A CONSERVING polarization must
+        // have a vanishing head as q -> 0 (f-sum rule / Ward), so <H, Pi(Gamma)> should be
+        // strongly suppressed. If Pi^0 is suppressed and pi^dyn is not, their difference
+        // inherits pi^dyn's violation and the W0(Gamma) head sandwich amplifies it.
+        if (head_ok) {
+          ComplexType hl(0.0, 0.0), hs(0.0, 0.0);
+          double hn = 0.0;
+          for (long P = 0; P < Np; ++P)
+            for (long Q = 0; Q < Np; ++Q) {
+              const ComplexType h = std::conj(H_PQ(P, Q));
+              hl += h * Pi0g(iq_gamma, P, Q);
+              hs += h * PiStat(iq_gamma, P, Q);
+              hn += std::norm(H_PQ(P, Q));
+            }
+          _diag_head_hl = std::abs(hl);
+          _diag_head_hs = std::abs(hs);
+          app_log(1, "  [HEADPROJ] q = Gamma: |<H, Pi^L>| = {:.6e}, |<H, Pi^0>| = {:.6e}, "
+                     "RATIO = {:.4e};  |H|_F^2 = {:.4e} (a conserving Pi must SUPPRESS this)",
+                  std::abs(hl), std::abs(hs),
+                  (std::abs(hs) > 0.0 ? std::abs(hl) / std::abs(hs) : 0.0), hn);
+        }
+      }
       Sigma_r = nda::array<ComplexType, 5>(nt, ns, nk_ext, nbnd, nbnd);
       if (sym_mesh)
         vertex_detail::eval_sigma_C_response_sym(mpi->comm, thc, G_tskij, Dw, Sigma_r);
@@ -2131,6 +2763,7 @@ namespace solvers {
       for (auto const& v : Sigma_C) xmax = std::max(xmax, std::abs(v));
       utils::check(std::isfinite(rmax),
                    "vertex_t::eval_Sigma_C: Sigma^(C,r) contains NaN/Inf -- aborting.");
+      _diag_resp_share = (xmax > 0.0 ? rmax / xmax : 0.0);
       app_log(1, "  Sigma^({}): max|.| = {:.4e}; response share "
                  "||Sigma^(C,r)||/||Sigma^(C,x)|| = {:.4f} (large => the deleted rung "
                  "dynamics likely matters; theory diagnostic O3)",
@@ -2156,8 +2789,21 @@ namespace solvers {
     if (mb_state.mpi->node_comm.root()) {
       // Sigma^{C,r} is FULL-SPACE (its lines live in W0's unprojected RPA bubble), so it
       // is added over the whole band range -- unlike Sigma^{C,x}, which is strictly C-C.
-      if (stat) sSigma_tskij.local() += Sigma_r;
-      if (not wan) {
+      if (_bl_drop != 0)
+        app_log(1, "  [DROP] vertex_bl_drop = {} -- {} is being OMITTED from the "
+                   "accumulated Sigma.\n"
+                   "         DIAGNOSTIC ONLY: one cut without the other is NOT "
+                   "Phi-derivable and these\n"
+                   "         energies do not conserve. Used to read off each piece's exact "
+                   "energy share.",
+                _bl_drop, (_bl_drop == 1 ? "Sigma^(L,r), the response term"
+                           : _bl_drop == 2 ? "Sigma^(C,x), the kernel term"
+                                           : "BOTH Sigma^C pieces (P^{C,L} still injected, "
+                                             "so this isolates its effect via Sigma_GW)"));
+      if (stat and _bl_drop != 1 and _bl_drop != 3) sSigma_tskij.local() += Sigma_r;
+      if (_bl_drop == 2 or _bl_drop == 3) {
+        // kernel term dropped -- nothing to accumulate on the C-C block
+      } else if (not wan) {
         sSigma_tskij.local()(all, all, all, _band_window, _band_window) += Sigma_C;
       } else {
         const long nW = _band_window.size();
@@ -2345,11 +2991,15 @@ namespace solvers {
       if (not sec_z) {
         // GLOBAL path: dense rank-1 head (unchanged from the legacy build).
         H_PQ = nda::array<ComplexType, 2>(Np, Np);
-        head_ok = vertex_head_detail::build_head_rank1(thc, iq_gamma, nkpts, H_PQ);
+        head_ok = vertex_head_detail::build_head_rank1(thc, iq_gamma, nkpts, H_PQ,
+                                                                    _bl_head_scale);
       } else {
         // SECONDARY path: replicate build_head_rank1's skip logic EXACTLY (madelung == 0 or an
         // all-zero chi(iq_gamma, :) => head_ok = false, no head) WITHOUT the dense Np^2 matrix.
-        const double xi = MF->madelung();
+        // "EXACTLY" now includes the P0.3 head-strength lambda: this site must carry the same
+        // factor as build_head_rank1 or the global and secondary paths would scale the head
+        // differently, and the secondary path would silently ignore the knob.
+        const double xi = MF->madelung() * _bl_head_scale;
         auto chi = thc.basis_head();                 // (nqpts_ibz, Np)
         utils::check(chi.shape(0) > iq_gamma and chi.shape(1) == Np,
                      "vertex_t::eval_Pi_C: basis_head shape mismatch (({}, {}) vs iq_gamma = "
@@ -2791,12 +3441,12 @@ namespace solvers {
       app_log(1, "  Pi^C [rung = linear]: P^(C,L) = Pi^(C,0) with the STATIC rung W0bar "
                  "at FULL parent weight (instantaneous phase only; no pole algebra).");
       if (sec)
-        vertex_pi::pi_c_accumulate_w(*_ft, tools, G_CC, _Xb_skma, W0b_r, nullptr,
+        vertex_pi::pi_c_accumulate_w(*_ft, tools, G_CC, _Xb_skma, W0b_r, static_cast<nda::array<ComplexType, 4> const*>(nullptr),
                                      kmq, kpq, nda::range(0, nc), Pi_wqMN,
                                      mpi->comm.rank(), mpi->comm.size(),
                                      skip_rung_gamma, &qx_diag, symc, &phase_diag);
       else
-        vertex_pi::pi_c_accumulate_w(*_ft, tools, G_CC, X_C, W0b_r, nullptr,
+        vertex_pi::pi_c_accumulate_w(*_ft, tools, G_CC, X_C, W0b_r, static_cast<nda::array<ComplexType, 4> const*>(nullptr),
                                      kmq, kpq, nda::range(0, nc), Pi_wqMN,
                                      mpi->comm.rank(), mpi->comm.size(),
                                      skip_rung_gamma, &qx_diag, symc, &phase_diag);
@@ -2821,6 +3471,76 @@ namespace solvers {
     // into the RPA grid (reduce_scatter_into). This removes the full-array all_reduce and
     // the persistent full replicated Pi_up / Pi_tqMN. Only qx_diag (tiny) is all_reduced.
     mpi->comm.all_reduce_in_place_n(qx_diag.data(), qx_diag.size(), std::plus<>{});
+
+    // ---- PROJECT P^C ONTO ITS EXACT SYMMETRY CLASS ------------------------------------
+    //   P_PQ(q) = P_QP(-q)     (exact; the same relation every rung obeys)
+    // The computed P^C satisfies it only to round-off. That would be harmless -- except
+    // that B-L (and the dynamic theory) INJECT P^C into the Dyson equation
+    //   W = v + v (P_RPA + P^C) W,
+    // which closes a loop W -> Sigma -> G -> P -> W. Measured on Si (kp222/nb60/M8), the
+    // resulting non-Hermitian component GROWS BY 3-4x PER ITERATION:
+    //   Im(e_corr)/Re(e_corr) = 3.8e-8 -> 1.2e-7 -> 6.2e-7 -> 1.5e-6 -> 4.9e-6 ...
+    // reaching 1.9e-2, while B-S -- identical system, identical head policy, but P stays
+    // RPA so no feedback path exists -- shows no imaginary part at all over 10 iterations.
+    // The seed is round-off (an unrelated numerical change halved it and left the growth
+    // rate untouched); what matters is that the loop gain exceeds 1 and nothing projects
+    // the illegal component out. Delta w has always been projected this way
+    // (vertex_detail::build_delta_w); P^C never was.
+    //
+    // Applied to the PARTIAL: the projection is LINEAR, so it commutes with the
+    // round-robin rank sum exactly as the upfold and the tau conversion do (same identity
+    // cited above). The q axis is full on every rank, so this costs no communication.
+    {
+      auto qminus_map = MF->qminus();
+      long n_done = 0, n_skip = 0;
+      double d_max = 0.0, sc_max = 0.0;
+      for (long iq = 0; iq < nqpts_ibz; ++iq) {
+        const long iqm = qminus_map(iq);
+        // Under an IBZ mesh -q need not be a stored row; those q are left alone (and
+        // counted). NOTE a Gamma-centred EVEN mesh (e.g. 2x2x2) has 2q = G for every q,
+        // i.e. every transfer is SELF-INVERSE -- there iqm == iq and coverage is complete.
+        if (iqm >= nqpts_ibz) { ++n_skip; continue; }
+        if (iqm < iq) continue;                    // already handled with its partner
+        ++n_done;
+        for (long l = 0; l < tools.nw_b; ++l) {
+          auto A = Pi_wqMN(l, iq, all, all);
+          if (iqm == iq) {
+            // self-inverse transfer: the relation reduces to P(q) = P(q)^T
+            for (long M = 0; M < naux; ++M)
+              for (long N = M; N < naux; ++N) {
+                const ComplexType s = 0.5 * (A(M, N) + A(N, M));
+                d_max = std::max(d_max, std::abs(A(M, N) - A(N, M)));
+                sc_max = std::max(sc_max, std::abs(A(M, N)));
+                A(M, N) = s;  A(N, M) = s;
+              }
+          } else {
+            // P_sym(q)_MN == P_sym(-q)_NM, so each (M,N) writes exactly the two slots it
+            // reads -- safe in place, no temporary.
+            auto B = Pi_wqMN(l, iqm, all, all);
+            for (long M = 0; M < naux; ++M)
+              for (long N = 0; N < naux; ++N) {
+                const ComplexType s = 0.5 * (A(M, N) + B(N, M));
+                d_max = std::max(d_max, std::abs(A(M, N) - B(N, M)));
+                sc_max = std::max(sc_max, std::abs(A(M, N)));
+                A(M, N) = s;  B(N, M) = s;
+              }
+          }
+        }
+      }
+      double gl[2] = {d_max, sc_max};
+      mpi->comm.all_reduce_in_place_n(gl, 2, boost::mpi3::max<>{});
+      app_log(2, "  Pi^C pair-symmetry projection: {} of {} stored q projected ({} left "
+                 "(no stored -q); rank-local |P_PQ(q) - P_QP(-q)| = {:.3e}, scale {:.3e})",
+              n_done, nqpts_ibz, n_skip, gl[0], gl[1]);
+      if (n_skip > 0)
+        app_log(1, "  [WARNING] Pi^C: {} of {} stored transfers have no stored -q partner "
+                   "(IBZ mesh), so the\n"
+                   "            pair-symmetry projection could not be applied there. In a "
+                   "theory that injects\n"
+                   "            P^C into the Dyson equation (linear / dynamic rung) the "
+                   "unprojected component is\n"
+                   "            amplified by the self-consistency loop.", n_skip, nqpts_ibz);
+    }
 
     // ---- KERNEL SCALES (2026-07-27 divergence hunt) -----------------------------------
     // Pi^C is MULTILINEAR in (G,G,G,G,W): bounded inputs => Lipschitz, so a ~1e-4 change in
@@ -3120,7 +3840,8 @@ namespace solvers {
     nda::array<ComplexType, 2> H_PQ(Np, Np);
     bool head_ok = false;
     if (head_insertion) {
-      head_ok = vertex_head_detail::build_head_rank1(thc, iq_gamma, nkpts, H_PQ);
+      head_ok = vertex_head_detail::build_head_rank1(thc, iq_gamma, nkpts, H_PQ,
+                                                                    _bl_head_scale);
       if (not head_ok)
         app_log(1, "  [WARNING] cache_w: gygi head insertion requested but head data "
                    "are unusable\n"
@@ -3140,7 +3861,13 @@ namespace solvers {
           mb_state.dW_qtPQ.value(), mpi->comm, nqpts_ibz, nt_half, Np);
 
       if (head_ok) {
-        if (mb_state.eps_inv_head.has_value()) {
+        if (_bl_head_static_all and _rung == linear_rung) {
+          // H1 (see _bl_head_static_all): the cached B-L rung must be analytic-head-free
+          // in its dynamic part, exactly like eval_Sigma_C's Wt_qtPQ -- the static-weight
+          // head rides the instantaneous slot at the consumer.
+          app_log(1, "  cache_w head insertion [H1 STATIC]: dynamic piece SKIPPED for the "
+                     "cached B-L rung (dW is analytic-head-free).");
+        } else if (mb_state.eps_inv_head.has_value()) {
           auto& eps = mb_state.eps_inv_head.value();
           utils::check(eps.shape(0) == nt_half,
                        "vertex_t::cache_w: eps_inv_head size {} != nt_half = {}.",
@@ -3464,7 +4191,12 @@ namespace solvers {
     if (head_insertion) {
       // SAME skip logic as vertex_head_detail::build_head_rank1 (madelung == 0 or an
       // all-zero chi(Gamma, :) => no head), rank-1 form, no dense Np^2 head.
-      const double xi = MF->madelung();
+      // ⚠ THE P0.3 lambda MUST BE APPLIED HERE TOO. W0 is the object B-L expands AROUND
+      // (dW = W - W0), so scaling the head in the rungs but not in W0 would not weaken the
+      // head -- it would create a W0-vs-W head-weight MISMATCH, which is a different effect
+      // that has already been measured and refuted as a cause (2.6e-04 in e_corr,
+      // notes/bl_head_channel_diagnosis.md section 4.2). One lambda, every site.
+      const double xi = MF->madelung() * _bl_head_scale;
       auto chi = thc.basis_head();                              // (nqpts_ibz, Np)
       utils::check(chi.shape(0) > iq_gamma and chi.shape(1) == Np,
                    "vertex_t::build_w0: basis_head shape mismatch (({}, {}) vs iq_gamma = "
@@ -3495,6 +4227,60 @@ namespace solvers {
                    "  Re[eps^-1_head(i.nu=0) - 1] = {:.6e}  =>  epsilon_inf(RPA, W0) = "
                    "{:.6f}",
                 xi, _w0_head_c.real(), _w0_eps_head, 1.0 / (1.0 + _w0_eps_head));
+
+        // ---- DIAGNOSTIC: take W0's Gamma head weight from the SAME eps^-1 that W uses --
+        // WHY THIS KNOB EXISTS. B-L expands in dW = W - W0, and W0 is the RPA-STATIC
+        // screen by definition (theoryB_static sec:BLmisc, "the kernel is the RPA-static
+        // screen"), while the run's own W carries P^{C,L}. That is a deliberate choice and
+        // the residue is nominally O(vertex^2). MEASURED on Si kp222/nb60/M8 at the B-L
+        // fixed point, it is not small where it matters:
+        //     head weight in W0 (RPA-only, this line) : Re[eps^-1 - 1] = -0.529172
+        //     head weight in W  (vertex-corrected)    : Re[eps^-1 - 1] = -0.568408
+        //     difference                              :                  -0.039236  (7.4 %)
+        // The head is rank-1, so that offset contributes  0.039236 * |H|_max = 1.576e-05
+        // to  |W(q,0) - W0(q)|_max, which the existing diagnostic reports as 1.684e-05:
+        // the Gamma head alone is 94 % OF THE ENTIRE "vertex correction to the static
+        // screen", and only 1.78 % in max-norm because max-norm cannot see a coherent
+        // rank-1 channel. The W0 . Pi . W0 sandwich then amplifies exactly that channel by
+        // c^2 ||chi||^4. (Second time a max-norm gate has hidden the head channel -- the
+        // vertex_pidyn = "check" gate missed the same thing at 2e-10.)
+        //
+        // Turning this on makes the head part of dW(Gamma, i.nu = 0) vanish (up to the
+        // one-iteration lag below), leaving W0's BODY RPA-static as the theory specifies.
+        // It isolates whether the head-channel residue is what drives B-L's instability.
+        //
+        // NOT THE DEFAULT, and note the tag change it implies: build_w0 runs immediately
+        // after Pi_RPA and BEFORE Pi^C is added (scr_coulomb_t.cpp:464-476), so
+        // mb_state.eps_inv_head is still the PREVIOUS iteration's vertex-corrected head.
+        // That one-iteration lag is the very thing _w0_eps_head was introduced to avoid;
+        // it vanishes at the fixed point (measured: consecutive iterations differ by ~2e-6
+        // there, against the 3.9e-2 it removes), so it is acceptable for a diagnostic and
+        // would need thought before ever becoming a default.
+        if (_bl_w0_head_from_w) {
+          if (mb_state.eps_inv_head.has_value()) {
+            auto &eih = mb_state.eps_inv_head.value();
+            const long nw_half =
+                (_ft->nw_b() % 2 == 0) ? _ft->nw_b() / 2 : _ft->nw_b() / 2 + 1;
+            nda::array<ComplexType, 2> eih_w(nw_half, 1);
+            auto eih_t = nda::reshape(eih, std::array<long, 2>{eih.shape(0), 1});
+            _ft->tau_to_w_PHsym(eih_t, eih_w);   // i.nu = 0 is index 0 of the PH-sym half
+            const double from_w = eih_w(0, 0).real();
+            app_log(1, "  [W0HEADFROMW] W0's Gamma head weight OVERRIDDEN: RPA-static "
+                       "{:.6e} -> W's own {:.6e} (difference {:.6e}, {:.2f} % of the "
+                       "RPA-static value). DIAGNOSTIC: makes the head part of "
+                       "W(Gamma,0) - W0(Gamma) vanish up to a one-iteration lag; W0's "
+                       "BODY stays RPA-static.",
+                    _w0_eps_head, from_w, from_w - _w0_eps_head,
+                    (_w0_eps_head != 0.0 ? 100.0 * (from_w - _w0_eps_head) / _w0_eps_head
+                                         : 0.0));
+            _w0_eps_head = from_w;
+          } else {
+            app_log(1, "  [WARNING] vertex_bl_w0_head_from_w is set but MBState carries no "
+                       "eps_inv_head yet\n"
+                       "            (first update of a cold run) -- keeping the RPA-static "
+                       "head weight this iteration.");
+          }
+        }
       }
     }
     if (not head_insertion)

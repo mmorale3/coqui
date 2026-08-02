@@ -91,6 +91,60 @@ namespace bdft_tests {
     inline long kminus(long k) { return (nk - k) % nk; }
 
     /**
+     * A q-resolved rung matrix carrying the symmetry EVERY rung object of this kernel must
+     * have: Hermitian per q, AND
+     *
+     *     M_{PQ}(q) = M_{QP}(-q).
+     *
+     * That second condition BINDS at a self-inverse transfer (q = -q: Gamma, and the
+     * zone-boundary points of an even mesh). There it forces M(q) to be REAL SYMMETRIC,
+     * not merely Hermitian. Writing the +q and -q blocks in a single pass silently
+     * violates it exactly there -- both writes land on the same element and the last one
+     * wins -- which is how the B-L oracles came to be fed an ILLEGAL rung.
+     *
+     * Why it matters, and why nothing else notices: Sigma^C is the Eq.-(10) pattern, i.e.
+     * ONE of the four ways to cut a G line out of Phi_2. It equals dPhi/dG only because
+     * the diagram's C4 rotation makes all four cuts equal -- and that rotation TRANSPOSES
+     * a rung's (row pair, col pair). So the four cuts are equal iff the rung obeys the
+     * relation above. Feed a rung that does not and the G-side oracle breaks by O(10%)
+     * with no other symptom: the W-side oracle, the Euler identities and the
+     * Sigma-vs-reference pins are all blind to it.
+     *
+     * The model's own Z_qPQ has always been built correctly (it uses a REAL draw at the
+     * self-inverse q); only the B-L perturbations did not. Use rung_sym_err() to assert it.
+     */
+    inline nda::array<cplx, 3> make_rung(unsigned long seed, double scale) {
+      rng_t rg(seed);
+      nda::array<cplx, 3> M(nk, Np, Np);
+      M() = cplx(0.0);
+      for (long q = 0; q < nk; ++q) {
+        if (kminus(q) < q) continue;
+        const long qm = kminus(q);
+        const bool self = (qm == q);
+        for (long P = 0; P < Np; ++P)
+          for (long Q = P; Q < Np; ++Q) {
+            // Hermitian diagonal is real; a self-inverse q is real SYMMETRIC throughout
+            cplx v = scale * ((self or P == Q) ? cplx(rg.u(), 0.0) : rg.z());
+            M(q, P, Q) = v;   M(q, Q, P) = std::conj(v);
+            if (not self) { M(qm, Q, P) = v;  M(qm, P, Q) = std::conj(v); }
+          }
+      }
+      return M;
+    }
+
+    /** max |M_{PQ}(q) - M_{QP}(-q)|, relative to max|M|. Must be ~0 for a legal rung. */
+    inline double rung_sym_err(nda::array<cplx, 3> const &M) {
+      double d = 0.0, sc = 0.0;
+      for (long q = 0; q < nk; ++q)
+        for (long P = 0; P < Np; ++P)
+          for (long Q = 0; Q < Np; ++Q) {
+            d = std::max(d, std::abs(M(q, P, Q) - M(kminus(q), Q, P)));
+            sc = std::max(sc, std::abs(M(q, P, Q)));
+          }
+      return (sc > 0.0) ? d / sc : 0.0;
+    }
+
+    /**
      * Toy THC model carrying the REALITY symmetry. Built on a k half-set and mirrored:
      *   eps(-k) = eps(k),  Pr(-k) = conj Pr(k),  X(-k) = conj X(k),  Z(-q) = conj Z(q)
      * (self-inverse points made real). With a Hermitian per-k spectral projector this
@@ -317,7 +371,7 @@ namespace bdft_tests {
       solvers::vertex_detail::eval_sigma_C_g3w2(ft, comm, C(), G, mdl.X_skPa, Wstub, W0,
                                                 mdl.kmq, mdl.qmin, /*iq_gamma*/ 0,
                                                 /*skip_rung_gamma*/ false,
-                                                /*rung_mode*/ 1, nullptr, nullptr, S);
+                                                /*rung_mode*/ 1, static_cast<nda::array<ComplexType, 4> const*>(nullptr), nullptr, S);
       return S;
     };
 
@@ -345,7 +399,7 @@ namespace bdft_tests {
 
       nda::array<cplx, 4> Pi_wq(nw_b, nk, Np, Np);
       Pi_wq() = cplx(0.0);
-      vertex_pi::pi_c_accumulate_w(ft, tools, G_CC, X_C, W0, /*Wdyn*/ nullptr,
+      vertex_pi::pi_c_accumulate_w(ft, tools, G_CC, X_C, W0, static_cast<nda::array<ComplexType, 4> const*>(nullptr),
                                    mdl.kmq, mdl.kpq, nda::range(0, ncw), Pi_wq,
                                    comm.rank(), comm.size());
       comm.all_reduce_in_place_n(Pi_wq.data(), Pi_wq.size(), std::plus<>{});
@@ -784,7 +838,7 @@ namespace bdft_tests {
           for (long P = 0; P < Np; ++P)
             for (long a = 0; a < ncw; ++a) X_C(s, k, P, a) = mdl.X_skPa(s, k, P, a);
       PCL_w() = cplx(0.0);
-      vertex_pi::pi_c_accumulate_w(ft, tools, G_CC, X_C, W0, /*Wdyn*/ nullptr,
+      vertex_pi::pi_c_accumulate_w(ft, tools, G_CC, X_C, W0, static_cast<nda::array<ComplexType, 4> const*>(nullptr),
                                    mdl.kmq, mdl.kpq, nda::range(0, ncw), PCL_w,
                                    comm.rank(), comm.size());
       comm.all_reduce_in_place_n(PCL_w.data(), PCL_w.size(), std::plus<>{});
@@ -798,20 +852,8 @@ namespace bdft_tests {
     const double Om = 0.83;
     nda::array<cplx, 4> dW_qw(nk, nw_b, Np, Np), dW_wq(nw_b, nk, Np, Np);
     {
-      rng_t rg(4242);
-      nda::array<cplx, 3> M(nk, Np, Np);
-      M() = cplx(0.0);
-      for (long q = 0; q < nk; ++q) {
-        if (kminus(q) < q) continue;
-        const long qm = kminus(q);
-        for (long P = 0; P < Np; ++P)
-          for (long Q = P; Q < Np; ++Q) {
-            cplx v = rg.z();
-            if (P == Q) v = cplx(v.real(), 0.0);        // Hermitian diagonal is real
-            M(q, P, Q) = v;   M(q, Q, P) = std::conj(v);
-            M(qm, Q, P) = v;  M(qm, P, Q) = std::conj(v);   // dW(-q) = dW(q)^T
-          }
-      }
+      auto M = make_rung(4242, 1.0);
+      REQUIRE(rung_sym_err(M) < 1e-14);   // the rung symmetry the Sigma pattern assumes
       for (long q = 0; q < nk; ++q)
         for (long l = 0; l < nw_b; ++l) {
           const double nu = double(tools.wn_b(l)) * M_PI / beta;
@@ -854,20 +896,8 @@ namespace bdft_tests {
     nda::array<cplx, 4> dW_base(nk, nw_b, Np, Np);
     {   // a nonzero base point, so the test is not secretly evaluated at dW = 0 (the B-S
         // limit) where the mixed terms vanish and the W-dependence would be untested
-      rng_t rg(1717);
-      nda::array<cplx, 3> B(nk, Np, Np);
-      B() = cplx(0.0);
-      for (long q = 0; q < nk; ++q) {
-        if (kminus(q) < q) continue;
-        const long qm = kminus(q);
-        for (long P = 0; P < Np; ++P)
-          for (long Q = P; Q < Np; ++Q) {
-            cplx v = 0.4 * rg.z();
-            if (P == Q) v = cplx(v.real(), 0.0);
-            B(q, P, Q) = v;   B(q, Q, P) = std::conj(v);
-            B(qm, Q, P) = v;  B(qm, P, Q) = std::conj(v);
-          }
-      }
+      auto B = make_rung(1717, 0.4);
+      REQUIRE(rung_sym_err(B) < 1e-14);
       const double Ob = 1.31;
       for (long q = 0; q < nk; ++q)
         for (long l = 0; l < nw_b; ++l) {
@@ -924,6 +954,314 @@ namespace bdft_tests {
       app_log(1, "fdoracle_bl_wside [{}]: CONTROL sign-flipped P^(C,L) -> rel = {:.3e} "
                  "(must be O(1))", prec, r_neg);
       REQUIRE(r_neg > 1.0);
+    }
+#endif
+  }
+
+  /**
+   * DIAGNOSTIC (temporary): pin the MIXED reductions S1/S2 against the ALREADY-PINNED
+   * doubly-instantaneous reduction S3.
+   *
+   * S1/S2 are BILINEAR in (x-rung, y-rung) exactly as S3 is, and the kernel is LINEAR in
+   * the Z slot separately for each rung. So if the "dynamic" rung handed to rung_mode = 2
+   * is a CONSTANT in i.nu, call it D, the mixed terms must be reproducible through the S3
+   * route alone by expanding the bilinear form:
+   *
+   *   S3[W0 + D, W0 + D] = S3[W0,W0] + S3[W0,D] + S3[D,W0] + S3[D,D]
+   *
+   * hence   S3[W0,D] + S3[D,W0] = static(W0+D) - static(W0) - static(D),
+   * while   S1[W0,D] + S2[D,W0] = linear(Z = W0, dW = D) - static(W0).
+   *
+   * The two right-hand sides use DISJOINT code paths (S3 only vs S1/S2 only) but must be
+   * the same object. A mismatch convicts the ORBITAL/MOMENTUM ROUTING of S1/S2 (the
+   * frequency algebra is trivial here -- D is a constant); a match exonerates the routing
+   * and moves the suspicion to the frequency handling of a genuinely dynamic rung.
+   */
+  TEST_CASE("vertex_mixpin", "[methods][vertex][fdoracle][bl]") {
+#ifndef ENABLE_DLR
+    SUCCEED("vertex_mixpin skipped: build has ENABLE_DLR=OFF.");
+#else
+    using namespace fdo;
+    auto &mpi_context = utils::make_unit_test_mpi_context();
+    auto comm = mpi_context->comm;
+
+    imag_axes_ft::IAFT ft(beta, wmax, imag_axes_ft::dlr_basis, "medium");
+    iaft_tools tools(ft);
+    const long nt = ft.nt_f(), nw_b = ft.nw_b();
+    model_t mdl;
+    auto G0 = mdl.G_tau(ft);
+
+    auto const &W0 = mdl.Z_qPQ;
+
+    // a SECOND fixed rung D, same symmetry class as W0 (Hermitian, D(-q) = D(q)^T)
+    auto D = make_rung(20260730, 0.37);
+    REQUIRE(rung_sym_err(D) < 1e-14);
+    nda::array<cplx, 3> WpD(nk, Np, Np);
+    for (long i = 0; i < WpD.size(); ++i) WpD.data()[i] = W0.data()[i] + D.data()[i];
+
+    nda::array<cplx, 4> Wstub(nk, 0, Np, Np);
+    auto sigma_static = [&](nda::array<cplx, 3> const &Zin) {
+      nda::array<cplx, 5> S(nt, ns, nk, nbnd, nbnd);
+      solvers::vertex_detail::eval_sigma_C_g3w2(ft, comm, C(), G0, mdl.X_skPa, Wstub, Zin,
+                                                mdl.kmq, mdl.qmin, 0, false,
+                                                /*rung_mode*/ 1, static_cast<nda::array<ComplexType, 4> const*>(nullptr), nullptr, S);
+      return S;
+    };
+    // rung_mode = 2 with a nu-INDEPENDENT "dW"
+    nda::array<cplx, 4> Dw_qw(nk, nw_b, Np, Np);
+    for (long q = 0; q < nk; ++q)
+      for (long l = 0; l < nw_b; ++l)
+        for (long P = 0; P < Np; ++P)
+          for (long Q = 0; Q < Np; ++Q) Dw_qw(q, l, P, Q) = D(q, P, Q);
+
+    nda::array<cplx, 5> S_lin(nt, ns, nk, nbnd, nbnd);
+    solvers::vertex_detail::eval_sigma_C_g3w2(ft, comm, C(), G0, mdl.X_skPa, Wstub, W0,
+                                              mdl.kmq, mdl.qmin, 0, false,
+                                              /*rung_mode*/ 2, &Dw_qw, nullptr, S_lin);
+
+    auto S_W0  = sigma_static(W0);
+    auto S_D   = sigma_static(D);
+    auto S_WpD = sigma_static(WpD);
+
+    double num = 0.0, den = 0.0, den_tot = 0.0;
+    for (long i = 0; i < S_lin.size(); ++i) {
+      const cplx mix_S1S2 = S_lin.data()[i] - S_W0.data()[i];
+      const cplx mix_S3   = S_WpD.data()[i] - S_W0.data()[i] - S_D.data()[i];
+      num = std::max(num, std::abs(mix_S1S2 - mix_S3));
+      den = std::max(den, std::abs(mix_S3));
+      den_tot = std::max(den_tot, std::abs(S_lin.data()[i]));
+    }
+    app_log(1, "vertex_mixpin: max|(S1+S2) - (S3 route)| = {:.4e}, scale |mixed| = {:.4e} "
+               "(rel {:.4e}), scale |Sigma^(C,L)| = {:.4e}",
+            num, den, num / den, den_tot);
+    REQUIRE(den > 1e-10);
+    REQUIRE(num < 1e-10 * den);
+#endif
+  }
+
+  /**
+   * SLOT-RESOLVED cut symmetry -- the sharpest form of "Sigma^C = dPhi/dG".
+   *
+   * Write Phi = (1/4) F(G,G,G,G) with the multilinear form
+   *     F(g_A0, g_B, g_C, g_D) := T[ Sigma^C(g_B, g_C, g_D), g_A0 ],
+   * the four slots being the four G lines of Phi_2 (A0 = the line the kernel cuts open;
+   * B, C, D = its three internal lines). Then dPhi/dl = (1/4) sum_i F(dG in slot i),
+   * whereas the kernel asserts T[Sigma, dG] = F(dG in slot A0). Those agree IFF F is
+   * invariant under the diagram's C4 rotation of its slots -- so this test measures all
+   * four cuts SEPARATELY (via sigma_C_slot_probe) instead of only their average.
+   *
+   * WHY IT EXISTS. The G-side oracle sees only the average, so when it fails it cannot say
+   * WHICH cut moved. Run slot-resolved, the failure fingerprint is unmistakable: the
+   * profile came out in arithmetic progression along the 4-cycle, invariant under exactly
+   * the reflection that transposes the LEGAL rung and broken under the one that transposes
+   * the illegal one. That identified the culprit -- rungs violating W_PQ(q) = W_QP(-q) at
+   * the self-inverse transfer -- in one measurement, after the aggregate oracle had been
+   * misread as convicting the mixed Sigma terms (eq:mixgw), which are in fact exact.
+   *
+   * The test covers B-S (S3) and both B-L mixed reductions (S1, S2), with constant and
+   * nu-dependent rungs, and carries the illegal-rung positive control at the end.
+   */
+  TEST_CASE("vertex_slotprobe", "[methods][vertex][fdoracle][bl]") {
+#ifndef ENABLE_DLR
+    SUCCEED("vertex_slotprobe skipped: build has ENABLE_DLR=OFF.");
+#else
+    using namespace fdo;
+    auto &mpi_context = utils::make_unit_test_mpi_context();
+    auto comm = mpi_context->comm;
+
+    std::string prec = GENERATE(std::string("medium"), std::string("high"));
+    imag_axes_ft::IAFT ft(beta, wmax, imag_axes_ft::dlr_basis, prec);
+    iaft_tools tools(ft);
+    const long nt = ft.nt_f(), nw_b = ft.nw_b();
+    model_t mdl;
+    auto G0 = mdl.G_tau(ft);
+    auto const &W0 = mdl.Z_qPQ;
+
+    auto tau_integral = [&](nda::array<cplx, 1> const &f_t) {
+      cplx acc(0.0);
+      for (long it = 0; it < nt; ++it) acc += tools.Twt_bb(tools.m0, it) * f_t(it);
+      return acc;
+    };
+    auto pairing = [&](nda::array<cplx, 5> const &A, nda::array<cplx, 5> const &B,
+                       long nrow, long ncol) {
+      cplx tot(0.0);
+      nda::array<cplx, 1> f_t(nt);
+      for (long s = 0; s < ns; ++s)
+        for (long k = 0; k < nk; ++k)
+          for (long a = 0; a < nrow; ++a)
+            for (long b = 0; b < ncol; ++b) {
+              for (long it = 0; it < nt; ++it)
+                f_t(it) = A(it, s, k, a, b) * B(tools.t_mirror(it), s, k, a, b);
+              tot += -tau_integral(f_t) / double(nk);
+            }
+      return tot;
+    };
+
+    // dG: same construction as the oracles (representable, k-reality-symmetric, non-Herm.)
+    nda::array<cplx, 5> dG(nt, ns, nk, nbnd, nbnd);
+    {
+      rng_t rg(90210);
+      const double de[3] = {-0.33, 0.19, 0.71};
+      nda::array<cplx, 5> Amp(ns, nk, nbnd, nbnd, nbnd);
+      Amp() = cplx(0.0);
+      for (long s = 0; s < ns; ++s)
+        for (long k = 0; k < nk; ++k) {
+          if (kminus(k) < k) continue;
+          const long km = kminus(k);
+          for (long r = 0; r < nbnd; ++r)
+            for (long a = 0; a < nbnd; ++a)
+              for (long b = 0; b < nbnd; ++b) {
+                if (km == k) {
+                  if (b < a) continue;
+                  cplx v = rg.z();
+                  Amp(s, k, r, a, b) = v;  Amp(s, k, r, b, a) = v;
+                } else {
+                  cplx v = rg.z();
+                  Amp(s, k, r, a, b) = v;  Amp(s, km, r, b, a) = v;
+                }
+              }
+        }
+      auto xm = ft.tau_mesh();
+      dG() = cplx(0.0);
+      for (long it = 0; it < nt; ++it) {
+        const double tau = (xm(it) + 1.0) * 0.5 * beta;
+        for (long s = 0; s < ns; ++s)
+          for (long k = 0; k < nk; ++k)
+            for (long r = 0; r < nbnd; ++r) {
+              const double g = g_tau(de[r], tau);
+              for (long a = 0; a < nbnd; ++a)
+                for (long b = 0; b < nbnd; ++b)
+                  dG(it, s, k, a, b) += g * Amp(s, k, r, a, b);
+            }
+      }
+    }
+
+    // a nu-DEPENDENT dW (Lorentzian, no constant piece) with dW(-q) = dW(q)^T Hermitian
+    const double Om = 1.07;
+    nda::array<cplx, 4> dW_qw(nk, nw_b, Np, Np);
+    {
+      auto M = make_rung(31337, 0.5);
+      REQUIRE(rung_sym_err(M) < 1e-14);
+      for (long q = 0; q < nk; ++q)
+        for (long l = 0; l < nw_b; ++l) {
+          const double nu = double(tools.wn_b(l)) * M_PI / beta;
+          const double s = 2.0 * Om / (Om * Om + nu * nu);
+          for (long P = 0; P < Np; ++P)
+            for (long Q = 0; Q < Np; ++Q) dW_qw(q, l, P, Q) = M(q, P, Q) * s;
+        }
+    }
+
+    // a nu-INDEPENDENT control rung, same symmetry class
+    nda::array<cplx, 4> Dc_qw(nk, nw_b, Np, Np);
+    {
+      auto Dm = make_rung(20260730, 0.37);
+      for (long q = 0; q < nk; ++q)
+        for (long l = 0; l < nw_b; ++l)
+          for (long P = 0; P < Np; ++P)
+            for (long Q = 0; Q < Np; ++Q) Dc_qw(q, l, P, Q) = Dm(q, P, Q);
+    }
+
+    nda::array<cplx, 3> Dconst(nk, Np, Np), WpD(nk, Np, Np);
+    for (long q = 0; q < nk; ++q)
+      for (long P = 0; P < Np; ++P)
+        for (long Q = 0; Q < Np; ++Q) {
+          Dconst(q, P, Q) = Dc_qw(q, 0, P, Q);
+          WpD(q, P, Q) = W0(q, P, Q) + Dconst(q, P, Q);
+        }
+
+    nda::array<cplx, 4> Wstub(nk, 0, Np, Np);
+    // Sigma with slot overrides + term selection in place
+    auto sigma = [&](int mode, int only, nda::array<cplx, 3> const &Zin,
+                     nda::array<cplx, 4> const *rung,
+                     nda::array<cplx, 5> const *pB, nda::array<cplx, 5> const *pC,
+                     nda::array<cplx, 5> const *pD) {
+      solvers::vertex_detail::sigma_C_slot_probe.B = pB;
+      solvers::vertex_detail::sigma_C_slot_probe.C = pC;
+      solvers::vertex_detail::sigma_C_slot_probe.D = pD;
+      solvers::vertex_detail::sigma_C_slot_probe.only_term = only;
+      nda::array<cplx, 5> S(nt, ns, nk, nbnd, nbnd);
+      solvers::vertex_detail::eval_sigma_C_g3w2(
+          ft, comm, C(), G0, mdl.X_skPa, Wstub, Zin, mdl.kmq, mdl.qmin, 0, false,
+          mode, rung, nullptr, S);
+      solvers::vertex_detail::sigma_C_slot_probe.clear();
+      return S;
+    };
+
+    auto report = [&](const char *tag, std::array<cplx, 4> const &f) {
+      const cplx avg = 0.25 * (f[0] + f[1] + f[2] + f[3]);
+      const double flat = std::abs(f[0] - avg) / std::abs(avg);
+      app_log(1, "vertex_slotprobe [{}] {}:\n"
+                 "    A0 = {:.10e}{:+.10e}i   B  = {:.10e}{:+.10e}i\n"
+                 "    C  = {:.10e}{:+.10e}i   D  = {:.10e}{:+.10e}i\n"
+                 "    |A0-avg|/|avg| = {:.4e}   |A0-C|/|A0| = {:.4e}   "
+                 "|B-D|/|B| = {:.4e}",
+              prec, tag, f[0].real(), f[0].imag(), f[1].real(), f[1].imag(),
+              f[2].real(), f[2].imag(), f[3].real(), f[3].imag(), flat,
+              std::abs(f[0] - f[2]) / std::abs(f[0]),
+              std::abs(f[1] - f[3]) / std::abs(f[1]));
+      return flat;
+    };
+
+    std::array<cplx, 4> last{};
+    auto profile = [&](const char *tag, int only, nda::array<cplx, 3> const &Zin,
+                       nda::array<cplx, 4> const *rung) {
+      std::array<cplx, 4> f{};
+      for (int slot = 0; slot < 4; ++slot) {
+        nda::array<cplx, 5> const *pB = (slot == 1) ? &dG : nullptr;
+        nda::array<cplx, 5> const *pC = (slot == 2) ? &dG : nullptr;
+        nda::array<cplx, 5> const *pD = (slot == 3) ? &dG : nullptr;
+        auto S = sigma(rung ? 2 : 1, only, Zin, rung, pB, pC, pD);
+        f[slot] = (slot == 0) ? pairing(S, dG, ncw, ncw) : pairing(S, G0, ncw, ncw);
+      }
+      last = f;
+      return report(tag, f);
+    };
+
+    // ---- every LEGAL rung must give a FLAT profile: that IS "Sigma = dPhi/dG" ---------
+    const double gate = 1e-9;
+    REQUIRE(profile("S3, Z = W0", 3, W0, nullptr) < gate);
+    auto pW0 = last;
+    REQUIRE(profile("S3, Z = D", 3, Dconst, nullptr) < gate);
+    auto pD_ = last;
+    REQUIRE(profile("S3, Z = W0 + D", 3, WpD, nullptr) < gate);
+    auto pWpD = last;
+    {   // the mixed part reached through the PINNED S3 route only
+      std::array<cplx, 4> f{};
+      for (int i = 0; i < 4; ++i) f[i] = pWpD[i] - pW0[i] - pD_[i];
+      REQUIRE(report("MIXED via the S3 route (S3[W0,D]+S3[D,W0])", f) < gate);
+    }
+    REQUIRE(profile("S1 only, CONSTANT dW", 1, W0, &Dc_qw) < gate);
+    auto s1c = last;
+    REQUIRE(profile("S2 only, CONSTANT dW", 2, W0, &Dc_qw) < gate);
+    auto s2c = last;
+    {   // S1 + S2 with a constant rung must BE the S3 route, slot by slot
+      std::array<cplx, 4> f{};
+      for (int i = 0; i < 4; ++i) f[i] = s1c[i] + s2c[i];
+      REQUIRE(report("MIXED via S1+S2, CONSTANT dW", f) < gate);
+    }
+    // the ones that actually matter for B-L: a genuinely nu-DEPENDENT rung
+    REQUIRE(profile("S1 only, Lorentzian dW", 1, W0, &dW_qw) < gate);
+    REQUIRE(profile("S2 only, Lorentzian dW", 2, W0, &dW_qw) < gate);
+
+    // ---- POSITIVE CONTROL: an ILLEGAL rung MUST break the flatness -------------------
+    // Hermitian per q and dW(-q) = dW(q)^T away from the zone centre, but NOT symmetric
+    // at the self-inverse q -- i.e. exactly what a single-pass +q/-q write produces, and
+    // exactly the defect that made the B-L G-side oracle read 1.118e-01. If this control
+    // stops firing, the probe has gone blind to the thing it exists to catch.
+    {
+      nda::array<cplx, 3> Bad(Dconst);
+      for (long q = 0; q < nk; ++q) {
+        if (kminus(q) != q) continue;                 // self-inverse transfers only
+        for (long P = 0; P < Np; ++P)
+          for (long Q = P + 1; Q < Np; ++Q) {         // Hermitian, deliberately non-real
+            const cplx v(Bad(q, P, Q).real(), 0.21);
+            Bad(q, P, Q) = v;  Bad(q, Q, P) = std::conj(v);
+          }
+      }
+      REQUIRE(rung_sym_err(Bad) > 1e-3);              // it really is illegal
+      const double broke = profile("S3, ILLEGAL Z (CONTROL, must NOT be flat)", 3, Bad,
+                                   nullptr);
+      REQUIRE(broke > 1e-3);
     }
 #endif
   }
@@ -1066,20 +1404,8 @@ namespace bdft_tests {
     const double Om = 1.07;
     nda::array<cplx, 4> W_qw(nk, nw_b, Np, Np);
     {
-      rng_t rg(31337);
-      nda::array<cplx, 3> M(nk, Np, Np);
-      M() = cplx(0.0);
-      for (long q = 0; q < nk; ++q) {
-        if (kminus(q) < q) continue;
-        const long qm = kminus(q);
-        for (long P = 0; P < Np; ++P)
-          for (long Q = P; Q < Np; ++Q) {
-            cplx v = 0.5 * rg.z();
-            if (P == Q) v = cplx(v.real(), 0.0);
-            M(q, P, Q) = v;   M(q, Q, P) = std::conj(v);
-            M(qm, Q, P) = v;  M(qm, P, Q) = std::conj(v);
-          }
-      }
+      auto M = make_rung(31337, 0.5);
+      REQUIRE(rung_sym_err(M) < 1e-14);
       for (long q = 0; q < nk; ++q)
         for (long l = 0; l < nw_b; ++l) {
           const double nu = double(tools.wn_b(l)) * M_PI / beta;
@@ -1123,7 +1449,7 @@ namespace bdft_tests {
       auto G_CC = GCC_of(G);
       nda::array<cplx, 4> Pi_wq(nw_b, nk, Np, Np);
       Pi_wq() = cplx(0.0);
-      vertex_pi::pi_c_accumulate_w(ft, tools, G_CC, X_C, W0, nullptr,
+      vertex_pi::pi_c_accumulate_w(ft, tools, G_CC, X_C, W0, static_cast<nda::array<ComplexType, 4> const*>(nullptr),
                                    mdl.kmq, mdl.kpq, nda::range(0, ncw), Pi_wq,
                                    comm.rank(), comm.size());
       comm.all_reduce_in_place_n(Pi_wq.data(), Pi_wq.size(), std::plus<>{});
@@ -1284,6 +1610,82 @@ namespace bdft_tests {
             prec, dphi_fd.real(), dphi_fd.imag(), t_expl.real(), t_resp.real(), rel);
     REQUIRE(std::abs(dphi_fd) > 1e-8);
     REQUIRE(rel < 1e-4);
+
+    // ---- THE q -> 0 HEAD-CHANNEL PROJECTION IS NOT A FUNCTIONAL DERIVATIVE ------------
+    // vertex_t::eval_Sigma_C (vertex_t.cpp, the _bl_head_projection block) deletes the
+    // rank-1 head component chi chi^dag from the response middle factor at q = Gamma
+    // BEFORE build_delta_w. On Si that removes 66 % of max|Pi(Gamma)| and changes
+    // Sigma^(L,r) by 9.7x, so it is not a round-off cleanup -- it is a modification of the
+    // theory. It is also applied to the SIGMA CUT ONLY: eval_Pi_C's P^{C,L}, which feeds
+    // the Dyson equation, keeps its head channel.
+    //
+    // This block asks the only question that settles whether that is legal: does the
+    // PROJECTED Sigma^(L,r) still satisfy the B-L G-side identity? The identity above
+    // holds for the unprojected middle factor at ~1e-11. Pi^L is what the chain rule
+    // through W0[G] produces, so deleting any part of it must show up as a residual --
+    // unless the deleted part is annihilated downstream, which is exactly what a
+    // "harmless projection" would mean.
+    //
+    // The toy model has no basis_head, so chi here is SYNTHETIC. That is sufficient: the
+    // claim under test is about deleting a rank-1 channel from Pi^L, not about which
+    // direction chi points. chi is given a non-trivial complex phase (Si's head is not
+    // real; LiH's is) and H is built exactly as vertex_head_detail::build_head_rank1 does,
+    // H_PQ = c * Re[conj(chi_P) chi_Q], including the Re[.].
+    {
+      nda::array<cplx, 1> chi(Np);
+      rng_t rg(20260731);
+      for (long P = 0; P < Np; ++P) chi(P) = cplx(rg.u(), 0.37 * rg.u());
+      const double c_head = 1.7;                 // stands in for N_k * madelung
+      nda::array<cplx, 2> H(Np, Np);
+      for (long P = 0; P < Np; ++P)
+        for (long Q = 0; Q < Np; ++Q)
+          H(P, Q) = c_head * std::real(std::conj(chi(P)) * chi(Q));
+
+      // the production projection, verbatim, at the same iq_gamma = 0 the rest of this
+      // test uses for the Gamma transfer
+      const long iq_gamma = 0;
+      cplx hp(0.0);
+      double hn = 0.0, pmax = 0.0, dmax = 0.0;
+      for (long P = 0; P < Np; ++P)
+        for (long Q = 0; Q < Np; ++Q) {
+          hp += std::conj(H(P, Q)) * PiL(iq_gamma, P, Q);
+          hn += std::norm(H(P, Q));
+          pmax = std::max(pmax, std::abs(PiL(iq_gamma, P, Q)));
+        }
+      REQUIRE(hn > 0.0);
+      const cplx cproj = hp / cplx(hn);
+      nda::array<cplx, 3> PiP(PiL);
+      for (long P = 0; P < Np; ++P)
+        for (long Q = 0; Q < Np; ++Q) {
+          const cplx d = cproj * H(P, Q);
+          dmax = std::max(dmax, std::abs(d));
+          PiP(iq_gamma, P, Q) -= d;
+        }
+      // the projection must actually remove something, or this control is blind
+      REQUIRE(dmax > 0.05 * pmax);
+
+      nda::array<cplx, 3> DwP(nk, Np, Np);
+      solvers::vertex_detail::build_delta_w(W0, PiP, mdl.qmin, DwP);
+      nda::array<cplx, 5> SLrP(nt, ns, nk, nbnd, nbnd);
+      solvers::vertex_detail::eval_sigma_C_response(comm, G0, mdl.X_skPa, DwP, mdl.kmq,
+                                                    mdl.qmin, SLrP);
+      const cplx t_resp_p = pairing(SLrP, dG, nbnd, nbnd);
+      const double rel_p =
+          std::abs(dphi_fd - (t_expl + t_resp_p)) / std::max(std::abs(dphi_fd), 1e-30);
+      app_log(1, "fdoracle_bl_gside [{}]: HEAD-PROJECTION control -> removed "
+                 "max|c H| = {:.4e} of max|Pi^L(Gamma)| = {:.4e} ({:.2f} %); "
+                 "Sigma^(L,r) pairing {:.6e} -> {:.6e} ({:.4f}x); "
+                 "identity rel {:.3e} -> {:.3e}",
+              prec, dmax, pmax, (pmax > 0.0 ? 100.0 * dmax / pmax : 0.0),
+              t_resp.real(), t_resp_p.real(),
+              (std::abs(t_resp) > 0.0 ? std::abs(t_resp_p) / std::abs(t_resp) : 0.0),
+              rel, rel_p);
+      // THE ASSERTION: projecting the head channel out of Pi^L BREAKS the B-L G-side
+      // functional-derivative identity. If this ever stops firing, the projection has
+      // become a no-op (or the oracle has gone blind) and that must be understood before
+      // the projection can be defended as a legal approximation.
+      REQUIRE(rel_p > 1e-3);
+    }
 
     // ---- POSITIVE CONTROLS -----------------------------------------------------------
     // "drop the -Sx term of eq:sigmaBL -> the G-oracle breaks" and the response controls.

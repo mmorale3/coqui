@@ -555,7 +555,7 @@ namespace bdft_tests {
       solvers::vertex_detail::eval_sigma_C_g3w2(ft, comm, C(), G, mdl.X_skPa, Wstub,
                                                 W0_qPQ, mdl.kmq, mdl.qmin,
                                                 /*iq_gamma*/ 0, skip,
-                                                /*rung_mode*/ 1, nullptr, nullptr, Sig);
+                                                /*rung_mode*/ 1, static_cast<nda::array<ComplexType, 4> const*>(nullptr), nullptr, Sig);
 
       // ---- (1) independent tau-contraction reference, rung = W0bar ------------------
       nda::array<cplx, 5> Sig_ref(nt, ns, nk, nbnd, nbnd);

@@ -593,7 +593,7 @@ namespace bdft_tests {
       Pi_dyn0() = cplx(0.0);
       // (1) STATIC path: no dynamic rung at all
       vertex_pi::pi_c_accumulate_w(ft, tools, G, mdl.X_skPa, W0_qPQ,
-                                   /*Wdyn*/ nullptr, mdl.kmq, mdl.kpq, C(),
+                                   static_cast<nda::array<ComplexType, 4> const*>(nullptr), mdl.kmq, mdl.kpq, C(),
                                    Pi_stat, 0, 1);
       // (2) the full kernel with an explicitly ZERO dynamic rung, same core
       nda::array<cplx, 4> Wzero(nk, nw_b, Np, Np);
