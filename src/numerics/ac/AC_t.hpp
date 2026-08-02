@@ -2,7 +2,7 @@
  * ==========================================================================
  * CoQuí: Correlated Quantum ínterface
  *
- * Copyright (c) 2022-2025 Simons Foundation & The CoQuí developer team
+ * Copyright (c) 2022-2026 Simons Foundation & The CoQuí developer team
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -41,8 +41,13 @@ namespace analyt_cont {
 
    public:
      AC_t(std::string ac_type = "pade") {
-       if (string_to_ac_enum(ac_type) == ac_type_e::pade) {
-         _ac_var = pade_driver();
+       auto e = string_to_ac_enum(ac_type);
+       if (e == ac_type_e::pade) {
+         _ac_var = pade_driver(pade_impl_e::original);
+       } else if (e == ac_type_e::pade_updated) {
+         // pivot-guarded fit + normalised continued-fraction evaluation; see
+         // pade_impl_e. Previously reachable only from test_pade.cpp.
+         _ac_var = pade_driver(pade_impl_e::updated);
        } else {
          APP_ABORT(" AC_t: Invalid type of analytical continuation. \n");
        }

@@ -2,7 +2,7 @@
  * ==========================================================================
  * CoQuí: Correlated Quantum ínterface
  *
- * Copyright (c) 2022-2025 Simons Foundation & The CoQuí developer team
+ * Copyright (c) 2022-2026 Simons Foundation & The CoQuí developer team
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,13 +24,21 @@
 
 namespace analyt_cont {
   enum ac_type_e {
-    pade
+    pade,
+    // Thiele's recursion divides by the pivot g(i-1,i-1); when that underflows,
+    // "pade" keeps going and the coefficients blow up. "pade_updated" stops the
+    // recursion at the last well-conditioned order and evaluates the continued
+    // fraction with a normalised (Lentz-style) recurrence instead of the raw
+    // backward form. Same interpolant when the fit is well conditioned.
+    pade_updated
   };
 
   inline std::string ac_enum_to_string(int ac_enum) {
     switch(ac_enum) {
       case ac_type_e::pade:
         return "pade";
+      case ac_type_e::pade_updated:
+        return "pade_updated";
       default:
         return "not recognized...";
     }
@@ -39,8 +47,10 @@ namespace analyt_cont {
   inline ac_type_e string_to_ac_enum(std::string ac_type) {
     if (ac_type == "pade") {
       return ac_type_e::pade;
+    } else if (ac_type == "pade_updated") {
+      return ac_type_e::pade_updated;
     } else {
-      utils::check(false, "Unrecognized ac_type");
+      utils::check(false, "Unrecognized ac_type: {} (choices: pade, pade_updated)", ac_type);
       return ac_type_e::pade;
     }
   }
