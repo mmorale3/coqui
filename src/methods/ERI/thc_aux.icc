@@ -1447,7 +1447,16 @@ auto thc::get_ZquG_Cquv_fft(nda::MemoryArrayOfRank<1> auto const& IPts,
         for( auto i : nda::range(nI) )
           iu_loc(i) = Z_qug.origin()[1] + b0 + i;
         if(nI<nI_per_blk)
-          iu_for_Xb(nda::range(nI,nI_per_blk)) = -1;
+          // Pad THIS RANK's slice. This used to index iu_for_Xb absolutely, i.e. positions
+          // [nI,nI_per_blk) of the global array, which belong to rank 0. Since the reduction
+          // below is a SUM, a rank with a partial block silently subtracted 1 from one of
+          // rank 0's interpolating-point indices: with nIpts=1275 on 4 ranks (nI_per_blk=319,
+          // ranks 0-2 hold 319 points, rank 3 holds 318) rank 3 wrote -1 at absolute index
+          // 318, turning rank 0's iu_for_Xb[318] from 318 into 317. Row 318 of C_quv then
+          // duplicated row 317, making C non-symmetric and exactly rank deficient
+          // (cond 1.4e19 vs 4.5e11), which in turn made the ISDF solve non-unique.
+          // GPU-only: the HOST path goes through get_ZquG_Cquv_fft_shared_memory.
+          iu_loc(nda::range(nI,nI_per_blk)) = -1;
         mpi->comm.all_reduce_in_place_n(iu_for_Xb.data(),iu_for_Xb.size(),std::plus<>{});
       }
       auto Tkur = memory::array_view<MEM,ComplexType,2>({nkloc, nI*rho_g.nnr()},buffer1.data());
