@@ -120,7 +120,18 @@ private:
     if(n >= timers.size())
       APP_ABORT(" Error in TimerManager n too large n:" + std::to_string(n) + "");
     return n;
-  } 
+  }
+
+  // Position of a timer, or -1 if it was never registered. Used by the read-only accessors:
+  // a timer only exists once some branch has start()ed it, so a sub-timer that lives on one
+  // side of an if/else is absent on the other. Reading it there is not an error -- it is
+  // zero time -- and aborting instead turned every one-sided sub-timer into a crash at the
+  // first timer dump, on the branch that was working.
+  int findPos(std::string const& str) const
+  {
+    auto it = id2pos.find(str);
+    return (it != id2pos.end()) ? it->second : -1;
+  }
 
 public:
   TimerManager() { timers.reserve(100); }
@@ -152,19 +163,20 @@ public:
 
   void stop(int n) { timers[ checkPos(n) ].stop(); }
 
-  double elapsed(const std::string& str) { return timers[ getPos(str) ].elapsed(); }
+  // Unknown name == never started == no time spent. See findPos.
+  double elapsed(const std::string& str) { int n = findPos(str); return (n < 0) ? 0.0 : timers[n].elapsed(); }
 
   double elapsed(int n){ return timers[ checkPos(n) ].elapsed(); }
 
-  double average(const std::string& str) { return timers[ getPos(str) ].average(); }
+  double average(const std::string& str) { int n = findPos(str); return (n < 0) ? 0.0 : timers[n].average(); }
 
   double average(int n) { return timers[ checkPos(n) ].average(); }
 
-  int number_of_calls(const std::string& str) { return timers[ getPos(str) ].number_of_calls(); }
+  int number_of_calls(const std::string& str) { int n = findPos(str); return (n < 0) ? 0 : timers[n].number_of_calls(); }
 
   int number_of_calls(int n) { return timers[ checkPos(n) ].number_of_calls(); }
 
-  void reset(const std::string& str) {  timers[ getPos(str) ].reset(); }
+  void reset(const std::string& str) { int n = findPos(str); if (n >= 0) timers[n].reset(); }
 
   void reset(int n) {  timers[ checkPos(n) ].reset(); }
 
@@ -177,14 +189,12 @@ public:
 
   void print_elapsed(const std::string& str)
   {
-    int n = getPos(str);
-    app_log(1, " Elapsed time in {}: {} ", str, timers[n].elapsed());
+    app_log(1, " Elapsed time in {}: {} ", str, elapsed(str));
   }
 
   void print_average(const std::string& str)
   {
-    int n = getPos(str);
-    app_log(1, " Average time in {}: {}", str, timers[n].average());
+    app_log(1, " Average time in {}: {}", str, average(str));
   }
 
   void print_average_all()

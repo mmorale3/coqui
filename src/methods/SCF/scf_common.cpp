@@ -173,10 +173,20 @@ double update_mu(double old_mu, dyson_type& dyson, const mf::MF &mf, const imag_
   double mu = old_mu;
   double nel_target = mf.nelec();
   double delta = 0.2;
+  // A wrong Sigma makes N(mu) monotone-but-never-crossing, or NaN. Both used to spin here:
+  // the bracketing walks and the bisection had no limit, and a NaN falls through every
+  // comparison below, so the search returned a NaN mu without a word. Cap both, and say
+  // which one gave up -- the bracket width is what names the bad input.
+  constexpr int max_bracket_steps = 200;   // 200 * 0.2 = 40 a.u., far beyond any real band
+  constexpr int max_bisect_steps  = 200;   // 40 a.u. / 2^200; tol is never this small
   nda::array<ComplexType, 4> FpSigma_spectra(FT.nw_f(), mf.nspin(), mf.nkpts_ibz(), mf.nbnd());
   dyson.compute_eigenspectra(mu, F, G, Sigma, FpSigma_spectra);
   nel = compute_Nelec(old_mu, FpSigma_spectra, mf, FT);
   app_log(2, "Initial chemical potential (mu) = {}, nelec = {}", old_mu, nel);
+  utils::check(std::isfinite(nel),
+               "update_mu: nelec is not finite ({}) at the starting mu = {}. The self-energy or "
+               "the eigenspectra are corrupt; the chemical potential search cannot proceed.",
+               nel, old_mu);
 
   if (std::abs(nel - nel_target) < dyson.mu_tol()) {
     app_log(1, "Chemical potential found (mu) = {} a.u.", mu);
@@ -188,18 +198,30 @@ double update_mu(double old_mu, dyson_type& dyson, const mf::MF &mf, const imag_
     mu2 = old_mu;
     mu1 = old_mu - delta;
     double nel1 = compute_Nelec(mu1, FpSigma_spectra, mf, FT);
+    int nstep = 0;
     while (nel1 > nel_target) {
+      utils::check(++nstep <= max_bracket_steps,
+                   "update_mu: failed to bracket nelec = {} from below after {} steps of {} a.u. "
+                   "(mu = {}, nelec = {}). N(mu) is not decreasing towards the target -- check the "
+                   "self-energy.", nel_target, max_bracket_steps, delta, mu1, nel1);
       mu1 -= delta;
       nel1 = compute_Nelec(mu1, FpSigma_spectra, mf, FT);
+      app_log(4, "bracketing down: mu = {}, nelec = {}", mu1, nel1);
     }
     app_log(4, "mu = {}, nelec = {}", mu1, nel1);
   } else {
     mu1 = old_mu;
     mu2 = old_mu + delta;
     double nel2 = compute_Nelec(mu2, FpSigma_spectra, mf, FT);
+    int nstep = 0;
     while (nel2 < nel_target) {
+      utils::check(++nstep <= max_bracket_steps,
+                   "update_mu: failed to bracket nelec = {} from above after {} steps of {} a.u. "
+                   "(mu = {}, nelec = {}). N(mu) is not increasing towards the target -- check the "
+                   "self-energy.", nel_target, max_bracket_steps, delta, mu2, nel2);
       mu2 += delta;
       nel2 = compute_Nelec(mu2, FpSigma_spectra, mf, FT);
+      app_log(4, "bracketing up: mu = {}, nelec = {}", mu2, nel2);
     }
     app_log(4, "mu = {}, nelec = {}", mu2, nel2);
   }
@@ -207,7 +229,12 @@ double update_mu(double old_mu, dyson_type& dyson, const mf::MF &mf, const imag_
   nel = compute_Nelec(mu_mid, FpSigma_spectra, mf, FT);
   app_log(4, "mu = {}, nelec = {}", mu_mid, nel);
 
+  int nbisect = 0;
   while (std::abs(nel - nel_target) >= dyson.mu_tol()) {
+    utils::check(++nbisect <= max_bisect_steps,
+                 "update_mu: bisection did not reach mu_tol = {} in {} steps; bracket is "
+                 "[{}, {}] and nelec = {} (target {}). N(mu) is likely discontinuous at the "
+                 "target.", dyson.mu_tol(), max_bisect_steps, mu1, mu2, nel, nel_target);
     if (nel >= nel_target) {
       mu2 = mu_mid;
     } else {
@@ -218,6 +245,11 @@ double update_mu(double old_mu, dyson_type& dyson, const mf::MF &mf, const imag_
     app_log(4, "mu = {}, nelec = {}", mu_mid, nel);
   }
   mu = mu_mid;
+  // Both loops above exit on a comparison, and every comparison against a NaN is false, so a
+  // NaN that appears after the starting point would walk straight out of here as the answer.
+  utils::check(std::isfinite(mu) and std::isfinite(nel),
+               "update_mu: search converged to a non-finite result (mu = {}, nelec = {}). The "
+               "self-energy or the eigenspectra are corrupt.", mu, nel);
   app_log(1, "Chemical potential found (mu) = {} a.u.", mu);
   app_log(1, "Number of electrons per unit cell = {}", nel);
   return mu;
