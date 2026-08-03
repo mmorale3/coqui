@@ -793,14 +793,35 @@ auto thc::chol_metric_impl(int iq, int nIpts, nda::range a_range, nda::range b_r
   if(not single_psi)
     utils::check(nproc_per_pool <= b_range.size(), "Error in chol_metric_impl: Too many processors. Decrease # of processors or increase distr_tol. ");
 
+  // B6 diagnostic (COQUI_CHOL_DIAG_DEBUG=1). Measured on H100: max|Psia| is ALREADY 0 by the time
+  // the residual diagonal is built, while sm80 has it at 1.293. That exonerates the cuTENSOR
+  // contractions, max_element_multi and the MPI reduction -- the orbitals themselves arrive empty.
+  // These stage prints split the remaining path: the mean-field read, the custom-grid FFT
+  // (copy_select + fft::backward), the optional C_skai rotation, and the Znorm scale. Whichever
+  // stage first reports 0 is the one to fix.
+  const bool chol_dbg = (std::getenv("COQUI_CHOL_DIAG_DEBUG") != nullptr);
+  auto dbg_maxabs = [&](auto const& A, char const* what) {
+    if (not chol_dbg) return;
+    double m = 0.0;
+    auto h = nda::to_host(nda::make_regular(A));
+    for (auto const& v : h) m = std::max(m, std::abs(v));
+    app_log(1, "  [CHOL_DIAG_DEBUG] max|{}| = {:.10e}", what, m);
+  };
+
   Timer.start("DistOrbs");
-  // read orbitals in real space and redistribute 
+  // read orbitals in real space and redistribute
   bool custom_grid = (mf->has_wfc_grid() and mf->fft_grid_dim() != rho_g.mesh());
   auto distPsia = mf::read_distributed_orbital_set<local_CArray_t>(*mf,mpi->comm,
                (custom_grid?'w':'r'),
                (custom_grid?std::array<long,2>{mpi->comm.size(),1}:std::array<long,2>{1,mpi->comm.size()}),
                nda::range(0,nspins),nda::range(0,nkpts),
-               (C_skai!=nullptr?nda::range(mf->nbnd()):a_range),{1,1}); 
+               (C_skai!=nullptr?nda::range(mf->nbnd()):a_range),{1,1});
+
+  if (chol_dbg)
+    app_log(1, "  [CHOL_DIAG_DEBUG] custom_grid={} C_skai={} single_psi={} mesh=({},{},{}) "
+               "wfc_grid={}", int(custom_grid), (C_skai!=nullptr?"set":"null"), int(single_psi),
+            rho_g.mesh(0), rho_g.mesh(1), rho_g.mesh(2), int(mf->has_wfc_grid()));
+  dbg_maxabs(distPsia.local(), "distPsia after read_distributed_orbital_set");
 
   if(custom_grid) {
     auto wfc_to_rho = memory::to_memory_space<MEM>(swfc_to_rho.local());
@@ -813,9 +834,12 @@ auto thc::chol_metric_impl(int iq, int nIpts, nda::range a_range, nda::range b_r
     math::nda::fft<true> F(P4d,math::fft::FFT_MEASURE);
     psir() = ComplexType(0.0);
     nda::copy_select(true,1,wfc_to_rho,ComplexType(1.0),distPsia.local(),ComplexType(0.0),psir);
+    dbg_maxabs(psir, "psir after copy_select (G-space, pre-FFT)");
     F.backward(P4d);
+    dbg_maxabs(psir, "psir after fft::backward (r-space)");
     math::nda::redistribute_in_place(dPsir,{1,mpi->comm.size()},{1,1});
     distPsia = std::move(dPsir);
+    dbg_maxabs(distPsia.local(), "distPsia after custom-grid FFT + redistribute");
   }
   // If a rotation matrix is provided, rotate orbitals
   if(C_skai!=nullptr) {
@@ -843,11 +867,14 @@ auto thc::chol_metric_impl(int iq, int nIpts, nda::range a_range, nda::range b_r
     } else {
       nda::tensor::contract(nda::conj(*C_skai),"skai",Pi,"skir",Pa,"skar");
     }
-    mpi->comm.barrier(); 
+    mpi->comm.barrier();
     distPsia = std::move(dPsir);
+    dbg_maxabs(distPsia.local(), "distPsia after C_skai rotation");
   }
   nda::tensor::scale(Znorm, distPsia.local());
-  utils::check(distPsia.local_shape()[0] == nspins*nkpts*a_range.size()*npol, "Shape mismatch"); 
+  if (chol_dbg) app_log(1, "  [CHOL_DIAG_DEBUG] Znorm = {:.10e}", std::abs(Znorm));
+  dbg_maxabs(distPsia.local(), "distPsia after Znorm scale (this is what Psia views)");
+  utils::check(distPsia.local_shape()[0] == nspins*nkpts*a_range.size()*npol, "Shape mismatch");
   
   // Similar to distPsia
   decltype(distPsia)* distPsib;
@@ -968,6 +995,27 @@ auto thc::chol_metric_impl(int iq, int nIpts, nda::range a_range, nda::range b_r
   } else {
     memory::device_array<ComplexType,4> Lr(nspins,nkpts,npol,r_range.size());
     nda::tensor::contract(nda::conj(Psia),"skapr",Psia,"skapr",Lr,"skpr");
+    // B6 diagnostic (COQUI_CHOL_DIAG_DEBUG=1). On sm90/H100 this routine aborts at
+    // thc.icc:1073 with nchol=0, meaning max|Diag| is already <= 1e-14 before the first
+    // pivot, while sm80/A100 gives Np=1275 on the same input. With nchol=0 the fault is
+    // upstream of the iteration, and there are exactly four candidates: Psia itself, this
+    // batched-dot contraction, the Diag accumulation below, or max_element_multi /
+    // find_distributed_maximum. Printing max|Psia|, max|Lr| and a HOST-computed max|Diag|
+    // alongside what max_element_multi returned separates all four in a single run -- each
+    // candidate zeroes a different one of these first. Reproduces at 1 rank, so the
+    // distributed reduction is already ruled out and the cycle is cheap.
+    // Keep this: it is the "instrument, do not guess" lesson from the iu_for_Xb hunt.
+    if (std::getenv("COQUI_CHOL_DIAG_DEBUG") != nullptr) {
+      auto Ph = nda::to_host(nda::make_regular(Psia));
+      auto Lh = nda::to_host(Lr);
+      double pmax = 0.0, lmax = 0.0;
+      for (auto const& v : Ph) pmax = std::max(pmax, std::abs(v));
+      for (auto const& v : Lh) lmax = std::max(lmax, std::abs(v));
+      app_log(1, "  [CHOL_DIAG_DEBUG] iq={} nspins={} nkpts={} npol={} nr={} na={}",
+              iq, nspins, nkpts, npol, r_range.size(), a_range.size());
+      app_log(1, "  [CHOL_DIAG_DEBUG] max|Psia|={:.10e}  max|Lr|={:.10e}  (Lr = sum_a conj(Psia)*Psia)",
+              pmax, lmax);
+    }
     if(single_psi) {
       for( auto is : itertools::range(nspins) ) {
         for( auto k : itertools::range(nkpts) ) {
@@ -994,10 +1042,29 @@ auto thc::chol_metric_impl(int iq, int nIpts, nda::range a_range, nda::range b_r
       }
     }
   }
-  // find index and value of maximum element  
+  // B6 diagnostic, second half: max|Diag| computed on the HOST, i.e. independently of
+  // max_element_multi, so the two can be compared. If max|Diag| is healthy here and
+  // lmax_res_val comes back ~0 the fault is max_element_multi; if max|Diag| is itself ~0 while
+  // max|Lr| above was healthy, it is the Diag accumulation contraction.
+  if (std::getenv("COQUI_CHOL_DIAG_DEBUG") != nullptr) {
+    auto Dh = nda::to_host(Diag);
+    double dmax = 0.0;
+    long dloc = -1;
+    for (long i = 0; i < Dh.extent(0); ++i)
+      if (std::abs(Dh(i)) > dmax) { dmax = std::abs(Dh(i)); dloc = i; }
+    app_log(1, "  [CHOL_DIAG_DEBUG] max|Diag|={:.10e} at r={} (host reduction over {} points)",
+            dmax, dloc, Dh.extent(0));
+  }
+
+  // find index and value of maximum element
   utils::max_element_multi(Diag,lmax_res_val(nda::range(0,block_size)),
                            lmax_res_indx(nda::range(0,block_size)));
-// MAM: dyn_thresh should be set by the magnitude of the residual at position nmax-nchol 
+
+  if (std::getenv("COQUI_CHOL_DIAG_DEBUG") != nullptr)
+    app_log(1, "  [CHOL_DIAG_DEBUG] max_element_multi -> lmax_res_val[0]={:.10e} indx[0]={} "
+               "(block_size={})", lmax_res_val(0), lmax_res_indx(0), block_size);
+
+// MAM: dyn_thresh should be set by the magnitude of the residual at position nmax-nchol
 //      in the globally ordered list, try to find the best approximation (upper bound) to it from 
 //      the information available in find_distributed_maximum
 //      even in this case is not guareanteed         
@@ -1560,6 +1627,7 @@ auto thc::intvec_impl(nda::MemoryArrayOfRank<1> auto const& IPts,
    */  
   std::optional<_darray_t_<MEM,3>> IquG;
 
+// MAM: When using block-cyclic version, redistribution is happening twice, inside get_ZquG_Cquv<> to pgrid3D, then again outside into the darray_multi_t, makes no sense. Maybe turn off redistribution inside get_ZquG_Cquv (through some clean mechanism) when block-cyclic is used out here. 
   utils::memory_report(4, "thc::get_ZquG_Cquv");
   // Z_quG: quG array with appropriate distribution slate
   auto [Z_quG, C_quv] = get_ZquG_Cquv<MEM>(IPts,Xa,Xb,a_range,b_range,pgrid3D);
@@ -1608,10 +1676,10 @@ auto thc::intvec_impl(nda::MemoryArrayOfRank<1> auto const& IPts,
       for (long j = 0; j < Zh.extent(1); ++j) zmax = std::max(zmax, std::abs(Zh(i,j)));
     app_log(1, "  [THC_SOLVE_DEBUG] pre-solve q0: max|C|={:.10e} max|Z|={:.10e} "
                "max|C-C^H|={:.6e}  (block_cyclic={})",
-            cmax, zmax, herm, int(math::nda::use_block_cyclic_slate()));
+            cmax, zmax, herm, int(math::nda::use_block_cyclic_slate(pgrid3D[1],pgrid3D[2])));
   }
 
-  if( math::nda::use_block_cyclic_slate() ) {
+  if( math::nda::use_block_cyclic_slate(pgrid3D[1],pgrid3D[2]) ) {
 
     // Block-cyclic path. C_quv/Z_quG are redistributed into 2D block-cyclic, tile-major
     // storage (distributed_matrix_array) before the solve. Two reasons:
@@ -1686,7 +1754,7 @@ auto thc::intvec_impl(nda::MemoryArrayOfRank<1> auto const& IPts,
       }
     app_log(1, "  [THC_SOLVE_DEBUG] post-solve q0: ||C*X-Z||_max={:.6e}  max|X|={:.10e}  "
                "sum|X|={:.10e}  (block_cyclic={})",
-            rmax, xmax, xsum, int(math::nda::use_block_cyclic_slate()));
+            rmax, xmax, xsum, int(math::nda::use_block_cyclic_slate(pgrid3D[1],pgrid3D[2])));
 
     // Dump C, and the first columns of Z and X, so the two paths can be compared exactly
     // offline: which system each X actually solves, and whether C is singular.
@@ -1720,7 +1788,7 @@ auto thc::intvec_impl(nda::MemoryArrayOfRank<1> auto const& IPts,
     // C_quv = Z_quG * Z_quG^H on its own. Only the second (post-Coulomb) call site needs
     // this in isolation; the first one is fused into the chain below.
     auto multiply_ZZh_into_C = [&]() {
-      if( math::nda::use_block_cyclic_slate() ) {
+      if( math::nda::use_block_cyclic_slate(pgrid3D[1],pgrid3D[2]) ) {
         Timer.start("ZBAR_REDIST");
         ma_t Zma(mpi->comm, pgrid3D, Z_quG.global_shape(), {block_size[1],block_size[2]});
         ma_t Cma(mpi->comm, pgrid3D, C_quv.global_shape(), {block_size[1],block_size[1]});
@@ -1737,7 +1805,7 @@ auto thc::intvec_impl(nda::MemoryArrayOfRank<1> auto const& IPts,
 
     // First compute the inverse of overlap matrices
     Timer.start("ZBAR");
-    if( math::nda::use_block_cyclic_slate() ) {
+    if( math::nda::use_block_cyclic_slate(pgrid3D[1],pgrid3D[2]) ) {
 
       // One pair of containers carries the whole chain
       //     C = Z Z^H   ->   C := C^{-1}   ->   IquG = C^{-1} Z
@@ -2094,6 +2162,22 @@ auto thc::intvec_impl(int iq, nda::MemoryArrayOfRank<1> auto const& IPts,
       nda::tensor::scale(ComplexType(1.0),ChC_uv.local(),nda::tensor::op::CONJ);
     }
 #if defined(ENABLE_SLATE)
+    // NOTE (2026-08-03): unlike the ISDF intvec_impl above, this LS-THC path still hands slate the
+    // legacy single-block views directly, with no block-cyclic branch. That layout cannot serve
+    // slate's batched DEVICE path at any grid with more than one rank on the matrix axes -- its
+    // tiles are views into one large local block, so their leading dimension is the block's lld
+    // rather than mb, and slate aborts in device_regions_build on `group.ld[m] == Mij.stride()`.
+    // It is safe today only because this overload is instantiated for HOST_MEMORY alone
+    // (`__eval_ls__(HOST_MEMORY)` at the bottom of thc.cpp; the ISDF `__eval__` is the one
+    // instantiated for DEVICE/UNIFIED), and slate's host path handles the layout.
+    // If this is ever instantiated for DEVICE, convert it to distributed_matrix_array the way
+    // intvec_impl was (see use_block_cyclic_slate and matrix_array.hpp) -- the Target::Devices
+    // branches just below will otherwise fail exactly as the ISDF path did at 12 ranks.
+    static_assert(MEM == HOST_MEMORY,
+                  "thc::intvec_impl(iq,...): the slate calls here use the legacy single-block "
+                  "layout, which slate's batched device path rejects for a distributed matrix. "
+                  "Port this call site to distributed_matrix_array before instantiating it for "
+                  "device memory.");
     auto As = math::nda::slate_ops::detail::to_slate_view<true>(ChC_uv);
     auto Bs = math::nda::slate_ops::detail::to_slate_view<true>(Snv);
     if(use_least_squares) {

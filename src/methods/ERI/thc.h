@@ -73,8 +73,25 @@ class thc
   /*
    * Creates a thc object with arguments in property tree.
    *  Important options:
-   *  - ecut: "same as MF", Plane wave cutoff used for the evaluation of coulomb matrix elements. 
-   *  - thresh: "0.0", Threshold in cholesky decomposition. 
+   *  - ecut: "same as MF", Plane wave cutoff used for the evaluation of coulomb matrix elements.
+   *  - thresh: "0.0", Threshold in cholesky decomposition.
+   *  - nIpts: number of interpolating points to select, instead of letting `thresh` decide.
+   *
+   *  REPRODUCIBILITY, threshold vs. fixed count (measured 2026-08-03, job 6744072).
+   *  With `thresh` driving the truncation, the *number* of interpolating points depends on the
+   *  processor grid, hence on the rank count: the pivoted-Cholesky residual at the margin wobbles
+   *  at roundoff and crosses `thresh` at a different pivot for a different decomposition. Measured
+   *  at Si 2x2x2 / 100 bands, `thresh = 1e-5` gives Np = 1289 / 1279 / 1275 / 1290 at 1 / 2 / 4 / 8
+   *  ranks and a total-energy spread of 3.1e-05 -- the method's own ISDF truncation error at that
+   *  threshold, not a defect. Pinning `nIpts = 1275` instead collapses the spread to 1.3e-14: the
+   *  pivot *sequence* is reproducible across decompositions to roundoff, only the cutoff moves.
+   *  => Set `nIpts` explicitly for any number that will be compared across rank counts (scaling
+   *     studies, A/B benchmarks, published values). `thresh` is fine for exploratory work.
+   *  Note the two routes are not interchangeable at equal Np: `thresh = 1e-5` at 4 ranks also lands
+   *  on Np = 1275 but gives E = 0.5145880920947619 versus 0.5146250400187667 for pinned
+   *  `nIpts = 1275`, because exhausting a threshold part-way through a `chol_block_size` block
+   *  selects a different point set than taking exactly Np pivots.
+   *
    *  Performance related options:
    *  - matrix_block_size: 1024, Block size used in distributed arrays.
    *  - chol_block_size: "8", Block size in cholesky decomposition.
