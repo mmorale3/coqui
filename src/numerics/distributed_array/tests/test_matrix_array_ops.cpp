@@ -656,6 +656,113 @@ void test_legacy_vs_bc_illcond()
 TEST_CASE("matrix_array_illcond_host", "[math][matrix_array_ops]") { test_legacy_vs_bc_illcond<HOST_MEMORY>(); }
 TEST_CASE("matrix_array_illcond_dev",  "[math][matrix_array_ops]") { test_legacy_vs_bc_illcond<DEVICE_MEMORY>(); }
 
+/***************************************************************************/
+/*      the solve orientation of each path, pinned on a NON-hermitian A    */
+/***************************************************************************/
+/*
+ * The two paths above agree because A is hermitian, and that is not an accident of the test --
+ * it is the *only* reason they agree, so it is the thing to pin. The legacy path stores A in C
+ * order, so lu_solve<true> conjugates A in place and hands slate the transposed view: slate
+ * receives conj(A)^T = A^H and solves A^H X = B. The block-cyclic container is natively column
+ * major and hands slate A itself, solving A X = B. For hermitian A those are one system; for
+ * anything else they are two.
+ *
+ * Pinning it on a non-hermitian A makes the convention explicit and gives the tests teeth: if
+ * either path's orientation is ever changed, the residual it is checked against here stops being
+ * satisfied. The hermitian agreement tests alone cannot see such a change, because A^H == A hides
+ * it -- which is how the wrong 2026-07-31 conclusion (that the paths disagreed on orientation, when
+ * in fact the input C was singular) survived as long as it did. Production call sites all pass a
+ * hermitian A; this test exists to keep the ground under that statement.
+ */
+template<MEMORY_SPACE MEM>
+void test_solve_orientation()
+{
+  auto world = boost::mpi3::environment::get_world_instance();
+  auto [p, q] = pq_of(world.size());
+  const long M = 32, NRHS = 16, mb = 8, nb = 8;
+  if (M < p or M < q or NRHS < q) return;
+
+  // Deliberately NOT hermitian, and diagonally dominant so both systems are well conditioned
+  // and the residuals below are meaningful.
+  hmat_t Aref(M,M), Bref(M,NRHS);
+  for (long j = 0; j < M; ++j)
+    for (long i = 0; i < M; ++i) Aref(i,j) = gen(i,j,51);
+  for (long i = 0; i < M; ++i) Aref(i,i) = cvalue(4.0*M, 0.0);
+  for (long j = 0; j < NRHS; ++j) for (long i = 0; i < M; ++i) Bref(i,j) = gen(i,j,52);
+
+  // it must really be non-hermitian, or this test proves nothing
+  double herm = 0.0;
+  for (long j = 0; j < M; ++j)
+    for (long i = 0; i < M; ++i) herm = std::max(herm, std::abs(Aref(i,j)-std::conj(Aref(j,i))));
+  REQUIRE(herm > 0.1);
+
+  // residual of X against the system  op(A) X = B
+  auto residual_against = [&](hmat_t const& op, hmat_t const& X) {
+    hmat_t AX(M,NRHS);
+    AX() = cvalue(0.0);
+    nda::blas::gemm(cvalue(1.0), op, X, cvalue(0.0), AX);
+    return max_abs_diff(AX, Bref);
+  };
+  hmat_t Ah(M,M);                       // A^H
+  for (long j = 0; j < M; ++j)
+    for (long i = 0; i < M; ++i) Ah(i,j) = std::conj(Aref(j,i));
+
+  // ---- legacy path: C-order view + lu_solve<true>  =>  solves A^H X = B ----
+  using cblock_t = memory::array<MEM, cvalue, 2>;
+  hmat_t Xlegacy(M,NRHS);
+  {
+    auto dA = make_distributed_array<cblock_t>(world, {p,q}, {M,M},    {mb,mb});
+    auto dB = make_distributed_array<cblock_t>(world, {p,q}, {M,NRHS}, {mb,nb});
+    auto fill = [&](auto& Dd, hmat_t const& src) {
+      auto h = nda::to_host(Dd.local());
+      for (long jj = 0; jj < h.extent(1); ++jj)
+        for (long ii = 0; ii < h.extent(0); ++ii)
+          h(ii,jj) = src(ii + Dd.origin()[0], jj + Dd.origin()[1]);
+      Dd.local() = h;
+    };
+    fill(dA, Aref); fill(dB, Bref);
+    long info = math::nda::slate_ops::lu_solve<true>(dA, dB);
+    REQUIRE(info == 0);
+    Xlegacy() = cvalue(0.0);
+    auto h = nda::to_host(dB.local());
+    for (long jj = 0; jj < h.extent(1); ++jj)
+      for (long ii = 0; ii < h.extent(0); ++ii)
+        Xlegacy(ii + dB.origin()[0], jj + dB.origin()[1]) = h(ii,jj);
+    world.all_reduce_in_place_n(Xlegacy.data(), Xlegacy.size(), std::plus<>{});
+  }
+
+  // ---- block-cyclic path: column major, no conjugation  =>  solves A X = B ----
+  hmat_t Xbc(M,NRHS);
+  {
+    using ma_t = memory::dmatrix_array_t<MEM, cvalue, 0, communicator>;
+    ma_t Cma(world, {p,q}, {M,M},    {mb,mb});
+    ma_t Zma(world, {p,q}, {M,NRHS}, {mb,nb});
+    scatter_into(Cma, Aref); scatter_into(Zma, Bref);
+    long info = math::nda::slate_ops::lu_solve(Cma, Zma);
+    REQUIRE(info == 0);
+    Xbc = gather_all(Zma, world);
+  }
+
+  double leg_vs_Ah = residual_against(Ah,   Xlegacy);
+  double leg_vs_A  = residual_against(Aref, Xlegacy);
+  double bc_vs_A   = residual_against(Aref, Xbc);
+  double bc_vs_Ah  = residual_against(Ah,   Xbc);
+  if (world.root())
+    std::cout << "  [orientation, non-hermitian A] legacy: ||A^H X - B|| = " << leg_vs_Ah
+              << " (vs ||A X - B|| = " << leg_vs_A << ")   block-cyclic: ||A X - B|| = "
+              << bc_vs_A << " (vs ||A^H X - B|| = " << bc_vs_Ah << ")" << std::endl;
+
+  // each path solves its own system ...
+  REQUIRE(leg_vs_Ah < 1e-9);
+  REQUIRE(bc_vs_A   < 1e-9);
+  // ... and demonstrably not the other one, so a change of orientation cannot pass unnoticed
+  REQUIRE(leg_vs_A  > 1e-6);
+  REQUIRE(bc_vs_Ah  > 1e-6);
+}
+
+TEST_CASE("matrix_array_hermitian_solve_orientation", "[math][matrix_array_ops]") { test_solve_orientation<HOST_MEMORY>(); }
+TEST_CASE("matrix_array_hermitian_solve_orientation_dev", "[math][matrix_array_ops]") { test_solve_orientation<DEVICE_MEMORY>(); }
+
 } // namespace bdft_tests
 
 
