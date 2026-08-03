@@ -536,24 +536,52 @@ matches CPU to 4.7e-14 / 3.4e-13 / 2.4e-13 at 1 / 2 / 4 ranks.
    cond(C) and collocation overlaps do not separate `eri_rs_BUGGY_4` from `eri_rs_FIXED_4`
    either. The only thing that ever established corruption was an **elementwise diff against a
    CPU reference** (`C_gpu[318,:] == C_cpu[317,:]`) plus the 3.4e-4 8-rank energy error.
-2. **R1 was mostly this bug.** Rank-count energy spread 3.39e-4 → 3.12e-5 (11x). The residual
-   3.1e-5 is the *point selection*, which varies with rank count on **CPU too** (Np = 1289 /
-   1279 / 1275 / 1290 at 1/2/4/8), so it is algorithmic: the blocked greedy pivoted Cholesky in
-   `chol_metric_impl` amplifies roundoff from different reduction orders. Needs reproducible
-   reductions or a decomposition-independent tie-break.
+2. **R1 was mostly this bug.** Rank-count energy spread 3.39e-4 → 3.12e-5 (11x).
+   **RESOLVED 2026-08-03 (job 6744072) — no code change needed; it is an input convention.**
+   Running the 1/2/4/8-rank CPU scan with `nIpts` pinned instead of threshold-driven collapses
+   the spread from **3.122e-05 to 1.277e-14**:
+
+   | scan | Np at 1/2/4/8 | E1 spread |
+   |---|---|---|
+   | `thresh = 1e-5` | 1289 / 1279 / 1275 / 1290 | 3.122e-05 |
+   | `nIpts = 1275`, `thresh = 0.0` | 1275 / 1275 / 1275 / 1275 | **1.277e-14** |
+
+   So the pivot *sequence* is reproducible across decompositions to roundoff; what varies with
+   rank count is only **where the threshold cuts off**, because the residual at the margin
+   wobbles at roundoff and crosses `thresh` differently. The earlier note here and in my memory
+   — that the blocked greedy pivoted Cholesky reorders near-degenerate pivots — is too
+   pessimistic and should not drive work.
+   **Recommendation: set `nIpts` explicitly for any run whose number must be compared against
+   another rank count** (scaling studies, A/B benchmarks, published values). `thresh` remains
+   fine for exploratory work, but its Np — and hence the energy at the 1e-5 level — is
+   decomposition dependent.
+   Note the two routes are not interchangeable at equal Np: `thresh = 1e-5` at 4 ranks also
+   lands on Np = 1275 but gives E1 = 0.5145880920947619, versus 0.5146250400187667 for pinned
+   `nIpts = 1275`, a 3.7e-5 difference. Exhausting a threshold part-way through a
+   `chol_block_size` block selects a different point set than taking exactly 1275 pivots. The
+   3e-5 scale is the ISDF truncation error at this threshold, i.e. the method's own error bar
+   rather than a defect.
+
+   (Superseded reasoning, kept for context: the residual was thought to be *point selection*
+   varying with rank count on **CPU too** (Np = 1289 / 1279 / 1275 / 1290 at 1/2/4/8), hence
+   algorithmic — the blocked greedy pivoted Cholesky in
+   `chol_metric_impl` amplifies roundoff from different reduction orders, needing reproducible
+   reductions or a decomposition-independent tie-break.)
 3. C is **not** singular (sigma_min 9.78e-6, cond 4.5e11). Any earlier note in this file
    suggesting the ISDF solve is ill-posed was based on the corrupted matrix.
 
-## A.2 Working tree — nothing is committed
+## A.2 Committed on branch `gpu` (2026-08-02/03), not pushed
 
-Modified: `methods/ERI/thc_aux.icc` (**the fix**), `methods/ERI/thc.{h,icc}` (block-cyclic
-branch + `COQUI_THC_SOLVE_DEBUG`/`_DUMP` instrumentation), `numerics/distributed_array/
-{detail/slate_aux.hpp, slate_ops.hpp, tests/CMakeLists.txt}`.
-New: `numerics/distributed_array/{matrix_array.hpp, slate_ops_matrix_array.hpp,
-matrix_array_redistribute.hpp}`, `tests/test_matrix_array{,_ops}.cpp`, and the two docs.
+- `6d85ff4` — **the ERI fix**, one line in `thc_aux.icc` plus the mechanism in the message.
+- `909927c` — block-cyclic `distributed_matrix_array` (container, `slate_ops_matrix_array`,
+  `matrix_array_redistribute`, tests) and every SLATE call site in `thc::intvec_impl` converted,
+  plus the `slate_aux` device-address-space fix and the out-of-place `getri` in
+  `slate_ops::inverse`. Gated by `COQUI_SLATE_BLOCK_CYCLIC`, **default OFF**.
+- `26e1b36` — share one pair of block-cyclic containers across the ZBAR chain (redistributes
+  9 → 5, verified bit-identical), and the ERI blast-radius correction in this file.
 
-**The ERI fix is independent of everything else and should land on its own** — one line plus a
-comment in `thc_aux.icc`.
+Still uncommitted: the `force_sync` iteration-0 checkpoint change (`chkpt_utils.{h,cpp}`,
+`scf_driver.cpp`, `scf_common.cpp`) and this file's R1 update.
 
 ## A.3 Do this next, in order
 

@@ -108,7 +108,10 @@ auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_ax
   Timer.start("WRITE");
   if (!restart) { // write metadata and the MF solution
     chkpt::write_metadata(mpi->comm, *mf, FT, dyson.sH0_skij(), dyson.sS_skij(), mb_state.coqui_prefix);
-    chkpt::dump_scf(mpi->comm, 0, sDm_skij, sG_tskij, sF_skij, sSigma_tskij, mu, mb_state.coqui_prefix);
+    // force_sync: read_input_iterations quiesces this write a few lines below, with no compute
+    // in between, so the async path would copy ~8.9 GB and overlap none of it.
+    chkpt::dump_scf(mpi->comm, 0, sDm_skij, sG_tskij, sF_skij, sSigma_tskij, mu,
+                    mb_state.coqui_prefix, "scf", -1, true);
   }
   Timer.stop("WRITE");
 

@@ -417,7 +417,9 @@ void write_mf_data(mf::MF &mf,
   update_G(dyson, mf, ft, sDm_skij, G_shm, sF_skij, Sigma_shm, mu, false);
 
   chkpt::write_metadata(mpi->comm, mf, ft, dyson.sH0_skij(), dyson.sS_skij(), output);
-  chkpt::dump_scf(mpi->comm, 0, sDm_skij, G_shm, sF_skij, Sigma_shm, mu, output);
+  // force_sync: this is the iteration-0 seed and the caller reads it back, so there is nothing
+  // to overlap -- the async path would only add an ~8.9 GB snapshot.
+  chkpt::dump_scf(mpi->comm, 0, sDm_skij, G_shm, sF_skij, Sigma_shm, mu, output, "scf", -1, true);
 }
 
 template<typename MPI_Context_t>

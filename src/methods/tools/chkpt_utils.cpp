@@ -101,7 +101,7 @@ void dump_scf(communicator_t &comm, long iter,
               const X_t &Dm, const Xt_t &G,
               const X_t &F, const Xt_t &Sigma,
               double mu, std::string output,
-              std::string input_grp, long input_iter) {
+              std::string input_grp, long input_iter, bool force_sync) {
   if (comm.root()) {
     if (input_iter==-1) input_iter = iter-1;
 
@@ -146,7 +146,7 @@ void dump_scf(communicator_t &comm, long iter,
       h5::h5_write(iter_grp, "mu", mu);
     };
 
-    if (async_checkpoint_enabled()) {
+    if (async_checkpoint_enabled() and not force_sync) {
       // Snapshot, then write off the critical path. The copy is ~8.9 GB of
       // memcpy (a couple of seconds) against ~30 s of ceph, and it is what lets
       // the solvers overwrite G/Sigma in the next iteration while the previous
@@ -561,7 +561,7 @@ template void dump_scf(
     mpi3::communicator&, long,
     const sArray_t<Array_view_4D_t>&, const sArray_t<Array_view_5D_t>&,
     const sArray_t<Array_view_4D_t>&, const sArray_t<Array_view_5D_t>&,
-    double, std::string, std::string, long);
+    double, std::string, std::string, long, bool);
 
 template void dump_scf(
     mpi3::communicator&, long,

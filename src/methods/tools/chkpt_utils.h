@@ -60,11 +60,18 @@ namespace methods {
                        const sArray_t<Array_view_4D_t> &sH0_skij, const sArray_t<Array_view_4D_t> &sS_skij,
                        std::string output);
 
+  /**
+   * @param force_sync - [INPUT] Write on this thread even when COQUI_ASYNC_CHKPT=1. Set it for
+   *                     a checkpoint that is joined again before any compute follows: the async
+   *                     path would pay for an ~8.9 GB snapshot and buy no overlap. The
+   *                     iteration-0 seed writes are exactly that case.
+   */
   template <typename communicator_t, typename X_t, typename Xt_t>
   void dump_scf(communicator_t &comm, long iter,
                 const X_t &Dm, const Xt_t &G, const X_t &F, const Xt_t &Sigma,
                 double mu, std::string output = "bdft",
-                std::string input_grp="scf", long input_iter=-1);
+                std::string input_grp="scf", long input_iter=-1,
+                bool force_sync=false);
 
   template<typename communicator_t, typename X_4D_t, typename X_3D_t>
   void dump_scf(communicator_t &comm, long iter,
