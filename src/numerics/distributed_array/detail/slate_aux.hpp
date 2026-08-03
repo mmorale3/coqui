@@ -126,8 +126,20 @@ auto make_slate(DMat& A_)
   cudaSetDevice(dev_);  // in case slate changes the active device (e.g. initialization of quues, etc)
 #endif
   if constexpr (tiles_on_device)
-    utils::check(dev < R.num_devices(), "make_slate: device {} not visible to slate (num_devices:{}).",
-                 dev, R.num_devices());
+    // tileDevice above hands slate ONE constant device for every tile of this rank, while slate
+    // iterates device = 0 .. num_devices()-1 and picks tiles by `device == tileDevice(i,j)`. That
+    // is only self-consistent when the process sees exactly one GPU. With several visible, each
+    // rank's cudaSetDevice(local_rank % num_devices) gives a different `dev` while every rank
+    // reports the same num_devices(), and slate's per-device workspace and the tiles disagree:
+    // measured as a cudaErrorIllegalAddress at 12 ranks x 3 nodes with --gpus-per-node=4, and as
+    // a clean run the moment --gpu-bind=single:1 collapses it to one visible device per rank.
+    // `dev < num_devices()` was the old test and it passes in exactly that broken case, so it
+    // never fired. Demand the assumption the code actually makes.
+    utils::check(R.num_devices() == 1,
+                 "make_slate: this rank sees {} GPUs (using device {}), but slate's tile->device "
+                 "map here assumes exactly one GPU per rank. Bind one GPU per rank at launch "
+                 "(srun --gpu-bind=single:1, or set CUDA_VISIBLE_DEVICES=$SLURM_LOCALID) and "
+                 "rerun.", R.num_devices(), dev);
 
   if constexpr (not view) {
     // to_slate() copies into tiles slate owns. Only the host case is implemented: the

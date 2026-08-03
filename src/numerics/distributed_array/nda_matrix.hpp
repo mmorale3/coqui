@@ -430,8 +430,18 @@ class distributed_array_view
 		    ::nda::ArrayOfRank<rank> auto && A_) :
 		    // can't keep a non-const view to a const-view, so need to take arg by mutable ref
     base(comm_,grid_,gshape,origin_,bsize,A_.shape()),
-    A(A_.indexmap(),A_.data()) 
+    A(A_.indexmap(),A_.data())
   {
+    // OwningPolicy (and hence everything downstream that dispatches on address space) comes from
+    // the *template argument*, while all we do here is take A_.data(). Nothing tied the two
+    // together, so naming a different address space than the pointer actually lives in compiled
+    // silently and produced a view that lies about its own memory -- which is how the unified-memory
+    // slate workaround was written, and how a device pointer could reach host BLAS and MPI. Tie them.
+    static_assert(::nda::mem::get_addr_space<std::decay_t<decltype(A_)>> ==
+                  ::nda::mem::get_addr_space<Base_t>,
+                  "distributed_array_view: the address space of the local array does not match the "
+                  "one named by the template argument. Type the view with the array's own address "
+                  "space (e.g. memory::array<MEM,...>) instead of reinterpreting it.");
   }
   
   ~distributed_array_view() {}

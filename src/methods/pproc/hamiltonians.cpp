@@ -168,8 +168,11 @@ void add_thc_hamiltonian_components(mf::MF &mf,
   auto dZ = thc.dZ(std::array<long,3>{1,nx,ny});
   long nI = dZ.global_shape()[1];
 
-  using lArray_t = std::conditional_t<MEM==HOST_MEMORY, memory::host_array<ComplexType,2>,
-                                      memory::unified_array<ComplexType,2>>;
+  // Must match the address space of dZ's local array: the darray_view_t below is built from a
+  // slice of it, and the view's address space comes from this type. Naming unified here (the old
+  // slate workaround) reinterpreted a device pointer as host-dereferenceable. Only HOST_MEMORY is
+  // instantiated for this routine, so the two branches agree today; keep them tied.
+  using lArray_t = memory::array<MEM,ComplexType,2>;
   if(type == "bare") {
 
     if(mpi->comm.root()) {
