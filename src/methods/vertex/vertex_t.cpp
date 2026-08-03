@@ -278,6 +278,41 @@ namespace solvers {
       }
     }
 
+    /**
+     * SLAB variant (Increment 3, the Pi^C slab accumulator): `part` holds ONLY this
+     * rank's owned q rows -- axis 1 is the slab, `slab_of` maps global iq -> slab row
+     * (-1 when not owned). Each destination block is packed from the slab where owned
+     * and ZEROS elsewhere -- identical math to the historic full-shape partial, whose
+     * non-owned rows were structurally zero -- then reduced onto its owner exactly as
+     * reduce_scatter_into. On one rank (every row owned) this is a bit-identical copy.
+     */
+    template<typename dArray_t, typename comm_t>
+    void reduce_scatter_slab_into(nda::array<ComplexType, 4> const& part,
+                                  std::vector<long> const& slab_of,
+                                  dArray_t& dPi, comm_t& comm) {
+      decltype(nda::range::all) all;
+      const long np = comm.size();
+      std::array<long, 8> mine{};
+      for (int d = 0; d < 4; ++d) { mine[d] = dPi.origin()[d]; mine[4 + d] = dPi.local_shape()[d]; }
+      nda::array<long, 2> boxes(np, 8);
+      comm.all_gather_n(mine.data(), 8, boxes.data());
+      for (long r = 0; r < np; ++r) {
+        nda::range r0(boxes(r, 0), boxes(r, 0) + boxes(r, 4));
+        nda::range r2(boxes(r, 2), boxes(r, 2) + boxes(r, 6));
+        nda::range r3(boxes(r, 3), boxes(r, 3) + boxes(r, 7));
+        nda::array<ComplexType, 4> buf(boxes(r, 4), boxes(r, 5), boxes(r, 6), boxes(r, 7));
+        buf() = ComplexType(0.0);
+        for (long jq = 0; jq < boxes(r, 5); ++jq) {
+          const long gq = boxes(r, 1) + jq;
+          const long sq = slab_of[gq];
+          if (sq < 0) continue;                       // not owned: stays zero
+          buf(all, jq, all, all) = part(r0, sq, r2, r3);
+        }
+        comm.reduce_in_place_n(buf.data(), buf.size(), std::plus<>{}, int(r));
+        if (r == comm.rank()) dPi.local() = buf;
+      }
+    }
+
   } // vertex_redist_detail
 
   /**
@@ -2284,7 +2319,20 @@ namespace solvers {
       //     Fed the C-C block: the kernel CONTRACTS its external orbital legs into the aux
       //     indices, so their range is part of the object (all eight labels of Phi are in C).
       const long Naux_pi = sec ? _Nm : Np;
-      nda::array<ComplexType, 4> Pi_wq(tools.nw_b, nqpts_ibz, Naux_pi, Naux_pi);
+      // INCREMENT 3 (the same slab as eval_Pi_C's accumulator): on the global path this
+      // response-stage accumulator is the SAME (nw_b, nq_ibz, Np, Np) giant -- 46.6
+      // GB/rank at Si kp666 -- and it bound the Sigma stage of every STATIC theory
+      // (B-S included, which the lean-W staging does not touch: need_dyn is false
+      // there). Store only the owned +-q-orbit rows; the (linear) tau = 0 row is
+      // applied to the slab below and the SMALL Pi0 is what gets reduced. The
+      // secondary path (N_m^2) stays full-shape in v1.
+      std::optional<vertex_pi::pi_qext_plan> pi0_plan;
+      if (not sec)
+        pi0_plan.emplace(vertex_pi::make_pi_qext_plan(mpi->comm.rank(), mpi->comm.size(),
+                                                      ns * nkpts * nqpts, nqpts_ibz,
+                                                      qmin));
+      const long n_pi0_rows = pi0_plan ? long(pi0_plan->owned.size()) : nqpts_ibz;
+      nda::array<ComplexType, 4> Pi_wq(tools.nw_b, n_pi0_rows, Naux_pi, Naux_pi);
       Pi_wq() = ComplexType(0.0);
       // symc MUST be threaded through: on an IBZ mesh the kernel's external q axis is
       // nqpts_ibz while kmq/kpq carry the FULL transfer mesh, and it sources non-IBZ
@@ -2303,8 +2351,14 @@ namespace solvers {
         vertex_pi::pi_c_accumulate_w(*_ft, tools, G_CC, X_C, W0b_r, static_cast<nda::array<ComplexType, 4> const*>(nullptr),
                                      kmq, kpq, nda::range(0, nc), Pi_wq,
                                      mpi->comm.rank(), mpi->comm.size(),
-                                     skip_rung_gamma, nullptr, symc);
-      mpi->comm.all_reduce_in_place_n(Pi_wq.data(), Pi_wq.size(), std::plus<>{});
+                                     skip_rung_gamma, nullptr, symc, nullptr,
+                                     &pi0_plan.value());
+      // The historic full-array all_reduce survives only on the (small, N_m^2)
+      // secondary path. On the global path the tau = 0 row is applied to the SLAB
+      // partial below and the reduction moves to the small Pi0 -- the giant is never
+      // materialized, let alone summed.
+      if (sec)
+        mpi->comm.all_reduce_in_place_n(Pi_wq.data(), Pi_wq.size(), std::plus<>{});
       _Timer.stop("SIG_RESP_PI0");
 
       // (2) the tau = 0 row (the LEGAL evaluation of (1/beta) sum_nu; sparse nodes are
@@ -2323,7 +2377,24 @@ namespace solvers {
         nda::blas::gemm(R0row, A, y);
       };
       nda::array<ComplexType, 3> Pi0(nqpts_ibz, Naux_pi, Naux_pi);
-      tau0_of(Pi_wq, Pi0);
+      if (pi0_plan) {
+        // SLAB: the same per-cell m-sum gemm as tau0_of, on the owned rows only. tau0
+        // is linear, so applying it before the rank sum and reducing Pi0 instead of
+        // Pi_wq agrees to reduction order (the ~1e-14 class the digit bars absorb).
+        nda::array<ComplexType, 3> Pi0_slab(n_pi0_rows, Naux_pi, Naux_pi);
+        {
+          const long ncol = n_pi0_rows * Naux_pi * Naux_pi;
+          auto A = nda::reshape(Pi_wq, std::array<long, 2>{tools.nw_b, ncol});
+          auto y = nda::reshape(Pi0_slab, std::array<long, 2>{1, ncol});
+          nda::blas::gemm(R0row, A, y);
+        }
+        Pi0() = ComplexType(0.0);
+        for (long r = 0; r < n_pi0_rows; ++r)
+          Pi0(pi0_plan->owned[r], all, all) = Pi0_slab(r, all, all);
+        mpi->comm.all_reduce_in_place_n(Pi0.data(), Pi0.size(), std::plus<>{});
+      } else {
+        tau0_of(Pi_wq, Pi0);
+      }
 
       nda::array<ComplexType, 3> PiStat;   // DIAGNOSTIC: B-S middle factor, kept for §8.2
       // ---- INCREMENT S9: B-L's response middle factor -------------------------------
@@ -2500,6 +2571,9 @@ namespace solvers {
         // is the ONLY thing that exposes B-L to the aux pole basis.
         if (_pidyn_mode != 0) {
           _Timer.start("SIG_RESP_PIDYN");
+          // Full-shape BY DESIGN (Increment 3 exemption): route B is the default-off
+          // production-scale refactor gate, tau0_of below wants the full q axis, and
+          // slabbing a diagnostic route buys nothing.
           nda::array<ComplexType, 4> Pid_wq(tools.nw_b, nqpts_ibz, Naux_pi, Naux_pi);
           Pid_wq() = ComplexType(0.0);
           if (sec)
@@ -3416,7 +3490,28 @@ namespace solvers {
     // (X_C, W, Z, Np) global vs (Xb, Wbar, Zbar, N_m) secondary.
     const long naux = sec ? _Nm : Np;
     nda::array<double, 1> qx_diag(nqpts);
-    nda::array<ComplexType, 4> Pi_wqMN(tools.nw_b, nqpts_ibz, naux, naux);
+    // INCREMENT 3 -- THE Pi^C SLAB ACCUMULATOR (global path). The per-rank full-shape
+    // partial (nw_b, nq_ibz, Np, Np) was the last replicated giant after the lean-W
+    // staging (46.6 GB/rank at Si kp666) and, unlike the lean-W fixes, it binds B-S,
+    // B-L AND the parent -- eval_Pi_C is the same call for all three. Each rank's
+    // partial is structurally zero outside its q_ext stride, so store ONLY the owned
+    // rows. Ownership is +-q-ORBIT-closed so the pair-symmetry projection below stays
+    // rank-local; the plan's qext-first preference divides the accumulator by
+    // qext_size at unchanged per-rank work (see vertex_pi::pi_qext_plan). The
+    // SECONDARY path stays full-shape (N_m^2 is small) in v1.
+    std::optional<vertex_pi::pi_qext_plan> qplan;
+    if (not sec)
+      qplan.emplace(vertex_pi::make_pi_qext_plan(mpi->comm.rank(), mpi->comm.size(),
+                                                 ns * nkpts * nqpts, nqpts_ibz,
+                                                 MF->qminus()));
+    const long n_qrows = qplan ? long(qplan->owned.size()) : nqpts_ibz;
+    if (qplan)
+      app_log(2, "  Pi^C slab accumulator: qext_size = {} x tup_size = {}; this rank "
+                 "stores {} of {} q rows ({:.2f} GB instead of {:.2f} GB)",
+              qplan->qext_size, qplan->tup_size, n_qrows, nqpts_ibz,
+              double(tools.nw_b * n_qrows * naux * naux) * 16.0 / 1.0e9,
+              double(tools.nw_b * nqpts_ibz * naux * naux) * 16.0 / 1.0e9);
+    nda::array<ComplexType, 4> Pi_wqMN(tools.nw_b, n_qrows, naux, naux);
     Pi_wqMN() = ComplexType(0.0);
     nda::array<double, 1> phase_diag(4);
     phase_diag() = 0.0;
@@ -3449,7 +3544,8 @@ namespace solvers {
         vertex_pi::pi_c_accumulate_w(*_ft, tools, G_CC, X_C, W0b_r, static_cast<nda::array<ComplexType, 4> const*>(nullptr),
                                      kmq, kpq, nda::range(0, nc), Pi_wqMN,
                                      mpi->comm.rank(), mpi->comm.size(),
-                                     skip_rung_gamma, &qx_diag, symc, &phase_diag);
+                                     skip_rung_gamma, &qx_diag, symc, &phase_diag,
+                                     &qplan.value());
     } else if (sec)
       vertex_pi::pi_c_accumulate_w(*_ft, tools, G_CC, _Xb_skma, Zb_qmm,
                                    Wbdyn_qwmm.has_value() ? &Wbdyn_qwmm.value() : nullptr,
@@ -3461,7 +3557,8 @@ namespace solvers {
                                    Wdyn_qwPQ.has_value() ? &Wdyn_qwPQ.value() : nullptr,
                                    kmq, kpq, nda::range(0, nc), Pi_wqMN,
                                    mpi->comm.rank(), mpi->comm.size(),
-                                   skip_rung_gamma, &qx_diag, symc, &phase_diag);
+                                   skip_rung_gamma, &qx_diag, symc, &phase_diag,
+                                   &qplan.value());
     _Timer.stop("PI_KERNEL");
     _Timer.start("PI_UPFOLD_REDUCE");
     // M3 item #8 (notes/vertex_parallelization_M3.md): DO NOT all_reduce the full partial
@@ -3501,9 +3598,18 @@ namespace solvers {
         // i.e. every transfer is SELF-INVERSE -- there iqm == iq and coverage is complete.
         if (iqm >= nqpts_ibz) { ++n_skip; continue; }
         if (iqm < iq) continue;                    // already handled with its partner
-        ++n_done;
+        ++n_done;                                  // global count -- every rank agrees
+        // SLAB (Increment 3): each rank projects only the rows it owns. Ownership is
+        // +-q-ORBIT-closed, so iq and iqm are always co-resident: both slab rows exist
+        // or neither does, and the projection needs no communication either way.
+        const long rA = qplan ? qplan->slab_of[iq] : iq;
+        if (rA < 0) continue;                      // not my orbit
+        const long rB = qplan ? qplan->slab_of[iqm] : iqm;
+        utils::check(rB >= 0,
+                     "vertex_t::eval_Pi_C: slab ownership is not orbit-closed "
+                     "(iq = {} owned, -q partner {} not).", iq, iqm);
         for (long l = 0; l < tools.nw_b; ++l) {
-          auto A = Pi_wqMN(l, iq, all, all);
+          auto A = Pi_wqMN(l, rA, all, all);
           if (iqm == iq) {
             // self-inverse transfer: the relation reduces to P(q) = P(q)^T
             for (long M = 0; M < naux; ++M)
@@ -3516,7 +3622,7 @@ namespace solvers {
           } else {
             // P_sym(q)_MN == P_sym(-q)_NM, so each (M,N) writes exactly the two slots it
             // reads -- safe in place, no temporary.
-            auto B = Pi_wqMN(l, iqm, all, all);
+            auto B = Pi_wqMN(l, rB, all, all);
             for (long M = 0; M < naux; ++M)
               for (long N = 0; N < naux; ++N) {
                 const ComplexType s = 0.5 * (A(M, N) + B(N, M));
@@ -3682,13 +3788,16 @@ namespace solvers {
       // write my t-slice of the block into the owned local() (q axis is full: local q == 0..nq).
       dPi_C_tqPQ.local() = Pi_t_blk(t_range, all, all, all);
     } else {
-      // GLOBAL: Pi_wqMN is already Np^2 (a partial). tau-convert the partial and reduce-
-      // scatter the full Np^2 partial into the RPA grid: every output block is summed across
-      // ranks and lands ONLY on its owner (no full-array all_reduce). On one rank this is a
-      // bit-identical copy.
-      nda::array<ComplexType, 4> Pi_tqMN(nt_half, nqpts_ibz, Np, Np);
+      // GLOBAL: Pi_wqMN is the OWNED-ROW SLAB of the partial (Increment 3). tau-convert
+      // the slab -- upfold-free here, and pi_w_to_code_tau's internal (nt, nq, ., .)
+      // transient (the OTHER historic full-shape giant) now shrinks with it -- and
+      // reduce-scatter into the RPA grid, packing ZEROS for the rows this rank does not
+      // own: identical math to the historic full-shape partial, whose non-owned rows
+      // were structurally zero. On one rank this is a bit-identical copy.
+      nda::array<ComplexType, 4> Pi_tqMN(nt_half, n_qrows, Np, Np);
       vertex_pi::pi_w_to_code_tau(*_ft, tools, Pi_wqMN, Pi_tqMN);
-      vertex_redist_detail::reduce_scatter_into(Pi_tqMN, dPi_C_tqPQ, mpi->comm);
+      vertex_redist_detail::reduce_scatter_slab_into(Pi_tqMN, qplan->slab_of,
+                                                     dPi_C_tqPQ, mpi->comm);
     }
 
     {

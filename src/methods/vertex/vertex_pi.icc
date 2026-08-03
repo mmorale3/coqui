@@ -73,6 +73,9 @@
 #include <cmath>
 #include <complex>
 #include <tuple>
+#include <vector>
+#include <array>
+#include <algorithm>
 
 #include "configuration.hpp"
 #include "nda/nda.hpp"
@@ -417,6 +420,88 @@ namespace vertex_pi {
   } // detail
 
   /**
+   * INCREMENT 3 -- THE Pi^C SLAB ACCUMULATOR (vertex parallelization; the 2026-08-02
+   * audit in notes/bl_head_balance_theory_and_plan.md section 5g). Ownership plan for
+   * the EXTERNAL q axis of the Pi^C accumulator. Under the 2D (tuple x q_ext) rank
+   * split each rank only ever writes the q_ext rows it strides, so the historic
+   * full-shape per-rank partial (nw_b, nq_ext, Np, Np) -- 46.6 GB/rank at Si kp666,
+   * the last replicated giant after the lean-W staging -- is structurally ZERO outside
+   * those rows. A plan makes the ownership explicit so the kernel can write a SLAB
+   * holding only the owned rows.
+   *
+   * Two deliberate choices:
+   *  - ownership is assigned over +-q ORBITS {iq, qminus(iq)} (self-inverse and
+   *    partnerless rows are singletons), so the caller's pair-symmetry projection
+   *    P_PQ(q) = P_QP(-q) stays rank-local on the slab;
+   *  - the factorization preference is FLIPPED relative to the legacy in-kernel split:
+   *    q_ext takes the LARGEST divisor of nproc the orbit count admits, the tuple axis
+   *    takes the rest. Per-rank WORK is ntuples * nq_ext / nproc under EITHER
+   *    preference; what the flip changes is the accumulator, which shrinks by
+   *    qext_size. Cross-rank reduction order changes (~1e-14 class on energy bars);
+   *    at nproc = 1 the slab is the full array and everything is bit-identical.
+   *
+   * A null plan in the kernel is the EXACT legacy path (tuple-first split, full-shape
+   * output) -- direct kernel callers and the secondary (N_m) path are unaffected.
+   */
+  struct pi_qext_plan {
+    long nq_ext = 0;            // full external q axis (the slab's global extent)
+    long tup_size = 1;          // ranks striding the (s,k,qx) tuple axis
+    long qext_size = 1;         // ranks striding the +-q orbits
+    long rank = 0, nproc = 1;   // the comm coordinates this plan was built for
+    std::vector<long> owned;    // ascending global iq rows owned by THIS rank
+    std::vector<long> slab_of;  // (nq_ext): global iq -> slab row, -1 when not owned
+  };
+
+  template<class QMinus>
+  pi_qext_plan make_pi_qext_plan(long rank, long nproc, long ntuples, long nq_ext,
+                                 QMinus const& qminus) {
+    pi_qext_plan plan;
+    plan.nq_ext = nq_ext;
+    plan.rank = rank;
+    plan.nproc = nproc;
+    // ---- +-q orbits over the stored rows (mirrors the pair-symmetry projection):
+    // {iq, qminus(iq)} when the partner is stored, else a singleton. Under an IBZ mesh
+    // -q need not be a stored row (those rows are singletons and the projection skips
+    // them); a Gamma-centred even mesh has every transfer self-inverse.
+    std::vector<std::array<long, 2>> orbits;   // {iq, iqm}; iqm = -1 for singletons
+    for (long iq = 0; iq < nq_ext; ++iq) {
+      const long iqm = qminus(iq);
+      if (iqm >= nq_ext or iqm == iq) { orbits.push_back({iq, -1}); continue; }
+      if (iqm < iq) continue;                  // listed with its partner
+      utils::check(qminus(iqm) == iq,
+                   "make_pi_qext_plan: qminus is not an involution on the stored rows "
+                   "({} -> {} -> {}).", iq, iqm, qminus(iqm));
+      orbits.push_back({iq, iqm});
+    }
+    const long n_orbits = long(orbits.size());
+    utils::check(n_orbits > 0, "make_pi_qext_plan: no stored q rows (nq_ext = {}).",
+                 nq_ext);
+    // ---- qext-FIRST factorization: the largest divisor of nproc the orbit count
+    // admits, spilling the rest onto the (large) tuple axis. Fallback (nproc beyond
+    // ntuples * n_orbits -- test-scale corner): keep the largest admissible qext and
+    // let the excess tuple ranks idle, exactly as the legacy split does.
+    long qd = 0;
+    for (long d = nproc; d >= 1; --d)
+      if (nproc % d == 0 and d <= n_orbits and nproc / d <= ntuples) { qd = d; break; }
+    if (qd == 0)
+      for (long d = nproc; d >= 1; --d)
+        if (nproc % d == 0 and d <= n_orbits) { qd = d; break; }
+    plan.qext_size = std::max(qd, 1l);
+    plan.tup_size = nproc / plan.qext_size;
+    // ---- round-robin orbits over the qext ranks; owned rows ascending -----------------
+    const long qext_rank = rank % plan.qext_size;
+    plan.slab_of.assign(nq_ext, -1);
+    for (long j = 0; j < n_orbits; ++j) {
+      if (j % plan.qext_size != qext_rank) continue;
+      plan.owned.push_back(orbits[j][0]);
+      if (orbits[j][1] >= 0) plan.owned.push_back(orbits[j][1]);
+    }
+    std::sort(plan.owned.begin(), plan.owned.end());
+    for (long r = 0; r < long(plan.owned.size()); ++r) plan.slab_of[plan.owned[r]] = r;
+    return plan;
+  }
+
+  /**
    * Accumulate Pi^C(q, inu) on the full bosonic Matsubara mesh, in the *notes* frequency
    * convention with the code's (M,N) index routing (see file header). Contributions from
    * the (s,k,qx) tuples with (flat index % nproc == rank) are added to Pi_wqMN.
@@ -461,7 +546,11 @@ namespace vertex_pi {
                          // [0] Pibar after the pole-free Phase 1, [1] max DLR pole residue
                          // of the z objects, [2] max |z| itself, [3] relative error of the
                          // pole fit reconstructed on the tau grid. Diagnostic (2026-07-27).
-                         nda::array<double, 1>* phase_diag = nullptr) {
+                         nda::array<double, 1>* phase_diag = nullptr,
+                         // Increment 3: non-null = Pi_wqMN is the OWNED-ROW SLAB described
+                         // by the plan (see pi_qext_plan above). nullptr = exact legacy
+                         // (tuple-first split, full-shape output).
+                         pi_qext_plan const* plan = nullptr) {
     (void)ft;
     decltype(nda::range::all) all;
     long ns = G_tskij.shape(1), nk = G_tskij.shape(2);
@@ -469,6 +558,7 @@ namespace vertex_pi {
     long Nb = C.size();
     long nt = tools.nt_f, nw_b = tools.nw_b;
     long Nb2 = Nb * Nb;
+    const bool slab = (plan != nullptr);
 
     // symmetry bookkeeping (notes/vertex_ibz_symmetry.md section 4):
     //   nq_w    = rows of the stored W/Z (IBZ under symmetry)
@@ -478,7 +568,9 @@ namespace vertex_pi {
     const bool sym = (symc != nullptr and symc->active);
     long nq_w = Z_qPQ.shape(0);
     long nq_full = kmq.shape(0);
-    long nq_ext = Pi_wqMN.shape(1);
+    // slab: the output's row axis is the OWNED subset, so the external q extent comes
+    // from the plan (the symmetry checks below still see the true global axis).
+    long nq_ext = slab ? plan->nq_ext : Pi_wqMN.shape(1);
     if (sym) {
       utils::check(nq_w == symc->nq_ibz and nq_ext == symc->nq_ibz and
                    nq_full == symc->nq_full and nk == symc->nk_full,
@@ -498,8 +590,14 @@ namespace vertex_pi {
     long nq = nq_full;   // internal transfer axis (historic name)
 
     utils::check(Pi_wqMN.shape(0) == nw_b and
+                 Pi_wqMN.shape(1) == (slab ? long(plan->owned.size()) : nq_ext) and
                  Pi_wqMN.shape(2) == Np and Pi_wqMN.shape(3) == Np,
                  "vertex_pi::pi_c_accumulate_w: output shape mismatch.");
+    if (slab)
+      utils::check(plan->rank == rank and plan->nproc == nproc,
+                   "vertex_pi::pi_c_accumulate_w: the slab plan was built for rank {} of "
+                   "{} but the kernel runs as rank {} of {}.",
+                   plan->rank, plan->nproc, rank, nproc);
 
     // spin factor mirrors rpa_pi.icc:312: external spin sum, ns==1 -> degeneracy 2
     const ComplexType pref = ComplexType(-((ns == 1) ? 2.0 : 1.0) / double(nk * nk));
@@ -546,7 +644,14 @@ namespace vertex_pi {
     // spilling the remainder onto q_ext, so on the target regime (ntuples >> nproc)
     // qext_size == 1 and this is bit-identical to the historic 1D tuple RR.
     long qext_size = 1, tup_size = nproc;
-    {
+    if (slab) {
+      // Increment 3: the plan fixes the factorization (qext-FIRST preference).
+      qext_size = plan->qext_size;
+      tup_size = plan->tup_size;
+      utils::check(qext_size * tup_size == nproc,
+                   "vertex_pi::pi_c_accumulate_w: slab plan factorization {} x {} does "
+                   "not cover nproc = {}.", tup_size, qext_size, nproc);
+    } else {
       for (long d = 1; d <= nproc; ++d) {
         if (nproc % d != 0) continue;
         long ts = nproc / d;
@@ -561,8 +666,28 @@ namespace vertex_pi {
     }
     const long tup_rank  = rank / qext_size;   // which (s,k,qx) tuples this rank owns
     const long qext_rank = rank % qext_size;   // which q_ext subset this rank owns
+    // External-q iteration: the slab's owned-row list, or the legacy qext stride mapped
+    // onto full-shape rows. AT FIXED FACTORIZATION the two are bit-identical per owned
+    // cell: the tup stride is untouched and distinct iq write distinct cells, so every
+    // (m, iq) cell receives the same additions in the same order -- only WHERE the row
+    // is stored changes. (The plan's qext-first preference is a different factorization,
+    // i.e. a cross-rank reduction-order change bounded by the ~1e-14 class the e2e bars
+    // absorb.)
+    std::vector<long> iq_own, iq_row;   // global iq  /  its row in Pi_wqMN
+    if (slab) {
+      iq_own = plan->owned;
+      iq_row.resize(iq_own.size());
+      for (long r = 0; r < long(iq_own.size()); ++r) iq_row[r] = r;
+    } else {
+      for (long iq = qext_rank; iq < nq_ext; iq += qext_size) {
+        iq_own.push_back(iq);
+        iq_row.push_back(iq);
+      }
+    }
+    const long n_own = long(iq_own.size());
     app_log(3, "pi_c_accumulate_w: rank split nproc = {} -> tup_size = {} x qext_size = {} "
-               "(ntuples = {}, nq_ext = {})", nproc, tup_size, qext_size, ntuples, nq_ext);
+               "(ntuples = {}, nq_ext = {}{}{})", nproc, tup_size, qext_size, ntuples,
+            nq_ext, slab ? ", SLAB rows = " : "", slab ? std::to_string(n_own) : "");
 
     // ---------------- helper: rung collocations + orbital-projected rung ----------------
     // Under symmetry the four rung legs use the effective columns Xhat(is, jsym, kL)
@@ -608,7 +733,8 @@ namespace vertex_pi {
         if (skip_rung_gamma and iqx == iq_gamma) continue;
         long ikmqx = kmq(iqx, ik);
         auto [qsx, trx, jsx] = q_access(iqx);
-        for (long iq = qext_rank; iq < nq_ext; iq += qext_size) {
+        for (long jq = 0; jq < n_own; ++jq) {
+          const long iq = iq_own[jq];
           long ikpq = kpq(iq, ik);
           long ikxq = kmq(iqx, ikpq);
           build_U(is, ik, ikmqx, ikpq, ikxq, jsx);
@@ -640,7 +766,7 @@ namespace vertex_pi {
           for (long m = 0; m < nw_b; ++m) {
             auto b41m = nda::reshape(b41(m, all), shape_t<2>{Nb2, Np});
             auto b23m = nda::reshape(b23(m, all), shape_t<2>{Nb2, Np});
-            auto Pi_MN = Pi_wqMN(m, iq, all, all);
+            auto Pi_MN = Pi_wqMN(m, iq_row[jq], all, all);
             nda::blas::gemm(wZmat, b23m, ThZ);
             nda::blas::gemm(pref, nda::transpose(ThZ), b41m, ComplexType(0.0), Ctmp);
             track_add(iqx, Pi_MN);
@@ -787,7 +913,8 @@ namespace vertex_pi {
       if (skip_rung_gamma and iqx == iq_gamma) continue;
       long ikmqx = kmq(iqx, ik);
       auto [qsx, trx, jsx] = q_access(iqx);
-      for (long iq = qext_rank; iq < nq_ext; iq += qext_size) {
+      for (long jq = 0; jq < n_own; ++jq) {
+        const long iq = iq_own[jq];
         long ikpq = kpq(iq, ik);
         long ikxq = kmq(iqx, ikpq);
         build_U(is, ik, ikmqx, ikpq, ikxq, jsx);          // m-invariant: ONCE per tile
@@ -819,7 +946,7 @@ namespace vertex_pi {
           build_T_tile(is, ik, iq);       // T pair at (is, ik,    iq)
           build_M_tile(is, ikmqx, iq);    // M pair at (is, ikmqx, iq)
 
-          auto Pi_MN = Pi_wqMN(m, iq, all, all);
+          auto Pi_MN = Pi_wqMN(m, iq_row[jq], all, all);
 
           // Pi_dyn(m) = -pref * sum_s [ row_m0(s) (T0.w~.M0 + T1.w~.M1)(s)
           //                           + row_m(s)  (T1.w~.M0)(s)
@@ -1005,6 +1132,8 @@ namespace vertex_pi {
     }
 
     // ---- 2D rank split, identical factorization to pi_c_accumulate_w -------------------
+    // (Increment 3 exemption: the output here is (nq_ext, Np, Np) -- no nw_b axis -- so
+    //  the full-shape accumulator is small and no slab plan is threaded through.)
     const long ntuples = ns * nk * nq;
     long qext_size = 1, tup_size = nproc;
     {
