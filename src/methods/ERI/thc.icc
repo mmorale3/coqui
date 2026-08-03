@@ -1711,12 +1711,14 @@ auto thc::intvec_impl(nda::MemoryArrayOfRank<1> auto const& IPts,
 
   if constexpr (return_coul_matrix) {
 
-    // C_quv = Z_quG * Z_quG^H, routed through the block-cyclic container when it is enabled.
-    // The legacy single-block layout cannot be used for this gemm at any grid with
+    // The legacy single-block layout cannot be used for these gemms/solves at any grid with
     // pgrid3D[1]*pgrid3D[2] > 1: its tiles are views into one large local block, so their
     // leading dimension is the block's lld rather than mb, and slate's device_regions_build
-    // asserts on the mismatch. Both call sites below need it, hence the lambda.
+    // asserts on the mismatch. Hence the block-cyclic branches below.
     using ma_t = memory::dmatrix_array_t<MEM,ComplexType,1,mpi3::communicator>;
+
+    // C_quv = Z_quG * Z_quG^H on its own. Only the second (post-Coulomb) call site needs
+    // this in isolation; the first one is fused into the chain below.
     auto multiply_ZZh_into_C = [&]() {
       if( math::nda::use_block_cyclic_slate() ) {
         Timer.start("ZBAR_REDIST");
@@ -1735,14 +1737,21 @@ auto thc::intvec_impl(nda::MemoryArrayOfRank<1> auto const& IPts,
 
     // First compute the inverse of overlap matrices
     Timer.start("ZBAR");
-    multiply_ZZh_into_C();
     if( math::nda::use_block_cyclic_slate() ) {
 
-      // C := C^{-1}, all q's at once rather than the round-robin over local q below.
+      // One pair of containers carries the whole chain
+      //     C = Z Z^H   ->   C := C^{-1}   ->   IquG = C^{-1} Z
+      // so Z is redistributed in exactly once and C only returns to the legacy layout at the
+      // end, where the local element work further down needs it. Doing these three as
+      // independent block-cyclic ops instead costs 9 redistributes rather than 3, and nothing
+      // between them reads C_quv or writes Z_quG in the legacy layout.
       Timer.start("ZBAR_REDIST");
+      ma_t Zma(mpi->comm, pgrid3D, Z_quG.global_shape(), {block_size[1],block_size[2]});
       ma_t Cma(mpi->comm, pgrid3D, C_quv.global_shape(), {block_size[1],block_size[1]});
-      math::nda::redistribute_to_matrix_array(C_quv, Cma);
+      math::nda::redistribute_to_matrix_array(Z_quG, Zma);
       Timer.stop("ZBAR_REDIST");
+
+      math::nda::slate_ops::multiply(Zma, math::nda::dagger(Zma), Cma);
 
       if (use_least_squares) {
         // mirror the legacy path exactly: solve C X = I instead of factorizing and inverting
@@ -1757,11 +1766,27 @@ auto thc::intvec_impl(nda::MemoryArrayOfRank<1> auto const& IPts,
         math::nda::slate_ops::inverse(Cma);
       }
 
+      if( return_Sinv_Ivec ) {
+        // IquG = C^{-1} * Z. Cma and Zma are already block-cyclic here, so this costs one
+        // redistribute out rather than two in plus one out.
+        Timer.start("ALLOC");
+        IquG = make_distributed_array<local_Array_t>(mpi->comm,pgrid3D,Z_quG.global_shape(),
+                    Z_quG.block_size());
+        ma_t Ima(mpi->comm, pgrid3D, Z_quG.global_shape(), {block_size[1],block_size[2]});
+        Timer.stop("ALLOC");
+        math::nda::slate_ops::multiply(Cma, Zma, Ima);
+        Timer.start("ZBAR_REDIST");
+        math::nda::redistribute_from_matrix_array(Ima, *IquG);
+        Timer.stop("ZBAR_REDIST");
+      }
+
       Timer.start("ZBAR_REDIST");
       math::nda::redistribute_from_matrix_array(Cma, C_quv);
       Timer.stop("ZBAR_REDIST");
 
     } else {
+      math::nda::slate_ops::multiply(Z_quG, dagger(Z_quG), C_quv);
+
       std::vector<std::pair<long,long> > diag_idx;
       for (auto [iu, u] : itertools::enumerate(C_quv.local_range(1))) {
         for (auto [iv, v] : itertools::enumerate(C_quv.local_range(2))) {
@@ -1801,30 +1826,16 @@ auto thc::intvec_impl(nda::MemoryArrayOfRank<1> auto const& IPts,
         }
         C2D = buf_loc;
       }
-    }
 
-    if( return_Sinv_Ivec ) {
-      // construct IquG
-      Timer.start("ALLOC");
-      IquG = make_distributed_array<local_Array_t>(mpi->comm,pgrid3D,Z_quG.global_shape(),
-                  Z_quG.block_size());
-      Timer.stop("ALLOC");
-      if( math::nda::use_block_cyclic_slate() ) {
-        Timer.start("ZBAR_REDIST");
-        ma_t Cma(mpi->comm, pgrid3D, C_quv.global_shape(), {block_size[1],block_size[1]});
-        ma_t Zma(mpi->comm, pgrid3D, Z_quG.global_shape(), {block_size[1],block_size[2]});
-        ma_t Ima(mpi->comm, pgrid3D, Z_quG.global_shape(), {block_size[1],block_size[2]});
-        math::nda::redistribute_to_matrix_array(C_quv, Cma);
-        math::nda::redistribute_to_matrix_array(Z_quG, Zma);
-        Timer.stop("ZBAR_REDIST");
-        math::nda::slate_ops::multiply(Cma, Zma, Ima);
-        Timer.start("ZBAR_REDIST");
-        math::nda::redistribute_from_matrix_array(Ima, *IquG);
-        Timer.stop("ZBAR_REDIST");
-      } else {
+      if( return_Sinv_Ivec ) {
+        // construct IquG
+        Timer.start("ALLOC");
+        IquG = make_distributed_array<local_Array_t>(mpi->comm,pgrid3D,Z_quG.global_shape(),
+                    Z_quG.block_size());
+        Timer.stop("ALLOC");
         math::nda::slate_ops::multiply(C_quv, Z_quG, *IquG);
       }
-    }    
+    }
 
     auto Zloc = Z_quG.local();
 
