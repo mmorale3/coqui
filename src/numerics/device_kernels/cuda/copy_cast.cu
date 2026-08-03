@@ -35,7 +35,7 @@ void copy_cast_impl(A const& a, B & b)
     auto f = [=] __device__(long n) {
       b_d(n) = T(a_d(n));
     };
-    cub::DeviceFor::Bulk(sz,f);
+    check_launch(cub::DeviceFor::Bulk(sz,f), "copy_cast");
   } else if constexpr (rank==2) {
     if constexpr (std::decay_t<A>::is_stride_order_C()) {
       int N = a.extent(1); 
@@ -44,7 +44,7 @@ void copy_cast_impl(A const& a, B & b)
         long j = n - i*N;
         b_d(i,j) = T(a_d(i,j));
       };
-      cub::DeviceFor::Bulk(sz,f);
+      check_launch(cub::DeviceFor::Bulk(sz,f), "copy_cast");
     } else {
       int N = a.extent(0); 
       auto f = [=] __device__(long n) {
@@ -52,7 +52,7 @@ void copy_cast_impl(A const& a, B & b)
         long j = n - i*N;
         b_d(j,i) = T(a_d(j,i));
       };
-      cub::DeviceFor::Bulk(sz,f);
+      check_launch(cub::DeviceFor::Bulk(sz,f), "copy_cast");
     }
   } 
   arch::synchronize_if_set();
@@ -72,7 +72,7 @@ void accumulate_cast_impl(nda::get_value_t<A> alpha, A const& a, B & b)
     auto f = [=] __device__(long n) {
       b_d(n) += T(alpha*a_d(n));
     };
-    cub::DeviceFor::Bulk(sz,f);
+    check_launch(cub::DeviceFor::Bulk(sz,f), "copy_cast");
   } else if constexpr (rank==2) {
     if constexpr (std::decay_t<A>::is_stride_order_C()) {
       int N = a.extent(1);
@@ -81,7 +81,7 @@ void accumulate_cast_impl(nda::get_value_t<A> alpha, A const& a, B & b)
         long j = n - i*N;
         b_d(i,j) += T(alpha*a_d(i,j));
       };
-      cub::DeviceFor::Bulk(sz,f);
+      check_launch(cub::DeviceFor::Bulk(sz,f), "copy_cast");
     } else {
       int N = a.extent(0);
       auto f = [=] __device__(long n) {
@@ -89,7 +89,7 @@ void accumulate_cast_impl(nda::get_value_t<A> alpha, A const& a, B & b)
         long j = n - i*N;
         b_d(j,i) += T(alpha*a_d(j,i));
       };
-      cub::DeviceFor::Bulk(sz,f);
+      check_launch(cub::DeviceFor::Bulk(sz,f), "copy_cast");
     }
   }
   arch::synchronize_if_set();

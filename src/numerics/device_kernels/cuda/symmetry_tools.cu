@@ -53,7 +53,7 @@ void transform_k2g(bool trev, nda::stack_array<double, 3, 3> const& Rinv,
   auto kernel = utils::detail::transform_k2g<decltype(k2g_d)>{(trev?-1.0:1.0),
             to_cuda_std_array<3>(mesh),to_cuda_std_array<3>(Gs),
             to_cuda_std_array<9>(Rinv),k2g_d,err_d};
-  cub::DeviceFor::Bulk(k2g.extent(0),kernel);
+  check_launch(cub::DeviceFor::Bulk(k2g.extent(0),kernel), "symmetry_tools");
   cuda::synchronize();
   cuda::cuda_check( cudaMemcpy(&err, err_d, sizeof(int), cudaMemcpyDefault), "CudaMemcpy" );
   cuda::cuda_check(cudaFree(err_d), "cudaFree");

@@ -51,7 +51,7 @@ void eval_mesh_2d_impl(double tpitz, double cutoff, int screen_type, double scre
   auto F = pots::detail::eval_mesh_2d_impl<decltype(V_d)>{rng.first(),cutoff,screen_type,
     screen_length, tpitz, V_d,to_cuda_std_array<3>(mesh),
     to_cuda_std_array<9>(recv), to_cuda_std_array<3>(k)};
-  cub::DeviceFor::Bulk(N,F);
+  check_launch(cub::DeviceFor::Bulk(N,F), "potentials");
   arch::synchronize_if_set();
 }
 
@@ -66,7 +66,7 @@ void eval_mesh_3d_impl(double cutoff, int screen_type, double screen_length,
   auto F = pots::detail::eval_mesh_3d_impl<decltype(V_d)>{rng.first(),cutoff,screen_type,
     screen_length, V_d,to_cuda_std_array<3>(mesh),
     to_cuda_std_array<9>(recv), to_cuda_std_array<3>(k)};
-  cub::DeviceFor::Bulk(N,F);
+  check_launch(cub::DeviceFor::Bulk(N,F), "potentials");
   arch::synchronize_if_set();
 }
 
@@ -80,7 +80,7 @@ void eval_2d_impl(double tpitz, double cutoff, int screen_type, double screen_le
   auto gv_d = to_cuda_std_mdspan(gv);
   auto F = pots::detail::eval_2d_impl<decltype(V_d),decltype(gv_d)>{rng.first(),cutoff,screen_type,
     screen_length, tpitz, V_d, gv_d, to_cuda_std_array<3>(k)}; 
-  cub::DeviceFor::Bulk(N,F);
+  check_launch(cub::DeviceFor::Bulk(N,F), "potentials");
   arch::synchronize_if_set();
 }
 
@@ -94,7 +94,7 @@ void eval_3d_impl(double cutoff, int screen_type, double screen_length,
   auto gv_d = to_cuda_std_mdspan(gv);
   auto F = pots::detail::eval_3d_impl<decltype(V_d),decltype(gv_d)>{rng.first(),cutoff,screen_type,
     screen_length, V_d, gv_d, to_cuda_std_array<3>(k)}; 
-  cub::DeviceFor::Bulk(N,F);
+  check_launch(cub::DeviceFor::Bulk(N,F), "potentials");
   arch::synchronize_if_set();
 }
 

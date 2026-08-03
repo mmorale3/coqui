@@ -147,11 +147,26 @@ endif()
 set(ENABLE_NCCL FALSE)
 if(ENABLE_CUDA)
   enable_language(CUDA)
-  if(DEFINED CUDA_ARCH)
+  # Architecture selection. This used to be `if(DEFINED CUDA_ARCH) ... else() set(... 80)`, which
+  # silently OVERWROTE a user-supplied -DCMAKE_CUDA_ARCHITECTURES with 80 -- the standard CMake
+  # variable everyone reaches for first. That is how build/gpu90 (configured with
+  # -DCMAKE_CUDA_ARCHITECTURES=90) came to contain sm_80 code only, with no PTX to JIT from: on an
+  # H100 every device kernel then failed to launch with cudaErrorNoKernelImageForDevice, and because
+  # CUB's launch status was being discarded (see device_kernels/cuda/cuda_aux.hpp) the failures were
+  # silent and the ERI came out as zeros. That was defect B6. Honour either spelling, prefer the
+  # standard one, and say out loud what was chosen.
+  if(DEFINED CUDA_ARCH AND NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
     set(CMAKE_CUDA_ARCHITECTURES ${CUDA_ARCH})
-  else()
+  elseif(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
     set(CMAKE_CUDA_ARCHITECTURES 80)
   endif()
+  if(DEFINED CUDA_ARCH AND DEFINED CMAKE_CUDA_ARCHITECTURES
+     AND NOT "${CUDA_ARCH}" STREQUAL "${CMAKE_CUDA_ARCHITECTURES}")
+    message(WARNING "Both CUDA_ARCH (${CUDA_ARCH}) and CMAKE_CUDA_ARCHITECTURES "
+                    "(${CMAKE_CUDA_ARCHITECTURES}) are set and disagree; using "
+                    "CMAKE_CUDA_ARCHITECTURES.")
+  endif()
+  message(STATUS "CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
   find_package(CUDAToolkit 12.0.0 REQUIRED)
   if(NOT FETCH_CCCL)
     find_package(CCCL REQUIRED)
