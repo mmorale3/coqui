@@ -1057,3 +1057,78 @@ a healthy A100-SXM4 node; roughly PCIe-gen5 speed, i.e. *normal for this hardwar
 `cuda_ipc` fault of §B.4. Net effect for this phase, the exchange penalty outweighs the compute gain.
 **Do not treat "H100" as strictly faster than "A100" here — ask whether the part is SXM or PCIe
 first**, and prefer the SXM4 A100 nodes for exchange-heavy runs at this size.
+
+---
+
+# D. FINAL RESULTS (2026-08-04) — and a correction to how §C.1 framed them
+
+The queued runs landed. `si_kp222_n500_e125/collect_pending_results.sh` reproduces everything below.
+
+## D.1 The SCF loop total is dominated by checkpoint-write variance
+
+**This corrects §C.1, which quoted a single sample as though it were the number.** Across five runs of
+the *same code*, 3 iterations each:
+
+| run | SCF | Write | **SCF − Write** |
+|---|---|---|---|
+| 8xA100 (anchored, job 6746623) | 407.8 | 81.7 | **326.1** |
+| 8xA100 (async A/B sync leg, 6746697) | 362.0 | 30.2 | **331.8** |
+| 8xA100 (async A/B async leg) | 355.7 | 19.4 | **336.3** |
+| 8xH100 (6746651) | 497.2 | 155.4 | **341.8** |
+| 16xA100 (6746624/96) | 312.0 | 73.6 | 238.3 |
+
+At 8 GPUs, **SCF − Write is 326–342 s (±2.4%) across every run and across both machines** — A100-SXM4
+and H100-PCIe agree to 5% — while the totals span **356–497 s**. So essentially all the spread in the
+headline figure is the checkpoint write, which itself ranged 19–155 s depending on filesystem load.
+
+**Quote the 8xA100 result as a range: 356–408 s for 3 iterations, i.e. 2.47–2.83x over the original
+1008.7 s.** A single number invites the reader to over-trust it, and the run-to-run spread here is
+larger than most of the code improvements measured this session.
+
+## D.2 16xA100 — two independent runs
+
+Both submissions (`-p gpu` and `-p gpupreempt`) ran, on the same four nodes, fabric OK (14.6 / 13.8
+GB/s intra-node):
+
+| job | anchor_0730 | current |
+|---|---|---|
+| 6746624 | 316.93 | 324.52 |
+| 6746696 | 312.85 | 311.97 |
+
+**16xA100 current ≈ 312–325 s / 3 iterations, versus the original 631.9 s: ~1.95–2.03x.** The anchor
+and current legs are indistinguishable here — run-to-run spread is ~4%, larger than the ~2% the
+post-07-30 commits are worth — so do not read a difference between them as signal at this rank count.
+Scaling 8→16 GPUs on the compute part is 326 → 238 s, i.e. **1.37x for 2x the GPUs**; the exchange
+(`redistribute` 45 s / 3 iters at 16 ranks vs 54 at 8) does not shrink, which is the expected
+communication-bound behaviour and where further scaling work would have to go.
+
+*Caveat on the setup:* both 16-rank jobs shared the `anchored16/` output directory, so its
+`log_*.txt` belong to whichever finished last. The per-job summaries above are independent (each job
+printed its own). Give parallel submissions distinct output directories.
+
+## D.3 Async checkpoint — works, and its value scales with how bad the filesystem is
+
+Same allocation, sync vs `COQUI_ASYNC_CHKPT=1`, current binary:
+
+| | SCF | Write |
+|---|---|---|
+| sync | 362.0 | 30.2 |
+| async | 355.7 | 19.4 |
+
+**It removes 36% of the write time**, and energies are **bit-identical** between the legs
+(0.4830503807840806 / 0.5300765029178806 / 0.5341906406075212), which is the thing that had to be
+confirmed before recommending it.
+
+The headline "1.7% of the loop" understates it, because this run drew a *fast* write (30 s). Scaled by
+the same 36% against the writes actually observed today, async is worth ~29 s when the write is 82 s
+and ~56 s when it is 155 s — i.e. **up to ~11% of the loop.** Recommend turning it on by default
+after one more A/B on a run that draws a slow write; the correctness question is settled.
+
+## D.4 Where the remaining time is
+
+At 8xA100 with a fast write, the ~332 s of non-write loop time over 3 iterations breaks down roughly
+as `update_w` ~121 (of which the W-Dyson LU ~55, transforms ~65), Sigma ~120, Dyson ~50, mixing ~19,
+energies ~5. The next targets in order of measured size: the **write path** (§3.6, and now D.3), the
+**W-Dyson LU** (device batched LU, §3.3/P7), and **G/Sigma device residency** (§3.1). Note §3.1's
+premise should be re-checked against D.1 — with compute now machine-insensitive to 5%, the case for
+further device porting is weaker than the case for writing less.
