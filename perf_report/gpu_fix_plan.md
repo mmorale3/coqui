@@ -994,7 +994,18 @@ equal footing with the 8-rank 1008.7 s. The anchor leg is what makes the compari
 
 Every script sets `UCX_TLS=^cuda_ipc` and prints `bench_comm` before measuring; if intra-node
 bandwidth is not O(10 GB/s) or the anchor is several times its 07-30 cost, discard and see §B.4.
-Extraction helper: `si_kp222_n500_e125/extract_timings.sh <log>...`.
+
+**To read the results, run one command:**
+
+```
+~/ceph/CoQui/GPU_PORT_run/si_kp222_n500_e125/collect_pending_results.sh
+```
+
+It finds whichever logs exist, judges each run's fabric health for you (flagging a discard if
+intra-node bandwidth came back under 1 GB/s), prints the anchor-vs-current comparison with the pass
+criterion spelled out, computes the async saving, and checks the async legs' energies match. It also
+reminds you to cancel the duplicate 16-rank submission. Per-phase detail for any single log:
+`./extract_timings.sh <log>`.
 
 Beyond these: rerun the **16-rank and H100 ERI builds on device** now that B6 is fixed and the
 block-cyclic path is auto-selected (§B.2, §B.3.2) — that combination has never been exercised
