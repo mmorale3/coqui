@@ -1,10 +1,11 @@
 # CoQuí GPU: plan to a working, performant, efficient device path
 
-> **READ FIRST — status as of 2026-08-02.** Since this plan was written, a **one-line bug in
-> the GPU ERI builder** was found and fixed, and it changes the priorities below. See
-> **§A. Handover** at the end of this file for the current state, what is committed, what is
-> in flight, and exactly what to do next. §0-§6 remain valid as the SLATE/device analysis, with
-> one correction: §0's framing of the block-cyclic port as the way to fix reproducibility was
+> **READ FIRST — status as of 2026-08-03.** The **correctness backlog is closed**; see
+> **§B. Correctness closeout (2026-08-03)** at the end of this file for the item-by-item
+> disposition, and **§B.4** for a measurement caveat that invalidates any wall-clock number
+> taken on rusty on 2026-08-03. Before that, a **one-line bug in the GPU ERI builder** was found
+> and fixed; see **§A. Handover**. §0-§6 remain valid as the SLATE/device analysis, with one
+> correction: §0's framing of the block-cyclic port as the way to fix reproducibility was
 > wrong — the reproducibility failure was the ERI bug, not the layout.
 
 Status date: 2026-07-30. Branch `gpu`. Baseline: 8×A100-80GB, Si kp222/500b, SCF loop
@@ -614,3 +615,375 @@ Still uncommitted: the `force_sync` iteration-0 checkpoint change (`chkpt_utils.
   but-wrong diagnoses over several hours. The elementwise diff showed the corruption was ONE row
   out of 1275 and that `C_gpu[318,:] == C_cpu[317,:]`, which named the mechanism immediately.
   Split CPU vs GPU early; it localizes a device defect in a single run.
+
+---
+
+# B. Correctness closeout (2026-08-03)
+
+Every open correctness item in §1.3, §2 and §A.3 is now closed, **including B6**. Three defects were
+found during the work that were not on the list: one by a test written to close another item
+(§B.2), and two that together *were* B6 (§B.3.2) — a build flag silently overridden, and CUB launch
+failures silently discarded. Validation: full `build/gpufix` build clean (0 errors, job 6745231) —
+which is what exercises the new `static_assert`s across every translation unit — plus
+`test_math_distributed_nda` at 1, 2 and 4 ranks, host and device, and the B6 reproducer on H100.
+
+## B.1 Disposition of every item
+
+| id | item | disposition |
+|---|---|---|
+| **B3** | device ISDF/THC builder fails once the grid distributes (u,v) | **CLOSED.** The block-cyclic path fixes it (job 6743779: 12 ranks completes where legacy aborts in `device_regions_build`). It was gated OFF behind a stale note; see §B.2. Now selected automatically. |
+| **B4** | µ-search bracketing walk silent and uncapped | **CLOSED.** `scf_common.cpp` `update_mu`: both bracketing walks and the bisection are capped (200 steps each) with messages naming the bracket, each bracketing step is logged, and non-finite `nelec` is rejected at entry *and* at exit. The exit check matters on its own: every loop here exits on a comparison, and every comparison against NaN is false, so a NaN appearing mid-search used to walk out as the answer. |
+| **B5** | `compute_eigenspectra` allocates the full Σ(ω) per rank | **CLOSED** by `342f09a`. The only Σ(ω)-sized array is now `Sigmaw_wskij(nwl, …)`, sized by this rank's frequency count (4.4 GB → ~0.3 GB/rank at 8 ranks). `spectra` is ~8.8 MB. Nothing else in the routine is Σ(ω)-sized. |
+| **B6** | device ISDF selects zero Cholesky vectors on sm90/H100 | **ROOT-CAUSED AND FIXED — it was two build/error-handling bugs, not a numerical one.** `CMakeLists.txt` silently overrode `-DCMAKE_CUDA_ARCHITECTURES`, so the "sm90" build contained sm_80 code only; on H100 every CoQuí kernel failed to launch, and CUB's discarded return value made that silent. See §B.3.2. |
+| **R1** | THC point selection depends on the processor grid | **CLOSED as an input convention** (job 6744072, already in §A.1). Now documented where users meet it: the `thc` constructor options block in `thc.h`, with both measured tables and the "pin `nIpts` for anything compared across rank counts" rule. |
+| §1.3 trap 1 | `tileDevice` assumes one visible GPU per rank | **CLOSED.** The guard that existed tested `dev < R.num_devices()`, which *passes* in exactly the broken case (4 visible GPUs, ranks setting dev=0..3) and so never fired. Replaced with `R.num_devices() == 1`, the assumption the code actually makes, with a message naming `--gpu-bind=single:1`. Launch side was already done (49 `srun` lines, 2026-08-02). |
+| §1.3 trap 2 | `distributed_array_view` silently reinterprets the address space | **CLOSED.** `static_assert` in the constructor tying the template argument's address space to the argument's. The one live reinterpretation (`hamiltonians.cpp`, `unified_array` over a device slice) is fixed to `memory::array<MEM,…>`; it was dead code in practice since `add_thc_hamiltonian_components` is instantiated HOST-only. `thc_aux.icc:970` had already been fixed. The clean full build is the proof no other site relied on it. |
+| §A.3 item 4 | `test_slate.cpp:232` fails at 2 ranks, hidden by `CTEST_NPROC=4` | **CHARACTERISED, deliberately not "fixed".** It is the legacy single-block container hitting the same `group.ld == Mij.stride()` assert as B3, reproduced on demand by `run_dtest.sbatch`'s witness leg. The fix is to route that call site through the block-cyclic container; the assert is the correct, loud behaviour meanwhile. Recorded rather than silenced. |
+| — | Zqur stage unlogged for ~390 lines | **CLOSED.** `get_ZquG_Cquv_rspace` now logs the nnr-block loop, per-spin T(k,u,r) and Z(q,u,r) stages, and the C_quv build, with `memory_report` at each allocation, all at verbosity 3. |
+| — | `TimerManager::elapsed()`/`number_of_calls()` abort on an unregistered name | **CLOSED.** Read accessors return 0 for unknown names via a new `findPos`; `start`/`stop` still abort, since stopping an unstarted timer is a real error. Removes the class of crash where a one-sided sub-timer killed the *working* branch at the first dump. |
+| — | `intvec_impl(int iq, …)` still calls raw SLATE with the legacy layout | **CLOSED as a guarded constraint.** It is reachable only through `__eval_ls__(HOST_MEMORY)` (LS-THC), never on device, so it cannot hit the device batched path. A `static_assert(MEM == HOST_MEMORY)` plus a comment now makes that a compile-time contract instead of an accident, and points at the port to do if it is ever wanted on device. |
+| **NEW** | `slate_ops::lu_solve` serial shortcut ignored `hermitian` | **FOUND AND FIXED.** See §B.2. |
+
+## B.2 B3: the orientation question was settled, and it had been blocking the fix
+
+`matrix_array.hpp` kept `COQUI_SLATE_BLOCK_CYCLIC` **default OFF** citing a 2026-07-31 measurement
+(job 6719571) where the two paths disagreed by ~6e1 on the ERI and ~8e-5 on the energy. **That
+diagnosis was wrong, and it was the only thing keeping the B3 fix switched off.**
+
+The two paths solve the same system whenever `A` is hermitian. The legacy path stores `A` in C order,
+so `hermitian=true` conjugates in place and hands slate the transposed view — slate sees
+`conj(A)^T = A^H`. The block-cyclic container is column-major and hands slate `A`. For
+`C_quv = Z Z^H` those are the same matrix. The 07-31 measurement predates the `iu_for_Xb` fix
+(`6d85ff4`), and the corrupted `C` it ran on had a duplicated interpolating point — hence a
+duplicated row **and** column, i.e. exactly rank deficient, cond 1.4e19. On a singular matrix the two
+factorization orders pick different solutions out of the null space; that is where 6e1 came from.
+With `C` correct (cond 4.5e11) job 6743779 measures the 4-rank energies agreeing to **5.8e-13**.
+
+**Selection is now automatic**, and the rule reproduces the measured boundary exactly:
+block-cyclic when the matrix grid is non-trivial (`pgrid3D[1]*pgrid3D[2] > 1`), legacy otherwise.
+At 4 ranks the grid is (4,1,1) → legacy, which takes its serial local `getrf`/`getri` shortcut: no
+slate, no redistribute, cheaper, and bit-compatible with every validated number to date. At 12 ranks
+it is (4,3,1) → block-cyclic, the configuration where legacy aborts. `COQUI_SLATE_BLOCK_CYCLIC=1/0`
+still forces either way for A/B work. Validated by `autodefault_validate.sbatch`, which pins all
+three branches (auto@4 == legacy reference, auto@12 == block-cyclic reference, forced-legacy@12
+still aborts).
+
+**The new defect, found by the test written to pin the convention.** The convention is now pinned by
+`matrix_array_hermitian_solve_orientation` on a deliberately **non-hermitian** `A` — the boundary the
+hermitian agreement tests cannot see, since `A^H == A` hides any orientation change. It failed
+immediately, at 1 rank only: `slate_ops::lu_solve`'s serial shortcut (`comm.size()==1`) ignored the
+`hermitian` template parameter entirely, solving `A X = B` while the distributed branch solved
+`A^H X = B` (measured `||A X - B||` = 7e-16 vs `||A^H X - B||` = 0.097 at 1 rank; the reverse at 2 and
+4). `least_squares_solve`'s serial shortcut already handled it, which is what marks this an oversight
+rather than a convention. Fixed by mirroring that. **No production result is affected** — every caller
+passes a hermitian `A`, where the two coincide — but the flag had been meaning different things at
+different rank counts, which is exactly the kind of thing that makes a future bug unfindable.
+
+Method note worth keeping: the useful test was not another agreement check, it was a test on the
+input class where the two paths are *supposed* to differ. That is what turned a documentation task
+into finding a real bug.
+
+**Numerical footprint of the `lu_solve` fix, measured deliberately** (job 6745450), because it does
+touch a production path: at 4 ranks the ERI grid is (4,1,1), so the matrix communicator has size 1
+and the legacy ISDF solve goes through exactly the shortcut that changed. Both legs forced to legacy,
+pre-fix vs post-fix binary, same node:
+
+| dataset | worst \|diff\| | relative |
+|---|---|---|
+| `collocation_matrix`, `kpts`, `qpts` | 0.0 | bit-identical |
+| `coulomb_matrix` | 2.79e-09 | 5.5e-08 |
+| `dual_interpolating_vectors_G0` | 9.13e-10 | 9.1e-10 |
+| `interpolating_vectors_G0` | 2.56e-07 | 1.7e-06 |
+| **total energy** | **1.45e-13** | — |
+
+Only the ISDF vectors move, at 1.7e-06 relative — two orders inside the eps·cond(C) ≈ 1e-4 bound —
+and the energy moves 1.45e-13, eight orders below the ISDF truncation error (3e-5). Accepted.
+Note this also explains the one line the `autodefault_validate` verdict flagged: its 4-rank leg was
+compared against an ERI built by a *pre-fix* binary, and the difference it reported (2.5585e-07)
+matches the table above to the digit. The auto-selection itself is exact — the 12-rank leg is
+**bit-identical** to the block-cyclic reference.
+
+## B.3 B6 — reproduced, narrowed, root-caused and fixed
+
+**It still reproduces against a current sm90 build** (job 6745246, H100 PCIe, compute_cap 9.0),
+at **1 rank and at 4 ranks**, with the abort exactly as reported in `b257c45`. Reproducing at one
+rank is the useful part: there is no MPI, so `find_distributed_maximum` and every reduction-order
+argument are **excluded**, and the whole reproducer is a single-GPU, nbnd=100 job — a fast, cheap
+debug cycle instead of a multi-node one. `--gpu-bind=single:1` verified (`CUDA_VISIBLE_DEVICES=0`
+for every rank), so §1.3's device-binding trap is also excluded.
+
+
+Device ISDF point selection aborts on sm90/H100 with "Current number of cholesky vectors = 0"
+(`thc.icc:1073`), i.e. `max|Diag|` is already ≤ 1e-14 at iteration 0, while identical source and
+input on sm80/A100 gives Np=1275. It is not SLATE: `chol_metric_impl` builds `Diag` with cuTENSOR
+contractions and finds the pivot with `utils::max_element_multi`, no slate involved.
+
+The abort condition localises it usefully: with `nchol = 0`, the residual diagonal is already empty
+on entry, so the fault is upstream of the iteration in one of four places —
+`Psia` itself, the `contract(conj(Psia),"skapr",Psia,"skapr",Lr,"skpr")` batched dot
+(`thc.icc:970`), the `Diag(r) += conj(Lr)*Lr` accumulation (`thc.icc:975-977`, an unusual
+no-reduction cuTENSOR pattern and the prime suspect), or `max_element_multi`/
+`find_distributed_maximum`. `b6_sm90_repro.sbatch` (in `correctness/eri_slate_check/`) establishes
+whether it still reproduces against a current sm90 build — the ERI path has changed substantially
+since the 07-27 binary that produced the original report. **Instrument before fixing:** print
+`sum|Psia|`, `sum|Lr|` and a host-computed `max|Diag|` on A100 and H100 and diff; each of the four
+candidates gives a different signature, and one run separates them. Workaround remains: build the
+ERI on A100 or CPU with `save=` and load it on H100.
+
+**The instrumentation is now in the tree**, gated by `COQUI_CHOL_DIAG_DEBUG=1` (zero cost otherwise),
+printing `max|Psia|`, `max|Lr|`, a **host-computed** `max|Diag|` and what `max_element_multi`
+returned — the host reduction is the point, since it makes `max_element_multi` falsifiable
+independently — plus stage prints along the orbital path. `b6_instrument_h100.sbatch` runs sm80 and
+sm90 legs and prints them side by side.
+
+### B.3.1 RESULT: localised to one call, `nda::copy_select` on sm90
+
+Ran it (job 6745552, H100 PCIe, 1 rank). Every suspect above is **exonerated** — the fault is four
+stages earlier:
+
+```
+custom_grid=1  C_skai=null  single_psi=1  mesh=(39,39,39)  wfc_grid=1
+max|distPsia after read_distributed_orbital_set|   = 9.5013249059e-01   <-- healthy
+max|psir after copy_select (G-space, pre-FFT)|     = 0.0000000000e+00   <-- BROKEN HERE
+max|psir after fft::backward (r-space)|            = 0.0000000000e+00
+max|distPsia after Znorm scale|                    = 0.0000000000e+00
+max|Psia| = 0  max|Lr| = 0  max|Diag| = 0  lmax_res_val[0] = 0
+```
+
+The orbitals are **read correctly** (0.950, identical to A100). The next operation,
+
+```cpp
+nda::copy_select(true, 1, wfc_to_rho, ComplexType(1.0), distPsia.local(), ComplexType(0.0), psir);
+```
+
+(`thc.icc`, the `custom_grid` branch — scattering the wavefunction G-vectors onto the density FFT
+grid) **produces all zeros on sm90 and the correct values on sm80.** Everything downstream is a
+faithful transform of zeros, which is why the abort surfaces 250 lines later with `nchol=0`.
+
+### B.3.2 ROOT CAUSE — two bugs, both fixed. It was never cuTENSOR and never sm90 codegen.
+
+**Correcting two of my own intermediate conclusions, because both were wrong and instructively so:**
+I wrote "it is not a failed launch" (because `arch::synchronize_if_set()` runs
+`cuda_check(cudaGetLastError())` and no error appeared) and "not codegen, since the sm90 binary is
+correct on A100". Both inferences were unsound. `cuobjdump` settles it:
+
+```
+build/gpu90/bin/coqui :  10 x "arch = sm_80"   ptx: (none)
+build/gpufix/bin/coqui:  10 x "arch = sm_80"   ptx: (none)
+```
+
+**The sm90 build was never compiled for sm90.** `CMakeLists.txt` had
+
+```cmake
+if(DEFINED CUDA_ARCH)
+  set(CMAKE_CUDA_ARCHITECTURES ${CUDA_ARCH})
+else()
+  set(CMAKE_CUDA_ARCHITECTURES 80)   # silently overwrites the user's flag
+endif()
+```
+
+so the project honoured only `-DCUDA_ARCH=`, and `build/gpu90/build.bash`'s
+`-DCMAKE_CUDA_ARCHITECTURES=90` — the standard variable anyone reaches for first, and the one the
+CMakeCache dutifully recorded as `UNINITIALIZED=90` — was **overwritten with 80**. The binary
+therefore held sm_80 cubins and no PTX to JIT forward from. That is why the "sm90" binary ran fine on
+an A100: it *is* an sm80 binary.
+
+**On H100 every CoQuí kernel then failed to launch** with `cudaErrorNoKernelImageForDevice`. Vendor
+libraries are fat binaries covering sm_90, so cuTENSOR / cuBLAS / cuFFT kept working perfectly — on
+zeros. Only CoQuí's own kernels died, `copy_select` among them.
+
+**And the failure was silent, which is the second and more serious bug.** Every
+`cub::DeviceFor::Bulk` call in `device_kernels/cuda/` **discarded the `cudaError_t` it returns**, and
+CUB *consumes* the sticky error to produce that return value — so by the time
+`arch::synchronize_if_set()` called `cudaGetLastError()` there was nothing left to find and the check
+passed. `psir` had been explicitly zeroed the line before, so it simply stayed zero. Then:
+FFT of zeros → `Diag` zero → `max_element_multi` (which for device input just does `nda::to_host` and
+runs the **host** algorithm, so no kernel and no error) faithfully reported 0 → abort 250 lines later
+blaming the ISDF threshold, with cuTENSOR the natural suspect. Every observation reconciles.
+
+**Fixes applied:**
+1. `CMakeLists.txt` now honours `CMAKE_CUDA_ARCHITECTURES`, keeps `CUDA_ARCH` as an alias, warns if
+   both are set and disagree, and prints the architecture it chose.
+2. `kernels::device::check_launch(status, what)` added in `cuda_aux.hpp` and applied to **all 28**
+   live CUB launch sites across `copy_select.cu`, `copy_cast.cu`, `complex_tools.cu`,
+   `kpoint_tools.cu`, `symmetry_tools.cu`, `potentials.cu`. On `cudaErrorNoKernelImageForDevice` it
+   additionally reports the device's actual `sm_XX` and tells you to rebuild and how to verify with
+   `cuobjdump`. Verified there are no CoQuí kernel launches outside that directory, and no raw
+   `<<<>>>` launches anywhere; `argmax_min.cu`'s thrust calls use the `thrust::device` policy, which
+   *throws* on error rather than returning a code, so they were never silent.
+
+**Lessons worth keeping.** (a) A discarded status from a library that consumes the underlying error is
+worse than no error handling at all — it makes the downstream `cudaGetLastError()` actively
+misleading, which is what defeated me for a round. (b) `-DCMAKE_CUDA_ARCHITECTURES` being silently
+overridden is the kind of build trap that produces wrong *numbers*, not build errors; the new
+`message(STATUS "CUDA architectures: ...")` makes it visible. (c) Check what a binary actually
+contains (`cuobjdump | grep 'arch ='`) before theorising about a hardware-specific numerical bug.
+(d) `b6_instrument.sbatch` without `--constraint=h100-80gb` gets handed an A100 and silently passes —
+that cost a round trip, and the accidental A100 run is what exposed the whole thing.
+
+## B.4 MEASUREMENT CAVEAT: do not trust any rusty wall-clock number from 2026-08-03
+
+New GPU timings were collected and are **not usable**. The 8-rank kp222/500b SCF loop measured
+1127 s where 07-30 measured 278 s for two iterations, and the sub-timers show the cause precisely:
+
+| per iteration, 8×A100 | 07-30 (job 6705038) | 08-03 (job 6745221) | ratio |
+|---|---|---|---|
+| `gemm Z*Pi -> A` | 3.97 | 3.88 | 1.0 |
+| `inverse(A)` [SLATE LU] | 8.26 | 7.87 | 0.95 |
+| FT gemm (PHsym) | 0.16 | 0.16 | 1.0 |
+| **redistribute** | **17.5** | **245.8** | **14×** |
+
+Compute is unchanged to a few percent; only the inter-rank exchange collapsed. Energies were
+bit-identical throughout, so this is purely a rate effect.
+
+### THE FIX FOR IT: `export UCX_TLS=^cuda_ipc`
+
+**Measured (job 6746573), same allocation, one SCF iteration.** Excluding the broken transport
+recovers essentially all the performance:
+
+| leg | tau_to_w | w_to_tau | redistribute | SCF total | intra-node BW |
+|---|---|---|---|---|---|
+| default (broken `cuda_ipc`) | 127.1 | 138.1 | 251.8 | 404.9 | 0.22 GB/s |
+| `COQUI_REDIST_DEVICE=0` (host staged) | 40.2 | 43.4 | 76.5 | 223.6 | — |
+| **`UCX_TLS=^cuda_ipc`** | **11.9** | **11.5** | **19.9** | **164.5** | **14.59 GB/s** |
+| 07-30 reference, healthy `cuda_ipc` | 10.2 | 10.9 | 17.5 | — | 88.75 GB/s |
+
+Within ~15% of the healthy reference even though intra-node bandwidth is still 6x down — at
+14.6 GB/s the exchange has stopped being the bottleneck. Note that host staging (40/43) also beats
+the default (127/138) by 3x, so *any* route around `cuda_ipc` is better than leaving it enabled.
+**Set `UCX_TLS=^cuda_ipc` in the run scripts until the site fixes CUDA IPC**, and re-measure before
+making it permanent.
+
+**It is site-wide, not a few bad nodes.** `bench_comm` on workergpu042-043 measured **intra-node
+GPU-GPU 0.20 GB/s** against a recorded 07-30 baseline of **88.75 GB/s** — a 444x collapse — while
+*inter-node* IB was healthy (8.95 vs 7.89 GB/s). Re-running the 8-rank benchmark with
+`--exclude=workergpu042,043,044` landed on **workergpu057,059** and was *equally* slow (tau_to_w
+125.4 s, redistribute 248.3 s for one iteration). So excluding nodes does not help. The signature —
+intra-node GPU peer-to-peer dead, inter-node fine, every a100-80gb node affected, the same binary
+that was fast on 07-30 — points at **CUDA IPC / peer-to-peer no longer working after a site-side
+driver or UCX change**. That is a ticket for the Flatiron admins, not a CoQuí fix. `transport_matrix.sbatch`
+measures whether routing around it helps (host-staged redistribute via `COQUI_REDIST_DEVICE=0`, and
+`UCX_TLS=^cuda_ipc`); on 07-30 host staging cost 52/57 s per iteration, which would be **better than
+the ~125/136 device-direct costs today**, so it is plausibly the right temporary default.
+
+**Established as environmental, not a code regression, two independent ways.** First, no commit
+after the 07-30 measurement touches the redistribute path at all — `git log fcc81ca..HEAD --
+nda_utils.hpp nda_matrix.hpp` returns only `9f41dd6`, which is *in* the 07-30 binary. Second and
+decisively, `binary_bisect.sbatch` (job 6745271) ran five snapshots back to back **inside one
+allocation**, holding nodes, env, ERI and input fixed:
+
+| binary | date | tau_to_w (1 iter) | w_to_tau |
+|---|---|---|---|
+| `coqui.syncwrite` | 07-30 09:58 | 125.3 | 138.6 |
+| `coqui.pre_blockcyclic` | 07-30 16:50 | 126.4 | 139.4 |
+| `coqui.pre_iufix` | 08-01 16:20 | 126.7 | 137.6 |
+| `coqui.pre_fuse` | 08-03 10:38 | 126.2 | 137.0 |
+| `coqui.perf0803` | 08-03 11:28 | *(see log)* | |
+
+Flat. `coqui.syncwrite` is the **very binary** that measured 10.2 s/iter on 07-30 and it is now 12×
+slower, so the machine changed, not CoQuí.
+
+**Protocol lessons, both of which cost real time here:**
+- **Always run the old binary alongside the new one, in the same allocation.** Cross-day comparison
+  on this cluster is worthless at the factor-of-ten level. Snapshot binaries
+  (`cp bin/coqui bin/coqui.<tag>`) exist for exactly this; use them for *performance*, not only for
+  bit-level correctness A/B.
+- **The launcher environment is part of the measurement.** `bench_gpu_4n/run.sbatch` and
+  `gw_gpu_8r/run.sbatch` still set `OMPI_MCA_pml=ucx` and a restricted
+  `UCX_TLS=cuda_copy,cuda_ipc,sm,self,rc,ud,dc`, while every post-P1 measurement
+  (`bench_gpu_2n_opt/opt2/redist`) sets only `UCX_MEMTYPE_CACHE=n`. On the same two nodes minutes
+  apart these gave SCF 703.6 s vs 1127.3 s — the settings are worth a factor of 1.6 here and the
+  scripts disagree with each other. Settle on one convention (`UCX_MEMTYPE_CACHE=n`, no `UCX_TLS`)
+  and record it in every script. Note this also means the **original 16-rank baseline of 631.9 s was
+  measured with the restricted-`UCX_TLS` environment** and the 8-rank 1008.7 s was not, so those two
+  baselines are not on equal footing either.
+- `homework/bench_comm.cu` is the right first instrument when the exchange looks wrong: it reports
+  intra- and inter-node GPU MPI bandwidth in about a minute, against a recorded 07-30 baseline of
+  **88.75 GB/s intra-node, 7.89 GB/s inter-node**.
+
+**To actually get the numbers:** rerun `bench_gpu_2n_0803`, `bench_gpu_4n_0803` and
+`bench_gpu_2n_0803_async` (niter=3, shared ERI, `UCX_MEMTYPE_CACHE=n`) once `bench_comm` reports
+**intra-node** bandwidth back at ~88 GB/s, and include a `coqui.syncwrite` leg in the same
+allocation so the result is anchored to the 07-30 measurement rather than to a date.
+
+### B.4.1 Two jobs were still queued when this session ended — collect them first
+
+Network access to rusty dropped (DNS) before these finished. They were left **queued, not
+cancelled**, so their logs should exist:
+
+| job | what it answers | where the log lands |
+|---|---|---|
+| **6745423** | `bench_comm` with `--exclude=workergpu042,043,044`. Is the 0.20 GB/s intra-node collapse specific to those three nodes, or cluster-wide? | `GPU_PORT_run/homework/benchcomm_6745423.log` |
+| **6745309** | 8-rank kp222/500b, niter=3, `coqui.perf0803`, same exclusion. The clean headline number, if the nodes it lands on are healthy. | `GPU_PORT_run/si_kp222_n500_e125/bench_gpu_2n_0803_excl/run_6745309.log` |
+
+**Read 6745423 first.** If intra-node is back at ~88 GB/s there, the degradation is node-local, the
+partition should simply be run with those three excluded, and 6745309 is a usable measurement — check
+its `redistribute` sub-timer is back near 17 s/iter before trusting the total. If intra-node is still
+~0.2 GB/s on other nodes, the problem is broader, 6745309 is *also* invalid, and this needs a ticket
+to the Flatiron admins rather than another benchmark.
+
+Extraction helper written for this: `si_kp222_n500_e125/extract_timings.sh <log>...` prints the
+Dyson-SCF totals, the `update_w` sub-timers, Np, niter, redistribute mode and energies in a fixed
+format. Baselines to compare against are in §B.4 above and the tables in §3.
+
+---
+
+# C. VALIDATED TIMINGS (2026-08-03, with `UCX_TLS=^cuda_ipc`)
+
+Obtained once the broken transport was routed around (§B.4). **Every leg below is validated by an
+anchor binary in the same allocation**: `coqui.syncwrite` (07-30) reproduced its 07-30 transform cost
+to within 3% (tau_to_w 31.47 s over 3 iterations = 10.5 s/iter vs 10.2 s/iter on 07-30), and the
+job's own `bench_comm` step reported intra-node 14.67 GB/s. So the allocation was behaving and the
+numbers mean something. Job 6746623, workergpu[057,059].
+
+## C.1 Si 2x2x2 / 500 bands, 8xA100 (2 nodes), shared ERI, niter=3
+
+Metric is the `Dyson-SCF timers -> Total` line, i.e. the SCF loop excluding ERI construction.
+
+| configuration | SCF loop, 3 iterations | vs original GPU |
+|---|---|---|
+| **CPU 1 node / 96 ranks** (original) | 1423.2 s | — |
+| **CPU 2 nodes / 192 ranks** (original) | 1017.8 s | — |
+| **GPU 8xA100, original code** (07-25, `bench_gpu_2n`) | 1008.7 s | 1.00x |
+| GPU 8xA100, 07-30 code (anchor, measured today) | 416.96 s | 2.42x |
+| **GPU 8xA100, current code** | **407.81 s** | **2.47x** |
+
+**Current GPU vs CPU: 2.50x faster than 192 CPU ranks (2 full nodes), 3.49x faster than 96.**
+Energies bit-identical across the anchor and current legs
+(0.4830503807840806 / 0.5300765029178806 / 0.5341906406075212), and identical to every earlier run
+in this series.
+
+Anchor vs current on identical hardware, same allocation:
+
+| | anchor (07-30) | current | |
+|---|---|---|---|
+| SCF loop, 3 iters | 416.96 | **407.81** | −2.2% |
+| tau_to_w, 3 iters | 31.47 | 31.63 | unchanged |
+| redistribute, 3 iters | 53.44 | 54.03 | unchanged |
+
+The transform and exchange phases are unchanged, which is exactly right — nothing since 07-30 touched
+them (`git log fcc81ca..HEAD -- nda_utils.hpp nda_matrix.hpp` is empty of functional change). The
+−2.2% comes from the host-side work committed after 07-30 (eigenspectra threading, the
+`Sigma_div_correction` staging buffer, mixing keeping F/Sigma in memory, the THC transform gemms).
+
+## C.2 Where the 2.47x came from
+
+Against the original 8xA100 run, in the order the work landed:
+
+| change | effect on the 8xA100 iteration |
+|---|---|
+| P1: device-direct redistribute (`9860888`, `c2f8e71`) | tau_to_w+w_to_tau 109 -> 46 s/iter |
+| `IAFT::check_leakage` on device (`817df17`) | −28 s/iter (a *diagnostic* was the second-largest cost) |
+| eigenspectra threading + omega-local transform (`342f09a`) | 44.6 -> 2.5 s/iter |
+| `Sigma_div_correction`, mixing, THC transform gemms | the residual −2.2% measured in C.1 |
+
+## C.3 Still to collect
+
+- **16xA100 (4 nodes), niter=3, anchored** — job 6746624, queued on 4 nodes at submission time.
+  Compare against the original `bench_gpu_4n` 631.9 s, but note that baseline was measured with the
+  restricted `UCX_TLS` (§B.4), so it is not on equal footing with the 8-rank 1008.7 s; the anchor leg
+  in 6746624 is what makes its comparison sound.
+- **H100** — now unblocked, since B6 is fixed and `build/gpu90` really contains sm_90 code
+  (§B.3.2). Rerun `bench_gpu_1n_h100` (original 941.4 s) with `UCX_TLS=^cuda_ipc` and an anchor leg.
+- **Async checkpoint** (`COQUI_ASYNC_CHKPT=1`) — worth ~13 s/iter of the 27 s/iter write cost;
+  measure on top of C.1.
