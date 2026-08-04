@@ -977,16 +977,28 @@ Against the original 8xA100 run, in the order the work landed:
 | eigenspectra threading + omega-local transform (`342f09a`) | 44.6 -> 2.5 s/iter |
 | `Sigma_div_correction`, mixing, THC transform gemms | the residual −2.2% measured in C.1 |
 
-## C.3 Still to collect
+## C.3 Still to collect — three jobs left queued, all self-diagnosing
 
-- **16xA100 (4 nodes), niter=3, anchored** — job 6746624, queued on 4 nodes at submission time.
-  Compare against the original `bench_gpu_4n` 631.9 s, but note that baseline was measured with the
-  restricted `UCX_TLS` (§B.4), so it is not on equal footing with the 8-rank 1008.7 s; the anchor leg
-  in 6746624 is what makes its comparison sound.
-- **H100** — now unblocked, since B6 is fixed and `build/gpu90` really contains sm_90 code
-  (§B.3.2). Rerun `bench_gpu_1n_h100` (original 941.4 s) with `UCX_TLS=^cuda_ipc` and an anchor leg.
-- **Async checkpoint** (`COQUI_ASYNC_CHKPT=1`) — worth ~13 s/iter of the 27 s/iter write cost;
-  measure on top of C.1.
+The `gpu` partition was saturated (110 running / 34 pending) when this session ended, so these were
+left **queued, not cancelled**. Each carries its own validity check, so they can be read cold.
+
+| job | what it answers | log |
+|---|---|---|
+| **6746624** (`-p gpu`) and **6746696** (`-p gpupreempt`) | 16xA100, niter=3, **anchored**. Same script submitted to both queues because 4 nodes are scarce — whichever runs first wins, cancel the other. | `anch16_6746624.log` / `anch16p_6746696.log` |
+| **6746697** | Async checkpoint A/B: sync vs `COQUI_ASYNC_CHKPT=1`, current binary, same allocation. This is now the **highest-value remaining perf item** (C.4: the write is 20-31% of the loop). | `asyncab_*.log` |
+
+Reading the 16-rank result: compare to the original `bench_gpu_4n` **631.9 s**, but that baseline was
+measured with the restricted `UCX_TLS` that pins the now-broken `cuda_ipc` (§B.4), so it is *not* on
+equal footing with the 8-rank 1008.7 s. The anchor leg is what makes the comparison sound — if
+`anchor_0730` reproduces ~31 s tau_to_w over 3 iterations, trust the `current` number.
+
+Every script sets `UCX_TLS=^cuda_ipc` and prints `bench_comm` before measuring; if intra-node
+bandwidth is not O(10 GB/s) or the anchor is several times its 07-30 cost, discard and see §B.4.
+Extraction helper: `si_kp222_n500_e125/extract_timings.sh <log>...`.
+
+Beyond these: rerun the **16-rank and H100 ERI builds on device** now that B6 is fixed and the
+block-cyclic path is auto-selected (§B.2, §B.3.2) — that combination has never been exercised
+end-to-end, and it is the configuration that used to abort.
 
 ## C.4 Si 2x2x2 / 500 bands, 8xH100 (1 node), shared ERI, niter=3
 
