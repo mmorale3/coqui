@@ -1182,9 +1182,22 @@ namespace solvers {
             dXa.local();
         ipts = std::move(ip);
       } else {
-        utils::check(MF->nkpts() == MF->nkpts_ibz(),
+        // Guard must match the sym_mesh predicate of the eval paths (eval_Sigma_C /
+        // eval_Pi_C): a mesh reduced by TIME REVERSAL alone still has
+        // nkpts == nkpts_ibz, but the eval paths then take the symmetry route and
+        // the secondary sym ctx is never U-rotated -- letting Wannier+secondary
+        // through on such a mesh would mix a rotated basis with a window-mode ctx.
+        bool sym_mesh = (MF->nqpts() != MF->nqpts_ibz()) or
+                        (MF->nkpts() != MF->nkpts_ibz());
+        {
+          auto kp_trev = MF->kp_trev();
+          for (long ik = 0; ik < MF->nkpts(); ++ik)
+            if (kp_trev(ik)) { sym_mesh = true; break; }
+        }
+        utils::check(not sym_mesh,
                      "vertex_t::build_secondary_basis: the Wannier rotated point-selection "
-                     "overload does not support symmetry-reduced k-meshes (thc.cpp:207). "
+                     "overload does not support symmetry-reduced k-meshes (thc.cpp:207), "
+                     "including meshes reduced by time reversal alone. "
                      "Use vertex_isdf = \"global\" for Wannier + symmetry runs.");
         const long nbnd = MF->nbnd();
         nda::array<ComplexType, 4> C_skai(ns, nkpts, nc, nbnd);

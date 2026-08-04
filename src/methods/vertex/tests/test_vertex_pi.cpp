@@ -736,6 +736,105 @@ namespace bdft_tests {
       }
     }
 
+    SECTION("static_rung_wannier_gauge") {
+      // T-2 of notes/wannier_static_vertex_plan.md (section 3): Pi^{C,0} -- B-S's
+      // response ingredient and B-L's Dyson polarization P^{C,L} -- depends on
+      // range(P) ONLY, exactly like the dynamic Pi^C: it is aux-emitted with every
+      // orbital slot contracted against the projected collocation, and the rung
+      // (here the static W0bar) is an orbital-blind aux matrix that the gauge never
+      // touches. Same oracle as "wannier_gauge", rung Z -> W0bar, NO dynamic rung
+      // (the production static call path: Wdyn = nullptr).
+      nda::array<cplx, 3> W0_qPQ(nk, Np, Np);
+      for (long iq = 0; iq < nk; ++iq) {
+        nda::array<cplx, 2> A(Np, Np);
+        for (long P = 0; P < Np; ++P)
+          for (long Q = 0; Q < Np; ++Q)
+            A(P, Q) = cplx(std::cos(1.3 * double((P + 1) * (Q + 3)) + 0.29 * double(iq)),
+                           std::sin(0.7 * double(P + 1) - 0.43 * double(Q + 1)
+                                    + 0.17 * double(iq)));
+        for (long P = 0; P < Np; ++P)
+          for (long Q = 0; Q < Np; ++Q)
+            W0_qPQ(iq, P, Q) = 0.5 * (A(P, Q) + std::conj(A(Q, P)));   // Hermitian
+      }
+      const long M = Nb;                       // full-window rotation (range(P) invariant)
+      auto run_gauge0 = [&](nda::array<cplx, 2> const& V, nda::array<cplx, 4>& Pi_out) {
+        nda::array<cplx, 4> Xbar(ns, nk, Np, M);
+        Xbar() = cplx(0.0);
+        for (long ik = 0; ik < nk; ++ik)
+          for (long P = 0; P < Np; ++P)
+            for (long a = 0; a < M; ++a)
+              for (long j = 0; j < Nb; ++j)
+                Xbar(0, ik, P, a) += mdl.X_skPa(0, ik, P, C().first() + j) * V(j, a);
+        nda::array<cplx, 5> Gbar(nt, ns, nk, M, M);
+        Gbar() = cplx(0.0);
+        for (long it = 0; it < nt; ++it)
+          for (long ik = 0; ik < nk; ++ik)
+            for (long a = 0; a < M; ++a)
+              for (long b = 0; b < M; ++b)
+                for (long i = 0; i < Nb; ++i)
+                  for (long jj = 0; jj < Nb; ++jj)
+                    Gbar(it, 0, ik, a, b) += std::conj(V(i, a)) *
+                        G(it, 0, ik, C().first() + i, C().first() + jj) * V(jj, b);
+        Pi_out() = cplx(0.0);
+        vertex_pi::pi_c_accumulate_w(ft, tools, Gbar, Xbar, W0_qPQ,
+                                     static_cast<nda::array<ComplexType, 4> const*>(nullptr),
+                                     mdl.kmq, mdl.kpq, nda::range(0, M), Pi_out, 0, 1);
+      };
+      nda::array<cplx, 4> Pi_ref(nw_b, nk, Np, Np), Pi_V(nw_b, nk, Np, Np);
+      {
+        nda::array<cplx, 2> Vid(M, M);
+        Vid() = cplx(0.0);
+        for (long a = 0; a < M; ++a) Vid(a, a) = cplx(1.0);
+        run_gauge0(Vid, Pi_ref);
+      }
+      REQUIRE(std::isfinite(nda::sum(nda::abs(Pi_ref))));
+      auto check0 = [&](nda::array<cplx, 2> const& V, const char* tag) {
+        run_gauge0(V, Pi_V);
+        double num = 0, den = 0;
+        for (long l = 0; l < nw_b; ++l)
+          for (long q = 0; q < nk; ++q)
+            for (long P = 0; P < Np; ++P)
+              for (long Q = 0; Q < Np; ++Q) {
+                num = std::max(num, std::abs(Pi_V(l, q, P, Q) - Pi_ref(l, q, P, Q)));
+                den = std::max(den, std::abs(Pi_ref(l, q, P, Q)));
+              }
+        app_log(1, "static_rung_wannier_gauge: {} max|dPi^(C,0)| = {:.3e} "
+                   "(max|Pi| = {:.3e}, rel = {:.3e})", tag, num, den, num / den);
+        REQUIRE(den > 1e-10);
+        REQUIRE(num / den < 1e-10);
+      };
+      {
+        rng_t rr(31);
+        auto Vc = unitary(M, rr);
+        nda::array<cplx, 2> Vre(M, M);
+        for (long a = 0; a < M; ++a)
+          for (long b = 0; b < M; ++b) Vre(a, b) = cplx(Vc(a, b).real());
+        for (long b = 0; b < M; ++b) {
+          for (long c = 0; c < b; ++c) {
+            cplx ip = 0;
+            for (long a = 0; a < M; ++a) ip += std::conj(Vre(a, c)) * Vre(a, b);
+            for (long a = 0; a < M; ++a) Vre(a, b) -= ip * Vre(a, c);
+          }
+          double nrm = 0;
+          for (long a = 0; a < M; ++a) nrm += std::norm(Vre(a, b));
+          nrm = std::sqrt(nrm);
+          for (long a = 0; a < M; ++a) Vre(a, b) /= nrm;
+        }
+        check0(Vre, "REAL orthogonal V ");
+      }
+      {
+        nda::array<cplx, 2> Vph(M, M);
+        Vph() = cplx(0.0);
+        for (long a = 0; a < M; ++a) Vph(a, a) = std::exp(cplx(0.0, 0.7 + 1.3 * double(a)));
+        check0(Vph, "DIAGONAL phase V  ");
+      }
+      {
+        rng_t rr(53);
+        auto Vc = unitary(M, rr);
+        check0(Vc, "COMPLEX off-diag V");
+      }
+    }
+
     SECTION("structure") {
       nda::array<cplx, 4> Pi_kern(nw_b, nk, Np, Np);
       Pi_kern() = cplx(0.0);

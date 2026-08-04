@@ -726,6 +726,114 @@ namespace bdft_tests {
       check(Vph, "DIAGONAL phase V  ");   // per-orbital phases: the M>=2 diagonal razor
       check(Vco, "COMPLEX off-diag V");   // genuine complex mixing: the sharp check (the bug)
     }
+
+    SECTION("static_rung_wannier_gauge") {
+      // T-2 of notes/wannier_static_vertex_plan.md (section 3.1): the STATIC (B-S,
+      // rung_mode = 1) and LINEAR (B-L, rung_mode = 2) Sigma paths inherit the dynamic
+      // kernel's gauge covariance Sbar(V) = V^T Sbar(id) conj(V) MECHANICALLY -- the
+      // rung enters as an orbital-blind aux matrix, so its frequency content (the
+      // static W0bar alone, or W0bar + the dynamic partner of the B-L mixed terms)
+      // cannot enter the covariance. This oracle feeds the SAME production
+      // substitutions (Xbar = X V, Gbar = V^dag G V, C' = [0, M)) to eval_sigma_C_g3w2
+      // at rung_mode 1 and 2 and REQUIREs the chain-rule back-rotation
+      // conj(V) Sbar(V) V^T == Sbar(id) at kernel accuracy -- the same discriminator
+      // that convicted the operator sandwich on the dynamic path, now gating the
+      // static seams. Zero production-code changes are expected to be needed: the
+      // static call sites reuse the (Gbar, Xbar) substitutions verbatim.
+      nda::array<cplx, 3> W0_qPQ(nk, Np, Np);
+      for (long iq = 0; iq < nk; ++iq) {
+        nda::array<cplx, 2> A(Np, Np);
+        for (long P = 0; P < Np; ++P)
+          for (long Q = 0; Q < Np; ++Q)
+            A(P, Q) = cplx(std::cos(1.7 * double((P + 1) * (Q + 2)) + 0.37 * double(iq)),
+                           std::sin(0.9 * double(P + 1) - 0.61 * double(Q + 1)
+                                    + 0.11 * double(iq)));
+        for (long P = 0; P < Np; ++P)
+          for (long Q = 0; Q < Np; ++Q)
+            W0_qPQ(iq, P, Q) = 0.5 * (A(P, Q) + std::conj(A(Q, P)));   // Hermitian
+      }
+      auto Wt = mdl.Wdyn_tau(ft);   // B-L's dynamic partner rung (the kernel builds its
+                                    // own nu-domain image when Ww_override is null)
+      nda::array<cplx, 4> Wstub(nk, 0, Np, Np);   // B-S: no dynamic rung at all
+      const long M = ncw;
+      auto run_gauge_r = [&](int rmode, nda::array<cplx, 2> const& V,
+                             nda::array<cplx, 5>& Sig_block) {
+        nda::array<cplx, 4> Xbar(ns, nk, Np, M);
+        Xbar() = cplx(0.0);
+        for (long ik = 0; ik < nk; ++ik)
+          for (long P = 0; P < Np; ++P)
+            for (long a = 0; a < M; ++a)
+              for (long j = 0; j < ncw; ++j)
+                Xbar(0, ik, P, a) += mdl.X_skPa(0, ik, P, C0 + j) * V(j, a);
+        nda::array<cplx, 5> Gbar(nt, ns, nk, M, M);
+        Gbar() = cplx(0.0);
+        for (long it = 0; it < nt; ++it)
+          for (long ik = 0; ik < nk; ++ik)
+            for (long a = 0; a < M; ++a)
+              for (long b = 0; b < M; ++b)
+                for (long i = 0; i < ncw; ++i)
+                  for (long jj = 0; jj < ncw; ++jj)
+                    Gbar(it, 0, ik, a, b) += std::conj(V(i, a)) *
+                        G(it, 0, ik, C0 + i, C0 + jj) * V(jj, b);
+        Sig_block = nda::array<cplx, 5>(nt, ns, nk, M, M);
+        solvers::vertex_detail::eval_sigma_C_g3w2(
+            ft, comm, nda::range(0, M), Gbar, Xbar, (rmode == 1 ? Wstub : Wt), W0_qPQ,
+            mdl.kmq, mdl.qmin, /*iq_gamma*/ 0, /*skip*/ false, rmode,
+            static_cast<nda::array<ComplexType, 4> const*>(nullptr), nullptr, Sig_block);
+      };
+      // the three test unitaries (the wannier_gauge set)
+      nda::array<cplx, 2> Vid(M, M), Vre(M, M), Vph(M, M), Vco(M, M);
+      {
+        Vid() = cplx(0.0);
+        for (long a = 0; a < M; ++a) Vid(a, a) = cplx(1.0);
+        rng_t rr(37);
+        auto Vc = unitary(M, rr);
+        for (long a = 0; a < M; ++a)
+          for (long b = 0; b < M; ++b) Vre(a, b) = cplx(Vc(a, b).real());
+        for (long b = 0; b < M; ++b) {
+          for (long c = 0; c < b; ++c) {
+            cplx ip = 0;
+            for (long a = 0; a < M; ++a) ip += std::conj(Vre(a, c)) * Vre(a, b);
+            for (long a = 0; a < M; ++a) Vre(a, b) -= ip * Vre(a, c);
+          }
+          double nrm = 0;
+          for (long a = 0; a < M; ++a) nrm += std::norm(Vre(a, b));
+          nrm = std::sqrt(nrm);
+          for (long a = 0; a < M; ++a) Vre(a, b) /= nrm;
+        }
+        Vph() = cplx(0.0);
+        for (long a = 0; a < M; ++a) Vph(a, a) = std::exp(cplx(0.0, 0.7 + 0.9 * double(a)));
+        rng_t rr2(61);
+        Vco = unitary(M, rr2);
+      }
+      for (int rmode : {1, 2}) {
+        const char* mode = (rmode == 1) ? "B-S" : "B-L";
+        nda::array<cplx, 5> Sbar_ref, Sbar_V;
+        run_gauge_r(rmode, Vid, Sbar_ref);
+        auto check_r = [&](nda::array<cplx, 2> const& V, const char* tag) {
+          run_gauge_r(rmode, V, Sbar_V);
+          double num = 0, den = 0;
+          for (long it = 0; it < nt; ++it)
+            for (long ik = 0; ik < nk; ++ik)
+              for (long i = 0; i < M; ++i)
+                for (long jj = 0; jj < M; ++jj) {
+                  cplx inj(0.0);
+                  for (long a = 0; a < M; ++a)
+                    for (long b = 0; b < M; ++b)
+                      inj += std::conj(V(i, a)) * Sbar_V(it, 0, ik, a, b) * V(jj, b);
+                  num = std::max(num, std::abs(inj - Sbar_ref(it, 0, ik, i, jj)));
+                  den = std::max(den, std::abs(Sbar_ref(it, 0, ik, i, jj)));
+                }
+          app_log(1, "sigma static_rung_wannier_gauge [{}]: {} max|dSigma_inj| = {:.3e} "
+                     "(max = {:.3e}, rel = {:.3e})", mode, tag, num, den, num / den);
+          REQUIRE(den > 1e-10);
+          REQUIRE(num / den < 1e-9);
+        };
+        check_r(Vre, "REAL orthogonal V ");
+        check_r(Vph, "DIAGONAL phase V  ");
+        check_r(Vco, "COMPLEX off-diag V");
+      }
+    }
 #endif  // ENABLE_DLR
   }
 

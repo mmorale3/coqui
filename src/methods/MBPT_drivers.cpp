@@ -127,10 +127,9 @@ inline void ensure_checkpoint(std::shared_ptr<mf::MF> mf, std::string const& out
  *                 "linear" (B-L) are the two conserving static-rung truncations, in which
  *                 the rungs are the iv = 0 statically screened W0[G]. ONE vertex_t drives
  *                 all cuts of the selected mode, so mixed half-theories cannot be
- *                 configured. All other vertex_* keys apply to every mode. The static
- *                 modes' kernels are NOT implemented yet: selecting one with a non-empty
- *                 vertex_band_window aborts (increment S2+); an empty window is a no-op in
- *                 every mode.
+ *                 configured. All other vertex_* keys apply to every mode. All three
+ *                 modes are fully implemented (plan increments S0-S10 complete); an
+ *                 empty window is a no-op in every mode.
  *  - vertex_band_window: [i0, i1) Contiguous 0-based orbital range defining the vertex
  *                 subspace C (gw solver only). Absent/empty window means C is the empty set,
  *                 which reproduces plain scGW exactly.

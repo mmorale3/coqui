@@ -149,12 +149,14 @@ namespace bdft_tests {
   } // namespace wan
 
   // one scGW driver: n_iter, optional vertex; the projector (if any) installs a
-  // Wannier subspace through the production seam. Returns (e_hf, e_corr).
+  // Wannier subspace through the production seam. rung selects the theory mode
+  // ("dynamic" default; "static" = B-S, "linear" = B-L). Returns (e_hf, e_corr).
   template<typename MpiCtx, typename ProjFn>
   std::pair<double, double> run_scgw(MpiCtx& mpi_context,
                                      imag_axes_ft::IAFT& ft, std::string const& mf_name,
                                      nda::range window, long n_iter, std::string const& isdf_mode,
-                                     ProjFn&& install_proj) {
+                                     ProjFn&& install_proj,
+                                     std::string const& rung = "dynamic") {
     auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, mf_name));
     thc_reader_t thc(mf, make_thc_reader_ptree(mf->nbnd() * 8, "", "incore", "", "bdft",
                                                1e-10, mf->ecutrho(), 1, 1024));
@@ -177,7 +179,7 @@ namespace bdft_tests {
     // fixed rank (e.g. 32) would exceed N_pair for the rank-1 Wannier C (M=1 => N_pair=8)
     // and abort in build_secondary_basis.
     solvers::vertex_t vtx(&ft, window.size() > 0 ? "2nd_exchange" : "none", window,
-                          mf->nbnd(), "ignore_g0", isdf_mode, -1, 1e-8);
+                          mf->nbnd(), "ignore_g0", isdf_mode, -1, 1e-8, -1.0, -1.0, rung);
     if (vtx.enabled()) {
       install_proj(vtx, *mf);
       scr_eri.set_vertex(&vtx);
@@ -367,6 +369,40 @@ namespace bdft_tests {
       // the window, so with the chain-rule injection the observable matches window to
       // machine precision (complex-U gauge invariance; notes section 6.2).
       REQUIRE(std::abs(ec_lw - ec_win) < 1e-10);
+    }
+
+    // ================= 5. STATIC RUNGS (B-S / B-L) x Wannier U =======================
+    // T-1/T-3 of notes/wannier_static_vertex_plan.md: the static-rung theories route
+    // through the SAME U-branched input substitutions (G_CC/X_C) and the SAME chain-rule
+    // injection as the dynamic path, so degenerate-U bit-identity and complex-U gauge
+    // invariance must hold in vertex_rung = "static" (B-S: Sigma^{C,x} + Sigma^{C,r},
+    // P = RPA) and "linear" (B-L: + mixed terms, P^{C,L} injection, pi^dyn response)
+    // with ZERO production-code changes. Covers, per run: the static Sigma injection,
+    // Pi^{C,0} -> Delta w -> Sigma^{C,r} (U-free by theory -- full-space externals),
+    // and for B-L the factorized pi^dyn route and the P^{C,L} Dyson feed.
+    for (std::string rung : {std::string("static"), std::string("linear")}) {
+      auto [ehf_w, ec_w] = run_scgw(mpi_context, ft, "qe_lih222", window, n_iter,
+                                    "global", no_proj, rung);
+      auto [ehf_id, ec_id] = run_scgw(mpi_context, ft, "qe_lih222", window, n_iter,
+                                      "global", install_identity, rung);
+      auto [ehf_g, ec_g] = run_scgw(mpi_context, ft, "qe_lih222", window, n_iter,
+                                    "global", install_Vk, rung);
+      app_log(1, "vertex_wannier [{}]: window     e_hf = {:.12f}, e_corr = {:.12f}",
+              rung, ehf_w, ec_w);
+      app_log(1, "vertex_wannier [{}]: U=1_window e_hf = {:.12f}, e_corr = {:.12f}  "
+                 "(|D e_corr| = {:.2e})", rung, ehf_id, ec_id, std::abs(ec_id - ec_w));
+      app_log(1, "vertex_wannier [{}]: V(k) gauge e_hf = {:.12f}, e_corr = {:.12f}  "
+                 "(|D e_corr| = {:.2e})", rung, ehf_g, ec_g, std::abs(ec_g - ec_w));
+      REQUIRE(std::isfinite(ec_w));
+      // the static-mode vertex must actually act (a dead vertex would pass every
+      // invariance check trivially)
+      REQUIRE(std::abs(ec_w - ec_win) > 1e-9);   // differs from the DYNAMIC-rung result
+      // T-1: degenerate-U reduction (window fast-path vs the gemm path)
+      REQUIRE(std::abs(ehf_id - ehf_w) < 1e-10);
+      REQUIRE(std::abs(ec_id - ec_w) < 1e-10);
+      // T-3: complex k-dependent gauge invariance (range(P) = the window for M == nW)
+      REQUIRE(std::abs(ehf_g - ehf_w) < 1e-10);
+      REQUIRE(std::abs(ec_g - ec_w) < 1e-10);
     }
 #endif
   }

@@ -63,8 +63,8 @@ namespace solvers {
    *                   alone).
    *   - linear_rung : B-L, the tangent completion of B-S, first order in
    *                   dW = W - W^0[G]: P^{C,L} injected, four Sigma pieces together.
-   * The static_rung/linear_rung KERNELS are not implemented yet: selecting either one
-   * with a non-empty subspace C aborts in the constructor (increment S2+ of the plan).
+   * All three modes are fully implemented (plan increments S0-S10 complete, plus IBZ
+   * symmetry); check_rung_implemented is retained as a no-op seam.
    * C = empty set stays an exact no-op in every mode.
    */
   enum vertex_rung_e {
@@ -418,10 +418,9 @@ namespace solvers {
      * @param rung          - [INPUT] rung mode of the active theory (vertex_rung_e above;
      *                        notes/static_vertex_implementation_plan.md section 2.1):
      *                        "dynamic" (default; Formulation B, bit-identical to the
-     *                        historic path), "static" (B-S) or "linear" (B-L). The static
-     *                        modes' kernels arrive at increment S2+, so requesting one with
-     *                        a non-empty C aborts here; C = empty set is a no-op in every
-     *                        mode.
+     *                        historic path), "static" (B-S) or "linear" (B-L). All three
+     *                        modes are fully implemented; C = empty set is a no-op in
+     *                        every mode.
      */
     vertex_t(const imag_axes_ft::IAFT *ft,
              std::string vertex_type,
@@ -1037,19 +1036,12 @@ namespace solvers {
     long ensure_secondary_basis(MBState &mb_state, THC_ERI auto const &thc);
 
     /**
-     * Abort unless the ACTIVE rung mode has KERNELS (the S1 guard, relocated at S2).
+     * Historic guard seam (the S1 "kernels not implemented" abort, relocated at S2,
+     * emptied as S3-S10 landed the kernels). All three rung modes are implemented;
+     * this is now a NO-OP retained so future mode additions have a ready guard point
+     * at the two kernel entries (eval_Sigma_C, eval_Pi_C).
      *
-     * S1 placed this in the constructor, because nothing of the static theories existed.
-     * S2 lands the shared W0[G] rung infrastructure, which is built inside update_w and
-     * is mode-agnostic; the pieces that are still missing are the KERNELS. The guard
-     * therefore moved to the two kernel entry points (eval_Sigma_C, eval_Pi_C), which is
-     * where the absence actually bites: an end-to-end static/linear run still aborts
-     * inside its FIRST iteration (static: at the Sigma^C evaluation, since the plan's
-     * section 2.1 turns the Pi^C injection off for B-S; linear: already at the P^{C,L}
-     * injection inside update_w), so no static run can produce numbers -- while the W0
-     * build seam is directly exercisable. Removed mode by mode as S3+ lands the kernels.
-     *
-     * @param where - [INPUT] call site, used verbatim in the abort message
+     * @param where - [INPUT] call site, used verbatim in a (currently unreachable) abort
      */
     void check_rung_implemented(std::string_view where) const;
 
