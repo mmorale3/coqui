@@ -987,3 +987,50 @@ Against the original 8xA100 run, in the order the work landed:
   (§B.3.2). Rerun `bench_gpu_1n_h100` (original 941.4 s) with `UCX_TLS=^cuda_ipc` and an anchor leg.
 - **Async checkpoint** (`COQUI_ASYNC_CHKPT=1`) — worth ~13 s/iter of the 27 s/iter write cost;
   measure on top of C.1.
+
+## C.4 Si 2x2x2 / 500 bands, 8xH100 (1 node), shared ERI, niter=3
+
+**The first trustworthy H100 measurement.** Until today `build/gpu90` contained sm_80 code despite
+being configured for 90 (§B.3.2), so on H100 every CoQuí kernel silently failed to launch. Binary
+verified here as `10 arch = sm_90`. Job 6746651, workergpu160, `UCX_TLS=^cuda_ipc`.
+
+| | original (job 6678589) | current | |
+|---|---|---|---|
+| SCF loop, 3 iterations | 941.36 s | **497.16 s** | **1.89x** |
+
+Energies match the reference to ~2e-15 relative
+(0.48305038078409046 / 0.5300765029178796 / 0.534190640607511).
+
+**Side by side with 8xA100, same input, same 3 iterations — and the difference is not the GPU:**
+
+| phase | 8xA100 (SXM4) | 8xH100 (PCIe) |
+|---|---|---|
+| SCF loop total | 407.81 | 497.16 |
+| Dyson | 50.08 | 53.99 |
+| MBPT solvers | 240.65 | 246.80 |
+| Iterative alg | 18.90 | 18.70 |
+| **checkpoint write** | **81.67** | **155.36** |
+| Energies | 5.15 | 5.28 |
+| unaccounted | 11.36 | 17.03 |
+
+Compute is a wash (MBPT 240.7 vs 246.8, Dyson 50.1 vs 54.0). **Essentially the whole 89 s gap is the
+checkpoint write**, +73.7 s, i.e. filesystem variance rather than hardware. Note the write is now
+**20% of the loop on A100 and 31% on H100** — at this problem size the SCF loop is no longer
+GPU-limited, which makes the async checkpoint (`COQUI_ASYNC_CHKPT=1`, §3.6) the obvious next win and
+promotes the write path above further device work.
+
+**Inside `update_w` the two machines differ in an instructive way:**
+
+| | 8xA100 (SXM4, NVLink) | 8xH100 (PCIe) |
+|---|---|---|
+| `eval_Pi_qdep` | 26.50 | 37.12 |
+| tau_to_w + w_to_tau | 65.42 | 103.98 |
+| `dyson_W_in_place` (SLATE LU) | 55.17 | **35.75** |
+
+The H100 wins the compute — the W-Dyson LU is **1.54x faster** — and loses the exchange, because
+these are **H100 PCIe** parts with no NVLink between GPUs, so all eight ranks talk over PCIe where the
+A100-SXM4 node has NVLink. Measured intra-node bandwidth 8.59 GB/s on the H100 node vs 88.75 GB/s on
+a healthy A100-SXM4 node; roughly PCIe-gen5 speed, i.e. *normal for this hardware* and not the
+`cuda_ipc` fault of §B.4. Net effect for this phase, the exchange penalty outweighs the compute gain.
+**Do not treat "H100" as strictly faster than "A100" here — ask whether the part is SXM or PCIe
+first**, and prefer the SXM4 A100 nodes for exchange-heavy runs at this size.
