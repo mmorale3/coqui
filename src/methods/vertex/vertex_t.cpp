@@ -20,7 +20,9 @@
 
 
 #include <cmath>
+#include <cstdlib>        // getenv: the read-only T6 R-decay diagnostic gate
 #include <unordered_set>
+#include <vector>
 
 #include "nda/lapack.hpp"
 #include "nda/linalg/eigenelements.hpp"
@@ -39,6 +41,193 @@
 
 namespace methods {
 namespace solvers {
+
+  namespace vertex_rdecay_detail {
+
+    /**
+     * T6 R-DECAY DIAGNOSTIC (notes/wannier_coarse_vertex_theory.md section 10, item T6).
+     * READ-ONLY, gated on env COQUI_VERTEX_RDECAY=1: measures the lattice (R-space)
+     * decay of the coarse-grid interpolants, the go/no-go number for evaluating the
+     * vertex on a coarse k-mesh and Wannier-interpolating to the fine one. Never
+     * touches any physics array.
+     *
+     * A(R) = (1/Nk) sum_k e^{-2 pi i k.R} A(k) on the mesh-dual minimal-image R
+     * lattice; shells are Chebyshev (max_i |n_i|). Logged per shell: max|A(R)|, rms,
+     * rel-to-shell-0, and the CUMULATIVE TAIL l2 fraction from that shell outward --
+     * the Route-B truncation-error proxy for a coarse mesh resolving shells < s.
+     */
+    inline void log_rshell_decay_k(auto MF, nda::ArrayOfRank<5> auto const &A,
+                                   std::string const &label) {
+      const long nt = A.shape(0), ns_ = A.shape(1), nk = A.shape(2);
+      const long na = A.shape(3), nb = A.shape(4);
+      auto kpts = MF->kpts_crystal();
+      auto grid = MF->kp_grid();
+      const long g0 = grid(0), g1 = grid(1), g2 = grid(2);
+      if (g0 * g1 * g2 != nk) {
+        app_log(1, "  [RDECAY] {}: kp_grid {}x{}x{} != nk {} -- table skipped.",
+                label, g0, g1, g2, nk);
+        return;
+      }
+      const long nshell = std::max({g0, g1, g2}) / 2 + 1;
+      std::vector<double> smax(nshell, 0.0), s2(nshell, 0.0);
+      std::vector<long> scnt(nshell, 0);
+      for (long n0 = 0; n0 < g0; ++n0)
+        for (long n1 = 0; n1 < g1; ++n1)
+          for (long n2 = 0; n2 < g2; ++n2) {
+            const long m0 = (2 * n0 > g0) ? n0 - g0 : n0;
+            const long m1 = (2 * n1 > g1) ? n1 - g1 : n1;
+            const long m2 = (2 * n2 > g2) ? n2 - g2 : n2;
+            const long sh = std::max({std::labs(m0), std::labs(m1), std::labs(m2)});
+            double amax = 0.0, a2 = 0.0;
+            for (long it = 0; it < nt; ++it)
+              for (long is = 0; is < ns_; ++is)
+                for (long a = 0; a < na; ++a)
+                  for (long b = 0; b < nb; ++b) {
+                    ComplexType acc(0.0);
+                    for (long k = 0; k < nk; ++k) {
+                      const double ph = -2.0 * M_PI * (kpts(k, 0) * double(m0) +
+                                                       kpts(k, 1) * double(m1) +
+                                                       kpts(k, 2) * double(m2));
+                      acc += ComplexType(std::cos(ph), std::sin(ph)) * A(it, is, k, a, b);
+                    }
+                    const double v = std::abs(acc) / double(nk);
+                    amax = std::max(amax, v);
+                    a2 += v * v;
+                  }
+            smax[sh] = std::max(smax[sh], amax);
+            s2[sh] += a2;
+            scnt[sh] += 1;
+          }
+      double tot2 = 0.0;
+      for (long s = 0; s < nshell; ++s) tot2 += s2[s];
+      app_log(1, "  [RDECAY] {} on {}x{}x{}: shell |R|_inf | n_R | max|A(R)| | "
+                 "rms | rel-to-0 | tail-l2-frac(>= shell)",
+              label, g0, g1, g2);
+      double tail2 = tot2;
+      for (long s = 0; s < nshell; ++s) {
+        const double rms = (scnt[s] > 0)
+            ? std::sqrt(s2[s] / double(scnt[s] * nt * ns_ * na * nb)) : 0.0;
+        app_log(1, "  [RDECAY] {}:   {}   {:4d}   {:.4e}   {:.4e}   {:.4e}   {:.4e}",
+                label, s, scnt[s], smax[s],
+                rms, (smax[0] > 0.0 ? smax[s] / smax[0] : 0.0),
+                (tot2 > 0.0 ? std::sqrt(tail2 / tot2) : 0.0));
+        tail2 -= s2[s];
+      }
+    }
+
+    /**
+     * The q-side companion for a per-q aux matrix D(q, P, Q) on the FULL transfer mesh
+     * (nosym runs only -- IBZ-stored q-objects do not star-unfold elementwise in the
+     * aux frame). Scalar channels are transformed: the aux trace plus three fixed
+     * deterministic probe bilinears u^dag D(q) v; for Np <= 512 the full matrix is
+     * transformed too. The q vectors are validated as crystal-integer multiples of the
+     * mesh (the Qpts cartesian-vs-crystal trap) and the table is skipped otherwise.
+     */
+    inline void log_rshell_decay_q(auto MF, nda::ArrayOfRank<3> auto const &D,
+                                   std::string const &label) {
+      const long nq = D.shape(0), Np = D.shape(1);
+      auto qcart = MF->Qpts();          // CARTESIAN (the known Qpts trap)
+      auto lat = MF->lattv();
+      auto grid = MF->kp_grid();
+      const long g0 = grid(0), g1 = grid(1), g2 = grid(2);
+      if (g0 * g1 * g2 != nq) {
+        app_log(1, "  [RDECAY] {}: kp_grid {}x{}x{} != nq {} -- table skipped.",
+                label, g0, g1, g2, nq);
+        return;
+      }
+      // cartesian -> crystal via the direct lattice, q_crys = q_cart . a / (2 pi);
+      // both matrix orientations are tried and the mesh-integrality check adjudicates
+      // (self-validating -- a wrong convention skips the table instead of lying).
+      const long gv[3] = {g0, g1, g2};
+      nda::array<double, 2> qpts(nq, 3);
+      bool ok = false;
+      for (int orient = 0; orient < 2 and not ok; ++orient) {
+        for (long q = 0; q < nq; ++q)
+          for (int c = 0; c < 3; ++c) {
+            double acc = 0.0;
+            for (int d = 0; d < 3; ++d)
+              acc += qcart(q, d) * (orient == 0 ? lat(c, d) : lat(d, c));
+            qpts(q, c) = acc / (2.0 * M_PI);
+          }
+        ok = true;
+        for (long q = 0; q < nq and ok; ++q)
+          for (int c = 0; c < 3 and ok; ++c) {
+            const double x = qpts(q, c) * double(gv[c]);
+            if (std::abs(x - std::round(x)) > 1e-6) ok = false;
+          }
+      }
+      if (not ok) {
+        app_log(1, "  [RDECAY] {}: Qpts do not reduce to crystal multiples of the "
+                   "{}x{}x{} mesh in either lattv orientation -- table skipped.",
+                label, g0, g1, g2);
+        return;
+      }
+      // channels: trace + three fixed probes (deterministic LCG)
+      const int nch = 4;
+      nda::array<ComplexType, 2> uu(nch, Np), vv(nch, Np);
+      {
+        unsigned long st = 88172645463325252ull;
+        auto rnd = [&st]() {  // xorshift, deterministic across platforms
+          st ^= st << 13; st ^= st >> 7; st ^= st << 17;
+          return double(st % 1000003ull) / 1000003.0 - 0.5;
+        };
+        for (int c = 1; c < nch; ++c) {
+          double nu = 0.0, nv = 0.0;
+          for (long P = 0; P < Np; ++P) {
+            uu(c, P) = ComplexType(rnd(), rnd());
+            vv(c, P) = ComplexType(rnd(), rnd());
+            nu += std::norm(uu(c, P));
+            nv += std::norm(vv(c, P));
+          }
+          for (long P = 0; P < Np; ++P) {
+            uu(c, P) /= std::sqrt(nu);
+            vv(c, P) /= std::sqrt(nv);
+          }
+        }
+      }
+      nda::array<ComplexType, 2> ch(nch, nq);
+      ch() = ComplexType(0.0);
+      for (long q = 0; q < nq; ++q) {
+        for (long P = 0; P < Np; ++P) ch(0, q) += D(q, P, P);
+        for (int c = 1; c < nch; ++c)
+          for (long P = 0; P < Np; ++P)
+            for (long Q = 0; Q < Np; ++Q)
+              ch(c, q) += std::conj(uu(c, P)) * D(q, P, Q) * vv(c, Q);
+      }
+      const long nshell = std::max({g0, g1, g2}) / 2 + 1;
+      std::vector<double> smax(nshell, 0.0);
+      std::vector<long> scnt(nshell, 0);
+      for (long n0 = 0; n0 < g0; ++n0)
+        for (long n1 = 0; n1 < g1; ++n1)
+          for (long n2 = 0; n2 < g2; ++n2) {
+            const long m0 = (2 * n0 > g0) ? n0 - g0 : n0;
+            const long m1 = (2 * n1 > g1) ? n1 - g1 : n1;
+            const long m2 = (2 * n2 > g2) ? n2 - g2 : n2;
+            const long sh = std::max({std::labs(m0), std::labs(m1), std::labs(m2)});
+            for (int c = 0; c < nch; ++c) {
+              ComplexType acc(0.0);
+              for (long q = 0; q < nq; ++q) {
+                const double ph = -2.0 * M_PI * (qpts(q, 0) * double(m0) +
+                                                 qpts(q, 1) * double(m1) +
+                                                 qpts(q, 2) * double(m2));
+                acc += ComplexType(std::cos(ph), std::sin(ph)) * ch(c, q);
+              }
+              smax[sh] = std::max(smax[sh], std::abs(acc) / double(nq));
+            }
+            scnt[sh] += 1;
+          }
+      app_log(1, "  [RDECAY] {} (trace+probe channels) on {}x{}x{}: shell | n_R | "
+                 "max|c(R)| | rel-to-0", label, g0, g1, g2);
+      for (long s = 0; s < nshell; ++s)
+        app_log(1, "  [RDECAY] {}:   {}   {:4d}   {:.4e}   {:.4e}", label, s, scnt[s],
+                smax[s], (smax[0] > 0.0 ? smax[s] / smax[0] : 0.0));
+      if (Np <= 512) {
+        auto Dv = nda::reshape(D, std::array<long, 5>{1, 1, nq, Np, Np});
+        log_rshell_decay_k(MF, Dv, label + " (full matrix)");
+      }
+    }
+
+  }  // vertex_rdecay_detail
 
   namespace vertex_timer_detail {
 
@@ -2794,6 +2983,14 @@ namespace solvers {
 
       vertex_detail::build_delta_w(W0g, Pi0g, qmin, Dw, /*assume_reflection*/ sym_mesh);
 
+      // T6 R-DECAY DIAGNOSTIC, q-side (read-only; env COQUI_VERTEX_RDECAY=1): Delta_w
+      // on the full transfer mesh. Full-q only (nosym runs) -- an IBZ-stored aux-frame
+      // q-object does not star-unfold elementwise (the collocation rotation intervenes).
+      if (const char *rd = std::getenv("COQUI_VERTEX_RDECAY");
+          rd and rd[0] == '1' and Dw.shape(0) == nqpts and mb_state.mpi->comm.root())
+        vertex_rdecay_detail::log_rshell_decay_q(MF, Dw,
+                                                 lin ? "Delta_w^L" : "Delta_w");
+
       // ---- DIAGNOSTIC (temporary): WHERE does B-L's response excess come from? --------
       // Sigma^r is exactly linear in the middle factor and B-S/B-L share this code, so
       // max|Dw^L(q)| / max|Dw^S(q)| must track X^L/Pi^0 (~0.35) at EVERY q. If it does
@@ -2855,6 +3052,41 @@ namespace solvers {
                  "||Sigma^(C,r)||/||Sigma^(C,x)|| = {:.4f} (large => the deleted rung "
                  "dynamics likely matters; theory diagnostic O3)",
               (lin ? "L,r" : "C,r"), rmax, (xmax > 0.0 ? rmax / xmax : 0.0));
+    }
+
+    // T6 R-DECAY DIAGNOSTIC (read-only; env COQUI_VERTEX_RDECAY=1;
+    // notes/wannier_coarse_vertex_theory.md item T6): lattice-decay tables of the
+    // coarse-grid interpolants. Sigma_C's externals are IBZ-resident; unfold to the
+    // full BZ by the SAME star-copy / trev-transpose convention as G_CC above (image
+    // points are gauge copies, identity D; symmetry.hpp:910) -- exactly the rule a
+    // coarse-grid interpolation would use. G_CC is logged as the long-range CONTRAST
+    // (interpolate Sigma/Pi, never G -- CLAUDE.md section 8).
+    if (const char *rd = std::getenv("COQUI_VERTEX_RDECAY");
+        rd and rd[0] == '1' and mb_state.mpi->comm.root()) {
+      nda::array<ComplexType, 5> Sfull(nt, ns, nkpts, nc, nc);
+      if (not sym_mesh) {
+        Sfull = Sigma_C;
+      } else {
+        auto kp_to_ibz = MF->kp_to_ibz();
+        auto kp_trev = MF->kp_trev();
+        for (long kp = 0; kp < nkpts; ++kp) {
+          const long kib = kp_to_ibz(kp);
+          if (not kp_trev(kp)) {
+            Sfull(all, all, kp, all, all) = Sigma_C(all, all, kib, all, all);
+          } else {
+            for (long it = 0; it < nt; ++it)
+              for (long is = 0; is < ns; ++is)
+                for (long a = 0; a < nc; ++a)
+                  for (long b = 0; b < nc; ++b)
+                    Sfull(it, is, kp, a, b) = Sigma_C(it, is, kib, b, a);
+          }
+        }
+      }
+      vertex_rdecay_detail::log_rshell_decay_k(
+          MF, Sfull, lin  ? "Sigma^(C,L-explicit) C-block"
+                     : stat ? "Sigma^(C,x) C-block"
+                            : "Sigma^C C-block");
+      vertex_rdecay_detail::log_rshell_decay_k(MF, G_CC, "G_CC contrast");
     }
 
     // accumulate on top of the GW self-energy: Sigma <- Sigma + Sigma^C
