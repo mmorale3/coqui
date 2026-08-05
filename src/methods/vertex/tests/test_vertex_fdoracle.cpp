@@ -706,6 +706,99 @@ namespace bdft_tests {
                  "W0.Pi.W0 sandwich gives rel = {:.3e}", rel_n);
       REQUIRE(rel_n > 1e-3);
     }
+
+    // --- T-4: THE ORACLE UNDER A COMPLEX WANNIER GAUGE (plan note, erratum E-S2) --------
+    // Feed the SAME functional through the production Wannier substitutions with a
+    // FULL-RANK complex unitary V on the window (range(P) unchanged, so Phi is the same
+    // functional): Xbar = X(:,C) V, Gbar = V^dag G_CC V, kernel at strict C-C. The
+    // conserving pairing is stated in the KERNEL'S OWN (Wannier) labels,
+    // T[Sbar^x, V^dag dG_CC V]; with the CHAIN-RULE injection this equals the band-label
+    // pairing exactly (associativity), so the oracle gate carries over unchanged. The
+    // OPERATOR-sandwich reading (V Sbar V^dag paired against dG_CC) is the documented
+    // trap (wannier_projector_theory section 2.7) and must break at O(1).
+    {
+      const long M = ncw;
+      nda::array<cplx, 2> V(M, M);
+      {
+        rng_t rg(777);
+        for (long a = 0; a < M; ++a)
+          for (long b = 0; b < M; ++b) V(a, b) = rg.z();
+        for (long b = 0; b < M; ++b) {                 // Gram-Schmidt -> unitary
+          for (long c = 0; c < b; ++c) {
+            cplx ip(0.0);
+            for (long a = 0; a < M; ++a) ip += std::conj(V(a, c)) * V(a, b);
+            for (long a = 0; a < M; ++a) V(a, b) -= ip * V(a, c);
+          }
+          double nrm = 0.0;
+          for (long a = 0; a < M; ++a) nrm += std::norm(V(a, b));
+          nrm = std::sqrt(nrm);
+          for (long a = 0; a < M; ++a) V(a, b) /= nrm;
+        }
+      }
+      auto rot_G = [&](nda::array<cplx, 5> const& G) {   // Gbar = V^dag G_CC V
+        nda::array<cplx, 5> Gb(nt, ns, nk, M, M);
+        Gb() = cplx(0.0);
+        for (long it = 0; it < nt; ++it)
+          for (long s = 0; s < ns; ++s)
+            for (long k = 0; k < nk; ++k)
+              for (long a = 0; a < M; ++a)
+                for (long b = 0; b < M; ++b) {
+                  cplx acc(0.0);
+                  for (long i = 0; i < M; ++i)
+                    for (long j = 0; j < M; ++j)
+                      acc += std::conj(V(i, a)) * G(it, s, k, i, j) * V(j, b);
+                  Gb(it, s, k, a, b) = acc;
+                }
+        return Gb;
+      };
+      nda::array<cplx, 4> Xbar(ns, nk, Np, M);
+      Xbar() = cplx(0.0);
+      for (long s = 0; s < ns; ++s)
+        for (long k = 0; k < nk; ++k)
+          for (long P = 0; P < Np; ++P)
+            for (long a = 0; a < M; ++a)
+              for (long j = 0; j < M; ++j)
+                Xbar(s, k, P, a) += mdl.X_skPa(s, k, P, j) * V(j, a);
+      nda::array<cplx, 4> Wstub_w(nk, 0, Np, Np);
+      nda::array<cplx, 5> Sxb(nt, ns, nk, M, M);
+      solvers::vertex_detail::eval_sigma_C_g3w2(ft, comm, nda::range(0, M), rot_G(G0),
+                                                Xbar, Wstub_w, W0, mdl.kmq, mdl.qmin,
+                                                /*iq_gamma*/ 0, /*skip*/ false,
+                                                /*rung_mode*/ 1,
+                                                static_cast<nda::array<ComplexType, 4> const*>(nullptr),
+                                                nullptr, Sxb);
+      // (1) Phi evaluated in the kernel's own Wannier labels == the band-label Phi
+      const cplx phi_w = 0.25 * pairing(Sxb, rot_G(G0), M, M);
+      // (2) the WANNIER-label explicit pairing reproduces the band one exactly, and the
+      //     full oracle gate carries over
+      const cplx t_x_w = pairing(Sxb, rot_G(dG), M, M);
+      const double rel_w = std::abs(dphi_fd - (t_x_w + t_r)) / std::abs(dphi_fd);
+      // (3) POSITIVE CONTROL: the operator-sandwich band injection V Sbar V^dag
+      nda::array<cplx, 5> S_bad(nt, ns, nk, M, M);
+      S_bad() = cplx(0.0);
+      for (long it = 0; it < nt; ++it)
+        for (long s = 0; s < ns; ++s)
+          for (long k = 0; k < nk; ++k)
+            for (long i = 0; i < M; ++i)
+              for (long j = 0; j < M; ++j) {
+                cplx acc(0.0);
+                for (long a = 0; a < M; ++a)
+                  for (long b = 0; b < M; ++b)
+                    acc += V(i, a) * Sxb(it, s, k, a, b) * std::conj(V(j, b));
+                S_bad(it, s, k, i, j) = acc;
+              }
+      const cplx t_x_bad = pairing(S_bad, dG, M, M);
+      const double rel_bad = std::abs(t_x_bad - dphi_expl) / std::abs(dphi_expl);
+      app_log(1, "vertex_fdoracle_bs wannier-gauge [prec = {}]: |Phi_w - Phi| rel = "
+                 "{:.3e}; |T_w[Sbar,dG] - T[Sx,dG]| rel = {:.3e}; oracle rel = {:.3e}; "
+                 "operator-sandwich control rel = {:.3e} (must be O(1)-broken)",
+              prec, std::abs(phi_w - phi_hat) / std::abs(phi_hat),
+              std::abs(t_x_w - t_x) / std::abs(t_x), rel_w, rel_bad);
+      REQUIRE(std::abs(phi_w - phi_hat) < 1e-9 * std::abs(phi_hat));
+      REQUIRE(std::abs(t_x_w - t_x) < 1e-9 * std::abs(t_x));
+      REQUIRE(rel_w < 1e-7);                     // the oracle, in Wannier labels (E-S2)
+      REQUIRE(rel_bad > 1e-2);                   // the section-2.7 trap, made a control
+    }
 #endif
   }
 

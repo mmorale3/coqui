@@ -47,6 +47,7 @@
 #include <array>
 #include <cmath>
 #include <complex>
+#include <functional>
 #include <random>
 #include <vector>
 
@@ -156,7 +157,8 @@ namespace bdft_tests {
                                      imag_axes_ft::IAFT& ft, std::string const& mf_name,
                                      nda::range window, long n_iter, std::string const& isdf_mode,
                                      ProjFn&& install_proj,
-                                     std::string const& rung = "dynamic") {
+                                     std::string const& rung = "dynamic",
+                                     std::function<void(solvers::vertex_t const&)> post = {}) {
     auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, mf_name));
     thc_reader_t thc(mf, make_thc_reader_ptree(mf->nbnd() * 8, "", "incore", "", "bdft",
                                                1e-10, mf->ecutrho(), 1, 1024));
@@ -188,6 +190,7 @@ namespace bdft_tests {
     auto [e_hf, e_corr] = scf_loop(mb_state, dyson, eri, ft,
                                    solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol,
                                    n_iter, false, 1e-12, true);
+    if (post and vtx.enabled()) post(vtx);   // read post-run diagnostics (e.g. leakage)
     mpi_context->comm.barrier();
     if (mpi_context->comm.root()) remove((output + ".mbpt.h5").c_str());
     mpi_context->comm.barrier();
@@ -403,6 +406,62 @@ namespace bdft_tests {
       // T-3: complex k-dependent gauge invariance (range(P) = the window for M == nW)
       REQUIRE(std::abs(ehf_g - ehf_w) < 1e-10);
       REQUIRE(std::abs(ec_g - ec_w) < 1e-10);
+    }
+
+    // ================= 6. SYMMETRY-CLOSED WANNIER C (T-5): SrVO3 t2g =================
+    // The physics payoff of the Wannier subspace (notes/wannier_static_vertex_plan.md
+    // section 3.3): a C that is symmetry-CLOSED by construction kills the band-cut
+    // D-matrix leakage. Three one-iteration B-S runs on the SYMMETRIC SVO mesh
+    // (leakage is rung-independent; B-S is the cheapest rung):
+    //   (a) window C = [20,22) CUTS the t2g triplet (no 2-dim invariant subspace of a
+    //       3-dim multiplet exists) -> leakage O(0.1-1): the measured control;
+    //   (b) window C = [20,23) = the full t2g group -> leakage ~ 0 (closed window);
+    //   (c) the REAL Wannier90 MLWF t2g projector (M = 3 on the same window, read
+    //       through the production wan.h5 seam) -> projector-level leakage ~ 0 AND
+    //       e_corr == (b) to gauge class: range(P) = the window, so this is the
+    //       production-file gauge test -- and the first LOCAL sym x Wannier e2e run
+    //       (sections 1-5 are all nosym).
+    {
+      imag_axes_ft::IAFT ft_svo(1000, 12.0, imag_axes_ft::dlr_basis, "low");
+      auto [svo_outdir, svo_prefix] = utils::utest_filename("qe_svo222_sym");
+      (void)svo_prefix;
+      std::string wannier_file = svo_outdir + "/../mlwf/svo.mlwf.h5";
+      const nda::range t2g(20, 23), t2g_cut(20, 22);
+
+      double leak_cut = -1.0, leak_closed = -1.0, leak_wan = -1.0;
+      auto grab = [](double& slot) {
+        return [&slot](solvers::vertex_t const& v) { slot = v.sym_leakage_max(); };
+      };
+      auto [ehf_cut, ec_cut] = run_scgw(mpi_context, ft_svo, "qe_svo222_sym", t2g_cut,
+                                        1, "global", no_proj, "static", grab(leak_cut));
+      auto [ehf_t2g, ec_t2g] = run_scgw(mpi_context, ft_svo, "qe_svo222_sym", t2g,
+                                        1, "global", no_proj, "static", grab(leak_closed));
+      auto install_mlwf = [&](solvers::vertex_t& v, mf::MF& mf) {
+        projector_t proj(mf, wannier_file, /*translate*/ false, /*print*/ false);
+        v.set_wannier_projector(proj, /*loewdin*/ true);
+        REQUIRE(v.subspace_rank() == 3);
+        REQUIRE(v.isometry_defect() < 1e-10);   // W90 t2g projection is ~unitary already
+      };
+      auto [ehf_wan, ec_wan] = run_scgw(mpi_context, ft_svo, "qe_svo222_sym", t2g,
+                                        1, "global", install_mlwf, "static",
+                                        grab(leak_wan));
+      app_log(1, "vertex_wannier svo t2g leakage: cut-window = {:.3e}, closed-window = "
+                 "{:.3e}, MLWF = {:.3e}", leak_cut, leak_closed, leak_wan);
+      app_log(1, "vertex_wannier svo t2g e_corr: closed-window = {:.12f}, MLWF = {:.12f} "
+                 "(|D| = {:.2e}; cut-window = {:.12f})", ec_t2g, ec_wan,
+              std::abs(ec_wan - ec_t2g), ec_cut);
+      REQUIRE(std::isfinite(ec_cut));
+      REQUIRE(std::isfinite(ec_t2g));
+      REQUIRE(std::isfinite(ec_wan));
+      // the leakage separation: the cut multiplet leaks at O(0.1-1); the closed window
+      // and the symmetry-closed MLWF set sit at the numerical floor
+      REQUIRE(leak_cut > 1e-2);
+      REQUIRE(leak_closed < 1e-8);
+      REQUIRE(leak_wan < 1e-8);
+      // production-file gauge identity: the full-rank MLWF rotation of the closed
+      // window has range(P) = the window, so observables match to gauge class
+      REQUIRE(std::abs(ehf_wan - ehf_t2g) < 1e-10);
+      REQUIRE(std::abs(ec_wan - ec_t2g) < 1e-10);
     }
 #endif
   }
