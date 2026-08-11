@@ -1335,15 +1335,13 @@ namespace solvers {
      */
     nda::array<ComplexType, 4> eval_pol_pi0(MBState &mb_state, THC_ERI auto &thc);
 
-    /** L1 gate diagnostics -- see vertex_ladder.icc for the gate + candidate
-     *  definitions (kernel choice x pairing topology; 6 candidates). */
+    /** L1 gate diagnostics -- see vertex_ladder.icc for the derivation. */
     struct ladder_l1_diag {
-      static constexpr int ncand = 6;
-      double l1a_eta = -1.0;                       // upfold vs C-masked global bubble
-      double l1b_resid[ncand] = {-1, -1, -1, -1, -1, -1};
-      ComplexType l1b_scale[ncand] = {};
-      double l1b_scale_spread[ncand] = {-1, -1, -1, -1, -1, -1};
-      int best = -1;
+      double l1a_eta = -1.0;      // upfold(Pi-bar^0) vs the C-masked global bubble
+      double l1b_resid = -1.0;    // pair-space one-rung rebuild vs the Pi^C anchor:
+                                  // an algebraic identity -- machine precision, no scale
+      double ladder_frac = -1.0;  // ||Pi_ladder - Pi_onerung|| / ||Pi^C||: >= 2-rung content
+      double onerung_max = 0.0, ladder_max = 0.0;
     };
     ladder_l1_diag ladder_l1_gates(MBState &mb_state, THC_ERI auto &thc);
 

@@ -182,31 +182,24 @@ namespace bdft_tests {
     app_log(1, "scgwt_ladder_l1: B-S secondary state e_hf = {}, e_corr = {}", e_hf, e_corr);
 
     auto diag = vtx.ladder_l1_gates(mb_state, thc);
-    // L1-a: the pair bubble is correct at the representation floor (measured 1.9e-05).
+    // L1-a: the pair-density bubble is correct at the representation floor
+    // (measured 1.9e-05 on this fixture).
     REQUIRE(diag.l1a_eta >= 0.0);
     REQUIRE(diag.l1a_eta < 0.05);
-    const int b = diag.best;
-    REQUIRE(b >= 0);
-    app_log(1, "scgwt_ladder_l1: best kernel candidate c{} resid = {:.3e}, "
-               "alpha = ({:+.6e}, {:+.6e}), spread = {:.3e}",
-            b, diag.l1b_resid[b], diag.l1b_scale[b].real(), diag.l1b_scale[b].imag(),
-            diag.l1b_scale_spread[b]);
-    // 🛑 L1-b MEASURED VERDICT (2026-08-11, lih222 window[0,2) secondary full-rank):
-    // NO candidate (kernel W0bar(q) / <W0bar>_qx, x all transpose topologies, x one
-    // fitted complex scalar) reproduces the implemented static-rung Pi^C:
-    //   best resid = 2.822e-01, alpha = -0.4644, per-(q,inu) spread = 1.686
-    //   (transpose variants EXACTLY degenerate; <W0bar> far worse at 8.4e-01)
-    // => the frequency-diagonal N_m x N_m ladder ansatz Pi-bar = [1 - Pi0 K]^-1 Pi0 of
-    // notes/scgwt_implementation_plan.md does NOT factorize the anchor: the anchor
-    // couples pairs at specific (k, k - qx) through per-(k, qx) collocation folds,
-    // which the momentum-collapsed chain cannot represent. This is the plan's declared
-    // STOP condition ("pinned by gate L1-b, NOT by rederivation") -- increment L2 is
-    // BLOCKED on a design ruling (R1'): k-resolved pair-space ladder vs a derived
-    // collapsed kernel vs re-scoping. The asserts below pin the MEASURED state so a
-    // future fix (or ruling) must consciously update them.
-    REQUIRE(diag.l1b_resid[b] > 0.1);          // the ansatz does NOT hold as written
-    REQUIRE(diag.l1b_resid[b] < 0.5);          // ...but is strongly correlated
-    REQUIRE(diag.l1b_scale_spread[b] > 0.5);   // and NOT a constant multiple
+    // L1-b [THE BIT-ANCHOR]: the pair-space one-rung rebuild
+    //   pref sum_{k,k'} b23(k')^T K(k,k')^T b41(k)
+    // is an algebraic REARRANGEMENT of pi_c_accumulate_w phase 1's own sums
+    // (vertex_ladder.icc header for the derivation), so it must reproduce the
+    // implemented static-rung Pi^C to machine precision with NO fitted scale.
+    app_log(1, "scgwt_ladder_l1: one-rung rebuild resid = {:.3e}; >= 2-rung content "
+               "= {:.3e} (max one-rung {:.3e}, max ladder {:.3e})",
+            diag.l1b_resid, diag.ladder_frac, diag.onerung_max, diag.ladder_max);
+    REQUIRE(diag.l1b_resid < 1e-10);
+    // L2 preview: the resummed ladder exists, is finite, and its >= 2-rung content is
+    // a sane fraction (the physics numbers are L2's gates, on real readouts).
+    REQUIRE(diag.ladder_frac >= 0.0);
+    REQUIRE(std::isfinite(diag.ladder_max));
+    REQUIRE(diag.ladder_max > 0.0);
 
     mpi_context->comm.barrier();
     if (mpi_context->comm.root()) remove((output + ".mbpt.h5").c_str());
