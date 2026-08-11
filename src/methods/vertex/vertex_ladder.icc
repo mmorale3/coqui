@@ -82,6 +82,39 @@ namespace solvers {
     }
 
     /**
+     * C-window G on the FULL BZ (C.2): a plain window slice on nosym meshes; under
+     * symmetry the image points are gauge copies of the IBZ blocks (identity D by
+     * convention, symmetry.hpp:910) and trev points are the tau-pointwise TRANSPOSE
+     * -- the eval-path contract verbatim (vertex_t.cpp SIG_SECONDARY block, memo
+     * (G1)/(G2); no tau-mirror anywhere).
+     */
+    inline void expand_G_CC_fullbz(nda::MemoryArrayOfRank<5> auto const &G_tskij,
+                                   nda::range bw, bool sym_mesh,
+                                   auto const &kp_to_ibz, auto const &kp_trev,
+                                   nda::array<ComplexType, 5> &G_CC) {
+      decltype(nda::range::all) all;
+      const long nt = G_CC.shape(0), ns = G_CC.shape(1), nk = G_CC.shape(2);
+      const long nc = G_CC.shape(3);
+      if (not sym_mesh) {
+        G_CC = G_tskij(all, all, all, bw, bw);
+        return;
+      }
+      for (long kp = 0; kp < nk; ++kp) {
+        const long kib = kp_to_ibz(kp);
+        if (not kp_trev(kp)) {
+          G_CC(all, all, kp, all, all) = G_tskij(all, all, kib, bw, bw);
+        } else {
+          for (long it = 0; it < nt; ++it)
+            for (long is = 0; is < ns; ++is)
+              for (long a = 0; a < nc; ++a)
+                for (long b = 0; b < nc; ++b)
+                  G_CC(it, is, kp, a, b) =
+                      G_tskij(it, is, kib, bw.first() + b, bw.first() + a);
+        }
+      }
+    }
+
+    /**
      * THE PAIR-SPACE LADDER CORE (file header for the derivation and conventions).
      * For the bosonic nodes in nu_list, accumulate the one-rung rebuild and/or the
      * resummed ladder (rungs >= 1) into (i_nu, iq)-indexed (Nm x Nm) outputs.
@@ -92,28 +125,65 @@ namespace solvers {
      * written by exactly one rank, so the caller's all_reduce (zeros elsewhere)
      * reproduces the replicated result BITWISE. (rank, nproc) = (0, 1) = the
      * replicated/toy mode. Outputs are ZEROED here, indexed by POSITION in nu_list.
+     *
+     * C.2 IBZ SYMMETRY (the pi_c_accumulate_w contract, notes/vertex_ibz_symmetry.md):
+     * with an active symc the EXTERNAL q axis of the outputs is nq_ibz, W0b carries
+     * nq_ibz rows, kmq/kpq carry the FULL transfer mesh, and G_CC/Xb are full-BZ
+     * objects. The rung K(k,k') then reads W0bar at q_star(qx) (PQ-TRANSPOSED for
+     * trev transfers, memo (P2)) with the four legs on the effective columns
+     * Xhat(is, jsym, .) through the anchor's OWN leg builder
+     * (vertex_pi::detail::build_U_legs -- the single source; identical assignments on
+     * the nosym path). nullptr / !active: all axes coincide, bit-identical to the
+     * historic kernel.
      */
     inline void pair_space_ladder(nda::MemoryArrayOfRank<5> auto const &G_CC,  // (nt,ns,nk,nc,nc)
                                   nda::array<ComplexType, 4> const &Xb,        // (ns,nk,Nm,nc)
-                                  nda::array<ComplexType, 3> const &W0b,       // (nq,Nm,Nm)
+                                  nda::array<ComplexType, 3> const &W0b,       // (nq_w,Nm,Nm)
                                   nda::array<long, 2> const &kmq,
                                   nda::array<long, 2> const &kpq,
                                   vertex_pi::iaft_tools const &tools,
                                   std::vector<long> const &nu_list,
-                                  nda::array<ComplexType, 4> *Pi_onerung,  // (nnu,nq,Nm,Nm) or null
-                                  nda::array<ComplexType, 4> *Pi_ladder,   // (nnu,nq,Nm,Nm) or null
-                                  long rank = 0, long nproc = 1) {
+                                  nda::array<ComplexType, 4> *Pi_onerung,  // (nnu,nq_ext,Nm,Nm) or null
+                                  nda::array<ComplexType, 4> *Pi_ladder,   // (nnu,nq_ext,Nm,Nm) or null
+                                  long rank = 0, long nproc = 1,
+                                  vertex_sym::sym_ctx const *symc = nullptr) {
       decltype(nda::range::all) all;
       const long nt = G_CC.shape(0), ns = G_CC.shape(1), nk = G_CC.shape(2);
       const long nc = G_CC.shape(3), Nm = Xb.shape(2);
-      const long nq = W0b.shape(0);
       const long nw_b = tools.nw_b;
       const long nc2 = nc * nc, Dsz = nc2 * nk;
       const long nnu = long(nu_list.size());
       const double spinfac = (ns == 1) ? 2.0 : 1.0;
       const double pref = -spinfac / double(nk * nk);
-      utils::check(kmq.shape(0) == nq and kmq.shape(1) == nk,
-                   "pair_space_ladder: kmq shape mismatch.");
+      // symmetry bookkeeping (the pi_c_accumulate_w axes): nq_w = stored rung rows,
+      // nq_full = internal transfer mesh, nq_ext = external output q axis.
+      const bool sym = (symc != nullptr and symc->active);
+      const long nq_w = W0b.shape(0);
+      const long nq_full = kmq.shape(0);
+      utils::check(Pi_onerung != nullptr or Pi_ladder != nullptr,
+                   "pair_space_ladder: no output requested.");
+      const long nq_ext = (Pi_onerung != nullptr) ? Pi_onerung->shape(1)
+                                                  : Pi_ladder->shape(1);
+      if (Pi_onerung != nullptr and Pi_ladder != nullptr)
+        utils::check(Pi_ladder->shape(1) == nq_ext,
+                     "pair_space_ladder: output q axes differ.");
+      if (sym) {
+        utils::check(nq_w == symc->nq_ibz and nq_ext == symc->nq_ibz and
+                     nq_full == symc->nq_full and nk == symc->nk_full,
+                     "pair_space_ladder: symmetry context dimension mismatch (nq_w = {}, "
+                     "nq_ext = {}, nq_full = {}, nk = {} vs ctx {}, {}, {}).",
+                     nq_w, nq_ext, nq_full, nk, symc->nq_ibz, symc->nq_full,
+                     symc->nk_full);
+        utils::check(symc->naux == Nm and symc->nc == nc,
+                     "pair_space_ladder: symmetry context Xhat mismatch (naux = {} vs "
+                     "Nm = {}, nc = {} vs {}).", symc->naux, Nm, symc->nc, nc);
+      } else {
+        utils::check(nq_w == nq_full and nq_ext == nq_full,
+                     "pair_space_ladder: inconsistent q axes without a symmetry context "
+                     "(nq_w = {}, nq_full = {}, nq_ext = {}).", nq_w, nq_full, nq_ext);
+      }
+      utils::check(kmq.shape(1) == nk and kpq.shape(0) >= nq_ext and kpq.shape(1) == nk,
+                   "pair_space_ladder: kmq/kpq shape mismatch.");
       for (auto m : nu_list)
         utils::check(m >= 0 and m < nw_b, "pair_space_ladder: nu index {} out of range.", m);
       if (Pi_onerung != nullptr) (*Pi_onerung)() = ComplexType(0.0);
@@ -122,7 +192,7 @@ namespace solvers {
       // qx lookup: kmq(qx, k) = k'  =>  qx_of(k, k')
       nda::array<long, 2> qx_of(nk, nk);
       qx_of() = -1;
-      for (long iqx = 0; iqx < nq; ++iqx)
+      for (long iqx = 0; iqx < nq_full; ++iqx)
         for (long ik = 0; ik < nk; ++ik) qx_of(ik, kmq(iqx, ik)) = iqx;
       for (long ik = 0; ik < nk; ++ik)
         for (long ikp = 0; ikp < nk; ++ikp)
@@ -142,9 +212,9 @@ namespace solvers {
       nda::array<ComplexType, 2> XD(Dsz, Nm), KXD(Dsz, Nm), XKXD(Dsz, Nm), Zl(Dsz, Nm);
       nda::array<ComplexType, 2> Dstack_c(Dsz, Nm);
 
-      for (long sq = rank; sq < ns * nq; sq += nproc) {
-        const long is = sq / nq;
-        const long iq = sq % nq;
+      for (long sq = rank; sq < ns * nq_ext; sq += nproc) {
+        const long is = sq / nq_ext;
+        const long iq = sq % nq_ext;
         {
           // --- d(k) and the chi0 blocks (only the requested nu rows are kept) ---------
           for (long ik = 0; ik < nk; ++ik) {
@@ -172,22 +242,24 @@ namespace solvers {
                   Cb(ik, jn, r, c) = Bf(nu_list[jn], r * nc2 + c);
           }
           // --- the rung blocks K(k, k') (nu-independent) -------------------------------
+          // qx = k - k' (kmq orientation; the ladder's k' IS the anchor's ikmqx). The
+          // legs go through the anchor's OWN builder (identical assignments on the
+          // nosym path; Xhat(is, jsx, .) under symmetry) and the rung is read at
+          // q_star(qx), PQ-TRANSPOSED for trev transfers (memo (P2)).
           for (long ik = 0; ik < nk; ++ik) {
             const long ikpq = kpq(iq, ik);
             for (long ikp = 0; ikp < nk; ++ikp) {
               const long iqx = qx_of(ik, ikp);
               const long ikppq = kpq(iq, ikp);
-              for (long p1 = 0; p1 < nc; ++p1)
-                for (long p1p = 0; p1p < nc; ++p1p)
-                  for (long P = 0; P < Nm; ++P)
-                    U1(P, p1 * nc + p1p) =
-                        Xb(is, ikp, P, p1) * std::conj(Xb(is, ik, P, p1p));
-              for (long p3 = 0; p3 < nc; ++p3)
-                for (long p3p = 0; p3p < nc; ++p3p)
-                  for (long Q = 0; Q < Nm; ++Q)
-                    U2(Q, p3 * nc + p3p) =
-                        Xb(is, ikpq, Q, p3) * std::conj(Xb(is, ikppq, Q, p3p));
-              nda::blas::gemm(W0b(iqx, all, all), U2, WU2);
+              const long jsx = sym ? symc->q_isym(iqx) : 0l;
+              const long qsx = sym ? symc->q_star(iqx) : iqx;
+              const bool trx = sym ? bool(symc->q_trev(iqx)) : false;
+              vertex_pi::detail::build_U_legs(Xb, symc, nda::range(0, nc), is, ik, ikp,
+                                              ikpq, ikppq, jsx, U1, U2);
+              if (trx)
+                nda::blas::gemm(nda::transpose(W0b(qsx, all, all)), U2, WU2);
+              else
+                nda::blas::gemm(W0b(qsx, all, all), U2, WU2);
               nda::blas::gemm(nda::transpose(U1), WU2, wb);
               // twist-pack (the anchor's to_wmat):
               //   K_{(p1' nc + p3),(p1 nc + p3')} = wb_{(p1 nc + p1'),(p3 nc + p3')}
@@ -781,10 +853,13 @@ namespace solvers {
   }
 
   /**
-   * L2: the resummed pair-space ladder at inu = 0, (nq, N_m, N_m) in THIS vertex's
+   * L2: the resummed pair-space ladder at inu = 0, (nq_ibz, N_m, N_m) in THIS vertex's
    * secondary aux basis (all rungs >= 1). See the file header; the n = 1 term is the
    * static-rung Pi^C, pinned by gate L1-b. Requires build_w0 to have run this
    * iteration (W0bar present). Replicated.
+   * C.2: symmetry-capable -- on IBZ-reduced meshes the external q axis is nq_ibz, the
+   * internal transfers run the full mesh through the secondary sym ctx (the
+   * pi_c_accumulate_w contract; pair_space_ladder header).
    */
   nda::array<ComplexType, 3> vertex_t::eval_pol_ladder_nu0(MBState &mb_state,
                                                            THC_ERI auto &thc) {
@@ -797,36 +872,135 @@ namespace solvers {
                  "vertex_t::eval_pol_ladder_nu0: W0bar is absent -- build_w0 must run "
                  "first (same iteration).");
     auto MF = thc.MF();
-    utils::check(MF->nkpts() == MF->nkpts_ibz(),
-                 "vertex_t::eval_pol_ladder_nu0: symmetry-free meshes only at L2.");
     utils::check(mb_state.sG_tskij.has_value(),
                  "vertex_t::eval_pol_ladder_nu0: mb_state carries no G.");
     ensure_secondary_basis(mb_state, thc);
 
     auto G_tskij = mb_state.sG_tskij.value().local();
-    const long nt = G_tskij.shape(0), ns = G_tskij.shape(1), nk = G_tskij.shape(2);
+    const long nt = G_tskij.shape(0), ns = G_tskij.shape(1);
+    const long nk = MF->nkpts();                    // FULL BZ (the ladder's k axis)
     const long nc = subspace_rank(), Nm = _Xb_skma.shape(2);
-    const long nq = MF->nqpts_ibz();
+    const long nq_ext = MF->nqpts_ibz(), nq_full = MF->nqpts();
+    const bool sym_mesh = (MF->nkpts() != MF->nkpts_ibz()) or (nq_full != nq_ext);
     nda::array<ComplexType, 5> G_CC(nt, ns, nk, nc, nc);
-    G_CC = G_tskij(all, all, all, _band_window, _band_window);
-    nda::array<long, 2> kmq(nq, nk), kpq(nq, nk);
+    vertex_ladder_detail::expand_G_CC_fullbz(G_tskij, _band_window, sym_mesh,
+                                             MF->kp_to_ibz(), MF->kp_trev(), G_CC);
+    // momentum maps on the FULL transfer mesh (the external IBZ q's are its leading rows)
+    nda::array<long, 2> kmq(nq_full, nk), kpq(nq_full, nk);
     auto qmin = MF->qminus();
-    for (long iq = 0; iq < nq; ++iq)
+    for (long iq = 0; iq < nq_full; ++iq)
       for (long ik = 0; ik < nk; ++ik) {
         kmq(iq, ik) = MF->qk_to_k2(iq, ik);
         kpq(iq, ik) = MF->qk_to_k2(qmin(iq), ik);
       }
+    // C.2: the secondary-basis symmetry context (rung reads at q_star with Xhat legs)
+    vertex_sym::sym_ctx const *symc = nullptr;
+    if (sym_mesh) {
+      build_sym_ctx(thc, _Xb_skma, _band_window.first(), _sym_secondary);
+      symc = &_sym_secondary.value();
+    }
 
     vertex_pi::iaft_tools tools(*_ft);
     std::vector<long> nu0 = {tools.nw_b / 2};   // the inu = 0 node of the full mesh
-    nda::array<ComplexType, 4> Pl(1, nq, Nm, Nm);
+    nda::array<ComplexType, 4> Pl(1, nq_ext, Nm, Nm);
     auto mpi = thc.mpi();
     vertex_ladder_detail::pair_space_ladder(G_CC, _Xb_skma, _W0b_qmm.value(), kmq, kpq,
                                             tools, nu0, nullptr, &Pl,
-                                            mpi->comm.rank(), mpi->comm.size());
+                                            mpi->comm.rank(), mpi->comm.size(), symc);
     mpi->comm.all_reduce_in_place_n(Pl.data(), Pl.size(), std::plus<>{});
-    nda::array<ComplexType, 3> out(nq, Nm, Nm);
+    nda::array<ComplexType, 3> out(nq_ext, Nm, Nm);
     out = Pl(0, all, all, all);
+    return out;
+  }
+
+  /**
+   * The C.2 IBZ-symmetry gate: the pair-space one-rung rebuild vs the implemented
+   * static-rung Pi^C (pi_c_accumulate_w phase 1) with the SAME symmetry context
+   * threaded through BOTH kernels -- the L1-b bit-anchor identity with the Xhat leg
+   * rotations and the q_star/trev rung reads LIVE. Still an algebraic rearrangement
+   * of identical sums (shared leg builder), so machine precision with no fitted
+   * scale, on sym and nosym meshes alike.
+   */
+  vertex_t::ladder_sym_diag vertex_t::ladder_sym_gate(MBState &mb_state, THC_ERI auto &thc) {
+    decltype(nda::range::all) all;
+    ladder_sym_diag out;
+    auto MF = thc.MF();
+    auto mpi = thc.mpi();
+    utils::check(active() and secondary(),
+                 "vertex_t::ladder_sym_gate: requires an ACTIVE secondary-basis vertex.");
+    utils::check(not _wannier, "vertex_t::ladder_sym_gate: window mode only.");
+    utils::check(_W0b_qmm.has_value(),
+                 "vertex_t::ladder_sym_gate: W0bar is absent -- run after an update_w "
+                 "with an active static-rung secondary vertex (build_w0).");
+    utils::check(mb_state.sG_tskij.has_value(),
+                 "vertex_t::ladder_sym_gate: mb_state carries no G.");
+    ensure_secondary_basis(mb_state, thc);
+
+    auto G_tskij = mb_state.sG_tskij.value().local();
+    const long nt = G_tskij.shape(0), ns = G_tskij.shape(1);
+    const long nk = MF->nkpts();
+    const long nc = subspace_rank(), Nm = _Xb_skma.shape(2);
+    const long nq_ext = MF->nqpts_ibz(), nq_full = MF->nqpts();
+    const bool sym_mesh = (MF->nkpts() != MF->nkpts_ibz()) or (nq_full != nq_ext);
+    out.sym_active = sym_mesh;
+    nda::array<ComplexType, 5> G_CC(nt, ns, nk, nc, nc);
+    vertex_ladder_detail::expand_G_CC_fullbz(G_tskij, _band_window, sym_mesh,
+                                             MF->kp_to_ibz(), MF->kp_trev(), G_CC);
+    nda::array<long, 2> kmq(nq_full, nk), kpq(nq_full, nk);
+    auto qmin = MF->qminus();
+    for (long iq = 0; iq < nq_full; ++iq)
+      for (long ik = 0; ik < nk; ++ik) {
+        kmq(iq, ik) = MF->qk_to_k2(iq, ik);
+        kpq(iq, ik) = MF->qk_to_k2(qmin(iq), ik);
+      }
+    vertex_sym::sym_ctx const *symc = nullptr;
+    if (sym_mesh) {
+      build_sym_ctx(thc, _Xb_skma, _band_window.first(), _sym_secondary);
+      symc = &_sym_secondary.value();
+    }
+
+    // the anchor with the SAME context: pi_c_accumulate_w phase 1 (rung = W0bar)
+    vertex_pi::iaft_tools tools(*_ft);
+    const long nw_b = tools.nw_b;
+    nda::array<ComplexType, 4> PiC(nw_b, nq_ext, Nm, Nm);
+    PiC() = ComplexType(0.0);
+    vertex_pi::pi_c_accumulate_w(*_ft, tools, G_CC, _Xb_skma, _W0b_qmm.value(),
+                                 static_cast<nda::array<ComplexType, 4> const *>(nullptr),
+                                 kmq, kpq, nda::range(0, nc), PiC,
+                                 mpi->comm.rank(), mpi->comm.size(),
+                                 false, nullptr, symc);
+    mpi->comm.all_reduce_in_place_n(PiC.data(), PiC.size(), std::plus<>{});
+
+    std::vector<long> nu_all(nw_b);
+    for (long m = 0; m < nw_b; ++m) nu_all[m] = m;
+    nda::array<ComplexType, 4> Pi_rebuild(nw_b, nq_ext, Nm, Nm), Pi_ladder(nw_b, nq_ext, Nm, Nm);
+    vertex_ladder_detail::pair_space_ladder(G_CC, _Xb_skma, _W0b_qmm.value(), kmq, kpq,
+                                            tools, nu_all, &Pi_rebuild, &Pi_ladder,
+                                            mpi->comm.rank(), mpi->comm.size(), symc);
+    mpi->comm.all_reduce_in_place_n(Pi_rebuild.data(), Pi_rebuild.size(), std::plus<>{});
+    mpi->comm.all_reduce_in_place_n(Pi_ladder.data(), Pi_ladder.size(), std::plus<>{});
+
+    double r2 = 0.0, a2 = 0.0, l2 = 0.0, pmax = 0.0, lmax = 0.0;
+    for (long m = 0; m < nw_b; ++m)
+      for (long iq = 0; iq < nq_ext; ++iq)
+        for (long M = 0; M < Nm; ++M)
+          for (long N = 0; N < Nm; ++N) {
+            r2 += std::norm(Pi_rebuild(m, iq, M, N) - PiC(m, iq, M, N));
+            a2 += std::norm(PiC(m, iq, M, N));
+            l2 += std::norm(Pi_ladder(m, iq, M, N) - Pi_rebuild(m, iq, M, N));
+            pmax = std::max(pmax, std::abs(Pi_rebuild(m, iq, M, N)));
+            lmax = std::max(lmax, std::abs(Pi_ladder(m, iq, M, N)));
+          }
+    out.l1b_resid = std::sqrt(r2 / std::max(a2, 1e-300));
+    out.ladder_frac = std::sqrt(l2 / std::max(a2, 1e-300));
+    out.onerung_max = pmax;
+    out.ladder_max = lmax;
+
+    app_log(1, "  [scGW-tilde C.2] IBZ gate (sym {}): one-rung rebuild vs the Pi^C "
+               "anchor rel resid = {:.3e}; >= 2-rung content = {:.3e} "
+               "(max one-rung {:.3e}, max ladder {:.3e})",
+            sym_mesh ? "ACTIVE" : "inactive", out.l1b_resid, out.ladder_frac,
+            out.onerung_max, out.ladder_max);
     return out;
   }
 
@@ -971,6 +1145,10 @@ namespace solvers {
     ladder_p4_diag out;
     auto MF = thc.MF();
     auto mpi = thc.mpi();
+    utils::check(MF->nkpts() == MF->nkpts_ibz(),
+                 "vertex_t::ladder_p4_gates: the R-space kernel path is nosym-only "
+                 "(the diagonal (P,Q) channel does not survive the Xhat leg "
+                 "rotations; C.2 lifts the EXACT path only).");
     utils::check(_W0b_qmm.has_value(),
                  "vertex_t::ladder_p4_gates: W0bar is absent -- run after an update_w "
                  "with an active static-rung secondary vertex (build_w0).");

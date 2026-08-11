@@ -1365,6 +1365,19 @@ namespace solvers {
     ladder_p4_diag ladder_p4_gates(MBState &mb_state, THC_ERI auto &thc);
 
     /**
+     * C.2 IBZ-symmetry gate (vertex_ladder.icc): the pair-space one-rung rebuild vs
+     * the pi_c_accumulate_w anchor with the SAME symmetry context threaded through
+     * both -- the L1-b machine-precision identity with the Xhat rotations live.
+     */
+    struct ladder_sym_diag {
+      bool sym_active = false;    // the mesh is IBZ-reduced (rotations exercised)
+      double l1b_resid = -1.0;    // one-rung rebuild vs the Pi^C anchor (symc threaded)
+      double ladder_frac = -1.0;  // >= 2-rung content
+      double onerung_max = 0.0, ladder_max = 0.0;
+    };
+    ladder_sym_diag ladder_sym_gate(MBState &mb_state, THC_ERI auto &thc);
+
+    /**
      * scGW-tilde increment L1 (vertex_ladder.icc): the C-window pair bubble
      * Pi-bar^0_MN(q, tau_pos) in the SECONDARY aux basis, (nt_half, nq, N_m, N_m),
      * replicated -- house RPA conventions (rpa_pi.icc Hadamard pairing, -spin/Nk,

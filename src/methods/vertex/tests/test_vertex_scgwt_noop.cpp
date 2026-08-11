@@ -299,4 +299,101 @@ namespace bdft_tests {
 #endif
   }
 
+  TEST_CASE("scgwt_ladder_ibz", "[methods][vertex][scgwt][ladder][ibz]") {
+#ifndef ENABLE_DLR
+    SUCCEED("scgwt_ladder_ibz skipped: build has ENABLE_DLR=OFF.");
+#else
+    // C.2: the IBZ-symmetry lift of the pair-space ladder's EXTERNAL q axis (the
+    // EXACT path + the L2 readout; the rs kernel stays nosym-guarded). Two gates:
+    //  (a) THE ANCHOR IDENTITY UNDER SYMMETRY: on qe_lih222_sym the one-rung rebuild
+    //      must reproduce pi_c_accumulate_w with the SAME symmetry context threaded
+    //      through both -- an algebraic rearrangement with a SHARED leg builder, so
+    //      machine precision with the Xhat rotations and trev rung reads live.
+    //  (b) CROSS-VARIANT READOUT (the vertex_ibz_gold pattern): the ladder eps_M
+    //      readout through qe_lih222 vs qe_lih222_sym at the symmetry-closed window
+    //      C = [1, 3) -- the sym-vs-nosym deviation is bounded by the representation
+    //      floor, and the ladder moves eps_M in the SAME direction.
+    auto& mpi_context = utils::make_unit_test_mpi_context();
+    imag_axes_ft::IAFT ft(1000, 6.0, imag_axes_ft::dlr_basis, "low");
+
+    // ---- (a) the sym anchor gate -----------------------------------------------------
+    {
+      std::string output = "coqui_scgwt_ibz_a";
+      auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_lih222_sym"));
+      REQUIRE(mf->nkpts() != mf->nkpts_ibz());   // rotations genuinely exercised
+      thc_reader_t thc(mf, make_thc_reader_ptree(mf->nbnd() * 8, "", "incore", "", "bdft",
+                                                 1e-10, mf->ecutrho(), 1, 1024));
+      auto eri = mb_eri_t(thc, thc);
+      solvers::hf_t hf;
+      solvers::gw_t gw(&ft, "ignore_g0", output);
+      solvers::scr_coulomb_t scr_eri(&ft, "rpa", "ignore_g0");
+      simple_dyson dyson(mf.get(), &ft);
+      MBState mb_state(mpi_context, ft, output);
+      iter_scf::iter_scf_t iter_sol("damping");
+      solvers::vertex_t vtx(&ft, "2nd_exchange", nda::range(1, 3), mf->nbnd(),
+                            "ignore_g0", "secondary", -1, 1e-8, -1.0, -1.0, "static");
+      scr_eri.set_vertex(&vtx);
+      gw.set_vertex(&vtx);
+      auto [e_hf, e_corr] = scf_loop(mb_state, dyson, eri, ft,
+                                     solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol,
+                                     2, false, 1e-9, true);
+      app_log(1, "scgwt_ladder_ibz: sym B-S state e_hf = {}, e_corr = {}", e_hf, e_corr);
+      auto d = vtx.ladder_sym_gate(mb_state, thc);
+      app_log(1, "scgwt_ladder_ibz: sym anchor gate resid = {:.3e}; >= 2-rung content "
+                 "= {:.3e} (max one-rung {:.3e}, max ladder {:.3e})",
+              d.l1b_resid, d.ladder_frac, d.onerung_max, d.ladder_max);
+      REQUIRE(d.sym_active);
+      REQUIRE(d.l1b_resid < 1e-10);
+      REQUIRE(d.ladder_frac >= 0.0);
+      REQUIRE(std::isfinite(d.ladder_max));
+      REQUIRE(d.ladder_max > 0.0);
+      mpi_context->comm.barrier();
+      if (mpi_context->comm.root()) remove((output + ".mbpt.h5").c_str());
+      mpi_context->comm.barrier();
+    }
+
+    // ---- (b) cross-variant eps_M readout ---------------------------------------------
+    auto run_readout = [&](std::string const &mf_name) {
+      std::string output = "coqui_scgwt_ibz_b";
+      auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, mf_name));
+      thc_reader_t thc(mf, make_thc_reader_ptree(mf->nbnd() * 8, "", "incore", "", "bdft",
+                                                 1e-10, mf->ecutrho(), 1, 1024));
+      auto eri = mb_eri_t(thc, thc);
+      solvers::hf_t hf;
+      solvers::gw_t gw(&ft, "ignore_g0", output);
+      solvers::scr_coulomb_t scr_eri(&ft, "rpa", "ignore_g0");
+      simple_dyson dyson(mf.get(), &ft);
+      MBState mb_state(mpi_context, ft, output);
+      iter_scf::iter_scf_t iter_sol("damping");
+      solvers::vertex_t vtx(&ft, "none", nda::range(0, 0), mf->nbnd());
+      vtx.set_pol_vertex("ladder", "w0_prev", nda::range(1, 3), -1, 1e-8, -1.0,
+                         -1.0, -1.0);
+      scr_eri.set_vertex(&vtx);
+      auto [e_hf, e_corr] = scf_loop(mb_state, dyson, eri, ft,
+                                     solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol,
+                                     2, false, 1e-9, true);
+      auto [er, el] = scr_eri.pol_eps_readout();
+      mpi_context->comm.barrier();
+      if (mpi_context->comm.root()) remove((output + ".mbpt.h5").c_str());
+      mpi_context->comm.barrier();
+      return std::make_tuple(er, el);
+    };
+    auto [er_ns, el_ns] = run_readout("qe_lih222");
+    auto [er_sy, el_sy] = run_readout("qe_lih222_sym");
+    app_log(1, "scgwt_ladder_ibz: eps_M(q_min) nosym RPA = {}, +ladder = {} "
+               "(Delta = {:+.6e}); sym RPA = {}, +ladder = {} (Delta = {:+.6e})",
+            er_ns, el_ns, el_ns - er_ns, er_sy, el_sy, el_sy - er_sy);
+    REQUIRE(er_sy > 0.0);
+    REQUIRE(el_sy > 0.0);
+    REQUIRE(std::isfinite(el_sy));
+    REQUIRE(el_sy != er_sy);                            // the ladder moved eps_M
+    // cross-variant agreement: representation-floor class (measured 2026-08-12:
+    // RPA 3.3e-5 rel, +ladder 2.9e-5 rel, Delta agreement 4e-3 rel; bars at ~30x)
+    REQUIRE(std::abs(er_sy - er_ns) < 1e-3 * er_ns);
+    REQUIRE(std::abs(el_sy - el_ns) < 1e-3 * el_ns);
+    REQUIRE(((el_sy - er_sy) > 0.0) == ((el_ns - er_ns) > 0.0));   // same direction
+    REQUIRE(std::abs((el_sy - er_sy) - (el_ns - er_ns)) < 0.1 * std::abs(el_ns - er_ns));
+#endif
+  }
+
 } // bdft_tests
