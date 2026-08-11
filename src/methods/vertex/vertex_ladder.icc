@@ -84,8 +84,13 @@ namespace solvers {
      * THE PAIR-SPACE LADDER CORE (file header for the derivation and conventions).
      * For the bosonic nodes in nu_list, accumulate the one-rung rebuild and/or the
      * resummed ladder (rungs >= 1) into (i_nu, iq)-indexed (Nm x Nm) outputs.
-     * Replicated: every rank computes the identical D = nc^2 nk sized algebra.
-     * Outputs are ZEROED here and indexed by the POSITION in nu_list.
+     *
+     * P2 (notes/scgwt_parallel_memory_design.md): the flattened (s, iq) pairs are
+     * round-robined over (rank, nproc) -- each owner builds its K blocks ONCE (they
+     * are nu-independent) and runs all requested nu. Every (jn, iq) output cell is
+     * written by exactly one rank, so the caller's all_reduce (zeros elsewhere)
+     * reproduces the replicated result BITWISE. (rank, nproc) = (0, 1) = the
+     * replicated/toy mode. Outputs are ZEROED here, indexed by POSITION in nu_list.
      */
     inline void pair_space_ladder(nda::MemoryArrayOfRank<5> auto const &G_CC,  // (nt,ns,nk,nc,nc)
                                   nda::array<ComplexType, 4> const &Xb,        // (ns,nk,Nm,nc)
@@ -95,7 +100,8 @@ namespace solvers {
                                   vertex_pi::iaft_tools const &tools,
                                   std::vector<long> const &nu_list,
                                   nda::array<ComplexType, 4> *Pi_onerung,  // (nnu,nq,Nm,Nm) or null
-                                  nda::array<ComplexType, 4> *Pi_ladder) { // (nnu,nq,Nm,Nm) or null
+                                  nda::array<ComplexType, 4> *Pi_ladder,   // (nnu,nq,Nm,Nm) or null
+                                  long rank = 0, long nproc = 1) {
       decltype(nda::range::all) all;
       const long nt = G_CC.shape(0), ns = G_CC.shape(1), nk = G_CC.shape(2);
       const long nc = G_CC.shape(3), Nm = Xb.shape(2);
@@ -135,8 +141,10 @@ namespace solvers {
       nda::array<ComplexType, 2> XD(Dsz, Nm), KXD(Dsz, Nm), XKXD(Dsz, Nm), Zl(Dsz, Nm);
       nda::array<ComplexType, 2> Dstack_c(Dsz, Nm);
 
-      for (long is = 0; is < ns; ++is) {
-        for (long iq = 0; iq < nq; ++iq) {
+      for (long sq = rank; sq < ns * nq; sq += nproc) {
+        const long is = sq / nq;
+        const long iq = sq % nq;
+        {
           // --- d(k) and the chi0 blocks (only the requested nu rows are kept) ---------
           for (long ik = 0; ik < nk; ++ik) {
             const long ikpq = kpq(iq, ik);
@@ -350,8 +358,11 @@ namespace solvers {
     vertex_pi::iaft_tools tools(*_ft);
     std::vector<long> nu0 = {tools.nw_b / 2};   // the inu = 0 node of the full mesh
     nda::array<ComplexType, 4> Pl(1, nq, Nm, Nm);
+    auto mpi = thc.mpi();
     vertex_ladder_detail::pair_space_ladder(G_CC, _Xb_skma, _W0b_qmm.value(), kmq, kpq,
-                                            tools, nu0, nullptr, &Pl);
+                                            tools, nu0, nullptr, &Pl,
+                                            mpi->comm.rank(), mpi->comm.size());
+    mpi->comm.all_reduce_in_place_n(Pl.data(), Pl.size(), std::plus<>{});
     nda::array<ComplexType, 3> out(nq, Nm, Nm);
     out = Pl(0, all, all, all);
     return out;
@@ -452,7 +463,10 @@ namespace solvers {
     for (long m = 0; m < nw_b; ++m) nu_all[m] = m;
     nda::array<ComplexType, 4> Pi_rebuild(nw_b, nq, Nm, Nm), Pi_ladder(nw_b, nq, Nm, Nm);
     vertex_ladder_detail::pair_space_ladder(G_CC, _Xb_skma, _W0b_qmm.value(), kmq, kpq,
-                                            tools, nu_all, &Pi_rebuild, &Pi_ladder);
+                                            tools, nu_all, &Pi_rebuild, &Pi_ladder,
+                                            mpi->comm.rank(), mpi->comm.size());
+    mpi->comm.all_reduce_in_place_n(Pi_rebuild.data(), Pi_rebuild.size(), std::plus<>{});
+    mpi->comm.all_reduce_in_place_n(Pi_ladder.data(), Pi_ladder.size(), std::plus<>{});
 
     double r2 = 0.0, a2 = 0.0, l2 = 0.0, pmax = 0.0, lmax = 0.0;
     for (long m = 0; m < nw_b; ++m)
