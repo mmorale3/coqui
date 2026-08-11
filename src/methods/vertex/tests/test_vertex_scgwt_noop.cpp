@@ -207,4 +207,62 @@ namespace bdft_tests {
 #endif
   }
 
+  TEST_CASE("scgwt_ladder_l2_readout", "[methods][vertex][scgwt][ladder]") {
+#ifndef ENABLE_DLR
+    SUCCEED("scgwt_ladder_l2_readout skipped: build has ENABLE_DLR=OFF.");
+#else
+    // Increment L2 (stance i): the ladder eps_M READOUT on a pol-vertex-only run
+    // (vertex_type = "none", pol_vertex = "ladder"). Two gates:
+    //   (1) NO-PERTURBATION: the readout is report-only, so e_hf/e_corr must be
+    //       EXACTLY those of the plain scGW run (bitwise -- the loop is untouched).
+    //   (2) the readout produced finite eps_M values and the ladder moved eps_M
+    //       (the DIRECTION is gate L2-b's business, on the Si readouts; logged here).
+    auto& mpi_context = utils::make_unit_test_mpi_context();
+    imag_axes_ft::IAFT ft(1000, 6.0, imag_axes_ft::dlr_basis, "low");
+    std::string output = "coqui_scgwt_l2";
+
+    auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_lih222"));
+    thc_reader_t thc(mf, make_thc_reader_ptree(mf->nbnd() * 8, "", "incore", "", "bdft",
+                                               1e-10, mf->ecutrho(), 1, 1024));
+    auto eri = mb_eri_t(thc, thc);
+
+    auto run = [&](bool with_readout) {
+      solvers::hf_t hf;
+      solvers::gw_t gw(&ft, "ignore_g0", output);
+      solvers::scr_coulomb_t scr_eri(&ft, "rpa", "ignore_g0");
+      simple_dyson dyson(mf.get(), &ft);
+      MBState mb_state(mpi_context, ft, output);
+      iter_scf::iter_scf_t iter_sol("damping");
+      solvers::vertex_t vtx(&ft, "none", nda::range(0, 0), mf->nbnd());
+      if (with_readout) {
+        vtx.set_pol_vertex("ladder", "w0_prev", nda::range(0, 2), -1, 1e-8, -1.0,
+                           -1.0, -1.0);
+        scr_eri.set_vertex(&vtx);   // the driver's pol-only attachment (scr only)
+      }
+      auto [e_hf, e_corr] = scf_loop(mb_state, dyson, eri, ft,
+                                     solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol,
+                                     2, false, 1e-9, true);
+      auto [er, el] = scr_eri.pol_eps_readout();
+      mpi_context->comm.barrier();
+      if (mpi_context->comm.root()) remove((output + ".mbpt.h5").c_str());
+      mpi_context->comm.barrier();
+      return std::make_tuple(e_hf, e_corr, er, el);
+    };
+
+    auto [eh0, ec0, er0, el0] = run(false);
+    auto [eh1, ec1, er1, el1] = run(true);
+    app_log(1, "scgwt_ladder_l2_readout: plain e_corr = {}; with readout e_corr = {} "
+               "(D = {:.3e})", ec0, ec1, std::abs(ec1 - ec0));
+    app_log(1, "scgwt_ladder_l2_readout: eps_M(q_min) RPA = {}, +ladder = {} "
+               "(Delta = {:+.6f})", er1, el1, el1 - er1);
+    REQUIRE(eh1 == eh0);            // (1) report-only: the loop is bit-identical
+    REQUIRE(ec1 == ec0);
+    REQUIRE(er0 == -1.0);           // no readout on the plain run
+    REQUIRE(er1 > 0.0);             // (2) readout populated and finite
+    REQUIRE(el1 > 0.0);
+    REQUIRE(std::isfinite(el1));
+    REQUIRE(el1 != er1);            // the ladder moved eps_M (direction logged)
+#endif
+  }
+
 } // bdft_tests

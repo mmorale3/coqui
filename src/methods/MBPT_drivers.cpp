@@ -499,6 +499,11 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
       }
       scr_eri.set_vertex(&vertex);
       gw.set_vertex(&vertex);
+    } else if (vertex.pol_vertex_enabled()) {
+      // scGW-tilde L2: a pol-vertex-only run (vertex_type = "none") attaches the knob
+      // carrier to scr_eri so update_w can run the ladder READOUT. Never attached to
+      // gw -- Sigma stays GW-form, and has_active_vertex() stays false (no injection).
+      scr_eri.set_vertex(&vertex);
     }
 
     if (screen_type.substr(0,8)=="gw_edmft") {
@@ -872,6 +877,11 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
       }
       scr_eri.set_vertex(&vertex);
       gw.set_vertex(&vertex);
+    } else if (vertex.pol_vertex_enabled()) {
+      // scGW-tilde L2: a pol-vertex-only run (vertex_type = "none") attaches the knob
+      // carrier to scr_eri so update_w can run the ladder READOUT. Never attached to
+      // gw -- Sigma stays GW-form, and has_active_vertex() stays false (no injection).
+      scr_eri.set_vertex(&vertex);
     }
 
     MBState mb_state(ft, output, mf, projector_ksIai, band_window, kpts_crys, trans_home_cell, false);

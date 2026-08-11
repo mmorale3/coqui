@@ -1312,11 +1312,14 @@ namespace solvers {
       utils::check(_ft->basis() == imag_axes_ft::dlr_basis,
                    "pol_vertex = \"ladder\" requires the DLR IAFT backend "
                    "(iaft basis = \"dlr\").");
-      // scaffolding stop (increment C0): pair bubble / solve / injection land in L1-L3.
-      utils::check(false,
-                   "pol_vertex = \"ladder\" is scaffolding only (increment C0); the pair "
-                   "bubble, ladder solve and injection land in increments L1-L3 of "
-                   "notes/scgwt_implementation_plan.md.");
+      // LIVE since increment L2 as a READOUT (stance i): scr_coulomb_t::update_w runs
+      // the pair-space ladder on its private readout vertex and reports the
+      // ladder-corrected eps_M each iteration; the loop is untouched (nothing is
+      // injected into P -- that is increment L3, gated on ruling R1).
+      app_log(1, "  [scGW-tilde] pol_vertex = \"ladder\" READOUT active: C window = "
+                 "[{}, {}), kernel = {} (L2, stance i -- report-only; in-loop injection "
+                 "is L3/R1).", _pol_band_window.first(), _pol_band_window.last(),
+              _pol_kernel);
     }
     // scGW-tilde ladder requested in the input ([gw] pol_vertex)
     bool pol_vertex_enabled() const { return _pol_vertex != "none"; }
@@ -1326,6 +1329,23 @@ namespace solvers {
     }
     std::string pol_vertex() const { return _pol_vertex; }
     std::string pol_vertex_kernel() const { return _pol_kernel; }
+    // resolved ladder-basis knobs (scr_coulomb_t builds its private readout vertex
+    // from these -- increment L2)
+    nda::range pol_band_window() const { return _pol_band_window; }
+    long pol_isdf_rank() const { return _pol_isdf_rank; }
+    double pol_isdf_svd_tol() const { return _pol_isdf_svd_tol; }
+    double pol_isdf_thresh() const { return _pol_isdf_thresh; }
+    double pol_isdf_cond_max() const { return _pol_isdf_cond_max; }
+    double pol_isdf_distr_tol() const { return _pol_isdf_distr_tol; }
+
+    /**
+     * scGW-tilde increment L2 (vertex_ladder.icc): the resummed pair-space ladder
+     * polarization at the inu = 0 bosonic node, (nq, N_m, N_m) in THIS vertex's
+     * secondary aux basis (all rungs >= 1; the n = 1 term is the static-rung Pi^C,
+     * pinned by gate L1-b at machine precision). Requires an ACTIVE static-rung
+     * secondary vertex with W0bar built (build_w0 this iteration). Replicated.
+     */
+    nda::array<ComplexType, 3> eval_pol_ladder_nu0(MBState &mb_state, THC_ERI auto &thc);
 
     /**
      * scGW-tilde increment L1 (vertex_ladder.icc): the C-window pair bubble

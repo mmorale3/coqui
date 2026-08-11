@@ -7,7 +7,7 @@
  *
  * THE PAIR SPACE (increment L1, corrected derivation 2026-08-11). The static-rung
  * Pi^C -- the anchor object, vertex_pi::pi_c_accumulate_w phase 1 -- decomposes
- * EXACTLY (verified index-by-index against the code) as
+ * EXACTLY (verified index-by-index against the code; gate L1-b measures 3.2e-16) as
  *
  *   Pi^C_MN(q, nu) = pref sum_s sum_{k,k'} [ b23(k')^T K(k,k')^T b41(k) ]_{MN},
  *   pref = -(spin)/nk^2,
@@ -26,17 +26,17 @@
  *
  * chi0 is the particle-hole PAIR PROPAGATOR (particle line at k+q, hole line at k);
  * d collapses a pair onto the coincident external density point N; K is the
- * qx = k - k' resolved e-h rung. The rebuild above is an algebraic REARRANGEMENT of
- * the anchor's own sums, so gate L1-b demands MACHINE-precision agreement with no
- * fitted scale. (The first attempt composed the coincident pair-density bubble as
- * Pi0.K.Pi0 -- the RING topology, resid 0.28 -- an error of this gate's own first
- * implementation, not physics; the ladder lives in the pair space above.)
+ * qx = k - k' resolved e-h rung. The rebuild is an algebraic REARRANGEMENT of the
+ * anchor's own sums, so gate L1-b demands MACHINE-precision agreement with no fitted
+ * scale. (A first attempt composed the coincident pair-density bubble as Pi0.K.Pi0 --
+ * the RING topology, resid 0.28 -- an error of that gate's own first implementation,
+ * not physics; the ladder lives in the pair space above.)
  *
- * THE RESUMMATION (increment L2 core): the rung is STATIC, so every segment between
- * rungs is an independent pair bubble at the EXTERNAL nu (the internal rung frequency
- * sums decouple the fermion loops -- exactly why the anchor's phase 1 factorizes into
- * b41(nu) x b23(nu)). The geometric series therefore closes frequency-diagonally in
- * the D-dimensional pair space, per (s, q, nu):
+ * THE RESUMMATION (increment L2): the rung is STATIC, so every segment between rungs
+ * is an independent pair bubble at the EXTERNAL nu (the bosonic rung-frequency sums
+ * map bijectively onto independent fermionic segment sums -- exactly why the anchor's
+ * phase 1 factorizes into b41(nu) x b23(nu)). The geometric series therefore closes
+ * frequency-diagonally in the D-dimensional pair space, per (s, q, nu):
  *
  *   Pi_ladder = -spin * conj(D)^T (1 - Xh Kt)^{-1} Xh Kt Xh D     (all rungs >= 1),
  *   Xh = blockdiag_k( chi0(k) ) / nk,   Kt[(k'),(k)] = K(k,k')^T,
@@ -45,7 +45,8 @@
  * whose n = 1 term is the anchor. Output contract (L3): return on the CALLER's grid
  * -- the Pi grid never splits q -- and the caller does +=.
  *
- * L1 runs NOSYM, window mode (the gate fixtures); symmetry + Wannier ride with L3.
+ * L1/L2 run NOSYM, window mode (the gate fixtures + the readout); symmetry + Wannier
+ * ride with L3.
  */
 
 #include "utilities/check.hpp"
@@ -77,6 +78,177 @@ namespace solvers {
           }
         }
       return Gc;
+    }
+
+    /**
+     * THE PAIR-SPACE LADDER CORE (file header for the derivation and conventions).
+     * For the bosonic nodes in nu_list, accumulate the one-rung rebuild and/or the
+     * resummed ladder (rungs >= 1) into (i_nu, iq)-indexed (Nm x Nm) outputs.
+     * Replicated: every rank computes the identical D = nc^2 nk sized algebra.
+     * Outputs are ZEROED here and indexed by the POSITION in nu_list.
+     */
+    inline void pair_space_ladder(nda::MemoryArrayOfRank<5> auto const &G_CC,  // (nt,ns,nk,nc,nc)
+                                  nda::array<ComplexType, 4> const &Xb,        // (ns,nk,Nm,nc)
+                                  nda::array<ComplexType, 3> const &W0b,       // (nq,Nm,Nm)
+                                  nda::array<long, 2> const &kmq,
+                                  nda::array<long, 2> const &kpq,
+                                  vertex_pi::iaft_tools const &tools,
+                                  std::vector<long> const &nu_list,
+                                  nda::array<ComplexType, 4> *Pi_onerung,  // (nnu,nq,Nm,Nm) or null
+                                  nda::array<ComplexType, 4> *Pi_ladder) { // (nnu,nq,Nm,Nm) or null
+      decltype(nda::range::all) all;
+      const long nt = G_CC.shape(0), ns = G_CC.shape(1), nk = G_CC.shape(2);
+      const long nc = G_CC.shape(3), Nm = Xb.shape(2);
+      const long nq = W0b.shape(0);
+      const long nw_b = tools.nw_b;
+      const long nc2 = nc * nc, Dsz = nc2 * nk;
+      const long nnu = long(nu_list.size());
+      const double spinfac = (ns == 1) ? 2.0 : 1.0;
+      const double pref = -spinfac / double(nk * nk);
+      utils::check(kmq.shape(0) == nq and kmq.shape(1) == nk,
+                   "pair_space_ladder: kmq shape mismatch.");
+      for (auto m : nu_list)
+        utils::check(m >= 0 and m < nw_b, "pair_space_ladder: nu index {} out of range.", m);
+      if (Pi_onerung != nullptr) (*Pi_onerung)() = ComplexType(0.0);
+      if (Pi_ladder != nullptr) (*Pi_ladder)() = ComplexType(0.0);
+
+      // qx lookup: kmq(qx, k) = k'  =>  qx_of(k, k')
+      nda::array<long, 2> qx_of(nk, nk);
+      qx_of() = -1;
+      for (long iqx = 0; iqx < nq; ++iqx)
+        for (long ik = 0; ik < nk; ++ik) qx_of(ik, kmq(iqx, ik)) = iqx;
+      for (long ik = 0; ik < nk; ++ik)
+        for (long ikp = 0; ikp < nk; ++ikp)
+          utils::check(qx_of(ik, ikp) >= 0,
+                       "pair_space_ladder: transfer mesh does not connect k = {} to "
+                       "k' = {}.", ik, ikp);
+
+      nda::array<ComplexType, 3> Dmat(nk, nc2, Nm), Dcj(nk, nc2, Nm);
+      nda::array<ComplexType, 4> Cb(nk, nnu, nc2, nc2);
+      nda::array<ComplexType, 4> Kb(nk, nk, nc2, nc2);
+      nda::array<ComplexType, 2> Pf(nt, nc2 * nc2), Bf(nw_b, nc2 * nc2);
+      nda::array<ComplexType, 2> U1(Nm, nc2), U2(Nm, nc2), WU2(Nm, nc2), wb(nc2, nc2);
+      nda::array<ComplexType, 3> Y1(nk, nc2, Nm), Y2(nk, nc2, Nm);
+      nda::array<ComplexType, 2> KtY1(nc2, Nm), T2(Nm, Nm);
+      nda::matrix<ComplexType> Rm(Dsz, Dsz);
+      nda::array<ComplexType, 2> Kbig(Dsz, Dsz), XK(Dsz, Dsz);
+      nda::array<ComplexType, 2> XD(Dsz, Nm), KXD(Dsz, Nm), XKXD(Dsz, Nm), Zl(Dsz, Nm);
+      nda::array<ComplexType, 2> Dstack_c(Dsz, Nm);
+
+      for (long is = 0; is < ns; ++is) {
+        for (long iq = 0; iq < nq; ++iq) {
+          // --- d(k) and the chi0 blocks (only the requested nu rows are kept) ---------
+          for (long ik = 0; ik < nk; ++ik) {
+            const long ikpq = kpq(iq, ik);
+            for (long a = 0; a < nc; ++a)
+              for (long b = 0; b < nc; ++b)
+                for (long N = 0; N < Nm; ++N) {
+                  Dmat(ik, a * nc + b, N) =
+                      Xb(is, ik, N, a) * std::conj(Xb(is, ikpq, N, b));
+                  Dcj(ik, a * nc + b, N) = std::conj(Dmat(ik, a * nc + b, N));
+                }
+            for (long s = 0; s < nt; ++s) {
+              const long sm = tools.t_mirror(s);
+              for (long p1p = 0; p1p < nc; ++p1p)
+                for (long p3 = 0; p3 < nc; ++p3)
+                  for (long a = 0; a < nc; ++a)
+                    for (long b = 0; b < nc; ++b)
+                      Pf(s, (p1p * nc + p3) * nc2 + (a * nc + b)) =
+                          G_CC(sm, is, ik, a, p1p) * G_CC(s, is, ikpq, p3, b);
+            }
+            nda::blas::gemm(ComplexType(-1.0), tools.Twt_bb, Pf, ComplexType(0.0), Bf);
+            for (long jn = 0; jn < nnu; ++jn)
+              for (long r = 0; r < nc2; ++r)
+                for (long c = 0; c < nc2; ++c)
+                  Cb(ik, jn, r, c) = Bf(nu_list[jn], r * nc2 + c);
+          }
+          // --- the rung blocks K(k, k') (nu-independent) -------------------------------
+          for (long ik = 0; ik < nk; ++ik) {
+            const long ikpq = kpq(iq, ik);
+            for (long ikp = 0; ikp < nk; ++ikp) {
+              const long iqx = qx_of(ik, ikp);
+              const long ikppq = kpq(iq, ikp);
+              for (long p1 = 0; p1 < nc; ++p1)
+                for (long p1p = 0; p1p < nc; ++p1p)
+                  for (long P = 0; P < Nm; ++P)
+                    U1(P, p1 * nc + p1p) =
+                        Xb(is, ikp, P, p1) * std::conj(Xb(is, ik, P, p1p));
+              for (long p3 = 0; p3 < nc; ++p3)
+                for (long p3p = 0; p3p < nc; ++p3p)
+                  for (long Q = 0; Q < Nm; ++Q)
+                    U2(Q, p3 * nc + p3p) =
+                        Xb(is, ikpq, Q, p3) * std::conj(Xb(is, ikppq, Q, p3p));
+              nda::blas::gemm(W0b(iqx, all, all), U2, WU2);
+              nda::blas::gemm(nda::transpose(U1), WU2, wb);
+              // twist-pack (the anchor's to_wmat):
+              //   K_{(p1' nc + p3),(p1 nc + p3')} = wb_{(p1 nc + p1'),(p3 nc + p3')}
+              for (long p1 = 0; p1 < nc; ++p1)
+                for (long p1p = 0; p1p < nc; ++p1p)
+                  for (long p3 = 0; p3 < nc; ++p3)
+                    for (long p3p = 0; p3p < nc; ++p3p)
+                      Kb(ik, ikp, p1p * nc + p3, p1 * nc + p3p) =
+                          wb(p1 * nc + p1p, p3 * nc + p3p);
+            }
+          }
+          // --- Kt[(k'),(k)] = K(k,k')^T and conj(D) stack (nu-independent) -------------
+          for (long ikp = 0; ikp < nk; ++ikp)
+            for (long ik = 0; ik < nk; ++ik)
+              for (long r = 0; r < nc2; ++r)
+                for (long c = 0; c < nc2; ++c)
+                  Kbig(ikp * nc2 + r, ik * nc2 + c) = Kb(ik, ikp, c, r);
+          for (long ik = 0; ik < nk; ++ik)
+            for (long r = 0; r < nc2; ++r) Dstack_c(ik * nc2 + r, all) = Dcj(ik, r, all);
+
+          // --- per requested nu: one-rung rebuild + resummation ------------------------
+          for (long jn = 0; jn < nnu; ++jn) {
+            if (Pi_onerung != nullptr) {
+              for (long ik = 0; ik < nk; ++ik) {
+                nda::blas::gemm(Cb(ik, jn, all, all), Dmat(ik, all, all),
+                                Y1(ik, all, all));
+                nda::blas::gemm(nda::transpose(Cb(ik, jn, all, all)), Dcj(ik, all, all),
+                                Y2(ik, all, all));
+              }
+              auto Pr = (*Pi_onerung)(jn, iq, all, all);
+              for (long ik = 0; ik < nk; ++ik)
+                for (long ikp = 0; ikp < nk; ++ikp) {
+                  nda::blas::gemm(nda::transpose(Kb(ik, ikp, all, all)),
+                                  Y1(ik, all, all), KtY1);
+                  nda::blas::gemm(ComplexType(pref), nda::transpose(Y2(ikp, all, all)),
+                                  KtY1, ComplexType(0.0), T2);
+                  Pr += T2;
+                }
+            }
+            if (Pi_ladder == nullptr) continue;
+            // Pi_ladder = -spin conj(D)^T (1 - Xh Kt)^{-1} Xh Kt Xh D
+            for (long ikp = 0; ikp < nk; ++ikp) {
+              auto Krows = Kbig(nda::range(ikp * nc2, (ikp + 1) * nc2), all);
+              auto Xrows = XK(nda::range(ikp * nc2, (ikp + 1) * nc2), all);
+              nda::blas::gemm(ComplexType(1.0 / nk), Cb(ikp, jn, all, all), Krows,
+                              ComplexType(0.0), Xrows);
+            }
+            for (long ik = 0; ik < nk; ++ik) {
+              auto Drows = XD(nda::range(ik * nc2, (ik + 1) * nc2), all);
+              nda::blas::gemm(ComplexType(1.0 / nk), Cb(ik, jn, all, all),
+                              Dmat(ik, all, all), ComplexType(0.0), Drows);
+            }
+            nda::blas::gemm(Kbig, XD, KXD);
+            for (long ikp = 0; ikp < nk; ++ikp) {
+              auto Kr = KXD(nda::range(ikp * nc2, (ikp + 1) * nc2), all);
+              auto Xr = XKXD(nda::range(ikp * nc2, (ikp + 1) * nc2), all);
+              nda::blas::gemm(ComplexType(1.0 / nk), Cb(ikp, jn, all, all), Kr,
+                              ComplexType(0.0), Xr);
+            }
+            Rm() = ComplexType(0.0);
+            Rm() -= XK;
+            for (long i = 0; i < Dsz; ++i) Rm(i, i) += ComplexType(1.0);
+            nda::inverse_in_place(Rm);
+            nda::blas::gemm(Rm, XKXD, Zl);
+            auto Pl = (*Pi_ladder)(jn, iq, all, all);
+            nda::blas::gemm(ComplexType(-spinfac), nda::transpose(Dstack_c), Zl,
+                            ComplexType(1.0), Pl);
+          }
+        }
+      }
     }
 
   } // vertex_ladder_detail
@@ -139,14 +311,60 @@ namespace solvers {
   }
 
   /**
+   * L2: the resummed pair-space ladder at inu = 0, (nq, N_m, N_m) in THIS vertex's
+   * secondary aux basis (all rungs >= 1). See the file header; the n = 1 term is the
+   * static-rung Pi^C, pinned by gate L1-b. Requires build_w0 to have run this
+   * iteration (W0bar present). Replicated.
+   */
+  nda::array<ComplexType, 3> vertex_t::eval_pol_ladder_nu0(MBState &mb_state,
+                                                           THC_ERI auto &thc) {
+    decltype(nda::range::all) all;
+    utils::check(active() and secondary(),
+                 "vertex_t::eval_pol_ladder_nu0: requires an ACTIVE secondary-basis "
+                 "vertex (the readout instance).");
+    utils::check(not _wannier, "vertex_t::eval_pol_ladder_nu0: window mode only at L2.");
+    utils::check(_W0b_qmm.has_value(),
+                 "vertex_t::eval_pol_ladder_nu0: W0bar is absent -- build_w0 must run "
+                 "first (same iteration).");
+    auto MF = thc.MF();
+    utils::check(MF->nkpts() == MF->nkpts_ibz(),
+                 "vertex_t::eval_pol_ladder_nu0: symmetry-free meshes only at L2.");
+    utils::check(mb_state.sG_tskij.has_value(),
+                 "vertex_t::eval_pol_ladder_nu0: mb_state carries no G.");
+    ensure_secondary_basis(mb_state, thc);
+
+    auto G_tskij = mb_state.sG_tskij.value().local();
+    const long nt = G_tskij.shape(0), ns = G_tskij.shape(1), nk = G_tskij.shape(2);
+    const long nc = subspace_rank(), Nm = _Xb_skma.shape(2);
+    const long nq = MF->nqpts_ibz();
+    nda::array<ComplexType, 5> G_CC(nt, ns, nk, nc, nc);
+    G_CC = G_tskij(all, all, all, _band_window, _band_window);
+    nda::array<long, 2> kmq(nq, nk), kpq(nq, nk);
+    auto qmin = MF->qminus();
+    for (long iq = 0; iq < nq; ++iq)
+      for (long ik = 0; ik < nk; ++ik) {
+        kmq(iq, ik) = MF->qk_to_k2(iq, ik);
+        kpq(iq, ik) = MF->qk_to_k2(qmin(iq), ik);
+      }
+
+    vertex_pi::iaft_tools tools(*_ft);
+    std::vector<long> nu0 = {tools.nw_b / 2};   // the inu = 0 node of the full mesh
+    nda::array<ComplexType, 4> Pl(1, nq, Nm, Nm);
+    vertex_ladder_detail::pair_space_ladder(G_CC, _Xb_skma, _W0b_qmm.value(), kmq, kpq,
+                                            tools, nu0, nullptr, &Pl);
+    nda::array<ComplexType, 3> out(nq, Nm, Nm);
+    out = Pl(0, all, all, all);
+    return out;
+  }
+
+  /**
    * The L1 gate harness (notes/scgwt_implementation_plan.md; file header for the
    * derivation):
    *
    *  L1-a  C-window RPA consistency: upfold(Pi-bar^0) = t^dag Pi-bar^0 t against the
    *        SAME Hadamard bubble built in the GLOBAL aux basis from the C-masked G --
    *        eta-class agreement (the secondary representation error).
-   *  L1-b  THE BIT-ANCHOR: the pair-space one-rung rebuild
-   *        pref sum_{k,k'} b23(k')^T K(k,k')^T b41(k) against the implemented
+   *  L1-b  THE BIT-ANCHOR: the pair-space one-rung rebuild against the implemented
    *        static-rung Pi^C (pi_c_accumulate_w phase 1). An algebraic rearrangement
    *        of identical sums: MACHINE precision, no fitted scale.
    *  L2 preview: the resummed ladder (all rungs >= 1) in the same pair space;
@@ -229,155 +447,13 @@ namespace solvers {
                                  false, nullptr, nullptr);
     mpi->comm.all_reduce_in_place_n(PiC.data(), PiC.size(), std::plus<>{});
 
-    // ---- L1-b: the EXACT pair-space rebuild + the resummed ladder ----------------------
-    // (file header for the derivation; replicated -- every rank computes the identical
-    //  D = nc^2 nk sized algebra, gate scale only)
-    const long nc2 = nc * nc, Dsz = nc2 * nk;
-    auto const &W0b = _W0b_qmm.value();
-    auto const &Xb = _Xb_skma;
-    const double spinfac = (ns == 1) ? 2.0 : 1.0;
-    const double pref = -spinfac / double(nk * nk);
+    // ---- L1-b + L2 preview: the pair-space core over the FULL bosonic grid -------------
+    std::vector<long> nu_all(nw_b);
+    for (long m = 0; m < nw_b; ++m) nu_all[m] = m;
+    nda::array<ComplexType, 4> Pi_rebuild(nw_b, nq, Nm, Nm), Pi_ladder(nw_b, nq, Nm, Nm);
+    vertex_ladder_detail::pair_space_ladder(G_CC, _Xb_skma, _W0b_qmm.value(), kmq, kpq,
+                                            tools, nu_all, &Pi_rebuild, &Pi_ladder);
 
-    // qx lookup: kmq(qx, k) = k'  =>  qx_of(k, k')
-    nda::array<long, 2> qx_of(nk, nk);
-    qx_of() = -1;
-    for (long iqx = 0; iqx < nq; ++iqx)
-      for (long ik = 0; ik < nk; ++ik) qx_of(ik, kmq(iqx, ik)) = iqx;
-    for (long ik = 0; ik < nk; ++ik)
-      for (long ikp = 0; ikp < nk; ++ikp)
-        utils::check(qx_of(ik, ikp) >= 0,
-                     "vertex_t::ladder_l1_gates: transfer mesh does not connect k = {} "
-                     "to k' = {}.", ik, ikp);
-
-    nda::array<ComplexType, 4> Pi_rebuild(nw_b, nq, Nm, Nm);
-    nda::array<ComplexType, 4> Pi_ladder(nw_b, nq, Nm, Nm);
-    Pi_rebuild() = ComplexType(0.0);
-    Pi_ladder() = ComplexType(0.0);
-
-    nda::array<ComplexType, 3> Dmat(nk, nc2, Nm), Dcj(nk, nc2, Nm);
-    nda::array<ComplexType, 4> Cb(nk, nw_b, nc2, nc2);
-    nda::array<ComplexType, 4> Kb(nk, nk, nc2, nc2);
-    nda::array<ComplexType, 2> Pf(nt, nc2 * nc2), Bf(nw_b, nc2 * nc2);
-    nda::array<ComplexType, 2> U1(Nm, nc2), U2(Nm, nc2), WU2(Nm, nc2), wb(nc2, nc2);
-    nda::array<ComplexType, 3> Y1(nk, nc2, Nm), Y2(nk, nc2, Nm);
-    nda::array<ComplexType, 2> KtY1(nc2, Nm), T2(Nm, Nm);
-    nda::matrix<ComplexType> Rm(Dsz, Dsz);
-    nda::array<ComplexType, 2> Kbig(Dsz, Dsz), XK(Dsz, Dsz);
-    nda::array<ComplexType, 2> XD(Dsz, Nm), KXD(Dsz, Nm), XKXD(Dsz, Nm), Zl(Dsz, Nm);
-    nda::array<ComplexType, 2> Dstack_c(Dsz, Nm);
-
-    for (long is = 0; is < ns; ++is) {
-      for (long iq = 0; iq < nq; ++iq) {
-        // --- d(k) and the chi0 blocks --------------------------------------------------
-        for (long ik = 0; ik < nk; ++ik) {
-          const long ikpq = kpq(iq, ik);
-          for (long a = 0; a < nc; ++a)
-            for (long b = 0; b < nc; ++b)
-              for (long N = 0; N < Nm; ++N) {
-                Dmat(ik, a * nc + b, N) =
-                    Xb(is, ik, N, a) * std::conj(Xb(is, ikpq, N, b));
-                Dcj(ik, a * nc + b, N) = std::conj(Dmat(ik, a * nc + b, N));
-              }
-          for (long s = 0; s < nt; ++s) {
-            const long sm = tools.t_mirror(s);
-            for (long p1p = 0; p1p < nc; ++p1p)
-              for (long p3 = 0; p3 < nc; ++p3)
-                for (long a = 0; a < nc; ++a)
-                  for (long b = 0; b < nc; ++b)
-                    Pf(s, (p1p * nc + p3) * nc2 + (a * nc + b)) =
-                        G_CC(sm, is, ik, a, p1p) * G_CC(s, is, ikpq, p3, b);
-          }
-          nda::blas::gemm(ComplexType(-1.0), tools.Twt_bb, Pf, ComplexType(0.0), Bf);
-          for (long m = 0; m < nw_b; ++m)
-            for (long r = 0; r < nc2; ++r)
-              for (long c = 0; c < nc2; ++c) Cb(ik, m, r, c) = Bf(m, r * nc2 + c);
-        }
-        // --- the rung blocks K(k, k') (nu-independent) ---------------------------------
-        for (long ik = 0; ik < nk; ++ik) {
-          const long ikpq = kpq(iq, ik);
-          for (long ikp = 0; ikp < nk; ++ikp) {
-            const long iqx = qx_of(ik, ikp);
-            const long ikppq = kpq(iq, ikp);
-            for (long p1 = 0; p1 < nc; ++p1)
-              for (long p1p = 0; p1p < nc; ++p1p)
-                for (long P = 0; P < Nm; ++P)
-                  U1(P, p1 * nc + p1p) =
-                      Xb(is, ikp, P, p1) * std::conj(Xb(is, ik, P, p1p));
-            for (long p3 = 0; p3 < nc; ++p3)
-              for (long p3p = 0; p3p < nc; ++p3p)
-                for (long Q = 0; Q < Nm; ++Q)
-                  U2(Q, p3 * nc + p3p) =
-                      Xb(is, ikpq, Q, p3) * std::conj(Xb(is, ikppq, Q, p3p));
-            nda::blas::gemm(W0b(iqx, all, all), U2, WU2);
-            nda::blas::gemm(nda::transpose(U1), WU2, wb);
-            // twist-pack (the anchor's to_wmat):
-            //   K_{(p1' nc + p3),(p1 nc + p3')} = wb_{(p1 nc + p1'),(p3 nc + p3')}
-            for (long p1 = 0; p1 < nc; ++p1)
-              for (long p1p = 0; p1p < nc; ++p1p)
-                for (long p3 = 0; p3 < nc; ++p3)
-                  for (long p3p = 0; p3p < nc; ++p3p)
-                    Kb(ik, ikp, p1p * nc + p3, p1 * nc + p3p) =
-                        wb(p1 * nc + p1p, p3 * nc + p3p);
-          }
-        }
-        // --- Kt[(k'),(k)] = K(k,k')^T and conj(D) stack (nu-independent) ---------------
-        for (long ikp = 0; ikp < nk; ++ikp)
-          for (long ik = 0; ik < nk; ++ik)
-            for (long r = 0; r < nc2; ++r)
-              for (long c = 0; c < nc2; ++c)
-                Kbig(ikp * nc2 + r, ik * nc2 + c) = Kb(ik, ikp, c, r);
-        for (long ik = 0; ik < nk; ++ik)
-          for (long r = 0; r < nc2; ++r) Dstack_c(ik * nc2 + r, all) = Dcj(ik, r, all);
-
-        // --- per-nu: one-rung rebuild + resummation ------------------------------------
-        for (long m = 0; m < nw_b; ++m) {
-          for (long ik = 0; ik < nk; ++ik) {
-            nda::blas::gemm(Cb(ik, m, all, all), Dmat(ik, all, all), Y1(ik, all, all));
-            nda::blas::gemm(nda::transpose(Cb(ik, m, all, all)), Dcj(ik, all, all),
-                            Y2(ik, all, all));
-          }
-          auto Pr = Pi_rebuild(m, iq, all, all);
-          for (long ik = 0; ik < nk; ++ik)
-            for (long ikp = 0; ikp < nk; ++ikp) {
-              nda::blas::gemm(nda::transpose(Kb(ik, ikp, all, all)), Y1(ik, all, all),
-                              KtY1);
-              nda::blas::gemm(ComplexType(pref), nda::transpose(Y2(ikp, all, all)), KtY1,
-                              ComplexType(0.0), T2);
-              Pr += T2;
-            }
-          // resummation: Pi_ladder = -spin conj(D)^T (1 - Xh Kt)^{-1} Xh Kt Xh D
-          // Xh Kt: block row k' = (Cb(k')/nk) . Kbig(k'-rows, :)
-          for (long ikp = 0; ikp < nk; ++ikp) {
-            auto Krows = Kbig(nda::range(ikp * nc2, (ikp + 1) * nc2), all);
-            auto Xrows = XK(nda::range(ikp * nc2, (ikp + 1) * nc2), all);
-            nda::blas::gemm(ComplexType(1.0 / nk), Cb(ikp, m, all, all), Krows,
-                            ComplexType(0.0), Xrows);
-          }
-          for (long ik = 0; ik < nk; ++ik) {
-            auto Drows = XD(nda::range(ik * nc2, (ik + 1) * nc2), all);
-            nda::blas::gemm(ComplexType(1.0 / nk), Cb(ik, m, all, all),
-                            Dmat(ik, all, all), ComplexType(0.0), Drows);
-          }
-          nda::blas::gemm(Kbig, XD, KXD);
-          for (long ikp = 0; ikp < nk; ++ikp) {
-            auto Kr = KXD(nda::range(ikp * nc2, (ikp + 1) * nc2), all);
-            auto Xr = XKXD(nda::range(ikp * nc2, (ikp + 1) * nc2), all);
-            nda::blas::gemm(ComplexType(1.0 / nk), Cb(ikp, m, all, all), Kr,
-                            ComplexType(0.0), Xr);
-          }
-          Rm() = ComplexType(0.0);
-          Rm() -= XK;
-          for (long i = 0; i < Dsz; ++i) Rm(i, i) += ComplexType(1.0);
-          nda::inverse_in_place(Rm);
-          nda::blas::gemm(Rm, XKXD, Zl);
-          auto Pl = Pi_ladder(m, iq, all, all);
-          nda::blas::gemm(ComplexType(-spinfac), nda::transpose(Dstack_c), Zl,
-                          ComplexType(1.0), Pl);
-        }
-      }
-    }
-
-    // ---- gates ------------------------------------------------------------------------
     double r2 = 0.0, a2 = 0.0, l2 = 0.0, pmax = 0.0, lmax = 0.0;
     for (long m = 0; m < nw_b; ++m)
       for (long iq = 0; iq < nq; ++iq)

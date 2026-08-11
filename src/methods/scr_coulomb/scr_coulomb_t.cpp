@@ -164,6 +164,19 @@ namespace solvers {
     }
     auto dPi_tqPQ = eval_Pi_qdep(mb_state, thc);
 
+    // scGW-tilde L2 (pol_vertex = "ladder", READOUT-ONLY): before the Dyson consumes
+    // dPi, (a) build the private readout vertex's W0bar (the ladder kernel; build_w0
+    // only READS dPi) and (b) keep a replicated copy of the inu = 0 Pi row for the
+    // eps-Dyson report below. Nothing here touches the loop's own W.
+    const bool pol_readout = (_vertex != nullptr and _vertex->pol_vertex_active()
+                              and not _vertex->active());
+    nda::array<ComplexType, 3> Pi0_qPQ;
+    if (pol_readout) {
+      ensure_pol_vertex(thc);
+      _pol_vtx->build_w0(mb_state, thc, dPi_tqPQ);
+      Pi0_qPQ = gather_nu0_row(dPi_tqPQ);
+    }
+
     // evaluate screened interaction (dW_tqPQ) and reset polarizability (dPi_tqPQ)
     // a) dPi_tqPQ is reset during dyson_W_from_Pi_tau()
     // b) pgrid and bsize of dW_tqPQ are forced to be the same as in dPi_tqPQ
@@ -202,6 +215,9 @@ namespace solvers {
                  "    epsilon_inf = {:.6f}   [eps^-1_head(inu=0) = {:.6e} {:+.6e}i]\n",
               eps_inf, eps_inv_static.real(), eps_inv_static.imag());
     }
+
+    // scGW-tilde L2: the ladder eps_M readout (report-only; see pol_ladder_eps_readout)
+    if (pol_readout) pol_ladder_eps_readout(mb_state, thc, Pi0_qPQ);
 
     // make routine to transposed distributed arrays over any 2 indices, so should
     // be easy to template to an array type and to indexes, and replace repeated code
@@ -297,6 +313,163 @@ namespace solvers {
     auto Et_2D = nda::reshape(Et, shape_t<2>{Et.shape(0), 1});
     _ft->w_to_tau_PHsym(Ew, Et_2D);
     return Et;
+  }
+
+  // ---- scGW-tilde L2 helpers (pol_vertex = "ladder" readout; stance i) ---------------
+
+  void scr_coulomb_t::ensure_pol_vertex(THC_ERI auto &thc) {
+    if (_pol_vtx) return;
+    utils::check(_vertex != nullptr, "ensure_pol_vertex: no knob carrier attached.");
+    auto w = _vertex->pol_band_window();
+    _pol_vtx = std::make_shared<vertex_t>(
+        _ft, "2nd_exchange", w, thc.MF()->nbnd(), _div_treatment, "secondary",
+        _vertex->pol_isdf_rank(), _vertex->pol_isdf_svd_tol(),
+        _vertex->pol_isdf_thresh(), _vertex->pol_isdf_cond_max(), "static");
+    _pol_vtx->set_isdf_distr_tol(_vertex->pol_isdf_distr_tol());
+    app_log(1, "  [scGW-tilde L2] ladder readout instance: C window = [{}, {}), "
+               "secondary rank knob = {}, div_treatment = {} (kernel head follows "
+               "build_w0's policy; W0bar is SAME-iteration -- coincides with "
+               "pol_vertex_kernel = \"w0_prev\" at a fixed point, R4 note).",
+            w.first(), w.last(), _vertex->pol_isdf_rank(), _div_treatment);
+  }
+
+  template<nda::MemoryArrayOfRank<4> Array_t, typename communicator_t>
+  nda::array<ComplexType, 3>
+  scr_coulomb_t::gather_nu0_row(memory::darray_t<Array_t, communicator_t> &dPi_tqPQ) {
+    auto [nt_h, nq, Np, Nq2] = dPi_tqPQ.global_shape();
+    auto R = solvers::vertex_w0_detail::nu0_transform_row(*_ft);
+    utils::check(R.shape(0) == nt_h,
+                 "gather_nu0_row: PH-sym tau half grid mismatch ({} vs {}).",
+                 R.shape(0), nt_h);
+    auto t_rng = dPi_tqPQ.local_range(0);
+    auto q_rng = dPi_tqPQ.local_range(1);
+    auto P_rng = dPi_tqPQ.local_range(2);
+    auto Q_rng = dPi_tqPQ.local_range(3);
+    auto Pi_loc = dPi_tqPQ.local();
+    nda::array<ComplexType, 3> out(nq, Np, Nq2);
+    out() = ComplexType(0.0);
+    for (long it = 0; it < long(t_rng.size()); ++it) {
+      const ComplexType r = R(t_rng.first() + it);
+      for (long iq = 0; iq < long(q_rng.size()); ++iq)
+        for (long iP = 0; iP < long(P_rng.size()); ++iP)
+          for (long iQ = 0; iQ < long(Q_rng.size()); ++iQ)
+            out(q_rng.first() + iq, P_rng.first() + iP, Q_rng.first() + iQ) +=
+                r * Pi_loc(it, iq, iP, iQ);
+    }
+    dPi_tqPQ.communicator()->all_reduce_in_place_n(out.data(), out.size(), std::plus<>{});
+    return out;
+  }
+
+  /**
+   * scGW-tilde L2, the ladder eps_M readout (stance i -- report-only, PDF section 4.2
+   * placement (i)): per q at inu = 0,
+   *   dP_ladder(q) = t(q)^dag Pi_ladder(q) t(q)          (upfold, adjoint-t/no-leak),
+   *   dW[P](q)     = ([I - Z(q) P(q)]^{-1} - I) Z(q)     (single-frequency THC Dyson),
+   *   eps^-1(q)-1  = (q^2 V / 4 pi) chi_bar(q) . dW(q) . chi_bar(q)*   (div_utils
+   *                  eval_eps_inv_q convention),
+   * evaluated for P = Pi0_RPA and P = Pi0_RPA + dP_ladder; eps_M(q) = 1/(1 + Re[.])
+   * reported at the smallest nonzero |q| (gate L2-b measures the DIRECTION of the
+   * ladder correction). Replicated Np x Np algebra: readout-scale only.
+   */
+  void scr_coulomb_t::pol_ladder_eps_readout(MBState &mb_state, THC_ERI auto &thc,
+                                             nda::array<ComplexType, 3> const &Pi0_qPQ) {
+    decltype(nda::range::all) all;
+    auto MF = thc.MF();
+    const long nq = Pi0_qPQ.shape(0), Np = Pi0_qPQ.shape(1);
+    if (MF->nqpts_ibz() == 1) {
+      app_log(1, "  [scGW-tilde L2] ladder readout skipped: nqpts_ibz == 1 (no finite "
+                 "q for the eps_M head).");
+      return;
+    }
+
+    // the ladder at inu = 0 in the readout vertex's secondary basis + upfold
+    auto Pl_qmm = _pol_vtx->eval_pol_ladder_nu0(mb_state, thc);   // (nq, Nm, Nm)
+    auto const &tmap = _pol_vtx->secondary_transfer();            // (nq, Nm, Np)
+    const long Nm = Pl_qmm.shape(1);
+    utils::check(tmap.shape(0) == nq and tmap.shape(1) == Nm and tmap.shape(2) == Np,
+                 "pol_ladder_eps_readout: transfer map shape mismatch.");
+
+    // replicated Z(q, P, Q) (same gather pattern as gather_nu0_row)
+    nda::array<ComplexType, 3> Z_qPQ(nq, Np, Np);
+    {
+      const long np_ranks = thc.mpi()->comm.size();
+      std::array<long, 3> zp = {1, 1, 1};
+      zp[1] = utils::find_proc_grid_min_diff(np_ranks, Np, Np);
+      zp[2] = np_ranks / zp[1];
+      std::array<long, 3> zb = {1, 1, 1};
+      zb[1] = std::min({static_cast<long>(1024), std::max(1l, Np / zp[1]),
+                        std::max(1l, Np / zp[2])});
+      zb[2] = zb[1];
+      auto dZ = thc.dZ(zp, zb);
+      auto q_rng = dZ.local_range(0);
+      auto P_rng = dZ.local_range(1);
+      auto Q_rng = dZ.local_range(2);
+      auto Z_loc = dZ.local();
+      Z_qPQ() = ComplexType(0.0);
+      for (long iq = 0; iq < long(q_rng.size()); ++iq)
+        for (long iP = 0; iP < long(P_rng.size()); ++iP)
+          for (long iQ = 0; iQ < long(Q_rng.size()); ++iQ)
+            Z_qPQ(q_rng.first() + iq, P_rng.first() + iP, Q_rng.first() + iQ) =
+                Z_loc(iq, iP, iQ);
+      thc.mpi()->comm.all_reduce_in_place_n(Z_qPQ.data(), Z_qPQ.size(), std::plus<>{});
+    }
+
+    // per q: upfold, two single-frequency Dysons, the chi_bar head contraction
+    auto Chi_bar = thc.basis_bar_head();                          // (nq, Np)
+    const double fpi = 4.0 * 3.14159265358979323846;
+    nda::array<ComplexType, 2> dP(Np, Np), tmpM(Nm, Np), A(Np, Np);
+    nda::matrix<ComplexType> Am(Np, Np);
+    nda::array<ComplexType, 1> chi_c(Np), buf(Np);
+    double eps_rpa_qmin = -1.0, eps_lad_qmin = -1.0, qmin_abs2 = 1e300;
+    long iq_min = -1;
+    for (long iq = 0; iq < nq; ++iq) {
+      auto qpts = MF->Qpts_ibz(iq);
+      const double q_abs2 = qpts(0) * qpts(0) + qpts(1) * qpts(1) + qpts(2) * qpts(2);
+      if (q_abs2 < 1e-12) continue;                               // Gamma: no head here
+      // upfold: dP = t^dag Pl t
+      auto tq = tmap(iq, all, all);
+      nda::blas::gemm(Pl_qmm(iq, all, all), tq, tmpM);            // Pl . t   (Nm x Np)
+      nda::array<ComplexType, 2> td(Np, Nm);
+      for (long m = 0; m < Nm; ++m)
+        for (long P = 0; P < Np; ++P) td(P, m) = std::conj(tq(m, P));
+      nda::blas::gemm(td, tmpM, dP);                              // t^dag Pl t
+      const double factor = (q_abs2 / fpi) * MF->volume();
+      chi_c = nda::conj(Chi_bar(iq, all));
+      auto eps_of = [&](bool with_ladder) {
+        // A = I - Z (P0 [+ dP]);  dW = (A^{-1} - I) Z;  head contraction
+        A() = Pi0_qPQ(iq, all, all);
+        if (with_ladder) A += dP;
+        nda::array<ComplexType, 2> ZP(Np, Np);
+        nda::blas::gemm(Z_qPQ(iq, all, all), A, ZP);
+        Am() = ZP;
+        Am() *= ComplexType(-1.0);
+        for (long P = 0; P < Np; ++P) Am(P, P) += ComplexType(1.0);
+        nda::inverse_in_place(Am);
+        for (long P = 0; P < Np; ++P) Am(P, P) -= ComplexType(1.0);
+        nda::blas::gemm(Am, Z_qPQ(iq, all, all), ZP);
+        nda::blas::gemv(ZP, chi_c, buf);
+        const ComplexType eih = factor * nda::blas::dot(Chi_bar(iq, all), buf);
+        return 1.0 / (1.0 + eih.real());
+      };
+      const double e_rpa = eps_of(false);
+      const double e_lad = eps_of(true);
+      app_log(2, "  [scGW-tilde L2]   q {} (|q|^2 = {:.4e}): eps_M RPA = {:.6f}, "
+                 "+ladder = {:.6f}", iq, q_abs2, e_rpa, e_lad);
+      if (q_abs2 < qmin_abs2) {
+        qmin_abs2 = q_abs2;
+        eps_rpa_qmin = e_rpa;
+        eps_lad_qmin = e_lad;
+        iq_min = iq;
+      }
+    }
+    if (iq_min >= 0) {
+      app_log(1, "  [scGW-tilde L2] ladder eps_M readout (inu = 0, q_min = {}): "
+                 "RPA = {:.6f}, +ladder = {:.6f} (Delta = {:+.6f}; gate L2-b watches "
+                 "the DIRECTION)", iq_min, eps_rpa_qmin, eps_lad_qmin,
+              eps_lad_qmin - eps_rpa_qmin);
+      _pol_eps_rpa = eps_rpa_qmin;
+      _pol_eps_ladder = eps_lad_qmin;
+    }
   }
 
   template<bool w_out, nda::MemoryArrayOfRank<4> local_Array_t, typename communicator_t>

@@ -271,6 +271,34 @@ namespace solvers {
     // nullptr or an inactive vertex leaves the RPA polarizability untouched.
     vertex_t* _vertex = nullptr;
 
+    // scGW-tilde L2 (pol_vertex = "ladder", READOUT-ONLY -- stance i of the proposal):
+    // a PRIVATE static-rung secondary vertex built from the pol_* knobs of _vertex,
+    // used only to build W0bar + the pair-space ladder for the eps_M report. It is
+    // never attached to the Sigma side and nothing is injected into P (that is
+    // increment L3, gated on ruling R1). shared_ptr: vertex_t is fwd-declared here.
+    std::shared_ptr<vertex_t> _pol_vtx;
+    // lazily construct _pol_vtx from _vertex's pol_* knobs
+    void ensure_pol_vertex(THC_ERI auto &thc);
+    // replicated (nq, Np, Np) copy of the inu = 0 row of the RPA Pi (PH-sym tau axis
+    // contracted with vertex_w0_detail::nu0_transform_row) -- the eps-Dyson input.
+    // Np^2-per-q replicated: readout-scale only (documented memory note).
+    template<nda::MemoryArrayOfRank<4> Array_t, typename communicator_t>
+    nda::array<ComplexType, 3> gather_nu0_row(memory::darray_t<Array_t, communicator_t> &dPi_tqPQ);
+    // the L2 readout: ladder at nu = 0, upfold via the readout vertex's t(q), redo the
+    // single-frequency Dyson with P0 and P0 + dP_ladder, report eps_M(q) both ways.
+    void pol_ladder_eps_readout(MBState &mb_state, THC_ERI auto &thc,
+                                nda::array<ComplexType, 3> const &Pi0_qPQ);
+    // last readout values at q_min (RPA, +ladder); -1 before the first readout
+    double _pol_eps_rpa = -1.0, _pol_eps_ladder = -1.0;
+
+  public:
+    // scGW-tilde L2: the last ladder eps_M readout (RPA, +ladder) at q_min
+    std::pair<double, double> pol_eps_readout() const {
+      return {_pol_eps_rpa, _pol_eps_ladder};
+    }
+
+  private:
+
     // optional container for screened interaction
     // TODO Remove these
     std::optional<memory::darray_t<nda::array<ComplexType, 4>, mpi3::communicator> > _dW_qtPQ_opt;
