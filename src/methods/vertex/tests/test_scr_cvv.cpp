@@ -766,6 +766,25 @@ namespace bdft_tests {
     REQUIRE(err_herm < 1e-10);
     REQUIRE(err_wdep == 0.0);
 
+    // P1 compaction control: an aggressive tolerance genuinely drops shells; the
+    // COMPACTED store (kept |R| shells only -- inversion-symmetric sets) still gives
+    // the structural 2^3 TRIM zero and a smaller footprint.
+    {
+      solvers::cvv_head_t cvvc(&ft, 0.9);
+      cvvc.build(*mf, dyson.H0(), mb_state.sF_skij.value().local(),
+                 mb_state.sSigma_tskij.value().local());
+      app_log(1, "cvv_build_lih222: P1 aggressive tol 0.9 -> nR_kept = {} / {}",
+              cvvc.nR_kept(), cvvc.nR());
+      REQUIRE(cvvc.nR_kept() >= 1);
+      REQUIRE(cvvc.nR_kept() < cvvc.nR());
+      auto vc = cvvc.velocity(0, 0);
+      double vmaxc = 0.0;
+      nda::for_each(vc.shape(),
+                    [&](auto... i) { vmaxc = std::max(vmaxc, std::abs(vc(i...))); });
+      REQUIRE(std::isfinite(vmaxc));
+      REQUIRE(vmaxc < 1e-10);   // the TRIM zero survives compaction
+    }
+
     // C3 smoke: the cvv_eps pproc target end-to-end on the checkpoint this scf just
     // wrote (load F/Sigma/mu -> Dyson G -> CVV head -> eps_inf + h5 output). On the
     // 2^3 mesh the TRIM zero forces Pi^jj == 0, so eps_inf == 1 EXACTLY -- the

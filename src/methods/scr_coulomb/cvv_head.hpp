@@ -260,83 +260,161 @@ namespace solvers {
       _kpts.resize(nk, 3);
       _kpts() = mf.kpts();
 
-      // node-shared stores (ground rule 4): static h(R) and Sigma(R, iw)
-      _shstat = sArray_t<nda::array_view<ComplexType, 4>>(
-          math::shm::make_shared_array<nda::array_view<ComplexType, 4>>(
-              *ctx, {ns, _nR, nb, nb}));
-      _shstat.value().set_zero();
+      // ---- P1 (notes/scgwt_parallel_memory_design.md): FULL-n_R node-shared STAGING;
+      // the two flop-heavy loops (k -> R gemms, tau -> iw) round-robin over NODE ranks
+      // between window fences (the unfold_bz write pattern); the shell decision is the
+      // pre-P1 math verbatim (measured on the omega staging); the FINAL stores are
+      // COMPACTED to the kept shells only. Every node computes identical content.
+      auto s_stat_stage = math::shm::make_shared_array<nda::array_view<ComplexType, 4>>(
+          *ctx, {ns, _nR, nb, nb});
+      s_stat_stage.set_zero();
+      using s5_t = sArray_t<nda::array_view<ComplexType, 5>>;
+      std::optional<s5_t> s_sigt_stage, s_sigw_stage;
       if (has_sigma) {
-        _ssig = sArray_t<nda::array_view<ComplexType, 5>>(
-            math::shm::make_shared_array<nda::array_view<ComplexType, 5>>(
-                *ctx, {ns, _nR, _nw, nb, nb}));
-        _ssig.value().set_zero();
-      } else {
-        _ssig.reset();
+        s_sigt_stage = math::shm::make_shared_array<nda::array_view<ComplexType, 5>>(
+            *ctx, {ns, _nR, nt, nb, nb});
+        s_sigw_stage = math::shm::make_shared_array<nda::array_view<ComplexType, 5>>(
+            *ctx, {ns, _nR, _nw, nb, nb});
+        s_sigt_stage.value().set_zero();
+        s_sigw_stage.value().set_zero();
       }
-
+      // f_Rk = e^{-i k.R}/nk on the full BZ: node-shared, node root computes
+      auto s_fRk = math::shm::make_shared_array<nda::array_view<ComplexType, 2>>(
+          *ctx, {_nR, nk});
+      s_fRk.win().fence();
       if (ctx->node_comm.root()) {
-        // f_Rk = e^{-i k.R}/nk on the full BZ (the plain non-collective kernel; the
-        // store is small so each node root computes the identical object)
-        nda::array<ComplexType, 2> f_Rk(_nR, nk);
-        utils::k_to_R_coefficients(rp, mf.kpts(), mf.lattv(), f_Rk);
+        auto f = s_fRk.local();
+        utils::k_to_R_coefficients(rp, mf.kpts(), mf.lattv(), f);
+      }
+      s_fRk.win().fence();
+      auto f_Rk = s_fRk.local();
 
-        auto kp_to_ibz = mf.kp_to_ibz();
-        auto kp_trev = mf.kp_trev();
-        const bool sym = (nk != nk_ibz);
+      auto kp_to_ibz = mf.kp_to_ibz();
+      auto kp_trev = mf.kp_trev();
+      const bool sym = (nk != nk_ibz);
+      // per-rank full-BZ slice gather (copy / conj-on-trev -- unfold_bz.cpp
+      // convention); one gemm k -> R per slice (idiom (a): flattened trailing pair).
+      // No global unfolded object is ever materialized.
+      nda::array<ComplexType, 2> buf(nk, nb * nb);
+      auto gather_full = [&](auto const &A_kij_ibz) {   // (nk_ibz, nb, nb) at fixed pre-axes
+        for (long ik = 0; ik < nk; ++ik) {
+          const long ksrc = sym ? long(kp_to_ibz(ik)) : ik;
+          const bool trev = sym and bool(kp_trev(ik));
+          auto row = nda::reshape(buf(ik, all), std::array<long, 2>{nb, nb});
+          if (trev) row = nda::conj(A_kij_ibz(ksrc, all, all));
+          else      row = A_kij_ibz(ksrc, all, all);
+        }
+      };
 
-        // full-BZ slice gather (copy / conj-on-trev -- unfold_bz.cpp convention) into a
-        // (nk, nb*nb) buffer, then ONE gemm k -> R per slice (idiom (a): flattened
-        // trailing pair). No global unfolded object is ever materialized.
-        nda::array<ComplexType, 2> buf(nk, nb * nb);
-        auto gather_full = [&](auto const &A_kij_ibz) {   // (nk_ibz, nb, nb) at fixed pre-axes
-          for (long ik = 0; ik < nk; ++ik) {
-            const long ksrc = sym ? long(kp_to_ibz(ik)) : ik;
-            const bool trev = sym and bool(kp_trev(ik));
-            auto row = nda::reshape(buf(ik, all), std::array<long, 2>{nb, nb});
-            if (trev) row = nda::conj(A_kij_ibz(ksrc, all, all));
-            else      row = A_kij_ibz(ksrc, all, all);
-          }
-        };
-
-        auto hstat = _shstat.value().local();
+      // static part (ns gemms, cheap): node root
+      s_stat_stage.win().fence();
+      if (ctx->node_comm.root()) {
+        auto hstat = s_stat_stage.local();
         for (long is = 0; is < ns; ++is) {
           gather_full(H0_skij(is, all, all, all));
           nda::array<ComplexType, 2> buf2(buf);
           gather_full(F_skij(is, all, all, all));
           buf += buf2;
-          auto h2 = nda::reshape(hstat(is, all, all, all), std::array<long, 2>{_nR, nb * nb});
+          auto h2 = nda::reshape(hstat(is, all, all, all),
+                                 std::array<long, 2>{_nR, nb * nb});
           nda::blas::gemm(f_Rk, buf, h2);
         }
-
-        // Sigma: k -> R per (t, s) into a tau staging, then tau -> iw ONCE per (s, R)
-        if (has_sigma) {
-          nda::array<ComplexType, 4> sig_t(ns, _nR, nt, nb * nb);
-          nda::array<ComplexType, 2> tmpR(_nR, nb * nb);
-          for (long is = 0; is < ns; ++is)
-            for (long it = 0; it < nt; ++it) {
-              gather_full(Sigma_tskij(it, is, all, all, all));
-              nda::blas::gemm(f_Rk, buf, tmpR);
-              for (long iR = 0; iR < _nR; ++iR) sig_t(is, iR, it, all) = tmpR(iR, all);
-            }
-          auto sig_w = _ssig.value().local();
-          for (long is = 0; is < ns; ++is)
-            for (long iR = 0; iR < _nR; ++iR) {
-              auto S_wf = nda::reshape(sig_w(is, iR, all, all, all),
-                                       std::array<long, 2>{_nw, nb * nb});
-              _ft->tau_to_w(sig_t(is, iR, all, all), S_wf, imag_axes_ft::fermion);
-            }
-        }
-
-        // R-SHELL truncation at cvv_rspace_tol: group by |R|, drop the largest-|R|
-        // suffix whose total norm fraction stays below tol, ZERO the dropped rows in
-        // the store (shells are inversion-symmetric sets, so hermiticity of the
-        // velocity is preserved exactly). Norms measured on the FULL stored object.
-        truncate_shells();
       }
+      s_stat_stage.win().fence();
+
+      if (has_sigma) {
+        // Sigma k -> R: (t, s) round-robin over node ranks; disjoint (is, :, it) writes
+        auto sig_t = s_sigt_stage.value().local();
+        nda::array<ComplexType, 2> tmpR(_nR, nb * nb);
+        s_sigt_stage.value().win().fence();
+        for (long ts = ctx->node_comm.rank(); ts < nt * ns;
+             ts += ctx->node_comm.size()) {
+          const long it = ts / ns, is = ts % ns;
+          gather_full(Sigma_tskij(it, is, all, all, all));
+          nda::blas::gemm(f_Rk, buf, tmpR);
+          for (long iR = 0; iR < _nR; ++iR)
+            sig_t(is, iR, it, all, all) =
+                nda::reshape(tmpR(iR, all), std::array<long, 2>{nb, nb});
+        }
+        s_sigt_stage.value().win().fence();
+        // tau -> iw ONCE per (s, R): round-robin over node ranks; disjoint (is, iR)
+        auto sig_w = s_sigw_stage.value().local();
+        s_sigw_stage.value().win().fence();
+        for (long sR = ctx->node_comm.rank(); sR < ns * _nR;
+             sR += ctx->node_comm.size()) {
+          const long is = sR / _nR, iR = sR % _nR;
+          auto S_tf = nda::reshape(sig_t(is, iR, all, all, all),
+                                   std::array<long, 2>{nt, nb * nb});
+          auto S_wf = nda::reshape(sig_w(is, iR, all, all, all),
+                                   std::array<long, 2>{_nw, nb * nb});
+          _ft->tau_to_w(S_tf, S_wf, imag_axes_ft::fermion);
+        }
+        s_sigw_stage.value().win().fence();
+        s_sigt_stage.reset();   // the tau staging is dead weight from here on
+      }
+
+      // shell selection (node root; the pre-P1 truncate_shells math verbatim,
+      // measured on the omega staging) + node broadcast of the kept rows
+      std::vector<long> kept;
+      long nkept = 0;
+      if (ctx->node_comm.root()) {
+        if (has_sigma) {
+          auto swv = s_sigw_stage.value().local();
+          kept = select_kept_shells(s_stat_stage.local(), &swv);
+        } else {
+          kept = select_kept_shells(s_stat_stage.local(), nullptr);
+        }
+        nkept = long(kept.size());
+      }
+      ctx->node_comm.broadcast_n(&nkept, 1, 0);
+      kept.resize(nkept);
+      ctx->node_comm.broadcast_n(kept.data(), nkept, 0);
+      _nR_kept = nkept;
+
+      // compact the geometry on every rank (original row order preserved)
+      {
+        nda::array<double, 2> Rc(nkept, 3);
+        nda::array<double, 1> wk(nkept);
+        for (long i = 0; i < nkept; ++i) {
+          for (int a = 0; a < 3; ++a) Rc(i, a) = _Rcart(kept[i], a);
+          wk(i) = _wR(kept[i]);
+        }
+        _Rcart = Rc;
+        _wR = wk;
+      }
+
+      // final COMPACT node-shared stores (ground rule 4); node root copies kept rows
+      _shstat = sArray_t<nda::array_view<ComplexType, 4>>(
+          math::shm::make_shared_array<nda::array_view<ComplexType, 4>>(
+              *ctx, {ns, nkept, nb, nb}));
+      if (has_sigma)
+        _ssig = sArray_t<nda::array_view<ComplexType, 5>>(
+            math::shm::make_shared_array<nda::array_view<ComplexType, 5>>(
+                *ctx, {ns, nkept, _nw, nb, nb}));
+      else
+        _ssig.reset();
+      _shstat.value().win().fence();
+      if (has_sigma) _ssig.value().win().fence();
+      if (ctx->node_comm.root()) {
+        auto dst = _shstat.value().local();
+        auto src = s_stat_stage.local();
+        for (long is = 0; is < ns; ++is)
+          for (long i = 0; i < nkept; ++i)
+            dst(is, i, all, all) = src(is, kept[i], all, all);
+        if (has_sigma) {
+          auto dsw = _ssig.value().local();
+          auto ssw = s_sigw_stage.value().local();
+          for (long is = 0; is < ns; ++is)
+            for (long i = 0; i < nkept; ++i)
+              dsw(is, i, all, all, all) = ssw(is, kept[i], all, all, all);
+        }
+      }
+      _shstat.value().win().fence();
+      if (has_sigma) _ssig.value().win().fence();
       ctx->comm.barrier();
-      _shstat.value().node_sync();
-      if (has_sigma) _ssig.value().node_sync();
-      ctx->node_comm.broadcast_n(&_nR_kept, 1, 0);
+      app_log(2, "  [CVV] R store compacted: {} / {} WS rows retained "
+                 "({:.1f} %% of the full-n_R staging footprint).",
+              nkept, _nR, 100.0 * double(nkept) / double(_nR));
       _built = true;
     }
 
@@ -470,7 +548,12 @@ namespace solvers {
     nda::array<ComplexType, 2> const &Kt_mir() const { return _Kt_mir; }
 
   private:
-    void truncate_shells();
+    // P1: shell selection on the FULL staging (the pre-P1 truncate_shells math
+    // verbatim -- |R| shells, cumulative dropped-norm bound, R = 0 never dropped);
+    // returns the KEPT row indices ascending, logs kept/dropped norms. Node-root only.
+    std::vector<long> select_kept_shells(
+        nda::array_view<ComplexType, 4> hs_stage,
+        nda::array_view<ComplexType, 5> const *sig_stage) const;
 
     const imag_axes_ft::IAFT* _ft = nullptr;
     double _rspace_tol = 1e-6;
