@@ -143,4 +143,75 @@ namespace bdft_tests {
 #endif
   }
 
+  TEST_CASE("scgwt_ladder_l1", "[methods][vertex][scgwt][ladder]") {
+#ifndef ENABLE_DLR
+    SUCCEED("scgwt_ladder_l1 skipped: build has ENABLE_DLR=OFF.");
+#else
+    // Increment L1 gates (notes/scgwt_implementation_plan.md):
+    //  L1-a  upfold(Pi-bar^0) vs the C-masked GLOBAL-basis Hadamard bubble -- the
+    //        secondary representation error of the pair bubble (eta-class; full-rank
+    //        N_m = nc^2 nk here, so it must sit at the representation floor).
+    //  L1-b  THE BIT-ANCHOR: Pi-bar^0 K-bar Pi-bar^0 vs the implemented static-rung
+    //        Pi^C (pi_c_accumulate_w phase 1 with W0bar), kernel candidates W0bar(q)
+    //        vs <W0bar>_qx, ONE fitted scalar allowed. Whatever (candidate, alpha)
+    //        matches near-bitwise is THE pinned convention for L2. The bars below are
+    //        provisional -- the FIRST RUN's printed numbers are the deliverable.
+    auto& mpi_context = utils::make_unit_test_mpi_context();
+    imag_axes_ft::IAFT ft(1000, 6.0, imag_axes_ft::dlr_basis, "low");
+    std::string output = "coqui_scgwt_l1";
+
+    auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_lih222"));
+    thc_reader_t thc(mf, make_thc_reader_ptree(mf->nbnd() * 8, "", "incore", "", "bdft",
+                                               1e-10, mf->ecutrho(), 1, 1024));
+    auto eri = mb_eri_t(thc, thc);
+
+    solvers::hf_t hf;
+    solvers::gw_t gw(&ft, "ignore_g0", output);
+    solvers::scr_coulomb_t scr_eri(&ft, "rpa", "ignore_g0");
+    simple_dyson dyson(mf.get(), &ft);
+    MBState mb_state(mpi_context, ft, output);
+    iter_scf::iter_scf_t iter_sol("damping");
+    // ACTIVE static-rung SECONDARY vertex: builds W0bar + the secondary basis in-loop
+    solvers::vertex_t vtx(&ft, "2nd_exchange", nda::range(0, 2), mf->nbnd(),
+                          "ignore_g0", "secondary", -1, 1e-8, -1.0, -1.0, "static");
+    scr_eri.set_vertex(&vtx);
+    gw.set_vertex(&vtx);
+    auto [e_hf, e_corr] = scf_loop(mb_state, dyson, eri, ft,
+                                   solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol,
+                                   2, false, 1e-9, true);
+    app_log(1, "scgwt_ladder_l1: B-S secondary state e_hf = {}, e_corr = {}", e_hf, e_corr);
+
+    auto diag = vtx.ladder_l1_gates(mb_state, thc);
+    // L1-a: the pair bubble is correct at the representation floor (measured 1.9e-05).
+    REQUIRE(diag.l1a_eta >= 0.0);
+    REQUIRE(diag.l1a_eta < 0.05);
+    const int b = diag.best;
+    REQUIRE(b >= 0);
+    app_log(1, "scgwt_ladder_l1: best kernel candidate c{} resid = {:.3e}, "
+               "alpha = ({:+.6e}, {:+.6e}), spread = {:.3e}",
+            b, diag.l1b_resid[b], diag.l1b_scale[b].real(), diag.l1b_scale[b].imag(),
+            diag.l1b_scale_spread[b]);
+    // 🛑 L1-b MEASURED VERDICT (2026-08-11, lih222 window[0,2) secondary full-rank):
+    // NO candidate (kernel W0bar(q) / <W0bar>_qx, x all transpose topologies, x one
+    // fitted complex scalar) reproduces the implemented static-rung Pi^C:
+    //   best resid = 2.822e-01, alpha = -0.4644, per-(q,inu) spread = 1.686
+    //   (transpose variants EXACTLY degenerate; <W0bar> far worse at 8.4e-01)
+    // => the frequency-diagonal N_m x N_m ladder ansatz Pi-bar = [1 - Pi0 K]^-1 Pi0 of
+    // notes/scgwt_implementation_plan.md does NOT factorize the anchor: the anchor
+    // couples pairs at specific (k, k - qx) through per-(k, qx) collocation folds,
+    // which the momentum-collapsed chain cannot represent. This is the plan's declared
+    // STOP condition ("pinned by gate L1-b, NOT by rederivation") -- increment L2 is
+    // BLOCKED on a design ruling (R1'): k-resolved pair-space ladder vs a derived
+    // collapsed kernel vs re-scoping. The asserts below pin the MEASURED state so a
+    // future fix (or ruling) must consciously update them.
+    REQUIRE(diag.l1b_resid[b] > 0.1);          // the ansatz does NOT hold as written
+    REQUIRE(diag.l1b_resid[b] < 0.5);          // ...but is strongly correlated
+    REQUIRE(diag.l1b_scale_spread[b] > 0.5);   // and NOT a constant multiple
+
+    mpi_context->comm.barrier();
+    if (mpi_context->comm.root()) remove((output + ".mbpt.h5").c_str());
+    mpi_context->comm.barrier();
+#endif
+  }
+
 } // bdft_tests

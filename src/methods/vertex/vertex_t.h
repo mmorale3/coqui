@@ -1327,6 +1327,26 @@ namespace solvers {
     std::string pol_vertex() const { return _pol_vertex; }
     std::string pol_vertex_kernel() const { return _pol_kernel; }
 
+    /**
+     * scGW-tilde increment L1 (vertex_ladder.icc): the C-window pair bubble
+     * Pi-bar^0_MN(q, tau_pos) in the SECONDARY aux basis, (nt_half, nq, N_m, N_m),
+     * replicated -- house RPA conventions (rpa_pi.icc Hadamard pairing, -spin/Nk,
+     * PH-sym tau half grid). NOSYM window mode only at L1.
+     */
+    nda::array<ComplexType, 4> eval_pol_pi0(MBState &mb_state, THC_ERI auto &thc);
+
+    /** L1 gate diagnostics -- see vertex_ladder.icc for the gate + candidate
+     *  definitions (kernel choice x pairing topology; 6 candidates). */
+    struct ladder_l1_diag {
+      static constexpr int ncand = 6;
+      double l1a_eta = -1.0;                       // upfold vs C-masked global bubble
+      double l1b_resid[ncand] = {-1, -1, -1, -1, -1, -1};
+      ComplexType l1b_scale[ncand] = {};
+      double l1b_scale_spread[ncand] = {-1, -1, -1, -1, -1, -1};
+      int best = -1;
+    };
+    ladder_l1_diag ladder_l1_gates(MBState &mb_state, THC_ERI auto &thc);
+
     /** DIAGNOSTIC, default 0 -- drop one cut-piece so its exact energy contribution can be
      *  read off. 1 = drop Sigma^(L,r), 2 = drop Sigma^(C,x), 3 = drop both (which isolates
      *  P^{C,L}'s effect through Sigma_GW). See _bl_drop. */

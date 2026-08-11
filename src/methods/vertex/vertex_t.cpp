@@ -4738,5 +4738,9 @@ namespace solvers {
   vertex_t::eval_Pi_C(MBState&, const thc_reader_t&,
                       std::array<long, 4>, std::array<long, 4>, std::array<long, 4>);
 
+  // scGW-tilde L1 (vertex_ladder.icc)
+  template nda::array<ComplexType, 4> vertex_t::eval_pol_pi0(MBState&, thc_reader_t&);
+  template vertex_t::ladder_l1_diag vertex_t::ladder_l1_gates(MBState&, thc_reader_t&);
+
 }  // solvers
 }  // methods

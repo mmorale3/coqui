@@ -8,44 +8,323 @@
  * Density-channel BSE with the static screened kernel, resummed in the secondary-ISDF
  * pair basis:
  *
- *   Pi-bar = [1 - Pi-bar^0 K-bar]^-1 Pi-bar^0,   K-bar = +/- W-bar_0
+ *   Pi-bar = [1 - Pi-bar^0 K-bar]^-1 Pi-bar^0
  *
- * frequency-diagonal (static kernel => independent (q, inu) solves, N_m x N_m LAPACK on
- * replicated arrays, round-robin over the flattened (q, inu) index -- the
- * build_secondary_basis pattern). The sign and prefactor of K-bar are pinned by gate
- * L1-b, NOT by rederivation: upfold(Pi-bar^0 K-bar Pi-bar^0) with K-bar from build_w0
- * must reproduce the implemented static-rung Pi^C (eval_Pi_C static path), the object
- * already validated by dense oracles + GF2 + conservation. The ladder's first-order term
- * IS that static rung (PDF section 5.2) -- which is also why pol_vertex = "ladder"
- * excludes a vertex_type whose P injection carries the static/linear Pi^C (double
- * counting; guard in vertex_t::set_pol_vertex).
+ * frequency-diagonal (static kernel => independent (q, inu) solves). The sign,
+ * prefactor and the KERNEL MOMENTUM COLLAPSE of K-bar are pinned by gate L1-b against
+ * the implemented static-rung Pi^C (vertex_pi::pi_c_accumulate_w phase 1 driven with
+ * W0bar in the Z slot -- the object already validated by dense oracles + GF2 +
+ * conservation), NOT by rederivation.
  *
- * Output contract (identical to eval_Pi_C at the scr_coulomb_t injection seam): return
- * on the CALLER's grid -- the Pi grid never splits q -- and the caller does +=.
+ * INCREMENT L1 (this file): the C-window pair bubble Pi-bar^0_MN(q, tau) in the
+ * secondary aux basis + the L1 gate harness. House conventions mirrored EXACTLY from
+ * the RPA bubble (rpa_pi.icc:305-336): Hadamard pairing
  *
- * INCREMENT C0: scaffolding only. L1 lands the C-window pair bubble Pi-bar^0_mn(q, inu)
- * (reusing build_pair_component, build_Xbar, fold_core_block, iaft tau -> nu rows); L2
- * lands the ladder solve + the ladder_eps readout; L3 wires the in-loop injection.
+ *   Pi_MN(q, tau_pos) = -(spin/Nk) sum_{s,k} conj(Gc_MN(k-q, tau_pos)) Gc_MN(k, beta-tau_pos)
+ *
+ * on the PH-symmetric tau half grid, with Gc the C-window G on the secondary
+ * interpolating points, Gc_MN(k,t) = sum_{ab in C} Xb_M,a(k) G^C_ab(k,t) Xb*_N,b(k).
+ *
+ * Output contract (L3): return on the CALLER's grid -- the Pi grid never splits q --
+ * and the caller does +=.
+ *
+ * L1 runs NOSYM, window mode (the gate fixtures); symmetry + Wannier ride with L3.
  */
 
 #include "utilities/check.hpp"
 
 namespace methods {
 namespace solvers {
-namespace vertex_ladder_detail {
 
-  // Every ladder entry funnels through this abort until L1/L2 land; the guard in
-  // vertex_t::set_pol_vertex fires earlier (an ACTIVE pol_vertex aborts at setup),
-  // so reaching this indicates a plumbing error.
-  [[noreturn]] inline void ladder_not_implemented(std::string_view where) {
-    utils::check(false,
-                 "{}: pol_vertex = \"ladder\" is scaffolding only (increment C0); the "
-                 "pair bubble, ladder solve and injection land in increments L1-L3 of "
-                 "notes/scgwt_implementation_plan.md.", where);
-    std::abort();  // unreachable: utils::check(false, ...) aborts
+  namespace vertex_ladder_detail {
+
+    // Gc on the secondary interpolating points, all (s, k, t) replicated (N_m-class):
+    //   Gc(s, k, t)_MN = [Xb(s,k) . G_CC(t,s,k) . Xb(s,k)^dag]_MN
+    inline nda::array<ComplexType, 5>
+    build_Gc_aux(nda::MemoryArrayOfRank<5> auto const &G_CC,      // (nt, ns, nk, nc, nc)
+                 nda::array<ComplexType, 4> const &Xb_skma) {     // (ns, nk, Nm, nc)
+      decltype(nda::range::all) all;
+      const long nt = G_CC.shape(0), ns = G_CC.shape(1), nk = G_CC.shape(2);
+      const long nc = G_CC.shape(3), Nm = Xb_skma.shape(2);
+      nda::array<ComplexType, 5> Gc(ns, nk, nt, Nm, Nm);
+      nda::array<ComplexType, 2> T(Nm, nc);
+      nda::array<ComplexType, 2> Xd(nc, Nm);
+      for (long is = 0; is < ns; ++is)
+        for (long ik = 0; ik < nk; ++ik) {
+          auto X = Xb_skma(is, ik, all, all);                     // (Nm, nc)
+          for (long a = 0; a < nc; ++a)
+            for (long m = 0; m < Nm; ++m) Xd(a, m) = std::conj(X(m, a));
+          for (long it = 0; it < nt; ++it) {
+            nda::blas::gemm(X, G_CC(it, is, ik, all, all), T);
+            nda::blas::gemm(T, Xd, Gc(is, ik, it, all, all));
+          }
+        }
+      return Gc;
+    }
+
+  } // vertex_ladder_detail
+
+  /**
+   * L1: the C-window pair bubble Pi-bar^0_MN(q, tau_pos) in the SECONDARY aux basis,
+   * (nt_half, nq, N_m, N_m), replicated (accumulated (s,k) round-robin over the global
+   * communicator + one all_reduce; N_m-class object). Preconditions: an ACTIVE
+   * secondary-basis WINDOW vertex on a symmetry-free mesh (the L1 gate fixtures);
+   * mb_state must carry G. The secondary basis is built on demand.
+   */
+  nda::array<ComplexType, 4> vertex_t::eval_pol_pi0(MBState &mb_state, THC_ERI auto &thc) {
+    decltype(nda::range::all) all;
+    utils::check(active() and secondary(),
+                 "vertex_t::eval_pol_pi0: requires an ACTIVE secondary-basis vertex "
+                 "(the L1 gate configuration).");
+    utils::check(not _wannier, "vertex_t::eval_pol_pi0: window mode only at L1.");
+    auto MF = thc.MF();
+    utils::check(MF->nkpts() == MF->nkpts_ibz(),
+                 "vertex_t::eval_pol_pi0: symmetry-free meshes only at L1 (nkpts = {} "
+                 "vs nkpts_ibz = {}).", MF->nkpts(), MF->nkpts_ibz());
+    utils::check(mb_state.sG_tskij.has_value(),
+                 "vertex_t::eval_pol_pi0: mb_state carries no G.");
+    ensure_secondary_basis(mb_state, thc);
+
+    auto G_tskij = mb_state.sG_tskij.value().local();
+    const long nt = G_tskij.shape(0), ns = G_tskij.shape(1), nk = G_tskij.shape(2);
+    const long nc = subspace_rank(), Nm = _Xb_skma.shape(2);
+    const long nq = MF->nqpts_ibz();
+    const long nt_half = (nt % 2 == 0) ? nt / 2 : nt / 2 + 1;
+    auto mpi = thc.mpi();
+
+    // C-window block of G on the full mesh (window mode, nosym: a plain slice)
+    nda::array<ComplexType, 5> G_CC(nt, ns, nk, nc, nc);
+    G_CC = G_tskij(all, all, all, _band_window, _band_window);
+    auto Gc = vertex_ladder_detail::build_Gc_aux(G_CC, _Xb_skma);
+
+    // the RPA Hadamard pairing on the PH-sym half grid (rpa_pi.icc:312, 323-334):
+    // factor -spin/Nk; Gp = conj(Gc(k-q, tau_pos)); Gn = Gc(k, beta - tau_pos)
+    const double factor = (ns == 2) ? -1.0 / double(nk) : -2.0 / double(nk);
+    nda::array<ComplexType, 4> Pi0(nt_half, nq, Nm, Nm);
+    Pi0() = ComplexType(0.0);
+    const long rank = mpi->comm.rank(), size = mpi->comm.size();
+    for (long qsk = rank; qsk < nq * ns * nk; qsk += size) {
+      const long iq = qsk / (ns * nk);
+      const long is = (qsk / nk) % ns;
+      const long ik = qsk % nk;
+      const long ikmq = MF->qk_to_k2(iq, ik);
+      for (long it = 0; it < nt_half; ++it) {
+        auto Gp = Gc(is, ikmq, it, all, all);
+        auto Gn = Gc(is, ik, nt - it - 1, all, all);
+        auto P = Pi0(it, iq, all, all);
+        for (long m = 0; m < Nm; ++m)
+          for (long n = 0; n < Nm; ++n)
+            P(m, n) += factor * std::conj(Gp(m, n)) * Gn(m, n);
+      }
+    }
+    mpi->comm.all_reduce_in_place_n(Pi0.data(), Pi0.size(), std::plus<>{});
+    return Pi0;
   }
 
-} // vertex_ladder_detail
+  /**
+   * The L1 gate harness (notes/scgwt_implementation_plan.md):
+   *
+   *  L1-a  C-window RPA consistency: upfold(Pi-bar^0) = t^dag Pi-bar^0 t against the
+   *        SAME Hadamard bubble built in the GLOBAL aux basis from the C-masked G --
+   *        eta-class agreement (the secondary representation error; monotone in N_m).
+   *  L1-b  THE BIT-ANCHOR: T_c(q, inu) = Pi-bar^0(inu) K-bar_c Pi-bar^0(inu) against
+   *        the implemented static-rung Pi^C (pi_c_accumulate_w phase 1, W0bar in the
+   *        Z slot, no dynamic rung). Kernel candidates:
+   *          c0: K-bar = W0bar(q)            (external-transfer kernel)
+   *          c1: K-bar = (1/nq) sum_qx W0bar(qx)   (momentum-collapsed static kernel)
+   *        A single fitted complex scale alpha_c (the sign/prefactor) is allowed; the
+   *        gate demands the residual || alpha T - Pi^C || / ||Pi^C|| be small AND the
+   *        per-(q, inu>0) fitted scalars be CONSTANT (near-bitwise proportionality).
+   *        Whatever (candidate, alpha) wins is THE pinned convention for L2.
+   */
+  vertex_t::ladder_l1_diag vertex_t::ladder_l1_gates(MBState &mb_state, THC_ERI auto &thc) {
+    decltype(nda::range::all) all;
+    ladder_l1_diag out;
+    auto MF = thc.MF();
+    auto mpi = thc.mpi();
+    utils::check(_W0b_qmm.has_value(),
+                 "vertex_t::ladder_l1_gates: W0bar is absent -- run after an update_w "
+                 "with an active static-rung secondary vertex (build_w0).");
+    auto Pi0_t = eval_pol_pi0(mb_state, thc);            // (nt_half, nq, Nm, Nm)
+    const long nt_half = Pi0_t.shape(0), nq = Pi0_t.shape(1), Nm = Pi0_t.shape(2);
+    const long nk = MF->nkpts(), ns = mb_state.sG_tskij.value().local().shape(1);
+    const long nt = mb_state.sG_tskij.value().local().shape(0);
+    const long nc = subspace_rank();
+    const long Np = thc.Np();
+
+    // ---- L1-a: global-basis C-masked reference + upfold --------------------------------
+    {
+      auto G_tskij = mb_state.sG_tskij.value().local();
+      nda::array<ComplexType, 5> G_CC(nt, ns, nk, nc, nc);
+      G_CC = G_tskij(all, all, all, _band_window, _band_window);
+      // global collocation restricted to the C columns
+      nda::array<ComplexType, 4> XC(ns, nk, Np, nc);
+      for (long is = 0; is < ns; ++is)
+        for (long ik = 0; ik < nk; ++ik)
+          XC(is, ik, all, all) = thc.X(is, 0, ik)(all, _band_window);
+      auto Gg = vertex_ladder_detail::build_Gc_aux(G_CC, XC);   // (ns, nk, nt, Np, Np)
+      const double factor = (ns == 2) ? -1.0 / double(nk) : -2.0 / double(nk);
+      double num2 = 0.0, den2 = 0.0;
+      nda::array<ComplexType, 2> ref(Np, Np), up(Np, Np), tmp(Nm, Np);
+      for (long iq = 0; iq < nq; ++iq) {
+        auto tq = _t_qmP(iq, all, all);                          // (Nm, Np)
+        nda::array<ComplexType, 2> td(Np, Nm);
+        for (long m = 0; m < Nm; ++m)
+          for (long P = 0; P < Np; ++P) td(P, m) = std::conj(tq(m, P));
+        for (long it = 0; it < nt_half; ++it) {
+          ref() = ComplexType(0.0);
+          for (long is = 0; is < ns; ++is)
+            for (long ik = 0; ik < nk; ++ik) {
+              const long ikmq = MF->qk_to_k2(iq, ik);
+              auto Gp = Gg(is, ikmq, it, all, all);
+              auto Gn = Gg(is, ik, nt - it - 1, all, all);
+              for (long P = 0; P < Np; ++P)
+                for (long Q = 0; Q < Np; ++Q)
+                  ref(P, Q) += factor * std::conj(Gp(P, Q)) * Gn(P, Q);
+            }
+          nda::blas::gemm(Pi0_t(it, iq, all, all), tq, tmp);     // Pi0 . t
+          nda::blas::gemm(td, tmp, up);                          // t^dag Pi0 t
+          for (long P = 0; P < Np; ++P)
+            for (long Q = 0; Q < Np; ++Q) {
+              num2 += std::norm(up(P, Q) - ref(P, Q));
+              den2 += std::norm(ref(P, Q));
+            }
+        }
+      }
+      out.l1a_eta = std::sqrt(num2 / std::max(den2, 1e-300));
+    }
+
+    // ---- L1-b: the bit-anchor ----------------------------------------------------------
+    // anchor: pi_c_accumulate_w PHASE 1 (instantaneous rung = W0bar, Wdyn = nullptr) --
+    // the exact call pattern of the Sigma^{C,r} response stage (vertex_t.cpp:2549).
+    vertex_pi::iaft_tools tools(*_ft);
+    const long nw_b = tools.nw_b;
+    nda::array<ComplexType, 4> PiC(nw_b, nq, Nm, Nm);
+    PiC() = ComplexType(0.0);
+    {
+      auto G_tskij = mb_state.sG_tskij.value().local();
+      nda::array<ComplexType, 5> G_CC(nt, ns, nk, nc, nc);
+      G_CC = G_tskij(all, all, all, _band_window, _band_window);
+      nda::array<long, 2> kmq(nq, nk), kpq(nq, nk);
+      auto qmin = MF->qminus();
+      for (long iq = 0; iq < nq; ++iq)
+        for (long ik = 0; ik < nk; ++ik) {
+          kmq(iq, ik) = MF->qk_to_k2(iq, ik);
+          kpq(iq, ik) = MF->qk_to_k2(qmin(iq), ik);
+        }
+      vertex_pi::pi_c_accumulate_w(*_ft, tools, G_CC, _Xb_skma, _W0b_qmm.value(),
+                                   static_cast<nda::array<ComplexType, 4> const *>(nullptr),
+                                   kmq, kpq, nda::range(0, nc), PiC,
+                                   mpi->comm.rank(), mpi->comm.size(),
+                                   false, nullptr, nullptr);
+      mpi->comm.all_reduce_in_place_n(PiC.data(), PiC.size(), std::plus<>{});
+    }
+
+    // Pi0 on the Matsubara axis (PH-sym half; full-grid index i0 + j <-> half index j)
+    const long nw_half = (nw_b % 2 == 0) ? nw_b / 2 : nw_b / 2 + 1;
+    const long i0 = nw_b / 2;
+    nda::array<ComplexType, 4> Pi0_w(nw_half, nq, Nm, Nm);
+    {
+      nda::array<ComplexType, 2> bt(nt_half, Nm * Nm), bw(nw_half, Nm * Nm);
+      for (long iq = 0; iq < nq; ++iq) {
+        for (long it = 0; it < nt_half; ++it)
+          bt(it, all) = nda::reshape(Pi0_t(it, iq, all, all), std::array<long, 1>{Nm * Nm});
+        _ft->tau_to_w_PHsym(bt, bw);
+        for (long j = 0; j < nw_half; ++j)
+          Pi0_w(j, iq, all, all) =
+              nda::reshape(bw(j, all), std::array<long, 2>{Nm, Nm});
+      }
+    }
+
+    // candidate kernels
+    auto const &W0b = _W0b_qmm.value();
+    nda::array<ComplexType, 2> Ksum(Nm, Nm);
+    Ksum() = ComplexType(0.0);
+    for (long iqx = 0; iqx < nq; ++iqx) Ksum += W0b(iqx, all, all);
+    Ksum /= double(nq);
+    constexpr int n_l1b_cands = ladder_l1_diag::ncand;
+
+    for (int c = 0; c < n_l1b_cands; ++c) {
+      // candidate topologies (the anchor's to_wmat applies a TWISTED pair ordering --
+      // Pi^C is the crossed/exchange-topology object -- so the factorized composition's
+      // transpose convention is part of what this gate pins, alongside sign/prefactor):
+      //   c0: P.K(q).P    c1: P.<K>.P    c2: P.K(q)^T.P    c3: P.<K>^T.P
+      //   c4: P^T.K(q).P  c5: P.K(q).P^T
+      ComplexType num(0.0);
+      double den = 0.0, ref2 = 0.0;
+      std::vector<ComplexType> alphas;
+      nda::array<ComplexType, 2> T(Nm, Nm), tmp(Nm, Nm);
+      // first pass: global alpha = <T, PiC> / <T, T>
+      std::vector<nda::array<ComplexType, 2>> Tstore(nq * nw_half,
+                                                     nda::array<ComplexType, 2>(Nm, Nm));
+      nda::array<ComplexType, 2> Kq(Nm, Nm), P0t(Nm, Nm);
+      for (long iq = 0; iq < nq; ++iq) {
+        if (c == 1 or c == 3) Kq = Ksum;
+        else                  Kq = W0b(iq, all, all);
+        if (c == 2 or c == 3) {
+          nda::array<ComplexType, 2> Kt(Nm, Nm);
+          for (long m = 0; m < Nm; ++m)
+            for (long n2 = 0; n2 < Nm; ++n2) Kt(m, n2) = Kq(n2, m);
+          Kq = Kt;
+        }
+        for (long j = 0; j < nw_half; ++j) {
+          auto P0 = Pi0_w(j, iq, all, all);
+          for (long m = 0; m < Nm; ++m)
+            for (long n2 = 0; n2 < Nm; ++n2) P0t(m, n2) = P0(n2, m);
+          if (c == 4)      nda::blas::gemm(P0t, Kq, tmp);
+          else             nda::blas::gemm(P0, Kq, tmp);
+          if (c == 5)      nda::blas::gemm(tmp, P0t, T);
+          else             nda::blas::gemm(tmp, P0, T);
+          Tstore[iq * nw_half + j] = T;
+          auto A = PiC(i0 + j, iq, all, all);
+          ComplexType tn(0.0);
+          double tt = 0.0, aa = 0.0;
+          for (long m = 0; m < Nm; ++m)
+            for (long n2 = 0; n2 < Nm; ++n2) {
+              tn += std::conj(T(m, n2)) * A(m, n2);
+              tt += std::norm(T(m, n2));
+              aa += std::norm(A(m, n2));
+            }
+          num += tn;
+          den += tt;
+          ref2 += aa;
+          if (tt > 1e-24 and aa > 1e-24) alphas.push_back(tn / tt);
+        }
+      }
+      const ComplexType alpha = num / std::max(den, 1e-300);
+      double r2 = 0.0;
+      for (long iq = 0; iq < nq; ++iq)
+        for (long j = 0; j < nw_half; ++j) {
+          auto const &Tj = Tstore[iq * nw_half + j];
+          auto A = PiC(i0 + j, iq, all, all);
+          for (long m = 0; m < Nm; ++m)
+            for (long n2 = 0; n2 < Nm; ++n2) r2 += std::norm(alpha * Tj(m, n2) - A(m, n2));
+        }
+      out.l1b_resid[c] = std::sqrt(r2 / std::max(ref2, 1e-300));
+      out.l1b_scale[c] = alpha;
+      double spread = 0.0;
+      for (auto const &a : alphas)
+        spread = std::max(spread, std::abs(a - alpha) / std::max(std::abs(alpha), 1e-300));
+      out.l1b_scale_spread[c] = spread;
+    }
+    out.best = 0;
+    for (int c = 1; c < n_l1b_cands; ++c)
+      if (out.l1b_resid[c] < out.l1b_resid[out.best]) out.best = c;
+
+    static const char *cand_names[n_l1b_cands] = {
+        "P.K(q).P  ", "P.<K>.P   ", "P.K(q)^T.P", "P.<K>^T.P ", "P^T.K(q).P",
+        "P.K(q).P^T"};
+    app_log(1, "  [scGW-tilde L1] gates: L1-a eta(upfold vs C-masked global RPA bubble) "
+               "= {:.3e}", out.l1a_eta);
+    for (int c = 0; c < n_l1b_cands; ++c)
+      app_log(1, "    L1-b c{} [{}]: resid = {:.3e}, alpha = ({:+.6e}, {:+.6e}), "
+                 "spread = {:.3e}", c, cand_names[c], out.l1b_resid[c],
+              out.l1b_scale[c].real(), out.l1b_scale[c].imag(),
+              out.l1b_scale_spread[c]);
+    app_log(1, "    best candidate: c{}", out.best);
+    return out;
+  }
+
 } // solvers
 } // methods
 
