@@ -38,6 +38,7 @@
 #include "vertex_pi.icc"
 #include "vertex_sigma.icc"  // ISDF-Vertex Phase 1c: fused G^3 W^2 Sigma^C kernel
 #include "vertex_sigma_r.icc" // INCREMENT S5: the static-vertex response cut Sigma^{C,r}
+#include "vertex_ladder.icc"  // scGW-tilde ladder polarization (C0 scaffolding; L1-L3)
 
 namespace methods {
 namespace solvers {

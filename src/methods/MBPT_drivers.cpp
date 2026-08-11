@@ -107,7 +107,13 @@ inline void ensure_checkpoint(std::shared_ptr<mf::MF> mf, std::string const& out
  *  - wmax: Optional. Frequency cutoff for the IAFT grids (a.u.).
  *          If not provided, wmax is estimated from mean_field. 
  *  - iaft_prec: "high" Precision of IAFT grids. {choices: "high", "medium", "low"}
- *  - div_treatment: "gygi" Divergent treatment for Coulomb kernel. {choices: "ignore_g0", "gygi"}
+ *  - div_treatment: "gygi" Divergent treatment for Coulomb kernel. {choices: "ignore_g0",
+ *                 "gygi", "cvv"}. "cvv" (gw solver only; scGW-tilde,
+ *                 notes/scgwt_implementation_plan.md) replaces the gygi/stored q->0
+ *                 EXTRAPOLATION of eps_inv_head by the covariant-velocity O(q^2) head,
+ *                 Pi_ab(inu) = -(2/(beta Nk V)) sum_k,iw tr[v~_a G v~_b G] with
+ *                 v~ = d_k(H0 + F + Sigma). Scaffolded (increment C0); ABORTS until the
+ *                 update_w head fill lands (C4).
  *  - hf_div_treatment: "gygi" Divergent treatment for Coulomb kernel in HF. {choices: "ignore_g0", "gygi"}
  *  - niter: "1" Number of iterations in the self-consistent loop.
  *  - conv_thr: "1e-9" Convergence threshold for the self-consistent loop.
@@ -233,6 +239,29 @@ inline void ensure_checkpoint(std::shared_ptr<mf::MF> mf, std::string const& out
  *                 exactly (deterministic, gauge-covariant; the correction norm is
  *                 logged). false = proceed with the raw disentangled U (warn; P then
  *                 only approximately idempotent).
+ *  - cvv_rspace_tol: "1e-6" R-shell truncation tolerance of the CVV head's
+ *                 Sigma(R, iw) store (div_treatment = "cvv" only; increment C1). The
+ *                 default is calibrated from the T6 R-decay diagnostic.
+ *  - pol_vertex: "none" scGW-tilde ladder polarization (gw solver only;
+ *                 notes/scgwt_implementation_plan.md L1-L3). {choices: "none", "ladder"}.
+ *                 "ladder" resums the density-channel BSE with the static screened
+ *                 kernel in the secondary-ISDF pair basis,
+ *                 Pi-bar = [1 - Pi-bar^0 K-bar]^-1 Pi-bar^0, injected into P beside the
+ *                 RPA bubble. P-ONLY: Sigma stays GW-form, so the production loop is NOT
+ *                 Phi-derivable (deliberate; user ruling 2026-08-10 -- accurate screening
+ *                 over Phi-derivability). Excludes an ACTIVE vertex_type (double-count
+ *                 guard, ruling R5) and requires the DLR IAFT backend. An empty ladder
+ *                 C-window is an exact no-op. Scaffolded (increment C0); an ACTIVE
+ *                 ladder ABORTS until L1-L3 land.
+ *  - pol_vertex_kernel: "w0_prev" Ladder kernel source (ruling R4). {choices: "w0_prev",
+ *                 "w0_frozen"}. "w0_prev" takes K-bar = W-bar_0 from the previous
+ *                 iteration's W (matches the static-rung convention); "w0_frozen" keeps
+ *                 the RPA@KS W_0 (scGW_0-flavored).
+ *  - pol_vertex_band_window, pol_vertex_isdf_rank, pol_vertex_isdf_svd_tol,
+ *    pol_vertex_isdf_thresh, pol_vertex_isdf_cond_max, pol_vertex_isdf_distr_tol:
+ *                 the ladder's C-window and secondary-basis knobs. Each key ABSENT
+ *                 inherits the corresponding vertex_* value, so a ladder run on top of
+ *                 an existing vertex input needs only pol_vertex = "ladder".
  */
 template<typename eri_t>
 void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
@@ -395,6 +424,27 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     // band_window) instead of the band window; U is Loewdin-orthonormalized at load.
     auto vertex_wannier_file = io::get_value_with_default<std::string>(pt,"vertex_wannier_file","");
     auto vertex_wannier_loewdin = io::get_value_with_default<bool>(pt,"vertex_wannier_loewdin",true);
+    // scGW-tilde knob surface (increment C0; notes/scgwt_implementation_plan.md
+    // section 1). div_treatment = "cvv" is validated here because the W build would
+    // otherwise silently ignore an unknown policy string; it aborts until the update_w
+    // head fill lands (increment C4). The pol_vertex_* basis knobs inherit the vertex_*
+    // values when their keys are absent, so a ladder run on top of an existing vertex
+    // input needs only pol_vertex = "ladder".
+    utils::check(div_treatment != "cvv",
+                 "div_treatment = \"cvv\" is scaffolding only (increment C0): the CVV "
+                 "head fill of update_w lands in increment C4 of "
+                 "notes/scgwt_implementation_plan.md.");
+    auto cvv_rspace_tol = io::get_value_with_default<double>(pt,"cvv_rspace_tol",1e-6);
+    auto pol_vertex = io::get_value_with_default<std::string>(pt,"pol_vertex","none");
+    io::tolower(pol_vertex);
+    auto pol_vertex_kernel = io::get_value_with_default<std::string>(pt,"pol_vertex_kernel","w0_prev");
+    io::tolower(pol_vertex_kernel);
+    auto pol_vertex_band_window = io::get_value_with_default<nda::range>(pt,"pol_vertex_band_window",vertex_band_window);
+    auto pol_vertex_isdf_rank = io::get_value_with_default<long>(pt,"pol_vertex_isdf_rank",vertex_isdf_rank);
+    auto pol_vertex_isdf_svd_tol = io::get_value_with_default<double>(pt,"pol_vertex_isdf_svd_tol",vertex_isdf_svd_tol);
+    auto pol_vertex_isdf_thresh = io::get_value_with_default<double>(pt,"pol_vertex_isdf_thresh",vertex_isdf_thresh);
+    auto pol_vertex_isdf_cond_max = io::get_value_with_default<double>(pt,"pol_vertex_isdf_cond_max",vertex_isdf_cond_max);
+    auto pol_vertex_isdf_distr_tol = io::get_value_with_default<double>(pt,"pol_vertex_isdf_distr_tol",vertex_isdf_distr_tol);
 
     simple_dyson dyson(mf.get(), &ft, mu_tol, mu_update_alg);
     if (io::get_value_with_default<bool>(pt,"iter_alg.enable", true)) {
@@ -419,6 +469,14 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     vertex.set_bl_head_static_all(vertex_bl_head_static_all);
     vertex.set_isdf_distr_tol(vertex_isdf_distr_tol);
     if (not vertex_div_treatment.empty()) vertex.set_div_treatment(vertex_div_treatment);
+    // scGW-tilde (C0): validate + store the ladder knobs (double-count guard and the
+    // not-implemented abort for an ACTIVE ladder live in the setter) and hand the CVV
+    // R-shell tolerance to the W builder for increment C4.
+    vertex.set_pol_vertex(pol_vertex, pol_vertex_kernel, pol_vertex_band_window,
+                          pol_vertex_isdf_rank, pol_vertex_isdf_svd_tol,
+                          pol_vertex_isdf_thresh, pol_vertex_isdf_cond_max,
+                          pol_vertex_isdf_distr_tol);
+    scr_eri.set_cvv_rspace_tol(cvv_rspace_tol);
     if (vertex.enabled()) {
       utils::check(screen_type == "rpa" or screen_type == "rpa_k",
                    "vertex_type = \"{}\" currently requires screen_type = \"rpa\" or \"rpa_k\" "
@@ -744,6 +802,27 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
     // band_window) instead of the band window; U is Loewdin-orthonormalized at load.
     auto vertex_wannier_file = io::get_value_with_default<std::string>(pt,"vertex_wannier_file","");
     auto vertex_wannier_loewdin = io::get_value_with_default<bool>(pt,"vertex_wannier_loewdin",true);
+    // scGW-tilde knob surface (increment C0; notes/scgwt_implementation_plan.md
+    // section 1). div_treatment = "cvv" is validated here because the W build would
+    // otherwise silently ignore an unknown policy string; it aborts until the update_w
+    // head fill lands (increment C4). The pol_vertex_* basis knobs inherit the vertex_*
+    // values when their keys are absent, so a ladder run on top of an existing vertex
+    // input needs only pol_vertex = "ladder".
+    utils::check(div_treatment != "cvv",
+                 "div_treatment = \"cvv\" is scaffolding only (increment C0): the CVV "
+                 "head fill of update_w lands in increment C4 of "
+                 "notes/scgwt_implementation_plan.md.");
+    auto cvv_rspace_tol = io::get_value_with_default<double>(pt,"cvv_rspace_tol",1e-6);
+    auto pol_vertex = io::get_value_with_default<std::string>(pt,"pol_vertex","none");
+    io::tolower(pol_vertex);
+    auto pol_vertex_kernel = io::get_value_with_default<std::string>(pt,"pol_vertex_kernel","w0_prev");
+    io::tolower(pol_vertex_kernel);
+    auto pol_vertex_band_window = io::get_value_with_default<nda::range>(pt,"pol_vertex_band_window",vertex_band_window);
+    auto pol_vertex_isdf_rank = io::get_value_with_default<long>(pt,"pol_vertex_isdf_rank",vertex_isdf_rank);
+    auto pol_vertex_isdf_svd_tol = io::get_value_with_default<double>(pt,"pol_vertex_isdf_svd_tol",vertex_isdf_svd_tol);
+    auto pol_vertex_isdf_thresh = io::get_value_with_default<double>(pt,"pol_vertex_isdf_thresh",vertex_isdf_thresh);
+    auto pol_vertex_isdf_cond_max = io::get_value_with_default<double>(pt,"pol_vertex_isdf_cond_max",vertex_isdf_cond_max);
+    auto pol_vertex_isdf_distr_tol = io::get_value_with_default<double>(pt,"pol_vertex_isdf_distr_tol",vertex_isdf_distr_tol);
 
     simple_dyson dyson(mf.get(), &ft, mu_tol, mu_update_alg);
     if (io::get_value_with_default<bool>(pt,"iter_alg.enable", true)) {
@@ -768,6 +847,14 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
     vertex.set_bl_head_static_all(vertex_bl_head_static_all);
     vertex.set_isdf_distr_tol(vertex_isdf_distr_tol);
     if (not vertex_div_treatment.empty()) vertex.set_div_treatment(vertex_div_treatment);
+    // scGW-tilde (C0): validate + store the ladder knobs (double-count guard and the
+    // not-implemented abort for an ACTIVE ladder live in the setter) and hand the CVV
+    // R-shell tolerance to the W builder for increment C4.
+    vertex.set_pol_vertex(pol_vertex, pol_vertex_kernel, pol_vertex_band_window,
+                          pol_vertex_isdf_rank, pol_vertex_isdf_svd_tol,
+                          pol_vertex_isdf_thresh, pol_vertex_isdf_cond_max,
+                          pol_vertex_isdf_distr_tol);
+    scr_eri.set_cvv_rspace_tol(cvv_rspace_tol);
     if (vertex.enabled()) {
       utils::check(screen_type == "rpa" or screen_type == "rpa_k",
                    "vertex_type = \"{}\" currently requires screen_type = \"rpa\" or \"rpa_k\" "

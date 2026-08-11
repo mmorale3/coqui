@@ -792,6 +792,24 @@ namespace solvers {
     bool _bl_head_static_all = false;
     // distr_tol for build_secondary_basis' private thc builder; <= 0 = builder default
     double _isdf_distr_tol = -1.0;
+    // ---- scGW-tilde ladder polarization (pol_vertex; notes/scgwt_implementation_plan.md
+    // increments L1-L3, notes/scgw_screening_fix_proposal.pdf section 4.2) -------------
+    // INDEPENDENT of the Phi-derivable vertex modes above: the ladder resums
+    // density-channel static-W-bar_0 rungs in P ONLY (Sigma stays GW-form), so
+    // Phi-derivability of the production loop is surrendered by construction (user
+    // ruling 2026-08-10). "none" (default) = inert, bit-identical to the pre-scgwt tree.
+    std::string _pol_vertex = "none";
+    // ladder kernel source (ruling R4): "w0_prev" = W-bar_0 from the previous iteration's
+    // W (matches the static-rung convention); "w0_frozen" = RPA@KS W_0 (scGW_0-flavored).
+    std::string _pol_kernel = "w0_prev";
+    // ladder C-window + secondary-basis knobs. These store RESOLVED values: the driver
+    // implements the "pol_vertex_* inherits vertex_*" default rule at parse time.
+    nda::range _pol_band_window = nda::range(0, 0);
+    long _pol_isdf_rank = -1;
+    double _pol_isdf_svd_tol = 1e-8;
+    double _pol_isdf_thresh = -1.0;
+    double _pol_isdf_cond_max = -1.0;
+    double _pol_isdf_distr_tol = -1.0;
     // DIAGNOSTIC (default OFF, not physical): THE CONSTANT-RUNG ABSOLUTE PIN.
     //
     // X^L = pi^dyn - Pi^{C,0}(tau=0) must VANISH when the screening is genuinely static.
@@ -1246,6 +1264,68 @@ namespace solvers {
      *  counts that already ran. */
     void set_isdf_distr_tol(double tol) { _isdf_distr_tol = tol; }
     double isdf_distr_tol() const { return _isdf_distr_tol; }
+
+    /**
+     * scGW-tilde ladder polarization (pol_vertex = "ladder"; notes/
+     * scgwt_implementation_plan.md increments L1-L3). Validates and stores the knob
+     * surface; enforces the double-count guard (ruling R5) and the DLR requirement for
+     * an ACTIVE ladder. C = empty (window size 0) is an exact no-op, mirroring the
+     * vertex convention -- the inert path is reached BEFORE any not-implemented abort,
+     * exactly like the S1 rung-mode plumbing. The pol_* basis knobs arrive RESOLVED
+     * (the driver applies the "inherit vertex_*" default rule).
+     */
+    void set_pol_vertex(std::string mode, std::string kernel, nda::range band_window,
+                        long isdf_rank, double isdf_svd_tol, double isdf_thresh,
+                        double isdf_cond_max, double isdf_distr_tol) {
+      utils::check(mode == "none" or mode == "ladder",
+                   "vertex_t::set_pol_vertex: unknown pol_vertex \"{}\". Valid options "
+                   "are \"none\", \"ladder\".", mode);
+      utils::check(kernel == "w0_prev" or kernel == "w0_frozen",
+                   "vertex_t::set_pol_vertex: unknown pol_vertex_kernel \"{}\". Valid "
+                   "options are \"w0_prev\" (default; ruling R4), \"w0_frozen\".", kernel);
+      _pol_vertex = mode;
+      _pol_kernel = kernel;
+      _pol_band_window = band_window;
+      _pol_isdf_rank = isdf_rank;
+      _pol_isdf_svd_tol = isdf_svd_tol;
+      _pol_isdf_thresh = isdf_thresh;
+      _pol_isdf_cond_max = isdf_cond_max;
+      _pol_isdf_distr_tol = isdf_distr_tol;
+      if (not pol_vertex_active()) {
+        if (pol_vertex_enabled())
+          app_log(1, "  [scGW-tilde] pol_vertex = \"ladder\" with an EMPTY C-window: "
+                     "the ladder is inert (exact no-op).");
+        return;
+      }
+      // DOUBLE-COUNT GUARD (ruling R5; scgw_screening_fix_proposal.pdf section 5.2): the
+      // ladder's first-order term IS the implemented static-rung Pi^C, so an ACTIVE
+      // vertex_type is excluded -- "linear"/"dynamic" inject a Pi^C into P (double
+      // counting), and "static" would run Sigma^C rungs beside the ladder, which the
+      // adopted scGW-tilde scheme defers (Sigma stays GW-form; Sigma^C re-enable is a
+      // separate ruling, plan X1 note).
+      utils::check(not active(),
+                   "pol_vertex = \"ladder\" cannot be combined with an ACTIVE vertex_type "
+                   "(= \"{}\", vertex_rung = \"{}\"): the ladder resums the static-rung "
+                   "Pi^C (double counting on the P side), and scGW-tilde keeps Sigma "
+                   "GW-form. Disable one of the two.", _vertex_type, rung_str());
+      // frequency-diagonal solves + the W-bar_0 kernel live on the DLR nodes
+      utils::check(_ft->basis() == imag_axes_ft::dlr_basis,
+                   "pol_vertex = \"ladder\" requires the DLR IAFT backend "
+                   "(iaft basis = \"dlr\").");
+      // scaffolding stop (increment C0): pair bubble / solve / injection land in L1-L3.
+      utils::check(false,
+                   "pol_vertex = \"ladder\" is scaffolding only (increment C0); the pair "
+                   "bubble, ladder solve and injection land in increments L1-L3 of "
+                   "notes/scgwt_implementation_plan.md.");
+    }
+    // scGW-tilde ladder requested in the input ([gw] pol_vertex)
+    bool pol_vertex_enabled() const { return _pol_vertex != "none"; }
+    // requested AND the ladder C-window is non-empty (C = empty = exact no-op)
+    bool pol_vertex_active() const {
+      return pol_vertex_enabled() and _pol_band_window.size() > 0;
+    }
+    std::string pol_vertex() const { return _pol_vertex; }
+    std::string pol_vertex_kernel() const { return _pol_kernel; }
 
     /** DIAGNOSTIC, default 0 -- drop one cut-piece so its exact energy contribution can be
      *  read off. 1 = drop Sigma^(L,r), 2 = drop Sigma^(C,x), 3 = drop both (which isolates

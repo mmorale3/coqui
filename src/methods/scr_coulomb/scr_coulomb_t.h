@@ -260,6 +260,11 @@ namespace solvers {
     std::string _screen_type = "";
 
     std::string _div_treatment;
+    // scGW-tilde CVV head (div_treatment = "cvv"; notes/scgwt_implementation_plan.md
+    // increments C1-C4): R-shell truncation tolerance handed to cvv_head_t
+    // ([gw] cvv_rspace_tol). Stored at C0; consumed when the update_w head fill
+    // lands (C4).
+    double _cvv_rspace_tol = 1e-6;
     utils::TimerManager _Timer;
 
     // optional second-order-exchange vertex correction (ISDF-Vertex, not owned).
@@ -273,6 +278,9 @@ namespace solvers {
 
   public:
     std::string div_treatment() const { return _div_treatment; }
+    // scGW-tilde (C0): cvv_head_t validates > 0 at construction (C4)
+    void set_cvv_rspace_tol(double tol) { _cvv_rspace_tol = tol; }
+    double cvv_rspace_tol() const { return _cvv_rspace_tol; }
     std::string& screen_type() { return _screen_type; };
     std::string screen_type() const { return _screen_type; };
 
