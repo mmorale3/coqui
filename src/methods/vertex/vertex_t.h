@@ -1354,6 +1354,13 @@ namespace solvers {
       long rungs_used = 0;
       double dropped_frac_test = -1.0; // tol_L = 0.5 kernel: dropped ||w(L)||
       double j1_resid_trunc = -1.0;    // ...and its j=1 error (monotone meter)
+      // the sampled kept-(P,Q) apply (design 4b.1 step (ii)):
+      double pq_all_j1_resid = -1.0;       // sampled, ALL pairs kept: j=1 vs direct
+      double pq_all_neumann_resid = -1.0;  // ...converged Neumann vs direct resolvent
+      double pq_all_max_reldiff = -1.0;    // ...max|sampled - dense-rs|/max|dense-rs|, j=1
+      double pq_kept_frac_test = -1.0;     // tau_PQ meter kernel: kept pair fraction
+      double pq_dropped_wfrac_test = -1.0; // ...dropped pair-channel ||w||_F fraction
+      double pq_j1_resid_trunc = -1.0;     // ...j=1 error (the monotone pair meter)
     };
     ladder_p4_diag ladder_p4_gates(MBState &mb_state, THC_ERI auto &thc);
 

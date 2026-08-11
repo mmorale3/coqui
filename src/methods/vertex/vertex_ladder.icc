@@ -273,6 +273,15 @@ namespace solvers {
       nda::array<double, 2> Lcart;          // (nL, 3) kept L vectors, cartesian
       nda::array<ComplexType, 3> w;         // (nL, Nm, Nm): w_PQ(L)/w_L (1/w_L folded in)
       double dropped_frac = 0.0;            // dropped ||w(L)|| fraction (the L meter)
+      // sampled kept-(P,Q) mode (tau_PQ > 0; design note section 4b.1 step (ii)):
+      // ONE global kept-pair list over the (P,Q) channel, kernel values stored on it
+      // only -- the dense (nL, Nm, Nm) store never exists in this mode. Thresholds and
+      // meters use the FOLDED values w_PQ(L)/w_L (what the apply consumes).
+      bool sampled = false;
+      nda::array<long, 1> pq_P, pq_Q;       // (n_pq) kept-pair channel indices
+      nda::array<ComplexType, 2> w_pq;      // (nL, n_pq): w_PQ(L)/w_L on the kept list
+      double pq_kept_frac = 1.0;            // n_pq / Nm^2 (the pair meter)
+      double pq_dropped_wfrac = 0.0;        // dropped pair-channel ||w||_F fraction
     };
 
     // cartesian L vectors from lattice-unit indices (the cvv_detail::rcart_from_idx
@@ -292,12 +301,16 @@ namespace solvers {
      *  L shell => the WS round trip is EXACT on mesh qx (the CVV-verified pair). The
      *  shell rule is the CVV cumulative-dropped-norm walk (outermost first, L = 0
      *  never dropped). One dense (Nm, Nm) buffer at a time -- no (nL, Nm^2) transient
-     *  beyond the kept set. */
+     *  beyond the kept set.
+     *  tau_PQ > 0 selects the SAMPLED kept-(P,Q) mode (design 4b.1 step (ii)): keep
+     *  the pairs with max_L |w_PQ(L)/w_L| >= tau_PQ * max over the kept L set (one
+     *  global list, v1), store the kernel values on the list only. tau_PQ = 0 is the
+     *  dense-w path, untouched. */
     inline ladder_kernel_rs build_kernel_rs(nda::array<ComplexType, 3> const &W0b,
                                             nda::MemoryArrayOfRank<2> auto const &Qpts,
                                             nda::stack_array<double, 3, 3> const &lattv,
                                             nda::MemoryArrayOfRank<1> auto const &kp_grid,
-                                            double tol_L) {
+                                            double tol_L, double tau_PQ = 0.0) {
       decltype(nda::range::all) all;
       const long nq = W0b.shape(0), Nm = W0b.shape(1);
       auto [lw, lp] = utils::WS_rgrid(lattv, kp_grid);
@@ -352,26 +365,170 @@ namespace solvers {
         if (not drop[iL]) kept.push_back(iL);
       ker.nL = long(kept.size());
       ker.Lcart = nda::array<double, 2>(ker.nL, 3);
-      ker.w = nda::array<ComplexType, 3>(ker.nL, Nm, Nm);
-      for (long i = 0; i < ker.nL; ++i) {
-        const long iL = kept[i];
-        for (int a = 0; a < 3; ++a) ker.Lcart(i, a) = Lc(iL, a);
-        wL_at(iL);                                   // pass 2: recompute, fold 1/w_L
-        ker.w(i, all, all) = wbuf;
-        ker.w(i, all, all) /= double(lw(iL));
+      for (long i = 0; i < ker.nL; ++i)
+        for (int a = 0; a < 3; ++a) ker.Lcart(i, a) = Lc(kept[i], a);
+      if (tau_PQ <= 0.0) {
+        ker.w = nda::array<ComplexType, 3>(ker.nL, Nm, Nm);
+        for (long i = 0; i < ker.nL; ++i) {
+          const long iL = kept[i];
+          wL_at(iL);                                 // pass 2: recompute, fold 1/w_L
+          ker.w(i, all, all) = wbuf;
+          ker.w(i, all, all) /= double(lw(iL));
+        }
+      } else {
+        // pass 2a: per-pair max and Frobenius weight of the FOLDED values over kept L
+        ker.sampled = true;
+        nda::array<double, 2> mx(Nm, Nm), n2p(Nm, Nm);
+        mx() = 0.0;
+        n2p() = 0.0;
+        for (long i = 0; i < ker.nL; ++i) {
+          const long iL = kept[i];
+          wL_at(iL);
+          const double wLi = 1.0 / double(lw(iL));
+          for (long P = 0; P < Nm; ++P)
+            for (long Q = 0; Q < Nm; ++Q) {
+              const double a = std::abs(wbuf(P, Q)) * wLi;
+              mx(P, Q) = std::max(mx(P, Q), a);
+              n2p(P, Q) += a * a;
+            }
+        }
+        double wmax = 0.0;
+        for (long P = 0; P < Nm; ++P)
+          for (long Q = 0; Q < Nm; ++Q) wmax = std::max(wmax, mx(P, Q));
+        std::vector<long> pq;
+        double kept2 = 0.0, all2 = 0.0;
+        for (long P = 0; P < Nm; ++P)
+          for (long Q = 0; Q < Nm; ++Q) {
+            all2 += n2p(P, Q);
+            if (mx(P, Q) >= tau_PQ * wmax) {
+              pq.push_back(P * Nm + Q);
+              kept2 += n2p(P, Q);
+            }
+          }
+        const long npq = long(pq.size());
+        ker.pq_P = nda::array<long, 1>(npq);
+        ker.pq_Q = nda::array<long, 1>(npq);
+        for (long ip = 0; ip < npq; ++ip) {
+          ker.pq_P(ip) = pq[ip] / Nm;
+          ker.pq_Q(ip) = pq[ip] % Nm;
+        }
+        ker.pq_kept_frac = double(npq) / double(Nm * Nm);
+        ker.pq_dropped_wfrac =
+            std::sqrt(std::max(all2 - kept2, 0.0) / std::max(all2, 1e-300));
+        // pass 2b: gather the kernel values on the kept list, 1/w_L folded
+        ker.w_pq = nda::array<ComplexType, 2>(ker.nL, npq);
+        for (long i = 0; i < ker.nL; ++i) {
+          const long iL = kept[i];
+          wL_at(iL);
+          const double wLi = 1.0 / double(lw(iL));
+          for (long ip = 0; ip < npq; ++ip)
+            ker.w_pq(i, ip) = wbuf(ker.pq_P(ip), ker.pq_Q(ip)) * wLi;
+        }
       }
       ker.dropped_frac = std::sqrt(drop2 / std::max(tot2, 1e-300));
       app_log(2, "  [scGW-tilde P4a] R-space kernel: {} / {} L shells kept "
                  "(tol_L = {}); dropped ||w(L)|| fraction = {:.3e}",
               ker.nL, nLf, tol_L, ker.dropped_frac);
+      if (ker.sampled)
+        app_log(2, "  [scGW-tilde P4a] sampled (P,Q) channel: {} / {} pairs kept "
+                   "(tau_PQ = {}); dropped pair ||w|| fraction = {:.3e}",
+                long(ker.pq_P.shape(0)), Nm * Nm, tau_PQ, ker.pq_dropped_wfrac);
       return ker;
+    }
+
+    /**
+     * The sampled kept-(P,Q) K~-apply (design 4b.1 step (ii)): the same three-phase
+     * sweep as the dense apply below, but the (P,Q) channel is visited on the kernel's
+     * global kept list only -- the dense T2 (forward) and A1 (backward) gemms become
+     * nc-length dots / rank-1 scatters per kept pair. Same summand values and p3/p1
+     * orderings as the dense path (the all-kept limit differs only by the gemm-vs-dot
+     * accumulation class). Y is OVERWRITTEN.
+     */
+    inline void apply_kernel_rs_sampled(ladder_kernel_rs const &ker,
+                                        nda::array<ComplexType, 4> const &Xb, long is,
+                                        nda::array<long, 2> const &kpq, long iq,
+                                        nda::array<double, 2> const &kpts,
+                                        nda::MemoryArrayOfRank<2> auto const &X,   // (D, B)
+                                        nda::MemoryArrayOfRank<2> auto &&Y) {      // (D, B)
+      decltype(nda::range::all) all;
+      const long nk = kpq.shape(1), nc = Xb.shape(3), Nm = ker.Nm;
+      const long nc2 = nc * nc, B = X.shape(1);
+      const long npq = ker.pq_P.shape(0);
+      utils::check(X.shape(0) == nc2 * nk and Y.shape(0) == nc2 * nk and
+                   Y.shape(1) == B, "apply_kernel_rs_sampled: block shape mismatch.");
+      Y() = ComplexType(0.0);
+      nda::array<ComplexType, 2> Xw(nc2, B), T1(Nm, nc * B);
+      nda::array<ComplexType, 2> Xkc(Nm, nc), Xq3(nc, Nm);
+      nda::array<ComplexType, 2> Gsp(npq, B);
+      nda::array<ComplexType, 2> Xp1(nc, Nm), Xqc(Nm, nc), A2s(nc * B, nc);
+      for (long iL = 0; iL < ker.nL; ++iL) {
+        Gsp() = ComplexType(0.0);
+        // ---- forward sweep: the T1 map gemm, then per kept pair an nc-length dot ----
+        for (long ik = 0; ik < nk; ++ik) {
+          const long ikpq = kpq(iq, ik);
+          const double kL = kpts(ik, 0) * ker.Lcart(iL, 0) +
+                            kpts(ik, 1) * ker.Lcart(iL, 1) +
+                            kpts(ik, 2) * ker.Lcart(iL, 2);
+          const ComplexType php = std::exp(ComplexType(0.0, kL));
+          Xw() = X(nda::range(ik * nc2, (ik + 1) * nc2), all);
+          auto X3 = nda::reshape(Xw, std::array<long, 2>{nc, nc * B});  // p1' x (p3, b)
+          for (long P = 0; P < Nm; ++P)
+            for (long p = 0; p < nc; ++p) Xkc(P, p) = std::conj(Xb(is, ik, P, p));
+          nda::blas::gemm(Xkc, X3, T1);                  // P x (p3, b)
+          for (long p3 = 0; p3 < nc; ++p3)
+            for (long Q = 0; Q < Nm; ++Q) Xq3(p3, Q) = Xb(is, ikpq, Q, p3);
+          for (long ip = 0; ip < npq; ++ip) {
+            const long P = ker.pq_P(ip), Q = ker.pq_Q(ip);
+            for (long b = 0; b < B; ++b) {
+              ComplexType g(0.0);
+              for (long p3 = 0; p3 < nc; ++p3) g += T1(P, p3 * B + b) * Xq3(p3, Q);
+              Gsp(ip, b) += php * g;
+            }
+          }
+        }
+        // ---- the diagonal kernel on the kept list -----------------------------------
+        for (long ip = 0; ip < npq; ++ip) {
+          const ComplexType wv = ker.w_pq(iL, ip);
+          for (long b = 0; b < B; ++b) Gsp(ip, b) *= wv;
+        }
+        // ---- backward sweep: rank-1 (p1 x p3') scatter per kept pair ----------------
+        for (long ikp = 0; ikp < nk; ++ikp) {
+          const long ikppq = kpq(iq, ikp);
+          const double kL = kpts(ikp, 0) * ker.Lcart(iL, 0) +
+                            kpts(ikp, 1) * ker.Lcart(iL, 1) +
+                            kpts(ikp, 2) * ker.Lcart(iL, 2);
+          const ComplexType phm = std::exp(ComplexType(0.0, -kL));
+          for (long p1 = 0; p1 < nc; ++p1)
+            for (long P = 0; P < Nm; ++P) Xp1(p1, P) = Xb(is, ikp, P, p1);
+          for (long Q = 0; Q < Nm; ++Q)
+            for (long p3p = 0; p3p < nc; ++p3p)
+              Xqc(Q, p3p) = std::conj(Xb(is, ikppq, Q, p3p));
+          A2s() = ComplexType(0.0);
+          for (long ip = 0; ip < npq; ++ip) {
+            const long P = ker.pq_P(ip), Q = ker.pq_Q(ip);
+            for (long b = 0; b < B; ++b) {
+              const ComplexType c = Gsp(ip, b);
+              for (long p1 = 0; p1 < nc; ++p1) {
+                const ComplexType t = Xp1(p1, P) * c;
+                for (long p3p = 0; p3p < nc; ++p3p)
+                  A2s(p1 * B + b, p3p) += t * Xqc(Q, p3p);
+              }
+            }
+          }
+          for (long p1 = 0; p1 < nc; ++p1)
+            for (long p3p = 0; p3p < nc; ++p3p)
+              for (long b = 0; b < B; ++b)
+                Y(ikp * nc2 + p1 * nc + p3p, b) += phm * A2s(p1 * B + b, p3p);
+        }
+      }
     }
 
     /**
      * The chain-native K~-apply (K~ = K^T, the verified Kbig orientation):
      *   out_{(p1 nc + p3', k'), b} = sum_L e^{-i k'.L} sum_{PQ} X_P,p1(k') X*_Q,p3'(k'+q)
      *       [w_PQ(L)/w_L] sum_k e^{+i k.L} sum_{p1' p3} X*_P,p1'(k) X_Q,p3(k+q) x_{(p1' nc + p3, k), b}
-     * Dense-w v1: gemms + small permute copies only. Y is OVERWRITTEN.
+     * Dense-w v1: gemms + small permute copies only. Y is OVERWRITTEN. A sampled
+     * kernel (tau_PQ > 0) dispatches to apply_kernel_rs_sampled.
      */
     inline void apply_kernel_rs(ladder_kernel_rs const &ker,
                                 nda::array<ComplexType, 4> const &Xb, long is,
@@ -379,6 +536,10 @@ namespace solvers {
                                 nda::array<double, 2> const &kpts,
                                 nda::MemoryArrayOfRank<2> auto const &X,   // (D, B)
                                 nda::MemoryArrayOfRank<2> auto &&Y) {      // (D, B)
+      if (ker.sampled) {
+        apply_kernel_rs_sampled(ker, Xb, is, kpq, iq, kpts, X, Y);
+        return;
+      }
       decltype(nda::range::all) all;
       const long nk = kpq.shape(1), nc = Xb.shape(3), Nm = ker.Nm;
       const long nc2 = nc * nc, B = X.shape(1);
@@ -881,12 +1042,53 @@ namespace solvers {
     mpi->comm.all_reduce_in_place_n(P1t.data(), P1t.size(), std::plus<>{});
     out.j1_resid_trunc = rel(P1t, P1d);
 
+    // ---- the sampled kept-(P,Q) apply (design 4b.1 step (ii)) ------------------------
+    // all-kept sampled kernel (tau_PQ = tiny, nothing dropped): pins the sampled
+    // contraction arithmetic against the dense-w apply (the T2/A1 gemms become
+    // nc-length dots -- FP-accumulation class) and against the direct anchor.
+    auto kers = vertex_ladder_detail::build_kernel_rs(_W0b_qmm.value(), Qpts,
+                                                      MF->lattv(), MF->kp_grid(), 0.0,
+                                                      1e-300);
+    nda::array<ComplexType, 4> P1s(1, nq, Nm, Nm), Pls(1, nq, Nm, Nm);
+    vertex_ladder_detail::pair_space_ladder_rs(G_CC, _Xb_skma, kers, kpq, kpts, tools,
+                                               nu0, 1e-12, 200, &P1s, &Pls, rank, size);
+    mpi->comm.all_reduce_in_place_n(P1s.data(), P1s.size(), std::plus<>{});
+    mpi->comm.all_reduce_in_place_n(Pls.data(), Pls.size(), std::plus<>{});
+    out.pq_all_j1_resid = rel(P1s, P1d);
+    out.pq_all_neumann_resid = rel(Pls, Pld);
+    {
+      double mxd = 0.0, mxv = 0.0;
+      for (long i = 0; i < long(P1s.size()); ++i) {
+        mxd = std::max(mxd, std::abs(*(P1s.data() + i) - *(P1r.data() + i)));
+        mxv = std::max(mxv, std::abs(*(P1r.data() + i)));
+      }
+      out.pq_all_max_reldiff = mxd / std::max(mxv, 1e-300);
+    }
+    // truncated pair list (tau_PQ = 0.5): the kept fraction must genuinely shrink and
+    // the j=1 error must sit above the all-kept floor (the monotone pair meter).
+    auto kert = vertex_ladder_detail::build_kernel_rs(_W0b_qmm.value(), Qpts,
+                                                      MF->lattv(), MF->kp_grid(), 0.0,
+                                                      0.5);
+    out.pq_kept_frac_test = kert.pq_kept_frac;
+    out.pq_dropped_wfrac_test = kert.pq_dropped_wfrac;
+    nda::array<ComplexType, 4> P1u(1, nq, Nm, Nm);
+    vertex_ladder_detail::pair_space_ladder_rs(G_CC, _Xb_skma, kert, kpq, kpts, tools,
+                                               nu0, 1e-12, 1, &P1u, nullptr, rank, size);
+    mpi->comm.all_reduce_in_place_n(P1u.data(), P1u.size(), std::plus<>{});
+    out.pq_j1_resid_trunc = rel(P1u, P1d);
+
     app_log(1, "  [scGW-tilde P4] gates: G-P4a rs(tol=0) j=1 vs direct one-rung = "
                "{:.3e}; G-P4b Neumann ({} rungs) vs direct resolvent = {:.3e};\n"
                "    truncation meter (tol_L = 0.5): dropped ||w(L)|| = {:.3e}, "
                "j=1 resid = {:.3e}",
             out.j1_resid, out.rungs_used, out.neumann_resid, out.dropped_frac_test,
             out.j1_resid_trunc);
+    app_log(1, "  [scGW-tilde P4] sampled (P,Q) gates: all-kept j=1 vs direct = {:.3e}, "
+               "Neumann vs direct = {:.3e}, max reldiff vs dense-rs = {:.3e};\n"
+               "    pair meter (tau_PQ = 0.5): kept frac = {:.3e}, dropped pair ||w|| "
+               "= {:.3e}, j=1 resid = {:.3e}",
+            out.pq_all_j1_resid, out.pq_all_neumann_resid, out.pq_all_max_reldiff,
+            out.pq_kept_frac_test, out.pq_dropped_wfrac_test, out.pq_j1_resid_trunc);
     return out;
   }
 

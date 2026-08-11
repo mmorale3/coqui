@@ -218,6 +218,22 @@ namespace bdft_tests {
     REQUIRE(d4.rungs_used >= 1);
     REQUIRE(d4.dropped_frac_test > 0.0);
     REQUIRE(d4.j1_resid_trunc > d4.j1_resid);
+    //  sampled kept-(P,Q) apply (design 4b.1 step (ii)): with ALL pairs kept the
+    //  sampled contractions must sit in the same machine-precision class as the dense
+    //  apply (the T2/A1 gemms become nc-length dots -- FP-accumulation class only);
+    //  a tau_PQ = 0.5 list must genuinely drop pairs and its j = 1 error must sit
+    //  above the all-kept floor (the monotone pair meter).
+    app_log(1, "scgwt_ladder_l1: P4 sampled (P,Q): all-kept j1 = {:.3e}, neumann = "
+               "{:.3e}, reldiff vs dense = {:.3e}; tau=0.5 kept frac = {:.3e}, "
+               "j1_trunc = {:.3e}",
+            d4.pq_all_j1_resid, d4.pq_all_neumann_resid, d4.pq_all_max_reldiff,
+            d4.pq_kept_frac_test, d4.pq_j1_resid_trunc);
+    REQUIRE(d4.pq_all_j1_resid < 1e-11);
+    REQUIRE(d4.pq_all_neumann_resid < 1e-8);
+    REQUIRE(d4.pq_all_max_reldiff < 1e-11);
+    REQUIRE(d4.pq_kept_frac_test > 0.0);
+    REQUIRE(d4.pq_kept_frac_test < 1.0);
+    REQUIRE(d4.pq_j1_resid_trunc > d4.pq_all_j1_resid);
 
     mpi_context->comm.barrier();
     if (mpi_context->comm.root()) remove((output + ".mbpt.h5").c_str());
