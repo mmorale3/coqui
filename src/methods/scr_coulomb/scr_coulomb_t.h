@@ -276,6 +276,24 @@ namespace solvers {
     std::optional<memory::darray_t<nda::array<ComplexType, 4>, mpi3::communicator> > _dW_qtPQ_opt;
     std::optional<nda::array<ComplexType, 1> > _eps_inv_head;
 
+    // scGW-tilde C4 (div_treatment = "cvv"): lazily built H0 store for the covariant
+    // velocity (hamilt::set_H0, once at the first cvv update_w; the transient
+    // pseudopot is discarded).
+    std::optional<sArray_t<nda::array_view<ComplexType, 4>>> _sH0_cvv;
+
+    /**
+     * scGW-tilde C4: (eps^{-1}_head - 1) on the PH-sym tau half grid from the
+     * covariant-velocity SUBTRACTED head (cvv_head_t / cvv_detail::head_subtract):
+     * scalar head Dyson eps(q^, inu) = 1 - 4 pi q^q^ : Phead(inu), wings dropped (as
+     * the gygi treatment does), angular average of eps^{-1} over the three cartesian
+     * directions (exact for cubic symmetry). Also logs the T-d meter v(q).P00 (PDF
+     * G-c; warns as it approaches 1). Called by update_w under div_treatment = "cvv"
+     * INSTEAD of the stored/gygi q -> 0 extrapolation; every downstream consumer
+     * (Sigma_div_correction, vertex rungs, build_w0, cache_w) reads the SAME
+     * mb_state.eps_inv_head array -- single-sourcing, none of them is edited.
+     */
+    nda::array<ComplexType, 1> eval_cvv_eps_inv_head(MBState &mb_state, THC_ERI auto &thc);
+
   public:
     std::string div_treatment() const { return _div_treatment; }
     // scGW-tilde (C0): cvv_head_t validates > 0 at construction (C4)

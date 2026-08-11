@@ -26,6 +26,9 @@
 #include "methods/HF/thc_solver_comm.hpp"
 #include "methods/GW/g0_div_utils.hpp"
 #include "methods/vertex/vertex_t.h"
+#include "hamiltonian/one_body_hamiltonian.hpp"   // scGW-tilde C4: H0 for the CVV velocity
+#include "hamiltonian/pseudo/pseudopot.h"
+#include "cvv_head.hpp"
 #include "scr_coulomb_t.h"
 #include "rpa_pi.icc"
 #include "edmft_pi.icc"
@@ -165,8 +168,17 @@ namespace solvers {
     // a) dPi_tqPQ is reset during dyson_W_from_Pi_tau()
     // b) pgrid and bsize of dW_tqPQ are forced to be the same as in dPi_tqPQ
     auto dW_tqPQ = dyson_W_from_Pi_tau<false>(dPi_tqPQ, thc, true);
+    // scGW-tilde C4 (div_treatment = "cvv"): the q -> 0 HEAD comes from the
+    // covariant-velocity subtracted head (eval_cvv_eps_inv_head) INSTEAD of the
+    // stored/gygi extrapolation; the q-RESOLVED eps_inv (diagnostics + dump) is
+    // div-treatment-independent, so eps_inv_head_t runs with "ignore_g0" (its head
+    // slot -- the smallest-q value -- is then replaced). Every consumer reads the
+    // same mb_state.eps_inv_head (single-sourcing; vertex_t.h coupling warning).
+    const bool cvv = (_div_treatment == "cvv");
     auto [eps_inv_head_q, eps_inv_head] =
-        div_utils::eps_inv_head_t(dW_tqPQ, thc, *thc.MF(), _ft, _div_treatment);
+        div_utils::eps_inv_head_t(dW_tqPQ, thc, *thc.MF(), _ft,
+                                  cvv ? "ignore_g0" : _div_treatment);
+    if (cvv) eps_inv_head = eval_cvv_eps_inv_head(mb_state, thc);
     mb_state.eps_inv_head = eps_inv_head;
 
     // ISDF-Vertex: report the static macroscopic dielectric constant
@@ -230,6 +242,61 @@ namespace solvers {
     if (_vertex != nullptr and _vertex->active() and _vertex->rung() == dynamic_rung
         and _vertex->secondary() and _vertex->w_cache_enabled())
       _vertex->cache_w(mb_state, thc);
+  }
+
+  // scGW-tilde C4: see the declaration in scr_coulomb_t.h for the contract. The
+  // returned array matches div_utils::eps_inv_head_t's head slot exactly: the PH-sym
+  // tau half grid storing (eps^{-1}_head - 1)(tau).
+  nda::array<ComplexType, 1> scr_coulomb_t::eval_cvv_eps_inv_head(MBState &mb_state,
+                                                                  THC_ERI auto &thc) {
+    mf::MF &mf = *thc.MF();
+    utils::check(mb_state.sF_skij.has_value() and mb_state.sG_tskij.has_value(),
+                 "eval_cvv_eps_inv_head: mb_state must carry F and G at update_w time.");
+    if (not _sH0_cvv.has_value()) {
+      _sH0_cvv = math::shm::make_shared_array<nda::array_view<ComplexType, 4>>(
+          *thc.mpi(), {mf.nspin(), mf.nkpts_ibz(), mf.nbnd(), mf.nbnd()});
+      auto psp = hamilt::make_pseudopot(mf);
+      hamilt::set_H0(mf, psp.get(), _sH0_cvv.value());
+    }
+
+    solvers::cvv_head_t cvv(_ft, _cvv_rspace_tol);
+    if (mb_state.sSigma_tskij.has_value())
+      cvv.build(mf, _sH0_cvv.value().local(), mb_state.sF_skij.value().local(),
+                mb_state.sSigma_tskij.value().local());
+    else {
+      nda::array<ComplexType, 5> sig_empty(0, 0, 0, 0, 0);
+      cvv.build(mf, _sH0_cvv.value().local(), mb_state.sF_skij.value().local(), sig_empty);
+    }
+    auto head = cvv.eval_head_tensor(mf, mb_state.sG_tskij.value().local());
+
+    // eps^{-1}_head(inu) - 1 on the PH-sym half grid (full-grid index i0 + j):
+    // scalar head Dyson per cartesian direction, angular average of eps^{-1}
+    const long nwb = _ft->nw_b(), i0 = nwb / 2;
+    const long nw_half = (nwb % 2 == 0) ? nwb / 2 : nwb / 2 + 1;
+    nda::array<ComplexType, 2> Ew(nw_half, 1);
+    for (long j = 0; j < nw_half; ++j) {
+      ComplexType acc(0.0);
+      for (int a = 0; a < 3; ++a)
+        acc += 1.0 / (1.0 - 4.0 * M_PI * head.Phead_wab(i0 + j, a, a));
+      Ew(j, 0) = acc / 3.0 - 1.0;
+    }
+    // T-d meter (PDF G-c): v(q).P00 at the head; the pre-fix runs showed it climbing
+    // toward 1 (dielectric collapse carries the J > 1 feedback)
+    double td = 0.0;
+    for (int a = 0; a < 3; ++a)
+      td = std::max(td, std::abs(4.0 * M_PI * head.Phead_wab(i0, a, a)));
+    app_log(1, "  [CVV] head (div_treatment = cvv): eps_inf(x, y, z) = "
+               "({:.6f}, {:.6f}, {:.6f}); T-d meter v.P00 = {:.4f}{}",
+            1.0 - 4.0 * M_PI * head.Phead_wab(i0, 0, 0).real(),
+            1.0 - 4.0 * M_PI * head.Phead_wab(i0, 1, 1).real(),
+            1.0 - 4.0 * M_PI * head.Phead_wab(i0, 2, 2).real(), td,
+            (td > 0.9) ? "  [WARNING: v.P00 approaching 1 -- dielectric collapse]" : "");
+
+    nda::array<ComplexType, 1> Et(_ft->nt_b() % 2 == 0 ? _ft->nt_b() / 2
+                                                       : _ft->nt_b() / 2 + 1);
+    auto Et_2D = nda::reshape(Et, shape_t<2>{Et.shape(0), 1});
+    _ft->w_to_tau_PHsym(Ew, Et_2D);
+    return Et;
   }
 
   template<bool w_out, nda::MemoryArrayOfRank<4> local_Array_t, typename communicator_t>

@@ -458,7 +458,13 @@ namespace methods {
 
       if (div_treatment == "ignore_g0") {
         return;
-      } else if (div_treatment.find("gygi") != std::string::npos) {
+      } else if (div_treatment.find("gygi") != std::string::npos
+                 or div_treatment == "cvv") {
+        // scGW-tilde C4: under div_treatment = "cvv" the correction formula below is
+        // UNCHANGED -- it reads the same madelung x eps_inv_head(tau) weight; only the
+        // CONTENT of mb_state.eps_inv_head differs (the covariant-velocity subtracted
+        // head instead of the q -> 0 extrapolation). Single-sourcing per the plan's C4
+        // invariant; this branch condition is the only edit.
         auto MF = thc.MF();
         auto mpi = thc.mpi();
         app_log(1, "    - madelung = {}", MF->madelung());

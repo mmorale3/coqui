@@ -794,4 +794,57 @@ namespace bdft_tests {
 #endif
   }
 
+  TEST_CASE("cvv_inloop_lih222", "[methods][scgwt][cvv]") {
+#ifndef ENABLE_DLR
+    SUCCEED("cvv_inloop_lih222 skipped: build has ENABLE_DLR=OFF.");
+#else
+    // Increment C4 gates on the 2^3 fixture. The TRIM zero makes the CVV head
+    // STRUCTURALLY ZERO at 2^3 (pinned above), which sharpens the A/B into:
+    //   C4-a  "cvv" == "ignore_g0" EXACTLY at 2^3: the head fill is exactly zero and
+    //         the Sigma correction adds an exactly-zero array -- the in-loop wiring
+    //         perturbs nothing outside the head;
+    //         "cvv" != "gygi": the gygi extrapolated head is nonzero, so the knob
+    //         moves numbers ONLY through the head content.
+    //   C4-c  ignore_g0/gygi bit-identity to the pre-scgwt tree is the scgwt_noop
+    //         gate (unchanged code paths; rerun with this suite).
+    // C4-b (8^3 damped-mixing stability without DIIS) needs the rusty checkpoints.
+    auto& mpi_context = utils::make_unit_test_mpi_context();
+    imag_axes_ft::IAFT ft(1000, 6.0, imag_axes_ft::dlr_basis, "low");
+    std::string output = "coqui_cvv_inloop";
+
+    auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_lih222"));
+    thc_reader_t thc(mf, make_thc_reader_ptree(mf->nbnd() * 8, "", "incore", "", "bdft",
+                                               1e-10, mf->ecutrho(), 1, 1024));
+    auto eri = mb_eri_t(thc, thc);
+
+    auto run = [&](std::string div) {
+      solvers::hf_t hf;
+      solvers::gw_t gw(&ft, div, output);
+      solvers::scr_coulomb_t scr_eri(&ft, "rpa", div);
+      simple_dyson dyson(mf.get(), &ft);
+      MBState mb_state(mpi_context, ft, output);
+      iter_scf::iter_scf_t iter_sol("damping");
+      auto [e_hf, e_corr] = scf_loop(mb_state, dyson, eri, ft,
+                                     solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol,
+                                     2, false, 1e-9, true);
+      mpi_context->comm.barrier();
+      if (mpi_context->comm.root()) remove((output + ".mbpt.h5").c_str());
+      mpi_context->comm.barrier();
+      return std::make_pair(e_hf, e_corr);
+    };
+
+    auto [eh_i, ec_i] = run("ignore_g0");
+    auto [eh_c, ec_c] = run("cvv");
+    auto [eh_g, ec_g] = run("gygi");
+    app_log(1, "cvv_inloop_lih222: ignore_g0 e_corr = {}", ec_i);
+    app_log(1, "cvv_inloop_lih222: cvv       e_corr = {}  (D vs ignore = {:.3e})",
+            ec_c, std::abs(ec_c - ec_i));
+    app_log(1, "cvv_inloop_lih222: gygi      e_corr = {}  (D vs ignore = {:.3e})",
+            ec_g, std::abs(ec_g - ec_i));
+    REQUIRE(eh_c == eh_i);            // C4-a: exactly-zero head at 2^3 => bit identity
+    REQUIRE(ec_c == ec_i);
+    REQUIRE(std::abs(ec_g - ec_i) > 1e-10);   // the head is what the knob moves
+#endif
+  }
+
 } // bdft_tests

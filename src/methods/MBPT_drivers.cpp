@@ -112,8 +112,11 @@ inline void ensure_checkpoint(std::shared_ptr<mf::MF> mf, std::string const& out
  *                 notes/scgwt_implementation_plan.md) replaces the gygi/stored q->0
  *                 EXTRAPOLATION of eps_inv_head by the covariant-velocity O(q^2) head,
  *                 Pi_ab(inu) = -(2/(beta Nk V)) sum_k,iw tr[v~_a G v~_b G] with
- *                 v~ = d_k(H0 + F + Sigma). Scaffolded (increment C0); ABORTS until the
- *                 update_w head fill lands (C4).
+ *                 v~ = d_k(H0 + F + Sigma). LIVE since increment C4: update_w fills
+ *                 mb_state.eps_inv_head from the SUBTRACTED head coefficient
+ *                 Phead(inu) = [Pi^jj(inu) - Pi^jj(0)]/(inu)^2 (zero-Drude-weight
+ *                 identity; insulators), wings dropped; all downstream consumers
+ *                 single-source that array. Logs the T-d meter v(q).P00 per iteration.
  *  - hf_div_treatment: "gygi" Divergent treatment for Coulomb kernel in HF. {choices: "ignore_g0", "gygi"}
  *  - niter: "1" Number of iterations in the self-consistent loop.
  *  - conv_thr: "1e-9" Convergence threshold for the self-consistent loop.
@@ -424,16 +427,11 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     // band_window) instead of the band window; U is Loewdin-orthonormalized at load.
     auto vertex_wannier_file = io::get_value_with_default<std::string>(pt,"vertex_wannier_file","");
     auto vertex_wannier_loewdin = io::get_value_with_default<bool>(pt,"vertex_wannier_loewdin",true);
-    // scGW-tilde knob surface (increment C0; notes/scgwt_implementation_plan.md
-    // section 1). div_treatment = "cvv" is validated here because the W build would
-    // otherwise silently ignore an unknown policy string; it aborts until the update_w
-    // head fill lands (increment C4). The pol_vertex_* basis knobs inherit the vertex_*
-    // values when their keys are absent, so a ladder run on top of an existing vertex
-    // input needs only pol_vertex = "ladder".
-    utils::check(div_treatment != "cvv",
-                 "div_treatment = \"cvv\" is scaffolding only (increment C0): the CVV "
-                 "head fill of update_w lands in increment C4 of "
-                 "notes/scgwt_implementation_plan.md.");
+    // scGW-tilde knob surface (notes/scgwt_implementation_plan.md section 1).
+    // div_treatment = "cvv" is live since increment C4 (the covariant-velocity head
+    // fill in update_w). The pol_vertex_* basis knobs inherit the vertex_* values when
+    // their keys are absent, so a ladder run on top of an existing vertex input needs
+    // only pol_vertex = "ladder".
     auto cvv_rspace_tol = io::get_value_with_default<double>(pt,"cvv_rspace_tol",1e-6);
     auto pol_vertex = io::get_value_with_default<std::string>(pt,"pol_vertex","none");
     io::tolower(pol_vertex);
@@ -802,16 +800,11 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
     // band_window) instead of the band window; U is Loewdin-orthonormalized at load.
     auto vertex_wannier_file = io::get_value_with_default<std::string>(pt,"vertex_wannier_file","");
     auto vertex_wannier_loewdin = io::get_value_with_default<bool>(pt,"vertex_wannier_loewdin",true);
-    // scGW-tilde knob surface (increment C0; notes/scgwt_implementation_plan.md
-    // section 1). div_treatment = "cvv" is validated here because the W build would
-    // otherwise silently ignore an unknown policy string; it aborts until the update_w
-    // head fill lands (increment C4). The pol_vertex_* basis knobs inherit the vertex_*
-    // values when their keys are absent, so a ladder run on top of an existing vertex
-    // input needs only pol_vertex = "ladder".
-    utils::check(div_treatment != "cvv",
-                 "div_treatment = \"cvv\" is scaffolding only (increment C0): the CVV "
-                 "head fill of update_w lands in increment C4 of "
-                 "notes/scgwt_implementation_plan.md.");
+    // scGW-tilde knob surface (notes/scgwt_implementation_plan.md section 1).
+    // div_treatment = "cvv" is live since increment C4 (the covariant-velocity head
+    // fill in update_w). The pol_vertex_* basis knobs inherit the vertex_* values when
+    // their keys are absent, so a ladder run on top of an existing vertex input needs
+    // only pol_vertex = "ladder".
     auto cvv_rspace_tol = io::get_value_with_default<double>(pt,"cvv_rspace_tol",1e-6);
     auto pol_vertex = io::get_value_with_default<std::string>(pt,"pol_vertex","none");
     io::tolower(pol_vertex);
