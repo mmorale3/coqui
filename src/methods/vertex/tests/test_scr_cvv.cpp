@@ -56,6 +56,7 @@
 #include "methods/SCF/simple_dyson.h"
 #include "methods/SCF/scf_driver.hpp"
 #include "methods/scr_coulomb/cvv_head.hpp"
+#include "methods/pproc/pproc_t.h"
 
 namespace bdft_tests {
 
@@ -764,6 +765,28 @@ namespace bdft_tests {
             err_herm, err_wdep);
     REQUIRE(err_herm < 1e-10);
     REQUIRE(err_wdep == 0.0);
+
+    // C3 smoke: the cvv_eps pproc target end-to-end on the checkpoint this scf just
+    // wrote (load F/Sigma/mu -> Dyson G -> CVV head -> eps_inf + h5 output). On the
+    // 2^3 mesh the TRIM zero forces Pi^jj == 0, so eps_inf == 1 EXACTLY -- the
+    // structural pin again, now through the full readout path. Real eps_inf numbers
+    // need the stored dense-mesh checkpoints (rusty; gate C3-a).
+    {
+      pproc_t pp(*mpi_context, output, ".");
+      ptree pt;
+      pp.cvv_eps(*mf, pt, "scf", -1);
+      mpi_context->comm.barrier();
+      long fiter = 0;
+      h5::file file(output + ".mbpt.h5", 'r');
+      auto grp = h5::group(file).open_group("scf");
+      h5::h5_read(grp, "final_iter", fiter);
+      nda::array<double, 1> eps_diag(3);
+      nda::h5_read(h5::group(file),
+                   "scf/iter" + std::to_string(fiter) + "/cvv_eps/eps_inf_diag", eps_diag);
+      app_log(1, "cvv_build_lih222: cvv_eps 2^3 structural eps_inf = ({}, {}, {})",
+              eps_diag(0), eps_diag(1), eps_diag(2));
+      for (int a = 0; a < 3; ++a) REQUIRE(std::abs(eps_diag(a) - 1.0) < 1e-8);
+    }
 
     mpi_context->comm.barrier();
     if (mpi_context->comm.root()) remove((output + ".mbpt.h5").c_str());

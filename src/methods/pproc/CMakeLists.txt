@@ -7,5 +7,7 @@ if(ENABLE_NEVANLINNA)
 else()
     target_link_libraries(pproc_lib PUBLIC utils numerics meanfield hamilt embed_lib)
 endif()
+# scGW-tilde C3: cvv_eps readout uses cvv_head_t (scr_coulomb) + simple_dyson (scf)
+target_link_libraries(pproc_lib PUBLIC scr_coulomb_lib scf_lib)
 install(TARGETS pproc_lib
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})

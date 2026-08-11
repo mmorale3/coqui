@@ -37,6 +37,8 @@
 #include "utilities/kpoint_utils.hpp"
 #include "utilities/interpolation_utils.hpp"
 #include "mean_field/symmetry/unfold_bz.h"
+#include "methods/SCF/simple_dyson.h"
+#include "methods/scr_coulomb/cvv_head.hpp"   // scGW-tilde C3: cvv_eps readout
 #include "pproc_t.h"
 
 namespace methods {
@@ -1086,5 +1088,84 @@ namespace methods {
       math::nda::redistribute(buffer2_diag, GS_diag);
       return GS_diag;
    }
+
+  void pproc_t::cvv_eps(mf::MF &mf, ptree const& pt, std::string grp_name, long iter) {
+    std::string filename = _scf_output + ".mbpt.h5";
+    app_log(1, "\nCVV dielectric readout (scGW-tilde increment C3, "
+               "notes/scgwt_implementation_plan.md)");
+    auto ft = imag_axes_ft::read_iaft(filename);
+    utils::check(ft.basis() == imag_axes_ft::dlr_basis,
+                 "cvv_eps: the CVV machinery requires the DLR IAFT backend "
+                 "(the checkpoint was run with iaft basis != \"dlr\").");
+
+    double mu = 0.0;
+    if (_context.comm.root()) {
+      h5::file file(filename, 'r');
+      utils::check(h5::group(file).has_subgroup(grp_name),
+                   "cvv_eps: {} does not exist in {}", grp_name, filename);
+      auto grp = h5::group(file).open_group(grp_name);
+      if (iter == -1) h5::h5_read(grp, "final_iter", iter);
+      h5::h5_read(grp, "iter" + std::to_string(iter) + "/mu", mu);
+    }
+    _context.comm.broadcast_n(&mu, 1, 0);
+    _context.comm.broadcast_n(&iter, 1, 0);
+
+    const double tol = io::get_value_with_default<double>(pt, "cvv_rspace_tol", 1e-6);
+    const long ns = mf.nspin(), nk_ibz = mf.nkpts_ibz(), nb = mf.nbnd();
+    const long nt = ft.nt_f();
+
+    using view4 = nda::array_view<ComplexType, 4>;
+    using view5 = nda::array_view<ComplexType, 5>;
+    auto sF = math::shm::make_shared_array<view4>(_context, {ns, nk_ibz, nb, nb});
+    auto sSigma = math::shm::make_shared_array<view5>(_context, {nt, ns, nk_ibz, nb, nb});
+    if (_context.node_comm.root()) {
+      h5::file file(filename, 'r');
+      auto grp = h5::group(file);
+      auto F_loc = sF.local();
+      nda::h5_read(grp, grp_name + "/iter" + std::to_string(iter) + "/F_skij", F_loc);
+      auto S_loc = sSigma.local();
+      nda::h5_read(grp, grp_name + "/iter" + std::to_string(iter) + "/Sigma_tskij", S_loc);
+    }
+    _context.comm.barrier();
+    sF.node_sync();
+    sSigma.node_sync();
+
+    // rebuild G(tau) by Dyson at the stored mu (G is not checkpointed)
+    simple_dyson dyson(&mf, &ft);
+    auto sG = math::shm::make_shared_array<view5>(_context, {nt, ns, nk_ibz, nb, nb});
+    dyson.solve_dyson(sG, sF, sSigma, mu);
+
+    solvers::cvv_head_t cvv(&ft, tol);
+    cvv.build(mf, dyson.H0(), sF.local(), sSigma.local());
+    auto head = cvv.eval_head_tensor(mf, sG.local());
+
+    // eps_M(q^) = 1 - v(q) P00(q -> 0) = 1 - 4 pi q^_a q^_b Phead_ab(inu = 0)
+    // (head-only, wings dropped as in the gygi treatment; an explicit O(q^2)
+    // coefficient, so no q -> 0 extrapolation and no stored-vs-quadratic convention)
+    const long i0 = ft.nw_b() / 2;
+    nda::array<double, 1> eps_diag(3);
+    for (int a = 0; a < 3; ++a)
+      eps_diag(a) = 1.0 - 4.0 * M_PI * head.Phead_wab(i0, a, a).real();
+    const double eps_iso = (eps_diag(0) + eps_diag(1) + eps_diag(2)) / 3.0;
+    app_log(1, "  cvv_eps [iter {}]: eps_inf(xx, yy, zz) = ({:.6f}, {:.6f}, {:.6f}); "
+               "isotropic avg = {:.6f}\n"
+               "    R store: {}/{} WS points kept; pole-fit err_max = {:.3e}, residue "
+               "ratio max = {:.3g}",
+            iter, eps_diag(0), eps_diag(1), eps_diag(2), eps_iso,
+            cvv.nR_kept(), cvv.nR(), head.fit_error_max, head.res_ratio_max);
+
+    if (_context.comm.root()) {
+      h5::file file(filename, 'a');
+      auto iter_grp = h5::group(file).open_group(grp_name + "/iter" + std::to_string(iter));
+      auto g = iter_grp.has_subgroup("cvv_eps") ? iter_grp.open_group("cvv_eps")
+                                                : iter_grp.create_group("cvv_eps");
+      nda::h5_write(g, "Pi_wab", head.Pi_wab, false);
+      nda::h5_write(g, "Phead_wab", head.Phead_wab, false);
+      nda::h5_write(g, "eps_inf_diag", eps_diag, false);
+      h5::h5_write(g, "fit_error_max", head.fit_error_max);
+      h5::h5_write(g, "res_ratio_max", head.res_ratio_max);
+    }
+    _context.comm.barrier();
+  }
 
 } // methods

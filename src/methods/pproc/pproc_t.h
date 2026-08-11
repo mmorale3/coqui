@@ -100,8 +100,21 @@ namespace methods {
      * E_a = F_aa + Re[Sigma_aa(E_a - mu)] for each (spin, k, band).
      * Writes E_ska to {grp_name}/iter{N}/qp_approx/E_ska in the checkpoint file.
      */
-    void compute_qp_on_ibz_kmesh(mf::MF &mf, const qp_params_t &qp_params, 
+    void compute_qp_on_ibz_kmesh(mf::MF &mf, const qp_params_t &qp_params,
                                 std::string grp_name="scf", long iter=-1);
+
+    /**
+     * scGW-tilde increment C3 (notes/scgwt_implementation_plan.md; the T-c probe):
+     * covariant-velocity dielectric readout on a STORED checkpoint. Loads
+     * (F, Sigma(tau), mu) of the requested iteration, rebuilds G by Dyson, builds the
+     * CVV R-space store, evaluates the head tensor and the SUBTRACTED head coefficient
+     * Phead_ab(inu) = [Pi^jj(inu) - Pi^jj(0)]/(inu)^2 (cvv_detail::head_subtract), and
+     * reports eps_inf(q^) = 1 - 4 pi q^ q^ : Phead(inu = 0) per cartesian direction --
+     * an explicit O(q^2) coefficient, NO q -> 0 extrapolation, so the
+     * stored-vs-quadratic convention split does not arise (gate C3-a / PDF G-b).
+     * Results are written to {grp_name}/iter{N}/cvv_eps in the checkpoint.
+     */
+    void cvv_eps(mf::MF &mf, ptree const& pt, std::string grp_name="scf", long iter=-1);
 
   private:
     template<nda::ArrayOfRank<4> local_Array_4D_t, typename communicator_t>

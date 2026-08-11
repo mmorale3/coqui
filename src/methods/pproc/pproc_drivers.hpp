@@ -220,6 +220,15 @@ namespace methods {
 
       pp.local_density_of_state(*mf, wannier_file, ac_context, grp_name, iteration, trans_home_cell);
 
+    } else if (pp_type == "cvv_eps") {
+
+      // scGW-tilde increment C3: covariant-velocity dielectric readout on a stored
+      // checkpoint (notes/scgwt_implementation_plan.md; the T-c probe).
+      pproc_t pp(*mpi, prefix, outdir);
+      auto grp_name  = io::get_value_with_default<std::string>(pt, "grp_name", "scf");
+      auto iteration = io::get_value_with_default<long>(pt, "iteration", -1);
+      pp.cvv_eps(*mf, pt, grp_name, iteration);
+
     } else if (pp_type == "dump_vxc") {
 
       std::string scf_output = outdir+"/"+prefix;
