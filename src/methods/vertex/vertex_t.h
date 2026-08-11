@@ -1347,6 +1347,16 @@ namespace solvers {
      */
     nda::array<ComplexType, 3> eval_pol_ladder_nu0(MBState &mb_state, THC_ERI auto &thc);
 
+    /** P4 gate diagnostics (vertex_ladder.icc / the parallel-memory design note). */
+    struct ladder_p4_diag {
+      double j1_resid = -1.0;          // rs (tol_L = 0) j=1 vs the direct one-rung
+      double neumann_resid = -1.0;     // converged Neumann vs the direct resolvent
+      long rungs_used = 0;
+      double dropped_frac_test = -1.0; // tol_L = 0.5 kernel: dropped ||w(L)||
+      double j1_resid_trunc = -1.0;    // ...and its j=1 error (monotone meter)
+    };
+    ladder_p4_diag ladder_p4_gates(MBState &mb_state, THC_ERI auto &thc);
+
     /**
      * scGW-tilde increment L1 (vertex_ladder.icc): the C-window pair bubble
      * Pi-bar^0_MN(q, tau_pos) in the SECONDARY aux basis, (nt_half, nq, N_m, N_m),

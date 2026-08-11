@@ -201,6 +201,24 @@ namespace bdft_tests {
     REQUIRE(std::isfinite(diag.ladder_max));
     REQUIRE(diag.ladder_max > 0.0);
 
+    // ---- P4 gates (the compressed/matrix-free ladder; design note section 4b.1) ----
+    //  G-P4a: the R-space kernel at tol_L = 0 is the EXACT WS round trip, so the
+    //         matrix-free j = 1 observable must equal the direct one-rung (== the
+    //         L1-b anchor) at machine precision;
+    //  G-P4b: the converged Neumann ladder must equal the direct resolvent;
+    //  meter: a tol_L = 0.5 kernel genuinely drops shells and its j = 1 error is
+    //         visibly larger (the monotone truncation meter).
+    auto d4 = vtx.ladder_p4_gates(mb_state, thc);
+    app_log(1, "scgwt_ladder_l1: P4 j1 = {:.3e}, neumann = {:.3e} ({} rungs), "
+               "trunc meter: dropped = {:.3e}, j1_trunc = {:.3e}",
+            d4.j1_resid, d4.neumann_resid, d4.rungs_used, d4.dropped_frac_test,
+            d4.j1_resid_trunc);
+    REQUIRE(d4.j1_resid < 1e-11);
+    REQUIRE(d4.neumann_resid < 1e-8);
+    REQUIRE(d4.rungs_used >= 1);
+    REQUIRE(d4.dropped_frac_test > 0.0);
+    REQUIRE(d4.j1_resid_trunc > d4.j1_resid);
+
     mpi_context->comm.barrier();
     if (mpi_context->comm.root()) remove((output + ".mbpt.h5").c_str());
     mpi_context->comm.barrier();

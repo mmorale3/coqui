@@ -50,6 +50,7 @@
  */
 
 #include "utilities/check.hpp"
+#include "utilities/interpolation_utils.hpp"   // P4a: WS_rgrid for the R-space kernel
 
 namespace methods {
 namespace solvers {
@@ -253,6 +254,306 @@ namespace solvers {
             nda::blas::gemm(Rm, XKXD, Zl);
             auto Pl = (*Pi_ladder)(jn, iq, all, all);
             nda::blas::gemm(ComplexType(-spinfac), nda::transpose(Dstack_c), Zl,
+                            ComplexType(1.0), Pl);
+          }
+        }
+      }
+    }
+
+    // =================================================================================
+    // P4a (notes/scgwt_parallel_memory_design.md section 4b.1): the R-space kernel
+    //   K = sum_L (1/w_L) R_L^T W^_L C_L,   w_PQ(L) = (1/N_k) sum_qx e^{-i qx.L} W0bar_PQ(qx)
+    // with W^_L DIAGONAL over the (P,Q)-pair channel. v1 stores w(L) DENSE per kept L
+    // (gemm-only apply; the sampled kept-(P,Q) path is the production follow-up, to be
+    // pinned bit-identically against this one). The chain applies K~ = K^T (the
+    // verified Kbig orientation), so the apply below is the K~-apply.
+    // =================================================================================
+    struct ladder_kernel_rs {
+      long Nm = 0, nL = 0, nL_full = 0;
+      nda::array<double, 2> Lcart;          // (nL, 3) kept L vectors, cartesian
+      nda::array<ComplexType, 3> w;         // (nL, Nm, Nm): w_PQ(L)/w_L (1/w_L folded in)
+      double dropped_frac = 0.0;            // dropped ||w(L)|| fraction (the L meter)
+    };
+
+    // cartesian L vectors from lattice-unit indices (the cvv_detail::rcart_from_idx
+    // math, duplicated locally to keep this module free of scr_coulomb headers)
+    inline nda::array<double, 2> lcart_from_idx(nda::MemoryArrayOfRank<2> auto const &Lidx,
+                                                nda::stack_array<double, 3, 3> const &lattv) {
+      const long nL = Lidx.shape(0);
+      nda::array<double, 2> Lc(nL, 3);
+      for (long i = 0; i < nL; ++i)
+        for (int a = 0; a < 3; ++a)
+          Lc(i, a) = Lidx(i, 0) * lattv(0, a) + Lidx(i, 1) * lattv(1, a) +
+                     Lidx(i, 2) * lattv(2, a);
+      return Lc;
+    }
+
+    /** Build the R-space kernel from W0bar on the transfer mesh. tol_L = 0 keeps every
+     *  L shell => the WS round trip is EXACT on mesh qx (the CVV-verified pair). The
+     *  shell rule is the CVV cumulative-dropped-norm walk (outermost first, L = 0
+     *  never dropped). One dense (Nm, Nm) buffer at a time -- no (nL, Nm^2) transient
+     *  beyond the kept set. */
+    inline ladder_kernel_rs build_kernel_rs(nda::array<ComplexType, 3> const &W0b,
+                                            nda::MemoryArrayOfRank<2> auto const &Qpts,
+                                            nda::stack_array<double, 3, 3> const &lattv,
+                                            nda::MemoryArrayOfRank<1> auto const &kp_grid,
+                                            double tol_L) {
+      decltype(nda::range::all) all;
+      const long nq = W0b.shape(0), Nm = W0b.shape(1);
+      auto [lw, lp] = utils::WS_rgrid(lattv, kp_grid);
+      const long nLf = lp.shape(0);
+      auto Lc = lcart_from_idx(lp, lattv);
+      nda::array<ComplexType, 2> wbuf(Nm, Nm);
+      auto wL_at = [&](long iL) {
+        wbuf() = ComplexType(0.0);
+        for (long iqx = 0; iqx < nq; ++iqx) {
+          const double qL = Qpts(iqx, 0) * Lc(iL, 0) + Qpts(iqx, 1) * Lc(iL, 1) +
+                            Qpts(iqx, 2) * Lc(iL, 2);
+          const ComplexType ph = std::exp(ComplexType(0.0, -qL)) / double(nq);
+          wbuf += ph * W0b(iqx, all, all);
+        }
+      };
+      // pass 1: per-L squared norms
+      std::vector<double> n2(nLf, 0.0), rad(nLf);
+      for (long iL = 0; iL < nLf; ++iL) {
+        wL_at(iL);
+        for (auto const &v : wbuf) n2[iL] += std::norm(v);
+        rad[iL] = std::sqrt(Lc(iL, 0) * Lc(iL, 0) + Lc(iL, 1) * Lc(iL, 1) +
+                            Lc(iL, 2) * Lc(iL, 2));
+      }
+      // shell walk (outermost first; cumulative bound; L = 0 kept)
+      std::vector<long> order(nLf);
+      for (long i = 0; i < nLf; ++i) order[i] = i;
+      std::sort(order.begin(), order.end(), [&](long a, long b) { return rad[a] > rad[b]; });
+      const double tot2 = std::accumulate(n2.begin(), n2.end(), 0.0);
+      std::vector<bool> drop(nLf, false);
+      double drop2 = 0.0;
+      {
+        long i = 0;
+        while (i < nLf) {
+          long j = i;
+          double shell2 = 0.0;
+          while (j < nLf and std::abs(rad[order[j]] - rad[order[i]]) < 1e-8) {
+            shell2 += n2[order[j]];
+            ++j;
+          }
+          if (rad[order[i]] < 1e-12) break;
+          if (std::sqrt((drop2 + shell2) / std::max(tot2, 1e-300)) > tol_L) break;
+          drop2 += shell2;
+          for (long m = i; m < j; ++m) drop[order[m]] = true;
+          i = j;
+        }
+      }
+      ladder_kernel_rs ker;
+      ker.Nm = Nm;
+      ker.nL_full = nLf;
+      std::vector<long> kept;
+      for (long iL = 0; iL < nLf; ++iL)
+        if (not drop[iL]) kept.push_back(iL);
+      ker.nL = long(kept.size());
+      ker.Lcart = nda::array<double, 2>(ker.nL, 3);
+      ker.w = nda::array<ComplexType, 3>(ker.nL, Nm, Nm);
+      for (long i = 0; i < ker.nL; ++i) {
+        const long iL = kept[i];
+        for (int a = 0; a < 3; ++a) ker.Lcart(i, a) = Lc(iL, a);
+        wL_at(iL);                                   // pass 2: recompute, fold 1/w_L
+        ker.w(i, all, all) = wbuf;
+        ker.w(i, all, all) /= double(lw(iL));
+      }
+      ker.dropped_frac = std::sqrt(drop2 / std::max(tot2, 1e-300));
+      app_log(2, "  [scGW-tilde P4a] R-space kernel: {} / {} L shells kept "
+                 "(tol_L = {}); dropped ||w(L)|| fraction = {:.3e}",
+              ker.nL, nLf, tol_L, ker.dropped_frac);
+      return ker;
+    }
+
+    /**
+     * The chain-native K~-apply (K~ = K^T, the verified Kbig orientation):
+     *   out_{(p1 nc + p3', k'), b} = sum_L e^{-i k'.L} sum_{PQ} X_P,p1(k') X*_Q,p3'(k'+q)
+     *       [w_PQ(L)/w_L] sum_k e^{+i k.L} sum_{p1' p3} X*_P,p1'(k) X_Q,p3(k+q) x_{(p1' nc + p3, k), b}
+     * Dense-w v1: gemms + small permute copies only. Y is OVERWRITTEN.
+     */
+    inline void apply_kernel_rs(ladder_kernel_rs const &ker,
+                                nda::array<ComplexType, 4> const &Xb, long is,
+                                nda::array<long, 2> const &kpq, long iq,
+                                nda::array<double, 2> const &kpts,
+                                nda::MemoryArrayOfRank<2> auto const &X,   // (D, B)
+                                nda::MemoryArrayOfRank<2> auto &&Y) {      // (D, B)
+      decltype(nda::range::all) all;
+      const long nk = kpq.shape(1), nc = Xb.shape(3), Nm = ker.Nm;
+      const long nc2 = nc * nc, B = X.shape(1);
+      utils::check(X.shape(0) == nc2 * nk and Y.shape(0) == nc2 * nk and
+                   Y.shape(1) == B, "apply_kernel_rs: block shape mismatch.");
+      Y() = ComplexType(0.0);
+      nda::array<ComplexType, 2> Xw(nc2, B), T1(Nm, nc * B), T1p(Nm * B, nc);
+      nda::array<ComplexType, 2> Xkc(Nm, nc), Xq3(nc, Nm), T2p(Nm * B, Nm);
+      nda::array<ComplexType, 2> G(Nm * Nm, B);
+      nda::array<ComplexType, 2> Xp1(nc, Nm), A1(nc, Nm * B), A1p(nc * B, Nm);
+      nda::array<ComplexType, 2> Xqc(Nm, nc), A2(nc * B, nc);
+      for (long iL = 0; iL < ker.nL; ++iL) {
+        G() = ComplexType(0.0);
+        // ---- forward sweep (contract the R_L side with the input rows) ---------------
+        for (long ik = 0; ik < nk; ++ik) {
+          const long ikpq = kpq(iq, ik);
+          const double kL = kpts(ik, 0) * ker.Lcart(iL, 0) +
+                            kpts(ik, 1) * ker.Lcart(iL, 1) +
+                            kpts(ik, 2) * ker.Lcart(iL, 2);
+          const ComplexType php = std::exp(ComplexType(0.0, kL));
+          Xw() = X(nda::range(ik * nc2, (ik + 1) * nc2), all);
+          auto X3 = nda::reshape(Xw, std::array<long, 2>{nc, nc * B});  // p1' x (p3, b)
+          for (long P = 0; P < Nm; ++P)
+            for (long p = 0; p < nc; ++p) Xkc(P, p) = std::conj(Xb(is, ik, P, p));
+          nda::blas::gemm(Xkc, X3, T1);                    // P x (p3, b)
+          for (long P = 0; P < Nm; ++P)
+            for (long p3 = 0; p3 < nc; ++p3)
+              for (long b = 0; b < B; ++b) T1p(P * B + b, p3) = T1(P, p3 * B + b);
+          for (long p3 = 0; p3 < nc; ++p3)
+            for (long Q = 0; Q < Nm; ++Q) Xq3(p3, Q) = Xb(is, ikpq, Q, p3);
+          nda::blas::gemm(T1p, Xq3, T2p);                  // (P, b) x Q
+          for (long P = 0; P < Nm; ++P)
+            for (long Q = 0; Q < Nm; ++Q)
+              for (long b = 0; b < B; ++b)
+                G(P * Nm + Q, b) += php * T2p(P * B + b, Q);
+        }
+        // ---- the diagonal (P,Q)-channel kernel --------------------------------------
+        for (long P = 0; P < Nm; ++P)
+          for (long Q = 0; Q < Nm; ++Q) {
+            const ComplexType wv = ker.w(iL, P, Q);
+            for (long b = 0; b < B; ++b) G(P * Nm + Q, b) *= wv;
+          }
+        // ---- backward sweep (emit on the C_L side) ----------------------------------
+        for (long ikp = 0; ikp < nk; ++ikp) {
+          const long ikppq = kpq(iq, ikp);
+          const double kL = kpts(ikp, 0) * ker.Lcart(iL, 0) +
+                            kpts(ikp, 1) * ker.Lcart(iL, 1) +
+                            kpts(ikp, 2) * ker.Lcart(iL, 2);
+          const ComplexType phm = std::exp(ComplexType(0.0, -kL));
+          for (long p1 = 0; p1 < nc; ++p1)
+            for (long P = 0; P < Nm; ++P) Xp1(p1, P) = Xb(is, ikp, P, p1);
+          auto Gv = nda::reshape(G, std::array<long, 2>{Nm, Nm * B});   // P x (Q, b)
+          nda::blas::gemm(Xp1, Gv, A1);                    // p1 x (Q, b)
+          for (long p1 = 0; p1 < nc; ++p1)
+            for (long Q = 0; Q < Nm; ++Q)
+              for (long b = 0; b < B; ++b) A1p(p1 * B + b, Q) = A1(p1, Q * B + b);
+          for (long Q = 0; Q < Nm; ++Q)
+            for (long p3p = 0; p3p < nc; ++p3p)
+              Xqc(Q, p3p) = std::conj(Xb(is, ikppq, Q, p3p));
+          nda::blas::gemm(A1p, Xqc, A2);                   // (p1, b) x p3'
+          for (long p1 = 0; p1 < nc; ++p1)
+            for (long p3p = 0; p3p < nc; ++p3p)
+              for (long b = 0; b < B; ++b)
+                Y(ikp * nc2 + p1 * nc + p3p, b) += phm * A2(p1 * B + b, p3p);
+        }
+      }
+    }
+
+    /**
+     * P4b: the truncated-NEUMANN pair-space ladder on the R-space kernel (design note
+     * section 4b.1): S_{j+1} = M(V + S_j), M = Xh K~ (apply-only), V = Xh D; the
+     * truncation order j IS the explicit rung count, and the j = 1 observable with an
+     * untruncated kernel is the anchor BITWISE (gate G-P4a). The (s, iq) pairs
+     * round-robin over (rank, nproc) exactly as pair_space_ladder (the caller
+     * all_reduces). The Dmat/Cb builders are duplicated from pair_space_ladder
+     * verbatim (deliberate: that function is gate-green and untouched; the two are
+     * pinned against each other by G-P4b).
+     */
+    inline void pair_space_ladder_rs(nda::MemoryArrayOfRank<5> auto const &G_CC,
+                                     nda::array<ComplexType, 4> const &Xb,
+                                     ladder_kernel_rs const &ker,
+                                     nda::array<long, 2> const &kpq,
+                                     nda::array<double, 2> const &kpts,
+                                     vertex_pi::iaft_tools const &tools,
+                                     std::vector<long> const &nu_list,
+                                     double neu_tol, long max_rungs,
+                                     nda::array<ComplexType, 4> *Pi_onerung,
+                                     nda::array<ComplexType, 4> *Pi_ladder,
+                                     long rank = 0, long nproc = 1,
+                                     long *max_rungs_used = nullptr) {
+      decltype(nda::range::all) all;
+      const long nt = G_CC.shape(0), ns = G_CC.shape(1), nk = G_CC.shape(2);
+      const long nc = G_CC.shape(3), Nm = Xb.shape(2);
+      const long nq = kpq.shape(0);
+      const long nw_b = tools.nw_b;
+      const long nc2 = nc * nc, Dsz = nc2 * nk;
+      const long nnu = long(nu_list.size());
+      const double spinfac = (ns == 1) ? 2.0 : 1.0;
+      if (Pi_onerung != nullptr) (*Pi_onerung)() = ComplexType(0.0);
+      if (Pi_ladder != nullptr) (*Pi_ladder)() = ComplexType(0.0);
+      if (max_rungs_used != nullptr) *max_rungs_used = 0;
+
+      nda::array<ComplexType, 3> Dmat(nk, nc2, Nm), Dcj(nk, nc2, Nm);
+      nda::array<ComplexType, 4> Cb(nk, nnu, nc2, nc2);
+      nda::array<ComplexType, 2> Pf(nt, nc2 * nc2), Bf(nw_b, nc2 * nc2);
+      nda::array<ComplexType, 2> Dstack_c(Dsz, Nm);
+      nda::array<ComplexType, 2> V(Dsz, Nm), S(Dsz, Nm), term(Dsz, Nm);
+      nda::array<ComplexType, 2> KX(Dsz, Nm), termn(Dsz, Nm);
+
+      for (long sq = rank; sq < ns * nq; sq += nproc) {
+        const long is = sq / nq;
+        const long iq = sq % nq;
+        // --- d(k) and the chi0 blocks (pair_space_ladder verbatim) --------------------
+        for (long ik = 0; ik < nk; ++ik) {
+          const long ikpq = kpq(iq, ik);
+          for (long a = 0; a < nc; ++a)
+            for (long b = 0; b < nc; ++b)
+              for (long N = 0; N < Nm; ++N) {
+                Dmat(ik, a * nc + b, N) =
+                    Xb(is, ik, N, a) * std::conj(Xb(is, ikpq, N, b));
+                Dcj(ik, a * nc + b, N) = std::conj(Dmat(ik, a * nc + b, N));
+              }
+          for (long s = 0; s < nt; ++s) {
+            const long sm = tools.t_mirror(s);
+            for (long p1p = 0; p1p < nc; ++p1p)
+              for (long p3 = 0; p3 < nc; ++p3)
+                for (long a = 0; a < nc; ++a)
+                  for (long b = 0; b < nc; ++b)
+                    Pf(s, (p1p * nc + p3) * nc2 + (a * nc + b)) =
+                        G_CC(sm, is, ik, a, p1p) * G_CC(s, is, ikpq, p3, b);
+          }
+          nda::blas::gemm(ComplexType(-1.0), tools.Twt_bb, Pf, ComplexType(0.0), Bf);
+          for (long jn = 0; jn < nnu; ++jn)
+            for (long r = 0; r < nc2; ++r)
+              for (long c = 0; c < nc2; ++c)
+                Cb(ik, jn, r, c) = Bf(nu_list[jn], r * nc2 + c);
+        }
+        for (long ik = 0; ik < nk; ++ik)
+          for (long r = 0; r < nc2; ++r) Dstack_c(ik * nc2 + r, all) = Dcj(ik, r, all);
+
+        for (long jn = 0; jn < nnu; ++jn) {
+          // V = Xh D
+          for (long ik = 0; ik < nk; ++ik) {
+            auto Vr = V(nda::range(ik * nc2, (ik + 1) * nc2), all);
+            nda::blas::gemm(ComplexType(1.0 / nk), Cb(ik, jn, all, all),
+                            Dmat(ik, all, all), ComplexType(0.0), Vr);
+          }
+          S() = ComplexType(0.0);
+          term() = V;
+          double s_nrm2 = 0.0;
+          for (long j = 1; j <= max_rungs; ++j) {
+            vertex_ladder_detail::apply_kernel_rs(ker, Xb, is, kpq, iq, kpts, term, KX);
+            for (long ik = 0; ik < nk; ++ik) {
+              auto Tr = termn(nda::range(ik * nc2, (ik + 1) * nc2), all);
+              auto Kr = KX(nda::range(ik * nc2, (ik + 1) * nc2), all);
+              nda::blas::gemm(ComplexType(1.0 / nk), Cb(ik, jn, all, all), Kr,
+                              ComplexType(0.0), Tr);
+            }
+            S += termn;
+            if (j == 1 and Pi_onerung != nullptr) {
+              auto Po = (*Pi_onerung)(jn, iq, all, all);
+              nda::blas::gemm(ComplexType(-spinfac), nda::transpose(Dstack_c), termn,
+                              ComplexType(1.0), Po);
+            }
+            double t2 = 0.0;
+            s_nrm2 = 0.0;
+            for (auto const &v : termn) t2 += std::norm(v);
+            for (auto const &v : S) s_nrm2 += std::norm(v);
+            term() = termn;
+            if (max_rungs_used != nullptr) *max_rungs_used = std::max(*max_rungs_used, j);
+            if (std::sqrt(t2) < neu_tol * std::max(std::sqrt(s_nrm2), 1e-300)) break;
+          }
+          if (Pi_ladder != nullptr) {
+            auto Pl = (*Pi_ladder)(jn, iq, all, all);
+            nda::blas::gemm(ComplexType(-spinfac), nda::transpose(Dstack_c), S,
                             ComplexType(1.0), Pl);
           }
         }
@@ -491,6 +792,101 @@ namespace solvers {
                "    L2 preview: ||Pi_ladder - Pi_onerung||/||Pi^C|| = {:.3e} "
                "(the >= 2-rung content); max|Pi_onerung| = {:.3e}, max|Pi_ladder| = {:.3e}",
             out.l1a_eta, out.l1b_resid, out.ladder_frac, out.onerung_max, out.ladder_max);
+    return out;
+  }
+
+  /**
+   * The P4 gate harness (design note sections 4b/4b.1):
+   *   G-P4a  the R-space kernel at tol_L = 0 is EXACT (the WS round trip on the mesh):
+   *          the rs j = 1 observable must reproduce the direct one-rung (== the L1-b
+   *          anchor) at machine precision;
+   *   G-P4b  the converged Neumann ladder must reproduce the direct resolvent;
+   *   meter  a deliberately truncated kernel (tol_L = 0.5) must show a NONZERO dropped
+   *          fraction and a larger j = 1 error (the monotone truncation meter).
+   * Runs at the inu = 0 node (the readout node); (s, q) distributed as elsewhere.
+   */
+  vertex_t::ladder_p4_diag vertex_t::ladder_p4_gates(MBState &mb_state, THC_ERI auto &thc) {
+    decltype(nda::range::all) all;
+    ladder_p4_diag out;
+    auto MF = thc.MF();
+    auto mpi = thc.mpi();
+    utils::check(_W0b_qmm.has_value(),
+                 "vertex_t::ladder_p4_gates: W0bar is absent -- run after an update_w "
+                 "with an active static-rung secondary vertex (build_w0).");
+    ensure_secondary_basis(mb_state, thc);
+    auto G_tskij = mb_state.sG_tskij.value().local();
+    const long nt = G_tskij.shape(0), ns = G_tskij.shape(1), nk = G_tskij.shape(2);
+    const long nc = subspace_rank(), Nm = _Xb_skma.shape(2);
+    const long nq = MF->nqpts_ibz();
+    nda::array<ComplexType, 5> G_CC(nt, ns, nk, nc, nc);
+    G_CC = G_tskij(all, all, all, _band_window, _band_window);
+    nda::array<long, 2> kmq(nq, nk), kpq(nq, nk);
+    auto qmin = MF->qminus();
+    for (long iq = 0; iq < nq; ++iq)
+      for (long ik = 0; ik < nk; ++ik) {
+        kmq(iq, ik) = MF->qk_to_k2(iq, ik);
+        kpq(iq, ik) = MF->qk_to_k2(qmin(iq), ik);
+      }
+    nda::array<double, 2> kpts(nk, 3), Qpts(nq, 3);
+    kpts() = MF->kpts();
+    for (long iq = 0; iq < nq; ++iq) {
+      auto qp = MF->Qpts_ibz(iq);
+      for (int a = 0; a < 3; ++a) Qpts(iq, a) = qp(a);
+    }
+
+    vertex_pi::iaft_tools tools(*_ft);
+    std::vector<long> nu0 = {tools.nw_b / 2};
+    const long rank = mpi->comm.rank(), size = mpi->comm.size();
+
+    // direct reference (one rung + resolvent) at nu = 0
+    nda::array<ComplexType, 4> P1d(1, nq, Nm, Nm), Pld(1, nq, Nm, Nm);
+    vertex_ladder_detail::pair_space_ladder(G_CC, _Xb_skma, _W0b_qmm.value(), kmq, kpq,
+                                            tools, nu0, &P1d, &Pld, rank, size);
+    mpi->comm.all_reduce_in_place_n(P1d.data(), P1d.size(), std::plus<>{});
+    mpi->comm.all_reduce_in_place_n(Pld.data(), Pld.size(), std::plus<>{});
+
+    // rs kernel, EXACT (tol_L = 0): j = 1 and converged Neumann
+    auto ker0 = vertex_ladder_detail::build_kernel_rs(_W0b_qmm.value(), Qpts,
+                                                      MF->lattv(), MF->kp_grid(), 0.0);
+    nda::array<ComplexType, 4> P1r(1, nq, Nm, Nm), Plr(1, nq, Nm, Nm);
+    long ju = 0;
+    vertex_ladder_detail::pair_space_ladder_rs(G_CC, _Xb_skma, ker0, kpq, kpts, tools,
+                                               nu0, 1e-12, 200, &P1r, &Plr, rank, size,
+                                               &ju);
+    mpi->comm.all_reduce_in_place_n(P1r.data(), P1r.size(), std::plus<>{});
+    mpi->comm.all_reduce_in_place_n(Plr.data(), Plr.size(), std::plus<>{});
+    out.rungs_used = mpi->comm.all_reduce_value(ju, boost::mpi3::max<>{});
+
+    auto rel = [&](auto const &A, auto const &Bref) {
+      double n2 = 0.0, d2 = 0.0;
+      for (long i = 0; i < long(A.size()); ++i) {
+        n2 += std::norm(*(A.data() + i) - *(Bref.data() + i));
+        d2 += std::norm(*(Bref.data() + i));
+      }
+      return std::sqrt(n2 / std::max(d2, 1e-300));
+    };
+    out.j1_resid = rel(P1r, P1d);
+    out.neumann_resid = rel(Plr, Pld);
+
+    // truncated-kernel meter: dropped fraction + the j = 1 error. tol_L = 0.9999 so
+    // shells drop even on 2^3 fixtures (no R-decay room there: each outer L shell
+    // carries an O(1) norm fraction, so moderate tolerances drop NOTHING at 2^3 --
+    // measured 2026-08-11; production meshes use physical tolerances).
+    auto ker5 = vertex_ladder_detail::build_kernel_rs(_W0b_qmm.value(), Qpts,
+                                                      MF->lattv(), MF->kp_grid(), 0.9999);
+    out.dropped_frac_test = ker5.dropped_frac;
+    nda::array<ComplexType, 4> P1t(1, nq, Nm, Nm);
+    vertex_ladder_detail::pair_space_ladder_rs(G_CC, _Xb_skma, ker5, kpq, kpts, tools,
+                                               nu0, 1e-12, 1, &P1t, nullptr, rank, size);
+    mpi->comm.all_reduce_in_place_n(P1t.data(), P1t.size(), std::plus<>{});
+    out.j1_resid_trunc = rel(P1t, P1d);
+
+    app_log(1, "  [scGW-tilde P4] gates: G-P4a rs(tol=0) j=1 vs direct one-rung = "
+               "{:.3e}; G-P4b Neumann ({} rungs) vs direct resolvent = {:.3e};\n"
+               "    truncation meter (tol_L = 0.5): dropped ||w(L)|| = {:.3e}, "
+               "j=1 resid = {:.3e}",
+            out.j1_resid, out.rungs_used, out.neumann_resid, out.dropped_frac_test,
+            out.j1_resid_trunc);
     return out;
   }
 

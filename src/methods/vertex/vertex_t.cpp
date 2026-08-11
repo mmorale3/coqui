@@ -4742,6 +4742,7 @@ namespace solvers {
   template nda::array<ComplexType, 4> vertex_t::eval_pol_pi0(MBState&, thc_reader_t&);
   template vertex_t::ladder_l1_diag vertex_t::ladder_l1_gates(MBState&, thc_reader_t&);
   template nda::array<ComplexType, 3> vertex_t::eval_pol_ladder_nu0(MBState&, thc_reader_t&);
+  template vertex_t::ladder_p4_diag vertex_t::ladder_p4_gates(MBState&, thc_reader_t&);
 
 }  // solvers
 }  // methods
