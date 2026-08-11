@@ -26,6 +26,7 @@
 #include "nda/blas.hpp"
 #include "numerics/shared_array/nda.hpp"
 #include "numerics/imag_axes_ft/IAFT.hpp"
+#include "numerics/imag_axes_ft/dlr_pole_fit.hpp"
 #include "utilities/check.hpp"
 #include "utilities/kpoint_utils.hpp"
 #include "utilities/interpolation_utils.hpp"
@@ -96,6 +97,109 @@ namespace solvers {
         if (with_value_row) P(3, i) = ph;
       }
       return P;
+    }
+
+    /**
+     * Generic fermionic pair bubble, accumulated on the FULL bosonic tau grid
+     * (increment C2):
+     *
+     *   Pi(tau_j, a, b) += pref * tr[ A_a(tau_j) . B_b(beta - tau_j) ]
+     *
+     * A and B arrive at the backend's fermionic iw nodes as flat batches
+     * (nw, da*nb*nb) / (nw, db*nb*nb); they are pole-fitted by the REGULARIZED w-side
+     * fit (imag_axes_ft::dlr_pole_fit_w -- rule 7: never a square interpolatory solve;
+     * fit_error/residue_ratio maxima are reported to the caller, who gates) and
+     * evaluated at the bosonic tau nodes through the analytic kernel K_F. A bosonic
+     * tau_to_w of the accumulated Pi then yields the Matsubara convolution
+     * -pref * (1/beta) sum_iw tr[A_a(iw) B_b(iw + inu)] per (a, b); the overall
+     * sign/normalization convention is PINNED by the dense-Matsubara oracle in
+     * test_scr_cvv (gate C2-b), not by rederivation.
+     */
+    inline void bubble_accumulate(imag_axes_ft::dlr_pole_fit_w const &pfw,
+                                  nda::MemoryArrayOfRank<2> auto const &A_wd,
+                                  nda::MemoryArrayOfRank<2> auto const &B_wd,
+                                  nda::MemoryArrayOfRank<2> auto const &Kt,      // (ntb, np): K_F(tau_j, eps_p)
+                                  nda::MemoryArrayOfRank<2> auto const &Kt_mir,  // (ntb, np): K_F(beta - tau_j, eps_p)
+                                  long nb, double pref,
+                                  nda::MemoryArrayOfRank<3> auto &&Pi_tab,       // (ntb, da, db), +=
+                                  double &fit_err_max, double &res_ratio_max) {
+      const long ntb = Kt.shape(0), nb2 = nb * nb;
+      const long da = A_wd.shape(1) / nb2, db = B_wd.shape(1) / nb2;
+      utils::check(A_wd.shape(1) == da * nb2 and B_wd.shape(1) == db * nb2,
+                   "cvv_detail::bubble_accumulate: batch width not a multiple of nb^2.");
+      utils::check(Pi_tab.shape(0) == ntb and Pi_tab.shape(1) == da and
+                   Pi_tab.shape(2) == db,
+                   "cvv_detail::bubble_accumulate: Pi shape mismatch.");
+
+      auto cA = pfw.coeffs(A_wd);
+      auto cB = pfw.coeffs(B_wd);
+      fit_err_max = std::max({fit_err_max, pfw.fit_error(A_wd, cA), pfw.fit_error(B_wd, cB)});
+      res_ratio_max = std::max({res_ratio_max, pfw.residue_ratio(A_wd, cA),
+                                pfw.residue_ratio(B_wd, cB)});
+
+      nda::array<ComplexType, 2> At(ntb, da * nb2), Bt(ntb, db * nb2);
+      nda::blas::gemm(Kt, cA, At);
+      nda::blas::gemm(Kt_mir, cB, Bt);
+
+      for (long j = 0; j < ntb; ++j)
+        for (long a = 0; a < da; ++a) {
+          const long oa = a * nb2;
+          for (long b = 0; b < db; ++b) {
+            const long ob = b * nb2;
+            ComplexType tr(0.0);   // tr[A B] = sum_im A(i,m) B(m,i), flat row indexing
+            for (long i = 0; i < nb; ++i)
+              for (long m = 0; m < nb; ++m)
+                tr += At(j, oa + i * nb + m) * Bt(j, ob + m * nb + i);
+            Pi_tab(j, a, b) += pref * tr;
+          }
+        }
+    }
+
+    /**
+     * The SUBTRACTED head coefficient (the object P00 actually consumes):
+     *
+     *   Phead_ab(inu) = [ Pi^jj_ab(inu) - Pi^jj_ab(0) ] / (inu)^2,
+     *
+     * finite at inu = 0 by Richardson extrapolation from the two smallest nonzero
+     * bosonic nodes. WHY THE SUBTRACTION [measured, gate C2-c 2026-08-11]: the raw
+     * paramagnetic bubble at inu = 0 does NOT give the density head -- on the gapped
+     * toy it overshoots by exactly gap^2 (measured 53x at gap ~ 8). Continuity ties the
+     * density response to the TOTAL (paramagnetic + diamagnetic) current response,
+     * (inu)^2 P00(q, inu) = q^2 [k_para(inu) + k_dia]; for an INSULATOR the Drude
+     * weight vanishes, k_dia = -k_para(0), so
+     *
+     *   P00(q -> 0, inu) = q_a q_b [Pi_ab(inu) - Pi_ab(0)] / (inu)^2
+     *
+     * at EVERY inu (k_dia is nu-independent), with the nu -> 0 limit at the static
+     * point -- no explicit diamagnetic / d2h evaluation needed. The PDF's boxed
+     * eq:tier1 inu = 0 line elides this subtraction; gate C2-c pins the corrected form
+     * against exact Adler-Wiser on the toy (2-level check: [2D/(D^2+nu^2) - 2/D]/(inu)^2
+     * -> 2/D^3 = the chi_rho-rho q^2 coefficient).
+     */
+    inline nda::array<ComplexType, 3> head_subtract(nda::MemoryArrayOfRank<3> auto const &Pi_wab,
+                                                    imag_axes_ft::IAFT const &ft) {
+      const long nwb = Pi_wab.shape(0), da = Pi_wab.shape(1), db = Pi_wab.shape(2);
+      auto wn_b = ft.wn_mesh_b();
+      long i0 = -1;
+      for (long m = 0; m < nwb; ++m)
+        if (wn_b(m) == 0) i0 = m;
+      utils::check(i0 >= 0 and i0 + 2 < nwb,
+                   "cvv_detail::head_subtract: no inu = 0 node / bosonic grid too small.");
+      nda::array<ComplexType, 3> Ph(nwb, da, db);
+      for (long m = 0; m < nwb; ++m) {
+        if (m == i0) continue;
+        const ComplexType inu2 = ft.omega(wn_b(m)) * ft.omega(wn_b(m));
+        for (long a = 0; a < da; ++a)
+          for (long b = 0; b < db; ++b)
+            Ph(m, a, b) = (Pi_wab(m, a, b) - Pi_wab(i0, a, b)) / inu2;
+      }
+      // inu = 0: Richardson in nu^2 from the two smallest positive nodes
+      const double x1 = double(wn_b(i0 + 1)) * double(wn_b(i0 + 1));
+      const double x2 = double(wn_b(i0 + 2)) * double(wn_b(i0 + 2));
+      for (long a = 0; a < da; ++a)
+        for (long b = 0; b < db; ++b)
+          Ph(i0, a, b) = (x2 * Ph(i0 + 1, a, b) - x1 * Ph(i0 + 2, a, b)) / (x2 - x1);
+      return Ph;
     }
 
   } // cvv_detail
@@ -242,11 +346,130 @@ namespace solvers {
      */
     nda::array<ComplexType, 4> velocity(long is, long ik) const;
 
-    // ---- increment C2: head tensor Pi_ab(inu) (aborts until it lands) ----
-    void eval_head_tensor();
+    /** Result of the C2 head tensor evaluation. */
+    struct head_result_t {
+      // Pi_ab on the FULL bosonic tau grid (bubble integrand incl. prefactor) and its
+      // bosonic transform; inu = 0 sits at index nw_b/2 of the full Matsubara grid.
+      nda::array<ComplexType, 3> Pi_tab;   // (nt_b, 3, 3) paramagnetic bubble
+      nda::array<ComplexType, 3> Pi_wab;   // (nw_b, 3, 3) paramagnetic bubble
+      // the SUBTRACTED head coefficient (cvv_detail::head_subtract) -- the object
+      // P00(q->0, inu) = q_a q_b Phead_ab(inu) consumes (C3 readout / C4 in-loop)
+      nda::array<ComplexType, 3> Phead_wab;  // (nw_b, 3, 3)
+      double fit_error_max = 0.0;          // worst w-side pole-fit reconstruction error
+      double res_ratio_max = 0.0;          // worst residue amplification (watched)
+    };
+
+    /**
+     * Increment C2: the covariant-velocity head tensor
+     *   Pi_ab(inu) = -(2/(beta Nk V)) sum_{s,k,iw} Tr[ v~_a G v~_b G ]     (PDF eq. tier1;
+     * spin factor 2 for ns = 1, plain spin sum for ns = 2). Per (s, k): G(tau) -> iw,
+     * M_a = v~_a G at the fermionic nodes, regularized w-side pole fit (rule 7), bubble
+     * on the bosonic tau grid (cvv_detail::bubble_accumulate), k round-robin over the
+     * global communicator + one tiny all_reduce, one bosonic tau_to_w at the end.
+     * G_tskij is the IBZ-resident Green's function on the fermionic tau mesh; the
+     * full-BZ gather uses the TRANSPOSE on trev k (the build_Gbar_fullbz G-convention;
+     * Sigma-class objects use conj -- see build()).
+     */
+    head_result_t eval_head_tensor(mf::MF &mf,
+                                   nda::MemoryArrayOfRank<5> auto const &G_tskij) {
+      decltype(nda::range::all) all;
+      utils::check(_built, "cvv_head_t::eval_head_tensor: build() has not run.");
+      auto ctx = mf.mpi();
+      const long nk = mf.nkpts(), nk_ibz = mf.nkpts_ibz();
+      const long nt_f = G_tskij.shape(0), nb = _nb, nb2 = nb * nb;
+      utils::check(G_tskij.shape(1) == _ns and G_tskij.shape(2) == nk_ibz and
+                   G_tskij.shape(3) == nb,
+                   "cvv_head_t::eval_head_tensor: G shape mismatch.");
+      utils::check(nt_f == _ft->nt_f(), "cvv_head_t::eval_head_tensor: nt mismatch.");
+      ensure_bubble_tables();
+
+      const long ntb = _Kt.shape(0);
+      head_result_t res;
+      res.Pi_tab = nda::array<ComplexType, 3>(ntb, 3, 3);
+      res.Pi_tab() = ComplexType(0.0);
+      // eq:tier1 normalization: -(spin_fac / (Nk V)) per k term; the 1/beta lives in the
+      // bosonic transform; the overall SIGN is pinned by the C2-b oracle.
+      const double pref = -((_ns == 1) ? 2.0 : 1.0) / (double(nk) * mf.volume());
+
+      auto kp_to_ibz = mf.kp_to_ibz();
+      auto kp_trev = mf.kp_trev();
+      const bool sym = (nk != nk_ibz);
+      nda::array<ComplexType, 2> Gk_t(nt_f, nb2), Gk_w(_nw, nb2);
+      nda::array<ComplexType, 2> M(_nw, 3 * nb2);
+      const long rank = ctx->comm.rank(), size = ctx->comm.size();
+      for (long isk = rank; isk < _ns * nk; isk += size) {
+        const long is = isk / nk, ik = isk % nk;
+        const long ksrc = sym ? long(kp_to_ibz(ik)) : ik;
+        const bool trev = sym and bool(kp_trev(ik));
+        for (long it = 0; it < nt_f; ++it) {
+          auto Gt = nda::reshape(Gk_t(it, all), std::array<long, 2>{nb, nb});
+          auto Gsrc = G_tskij(it, is, ksrc, all, all);
+          if (trev) { for (long i = 0; i < nb; ++i)
+                        for (long j = 0; j < nb; ++j) Gt(i, j) = Gsrc(j, i); }
+          else      Gt = Gsrc;
+        }
+        _ft->tau_to_w(Gk_t, Gk_w, imag_axes_ft::fermion);
+        auto v = velocity(is, ik);                       // (3, nw, nb, nb)
+        nda::array<ComplexType, 2> Gn(nb, nb), Mn(nb, nb);
+        for (long n = 0; n < _nw; ++n) {
+          for (long i = 0; i < nb; ++i)
+            for (long m = 0; m < nb; ++m) Gn(i, m) = Gk_w(n, i * nb + m);
+          for (long a = 0; a < 3; ++a) {
+            nda::blas::gemm(v(a, n, all, all), Gn, Mn);
+            const long oa = a * nb2;
+            for (long i = 0; i < nb; ++i)
+              for (long m = 0; m < nb; ++m) M(n, oa + i * nb + m) = Mn(i, m);
+          }
+        }
+        cvv_detail::bubble_accumulate(_pfw.value(), M, M, _Kt, _Kt_mir, nb, pref,
+                                      res.Pi_tab, res.fit_error_max, res.res_ratio_max);
+      }
+      ctx->comm.all_reduce_in_place_n(res.Pi_tab.data(), res.Pi_tab.size(), std::plus<>{});
+      res.fit_error_max = ctx->comm.max(res.fit_error_max);
+      res.res_ratio_max = ctx->comm.max(res.res_ratio_max);
+      imag_axes_ft::dlr_pole_fit_gate(res.fit_error_max, "cvv_head_t::eval_head_tensor",
+                                      1e-3, 1e-2, res.res_ratio_max);
+
+      res.Pi_wab = nda::array<ComplexType, 3>(_ft->nw_b(), 3, 3);
+      auto Pt2 = nda::reshape(res.Pi_tab, std::array<long, 2>{ntb, 9});
+      auto Pw2 = nda::reshape(res.Pi_wab, std::array<long, 2>{long(_ft->nw_b()), 9});
+      _ft->tau_to_w(Pt2, Pw2, imag_axes_ft::boson);
+      res.Phead_wab = cvv_detail::head_subtract(res.Pi_wab, *_ft);
+      const long i0 = _ft->nw_b() / 2;
+      app_log(2, "  [CVV] head tensor: diag Phead(inu=0) = ({:.6e}, {:.6e}, {:.6e}) "
+                 "[raw para bubble Pi(0) diag = ({:.3e}, {:.3e}, {:.3e})]; "
+                 "pole-fit err_max = {:.3e}, residue ratio max = {:.3g}",
+              res.Phead_wab(i0, 0, 0).real(), res.Phead_wab(i0, 1, 1).real(),
+              res.Phead_wab(i0, 2, 2).real(), res.Pi_wab(i0, 0, 0).real(),
+              res.Pi_wab(i0, 1, 1).real(), res.Pi_wab(i0, 2, 2).real(),
+              res.fit_error_max, res.res_ratio_max);
+      return res;
+    }
+
+    /** lazy build of the w-side pole fit + the bosonic-tau kernel tables (public so the
+     *  unit tests can drive cvv_detail::bubble_accumulate with the same tables). */
+    void ensure_bubble_tables() {
+      if (_pfw.has_value()) return;
+      _pfw = imag_axes_ft::dlr_pole_fit_w(*_ft);
+      auto const &pf = _pfw.value();
+      const long ntb = _ft->nt_b();
+      const double beta = _ft->beta();
+      auto taub = _ft->tau_mesh_b();
+      _Kt = nda::array<ComplexType, 2>(ntb, pf.np);
+      _Kt_mir = nda::array<ComplexType, 2>(ntb, pf.np);
+      for (long j = 0; j < ntb; ++j) {
+        const double s = (taub(j) + 1.0) * 0.5 * beta;   // tau_mesh in [-1, 1] convention
+        for (long p = 0; p < pf.np; ++p) {
+          _Kt(j, p) = ComplexType(imag_axes_ft::dlr_kF(beta, s, pf.epsl(p)));
+          _Kt_mir(j, p) = ComplexType(imag_axes_ft::dlr_kF(beta, beta - s, pf.epsl(p)));
+        }
+      }
+    }
+    imag_axes_ft::dlr_pole_fit_w const &pole_fit_w() { ensure_bubble_tables(); return _pfw.value(); }
+    nda::array<ComplexType, 2> const &Kt() const { return _Kt; }
+    nda::array<ComplexType, 2> const &Kt_mir() const { return _Kt_mir; }
 
   private:
-    [[noreturn]] void not_implemented(std::string_view where) const;
     void truncate_shells();
 
     const imag_axes_ft::IAFT* _ft = nullptr;
@@ -261,6 +484,10 @@ namespace solvers {
     // node-shared R stores; dropped shells are zeroed rows
     std::optional<sArray_t<nda::array_view<ComplexType, 4>>> _shstat;  // (ns, nR, nb, nb)
     std::optional<sArray_t<nda::array_view<ComplexType, 5>>> _ssig;   // (ns, nR, nw, nb, nb)
+    // C2 bubble machinery (lazy): the w-side regularized pole fit + the K_F tables on
+    // the bosonic tau grid (tau_j and beta - tau_j)
+    std::optional<imag_axes_ft::dlr_pole_fit_w> _pfw;
+    nda::array<ComplexType, 2> _Kt, _Kt_mir;
   };
 
 } // solvers

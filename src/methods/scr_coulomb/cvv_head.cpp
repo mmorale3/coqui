@@ -36,15 +36,6 @@ namespace solvers {
                  "cvv_head_t: cvv_rspace_tol must be > 0 (got {}).", rspace_tol);
   }
 
-  void cvv_head_t::not_implemented(std::string_view where) const {
-    utils::check(false,
-                 "{}: the CVV head tensor lands in increment C2 of "
-                 "notes/scgwt_implementation_plan.md.", where);
-    std::abort();  // unreachable: utils::check(false, ...) aborts
-  }
-
-  void cvv_head_t::eval_head_tensor() { not_implemented("cvv_head_t::eval_head_tensor"); }
-
   nda::array<ComplexType, 4> cvv_head_t::velocity(long is, long ik) const {
     decltype(nda::range::all) all;
     utils::check(_built, "cvv_head_t::velocity: build() has not run.");

@@ -442,6 +442,162 @@ namespace imag_axes_ft {
                  "wmax, or lower the pole-fit rel_tol.", who, err, abort_at);
   }
 
+  /**
+   * scGW-tilde increment C2: the SAME regularized auxiliary pole fit, ingesting
+   * FERMIONIC MATSUBARA-NODE data instead of tau data.
+   *
+   * WHY IT EXISTS. The CVV head builds M_alpha = v~_alpha G as a PRODUCT at the
+   * backend's fermionic iw nodes (that is where both factors live); its tau
+   * representation is exactly what the fit is asked to produce, so a tau-side fit is
+   * circular, and pushing the product through the square interpolatory w -> tau map is
+   * the alias trap this file exists to forbid (rule 7 of
+   * notes/scgwt_implementation_plan.md). Kernel
+   *
+   *      K(n,p) = 1 / (iw_n - eps_p)     (backend fermionic nodes iw_n, aux poles eps_p)
+   *
+   * complex truncated SVD, and the identical FIXED-RANK doctrine: the rank is chosen at
+   * build() from the singular spectrum alone, never from the data (same three
+   * requirements as the tau-side struct). fit_error is the same honest max-norm
+   * reconstruction error, measured on the SAME iw grid the data came from; callers gate
+   * on it with dlr_pole_fit_gate exactly as for the tau fit. Residues share the aux
+   * NONSYM pole grid, so downstream kernel evaluations (dlr_kF at arbitrary tau) and
+   * any residue algebra see the same well-separated nodes.
+   */
+  struct dlr_pole_fit_w {
+    long np = 0;                         // number of auxiliary poles
+    long nw = 0;                         // backend fermionic Matsubara nodes
+    long n_kept = 0;
+    double beta = 0.0;
+    double rel_tol = 0.0;
+    double s_max = 0.0, s_min_kept = 0.0;
+    double amplification = 0.0;
+
+    nda::array<double, 1> epsl;          // physical pole energies (aux NONSYM grid)
+    nda::array<ComplexType, 1> iwn;      // physical iw_n of the backend fermionic mesh
+    nda::array<ComplexType, 2> Kc;       // (nw, np) reconstruction kernel
+    nda::array<ComplexType, 2> Ut;       // (ns, nw)  U^H (conjugate transpose)
+    nda::array<ComplexType, 2> Vs;       // (np, ns)  V * diag(1/s)
+    nda::array<double, 1> sval;
+    long ns_max = 0;
+
+    dlr_pole_fit_w() = default;
+    dlr_pole_fit_w(IAFT const& ft, double rtol = -1.0) { build(ft, rtol); }
+
+    void build(IAFT const& ft, double rtol = -1.0) {
+#ifndef ENABLE_DLR
+      (void)ft; (void)rtol;
+      utils::check(false, "imag_axes_ft::dlr_pole_fit_w: requires the DLR backend "
+                          "(build with ENABLE_DLR=ON).");
+#else
+      utils::check(ft.basis() == imag_axes_ft::dlr_basis,
+                   "imag_axes_ft::dlr_pole_fit_w: requires the DLR imaginary-axis backend.");
+      if (rtol < 0.0) rtol = dlr_pole_fit_rel_tol;
+      utils::check(rtol > 0.0 and rtol < 1.0,
+                   "imag_axes_ft::dlr_pole_fit_w: rel_tol = {} must be in (0,1).", rtol);
+      beta = ft.beta();
+      nw = ft.nw_f();
+      rel_tol = rtol;
+
+      // the SAME auxiliary NONSYM pole grid as the tau-side fit (see its build())
+      auto rf_v = cppdlr::build_dlr_rf(ft.lambda(), ft.eps());
+      np = rf_v.size();
+      epsl = nda::array<double, 1>(np);
+      for (long l = 0; l < np; ++l) epsl(l) = rf_v(l) / beta;
+
+      auto wn = ft.wn_mesh_f();
+      iwn = nda::array<ComplexType, 1>(nw);
+      for (long n = 0; n < nw; ++n) iwn(n) = ft.omega(wn(n));
+
+      Kc = nda::array<ComplexType, 2>(nw, np);
+      for (long n = 0; n < nw; ++n)
+        for (long p = 0; p < np; ++p) Kc(n, p) = 1.0 / (iwn(n) - epsl(p));
+
+      nda::matrix<ComplexType, nda::F_layout> A(nw, np);
+      A() = Kc;
+      long ms = std::min(nw, np);
+      nda::vector<double> sig(ms);
+      nda::matrix<ComplexType, nda::F_layout> U(nw, nw), VH(np, np);
+      int info = nda::lapack::gesvd(A, sig, U, VH);
+      utils::check(info == 0, "imag_axes_ft::dlr_pole_fit_w: gesvd failed (info = {}).", info);
+
+      s_max = sig(0);
+      ns_max = 0;
+      while (ns_max < ms and sig(ns_max) > dlr_pole_fit_smin_floor * s_max) ++ns_max;
+      utils::check(ns_max > 0, "imag_axes_ft::dlr_pole_fit_w: no usable singular directions.");
+      // the rank is fixed HERE, from the spectrum and the instance's target only
+      n_kept = 0;
+      while (n_kept < ns_max and sig(n_kept) > rel_tol * s_max) ++n_kept;
+      utils::check(n_kept > 0, "imag_axes_ft::dlr_pole_fit_w: truncation kept no singular "
+                               "values (rel_tol = {}).", rel_tol);
+      s_min_kept = sig(n_kept - 1);
+      amplification = 1.0 / s_min_kept;
+
+      sval = nda::array<double, 1>(ns_max);
+      Ut = nda::array<ComplexType, 2>(ns_max, nw);
+      Vs = nda::array<ComplexType, 2>(np, ns_max);
+      for (long k = 0; k < ns_max; ++k) {
+        sval(k) = sig(k);
+        // complex LS: c = V diag(1/s) U^H F -- conjugate transposes, unlike the real case
+        for (long n = 0; n < nw; ++n) Ut(k, n) = std::conj(U(n, k));
+        double inv = 1.0 / sig(k);
+        for (long p = 0; p < np; ++p) Vs(p, k) = std::conj(VH(k, p)) * inv;
+      }
+#endif
+    }
+
+    /** Residues of Matsubara-node data (leading axis nw, trailing axis a flat batch). */
+    nda::array<ComplexType, 2> coeffs(nda::MemoryArrayOfRank<2> auto const& F_wd) const {
+      utils::check(F_wd.shape(0) == nw,
+                   "imag_axes_ft::dlr_pole_fit_w::coeffs: leading axis {} != nw = {}.",
+                   F_wd.shape(0), nw);
+      const long d = F_wd.shape(1);
+      nda::array<ComplexType, 2> c(np, d);
+      if (d == 0) return c;
+      nda::array<ComplexType, 2> g(n_kept, d);
+      nda::array<ComplexType, 2> Utk_c(n_kept, nw);
+      Utk_c() = Ut(nda::range(0, n_kept), nda::range::all);
+      nda::blas::gemm(Utk_c, F_wd, g);
+      nda::array<ComplexType, 2> Vk_c(np, n_kept);
+      Vk_c() = Vs(nda::range::all, nda::range(0, n_kept));
+      nda::blas::gemm(Vk_c, g, c);
+      return c;
+    }
+
+    /** Relative max-norm reconstruction error on the SAME iw grid the data came from. */
+    double fit_error(nda::MemoryArrayOfRank<2> auto const& F_wd,
+                     nda::array<ComplexType, 2> const& c) const {
+      long d = F_wd.shape(1);
+      if (d == 0) return 0.0;
+      constexpr long BJ = 256;
+      const long nb = std::min(d, BJ);
+      nda::array<ComplexType, 2> cb(np, nb), rb(nw, nb);
+      double num = 0.0, den = 0.0;
+      for (long j0 = 0; j0 < d; j0 += nb) {
+        const long nj = std::min(nb, d - j0);
+        for (long p = 0; p < np; ++p) {
+          for (long j = 0; j < nj; ++j) cb(p, j) = c(p, j0 + j);
+          for (long j = nj; j < nb; ++j) cb(p, j) = ComplexType(0.0);
+        }
+        nda::blas::gemm(ComplexType(1.0), Kc, cb, ComplexType(0.0), rb);
+        for (long s = 0; s < nw; ++s)
+          for (long j = 0; j < nj; ++j) {
+            num = std::max(num, std::abs(F_wd(s, j0 + j) - rb(s, j)));
+            den = std::max(den, std::abs(F_wd(s, j0 + j)));
+          }
+      }
+      return (den > 0.0) ? num / den : 0.0;
+    }
+
+    /** max|c| / max|F| -- see dlr_pole_fit::residue_ratio for why this is watched. */
+    double residue_ratio(nda::MemoryArrayOfRank<2> auto const& F_wd,
+                         nda::array<ComplexType, 2> const& c) const {
+      double cm = 0.0, fm = 0.0;
+      for (auto const& v : c) cm = std::max(cm, std::abs(v));
+      for (auto const& v : F_wd) fm = std::max(fm, std::abs(v));
+      return (fm > 0.0) ? cm / fm : 0.0;
+    }
+  };
+
 } // namespace imag_axes_ft
 
 #endif // COQUI_DLR_POLE_FIT_HPP
