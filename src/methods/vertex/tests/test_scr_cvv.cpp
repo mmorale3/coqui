@@ -693,6 +693,69 @@ namespace bdft_tests {
               -(num * Pi_w3(mlast, 2, 2)).real());
       for (int a = 0; a < 3; ++a) REQUIRE(std::isfinite(d2h(a, a).real()));
     }
+
+    // C3-a MECHANISM PIN (2026-08-12): the SAME toy stored in the PER-K EIGENBASIS --
+    // the gauge every real mean-field's band data is in. H_eig(k) = diag(eps(k)), G
+    // diagonal; the R-interpolant derivative of eigen-gauge data carries the
+    // INTRABAND velocity only (the interband dipole <n|dH/dk|m> lives in the k-
+    // dependence of the basis rotation and cannot survive a per-k eigen store), so
+    // the subtracted head must COLLAPSE relative to the fixed-basis head above.
+    // This pins the rusty C3-a finding (eps_inf ~ 1.00 at iter 1 on real mfs, sym
+    // and nosym alike, vs 6.8-8.3 stored) as BASIS-GAUGE sensitivity of the CVV
+    // store -- NOT a symmetry-unfold defect (the D-rotation fix was necessary but
+    // insufficient). The store needs a smooth fixed gauge (Wannier-class) or a
+    // commutator/position-element velocity: an R1 theory decision.
+    {
+      nda::array<double, 1> evk(2);
+      nda::array<ComplexType, 2> Uk(2, 2);
+      nda::array<ComplexType, 2> Hd_k(nk, nb * nb);
+      Hd_k() = ComplexType(0.0);
+      for (long ik = 0; ik < nk; ++ik) {
+        auto hk = toy.H(kpts(ik, all));
+        eig2(hk, evk, Uk);
+        for (long i = 0; i < nb; ++i) Hd_k(ik, i * nb + i) = evk(i);
+      }
+      nda::array<ComplexType, 2> hd_R(nR, nb * nb);
+      nda::blas::gemm(f_Rk, Hd_k, hd_R);
+      nda::array<ComplexType, 3> Pi_te(ntb, 3, 3);
+      Pi_te() = ComplexType(0.0);
+      double fe2 = 0.0, rr2 = 0.0;
+      for (long ik = 0; ik < nk; ++ik) {
+        auto hk = toy.H(kpts(ik, all));
+        eig2(hk, evk, Uk);
+        auto P = solvers::cvv_detail::phase_rows(Rcart, rw, kpts(ik, all), false);
+        nda::array<ComplexType, 2> vk(3, nb * nb);
+        nda::blas::gemm(P, hd_R, vk);
+        for (long n = 0; n < nw; ++n)
+          for (long a = 0; a < 3; ++a) {
+            const long oa = a * nb * nb;
+            for (long i = 0; i < nb; ++i)
+              for (long j = 0; j < nb; ++j)
+                Mbuf(n, oa + i * nb + j) =
+                    vk(a, i * nb + j) / (pfw.iwn(n) - evk(j));
+          }
+        solvers::cvv_detail::bubble_accumulate(pfw, Mbuf, Mbuf, cvv.Kt(), cvv.Kt_mir(),
+                                               nb, pref, Pi_te, fe2, rr2);
+      }
+      nda::array<ComplexType, 3> Pi_we(nwb, 3, 3);
+      { auto P2 = nda::reshape(Pi_te, std::array<long, 2>{ntb, 9});
+        auto Pw2 = nda::reshape(Pi_we, std::array<long, 2>{nwb, 9});
+        ft.tau_to_w(P2, Pw2, imag_axes_ft::boson); }
+      auto Phead_e = solvers::cvv_detail::head_subtract(Pi_we, ft);
+      double mfix = 0.0, meig = 0.0;
+      for (int a = 0; a < 3; ++a) {
+        mfix = std::max(mfix, std::abs(Phead(i0, a, a)));
+        meig = std::max(meig, std::abs(Phead_e(i0, a, a)));
+      }
+      const double collapse = meig / std::max(mfix, 1e-300);
+      app_log(1, "cvv_ks_head_control: EIGEN-GAUGE mechanism pin: max|Phead| fixed "
+                 "basis = {:.4e}, eigen gauge = {:.4e}, ratio = {:.3e} "
+                 "(H1: the eigen-gauge store loses the interband dipole)",
+              mfix, meig, collapse);
+      REQUIRE(std::isfinite(collapse));
+      REQUIRE(collapse < 0.05);   // the collapse IS the mechanism (H1); bars
+                                  // provisional -- pinned from the first run
+    }
 #endif
   }
 
