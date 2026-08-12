@@ -625,6 +625,8 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     qp_params_t qp_params(qp_type, ac_alg, Nfit, eta, conv_thr, "evscf", keep_scr_coulomb_fixed,
                           "fermi", mu_tol, mu_update_alg);
     qp_params.qp_map = qp_map;
+    qp_params.qp_map_wpow = io::get_value_with_default<double>(pt,"qp_map_wpow",2.0);
+    utils::check(qp_params.qp_map_wpow >= 0.0, "evgw: qp_map_wpow must be >= 0.");
     if (io::get_value_with_default<bool>(pt,"iter_alg.enable", true)) {
       iter_solver = std::make_unique<iter_scf::iter_scf_t>(iter_scf::make_iter_scf(pt, 0.7, true));
     } else {
@@ -654,6 +656,8 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     qp_params_t qp_params("sc", ac_alg, Nfit, eta, 1e-8, "qpscf", false, off_diag_mode,
                           mu_tol, mu_update_alg);
     qp_params.qp_map = qp_map;
+    qp_params.qp_map_wpow = io::get_value_with_default<double>(pt,"qp_map_wpow",2.0);
+    utils::check(qp_params.qp_map_wpow >= 0.0, "qpgw: qp_map_wpow must be >= 0.");
     if (io::get_value_with_default<bool>(pt,"iter_alg.enable", true)) {
       iter_solver = std::make_unique<iter_scf::iter_scf_t>(iter_scf::make_iter_scf(pt));
     } else {

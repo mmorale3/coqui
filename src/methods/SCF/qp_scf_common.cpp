@@ -325,6 +325,7 @@ void solve_qp_eqn(sArray_t<Array_view_3D_t> &sE_ska,
       }
     } else { // "mats_gmatch"
       qp_matsubara::gmatch_opts opt;
+      opt.wpow = qp_params.qp_map_wpow;
       app_log(2, "  - gmatch weights (reportable):                w_n = (w0/w_n)^{}", opt.wpow);
       nda::array<ComplexType, 1> S2(2);
       nda::array<ComplexType, 3> G(npos, 1, 1);
@@ -613,6 +614,7 @@ auto qp_approx(const sArray_t<Array_view_5D_t> &sSigma_tskij,
     }
   } else { // "mats_gmatch"
     qp_matsubara::gmatch_opts opt;
+    opt.wpow = qp_params.qp_map_wpow;
     app_log(2, "  - gmatch weights (reportable): w_n = (w0/w_n)^{}", opt.wpow);
     nda::array<ComplexType, 3> S2(2, nbnd, nbnd), G(npos, nbnd, nbnd);
     nda::array<ComplexType, 2> Hstat_ab(nbnd, nbnd), H(nbnd, nbnd), tmp(nbnd, nbnd);

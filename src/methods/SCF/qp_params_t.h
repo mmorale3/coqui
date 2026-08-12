@@ -59,6 +59,14 @@ struct qp_params_t {
   // Wired into the solvers at increment Q2; parsed and validated from Q0 so the
   // default path is pinned bitwise before any dispatch lands.
   std::string qp_map = "ac_pade";
+
+  // mats_gmatch weight exponent: w_n = (w0/w_n)^qp_map_wpow on the positive
+  // fermionic nodes. 2.0 emphasizes omega -> 0 (Z-weighted, Kutepov-like
+  // behavior); 0.0 weights all nodes equally, exposing the QP-pole window
+  // omega ~ |eps - mu| (closer to the real-axis Sigma(eps_QP) map). The
+  // residual's leading 1/(i omega) tails cancel, so any wpow >= 0 is
+  // well-posed. Scanned against the real-axis qsGW references (Q2-c).
+  double qp_map_wpow = 2.0;
 };
 
 } // methods
