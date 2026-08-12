@@ -235,6 +235,17 @@ namespace bdft_tests {
     REQUIRE(d4.pq_kept_frac_test < 1.0);
     REQUIRE(d4.pq_j1_resid_trunc > d4.pq_all_j1_resid);
 
+    // ---- P3 gate (C.3): node-group scheduling invariance --------------------------
+    // The grouped assembly is disjoint writes + a zeros-elsewhere all_reduce, so
+    // every scheduling variant must reproduce the replicated reference BITWISE.
+    auto d3 = vtx.ladder_p3_gate(mb_state, thc);
+    app_log(1, "scgwt_ladder_l1: P3 scheduling invariance: P2 = {:.3e}, grp1 = "
+               "{:.3e}, grpN = {:.3e} (max abs diff vs replicated)",
+            d3.p2_max_diff, d3.grp1_max_diff, d3.grpN_max_diff);
+    REQUIRE(d3.p2_max_diff == 0.0);
+    REQUIRE(d3.grp1_max_diff == 0.0);
+    REQUIRE(d3.grpN_max_diff == 0.0);
+
     mpi_context->comm.barrier();
     if (mpi_context->comm.root()) remove((output + ".mbpt.h5").c_str());
     mpi_context->comm.barrier();

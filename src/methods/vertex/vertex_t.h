@@ -1378,6 +1378,18 @@ namespace solvers {
     ladder_sym_diag ladder_sym_gate(MBState &mb_state, THC_ERI auto &thc);
 
     /**
+     * P3 gate (C.3, vertex_ladder.icc): scheduling invariance of the pair-space
+     * ladder -- P2 round-robin, groups-of-1, and one-group-of-all-ranks against the
+     * replicated reference. Disjoint-write group assembly => BITWISE (0.0) expected.
+     */
+    struct ladder_p3_diag {
+      double p2_max_diff = -1.0;    // rank round-robin vs replicated
+      double grp1_max_diff = -1.0;  // groups-of-1 grid vs replicated
+      double grpN_max_diff = -1.0;  // one group of all ranks vs replicated
+    };
+    ladder_p3_diag ladder_p3_gate(MBState &mb_state, THC_ERI auto &thc);
+
+    /**
      * scGW-tilde increment L1 (vertex_ladder.icc): the C-window pair bubble
      * Pi-bar^0_MN(q, tau_pos) in the SECONDARY aux basis, (nt_half, nq, N_m, N_m),
      * replicated -- house RPA conventions (rpa_pi.icc Hadamard pairing, -spin/Nk,

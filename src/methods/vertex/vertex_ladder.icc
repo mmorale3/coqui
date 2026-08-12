@@ -126,6 +126,17 @@ namespace solvers {
      * reproduces the replicated result BITWISE. (rank, nproc) = (0, 1) = the
      * replicated/toy mode. Outputs are ZEROED here, indexed by POSITION in nu_list.
      *
+     * P3 NODE-GROUP SCHEDULING (design section 4, C.3): g_comm != nullptr makes
+     * (rank, nproc) the GROUP grid (every member of a group passes the same pair;
+     * production callers use internode rank/size with g_comm = &node_comm) and the
+     * intra-group split is: the d/chi0 and K builds are divided over group ranks by
+     * DISJOINT writes + a zeros-elsewhere all_reduce -- the assembled operands are
+     * BITWISE the replicated ones -- and each requested nu is solved by exactly one
+     * group rank (jn % lsize). Every (jn, iq) output cell is therefore still written
+     * by exactly one rank GLOBALLY: the caller's all_reduce contract is unchanged.
+     * v1 assembles the group operands via all_reduce; the node-shared (shm) K window
+     * is the rusty-scale follow-up (the memory win; the build-time win is here).
+     *
      * C.2 IBZ SYMMETRY (the pi_c_accumulate_w contract, notes/vertex_ibz_symmetry.md):
      * with an active symc the EXTERNAL q axis of the outputs is nq_ibz, W0b carries
      * nq_ibz rows, kmq/kpq carry the FULL transfer mesh, and G_CC/Xb are full-BZ
@@ -146,7 +157,8 @@ namespace solvers {
                                   nda::array<ComplexType, 4> *Pi_onerung,  // (nnu,nq_ext,Nm,Nm) or null
                                   nda::array<ComplexType, 4> *Pi_ladder,   // (nnu,nq_ext,Nm,Nm) or null
                                   long rank = 0, long nproc = 1,
-                                  vertex_sym::sym_ctx const *symc = nullptr) {
+                                  vertex_sym::sym_ctx const *symc = nullptr,
+                                  boost::mpi3::communicator *g_comm = nullptr) {
       decltype(nda::range::all) all;
       const long nt = G_CC.shape(0), ns = G_CC.shape(1), nk = G_CC.shape(2);
       const long nc = G_CC.shape(3), Nm = Xb.shape(2);
@@ -212,12 +224,22 @@ namespace solvers {
       nda::array<ComplexType, 2> XD(Dsz, Nm), KXD(Dsz, Nm), XKXD(Dsz, Nm), Zl(Dsz, Nm);
       nda::array<ComplexType, 2> Dstack_c(Dsz, Nm);
 
+      // P3: intra-group coordinates (lsize = 1 without a group communicator)
+      const long lrank = (g_comm != nullptr) ? g_comm->rank() : 0;
+      const long lsize = (g_comm != nullptr) ? g_comm->size() : 1;
       for (long sq = rank; sq < ns * nq_ext; sq += nproc) {
         const long is = sq / nq_ext;
         const long iq = sq % nq_ext;
         {
           // --- d(k) and the chi0 blocks (only the requested nu rows are kept) ---------
+          // P3: ik split over group ranks; disjoint writes, zeros-elsewhere reduce.
+          if (lsize > 1) {
+            Dmat() = ComplexType(0.0);
+            Dcj() = ComplexType(0.0);
+            Cb() = ComplexType(0.0);
+          }
           for (long ik = 0; ik < nk; ++ik) {
+            if (ik % lsize != lrank) continue;
             const long ikpq = kpq(iq, ik);
             for (long a = 0; a < nc; ++a)
               for (long b = 0; b < nc; ++b)
@@ -241,14 +263,22 @@ namespace solvers {
                 for (long c = 0; c < nc2; ++c)
                   Cb(ik, jn, r, c) = Bf(nu_list[jn], r * nc2 + c);
           }
+          if (lsize > 1) {
+            g_comm->all_reduce_in_place_n(Dmat.data(), Dmat.size(), std::plus<>{});
+            g_comm->all_reduce_in_place_n(Dcj.data(), Dcj.size(), std::plus<>{});
+            g_comm->all_reduce_in_place_n(Cb.data(), Cb.size(), std::plus<>{});
+          }
           // --- the rung blocks K(k, k') (nu-independent) -------------------------------
           // qx = k - k' (kmq orientation; the ladder's k' IS the anchor's ikmqx). The
           // legs go through the anchor's OWN builder (identical assignments on the
           // nosym path; Xhat(is, jsx, .) under symmetry) and the rung is read at
           // q_star(qx), PQ-TRANSPOSED for trev transfers (memo (P2)).
+          // P3: flattened (ik, ik') split over group ranks, same disjoint-write reduce.
+          if (lsize > 1) Kb() = ComplexType(0.0);
           for (long ik = 0; ik < nk; ++ik) {
             const long ikpq = kpq(iq, ik);
             for (long ikp = 0; ikp < nk; ++ikp) {
+              if ((ik * nk + ikp) % lsize != lrank) continue;
               const long iqx = qx_of(ik, ikp);
               const long ikppq = kpq(iq, ikp);
               const long jsx = sym ? symc->q_isym(iqx) : 0l;
@@ -271,17 +301,25 @@ namespace solvers {
                           wb(p1 * nc + p1p, p3 * nc + p3p);
             }
           }
+          if (lsize > 1)
+            g_comm->all_reduce_in_place_n(Kb.data(), Kb.size(), std::plus<>{});
           // --- Kt[(k'),(k)] = K(k,k')^T and conj(D) stack (nu-independent) -------------
-          for (long ikp = 0; ikp < nk; ++ikp)
+          // P3: packed only where a resolvent solve actually runs on this rank.
+          const bool solves_here = (Pi_ladder != nullptr and lrank < std::min(lsize, nnu));
+          if (solves_here) {
+            for (long ikp = 0; ikp < nk; ++ikp)
+              for (long ik = 0; ik < nk; ++ik)
+                for (long r = 0; r < nc2; ++r)
+                  for (long c = 0; c < nc2; ++c)
+                    Kbig(ikp * nc2 + r, ik * nc2 + c) = Kb(ik, ikp, c, r);
             for (long ik = 0; ik < nk; ++ik)
-              for (long r = 0; r < nc2; ++r)
-                for (long c = 0; c < nc2; ++c)
-                  Kbig(ikp * nc2 + r, ik * nc2 + c) = Kb(ik, ikp, c, r);
-          for (long ik = 0; ik < nk; ++ik)
-            for (long r = 0; r < nc2; ++r) Dstack_c(ik * nc2 + r, all) = Dcj(ik, r, all);
+              for (long r = 0; r < nc2; ++r) Dstack_c(ik * nc2 + r, all) = Dcj(ik, r, all);
+          }
 
           // --- per requested nu: one-rung rebuild + resummation ------------------------
+          // P3: each nu is owned by exactly one group rank (write-once globally).
           for (long jn = 0; jn < nnu; ++jn) {
+            if (jn % lsize != lrank) continue;
             if (Pi_onerung != nullptr) {
               for (long ik = 0; ik < nk; ++ik) {
                 nda::blas::gemm(Cb(ik, jn, all, all), Dmat(ik, all, all),
@@ -904,9 +942,15 @@ namespace solvers {
     std::vector<long> nu0 = {tools.nw_b / 2};   // the inu = 0 node of the full mesh
     nda::array<ComplexType, 4> Pl(1, nq_ext, Nm, Nm);
     auto mpi = thc.mpi();
+    // P3 (C.3): NODE-GROUP scheduling -- (s, q) pairs over the internode grid, builds
+    // cooperatively inside each node (disjoint writes, bitwise assembly), the nu = 0
+    // solve on one node rank. The global all_reduce contract below is unchanged
+    // (every output cell written exactly once globally).
     vertex_ladder_detail::pair_space_ladder(G_CC, _Xb_skma, _W0b_qmm.value(), kmq, kpq,
                                             tools, nu0, nullptr, &Pl,
-                                            mpi->comm.rank(), mpi->comm.size(), symc);
+                                            mpi->internode_comm.rank(),
+                                            mpi->internode_comm.size(), symc,
+                                            std::addressof(mpi->node_comm));
     mpi->comm.all_reduce_in_place_n(Pl.data(), Pl.size(), std::plus<>{});
     nda::array<ComplexType, 3> out(nq_ext, Nm, Nm);
     out = Pl(0, all, all, all);
@@ -1001,6 +1045,96 @@ namespace solvers {
                "(max one-rung {:.3e}, max ladder {:.3e})",
             sym_mesh ? "ACTIVE" : "inactive", out.l1b_resid, out.ladder_frac,
             out.onerung_max, out.ladder_max);
+    return out;
+  }
+
+  /**
+   * The P3 gate (C.3, design section 4): scheduling invariance of the pair-space
+   * ladder at the readout node (inu = 0). The same state is run replicated, P2
+   * rank-round-robin, groups-of-1, and ONE group of all ranks (the intra-group
+   * cooperative build + owned solve). The group assembly is disjoint writes + a
+   * zeros-elsewhere all_reduce, so every variant must be BITWISE the replicated
+   * reference (max abs diff exactly 0.0) -- stronger than the FP floor.
+   */
+  vertex_t::ladder_p3_diag vertex_t::ladder_p3_gate(MBState &mb_state, THC_ERI auto &thc) {
+    decltype(nda::range::all) all;
+    ladder_p3_diag out;
+    auto MF = thc.MF();
+    auto mpi = thc.mpi();
+    utils::check(active() and secondary(),
+                 "vertex_t::ladder_p3_gate: requires an ACTIVE secondary-basis vertex.");
+    utils::check(not _wannier, "vertex_t::ladder_p3_gate: window mode only.");
+    utils::check(_W0b_qmm.has_value(),
+                 "vertex_t::ladder_p3_gate: W0bar is absent -- run after an update_w "
+                 "with an active static-rung secondary vertex (build_w0).");
+    utils::check(mb_state.sG_tskij.has_value(),
+                 "vertex_t::ladder_p3_gate: mb_state carries no G.");
+    ensure_secondary_basis(mb_state, thc);
+
+    auto G_tskij = mb_state.sG_tskij.value().local();
+    const long nt = G_tskij.shape(0), ns = G_tskij.shape(1);
+    const long nk = MF->nkpts();
+    const long nc = subspace_rank(), Nm = _Xb_skma.shape(2);
+    const long nq_ext = MF->nqpts_ibz(), nq_full = MF->nqpts();
+    const bool sym_mesh = (MF->nkpts() != MF->nkpts_ibz()) or (nq_full != nq_ext);
+    nda::array<ComplexType, 5> G_CC(nt, ns, nk, nc, nc);
+    vertex_ladder_detail::expand_G_CC_fullbz(G_tskij, _band_window, sym_mesh,
+                                             MF->kp_to_ibz(), MF->kp_trev(), G_CC);
+    nda::array<long, 2> kmq(nq_full, nk), kpq(nq_full, nk);
+    auto qmin = MF->qminus();
+    for (long iq = 0; iq < nq_full; ++iq)
+      for (long ik = 0; ik < nk; ++ik) {
+        kmq(iq, ik) = MF->qk_to_k2(iq, ik);
+        kpq(iq, ik) = MF->qk_to_k2(qmin(iq), ik);
+      }
+    vertex_sym::sym_ctx const *symc = nullptr;
+    if (sym_mesh) {
+      build_sym_ctx(thc, _Xb_skma, _band_window.first(), _sym_secondary);
+      symc = &_sym_secondary.value();
+    }
+
+    vertex_pi::iaft_tools tools(*_ft);
+    std::vector<long> nu0 = {tools.nw_b / 2};
+    const long rank = mpi->comm.rank(), size = mpi->comm.size();
+    auto W0b = _W0b_qmm.value();
+
+    // A: the replicated reference (every rank computes everything; no reduce)
+    nda::array<ComplexType, 4> Pa(1, nq_ext, Nm, Nm);
+    vertex_ladder_detail::pair_space_ladder(G_CC, _Xb_skma, W0b, kmq, kpq, tools, nu0,
+                                            nullptr, &Pa, 0, 1, symc, nullptr);
+    auto maxdiff = [&](nda::array<ComplexType, 4> const &P) {
+      double mx = 0.0;
+      for (long i = 0; i < long(P.size()); ++i)
+        mx = std::max(mx, std::abs(*(P.data() + i) - *(Pa.data() + i)));
+      return mx;
+    };
+    // B: P2 rank round-robin + the global all_reduce
+    nda::array<ComplexType, 4> Pb(1, nq_ext, Nm, Nm);
+    vertex_ladder_detail::pair_space_ladder(G_CC, _Xb_skma, W0b, kmq, kpq, tools, nu0,
+                                            nullptr, &Pb, rank, size, symc, nullptr);
+    mpi->comm.all_reduce_in_place_n(Pb.data(), Pb.size(), std::plus<>{});
+    out.p2_max_diff = maxdiff(Pb);
+    // C1: groups of 1 (the grouped code path, degenerate lsize = 1)
+    auto c_self = mpi->comm.split(int(rank), 0);
+    nda::array<ComplexType, 4> Pc1(1, nq_ext, Nm, Nm);
+    vertex_ladder_detail::pair_space_ladder(G_CC, _Xb_skma, W0b, kmq, kpq, tools, nu0,
+                                            nullptr, &Pc1, rank, size, symc,
+                                            std::addressof(c_self));
+    mpi->comm.all_reduce_in_place_n(Pc1.data(), Pc1.size(), std::plus<>{});
+    out.grp1_max_diff = maxdiff(Pc1);
+    // C2: ONE group of ALL ranks (cooperative builds + the owned nu solve)
+    auto c_all = mpi->comm.split(0, int(rank));
+    nda::array<ComplexType, 4> Pc2(1, nq_ext, Nm, Nm);
+    vertex_ladder_detail::pair_space_ladder(G_CC, _Xb_skma, W0b, kmq, kpq, tools, nu0,
+                                            nullptr, &Pc2, 0, 1, symc,
+                                            std::addressof(c_all));
+    mpi->comm.all_reduce_in_place_n(Pc2.data(), Pc2.size(), std::plus<>{});
+    out.grpN_max_diff = maxdiff(Pc2);
+
+    app_log(1, "  [scGW-tilde P3] scheduling-invariance gate (nu = 0, {} ranks): "
+               "P2 round-robin = {:.3e}, groups-of-1 = {:.3e}, one-group-of-{} = "
+               "{:.3e} (max abs diff vs replicated; expected BITWISE 0.0)",
+            size, out.p2_max_diff, out.grp1_max_diff, size, out.grpN_max_diff);
     return out;
   }
 
