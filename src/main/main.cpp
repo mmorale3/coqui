@@ -362,7 +362,8 @@ void run(mpi3::communicator &comm, InputParser &parser)
 
     } else if (cname == "ac" or cname == "unfold_bz"
                or cname == "band_interpolation" or cname == "spectral_interpolation" or cname == "local_dos"
-               or cname == "dump_vxc" or cname == "dump_hartree") { // more pproc options would be added.
+               or cname == "dump_vxc" or cname == "dump_hartree"
+               or cname == "cvv_eps") { // more pproc options would be added.
 
       ptree pt = it.second;
       auto mf_name = mf::get_mf(mpi_context, pt, mf_list);
