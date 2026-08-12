@@ -946,11 +946,20 @@ namespace solvers {
     // cooperatively inside each node (disjoint writes, bitwise assembly), the nu = 0
     // solve on one node rank. The global all_reduce contract below is unchanged
     // (every output cell written exactly once globally).
-    vertex_ladder_detail::pair_space_ladder(G_CC, _Xb_skma, _W0b_qmm.value(), kmq, kpq,
-                                            tools, nu0, nullptr, &Pl,
-                                            mpi->internode_comm.rank(),
-                                            mpi->internode_comm.size(), symc,
-                                            std::addressof(mpi->node_comm));
+    // SINGLE-NODE runs use the P2 rank round-robin instead: with one group and
+    // nnu = 1 the group mode serializes ALL q-solves onto node rank 0 (measured on
+    // the first nosym444 readout, ~30 s x 64 q per iteration), while P2 spreads the
+    // q's across ranks at identical results (the ladder_p3_gate bitwise identity).
+    if (mpi->internode_comm.size() > 1)
+      vertex_ladder_detail::pair_space_ladder(G_CC, _Xb_skma, _W0b_qmm.value(), kmq,
+                                              kpq, tools, nu0, nullptr, &Pl,
+                                              mpi->internode_comm.rank(),
+                                              mpi->internode_comm.size(), symc,
+                                              std::addressof(mpi->node_comm));
+    else
+      vertex_ladder_detail::pair_space_ladder(G_CC, _Xb_skma, _W0b_qmm.value(), kmq,
+                                              kpq, tools, nu0, nullptr, &Pl,
+                                              mpi->comm.rank(), mpi->comm.size(), symc);
     mpi->comm.all_reduce_in_place_n(Pl.data(), Pl.size(), std::plus<>{});
     nda::array<ComplexType, 3> out(nq_ext, Nm, Nm);
     out = Pl(0, all, all, all);
