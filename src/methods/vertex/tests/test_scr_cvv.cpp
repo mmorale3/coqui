@@ -813,6 +813,97 @@ namespace bdft_tests {
 #endif
   }
 
+  TEST_CASE("cvv_sym_unfold", "[methods][scgwt][cvv][ibz]") {
+#ifndef ENABLE_DLR
+    SUCCEED("cvv_sym_unfold skipped: build has ENABLE_DLR=OFF.");
+#else
+    // C3-a fix gate (LOCAL tier): the TRUE D(S,k)-rotated IBZ -> full-BZ unfold
+    // (cvv_detail::unfold_rotate_slice) on REAL symmetry-reduced meshes. The former
+    // copy/identity-D unfold made the stored k-slices STAR-CONSTANT, so the
+    // interpolant velocity lost the interband dipole at image k (the rusty C3-a
+    // finding: iter-1 states read eps_inf 1.07 where the stored convention gives
+    // 10-16). Local gates (the ABSOLUTE pin is production-tier: sym-vs-nosym iter-1
+    // head at Si kp444 -- no nosym lih223 twin exists locally):
+    //  (a) lih222_sym: the structural 2^3 TRIM zero must SURVIVE the rotations
+    //      (v(mesh k) == 0 is unfold-independent), and the Sigma = 0 velocity must
+    //      stay HERMITIAN -- a wrong sandwich composition (e.g. D H D^T) breaks
+    //      hermiticity at O(1), so err_herm < 1e-10 pins the composition;
+    //  (b) lih223_sym (non-TRIM k = +-1/3): same hermiticity pin with NONZERO
+    //      velocities, head finite, fit meters green; the diag is logged (measured,
+    //      not asserted -- the 223 mesh axis is b3, not a cartesian direction).
+    auto& mpi_context = utils::make_unit_test_mpi_context();
+    imag_axes_ft::IAFT ft(1000, 6.0, imag_axes_ft::dlr_basis, "low");
+
+    auto run_fixture = [&](std::string const &name, std::string const &output) {
+      auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, name));
+      REQUIRE(mf->nkpts() != mf->nkpts_ibz());   // rotations genuinely exercised
+      thc_reader_t thc(mf, make_thc_reader_ptree(mf->nbnd() * 8, "", "incore", "",
+                                                 "bdft", 1e-10, mf->ecutrho(), 1, 1024));
+      auto eri = mb_eri_t(thc, thc);
+      solvers::hf_t hf;
+      solvers::gw_t gw(&ft, "ignore_g0", output);
+      solvers::scr_coulomb_t scr_eri(&ft, "rpa", "ignore_g0");
+      simple_dyson dyson(mf.get(), &ft);
+      MBState mb_state(mpi_context, ft, output);
+      iter_scf::iter_scf_t iter_sol("damping");
+      auto [e_hf, e_corr] = scf_loop(mb_state, dyson, eri, ft,
+                                     solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol,
+                                     2, false, 1e-9, true);
+      app_log(1, "cvv_sym_unfold [{}]: e_hf = {}, e_corr = {}", name, e_hf, e_corr);
+      REQUIRE(mb_state.sF_skij.has_value());
+      REQUIRE(mb_state.sG_tskij.has_value());
+
+      // Sigma = 0 (KS/HF) build: the hermiticity pin on the D-rotated velocity
+      solvers::cvv_head_t cvv0(&ft, 1e-6);
+      nda::array<ComplexType, 5> sig_empty(0, 0, 0, 0, 0);
+      cvv0.build(*mf, dyson.H0(), mb_state.sF_skij.value().local(), sig_empty);
+      REQUIRE(cvv0.built());
+      double err_herm = 0.0, vmax = 0.0;
+      for (long ik = 0; ik < mf->nkpts(); ++ik) {
+        auto v0 = cvv0.velocity(0, ik);
+        for (int a = 0; a < 3; ++a)
+          for (long i = 0; i < v0.shape(2); ++i)
+            for (long j = 0; j < v0.shape(3); ++j) {
+              err_herm = std::max(err_herm,
+                                  std::abs(v0(a, 0, i, j) - std::conj(v0(a, 0, j, i))));
+              vmax = std::max(vmax, std::abs(v0(a, 0, i, j)));
+            }
+      }
+      // the full head through the production path (rotated G gather included)
+      solvers::cvv_head_t cvv(&ft, 1e-6);
+      cvv.build(*mf, dyson.H0(), mb_state.sF_skij.value().local(),
+                mb_state.sSigma_tskij.value().local());
+      auto head = cvv.eval_head_tensor(*mf, mb_state.sG_tskij.value().local());
+      const long i0 = ft.nw_b() / 2;
+      app_log(1, "cvv_sym_unfold [{}]: max|v| = {:.3e}, err_herm = {:.3e}; "
+                 "Phead(inu=0) diag = ({:.6e}, {:.6e}, {:.6e}); fit err = {:.3e}",
+              name, vmax, err_herm, head.Phead_wab(i0, 0, 0).real(),
+              head.Phead_wab(i0, 1, 1).real(), head.Phead_wab(i0, 2, 2).real(),
+              head.fit_error_max);
+      mpi_context->comm.barrier();
+      if (mpi_context->comm.root()) remove((output + ".mbpt.h5").c_str());
+      mpi_context->comm.barrier();
+      return std::make_tuple(vmax, err_herm, head.Phead_wab(i0, 2, 2).real(),
+                             head.fit_error_max);
+    };
+
+    {  // (a) lih222_sym: TRIM zero + hermiticity through the rotations
+      auto [vmax, err_herm, pzz, fit] = run_fixture("qe_lih222_sym", "coqui_cvv_sym222");
+      REQUIRE(vmax < 1e-10);        // the structural 2^3 TRIM zero survives
+      REQUIRE(err_herm < 1e-10);    // the composition pin (trivially met when v = 0)
+      REQUIRE(fit < 1e-2);
+    }
+    {  // (b) lih223_sym: nonzero velocities, the real composition pin
+      auto [vmax, err_herm, pzz, fit] = run_fixture("qe_lih223_sym", "coqui_cvv_sym223");
+      REQUIRE(vmax > 1e-6);         // non-TRIM k: the velocity is genuinely nonzero
+      REQUIRE(err_herm < 1e-10);    // hermiticity of D . H . D^dag -- THE pin
+      REQUIRE(std::isfinite(pzz));
+      REQUIRE(std::abs(pzz) > 1e-10);   // the head sees the z-dispersion
+      REQUIRE(fit < 1e-2);
+    }
+#endif
+  }
+
   TEST_CASE("cvv_inloop_lih222", "[methods][scgwt][cvv]") {
 #ifndef ENABLE_DLR
     SUCCEED("cvv_inloop_lih222 skipped: build has ENABLE_DLR=OFF.");

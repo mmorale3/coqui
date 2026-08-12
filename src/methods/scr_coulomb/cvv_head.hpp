@@ -32,6 +32,7 @@
 #include "utilities/interpolation_utils.hpp"
 #include "IO/app_loggers.h"
 #include "mean_field/MF.hpp"
+#include "numerics/sparse/csr_blas.hpp"   // C3-a fix: D-rotated IBZ->full-BZ unfold
 
 namespace methods {
 namespace solvers {
@@ -73,6 +74,89 @@ namespace solvers {
           Rc(i, a) = Rpts_idx(i, 0) * lattv(0, a) + Rpts_idx(i, 1) * lattv(1, a) +
                      Rpts_idx(i, 2) * lattv(2, a);
       return Rc;
+    }
+
+    /**
+     * C3-a FIX (2026-08-12): D-rotated IBZ -> full-BZ gather of one band-matrix slice.
+     * The historic copy/conj-on-trev (identity-D) unfold makes every stored k-slice
+     * STAR-CONSTANT, and the velocity -- the k-DERIVATIVE of the R interpolant -- of
+     * star-constant data loses the interband dipole at image k (measured on the
+     * rusty eps_ladder checkpoints: iter-1 G0W0-class states read eps_inf 1.07 where
+     * the stored convention gives 10-16; cubic Si shows xx = yy != zz). The fix
+     * rotates with the TRUE band D-matrices (MF::symmetry_rotation; the
+     * projector_boson_t / build_sym_ctx consumer precedent):
+     *     A(k_img) = D . A(k_ibz) . D^dag,
+     * with the trev branch composing as the D -> 1 limits of the historic code:
+     * Sigma-class = conj(D A D^dag) [was conj(A)]; G-class = (D A D^dag)^T [was A^T].
+     * The composition is PINNED BY GATE (sym-vs-nosym iter-1 head at Si kp444 on the
+     * production side; lih223_sym xx = yy smoke locally), not by derivation. D carries
+     * the known nbnd-truncation leakage (symmetry.hpp row normalization) -- measured
+     * by the gates, not hidden.
+     */
+    /**
+     * qsymms POSITION of kp_symm(ik) per full-BZ k (the build_sym_ctx search pattern
+     * verbatim, vertex_t.cpp:917-923: kp_symm returns the raw symm-list ID, while
+     * MF::symmetry_rotation indexes the stored qsymms subgroup by POSITION with
+     * 0 = identity, not stored).
+     */
+    inline nda::array<long, 1> k_isym_positions(mf::MF &mf) {
+      auto qsymms = mf.qsymms();
+      auto kp_symm = mf.kp_symm();
+      const long nsym = qsymms.extent(0), nk = mf.nkpts();
+      nda::array<long, 1> js_of(nk);
+      for (long ik = 0; ik < nk; ++ik) {
+        const int sidx = int(kp_symm(ik));
+        long js = -1;
+        for (long i = 0; i < nsym; ++i)
+          if (qsymms(i) == sidx) { js = i; break; }
+        utils::check(js >= 0,
+                     "cvv k_isym_positions: kp_symm({}) = {} not found in qsymms.",
+                     ik, sidx);
+        js_of(ik) = js;
+      }
+      return js_of;
+    }
+
+    inline void unfold_rotate_slice(mf::MF &mf, long isym, long ksrc, bool trev,
+                                    bool g_class,
+                                    nda::MemoryArrayOfRank<2> auto const &A_src,
+                                    nda::MemoryArrayOfRank<2> auto &&row,
+                                    nda::array<ComplexType, 2> &t1,
+                                    nda::array<ComplexType, 2> &t2) {
+      const long nb = A_src.shape(0);
+      if (isym == 0) {
+        if (not trev) { row = A_src; }
+        else if (g_class) {
+          for (long i = 0; i < nb; ++i)
+            for (long j = 0; j < nb; ++j) row(i, j) = A_src(j, i);
+        } else {
+          row = nda::conj(A_src);
+        }
+        return;
+      }
+      auto [cjg, D] = mf.symmetry_rotation(isym, ksrc);
+      // kp_trev tracks the bz-level time reversal of the k MAPPING; cjg marks ops
+      // whose stored D itself composes with TR. TR over a plain rotation (trev, !cjg)
+      // is legal -- measured on qe_lih223_sym 2026-08-12 -- and conjugation applies
+      // ONCE, driven by trev. A cjg op at a non-trev k would double-count TR: forbid.
+      utils::check(not cjg or trev,
+                   "cvv unfold_rotate_slice: TR-composed symmetry (cjg) at a non-trev "
+                   "k (isym = {}, ksrc = {}).", isym, ksrc);
+      // P = D A D^dag via two csrmm's: t1 = D.A; t2 = t1^dag; t1 = D.t2; P = t1^dag.
+      math::sparse::csrmm(ComplexType(1.0), *D, A_src, ComplexType(0.0), t1);
+      for (long i = 0; i < nb; ++i)
+        for (long j = 0; j < nb; ++j) t2(i, j) = std::conj(t1(j, i));
+      math::sparse::csrmm(ComplexType(1.0), *D, t2, ComplexType(0.0), t1);
+      if (not trev) {              // row = P
+        for (long i = 0; i < nb; ++i)
+          for (long j = 0; j < nb; ++j) row(i, j) = std::conj(t1(j, i));
+      } else if (g_class) {        // row = P^T
+        for (long i = 0; i < nb; ++i)
+          for (long j = 0; j < nb; ++j) row(i, j) = std::conj(t1(i, j));
+      } else {                     // row = conj(P)
+        for (long i = 0; i < nb; ++i)
+          for (long j = 0; j < nb; ++j) row(i, j) = t1(j, i);
+      }
     }
 
     /**
@@ -291,18 +375,24 @@ namespace solvers {
 
       auto kp_to_ibz = mf.kp_to_ibz();
       auto kp_trev = mf.kp_trev();
+      auto kp_symm = mf.kp_symm();
       const bool sym = (nk != nk_ibz);
-      // per-rank full-BZ slice gather (copy / conj-on-trev -- unfold_bz.cpp
-      // convention); one gemm k -> R per slice (idiom (a): flattened trailing pair).
-      // No global unfolded object is ever materialized.
+      // per-rank full-BZ slice gather with the TRUE D(S, k) rotation (the C3-a fix,
+      // cvv_detail::unfold_rotate_slice; Sigma-class trev branch). nosym meshes take
+      // the plain-copy fast path -- bit-identical to the historic kernel. One gemm
+      // k -> R per slice (idiom (a)); no global unfolded object is materialized.
       nda::array<ComplexType, 2> buf(nk, nb * nb);
+      nda::array<ComplexType, 2> rt1(nb, nb), rt2(nb, nb);
+      nda::array<long, 1> k_js;
+      if (sym) k_js = cvv_detail::k_isym_positions(mf);
       auto gather_full = [&](auto const &A_kij_ibz) {   // (nk_ibz, nb, nb) at fixed pre-axes
         for (long ik = 0; ik < nk; ++ik) {
-          const long ksrc = sym ? long(kp_to_ibz(ik)) : ik;
-          const bool trev = sym and bool(kp_trev(ik));
           auto row = nda::reshape(buf(ik, all), std::array<long, 2>{nb, nb});
-          if (trev) row = nda::conj(A_kij_ibz(ksrc, all, all));
-          else      row = A_kij_ibz(ksrc, all, all);
+          if (not sym) { row = A_kij_ibz(ik, all, all); continue; }
+          cvv_detail::unfold_rotate_slice(mf, k_js(ik), long(kp_to_ibz(ik)),
+                                          bool(kp_trev(ik)), false,
+                                          A_kij_ibz(long(kp_to_ibz(ik)), all, all),
+                                          row, rt1, rt2);
         }
       };
 
@@ -471,20 +561,26 @@ namespace solvers {
 
       auto kp_to_ibz = mf.kp_to_ibz();
       auto kp_trev = mf.kp_trev();
+      auto kp_symm = mf.kp_symm();
       const bool sym = (nk != nk_ibz);
       nda::array<ComplexType, 2> Gk_t(nt_f, nb2), Gk_w(_nw, nb2);
       nda::array<ComplexType, 2> M(_nw, 3 * nb2);
+      nda::array<ComplexType, 2> gt1(nb, nb), gt2(nb, nb);
+      nda::array<long, 1> k_js;
+      if (sym) k_js = cvv_detail::k_isym_positions(mf);
       const long rank = ctx->comm.rank(), size = ctx->comm.size();
       for (long isk = rank; isk < _ns * nk; isk += size) {
         const long is = isk / nk, ik = isk % nk;
         const long ksrc = sym ? long(kp_to_ibz(ik)) : ik;
-        const bool trev = sym and bool(kp_trev(ik));
+        // C3-a fix: G at image k through the SAME D rotation as the velocity store
+        // (G-class trev branch = transpose composition); nosym = plain copy.
         for (long it = 0; it < nt_f; ++it) {
           auto Gt = nda::reshape(Gk_t(it, all), std::array<long, 2>{nb, nb});
           auto Gsrc = G_tskij(it, is, ksrc, all, all);
-          if (trev) { for (long i = 0; i < nb; ++i)
-                        for (long j = 0; j < nb; ++j) Gt(i, j) = Gsrc(j, i); }
-          else      Gt = Gsrc;
+          if (not sym) Gt = Gsrc;
+          else cvv_detail::unfold_rotate_slice(mf, k_js(ik), ksrc,
+                                               bool(kp_trev(ik)), true, Gsrc, Gt,
+                                               gt1, gt2);
         }
         _ft->tau_to_w(Gk_t, Gk_w, imag_axes_ft::fermion);
         auto v = velocity(is, ik);                       // (3, nw, nb, nb)
