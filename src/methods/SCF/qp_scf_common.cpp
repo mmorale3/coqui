@@ -19,6 +19,10 @@
  */
 
 
+#include <algorithm>
+#include <utility>
+#include <vector>
+
 #include "nda/linalg.hpp"
 #include "nda/linalg/det_and_inverse.hpp"
 #include "numerics/nda_functions.hpp"
@@ -33,8 +37,30 @@
 #include "methods/SCF/mb_solver_t.h"
 #include "methods/SCF/scf_common.hpp"
 #include "methods/SCF/qp_solvers.hpp"
+#include "methods/SCF/qp_maps_matsubara.hpp"
 
 namespace methods {
+
+namespace {
+  // The Matsubara-native maps (qp_map != "ac_pade") consume Sigma(iw) on the
+  // POSITIVE fermionic nodes in ascending order; the sampling mesh interleaves
+  // signs, so select and sort once. Returns (w_n values, row indices into the
+  // wn_mesh-ordered frequency axis).
+  auto positive_wn_nodes(nda::array<ComplexType, 1> const &iw_mesh) {
+    std::vector<std::pair<double, long>> pw;
+    for (long n = 0; n < iw_mesh.shape(0); ++n)
+      if (iw_mesh(n).imag() > 0.0) pw.emplace_back(iw_mesh(n).imag(), n);
+    std::sort(pw.begin(), pw.end());
+    utils::check(pw.size() >= 2, "qp_map matsubara: found {} positive fermionic nodes, need >= 2.", pw.size());
+    nda::array<double, 1> wp(pw.size());
+    std::vector<long> idx(pw.size());
+    for (size_t m = 0; m < pw.size(); ++m) {
+      wp(m) = pw[m].first;
+      idx[m] = pw[m].second;
+    }
+    return std::make_pair(std::move(wp), std::move(idx));
+  }
+}
 
 auto get_mf_MOs(utils::mpi_context_t<mpi3::communicator> &context, mf::MF &mf, hamilt::pseudopot &psp)
   -> std::tuple<sArray_t<Array_view_4D_t>, sArray_t<Array_view_3D_t> > {
@@ -272,10 +298,63 @@ void solve_qp_eqn(sArray_t<Array_view_3D_t> &sE_ska,
       return std::make_tuple(s_rng.first()+s_loc, k_rng.first()+k_loc, a_rng.first()+a_loc);
     };
 
-    analyt_cont::AC_t AC(qp_params.ac_alg);
     auto n_to_iw = nda::map([&](int n) { return FT.omega(n); });
     nda::array<ComplexType, 1> iw_mesh(n_to_iw(FT.wn_mesh()));
 
+    if (qp_params.qp_map != "ac_pade") {
+
+    // Project 2 increment Q2 (notes/qpgw_edmft_implementation_plan.md): the
+    // Matsubara-native quasiparticle maps (qp_maps_matsubara.hpp), scalar form
+    // -- the qp_type solvers belong to the AC route only.
+    auto [wp, widx] = positive_wn_nodes(iw_mesh);
+    const long npos = wp.shape(0);
+    nda::array<double, 1> wn2(2);
+    wn2(0) = wp(0);
+    wn2(1) = wp(1);
+    long n_clamped = 0, n_noconv = 0;
+    app_log(2, "\n* Solving quasiparticle equation for given Sigma(iw): ");
+    app_log(2, "  - processor grid for quasi-particle equation: (s, k, a) = ({}, {}, {})", 1, nkpools, np_a);
+    app_log(2, "  - quasiparticle map:                          {} (Matsubara-native, no AC)", qp_params.qp_map);
+    app_log(2, "  - positive fermionic nodes:                   {} (w0 = {:.6f}, w1 = {:.6f})", npos, wp(0), wp(1));
+    if (qp_params.qp_map == "mats_lin") {
+      nda::array<ComplexType, 1> S2(2);
+      for (size_t I = 0; I < dim1; ++I) {
+        S2(0) = Sigma_loc_2D(widx[0], I);
+        S2(1) = Sigma_loc_2D(widx[1], I);
+        E_loc_1D(I) = qp_matsubara::qp_lin_diagonal(S2, wn2, Vhf_loc_1D(I).real(), n_clamped);
+      }
+    } else { // "mats_gmatch"
+      qp_matsubara::gmatch_opts opt;
+      app_log(2, "  - gmatch weights (reportable):                w_n = (w0/w_n)^{}", opt.wpow);
+      nda::array<ComplexType, 1> S2(2);
+      nda::array<ComplexType, 3> G(npos, 1, 1);
+      nda::array<ComplexType, 2> H(1, 1);
+      double rmax = 0.0;
+      for (size_t I = 0; I < dim1; ++I) {
+        const double vhf = Vhf_loc_1D(I).real();
+        for (long m = 0; m < npos; ++m)
+          G(m, 0, 0) = 1.0 / (ComplexType(mu - vhf, wp(m)) - Sigma_loc_2D(widx[m], I));
+        S2(0) = Sigma_loc_2D(widx[0], I);
+        S2(1) = Sigma_loc_2D(widx[1], I);
+        H(0, 0) = ComplexType(qp_matsubara::qp_lin_diagonal(S2, wn2, vhf, n_clamped, opt.z_floor));
+        auto info = qp_matsubara::qp_gmatch_block(G, wp, mu, H, opt);
+        if (not info.converged) ++n_noconv;
+        rmax = std::max(rmax, info.r);
+        E_loc_1D(I) = H(0, 0);
+      }
+      rmax = comm->all_reduce_value(rmax, boost::mpi3::max<>{});
+      app_log(2, "  - gmatch final weighted residual (max over states): {:.3e}", rmax);
+    }
+    n_clamped = comm->all_reduce_value(n_clamped, std::plus<>{});
+    n_noconv = comm->all_reduce_value(n_noconv, std::plus<>{});
+    if (n_clamped > 0)
+      app_log(2, "  - Z-window clamps: {} of {} states", n_clamped, ns * nkpts * nbnd);
+    if (n_noconv > 0)
+      app_warning("solve_qp_eqn: gmatch hit maxiter on {} states.", n_noconv);
+
+    } else {
+
+    analyt_cont::AC_t AC(qp_params.ac_alg);
     app_log(2, "\n* Solving quasiparticle equation for given Sigma(iw): ");
     app_log(2, "  - processor grid for quasi-particle equation: (s, k, a) = ({}, {}, {})", 1, nkpools, np_a);
     app_log(2, "  - quasi-particle equation algorithm:          {}", qp_params.qp_type);
@@ -316,6 +395,8 @@ void solve_qp_eqn(sArray_t<Array_view_3D_t> &sE_ska,
     } else {
       utils::check(false, "solve_qp_eqn: unknown type of qp equation: {}", qp_params.qp_type);
     }
+
+    } // qp_map dispatch
   }
   dSigma_wska.reset();
   dVhf_ska.reset();
@@ -412,7 +493,8 @@ void add_evscf_vcorr(MBState &mb_state,
 auto qp_approx(const sArray_t<Array_view_5D_t> &sSigma_tskij,
                const sArray_t<Array_view_4D_t> &sMO_skia,
                const sArray_t<Array_view_3D_t> &sE_ska, double mu,
-               const imag_axes_ft::IAFT &FT, qp_params_t &qp_params)
+               const imag_axes_ft::IAFT &FT, qp_params_t &qp_params,
+               const sArray_t<Array_view_4D_t> *sHstat_skij)
                -> sArray_t<Array_view_4D_t> {
   using math::shm::make_shared_array;
   using math::nda::make_distributed_array;
@@ -486,10 +568,96 @@ auto qp_approx(const sArray_t<Array_view_5D_t> &sSigma_tskij,
     return std::make_tuple(s_rng.first()+s_loc, k_rng.first()+k_loc, a_rng.first()+a_loc, b_rng.first()+b_loc);
   };
 
-  analyt_cont::AC_t AC(qp_params.ac_alg);
   auto n_to_iw = nda::map([&](int n) { return FT.omega(n); });
   nda::array<ComplexType, 1> iw_mesh(n_to_iw(FT.wn_mesh()));
 
+  auto sVcorr_skij = make_shared_array<Array_view_4D_t>(*comm, *internode_comm, *node_comm, {ns, nkpts, nbnd, nbnd});
+
+  if (qp_params.qp_map != "ac_pade") {
+
+  // Project 2 increment Q2 (notes/qpgw_edmft_implementation_plan.md): the
+  // Matsubara-native maps (qp_maps_matsubara.hpp) act on whole (a,b) blocks per
+  // (s,k), so gather the MO-basis Sigma(iw) tiles into a shared array (disjoint
+  // writes + zeros-elsewhere all_reduce) and round-robin the blocks over ranks.
+  utils::check(qp_params.qp_map == "mats_lin" or sHstat_skij != nullptr,
+               "qp_approx: qp_map = mats_gmatch needs the static Heff, which only the "
+               "qp-scf loop call path provides; use ac_pade or mats_lin here.");
+  auto sSigma_wskab = make_shared_array<Array_view_5D_t>(*comm, *internode_comm, *node_comm,
+                                                         {nw, ns, nkpts, nbnd, nbnd});
+  sSigma_wskab.set_zero();
+  sSigma_wskab.win().fence();
+  sSigma_wskab.local()(nda::range::all, s_rng, k_rng, a_rng, b_rng) = dSigma_wskab.local();
+  sSigma_wskab.win().fence();
+  sSigma_wskab.all_reduce();
+  dSigma_wskab.reset();
+
+  auto [wp, widx] = positive_wn_nodes(iw_mesh);
+  const long npos = wp.shape(0);
+  nda::array<double, 1> wn2(2);
+  wn2(0) = wp(0);
+  wn2(1) = wp(1);
+  long n_clamped = 0, n_noconv = 0;
+  decltype(nda::range::all) all;
+  app_log(2, "\n* Applying the Matsubara-native static map to Sigma(iw): ");
+  app_log(2, "  - quasiparticle map:        {} (no AC)", qp_params.qp_map);
+  app_log(2, "  - positive fermionic nodes: {} (w0 = {:.6f}, w1 = {:.6f})", npos, wp(0), wp(1));
+  sVcorr_skij.set_zero();
+  sVcorr_skij.win().fence();
+  if (qp_params.qp_map == "mats_lin") {
+    nda::array<ComplexType, 3> S2(2, nbnd, nbnd);
+    for (long sk = comm->rank(); sk < long(ns * nkpts); sk += comm->size()) {
+      long is = sk / nkpts, ik = sk % nkpts;
+      S2(0, all, all) = sSigma_wskab.local()(widx[0], is, ik, all, all);
+      S2(1, all, all) = sSigma_wskab.local()(widx[1], is, ik, all, all);
+      sVcorr_skij.local()(is, ik, all, all) = qp_matsubara::qp_lin_matrix(S2, wn2, n_clamped);
+    }
+  } else { // "mats_gmatch"
+    qp_matsubara::gmatch_opts opt;
+    app_log(2, "  - gmatch weights (reportable): w_n = (w0/w_n)^{}", opt.wpow);
+    nda::array<ComplexType, 3> S2(2, nbnd, nbnd), G(npos, nbnd, nbnd);
+    nda::array<ComplexType, 2> Hstat_ab(nbnd, nbnd), H(nbnd, nbnd), tmp(nbnd, nbnd);
+    nda::matrix<ComplexType> K(nbnd, nbnd);
+    double rmax = 0.0;
+    for (long sk = comm->rank(); sk < long(ns * nkpts); sk += comm->size()) {
+      long is = sk / nkpts, ik = sk % nkpts;
+      auto MO = sMO_skia.local()(is, ik, all, all); // (i, a)
+      // the static part in the MO basis
+      nda::blas::gemm(ComplexType(1.0), sHstat_skij->local()(is, ik, nda::ellipsis{}), MO,
+                      ComplexType(0.0), tmp);
+      nda::blas::gemm(ComplexType(1.0), nda::dagger(MO), tmp, ComplexType(0.0), Hstat_ab);
+      // the target G^GW on the positive nodes (spec principle 2: Sigma^GW only)
+      for (long m = 0; m < npos; ++m) {
+        auto Sw = sSigma_wskab.local()(widx[m], is, ik, all, all);
+        for (long i = 0; i < nbnd; ++i)
+          for (long j = 0; j < nbnd; ++j) K(i, j) = -Hstat_ab(i, j) - Sw(i, j);
+        for (long i = 0; i < nbnd; ++i) K(i, i) += ComplexType(mu, wp(m));
+        nda::inverse_in_place(K);
+        G(m, all, all) = K;
+      }
+      // map-(i) initializer
+      S2(0, all, all) = sSigma_wskab.local()(widx[0], is, ik, all, all);
+      S2(1, all, all) = sSigma_wskab.local()(widx[1], is, ik, all, all);
+      H = Hstat_ab + qp_matsubara::qp_lin_matrix(S2, wn2, n_clamped, opt.z_floor);
+      auto info = qp_matsubara::qp_gmatch_block(G, wp, mu, H, opt);
+      if (not info.converged) ++n_noconv;
+      rmax = std::max(rmax, info.r);
+      sVcorr_skij.local()(is, ik, all, all) = H - Hstat_ab;
+    }
+    rmax = comm->all_reduce_value(rmax, boost::mpi3::max<>{});
+    app_log(2, "  - gmatch final weighted residual (max over blocks): {:.3e}", rmax);
+  }
+  n_clamped = comm->all_reduce_value(n_clamped, std::plus<>{});
+  n_noconv = comm->all_reduce_value(n_noconv, std::plus<>{});
+  if (n_clamped > 0)
+    app_log(2, "  - Z-window clamps: {} eigenvalues", n_clamped);
+  if (n_noconv > 0)
+    app_warning("qp_approx: gmatch hit maxiter on {} (s,k) blocks.", n_noconv);
+  sVcorr_skij.win().fence();
+  sVcorr_skij.all_reduce();
+
+  } else {
+
+  analyt_cont::AC_t AC(qp_params.ac_alg);
   app_log(2, "\n* Applying the static approximation (Phys. Rev. Lett. 93, 126406) to Sigma(w): ");
   app_log(2, "  - processor grid for V_QPGW : (s, k, a, b) = ({}, {}, {})", 1, nkpools, np_a, np_b);
   app_log(2, "  - ac algorithm:               {}", qp_params.ac_alg);
@@ -498,7 +666,6 @@ auto qp_approx(const sArray_t<Array_view_5D_t> &sSigma_tskij,
   auto Sigma_loc_2D = nda::reshape(dSigma_wskab.local(), std::array<long, 2>{nw, dim1});
   AC.init(iw_mesh, Sigma_loc_2D, qp_params.Nfit);
 
-  auto sVcorr_skij = make_shared_array<Array_view_4D_t>(*comm, *internode_comm, *node_comm, {ns, nkpts, nbnd, nbnd});
   sVcorr_skij.win().fence();
   for (size_t I = 0; I < dim1; ++I) {
     auto [s, k, a, b] = I_to_skab(I);
@@ -516,6 +683,8 @@ auto qp_approx(const sArray_t<Array_view_5D_t> &sSigma_tskij,
   }
   sVcorr_skij.win().fence();
   sVcorr_skij.all_reduce();
+
+  } // qp_map dispatch
 
   // prepare for inverse transformation from MO to primary basis
   auto sMOinv_skai = make_shared_array<Array_view_4D_t>(*comm, *internode_comm, *node_comm, {ns, nkpts, nbnd, nbnd});
@@ -580,8 +749,10 @@ void add_qpscf_vcorr(MBState &mb_state,
   mb_solver.corr->evaluate(mb_state, eri);
   FT.check_leakage(mb_state.sSigma_tskij.value(), imag_axes_ft::fermion, "Self-energy");
 
-  // Add the correlation contribution to the QP Hamiltonian.
-  auto sVcorr_skij = qp_approx(mb_state.sSigma_tskij.value(),  sMO_skia, sE_ska, mu, FT, qp_params);
+  // Add the correlation contribution to the QP Hamiltonian. At this point
+  // sHeff_skij holds the static (H0 + HF) part only -- the map-(ii) reference.
+  auto sVcorr_skij = qp_approx(mb_state.sSigma_tskij.value(),  sMO_skia, sE_ska, mu, FT, qp_params,
+                               std::addressof(sHeff_skij));
   if (mpi->node_comm.root()) sHeff_skij.local() += sVcorr_skij.local();
   mpi->comm.barrier();
  

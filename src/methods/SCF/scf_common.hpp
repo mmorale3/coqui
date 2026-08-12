@@ -287,7 +287,8 @@ void solve_qp_eqn(sArray_t<Array_view_3D_t> &sE_ska,
 auto qp_approx(const sArray_t<Array_view_5D_t> &sSigma_tskij,
                const sArray_t<Array_view_4D_t> &sMO_skia,
                const sArray_t<Array_view_3D_t> &sE_ska, double mu,
-               const imag_axes_ft::IAFT &FT, qp_params_t &qp_params)
+               const imag_axes_ft::IAFT &FT, qp_params_t &qp_params,
+               const sArray_t<Array_view_4D_t> *sHstat_skij = nullptr)
   -> sArray_t<Array_view_4D_t>;
 
 /**
