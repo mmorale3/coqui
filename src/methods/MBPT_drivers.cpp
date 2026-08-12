@@ -617,8 +617,14 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     auto Nfit    = io::get_value_with_default<int>(pt,"Nfit",18);
     io::tolower(ac_alg);
     io::tolower(qp_type);
+    auto qp_map = io::get_value_with_default<std::string>(pt,"qp_map","ac_pade");
+    io::tolower(qp_map);
+    utils::check(qp_map=="ac_pade" or qp_map=="mats_lin" or qp_map=="mats_gmatch",
+                 "evgw: unknown qp_map: {}. Valid options: \"ac_pade\", \"mats_lin\", "
+                 "\"mats_gmatch\" (Project 2 increment Q0).", qp_map);
     qp_params_t qp_params(qp_type, ac_alg, Nfit, eta, conv_thr, "evscf", keep_scr_coulomb_fixed,
                           "fermi", mu_tol, mu_update_alg);
+    qp_params.qp_map = qp_map;
     if (io::get_value_with_default<bool>(pt,"iter_alg.enable", true)) {
       iter_solver = std::make_unique<iter_scf::iter_scf_t>(iter_scf::make_iter_scf(pt, 0.7, true));
     } else {
@@ -640,8 +646,14 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     io::tolower(off_diag_mode);
     utils::check(off_diag_mode=="fermi" or off_diag_mode=="qp_energy",
                  "unknown off_diag_mode: {}. Valid options are \"fermi\" and \"qp_energy\"");
+    auto qp_map = io::get_value_with_default<std::string>(pt,"qp_map","ac_pade");
+    io::tolower(qp_map);
+    utils::check(qp_map=="ac_pade" or qp_map=="mats_lin" or qp_map=="mats_gmatch",
+                 "qpgw: unknown qp_map: {}. Valid options: \"ac_pade\", \"mats_lin\", "
+                 "\"mats_gmatch\" (Project 2 increment Q0).", qp_map);
     qp_params_t qp_params("sc", ac_alg, Nfit, eta, 1e-8, "qpscf", false, off_diag_mode,
                           mu_tol, mu_update_alg);
+    qp_params.qp_map = qp_map;
     if (io::get_value_with_default<bool>(pt,"iter_alg.enable", true)) {
       iter_solver = std::make_unique<iter_scf::iter_scf_t>(iter_scf::make_iter_scf(pt));
     } else {

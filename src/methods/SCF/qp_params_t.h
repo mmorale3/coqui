@@ -47,6 +47,18 @@ struct qp_params_t {
 
   double mu_tolerance = 1e-9;
   std::string mu_update_alg = "bisection";
+
+  // Project 2 increment Q0 (notes/qpgw_edmft_implementation_plan.md): the
+  // quasiparticle-map selector.
+  // - "ac_pade":     today's route -- Pade AC of Sigma(iw) evaluated near the
+  //                  real axis (solve_qp_eqn / qp_approx unchanged). DEFAULT.
+  // - "mats_lin":    Matsubara-native omega~0 linearization (spec eq 13;
+  //                  qp_maps_matsubara.hpp map (i)) -- no analytic continuation.
+  // - "mats_gmatch": Matsubara-native variational Green's-function matching
+  //                  (spec eq 14; map (ii)) -- no analytic continuation.
+  // Wired into the solvers at increment Q2; parsed and validated from Q0 so the
+  // default path is pinned bitwise before any dispatch lands.
+  std::string qp_map = "ac_pade";
 };
 
 } // methods
