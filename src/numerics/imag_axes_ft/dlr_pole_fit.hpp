@@ -95,6 +95,7 @@
 #include <cmath>
 #include <complex>
 #include <algorithm>
+#include <vector>
 
 #include "configuration.hpp"
 #include "utilities/check.hpp"
@@ -395,6 +396,207 @@ namespace imag_axes_ft {
                      "amplification {:.4g}, min|hw_l| = {:.4g}, min node gap = {:.4g}",
               who, nt, np, rel_tol, n_kept, ns_max, amplification,
               min_abs_node, min_node_gap);
+    }
+  };
+
+  /**
+   * SUPPORT-CONSTRAINED (masked-columns) auxiliary pole fit -- Project 2 increment QM3,
+   * promoted verbatim from the QM2-b measurement (test_qp_maps_matsubara.cpp, gate
+   * "route_b_fitted_W_chain") so that production and its unit gate share ONE code path.
+   *
+   * WHY IT EXISTS (measured, QM2-b; notes/qm2_route_b_finite_t_spec.md)
+   * ------------------------------------------------------------------
+   * `dlr_pole_fit` is exact-to-eps ON THE IMAGINARY AXIS, which is all the residue algebras
+   * of project 1 ever ask of it. Route B (sigma_route_b.hpp) instead evaluates the fitted
+   * measure at REAL arguments eps_l - z. Auxiliary nodes that carry spurious weight where
+   * W^c has no spectral support are then divided by a vanishing gap: on the QM2-b fixture
+   * the plain fit misses Sigma^c(real z) by 1.5e+04 eV while its tau fit_error is 1e-5.
+   *
+   * The cure is PRIOR PHYSICAL INFORMATION, not regularization: a bosonic W^c has no
+   * spectral weight inside the particle-hole gap, so the kernel columns of auxiliary nodes
+   * with |eps_p| < gap_edge are REMOVED from the least squares. Measured on the same
+   * fixture: 20.8 / 2.6 / 0.14 meV at DLR prec low / medium / high, i.e. six orders better
+   * than the plain fit, with the residual set by how well the retained nodes cover the
+   * support (NOT by the DLR accuracy -- more precision alone does not fix the plain fit).
+   *
+   * DOCTRINE, inherited unchanged from dlr_pole_fit
+   * ----------------------------------------------
+   *  - the map is a FIXED linear map: the retained column set comes from gap_edge and the
+   *    rank from the singular spectrum at build(), never from the data. That is what makes
+   *    "fit in the auxiliary basis, then contract" identical to "contract, then fit"
+   *    (QM3 spec section 3), and it is required for gauge covariance / MPI invariance /
+   *    elementwise batch semantics exactly as in the parent struct.
+   *  - the same `dlr_pole_fit_rel_tol` truncated-SVD cut, and `fit_error` is the same honest
+   *    max-norm reconstruction error on the grid the data came from.
+   *
+   * TWO KERNELS (QM3 knob qp_modea_wfit)
+   *  - from_tau: the tested convention. Columns are dlr_kF(beta, tau_i, eps_p) on the
+   *    backend FERMIONIC tau grid; the frequency-domain BOSONIC residues are
+   *    w_p = tanh(hw_p/2) * c_p (`residue_scale`), the iaft_dconv convention.
+   *  - from_matsubara: columns are 1/(i nu_m - eps_p) on the supplied node list; the
+   *    coefficients ARE the residues (residue_scale == 1).
+   */
+  struct masked_pole_fit {
+    long nrow = 0;        // sample rows (tau nodes or Matsubara nodes)
+    long np_all = 0;      // full auxiliary pole grid
+    long nkeep = 0;       // retained columns (the support)
+    long n_kept = 0;      // singular directions retained
+    double rel_tol = 0.0;
+    double s_max = 0.0, s_min_kept = 0.0, amplification = 0.0;
+    double gap_edge = 0.0;
+    bool nu_route = false;
+
+    nda::array<long, 1> keep;            // (nkeep) indices into the full auxiliary grid
+    nda::array<double, 1> om;            // (nkeep) retained pole energies, physical units
+    nda::array<double, 1> hw;            // (nkeep) dimensionless nodes beta * om
+    nda::array<double, 1> residue_scale; // (nkeep) tanh(hw/2) [tau] or 1 [nu]
+    nda::array<ComplexType, 2> Kc;       // (nrow, nkeep) reconstruction kernel
+    nda::array<ComplexType, 2> Uc;       // (n_kept, nrow)  conj(U)^T
+    nda::array<ComplexType, 2> Vc;       // (nkeep, n_kept) V (NOT pre-scaled by 1/s)
+    nda::array<double, 1> sval;          // (n_kept) singular values, descending
+
+    masked_pole_fit() = default;
+
+    /** columns retained by the support constraint; gap_edge <= 0 keeps every column. */
+    static std::vector<long> support_columns(nda::array<double, 1> const& epsl, double gap_edge) {
+      std::vector<long> keep;
+      for (long p = 0; p < epsl.shape(0); ++p)
+        if (gap_edge <= 0.0 or std::abs(epsl(p)) >= gap_edge) keep.push_back(p);
+      return keep;
+    }
+
+    /**
+     * Generic build from an explicit kernel. `K` is (nrow, np_all) in the FULL auxiliary
+     * basis; only the columns in `keep_idx` enter the least squares.
+     *
+     * The real-kernel path runs a REAL gesvd, and the apply below accumulates in exactly the
+     * order the QM2-b measurement used, so the promoted utility reproduces that gate's
+     * numbers bit for bit rather than merely to its printed precision.
+     */
+    template<typename S>
+    void build(nda::MemoryArrayOfRank<2> auto const& K,
+               std::vector<long> const& keep_idx,
+               nda::array<double, 1> const& epsl_all,
+               nda::array<double, 1> const& hw_all,
+               bool tanh_residues, double beta_unused = 0.0, double rtol = -1.0) {
+      (void)beta_unused;
+      nrow = K.shape(0);
+      np_all = K.shape(1);
+      nkeep = long(keep_idx.size());
+      nu_route = not tanh_residues;
+      if (rtol < 0.0) rtol = dlr_pole_fit_rel_tol;
+      rel_tol = rtol;
+      utils::check(nkeep > 0, "imag_axes_ft::masked_pole_fit: the support constraint retained "
+                              "0 of {} auxiliary nodes.", np_all);
+      utils::check(nrow >= 1, "imag_axes_ft::masked_pole_fit: empty sample grid.");
+
+      keep = nda::array<long, 1>(nkeep);
+      om = nda::array<double, 1>(nkeep);
+      hw = nda::array<double, 1>(nkeep);
+      residue_scale = nda::array<double, 1>(nkeep);
+      for (long q = 0; q < nkeep; ++q) {
+        keep(q) = keep_idx[q];
+        om(q) = epsl_all(keep_idx[q]);
+        hw(q) = hw_all(keep_idx[q]);
+        residue_scale(q) = tanh_residues ? std::tanh(0.5 * hw(q)) : 1.0;
+      }
+
+      Kc = nda::array<ComplexType, 2>(nrow, nkeep);
+      for (long i = 0; i < nrow; ++i)
+        for (long q = 0; q < nkeep; ++q) Kc(i, q) = ComplexType(K(i, keep(q)));
+
+      const long ms = std::min(nrow, nkeep);
+      nda::vector<double> sig(ms);
+      nda::matrix<S, nda::F_layout> A(nrow, nkeep), U(nrow, nrow), VT(nkeep, nkeep);
+      for (long i = 0; i < nrow; ++i)
+        for (long q = 0; q < nkeep; ++q) A(i, q) = S(K(i, keep(q)));
+      const int info = nda::lapack::gesvd(A, sig, U, VT);
+      utils::check(info == 0, "imag_axes_ft::masked_pole_fit: gesvd failed on the reduced "
+                              "kernel (info = {}).", info);
+      s_max = sig(0);
+      n_kept = 0;
+      while (n_kept < ms and sig(n_kept) > rel_tol * s_max) ++n_kept;
+      utils::check(n_kept > 0, "imag_axes_ft::masked_pole_fit: truncation kept no singular "
+                               "values (rel_tol = {}).", rel_tol);
+      s_min_kept = sig(n_kept - 1);
+      amplification = 1.0 / s_min_kept;
+
+      sval = nda::array<double, 1>(n_kept);
+      Uc = nda::array<ComplexType, 2>(n_kept, nrow);
+      Vc = nda::array<ComplexType, 2>(nkeep, n_kept);
+      for (long k = 0; k < n_kept; ++k) {
+        sval(k) = sig(k);
+        for (long i = 0; i < nrow; ++i) Uc(k, i) = std::conj(ComplexType(U(i, k)));
+        for (long q = 0; q < nkeep; ++q) Vc(q, k) = std::conj(ComplexType(VT(k, q)));
+      }
+    }
+
+    /** the QM2-b tau chain: backend fermionic tau nodes, bosonic residues via tanh(hw/2). */
+    static masked_pole_fit from_tau(dlr_pole_fit const& pf, double gap_edge, double rtol = -1.0) {
+      masked_pole_fit f;
+      f.gap_edge = gap_edge;
+      f.build<double>(pf.Kmat, support_columns(pf.epsl, gap_edge), pf.epsl, pf.rf, true,
+                      pf.beta, rtol);
+      return f;
+    }
+
+    /** the nu route: LS directly on Matsubara-node data, kernel 1/(i nu_m - eps_p). */
+    static masked_pole_fit from_matsubara(dlr_pole_fit const& pf,
+                                          nda::array<ComplexType, 1> const& z,
+                                          double gap_edge, double rtol = -1.0) {
+      masked_pole_fit f;
+      f.gap_edge = gap_edge;
+      nda::array<ComplexType, 2> K(z.shape(0), pf.np);
+      for (long m = 0; m < z.shape(0); ++m)
+        for (long p = 0; p < pf.np; ++p) K(m, p) = 1.0 / (z(m) - pf.epsl(p));
+      f.build<ComplexType>(K, support_columns(pf.epsl, gap_edge), pf.epsl, pf.rf, false,
+                           pf.beta, rtol);
+      return f;
+    }
+
+    /**
+     * Residues of grid data (leading axis nrow, trailing axis a flat batch) -> (nkeep, d).
+     * FIXED rank and FIXED column set; the accumulation order is the QM2-b one.
+     */
+    nda::array<ComplexType, 2> coeffs(nda::MemoryArrayOfRank<2> auto const& F) const {
+      utils::check(F.shape(0) == nrow,
+                   "imag_axes_ft::masked_pole_fit::coeffs: leading axis {} != nrow = {}.",
+                   F.shape(0), nrow);
+      const long d = F.shape(1);
+      nda::array<ComplexType, 2> c(nkeep, d);
+      c() = ComplexType(0.0);
+      for (long j = 0; j < d; ++j)
+        for (long k = 0; k < n_kept; ++k) {
+          ComplexType g(0.0);
+          for (long i = 0; i < nrow; ++i) g += Uc(k, i) * F(i, j);
+          g /= sval(k);
+          for (long q = 0; q < nkeep; ++q) c(q, j) += Vc(q, k) * g;
+        }
+      return c;
+    }
+
+    /** relative max-norm reconstruction error on the SAME grid the data came from. */
+    double fit_error(nda::MemoryArrayOfRank<2> auto const& F,
+                     nda::array<ComplexType, 2> const& c) const {
+      const long d = F.shape(1);
+      double num = 0.0, den = 0.0;
+      for (long i = 0; i < nrow; ++i)
+        for (long j = 0; j < d; ++j) {
+          ComplexType rec(0.0);
+          for (long q = 0; q < nkeep; ++q) rec += Kc(i, q) * c(q, j);
+          num = std::max(num, std::abs(F(i, j) - rec));
+          den = std::max(den, std::abs(F(i, j)));
+        }
+      return (den > 0.0) ? num / den : 0.0;
+    }
+
+    /** max|c| / max|F| -- see dlr_pole_fit::residue_ratio for why this is watched. */
+    double residue_ratio(nda::MemoryArrayOfRank<2> auto const& F,
+                         nda::array<ComplexType, 2> const& c) const {
+      double cm = 0.0, fm = 0.0;
+      for (auto const& v : c) cm = std::max(cm, std::abs(v));
+      for (auto const& v : F) fm = std::max(fm, std::abs(v));
+      return (fm > 0.0) ? cm / fm : 0.0;
     }
   };
 

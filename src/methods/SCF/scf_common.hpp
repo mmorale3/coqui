@@ -40,6 +40,10 @@
 namespace methods {
   // TODO Put everything in "scf" namespace to isolate using directives
 
+// Project 2 increment QM3: the mode-A evaluator context is an opaque pointer here -- its
+// definition (methods/SCF/qp_modea.hpp) is only needed by the .cpp that builds and consumes it.
+namespace qp_modea { struct modea_ctx; }
+
 namespace detail {
 
 template<typename eval_t>
@@ -267,7 +271,8 @@ void solve_qp_eqn(sArray_t<Array_view_3D_t> &sE_ska,
                   const sArray_t<Array_view_4D_t> &sVhf_skij,
                   const sArray_t<Array_view_4D_t> &sMO_skia,
                   double mu,
-                  const imag_axes_ft::IAFT &FT, qp_params_t &qp_params);
+                  const imag_axes_ft::IAFT &FT, qp_params_t &qp_params,
+                  const qp_modea::modea_ctx *modea_ctx = nullptr);
 
 /**
  * Given a dynamic self-energy in the primary basis, return the static approximation (Phys. Rev. Lett. 96, 226402 (2006)) of it
@@ -288,7 +293,8 @@ auto qp_approx(const sArray_t<Array_view_5D_t> &sSigma_tskij,
                const sArray_t<Array_view_4D_t> &sMO_skia,
                const sArray_t<Array_view_3D_t> &sE_ska, double mu,
                const imag_axes_ft::IAFT &FT, qp_params_t &qp_params,
-               const sArray_t<Array_view_4D_t> *sHstat_skij = nullptr)
+               const sArray_t<Array_view_4D_t> *sHstat_skij = nullptr,
+               const qp_modea::modea_ctx *modea_ctx = nullptr)
   -> sArray_t<Array_view_4D_t>;
 
 /**

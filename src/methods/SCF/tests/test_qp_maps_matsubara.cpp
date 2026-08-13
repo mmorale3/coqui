@@ -1186,45 +1186,26 @@ namespace bdft_tests {
       }
 
       // ---- the SUPPORT-CONSTRAINED least squares on the reduced kernel columns --------------
-      std::vector<long> keep;
-      for (long p = 0; p < np; ++p) if (std::abs(pf.epsl(p)) >= F.gap_edge) keep.push_back(p);
-      const long npr = long(keep.size());
+      // QM3: this block WAS a local least squares here. It has been PROMOTED into shared code
+      // (imag_axes_ft::masked_pole_fit) so that the production mode-A fit and this gate run
+      // ONE code path -- no duplicated fit code test-vs-prod (QM3 spec, "PROMOTE"). The gate
+      // below is therefore also the promoted utility's unit test: the numbers it prints must
+      // be bit-identical to the pre-promotion measurement, which is why masked_pole_fit keeps
+      // the real-kernel gesvd and the exact accumulation order used here before.
+      auto mpf = imag_axes_ft::masked_pole_fit::from_tau(pf, F.gap_edge);
+      const long npr = mpf.nkeep;
       R.n_support = npr;
+      R.s_kept = mpf.n_kept;
       nda::array<double, 1> om_sup(npr);
       nda::array<ComplexType, 1> w_sup(npr);
       {
-        nda::matrix<double, nda::F_layout> A(nt, npr);
-        for (long i = 0; i < nt; ++i)
-          for (long q = 0; q < npr; ++q) A(i, q) = pf.Kmat(i, keep[q]);
-        nda::matrix<double, nda::F_layout> Kred(A);
-        const long ms = std::min(nt, npr);
-        nda::vector<double> sig(ms);
-        nda::matrix<double, nda::F_layout> U(nt, nt), VT(npr, npr);
-        const int info = nda::lapack::gesvd(A, sig, U, VT);
-        utils::check(info == 0, "QM2-b: gesvd failed on the reduced kernel (info = {}).", info);
-        while (R.s_kept < ms and sig(R.s_kept) > imag_axes_ft::dlr_pole_fit_rel_tol * sig(0))
-          ++R.s_kept;
-        nda::array<ComplexType, 1> c(npr);
-        c() = ComplexType(0.0);
-        for (long k = 0; k < R.s_kept; ++k) {
-          ComplexType g(0.0);
-          for (long i = 0; i < nt; ++i) g += U(i, k) * W_t(i, 0);
-          g /= sig(k);
-          for (long q = 0; q < npr; ++q) c(q) += VT(k, q) * g;
+        auto c = mpf.coeffs(W_t);
+        R.fit_err_sup = mpf.fit_error(W_t, c);
+        for (long q = 0; q < npr; ++q) {
+          om_sup(q) = mpf.om(q);
+          w_sup(q) = mpf.residue_scale(q) * c(q, 0);
         }
         double num = 0.0, den = 0.0;
-        for (long i = 0; i < nt; ++i) {
-          ComplexType rec(0.0);
-          for (long q = 0; q < npr; ++q) rec += Kred(i, q) * c(q);
-          num = std::max(num, std::abs(rec - W_t(i, 0)));
-          den = std::max(den, std::abs(W_t(i, 0)));
-        }
-        R.fit_err_sup = num / den;
-        for (long q = 0; q < npr; ++q) {
-          om_sup(q) = pf.epsl(keep[q]);
-          w_sup(q) = std::tanh(0.5 * pf.rf(keep[q])) * c(q);
-        }
-        num = den = 0.0;
         for (long m = 0; m < nwb; ++m) {
           const ComplexType z = ft.omega(wnb(m));
           ComplexType rec(0.0);
@@ -1233,6 +1214,8 @@ namespace bdft_tests {
           den = std::max(den, std::abs(W_w(m, 0)));
         }
         R.rec_rel_sup = num / den;
+        // the promoted utility must agree with the auxiliary grid it was built from
+        for (long q = 0; q < npr; ++q) REQUIRE(std::abs(om_sup(q)) >= F.gap_edge);
       }
 
       // ---- the near-omega = 0 residue profile (the spurious-weight diagnostic) --------------

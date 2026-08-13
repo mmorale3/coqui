@@ -619,14 +619,38 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     io::tolower(qp_type);
     auto qp_map = io::get_value_with_default<std::string>(pt,"qp_map","ac_pade");
     io::tolower(qp_map);
-    utils::check(qp_map=="ac_pade" or qp_map=="mats_lin" or qp_map=="mats_gmatch",
+    utils::check(qp_map=="ac_pade" or qp_map=="mats_lin" or qp_map=="mats_gmatch" or
+                 qp_map=="mode_a" or qp_map=="mode_b",
                  "evgw: unknown qp_map: {}. Valid options: \"ac_pade\", \"mats_lin\", "
-                 "\"mats_gmatch\" (Project 2 increment Q0).", qp_map);
+                 "\"mats_gmatch\" (Project 2 increment Q0), \"mode_b\" (increment QM3; "
+                 "\"mode_a\" is ON HOLD, see the spec rev 2).",
+                 qp_map);
     qp_params_t qp_params(qp_type, ac_alg, Nfit, eta, conv_thr, "evscf", keep_scr_coulomb_fixed,
                           "fermi", mu_tol, mu_update_alg);
     qp_params.qp_map = qp_map;
     qp_params.qp_map_wpow = io::get_value_with_default<double>(pt,"qp_map_wpow",2.0);
     utils::check(qp_params.qp_map_wpow >= 0.0, "evgw: qp_map_wpow must be >= 0.");
+    // Project 2 increment QM3 (notes/qm3_mode_a_loop_spec.md section 6): mode-A knobs.
+    qp_params.qp_modea_route = io::get_value_with_default<std::string>(pt,"qp_modea_route","cd");
+    io::tolower(qp_params.qp_modea_route);
+    utils::check(qp_params.qp_modea_route=="cd" or qp_params.qp_modea_route=="expansion",
+                 "evgw: unknown qp_modea_route: {}. Valid options: \"cd\", \"expansion\".",
+                 qp_params.qp_modea_route);
+    qp_params.qp_modea_nconsist = io::get_value_with_default<long>(pt,"qp_modea_nconsist",5);
+    utils::check(qp_params.qp_modea_nconsist >= 1, "evgw: qp_modea_nconsist must be >= 1.");
+    qp_params.qp_modea_consist_tol = io::get_value_with_default<double>(pt,"qp_modea_consist_tol",1e-8);
+    utils::check(qp_params.qp_modea_consist_tol > 0.0, "evgw: qp_modea_consist_tol must be > 0.");
+    qp_params.qp_modea_eta = io::get_value_with_default<double>(pt,"qp_modea_eta",0.0);
+    qp_params.qp_modea_wsupp = io::get_value_with_default<std::string>(pt,"qp_modea_wsupp","auto");
+    io::tolower(qp_params.qp_modea_wsupp);
+    qp_params.qp_modea_wfit = io::get_value_with_default<std::string>(pt,"qp_modea_wfit","tau");
+    io::tolower(qp_params.qp_modea_wfit);
+    utils::check(qp_params.qp_modea_wfit=="tau" or qp_params.qp_modea_wfit=="nu",
+                 "evgw: unknown qp_modea_wfit: {}. Valid options: \"tau\", \"nu\".",
+                 qp_params.qp_modea_wfit);
+    qp_params.qp_modea_wrtol = io::get_value_with_default<double>(pt,"qp_modea_wrtol",-1.0);
+    utils::check(qp_params.qp_modea_wrtol < 1.0,
+                 "evgw: qp_modea_wrtol must be < 1 (negative selects the doctrine default).");
     if (io::get_value_with_default<bool>(pt,"iter_alg.enable", true)) {
       iter_solver = std::make_unique<iter_scf::iter_scf_t>(iter_scf::make_iter_scf(pt, 0.7, true));
     } else {
@@ -650,14 +674,38 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
                  "unknown off_diag_mode: {}. Valid options are \"fermi\" and \"qp_energy\"");
     auto qp_map = io::get_value_with_default<std::string>(pt,"qp_map","ac_pade");
     io::tolower(qp_map);
-    utils::check(qp_map=="ac_pade" or qp_map=="mats_lin" or qp_map=="mats_gmatch",
+    utils::check(qp_map=="ac_pade" or qp_map=="mats_lin" or qp_map=="mats_gmatch" or
+                 qp_map=="mode_a" or qp_map=="mode_b",
                  "qpgw: unknown qp_map: {}. Valid options: \"ac_pade\", \"mats_lin\", "
-                 "\"mats_gmatch\" (Project 2 increment Q0).", qp_map);
+                 "\"mats_gmatch\" (Project 2 increment Q0), \"mode_b\" (increment QM3; "
+                 "\"mode_a\" is ON HOLD, see the spec rev 2).",
+                 qp_map);
     qp_params_t qp_params("sc", ac_alg, Nfit, eta, 1e-8, "qpscf", false, off_diag_mode,
                           mu_tol, mu_update_alg);
     qp_params.qp_map = qp_map;
     qp_params.qp_map_wpow = io::get_value_with_default<double>(pt,"qp_map_wpow",2.0);
     utils::check(qp_params.qp_map_wpow >= 0.0, "qpgw: qp_map_wpow must be >= 0.");
+    // Project 2 increment QM3 (notes/qm3_mode_a_loop_spec.md section 6): mode-A knobs.
+    qp_params.qp_modea_route = io::get_value_with_default<std::string>(pt,"qp_modea_route","cd");
+    io::tolower(qp_params.qp_modea_route);
+    utils::check(qp_params.qp_modea_route=="cd" or qp_params.qp_modea_route=="expansion",
+                 "qpgw: unknown qp_modea_route: {}. Valid options: \"cd\", \"expansion\".",
+                 qp_params.qp_modea_route);
+    qp_params.qp_modea_nconsist = io::get_value_with_default<long>(pt,"qp_modea_nconsist",5);
+    utils::check(qp_params.qp_modea_nconsist >= 1, "qpgw: qp_modea_nconsist must be >= 1.");
+    qp_params.qp_modea_consist_tol = io::get_value_with_default<double>(pt,"qp_modea_consist_tol",1e-8);
+    utils::check(qp_params.qp_modea_consist_tol > 0.0, "qpgw: qp_modea_consist_tol must be > 0.");
+    qp_params.qp_modea_eta = io::get_value_with_default<double>(pt,"qp_modea_eta",0.0);
+    qp_params.qp_modea_wsupp = io::get_value_with_default<std::string>(pt,"qp_modea_wsupp","auto");
+    io::tolower(qp_params.qp_modea_wsupp);
+    qp_params.qp_modea_wfit = io::get_value_with_default<std::string>(pt,"qp_modea_wfit","tau");
+    io::tolower(qp_params.qp_modea_wfit);
+    utils::check(qp_params.qp_modea_wfit=="tau" or qp_params.qp_modea_wfit=="nu",
+                 "qpgw: unknown qp_modea_wfit: {}. Valid options: \"tau\", \"nu\".",
+                 qp_params.qp_modea_wfit);
+    qp_params.qp_modea_wrtol = io::get_value_with_default<double>(pt,"qp_modea_wrtol",-1.0);
+    utils::check(qp_params.qp_modea_wrtol < 1.0,
+                 "qpgw: qp_modea_wrtol must be < 1 (negative selects the doctrine default).");
     if (io::get_value_with_default<bool>(pt,"iter_alg.enable", true)) {
       iter_solver = std::make_unique<iter_scf::iter_scf_t>(iter_scf::make_iter_scf(pt));
     } else {

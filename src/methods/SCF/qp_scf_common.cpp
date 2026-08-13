@@ -20,6 +20,7 @@
 
 
 #include <algorithm>
+#include <functional>
 #include <utility>
 #include <vector>
 
@@ -38,6 +39,8 @@
 #include "methods/SCF/scf_common.hpp"
 #include "methods/SCF/qp_solvers.hpp"
 #include "methods/SCF/qp_maps_matsubara.hpp"
+#include "methods/SCF/qp_modea.hpp"
+#include "methods/SCF/wc_band_elements.hpp"
 
 namespace methods {
 
@@ -59,6 +62,565 @@ namespace {
       idx[m] = pw[m].second;
     }
     return std::make_pair(std::move(wp), std::move(idx));
+  }
+
+  /**
+   * Project 2 increment QM3: build the mode-A evaluator context, if and only if the map asks
+   * for it. MUST be called inside the live-W window of the caller (mb_state.dW_qtPQ alive).
+   * `need_diag` also produces the replicated DIAGONAL residues, which the evGW leg needs
+   * because solve_qp_eqn distributes (s,k,a) on a processor grid of its own.
+   */
+  template<typename eri_t, typename corr_solver_t>
+  void build_modea_ctx_if_needed(qp_modea::modea_ctx &ctx, MBState &mb_state,
+                                 solvers::mb_solver_t<corr_solver_t> &mb_solver, eri_t &eri,
+                                 const sArray_t<Array_view_4D_t> &sMO_skia,
+                                 const sArray_t<Array_view_3D_t> &sE_ska,
+                                 double mu, const imag_axes_ft::IAFT &FT,
+                                 qp_params_t &qp_params, bool need_diag) {
+    if (qp_params.qp_map != "mode_a" and qp_params.qp_map != "mode_b") return;
+    qp_modea::modea_opts opts;
+    opts.route = qp_params.qp_modea_route;
+    opts.nconsist = qp_params.qp_modea_nconsist;
+    opts.consist_tol = qp_params.qp_modea_consist_tol;
+    opts.eta = qp_params.qp_modea_eta;
+    opts.wsupp = qp_params.qp_modea_wsupp;
+    opts.wfit = qp_params.qp_modea_wfit;
+    opts.wrtol = qp_params.qp_modea_wrtol;
+    opts.iter = 1;
+    std::string div = "ignore_g0";
+    if constexpr (requires { mb_solver.corr->iter(); })
+      if (mb_solver.corr != nullptr) opts.iter = mb_solver.corr->iter();
+    if constexpr (requires { mb_solver.corr->div_treatment(); })
+      if (mb_solver.corr != nullptr) div = mb_solver.corr->div_treatment();
+    utils::check(opts.route == "cd" or opts.route == "expansion",
+                 "qp_modea: unknown qp_modea_route = {}. Valid: \"cd\", \"expansion\".",
+                 opts.route);
+    utils::check(opts.wfit == "tau" or opts.wfit == "nu",
+                 "qp_modea: unknown qp_modea_wfit = {}. Valid: \"tau\", \"nu\".", opts.wfit);
+
+    app_log(2, "\n* {} quasiparticle map (Project 2 increment QM3): building the "
+               "evaluator context", qp_params.qp_map);
+    if (qp_params.qp_map == "mode_a")
+      app_log(2, "  - evaluation energies are STRIP-CLAMPED TO mu (spec rev 3.1, addendum "
+                 "item 2): states inside (VBM - 0.95 E_PH, CBM + 0.95 E_PH) are exact mode A, "
+                 "states outside it are evaluated at mu; census logged below.");
+    if (opts.route == "expansion") {
+      // pure diagnostic: the whole map is solved from the route-A z0 = 0 re-expansion of the
+      // stored Sigma(iw), so no W data (and no THC contraction) is needed at all.
+      ctx = qp_modea::modea_ctx{};
+      ctx.opts = opts;
+      ctx.active = true;
+      ctx.have_cd = false;
+      ctx.beta = FT.beta();
+      ctx.mu = mu;
+      ctx.eta = opts.eta;
+      ctx.ns = sE_ska.shape()[0];
+      ctx.nk = sE_ska.shape()[1];
+      ctx.nbnd = sE_ska.shape()[2];
+      app_log(2, "  - route:                       expansion (DIAGNOSTIC -- Sigma^c comes "
+                 "from the route-A z0 = 0 fit, no W^c contraction)");
+      return;
+    }
+    if constexpr (std::is_same_v<std::decay_t<eri_t>, thc_reader_t>) {
+      qp_modea::build_modea_context(ctx, mb_state, eri, sMO_skia, sE_ska, mu, FT, opts, div,
+                                    need_diag);
+    } else {
+      utils::check(false, "qp_modea: qp_map = \"mode_a\" with qp_modea_route = \"cd\" needs a "
+                          "THC ERI (the W^c band elements are collocation pair vectors). Use "
+                          "a thc eri, or qp_modea_route = \"expansion\".");
+    }
+  }
+
+  // ---------------------------------------------------------------------------------------
+  // Project 2 increment QM3: the mode-A driver (notes/qm3_mode_a_loop_spec.md sections 4/5/7)
+  //
+  // Runs, per external (s,k) block owned by this rank:
+  //   (1) the inner QP-consistency loop at FIXED Sigma data -> the LAST V^xc;
+  //   (2) THE ANCHOR (gate QM3-b(ii)): route-B Sigma^c_ab at the first few FERMIONIC nodes
+  //       vs the gathered solver Sigma(i w_n). Pins prefactor, spin, q-star/trev rule, the
+  //       MO rotation and the head in one number;
+  //   (3) the A/B cross-validation harness of spec section 5: delta_i = |Sigma^A_ii(eps_i) -
+  //       Sigma^B_ii(eps_i)| against the A-side TRUNCATION CLASS |Sigma^A_(p+1) - Sigma^A_(p)|,
+  //       plus one off-diagonal spot check.
+  // Everything here is LOGGED; the only hard failure is a route/knob misuse.
+  // ---------------------------------------------------------------------------------------
+  template<typename comm_t>
+  void modea_run(sArray_t<Array_view_4D_t> &sVcorr_skij,
+                 const sArray_t<Array_view_5D_t> &sSigma_wskab,
+                 const sArray_t<Array_view_5D_t> &sSigma_tskab,
+                 const sArray_t<Array_view_4D_t> &sMO_skia,
+                 const sArray_t<Array_view_3D_t> &sE_ska,
+                 const sArray_t<Array_view_4D_t> &sHstat_skij,
+                 nda::array<double, 1> const &wp, std::vector<long> const &widx,
+                 double mu, const imag_axes_ft::IAFT &FT, std::string const &map_name,
+                 const qp_modea::modea_ctx *ctx, comm_t &comm) {
+    using namespace qp_modea;
+    decltype(nda::range::all) all;
+    constexpr double HA2EV = 27.211386245988;
+    auto [ns, nkpts, nbnd] = sE_ska.shape();
+    const long npos = wp.shape(0);
+    const int lvl = 2;
+
+    utils::check(ctx != nullptr and ctx->active,
+                 "qp_approx: qp_map = \"mode_a\" reached the map without an evaluator "
+                 "context. The context is built in the live W window of add_qpscf_vcorr / "
+                 "add_evscf_vcorr and requires a THC ERI.");
+    const bool cd = ctx->have_cd;
+    const bool mode_b = (map_name == "mode_b");
+
+    // owned blocks: the cd route inherits the context's partition, the diagnostic
+    // "expansion" route round-robins the same way.
+    std::vector<std::pair<long, long>> mine;
+    if (cd) {
+      for (auto const &b : ctx->blocks) mine.emplace_back(b.is, b.ik);
+    } else {
+      for (long sk = comm.rank(); sk < long(ns * nkpts); sk += comm.size())
+        mine.emplace_back(sk / nkpts, sk % nkpts);
+    }
+
+    // the A-side window: order p and p+1 on the SAME node window (spec section 5)
+    sigma_real_axis::fit_opts optA, optA1;
+    optA.p = 2;
+    optA1.p = 3;
+    optA.m = optA1.m = std::min<long>(3 * (optA1.p), npos);
+    utils::check(optA.m >= optA1.p + 1,
+                 "qp_approx (mode_a): only {} positive fermionic nodes; the A-side "
+                 "truncation-class fit needs at least {}.", npos, optA1.p + 1);
+
+    double anchor_worst = 0.0, anchor_expect = ctx->diag.rec_rel_worst;
+    double dmax_worst = 0.0, min_den_worst = 1e300, anti_worst = 0.0;
+    double ratio_worst = 0.0, dev_off_worst = 0.0;
+    double ratio_in_worst = 0.0, delta_in_worst = 0.0, class_in_worst = 0.0;
+    double tau_dev_worst = 0.0;
+    long iters_worst = 0, n_noconv = 0, n_flag = 0, n_flag_in = 0;
+    long n_fallback = 0, n_fallback_win = 0, n_sanity_trip = 0;
+    long n_homo_fb = 0, n_lumo_fb = 0, n_blocks = 0;
+    // mode_a STRIP CLAMP census (spec rev 3 addendum item 2)
+    long n_clamp = 0, n_clamp_win = 0, n_eval = 0, n_homo_cl = 0, n_lumo_cl = 0;
+    double exc_lo_worst = 0.0, exc_hi_worst = 0.0;
+    const qp_modea::strip_t strip = qp_modea::strip_of(*ctx);
+
+    nda::array<ComplexType, 2> tmp(nbnd, nbnd), Hstat_ab(nbnd, nbnd), V(nbnd, nbnd);
+    nda::array<ComplexType, 3> Sw(optA.m, nbnd, nbnd);
+    nda::array<ComplexType, 2> Sanch(nbnd, nbnd);
+    nda::array<double, 1> eps(nbnd), eps_rel(nbnd);
+
+    for (auto const &[is, ik] : mine) {
+      auto MO = sMO_skia.local()(is, ik, all, all);
+      nda::blas::gemm(ComplexType(1.0), sHstat_skij.local()(is, ik, nda::ellipsis{}), MO,
+                      ComplexType(0.0), tmp);
+      nda::blas::gemm(ComplexType(1.0), nda::dagger(MO), tmp, ComplexType(0.0), Hstat_ab);
+
+      for (long m = 0; m < optA.m; ++m)
+        Sw(m, all, all) = sSigma_wskab.local()(widx[m], is, ik, all, all);
+      auto XA = sigma_real_axis::fit_matsubara(Sw, wp, optA);
+      auto XA1 = sigma_real_axis::fit_matsubara(Sw, wp, optA1);
+
+      // The RAW incoming QP spectrum. Everything DIAGNOSTIC below is read here: it is the
+      // physical band structure of the current outer iteration, and it is what "gap window"
+      // means. The route-A start refinement is applied afterwards, to the inner loop's
+      // starting point only, so that a bad refinement cannot silently move the diagnostics.
+      for (long a = 0; a < nbnd; ++a) eps(a) = sE_ska.local()(is, ik, a).real();
+
+      const sk_block *blk = nullptr;
+      if (cd) blk = std::addressof(ctx->blocks[ctx->block_index(is, ik)]);
+
+      // ------- the gap window: two occupied + two empty states straddling mu -----------
+      // Built from the INCOMING (route-A refined) spectrum, i.e. before the inner loop can
+      // move anything: it is the physically meaningful window, and it must not depend on the
+      // outcome of the loop it is used to diagnose.
+      std::vector<long> win;
+      {
+        std::vector<long> occ, emp;
+        for (long a = 0; a < nbnd; ++a) (eps(a) < mu ? occ : emp).push_back(a);
+        std::sort(occ.begin(), occ.end(), [&](long x, long y) { return eps(x) > eps(y); });
+        std::sort(emp.begin(), emp.end(), [&](long x, long y) { return eps(x) < eps(y); });
+        for (size_t t = 0; t < std::min<size_t>(2, occ.size()); ++t) win.push_back(occ[t]);
+        for (size_t t = 0; t < std::min<size_t>(2, emp.size()); ++t) win.push_back(emp[t]);
+        std::sort(win.begin(), win.end());
+      }
+
+      // ------- THE ANCHOR (gate QM3-b(ii)) ---------------------------------------------
+      // Evaluated at FERMIONIC nodes, so it is independent of eps; only the window is not.
+      if (cd) {
+        double num = 0.0, den = 0.0;
+        const long nanch = std::min<long>(4, npos);
+        for (long m = 0; m < nanch; ++m) {
+          modea_sigma_at(*ctx, *blk, ComplexType(mu, wp(m)), Sanch);
+          auto Sgw = sSigma_wskab.local()(widx[m], is, ik, all, all);
+          for (long a : win)
+            for (long b : win) {
+              num = std::max(num, std::abs(Sanch(a, b) - Sgw(a, b)));
+              den = std::max(den, std::abs(Sgw(a, b)));
+            }
+        }
+        const double dev = (den > 0.0) ? num / den : 0.0;
+        anchor_worst = std::max(anchor_worst, dev);
+        app_log(lvl, "  mode_a ANCHOR (s,k) = ({},{}): max rel dev over {} nodes x the "
+                     "gap window = {:.4e}  (max|Sigma^GW| = {:.4e}, W-fit reconstruction "
+                     "class {:.4e})", is, ik, nanch, dev, den, ctx->diag.rec_rel_worst);
+      }
+
+      // ------- the A/B harness AT THE INCOMING ENERGIES (spec section 5) ----------------
+      // This is the near-gap real-axis accuracy of route B: close to mu the A-side
+      // truncation class is tight, so delta_i there IS the B-side error scale. It must be
+      // read BEFORE the inner loop, whose divergence would otherwise evaluate both sides at
+      // meaningless energies.
+      {
+        // Both sides are read AT THE ACTUAL EVALUATION POINT of the map, i.e. at the
+        // STRIP-CLAMPED energy (rev 3 addendum item 2): comparing an out-of-strip A-side
+        // extrapolation against a B side evaluated at mu would compare two different
+        // arguments. Clamped rows are marked "*"; eps_i - mu is printed RAW.
+        app_log(lvl, "  mode_a delta_i [IN] (s,k) = ({},{}):  {:>4} {:>14} {:>12} {:>12} "
+                     "{:>10}", is, ik, "i", "eps_i-mu (eV)", "delta_i", "class_i", "ratio");
+        for (long i = 0; i < nbnd; ++i) {
+          const bool in_win = std::find(win.begin(), win.end(), i) != win.end();
+          const double er = eps(i) - mu;
+          bool hit = false;
+          const double zc = (mode_b or not cd) ? eps(i) : strip.clamp(eps(i), &hit);
+          const ComplexType SA = XA.eval(i, i, zc - mu);
+          const ComplexType SA1 = XA1.eval(i, i, zc - mu);
+          const ComplexType SB =
+              cd ? modea_sigma_diag(*ctx, *blk, i, ComplexType(zc, ctx->eta)) : SA;
+          const double d = std::abs(SB - SA), cl = std::abs(SA1 - SA);
+          const double ratio = (cl > 0.0) ? d / cl : 0.0;
+          if (in_win) {
+            ratio_in_worst = std::max(ratio_in_worst, ratio);
+            delta_in_worst = std::max(delta_in_worst, d);
+            class_in_worst = std::max(class_in_worst, cl);
+            if (ratio > 10.0) ++n_flag_in;
+          }
+          app_log(in_win ? lvl : lvl + 1, "  mode_a delta_i [IN]   ({},{}):  {:>4} {:>14.4f} "
+                                          "{:>12.4e} {:>12.4e} {:>10.3g}{}",
+                  is, ik, i, er * HA2EV, d, cl, ratio, hit ? "  * clamped" : "");
+        }
+      }
+
+      // NOTE: the route-A z0 = 0 start refinement that the spec adopted as a default here
+      // has been DELETED -- see the reversal note in qp_modea.hpp. The inner loop starts
+      // unconditionally from the raw incoming sE_ska.
+      // ------- THE TAU-DOMAIN ORACLE (coordinator request 2026-08-12) ------------------
+      // Same elements, two domains: tau (no transform on either side) vs the first fermionic
+      // nodes (the anchor). Run on the first two owned blocks only -- it is a diagnostic.
+      if (cd) {
+        nda::array<double, 1> tau_ph(FT.nt_f());
+        {
+          auto xm = FT.tau_mesh();
+          for (long i = 0; i < FT.nt_f(); ++i) tau_ph(i) = (xm(i) + 1.0) * FT.beta() / 2.0;
+        }
+        nda::array<ComplexType, 1> Stau(FT.nt_f());
+        // the gap-window diagonals, plus the largest off-diagonal of the raw map
+        std::vector<std::pair<long, long>> elems;
+        for (long i : win) elems.emplace_back(i, i);
+        {
+          long ba = 0, bb = 1;
+          double vm = -1.0;
+          for (long a : win)
+            for (long b : win)
+              if (a != b) {
+                double m = 0.0;
+                for (long i = 0; i < FT.nt_f(); ++i)
+                  m = std::max(m, std::abs(sSigma_tskab.local()(i, is, ik, a, b)));
+                if (m > vm) { vm = m; ba = a; bb = b; }
+              }
+          elems.emplace_back(ba, bb);
+        }
+        app_log(lvl, "  mode_a TAU ORACLE (s,k) = ({},{}): {:>6} {:>14} {:>14} {:>10}",
+                is, ik, "(a,b)", "tau rel dev", "iw rel dev", "ratio");
+        for (auto const &[a, b] : elems) {
+          modea_sigma_tau(*ctx, *blk, a, b, tau_ph, Stau);
+          double tn = 0.0, td = 0.0;
+          for (long i = 0; i < FT.nt_f(); ++i) {
+            const ComplexType ref = sSigma_tskab.local()(i, is, ik, a, b);
+            tn = std::max(tn, std::abs(Stau(i) - ref));
+            td = std::max(td, std::abs(ref));
+          }
+          double wn_ = 0.0, wd = 0.0;
+          const long nanch = std::min<long>(4, npos);
+          for (long m = 0; m < nanch; ++m) {
+            modea_sigma_at(*ctx, *blk, ComplexType(mu, wp(m)), Sanch);
+            const ComplexType ref = sSigma_wskab.local()(widx[m], is, ik, a, b);
+            wn_ = std::max(wn_, std::abs(Sanch(a, b) - ref));
+            wd = std::max(wd, std::abs(ref));
+          }
+          const double dtau = (td > 0.0) ? tn / td : 0.0;
+          const double diw = (wd > 0.0) ? wn_ / wd : 0.0;
+          tau_dev_worst = std::max(tau_dev_worst, dtau);
+          app_log(lvl, "  mode_a TAU ORACLE     ({},{}): ({:>2},{:>2}) {:>14.4e} {:>14.4e} "
+                       "{:>10.3g}{}", is, ik, a, b, dtau, diw,
+                  (dtau > 0.0 ? diw / dtau : 0.0), (a == b) ? "" : "   <- off-diagonal");
+        }
+      }
+
+      if (mode_b) {
+        // ---- MODE B (spec rev 2, the user ruling): no inner-consistency loop ----
+        auto br = modeb_vxc(*ctx, *blk, eps, win, V);
+        sVcorr_skij.local()(is, ik, all, all) = V;
+        n_fallback += br.n_fallback;
+        n_fallback_win += br.n_fallback_win;
+        n_sanity_trip += br.n_sanity_trip;
+        if (br.homo_fallback) ++n_homo_fb;
+        if (br.lumo_fallback) ++n_lumo_fb;
+        ++n_blocks;
+        min_den_worst = std::min(min_den_worst, br.min_den);
+        anti_worst = std::max(anti_worst, br.anti_herm);
+        app_log(lvl, "  mode_b (s,k) = ({},{}): max|V| = {:.4e}, min_den = {:.4e} a.u., "
+                     "diagonal fallbacks to z = mu: {} of {} ({} in the gap window); per-k "
+                     "HOMO {}, LUMO {}",
+                is, ik, br.vmax, br.min_den, br.n_fallback, nbnd, br.n_fallback_win,
+                br.homo_fallback ? "FALLBACK" : "strip-exact",
+                br.lumo_fallback ? "FALLBACK" : "strip-exact");
+        continue;
+      }
+
+      consist_result cr;
+      qp_modea::clamp_census cc;   // the LAST sweep's census (the map that is returned)
+      if (cd) {
+        cr = inner_consistency(
+            [&](nda::array<double, 1> const &e, nda::array<ComplexType, 2> &Vout, long *am) {
+              return modea_vxc_cd(*ctx, *blk, e, Vout, am, std::addressof(cc),
+                                  std::addressof(win));
+            }, Hstat_ab, eps, V, ctx->opts.nconsist, ctx->opts.consist_tol);
+      } else {
+        cr = inner_consistency(
+            [&](nda::array<double, 1> const &e, nda::array<ComplexType, 2> &Vout, long *am) {
+              (void)am;
+              nda::array<double, 1> er(e.shape(0));
+              for (long a = 0; a < e.shape(0); ++a) er(a) = e(a) - mu;
+              Vout = sigma_real_axis::assemble_vxc(XA, er);
+              return 1e300;
+            }, Hstat_ab, eps, V, ctx->opts.nconsist, ctx->opts.consist_tol);
+      }
+      sVcorr_skij.local()(is, ik, all, all) = V;
+      app_log(lvl, "  mode_a inner consistency (s,k) = ({},{}): {} sweeps, max|d eps| = "
+                       "{:.4e}, max|V| = {:.4e}, min_den = {:.4e} at state {} (eps - mu = "
+                       "{:+.6f} a.u.)", is, ik, cr.iters, cr.dmax, cr.vmax, cr.min_den,
+              cr.min_den_a, cr.min_den_ea - mu);
+      iters_worst = std::max(iters_worst, cr.iters);
+      dmax_worst = std::max(dmax_worst, cr.dmax);
+      min_den_worst = std::min(min_den_worst, cr.min_den);
+      anti_worst = std::max(anti_worst, cr.anti_herm);
+      if (not cr.converged) ++n_noconv;
+
+      // ------- THE STRIP CLAMP CENSUS (spec rev 3 addendum item 2) ---------------------
+      // Read off the LAST inner sweep, i.e. the map actually returned to the caller.
+      if (cd) {
+        n_clamp += cc.n_clamp;
+        n_clamp_win += cc.n_clamp_win;
+        n_eval += cc.n_eval;
+        if (cc.homo_clamp) ++n_homo_cl;
+        if (cc.lumo_clamp) ++n_lumo_cl;
+        exc_lo_worst = std::max(exc_lo_worst, cc.exc_lo);
+        exc_hi_worst = std::max(exc_hi_worst, cc.exc_hi);
+        ++n_blocks;
+        app_log(lvl, "  mode_a STRIP CLAMP (s,k) = ({},{}): {} of {} evaluation energies "
+                     "clamped ({} in the gap window); per-k HOMO {}, LUMO {}; worst "
+                     "excursion below the lower bound {:.4f} a.u., above the upper bound "
+                     "{:.4f} a.u.", is, ik, cc.n_clamp, cc.n_eval, cc.n_clamp_win,
+                cc.homo_clamp ? "CLAMPED" : "in strip",
+                cc.lumo_clamp ? "CLAMPED" : "in strip", cc.exc_lo, cc.exc_hi);
+      }
+
+      // ------- the same harness AT THE EXIT ENERGIES (reported, interpretable only if
+      //         the inner loop converged) -------------------------------------------------
+      {
+        app_log(lvl + 1, "  mode_a delta_i [OUT] (s,k) = ({},{}):  {:>4} {:>14} {:>12} {:>12} "
+                         "{:>10}", is, ik, "i", "eps_i-mu (eV)", "delta_i", "class_i", "ratio");
+        for (long i = 0; i < nbnd; ++i) {
+          const bool in_win = std::find(win.begin(), win.end(), i) != win.end();
+          const double er = eps(i) - mu;
+          bool hit = false;
+          const double zc = cd ? strip.clamp(eps(i), &hit) : eps(i);
+          const ComplexType SA = XA.eval(i, i, zc - mu);
+          const ComplexType SA1 = XA1.eval(i, i, zc - mu);
+          const ComplexType SB = cd ? modea_sigma_diag(*ctx, *blk, i, ComplexType(zc, ctx->eta))
+                                    : SA;
+          const double d = std::abs(SB - SA), cl = std::abs(SA1 - SA);
+          const double ratio = (cl > 0.0) ? d / cl : 0.0;
+          if (in_win) ratio_worst = std::max(ratio_worst, ratio);
+          if (in_win and ratio > 10.0) ++n_flag;
+          app_log(lvl + 1, "  mode_a delta_i [OUT]  ({},{}):  {:>4} {:>14.4f} "
+                           "{:>12.4e} {:>12.4e} {:>10.3g}{}",
+                  is, ik, i, er * HA2EV, d, cl, ratio, hit ? "  * clamped" : "");
+        }
+        // one off-diagonal spot check: the largest |V^xc_ab|, a != b. The A side is built at
+        // the SAME (clamped) energies the B side used, for the same reason as the table above.
+        long ba = 0, bb = 0;
+        double vmax = -1.0;
+        for (long a = 0; a < nbnd; ++a)
+          for (long b = 0; b < nbnd; ++b)
+            if (a != b and std::abs(V(a, b)) > vmax) { vmax = std::abs(V(a, b)); ba = a; bb = b; }
+        for (long a = 0; a < nbnd; ++a)
+          eps_rel(a) = (cd ? strip.clamp(eps(a)) : eps(a)) - mu;
+        auto VA = sigma_real_axis::assemble_vxc(XA, eps_rel);
+        const double doff = std::abs(V(ba, bb) - VA(ba, bb)) / std::max(vmax, 1e-30);
+        dev_off_worst = std::max(dev_off_worst, doff);
+        app_log(lvl + 1, "  mode_a off-diagonal spot check (s,k) = ({},{}): largest |V_ab| at "
+                         "({},{}) = {:.4e}; A-vs-B rel dev = {:.4e}", is, ik, ba, bb, vmax, doff);
+      }
+    }
+
+    anchor_worst = comm.all_reduce_value(anchor_worst, boost::mpi3::max<>{});
+    dmax_worst = comm.all_reduce_value(dmax_worst, boost::mpi3::max<>{});
+    min_den_worst = comm.all_reduce_value(min_den_worst, boost::mpi3::min<>{});
+    anti_worst = comm.all_reduce_value(anti_worst, boost::mpi3::max<>{});
+    ratio_worst = comm.all_reduce_value(ratio_worst, boost::mpi3::max<>{});
+    dev_off_worst = comm.all_reduce_value(dev_off_worst, boost::mpi3::max<>{});
+    iters_worst = comm.all_reduce_value(iters_worst, boost::mpi3::max<>{});
+    n_noconv = comm.all_reduce_value(n_noconv, std::plus<>{});
+    n_flag = comm.all_reduce_value(n_flag, std::plus<>{});
+    ratio_in_worst = comm.all_reduce_value(ratio_in_worst, boost::mpi3::max<>{});
+    delta_in_worst = comm.all_reduce_value(delta_in_worst, boost::mpi3::max<>{});
+    class_in_worst = comm.all_reduce_value(class_in_worst, boost::mpi3::max<>{});
+    n_flag_in = comm.all_reduce_value(n_flag_in, std::plus<>{});
+
+    app_log(lvl, "  - inner QP consistency:       worst count {} of {} (cap), max|d eps| at "
+                 "exit = {:.3e} a.u., min_den = {:.4e} a.u.",
+            iters_worst, ctx->opts.nconsist, dmax_worst, min_den_worst);
+    app_log(lvl, "  - anti-Hermitian residual:    max|V - V^dag|/max|V| = {:.3e} (expected at "
+                 "the W-fit class {:.3e}; O(1) would be a routing error)",
+            anti_worst, ctx->diag.rec_rel_worst);
+    if (cd)
+      app_log(lvl, "  - i w comparison (DIAGNOSTIC, never a gate): route-B Sigma^c vs the "
+                   "solver Sigma(i w_n) over the gap window = {:.4e} [W-fit class {:.4e}]. "
+                   "This number is dominated by the REFERENCE's tau -> i w transform of the "
+                   "G.W product, whose spectral support exceeds the grid: it halves with "
+                   "every DLR prec notch while the tau deviation does not. The gate is the "
+                   "TAU anchor above.", anchor_worst, anchor_expect);
+    tau_dev_worst = comm.all_reduce_value(tau_dev_worst, boost::mpi3::max<>{});
+    app_log(lvl, "  - TAU ORACLE:                 max rel dev of Sigma_B(tau) vs the solver's "
+                 "Sigma^c(tau) (no transform on either side) = {:.4e}; the same elements at "
+                 "the first fermionic nodes deviate by {:.4e} (the anchor)",
+            tau_dev_worst, anchor_worst);
+    app_log(lvl, "  - A/B harness [IN, gap window]: max delta_i = {:.4e} a.u. ({:.4g} meV), "
+                 "max class_i = {:.4e} a.u. ({:.4g} meV), worst ratio = {:.3g} ({} states "
+                 "above 10x)",
+            delta_in_worst, delta_in_worst * 27211.386, class_in_worst,
+            class_in_worst * 27211.386, ratio_in_worst, n_flag_in);
+    app_log(lvl, "  - A/B harness [OUT]:          worst delta_i/class_i over gap-window "
+                 "states = {:.3g} ({} states above 10x); off-diagonal spot check rel dev = "
+                 "{:.3e}", ratio_worst, n_flag, dev_off_worst);
+    // ONE machine-greppable line per outer iteration: the knob-matrix harness scrapes this.
+    app_log(1, "@@MODEA_CELL wfit={} wrtol={:.1e} eta={:.4e} | ratio={:.4e} rec={:.4e} "
+               "gapedge={:.6g} npk={} | dmax={:.4e} iters={} minden={:.4e} anchor={:.4e} "
+               "antiherm={:.4e} taudev={:.4e} | dIN={:.4e} clIN={:.4e} rIN={:.4e}",
+            ctx->opts.wfit, ctx->diag.gap_edge > -1 ? qp_modea::last_run().wrtol : -1.0,
+            ctx->eta, ctx->diag.res_ratio_worst, ctx->diag.rec_rel_worst,
+            ctx->diag.gap_edge, ctx->npk, dmax_worst, iters_worst, min_den_worst,
+            anchor_worst, anti_worst, tau_dev_worst, delta_in_worst, class_in_worst,
+            ratio_in_worst);
+    if (n_noconv > 0)
+      app_warning("qp_approx (mode_a): the inner QP-consistency loop hit the cap ({}) on {} "
+                  "(s,k) blocks with max|d eps| = {:.3e}. This is the physical "
+                  "multi-solution flag of the spec, not an error.",
+                  ctx->opts.nconsist, n_noconv, dmax_worst);
+
+    // ---- THE STRIP CLAMP CENSUS, summary (spec rev 3 addendum item 2) ----
+    // n_blocks is shared with the mode_b census below and is reduced HERE, once.
+    n_blocks = comm.all_reduce_value(n_blocks, std::plus<>{});
+    n_clamp = comm.all_reduce_value(n_clamp, std::plus<>{});
+    n_clamp_win = comm.all_reduce_value(n_clamp_win, std::plus<>{});
+    n_eval = comm.all_reduce_value(n_eval, std::plus<>{});
+    n_homo_cl = comm.all_reduce_value(n_homo_cl, std::plus<>{});
+    n_lumo_cl = comm.all_reduce_value(n_lumo_cl, std::plus<>{});
+    exc_lo_worst = comm.all_reduce_value(exc_lo_worst, boost::mpi3::max<>{});
+    exc_hi_worst = comm.all_reduce_value(exc_hi_worst, boost::mpi3::max<>{});
+    if (cd and not mode_b) {
+      app_log(lvl, "  - mode_a STRIP CLAMP:         strip = (VBM - 0.95 E_PH, CBM + 0.95 "
+                   "E_PH) = ({:+.6f}, {:+.6f}) a.u. with VBM {:+.6f}, CBM {:+.6f}, E_PH "
+                   "{:.6f} ({})", strip.lo, strip.hi, ctx->vbm, ctx->cbm,
+              ctx->diag.gap_edge, strip.active ? "ACTIVE" : "INACTIVE (no support "
+                                                            "constraint this iteration)");
+      app_log(lvl, "  - mode_a clamp census:        {} of {} evaluation energies clamped to mu "
+                   "({} in the gap window) over {} (s,k) blocks; THE JUDGE "
+                   "STATES: per-k HOMO clamped in {} of {} blocks, LUMO in {} of {}; worst "
+                   "excursion {:.4f} a.u. below / {:.4f} a.u. above",
+              n_clamp, n_eval, n_clamp_win, n_blocks, n_homo_cl, n_blocks, n_lumo_cl,
+              n_blocks, exc_lo_worst, exc_hi_worst);
+      if (n_clamp_win > 0)
+        app_warning("qp_approx (mode_a): {} GAP-WINDOW evaluation energies were STRIP-CLAMPED. "
+                    "Near mu the particle-hole edge should guarantee a clearance of E_PH = "
+                    "{:.4g} a.u., so a clamp there means the QP spectrum has moved a band-edge "
+                    "state outside the analyticity strip -- the judge states are then NOT exact "
+                    "mode A. Check the gap and the inner-consistency numbers above.",
+                    n_clamp_win, ctx->diag.gap_edge);
+    }
+
+    auto &LR = qp_modea::last_run();
+    LR.anchor = cd ? anchor_worst : -1.0;
+    LR.n_clamp = n_clamp;
+    LR.n_clamp_win = n_clamp_win;
+    LR.n_eval = n_eval;
+    LR.n_homo_clamp = n_homo_cl;
+    LR.n_lumo_clamp = n_lumo_cl;
+    LR.n_blocks = n_blocks;
+    LR.converged_inner = (n_noconv == 0);
+    LR.anchor_expect = anchor_expect;
+    LR.ratio_worst = ratio_worst;
+    LR.anti_herm = anti_worst;
+    LR.dmax = dmax_worst;
+    LR.min_den = min_den_worst;
+    LR.iters = iters_worst;
+    LR.tau_dev = tau_dev_worst;
+    LR.n_fallback = n_fallback;
+    LR.delta_in = delta_in_worst;
+    LR.class_in = class_in_worst;
+    LR.ratio_in = ratio_in_worst;
+
+    n_fallback = comm.all_reduce_value(n_fallback, std::plus<>{});
+    n_fallback_win = comm.all_reduce_value(n_fallback_win, std::plus<>{});
+    n_sanity_trip = comm.all_reduce_value(n_sanity_trip, std::plus<>{});
+    n_homo_fb = comm.all_reduce_value(n_homo_fb, std::plus<>{});
+    n_lumo_fb = comm.all_reduce_value(n_lumo_fb, std::plus<>{});
+    if (mode_b) {
+      app_log(lvl, "  - mode_b STRIP TEST census:   strip = (VBM - 0.95 E_PH, CBM + 0.95 "
+                   "E_PH) = ({:+.6f}, {:+.6f}) a.u. with VBM {:+.6f}, CBM {:+.6f}, E_PH "
+                   "{:.6f}", ctx->vbm - 0.95 * ctx->diag.gap_edge,
+              ctx->cbm + 0.95 * ctx->diag.gap_edge, ctx->vbm, ctx->cbm, ctx->diag.gap_edge);
+      app_log(lvl, "  - mode_b diagonal fallbacks:  {} states demoted to z = mu ({} in the gap "
+                   "window); THE JUDGE STATES: per-k HOMO fell back in {} of {} blocks, LUMO "
+                   "in {} of {}", n_fallback, n_fallback_win, n_homo_fb, n_blocks, n_lumo_fb,
+              n_blocks);
+      app_log(lvl, "  - mode_b strip-interior |ReSigma| trips: {} (expected 0 -- a nonzero "
+                   "count FALSIFIES the strip criterion)", n_sanity_trip);
+      if (n_fallback_win > 0)
+        app_warning("qp_approx (mode_b): {} GAP-WINDOW diagonal states fell back to the "
+                    "Fermi-static value because Sigma^c could not be resolved at their "
+                    "quasiparticle energy. Near mu the support constraint should guarantee a "
+                    "clearance of gap_edge; check min_den = {:.4e} a.u. and the W^c fit.",
+                    n_fallback_win, min_den_worst);
+    }
+
+    // THE GATE (spec rev 2): the TAU-DOMAIN anchor. The tau image of the route-B pole rep is
+    // compared against the solver's Sigma^c(tau) with NO transform on either side, so it
+    // isolates the contraction from the reference's tau -> i w aliasing. Measured 2026-08-12:
+    // tau agreement 5.6e-05 at DLR prec "low", two orders below that grid's W-fit class,
+    // while the i w deviation was 2.3e-01 on the SAME elements and halved with every prec
+    // notch. The i w comparison is therefore a LOGGED DIAGNOSTIC ONLY -- never a gate.
+    if (cd)
+      utils::check(tau_dev_worst < qp_modea::modea_tau_anchor_mult * ctx->diag.rec_rel_worst,
+                   "qp_approx ({}): THE TAU ANCHOR FAILED -- the analytic tau image of the "
+                   "route-B Sigma^c deviates from the solver's Sigma^c(tau) by {:.4e} over the "
+                   "gap window and the largest off-diagonal, against a gate of {:.1f} x the "
+                   "W-fit reconstruction class ({:.4e}). Neither side applies a Fourier "
+                   "transform here, so this is a CONTRACTION error (prefactor, spin, "
+                   "q-star/trev rule, MO rotation, or the Gamma head), not a representation "
+                   "artefact. See notes/qm3_mode_a_loop_spec.md rev 2.",
+                   map_name, tau_dev_worst, qp_modea::modea_tau_anchor_mult,
+                   ctx->diag.rec_rel_worst);
+    if (false)
+      utils::check(anchor_worst < qp_modea::modea_anchor_gate,
+                   "qp_approx (mode_a): THE ANCHOR FAILED -- route-B Sigma^c deviates from the "
+                   "solver Sigma(i w_n) by {:.4e} (gate {:.1g}) over the gap window, against a "
+                   "W-fit reconstruction class of {:.4e}.\nIf the class is itself O(1) the W "
+                   "pole representation collapsed, which normally means the INCOMING QP "
+                   "spectrum already diverged -- check the previous iteration's inner-"
+                   "consistency numbers (this iteration: worst count {}, max|d eps| = {:.3e} "
+                   "a.u., min_den = {:.4e} a.u.).\nOtherwise this is a CONTRACTION ROUTING "
+                   "error (prefactor, spin, q-star/trev rule, MO rotation, or the Gamma head), "
+                   "not a tolerance to loosen. See notes/qm3_mode_a_loop_spec.md section 7(ii).",
+                   anchor_worst, qp_modea::modea_anchor_gate, anchor_expect, iters_worst,
+                   dmax_worst, min_den_worst);
   }
 }
 
@@ -200,7 +762,8 @@ void solve_qp_eqn(sArray_t<Array_view_3D_t> &sE_ska,
                   const sArray_t<Array_view_4D_t> &sVhf_skij,
                   const sArray_t<Array_view_4D_t> &sMO_skia,
                   double mu,
-                  const imag_axes_ft::IAFT &FT, qp_params_t &qp_params) {
+                  const imag_axes_ft::IAFT &FT, qp_params_t &qp_params,
+                  const qp_modea::modea_ctx *modea_ctx) {
   using math::shm::make_shared_array;
   using math::nda::make_distributed_array;
   using local_Array_4D_t = nda::array<ComplexType, 4>;
@@ -316,7 +879,83 @@ void solve_qp_eqn(sArray_t<Array_view_3D_t> &sE_ska,
     app_log(2, "  - processor grid for quasi-particle equation: (s, k, a) = ({}, {}, {})", 1, nkpools, np_a);
     app_log(2, "  - quasiparticle map:                          {} (Matsubara-native, no AC)", qp_params.qp_map);
     app_log(2, "  - positive fermionic nodes:                   {} (w0 = {:.6f}, w1 = {:.6f})", npos, wp(0), wp(1));
-    if (qp_params.qp_map == "mats_lin") {
+    if (qp_params.qp_map == "mode_a" or qp_params.qp_map == "mode_b") {
+
+    // ---- Project 2 increment QM3: the evGW diagonal leg (spec section 4) ----
+    // The QP equation E = Vhf + Sigma_ii(E) is solved by the EXISTING generic helpers; only
+    // the sampler changes. The functor bridges to the route-B closed form on the cached
+    // DIAGONAL residues (z = (w - mu) + mu is ABSOLUTE, the sigma_route_b mu rider).
+    utils::check(modea_ctx != nullptr and modea_ctx->active,
+                 "solve_qp_eqn: qp_map = \"mode_a\" reached the solver without an evaluator "
+                 "context (built in the live W window of add_evscf_vcorr).");
+    utils::check(modea_ctx->have_cd and modea_ctx->have_diag,
+                 "solve_qp_eqn: qp_map = \"mode_a\" on the evGW leg requires "
+                 "qp_modea_route = \"cd\" (the diagnostic \"expansion\" route has no "
+                 "diagonal residue data on this processor grid).");
+    utils::check(qp_params.qp_type == "sc" or qp_params.qp_type == "sc_bisection" or
+                 qp_params.qp_type == "sc_newton" or qp_params.qp_type == "linearized",
+                 "solve_qp_eqn: qp_map = \"mode_a\" supports qp_type in {{sc, sc_bisection, "
+                 "sc_newton, linearized}}; \"{}\" is AC-specific (it needs a spectral "
+                 "function, which route B does not produce).", qp_params.qp_type);
+    app_log(2, "  - route-B (CD) diagonal sampler:              nJ x npk = {} poles, "
+               "eta = {:.3g}", modea_ctx->nJ * modea_ctx->npk, modea_ctx->eta);
+    // GUARD, spec rev 3 addendum item 4 (measured, 2026-08-12). This leg is reached only by
+    // evGW (qp_mode = "evscf"); the qsGW leg goes through modea_run.
+    app_warning("solve_qp_eqn (qp_map = {}): THE evGW LEG IS KNOWN-INCOMPLETE AND "
+                "PATHOLOGICALLY SLOW -- measured >75 min per outer iteration on qe_lih222 "
+                "against ~7 s for the qsGW (qpscf) leg of the same fixture, __divdc3-bound: "
+                "the route-B diagonal sampler rebuilds the full nJ x npk = {} pole-weight "
+                "vector at EVERY secant/bisection step of EVERY (s,k,a). It is neither "
+                "optimized nor gated in this increment -- the live QM3 gates cover the qpscf "
+                "leg only (the evscf fixture cases are hidden behind [.modeb_evscf]). Results "
+                "from this path are diagnostic, not deliverable. See "
+                "notes/qm3_mode_a_loop_spec.md rev 3 addendum item 4.",
+                qp_params.qp_map, modea_ctx->nJ * modea_ctx->npk);
+
+    struct modea_diag_sampler {
+      const qp_modea::modea_ctx *ctx;
+      long nkpts_ = 0;
+      std::function<std::tuple<long,long,long>(size_t)> I_to;
+      mutable nda::array<ComplexType, 1> w;
+      ComplexType evaluate(ComplexType dz, long I) const {
+        auto [is, ik, ia] = I_to(size_t(I));
+        const ComplexType z = dz + ctx->mu;   // sigma_route_b: z ABSOLUTE
+        ctx->pole_weights(is, ik, z, w);
+        ComplexType s(0.0);
+        const long nP = ctx->nJ * ctx->npk;
+        for (long P = 0; P < nP; ++P) s += ctx->Mdiag(is, ik, ia, P) * w(P);
+        return s;
+      }
+    };
+    modea_diag_sampler S;
+    S.ctx = modea_ctx;
+    S.I_to = I_to_ska;
+    S.w = nda::array<ComplexType, 1>(modea_ctx->nJ * modea_ctx->npk);
+
+    double res;
+    bool conv;
+    long n_noconv_a = 0;
+    const double eta_a = qp_params.qp_modea_eta;
+    for (size_t I = 0; I < dim1; ++I) {
+      if (qp_params.qp_type == "linearized") {
+        E_loc_1D(I) = qp_eqn_linearized(Vhf_loc_1D(I).real(), S, I, mu, E_loc_1D(I).real(), eta_a);
+      } else if (qp_params.qp_type == "sc_newton") {
+        std::tie(E_loc_1D(I), res, conv) =
+            qp_eqn_secant(Vhf_loc_1D(I).real(), S, I, mu, E_loc_1D(I).real(), 400,
+                          qp_params.tol, eta_a);
+        if (!conv) ++n_noconv_a;
+      } else {
+        std::tie(E_loc_1D(I), res) =
+            qp_eqn_bisection(Vhf_loc_1D(I).real(), S, I, mu, E_loc_1D(I).real(),
+                             qp_params.tol, eta_a);
+      }
+    }
+    n_noconv_a = comm->all_reduce_value(n_noconv_a, std::plus<>{});
+    if (n_noconv_a > 0)
+      app_warning("solve_qp_eqn (mode_a): the qp equation did not converge on {} states.",
+                  n_noconv_a);
+
+    } else if (qp_params.qp_map == "mats_lin") {
       nda::array<ComplexType, 1> S2(2);
       for (size_t I = 0; I < dim1; ++I) {
         S2(0) = Sigma_loc_2D(widx[0], I);
@@ -449,15 +1088,23 @@ void add_evscf_vcorr(MBState &mb_state,
     mb_solver.corr->evaluate(mb_state, eri);
     FT.check_leakage(mb_state.sSigma_tskij.value(), imag_axes_ft::fermion, "Self-energy");
     mpi->comm.barrier();
-
-    // deallocate dynamically screened interaction if it is not fixed for the next iteration.
-    if (not fixed_w) {
-      mb_state.dW_qtPQ.reset();
-    }
   }
 
-  // Solve the QP equation to get new QP energies. 
-  solve_qp_eqn(sE_ska, mb_state.sSigma_tskij.value(), sHeff_skij, sMO_skia, mu, FT, qp_params);
+  // Project 2 increment QM3: the mode-A context must be built while dW is still alive
+  // (it is freed just below when keep_scr_coulomb_fixed is off). evGW needs the DIAGONAL
+  // residues replicated -- solve_qp_eqn distributes (s,k,a) on its own processor grid.
+  qp_modea::modea_ctx modea_ctx;
+  build_modea_ctx_if_needed(modea_ctx, mb_state, mb_solver, eri, sMO_skia, sE_ska, mu, FT,
+                            qp_params, true);
+
+  // deallocate dynamically screened interaction if it is not fixed for the next iteration.
+  if (not fixed_w) {
+    mb_state.dW_qtPQ.reset();
+  }
+
+  // Solve the QP equation to get new QP energies.
+  solve_qp_eqn(sE_ska, mb_state.sSigma_tskij.value(), sHeff_skij, sMO_skia, mu, FT, qp_params,
+               modea_ctx.active ? std::addressof(modea_ctx) : nullptr);
   mb_state.sG_tskij.reset();
   mb_state.sSigma_tskij.reset();
 
@@ -495,7 +1142,8 @@ auto qp_approx(const sArray_t<Array_view_5D_t> &sSigma_tskij,
                const sArray_t<Array_view_4D_t> &sMO_skia,
                const sArray_t<Array_view_3D_t> &sE_ska, double mu,
                const imag_axes_ft::IAFT &FT, qp_params_t &qp_params,
-               const sArray_t<Array_view_4D_t> *sHstat_skij)
+               const sArray_t<Array_view_4D_t> *sHstat_skij,
+               const qp_modea::modea_ctx *modea_ctx)
                -> sArray_t<Array_view_4D_t> {
   using math::shm::make_shared_array;
   using math::nda::make_distributed_array;
@@ -526,6 +1174,16 @@ auto qp_approx(const sArray_t<Array_view_5D_t> &sSigma_tskij,
   auto b_rng = dSigma_wskab.local_range(4);
   auto [nw_loc, ns_loc, nk_loc, na_loc, nb_loc] = dSigma_wskab.local_shape();
 
+  // Project 2 increment QM3: the tau-domain ORACLE for the anchor discrepancy needs the
+  // MO-basis Sigma^c(tau) BEFORE tau_to_w, i.e. the reference as the solver actually built
+  // it, with no fermionic transform applied. Only allocated for mode_a.
+  std::optional<sArray_t<Array_view_5D_t>> sSigma_tskab_shm;
+  if (qp_params.qp_map == "mode_a" or qp_params.qp_map == "mode_b") {
+    sSigma_tskab_shm.emplace(make_shared_array<Array_view_5D_t>(
+        *comm, *internode_comm, *node_comm, {nt, ns, nkpts, nbnd, nbnd}));
+    sSigma_tskab_shm->set_zero();
+  }
+
   // ------ basis transform from primary to MO basis ------
   {
     auto dSigma_tskab = make_distributed_array<local_Array_5D_t>(*comm, {1, 1, nkpools, np_a, np_b},
@@ -549,6 +1207,13 @@ auto qp_approx(const sArray_t<Array_view_5D_t> &sSigma_tskij,
           Sigma_tskab_loc(it, is_loc, ik_loc, nda::range::all, nda::range::all) = Sigma_ab;
         }
       }
+    }
+    if (sSigma_tskab_shm.has_value()) {
+      sSigma_tskab_shm->win().fence();
+      sSigma_tskab_shm->local()(nda::range::all, s_rng, k_rng, a_rng, b_rng) =
+          dSigma_tskab.local();
+      sSigma_tskab_shm->win().fence();
+      sSigma_tskab_shm->all_reduce();
     }
     FT.tau_to_w(dSigma_tskab.local(), dSigma_wskab.local(), imag_axes_ft::fermion);
   }
@@ -581,8 +1246,9 @@ auto qp_approx(const sArray_t<Array_view_5D_t> &sSigma_tskij,
   // (s,k), so gather the MO-basis Sigma(iw) tiles into a shared array (disjoint
   // writes + zeros-elsewhere all_reduce) and round-robin the blocks over ranks.
   utils::check(qp_params.qp_map == "mats_lin" or sHstat_skij != nullptr,
-               "qp_approx: qp_map = mats_gmatch needs the static Heff, which only the "
-               "qp-scf loop call path provides; use ac_pade or mats_lin here.");
+               "qp_approx: qp_map = {} needs the static Heff, which only the "
+               "qp-scf loop call path provides; use ac_pade or mats_lin here.",
+               qp_params.qp_map);
   auto sSigma_wskab = make_shared_array<Array_view_5D_t>(*comm, *internode_comm, *node_comm,
                                                          {nw, ns, nkpts, nbnd, nbnd});
   sSigma_wskab.set_zero();
@@ -602,9 +1268,24 @@ auto qp_approx(const sArray_t<Array_view_5D_t> &sSigma_tskij,
   app_log(2, "\n* Applying the Matsubara-native static map to Sigma(iw): ");
   app_log(2, "  - quasiparticle map:        {} (no AC)", qp_params.qp_map);
   app_log(2, "  - positive fermionic nodes: {} (w0 = {:.6f}, w1 = {:.6f})", npos, wp(0), wp(1));
+  if (qp_params.qp_map == "mode_a" or qp_params.qp_map == "mode_b")
+    app_log(2, "  - mode knobs:             route = {}, nconsist = {}, consist_tol = {:.1e}, "
+               "eta = {:.3g}, wsupp = {}, wfit = {}, wrtol = {:.2g}",
+            qp_params.qp_modea_route, qp_params.qp_modea_nconsist,
+            qp_params.qp_modea_consist_tol, qp_params.qp_modea_eta,
+            qp_params.qp_modea_wsupp, qp_params.qp_modea_wfit, qp_params.qp_modea_wrtol);
   sVcorr_skij.set_zero();
   sVcorr_skij.win().fence();
-  if (qp_params.qp_map == "mats_lin") {
+  if (qp_params.qp_map == "mode_a" or qp_params.qp_map == "mode_b") {
+
+  // ---- Project 2 increment QM3 (notes/qm3_mode_a_loop_spec.md): the MODE-A map ----
+  // V^xc_ab = 1/2 [ Sigma^c_ab(eps_a) + Sigma^c_ab(eps_b) ] with Sigma^c from the QM2
+  // contour-deformation kernel, driven to inner QP consistency at FIXED Sigma data. The
+  // Hermitize + MO -> primary tail below is the existing one, unchanged.
+  modea_run(sVcorr_skij, sSigma_wskab, sSigma_tskab_shm.value(), sMO_skia, sE_ska,
+            *sHstat_skij, wp, widx, mu, FT, qp_params.qp_map, modea_ctx, *comm);
+
+  } else if (qp_params.qp_map == "mats_lin") {
     nda::array<ComplexType, 3> S2(2, nbnd, nbnd);
     for (long sk = comm->rank(); sk < long(ns * nkpts); sk += comm->size()) {
       long is = sk / nkpts, ik = sk % nkpts;
@@ -751,10 +1432,17 @@ void add_qpscf_vcorr(MBState &mb_state,
   mb_solver.corr->evaluate(mb_state, eri);
   FT.check_leakage(mb_state.sSigma_tskij.value(), imag_axes_ft::fermion, "Self-energy");
 
+  // Project 2 increment QM3: build the mode-A evaluator context HERE -- this is the only
+  // window in which mb_state.dW_qtPQ is alive (it is reset below).
+  qp_modea::modea_ctx modea_ctx;
+  build_modea_ctx_if_needed(modea_ctx, mb_state, mb_solver, eri, sMO_skia, sE_ska, mu, FT,
+                            qp_params, false);
+
   // Add the correlation contribution to the QP Hamiltonian. At this point
   // sHeff_skij holds the static (H0 + HF) part only -- the map-(ii) reference.
   auto sVcorr_skij = qp_approx(mb_state.sSigma_tskij.value(),  sMO_skia, sE_ska, mu, FT, qp_params,
-                               std::addressof(sHeff_skij));
+                               std::addressof(sHeff_skij),
+                               modea_ctx.active ? std::addressof(modea_ctx) : nullptr);
   if (mpi->node_comm.root()) sHeff_skij.local() += sVcorr_skij.local();
   mpi->comm.barrier();
  
