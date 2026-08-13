@@ -110,6 +110,20 @@ struct qp_params_t {
   // 1e-4 -> (8.5e-3, 7.7e-1). The knob is the imaginary-accuracy vs real-axis-smoothness
   // trade-off; the production value is a spec decision, NOT an agent default.
   double qp_modea_wrtol = -1.0;
+
+  // W^c RESIDUE-SLAB COMPRESSION (stage 1b of wc_band_elements.hpp). Relative eigenvalue cut
+  // on each Hermitian residue slab W^(p)_PQ: the mode-A sandwich then costs r/Np of the dense
+  // Np^2 one, which is what makes the production (nbnd, Np) reachable -- see the flop model in
+  // that file's header. <= 0 disables the factorization and takes the dense reference path.
+  // The default is a numerical-noise cut, three orders below the W-fit reconstruction error
+  // that bounds the whole map's accuracy; the achieved rank AND the truncation residual of
+  // every (q,p) slab are logged, so this is never a silent accuracy change.
+  double qp_modea_wrank = 1e-10;
+  // factorization backend: 0 = automatic (LAPACK heev up to Np = 600, randomized Nystrom
+  // sketching above it), > 0 = force the sketch with that initial block size, < 0 = force
+  // heev. Exposed because the sketch is the production path but only the small fixtures can
+  // cross-check it against the exact one.
+  long qp_modea_wsketch = 0;
 };
 
 } // methods

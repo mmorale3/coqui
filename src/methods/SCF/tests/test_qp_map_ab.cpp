@@ -91,7 +91,7 @@ namespace bdft_tests {
                           int niter, double conv_tol,
                           const std::string &wfit = "tau",
                           const std::string &tag = "", double eta = 0.0,
-                          double wrtol = -1.0) {
+                          double wrtol = -1.0, double wrank = 1e-10, long wsketch = 0) {
       const std::string output = "qp_map_ab_" + map + "_" + mode + tag;
       solvers::hf_t hf;
       solvers::gw_t gw(&ft, "ignore_g0", output);
@@ -105,6 +105,8 @@ namespace bdft_tests {
       qp_params.qp_modea_wfit = wfit;
       qp_params.qp_modea_eta = eta;
       qp_params.qp_modea_wrtol = wrtol;
+      qp_params.qp_modea_wrank = wrank;
+      qp_params.qp_modea_wsketch = wsketch;
       qp_modea::last_run() = qp_modea::last_run_t{};
       iter_scf::iter_scf_t iter_sol(iter_scf::damp_t(0.7));
       MBState mb_state(mpi_context, ft, output);
@@ -530,6 +532,153 @@ namespace bdft_tests {
     auto row = run_map(mpi_context, mf, ft, "mode_a", "qpscf", 12, 1e-10, 1, 1e-6,
                        wfits[iw], "_cell" + std::to_string(cell), etas[ie], rtols[ir]);
     app_log(1, "@@CELLDONE {} gap = {:.6f} eV", cell, row.gap_eV());
+  }
+
+  /**
+   * ==========================================================================================
+   * MEASUREMENT (on hold, run explicitly): THE W^c SLAB LOW-RANK SCAN
+   * ==========================================================================================
+   * The mode-A context build is dominated by the (Np,Np)x(Np,nbnd) sandwich, whose cost is
+   * nqpts*nbnd*npk*8*Np*nbnd*(Np+nbnd) flops per owned (s,k) -- 1.2e14 at the production
+   * (nbnd 60, Np 2918, nq 8, npk 60), i.e. the measured ~45 min/iteration. Factoring each
+   * residue slab as W^(p) = V S V^dag and contracting through V makes that r/Np of the dense
+   * cost (wc_band_elements.hpp, stage 1b + the header's flop model).
+   *
+   * This case measures the two things that decision rests on, on a fixture small enough that
+   * the EXACT eigendecomposition is affordable:
+   *   (i)   the eigenvalue decay of the slabs -- the "rank ladder" line of every context
+   *         build reports max/mean rank at |lambda| >= {1e-2 ... 1e-10} * max|lambda|;
+   *   (ii)  the gap moved by the truncation, against the dense reference path (wrank <= 0),
+   *         and the agreement of the RANDOMIZED backend (the production one, which the
+   *         gates cannot reach because they run below detail::wslab_dense_max) with the
+   *         exact one at the same tolerance.
+   *
+   *     KMP_DUPLICATE_LIB_OK=TRUE OMP_NUM_THREADS=1 \
+   *       <build>/tests/bin/test_methods_qp_map_ab "qp_map_modea_wrank_scan"
+   */
+  TEST_CASE("qp_map_modea_wrank_scan", "[.modea_hold]") {
+    using namespace qp_map_ab_detail;
+    auto& mpi_context = utils::make_unit_test_mpi_context();
+    imag_axes_ft::IAFT ft(1000.0, 1.2, imag_axes_ft::dlr_basis);
+    auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_lih222"));
+
+    // cell 1 isolates the two accuracy effects of the factored path: it truncates nothing
+    // (r ~ Np) but still replaces each slab by its Hermitian part, so cell1 - cell0 is the
+    // HERMITIZATION alone and cell2 - cell1 is the truncation alone.
+    struct cell { const char *name; double wrank; long wsketch; };
+    const std::vector<cell> cells = {
+        {"dense reference (wrank = 0)", 0.0, 0},
+        {"hermitize only (wrank = 1e-14)", 1e-14, -1},
+        {"exact heev,  wrank = 1e-10", 1e-10, -1},
+        {"exact heev,  wrank = 1e-8", 1e-8, -1},
+        {"sketch 32 -> heev fallback", 1e-10, 32},
+    };
+    // NOT a cell: wrank = 1e-4 ABORTS (measured) -- the tau anchor of qp_approx fires at
+    // 3.6e-1 against its 10 x 4.4e-3 gate. That is the intended interlock: an over-aggressive
+    // slab truncation is a CONTRACTION error to the anchor, and it stops the run rather than
+    // quietly shifting the spectrum. The knob cannot silently buy speed with accuracy.
+    std::vector<ab_row> rows;
+    for (size_t c = 0; c < cells.size(); ++c) {
+      app_log(1, "\n@@WRANK cell {}: {}", c, cells[c].name);
+      rows.push_back(run_map(mpi_context, mf, ft, "mode_a", "qpscf", 12, 1e-10, 20, 1e-6,
+                             "tau", "_wrank" + std::to_string(c), 0.0, -1.0,
+                             cells[c].wrank, cells[c].wsketch));
+    }
+    app_log(1, "\n  W^c slab low-rank scan (qe_lih222 / mode_a / qpscf), Np = {}:",
+            rows[0].lr.Np);
+    app_log(1, "  {:<30} {:>10} {:>12} {:>8} {:>9} {:>10} {:>9} {:>9}",
+            "cell", "gap (eV)", "d vs dense", "max r", "mean r", "worst res", "t_fac", "t_sand");
+    for (size_t c = 0; c < cells.size(); ++c)
+      app_log(1, "  {:<30} {:>10.6f} {:>12.2e} {:>8} {:>9.2f} {:>10.2e} {:>8.2f}s {:>8.2f}s",
+              cells[c].name, rows[c].gap_eV(), rows[c].gap_eV() - rows[0].gap_eV(),
+              rows[c].lr.wrank_max, rows[c].lr.wrank_mean, rows[c].lr.wtrunc,
+              rows[c].lr.t_fac, rows[c].lr.t_sand);
+    // the DEFAULT cut (cell 2) must not move the gap at the resolution the QM3 gates compare at
+    REQUIRE(std::abs(rows[2].gap_eV() - rows[0].gap_eV()) < 1e-6);
+    // ... and neither may the Hermitization on its own (cell 1)
+    REQUIRE(std::abs(rows[1].gap_eV() - rows[0].gap_eV()) < 1e-6);
+  }
+
+  /**
+   * ==========================================================================================
+   * MEASUREMENT (on hold, run explicitly): THE RANDOMIZED BACKEND AGAINST THE EXACT ONE
+   * ==========================================================================================
+   * detail::wslab_factorize takes LAPACK heev up to Np = 600 and the randomized Nystrom
+   * sketch above it, so the PRODUCTION backend is the one no fixture reaches by default.
+   * Forcing the sketch on a fixture is only meaningful where it can actually resolve the
+   * tail: the sketch doubles and then gives up to heev once 2l > Np, and at wrank = 1e-10
+   * the fixture rank (~135 of 192) is above that ceiling, so the cut is loosened here until
+   * the retained rank (~72 mean / 86 max of 192) is inside it -- the backend then reports
+   * "mixed", the slabs that fit being sketched and the rest falling back. 1e-6 is as loose as
+   * this can go: at 1e-4 the tau anchor of qp_approx aborts the run (measured). One outer
+   * iteration -- this compares two factorizations of the SAME W, not converged solutions.
+   *
+   *     KMP_DUPLICATE_LIB_OK=TRUE OMP_NUM_THREADS=1 \
+   *       <build>/tests/bin/test_methods_qp_map_ab "qp_map_modea_sketch_check"
+   */
+  TEST_CASE("qp_map_modea_sketch_check", "[.modea_hold]") {
+    using namespace qp_map_ab_detail;
+    auto& mpi_context = utils::make_unit_test_mpi_context();
+    imag_axes_ft::IAFT ft(1000.0, 1.2, imag_axes_ft::dlr_basis);
+    auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_lih222"));
+    auto ex = run_map(mpi_context, mf, ft, "mode_a", "qpscf", 12, 1e-10, 1, 1e-6,
+                      "tau", "_skx", 0.0, -1.0, 1e-6, -1);
+    auto rd = run_map(mpi_context, mf, ft, "mode_a", "qpscf", 12, 1e-10, 1, 1e-6,
+                      "tau", "_skr", 0.0, -1.0, 1e-6, 32);
+    app_log(1, "\n  W^c slab factorization backends at wrank = 1e-6 (qe_lih222, 1 iteration):");
+    app_log(1, "  {:<14} {:>12} {:>8} {:>10} {:>12}", "backend", "gap (eV)", "max r",
+            "mean r", "worst res");
+    app_log(1, "  {:<14} {:>12.6f} {:>8} {:>10.2f} {:>12.2e}", "exact heev", ex.gap_eV(),
+            ex.lr.wrank_max, ex.lr.wrank_mean, ex.lr.wtrunc);
+    app_log(1, "  {:<14} {:>12.6f} {:>8} {:>10.2f} {:>12.2e}", "randomized", rd.gap_eV(),
+            rd.lr.wrank_max, rd.lr.wrank_mean, rd.lr.wtrunc);
+    app_log(1, "  gap difference between backends = {:.3e} eV", rd.gap_eV() - ex.gap_eV());
+    // the sketch must find the same dominant subspace, well inside the cut it was given
+    REQUIRE(std::abs(rd.gap_eV() - ex.gap_eV()) < 1e-3);
+    REQUIRE(rd.lr.wrank_max > 0);
+  }
+
+  /**
+   * ==========================================================================================
+   * MEASUREMENT (on hold, run explicitly): DOES THE SLAB RANK SATURATE WITH Np?
+   * ==========================================================================================
+   * THE question for the production sizes. The low-rank sandwich costs r/Np of the dense one,
+   * so the compression that matters is not r/Np at the fixture's Np -- it is whether r is set
+   * by the PHYSICS (a fixed number of screening modes per pole, so r/Np falls as 1/Np and the
+   * Np = 2918 production case wins by ~Np/r) or by the BASIS (r proportional to Np, so the
+   * ratio is frozen at whatever the fixture shows and kp444 needs a different idea).
+   *
+   * Same cell, same everything, ONE outer iteration, THC prefactor swept: Np = 8/12/18/24
+   * times nbnd. Only the auxiliary basis changes, so any growth of r with Np is basis-driven.
+   *
+   *     KMP_DUPLICATE_LIB_OK=TRUE OMP_NUM_THREADS=1 \
+   *       <build>/tests/bin/test_methods_qp_map_ab "qp_map_modea_np_scan"
+   */
+  TEST_CASE("qp_map_modea_np_scan", "[.modea_hold]") {
+    using namespace qp_map_ab_detail;
+    auto& mpi_context = utils::make_unit_test_mpi_context();
+    imag_axes_ft::IAFT ft(1000.0, 1.2, imag_axes_ft::dlr_basis);
+    auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_lih222"));
+
+    const std::vector<int> prefs = {6, 12, 18, 24};
+    std::vector<ab_row> rows;
+    for (size_t c = 0; c < prefs.size(); ++c) {
+      app_log(1, "\n@@NPSCAN cell {}: thc prefactor {} (Np = {} x nbnd)", c, prefs[c], prefs[c]);
+      rows.push_back(run_map(mpi_context, mf, ft, "mode_a", "qpscf", prefs[c], 1e-10, 1, 1e-6,
+                             "tau", "_np" + std::to_string(c), 0.0, -1.0, 1e-8, -1));
+    }
+    app_log(1, "\n  W^c slab rank vs THC basis size (qe_lih222 / mode_a, 1 outer iteration).");
+    app_log(1, "  mean retained rank over the (q,p) slabs, and r/Np, at each tolerance:");
+    app_log(1, "  {:>6} {:>26} {:>26} {:>26} {:>26}", "Np", "1e-4", "1e-6", "1e-8", "1e-10");
+    for (size_t c = 0; c < prefs.size(); ++c) {
+      std::string line = std::format("  {:>6}", rows[c].lr.Np);
+      for (int t = 1; t < 5; ++t)
+        line += std::format(" {:>12.1f} (r/Np {:>6.3f})", rows[c].lr.lad_mean[t],
+                            rows[c].lr.lad_mean[t] / double(std::max(rows[c].lr.Np, 1L)));
+      app_log(1, "{}", line);
+    }
+    app_log(1, "  [if the mean rank is FLAT down the columns the compression scales as 1/Np "
+               "and the production Np = 2918 wins by ~Np/r; if r/Np is flat it does not.]");
   }
 
   /**

@@ -86,6 +86,8 @@ namespace {
     opts.wsupp = qp_params.qp_modea_wsupp;
     opts.wfit = qp_params.qp_modea_wfit;
     opts.wrtol = qp_params.qp_modea_wrtol;
+    opts.wrank = qp_params.qp_modea_wrank;
+    opts.wsketch = qp_params.qp_modea_wsketch;
     opts.iter = 1;
     std::string div = "ignore_g0";
     if constexpr (requires { mb_solver.corr->iter(); })
@@ -503,12 +505,16 @@ namespace {
     // ONE machine-greppable line per outer iteration: the knob-matrix harness scrapes this.
     app_log(1, "@@MODEA_CELL wfit={} wrtol={:.1e} eta={:.4e} | ratio={:.4e} rec={:.4e} "
                "gapedge={:.6g} npk={} | dmax={:.4e} iters={} minden={:.4e} anchor={:.4e} "
-               "antiherm={:.4e} taudev={:.4e} | dIN={:.4e} clIN={:.4e} rIN={:.4e}",
+               "antiherm={:.4e} taudev={:.4e} | dIN={:.4e} clIN={:.4e} rIN={:.4e} | "
+               "wrank={:.1e} Np={} rmax={} rmean={:.2f} wtrunc={:.3e} "
+               "tfit={:.2f} tfac={:.2f} tsand={:.2f}",
             ctx->opts.wfit, ctx->diag.gap_edge > -1 ? qp_modea::last_run().wrtol : -1.0,
             ctx->eta, ctx->diag.res_ratio_worst, ctx->diag.rec_rel_worst,
             ctx->diag.gap_edge, ctx->npk, dmax_worst, iters_worst, min_den_worst,
             anchor_worst, anti_worst, tau_dev_worst, delta_in_worst, class_in_worst,
-            ratio_in_worst);
+            ratio_in_worst, ctx->opts.wrank, qp_modea::last_run().Np,
+            ctx->diag.wrank_max, ctx->diag.wrank_mean, ctx->diag.wtrunc_worst,
+            ctx->diag.t_fit, ctx->diag.t_fac, ctx->diag.t_sand);
     if (n_noconv > 0)
       app_warning("qp_approx (mode_a): the inner QP-consistency loop hit the cap ({}) on {} "
                   "(s,k) blocks with max|d eps| = {:.3e}. This is the physical "
@@ -1270,10 +1276,12 @@ auto qp_approx(const sArray_t<Array_view_5D_t> &sSigma_tskij,
   app_log(2, "  - positive fermionic nodes: {} (w0 = {:.6f}, w1 = {:.6f})", npos, wp(0), wp(1));
   if (qp_params.qp_map == "mode_a" or qp_params.qp_map == "mode_b")
     app_log(2, "  - mode knobs:             route = {}, nconsist = {}, consist_tol = {:.1e}, "
-               "eta = {:.3g}, wsupp = {}, wfit = {}, wrtol = {:.2g}",
+               "eta = {:.3g}, wsupp = {}, wfit = {}, wrtol = {:.2g}, wrank = {:.2g}, "
+               "wsketch = {}",
             qp_params.qp_modea_route, qp_params.qp_modea_nconsist,
             qp_params.qp_modea_consist_tol, qp_params.qp_modea_eta,
-            qp_params.qp_modea_wsupp, qp_params.qp_modea_wfit, qp_params.qp_modea_wrtol);
+            qp_params.qp_modea_wsupp, qp_params.qp_modea_wfit, qp_params.qp_modea_wrtol,
+            qp_params.qp_modea_wrank, qp_params.qp_modea_wsketch);
   sVcorr_skij.set_zero();
   sVcorr_skij.win().fence();
   if (qp_params.qp_map == "mode_a" or qp_params.qp_map == "mode_b") {

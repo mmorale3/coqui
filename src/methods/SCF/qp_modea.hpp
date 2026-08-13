@@ -170,6 +170,13 @@ namespace qp_modea {
     std::string wsupp = "auto";        // {"auto","off",<value in a.u.>}
     std::string wfit = "tau";          // {tau, nu}
     double wrtol = -1.0;               // masked-fit SVD cut; < 0 = the shared doctrine value
+    // W^c residue-slab compression (stage 1b of wc_band_elements.hpp). wrank is a RELATIVE
+    // eigenvalue cut on each Hermitian slab W^(p)_PQ: <= 0 disables the factorization and
+    // takes the dense Np^2 sandwich (the reference path). wsketch selects the factorization
+    // backend: 0 = automatic, > 0 = force the randomized sketch with that initial size,
+    // < 0 = force LAPACK heev.
+    double wrank = 1e-10;
+    long wsketch = 0;
     long iter = 1;                     // outer iteration (1 => Route-A root refinement)
     int level = 2;                     // logging level for the per-iteration banner
   };
@@ -203,6 +210,18 @@ namespace qp_modea {
     bool converged_inner = false;  // every block's inner-consistency loop met consist_tol
     long iters = 0, n_support = 0, np_total = 0, nJ = 0, npk = 0;
     std::string wfit;
+    // stage-1b (low-rank W^c slabs), last context build
+    double wrank = 0.0;            // the knob value in force
+    long wrank_max = 0;            // worst retained rank over (q,p)
+    double wrank_mean = 0.0;       // mean retained rank over (q,p)
+    double wtrunc = 0.0;           // worst 2-norm truncation residual over (q,p)
+    double t_fit = 0.0, t_fac = 0.0, t_sand = 0.0;   // context-build stage wall times
+    long Np = 0;                   // THC auxiliary basis size (the compression denominator)
+    // the slab rank ladder: max / mean retained rank over (q,p) at the FIXED tolerances
+    // detail::wrank_ladder = {1e-2, 1e-4, 1e-6, 1e-8, 1e-10}. THE low-rank measurement --
+    // whether r saturates with Np decides whether this compression reaches production.
+    std::array<long, 5> lad_max{};
+    std::array<double, 5> lad_mean{};
   };
   inline last_run_t &last_run() { static last_run_t x; return x; }
 
@@ -233,6 +252,13 @@ namespace qp_modea {
     double wall_s = 0.0;               // context build wall time
     double mem_mb = 0.0;               // peak extra memory (per rank, residue slabs + buffers)
     long nJ = 0, npk = 0;
+    // stage-1b (low-rank W^c slabs) census + the per-stage wall clock
+    long wrank_max = 0;                // worst retained rank over (q,p)
+    double wrank_mean = 0.0;           // mean retained rank over (q,p)
+    double wtrunc_worst = 0.0;         // worst |discarded lambda| / max|lambda| over (q,p)
+    double wtrunc_frob_worst = 0.0;    // worst Frobenius-relative discarded weight
+    double wanti_worst = 0.0;          // worst max|W - W^dag| / max|W| of a residue slab
+    double t_fit = 0.0, t_fac = 0.0, t_sand = 0.0;
   };
 
   /**
