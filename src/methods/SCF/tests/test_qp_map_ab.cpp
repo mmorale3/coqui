@@ -91,7 +91,8 @@ namespace bdft_tests {
                           int niter, double conv_tol,
                           const std::string &wfit = "tau",
                           const std::string &tag = "", double eta = 0.0,
-                          double wrtol = -1.0, double wrank = 1e-10, long wsketch = 0) {
+                          double wrtol = -1.0, double wrank = 1e-10, long wsketch = 0,
+                          double eta_far = 0.0, bool gate = true) {
       const std::string output = "qp_map_ab_" + map + "_" + mode + tag;
       solvers::hf_t hf;
       solvers::gw_t gw(&ft, "ignore_g0", output);
@@ -104,6 +105,7 @@ namespace bdft_tests {
       qp_params.qp_map = map;
       qp_params.qp_modea_wfit = wfit;
       qp_params.qp_modea_eta = eta;
+      qp_params.qp_modea_eta_far = eta_far;      // spec rev 4; 0 = the rev-3.1 mu fallback
       qp_params.qp_modea_wrtol = wrtol;
       qp_params.qp_modea_wrank = wrank;
       qp_params.qp_modea_wsketch = wsketch;
@@ -192,19 +194,27 @@ namespace bdft_tests {
                 map, tag, L.wfit, L.gap_edge, L.gap_edge * HA2EV, L.n_support, L.np_total,
                 L.nJ, L.npk, L.wall_s, L.mem_mb);
         REQUIRE(L.tau_dev >= 0.0);
-        // THE GATE (spec rev 2) -- tau domain, not tunable
-        REQUIRE(L.tau_dev < qp_modea::modea_tau_anchor_mult * L.anchor_expect);
+        // THE GATE (spec rev 2) -- tau domain, not tunable. `gate = false` is used ONLY by the
+        // hidden measurement harnesses, whose point is to REPORT a cell that misbehaves (a
+        // REQUIRE there aborts the case and loses the rest of the table); every live case
+        // leaves it true. The driver's own tau-anchor check still aborts the process, so this
+        // cannot hide a contraction error.
+        if (gate) REQUIRE(L.tau_dev < qp_modea::modea_tau_anchor_mult * L.anchor_expect);
       }
       if (map == "mode_a") {
         auto const &L = row.lr;
         // THE STRIP-CLAMP CENSUS of the LAST outer iteration (rev 3 addendum item 2) and the
         // inner-consistency convergence that the clamp is there to restore.
-        app_log(1, "@@CLAMPCENSUS [{}{}] clamped {} of {} evaluation energies ({} in the gap "
-                   "window) over {} (s,k) blocks; per-k HOMO clamped in {} blocks, LUMO in "
-                   "{}; inner consistency: {} sweeps, max|d eps| = {:.4e} a.u. ({})",
+        app_log(1, "@@CLAMPCENSUS [{}{}] out of strip {} of {} evaluation energies ({} in the "
+                   "gap window) over {} (s,k) blocks; per-k HOMO out of strip in {} blocks, "
+                   "LUMO in {}; inner consistency: {} sweeps, max|d eps| = {:.4e} a.u. ({}); "
+                   "rev4: etafar = {:.4e} a.u., eta-evaluated {} (mu-clamped {}), "
+                   "max|Im Sigma| off strip = {:.4e} a.u., in-strip anti-herm = {:.3e}, "
+                   "pole spacing = {:.4e} a.u.",
                 map, tag, L.n_clamp, L.n_eval, L.n_clamp_win, L.n_blocks, L.n_homo_clamp,
                 L.n_lumo_clamp, L.iters, L.dmax,
-                L.converged_inner ? "converged" : "HIT THE CAP");
+                L.converged_inner ? "converged" : "HIT THE CAP",
+                L.eta_far, L.n_eta, L.n_clamp - L.n_eta, L.im_off, L.anti_in, L.spacing);
         // (i) of gate QM3-b: THE LOOP MUST CONVERGE. The rev-1 failure mode was
         // max|d eps| ~ 1e4-1e5 a.u. and the strip-BOUNDARY reading gave 2.4e+04; with the
         // clamp to mu every evaluation is bounded.
@@ -217,12 +227,14 @@ namespace bdft_tests {
         // Requiring the flag would gate on the knob; requiring 1e-6 a.u. (0.027 meV) gates
         // on the physics and still fails the boundary pathology by ten orders. The flag is
         // logged above and the driver warns on it every outer iteration.
-        REQUIRE(std::isfinite(L.dmax));
-        REQUIRE(L.dmax < 1e-6);
-        // the census must be self-consistent (a nonzero count with no evaluations would mean
-        // the census never ran, i.e. a vacuous check)
-        REQUIRE(L.n_eval > 0);
-        REQUIRE(L.n_blocks > 0);
+        if (gate) {
+          REQUIRE(std::isfinite(L.dmax));
+          REQUIRE(L.dmax < 1e-6);
+          // the census must be self-consistent (a nonzero count with no evaluations would mean
+          // the census never ran, i.e. a vacuous check)
+          REQUIRE(L.n_eval > 0);
+          REQUIRE(L.n_blocks > 0);
+        }
       }
       return row;
     }
@@ -490,6 +502,115 @@ namespace bdft_tests {
              run_map(mpi_context, mf, ft, "mode_b", "evscf", 12, 1e-10, 20, 1e-6,
                      wfit, "_lih_e_" + cfg, 0.0, wrtol));
     }
+  }
+
+  /**
+   * ==========================================================================================
+   * GATE (spec rev 4): THE eta_far = 0 BIT-IDENTITY
+   * ==========================================================================================
+   * Rev 4 adds the graded-eta far-state evaluation (qp_modea_eta_far). Its DEFAULT is 0, which
+   * must reproduce the rev-3.1 mu fallback exactly -- the whole increment is then a no-op on
+   * every stored number. THAT is what this case gates, and only that: the four converged gaps
+   * of the tree at 690ade1, with eta_far passed EXPLICITLY as 0 so the plumbing (params ->
+   * opts -> ctx -> strip_t::zeval) is exercised rather than bypassed.
+   *
+   *   fixture        map      gap (eV) at 690ade1
+   *   qe_lih222      mode_a   11.856870
+   *   qe_lih222      mode_b   11.853654
+   *   pyscf_si222    mode_a    9.257495
+   *   pyscf_si222    mode_b    9.261511
+   *
+   * Tolerance 1e-5 eV: the references are quoted to 1e-6 eV, and the failure this guards
+   * against (an out-of-strip state silently evaluated at eps instead of mu) moves the gap by
+   * O(0.1-1 eV) or diverges the loop. The eta_far > 0 cells are a MEASUREMENT, not a gate --
+   * they live in [.etafar_scan] below.
+   */
+  TEST_CASE("qp_map_etafar_identity", "[methods][qpgw][qp_map_ab][etafar]") {
+    using namespace qp_map_ab_detail;
+    auto& mpi_context = utils::make_unit_test_mpi_context();
+    imag_axes_ft::IAFT ft(1000.0, 1.2, imag_axes_ft::dlr_basis);
+    constexpr double tol = 1e-5;   // eV
+
+    auto check = [&](std::string const &fix, std::string const &map, double gap, double ref) {
+      app_log(1, "@@ETAFAR0 [{}/{}] gap = {:.6f} eV, reference (690ade1) = {:.6f} eV, "
+                 "d = {:+.2e} eV", fix, map, gap, ref, gap - ref);
+      REQUIRE(std::abs(gap - ref) < tol);
+    };
+    {
+      auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_lih222"));
+      auto ra = run_map(mpi_context, mf, ft, "mode_a", "qpscf", 12, 1e-10, 20, 1e-6,
+                        "tau", "_ef0a", 0.0, -1.0, 1e-10, 0, 0.0);
+      check("qe_lih222", "mode_a", ra.gap_eV(), 11.856870);
+      REQUIRE(ra.lr.n_eta == 0);
+      auto rb = run_map(mpi_context, mf, ft, "mode_b", "qpscf", 12, 1e-10, 20, 1e-6,
+                        "tau", "_ef0b", 0.0, -1.0, 1e-10, 0, 0.0);
+      check("qe_lih222", "mode_b", rb.gap_eV(), 11.853654);
+    }
+    {
+      auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "pyscf_si222"));
+      auto ra = run_map(mpi_context, mf, ft, "mode_a", "qpscf", 10, 1e-8, 12, 1e-5,
+                        "tau", "_ef0a", 0.0, -1.0, 1e-10, 0, 0.0);
+      check("pyscf_si222", "mode_a", ra.gap_eV(), 9.257495);
+      REQUIRE(ra.lr.n_eta == 0);
+      auto rb = run_map(mpi_context, mf, ft, "mode_b", "qpscf", 10, 1e-8, 12, 1e-5,
+                        "tau", "_ef0b", 0.0, -1.0, 1e-10, 0, 0.0);
+      check("pyscf_si222", "mode_b", rb.gap_eV(), 9.261511);
+    }
+  }
+
+  /**
+   * ==========================================================================================
+   * MEASUREMENT (hidden, run explicitly): THE eta_far SCAN of spec rev 4
+   * ==========================================================================================
+   * eta_far in {0, 1.8e-3, 3.7e-3, 7.3e-3} a.u. (= 0, 0.05, 0.1, 0.2 eV), full loops, both
+   * maps. Reports convergence, the final gap and its drift vs eta_far, the tau anchor, the
+   * IN-STRIP anti-Hermitian residual, max|Im Sigma| off strip, the measured pole spacing and
+   * the out-of-strip census. On these fixtures the gaps are huge and few states sit near the
+   * strip boundary, so little movement is EXPECTED -- the real target is the kp222 judge
+   * rerun. One section per (fixture, map); run them one at a time:
+   *
+   *     KMP_DUPLICATE_LIB_OK=TRUE OMP_NUM_THREADS=1 \
+   *       <build>/tests/bin/test_methods_qp_map_ab "qp_map_etafar_scan" -c lih222_mode_a
+   */
+  TEST_CASE("qp_map_etafar_scan", "[.etafar_scan]") {
+    using namespace qp_map_ab_detail;
+    auto& mpi_context = utils::make_unit_test_mpi_context();
+    imag_axes_ft::IAFT ft(1000.0, 1.2, imag_axes_ft::dlr_basis);
+    const std::vector<double> etas = {0.0, 1.8e-3, 3.7e-3, 7.3e-3};
+
+    auto scan = [&](std::string const &fixture, std::string const &map, int pref, double thc_tol,
+                    int niter, double conv_tol) {
+      auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, fixture));
+      std::vector<ab_row> rows;
+      for (size_t c = 0; c < etas.size(); ++c) {
+        app_log(1, "\n@@ETAFAR cell {}: {} / {} / eta_far = {:.4e} a.u. ({:.4g} eV)",
+                c, fixture, map, etas[c], etas[c] * HA2EV);
+        rows.push_back(run_map(mpi_context, mf, ft, map, "qpscf", pref, thc_tol, niter,
+                               conv_tol, "tau", "_ef" + std::to_string(c), 0.0, -1.0, 1e-10,
+                               0, etas[c], false));
+      }
+      app_log(1, "\n== rev-4 eta_far scan: {} / {} ==", fixture, map);
+      app_log(1, "{:>12} {:>10} {:>12} {:>12} {:>10} {:>10} {:>7} {:>11} {:>11} {:>11} {:>11}",
+              "eta_far (eV)", "gap (eV)", "d vs eta=0", "outer conv", "inner dmax", "taudev",
+              "n_eta", "antiherm", "im_off", "spacing", "eta/spacing");
+      for (size_t c = 0; c < rows.size(); ++c) {
+        auto const &L = rows[c].lr;
+        app_log(1, "{:>12.4g} {:>10.6f} {:>12.2e} {:>12} {:>10.2e} {:>10.2e} {:>7} {:>11.3e} "
+                   "{:>11.3e} {:>11.3e} {:>11.3g}",
+                etas[c] * HA2EV, rows[c].gap_eV(), rows[c].gap_eV() - rows[0].gap_eV(),
+                (rows[c].final_iter < rows[c].niter ? "yes" : "NO (cap)"), L.dmax, L.tau_dev,
+                L.n_eta, L.anti_herm, L.im_off, L.spacing,
+                (L.spacing > 0.0 ? etas[c] / L.spacing : 0.0));
+      }
+      app_log(1, "  [out-of-strip census of the last iteration: {} of {} evaluations, per-k "
+                 "HOMO in {} blocks, LUMO in {}]", rows.back().lr.n_clamp,
+              rows.back().lr.n_eval, rows.back().lr.n_homo_clamp, rows.back().lr.n_lumo_clamp);
+    };
+
+    SECTION("lih222_mode_a") { scan("qe_lih222", "mode_a", 12, 1e-10, 20, 1e-6); }
+    SECTION("lih222_mode_b") { scan("qe_lih222", "mode_b", 12, 1e-10, 20, 1e-6); }
+    SECTION("si222_mode_a")  { scan("pyscf_si222", "mode_a", 10, 1e-8, 12, 1e-5); }
+    SECTION("si222_mode_b")  { scan("pyscf_si222", "mode_b", 10, 1e-8, 12, 1e-5); }
   }
 
   /**

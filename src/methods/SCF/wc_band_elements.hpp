@@ -341,6 +341,7 @@ namespace qp_modea {
     ctx.beta = FT.beta();
     ctx.mu = mu;
     ctx.eta = opts.eta;
+    ctx.eta_far = opts.eta_far;
     ctx.ns = ns;
     ctx.nk = nk_ibz;
     ctx.nbnd = nbnd;

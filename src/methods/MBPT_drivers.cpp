@@ -641,6 +641,10 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     qp_params.qp_modea_consist_tol = io::get_value_with_default<double>(pt,"qp_modea_consist_tol",1e-8);
     utils::check(qp_params.qp_modea_consist_tol > 0.0, "evgw: qp_modea_consist_tol must be > 0.");
     qp_params.qp_modea_eta = io::get_value_with_default<double>(pt,"qp_modea_eta",0.0);
+    // spec rev 4: out-of-strip evaluation at eps + i*eta_far (0 = the rev-3.1 mu fallback).
+    qp_params.qp_modea_eta_far = io::get_value_with_default<double>(pt,"qp_modea_eta_far",0.0);
+    utils::check(qp_params.qp_modea_eta_far >= 0.0,
+                 "evgw: qp_modea_eta_far must be >= 0 (0 = the mu fallback of spec rev 3.1).");
     qp_params.qp_modea_wsupp = io::get_value_with_default<std::string>(pt,"qp_modea_wsupp","auto");
     io::tolower(qp_params.qp_modea_wsupp);
     qp_params.qp_modea_wfit = io::get_value_with_default<std::string>(pt,"qp_modea_wfit","tau");
@@ -700,6 +704,10 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     qp_params.qp_modea_consist_tol = io::get_value_with_default<double>(pt,"qp_modea_consist_tol",1e-8);
     utils::check(qp_params.qp_modea_consist_tol > 0.0, "qpgw: qp_modea_consist_tol must be > 0.");
     qp_params.qp_modea_eta = io::get_value_with_default<double>(pt,"qp_modea_eta",0.0);
+    // spec rev 4: out-of-strip evaluation at eps + i*eta_far (0 = the rev-3.1 mu fallback).
+    qp_params.qp_modea_eta_far = io::get_value_with_default<double>(pt,"qp_modea_eta_far",0.0);
+    utils::check(qp_params.qp_modea_eta_far >= 0.0,
+                 "qpgw: qp_modea_eta_far must be >= 0 (0 = the mu fallback of spec rev 3.1).");
     qp_params.qp_modea_wsupp = io::get_value_with_default<std::string>(pt,"qp_modea_wsupp","auto");
     io::tolower(qp_params.qp_modea_wsupp);
     qp_params.qp_modea_wfit = io::get_value_with_default<std::string>(pt,"qp_modea_wfit","tau");

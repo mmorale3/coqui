@@ -167,6 +167,7 @@ namespace qp_modea {
     long nconsist = 5;                 // inner-consistency cap
     double consist_tol = 1e-8;         // a.u.
     double eta = 0.0;                  // evaluation offset i*eta (stress only)
+    double eta_far = 0.0;              // rev 4: OUT-OF-STRIP offset i*eta_far (0 = mu fallback)
     std::string wsupp = "auto";        // {"auto","off",<value in a.u.>}
     std::string wfit = "tau";          // {tau, nu}
     double wrtol = -1.0;               // masked-fit SVD cut; < 0 = the shared doctrine value
@@ -202,8 +203,14 @@ namespace qp_modea {
     double tau_dev = -1.0;         // THE GATE quantity (spec rev 2)
     long n_fallback = 0;           // mode_b diagonal states demoted to z = mu
     // mode_a STRIP CLAMP census (rev 3 addendum item 2), last outer iteration, last sweep:
-    long n_clamp = 0;              // evaluation energies clamped to mu (out-of-strip states)
+    long n_clamp = 0;              // evaluation energies OUT OF STRIP (mu-fallback or eta_far)
     long n_clamp_win = 0;          // ... of which are gap-window states
+    // rev 4 (graded-eta far-state evaluation):
+    double eta_far = 0.0;          // the knob in force, a.u.
+    long n_eta = 0;                // out-of-strip evaluations taken at eps + i*eta_far
+    double im_off = 0.0;           // max|Im Sigma^c| over those (PHYSICS, never an error)
+    double anti_in = -1.0;         // max|V - V^dag|/max|V| over IN-STRIP elements only
+    double spacing = 0.0;          // worst local fitted-pole spacing at an eta evaluation
     long n_homo_clamp = 0;         // (s,k) blocks whose per-k HOMO was clamped -- THE JUDGE
     long n_lumo_clamp = 0;         // (s,k) blocks whose per-k LUMO was clamped -- THE JUDGE
     long n_eval = 0, n_blocks = 0;
@@ -268,7 +275,7 @@ namespace qp_modea {
   struct modea_ctx {
     bool active = false;
     bool have_cd = false;              // route == cd (residue slabs present)
-    double beta = 0.0, mu = 0.0, eta = 0.0;
+    double beta = 0.0, mu = 0.0, eta = 0.0, eta_far = 0.0;
     long ns = 0, nk = 0, nbnd = 0, nkpts_full = 0;
     long nJ = 0, npk = 0;              // internal states, retained W poles
     modea_opts opts;
@@ -310,7 +317,44 @@ namespace qp_modea {
       }
       return min_den;
     }
+
+    /**
+     * THE VALIDITY FLOOR MEASUREMENT (spec rev 4): the local spacing of the fitted Sigma^c
+     * poles E_{Jp} = eps_J - om_p around a real energy x, as a MEAN SPACING in a.u.
+     *
+     * Rev 4 requires eta_far to exceed the local pole spacing, or the evaluation rides a
+     * single fitted pole instead of sampling the eta-smoothed spectral density. The measure
+     * used here is the MEAN spacing inside a fixed window, not the minimum adjacent gap: the
+     * pole set has near-degenerate members by construction (every eps_J is offset by the SAME
+     * om_p set, so accidental coincidences are generic), and a minimum gap is therefore ~0
+     * everywhere and would warn unconditionally. The mean spacing is the number that decides
+     * whether i*eta averages over many poles, which is what the criterion is about.
+     * [agent-chosen window; FLAGGED. The global mean spacing is the fallback when the window
+     *  holds fewer than two poles, and both are logged.]
+     */
+    double pole_spacing(long is, long ik, double x, double halfwidth) const {
+      const long off = (is * nk + ik) * nJ;
+      long cnt = 0;
+      double lo = 1e300, hi = -1e300;
+      for (long J = 0; J < nJ; ++J) {
+        const double e = epsJ(off + J);
+        for (long p = 0; p < npk; ++p) {
+          const double E = e - om(p);
+          lo = std::min(lo, E);
+          hi = std::max(hi, E);
+          if (std::abs(E - x) <= halfwidth) ++cnt;
+        }
+      }
+      if (cnt >= 2) return 2.0 * halfwidth / double(cnt);
+      const long ntot = nJ * npk;
+      return (ntot > 1 and hi > lo) ? (hi - lo) / double(ntot) : 0.0;
+    }
   };
+
+  /** window half-width (a.u., ~1.4 eV) of the local pole-spacing measure above. */
+  inline constexpr double modea_spacing_window = 0.05;
+  /** rev 4: eta_far must exceed this multiple of the measured local spacing (warn only). */
+  inline constexpr double modea_eta_far_mult = 3.0;
 
   // ---------------------------------------------------------------------------------------
   //  gap edge (support constraint)
@@ -445,15 +489,56 @@ namespace qp_modea {
    * metallic / degenerate / qp_modea_wsupp = "off"): there is then no strip to speak of, and
    * collapsing every evaluation onto mu would be a silent Fermi-static map.
    */
+  /**
+   * ---------------------------------------------------------------------------------------
+   * REV 4 (2026-08-13): GRADED-eta FAR-STATE EVALUATION -- the knob qp_modea_eta_far
+   * ---------------------------------------------------------------------------------------
+   * The judge verdict on kp222 (matched heads) put mode_a == mode_b at 3.714/1.219 eV against
+   * a real-axis reference series of 3.10-3.37/0.70-0.94 eV, with a tau oracle of 2.6e-08 at
+   * production: the contraction is right and the 0.35/0.45 eV offset is ENTIRELY the mu
+   * fallback of the 471 out-of-strip evaluations (per-k HOMO 7 of 8, LUMO 5 of 8 at
+   * E_PH = 1.22 eV). The reference's own far-state object is Re Sigma(eps + i eta), so ours
+   * must be too:
+   *
+   *     z_i = eps_i                       in strip   (eta -> 0, EXACT -- better than the
+   *                                                   reference, which broadens everywhere)
+   *     z_i = eps_i + i eta_far           out of strip, when qp_modea_eta_far > 0
+   *     z_i = mu                          out of strip, when qp_modea_eta_far = 0  (rev 3.1)
+   *
+   * eta_far = 0 is the DEFAULT and reproduces rev 3.1 BIT-FOR-BIT (gate). The uniform stress
+   * knob qp_modea_eta rides on top of both branches, so the far-state offset composes as
+   * eta + eta_far; with the production eta = 0 they coincide.
+   *
+   * The rev-3.1 clamp-to-mu diagnosis is unchanged and is WHY eta_far exists rather than a
+   * clamp to the strip boundary: the boundary sits inside the fitted-pole pile-up, whereas
+   * eps + i eta_far keeps a clearance of eta_far from EVERY pole by construction (|z - E| >=
+   * |Im z| = eta_far), which is the same bounded-evaluation property mu has, at the physically
+   * right argument. That clearance is also why the validity floor is on the POLE SPACING, not
+   * on min_den: eta_far below the spacing resolves individual fit poles (an artefact of the
+   * finite fit), above it it samples the smoothed spectral density (the physical object).
+   */
   struct strip_t {
     double lo = 0.0, hi = 0.0, mu = 0.0;
+    double eta = 0.0;                 // uniform evaluation offset (qp_modea_eta)
+    double eta_far = 0.0;             // rev 4 far-state offset (qp_modea_eta_far)
     bool active = false;
-    /** the mode-A evaluation point of a state at energy e (rev 3.1: out-of-strip -> mu). */
+    bool in_strip(double e) const { return (not active) or (e >= lo and e <= hi); }
+    /** the rev-3.1 REAL evaluation energy (out-of-strip -> mu). Retained because the A-side
+     *  (route-A) diagnostics can only be evaluated at real energies; with eta_far > 0 it is
+     *  Re zeval(e). */
     double clamp(double e, bool *hit = nullptr) const {
       if (hit != nullptr) *hit = false;
       if (not active) return e;
       if (e < lo or e > hi) { if (hit != nullptr) *hit = true; return mu; }
       return e;
+    }
+    /** THE evaluation point (rev 4). `hit` reports "this state is out of the strip". */
+    ComplexType zeval(double e, bool *hit = nullptr) const {
+      if (hit != nullptr) *hit = false;
+      if (in_strip(e)) return ComplexType(e, eta);
+      if (hit != nullptr) *hit = true;
+      if (eta_far > 0.0) return ComplexType(e, eta + eta_far);
+      return ComplexType(mu, eta);
     }
   };
 
@@ -464,27 +549,43 @@ namespace qp_modea {
     s.lo = ctx.vbm - d;
     s.hi = ctx.cbm + d;
     s.mu = ctx.mu;
+    s.eta = ctx.eta;
+    s.eta_far = ctx.eta_far;
     return s;
   }
 
   /** clamp bookkeeping of ONE map assembly (one (s,k) block, one inner sweep). */
   struct clamp_census {
     long n_eval = 0;             // evaluation energies examined (= nbnd)
-    long n_clamp = 0;            // ... of which were outside the strip and were moved to mu
+    long n_clamp = 0;            // ... of which were OUTSIDE the strip (mu-fallback or eta)
     long n_clamp_win = 0;        // ... of which are gap-window states
-    bool homo_clamp = false;     // this block's per-k HOMO was clamped (the judge reads it)
+    bool homo_clamp = false;     // this block's per-k HOMO was out of strip (the judge reads it)
     bool lumo_clamp = false;
     double exc_lo = 0.0;         // worst excursion below the lower bound (a.u., >= 0)
     double exc_hi = 0.0;         // worst excursion above the upper bound (a.u., >= 0)
+    // ---- rev 4 (graded-eta far-state evaluation) ----
+    long n_eta = 0;              // out-of-strip evaluations taken at eps + i eta_far
+    double im_off = 0.0;         // max|Im Sigma^c| over those evaluations (a.u.) -- PHYSICS
+    double anti_in = -1.0;       // max|V - V^dag|/max|V| restricted to IN-STRIP (a,b) pairs
+    double spacing = 0.0;        // worst local fitted-pole spacing at an eta evaluation (a.u.)
   };
 
   /**
-   * V^xc_ab = 1/2 [ Sigma_ab(z_a) + Sigma_ab(z_b) ] at the STRIP-CLAMPED energies
-   * z = clamp(eps) (rev 3.1: eps in-strip, mu out-of-strip).
+   * V^xc_ab = 1/2 [ Sigma_ab(z_a) + Sigma_ab(z_b) ] at the strip evaluation points
+   * z = zeval(eps) (rev 3.1 / rev 4: eps in-strip, mu or eps + i eta_far out-of-strip).
    * D  (a,b) = Sigma_ab(z_a)   -- one gemv per a over the flat pole axis
    * D' (a,b) = Sigma_ab(z_b)   -- one dot per (a,b)
    * Both are formed EXPLICITLY (no Hermiticity identity) so that max|V - V^dag| is a genuine
    * routing tripwire rather than zero by construction.
+   *
+   * HERMITICITY RESCOPE (rev 4). With eta_far > 0 the out-of-strip evaluations are genuinely
+   * complex -- Im Sigma(eps + i eta) is eta times the smoothed spectral density, which is
+   * LARGE off strip, and any (a,b) with either index out of strip therefore carries a real
+   * anti-Hermitian part. That is physics, and the existing Hermitize tail takes the Re map of
+   * it. The tripwire is therefore reported over IN-STRIP (a,b) pairs only (cc->anti_in, both
+   * indices in strip and both evaluated at real z), and the off-strip Im magnitude is logged
+   * separately (cc->im_off) as a diagnostic. At eta_far = 0 nothing here changes: every
+   * evaluation point is real and anti_in is a sub-block of the full residual.
    */
   inline double modea_vxc_cd(modea_ctx const &ctx, sk_block const &blk,
                              nda::MemoryArrayOfRank<1> auto const &eps,
@@ -496,9 +597,10 @@ namespace qp_modea {
     nda::array<ComplexType, 2> D(nbnd, nbnd), Dp(nbnd, nbnd);
     double min_den = 1e300;
 
-    // ---- the strip clamp + its census (spec rev 3 addendum item 2) ----
+    // ---- the strip evaluation points + their census (rev 3 addendum item 2, rev 4) ----
     const strip_t strip = strip_of(ctx);
-    nda::array<double, 1> z_a(nbnd);
+    nda::array<ComplexType, 1> z_a(nbnd);
+    nda::array<int, 1> far(nbnd);          // 1 = this index is OUT of the strip
     if (cc != nullptr) *cc = clamp_census{};
     long homo = -1, lumo = -1;
     if (cc != nullptr)
@@ -508,11 +610,17 @@ namespace qp_modea {
       }
     for (long a = 0; a < nbnd; ++a) {
       bool hit = false;
-      z_a(a) = strip.clamp(eps(a), &hit);
+      z_a(a) = strip.zeval(eps(a), &hit);
+      far(a) = hit ? 1 : 0;
       if (cc == nullptr) continue;
       ++cc->n_eval;
       if (not hit) continue;
       ++cc->n_clamp;
+      if (strip.eta_far > 0.0) {
+        ++cc->n_eta;
+        cc->spacing = std::max(cc->spacing,
+                               ctx.pole_spacing(blk.is, blk.ik, eps(a), modea_spacing_window));
+      }
       if (win != nullptr and std::find(win->begin(), win->end(), a) != win->end())
         ++cc->n_clamp_win;
       if (a == homo) cc->homo_clamp = true;
@@ -522,7 +630,7 @@ namespace qp_modea {
     }
 
     for (long a = 0; a < nbnd; ++a) {
-      const ComplexType z(z_a(a), ctx.eta);
+      const ComplexType z = z_a(a);
       const double md = ctx.pole_weights(blk.is, blk.ik, z, w);
       if (md < min_den and argmin != nullptr) *argmin = a;
       min_den = std::min(min_den, md);
@@ -531,19 +639,43 @@ namespace qp_modea {
         auto Mab = blk.M(a, b, nda::range::all);
         for (long P = 0; P < nP; ++P) s += Mab(P) * w(P);
         D(a, b) = s;
+        if (cc != nullptr and far(a) == 1)
+          cc->im_off = std::max(cc->im_off, std::abs(s.imag()));
       }
     }
     for (long b = 0; b < nbnd; ++b) {
-      const ComplexType z(z_a(b), ctx.eta);
+      const ComplexType z = z_a(b);
       ctx.pole_weights(blk.is, blk.ik, z, w);
       for (long a = 0; a < nbnd; ++a) {
         ComplexType s(0.0);
         auto Mab = blk.M(a, b, nda::range::all);
         for (long P = 0; P < nP; ++P) s += Mab(P) * w(P);
         Dp(a, b) = s;
+        if (cc != nullptr and far(b) == 1)
+          cc->im_off = std::max(cc->im_off, std::abs(s.imag()));
       }
     }
     V = 0.5 * (D + Dp);
+    // rev 4: the anti-Hermitian tripwire, restricted to the elements both of whose evaluation
+    // points are real (in strip). At eta_far = 0 that restriction is inert -- every point is
+    // real and this is a sub-block of the full residual, which the caller still reports.
+    // NOTE the UNDEFINED case: if every index is out of strip there is no in-strip pair, and
+    // reporting 0 there would read as "perfectly Hermitian" for a block in which the tripwire
+    // measured nothing at all (it happens on qe_lih222's first outer iteration, where the
+    // narrow initial E_PH puts all 128 states outside). anti_in stays -1 = "not measured" and
+    // the driver then falls back to the full-matrix residual.
+    if (cc != nullptr) {
+      double num = 0.0, den = 0.0;
+      bool any = false;
+      for (long i = 0; i < nbnd; ++i)
+        for (long j = 0; j < nbnd; ++j) {
+          if (far(i) == 1 or far(j) == 1) continue;
+          any = true;
+          num = std::max(num, std::abs(V(i, j) - std::conj(V(j, i))));
+          den = std::max(den, std::abs(V(i, j)));
+        }
+      if (any) cc->anti_in = (den > 0.0) ? num / den : 0.0;
+    }
     return min_den;
   }
 
@@ -615,16 +747,25 @@ namespace qp_modea {
    * near a pole (min_den below the floor) or the result exceeds a data-derived sanity bound,
    * that state falls back to z = mu -- mode B where the representation resolves the state,
    * Fermi-static where it cannot. Counted and warned, never silent.
+   *
+   * REV 4: with qp_modea_eta_far > 0 the out-of-strip diagonal is evaluated at
+   * z = eps_a + i eta_far and V_aa = Re Sigma_aa(z) instead of falling back to mu -- the same
+   * convention mode_a uses, on the only index mode_b evaluates off-centre. eta_far = 0 keeps
+   * the mu fallback exactly.
    */
   struct modeb_result {
-    long n_fallback = 0;         // diagonal states demoted to z = mu
+    long n_fallback = 0;         // OUT-OF-STRIP diagonal states (demoted to mu, or eta-evaluated)
     long n_fallback_win = 0;     // ... of which are in the gap window
     long n_sanity_trip = 0;      // STRIP-INTERIOR states tripping the |ReSigma| bound
-    bool homo_fallback = false;  // this block's per-k HOMO fell back (the judge reads it)
-    bool lumo_fallback = false;  // this block's per-k LUMO fell back
-    double min_den = 1e300;      // smallest |z - (eps_J - om_p)| met on the diagonal
+    bool homo_fallback = false;  // this block's per-k HOMO was out of strip (the judge reads it)
+    bool lumo_fallback = false;  // this block's per-k LUMO was out of strip
+    double min_den = 1e300;      // smallest |z - (eps_J - om_p)| met on the diagonal at eta = 0
     double anti_herm = 0.0;      // max|V - V^dag| / max|V| of the RAW map
     double vmax = 0.0;
+    // ---- rev 4 (graded-eta far-state evaluation) ----
+    long n_eta = 0;              // of n_fallback, the ones taken at eps + i eta_far instead
+    double im_off = 0.0;         // max|Im Sigma^c_aa| over those (a.u.) -- PHYSICS, not an error
+    double spacing = 0.0;        // worst local fitted-pole spacing at an eta evaluation (a.u.)
   };
 
   /**
@@ -694,7 +835,20 @@ namespace qp_modea {
         if (std::find(win.begin(), win.end(), a) != win.end()) ++out.n_fallback_win;
         if (a == homo) out.homo_fallback = true;
         if (a == lumo) out.lumo_fallback = true;
-        V(a, a) = ComplexType(V(a, a).real(), 0.0);
+        if (ctx.eta_far > 0.0) {
+          // rev 4: the far-state object is Re Sigma(eps + i eta_far), not Sigma(mu). Note the
+          // min_den above is deliberately the eta = 0 one -- it measures real-axis proximity;
+          // this evaluation's own denominators are bounded below by eta_far by construction.
+          ++out.n_eta;
+          const ComplexType Sf = modea_sigma_diag(ctx, blk, a,
+                                                  ComplexType(eps(a), ctx.eta + ctx.eta_far));
+          out.im_off = std::max(out.im_off, std::abs(Sf.imag()));
+          out.spacing = std::max(out.spacing,
+                                 ctx.pole_spacing(blk.is, blk.ik, eps(a), modea_spacing_window));
+          V(a, a) = ComplexType(Sf.real(), 0.0);
+        } else {
+          V(a, a) = ComplexType(V(a, a).real(), 0.0);
+        }
       }
     }
     for (long i = 0; i < nbnd; ++i)

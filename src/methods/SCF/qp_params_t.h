@@ -124,6 +124,26 @@ struct qp_params_t {
   // heev. Exposed because the sketch is the production path but only the small fixtures can
   // cross-check it against the exact one.
   long qp_modea_wsketch = 0;
+
+  // ---- spec rev 4 (2026-08-13): GRADED-eta FAR-STATE EVALUATION ----
+  // Imaginary offset, in a.u., applied to the evaluation energies of states OUTSIDE the
+  // analyticity strip (VBM - 0.95 E_PH, CBM + 0.95 E_PH):
+  //
+  //     eta_far  = 0   -> out-of-strip states are evaluated at z = mu   (rev 3.1, THE DEFAULT)
+  //     eta_far  > 0   -> out-of-strip states are evaluated at z = eps + i eta_far
+  //
+  // In-strip states are unaffected and stay exact (eta -> 0). Applies to mode_a (both indices
+  // of 1/2[Sigma(eps_a) + Sigma(eps_b)]) and to the mode_b diagonal.
+  //
+  // WHY (QM3-c judge verdict, kp222, matched heads): mode_a == mode_b = 3.714/1.219 eV against
+  // a real-axis reference series of 3.10-3.37/0.70-0.94 eV with a tau oracle of 2.6e-08, i.e.
+  // the whole 0.35/0.45 eV offset is the mu fallback of the 471 out-of-strip evaluations. The
+  // reference's own far-state object is Re Sigma(eps + i eta), so ours must be too.
+  //
+  // VALIDITY FLOOR (logged, warned, never fatal): eta_far must exceed ~3x the local fitted-pole
+  // spacing (~1e-3 a.u. at kp222) or the evaluation rides single poles of the fit instead of
+  // the eta-smoothed spectral density. The measured spacing is reported every outer iteration.
+  double qp_modea_eta_far = 0.0;
 };
 
 } // methods

@@ -83,6 +83,7 @@ namespace {
     opts.nconsist = qp_params.qp_modea_nconsist;
     opts.consist_tol = qp_params.qp_modea_consist_tol;
     opts.eta = qp_params.qp_modea_eta;
+    opts.eta_far = qp_params.qp_modea_eta_far;
     opts.wsupp = qp_params.qp_modea_wsupp;
     opts.wfit = qp_params.qp_modea_wfit;
     opts.wrtol = qp_params.qp_modea_wrtol;
@@ -99,10 +100,19 @@ namespace {
                  opts.route);
     utils::check(opts.wfit == "tau" or opts.wfit == "nu",
                  "qp_modea: unknown qp_modea_wfit = {}. Valid: \"tau\", \"nu\".", opts.wfit);
+    utils::check(opts.eta_far >= 0.0,
+                 "qp_modea: qp_modea_eta_far = {} must be >= 0 (0 = the rev-3.1 mu fallback).",
+                 opts.eta_far);
 
     app_log(2, "\n* {} quasiparticle map (Project 2 increment QM3): building the "
                "evaluator context", qp_params.qp_map);
-    if (qp_params.qp_map == "mode_a")
+    if (opts.eta_far > 0.0)
+      app_log(2, "  - FAR-STATE EVALUATION (spec rev 4): states outside (VBM - 0.95 E_PH, "
+                 "CBM + 0.95 E_PH) are evaluated at z = eps + i eta_far with eta_far = "
+                 "{:.4e} a.u. ({:.4g} eV); in-strip states stay exact (eta = 0). Census and "
+                 "the pole-spacing validity floor are logged below.",
+              opts.eta_far, opts.eta_far * 27.211386245988);
+    else if (qp_params.qp_map == "mode_a")
       app_log(2, "  - evaluation energies are STRIP-CLAMPED TO mu (spec rev 3.1, addendum "
                  "item 2): states inside (VBM - 0.95 E_PH, CBM + 0.95 E_PH) are exact mode A, "
                  "states outside it are evaluated at mu; census logged below.");
@@ -116,6 +126,7 @@ namespace {
       ctx.beta = FT.beta();
       ctx.mu = mu;
       ctx.eta = opts.eta;
+      ctx.eta_far = opts.eta_far;
       ctx.ns = sE_ska.shape()[0];
       ctx.nk = sE_ska.shape()[1];
       ctx.nbnd = sE_ska.shape()[2];
@@ -200,7 +211,11 @@ namespace {
     // mode_a STRIP CLAMP census (spec rev 3 addendum item 2)
     long n_clamp = 0, n_clamp_win = 0, n_eval = 0, n_homo_cl = 0, n_lumo_cl = 0;
     double exc_lo_worst = 0.0, exc_hi_worst = 0.0;
+    // rev 4: the graded-eta far-state census
+    long n_eta = 0, n_anti_in = 0;
+    double im_off_worst = 0.0, anti_in_worst = 0.0, spacing_worst = 0.0;
     const qp_modea::strip_t strip = qp_modea::strip_of(*ctx);
+    const double eta_far = ctx->eta_far;
 
     nda::array<ComplexType, 2> tmp(nbnd, nbnd), Hstat_ab(nbnd, nbnd), V(nbnd, nbnd);
     nda::array<ComplexType, 3> Sw(optA.m, nbnd, nbnd);
@@ -269,21 +284,23 @@ namespace {
       // read BEFORE the inner loop, whose divergence would otherwise evaluate both sides at
       // meaningless energies.
       {
-        // Both sides are read AT THE ACTUAL EVALUATION POINT of the map, i.e. at the
-        // STRIP-CLAMPED energy (rev 3 addendum item 2): comparing an out-of-strip A-side
+        // Both sides are read AT THE ACTUAL EVALUATION POINT of the map, i.e. at the strip
+        // evaluation point (rev 3 addendum item 2 / rev 4): comparing an out-of-strip A-side
         // extrapolation against a B side evaluated at mu would compare two different
-        // arguments. Clamped rows are marked "*"; eps_i - mu is printed RAW.
+        // arguments. The A side can only be evaluated at REAL energies, so with eta_far > 0
+        // it is read at Re z (the same eps_i) while the B side carries the i eta_far.
+        // Out-of-strip rows are marked "*"; eps_i - mu is printed RAW.
         app_log(lvl, "  mode_a delta_i [IN] (s,k) = ({},{}):  {:>4} {:>14} {:>12} {:>12} "
                      "{:>10}", is, ik, "i", "eps_i-mu (eV)", "delta_i", "class_i", "ratio");
         for (long i = 0; i < nbnd; ++i) {
           const bool in_win = std::find(win.begin(), win.end(), i) != win.end();
           const double er = eps(i) - mu;
           bool hit = false;
-          const double zc = (mode_b or not cd) ? eps(i) : strip.clamp(eps(i), &hit);
-          const ComplexType SA = XA.eval(i, i, zc - mu);
-          const ComplexType SA1 = XA1.eval(i, i, zc - mu);
-          const ComplexType SB =
-              cd ? modea_sigma_diag(*ctx, *blk, i, ComplexType(zc, ctx->eta)) : SA;
+          const ComplexType zc = (mode_b or not cd) ? ComplexType(eps(i), ctx->eta)
+                                                    : strip.zeval(eps(i), &hit);
+          const ComplexType SA = XA.eval(i, i, zc.real() - mu);
+          const ComplexType SA1 = XA1.eval(i, i, zc.real() - mu);
+          const ComplexType SB = cd ? modea_sigma_diag(*ctx, *blk, i, zc) : SA;
           const double d = std::abs(SB - SA), cl = std::abs(SA1 - SA);
           const double ratio = (cl > 0.0) ? d / cl : 0.0;
           if (in_win) {
@@ -294,7 +311,8 @@ namespace {
           }
           app_log(in_win ? lvl : lvl + 1, "  mode_a delta_i [IN]   ({},{}):  {:>4} {:>14.4f} "
                                           "{:>12.4e} {:>12.4e} {:>10.3g}{}",
-                  is, ik, i, er * HA2EV, d, cl, ratio, hit ? "  * clamped" : "");
+                  is, ik, i, er * HA2EV, d, cl, ratio,
+                  hit ? (eta_far > 0.0 ? "  * eta_far" : "  * clamped") : "");
         }
       }
 
@@ -366,12 +384,15 @@ namespace {
         ++n_blocks;
         min_den_worst = std::min(min_den_worst, br.min_den);
         anti_worst = std::max(anti_worst, br.anti_herm);
+        n_eta += br.n_eta;
+        im_off_worst = std::max(im_off_worst, br.im_off);
+        spacing_worst = std::max(spacing_worst, br.spacing);
         app_log(lvl, "  mode_b (s,k) = ({},{}): max|V| = {:.4e}, min_den = {:.4e} a.u., "
-                     "diagonal fallbacks to z = mu: {} of {} ({} in the gap window); per-k "
-                     "HOMO {}, LUMO {}",
-                is, ik, br.vmax, br.min_den, br.n_fallback, nbnd, br.n_fallback_win,
-                br.homo_fallback ? "FALLBACK" : "strip-exact",
-                br.lumo_fallback ? "FALLBACK" : "strip-exact");
+                     "out-of-strip diagonals: {} of {} ({} in the gap window, {} evaluated at "
+                     "eps + i eta_far, the rest at z = mu); per-k HOMO {}, LUMO {}",
+                is, ik, br.vmax, br.min_den, br.n_fallback, nbnd, br.n_fallback_win, br.n_eta,
+                br.homo_fallback ? "OUT OF STRIP" : "strip-exact",
+                br.lumo_fallback ? "OUT OF STRIP" : "strip-exact");
         continue;
       }
 
@@ -414,13 +435,18 @@ namespace {
         if (cc.lumo_clamp) ++n_lumo_cl;
         exc_lo_worst = std::max(exc_lo_worst, cc.exc_lo);
         exc_hi_worst = std::max(exc_hi_worst, cc.exc_hi);
+        n_eta += cc.n_eta;
+        im_off_worst = std::max(im_off_worst, cc.im_off);
+        spacing_worst = std::max(spacing_worst, cc.spacing);
+        if (cc.anti_in >= 0.0) { anti_in_worst = std::max(anti_in_worst, cc.anti_in); ++n_anti_in; }
         ++n_blocks;
-        app_log(lvl, "  mode_a STRIP CLAMP (s,k) = ({},{}): {} of {} evaluation energies "
-                     "clamped ({} in the gap window); per-k HOMO {}, LUMO {}; worst "
-                     "excursion below the lower bound {:.4f} a.u., above the upper bound "
-                     "{:.4f} a.u.", is, ik, cc.n_clamp, cc.n_eval, cc.n_clamp_win,
-                cc.homo_clamp ? "CLAMPED" : "in strip",
-                cc.lumo_clamp ? "CLAMPED" : "in strip", cc.exc_lo, cc.exc_hi);
+        app_log(lvl, "  mode_a STRIP CENSUS (s,k) = ({},{}): {} of {} evaluation energies "
+                     "out of strip ({} in the gap window, {} evaluated at eps + i eta_far, "
+                     "the rest at mu); per-k HOMO {}, LUMO {}; worst excursion below the "
+                     "lower bound {:.4f} a.u., above the upper bound {:.4f} a.u.",
+                is, ik, cc.n_clamp, cc.n_eval, cc.n_clamp_win, cc.n_eta,
+                cc.homo_clamp ? "OUT OF STRIP" : "in strip",
+                cc.lumo_clamp ? "OUT OF STRIP" : "in strip", cc.exc_lo, cc.exc_hi);
       }
 
       // ------- the same harness AT THE EXIT ENERGIES (reported, interpretable only if
@@ -432,18 +458,19 @@ namespace {
           const bool in_win = std::find(win.begin(), win.end(), i) != win.end();
           const double er = eps(i) - mu;
           bool hit = false;
-          const double zc = cd ? strip.clamp(eps(i), &hit) : eps(i);
-          const ComplexType SA = XA.eval(i, i, zc - mu);
-          const ComplexType SA1 = XA1.eval(i, i, zc - mu);
-          const ComplexType SB = cd ? modea_sigma_diag(*ctx, *blk, i, ComplexType(zc, ctx->eta))
-                                    : SA;
+          const ComplexType zc = cd ? strip.zeval(eps(i), &hit)
+                                    : ComplexType(eps(i), ctx->eta);
+          const ComplexType SA = XA.eval(i, i, zc.real() - mu);
+          const ComplexType SA1 = XA1.eval(i, i, zc.real() - mu);
+          const ComplexType SB = cd ? modea_sigma_diag(*ctx, *blk, i, zc) : SA;
           const double d = std::abs(SB - SA), cl = std::abs(SA1 - SA);
           const double ratio = (cl > 0.0) ? d / cl : 0.0;
           if (in_win) ratio_worst = std::max(ratio_worst, ratio);
           if (in_win and ratio > 10.0) ++n_flag;
           app_log(lvl + 1, "  mode_a delta_i [OUT]  ({},{}):  {:>4} {:>14.4f} "
                            "{:>12.4e} {:>12.4e} {:>10.3g}{}",
-                  is, ik, i, er * HA2EV, d, cl, ratio, hit ? "  * clamped" : "");
+                  is, ik, i, er * HA2EV, d, cl, ratio,
+                  hit ? (eta_far > 0.0 ? "  * eta_far" : "  * clamped") : "");
         }
         // one off-diagonal spot check: the largest |V^xc_ab|, a != b. The A side is built at
         // the SAME (clamped) energies the B side used, for the same reason as the table above.
@@ -453,7 +480,7 @@ namespace {
           for (long b = 0; b < nbnd; ++b)
             if (a != b and std::abs(V(a, b)) > vmax) { vmax = std::abs(V(a, b)); ba = a; bb = b; }
         for (long a = 0; a < nbnd; ++a)
-          eps_rel(a) = (cd ? strip.clamp(eps(a)) : eps(a)) - mu;
+          eps_rel(a) = (cd ? strip.zeval(eps(a)).real() : eps(a)) - mu;
         auto VA = sigma_real_axis::assemble_vxc(XA, eps_rel);
         const double doff = std::abs(V(ba, bb) - VA(ba, bb)) / std::max(vmax, 1e-30);
         dev_off_worst = std::max(dev_off_worst, doff);
@@ -476,12 +503,53 @@ namespace {
     class_in_worst = comm.all_reduce_value(class_in_worst, boost::mpi3::max<>{});
     n_flag_in = comm.all_reduce_value(n_flag_in, std::plus<>{});
 
+    // rev 4: the far-state census travels with the anti-Hermitian rescope below.
+    n_eta = comm.all_reduce_value(n_eta, std::plus<>{});
+    im_off_worst = comm.all_reduce_value(im_off_worst, boost::mpi3::max<>{});
+    spacing_worst = comm.all_reduce_value(spacing_worst, boost::mpi3::max<>{});
+    anti_in_worst = comm.all_reduce_value(anti_in_worst, boost::mpi3::max<>{});
+    n_anti_in = comm.all_reduce_value(n_anti_in, std::plus<>{});
+    // THE TRIPWIRE quantity. With eta_far > 0 the off-strip evaluations are complex BY
+    // CONSTRUCTION (Im Sigma(eps + i eta) is eta times the smoothed spectral density), so an
+    // O(1) anti-Hermitian residual there is physics, not a routing error; the tripwire is
+    // rescoped to the elements both of whose evaluation points are real. mode_b needs no
+    // rescope: its off-diagonals are all at z = mu and its diagonal takes Re explicitly.
+    // n_anti_in = 0 means NO block had an in-strip pair at all (every state out of strip); the
+    // rescoped number would then be vacuous, so the full-matrix one is reported instead.
+    const bool anti_rescoped = (eta_far > 0.0 and not mode_b and cd and n_anti_in > 0);
+    const double anti_gate = anti_rescoped ? anti_in_worst : anti_worst;
+
     app_log(lvl, "  - inner QP consistency:       worst count {} of {} (cap), max|d eps| at "
                  "exit = {:.3e} a.u., min_den = {:.4e} a.u.",
             iters_worst, ctx->opts.nconsist, dmax_worst, min_den_worst);
-    app_log(lvl, "  - anti-Hermitian residual:    max|V - V^dag|/max|V| = {:.3e} (expected at "
-                 "the W-fit class {:.3e}; O(1) would be a routing error)",
-            anti_worst, ctx->diag.rec_rel_worst);
+    app_log(lvl, "  - anti-Hermitian residual:    max|V - V^dag|/max|V| = {:.3e} over {} "
+                 "(expected at the W-fit class {:.3e}; O(1) would be a routing error)",
+            anti_gate, anti_rescoped ? "the IN-STRIP elements (rev 4 rescope; the full-matrix "
+                                       "value below is dominated by the eta-broadened far "
+                                       "states and is NOT an error)" : "all elements",
+            ctx->diag.rec_rel_worst);
+    if (eta_far > 0.0)
+      app_log(lvl, "  - rev-4 far-state physics:    {} out-of-strip evaluations at eps + i "
+                   "eta_far ({:.4e} a.u. = {:.4g} eV); max|Im Sigma^c| there = {:.4e} a.u. "
+                   "({:.4g} eV) [= eta x the smoothed spectral density, a DIAGNOSTIC]; "
+                   "full-matrix anti-Hermitian residual = {:.3e}; worst local fitted-pole "
+                   "spacing at those points = {:.4e} a.u. (eta_far / spacing = {:.3g}, "
+                   "floor {:.1f})",
+              n_eta, eta_far, eta_far * HA2EV, im_off_worst, im_off_worst * HA2EV, anti_worst,
+              spacing_worst, (spacing_worst > 0.0 ? eta_far / spacing_worst : 0.0),
+              qp_modea::modea_eta_far_mult);
+    if (eta_far > 0.0 and n_eta > 0 and spacing_worst > 0.0 and
+        eta_far < qp_modea::modea_eta_far_mult * spacing_worst)
+      app_warning("qp_approx ({}): qp_modea_eta_far = {:.4e} a.u. is BELOW {:.1f} x the "
+                  "measured local fitted-pole spacing ({:.4e} a.u.) at the out-of-strip "
+                  "evaluation points. Sigma^c(eps + i eta_far) is then dominated by individual "
+                  "poles of the FIT rather than by the eta-smoothed spectral density, i.e. the "
+                  "far-state values are representation artefacts. Raise eta_far above {:.4e} "
+                  "a.u. ({:.4g} eV) or sharpen the W^c fit. See notes/qm3_mode_a_loop_spec.md "
+                  "rev 4 (validity floor).",
+                  map_name, eta_far, qp_modea::modea_eta_far_mult, spacing_worst,
+                  qp_modea::modea_eta_far_mult * spacing_worst,
+                  qp_modea::modea_eta_far_mult * spacing_worst * HA2EV);
     if (cd)
       app_log(lvl, "  - i w comparison (DIAGNOSTIC, never a gate): route-B Sigma^c vs the "
                    "solver Sigma(i w_n) over the gap window = {:.4e} [W-fit class {:.4e}]. "
@@ -507,14 +575,16 @@ namespace {
                "gapedge={:.6g} npk={} | dmax={:.4e} iters={} minden={:.4e} anchor={:.4e} "
                "antiherm={:.4e} taudev={:.4e} | dIN={:.4e} clIN={:.4e} rIN={:.4e} | "
                "wrank={:.1e} Np={} rmax={} rmean={:.2f} wtrunc={:.3e} "
-               "tfit={:.2f} tfac={:.2f} tsand={:.2f}",
+               "tfit={:.2f} tfac={:.2f} tsand={:.2f} | etafar={:.4e} neta={} imoff={:.4e} "
+               "spacing={:.4e} antiin={:.4e}",
             ctx->opts.wfit, ctx->diag.gap_edge > -1 ? qp_modea::last_run().wrtol : -1.0,
             ctx->eta, ctx->diag.res_ratio_worst, ctx->diag.rec_rel_worst,
             ctx->diag.gap_edge, ctx->npk, dmax_worst, iters_worst, min_den_worst,
-            anchor_worst, anti_worst, tau_dev_worst, delta_in_worst, class_in_worst,
+            anchor_worst, anti_gate, tau_dev_worst, delta_in_worst, class_in_worst,
             ratio_in_worst, ctx->opts.wrank, qp_modea::last_run().Np,
             ctx->diag.wrank_max, ctx->diag.wrank_mean, ctx->diag.wtrunc_worst,
-            ctx->diag.t_fit, ctx->diag.t_fac, ctx->diag.t_sand);
+            ctx->diag.t_fit, ctx->diag.t_fac, ctx->diag.t_sand,
+            eta_far, n_eta, im_off_worst, spacing_worst, anti_in_worst);
     if (n_noconv > 0)
       app_warning("qp_approx (mode_a): the inner QP-consistency loop hit the cap ({}) on {} "
                   "(s,k) blocks with max|d eps| = {:.3e}. This is the physical "
@@ -537,19 +607,21 @@ namespace {
                    "{:.6f} ({})", strip.lo, strip.hi, ctx->vbm, ctx->cbm,
               ctx->diag.gap_edge, strip.active ? "ACTIVE" : "INACTIVE (no support "
                                                             "constraint this iteration)");
-      app_log(lvl, "  - mode_a clamp census:        {} of {} evaluation energies clamped to mu "
-                   "({} in the gap window) over {} (s,k) blocks; THE JUDGE "
-                   "STATES: per-k HOMO clamped in {} of {} blocks, LUMO in {} of {}; worst "
-                   "excursion {:.4f} a.u. below / {:.4f} a.u. above",
-              n_clamp, n_eval, n_clamp_win, n_blocks, n_homo_cl, n_blocks, n_lumo_cl,
-              n_blocks, exc_lo_worst, exc_hi_worst);
+      app_log(lvl, "  - mode_a strip census:        {} of {} evaluation energies out of strip "
+                   "({} in the gap window; {} evaluated at eps + i eta_far, {} clamped to mu) "
+                   "over {} (s,k) blocks; THE JUDGE STATES: per-k HOMO out of strip in {} of "
+                   "{} blocks, LUMO in {} of {}; worst excursion {:.4f} a.u. below / {:.4f} "
+                   "a.u. above",
+              n_clamp, n_eval, n_clamp_win, n_eta, n_clamp - n_eta, n_blocks, n_homo_cl,
+              n_blocks, n_lumo_cl, n_blocks, exc_lo_worst, exc_hi_worst);
       if (n_clamp_win > 0)
-        app_warning("qp_approx (mode_a): {} GAP-WINDOW evaluation energies were STRIP-CLAMPED. "
-                    "Near mu the particle-hole edge should guarantee a clearance of E_PH = "
-                    "{:.4g} a.u., so a clamp there means the QP spectrum has moved a band-edge "
-                    "state outside the analyticity strip -- the judge states are then NOT exact "
-                    "mode A. Check the gap and the inner-consistency numbers above.",
-                    n_clamp_win, ctx->diag.gap_edge);
+        app_warning("qp_approx (mode_a): {} GAP-WINDOW evaluation energies were OUT OF STRIP "
+                    "(evaluated at {}). Near mu the particle-hole edge should guarantee a "
+                    "clearance of E_PH = {:.4g} a.u., so this means the QP spectrum has moved "
+                    "a band-edge state outside the analyticity strip -- the judge states are "
+                    "then NOT exact mode A. Check the gap and the inner-consistency numbers "
+                    "above.", n_clamp_win,
+                    eta_far > 0.0 ? "eps + i eta_far" : "mu", ctx->diag.gap_edge);
     }
 
     auto &LR = qp_modea::last_run();
@@ -563,7 +635,12 @@ namespace {
     LR.converged_inner = (n_noconv == 0);
     LR.anchor_expect = anchor_expect;
     LR.ratio_worst = ratio_worst;
-    LR.anti_herm = anti_worst;
+    LR.anti_herm = anti_gate;      // rev 4: IN-STRIP only once eta_far > 0 (see above)
+    LR.eta_far = eta_far;
+    LR.n_eta = n_eta;
+    LR.im_off = im_off_worst;
+    LR.anti_in = anti_in_worst;
+    LR.spacing = spacing_worst;
     LR.dmax = dmax_worst;
     LR.min_den = min_den_worst;
     LR.iters = iters_worst;
@@ -583,10 +660,11 @@ namespace {
                    "E_PH) = ({:+.6f}, {:+.6f}) a.u. with VBM {:+.6f}, CBM {:+.6f}, E_PH "
                    "{:.6f}", ctx->vbm - 0.95 * ctx->diag.gap_edge,
               ctx->cbm + 0.95 * ctx->diag.gap_edge, ctx->vbm, ctx->cbm, ctx->diag.gap_edge);
-      app_log(lvl, "  - mode_b diagonal fallbacks:  {} states demoted to z = mu ({} in the gap "
-                   "window); THE JUDGE STATES: per-k HOMO fell back in {} of {} blocks, LUMO "
-                   "in {} of {}", n_fallback, n_fallback_win, n_homo_fb, n_blocks, n_lumo_fb,
-              n_blocks);
+      app_log(lvl, "  - mode_b out-of-strip diag:   {} states ({} in the gap window; {} "
+                   "evaluated at eps + i eta_far, {} demoted to z = mu); THE JUDGE STATES: "
+                   "per-k HOMO out of strip in {} of {} blocks, LUMO in {} of {}",
+              n_fallback, n_fallback_win, n_eta, n_fallback - n_eta, n_homo_fb, n_blocks,
+              n_lumo_fb, n_blocks);
       app_log(lvl, "  - mode_b strip-interior |ReSigma| trips: {} (expected 0 -- a nonzero "
                    "count FALSIFIES the strip criterion)", n_sanity_trip);
       if (n_fallback_win > 0)
