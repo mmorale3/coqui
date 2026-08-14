@@ -58,3 +58,17 @@ target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield method
 add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
 set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
                     TIMEOUT 14400)
+
+# Project 2 increment Q5 (notes/q5_option2_outer_loop_spec.md): the Option-2 outer loop --
+# the source-swap identity of the external-G injection (Q5-g1) and the restart composition
+# that IS the C = empty-set Option-1-vs-Option-2 statement (Q5-g2). Separate executable so
+# the Q3/Q4 suites keep their exact tallies.
+set(TEST_ID methods_qpgw_q5)
+
+add_executable(test_${TEST_ID} test_methods_qpgw_q5.cpp)
+target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield eri_lib hf_lib
+                      gw_lib scf_lib vertex_lib scr_coulomb_lib)
+
+add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
+set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
+                    TIMEOUT 14400)

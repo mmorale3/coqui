@@ -815,9 +815,22 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
                                       pol_vertex_isdf_thresh, pol_vertex_isdf_cond_max,
                                       pol_vertex_isdf_distr_tol, pol_vertex_inject);
     if (pol_vertex_carrier.pol_vertex_enabled()) scr_eri.set_vertex(&pol_vertex_carrier);
+    // Project 2 increment Q5 (notes/q5_option2_outer_loop_spec.md §1): the Option-2
+    // re-QP-ization knobs. Parsed with an EMPTY default -- absent means INERT, i.e. the qp
+    // loop builds its own analytic QP G and the run is bit-identical to the pre-Q5 one. When
+    // set, ITERATION 1 consumes the external G of that checkpoint group (its density matrix
+    // drives the HF stage, and update_w / Sigma^GW screen with it); iterations >= 2 revert.
+    // Note: the function-scope greens_func_source above defaults to "scf" and belongs to the
+    // [gw]/[hf] dyson-scf branches -- the [qpgw] branch must NOT inherit that default.
+    auto qp_gf_grp = io::get_value_with_default<std::string>(pt,"greens_func_source","");
+    io::tolower(qp_gf_grp);
+    auto qp_gf_iter = io::get_value_with_default<long>(pt,"greens_func_iteration",-1);
+    utils::check(qp_gf_grp=="" or qp_gf_grp=="scf" or qp_gf_grp=="embed",
+                 "qpgw: greens_func_source = \"{}\" is not supported. Valid options: "
+                 "absent (the loop's own analytic QP G), \"scf\", \"embed\".", qp_gf_grp);
     MBState mb_state(mpi, ft, output);
     qp_scf_loop(mb_state, eri, ft, qp_params, mb_solver_t(&hf,&gw,&scr_eri), iter_solver.get(),
-                niter, restart, conv_thr);
+                niter, restart, conv_thr, qp_gf_grp, qp_gf_iter);
 
   } else
     APP_ABORT("mbpt: Unknown solver type: {}",solver_type);
@@ -1174,6 +1187,20 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
                                       pol_vertex_isdf_distr_tol, pol_vertex_inject);
     if (pol_vertex_carrier.pol_vertex_enabled()) scr_eri.set_vertex(&pol_vertex_carrier);
 
+    // Project 2 increment Q5 (notes/q5_option2_outer_loop_spec.md §1): the Option-2
+    // re-QP-ization knobs -- SAME surface as the projector-less [qpgw] branch. Absent =>
+    // INERT (the loop's own analytic QP G, bit-identical to the pre-Q5 loop). When set,
+    // ITERATION 1 consumes the external G of that checkpoint group, so the Q3/Q4 screening
+    // W_corr = W[P^RPA[G_ext] + P^lad + P_C(P_imp - P_dc)P_C^dag] comes for free: update_w
+    // consumes the SAME injected mb_state.sG_tskij. The function-scope greens_func_source
+    // above defaults to "scf" and belongs to the [gw] dyson-scf branch.
+    auto qp_gf_grp = io::get_value_with_default<std::string>(pt,"greens_func_source","");
+    io::tolower(qp_gf_grp);
+    auto qp_gf_iter = io::get_value_with_default<long>(pt,"greens_func_iteration",-1);
+    utils::check(qp_gf_grp=="" or qp_gf_grp=="scf" or qp_gf_grp=="embed",
+                 "qpgw: greens_func_source = \"{}\" is not supported. Valid options: "
+                 "absent (the loop's own analytic QP G), \"scf\", \"embed\".", qp_gf_grp);
+
     MBState mb_state(ft, output, mf, projector_ksIai, band_window, kpts_crys, trans_home_cell, false);
     if (local_polarizabilities) {
       mb_state.set_local_polarizabilities(std::move(local_polarizabilities.value()));
@@ -1181,7 +1208,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
     }
 
     qp_scf_loop(mb_state, eri, ft, qp_params, mb_solver_t(&hf,&gw,&scr_eri), iter_solver.get(),
-                niter, restart, conv_thr);
+                niter, restart, conv_thr, qp_gf_grp, qp_gf_iter);
 
   } else
     APP_ABORT("mbpt: Unknown solver type: {}",solver_type);

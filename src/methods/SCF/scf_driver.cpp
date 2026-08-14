@@ -20,6 +20,9 @@
 
 
 
+#include <filesystem>
+#include <optional>
+
 #include "nda/nda.hpp"
 #include "numerics/distributed_array/nda.hpp"
 #include "numerics/shared_array/nda.hpp"
@@ -248,9 +251,11 @@ double qp_scf_loop(
   qp_params_t& qp_params, 
   solvers::mb_solver_t<corr_solver_t> mb_solver,
   iter_scf::iter_scf_t *iter_solver,
-  int niter, 
-  bool restart, 
-  double conv_tol) {
+  int niter,
+  bool restart,
+  double conv_tol,
+  std::string gf_grp,
+  long gf_iter) {
 
   using math::shm::make_shared_array;
   utils::TimerManager Timer;
@@ -262,6 +267,19 @@ double qp_scf_loop(
   utils::check(qp_params.qp_type=="sc" or qp_params.qp_type=="sc_newton" or
                qp_params.qp_type=="sc_bisection" or qp_params.qp_type=="linearized" or qp_params.qp_type=="spectral",
                "qp_scf_loop: unknown qp_type {}: sc or linearized.", qp_params.qp_type);
+  // Project 2 increment Q5 (notes/q5_option2_outer_loop_spec.md §1): the Option-2
+  // re-QP-ization knobs. gf_grp EMPTY (the default) = INERT -- iteration 1 builds its own
+  // analytic QP G exactly as before. When set ("scf"/"embed"), iteration 1 consumes the
+  // EXTERNAL G of that checkpoint group for the HF density matrix (eq 3's Sigma^H[rho_latt])
+  // and for the Sigma^GW/W build; iterations >= 2 revert to the loop's own QP G.
+  const bool ext_gf = not gf_grp.empty();
+  utils::check(not ext_gf or gf_grp == "scf" or gf_grp == "embed",
+               "qp_scf_loop: greens_func_source = \"{}\" is not supported. Valid options: "
+               "\"\" (inert, the loop's own analytic QP G), \"scf\", \"embed\".", gf_grp);
+  utils::check(not ext_gf or qp_params.qp_scf_mode != "evscf",
+               "qp_scf_loop: the external Green's function injection (greens_func_source = "
+               "\"{}\") is not implemented for qp_scf_mode = \"evscf\" -- evGW keeps its own "
+               "convention (notes/q5_option2_outer_loop_spec.md §4).", gf_grp);
   // http://patorjk.com/software/taag/#p=display&f=Calvin%20S&t=COQUI%20qp-scf
   app_log(1, "\n"
              "╔═╗╔═╗╔═╗ ╦ ╦╦  ┌─┐ ┌─┐   ┌─┐┌─┐┌─┐\n"
@@ -273,6 +291,9 @@ double qp_scf_loop(
   app_log(1, "  Convergence tolerance       = {}", conv_tol);
   app_log(1, "  Checkpoint HDF5             = {}", mb_state.coqui_prefix+".mbpt.h5");
   app_log(1, "  Restart                     = {}", (restart)? "yes" : "no");
+  if (ext_gf) {
+    app_log(1, "  External G (iteration 1)    = {}/iter{}", gf_grp, gf_iter);
+  }
   app_log(1, "  Number of processors        = {} cores per node, {} nodes\n",
           mpi->node_comm.size(), mpi->internode_comm.size());
   FT.metadata_log();
@@ -308,6 +329,43 @@ double qp_scf_loop(
   mu = update_mu(mu, *mf, sE_ska, FT.beta(), qp_params.mu_tolerance, qp_params.mu_update_alg);
   update_Dm(sDm_skij, sMO_skia, sE_ska, mu, FT.beta());
   Timer.stop("CANONICALIZATION");
+
+  // Project 2 increment Q5 (spec §1 piece 1): ITERATION 1 consumes an EXTERNAL G instead of
+  // the restart-H_eff's analytic QP G. Two consumers, one object:
+  //   (a) sDm_skij <- Dm[G_ext] here, for the HF stage (eq 3's Sigma^H[rho_latt]);
+  //   (b) sG_ext handed to add_qpscf_vcorr below, so update_w AND the Sigma^GW build screen
+  //       with the SAME G (W_corr = W[P^RPA[G_ext] + P^lad + P_C(P_imp-P_dc)P_C^dag]).
+  // Dm-from-G follows the Dyson convention verbatim (simple_dyson.cpp:143-145,
+  // dca_dyson.cpp:227): Dm = -G(tau -> beta). NOTE: mu is NOT taken from the external
+  // checkpoint -- the qp/map stage keeps the loop's OWN spectrum and chemical potential
+  // (spec §1: the CD kernel evaluates Sigma at the MAP stage from the loop's spectrum).
+  std::optional<sArray_t<Array_view_5D_t> > sG_ext;
+  if (ext_gf) {
+    const std::string filename = mb_state.coqui_prefix + ".mbpt.h5";
+    utils::check(std::filesystem::exists(filename),
+                 "qp_scf_loop: greens_func_source = \"{}\" while the CoQui checkpoint {} does "
+                 "not exist.", gf_grp, filename);
+    if (gf_iter < 0) {
+      auto [scf_it, df1e_it, df2e_it, embed_it] = chkpt::read_input_iterations(filename);
+      (void) df1e_it; (void) df2e_it;
+      gf_iter = (gf_grp == "embed")? embed_it : scf_it;
+      utils::check(gf_iter >= 0,
+                   "qp_scf_loop: greens_func_iteration = -1 with greens_func_source = \"{}\", "
+                   "but {} carries no \"{}/final_iter\".", gf_grp, filename, gf_grp);
+    }
+    app_log(1, "\n  Q5 re-QP-ization (Option 2): iteration {} consumes the external Green's "
+               "function {}/iter{} of {}.\n", init_it+1, gf_grp, gf_iter, filename);
+    sG_ext.emplace(read_greens_function(*mpi, mf.get(), filename, gf_iter, gf_grp));
+    FT.check_leakage(sG_ext.value(), imag_axes_ft::fermion, "external Green's function");
+    sDm_skij.win().fence();
+    if (mpi->node_comm.root()) {
+      auto Dm = sDm_skij.local();
+      FT.tau_to_beta(sG_ext.value().local(), Dm);
+      Dm *= -1;
+    }
+    sDm_skij.win().fence();
+    mpi->comm.barrier();
+  }
 
   Timer.start("WRITE");
   if (!restart) {
@@ -360,8 +418,12 @@ double qp_scf_loop(
         // 2. sHeff_skij with the updated QP energies while keeping sMO_skia the same.
         add_evscf_vcorr(mb_state, mu, mb_solver, mb_eri.corr_eri->get(), FT, qp_params, qp_params.keep_scr_coulomb_fixed);
       } else {
-        // add_qpscf_vcorr only updates sHeff_skij. MO_skia and E_ska are updated later. 
-        add_qpscf_vcorr(mb_state, mu, mb_solver, mb_eri.corr_eri->get(), FT, qp_params);
+        // add_qpscf_vcorr only updates sHeff_skij. MO_skia and E_ska are updated later.
+        // Q5: sG_ext is non-null in ITERATION 1 ONLY -- it is released right after, so
+        // iterations >= 2 fall back to the loop's own analytic QP G (spec §1).
+        add_qpscf_vcorr(mb_state, mu, mb_solver, mb_eri.corr_eri->get(), FT, qp_params,
+                        sG_ext? std::addressof(sG_ext.value()) : nullptr);
+        sG_ext.reset();
       }
     }
     Timer.stop("MBPT_SOLVERS");
@@ -485,7 +547,7 @@ qp_scf_loop(MBState&,                         \
             qp_params_t&, \
             solvers::mb_solver_t<solvers::gw_t>,       \
             iter_scf::iter_scf_t*, \
-            int, bool, double);
+            int, bool, double, std::string, long);
 
 // All combinations of thc/chol for 4 eri slots
 QPSCF_LOOP_INST(thc_reader_t, thc_reader_t, thc_reader_t, thc_reader_t)

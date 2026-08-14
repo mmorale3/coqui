@@ -30,6 +30,7 @@ try:
   from .weiss import *
   from .bath_fit import *
   from .retardation import *
+  from .outer_loop import *
   from .io import *
   from .plot import *
   _TRIQS_AVAILABLE = True

@@ -59,6 +59,27 @@ def convert_gw_edmft_params(gw_edmft_params: dict):
             "workflow would do nothing afterwards; set 'edmft_iter_per_loop' >= 1."
         )
 
+    # Q5 (notes/q5_option2_outer_loop_spec.md §1 piece 2): the outer-loop selector.
+    # "option1" is the Q4 frozen-H_eff stage, wired byte-identically to before.
+    # "option2" re-derives H_eff from Sigma^GW[G_latt, W_corr] EVERY outer cycle (PDF eq 3-4).
+    outer_loop = gw_edmft_group.get('outer_loop', 'option1')
+    if outer_loop not in {'option1', 'option2'}:
+        raise ValueError(
+            f"'outer_loop' must be one of \"option1\", \"option2\" (got {outer_loop!r})."
+        )
+    if outer_loop == 'option2' and lattice_solver != 'qpgw':
+        raise ValueError(
+            "outer_loop=\"option2\" re-derives H_eff from the qpGW lattice stage every "
+            f"cycle and therefore requires lattice_solver=\"qpgw\" (got {lattice_solver!r})."
+        )
+    gw_edmft_params['outer_loop'] = outer_loop
+    # Number of qp iterations of the per-cycle Option-2 lattice stage. 1 = the pure
+    # Option-2 one-shot re-QP step (spec §1); the outer loop supplies the outer iteration.
+    outer_qpgw_niter = gw_edmft_group.get('outer_qpgw_niter', 1)
+    if not isinstance(outer_qpgw_niter, int) or outer_qpgw_niter < 1:
+        raise ValueError("'outer_qpgw_niter' must be a positive integer.")
+    gw_edmft_params['outer_qpgw_niter'] = outer_qpgw_niter
+
     if lattice_solver == 'gw' and edmft_iter_per_loop == 0 and gw_iter_per_loop == 1:
         # Current GW+EDMFT SC logic does not upfold the GW solution and write new `embed` data 
         # if `gw_iter_per_loop` is 1 in order to save some memory in the checkpoint hdf5. 
@@ -140,6 +161,16 @@ def convert_gw_edmft_params(gw_edmft_params: dict):
             'div_treatment': div_treatment,
             'iter_alg': gw_iter_params
         }
+        if outer_loop == 'option2':
+            # Q5 / R-Q5-1: the stage now runs INSIDE every outer cycle, so it takes
+            # `outer_qpgw_niter` qp iterations per cycle (default 1 = the pure Option-2
+            # one-shot re-QP step) instead of running once to its own fixed point.
+            # The outer H_eff damping IS the qp loop's own iter_alg mixing against the
+            # checkpointed H_eff -- no new damping machinery. PDF §7 asks for a
+            # conservative alpha near the transition; gw_iter_params already carries the
+            # workflow default mixing = 0.3, and the user overrides it through
+            # 'iter_alg' (gw_mixing) or the 'qpgw' section below.
+            qpgw_params['niter'] = outer_qpgw_niter
         qpgw_params.update(deepcopy(gw_edmft_group.get('qpgw', {})))
         gw_edmft_params['qpgw'] = qpgw_params
 

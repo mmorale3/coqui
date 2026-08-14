@@ -51,15 +51,25 @@ auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_ax
               -> std::tuple<double, double>;
 
 /**
- * Generic self-consistent loop for quasiparticle equations. 
- * The template parameters allow for different types of self-energy solvers (e.g. HF, GW, GF2) 
+ * Generic self-consistent loop for quasiparticle equations.
+ * The template parameters allow for different types of self-energy solvers (e.g. HF, GW, GF2)
  * and different types of Coulomb Hamiltonian representations (e.g. THC, Cholesky).
+ *
+ * Project 2 increment Q5 (notes/q5_option2_outer_loop_spec.md §1): the last two arguments are
+ * the Option-2 re-QP-ization knobs, following the scf_loop naming convention.
+ * @param gf_grp  - checkpoint group of an EXTERNAL Green's function ("scf"/"embed"), which
+ *                  ITERATION 1 consumes in place of the restart-H_eff's analytic QP G (its
+ *                  density matrix feeds the HF stage and it feeds the Sigma^GW/W build;
+ *                  iterations >= 2 revert to the loop's own QP G). EMPTY = INERT (default):
+ *                  the loop is bit-identical to the pre-Q5 one.
+ * @param gf_iter - iteration inside gf_grp; -1 = that group's "final_iter".
  */
 template<typename eri_t, typename corr_solver_t>
 double qp_scf_loop(MBState &mb_state, eri_t &mb_eri, const imag_axes_ft::IAFT& FT,
                    qp_params_t &qp_params, solvers::mb_solver_t<corr_solver_t> mb_solver,
                    iter_scf::iter_scf_t *iter_solver = nullptr, int niter = 1,
-                   bool restart = false, double conv_tol = 1e-8);
+                   bool restart = false, double conv_tol = 1e-8,
+                   std::string gf_grp = "", long gf_iter = -1);
 
 /**
  * RPA energy functional loop.

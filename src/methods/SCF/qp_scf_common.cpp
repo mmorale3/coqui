@@ -1642,7 +1642,8 @@ void add_qpscf_vcorr(MBState &mb_state,
                      solvers::mb_solver_t<corr_solver_t> &mb_solver,
                      eri_t &eri,
                      const imag_axes_ft::IAFT &FT,
-                     qp_params_t &qp_params) {
+                     qp_params_t &qp_params,
+                     const sArray_t<Array_view_5D_t> *sG_ext) {
   using math::shm::make_shared_array;
 
   auto& sHeff_skij = mb_state.sHeff_skij.value();
@@ -1654,9 +1655,25 @@ void add_qpscf_vcorr(MBState &mb_state,
 
   mb_state.sSigma_tskij.emplace(make_shared_array<Array_view_5D_t>(*mpi, {nt, ns, nkpts, nbnd, nbnd}));
   mb_state.sG_tskij.emplace(make_shared_array<Array_view_5D_t>(*mpi, {nt, ns, nkpts, nbnd, nbnd}));
-  update_G(mb_state.sG_tskij.value(), sMO_skia, sE_ska, mu, FT);
+  if (sG_ext == nullptr) {
+    update_G(mb_state.sG_tskij.value(), sMO_skia, sE_ska, mu, FT);
+  } else {
+    // Project 2 increment Q5 (spec §1): the re-QP-ization step. The external G replaces the
+    // analytic QP G for BOTH consumers below -- update_w (so W_corr screens with
+    // P^RPA[G_ext] + P^lad + P_C(P_imp-P_dc)P_C^dag) and the Sigma^GW build. The MAP stage
+    // downstream (qp_approx / the mode-A CD kernel) is untouched: it consumes the MO-basis
+    // Sigma gather + mb_state.dW_qtPQ, both built from whatever G is here.
+    utils::check(sG_ext->shape() == mb_state.sG_tskij.value().shape(),
+                 "add_qpscf_vcorr: external Green's function shape {} != expected {}.",
+                 sG_ext->shape(), mb_state.sG_tskij.value().shape());
+    auto &sG = mb_state.sG_tskij.value();
+    sG.win().fence();
+    if (mpi->node_comm.root()) sG.local() = sG_ext->local();
+    sG.win().fence();
+    mpi->comm.barrier();
+  }
   FT.check_leakage(mb_state.sG_tskij.value(), imag_axes_ft::fermion, "Green's function");
-  
+
   // compute screen interaction
   utils::check(mb_solver.scr_eri!=nullptr, "add_qpscf_vcorr: mb_solver.scr_eri == nullptr.");
   mb_solver.scr_eri->update_w(mb_state, eri, mb_solver.corr->iter());
@@ -1829,8 +1846,8 @@ template double update_mu(double, const mf::MF&, const sArray_t<Array_view_3D_t>
 template void add_evscf_vcorr(MBState&, double, solvers::mb_solver_t<>&, thc_reader_t&, const imag_axes_ft::IAFT&, qp_params_t&, bool);
 template void add_evscf_vcorr(MBState&, double, solvers::mb_solver_t<>&, chol_reader_t&, const imag_axes_ft::IAFT&, qp_params_t&, bool);
 
-template void add_qpscf_vcorr(MBState&, double, solvers::mb_solver_t<>&, thc_reader_t&, const imag_axes_ft::IAFT&, qp_params_t&);
-template void add_qpscf_vcorr(MBState&, double, solvers::mb_solver_t<>&, chol_reader_t&, const imag_axes_ft::IAFT&, qp_params_t&);
+template void add_qpscf_vcorr(MBState&, double, solvers::mb_solver_t<>&, thc_reader_t&, const imag_axes_ft::IAFT&, qp_params_t&, const sArray_t<Array_view_5D_t>*);
+template void add_qpscf_vcorr(MBState&, double, solvers::mb_solver_t<>&, chol_reader_t&, const imag_axes_ft::IAFT&, qp_params_t&, const sArray_t<Array_view_5D_t>*);
 
 template double qp_eqn_linearized(double, analyt_cont::AC_t &, long, double, double, double);
 template std::tuple<double,double> qp_eqn_bisection(double, analyt_cont::AC_t &, long, double, double, double, double);

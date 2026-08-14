@@ -340,6 +340,11 @@ void add_evscf_vcorr(MBState &mb_state,
  * @param FT             - [INPUT] Fourier transform driver on imaginary axes
  * @param mu             - [INPUT] chemical potential
  * @param qp_params     - [INPUT] setups for quasiparitcle eqn
+ * @param sG_ext        - [INPUT] Project 2 increment Q5 (notes/q5_option2_outer_loop_spec.md
+ *                        §1): when non-null, the EXTERNAL Green's function replaces the
+ *                        analytic QP G that update_G would build from (sMO_skia, sE_ska, mu).
+ *                        Both update_w and the Sigma^GW build then see it. nullptr (default)
+ *                        = the pre-Q5 path, bit for bit.
  * @return new qp energies in share memory sE_ska(ns, nkpts, nbnd)
  */
 template<typename eri_t, typename corr_solver_t>
@@ -348,7 +353,8 @@ void add_qpscf_vcorr(MBState &mb_state,
                      solvers::mb_solver_t<corr_solver_t> &mb_solver,
                      eri_t &eri,
                      const imag_axes_ft::IAFT &FT,
-                     qp_params_t &qp_params);
+                     qp_params_t &qp_params,
+                     const sArray_t<Array_view_5D_t> *sG_ext = nullptr);
 
 template<typename function_t>
 double qp_eqn_linearized(double Vhf, function_t &Sigma, long I, double mu, double eps_ks, double eta = 0.0);
