@@ -258,6 +258,11 @@ namespace solvers {
                                                          : scf_grp.create_group(grp_name);
         nda::h5_write(iter_grp, "pi_lad_loc_wabcd",
                       mb_state.sPi_lad_loc_wabcd.value().local(), false);
+        // Q4-C3b: the DC-ready orbital/chi-convention object rides in the same group
+        // (dataset name distinct -- the consumers select with pi_lad_dc).
+        if (mb_state.sPi_lad_loc_orb_wabcd)
+          nda::h5_write(iter_grp, "pi_lad_loc_orb_wabcd",
+                        mb_state.sPi_lad_loc_orb_wabcd.value().local(), false);
       }
       thc.mpi()->comm.barrier();
     }
@@ -494,6 +499,140 @@ namespace solvers {
   }
 
   /**
+   * qpGW Q4 increment C3b (notes/q4_c3b_orbital_ladder_dc_spec.md; the R-Q4-2 AMENDMENT):
+   * the eq-7 bosonic DC's ladder half PROPER,
+   *
+   *   P^lad_loc,orb(i.nu)_abcd = (1/N_q) sum_q [ E(q)^dag ((1-XK)^-1 XKX)(q, i.nu) E(q) ],
+   *   E(k; q)_{(a nc + b),(m norb + n)} = U_{m a}(k) conj(U_{n b}(k + q)),
+   *
+   * i.e. the SAME pair-space sandwich the lattice ladder is, contracted with the MLWF pair
+   * legs instead of the THC density collapse -- an ORBITAL/chi-convention object on the
+   * scale of bubble[G_loc], with no metric inverse anywhere (that is the whole point of the
+   * amendment: the C3 THC adjoint carries the upfold's ||B||^2 gain, this does not). Leg
+   * derivation + the chi-convention statement: vertex_ladder.icc header; pinned by
+   * vertex_t::ladder_loc_gate (gates G2/G3).
+   *
+   * THE LEGS: the ONE fermionic projector, proj_boson.proj_fermi()'s C_skIai on the FULL BZ
+   * k axis, placed on the LADDER window's columns. The projector's band window must lie
+   * INSIDE the ladder window -- otherwise the projector has weight on bands the ladder
+   * never resummed and the object would silently drop it. Both windows are logged.
+   *
+   * ⚠ WHERE THAT REQUIREMENT ABORTS: this accumulator is OPPORTUNISTIC (it runs on every
+   * injection that has a bosonic projector, whether or not anyone asked for the ladder DC),
+   * so an incompatible pair of windows here is a SKIP with a loud warning, not a fatal --
+   * the shipped lih222 fixture is itself incompatible (projector [0, 2) vs the Q3/Q4 ladder
+   * window [1, 3)) and those runs must keep working. The FATAL lives where the object is
+   * actually demanded: downfold_edmft_impl's pi_lad_dc = "orbital" aborts when no
+   * P^lad_loc,orb is found rather than silently downgrading the DC.
+   *
+   * q-WEIGHTS: identical to accumulate_pi_lad_loc -- loop the FULL q mesh, map to the IBZ
+   * parent, conjugate on qp_trev, divide by nqpts once. (P^orb(-q) = conj(P^orb(q)) follows
+   * from the trev relations of U and G, exactly as conj(t^dag Pl t) does there. Both fixture
+   * meshes of this increment are unsymmetrized, so the trev branch is UNEXERCISED -- kept,
+   * flagged, not faked.)
+   */
+  void scr_coulomb_t::accumulate_pi_lad_loc_orb(MBState &mb_state, THC_ERI auto &thc) {
+    decltype(nda::range::all) all;
+    auto &proj_boson = mb_state.proj_boson.value();
+    utils::check(proj_boson.nImps() == 1,
+                 "scr_coulomb_t::accumulate_pi_lad_loc_orb: implemented for a SINGLE "
+                 "impurity only (nImps = {}).", proj_boson.nImps());
+    utils::check(_pol_vtx != nullptr,
+                 "scr_coulomb_t::accumulate_pi_lad_loc_orb: the ladder instance is absent.");
+    mf::MF &mf = *thc.MF();
+    auto C_skIai = proj_boson.proj_fermi().C_skIai();      // (ns, nk, nImps, norb, nOrbs_W)
+    auto const &W_rng = proj_boson.W_rng()[0];
+    auto bw = _pol_vtx->band_window();
+    if (W_rng.first() < bw.first() or W_rng.last() > bw.last()) {
+      app_log(1, "\n  [WARNING] Q4-C3b: the eq-7 ladder DC (orbital convention) was NOT "
+                 "produced.\n            The bosonic projector's band window [{}, {}) is "
+                 "not contained in the\n            ladder (C) window [{}, {}), so the "
+                 "local projection would drop bands the\n            ladder never "
+                 "resummed. Widen pol_vertex's window (or narrow the\n            "
+                 "projector) if you intend to consume pi_lad_dc = \"orbital\".",
+              W_rng.first(), W_rng.last(), bw.first(), bw.last());
+      mb_state.sPi_lad_loc_orb_wabcd.reset();
+      _pol_lad_loc_orb_max = -1.0;
+      _pol_lad_loc_orb_ratio = -1.0;
+      return;
+    }
+
+    const long ns = C_skIai.shape(0), nk = C_skIai.shape(1);
+    const long norb = proj_boson.nImpOrbs(), nab = norb * norb, nc = bw.size();
+    utils::check(nk == mf.nkpts() and ns == mf.nspin(),
+                 "scr_coulomb_t::accumulate_pi_lad_loc_orb: projector axes ({} spins, {} "
+                 "k-points) do not match the mean field ({}, {}).", ns, nk, mf.nspin(),
+                 mf.nkpts());
+    utils::check(C_skIai.shape(4) == W_rng.size(),
+                 "scr_coulomb_t::accumulate_pi_lad_loc_orb: projector column count {} != "
+                 "band window size {}.", C_skIai.shape(4), W_rng.size());
+
+    // U on the LADDER window's columns: zero on the bands the projector does not span
+    nda::array<ComplexType, 4> U_skia(ns, nk, norb, nc);
+    U_skia() = ComplexType(0.0);
+    const long off = W_rng.first() - bw.first();
+    for (long is = 0; is < ns; ++is)
+      for (long ik = 0; ik < nk; ++ik)
+        for (long m = 0; m < norb; ++m)
+          for (long j = 0; j < W_rng.size(); ++j)
+            U_skia(is, ik, m, off + j) = C_skIai(is, ik, 0, m, j);
+    app_log(2, "  [qpGW Q4-C3b] MLWF ladder legs: projector window [{}, {}) inside the "
+               "ladder window [{}, {}) (offset {}), {} impurity orbitals.",
+            W_rng.first(), W_rng.last(), bw.first(), bw.last(), off, norb);
+
+    auto Ploc = _pol_vtx->eval_pol_ladder_loc_whalf(mb_state, thc, U_skia);
+    const long nw_h = Ploc.shape(0), nq_ibz = Ploc.shape(1), nqpts = mf.nqpts();
+    const long nw_half = (_ft->nw_b() % 2 == 0) ? _ft->nw_b() / 2 : _ft->nw_b() / 2 + 1;
+    utils::check(nw_h == nw_half and Ploc.shape(2) == nab,
+                 "scr_coulomb_t::accumulate_pi_lad_loc_orb: evaluator returned {} x {} x "
+                 "{} rows, expected {} x {} x {}.", nw_h, nq_ibz, Ploc.shape(2), nw_half,
+                 mf.nqpts_ibz(), nab);
+
+    if (not mb_state.sPi_lad_loc_orb_wabcd or
+        mb_state.sPi_lad_loc_orb_wabcd.value().shape()[0] != nw_h)
+      mb_state.sPi_lad_loc_orb_wabcd.emplace(
+          math::shm::make_shared_array<Array_view_5D_t>(
+              *thc.mpi(), {nw_h, norb, norb, norb, norb}));
+
+    double lmax = 0.0;
+    mb_state.sPi_lad_loc_orb_wabcd.value().win().fence();
+    if (thc.mpi()->node_comm.root()) {
+      auto D = nda::reshape(mb_state.sPi_lad_loc_orb_wabcd.value().local(),
+                            shape_t<3>{nw_h, nab, nab});
+      D() = ComplexType(0.0);
+      for (long iq = 0; iq < nqpts; ++iq) {
+        const long iq_ibz = mf.qp_to_ibz(iq);
+        const bool trev = mf.qp_trev(iq);
+        for (long j = 0; j < nw_h; ++j) {
+          auto Pq = Ploc(j, iq_ibz, all, all);
+          if (trev)
+            D(j, all, all) += nda::conj(Pq);
+          else
+            D(j, all, all) += Pq;
+        }
+      }
+      D() /= double(nqpts);
+      for (auto const &v : D) lmax = std::max(lmax, std::abs(v));
+    }
+    mb_state.sPi_lad_loc_orb_wabcd.value().win().fence();
+    thc.mpi()->comm.barrier();
+    _pol_lad_loc_orb_max = thc.mpi()->comm.all_reduce_value(lmax, boost::mpi3::max<>{});
+
+    // gate G4: the scale statement of the amendment -- this object must sit ON the scale of
+    // bubble[G_loc] (the THC adjoint sat ~10 orders above it).
+    _pol_lad_loc_orb_ratio = -1.0;
+    if (mb_state.sPi_dc_wabcd and _pol_dc_bubble_max > 0.0) {
+      _pol_lad_loc_orb_ratio = _pol_lad_loc_orb_max / _pol_dc_bubble_max;
+      app_log(1, "  [qpGW Q4-C3b] ||P^lad_loc,orb||_max = {:.4e} vs ||P_dc,bubble||_max = "
+                 "{:.4e} (ratio {:.3e})", _pol_lad_loc_orb_max, _pol_dc_bubble_max,
+              _pol_lad_loc_orb_ratio);
+    } else {
+      app_log(1, "  [qpGW Q4-C3b] ||P^lad_loc,orb||_max = {:.4e} (no bubble P_dc present "
+                 "to compare against)", _pol_lad_loc_orb_max);
+    }
+  }
+
+  /**
    * qpGW Q3 increment I2 (notes/q3_bse_tier_spec.md section 4): the BSE tier injection.
    *
    *   P_latt(q, i.nu) = P^RPA(q, i.nu) + P^lad(q, i.nu),   P^lad = eq 6's [.]_{n >= 2}
@@ -645,8 +784,17 @@ namespace solvers {
     // Q4 C3: with a bosonic projector attached, the SAME ladder is also downfolded to the
     // impurity's local product basis -- eq 7's P_dc gains P^lad_loc (R-Q4-2). Nothing here
     // feeds back into the lattice P above; the local object is a DC ingredient only.
-    if (mb_state.proj_boson.has_value())
+    if (mb_state.proj_boson.has_value()) {
       accumulate_pi_lad_loc(mb_state, thc, Pl, tmap);
+      // Q4-C3b: ... and the DC-READY object next to it (the diagnostic above stays as-is).
+      // COST NOTE: this re-runs the pair-space kernel with the E legs -- the K blocks are
+      // rebuilt, so the ladder cost of an injection with a bosonic projector roughly
+      // doubles. The kernel already accepts both RHS blocks in ONE pass (pair_space_ladder
+      // takes Pi_ladder and Pi_lad_loc together); fusing the two calls is a pure
+      // performance follow-up and is deliberately NOT done here, so the injection path
+      // stays bit-identical to Q3 (gate G1).
+      accumulate_pi_lad_loc_orb(mb_state, thc);
+    }
   }
 
   /**

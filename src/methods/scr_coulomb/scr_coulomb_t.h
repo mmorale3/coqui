@@ -328,6 +328,17 @@ namespace solvers {
     // (gate Q4-c3(iii)); -1 when never measured / no bubble P_dc was present.
     double _pol_lad_loc_max = -1.0, _pol_dc_bubble_max = -1.0, _pol_lad_loc_ratio = -1.0;
 
+    // Q4-C3b (notes/q4_c3b_orbital_ladder_dc_spec.md): the eq-7 ladder DC PROPER -- the
+    // orbital/chi-convention local part of the same lattice ladder, on
+    // mb_state.sPi_lad_loc_orb_wabcd. Extracts the MLWF legs U(k) from
+    // proj_boson.proj_fermi() (window containment checked), evaluates the E-leg ladder and
+    // q-averages it with the SAME star/trev rule as accumulate_pi_lad_loc.
+    void accumulate_pi_lad_loc_orb(MBState &mb_state, THC_ERI auto &thc);
+    // ||P^lad_loc,orb||_max and its ratio to ||P_dc,bubble||_max at the last injection
+    // (gate G4: the amendment predicts O(1), i.e. a ratio of order 1); -1 when never
+    // measured / no bubble P_dc was present.
+    double _pol_lad_loc_orb_max = -1.0, _pol_lad_loc_orb_ratio = -1.0;
+
   public:
     // scGW-tilde L2: the last ladder eps_M readout (RPA, +ladder) at q_min
     std::pair<double, double> pol_eps_readout() const {
@@ -344,6 +355,9 @@ namespace solvers {
     double pol_lad_loc_max() const { return _pol_lad_loc_max; }
     double pol_dc_bubble_max() const { return _pol_dc_bubble_max; }
     double pol_lad_loc_ratio() const { return _pol_lad_loc_ratio; }
+    // Q4-C3b gate G4: the scale of the eq-7 ladder DC proper
+    double pol_lad_loc_orb_max() const { return _pol_lad_loc_orb_max; }
+    double pol_lad_loc_orb_ratio() const { return _pol_lad_loc_orb_ratio; }
     // Q3 gates (spec section 5 Q3-c/Q3-d): the PRIVATE ladder instance, so a test can
     // re-run the anchor identity on the very state the loop used. nullptr before the
     // first update_w with an active pol vertex.

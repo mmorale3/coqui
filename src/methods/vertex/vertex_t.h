@@ -1397,6 +1397,40 @@ namespace solvers {
     nda::array<ComplexType, 4> eval_pol_ladder_whalf(MBState &mb_state, THC_ERI auto &thc,
                                                      nda::array<double, 1> *lam_max = nullptr);
 
+    /**
+     * Q4-C3b (notes/q4_c3b_orbital_ladder_dc_spec.md): the ORBITAL / chi-convention local
+     * part of the SAME ladder -- the eq-7 bosonic DC's ladder half proper (the C3
+     * THC-adjoint object is a diagnostic, R-Q4-2 AMENDMENT). Returns
+     * (n_nu_half, nq_ibz, nab, nab), nab = norb^2, in the eval_Pi_rpa_dc pair pack
+     * abcd = (m, n, m', n'); the q-average is the caller's (star/trev rule).
+     * U_skia (ns, nk_FULL, norb, nc_ladder_window) are the MLWF legs; the derivation of
+     * the leg conjugation is in vertex_ladder.icc's header and is pinned by
+     * ladder_loc_gate. Pi_onerung_loc, when given, is RESIZED and filled with the
+     * one-rung analog. Same guards/scheduling as eval_pol_ladder_whalf; replicated.
+     */
+    nda::array<ComplexType, 4>
+    eval_pol_ladder_loc_whalf(MBState &mb_state, THC_ERI auto &thc,
+                              nda::array<ComplexType, 4> const &U_skia,
+                              nda::array<ComplexType, 4> *Pi_onerung_loc = nullptr);
+
+    /** Q4-C3b gates G2/G3 (vertex_ladder.icc): the leg pin and the chi-convention pin,
+     *  both against brute-force references written from the definitions. NOSYM only. */
+    struct ladder_loc_diag {
+      bool sym_active = false;
+      long norb = 0, nnu_checked = 0;
+      double onerung_resid = -1.0, onerung_scale = 0.0;  // G2 (machine class)
+      double bub_resid_w = -1.0, bub_scale = 0.0;        // G3 chi0 vs G-space (machine)
+      double bub_resid_phsym = -1.0;                     // G3 vs the PH-sym tau route
+      // ... and its exact characterization: the PH-sym half-grid route is the SYMMETRIC
+      // part of the tau object (tau_asym is the bubble's PH asymmetry; after symmetrizing,
+      // the routes agree at machine class)
+      double bub_tau_asym = -1.0, bub_resid_phsym_sym = -1.0;
+      double loc_ph_sym = -1.0;                          // |P^lad_loc(-nu) - P^lad_loc(nu)|
+      double lad_loc_max = 0.0;                          // scale material for G4
+    };
+    ladder_loc_diag ladder_loc_gate(MBState &mb_state, THC_ERI auto &thc,
+                                    nda::array<ComplexType, 4> const &U_skia);
+
     /** Q3 gates on the multi-nu evaluator (vertex_ladder.icc; spec section 5 Q3-c). */
     struct ladder_whalf_diag {
       double node_map_resid = -1.0;   // half-grid output vs the full mesh at nw_b/2 + j

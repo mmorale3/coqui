@@ -403,11 +403,15 @@ namespace methods {
     // default -- the only object this tree can produce today is the THC-adjoint one, whose
     // convention the amendment rejects as a DC contribution (increment Q4-C3b delivers the
     // orbital/chi-convention 4-leg projection). "thc_adjoint_diag" is named for what it is.
+    // "orbital" (Q4-C3b, notes/q4_c3b_orbital_ladder_dc_spec.md) is the DC-ready value:
+    // the orbital/chi-convention 4-leg projection of the same lattice ladder.
     auto pi_lad_dc = io::tolower_copy(
         io::get_value_with_default<std::string>(pt,"pi_lad_dc","none"));
-    utils::check(pi_lad_dc == "none" or pi_lad_dc == "thc_adjoint_diag",
+    utils::check(pi_lad_dc == "none" or pi_lad_dc == "thc_adjoint_diag" or
+                 pi_lad_dc == "orbital",
                  "downfolding_edmft: unknown pi_lad_dc = \"{}\". Valid options: \"none\" "
-                 "(default), \"thc_adjoint_diag\" (the DIAGNOSTIC-convention ladder DC of "
+                 "(default), \"orbital\" (the eq-7 ladder DC of Q4-C3b), "
+                 "\"thc_adjoint_diag\" (the DIAGNOSTIC-convention ladder DC of "
                  "Q4 C3 -- see the R-Q4-2 AMENDMENT before using it).", pi_lad_dc);
 
     _Timer.stop("DF_READ");
@@ -857,13 +861,25 @@ namespace methods {
     // P^lad_loc belongs to that lattice screening step, not to the Gloc used for the
     // bubble).
     if (pi_lad_dc != "none") {
-      app_log(1, "\n  [WARNING] pi_lad_dc = \"{}\": the ladder double counting is ON with "
-                 "the\n            DIAGNOSTIC (THC-adjoint) convention, which the R-Q4-2 "
-                 "AMENDMENT rejects\n            as a DC contribution. U(i.nu) from this "
-                 "run is a diagnostic, not a result.", pi_lad_dc);
+      const bool orb_dc = (pi_lad_dc == "orbital");
+      // Q4-C3b: the "orbital" value selects the DC-ready object (same read pattern, dataset
+      // and MBState slot swapped); the diagnostic warning belongs to the OTHER value only.
+      const std::string lad_dset = orb_dc ? "pi_lad_loc_orb_wabcd" : "pi_lad_loc_wabcd";
+      if (orb_dc)
+        app_log(1, "\n  - pi_lad_dc = \"orbital\": eq 7's P_dc = bubble[Gloc] + P^lad_loc "
+                   "with the orbital/chi-convention\n    ladder DC of increment Q4-C3b "
+                   "(dataset {}).", lad_dset);
+      else
+        app_log(1, "\n  [WARNING] pi_lad_dc = \"{}\": the ladder double counting is ON with "
+                   "the\n            DIAGNOSTIC (THC-adjoint) convention, which the R-Q4-2 "
+                   "AMENDMENT rejects\n            as a DC contribution. U(i.nu) from this "
+                   "run is a diagnostic, not a result.", pi_lad_dc);
       nda::array<ComplexType, 5> Pi_lad_loc;
       bool have_lad = false;
-      if (mb_state.sPi_lad_loc_wabcd) {
+      if (orb_dc and mb_state.sPi_lad_loc_orb_wabcd) {
+        Pi_lad_loc = mb_state.sPi_lad_loc_orb_wabcd.value().local();
+        have_lad = true;
+      } else if (not orb_dc and mb_state.sPi_lad_loc_wabcd) {
         Pi_lad_loc = mb_state.sPi_lad_loc_wabcd.value().local();
         have_lad = true;
       } else if (mpi->node_comm.root()) {
@@ -874,14 +890,26 @@ namespace methods {
           auto g = root_grp.open_group(g_grp[0]);
           if (g.has_subgroup(gname)) {
             auto ig = g.open_group(gname);
-            if (ig.has_dataset("pi_lad_loc_wabcd")) {
-              nda::h5_read(ig, "pi_lad_loc_wabcd", Pi_lad_loc);
+            if (ig.has_dataset(lad_dset)) {
+              nda::h5_read(ig, lad_dset, Pi_lad_loc);
               have_lad = true;
             }
           }
         }
       }
       mpi->node_comm.broadcast_n(&have_lad, 1, 0);
+      // Q4-C3b: the DC-ready value is a DEMAND -- if the object is missing, the run would
+      // silently fall back to a bubble-only P_dc. That is the failure the amendment's whole
+      // bookkeeping exists to prevent, so it is fatal here (the producer's own
+      // window-compatibility skip logs the usual cause).
+      if (orb_dc)
+        utils::check(have_lad,
+                     "downfold_edmft_impl: pi_lad_dc = \"orbital\" but no P^lad_loc,orb is "
+                     "available -- neither MBState nor {}/iter{} of {} carries "
+                     "\"pi_lad_loc_orb_wabcd\". The lattice stage must have run with an "
+                     "injecting ladder AND a bosonic projector whose band window lies "
+                     "inside the ladder window (see the Q4-C3b warning in its log).",
+                     g_grp[0], g_iter[0], filename);
       if (have_lad) {
         sPi_dc_wabcd_new.win().fence();
         if (mpi->node_comm.root()) {

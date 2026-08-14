@@ -149,6 +149,15 @@ public:
   // under the explicit opt-in knob pi_lad_dc = "thc_adjoint_diag" (downfold_edmft_impl).
   // Same shape class as sPi_dc_wabcd, (nw_half, nImpOrbs^4). Single impurity.
   std::optional<sArray_t<nda::array_view<ComplexType, 5> > > sPi_lad_loc_wabcd;
+  // THE eq-7 LADDER DC PROPER (Project 2 increment Q4-C3b,
+  // notes/q4_c3b_orbital_ladder_dc_spec.md): the ORBITAL / chi-convention local part of
+  // the lattice ladder, (1/N_q) sum_q E(q)^dag [(1-XK)^-1 XKX](q, i.nu) E(q) with the MLWF
+  // pair-leg maps E -- an O(1) object in the SAME convention as sPi_dc_wabcd (the pair pack
+  // abcd of eval_Pi_rpa_dc), no metric inverse anywhere. Produced by the same injection as
+  // the diagnostic above whenever a bosonic projector is present; consumed under
+  // pi_lad_dc = "orbital". Same shape class as sPi_dc_wabcd, (nw_half, nImpOrbs^4).
+  // Single impurity.
+  std::optional<sArray_t<nda::array_view<ComplexType, 5> > > sPi_lad_loc_orb_wabcd;
 
   // Quasiparticle approx. to the dynamic part of the double-counting self-energy
   std::optional<nda::array<ComplexType, 4> > Vcorr_dc_sIab;

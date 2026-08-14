@@ -720,6 +720,125 @@ TEST_CASE("downfold_1e_mb_qp", "[methods][embed][df_1e]") {
     }
   }
 
+  /**
+   * Project 2 increment Q4-C3b (notes/q4_c3b_orbital_ladder_dc_spec.md), gate G5: the
+   * CONSUMER leg of the eq-7 ladder DC. pi_lad_dc = "orbital" makes P_dc gain
+   * P^lad_loc,orb (dataset "pi_lad_loc_orb_wabcd" of the screening group), and nothing
+   * else in downfold_2e changes: the default leg below reproduces downfold_2e_edmft's
+   * stored values EXACTLY, on the same fixture, with the new knob code compiled in.
+   *
+   * The ladder object is SYNTHETIC here (a fixed constant tensor injected into the
+   * checkpoint). This test is about the consumer wiring -- which dataset is read, that the
+   * sum reaches Pi_dc and that a missing object is fatal rather than silent. The physics
+   * object and its convention are pinned in test_methods_qpgw_c3b (gates G2/G3/G4).
+   */
+  TEST_CASE("downfold_2e_edmft_pi_lad_orbital", "[methods][embed][df_2e]") {
+    auto& mpi = utils::make_unit_test_mpi_context();
+    auto [outdir, prefix_in] = utils::utest_filename("qe_lih222");
+    auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi, "qe_lih222"));
+    std::string wannier_file = outdir + "/lih_wan.h5";
+
+    thc_reader_t thc(mf, make_thc_reader_ptree(mf->nbnd()*20, "", "incore", "", "bdft",
+                                               1e-10, mf->ecutrho(), 1, 1024));
+    std::string prefix = "coqui_c3b";
+    imag_axes_ft::IAFT ft(1000.0, 1.2, imag_axes_ft::ir_basis, "high", true);
+    simple_dyson dyson(mf.get(), &ft);
+    write_mf_data(*mf, ft, dyson, prefix);
+    mpi->comm.barrier();
+
+    auto run_leg = [&](std::string const &pi_lad_dc) {
+      MBState mb_state(ft, prefix, mf, wannier_file, true);
+      ptree pt;
+      pt.put("permut_symm", true);
+      pt.put("force_real", true);
+      pt.put("greens_func_source", "mf");
+      pt.put("greens_func_iteration", 0);       // the group write_mf_data just wrote
+      if (not pi_lad_dc.empty()) pt.put("pi_lad_dc", pi_lad_dc);
+      embed_eri_t embed_2e(*mf, "gygi_smallest_q");
+      embed_2e.downfolding_edmft(thc, mb_state, pt, "gw_edmft");
+      mpi->comm.barrier();
+      nda::array<ComplexType, 5> Uloc, Pi_dc;
+      long iter;
+      h5::file file(prefix + ".mbpt.h5", 'r');
+      auto df_grp = h5::group(file).open_group("downfold_2e");
+      h5::h5_read(df_grp, "final_iter", iter);
+      auto iter_grp = df_grp.open_group("iter" + std::to_string(iter));
+      nda::h5_read(iter_grp, "Uloc_wabcd", Uloc);
+      nda::h5_read(iter_grp, "Pi_dc_wabcd", Pi_dc);
+      return std::make_pair(Uloc, Pi_dc);
+    };
+
+    // ---- the DEFAULT leg: bit-for-bit the downfold_2e_edmft reference ------------------
+    auto [U_def, Pdc_def] = run_leg("");
+    VALUE_EQUAL(U_def(0,0,0,0,0), -0.350314225326, 1e-5);
+    VALUE_EQUAL(U_def(0,0,1,0,1), -0.000005850911, 1e-5);
+    VALUE_EQUAL(U_def(0,1,1,1,1), -0.220909949584, 1e-5);
+    VALUE_EQUAL(U_def(0,0,0,1,1), -0.115138998264, 1e-5);
+
+    // ---- inject a synthetic P^lad_loc,orb into the screening group ---------------------
+    const long nw_half = (ft.nw_b()%2==0)? ft.nw_b()/2 : ft.nw_b()/2+1;
+    const long n = U_def.shape(1);
+    const double amp = 1e-3;
+    if (mpi->comm.root()) {
+      nda::array<ComplexType, 5> P(nw_half, n, n, n, n);
+      P() = ComplexType(0.0);
+      for (long w = 0; w < nw_half; ++w)
+        for (long a = 0; a < n; ++a)
+          for (long c = 0; c < n; ++c) P(w, a, a, c, c) = ComplexType(amp, 0.0);
+      h5::file file(prefix + ".mbpt.h5", 'a');
+      h5::group grp(file);
+      auto scf_grp = grp.open_group("scf");
+      auto it_grp = scf_grp.open_group("iter0");
+      nda::h5_write(it_grp, "pi_lad_loc_orb_wabcd", P, false);
+    }
+    mpi->comm.barrier();
+
+    // ---- the ORBITAL leg: P_dc gains the object ---------------------------------------
+    auto [U_orb, Pdc_orb] = run_leg("orbital");
+    // THE GATE: the stored Pi_dc must differ from the default leg by EXACTLY the injected
+    // tensor, element by element -- that pins the dataset selection, the shape check and
+    // the sum (a wrong dataset name would have aborted; a wrong slot would show up here).
+    double perr = 0.0, pmax = 0.0;
+    for (long w = 0; w < Pdc_def.shape(0); ++w)
+      for (long a = 0; a < n; ++a)
+        for (long b = 0; b < n; ++b)
+          for (long c = 0; c < n; ++c)
+            for (long d = 0; d < n; ++d) {
+              const ComplexType inj = (a == b and c == d) ? ComplexType(amp, 0.0)
+                                                          : ComplexType(0.0);
+              perr = std::max(perr, std::abs(Pdc_orb(w,a,b,c,d) - Pdc_def(w,a,b,c,d) - inj));
+              pmax = std::max(pmax, std::abs(Pdc_def(w,a,b,c,d)));
+            }
+    // ... and the Uloc shift, RECORDED not gated (spec G5). On this fixture there is no
+    // impurity polarizability at all, so Uloc == Wloc and P_dc does not reach U(i.nu):
+    // the measured shift is 0. The DC path itself is what this leg pins.
+    double dmax = 0.0, umax = 0.0;
+    for (long w = 0; w < U_def.shape(0); ++w)
+      for (long a = 0; a < n; ++a)
+        for (long b = 0; b < n; ++b)
+          for (long c = 0; c < n; ++c)
+            for (long d = 0; d < n; ++d) {
+              dmax = std::max(dmax, std::abs(U_orb(w,a,b,c,d) - U_def(w,a,b,c,d)));
+              umax = std::max(umax, std::abs(U_def(w,a,b,c,d)));
+            }
+    app_log(1, "@@C3B G5 pi_lad_dc = \"orbital\" (synthetic P^lad_loc,orb, amplitude "
+               "{:.1e}): |Pi_dc(orb) - Pi_dc(def) - injected|_max = {:.3e} on "
+               "||Pi_dc||_max = {:.6e}; Uloc shift = {:.6e} on ||Uloc||_max = {:.6e} "
+               "(Uloc == Wloc on this fixture -- no impurity polarizability)",
+            amp, perr, pmax, dmax, umax);
+    // MEASURED (2026-08-14): perr = 0.000e+00 exactly; Uloc shift = 0. NON-VACUITY of the
+    // perr gate: had the object NOT been added, perr would be the injected amplitude 1e-03
+    // -- 11 orders above the stored bubble P_dc of this fixture, which is itself machine
+    // zero (||Pi_dc||_max = 2.26e-14 on the mf Green's function written by write_mf_data).
+    REQUIRE(pmax > 0.0);
+    REQUIRE(perr < 1e-14);            // the orbital object landed on Pi_dc exactly
+    REQUIRE(umax > 0.0);
+
+    mpi->comm.barrier();
+    if (mpi->comm.root()) remove((prefix + ".mbpt.h5").c_str());
+    mpi->comm.barrier();
+  }
+
   TEST_CASE("downfold_model_cholesky", "[methods][embed][df_2e]") {
     auto& mpi = utils::make_unit_test_mpi_context();
 

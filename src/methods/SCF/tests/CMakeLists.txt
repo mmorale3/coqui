@@ -46,3 +46,15 @@ target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield method
 add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
 set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
                     TIMEOUT 14400)
+
+# Project 2 increment Q4-C3b (notes/q4_c3b_orbital_ladder_dc_spec.md): the eq-7 ladder DC
+# proper -- the orbital/chi-convention local part of the lattice ladder. Separate executable
+# so the Q3/Q4 suites keep their exact tallies (gate G1's no-disturbance discipline).
+set(TEST_ID methods_qpgw_c3b)
+
+add_executable(test_${TEST_ID} test_methods_qpgw_c3b.cpp)
+target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield methods_lib)
+
+add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
+set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
+                    TIMEOUT 14400)

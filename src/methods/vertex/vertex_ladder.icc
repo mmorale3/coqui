@@ -47,6 +47,41 @@
  *
  * L1/L2 run NOSYM, window mode (the gate fixtures + the readout); symmetry + Wannier
  * ride with L3.
+ *
+ * THE ORBITAL (chi-convention) LOCAL PROJECTION (Q4-C3b,
+ * notes/q4_c3b_orbital_ladder_dc_spec.md; R-Q4-2 AMENDMENT of
+ * notes/q4_edmft_skeleton_spec.md). The eq-7 bosonic DC needs the SAME pair-space
+ * sandwich contracted onto the impurity's MLWF product basis instead of the THC
+ * density points:
+ *
+ *   P^lad_loc(q, nu)_{(mn),(m'n')} = -spin [ E(q)^dag (1 - Xh Kt)^{-1} Xh Kt Xh E(q) ],
+ *   E(k; q)_{(a nc + b), (m norb + n)} = U_{m a}(k) . conj(U_{n b}(k + q)),
+ *
+ * with U(k) the ONE fermionic projector (projector_t::C_skIai restricted to the ladder
+ * window's rows). THE LEG PATTERN IS NOT GUESSED -- it is the d-map isomorphism: the
+ * pair index r = (a nc + b) of this space carries a on the k line and b on the k+q
+ * line (see chi0 above), and the THC collapse realizes that external pairing as
+ * d_{(a nc + b), N} = Xb_{N a}(k) . conj(Xb_{N b}(k + q)) -- X-column UNCONJUGATED on
+ * the k (hole) leg, X-column CONJUGATED on the k+q (particle) leg, one aux label N on
+ * both. E is the same map with the U columns in place of the X columns and the single
+ * label N split into the two orbital labels (m, n); conjugation is inherited leg by
+ * leg. The left leg is then E^dag = conj(E)^T exactly as the kernel already uses
+ * conj(D)^T, so no new sign or ordering choice is made anywhere.
+ *
+ * WHY THAT LANDS IN THE eval_Pi_rpa_dc (chi) CONVENTION, mechanically: substituting the
+ * definitions above, the ONE-chi0 sandwich collapses to
+ *   (1/nk) sum_k [E^dag chi0 E]_{(mn),(m'n')}
+ *     = -(1/nk) sum_{k,s} Twt(nu, s) [U G U^dag](k, beta - s)_{m'm} .
+ *                                     [U G U^dag](k + q, s)_{n n'},
+ * i.e. exactly dc_utilities.hpp:425-496's Pi_abcd(t) = spin_factor G_bd(t) G_ca(beta-t)
+ * with (a, b, c, d) = (m, n, m', n') and spin_factor = -spin (the kernel's own prefactor
+ * -spinfac reproduces it; the same substitution with the D legs reproduces rpa_pi.icc's
+ * sp_factor Gp . conj(Gn) bubble, which is the cross-check that the prefactor convention
+ * of this file IS the house polarization convention). Hence the pair pack of the OUTPUT
+ * is abcd = (m, n, m', n') with row (a b) = (m n) and column (c d) = (m', n'), directly
+ * addable to P_dc. Both statements are PINNED, not assumed: gate G2 (one-rung vs a
+ * brute-force 4-leg contraction) and gate G3 (the E-leg bubble vs a G-space brute force
+ * in the eval_Pi_rpa_dc convention) -- vertex_t::ladder_loc_gate below.
  */
 
 #include "utilities/check.hpp"
@@ -153,6 +188,14 @@ namespace solvers {
      * solve forms anyway; written like the outputs (zeroed here, one owner per (jn, iq)),
      * so the caller reduces it with max. Read-only w.r.t. the solve: the outputs are
      * BITWISE unchanged whether or not it is requested.
+     *
+     * Q4-C3b: U_skia != nullptr (ns, nk, norb, nc) additionally enables the ORBITAL
+     * (chi-convention) outputs Pi_lad_loc / Pi_onerung_loc, (nnu, nq_ext, nab, nab) with
+     * nab = norb^2 -- the SAME sandwich with the E legs of the file header in place of the
+     * THC collapse D. They are a second RHS block through the SAME resolvent: the inverse
+     * Rm the historic path already forms is reused verbatim, so requesting them leaves the
+     * D-space outputs BITWISE unchanged (gate G1) and costs one extra (Dsz x nab) triple
+     * product per (jn, iq).
      */
     inline void pair_space_ladder(nda::MemoryArrayOfRank<5> auto const &G_CC,  // (nt,ns,nk,nc,nc)
                                   nda::array<ComplexType, 4> const &Xb,        // (ns,nk,Nm,nc)
@@ -166,7 +209,11 @@ namespace solvers {
                                   long rank = 0, long nproc = 1,
                                   vertex_sym::sym_ctx const *symc = nullptr,
                                   boost::mpi3::communicator *g_comm = nullptr,
-                                  nda::array<double, 1> *lam_max = nullptr) {  // (nnu) or null
+                                  nda::array<double, 1> *lam_max = nullptr,   // (nnu) or null
+                                  // Q4-C3b: MLWF legs + the orbital/chi-convention outputs
+                                  nda::array<ComplexType, 4> const *U_skia = nullptr,
+                                  nda::array<ComplexType, 4> *Pi_lad_loc = nullptr,
+                                  nda::array<ComplexType, 4> *Pi_onerung_loc = nullptr) {
       decltype(nda::range::all) all;
       const long nt = G_CC.shape(0), ns = G_CC.shape(1), nk = G_CC.shape(2);
       const long nc = G_CC.shape(3), Nm = Xb.shape(2);
@@ -180,13 +227,37 @@ namespace solvers {
       const bool sym = (symc != nullptr and symc->active);
       const long nq_w = W0b.shape(0);
       const long nq_full = kmq.shape(0);
-      utils::check(Pi_onerung != nullptr or Pi_ladder != nullptr,
+      // Q4-C3b: the orbital (chi-convention) leg map E, enabled by U_skia
+      const bool want_loc = (Pi_lad_loc != nullptr or Pi_onerung_loc != nullptr);
+      utils::check(not want_loc or U_skia != nullptr,
+                   "pair_space_ladder: the orbital outputs need the MLWF legs U_skia.");
+      const long norb = want_loc ? U_skia->shape(2) : 0;
+      const long nab = norb * norb;
+      if (want_loc)
+        utils::check(U_skia->shape(0) == ns and U_skia->shape(1) == nk and
+                     U_skia->shape(3) == nc,
+                     "pair_space_ladder: U_skia is {} x {} x {} x {}, expected {} x {} x "
+                     "norb x {}.", U_skia->shape(0), U_skia->shape(1), U_skia->shape(2),
+                     U_skia->shape(3), ns, nk, nc);
+      utils::check(Pi_onerung != nullptr or Pi_ladder != nullptr or want_loc,
                    "pair_space_ladder: no output requested.");
-      const long nq_ext = (Pi_onerung != nullptr) ? Pi_onerung->shape(1)
-                                                  : Pi_ladder->shape(1);
-      if (Pi_onerung != nullptr and Pi_ladder != nullptr)
-        utils::check(Pi_ladder->shape(1) == nq_ext,
-                     "pair_space_ladder: output q axes differ.");
+      long nq_ext = -1;
+      if (Pi_onerung != nullptr) nq_ext = Pi_onerung->shape(1);
+      else if (Pi_ladder != nullptr) nq_ext = Pi_ladder->shape(1);
+      else if (Pi_lad_loc != nullptr) nq_ext = Pi_lad_loc->shape(1);
+      else nq_ext = Pi_onerung_loc->shape(1);
+      for (auto const &o : {Pi_onerung, Pi_ladder})
+        if (o != nullptr)
+          utils::check(o->shape(1) == nq_ext,
+                       "pair_space_ladder: output q axes differ ({} vs {}).",
+                       o->shape(1), nq_ext);
+      for (auto const &o : {Pi_lad_loc, Pi_onerung_loc})
+        if (o != nullptr)
+          utils::check(o->shape(0) == nnu and o->shape(1) == nq_ext and
+                       o->shape(2) == nab and o->shape(3) == nab,
+                       "pair_space_ladder: orbital output is {} x {} x {} x {}, expected "
+                       "{} x {} x {} x {}.", o->shape(0), o->shape(1), o->shape(2),
+                       o->shape(3), nnu, nq_ext, nab, nab);
       if (sym) {
         utils::check(nq_w == symc->nq_ibz and nq_ext == symc->nq_ibz and
                      nq_full == symc->nq_full and nk == symc->nk_full,
@@ -208,6 +279,8 @@ namespace solvers {
         utils::check(m >= 0 and m < nw_b, "pair_space_ladder: nu index {} out of range.", m);
       if (Pi_onerung != nullptr) (*Pi_onerung)() = ComplexType(0.0);
       if (Pi_ladder != nullptr) (*Pi_ladder)() = ComplexType(0.0);
+      if (Pi_lad_loc != nullptr) (*Pi_lad_loc)() = ComplexType(0.0);
+      if (Pi_onerung_loc != nullptr) (*Pi_onerung_loc)() = ComplexType(0.0);
       if (lam_max != nullptr) {
         utils::check(Pi_ladder != nullptr,
                      "pair_space_ladder: lam_max requires the resummed-ladder output.");
@@ -243,6 +316,15 @@ namespace solvers {
       // the historic path's allocation profile is untouched)
       const long lam_d = (lam_max != nullptr) ? Dsz : 0;
       nda::array<ComplexType, 1> pv(lam_d), pw(lam_d);
+      // Q4-C3b workspace: sized 0 unless the orbital outputs are requested (same rule --
+      // the historic allocation profile is untouched)
+      const long lnk = want_loc ? nk : 0, lD = want_loc ? Dsz : 0;
+      const long lnc2 = want_loc ? nc2 : 0;
+      nda::array<ComplexType, 3> Emat(lnk, lnc2, nab), Ecj(lnk, lnc2, nab);
+      nda::array<ComplexType, 3> Y1e(lnk, lnc2, nab), Y2e(lnk, lnc2, nab);
+      nda::array<ComplexType, 2> KtY1e(lnc2, nab), T2e(nab, nab);
+      nda::array<ComplexType, 2> XE(lD, nab), KXE(lD, nab), XKXE(lD, nab), ZlE(lD, nab);
+      nda::array<ComplexType, 2> Estack_c(lD, nab);
 
       // P3: intra-group coordinates (lsize = 1 without a group communicator)
       const long lrank = (g_comm != nullptr) ? g_comm->rank() : 0;
@@ -257,6 +339,7 @@ namespace solvers {
             Dmat() = ComplexType(0.0);
             Dcj() = ComplexType(0.0);
             Cb() = ComplexType(0.0);
+            if (want_loc) { Emat() = ComplexType(0.0); Ecj() = ComplexType(0.0); }
           }
           for (long ik = 0; ik < nk; ++ik) {
             if (ik % lsize != lrank) continue;
@@ -268,6 +351,18 @@ namespace solvers {
                       Xb(is, ik, N, a) * std::conj(Xb(is, ikpq, N, b));
                   Dcj(ik, a * nc + b, N) = std::conj(Dmat(ik, a * nc + b, N));
                 }
+            // Q4-C3b: the MLWF pair-leg map E, the d-map isomorphism with U columns
+            // (file header): hole leg U(k) unconjugated, particle leg U(k+q) conjugated.
+            if (want_loc)
+              for (long a = 0; a < nc; ++a)
+                for (long b = 0; b < nc; ++b)
+                  for (long m = 0; m < norb; ++m)
+                    for (long n2 = 0; n2 < norb; ++n2) {
+                      const ComplexType e = (*U_skia)(is, ik, m, a) *
+                                            std::conj((*U_skia)(is, ikpq, n2, b));
+                      Emat(ik, a * nc + b, m * norb + n2) = e;
+                      Ecj(ik, a * nc + b, m * norb + n2) = std::conj(e);
+                    }
             for (long s = 0; s < nt; ++s) {
               const long sm = tools.t_mirror(s);
               for (long p1p = 0; p1p < nc; ++p1p)
@@ -287,6 +382,10 @@ namespace solvers {
             g_comm->all_reduce_in_place_n(Dmat.data(), Dmat.size(), std::plus<>{});
             g_comm->all_reduce_in_place_n(Dcj.data(), Dcj.size(), std::plus<>{});
             g_comm->all_reduce_in_place_n(Cb.data(), Cb.size(), std::plus<>{});
+            if (want_loc) {
+              g_comm->all_reduce_in_place_n(Emat.data(), Emat.size(), std::plus<>{});
+              g_comm->all_reduce_in_place_n(Ecj.data(), Ecj.size(), std::plus<>{});
+            }
           }
           // --- the rung blocks K(k, k') (nu-independent) -------------------------------
           // qx = k - k' (kmq orientation; the ladder's k' IS the anchor's ikmqx). The
@@ -325,15 +424,20 @@ namespace solvers {
             g_comm->all_reduce_in_place_n(Kb.data(), Kb.size(), std::plus<>{});
           // --- Kt[(k'),(k)] = K(k,k')^T and conj(D) stack (nu-independent) -------------
           // P3: packed only where a resolvent solve actually runs on this rank.
-          const bool solves_here = (Pi_ladder != nullptr and lrank < std::min(lsize, nnu));
+          const bool solves_here = ((Pi_ladder != nullptr or Pi_lad_loc != nullptr)
+                                    and lrank < std::min(lsize, nnu));
           if (solves_here) {
             for (long ikp = 0; ikp < nk; ++ikp)
               for (long ik = 0; ik < nk; ++ik)
                 for (long r = 0; r < nc2; ++r)
                   for (long c = 0; c < nc2; ++c)
                     Kbig(ikp * nc2 + r, ik * nc2 + c) = Kb(ik, ikp, c, r);
-            for (long ik = 0; ik < nk; ++ik)
-              for (long r = 0; r < nc2; ++r) Dstack_c(ik * nc2 + r, all) = Dcj(ik, r, all);
+            if (Pi_ladder != nullptr)
+              for (long ik = 0; ik < nk; ++ik)
+                for (long r = 0; r < nc2; ++r) Dstack_c(ik * nc2 + r, all) = Dcj(ik, r, all);
+            if (Pi_lad_loc != nullptr)
+              for (long ik = 0; ik < nk; ++ik)
+                for (long r = 0; r < nc2; ++r) Estack_c(ik * nc2 + r, all) = Ecj(ik, r, all);
           }
 
           // --- per requested nu: one-rung rebuild + resummation ------------------------
@@ -357,7 +461,25 @@ namespace solvers {
                   Pr += T2;
                 }
             }
-            if (Pi_ladder == nullptr) continue;
+            // Q4-C3b: the SAME one-rung contraction with the E legs (the G2 pin target)
+            if (Pi_onerung_loc != nullptr) {
+              for (long ik = 0; ik < nk; ++ik) {
+                nda::blas::gemm(Cb(ik, jn, all, all), Emat(ik, all, all),
+                                Y1e(ik, all, all));
+                nda::blas::gemm(nda::transpose(Cb(ik, jn, all, all)), Ecj(ik, all, all),
+                                Y2e(ik, all, all));
+              }
+              auto Pre = (*Pi_onerung_loc)(jn, iq, all, all);
+              for (long ik = 0; ik < nk; ++ik)
+                for (long ikp = 0; ikp < nk; ++ikp) {
+                  nda::blas::gemm(nda::transpose(Kb(ik, ikp, all, all)),
+                                  Y1e(ik, all, all), KtY1e);
+                  nda::blas::gemm(ComplexType(pref), nda::transpose(Y2e(ikp, all, all)),
+                                  KtY1e, ComplexType(0.0), T2e);
+                  Pre += T2e;
+                }
+            }
+            if (Pi_ladder == nullptr and Pi_lad_loc == nullptr) continue;
             // Pi_ladder = -spin conj(D)^T (1 - Xh Kt)^{-1} Xh Kt Xh D
             for (long ikp = 0; ikp < nk; ++ikp) {
               auto Krows = Kbig(nda::range(ikp * nc2, (ikp + 1) * nc2), all);
@@ -385,26 +507,50 @@ namespace solvers {
               }
               (*lam_max)(jn) = std::max((*lam_max)(jn), lam);
             }
-            for (long ik = 0; ik < nk; ++ik) {
-              auto Drows = XD(nda::range(ik * nc2, (ik + 1) * nc2), all);
-              nda::blas::gemm(ComplexType(1.0 / nk), Cb(ik, jn, all, all),
-                              Dmat(ik, all, all), ComplexType(0.0), Drows);
-            }
-            nda::blas::gemm(Kbig, XD, KXD);
-            for (long ikp = 0; ikp < nk; ++ikp) {
-              auto Kr = KXD(nda::range(ikp * nc2, (ikp + 1) * nc2), all);
-              auto Xr = XKXD(nda::range(ikp * nc2, (ikp + 1) * nc2), all);
-              nda::blas::gemm(ComplexType(1.0 / nk), Cb(ikp, jn, all, all), Kr,
-                              ComplexType(0.0), Xr);
-            }
+            // the resolvent depends on XK only -- formed here so BOTH RHS blocks (the
+            // THC-collapse D and, at Q4-C3b, the MLWF E) share the one inverse. Moving it
+            // ahead of the D block below changes no arithmetic on the historic path.
             Rm() = ComplexType(0.0);
             Rm() -= XK;
             for (long i = 0; i < Dsz; ++i) Rm(i, i) += ComplexType(1.0);
             nda::inverse_in_place(Rm);
-            nda::blas::gemm(Rm, XKXD, Zl);
-            auto Pl = (*Pi_ladder)(jn, iq, all, all);
-            nda::blas::gemm(ComplexType(-spinfac), nda::transpose(Dstack_c), Zl,
-                            ComplexType(1.0), Pl);
+            if (Pi_ladder != nullptr) {
+              for (long ik = 0; ik < nk; ++ik) {
+                auto Drows = XD(nda::range(ik * nc2, (ik + 1) * nc2), all);
+                nda::blas::gemm(ComplexType(1.0 / nk), Cb(ik, jn, all, all),
+                                Dmat(ik, all, all), ComplexType(0.0), Drows);
+              }
+              nda::blas::gemm(Kbig, XD, KXD);
+              for (long ikp = 0; ikp < nk; ++ikp) {
+                auto Kr = KXD(nda::range(ikp * nc2, (ikp + 1) * nc2), all);
+                auto Xr = XKXD(nda::range(ikp * nc2, (ikp + 1) * nc2), all);
+                nda::blas::gemm(ComplexType(1.0 / nk), Cb(ikp, jn, all, all), Kr,
+                                ComplexType(0.0), Xr);
+              }
+              nda::blas::gemm(Rm, XKXD, Zl);
+              auto Pl = (*Pi_ladder)(jn, iq, all, all);
+              nda::blas::gemm(ComplexType(-spinfac), nda::transpose(Dstack_c), Zl,
+                              ComplexType(1.0), Pl);
+            }
+            // Q4-C3b: the orbital/chi-convention block through the SAME resolvent
+            if (Pi_lad_loc != nullptr) {
+              for (long ik = 0; ik < nk; ++ik) {
+                auto Erows = XE(nda::range(ik * nc2, (ik + 1) * nc2), all);
+                nda::blas::gemm(ComplexType(1.0 / nk), Cb(ik, jn, all, all),
+                                Emat(ik, all, all), ComplexType(0.0), Erows);
+              }
+              nda::blas::gemm(Kbig, XE, KXE);
+              for (long ikp = 0; ikp < nk; ++ikp) {
+                auto Kr = KXE(nda::range(ikp * nc2, (ikp + 1) * nc2), all);
+                auto Xr = XKXE(nda::range(ikp * nc2, (ikp + 1) * nc2), all);
+                nda::blas::gemm(ComplexType(1.0 / nk), Cb(ikp, jn, all, all), Kr,
+                                ComplexType(0.0), Xr);
+              }
+              nda::blas::gemm(Rm, XKXE, ZlE);
+              auto Po = (*Pi_lad_loc)(jn, iq, all, all);
+              nda::blas::gemm(ComplexType(-spinfac), nda::transpose(Estack_c), ZlE,
+                              ComplexType(1.0), Po);
+            }
           }
         }
       }
@@ -1106,6 +1252,418 @@ namespace solvers {
       mpi->comm.all_reduce_in_place_n(lam_max->data(), lam_max->size(),
                                       boost::mpi3::max<>{});
     return Pl;
+  }
+
+  /**
+   * Q4-C3b (notes/q4_c3b_orbital_ladder_dc_spec.md section 2 item 2): the ORBITAL /
+   * chi-convention local part of the SAME resummed ladder, per external q,
+   * (n_nu_half, nq_ibz, nab, nab) with nab = norb^2 and the pair pack
+   * abcd = (m, n, m', n') of dc_utilities.hpp's eval_Pi_rpa_dc (see the file header for
+   * the leg derivation; gates G2/G3 pin it). The q-average of eq 7 is NOT taken here --
+   * the caller does it with the star/trev rule (scr_coulomb_t::accumulate_pi_lad_loc_orb),
+   * exactly as the C3 accumulator does.
+   *
+   * U_skia (ns, nk_FULL, norb, nc) are the MLWF legs on the LADDER window's columns: the
+   * production caller extracts them from proj_boson.proj_fermi() (and checks the window
+   * containment); tests pass synthetic legs. Same guards and the same P2/P3 scheduling as
+   * eval_pol_ladder_whalf. Pi_onerung_loc, when given, is filled with the ONE-RUNG analog
+   * on the same grid (the G2 pin target). Replicated.
+   */
+  nda::array<ComplexType, 4>
+  vertex_t::eval_pol_ladder_loc_whalf(MBState &mb_state, THC_ERI auto &thc,
+                                      nda::array<ComplexType, 4> const &U_skia,
+                                      nda::array<ComplexType, 4> *Pi_onerung_loc) {
+    utils::check(active() and secondary(),
+                 "vertex_t::eval_pol_ladder_loc_whalf: requires an ACTIVE secondary-basis "
+                 "vertex (the readout instance).");
+    utils::check(not _wannier,
+                 "vertex_t::eval_pol_ladder_loc_whalf: window mode only (ruling R-Q3-2).");
+    utils::check(_W0b_qmm.has_value(),
+                 "vertex_t::eval_pol_ladder_loc_whalf: W0bar is absent -- build_w0 must "
+                 "run first (same iteration).");
+    auto MF = thc.MF();
+    auto mpi = thc.mpi();
+    nda::array<ComplexType, 5> G_CC;
+    nda::array<long, 2> kmq, kpq;
+    vertex_sym::sym_ctx const *symc = nullptr;
+    ladder_inputs(mb_state, thc, G_CC, kmq, kpq, symc);
+
+    const long ns = G_CC.shape(1), nk = G_CC.shape(2), nc = subspace_rank();
+    utils::check(U_skia.shape(0) == ns and U_skia.shape(1) == nk and
+                 U_skia.shape(3) == nc,
+                 "vertex_t::eval_pol_ladder_loc_whalf: U_skia is {} x {} x {} x {}, "
+                 "expected {} x {} x norb x {} (spin, FULL-BZ k, orbitals, ladder window).",
+                 U_skia.shape(0), U_skia.shape(1), U_skia.shape(2), U_skia.shape(3),
+                 ns, nk, nc);
+    const long norb = U_skia.shape(2), nab = norb * norb;
+
+    vertex_pi::iaft_tools tools(*_ft);
+    const long nw_b = tools.nw_b;
+    const long nw_half = (nw_b % 2 == 0) ? nw_b / 2 : nw_b / 2 + 1;
+    std::vector<long> nu_h(nw_half);
+    for (long j = 0; j < nw_half; ++j) nu_h[j] = nw_b / 2 + j;
+
+    const long nq_ext = MF->nqpts_ibz();
+    nda::array<ComplexType, 4> Ploc(nw_half, nq_ext, nab, nab);
+    if (Pi_onerung_loc != nullptr)
+      *Pi_onerung_loc = nda::array<ComplexType, 4>(nw_half, nq_ext, nab, nab);
+    if (mpi->internode_comm.size() > 1)
+      vertex_ladder_detail::pair_space_ladder(G_CC, _Xb_skma, _W0b_qmm.value(), kmq,
+                                              kpq, tools, nu_h, nullptr, nullptr,
+                                              mpi->internode_comm.rank(),
+                                              mpi->internode_comm.size(), symc,
+                                              std::addressof(mpi->node_comm), nullptr,
+                                              &U_skia, &Ploc, Pi_onerung_loc);
+    else
+      vertex_ladder_detail::pair_space_ladder(G_CC, _Xb_skma, _W0b_qmm.value(), kmq,
+                                              kpq, tools, nu_h, nullptr, nullptr,
+                                              mpi->comm.rank(), mpi->comm.size(), symc,
+                                              nullptr, nullptr,
+                                              &U_skia, &Ploc, Pi_onerung_loc);
+    mpi->comm.all_reduce_in_place_n(Ploc.data(), Ploc.size(), std::plus<>{});
+    if (Pi_onerung_loc != nullptr)
+      mpi->comm.all_reduce_in_place_n(Pi_onerung_loc->data(), Pi_onerung_loc->size(),
+                                      std::plus<>{});
+    return Ploc;
+  }
+
+  /**
+   * Q4-C3b gates G2/G3 (spec section 3), the leg + convention pins. BOTH reference legs
+   * below are written from the DEFINITIONS in this file's header (chi0, K, E) and from
+   * eval_Pi_rpa_dc's formula, with explicit einsum-style loops -- they share no code with
+   * pair_space_ladder beyond its inputs (G_CC, Xb, W0bar, the IAFT tools):
+   *
+   *  - G2 onerung_resid: the kernel's E-leg ONE-RUNG output against a brute-force 4-leg
+   *    contraction pref sum_{k,k'} [b23e(k')^T K(k,k')^T b41e(k)] built here. Machine
+   *    class; this is the s/leg/conjugation pin.
+   *  - G3 bub_resid_w: the E-leg BUBBLE (1/nk) sum_k spin E^dag chi0 E against the SAME
+   *    bubble taken in the G-space (U G U^dag) association -- the eval_Pi_rpa_dc index
+   *    order, spin factor and conjugation, read off first principles. Machine class.
+   *  - G3 bub_resid_phsym: the same G-space bubble assembled on the TAU half grid exactly
+   *    as eval_Pi_rpa_dc does (spin_factor G_bd(t) G_ca(beta - t)) and pushed through
+   *    IAFT::tau_to_w_PHsym -- the PH-sym nu-grid convention P_dc lives on. NOT machine
+   *    class: it carries the PH-symmetry/DLR class of the transform (the same class
+   *    ladder_whalf_gate's ph_sym_resid measures).
+   *
+   * NOSYM fixtures only (the Q4 caveat: lih222 is unsymmetrized); the gate aborts on a
+   * symmetry-reduced mesh rather than pretending to cover that path.
+   */
+  vertex_t::ladder_loc_diag
+  vertex_t::ladder_loc_gate(MBState &mb_state, THC_ERI auto &thc,
+                            nda::array<ComplexType, 4> const &U_skia) {
+    decltype(nda::range::all) all;
+    ladder_loc_diag out;
+    auto MF = thc.MF();
+    auto mpi = thc.mpi();
+    utils::check(active() and secondary(),
+                 "vertex_t::ladder_loc_gate: requires an ACTIVE secondary-basis vertex.");
+    utils::check(not _wannier, "vertex_t::ladder_loc_gate: window mode only.");
+    utils::check(_W0b_qmm.has_value(),
+                 "vertex_t::ladder_loc_gate: W0bar is absent -- build_w0 must run first.");
+    nda::array<ComplexType, 5> G_CC;
+    nda::array<long, 2> kmq, kpq;
+    vertex_sym::sym_ctx const *symc = nullptr;
+    ladder_inputs(mb_state, thc, G_CC, kmq, kpq, symc);
+    utils::check(symc == nullptr,
+                 "vertex_t::ladder_loc_gate: the brute-force references are written for "
+                 "NOSYM meshes only (the Q4-C3b fixture caveat); this mesh is IBZ-reduced.");
+
+    auto const &W0b = _W0b_qmm.value();
+    vertex_pi::iaft_tools tools(*_ft);
+    const long nt = G_CC.shape(0), ns = G_CC.shape(1), nk = G_CC.shape(2);
+    const long nc = G_CC.shape(3), nc2 = nc * nc, Nm = _Xb_skma.shape(2);
+    const long nw_b = tools.nw_b, i0 = nw_b / 2;
+    const long nw_half = (nw_b % 2 == 0) ? nw_b / 2 : nw_b / 2 + 1;
+    const long nq_ext = MF->nqpts_ibz();
+    const long norb = U_skia.shape(2), nab = norb * norb;
+    const double spinfac = (ns == 1) ? 2.0 : 1.0;
+    const double pref = -spinfac / double(nk * nk);
+    out.sym_active = false;
+    out.norb = norb;
+
+    // the checked nu nodes: the static one, its neighbour and the top of the half grid
+    std::vector<long> jsub;
+    for (long j : {0l, 1l, nw_half - 1}) {
+      if (j < 0 or j >= nw_half) continue;
+      bool seen = false;
+      for (long jj : jsub) seen = seen or (jj == j);
+      if (not seen) jsub.push_back(j);
+    }
+    std::vector<long> nu_sub;
+    for (long j : jsub) nu_sub.push_back(i0 + j);
+    const long nnu = long(nu_sub.size());
+    out.nnu_checked = nnu;
+
+    // ---- the KERNEL side: the E-leg one-rung and the resummed local object -----------
+    nda::array<ComplexType, 4> P1k(nnu, nq_ext, nab, nab), Plk(nnu, nq_ext, nab, nab);
+    vertex_ladder_detail::pair_space_ladder(G_CC, _Xb_skma, W0b, kmq, kpq, tools, nu_sub,
+                                            nullptr, nullptr, mpi->comm.rank(),
+                                            mpi->comm.size(), symc, nullptr, nullptr,
+                                            &U_skia, &Plk, &P1k);
+    mpi->comm.all_reduce_in_place_n(P1k.data(), P1k.size(), std::plus<>{});
+    mpi->comm.all_reduce_in_place_n(Plk.data(), Plk.size(), std::plus<>{});
+    out.lad_loc_max = 0.0;
+    for (auto const &v : Plk) out.lad_loc_max = std::max(out.lad_loc_max, std::abs(v));
+
+    // ---- the BRUTE-FORCE side (explicit loops from the definitions) -------------------
+    // qx lookup, written here rather than shared: kmq(qx, k) = k'
+    nda::array<long, 2> qx_of(nk, nk);
+    qx_of() = -1;
+    for (long iqx = 0; iqx < kmq.shape(0); ++iqx)
+      for (long ik = 0; ik < nk; ++ik) qx_of(ik, kmq(iqx, ik)) = iqx;
+
+    nda::array<ComplexType, 4> P1b(nnu, nq_ext, nab, nab);   // one-rung, brute force
+    nda::array<ComplexType, 4> Bub_i(nnu, nq_ext, nab, nab); // E-leg bubble (chi0 route)
+    nda::array<ComplexType, 4> Bub_g(nnu, nq_ext, nab, nab); // ... G-space route
+    nda::array<ComplexType, 4> Bub_p(nw_half, nq_ext, nab, nab); // ... PH-sym tau route
+    P1b() = ComplexType(0.0);
+    Bub_i() = ComplexType(0.0);
+    Bub_g() = ComplexType(0.0);
+    Bub_p() = ComplexType(0.0);
+
+    nda::array<ComplexType, 4> C0(nnu, nk, nc2, nc2);        // chi0(k) at the nodes
+    nda::array<ComplexType, 3> Eb(nk, nc2, nab);             // E(k)
+    nda::array<ComplexType, 4> Kbf(nk, nk, nc2, nc2);        // K(k, k')
+    nda::array<ComplexType, 4> GU(nt, nk, norb, norb);       // [U G U^dag](k, tau)
+    const long nts_half = (nt % 2 == 0) ? nt / 2 : nt / 2 + 1;
+    nda::array<ComplexType, 3> Ptau(nts_half, nab, nab);     // the tau-space bubble
+    nda::array<ComplexType, 3> Pful(nt, nab, nab);           // ... on the FULL tau grid
+    nda::array<ComplexType, 2> Pw2(nw_half, nab * nab);
+    nda::array<ComplexType, 4> Bub_s(nnu, nq_ext, nab, nab); // ... symmetrized, via Twt
+    Bub_s() = ComplexType(0.0);
+    double tau_dev = 0.0, tau_scale = 0.0;
+
+    for (long is = 0; is < ns; ++is) {
+      // [U G U^dag](k, tau), the downfold_loc association
+      for (long it = 0; it < nt; ++it)
+        for (long ik = 0; ik < nk; ++ik)
+          for (long m = 0; m < norb; ++m)
+            for (long n2 = 0; n2 < norb; ++n2) {
+              ComplexType acc(0.0);
+              for (long a = 0; a < nc; ++a)
+                for (long b = 0; b < nc; ++b)
+                  acc += U_skia(is, ik, m, a) * G_CC(it, is, ik, a, b) *
+                         std::conj(U_skia(is, ik, n2, b));
+              GU(it, ik, m, n2) = acc;
+            }
+      for (long iq = 0; iq < nq_ext; ++iq) {
+        // chi0 and E
+        for (long ik = 0; ik < nk; ++ik) {
+          const long ikpq = kpq(iq, ik);
+          for (long p1p = 0; p1p < nc; ++p1p)
+            for (long p3 = 0; p3 < nc; ++p3)
+              for (long a = 0; a < nc; ++a)
+                for (long b = 0; b < nc; ++b)
+                  for (long jn = 0; jn < nnu; ++jn) {
+                    ComplexType acc(0.0);
+                    for (long s = 0; s < nt; ++s)
+                      acc += tools.Twt_bb(nu_sub[jn], s) *
+                             G_CC(tools.t_mirror(s), is, ik, a, p1p) *
+                             G_CC(s, is, ikpq, p3, b);
+                    C0(jn, ik, p1p * nc + p3, a * nc + b) = -acc;
+                  }
+          for (long a = 0; a < nc; ++a)
+            for (long b = 0; b < nc; ++b)
+              for (long m = 0; m < norb; ++m)
+                for (long n2 = 0; n2 < norb; ++n2)
+                  Eb(ik, a * nc + b, m * norb + n2) =
+                      U_skia(is, ik, m, a) * std::conj(U_skia(is, ikpq, n2, b));
+        }
+        // K(k, k') straight from the header formula (nosym)
+        for (long ik = 0; ik < nk; ++ik) {
+          const long ikpq = kpq(iq, ik);
+          for (long ikp = 0; ikp < nk; ++ikp) {
+            const long iqx = qx_of(ik, ikp), ikppq = kpq(iq, ikp);
+            for (long p1 = 0; p1 < nc; ++p1)
+              for (long p1p = 0; p1p < nc; ++p1p)
+                for (long p3 = 0; p3 < nc; ++p3)
+                  for (long p3p = 0; p3p < nc; ++p3p) {
+                    ComplexType acc(0.0);
+                    for (long P = 0; P < Nm; ++P)
+                      for (long Q = 0; Q < Nm; ++Q)
+                        acc += _Xb_skma(is, ikp, P, p1) *
+                               std::conj(_Xb_skma(is, ik, P, p1p)) * W0b(iqx, P, Q) *
+                               _Xb_skma(is, ikpq, Q, p3) *
+                               std::conj(_Xb_skma(is, ikppq, Q, p3p));
+                    Kbf(ik, ikp, p1p * nc + p3, p1 * nc + p3p) = acc;
+                  }
+          }
+        }
+        for (long jn = 0; jn < nnu; ++jn) {
+          // b41e(k) = chi0(k) . E(k);  b23e(k') = chi0(k')^T . conj(E(k'))
+          nda::array<ComplexType, 3> b41(nk, nc2, nab), b23(nk, nc2, nab);
+          for (long ik = 0; ik < nk; ++ik)
+            for (long r = 0; r < nc2; ++r)
+              for (long col = 0; col < nab; ++col) {
+                ComplexType s1(0.0), s2(0.0);
+                for (long u = 0; u < nc2; ++u) {
+                  s1 += C0(jn, ik, r, u) * Eb(ik, u, col);
+                  s2 += C0(jn, ik, u, r) * std::conj(Eb(ik, u, col));
+                }
+                b41(ik, r, col) = s1;
+                b23(ik, r, col) = s2;
+              }
+          for (long row = 0; row < nab; ++row)
+            for (long col = 0; col < nab; ++col) {
+              ComplexType acc(0.0);
+              for (long ik = 0; ik < nk; ++ik)
+                for (long ikp = 0; ikp < nk; ++ikp)
+                  for (long r = 0; r < nc2; ++r)
+                    for (long c2 = 0; c2 < nc2; ++c2)
+                      acc += b23(ikp, c2, row) * Kbf(ik, ikp, r, c2) * b41(ik, r, col);
+              P1b(jn, iq, row, col) += ComplexType(pref) * acc;
+            }
+          // G3 (i): the E-leg bubble, spin (1/nk) sum_k E^dag chi0 E
+          for (long row = 0; row < nab; ++row)
+            for (long col = 0; col < nab; ++col) {
+              ComplexType acc(0.0);
+              for (long ik = 0; ik < nk; ++ik)
+                for (long r = 0; r < nc2; ++r)
+                  for (long u = 0; u < nc2; ++u)
+                    acc += std::conj(Eb(ik, r, row)) * C0(jn, ik, r, u) * Eb(ik, u, col);
+              Bub_i(jn, iq, row, col) += ComplexType(spinfac / double(nk)) * acc;
+            }
+          // G3 (ii): the same bubble in the G-space association, first principles
+          for (long m = 0; m < norb; ++m)
+            for (long n2 = 0; n2 < norb; ++n2)
+              for (long mp = 0; mp < norb; ++mp)
+                for (long np = 0; np < norb; ++np) {
+                  ComplexType acc(0.0);
+                  for (long ik = 0; ik < nk; ++ik) {
+                    const long ikpq = kpq(iq, ik);
+                    for (long s = 0; s < nt; ++s)
+                      acc += tools.Twt_bb(nu_sub[jn], s) *
+                             GU(tools.t_mirror(s), ik, mp, m) * GU(s, ikpq, n2, np);
+                  }
+                  Bub_g(jn, iq, m * norb + n2, mp * norb + np) +=
+                      ComplexType(-spinfac / double(nk)) * acc;
+                }
+        }
+        // G3 (iii): eval_Pi_rpa_dc's own route -- Pi_abcd(t) = spin_factor G_bd(t)
+        // G_ca(beta - t) on the tau HALF grid, then IAFT::tau_to_w_PHsym
+        for (long it = 0; it < nt; ++it) {
+          const long itt = nt - it - 1;
+          for (long m = 0; m < norb; ++m)
+            for (long n2 = 0; n2 < norb; ++n2)
+              for (long mp = 0; mp < norb; ++mp)
+                for (long np = 0; np < norb; ++np) {
+                  ComplexType acc(0.0);
+                  for (long ik = 0; ik < nk; ++ik)
+                    acc += GU(it, kpq(iq, ik), n2, np) * GU(itt, ik, mp, m);
+                  Pful(it, m * norb + n2, mp * norb + np) =
+                      ComplexType(-spinfac / double(nk)) * acc;
+                }
+          if (it < nts_half) Ptau(it, all, all) = Pful(it, all, all);
+        }
+        {
+          auto Pt2 = nda::reshape(Ptau, std::array<long, 2>{nts_half, nab * nab});
+          _ft->tau_to_w_PHsym(Pt2, Pw2);
+          for (long j = 0; j < nw_half; ++j)
+            for (long row = 0; row < nab; ++row)
+              for (long col = 0; col < nab; ++col)
+                Bub_p(j, iq, row, col) += Pw2(j, row * nab + col);
+        }
+        // ... and its exact characterization. IAFT::tau_to_w_PHsym (IAFT.icc:48-72) folds
+        // Twt(iw, it) + Twt(iw, nt - 1 - it) onto the first tau half, i.e. it is the
+        // FULL-mesh transform of the MIRROR EXTENSION of that half -- not of the average.
+        // Bub_s below is exactly that reference; what separates it from the direct object
+        // is then the bubble's own tau asymmetry (tau -> beta - tau maps Pi_{(mn),(m'n')}
+        // onto a pair/index-transposed element, so unlike the resummed ladder the bare
+        // local bubble is NOT PH-symmetric element by element).
+        for (long it = 0; it < nt; ++it) {
+          const long itm = nt - it - 1;
+          for (long row = 0; row < nab; ++row)
+            for (long col = 0; col < nab; ++col) {
+              tau_dev = std::max(tau_dev, std::abs(Pful(it, row, col) -
+                                                   Pful(itm, row, col)));
+              tau_scale = std::max(tau_scale, std::abs(Pful(it, row, col)));
+            }
+        }
+        for (long jn = 0; jn < nnu; ++jn)
+          for (long row = 0; row < nab; ++row)
+            for (long col = 0; col < nab; ++col) {
+              ComplexType acc(0.0);
+              for (long it = 0; it < nt; ++it) {
+                const long ie = (it < nts_half) ? it : nt - it - 1;   // mirror extension
+                acc += tools.Twt_bb(nu_sub[jn], it) * Pful(ie, row, col);
+              }
+              Bub_s(jn, iq, row, col) += acc;
+            }
+      }
+    }
+
+    auto reldiff = [](auto const &A, auto const &B) {
+      double d = 0.0, s = 0.0;
+      auto ia = A.begin();
+      auto ib = B.begin();
+      for (; ia != A.end(); ++ia, ++ib) {
+        d = std::max(d, std::abs(*ia - *ib));
+        s = std::max(s, std::abs(*ia));
+      }
+      return std::make_pair(d, s);
+    };
+    {
+      auto [d, s] = reldiff(P1k, P1b);
+      out.onerung_resid = d / std::max(s, 1e-300);
+      out.onerung_scale = s;
+    }
+    {
+      auto [d, s] = reldiff(Bub_i, Bub_g);
+      out.bub_resid_w = d / std::max(s, 1e-300);
+      out.bub_scale = s;
+    }
+    {
+      double d = 0.0, ds = 0.0, s = 0.0;
+      for (long jn = 0; jn < nnu; ++jn)
+        for (long iq = 0; iq < nq_ext; ++iq)
+          for (long row = 0; row < nab; ++row)
+            for (long col = 0; col < nab; ++col) {
+              d = std::max(d, std::abs(Bub_i(jn, iq, row, col) -
+                                       Bub_p(jsub[size_t(jn)], iq, row, col)));
+              ds = std::max(ds, std::abs(Bub_s(jn, iq, row, col) -
+                                         Bub_p(jsub[size_t(jn)], iq, row, col)));
+              s = std::max(s, std::abs(Bub_i(jn, iq, row, col)));
+            }
+      out.bub_resid_phsym = d / std::max(s, 1e-300);
+      out.bub_resid_phsym_sym = ds / std::max(s, 1e-300);
+      out.bub_tau_asym = tau_dev / std::max(tau_scale, 1e-300);
+    }
+
+    // the transform licence for the LOCAL LADDER itself (what P_dc actually receives):
+    // |P^lad_loc(-nu) - P^lad_loc(+nu)| on the full mesh, the ph_sym_resid of
+    // ladder_whalf_gate applied to the E-leg object.
+    {
+      std::vector<long> nu_pm;
+      for (long j : jsub) {
+        if (i0 + j < nw_b) nu_pm.push_back(i0 + j);
+        if (i0 - j >= 0) nu_pm.push_back(i0 - j);
+      }
+      nda::array<ComplexType, 4> Ppm(long(nu_pm.size()), nq_ext, nab, nab);
+      vertex_ladder_detail::pair_space_ladder(G_CC, _Xb_skma, W0b, kmq, kpq, tools, nu_pm,
+                                              nullptr, nullptr, mpi->comm.rank(),
+                                              mpi->comm.size(), symc, nullptr, nullptr,
+                                              &U_skia, &Ppm, nullptr);
+      mpi->comm.all_reduce_in_place_n(Ppm.data(), Ppm.size(), std::plus<>{});
+      double d = 0.0, s = 0.0;
+      for (long l = 0; l + 1 < long(nu_pm.size()); l += 2)
+        for (long iq = 0; iq < nq_ext; ++iq)
+          for (long row = 0; row < nab; ++row)
+            for (long col = 0; col < nab; ++col) {
+              d = std::max(d, std::abs(Ppm(l, iq, row, col) - Ppm(l + 1, iq, row, col)));
+              s = std::max(s, std::abs(Ppm(l, iq, row, col)));
+            }
+      out.loc_ph_sym = d / std::max(s, 1e-300);
+    }
+
+    app_log(1, "  [qpGW Q4-C3b] ladder_loc gate ({} orbitals, {} nu nodes, nosym): G2 "
+               "one-rung vs brute force = {:.3e} (scale {:.3e}); G3 E-leg bubble vs the "
+               "G-space bubble = {:.3e} (scale {:.3e}); PH-sym tau route: raw = {:.3e}, "
+               "after symmetrizing = {:.3e} (the bubble's own tau asymmetry = {:.3e}); "
+               "P^lad_loc nu-mirror resid = {:.3e}; max |P^lad_loc,orb| = {:.4e}",
+            norb, nnu, out.onerung_resid, out.onerung_scale, out.bub_resid_w,
+            out.bub_scale, out.bub_resid_phsym, out.bub_resid_phsym_sym,
+            out.bub_tau_asym, out.loc_ph_sym, out.lad_loc_max);
+    return out;
   }
 
   /**

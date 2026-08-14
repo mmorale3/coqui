@@ -4752,5 +4752,13 @@ namespace solvers {
   template vertex_t::ladder_whalf_diag
   vertex_t::ladder_whalf_gate(MBState&, thc_reader_t&, double);
 
+  // qpGW Q4-C3b (notes/q4_c3b_orbital_ladder_dc_spec.md)
+  template nda::array<ComplexType, 4>
+  vertex_t::eval_pol_ladder_loc_whalf(MBState&, thc_reader_t&,
+                                      nda::array<ComplexType, 4> const&,
+                                      nda::array<ComplexType, 4>*);
+  template vertex_t::ladder_loc_diag
+  vertex_t::ladder_loc_gate(MBState&, thc_reader_t&, nda::array<ComplexType, 4> const&);
+
 }  // solvers
 }  // methods
