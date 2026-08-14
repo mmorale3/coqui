@@ -206,6 +206,12 @@ namespace {
     double ratio_worst = 0.0, dev_off_worst = 0.0;
     double ratio_in_worst = 0.0, delta_in_worst = 0.0, class_in_worst = 0.0;
     double tau_dev_worst = 0.0;
+    // WHERE the gate quantity is attained: the (s,k) block and the element of the probed set
+    // that carries max|Sigma_B - Sigma^GW|. Reduced together with the value (see below) so
+    // the abort names its own element -- the kp444 false fire of 2026-08-13 was invisible
+    // precisely because the offending block was owned by a non-root rank and app_log is
+    // root-only, while the gate maxes over every rank's blocks.
+    long tau_dev_is = -1, tau_dev_ik = -1, tau_dev_a = -1, tau_dev_b = -1;
     // the per-isym anchor breakdown, kept for the gate message (see the TAU ISYM block)
     double isym_ratio_worst = 0.0;
     long isym_class_worst = -1;
@@ -325,7 +331,20 @@ namespace {
       // unconditionally from the raw incoming sE_ska.
       // ------- THE TAU-DOMAIN ORACLE (coordinator request 2026-08-12) ------------------
       // Same elements, two domains: tau (no transform on either side) vs the first fermionic
-      // nodes (the anchor). Run on the first two owned blocks only -- it is a diagnostic.
+      // nodes (the anchor). Runs on EVERY block this rank owns; only the root rank's rows
+      // reach the log (app_log), while the gate below maxes over all ranks -- which is why
+      // the gate quantity now carries its argmax (s,k,a,b) with it.
+      //
+      // NORMALIZATION -- GATE-SEMANTICS CORRECTION, 2026-08-13 (spec-author ruling; see
+      // notes/qm3_mode_a_loop_spec.md rev 4 and "THE GATE'S NORMALIZATION" in
+      // wc_band_elements.hpp). The GATE quantity is normalized ONCE PER BLOCK, by the largest
+      // |Sigma^GW| of the probed set, exactly like the i w anchor it replaced (:270-283). The
+      // per-element ratios below are KEPT as log lines -- they are what identified the kp444
+      // false fire -- but they are diagnostics, not the gate: dividing each element by ITS OWN
+      // magnitude lets a symmetry-suppressed off-diagonal (kp444 block (0,0): the largest
+      // gap-window off-diagonal was 1860x below the diagonal) turn a uniform 5.6e-09 a.u.
+      // absolute deviation into a 6.6e-05 "relative" one, and the gate fired on the smallness
+      // of the element rather than on any error.
       if (cd) {
         nda::array<double, 1> tau_ph(FT.nt_f());
         {
@@ -351,7 +370,7 @@ namespace {
         }
         app_log(lvl, "  mode_a TAU ORACLE (s,k) = ({},{}): {:>6} {:>14} {:>14} {:>10}",
                 is, ik, "(a,b)", "tau rel dev", "iw rel dev", "ratio");
-        double worst_tn = -1.0, worst_td = 0.0;
+        double worst_tn = -1.0, worst_td = 0.0, blk_den = 0.0;
         std::pair<long, long> worst_ab{0, 0};
         for (auto const &[a, b] : elems) {
           modea_sigma_tau(*ctx, *blk, a, b, tau_ph, Stau);
@@ -371,17 +390,37 @@ namespace {
           }
           const double dtau = (td > 0.0) ? tn / td : 0.0;
           const double diw = (wd > 0.0) ? wn_ / wd : 0.0;
-          tau_dev_worst = std::max(tau_dev_worst, dtau);
-          if (tn > worst_tn) { worst_tn = tn; worst_td = td; worst_ab = {a, b}; }
+          if (tn > worst_tn) { worst_tn = tn; worst_ab = {a, b}; }
+          blk_den = std::max(blk_den, td);
           app_log(lvl, "  mode_a TAU ORACLE     ({},{}): ({:>2},{:>2}) {:>14.4e} {:>14.4e} "
                        "{:>10.3g}{}", is, ik, a, b, dtau, diw,
                   (dtau > 0.0 ? diw / dtau : 0.0), (a == b) ? "" : "   <- off-diagonal");
         }
+        // THE GATE QUANTITY of this block: ONE denominator for the probed set (above).
+        const double dtau_blk = (blk_den > 0.0 and worst_tn > 0.0) ? worst_tn / blk_den : 0.0;
+        worst_td = blk_den;
+        app_log(lvl, "  mode_a TAU ORACLE     ({},{}): BLOCK = {:.4e}  [= max|Sigma_B - "
+                     "Sigma^GW| {:.4e} over the probed set, at element ({},{}), / max|Sigma^GW| "
+                     "{:.4e} of the SAME set -- THE GATE QUANTITY, normalized once per block "
+                     "like the i w anchor. The per-element rows above divide by each element's "
+                     "own magnitude and are diagnostics only.]",
+                is, ik, dtau_blk, worst_tn, worst_ab.first, worst_ab.second, blk_den);
+        if (dtau_blk > tau_dev_worst) {
+          tau_dev_worst = dtau_blk;
+          tau_dev_is = is; tau_dev_ik = ik;
+          tau_dev_a = worst_ab.first; tau_dev_b = worst_ab.second;
+        }
         // ---- THE PER-ISYM BREAKDOWN (permanent, level 2; the kp444 post-mortem) ---------
-        // The route-B side of the WORST element above, split over the symmetry classes of the
-        // star loop (ctx->q_isym; the classes partition the full transfer mesh, so the rows
-        // sum back to the total -- printed as the bookkeeping check), against the SAME
-        // absolute deviation. The reference cannot be split (the solver sums the isym loop
+        // The route-B side of the element with the largest ABSOLUTE deviation, split over the
+        // symmetry classes of the star loop (ctx->q_isym; the classes partition the full
+        // transfer mesh, so the rows sum back to the total -- printed as the bookkeeping
+        // check), against that same absolute deviation. Under the block normalization adopted
+        // on 2026-08-13 that element IS the one that sets the gate (numerator and gate share
+        // the same max), so the breakdown and the gate now describe the same thing -- they did
+        // NOT before: the census picked the largest absolute deviation while the gate maxed
+        // per-element ratios, so at kp444 the census described the diagonal (3,3) while the
+        // gate fired on the suppressed off-diagonal (2,5). The reference cannot be split (the
+        // solver sums the isym loop
         // internally), so there is no per-class deviation; what discriminates is each class's
         // own MAGNITUDE:
         //   share       = max_tau |Sigma_B^(isym)| / max_tau |Sigma^GW|
@@ -617,11 +656,28 @@ namespace {
                    "G.W product, whose spectral support exceeds the grid: it halves with "
                    "every DLR prec notch while the tau deviation does not. The gate is the "
                    "TAU anchor above.", anchor_worst, anchor_expect);
-    tau_dev_worst = comm.all_reduce_value(tau_dev_worst, boost::mpi3::max<>{});
-    app_log(lvl, "  - TAU ORACLE:                 max rel dev of Sigma_B(tau) vs the solver's "
-                 "Sigma^c(tau) (no transform on either side) = {:.4e}; the same elements at "
-                 "the first fermionic nodes deviate by {:.4e} (the anchor)",
-            tau_dev_worst, anchor_worst);
+    {   // MAXLOC: reduce the gate quantity together with WHERE it was attained. Only the
+        // root rank's oracle rows reach the log, so without this the offending block of a
+        // multi-rank run is unnameable -- the 2026-08-13 kp444 post-mortem.
+      const double local = tau_dev_worst;
+      tau_dev_worst = comm.all_reduce_value(tau_dev_worst, boost::mpi3::max<>{});
+      if (local < tau_dev_worst) { tau_dev_is = tau_dev_ik = tau_dev_a = tau_dev_b = -1; }
+      tau_dev_is = comm.all_reduce_value(tau_dev_is, boost::mpi3::max<>{});
+      tau_dev_ik = comm.all_reduce_value(tau_dev_ik, boost::mpi3::max<>{});
+      tau_dev_a = comm.all_reduce_value(tau_dev_a, boost::mpi3::max<>{});
+      tau_dev_b = comm.all_reduce_value(tau_dev_b, boost::mpi3::max<>{});
+      const double li = isym_ratio_worst;
+      isym_ratio_worst = comm.all_reduce_value(isym_ratio_worst, boost::mpi3::max<>{});
+      if (li < isym_ratio_worst) isym_class_worst = -1;
+      isym_class_worst = comm.all_reduce_value(isym_class_worst, boost::mpi3::max<>{});
+    }
+    app_log(lvl, "  - TAU ORACLE:                 max BLOCK-normalized dev of Sigma_B(tau) vs "
+                 "the solver's Sigma^c(tau) (no transform on either side) = {:.4e}, attained "
+                 "on block (s,k) = ({},{}) at element ({},{}); the same elements at the first "
+                 "fermionic nodes deviate by {:.4e} (the anchor). [Both are normalized by the "
+                 "largest |Sigma^GW| of the probed set -- gate-semantics correction of "
+                 "2026-08-13, see wc_band_elements.hpp.]",
+            tau_dev_worst, tau_dev_is, tau_dev_ik, tau_dev_a, tau_dev_b, anchor_worst);
     app_log(lvl, "  - A/B harness [IN, gap window]: max delta_i = {:.4e} a.u. ({:.4g} meV), "
                  "max class_i = {:.4e} a.u. ({:.4g} meV), worst ratio = {:.3g} ({} states "
                  "above 10x)",
@@ -738,15 +794,20 @@ namespace {
     // THE GATE (spec rev 2): the TAU-DOMAIN anchor. The tau image of the route-B pole rep is
     // compared against the solver's Sigma^c(tau) with NO transform on either side, so it
     // isolates the contraction from the reference's tau -> i w aliasing. Measured 2026-08-12:
-    // tau agreement 5.6e-05 at DLR prec "low", two orders below that grid's W-fit class,
+    // tau agreement 5.6e-05 at DLR prec "low" (per-element normalization, retired 2026-08-13
+    // -- the block-normalized number is smaller), two orders below that grid's W-fit class,
     // while the i w deviation was 2.3e-01 on the SAME elements and halved with every prec
     // notch. The i w comparison is therefore a LOGGED DIAGNOSTIC ONLY -- never a gate.
+    //
+    // NORMALIZED PER BLOCK since 2026-08-13 (spec-author ruling, rev 4 note): one denominator
+    // for the probed set, exactly as the i w anchor at :270-283. See the oracle above.
     if (cd) {
-      isym_ratio_worst = comm.all_reduce_value(isym_ratio_worst, boost::mpi3::max<>{});
       utils::check(tau_dev_worst < qp_modea::modea_tau_anchor_mult * ctx->diag.rec_rel_worst,
                    "qp_approx ({}): THE TAU ANCHOR FAILED -- the analytic tau image of the "
-                   "route-B Sigma^c deviates from the solver's Sigma^c(tau) by {:.4e} over the "
-                   "gap window and the largest off-diagonal, against a gate of {:.1f} x the "
+                   "route-B Sigma^c deviates from the solver's Sigma^c(tau) by {:.4e} on block "
+                   "(s,k) = ({},{}) at element ({},{}) [block-normalized: max|Sigma_B - "
+                   "Sigma^GW| over the gap window and the largest off-diagonal, divided by "
+                   "max|Sigma^GW| of that same set], against a gate of {:.1f} x the "
                    "W-fit reconstruction class ({:.4e}). Neither side applies a Fourier "
                    "transform here, so the two sides differ ONLY in (a) the contraction "
                    "(prefactor, spin, q-star/trev rule, MO rotation, the Gamma head) and "
@@ -768,8 +829,10 @@ namespace {
                    "(Frobenius {:.3e}), union projection tail {:.3e}. The gate's yardstick is "
                    "the per-q RELATIVE bosonic-mesh class, which is a different object from "
                    "the budget.\n"
-                   "See notes/qm3_mode_a_loop_spec.md rev 2.",
-                   map_name, tau_dev_worst, qp_modea::modea_tau_anchor_mult,
+                   "See notes/qm3_mode_a_loop_spec.md rev 2 (and its rev-4 note on the "
+                   "2026-08-13 block-normalization correction).",
+                   map_name, tau_dev_worst, tau_dev_is, tau_dev_ik, tau_dev_a, tau_dev_b,
+                   qp_modea::modea_tau_anchor_mult,
                    ctx->diag.rec_rel_worst, isym_ratio_worst, isym_class_worst,
                    ctx->diag.rec_budget, tau_dev_worst,
                    ctx->diag.fit_err_worst, ctx->diag.wtrunc_worst,

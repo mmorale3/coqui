@@ -552,7 +552,9 @@ namespace qp_modea {
    * REV 4 (2026-08-13): GRADED-eta FAR-STATE EVALUATION -- the knob qp_modea_eta_far
    * ---------------------------------------------------------------------------------------
    * The judge verdict on kp222 (matched heads) put mode_a == mode_b at 3.714/1.219 eV against
-   * a real-axis reference series of 3.10-3.37/0.70-0.94 eV, with a tau oracle of 2.6e-08 at
+   * a real-axis reference series of 3.10-3.37/0.70-0.94 eV, with a tau oracle of 2.6e-08
+   * (per-element normalization, retired 2026-08-13 -- see "THE GATE'S NORMALIZATION" in
+   * wc_band_elements.hpp; the block-normalized value is smaller) at
    * production: the contraction is right and the 0.35/0.45 eV offset is ENTIRELY the mu
    * fallback of the 471 out-of-strip evaluations (per-k HOMO 7 of 8, LUMO 5 of 8 at
    * E_PH = 1.22 eV). The reference's own far-state object is Re Sigma(eps + i eta), so ours

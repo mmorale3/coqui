@@ -816,7 +816,9 @@ namespace bdft_tests {
    *     KMP_DUPLICATE_LIB_OK=TRUE OMP_NUM_THREADS=1 mpirun -np 4 \
    *       <build>/tests/bin/test_methods_qp_map_ab "qp_map_modea_worksharing"
    *
-   * [measured, 2026-08-13: gap 12.008579 eV and tau anchor 7.1816e-04 at both -np 1 and -np 2;
+   * [measured, 2026-08-13: gap 12.008579 eV and tau anchor 5.0378e-04 at both -np 1 and -np 2
+   *  (the anchor read 7.1816e-04 under the per-element normalization retired the same day --
+   *  see "THE GATE'S NORMALIZATION" in wc_band_elements.hpp; the gap is unchanged by it);
    *  >= 4 ranks is not reachable on this laptop -- the ISDF setup of every mode_a fixture
    *  aborts there (thc_reader_t::build, "create_plan_many: howmany=0"), which predates this
    *  increment. A run-time tripwire in wc_band_elements.hpp checks the pair census of every
@@ -955,6 +957,11 @@ namespace bdft_tests {
    * (thc_gw.icc:444-531) forms -madelung eps_inv_head(tau) T G T^dag directly at each IBZ k.
    * The tau anchor is exactly the comparison that closes that loop, so it is now run with the
    * head ON. Same fixture as the qp_map_ab gates, no symmetry (12 k, 12 in the IBZ).
+   *
+   * [measured 2026-08-13, block-normalized semantics: anchor 3.4578e-04, ratio 0.158 of the
+   *  gate, from an absolute deviation of 7.11e-05 a.u. on a block scale of 2.057e-01 -- against
+   *  4.1824e-04 from 6.77e-05 a.u. on 1.620e-01 with the head OFF. The head adds ~27% to
+   *  |Sigma| and moves the absolute deviation by < 5%.]
    */
   TEST_CASE("qp_map_modeb_head_anchor", "[methods][qpgw][qp_map_ab][modeb]") {
     using namespace qp_map_ab_detail;
@@ -978,6 +985,12 @@ namespace bdft_tests {
    *    qe_lih223       12 k, 12 IBZ, no reduction        -> isym loop and trev branches DEAD
    *    qe_lih223_inv   12 k,  8 IBZ, time reversal only  -> trev branches LIVE, no D
    *    qe_lih223_sym   12 k,  6 IBZ, 2 q-symmetries      -> D-matrix external rotation LIVE
+   *
+   * [measured 2026-08-13, block-normalized semantics: 4.1824e-04 / 4.1824e-04 / 4.1827e-04
+   *  at a common W-fit class of 3.8581e-03 (ratio 0.108). The sym row is not vacuous -- its
+   *  census reads "D-rotation exercised on 4 of 6 (isym > 0, k) pairs, worst max|D - 1| = 2.0".
+   *  The same rows read 6.3697 / 6.3697 / 6.3703e-04 under the per-element normalization
+   *  retired the same day.]
    *
    * REPORTS only (hidden case, run explicitly by name).
    */

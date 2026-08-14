@@ -65,6 +65,42 @@
  * (node-shared) plus this rank's (a,b,J,p) slabs.
  *
  * =====================================================================================
+ * THE GATE'S NORMALIZATION -- A DOCUMENTED GATE-SEMANTICS CORRECTION (2026-08-13)
+ * [spec-author ruling, recorded; notes/qm3_mode_a_loop_spec.md rev 4. NOT a silent edit:
+ *  the numbers every fixture reports for the tau anchor CHANGE with it, and the tables in
+ *  this header and in test_qp_map_ab.cpp were re-measured on the same day.]
+ * =====================================================================================
+ * The tau anchor replaced the i w anchor as THE gate (spec rev 2) but, until this date,
+ * inherited its threshold without its NORMALIZATION. The i w anchor divides by the largest
+ * |Sigma^GW| of the whole probed set (one number per (s,k) block, qp_scf_common.cpp:270-283);
+ * the tau oracle divided each probed element by ITS OWN magnitude. On a symmetry-reduced
+ * production mesh those two differ by orders, and the gate fired on the difference:
+ *
+ *   MEASURED [Si kp444, 13 IBZ k of 64, first symmetry-reduced production run, block (0,0)]:
+ *     gap-window diagonals (2,2) (3,3) (4,4) (5,5):  tau rel dev 3.0-3.6e-08
+ *     largest gap-window OFF-diagonal (2,5):         tau rel dev 6.6e-05      <- fired
+ *     absolute deviation of the whole probed set:    5.5556e-09 a.u. (0.15 ueV), UNIFORM
+ *     max|Sigma^GW| of the block:                    1.5648e-01 a.u.
+ *     => max|Sigma^GW_(2,5)| = 5.5556e-09 / 6.6e-05 = 8.4e-05 a.u., i.e. the largest
+ *        off-diagonal of that window is 1860x BELOW the diagonal (symmetry-suppressed in the
+ *        MO basis), and its "relative deviation" measures the smallness of the element, not
+ *        an error. The same element read 7.8e-04 in the oracle's per-element i w column while
+ *        the BLOCK-normalized i w anchor on the same data read 3.5e-08 -- same numbers, two
+ *        denominators, four orders apart. That is the whole effect.
+ *   The run's own evidence agreed: per-isym breakdown <= 1.4e-06 for every class, W error
+ *   budget 1.586e-07, and 5.5556e-09/1.5648e-01 = 3.55e-08 = exactly the diagonal readings.
+ *
+ * THE GATE QUANTITY IS THEREFORE, since 2026-08-13,
+ *     tau_dev(s,k) = max_{probed elements, tau} |Sigma_B - Sigma^GW|
+ *                    / max_{SAME set, tau} |Sigma^GW|,
+ * one denominator per block, and the gate is its max over blocks -- reduced together with the
+ * (s,k,a,b) where it is attained, because only the ROOT rank's oracle rows reach the log while
+ * the gate maxes over every rank's blocks (that is why the kp444 fire was unnameable). The
+ * per-element ratios remain as log lines: they are diagnostics, and they are what identified
+ * this. The per-isym census keys on the largest ABSOLUTE deviation, which under this
+ * normalization IS the element that sets the gate.
+ *
+ * =====================================================================================
  * THE SYMMETRY PATH -- WHAT THE PRODUCTION DOES TO THE ORBITAL INDICES, AND WHY THIS MAP
  * IS EXACT AGAINST IT FOR ANY D (INCLUDING A NON-SYMMORPHIC GROUP)
  * [verified: re-derived mechanically from thc_gw.icc:287-322 (the isym loop and the D
@@ -125,12 +161,18 @@
  * attributable]:
  *
  *     fixture          nk  nk_ibz  nqsym  ntrev     tau dev    W-fit class   ratio
- *     qe_lih223        12    12      1      0     6.3697e-04   3.8581e-03    0.165
- *     qe_lih223_inv    12     8      1      4     6.3697e-04   3.8581e-03    0.165
- *     qe_lih223_sym    12     6      2      4     6.3703e-04   3.8581e-03    0.165
+ *     qe_lih223        12    12      1      0     4.1824e-04   3.8581e-03    0.108
+ *     qe_lih223_inv    12     8      1      4     4.1824e-04   3.8581e-03    0.108
+ *     qe_lih223_sym    12     6      2      4     4.1827e-04   3.8581e-03    0.108
+ *
+ * [re-measured 2026-08-13 under the block normalization above; the same three rows read
+ *  6.3697 / 6.3697 / 6.3703e-04 (ratio 0.165) under the retired per-element one. The fixture
+ *  moves by only 1.5x because its largest gap-window off-diagonal is of the same order as the
+ *  diagonal -- which is exactly why no fixture ever caught the normalization, and kp444, where
+ *  that off-diagonal is 1860x smaller, did.]
  *
  * Turning on the star loop, the trev branches and the D rotation moves the tau anchor by
- * 6e-09 ABSOLUTE on a deviation of 6.4e-04. The sym row is not vacuous: its census reads
+ * 3e-09 ABSOLUTE on a deviation of 4.2e-04. The sym row is not vacuous: its census reads
  * "D-rotation exercised on 4 of 6 (isym > 0, k) pairs, worst max|D - 1| = 2.0e+00, worst
  * max|D^dag D - 1| = 5.3e-16", i.e. the rotation really is non-trivial there (and exactly
  * unitary on this fixture, whose 16 bands close every multiplet).
@@ -764,11 +806,16 @@ namespace qp_modea {
       //  conj(chi_P) chi_Q is exactly the q = Gamma term of the main sum with this W added --
       //  the -1/nk prefactor cancels the nk here.]
       // [verified -- gate: test_qp_map_ab "qp_map_modeb_head_anchor" (2026-08-13), the tau
-      //  anchor on qe_lih223 with div_treatment = gygi. MEASURED: 6.3705e-04 with the head
-      //  ON against 6.3697e-04 with it OFF, i.e. the two routes to the same physics -- this
-      //  augmentation and gw_t::Sigma_div_correction -- agree to 8e-09 absolute. Before that
-      //  gate this was the ONE unexercised branch of the map (both QM3-b fixtures and the
-      //  QM3-c judge run div_treatment = ignore_g0, where the head is absent on both sides).]
+      //  anchor on qe_lih223 with div_treatment = gygi. MEASURED (block-normalized, the
+      //  2026-08-13 semantics): head ON gives anchor 3.4578e-04, ratio 0.158 of its gate,
+      //  from an ABSOLUTE deviation of 7.11e-05 a.u. over a block scale of 2.057e-01;
+      //  the same fixture with the head OFF gives 4.1824e-04 from 6.77e-05 a.u. over
+      //  1.620e-01. Turning the head on adds ~27% to |Sigma| and leaves the map-vs-reference
+      //  ABSOLUTE deviation within 5% -- i.e. this augmentation and gw_t::Sigma_div_correction
+      //  are the same physics to well inside the W-fit scale they share, and the head carries
+      //  no error of its own that the anchor can resolve. Before that gate this was the ONE
+      //  unexercised branch of the map (both QM3-b fixtures and the QM3-c judge run
+      //  div_treatment = ignore_g0, where the head is absent on both sides).]
       auto chi = thc.basis_head()(0, all);
       const double mad = MF->madelung();
       for (long j = 0; j < nc; ++j) {
