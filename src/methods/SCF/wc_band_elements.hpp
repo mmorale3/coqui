@@ -65,6 +65,85 @@
  * (node-shared) plus this rank's (a,b,J,p) slabs.
  *
  * =====================================================================================
+ * THE SYMMETRY PATH -- WHAT THE PRODUCTION DOES TO THE ORBITAL INDICES, AND WHY THIS MAP
+ * IS EXACT AGAINST IT FOR ANY D (INCLUDING A NON-SYMMORPHIC GROUP)
+ * [verified: re-derived mechanically from thc_gw.icc:287-322 (the isym loop and the D
+ *  application), thc_solver_comm.hpp:537-590 (aux_to_primary) and :459-517 / the
+ *  primary_to_aux impl (:384-450), mf::MF::symmetry_rotation -> bdft_readonly.hpp:571-585,
+ *  and utils::generate_dmatrix, symmetry.hpp:764-1092.
+ *  MEASURED: the lih223 symmetry ladder, test_qp_map_ab.cpp "qp_map_modea_sym_ladder",
+ *  2026-08-13 -- the table below.]
+ * =====================================================================================
+ * For an external IBZ point k and symmetry class isym, the production assembles Sigma in the
+ * auxiliary basis AT THE ROTATED POINT ks = ks_to_k(isym, k), sums that class's transfers
+ * there, and only then rotates the ORBITAL indices back to k:
+ *
+ *   Sigma^(isym)_ab(ks) = sum_PQ conj(X_ks(P,a)) [ sum_{q in star} -(1/nk) G_PQ(ks-qs)
+ *                                                  W_PQ(qs) ] X_ks(Q,b)
+ *                                                  [aux_to_primary, kp_map = ks_to_k(isym)]
+ *   Sigma_ij(k)        += sum_ab conj(D(a,i)) Sigma^(isym)_ab(ks) D(b,j)   [thc_gw.icc:310-317]
+ *
+ * with D = MF->symmetry_rotation(isym, k): ROWS are bands at ks, COLUMNS bands at k, and the
+ * conjugation flag cjg is false for every k of the IBZ (it is kp_trev(k), bdft_readonly.hpp:
+ * 579-584 -- it marks a stored D that itself composes with time reversal, which only happens
+ * at a trev image k, never at an IBZ k). The internal leg carries NO D at all: primary_to_aux
+ * pairs X(k') with G_ab(kp_to_ibz(k')) directly.
+ *
+ * NO FRACTIONAL-TRANSLATION PHASE APPEARS ANYWHERE IN THIS CHAIN, symmorphic or not:
+ *   * the D matrices are overlaps of the ROTATED IBZ orbital set against the stored one, and
+ *     generate_dmatrix builds them with Xft = nullptr (symmetry.hpp:839 and the
+ *     transform_k2g call at :1016), i.e. the e^{-i sg Rinv (G+k) T} factor that transform_k2g
+ *     CAN return is deliberately not applied;
+ *   * the orbitals at an image k-point -- hence the collocation columns X(ks) -- are DEFINED
+ *     by the same index rotation with the canonical operation kp_symm(ks). That is why
+ *     generate_dmatrix stores the IDENTITY at (kp_symm(ks), k) ("by convention,
+ *     d(kp_symm(k), kp_to_ibz(k)) = delta", symmetry.hpp:906-921) and why primary_to_aux may
+ *     use the IBZ G matrix at an image k with no rotation at all.
+ * Whatever phase convention the stored orbitals carry is therefore COMMON to both sides, and
+ * this map never re-derives a rotation: it calls the same MF->symmetry_rotation and reads the
+ * same thc.X(is, 0, ks) columns the GW assembly does.
+ *
+ * Composing with the MO factorizations gives the two collocation matrices of DERIVATION 1
+ * (qp_modea.hpp): XCe = X(ks) . D . C(k) and XCi = X(k') . C(kp_to_ibz(k')). Note the ORDER:
+ * D multiplies C from the LEFT -- csrmm(1, D, C) -- contracting D's COLUMN index against C's
+ * primary index, which is the order both in-tree consumers use
+ * (projector_boson_t.cpp:108-121; vertex_sym.hpp:36-42, Xhat = X(krot) . Dc).
+ *
+ * EXACTNESS, AND WHY D-MATRIX LEAKAGE CANNOT REACH THE ANCHOR. Since
+ * conj(XCe(P,n)) = sum_a conj(X_ks(P,a)) conj([D C](a,n)), this map's per-(isym, q) term is
+ * the production's per-(isym, q) term with C^dag (.) C applied -- and C^dag (.) C is exactly
+ * the MO transform the reference receives before the comparison (qp_scf_common.cpp:1283-1295).
+ * The two sides are identical TERM BY TERM for ANY D, unitary or not. The nbnd-truncation
+ * leakage of the stored D (row normalization, symmetry.hpp:1067-1092; the "accuracy floor of
+ * the symmetry path" of vertex_sym.hpp:52-56) is a property of the shared data, cancels in
+ * the difference, and is REPORTED by the symmetry census below, never gated. The only object
+ * the two sides do NOT share is the W REPRESENTATION (the support-constrained pole fit and
+ * the stage-1b/1c truncations) -- so any tau-anchor deviation is either that or the head.
+ *
+ * MEASURED [qp_map_modea_sym_ladder, mode_b, one outer iteration; three reductions of the
+ * SAME cell and the SAME 2x2x3 mesh, so the W-fit class is common and the deviation is
+ * attributable]:
+ *
+ *     fixture          nk  nk_ibz  nqsym  ntrev     tau dev    W-fit class   ratio
+ *     qe_lih223        12    12      1      0     6.3697e-04   3.8581e-03    0.165
+ *     qe_lih223_inv    12     8      1      4     6.3697e-04   3.8581e-03    0.165
+ *     qe_lih223_sym    12     6      2      4     6.3703e-04   3.8581e-03    0.165
+ *
+ * Turning on the star loop, the trev branches and the D rotation moves the tau anchor by
+ * 6e-09 ABSOLUTE on a deviation of 6.4e-04. The sym row is not vacuous: its census reads
+ * "D-rotation exercised on 4 of 6 (isym > 0, k) pairs, worst max|D - 1| = 2.0e+00, worst
+ * max|D^dag D - 1| = 5.3e-16", i.e. the rotation really is non-trivial there (and exactly
+ * unitary on this fixture, whose 16 bands close every multiplet).
+ *
+ * WHAT THE LADDER DOES NOT COVER, and it is worth knowing before blaming symmetry again:
+ * (i) a NON-SYMMORPHIC group -- every symmetry fixture in tests/unit_test_files has ft = 0
+ * (checked 2026-08-13: lih222_sym, lih223_sym, svo222_sym, GaAs, all Si; the only
+ * non-symmorphic cells in the tree are unreduced meshes, nsym = 1), so a fractional
+ * translation is untested LOCALLY -- though by the paragraph above it cannot enter;
+ * (ii) a LEAKY D (max|D^dag D - 1| >> 0), which needs a fixture whose band window cuts a
+ * degenerate multiplet; (iii) more than two symmetry classes.
+ *
+ * =====================================================================================
  * WHY STAGE 1b EXISTS -- THE FLOP MODEL OF THE SANDWICH
  * [measured: rusty, Si kp222, nbnd = 60, Np = 2918, nq = 8, ~60 retained poles, 32 ranks
  *  -> ~45 min per outer iteration, i.e. two orders over budget]
@@ -684,8 +763,12 @@ namespace qp_modea {
       //  whose Delta_ij = -madelung * eps_inv_head(tau) * sum_PQ conj(X_Pi) X_Qj G_PQ(k)
       //  conj(chi_P) chi_Q is exactly the q = Gamma term of the main sum with this W added --
       //  the -1/nk prefactor cancels the nk here.]
-      // [assumed -- gate: NONE in QM3; both QM3-b fixtures and the QM3-c judge run
-      //  div_treatment = ignore_g0, so this branch is UNEXERCISED by any gate.]
+      // [verified -- gate: test_qp_map_ab "qp_map_modeb_head_anchor" (2026-08-13), the tau
+      //  anchor on qe_lih223 with div_treatment = gygi. MEASURED: 6.3705e-04 with the head
+      //  ON against 6.3697e-04 with it OFF, i.e. the two routes to the same physics -- this
+      //  augmentation and gw_t::Sigma_div_correction -- agree to 8e-09 absolute. Before that
+      //  gate this was the ONE unexercised branch of the map (both QM3-b fixtures and the
+      //  QM3-c judge run div_treatment = ignore_g0, where the head is absent on both sides).]
       auto chi = thc.basis_head()(0, all);
       const double mad = MF->madelung();
       for (long j = 0; j < nc; ++j) {
@@ -693,7 +776,8 @@ namespace qp_modea {
         Hcol(j) = double(nkpts) * mad * std::conj(chi(P)) * chi(Q);
       }
       app_log(lvl, "  - Gamma head:                  ON (div_treatment = {}, madelung = "
-                   "{:.6g}) -- UNGATED code path, see wc_band_elements.hpp", div_treatment, mad);
+                   "{:.6g}) -- gated by test_qp_map_ab \"qp_map_modeb_head_anchor\"",
+              div_treatment, mad);
     } else {
       app_log(lvl, "  - Gamma head:                  OFF (div_treatment = {})", div_treatment);
     }
@@ -707,6 +791,8 @@ namespace qp_modea {
     nda::array<ComplexType, 2> Wt(nt_half, nc), Whalf(nw_half, nc), Ww(nwb, nc);
     nda::array<ComplexType, 2> Wf((opts.wfit == "nu") ? 0 : ntf, (opts.wfit == "nu") ? 0 : nc);
     double herm_num = 0.0, herm_den = 0.0, rec_worst = 0.0, fit_worst = 0.0, ratio_worst = 0.0;
+    double rec_abs_worst = 0.0, rec_abs_den = 0.0, rec_abs_sum = 0.0, w_max_sum = 0.0;
+    long rec_q = -1, rec_abs_q = -1;
 
     for (long iq = 0; iq < nq_ibz; ++iq) {
       sWt.set_zero();
@@ -766,7 +852,21 @@ namespace qp_modea {
             den = std::max(den, std::abs(Ww(m, j)));
           }
         }
-        if (den > 0.0) rec_worst = std::max(rec_worst, num / den);
+        if (den > 0.0 and num / den > rec_worst) { rec_worst = num / den; rec_q = iq; }
+        // ... and the ABSOLUTE error of the same reconstruction. The gate's class is the
+        // RELATIVE number above, normalized per q by max|W_q| -- but Sigma sums the q mesh
+        // with band factors of a common scale, so what reaches the tau anchor is the
+        // ABSOLUTE error, and the two orderings differ by orders once the mesh resolves the
+        // 1/q^2 growth of W near Gamma (max|W_q| itself is printed so the ratio is readable).
+        if (num > rec_abs_worst) { rec_abs_worst = num; rec_abs_q = iq; rec_abs_den = den; }
+        // THE ERROR BUDGET. Sigma^c_ab = -(1/nk) sum_q sum_PQ A_P W_PQ(q) conj(A_Q) with
+        // band factors A of a q-independent scale, so the RELATIVE error the tau anchor
+        // measures is bounded by (sum_q |dW_q|) / (sum_q max|W_q|) up to the correlation
+        // between dW and the band factors. That ratio is the anchor scale the W
+        // representation ALONE predicts -- if the measured anchor sits at it, there is no
+        // routing error left to look for.
+        rec_abs_sum += num;
+        w_max_sum += den;
       }
 
       for (long p = 0; p < npk; ++p)
@@ -817,6 +917,20 @@ namespace qp_modea {
     ctx.diag.rec_rel_worst = mpi->comm.all_reduce_value(rec_worst, boost::mpi3::max<>{});
     ctx.diag.fit_err_worst = mpi->comm.all_reduce_value(fit_worst, boost::mpi3::max<>{});
     ctx.diag.res_ratio_worst = mpi->comm.all_reduce_value(ratio_worst, boost::mpi3::max<>{});
+    {   // the ABSOLUTE reconstruction error and where each worst case sits (see above)
+      const double a_max = mpi->comm.all_reduce_value(rec_abs_worst, boost::mpi3::max<>{});
+      if (rec_abs_worst < a_max) { rec_abs_q = -1; rec_abs_den = 0.0; }
+      if (rec_worst < ctx.diag.rec_rel_worst) rec_q = -1;
+      ctx.diag.rec_abs_worst = a_max;
+      ctx.diag.rec_abs_q = mpi->comm.all_reduce_value(rec_abs_q, boost::mpi3::max<>{});
+      ctx.diag.rec_abs_wmax = mpi->comm.all_reduce_value(rec_abs_den, boost::mpi3::max<>{});
+      ctx.diag.rec_rel_q = mpi->comm.all_reduce_value(rec_q, boost::mpi3::max<>{});
+      // the budget is the WORST column slice: each rank holds a slice of every q, so its
+      // (sum_q |dW|) / (sum_q max|W|) is one sample of the same ratio -- reduce the ratio,
+      // not the two sums separately (they would come from different ranks).
+      const double br = (w_max_sum > 0.0) ? rec_abs_sum / w_max_sum : 0.0;
+      ctx.diag.rec_budget = mpi->comm.all_reduce_value(br, boost::mpi3::max<>{});
+    }
     Wt = nda::array<ComplexType, 2>();
     Whalf = nda::array<ComplexType, 2>();
     Ww = nda::array<ComplexType, 2>();
@@ -1188,6 +1302,84 @@ namespace qp_modea {
     auto qminus = MF->qminus();
     const double pref = 1.0 / double(nkpts);
 
+    // ---------------- the SYMMETRY CENSUS (permanent, level 2) -------------------------
+    // Two things the kp444 post-mortem needed and no log carried:
+    //  (1) q_isym: which symmetry class handles each full-BZ transfer. The (isym, q-in-star)
+    //      pairs partition the full mesh (the coverage tripwire below re-checks it), so the
+    //      flat internal label J = q'*nbnd + n inherits a class and the tau oracle can split
+    //      its route-B side per class -- the per-isym anchor breakdown.
+    //  (2) whether the D-matrix external rotation is EXERCISED AT ALL, and its unitarity
+    //      defect. generate_dmatrix stores the IDENTITY for the symmetry that defines the
+    //      image k-point's orbitals ("by convention, d(kp_symm(k), kp_to_ibz(k)) = delta",
+    //      symmetry.hpp:906-921), so a symmetry-reduced mesh can run the whole isym loop with
+    //      D = 1 everywhere: the star structure is then tested and the ROTATION is not. The
+    //      defect max|D^dag D - 1| is the accuracy floor of the symmetry path in the sense of
+    //      vertex_sym.hpp:52-56 (nbnd-truncated degenerate multiplets, row-normalized rows).
+    //      It cancels between this map and the reference -- both apply the SAME D to the same
+    //      object (see DERIVATION 1) -- so it is reported, never gated.
+    ctx.nsym = nsym;
+    ctx.q_isym = nda::array<long, 1>(nqpts);
+    ctx.q_isym() = 0;
+    {
+      nda::array<long, 1> seen(nqpts);
+      seen() = 0;
+      for (long isym = 0; isym < nsym; ++isym)
+        for (long iq = 0; iq < MF->nq_per_s(isym); ++iq) {
+          const long qp = MF->Qs(isym, iq);
+          utils::check(qp >= 0 and qp < nqpts, "qp_modea: Qs({},{}) = {} out of range.",
+                       isym, iq, qp);
+          ctx.q_isym(qp) = isym;
+          ++seen(qp);
+        }
+      for (long qp = 0; qp < nqpts; ++qp)
+        utils::check(seen(qp) == 1, "qp_modea: transfer q' = {} is handled by {} (isym, q) "
+                     "pairs of the star loop, not 1.", qp, seen(qp));
+    }
+    if (nsym > 1) {
+      nda::array<long, 1> ncls(nsym), nnid(nsym);
+      nda::array<double, 1> did(nsym), dun(nsym);
+      ncls() = 0; nnid() = 0; did() = 0.0; dun() = 0.0;
+      nda::array<ComplexType, 2> Dd(nbnd, nbnd), DhD(nbnd, nbnd), Id(nbnd, nbnd);
+      Id() = ComplexType(0.0);
+      for (long i = 0; i < nbnd; ++i) Id(i, i) = ComplexType(1.0);
+      for (long isym = 0; isym < nsym; ++isym) {
+        ncls(isym) = MF->nq_per_s(isym);
+        if (isym == 0) continue;
+        for (long ik = 0; ik < nk_ibz; ++ik) {
+          auto [cjg, D] = MF->symmetry_rotation(isym, ik);
+          Dd() = ComplexType(0.0);
+          math::sparse::csrmm(ComplexType(1.0), *D, Id, ComplexType(0.0), Dd);
+          double di = 0.0;
+          for (long i = 0; i < nbnd; ++i)
+            for (long j = 0; j < nbnd; ++j)
+              di = std::max(di, std::abs(Dd(i, j) - (i == j ? ComplexType(1.0)
+                                                            : ComplexType(0.0))));
+          nda::blas::gemm(nda::dagger(Dd), Dd, DhD);
+          double du = 0.0;
+          for (long i = 0; i < nbnd; ++i)
+            for (long j = 0; j < nbnd; ++j)
+              du = std::max(du, std::abs(DhD(i, j) - (i == j ? ComplexType(1.0)
+                                                             : ComplexType(0.0))));
+          if (di > 1e-12) ++nnid(isym);
+          did(isym) = std::max(did(isym), di);
+          dun(isym) = std::max(dun(isym), du);
+        }
+        ctx.diag.n_D_nonid += nnid(isym);
+        ctx.diag.d_ident_worst = std::max(ctx.diag.d_ident_worst, did(isym));
+        ctx.diag.d_unit_worst = std::max(ctx.diag.d_unit_worst, dun(isym));
+      }
+      app_log(lvl, "  - symmetry census:             {} q-symmetry classes over {} full-BZ "
+                   "transfers, {} IBZ k; D-rotation exercised on {} of {} (isym > 0, k) pairs, "
+                   "worst max|D - 1| = {:.3e}, worst max|D^dag D - 1| = {:.3e} (REPORTED -- it "
+                   "cancels against the reference, which applies the same D)",
+              nsym, nqpts, nk_ibz, ctx.diag.n_D_nonid, (nsym - 1) * nk_ibz,
+              ctx.diag.d_ident_worst, ctx.diag.d_unit_worst);
+      for (long isym = 0; isym < nsym; ++isym)
+        app_log(lvl + 1, "  - symmetry class {:>3}:          {} transfers, D non-identity at "
+                         "{} of {} k, max|D - 1| = {:.3e}, max|D^dag D - 1| = {:.3e}",
+                isym, ncls(isym), nnid(isym), (isym == 0 ? 0 : nk_ibz), did(isym), dun(isym));
+    }
+
     nda::array<ComplexType, 2> XCe(NP, nbnd), DC(nbnd, nbnd);
     nda::array<ComplexType, 2> B(NP, nbnd), Bc(NP, nbnd), T(NP, nbnd), Msand(nbnd, nbnd);
     // low-rank path scratch: the r-th column of the slab basis contracts BOTH legs at once,
@@ -1483,9 +1675,24 @@ namespace qp_modea {
                  "(max|Im Ttw_bb| = {:.3e}); the trev-q rule implemented is conj(W_PQ), "
                  "matching thc_gw.icc:381-393", ctx.diag.w_herm_rel, ctx.diag.ttw_imag);
     app_log(lvl, "  - W^c fit quality:             bosonic-mesh reconstruction rel err = "
-                 "{:.3e} (worst q)   [own-grid residual {:.3e}, residue ratio {:.3g} -- "
+                 "{:.3e} (worst q = {})   [own-grid residual {:.3e}, residue ratio {:.3g} -- "
                  "reported, NOT the quality number]",
-            ctx.diag.rec_rel_worst, ctx.diag.fit_err_worst, ctx.diag.res_ratio_worst);
+            ctx.diag.rec_rel_worst, ctx.diag.rec_rel_q, ctx.diag.fit_err_worst,
+            ctx.diag.res_ratio_worst);
+    app_log(lvl, "  - W^c fit, ABSOLUTE scale:     worst absolute reconstruction error = "
+                 "{:.3e} at IBZ q = {} (max|W_q| there = {:.3e}, i.e. {:.3e} relative; the "
+                 "relative class above is worst at q = {}). The two orderings differ once the "
+                 "mesh resolves the 1/q^2 growth of W near Gamma, and Sigma sums the mesh "
+                 "against band factors of a common scale, so it is the ABSOLUTE column that "
+                 "reaches the anchor.",
+            ctx.diag.rec_abs_worst, ctx.diag.rec_abs_q, ctx.diag.rec_abs_wmax,
+            (ctx.diag.rec_abs_wmax > 0.0 ? ctx.diag.rec_abs_worst / ctx.diag.rec_abs_wmax
+                                         : 0.0), ctx.diag.rec_rel_q);
+    app_log(lvl, "  - W^c error BUDGET:            sum_q |dW_q| / sum_q max|W_q| = {:.3e} -- "
+                 "the tau-anchor scale the W REPRESENTATION alone predicts. A measured anchor "
+                 "at this scale leaves nothing for a routing error to explain; an anchor far "
+                 "ABOVE it is the only reading that points back at the contraction.",
+            ctx.diag.rec_budget);
     app_log(lvl, "  - context build:               {:.2f} s wall, {:.1f} MB extra per rank "
                  "(peak)", ctx.diag.wall_s, ctx.diag.mem_mb);
     app_log(lvl, "  - context build memory:        stage 1c {:.0f} MB (dense slabs {:.0f} + "

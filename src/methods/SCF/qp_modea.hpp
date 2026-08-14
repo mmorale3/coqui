@@ -60,6 +60,11 @@
  *     XCe(P,a) = [ X(ks) . D(isym,k) . C(k) ](P,a)          (external leg, D = 1 at isym = 0)
  *     XCi(P,n) = [ X(k') . C(kp_to_ibz(k')) ](P,n)          (internal leg)
  *
+ * [the SYMMETRY half of this composition -- the D index order, the absence of any
+ *  fractional-translation phase, the proof that the two sides are identical term by term for
+ *  ANY D (so D leakage cannot reach the anchor), and the lih223 ladder that measures it --
+ *  is derived in the header of wc_band_elements.hpp, section "THE SYMMETRY PATH"]
+ *
  * and the pair vector of the spec,   A_P(k,k'; a,n) = conj(XCe(P,a)) * XCi(P,n),   giving
  *
  *     Sigma^c_ab(s,k; tau) = -(1/nk) sum_q sum_n g_n(k-q,tau)
@@ -267,6 +272,16 @@ namespace qp_modea {
     double w_herm_rel = 0.0;           // max|W - W^dag| / max|W| on the stored tau data
     double ttw_imag = 0.0;             // max|Im Ttw_bb| (reality of the nu <-> tau kernel)
     double rec_rel_worst = 0.0;        // worst-q bosonic-mesh reconstruction rel error
+    // ... the SAME reconstruction in ABSOLUTE units, and where each worst case sits. The
+    // gate normalizes per q by max|W_q|; what reaches Sigma is the absolute error summed
+    // over the mesh, and near Gamma max|W_q| grows as 1/q^2, so the two can order the q's
+    // completely differently on a fine mesh. Reported, never gated.
+    double rec_abs_worst = 0.0;        // worst-q ABSOLUTE reconstruction error
+    double rec_abs_wmax = 0.0;         // max|W_q| of that q
+    long rec_rel_q = -1, rec_abs_q = -1;   // IBZ q index of each worst case
+    // sum_q |dW_q| / sum_q max|W_q| -- the tau-anchor scale the W representation alone
+    // predicts (see the error budget note in wc_band_elements.hpp)
+    double rec_budget = 0.0;
     double fit_err_worst = 0.0;        // worst-q fit residual ON ITS OWN grid (NOT a quality
                                        // number -- see binding requirement 3)
     double res_ratio_worst = 0.0;
@@ -285,6 +300,15 @@ namespace qp_modea {
     double wtrunc_frob_worst = 0.0;    // worst Frobenius-relative discarded weight
     double wanti_worst = 0.0;          // worst max|W - W^dag| / max|W| of a residue slab
     double t_fit = 0.0, t_fac = 0.0, t_sand = 0.0;
+    // ---- the SYMMETRY path census (2026-08-13) -----------------------------------------
+    // The external-leg rotation XCe = X(ks) D(isym,k) C(k) is exercised only where the
+    // stored D is NOT the identity: generate_dmatrix stores the identity for the symmetry
+    // that DEFINES the image k-point's orbitals (symmetry.hpp:906-921), so a reduced mesh
+    // can run the whole isym loop with D = 1 everywhere and never test the rotation. These
+    // two numbers say whether a given run did.
+    long n_D_nonid = 0;                // (isym, k) pairs with a non-identity stored D
+    double d_ident_worst = 0.0;        // worst max|D - 1| over those pairs
+    double d_unit_worst = 0.0;         // worst max|D^dag D - 1| (the symmetry accuracy floor)
   };
 
   /**
@@ -310,6 +334,21 @@ namespace qp_modea {
     // diagonal residues for the evGW leg, replicated: (ns, nk, nbnd, nJ*npk)
     nda::array<ComplexType, 4> Mdiag;
     bool have_diag = false;
+
+    // ---- SYMMETRY BOOKKEEPING (the per-isym anchor breakdown, 2026-08-13) --------------
+    // Every full-BZ transfer q' is handled by EXACTLY ONE (isym, q-in-star) pair of the
+    // thc_gw star loop, so the flat internal label J = q'*nbnd + n inherits that pair's
+    // symmetry class. q_isym(q') is that class (0 = identity, the qsymms POSITION), which
+    // is what lets the tau oracle split its route-B side per symmetry class without
+    // touching the contraction. nsym <= 1 means the isym loop never runs.
+    long nsym = 1;
+    nda::array<long, 1> q_isym;        // (nkpts_full) qsymms position that handles q'
+    /** the symmetry class of a flat internal label J = q'*nbnd + n. */
+    long isym_of_J(long J) const {
+      if (q_isym.size() == 0 or nbnd <= 0) return 0;
+      const long qp = J / nbnd;
+      return (qp >= 0 and qp < q_isym.size()) ? q_isym(qp) : 0;
+    }
 
     long block_index(long is, long ik) const {
       for (size_t b = 0; b < blocks.size(); ++b)
@@ -961,6 +1000,48 @@ namespace qp_modea {
         const ComplexType R = blk.M(a, b, J * npk + p) * (ctx.nB(p) + f);
         const double E = e - ctx.om(p);
         for (long i = 0; i < nt; ++i) out(i) += R * g(E, tau(i));
+      }
+    }
+  }
+
+  /**
+   * THE PER-ISYM BREAKDOWN of the same tau image: out(s, i) is the part of Sigma_B(tau_i)
+   * carried by the internal labels whose transfer q' is handled by symmetry class s
+   * (ctx.q_isym; the classes partition the full transfer mesh, so the rows sum to
+   * modea_sigma_tau). ONE pass over (J,p) -- the class is a property of J.
+   *
+   * WHAT IT IS FOR (kp444 post-mortem, 2026-08-13). The reference Sigma^c(tau) cannot be
+   * split per class (the solver sums the isym loop internally), so a per-class DEVIATION does
+   * not exist. What does exist, and is the discriminating statistic, is each class's own
+   * MAGNITUDE: a class whose contribution is 1e-2 of the total cannot explain a 1e-4 total
+   * deviation unless it is itself wrong by 1e-2 relative, and a wrong symmetry convention
+   * (rotation, fractional-translation phase, trev branch) is wrong by O(1), not by 1e-2. The
+   * ratio dev/|class| printed by the caller is therefore a DIRECT test of "is any single
+   * symmetry class structurally wrong": O(1) for the offending class if one is, << 1 for all
+   * classes if the deviation is diffuse (i.e. the W representation, which is the only other
+   * difference between the two sides -- DERIVATION 1 makes the contraction identical term by
+   * term for any D).
+   */
+  inline void modea_sigma_tau_by_class(modea_ctx const &ctx, sk_block const &blk, long a,
+                                       long b, nda::MemoryArrayOfRank<1> auto const &tau,
+                                       nda::array<ComplexType, 2> &out) {
+    const long nt = tau.shape(0), npk = ctx.npk, nJ = ctx.nJ;
+    const long off = (blk.is * ctx.nk + blk.ik) * nJ;
+    const double beta = ctx.beta;
+    auto g = [&](double E, double t) {
+      const double x = E - ctx.mu;
+      if (x > 0.0) return -std::exp(-x * t) / (1.0 + std::exp(-x * beta));
+      return -std::exp(x * (beta - t)) / (1.0 + std::exp(x * beta));
+    };
+    out() = ComplexType(0.0);
+    for (long J = 0; J < nJ; ++J) {
+      const long s = ctx.isym_of_J(J);
+      if (s < 0 or s >= out.shape(0)) continue;
+      const double e = ctx.epsJ(off + J), f = ctx.fJ(off + J);
+      for (long p = 0; p < npk; ++p) {
+        const ComplexType R = blk.M(a, b, J * npk + p) * (ctx.nB(p) + f);
+        const double E = e - ctx.om(p);
+        for (long i = 0; i < nt; ++i) out(s, i) += R * g(E, tau(i));
       }
     }
   }

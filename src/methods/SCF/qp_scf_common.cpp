@@ -206,6 +206,9 @@ namespace {
     double ratio_worst = 0.0, dev_off_worst = 0.0;
     double ratio_in_worst = 0.0, delta_in_worst = 0.0, class_in_worst = 0.0;
     double tau_dev_worst = 0.0;
+    // the per-isym anchor breakdown, kept for the gate message (see the TAU ISYM block)
+    double isym_ratio_worst = 0.0;
+    long isym_class_worst = -1;
     long iters_worst = 0, n_noconv = 0, n_flag = 0, n_flag_in = 0;
     long n_fallback = 0, n_fallback_win = 0, n_sanity_trip = 0;
     long n_homo_fb = 0, n_lumo_fb = 0, n_blocks = 0;
@@ -348,6 +351,8 @@ namespace {
         }
         app_log(lvl, "  mode_a TAU ORACLE (s,k) = ({},{}): {:>6} {:>14} {:>14} {:>10}",
                 is, ik, "(a,b)", "tau rel dev", "iw rel dev", "ratio");
+        double worst_tn = -1.0, worst_td = 0.0;
+        std::pair<long, long> worst_ab{0, 0};
         for (auto const &[a, b] : elems) {
           modea_sigma_tau(*ctx, *blk, a, b, tau_ph, Stau);
           double tn = 0.0, td = 0.0;
@@ -367,9 +372,63 @@ namespace {
           const double dtau = (td > 0.0) ? tn / td : 0.0;
           const double diw = (wd > 0.0) ? wn_ / wd : 0.0;
           tau_dev_worst = std::max(tau_dev_worst, dtau);
+          if (tn > worst_tn) { worst_tn = tn; worst_td = td; worst_ab = {a, b}; }
           app_log(lvl, "  mode_a TAU ORACLE     ({},{}): ({:>2},{:>2}) {:>14.4e} {:>14.4e} "
                        "{:>10.3g}{}", is, ik, a, b, dtau, diw,
                   (dtau > 0.0 ? diw / dtau : 0.0), (a == b) ? "" : "   <- off-diagonal");
+        }
+        // ---- THE PER-ISYM BREAKDOWN (permanent, level 2; the kp444 post-mortem) ---------
+        // The route-B side of the WORST element above, split over the symmetry classes of the
+        // star loop (ctx->q_isym; the classes partition the full transfer mesh, so the rows
+        // sum back to the total -- printed as the bookkeeping check), against the SAME
+        // absolute deviation. The reference cannot be split (the solver sums the isym loop
+        // internally), so there is no per-class deviation; what discriminates is each class's
+        // own MAGNITUDE:
+        //   share       = max_tau |Sigma_B^(isym)| / max_tau |Sigma^GW|
+        //   dev/|class| = how wrong THAT CLASS ALONE would have to be, relatively, to carry
+        //                 the entire deviation.
+        // A structurally wrong class -- wrong rotation, wrong fractional-translation phase,
+        // wrong trev branch -- is wrong by O(1), so exactly one row would read ~1. Rows that
+        // all read << 1 EXCLUDE a per-class convention error, and by the symmetry derivation
+        // in wc_band_elements.hpp the only object the two sides then still differ in is the W
+        // representation (fit + stage-1b/1c truncation).
+        if (ctx->nsym > 1 and ctx->q_isym.size() > 0 and worst_td > 0.0) {
+          const long a = worst_ab.first, b = worst_ab.second;
+          nda::array<ComplexType, 2> Scls(ctx->nsym, FT.nt_f());
+          modea_sigma_tau_by_class(*ctx, *blk, a, b, tau_ph, Scls);
+          modea_sigma_tau(*ctx, *blk, a, b, tau_ph, Stau);
+          double chk = 0.0, worst_ratio = 0.0;
+          long worst_s = -1;
+          for (long i = 0; i < FT.nt_f(); ++i) {
+            ComplexType tot(0.0);
+            for (long s = 0; s < ctx->nsym; ++s) tot += Scls(s, i);
+            chk = std::max(chk, std::abs(tot - Stau(i)));
+          }
+          app_log(lvl, "  mode_a TAU ISYM (s,k) = ({},{}): worst element ({},{}), absolute "
+                       "deviation {:.4e} of max|Sigma^GW| {:.4e}; {:>5} {:>8} {:>14} {:>11} "
+                       "{:>13}", is, ik, a, b, worst_tn, worst_td, "isym", "nq", "max|Sigma_B|",
+                  "share", "dev/|class|");
+          for (long s = 0; s < ctx->nsym; ++s) {
+            double m = 0.0;
+            for (long i = 0; i < FT.nt_f(); ++i) m = std::max(m, std::abs(Scls(s, i)));
+            long nq_s = 0;
+            for (long qp = 0; qp < ctx->q_isym.size(); ++qp) if (ctx->q_isym(qp) == s) ++nq_s;
+            if (nq_s == 0) continue;      // a qsymms entry the star loop never uses
+            const double ratio = (m > 0.0) ? worst_tn / m : -1.0;
+            if (ratio > worst_ratio) { worst_ratio = ratio; worst_s = s; }
+            app_log(lvl, "  mode_a TAU ISYM       ({},{}): {:>27} {:>5} {:>8} {:>14.4e} "
+                         "{:>11.3e} {:>13.3g}", is, ik, "", s, nq_s, m,
+                    (worst_td > 0.0 ? m / worst_td : 0.0), ratio);
+          }
+          app_log(lvl, "  mode_a TAU ISYM       ({},{}): worst dev/|class| = {:.3g} at class "
+                       "{} -- O(1) there means THAT symmetry class is structurally wrong, "
+                       "<< 1 for every class means the deviation is diffuse (the W "
+                       "representation). Class sum vs total = {:.2e} (bookkeeping).",
+                  is, ik, worst_ratio, worst_s, chk);
+          if (worst_ratio > isym_ratio_worst) {
+            isym_ratio_worst = worst_ratio;
+            isym_class_worst = worst_s;
+          }
         }
       }
 
@@ -682,17 +741,40 @@ namespace {
     // tau agreement 5.6e-05 at DLR prec "low", two orders below that grid's W-fit class,
     // while the i w deviation was 2.3e-01 on the SAME elements and halved with every prec
     // notch. The i w comparison is therefore a LOGGED DIAGNOSTIC ONLY -- never a gate.
-    if (cd)
+    if (cd) {
+      isym_ratio_worst = comm.all_reduce_value(isym_ratio_worst, boost::mpi3::max<>{});
       utils::check(tau_dev_worst < qp_modea::modea_tau_anchor_mult * ctx->diag.rec_rel_worst,
                    "qp_approx ({}): THE TAU ANCHOR FAILED -- the analytic tau image of the "
                    "route-B Sigma^c deviates from the solver's Sigma^c(tau) by {:.4e} over the "
                    "gap window and the largest off-diagonal, against a gate of {:.1f} x the "
                    "W-fit reconstruction class ({:.4e}). Neither side applies a Fourier "
-                   "transform here, so this is a CONTRACTION error (prefactor, spin, "
-                   "q-star/trev rule, MO rotation, or the Gamma head), not a representation "
-                   "artefact. See notes/qm3_mode_a_loop_spec.md rev 2.",
+                   "transform here, so the two sides differ ONLY in (a) the contraction "
+                   "(prefactor, spin, q-star/trev rule, MO rotation, the Gamma head) and "
+                   "(b) the W REPRESENTATION -- the support-constrained pole fit and the "
+                   "stage-1b/1c truncations. Read them apart from the numbers this run "
+                   "already printed:\n"
+                   "  * per-isym breakdown (TAU ISYM lines): worst dev/|class| = {:.3g} at "
+                   "class {}. A structurally wrong symmetry class is wrong by O(1), so a "
+                   "value << 1 for EVERY class rules the symmetry path out -- and the "
+                   "contraction is identical to the GW assembly term by term for any D, see "
+                   "\"THE SYMMETRY PATH\" in wc_band_elements.hpp (measured: the lih223 "
+                   "ladder, 6e-09 absolute).\n"
+                   "  * the head: gated since 2026-08-13 by test_qp_map_ab "
+                   "\"qp_map_modeb_head_anchor\" (agrees with Sigma_div_correction to 8e-09).\n"
+                   "  * the W representation: its own ERROR BUDGET sum_q |dW_q| / sum_q "
+                   "max|W_q| = {:.3e} is the anchor scale it predicts on its own -- compare "
+                   "it with the {:.4e} above BEFORE reading this as a routing error. Backing "
+                   "numbers: tau-domain fit residual {:.3e}, worst slab truncation {:.3e} "
+                   "(Frobenius {:.3e}), union projection tail {:.3e}. The gate's yardstick is "
+                   "the per-q RELATIVE bosonic-mesh class, which is a different object from "
+                   "the budget.\n"
+                   "See notes/qm3_mode_a_loop_spec.md rev 2.",
                    map_name, tau_dev_worst, qp_modea::modea_tau_anchor_mult,
-                   ctx->diag.rec_rel_worst);
+                   ctx->diag.rec_rel_worst, isym_ratio_worst, isym_class_worst,
+                   ctx->diag.rec_budget, tau_dev_worst,
+                   ctx->diag.fit_err_worst, ctx->diag.wtrunc_worst,
+                   ctx->diag.wtrunc_frob_worst, ctx->diag.union_tail_worst);
+    }
     if (false)
       utils::check(anchor_worst < qp_modea::modea_anchor_gate,
                    "qp_approx (mode_a): THE ANCHOR FAILED -- route-B Sigma^c deviates from the "

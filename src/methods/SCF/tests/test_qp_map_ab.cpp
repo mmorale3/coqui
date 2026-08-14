@@ -92,11 +92,12 @@ namespace bdft_tests {
                           const std::string &wfit = "tau",
                           const std::string &tag = "", double eta = 0.0,
                           double wrtol = -1.0, double wrank = 1e-10, long wsketch = 0,
-                          double eta_far = 0.0, bool gate = true, double wunion = -1.0) {
+                          double eta_far = 0.0, bool gate = true, double wunion = -1.0,
+                          const std::string &div = "ignore_g0") {
       const std::string output = "qp_map_ab_" + map + "_" + mode + tag;
       solvers::hf_t hf;
-      solvers::gw_t gw(&ft, "ignore_g0", output);
-      solvers::scr_coulomb_t scr_eri(&ft, "rpa", "ignore_g0");
+      solvers::gw_t gw(&ft, div, output);
+      solvers::scr_coulomb_t scr_eri(&ft, "rpa", div);
 
       thc_reader_t thc(mf, make_thc_reader_ptree(mf->nbnd()*thc_prefactor, "", "incore", "", output,
                                                  thc_tol, mf->ecutrho(), 1, 1024));
@@ -942,6 +943,70 @@ namespace bdft_tests {
             (row.lr.anchor_expect > 0.0 ? row.lr.tau_dev / row.lr.anchor_expect : 0.0));
     REQUIRE(row.lr.tau_dev < qp_modea::modea_tau_anchor_mult * row.lr.anchor_expect);
   }
+
+  /**
+   * THE GAMMA-HEAD GATE (2026-08-13). Until today the head augmentation of stage 1
+   * (wc_band_elements.hpp, "Gamma head") was the ONE code path of the map that no gate
+   * touched: every QM3 fixture and the QM3-c judge run div_treatment = ignore_g0, where the
+   * head is absent on BOTH sides by construction. It is also the only place where this map
+   * and the reference build the same physics by DIFFERENT routes -- the map adds
+   * W^head_PQ(tau) = nk madelung eps_inv_head(tau) conj(chi_P) chi_Q into the q = Gamma slab
+   * and lets it ride through the ordinary contraction, while gw_t::Sigma_div_correction
+   * (thc_gw.icc:444-531) forms -madelung eps_inv_head(tau) T G T^dag directly at each IBZ k.
+   * The tau anchor is exactly the comparison that closes that loop, so it is now run with the
+   * head ON. Same fixture as the qp_map_ab gates, no symmetry (12 k, 12 in the IBZ).
+   */
+  TEST_CASE("qp_map_modeb_head_anchor", "[methods][qpgw][qp_map_ab][modeb]") {
+    using namespace qp_map_ab_detail;
+    auto& mpi_context = utils::make_unit_test_mpi_context();
+    imag_axes_ft::IAFT ft(1000.0, 1.2, imag_axes_ft::dlr_basis);
+    auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_lih223"));
+    auto row = run_map(mpi_context, mf, ft, "mode_b", "qpscf", 12, 1e-10, 1, 1e-6, "tau",
+                       "_head", 0.0, -1.0, 1e-10, 0, 0.0, true, -1.0, "gygi");
+    app_log(1, "mode_b GAMMA HEAD gate (div_treatment = gygi): TAU ANCHOR = {:.4e}, W-fit "
+               "reconstruction class = {:.4e}, ratio = {:.3g}", row.lr.tau_dev,
+            row.lr.anchor_expect,
+            (row.lr.anchor_expect > 0.0 ? row.lr.tau_dev / row.lr.anchor_expect : 0.0));
+    REQUIRE(row.lr.tau_dev < qp_modea::modea_tau_anchor_mult * row.lr.anchor_expect);
+  }
+
+  /**
+   * THE SYMMETRY LADDER (post-mortem of the kp444 tau-anchor abort, 2026-08-13). Three
+   * fixtures of the SAME cell and the SAME 2x2x3 mesh, differing only in how the mesh is
+   * reduced, so the W-fit class is (nearly) common and the tau deviation is attributable:
+   *
+   *    qe_lih223       12 k, 12 IBZ, no reduction        -> isym loop and trev branches DEAD
+   *    qe_lih223_inv   12 k,  8 IBZ, time reversal only  -> trev branches LIVE, no D
+   *    qe_lih223_sym   12 k,  6 IBZ, 2 q-symmetries      -> D-matrix external rotation LIVE
+   *
+   * REPORTS only (hidden case, run explicitly by name).
+   */
+  TEST_CASE("qp_map_modea_sym_ladder", "[.nsym]") {
+    using namespace qp_map_ab_detail;
+    auto& mpi_context = utils::make_unit_test_mpi_context();
+    imag_axes_ft::IAFT ft(1000.0, 1.2, imag_axes_ft::dlr_basis);
+    const std::vector<std::string> names = {"qe_lih223", "qe_lih223_inv", "qe_lih223_sym"};
+    struct lrow { std::string name; long nk, nkibz, nsym, ntrev; double dev, cls; };
+    std::vector<lrow> rows;
+    for (size_t i = 0; i < names.size(); ++i) {
+      auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, names[i]));
+      app_log(1, "\n== ladder {}: nkpts = {} ({} IBZ), nqpts = {} ({} IBZ), q-symmetries = {}, "
+                 "trev k-pairs = {} ==", names[i], mf->nkpts(), mf->nkpts_ibz(), mf->nqpts(),
+              mf->nqpts_ibz(), mf->qsymms().size(), mf->nkpts_trev_pairs());
+      auto row = run_map(mpi_context, mf, ft, "mode_b", "qpscf", 12, 1e-10, 1, 1e-6, "tau",
+                         "_lad" + std::to_string(i), 0.0, -1.0, 1e-10, 0, 0.0, false);
+      rows.push_back({names[i], mf->nkpts(), mf->nkpts_ibz(), long(mf->qsymms().size()),
+                      mf->nkpts_trev_pairs(), row.lr.tau_dev, row.lr.anchor_expect});
+    }
+    app_log(1, "\n== SYMMETRY LADDER (lih223, mode_b, one outer iteration) ==");
+    app_log(1, "  {:<16} {:>4} {:>6} {:>6} {:>6} {:>12} {:>12} {:>9}", "fixture", "nk",
+            "nk_ibz", "nqsym", "ntrev", "tau dev", "W-fit class", "ratio");
+    for (auto const &r : rows)
+      app_log(1, "  {:<16} {:>4} {:>6} {:>6} {:>6} {:>12.4e} {:>12.4e} {:>9.3g}", r.name,
+              r.nk, r.nkibz, r.nsym, r.ntrev, r.dev, r.cls, (r.cls > 0.0 ? r.dev / r.cls : 0.0));
+    REQUIRE(rows.size() == names.size());
+  }
+
   /**
    * Gate QM3-b(v) -- the two MEASUREMENTS that binding requirement 2 of the QM3 spec asks for,
    * on lih222/qpscf:
