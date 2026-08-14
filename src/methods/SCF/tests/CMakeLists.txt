@@ -72,3 +72,17 @@ target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield eri_li
 add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
 set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
                     TIMEOUT 14400)
+
+# Project 2 increment Q6 (notes/q6_diagnostics_closeout_spec.md): the diagnostics closeout --
+# the compressibility seam (§1.2, scope-reduced: const_mu does not reach the qp path), the
+# map-stage lineshape meter (§1.3) and the persisted injection meters + consolidated summary
+# line (§1.4). Separate executable so the Q3/Q4/Q5 suites keep their exact tallies.
+set(TEST_ID methods_qpgw_q6)
+
+add_executable(test_${TEST_ID} test_methods_qpgw_q6.cpp)
+target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield eri_lib hf_lib
+                      gw_lib scf_lib vertex_lib scr_coulomb_lib)
+
+add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
+set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
+                    TIMEOUT 14400)

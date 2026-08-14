@@ -571,11 +571,11 @@ def _option2_cycle_diagnostics(mf, proj_info, dmft_state, coqui_chkpt_h5,
     ============================  =========================================================
     ``gap_eV``                    ``scf/iter{N}/E_ska`` of the qpGW stage just run
     ``epsilon_inf``               ``scf/iter{N}/epsilon_inf`` (``scr_coulomb_t.cpp:1526``)
-    ``lambda_nu0``                the eq-6 ladder watchdog. Logged by the C++ stage
-                                  (``scr_coulomb_t.cpp:770``) but NOT written to the h5, so
-                                  it is reported as "not measured" here rather than being
-                                  invented; adding an h5 dump would touch the Q3 readout
-                                  seam, which Q5 keeps frozen.
+    ``lambda_nu0``                the eq-6 ladder watchdog, ``scf/iter{N}/lambda_nu0``.
+                                  Increment Q6 §1.4(a) PERSISTS it from the C++ stage
+                                  (``scr_coulomb_t.cpp``, the Q4 checkpoint-write block),
+                                  so it is a real number whenever the ladder was injected;
+                                  before Q6 it was permanently "not measured".
     ``*_imp_minus_dc``            ``dmft_state.local_{sigma,pi}_w`` on the tau axis
                                   (the ``dmft_state.py:267-289`` metric)
     ``u_bar_0`` / ``z_b``         impurity 0's ``Vloc + u_weiss_iw``; ``z_b`` only in
@@ -583,6 +583,11 @@ def _option2_cycle_diagnostics(mf, proj_info, dmft_state, coqui_chkpt_h5,
     ``dc_*_staleness``            this cycle's DC against the previous cycle's
     ``band_reorder_count``        maximal-overlap continuation meter on ``MO_skia``
     ``o_c``                       C-window MO character retention (R-Q5-2)
+    ``r_nu0``/``r_mid``/``r_top`` Q6 §1.1 (PDF §8.3): the cancellation load
+                                  ``||P_imp - P_dc||/||P_dc||`` per nu band, from the same
+                                  ``dmft_state.local_pi_w`` that feeds ``pi_imp_minus_dc``
+    ``lad_over_dc``               Q6 §1.1 / C3b: ``||P^lad_loc,orb||/||P_dc||`` from
+                                  ``scf/iter{N}/pi_lad_loc_orb_wabcd``
     ============================  =========================================================
 
     Every step is guarded: a diagnostic must never take a production run down, and any
@@ -599,7 +604,7 @@ def _option2_cycle_diagnostics(mf, proj_info, dmft_state, coqui_chkpt_h5,
         return iaft.w_to_tau_phsym(d, stats='b')
 
     # ---- the lattice stage: gap(H_eff), eps_inf, and the MO set for the trackers -------
-    e_ska = mo_skia = ovlp = None
+    e_ska = mo_skia = ovlp = pi_lad_orb = None
     try:
         with HDFArchive(coqui_chkpt_h5, 'r') as ar:
             it = ar["scf/final_iter"]
@@ -608,6 +613,12 @@ def _option2_cycle_diagnostics(mf, proj_info, dmft_state, coqui_chkpt_h5,
             mo_skia = np.asarray(grp["MO_skia"])
             if "epsilon_inf" in grp.keys():
                 fields['epsilon_inf'] = float(np.real(grp["epsilon_inf"]))
+            # Q6 §1.4(a): the Q3 injection meters, now persisted by the C++ stage. Absent
+            # whenever the ladder was not injected -- the field then stays at MISSING.
+            if "lambda_nu0" in grp.keys():
+                fields['lambda_nu0'] = float(np.real(grp["lambda_nu0"]))
+            if "pi_lad_loc_orb_wabcd" in grp.keys():
+                pi_lad_orb = np.asarray(grp["pi_lad_loc_orb_wabcd"])
             ovlp = np.asarray(ar["system/S_skij"])
     except (OSError, KeyError, ValueError, TypeError) as e:
         coqui.app_log(2, f"[Q5-b] lattice-stage fields not available this cycle: {e}")
@@ -634,6 +645,15 @@ def _option2_cycle_diagnostics(mf, proj_info, dmft_state, coqui_chkpt_h5,
     fields['dc_sigma_staleness'] = ol.dc_staleness(sigma_dc, prev.get('sigma_dc'),
                                                    transform=_tau_f)
     fields['dc_pi_staleness'] = ol.dc_staleness(pi_dc, prev.get('pi_dc'), transform=_tau_b)
+
+    # ---- Q6 §1.1 (PDF §8.3): the R(inu) cancellation load ------------------------------
+    # Same object as pi_imp_minus_dc above, but NORMALISED by ||P_dc|| and resolved per nu
+    # band -- that normalisation is what makes it a cancellation meter rather than a
+    # magnitude. Measured on the nu axis the arrays already live on (no tau transform: the
+    # ratio is taken node by node, and a tau image would mix the nodes it is separating).
+    fields['r_nu0'], fields['r_mid'], fields['r_top'] = \
+        ol.r_cancellation_load(dmft_state.local_pi_w)
+    fields['lad_over_dc'] = ol.ladder_over_dc(pi_lad_orb, pi_dc)
 
     # ---- Ubar(0) and Z_B (impurity mode (a), R-Q4-5) ------------------------------------
     try:

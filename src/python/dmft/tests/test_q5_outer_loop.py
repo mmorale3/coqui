@@ -123,18 +123,32 @@ def _full_trail_fields():
         "dc_pi_staleness": 9.8e-6,
         "band_reorder_count": 0.0,
         "o_c": 0.9997,
+        # Q6 §1.1 appended the cancellation-load columns to this same trail
+        "r_nu0": 4.2e-2,
+        "r_mid": 7.8e-2,
+        "r_top": 1.3e-1,
+        "lad_over_dc": 0.64,
     }
 
 
 def test_mott_chain_trail_layout_is_the_q5b_field_list():
-    """The trail layout IS the gate's field list -- spec §3, gate Q5-b."""
-    assert ol.MOTT_CHAIN_TRAIL_LABELS == (
+    """
+    The trail layout IS the gate's field list -- spec §3, gate Q5-b.
+
+    The Q5-b prefix is pinned FIRST and separately: the layout is documented "append only,
+    never reorder" (outer_loop.py:68-69), so a later increment adding columns must leave the
+    Q5-b slots exactly where they were, and this asserts that rather than just the total.
+    Increment Q6 §1.1 appended the four cancellation-load columns.
+    """
+    q5b = (
         "gap_eV", "epsilon_inf", "lambda_nu0",
         "pi_imp_minus_dc", "sigma_imp_minus_dc",
         "u_bar_0", "z_b",
         "dc_sigma_staleness", "dc_pi_staleness",
         "band_reorder_count", "o_c",
     )
+    assert ol.MOTT_CHAIN_TRAIL_LABELS[:len(q5b)] == q5b
+    assert ol.MOTT_CHAIN_TRAIL_LABELS == q5b + ("r_nu0", "r_mid", "r_top", "lad_over_dc")
     assert len(set(ol.MOTT_CHAIN_TRAIL_LABELS)) == len(ol.MOTT_CHAIN_TRAIL_LABELS)
 
 

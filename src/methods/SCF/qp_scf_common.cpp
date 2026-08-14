@@ -1467,6 +1467,49 @@ auto qp_approx(const sArray_t<Array_view_5D_t> &sSigma_tskij,
   auto n_to_iw = nda::map([&](int n) { return FT.omega(n); });
   nda::array<ComplexType, 1> iw_mesh(n_to_iw(FT.wn_mesh()));
 
+  // ---- Project 2 increment Q6 (notes/q6_diagnostics_closeout_spec.md §1.3), part 1 ----
+  // THE LINESHAPE METER, input half: the MO-basis DIAGONAL Sigma^c_aa at the first and the
+  // highest positive fermionic node. Gathered HERE because this is the only point at which
+  // dSigma_wskab is alive for EVERY map -- the Matsubara branch below resets it, and the
+  // ac_pade branch consumes it in place. ADDITIVE: nothing downstream reads these arrays.
+  nda::array<ComplexType, 3> q6_sig_w0(ns, nkpts, nbnd), q6_sig_wtop(ns, nkpts, nbnd);
+  q6_sig_w0() = ComplexType(0.0);
+  q6_sig_wtop() = ComplexType(0.0);
+  double q6_w0 = -1.0, q6_wtop = -1.0;
+  {
+    // NOT positive_wn_nodes(): that helper hard-checks ">= 2 positive nodes" for the
+    // Matsubara maps, and a REPORTING hook must never be able to abort the ac_pade path.
+    auto w_rng = dSigma_wskab.local_range(0);
+    long g_w0 = -1, g_wtop = -1;
+    double lo = 1e300, hi = -1.0;
+    for (long n = 0; n < iw_mesh.shape(0); ++n) {
+      const double x = iw_mesh(n).imag();
+      if (x <= 0.0) continue;
+      if (x < lo) { lo = x; g_w0 = n; }
+      if (x > hi) { hi = x; g_wtop = n; }
+    }
+    if (g_w0 >= 0 and g_wtop >= 0) {
+      q6_w0 = lo;
+      q6_wtop = hi;
+      const bool have_w0 = (g_w0 >= w_rng.first() and g_w0 < w_rng.first() + long(w_rng.size()));
+      const bool have_wt = (g_wtop >= w_rng.first() and g_wtop < w_rng.first() + long(w_rng.size()));
+      for (auto [is_loc, is]: itertools::enumerate(s_rng))
+        for (auto [ik_loc, ik]: itertools::enumerate(k_rng))
+          for (auto [ia_loc, ia]: itertools::enumerate(a_rng))
+            for (auto [ib_loc, ib]: itertools::enumerate(b_rng)) {
+              if (ia != ib) continue;            // the (a,b) grid is disjoint => no double count
+              if (have_w0)
+                q6_sig_w0(is, ik, ia) = dSigma_wskab.local()(g_w0 - w_rng.first(),
+                                                             is_loc, ik_loc, ia_loc, ib_loc);
+              if (have_wt)
+                q6_sig_wtop(is, ik, ia) = dSigma_wskab.local()(g_wtop - w_rng.first(),
+                                                               is_loc, ik_loc, ia_loc, ib_loc);
+            }
+      comm->all_reduce_in_place_n(q6_sig_w0.data(), q6_sig_w0.size(), std::plus<>{});
+      comm->all_reduce_in_place_n(q6_sig_wtop.data(), q6_sig_wtop.size(), std::plus<>{});
+    }
+  }
+
   auto sVcorr_skij = make_shared_array<Array_view_4D_t>(*comm, *internode_comm, *node_comm, {ns, nkpts, nbnd, nbnd});
 
   if (qp_params.qp_map != "ac_pade") {
@@ -1602,6 +1645,80 @@ auto qp_approx(const sArray_t<Array_view_5D_t> &sSigma_tskij,
 
   } // qp_map dispatch
 
+  // ---- Project 2 increment Q6 (spec §1.3), part 2: THE LINESHAPE METER, output half ----
+  // sVcorr_skij still holds V^xc in the MO BASIS here (the Hermitize + MO -> primary tail is
+  // below), i.e. the map's own output measured against the map's own input -- which is what
+  // "what the static map discards" means. Reading it AFTER the Hermitization would only drop
+  // Im on the diagonal, and that drop is itself part of the discard.
+  sVcorr_skij.win().fence();
+  {
+    auto &LS = q6_lineshape();
+    LS = q6_lineshape_t{};
+    LS.w0 = q6_w0;
+    LS.wtop = q6_wtop;
+    if (q6_w0 > 0.0) {
+      // eps_floor: the denominator guard of spec §1.3. At 1e-12 a.u. it sits ~10 orders below
+      // any Sigma^c this map is applied to, so it fires only on an exact zero.
+      constexpr double eps_floor = 1e-12;
+      double m0 = 0.0, mt = 0.0, s0 = 0.0, st = 0.0;
+      double a0 = 0.0, at = 0.0, b0 = 0.0, bt = 0.0;   // the ABSOLUTE discard, a.u.
+      long cnt = 0;
+      std::vector<long> occ, emp, win;
+      for (long is = 0; is < ns; ++is)
+        for (long ik = 0; ik < nkpts; ++ik) {
+          // The gap window, built with the SAME rule as the mode-A diagnostics
+          // (qp_scf_common.cpp:255-267): the two highest occupied + the two lowest empty
+          // states of the INCOMING qp spectrum. Map-independent by construction, so the
+          // meter compares the same states across ac_pade / mats_* / mode_a / mode_b.
+          occ.clear(); emp.clear(); win.clear();
+          for (long a = 0; a < nbnd; ++a)
+            ((sE_ska.local()(is, ik, a).real() < mu) ? occ : emp).push_back(a);
+          std::sort(occ.begin(), occ.end(), [&](long x, long y) {
+            return sE_ska.local()(is, ik, x).real() > sE_ska.local()(is, ik, y).real(); });
+          std::sort(emp.begin(), emp.end(), [&](long x, long y) {
+            return sE_ska.local()(is, ik, x).real() < sE_ska.local()(is, ik, y).real(); });
+          for (size_t t = 0; t < std::min<size_t>(2, occ.size()); ++t) win.push_back(occ[t]);
+          for (size_t t = 0; t < std::min<size_t>(2, emp.size()); ++t) win.push_back(emp[t]);
+          for (long a : win) {
+            const ComplexType V = sVcorr_skij.local()(is, ik, a, a);
+            const ComplexType S0 = q6_sig_w0(is, ik, a);
+            const ComplexType St = q6_sig_wtop(is, ik, a);
+            const double d0 = std::abs(S0 - V), dt = std::abs(St - V);
+            const double f0 = d0 / std::max(std::abs(S0), eps_floor);
+            const double ft = dt / std::max(std::abs(St), eps_floor);
+            m0 = std::max(m0, f0);
+            mt = std::max(mt, ft);
+            s0 += f0;
+            st += ft;
+            a0 = std::max(a0, d0);
+            at = std::max(at, dt);
+            b0 += d0;
+            bt += dt;
+            ++cnt;
+          }
+        }
+      if (cnt > 0) {
+        LS.frac_w0_max = m0;
+        LS.frac_w0_mean = s0 / double(cnt);
+        LS.frac_top_max = mt;
+        LS.frac_top_mean = st / double(cnt);
+        LS.abs_w0_max = a0;
+        LS.abs_w0_mean = b0 / double(cnt);
+        LS.abs_top_max = at;
+        LS.abs_top_mean = bt / double(cnt);
+        LS.n_states = cnt;
+      }
+    }
+    app_log(2, "  [Q6] lineshape meter ({} gap-window diagonals): "
+               "|Sigma^c_aa - V^xc_aa| / |Sigma^c_aa| at iw_0 = {:.6f} a.u.: max {:.6e}, "
+               "mean {:.6e}; at iw_top = {:.6f} a.u.: max {:.6e}, mean {:.6e}. "
+               "ABSOLUTE discard |Sigma^c_aa - V^xc_aa| (a.u.): iw_0 max {:.6e} mean {:.6e}, "
+               "iw_top max {:.6e} mean {:.6e}",
+            LS.n_states, LS.w0, LS.frac_w0_max, LS.frac_w0_mean,
+            LS.wtop, LS.frac_top_max, LS.frac_top_mean,
+            LS.abs_w0_max, LS.abs_w0_mean, LS.abs_top_max, LS.abs_top_mean);
+  }
+
   // prepare for inverse transformation from MO to primary basis
   auto sMOinv_skai = make_shared_array<Array_view_4D_t>(*comm, *internode_comm, *node_comm, {ns, nkpts, nbnd, nbnd});
   sMOinv_skai.win().fence();
@@ -1663,9 +1780,13 @@ void add_qpscf_vcorr(MBState &mb_state,
     // P^RPA[G_ext] + P^lad + P_C(P_imp-P_dc)P_C^dag) and the Sigma^GW build. The MAP stage
     // downstream (qp_approx / the mode-A CD kernel) is untouched: it consumes the MO-basis
     // Sigma gather + mb_state.dW_qtPQ, both built from whatever G is here.
-    utils::check(sG_ext->shape() == mb_state.sG_tskij.value().shape(),
-                 "add_qpscf_vcorr: external Green's function shape {} != expected {}.",
-                 sG_ext->shape(), mb_state.sG_tskij.value().shape());
+    // element-wise dims: rusty's bundled fmt has no std::array formatter
+    auto gx = sG_ext->shape();
+    auto ge = mb_state.sG_tskij.value().shape();
+    utils::check(gx == ge,
+                 "add_qpscf_vcorr: external Green's function shape ({},{},{},{},{}) != "
+                 "expected ({},{},{},{},{}).",
+                 gx[0], gx[1], gx[2], gx[3], gx[4], ge[0], ge[1], ge[2], ge[3], ge[4]);
     auto &sG = mb_state.sG_tskij.value();
     sG.win().fence();
     if (mpi->node_comm.root()) sG.local() = sG_ext->local();

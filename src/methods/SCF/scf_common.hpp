@@ -256,6 +256,47 @@ double update_mu(double old_mu, const mf::MF &mf, const X_t &sE_ski, double beta
 double compute_Nelec(double mu, const mf::MF &mf, const sArray_t<Array_view_3D_t> &sE_ski, double beta);
 
 /**
+ * Project 2 increment Q6 (notes/q6_diagnostics_closeout_spec.md §1.3, PDF §9): THE
+ * LINESHAPE METER -- the size of what the static quasiparticle map throws away.
+ *
+ * Over the gap-window DIAGONAL states (the same "two occupied + two empty straddling mu"
+ * window the mode-A diagnostics use, qp_scf_common.cpp:255-267), per qp iteration:
+ *
+ *     f(iw) = |Sigma^c_aa(iw) - V^xc,c_aa| / max(|Sigma^c_aa(iw)|, eps_floor)
+ *
+ * at the FIRST positive fermionic node (the dynamical-discard fraction: this is the
+ * frequency where the dynamics the static map cannot carry actually lives) and at the
+ * HIGHEST node (tail sanity). Both are read in the MO basis at the map stage, where the
+ * Sigma(iw) gather and the assembled V^xc coexist.
+ *
+ * This is a REPORTING hook ONLY -- exactly the qp_modea::last_run() pattern. No code path
+ * branches on it and qp_approx computes nothing extra for the map. Populated by qp_approx
+ * for EVERY map (ac_pade and the Matsubara-native ones alike); the Q6 iteration-summary
+ * line in qp_scf_loop reads it back.
+ *
+ * The ABSOLUTE discard |Sigma^c_aa(iw) - V^xc,c_aa| (a.u.) is carried alongside the ratio,
+ * and it is the one that answers "does the map discard more at low frequency". MEASURED
+ * 2026-08-14 (qe_lih222, ac_pade): the RATIO is larger at iw_top than at iw_0, which is a
+ * NORMALIZATION artifact and not a physics failure -- Sigma^c(iw) -> 0 in the tail, so at
+ * iw_top the ratio degenerates to |V^xc| / |Sigma^c(iw_top)| >> 1 with a vanishing
+ * denominator. See the Q6 test file for the numbers and the flag.
+ */
+struct q6_lineshape_t {
+  double frac_w0_max = -1.0;    // max_a f(iw_0)   over the gap-window diagonals
+  double frac_w0_mean = -1.0;   // mean_a f(iw_0)  over the same set
+  double frac_top_max = -1.0;   // max_a f(iw_top)
+  double frac_top_mean = -1.0;  // mean_a f(iw_top)
+  double abs_w0_max = -1.0;     // max_a |Sigma^c_aa(iw_0) - V^xc_aa|, a.u.
+  double abs_w0_mean = -1.0;    // mean_a of the same
+  double abs_top_max = -1.0;    // max_a |Sigma^c_aa(iw_top) - V^xc_aa|, a.u.
+  double abs_top_mean = -1.0;   // mean_a of the same
+  double w0 = -1.0;             // the first positive fermionic node, a.u.
+  double wtop = -1.0;           // the highest positive fermionic node, a.u.
+  long n_states = 0;            // gap-window diagonals entering the aggregates
+};
+inline q6_lineshape_t &q6_lineshape() { static q6_lineshape_t x; return x; }
+
+/**
  * Given a dynamic self-energy, solve the quasi-particle equation and update sE_ska in-place
  * @param sE_ska        - [INPUT] initial qp energies
  *                        [OUTPUT] updated qp energies

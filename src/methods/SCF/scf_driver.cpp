@@ -31,6 +31,7 @@
 
 #include "methods/ERI/mb_eri_context.h"
 #include "methods/tools/chkpt_utils.h"
+#include "methods/SCF/qp_modea.hpp"   // Q6 §1.4(b): qp_modea::last_run(), read-only
 #include "simple_dyson.h"
 #include "dca_dyson.h"
 #include "scf_driver.hpp"
@@ -410,6 +411,11 @@ double qp_scf_loop(
       sHeff_skij.win().fence();
       mpi->comm.barrier();
     }
+    // Q6 §1.3: the lineshape meter is populated by qp_approx, i.e. by the qpscf MAP stage.
+    // Reset it here so an iteration that never reaches that stage (evscf mode, or no corr
+    // solver at all) reports the MISSING sentinel in the Q6 summary line below instead of a
+    // stale value left by an earlier loop in the same process.
+    q6_lineshape() = q6_lineshape_t{};
     if (mb_solver.corr != nullptr) { // GW
       mb_solver.corr->iter() = it;
       if (qp_params.qp_scf_mode == "evscf") {
@@ -455,6 +461,36 @@ double qp_scf_loop(
     app_log(1, " ");
     app_log(1, "energy difference:                {} a.u.", e_diff);
     app_log(1, "abs max diff of QP Hamiltonian:    {} a.u.\n", Heff_conv);
+
+    // ---- Project 2 increment Q6 (notes/q6_diagnostics_closeout_spec.md §1.4(b)) --------
+    // ONE consolidated summary line per qp iteration. Strictly a READ of meters that already
+    // exist: Heff_conv (this loop), qp_modea::last_run() (the mode-A inner loop + the rev-3
+    // strip census; -1/0 for every other map), q6_lineshape() (the Q6 map-stage meter, which
+    // qp_approx populates for EVERY map), and the scr_coulomb_t Q3 injection meters. Nothing
+    // here is computed.
+    // NOT AVAILABLE IN C++: the band-reordering count is a PYTHON-side meter
+    // (dmft/outer_loop.py::count_band_reorderings, Q5/R-Q5-2) and §1.4(b) forbids computing
+    // anything new, so it is reported as the -1 MISSING sentinel rather than duplicated.
+    {
+      auto const &LR = qp_modea::last_run();
+      auto const &LS = q6_lineshape();
+      const bool has_scr = (mb_solver.scr_eri != nullptr);
+      const double lam_max   = has_scr ? mb_solver.scr_eri->pol_lambda_max()   : -1.0;
+      const double lad_ratio = has_scr ? mb_solver.scr_eri->pol_ladder_ratio() : -1.0;
+      const double r_rt      = has_scr ? mb_solver.scr_eri->pol_round_trip()   : -1.0;
+      app_log(1, "[Q6] qpgw iteration summary  it = {}: dmax(H_eff) = {:.3e} a.u., "
+                 "dmax(map inner) = {:.3e}, inner-consist iters = {}, band-reorder = {} "
+                 "(python-side meter), strip census in-strip/eta-far/clamped = {}/{}/{}, "
+                 "lambda_max = {:.6f}, ||P^lad||/||P^RPA|| = {:.6e}, r_rt = {:.3e}, "
+                 "lineshape max |Sigma^c - V^xc|/|Sigma^c| iw_0/iw_top = {:.6e}/{:.6e} "
+                 "(mean {:.6e}/{:.6e}, {} states; ABS discard max iw_0/iw_top = "
+                 "{:.6e}/{:.6e} a.u.)",
+              it, Heff_conv, LR.dmax, LR.iters, -1,
+              LR.n_eval - LR.n_clamp, LR.n_eta, LR.n_clamp - LR.n_eta,
+              lam_max, lad_ratio, r_rt,
+              LS.frac_w0_max, LS.frac_top_max, LS.frac_w0_mean, LS.frac_top_mean,
+              LS.n_states, LS.abs_w0_max, LS.abs_top_max);
+    }
 
     Timer.start("WRITE");
     chkpt::dump_scf(mpi->comm, it, sDm_skij, sHeff_skij, sMO_skia, sE_ska, mu, mb_state.coqui_prefix);

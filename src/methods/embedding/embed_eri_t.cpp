@@ -913,9 +913,15 @@ namespace methods {
       if (have_lad) {
         sPi_dc_wabcd_new.win().fence();
         if (mpi->node_comm.root()) {
+          // element-wise dims: rusty's bundled fmt has no std::array formatter
           utils::check(Pi_lad_loc.shape() == sPi_dc_wabcd_new.shape(),
-                       "downfold_edmft_impl: P^lad_loc shape {} does not match P_dc {}.",
-                       Pi_lad_loc.shape(), sPi_dc_wabcd_new.shape());
+                       "downfold_edmft_impl: P^lad_loc shape ({},{},{},{},{}) does not "
+                       "match P_dc ({},{},{},{},{}).",
+                       Pi_lad_loc.shape()[0], Pi_lad_loc.shape()[1], Pi_lad_loc.shape()[2],
+                       Pi_lad_loc.shape()[3], Pi_lad_loc.shape()[4],
+                       sPi_dc_wabcd_new.shape()[0], sPi_dc_wabcd_new.shape()[1],
+                       sPi_dc_wabcd_new.shape()[2], sPi_dc_wabcd_new.shape()[3],
+                       sPi_dc_wabcd_new.shape()[4]);
           double lmax = 0.0, dmax = 0.0;
           for (auto const &v : Pi_lad_loc) lmax = std::max(lmax, std::abs(v));
           for (auto const &v : sPi_dc_wabcd_new.local()) dmax = std::max(dmax, std::abs(v));

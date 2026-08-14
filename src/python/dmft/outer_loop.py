@@ -35,7 +35,12 @@ Three things live here, and nothing else:
     MO character per outer cycle. Full per-cycle re-wannierization is out of
     scope (revisit only if ``o_C`` degrades in production);
   * the **Q5-b Mott-feedback-chain trail**: one consolidated per-cycle log block
-    and a fixed-layout float array for the checkpoint.
+    and a fixed-layout float array for the checkpoint;
+  * the **Q6 R(inu) cancellation load** (increment Q6,
+    ``notes/q6_diagnostics_closeout_spec.md`` §1.1, PDF §8.3):
+    ``R(inu) = ||P_imp - P_dc||_max / ||P_dc||_max`` per bosonic node, aggregated
+    into three nu bands and APPENDED to the same trail and log block, with the
+    C3b ladder column ``||P^lad_loc,orb||/||P_dc||`` alongside it.
 
 This module is deliberately **numpy-only** at import time, following
 ``retardation.py``: the Q5-b/Q5-g3 unit checks must run on a host where neither
@@ -74,7 +79,16 @@ MOTT_CHAIN_TRAIL_LABELS = (
     "dc_pi_staleness",      # ||P_dc^(n)     - P_dc^(n-1)||
     "band_reorder_count",   # qp-loop band-reordering events this cycle
     "o_c",                  # C-window MO-character overlap (R-Q5-2)
+    # ---- Q6 §1.1 (APPENDED, never reordered): the R(inu) cancellation load ----
+    "r_nu0",                # R(inu) at the nu = 0 node
+    "r_mid",                # max R(inu) over the middle third of the nu axis
+    "r_top",                # max R(inu) over the top third of the nu axis
+    "lad_over_dc",          # ||P^lad_loc,orb||_max / ||P_dc||_max (C3b column)
 )
+
+#: Fixed ordering of the R(inu) nu-band aggregates returned by
+#: :func:`r_cancellation_load`, matching the trail slots above.
+R_BAND_LABELS = ("r_nu0", "r_mid", "r_top")
 
 
 # --------------------------------------------------------------------------
@@ -126,6 +140,95 @@ def imp_minus_dc(local_field, transform=None):
         return field_distance(local_field["imp"], local_field["dc"], transform=transform)
     except (KeyError, TypeError, IndexError):
         return MISSING
+
+
+# --------------------------------------------------------------------------
+# Q6 §1.1: the R(inu) cancellation load (PDF §8.3)
+# --------------------------------------------------------------------------
+
+def nu_band_slices(n_nu):
+    """
+    The three nu bands of Q6 spec §1.1: the ``nu = 0`` NODE alone, the MIDDLE third and the
+    TOP third of the bosonic axis. Thirds are cut with floor division, so ``n_nu = 3m``
+    gives exactly ``m`` nodes per third and any leftover node lands in the top band. The
+    nu = 0 node is index 0 and is reported SEPARATELY (it also sits inside the bottom third,
+    which is not aggregated: the bottom third's interesting node IS nu = 0).
+
+    Returns ``(nu0, mid, top)`` as integer index arrays; bands can be empty for ``n_nu < 3``
+    and the aggregates then report :data:`MISSING`.
+    """
+    n = int(n_nu)
+    lo, hi = n // 3, (2 * n) // 3
+    return (np.arange(0, min(1, n)), np.arange(lo, hi), np.arange(hi, n))
+
+
+def r_cancellation_load(local_pi_w, eps=1e-30):
+    """
+    PDF §8.3 adapted to the implemented DC conventions (bubble[G_loc]-based, ruling R-Q4-2):
+    per bosonic node,
+
+        ``R(inu) = ||P_imp(inu) - P_dc(inu)||_max / ||P_dc(inu)||_max``
+
+    i.e. how much of the impurity polarization the double counting FAILS to cancel.
+    ``R << 1`` is a healthy cancellation -- the outer loop feeds back a small correction on
+    top of a large common part. ``R ~ 1`` or above says the two objects have stopped
+    describing the same physics and the eq-7 subtraction has nothing left to cancel.
+
+    ``local_pi_w`` is the ``{"imp": ..., "dc": ...}`` dict ``weiss.embed_impurities``
+    returns, bosonic frequency on axis 0 (the same layout :func:`imp_minus_dc` consumes).
+
+    Returns the three aggregates of :data:`R_BAND_LABELS` as a plain tuple: the ``nu = 0``
+    node, then the MAX over the middle and over the top third. Max, not mean: an average
+    would hide the single node where the cancellation broke, which is the only thing this
+    meter exists to catch. Nodes whose ``||P_dc||`` is below ``eps`` contribute nothing
+    (0/0 is not a cancellation failure); a band with no usable node reports
+    :data:`MISSING`.
+    """
+    if local_pi_w is None:
+        return (MISSING, MISSING, MISSING)
+    try:
+        imp = np.asarray(local_pi_w["imp"])
+        dc = np.asarray(local_pi_w["dc"])
+    except (KeyError, TypeError, IndexError):
+        return (MISSING, MISSING, MISSING)
+    if imp.shape != dc.shape or imp.ndim < 1 or imp.shape[0] == 0:
+        return (MISSING, MISSING, MISSING)
+
+    tail = tuple(range(1, imp.ndim))
+    num = np.max(np.abs(imp - dc), axis=tail) if tail else np.abs(imp - dc)
+    den = np.max(np.abs(dc), axis=tail) if tail else np.abs(dc)
+    live = den > eps
+    r = np.full(imp.shape[0], np.nan, dtype=float)
+    r[live] = num[live] / den[live]
+
+    out = []
+    for band in nu_band_slices(imp.shape[0]):
+        vals = r[band]
+        vals = vals[np.isfinite(vals)]
+        out.append(float(np.max(vals)) if vals.size else MISSING)
+    return tuple(out)
+
+
+def ladder_over_dc(pi_lad_orb, pi_dc, eps=1e-30):
+    """
+    The C3b column of the same cancellation block: ``||P^lad_loc,orb||_max / ||P_dc||_max``.
+
+    This is the python-side twin of ``scr_coulomb_t::pol_lad_loc_orb_ratio()``
+    (``scr_coulomb_t.h:355-360``), which measures the eq-7 ladder DC against the SAME bubble
+    ``P_dc``. ``pi_lad_orb`` is the ``pi_lad_loc_orb_wabcd`` dataset of the ``scf/iterN``
+    checkpoint group (written by ``scr_coulomb_t.cpp``'s Q4 checkpoint block); it is absent
+    whenever the ladder was not injected, and the meter then reports :data:`MISSING`.
+    """
+    if pi_lad_orb is None or pi_dc is None:
+        return MISSING
+    a = np.abs(np.asarray(pi_lad_orb))
+    b = np.abs(np.asarray(pi_dc))
+    if a.size == 0 or b.size == 0:
+        return MISSING
+    den = float(np.max(b))
+    if den <= eps:
+        return MISSING
+    return float(np.max(a) / den)
 
 
 # --------------------------------------------------------------------------
@@ -269,7 +372,14 @@ def log_mott_chain(cycle, niter, trail, verbose=True):
     app_log(1, f"  DC staleness, Sigma_dc         = {_f('dc_sigma_staleness', '', '{:.6e}')}")
     app_log(1, f"  DC staleness, P_dc             = {_f('dc_pi_staleness', '', '{:.6e}')}")
     app_log(1, f"  band-reorder events            = {_f('band_reorder_count', '', '{:.0f}')}")
-    app_log(1, f"  o_C (C-window MO character)    = {_f('o_c')}\n")
+    app_log(1, f"  o_C (C-window MO character)    = {_f('o_c')}")
+    # Q6 §1.1: the cancellation load rides in the SAME block -- it is read across cycles
+    # together with ||P_imp - P_dc|| above, which is its own numerator at a single node.
+    app_log(1,   "  R(inu) = ||P_imp - P_dc||/||P_dc||   (Q6, cancellation load)")
+    app_log(1, f"    nu = 0 node                  = {_f('r_nu0', '', '{:.6e}')}")
+    app_log(1, f"    middle third (max)           = {_f('r_mid', '', '{:.6e}')}")
+    app_log(1, f"    top third (max)              = {_f('r_top', '', '{:.6e}')}")
+    app_log(1, f"    ||P^lad_loc,orb||/||P_dc||   = {_f('lad_over_dc', '', '{:.6e}')}\n")
 
 
 # --------------------------------------------------------------------------

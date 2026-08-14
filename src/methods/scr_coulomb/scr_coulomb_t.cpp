@@ -247,8 +247,11 @@ namespace solvers {
       // C++ bosonic closure (downfold_edmft_impl). Written only when THIS update_w
       // injected (a stale MBState copy must not be re-published), and never as a separate
       // file (the eval_Pi_rpa_dc "pi_rpa_loc_debug.h5" wart is not copied).
-      if (pol_readout and _vertex->pol_vertex_inject_enabled()
-          and mb_state.sPi_lad_loc_wabcd and thc.mpi()->comm.root()) {
+      // Q6 §1.4(a) widened the ENCLOSING condition from "... and sPi_lad_loc_wabcd" to
+      // "the ladder was injected": the scalar meters below exist on every injecting run,
+      // including the ones with no bosonic projector (where P^lad_loc is never built).
+      // The pi_lad_loc datasets keep their ORIGINAL condition, one level in.
+      if (pol_readout and _vertex->pol_vertex_inject_enabled() and thc.mpi()->comm.root()) {
         h5::file file(mb_state.coqui_prefix + ".mbpt.h5", 'a');
         h5::group grp(file);
         auto scf_grp = (grp.has_subgroup("scf")) ? grp.open_group("scf")
@@ -256,13 +259,24 @@ namespace solvers {
         std::string grp_name = "iter" + std::to_string(h5_iter);
         auto iter_grp = (scf_grp.has_subgroup(grp_name)) ? scf_grp.open_group(grp_name)
                                                          : scf_grp.create_group(grp_name);
-        nda::h5_write(iter_grp, "pi_lad_loc_wabcd",
-                      mb_state.sPi_lad_loc_wabcd.value().local(), false);
-        // Q4-C3b: the DC-ready orbital/chi-convention object rides in the same group
-        // (dataset name distinct -- the consumers select with pi_lad_dc).
-        if (mb_state.sPi_lad_loc_orb_wabcd)
-          nda::h5_write(iter_grp, "pi_lad_loc_orb_wabcd",
-                        mb_state.sPi_lad_loc_orb_wabcd.value().local(), false);
+        if (mb_state.sPi_lad_loc_wabcd) {
+          nda::h5_write(iter_grp, "pi_lad_loc_wabcd",
+                        mb_state.sPi_lad_loc_wabcd.value().local(), false);
+          // Q4-C3b: the DC-ready orbital/chi-convention object rides in the same group
+          // (dataset name distinct -- the consumers select with pi_lad_dc).
+          if (mb_state.sPi_lad_loc_orb_wabcd)
+            nda::h5_write(iter_grp, "pi_lad_loc_orb_wabcd",
+                          mb_state.sPi_lad_loc_orb_wabcd.value().local(), false);
+        }
+        // Q6 §1.4(a): PERSIST the Q3 injection meters next to the object they describe.
+        // Before this, python's Q5-b trail had no source for lambda_nu0 and carried the
+        // MISSING = -1 sentinel forever (outer_loop.py:62-66). These are the SAME numbers
+        // the pol_lambda_nu0()/pol_lambda_max()/pol_round_trip()/pol_ladder_ratio()
+        // accessors return for THIS update_w -- read, not recomputed.
+        h5::h5_write(iter_grp, "lambda_nu0", _pol_lam_nu0);
+        h5::h5_write(iter_grp, "lambda_max", _pol_lam_max);
+        h5::h5_write(iter_grp, "r_rt", _pol_r_rt);
+        h5::h5_write(iter_grp, "lad_ratio", _pol_lad_ratio);
       }
       thc.mpi()->comm.barrier();
     }
