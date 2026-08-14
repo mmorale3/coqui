@@ -140,6 +140,15 @@ public:
   std::optional<sArray_t<nda::array_view<ComplexType, 5> > > sPi_imp_wabcd;
   // Double-counting polarizability
   std::optional<sArray_t<nda::array_view<ComplexType, 5> > > sPi_dc_wabcd;
+  // THC-adjoint local image of the LATTICE ladder polarization,
+  // (1/N_q) sum_q B(q)^dag P^lad(q, inu) B(q) (Project 2 increment Q4 C3), produced by
+  // the injection in scr_coulomb_t::eval_Pi_qdep whenever a bosonic projector is present.
+  // ⚠ DIAGNOSTIC convention, NOT DC-ready: the adjoint carries the upfold's ||B||^2 gain
+  // (R-Q4-2 AMENDMENT, notes/q4_edmft_skeleton_spec.md); the eq-7 ladder DC proper is the
+  // orbital/chi-convention 4-leg projection, delivered by increment Q4-C3b. Consumed only
+  // under the explicit opt-in knob pi_lad_dc = "thc_adjoint_diag" (downfold_edmft_impl).
+  // Same shape class as sPi_dc_wabcd, (nw_half, nImpOrbs^4). Single impurity.
+  std::optional<sArray_t<nda::array_view<ComplexType, 5> > > sPi_lad_loc_wabcd;
 
   // Quasiparticle approx. to the dynamic part of the double-counting self-energy
   std::optional<nda::array<ComplexType, 4> > Vcorr_dc_sIab;

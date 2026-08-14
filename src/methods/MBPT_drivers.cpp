@@ -1064,6 +1064,125 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
              iter_solver.get(), niter, restart, conv_thr, const_mu,
              greens_func_source, greens_func_iteration);
 
+  } else if (solver_type == "qpgw") {
+
+    // Project 2 increment Q4 (notes/q4_edmft_skeleton_spec.md C2): the qpGW+BSE lattice
+    // stage of the GW+EDMFT skeleton. Same knob surface as the plain [qpgw] branch of the
+    // projector-less overload, PLUS the screen_type knob and the projector-carrying
+    // MBState -- so the lattice loop screens with
+    //   P_latt = P^RPA[G_latt] + P^lad + P_C[P_imp - P_dc]P_C^dag.
+    // FROZEN H_eff (Option 1, ruling R-Q4-4): the qp loop's own update_G supplies the G
+    // that eval_Pi_qdep consumes; the impurity self-energy re-enters the lattice only
+    // through the downfold/embed cycle (dmft_embed), never inside this loop. The
+    // bubble-from-corrected-G of the PDF's principle 3 activates at Q5, when the qpgw
+    // stage moves inside the outer cycle.
+    auto screen_type = io::get_value_with_default<std::string>(pt,"screen_type", "rpa");
+    io::tolower(screen_type);
+    utils::check(screen_type == "rpa" or screen_type == "gw_edmft",
+                 "qpgw: screen_type = \"{}\" is not supported by the qpGW lattice stage. "
+                 "Valid options: \"rpa\", \"gw_edmft\".", screen_type);
+
+    auto ac_alg  = io::get_value_with_default<std::string>(pt,"ac_alg","pade");
+    auto eta     = io::get_value_with_default<double>(pt,"eta", M_PI/ft.beta());
+    auto Nfit    = io::get_value_with_default<int>(pt,"Nfit",18);
+    auto off_diag_mode = io::get_value_with_default<std::string>(pt,"off_diag_mode","fermi");
+    io::tolower(ac_alg);
+    io::tolower(off_diag_mode);
+    utils::check(off_diag_mode=="fermi" or off_diag_mode=="qp_energy",
+                 "unknown off_diag_mode: {}. Valid options are \"fermi\" and \"qp_energy\"");
+    auto qp_map = io::get_value_with_default<std::string>(pt,"qp_map","ac_pade");
+    io::tolower(qp_map);
+    utils::check(qp_map=="ac_pade" or qp_map=="mats_lin" or qp_map=="mats_gmatch" or
+                 qp_map=="mode_a" or qp_map=="mode_b",
+                 "qpgw: unknown qp_map: {}. Valid options: \"ac_pade\", \"mats_lin\", "
+                 "\"mats_gmatch\" (Project 2 increment Q0), \"mode_b\" (increment QM3; "
+                 "\"mode_a\" is ON HOLD, see the spec rev 2).",
+                 qp_map);
+    qp_params_t qp_params("sc", ac_alg, Nfit, eta, 1e-8, "qpscf", false, off_diag_mode,
+                          mu_tol, mu_update_alg);
+    qp_params.qp_map = qp_map;
+    qp_params.qp_map_wpow = io::get_value_with_default<double>(pt,"qp_map_wpow",2.0);
+    utils::check(qp_params.qp_map_wpow >= 0.0, "qpgw: qp_map_wpow must be >= 0.");
+    // Project 2 increment QM3 (notes/qm3_mode_a_loop_spec.md section 6): mode-A knobs.
+    qp_params.qp_modea_route = io::get_value_with_default<std::string>(pt,"qp_modea_route","cd");
+    io::tolower(qp_params.qp_modea_route);
+    utils::check(qp_params.qp_modea_route=="cd" or qp_params.qp_modea_route=="expansion",
+                 "qpgw: unknown qp_modea_route: {}. Valid options: \"cd\", \"expansion\".",
+                 qp_params.qp_modea_route);
+    qp_params.qp_modea_nconsist = io::get_value_with_default<long>(pt,"qp_modea_nconsist",5);
+    utils::check(qp_params.qp_modea_nconsist >= 1, "qpgw: qp_modea_nconsist must be >= 1.");
+    qp_params.qp_modea_consist_tol = io::get_value_with_default<double>(pt,"qp_modea_consist_tol",1e-8);
+    utils::check(qp_params.qp_modea_consist_tol > 0.0, "qpgw: qp_modea_consist_tol must be > 0.");
+    qp_params.qp_modea_eta = io::get_value_with_default<double>(pt,"qp_modea_eta",0.0);
+    // spec rev 4: out-of-strip evaluation at eps + i*eta_far (0 = the rev-3.1 mu fallback).
+    qp_params.qp_modea_eta_far = io::get_value_with_default<double>(pt,"qp_modea_eta_far",0.0);
+    utils::check(qp_params.qp_modea_eta_far >= 0.0,
+                 "qpgw: qp_modea_eta_far must be >= 0 (0 = the mu fallback of spec rev 3.1).");
+    qp_params.qp_modea_wsupp = io::get_value_with_default<std::string>(pt,"qp_modea_wsupp","auto");
+    io::tolower(qp_params.qp_modea_wsupp);
+    qp_params.qp_modea_wfit = io::get_value_with_default<std::string>(pt,"qp_modea_wfit","tau");
+    io::tolower(qp_params.qp_modea_wfit);
+    utils::check(qp_params.qp_modea_wfit=="tau" or qp_params.qp_modea_wfit=="nu",
+                 "qpgw: unknown qp_modea_wfit: {}. Valid options: \"tau\", \"nu\".",
+                 qp_params.qp_modea_wfit);
+    qp_params.qp_modea_wrtol = io::get_value_with_default<double>(pt,"qp_modea_wrtol",-1.0);
+    utils::check(qp_params.qp_modea_wrtol < 1.0,
+                 "qpgw: qp_modea_wrtol must be < 1 (negative selects the doctrine default).");
+    qp_params.qp_modea_wrank = io::get_value_with_default<double>(pt,"qp_modea_wrank",1e-10);
+    utils::check(qp_params.qp_modea_wrank < 1.0,
+                 "qpgw: qp_modea_wrank must be < 1 (<= 0 takes the dense reference sandwich).");
+    qp_params.qp_modea_wsketch = io::get_value_with_default<long>(pt,"qp_modea_wsketch",0);
+    qp_params.qp_modea_wunion = io::get_value_with_default<double>(pt,"qp_modea_wunion",-1.0);
+    utils::check(qp_params.qp_modea_wunion < 1.0,
+                 "qpgw: qp_modea_wunion must be < 1 (< 0 disables the union-subspace "
+                 "restructure, 0 takes qp_modea_wrank).");
+    // Project 2 increment Q3 (notes/q3_bse_tier_spec.md I4): the BSE (ladder) polarization
+    // tier. The [qpgw] driver attaches no Sigma-side vertex, so vertex_t below is a pure
+    // KNOB CARRIER (vertex_type = "none") -- the pol-vertex-only attachment pattern of the
+    // [gw] block. The pol_vertex_* keys keep that block's "inherit vertex_*" default rule.
+    auto pol_vertex = io::get_value_with_default<std::string>(pt,"pol_vertex","none");
+    io::tolower(pol_vertex);
+    auto pol_vertex_inject = io::get_value_with_default<std::string>(pt,"pol_vertex_inject","none");
+    io::tolower(pol_vertex_inject);
+    auto pol_vertex_kernel = io::get_value_with_default<std::string>(pt,"pol_vertex_kernel","w0_prev");
+    io::tolower(pol_vertex_kernel);
+    auto pol_vertex_band_window = io::get_value_with_default<nda::range>(pt,"pol_vertex_band_window",
+        io::get_value_with_default<nda::range>(pt,"vertex_band_window",nda::range(0,0)));
+    auto pol_vertex_isdf_rank = io::get_value_with_default<long>(pt,"pol_vertex_isdf_rank",
+        io::get_value_with_default<long>(pt,"vertex_isdf_rank",-1));
+    auto pol_vertex_isdf_svd_tol = io::get_value_with_default<double>(pt,"pol_vertex_isdf_svd_tol",
+        io::get_value_with_default<double>(pt,"vertex_isdf_svd_tol",1e-8));
+    auto pol_vertex_isdf_thresh = io::get_value_with_default<double>(pt,"pol_vertex_isdf_thresh",
+        io::get_value_with_default<double>(pt,"vertex_isdf_thresh",-1.0));
+    auto pol_vertex_isdf_cond_max = io::get_value_with_default<double>(pt,"pol_vertex_isdf_cond_max",
+        io::get_value_with_default<double>(pt,"vertex_isdf_cond_max",-1.0));
+    auto pol_vertex_isdf_distr_tol = io::get_value_with_default<double>(pt,"pol_vertex_isdf_distr_tol",
+        io::get_value_with_default<double>(pt,"vertex_isdf_distr_tol",-1.0));
+    if (io::get_value_with_default<bool>(pt,"iter_alg.enable", true)) {
+      iter_solver = std::make_unique<iter_scf::iter_scf_t>(iter_scf::make_iter_scf(pt));
+    } else {
+      iter_solver = nullptr;
+    }
+    solvers::scr_coulomb_t scr_eri(&ft, screen_type, div_treatment);
+    solvers::gw_t gw(&ft, div_treatment, output);
+    // Q3: the knob carrier MUST outlive qp_scf_loop -- same stack frame as scr_eri.
+    solvers::vertex_t pol_vertex_carrier(&ft, "none", nda::range(0,0), mf->nbnd(),
+                                         div_treatment);
+    pol_vertex_carrier.set_pol_vertex(pol_vertex, pol_vertex_kernel, pol_vertex_band_window,
+                                      pol_vertex_isdf_rank, pol_vertex_isdf_svd_tol,
+                                      pol_vertex_isdf_thresh, pol_vertex_isdf_cond_max,
+                                      pol_vertex_isdf_distr_tol, pol_vertex_inject);
+    if (pol_vertex_carrier.pol_vertex_enabled()) scr_eri.set_vertex(&pol_vertex_carrier);
+
+    MBState mb_state(ft, output, mf, projector_ksIai, band_window, kpts_crys, trans_home_cell, false);
+    if (local_polarizabilities) {
+      mb_state.set_local_polarizabilities(std::move(local_polarizabilities.value()));
+      local_polarizabilities.reset();
+    }
+
+    qp_scf_loop(mb_state, eri, ft, qp_params, mb_solver_t(&hf,&gw,&scr_eri), iter_solver.get(),
+                niter, restart, conv_thr);
+
   } else
     APP_ABORT("mbpt: Unknown solver type: {}",solver_type);
 }

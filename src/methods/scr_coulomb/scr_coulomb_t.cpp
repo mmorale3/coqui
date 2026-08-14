@@ -162,28 +162,14 @@ namespace solvers {
         }
       }
     }
-    auto dPi_tqPQ = eval_Pi_qdep(mb_state, thc);
-
-    // scGW-tilde L2 (pol_vertex = "ladder", READOUT-ONLY): before the Dyson consumes
-    // dPi, (a) build the private readout vertex's W0bar (the ladder kernel; build_w0
-    // only READS dPi) and (b) keep a replicated copy of the inu = 0 Pi row for the
-    // eps-Dyson report below. Nothing here touches the loop's own W.
+    // qpGW Q4 (notes/q4_edmft_skeleton_spec.md, ruling R-Q4-3): the Q3 BSE tier -- the
+    // ladder kernel build AND the injection -- now runs INSIDE eval_Pi_qdep, at the pinned
+    // points (pure-RPA kernel; injection last, still before the Dyson). What stays here is
+    // the eps_M READOUT, which needs the post-Dyson head: it consumes the inu = 0 RPA row
+    // stashed at that pure-RPA point (_pol_pi0_qPQ) instead of gathering it here.
     const bool pol_readout = (_vertex != nullptr and _vertex->pol_vertex_active()
                               and not _vertex->active());
-    nda::array<ComplexType, 3> Pi0_qPQ;
-    if (pol_readout) {
-      ensure_pol_vertex(thc);
-      _pol_vtx->build_w0(mb_state, thc, dPi_tqPQ);
-      Pi0_qPQ = gather_nu0_row(dPi_tqPQ);
-    }
-
-    // qpGW Q3 (notes/q3_bse_tier_spec.md, ruling R-Q3-3): the BSE tier. The ORDER above
-    // and here is the contract, not an accident -- build_w0 and the readout baseline must
-    // see the PURE RPA Pi (the rung is W-bar_0[P^RPA], R-Q3-1), and the injection lands
-    // AFTER both and BEFORE the Dyson, so W is the ladder-corrected one and every
-    // downstream consumer (eps_inv_head, mb_state.dW_qtPQ, the QM3 map) is untouched.
-    if (pol_readout and _vertex->pol_vertex_inject_enabled())
-      inject_pol_ladder(mb_state, thc, dPi_tqPQ);
+    auto dPi_tqPQ = eval_Pi_qdep(mb_state, thc);
 
     // evaluate screened interaction (dW_tqPQ) and reset polarizability (dPi_tqPQ)
     // a) dPi_tqPQ is reset during dyson_W_from_Pi_tau()
@@ -228,7 +214,7 @@ namespace solvers {
     // Q3: eps_inv_head_q carries the loop's OWN q-resolved head, so the readout also
     // reports the loop-side eps_M(q_min) -- the second route of gate Q3-b(i).
     if (pol_readout)
-      pol_ladder_eps_readout(mb_state, thc, Pi0_qPQ, std::addressof(eps_inv_head_q));
+      pol_ladder_eps_readout(mb_state, thc, _pol_pi0_qPQ, std::addressof(eps_inv_head_q));
 
     // make routine to transposed distributed arrays over any 2 indices, so should
     // be easy to template to an array type and to indexes, and replace repeated code
@@ -256,6 +242,24 @@ namespace solvers {
       dump_eps_inv_head(eps_inv_head_q, eps_inv_head,
                         mb_state.coqui_prefix, h5_iter,
                         thc.mpi()->comm, *thc.MF());
+      // Q4 C3: publish the ladder half of the eq-7 bosonic DC next to the other scf/iter
+      // outputs so BOTH consumers can read it -- python's DC assembly (weiss.py) and the
+      // C++ bosonic closure (downfold_edmft_impl). Written only when THIS update_w
+      // injected (a stale MBState copy must not be re-published), and never as a separate
+      // file (the eval_Pi_rpa_dc "pi_rpa_loc_debug.h5" wart is not copied).
+      if (pol_readout and _vertex->pol_vertex_inject_enabled()
+          and mb_state.sPi_lad_loc_wabcd and thc.mpi()->comm.root()) {
+        h5::file file(mb_state.coqui_prefix + ".mbpt.h5", 'a');
+        h5::group grp(file);
+        auto scf_grp = (grp.has_subgroup("scf")) ? grp.open_group("scf")
+                                                 : grp.create_group("scf");
+        std::string grp_name = "iter" + std::to_string(h5_iter);
+        auto iter_grp = (scf_grp.has_subgroup(grp_name)) ? scf_grp.open_group(grp_name)
+                                                         : scf_grp.create_group(grp_name);
+        nda::h5_write(iter_grp, "pi_lad_loc_wabcd",
+                      mb_state.sPi_lad_loc_wabcd.value().local(), false);
+      }
+      thc.mpi()->comm.barrier();
     }
 
     // ISDF-Vertex Refinement 2, W-bar iteration cache (notes/wbar_cache.md): with an
@@ -369,6 +373,124 @@ namespace solvers {
     }
     dPi_tqPQ.communicator()->all_reduce_in_place_n(out.data(), out.size(), std::plus<>{});
     return out;
+  }
+
+  /**
+   * qpGW Q4 increment C3 (notes/q4_edmft_skeleton_spec.md, ruling R-Q4-2): the LADDER half
+   * of the eq-7 bosonic double counting,
+   *
+   *   P^lad_loc(i.nu)_abcd = (1/N_q) sum_q [ B(q)^dag (t(q)^dag Pl(i.nu, q) t(q)) B(q) ]_abcd,
+   *
+   * i.e. the exact downfold ADJOINT of the upfold chain the EDMFT correction uses
+   * (upfold_pi_local, edmft_pi.icc:61-79: Pi_up(P,Q) = B(P;ab) Pi_ab,cd conj(B(Q;cd));
+   * its adjoint is D_ab,cd = conj(B(P;ab)) X_PQ B(Q;cd)). Unlike the bubble part of P_dc
+   * there is no impurity-side counterpart object, so eq 7's "what the lattice already
+   * contains" is the definition (R-Q4-2).
+   *
+   * ⚠ CONVENTION CAVEAT -- NOT A DC-READY OBJECT (R-Q4-2 AMENDMENT,
+   * notes/q4_edmft_skeleton_spec.md): the ADJOINT of the upfold is not its INVERSE --
+   * upfold_pi_local has gain ||B||^2 (a local Pi of O(1) upfolds onto the O(10^4) scale the
+   * THC-basis Pi lives on), so the adjoint carries that same gain instead of its reciprocal
+   * and this object lands ~10 orders above bubble[G_loc]; the amendment rules that neither
+   * the THC adjoint nor the s^-1 = (B^dag B)^-1 dual belongs in the bosonic double counting
+   * (the DC-ready object is the orbital/chi-convention 4-leg MLWF U-leg projection of the
+   * pair-space ladder, deferred to increment Q4-C3b). What is kept here is the INTERFACE
+   * DIAGNOSTIC: the ratio meter logged below is the cancellation-load column that exposed
+   * the convention, and the only consumer is opt-in and off by default
+   * (downfold_edmft_impl's pi_lad_dc = "thc_adjoint_diag").
+   *
+   * q-WEIGHTS: B carries the FULL BZ q axis (and its own 1/N_q from
+   * calc_bosonic_projector), Pl and t carry the IBZ axis. The star multiplicities are
+   * therefore taken exactly as downfold_W does (embed_eri_t.cpp:2124-2146): loop the FULL
+   * q mesh, map each q to its IBZ parent, conjugate the parent's matrix when qp_trev, and
+   * divide by nqpts once at the end.
+   *
+   * COST: the Np x Np upfold is never formed. With Y(q) = t(q) B(q) (N_m x nImpOrbs^2, one
+   * gemm per q) the whole object is Y^dag Pl Y -- exactly the same number by associativity,
+   * at readout scale. Under time reversal the same expression holds with t -> conj(t) and
+   * Pl -> conj(Pl) (both conjugations follow from conj(t^dag Pl t)).
+   */
+  void scr_coulomb_t::accumulate_pi_lad_loc(MBState &mb_state, THC_ERI auto &thc,
+                                            nda::array<ComplexType, 4> const &Pl,
+                                            nda::array<ComplexType, 3> const &tmap) {
+    decltype(nda::range::all) all;
+    auto &proj_boson = mb_state.proj_boson.value();
+    utils::check(proj_boson.nImps() == 1,
+                 "scr_coulomb_t::accumulate_pi_lad_loc: P^lad_loc is implemented for a "
+                 "SINGLE impurity only (nImps = {}); the upfold it is the adjoint of is "
+                 "single-impurity too (edmft_pi.icc:74/78).", proj_boson.nImps());
+    mf::MF &mf = *thc.MF();
+    const long nw_h = Pl.shape(0), Nm = Pl.shape(2);
+    const long nImpOrbs = proj_boson.nImpOrbs(), nab = nImpOrbs * nImpOrbs;
+    const long nqpts = mf.nqpts(), Np = tmap.shape(2);
+    const long nw_half = (_ft->nw_b() % 2 == 0) ? _ft->nw_b() / 2 : _ft->nw_b() / 2 + 1;
+    utils::check(nw_h == nw_half,
+                 "scr_coulomb_t::accumulate_pi_lad_loc: the ladder's PH-sym half grid ({}) "
+                 "does not match the local-polarizability one ({}).", nw_h, nw_half);
+
+    auto sB_qIPab = (mf.nqpts_ibz() == mf.nqpts()) ?
+                    proj_boson.calc_bosonic_projector(thc) :
+                    proj_boson.calc_bosonic_projector_symm(thc);
+    utils::check(sB_qIPab.shape()[0] == nqpts and sB_qIPab.shape()[2] == Np,
+                 "scr_coulomb_t::accumulate_pi_lad_loc: bosonic projector shape mismatch "
+                 "({} x {} vs nqpts = {}, Np = {}).",
+                 sB_qIPab.shape()[0], sB_qIPab.shape()[2], nqpts, Np);
+
+    if (not mb_state.sPi_lad_loc_wabcd or
+        mb_state.sPi_lad_loc_wabcd.value().shape()[0] != nw_h)
+      mb_state.sPi_lad_loc_wabcd.emplace(
+          math::shm::make_shared_array<Array_view_5D_t>(
+              *thc.mpi(), {nw_h, nImpOrbs, nImpOrbs, nImpOrbs, nImpOrbs}));
+
+    auto B_loc = nda::reshape(sB_qIPab.local(), shape_t<3>{nqpts, Np, nab});
+    double lmax = 0.0;
+    mb_state.sPi_lad_loc_wabcd.value().win().fence();
+    if (thc.mpi()->node_comm.root()) {
+      auto D = nda::reshape(mb_state.sPi_lad_loc_wabcd.value().local(),
+                            shape_t<3>{nw_h, nab, nab});
+      D() = ComplexType(0.0);
+      nda::matrix<ComplexType> T(Nm, Np), Bq(Np, nab), Y(Nm, nab), core(Nm, Nm);
+      nda::matrix<ComplexType> CY(Nm, nab), acc(nab, nab);
+      for (long iq = 0; iq < nqpts; ++iq) {
+        const long iq_ibz = mf.qp_to_ibz(iq);
+        const bool trev = mf.qp_trev(iq);
+        T = trev ? nda::matrix<ComplexType>(nda::conj(tmap(iq_ibz, all, all)))
+                 : nda::matrix<ComplexType>(tmap(iq_ibz, all, all));
+        Bq = B_loc(iq, all, all);
+        nda::blas::gemm(T, Bq, Y);                        // Y = t(q) B(q)
+        for (long j = 0; j < nw_h; ++j) {
+          core = trev ? nda::matrix<ComplexType>(nda::conj(Pl(j, iq_ibz, all, all)))
+                      : nda::matrix<ComplexType>(Pl(j, iq_ibz, all, all));
+          nda::blas::gemm(core, Y, CY);
+          nda::blas::gemm(ComplexType(1.0), nda::dagger(Y), CY, ComplexType(0.0), acc);
+          D(j, all, all) += acc;
+        }
+      }
+      D() /= double(nqpts);
+      for (auto const &v : D) lmax = std::max(lmax, std::abs(v));
+    }
+    mb_state.sPi_lad_loc_wabcd.value().win().fence();
+    thc.mpi()->comm.barrier();
+    _pol_lad_loc_max = thc.mpi()->comm.all_reduce_value(lmax, boost::mpi3::max<>{});
+
+    // gate Q4-c3(iii): the cancellation-load meter of PDF section 8.3 gets its ladder
+    // column -- ||P^lad_loc|| against the bubble part of P_dc when the latter is present
+    // (it is absent in the C = empty leg, where there is nothing to compare against).
+    _pol_lad_loc_ratio = -1.0;
+    if (mb_state.sPi_dc_wabcd) {
+      double dmax = 0.0;
+      for (auto const &v : mb_state.sPi_dc_wabcd.value().local())
+        dmax = std::max(dmax, std::abs(v));
+      _pol_dc_bubble_max = thc.mpi()->comm.all_reduce_value(dmax, boost::mpi3::max<>{});
+      if (_pol_dc_bubble_max > 0.0)
+        _pol_lad_loc_ratio = _pol_lad_loc_max / _pol_dc_bubble_max;
+      app_log(1, "  [qpGW Q4] ||P^lad_loc||_max = {:.4e} vs ||P_dc,bubble||_max = {:.4e} "
+                 "(ratio {:.3e})", _pol_lad_loc_max, _pol_dc_bubble_max, _pol_lad_loc_ratio);
+    } else {
+      _pol_dc_bubble_max = -1.0;
+      app_log(1, "  [qpGW Q4] ||P^lad_loc||_max = {:.4e} (no bubble P_dc present to "
+                 "compare against)", _pol_lad_loc_max);
+    }
   }
 
   /**
@@ -519,6 +641,12 @@ namespace solvers {
                  "corrects.\n"
                  "            Expect eps = I - Z.P to lose conditioning (see the "
                  "dielectric conditioning below).");
+
+    // Q4 C3: with a bosonic projector attached, the SAME ladder is also downfolded to the
+    // impurity's local product basis -- eq 7's P_dc gains P^lad_loc (R-Q4-2). Nothing here
+    // feeds back into the lattice P above; the local object is a DC ingredient only.
+    if (mb_state.proj_boson.has_value())
+      accumulate_pi_lad_loc(mb_state, thc, Pl, tmap);
   }
 
   /**
@@ -965,18 +1093,47 @@ namespace solvers {
       }
     };
 
+    // qpGW Q4 (notes/q4_edmft_skeleton_spec.md, ruling R-Q4-3): the Q3 BSE tier lives HERE,
+    // not in update_w. Two structural reasons: (i) in edmft mode update_w would hand the
+    // kernel builder the IMPURITY-CORRECTED Pi, violating R-Q3-1 ("the kernel sees the pure
+    // RPA Pi"); (ii) the bosonic closure reaches eval_Pi_qdep + its own Dyson directly and
+    // never through update_w, so W_loc must get its ladder from this seam. The ORDER is the
+    // contract: RPA Pi -> build_vertex_W0 -> build_pol_ladder_kernel (the PURE-RPA point)
+    // -> crpa/edmft corrections -> add_vertex_Pi_C -> inject_pol_ladder (last), and every
+    // return path below runs the same two hooks -- including the "rpa"/gw_edmft_rpa early
+    // return, which is Q3's production mode and must keep injecting.
+    // ARITHMETIC IDENTITY with the pre-Q4 update_w placement (gate Q4-s1): the readout
+    // requires an INACTIVE _vertex, and add_vertex_Pi_C is a strict no-op for an inactive
+    // vertex, so the kernel build moving across it changes no executed operation.
+    const bool pol_readout = (_vertex != nullptr and _vertex->pol_vertex_active()
+                              and not _vertex->active());
+    auto build_pol_ladder_kernel = [&](auto &dPi_rpa) {
+      if (not pol_readout) return;
+      ensure_pol_vertex(thc);
+      _pol_vtx->build_w0(mb_state, thc, dPi_rpa);   // build_w0 only READS dPi
+      _pol_pi0_qPQ = gather_nu0_row(dPi_rpa);       // the readout's RPA baseline
+    };
+    auto inject_pol_tier = [&](auto &dPi) {
+      if (pol_readout and _vertex->pol_vertex_inject_enabled())
+        inject_pol_ladder(mb_state, thc, dPi);
+    };
+
     if (_screen_type == "rpa_k") {
       auto dPi_tqPQ = eval_Pi_rpa_kspace(G_tskij, thc);
       build_vertex_W0(dPi_tqPQ);            // RPA-only Pi: before ANY correction
+      build_pol_ladder_kernel(dPi_tqPQ);
       add_vertex_Pi_C(dPi_tqPQ);
+      inject_pol_tier(dPi_tqPQ);
       return dPi_tqPQ;
     }
 
     // RPA polarizability
     auto dPi_tqPQ = eval_Pi_rpa_Rspace(G_tskij, thc);
     build_vertex_W0(dPi_tqPQ);              // RPA-only Pi: before ANY correction
+    build_pol_ladder_kernel(dPi_tqPQ);
     if (_screen_type.find("gw_edmft_rpa")!=std::string::npos or _screen_type=="rpa") {
       add_vertex_Pi_C(dPi_tqPQ);
+      inject_pol_tier(dPi_tqPQ);
       return dPi_tqPQ;
     }
 
@@ -1033,6 +1190,7 @@ namespace solvers {
 
     // ISDF-Vertex: Pi = Pi_RPA (+ corrections) + Pi^C
     add_vertex_Pi_C(dPi_tqPQ);
+    inject_pol_tier(dPi_tqPQ);
 
     return dPi_tqPQ;
   }

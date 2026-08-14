@@ -398,12 +398,25 @@ namespace methods {
     std::array<double, 2> mixing{io::get_value_with_default<double>(pt,"dc_pi_mixing",1.0),
                                  io::get_value_with_default<double>(pt,"u_weiss_mixing",1.0)};
 
+    // Project 2 increment Q4 (notes/q4_edmft_skeleton_spec.md, R-Q4-2 AMENDMENT): whether
+    // the lattice ladder's local part joins the bosonic double counting. OPT-IN and OFF by
+    // default -- the only object this tree can produce today is the THC-adjoint one, whose
+    // convention the amendment rejects as a DC contribution (increment Q4-C3b delivers the
+    // orbital/chi-convention 4-leg projection). "thc_adjoint_diag" is named for what it is.
+    auto pi_lad_dc = io::tolower_copy(
+        io::get_value_with_default<std::string>(pt,"pi_lad_dc","none"));
+    utils::check(pi_lad_dc == "none" or pi_lad_dc == "thc_adjoint_diag",
+                 "downfolding_edmft: unknown pi_lad_dc = \"{}\". Valid options: \"none\" "
+                 "(default), \"thc_adjoint_diag\" (the DIAGNOSTIC-convention ladder DC of "
+                 "Q4 C3 -- see the R-Q4-2 AMENDMENT before using it).", pi_lad_dc);
+
     _Timer.stop("DF_READ");
 
     utils::check(_output_type == "default",
                  "Error in eri::downfolding: edmft_downfolding is only available with output_type=default.");
 
-    downfold_edmft_impl(eri, mb_state, screen_type, permut_symm, g_grp, g_iter, mixing);
+    downfold_edmft_impl(eri, mb_state, screen_type, permut_symm, g_grp, g_iter, mixing,
+                        pi_lad_dc);
   }
 
   template<THC_ERI thc_t>
@@ -693,7 +706,8 @@ namespace methods {
       std::string permut_symm,
       std::array<std::string, 2> g_grp,
       std::array<long, 2> g_iter,
-      std::array<double, 2> mixing) {
+      std::array<double, 2> mixing,
+      std::string pi_lad_dc) {
 
     using math::shm::make_shared_array;
 
@@ -826,6 +840,70 @@ namespace methods {
         proj_boson.proj_fermi().downfold_loc<true>(sG_tskij_dc, "Gloc for DC polarizability") :
         proj_boson.proj_fermi().downfold_loc<false>(sG_tskij_dc, "Gloc for DC polarizability");
     auto sPi_dc_wabcd_new = eval_Pi_rpa_dc<true>(*mpi, G_tsIab, ft, density_only);
+
+    // Project 2 increment Q4 (notes/q4_edmft_skeleton_spec.md C3): eq 7's bosonic double
+    // counting is P_dc = bubble[G_loc] + P^lad_loc. The bubble is the line above (the
+    // implemented convention, kept -- it is what makes the clean limit exact); the LADDER
+    // half is what the lattice BSE tier already contains locally.
+    //
+    // ⚠ OPT-IN, DEFAULT OFF (R-Q4-2 AMENDMENT): the only P^lad_loc this tree produces is
+    // the THC-ADJOINT object of C3, whose convention the amendment rejects as a DC
+    // contribution (it carries the upfold's ||B||^2 gain instead of its reciprocal, so it
+    // is ~10 orders above bubble[G_loc]). The DC-ready orbital/chi-convention 4-leg
+    // projection is increment Q4-C3b. With pi_lad_dc = "none" this block does not execute
+    // at all -- no h5 read, no accumulation -- so P_dc is bit-identical to pre-C3.
+    // Source when enabled: MBState if the lattice stage ran in this process, else the
+    // checkpoint group that produced the RPA polarizability (g_grp[0]/g_iter[0] --
+    // P^lad_loc belongs to that lattice screening step, not to the Gloc used for the
+    // bubble).
+    if (pi_lad_dc != "none") {
+      app_log(1, "\n  [WARNING] pi_lad_dc = \"{}\": the ladder double counting is ON with "
+                 "the\n            DIAGNOSTIC (THC-adjoint) convention, which the R-Q4-2 "
+                 "AMENDMENT rejects\n            as a DC contribution. U(i.nu) from this "
+                 "run is a diagnostic, not a result.", pi_lad_dc);
+      nda::array<ComplexType, 5> Pi_lad_loc;
+      bool have_lad = false;
+      if (mb_state.sPi_lad_loc_wabcd) {
+        Pi_lad_loc = mb_state.sPi_lad_loc_wabcd.value().local();
+        have_lad = true;
+      } else if (mpi->node_comm.root()) {
+        h5::file file(filename, 'r');
+        auto root_grp = h5::group(file);
+        std::string gname = "iter" + std::to_string(g_iter[0]);
+        if (root_grp.has_subgroup(g_grp[0])) {
+          auto g = root_grp.open_group(g_grp[0]);
+          if (g.has_subgroup(gname)) {
+            auto ig = g.open_group(gname);
+            if (ig.has_dataset("pi_lad_loc_wabcd")) {
+              nda::h5_read(ig, "pi_lad_loc_wabcd", Pi_lad_loc);
+              have_lad = true;
+            }
+          }
+        }
+      }
+      mpi->node_comm.broadcast_n(&have_lad, 1, 0);
+      if (have_lad) {
+        sPi_dc_wabcd_new.win().fence();
+        if (mpi->node_comm.root()) {
+          utils::check(Pi_lad_loc.shape() == sPi_dc_wabcd_new.shape(),
+                       "downfold_edmft_impl: P^lad_loc shape {} does not match P_dc {}.",
+                       Pi_lad_loc.shape(), sPi_dc_wabcd_new.shape());
+          double lmax = 0.0, dmax = 0.0;
+          for (auto const &v : Pi_lad_loc) lmax = std::max(lmax, std::abs(v));
+          for (auto const &v : sPi_dc_wabcd_new.local()) dmax = std::max(dmax, std::abs(v));
+          app_log(1, "  - eq-7 ladder DC: ||P^lad_loc||_max = {:.4e} added to "
+                     "||bubble[Gloc]||_max = {:.4e} (ratio {:.3e}){}",
+                  lmax, dmax, lmax / std::max(dmax, 1e-300),
+                  (lmax > dmax) ? "\n    [WARNING] the ladder half of P_dc EXCEEDS the "
+                                  "bubble half: P_dc is then dominated by a term eq 7 "
+                                  "intends as a correction. Check the local projection's "
+                                  "normalization before trusting U(i.nu)." : "");
+          sPi_dc_wabcd_new.local() += Pi_lad_loc;
+        }
+        sPi_dc_wabcd_new.win().fence();
+      }
+      mpi->comm.barrier();
+    }
 
     // mixing pi_dc with the previous value
     if (mb_state.sPi_dc_wabcd and mixing[0] < 1.0) {

@@ -284,6 +284,11 @@ namespace solvers {
     // Np^2-per-q replicated: readout-scale only (documented memory note).
     template<nda::MemoryArrayOfRank<4> Array_t, typename communicator_t>
     nda::array<ComplexType, 3> gather_nu0_row(memory::darray_t<Array_t, communicator_t> &dPi_tqPQ);
+    // Q4 (R-Q4-3): the PURE-RPA inu = 0 row stashed by eval_Pi_qdep at the point where the
+    // ladder kernel is built. update_w's readout consumes it instead of gathering after
+    // the corrections -- in edmft mode the post-correction Pi is NOT the readout baseline
+    // (the kernel is W-bar_0[P^RPA], R-Q3-1). Empty until the first ladder-readout pass.
+    nda::array<ComplexType, 3> _pol_pi0_qPQ;
     // the L2 readout: ladder at nu = 0, upfold via the readout vertex's t(q), redo the
     // single-frequency Dyson with P0 and P0 + dP_ladder, report eps_M(q) both ways.
     // eps_inv_head_q (the loop's OWN q-resolved eps^-1 head on the PH-sym tau half grid,
@@ -312,6 +317,17 @@ namespace solvers {
     double _pol_lam_nu0 = -1.0, _pol_lam_max = -1.0;
     double _pol_r_rt = -1.0, _pol_lad_ratio = -1.0;
 
+    // Q4 C3 (notes/q4_edmft_skeleton_spec.md, ruling R-Q4-2): the ladder half of the eq-7
+    // bosonic DC, P^lad_loc = (1/N_q) sum_q B(q)^dag [t^dag Pl t](q) B(q). Stored on
+    // mb_state.sPi_lad_loc_wabcd; run from inject_pol_ladder whenever a bosonic projector
+    // is present. Single impurity (the upfold it is the adjoint of is single-impurity).
+    void accumulate_pi_lad_loc(MBState &mb_state, THC_ERI auto &thc,
+                               nda::array<ComplexType, 4> const &Pl,
+                               nda::array<ComplexType, 3> const &tmap);
+    // ||P^lad_loc||_max, ||P_dc,bubble||_max and their ratio at the last injection
+    // (gate Q4-c3(iii)); -1 when never measured / no bubble P_dc was present.
+    double _pol_lad_loc_max = -1.0, _pol_dc_bubble_max = -1.0, _pol_lad_loc_ratio = -1.0;
+
   public:
     // scGW-tilde L2: the last ladder eps_M readout (RPA, +ladder) at q_min
     std::pair<double, double> pol_eps_readout() const {
@@ -324,6 +340,10 @@ namespace solvers {
     double pol_lambda_max() const { return _pol_lam_max; }
     double pol_round_trip() const { return _pol_r_rt; }
     double pol_ladder_ratio() const { return _pol_lad_ratio; }
+    // Q4 C3 gate (iii): the ladder column of the cancellation-load meter
+    double pol_lad_loc_max() const { return _pol_lad_loc_max; }
+    double pol_dc_bubble_max() const { return _pol_dc_bubble_max; }
+    double pol_lad_loc_ratio() const { return _pol_lad_loc_ratio; }
     // Q3 gates (spec section 5 Q3-c/Q3-d): the PRIVATE ladder instance, so a test can
     // re-run the anchor identity on the very state the loop used. nullptr before the
     // first update_w with an active pol vertex.

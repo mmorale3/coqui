@@ -33,3 +33,16 @@ target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield eri_li
 add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
 set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
                     TIMEOUT 14400)
+
+# Project 2 increment Q4 (notes/q4_edmft_skeleton_spec.md): the EDMFT skeleton -- the
+# C = empty identity of the qpGW+BSE lattice stage under screen_type = "gw_edmft" with a
+# bosonic projector, and the eq-7 ladder DC (P^lad_loc). Links methods_lib: it needs the
+# embedding projector alongside the scf/vertex/scr_coulomb stack.
+set(TEST_ID methods_qpgw_edmft)
+
+add_executable(test_${TEST_ID} test_methods_qpgw_edmft.cpp)
+target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield methods_lib)
+
+add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
+set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
+                    TIMEOUT 14400)
