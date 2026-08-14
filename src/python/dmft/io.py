@@ -43,7 +43,23 @@ def convert_gw_edmft_params(gw_edmft_params: dict):
         raise ValueError("'gw_iter_per_loop' must be a non-negative integer.")
     if not isinstance(edmft_iter_per_loop, int) or edmft_iter_per_loop < 0:
         raise ValueError("'edmft_iter_per_loop' must be a non-negative integer.")
-    if edmft_iter_per_loop == 0 and gw_iter_per_loop == 1:
+
+    # Q4 (notes/q4_edmft_skeleton_spec.md, ruling R-Q4-4): lattice-stage selector.
+    # "gw" reproduces the pre-Q4 workflow bit-for-bit.
+    lattice_solver = gw_edmft_group.get('lattice_solver', 'gw')
+    if lattice_solver not in {'gw', 'qpgw'}:
+        raise ValueError(
+            f"'lattice_solver' must be one of \"gw\", \"qpgw\" (got {lattice_solver!r})."
+        )
+    gw_edmft_params['lattice_solver'] = lattice_solver
+    if lattice_solver == 'qpgw' and edmft_iter_per_loop == 0:
+        raise ValueError(
+            "lattice_solver=\"qpgw\" runs the qpGW+BSE lattice stage ONCE before the "
+            "outer loop (frozen H_eff, Option 1). With 'edmft_iter_per_loop' = 0 the "
+            "workflow would do nothing afterwards; set 'edmft_iter_per_loop' >= 1."
+        )
+
+    if lattice_solver == 'gw' and edmft_iter_per_loop == 0 and gw_iter_per_loop == 1:
         # Current GW+EDMFT SC logic does not upfold the GW solution and write new `embed` data 
         # if `gw_iter_per_loop` is 1 in order to save some memory in the checkpoint hdf5. 
         # Here, we swap `niter` and `gw_iter_per_loop` to make sure `embed` data is updated in the checkpoint.  
@@ -91,16 +107,41 @@ def convert_gw_edmft_params(gw_edmft_params: dict):
     edmft_iter_params['mix_in_first_iter'] = edmft_mix_in_first_iter
 
     # GW parameters
-    if gw_iter_per_loop > 0:
-        gw_edmft_params['gw'] = { 
-            'outdir': outdir, 
+    if lattice_solver == 'gw' and gw_iter_per_loop > 0:
+        gw_edmft_params['gw'] = {
+            'outdir': outdir,
             'prefix': prefix,
-            'restart': True, 
+            'restart': True,
             'screen_type': screen_type,
             'niter': 1,
             'div_treatment': div_treatment,
             'iter_alg': gw_iter_params
         }
+
+    # qpGW lattice-stage parameters (R-Q4-4). Only the frozen-H_eff single shot; the
+    # user's 'qpgw' section carries the qp/mode-A and BSE (pol_vertex_*) knobs and wins
+    # over the defaults derived from the top-level settings.
+    if lattice_solver == 'qpgw':
+        if screen_type not in {'rpa', 'gw_edmft'}:
+            raise ValueError(
+                f"lattice_solver=\"qpgw\" supports screen_type in {{\"rpa\", \"gw_edmft\"}} "
+                f"(got {screen_type!r}); the qpGW lattice stage rejects anything else "
+                f"(methods/MBPT_drivers.cpp, [qpgw] branch)."
+            )
+        qpgw_params = {
+            'outdir': outdir,
+            'prefix': prefix,
+            'restart': True,
+            'screen_type': screen_type,
+            # Unlike the per-cycle 'gw' block (niter=1, repeated every cycle), the frozen
+            # qpGW stage runs ONCE and must reach ITS OWN qp fixed point here -- a default
+            # of 1 would freeze a single-iteration (G0W0-class) H_eff silently.
+            'niter': 10,
+            'div_treatment': div_treatment,
+            'iter_alg': gw_iter_params
+        }
+        qpgw_params.update(deepcopy(gw_edmft_group.get('qpgw', {})))
+        gw_edmft_params['qpgw'] = qpgw_params
 
     # wloc parameters
     gw_edmft_params['wloc'] = {'outdir': outdir, 'prefix': prefix, 'screen_type': screen_type, 
@@ -299,7 +340,7 @@ def _write_impurity_results(h5_grp, impurity_results):
     # ----- optional keys (raw numpy arrays on IR mesh) -----
     # "_data" appendices imply raw numpy arrays on IR mesh
     optional_keys = [
-        'gf_struct', 'mu_imp', 'convergence', 'density',
+        'gf_struct', 'mu_imp', 'convergence', 'causality', 'density',
         'G_iw_data', 'Sigma_iw_data',
         'Pi_iw_data', 'W_iw_data',
         'Sigma_infty_dc', 'Sigma_iw_dc_data', 'Pi_iw_dc_data'

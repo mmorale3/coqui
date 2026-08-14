@@ -69,8 +69,45 @@ def run_gw_edmft(h_int, embedding, inner_loop_alg=1, *, proj_info=None, params: 
 
         Optional top-level keys and defaults
         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            - ``lattice_solver`` (``"gw"``, ``"qpgw"``; default ``"gw"``): solver used
+                for the lattice stage.
+
+                - ``"gw"``: the pre-Q4 workflow. ``coqui.run_gw`` is called
+                    ``gw_iter_per_loop`` times inside every GW+EDMFT cycle.
+                - ``"qpgw"``: the Q4 skeleton with a **frozen** effective Hamiltonian
+                    (Option 1, ruling R-Q4-4 of ``notes/q4_edmft_skeleton_spec.md``).
+                    ``coqui.run_qpgw`` runs **once**, before the outer loop, with
+                    ``projector_info`` and the current
+                    ``local_polarizabilities = dmft_state.local_pi_w`` attached; every
+                    subsequent outer cycle is EDMFT-only and the GW stage is skipped
+                    (the freeze is logged each cycle). ``gw_iter_per_loop`` is ignored
+                    and ``edmft_iter_per_loop`` must be ``>= 1``. Q5 unfreezes this by
+                    moving the qpGW stage back inside the cycle.
+
+                    **Where the fermionic double counting is set.** Not by a downfold
+                    knob: this workflow never calls ``coqui.downfold_1e``, so the
+                    ``qp_selfenergy`` / ``dc_type`` parameters of the C++ QP-downfold
+                    route (``MBPT_drivers.cpp`` ``downfolding_1e`` /
+                    ``embed_t::downfolding``) are inert here and are deliberately not
+                    set. The DC is built in python by
+                    :func:`coqui.dmft.weiss.solve_gw_dc`:
+                    ``Σ_dc = −G_loc·W_loc(τ)`` with the **full dynamical** ``W_loc``,
+                    and ``Vhf_dc = eval_hf_dc(dm, V, U(0)+V)`` (Hartree at ``U(0)+V``,
+                    exchange at ``V``). That is PDF eq 12 verbatim, and it is the unique
+                    choice under which the Q4-b clean-limit gate is exact -- accepted as
+                    the skeleton's fermionic DC by the R-Q4-1 AMENDMENT of
+                    ``notes/q4_edmft_skeleton_spec.md`` §2. The original R-Q4-1 static-U
+                    ``dc_type="gw"`` level applies only to the C++ ``downfold_1e``
+                    route (one-shot / model workflows).
+            - ``qpgw`` (dict, only used when ``lattice_solver="qpgw"``): knobs forwarded
+                verbatim to :func:`coqui.run_qpgw` (``qp_map``, ``off_diag_mode``,
+                ``eta``, ``Nfit``, the ``qp_modea_*`` family, and the BSE/ladder
+                ``pol_vertex_*`` family). ``outdir``, ``prefix``, ``restart``,
+                ``screen_type``, ``div_treatment``, ``iter_alg`` and ``niter`` (=10;
+                the frozen stage must reach its own qp fixed point) are
+                filled in from the top-level settings and may be overridden here.
             - ``gw_iter_per_loop`` (int, default ``1``): number of GW updates per
-                GW+EDMFT cycle.
+                GW+EDMFT cycle. Ignored when ``lattice_solver="qpgw"``.
             - ``edmft_iter_per_loop`` (int, default ``1``): number of EDMFT updates
                 per GW+EDMFT cycle.
             - ``outdir`` (str, default ``"./"``): output/checkpoint directory.
@@ -137,6 +174,26 @@ def run_gw_edmft(h_int, embedding, inner_loop_alg=1, *, proj_info=None, params: 
 
                 Additional DMFT workflow options in the same impurity block:
 
+                     - ``retardation`` (``"dynamic"``, ``"static_u_zb"``; default
+                         ``"dynamic"``): impurity retardation policy (ruling R-Q4-5).
+                         ``"dynamic"`` (default, pre-Q4 behaviour) hands the solver the
+                         full retarded ``U(iν)``. ``"static_u_zb"`` is **impurity mode
+                         (a)**: the retarded part is dropped, the static interaction is
+                         taken from ``static_u_source``, and the hybridization is
+                         renormalized as ``Δ → Z_B Δ`` with the Casula-Werner bandwidth
+                         factor (:func:`coqui.dmft.retardation.casula_werner_zb`). The
+                         double-counting terms and the checkpointed solver inputs are
+                         always built from the *unmodified* ``Vloc`` / ``u_weiss_iw``.
+                     - ``static_u_source`` (``"u0"``, ``"u_inf"``; default ``"u0"``):
+                         which column of ``U(iν)`` becomes the static interaction in
+                         ``retardation="static_u_zb"``. ``"u0"`` is the screened
+                         ``U(iν = 0)`` (the Casula-Werner standard); ``"u_inf"`` is the
+                         unscreened ``U(iν → ∞) = Vloc``, the PDF §3.3 literal. ⚠ The
+                         default deliberately contradicts the PDF §3.3 text as written
+                         (R-Q4-5 AMENDMENT): pairing the bare interaction with
+                         ``Z_B < 1`` double-counts screening, because ``Z_B`` comes from
+                         integrating out the *screening* bosons. Set ``"u_inf"``
+                         explicitly if the PDF literal was intended.
                      - ``init_imp_results`` (str, default ``"dc"``): initialization strategy
                          for impurity self-energies (``"dc"`` or ``"zero"``).
                      - ``degenerate_blk`` (list[list[int]], default ``None``): explicit
@@ -221,13 +278,20 @@ def run_gw_edmft(h_int, embedding, inner_loop_alg=1, *, proj_info=None, params: 
     niter, gw_iter_per_loop, edmft_iter_per_loop = (
         params.pop('niter'), params.pop('gw_iter_per_loop'), params.pop('edmft_iter_per_loop')
     )
+    # Q4 (ruling R-Q4-4): lattice stage selector. "gw" reproduces the pre-Q4 workflow.
+    lattice_solver = params.pop('lattice_solver', 'gw')
+    qpgw_params = params.pop('qpgw', None)
 
     # http://patorjk.com/software/taag/#p=display&f=Calvin+S&t=COQUI+GW%2BEDMFT&x=none&v=4&h=4&w=80&we=false
     coqui.app_log(1, "╔═╗╔═╗╔═╗ ╦ ╦╦  ╔═╗┬ ┬╔═╗┌┬┐┌┬┐┌─┐┌┬┐\n"
                      "║  ║ ║║═╬╗║ ║║  ║ ╦│││║╣  │││││├┤  │ \n"
                      "╚═╝╚═╝╚═╝╚╚═╝╩  ╚═╝└┴┘╚═╝─┴┘┴ ┴└   ┴ \n")
     coqui.app_log(1, f"  Total GW+EDMFT cycles (niter)       = {niter}")
-    coqui.app_log(1, f"  GW iterations per GW+EDMFT cycle    = {gw_iter_per_loop}")
+    coqui.app_log(1, f"  Lattice solver                      = {lattice_solver}")
+    if lattice_solver == "qpgw":
+        coqui.app_log(1,  "  GW iterations per GW+EDMFT cycle    = 0 (frozen H_eff, Option 1)")
+    else:
+        coqui.app_log(1, f"  GW iterations per GW+EDMFT cycle    = {gw_iter_per_loop}")
     coqui.app_log(1, f"  EDMFT iterations per GW+EDMFT cycle = {edmft_iter_per_loop}")
     coqui.app_log(1, f"    - Fix Gloc and Wloc during EDMFT iterations = {inner_loop_alg==2}\n")
 
@@ -264,12 +328,28 @@ def run_gw_edmft(h_int, embedding, inner_loop_alg=1, *, proj_info=None, params: 
     )
     if impurity_params.pop('restart', True):
         dmft_state.load(solver_chkpt_h5)
-    
+
     coqui_mpi.barrier()
+
+    if lattice_solver == "qpgw":
+        # No qp_selfenergy/dc_type knob is set here: the python EDMFT loop never routes
+        # through coqui.downfold_1e, so both keys would be inert (R-Q4-1 AMENDMENT).
+        # The loop's fermionic DC is weiss.solve_gw_dc, called in the inner loop below.
+        #
+        # The frozen-H_eff lattice stage: ONE qpGW+BSE solve before the outer loop.
+        _qpgw_lattice_stage(h_int, proj_info, dmft_state, qpgw_params)
+        coqui_mpi.barrier()
 
     for iteration in range(niter):
 
-        if gw_params is not None and gw_iter_per_loop >= 1:
+        if lattice_solver == "qpgw":
+            # Option 1 freeze (R-Q4-4): H_eff, the qpGW+BSE W and the checkpoint were
+            # produced once before the loop and are NOT refreshed per cycle.
+            coqui.app_log(1, f"[GW+EDMFT cycle {iteration+1}/{niter}] lattice_solver = \"qpgw\": "
+                             f"H_eff is FROZEN (Option 1, ruling R-Q4-4).\n"
+                             f"  --> skipping the per-cycle lattice update; "
+                             f"the qpGW+BSE stage ran once before the outer loop.\n")
+        elif gw_params is not None and gw_iter_per_loop >= 1:
             # update GW solution with fixed impurity self-energies and polarizabilities
             _gw_loop(
                 mf, h_int, proj_info, 
@@ -279,14 +359,25 @@ def run_gw_edmft(h_int, embedding, inner_loop_alg=1, *, proj_info=None, params: 
 
         if edmft_iter_per_loop >= 1:
             # Set the Green's function for the non-local RPA polarizability
-            with HDFArchive(coqui_chkpt_h5, 'r') as ar:
-                mbpt_final_iter = ar["scf/final_iter"]
-                try:
-                    gf_for_wloc_source = ar[f"scf/iter{mbpt_final_iter}/greens_func_source"]
-                    gf_for_wloc_iteration = ar[f"scf/iter{mbpt_final_iter}/greens_func_iteration"]
-                except KeyError:
-                    gf_for_wloc_source = ar[f"scf/iter{mbpt_final_iter}/input_grp"]
-                    gf_for_wloc_iteration = ar[f"scf/iter{mbpt_final_iter}/input_iter"]
+            if lattice_solver == "qpgw":
+                # The qp SCF loop writes "scf/iter{N}" through chkpt::dump_scf
+                # (tools/chkpt_utils.cpp:108-130) with Dm_skij/Heff_skij/MO_skia/E_ska/mu
+                # and stores NEITHER "greens_func_source" NOR the legacy "input_grp". The
+                # G that W_loc's RPA bubble must use is the qpGW lattice G itself, which
+                # read_greens_function rebuilds on the fly from (MO_skia, E_ska, mu)
+                # (SCF/scf_common.cpp:440-459).
+                with HDFArchive(coqui_chkpt_h5, 'r') as ar:
+                    gf_for_wloc_source = "scf"
+                    gf_for_wloc_iteration = ar["scf/final_iter"]
+            else:
+                with HDFArchive(coqui_chkpt_h5, 'r') as ar:
+                    mbpt_final_iter = ar["scf/final_iter"]
+                    try:
+                        gf_for_wloc_source = ar[f"scf/iter{mbpt_final_iter}/greens_func_source"]
+                        gf_for_wloc_iteration = ar[f"scf/iter{mbpt_final_iter}/greens_func_iteration"]
+                    except KeyError:
+                        gf_for_wloc_source = ar[f"scf/iter{mbpt_final_iter}/input_grp"]
+                        gf_for_wloc_iteration = ar[f"scf/iter{mbpt_final_iter}/input_iter"]
             wloc_params["greens_func_source"] = gf_for_wloc_source
             wloc_params["greens_func_iteration"] = gf_for_wloc_iteration
             coqui_mpi.barrier()
@@ -305,8 +396,57 @@ def run_gw_edmft(h_int, embedding, inner_loop_alg=1, *, proj_info=None, params: 
             )
 
 
-def _gw_loop(mf, h_int, proj_info, 
-             dmft_state, coqui_chkpt_h5, 
+def _qpgw_lattice_stage(h_int, proj_info, dmft_state, qpgw_params):
+    """
+    Run the qpGW+BSE lattice stage of the GW+EDMFT skeleton exactly once.
+
+    This is the Option-1 ("frozen H_eff") realization of ruling R-Q4-4: the
+    quasiparticle Hamiltonian, the qpGW+BSE screened interaction and the
+    ``scf/iter{N}`` checkpoint entry are produced here, before the outer loop,
+    and are never refreshed while the EDMFT cycles run. Q5 unfreezes it by
+    moving this call back inside the outer cycle.
+
+    The impurity correction enters the lattice polarization only through
+    ``local_polarizabilities`` (``P_latt = P^RPA[G_latt] + P^lad +
+    P_C[P_imp - P_dc]P_C^dag``); on the first, from-scratch cycle
+    ``dmft_state.local_pi_w`` is ``None``, which is the C = empty-set limit
+    gated by Q4-a.
+
+    Parameters
+    ----------
+    h_int : ThcCoulomb
+        Coulomb interaction object for the full system.
+    proj_info : dict
+        Projector metadata (``proj_mat``, ``band_window``, ``kpts_w90``).
+    dmft_state : DMFTState
+        Supplies ``local_pi_w`` (``None`` before any impurity solution exists).
+    qpgw_params : dict
+        Parameter block forwarded verbatim to :func:`coqui.run_qpgw`.
+    """
+    if qpgw_params is None:
+        raise KeyError(
+            "run_gw_edmft: lattice_solver=\"qpgw\" requires a qpGW parameter block. "
+            "This is built by coqui.dmft.io.convert_gw_edmft_params."
+        )
+
+    coqui_mpi = h_int.mpi()
+    coqui.app_log(1, "Lattice stage: qpGW+BSE, run ONCE (frozen H_eff, Option 1 / R-Q4-4)")
+    coqui.app_log(1, "-------------------------------------------------------------------")
+    coqui.app_log(1, f"  screen_type                = {qpgw_params.get('screen_type')}")
+    coqui.app_log(1, f"  qp_map                     = {qpgw_params.get('qp_map', 'ac_pade')}")
+    coqui.app_log(1, f"  pol_vertex                 = {qpgw_params.get('pol_vertex', 'none')}")
+    coqui.app_log(1, f"  local polarizabilities     = "
+                     f"{'attached' if dmft_state.local_pi_w is not None else 'absent (C = empty set)'}\n")
+
+    coqui.run_qpgw(
+        qpgw_params, h_int = h_int, projector_info = proj_info,
+        local_polarizabilities = dmft_state.local_pi_w
+    )
+    coqui_mpi.barrier()
+
+
+def _gw_loop(mf, h_int, proj_info,
+             dmft_state, coqui_chkpt_h5,
              gw_params, embed_params, gw_iter_per_loop):
     if gw_iter_per_loop < 1:
         return
@@ -408,10 +548,28 @@ def _edmft_loop(mf, h_int, proj_info, dmft_state, solver_chkpt_h5, coqui_chkpt_h
                 Input['u_weiss_iw'], dmft_state.iaft, solver_params.get("causal_projection")
             )
 
+            # Q4-c causality monitor: meters U(inu) = Vloc + u_weiss_iw AFTER the causal
+            # projection of fit_u_weiss (bath_fit.py:175-190), so it reports the object the
+            # solver actually receives. Non-fatal.
+            causality = coqui_dmft.monitor_u_causality(
+                Input['Vloc'], Input['u_weiss_iw'], _bosonic_nu_mesh(dmft_state.iaft),
+                imp_index=imp_index, verbose=coqui_mpi.root()
+            )
+
             # h0: (nspin, norb, norb), delta_iw: (niw, nspin, norb, norb)
             Input['h0'], Input['delta_iw'] = coqui_dmft.extract_h0_and_delta(
                 Input['g_weiss_iw'], dmft_state.iaft
             )
+
+            # Impurity retardation policy (R-Q4-5). "dynamic" (default) is a pass-through.
+            delta_iw_solver, Vloc_solver, u_weiss_iw_solver, z_b = \
+                coqui_dmft.apply_impurity_retardation_mode(
+                    Input['delta_iw'], Input['u_weiss_iw'], Input['Vloc'],
+                    _bosonic_nu_mesh(dmft_state.iaft),
+                    mode=solver_params.get('retardation', 'dynamic'),
+                    static_u_source=solver_params.get('static_u_source', 'u0'),
+                    name=f"impurity {imp_index}"
+                )
 
             Ub, Ubp, Jb_spin, Jb_pair = coqui_dmft.hubbard_kanamori_coulomb(Input['Vloc'])
             U, Up, J_spin, J_pair = coqui_dmft.hubbard_kanamori_coulomb(Input['Vloc']+Input['u_weiss_iw'][0])
@@ -443,7 +601,7 @@ def _edmft_loop(mf, h_int, proj_info, dmft_state, solver_chkpt_h5, coqui_chkpt_h
 
             # Convert CoQuí outputs to TRIQS containers
             h0, delta_iw, h_int, u_weiss_iw = coqui_dmft.to_triqs_containers(
-                Input['h0'], Input['delta_iw'], Input['Vloc'], Input['u_weiss_iw'],
+                Input['h0'], delta_iw_solver, Vloc_solver, u_weiss_iw_solver,
                 dmft_state.iaft, gf_struct = Res['gf_struct'],
                 triqs_iw_mesh = {"fermion": Res['iw_mesh_f'], "boson": Res['iw_mesh_b']},
                 density_hamiltonian = True, real_hamiltonian = True,
@@ -496,9 +654,12 @@ def _edmft_loop(mf, h_int, proj_info, dmft_state, solver_chkpt_h5, coqui_chkpt_h
                 Res['convergence'] = np.array([
                     U, A_w0,
                     conv_metrics['diff_g'], conv_metrics['diff_g_weiss'],
-                    conv_metrics['diff_u_weiss'], conv_metrics['diff_w'], 
+                    conv_metrics['diff_u_weiss'], conv_metrics['diff_w'],
                     sigma_w0
                 ])
+                # Q4-c trail: [hermiticity_max, dd_monotonicity_flips,
+                #              min eig(U(0)-U(inu_max)), max eig(U(0)-U(inu_max))]
+                Res['causality'] = coqui_dmft.causality_trail(causality)
 
             # GW double counting contributions (current implementation uses Gloc/Wloc inputs)
             Res.update(
@@ -596,10 +757,26 @@ def _edmft_loop_fixed_gloc_and_wloc(
                 Input['u_weiss_iw'], dmft_state.iaft, solver_params.get("causal_projection")
             )
 
+            # Q4-c causality monitor (see _edmft_loop for the seam note). Non-fatal.
+            causality = coqui_dmft.monitor_u_causality(
+                Input['Vloc'], Input['u_weiss_iw'], _bosonic_nu_mesh(dmft_state.iaft),
+                imp_index=imp_index, verbose=coqui_mpi.root()
+            )
+
             # h0: (nspin, norb, norb), delta_iw: (niw, nspin, norb, norb)
             Input['h0'], Input['delta_iw'] = coqui_dmft.extract_h0_and_delta(
                 Input['g_weiss_iw'], dmft_state.iaft
             )
+
+            # Impurity retardation policy (R-Q4-5). "dynamic" (default) is a pass-through.
+            delta_iw_solver, Vloc_solver, u_weiss_iw_solver, z_b = \
+                coqui_dmft.apply_impurity_retardation_mode(
+                    Input['delta_iw'], Input['u_weiss_iw'], Input['Vloc'],
+                    _bosonic_nu_mesh(dmft_state.iaft),
+                    mode=solver_params.get('retardation', 'dynamic'),
+                    static_u_source=solver_params.get('static_u_source', 'u0'),
+                    name=f"impurity {imp_index}"
+                )
 
             Ub, Ubp, Jb_spin, Jb_pair = coqui_dmft.hubbard_kanamori_coulomb(Input['Vloc'])
             U, Up, J_spin, J_pair = coqui_dmft.hubbard_kanamori_coulomb(Input['Vloc']+Input['u_weiss_iw'][0])
@@ -634,7 +811,7 @@ def _edmft_loop_fixed_gloc_and_wloc(
 
             # Convert CoQuí outputs to TRIQS containers
             h0, delta_iw, h_int, u_weiss_iw = coqui_dmft.to_triqs_containers(
-                Input['h0'], Input['delta_iw'], Input['Vloc'], Input['u_weiss_iw'],
+                Input['h0'], delta_iw_solver, Vloc_solver, u_weiss_iw_solver,
                 dmft_state.iaft, gf_struct = Res['gf_struct'],
                 triqs_iw_mesh = {"fermion": Res['iw_mesh_f'], "boson": Res['iw_mesh_b']},
                 density_hamiltonian = True, real_hamiltonian = True,
@@ -679,6 +856,9 @@ def _edmft_loop_fixed_gloc_and_wloc(
                     conv_metrics['diff_g'], conv_metrics['diff_g_weiss'],
                     conv_metrics['diff_u_weiss'], conv_metrics['diff_w']
                 ])
+                # Q4-c trail: [hermiticity_max, dd_monotonicity_flips,
+                #              min eig(U(0)-U(inu_max)), max eig(U(0)-U(inu_max))]
+                Res['causality'] = coqui_dmft.causality_trail(causality)
 
             # GW double counting contributions
             Res.update(
@@ -713,6 +893,16 @@ def _edmft_loop_fixed_gloc_and_wloc(
         local_sigma_dynamic = dmft_state.local_sigma_w
     )
     coqui_mpi.barrier()
+
+
+def _bosonic_nu_mesh(iaft):
+    """
+    Non-negative bosonic Matsubara frequencies nu_n = 2*pi*n/beta matching the
+    ph-symmetric arrays produced by ``iaft.tau_to_w_phsym(..., stats='b')``.
+
+    Same construction as ``bath_fit.causal_projection_boson`` (bath_fit.py:105).
+    """
+    return iaft.wn_mesh('b', positive_only=True) * np.pi / iaft.beta
 
 
 def _compute_weiss_fields(coqui_mpi, imp_results, imp_inputs, solver_params, iaft):
@@ -774,6 +964,9 @@ def _solver_inner_loop(coqui_mpi, h0, delta_iw, u_weiss_iw, h_int,
     solver_params.pop('init_imp_results', None)
     solver_params.pop("causal_projection", None)
     solver_params.pop("screen_j", None)
+    # Q4 R-Q4-5: consumed by apply_impurity_retardation_mode before the solver call.
+    solver_params.pop("retardation", None)
+    solver_params.pop("static_u_source", None)
     mu_params = solver_params.pop('chemical_potential', None)
 
     if mu_params is not None:
