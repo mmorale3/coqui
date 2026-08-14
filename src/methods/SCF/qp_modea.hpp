@@ -178,6 +178,13 @@ namespace qp_modea {
     // < 0 = force LAPACK heev.
     double wrank = 1e-10;
     long wsketch = 0;
+    // W^c UNION SUBSPACE across the npk slabs of one q (stage 1c of wc_band_elements.hpp).
+    // Cut on the residue-weighted part of a retained slab direction that the shared basis
+    // does not already span, scaled by the largest slab of the q: < 0 disables the
+    // restructure (the per-slab stage-1b path -- THE DEFAULT), 0 takes wrank, > 0 is that
+    // tolerance. Measured in that file's header: R/Np is 1.00 at 1e-10 and 0.81 at 1e-8, so
+    // the restructure has nothing to compress at the accuracy class the gates require.
+    double wunion = -1.0;
     long iter = 1;                     // outer iteration (1 => Route-A root refinement)
     int level = 2;                     // logging level for the per-iteration banner
   };
@@ -223,6 +230,13 @@ namespace qp_modea {
     double wrank_mean = 0.0;       // mean retained rank over (q,p)
     double wtrunc = 0.0;           // worst 2-norm truncation residual over (q,p)
     double t_fit = 0.0, t_fac = 0.0, t_sand = 0.0;   // context-build stage wall times
+    // stage-1c (union subspace across the npk slabs of one q)
+    double wunion = 0.0;           // the knob value in force (< 0 = restructure off)
+    long union_R_max = 0;          // worst union rank R_q
+    double union_R_mean = 0.0;     // mean union rank over q
+    double union_tail = 0.0;       // worst per-slab 2-norm projection residual / max|s|
+    double union_frob = 0.0;       // worst per-slab Frobenius projection residual
+    double t_union = 0.0;          // stage-1c wall time
     long Np = 0;                   // THC auxiliary basis size (the compression denominator)
     // the slab rank ladder: max / mean retained rank over (q,p) at the FIXED tolerances
     // detail::wrank_ladder = {1e-2, 1e-4, 1e-6, 1e-8, 1e-10}. THE low-rank measurement --
@@ -262,6 +276,11 @@ namespace qp_modea {
     // stage-1b (low-rank W^c slabs) census + the per-stage wall clock
     long wrank_max = 0;                // worst retained rank over (q,p)
     double wrank_mean = 0.0;           // mean retained rank over (q,p)
+    long union_R_max = 0;              // worst union rank R_q (stage 1c; 0 = restructure off)
+    double union_R_mean = 0.0;         // mean union rank over q
+    double union_tail_worst = 0.0;     // worst per-slab union projection residual (2-norm)
+    double union_frob_worst = 0.0;     // worst per-slab union projection residual (Frobenius)
+    double t_union = 0.0;              // stage-1c wall time
     double wtrunc_worst = 0.0;         // worst |discarded lambda| / max|lambda| over (q,p)
     double wtrunc_frob_worst = 0.0;    // worst Frobenius-relative discarded weight
     double wanti_worst = 0.0;          // worst max|W - W^dag| / max|W| of a residue slab

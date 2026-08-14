@@ -125,6 +125,26 @@ struct qp_params_t {
   // cross-check it against the exact one.
   long qp_modea_wsketch = 0;
 
+  // W^c UNION SUBSPACE (stage 1c of wc_band_elements.hpp): ONE orthonormal basis per q,
+  // shared by the npk residue slabs of that q, so the Np axis of the sandwich is contracted
+  // R_q times per (k,q,n) instead of sum_p r_p times -- the dominant stage-2 term goes from
+  // npk*r*Np to npk*r*R + Np*R. Cut on the not-yet-spanned part of a retained slab direction,
+  // weighted by its residue and scaled by the LARGEST slab of that q (see the normalization
+  // argument at detail::union_build -- it bounds the absolute error of the residue sum, which
+  // is what the sandwich accumulates, and it is NOT the per-slab relative measure of wrank):
+  //     < 0  -> the restructure is OFF (the per-slab stage-1b path)   <-- THE DEFAULT
+  //     = 0  -> take qp_modea_wrank
+  //     > 0  -> that tolerance
+  // WHY THE DEFAULT IS OFF (measured, qe_lih222 / mode_a / qpscf, the scan case
+  // "qp_map_modea_wunion_scan" plus the rank ladder in wc_band_elements.hpp): the achieved
+  // basis is R/Np = 1.00 at wunion = 1e-10 and still 0.81 at 1e-8, so at the accuracy class
+  // the QM3 gates require the restructure has nothing to compress -- it only adds the
+  // stage-1c build (measured +0.46 s against a 1.70 s stage 2 on the fixture). It becomes a
+  // real speedup only where R << Np, i.e. at cuts of 1e-6 and looser, which is a spec
+  // decision and not an agent default. It is a TRUNCATION trade, tau-anchor interlocked like
+  // every other cut, and R, R/Np and the projection residual are logged on every build.
+  double qp_modea_wunion = -1.0;
+
   // ---- spec rev 4 (2026-08-13): GRADED-eta FAR-STATE EVALUATION ----
   // Imaginary offset, in a.u., applied to the evaluation energies of states OUTSIDE the
   // analyticity strip (VBM - 0.95 E_PH, CBM + 0.95 E_PH):

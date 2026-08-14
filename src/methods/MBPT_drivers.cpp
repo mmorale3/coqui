@@ -659,6 +659,10 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     utils::check(qp_params.qp_modea_wrank < 1.0,
                  "evgw: qp_modea_wrank must be < 1 (<= 0 takes the dense reference sandwich).");
     qp_params.qp_modea_wsketch = io::get_value_with_default<long>(pt,"qp_modea_wsketch",0);
+    qp_params.qp_modea_wunion = io::get_value_with_default<double>(pt,"qp_modea_wunion",-1.0);
+    utils::check(qp_params.qp_modea_wunion < 1.0,
+                 "evgw: qp_modea_wunion must be < 1 (< 0 disables the union-subspace "
+                 "restructure, 0 takes qp_modea_wrank).");
     if (io::get_value_with_default<bool>(pt,"iter_alg.enable", true)) {
       iter_solver = std::make_unique<iter_scf::iter_scf_t>(iter_scf::make_iter_scf(pt, 0.7, true));
     } else {
@@ -722,6 +726,10 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     utils::check(qp_params.qp_modea_wrank < 1.0,
                  "qpgw: qp_modea_wrank must be < 1 (<= 0 takes the dense reference sandwich).");
     qp_params.qp_modea_wsketch = io::get_value_with_default<long>(pt,"qp_modea_wsketch",0);
+    qp_params.qp_modea_wunion = io::get_value_with_default<double>(pt,"qp_modea_wunion",-1.0);
+    utils::check(qp_params.qp_modea_wunion < 1.0,
+                 "qpgw: qp_modea_wunion must be < 1 (< 0 disables the union-subspace "
+                 "restructure, 0 takes qp_modea_wrank).");
     if (io::get_value_with_default<bool>(pt,"iter_alg.enable", true)) {
       iter_solver = std::make_unique<iter_scf::iter_scf_t>(iter_scf::make_iter_scf(pt));
     } else {

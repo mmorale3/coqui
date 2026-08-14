@@ -92,7 +92,7 @@ namespace bdft_tests {
                           const std::string &wfit = "tau",
                           const std::string &tag = "", double eta = 0.0,
                           double wrtol = -1.0, double wrank = 1e-10, long wsketch = 0,
-                          double eta_far = 0.0, bool gate = true) {
+                          double eta_far = 0.0, bool gate = true, double wunion = -1.0) {
       const std::string output = "qp_map_ab_" + map + "_" + mode + tag;
       solvers::hf_t hf;
       solvers::gw_t gw(&ft, "ignore_g0", output);
@@ -109,6 +109,7 @@ namespace bdft_tests {
       qp_params.qp_modea_wrtol = wrtol;
       qp_params.qp_modea_wrank = wrank;
       qp_params.qp_modea_wsketch = wsketch;
+      qp_params.qp_modea_wunion = wunion;
       qp_modea::last_run() = qp_modea::last_run_t{};
       iter_scf::iter_scf_t iter_sol(iter_scf::damp_t(0.7));
       MBState mb_state(mpi_context, ft, output);
@@ -800,6 +801,120 @@ namespace bdft_tests {
     }
     app_log(1, "  [if the mean rank is FLAT down the columns the compression scales as 1/Np "
                "and the production Np = 2918 wins by ~Np/r; if r/Np is flat it does not.]");
+  }
+
+  /**
+   * WORK-SHARING GATE (stage 2 distribution): qe_lih222_sym has THREE (s,k) blocks and eight
+   * (isym, q-in-star) pairs, so ANY run with more than three ranks makes the other ranks
+   * helpers on somebody's block. That is the only configuration in this suite which exercises
+   * the pair split and the per-pair group reduction of stage 2 -- lih222/si222 have 8 blocks
+   * and lih223_sym 6, i.e. they need 9 / 7 ranks, which the ISDF setup of these fixtures does
+   * not survive on a laptop. One outer iteration; the gap and the anchor are rank-count
+   * invariants, so the SAME numbers must come out at -np 1 and -np 4:
+   *
+   *     KMP_DUPLICATE_LIB_OK=TRUE OMP_NUM_THREADS=1 mpirun -np 4 \
+   *       <build>/tests/bin/test_methods_qp_map_ab "qp_map_modea_worksharing"
+   *
+   * [measured, 2026-08-13: gap 12.008579 eV and tau anchor 7.1816e-04 at both -np 1 and -np 2;
+   *  >= 4 ranks is not reachable on this laptop -- the ISDF setup of every mode_a fixture
+   *  aborts there (thc_reader_t::build, "create_plan_many: howmany=0"), which predates this
+   *  increment. A run-time tripwire in wc_band_elements.hpp checks the pair census of every
+   *  group instead, so a mis-split aborts rather than silently dropping a q.]
+   *
+   * The same case is ALSO the union-subspace agreement gate: qe_lih222_sym is the only fixture
+   * in the suite with both D-matrix rotations and time-reversed q, so it is the only one that
+   * exercises the wconj branch of the stage-1c contraction (the two unreduced fixtures never
+   * enter it). At wunion = wrank the basis carries every direction the slab cut kept, to the
+   * same tolerance, so the two paths must agree at the resolution the QM3 gates compare at.
+   */
+  TEST_CASE("qp_map_modea_worksharing", "[methods][qpgw][qp_map_ab][modea2]") {
+    using namespace qp_map_ab_detail;
+    auto& mpi_context = utils::make_unit_test_mpi_context();
+    imag_axes_ft::IAFT ft(1000.0, 1.2, imag_axes_ft::dlr_basis);
+    auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_lih222_sym"));
+    REQUIRE(mf->nkpts_ibz() < mf->nkpts());
+    // union ON at wunion = wrank (the restructure is OFF by default -- see the scan below --
+    // so it has to be asked for explicitly, and this case is where it is gated)
+    auto row = run_map(mpi_context, mf, ft, "mode_a", "qpscf", 12, 1e-10, 1, 1e-6, "tau", "_ws",
+                       0.0, -1.0, 1e-10, 0, 0.0, true, 0.0);
+    app_log(1, "@@WORKSHARE ranks = {}, (s,k) blocks = {}, (isym,q) pairs = {}: gap = {:.6f} eV,"
+               " TAU ANCHOR = {:.4e} (class {:.4e}), inner max|d eps| = {:.3e}",
+            mpi_context->comm.size(), mf->nkpts_ibz(), mf->nqpts(), row.gap_eV(),
+            row.lr.tau_dev, row.lr.anchor_expect, row.lr.dmax);
+    REQUIRE(row.lr.tau_dev < qp_modea::modea_tau_anchor_mult * row.lr.anchor_expect);
+    REQUIRE(std::isfinite(row.gap_eV()));
+    REQUIRE(row.gap_eV() > 0.0);
+
+    auto ref = run_map(mpi_context, mf, ft, "mode_a", "qpscf", 12, 1e-10, 1, 1e-6, "tau",
+                       "_wsref");                                          // union OFF (default)
+    app_log(1, "@@UNIONID union ON (R = {} of Np = {}, worst projection residual {:.3e}) vs the "
+               "per-slab path: gap {:.6f} vs {:.6f} eV, d = {:+.2e}; anchor {:.4e} vs {:.4e}",
+            row.lr.union_R_max, row.lr.Np, row.lr.union_tail, row.gap_eV(), ref.gap_eV(),
+            row.gap_eV() - ref.gap_eV(), row.lr.tau_dev, ref.lr.tau_dev);
+    REQUIRE(std::abs(row.gap_eV() - ref.gap_eV()) < 1e-6);
+  }
+
+  /**
+   * ==========================================================================================
+   * MEASUREMENT (on hold, run explicitly): THE UNION-SUBSPACE CUT -- WHAT R BUYS, AND AT WHAT
+   * ==========================================================================================
+   * Stage 1c replaces the npk per-slab bases of one q by ONE basis of R_q vectors, so the Np
+   * axis of the sandwich is contracted R times per (k,q,n) instead of sum_p r_p times. The
+   * whole restructure is worth R/Np -- and R is a function OF THE CUT, not of the cell: the
+   * np_scan probe measures the stack rank saturating at 89 (1e-6) and 143 (1e-8) of Np = 384
+   * while at the default 1e-10 it is Np itself (the retained tails of different poles are
+   * mutually orthogonal there). So this case is the one that decides the default: each cell
+   * runs the SAME full loop with a different qp_modea_wunion at fixed wrank = 1e-10, and
+   * reports the gap against the union-OFF reference together with R, the projection residual
+   * and the tau anchor.
+   *
+   * The reference cell is wunion < 0 = the per-slab stage-1b path of 18d35a3, so cell k minus
+   * cell 0 IS the union restructure's accuracy cost, isolated from everything else.
+   *
+   *     KMP_DUPLICATE_LIB_OK=TRUE OMP_NUM_THREADS=1 \
+   *       <build>/tests/bin/test_methods_qp_map_ab "qp_map_modea_wunion_scan"
+   */
+  TEST_CASE("qp_map_modea_wunion_scan", "[.modea_hold]") {
+    using namespace qp_map_ab_detail;
+    auto& mpi_context = utils::make_unit_test_mpi_context();
+    imag_axes_ft::IAFT ft(1000.0, 1.2, imag_axes_ft::dlr_basis);
+    auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_lih222"));
+
+    // 1e-4 is NOT a cell: the tau anchor of qp_approx aborts the process there (measured for
+    // wrank; the union cut carries the same error class), and an abort loses the table.
+    struct cell { const char *name; double wunion; };
+    const std::vector<cell> cells = {
+        {"union OFF (per-slab, 18d35a3)", -1.0},
+        {"wunion = wrank = 1e-10", 0.0},
+        {"wunion = 1e-8", 1e-8},
+        {"wunion = 1e-6", 1e-6},
+    };
+    std::vector<ab_row> rows;
+    for (size_t c = 0; c < cells.size(); ++c) {
+      app_log(1, "\n@@WUNION cell {}: {}", c, cells[c].name);
+      rows.push_back(run_map(mpi_context, mf, ft, "mode_a", "qpscf", 12, 1e-10, 20, 1e-6,
+                             "tau", "_wu" + std::to_string(c), 0.0, -1.0, 1e-10, 0, 0.0,
+                             true, cells[c].wunion));
+    }
+    app_log(1, "\n  W^c union-subspace scan (qe_lih222 / mode_a / qpscf), Np = {}, "
+               "wrank = 1e-10:", rows[0].lr.Np);
+    app_log(1, "  {:<32} {:>10} {:>11} {:>7} {:>8} {:>11} {:>10} {:>9} {:>9}",
+            "cell", "gap (eV)", "d vs OFF", "max R", "R/Np", "proj resid", "anchor",
+            "t_1c", "t_sand");
+    for (size_t c = 0; c < cells.size(); ++c)
+      app_log(1, "  {:<32} {:>10.6f} {:>11.2e} {:>7} {:>8.3f} {:>11.2e} {:>10.2e} {:>8.2f}s "
+                 "{:>8.2f}s",
+              cells[c].name, rows[c].gap_eV(), rows[c].gap_eV() - rows[0].gap_eV(),
+              rows[c].lr.union_R_max,
+              rows[c].lr.union_R_max / double(std::max(rows[c].lr.Np, 1L)),
+              rows[c].lr.union_tail, rows[c].lr.tau_dev, rows[c].lr.t_union,
+              rows[c].lr.t_sand);
+    app_log(1, "  [the DEFAULT is the loosest cell whose gap still sits inside the 1e-5 eV "
+               "gate band of qp_map_etafar_identity AND whose tau anchor is inside its own "
+               "10 x reconstruction-class interlock.]");
+    // the exact cell (wunion = wrank) must reproduce the per-slab path: at that cut the union
+    // basis spans every retained direction, so the restructure is algebra, not truncation
+    REQUIRE(std::abs(rows[1].gap_eV() - rows[0].gap_eV()) < 1e-6);
   }
 
   /**

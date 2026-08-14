@@ -89,6 +89,7 @@ namespace {
     opts.wrtol = qp_params.qp_modea_wrtol;
     opts.wrank = qp_params.qp_modea_wrank;
     opts.wsketch = qp_params.qp_modea_wsketch;
+    opts.wunion = qp_params.qp_modea_wunion;
     opts.iter = 1;
     std::string div = "ignore_g0";
     if constexpr (requires { mb_solver.corr->iter(); })
@@ -1355,11 +1356,12 @@ auto qp_approx(const sArray_t<Array_view_5D_t> &sSigma_tskij,
   if (qp_params.qp_map == "mode_a" or qp_params.qp_map == "mode_b")
     app_log(2, "  - mode knobs:             route = {}, nconsist = {}, consist_tol = {:.1e}, "
                "eta = {:.3g}, wsupp = {}, wfit = {}, wrtol = {:.2g}, wrank = {:.2g}, "
-               "wsketch = {}",
+               "wsketch = {}, wunion = {:.2g}",
             qp_params.qp_modea_route, qp_params.qp_modea_nconsist,
             qp_params.qp_modea_consist_tol, qp_params.qp_modea_eta,
             qp_params.qp_modea_wsupp, qp_params.qp_modea_wfit, qp_params.qp_modea_wrtol,
-            qp_params.qp_modea_wrank, qp_params.qp_modea_wsketch);
+            qp_params.qp_modea_wrank, qp_params.qp_modea_wsketch,
+            qp_params.qp_modea_wunion);
   sVcorr_skij.set_zero();
   sVcorr_skij.win().fence();
   if (qp_params.qp_map == "mode_a" or qp_params.qp_map == "mode_b") {

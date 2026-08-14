@@ -47,10 +47,19 @@
  *    W^(p)_PQ = sum_r V(P,r) s_r conj(V(Q,r)) with |s_r| >= wrank * max|s|. See
  *    "WHY STAGE 1b EXISTS" below -- this is what makes the production sizes reachable.
  *
- *  STAGE 2 (rank-local): for each owned external (s,k), loop the qsymms/star structure of
- *    thc_gw verbatim and accumulate the sandwich
+ *  STAGE 1c (collective, per q): the UNION SUBSPACE -- ONE orthonormal basis Q_q for all npk
+ *    slab ranges of that q, and the (r_p, R_q) coefficient blocks of every slab in it. This
+ *    takes the Np axis out of the p loop of stage 2; see "THE UNION SUBSPACE" below for what
+ *    it is worth, which is a MEASURED function of the truncation and not a free win. The
+ *    dense slabs (and, here, the per-slab factors) are released as soon as they are dead.
+ *
+ *  STAGE 2 (distributed): for each external (s,k), loop the qsymms/star structure of thc_gw
+ *    verbatim and accumulate the sandwich
  *        B(P,a) = conj(XCe(P,a)) u(P,n),    M^(n,p) += (1/nk) B^T W^(p) conj(B),
- *    either densely (wrank <= 0: the reference path) or through the stage-1b factors.
+ *    densely (wrank <= 0: the reference path), through the stage-1b factors, or through the
+ *    stage-1c union basis. The block STORAGE is owned by rank sk % size as before, but the
+ *    flops are split over the whole congruence class of that rank on the (isym, q) pair axis
+ *    -- with 8 blocks on 32 ranks the single-owner loop left 24 ranks idle.
  *
  * Nothing here re-materializes W at (a,n,b,nu); the working set is one q's residue slab
  * (node-shared) plus this rank's (a,b,J,p) slabs.
@@ -107,12 +116,93 @@
  * whole set, ~40 s on 32 ranks against the several minutes stage 2 still costs. Subdominant,
  * as required.
  *
- * WHAT THIS DOES NOT FIX (measured, same probe): the npk slabs of ONE q span a COMMON
- * subspace -- the union rank of the whole stack is ~1.2x the rank of a single slab, against
- * sum_p r_p ~ 40x it. A basis shared across p would therefore contract the Np axis once per
- * q instead of once per (q,p), turning the dominant term from nqpts*npk*nbnd^2*Np*r into
- * nqpts*npk*nbnd^2*R^2 (Np drops out entirely). That is the next increment, not this one; the
- * "W^c union subspace" line of every small-Np build is its measurement.
+ * =====================================================================================
+ * THE UNION SUBSPACE (stage 1c) -- AND WHY IT IS A TRUNCATION TRADE, NOT A FREE WIN
+ * =====================================================================================
+ * Stage 1b contracts the Np axis once per (q,p,r), i.e. sum_p r_p times per (k,q): the npk
+ * slabs of one q are npk DIFFERENT bases. Let ONE orthonormal basis Q_q (R_q vectors) span
+ * all of them, V^(p) = Q_q A^(p) with A^(p) the (R_q, r_p) coefficient block. Then, with
+ *
+ *     H(R,a) = sum_P q_R(P) B(P,a)          <- the ONLY contraction of P, once per (k,q,n)
+ *     g^(p)(a,r) = sum_R A^(p)(R,r) H(R,a),   M^(n,p)_ab = sum_r s_r g(a,r) conj(g(b,r)),
+ *
+ *     F_union = 8 * nqpts * nbnd^2 * [ Np * R + npk * r * (R + nbnd) ]
+ *     F_1b    = 8 * nqpts * nbnd^2 * [ npk * r * (Np + nbnd) ]
+ *
+ *     F_union / F_1b  =  R/(npk*r)  +  (R + nbnd)/(Np + nbnd)   ~   R/Np.
+ *
+ * Np is replaced by R in the dominant term and the one-time projection costs 1/(npk*r) of it.
+ * The whole increment is therefore worth exactly what R is -- and R is set by the TRUNCATION,
+ * not by the cell:
+ *
+ * MEASURED [qe_lih222, "qp_map_modea_np_scan"; rank of the npk = 28 slab stack of q = 0, i.e.
+ *  of sum_p W^(p) W^(p)dag, at |sigma| >= tol * max|sigma|; per-slab mean r for scale]
+ *
+ *      Np           96     192     288     384        mean r at Np = 384
+ *      1e-4         41      43      49      49              37.3
+ *      1e-6         76      86      89      89              72.2
+ *      1e-8         95     133     139     143             106.9
+ *      1e-10        96     192     288     384             139.4     <- FULL RANK
+ *
+ * Two things are measured there, and only one of them is good news.
+ *
+ *  (a) AT A FIXED CUT OF 1e-8 OR LOOSER, R SATURATES IN Np (143 at Np = 384 against 133 at
+ *      192) and sits at ~1.2 x max_p r_p: the slabs of one q really do share a subspace, so
+ *      R/Np falls as 1/Np and the restructure improves as the basis grows.
+ *  (b) AT THE DEFAULT CUT 1e-10 THE SHARING IS GONE: R = Np at every Np. The directions the
+ *      slab cut retains down there are mutually orthogonal noise tails, they fill the space,
+ *      and the restructure is then break-even (Np*R + npk*r*R against npk*r*Np) at the price
+ *      of one extra (nq, Np, R) window and the stage-1c build.
+ *
+ * DO NOT read the absolute numbers above as production numbers: R >= max_p r_p ALWAYS (the
+ * basis must at least span one slab), so the ceiling of the restructure is R/Np >= r/Np, and
+ * the production kp222 cell measures r_mean = 520 of Np = 2918 at 1e-10. Even in the best case
+ * -- a cut where R falls to ~1.2 max_p r_p -- that is R/Np ~ 0.2, i.e. a 5x stage-2 speedup,
+ * not the 20-30x the fixture's r/Np would suggest. lih222 has 16 bands and ~140 screening
+ * modes; the production cell has ~4x that, and r is a property of the CELL.
+ *
+ * So qp_modea_wunion is a knob: a column of V^(p) is dropped from the basis only when
+ * |s_r| * ||(1-P) v_r|| < wunion * max_p max|s^(p)|, i.e. only when it moves the RESIDUE SUM
+ * of that q by less than wunion of its largest slab (the normalization is discussed at
+ * detail::union_build -- it is the absolute one, and it is what the ladder above measures).
+ * R, R/Np and the worst projection residual in both norms are logged on every build, the cut
+ * is interlocked by the SAME tau anchor that aborts an over-aggressive wrank, and its default
+ * is chosen by the scan in test_qp_map_ab.cpp ("qp_map_modea_wunion_scan"). It is never a
+ * silent accuracy change.
+ *
+ * THE DEFAULT IS OFF, and this is why [measured, qe_lih222 / mode_a / qpscf, 20 outer
+ * iterations, Np = 192; "R" is what the incremental basis of union_build actually achieves,
+ * "gap" is the converged fundamental gap against the per-slab reference]:
+ *
+ *      wunion       R/Np    gap (eV)     d vs OFF   proj resid   anchor     1c / stage 2 wall
+ *      OFF          --      11.856870     --         --          4.26e-3    0.00 s / 1.70 s
+ *      1e-10        1.000   11.856870    -1.7e-11    1.8e-12     4.26e-3    0.47 s / 1.41 s
+ *      1e-8         0.859   11.856872    +1.7e-06    9.8e-09     4.28e-3    0.36 s / 1.23 s
+ *      1e-6         0.818   11.856873    +2.6e-06    6.7e-08     4.28e-3    0.34 s / 1.17 s
+ *
+ * At the cut the QM3 gates are pinned to, the basis IS the whole space; loosening it by FOUR
+ * orders still leaves R = 0.82 Np and has already moved the sixth decimal of the gap. Stage 2
+ * does get faster even at R = Np (1.70 -> 1.41 s) but that is BLAS SHAPE, not compression --
+ * the union path builds B once per (k,q,n) where the per-slab path rebuilds an (Np,nbnd)
+ * Hadamard product once per (k,q,p,r) -- and stage 1c eats it.
+ *
+ * OPEN, and where to look if this is ever revisited: the ACHIEVED R (0.82 Np at 1e-6) is far
+ * above the SVD-optimal stack rank the union probe reports on comparable data (0.45 Np). The
+ * probe diagonalizes sum_p W^(p) W^(p)dag, which costs 8*Np^2*r per (q,p) -- more than the
+ * stage 2 it would save -- so the incremental basis is what is affordable, and it is the
+ * incremental basis that does not pay. Closing that factor of two is the only route left to a
+ * compression-based speedup; what scales without it is stage 2's parallelism, below.
+ *
+ * =====================================================================================
+ * WHAT ACTUALLY REACHES kp444: THE PARALLEL CEILING, NOT THE COMPRESSION
+ * =====================================================================================
+ * Np is set by the CELL (nbnd x the ISDF prefactor) and not by the k mesh, so kp222 -> kp444
+ * multiplies the stage-2 work of ONE block by nqpts (8 -> 64) and leaves Np, npk and r where
+ * they were. The old loop gave a block to exactly one rank, so it could use ns*nk_ibz ranks
+ * (8 at kp222, of 32) and the iteration cost was ONE block's serial time. The pair split
+ * raises that ceiling to ns*nk_ibz*nqpts ranks -- 64 at kp222, 512 at kp444 -- and a kp444
+ * iteration costs (8 x the kp222 block) / (ranks per block). At the 1e-10 accuracy class,
+ * where R = Np and the union restructure is break-even, THAT is the whole increment.
  */
 
 #include <chrono>
@@ -302,6 +392,128 @@ namespace qp_modea {
       for (long l = l0; l > 0 and 2 * l <= NP; l *= 2)
         if (wslab_factor_rand(W, tol, l, seed, f)) return;
       wslab_factor_exact(W, tol, f);
+    }
+
+    // -------------------------------------------------------------------------------------
+    //  stage 1c: ONE basis for all npk slabs of a q  (the union-subspace restructure)
+    // -------------------------------------------------------------------------------------
+
+    /** grow a (cap, NP) ROW-major basis buffer, preserving its first R rows. */
+    inline void union_grow(nda::array<ComplexType, 2> &Q, long newcap, long R) {
+      decltype(nda::range::all) all;
+      nda::array<ComplexType, 2> Q2(newcap, Q.shape(1));
+      Q2() = ComplexType(0.0);
+      if (R > 0) Q2(nda::range(0, R), all) = Q(nda::range(0, R), all);
+      Q = std::move(Q2);
+    }
+
+    /**
+     * Build the union basis of one q's retained slab ranges. The basis is stored ROW-major,
+     * Q(R, P) = q_R(P), because every consumer wants a leading-dimension-clean row block:
+     *
+     *   coefficients   A^(p)(R,r) = <q_R, v_r>   ->  At = transpose(V) * dagger(Q)   (r, R)
+     *   sandwich       H(R,a) = sum_P q_R(P) B(P,a)  ->  H  = Q * B                  (R, nbnd)
+     *
+     * -- neither needs a conjugation of the stored basis or of the coefficient blocks (the
+     * trev-q rule is carried on the (Np, nbnd) side instead; see stage 2).
+     *
+     * Incremental modified Gram-Schmidt with one re-orthogonalization, p in INDEX order, so
+     * the result depends on nothing but (q, the slabs) -- every node builds the same basis.
+     * A column v_j of V^(p) is appended only if the part of it that the current basis does
+     * NOT span carries significant WEIGHT:
+     *
+     *     |s_j| * ||(1 - P) v_j||  >=  tol * max_p max|s^(p)|,
+     *
+     * i.e. the scale is the LARGEST residue slab of this q, not the slab the column belongs
+     * to. That is deliberate and it is the difference between a restructure that pays and one
+     * that does not:
+     *
+     *   - what the sandwich sums is sum_p B^T W^(p) conj(B), so the error that reaches
+     *     Sigma^c is sum_p ||(1-P) W^(p)||, an ABSOLUTE quantity. A slab whose norm is 1e-6
+     *     of the largest one may be projected badly in its OWN relative terms and still not
+     *     move the answer;
+     *   - measured (qe_lih222, wunion = 1e-8, Np = 192): the per-slab-relative criterion
+     *     needs R = 186 of 192 -- the restructure buys nothing -- while this one needs 143,
+     *     the same number the independent stack-rank probe reports at that tolerance;
+     *   - it is also the criterion the "W^c union subspace" probe measures, so the ladder in
+     *     this file's header IS the prediction for this basis.
+     *
+     * The price is that the tolerance is NOT a per-slab relative accuracy (qp_modea_wrank
+     * is); the per-slab residual is measured and logged separately so the difference is never
+     * hidden. With tol below the slab cut the basis spans every retained direction and the
+     * restructure is EXACT -- but then R is the rank of the whole stack, which is Np at the
+     * production cut (again, the ladder). That is the trade.
+     */
+    template<typename Vfn, typename Sfn>
+    inline long union_build(long NP, long npk, double tol, nda::array<long, 1> const &rk,
+                            nda::array<double, 1> const &amax, Vfn &&Vof, Sfn &&Sof,
+                            nda::array<ComplexType, 2> &Q, long &nappend, long &ndrop) {
+      decltype(nda::range::all) all;
+      long cap = 64;
+      for (long p = 0; p < npk; ++p) cap = std::max(cap, rk(p));
+      cap = std::min(NP, cap + 64);
+      Q = nda::array<ComplexType, 2>(cap, NP);
+      Q() = ComplexType(0.0);
+      long R = 0;
+      nappend = 0;
+      ndrop = 0;
+      double am = 0.0;                         // the scale: the largest slab of this q
+      for (long p = 0; p < npk; ++p) am = std::max(am, amax(p));
+      if (am <= 0.0) am = 1.0;
+      nda::array<ComplexType, 2> E(1, NP);
+      std::vector<char> add;
+      for (long p = 0; p < npk; ++p) {
+        const long r = rk(p);
+        if (r == 0) continue;
+        auto V = Vof(p);                       // (NP, r), orthonormal columns
+        auto s = Sof(p);                       // (r), signed eigenvalues
+        add.assign(size_t(r), 1);
+        if (R > 0) {
+          // At(j,R) = <q_R, v_j> and the residual of the whole slab in TWO gemms. The norm is
+          // taken on the residual VECTOR, never as 1 - ||At(j,:)||^2: that difference of two
+          // numbers of size 1 cannot resolve below sqrt(eps) ~ 1.5e-8, which is above the cut
+          // this criterion has to make.
+          auto QR = Q(nda::range(0, R), all);
+          nda::array<ComplexType, 2> At(r, R), Rt(r, NP);
+          nda::blas::gemm(nda::transpose(V), nda::dagger(QR), At);
+          nda::blas::gemm(At, QR, Rt);                 // Rt(j,P) = (P v_j)(P)
+          for (long j = 0; j < r; ++j) {
+            double d2 = 0.0;
+            for (long P = 0; P < NP; ++P) d2 += std::norm(V(P, j) - Rt(j, P));
+            add[size_t(j)] = ((std::abs(s(j)) / am) * std::sqrt(d2) >= tol) ? 1 : 0;
+          }
+        }
+        for (long j = 0; j < r; ++j) {
+          if (not add[size_t(j)]) { ++ndrop; continue; }
+          if (R >= NP) { ++ndrop; continue; }
+          for (long P = 0; P < NP; ++P) E(0, P) = V(P, j);
+          double nrm = 1.0;
+          for (int pass = 0; pass < 2; ++pass) {
+            if (R > 0) {
+              nda::array<ComplexType, 2> C(1, R);
+              auto QR = Q(nda::range(0, R), all);
+              nda::blas::gemm(E, nda::dagger(QR), C);                  // C = <q_R, e>
+              nda::blas::gemm(ComplexType(-1.0), C, QR, ComplexType(1.0), E);
+            }
+            nrm = 0.0;
+            for (long P = 0; P < NP; ++P) nrm += std::norm(E(0, P));
+            nrm = std::sqrt(nrm);
+            if (nrm > 0.5) break;   // no cancellation happened; the second pass is a no-op
+          }
+          // a residual this small is the numerical zero of an already-spanned direction
+          if (nrm <= 1e-8) { ++ndrop; continue; }
+          if (R == cap) {
+            const long nc = std::min(NP, 2 * cap);
+            if (nc == cap) { ++ndrop; continue; }
+            union_grow(Q, nc, R);
+            cap = nc;
+          }
+          for (long P = 0; P < NP; ++P) Q(R, P) = E(0, P) / nrm;
+          ++R;
+          ++nappend;
+        }
+      }
+      return R;
     }
 
   } // detail
@@ -622,9 +834,10 @@ namespace qp_modea {
     long rcap = 0;
     nda::array<long, 2> rk_qp(nq_ibz, npk);
     nda::array<double, 2> tail_qp(nq_ibz, npk), frob_qp(nq_ibz, npk), anti_qp(nq_ibz, npk);
+    nda::array<double, 2> amax_qp(nq_ibz, npk);
     nda::array<long, 3> lad_qp(nq_ibz, npk, long(detail::wrank_ladder.size()));
     nda::array<long, 2> exact_qp(nq_ibz, npk), probe_qp(nq_ibz, npk);
-    rk_qp() = 0; tail_qp() = 0.0; frob_qp() = 0.0; anti_qp() = 0.0;
+    rk_qp() = 0; tail_qp() = 0.0; frob_qp() = 0.0; anti_qp() = 0.0; amax_qp() = 0.0;
     lad_qp() = 0; exact_qp() = 0; probe_qp() = 0;
     std::vector<detail::wslab_factor> myf;
     long f0 = 0, f1 = 0;
@@ -640,6 +853,7 @@ namespace qp_modea {
         tail_qp(iq, p) = f.tail;
         frob_qp(iq, p) = f.frob;
         anti_qp(iq, p) = f.anti;
+        amax_qp(iq, p) = f.amax;
         exact_qp(iq, p) = f.exact ? 1 : 0;
         probe_qp(iq, p) = f.nprobe;
         for (size_t t = 0; t < detail::wrank_ladder.size(); ++t) lad_qp(iq, p, long(t)) = f.ladder[t];
@@ -652,6 +866,7 @@ namespace qp_modea {
       mpi->node_comm.all_reduce_in_place_n(tail_qp.data(), tail_qp.size(), std::plus<>{});
       mpi->node_comm.all_reduce_in_place_n(frob_qp.data(), frob_qp.size(), std::plus<>{});
       mpi->node_comm.all_reduce_in_place_n(anti_qp.data(), anti_qp.size(), std::plus<>{});
+      mpi->node_comm.all_reduce_in_place_n(amax_qp.data(), amax_qp.size(), std::plus<>{});
       mpi->node_comm.all_reduce_in_place_n(lad_qp.data(), lad_qp.size(), std::plus<>{});
       mpi->node_comm.all_reduce_in_place_n(exact_qp.data(), exact_qp.size(), std::plus<>{});
       mpi->node_comm.all_reduce_in_place_n(probe_qp.data(), probe_qp.size(), std::plus<>{});
@@ -689,6 +904,105 @@ namespace qp_modea {
     }
     const double t_fac = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - t_fac0).count();
+
+    // ---------------- stage 1c: the union subspace of one q's slab stack ---------------
+    // ONE orthonormal basis Q_q for all npk retained slab ranges of q, and the (r_p, R_q)
+    // coefficient blocks that express every slab in it. Stage 2 then contracts the Np axis
+    // R_q times per (k,q,n) instead of sum_p r_p times -- see the flop model in the header.
+    // The q axis of the CONSTRUCTION is partitioned over the node's ranks (it is sequential
+    // in p, so it does not parallelize further), the PROJECTION over the (q,p) axis like
+    // stage 1b, and both are deterministic: every node builds the same basis for the same q.
+    const auto t_un0 = std::chrono::steady_clock::now();
+    const double wu = (opts.wunion > 0.0) ? opts.wunion : opts.wrank;
+    const bool union_on = lowrank and (opts.wunion >= 0.0);
+    nda::array<long, 1> Rq(nq_ibz);
+    nda::array<double, 2> utail_qp(nq_ibz, npk), ufrob_qp(nq_ibz, npk);
+    Rq() = 0; utail_qp() = 0.0; ufrob_qp() = 0.0;
+    long Rcap = 0, nappend = 0, ndrop = 0, uq0 = 0, uq1 = 0;
+    std::vector<nda::array<ComplexType, 2>> myQ;
+    if (union_on) {
+      std::tie(uq0, uq1) = itertools::chunk_range(0, nq_ibz, mpi->node_comm.size(),
+                                                  mpi->node_comm.rank());
+      for (long iq = uq0; iq < uq1; ++iq) {
+        nda::array<ComplexType, 2> Q;
+        long nap = 0, ndr = 0;
+        Rq(iq) = detail::union_build(
+            NP, npk, wu, rk_qp(iq, all), amax_qp(iq, all),
+            [&](long p) { return sWv.local()(iq, p, all, nda::range(0, rk_qp(iq, p))); },
+            [&](long p) { return sWs.local()(iq, p, nda::range(0, rk_qp(iq, p))); },
+            Q, nap, ndr);
+        nappend += nap;
+        ndrop += ndr;
+        myQ.push_back(std::move(Q));
+      }
+      mpi->node_comm.all_reduce_in_place_n(Rq.data(), Rq.size(), std::plus<>{});
+      for (long iq = 0; iq < nq_ibz; ++iq) Rcap = std::max(Rcap, Rq(iq));
+      // the shared window must have the same shape on every node
+      Rcap = mpi->comm.all_reduce_value(Rcap, boost::mpi3::max<>{});
+      // node_comm, never comm: every node builds the whole q set among its own ranks, so a
+      // global reduce would multiply the census by the node count (same rule as stage 1b).
+      nappend = mpi->node_comm.all_reduce_value(nappend, std::plus<>{});
+      ndrop = mpi->node_comm.all_reduce_value(ndrop, std::plus<>{});
+    }
+    // Q is stored ROW-major (R, Np) and the coefficients TRANSPOSED (r, R): both are then
+    // leading-dimension-clean row blocks at the exact rank in use, and neither needs a
+    // conjugation (the trev-q rule rides on the (Np, nbnd) side of stage 2).
+    auto sQ = make_shared_array<nda::array_view<ComplexType, 3>>(
+        *mpi, {union_on ? nq_ibz : 1L, std::max(Rcap, 1L), union_on ? NP : 1L});
+    auto sWa = make_shared_array<nda::array_view<ComplexType, 4>>(
+        *mpi, {union_on ? nq_ibz : 1L, union_on ? npk : 1L,
+               union_on ? std::max(rcap, 1L) : 1L, std::max(Rcap, 1L)});
+    if (union_on) {
+      sQ.win().fence();
+      for (long iq = uq0; iq < uq1; ++iq)
+        if (Rq(iq) > 0)
+          sQ.local()(iq, nda::range(0, Rq(iq)), all) =
+              myQ[size_t(iq - uq0)](nda::range(0, Rq(iq)), all);
+      sQ.win().fence();
+      myQ.clear();
+      myQ.shrink_to_fit();
+      sWa.win().fence();
+      auto [g0, g1] = itertools::chunk_range(0, nq_ibz * npk, mpi->node_comm.size(),
+                                             mpi->node_comm.rank());
+      for (long j = g0; j < g1; ++j) {
+        const long iq = j / npk, p = j % npk;
+        const long r = rk_qp(iq, p);
+        if (r == 0 or Rq(iq) == 0) continue;
+        auto At = sWa.local()(iq, p, nda::range(0, r), all);          // (r, Rcap)
+        nda::blas::gemm(nda::transpose(sWv.local()(iq, p, all, nda::range(0, r))),
+                        nda::dagger(sQ.local()(iq, all, all)), At);
+        // WHAT THE PROJECTION COSTS THIS SLAB. Two numbers, because the criterion and the
+        // stage-1b truncation are normalized differently (see union_build): the 2-norm one is
+        // scaled by the LARGEST slab of this q -- that is what wunion bounds -- and the
+        // Frobenius one is relative to THIS slab, i.e. directly comparable to the stage-1b
+        // residual. Both are measured on the residual VECTOR (the 1 - ||At||^2 shortcut has a
+        // sqrt(eps) floor and would report 1e-8 for an EXACT projection).
+        double am = 0.0;
+        for (long p2 = 0; p2 < npk; ++p2) am = std::max(am, amax_qp(iq, p2));
+        if (am <= 0.0) am = 1.0;
+        double tmax = 0.0, num = 0.0, den = 0.0;
+        nda::array<ComplexType, 2> Rt(r, NP);
+        nda::blas::gemm(At, sQ.local()(iq, all, all), Rt);
+        auto Vp = sWv.local()(iq, p, all, nda::range(0, r));
+        for (long jj = 0; jj < r; ++jj) {
+          double d2 = 0.0;
+          for (long P = 0; P < NP; ++P) d2 += std::norm(Vp(P, jj) - Rt(jj, P));
+          const double s2 = sWs.local()(iq, p, jj) * sWs.local()(iq, p, jj);
+          tmax = std::max(tmax, std::sqrt(s2 * d2) / am);
+          num += s2 * d2;
+          den += s2;
+        }
+        utail_qp(iq, p) = tmax;
+        ufrob_qp(iq, p) = (den > 0.0) ? std::sqrt(num / den) : 0.0;
+      }
+      sWa.win().fence();
+      mpi->node_comm.all_reduce_in_place_n(utail_qp.data(), utail_qp.size(), std::plus<>{});
+      mpi->node_comm.all_reduce_in_place_n(ufrob_qp.data(), ufrob_qp.size(), std::plus<>{});
+      mpi->node_comm.barrier();
+    }
+    const double t_union = mpi->comm.all_reduce_value(
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - t_un0).count(),
+        boost::mpi3::max<>{});
 
     if (lowrank) {
       double tw = 0.0, fw = 0.0, aw = 0.0, rmean = 0.0;
@@ -780,6 +1094,61 @@ namespace qp_modea {
                    "Np^2 sandwich is used", opts.wrank);
     }
 
+    if (union_on) {
+      double Rmean = 0.0, ut = 0.0, uf = 0.0;
+      long Rmax = 0, Rmin = NP;
+      for (long iq = 0; iq < nq_ibz; ++iq) {
+        Rmax = std::max(Rmax, Rq(iq));
+        Rmin = std::min(Rmin, Rq(iq));
+        Rmean += double(Rq(iq));
+      }
+      Rmean /= double(std::max(nq_ibz, 1L));
+      for (long iq = 0; iq < nq_ibz; ++iq)
+        for (long p = 0; p < npk; ++p) {
+          ut = std::max(ut, utail_qp(iq, p));
+          uf = std::max(uf, ufrob_qp(iq, p));
+        }
+      ctx.diag.union_R_max = Rmax;
+      ctx.diag.union_R_mean = Rmean;
+      ctx.diag.union_tail_worst = ut;
+      ctx.diag.union_frob_worst = uf;
+      ctx.diag.t_union = t_union;
+      double rsum = 0.0;
+      for (long p = 0; p < npk; ++p) rsum += double(rk_qp(0, p));
+      app_log(lvl, "  - W^c union subspace:          ON (qp_modea_wunion = {:.2g}{}) -- rank R: "
+                   "min {}, mean {:.1f}, max {} of Np = {}  [sum_p r_p = {:.0f} at q = 0, so the "
+                   "Np contraction of stage 2 is done {:.1f}x less often; R/Np = {:.4f}]",
+              wu, (opts.wunion > 0.0 ? "" : " = qp_modea_wrank"), Rmin, Rmean, Rmax, NP,
+              rsum, (Rmax > 0 ? rsum / double(Rmax) : 0.0), Rmean / double(NP));
+      app_log(lvl, "  - W^c union projection:        worst residual: 2-norm {:.3e} (scaled by "
+                   "the largest slab of the q -- THE quantity wunion = {:.2g} bounds), "
+                   "Frobenius {:.3e} (relative to the slab itself; stage-1b truncation is "
+                   "{:.3e}) -- {} basis vectors kept, {} slab directions absorbed",
+              ut, wu, uf, ctx.diag.wtrunc_worst, nappend, ndrop);
+      if (Rmax >= NP)
+        app_log(lvl, "  - W^c union subspace:          NOTE: R = Np, i.e. the retained slab "
+                     "ranges of this q span everything at wunion = {:.2g}. The restructure is "
+                     "then break-even (Np*R + npk*r*R against npk*r*Np) and costs one extra "
+                     "(nq, Np, R) window -- loosen qp_modea_wunion to buy anything.", wu);
+    } else if (lowrank) {
+      app_log(lvl, "  - W^c union subspace:          OFF (qp_modea_wunion = {:.2g}) -- the "
+                   "per-slab stage-1b sandwich is used", opts.wunion);
+    }
+
+    // ---- the dense slabs are DEAD once the factors exist (only the wrank <= 0 reference
+    // path reads them in stage 2). At the production sizes this window is the single biggest
+    // allocation of the whole build -- (nq_ibz, npk, Np, Np) complex, node-shared -- and
+    // holding it through stage 2 was measured at +9 GB per node for nothing. Likewise the
+    // per-slab factors, once every slab has been expressed in its q's union basis.
+    if (lowrank) {
+      mpi->node_comm.barrier();
+      sWres = make_shared_array<nda::array_view<ComplexType, 4>>(*mpi, {1L, 1L, 1L, 1L});
+    }
+    if (union_on) {
+      mpi->node_comm.barrier();
+      sWv = make_shared_array<nda::array_view<ComplexType, 4>>(*mpi, {1L, 1L, 1L, 1L});
+    }
+
     // ---------------- MO collocation columns ------------------------------------------
     // internal leg: XCi(s, k_full) = X(k_full) . C(kp_to_ibz(k_full))   [derivation 1]
     nda::array<ComplexType, 3> XCi(ns * nkpts, NP, nbnd);
@@ -824,41 +1193,93 @@ namespace qp_modea {
     // low-rank path scratch: the r-th column of the slab basis contracts BOTH legs at once,
     // Z(P,a) = conj(XCe(P,a)) V(P,r)  ->  Gr = Z^T Uc = g_r(a, n)  (one gemm per (q,p,r)).
     const long rc = std::max(rcap, 1L);
+    const bool perslab = lowrank and not union_on;
     nda::array<ComplexType, 2> Uc(lowrank ? NP : 1, lowrank ? nbnd : 1);
-    nda::array<ComplexType, 2> Z(lowrank ? NP : 1, lowrank ? nbnd : 1);
-    nda::array<ComplexType, 2> Vw(lowrank ? NP : 1, lowrank ? rc : 1);
-    nda::array<ComplexType, 2> Gr(lowrank ? nbnd : 1, lowrank ? nbnd : 1);
-    nda::array<ComplexType, 3> Gall(lowrank ? rc : 1, lowrank ? nbnd : 1, lowrank ? nbnd : 1);
+    nda::array<ComplexType, 2> Z(perslab ? NP : 1, perslab ? nbnd : 1);
+    nda::array<ComplexType, 2> Vw(perslab ? NP : 1, perslab ? rc : 1);
+    nda::array<ComplexType, 2> Gr(perslab ? nbnd : 1, perslab ? nbnd : 1);
+    nda::array<ComplexType, 3> Gall(perslab ? rc : 1, perslab ? nbnd : 1, perslab ? nbnd : 1);
     nda::array<ComplexType, 2> Gs(lowrank ? rc : 1, lowrank ? nbnd : 1);
     nda::array<ComplexType, 2> Gc(lowrank ? rc : 1, lowrank ? nbnd : 1);
+    // union path scratch: H is the ONE contraction of the Np axis, done per (k,q,n).
+    nda::array<ComplexType, 2> Hn(union_on ? std::max(Rcap, 1L) : 1, union_on ? nbnd : 1);
+    nda::array<ComplexType, 2> Gt(union_on ? rc : 1, union_on ? nbnd : 1);
+
+    // ---- WHO DOES THE WORK (and who stores it) ----------------------------------------
+    // The ctx layout is unchanged: block sk lives on rank sk % size, and every consumer of
+    // ctx.blocks still finds it there. What changes is that the FLOPS of a block are spread
+    // over the whole congruence class {r : r % nblk == sk}: with ns*nk_ibz = 8 blocks on 32
+    // ranks the old loop left 24 ranks idle for the entire sandwich stage. The split axis is
+    // the (isym, q-in-star) PAIR, which the star loop visits exactly once per full-mesh q, so
+    // every member gets a disjoint slice of both the M accumulation and the (eps_J, f_J)
+    // writes -- nothing is computed twice and the plus-reduce of eps_J/f_J stays exact.
+    // [multi-node caveat: the class is congruence-based, so on more than one node a group can
+    //  straddle nodes and the per-pair reduction crosses the network. Its volume is one
+    //  block's worth per outer iteration -- seconds at the production sizes.]
+    const long nblk = ns * nk_ibz;
+    const int csize = mpi->comm.size(), crank = mpi->comm.rank();
+    const bool helpers_on = (csize > nblk);
+    auto wcomm = mpi->comm.split(helpers_on ? int(crank % nblk) : crank, crank);
+    const int gsize = helpers_on ? wcomm.size() : 1;
+    const int grank = helpers_on ? wcomm.rank() : 0;
+    // the staging buffer of ONE (isym, q) pair, (n, a, b, p) so that a pair is contiguous and
+    // the group reduction is a single call. The owner adds it into blk.M pair by pair.
+    bool any_work = false;
+    for (long sk = 0; sk < nblk; ++sk)
+      if (sk % csize == crank or (helpers_on and crank % nblk == sk)) { any_work = true; break; }
+    nda::array<ComplexType, 4> Mq(any_work ? nbnd : 1, any_work ? nbnd : 1,
+                                  any_work ? nbnd : 1, any_work ? npk : 1);
+    if (helpers_on)
+      app_log(lvl, "  - stage 2 work sharing:        {} (s,k) blocks over {} ranks -> {} ranks "
+                   "per block, split over the {} (isym, q) pairs; block storage unchanged "
+                   "(owner = sk % size)", nblk, csize, gsize, nqpts);
+
     const auto t_s2 = std::chrono::steady_clock::now();
 
-    for (long sk = 0; sk < ns * nk_ibz; ++sk) {
-      ctx.owner(sk) = sk % mpi->comm.size();
-      if (ctx.owner(sk) != mpi->comm.rank()) continue;
+    for (long sk = 0; sk < nblk; ++sk) {
+      ctx.owner(sk) = sk % csize;
+      const bool own = (ctx.owner(sk) == crank);
+      const bool help = helpers_on and (crank % nblk == sk);
+      if (not own and not help) continue;
       const long is = sk / nk_ibz, ik = sk % nk_ibz;
       sk_block blk;
       blk.is = is;
       blk.ik = ik;
-      blk.M = nda::array<ComplexType, 3>(nbnd, nbnd, nP_flat);
-      blk.M() = ComplexType(0.0);
+      if (own) {
+        blk.M = nda::array<ComplexType, 3>(nbnd, nbnd, nP_flat);
+        blk.M() = ComplexType(0.0);
+      }
 
+      long pair = 0, npair_mine = 0;
       for (long isym = 0; isym < nsym; ++isym) {
-        const long ks = MF->ks_to_k(isym, ik);
-        if (isym == 0) {
-          XCe = XCi(is * nkpts + ks, all, all);
-        } else {
-          auto [cjg, D] = MF->symmetry_rotation(isym, ik);
-          utils::check(not cjg, "qp_modea: symmetry_rotation(isym = {}, k = {}) reports the "
-                                "conjugation flag, which the GW assembly this map reproduces "
-                                "does not handle either (thc_gw.icc:311).", isym, ik);
-          math::sparse::csrmm(ComplexType(1.0), *D,
-                              nda::make_regular(sMO_skia.local()(is, ik, all, all)),
-                              ComplexType(0.0), DC);
-          nda::blas::gemm(thc.X(is, 0, ks), DC, XCe);
+        const long nqs = MF->nq_per_s(isym);
+        bool mine_any = false;
+        for (long iq = 0; iq < nqs; ++iq)
+          if (not helpers_on or ((pair + iq) % gsize == grank)) { mine_any = true; break; }
+        long ks = -1;
+        if (mine_any) {
+          ks = MF->ks_to_k(isym, ik);
+          if (isym == 0) {
+            XCe = XCi(is * nkpts + ks, all, all);
+          } else {
+            auto [cjg, D] = MF->symmetry_rotation(isym, ik);
+            utils::check(not cjg, "qp_modea: symmetry_rotation(isym = {}, k = {}) reports the "
+                                  "conjugation flag, which the GW assembly this map reproduces "
+                                  "does not handle either (thc_gw.icc:311).", isym, ik);
+            math::sparse::csrmm(ComplexType(1.0), *D,
+                                nda::make_regular(sMO_skia.local()(is, ik, all, all)),
+                                ComplexType(0.0), DC);
+            nda::blas::gemm(thc.X(is, 0, ks), DC, XCe);
+          }
         }
 
-        for (long iq = 0; iq < MF->nq_per_s(isym); ++iq) {
+        for (long iq = 0; iq < nqs; ++iq, ++pair) {
+          const bool mine = (not helpers_on) or (pair % gsize == grank);
+          const bool reduce = (gsize > 1) and ((pair % gsize) != 0);
+          if (mine or reduce) Mq() = ComplexType(0.0);
+
+          if (mine) {
+          ++npair_mine;
           const long qp = MF->Qs(isym, iq);
           const long qs = MF->qp_to_ibz(qp);
           const bool wconj = qp_trev(qp);
@@ -875,7 +1296,44 @@ namespace qp_modea {
             ctx.fJ((is * nk_ibz + ik) * nJ + J) = sigma_route_b::stable_nF(ctx.beta, e - mu);
           }
 
-          if (lowrank) {
+          if (union_on) {
+            // W^(p) = Q_q A^(p) S A^(p)dag Q_q^dag, so with H(R,a) = sum_P q_R(P) B(P,a)
+            //     g^(p)(a,r) = sum_R A^(p)(R,r) H(R,a),   M = sum_r s_r g conj(g),
+            // and the Np axis is contracted ONCE per (k,q,n) -- for the WHOLE slab stack.
+            // The trev-q rule rides on the (Np,nbnd) side here, through
+            //     B^T conj(W) conj(B) = conj( conj(B)^T W B ),
+            // so Q and the coefficient blocks are used exactly as stored (no (Np,r) copy per
+            // (q,p), which is what the per-slab path below has to pay).
+            if (gconj != wconj) Uc = nda::conj(U);
+            else                Uc = U;
+            if (wconj) Bc = XCe;
+            else       Bc = nda::conj(XCe);
+            for (long n = 0; n < nbnd; ++n) {
+              for (long P = 0; P < NP; ++P) {
+                const ComplexType u = Uc(P, n);
+                for (long a = 0; a < nbnd; ++a) B(P, a) = Bc(P, a) * u;
+              }
+              nda::blas::gemm(sQ.local()(qs, all, all), B, Hn);   // (Rcap, NP) x (NP, nbnd)
+              for (long p = 0; p < npk; ++p) {
+                const long r = rk_qp(qs, p);
+                if (r == 0) continue;
+                auto Gtr = Gt(nda::range(0, r), all);
+                nda::blas::gemm(sWa.local()(qs, p, nda::range(0, r), all), Hn, Gtr);
+                for (long rr = 0; rr < r; ++rr) {
+                  const double sr = sWs.local()(qs, p, rr);
+                  for (long a = 0; a < nbnd; ++a) {
+                    Gs(rr, a) = sr * Gt(rr, a);
+                    Gc(rr, a) = std::conj(Gt(rr, a));
+                  }
+                }
+                nda::blas::gemm(nda::transpose(Gs(nda::range(0, r), all)),
+                                Gc(nda::range(0, r), all), Msand);
+                for (long a = 0; a < nbnd; ++a)
+                  for (long b = 0; b < nbnd; ++b)
+                    Mq(n, a, b, p) += pref * (wconj ? std::conj(Msand(a, b)) : Msand(a, b));
+              }
+            }
+          } else if (lowrank) {
             // M^(n,p)_ab = sum_r s_r g_r(a) conj(g_r(b)),  g_r(a) = sum_P B(P,a) V(P,r),
             // which is the SAME double sum as the dense sandwich with W^(p) = V S V^dag
             // substituted -- see the flop model in the file header.
@@ -911,9 +1369,8 @@ namespace qp_modea {
                   }
                 }
                 nda::blas::gemm(nda::transpose(Gsr), Gcr, Msand);
-                const long Pf = (qp * nbnd + n) * npk + p;
                 for (long a = 0; a < nbnd; ++a)
-                  for (long b = 0; b < nbnd; ++b) blk.M(a, b, Pf) += pref * Msand(a, b);
+                  for (long b = 0; b < nbnd; ++b) Mq(n, a, b, p) += pref * Msand(a, b);
               }
             }
           } else {
@@ -939,19 +1396,48 @@ namespace qp_modea {
                   nda::blas::gemm(Wp, Bc, T);
                   nda::blas::gemm(nda::transpose(B), T, Msand);
                 }
-                const long Pf = (qp * nbnd + n) * npk + p;
                 for (long a = 0; a < nbnd; ++a)
                   for (long b = 0; b < nbnd; ++b)
-                    blk.M(a, b, Pf) += pref * (wconj ? std::conj(Msand(a, b)) : Msand(a, b));
+                    Mq(n, a, b, p) += pref * (wconj ? std::conj(Msand(a, b)) : Msand(a, b));
               }
             }
           }
+          }   // mine
+
+          // the block accumulation is linear in the pair, so the group's partial results just
+          // add: exactly one member computed this pair, the rest hold zeros.
+          if (reduce) wcomm.reduce_in_place_n(Mq.data(), Mq.size(), std::plus<>{}, 0);
+          if (own) {
+            const long qp = MF->Qs(isym, iq);
+            for (long n = 0; n < nbnd; ++n)
+              for (long p = 0; p < npk; ++p) {
+                const long Pf = (qp * nbnd + n) * npk + p;
+                for (long a = 0; a < nbnd; ++a)
+                  for (long b = 0; b < nbnd; ++b) blk.M(a, b, Pf) += Mq(n, a, b, p);
+              }
+          }
         }
       }
-      if (need_diag)
-        for (long a = 0; a < nbnd; ++a)
-          for (long Pf = 0; Pf < nP_flat; ++Pf) ctx.Mdiag(is, ik, a, Pf) = blk.M(a, a, Pf);
-      ctx.blocks.push_back(std::move(blk));
+      // COVERAGE TRIPWIRE for the split above. Every (isym, q) pair of the star must have been
+      // computed by exactly ONE member of the group, and the pairs must cover the full q mesh
+      // -- the two assumptions the whole distribution rests on. Both are cheap to verify and
+      // neither is reachable by the single-rank gates (a helper group needs more ranks than
+      // there are (s,k) blocks), so they are checked at run time instead.
+      {
+        const long tot = (gsize > 1) ? wcomm.all_reduce_value(npair_mine, std::plus<>{})
+                                     : npair_mine;
+        utils::check(tot == nqpts,
+                     "qp_modea: stage-2 work sharing lost or duplicated work on block "
+                     "(s,k) = ({},{}): the group computed {} (isym,q) pairs, the star of the "
+                     "full mesh has {}. [group size {}, rank {} of {}]",
+                     is, ik, tot, nqpts, gsize, crank, csize);
+      }
+      if (own) {
+        if (need_diag)
+          for (long a = 0; a < nbnd; ++a)
+            for (long Pf = 0; Pf < nP_flat; ++Pf) ctx.Mdiag(is, ik, a, Pf) = blk.M(a, a, Pf);
+        ctx.blocks.push_back(std::move(blk));
+      }
     }
 
     mpi->comm.all_reduce_in_place_n(ctx.epsJ.data(), ctx.epsJ.size(), std::plus<>{});
@@ -962,14 +1448,25 @@ namespace qp_modea {
     ctx.active = true;
     ctx.have_cd = true;
     const double mb = 1.0 / (1024.0 * 1024.0);
-    double mem = double(ctx.blocks.size()) * double(nbnd) * double(nbnd) * double(nP_flat)
-                 * sizeof(ComplexType) * mb
-                 + double(nq_ibz) * double(npk) * double(NP) * double(NP)
-                       * sizeof(ComplexType) * mb
-                 + (need_diag ? double(ns) * nk_ibz * nbnd * nP_flat * sizeof(ComplexType) * mb
-                              : 0.0);
-    if (lowrank)
-      mem += double(nq_ibz) * double(npk) * double(NP) * double(rc) * sizeof(ComplexType) * mb;
+    const double sz = double(sizeof(ComplexType)) * mb;
+    const double m_res = double(nq_ibz) * double(npk) * double(NP) * double(NP) * sz;
+    const double m_v = lowrank ? double(nq_ibz) * double(npk) * double(NP) * double(rc) * sz : 0.0;
+    const double m_qb = union_on ? double(nq_ibz) * double(std::max(Rcap, 1L)) * double(NP) * sz
+                                 : 0.0;
+    const double m_a = union_on ? double(nq_ibz) * double(npk) * double(rc)
+                                      * double(std::max(Rcap, 1L)) * sz : 0.0;
+    const double m_blk = double(ctx.blocks.size()) * double(nbnd) * double(nbnd)
+                         * double(nP_flat) * sz;
+    const double m_mq = any_work ? double(nbnd) * double(nbnd) * double(nbnd) * double(npk) * sz
+                                 : 0.0;
+    const double m_dia = need_diag ? double(ns) * nk_ibz * nbnd * nP_flat * sz : 0.0;
+    // the two footprints the build actually passes through: stage 1c (the dense slabs, the
+    // factors and the union data all live) and stage 2 (whatever was freed above is gone,
+    // the blocks and the pair buffer are up).
+    const double m_s1 = m_res + m_v + m_qb + m_a + m_dia;
+    const double m_s2 = (lowrank ? 0.0 : m_res) + (union_on ? 0.0 : m_v) + m_qb + m_a
+                        + m_blk + m_mq + m_dia;
+    double mem = std::max(m_s1, m_s2);
     ctx.diag.mem_mb = mpi->comm.all_reduce_value(mem, boost::mpi3::max<>{});
     ctx.diag.wall_s = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - t_start).count();
@@ -991,9 +1488,15 @@ namespace qp_modea {
             ctx.diag.rec_rel_worst, ctx.diag.fit_err_worst, ctx.diag.res_ratio_worst);
     app_log(lvl, "  - context build:               {:.2f} s wall, {:.1f} MB extra per rank "
                  "(peak)", ctx.diag.wall_s, ctx.diag.mem_mb);
+    app_log(lvl, "  - context build memory:        stage 1c {:.0f} MB (dense slabs {:.0f} + "
+                 "slab factors {:.0f} + union basis {:.0f} + coefficients {:.0f}), stage 2 "
+                 "{:.0f} MB (blocks {:.0f} + pair buffer {:.0f}); freed after stage 1c: {}",
+            m_s1, m_res, m_v, m_qb, m_a, m_s2, m_blk, m_mq,
+            (lowrank ? (union_on ? "dense slabs + slab factors" : "dense slabs") : "nothing"));
     app_log(lvl, "  - context build breakdown:     stage 1 (gather + fit) {:.2f} s, stage 1b "
-                 "(slab factorization) {:.2f} s, stage 2 (sandwiches) {:.2f} s  [worst rank]",
-            ctx.diag.t_fit, ctx.diag.t_fac, ctx.diag.t_sand);
+                 "(slab factorization) {:.2f} s, stage 1c (union subspace) {:.2f} s, stage 2 "
+                 "(sandwiches) {:.2f} s  [worst rank]",
+            ctx.diag.t_fit, ctx.diag.t_fac, t_union, ctx.diag.t_sand);
 
     auto &LR = last_run();
     LR.gap_edge = ctx.diag.gap_edge;
@@ -1015,6 +1518,12 @@ namespace qp_modea {
     LR.t_fac = ctx.diag.t_fac;
     LR.t_sand = ctx.diag.t_sand;
     LR.Np = NP;
+    LR.wunion = union_on ? wu : -1.0;
+    LR.union_R_max = ctx.diag.union_R_max;
+    LR.union_R_mean = ctx.diag.union_R_mean;
+    LR.union_tail = ctx.diag.union_tail_worst;
+    LR.union_frob = ctx.diag.union_frob_worst;
+    LR.t_union = ctx.diag.t_union;
   }
 
 } // qp_modea
