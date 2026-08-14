@@ -286,16 +286,48 @@ namespace solvers {
     nda::array<ComplexType, 3> gather_nu0_row(memory::darray_t<Array_t, communicator_t> &dPi_tqPQ);
     // the L2 readout: ladder at nu = 0, upfold via the readout vertex's t(q), redo the
     // single-frequency Dyson with P0 and P0 + dP_ladder, report eps_M(q) both ways.
+    // eps_inv_head_q (the loop's OWN q-resolved eps^-1 head on the PH-sym tau half grid,
+    // div-treatment independent) is optional: when given, the SAME q_min is converted to
+    // eps_M at inu = 0 and stored as the loop-side leg of gate Q3-b(i).
     void pol_ladder_eps_readout(MBState &mb_state, THC_ERI auto &thc,
-                                nda::array<ComplexType, 3> const &Pi0_qPQ);
+                                nda::array<ComplexType, 3> const &Pi0_qPQ,
+                                nda::array<ComplexType, 2> const *eps_inv_head_q = nullptr);
     // last readout values at q_min (RPA, +ladder); -1 before the first readout
     double _pol_eps_rpa = -1.0, _pol_eps_ladder = -1.0;
+    // Q3: the LOOP's own eps_M(q_min, inu = 0) from eps_inv_head_q -- the other route of
+    // the Q3-b(i) identity (tau-Dyson of the injected Pi vs the readout's single-frequency
+    // Dyson). -1 before the first readout.
+    double _pol_eps_loop = -1.0;
+
+    // Q3 I2 (notes/q3_bse_tier_spec.md section 4): inject the resummed ladder into the
+    // RPA polarizability IN PLACE -- P_latt = P^RPA + P^lad. The upfold and the nu -> tau
+    // transform run on the LOCAL (P, Q) block only; no replicated (nu|t, q, Np, Np) array
+    // is ever formed. Called from update_w between the readout's build_w0 hook and the
+    // Dyson (ordering pinned by R-Q3-3).
+    template<nda::MemoryArrayOfRank<4> Array_t, typename communicator_t>
+    void inject_pol_ladder(MBState &mb_state, THC_ERI auto &thc,
+                           memory::darray_t<Array_t, communicator_t> &dPi_tqPQ);
+    // Q3 injection meters of the last update_w: the watchdog rho(Xh Kt) at inu = 0 and its
+    // max over nu, the nu -> tau -> nu round-trip residual, and ||P^lad||/||P^RPA||.
+    double _pol_lam_nu0 = -1.0, _pol_lam_max = -1.0;
+    double _pol_r_rt = -1.0, _pol_lad_ratio = -1.0;
 
   public:
     // scGW-tilde L2: the last ladder eps_M readout (RPA, +ladder) at q_min
     std::pair<double, double> pol_eps_readout() const {
       return {_pol_eps_rpa, _pol_eps_ladder};
     }
+    // Q3: the loop-side eps_M(q_min, inu = 0) of the same iteration (gate Q3-b(i))
+    double pol_eps_loop() const { return _pol_eps_loop; }
+    // Q3: the last injection's watchdog / meter values (gate Q3-c); -1 if never injected
+    double pol_lambda_nu0() const { return _pol_lam_nu0; }
+    double pol_lambda_max() const { return _pol_lam_max; }
+    double pol_round_trip() const { return _pol_r_rt; }
+    double pol_ladder_ratio() const { return _pol_lad_ratio; }
+    // Q3 gates (spec section 5 Q3-c/Q3-d): the PRIVATE ladder instance, so a test can
+    // re-run the anchor identity on the very state the loop used. nullptr before the
+    // first update_w with an active pol vertex.
+    vertex_t* pol_vertex_instance() { return _pol_vtx.get(); }
 
   private:
 

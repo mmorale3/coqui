@@ -146,6 +146,13 @@ namespace solvers {
      * (vertex_pi::detail::build_U_legs -- the single source; identical assignments on
      * the nosym path). nullptr / !active: all axes coincide, bit-identical to the
      * historic kernel.
+     *
+     * Q3 I3 (notes/q3_bse_tier_spec.md; PDF section 8.2): lam_max != nullptr requests the
+     * per-nu spectral radius rho(Xh Kt) -- the resolvent's margin to the particle-hole
+     * instability at rho = 1. Estimated by power iteration on the D x D product the dense
+     * solve forms anyway; written like the outputs (zeroed here, one owner per (jn, iq)),
+     * so the caller reduces it with max. Read-only w.r.t. the solve: the outputs are
+     * BITWISE unchanged whether or not it is requested.
      */
     inline void pair_space_ladder(nda::MemoryArrayOfRank<5> auto const &G_CC,  // (nt,ns,nk,nc,nc)
                                   nda::array<ComplexType, 4> const &Xb,        // (ns,nk,Nm,nc)
@@ -158,7 +165,8 @@ namespace solvers {
                                   nda::array<ComplexType, 4> *Pi_ladder,   // (nnu,nq_ext,Nm,Nm) or null
                                   long rank = 0, long nproc = 1,
                                   vertex_sym::sym_ctx const *symc = nullptr,
-                                  boost::mpi3::communicator *g_comm = nullptr) {
+                                  boost::mpi3::communicator *g_comm = nullptr,
+                                  nda::array<double, 1> *lam_max = nullptr) {  // (nnu) or null
       decltype(nda::range::all) all;
       const long nt = G_CC.shape(0), ns = G_CC.shape(1), nk = G_CC.shape(2);
       const long nc = G_CC.shape(3), Nm = Xb.shape(2);
@@ -200,6 +208,14 @@ namespace solvers {
         utils::check(m >= 0 and m < nw_b, "pair_space_ladder: nu index {} out of range.", m);
       if (Pi_onerung != nullptr) (*Pi_onerung)() = ComplexType(0.0);
       if (Pi_ladder != nullptr) (*Pi_ladder)() = ComplexType(0.0);
+      if (lam_max != nullptr) {
+        utils::check(Pi_ladder != nullptr,
+                     "pair_space_ladder: lam_max requires the resummed-ladder output.");
+        utils::check(lam_max->shape(0) == nnu,
+                     "pair_space_ladder: lam_max has {} rows, expected nnu = {}.",
+                     lam_max->shape(0), nnu);
+        (*lam_max)() = 0.0;
+      }
 
       // qx lookup: kmq(qx, k) = k'  =>  qx_of(k, k')
       nda::array<long, 2> qx_of(nk, nk);
@@ -223,6 +239,10 @@ namespace solvers {
       nda::array<ComplexType, 2> Kbig(Dsz, Dsz), XK(Dsz, Dsz);
       nda::array<ComplexType, 2> XD(Dsz, Nm), KXD(Dsz, Nm), XKXD(Dsz, Nm), Zl(Dsz, Nm);
       nda::array<ComplexType, 2> Dstack_c(Dsz, Nm);
+      // I3 power-iteration workspace (allocated only when the watchdog is requested, so
+      // the historic path's allocation profile is untouched)
+      const long lam_d = (lam_max != nullptr) ? Dsz : 0;
+      nda::array<ComplexType, 1> pv(lam_d), pw(lam_d);
 
       // P3: intra-group coordinates (lsize = 1 without a group communicator)
       const long lrank = (g_comm != nullptr) ? g_comm->rank() : 0;
@@ -344,6 +364,26 @@ namespace solvers {
               auto Xrows = XK(nda::range(ikp * nc2, (ikp + 1) * nc2), all);
               nda::blas::gemm(ComplexType(1.0 / nk), Cb(ikp, jn, all, all), Krows,
                               ComplexType(0.0), Xrows);
+            }
+            if (lam_max != nullptr) {
+              // I3: rho(Xh Kt) by power iteration on the assembled XK. Fixed seed =>
+              // reproducible; 20 sweeps or a 1e-3 relative change. |XK v| with |v| = 1
+              // converges to the dominant |eigenvalue| -- the margin eq 6's resolvent
+              // (1 - Xh Kt)^-1 has left.
+              const double seed = 1.0 / std::sqrt(double(Dsz));
+              for (long i = 0; i < Dsz; ++i) pv(i) = ComplexType(seed, 0.0);
+              double lam = 0.0, lam_prev = -1.0;
+              for (int itp = 0; itp < 20; ++itp) {
+                nda::blas::gemv(XK, pv, pw);
+                double n2 = 0.0;
+                for (long i = 0; i < Dsz; ++i) n2 += std::norm(pw(i));
+                lam = std::sqrt(n2);
+                if (lam <= 0.0) break;
+                for (long i = 0; i < Dsz; ++i) pv(i) = pw(i) / lam;
+                if (lam_prev > 0.0 and std::abs(lam - lam_prev) <= 1e-3 * lam) break;
+                lam_prev = lam;
+              }
+              (*lam_max)(jn) = std::max((*lam_max)(jn), lam);
             }
             for (long ik = 0; ik < nk; ++ik) {
               auto Drows = XD(nda::range(ik * nc2, (ik + 1) * nc2), all);
@@ -963,6 +1003,188 @@ namespace solvers {
     mpi->comm.all_reduce_in_place_n(Pl.data(), Pl.size(), std::plus<>{});
     nda::array<ComplexType, 3> out(nq_ext, Nm, Nm);
     out = Pl(0, all, all, all);
+    return out;
+  }
+
+  /**
+   * Q3 I1 (notes/q3_bse_tier_spec.md section 4): the ladder kernel's shared inputs --
+   * the full-BZ C-window G, the transfer maps on the FULL mesh (the external IBZ q's
+   * are its leading rows) and the secondary symmetry context. This is
+   * eval_pol_ladder_nu0's preamble verbatim; it is a separate entry point so the L2
+   * readout path is not edited by Q3.
+   */
+  void vertex_t::ladder_inputs(MBState &mb_state, THC_ERI auto &thc,
+                               nda::array<ComplexType, 5> &G_CC,
+                               nda::array<long, 2> &kmq, nda::array<long, 2> &kpq,
+                               vertex_sym::sym_ctx const *&symc) {
+    auto MF = thc.MF();
+    utils::check(mb_state.sG_tskij.has_value(),
+                 "vertex_t::ladder_inputs: mb_state carries no G.");
+    ensure_secondary_basis(mb_state, thc);
+
+    auto G_tskij = mb_state.sG_tskij.value().local();
+    const long nt = G_tskij.shape(0), ns = G_tskij.shape(1);
+    const long nk = MF->nkpts();                    // FULL BZ (the ladder's k axis)
+    const long nc = subspace_rank();
+    const long nq_ext = MF->nqpts_ibz(), nq_full = MF->nqpts();
+    const bool sym_mesh = (MF->nkpts() != MF->nkpts_ibz()) or (nq_full != nq_ext);
+    G_CC = nda::array<ComplexType, 5>(nt, ns, nk, nc, nc);
+    vertex_ladder_detail::expand_G_CC_fullbz(G_tskij, _band_window, sym_mesh,
+                                             MF->kp_to_ibz(), MF->kp_trev(), G_CC);
+    kmq = nda::array<long, 2>(nq_full, nk);
+    kpq = nda::array<long, 2>(nq_full, nk);
+    auto qmin = MF->qminus();
+    for (long iq = 0; iq < nq_full; ++iq)
+      for (long ik = 0; ik < nk; ++ik) {
+        kmq(iq, ik) = MF->qk_to_k2(iq, ik);
+        kpq(iq, ik) = MF->qk_to_k2(qmin(iq), ik);
+      }
+    symc = nullptr;
+    if (sym_mesh) {
+      build_sym_ctx(thc, _Xb_skma, _band_window.first(), _sym_secondary);
+      symc = &_sym_secondary.value();
+    }
+  }
+
+  /**
+   * Q3 I1: the resummed pair-space ladder (rungs >= 1) at ALL PH-sym POSITIVE bosonic
+   * half-grid nodes, (n_nu_half, nq_ibz, N_m, N_m) in this vertex's secondary aux basis.
+   * Same object, same guards and the same P2/P3 scheduling as eval_pol_ladder_nu0 -- only
+   * the nu list is wider (nu parallelism comes free from the group mode's jn % lsize).
+   *
+   * NODE MAP [verified against numerics/imag_axes_ft/IAFT.icc, NOT assumed]: both
+   * tau_to_w_PHsym (:65) and w_to_tau_PHsym (:121) address the full bosonic mesh as
+   * iw = nw_b/2 + j for half index j, so half index 0 IS the inu = 0 node
+   * eval_pol_ladder_nu0 pins as nw_b/2. Gates: ladder_whalf_gate's node_map_resid (this
+   * list against a full-mesh evaluation) and the Q3-b(i) loop-vs-readout identity.
+   *
+   * lam_max != nullptr additionally returns the per-node rho(Xh Kt) watchdog (I3).
+   * Replicated.
+   */
+  nda::array<ComplexType, 4>
+  vertex_t::eval_pol_ladder_whalf(MBState &mb_state, THC_ERI auto &thc,
+                                  nda::array<double, 1> *lam_max) {
+    utils::check(active() and secondary(),
+                 "vertex_t::eval_pol_ladder_whalf: requires an ACTIVE secondary-basis "
+                 "vertex (the readout instance).");
+    utils::check(not _wannier,
+                 "vertex_t::eval_pol_ladder_whalf: window mode only (ruling R-Q3-2).");
+    utils::check(_W0b_qmm.has_value(),
+                 "vertex_t::eval_pol_ladder_whalf: W0bar is absent -- build_w0 must run "
+                 "first (same iteration).");
+    auto MF = thc.MF();
+    auto mpi = thc.mpi();
+    nda::array<ComplexType, 5> G_CC;
+    nda::array<long, 2> kmq, kpq;
+    vertex_sym::sym_ctx const *symc = nullptr;
+    ladder_inputs(mb_state, thc, G_CC, kmq, kpq, symc);
+
+    vertex_pi::iaft_tools tools(*_ft);
+    const long nw_b = tools.nw_b;
+    const long nw_half = (nw_b % 2 == 0) ? nw_b / 2 : nw_b / 2 + 1;
+    std::vector<long> nu_h(nw_half);
+    for (long j = 0; j < nw_half; ++j) nu_h[j] = nw_b / 2 + j;
+
+    const long nq_ext = MF->nqpts_ibz(), Nm = _Xb_skma.shape(2);
+    nda::array<ComplexType, 4> Pl(nw_half, nq_ext, Nm, Nm);
+    if (lam_max != nullptr) *lam_max = nda::array<double, 1>(nw_half);
+    // scheduling: the eval_pol_ladder_nu0 rule (node groups when internode > 1, else the
+    // P2 rank round-robin), unchanged -- with nnu > 1 the group mode also spreads nu.
+    if (mpi->internode_comm.size() > 1)
+      vertex_ladder_detail::pair_space_ladder(G_CC, _Xb_skma, _W0b_qmm.value(), kmq,
+                                              kpq, tools, nu_h, nullptr, &Pl,
+                                              mpi->internode_comm.rank(),
+                                              mpi->internode_comm.size(), symc,
+                                              std::addressof(mpi->node_comm), lam_max);
+    else
+      vertex_ladder_detail::pair_space_ladder(G_CC, _Xb_skma, _W0b_qmm.value(), kmq,
+                                              kpq, tools, nu_h, nullptr, &Pl,
+                                              mpi->comm.rank(), mpi->comm.size(), symc,
+                                              nullptr, lam_max);
+    mpi->comm.all_reduce_in_place_n(Pl.data(), Pl.size(), std::plus<>{});
+    if (lam_max != nullptr)
+      mpi->comm.all_reduce_in_place_n(lam_max->data(), lam_max->size(),
+                                      boost::mpi3::max<>{});
+    return Pl;
+  }
+
+  /**
+   * Q3 gates on the multi-nu evaluator (vertex_ladder.icc; spec section 5 Q3-c and the
+   * node-map pin of section 4 I1):
+   *  - node_map_resid: the PH-sym half-grid output against a FULL-mesh evaluation read at
+   *    nw_b/2 + j (the ladder_sym_gate all-node pattern). Same kernel, same scheduling =>
+   *    BITWISE 0 expected; a wrong half<->full map shows up as O(1).
+   *  - ph_sym_resid: |Pl(nw_b/2 - j) - Pl(nw_b/2 + j)| over the full mesh. The PH-sym
+   *    transforms ASSUME this symmetry; it is what makes the tau image of P^lad
+   *    well defined (measure-first: the number is the licence, not an assumption).
+   *  - lam_*: the I3 watchdog, plus the kernel-scaling linearity pin -- Xh Kt is LINEAR
+   *    in the rung, so scaling W0bar by c must scale rho by exactly c. That pins the
+   *    estimator onto the right matrix (a vacuous "the log line exists" gate would not).
+   */
+  vertex_t::ladder_whalf_diag vertex_t::ladder_whalf_gate(MBState &mb_state,
+                                                          THC_ERI auto &thc, double scale) {
+    ladder_whalf_diag out;
+    out.scale = scale;
+    auto mpi = thc.mpi();
+    utils::check(scale > 0.0, "vertex_t::ladder_whalf_gate: scale must be > 0.");
+
+    nda::array<double, 1> lam;
+    auto Ph = eval_pol_ladder_whalf(mb_state, thc, &lam);
+    const long nw_half = Ph.shape(0), nq_ext = Ph.shape(1), Nm = Ph.shape(2);
+    out.lam_nu0 = lam(0);
+    out.lam_max = 0.0;
+    for (long j = 0; j < nw_half; ++j) out.lam_max = std::max(out.lam_max, lam(j));
+
+    // the full-mesh reference (ladder_sym_gate's nu list)
+    nda::array<ComplexType, 5> G_CC;
+    nda::array<long, 2> kmq, kpq;
+    vertex_sym::sym_ctx const *symc = nullptr;
+    ladder_inputs(mb_state, thc, G_CC, kmq, kpq, symc);
+    vertex_pi::iaft_tools tools(*_ft);
+    const long nw_b = tools.nw_b, i0 = nw_b / 2;
+    std::vector<long> nu_all(nw_b);
+    for (long m = 0; m < nw_b; ++m) nu_all[m] = m;
+    nda::array<ComplexType, 4> Pf(nw_b, nq_ext, Nm, Nm);
+    vertex_ladder_detail::pair_space_ladder(G_CC, _Xb_skma, _W0b_qmm.value(), kmq, kpq,
+                                            tools, nu_all, nullptr, &Pf,
+                                            mpi->comm.rank(), mpi->comm.size(), symc);
+    mpi->comm.all_reduce_in_place_n(Pf.data(), Pf.size(), std::plus<>{});
+    double fmax = 0.0;
+    for (auto const &v : Pf) fmax = std::max(fmax, std::abs(v));
+    double dmap = 0.0, dsym = 0.0;
+    for (long j = 0; j < nw_half; ++j)
+      for (long iq = 0; iq < nq_ext; ++iq)
+        for (long M = 0; M < Nm; ++M)
+          for (long N = 0; N < Nm; ++N) {
+            dmap = std::max(dmap, std::abs(Ph(j, iq, M, N) - Pf(i0 + j, iq, M, N)));
+            if (i0 - j >= 0)
+              dsym = std::max(dsym, std::abs(Pf(i0 - j, iq, M, N) - Pf(i0 + j, iq, M, N)));
+          }
+    out.node_map_resid = dmap / std::max(fmax, 1e-300);
+    out.ph_sym_resid = dsym / std::max(fmax, 1e-300);
+    out.ladder_max = fmax;
+
+    // kernel-scaling linearity of the estimator (inu = 0 node only -- one solve)
+    {
+      nda::array<ComplexType, 3> W0s = _W0b_qmm.value();
+      W0s *= ComplexType(scale);
+      std::vector<long> nu0 = {i0};
+      nda::array<ComplexType, 4> Ps(1, nq_ext, Nm, Nm);
+      nda::array<double, 1> lam_s(1);
+      vertex_ladder_detail::pair_space_ladder(G_CC, _Xb_skma, W0s, kmq, kpq, tools, nu0,
+                                              nullptr, &Ps, mpi->comm.rank(),
+                                              mpi->comm.size(), symc, nullptr, &lam_s);
+      mpi->comm.all_reduce_in_place_n(lam_s.data(), lam_s.size(), boost::mpi3::max<>{});
+      out.lam_nu0_scaled = lam_s(0);
+    }
+
+    app_log(1, "  [qpGW Q3] ladder whalf gate: {} PH-sym half nodes of {}; node-map resid "
+               "= {:.3e}, PH-symmetry resid = {:.3e} (rel to max |Pi_ladder| = {:.3e}); "
+               "lambda_max(inu = 0) = {:.6f}, max over nu = {:.6f}; rung x {:.3g} => "
+               "lambda(inu = 0) = {:.6f} (ratio {:.6f})",
+            nw_half, nw_b, out.node_map_resid, out.ph_sym_resid, out.ladder_max,
+            out.lam_nu0, out.lam_max, scale, out.lam_nu0_scaled,
+            (out.lam_nu0 > 0.0) ? out.lam_nu0_scaled / out.lam_nu0 : 0.0);
     return out;
   }
 

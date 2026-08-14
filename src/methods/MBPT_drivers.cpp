@@ -265,6 +265,20 @@ inline void ensure_checkpoint(std::shared_ptr<mf::MF> mf, std::string const& out
  *                 the ladder's C-window and secondary-basis knobs. Each key ABSENT
  *                 inherits the corresponding vertex_* value, so a ladder run on top of
  *                 an existing vertex input needs only pol_vertex = "ladder".
+ *  - pol_vertex_inject: "none" In-loop INJECTION of the ladder polarization (Project 2
+ *                 increment Q3, notes/q3_bse_tier_spec.md; qpgw / evgw / gw solvers).
+ *                 {choices: "none", "ladder_n2"}. "none" leaves the ladder a report-only
+ *                 readout (increment L2), bit-identical to the pre-Q3 tree. "ladder_n2"
+ *                 screens with P_latt = P^RPA + P^lad, P^lad = the resummed static-rung
+ *                 electron-hole ladder (rungs >= 1 = eq 6's [.]_{n>=2}: the bare bubble
+ *                 is excluded by construction, NO subtraction is performed). The rung is
+ *                 W-bar_0 = [1 - v P^RPA]^-1 v at i.nu = 0 from the SAME iteration
+ *                 (ruling R-Q3-1). Auto-enables pol_vertex = "ladder"; excludes an
+ *                 ACTIVE vertex_type (double counting); an empty ladder C-window is an
+ *                 exact no-op. The run logs ||P^lad||/||P^RPA||, its per-q breakdown,
+ *                 the nu -> tau -> nu round trip r_rt, and the resolvent margin
+ *                 lambda_max = rho(chi0 Xi) -- which ABORTS at 1 (particle-hole
+ *                 instability) and warns above 0.9.
  */
 template<typename eri_t>
 void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
@@ -435,6 +449,10 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     auto cvv_rspace_tol = io::get_value_with_default<double>(pt,"cvv_rspace_tol",1e-6);
     auto pol_vertex = io::get_value_with_default<std::string>(pt,"pol_vertex","none");
     io::tolower(pol_vertex);
+    // Project 2 increment Q3 (notes/q3_bse_tier_spec.md, ruling R-Q3-3): in-loop INJECTION
+    // of the ladder into P. Auto-enables pol_vertex = "ladder" (logged in the setter).
+    auto pol_vertex_inject = io::get_value_with_default<std::string>(pt,"pol_vertex_inject","none");
+    io::tolower(pol_vertex_inject);
     auto pol_vertex_kernel = io::get_value_with_default<std::string>(pt,"pol_vertex_kernel","w0_prev");
     io::tolower(pol_vertex_kernel);
     auto pol_vertex_band_window = io::get_value_with_default<nda::range>(pt,"pol_vertex_band_window",vertex_band_window);
@@ -473,7 +491,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     vertex.set_pol_vertex(pol_vertex, pol_vertex_kernel, pol_vertex_band_window,
                           pol_vertex_isdf_rank, pol_vertex_isdf_svd_tol,
                           pol_vertex_isdf_thresh, pol_vertex_isdf_cond_max,
-                          pol_vertex_isdf_distr_tol);
+                          pol_vertex_isdf_distr_tol, pol_vertex_inject);
     scr_eri.set_cvv_rspace_tol(cvv_rspace_tol);
     if (vertex.enabled()) {
       utils::check(screen_type == "rpa" or screen_type == "rpa_k",
@@ -663,6 +681,28 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     utils::check(qp_params.qp_modea_wunion < 1.0,
                  "evgw: qp_modea_wunion must be < 1 (< 0 disables the union-subspace "
                  "restructure, 0 takes qp_modea_wrank).");
+    // Project 2 increment Q3 (notes/q3_bse_tier_spec.md I4): the BSE (ladder) polarization
+    // tier. The [evgw] driver attaches no Sigma-side vertex, so vertex_t below is a pure
+    // KNOB CARRIER (vertex_type = "none") -- the pol-vertex-only attachment pattern of the
+    // [gw] block. The pol_vertex_* keys keep that block's "inherit vertex_*" default rule.
+    auto pol_vertex = io::get_value_with_default<std::string>(pt,"pol_vertex","none");
+    io::tolower(pol_vertex);
+    auto pol_vertex_inject = io::get_value_with_default<std::string>(pt,"pol_vertex_inject","none");
+    io::tolower(pol_vertex_inject);
+    auto pol_vertex_kernel = io::get_value_with_default<std::string>(pt,"pol_vertex_kernel","w0_prev");
+    io::tolower(pol_vertex_kernel);
+    auto pol_vertex_band_window = io::get_value_with_default<nda::range>(pt,"pol_vertex_band_window",
+        io::get_value_with_default<nda::range>(pt,"vertex_band_window",nda::range(0,0)));
+    auto pol_vertex_isdf_rank = io::get_value_with_default<long>(pt,"pol_vertex_isdf_rank",
+        io::get_value_with_default<long>(pt,"vertex_isdf_rank",-1));
+    auto pol_vertex_isdf_svd_tol = io::get_value_with_default<double>(pt,"pol_vertex_isdf_svd_tol",
+        io::get_value_with_default<double>(pt,"vertex_isdf_svd_tol",1e-8));
+    auto pol_vertex_isdf_thresh = io::get_value_with_default<double>(pt,"pol_vertex_isdf_thresh",
+        io::get_value_with_default<double>(pt,"vertex_isdf_thresh",-1.0));
+    auto pol_vertex_isdf_cond_max = io::get_value_with_default<double>(pt,"pol_vertex_isdf_cond_max",
+        io::get_value_with_default<double>(pt,"vertex_isdf_cond_max",-1.0));
+    auto pol_vertex_isdf_distr_tol = io::get_value_with_default<double>(pt,"pol_vertex_isdf_distr_tol",
+        io::get_value_with_default<double>(pt,"vertex_isdf_distr_tol",-1.0));
     if (io::get_value_with_default<bool>(pt,"iter_alg.enable", true)) {
       iter_solver = std::make_unique<iter_scf::iter_scf_t>(iter_scf::make_iter_scf(pt, 0.7, true));
     } else {
@@ -670,6 +710,14 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     }
     solvers::scr_coulomb_t scr_eri(&ft, "rpa", div_treatment);
     solvers::gw_t gw(&ft, div_treatment, output);
+    // Q3: the knob carrier MUST outlive qp_scf_loop -- same stack frame as scr_eri.
+    solvers::vertex_t pol_vertex_carrier(&ft, "none", nda::range(0,0), mf->nbnd(),
+                                         div_treatment);
+    pol_vertex_carrier.set_pol_vertex(pol_vertex, pol_vertex_kernel, pol_vertex_band_window,
+                                      pol_vertex_isdf_rank, pol_vertex_isdf_svd_tol,
+                                      pol_vertex_isdf_thresh, pol_vertex_isdf_cond_max,
+                                      pol_vertex_isdf_distr_tol, pol_vertex_inject);
+    if (pol_vertex_carrier.pol_vertex_enabled()) scr_eri.set_vertex(&pol_vertex_carrier);
     MBState mb_state(mpi, ft, output);
     qp_scf_loop(mb_state, eri, ft, qp_params, mb_solver_t(&hf,&gw,&scr_eri), iter_solver.get(),
                 niter, restart, conv_thr);
@@ -730,6 +778,28 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     utils::check(qp_params.qp_modea_wunion < 1.0,
                  "qpgw: qp_modea_wunion must be < 1 (< 0 disables the union-subspace "
                  "restructure, 0 takes qp_modea_wrank).");
+    // Project 2 increment Q3 (notes/q3_bse_tier_spec.md I4): the BSE (ladder) polarization
+    // tier. The [qpgw] driver attaches no Sigma-side vertex, so vertex_t below is a pure
+    // KNOB CARRIER (vertex_type = "none") -- the pol-vertex-only attachment pattern of the
+    // [gw] block. The pol_vertex_* keys keep that block's "inherit vertex_*" default rule.
+    auto pol_vertex = io::get_value_with_default<std::string>(pt,"pol_vertex","none");
+    io::tolower(pol_vertex);
+    auto pol_vertex_inject = io::get_value_with_default<std::string>(pt,"pol_vertex_inject","none");
+    io::tolower(pol_vertex_inject);
+    auto pol_vertex_kernel = io::get_value_with_default<std::string>(pt,"pol_vertex_kernel","w0_prev");
+    io::tolower(pol_vertex_kernel);
+    auto pol_vertex_band_window = io::get_value_with_default<nda::range>(pt,"pol_vertex_band_window",
+        io::get_value_with_default<nda::range>(pt,"vertex_band_window",nda::range(0,0)));
+    auto pol_vertex_isdf_rank = io::get_value_with_default<long>(pt,"pol_vertex_isdf_rank",
+        io::get_value_with_default<long>(pt,"vertex_isdf_rank",-1));
+    auto pol_vertex_isdf_svd_tol = io::get_value_with_default<double>(pt,"pol_vertex_isdf_svd_tol",
+        io::get_value_with_default<double>(pt,"vertex_isdf_svd_tol",1e-8));
+    auto pol_vertex_isdf_thresh = io::get_value_with_default<double>(pt,"pol_vertex_isdf_thresh",
+        io::get_value_with_default<double>(pt,"vertex_isdf_thresh",-1.0));
+    auto pol_vertex_isdf_cond_max = io::get_value_with_default<double>(pt,"pol_vertex_isdf_cond_max",
+        io::get_value_with_default<double>(pt,"vertex_isdf_cond_max",-1.0));
+    auto pol_vertex_isdf_distr_tol = io::get_value_with_default<double>(pt,"pol_vertex_isdf_distr_tol",
+        io::get_value_with_default<double>(pt,"vertex_isdf_distr_tol",-1.0));
     if (io::get_value_with_default<bool>(pt,"iter_alg.enable", true)) {
       iter_solver = std::make_unique<iter_scf::iter_scf_t>(iter_scf::make_iter_scf(pt));
     } else {
@@ -737,6 +807,14 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     }
     solvers::scr_coulomb_t scr_eri(&ft, "rpa", div_treatment);
     solvers::gw_t gw(&ft, div_treatment, output);
+    // Q3: the knob carrier MUST outlive qp_scf_loop -- same stack frame as scr_eri.
+    solvers::vertex_t pol_vertex_carrier(&ft, "none", nda::range(0,0), mf->nbnd(),
+                                         div_treatment);
+    pol_vertex_carrier.set_pol_vertex(pol_vertex, pol_vertex_kernel, pol_vertex_band_window,
+                                      pol_vertex_isdf_rank, pol_vertex_isdf_svd_tol,
+                                      pol_vertex_isdf_thresh, pol_vertex_isdf_cond_max,
+                                      pol_vertex_isdf_distr_tol, pol_vertex_inject);
+    if (pol_vertex_carrier.pol_vertex_enabled()) scr_eri.set_vertex(&pol_vertex_carrier);
     MBState mb_state(mpi, ft, output);
     qp_scf_loop(mb_state, eri, ft, qp_params, mb_solver_t(&hf,&gw,&scr_eri), iter_solver.get(),
                 niter, restart, conv_thr);
@@ -901,6 +979,10 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
     auto cvv_rspace_tol = io::get_value_with_default<double>(pt,"cvv_rspace_tol",1e-6);
     auto pol_vertex = io::get_value_with_default<std::string>(pt,"pol_vertex","none");
     io::tolower(pol_vertex);
+    // Project 2 increment Q3 (notes/q3_bse_tier_spec.md, ruling R-Q3-3): in-loop INJECTION
+    // of the ladder into P. Auto-enables pol_vertex = "ladder" (logged in the setter).
+    auto pol_vertex_inject = io::get_value_with_default<std::string>(pt,"pol_vertex_inject","none");
+    io::tolower(pol_vertex_inject);
     auto pol_vertex_kernel = io::get_value_with_default<std::string>(pt,"pol_vertex_kernel","w0_prev");
     io::tolower(pol_vertex_kernel);
     auto pol_vertex_band_window = io::get_value_with_default<nda::range>(pt,"pol_vertex_band_window",vertex_band_window);
@@ -939,7 +1021,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
     vertex.set_pol_vertex(pol_vertex, pol_vertex_kernel, pol_vertex_band_window,
                           pol_vertex_isdf_rank, pol_vertex_isdf_svd_tol,
                           pol_vertex_isdf_thresh, pol_vertex_isdf_cond_max,
-                          pol_vertex_isdf_distr_tol);
+                          pol_vertex_isdf_distr_tol, pol_vertex_inject);
     scr_eri.set_cvv_rspace_tol(cvv_rspace_tol);
     if (vertex.enabled()) {
       utils::check(screen_type == "rpa" or screen_type == "rpa_k",

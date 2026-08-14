@@ -4746,5 +4746,11 @@ namespace solvers {
   template vertex_t::ladder_sym_diag vertex_t::ladder_sym_gate(MBState&, thc_reader_t&);
   template vertex_t::ladder_p3_diag vertex_t::ladder_p3_gate(MBState&, thc_reader_t&);
 
+  // qpGW Q3 (notes/q3_bse_tier_spec.md increment I1)
+  template nda::array<ComplexType, 4>
+  vertex_t::eval_pol_ladder_whalf(MBState&, thc_reader_t&, nda::array<double, 1>*);
+  template vertex_t::ladder_whalf_diag
+  vertex_t::ladder_whalf_gate(MBState&, thc_reader_t&, double);
+
 }  // solvers
 }  // methods

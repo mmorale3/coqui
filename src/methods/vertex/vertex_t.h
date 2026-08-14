@@ -799,6 +799,11 @@ namespace solvers {
     // Phi-derivability of the production loop is surrendered by construction (user
     // ruling 2026-08-10). "none" (default) = inert, bit-identical to the pre-scgwt tree.
     std::string _pol_vertex = "none";
+    // Q3 (notes/q3_bse_tier_spec.md, ruling R-Q3-3): in-loop INJECTION of the ladder into
+    // P. "none" (default) = the L2 report-only readout, bit-identical to the pre-Q3 tree;
+    // "ladder_n2" = P_latt = P^RPA + P^lad with P^lad the resummed ladder (rungs >= 1 =
+    // eq 6's [.]_{n>=2}, no subtraction). Auto-enables pol_vertex = "ladder".
+    std::string _pol_vertex_inject = "none";
     // ladder kernel source (ruling R4): "w0_prev" = W-bar_0 from the previous iteration's
     // W (matches the static-rung convention); "w0_frozen" = RPA@KS W_0 (scGW_0-flavored).
     std::string _pol_kernel = "w0_prev";
@@ -1015,6 +1020,14 @@ namespace solvers {
                        long C0_global,
                        std::optional<vertex_sym::sym_ctx> &slot,
                        nda::array<ComplexType, 4> const *U_skia = nullptr);
+
+    /** Q3 I1 (vertex_ladder.icc): the pair-space ladder's shared inputs -- full-BZ
+     *  C-window G, the transfer maps on the full mesh, and the secondary symmetry
+     *  context (nullptr on nosym meshes). Ensures the secondary basis. */
+    void ladder_inputs(MBState &mb_state, THC_ERI auto &thc,
+                       nda::array<ComplexType, 5> &G_CC,
+                       nda::array<long, 2> &kmq, nda::array<long, 2> &kpq,
+                       vertex_sym::sym_ctx const *&symc);
 
     /**
      * Build the secondary ISDF basis and the per-q Option-A transfer maps
@@ -1276,13 +1289,26 @@ namespace solvers {
      */
     void set_pol_vertex(std::string mode, std::string kernel, nda::range band_window,
                         long isdf_rank, double isdf_svd_tol, double isdf_thresh,
-                        double isdf_cond_max, double isdf_distr_tol) {
+                        double isdf_cond_max, double isdf_distr_tol,
+                        std::string inject = "none") {
       utils::check(mode == "none" or mode == "ladder",
                    "vertex_t::set_pol_vertex: unknown pol_vertex \"{}\". Valid options "
                    "are \"none\", \"ladder\".", mode);
       utils::check(kernel == "w0_prev" or kernel == "w0_frozen",
                    "vertex_t::set_pol_vertex: unknown pol_vertex_kernel \"{}\". Valid "
                    "options are \"w0_prev\" (default; ruling R4), \"w0_frozen\".", kernel);
+      utils::check(inject == "none" or inject == "ladder_n2",
+                   "vertex_t::set_pol_vertex: unknown pol_vertex_inject \"{}\". Valid "
+                   "options are \"none\" (default), \"ladder_n2\".", inject);
+      _pol_vertex_inject = inject;
+      // R-Q3-3: injection IMPLIES the ladder machinery, so it auto-enables it rather than
+      // failing on a half-specified input. Logged -- a knob that changes the theory must
+      // never turn itself on silently.
+      if (inject != "none" and mode == "none") {
+        mode = "ladder";
+        app_log(1, "  [qpGW Q3] pol_vertex_inject = \"{}\" auto-enables pol_vertex = "
+                   "\"ladder\".", inject);
+      }
       _pol_vertex = mode;
       _pol_kernel = kernel;
       _pol_band_window = band_window;
@@ -1314,15 +1340,28 @@ namespace solvers {
                    "(iaft basis = \"dlr\").");
       // LIVE since increment L2 as a READOUT (stance i): scr_coulomb_t::update_w runs
       // the pair-space ladder on its private readout vertex and reports the
-      // ladder-corrected eps_M each iteration; the loop is untouched (nothing is
-      // injected into P -- that is increment L3, gated on ruling R1).
+      // ladder-corrected eps_M each iteration. Without pol_vertex_inject the loop is
+      // untouched (report-only); with it, the Q3 line below states the actual regime.
       app_log(1, "  [scGW-tilde] pol_vertex = \"ladder\" READOUT active: C window = "
-                 "[{}, {}), kernel = {} (L2, stance i -- report-only; in-loop injection "
-                 "is L3/R1).", _pol_band_window.first(), _pol_band_window.last(),
-              _pol_kernel);
+                 "[{}, {}), kernel = {}{}", _pol_band_window.first(),
+              _pol_band_window.last(), _pol_kernel,
+              pol_vertex_inject_enabled()
+                  ? " (L2 readout + the Q3 injection below)."
+                  : " (L2, stance i -- report-only; in-loop injection is off,"
+                    " knob pol_vertex_inject).");
+      if (pol_vertex_inject_enabled())
+        app_log(1, "  [qpGW Q3] pol_vertex_inject = \"{}\": the resummed ladder IS "
+                   "injected into P (P_latt = P^RPA + P^lad, eq 6 of "
+                   "notes/qpgw_bse_edmft_option2.pdf; rung = W-bar_0[RPA] at inu = 0, "
+                   "ruling R-Q3-1). The loop is no longer plain RPA-screened.",
+                _pol_vertex_inject);
     }
     // scGW-tilde ladder requested in the input ([gw] pol_vertex)
     bool pol_vertex_enabled() const { return _pol_vertex != "none"; }
+    // Q3: in-loop ladder injection requested (R-Q3-3). Injection additionally requires
+    // pol_vertex_active() (non-empty C window) -- empty window = structural no-op.
+    bool pol_vertex_inject_enabled() const { return _pol_vertex_inject != "none"; }
+    std::string pol_vertex_inject() const { return _pol_vertex_inject; }
     // requested AND the ladder C-window is non-empty (C = empty = exact no-op)
     bool pol_vertex_active() const {
       return pol_vertex_enabled() and _pol_band_window.size() > 0;
@@ -1346,6 +1385,29 @@ namespace solvers {
      * secondary vertex with W0bar built (build_w0 this iteration). Replicated.
      */
     nda::array<ComplexType, 3> eval_pol_ladder_nu0(MBState &mb_state, THC_ERI auto &thc);
+
+    /**
+     * Q3 increment I1 (notes/q3_bse_tier_spec.md section 4): the same resummed ladder at
+     * ALL PH-sym POSITIVE bosonic half-grid nodes, (n_nu_half, nq_ibz, N_m, N_m). Half
+     * index j is the full-mesh node nw_b/2 + j (verified against IAFT.icc's PH-sym
+     * transforms; j = 0 is the inu = 0 node of eval_pol_ladder_nu0). lam_max, when given,
+     * is RESIZED to n_nu_half and filled with the per-node rho(Xh Kt) watchdog (I3).
+     * Replicated; same guards as eval_pol_ladder_nu0.
+     */
+    nda::array<ComplexType, 4> eval_pol_ladder_whalf(MBState &mb_state, THC_ERI auto &thc,
+                                                     nda::array<double, 1> *lam_max = nullptr);
+
+    /** Q3 gates on the multi-nu evaluator (vertex_ladder.icc; spec section 5 Q3-c). */
+    struct ladder_whalf_diag {
+      double node_map_resid = -1.0;   // half-grid output vs the full mesh at nw_b/2 + j
+      double ph_sym_resid = -1.0;     // |Pi_ladder(-nu) - Pi_ladder(+nu)| (transform licence)
+      double ladder_max = 0.0;        // max |Pi_ladder| over the full mesh
+      double lam_nu0 = -1.0, lam_max = -1.0;   // the I3 watchdog
+      double lam_nu0_scaled = -1.0;   // ... with the rung scaled by `scale`
+      double scale = 1.0;
+    };
+    ladder_whalf_diag ladder_whalf_gate(MBState &mb_state, THC_ERI auto &thc,
+                                        double scale = 2.0);
 
     /** P4 gate diagnostics (vertex_ladder.icc / the parallel-memory design note). */
     struct ladder_p4_diag {

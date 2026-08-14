@@ -177,6 +177,14 @@ namespace solvers {
       Pi0_qPQ = gather_nu0_row(dPi_tqPQ);
     }
 
+    // qpGW Q3 (notes/q3_bse_tier_spec.md, ruling R-Q3-3): the BSE tier. The ORDER above
+    // and here is the contract, not an accident -- build_w0 and the readout baseline must
+    // see the PURE RPA Pi (the rung is W-bar_0[P^RPA], R-Q3-1), and the injection lands
+    // AFTER both and BEFORE the Dyson, so W is the ladder-corrected one and every
+    // downstream consumer (eps_inv_head, mb_state.dW_qtPQ, the QM3 map) is untouched.
+    if (pol_readout and _vertex->pol_vertex_inject_enabled())
+      inject_pol_ladder(mb_state, thc, dPi_tqPQ);
+
     // evaluate screened interaction (dW_tqPQ) and reset polarizability (dPi_tqPQ)
     // a) dPi_tqPQ is reset during dyson_W_from_Pi_tau()
     // b) pgrid and bsize of dW_tqPQ are forced to be the same as in dPi_tqPQ
@@ -216,8 +224,11 @@ namespace solvers {
               eps_inf, eps_inv_static.real(), eps_inv_static.imag());
     }
 
-    // scGW-tilde L2: the ladder eps_M readout (report-only; see pol_ladder_eps_readout)
-    if (pol_readout) pol_ladder_eps_readout(mb_state, thc, Pi0_qPQ);
+    // scGW-tilde L2: the ladder eps_M readout (report-only; see pol_ladder_eps_readout).
+    // Q3: eps_inv_head_q carries the loop's OWN q-resolved head, so the readout also
+    // reports the loop-side eps_M(q_min) -- the second route of gate Q3-b(i).
+    if (pol_readout)
+      pol_ladder_eps_readout(mb_state, thc, Pi0_qPQ, std::addressof(eps_inv_head_q));
 
     // make routine to transposed distributed arrays over any 2 indices, so should
     // be easy to template to an array type and to indexes, and replace repeated code
@@ -361,6 +372,156 @@ namespace solvers {
   }
 
   /**
+   * qpGW Q3 increment I2 (notes/q3_bse_tier_spec.md section 4): the BSE tier injection.
+   *
+   *   P_latt(q, i.nu) = P^RPA(q, i.nu) + P^lad(q, i.nu),   P^lad = eq 6's [.]_{n >= 2}
+   *
+   * The implemented pair-space ladder resums rungs >= 1, i.e. chi0-FACTOR counts >= 2, so
+   * it IS eq 6's object as-is: only the bare bubble is excluded, and it never enters the
+   * kernel. NO subtraction is performed anywhere (spec section 1; plan section 5 item 1).
+   *
+   * MEMORY: the ladder lives in the secondary aux basis, (n_nu_half, nq, N_m, N_m)
+   * replicated. It is upfolded to the primary basis and transformed to tau ON THE LOCAL
+   * (P, Q) BLOCK ONLY -- the replicated (nu | t, q, Np, Np) object is O(10 TB) at
+   * production scale and is never formed. Per-rank cost is the class of the local dPi
+   * block itself.
+   *
+   * The three logged meters are the acceptance instruments, not decoration:
+   *   - ||P^lad||_max / ||P^RPA||_max (+ the per-q breakdown, the add_vertex_Pi_C
+   *     precedent): a correction comparable to what it corrects means the tier is out of
+   *     its regime, and eps = I - Z.P is then at risk of losing positivity;
+   *   - lambda_max = rho(Xh Kt) (I3, PDF section 8.2): the resolvent's margin to the
+   *     particle-hole instability at 1;
+   *   - r_rt: the nu -> tau -> nu round trip of P^lad through the IAFT PH-sym pair. The
+   *     injection ASSUMES P^lad is PH-symmetric and representable on this grid; r_rt is
+   *     that assumption's meter, measured every update_w (lesson QM2-b: never silently
+   *     trust a transform at a new evaluation point). It is a NU-space round trip, not a
+   *     tau-space fit error (which must never be gated on).
+   */
+  template<nda::MemoryArrayOfRank<4> Array_t, typename communicator_t>
+  void scr_coulomb_t::inject_pol_ladder(MBState &mb_state, THC_ERI auto &thc,
+                                        memory::darray_t<Array_t, communicator_t> &dPi_tqPQ) {
+    decltype(nda::range::all) all;
+    utils::check(_pol_vtx != nullptr,
+                 "inject_pol_ladder: the ladder instance is absent (ensure_pol_vertex).");
+    utils::check(_vertex != nullptr and not _vertex->active(),
+                 "inject_pol_ladder: an ACTIVE vertex_type injects its own Pi^C -- the "
+                 "combination double counts (ruling R-Q3-3).");
+    auto [nt_h, nq_g, Np, NQ_g] = dPi_tqPQ.global_shape();
+
+    nda::array<double, 1> lam;
+    auto Pl = _pol_vtx->eval_pol_ladder_whalf(mb_state, thc, &lam);  // (nw_h, nq, Nm, Nm)
+    auto const &tmap = _pol_vtx->secondary_transfer();               // (nq, Nm, Np)
+    const long nw_h = Pl.shape(0), Nm = Pl.shape(2);
+    utils::check(Pl.shape(1) == nq_g and tmap.shape(0) == nq_g and tmap.shape(1) == Nm
+                 and tmap.shape(2) == Np,
+                 "inject_pol_ladder: shape mismatch (ladder {}x{}x{}, t {}x{}x{}, Pi q = "
+                 "{}, Np = {}).", Pl.shape(0), Pl.shape(1), Nm, tmap.shape(0),
+                 tmap.shape(1), tmap.shape(2), nq_g, Np);
+
+    auto t_rng = dPi_tqPQ.local_range(0);
+    auto q_rng = dPi_tqPQ.local_range(1);
+    auto P_rng = dPi_tqPQ.local_range(2);
+    auto Q_rng = dPi_tqPQ.local_range(3);
+    const long ntl = long(t_rng.size()), nql = long(q_rng.size());
+    const long nPl = long(P_rng.size()), nQl = long(Q_rng.size());
+    auto Pi_loc = dPi_tqPQ.local();
+
+    // ||P^RPA||_max BEFORE the +=, on the same grid (the comparison the ratio reports)
+    double nR = 0.0;
+    for (auto const &v : Pi_loc) nR = std::max(nR, std::abs(v));
+
+    nda::array<ComplexType, 3> A(nw_h, nPl, nQl), B(nt_h, nPl, nQl);
+    nda::array<ComplexType, 2> tq_Q(Nm, nQl), td_P(nPl, Nm), tmp(Nm, nQl);
+    double nC = 0.0;
+    std::vector<double> qmax(size_t(nq_g), 0.0);
+    // a rank with an empty local block still joins the reductions below
+    const long nq_own = (nPl > 0 and nQl > 0 and ntl > 0) ? nql : 0;
+    for (long iql = 0; iql < nq_own; ++iql) {
+      const long iq = q_rng.first() + iql;
+      auto tq = tmap(iq, all, all);
+      for (long m = 0; m < Nm; ++m) {
+        for (long j = 0; j < nQl; ++j) tq_Q(m, j) = tq(m, Q_rng.first() + j);
+        for (long i = 0; i < nPl; ++i) td_P(i, m) = std::conj(tq(m, P_rng.first() + i));
+      }
+      // upfold ONLY the local block: dP(P, Q) = sum_MN conj(t_MP) Pl_MN t_NQ (the
+      // adjoint/no-leak map -- two thin gemms, never the full Np x Np)
+      for (long j = 0; j < nw_h; ++j) {
+        nda::blas::gemm(Pl(j, iq, all, all), tq_Q, tmp);
+        nda::blas::gemm(td_P, tmp, A(j, all, all));
+      }
+      // nu -> tau on the flattened local block through the PUBLIC PH-sym transform
+      auto A2 = nda::reshape(A, shape_t<2>{nw_h, nPl * nQl});
+      auto B2 = nda::reshape(B, shape_t<2>{nt_h, nPl * nQl});
+      _ft->w_to_tau_PHsym(A2, B2);
+      for (long it = 0; it < ntl; ++it)
+        for (long i = 0; i < nPl; ++i)
+          for (long j = 0; j < nQl; ++j) {
+            const ComplexType v = B(t_rng.first() + it, i, j);
+            const double a = std::abs(v);
+            nC = std::max(nC, a);
+            qmax[size_t(iq)] = std::max(qmax[size_t(iq)], a);
+            Pi_loc(it, iql, i, j) += v;
+          }
+    }
+    auto &comm = *dPi_tqPQ.communicator();
+    nC = comm.all_reduce_value(nC, boost::mpi3::max<>{});
+    nR = comm.all_reduce_value(nR, boost::mpi3::max<>{});
+    comm.all_reduce_in_place_n(qmax.data(), qmax.size(), boost::mpi3::max<>{});
+    _pol_lad_ratio = nC / std::max(nR, 1e-300);
+
+    // r_rt on a sampled q (Gamma + the last IBZ transfer): replicated N_m-class algebra
+    {
+      nda::array<ComplexType, 3> R(nw_h, Nm, Nm), S(nt_h, Nm, Nm);
+      double num = 0.0, den = 0.0;
+      for (long iq : {0l, nq_g - 1}) {
+        R = Pl(all, iq, all, all);
+        auto R2 = nda::reshape(R, shape_t<2>{nw_h, Nm * Nm});
+        auto S2 = nda::reshape(S, shape_t<2>{nt_h, Nm * Nm});
+        _ft->w_to_tau_PHsym(R2, S2);
+        _ft->tau_to_w_PHsym(S2, R2);
+        for (long j = 0; j < nw_h; ++j)
+          for (long M = 0; M < Nm; ++M)
+            for (long N = 0; N < Nm; ++N) {
+              num += std::norm(R(j, M, N) - Pl(j, iq, M, N));
+              den += std::norm(Pl(j, iq, M, N));
+            }
+        if (nq_g == 1) break;
+      }
+      _pol_r_rt = std::sqrt(num / std::max(den, 1e-300));
+    }
+
+    _pol_lam_nu0 = lam(0);
+    _pol_lam_max = 0.0;
+    for (long j = 0; j < nw_h; ++j) _pol_lam_max = std::max(_pol_lam_max, lam(j));
+
+    app_log(1, "  [qpGW Q3] ladder injected into P ({} PH-sym nu nodes, N_m = {}): "
+               "||P^lad||_max = {:.4e} vs ||P^RPA||_max = {:.4e} (ratio {:.3e}); "
+               "transform round trip r_rt = {:.3e}",
+            nw_h, Nm, nC, nR, _pol_lad_ratio, _pol_r_rt);
+    {
+      std::ostringstream oss;
+      oss << std::scientific << std::setprecision(2);
+      for (long q = 0; q < nq_g; ++q) oss << (q ? " " : "") << qmax[size_t(q)];
+      app_log(1, "  [qpGW Q3] ||P^lad||_max by transfer q (q=0 is Gamma): {}", oss.str());
+    }
+    app_log(1, "  [qpGW Q3] ladder resolvent margin: lambda_max(inu = 0) = {:.6f}, "
+               "max over nu = {:.6f}{}", _pol_lam_nu0, _pol_lam_max,
+            (_pol_lam_max > 0.9) ? "   [WARNING: approaching the particle-hole "
+                                   "instability -- the resolvent is losing margin]" : "");
+    utils::check(std::isfinite(_pol_lam_max) and _pol_lam_max < 1.0,
+                 "inject_pol_ladder: the ladder kernel's spectral radius rho(Xh Kt) = {} "
+                 "has reached 1 -- eq 6's resolvent (1 - chi0 Xi)^-1 is singular "
+                 "(particle-hole instability). The BSE tier is outside its regime here; "
+                 "reduce the ladder C window.", _pol_lam_max);
+    if (nC > nR)
+      app_log(1, "  [WARNING] the ladder polarization EXCEEDS the RPA polarization it "
+                 "corrects.\n"
+                 "            Expect eps = I - Z.P to lose conditioning (see the "
+                 "dielectric conditioning below).");
+  }
+
+  /**
    * scGW-tilde L2, the ladder eps_M readout (stance i -- report-only, PDF section 4.2
    * placement (i)): per q at inu = 0,
    *   dP_ladder(q) = t(q)^dag Pi_ladder(q) t(q)          (upfold, adjoint-t/no-leak),
@@ -372,7 +533,8 @@ namespace solvers {
    * ladder correction). Replicated Np x Np algebra: readout-scale only.
    */
   void scr_coulomb_t::pol_ladder_eps_readout(MBState &mb_state, THC_ERI auto &thc,
-                                             nda::array<ComplexType, 3> const &Pi0_qPQ) {
+                                             nda::array<ComplexType, 3> const &Pi0_qPQ,
+                                             nda::array<ComplexType, 2> const *eps_inv_head_q) {
     decltype(nda::range::all) all;
     auto MF = thc.MF();
     const long nq = Pi0_qPQ.shape(0), Np = Pi0_qPQ.shape(1);
@@ -469,6 +631,25 @@ namespace solvers {
               eps_lad_qmin - eps_rpa_qmin);
       _pol_eps_rpa = eps_rpa_qmin;
       _pol_eps_ladder = eps_lad_qmin;
+    }
+    // Q3-b(i): the SAME q_min read off the loop's own screening. Same G, same kernel, two
+    // evaluation routes -- the tau-space Dyson of the (injected) Pi against the readout's
+    // single-frequency inu = 0 Dyson above. With the injection ON the two must agree to
+    // the transform class (r_rt); with it OFF this is the RPA leg of the same identity.
+    if (eps_inv_head_q != nullptr and iq_min >= 0) {
+      const long nt_h = eps_inv_head_q->shape(0);
+      utils::check(eps_inv_head_q->shape(1) == nq,
+                   "pol_ladder_eps_readout: eps_inv_head_q has {} q rows, expected {}.",
+                   eps_inv_head_q->shape(1), nq);
+      long nw_half = (_ft->nw_b() % 2 == 0) ? _ft->nw_b() / 2 : _ft->nw_b() / 2 + 1;
+      nda::array<ComplexType, 2> et(nt_h, 1), ew(nw_half, 1);
+      for (long it = 0; it < nt_h; ++it) et(it, 0) = (*eps_inv_head_q)(it, iq_min);
+      _ft->tau_to_w_PHsym(et, ew);            // inu = 0 = index 0 of the PH-sym half grid
+      _pol_eps_loop = 1.0 / (1.0 + ew(0, 0).real());
+      app_log(1, "  [qpGW Q3] loop-side eps_M(q_min = {}, inu = 0) from the tau Dyson = "
+                 "{:.9f}; readout route (+ladder) = {:.9f} (deviation = {:.3e})",
+              iq_min, _pol_eps_loop, eps_lad_qmin,
+              std::abs(_pol_eps_loop - eps_lad_qmin));
     }
   }
 
