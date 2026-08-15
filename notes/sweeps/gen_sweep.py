@@ -20,6 +20,12 @@ FIXTURES = {
     # rusty production saves (ONCV NC, 256 bands stored, capped at read time)
     "prod222": ("/mnt/ceph/users/mmorales/ISDF_metric/runs/mf_saves/nscf_kp222_nbnd256_nosym/out", "si", 60, 60),
     "prod444": ("/mnt/ceph/users/mmorales/ISDF_metric/runs/mf_saves/nscf_kp444_nbnd256_nosym/out", "si", 60, 60),
+    "prod222_n250": ("/mnt/ceph/users/mmorales/ISDF_metric/runs/mf_saves/nscf_kp222_nbnd256_nosym/out", "si", 250, 250),
+    "prod444_n250": ("/mnt/ceph/users/mmorales/ISDF_metric/runs/mf_saves/nscf_kp444_nbnd256_nosym/out", "si", 250, 250),
+    # SrVO3 (cubic, ONCV SG15, ecutwfc 90 Ry, metallic; nosym saves generated
+    # in our workspace from the SVO_CaVO scf density)
+    "svo222": ("/mnt/ceph/users/mmorales/ISDF_metric/runs/svo_mf/nscf_222_nosym/OUT", "svo", 60, 0),
+    "svo444": ("/mnt/ceph/users/mmorales/ISDF_metric/runs/svo_mf/nscf_444_nosym/OUT", "svo", 60, 0),
 }
 
 # knob configurations: name -> dict of extra [interaction.thc] keys
@@ -131,7 +137,7 @@ def main():
         # references
         refs = [("thc_ref", TOML.format(outdir=outdir, prefix=prefix, nbnd_line=nbnd_line,
                                         nipts=C_REF * nbnd, extra=""))]
-        if f in ("ncpp", "prod222", "prod444"):
+        if f in ("ncpp", "prod222", "prod444", "prod222_n250", "prod444_n250", "svo222", "svo444"):
             refs.append(("chol_ref", CHOL_TOML.format(outdir=outdir, prefix=prefix,
                                                       nbnd_line=nbnd_line)))
         for name, toml in refs:

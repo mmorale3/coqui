@@ -73,3 +73,9 @@ Append-only. Newest at the bottom. Each entry: date, decision, why.
   makes weighted selection as cheap as unweighted) and maximize c_mu reduction
   scored on |dE_x|+|dE_RPA|. New plan item M4b; TOML surface will gain
   `isdf_weight_params` and additional `isdf_pair_weight` family names.
+- **2026-08-15 — Extended test matrix (user).** (i) Si production sweeps also at
+  nbnd = 250 (saves carry 256 bands). (ii) Second system: SrVO3 (interpreted
+  from "SiVO3"; examples in the SVO/CaVO project on ceph) — a correlated metal,
+  stressing the weight regularization and metallic screening. (iii) Hartree
+  errors are PRESENTED in all tables/figures (useful), while scheme
+  recommendations remain scored on E_x + E_RPA.
