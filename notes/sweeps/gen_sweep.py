@@ -18,8 +18,8 @@ FIXTURES = {
     "uspp": ("qe/si_kp222_uspp", "pwscf", 16, 0),
     "paw":  ("qe/si_kp222_paw",  "pwscf", 16, 0),
     # rusty production saves (ONCV NC, 256 bands stored, capped at read time)
-    "prod222": ("/mnt/ceph/users/mmorales/ISDF_metric/runs/mf_saves/nscf_kp222_nbnd256/out", "si", 60, 60),
-    "prod444": ("/mnt/ceph/users/mmorales/ISDF_metric/runs/mf_saves/nscf_kp444_nbnd256/out", "si", 60, 60),
+    "prod222": ("/mnt/ceph/users/mmorales/ISDF_metric/runs/mf_saves/nscf_kp222_nbnd256_nosym/out", "si", 60, 60),
+    "prod444": ("/mnt/ceph/users/mmorales/ISDF_metric/runs/mf_saves/nscf_kp444_nbnd256_nosym/out", "si", 60, 60),
 }
 
 # knob configurations: name -> dict of extra [interaction.thc] keys
