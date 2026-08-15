@@ -323,14 +323,46 @@ parameter & default & role \\
 \section{Results}
 \label{sec:results}
 
-\todo{Computational details: Si (diamond structure), $2\times2\times2$ and
-$4\times4\times4$ Monkhorst--Pack grids, norm-conserving, ultrasoft, and PAW
-pseudopotentials, plane-wave cutoffs, imaginary-time representation.
-Reference energies: Cholesky-decomposed integrals at threshold $10^{-10}$
-(norm-conserving) and THC self-convergence (ultrasoft, PAW). Error measures:
-$|\Delta E_H|$, $|\Delta E_x|$, $|\Delta E_{\mathrm{RPA}}|$ as functions of
-$\cmu$; tabulated $\cmu^{*}$; convergence with respect to $\alpha$, $s$,
-the metric truncation, and $N_L$; composition of the three schemes.}
+\subsection{Computational details}
+\label{sec:compdetails}
+
+We consider bulk silicon in the diamond structure, described by
+norm-conserving (ONCV), ultrasoft, and PAW pseudopotentials, with
+$\Gamma$-centered $2\times2\times2$ Monkhorst--Pack sampling for the
+pseudopotential comparison and symmetry-free $2\times2\times2$ and
+$4\times4\times4$ grids with 60 bands for the production scans
+\todo{cutoffs and remaining numerical parameters from the run inputs}.
+Correlation energies are evaluated within the RPA on the imaginary axis
+using a discrete Lehmann representation at inverse temperature
+$\beta = 1000$~Ha$^{-1}$. For the norm-conserving calculations, reference
+integrals are obtained from a Cholesky decomposition of the Coulomb tensor
+converged to a threshold of $10^{-10}$, evaluated through the identical
+energy pipeline; the ISDF representation at $\cmu = 20$ reproduces these
+reference energies to better than $3\times10^{-5}$~Ha in the exchange and
+$2\times10^{-6}$~Ha in the RPA correlation energy, validating both the
+factorization and the error measure. For the augmented pseudopotentials,
+where the Cholesky route is unavailable, the reference is the ISDF result
+at $\cmu = 20$. Errors are reported for the exact-exchange and RPA
+correlation energies; the Hartree energy, which is available directly from
+the density at negligible cost and need not be represented by the
+factorization, is monitored only as a consistency check. As the figure of
+merit we use $\cmu^{*}$, the smallest $\cmu$ at which a given error target
+is met, obtained by logarithmic interpolation of the error curves.
+
+\subsection{Selection schemes at fixed system size}
+\label{sec:results222}
+
+\todo{Insert final 2x2x2 comparison table/figure: baseline vs the three
+schemes and compositions; $\cmu^{*}$ table under both 1 mHa and 0.1 mHa
+targets; the optimized sigmoid result and its transfer behavior;
+$s$-dependence.}
+
+\subsection{Production-scale scans}
+\label{sec:results444}
+
+\todo{4x4x4, 60 bands: error curves for the winning configurations,
+composition, and recommended defaults; timing of the selection step
+(IpRerank timer) demonstrating the ~s x overhead claim.}
 
 \begin{figure}
   \centering
@@ -373,6 +405,56 @@ $W(\GG)$ in place of $v(\GG)$.}
 The Flatiron Institute is a division of the Simons Foundation.
 \end{acknowledgments}
 
-%\bibliography{isdf_metric}
+\begin{thebibliography}{99}
+% NOTE: all entries require verification against the originals before submission.
+
+\bibitem{LuYing2015}
+J.~Lu and L.~Ying,
+Compression of the electron repulsion integral tensor in tensor
+hypercontraction format with cubic scaling cost,
+J.~Comput.~Phys. \textbf{302}, 329 (2015).
+
+\bibitem{HuLinYang2017}
+W.~Hu, L.~Lin, and C.~Yang,
+Interpolative separable density fitting decomposition for accelerating
+hybrid density functional calculations with applications to defects in
+silicon,
+J.~Chem.~Theory Comput. \textbf{13}, 5420 (2017).
+
+\bibitem{Hohenstein2012}
+E.~G.~Hohenstein, R.~M.~Parrish, and T.~J.~Mart\'inez,
+Tensor hypercontraction density fitting. I. Quartic scaling second- and
+third-order M{\o}ller--Plesset perturbation theory,
+J.~Chem.~Phys. \textbf{137}, 044103 (2012).
+
+\bibitem{Parrish2012}
+R.~M.~Parrish, E.~G.~Hohenstein, T.~J.~Mart\'inez, and C.~D.~Sherrill,
+Tensor hypercontraction. II. Least-squares renormalization,
+J.~Chem.~Phys. \textbf{137}, 224106 (2012).
+
+\bibitem{Dong2018}
+K.~Dong, W.~Hu, and L.~Lin,
+Interpolative separable density fitting through centroidal Voronoi
+tessellation with applications to hybrid functional electronic structure
+calculations,
+J.~Chem.~Theory Comput. \textbf{14}, 1311 (2018).
+
+\bibitem{Matthews2020}
+D.~A.~Matthews,
+Improved grid optimization and fitting in least squares tensor
+hypercontraction,
+J.~Chem.~Theory Comput. \textbf{16}, 1382 (2020).
+
+\bibitem{Lee2021}
+J.~Lee, D.~W.~Berry, C.~Gidney, W.~J.~Huggins, J.~R.~McClean, N.~Wiebe,
+and R.~Babbush,
+Even more efficient quantum computations of chemistry through tensor
+hypercontraction,
+PRX Quantum \textbf{2}, 030305 (2021).
+
+\bibitem{CoQui}
+\todo{CoQui code reference (repository/paper), to be finalized.}
+
+\end{thebibliography}
 
 \end{document}
