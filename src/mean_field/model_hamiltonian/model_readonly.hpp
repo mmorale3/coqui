@@ -56,6 +56,8 @@ public:
 
   // accessor functions
   auto mpi() const { return sys.mpi; }
+  long nspin() const { return sys.nspin; }
+  long npol() const { return sys.npol; }
   long nbnd() const { return sys.nbnd; }
   long nbnd_aux() const { return sys.nbnd_aux; }
   decltype(auto) kpts() { return sys.bz().kpts(); }
@@ -68,11 +70,17 @@ public:
   auto const& bz() const { return sys.bz(); }
   // should not be called
   int fft_grid_size() const { _abort_("fft_grid_size"); return 0; }
+  int fft_grid_size_aug() const { _abort_("fft_grid_size_aug"); return 0; }
   int nnr() const { _abort_("nnr"); return 0; }
+  int nnr_aug() const { _abort_("nnr_aug"); return 0; }
   decltype(auto) lattice() const { _abort_("lattice"); return sys.latt(); }
   decltype(auto) recv() const { _abort_("recv"); return sys.recv(); }
   decltype(auto) fft_grid_dim() const {
     _abort_("fft_grid_dim");
+    return fft_mesh();
+  }
+  decltype(auto) fft_grid_dim_aug() const {
+    _abort_("fft_grid_dim_aug");
     return fft_mesh();
   }
   decltype(auto) wfc_truncated_grid() const {
@@ -128,19 +136,25 @@ public:
 
   template<typename... Args> void get_orbital_set(Args&&...) {  _abort_("get_orbital_set"); }
 
+  void setup_symmetry_rotations() {}
+
   template<typename... Args> decltype(auto) symmetry_rotation(Args&&...) const
   { 
     _abort_("symmetry_rotation");
     return std::make_tuple(false,  std::addressof(dmat.at(0)));
   }
 
-  void set_pseudopot([[maybe_unused]] std::shared_ptr<hamilt::pseudopot> const& psp_) 
-  { _abort_("set_pseudopot"); } 
-  std::shared_ptr<hamilt::pseudopot> get_pseudopot() 
-  {  
-    _abort_("get_pseudopot"); 
+  void set_pseudopot([[maybe_unused]] std::shared_ptr<hamilt::pseudopot> const& psp_)
+  { _abort_("set_pseudopot"); }
+  std::shared_ptr<hamilt::pseudopot> get_pseudopot()
+  {
+    _abort_("get_pseudopot");
     return std::shared_ptr<hamilt::pseudopot>{nullptr};
   }
+
+  // Model Hamiltonian has no pseudopotential; reported as pp_FILE_t so
+  // augmentation guards stay inactive here.
+  hamilt::pp_type_e pp_type() const { return hamilt::pp_FILE_t; }
 
   void close() {}
 

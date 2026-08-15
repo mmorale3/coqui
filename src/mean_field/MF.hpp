@@ -159,14 +159,25 @@ class MF
     { return std::visit( [&](auto&& v) { return v.get_sys().orb_on_fft_grid; }, var); }
     auto ecutrho() const 
     { return std::visit( [&](auto&& v) { return v.get_sys().ecutrho; }, var); }
-    auto fft_grid_size() const 
+    // Smooth FFT grid (mirrors QE's dffts; sized by ecutwfc).
+    // Use this for ψ FFTs and pair densities of pseudo-orbitals.
+    auto fft_grid_size() const
     { return std::visit( [&](auto&& v) { return v.fft_grid_size(); }, var); }
-    decltype(auto) fft_grid_dim() const 
+    decltype(auto) fft_grid_dim() const
     { return std::visit( [&](auto&& v) { return v.fft_grid_dim(); }, var ); }
     auto fft_grid_dim(int i) const { return fft_grid_dim()(i); }
-    auto nnr() const { return fft_grid_size(); } 
+    auto nnr() const { return fft_grid_size(); }
+    // Dense / augmented FFT grid (mirrors QE's dfftp; sized by ecutrho).
+    // Use this for V_loc, V_eff, V_xc, ρ_eff, augmentation Q_ij, and any
+    // ecutrho-derived G-vector lists. For NCPP this matches the smooth grid.
+    auto fft_grid_size_aug() const
+    { return std::visit( [&](auto&& v) { return v.fft_grid_size_aug(); }, var); }
+    decltype(auto) fft_grid_dim_aug() const
+    { return std::visit( [&](auto&& v) { return v.fft_grid_dim_aug(); }, var ); }
+    auto fft_grid_dim_aug(int i) const { return fft_grid_dim_aug()(i); }
+    auto nnr_aug() const { return fft_grid_size_aug(); }
     decltype(auto) wfc_truncated_grid() const
-    { return std::visit( [&](auto&& v) { return v.wfc_truncated_grid(); }, var ); }  
+    { return std::visit( [&](auto&& v) { return v.wfc_truncated_grid(); }, var ); }
 
     /* cell */
     // translational vectors
@@ -327,6 +338,19 @@ class MF
     auto efermi() const 
     { return std::visit( [&](auto&& v) { return v.get_sys().efermi; }, var ); }
 
+    // symmetry rotations
+    void setup_symmetry_rotations() 
+    { 
+      // paw/uspp need pseudopot constructed to be able to generate symmetry rotations
+      // construct here since you need MF, not the backend object.
+      auto ps_type = pp_type();
+      if( ps_type == hamilt::pp_paw_t or ps_type == hamilt::pp_uspp_t ) {
+        // forces construction of pseudopot if not yet constructed
+        auto ps = hamilt::make_pseudopot(*this);
+        (void) ps;
+      }
+      std::visit( [&](auto&& v) { v.setup_symmetry_rotations(); }, var ); 
+    }
     decltype(auto) symmetry_rotation(long s, long k) const
     {
       auto ns = qsymms().extent(0);
@@ -352,10 +376,20 @@ class MF
     { std::visit( [&](auto&& v) { v.get_orbital_set(OT,ispin,k_rng,b_rng,p_rng,std::forward<A4D>(Orb),r); }, var ); }
 
     /* accessor functions for pseudopot shared pointer */
-    void set_pseudopot(std::shared_ptr<hamilt::pseudopot> const& psp) 
+    void set_pseudopot(std::shared_ptr<hamilt::pseudopot> const& psp)
     { return std::visit( [&](auto&& v) { v.set_pseudopot(psp); }, var ); }
-    std::shared_ptr<hamilt::pseudopot> get_pseudopot() 
+    std::shared_ptr<hamilt::pseudopot> get_pseudopot()
     { return std::visit( [&](auto&& v) { return v.get_pseudopot(); }, var ); }
+
+    // Backend-reported pseudopotential type. Available without constructing
+    // the full hamilt::pseudopot. Backends:
+    //   qe    : value cached in qe_system from /Hamiltonian/pp_type
+    //   bdft  : hardcoded pp_ncpp_t (TODO: lift once bdft handles PAW/USPP)
+    //   pyscf : pp_FILE_t
+    //   model : pp_FILE_t
+    // See hamilt::mf_requires_augmentation in pseudopot.h.
+    hamilt::pp_type_e pp_type() const
+    { return std::visit( [&](auto&& v) { return v.pp_type(); }, var ); }
 
     /* closes record */
     template<class... Args>

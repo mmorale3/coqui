@@ -34,6 +34,7 @@
 
 #include "mean_field/mf_source.hpp"
 #include "mean_field/symmetry/bz_symmetry.hpp"
+#include "hamiltonian/pseudo/pseudopot_type.hpp"
 
 namespace mf
 {
@@ -50,6 +51,7 @@ struct qe_system
   qe_system(std::shared_ptr<utils::mpi_context_t<mpi3::communicator>> mpi_,
             std::string out, std::string pre,
             mf_input_file_type_e input_file_type_,
+            hamilt::pp_type_e pp_type_,
             bool no_q_sym,
             double alat_, int npwx_, int ng,
             int ngms_, double nelec_, int ndims_, int nspin_,
@@ -59,6 +61,7 @@ struct qe_system
             nda::array<int, 1> ids,
             nda::array<double, 2> pos,
             nda::array<int, 1> mesh,
+            nda::array<int, 1> mesh_aug,
             nda::array<double, 2> latt_,
             nda::array<double, 2> bg,
             nda::array<double, 1> kp_grid_,
@@ -75,17 +78,21 @@ struct qe_system
         prefix(pre),
         filename(outdir+"/"+prefix+".coqui.h5"),
         input_file_type(input_file_type_),
+        pp_type(pp_type_),
         ndims(ndims_),
         nspin(nspin_),
         nspin_in_basis(nspin),      // no choice in this backend
-        npol(npol_), 
+        npol(npol_),
         npol_in_basis(npol),
-        nbnd(eigval_.shape()[2]), 
+        nbnd(eigval_.shape()[2]),
         nbnd_aux(0),
         natoms(pos.shape()[0]),
         nspecies(sp.size()),
         alat(alat_),
         nnr(mesh(0)*mesh(1)*mesh(2)),
+        nnr_aug((mesh_aug.size()==3 ? mesh_aug(0) : mesh(0))*
+                (mesh_aug.size()==3 ? mesh_aug(1) : mesh(1))*
+                (mesh_aug.size()==3 ? mesh_aug(2) : mesh(2))),
         npwx(npwx_),
         ngm(ng),
         ngms(ngms_),
@@ -97,6 +104,7 @@ struct qe_system
         efermi(efermi_),
         ecutrho(ecrho),
         fft_mesh(mesh),
+        fft_mesh_aug(mesh_aug.size()==3 ? mesh_aug : mesh),
         latt(latt_),
         recv(bg),
         symm(mpi->comm,no_q_sym,latt,recv,kp_grid_,kpts_,symm_list_,use_trev)
@@ -110,9 +118,13 @@ struct qe_system
     utils::check(occ_.shape()[0] == nspin, "Wrong dimensions in qe_system constructor.");
     utils::check(occ_.shape()[2] == nbnd, "Wrong dimensions in qe_system constructor.");
 
-    // adjust ,esh if needed
+    // adjust meshes if needed (smooth and dense are independent)
     fft_mesh = utils::generate_consistent_fft_mesh(fft_mesh,symm.symm_list,1e-4,"qe_system");
     fft_mesh = utils::generate_consistent_fft_mesh(fft_mesh,symm.symm_list,1e-4,"qe_system",true);
+    fft_mesh_aug = utils::generate_consistent_fft_mesh(fft_mesh_aug,symm.symm_list,1e-4,"qe_system");
+    fft_mesh_aug = utils::generate_consistent_fft_mesh(fft_mesh_aug,symm.symm_list,1e-4,"qe_system",true);
+    nnr     = fft_mesh(0)*fft_mesh(1)*fft_mesh(2);
+    nnr_aug = fft_mesh_aug(0)*fft_mesh_aug(1)*fft_mesh_aug(2);
 
     int nkpts = symm.nkpts;
     int nkpts_ibz = symm.nkpts_ibz;
@@ -144,6 +156,7 @@ struct qe_system
   qe_system(std::shared_ptr<utils::mpi_context_t<mpi3::communicator>> mpi_,
             std::string out, std::string pre,
             mf_input_file_type_e input_file_type_,
+            hamilt::pp_type_e pp_type_,
             [[maybe_unused]] bool no_q_sym,
             double alat_, int npwx_, int ng,
             int ngms_, double nelec_, int ndims_, int nspin_,
@@ -153,6 +166,7 @@ struct qe_system
             nda::array<int, 1> ids,
             nda::array<double, 2> pos,
             nda::array<int, 1> mesh,
+            nda::array<int, 1> mesh_aug,
             nda::array<double, 2> latt_,
             nda::array<double, 2> bg,
             [[maybe_unused]] nda::array<double, 1> kp_grid_,
@@ -169,6 +183,7 @@ struct qe_system
         prefix(pre),
         filename(outdir+"/"+prefix+".coqui.h5"),
         input_file_type(input_file_type_),
+        pp_type(pp_type_),
         ndims(ndims_),
         nspin(nspin_),
         npol(npol_),                  // no choice right now, hardcoded in QE
@@ -179,6 +194,9 @@ struct qe_system
         nspecies(sp.size()),
         alat(alat_),
         nnr(mesh(0)*mesh(1)*mesh(2)),
+        nnr_aug((mesh_aug.size()==3 ? mesh_aug(0) : mesh(0))*
+                (mesh_aug.size()==3 ? mesh_aug(1) : mesh(1))*
+                (mesh_aug.size()==3 ? mesh_aug(2) : mesh(2))),
         npwx(npwx_),
         ngm(ng),
         ngms(ngms_),
@@ -190,6 +208,7 @@ struct qe_system
         efermi(efermi_),
         ecutrho(ecrho),
         fft_mesh(mesh),
+        fft_mesh_aug(mesh_aug.size()==3 ? mesh_aug : mesh),
         latt(latt_),
         recv(bg),
         symm(bz_)
@@ -203,9 +222,13 @@ struct qe_system
     utils::check(occ_.shape()[0] == nspin, "Wrong dimensions in qe_system constructor.");
     utils::check(occ_.shape()[2] == nbnd, "Wrong dimensions in qe_system constructor.");
 
-    // adjust ,esh if needed
+    // adjust meshes if needed (smooth and dense are independent)
     fft_mesh = utils::generate_consistent_fft_mesh(fft_mesh,symm.symm_list,1e-4,"qe_system");
     fft_mesh = utils::generate_consistent_fft_mesh(fft_mesh,symm.symm_list,1e-4,"qe_system",true);
+    fft_mesh_aug = utils::generate_consistent_fft_mesh(fft_mesh_aug,symm.symm_list,1e-4,"qe_system");
+    fft_mesh_aug = utils::generate_consistent_fft_mesh(fft_mesh_aug,symm.symm_list,1e-4,"qe_system",true);
+    nnr     = fft_mesh(0)*fft_mesh(1)*fft_mesh(2);
+    nnr_aug = fft_mesh_aug(0)*fft_mesh_aug(1)*fft_mesh_aug(2);
 
     int nkpts = symm.nkpts;
     int nkpts_ibz = symm.nkpts_ibz;
@@ -259,6 +282,14 @@ struct qe_system
     //BZ
     symm.save(sgrp);
 
+    // pp_type
+    std::string pp_type_str;
+    if(pp_type == hamilt::pp_ncpp_t) pp_type_str = "ncpp"; 
+    else if(pp_type == hamilt::pp_uspp_t) pp_type_str = "uspp"; 
+    else if(pp_type == hamilt::pp_paw_t) pp_type_str = "paw"; 
+    else utils::check(false,"Unexpected pp_type.");
+    h5::h5_write_attribute(sgrp, "pp_type", pp_type_str);
+
     // unit cell
     h5::h5_write_attribute(sgrp, "number_of_atoms", natoms);
     h5::h5_write_attribute(sgrp, "number_of_species", nspecies);
@@ -274,6 +305,7 @@ struct qe_system
     nda::h5_write(sgrp, "atomic_positions", at_pos, false);
     nda::h5_write(sgrp, "lattice_vectors", latt, false);
     nda::h5_write(sgrp, "reciprocal_vectors", recv, false);
+    
 
     nda::h5_write(sgrp, "kpoint_weights", k_weight, false);
         
@@ -289,6 +321,7 @@ struct qe_system
     h5::h5_write_attribute(ogrp, "ecutrho", ecutrho);
     h5::h5_write_attribute(ogrp, "npwx", npwx);
     nda::h5_write(ogrp, "fft_mesh", fft_mesh, false);
+    nda::h5_write(ogrp, "fft_mesh_aug", fft_mesh_aug, false);
     nda::h5_write(ogrp, "npw", npw, false);
         
     nda::h5_write(ogrp, "eigval", eigval, false);
@@ -308,7 +341,10 @@ struct qe_system
   std::string filename = "";
 
   // type of input file, hardwired to h5
-  mf_input_file_type_e input_file_type;  
+  mf_input_file_type_e input_file_type;
+
+  // type of pseudopotential
+  hamilt::pp_type_e pp_type = hamilt::pp_ncpp_t;
 
   // basic info
   int ndims = 3;                        // number of dimensions
@@ -322,7 +358,8 @@ struct qe_system
   int nspecies = 0;		                // # of species
   double alat = 0.0;                    // lattv units in QE, not used in this code.
   // MAM: nnr should be long!
-  int nnr = 0;                         // number of points in fft grid
+  int nnr = 0;                         // number of points in smooth fft grid (dffts)
+  int nnr_aug = 0;                     // number of points in dense/augmented fft grid (dfftp)
   int npwx = 0;                         // maximum number of pws in wfn grid
   int ngm = 0;                          // number of g vectors
   int ngms = 0;                         // number of g vectors on smooth grid
@@ -338,8 +375,15 @@ struct qe_system
   bool orb_on_fft_grid = true;          // orbitals are stored on FFT grid or not
   double ecutrho = 0.0;                 // plane-wave cutoffs
 
-  // fft grid	 
+  // smooth fft grid (mirrors QE's dffts; sized by ecutwfc)
+  // wavefunctions ψ_k and pair densities of pseudo-orbitals live here
   nda::stack_array<int,3> fft_mesh;
+
+  // dense/augmented fft grid (mirrors QE's dfftp; sized by ecutrho)
+  // total density ρ_eff (with PAW augmentation), V_loc, V_eff, V_xc, V_H,
+  // augmentation Q_ij, and all ecutrho-sized G-vector lists live here.
+  // For NCPP, fft_mesh_aug == fft_mesh; for USPP/PAW it is generally larger.
+  nda::stack_array<int,3> fft_mesh_aug;
    
   // lattice vectors
   // a_n[i] = latt(n,i), for the ith (x,y,z) cartesian component of the nth (1,2,3) vector.

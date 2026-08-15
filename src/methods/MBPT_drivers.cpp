@@ -737,7 +737,7 @@ void hf_downfold(eri_t &eri, ptree const& pt) {
  *  - factorization_type: "cholesky", Type of factorization. {choices: "none", "cholesky", "cholesky_high_memory", "choleksy_from_4index", "thc"}
  *  - thresh: 1e-6. Threshold used if factorization is requested.
  *  Parameters used by quasiparticle algorithm:
- *  - ac_alg: Algorithm for analytic continuation, default:pade {choices: pade}
+ *  - ac_alg: Algorithm for analytic continuation, default:pade {choices: pade, pade_updated}
  *  - eta: Smearing parameter: default:1e-6
  *  - Nfit: Number of terms in AC fit, default: 30
  *  - off_diag_mode: Off diagonal treatment, default: qp_energy. {choices: fermi, qp_energy} 
@@ -925,6 +925,14 @@ template void mbpt(std::string, \
   MBPT_INST(chol_reader_t, chol_reader_t, thc_reader_t, chol_reader_t)
   MBPT_INST(chol_reader_t, chol_reader_t, chol_reader_t, thc_reader_t)
   MBPT_INST(chol_reader_t, chol_reader_t, chol_reader_t, chol_reader_t)
+// hamilt (direct-route) static slots — constructible combos only (main.cpp)
+  MBPT_INST(hamilt_eval_t, thc_reader_t, thc_reader_t, thc_reader_t)
+  MBPT_INST(hamilt_eval_t, thc_reader_t, thc_reader_t, chol_reader_t)
+  MBPT_INST(thc_reader_t, hamilt_eval_t, hamilt_eval_t, thc_reader_t)
+  MBPT_INST(thc_reader_t, hamilt_eval_t, thc_reader_t, thc_reader_t)
+  MBPT_INST(thc_reader_t, thc_reader_t, hamilt_eval_t, thc_reader_t)
+  MBPT_INST(thc_reader_t, hamilt_eval_t, chol_reader_t, thc_reader_t)
+  MBPT_INST(thc_reader_t, chol_reader_t, hamilt_eval_t, thc_reader_t)
 
 #undef MBPT_INST
 

@@ -50,13 +50,16 @@ namespace methods
 namespace detail 
 {
 
-// encapsulates details of construction of rho_g 
+// encapsulates details of construction of rho_g
 auto make_grid(utils::Communicator auto&& comm, double ecut, mf::MF& mf)
 {
-  // until you propagate the change everywhere
-  if(not mf.has_wfc_grid() or (ecut <= 0) or (std::abs(ecut-mf.ecutrho()) < 1e-3) ) 
-    return grids::truncated_g_grid( mf.ecutrho(), mf.fft_grid_dim(), mf.recv() ); 
-  auto mesh = grids::find_fft_mesh(comm,ecut,mf.recv(),mf.symm_list()); 
+  // Default cutoff/mesh: ecutrho on the dense (dfftp / aug) mesh — matches
+  // QE's convention. For NCPP fft_grid_dim_aug() == fft_grid_dim(); for PAW
+  // we need the dense mesh so the rho_g G-list and any augmentation extension
+  // (Y rows, dZ on dense G's) are sized consistently.
+  if(not mf.has_wfc_grid() or (ecut <= 0) or (std::abs(ecut-mf.ecutrho()) < 1e-3) )
+    return grids::truncated_g_grid( mf.ecutrho(), mf.fft_grid_dim_aug(), mf.recv() );
+  auto mesh = grids::find_fft_mesh(comm,ecut,mf.recv(),mf.symm_list());
   auto wfc_mesh = mf.wfc_truncated_grid()->mesh();
   if( mesh[0] < wfc_mesh[0] or
       mesh[1] < wfc_mesh[1] or
@@ -245,7 +248,7 @@ template<MEMORY_SPACE MEM, typename Tensor_t>
 auto thc::evaluate(memory::array<MEM,long,1> const& ri, 
                    Tensor_t const& Xa,
                    std::optional<Tensor_t> const& Xb,
-                   bool return_Sinv_Ivec, 
+                   bool return_Ivec, 
                    nda::range a_range, nda::range b_range,
                    std::array<long, 3> pgrid3D)
         -> std::tuple<_darray_t_<MEM,3>, memory::array<MEM, ComplexType, 2>, 
@@ -260,14 +263,14 @@ auto thc::evaluate(memory::array<MEM,long,1> const& ri,
   set_range(a_range);
   set_range(b_range);
   if(Xb.has_value()) {
-    auto [return_v, Z_head_qu, Zbar_head_qu, Sinv_IVec] = intvec_impl<MEM,true>(ri,Xa,std::addressof(*Xb),return_Sinv_Ivec,a_range,b_range,pgrid3D);
+    auto [return_v, Z_head_qu, Zbar_head_qu, _IVec] = intvec_impl<MEM,true>(ri,Xa,std::addressof(*Xb),return_Ivec,a_range,b_range,pgrid3D);
     Timer.stop("TOTAL");
-    return std::make_tuple(std::move(return_v), std::move(Z_head_qu), std::move(Zbar_head_qu), std::move(Sinv_IVec));
+    return std::make_tuple(std::move(return_v), std::move(Z_head_qu), std::move(Zbar_head_qu), std::move(_IVec));
   } else { 
     std::decay_t<Tensor_t>* nullXb = nullptr;
-    auto [return_v, Z_head_qu, Zbar_head_qu, Sinv_IVec] = intvec_impl<MEM,true>(ri,Xa,nullXb,return_Sinv_Ivec,a_range,b_range,pgrid3D);
+    auto [return_v, Z_head_qu, Zbar_head_qu, _IVec] = intvec_impl<MEM,true>(ri,Xa,nullXb,return_Ivec,a_range,b_range,pgrid3D);
     Timer.stop("TOTAL");
-    return std::make_tuple(std::move(return_v), std::move(Z_head_qu), std::move(Zbar_head_qu), std::move(Sinv_IVec));
+    return std::make_tuple(std::move(return_v), std::move(Z_head_qu), std::move(Zbar_head_qu), std::move(_IVec));
   } 
 }
 
@@ -276,7 +279,7 @@ auto thc::evaluate(memory::array<MEM,long,1> const& ri,
                    nda::MemoryArrayOfRank<4> auto const& C_skai,
                    Tensor_t const& Xa,
                    Tensor_t const& Xb,
-                   bool return_Sinv_Ivec,
+                   bool return_Ivec,
                    std::array<long, 3> pgrid3D)
         -> std::tuple<_darray_t_<MEM,3>, memory::array<MEM, ComplexType, 2>,
                       memory::array<MEM, ComplexType, 2>, std::optional<_darray_t_<MEM,3>> >
@@ -321,9 +324,9 @@ auto thc::evaluate(memory::array<MEM,long,1> const& ri,
     }
   }
   mpi->comm.barrier();
-  auto [return_v, Z_head_qu, Zbar_head_qu, Sinv_IVec] = intvec_impl<MEM,true>(ri,CtX,std::addressof(Xb),return_Sinv_Ivec,a_range,a_range,pgrid3D);
+  auto [return_v, Z_head_qu, Zbar_head_qu, _IVec] = intvec_impl<MEM,true>(ri,CtX,std::addressof(Xb),return_Ivec,a_range,a_range,pgrid3D);
   Timer.stop("TOTAL");
-  return std::make_tuple(std::move(return_v), std::move(Z_head_qu), std::move(Zbar_head_qu), std::move(Sinv_IVec));
+  return std::make_tuple(std::move(return_v), std::move(Z_head_qu), std::move(Zbar_head_qu), std::move(_IVec));
 }
 
 template<MEMORY_SPACE MEM, typename Tensor_t>

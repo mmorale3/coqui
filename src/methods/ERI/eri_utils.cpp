@@ -47,8 +47,8 @@ auto make_thc(std::shared_ptr<mf::MF> mf, ptree const& pt) -> thc_reader_t {
   utils::check(mf->has_orbital_set() or not build_eri, "Error in make_thc: MF types that have no orbital sets (e.g type=model), can not be built, they must be read from file. save file ({}) must be provided or could not be opened.",save);
 
   thc_reader_t eri = (build_eri?
-                      thc_reader_t(std::move(mf), pt, false, false, init) :
-                      thc_reader_t(std::move(mf), storage, save, false, init));
+                      thc_reader_t(std::move(mf), pt, false, init) :
+                      thc_reader_t(std::move(mf), storage, save, init));
   return eri;
 };
 
@@ -60,7 +60,7 @@ void make_isdf(std::shared_ptr<mf::MF> mf, ptree const& pt) {
   utils::check( nIpts>0 or thresh>0.0, "{} Must set nIpts and/or thresh", err);
 
   bool isdf_only = true;
-  thc_reader_t isdf(std::move(mf), pt, false, isdf_only);
+  thc_reader_t isdf(std::move(mf), pt, isdf_only);
 };
 
 

@@ -1518,7 +1518,7 @@ template<MEMORY_SPACE MEM, bool return_coul_matrix, typename Tensor_t, typename 
 auto thc::intvec_impl(nda::MemoryArrayOfRank<1> auto const& IPts, 
                       Tensor_t const& Xa,
                       Tensor2_t const* Xb,
-                      bool return_Sinv_Ivec, 
+                      bool return_Ivec, 
                       nda::range a_range, nda::range b_range, std::array<long, 3> pgrid3D)
 {
   Timer.start("IntVecs");
@@ -1564,14 +1564,6 @@ auto thc::intvec_impl(nda::MemoryArrayOfRank<1> auto const& IPts,
   app_log(1, " - Number of interpolating points: {}", nIpts);
   app_log(1, " - Number of q-points in IBZ: {}",nqpts_ibz);
   app_log(2, " - Processor grid: ({},{},{})",pgrid3D[0],pgrid3D[1],pgrid3D[2]);
-
-  /* 
-   * std::optional<_darray_t_<MEM,3>> I(q,u,G) = (S)^{-1}(q,u,v) * IVec(q,v,G), "inverse" interpolating vector 
-   * We can represent functions in real space using I(u,G), for example the representation of the coulomb potential
-   * within the THC basis is:
-   *   V(r,r') = sum_quv conj(I(q,u,r)) Vuv(q) I(q,v,r')
-   */  
-  std::optional<_darray_t_<MEM,3>> IquG;
 
   utils::memory_report(4, "thc::get_ZquG_Cquv");
   // Z_quG: quG array with appropriate distribution slate
@@ -1659,15 +1651,6 @@ auto thc::intvec_impl(nda::MemoryArrayOfRank<1> auto const& IPts,
       }
     }
 
-    if( return_Sinv_Ivec ) {
-      // construct IquG
-      Timer.start("ALLOC");
-      IquG = make_distributed_array<local_uArray_t>(mpi->comm,pgrid3D,Z_quG.global_shape(),
-                  Z_quG.block_size());  
-      Timer.stop("ALLOC");
-      math::nda::slate_ops::multiply(C_quv, Z_quG, *IquG);
-    }    
-
     auto Zloc = Z_quG.local();
 
     // Store Chi^{q}_{u}(G=0) and \bar(Chi)^{q}_{u}(G=0)
@@ -1710,21 +1693,66 @@ auto thc::intvec_impl(nda::MemoryArrayOfRank<1> auto const& IPts,
     memory::unified_array<ComplexType,1> sqrtVg(rho_g.size());
     Timer.stop("ALLOC");
     // multiply Coulomb potential
+    // store Zloc where sqrtVg(g)=0, if return_Ivec. Assuming a single g for now
+    memory::array<MEM,ComplexType,2> Zloc_store( Z_quG.local_range(0).size(), 
+                          (return_Ivec?1:0)*Z_quG.local_range(1).size());
     for( auto [iq,q] : itertools::enumerate(Z_quG.local_range(0)) ) {
       vG.evaluate(sqrtVg,mf->lattv(),rho_g.g_vectors(),v_zero,Q(q,all));
       for( auto& v: sqrtVg ) v = std::sqrt(v);
       if constexpr (MEM==HOST_MEMORY) {
-        for( auto iu : nda::range(Z_quG.local_shape()[1]) )
-          for( auto [ig, g] : itertools::enumerate(Z_quG.local_range(2)) ) {
-            Zloc(iq, iu, ig) *= sqrtVg(g);
+        if(return_Ivec) { 
+          bool found = false;
+          for( auto [ig, g] : itertools::enumerate(Z_quG.local_range(2)) ) { 
+            if(std::abs(sqrtVg(g)) < 1e-8) { 
+              utils::check(not found, "Error: Found more than one place with V(q)=0");
+              for( auto iu : nda::range(Z_quG.local_shape()[1]) )
+                Zloc_store(iq, iu) = Zloc(iq, iu, ig);
+              found=true;
+            }
           }
+        }
+        // now scale by srqtVg
+        for( auto iu : nda::range(Z_quG.local_shape()[1]) )
+          for( auto [ig, g] : itertools::enumerate(Z_quG.local_range(2)) )
+            Zloc(iq, iu, ig) *= sqrtVg(g);
       } else {
+utils::check(not return_Ivec,"finish, need kernel or a solution");
         nda::tensor::elementwise(ComplexType(1.0),sqrtVg(Z_quG.local_range(2)),"g",
                                  ComplexType(1.0),Zloc(iq,all,all),"ug",nda::tensor::op::MUL);
       }
     }
     math::nda::slate_ops::multiply(Z_quG,dagger(Z_quG),C_quv);
     nda::tensor::scale(ComplexType(1.0)/mf->volume()/mf->nkpts(), C_quv.local());
+    std::optional<_darray_t_<MEM,3>> Z_quG_opt(std::nullopt);
+    if(return_Ivec) { 
+      // remove sqrtVg factor and move into optional
+      for( auto [iq,q] : itertools::enumerate(Z_quG.local_range(0)) ) {
+        vG.evaluate(sqrtVg,mf->lattv(),rho_g.g_vectors(),v_zero,Q(q,all));
+        for( auto& v: sqrtVg ) v = std::sqrt(v);
+        if constexpr (MEM==HOST_MEMORY) {
+          int ig0 = -1;
+          for( auto [ig, g] : itertools::enumerate(Z_quG.local_range(2)) ) 
+            if(std::abs(sqrtVg(g)) < 1e-8) { 
+              ig0 = ig;
+              sqrtVg(g) = ComplexType(1.0);
+            }
+          for( auto iu : nda::range(Z_quG.local_shape()[1]) )
+            for( auto [ig, g] : itertools::enumerate(Z_quG.local_range(2)) ) 
+              Zloc(iq, iu, ig) /= sqrtVg(g);
+          if(ig0>=0)
+            for( auto iu : nda::range(Z_quG.local_shape()[1]) )
+              Zloc(iq, iu, ig0) = Zloc_store(iq, iu);
+        } else {
+          auto sqVg = sqrtVg(Z_quG.local_range(2));
+          // calculate reciprocal, since elementwise does not have division.
+utils::check(false,"finish, need kernel or a solution");
+          nda::tensor::scale(ComplexType(1.0),sqVg,nda::tensor::op::RCP); 
+          nda::tensor::elementwise(ComplexType(1.0),sqVg,"g",
+                                   ComplexType(1.0),Zloc(iq,all,all),"ug",nda::tensor::op::MUL);
+        }
+      }
+      Z_quG_opt.emplace(std::move(Z_quG));   // should move into optional 
+    }
     Timer.stop("VCoul");
     if constexpr (MEM==DEVICE_MEMORY) {
       Timer.start("ALLOC");
@@ -1734,10 +1762,10 @@ auto thc::intvec_impl(nda::MemoryArrayOfRank<1> auto const& IPts,
       Timer.stop("ALLOC");
       C_quv_.local() = C_quv.local();	
       return std::make_tuple(std::move(C_quv_), std::move(Z_qu), std::move(Zbar_qu), 
-                             std::move(IquG));
+                             std::move(Z_quG_opt));
     } else {
       return std::make_tuple(std::move(C_quv), std::move(Z_qu), std::move(Zbar_qu),
-                             std::move(IquG));
+                             std::move(Z_quG_opt));
     }
 
   } else {

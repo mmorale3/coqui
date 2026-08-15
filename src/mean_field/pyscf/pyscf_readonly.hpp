@@ -66,13 +66,18 @@ namespace mf {
 
       // accessor functions
       auto mpi() const { return sys.mpi; }
+      long nspin() const { return sys.nspin; }
+      long npol() const { return sys.npol; }
       long nbnd() const { return sys.nbnd; }
       long nbnd_aux() const { return sys.nbnd_aux; }
       int nnr() const { return sys.nnr; }
+      int nnr_aug() const { return sys.nnr; }                      // no aug grid in PySCF
       decltype(auto) kpts_crystal() { return sys.bz().kpts_crys(); }
       int nkpts_ibz() const { return sys.bz().nkpts_ibz; }
       int fft_grid_size() const { return fft_mesh(0)*fft_mesh(1)*fft_mesh(2); }
+      int fft_grid_size_aug() const { return fft_grid_size(); }    // aug == smooth for PySCF
       decltype(auto) fft_grid_dim() const { return fft_mesh(); }
+      decltype(auto) fft_grid_dim_aug() const { return fft_mesh(); }
       decltype(auto) lattice() const { return sys.latt(); }
       decltype(auto) recv() const { return sys.recv(); }
       decltype(auto) kpts() { return sys.bz().kpts(); }
@@ -399,6 +404,8 @@ namespace mf {
         }
       }
 
+      void setup_symmetry_rotations() {}
+
       decltype(auto) symmetry_rotation(long s, long k) const
       { 
         utils::check( false, "Symmetry operations are not allowed in pyscf backend.");
@@ -412,6 +419,10 @@ namespace mf {
 
       void set_pseudopot(std::shared_ptr<hamilt::pseudopot> const& psp_) { psp = psp_; }
       std::shared_ptr<hamilt::pseudopot> get_pseudopot() { return psp; }
+
+      // pyscf path is not pseudopotential-driven in the QE/PAW sense; report
+      // pp_FILE_t so guards that abort on USPP/PAW remain inactive here.
+      hamilt::pp_type_e pp_type() const { return hamilt::pp_FILE_t; }
 
     private:
       pyscf_system sys;

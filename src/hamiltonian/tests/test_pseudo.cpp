@@ -116,4 +116,29 @@ TEST_CASE("pseudo_h5", "[pseudo]")
 
 }
 
+void test_dmatrix_paw(mpi_context_t& mpi, mf::MF &mf)
+{
+  // this will trigger construction of pseudopot and will call generate_dmatrix.
+  mf.setup_symmetry_rotations();
+  mpi.comm.barrier();
+}
+
+// Test generate_dmatrix with PAW
+TEST_CASE("dmatrix_paw", "[pseudo]")
+{
+  auto& mpi = utils::make_unit_test_mpi_context();
+  SECTION("lih222_paw_sym")
+  {
+    auto qe_h5 = mf::default_MF(mpi, "qe_lih222_paw_sym", mf::h5_input_type);
+    test_dmatrix_paw(*mpi, qe_h5);
+  }
+
+  SECTION("si222_paw_sym")
+  {
+    auto qe_h5 = mf::default_MF(mpi, "qe_si222_paw_sym", mf::h5_input_type);
+    test_dmatrix_paw(*mpi, qe_h5);
+  }
+
+}
+
 }

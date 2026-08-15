@@ -30,6 +30,7 @@
 #include "methods/tools/chkpt_utils.h"
 #include "simple_dyson.h"
 #include "scf_driver.hpp"
+#include "energy_decomposition.hpp"
 
 
 namespace methods {
@@ -105,6 +106,23 @@ double rpa_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_
   app_log(2, "RPA energy:                {} a.u.", e_rpa);
   app_log(2, "Total energy:              {} a.u.\n", e_1e_new + e_hf_new + e_rpa);
 
+  // Exact-exchange energy alone (Fock exchange, no Hartree), reported for
+  // code-vs-code comparison (e.g. ABINIT with fock_icutcoul=3, bare Coulomb).
+  // Re-evaluates the Fock matrix with exchange only; sF_skij is unused past here.
+  if (mb_solver.hf != nullptr) {
+    mb_solver.hf->evaluate(sF_skij, sDm_skij.local(), mb_eri.hf_eri->get(),
+                           dyson.sS_skij().local(), false, true);
+    mpi->comm.barrier();
+    auto e_x = eval_hf_energy(sDm_skij, sF_skij, dyson.sH0_skij(), k_weight, false);
+    app_log(2, "Exchange energy:           {} a.u.\n", std::get<1>(e_x));
+    app_log(2, "Hartree energy:            {} a.u. (= E_HF - E_x)\n",
+            e_hf_new - std::get<1>(e_x));
+  }
+
+  // Term-by-term split of e_1e, for the cross-code PAW energy ledger. sF_skij
+  // is dead past the exchange evaluation above, so it doubles as workspace.
+  print_e1_decomposition(*mf, dyson.PSP(), sDm_skij, sF_skij, k_weight, e_1e_new);
+
   Timer.start("WRITE");
   if (mpi->comm.root()) {
     std::string filename = mb_state.coqui_prefix + ".mbpt.h5";
@@ -156,6 +174,14 @@ RPA_LOOP_INST(chol_reader_t, chol_reader_t, thc_reader_t, thc_reader_t)
 RPA_LOOP_INST(chol_reader_t, chol_reader_t, thc_reader_t, chol_reader_t)
 RPA_LOOP_INST(chol_reader_t, chol_reader_t, chol_reader_t, thc_reader_t)
 RPA_LOOP_INST(chol_reader_t, chol_reader_t, chol_reader_t, chol_reader_t)
+// hamilt (direct-route) static slots — constructible combos only (main.cpp)
+RPA_LOOP_INST(hamilt_eval_t, thc_reader_t, thc_reader_t, thc_reader_t)
+RPA_LOOP_INST(hamilt_eval_t, thc_reader_t, thc_reader_t, chol_reader_t)
+RPA_LOOP_INST(thc_reader_t, hamilt_eval_t, hamilt_eval_t, thc_reader_t)
+RPA_LOOP_INST(thc_reader_t, hamilt_eval_t, thc_reader_t, thc_reader_t)
+RPA_LOOP_INST(thc_reader_t, thc_reader_t, hamilt_eval_t, thc_reader_t)
+RPA_LOOP_INST(thc_reader_t, hamilt_eval_t, chol_reader_t, thc_reader_t)
+RPA_LOOP_INST(thc_reader_t, chol_reader_t, hamilt_eval_t, thc_reader_t)
 
 #undef RPA_LOOP_INST
 

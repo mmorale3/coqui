@@ -33,3 +33,10 @@
 # IDE files
 .idea/
 *build*/
+
+# large local test artifact / python cache
+test.h5
+**/__pycache__/
+
+# OS cruft
+.DS_Store

@@ -457,9 +457,101 @@ struct bz_symm
   }
 
   /*
+   * True when /System/BZ carries only the "minimal" symmetry description:
+   * the MP grid, the IBZ kpoint list and the symmetry operations, without the
+   * precomputed k/q map tables that can_init_from_h5 requires.
+   *
+   * This is what a converter can write directly from a symmetry-reduced
+   * mean-field run (e.g. abinit2coqui on a kptopt/=3 WFK): the maps are then
+   * rebuilt here by the bz_symm(comm,...,symm_list,...) constructor, which is
+   * the same code path the QE reader uses, rather than being reimplemented in
+   * the converter.
+   */
+  static bool can_init_from_h5_minimal(h5::group& grp) {
+    if(not grp.has_subgroup("BZ")) return false;
+    auto bgrp = grp.open_group("BZ");
+
+    // Deliberately NOT "kpoints": in the full layout that dataset holds the
+    // FULL BZ list, while the constructor needs the IBZ list. A distinct name
+    // keeps the two layouts from ever being confused for one another.
+    for( auto [i,v] : itertools::enumerate(std::vector<std::string>{"kp_grid","kpoints_ibz"}) ) {
+      if(not bgrp.has_dataset(v)) return false;
+    }
+
+    if(not bgrp.has_subgroup("Symmetries")) return false;
+    auto sbgrp = bgrp.open_group("Symmetries");
+    if(not H5Aexists(h5::hid_t(sbgrp),"number_of_symmetries")) return false;
+    int nsym;
+    h5::h5_read_attribute(sbgrp, "number_of_symmetries",nsym);
+    if(nsym < 1) return false;
+    for(int i=0; i<nsym; i++) {
+      if(not sbgrp.has_subgroup("s"+std::to_string(i))) return false;
+      if(not sbgrp.has_dataset("s"+std::to_string(i)+"/R")) return false;
+      if(not sbgrp.has_dataset("s"+std::to_string(i)+"/ft")) return false;
+    }
+    return true;
+  }
+
+  /*
+   * Reads the symmetry operations from /System/BZ/Symmetries.
+   * R is the rotation in reduced (crystal) real-space coordinates and ft the
+   * fractional translation, matching what pw2coqui and abinit2coqui write.
+   * Rinv is formed here so that transform_miller_indices' G'_j = sum_i G_i
+   * Rinv(i,j) is the inverse-transpose action on reciprocal lattice vectors.
+   */
+  static std::vector<utils::symm_op> read_symm_list_from_h5(h5::group& grp) {
+    utils::check(grp.has_subgroup("BZ"), "read_symm_list_from_h5: missing /System/BZ.");
+    auto bgrp = grp.open_group("BZ");
+    utils::check(bgrp.has_subgroup("Symmetries"),
+                 "read_symm_list_from_h5: missing /System/BZ/Symmetries.");
+    auto sbgrp = bgrp.open_group("Symmetries");
+    int nsym = 0;
+    h5::h5_read_attribute(sbgrp, "number_of_symmetries", nsym);
+    utils::check(nsym >= 1, "read_symm_list_from_h5: number_of_symmetries: {}", nsym);
+
+    std::vector<utils::symm_op> slist;
+    slist.reserve(nsym);
+    int id_pos = -1;
+    for(int i=0; i<nsym; ++i) {
+      auto gi = sbgrp.open_group("s"+std::to_string(i));
+      nda::array<double, 2> R_(3,3);
+      nda::array<double, 1> ft_(3);
+      nda::h5_read(gi, "R", R_);
+      nda::h5_read(gi, "ft", ft_);
+
+      nda::stack_array<double, 3, 3> R;
+      nda::matrix<double> Rinv(3,3);
+      nda::stack_array<double, 3> ft;
+      R  = R_;
+      ft = ft_;
+
+      double dev = 0.0;
+      for(int a=0; a<3; ++a) {
+        for(int b=0; b<3; ++b) dev += std::abs(R(a,b) - (a==b ? 1.0 : 0.0));
+        dev += std::abs(ft(a));
+      }
+      if(dev < 1e-8) id_pos = i;
+
+      Rinv = R;
+      nda::inverse3_in_place(Rinv);
+      slist.emplace_back(utils::symm_op{R,Rinv,ft});
+    }
+
+    // The bz_symm constructor tags every IBZ kpoint with symmetry 0, so the
+    // identity has to sit at the front of the list (same invariant the QE
+    // reader enforces in qe_interface.cpp).
+    utils::check(id_pos >= 0,
+                 "read_symm_list_from_h5: identity operation not found among the "
+                 "{} symmetries in /System/BZ/Symmetries.", nsym);
+    if(id_pos != 0) std::swap(slist[0], slist[id_pos]);
+
+    return slist;
+  }
+
+  /*
    * Creates an object of type bz_symm,
-   * consistent with a single kpoint calculation at the gamma point. 
-   * Useful to initialize model hamiltonians. 
+   * consistent with a single kpoint calculation at the gamma point.
+   * Useful to initialize model hamiltonians.
    */
   static auto gamma_point_instance() 
   {

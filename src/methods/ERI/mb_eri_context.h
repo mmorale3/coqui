@@ -24,6 +24,7 @@
 
 #include "thc_reader_t.hpp"
 #include "chol_reader_t.hpp"
+#include "hamilt_eval_t.hpp"
 
 namespace methods {
 

@@ -44,6 +44,7 @@
 #include "utilities/parser.h"
 #include "utilities/stl_utils.hpp"
 #include "utilities/fortran_utilities.h"
+#include "hamiltonian/pseudo/pseudopot_query.h"
 #include "numerics/nda_functions.hpp"
 #include "numerics/shared_array/nda.hpp"
 #include "mean_field/MF.hpp"
@@ -536,11 +537,20 @@ auto rotated_ylm_coeffs(int lmax, std::vector<projection> const& proj)
   return coeff;
 }
 
-auto compute_mmn(utils::mpi_context_t<mpi3::communicator> &mpi, mf::MF &mf,    
+auto compute_mmn(utils::mpi_context_t<mpi3::communicator> &mpi, mf::MF &mf,
     std::string prefix, nda::array<int, 1> const& kp_maps,
     nda::array<double, 2> const& wann_kp, nda::array<int, 3> const& nnkpts,
     nda::array<int,1> const& band_list, bool transpose, bool write_to_file)
 {
+  // Mmn(k,b) = <u_mk | u_n,k+b> is computed below from the smooth/pseudo
+  // wavefunction. For USPP/PAW the augmentation contribution
+  // Σ_a Q_ab^I <p̃_a|ψ̃><ψ̃|p̃_b> is missing; the resulting Wannier
+  // overlaps would be silently incorrect. Aborting until the
+  // augmentation-aware path lands.
+  utils::check(!hamilt::mf_requires_augmentation(mf),
+    "wannier::compute_mmn: orbital overlaps Mmn are computed from the "
+    "smooth wavefunction only; the USPP/PAW augmentation correction is "
+    "missing. Aborting until the augmentation-aware path is in place.");
   using Array_view_4D_t = nda::array_view<ComplexType,4>;
   auto all = ::nda::range::all;
   long nband = band_list.size();

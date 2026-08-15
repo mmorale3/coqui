@@ -35,6 +35,14 @@ namespace methods {
   concept Cholesky_ERI = requires(const A &a) {
     { a.chol_read_type() };
   };
+
+  /* Direct-route static evaluator ("hamilt" interaction type): not an ERI —
+   * satisfies the static slots of mb_eri_t so hf_t builds V_H / K through the
+   * hamiltonian routines (see methods/ERI/hamilt_eval_t.hpp). */
+  template<typename A>
+  concept Hamilt_ERI = requires(const A &a) {
+    { a.hamilt_eval_type() };
+  };
 } // methods
 
 #endif //COQUI_CONCEPTS_HPP

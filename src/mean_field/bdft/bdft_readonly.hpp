@@ -45,6 +45,8 @@
 #include "grids/g_grids.hpp"
 #include "hamiltonian/pseudo/pseudopot.h"
 #include "hamiltonian/pseudo/pseudopot_to_h5.hpp"
+#include "utilities/symmetry.hpp"
+#include "utilities/symmetry_rotations.hpp"
 
 namespace mf {
 namespace bdft {
@@ -147,11 +149,16 @@ public:
 
   // accessor functions
   auto mpi() const { return sys.mpi; }
+  long nspin() const { return sys.nspin; }
+  long npol() const { return sys.npol; }
   long nbnd() const { return sys.nbnd; }
   long nbnd_aux() const { return sys.nbnd_aux; }
   int fft_grid_size() const { return fft_mesh(0)*fft_mesh(1)*fft_mesh(2); }
+  int fft_grid_size_aug() const { return fft_mesh_aug(0)*fft_mesh_aug(1)*fft_mesh_aug(2); }
   int nnr() const { return fft_grid_size(); }
+  int nnr_aug() const { return fft_grid_size_aug(); }
   decltype(auto) fft_grid_dim() const { return fft_mesh(); }
+  decltype(auto) fft_grid_dim_aug() const { return fft_mesh_aug(); }
   decltype(auto) lattice() const { return sys.latt(); }
   decltype(auto) recv() const { return sys.recv(); }
   decltype(auto) kpts() { return sys.bz().kpts(); }
@@ -173,40 +180,31 @@ public:
                 double ecut_ = 0.0, long n_ = -1):
     sys(std::move(mpi), outdir, prefix, n_),
     h5file(std::nullopt),
-    ecut(ecut_<=0.1?sys.ecutrho:ecut_), 
+    ecut(ecut_<=0.1?sys.ecutrho:ecut_),
     fft_mesh( ecut_>0.0 ? nda::stack_array<int, 3>{grids::find_fft_mesh(sys.mpi->comm,ecut,sys.recv,sys.bz().symm_list)} : sys.fft_mesh),
+    fft_mesh_aug(sys.fft_mesh_aug),
     wfc_g(detail::make_wfc(sys)),
     ksymms(detail::make_ksymms(sys.bz())),
     swfc_maps(detail::make_swfc_maps(sys,ksymms,fft_mesh,wfc_g))
   {
-    // build symmetry rotations: only correct with orthogonal bases, fix!
-    auto slist = utils::find_inverse_symmetry(sys.bz().qsymms,sys.bz().symm_list);
-    if(slist.size() > 0) 
-      std::tie(sk_to_n,dmat) = utils::generate_dmatrix<true>(*this, sys.bz().symm_list, slist);
-
     print_metadata("CoQuí mean-field reader");
   }
 
   bdft_readonly(bdft_system const& bdft_sys):
     sys(bdft_sys),
     h5file(std::nullopt),
-    ecut(sys.ecutrho), fft_mesh(sys.fft_mesh),
+    ecut(sys.ecutrho), fft_mesh(sys.fft_mesh), fft_mesh_aug(sys.fft_mesh_aug),
     wfc_g(detail::make_wfc(sys)),
     ksymms(detail::make_ksymms(sys.bz())),
     swfc_maps(detail::make_swfc_maps(sys,ksymms,fft_mesh,wfc_g))
   {
-    // build symmetry rotations
-    auto slist = utils::find_inverse_symmetry(sys.bz().qsymms,sys.bz().symm_list);
-    if(slist.size() > 0) 
-      std::tie(sk_to_n,dmat) = utils::generate_dmatrix<true>(*this,sys.bz().symm_list,slist);
-
     print_metadata("CoQuí mean-field reader");
   }
 
   bdft_readonly(bdft_readonly const& other):
     sys(other.sys),
     h5file(std::nullopt),
-    ecut(other.ecut), fft_mesh(other.fft_mesh),
+    ecut(other.ecut), fft_mesh(other.fft_mesh), fft_mesh_aug(other.fft_mesh_aug),
     wfc_g(other.wfc_g),
     ksymms(other.ksymms),
     swfc_maps(other.swfc_maps),
@@ -216,16 +214,11 @@ public:
   bdft_readonly(bdft_system&& bdft_sys):
     sys(std::move(bdft_sys) ),
     h5file(std::nullopt),
-    ecut(sys.ecutrho), fft_mesh(sys.fft_mesh),
+    ecut(sys.ecutrho), fft_mesh(sys.fft_mesh), fft_mesh_aug(sys.fft_mesh_aug),
     wfc_g(detail::make_wfc(sys)),
     ksymms(detail::make_ksymms(sys.bz())),
     swfc_maps(detail::make_swfc_maps(sys,ksymms,fft_mesh,wfc_g))
   {
-    // build symmetry rotations
-    auto slist = utils::find_inverse_symmetry(sys.bz().qsymms,sys.bz().symm_list);
-    if(slist.size() > 0) 
-      std::tie(sk_to_n,dmat) = utils::generate_dmatrix<true>(*this,sys.bz().symm_list,slist);
-
     print_metadata("CoQuí mean-field reader");
   }
 
@@ -236,7 +229,7 @@ public:
                 bool update_eig_occ = false) :
     sys(mf,fn,false),
     h5file(std::nullopt),
-    ecut(sys.ecutrho), fft_mesh(sys.fft_mesh),
+    ecut(sys.ecutrho), fft_mesh(sys.fft_mesh), fft_mesh_aug(sys.fft_mesh_aug),
     wfc_g(*mf.wfc_truncated_grid()),
     ksymms(detail::make_ksymms(sys.bz())),
     swfc_maps(detail::make_swfc_maps(sys,ksymms,fft_mesh,wfc_g))
@@ -328,12 +321,6 @@ public:
     }
     sys.mpi->comm.barrier();
 
-    // build symmetry rotations
-    auto slist = utils::find_inverse_symmetry(sys.bz().qsymms,sys.bz().symm_list);
-    if(slist.size() > 0) 
-      std::tie(sk_to_n,dmat) = utils::generate_dmatrix<true>(*this,sys.bz().symm_list,slist);
-    sys.mpi->comm.barrier();
-
     print_metadata("CoQuí mean-field reader (from mf object)");
     sys.mpi->comm.barrier();
   }
@@ -343,7 +330,7 @@ public:
     	    nda::array<std::pair<long,double>,2> const& orb_list) :
     sys(mf,fn,false),
     h5file(std::nullopt),
-    ecut(sys.ecutrho), fft_mesh(sys.fft_mesh),
+    ecut(sys.ecutrho), fft_mesh(sys.fft_mesh), fft_mesh_aug(sys.fft_mesh_aug),
     wfc_g(*mf.wfc_truncated_grid()),
     ksymms(detail::make_ksymms(sys.bz())),
     swfc_maps(detail::make_swfc_maps(sys,ksymms,fft_mesh,wfc_g))
@@ -418,20 +405,16 @@ public:
         } 
       } 
 
-      // if available, write pseudopot
+      // if available, write pseudopot. The pseudopot data lives on the dense
+      // (dfftp) grid (V_loc, mill_g, augmentation Q), so pass the aug mesh.
       if(mf.input_file_type() == mf::xml_input_type and mf.mf_type() == mf::qe_source) {
-        hamilt::pseudopot_to_h5(mf.fft_grid_dim(),grp,mf.outdir(),mf::xml_input_type);
+        hamilt::pseudopot_to_h5(mf.fft_grid_dim_aug(),grp,mf.outdir(),mf::xml_input_type);
       } else if(mf.input_file_type() == mf::h5_input_type and mf.mf_type() != mf::pyscf_source) {
-        hamilt::pseudopot_to_h5(mf.fft_grid_dim(),grp,mf.filename(),mf::h5_input_type);
+        hamilt::pseudopot_to_h5(mf.fft_grid_dim_aug(),grp,mf.filename(),mf::h5_input_type);
       }
     }
     sys.mpi->comm.barrier();
 
-
-    // build symmetry rotations
-    auto slist = utils::find_inverse_symmetry(sys.bz().qsymms,sys.bz().symm_list);
-    if(slist.size() > 0) 
-      std::tie(sk_to_n,dmat) = utils::generate_dmatrix<true>(*this,sys.bz().symm_list,slist);
 
     print_metadata("CoQuí mean-field reader (from mf object with orbital selection)");
     sys.mpi->comm.barrier();
@@ -440,9 +423,9 @@ public:
   bdft_readonly(bdft_readonly&& other):
       sys(std::move(other.sys) ),
       h5file(std::nullopt),
-      ecut(other.ecut), fft_mesh(other.fft_mesh), 
+      ecut(other.ecut), fft_mesh(other.fft_mesh), fft_mesh_aug(other.fft_mesh_aug),
       wfc_g(std::move(other.wfc_g)), ksymms(std::move(other.ksymms)),
-      swfc_maps(std::move(other.swfc_maps)), 
+      swfc_maps(std::move(other.swfc_maps)),
       sk_to_n(std::move(other.sk_to_n)), dmat( std::move(other.dmat) ) {}
 
   ~bdft_readonly() { close(); }
@@ -454,6 +437,7 @@ public:
     close();
     this->ecut = other.ecut;
     this->fft_mesh = other.fft_mesh;
+    this->fft_mesh_aug = other.fft_mesh_aug;
     this->wfc_g = other.wfc_g;
     this->ksymms = other.ksymms;
     this->swfc_maps = other.swfc_maps;
@@ -467,6 +451,7 @@ public:
     close();
     this->ecut = other.ecut;
     this->fft_mesh = other.fft_mesh;
+    this->fft_mesh_aug = other.fft_mesh_aug;
     this->ksymms = std::move(other.ksymms);
     this->swfc_maps = std::move(other.swfc_maps);
     this->wfc_g = std::move(other.wfc_g);
@@ -483,9 +468,10 @@ public:
     app_log(1, "  Monkhorst-Pack mesh        = ({},{},{})", sys.bz().kp_grid(0), sys.bz().kp_grid(1), sys.bz().kp_grid(2));
     app_log(1, "  K-points                   = {} total, {} in the IBZ", sys.bz().nkpts, sys.bz().nkpts_ibz);
     app_log(1, "  Number of electrons        = {}", sys.nelec);
-    app_log(1, "  Density energy cutoff      = {0:.3f} a.u. | FFT mesh = ({1},{2},{3})",
-            ecut,fft_mesh(0),fft_mesh(1),fft_mesh(2));
-    app_log(1, "  Wavefunction energy cutoff = {0:.3f} a.u. | FFT mesh = ({1},{2},{3}), Number of PWs = {4}\n",
+    app_log(1, "  Smooth FFT mesh (dffts)    = ({},{},{})", fft_mesh(0),fft_mesh(1),fft_mesh(2));
+    app_log(1, "  Dense  FFT mesh (dfftp,aug)= ({},{},{})", fft_mesh_aug(0),fft_mesh_aug(1),fft_mesh_aug(2));
+    app_log(1, "  Density energy cutoff      = {0:.3f} a.u.", ecut);
+    app_log(1, "  Wavefunction energy cutoff = {0:.3f} a.u. | wfc grid = ({1},{2},{3}), Number of PWs = {4}\n",
             wfc_g.ecut(), wfc_g.mesh(0),wfc_g.mesh(1),wfc_g.mesh(2), wfc_g.size());
   }
 
@@ -568,6 +554,25 @@ public:
     get_orbital_set(OT,_ispin,k_rng,b_rng,O_,r);
   }
 
+  // setup should be deterministic, so we are going to assume that if dmat is not empty
+  // that this was already called
+  void setup_symmetry_rotations() 
+  {
+    if(dmat.size() == 0)
+    {
+      // build symmetry rotations
+      auto slist = utils::find_inverse_symmetry(sys.bz().qsymms,sys.bz().symm_list);
+      if(slist.size() > 0) {
+        if(pp_type() == hamilt::pp_paw_t or pp_type() == hamilt::pp_uspp_t) {
+          utils::check(bool(psp),"Error in setup_symmetry_rotations: pseudopot must be attached before calling setup_symmetry_rotations when PAW/USPP is used.");
+          std::tie(sk_to_n,dmat) = utils::generate_dmatrix<true>(*this,sys.bz().symm_list,slist,psp.get());
+        } else {
+          std::tie(sk_to_n,dmat) = utils::generate_dmatrix<true>(*this,sys.bz().symm_list,slist);
+        }
+      }
+    }
+  }
+
   decltype(auto) symmetry_rotation(long s, long k) const
   { 
     long ns = sys.bz().qsymms.extent(0);
@@ -587,6 +592,30 @@ public:
   void set_pseudopot(std::shared_ptr<hamilt::pseudopot> const& psp_) { psp = psp_; }
   std::shared_ptr<hamilt::pseudopot> get_pseudopot() { return psp; }
 
+  // type of pseudopotential treatment. Read from the /Hamiltonian `pp_type`
+  // attribute in the h5 (ncpp if absent/unreadable) and cached. This enables the
+  // PAW/USPP code paths for bdft mean fields (compensation augmentation in the
+  // THC reader, identity band-basis overlap, native deeq) that were previously
+  // disabled by hardcoding ncpp -- the bdft PAW/USPP path had never been
+  // exercised. The pseudopot is attached only after the THC reader builds, so we
+  // cannot route through it; read the type directly from the file instead.
+  hamilt::pp_type_e pp_type() const {
+    if (not _pp_type_cache.has_value()) {
+      hamilt::pp_type_e t = hamilt::pp_ncpp_t;
+      try {
+        h5::file file(sys.filename, 'r');
+        h5::group grp(file);
+        h5::group hgrp = grp.open_group("Hamiltonian");
+        std::string s;
+        h5::h5_read_attribute(hgrp, "pp_type", s);
+        if (s == "paw") t = hamilt::pp_paw_t;
+        else if (s == "uspp") t = hamilt::pp_uspp_t;
+      } catch(...) {}
+      _pp_type_cache = t;
+    }
+    return *_pp_type_cache;
+  }
+
   // close h5 handles 
   void close()
   {
@@ -602,11 +631,18 @@ public:
   // h5 handle 
   std::optional<h5::file> h5file;
 
+  // lazily-read + cached /Hamiltonian pp_type (see pp_type()).
+  mutable std::optional<hamilt::pp_type_e> _pp_type_cache;
+
   // plane wave cutoff of the FFT grid for AOs
   double ecut = 0.0;
 
-  // fft mesh compatible with ecut
+  // smooth fft mesh (mirrors QE's dffts; sized by ecutwfc); ψ FFTs live here
   nda::stack_array<int, 3> fft_mesh;
+
+  // dense/augmented fft mesh (mirrors QE's dfftp; sized by ecutrho); used for
+  // ρ_eff, V_loc, V_eff, V_xc, augmentation Q, etc. Equals fft_mesh for NCPP.
+  nda::stack_array<int, 3> fft_mesh_aug;
 
   // truncated g grid for wfc.
   // Constructed from the miller indices read from h5.

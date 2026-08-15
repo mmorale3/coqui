@@ -109,6 +109,13 @@ namespace methods {
         _tol(-1.0), _Timer() {
 
       utils::check(_storage != incore, "chol_rader_t: incore version is not implemented yet!");
+      // Precomputed Cholesky ERIs are smooth-grid only (no USPP/PAW
+      // augmentation) — refuse to pair them with an augmented mean-field.
+      utils::check(_MF->pp_type() != hamilt::pp_uspp_t and
+                   _MF->pp_type() != hamilt::pp_paw_t,
+                   "chol_reader_t: Cholesky ERIs do not include USPP/PAW "
+                   "augmentation and would be silently wrong for this "
+                   "mean-field. Use the THC ERI path (paw_aug) instead.");
       if (!std::filesystem::exists(_eri_dir+"/"+_eri_filename))
         utils::check(false, "chol_reader_t: Cholesky ERIs not found!");
 

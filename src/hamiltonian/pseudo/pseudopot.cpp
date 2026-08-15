@@ -42,7 +42,12 @@
 #include "mean_field/distributed_orbital_readers.hpp"
 #include "hamiltonian/add_vloc.hpp"
 #include "hamiltonian/v_h.hpp"
+#include "hamiltonian/v_x.hpp"
+#include "hamiltonian/paw/v_h_paw.hpp"
+#include "hamiltonian/paw/v_x_paw.hpp"
+#include "hamiltonian/paw/paw_onecenter.hpp"   // compute_paw_deeq / compute_deeq_scf
 #include "hamiltonian/pseudo/pseudopot.h"
+#include "hamiltonian/pseudo/pp_schema.hpp"
 #include "hamiltonian/pseudo/pseudopot_to_h5.hpp"
 #include "numerics/nda_functions.hpp"
 
@@ -57,8 +62,8 @@ using boost::mpi3::shared_communicator;
 template<typename MF_t>
 pseudopot::pseudopot(MF_t &mf, std::string const filename) :
   mpi(mf.mpi()),
-  fft_mesh(mf.fft_grid_dim()),      // customize grid!!!
-  nnr(mf.nnr()),
+  fft_mesh_aug(mf.fft_grid_dim_aug()),  // dense grid: vsc, vloc, mill_g, all PAW augmentation pieces
+  nnr_aug(mf.nnr_aug()),            // dense FFT box (must hold all dense G-vectors)
   recv(mf.recv()),
   lattv(mf.lattv()),
   nkpts(mf.nkpts()),
@@ -71,11 +76,20 @@ pseudopot::pseudopot(MF_t &mf, std::string const filename) :
   kp_symm(mf.kp_symm()),
   Pskna(make_shared_array<nda::array_view<ComplexType,4>>(*mpi,{1,1,1,1})),   // resize later
   Dnn(make_shared_array<nda::array_view<ComplexType,3>>(*mpi,{1,1,1})),       // resize later
-  swfc_to_rho(detail::make_wfc_to_rho(*mpi,mf,fft_mesh)),
+  Dnn_atom_static(make_shared_array<nda::array_view<ComplexType,3>>(*mpi,{1,1,1})), // resized+filled in read_vnl_h5 for USPP/PAW
+  swfc_to_rho(detail::make_wfc_to_rho(*mpi,mf,fft_mesh_aug)),
   svloc(make_shared_array<nda::array_view<ComplexType,3>>(*mpi,{1,1,1})),            // resize later
   svsc(make_shared_array<nda::array_view<ComplexType,3>>(*mpi,{1,1,1})),  // resize later
-  qgm(make_shared_array<nda::array_view<ComplexType,3>>(*mpi,{1,1,1}))             // resize later
-{ 
+  qgm(make_shared_array<nda::array_view<ComplexType,3>>(*mpi,{1,1,1})),            // resize later
+  qq_nt_data(make_shared_array<nda::array_view<ComplexType,3>>(*mpi,{1,1,1}))     // resize later
+{
+  // Cache cartesian atom positions for the v_h_paw augmentation step.
+  // mf.atomic_positions() returns shape (nat, 3) in cartesian.
+  {
+    auto ap = mf.atomic_positions();
+    atom_pos_cart = nda::array<double,2>::zeros({ap.extent(0), ap.extent(1)});
+    atom_pos_cart() = ap;
+  }
   if( mf.mf_type() == mf::pyscf_source ) { 
 
     // nothing to do, evaluation routines should not be called! 
@@ -94,8 +108,8 @@ pseudopot::pseudopot(MF_t &mf, std::string const filename) :
     app_log(2,"  Device support enabled.");
 #endif
     if(filename != "" or mf.input_file_type() == mf::h5_input_type) {
-      input_file_name = (filename != ""?filename:mf.filename()); 
-      utils::check(std::filesystem::exists(input_file_name), "Error: Missing file: {}",input_file_name); 
+      input_file_name = (filename != ""?filename:mf.filename());
+      utils::check(std::filesystem::exists(input_file_name), "Error: Missing file: {}",input_file_name);
       h5::file file;
       try {
         file = h5::file(input_file_name, 'r');
@@ -224,11 +238,11 @@ void pseudopot::read_vnl_pw2bgw(MF_t &mf, std::string outdir)
         long n1 = mill(i,0); if(n1<0) n1 += NX;
         long n2 = mill(i,1); if(n2<0) n2 += NY;
         long n3 = mill(i,2); if(n3<0) n3 += NZ;
-        utils::check(n1 < NX, "read_vnl_h5: Index out of range. i:{}, n:{}, NX:{}",i,n1,NX);
-        utils::check(n2 < NY, "read_vnl_h5: Index out of range. i:{}, n:{}, NY:{}",i,n2,NY);
-        utils::check(n3 < NZ, "read_vnl_h5: Index out of range. i:{}, n:{}, NZ:{}",i,n3,NZ);
+        utils::check(n1 < NX, "read_vnl_pw2bgw: Index out of range. i:{}, n:{}, NX:{}",i,n1,NX);
+        utils::check(n2 < NY, "read_vnl_pw2bgw: Index out of range. i:{}, n:{}, NY:{}",i,n2,NY);
+        utils::check(n3 < NZ, "read_vnl_pw2bgw: Index out of range. i:{}, n:{}, NZ:{}",i,n3,NZ);
         long N = (n1*NY + n2)*NZ + n3;
-        utils::check( N >= 0 and N < wfc_nnr, "read_vnl_h5: Index out of range. N:{}, nnr:{}",N,wfc_nnr);
+        utils::check( N >= 0 and N < wfc_nnr, "read_vnl_pw2bgw: Index out of range. N:{}, nnr:{}",N,wfc_nnr);
         k2g(ik,i) = fft2gv(N);  
         utils::check( k2g(ik,i) >= 0 and k2g(ik,i) < ngm, "read_vnl_xml: Index not mapped in truncated grid. ");
       }
@@ -278,16 +292,16 @@ void pseudopot::read_vnl_pw2bgw(MF_t &mf, std::string outdir)
 
   // local and self-consistent potentials
   spinorbit_loc = false;
-  svloc = sarray_t<nda::array_view<ComplexType,3>>(*mpi,{nspin,1,nnr}); 
-  svsc = sarray_t<nda::array_view<ComplexType,3>>(*mpi,{nspin,npol*npol,nnr}); 
+  svloc = sarray_t<nda::array_view<ComplexType,3>>(*mpi,{nspin,1,nnr_aug});
+  svsc = sarray_t<nda::array_view<ComplexType,3>>(*mpi,{nspin,npol*npol,nnr_aug});
   if(mpi->comm.root()) {
     if(std::filesystem::exists(outdir+"/VSC")) {
       nda::array<ComplexType,1> v;
-      utils::read_qe_plot_file(1,outdir+"/VSC",mf.fft_grid_dim(),v);
-      // MAM: transform to nnr grid...  spin/polarization dependence???
+      utils::read_qe_plot_file(1,outdir+"/VSC",mf.fft_grid_dim_aug(),v);  // V_eff is on dfftp
+      // MAM: transform to nnr_aug grid...  spin/polarization dependence???
       // this is wrong if nspin or npol > 1!
       // ignore for now since this is not used anywhere!
-      utils::check(v.extent(0) == nnr, "Error: Dimension mismatch");
+      utils::check(v.extent(0) == nnr_aug, "Error: Dimension mismatch");
       for(int is=0; is<nspin; is++)
         svsc.local()(is,0,all) = v();
       // to Hartree
@@ -299,9 +313,9 @@ void pseudopot::read_vnl_pw2bgw(MF_t &mf, std::string outdir)
     }
     if(std::filesystem::exists(outdir+"/VLTOT")) { 
       nda::array<ComplexType,1> v;
-      utils::read_qe_plot_file(2,outdir+"/VLTOT",mf.fft_grid_dim(),v);
-      // MAM: transform to nnr grid...
-      utils::check(v.extent(0) == nnr, "Error: Dimension mismatch");
+      utils::read_qe_plot_file(2,outdir+"/VLTOT",mf.fft_grid_dim_aug(),v);  // V_loc is on dfftp
+      // MAM: transform to nnr_aug grid...
+      utils::check(v.extent(0) == nnr_aug, "Error: Dimension mismatch");
       for(int is=0; is<nspin; is++)
         svloc.local()(is,0,all) = v();
       // to Hartree
@@ -334,9 +348,16 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
 {
   using nda::range;
   decltype(range::all) all;
-  std::string type(""); 
+  std::string type("");
 
   h5::group grp1 = grp0.open_group("Hamiltonian");
+  // On-disk unit convention: energy-valued datasets are Ry for
+  // legacy files (scale 0.5 on read) and HARTREE for schema_version >= 2
+  // (scale 1). In-memory convention is always Hartree.
+  const int    pp_sv  = h5_pp_schema_version(grp1);
+  const double ry2ha  = (pp_sv >= 2) ? 1.0 : 0.5;
+  app_log(3, "  pseudopot::read_vnl_h5: schema_version = {} ({} on disk)",
+          pp_sv, (pp_sv >= 2) ? "Hartree" : "legacy Ry");
   h5::h5_read_attribute(grp1, "pp_type", type);
 
   app_log(2,"  input type: coqui::h5");
@@ -399,25 +420,35 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
   mpi->comm.all_reduce_in_place_n(&nnodes,1,mpi3::max<>{});
 
   // local potential
-  svloc = sarray_t<nda::array_view<ComplexType,3>>(*mpi,{nspin,(spinorbit_loc?npol*npol:1),nnr});
-  svsc = sarray_t<nda::array_view<ComplexType,3>>(*mpi,{nspin,npol*npol,nnr});
+  svloc = sarray_t<nda::array_view<ComplexType,3>>(*mpi,{nspin,(spinorbit_loc?npol*npol:1),nnr_aug});
+  svsc = sarray_t<nda::array_view<ComplexType,3>>(*mpi,{nspin,npol*npol,nnr_aug});
   if(mpi->comm.root()) {
     int ngm;
     h5::h5_read_attribute(grp,"ngm",ngm);
-    nda::array<long,1> k2g(ngm); 
+    // Cache the dense-grid size on the member here so the USPP/PAW broadcast
+    // block below propagates the correct value to non-root ranks (otherwise
+    // ngm_dense stayed 0 on root and the subsequent miller_g_dense broadcast
+    // had a count mismatch under MPI > 1).
+    ngm_dense = ngm;
+    nda::array<long,1> k2g(ngm);
 
     {
-      nda::array<int,2> mill_g(ngm,3); 
+      nda::array<int,2> mill_g(ngm,3);
       nda::h5_read(grp,"miller_g",mill_g);
-      utils::generate_k2g(mill_g,k2g,mf.fft_grid_dim());
+      // mill_g lists dense G-vectors (ngm = ngm_dense), so the target FFT box
+      // must be the dense (dfftp / aug) mesh — not the smooth one.
+      utils::generate_k2g(mill_g,k2g,mf.fft_grid_dim_aug());
+      // Cache miller_g_dense for v_h_paw augmentation. Only meaningful for
+      // USPP/PAW; populated unconditionally here (cheap and harmless).
+      miller_g_dense = mill_g;
     }
 
 
     // vsc
     { 
       auto vr = svsc.local();
-      auto vr2d = nda::reshape(vr,std::array<long,2>{nspin*npol*npol,nnr});
-      auto v4D = nda::reshape(vr,std::array<long,4>{nspin*npol*npol,fft_mesh(0),fft_mesh(1),fft_mesh(2)});
+      auto vr2d = nda::reshape(vr,std::array<long,2>{nspin*npol*npol,nnr_aug});
+      auto v4D = nda::reshape(vr,std::array<long,4>{nspin*npol*npol,fft_mesh_aug(0),fft_mesh_aug(1),fft_mesh_aug(2)});
       math::nda::fft<true> F(v4D);
 
       nda::array<ComplexType,3> vl(nspin, npol*npol, ngm); 
@@ -432,8 +463,8 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
     // vloc
     if(spinorbit_loc) {
       auto vr = svloc.local();
-      auto vr2d = nda::reshape(vr,std::array<long,2>{nspin*npol*npol,nnr});
-      auto v4D = nda::reshape(vr,std::array<long,4>{nspin*npol*npol,fft_mesh(0),fft_mesh(1),fft_mesh(2)});
+      auto vr2d = nda::reshape(vr,std::array<long,2>{nspin*npol*npol,nnr_aug});
+      auto v4D = nda::reshape(vr,std::array<long,4>{nspin*npol*npol,fft_mesh_aug(0),fft_mesh_aug(1),fft_mesh_aug(2)});
       math::nda::fft<true> F(v4D);
 
       nda::array<ComplexType,3> vl(nspin, npol*npol, ngm); 
@@ -447,8 +478,8 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
       F.backward(v4D);
     } else {
       auto vr = svloc.local();
-      auto vr2d = nda::reshape(vr,std::array<long,2>{nspin,nnr});
-      auto v4D = nda::reshape(vr,std::array<long,4>{nspin, fft_mesh(0),fft_mesh(1),fft_mesh(2)});
+      auto vr2d = nda::reshape(vr,std::array<long,2>{nspin,nnr_aug});
+      auto v4D = nda::reshape(vr,std::array<long,4>{nspin, fft_mesh_aug(0),fft_mesh_aug(1),fft_mesh_aug(2)});
       math::nda::fft<true> F(v4D);
 
       nda::array<ComplexType,1> vl_(ngm); 
@@ -461,9 +492,10 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
       F.backward(v4D);
     }
 
-    // to Hartree unit
-    nda::tensor::scale(ComplexType(0.5),svsc.local());
-    nda::tensor::scale(ComplexType(0.5),svloc.local());
+    // to Hartree unit (legacy Ry files only; schema_version >= 2 is
+    // already Hartree on disk)
+    nda::tensor::scale(ComplexType(ry2ha),svsc.local());
+    nda::tensor::scale(ComplexType(ry2ha),svloc.local());
   }
   if(mpi->node_comm.root()) { 
     mpi->internode_comm.broadcast_n(svsc.local().data(),svsc.size(),0);
@@ -471,18 +503,46 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
   }
   mpi->comm.barrier();
 
-  nh.resize(nsp);
+  // miller_g_dense was populated only on mpi.comm.root above; replicate.
+  {
+    int ngm_attr = (int)ngm_dense;
+    if (ptype == pp_uspp_t || ptype == pp_paw_t) {
+      // ngm_dense was set on root inside the uspp/paw branch above
+      mpi->comm.broadcast_value(ngm_attr);
+      ngm_dense = ngm_attr;
+      if (!mpi->comm.root())
+        miller_g_dense = nda::array<int,2>::zeros({ngm_dense, 3});
+      mpi->comm.broadcast_n(miller_g_dense.data(), miller_g_dense.size(), 0);
+    }
+  }
+
   ityp.resize(nat);
   ofs.resize(nat);
-  // for PAW/USPP: 
-  // ijtoh.resize(nhm,nhm,nsp);
-  
-  nda::h5_read(grp,"proj_per_atom",nh);
+  {
+    // proj_per_atom is per-SPECIES (length nsp). A wrong length
+    // (e.g. per-atom, an ABINIT-converter gap) silently resizes
+    // nh and mis-indexes every augmentation consumer, so it is a hard error.
+    nda::array<int,1> nh_read;
+    nda::h5_read(grp,"proj_per_atom",nh_read);
+    utils::check(nh_read.extent(0) == nsp,
+                 "pseudopot::read_vnl_h5: 'proj_per_atom' has length {} but "
+                 "number_of_species = {} — it must be per-species. "
+                 "Regenerate the h5 with the CoQui-shipped converter "
+                 "(pw2coqui / abinit2coqui; the ABINIT converter needs the "
+                 "per-species proj_per_atom fix).",
+                 nh_read.extent(0), nsp);
+    nh = nh_read;
+    int nh_max = 0;
+    for (int s = 0; s < nsp; ++s) nh_max = std::max(nh_max, nh(s));
+    utils::check(nh_max <= nhm,
+                 "pseudopot::read_vnl_h5: max(proj_per_atom) = {} exceeds "
+                 "max_proj_per_atom = {} — inconsistent h5.",
+                 nh_max, nhm);
+  }
   nda::h5_read(grp,"projector_offset",ofs);
-  //nda::h5_read(grp,"ijtoh",ijtoh);
   nda::h5_read(grp,"npw",npw);
   nda::h5_read(grp,"atomic_id",ityp);
-  //ityp = ityp-1;  
+  //ityp = ityp-1;
   // MAM: temporary fix until new pw2coqui.f90 is in place, remove eventually
   // should be 0-based indexing always
   {
@@ -491,40 +551,629 @@ void pseudopot::read_vnl_h5(MF_t &mf, h5::group& grp0)
                  "qe_interface::read_h5 Invalid atomic_ids array: min id:{}.",id_min);
     ityp() -= id_min;
   }
+  {
+    // Σ_atoms proj_per_atom(type) must reproduce total_num_of_proj
+    // (order-independent; catches per-atom/per-species confusion the length
+    // check above might miss for nat == nsp systems).
+    long nkb_sum = 0;
+    for (int ia = 0; ia < nat; ++ia) nkb_sum += nh(ityp(ia));
+    utils::check(nkb_sum == nkb,
+                 "pseudopot::read_vnl_h5: sum over atoms of proj_per_atom "
+                 "({}) != total_num_of_proj ({}) — inconsistent h5.",
+                 nkb_sum, nkb);
+  }
 
   // Dnn = dvan
   Dnn = sarray_t<nda::array_view<ComplexType,3>>(*mpi,{nsp,nhm*npol,nhm*npol});
   mpi->node_comm.barrier();
 
+  // dion / dion_so is written by pw2coqui for ncpp, uspp, and paw alike.
+  // The augmentation-related fields (qq_nt, ijtoh, augmentation_function_isp*)
+  // are only present for uspp and paw and are read in the block below.
   if(mpi->node_comm.root())
   {
-    if(ptype == pp_ncpp_t) {
-      if(spinorbit_nl) {
-        nda::array<ComplexType,4> Dnn_c(nsp,npol*npol,nhm,nhm); 
-        nda::h5_read(grp,"dion_so",Dnn_c);
-        auto Dloc = Dnn.local();
-        // MAM: dion_so needs to be transposed, since it was written in column-major
-        for( int s=0; s<nsp; ++s )
-          for( int p=0; p<npol; ++p )
-            for( int q=0; q<npol; ++q )
-              for( int n=0; n<nhm; ++n )
-                for( int m=0; m<nhm; ++m )
-                  // Dloc(s,np,mq) = transpose( Dnn_c(s,pq,n,m) )
-                  Dloc(s,n*npol+p,m*npol+q) = Dnn_c(s,p*npol+q,m,n);
-      } else {
-        nda::array<double,3> Dnn_r(nsp,nhm,nhm); 
-        nda::h5_read(grp,"dion",Dnn_r);
-        auto Dloc = Dnn.local();
-        Dloc() = ComplexType(0.0);
-        for( int s=0; s<nsp; ++s )
-          for( int p=0; p<npol; ++p )
+    if(spinorbit_nl) {
+      nda::array<ComplexType,4> Dnn_c(nsp,npol*npol,nhm,nhm);
+      nda::h5_read(grp,"dion_so",Dnn_c);
+      utils::check(Dnn_c.extent(0) == nsp && Dnn_c.extent(1) == npol*npol &&
+                   Dnn_c.extent(2) == nhm && Dnn_c.extent(3) == nhm,
+                   "pseudopot::read_vnl_h5: 'dion_so' shape mismatch.");
+      auto Dloc = Dnn.local();
+      // dion_so was written in column-major; reorder.
+      for( int s=0; s<nsp; ++s )
+        for( int p=0; p<npol; ++p )
+          for( int q=0; q<npol; ++q )
             for( int n=0; n<nhm; ++n )
               for( int m=0; m<nhm; ++m )
-                Dloc(s,n*npol+p,m*npol+p) = Dnn_r(s,n,m);
+                Dloc(s,n*npol+p,m*npol+q) = Dnn_c(s,p*npol+q,m,n);
+    } else {
+      nda::array<double,3> Dnn_r(nsp,nhm,nhm);
+      nda::h5_read(grp,"dion",Dnn_r);
+      utils::check(Dnn_r.extent(0) == nsp && Dnn_r.extent(1) == nhm &&
+                   Dnn_r.extent(2) == nhm,
+                   "pseudopot::read_vnl_h5: 'dion' shape mismatch.");
+      auto Dloc = Dnn.local();
+      Dloc() = ComplexType(0.0);
+      for( int s=0; s<nsp; ++s )
+        for( int p=0; p<npol; ++p )
+          for( int n=0; n<nhm; ++n )
+            for( int m=0; m<nhm; ++m )
+              Dloc(s,n*npol+p,m*npol+p) = Dnn_r(s,n,m);
+    }
+    // Ry -> Ha for legacy files; schema_version >= 2 is already Ha
+    nda::tensor::scale(ComplexType(ry2ha),Dnn.local());
+    // dion must be Hermitian per species block and at a plausible
+    // Hartree scale — catches transposed/corrupted exports and unit errors
+    // (Ry/eV/e² factors) at read time instead of as finite-but-wrong
+    // energies downstream. Only the active nh(s)×npol block is checked
+    // (padding beyond nh(s) is unconstrained).
+    {
+      auto Dloc = Dnn.local();
+      double dmax = 0.0, herm = 0.0;
+      for (int s = 0; s < nsp; ++s) {
+        int nch = nh(s) * npol;
+        for (int i = 0; i < nch; ++i)
+          for (int j = 0; j < nch; ++j) {
+            dmax = std::max(dmax, std::abs(Dloc(s,i,j)));
+            herm = std::max(herm,
+                            std::abs(Dloc(s,i,j) - std::conj(Dloc(s,j,i))));
+          }
       }
-      nda::tensor::scale(ComplexType(0.5),Dnn.local());
-    } else
-      utils::check(false,"finish");
+      utils::check(herm <= 1e-8 * std::max(1.0, dmax),
+                   "pseudopot::read_vnl_h5: 'dion' is not Hermitian (max "
+                   "residual {}, max element {} Ha) — corrupted or transposed "
+                   "export; regenerate the h5 with the CoQui-shipped "
+                   "converter.", herm, dmax);
+      // Bound must admit legitimate datasets: JTH-v2.0 (atompaw-4.0.x) XMLs
+      // store unnormalized completeness partial waves with ||phi||^2 ~ 1e4,
+      // and dij0 scales as ||phi||^2 (measured: Si Psdj max|dij0| = 6.4e3 Ha,
+      // same physics as the atompaw-4.2 regeneration at 1.7e2).
+      utils::check(dmax <= 1.0e5,
+                   "pseudopot::read_vnl_h5: max|dion| = {} Ha is implausibly "
+                   "large — likely a unit/scale error in the converter.", dmax);
+      if (ptype != pp_ncpp_t)
+        utils::check(dmax > 0.0,
+                     "pseudopot::read_vnl_h5: 'dion' is identically zero for "
+                     "a USPP/PAW pseudopotential — broken export.");
+    }
+  }
+  mpi->node_comm.barrier();
+
+  // NOTE: QE `deeq` is no longer read — it carries QE's converged
+  // V_H and V_xc content and violates the no-XC static-D contract (plan F1).
+  // The per-atom static tensor Dnn_atom_static (dion replica + ex_cvij) is
+  // assembled after the paw_species fields are loaded below; the
+  // density-dependent Hartree-only terms are rebuilt per evaluation via
+  // compute_paw_deeq.
+
+  // USPP / PAW augmentation overlap and Q^IJ(G).
+  // qq_nt: per-species ⟨β|Q|β⟩ overlap, shape (nsp, nhm, nhm) on disk.
+  // ijtoh: composite (ih,jh) -> ij map, shape (nsp, nhm, nhm), 1-based.
+  // augmentation_function_isp{nt}: Q^IJ(G) on the dense grid, complex,
+  //   shape (nij(nt), ngm_dense) per species, no structure factor.
+  // For non-collinear/SOC USPP we'd also need qq_so; not implemented here
+  // yet (will warn).
+  qq_nt_data = sarray_t<nda::array_view<ComplexType,3>>(*mpi,
+                  {std::max(1L,(long)nsp), std::max(1L,(long)nhm),
+                   std::max(1L,(long)nhm)});
+  if(ptype == pp_uspp_t or ptype == pp_paw_t) {
+    int ngm_attr = 0;
+    h5::h5_read_attribute(grp,"ngm",ngm_attr);
+    ngm_dense = ngm_attr;
+    long nij_max = static_cast<long>(nhm)*(nhm+1)/2;
+    qgm = sarray_t<nda::array_view<ComplexType,3>>(*mpi,
+            {(long)nsp, std::max(1L,nij_max), ngm_dense});
+    ijtoh = nda::array<int,3>::zeros({nsp, nhm, nhm});
+
+    if(mpi->node_comm.root()) {
+      // ijtoh is integer, written as h5_write_tensor_int(ijtoh, "ijtoh") in
+      // pw2coqui. Fortran (nhm, nhm, nsp) -> C++ (nsp, nhm, nhm).
+      nda::h5_read(grp,"ijtoh",ijtoh);
+      // Schema contract: ijtoh must be the sequential upper-triangle
+      // packing `for ih: for jh >= ih: ++ij` (1-based, symmetric — QE
+      // init_us_1, verified against QE 7.4.1). Only the active nh(s) block
+      // is constrained (QE pads with -1, abinit2coqui with 0). A transposed
+      // or rebased export would silently scramble every qfuncl/Q^IJ lookup.
+      for(int s=0; s<nsp; ++s) {
+        int c = 0;
+        for(int ih=0; ih<nh(s); ++ih)
+          for(int jh=ih; jh<nh(s); ++jh) {
+            ++c;
+            utils::check(ijtoh(s,ih,jh) == c && ijtoh(s,jh,ih) == c,
+                "pseudopot::read_vnl_h5: ijtoh(nt={},ih={},jh={}) = {}/{} != "
+                "expected sequential upper-triangle index {} (QE init_us_1 "
+                "convention, per the schema contract) — corrupted or "
+                "non-conforming export.", s, ih, jh,
+                ijtoh(s,ih,jh), ijtoh(s,jh,ih), c);
+          }
+      }
+
+      // qq_nt: real on disk for non-SOC. SOC path (qq_so) is a TODO.
+      if(spinorbit_nl) {
+        app_warning("USPP/PAW + spin-orbit: qq_so reader not yet wired; "
+                    "augmentation overlap will be set to zero.");
+        qq_nt_data.local()() = ComplexType(0.0);
+      } else {
+        nda::array<double,3> qq_r(nsp, nhm, nhm);
+        qq_r() = 0.0;
+        try { nda::h5_read(grp,"qq_nt",qq_r); }
+        catch(...) {
+          utils::check(false,
+              "USPP/PAW: dataset 'qq_nt' missing from the mean-field h5 file "
+              "(old-schema file). The native one-center D build requires it "
+              "— regenerate the h5 with the CoQui-shipped "
+              "converter (pw2coqui / abinit2coqui).");
+        }
+        auto Qloc = qq_nt_data.local();
+        Qloc() = ComplexType(0.0);
+        for(int s=0; s<nsp; ++s)
+          for(int n=0; n<nhm; ++n)
+            for(int m=0; m<nhm; ++m)
+              Qloc(s,n,m) = ComplexType(qq_r(s,n,m), 0.0);
+      }
+
+      // Q^IJ(G) per species. Each species has nij(nt) = nh(nt)*(nh(nt)+1)/2
+      // pairs; pad to nij_max with zeros in qgm.
+      auto qg_loc = qgm.local();
+      qg_loc() = ComplexType(0.0);
+      for(int nt=0; nt<nsp; ++nt) {
+        long nij = static_cast<long>(nh(nt))*(nh(nt)+1)/2;
+        if(nij <= 0) continue;
+        std::string ds = "augmentation_function_isp"+std::to_string(nt);
+        try {
+          nda::array<ComplexType,2> qfn(nij, ngm_dense);
+          nda::h5_read(grp,ds,qfn);
+          qg_loc(nt, nda::range(nij), nda::range(ngm_dense)) = qfn;
+        } catch(...) {
+          utils::check(false,
+              "USPP/PAW: dataset '{}' (augmentation Q^IJ(G) for species {}) "
+              "missing from the mean-field h5 file (old-schema file). "
+              "Regenerate the h5 with the CoQui-shipped converter "
+              "(pw2coqui / abinit2coqui).", ds, nt);
+        }
+      }
+    }
+  }
+  if(mpi->node_comm.root()) { /* no-op: already on root */ }
+  mpi->node_comm.barrier();
+  if(mpi->node_comm.root()) {
+    if(qgm.local().size() > 0)
+      mpi->internode_comm.broadcast_n(qgm.local().data(), qgm.size(), 0);
+    if(qq_nt_data.local().size() > 0)
+      mpi->internode_comm.broadcast_n(qq_nt_data.local().data(),
+                                      qq_nt_data.size(), 0);
+  }
+  if(ijtoh.size() > 0)
+    mpi->comm.broadcast_n(ijtoh.data(), ijtoh.size(), 0);
+  mpi->comm.barrier();
+
+  // Per-species PAW radial data (filled when /Hamiltonian/Species/ exists
+  // in the h5 file), including Onecenter/deltaC for PAW species.
+  // The five heavy radial tables (aewfc, pswfc, qfuncl, deltaC, core_aewfc)
+  // are loaded on global root into per-species temporaries, then placed in
+  // node-shared memory (paw_species_shm) and exposed to consumers as
+  // `nda::array_view` fields of species_paw_t — one node-local copy
+  // instead of a per-rank replication that scaled to ~3 GB/species on a
+  // 96-core node.
+  paw_species.clear();
+  paw_species_shm.clear();
+  if(ptype == pp_uspp_t or ptype == pp_paw_t) {
+    paw_species.resize(nsp);
+    paw_species_shm.reserve(nsp);
+    for (int nt = 0; nt < nsp; ++nt) paw_species_shm.emplace_back(*mpi);
+
+    // Per-species temporaries holding the heavy fields read on root.
+    // These are local to read_vnl_h5 and freed at end of scope, so the
+    // per-rank allocation only lives on the global root for the duration
+    // of this block.
+    struct heavy_tmp {
+      nda::array<double,2> aewfc;
+      nda::array<double,2> pswfc;
+      nda::array<double,3> qfuncl;
+      nda::array<double,4> deltaC;
+      nda::array<double,2> ex_cvij;
+      nda::array<double,2> core_aewfc;
+    };
+    std::vector<heavy_tmp> heavy_root(nsp);
+
+    if(mpi->comm.root()) {
+      bool has_species_grp = grp0.has_subgroup("Hamiltonian") &&
+        grp0.open_group("Hamiltonian").has_subgroup("Species");
+      if(!has_species_grp) {
+        utils::check(false,
+            "/Hamiltonian/Species group missing from the mean-field h5 file "
+            "(old-schema file). The native USPP/PAW one-center D build "
+            "requires the per-species radial data — regenerate "
+            "the h5 with the CoQui-shipped converter "
+            "(pw2coqui / abinit2coqui).");
+      } else {
+        h5::group hgrp = grp0.open_group("Hamiltonian");
+        h5::group sp_grp = hgrp.open_group("Species");
+        // Required datasets are HARD errors — silent fallbacks are
+        // how the historical inconsistencies survived.
+        auto require_read = [](h5::group& g, std::string const& ds,
+                               auto& target, int nt_i, char const* why) {
+          bool ok = true;
+          try { nda::h5_read(g, ds, target); } catch(...) { ok = false; }
+          utils::check(ok,
+              "pseudopot::read_vnl_h5: required dataset '{}' missing or "
+              "unreadable for species nt{} ({}) — old-schema or incomplete "
+              "h5; regenerate with the CoQui-shipped converter "
+              "(pw2coqui / abinit2coqui).", ds, nt_i, why);
+        };
+        for(int nt=0; nt<nsp; ++nt) {
+          std::string nt_name = "nt"+std::to_string(nt);
+          // The CoQui-shipped converters write a species group (with
+          // species_kind paw|uspp|ncpp) for EVERY species; a missing group
+          // is an old-schema file.
+          utils::check(sp_grp.has_subgroup(nt_name),
+              "pseudopot::read_vnl_h5: /Hamiltonian/Species/{} missing — "
+              "old-schema h5; regenerate with the CoQui-shipped "
+              "converter (pw2coqui / abinit2coqui).", nt_name);
+          h5::group nt_grp = sp_grp.open_group(nt_name);
+          auto& sp = paw_species[nt];
+          auto& tmp = heavy_root[nt];
+          std::string kind;
+          h5::h5_read_attribute(nt_grp, "species_kind", kind);
+          sp.is_paw  = (kind == "paw");
+          sp.is_uspp = (kind == "uspp");
+          h5::h5_read_attribute(nt_grp, "mesh",   sp.mesh);
+          h5::h5_read_attribute(nt_grp, "nbeta",  sp.nbeta);
+          h5::h5_read_attribute(nt_grp, "kkbeta", sp.kkbeta);
+          h5::h5_read_attribute(nt_grp, "nh",     sp.nh);
+          sp.r.resize(sp.mesh);   nda::h5_read(nt_grp, "r",   sp.r);
+          sp.rab.resize(sp.mesh); nda::h5_read(nt_grp, "rab", sp.rab);
+          if(sp.is_paw || sp.is_uspp)
+            utils::check((int)nh(nt) == sp.nh,
+                "pseudopot::read_vnl_h5: species nt{} 'nh' attribute ({}) != "
+                "proj_per_atom ({}) — inconsistent h5.",
+                nt, sp.nh, (int)nh(nt));
+          if(sp.is_paw) {
+            utils::check(nt_grp.has_subgroup("paw"),
+                "pseudopot::read_vnl_h5: species nt{} is PAW but has no "
+                "'paw' subgroup — old-schema h5; regenerate with "
+                "the CoQui-shipped converter.", nt);
+            h5::group pgrp = nt_grp.open_group("paw");
+            h5::h5_read_attribute(pgrp, "lmax_aug", sp.lmax_aug);
+            h5::h5_read_attribute(pgrp, "raug",     sp.raug);
+            h5::h5_read_attribute(pgrp, "iraug",    sp.iraug);
+            // pfunc, ptfunc, augmom are derivable from aewfc/pswfc/qfuncl
+            // (see species_paw_t comment) — not loaded.
+            //
+            // ae_vloc / vloc_ps: REQUIRED for schema_version >= 2 files
+            // warned-optional for legacy files (the lih222_paw_hf fixture
+            // predates the PS-side export, and the only consumer,
+            // compute_paw_static_D, is not used in production).
+            // Normalized to HARTREE in
+            // memory here (legacy files store Ry — scale ry2ha).
+            // ae_rho_atc / rho_atc_ps stay silent-optional: absence can be
+            // PHYSICAL (no NLCC ⇒ QE writes no PS core); no production
+            // consumer today (the one-center Hartree driver is valence-only
+            // core electrostatics lives in dion).
+            auto read_radial_vpot = [&](h5::group& g, std::string const& ds,
+                                        auto& target) {
+              try { nda::h5_read(g, ds, target); }
+              catch(...) {
+                utils::check(pp_sv < 2,
+                    "pseudopot::read_vnl_h5: dataset '{}' missing for PAW "
+                    "species nt{} in a schema_version={} h5 — required by "
+                    "the B4 schema contract; regenerate with the current "
+                    "converter (pw2coqui / abinit2coqui).", ds, nt, pp_sv);
+                app_log(1,
+                    "WARNING pseudopot::read_vnl_h5: dataset '{}' absent for "
+                    "species nt{} (pre-B1 h5 export). Only the unused "
+                    "compute_paw_static_D consumes it; regenerate with the "
+                    "current pw2coqui when convenient.", ds, nt);
+                return;
+              }
+              target *= ry2ha;   // in-memory Hartree
+            };
+            read_radial_vpot(pgrp, "ae_vloc", sp.ae_vloc);
+            try { nda::h5_read(pgrp, "ae_rho_atc", sp.ae_rho_atc); } catch(...) {}
+            // PS-side counterparts needed to reconstruct paw_init_keeq inside
+            // CoQui (rather than relying on QE's ddd_paw being frozen at ρ_QE).
+            read_radial_vpot(pgrp, "vloc_ps", sp.vloc_ps);
+            try { nda::h5_read(pgrp, "rho_atc_ps", sp.rho_atc_ps); } catch(...) {}
+          }
+          if(sp.is_paw || sp.is_uspp) {
+            if(sp.is_paw) {
+              require_read(nt_grp, "aewfc", tmp.aewfc, nt, "AE partial waves");
+              require_read(nt_grp, "pswfc", tmp.pswfc, nt, "PS partial waves");
+            } else {
+              // USPP carries no partial waves; keep optional.
+              try { nda::h5_read(nt_grp, "aewfc",  tmp.aewfc); }  catch(...) {}
+              try { nda::h5_read(nt_grp, "pswfc",  tmp.pswfc); }  catch(...) {}
+            }
+            require_read(nt_grp, "qfuncl", tmp.qfuncl, nt,
+                         "augmentation radial Q_L");
+            // Angular momentum metadata for q+G evaluation of the
+            // augmentation function (qvan2 reconstruction in CoQui).
+            require_read(nt_grp, "lll",    sp.lll,    nt, "beta l metadata");
+            require_read(nt_grp, "nhtol",  sp.nhtol,  nt, "channel l metadata");
+            require_read(nt_grp, "nhtolm", sp.nhtolm, nt, "channel lm metadata");
+            require_read(nt_grp, "indv",   sp.indv,   nt, "channel→beta map");
+            utils::check(sp.lll.extent(0) == sp.nbeta,
+                "pseudopot::read_vnl_h5: species nt{} 'lll' length ({}) != "
+                "nbeta ({}).", nt, sp.lll.extent(0), sp.nbeta);
+            utils::check(sp.nhtol.extent(0) == sp.nh &&
+                         sp.nhtolm.extent(0) == sp.nh &&
+                         sp.indv.extent(0) == sp.nh,
+                "pseudopot::read_vnl_h5: species nt{} nhtol/nhtolm/indv "
+                "lengths ({}/{}/{}) != nh ({}).", nt,
+                sp.nhtol.extent(0), sp.nhtolm.extent(0), sp.indv.extent(0),
+                sp.nh);
+          }
+          // One-center Coulomb residual ΔC = K_AE − K_PS, raw ke%k from
+          // PAW_init_fock_kernel exported by pw2coqui (in proper Hartree).
+          if(sp.is_paw && nt_grp.has_subgroup("Onecenter")) {
+            h5::group ogrp = nt_grp.open_group("Onecenter");
+            try { nda::h5_read(ogrp, "deltaC", tmp.deltaC); } catch(...) {}
+            // Frozen core-valence exact-exchange kernel (ABINIT ex_cvij). Optional:
+            // absent for GIPAW-less / core-valence-free datasets. Warned about below.
+            try { nda::h5_read(ogrp, "ex_cvij", tmp.ex_cvij); } catch(...) {}
+          }
+          // GIPAW core orbitals (notes §7 — required for explicit
+          // core-valence/core-core exchange). Absent for non-GIPAW pseudos.
+          if(sp.is_paw && nt_grp.has_subgroup("Core")) {
+            h5::group cgrp = nt_grp.open_group("Core");
+            // An attr-less Core/ group (hand-injected
+            // cores, pre-B2 files) used to die in an unclear HDF5 exception
+            // cascade here. Name the problem and the fix instead.
+            utils::check(H5Aexists(h5::hid_t(cgrp), "ncore_orbitals") > 0,
+                "read_vnl_h5: Species nt{} has a Core/ group without the "
+                "'ncore_orbitals' attribute. Core/ requires attrs+datasets "
+                "(ncore_orbitals, n, l, ae_wfc) — regenerate the h5 with the "
+                "current converter (pw2coqui --with-gipaw pseudo / "
+                "abinit2coqui --corewf).", nt);
+            h5::h5_read_attribute(cgrp, "ncore_orbitals", sp.ncore_orbitals);
+            try { nda::h5_read(cgrp, "n",      sp.core_n); }     catch(...) {}
+            try { nda::h5_read(cgrp, "l",      sp.core_l); }     catch(...) {}
+            try { nda::h5_read(cgrp, "ae_wfc", tmp.core_aewfc); } catch(...) {}
+          }
+          // Native ex_cvij: when the h5 carries no Onecenter/
+          // ex_cvij but DOES carry AE core orbitals, build the frozen
+          // core-valence exact exchange here (Slater R^L + closed-shell
+          // Gaunt² sum, hamilt::paw::compute_ex_cvij_from_core; validated
+          // vs ABINIT-XML <exact_exchange_X_matrix> and analytic hydrogenic
+          // integrals). Detection order: h5 ex_cvij → native-from-Core →
+          // [dft_xc TBD] → none + loud warning below. Serves the QE path
+          // (GIPAW cores, pw2coqui exports Core/ but no ex_cvij).
+          if(sp.is_paw && tmp.ex_cvij.size() == 0 &&
+             tmp.core_aewfc.size() > 0 && sp.core_l.size() > 0 &&
+             tmp.aewfc.size() > 0) {
+            tmp.ex_cvij = hamilt::paw::compute_ex_cvij_from_core(
+                tmp.aewfc, tmp.core_aewfc, sp.lll, sp.core_l,
+                sp.indv, sp.nhtolm, sp.r, sp.rab);
+            app_log(2, "  pseudopot: species nt{} — ex_cvij built natively "
+                       "from Core/ae_wfc ({} core orbitals).",
+                    nt, sp.core_l.size());
+          }
+        }
+      }
+    }
+    mpi->comm.barrier();
+
+    // Broadcast paw_species data to non-root ranks. The h5 read above only
+    // executes on comm.root; without this broadcast, downstream consumers
+    // (paw_aug_thc, paw_aug_q_eval, local_isdf, hartree_xc_energy) get
+    // empty species data on non-root ranks and either silently skip work
+    // or hang on collective ops triggered by inconsistent metadata.
+    auto bcast_array_1 = [this](nda::array<double,1>& a) {
+      long sz = a.size();
+      mpi->comm.broadcast_value(sz);
+      if (!mpi->comm.root()) a.resize(sz);
+      if (sz > 0) mpi->comm.broadcast_n(a.data(), sz, 0);
+    };
+    auto bcast_iarray_1 = [this](nda::array<int,1>& a) {
+      long sz = a.size();
+      mpi->comm.broadcast_value(sz);
+      if (!mpi->comm.root()) a.resize(sz);
+      if (sz > 0) mpi->comm.broadcast_n(a.data(), sz, 0);
+    };
+
+    // Helpers that broadcast a heavy field's shape, allocate a node-shared
+    // SHM segment of that shape (collective on all ranks; sized to the
+    // global root's data), copy on global root, internode-broadcast across
+    // node-roots, and bind the species_paw_t view to the SHM's local().
+    // For empty inputs (size == 0 on root) the SHM is left at its dummy
+    // 1×… shape and the view is set to the empty zero-size sub-view.
+    auto bcast_to_shm_2 = [this](nda::array<double,2>& tmp_root,
+                                  sarray_t<nda::array_view<double,2>>& shm,
+                                  nda::array_view<double,2>& view) {
+      std::array<long,2> sh{0,0};
+      if (mpi->comm.root()) sh = {tmp_root.shape()[0], tmp_root.shape()[1]};
+      mpi->comm.broadcast_n(sh.data(), 2, 0);
+      if (sh[0] == 0 || sh[1] == 0) { view = nda::array_view<double,2>{}; return; }
+      shm = math::shm::make_shared_array<nda::array_view<double,2>>(*mpi, {sh[0],sh[1]});
+      shm.win().fence();
+      if (mpi->comm.root()) shm.local() = tmp_root;
+      shm.win().fence();
+      if (mpi->node_comm.root())
+        mpi->internode_comm.broadcast_n(shm.local().data(), shm.size(), 0);
+      mpi->comm.barrier();
+      view.rebind(shm.local());
+    };
+    auto bcast_to_shm_3 = [this](nda::array<double,3>& tmp_root,
+                                  sarray_t<nda::array_view<double,3>>& shm,
+                                  nda::array_view<double,3>& view) {
+      std::array<long,3> sh{0,0,0};
+      if (mpi->comm.root())
+        sh = {tmp_root.shape()[0], tmp_root.shape()[1], tmp_root.shape()[2]};
+      mpi->comm.broadcast_n(sh.data(), 3, 0);
+      if (sh[0]*sh[1]*sh[2] == 0) { view = nda::array_view<double,3>{}; return; }
+      shm = math::shm::make_shared_array<nda::array_view<double,3>>(*mpi, {sh[0],sh[1],sh[2]});
+      shm.win().fence();
+      if (mpi->comm.root()) shm.local() = tmp_root;
+      shm.win().fence();
+      if (mpi->node_comm.root())
+        mpi->internode_comm.broadcast_n(shm.local().data(), shm.size(), 0);
+      mpi->comm.barrier();
+      view.rebind(shm.local());
+    };
+    auto bcast_to_shm_4 = [this](nda::array<double,4>& tmp_root,
+                                  sarray_t<nda::array_view<double,4>>& shm,
+                                  nda::array_view<double,4>& view) {
+      std::array<long,4> sh{0,0,0,0};
+      if (mpi->comm.root())
+        sh = {tmp_root.shape()[0], tmp_root.shape()[1],
+              tmp_root.shape()[2], tmp_root.shape()[3]};
+      mpi->comm.broadcast_n(sh.data(), 4, 0);
+      if (sh[0]*sh[1]*sh[2]*sh[3] == 0) { view = nda::array_view<double,4>{}; return; }
+      shm = math::shm::make_shared_array<nda::array_view<double,4>>(*mpi, {sh[0],sh[1],sh[2],sh[3]});
+      shm.win().fence();
+      if (mpi->comm.root()) shm.local() = tmp_root;
+      shm.win().fence();
+      if (mpi->node_comm.root())
+        mpi->internode_comm.broadcast_n(shm.local().data(), shm.size(), 0);
+      mpi->comm.barrier();
+      view.rebind(shm.local());
+    };
+
+    for (int nt = 0; nt < nsp; ++nt) {
+      auto& sp     = paw_species[nt];
+      auto& sp_shm = paw_species_shm[nt];
+      auto& tmp    = heavy_root[nt];
+      // scalars
+      mpi->comm.broadcast_value(sp.is_paw);
+      mpi->comm.broadcast_value(sp.is_uspp);
+      mpi->comm.broadcast_value(sp.mesh);
+      mpi->comm.broadcast_value(sp.nbeta);
+      mpi->comm.broadcast_value(sp.kkbeta);
+      mpi->comm.broadcast_value(sp.nh);
+      mpi->comm.broadcast_value(sp.lmax_aug);
+      mpi->comm.broadcast_value(sp.raug);
+      mpi->comm.broadcast_value(sp.iraug);
+      mpi->comm.broadcast_value(sp.ncore_orbitals);
+      // small per-rank arrays
+      bcast_array_1(sp.r);
+      bcast_array_1(sp.rab);
+      bcast_iarray_1(sp.lll);
+      bcast_iarray_1(sp.nhtol);
+      bcast_iarray_1(sp.nhtolm);
+      bcast_iarray_1(sp.indv);
+      bcast_array_1(sp.ae_vloc);
+      bcast_array_1(sp.ae_rho_atc);
+      bcast_array_1(sp.vloc_ps);
+      bcast_array_1(sp.rho_atc_ps);
+      bcast_array_1(sp.core_n);
+      bcast_array_1(sp.core_l);
+      // heavy fields → SHM (one copy per node).
+      bcast_to_shm_2(tmp.aewfc,      sp_shm.aewfc,      sp.aewfc);
+      bcast_to_shm_2(tmp.pswfc,      sp_shm.pswfc,      sp.pswfc);
+      bcast_to_shm_3(tmp.qfuncl,     sp_shm.qfuncl,     sp.qfuncl);
+      bcast_to_shm_4(tmp.deltaC,     sp_shm.deltaC,     sp.deltaC);
+      bcast_to_shm_2(tmp.ex_cvij,    sp_shm.ex_cvij,    sp.ex_cvij);
+      bcast_to_shm_2(tmp.core_aewfc, sp_shm.core_aewfc, sp.core_aewfc);
+    }
+    mpi->comm.barrier();
+
+    // ---- Visibility: warn LOUDLY when frozen core-valence contributions are
+    // absent for a PAW species, so they are never silently dropped. The core
+    // charge feeds the core-valence Hartree; ex_cvij is the core-valence exact
+    // exchange (both live entirely inside the augmentation sphere; see notes).
+    for (int nt = 0; nt < nsp; ++nt) {
+      auto& sp = paw_species[nt];
+      if (!sp.is_paw) continue;
+      bool no_core_charge = (sp.ae_rho_atc.size() == 0) &&
+                            (sp.ncore_orbitals == 0 || sp.core_aewfc.size() == 0);
+      // Auto-detect the core-valence exchange treatment (detection order):
+      //   h5 Onecenter/ex_cvij       -> frozen Fock c-v exchange (fock)
+      //   else Core/ae_wfc present   -> ex_cvij built NATIVELY at read time
+      //                                 (compute_ex_cvij_from_core, above)
+      //                                 -> fock via the same sp.ex_cvij
+      //   else <DFT c-v XC dataset>  -> dft_xc   [TODO: dataset TBD]
+      //   else                       -> none (omitted; warned loudly below)
+      // TODO: when a DFT core-valence XC dataset is defined in the h5, read a
+      // per-species flag in the loading loop above, broadcast it alongside the
+      // other scalars, and set sp.cv_exchange = cv_exchange_e::dft_xc here.
+      sp.cv_exchange = (sp.ex_cvij.size() > 0) ? cv_exchange_e::fock
+                                               : cv_exchange_e::none;
+      bool no_cv_exchange = (sp.cv_exchange == cv_exchange_e::none);
+      if (no_core_charge) {
+        app_warning("**************************************************************************");
+        app_warning("**************************************************************************");
+        app_warning("***  WARNING: PAW species nt={} has NO all-electron core charge.", nt);
+        app_warning("***  The CORE-VALENCE HARTREE contribution will be OMITTED (set to 0).");
+        app_warning("***  Provide ae_rho_atc (AE core density) or GIPAW core orbitals in the");
+        app_warning("***  mean-field h5 to include it. Total energies / QP levels are affected.");
+        app_warning("**************************************************************************");
+        app_warning("**************************************************************************");
+      }
+      if (no_cv_exchange) {
+        app_warning("**************************************************************************");
+        app_warning("**************************************************************************");
+        app_warning("***  WARNING: PAW species nt={} has NO core-valence exchange kernel", nt);
+        app_warning("***  (no Onecenter/ex_cvij AND no Core/ae_wfc to build one natively).");
+        app_warning("***  The CORE-VALENCE EXACT EXCHANGE is OMITTED. Provide ex_cvij");
+        app_warning("***  (ABINIT <exact_exchange_X_matrix>) or AE core orbitals (Core/,");
+        app_warning("***  GIPAW-enabled pseudo / --corewf XML) to include it.");
+        app_warning("**************************************************************************");
+        app_warning("**************************************************************************");
+      }
+    }
+  }
+
+  // Static (frozen) per-atom D for USPP/PAW (assembled eagerly):
+  //
+  //   D_static(a, I, J) = dion(type(a), I, J) + alpha_x * ex_cvij(type(a), I, J)
+  //
+  // dion (h5 `dion`, loaded into Dnn above) is the FULL frozen D^0 per QE
+  // convention (AE−PS kinetic + frozen-core-screened ionic Hartree). ex_cvij
+  // is the frozen core-valence exact exchange (ABINIT <exact_exchange_X_matrix>):
+  // a static one-center projector Dij contracted LINEARLY with becsum (factor
+  // 1), disjoint from the density-dependent valence Fock (v_x/deltaC), so
+  // holding it in the frozen per-atom D makes e_1e = Tr[Dm·H0] capture it with
+  // the correct factor 1. ex_cvij is in Hartree (matches Dnn after 0.5 Ry→Ha).
+  // alpha_x = exchange fraction (1 for HF/GW). Assembled here (not in the
+  // dion read above) because ex_cvij is only loaded with the heavy paw_species
+  // fields just above. This tensor is never mutated after this point;
+  // density-dependent (Hartree-only) terms are rebuilt per evaluation via
+  // compute_paw_deeq.
+  //
+  // Guard on pp type: paw_species is only populated for USPP/PAW (see above),
+  // so this block must NOT dereference paw_species[nt] on the NC path (empty
+  // vector -> out-of-bounds). ex_cvij is PAW-only; USPP simply has size()==0.
+  //
+  // The core-valence exchange treatment is AUTO-DETECTED per species from the h5
+  // (species_paw_t::cv_exchange, set in the loop above): 'fock' inserts the
+  // frozen ex_cvij one-center Dij here; 'none' skips it (omitted, warned above);
+  // 'dft_xc' (DFT-based c-v XC, dataset TBD) is NOT YET IMPLEMENTED and aborts.
+  if(ptype == pp_uspp_t or ptype == pp_paw_t) {
+    Dnn_atom_static = sarray_t<nda::array_view<ComplexType,3>>(*mpi,
+                        {std::max(1,nat), nhm*npol, nhm*npol});
+    mpi->node_comm.barrier();
+    if(mpi->node_comm.root()) {
+      const double alpha_x = 1.0;
+      auto Dloc_sp = Dnn.local();
+      auto Dloc_st = Dnn_atom_static.local();
+      Dloc_st() = ComplexType(0.0);
+      for(int ia=0; ia<nat; ++ia) {
+        int nt = ityp(ia);
+        // dion replica (already in Ha after the 0.5 Ry→Ha scale above).
+        for(int n=0; n<nhm*npol; ++n)
+          for(int m=0; m<nhm*npol; ++m)
+            Dloc_st(ia, n, m) = Dloc_sp(nt, n, m);
+        auto const& sp = paw_species[nt];
+        if(!sp.is_paw) continue;
+        if(sp.cv_exchange == cv_exchange_e::none) continue;  // omitted (warned above)
+        utils::check(sp.cv_exchange == cv_exchange_e::fock,
+          "pseudopot: core-valence exchange 'dft_xc' (DFT-based core-valence XC) is "
+          "NOT YET IMPLEMENTED for PAW species nt={}: a DFT c-v XC dataset was "
+          "detected in the h5 but cannot be used yet. TODO: implement + unit test.", nt);
+        // fock: insert the frozen ex_cvij one-center Dij (ex_cvij guaranteed present).
+        int nh_a = sp.nh;
+        for(int p=0; p<npol; ++p)
+          for(int n=0; n<nh_a; ++n)
+            for(int m=0; m<nh_a; ++m)
+              Dloc_st(ia, n*npol+p, m*npol+p) +=
+                  ComplexType(alpha_x * sp.ex_cvij(n,m), 0.0);
+      }
+    }
+    mpi->node_comm.barrier();
+    if(mpi->node_comm.root())
+      mpi->internode_comm.broadcast_n(Dnn_atom_static.local().data(),
+                                      Dnn_atom_static.size(), 0);
+    mpi->comm.barrier();
   }
   mpi->node_comm.barrier();
 
@@ -613,7 +1262,7 @@ void pseudopot::save(std::string fname, bool append)
     APP_ABORT("Failed to open h5 file: {}, mode:{}",fname,mode);
   }
   h5::group grp(file);
-  pseudopot_to_h5(fft_mesh,grp,input_file_name,input_file_type);
+  pseudopot_to_h5(fft_mesh_aug,grp,input_file_name,input_file_type);
 }
 
 // This should only be called by a single task
@@ -621,7 +1270,7 @@ void pseudopot::save(std::string fname, bool append)
 void pseudopot::save(h5::group& grp0)
 {
   if(ptype == pp_FILE_t) return; 
-  pseudopot_to_h5(fft_mesh,grp0,input_file_name,input_file_type);
+  pseudopot_to_h5(fft_mesh_aug,grp0,input_file_name,input_file_type);
 }
 
 void pseudopot::add_vnl_impl(nda::range k_range, nda::range b_range, 
@@ -702,7 +1351,8 @@ void pseudopot::add_vpp_impl(boost::mpi3::communicator& comm,
 		   math::nda::DistributedArrayOfRank<4> auto const& psi,
 		   math::nda::DistributedArrayOfRank<4> auto & hpsi,
 		   math::nda::DistributedArrayOfRank<4> auto & Hij,
-                   const Arr3 * nii, const Arr4 * nij)
+                   const Arr3 * nii, const Arr4 * nij,
+                   bool add_hartree, bool add_exchange)
 {
   pots::potential_t vG(ptree{});
 
@@ -740,25 +1390,30 @@ void pseudopot::add_vpp_impl(boost::mpi3::communicator& comm,
    *   4. fft to real space
    *   5. add to vloc
    */
-  if( nii != nullptr or nij != nullptr ) {
+  bool const have_density = (nii != nullptr or nij != nullptr);
+  utils::check( nii == nullptr or nij == nullptr,
+                "Error in pseudo::add_vpp_impl: Both nii and nij!!");
+  utils::check( have_density or not add_exchange,
+                "pseudo::add_vpp_impl: add_exchange requires a density (nii or nij).");
+  if( have_density and add_hartree ) {
 
-    auto mpi_local_context = utils::make_mpi_context(comm); 
+    auto mpi_local_context = utils::make_mpi_context(comm);
 
     // local pseudopotential + hartree
-    sarray_t<nda::array_view<ComplexType,1>> svr(mpi_local_context,{nnr}); 
+    sarray_t<nda::array_view<ComplexType,1>> svr(mpi_local_context,{nnr_aug});
     auto vr = svr.local();
     auto vltot = svloc.local();
 
-    utils::check( nii == nullptr or nij == nullptr, 
-                  "Error in pseudo::add_vpp_impl: Both nii and nij!!");
-    utils::check( k_range.first() == 0 and  k_range.last() == nkpts_ibz, 
+    utils::check( k_range.first() == 0 and  k_range.last() == nkpts_ibz,
                  "Error in add_vloc: add_hartree requires full kpoint range.");
-    // calculate and add hartree term with diagonal occupation matrix
+    // Calculates hartree potential on the soft+augmentation charge density. 
     if( nii != nullptr)
-      hamilt::v_h(*mpi, vG, npol, fft_mesh, lattv, recv, swfc_to_rho.local(), kpts, kp_to_ibz,
+      hamilt::v_h(*mpi, vG, *this, npol, fft_mesh_aug, lattv, recv,
+                  swfc_to_rho.local(), kpts, kp_to_ibz,
                   kp_trev, kp_symm, symm_list, *nii, psi, false, svr);
     else
-      hamilt::v_h(*mpi, vG, npol, fft_mesh, lattv, recv, swfc_to_rho.local(), kpts, kp_to_ibz,
+      hamilt::v_h(*mpi, vG, *this, npol, fft_mesh_aug, lattv, recv,
+                  swfc_to_rho.local(), kpts, kp_to_ibz,
                   kp_trev, kp_symm, symm_list, *nij, psi, false, svr);
 
     mpi->node_comm.barrier();
@@ -774,10 +1429,10 @@ void pseudopot::add_vpp_impl(boost::mpi3::communicator& comm,
     mpi->node_comm.barrier();
 
     // local potential
-    hamilt::add_vloc(npol,fft_mesh,swfc_to_rho.local(),vltot,psi,hpsi);
+    hamilt::add_vloc(npol,fft_mesh_aug,swfc_to_rho.local(),vltot,psi,hpsi);
 
     mpi->node_comm.barrier();
-    // restore vltot (remove vr) 
+    // restore vltot (remove vr)
     if(mpi->node_comm.root()) {
       for( auto is: nda::range(vltot.extent(0)) ) {
         for( auto ip: nda::range(vltot.extent(1)) ) {
@@ -787,21 +1442,123 @@ void pseudopot::add_vpp_impl(boost::mpi3::communicator& comm,
     }
     mpi->node_comm.barrier();
 
+    // Native PAW deeq: build the per-channel D from V_eff = V_loc + V_H
+    // (vltot + vr) on the smooth grid, plus the static (dion + ex_cvij)
+    // baseline and the radial AE−PS one-center Hartree. PerType scaling means
+    // no occupation/N_k is folded into the channel. Built only on PAW/USPP;
+    // NCPP takes the species-resolved static Dnn (its Hartree is purely the
+    // smooth vr applied above). nii and nij produce the identical operator
+    // for the same physical density, both via the full-BZ
+    // symmetry-correct becsum.
+    if (ptype != pp_ncpp_t) {
+      sarray_t<nda::array_view<ComplexType,1>> svfull(mpi_local_context,{nnr_aug});
+      auto vfull = svfull.local();
+      if (mpi->node_comm.root()) {
+        // svloc holds V_loc (Ha); vr holds V_H (Ha) for the converged density.
+        // Build V_eff = V_loc + V_H; deeq sees the L=0 spherical part of svloc
+        // automatically, so we collapse the (spin, npol²) axes to scalar.
+        for (long r = 0; r < nnr_aug; ++r)
+          vfull(r) = svloc.local()(0, 0, r) + vr(r);
+      }
+      mpi->node_comm.barrier();
+      auto Dion_native = (nii != nullptr)
+          ? compute_paw_deeq(*nii, vfull, /*include_static=*/true)
+          : compute_paw_deeq(*nij, vfull, /*include_static=*/true);
+      add_vnl_impl(k_range, b_range, Dion_native, Hij);
+    } else {
+      add_vnl_impl(k_range, b_range, Dnn.local(), Hij);
+    }
+
   } else {
 
-    // local potential
+    // No density (or add_hartree=false): static-only assembly, Eq. (h0) of
+    // Local potential on hpsi plus the frozen non-local D in Hij.
+    // add_vnl_impl indexes Dion(id, ...) with id = (ncpp ? nt : ia); NCPP →
+    // species-resolved Dnn, USPP/PAW → per-atom static_h0_D() =
+    // Dnn_atom_static (dion + ex_cvij) + ∫V_loc·Q̂. The ∫V_loc·Q̂ term is
+    // the frozen one-body ELECTROSTATIC compensation-charge coupling —
+    // neither exchange nor correlation, so it is ALWAYS included (it is
+    // NOT in dion — Eq. d0's −⟨Q̂|v_H[ñ_Zc]⟩ is the
+    // opposite-sign one-center descreening reference). Hartree/exchange are
+    // supplied elsewhere (today: the ERI objects in the SCF classes) and
+    // must not be double-counted here; the density path integrates
+    // (V_loc+V_H)·Q̂ itself and never touches static_h0_D, so the identity
+    // H(n) ≡ H0 + Hartree(n) holds exactly.
     auto vltot = svloc.local();
-    hamilt::add_vloc(npol,fft_mesh,swfc_to_rho.local(),vltot,psi,hpsi);
+    hamilt::add_vloc(npol,fft_mesh_aug,swfc_to_rho.local(),vltot,psi,hpsi);
+
+    if (ptype == pp_ncpp_t)
+      add_vnl_impl(k_range, b_range, Dnn.local(),   Hij);
+    else
+      add_vnl_impl(k_range, b_range, static_h0_D(), Hij);
 
   }
 
-  // non-local part, directly into Hij
-  if( ptype == pp_ncpp_t ) {
-    add_vnl_impl(k_range, b_range, Dnn.local(), Hij); 
-  } else { 
-    utils::check( false, "finish" );
+  // Direct-route exact exchange: the
+  // band-pair-augmented K has no hpsi representation, so it is built into a
+  // temporary with Hij's distribution and accumulated. K is SIGNED
+  // (F = H + K, K negative) per the add_exchange convention.
+  if( have_density and add_exchange ) {
+    if constexpr (MEM == HOST_MEMORY) {
+      auto Kij = math::nda::make_distributed_array<memory::array<MEM,ComplexType,4>>(
+          comm, Hij.grid(), Hij.global_shape(), Hij.block_size());
+      Kij.local() = ComplexType(0.0);
+      if (nii != nullptr) this->add_exchange(k_range, *nii, psi, Kij);
+      else                this->add_exchange(k_range, *nij, psi, Kij);
+      Hij.local() += Kij.local();
+    } else {
+      utils::check(false, "pseudo::add_vpp_impl: add_exchange direct route "
+                          "is host-memory only; use the ERI route on device.");
+    }
   }
+}
 
+// Standalone helper: add the USPP/PAW augmentation to a smooth-grid pair
+// density evaluated at a single (atom-list × G-grid) configuration.
+//
+// Inputs:
+//   becsum_aIJ : per-atom, per-(I,J) coefficient ⟨ψ_a|β_aI⟩ q_IJ ⟨β_aJ|ψ_b⟩
+//                (caller computes from Pskna; shape (nat, nij_max))
+//   gvec_phase : structure factor e^{-iG·τ_a}, shape (nat, ngm_dense)
+// Output:
+//   rhoG       : input density on dense G grid, shape (ngm_dense,);
+//                augmented in place: rhoG += Σ_a Σ_IJ becsum_aIJ Q^IJ_nt(a)(G) e^{-iG·τ_a}
+//
+// Independent of the Hartree/exchange wiring above.
+void pseudopot::add_augmentation_to_pairdensity(
+    nda::ArrayOfRank<2> auto const& becsum_aIJ,
+    nda::ArrayOfRank<2> auto const& gvec_phase,
+    nda::ArrayOfRank<1> auto       & rhoG) const
+{
+  if (ptype == pp_ncpp_t) return;
+  utils::check(qgm.local().size() > 0,
+               "add_augmentation_to_pairdensity: qgm not populated.");
+  utils::check(ngm_dense > 0,
+               "add_augmentation_to_pairdensity: ngm_dense unknown.");
+  long ngm = rhoG.extent(0);
+  utils::check(ngm == ngm_dense,
+               "add_augmentation_to_pairdensity: rhoG/ngm_dense mismatch ({} vs {})",
+               ngm, ngm_dense);
+  utils::check(gvec_phase.extent(1) == ngm,
+               "add_augmentation_to_pairdensity: gvec_phase G-dim mismatch");
+
+  long nat = ityp.extent(0);
+  utils::check(becsum_aIJ.extent(0) == nat, "becsum atom-dim mismatch");
+  utils::check(gvec_phase.extent(0) == nat, "gvec_phase atom-dim mismatch");
+
+  auto qg = qgm.local();
+  for (long ia=0; ia<nat; ++ia) {
+    int nt = ityp(ia);
+    long nij = static_cast<long>(nh(nt))*(nh(nt)+1)/2;
+    if (nij == 0) continue;
+    for (long ij=0; ij<nij; ++ij) {
+      ComplexType b = becsum_aIJ(ia, ij);
+      if (b == ComplexType(0.0)) continue;
+      for (long g=0; g<ngm; ++g) {
+        rhoG(g) += b * qg(nt, ij, g) * gvec_phase(ia, g);
+      }
+    }
+  }
 }
 
 void pseudopot::add_Vpp(boost::mpi3::communicator& comm,
@@ -821,42 +1578,47 @@ void pseudopot::add_Vpp(boost::mpi3::communicator& comm,
 }
 
 void pseudopot::add_Vpp(boost::mpi3::communicator& comm,
-                   nda::range k_range, nda::range b_range, 
-                   nda::ArrayOfRank<3> auto const& nii, 
+                   nda::range k_range, nda::range b_range,
+                   nda::ArrayOfRank<3> auto const& nii,
                    math::nda::DistributedArrayOfRank<4> auto const& psi,
                    math::nda::DistributedArrayOfRank<4> auto & hpsi,
-                   math::nda::DistributedArrayOfRank<4> auto & Hij)
+                   math::nda::DistributedArrayOfRank<4> auto & Hij,
+                   bool add_hartree, bool add_exchange)
 {
-  constexpr auto MEM = memory::get_memory_space<std::decay_t<decltype(psi.local())>>(); 
+  constexpr auto MEM = memory::get_memory_space<std::decay_t<decltype(psi.local())>>();
   constexpr auto MEM1 = memory::get_memory_space<std::decay_t<decltype(hpsi.local())>>();
   constexpr auto MEM2 = memory::get_memory_space<std::decay_t<decltype(Hij.local())>>();
   static_assert(MEM == MEM1, "Memory mismatch.");
   static_assert(MEM == MEM2, "Memory mismatch.");
   memory::array<MEM,ComplexType,4>* p4 = nullptr;
-  add_vpp_impl(comm,k_range,b_range,psi,hpsi,Hij,std::addressof(nii),p4);
+  add_vpp_impl(comm,k_range,b_range,psi,hpsi,Hij,std::addressof(nii),p4,
+               add_hartree,add_exchange);
 }
 
 void pseudopot::add_Vpp(boost::mpi3::communicator& comm,
-                   nda::range k_range, nda::range b_range, 
+                   nda::range k_range, nda::range b_range,
                    nda::ArrayOfRank<4> auto const& nij,
                    math::nda::DistributedArrayOfRank<4> auto const& psi,
                    math::nda::DistributedArrayOfRank<4> auto & hpsi,
-                   math::nda::DistributedArrayOfRank<4> auto & Hij)
-{ 
-  constexpr auto MEM = memory::get_memory_space<std::decay_t<decltype(psi.local())>>(); 
+                   math::nda::DistributedArrayOfRank<4> auto & Hij,
+                   bool add_hartree, bool add_exchange)
+{
+  constexpr auto MEM = memory::get_memory_space<std::decay_t<decltype(psi.local())>>();
   constexpr auto MEM1 = memory::get_memory_space<std::decay_t<decltype(hpsi.local())>>();
   constexpr auto MEM2 = memory::get_memory_space<std::decay_t<decltype(Hij.local())>>();
   static_assert(MEM == MEM1, "Memory mismatch.");
   static_assert(MEM == MEM2, "Memory mismatch.");
   memory::array<MEM,ComplexType,3>* p3 = nullptr;
-  add_vpp_impl(comm,k_range,b_range,psi,hpsi,Hij,p3,std::addressof(nij));
+  add_vpp_impl(comm,k_range,b_range,psi,hpsi,Hij,p3,std::addressof(nij),
+               add_hartree,add_exchange);
 }
 
 // MAM: This routine should take an mpi_context and use it, instead of mpi
 template<nda::ArrayOfRank<3> Arr3, nda::ArrayOfRank<4> Arr4>
-void pseudopot::add_Hartree_impl(nda::range k_range,
+void pseudopot::add_Hartree_impl(nda::range k_range, nda::range b_range,
                                  math::nda::DistributedArrayOfRank<4> auto const& psi,
                                  math::nda::DistributedArrayOfRank<4> auto & hpsi,
+                                 math::nda::DistributedArrayOfRank<4> auto & Vij,
                                  const Arr3 *nii, const Arr4 *nij, bool symmetrize) {
   constexpr auto MEM = memory::get_memory_space<std::decay_t<decltype(psi.local())>>();
   constexpr auto MEM1 = memory::get_memory_space<std::decay_t<decltype(hpsi.local())>>();
@@ -873,7 +1635,7 @@ void pseudopot::add_Hartree_impl(nda::range k_range,
   utils::check(k_range_loc.first() >= 0 and
                k_range_loc.last()  <= nkpts_ibz, "Range mismatch.");
 
-  auto sv_hartree = make_shared_array<nda::array_view<ComplexType, 1>>(*mpi, {nnr});
+  auto sv_hartree = make_shared_array<nda::array_view<ComplexType, 1>>(*mpi, {nnr_aug});
   auto v_hartree = sv_hartree.local();
 
   // MAM: this must be passed to the routine
@@ -883,16 +1645,41 @@ void pseudopot::add_Hartree_impl(nda::range k_range,
                "Error in pseudo::add_Hartree_impl: Both nii and nij exist!");
   utils::check(k_range.first() == 0 and k_range.last() == nkpts_ibz,
                "Error in add_Hartree_impl: add_hartree requires full kpoint range.");
-  // calculate and add hartree term with diagonal occupation matrix
+  // calculate and add hartree term. The pseudopot-taking hamilt::v_h
+  // delegates to the smooth-only v_h then (for USPP/PAW) adds the
+  // compensation-charge augmentation in G-space; NCPP no-ops the augment.
   if (nii != nullptr)
-    hamilt::v_h(*mpi, vG, npol, fft_mesh, lattv, recv, swfc_to_rho.local(), kpts, kp_to_ibz,
+    hamilt::v_h(*mpi, vG, *this, npol, fft_mesh_aug, lattv, recv,
+                swfc_to_rho.local(), kpts, kp_to_ibz,
                 kp_trev, kp_symm, symm_list, *nii, psi, symmetrize, sv_hartree);
   else
-    hamilt::v_h(*mpi, vG, npol, fft_mesh, lattv, recv, swfc_to_rho.local(), kpts, kp_to_ibz,
+    hamilt::v_h(*mpi, vG, *this, npol, fft_mesh_aug, lattv, recv,
+                swfc_to_rho.local(), kpts, kp_to_ibz,
                 kp_trev, kp_symm, symm_list, *nij, psi, symmetrize, sv_hartree);
 
   // add v_hartree to hpsi
-  hamilt::add_vloc(npol, fft_mesh, swfc_to_rho.local(), v_hartree, psi, hpsi);
+  hamilt::add_vloc(npol, fft_mesh_aug, swfc_to_rho.local(), v_hartree, psi, hpsi);
+
+  // PAW/USPP: build the native one-center deeq (radial AE−PS + dynamic
+  // G-space ∫V_H·Q from the smooth V_H(r) just computed; NO static, since
+  // Vij is the pure Hartree matrix) and contract it into Vij via add_vnl_impl
+  // — the single matrix-touching path, mirroring how add_vpp_impl forms Hij.
+  // No QE deeq, no XC. NCPP / non-augmented species → zero Dion (no-op).
+  // The deeq is a functional of the supplied density (diagonal nii or full
+  // nij), NOT of the QE mean-field.
+  if (ptype != pp_ncpp_t) {
+    if (nii != nullptr) {
+      auto Dion_H = compute_paw_deeq(*nii, v_hartree, /*include_static=*/false);
+      add_vnl_impl(k_range, b_range, Dion_H, Vij);
+    } else if (nij != nullptr) {
+      // Full density-matrix path: becsum via compute_becsum_full_symm
+      // (full-BZ lift, 1/N_k k-weight), so the one-center radial Hartree
+      // matches the smooth compensation charge that hamilt::v_h(*nij,...)
+      // already added above — also on symmetry-reduced meshes.
+      auto Dion_H = compute_paw_deeq(*nij, v_hartree, /*include_static=*/false);
+      add_vnl_impl(k_range, b_range, Dion_H, Vij);
+    }
+  }
 
 }
 
@@ -900,18 +1687,83 @@ void pseudopot::add_Hartree(nda::range k_range,
                             nda::ArrayOfRank<3> auto const& nii,
                             math::nda::DistributedArrayOfRank<4> auto const& psi,
                             math::nda::DistributedArrayOfRank<4> auto & hpsi,
+                            math::nda::DistributedArrayOfRank<4> auto & Vij,
                             bool symmetrize) {
   nda::array<ComplexType, 4>* p4 = nullptr;
-  add_Hartree_impl(k_range, psi, hpsi, std::addressof(nii), p4, symmetrize);
+  nda::range b_range(0, psi.global_shape()[2]);
+  add_Hartree_impl(k_range, b_range, psi, hpsi, Vij, std::addressof(nii), p4, symmetrize);
 }
 
 void pseudopot::add_Hartree(nda::range k_range,
                             nda::ArrayOfRank<4> auto const& nij,
                             math::nda::DistributedArrayOfRank<4> auto const& psi,
                             math::nda::DistributedArrayOfRank<4> auto & hpsi,
+                            math::nda::DistributedArrayOfRank<4> auto & Vij,
                             bool symmetrize) {
   nda::array<ComplexType,3>* p3 = nullptr;
-  add_Hartree_impl(k_range, psi, hpsi, p3, std::addressof(nij), symmetrize);
+  nda::range b_range(0, psi.global_shape()[2]);
+  add_Hartree_impl(k_range, b_range, psi, hpsi, Vij, p3, std::addressof(nij), symmetrize);
+}
+
+// ---------------------------------------------------------------------------
+// Exact-exchange matrix elements K_{ij}(s, k_p) on the IBZ.
+//
+// Builds K via FFT pair densities; for USPP/PAW also adds the per-pair
+// Q^IJ_a(G+Δk) augmentation. Dispatches on pp_type via the v_x_paw header,
+// which delegates to the smooth-only `hamilt::v_x(...)` for NCPP.
+//
+// Unlike add_Hartree, which produces an hpsi correction, exchange has no
+// representation as a local potential acting on a single orbital — the
+// augmentation cross terms involve band-pair-dependent projector overlaps.
+// add_exchange therefore writes the full K matrix directly into Kij.
+// ---------------------------------------------------------------------------
+void pseudopot::add_exchange(nda::range k_range,
+                             nda::ArrayOfRank<3> auto const& nii,
+                             math::nda::DistributedArrayOfRank<4> auto const& psi,
+                             math::nda::DistributedArrayOfRank<4> auto & Kij)
+{
+  constexpr auto MEM  = memory::get_memory_space<std::decay_t<decltype(psi.local())>>();
+  constexpr auto MEM2 = memory::get_memory_space<std::decay_t<decltype(Kij.local())>>();
+  static_assert(MEM == MEM2, "pseudopot::add_exchange: psi/Kij memory mismatch");
+
+  utils::check(k_range.first() == 0 && k_range.last() == nkpts_ibz,
+               "pseudopot::add_exchange: k_range must span the full IBZ");
+  utils::check(psi.global_shape()[1] == nkpts_ibz,
+               "pseudopot::add_exchange: psi must be on the IBZ");
+  utils::check(psi.global_shape()[3] == npol * (long)swfc_to_rho.size(),
+               "pseudopot::add_exchange: psi g-dim mismatch");
+
+  // Coulomb kernel (default: bare 4π/|G+Δk|² with G+Δk=0 zeroed).
+  pots::potential_t vG(ptree{});
+
+  hamilt::paw::v_x(*mpi, vG, *this, npol, fft_mesh_aug, lattv, recv,
+                   swfc_to_rho.local(), kpts, kp_to_ibz,
+                   kp_trev, kp_symm, symm_list, nii, psi, Kij,
+                   paw_shape_restored(), paw_onsite_diag());
+}
+
+// Full density-matrix overload (routes to the natural-orbital v_x(nij)).
+void pseudopot::add_exchange(nda::range k_range,
+                             nda::ArrayOfRank<4> auto const& nij,
+                             math::nda::DistributedArrayOfRank<4> auto const& psi,
+                             math::nda::DistributedArrayOfRank<4> auto & Kij)
+{
+  constexpr auto MEM  = memory::get_memory_space<std::decay_t<decltype(psi.local())>>();
+  constexpr auto MEM2 = memory::get_memory_space<std::decay_t<decltype(Kij.local())>>();
+  static_assert(MEM == MEM2, "pseudopot::add_exchange: psi/Kij memory mismatch");
+
+  utils::check(k_range.first() == 0 && k_range.last() == nkpts_ibz,
+               "pseudopot::add_exchange: k_range must span the full IBZ");
+  utils::check(psi.global_shape()[1] == nkpts_ibz,
+               "pseudopot::add_exchange: psi must be on the IBZ");
+  utils::check(psi.global_shape()[3] == npol * (long)swfc_to_rho.size(),
+               "pseudopot::add_exchange: psi g-dim mismatch");
+
+  pots::potential_t vG(ptree{});
+  hamilt::paw::v_x(*mpi, vG, *this, npol, fft_mesh_aug, lattv, recv,
+                   swfc_to_rho.local(), kpts, kp_to_ibz,
+                   kp_trev, kp_symm, symm_list, nij, psi, Kij,
+                   paw_shape_restored(), paw_onsite_diag());
 }
 
 
@@ -932,40 +1784,68 @@ template void pseudopot::add_Vpp(boost::mpi3::communicator&,nda::range,nda::rang
         V<ComplexType,3> const&, \
         darray_t<V<ComplexType,4>,communicator> const&, \
         darray_t<V<ComplexType,4>,communicator>&, \
-        darray_t<V<ComplexType,4>,communicator>&); \
+        darray_t<V<ComplexType,4>,communicator>&,bool,bool); \
 template void pseudopot::add_Vpp(boost::mpi3::communicator&,nda::range,nda::range, \
         V<ComplexType,4> const&,  \
         darray_t<V<ComplexType,4>,communicator> const&,  \
         darray_t<V<ComplexType,4>,communicator>&,  \
-        darray_t<V<ComplexType,4>,communicator>&);  \
+        darray_t<V<ComplexType,4>,communicator>&,bool,bool);  \
 
 #define __add_Vpp2__(V1,V2) \
 template void pseudopot::add_Vpp(boost::mpi3::communicator&,nda::range,nda::range, \
         V1<ComplexType,3> const&, \
         darray_t<V2<ComplexType,4>,communicator> const&, \
         darray_t<V2<ComplexType,4>,communicator>&, \
-        darray_t<V2<ComplexType,4>,communicator>&); \
+        darray_t<V2<ComplexType,4>,communicator>&,bool,bool); \
 template void pseudopot::add_Vpp(boost::mpi3::communicator&,nda::range,nda::range, \
         V1<ComplexType,4> const&, \
         darray_t<V2<ComplexType,4>,communicator> const&, \
         darray_t<V2<ComplexType,4>,communicator>&, \
-        darray_t<V2<ComplexType,4>,communicator>&); 
+        darray_t<V2<ComplexType,4>,communicator>&,bool,bool);
 
 #define __add_hartree__(V1,V2)  \
 template void pseudopot::add_Hartree(nda::range k_range,  \
         V1<ComplexType, 3> const&,  \
         darray_t<V2<ComplexType,4>,communicator> const&,  \
+        darray_t<V2<ComplexType,4>,communicator>&,  \
         darray_t<V2<ComplexType,4>,communicator>&, bool);  \
 template void pseudopot::add_Hartree(nda::range k_range,  \
         V1<ComplexType, 4> const&,  \
         darray_t<V2<ComplexType,4>,communicator> const&,  \
-        darray_t<V2<ComplexType,4>,communicator>&, bool);  
+        darray_t<V2<ComplexType,4>,communicator>&,  \
+        darray_t<V2<ComplexType,4>,communicator>&, bool);
+
+#define __add_exchange__(V1,V2)  \
+template void pseudopot::add_exchange(nda::range k_range,  \
+        V1<ComplexType, 3> const&,  \
+        darray_t<V2<ComplexType,4>,communicator> const&,  \
+        darray_t<V2<ComplexType,4>,communicator>&);  \
+template void pseudopot::add_exchange(nda::range k_range,  \
+        V1<ComplexType, 4> const&,  \
+        darray_t<V2<ComplexType,4>,communicator> const&,  \
+        darray_t<V2<ComplexType,4>,communicator>&);
+
+// add_vnl_impl is a template defined in this TU, so the header-inline add_Vnl
+// wrapper (used by hamilt::set_vnl_only for the cross-code energy ledger) needs
+// its instantiations here. Both D flavours occur: a view, from Dnn_view() /
+// Dnn_atom_view(), and an owning array, from static_D_cv_only() / static_h0_D()
+// and the differences taken between them.
+#define __add_vnl__(V1,V2) \
+template void pseudopot::add_vnl_impl(nda::range,nda::range, \
+        V1<ComplexType,3> const&, \
+        darray_t<V2<ComplexType,4>,communicator>&);
 
 __add_Vpp__(host_array)
 __add_Vpp2__(host_array_view,host_array)
 
+__add_vnl__(host_array,host_array)
+__add_vnl__(host_array_view,host_array)
+
 __add_hartree__(host_array,host_array)
 __add_hartree__(host_array_view,host_array)
+
+__add_exchange__(host_array,host_array)
+__add_exchange__(host_array_view,host_array)
 
 #if defined(ENABLE_DEVICE)
 using memory::device_array;

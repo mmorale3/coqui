@@ -35,6 +35,7 @@
 #include "utilities/concepts.hpp"
 #include "mean_field/symmetry/bz_symmetry.hpp"
 #include "mean_field/mf_source.hpp"
+#include "hamiltonian/pseudo/pp_schema.hpp"
 #include <hdf5.h>
 #include <hdf5_hl.h>
 
@@ -117,13 +118,21 @@ qe_system read_xml(std::shared_ptr<utils::mpi_context_t<mpi3::communicator>> mpi
    * basis set
    */ 
   auto ecrho = io::get_value<double>(pt, "qes:espresso.output.basis_set.ecutrho");
-  auto npwx = io::get_value<int>(pt, "qes:espresso.output.basis_set.npwx"); 
-  auto ngm = io::get_value<int>(pt, "qes:espresso.output.basis_set.ngm"); 
-  auto ngms = io::get_value<int>(pt, "qes:espresso.output.basis_set.ngms"); 
+  auto npwx = io::get_value<int>(pt, "qes:espresso.output.basis_set.npwx");
+  auto ngm = io::get_value<int>(pt, "qes:espresso.output.basis_set.ngm");
+  auto ngms = io::get_value<int>(pt, "qes:espresso.output.basis_set.ngms");
+  // QE convention: basis_set/fft_grid is the dense (dfftp) grid (ecutrho-sized);
+  //                basis_set/fft_smooth is the smooth (dffts) grid (ecutwfc-sized).
+  // For NCPP these are equal. fft_smooth is not always written (older QE schemas);
+  // when missing, fall back to the dense grid.
+  nda::array<int, 1> fft_mesh_aug(3);
+  fft_mesh_aug(0) = io::get_value<int>(pt, "qes:espresso.output.basis_set.fft_grid.nr1");
+  fft_mesh_aug(1) = io::get_value<int>(pt, "qes:espresso.output.basis_set.fft_grid.nr2");
+  fft_mesh_aug(2) = io::get_value<int>(pt, "qes:espresso.output.basis_set.fft_grid.nr3");
   nda::array<int, 1> fft_mesh(3);
-  fft_mesh(0) = io::get_value<int>(pt, "qes:espresso.output.basis_set.fft_grid.nr1"); 
-  fft_mesh(1) = io::get_value<int>(pt, "qes:espresso.output.basis_set.fft_grid.nr2"); 
-  fft_mesh(2) = io::get_value<int>(pt, "qes:espresso.output.basis_set.fft_grid.nr3"); 
+  fft_mesh(0) = io::get_value_with_default<int>(pt, "qes:espresso.output.basis_set.fft_smooth.nr1", fft_mesh_aug(0));
+  fft_mesh(1) = io::get_value_with_default<int>(pt, "qes:espresso.output.basis_set.fft_smooth.nr2", fft_mesh_aug(1));
+  fft_mesh(2) = io::get_value_with_default<int>(pt, "qes:espresso.output.basis_set.fft_smooth.nr3", fft_mesh_aug(2));
 
   nda::array<double, 2> bg(3,3);
   {
@@ -283,9 +292,9 @@ qe_system read_xml(std::shared_ptr<utils::mpi_context_t<mpi3::communicator>> mpi
   utils::check(symm_list.size() == nsym,
                "Error parsing symmetries from qe::xml. nsym:{}, # symmetries found:{}",nsym,symm_list.size());
 
-  return qe_system(std::move(mpi),outdir,prefix,xml_input_type,no_q_sym,
+  return qe_system(std::move(mpi),outdir,prefix,xml_input_type,hamilt::pp_ncpp_t,no_q_sym,
 		   alat,npwx,ngm,ngms,nelec,3,nspin,(noncolin?2:1),spinorbit,
-		   ecrho,species,at_ids,at_pos,fft_mesh,
+		   ecrho,species,at_ids,at_pos,fft_mesh,fft_mesh_aug,
 		   lattv,bg,kp_grid,kpts,k_weight,npw,eigval,occ,symm_list,efermi,not noinv);
 }
 
@@ -319,8 +328,9 @@ qe_system read_h5(std::shared_ptr<utils::mpi_context_t<mpi3::communicator>> mpi,
   double efermi = 0.0;
 
   nda::stack_array<int,3> fft_mesh;
+  nda::stack_array<int,3> fft_mesh_aug;
 
-  h5::group sgrp = grp.open_group("System"); 
+  h5::group sgrp = grp.open_group("System");
   // unit cell
   h5::h5_read_attribute(sgrp, "number_of_atoms", natoms);
   h5::h5_read_attribute(sgrp, "number_of_species", nspecies);
@@ -444,7 +454,36 @@ qe_system read_h5(std::shared_ptr<utils::mpi_context_t<mpi3::communicator>> mpi,
 
   h5::h5_read_attribute(ogrp, "number_of_bands", nbnd);
   h5::h5_read_attribute(ogrp, "ecutrho", ecrho);
+  // Unit pin (schema 3): /Orbitals@ecutrho is
+  // HARTREE for pw2coqui files with /Hamiltonian@schema_version >= 3.
+  // Older pw2coqui files wrote QE's ecutrho in raw Ry — scale x0.5 so this
+  // init path matches the XML path (which is Hartree and reproduces QE's
+  // dense G-sphere exactly; the unscaled Ry value inflated the sphere 2x).
+  {
+    int sv = 0;
+    if (grp.has_subgroup("Hamiltonian")) {
+      h5::group hgrp = grp.open_group("Hamiltonian");
+      sv = hamilt::h5_pp_schema_version(hgrp);
+    }
+    if (sv < 3) ecrho *= 0.5;
+  }
+  // Smooth (dffts) FFT mesh: written as "fft_mesh" by both pw2coqui and the
+  // CoQui qe_system::save() path.
   nda::h5_read(grp, "Orbitals/fft_mesh", fft_mesh);
+  // Dense (dfftp / augmentation) FFT mesh: written as "fft_mesh_aug" by
+  // pw2coqui (Step-1+ schema) and qe_system::save(). For older checkpoints
+  // that predate the smooth/dense split, fall back to the smooth mesh
+  // (NCPP-equivalent behavior) with a warning so the user knows that PAW
+  // augmentation paths may be silently mis-sized.
+  if (ogrp.has_dataset("fft_mesh_aug")) {
+    nda::h5_read(grp, "Orbitals/fft_mesh_aug", fft_mesh_aug);
+  } else {
+    fft_mesh_aug = fft_mesh;
+    app_warning("qe_interface::read_h5: 'Orbitals/fft_mesh_aug' not present in {}; "
+                "falling back to fft_mesh for the dense grid. Regenerate the h5 "
+                "with the current pw2coqui to silence this warning.",
+                outdir+"/"+prefix+".coqui.h5");
+  }
   h5::h5_read_attribute(ogrp, "npwx", npwx);
   nda::array<int, 1> npw(npwx);
   nda::h5_read(grp, "Orbitals/npw", npw);
@@ -482,18 +521,41 @@ qe_system read_h5(std::shared_ptr<utils::mpi_context_t<mpi3::communicator>> mpi,
   std::map<std::string,double> total_energy;
   total_energy[std::string("ewald")] = enuc;
 
+  // read pseudopotential type
+  hamilt::pp_type_e pp_type = hamilt::pp_ncpp_t;
+  std::string pp_type_str = "none";
+  if(H5Aexists(h5::hid_t(sgrp), "pp_type")) {
+    h5::h5_read_attribute(sgrp, "pp_type", pp_type_str);
+  } else if (grp.has_subgroup("Hamiltonian")) {
+    auto hgrp = grp.open_group("Hamiltonian");
+    if (H5Aexists(h5::hid_t(hgrp), "pp_type")) {
+      h5::h5_read_attribute(hgrp, "pp_type", pp_type_str);
+    } else {
+      utils::check(false,
+        "qe_interface::read_h5: Could not find pp_type in either System or Hamiltonian datasets.");
+    }
+  } else {
+    utils::check(false,
+      "qe_interface::read_h5: Could not find pp_type in either System or Hamiltonian datasets.");
+  }
+  if      (pp_type_str == "ncpp") pp_type = hamilt::pp_ncpp_t;
+  else if (pp_type_str == "uspp") pp_type = hamilt::pp_uspp_t;
+  else if (pp_type_str == "paw")  pp_type = hamilt::pp_paw_t;
+  else utils::check(false,"qe_interface::read_h5: unrecognised pp_type='{}' in {}",
+                   pp_type_str, outdir+"/"+prefix+".coqui.h5");
+
   if( mf::bz_symm::can_init_from_h5(sgrp) ) {
-    mf::bz_symm bz(sgrp); 
-    return qe_system(std::move(mpi),outdir,prefix,h5_input_type,false,
+    mf::bz_symm bz(sgrp);
+    return qe_system(std::move(mpi),outdir,prefix,h5_input_type,pp_type,false,
                      alat,npwx,ngm,ngms,nelec,ndims,nspin,npol,spinorbit,
-                     ecrho,species,at_ids,at_pos,fft_mesh,
+                     ecrho,species,at_ids,at_pos,fft_mesh,fft_mesh_aug,
                      lattv,bg,kp_grid,kpts,k_weight,npw,eigval,occ,symm_list,efermi,bz);
   } else {
-    return qe_system(std::move(mpi),outdir,prefix,h5_input_type,false,
+    return qe_system(std::move(mpi),outdir,prefix,h5_input_type,pp_type,false,
                      alat,npwx,ngm,ngms,nelec,ndims,nspin,npol,spinorbit,
-                     ecrho,species,at_ids,at_pos,fft_mesh,
+                     ecrho,species,at_ids,at_pos,fft_mesh,fft_mesh_aug,
                      lattv,bg,kp_grid,kpts,k_weight,npw,eigval,occ,symm_list,efermi,not noinv);
-  } 
+  }
 }
 
 } // qe

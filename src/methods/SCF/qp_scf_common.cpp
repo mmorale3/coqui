@@ -254,6 +254,38 @@ void solve_qp_eqn(sArray_t<Array_view_3D_t> &sE_ska,
     E_loc = sE_ska.local()(s_rng, k_rng, a_rng);
   }
 
+  // Optional diagnostic dump of the exact AC inputs: the diagonal dynamic
+  // self-energy Sigma_c(iw) in the MO basis, the static Vhf diagonal, and the
+  // starting energies. Enabled by COQUI_QP_SIGMA_DUMP=<file.h5>. All ranks
+  // participate in the reduction; only the global root writes.
+  if (const char *dump_path = std::getenv("COQUI_QP_SIGMA_DUMP")) {
+    nda::array<ComplexType, 4> Sig_wska(nw, ns, nkpts, nbnd);
+    nda::array<ComplexType, 3> Vhf_ska(ns, nkpts, nbnd);
+    nda::array<ComplexType, 3> E0_ska(ns, nkpts, nbnd);
+    Sig_wska() = ComplexType(0.0);
+    Vhf_ska() = ComplexType(0.0);
+    E0_ska() = ComplexType(0.0);
+    Sig_wska(nda::range::all, s_rng, k_rng, a_rng) = dSigma_wska.local();
+    Vhf_ska(s_rng, k_rng, a_rng) = dVhf_ska.local();
+    E0_ska(s_rng, k_rng, a_rng) = dE_ska.local();
+    comm->all_reduce_in_place_n(Sig_wska.data(), Sig_wska.size(), std::plus<>{});
+    comm->all_reduce_in_place_n(Vhf_ska.data(), Vhf_ska.size(), std::plus<>{});
+    comm->all_reduce_in_place_n(E0_ska.data(), E0_ska.size(), std::plus<>{});
+    if (comm->root()) {
+      auto n_to_iw_d = nda::map([&](int n) { return FT.omega(n); });
+      nda::array<ComplexType, 1> iw_mesh_d(n_to_iw_d(FT.wn_mesh()));
+      h5::file f(dump_path, 'w');
+      h5::group g(f);
+      nda::h5_write(g, "iw_mesh", iw_mesh_d, false);
+      nda::h5_write(g, "Sigma_wska", Sig_wska, false);
+      nda::h5_write(g, "Vhf_ska", Vhf_ska, false);
+      nda::h5_write(g, "E0_ska", E0_ska, false);
+      h5::h5_write(g, "mu", mu);
+      app_log(1, "solve_qp_eqn: dumped Sigma(iw)/Vhf/E0 to {}", dump_path);
+    }
+    comm->barrier();
+  }
+
   // ------ Solve quasi-particle equation for Heff ------
   {
     long dim1 = ns_loc * nk_loc * na_loc;

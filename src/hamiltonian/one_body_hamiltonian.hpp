@@ -58,9 +58,10 @@ namespace hamilt
  *           with global shape = (nspin, nkpts, nbnd, nbnd)
  */ 
 template<MEMORY_SPACE MEM = HOST_MEMORY>
-auto H0(mf::MF &mf, boost::mpi3::communicator &comm, pseudopot *psp,  
-        nda::range k_range = {-1,-1}, nda::range b_range = {-1,-1}, 
-        std::array<long,4> pgrid = {0}, std::array<long,4> bz = {1,1,2048,2048})
+auto H0(mf::MF &mf, boost::mpi3::communicator &comm, pseudopot *psp,
+        nda::range k_range = {-1,-1}, nda::range b_range = {-1,-1},
+        std::array<long,4> pgrid = {0}, std::array<long,4> bz = {1,1,2048,2048},
+        bool skip_pp = false)
 {
   if(k_range == nda::range{-1,-1}) k_range = nda::range(mf.nkpts_ibz());
   if(b_range == nda::range{-1,-1}) b_range = nda::range(mf.nbnd());
@@ -69,10 +70,10 @@ auto H0(mf::MF &mf, boost::mpi3::communicator &comm, pseudopot *psp,
     using larray = memory::array<MEM,ComplexType,4>;
     utils::check(psp != nullptr, "Error in H0: Missing pseudopot object.");
     auto psi = mf::read_distributed_orbital_set_ibz<larray>(mf,comm,'w',pgrid,
-                               nda::range(-1,-1), k_range, b_range, bz); 
+                               nda::range(-1,-1), k_range, b_range, bz);
     memory::array_view<MEM,ComplexType,3> *p3=nullptr;
     memory::array_view<MEM,ComplexType,4> *p4=nullptr;
-    return detail::gen_H0<MEM>(mf,comm,psp,k_range,b_range,psi,p3,p4);
+    return detail::gen_H0<MEM>(mf,comm,psp,k_range,b_range,psi,p3,p4,skip_pp);
   } else {
     utils::check(mf.mf_type() == mf::pyscf_source, "Source mismacth");
     utils::check(k_range.size() == mf.nkpts_ibz(), "No k_range with pyscf backend yet.");
@@ -111,6 +112,83 @@ void set_H0(mf::MF &mf, pseudopot *psp, math::shm::shared_array<Array_4D_t> &sH0
 }
 
 /**
+ * Diagnostic: kinetic-only one-body Hamiltonian (skips the pseudopotential /
+ * external + one-center terms). Used to split e_1e = Tr[Dm*H0] into the smooth
+ * kinetic energy Tr[Dm*T] and the remaining external/pseudopotential part, for
+ * component-by-component comparison against other codes (e.g. ABINIT).
+ */
+template<nda::MemoryArrayOfRank<4> Array_4D_t>
+void set_kinetic(mf::MF &mf, pseudopot *psp, math::shm::shared_array<Array_4D_t> &sT_skij) {
+  long np = sT_skij.internode_comm()->size();
+  long np_s = (np % mf.nspin()== 0)? mf.nspin() : 1;
+  long np_k = utils::find_proc_grid_max_npools(np/np_s, (long)mf.nkpts_ibz(), 1.0);
+  long np_i = np / (np_s*np_k);
+  std::array<long, 4> pgrid = {np_s, np_k, np_i, 1};
+  long blk_i = std::min( {(long)1024, (mf.nbnd())/np_i});
+  std::array<long, 4> bsize = {1, 1, blk_i, 2048};
+  // Each node root writes only ITS OWN slice, and all_reduce() then sums across
+  // nodes -- so anything already in sT_skij outside that slice is summed once per
+  // node rather than overwritten. set_H0 gets away without this because it is
+  // handed a freshly constructed (zero-initialised) array; a caller reusing a
+  // matrix as scratch is not. Measured cost of omitting it: a reused Fock matrix
+  // turned Tr[Dm*T] into -61.6 Ha (16 nodes x Tr[Dm*F]) on a 128-rank run.
+  sT_skij.set_zero();
+  if (sT_skij.node_comm()->root()) {
+    auto dT  = hamilt::H0<HOST_MEMORY>(mf, *sT_skij.internode_comm(), psp,
+                                       nda::range(mf.nkpts_ibz()), nda::range(mf.nbnd()),
+                                       pgrid, bsize, /*skip_pp=*/true);
+    auto T_loc = sT_skij.local();
+    T_loc(dT.local_range(0), dT.local_range(1), dT.local_range(2), dT.local_range(3)) = dT.local();
+  }
+  sT_skij.communicator()->barrier();
+  sT_skij.all_reduce();
+}
+
+/**
+ * Diagnostic: shared-memory band-space matrix of a caller-supplied non-local D
+ * tensor ONLY — no kinetic, no local potential, no Hartree. Contracting it with
+ * the density matrix gives that single term's contribution to
+ * e_1e = Tr[Dm*H0], which is how e_1e gets split for the cross-code PAW energy
+ * ledger (ABINIT's e1t10, dijfock_cv, and the descreening ∫V_loc·Q̂).
+ *
+ * Cheap: add_Vnl works off the stored projectors, so unlike set_H0/set_kinetic
+ * this reads no orbitals.
+ *
+ * Convention note: gen_H0 conjugates Hij, adds the local part, then conjugates
+ * again — so the non-local block passes through UNCHANGED, and what add_Vnl
+ * returns here is already in H0's final convention. Do not conjugate it.
+ *
+ * `D`'s leading index is the species for NCPP and the atom for USPP/PAW, as in
+ * add_vnl_impl.
+ */
+template<nda::MemoryArrayOfRank<4> Array_4D_t>
+void set_vnl_only(mf::MF &mf, pseudopot *psp, nda::ArrayOfRank<3> auto const& D,
+                  math::shm::shared_array<Array_4D_t> &sV_skij) {
+  utils::check(psp != nullptr, "Error in set_vnl_only: Missing pseudopot object.");
+  long np = sV_skij.internode_comm()->size();
+  long np_s = (np % mf.nspin()== 0)? mf.nspin() : 1;
+  long np_k = utils::find_proc_grid_max_npools(np/np_s, (long)mf.nkpts_ibz(), 1.0);
+  long np_i = np / (np_s*np_k);
+  std::array<long, 4> pgrid = {np_s, np_k, np_i, 1};
+  long blk_i = std::min( {(long)1024, (mf.nbnd())/np_i});
+  std::array<long, 4> bsize = {1, 1, blk_i, 2048};
+  sV_skij.set_zero();
+  if (sV_skij.node_comm()->root()) {
+    using larray = memory::array<HOST_MEMORY,ComplexType,4>;
+    auto dV = math::nda::make_distributed_array<larray>(
+                  *sV_skij.internode_comm(), pgrid,
+                  {(long)mf.nspin(), (long)mf.nkpts_ibz(), (long)mf.nbnd(), (long)mf.nbnd()},
+                  bsize);
+    dV.local() = ComplexType(0.0);
+    psp->add_Vnl(nda::range(mf.nkpts_ibz()), nda::range(mf.nbnd()), D, dV);
+    auto V_loc = sV_skij.local();
+    V_loc(dV.local_range(0), dV.local_range(1), dV.local_range(2), dV.local_range(3)) = dV.local();
+  }
+  sV_skij.communicator()->barrier();
+  sV_skij.all_reduce();
+}
+
+/**
  * One-body hamiltonian associated with MF object in a distributed array
  * Includes kinetic, hartree and pseudo-potential/external potential contributions.
  * @param mf    [input] - mean-field object
@@ -125,8 +203,9 @@ void set_H0(mf::MF &mf, pseudopot *psp, math::shm::shared_array<Array_4D_t> &sH0
 template<MEMORY_SPACE MEM = HOST_MEMORY>
 auto H(mf::MF &mf, boost::mpi3::communicator &comm, pseudopot *psp,
         nda::ArrayOfRank<4> auto const& nij,
-        std::array<long,4> pgrid = {0}, std::array<long,4> bz = {1,1,2048,2048})
-{ 
+        std::array<long,4> pgrid = {0}, std::array<long,4> bz = {1,1,2048,2048},
+        bool add_hartree = true, bool add_exchange = false)
+{
   using nij_type = decltype(nij);
   static_assert(memory::get_memory_space<nij_type>() == MEM, "Memory Space mismatch.");
   // this is, unfortunately, code dependent, so fork here!
@@ -138,7 +217,8 @@ auto H(mf::MF &mf, boost::mpi3::communicator &comm, pseudopot *psp,
     auto psi = mf::read_distributed_orbital_set_ibz<larray>(mf,comm,'w',pgrid,
                                nda::range(mf.nspin()),k_rng,b_rng,bz);
     memory::array_view<MEM,ComplexType,3> *p3=nullptr;
-    return detail::gen_H0<MEM>(mf,comm,psp,k_rng,b_rng,psi,p3,std::addressof(nij));
+    return detail::gen_H0<MEM>(mf,comm,psp,k_rng,b_rng,psi,p3,std::addressof(nij),
+                               /*skip_pp=*/false,add_hartree,add_exchange);
   } else {
     utils::check(mf.mf_type() == mf::pyscf_source, "Source mismatch");
     return detail::pyscf_read_1B_from_file<MEM>(mf,"H0",comm,pgrid,bz);
@@ -160,7 +240,8 @@ auto H(mf::MF &mf, boost::mpi3::communicator &comm, pseudopot *psp,
 template<MEMORY_SPACE MEM = HOST_MEMORY>
 auto H(mf::MF &mf, boost::mpi3::communicator &comm, pseudopot *psp,
         nda::ArrayOfRank<3> auto const& nii,
-        std::array<long,4> pgrid = {0}, std::array<long,4> bz = {1,1,2048,2048})
+        std::array<long,4> pgrid = {0}, std::array<long,4> bz = {1,1,2048,2048},
+        bool add_hartree = true, bool add_exchange = false)
 {
   // this is, unfortunately, code dependent, so fork here!
   if (mf.mf_type() == mf::qe_source or mf.mf_type() == mf::bdft_source) {
@@ -171,7 +252,8 @@ auto H(mf::MF &mf, boost::mpi3::communicator &comm, pseudopot *psp,
     auto psi = mf::read_distributed_orbital_set_ibz<larray>(mf,comm,'w',pgrid,
                                nda::range(mf.nspin()),k_rng,b_rng,bz);
     memory::array_view<MEM,ComplexType,4> *p4=nullptr;
-    return detail::gen_H0<MEM>(mf,comm,psp,k_rng,b_rng,psi,std::addressof(nii),p4);
+    return detail::gen_H0<MEM>(mf,comm,psp,k_rng,b_rng,psi,std::addressof(nii),p4,
+                               /*skip_pp=*/false,add_hartree,add_exchange);
   } else {
     utils::check(mf.mf_type() == mf::pyscf_source, "Source mismatch");
     return detail::pyscf_read_1B_from_file<MEM>(mf,"H0",comm,pgrid,bz);
@@ -336,6 +418,134 @@ auto Vhartree(mf::MF &mf, boost::mpi3::communicator &comm, pseudopot *psp,
   }
 }
 
+/**
+ * Compute the matrix elements of the exact-exchange operator K_{ij} (Fock K)
+ * in a distributed array. Sign convention: K is signed so that F = H_core
+ * + V_H + K matches the existing test_dft_eigenvalues / set_fock convention
+ * (K contains its leading minus). NCPP / USPP / PAW dispatch is internal.
+ *
+ * Two overloads: diagonal occupations (rank-3 nii) and the full density
+ * matrix (rank-4 nij). The nij path generalizes via the natural-orbital
+ * decomposition (see hamilt::v_x / hamilt::paw::v_x nij overloads);
+ * symmetry-reduced meshes are handled by the band-matrix lift at the
+ * rotated k-point.
+ */
+template<MEMORY_SPACE MEM = HOST_MEMORY, nda::ArrayOfRank<3> Arr3_t>
+auto Vexchange(mf::MF &mf, boost::mpi3::communicator &comm, pseudopot *psp,
+               Arr3_t const& nii,
+               nda::range k_range = {-1,-1}, nda::range b_range = {-1,-1},
+               std::array<long,4> pgrid = {0}, std::array<long,4> bz = {1,1,2048,2048})
+{
+  if(k_range == nda::range{-1,-1}) k_range = nda::range(mf.nkpts_ibz());
+  if(b_range == nda::range{-1,-1}) b_range = nda::range(mf.nbnd());
+  utils::check(mf.mf_type() == mf::qe_source or mf.mf_type() == mf::bdft_source,
+               "Vexchange: only qe_source / bdft_source backends supported");
+  utils::check(psp != nullptr, "Vexchange: Missing pseudopot object.");
+  utils::check(k_range.first() == 0 && k_range.last() == mf.nkpts_ibz(),
+               "Vexchange: requires full IBZ k_range.");
+  // A contiguous-from-zero partial band range is permitted: the exchange sum
+  // over occupied n is exact as long as b_range covers all occupied bands
+  // (f_n = 0 above the top occupied). Used to restrict the occupied-occupied
+  // exchange energy build to the valence subspace.
+  utils::check(b_range.first() == 0 && b_range.last() <= mf.nbnd(),
+               "Vexchange: requires contiguous-from-zero b_range within nbnd.");
+  using larray = memory::array<MEM,ComplexType,4>;
+  auto psi = mf::read_distributed_orbital_set_ibz<larray>(
+      mf, comm, 'w', pgrid,
+      nda::range(-1, -1), k_range, b_range, bz);
+  return detail::gen_Vexchange<MEM>(mf, comm, psp, k_range, b_range, psi, nii);
+}
+
+template<MEMORY_SPACE MEM = HOST_MEMORY, nda::ArrayOfRank<4> Arr4_t>
+auto Vexchange(mf::MF &mf, boost::mpi3::communicator &comm, pseudopot *psp,
+               Arr4_t const& nij,
+               nda::range k_range = {-1,-1}, nda::range b_range = {-1,-1},
+               std::array<long,4> pgrid = {0}, std::array<long,4> bz = {1,1,2048,2048})
+{
+  if(k_range == nda::range{-1,-1}) k_range = nda::range(mf.nkpts_ibz());
+  if(b_range == nda::range{-1,-1}) b_range = nda::range(mf.nbnd());
+  utils::check(mf.mf_type() == mf::qe_source or mf.mf_type() == mf::bdft_source,
+               "Vexchange: only qe_source / bdft_source backends supported");
+  utils::check(psp != nullptr, "Vexchange: Missing pseudopot object.");
+  utils::check(k_range.first() == 0 && k_range.last() == mf.nkpts_ibz(),
+               "Vexchange: requires full IBZ k_range.");
+  utils::check(b_range.first() == 0 && b_range.last() == mf.nbnd(),
+               "Vexchange: requires full nbnd b_range.");
+  using larray = memory::array<MEM,ComplexType,4>;
+  auto psi = mf::read_distributed_orbital_set_ibz<larray>(
+      mf, comm, 'w', pgrid,
+      nda::range(-1, -1), k_range, b_range, bz);
+  return detail::gen_Vexchange<MEM>(mf, comm, psp, k_range, b_range, psi, nij);
+}
+
+/**
+ * psi-taking overloads (full density matrix): identical to the nij overloads
+ * above but reuse a caller-provided distributed orbital set instead of
+ * re-reading it. Used by the SCF static-route evaluator (hamilt_eval_t),
+ * which caches psi across iterations. k_range/b_range must match the ranges
+ * psi was read with (full IBZ, full bands).
+ */
+template<MEMORY_SPACE MEM = HOST_MEMORY, nda::ArrayOfRank<4> Arr4_t>
+auto Vhartree(mf::MF &mf, boost::mpi3::communicator &comm, pseudopot *psp,
+              memory::darray_t<memory::array<MEM,ComplexType,4>, mpi3::communicator>& psi,
+              Arr4_t const& nij, nda::range k_range, nda::range b_range)
+{
+  utils::check(psp != nullptr, "Vhartree(psi): Missing pseudopot object.");
+  utils::check(k_range.first() == 0 && k_range.last() == mf.nkpts_ibz(),
+               "Vhartree(psi): requires full IBZ k_range.");
+  utils::check(b_range.first() == 0 && b_range.last() == mf.nbnd(),
+               "Vhartree(psi): requires full nbnd b_range.");
+  memory::array_view<MEM,ComplexType,3> *p3=nullptr;
+  return detail::gen_Vhartree<MEM>(mf,comm,psp,k_range,b_range,psi,p3,
+                                   std::addressof(nij),false);
+}
+
+template<MEMORY_SPACE MEM = HOST_MEMORY, nda::ArrayOfRank<4> Arr4_t>
+auto Vexchange(mf::MF &mf, boost::mpi3::communicator &comm, pseudopot *psp,
+               memory::darray_t<memory::array<MEM,ComplexType,4>, mpi3::communicator>& psi,
+               Arr4_t const& nij, nda::range k_range, nda::range b_range)
+{
+  utils::check(psp != nullptr, "Vexchange(psi): Missing pseudopot object.");
+  utils::check(k_range.first() == 0 && k_range.last() == mf.nkpts_ibz(),
+               "Vexchange(psi): requires full IBZ k_range.");
+  utils::check(b_range.first() == 0 && b_range.last() == mf.nbnd(),
+               "Vexchange(psi): requires full nbnd b_range.");
+  return detail::gen_Vexchange<MEM>(mf, comm, psp, k_range, b_range, psi, nij);
+}
+
+template<nda::MemoryArrayOfRank<4> Array_4D_t, nda::ArrayOfRank<3> Arr3_t>
+void set_Vexchange(mf::MF &mf, pseudopot *psp,
+                   Arr3_t const& nii,
+                   math::shm::shared_array<Array_4D_t> &sK_skij,
+                   long nbnd_max = -1) {
+  // nbnd_max>0 restricts the orbital band range read for the exchange build.
+  // The exchange energy is occupied-occupied only, so capping to the occupied
+  // count is exact for E_x while cutting the O(nbnd^2 nh^2) direct-v_x cost.
+  long nb_use = (nbnd_max > 0) ? std::min<long>(nbnd_max, mf.nbnd()) : (long)mf.nbnd();
+  long np = sK_skij.internode_comm()->size();
+  long np_s = (np % mf.nspin()== 0)? mf.nspin() : 1;
+  long np_k = utils::find_proc_grid_max_npools(np/np_s, (long)mf.nkpts_ibz(), 1.0);
+  long np_i = np / (np_s*np_k);
+  std::array<long, 4> pgrid = {np_s, np_k, np_i, 1};
+  long blk_i = std::max<long>(1, std::min<long>(1024, nb_use/np_i));
+  std::array<long, 4> bsize = {1, 1, blk_i, 2048};
+  app_log(4, "Exchange matrix in distributed array:");
+  app_log(4, "  - pgrid = ({}, {}, {}, {})", np_s, np_k, np_i, 1);
+  app_log(4, "  - bsize = ({}, {}, {}, {})\n", 1, 1, blk_i, 2048);
+
+  if (sK_skij.node_comm()->root()) {
+    auto dK = hamilt::Vexchange<HOST_MEMORY>(
+        mf, *sK_skij.internode_comm(), psp, nii,
+        nda::range(mf.nkpts_ibz()), nda::range(nb_use),
+        pgrid, bsize);
+    auto K_loc = sK_skij.local();
+    K_loc(dK.local_range(0), dK.local_range(1),
+          dK.local_range(2), dK.local_range(3)) = dK.local();
+  }
+  sK_skij.communicator()->barrier();
+  sK_skij.all_reduce();
+}
+
 template<typename MPI_t>
 void dump_hartree(MPI_t &mpi, mf::MF &mf, pseudopot *psp, std::string coqui_output, int scf_iter) {
   long np = mpi.comm.size();
@@ -408,11 +618,43 @@ auto ovlp(mf::MF& mf, boost::mpi3::communicator& comm,
   if(k_range == nda::range{-1,-1}) k_range = nda::range(mf.nkpts_ibz());
   if(b_range == nda::range{-1,-1}) b_range = nda::range(mf.nbnd());
   // this is, unfortunately, code dependent, so fork here!
-  if (mf.mf_type() == mf::qe_source or mf.mf_type() == mf::bdft_source) {
-    using larray = memory::array<MEM,ComplexType,4>;
-    auto psi = mf::read_distributed_orbital_set_ibz<larray>(mf,comm,'w',pgrid,
-                               nda::range(-1,-1), k_range, b_range, bz); 
-    return detail::gen_ovlp<MEM,false>(comm,psi);
+  if (mf.mf_type() == mf::qe_source) {
+    // QE produces orbitals from the augmented eigenproblem H|ψ̃> = ε S_aug|ψ̃>
+    // (NCPP / USPP / PAW), so the bands are S_aug-orthonormal and the
+    // all-electron / physical band-basis overlap is the identity by
+    // construction. Skip the I/O of psi and write identity directly. See
+    // gen_identity_ovlp docstring for the derivation.
+    // default grid compatible with mf::read_distributed_orbital_set_ibz
+    long np0 = std::accumulate(pgrid.cbegin(), pgrid.cend(), long(1), std::multiplies<>{});
+    if(np0 == 0) {
+      long sz = comm.size();
+      long ps = (sz%mf.nspin()==0?mf.nspin():1);
+      long n_ = sz/ps;
+      long pk = utils::find_proc_grid_max_rows(n_,k_range.size());
+      pgrid = {ps,pk,n_/pk,1};
+    }
+    return detail::gen_identity_ovlp<MEM>(comm, pgrid,
+                                          mf.nspin(), k_range.size(), b_range.size(),
+                                          bz);
+  } else if (mf.mf_type() == mf::bdft_source) {
+    // bdft bands (QE/ABINIT-sourced) come from the augmented eigenproblem
+    // H|ψ̃> = ε S_aug|ψ̃> (NCPP/USPP/PAW), so they are S_aug-orthonormal and the
+    // all-electron / physical band-basis overlap is the identity — the basis GW
+    // works in. For NCPP the smooth ⟨ψ̃|ψ̃⟩ is already ≈ I; for PAW it is NOT
+    // (⟨ψ̃|ψ̃⟩ ≠ I), so it MUST be replaced by identity to stay consistent with
+    // the AE PAW basis. Identity is correct for both cases. Same rationale as
+    // the QE branch above.
+    long np0 = std::accumulate(pgrid.cbegin(), pgrid.cend(), long(1), std::multiplies<>{});
+    if(np0 == 0) {
+      long sz = comm.size();
+      long ps = (sz%mf.nspin()==0?mf.nspin():1);
+      long n_ = sz/ps;
+      long pk = utils::find_proc_grid_max_rows(n_,k_range.size());
+      pgrid = {ps,pk,n_/pk,1};
+    }
+    return detail::gen_identity_ovlp<MEM>(comm, pgrid,
+                                          mf.nspin(), k_range.size(), b_range.size(),
+                                          bz);
   } else {
     utils::check(mf.mf_type() == mf::pyscf_source, "Source mismatch");
     utils::check(k_range.size() == mf.nkpts_ibz(), "No k_range with pyscf backend yet.");
@@ -425,19 +667,41 @@ auto ovlp(mf::MF& mf, boost::mpi3::communicator& comm,
  * @return - A distributed array of overlap matrix with global shape = (nspin, nkpts, nbnd, nbnd)
  */
 template<MEMORY_SPACE MEM = HOST_MEMORY>
-auto ovlp_diagonal(mf::MF& mf, boost::mpi3::communicator& comm, 
+auto ovlp_diagonal(mf::MF& mf, boost::mpi3::communicator& comm,
           nda::range k_range = {-1,-1}, nda::range b_range = {-1,-1},
           std::array<long,3> pgrid = {0}, std::array<long,3> bz = {1,1,2048})
 {
   if(k_range == nda::range{-1,-1}) k_range = nda::range(mf.nkpts_ibz());
   if(b_range == nda::range{-1,-1}) b_range = nda::range(mf.nbnd());
   // this is, unfortunately, code dependent, so fork here!
-  if (mf.mf_type() == mf::qe_source or mf.mf_type() == mf::bdft_source) {
-    using larray = memory::array<MEM,ComplexType,4>;
-    auto psi = mf::read_distributed_orbital_set_ibz<larray>(mf,comm,'w',
-             {pgrid[0],pgrid[1],pgrid[2],1},nda::range(-1,-1), k_range, b_range,
-             {bz[0],bz[1],bz[2],2048});
-    return detail::gen_ovlp<MEM,true>(comm,psi);
+  if (mf.mf_type() == mf::qe_source) {
+    // See ovlp(): QE bands are S_aug-orthonormal so the physical overlap is I.
+    long np0 = std::accumulate(pgrid.cbegin(), pgrid.cend(), long(1), std::multiplies<>{});
+    if(np0 == 0) {
+      long sz = comm.size();
+      long ps = (sz%mf.nspin()==0?mf.nspin():1);
+      long n_ = sz/ps;
+      long pk = utils::find_proc_grid_max_rows(n_,k_range.size());
+      pgrid = {ps,pk,n_/pk};
+    }
+    return detail::gen_identity_ovlp_diagonal<MEM>(comm, pgrid,
+                                                   mf.nspin(), k_range.size(), b_range.size(),
+                                                   bz);
+  } else if (mf.mf_type() == mf::bdft_source) {
+    // See ovlp(): bdft PAW bands are S_aug-orthonormal, so the physical
+    // band-basis overlap is identity (the AE PAW basis GW works in). The smooth
+    // ⟨ψ̃|ψ̃⟩ ≠ I for PAW must NOT be used.
+    long np0 = std::accumulate(pgrid.cbegin(), pgrid.cend(), long(1), std::multiplies<>{});
+    if(np0 == 0) {
+      long sz = comm.size();
+      long ps = (sz%mf.nspin()==0?mf.nspin():1);
+      long n_ = sz/ps;
+      long pk = utils::find_proc_grid_max_rows(n_,k_range.size());
+      pgrid = {ps,pk,n_/pk};
+    }
+    return detail::gen_identity_ovlp_diagonal<MEM>(comm, pgrid,
+                                                   mf.nspin(), k_range.size(), b_range.size(),
+                                                   bz);
   } else {
     utils::check(mf.mf_type() == mf::pyscf_source, "Source mismatch");
     utils::check(k_range.size() == mf.nkpts_ibz(), "No k_range with pyscf backend yet.");

@@ -36,6 +36,7 @@
 #include "utilities/mpi_context.h"
 #include "utilities/check.hpp"
 #include "utilities/concepts.hpp"
+#include "utilities/madelung_utils.hpp"
 
 #include "mean_field/mf_source.hpp"
 #include "mean_field/symmetry/bz_symmetry.hpp"
@@ -136,10 +137,15 @@ namespace mf {
       bool orb_on_fft_grid = true;
       // plane-wave cutoff for charge density
       double ecutrho;
-      // fft grid
+      // smooth fft grid (mirrors QE's dffts; sized by ecutwfc)
       nda::stack_array<int, 3> fft_mesh;
-      // number of points in fft grid
+      // dense/augmented fft grid (mirrors QE's dfftp; sized by ecutrho)
+      // For NCPP-equivalent backends this matches fft_mesh.
+      nda::stack_array<int, 3> fft_mesh_aug;
+      // number of points in smooth fft grid
       int nnr;
+      // number of points in dense/augmented fft grid
+      int nnr_aug = 0;
 
       // mean-field info
       // # of dimensions
@@ -213,6 +219,7 @@ namespace mf {
         h5::h5_write_attribute(ogrp, "number_of_aux_bands", nbnd_aux);
         h5::h5_write_attribute(ogrp, "ecutrho", ecutrho);
         nda::h5_write(ogrp, "fft_mesh", fft_mesh, false);
+        nda::h5_write(ogrp, "fft_mesh_aug", fft_mesh_aug, false);
 
         nda::h5_write(ogrp, "eigval", eigval, false);
         if(nbnd_aux>0) nda::h5_write(ogrp, "eigval_aux", eigval_aux, false);
@@ -228,8 +235,23 @@ namespace mf {
         h5::file file = h5::file(filename, 'r');
         h5::group grp(file);
 
-        h5::group sgrp = grp.open_group("System"); 
-        h5::group ogrp = grp.open_group("Orbitals"); 
+        h5::group sgrp = grp.open_group("System");
+        h5::group ogrp = grp.open_group("Orbitals");
+
+        // A pw2coqui .coqui.h5 is a qe-backend
+        // COMPANION file — it has /System + /Hamiltonian but writes NO
+        // orbitals (no psi/miller_wfc/wfc_ecut) and only a skeleton
+        // /System/BZ. Feeding it to the bdft reader used to die in an HDF5
+        // exception cascade (first at the BZ table read, then at psi);
+        // identify the situation up front instead. Checked BEFORE the BZ
+        // init below — that is where the cascade used to start.
+        utils::check(ogrp.has_dataset("miller_wfc") && ogrp.has_dataset("wfc_ecut"),
+            "bdft_system: /Orbitals in '{}' has no wavefunction data "
+            "(miller_wfc / wfc_ecut / psi_s*_k* missing). This looks like a "
+            "pw2coqui companion file for the QE backend — it is NOT a "
+            "standalone bdft file. Use mf_source \"qe\" with the QE outdir/"
+            "prefix, or produce a bdft file with abinit2coqui / CoQui's "
+            "converter.", filename);
 
         // unit cell
         h5::h5_read_attribute(sgrp, "number_of_atoms", natoms);
@@ -257,7 +279,12 @@ namespace mf {
         utils::check( npol_in_basis <= npol and npol_in_basis > 0, "Error: nspin_in_basis: {}",nspin_in_basis);
 
         h5::h5_read_attribute(sgrp, "number_of_elec", nelec);
-        h5::h5_read_attribute(sgrp, "madelung_constant", madelung);
+        // madelung_constant is absent from pw2coqui-written files (QE-sourced
+        // bdft); absent == 0 == "compute from cell/k-mesh" below.
+        if(H5Aexists(h5::hid_t(sgrp),"madelung_constant"))
+          h5::h5_read_attribute(sgrp, "madelung_constant", madelung);
+        else
+          madelung = 0.0;
         h5::h5_read_attribute(sgrp, "nuclear_energy", enuc);
         if( H5Aexists(h5::hid_t(sgrp),"fermi_energy") )
           h5::h5_read_attribute(sgrp, "fermi_energy", efermi);
@@ -271,7 +298,50 @@ namespace mf {
         nda::h5_read(grp, "System/reciprocal_vectors", recv);
 
         // BZ
-        _symm.initialize_from_h5(sgrp);  
+        // Two accepted layouts:
+        //  - the full table set (19 datasets incl. q-point maps), read verbatim;
+        //  - the minimal set (MP grid + IBZ kpoints + symmetry operations), from
+        //    which the maps are rebuilt by the bz_symm constructor. The minimal
+        //    form is what a converter can write straight off a symmetry-reduced
+        //    mean-field run, and it reuses the same map-building code the QE
+        //    reader goes through instead of duplicating it converter-side.
+        if(bz_symm::can_init_from_h5(sgrp)) {
+          _symm.initialize_from_h5(sgrp);
+        } else if(bz_symm::can_init_from_h5_minimal(sgrp)) {
+          auto bgrp = sgrp.open_group("BZ");
+
+          nda::array<double, 1> kp_grid_(3);
+          nda::array<double, 2> kpts_ibz_;
+          nda::h5_read(bgrp, "kp_grid", kp_grid_);
+          nda::h5_read(bgrp, "kpoints_ibz", kpts_ibz_);
+          utils::check(kpts_ibz_.extent(1) == 3,
+              "bdft_system: /System/BZ/kpoints_ibz in '{}' has {} columns, expected 3.",
+              filename, kpts_ibz_.extent(1));
+
+          auto symm_list_ = bz_symm::read_symm_list_from_h5(sgrp);
+
+          // Symmetry-exploitation levels. Both are correctness-neutral when the
+          // symmetry data are right, so they stay overridable from the file.
+          int no_q_sym_i = 0, use_trev_i = 0;
+          if(H5Aexists(h5::hid_t(bgrp),"no_q_sym"))
+            h5::h5_read_attribute(bgrp, "no_q_sym", no_q_sym_i);
+          if(H5Aexists(h5::hid_t(bgrp),"use_trev"))
+            h5::h5_read_attribute(bgrp, "use_trev", use_trev_i);
+
+          app_log(2, "  bdft_system: rebuilding BZ maps from {} symmetry operation(s) "
+                     "and {} IBZ k-points (no_q_sym={}, use_trev={}).",
+                  symm_list_.size(), kpts_ibz_.extent(0), no_q_sym_i, use_trev_i);
+
+          _symm = bz_symm(mpi->comm, bool(no_q_sym_i), latt, recv, kp_grid_,
+                          kpts_ibz_, symm_list_, bool(use_trev_i));
+        } else {
+          utils::check(false,
+              "bdft_system: /System/BZ in '{}' matches neither the full "
+              "BZ/symmetry table set (kp/q maps, trev tables, ...) nor the "
+              "minimal set (kp_grid + kpoints + Symmetries). Regenerate the "
+              "file with the current abinit2coqui, or use the reader matching "
+              "the file's producer.", filename);
+        }
 
         int nkpts = _symm.nkpts;
         int nkpts_ibz = _symm.nkpts_ibz;
@@ -281,7 +351,7 @@ namespace mf {
         if( std::abs( nda::sum(k_weight) - 1.0 ) > 1e-6 and mpi->comm.root() )
           app_warning(" k_weight is not normalized. sum(k_weight): {}",nda::sum(k_weight)); 
 
-        // Orbitals 
+        // Orbitals
         { // some checks
           int dummy;
           h5::h5_read_attribute(ogrp, "number_of_spins", dummy);
@@ -310,10 +380,33 @@ namespace mf {
 //          h5::h5_read_attribute(ogrp, "number_of_aux_bands", nbnd_aux);
         h5::h5_read_attribute(ogrp, "ecutrho", ecutrho);
         nda::h5_read(grp, "Orbitals/fft_mesh", fft_mesh);
-        // adjust ,esh if needed
+        // Dense/augmented mesh: present in current schema, falls back to fft_mesh
+        // for older checkpoints (NCPP-equivalent behavior).
+        if(ogrp.has_dataset("fft_mesh_aug"))
+          nda::h5_read(grp, "Orbitals/fft_mesh_aug", fft_mesh_aug);
+        else
+          fft_mesh_aug = fft_mesh;
+        // adjust meshes if needed
         fft_mesh = utils::generate_consistent_fft_mesh(fft_mesh,_symm.symm_list,1e-4,"bdft_system");
         fft_mesh = utils::generate_consistent_fft_mesh(fft_mesh,_symm.symm_list,1e-4,"bdft_system",true);
-        nnr = fft_mesh(0)*fft_mesh(1)*fft_mesh(2);
+        fft_mesh_aug = utils::generate_consistent_fft_mesh(fft_mesh_aug,_symm.symm_list,1e-4,"bdft_system");
+        fft_mesh_aug = utils::generate_consistent_fft_mesh(fft_mesh_aug,_symm.symm_list,1e-4,"bdft_system",true);
+        nnr     = fft_mesh(0)*fft_mesh(1)*fft_mesh(2);
+        nnr_aug = fft_mesh_aug(0)*fft_mesh_aug(1)*fft_mesh_aug(2);
+
+        // The Madelung constant is stored in the checkpoint (System group).
+        // External converters (e.g. abinit2coqui) may write 0 as a stub, which
+        // silently disables the q->0 exchange finite-size correction
+        // (HF_K_correction uses -madelung*S*Dm*S). If the stored value is zero,
+        // compute it here from the cell + k-mesh exactly as qe_system does, so
+        // bdft-sourced mean fields get the same finite-size treatment as QE.
+        if( std::abs(madelung) < 1e-12 ) {
+          auto rg = nda::range(ndims);
+          madelung = -2 * utils::madelung(latt(rg,rg), recv(rg,rg),
+                                          _symm.kp_grid(rg), fft_mesh(rg), 1e-10);
+          app_log(2, "  bdft_system: stored madelung_constant was 0; "
+                     "computed from cell/k-mesh = {} Ha", madelung);
+        }
 
         // MAM: should this be size nspin_in_basis?
         //      In any case, if nspin_in_basis!=nspin, the basis can't be MO
@@ -381,12 +474,16 @@ namespace mf {
         // Orbital info
         nbnd     = mf.nbnd();
         nbnd_aux = mf.nbnd_aux();
-        ecutrho  = mf.ecutrho();
-        fft_mesh = mf.fft_grid_dim();
-        // adjust ,esh if needed
+        ecutrho      = mf.ecutrho();
+        fft_mesh     = mf.fft_grid_dim();
+        fft_mesh_aug = mf.fft_grid_dim_aug();
+        // adjust meshes if needed (smooth and dense are independent)
         fft_mesh = utils::generate_consistent_fft_mesh(fft_mesh,_symm.symm_list,1e-4,"bdft_system");
         fft_mesh = utils::generate_consistent_fft_mesh(fft_mesh,_symm.symm_list,1e-4,"bdft_system",true);
-        nnr = fft_mesh(0)*fft_mesh(1)*fft_mesh(2);
+        fft_mesh_aug = utils::generate_consistent_fft_mesh(fft_mesh_aug,_symm.symm_list,1e-4,"bdft_system");
+        fft_mesh_aug = utils::generate_consistent_fft_mesh(fft_mesh_aug,_symm.symm_list,1e-4,"bdft_system",true);
+        nnr     = fft_mesh(0)*fft_mesh(1)*fft_mesh(2);
+        nnr_aug = fft_mesh_aug(0)*fft_mesh_aug(1)*fft_mesh_aug(2);
 
         eigval     = mf.eigval(); 
         eigval_aux = mf.eigval_aux(); 

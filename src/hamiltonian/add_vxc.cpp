@@ -24,6 +24,7 @@
 #include "numerics/distributed_array/nda.hpp"
 #include "numerics/shared_array/nda.hpp"
 #include "mean_field/MF.hpp"
+#include "hamiltonian/pseudo/pp_schema.hpp"
 #include "add_vloc.hpp"
 #include "add_vxc.h"
 
@@ -48,9 +49,12 @@ void add_vxc(MF_t& mf, nda::range k_range, nda::range b_range,
 
   int nspin = mf.nspin();
   int npol = mf.npol();
-  auto fft_mesh = mf.fft_grid_dim();
-  auto swfc_to_rho = detail::make_wfc_to_rho(mpi_context, mf, fft_mesh);
-  auto svxc = shared_array<nda::array_view<ComplexType,3>>(mpi_context, {nspin, npol*npol, mf.nnr()});
+  // Vxc is on QE's dfftp (dense) grid. Read it on the dense grid and apply
+  // V·ψ on the dense grid as well; for NCPP this matches the smooth grid, and
+  // for PAW it correctly accommodates ngm_dense G-vectors.
+  auto fft_mesh_aug = mf.fft_grid_dim_aug();
+  auto swfc_to_rho = detail::make_wfc_to_rho(mpi_context, mf, fft_mesh_aug);
+  auto svxc = shared_array<nda::array_view<ComplexType,3>>(mpi_context, {nspin, npol*npol, mf.nnr_aug()});
 
   utils::check(k_range.size() == mf.nkpts_ibz() and
                b_range.size() == mf.nbnd(), "add_vxc: partial k_range/b_range not yet implemented.");
@@ -79,7 +83,7 @@ void add_vxc(MF_t& mf, nda::range k_range, nda::range b_range,
     utils::check(false,"Error in hamilt::add_vxc:: Unknown input file type/mf object combination.");
 
   // add vxc to hpsi
-  add_vloc(npol, fft_mesh, swfc_to_rho.local(), svxc.local(), psi, hpsi);
+  add_vloc(npol, fft_mesh_aug, swfc_to_rho.local(), svxc.local(), psi, hpsi);
 }
 
 template<typename MF_t, nda::MemoryArrayOfRank<3> array_t>
@@ -107,10 +111,11 @@ void read_vxc_h5(MF_t &mf, h5::group& grp0, shared_array<array_t> &svxc)
   utils::check(nk == mf.nkpts_ibz(), "Error in pseudopot::read_vxc_h5: Inconsistent nkpts.");
   utils::check(mf.wfc_truncated_grid()->size() >= npwx,
                "Error in pseudopot::read_vxc_h5: ngm < max_npw");
-  utils::check(svxc.shape() == std::array<long,3>{nspin,npol*npol,mf.nnr()}, 
+  utils::check(svxc.shape() == std::array<long,3>{nspin,npol*npol,mf.nnr_aug()},
                "Error in pseudopot::read_vxc_h5: Inconsistent vxc shape.");
 
-  auto fft_mesh = mf.fft_grid_dim();
+  // Vxc/V_eff h5 datasets store ngm_dense G-vectors and live on dfftp.
+  auto fft_mesh_aug = mf.fft_grid_dim_aug();
   auto vxc = svxc.local();
 
   if(svxc.communicator()->root()) {
@@ -119,25 +124,36 @@ void read_vxc_h5(MF_t &mf, h5::group& grp0, shared_array<array_t> &svxc)
     nda::array<ComplexType,3> vl(nspin,npol*npol,ngm);
     nda::array<long,1> k2g(ngm);
 
-    auto vxc_4D = nda::reshape(vxc,std::array<long,4>{nspin*npol*npol,fft_mesh(0),fft_mesh(1),fft_mesh(2)});
+    auto vxc_4D = nda::reshape(vxc,std::array<long,4>{nspin*npol*npol,fft_mesh_aug(0),fft_mesh_aug(1),fft_mesh_aug(2)});
     math::nda::fft<true> F(vxc_4D);
 
     {
       nda::array<int,2> mill_g(ngm,3);
       nda::h5_read(grp,"miller_g",mill_g);
-      utils::generate_k2g(mill_g,k2g,fft_mesh);
+      utils::generate_k2g(mill_g,k2g,fft_mesh_aug);
     }
 
     // vxc
-    auto vxc_2D = nda::reshape(vxc,std::array<long,2>{nspin*npol*npol,mf.nnr()});
+    auto vxc_2D = nda::reshape(vxc,std::array<long,2>{nspin*npol*npol,mf.nnr_aug()});
     auto vl_2D = nda::reshape(vl,std::array<long,2>{nspin*npol*npol,ngm});
     vxc_2D() = ComplexType(0.0);
+    // Hardening (converter audit): schema-3 converters OMIT vxc_with_nlcc
+    // when the source run carried no density (abinit2coqui without --den) —
+    // pre-audit files wrote silent ZEROS instead. Name the situation rather
+    // than cascading an HDF5 read exception.
+    utils::check(grp.has_dataset("vxc_with_nlcc"),
+        "add_vxc: 'vxc_with_nlcc' is absent from the /Hamiltonian/{} block. "
+        "The h5 was converted without XC-potential data (e.g. abinit2coqui "
+        "without --den), so the GW@DFT Sigma - Vxc subtraction cannot run. "
+        "Reconvert with the density file, or use a starting point that does "
+        "not require vxc.", type);
     nda::h5_read(grp,"vxc_with_nlcc",vl);
     nda::copy_select(true,1,k2g,ComplexType(1.0),vl_2D,ComplexType(0.0),vxc_2D);
     F.backward(vxc_4D);
 
-    // to Hartree unit
-    nda::tensor::scale(ComplexType(0.5), vxc_2D);
+    // to Hartree unit (legacy Ry files only; schema_version >= 2 is
+    // already Hartree on disk)
+    nda::tensor::scale(ComplexType(h5_pp_ry2ha(grp1)), vxc_2D);
   }
   if(svxc.node_comm()->root()) {
     svxc.internode_comm()->broadcast_n(svxc.local().data(), svxc.size(), 0);
@@ -153,6 +169,9 @@ using memory::host_array_view;
 template void add_vxc(mf::MF&, nda::range, nda::range,
     darray_t<host_array<ComplexType,4>,communicator> const&,
     darray_t<host_array<ComplexType,4>,communicator>&);
+// NOTE: read_vxc_h5<mf::MF, array_view<ComplexType,3>> is already
+// instantiated through the add_vxc body above; the QE-eigenvalue diagnostic
+// links against that instantiation.
 #if defined(ENABLE_DEVICE)
 using memory::device_array;
 using memory::unified_array;

@@ -65,12 +65,38 @@ cholesky::cholesky(mf::MF *mf_,
     cutoff( io::get_value_with_default<double>(pt,"tol",1e-10) ),
     default_block_size( io::get_value_with_default<int>(pt,"chol_block_size",32) ),
     ecut( io::get_value_with_default<double>(pt,"ecut",mf->ecutrho()) ),
+    // Default rho_g sits on the smooth (dffts) mesh: this Cholesky path reads
+    // ψ on the smooth real-space grid and FFTs the pair densities on a box
+    // of the same size. Switching to the dense (dfftp / aug) mesh would
+    // require a custom-grid mapping (read 'w', map via swfc_to_rho) — that
+    // path is not yet plumbed here. For NCPP smooth == dense, so this is
+    // already a no-op; for PAW, augmentation contributions to ERIs are a
+    // separate follow-up (use the THC + paw_aug pipeline in the meantime).
     rho_g(ecut,mf->fft_grid_dim(),mf->recv()),
     vG( io::check_child_exists(pt,"potential") ? io::find_child(pt,"potential") : ptree{} ),
     howmany_fft(-1)
 {
   utils::check(mf != nullptr, "cholesky::Null pointer.");
   utils::check(mf->has_orbital_set(), "Error in cholesky: Invalid mf type. ");
+
+  // This builder factorizes SMOOTH-grid pair densities only — no
+  // augmentation-charge (Q_ij) contribution — so for USPP/PAW the resulting
+  // ERIs silently miss the augmentation physics. Hard-abort until an
+  // augmented Cholesky path lands; use the THC ERI path (paw_aug) instead.
+  // Diagnostics that WANT the smooth-only reference (e.g. the paw_aug
+  // exchange tests) must opt in explicitly — nothing smooth-only ships
+  // silently.
+  if (mf->pp_type() == hamilt::pp_uspp_t or mf->pp_type() == hamilt::pp_paw_t) {
+    bool allow = io::get_value_with_default<bool>(pt, "allow_smooth_only_aug_pp", false);
+    utils::check(allow,
+                 "cholesky: Cholesky ERIs do not include USPP/PAW augmentation "
+                 "(smooth-grid pair densities only) and would be silently wrong "
+                 "for this mean-field. Use the THC ERI path (paw_aug) instead. "
+                 "(Diagnostic override: allow_smooth_only_aug_pp = true.)");
+    app_warning("cholesky: allow_smooth_only_aug_pp=true on a USPP/PAW "
+                "mean-field — the resulting ERIs are SMOOTH-ONLY (no "
+                "augmentation) and are for diagnostics, not production.");
+  }
 
   // maximize size of pool communicator for now, change if needed later
   utils::check( npools > 0 and npools <= mf->nkpts(), "Error: npools > nkpts");

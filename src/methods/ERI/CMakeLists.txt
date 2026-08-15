@@ -21,7 +21,7 @@ endif()
 endif()
 
 ADD_LIBRARY(eri_lib ${ERI_SRCS})
-target_link_libraries(eri_lib PUBLIC utils numerics meanfield nda_c h5_c slate)
+target_link_libraries(eri_lib PUBLIC utils numerics meanfield hamilt nda_c h5_c slate)
 install(TARGETS eri_lib
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
 

@@ -593,3 +593,4 @@ configure_file(${PROJECT_SOURCE_DIR}/src/COQUI.settings ${PROJECT_BINARY_DIR}/bi
 install(FILES ${PROJECT_BINARY_DIR}/bin/COQUI.settings DESTINATION bin)
 
 add_subdirectory(src)
+add_subdirectory(qe_converter)

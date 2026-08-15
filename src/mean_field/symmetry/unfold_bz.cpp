@@ -24,10 +24,19 @@
 #include "numerics/nda_functions.hpp"
 #include "numerics/imag_axes_ft/iaft_utils.hpp"
 #include "utilities/kpoint_utils.hpp"
+#include "hamiltonian/pseudo/pseudopot_query.h"
 #include "unfold_bz.h"
 
 namespace methods {
   void unfold_bz(utils::mpi_context_t<mpi3::communicator> &context, mf::MF &mf, std::string scf_prefix) {
+    // BZ unfolding for non-trivial point-group rotations relies on d-matrices
+    // produced by utils::generate_dmatrix; for USPP/PAW those d-matrices use
+    // smooth-only orbital overlaps and are silently wrong. Abort here until
+    // the augmentation-aware d-matrix path is in place.
+    utils::check(!hamilt::mf_requires_augmentation(mf),
+      "unfold_bz: BZ unfolding for USPP/PAW is currently silently wrong "
+      "because the underlying d-matrices use smooth-only orbital overlaps. "
+      "Aborting until the augmentation-aware path is in place.");
     std::string filename = scf_prefix + ".mbpt.h5";
     int iter;
     std::string scf_type;
@@ -252,6 +261,13 @@ namespace methods {
     decltype(nda::range::all) all;
     utils::check(mf_sym.mf_type()==mf::mf_source_e::qe_source and mf_nosym.mf_type()==mf::mf_source_e::qe_source,
                  "unfold_wfc: mf_source != qe_source");
+    // The wavefunctions written below are smooth/pseudo and are mapped via
+    // d-matrices that ignore the USPP/PAW augmentation contribution.
+    utils::check(!hamilt::mf_requires_augmentation(mf_sym) &&
+                 !hamilt::mf_requires_augmentation(mf_nosym),
+      "unfold_wfc: wavefunction unfolding does not yet handle USPP/PAW "
+      "augmentation; the unfolded orbitals would be silently wrong. "
+      "Aborting until the augmentation-aware path is in place.");
     utils::check(mf_sym.nkpts()==mf_nosym.nkpts(), "unfold_wfc: inconsistent nkpts between mf_sym and mf_nosym");
     utils::check(mf_sym.nspin()==mf_nosym.nspin(), "unfold_wfc: inconsistent nspin between mf_sym and mf_nosym");
     utils::check(mf_sym.nbnd()>=mf_nosym.nbnd(), "unfold_wfc: mf_sym.nbnd()<mf_nosym.nbnd()");

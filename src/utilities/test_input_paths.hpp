@@ -87,6 +87,22 @@ inline std::tuple<std::string,std::string> utest_filename(std::string src)
     return std::make_tuple(std::string(PROJECT_SOURCE_DIR)+
                                "/tests/unit_test_files/qe/si_kp222_nbnd8_so/",
                            std::string("pwscf"));
+  } else if (src == "qe_si222_ncpp") {
+    return std::make_tuple(std::string(PROJECT_SOURCE_DIR)+
+                               "/tests/unit_test_files/qe/si_kp222_ncpp/",
+                           std::string("pwscf"));
+  } else if (src == "qe_si222_uspp") {
+    return std::make_tuple(std::string(PROJECT_SOURCE_DIR)+
+                               "/tests/unit_test_files/qe/si_kp222_uspp/",
+                           std::string("pwscf"));
+  } else if (src == "qe_si222_paw") {
+    return std::make_tuple(std::string(PROJECT_SOURCE_DIR)+
+                               "/tests/unit_test_files/qe/si_kp222_paw/",
+                           std::string("pwscf"));
+  } else if (src == "qe_si222_paw_sym") {
+    return std::make_tuple(std::string(PROJECT_SOURCE_DIR)+
+                               "/tests/unit_test_files/qe/si_kp222_paw_sym/",
+                           std::string("pwscf"));
   } else if (src == "qe_lih222") {
     return std::make_tuple(std::string(PROJECT_SOURCE_DIR)+
                                "/tests/unit_test_files/qe/lih_kp222_nbnd16/",
@@ -94,6 +110,18 @@ inline std::tuple<std::string,std::string> utest_filename(std::string src)
   } else if (src == "qe_lih222_sym") {
     return std::make_tuple(std::string(PROJECT_SOURCE_DIR)+
                                "/tests/unit_test_files/qe/lih_kp222_nbnd16_sym/",
+                           std::string("pwscf"));
+  } else if (src == "qe_lih222_paw") {
+    return std::make_tuple(std::string(PROJECT_SOURCE_DIR)+
+                               "/tests/unit_test_files/qe/lih_kp222_nbnd16_paw/",
+                           std::string("pwscf"));
+  } else if (src == "qe_lih222_paw_sym") {
+    return std::make_tuple(std::string(PROJECT_SOURCE_DIR)+
+                               "/tests/unit_test_files/qe/lih_kp222_nbnd16_paw_sym/",
+                           std::string("pwscf"));
+  } else if (src == "qe_lih222_uspp") {
+    return std::make_tuple(std::string(PROJECT_SOURCE_DIR)+
+                               "/tests/unit_test_files/qe/lih_kp222_nbnd16_uspp/",
                            std::string("pwscf"));
   } else if (src == "qe_lih223") {
     return std::make_tuple(std::string(PROJECT_SOURCE_DIR)+
@@ -110,6 +138,14 @@ inline std::tuple<std::string,std::string> utest_filename(std::string src)
   } else if (src == "qe_lih222_hf") {
     return std::make_tuple(std::string(PROJECT_SOURCE_DIR)+
                                "/tests/unit_test_files/qe/lih_kp222_nbnd16_hf/",
+                           std::string("pwscf"));
+  } else if (src == "qe_lih222_paw_hf") {
+    return std::make_tuple(std::string(PROJECT_SOURCE_DIR)+
+                               "/tests/unit_test_files/qe/lih_kp222_nbnd16_paw_hf/",
+                           std::string("pwscf"));
+  } else if (src == "qe_lih222_uspp_hf") {
+    return std::make_tuple(std::string(PROJECT_SOURCE_DIR)+
+                               "/tests/unit_test_files/qe/lih_kp222_nbnd16_uspp_hf/",
                            std::string("pwscf"));
   } else if (src == "qe_GaAs222_hf") {
     return std::make_tuple(std::string(PROJECT_SOURCE_DIR)+
@@ -134,6 +170,15 @@ inline std::tuple<std::string,std::string> utest_filename(std::string src)
   } else if (src == "bdft_lih222_sym") {
     return std::make_tuple(std::string(PROJECT_SOURCE_DIR)+
                                "/tests/unit_test_files/bdft/lih_kp222_nbnd16_sym/",
+                           std::string("bdft"));
+  } else if (src == "bdft_si222_paw_ab") {
+    // ABINIT-sourced Si PAW mf (abinit2coqui: WFK+POT+DEN+pawxml+corewf,
+    // LDA-PW 12-electron dataset, 2x2x2 full-BZ nosym). The
+    // route-equivalence matrix MUST include an ABINIT-sourced mf — the
+    // real_ylm converter bug was invisible to QE-only route tests.
+    // Generation input: PROVENANCE.abi in the fixture directory.
+    return std::make_tuple(std::string(PROJECT_SOURCE_DIR)+
+                               "/tests/unit_test_files/bdft/si_kp222_paw_abinit/",
                            std::string("bdft"));
 /*
   } else if (src == "bdft_si222") {

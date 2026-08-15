@@ -19,8 +19,7 @@
  */
 
 
-#ifndef HAMILTONIAN_PSEUDO_NCPP_H
-#define HAMILTONIAN_PSEUDO_NCPP_H
+#pragma once
 
 #include <iostream>
 #include <memory>
@@ -41,8 +40,81 @@
 #include "mean_field/mf_source.hpp"
 #include "utilities/symmetry.hpp"
 
-namespace hamilt 
+namespace hamilt
 {
+
+namespace paw {
+// Lazily built runtime caches: angular aainit tables, per-species
+// qrad interpolation tables, the full-BZ Pskna lift, and the Δk-keyed Qfac
+// cache. Defined in hamiltonian/paw/paw_runtime_caches.hpp (its member types
+// live in paw headers that themselves include pseudopot.h, hence the
+// forward declaration + shared_ptr storage here).
+struct runtime_caches;
+struct aainit_tables;
+struct qrad_tab;
+}
+
+/**
+ * Core-valence exchange treatment. This is NOT a user/toml option: it is
+ * AUTO-DETECTED per PAW species from the mean-field h5 content in the pseudopot
+ * constructor (stored in species_paw_t::cv_exchange) and then controls behaviour
+ * during the calculation. Detection order: ex_cvij present -> fock; else a DFT
+ * core-valence XC dataset present -> dft_xc (dataset TBD); else none (warned).
+ */
+enum class cv_exchange_e {
+  fock,     ///< frozen core-valence exact-exchange (h5 ex_cvij found)
+  dft_xc,   ///< DFT-based core-valence exchange-correlation (h5 dataset TBD; NOT YET IMPLEMENTED)
+  none      ///< no core-valence exchange dataset found (contribution omitted; warned loudly)
+};
+enum class vv_compensation_e {
+  moment,   ///< moment-restored compensation charge (Shishkin-Kresse; build_qrad_tab) (default)
+  shape     ///< shape-restored full AE-PS partial-wave pair density (Arnaud; build_qrad_tab_full_aeps)
+};
+
+/**
+ * PAW valence-valence exchange options (set from the toml). Either compensation
+ * mode is computable from the SAME PAW h5 (qfuncl for 'moment'; aewfc+pswfc for
+ * 'shape'), so this is a genuine methodological choice and is toml-controlled.
+ * Scaffolding: choices not yet implemented ABORT in validate() with a clear
+ * message; defaults reproduce the current validated behaviour. (Core-valence
+ * exchange is NOT here — it is auto-detected from the h5; see cv_exchange_e.)
+ */
+struct paw_exx_options {
+  /// Valence-valence on-site compensation charge. Default: moment-restored.
+  vv_compensation_e vv_compensation = vv_compensation_e::moment;
+  /// Maximum angular momentum L of the compensation-charge multipole expansion.
+  /// Default -1 = full 2*lmax per species (lmax = highest partial-wave l), i.e.
+  /// the complete augmentation with no truncation (cf. VASP LMAXPAW = 2*lmax).
+  /// A value >= 0 caps the multipoles at L <= aug_lmax, trading accuracy for
+  /// speed (cf. VASP LMAXFOCK for the Fock-exchange augmentation).
+  int aug_lmax = -1;
+  /// Per-rank byte budget (in MB) of the Δk-keyed Qfac pair-factor cache used
+  /// by the direct v_x path (see paw_runtime_caches). Δk entries are
+  /// cached first-come-stays until the budget is exhausted; further Δk are
+  /// built into caller scratch each call (correct, just slower). 0 disables
+  /// caching. Sizing: one entry is nat × nij_max × nnr_dense × 16 B.
+  int qfac_cache_mb = 256;
+
+  /**
+   * Abort with a clear message for invalid / not-yet-implemented options.
+   * Both compensation modes are supported by both routes: the direct v_x
+   * path evaluates the augmentation on the dense fft_mesh_aug sphere, and
+   * the THC construction evaluates its atom-local LL Coulomb
+   * block on the same dense sphere regardless of the (possibly ecut-reduced)
+   * smooth THC collocation grid — which is what makes 'shape' (the sharp
+   * AE-PS pair density) resolvable in THC. `in_thc` is kept for future
+   * route-specific restrictions (currently none).
+   */
+  void validate([[maybe_unused]] bool in_thc,
+                std::string const& ctx = "paw_exx_options") const {
+    utils::check(aug_lmax >= -1,
+      "{}: aug_lmax = {} is invalid (must be >= 0, or -1 for no cap).",
+      ctx, aug_lmax);
+    utils::check(qfac_cache_mb >= 0,
+      "{}: qfac_cache_mb = {} is invalid (must be >= 0; 0 disables the cache).",
+      ctx, qfac_cache_mb);
+  }
+};
 
 /**
  * @class pseudopot
@@ -88,7 +160,135 @@ class pseudopot
   pseudopot& operator=(pseudopot const&) = default;
   pseudopot& operator=(pseudopot &&) = default;
 
+  // accessor functions
   pp_type_e pp_type() const { return ptype; }
+  auto get_input_file_type() const { return input_file_type; }
+  auto get_input_file_name() const { return input_file_name; } 
+
+  // Read-only accessors for the host-resident augmentation data used by
+  // v_h_paw and similar PAW/USPP utilities. The full state remains private
+  // to keep the data model encapsulated.
+  auto Pskna_view() const { return Pskna.local(); }
+  auto Qij_view() const { return qq_nt_data.local(); }
+  auto qgm_view() const { return qgm.local(); }
+  // Static per-atom non-local D (nat, nhm*npol, nhm*npol): dion replica +
+  // alpha_x * ex_cvij, built eagerly in read_vnl_h5 for USPP/PAW.
+  // Exposed read-only for tests/validation. Dummy (1,1,1) for NCPP.
+  auto Dnn_atom_view() const { return Dnn_atom_static.local(); }
+  nda::array<int,3> const& ijtoh_view() const { return ijtoh; }
+  nda::array<int,1> const& ityp_view() const { return ityp; }
+  nda::array<int,1> const& nh_view() const { return nh; }
+  nda::array<int,1> const& ofs_view() const { return ofs; }
+  nda::array<int,2> const& miller_g_dense_view() const { return miller_g_dense; }
+  nda::array<double,2> const& atom_pos_cart_view() const { return atom_pos_cart; }
+  long ngm_dense_get() const { return ngm_dense; }
+
+  // Per-species PAW data (qfuncl, deltaC, partial waves, projector metadata,
+  // GIPAW core orbitals). Populated from /Hamiltonian/Species/{nt}/ in
+  // `read_vnl_h5`; entries for non-PAW species are mostly empty and should
+  // be guarded with `sp.is_paw` (or `sp.is_uspp` for USPP-like data).
+  struct species_paw_t {
+    bool is_paw = false;
+    bool is_uspp = false;
+    int  mesh = 0;
+    int  nbeta = 0;
+    int  kkbeta = 0;
+    int  nh = 0;
+    int  lmax_aug = 0;
+    double raug = 0.0;
+    int  iraug = 0;
+    nda::array<double,1> r;            // (mesh)
+    nda::array<double,1> rab;          // (mesh)
+    // Heavy radial tables — stored as views into per-node SHM owned by
+    // pseudopot::paw_species_shm (one copy per node, not per rank). For
+    // a 96-core node this saves ~3 GB/species over the previous per-rank
+    // replication. See species_paw_shm_t below for the backing storage.
+    nda::array_view<double,2> aewfc;     // (nbeta, mesh)
+    nda::array_view<double,2> pswfc;     // (nbeta, mesh)
+    nda::array_view<double,3> qfuncl;    // (2*lmax+1, nbeta(nbeta+1)/2, mesh)
+    nda::array_view<double,4> deltaC;    // (nh, nh, nh, nh) — raw ke%k from QE
+    nda::array_view<double,2> ex_cvij;   // (nh, nh) — frozen core-valence exact-
+                                         //   exchange kernel (ABINIT ex_cvij =
+                                         //   Σ_c⟨φ_I c|c φ_J⟩, from PAW-XML
+                                         //   <exact_exchange_X_matrix>). Contracts
+                                         //   LINEARLY with becsum (factor 1, no ½);
+                                         //   one-center, frozen. Empty ⇒ omitted.
+    // Core-valence exchange treatment for this species, AUTO-DETECTED from the
+    // h5 content in the pseudopot constructor (fock if ex_cvij present, else
+    // dft_xc if a DFT c-v XC dataset is present [TBD], else none). Controls the
+    // frozen c-v exchange insertion into H0. See cv_exchange_e.
+    cv_exchange_e cv_exchange = cv_exchange_e::none;
+    nda::array_view<double,2> core_aewfc;// (ncore, mesh)
+    // Angular momentum metadata (per-species slices of QE's global uspp
+    // tables; ih ∈ [0, nh), nbeta ∈ [0, nbeta)).
+    nda::array<int,1> lll;             // (nbeta) — l per beta projector
+    nda::array<int,1> nhtol;           // (nh)    — l per ih
+    nda::array<int,1> nhtolm;          // (nh)    — lm = l*(l+1)+m+1 (1-based) per ih
+    nda::array<int,1> indv;            // (nh)    — beta-channel index per ih (1-based)
+    // pfunc, ptfunc, augmom were previously loaded from QE's `paw` subgroup
+    // but are derivable from aewfc/pswfc and qfuncl on demand:
+    //   pfunc(I,J,r)  = aewfc(I,r) * aewfc(J,r)
+    //   ptfunc(I,J,r) = pswfc(I,r) * pswfc(J,r)
+    //   augmom(L,I,J) = ∫ qfuncl(L, ij(I,J), r) * r^(L+2) dr
+    // No consumer ever reads them in steady state, so they are dropped
+    // from the in-memory struct. Re-derive at the call site if needed
+    // (e.g. by paw_onecenter when the deeq SCF path lands).
+    nda::array<double,1> ae_vloc;      // (mesh) AE radial local potential
+                                       // (= -Z/r screened by frozen AE core
+                                       //  Hartree). Diagonal of T+V_AE_static.
+                                       // In-memory HARTREE (read-time
+                                       // scaled; legacy h5 stores Ry).
+    nda::array<double,1> ae_rho_atc;   // (mesh) AE atomic core density ρ_core_AE
+    nda::array<double,1> vloc_ps;      // (mesh) PS radial local pseudopotential
+                                       // — paired with ae_vloc, needed for the
+                                       //   PAW static one-center D matrix
+                                       //   (kinetic + ionic, frozen-core).
+                                       // In-memory HARTREE.
+    nda::array<double,1> rho_atc_ps;   // (mesh) PS atomic core density ρ_core_PS
+                                       //   (NLCC). Required for the dynamic
+                                       //   one-center Hartree update
+                                       //   (compute_deeq_scf).
+    // GIPAW core orbitals (only when species was generated --with-gipaw)
+    int  ncore_orbitals = 0;
+    nda::array<double,1> core_n;       // principal qno (ncore)
+    nda::array<double,1> core_l;       // l qno (ncore)  (real for QE convention)
+  };
+
+  // Per-node SHM storage backing the heavy `species_paw_t` fields. One
+  // entry per species; aligned with `paw_species`. Each member is loaded
+  // on global root, broadcast across nodes via internode_comm, and shared
+  // within a node via the shared_array's shared-memory window. After
+  // population the corresponding `species_paw_t` view fields are bound
+  // to the `.local()` of the appropriate sarray_t below.
+  //
+  // Construction takes an mpi_t because `sarray_t` has no default
+  // constructor; emplace each instance with a 1-element dummy size and
+  // re-assign at load time once shapes are known (same pattern used for
+  // Pskna/qq_nt_data/Dnn_atom_static in the pseudopot ctor init list).
+  struct species_paw_shm_t {
+    sarray_t<nda::array_view<double,2>> aewfc;
+    sarray_t<nda::array_view<double,2>> pswfc;
+    sarray_t<nda::array_view<double,3>> qfuncl;
+    sarray_t<nda::array_view<double,4>> deltaC;
+    sarray_t<nda::array_view<double,2>> ex_cvij;
+    sarray_t<nda::array_view<double,2>> core_aewfc;
+
+    explicit species_paw_shm_t(mpi_t& m)
+      : aewfc(math::shm::make_shared_array<nda::array_view<double,2>>(m, {1,1})),
+        pswfc(math::shm::make_shared_array<nda::array_view<double,2>>(m, {1,1})),
+        qfuncl(math::shm::make_shared_array<nda::array_view<double,3>>(m, {1,1,1})),
+        deltaC(math::shm::make_shared_array<nda::array_view<double,4>>(m, {1,1,1,1})),
+        ex_cvij(math::shm::make_shared_array<nda::array_view<double,2>>(m, {1,1})),
+        core_aewfc(math::shm::make_shared_array<nda::array_view<double,2>>(m, {1,1}))
+    {}
+  };
+
+  // Read-only access to per-species PAW data. Empty entry for non-PAW
+  // species — check `sp.is_paw` before consuming PAW-only fields.
+  auto const& paw_species_view() const { return paw_species; }
+  // wfc-G → dense-FFT-linear-index mapping (REMAPPED to dense mesh, NOT
+  // the raw wfc_g.gv_to_fft() which is encoded on the wfc mesh).
+  auto swfc_to_rho_view() const { return swfc_to_rho.local(); }
 
   void save(std::string fname, bool append = true);
   void save(h5::group& grp);
@@ -116,17 +316,34 @@ class pseudopot
                math::nda::DistributedArrayOfRank<4> auto & hpsi,
                math::nda::DistributedArrayOfRank<4> auto & Hij);
 
+  /**
+   * Density-dependent overloads: on top of the static assembly
+   * above, the requested density-dependent terms are added under separate
+   * boolean control, so callers (e.g. a future set_H) can mix direct and
+   * ERI routes per term:
+   *   - add_hartree: smooth V_H[n] applied to hpsi, plus (USPP/PAW) the
+   *     one-center D built from V_loc+V_H (∫V·Q̂ + radial AE−PS Hartree)
+   *     contracted into Hij. With add_hartree=false the static-only
+   *     operator of the no-density overload is produced.
+   *   - add_exchange: the band-pair-augmented exact-exchange matrix K
+   *     (direct v_x route, SIGNED: F = H + K with K negative) accumulated
+   *     into Hij. Host memory only.
+   * The nii and nij overloads produce the identical operator for the same
+   * physical density.
+   */
   void add_Vpp(boost::mpi3::communicator& comm, nda::range k_range, nda::range b_range,
                nda::ArrayOfRank<3> auto const& nii,
                math::nda::DistributedArrayOfRank<4> auto const& psi,
                math::nda::DistributedArrayOfRank<4> auto & hpsi,
-               math::nda::DistributedArrayOfRank<4> auto & Hij);
+               math::nda::DistributedArrayOfRank<4> auto & Hij,
+               bool add_hartree = true, bool add_exchange = false);
 
   void add_Vpp(boost::mpi3::communicator& comm, nda::range k_range, nda::range b_range,
                nda::ArrayOfRank<4> auto const& nij,
                math::nda::DistributedArrayOfRank<4> auto const& psi,
                math::nda::DistributedArrayOfRank<4> auto & hpsi,
-               math::nda::DistributedArrayOfRank<4> auto & Hij);
+               math::nda::DistributedArrayOfRank<4> auto & Hij,
+               bool add_hartree = true, bool add_exchange = false);
 
   /**
    * Add the contributions of the Hartree potential to the wavefunctions "hpsi"
@@ -142,6 +359,7 @@ class pseudopot
                    nda::ArrayOfRank<3> auto const& nii,
                    math::nda::DistributedArrayOfRank<4> auto const& psi,
                    math::nda::DistributedArrayOfRank<4> auto & hpsi,
+                   math::nda::DistributedArrayOfRank<4> auto & Vij,
                    bool symmetrize=false);
 
   /**
@@ -158,7 +376,137 @@ class pseudopot
                    nda::ArrayOfRank<4> auto const& nij,
                    math::nda::DistributedArrayOfRank<4> auto const& psi,
                    math::nda::DistributedArrayOfRank<4> auto & hpsi,
+                   math::nda::DistributedArrayOfRank<4> auto & Vij,
                    bool symmetrize=false);
+
+  /**
+   * Build the matrix elements of the exact-exchange operator K_{ij}(s, k_p)
+   * for the diagonal-occupation density matrix.
+   *
+   * Unlike add_Hartree (which outputs an hpsi correction), exchange has no
+   * representation as a local potential acting on a single orbital — the
+   * augmentation cross terms involve band-pair-dependent projector overlaps.
+   * add_exchange therefore writes the full K matrix directly.
+   *
+   * Sign convention: K is the SIGNED contribution to the Fock matrix
+   * (F = H_core + V_H + K, with K already negative), matching CoQui's
+   * existing set_fock / test_dft_eigenvalues convention.
+   *
+   * @param k_range - [input] k-point range (must cover the full IBZ)
+   * @param nii     - [input] occupations (s, k_ibz, n), spin-summed for nspin=1
+   * @param psi     - [input] orbitals on wfc-G grid (s, k_ibz, n, g)
+   * @param Kij     - [output] K_{ij}(s, k_ibz, i, j) — written (overwritten)
+   */
+  void add_exchange(nda::range k_range,
+                    nda::ArrayOfRank<3> auto const& nii,
+                    math::nda::DistributedArrayOfRank<4> auto const& psi,
+                    math::nda::DistributedArrayOfRank<4> auto & Kij);
+
+  /**
+   * Exact-exchange K_{ij}(s, k_p) from a FULL density matrix nij(s,k,a,b).
+   * Generalizes add_exchange(nii) via the natural-orbital decomposition of
+   * nij (see hamilt::paw::v_x / hamilt::v_x nij overloads). Same sign/scale
+   * convention as the diagonal version. Currently requires a no-symmetry mesh
+   * (nk_ibz == nk).
+   *
+   * @param nij - [input] density matrix (s, k_ibz, a, b)
+   */
+  void add_exchange(nda::range k_range,
+                    nda::ArrayOfRank<4> auto const& nij,
+                    math::nda::DistributedArrayOfRank<4> auto const& psi,
+                    math::nda::DistributedArrayOfRank<4> auto & Kij);
+
+  /**
+   * Option A ("shape-restored" on-site exact exchange), derived from the
+   * single mode source _exx_opts.vv_compensation (no independent
+   * bool). When shape mode is selected, add_exchange (both the nii and nij
+   * overloads) builds the PAW augmentation from the FULL AE−PS partial-wave
+   * pair density (φφ − φ̃φ̃, via build_qrad_tab_full_aeps) instead of the
+   * compensation charge, and drops the deltaC one-center correction —
+   * reproducing ABINIT's phiphj−tphitphj oscillator, i.e. the exact
+   * all-electron on-site exchange (fixes the ~0.05 Ha/Si compensated-PAW
+   * under-count). PAW species
+   * only; USPP is unaffected. Default moment = compensation charge + deltaC.
+   * The deltaC/K_a inclusion is ALWAYS derived from this mode (moment =>
+   * include, shape => drop) in both the direct v_x and THC paths; it is never
+   * independently toggled.
+   */
+  bool paw_shape_restored() const {
+    return _exx_opts.vv_compensation == vv_compensation_e::shape;
+  }
+  /// Test convenience: select the vv_compensation mode as a bool. Delegates
+  /// to _exx_opts (the single source of truth).
+  void set_paw_exx_shape_restored(bool b) {
+    _exx_opts.vv_compensation = b ? vv_compensation_e::shape
+                                  : vv_compensation_e::moment;
+  }
+
+  /**
+   * Drop the deltaC one-center Fock correction from add_exchange while keeping
+   * the compensation augmentation, so that the on-site term can be isolated as
+   * E_x(true) − E_x(false). This is the direct-route counterpart of
+   * thc_reader_t's `paw_onsite` knob and exists so the one-center exchange can
+   * be compared against an external reference; whether K_a belongs at all is
+   * derived from vv_compensation (moment => include, shape => drop) and is
+   * never overridden here. Not settable from the toml; production leaves it
+   * true.
+   */
+  bool paw_onsite_diag() const { return _paw_onsite_diag; }
+  void set_paw_onsite_diag(bool b) { _paw_onsite_diag = b; }
+
+  /**
+   * PAW exact-exchange options (toml-controlled). Governs the core-valence
+   * exchange source, the valence-valence compensation-charge model, and the
+   * augmentation angular-momentum cutoff for the direct v_x / add_exchange path.
+   * Set via set_exx_options() from the toml-parsing constructor (thc_reader_t).
+   */
+  paw_exx_options _exx_opts;
+  /// Backing store for paw_onsite_diag().
+  bool _paw_onsite_diag = true;
+  paw_exx_options const& exx_options() const { return _exx_opts; }
+  int aug_lmax() const { return _exx_opts.aug_lmax; }
+  void set_exx_options(paw_exx_options const& o) {
+    o.validate(/*in_thc=*/false, "pseudopot::set_exx_options");
+    _exx_opts = o;
+  }
+
+  // ---- Lazily built runtime caches. Definitions in
+  // hamiltonian/paw/paw_runtime_caches.hpp; every cached object is a pure
+  // function of the immutable pseudopot state plus the explicit key
+  // arguments, so the cache is shared across pseudopot copies.
+  paw::runtime_caches& paw_rt() const;
+  // ∫ V(r) Q̂^a_IJ(r) dr on the dense (augmentation) grid for an arbitrary
+  // local potential V(r) (proper-FT contraction with qgm; e^{+iG·τ} phase).
+  // Returns (nat, nhm, nhm); zero for NCPP / empty V / empty qgm. Purely
+  // RANK-LOCAL (no MPI): the calling rank must hold valid V content and does
+  // the FFT + full G contraction itself — safe from node-root-only shm
+  // builders (set_H0). Defined in paw_onecenter.hpp.
+  template<typename Pot_t>
+  nda::array<ComplexType,3> compute_int_VQ(Pot_t const& V_r) const;
+  // Eq. (h0) static USPP/PAW non-local D:
+  //     D_h0 = Dnn_atom_static (dion + ex_cvij)  +  ∫ V_loc · Q̂
+  // The second term is the frozen one-body ELECTROSTATIC coupling of the
+  // compensation charge to the local potential — neither exchange nor
+  // correlation, so it is ALWAYS included. It is NOT
+  // contained in dion: Eq. (d0)'s −⟨Q̂|v_H[ñ_Zc]⟩ is the one-center
+  // DESCREENING reference (opposite sign, radial, own-atom), put there
+  // precisely so the solid re-adds the full periodic integral. Lazily
+  // cached (V_loc and Q̂ are frozen); the first-call build is rank-local,
+  // so calls are safe from any context (incl. node-root-only builders).
+  nda::array<ComplexType,3> const& static_h0_D() const;
+  // Angular-momentum coupling tables at lli = 1 + max l over all projectors.
+  paw::aainit_tables const& paw_aatab() const;
+  // Per-species qrad interpolation tables at the SINGLE project-wide
+  // dq = 0.01; rebuilt only when Kmax grows or the mode
+  // (shape-restored vs moment) / aug_lmax changes. A table built to a larger
+  // Kmax is exact for any smaller request (identical interpolation nodes).
+  std::vector<paw::qrad_tab> const& paw_qrad_tabs(
+      double Kmax, bool shape_restored_paw) const;
+  // Full-BZ View-2 Pskna lift, built once. MPI-COLLECTIVE on this
+  // pseudopot's own communicator at the first call: every rank must reach
+  // it together (all current consumers are themselves collective helpers).
+  math::shm::shared_array<nda::array_view<ComplexType,4>> const&
+      Pskna_full_bz() const;
 
   private:
 
@@ -174,9 +522,11 @@ class pseudopot
   // input file, needed for save
   std::string input_file_name = "";
 
-  // basic system info
-  nda::stack_array<int,3> fft_mesh;
-  long nnr = 0;
+  // basic system info — dense (dfftp / augmentation) FFT grid.
+  // Pseudopotential data (V_loc, V_eff, augmentation Q, dense miller_g)
+  // all live on this grid; for NCPP it coincides with the smooth grid.
+  nda::stack_array<int,3> fft_mesh_aug;
+  long nnr_aug = 0;
  
   // reciprocal lattice vectors
   nda::stack_array<double,3,3> recv;
@@ -219,9 +569,35 @@ class pseudopot
   // Matrix elements between projectors and basis orbitals (in mf)
   sarray_t<nda::array_view<ComplexType,4>> Pskna;
 
-  // D matrix for local projectors
+  // D matrix for local projectors. Species-resolved (nsp, nhm*npol, nhm*npol)
+  // for NCPP. For USPP/PAW the per-atom static D is held separately in
+  // Dnn_atom_static (below); add_Vpp dispatches between the two.
   //memory::unified_array<ComplexType,3> Dnn;
   sarray_t<nda::array_view<ComplexType,3>> Dnn;
+
+  // Static (frozen) per-atom non-local D for USPP/PAW:
+  //   D_static(a, I, J) = dion(type(a), I, J) + alpha_x * ex_cvij(type(a), I, J)
+  // shape (nat, nhm*npol, nhm*npol). Built EAGERLY in read_vnl_h5 (dion is the
+  // full frozen D^0 per QE convention; ex_cvij is the frozen core-valence
+  // exact exchange, contracted with factor 1). Never mutated afterwards —
+  // this is the only persistent per-atom D. Density-dependent (Hartree-only)
+  // terms are rebuilt per evaluation via compute_paw_deeq. Dummy
+  // (1,1,1) for NCPP (species-resolved Dnn is used instead).
+  sarray_t<nda::array_view<ComplexType,3>> Dnn_atom_static;
+
+  // aainit `lli` parameter (= 1 + max_l over all PAW betas), needed to size
+  // the angular-momentum coupling tables. Populated lazily alongside the
+  // SCF caches above.
+  int paw_aainit_lli = 0;
+
+  // Runtime caches (see paw_rt() above). Created lazily; shared
+  // between copies of this pseudopot (safe: content is keyed, never stale).
+  mutable std::shared_ptr<paw::runtime_caches> paw_rt_cache;
+
+  // True after `build_paw_scf_caches` has built paw_aainit_lli. Acts as a
+  // memoization flag so the SCF entry point can skip rebuilding the static
+  // caches each iteration.
+  bool paw_scf_caches_built = false;
 
   // mapping from wfc_g grid to rho grid. 
   // hard coding ecut in mf now, allow for a custom cutoff later on
@@ -233,18 +609,247 @@ class pseudopot
   // scf local potential
   sarray_t<nda::array_view<ComplexType,3>> svsc;
 
-  // qgm
+  // qgm: Q^IJ(G) augmentation in reciprocal space, structure-factor free
+  // shape: (nsp, nij_max, ngm_dense), where nij_max = max_t nh(t)*(nh(t)+1)/2
+  // For species nt, valid pair indices are ij ∈ [0, nh(nt)*(nh(nt)+1)/2 ).
+  // Non-USPP/PAW species rows are zero.
   sarray_t<nda::array_view<ComplexType,3>> qgm;
 
+  // composite (ih,jh) -> ij index map for augmentation, shape (nsp, nhm, nhm)
+  // 1-based indices coming from QE; subtract 1 before indexing into qgm.
+  // Allocated empty for ncpp.
+  nda::array<int,3> ijtoh;
+
+  // augmentation overlap S = 1 + Σ_a Σ_IJ |β_aI⟩ q_{IJ} ⟨β_aJ|
+  // shape: (nsp, nhm*npol, nhm*npol). Real-only convention until SOC ops land;
+  // for non-SO USPP/PAW the imag part is zero.
+  sarray_t<nda::array_view<ComplexType,3>> qq_nt_data;
+
+  // Per-species PAW data (definition hoisted to public scope, see above).
+  // Populated from /Hamiltonian/Species/{nt}/ in read_vnl_h5.
+  std::vector<species_paw_t> paw_species;
+
+  // Per-node SHM storage backing the heavy paw_species fields (aewfc,
+  // pswfc, qfuncl, deltaC, core_aewfc). Index aligned with paw_species.
+  // The `nda::array_view` fields in species_paw_t are bound to the
+  // `.local()` of the corresponding sarray here, so consumers see
+  // node-shared memory instead of per-rank replication.
+  std::vector<species_paw_shm_t> paw_species_shm;
+
+  // dense-grid G-vector count (read from /Hamiltonian/{type}/ngm attribute);
+  // needed to size qgm and to map Q-index space.
+  long ngm_dense = 0;
+
+  // Miller indices for the dense G-grid that qgm lives on, shape (ngm_dense, 3).
+  // Allocated only for USPP/PAW; needed by v_h_paw to build structure factors
+  // and cartesian G-vectors when injecting the augmentation Q^IJ(G) e^{-iG·τ_a}.
+  nda::array<int,2> miller_g_dense;
+
+  // Cartesian atom positions, shape (nat, 3). Cached from mf at construct time
+  // so the Hartree augmentation step doesn't need to thread mf through.
+  nda::array<double,2> atom_pos_cart;
+
   template<typename MF_t>
-  void read_vnl_pw2bgw(MF_t &mf, std::string outdir); 
+  void read_vnl_pw2bgw(MF_t &mf, std::string outdir);
 
   template<typename MF_t>
   void read_vnl_h5(MF_t &mf, h5::group& grp); 
 
-  void add_vnl_impl(nda::range k_range, nda::range b_range, 
-               nda::ArrayOfRank<3> auto const& Dion, 
+  void add_vnl_impl(nda::range k_range, nda::range b_range,
+               nda::ArrayOfRank<3> auto const& Dion,
                math::nda::DistributedArrayOfRank<4> auto & Hij);
+
+  // Public PAW/USPP utilities exposed to callers (test code, paw_aug_thc,
+  // v_h_paw, etc.). Re-open public scope here.
+public:
+
+  /**
+   * Diagnostic: contract a caller-supplied non-local D tensor into a band-space
+   * matrix and NOTHING else — no kinetic, no local potential, no Hartree. Hij
+   * is accumulated into, so the caller must zero it first.
+   *
+   * Exists to split e_1e = Tr[γ H0] into its individual one-center pieces so
+   * each can be compared against the matching term of another code's PAW energy
+   * decomposition (ABINIT's e1t10 = Σ_ij ρ_ij dij0, etc.). Uses only the stored
+   * projectors Pskna, so it needs no orbital I/O and is cheap.
+   *
+   * Indexing follows add_vnl_impl: the leading index of `Dion` is the SPECIES
+   * for NCPP and the ATOM for USPP/PAW.
+   */
+  void add_Vnl(nda::range k_range, nda::range b_range,
+               nda::ArrayOfRank<3> auto const& Dion,
+               math::nda::DistributedArrayOfRank<4> auto & Hij)
+  { add_vnl_impl(k_range, b_range, Dion, Hij); }
+
+  // Species-resolved frozen dion (nsp, nhm*npol, nhm*npol), Hartree. For NCPP
+  // this IS the entire non-local pseudopotential (ABINIT's non_local_psp); for
+  // USPP/PAW it is the dion part replicated into Dnn_atom_static.
+  auto Dnn_view() const { return Dnn.local(); }
+
+  /**
+   * Diagnostic: the per-atom static-D contribution of the frozen core-valence
+   * exact-exchange kernel ALONE (alpha_x * ex_cvij) — i.e. the ex_cvij half of
+   * Dnn_atom_static. Zero for NCPP, and for PAW species whose dataset carries
+   * no core-valence exchange. Subtracting it from Dnn_atom_view() leaves the
+   * pure dion replica, which is what maps onto ABINIT's e1t10; ex_cvij itself
+   * maps onto ABINIT's dijfock_cv, i.e. it belongs with EXCHANGE, not with the
+   * one-body term where CoQui's static D keeps it.
+   */
+  nda::array<ComplexType,3> static_D_cv_only() const;
+
+  /**
+   * Return the self-consistent per-atom D for a current density matrix `nij`
+   * under the frozen-core no-XC scGW framework:
+   *
+   *   D_eff^a(ρ) = D_static^a + ΔD_H^a(becsum^a(ρ), ρ_core_AE, ρ_core_PS)
+   *
+   * Thin non-mutating wrapper over `compute_paw_deeq(nij, empty_Vloc,
+   * include_static=true)`: the static tensor `Dnn_atom_static`
+   * (dion + ex_cvij, built in the ctor) is the baseline and is never
+   * modified; the dynamic piece is the Hartree-only radial one-center term
+   * from the current becsum. No G-space ∫V·Q term (pass a potential to
+   * `compute_paw_deeq` directly for the full KS-like operator).
+   *
+   * Restrictions: npol = 1 (no SOC), non-magnetic (nspin = 1 path uses
+   * full nij; LSDA averaging is the same path on the spin-summed becsum).
+   * Requires populated `species_paw_t` fields (aewfc, pswfc, ae_vloc,
+   * vloc_ps, qfuncl); throws otherwise.
+   *
+   * Implementation lives out-of-class in `hamiltonian/paw/paw_onecenter.hpp`
+   * — include that header at the call site.
+   */
+  template<typename nij_t>
+  nda::array<ComplexType,3> compute_deeq_scf(nij_t const& nij);
+
+  /**
+   * Unified native PAW non-local D builder (the single source of truth — no
+   * QE deeq, no XC). Returns a per-atom Dion array (nat, nhm*npol, nhm*npol)
+   * assembled from up to three terms:
+   *   1. static     : dvan (h5 `dion` in Ha; already includes the AE−PS
+   *                   V_loc baseline per QE convention), included iff
+   *                   `include_static`.
+   *   2. radial     : AE−PS one-center Hartree, `compute_paw_hartree_atom`
+   *                   from `becsum = ns_scl × compute_becsum_{diagonal,full}`.
+   *                   No additional multiplier — `dDeeq_H` evaluated on the
+   *                   spin-summed becsum equals QE's `ddd_paw` per-channel
+   *                   (Ry/Ha cancellation across QE's `e2=2` convention and
+   *                   CoQui's spin doubling).
+   *   3. G-space    : `∫ Vloc_r(r) Q^IJ_a(r) dr`, included iff `Vloc_r` is
+   *                   non-empty (caller passes V_H for the Hartree matrix,
+   *                   or V_eff = V_loc+V_H for the full deeq used in
+   *                   `add_vpp_impl`).
+   * Callers build Dion then feed it to `add_vnl_impl` — the single code path
+   * that touches Hij/Vij. Two overloads accept the density either as the
+   * diagonal `nii(s,k,n)` or the full density matrix `nij(s,k,a,b)`; both
+   * funnel through `compute_paw_deeq_from_becsum` so the static / radial /
+   * G-space assembly (and the rad_fac = 1 convention) lives in one place.
+   *
+   * Implementation lives out-of-class in `hamiltonian/paw/paw_onecenter.hpp`.
+   */
+  template<typename Pot_t>
+  nda::array<ComplexType,3> compute_paw_deeq(nda::ArrayOfRank<3> auto const& nii,
+                                             Pot_t const& Vloc_r,
+                                             bool include_static);
+  template<typename Pot_t>
+  nda::array<ComplexType,3> compute_paw_deeq(nda::ArrayOfRank<4> auto const& nij,
+                                             Pot_t const& Vloc_r,
+                                             bool include_static);
+  // Shared core: assemble Dion from an already spin-scaled per-atom becsum
+  // (nat, nhm, nhm). The two compute_paw_deeq overloads build becsum from
+  // nii / nij respectively and delegate here.
+  template<typename Pot_t>
+  nda::array<ComplexType,3> compute_paw_deeq_from_becsum(
+                                             nda::array<double,3> const& becsum,
+                                             Pot_t const& Vloc_r,
+                                             bool include_static);
+
+  /**
+   * Build the SCF-invariant caches consumed by the PAW deeq builders:
+   * `paw_aainit_lli`. (The static per-atom tensor
+   * `Dnn_atom_static` is NOT built here — it is assembled eagerly in
+   * `read_vnl_h5`.) Idempotent; subsequent calls return immediately.
+   * Called automatically from `compute_paw_deeq_from_becsum`; exposed
+   * publicly so callers can pre-build the caches (e.g., during driver
+   * setup, outside the SCF hot loop).
+   *
+   * Implementation lives out-of-class in `hamiltonian/paw/paw_onecenter.hpp`.
+   */
+  void build_paw_scf_caches();
+
+  /**
+   * Add the smooth-grid USPP/PAW augmentation Σ_a Σ_IJ becsum_aIJ Q^IJ_nt(G) e^{-iG·τ_a}
+   * to a pair density rhoG already on the dense G grid. NCPP species are
+   * skipped. The caller is responsible for building becsum_aIJ from Pskna
+   * and the gvec_phase structure-factor table.
+   */
+  void add_augmentation_to_pairdensity(
+      nda::ArrayOfRank<2> auto const& becsum_aIJ,
+      nda::ArrayOfRank<2> auto const& gvec_phase,
+      nda::ArrayOfRank<1> auto       & rhoG) const;
+
+  /**
+   * Add the augmentation contribution to a (s,k,a,b) orbital-basis overlap:
+   *   S_ab(s,k) += Σ_atom Σ_IJ conj(P_aI(s,k,a)) * q_IJ(type(atom)) * P_aJ(s,k,b)
+   *
+   * Combined with the identity, this yields the full ultrasoft/PAW S overlap
+   * S = 1 + Σ_a Σ_IJ |β_aI⟩ q_{IJ} ⟨β_aJ|
+   * For NCPP species (qq_nt = 0) the call is a no-op. For SOC the diagonal
+   * spinor block is used (qq_so support is a TODO).
+   *
+   * Sij must already hold the bare overlap (typically the identity) on entry;
+   * this method *adds* the augmentation correction. Pattern matches
+   * add_vnl_impl so consumers can dispatch the same way they do for V_NL.
+   */
+  void add_S(nda::range k_range, nda::range b_range,
+             math::nda::DistributedArrayOfRank<4> auto & Sij)
+  {
+    using nda::range;
+    decltype(range::all) all;
+    constexpr auto MEM = memory::get_memory_space<std::decay_t<decltype(Sij.local())>>();
+
+    if (ptype == pp_ncpp_t) return;
+
+    auto k_range_loc = Sij.local_range(1) + k_range.first();
+    auto b_range_loc = Sij.local_range(2) + b_range.first();
+    long nkb  = Pskna.shape()[2]/npol;
+    if (nkb == 0) return;
+
+    auto Qloc  = qq_nt_data.local();
+    auto Sloc  = Sij.local();
+    auto Ploc  = Pskna.local();
+
+    if constexpr (MEM == HOST_MEMORY) {
+      long nbnd = b_range_loc.size();
+      memory::array<MEM, ComplexType, 2> T(nbnd, nkb*npol);
+      memory::array<MEM, ComplexType, 3> Qfull;
+      int nhm = Qloc.shape()[1];
+      Qfull = memory::array<MEM, ComplexType, 3>(Qloc.shape()[0], nhm*npol, nhm*npol);
+      Qfull() = ComplexType(0.0);
+      for (int s=0; s<int(Qloc.shape()[0]); ++s)
+        for (int p=0; p<npol; ++p)
+          for (int n=0; n<nhm; ++n)
+            for (int m=0; m<nhm; ++m)
+              Qfull(s, n*npol+p, m*npol+p) = Qloc(s, n, m);
+      for (auto [is,s] : itertools::enumerate(Sij.local_range(0)))
+        for (auto [ik,k] : itertools::enumerate(k_range_loc)) {
+          for (auto [ia,nt] : itertools::enumerate(ityp)) {
+            if (nh(nt) == 0) continue;
+            nda::blas::gemm(ComplexType(1.0),
+              nda::dagger(Ploc(s, k,
+                    range(ofs(ia)*npol, (ofs(ia)+nh(nt))*npol), b_range_loc)),
+              Qfull(nt, range(nh(nt)*npol), range(nh(nt)*npol)),
+              ComplexType(0.0),
+              T(all, range(ofs(ia)*npol, (ofs(ia)+nh(nt))*npol)));
+          }
+          nda::blas::gemm(ComplexType(1.0), T,
+                          Ploc(s, k, all, b_range),
+                          ComplexType(1.0), Sloc(is, ik, all, all));
+        }
+    } else {
+      static_assert(MEM == HOST_MEMORY,
+          "pseudopot::add_S device path not yet implemented");
+    }
+  }
 
   /**
    * Add the contributions of a generic pseudopotentials:
@@ -266,14 +871,20 @@ class pseudopot
    *                           where Vpp_nl is the non-local part of the pseudopotential
    * @param nii     - [input] Diagonal density matrix (s, k, a)
    * @param nij     - [input] Density matrix (s, k, a, b)
+   * @param add_hartree  - [input] with a density: add smooth V_H to hpsi and
+   *                       the V_loc+V_H one-center D to Hij. false
+   *                       reduces to the static-only no-density assembly.
+   * @param add_exchange - [input] with a density: accumulate the direct-route
+   *                       exact-exchange K into Hij (host only).
    */
   template< nda::ArrayOfRank<3> Arr3, nda::ArrayOfRank<4> Arr4>
   void add_vpp_impl(boost::mpi3::communicator& comm,
-               nda::range k_range, nda::range b_range, 
+               nda::range k_range, nda::range b_range,
                math::nda::DistributedArrayOfRank<4> auto const& psi,
                math::nda::DistributedArrayOfRank<4> auto & hpsi,
                math::nda::DistributedArrayOfRank<4> auto & Hij,
-               const Arr3 * nii, const Arr4 * nij);
+               const Arr3 * nii, const Arr4 * nij,
+               bool add_hartree = true, bool add_exchange = false);
 
   /**
    * Add the contributions of the Hartree potential to the wavefunctions "hpsi"
@@ -290,16 +901,17 @@ class pseudopot
    *                          should be provided, not both.
    */
   template<nda::ArrayOfRank<3> Arr3, nda::ArrayOfRank<4> Arr4>
-  void add_Hartree_impl(nda::range k_range,
+  void add_Hartree_impl(nda::range k_range, nda::range b_range,
                         math::nda::DistributedArrayOfRank<4> auto const& psi,
                         math::nda::DistributedArrayOfRank<4> auto & hpsi,
+                        math::nda::DistributedArrayOfRank<4> auto & Vij,
                         const Arr3 *nii, const Arr4 *nij, bool symmetrize=false);
 
 
 };
 
 // if mf.get_pseudopot() returns a valid shared pointer, return it.
-// otherwise, construct a new object managed by a shared pointer, 
+// otherwise, construct a new object managed by a shared pointer,
 // store the pointer in mf and return it.
 template<typename MF_t>
 std::shared_ptr<pseudopot> make_pseudopot(MF_t &mf)
@@ -308,8 +920,8 @@ std::shared_ptr<pseudopot> make_pseudopot(MF_t &mf)
   auto mpi = mf.mpi();
   mpi->comm.barrier();
   if(mf.get_pseudopot()) { return mf.get_pseudopot(); }
-  else { 
-    //
+  else {
+    // Construct object, attach lazy reference to mf, return
     auto psp = std::make_shared<pseudopot>(mf);
     mf.set_pseudopot(psp);
     if( not mf.get_pseudopot() )
@@ -320,4 +932,3 @@ std::shared_ptr<pseudopot> make_pseudopot(MF_t &mf)
 
 }
 
-#endif

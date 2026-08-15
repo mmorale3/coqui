@@ -258,7 +258,79 @@ TEST_CASE("bz_symm", "[mean_field]")
   REQUIRE( s1.kpts == nda::array<double,2>{{0,0,0}} );
   REQUIRE( s1.Qpts == nda::array<double,2>{{0,0,0}} );
   REQUIRE( s1.symm_list.size() == 1 );
-  world.barrier(); 
+  world.barrier();
+}
+
+/*
+ * The minimal /System/BZ layout (MP grid + IBZ kpoints + symmetry operations)
+ * must rebuild exactly the maps that the full layout stores verbatim.  This is
+ * what lets abinit2coqui emit a symmetry-reduced checkpoint without
+ * reimplementing bz_symm's map construction converter-side.
+ *
+ * Rather than ship a second fixture, this reads the full block from the
+ * symmetry-reduced LiH checkpoint and feeds its own (kp_grid, IBZ kpoints,
+ * symm_list) back through the constructor, then compares every map.
+ */
+TEST_CASE("bz_symm_minimal_rebuild", "[mean_field]")
+{
+  auto world = boost::mpi3::environment::get_world_instance();
+  auto [outdir, prefix] = utils::utest_filename("bdft_lih222_sym");
+  std::string fn = outdir + "/" + prefix + ".h5";
+  if(not std::filesystem::exists(fn)) return;
+
+  nda::array<double, 2> latt(3,3), recv(3,3);
+  mf::bz_symm full;
+  {
+    h5::file file(fn, 'r');
+    h5::group grp(file);
+    h5::group sgrp = grp.open_group("System");
+    REQUIRE( mf::bz_symm::can_init_from_h5(sgrp) );
+    nda::h5_read(grp, "System/lattice_vectors", latt);
+    nda::h5_read(grp, "System/reciprocal_vectors", recv);
+    full.initialize_from_h5(sgrp);
+  }
+  // a genuinely symmetry-reduced checkpoint, else the test proves nothing
+  REQUIRE( full.nkpts_ibz < full.nkpts );
+  REQUIRE( full.symm_list.size() > 1 );
+
+  // IBZ kpoints are the leading nkpts_ibz entries of the stored (cartesian) list
+  nda::array<double, 2> kpts_ibz(full.nkpts_ibz, 3);
+  kpts_ibz() = full.kpts(nda::range(full.nkpts_ibz), nda::range(3));
+
+  bool no_q_sym = (full.nqpts_ibz == full.nqpts);
+  bool use_trev = (full.nkpts_trev_pairs > 0);
+  mf::bz_symm rebuilt(world, no_q_sym, latt, recv, full.kp_grid, kpts_ibz,
+                      full.symm_list, use_trev);
+
+  REQUIRE( rebuilt.nkpts     == full.nkpts );
+  REQUIRE( rebuilt.nkpts_ibz == full.nkpts_ibz );
+  REQUIRE( rebuilt.nqpts     == full.nqpts );
+  REQUIRE( rebuilt.nqpts_ibz == full.nqpts_ibz );
+  REQUIRE( rebuilt.nkpts_trev_pairs == full.nkpts_trev_pairs );
+
+  REQUIRE( rebuilt.kp_symm      == full.kp_symm );
+  REQUIRE( rebuilt.kp_to_ibz    == full.kp_to_ibz );
+  REQUIRE( rebuilt.kp_trev_pair == full.kp_trev_pair );
+  REQUIRE( rebuilt.qk_to_k2     == full.qk_to_k2 );
+  REQUIRE( rebuilt.qminus       == full.qminus );
+  REQUIRE( rebuilt.qp_symm      == full.qp_symm );
+  REQUIRE( rebuilt.qp_to_ibz    == full.qp_to_ibz );
+  REQUIRE( rebuilt.qsymms       == full.qsymms );
+  REQUIRE( rebuilt.nq_per_s     == full.nq_per_s );
+  REQUIRE( rebuilt.ks_to_k      == full.ks_to_k );
+  REQUIRE( rebuilt.Qs           == full.Qs );
+  REQUIRE( rebuilt.qs_to_q      == full.qs_to_q );
+
+  auto max_dev = [](auto const& a, auto const& b) {
+    double d = 0.0;
+    for(long i=0; i<a.size(); ++i)
+      d = std::max(d, std::abs(a.data()[i] - b.data()[i]));
+    return d;
+  };
+  REQUIRE( max_dev(rebuilt.kpts, full.kpts) < 1e-10 );
+  REQUIRE( max_dev(rebuilt.kpts_crys, full.kpts_crys) < 1e-10 );
+  REQUIRE( max_dev(rebuilt.Qpts, full.Qpts) < 1e-10 );
+  world.barrier();
 }
 
 

@@ -35,10 +35,11 @@ namespace hamilt::detail
  *           with global shape = (nspin, nkpts, nbnd, nbnd)
  */
 template<MEMORY_SPACE MEM, nda::ArrayOfRank<3> Arr3, nda::ArrayOfRank<4> Arr4>
-auto gen_H0(mf::MF& mf, boost::mpi3::communicator& comm, pseudopot *psp, 
+auto gen_H0(mf::MF& mf, boost::mpi3::communicator& comm, pseudopot *psp,
             nda::range k_range, nda::range b_range,
             memory::darray_t<memory::array<MEM,ComplexType,4>, mpi3::communicator>& psi,
-            Arr3 const* p3, Arr4 const* p4)
+            Arr3 const* p3, Arr4 const* p4, bool skip_pp = false,
+            bool add_hartree = true, bool add_exchange = false)
 {
   decltype(nda::range::all) all;
   using larray = memory::array<MEM,ComplexType,4>;
@@ -62,13 +63,17 @@ auto gen_H0(mf::MF& mf, boost::mpi3::communicator& comm, pseudopot *psp,
   // add kinetic part to hpsi
   hamilt::add_kinetic(npol,kpts,*wfc_g,psi,hpsi);
 
-  // add local pp to hpsi, non-local pp to Hij
-  if(p3 != nullptr)
-    psp->add_Vpp(comm,k_range,b_range,*p3,psi,hpsi,Hij);
-  else if(p4 != nullptr)
-    psp->add_Vpp(comm,k_range,b_range,*p4,psi,hpsi,Hij);
-  else 
-    psp->add_Vpp(comm,k_range,b_range,psi,hpsi,Hij);
+  // add local pp to hpsi, non-local pp to Hij.
+  // skip_pp=true leaves only the kinetic term (diagnostic: split e_1e into
+  // kinetic vs external/pseudopotential + one-center contributions).
+  if(!skip_pp) {
+    if(p3 != nullptr)
+      psp->add_Vpp(comm,k_range,b_range,*p3,psi,hpsi,Hij,add_hartree,add_exchange);
+    else if(p4 != nullptr)
+      psp->add_Vpp(comm,k_range,b_range,*p4,psi,hpsi,Hij,add_hartree,add_exchange);
+    else
+      psp->add_Vpp(comm,k_range,b_range,psi,hpsi,Hij);
+  }
 
   // Combine the local and non-local parts:
   // Hij = Hij + conj(psi(i,:)) * hpsi(j,:) = conj( conj(Hij) + psi(i,:) * conj(hpsi(j,:)) ) 
@@ -110,23 +115,116 @@ auto gen_Vhartree(mf::MF& mf, boost::mpi3::communicator& comm, pseudopot *psp,
   long nkpts = psi.global_shape()[1];
   long nbnd = psi.global_shape()[2];
 
-  // add Hartree potential to hpsi
+  // Vij accumulates the PAW/USPP one-center deeq (radial AE−PS + dynamic
+  // G-space ∫V_H·Q) inside add_Hartree (via add_vnl_impl), then the smooth
+  // bra ⟨ψ̃_i|V_H|ψ̃_j⟩ is added below — exactly mirroring gen_H0's Hij. The
+  // sum is the ALL-ELECTRON V_H matrix element; NCPP contributes zero deeq.
+  auto Vij = math::nda::make_distributed_array<larray>(comm,psi.grid(),{nspin,nkpts,nbnd,nbnd},
+                                                       {psi.block_size()[0],psi.block_size()[1],psi.block_size()[2],psi.block_size()[2]});
+  Vij.local() = ComplexType(0.0);
+
+  // add Hartree potential to hpsi (local), one-center deeq to Vij (non-local)
   if(nii != nullptr)
-    psp->add_Hartree(k_range,*nii,psi,hpsi,symmetrize);
+    psp->add_Hartree(k_range,*nii,psi,hpsi,Vij,symmetrize);
   else if(nij != nullptr)
-    psp->add_Hartree(k_range,*nij,psi,hpsi,symmetrize);
+    psp->add_Hartree(k_range,*nij,psi,hpsi,Vij,symmetrize);
   else
     utils::check(false, "gen_Vhartree: both nii and nij are \"nullptr\". ");
 
-  // Vij = conj(psi(i,:)) * hpsi(j,:) = conj( conj(Vij) + psi(i,:) * conj(hpsi(j,:)) )
-  auto Vij = math::nda::make_distributed_array<larray>(comm,psi.grid(),{nspin,nkpts,nbnd,nbnd},
-                                                       {psi.block_size()[0],psi.block_size()[1],psi.block_size()[2],psi.block_size()[2]});
-
+  // Combine: Vij = Vij_deeq + conj(psi(i,:)) * hpsi(j,:)
+  //              = conj( conj(Vij_deeq) + psi(i,:) * conj(hpsi(j,:)) )
+  nda::tensor::scale(ComplexType(1.0),Vij.local(),nda::tensor::op::CONJ);
   math::nda::slate_ops::multiply(ComplexType(1.0),psi,math::nda::dagger(hpsi),
-                                   ComplexType(0.0),Vij);
+                                   ComplexType(1.0),Vij);
   nda::tensor::scale(ComplexType(1.0),Vij.local(),nda::tensor::op::CONJ);
 
   return Vij;
+}
+
+/**
+ * Compute the matrix elements of the exact-exchange operator K_{ij}(s, k_p)
+ * via FFT pair densities. NCPP / USPP / PAW dispatch is handled inside
+ * pseudopot::add_exchange (which routes through hamilt::paw::v_x → delegates
+ * to hamilt::v_x for NCPP, adds Q-augmented pair density for USPP/PAW).
+ *
+ * Unlike gen_Vhartree this does NOT build an hpsi intermediate. Exact
+ * exchange has no representation as a local potential acting on a single
+ * orbital — the augmentation cross terms are band-pair-dependent, so the
+ * K matrix is built directly.
+ *
+ * Sign: K is the SIGNED contribution to the Fock matrix (F = H_core + V_H + K
+ * with K already negative).
+ */
+template<MEMORY_SPACE MEM, nda::ArrayOfRank<3> Arr3_t>
+auto gen_Vexchange(mf::MF& mf, boost::mpi3::communicator& comm, pseudopot *psp,
+                   nda::range k_range, nda::range b_range,
+                   memory::darray_t<memory::array<MEM,ComplexType,4>, mpi3::communicator>& psi,
+                   Arr3_t const& nii)
+{
+  using larray = memory::array<MEM,ComplexType,4>;
+
+  app_log(2, "Evaluate the exchange matrix using FFT pair densities");
+  app_log(2, "-----------------------------------------------------\n");
+  app_log(2, "  nbnd  = {}", mf.nbnd());
+  app_log(2, "  npol  = {}", mf.npol());
+  app_log(2, "  nspin = {}", mf.nspin());
+  app_log(2, "  nkpts = {}", mf.nkpts());
+  app_log(2, "  nkpts_ibz = {}", mf.nkpts_ibz());
+  app_log(2, "");
+
+  utils::check(psp != nullptr, "gen_Vexchange: Missing pseudopot object.");
+  utils::check(k_range.size() == psi.global_shape()[1], "Shape mismatch.");
+  utils::check(b_range.size() == psi.global_shape()[2], "Shape mismatch.");
+
+  long nspin = psi.global_shape()[0];
+  long nkpts = psi.global_shape()[1];
+  long nbnd  = psi.global_shape()[2];
+
+  auto Kij = math::nda::make_distributed_array<larray>(
+      comm, psi.grid(), {nspin, nkpts, nbnd, nbnd},
+      {psi.block_size()[0], psi.block_size()[1],
+       psi.block_size()[2], psi.block_size()[2]});
+  Kij.local() = ComplexType(0.0);
+
+  psp->add_exchange(k_range, nii, psi, Kij);
+
+  return Kij;
+}
+
+// Full density-matrix overload of gen_Vexchange (mirrors the nii version but
+// passes the rank-4 density matrix through to pseudopot::add_exchange(nij)).
+template<MEMORY_SPACE MEM, nda::ArrayOfRank<4> Arr4_t>
+auto gen_Vexchange(mf::MF& mf, boost::mpi3::communicator& comm, pseudopot *psp,
+                   nda::range k_range, nda::range b_range,
+                   memory::darray_t<memory::array<MEM,ComplexType,4>, mpi3::communicator>& psi,
+                   Arr4_t const& nij)
+{
+  using larray = memory::array<MEM,ComplexType,4>;
+
+  app_log(2, "Evaluate the exchange matrix (full density matrix) using FFT pair densities");
+  app_log(2, "-----------------------------------------------------------------------\n");
+  app_log(2, "  nbnd  = {}", mf.nbnd());
+  app_log(2, "  nspin = {}", mf.nspin());
+  app_log(2, "  nkpts_ibz = {}", mf.nkpts_ibz());
+  app_log(2, "");
+
+  utils::check(psp != nullptr, "gen_Vexchange: Missing pseudopot object.");
+  utils::check(k_range.size() == psi.global_shape()[1], "Shape mismatch.");
+  utils::check(b_range.size() == psi.global_shape()[2], "Shape mismatch.");
+
+  long nspin = psi.global_shape()[0];
+  long nkpts = psi.global_shape()[1];
+  long nbnd  = psi.global_shape()[2];
+
+  auto Kij = math::nda::make_distributed_array<larray>(
+      comm, psi.grid(), {nspin, nkpts, nbnd, nbnd},
+      {psi.block_size()[0], psi.block_size()[1],
+       psi.block_size()[2], psi.block_size()[2]});
+  Kij.local() = ComplexType(0.0);
+
+  psp->add_exchange(k_range, nij, psi, Kij);
+
+  return Kij;
 }
 
 /**
@@ -246,6 +344,58 @@ auto gen_ovlp(boost::mpi3::communicator& comm,
   }
 }
 
+
+/**
+ * Identity overlap matrix in the band basis (full N×N).
+ *
+ * For PAW and USPP the QE pseudo-orbitals satisfy <ψ̃_n|S_aug|ψ̃_m> = δ_nm,
+ * where S_aug = 1 + Σ_a |p̃_a⟩(<φ_a^AE|φ_b^AE> − <φ_a^PS|φ_b^PS>)⟨p̃_b| is the
+ * augmented overlap operator, and the AE inner product equals the augmented
+ * pseudo inner product: <ψ_n^AE|ψ_m^AE> = <ψ̃_n|S_aug|ψ̃_m> = δ_nm. The AE
+ * (i.e. physical) band-basis overlap is therefore the identity. NCPP is a
+ * trivial case (S_aug = I, so even <ψ̃|ψ̃> = I); for USPP/PAW the pseudo-only
+ * inner product <ψ̃|ψ̃> ≠ I and silently misses the augmentation correction.
+ *
+ * This helper short-circuits the smooth-orbital `gen_ovlp` for QE-sourced
+ * mean-fields and writes the mathematically correct identity directly.
+ */
+template<MEMORY_SPACE MEM>
+auto gen_identity_ovlp(boost::mpi3::communicator& comm,
+                       std::array<long,4> grid,
+                       long nspin, long nkpts, long nbnd,
+                       std::array<long,4> bsize)
+{
+  using larray = memory::array<MEM, ComplexType, 4>;
+  auto Hij = math::nda::make_distributed_array<larray>(
+      comm, grid, {nspin, nkpts, nbnd, nbnd}, bsize);
+  auto Hloc = Hij.local();
+  Hloc() = ComplexType(0.0);
+  auto iloc = Hij.local_range(2);
+  auto jloc = Hij.local_range(3);
+  for (auto [is_l, is] : itertools::enumerate(Hij.local_range(0)))
+    for (auto [ik_l, ik] : itertools::enumerate(Hij.local_range(1)))
+      for (auto [ii_l, ii] : itertools::enumerate(iloc))
+        for (auto [ij_l, ij] : itertools::enumerate(jloc))
+          if (ii == ij) Hloc(is_l, ik_l, ii_l, ij_l) = ComplexType(1.0, 0.0);
+  return Hij;
+}
+
+/**
+ * Diagonal-only identity overlap (rank-3). Companion to gen_identity_ovlp; see
+ * that function's docstring for the math.
+ */
+template<MEMORY_SPACE MEM>
+auto gen_identity_ovlp_diagonal(boost::mpi3::communicator& comm,
+                                std::array<long,3> grid,
+                                long nspin, long nkpts, long nbnd,
+                                std::array<long,3> bsize)
+{
+  using larray3D = memory::array<MEM, ComplexType, 3>;
+  auto Hii = math::nda::make_distributed_array<larray3D>(
+      comm, grid, {nspin, nkpts, nbnd}, bsize);
+  Hii.local()() = ComplexType(1.0);
+  return Hii;
+}
 
 }  // namespace hamilt::detail
 

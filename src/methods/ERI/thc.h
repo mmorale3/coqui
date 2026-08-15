@@ -151,7 +151,7 @@ class thc
    * @param ri  - [INPUT] interpolating points
    * @param Xa  - [INPUT] orbital "a" on interpolating points: phi^{k*}_a(r_mu)
    * @param Xb  - [INPUT] orbital "b" on interpolating points: phi^{k-q*}_b(r_mu)
-   * @param return_Sinv_Ivec - [INPUT] return inverse of overlap matrix for \zeta^{q}_mu(r)
+   * @param return_Ivec - [INPUT] return \zeta^{q}_mu(G)
    * @param a_range - [INPUT] range of orbital "a"
    * @param b_range - [INPUT] range of orbital "b"
    * @param pgrid3D - [INPUT] processor grid
@@ -164,7 +164,7 @@ class thc
   auto evaluate(memory::array<MEM,long,1> const& ri, 
               Tensor_t const& Xa,
               std::optional<Tensor_t> const& Xb,
-              bool return_Sinv_Ivec = false, 
+              bool return_Ivec = false, 
               nda::range a_range = nda::range(-1,-1),
               nda::range b_range = nda::range(-1,-1),
               std::array<long, 3> pgrid3D = {0,0,0})
@@ -190,7 +190,7 @@ class thc
               nda::MemoryArrayOfRank<4> auto const& C_skai,
               Tensor_t const& Xa,
               Tensor_t const& Xb,
-              bool return_Sinv_Ivec = false,
+              bool return_Ivec = false,
               std::array<long, 3> pgrid3D = {0,0,0})
         -> std::tuple<_darray_t_<MEM,3>,
                       memory::array<MEM, ComplexType, 2>, memory::array<MEM, ComplexType, 2>,
@@ -304,6 +304,20 @@ class thc
   void print_timers();
   void reset_timers() { Timer.reset(); }
 
+  // Read-only access to the dense G grid used by the smooth ISDF (built
+  // from the input ecut, default = ecutrho). Needed by external callers
+  // that wish to evaluate auxiliary functions (e.g. PAW augmentation
+  // η^q(G)) on the same grid for cross-block Coulomb contractions.
+  grids::truncated_g_grid const& g_grid() const { return rho_g; }
+
+  // Cell volume Ω of the underlying MF object — convenience for callers
+  // assembling Coulomb contractions in G-space.
+  double volume() const { return (mf != nullptr) ? mf->volume() : 0.0; }
+
+  // MF accessor (used by augmentation hooks to reach pseudopot via
+  // make_pseudopot, atom positions, etc.).
+  mf::MF* get_mf() const { return mf; }
+
   private:
 
   // mpi context with global, node, internode and gpu communicators
@@ -377,7 +391,7 @@ class thc
    * @param ri  - [INPUT] interpolating points
    * @param Xa  - [INPUT] orbital "a" on interpolating points: phi^{k*}_a(r_mu)
    * @param Xb  - [INPUT] orbital "b" on interpolating points: phi^{k-q*}_b(r_mu)
-   * @param return_Sinv_Ivec - [INPUT] return inverse of overlap matrix for \zeta^{q}_mu(r)
+   * @param return_Ivec - [INPUT] return \zeta^{q}_mu(G)
    * @param a_range - [INPUT] range of orbital "a"
    * @param b_range - [INPUT] range of orbital "b"
    * @param pgrid3D - [INPUT] processor grid
@@ -395,7 +409,7 @@ class thc
   auto intvec_impl(nda::MemoryArrayOfRank<1> auto const& IPoints, 
         Tensor_t const& Xa,
         Tensor2_t const* Xb,
-        bool return_Sinv_Ivec, nda::range a_range, nda::range b_range, 
+        bool return_Ivec, nda::range a_range, nda::range b_range, 
         std::array<long, 3> pgrid3D={0,0,0});
   /**
    * Calculate the following quantity for orbitals stored on a non-uniform real-space grid:

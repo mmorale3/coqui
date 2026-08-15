@@ -38,9 +38,12 @@
 namespace mf
 {
 
-// calculates the charge density associated with the object mf and returns
-// a distributed array defined by the given processor grid and communicator.
-auto distributed_charge_density(MF &mf, boost::mpi3::communicator &comm, 
+// Builds the SMOOTH pseudo-density ρ̃(r) = Σ_n w_n |ψ̃_n(r)|² on the smooth
+// (dffts) grid. For NCPP this equals the physical density. For USPP/PAW the
+// physical density is ρ̃ + Σ_a Q_ij^a ⟨ψ|β_i^a⟩⟨β_j^a|ψ⟩ and lives on the
+// dense (dfftp) grid; constructing the augmented density would be a separate
+// routine that fills a dense-grid buffer.
+auto distributed_charge_density(MF &mf, boost::mpi3::communicator &comm,
 			        std::array<long,3> pgrid )
 {
   utils::check(mf.has_orbital_set(), "Error in distributed_charge_density: Invalid mf type. ");

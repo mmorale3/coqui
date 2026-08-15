@@ -40,9 +40,22 @@ using utils::mpi_context_t;
 using boost::mpi3::communicator;
 using boost::mpi3::shared_communicator;
 
+// The smooth-grid Coulomb solver, hidden in `detail`. The public entry point
+// is the pseudopot-aware `hamilt::v_h(..., pseudopot const&, ...)` overload
+// (in paw/v_h_paw.hpp), which builds the USPP/PAW compensation charge and
+// folds it into the density passed here — so the augmentation rides through
+// this single Coulomb pass (no separate post-hoc augmentation FFT).
+// MAM-TODO (deferred): physically relocating the pseudopot-aware overload +
+// compute_rho_aug_density_r/compute_becsum_* into this file is blocked by an
+// include cycle (they need pseudopot.h and are used across several headers);
+// the functional dedup the note targeted is already done.
+namespace detail
+{
+
 // TODO:
 //   1. construct rho(r) from non-orthogonal basis
 //   2. symmetrize rho(r)
+//   3. Move fuse v_h_paw with v_h, no need to separate interfaces
 
 /*
  * MAM: Implementation uses 2 copies of the charge density per core in a node. 
@@ -70,7 +83,7 @@ using boost::mpi3::shared_communicator;
  * @param svr  - [output] Hartree potential V_H(r) on a real-space mesh that is consistent with "mesh"
  */
 template<nda::ArrayOfRank<1> Arr>
-void v_h(mpi_context_t<communicator,shared_communicator> &mpi,
+void v_h_impl(mpi_context_t<communicator,shared_communicator> &mpi,
          pots::potential_t& vG,
          int npol,
          nda::stack_array<long, 3> const& mesh,
@@ -82,10 +95,15 @@ void v_h(mpi_context_t<communicator,shared_communicator> &mpi,
          nda::ArrayOfRank<1> auto const& kp_trev,
          nda::ArrayOfRank<1> auto const& kp_symm,
          std::vector<utils::symm_op> const& symm_list,
-         nda::ArrayOfRank<3> auto const& nii_, 
+         nda::ArrayOfRank<3> auto const& nii_,
          math::nda::DistributedArrayOfRank<4> auto const& psi,
          bool symmetrize_rho_r,
-         math::shm::shared_array<Arr>& svr)    // GPU!!!
+         math::shm::shared_array<Arr>& svr,    // GPU!!!
+         // Optional USPP/PAW augmentation density at the un-normalized nr(r)
+         // scale (= vol·N_k·ρ_aug,proper, root-only). When present it is added
+         // to the smooth density before the single Coulomb solve — folding the
+         // augmentation into v_h instead of a separate post-hoc FFT pass.
+         nda::array<ComplexType,1> const& rho_aug_r = nda::array<ComplexType,1>{})
 {
   decltype(nda::range::all) all;
   constexpr auto MEM = memory::get_memory_space<std::decay_t<decltype(psi.local())>>();
@@ -232,9 +250,19 @@ void v_h(mpi_context_t<communicator,shared_communicator> &mpi,
   } else {
     app_log(2, "  [WARNING] v_h: symmetrize_rho_r = false. The Hartree potential may not be fully symmetry-adapted.\n");
   }
- 
+
   // calculate potential in root
   if( mpi.comm.root() ) {
+
+    // Fold the USPP/PAW compensation charge into the density (single Coulomb
+    // pass), instead of a separate post-hoc augmentation FFT. rho_aug_r is
+    // pre-scaled by the caller to the un-normalized nr(r) convention.
+    if (rho_aug_r.size() == nnr) {
+      if constexpr (MEM == HOST_MEMORY)
+        nr() += rho_aug_r();
+      else
+        nr() += memory::to_memory_space<MEM>(rho_aug_r());
+    }
 
     auto nr3d = nda::reshape(nr,std::array<long,3>{mesh(0),mesh(1),mesh(2)});
     math::nda::fft<false> Fn(nr3d,math::fft::FFT_MEASURE | math::fft::FFT_PRESERVE_INPUT);
@@ -302,7 +330,7 @@ void v_h(mpi_context_t<communicator,shared_communicator> &mpi,
  * @param svr  - [output] Hartree potential V_H(r) on a real-space mesh that is consistent with "mesh"
  */
 template<nda::ArrayOfRank<1> Arr>
-void v_h(mpi_context_t<communicator,shared_communicator> &mpi,
+void v_h_impl(mpi_context_t<communicator,shared_communicator> &mpi,
          pots::potential_t& vG,
          int npol,
          nda::stack_array<long, 3> const& mesh,
@@ -314,10 +342,13 @@ void v_h(mpi_context_t<communicator,shared_communicator> &mpi,
          nda::ArrayOfRank<1> auto const& kp_trev,
          nda::ArrayOfRank<1> auto const& kp_symm,
          std::vector<utils::symm_op> const& symm_list,
-         nda::ArrayOfRank<4> auto const& nij_,  
+         nda::ArrayOfRank<4> auto const& nij_,
          math::nda::DistributedArrayOfRank<4> auto const& psi,
          bool symmetrize_rho_r,
-         math::shm::shared_array<Arr>& svr)
+         math::shm::shared_array<Arr>& svr,
+         // Optional USPP/PAW augmentation density at the nr(r) scale (root-only);
+         // folded into the smooth density before the single Coulomb solve.
+         nda::array<ComplexType,1> const& rho_aug_r = nda::array<ComplexType,1>{})
 {
 #if defined(ENABLE_DEVICE)
   using nda::tensor::reduce;
@@ -446,8 +477,17 @@ void v_h(mpi_context_t<communicator,shared_communicator> &mpi,
             // such that no conjugation is needed for nij in the next step
             if (kp_trev(k)) psi_r() = nda::conj(psi_r);
 
-            //accumulate density: Only diagonal components in polarization
-            nda::blas::gemm(nij(s, k_sym, all, all), psi_r, T);
+            //accumulate density: Only diagonal components in polarization.
+            // Convention: ρ(r) = Σ_ab nij_ab ψ_a(r) ψ*_b(r), i.e. nij_ab =
+            // ⟨ψ_a|γ|ψ_b⟩ — the SAME convention CoQui's SCF density matrix
+            // (qp_scf_common::update_Dm) and the THC Fock build use. The gemm
+            // below forms T_a = Σ_b nij_ab ψ_b and the loop contracts ψ*_a,
+            // which yields Σ_ab nij_ab ψ*_a ψ_b (the transposed density); we
+            // therefore pass nijᵀ so the result is Σ_ab nij_ab ψ_a ψ*_b. For
+            // real / diagonal nij this is a no-op; it only corrects the
+            // imaginary off-diagonal part of a complex Hermitian density
+            // matrix (see test thc_vs_direct_nij).
+            nda::blas::gemm(nda::transpose(nij(s, k_sym, all, all)), psi_r, T);
 
             if constexpr ( MEM == HOST_MEMORY ) {
               for (auto ib : nda::range(nbnd) ) {
@@ -514,10 +554,19 @@ void v_h(mpi_context_t<communicator,shared_communicator> &mpi,
   // calculate potential in root
   if( mpi.comm.root() ) {
 
+    // Fold the USPP/PAW compensation charge into the density (single Coulomb
+    // pass); rho_aug_r is pre-scaled to the un-normalized nr(r) convention.
+    if (rho_aug_r.size() == nnr) {
+      if constexpr (MEM == HOST_MEMORY)
+        nr() += rho_aug_r();
+      else
+        nr() += memory::to_memory_space<MEM>(rho_aug_r());
+    }
+
     auto n3d = nda::reshape(nr,std::array<long,3>{mesh(0),mesh(1),mesh(2)});
     math::nda::fft<false> Fn(n3d,math::fft::FFT_MEASURE | math::fft::FFT_PRESERVE_INPUT);
 
-    // r -> g 
+    // r -> g
     Fn.forward(n3d);
 
     if constexpr (MEM == HOST_MEMORY) {
@@ -551,6 +600,8 @@ void v_h(mpi_context_t<communicator,shared_communicator> &mpi,
   mpi.comm.barrier();
 
 }
+
+} // namespace detail
 
 }
 
