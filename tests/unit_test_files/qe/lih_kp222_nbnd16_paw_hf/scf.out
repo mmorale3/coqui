@@ -1,0 +1,4470 @@
+
+     Program PWSCF v.7.4.1 starts on 21May2026 at 16:25:21 
+
+     This program is part of the open-source Quantum ESPRESSO suite
+     for quantum simulation of materials; please cite
+         "P. Giannozzi et al., J. Phys.:Condens. Matter 21 395502 (2009);
+         "P. Giannozzi et al., J. Phys.:Condens. Matter 29 465901 (2017);
+         "P. Giannozzi et al., J. Chem. Phys. 152 154105 (2020);
+          URL http://www.quantum-espresso.org", 
+     in publications or presentations arising from this work. More details at
+     http://www.quantum-espresso.org/quote
+
+     Parallel version (MPI), running on     1 processors
+
+     MPI processes distributed on     1 nodes
+     0 MiB available memory on the printing compute node when the environment starts
+
+     Reading input from scf.inp
+
+     Current dimensions of program PWSCF are:
+     Max number of different atomic species (ntypx) = 10
+     Max number of k-points (npk) =  40000
+     Max angular momentum in pseudopotentials (lmaxx) =  4
+     file H.pbe-kjpaw_psl.1.0.0.UPF: wavefunction(s)  1S renormalized
+
+     IMPORTANT: XC functional enforced from input :
+     Exchange-correlation= HF+NOC
+                           (   5   0   0   0   0   0   0)
+     EXX-fraction              =        1.00
+     Any further DFT definition will be discarded
+     Please, verify this is what you really want
+
+
+     Subspace diagonalization in iterative solution of the eigenvalue problem:
+     a serial algorithm will be used
+
+     EXX: q-point mesh:     2    2    2
+     EXX: setup a grid of 8 q-points centered on each k-point
+     (k+q)-points:
+   0.0000000   0.0000000   0.0000000         1    1
+   0.5000000  -0.5000000   0.5000000         2    1
+  -0.5000000  -0.5000000  -0.5000000         3    1
+   0.0000000  -1.0000000   0.0000000         4    1
+   0.5000000   0.5000000  -0.5000000         5    1
+   1.0000000   0.0000000   0.0000000         6    1
+   0.0000000   0.0000000  -1.0000000         7    1
+   0.5000000  -0.5000000  -0.5000000         8    1
+
+     G-vector sticks info
+     --------------------
+     sticks:   dense  smooth     PW     G-vecs:    dense   smooth      PW
+     Sum         823     823    241                15593    15593    2445
+
+     Using Slab Decomposition
+
+
+
+     bravais-lattice index     =            2
+     lattice parameter (alat)  =       7.7158  a.u.
+     unit-cell volume          =     114.8351 (a.u.)^3
+     number of atoms/cell      =            2
+     number of atomic types    =            2
+     number of electrons       =         4.00
+     number of Kohn-Sham states=           16
+     kinetic-energy cutoff     =     100.0000  Ry
+     charge density cutoff     =     400.0000  Ry
+     cutoff for Fock operator  =     400.0000  Ry
+     scf convergence threshold =      1.0E-10
+     mixing beta               =       0.3000
+     number of iterations used =            8  plain     mixing
+     Exchange-correlation= HF+NOC
+                           (   5   0   0   0   0   0   0)
+     EXX-fraction              =        1.00
+
+     celldm(1)=   7.715752  celldm(2)=   0.000000  celldm(3)=   0.000000
+     celldm(4)=   0.000000  celldm(5)=   0.000000  celldm(6)=   0.000000
+
+     crystal axes: (cart. coord. in units of alat)
+               a(1) = (  -0.500000   0.000000   0.500000 )  
+               a(2) = (   0.000000   0.500000   0.500000 )  
+               a(3) = (  -0.500000   0.500000   0.000000 )  
+
+     reciprocal axes: (cart. coord. in units 2 pi/alat)
+               b(1) = ( -1.000000 -1.000000  1.000000 )  
+               b(2) = (  1.000000  1.000000  1.000000 )  
+               b(3) = ( -1.000000  1.000000 -1.000000 )  
+
+
+     PseudoPot. # 1 for Li read from file:
+     ./Li.pbe-sl-kjpaw_psl.1.0.0.UPF
+     MD5 check sum: 5f86f3d72282a55e576b7faccaf98e5a
+     Pseudo is Projector augmented-wave, Zval =  3.0
+     Generated using 'atomic' code by A. Dal Corso  v.6.8
+     Shape of augmentation charge: PSQ
+     Using radial grid of 1017 points,  4 beta functions with: 
+                l(1) =   0
+                l(2) =   0
+                l(3) =   1
+                l(4) =   1
+     Q(r) pseudized with 0 coefficients 
+
+
+     PseudoPot. # 2 for H  read from file:
+     ./H.pbe-kjpaw_psl.1.0.0.UPF
+     MD5 check sum: a42d397bfce5a7f244adf0db30ddc004
+     Pseudo is Projector augmented-wave, Zval =  1.0
+     Generated using 'atomic' code by A. Dal Corso  v.6.8
+     Shape of augmentation charge: PSQ
+     Using radial grid of  929 points,  2 beta functions with: 
+                l(1) =   0
+                l(2) =   0
+     Q(r) pseudized with 0 coefficients 
+
+
+     atomic species   valence    mass     pseudopotential
+     Li                3.00     6.94100     Li( 1.00)
+     H                 1.00     1.00794     H ( 1.00)
+
+     No symmetry found
+
+
+                                    s                        frac. trans.
+
+      isym =  1     identity                                     
+
+ cryst.   s( 1) = (     1          0          0      )
+                  (     0          1          0      )
+                  (     0          0          1      )
+
+ cart.    s( 1) = (  1.0000000  0.0000000  0.0000000 )
+                  (  0.0000000  1.0000000  0.0000000 )
+                  (  0.0000000  0.0000000  1.0000000 )
+
+
+     point group C_1 (1)    
+     there are  1 classes
+     the character table:
+
+       E    
+A      1.00
+
+     the symmetry operations in each class and the name of the first element:
+
+     E        1
+          identity                                               
+
+   Cartesian axes
+
+     site n.     atom                  positions (alat units)
+         1        Li     tau(   1) = (   0.0000000   0.0000000   0.0000000  )
+         2        H      tau(   2) = (   0.5000000   0.5000000   0.5000000  )
+
+   Crystallographic axes
+
+     site n.     atom                  positions (cryst. coord.)
+         1        Li     tau(   1) = (  0.0000000  0.0000000  0.0000000  )
+         2        H      tau(   2) = ( -0.5000000  1.5000000 -0.5000000  )
+
+     number of k points=     8
+                       cart. coord. in units 2pi/alat
+        k(    1) = (   0.0000000   0.0000000   0.0000000), wk =   0.2500000
+        k(    2) = (   0.5000000  -0.5000000   0.5000000), wk =   0.2500000
+        k(    3) = (  -0.5000000  -0.5000000  -0.5000000), wk =   0.2500000
+        k(    4) = (   0.0000000  -1.0000000   0.0000000), wk =   0.2500000
+        k(    5) = (   0.5000000   0.5000000  -0.5000000), wk =   0.2500000
+        k(    6) = (   1.0000000   0.0000000   0.0000000), wk =   0.2500000
+        k(    7) = (   0.0000000   0.0000000  -1.0000000), wk =   0.2500000
+        k(    8) = (   0.5000000  -0.5000000  -0.5000000), wk =   0.2500000
+
+                       cryst. coord.
+        k(    1) = (   0.0000000   0.0000000   0.0000000), wk =   0.2500000
+        k(    2) = (   0.0000000   0.0000000  -0.5000000), wk =   0.2500000
+        k(    3) = (   0.0000000  -0.5000000   0.0000000), wk =   0.2500000
+        k(    4) = (   0.0000000  -0.5000000  -0.5000000), wk =   0.2500000
+        k(    5) = (  -0.5000000   0.0000000   0.0000000), wk =   0.2500000
+        k(    6) = (  -0.5000000   0.0000000  -0.5000000), wk =   0.2500000
+        k(    7) = (  -0.5000000  -0.5000000   0.0000000), wk =   0.2500000
+        k(    8) = (  -0.5000000  -0.5000000  -0.5000000), wk =   0.2500000
+
+     Dense  grid:    15593 G-vectors     FFT dimensions: (  36,  36,  36)
+
+     Dynamical RAM for                 wfc:       0.47 MB
+
+     Dynamical RAM for     wfc (w. buffer):       4.26 MB
+
+     Dynamical RAM for                 EXX:      66.28 MB
+
+     Dynamical RAM for           str. fact:       0.48 MB
+
+     Dynamical RAM for           local pot:       0.00 MB
+
+     Dynamical RAM for          nlocal pot:       0.30 MB
+
+     Dynamical RAM for                qrad:       0.98 MB
+
+     Dynamical RAM for          rho,v,vnew:       1.78 MB
+
+     Dynamical RAM for               rhoin:       0.59 MB
+
+     Dynamical RAM for            rho*nmix:       3.81 MB
+
+     Dynamical RAM for           G-vectors:       1.01 MB
+
+     Dynamical RAM for          h,s,v(r/c):       0.01 MB
+
+     Dynamical RAM for          <psi|beta>:       0.00 MB
+
+     Dynamical RAM for      wfcinit/wfcrot:       0.95 MB
+
+     Dynamical RAM for           addusdens:      10.47 MB
+
+     Estimated static dynamical RAM per process >      78.17 MB
+
+     Estimated max dynamical RAM per process >      92.45 MB
+     EXX: ACE will be initialized later
+
+     Initial potential from superposition of free atoms
+
+     starting charge       3.9954, renormalised to       4.0000
+     Starting wfcs are    6 randomized atomic wfcs +   10 random wfcs
+
+     total cpu time spent up to now is        0.2 secs
+
+     Self-consistent Calculation
+
+     iteration #  1     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  1.00E-02,  avg # of iterations =  6.8
+
+     total cpu time spent up to now is        0.5 secs
+
+     total energy              =     -15.53617192 Ry
+     estimated scf accuracy    <       0.07495055 Ry
+
+     iteration #  2     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  1.87E-03,  avg # of iterations =  3.2
+
+     total cpu time spent up to now is        0.7 secs
+
+     total energy              =     -15.53039265 Ry
+     estimated scf accuracy    <       0.02270986 Ry
+
+     iteration #  3     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  5.68E-04,  avg # of iterations =  3.2
+
+     total cpu time spent up to now is        0.9 secs
+
+     total energy              =     -15.53282217 Ry
+     estimated scf accuracy    <       0.00033700 Ry
+
+     iteration #  4     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  8.42E-06,  avg # of iterations =  4.8
+
+     total cpu time spent up to now is        1.1 secs
+
+     total energy              =     -15.53287585 Ry
+     estimated scf accuracy    <       0.00012912 Ry
+
+     iteration #  5     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  3.23E-06,  avg # of iterations =  3.2
+
+     total cpu time spent up to now is        1.2 secs
+
+     total energy              =     -15.53289377 Ry
+     estimated scf accuracy    <       0.00000291 Ry
+
+     iteration #  6     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  7.28E-08,  avg # of iterations =  4.6
+
+     total cpu time spent up to now is        1.5 secs
+
+     total energy              =     -15.53289545 Ry
+     estimated scf accuracy    <       0.00000083 Ry
+
+     iteration #  7     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  2.08E-08,  avg # of iterations =  3.2
+
+     total cpu time spent up to now is        1.6 secs
+
+     total energy              =     -15.53289540 Ry
+     estimated scf accuracy    <       0.00000049 Ry
+
+     iteration #  8     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  1.22E-08,  avg # of iterations =  3.2
+
+     total cpu time spent up to now is        1.8 secs
+
+     total energy              =     -15.53289552 Ry
+     estimated scf accuracy    <       0.00000001 Ry
+
+     iteration #  9     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  2.74E-10,  avg # of iterations =  4.5
+
+     total cpu time spent up to now is        2.0 secs
+
+     total energy              =     -15.53289554 Ry
+     estimated scf accuracy    <       0.00000001 Ry
+
+     iteration # 10     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  2.74E-10,  avg # of iterations =  3.0
+
+     total cpu time spent up to now is        2.2 secs
+
+     total energy              =     -15.53289554 Ry
+     estimated scf accuracy    <       0.00000002 Ry
+
+     iteration # 11     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  2.74E-10,  avg # of iterations =  3.0
+
+     total cpu time spent up to now is        2.3 secs
+
+     total energy              =     -15.53289554 Ry
+     estimated scf accuracy    <          2.2E-09 Ry
+
+     iteration # 12     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  5.62E-11,  avg # of iterations =  3.0
+
+     total cpu time spent up to now is        2.5 secs
+
+     total energy              =     -15.53289554 Ry
+     estimated scf accuracy    <          1.2E-09 Ry
+
+     iteration # 13     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  2.95E-11,  avg # of iterations =  3.0
+
+     total cpu time spent up to now is        2.6 secs
+
+     total energy              =     -15.53289554 Ry
+     estimated scf accuracy    <          6.7E-10 Ry
+
+     iteration # 14     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  1.67E-11,  avg # of iterations =  3.1
+
+     total cpu time spent up to now is        2.8 secs
+
+     End of self-consistent calculation
+
+          k = 0.0000 0.0000 0.0000 (  1917 PWs)   bands (ev):
+
+   -41.4364  -3.4900  17.5542  18.5111  18.5111  18.5111  23.2148  23.2148
+    23.2148  24.7613  29.2929  29.2929  29.2929  31.2208  31.2208  44.8387
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000-0.5000 0.5000 (  1946 PWs)   bands (ev):
+
+   -41.3920  -0.6756   6.1560  14.9882  17.0879  17.0879  20.0041  20.0041
+    27.6816  32.8547  36.7831  36.7831  37.4404  37.4404  43.7989  47.4377
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k =-0.5000-0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -41.3920  -0.6756   6.1560  14.9882  17.0879  17.0879  20.0041  20.0041
+    27.6816  32.8547  36.7831  36.7831  37.4404  37.4404  43.7989  47.4377
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.0000-1.0000 0.0000 (  1964 PWs)   bands (ev):
+
+   -41.3785   2.0818   4.2896  11.7892  11.7892  14.9433  18.0016  35.0115
+    35.0115  36.6623  36.9126  38.9846  40.7684  40.7684  41.6372  42.9878
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000 0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -41.3920  -0.6756   6.1560  14.9882  17.0879  17.0879  20.0041  20.0041
+    27.6816  32.8547  36.7831  36.7831  37.4404  37.4404  43.7989  47.4377
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 1.0000 0.0000 0.0000 (  1964 PWs)   bands (ev):
+
+   -41.3785   2.0818   4.2896  11.7892  11.7892  14.9433  18.0016  35.0115
+    35.0115  36.6623  36.9126  38.9846  40.7684  40.7684  41.6372  42.9878
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.0000 0.0000-1.0000 (  1964 PWs)   bands (ev):
+
+   -41.3785   2.0818   4.2896  11.7892  11.7892  14.9433  18.0016  35.0115
+    35.0115  36.6623  36.9126  38.9846  40.7684  40.7684  41.6372  42.9878
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000-0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -41.3920  -0.6756   6.1560  14.9882  17.0879  17.0879  20.0041  20.0041
+    27.6816  32.8547  36.7831  36.7831  37.4404  37.4404  43.7989  47.4377
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+     highest occupied, lowest unoccupied level (ev):     2.0818    4.2896
+
+!    total energy              =     -15.53289554 Ry
+     estimated scf accuracy    <          8.3E-11 Ry
+
+     convergence has been achieved in  14 iterations
+
+     Using ACE for calculation of exact exchange
+
+     EXX grid:    15593 G-vectors     FFT dimensions: (  36,  36,  36)
+     ACE projected onto    16 (nbndproj) and applied to    16 (nbnd) bands
+
+     EXX: now go back to refine exchange calculation
+
+     total cpu time spent up to now is       28.4 secs
+
+     Self-consistent Calculation
+
+     iteration #  1     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     c_bands:  1 eigenvalues not converged
+     c_bands:  1 eigenvalues not converged
+     c_bands:  1 eigenvalues not converged
+     c_bands:  1 eigenvalues not converged
+     c_bands:  1 eigenvalues not converged
+     c_bands:  1 eigenvalues not converged
+     c_bands:  1 eigenvalues not converged
+     c_bands:  1 eigenvalues not converged
+     ethr =  1.67E-11,  avg # of iterations = 12.3
+
+     total cpu time spent up to now is       29.0 secs
+
+     total energy              =     -17.85304811 Ry
+     estimated scf accuracy    <       0.00977734 Ry
+
+     iteration #  2     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  2.44E-04,  avg # of iterations =  4.8
+
+     total cpu time spent up to now is       29.2 secs
+
+     total energy              =     -14.93707036 Ry
+     estimated scf accuracy    <       0.00329176 Ry
+
+     iteration #  3     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  8.23E-05,  avg # of iterations =  3.0
+
+     total cpu time spent up to now is       29.4 secs
+
+     total energy              =     -14.93517025 Ry
+     estimated scf accuracy    <       0.00195004 Ry
+
+     iteration #  4     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  4.88E-05,  avg # of iterations =  3.0
+
+     total cpu time spent up to now is       29.6 secs
+
+     total energy              =     -14.93533679 Ry
+     estimated scf accuracy    <       0.00006067 Ry
+
+     iteration #  5     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  1.52E-06,  avg # of iterations =  3.6
+
+     total cpu time spent up to now is       29.7 secs
+
+     total energy              =     -14.93546933 Ry
+     estimated scf accuracy    <       0.00000201 Ry
+
+     iteration #  6     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  5.03E-08,  avg # of iterations =  4.5
+
+     total cpu time spent up to now is       30.0 secs
+
+     total energy              =     -14.93544311 Ry
+     estimated scf accuracy    <       0.00007704 Ry
+
+     iteration #  7     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  5.03E-08,  avg # of iterations =  4.4
+
+     total cpu time spent up to now is       30.2 secs
+
+     total energy              =     -14.93545053 Ry
+     estimated scf accuracy    <       0.00000255 Ry
+
+     iteration #  8     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  5.03E-08,  avg # of iterations =  3.1
+
+     total cpu time spent up to now is       30.4 secs
+
+     total energy              =     -14.93545090 Ry
+     estimated scf accuracy    <       0.00000228 Ry
+
+     iteration #  9     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  5.03E-08,  avg # of iterations =  3.0
+
+     total cpu time spent up to now is       30.5 secs
+
+     total energy              =     -14.93545018 Ry
+     estimated scf accuracy    <       0.00000175 Ry
+
+     iteration # 10     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  4.37E-08,  avg # of iterations =  3.0
+
+     total cpu time spent up to now is       30.7 secs
+
+     total energy              =     -14.93544966 Ry
+     estimated scf accuracy    <       0.00000076 Ry
+
+     iteration # 11     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  1.91E-08,  avg # of iterations =  3.1
+
+     total cpu time spent up to now is       30.9 secs
+
+     total energy              =     -14.93544982 Ry
+     estimated scf accuracy    <       0.00000005 Ry
+
+     iteration # 12     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  1.29E-09,  avg # of iterations =  3.5
+
+     total cpu time spent up to now is       31.1 secs
+
+     total energy              =     -14.93544987 Ry
+     estimated scf accuracy    <          5.4E-09 Ry
+
+     iteration # 13     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  1.36E-10,  avg # of iterations =  3.5
+
+     total cpu time spent up to now is       31.2 secs
+
+     total energy              =     -14.93544989 Ry
+     estimated scf accuracy    <          2.3E-09 Ry
+
+     iteration # 14     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  5.68E-11,  avg # of iterations =  3.3
+
+     total cpu time spent up to now is       31.4 secs
+
+     total energy              =     -14.93544989 Ry
+     estimated scf accuracy    <          5.5E-10 Ry
+
+     iteration # 15     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  1.38E-11,  avg # of iterations =  3.6
+
+     total cpu time spent up to now is       31.6 secs
+
+     total energy              =     -14.93544989 Ry
+     estimated scf accuracy    <          6.0E-10 Ry
+
+     iteration # 16     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  1.38E-11,  avg # of iterations =  3.1
+
+     total cpu time spent up to now is       31.8 secs
+
+     total energy              =     -14.93544989 Ry
+     estimated scf accuracy    <          2.4E-09 Ry
+
+     iteration # 17     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  1.38E-11,  avg # of iterations =  3.7
+
+     total cpu time spent up to now is       32.0 secs
+
+     total energy              =     -14.93544989 Ry
+     estimated scf accuracy    <          1.8E-09 Ry
+
+     iteration # 18     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  1.38E-11,  avg # of iterations =  3.2
+
+     total cpu time spent up to now is       32.2 secs
+
+     total energy              =     -14.93544989 Ry
+     estimated scf accuracy    <          3.2E-09 Ry
+
+     iteration # 19     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  1.38E-11,  avg # of iterations =  3.0
+
+     total cpu time spent up to now is       32.3 secs
+
+     total energy              =     -14.93544989 Ry
+     estimated scf accuracy    <          1.1E-09 Ry
+
+     iteration # 20     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  1.38E-11,  avg # of iterations =  3.3
+
+     total cpu time spent up to now is       32.5 secs
+
+     total energy              =     -14.93544990 Ry
+     estimated scf accuracy    <          3.5E-10 Ry
+
+     iteration # 21     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  8.67E-12,  avg # of iterations =  3.8
+
+     total cpu time spent up to now is       32.7 secs
+
+     total energy              =     -14.93544989 Ry
+     estimated scf accuracy    <          6.0E-09 Ry
+
+     iteration # 22     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  8.67E-12,  avg # of iterations =  3.5
+
+     total cpu time spent up to now is       32.9 secs
+
+     total energy              =     -14.93544989 Ry
+     estimated scf accuracy    <          4.6E-10 Ry
+
+     iteration # 23     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  8.67E-12,  avg # of iterations =  3.6
+
+     total cpu time spent up to now is       33.1 secs
+
+     total energy              =     -14.93544989 Ry
+     estimated scf accuracy    <          1.4E-09 Ry
+
+     iteration # 24     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  8.67E-12,  avg # of iterations =  3.0
+
+     total cpu time spent up to now is       33.2 secs
+
+     total energy              =     -14.93544989 Ry
+     estimated scf accuracy    <          8.4E-10 Ry
+
+     iteration # 25     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  8.67E-12,  avg # of iterations =  3.0
+
+     total cpu time spent up to now is       33.4 secs
+
+     End of self-consistent calculation
+
+          k = 0.0000 0.0000 0.0000 (  1917 PWs)   bands (ev):
+
+   -51.5611  -2.0335  23.0136  24.4237  24.4237  24.4237  28.2498  28.2498
+    28.2498  29.4258  35.3235  35.3235  35.3235  36.7978  36.7978  51.5330
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000-0.5000 0.5000 (  1946 PWs)   bands (ev):
+
+   -51.5032   1.4036  10.0053  20.0127  22.8692  22.8692  25.0417  25.0417
+    32.9945  39.1324  42.8524  42.8524  43.1483  43.1483  50.5422  55.2401
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k =-0.5000-0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.5032   1.4036  10.0053  20.0127  22.8692  22.8692  25.0417  25.0417
+    32.9945  39.1324  42.8524  42.8524  43.1483  43.1483  50.5422  55.2401
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.0000-1.0000 0.0000 (  1964 PWs)   bands (ev):
+
+   -51.4905   4.2252   8.2634  16.6958  16.6958  19.4904  23.2513  42.1030
+    42.1030  43.3753  43.8295  45.0794  46.2850  46.2850  47.0395  50.0963
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000 0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.5032   1.4036  10.0053  20.0127  22.8692  22.8692  25.0417  25.0417
+    32.9945  39.1324  42.8524  42.8524  43.1483  43.1483  50.5422  55.2401
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 1.0000 0.0000 0.0000 (  1964 PWs)   bands (ev):
+
+   -51.4905   4.2252   8.2634  16.6958  16.6958  19.4904  23.2513  42.1030
+    42.1030  43.3753  43.8295  45.0794  46.2850  46.2850  47.0395  50.0963
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.0000 0.0000-1.0000 (  1964 PWs)   bands (ev):
+
+   -51.4905   4.2252   8.2634  16.6958  16.6958  19.4904  23.2513  42.1030
+    42.1030  43.3753  43.8295  45.0794  46.2850  46.2850  47.0395  50.0963
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000-0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.5032   1.4036  10.0053  20.0127  22.8692  22.8692  25.0417  25.0417
+    32.9945  39.1324  42.8524  42.8524  43.1483  43.1483  50.5422  55.2401
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+     highest occupied, lowest unoccupied level (ev):     4.2252    8.2634
+
+!    total energy              =     -14.93544989 Ry
+     estimated scf accuracy    <          4.8E-11 Ry
+
+     convergence has been achieved in  25 iterations
+
+     Using ACE for calculation of exact exchange
+     ACE projected onto    16 (nbndproj) and applied to    16 (nbnd) bands
+
+     total energy              =     -14.93663705 Ry
+     Harris-Foulkes estimate   =     -14.93663705 Ry
+     est. exchange err (dexx)  =       0.00118716 Ry
+     - averaged Fock potential =       6.42164061 Ry
+     + Fock energy (ACE)       =      -3.25975413 Ry
+
+     EXX: now go back to refine exchange calculation
+
+     total cpu time spent up to now is       59.0 secs
+
+     Self-consistent Calculation
+
+     iteration #  1     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     c_bands:  1 eigenvalues not converged
+     c_bands:  1 eigenvalues not converged
+     c_bands:  1 eigenvalues not converged
+     c_bands:  1 eigenvalues not converged
+     c_bands:  1 eigenvalues not converged
+     c_bands:  1 eigenvalues not converged
+     c_bands:  1 eigenvalues not converged
+     c_bands:  1 eigenvalues not converged
+     ethr =  8.67E-12,  avg # of iterations =  9.7
+
+     total cpu time spent up to now is       59.5 secs
+
+     total energy              =     -14.93726643 Ry
+     estimated scf accuracy    <       0.00024345 Ry
+
+     iteration #  2     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  6.09E-06,  avg # of iterations =  3.0
+
+     total cpu time spent up to now is       59.7 secs
+
+     total energy              =     -14.93719935 Ry
+     estimated scf accuracy    <       0.00008199 Ry
+
+     iteration #  3     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  2.05E-06,  avg # of iterations =  3.2
+
+     total cpu time spent up to now is       59.9 secs
+
+     total energy              =     -14.93721554 Ry
+     estimated scf accuracy    <       0.00000146 Ry
+
+     iteration #  4     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  3.66E-08,  avg # of iterations =  3.7
+
+     total cpu time spent up to now is       60.1 secs
+
+     total energy              =     -14.93721769 Ry
+     estimated scf accuracy    <       0.00000006 Ry
+
+     iteration #  5     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  1.53E-09,  avg # of iterations =  4.1
+
+     total cpu time spent up to now is       60.3 secs
+
+     total energy              =     -14.93721827 Ry
+     estimated scf accuracy    <       0.00000058 Ry
+
+     iteration #  6     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  1.53E-09,  avg # of iterations =  3.0
+
+     total cpu time spent up to now is       60.4 secs
+
+     total energy              =     -14.93721782 Ry
+     estimated scf accuracy    <       0.00000056 Ry
+
+     iteration #  7     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  1.53E-09,  avg # of iterations =  3.5
+
+     total cpu time spent up to now is       60.6 secs
+
+     total energy              =     -14.93721781 Ry
+     estimated scf accuracy    <       0.00000008 Ry
+
+     iteration #  8     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  1.53E-09,  avg # of iterations =  3.0
+
+     total cpu time spent up to now is       60.8 secs
+
+     total energy              =     -14.93721780 Ry
+     estimated scf accuracy    <       0.00000004 Ry
+
+     iteration #  9     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  9.60E-10,  avg # of iterations =  3.0
+
+     total cpu time spent up to now is       61.0 secs
+
+     total energy              =     -14.93721779 Ry
+     estimated scf accuracy    <       0.00000002 Ry
+
+     iteration # 10     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  3.77E-10,  avg # of iterations =  3.3
+
+     total cpu time spent up to now is       61.1 secs
+
+     total energy              =     -14.93721779 Ry
+     estimated scf accuracy    <          9.2E-10 Ry
+
+     iteration # 11     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  2.30E-11,  avg # of iterations =  3.6
+
+     total cpu time spent up to now is       61.3 secs
+
+     total energy              =     -14.93721780 Ry
+     estimated scf accuracy    <          4.3E-10 Ry
+
+     iteration # 12     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  1.06E-11,  avg # of iterations =  3.9
+
+     total cpu time spent up to now is       61.5 secs
+
+     total energy              =     -14.93721780 Ry
+     estimated scf accuracy    <       0.00000001 Ry
+
+     iteration # 13     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  1.06E-11,  avg # of iterations =  3.6
+
+     total cpu time spent up to now is       61.7 secs
+
+     total energy              =     -14.93721780 Ry
+     estimated scf accuracy    <          2.1E-09 Ry
+
+     iteration # 14     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  1.06E-11,  avg # of iterations =  3.2
+
+     total cpu time spent up to now is       61.9 secs
+
+     total energy              =     -14.93721779 Ry
+     estimated scf accuracy    <          1.0E-09 Ry
+
+     iteration # 15     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  1.06E-11,  avg # of iterations =  3.2
+
+     total cpu time spent up to now is       62.1 secs
+
+     total energy              =     -14.93721779 Ry
+     estimated scf accuracy    <          1.4E-10 Ry
+
+     iteration # 16     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  3.38E-12,  avg # of iterations =  3.1
+
+     total cpu time spent up to now is       62.2 secs
+
+     total energy              =     -14.93721779 Ry
+     estimated scf accuracy    <          3.3E-10 Ry
+
+     iteration # 17     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  3.38E-12,  avg # of iterations =  3.0
+
+     total cpu time spent up to now is       62.4 secs
+
+     total energy              =     -14.93721779 Ry
+     estimated scf accuracy    <          4.0E-10 Ry
+
+     iteration # 18     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  3.38E-12,  avg # of iterations =  3.0
+
+     total cpu time spent up to now is       62.6 secs
+
+     total energy              =     -14.93721779 Ry
+     estimated scf accuracy    <          3.4E-10 Ry
+
+     iteration # 19     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  3.38E-12,  avg # of iterations =  3.3
+
+     total cpu time spent up to now is       62.7 secs
+
+     End of self-consistent calculation
+
+          k = 0.0000 0.0000 0.0000 (  1917 PWs)   bands (ev):
+
+   -51.8752  -2.1210  22.8970  24.5016  24.5016  24.5016  28.2948  28.2948
+    28.2948  29.4756  35.3277  35.3277  35.3277  36.8178  36.8178  51.5046
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000-0.5000 0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8248   1.2925  10.0706  20.0001  22.9805  22.9805  25.0360  25.0360
+    33.0119  39.1887  42.8854  42.8854  43.1592  43.1592  50.5103  55.3019
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k =-0.5000-0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8248   1.2925  10.0706  20.0001  22.9805  22.9805  25.0360  25.0360
+    33.0119  39.1887  42.8854  42.8854  43.1592  43.1592  50.5103  55.3019
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.0000-1.0000 0.0000 (  1964 PWs)   bands (ev):
+
+   -51.8146   3.9681   8.4132  16.7871  16.7871  19.5705  23.2317  42.1437
+    42.1437  43.3664  43.9024  45.0905  46.2991  46.2991  47.0525  50.1013
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000 0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8248   1.2925  10.0706  20.0001  22.9805  22.9805  25.0360  25.0360
+    33.0119  39.1887  42.8854  42.8854  43.1592  43.1592  50.5103  55.3019
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 1.0000 0.0000 0.0000 (  1964 PWs)   bands (ev):
+
+   -51.8146   3.9681   8.4132  16.7871  16.7871  19.5705  23.2317  42.1437
+    42.1437  43.3664  43.9024  45.0905  46.2991  46.2991  47.0525  50.1013
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.0000 0.0000-1.0000 (  1964 PWs)   bands (ev):
+
+   -51.8146   3.9681   8.4132  16.7871  16.7871  19.5705  23.2317  42.1437
+    42.1437  43.3664  43.9024  45.0905  46.2991  46.2991  47.0525  50.1013
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000-0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8248   1.2925  10.0706  20.0001  22.9805  22.9805  25.0360  25.0360
+    33.0119  39.1887  42.8854  42.8854  43.1592  43.1592  50.5103  55.3019
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+     highest occupied, lowest unoccupied level (ev):     3.9681    8.4132
+
+!    total energy              =     -14.93721779 Ry
+     estimated scf accuracy    <          1.4E-11 Ry
+
+     convergence has been achieved in  19 iterations
+
+     Using ACE for calculation of exact exchange
+     ACE projected onto    16 (nbndproj) and applied to    16 (nbnd) bands
+
+     total energy              =     -14.93750426 Ry
+     Harris-Foulkes estimate   =     -14.93750426 Ry
+     est. exchange err (dexx)  =       0.00028647 Ry
+     - averaged Fock potential =       6.53905103 Ry
+     + Fock energy (ACE)       =      -3.27958337 Ry
+
+     EXX: now go back to refine exchange calculation
+
+     total cpu time spent up to now is       88.4 secs
+
+     Self-consistent Calculation
+
+     iteration #  1     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     c_bands:  1 eigenvalues not converged
+     c_bands:  1 eigenvalues not converged
+     c_bands:  1 eigenvalues not converged
+     c_bands:  1 eigenvalues not converged
+     ethr =  3.38E-12,  avg # of iterations =  9.5
+
+     total cpu time spent up to now is       88.9 secs
+
+     total energy              =     -14.93754087 Ry
+     estimated scf accuracy    <       0.00001624 Ry
+
+     iteration #  2     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  4.06E-07,  avg # of iterations =  3.0
+
+     total cpu time spent up to now is       89.0 secs
+
+     total energy              =     -14.93753654 Ry
+     estimated scf accuracy    <       0.00000538 Ry
+
+     iteration #  3     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  1.35E-07,  avg # of iterations =  3.2
+
+     total cpu time spent up to now is       89.2 secs
+
+     total energy              =     -14.93753764 Ry
+     estimated scf accuracy    <       0.00000009 Ry
+
+     iteration #  4     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  2.15E-09,  avg # of iterations =  3.7
+
+     total cpu time spent up to now is       89.4 secs
+
+     total energy              =     -14.93753776 Ry
+     estimated scf accuracy    <          3.1E-09 Ry
+
+     iteration #  5     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  7.83E-11,  avg # of iterations =  4.1
+
+     total cpu time spent up to now is       89.6 secs
+
+     total energy              =     -14.93753779 Ry
+     estimated scf accuracy    <       0.00000003 Ry
+
+     iteration #  6     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  7.83E-11,  avg # of iterations =  3.0
+
+     total cpu time spent up to now is       89.8 secs
+
+     total energy              =     -14.93753777 Ry
+     estimated scf accuracy    <       0.00000003 Ry
+
+     iteration #  7     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  7.83E-11,  avg # of iterations =  3.3
+
+     total cpu time spent up to now is       90.0 secs
+
+     total energy              =     -14.93753777 Ry
+     estimated scf accuracy    <          8.9E-09 Ry
+
+     iteration #  8     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  7.83E-11,  avg # of iterations =  3.0
+
+     total cpu time spent up to now is       90.1 secs
+
+     total energy              =     -14.93753777 Ry
+     estimated scf accuracy    <          4.6E-09 Ry
+
+     iteration #  9     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  7.83E-11,  avg # of iterations =  3.0
+
+     total cpu time spent up to now is       90.3 secs
+
+     total energy              =     -14.93753778 Ry
+     estimated scf accuracy    <          5.1E-09 Ry
+
+     iteration # 10     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  7.83E-11,  avg # of iterations =  3.0
+
+     total cpu time spent up to now is       90.5 secs
+
+     total energy              =     -14.93753778 Ry
+     estimated scf accuracy    <          9.5E-09 Ry
+
+     iteration # 11     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  7.83E-11,  avg # of iterations =  3.0
+
+     total cpu time spent up to now is       90.6 secs
+
+     total energy              =     -14.93753777 Ry
+     estimated scf accuracy    <       0.00000001 Ry
+
+     iteration # 12     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  7.83E-11,  avg # of iterations =  3.5
+
+     total cpu time spent up to now is       90.8 secs
+
+     total energy              =     -14.93753777 Ry
+     estimated scf accuracy    <          2.9E-09 Ry
+
+     iteration # 13     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  7.34E-11,  avg # of iterations =  3.0
+
+     total cpu time spent up to now is       91.0 secs
+
+     total energy              =     -14.93753777 Ry
+     estimated scf accuracy    <          1.3E-09 Ry
+
+     iteration # 14     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  3.30E-11,  avg # of iterations =  3.0
+
+     total cpu time spent up to now is       91.1 secs
+
+     total energy              =     -14.93753777 Ry
+     estimated scf accuracy    <          1.0E-10 Ry
+
+     iteration # 15     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  2.52E-12,  avg # of iterations =  3.1
+
+     total cpu time spent up to now is       91.3 secs
+
+     End of self-consistent calculation
+
+          k = 0.0000 0.0000 0.0000 (  1917 PWs)   bands (ev):
+
+   -51.9274  -2.1390  22.8559  24.5071  24.5071  24.5071  28.3044  28.3044
+    28.3044  29.4810  35.3265  35.3265  35.3265  36.8251  36.8251  51.4921
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000-0.5000 0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8779   1.2611  10.0850  19.9801  22.9895  22.9895  25.0420  25.0420
+    33.0114  39.1837  42.8875  42.8875  43.1619  43.1619  50.5034  55.2924
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k =-0.5000-0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8779   1.2611  10.0850  19.9801  22.9895  22.9895  25.0420  25.0420
+    33.0114  39.1837  42.8875  42.8875  43.1619  43.1619  50.5034  55.2924
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.0000-1.0000 0.0000 (  1964 PWs)   bands (ev):
+
+   -51.8679   3.9149   8.4339  16.7994  16.7994  19.5832  23.2222  42.1389
+    42.1389  43.3579  43.8982  45.0962  46.3019  46.3019  47.0560  50.0951
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000 0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8779   1.2611  10.0850  19.9801  22.9895  22.9895  25.0420  25.0420
+    33.0114  39.1837  42.8875  42.8875  43.1619  43.1619  50.5034  55.2924
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 1.0000 0.0000 0.0000 (  1964 PWs)   bands (ev):
+
+   -51.8679   3.9149   8.4339  16.7994  16.7994  19.5832  23.2222  42.1389
+    42.1389  43.3579  43.8982  45.0962  46.3019  46.3019  47.0560  50.0951
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.0000 0.0000-1.0000 (  1964 PWs)   bands (ev):
+
+   -51.8679   3.9149   8.4339  16.7994  16.7994  19.5832  23.2222  42.1389
+    42.1389  43.3579  43.8982  45.0962  46.3019  46.3019  47.0560  50.0951
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000-0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8779   1.2611  10.0850  19.9801  22.9895  22.9895  25.0420  25.0420
+    33.0114  39.1837  42.8875  42.8875  43.1619  43.1619  50.5034  55.2924
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+     highest occupied, lowest unoccupied level (ev):     3.9149    8.4339
+
+!    total energy              =     -14.93753777 Ry
+     estimated scf accuracy    <          1.0E-10 Ry
+
+     convergence has been achieved in  15 iterations
+
+     Using ACE for calculation of exact exchange
+     ACE projected onto    16 (nbndproj) and applied to    16 (nbnd) bands
+
+     total energy              =     -14.93755157 Ry
+     Harris-Foulkes estimate   =     -14.93755157 Ry
+     est. exchange err (dexx)  =       0.00001380 Ry
+     - averaged Fock potential =       6.56390337 Ry
+     + Fock energy (ACE)       =      -3.28433380 Ry
+
+     EXX: now go back to refine exchange calculation
+
+     total cpu time spent up to now is      117.0 secs
+
+     Self-consistent Calculation
+
+     iteration #  1     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  2.52E-12,  avg # of iterations =  7.9
+
+     total cpu time spent up to now is      117.4 secs
+
+     total energy              =     -14.93755412 Ry
+     estimated scf accuracy    <       0.00000116 Ry
+
+     iteration #  2     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  2.90E-08,  avg # of iterations =  3.0
+
+     total cpu time spent up to now is      117.5 secs
+
+     total energy              =     -14.93755381 Ry
+     estimated scf accuracy    <       0.00000038 Ry
+
+     iteration #  3     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  9.52E-09,  avg # of iterations =  3.2
+
+     total cpu time spent up to now is      117.7 secs
+
+     total energy              =     -14.93755389 Ry
+     estimated scf accuracy    <          5.6E-09 Ry
+
+     iteration #  4     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  1.40E-10,  avg # of iterations =  3.7
+
+     total cpu time spent up to now is      117.9 secs
+
+     total energy              =     -14.93755390 Ry
+     estimated scf accuracy    <          1.9E-10 Ry
+
+     iteration #  5     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  4.87E-12,  avg # of iterations =  4.1
+
+     total cpu time spent up to now is      118.1 secs
+
+     total energy              =     -14.93755391 Ry
+     estimated scf accuracy    <          1.4E-09 Ry
+
+     iteration #  6     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  4.87E-12,  avg # of iterations =  3.4
+
+     total cpu time spent up to now is      118.3 secs
+
+     total energy              =     -14.93755390 Ry
+     estimated scf accuracy    <          3.7E-09 Ry
+
+     iteration #  7     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  4.87E-12,  avg # of iterations =  3.6
+
+     total cpu time spent up to now is      118.5 secs
+
+     total energy              =     -14.93755390 Ry
+     estimated scf accuracy    <          1.5E-09 Ry
+
+     iteration #  8     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  4.87E-12,  avg # of iterations =  3.1
+
+     total cpu time spent up to now is      118.7 secs
+
+     total energy              =     -14.93755390 Ry
+     estimated scf accuracy    <          5.5E-10 Ry
+
+     iteration #  9     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  4.87E-12,  avg # of iterations =  3.0
+
+     total cpu time spent up to now is      118.8 secs
+
+     total energy              =     -14.93755390 Ry
+     estimated scf accuracy    <          4.7E-10 Ry
+
+     iteration # 10     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  4.87E-12,  avg # of iterations =  3.0
+
+     total cpu time spent up to now is      119.0 secs
+
+     total energy              =     -14.93755390 Ry
+     estimated scf accuracy    <          1.2E-10 Ry
+
+     iteration # 11     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  2.89E-12,  avg # of iterations =  3.2
+
+     total cpu time spent up to now is      119.2 secs
+
+     End of self-consistent calculation
+
+          k = 0.0000 0.0000 0.0000 (  1917 PWs)   bands (ev):
+
+   -51.9389  -2.1430  22.8445  24.5082  24.5082  24.5082  28.3066  28.3066
+    28.3066  29.4822  35.3269  35.3269  35.3269  36.8269  36.8269  51.4882
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000-0.5000 0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8895   1.2540  10.0885  19.9747  22.9912  22.9912  25.0442  25.0442
+    33.0107  39.1825  42.8883  42.8883  43.1625  43.1625  50.5019  55.2903
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k =-0.5000-0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8895   1.2540  10.0885  19.9747  22.9912  22.9912  25.0442  25.0442
+    33.0107  39.1825  42.8883  42.8883  43.1625  43.1625  50.5019  55.2903
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.0000-1.0000 0.0000 (  1964 PWs)   bands (ev):
+
+   -51.8796   3.9024   8.4390  16.8025  16.8025  19.5861  23.2190  42.1382
+    42.1382  43.3549  43.8973  45.0976  46.3024  46.3024  47.0568  50.0943
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000 0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8895   1.2540  10.0885  19.9747  22.9912  22.9912  25.0442  25.0442
+    33.0107  39.1825  42.8883  42.8883  43.1625  43.1625  50.5019  55.2903
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 1.0000 0.0000 0.0000 (  1964 PWs)   bands (ev):
+
+   -51.8796   3.9024   8.4390  16.8025  16.8025  19.5861  23.2190  42.1382
+    42.1382  43.3549  43.8973  45.0976  46.3024  46.3024  47.0568  50.0943
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.0000 0.0000-1.0000 (  1964 PWs)   bands (ev):
+
+   -51.8796   3.9024   8.4390  16.8025  16.8025  19.5861  23.2190  42.1382
+    42.1382  43.3549  43.8973  45.0976  46.3024  46.3024  47.0568  50.0943
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000-0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8895   1.2540  10.0885  19.9747  22.9912  22.9912  25.0442  25.0442
+    33.0107  39.1825  42.8883  42.8883  43.1625  43.1625  50.5019  55.2903
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+     highest occupied, lowest unoccupied level (ev):     3.9024    8.4390
+
+!    total energy              =     -14.93755390 Ry
+     estimated scf accuracy    <          1.8E-11 Ry
+
+     convergence has been achieved in  11 iterations
+
+     Using ACE for calculation of exact exchange
+     ACE projected onto    16 (nbndproj) and applied to    16 (nbnd) bands
+
+     total energy              =     -14.93755628 Ry
+     Harris-Foulkes estimate   =     -14.93755628 Ry
+     est. exchange err (dexx)  =       0.00000238 Ry
+     - averaged Fock potential =       6.56987296 Ry
+     + Fock energy (ACE)       =      -3.28554154 Ry
+
+     EXX: now go back to refine exchange calculation
+
+     total cpu time spent up to now is      144.9 secs
+
+     Self-consistent Calculation
+
+     iteration #  1     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  2.89E-12,  avg # of iterations =  6.6
+
+     total cpu time spent up to now is      145.2 secs
+
+     total energy              =     -14.93755647 Ry
+     estimated scf accuracy    <       0.00000008 Ry
+
+     iteration #  2     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  2.10E-09,  avg # of iterations =  3.0
+
+     total cpu time spent up to now is      145.4 secs
+
+     total energy              =     -14.93755644 Ry
+     estimated scf accuracy    <       0.00000003 Ry
+
+     iteration #  3     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  6.88E-10,  avg # of iterations =  3.2
+
+     total cpu time spent up to now is      145.6 secs
+
+     total energy              =     -14.93755645 Ry
+     estimated scf accuracy    <          3.9E-10 Ry
+
+     iteration #  4     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  9.72E-12,  avg # of iterations =  3.7
+
+     total cpu time spent up to now is      145.8 secs
+
+     End of self-consistent calculation
+
+          k = 0.0000 0.0000 0.0000 (  1917 PWs)   bands (ev):
+
+   -51.9416  -2.1441  22.8414  24.5085  24.5085  24.5085  28.3072  28.3072
+    28.3072  29.4825  35.3270  35.3270  35.3270  36.8273  36.8273  51.4872
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000-0.5000 0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8923   1.2521  10.0894  19.9731  22.9915  22.9915  25.0448  25.0448
+    33.0105  39.1821  42.8884  42.8884  43.1626  43.1626  50.5016  55.2896
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k =-0.5000-0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8923   1.2521  10.0894  19.9731  22.9915  22.9915  25.0448  25.0448
+    33.0105  39.1821  42.8884  42.8884  43.1626  43.1626  50.5016  55.2896
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.0000-1.0000 0.0000 (  1964 PWs)   bands (ev):
+
+   -51.8823   3.8991   8.4404  16.8033  16.8033  19.5869  23.2181  42.1380
+    42.1380  43.3540  43.8970  45.0980  46.3025  46.3025  47.0570  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000 0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8923   1.2521  10.0894  19.9731  22.9915  22.9915  25.0448  25.0448
+    33.0105  39.1821  42.8884  42.8884  43.1626  43.1626  50.5016  55.2896
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 1.0000 0.0000 0.0000 (  1964 PWs)   bands (ev):
+
+   -51.8823   3.8991   8.4404  16.8033  16.8033  19.5869  23.2181  42.1380
+    42.1380  43.3540  43.8970  45.0980  46.3025  46.3025  47.0570  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.0000 0.0000-1.0000 (  1964 PWs)   bands (ev):
+
+   -51.8823   3.8991   8.4404  16.8033  16.8033  19.5869  23.2181  42.1380
+    42.1380  43.3540  43.8970  45.0980  46.3025  46.3025  47.0570  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000-0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8923   1.2521  10.0894  19.9731  22.9915  22.9915  25.0448  25.0448
+    33.0105  39.1821  42.8884  42.8884  43.1626  43.1626  50.5016  55.2896
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+     highest occupied, lowest unoccupied level (ev):     3.8991    8.4404
+
+!    total energy              =     -14.93755645 Ry
+     estimated scf accuracy    <          1.3E-11 Ry
+
+     convergence has been achieved in   4 iterations
+
+     Using ACE for calculation of exact exchange
+     ACE projected onto    16 (nbndproj) and applied to    16 (nbnd) bands
+
+     total energy              =     -14.93755686 Ry
+     Harris-Foulkes estimate   =     -14.93755686 Ry
+     est. exchange err (dexx)  =       0.00000041 Ry
+     - averaged Fock potential =       6.57140550 Ry
+     + Fock energy (ACE)       =      -3.28586437 Ry
+
+     EXX: now go back to refine exchange calculation
+
+     total cpu time spent up to now is      171.5 secs
+
+     Self-consistent Calculation
+
+     iteration #  1     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  9.72E-12,  avg # of iterations =  4.1
+
+     total cpu time spent up to now is      171.7 secs
+
+     total energy              =     -14.93755687 Ry
+     estimated scf accuracy    <          5.9E-09 Ry
+
+     iteration #  2     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  1.47E-10,  avg # of iterations =  3.0
+
+     total cpu time spent up to now is      171.9 secs
+
+     total energy              =     -14.93755687 Ry
+     estimated scf accuracy    <          1.9E-09 Ry
+
+     iteration #  3     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  4.74E-11,  avg # of iterations =  3.1
+
+     total cpu time spent up to now is      172.0 secs
+
+     End of self-consistent calculation
+
+          k = 0.0000 0.0000 0.0000 (  1917 PWs)   bands (ev):
+
+   -51.9426  -2.1443  22.8405  24.5086  24.5086  24.5086  28.3073  28.3073
+    28.3073  29.4826  35.3270  35.3270  35.3270  36.8275  36.8275  51.4869
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000-0.5000 0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8933   1.2517  10.0896  19.9727  22.9916  22.9916  25.0449  25.0449
+    33.0104  39.1820  42.8885  42.8885  43.1626  43.1626  50.5015  55.2895
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k =-0.5000-0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8933   1.2517  10.0896  19.9727  22.9916  22.9916  25.0449  25.0449
+    33.0104  39.1820  42.8885  42.8885  43.1626  43.1626  50.5015  55.2895
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.0000-1.0000 0.0000 (  1964 PWs)   bands (ev):
+
+   -51.8833   3.8982   8.4407  16.8035  16.8035  19.5871  23.2179  42.1380
+    42.1380  43.3537  43.8969  45.0981  46.3026  46.3026  47.0571  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000 0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8933   1.2517  10.0896  19.9727  22.9916  22.9916  25.0449  25.0449
+    33.0104  39.1820  42.8885  42.8885  43.1626  43.1626  50.5015  55.2895
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 1.0000 0.0000 0.0000 (  1964 PWs)   bands (ev):
+
+   -51.8833   3.8982   8.4407  16.8035  16.8035  19.5871  23.2179  42.1380
+    42.1380  43.3537  43.8969  45.0981  46.3026  46.3026  47.0571  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.0000 0.0000-1.0000 (  1964 PWs)   bands (ev):
+
+   -51.8833   3.8982   8.4407  16.8035  16.8035  19.5871  23.2179  42.1380
+    42.1380  43.3537  43.8969  45.0981  46.3026  46.3026  47.0571  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000-0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8933   1.2517  10.0896  19.9727  22.9916  22.9916  25.0449  25.0449
+    33.0104  39.1820  42.8885  42.8885  43.1626  43.1626  50.5015  55.2895
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+     highest occupied, lowest unoccupied level (ev):     3.8982    8.4407
+
+!    total energy              =     -14.93755687 Ry
+     estimated scf accuracy    <          2.6E-11 Ry
+
+     convergence has been achieved in   3 iterations
+
+     Using ACE for calculation of exact exchange
+     ACE projected onto    16 (nbndproj) and applied to    16 (nbnd) bands
+
+     total energy              =     -14.93755697 Ry
+     Harris-Foulkes estimate   =     -14.93755697 Ry
+     est. exchange err (dexx)  =       0.00000010 Ry
+     - averaged Fock potential =       6.57181340 Ry
+     + Fock energy (ACE)       =      -3.28594913 Ry
+
+     EXX: now go back to refine exchange calculation
+
+     total cpu time spent up to now is      197.7 secs
+
+     Self-consistent Calculation
+
+     iteration #  1     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  4.74E-11,  avg # of iterations =  2.2
+
+     total cpu time spent up to now is      197.8 secs
+
+     total energy              =     -14.93755697 Ry
+     estimated scf accuracy    <          4.0E-10 Ry
+
+     iteration #  2     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  1.00E-11,  avg # of iterations =  3.1
+
+     total cpu time spent up to now is      198.0 secs
+
+     total energy              =     -14.93755697 Ry
+     estimated scf accuracy    <          1.2E-10 Ry
+
+     iteration #  3     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  3.09E-12,  avg # of iterations =  3.2
+
+     total cpu time spent up to now is      198.1 secs
+
+     End of self-consistent calculation
+
+          k = 0.0000 0.0000 0.0000 (  1917 PWs)   bands (ev):
+
+   -51.9428  -2.1444  22.8403  24.5086  24.5086  24.5086  28.3074  28.3074
+    28.3074  29.4826  35.3270  35.3270  35.3270  36.8275  36.8275  51.4868
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000-0.5000 0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9726  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k =-0.5000-0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9726  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.0000-1.0000 0.0000 (  1964 PWs)   bands (ev):
+
+   -51.8835   3.8980   8.4408  16.8035  16.8035  19.5871  23.2178  42.1380
+    42.1380  43.3537  43.8969  45.0981  46.3026  46.3026  47.0571  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000 0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9726  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 1.0000 0.0000 0.0000 (  1964 PWs)   bands (ev):
+
+   -51.8835   3.8980   8.4408  16.8035  16.8035  19.5871  23.2178  42.1380
+    42.1380  43.3537  43.8969  45.0981  46.3026  46.3026  47.0571  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.0000 0.0000-1.0000 (  1964 PWs)   bands (ev):
+
+   -51.8835   3.8980   8.4408  16.8035  16.8035  19.5871  23.2178  42.1380
+    42.1380  43.3537  43.8969  45.0981  46.3026  46.3026  47.0571  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000-0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9726  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+     highest occupied, lowest unoccupied level (ev):     3.8980    8.4408
+
+!    total energy              =     -14.93755697 Ry
+     estimated scf accuracy    <          2.9E-12 Ry
+
+     convergence has been achieved in   3 iterations
+
+     Using ACE for calculation of exact exchange
+     ACE projected onto    16 (nbndproj) and applied to    16 (nbnd) bands
+
+     total energy              =     -14.93755701 Ry
+     Harris-Foulkes estimate   =     -14.93755701 Ry
+     est. exchange err (dexx)  =       0.00000004 Ry
+     - averaged Fock potential =       6.57191615 Ry
+     + Fock energy (ACE)       =      -3.28596705 Ry
+
+     EXX: now go back to refine exchange calculation
+
+     total cpu time spent up to now is      223.8 secs
+
+     Self-consistent Calculation
+
+     iteration #  1     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  3.09E-12,  avg # of iterations =  2.2
+
+     total cpu time spent up to now is      223.9 secs
+
+     End of self-consistent calculation
+
+          k = 0.0000 0.0000 0.0000 (  1917 PWs)   bands (ev):
+
+   -51.9428  -2.1445  22.8402  24.5086  24.5086  24.5086  28.3074  28.3074
+    28.3074  29.4826  35.3270  35.3270  35.3270  36.8275  36.8275  51.4868
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000-0.5000 0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5014  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k =-0.5000-0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5014  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.0000-1.0000 0.0000 (  1964 PWs)   bands (ev):
+
+   -51.8835   3.8979   8.4408  16.8035  16.8035  19.5872  23.2178  42.1380
+    42.1380  43.3536  43.8969  45.0982  46.3026  46.3026  47.0571  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000 0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5014  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 1.0000 0.0000 0.0000 (  1964 PWs)   bands (ev):
+
+   -51.8835   3.8979   8.4408  16.8035  16.8035  19.5872  23.2178  42.1380
+    42.1380  43.3536  43.8969  45.0982  46.3026  46.3026  47.0571  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.0000 0.0000-1.0000 (  1964 PWs)   bands (ev):
+
+   -51.8835   3.8979   8.4408  16.8035  16.8035  19.5872  23.2178  42.1380
+    42.1380  43.3536  43.8969  45.0982  46.3026  46.3026  47.0571  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000-0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5014  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+     highest occupied, lowest unoccupied level (ev):     3.8979    8.4408
+
+!    total energy              =     -14.93755701 Ry
+     estimated scf accuracy    <          2.9E-11 Ry
+
+     convergence has been achieved in   1 iterations
+
+     Using ACE for calculation of exact exchange
+     ACE projected onto    16 (nbndproj) and applied to    16 (nbnd) bands
+
+     total energy              =     -14.93755701 Ry
+     Harris-Foulkes estimate   =     -14.93755701 Ry
+     est. exchange err (dexx)  =          5.5E-09 Ry
+     - averaged Fock potential =       6.57194043 Ry
+     + Fock energy (ACE)       =      -3.28597338 Ry
+
+     EXX: now go back to refine exchange calculation
+
+     total cpu time spent up to now is      249.6 secs
+
+     Self-consistent Calculation
+
+     iteration #  1     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     ethr =  3.09E-12,  avg # of iterations =  2.0
+
+     Threshold (ethr) on eigenvalues was too large:
+     Diagonalizing with lowered threshold
+
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     c_bands:  1 eigenvalues not converged
+     c_bands:  1 eigenvalues not converged
+     c_bands:  1 eigenvalues not converged
+     ethr =  1.16E-14,  avg # of iterations =  4.8
+
+     total cpu time spent up to now is      250.0 secs
+
+     End of self-consistent calculation
+
+          k = 0.0000 0.0000 0.0000 (  1917 PWs)   bands (ev):
+
+   -51.9428  -2.1444  22.8402  24.5086  24.5086  24.5086  28.3074  28.3074
+    28.3074  29.4826  35.3270  35.3270  35.3270  36.8275  36.8275  51.4868
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000-0.5000 0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k =-0.5000-0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.0000-1.0000 0.0000 (  1964 PWs)   bands (ev):
+
+   -51.8835   3.8979   8.4408  16.8035  16.8035  19.5871  23.2178  42.1380
+    42.1380  43.3536  43.8969  45.0982  46.3026  46.3026  47.0571  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000 0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 1.0000 0.0000 0.0000 (  1964 PWs)   bands (ev):
+
+   -51.8835   3.8979   8.4408  16.8035  16.8035  19.5871  23.2178  42.1380
+    42.1380  43.3536  43.8969  45.0981  46.3026  46.3026  47.0571  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.0000 0.0000-1.0000 (  1964 PWs)   bands (ev):
+
+   -51.8835   3.8979   8.4408  16.8035  16.8035  19.5871  23.2178  42.1380
+    42.1380  43.3536  43.8969  45.0982  46.3026  46.3026  47.0571  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000-0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+     highest occupied, lowest unoccupied level (ev):     3.8979    8.4408
+
+!    total energy              =     -14.93755701 Ry
+     estimated scf accuracy    <          5.2E-13 Ry
+
+     convergence has been achieved in   1 iterations
+
+     Using ACE for calculation of exact exchange
+     ACE projected onto    16 (nbndproj) and applied to    16 (nbnd) bands
+
+     total energy              =     -14.93755701 Ry
+     Harris-Foulkes estimate   =     -14.93755701 Ry
+     est. exchange err (dexx)  =          1.2E-09 Ry
+     - averaged Fock potential =       6.57194611 Ry
+     + Fock energy (ACE)       =      -3.28597273 Ry
+
+     EXX: now go back to refine exchange calculation
+
+     total cpu time spent up to now is      275.7 secs
+
+     Self-consistent Calculation
+
+     iteration #  1     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     c_bands:  1 eigenvalues not converged
+     c_bands:  1 eigenvalues not converged
+     c_bands:  1 eigenvalues not converged
+     c_bands:  1 eigenvalues not converged
+     ethr =  1.16E-14,  avg # of iterations =  3.3
+
+     total cpu time spent up to now is      275.8 secs
+
+     End of self-consistent calculation
+
+          k = 0.0000 0.0000 0.0000 (  1917 PWs)   bands (ev):
+
+   -51.9428  -2.1444  22.8402  24.5086  24.5086  24.5086  28.3074  28.3074
+    28.3074  29.4826  35.3270  35.3270  35.3270  36.8275  36.8275  51.4868
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000-0.5000 0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k =-0.5000-0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.0000-1.0000 0.0000 (  1964 PWs)   bands (ev):
+
+   -51.8835   3.8979   8.4408  16.8035  16.8035  19.5871  23.2178  42.1380
+    42.1380  43.3536  43.8969  45.0982  46.3026  46.3026  47.0571  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000 0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 1.0000 0.0000 0.0000 (  1964 PWs)   bands (ev):
+
+   -51.8835   3.8979   8.4408  16.8035  16.8035  19.5871  23.2178  42.1380
+    42.1380  43.3536  43.8969  45.0982  46.3026  46.3026  47.0571  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.0000 0.0000-1.0000 (  1964 PWs)   bands (ev):
+
+   -51.8835   3.8979   8.4408  16.8035  16.8035  19.5871  23.2178  42.1380
+    42.1380  43.3536  43.8969  45.0982  46.3026  46.3026  47.0571  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000-0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+     highest occupied, lowest unoccupied level (ev):     3.8979    8.4408
+
+!    total energy              =     -14.93755701 Ry
+     estimated scf accuracy    <          2.1E-12 Ry
+
+     convergence has been achieved in   1 iterations
+
+     Using ACE for calculation of exact exchange
+     ACE projected onto    16 (nbndproj) and applied to    16 (nbnd) bands
+     BEWARE: negative dexx:  -0.556E-08
+
+     total energy              =     -14.93755701 Ry
+     Harris-Foulkes estimate   =     -14.93755701 Ry
+     est. exchange err (dexx)  =          5.6E-09 Ry
+     - averaged Fock potential =       6.57194806 Ry
+     + Fock energy (ACE)       =      -3.28597533 Ry
+
+     EXX: now go back to refine exchange calculation
+
+     total cpu time spent up to now is      301.5 secs
+
+     Self-consistent Calculation
+
+     iteration #  1     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     c_bands:  1 eigenvalues not converged
+     ethr =  1.16E-14,  avg # of iterations =  2.9
+
+     Threshold (ethr) on eigenvalues was too large:
+     Diagonalizing with lowered threshold
+
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     c_bands:  2 eigenvalues not converged
+     c_bands:  2 eigenvalues not converged
+     c_bands:  2 eigenvalues not converged
+     c_bands:  1 eigenvalues not converged
+     c_bands:  4 eigenvalues not converged
+     c_bands:  1 eigenvalues not converged
+     c_bands:  4 eigenvalues not converged
+     c_bands:  2 eigenvalues not converged
+     ethr =  6.90E-16,  avg # of iterations =  6.0
+
+     total cpu time spent up to now is      302.0 secs
+
+     End of self-consistent calculation
+
+          k = 0.0000 0.0000 0.0000 (  1917 PWs)   bands (ev):
+
+   -51.9428  -2.1444  22.8402  24.5086  24.5086  24.5086  28.3074  28.3074
+    28.3074  29.4826  35.3270  35.3270  35.3270  36.8275  36.8275  51.4868
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000-0.5000 0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k =-0.5000-0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.0000-1.0000 0.0000 (  1964 PWs)   bands (ev):
+
+   -51.8835   3.8979   8.4408  16.8035  16.8035  19.5871  23.2178  42.1380
+    42.1380  43.3536  43.8969  45.0982  46.3026  46.3026  47.0571  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000 0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 1.0000 0.0000 0.0000 (  1964 PWs)   bands (ev):
+
+   -51.8835   3.8979   8.4408  16.8035  16.8035  19.5871  23.2178  42.1380
+    42.1380  43.3536  43.8969  45.0982  46.3026  46.3026  47.0571  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.0000 0.0000-1.0000 (  1964 PWs)   bands (ev):
+
+   -51.8835   3.8979   8.4408  16.8035  16.8035  19.5871  23.2178  42.1380
+    42.1380  43.3536  43.8969  45.0982  46.3026  46.3026  47.0571  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000-0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+     highest occupied, lowest unoccupied level (ev):     3.8979    8.4408
+
+!    total energy              =     -14.93755704 Ry
+     estimated scf accuracy    <          2.3E-11 Ry
+
+     convergence has been achieved in   1 iterations
+
+     Using ACE for calculation of exact exchange
+     ACE projected onto    16 (nbndproj) and applied to    16 (nbnd) bands
+
+     total energy              =     -14.93755708 Ry
+     Harris-Foulkes estimate   =     -14.93755708 Ry
+     est. exchange err (dexx)  =       0.00000004 Ry
+     - averaged Fock potential =       6.57194259 Ry
+     + Fock energy (ACE)       =      -3.28596730 Ry
+
+     EXX: now go back to refine exchange calculation
+
+     total cpu time spent up to now is      327.6 secs
+
+     Self-consistent Calculation
+
+     iteration #  1     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     c_bands:  1 eigenvalues not converged
+     c_bands:  2 eigenvalues not converged
+     c_bands:  3 eigenvalues not converged
+     c_bands:  4 eigenvalues not converged
+     c_bands:  2 eigenvalues not converged
+     c_bands:  5 eigenvalues not converged
+     c_bands:  3 eigenvalues not converged
+     c_bands:  1 eigenvalues not converged
+     ethr =  6.90E-16,  avg # of iterations = 13.0
+
+     total cpu time spent up to now is      328.3 secs
+
+     End of self-consistent calculation
+
+          k = 0.0000 0.0000 0.0000 (  1917 PWs)   bands (ev):
+
+   -51.9428  -2.1444  22.8402  24.5086  24.5086  24.5086  28.3074  28.3074
+    28.3074  29.4826  35.3270  35.3270  35.3270  36.8275  36.8275  51.4867
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000-0.5000 0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5014  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k =-0.5000-0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5014  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.0000-1.0000 0.0000 (  1964 PWs)   bands (ev):
+
+   -51.8835   3.8979   8.4408  16.8035  16.8035  19.5872  23.2178  42.1380
+    42.1380  43.3536  43.8969  45.0982  46.3026  46.3026  47.0571  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000 0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5014  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 1.0000 0.0000 0.0000 (  1964 PWs)   bands (ev):
+
+   -51.8836   3.8979   8.4408  16.8035  16.8035  19.5872  23.2178  42.1380
+    42.1380  43.3536  43.8969  45.0982  46.3026  46.3026  47.0571  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.0000 0.0000-1.0000 (  1964 PWs)   bands (ev):
+
+   -51.8835   3.8979   8.4408  16.8035  16.8035  19.5871  23.2178  42.1380
+    42.1380  43.3536  43.8969  45.0982  46.3026  46.3026  47.0571  50.0940
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000-0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5014  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+     highest occupied, lowest unoccupied level (ev):     3.8979    8.4408
+
+!    total energy              =     -14.93755705 Ry
+     estimated scf accuracy    <          3.8E-11 Ry
+
+     convergence has been achieved in   1 iterations
+
+     Using ACE for calculation of exact exchange
+     ACE projected onto    16 (nbndproj) and applied to    16 (nbnd) bands
+     BEWARE: negative dexx:  -0.452E-07
+
+     total energy              =     -14.93755700 Ry
+     Harris-Foulkes estimate   =     -14.93755700 Ry
+     est. exchange err (dexx)  =       0.00000005 Ry
+     - averaged Fock potential =       6.57194545 Ry
+     + Fock energy (ACE)       =      -3.28597811 Ry
+
+     EXX: now go back to refine exchange calculation
+
+     total cpu time spent up to now is      353.9 secs
+
+     Self-consistent Calculation
+
+     iteration #  1     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     c_bands:  4 eigenvalues not converged
+     c_bands:  5 eigenvalues not converged
+     c_bands:  2 eigenvalues not converged
+     c_bands:  4 eigenvalues not converged
+     c_bands:  1 eigenvalues not converged
+     c_bands:  4 eigenvalues not converged
+     c_bands:  4 eigenvalues not converged
+     c_bands:  3 eigenvalues not converged
+     ethr =  6.90E-16,  avg # of iterations = 13.8
+
+     total cpu time spent up to now is      354.6 secs
+
+     End of self-consistent calculation
+
+          k = 0.0000 0.0000 0.0000 (  1917 PWs)   bands (ev):
+
+   -51.9428  -2.1444  22.8402  24.5086  24.5086  24.5086  28.3074  28.3074
+    28.3074  29.4826  35.3270  35.3270  35.3270  36.8275  36.8275  51.4868
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000-0.5000 0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8934   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k =-0.5000-0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8934   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.0000-1.0000 0.0000 (  1964 PWs)   bands (ev):
+
+   -51.8835   3.8979   8.4408  16.8035  16.8035  19.5871  23.2178  42.1380
+    42.1380  43.3536  43.8969  45.0982  46.3026  46.3026  47.0571  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000 0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8934   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 1.0000 0.0000 0.0000 (  1964 PWs)   bands (ev):
+
+   -51.8835   3.8979   8.4408  16.8035  16.8035  19.5871  23.2178  42.1380
+    42.1380  43.3536  43.8969  45.0982  46.3026  46.3026  47.0571  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.0000 0.0000-1.0000 (  1964 PWs)   bands (ev):
+
+   -51.8835   3.8979   8.4408  16.8035  16.8035  19.5871  23.2178  42.1380
+    42.1380  43.3536  43.8969  45.0982  46.3026  46.3026  47.0571  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000-0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8934   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+     highest occupied, lowest unoccupied level (ev):     3.8979    8.4408
+
+!    total energy              =     -14.93755700 Ry
+     estimated scf accuracy    <          1.2E-12 Ry
+
+     convergence has been achieved in   1 iterations
+
+     Using ACE for calculation of exact exchange
+     ACE projected onto    16 (nbndproj) and applied to    16 (nbnd) bands
+
+     total energy              =     -14.93755701 Ry
+     Harris-Foulkes estimate   =     -14.93755701 Ry
+     est. exchange err (dexx)  =          4.7E-09 Ry
+     - averaged Fock potential =       6.57195449 Ry
+     + Fock energy (ACE)       =      -3.28597639 Ry
+
+     EXX: now go back to refine exchange calculation
+
+     total cpu time spent up to now is      380.3 secs
+
+     Self-consistent Calculation
+
+     iteration #  1     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     c_bands:  3 eigenvalues not converged
+     c_bands:  3 eigenvalues not converged
+     c_bands:  1 eigenvalues not converged
+     c_bands:  2 eigenvalues not converged
+     c_bands:  3 eigenvalues not converged
+     c_bands:  5 eigenvalues not converged
+     c_bands:  1 eigenvalues not converged
+     c_bands:  2 eigenvalues not converged
+     ethr =  6.90E-16,  avg # of iterations =  8.4
+
+     total cpu time spent up to now is      380.7 secs
+
+     End of self-consistent calculation
+
+          k = 0.0000 0.0000 0.0000 (  1917 PWs)   bands (ev):
+
+   -51.9428  -2.1444  22.8402  24.5086  24.5086  24.5086  28.3074  28.3074
+    28.3074  29.4826  35.3270  35.3270  35.3270  36.8275  36.8275  51.4868
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000-0.5000 0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k =-0.5000-0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.0000-1.0000 0.0000 (  1964 PWs)   bands (ev):
+
+   -51.8835   3.8979   8.4408  16.8035  16.8035  19.5871  23.2178  42.1380
+    42.1380  43.3536  43.8969  45.0982  46.3026  46.3026  47.0571  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000 0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 1.0000 0.0000 0.0000 (  1964 PWs)   bands (ev):
+
+   -51.8835   3.8979   8.4408  16.8035  16.8035  19.5871  23.2178  42.1380
+    42.1380  43.3536  43.8969  45.0982  46.3026  46.3026  47.0571  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.0000 0.0000-1.0000 (  1964 PWs)   bands (ev):
+
+   -51.8835   3.8979   8.4408  16.8035  16.8035  19.5871  23.2178  42.1380
+    42.1380  43.3536  43.8969  45.0982  46.3026  46.3026  47.0571  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000-0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+     highest occupied, lowest unoccupied level (ev):     3.8979    8.4408
+
+!    total energy              =     -14.93755701 Ry
+     estimated scf accuracy    <          4.7E-12 Ry
+
+     convergence has been achieved in   1 iterations
+
+     Using ACE for calculation of exact exchange
+     ACE projected onto    16 (nbndproj) and applied to    16 (nbnd) bands
+     BEWARE: negative dexx:  -0.540E-08
+
+     total energy              =     -14.93755700 Ry
+     Harris-Foulkes estimate   =     -14.93755700 Ry
+     est. exchange err (dexx)  =          5.4E-09 Ry
+     - averaged Fock potential =       6.57195682 Ry
+     + Fock energy (ACE)       =      -3.28598043 Ry
+
+     EXX: now go back to refine exchange calculation
+
+     total cpu time spent up to now is      406.4 secs
+
+     Self-consistent Calculation
+
+     iteration #  1     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     c_bands:  3 eigenvalues not converged
+     c_bands:  1 eigenvalues not converged
+     c_bands:  3 eigenvalues not converged
+     c_bands:  2 eigenvalues not converged
+     c_bands:  3 eigenvalues not converged
+     c_bands:  2 eigenvalues not converged
+     c_bands:  4 eigenvalues not converged
+     c_bands:  4 eigenvalues not converged
+     ethr =  6.90E-16,  avg # of iterations =  8.6
+
+     total cpu time spent up to now is      406.9 secs
+
+     End of self-consistent calculation
+
+          k = 0.0000 0.0000 0.0000 (  1917 PWs)   bands (ev):
+
+   -51.9427  -2.1444  22.8402  24.5086  24.5086  24.5086  28.3074  28.3074
+    28.3074  29.4826  35.3270  35.3270  35.3270  36.8275  36.8275  51.4868
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000-0.5000 0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8934   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k =-0.5000-0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8934   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.0000-1.0000 0.0000 (  1964 PWs)   bands (ev):
+
+   -51.8835   3.8979   8.4408  16.8035  16.8035  19.5871  23.2178  42.1380
+    42.1380  43.3536  43.8969  45.0982  46.3026  46.3026  47.0571  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000 0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8934   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 1.0000 0.0000 0.0000 (  1964 PWs)   bands (ev):
+
+   -51.8835   3.8979   8.4408  16.8035  16.8035  19.5871  23.2178  42.1380
+    42.1380  43.3536  43.8969  45.0982  46.3026  46.3026  47.0571  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.0000 0.0000-1.0000 (  1964 PWs)   bands (ev):
+
+   -51.8835   3.8979   8.4408  16.8035  16.8035  19.5871  23.2178  42.1380
+    42.1380  43.3536  43.8969  45.0982  46.3026  46.3026  47.0571  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000-0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8934   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+     highest occupied, lowest unoccupied level (ev):     3.8979    8.4408
+
+!    total energy              =     -14.93755700 Ry
+     estimated scf accuracy    <          6.6E-12 Ry
+
+     convergence has been achieved in   1 iterations
+
+     Using ACE for calculation of exact exchange
+     ACE projected onto    16 (nbndproj) and applied to    16 (nbnd) bands
+
+     total energy              =     -14.93755701 Ry
+     Harris-Foulkes estimate   =     -14.93755701 Ry
+     est. exchange err (dexx)  =          8.5E-09 Ry
+     - averaged Fock potential =       6.57195608 Ry
+     + Fock energy (ACE)       =      -3.28597566 Ry
+
+     EXX: now go back to refine exchange calculation
+
+     total cpu time spent up to now is      432.5 secs
+
+     Self-consistent Calculation
+
+     iteration #  1     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     c_bands:  2 eigenvalues not converged
+     c_bands:  1 eigenvalues not converged
+     c_bands:  1 eigenvalues not converged
+     c_bands:  4 eigenvalues not converged
+     c_bands:  2 eigenvalues not converged
+     c_bands:  4 eigenvalues not converged
+     c_bands:  1 eigenvalues not converged
+     c_bands:  2 eigenvalues not converged
+     ethr =  6.90E-16,  avg # of iterations =  8.1
+
+     total cpu time spent up to now is      432.9 secs
+
+     End of self-consistent calculation
+
+          k = 0.0000 0.0000 0.0000 (  1917 PWs)   bands (ev):
+
+   -51.9428  -2.1444  22.8402  24.5086  24.5086  24.5086  28.3074  28.3074
+    28.3074  29.4826  35.3270  35.3270  35.3270  36.8275  36.8275  51.4868
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000-0.5000 0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k =-0.5000-0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.0000-1.0000 0.0000 (  1964 PWs)   bands (ev):
+
+   -51.8835   3.8979   8.4408  16.8035  16.8035  19.5871  23.2178  42.1380
+    42.1380  43.3536  43.8969  45.0982  46.3026  46.3026  47.0571  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000 0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 1.0000 0.0000 0.0000 (  1964 PWs)   bands (ev):
+
+   -51.8835   3.8979   8.4408  16.8035  16.8035  19.5871  23.2178  42.1380
+    42.1380  43.3536  43.8969  45.0982  46.3026  46.3026  47.0571  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.0000 0.0000-1.0000 (  1964 PWs)   bands (ev):
+
+   -51.8835   3.8979   8.4408  16.8035  16.8035  19.5871  23.2178  42.1380
+    42.1380  43.3536  43.8969  45.0982  46.3026  46.3026  47.0571  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000-0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+     highest occupied, lowest unoccupied level (ev):     3.8979    8.4408
+
+!    total energy              =     -14.93755701 Ry
+     estimated scf accuracy    <          3.4E-14 Ry
+
+     convergence has been achieved in   1 iterations
+
+     Using ACE for calculation of exact exchange
+     ACE projected onto    16 (nbndproj) and applied to    16 (nbnd) bands
+     BEWARE: negative dexx:  -0.288E-09
+
+     total energy              =     -14.93755701 Ry
+     Harris-Foulkes estimate   =     -14.93755701 Ry
+     est. exchange err (dexx)  =          2.9E-10 Ry
+     - averaged Fock potential =       6.57195110 Ry
+     + Fock energy (ACE)       =      -3.28597545 Ry
+
+     EXX: now go back to refine exchange calculation
+
+     total cpu time spent up to now is      458.6 secs
+
+     Self-consistent Calculation
+
+     iteration #  1     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     c_bands:  1 eigenvalues not converged
+     c_bands:  1 eigenvalues not converged
+     c_bands:  2 eigenvalues not converged
+     c_bands:  4 eigenvalues not converged
+     c_bands:  2 eigenvalues not converged
+     c_bands:  2 eigenvalues not converged
+     c_bands:  2 eigenvalues not converged
+     c_bands:  2 eigenvalues not converged
+     ethr =  6.90E-16,  avg # of iterations =  6.8
+
+     total cpu time spent up to now is      458.9 secs
+
+     End of self-consistent calculation
+
+          k = 0.0000 0.0000 0.0000 (  1917 PWs)   bands (ev):
+
+   -51.9428  -2.1444  22.8402  24.5086  24.5086  24.5086  28.3074  28.3074
+    28.3074  29.4826  35.3270  35.3270  35.3270  36.8275  36.8275  51.4868
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000-0.5000 0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k =-0.5000-0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.0000-1.0000 0.0000 (  1964 PWs)   bands (ev):
+
+   -51.8835   3.8979   8.4408  16.8035  16.8035  19.5871  23.2178  42.1380
+    42.1380  43.3536  43.8969  45.0982  46.3026  46.3026  47.0571  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000 0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 1.0000 0.0000 0.0000 (  1964 PWs)   bands (ev):
+
+   -51.8835   3.8979   8.4408  16.8035  16.8035  19.5871  23.2178  42.1380
+    42.1380  43.3536  43.8969  45.0982  46.3026  46.3026  47.0571  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.0000 0.0000-1.0000 (  1964 PWs)   bands (ev):
+
+   -51.8835   3.8979   8.4408  16.8035  16.8035  19.5871  23.2178  42.1380
+    42.1380  43.3536  43.8969  45.0982  46.3026  46.3026  47.0571  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000-0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+     highest occupied, lowest unoccupied level (ev):     3.8979    8.4408
+
+!    total energy              =     -14.93755701 Ry
+     estimated scf accuracy    <          1.2E-13 Ry
+
+     convergence has been achieved in   1 iterations
+
+     Using ACE for calculation of exact exchange
+     ACE projected onto    16 (nbndproj) and applied to    16 (nbnd) bands
+
+     total energy              =     -14.93755701 Ry
+     Harris-Foulkes estimate   =     -14.93755701 Ry
+     est. exchange err (dexx)  =          8.3E-10 Ry
+     - averaged Fock potential =       6.57195147 Ry
+     + Fock energy (ACE)       =      -3.28597602 Ry
+
+     EXX: now go back to refine exchange calculation
+
+     total cpu time spent up to now is      484.6 secs
+
+     Self-consistent Calculation
+
+     iteration #  1     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     c_bands:  2 eigenvalues not converged
+     c_bands:  1 eigenvalues not converged
+     c_bands:  2 eigenvalues not converged
+     c_bands:  4 eigenvalues not converged
+     c_bands:  2 eigenvalues not converged
+     c_bands:  5 eigenvalues not converged
+     c_bands:  2 eigenvalues not converged
+     c_bands:  1 eigenvalues not converged
+     ethr =  6.90E-16,  avg # of iterations =  6.4
+
+     total cpu time spent up to now is      484.9 secs
+
+     End of self-consistent calculation
+
+          k = 0.0000 0.0000 0.0000 (  1917 PWs)   bands (ev):
+
+   -51.9428  -2.1444  22.8402  24.5086  24.5086  24.5086  28.3074  28.3074
+    28.3074  29.4826  35.3270  35.3270  35.3270  36.8275  36.8275  51.4868
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000-0.5000 0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k =-0.5000-0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.0000-1.0000 0.0000 (  1964 PWs)   bands (ev):
+
+   -51.8835   3.8979   8.4408  16.8035  16.8035  19.5871  23.2178  42.1380
+    42.1380  43.3536  43.8969  45.0982  46.3026  46.3026  47.0571  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000 0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 1.0000 0.0000 0.0000 (  1964 PWs)   bands (ev):
+
+   -51.8835   3.8979   8.4408  16.8035  16.8035  19.5871  23.2178  42.1380
+    42.1380  43.3536  43.8969  45.0982  46.3026  46.3026  47.0571  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.0000 0.0000-1.0000 (  1964 PWs)   bands (ev):
+
+   -51.8835   3.8979   8.4408  16.8035  16.8035  19.5871  23.2178  42.1380
+    42.1380  43.3536  43.8969  45.0982  46.3026  46.3026  47.0571  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000-0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+     highest occupied, lowest unoccupied level (ev):     3.8979    8.4408
+
+!    total energy              =     -14.93755701 Ry
+     estimated scf accuracy    <          8.4E-12 Ry
+
+     convergence has been achieved in   1 iterations
+
+     Using ACE for calculation of exact exchange
+     ACE projected onto    16 (nbndproj) and applied to    16 (nbnd) bands
+
+     total energy              =     -14.93755703 Ry
+     Harris-Foulkes estimate   =     -14.93755703 Ry
+     est. exchange err (dexx)  =       0.00000001 Ry
+     - averaged Fock potential =       6.57194660 Ry
+     + Fock energy (ACE)       =      -3.28597059 Ry
+
+     EXX: now go back to refine exchange calculation
+
+     total cpu time spent up to now is      510.6 secs
+
+     Self-consistent Calculation
+
+     iteration #  1     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     c_bands:  4 eigenvalues not converged
+     c_bands:  3 eigenvalues not converged
+     c_bands:  4 eigenvalues not converged
+     c_bands:  1 eigenvalues not converged
+     c_bands:  3 eigenvalues not converged
+     c_bands:  5 eigenvalues not converged
+     c_bands:  3 eigenvalues not converged
+     c_bands:  4 eigenvalues not converged
+     ethr =  6.90E-16,  avg # of iterations =  9.5
+
+     total cpu time spent up to now is      511.1 secs
+
+     End of self-consistent calculation
+
+          k = 0.0000 0.0000 0.0000 (  1917 PWs)   bands (ev):
+
+   -51.9428  -2.1444  22.8402  24.5086  24.5086  24.5086  28.3074  28.3074
+    28.3074  29.4826  35.3270  35.3270  35.3270  36.8275  36.8275  51.4868
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000-0.5000 0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k =-0.5000-0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.0000-1.0000 0.0000 (  1964 PWs)   bands (ev):
+
+   -51.8835   3.8979   8.4408  16.8035  16.8035  19.5871  23.2178  42.1380
+    42.1380  43.3536  43.8969  45.0982  46.3026  46.3026  47.0571  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000 0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 1.0000 0.0000 0.0000 (  1964 PWs)   bands (ev):
+
+   -51.8835   3.8979   8.4408  16.8035  16.8035  19.5871  23.2178  42.1380
+    42.1380  43.3536  43.8969  45.0982  46.3026  46.3026  47.0571  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.0000 0.0000-1.0000 (  1964 PWs)   bands (ev):
+
+   -51.8835   3.8979   8.4408  16.8035  16.8035  19.5871  23.2178  42.1380
+    42.1380  43.3536  43.8969  45.0982  46.3026  46.3026  47.0571  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000-0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+     highest occupied, lowest unoccupied level (ev):     3.8979    8.4408
+
+!    total energy              =     -14.93755702 Ry
+     estimated scf accuracy    <          7.1E-12 Ry
+
+     convergence has been achieved in   1 iterations
+
+     Using ACE for calculation of exact exchange
+     ACE projected onto    16 (nbndproj) and applied to    16 (nbnd) bands
+
+     total energy              =     -14.93755703 Ry
+     Harris-Foulkes estimate   =     -14.93755703 Ry
+     est. exchange err (dexx)  =          6.9E-09 Ry
+     - averaged Fock potential =       6.57193662 Ry
+     + Fock energy (ACE)       =      -3.28596604 Ry
+
+     EXX: now go back to refine exchange calculation
+
+     total cpu time spent up to now is      536.8 secs
+
+     Self-consistent Calculation
+
+     iteration #  1     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     c_bands:  2 eigenvalues not converged
+     c_bands:  5 eigenvalues not converged
+     c_bands:  3 eigenvalues not converged
+     c_bands:  4 eigenvalues not converged
+     c_bands:  4 eigenvalues not converged
+     c_bands:  4 eigenvalues not converged
+     c_bands:  5 eigenvalues not converged
+     c_bands:  1 eigenvalues not converged
+     ethr =  6.90E-16,  avg # of iterations = 11.4
+
+     total cpu time spent up to now is      537.3 secs
+
+     End of self-consistent calculation
+
+          k = 0.0000 0.0000 0.0000 (  1917 PWs)   bands (ev):
+
+   -51.9428  -2.1444  22.8402  24.5086  24.5086  24.5086  28.3074  28.3074
+    28.3074  29.4826  35.3270  35.3270  35.3270  36.8275  36.8275  51.4868
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000-0.5000 0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9726  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k =-0.5000-0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9726  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.0000-1.0000 0.0000 (  1964 PWs)   bands (ev):
+
+   -51.8836   3.8979   8.4408  16.8035  16.8035  19.5872  23.2178  42.1380
+    42.1380  43.3536  43.8969  45.0982  46.3026  46.3026  47.0571  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000 0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 1.0000 0.0000 0.0000 (  1964 PWs)   bands (ev):
+
+   -51.8836   3.8979   8.4408  16.8035  16.8035  19.5872  23.2178  42.1380
+    42.1380  43.3536  43.8969  45.0982  46.3026  46.3026  47.0571  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.0000 0.0000-1.0000 (  1964 PWs)   bands (ev):
+
+   -51.8836   3.8979   8.4408  16.8035  16.8035  19.5872  23.2178  42.1380
+    42.1380  43.3536  43.8969  45.0982  46.3026  46.3026  47.0571  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000-0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+     highest occupied, lowest unoccupied level (ev):     3.8979    8.4408
+
+!    total energy              =     -14.93755703 Ry
+     estimated scf accuracy    <          2.0E-11 Ry
+
+     convergence has been achieved in   1 iterations
+
+     Using ACE for calculation of exact exchange
+     ACE projected onto    16 (nbndproj) and applied to    16 (nbnd) bands
+     BEWARE: negative dexx:  -0.229E-07
+
+     total energy              =     -14.93755701 Ry
+     Harris-Foulkes estimate   =     -14.93755701 Ry
+     est. exchange err (dexx)  =       0.00000002 Ry
+     - averaged Fock potential =       6.57194053 Ry
+     + Fock energy (ACE)       =      -3.28597446 Ry
+
+     EXX: now go back to refine exchange calculation
+
+     total cpu time spent up to now is      563.0 secs
+
+     Self-consistent Calculation
+
+     iteration #  1     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     c_bands:  1 eigenvalues not converged
+     c_bands:  4 eigenvalues not converged
+     c_bands:  1 eigenvalues not converged
+     c_bands:  4 eigenvalues not converged
+     c_bands:  3 eigenvalues not converged
+     c_bands:  3 eigenvalues not converged
+     c_bands:  2 eigenvalues not converged
+     c_bands:  1 eigenvalues not converged
+     ethr =  6.90E-16,  avg # of iterations =  7.9
+
+     total cpu time spent up to now is      563.4 secs
+
+     End of self-consistent calculation
+
+          k = 0.0000 0.0000 0.0000 (  1917 PWs)   bands (ev):
+
+   -51.9428  -2.1444  22.8402  24.5086  24.5086  24.5086  28.3074  28.3074
+    28.3074  29.4826  35.3270  35.3270  35.3270  36.8275  36.8275  51.4868
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000-0.5000 0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k =-0.5000-0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.0000-1.0000 0.0000 (  1964 PWs)   bands (ev):
+
+   -51.8835   3.8979   8.4408  16.8035  16.8035  19.5871  23.2178  42.1380
+    42.1380  43.3536  43.8969  45.0982  46.3026  46.3026  47.0571  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000 0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 1.0000 0.0000 0.0000 (  1964 PWs)   bands (ev):
+
+   -51.8835   3.8979   8.4408  16.8035  16.8035  19.5871  23.2178  42.1380
+    42.1380  43.3536  43.8969  45.0982  46.3026  46.3026  47.0571  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.0000 0.0000-1.0000 (  1964 PWs)   bands (ev):
+
+   -51.8835   3.8979   8.4408  16.8035  16.8035  19.5871  23.2178  42.1380
+    42.1380  43.3536  43.8969  45.0982  46.3026  46.3026  47.0571  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000-0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+     highest occupied, lowest unoccupied level (ev):     3.8979    8.4408
+
+!    total energy              =     -14.93755701 Ry
+     estimated scf accuracy    <          5.1E-13 Ry
+
+     convergence has been achieved in   1 iterations
+
+     Using ACE for calculation of exact exchange
+     ACE projected onto    16 (nbndproj) and applied to    16 (nbnd) bands
+
+     total energy              =     -14.93755701 Ry
+     Harris-Foulkes estimate   =     -14.93755701 Ry
+     est. exchange err (dexx)  =          1.4E-09 Ry
+     - averaged Fock potential =       6.57194765 Ry
+     + Fock energy (ACE)       =      -3.28597319 Ry
+
+     EXX: now go back to refine exchange calculation
+
+     total cpu time spent up to now is      589.1 secs
+
+     Self-consistent Calculation
+
+     iteration #  1     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     c_bands:  2 eigenvalues not converged
+     c_bands:  1 eigenvalues not converged
+     c_bands:  3 eigenvalues not converged
+     c_bands:  5 eigenvalues not converged
+     c_bands:  4 eigenvalues not converged
+     c_bands:  1 eigenvalues not converged
+     c_bands:  2 eigenvalues not converged
+     c_bands:  1 eigenvalues not converged
+     ethr =  6.90E-16,  avg # of iterations =  9.6
+
+     total cpu time spent up to now is      589.6 secs
+
+     End of self-consistent calculation
+
+          k = 0.0000 0.0000 0.0000 (  1917 PWs)   bands (ev):
+
+   -51.9428  -2.1444  22.8402  24.5086  24.5086  24.5086  28.3074  28.3074
+    28.3074  29.4826  35.3270  35.3270  35.3270  36.8275  36.8275  51.4868
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000-0.5000 0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k =-0.5000-0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.0000-1.0000 0.0000 (  1964 PWs)   bands (ev):
+
+   -51.8835   3.8979   8.4408  16.8035  16.8035  19.5871  23.2178  42.1380
+    42.1380  43.3536  43.8969  45.0982  46.3026  46.3026  47.0571  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000 0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 1.0000 0.0000 0.0000 (  1964 PWs)   bands (ev):
+
+   -51.8835   3.8979   8.4408  16.8035  16.8035  19.5871  23.2178  42.1380
+    42.1380  43.3536  43.8969  45.0982  46.3026  46.3026  47.0571  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.0000 0.0000-1.0000 (  1964 PWs)   bands (ev):
+
+   -51.8835   3.8979   8.4408  16.8035  16.8035  19.5871  23.2178  42.1380
+    42.1380  43.3536  43.8969  45.0982  46.3026  46.3026  47.0571  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000-0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+     highest occupied, lowest unoccupied level (ev):     3.8979    8.4408
+
+!    total energy              =     -14.93755701 Ry
+     estimated scf accuracy    <          4.6E-13 Ry
+
+     convergence has been achieved in   1 iterations
+
+     Using ACE for calculation of exact exchange
+     ACE projected onto    16 (nbndproj) and applied to    16 (nbnd) bands
+
+     total energy              =     -14.93755701 Ry
+     Harris-Foulkes estimate   =     -14.93755701 Ry
+     est. exchange err (dexx)  =          3.6E-09 Ry
+     - averaged Fock potential =       6.57194756 Ry
+     + Fock energy (ACE)       =      -3.28597438 Ry
+
+     EXX: now go back to refine exchange calculation
+
+     total cpu time spent up to now is      615.2 secs
+
+     Self-consistent Calculation
+
+     iteration #  1     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     c_bands:  3 eigenvalues not converged
+     c_bands:  1 eigenvalues not converged
+     c_bands:  3 eigenvalues not converged
+     c_bands:  1 eigenvalues not converged
+     c_bands:  2 eigenvalues not converged
+     c_bands:  3 eigenvalues not converged
+     c_bands:  1 eigenvalues not converged
+     c_bands:  5 eigenvalues not converged
+     ethr =  6.90E-16,  avg # of iterations =  9.5
+
+     total cpu time spent up to now is      615.7 secs
+
+     End of self-consistent calculation
+
+          k = 0.0000 0.0000 0.0000 (  1917 PWs)   bands (ev):
+
+   -51.9428  -2.1444  22.8402  24.5086  24.5086  24.5086  28.3074  28.3074
+    28.3074  29.4826  35.3270  35.3270  35.3270  36.8275  36.8275  51.4868
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000-0.5000 0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k =-0.5000-0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.0000-1.0000 0.0000 (  1964 PWs)   bands (ev):
+
+   -51.8835   3.8979   8.4408  16.8035  16.8035  19.5871  23.2178  42.1380
+    42.1380  43.3536  43.8969  45.0982  46.3026  46.3026  47.0571  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000 0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 1.0000 0.0000 0.0000 (  1964 PWs)   bands (ev):
+
+   -51.8835   3.8979   8.4408  16.8035  16.8035  19.5871  23.2178  42.1380
+    42.1380  43.3536  43.8969  45.0982  46.3026  46.3026  47.0571  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.0000 0.0000-1.0000 (  1964 PWs)   bands (ev):
+
+   -51.8835   3.8979   8.4408  16.8035  16.8035  19.5871  23.2178  42.1380
+    42.1380  43.3536  43.8969  45.0982  46.3026  46.3026  47.0571  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000-0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+     highest occupied, lowest unoccupied level (ev):     3.8979    8.4408
+
+!    total energy              =     -14.93755701 Ry
+     estimated scf accuracy    <          2.1E-13 Ry
+
+     convergence has been achieved in   1 iterations
+
+     Using ACE for calculation of exact exchange
+     ACE projected onto    16 (nbndproj) and applied to    16 (nbnd) bands
+     BEWARE: negative dexx:  -0.274E-08
+
+     total energy              =     -14.93755701 Ry
+     Harris-Foulkes estimate   =     -14.93755701 Ry
+     est. exchange err (dexx)  =          2.7E-09 Ry
+     - averaged Fock potential =       6.57194957 Ry
+     + Fock energy (ACE)       =      -3.28597519 Ry
+
+     EXX: now go back to refine exchange calculation
+
+     total cpu time spent up to now is      642.0 secs
+
+     Self-consistent Calculation
+
+     iteration #  1     ecut=   100.00 Ry     beta= 0.30
+     CG style diagonalization
+
+---- Real-time Memory Report at c_bands before calling an iterative solver
+             0 MiB given to the printing process from OS
+             0 MiB allocation reported by mallinfo(arena+hblkhd)
+             0 MiB available memory on the node where the printing process lives
+------------------
+     c_bands:  1 eigenvalues not converged
+     c_bands:  1 eigenvalues not converged
+     c_bands:  2 eigenvalues not converged
+     c_bands:  4 eigenvalues not converged
+     c_bands:  2 eigenvalues not converged
+     c_bands:  2 eigenvalues not converged
+     c_bands:  2 eigenvalues not converged
+     c_bands:  1 eigenvalues not converged
+     ethr =  6.90E-16,  avg # of iterations =  8.4
+
+     total cpu time spent up to now is      642.4 secs
+
+     End of self-consistent calculation
+
+          k = 0.0000 0.0000 0.0000 (  1917 PWs)   bands (ev):
+
+   -51.9428  -2.1444  22.8402  24.5086  24.5086  24.5086  28.3074  28.3074
+    28.3074  29.4826  35.3270  35.3270  35.3270  36.8275  36.8275  51.4868
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000-0.5000 0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k =-0.5000-0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.0000-1.0000 0.0000 (  1964 PWs)   bands (ev):
+
+   -51.8835   3.8979   8.4408  16.8035  16.8035  19.5871  23.2178  42.1380
+    42.1380  43.3536  43.8969  45.0982  46.3026  46.3026  47.0571  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000 0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 1.0000 0.0000 0.0000 (  1964 PWs)   bands (ev):
+
+   -51.8835   3.8979   8.4408  16.8035  16.8035  19.5871  23.2178  42.1380
+    42.1380  43.3536  43.8969  45.0982  46.3026  46.3026  47.0571  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.0000 0.0000-1.0000 (  1964 PWs)   bands (ev):
+
+   -51.8835   3.8979   8.4408  16.8035  16.8035  19.5871  23.2178  42.1380
+    42.1380  43.3536  43.8969  45.0982  46.3026  46.3026  47.0571  50.0941
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+          k = 0.5000-0.5000-0.5000 (  1946 PWs)   bands (ev):
+
+   -51.8935   1.2515  10.0897  19.9725  22.9917  22.9917  25.0450  25.0450
+    33.0104  39.1820  42.8885  42.8885  43.1627  43.1627  50.5015  55.2894
+
+     occupation numbers 
+     1.0000   1.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+     0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000   0.0000
+
+     highest occupied, lowest unoccupied level (ev):     3.8979    8.4408
+
+!    total energy              =     -14.93755701 Ry
+     estimated scf accuracy    <          4.5E-15 Ry
+
+     convergence has been achieved in   1 iterations
+
+     Using ACE for calculation of exact exchange
+     ACE projected onto    16 (nbndproj) and applied to    16 (nbnd) bands
+
+!!   total energy              =     -14.93755701 Ry
+     Harris-Foulkes estimate   =     -14.93755701 Ry
+     est. exchange err (dexx)  =          9.3E-11 Ry
+     - averaged Fock potential =       6.57195047 Ry
+     + Fock energy (ACE)       =      -3.28597528 Ry
+
+     EXX self-consistency reached
+
+     Writing all to output data dir ./pwscf.save/ :
+     XML data file, charge density, pseudopotentials, collected wavefunctions
+
+     init_run     :      0.18s CPU      0.18s WALL (       1 calls)
+     electrons    :     25.14s CPU     25.56s WALL (      25 calls)
+
+     Called by init_run:
+     aceinit0     :      0.00s CPU      0.00s WALL (       1 calls)
+     wfcinit      :      0.05s CPU      0.05s WALL (       1 calls)
+     wfcinit:atom :      0.00s CPU      0.00s WALL (       8 calls)
+     wfcinit:wfcr :      0.05s CPU      0.05s WALL (       8 calls)
+     potinit      :      0.01s CPU      0.01s WALL (       1 calls)
+     hinit0       :      0.11s CPU      0.11s WALL (       1 calls)
+
+     Called by electrons:
+     c_bands      :     22.08s CPU     22.46s WALL (     113 calls)
+     sum_band     :      2.46s CPU      2.48s WALL (     113 calls)
+     v_of_rho     :      0.07s CPU      0.07s WALL (     113 calls)
+     v_h          :      0.03s CPU      0.03s WALL (     113 calls)
+     v_xc         :      0.04s CPU      0.04s WALL (     113 calls)
+     newd         :      0.27s CPU      0.27s WALL (     112 calls)
+     PAW_pot      :      0.18s CPU      0.18s WALL (     113 calls)
+     mix_rho      :      0.07s CPU      0.07s WALL (     113 calls)
+
+     Called by c_bands:
+     init_us_2    :      0.41s CPU      0.42s WALL (    5216 calls)
+     ccgdiagg     :     18.51s CPU     18.86s WALL (     912 calls)
+     wfcrot       :      3.52s CPU      3.54s WALL (     704 calls)
+
+     Called by sum_band:
+     sum_band:wei :      0.00s CPU      0.00s WALL (     113 calls)
+     sum_band:loo :      2.12s CPU      2.13s WALL (     113 calls)
+     sum_band:buf :      0.01s CPU      0.01s WALL (     904 calls)
+     sum_band:ini :      0.08s CPU      0.08s WALL (     904 calls)
+     sum_band:cal :      0.06s CPU      0.06s WALL (     904 calls)
+     sum_band:bec :      0.00s CPU      0.00s WALL (     904 calls)
+     addusdens    :      0.30s CPU      0.30s WALL (     113 calls)
+                                        0.00s GPU  (     113 calls)
+     addusd:skk   :      0.00s CPU      0.00s WALL (     226 calls)
+                                        0.00s GPU  (     226 calls)
+
+     Called by *cgdiagg:
+     h_psi        :     19.18s CPU     19.42s WALL (   51901 calls)
+     s_psi        :      0.83s CPU      0.85s WALL (  103098 calls)
+
+     Called by h_psi:
+     h_psi:calbec :      0.48s CPU      0.50s WALL (   51901 calls)
+     vloc_psi     :     16.47s CPU     16.58s WALL (   51901 calls)
+     add_vuspsi   :      0.57s CPU      0.58s WALL (   51901 calls)
+     hs_1psi      :     16.41s CPU     16.69s WALL (   51197 calls)
+     s_1psi       :      0.86s CPU      0.91s WALL (   51197 calls)
+
+     General routines
+     calbec       :      1.72s CPU      1.75s WALL (  151999 calls)
+     fft          :      0.10s CPU      0.10s WALL (     426 calls)
+     ffts         :      0.02s CPU      0.02s WALL (     113 calls)
+     fftw         :     16.12s CPU     16.19s WALL (  139386 calls)
+     fftc         :    159.79s CPU    160.42s WALL (  819200 calls)
+     fftcw        :      1.12s CPU      1.13s WALL (    9600 calls)
+
+     Parallel routines
+
+     EXX routines
+     exx_grid     :      0.00s CPU      0.00s WALL (       1 calls)
+     exxinit      :      0.77s CPU      0.77s WALL (      25 calls)
+     vexx         :    640.55s CPU    642.60s WALL (     200 calls)
+     matcalc      :      0.77s CPU      0.80s WALL (   47797 calls)
+     aceupdate    :      0.02s CPU      0.02s WALL (     200 calls)
+     vexxace      :      1.71s CPU      1.75s WALL (   47205 calls)
+     aceinit      :    640.60s CPU    642.64s WALL (     200 calls)
+
+     EXX+US  routines
+     becxx        :      0.00s CPU      0.00s WALL (      25 calls)
+     addusxx      :    239.64s CPU    240.13s WALL (  409600 calls)
+     newdxx       :    204.10s CPU    204.68s WALL (  409600 calls)
+     qvan_init    :      3.21s CPU      3.22s WALL (    1600 calls)
+     nlxx_pot     :      0.25s CPU      0.26s WALL (    3200 calls)
+
+     EXX+PAW routines
+     PAW_newdxx   :      1.26s CPU      1.32s WALL (  409600 calls)
+
+     PAW routines
+     PAW_pot      :      0.18s CPU      0.18s WALL (     113 calls)
+
+     PWSCF        :  11m 6.89s CPU  11m 9.38s WALL
+
+
+   This run was terminated on:  16:36:30  21May2026            
+
+=------------------------------------------------------------------------------=
+   JOB DONE.
+=------------------------------------------------------------------------------=
+Note: The following floating-point exceptions are signalling: IEEE_OVERFLOW_FLAG

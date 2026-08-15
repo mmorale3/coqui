@@ -1,0 +1,19 @@
+ &control
+    calculation = 'scf', verbosity = 'high', outdir = './', prefix = 'pwscf', pseudo_dir = './'
+ /
+ &system
+    ibrav=2, celldm(1)=10.244, nat=2, ntyp=1, nbnd=16,
+    ecutwfc=50.0, ecutrho=200.0,
+    force_symmorphic=.true.,
+    occupations='smearing', degauss=0.0001, smearing='fermi-dirac',
+ /
+ &electrons
+    conv_thr=1e-12, mixing_beta=0.3, electron_maxstep=200,
+ /
+ATOMIC_SPECIES
+ Si 0.0 Si.pbe-n-kjpaw_psl.1.0.0.UPF
+ATOMIC_POSITIONS {alat}
+ Si 0.000 0.000 0.000
+ Si 0.250 0.250 0.250
+K_POINTS {automatic}
+ 2 2 2 0 0 0

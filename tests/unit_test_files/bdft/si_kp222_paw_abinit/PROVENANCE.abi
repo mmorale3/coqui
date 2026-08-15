@@ -1,0 +1,50 @@
+# Si diamond, PAW (LDA-PW 12-electron dataset), 2x2x2 full-BZ nosym grid.
+# Route-equivalence fixture source: WFK+DEN+POT converted via abinit2coqui
+#   abinit2coqui.py si_abo_WFK.nc --outdir . --prefix bdft \
+#     --pawxml  <Pspdir>/Si_paw_pw_12el.xml \
+#     --corewf  <Pspdir>/Si_paw_pw_12el.corewf.xml \
+#     --pot si_abo_POT.nc --den si_abo_DEN.nc --xc lda_pw
+acell 3*10.26
+rprim  0.0 0.5 0.5   0.5 0.0 0.5   0.5 0.5 0.0
+ntypat 1  znucl 14  natom 2  typat 1 1
+xred  0.0 0.0 0.0   0.25 0.25 0.25
+
+ecut 15.0
+pawecutdg 30.0
+ngkpt 2 2 2
+nshiftk 1
+shiftk 0.0 0.0 0.0
+kptopt 3          # full BZ (8 k-points), no symmetry reduction
+nsym 1            # nosym
+
+istwfk *1
+
+occopt 1
+nband 16          # 24 valence electrons -> 12 occupied + buffer
+tolvrs 1.0d-12
+nstep 100
+
+prtwf 1
+prtden 1
+prtpot 1
+iomode 3
+
+pp_dirpath "/Users/mmorales/abinit_local/abinit-10.6.7/tests/Pspdir"
+pseudos "Si_paw_pw_12el.xml"
+
+# ---------------------------------------------------------------------------
+# Regenerated with the sqrt(4pi)-corrected abinit2coqui. The previous h5 was
+# built before abinit2coqui applied the PAW-XML L=0 1/sqrt(4pi) to
+# blochl_local_ionic_potential / zero_potential, so its local-potential data
+# were mis-normalized.
+#
+# Verified against the previous fixture dataset by dataset: 46 numeric datasets
+# bit-identical (orbitals, eigenvalues, occupations, qfuncl, deltaC, ex_cvij,
+# qgm, ...), and EXACTLY the three the fix touches moved --
+#     /Hamiltonian/paw/pp_local_component    70% relative
+#     /Hamiltonian/paw/dion                 116%
+#     /Hamiltonian/Species/nt0/paw/vloc_ps    7%
+# -- which is simultaneously the check that this input reproduces the original
+# run and that the regeneration changed only what it should. Because deltaC and
+# the orbitals are unchanged, the one-centre exchange anchor in
+# test_paw_onecenter.cpp is unaffected.
