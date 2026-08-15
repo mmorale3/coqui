@@ -82,6 +82,34 @@ void apply_isdf_filter(Arr&& A, long row0, long nk, long norb, long npol,
       A(r,ig) *= F(ik,ig);
   }
 }
+// knob 1 (isdf_pair_weight="gap"): log-midpoint quadrature of 1/x = int_0^inf e^{-xt} dt,
+// giving 1/x ~ sum_p c_p exp(-t_p x) on [xmin,xmax] with c_p, t_p > 0. Selection-grade
+// accuracy is all that is needed (the pivot ordering is a discrete choice).
+inline void isdf_laplace_quadrature(int NL, double xmin, double xmax,
+                                    nda::array<RealType,1>& t, nda::array<RealType,1>& c)
+{
+  utils::check(NL >= 1 and xmin > 0.0 and xmax > xmin,
+               "isdf_laplace_quadrature: invalid NL/xmin/xmax: {} {} {}", NL, xmin, xmax);
+  t = nda::array<RealType,1>(NL);
+  c = nda::array<RealType,1>(NL);
+  double slo = std::log(0.05/xmax), shi = std::log(30.0/xmin);
+  double h = (shi-slo)/NL;
+  for(int j=0; j<NL; ++j) {
+    double s = slo + (j+0.5)*h;
+    t(j) = std::exp(s);
+    c(j) = h*t(j);
+  }
+  // diagnostic: worst relative error of the expansion over the target interval
+  double emax = 0.0;
+  for(int i=0; i<200; ++i) {
+    double x = xmin*std::exp( (std::log(xmax)-std::log(xmin))*i/199.0 );
+    double s = 0.0;
+    for(int j=0; j<NL; ++j) s += c(j)*std::exp(-t(j)*x);
+    emax = std::max(emax, std::abs(s*x - 1.0));
+  }
+  app_log(2, "  isdf pair-weight Laplace expansion: NL = {}, x range = [{:.3e},{:.3e}], max rel err = {:.2e}",
+          NL, xmin, xmax, emax);
+}
 } // namespace detail
 
 template<MEMORY_SPACE MEM, bool Ipts_only, bool return_Ruv>
@@ -203,6 +231,9 @@ auto thc::chol_metric_impl_ibz(int iq, int nIpts, nda::range a_range, nda::range
   bool use_filter = (isdf_filter_alpha > 0.0);
   utils::check(not use_filter or mf->has_wfc_grid(),
       "isdf_filter_alpha > 0 requires a plane-wave mean field with a wavefunction G-grid.");
+  utils::check(isdf_pair_weight == "none",
+      "isdf_pair_weight != none is not implemented in the symmetry-adapted (ibz) selection; "
+      "use a symmetry-free mean field or isdf_pair_weight = \"none\".");
   auto fill_dist = [&](auto& target, bool do_filter) {
     if( not mf->has_wfc_grid() or (mf->fft_grid_dim() == rho_g.mesh() and not do_filter) )
     {
@@ -1092,8 +1123,51 @@ auto thc::chol_metric_impl(int iq, int nIpts, nda::range a_range, nda::range b_r
   }
 
   /*********************************************
-                 Diagonal/Residual 
+                 Diagonal/Residual
   *********************************************/
+
+  // knob 1: separable pair weights. "gap": w_ia = 1/(|e_i-mu| + |e_a-mu| + eta),
+  // Laplace-expanded into NL nonnegative separable terms f_p(n) = exp(-t_p |e_n-mu|).
+  // The weight enters the SELECTION Gram only (diagonal + pivot columns below);
+  // collation values and everything downstream are untouched.
+  bool use_weight = (isdf_pair_weight != "none");
+  nda::array<RealType,1> lap_c, lap_t;
+  nda::array<RealType,3> wtab_a, wtab_b;   // (NL, ns*nk, na/nb)
+  if(use_weight) {
+    if constexpr (MEM != HOST_MEMORY)
+      utils::check(false, "isdf_pair_weight != none: device path not implemented; run the CPU build.");
+    utils::check(C_skai == nullptr,
+        "isdf_pair_weight != none is incompatible with rotated-orbital selection (no band energies).");
+    auto eigval = mf->eigval();
+    auto kmap = mf->kp_to_ibz();
+    double mu = mf->efermi();
+    double dmax = 1e-12;
+    for(long is=0; is<nspins; ++is)
+      for(long ik=0; ik<nkpts; ++ik)
+        for(auto n : a_range)
+          dmax = std::max(dmax, std::abs(eigval(is,kmap(ik),n) - mu));
+    for(long is=0; is<nspins; ++is)
+      for(long ik=0; ik<nkpts; ++ik)
+        for(auto n : b_range)
+          dmax = std::max(dmax, std::abs(eigval(is,kmap(ik),n) - mu));
+    detail::isdf_laplace_quadrature(isdf_laplace_terms, isdf_eta, 2.0*dmax + isdf_eta,
+                                    lap_t, lap_c);
+    // fold e^{-t_p eta} of the regularizer into the coefficients:
+    // x = |e_i-mu| + |e_a-mu| + eta  =>  c_p e^{-t_p eta} e^{-t_p|e_i-mu|} e^{-t_p|e_a-mu|}
+    long NL = isdf_laplace_terms;
+    wtab_a = nda::array<RealType,3>(NL, nspins*nkpts, a_range.size());
+    wtab_b = nda::array<RealType,3>(NL, nspins*nkpts, b_range.size());
+    for(long p=0; p<NL; ++p) {
+      lap_c(p) *= std::exp(-lap_t(p)*isdf_eta);
+      for(long is=0; is<nspins; ++is)
+        for(long ik=0; ik<nkpts; ++ik) {
+          for(auto [ia,n] : itertools::enumerate(a_range))
+            wtab_a(p,is*nkpts+ik,ia) = std::exp(-lap_t(p)*std::abs(eigval(is,kmap(ik),n)-mu));
+          for(auto [ib,n] : itertools::enumerate(b_range))
+            wtab_b(p,is*nkpts+ik,ib) = std::exp(-lap_t(p)*std::abs(eigval(is,kmap(ik),n)-mu));
+        }
+    }
+  }
 
   nda::array<RealType,1> lmax_res_val(block_size,0.0);
   // linear indexes of the locations of the maximum residuals (not in order)
@@ -1103,6 +1177,37 @@ auto thc::chol_metric_impl(int iq, int nIpts, nda::range a_range, nda::range b_r
   // batched dot gemm in gpu!!!
   memory::array<MEM,ComplexType,1> Diag(r_range.size(),0.0);
   if constexpr (MEM==HOST_MEMORY) {
+    if(use_weight) {
+      // C^w_gg = sum_p c_p A^p_sk(g) conj(B^p_sk(g)) per (s,k); A^p(g) = sum_i f_p(i)|u_i(g)|^2
+      long NL = isdf_laplace_terms;
+      nda::array<RealType,1> accA(NL), accB(NL);
+      for( auto is : itertools::range(nspins) ) {
+        for( auto k : itertools::range(nkpts) ) {
+          long ka = k;
+          long kb = mf->qk_to_k2(iq,ka);
+          for( auto p : itertools::range(npol) ) {
+            for( auto r : itertools::range(r_range.size()) ) {
+              accA() = 0.0; accB() = 0.0;
+              for( auto [ia,i] : itertools::enumerate(a_range) ) {
+                (void) i;
+                RealType v = std::norm(Psia(is,ka,ia,p,r));
+                for(long l=0; l<NL; ++l) accA(l) += wtab_a(l,is*nkpts+ka,ia)*v;
+              }
+              if( single_psi ) {
+                for(long l=0; l<NL; ++l) Diag(r) += lap_c(l)*accA(l)*accA(l);
+              } else {
+                for( auto [ib,i] : itertools::enumerate(b_range) ) {
+                  (void) i;
+                  RealType v = std::norm(Psib(is,kb,ib,p,r));
+                  for(long l=0; l<NL; ++l) accB(l) += wtab_b(l,is*nkpts+kb,ib)*v;
+                }
+                for(long l=0; l<NL; ++l) Diag(r) += lap_c(l)*accA(l)*accB(l);
+              }
+            }
+          }
+        }
+      }
+    } else {
     for( auto is : itertools::range(nspins) ) {
       for( auto k : itertools::range(nkpts) ) {
         long ka = k;
@@ -1119,6 +1224,7 @@ auto thc::chol_metric_impl(int iq, int nIpts, nda::range a_range, nda::range b_r
           }
         }
       }
+    }
     }
   } else {
     memory::device_array<ComplexType,4> Lr(nspins,nkpts,npol,r_range.size());
@@ -1304,6 +1410,48 @@ auto thc::chol_metric_impl(int iq, int nIpts, nda::range a_range, nda::range b_r
     Timer.start("ip_chol");
     Tab() = ComplexType(0.0);
     if constexpr (MEM==HOST_MEMORY) {
+      if(use_weight) {
+        // C^w column: per Laplace term, weight the GATHERED factor rows by f_l and
+        // accumulate the per-(s,k) Hadamard product with coefficient c_l.
+        long NL = isdf_laplace_terms;
+        memory::array<MEM,ComplexType,2> WP(std::max(a_range.size(),b_range.size()),block_size);
+        auto L3D = nda::reshape(Lr,shape_t<3>{nspins*nkpts*npol,block_size,r_range.size()});
+        auto R3D = nda::reshape(Rr,shape_t<3>{nspins*nkpts*npol,block_size,r_range.size()});
+        auto L2D = nda::reshape(Lr,shape_t<2>{nspins*nkpts*npol,block_size*r_range.size()});
+        auto T1D = nda::reshape(Tab,shape_t<1>{block_size*r_range.size()});
+        for(long l=0; l<NL; ++l) {
+          for( auto is : itertools::range(nspins) ) {
+            for( auto k : itertools::range(nkpts) ) {
+              long ka = k;
+              long kb = mf->qk_to_k2(iq, ka);
+              for( auto p : itertools::range(npol) ) {
+                auto WPa = WP(nda::range(a_range.size()),all);
+                for( auto [ia,i] : itertools::enumerate(a_range) ) {
+                  (void) i;
+                  WPa(ia,all) = wtab_a(l,is*nkpts+ka,ia)*Paki5d(is,ka,ia,p,all);
+                }
+                nda::blas::gemm(nda::transpose(WPa),Psia(is,ka,all,p,all),Lr(is,ka,p,all,all));
+                if(not single_psi) {
+                  auto WPb = WP(nda::range(b_range.size()),all);
+                  for( auto [ib,i] : itertools::enumerate(b_range) ) {
+                    (void) i;
+                    WPb(ib,all) = wtab_b(l,is*nkpts+kb,ib)*Pbki5d(is,kb,ib,p,all);
+                  }
+                  nda::blas::gemm(nda::transpose(WPb),Psib(is,kb,all,p,all),Rr(is,kb,p,all,all));
+                }
+              }
+            }
+          }
+          if(single_psi) {
+            for( auto isk : itertools::range(nspins*nkpts*npol) )
+              T1D(all) += ComplexType(lap_c(l))*nda::conj(L2D(isk,all))*L2D(isk,all);
+          } else {
+            for( auto ib : itertools::range(block_size) )
+              for( auto r : itertools::range(r_range.size()) )
+                Tab(ib,r) += ComplexType(lap_c(l))*nda::blas::dotc(L3D(all,ib,r),R3D(all,ib,r));
+          }
+        }
+      } else {
       for( auto is : itertools::range(nspins) ) {
         for( auto k : itertools::range(nkpts) ) {
           long ka = k;
@@ -1311,7 +1459,7 @@ auto thc::chol_metric_impl(int iq, int nIpts, nda::range a_range, nda::range b_r
           for( auto p : itertools::range(npol) ) {
             nda::blas::gemm(nda::transpose(Paki5d(is,ka,all,p,all)),
                             Psia(is,ka,all,p,all),Lr(is,ka,p,all,all));
-            if(not single_psi) 
+            if(not single_psi)
               nda::blas::gemm(nda::transpose(Pbki5d(is,kb,all,p,all)),
                               Psib(is,kb,all,p,all),Rr(is,kb,p,all,all));
           }
@@ -1325,9 +1473,10 @@ auto thc::chol_metric_impl(int iq, int nIpts, nda::range a_range, nda::range b_r
           T1D(all) += nda::conj(L2D(isk,all))*L2D(isk,all);
       } else {
         auto R3D = nda::reshape(Rr,shape_t<3>{nspins*nkpts*npol,block_size,r_range.size()});
-        for( auto ib : itertools::range(block_size) ) 
-          for( auto r : itertools::range(r_range.size()) ) 
-            Tab(ib,r) = nda::blas::dotc(L3D(all,ib,r),R3D(all,ib,r)); 
+        for( auto ib : itertools::range(block_size) )
+          for( auto r : itertools::range(r_range.size()) )
+            Tab(ib,r) = nda::blas::dotc(L3D(all,ib,r),R3D(all,ib,r));
+      }
       }
     } else {
       if(single_psi) {

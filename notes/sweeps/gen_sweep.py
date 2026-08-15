@@ -12,10 +12,14 @@ Energies are parsed later by collect.py from run.log (+ <prefix>.mbpt.h5).
 import argparse, os, sys, stat, textwrap
 
 FIXTURES = {
-    # name -> (subdir under fixture base, nbnd, pp_type)
-    "ncpp": ("qe/si_kp222_ncpp", 16, "ncpp"),
-    "uspp": ("qe/si_kp222_uspp", 16, "uspp"),
-    "paw":  ("qe/si_kp222_paw",  16, "paw"),
+    # name -> (subdir under fixture base OR absolute dir, prefix, nbnd used for
+    #          nIpts=c*nbnd, nbnd cap written into [mean_field.qe] (0 = omit))
+    "ncpp": ("qe/si_kp222_ncpp", "pwscf", 16, 0),
+    "uspp": ("qe/si_kp222_uspp", "pwscf", 16, 0),
+    "paw":  ("qe/si_kp222_paw",  "pwscf", 16, 0),
+    # rusty production saves (ONCV NC, 256 bands stored, capped at read time)
+    "prod222": ("/mnt/ceph/users/mmorales/ISDF_metric/runs/mf_saves/nscf_kp222_nbnd256/out", "si", 60, 60),
+    "prod444": ("/mnt/ceph/users/mmorales/ISDF_metric/runs/mf_saves/nscf_kp444_nbnd256/out", "si", 60, 60),
 }
 
 # knob configurations: name -> dict of extra [interaction.thc] keys
@@ -42,10 +46,10 @@ C_REF = 20  # THC self-convergence reference
 TOML = """\
 [mean_field.qe]
 name     = "mf"
-prefix   = "pwscf"
+prefix   = "{prefix}"
 outdir   = "{outdir}"
 filetype = "h5"
-
+{nbnd_line}
 [interaction.thc]
 name       = "eri"
 mean_field = "mf"
@@ -63,15 +67,15 @@ prefix      = "sweep"
 CHOL_TOML = """\
 [mean_field.qe]
 name     = "mf"
-prefix   = "pwscf"
+prefix   = "{prefix}"
 outdir   = "{outdir}"
 filetype = "h5"
-
+{nbnd_line}
 [interaction.cholesky]
 name       = "eri"
 mean_field = "mf"
-storage    = "incore"
-thresh     = 1e-10
+storage    = "outcore"
+tol        = 1e-10
 
 [rpa]
 interaction = "eri"
@@ -116,13 +120,16 @@ def main():
 
     jobs = []
     for f in fixtures:
-        sub, nbnd, _pp = FIXTURES[f]
-        outdir = os.path.join(fbase, sub) + "/"
+        sub, prefix, nbnd, nbnd_cap = FIXTURES[f]
+        outdir = (sub if os.path.isabs(sub) else os.path.join(fbase, sub)) + "/"
+        nbnd_line = (f"nbnd     = {nbnd_cap}\n" if nbnd_cap > 0 else "")
         assert args.np <= nbnd, f"np={args.np} > nbnd={nbnd} (reader rank cap)"
         # references
-        refs = [("thc_ref", TOML.format(outdir=outdir, nipts=C_REF * nbnd, extra=""))]
-        if f == "ncpp":
-            refs.append(("chol_ref", CHOL_TOML.format(outdir=outdir)))
+        refs = [("thc_ref", TOML.format(outdir=outdir, prefix=prefix, nbnd_line=nbnd_line,
+                                        nipts=C_REF * nbnd, extra=""))]
+        if f in ("ncpp", "prod222", "prod444"):
+            refs.append(("chol_ref", CHOL_TOML.format(outdir=outdir, prefix=prefix,
+                                                      nbnd_line=nbnd_line)))
         for name, toml in refs:
             d = os.path.join(args.root, f, name)
             os.makedirs(d, exist_ok=True)
@@ -136,7 +143,8 @@ def main():
                 d = os.path.join(args.root, f, cfg, f"c{c:02d}")
                 os.makedirs(d, exist_ok=True)
                 open(os.path.join(d, "rpa.toml"), "w").write(
-                    TOML.format(outdir=outdir, nipts=c * nbnd, extra=extra))
+                    TOML.format(outdir=outdir, prefix=prefix, nbnd_line=nbnd_line,
+                                nipts=c * nbnd, extra=extra))
                 jobs.append(d)
 
     runner = os.path.join(args.root, "run_all.sh")
