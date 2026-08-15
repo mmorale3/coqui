@@ -22,7 +22,7 @@ Develop and unit-test LOCALLY (Mac); rusty ONLY for production curves (M5).
 
 | Milestone | State | Commit |
 |---|---|---|
-| M0 scaffolding + instrumentation | pending | |
+| M0 scaffolding + instrumentation | DONE (incl. pre-existing rpa.cpp exchange-block segfault fix) | see git log |
 | M1 knob 2: filtered-orbital surrogate | pending | |
 | M2 knob 1: separable pair weights | pending | |
 | M3 knob 3: Coulomb-metric re-ranking (M3b: ibz mirror) | pending | |

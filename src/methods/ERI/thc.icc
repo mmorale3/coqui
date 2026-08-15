@@ -608,6 +608,7 @@ auto thc::chol_metric_impl_ibz(int iq, int nIpts, nda::range a_range, nda::range
           std::string("Error: Cholesky algorithm failed in thc::chol_metric_impl_ibz. \n") +
           std::string("       Found invalid residual:{}"),curr_max);
 
+    old_max = curr_max;
     // stopping condition when thresh is set
     if( thresh > 0.0 and thresh > curr_max) {
       if (nIpts > 0 and nchol < nIpts) {
@@ -615,9 +616,13 @@ auto thc::chol_metric_impl_ibz(int iq, int nIpts, nda::range a_range, nda::range
       }
       break;
     }
-    old_max = find_max();
-  }  
+  }
   Timer.stop("IpIter");
+  // selection summary. old_max is the residual tracked at loop exit; when the loop stops on
+  // nIpts it corresponds to the residual before the downdate of the last accepted block.
+  app_log(2, "  ISDF point selection (chol_metric_impl_ibz): nchol = {}, final max |D| = {}, c_mu = nchol/sqrt(na*nb) = {} (na = {}, nb = {})",
+          nchol, old_max, double(nchol)/std::sqrt(double(a_range.size()*b_range.size())),
+          a_range.size(), b_range.size());
 
   if constexpr (Ipts_only) {
     Timer.stop("IntPts");
@@ -1083,10 +1088,15 @@ auto thc::chol_metric_impl(int iq, int nIpts, nda::range a_range, nda::range b_r
     utils::check( old_max > 1e-14, " Error in thc::chol_metric_impl: Reached truncation error of 1e-14 without convergence. This likely means that nIpts is too large. Current number of cholesky vectors = {}. Set nIpts to a value equal or larger than this. ",nchol);   
 
     // stopping condition when thresh is set
-    if( thresh > 0.0 and thresh > old_max) break;
+    if( thresh > 0.0 and thresh > old_max) {
+      if (nIpts > 0 and nchol < nIpts) {
+        app_log(1, "[WARNING] thresh={} reached after {} interpolating points, before reaching requested nIpts={}.", thresh, nchol, nIpts);
+      }
+      break;
+    }
 
-    utils::check( std::isfinite(old_max), 
-          std::string("Error: Cholesky algorithm failed in thc::chol_metric_impl. \n") + 
+    utils::check( std::isfinite(old_max),
+          std::string("Error: Cholesky algorithm failed in thc::chol_metric_impl. \n") +
           std::string("       Found invalid residual:{}"),old_max); 
 
     auto Paki = memory::array_view<MEM,ComplexType,2>({nspins*nkpts*a_range.size()*npol,block_size},
@@ -1331,11 +1341,21 @@ auto thc::chol_metric_impl(int iq, int nIpts, nda::range a_range, nda::range b_r
           std::string("Error: Cholesky algorithm failed in thc::chol_metric_impl. \n") +
           std::string("       Found invalid residual:{}"),curr_max);
 
-    // stopping condition when thresh is set
-    if( thresh > 0.0 and thresh > curr_max) break;
     old_max = curr_max;
+    // stopping condition when thresh is set
+    if( thresh > 0.0 and thresh > curr_max) {
+      if (nIpts > 0 and nchol < nIpts) {
+        app_log(1, "[WARNING] thresh={} reached after {} interpolating points, before reaching requested nIpts={}.", thresh, nchol, nIpts);
+      }
+      break;
+    }
   }
   Timer.stop("IpIter");
+  // selection summary. old_max is the residual tracked at loop exit; when the loop stops on
+  // nIpts it corresponds to the residual before the downdate of the last accepted block.
+  app_log(2, "  ISDF point selection (chol_metric_impl): nchol = {}, final max |D| = {}, c_mu = nchol/sqrt(na*nb) = {} (na = {}, nb = {})",
+          nchol, old_max, double(nchol)/std::sqrt(double(a_range.size()*b_range.size())),
+          a_range.size(), b_range.size());
 
   if constexpr (Ipts_only) {
     Timer.stop("IntPts");

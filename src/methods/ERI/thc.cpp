@@ -122,12 +122,34 @@ thc::thc(mf::MF *mf_,
   distr_tol( io::get_value_with_default<double>(pt,"distr_tol",0.2) ),
   memory_frac( io::get_value_with_default<double>(pt,"memory_frac",0.75) ),
   use_least_squares( io::get_value_with_default<bool>(pt,"use_least_squares",false) ),
+  isdf_filter_alpha( io::get_value_with_default<double>(pt,"isdf_filter_alpha",0.0) ),
+  isdf_pair_weight( io::get_value_with_default<std::string>(pt,"isdf_pair_weight","none") ),
+  isdf_laplace_terms( io::get_value_with_default<int>(pt,"isdf_laplace_terms",4) ),
+  isdf_eta( io::get_value_with_default<double>(pt,"isdf_eta",0.01) ),
+  isdf_metric( io::get_value_with_default<std::string>(pt,"isdf_metric","l2") ),
+  isdf_pool_factor( io::get_value_with_default<double>(pt,"isdf_pool_factor",2.0) ),
+  isdf_metric_qavg( io::get_value_with_default<bool>(pt,"isdf_metric_qavg",true) ),
+  isdf_metric_gcut( io::get_value_with_default<double>(pt,"isdf_metric_gcut",0.0) ),
+  isdf_metric_omega( io::get_value_with_default<double>(pt,"isdf_metric_omega",0.0) ),
   howmany_fft(-1)
 {
   utils::check(mf != nullptr, "thc::Null pointer.");
   utils::check(mf->has_orbital_set(), "Error in thc: Invalid mf type. ");
   utils::check(default_block_size>0, "Error in thc: Invalid matrix_block_size:{}",default_block_size);
   utils::check(default_cholesky_block_size>0, "Error in thc: Invalid chol_block_size:{}",default_cholesky_block_size);
+
+  utils::check(isdf_metric=="l2" or isdf_metric=="bare" or isdf_metric=="attenuated",
+               "Error in thc: Invalid isdf_metric:{}. Options: l2, bare, attenuated.",isdf_metric);
+  utils::check(isdf_pair_weight=="none" or isdf_pair_weight=="gap",
+               "Error in thc: Invalid isdf_pair_weight:{}. Options: none, gap.",isdf_pair_weight);
+  utils::check(isdf_pool_factor >= 1.0,
+               "Error in thc: Invalid isdf_pool_factor:{}. Must be >= 1.0.",isdf_pool_factor);
+  utils::check(isdf_filter_alpha >= 0.0,
+               "Error in thc: Invalid isdf_filter_alpha:{}. Must be >= 0.0.",isdf_filter_alpha);
+  utils::check(isdf_laplace_terms >= 1 and isdf_laplace_terms <= 16,
+               "Error in thc: Invalid isdf_laplace_terms:{}. Must be in [1,16].",isdf_laplace_terms);
+  utils::check(isdf_eta > 0.0,
+               "Error in thc: Invalid isdf_eta:{}. Must be > 0.0.",isdf_eta);
 
   memory_frac = std::min( 0.90, std::max( 0.25, memory_frac ) );
 
@@ -155,6 +177,11 @@ void thc::print_metadata()
   app_log(1,"  Threshold                    = {}",thresh);
   app_log(2,"  Distribution tolerance       = {}",distr_tol);
   app_log(2,"  Fraction of memory used for estimation = {}",memory_frac);
+  app_log(2,"  ISDF point-selection options:");
+  app_log(2,"    isdf_filter_alpha = {} | isdf_pair_weight = {} | isdf_laplace_terms = {} | isdf_eta = {}",
+          isdf_filter_alpha, isdf_pair_weight, isdf_laplace_terms, isdf_eta);
+  app_log(2,"    isdf_metric = {} | isdf_pool_factor = {} | isdf_metric_qavg = {} | isdf_metric_gcut = {} | isdf_metric_omega = {}",
+          isdf_metric, isdf_pool_factor, isdf_metric_qavg, isdf_metric_gcut, isdf_metric_omega);
   utils::memory_report(2);
   app_log(1,"");
 }
