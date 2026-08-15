@@ -31,7 +31,11 @@ def parse_run(d):
     row = {"status": "ok"}
     for k, pat in PATTERNS.items():
         m = pat.findall(txt)
-        row[k] = float(m[-1]) if m else float("nan")
+        try:
+            row[k] = float(m[-1]) if m else float("nan")
+        except ValueError:
+            row[k] = float("nan")
+            row["status"] = "PARSE_ERROR"
     m = SEL.findall(txt)
     if m:
         row["sel_impl"], row["nchol"], row["resid"], row["c_mu"] = \
