@@ -23,8 +23,8 @@ Develop and unit-test LOCALLY (Mac); rusty ONLY for production curves (M5).
 | Milestone | State | Commit |
 |---|---|---|
 | M0 scaffolding + instrumentation | DONE (incl. pre-existing rpa.cpp exchange-block segfault fix) | see git log |
-| M1 knob 2: filtered-orbital surrogate | pending | |
-| M2 knob 1: separable pair weights | pending | |
+| M1 knob 2: filtered-orbital surrogate | DONE (X-decontamination via unfiltered twins) | 2af4ba3 |
+| M2 knob 1: separable pair weights | DONE (gap weight; ibz guarded; + e1-ledger pyscf gate) | see git log |
 | M3 knob 3: Coulomb-metric re-ranking (M3b: ibz mirror) | pending | |
 | M4 sweep harness + local Si curves | pending | |
 | M5 rusty production runs (Si 444) | pending | |

@@ -110,6 +110,45 @@ inline void isdf_laplace_quadrature(int NL, double xmin, double xmax,
   app_log(2, "  isdf pair-weight Laplace expansion: NL = {}, x range = [{:.3e},{:.3e}], max rel err = {:.2e}",
           NL, xmin, xmax, emax);
 }
+
+// knob 3: serial full pivoted Cholesky on a COPY of K (n x n, PSD, replicated);
+// returns the first n_keep pivot indices (into K's original ordering) in
+// elimination order. Runs identically on every rank -> deterministic.
+inline nda::array<long,1> pivoted_chol_order(nda::array<ComplexType,2> K, long n_keep)
+{
+  long n = K.extent(0);
+  utils::check(K.extent(1) == n and n_keep > 0 and n_keep <= n,
+               "pivoted_chol_order: bad shapes n={} keep={}", n, n_keep);
+  nda::array<long,1> perm(n), sel(n_keep);
+  for(long i=0;i<n;++i) perm(i)=i;
+  nda::array<RealType,1> d(n);
+  for(long i=0;i<n;++i) d(i) = std::real(K(i,i));
+  double d0 = *std::max_element(d.begin(), d.end());
+  for(long m=0;m<n_keep;++m) {
+    long imax=m; RealType dmax = -1.0;
+    for(long i=m;i<n;++i) if(d(i) > dmax) { dmax = d(i); imax = i; }
+    utils::check(dmax > 1e-14*std::max(d0,1.0),
+        "pivoted_chol_order: pool rank exhausted at {} < requested {} (residual {}). "
+        "Reduce isdf_pool_factor or nIpts.", m, n_keep, dmax);
+    if(imax != m) {
+      for(long j=0;j<n;++j) std::swap(K(m,j), K(imax,j));
+      for(long i=0;i<n;++i) std::swap(K(i,m), K(i,imax));
+      std::swap(d(m), d(imax));
+      std::swap(perm(m), perm(imax));
+    }
+    RealType lmm = std::sqrt(dmax);
+    K(m,m) = lmm;
+    for(long i=m+1;i<n;++i) K(i,m) = K(i,m)/lmm;
+    // full trailing update (both triangles): pivot swaps exchange full rows and
+    // columns, so the upper triangle must be kept current as well
+    for(long i=m+1;i<n;++i) {
+      for(long j=m+1;j<n;++j) K(i,j) -= K(i,m)*std::conj(K(j,m));
+      d(i) = std::real(K(i,i));
+    }
+    sel(m) = perm(m);
+  }
+  return sel;
+}
 } // namespace detail
 
 template<MEMORY_SPACE MEM, bool Ipts_only, bool return_Ruv>
@@ -234,6 +273,9 @@ auto thc::chol_metric_impl_ibz(int iq, int nIpts, nda::range a_range, nda::range
   utils::check(isdf_pair_weight == "none",
       "isdf_pair_weight != none is not implemented in the symmetry-adapted (ibz) selection; "
       "use a symmetry-free mean field or isdf_pair_weight = \"none\".");
+  utils::check(isdf_metric == "l2",
+      "isdf_metric != l2 is not yet implemented in the symmetry-adapted (ibz) selection; "
+      "use a symmetry-free mean field or isdf_metric = \"l2\".");
   auto fill_dist = [&](auto& target, bool do_filter) {
     if( not mf->has_wfc_grid() or (mf->fft_grid_dim() == rho_g.mesh() and not do_filter) )
     {
@@ -909,8 +951,17 @@ auto thc::chol_metric_impl(int iq, int nIpts, nda::range a_range, nda::range b_r
                                    b_range.size() == mf->nbnd()), 
                "Error in chol_metric_impl: Rotation and range simultaneously used. ");
 
+  // knob 3: Coulomb-metric re-ranking. Pass 1 runs to an inflated pool size
+  // (nIpts is re-targeted here so every stop/clamp below uses the pool size);
+  // pass 2 reduces the pool back to nIpts_target after the loop.
+  utils::check(isdf_metric == "l2" or nIpts > 0,
+               "Error in thc::chol_metric_impl: isdf_metric != l2 requires an explicit nIpts (>0).");
+  const int nIpts_target = nIpts;
+  const bool rerank = (isdf_metric != "l2" and nIpts > 0);
+  if(rerank) nIpts = int(std::ceil(isdf_pool_factor * nIpts));
+
   // storage space, to be adjusted synamically later on
-  int nmax = (nIpts > 0 ? nIpts : 6*int(sqrt(a_range.size()*b_range.size()))); 
+  int nmax = (nIpts > 0 ? nIpts : 6*int(sqrt(a_range.size()*b_range.size())));
   long nspins = mf->nspin_in_basis();
   long npol = mf->npol_in_basis();
   long nkpts = mf->nkpts();
@@ -1662,6 +1713,114 @@ auto thc::chol_metric_impl(int iq, int nIpts, nda::range a_range, nda::range b_r
   app_log(2, "  ISDF point selection (chol_metric_impl): nchol = {}, final max |D| = {}, c_mu = nchol/sqrt(na*nb) = {} (na = {}, nb = {})",
           nchol, old_max, double(nchol)/std::sqrt(double(a_range.size()*b_range.size())),
           a_range.size(), b_range.size());
+
+  // knob 3, pass 2: exact Coulomb-metric re-ranking of the pool.
+  // K_PP = ell (L^H vbar L) ell^H with ell = L[P,:], L(g,v) = conj(R(v,g));
+  // exact because the Schur complement vanishes on eliminated pivots.
+  if(rerank and nchol > nIpts_target) {
+    Timer.start("IpRerank");
+    const long N1 = nchol;
+    const long nnr_glob = distPsia.global_shape()[1];
+    // (1) ell: owner ranks fill the columns of R at their local pivot points
+    nda::array<ComplexType,2> ell(N1, N1); ell() = ComplexType(0.0);
+    for(long j=0;j<N1;++j) {
+      long g = rn(j);
+      if(g >= r_range.first() and g < r_range.first()+long(r_range.size())) {
+        long lr = g - r_range.first();
+        for(long v=0;v<N1;++v) ell(j,v) = std::conj(R(v,lr));
+      }
+    }
+    mpi->comm.all_reduce_in_place_n(ell.data(), N1*N1, std::plus<>{});
+    // (2) rows of the factor to full grid, conjugate -> columns of L, batched FFT
+    auto dR = memory::darray_t<local_CArray_t,mpi3::communicator>(
+        std::addressof(mpi->comm), {1,mpi->comm.size()}, {N1, nnr_glob},
+        {N1, long(r_range.size())}, {0, r_range.first()}, {1,1});
+    dR.local() = R(nda::range(N1), nda::range(long(r_range.size())));
+    math::nda::redistribute_in_place(dR, {mpi->comm.size(),1}, {1,1});
+    auto rows = dR.local();
+    if(rows.extent(0) > 0) {
+      nda::tensor::scale(ComplexType(1.0), rows, nda::tensor::op::CONJ);
+      auto rows4 = nda::reshape(rows, std::array<long,4>{rows.extent(0),
+                         rho_g.mesh(0), rho_g.mesh(1), rho_g.mesh(2)});
+      // FFT_ESTIMATE: MEASURE planning would overwrite the (already loaded) data
+      math::nda::fft<true> Ff(rows4, math::fft::FFT_ESTIMATE);
+      Ff.forward(rows4);
+    }
+    // (3) vbar on the truncated G list (overall scale irrelevant to pivoting)
+    const long ngm = rho_g.size();
+    nda::array<RealType,1> vbar(ngm); vbar() = 0.0;
+    {
+      memory::unified_array<ComplexType,1> vq_buf(ngm);
+      nda::array<RealType,1> v_zero3 = {0.0,0.0,0.0};
+      auto Qpts_all = mf->Qpts();
+      long nq_avg = (isdf_metric_qavg ? Qpts_all.extent(0) : 1);
+      for(long iq_=0; iq_<nq_avg; ++iq_) {
+        vG.evaluate(vq_buf, mf->lattv(), rho_g.g_vectors(), v_zero3, Qpts_all(iq_,all));
+        for(long ig=0; ig<ngm; ++ig) vbar(ig) += std::real(vq_buf(ig));
+      }
+      auto gv = rho_g.g_vectors();
+      if(isdf_metric == "attenuated") {
+        double om = (isdf_metric_omega > 0.0 ? isdf_metric_omega
+                                             : 2.0*M_PI/std::cbrt(volume()));
+        for(long ig=0; ig<ngm; ++ig) {
+          double g2 = gv(ig,0)*gv(ig,0)+gv(ig,1)*gv(ig,1)+gv(ig,2)*gv(ig,2);
+          vbar(ig) *= std::exp(-g2/(4.0*om*om));
+        }
+      }
+      if(isdf_metric_gcut > 0.0)
+        for(long ig=0; ig<ngm; ++ig) {
+          double g2 = gv(ig,0)*gv(ig,0)+gv(ig,1)*gv(ig,1)+gv(ig,2)*gv(ig,2);
+          if(0.5*g2 > isdf_metric_gcut) vbar(ig) = 0.0;
+        }
+    }
+    // (4) V(i,ig) = sqrt(vbar) * hatL rows; G-distribute; M = conj(V V^H)
+    auto g2fft = rho_g.gv_to_fft();
+    auto dV = memory::darray_t<local_CArray_t,mpi3::communicator>(
+        std::addressof(mpi->comm), {mpi->comm.size(),1}, {N1, ngm},
+        {rows.extent(0), ngm}, {dR.origin()[0], 0}, {1,1});
+    {
+      auto Vloc = dV.local();
+      for(long i=0;i<rows.extent(0);++i)
+        for(long ig=0; ig<ngm; ++ig)
+          Vloc(i,ig) = std::sqrt(std::max<RealType>(vbar(ig),RealType(0.0))) * rows(i, g2fft(ig));
+    }
+    math::nda::redistribute_in_place(dV, {1,mpi->comm.size()}, {1,1});
+    nda::array<ComplexType,2> W(N1,N1); W() = ComplexType(0.0);
+    {
+      auto Vg = dV.local();
+      if(Vg.extent(1) > 0)
+        nda::blas::gemm(Vg, nda::dagger(Vg), W);
+    }
+    mpi->comm.all_reduce_in_place_n(W.data(), N1*N1, std::plus<>{});
+    for(long i=0;i<N1;++i)
+      for(long j=0;j<N1;++j) W(i,j) = std::conj(W(i,j));
+    // (5) K = ell M ell^H and deterministic dense pivoted Cholesky
+    nda::array<ComplexType,2> T1(N1,N1), K(N1,N1);
+    nda::blas::gemm(ell, W, T1);
+    nda::blas::gemm(T1, nda::dagger(ell), K);
+    auto order = detail::pivoted_chol_order(K, nIpts_target);
+    // (6) subset/reorder the pool outputs consistently
+    nda::array<long,1> rn_new(nmax); rn_new() = 0;
+    std::vector<memory::array<MEM,ComplexType,3>> Pa_new;
+    std::vector<memory::array<MEM,ComplexType,3>> Pb_new;
+    Pa_new.reserve(nIpts_target);
+    if(not single_psi) Pb_new.reserve(nIpts_target);
+    for(long i=0;i<nIpts_target;++i) {
+      rn_new(i) = rn(order(i));
+      Pa_new.push_back(std::move(Pskau[order(i)]));
+      if(not single_psi) Pb_new.push_back(std::move(Pskbu[order(i)]));
+    }
+    rn = std::move(rn_new);
+    Pskau = std::move(Pa_new);
+    if(not single_psi) Pskbu = std::move(Pb_new);
+    nchol = nIpts_target;
+    Timer.stop("IpRerank");
+    app_log(2, "  ISDF Coulomb re-ranking: pool {} -> {} points (metric = {}, qavg = {}, gcut = {}, omega = {})",
+            N1, nchol, isdf_metric, isdf_metric_qavg, isdf_metric_gcut, isdf_metric_omega);
+  } else if(rerank) {
+    app_log(1, "[WARNING] ISDF Coulomb re-ranking skipped: pool ({}) <= target nIpts ({}).",
+            nchol, nIpts_target);
+  }
 
   if constexpr (Ipts_only) {
     Timer.stop("IntPts");
