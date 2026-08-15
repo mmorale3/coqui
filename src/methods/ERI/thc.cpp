@@ -126,6 +126,7 @@ thc::thc(mf::MF *mf_,
   isdf_pair_weight( io::get_value_with_default<std::string>(pt,"isdf_pair_weight","none") ),
   isdf_laplace_terms( io::get_value_with_default<int>(pt,"isdf_laplace_terms",4) ),
   isdf_eta( io::get_value_with_default<double>(pt,"isdf_eta",0.01) ),
+  isdf_weight_params( io::get_array_with_default<double>(pt,"isdf_weight_params",std::vector<double>{}) ),
   isdf_metric( io::get_value_with_default<std::string>(pt,"isdf_metric","l2") ),
   isdf_pool_factor( io::get_value_with_default<double>(pt,"isdf_pool_factor",2.0) ),
   isdf_metric_qavg( io::get_value_with_default<bool>(pt,"isdf_metric_qavg",true) ),
@@ -140,8 +141,19 @@ thc::thc(mf::MF *mf_,
 
   utils::check(isdf_metric=="l2" or isdf_metric=="bare" or isdf_metric=="attenuated",
                "Error in thc: Invalid isdf_metric:{}. Options: l2, bare, attenuated.",isdf_metric);
-  utils::check(isdf_pair_weight=="none" or isdf_pair_weight=="gap",
-               "Error in thc: Invalid isdf_pair_weight:{}. Options: none, gap.",isdf_pair_weight);
+  utils::check(isdf_pair_weight=="none" or isdf_pair_weight=="gap" or
+               isdf_pair_weight=="exp" or isdf_pair_weight=="sigmoid" or isdf_pair_weight=="power",
+               "Error in thc: Invalid isdf_pair_weight:{}. Options: none, gap, exp, sigmoid, power.",
+               isdf_pair_weight);
+  if(isdf_pair_weight=="exp")
+    utils::check(isdf_weight_params.size()>=1 and isdf_weight_params[0]>0.0,
+                 "Error in thc: isdf_pair_weight=exp needs isdf_weight_params=[t>0].");
+  if(isdf_pair_weight=="sigmoid")
+    utils::check(isdf_weight_params.size()>=2 and isdf_weight_params[1]>0.0,
+                 "Error in thc: isdf_pair_weight=sigmoid needs isdf_weight_params=[w, t>0].");
+  if(isdf_pair_weight=="power")
+    utils::check(isdf_weight_params.size()>=1 and isdf_weight_params[0]>0.0,
+                 "Error in thc: isdf_pair_weight=power needs isdf_weight_params=[p>0].");
   utils::check(isdf_pool_factor >= 1.0,
                "Error in thc: Invalid isdf_pool_factor:{}. Must be >= 1.0.",isdf_pool_factor);
   utils::check(isdf_filter_alpha >= 0.0,
@@ -178,8 +190,10 @@ void thc::print_metadata()
   app_log(2,"  Distribution tolerance       = {}",distr_tol);
   app_log(2,"  Fraction of memory used for estimation = {}",memory_frac);
   app_log(2,"  ISDF point-selection options:");
-  app_log(2,"    isdf_filter_alpha = {} | isdf_pair_weight = {} | isdf_laplace_terms = {} | isdf_eta = {}",
-          isdf_filter_alpha, isdf_pair_weight, isdf_laplace_terms, isdf_eta);
+  std::string wp_str;
+  for(auto v : isdf_weight_params) wp_str += (wp_str.empty() ? "" : ", ") + std::to_string(v);
+  app_log(2,"    isdf_filter_alpha = {} | isdf_pair_weight = {} | isdf_laplace_terms = {} | isdf_eta = {} | isdf_weight_params = [{}]",
+          isdf_filter_alpha, isdf_pair_weight, isdf_laplace_terms, isdf_eta, wp_str);
   app_log(2,"    isdf_metric = {} | isdf_pool_factor = {} | isdf_metric_qavg = {} | isdf_metric_gcut = {} | isdf_metric_omega = {}",
           isdf_metric, isdf_pool_factor, isdf_metric_qavg, isdf_metric_gcut, isdf_metric_omega);
   utils::memory_report(2);

@@ -185,11 +185,38 @@ algorithm.
 \subsection{Pair-space weighting}
 \label{sec:knob1}
 
-\todo{Condensed from the design document: separable weights preserve the
-Hadamard structure at $N_L\times$ cost; positive semidefiniteness follows
-from the Schur product theorem for $f_p, g_p, c_p \ge 0$; energy
-denominators admit a Laplace expansion; weighting is applied to selection
-only; the rotation-invariance trade-off is discussed.}
+The pair weight $W$ of Eq.~\eqref{eq:functional} survives the elimination of
+$\zeta$ and modifies the selection functional directly. A general weight
+$w_{ia}$ would destroy the Hadamard factorization that makes the selection
+affordable, but any weight expressible as a short sum of separable
+nonnegative terms,
+\begin{equation}
+  w_{ia} \;=\; \sum_{p=1}^{N_L} c_p\, f_p(\varepsilon_i)\, g_p(\varepsilon_a),
+  \qquad c_p, f_p, g_p \ge 0,
+  \label{eq:sepweight}
+\end{equation}
+preserves it at $N_L$ times the cost: each term contributes a Gram matrix of
+scaled orbitals, and the weighted selection matrix
+$C^{w} = \sum_p c_p\, A^{(p)} \odot B^{(p)*}$ remains positive semidefinite
+by the Schur product theorem, so the pivoted factorization retains its
+numerical robustness. In practice the weights are functions of the
+single-particle energies. Energy-denominator weights,
+$w_{ia} = (|\varepsilon_i - \mu| + |\varepsilon_a - \mu| + \eta)^{-1}$,
+which reduce to the familiar $1/(\varepsilon_a-\varepsilon_i+\eta)$ for
+occupied--virtual pairs, admit a Laplace expansion into the form of
+Eq.~\eqref{eq:sepweight} with all coefficients nonnegative and no numerical
+overflow; quadrature orders $N_L = 4$--$6$ suffice, since the pivot ordering
+is a discrete choice far more forgiving than a continuous fit. Beyond fixed
+functional forms, Eq.~\eqref{eq:sepweight} defines a design space: a rank-1
+weight ($N_L = 1$) costs no more than the unweighted selection, and the
+parameters of a simple family $f(\varepsilon)$ can be optimized directly
+against the error in the target observables. The weight is applied to the
+point selection only; the interpolation vectors are always obtained from
+Eq.~\eqref{eq:zeta} with $W = \mathbb{1}$, so a single point set can serve
+several consumers. Unweighted selection depends only on the span of the
+orbital set and is therefore invariant under unitary rotations within it;
+energy-dependent weights forfeit this invariance, and the point set should
+then be selected once and reused.
 
 \subsection{Filtered-orbital surrogate}
 \label{sec:knob2}
