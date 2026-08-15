@@ -1,0 +1,358 @@
+
+ ---------------------------------
+     ____ ___   ___  _   _ ___ 
+    / ___/ _ \ / _ \| | | |_ _|
+   | |  | | | | | | | | | || | 
+   | |__| |_| | |_| | |_| || | 
+    \____\___/ \__\_\\___/|___|
+  --------------------------------
+ |  Correlated Quantum Interface  |
+  --------------------------------
+
+Input Parameters
+----------------
+
+[mean_field.qe]
+filetype = 'h5'
+name = 'mf'
+outdir = '/Users/mmorales/Projects/ISDF_metric/coqui/tests/unit_test_files/qe/si_kp222_ncpp/'
+prefix = 'pwscf'
+
+[interaction.thc]
+isdf_eta = 0.050000000000000003
+isdf_laplace_terms = 4
+isdf_pair_weight = 'gap'
+mean_field = 'mf'
+nIpts = 128
+name = 'eri'
+storage = 'incore'
+
+[rpa]
+beta = 1000
+iaft_prec = 'medium'
+interaction = 'eri'
+outdir = './'
+prefix = 'si_smoke'
+
+-- End of Input Parameters --
+
+  Brillouin zone symmetry info
+  ----------------------------
+  Q-points in the irreducible zone = 8
+  Symmetries applied to Q-points   = 1
+  Time-reversal k-point pairs      = 0
+
+  Quantum ESPRESSO reader
+  -----------------------
+  Number of spins                = 1
+  Number of polarizations        = 1
+  Number of bands                = 16
+  Monkhorst-Pack mesh            = (2,2,2)
+  K-points                       = 8 total, 8 in the IBZ
+  Number of electrons            = 8
+  Smooth FFT mesh (dffts)        = (36,36,36)
+  Dense  FFT mesh (dfftp,aug)    = (36,36,36)
+  Electron density energy cutoff = 100.000 a.u.
+  Wavefunction energy cutoff     = 28.592 a.u. | wfc grid = (17,17,17), Number of PWs = 1989
+
+  Electron-electron interaction kernel
+  ------------------------------------
+  type          = coulomb
+  ndim          = 3
+  cutoff        = 1e-08
+  screen_type   = none
+
+
+╔═╗╔═╗╔═╗ ╦ ╦╦  ╔╦╗┬ ┬┌─┐╔═╗┌─┐┬ ┬┬  ┌─┐┌┬┐┌┐ 
+║  ║ ║║═╬╗║ ║║   ║ ├─┤│  ║  │ ││ ││  │ ││││├┴┐
+╚═╝╚═╝╚═╝╚╚═╝╩   ╩ ┴ ┴└─┘╚═╝└─┘└─┘┴─┘└─┘┴ ┴└─┘
+
+  Algorithm                       = ISDF
+  THC integrals access            = incore
+  Found precomputed THC integrals = false
+  --> CoQuí will compute THC integrals.
+
+  ERI::thc Computation Details
+  ----------------------------
+  Energy cutoff                = 40.02864700274922 a.u. | FFT mesh = (21,21,21), Number of PWs = 3287
+  Default Slate block size     = 1024
+  Default cholesky block size  = 8
+  Threshold                    = 1e-05
+  Distribution tolerance       = 0.2
+  Fraction of memory used for estimation = 0.75
+  ISDF point-selection options:
+    isdf_filter_alpha = 0 | isdf_pair_weight = gap | isdf_laplace_terms = 4 | isdf_eta = 0.05
+    isdf_metric = l2 | isdf_pool_factor = 2 | isdf_metric_qavg = true | isdf_metric_gcut = 0 | isdf_metric_omega = 0
+  --> CPU Memory Available: 48901 
+ 
+
+*******************************
+ ERI::thc::interpolating_points 
+*******************************
+  -memory space: host
+  memory report: thc::interpolating_points
+  --> CPU Memory Available: 48901 
+ 
+  isdf pair-weight Laplace expansion: NL = 4, x range = [5.000e-02,2.222e+00], max rel err = 1.74e-01
+  ISDF point selection (chol_metric_impl): nchol = 128, final max |D| = 0.09523104101797508, c_mu = nchol/sqrt(na*nb) = 8 (na = 16, nb = 16)
+*******************************
+ ERI::thc::evaluate (ISDF)
+*******************************
+  -memory space: host
+  memory report: thc::evaluate
+  --> CPU Memory Available: 48901 
+ 
+*********************************************************************
+  ISDF - fitting interpolating vectors to pair densities 
+*********************************************************************
+ - Number of interpolating points: 128
+ - Number of q-points in IBZ: 8
+ - Processor grid: (2,1,1)
+ - block sizes: (1,128,1024)
+ - Calculating Zqur with fft algorithm 
+ - Estimated minimum memory requirement for this step, 
+     per (current type of) node: 0.061270713806152344 GB 
+ - # of blocks used to process Ipts:1
+ - # of Ipts/iteration/node:128
+
+
+  THC timers for the Cholesky algorithm
+  -------------------------------------
+  Total:                   0.41034875000000004
+    IO (save):             0
+    IO (orbs):             0
+    allocations:           0.031246124
+    communications:        0.0008172910000000002
+    fft:                   0.048211333
+      - fft (planning):    0.002860708
+    int. points:           0.146153875
+      -orbs IO+FFT:        0.013328333
+      -serial:             7.429100000000002e-05
+      -iters:              0.132328166
+        -setup_comm:       2.1499000000000002e-05
+        -comm:             0.0008092070000000002
+        -chol:             0.12981941399999997
+        -residual:         0.0010767090000000001
+    int. vectors:          0.189348459
+      - gemm:              0.003999167
+      - shmX:              0.000219417
+      - Tur:               0.01134025
+      - Zur:               0.103353375
+      - extra:             0.006245334999999999
+      - ls solve:          0.050456166
+    coulomb matrix:        0.036457541
+  --> CPU Memory Available: 48617 
+ 
+
+
+  THC-READER::BUILD()
+  -------------------
+    Build total:                     0.411 sec
+      - compute thc-eri:             0.410 sec
+      - gather collocation matrices: 0.001 sec
+      - paw augmentation total:      0.000 sec
+ 
+
+  Summary of THC Coulomb Integrals
+  --------------------------------
+  Number of interpolating points = 128
+  X orbital index range          = [0,16)
+  Y orbital index range          = [0,16)
+
+####### End of THC initialization routines #######
+
+************************************************
+ Initializing External Potential: 
+************************************************
+  input type: coqui::h5
+  type: NCPP
+  # of species: 1
+  # of atoms: 2
+  max # of projectors per atom: 8
+  # of projectors: 16
+  # of polarizations: 1
+  spin orbit: false
+
+ Memory usage: 
+   Overlaps:                      3.0517578125e-05 MB
+   Dion:                          9.5367431640625e-07 MB
+************************************************
+
+  Electron-electron interaction kernel
+  ------------------------------------
+  type          = coulomb
+  ndim          = 3
+  cutoff        = 1e-08
+  screen_type   = none
+
+###### RPA energy routines start ######
+
+  Electron-electron interaction kernel
+  ------------------------------------
+  type          = coulomb
+  ndim          = 3
+  cutoff        = 1e-08
+  screen_type   = none
+
+* Solving Green's function:
+Initial chemical potential (mu) = 0, nelec - target = -4.25000012305148
+Chemical potential bounds found (mu_left, mu_right) = (0.25193330852853263, 0.25193334473224244) a.u.
+Chemical potential found (mu) = 0.25193332663038753 a.u.
+Number of electrons per unit cell = 7.999999999999809
+Dyson equation for Green's function:
+  - processor grid for G/Self-energy: (w, k, i, j) = (2, 1, 1, 1)
+  - block size: (w, k, i, j) = (1, 1, 16, 16)
+
+  DYSON timers
+  ------------
+    Dyson eqn:                      0.003 sec
+      - Sigma(t)->Sigma(w):         0.001 sec
+      - Dyson loop:                 0.001 sec
+      - Redistribute                0.000 sec
+      - Gather:                     0.000 sec
+
+
+╔═╗╔═╗╔═╗ ╦ ╦╦  ┌┬┐┬ ┬┌─┐ ┬ ┬┌─┐
+║  ║ ║║═╬╗║ ║║   │ ├─┤│───├─┤├┤ 
+╚═╝╚═╝╚═╝╚╚═╝╩   ┴ ┴ ┴└─┘ ┴ ┴└  
+
+  Hartree, Exchange             = true, true
+  Number of spins               = 1
+  Number of polarizations       = 1
+  Number of bands               = 16
+  Number of THC auxiliary basis = 128
+  K-points                      = 8 total, 8 in the IBZ
+  Divergent treatment at q->0   = gygi
+
+Evaluation of J/K matrix:
+  - processor grid for density matrix:  (s, k, P, Q) = (1, 1, 2, 1)
+
+  Treatment of long-wavelength divergence in the non-local HF exchange potential : gygi
+
+
+  THC-HF timers
+  -------------
+    Total:                 0.002 sec
+    Allocations:           0.000 sec
+    Primary_to_aux:        0.000 sec
+    Coulomb:               0.000 sec
+    Exchange:              0.000 sec
+    Aux_to_primary:        0.000 sec
+
+
+  THC-READER timers
+  -----------------
+    BUILD:                0.411 sec
+    READ_X:               0.000 sec
+    READ_V:               0.000 sec
+
+
+╔═╗╔═╗╔═╗ ╦ ╦╦  ┌┬┐┬ ┬┌─┐ ┬─┐┌─┐┌─┐
+║  ║ ║║═╬╗║ ║║   │ ├─┤│───├┬┘├─┘├─┤
+╚═╝╚═╝╚═╝╚╚═╝╩   ┴ ┴ ┴└─┘ ┴└─┴  ┴ ┴
+
+  Mesh details on the imaginary axis
+  ----------------------------------
+  Discrete Lehmann Representation
+  Beta                   = 1000 a.u.
+  Frequency cutoff       = 1.62885395601693 a.u.
+  Lambda                 = 1628.85395601693
+  Precision              = medium (i.e. eps = 1e-10)
+  nt_f, nt_b, nw_f, nw_b = 54, 54, 54, 55
+
+  Evaluation of the RPA polarization function:
+    - processor grid for Pi: (t, q, P, Q) = (2, 1, 1, 1)
+
+e_rpa_impl:
+  - processor grid for Pi: (w, q, P, Q) = (1, 2, 1, 1)
+  - block size: (w, q, P, Q) = (1, 1, 128, 128)
+  RPA spectrum: max 1/n_eff = |resid|/(Tr^2/2) = 5.7520e-02 at iq=1 iw=54 (Tr there -1.140535e-01, resid -3.741164e-04). This is the inverse participation ratio of Pi*Z -- small = weight spread over many modes, ~1 = a single mode carries the block. Only blocks with |Tr| above a floor are eligible -- an empty high-frequency block otherwise returns a garbage O(1) ratio from noise/noise^2. Proximity to the ln(1-lambda) singularity is a DIFFERENT question, tested exactly by the log_det<0 / Tr>0 warning.
+  RPA term split: Tr(Pi*Z) = -1.53867011, ln|det(I-Pi*Z)| = 1.30633188, sum = -0.23233823 Ha. The two are individually large and opposite in sign; E_c is what survives their cancellation, so comparing the split across runs localizes a change that E_c alone hides.
+
+  THC-RPA timers
+  --------------
+    Total:                 0.119 sec
+    Evaluate RPA:          0.059 sec
+        - Alloc:           0.000 sec
+    Imaginary FT tau->w:   0.000 sec
+      - FT_REDISTRIBUTE:   0.000 sec
+
+
+  THC-READER timers
+  -----------------
+    BUILD:                0.411 sec
+    READ_X:               0.000 sec
+    READ_V:               0.000 sec
+
+
+One-electron energy:       2.4411200568832196 a.u.
+Hartree-Fock energy:       -1.5755249414892931 a.u.
+RPA energy:                -0.23233822767439846 a.u.
+Total energy:              0.633256887719528 a.u.
+
+
+╔═╗╔═╗╔═╗ ╦ ╦╦  ┌┬┐┬ ┬┌─┐ ┬ ┬┌─┐
+║  ║ ║║═╬╗║ ║║   │ ├─┤│───├─┤├┤ 
+╚═╝╚═╝╚═╝╚╚═╝╩   ┴ ┴ ┴└─┘ ┴ ┴└  
+
+  Hartree, Exchange             = false, true
+  Number of spins               = 1
+  Number of polarizations       = 1
+  Number of bands               = 16
+  Number of THC auxiliary basis = 128
+  K-points                      = 8 total, 8 in the IBZ
+  Divergent treatment at q->0   = gygi
+
+Evaluation of J/K matrix:
+  - processor grid for density matrix:  (s, k, P, Q) = (1, 1, 2, 1)
+
+  Treatment of long-wavelength divergence in the non-local HF exchange potential : gygi
+
+
+  THC-HF timers
+  -------------
+    Total:                 0.003 sec
+    Allocations:           0.000 sec
+    Primary_to_aux:        0.000 sec
+    Coulomb:               0.000 sec
+    Exchange:              0.001 sec
+    Aux_to_primary:        0.001 sec
+
+
+  THC-READER timers
+  -----------------
+    BUILD:                0.411 sec
+    READ_X:               0.000 sec
+    READ_V:               0.001 sec
+
+Exchange energy:           -2.2189337896539683 a.u.
+
+Hartree energy:            0.6434088481646751 a.u. (= E_HF - E_x)
+
+
+  One-electron energy decomposition (Ha)
+  --------------------------------------
+    kinetic   Tr[Dm T]              = 3.300665357411348
+    local     Tr[Dm V_loc]          = -2.6992615091491863
+    dion      Tr[Dm V_NL(dion)]     = 1.839716208621058
+    ex_cvij   Tr[Dm V_NL(ex_cvij)]  = 0
+    int_VQ    Tr[Dm V_NL(intV Q)]   = 0
+    ---------------------------------
+    sum                             = 2.4411200568832196
+    e_1e                            = 2.4411200568832196
+  NOTE: ex_cvij is frozen core-valence EXACT EXCHANGE. CoQui keeps it
+  in the static D (so it lands in e_1e); ABINIT accounts it with the
+  Fock energy (dijfock_cv). Move it across before comparing.
+
+
+***************************************************
+                 RPA timers 
+***************************************************
+    Total:                0.197 sec
+    Dyson:                0.010 sec
+    RPA solvers:          0.120 sec
+    Write:                0.001 sec
+***************************************************
+
+####### RPA energy routines end #######
+

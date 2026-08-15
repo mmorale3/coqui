@@ -25,8 +25,10 @@ Develop and unit-test LOCALLY (Mac); rusty ONLY for production curves (M5).
 | M0 scaffolding + instrumentation | DONE (incl. pre-existing rpa.cpp exchange-block segfault fix) | see git log |
 | M1 knob 2: filtered-orbital surrogate | DONE (X-decontamination via unfiltered twins) | 2af4ba3 |
 | M2 knob 1: separable pair weights | DONE (gap weight; ibz guarded; + e1-ledger pyscf gate) | see git log |
-| M3 knob 3: Coulomb-metric re-ranking (M3b: ibz mirror) | pending | |
-| M4 sweep harness + local Si curves | pending | |
+| M3 knob 3: Coulomb-metric re-ranking | DONE (main impl exact; ibz guarded, mirror = follow-up) | 5cd0f5c |
+| M3b ibz mirror | follow-up (production uses nosym saves) | |
+| M4 sweep harness + local Si curves | DONE (ncpp exact-ref + uspp/paw; data in notes/sweeps/data_local_si222) | see git log |
+| M4b optimized weight functional | pending | |
 | M5 rusty production runs (Si 444) | pending | |
 | M6 PRB article | pending | |
 
@@ -118,6 +120,32 @@ convergence flat by 5-6; min-pivot logged, no PSD violation.
 **M3 — knob 3.** Two-pass re-rank as above. Accept: `l2` bitwise; `s=1` no-op vs
 pool-truncated baseline; `bare` vs `attenuated` both run on all three Si fixtures;
 gcut and s scans converge (curves move < target between last two values).
+
+**M4b — optimized weight functional (user directive 2026-08-15).** The weight
+interface admits ANY nonnegative separable function of the pair via the orbital
+energies, w_ia = sum_p c_p f_p(eps_i) g_p(eps_a); PSD is automatic (Schur).
+Instead of fixing the form to the Laplace expansion of 1/x, treat f as a
+small parametrized family and OPTIMIZE its parameters to (a) minimize the
+selection cost — prefer rank-1 (N_L = 1), which makes weighted selection as
+cheap as unweighted — and (b) maximize the c_mu reduction scored on
+|dE_x| + |dE_RPA| (per the scoring directive; Hartree excluded).
+Candidate families (all rank-1 unless noted):
+  - exponential taper  f(e) = exp(-t |e - mu|)            (1 param)
+  - shifted sigmoid    f(e) = 1/(1 + exp((|e-mu| - w)/t)) (2 params)
+  - power law          f(e) = (|e - mu| + eta)^(-p)       (2 params, sep. rank-1
+    in f*g only approximately -> use as f directly)
+  - two-term mixtures of the above (N_L = 2)
+Optimizer: derivative-free (coarse grid, then Nelder-Mead) over 1-3 params;
+objective = error at fixed c (or interpolated c_mu*) on qe_si222_ncpp with the
+exact Cholesky reference; each evaluation is one selection + one RPA-driver run
+(~1-2 min), so a full optimization is ~50-100 runs. Validate the optimum on
+uspp/paw and at production scale (M5). Implementation: generalize
+`isdf_pair_weight` to accept the family name + parameters (e.g.
+`isdf_pair_weight = "exp"`, `isdf_weight_params = [t]`); the Gram machinery
+from M2 is reused unchanged (tables built from f instead of the Laplace terms).
+Accept: optimizer script in notes/sweeps/; optimized form beats both `none`
+and `gap` on the E_x+E_RPA score on at least one Si system, or a documented
+negative result; cost of weighted selection at N_L=1 measured ~= baseline.
 
 **M4 — sweep harness + local curves.** `notes/sweeps/gen_sweep.py` + `collect.py`
 (precedent: the paw notes' harvest scripts; parse stdout + `<prefix>.mbpt.h5` RPA
