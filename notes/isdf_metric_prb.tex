@@ -345,10 +345,29 @@ the metric truncation, and $N_L$; composition of the three schemes.}
 \section{Discussion and conclusions}
 \label{sec:conclusions}
 
-\todo{Regimes in which the metric is expected to matter (vacuum regions,
-localized orbitals, metals); criterion for when the pair-density rank rather
-than the selection metric limits compression; extension to screened
-interactions; recommended default parameters.}
+Two observations from the numerical results deserve emphasis. First, the
+appropriate selection metric is observable dependent. The exact
+Coulomb-metric re-ranking improves the exchange and correlation energies
+simultaneously, whereas the filtered surrogate improves correlation-type
+observables at the expense of exchange, whose short-range content the
+filter deprioritizes. Since the Hartree contribution can be evaluated
+directly from the density at negligible cost, without recourse to the
+factorized integrals, the fidelity of the factorization matters precisely
+for the exchange and dynamically screened contributions; our
+recommendations are scored accordingly. Second, the compression attainable
+by improving the selection is bounded by the intrinsic rank of the
+pair-density manifold: once the selected points resolve that manifold in
+the Coulomb metric, further gains require compressing the interpolation
+basis downstream rather than choosing better points. The saturation of the
+error curves at large $\cmu$ provides a practical indicator of this
+crossover.
+
+\todo{Finalize after production runs: regimes where the metric matters most
+(vacuum regions, localized orbitals, metals --- the overlap metric is known
+to overspend in vacuum); recommended defaults (metric choice, $s$,
+attenuation); the optimized rank-1 weight; extension of $\bar v$ to static
+screened interactions, where the same re-ranking applies verbatim with
+$W(\GG)$ in place of $v(\GG)$.}
 
 \begin{acknowledgments}
 The Flatiron Institute is a division of the Simons Foundation.

@@ -28,7 +28,7 @@ Develop and unit-test LOCALLY (Mac); rusty ONLY for production curves (M5).
 | M3 knob 3: Coulomb-metric re-ranking | DONE (main impl exact; ibz guarded, mirror = follow-up) | 5cd0f5c |
 | M3b ibz mirror | follow-up (production uses nosym saves) | |
 | M4 sweep harness + local Si curves | DONE (ncpp exact-ref + uspp/paw; data in notes/sweeps/data_local_si222) | see git log |
-| M4b optimized weight functional | pending | |
+| M4b optimized weight functional | DONE (sigmoid w=0.11,t=0.16 Ha: 5.4x over baseline on Ex+RPA @ c8+c10 ncpp, zero cost; transfers to paw, mixed on uspp at large c) | see git log |
 | M5 rusty production runs (Si 444) | pending | |
 | M6 PRB article | pending | |
 
