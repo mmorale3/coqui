@@ -84,6 +84,11 @@
  * in the eval_Pi_rpa_dc convention) -- vertex_t::ladder_loc_gate below.
  */
 
+#include <chrono>
+#include <string>
+#include <vector>
+#include <sys/resource.h>
+
 #include "utilities/check.hpp"
 #include "utilities/interpolation_utils.hpp"   // P4a: WS_rgrid for the R-space kernel
 
@@ -91,6 +96,272 @@ namespace methods {
 namespace solvers {
 
   namespace vertex_ladder_detail {
+
+    // ================================================================================
+    // PROFILING METERS (notes/ladder_profiling_spec.md).
+    //
+    // PURE OBSERVERS. Every object below is written only by the meters and read only by
+    // the reports; no physics array, no arithmetic and no loop order is touched, and all
+    // meters are inert unless a ladder_prof* is passed in (the default is nullptr, i.e.
+    // the historic path). Gate 2 of the spec pins the bitwise identity.
+    //
+    // Layout: the (s, q) loop of pair_space_ladder is decomposed into phases that cover
+    // it 100% -- t_loop is the reference wall and the residual "other" row is printed
+    // explicitly so the table can never hide a cost. Walls are cumulative PER RANK;
+    // prof_report aggregates min/mean/max over a communicator.
+    // ================================================================================
+
+    /** MaxRSS of this process in GB (getrusage; ru_maxrss is bytes on macOS, kB on
+     *  Linux). High-water mark, so it is monotone within a run. */
+    inline double prof_rss_gb() {
+      struct rusage ru;
+      if (getrusage(RUSAGE_SELF, &ru) != 0) return 0.0;
+#if defined(__APPLE__)
+      return double(ru.ru_maxrss) / (1024.0 * 1024.0 * 1024.0);
+#else
+      return double(ru.ru_maxrss) / (1024.0 * 1024.0);
+#endif
+    }
+
+    struct ladder_prof {
+      enum ph { P_DCHI0 = 0, P_KERNEL, P_KPACK, P_XK, P_LAM, P_RESOLV, P_PROJD,
+                P_ONERUNG, P_LOC, P_MPI, P_NPHASE };
+      double t[P_NPHASE] = {};       // cumulative phase walls, this rank
+      long   n[P_NPHASE] = {};       // call counts, this rank
+      double t_loop = 0.0;           // the whole (s, q) loop (the 100% reference)
+      double t_setup = 0.0;          // pre-loop: checks, qx_of, rank-local allocations
+      double t_inputs = 0.0;         // caller side: G_CC expand / ladder_inputs
+      double t_barrier = 0.0;        // caller side: end-of-loop wait = the idle meter
+      double t_call = 0.0;           // caller side: the whole eval wall
+      double t_reduce = 0.0;         // caller side: the output all_reduce
+      long   nunit = 0;              // (s, q) units executed on this rank
+      double t_unit_min = 0.0, t_unit_max = 0.0, t_unit_sum = 0.0;
+      double rss_entry = 0.0, rss_alloc = 0.0, rss_unit1 = 0.0, rss_exit = 0.0;
+      // dimensions (the allocation table + the scaling model)
+      long ns = 0, nk = 0, nc = 0, nc2 = 0, Nm = 0, Dsz = 0, nnu = 0, nt = 0;
+      long nq_ext = 0, nq_full = 0, nab = 0;
+      long nproc = 1, lsize = 1;     // (s,q)-unit groups x intra-group ranks
+      double gb_local = 0.0;         // total rank-local physics allocation, GB
+    };
+
+    inline const char *prof_phase_name(int p) {
+      switch (p) {
+        case ladder_prof::P_DCHI0:   return "d/E legs + chi0 (Cb)";
+        case ladder_prof::P_KERNEL:  return "K rung blocks (Kb)";
+        case ladder_prof::P_KPACK:   return "Kbig pack + D stack";
+        case ladder_prof::P_XK:      return "XK = Xh.Kt product";
+        case ladder_prof::P_LAM:     return "lambda_max power it.";
+        case ladder_prof::P_RESOLV:  return "resolvent inverse";
+        case ladder_prof::P_PROJD:   return "projections to N_m";
+        case ladder_prof::P_ONERUNG: return "one-rung rebuild";
+        case ladder_prof::P_LOC:     return "orbital (E-leg) block";
+        case ladder_prof::P_MPI:     return "MPI intra-group reduce";
+        default:                     return "?";
+      }
+    }
+
+    /** Explicit-scope phase accumulator: begin(phase) / end() around an existing block,
+     *  so the hot loop needs no extra braces and no reindentation. Inert (one predicted
+     *  branch) when prof == nullptr. */
+    struct prof_phase {
+      ladder_prof *p = nullptr;
+      int cur = -1;
+      std::chrono::steady_clock::time_point t0;
+      explicit prof_phase(ladder_prof *pp) : p(pp) {}
+      void begin(int ph) {
+        if (p == nullptr) return;
+        cur = ph;
+        t0 = std::chrono::steady_clock::now();
+      }
+      void end() {
+        if (p == nullptr or cur < 0) return;
+        p->t[cur] += std::chrono::duration<double>(
+                         std::chrono::steady_clock::now() - t0).count();
+        ++p->n[cur];
+        cur = -1;
+      }
+    };
+
+    /** Plain stopwatch for the caller-side meters. */
+    struct prof_watch {
+      std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+      double lap() {
+        auto t1 = std::chrono::steady_clock::now();
+        double d = std::chrono::duration<double>(t1 - t0).count();
+        t0 = t1;
+        return d;
+      }
+      double peek() const {
+        return std::chrono::duration<double>(
+                   std::chrono::steady_clock::now() - t0).count();
+      }
+    };
+
+    /** Root-only, RANK-LOCAL progress line emitted after every resolvent solve. NOT a
+     *  collective (groups hold different unit counts, so a collective here would
+     *  deadlock) and not aggregated -- it is deliberately the cheapest thing that still
+     *  reports phase structure. It exists because at kp666 one (s,q) unit is hours long:
+     *  a job that never reaches the exit report would otherwise produce NO phase data at
+     *  all. Values are this rank's CUMULATIVE phase seconds; per-solve costs are the
+     *  successive differences. */
+    inline void prof_solve_line(ladder_prof const &pr, long sq, long jn,
+                                double t_in_unit) {
+      app_log(1, "  [ladder-prof solve] (s,q) unit {} / nu {} done: rank0 cumulative s -- "
+                 "dchi0 {:.1f}  K {:.1f}  Kpack {:.1f}  XK {:.1f}  lam {:.1f}  inv {:.1f} "
+                 " proj {:.1f}  onerung {:.1f}  loc {:.1f}  mpi {:.1f} ; units finished "
+                 "{} , wall so far in this unit {:.1f} s",
+              sq, jn,
+              pr.t[ladder_prof::P_DCHI0], pr.t[ladder_prof::P_KERNEL],
+              pr.t[ladder_prof::P_KPACK], pr.t[ladder_prof::P_XK],
+              pr.t[ladder_prof::P_LAM], pr.t[ladder_prof::P_RESOLV],
+              pr.t[ladder_prof::P_PROJD], pr.t[ladder_prof::P_ONERUNG],
+              pr.t[ladder_prof::P_LOC], pr.t[ladder_prof::P_MPI],
+              pr.nunit, t_in_unit);
+      app_log_flush();
+    }
+
+    /** The rank-local allocation table of pair_space_ladder: every array with its shape,
+     *  element count and GB, plus the dimension formulas. Printed at ENTRY (a run that
+     *  never finishes an iteration still reports its memory). Root only. */
+    inline void prof_alloc_table(ladder_prof &pr, const char *tag) {
+      const double z = double(sizeof(ComplexType)) / (1024.0 * 1024.0 * 1024.0);
+      double tot = 0.0;
+      app_log(1, "  [ladder-prof {}] rank-local allocation table  (ns = {}, nk = {}, "
+                 "nc = {}, nc2 = {}, N_m = {}, D = nc2*nk = {}, n_nu = {}, nt = {}, "
+                 "nq_ext = {}, nq_full = {}, nab = {})",
+              tag, pr.ns, pr.nk, pr.nc, pr.nc2, pr.Nm, pr.Dsz, pr.nnu, pr.nt,
+              pr.nq_ext, pr.nq_full, pr.nab);
+      app_log(1, "  [ladder-prof {}] {:<12} {:<30} {:>16} {:>12}", tag, "array",
+              "shape", "elements", "GB");
+      auto row = [&](const char *nm, const char *shape, double ne) {
+        const double gb = ne * z;
+        tot += gb;
+        app_log(1, "  [ladder-prof {}] {:<12} {:<30} {:16.6e} {:12.4f}", tag, nm,
+                shape, ne, gb);
+      };
+      const double dk = double(pr.nk), dc2 = double(pr.nc2), dm = double(pr.Nm);
+      const double dD = double(pr.Dsz), dnu = double(pr.nnu), dab = double(pr.nab);
+      row("G_CC",   "(nt,ns,nk,nc,nc)",  double(pr.nt) * double(pr.ns) * dk *
+                                         double(pr.nc) * double(pr.nc));
+      row("Dmat+Dcj", "2 x (nk,nc2,Nm)", 2.0 * dk * dc2 * dm);
+      row("Cb",     "(nk,nnu,nc2,nc2)",  dk * dnu * dc2 * dc2);
+      row("Kb",     "(nk,nk,nc2,nc2)",   dk * dk * dc2 * dc2);
+      row("Pf+Bf",  "(nt|nw_b,nc2^2)",   2.0 * double(pr.nt) * dc2 * dc2);
+      row("Y1+Y2",  "2 x (nk,nc2,Nm)",   2.0 * dk * dc2 * dm);
+      row("Rm",     "(D,D)",             dD * dD);
+      row("Kbig",   "(D,D)",             dD * dD);
+      row("XK",     "(D,D)",             dD * dD);
+      row("XD..Zl", "4 x (D,Nm)",        4.0 * dD * dm);
+      row("Dstack_c", "(D,Nm)",          dD * dm);
+      if (pr.nab > 0) {
+        row("E legs", "4 x (nk,nc2,nab)", 4.0 * dk * dc2 * dab);
+        row("XE..ZlE", "5 x (D,nab)",     5.0 * dD * dab);
+      }
+      pr.gb_local = tot;
+      app_log(1, "  [ladder-prof {}] TOTAL rank-local = {:.3f} GB   (the three (D,D) "
+                 "arrays Rm/Kbig/XK alone = {:.3f} GB, Kb = {:.3f} GB)",
+              tag, tot, 3.0 * dD * dD * z, dk * dk * dc2 * dc2 * z);
+      app_log_flush();
+    }
+
+    /** min/mean/max over the communicator of every meter + the phase table. Collective:
+     *  EVERY rank must call it. Scalars only in the format strings (rusty's bundled fmt
+     *  cannot format containers). */
+    template<class comm_t>
+    inline void prof_report(ladder_prof const &pr, comm_t &comm, const char *tag) {
+      const int NP = ladder_prof::P_NPHASE;
+      const int NX = 12;                        // the extra (non-phase) meters
+      const int NV = NP + NX;
+      std::vector<double> v(size_t(NV), 0.0);
+      for (int p = 0; p < NP; ++p) v[size_t(p)] = pr.t[p];
+      v[size_t(NP + 0)]  = pr.t_loop;
+      v[size_t(NP + 1)]  = pr.t_setup;
+      v[size_t(NP + 2)]  = pr.t_inputs;
+      v[size_t(NP + 3)]  = pr.t_barrier;
+      v[size_t(NP + 4)]  = pr.t_call;
+      v[size_t(NP + 5)]  = pr.t_reduce;
+      v[size_t(NP + 6)]  = double(pr.nunit);
+      v[size_t(NP + 7)]  = pr.t_unit_max;
+      v[size_t(NP + 8)]  = pr.rss_entry;
+      v[size_t(NP + 9)]  = pr.rss_alloc;
+      v[size_t(NP + 10)] = pr.rss_unit1;
+      v[size_t(NP + 11)] = pr.rss_exit;
+      std::vector<double> vmin(v), vmax(v), vsum(v);
+      // the per-unit min is only meaningful on ranks that ran a unit
+      double umin = (pr.nunit > 0) ? pr.t_unit_min : 1e300;
+      double usum = pr.t_unit_sum;
+      long   ucnt = pr.nunit;
+      comm.all_reduce_in_place_n(vmin.data(), vmin.size(), boost::mpi3::min<>{});
+      comm.all_reduce_in_place_n(vmax.data(), vmax.size(), boost::mpi3::max<>{});
+      comm.all_reduce_in_place_n(vsum.data(), vsum.size(), std::plus<>{});
+      umin = comm.all_reduce_value(umin, boost::mpi3::min<>{});
+      usum = comm.all_reduce_value(usum, std::plus<>{});
+      ucnt = comm.all_reduce_value(ucnt, std::plus<>{});
+      const double np = double(comm.size());
+      const double loop_mean = vsum[size_t(NP + 0)] / np;
+      const double call_mean = vsum[size_t(NP + 4)] / np;
+      double phase_mean_tot = 0.0;
+      for (int p = 0; p < NP; ++p) phase_mean_tot += vsum[size_t(p)] / np;
+
+      app_log(1, "  [ladder-prof {}] phase table over {} ranks: seconds per rank, "
+                 "cumulative; % is of the mean (s,q)-loop wall {:.3f} s",
+              tag, long(np), loop_mean);
+      app_log(1, "  [ladder-prof {}] {:<24}{:>12}{:>12}{:>12}{:>9}{:>12}", tag,
+              "phase", "min", "mean", "max", "%", "calls(max)");
+      for (int p = 0; p < NP; ++p) {
+        const double mean = vsum[size_t(p)] / np;
+        if (vmax[size_t(p)] <= 0.0) continue;
+        const double pct = 100.0 * mean / std::max(loop_mean, 1e-300);
+        const char *nm = prof_phase_name(p);
+        app_log(1, "  [ladder-prof {}] {:<24}{:12.3f}{:12.3f}{:12.3f}{:9.2f}{:12d}", tag,
+                nm, vmin[size_t(p)], mean, vmax[size_t(p)], pct, long(pr.n[p]));
+      }
+      {
+        const double other = loop_mean - phase_mean_tot;
+        const double pct = 100.0 * other / std::max(loop_mean, 1e-300);
+        app_log(1, "  [ladder-prof {}] {:<24}{:12.3f}{:12.3f}{:12.3f}{:9.2f}", tag,
+                "other (residual)", other, other, other, pct);
+        app_log(1, "  [ladder-prof {}] phases cover {:.2f}% of the loop wall "
+                   "(spec gate 3 wants >= 95%)", tag,
+                100.0 * phase_mean_tot / std::max(loop_mean, 1e-300));
+      }
+      app_log(1, "  [ladder-prof {}] setup(alloc+qx) min/mean/max = {:.3f} / {:.3f} / "
+                 "{:.3f} s ; ladder_inputs (G_CC) = {:.3f} / {:.3f} / {:.3f} s", tag,
+              vmin[size_t(NP + 1)], vsum[size_t(NP + 1)] / np, vmax[size_t(NP + 1)],
+              vmin[size_t(NP + 2)], vsum[size_t(NP + 2)] / np, vmax[size_t(NP + 2)]);
+      app_log(1, "  [ladder-prof {}] (s,q) units: {} total over {} ranks ({} unit slots "
+                 "= ns*nq_ext); per-unit wall min/mean/max = {:.3f} / {:.3f} / {:.3f} s",
+              tag, ucnt, long(np), pr.ns * pr.nq_ext,
+              (ucnt > 0 ? umin : 0.0), (ucnt > 0 ? usum / double(ucnt) : 0.0),
+              vmax[size_t(NP + 7)]);
+      {
+        const double bmean = vsum[size_t(NP + 3)] / np;
+        const double idle = 100.0 * bmean / std::max(call_mean, 1e-300);
+        app_log(1, "  [ladder-prof {}] end-of-loop barrier wait min/mean/max = {:.3f} / "
+                   "{:.3f} / {:.3f} s  => idle fraction {:.2f}% of the {:.3f} s eval "
+                   "wall (the load-imbalance / idle-rank meter)", tag,
+                vmin[size_t(NP + 3)], bmean, vmax[size_t(NP + 3)], idle, call_mean);
+        app_log(1, "  [ladder-prof {}] output all_reduce min/mean/max = {:.3f} / {:.3f} "
+                   "/ {:.3f} s ; TOTAL eval wall = {:.3f} / {:.3f} / {:.3f} s", tag,
+                vmin[size_t(NP + 5)], vsum[size_t(NP + 5)] / np, vmax[size_t(NP + 5)],
+                vmin[size_t(NP + 4)], call_mean, vmax[size_t(NP + 4)]);
+      }
+      app_log(1, "  [ladder-prof {}] work grid: {} (s,q) groups x {} intra-group ranks "
+                 "= {} ranks; ns*nq_ext = {} units => {:.2f} units per group "
+                 "(idle groups when < 1)", tag, pr.nproc, pr.lsize,
+              pr.nproc * pr.lsize, pr.ns * pr.nq_ext,
+              double(pr.ns * pr.nq_ext) / std::max(double(pr.nproc), 1.0));
+      app_log(1, "  [ladder-prof {}] MaxRSS GB min/mean/max -- entry {:.2f}/{:.2f}/{:.2f}"
+                 "  after-alloc {:.2f}/{:.2f}/{:.2f}  after-unit-1 {:.2f}/{:.2f}/{:.2f}"
+                 "  exit {:.2f}/{:.2f}/{:.2f}", tag,
+              vmin[size_t(NP + 8)], vsum[size_t(NP + 8)] / np, vmax[size_t(NP + 8)],
+              vmin[size_t(NP + 9)], vsum[size_t(NP + 9)] / np, vmax[size_t(NP + 9)],
+              vmin[size_t(NP + 10)], vsum[size_t(NP + 10)] / np, vmax[size_t(NP + 10)],
+              vmin[size_t(NP + 11)], vsum[size_t(NP + 11)] / np, vmax[size_t(NP + 11)]);
+      app_log(1, "  [ladder-prof {}] predicted node RSS at R ranks/node = R x {:.2f} GB "
+                 "(max exit RSS)", tag, vmax[size_t(NP + 11)]);
+      app_log_flush();
+    }
 
     // Gc on the secondary interpolating points, all (s, k, t) replicated (N_m-class):
     //   Gc(s, k, t)_MN = [Xb(s,k) . G_CC(t,s,k) . Xb(s,k)^dag]_MN
@@ -213,7 +484,11 @@ namespace solvers {
                                   // Q4-C3b: MLWF legs + the orbital/chi-convention outputs
                                   nda::array<ComplexType, 4> const *U_skia = nullptr,
                                   nda::array<ComplexType, 4> *Pi_lad_loc = nullptr,
-                                  nda::array<ComplexType, 4> *Pi_onerung_loc = nullptr) {
+                                  nda::array<ComplexType, 4> *Pi_onerung_loc = nullptr,
+                                  // profiling meters (pure observer; nullptr = historic path)
+                                  ladder_prof *prof = nullptr) {
+      prof_watch pwatch;
+      if (prof) prof->rss_entry = prof_rss_gb();
       decltype(nda::range::all) all;
       const long nt = G_CC.shape(0), ns = G_CC.shape(1), nk = G_CC.shape(2);
       const long nc = G_CC.shape(3), Nm = Xb.shape(2);
@@ -329,12 +604,30 @@ namespace solvers {
       // P3: intra-group coordinates (lsize = 1 without a group communicator)
       const long lrank = (g_comm != nullptr) ? g_comm->rank() : 0;
       const long lsize = (g_comm != nullptr) ? g_comm->size() : 1;
+      if (prof) {
+        prof->ns = ns; prof->nk = nk; prof->nc = nc; prof->nc2 = nc2;
+        prof->Nm = Nm; prof->Dsz = Dsz; prof->nnu = nnu; prof->nt = nt;
+        prof->nq_ext = nq_ext; prof->nq_full = nq_full; prof->nab = nab;
+        prof->nproc = nproc; prof->lsize = lsize;
+        prof->rss_alloc = prof_rss_gb();
+        if (rank == 0 and lrank == 0) prof_alloc_table(*prof, "core");
+        prof->t_setup = pwatch.lap();
+      }
+      prof_phase pph(prof);
+      // throttle for the per-solve progress line: at fixture scale a solve is
+      // sub-millisecond and the line would be pure noise, at production scale it is
+      // minutes and the line is the only mid-run phase data. One line per second of
+      // solve wall, root rank only.
+      prof_watch lwatch;
+      bool first_line = true;
       for (long sq = rank; sq < ns * nq_ext; sq += nproc) {
+        prof_watch uwatch;
         const long is = sq / nq_ext;
         const long iq = sq % nq_ext;
         {
           // --- d(k) and the chi0 blocks (only the requested nu rows are kept) ---------
           // P3: ik split over group ranks; disjoint writes, zeros-elsewhere reduce.
+          pph.begin(ladder_prof::P_DCHI0);
           if (lsize > 1) {
             Dmat() = ComplexType(0.0);
             Dcj() = ComplexType(0.0);
@@ -378,6 +671,8 @@ namespace solvers {
                 for (long c = 0; c < nc2; ++c)
                   Cb(ik, jn, r, c) = Bf(nu_list[jn], r * nc2 + c);
           }
+          pph.end();
+          pph.begin(ladder_prof::P_MPI);
           if (lsize > 1) {
             g_comm->all_reduce_in_place_n(Dmat.data(), Dmat.size(), std::plus<>{});
             g_comm->all_reduce_in_place_n(Dcj.data(), Dcj.size(), std::plus<>{});
@@ -387,12 +682,14 @@ namespace solvers {
               g_comm->all_reduce_in_place_n(Ecj.data(), Ecj.size(), std::plus<>{});
             }
           }
+          pph.end();
           // --- the rung blocks K(k, k') (nu-independent) -------------------------------
           // qx = k - k' (kmq orientation; the ladder's k' IS the anchor's ikmqx). The
           // legs go through the anchor's OWN builder (identical assignments on the
           // nosym path; Xhat(is, jsx, .) under symmetry) and the rung is read at
           // q_star(qx), PQ-TRANSPOSED for trev transfers (memo (P2)).
           // P3: flattened (ik, ik') split over group ranks, same disjoint-write reduce.
+          pph.begin(ladder_prof::P_KERNEL);
           if (lsize > 1) Kb() = ComplexType(0.0);
           for (long ik = 0; ik < nk; ++ik) {
             const long ikpq = kpq(iq, ik);
@@ -420,10 +717,14 @@ namespace solvers {
                           wb(p1 * nc + p1p, p3 * nc + p3p);
             }
           }
+          pph.end();
+          pph.begin(ladder_prof::P_MPI);
           if (lsize > 1)
             g_comm->all_reduce_in_place_n(Kb.data(), Kb.size(), std::plus<>{});
+          pph.end();
           // --- Kt[(k'),(k)] = K(k,k')^T and conj(D) stack (nu-independent) -------------
           // P3: packed only where a resolvent solve actually runs on this rank.
+          pph.begin(ladder_prof::P_KPACK);
           const bool solves_here = ((Pi_ladder != nullptr or Pi_lad_loc != nullptr)
                                     and lrank < std::min(lsize, nnu));
           if (solves_here) {
@@ -440,10 +741,12 @@ namespace solvers {
                 for (long r = 0; r < nc2; ++r) Estack_c(ik * nc2 + r, all) = Ecj(ik, r, all);
           }
 
+          pph.end();
           // --- per requested nu: one-rung rebuild + resummation ------------------------
           // P3: each nu is owned by exactly one group rank (write-once globally).
           for (long jn = 0; jn < nnu; ++jn) {
             if (jn % lsize != lrank) continue;
+            pph.begin(ladder_prof::P_ONERUNG);
             if (Pi_onerung != nullptr) {
               for (long ik = 0; ik < nk; ++ik) {
                 nda::blas::gemm(Cb(ik, jn, all, all), Dmat(ik, all, all),
@@ -479,14 +782,18 @@ namespace solvers {
                   Pre += T2e;
                 }
             }
+            pph.end();
             if (Pi_ladder == nullptr and Pi_lad_loc == nullptr) continue;
             // Pi_ladder = -spin conj(D)^T (1 - Xh Kt)^{-1} Xh Kt Xh D
+            pph.begin(ladder_prof::P_XK);
             for (long ikp = 0; ikp < nk; ++ikp) {
               auto Krows = Kbig(nda::range(ikp * nc2, (ikp + 1) * nc2), all);
               auto Xrows = XK(nda::range(ikp * nc2, (ikp + 1) * nc2), all);
               nda::blas::gemm(ComplexType(1.0 / nk), Cb(ikp, jn, all, all), Krows,
                               ComplexType(0.0), Xrows);
             }
+            pph.end();
+            pph.begin(ladder_prof::P_LAM);
             if (lam_max != nullptr) {
               // I3: rho(Xh Kt) by power iteration on the assembled XK. Fixed seed =>
               // reproducible; 20 sweeps or a 1e-3 relative change. |XK v| with |v| = 1
@@ -507,13 +814,17 @@ namespace solvers {
               }
               (*lam_max)(jn) = std::max((*lam_max)(jn), lam);
             }
+            pph.end();
             // the resolvent depends on XK only -- formed here so BOTH RHS blocks (the
             // THC-collapse D and, at Q4-C3b, the MLWF E) share the one inverse. Moving it
             // ahead of the D block below changes no arithmetic on the historic path.
+            pph.begin(ladder_prof::P_RESOLV);
             Rm() = ComplexType(0.0);
             Rm() -= XK;
             for (long i = 0; i < Dsz; ++i) Rm(i, i) += ComplexType(1.0);
             nda::inverse_in_place(Rm);
+            pph.end();
+            pph.begin(ladder_prof::P_PROJD);
             if (Pi_ladder != nullptr) {
               for (long ik = 0; ik < nk; ++ik) {
                 auto Drows = XD(nda::range(ik * nc2, (ik + 1) * nc2), all);
@@ -532,7 +843,9 @@ namespace solvers {
               nda::blas::gemm(ComplexType(-spinfac), nda::transpose(Dstack_c), Zl,
                               ComplexType(1.0), Pl);
             }
+            pph.end();
             // Q4-C3b: the orbital/chi-convention block through the SAME resolvent
+            pph.begin(ladder_prof::P_LOC);
             if (Pi_lad_loc != nullptr) {
               for (long ik = 0; ik < nk; ++ik) {
                 auto Erows = XE(nda::range(ik * nc2, (ik + 1) * nc2), all);
@@ -551,8 +864,35 @@ namespace solvers {
               nda::blas::gemm(ComplexType(-spinfac), nda::transpose(Estack_c), ZlE,
                               ComplexType(1.0), Po);
             }
+            pph.end();
+            if (prof and rank == 0 and lrank == 0 and
+                (first_line or lwatch.peek() >= 1.0)) {
+              prof_solve_line(*prof, sq, jn, uwatch.peek());
+              lwatch.lap();
+              first_line = false;
+            }
           }
         }
+        if (prof) {
+          const double tu = uwatch.lap();
+          prof->t_unit_sum += tu;
+          prof->t_unit_max = std::max(prof->t_unit_max, tu);
+          prof->t_unit_min = (prof->nunit == 0) ? tu : std::min(prof->t_unit_min, tu);
+          ++prof->nunit;
+          if (prof->nunit == 1) prof->rss_unit1 = prof_rss_gb();
+          if (rank == 0 and lrank == 0 and (prof->nunit == 1 or tu >= 1.0)) {
+            const double rss = prof_rss_gb();
+            app_log(1, "  [ladder-prof unit] (s,q) unit {} (is = {}, iq = {}) done in "
+                       "{:.1f} s ; {} of {} units on this group rank ; rank0 MaxRSS "
+                       "{:.2f} GB", sq, is, iq, tu, prof->nunit,
+                    (ns * nq_ext + nproc - 1 - rank) / nproc, rss);
+            app_log_flush();
+          }
+        }
+      }
+      if (prof) {
+        prof->t_loop = pwatch.lap();
+        prof->rss_exit = prof_rss_gb();
       }
     }
 
@@ -1136,17 +1476,29 @@ namespace solvers {
     // nnu = 1 the group mode serializes ALL q-solves onto node rank 0 (measured on
     // the first nosym444 readout, ~30 s x 64 q per iteration), while P2 spreads the
     // q's across ranks at identical results (the ladder_p3_gate bitwise identity).
+    // profiling meters (spec section 2b: the lighter set on the readout path)
+    vertex_ladder_detail::ladder_prof prof;
+    vertex_ladder_detail::prof_watch cwatch, twatch;
     if (mpi->internode_comm.size() > 1)
       vertex_ladder_detail::pair_space_ladder(G_CC, _Xb_skma, _W0b_qmm.value(), kmq,
                                               kpq, tools, nu0, nullptr, &Pl,
                                               mpi->internode_comm.rank(),
                                               mpi->internode_comm.size(), symc,
-                                              std::addressof(mpi->node_comm));
+                                              std::addressof(mpi->node_comm), nullptr,
+                                              nullptr, nullptr, nullptr, &prof);
     else
       vertex_ladder_detail::pair_space_ladder(G_CC, _Xb_skma, _W0b_qmm.value(), kmq,
                                               kpq, tools, nu0, nullptr, &Pl,
-                                              mpi->comm.rank(), mpi->comm.size(), symc);
+                                              mpi->comm.rank(), mpi->comm.size(), symc,
+                                              nullptr, nullptr,
+                                              nullptr, nullptr, nullptr, &prof);
+    cwatch.lap();
+    mpi->comm.barrier();
+    prof.t_barrier = cwatch.lap();
     mpi->comm.all_reduce_in_place_n(Pl.data(), Pl.size(), std::plus<>{});
+    prof.t_reduce = cwatch.lap();
+    prof.t_call = twatch.lap();
+    vertex_ladder_detail::prof_report(prof, mpi->comm, "nu0");
     nda::array<ComplexType, 3> out(nq_ext, Nm, Nm);
     out = Pl(0, all, all, all);
     return out;
@@ -1220,10 +1572,15 @@ namespace solvers {
                  "first (same iteration).");
     auto MF = thc.MF();
     auto mpi = thc.mpi();
+    // profiling meters (notes/ladder_profiling_spec.md): pure observers -- Pl and lam_max
+    // are bitwise what the historic path returns (gate 2).
+    vertex_ladder_detail::ladder_prof prof;
+    vertex_ladder_detail::prof_watch cwatch, twatch;
     nda::array<ComplexType, 5> G_CC;
     nda::array<long, 2> kmq, kpq;
     vertex_sym::sym_ctx const *symc = nullptr;
     ladder_inputs(mb_state, thc, G_CC, kmq, kpq, symc);
+    prof.t_inputs = cwatch.lap();
 
     vertex_pi::iaft_tools tools(*_ft);
     const long nw_b = tools.nw_b;
@@ -1241,16 +1598,26 @@ namespace solvers {
                                               kpq, tools, nu_h, nullptr, &Pl,
                                               mpi->internode_comm.rank(),
                                               mpi->internode_comm.size(), symc,
-                                              std::addressof(mpi->node_comm), lam_max);
+                                              std::addressof(mpi->node_comm), lam_max,
+                                              nullptr, nullptr, nullptr, &prof);
     else
       vertex_ladder_detail::pair_space_ladder(G_CC, _Xb_skma, _W0b_qmm.value(), kmq,
                                               kpq, tools, nu_h, nullptr, &Pl,
                                               mpi->comm.rank(), mpi->comm.size(), symc,
-                                              nullptr, lam_max);
+                                              nullptr, lam_max,
+                                              nullptr, nullptr, nullptr, &prof);
+    cwatch.lap();
+    // the idle-rank meter: a rank that finished its (s,q) units early waits here. The
+    // all_reduce below already synchronizes, so this only SPLITS an existing wait.
+    mpi->comm.barrier();
+    prof.t_barrier = cwatch.lap();
     mpi->comm.all_reduce_in_place_n(Pl.data(), Pl.size(), std::plus<>{});
     if (lam_max != nullptr)
       mpi->comm.all_reduce_in_place_n(lam_max->data(), lam_max->size(),
                                       boost::mpi3::max<>{});
+    prof.t_reduce = cwatch.lap();
+    prof.t_call = twatch.lap();
+    vertex_ladder_detail::prof_report(prof, mpi->comm, "whalf");
     return Pl;
   }
 

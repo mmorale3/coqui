@@ -22,6 +22,8 @@
 #include <unordered_set>
 #include <sstream>
 #include <iomanip>
+#include <chrono>
+#include <sys/resource.h>
 #include "methods/ERI/thc_reader_t.hpp"
 #include "methods/HF/thc_solver_comm.hpp"
 #include "methods/GW/g0_div_utils.hpp"
@@ -35,6 +37,32 @@
 
 namespace methods {
 namespace solvers {
+
+  namespace ladder_meter {
+    // Injection-side profiling meters (notes/ladder_profiling_spec.md section 2b/2c).
+    // PURE OBSERVERS: nothing here is read by the physics.
+    inline double rss_gb() {
+      struct rusage ru;
+      if (getrusage(RUSAGE_SELF, &ru) != 0) return 0.0;
+#if defined(__APPLE__)
+      return double(ru.ru_maxrss) / (1024.0 * 1024.0 * 1024.0);
+#else
+      return double(ru.ru_maxrss) / (1024.0 * 1024.0);
+#endif
+    }
+    struct watch {
+      std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+      double lap() {
+        auto t1 = std::chrono::steady_clock::now();
+        double d = std::chrono::duration<double>(t1 - t0).count();
+        t0 = t1;
+        return d;
+      }
+    };
+    // cumulative ladder wall across outer iterations (the section-2c iteration line)
+    inline double cum_eval = 0.0, cum_inject = 0.0;
+    inline long ncalls = 0;
+  }
 
   bool scr_coulomb_t::has_active_vertex() const {
     return _vertex != nullptr and _vertex->active();
@@ -684,8 +712,12 @@ namespace solvers {
                  "combination double counts (ruling R-Q3-3).");
     auto [nt_h, nq_g, Np, NQ_g] = dPi_tqPQ.global_shape();
 
+    ladder_meter::watch lwatch, ltot;
+    const double rss_in = ladder_meter::rss_gb();
     nda::array<double, 1> lam;
     auto Pl = _pol_vtx->eval_pol_ladder_whalf(mb_state, thc, &lam);  // (nw_h, nq, Nm, Nm)
+    const double t_eval = lwatch.lap();
+    const double rss_eval = ladder_meter::rss_gb();
     auto const &tmap = _pol_vtx->secondary_transfer();               // (nq, Nm, Np)
     const long nw_h = Pl.shape(0), Nm = Pl.shape(2);
     utils::check(Pl.shape(1) == nq_g and tmap.shape(0) == nq_g and tmap.shape(1) == Nm
@@ -739,6 +771,7 @@ namespace solvers {
             Pi_loc(it, iql, i, j) += v;
           }
     }
+    const double t_upfold = lwatch.lap();
     auto &comm = *dPi_tqPQ.communicator();
     nC = comm.all_reduce_value(nC, boost::mpi3::max<>{});
     nR = comm.all_reduce_value(nR, boost::mpi3::max<>{});
@@ -770,6 +803,27 @@ namespace solvers {
     _pol_lam_max = 0.0;
     for (long j = 0; j < nw_h; ++j) _pol_lam_max = std::max(_pol_lam_max, lam(j));
 
+    // --- section 2b/2c meters: the ladder wall of THIS outer iteration + the RSS trace.
+    // t_meters is charged to the r_rt / q-max diagnostics between the two laps above.
+    {
+      const double t_diag = lwatch.lap();
+      const double t_tot = ltot.lap();
+      const double rss_out = ladder_meter::rss_gb();
+      ladder_meter::cum_eval += t_eval;
+      ladder_meter::cum_inject += t_tot;
+      ++ladder_meter::ncalls;
+      double rss_mx = comm.all_reduce_value(rss_out, boost::mpi3::max<>{});
+      double rss_ev = comm.all_reduce_value(rss_eval, boost::mpi3::max<>{});
+      double rss_e0 = comm.all_reduce_value(rss_in, boost::mpi3::max<>{});
+      app_log(1, "  [ladder-prof inject] iteration {}: ladder eval = {:.2f} s of {:.2f} s "
+                 "injection ({:.1f}%); upfold+nu->tau = {:.2f} s, meters = {:.2f} s; "
+                 "cumulative ladder eval = {:.2f} s over {} iterations",
+              ladder_meter::ncalls, t_eval, t_tot,
+              100.0 * t_eval / std::max(t_tot, 1e-300), t_upfold, t_diag,
+              ladder_meter::cum_eval, ladder_meter::ncalls);
+      app_log(1, "  [ladder-prof inject] MaxRSS GB (max over ranks): entry {:.2f} -> "
+                 "after ladder eval {:.2f} -> exit {:.2f}", rss_e0, rss_ev, rss_mx);
+    }
     app_log(1, "  [qpGW Q3] ladder injected into P ({} PH-sym nu nodes, N_m = {}): "
                "||P^lad||_max = {:.4e} vs ||P^RPA||_max = {:.4e} (ratio {:.3e}); "
                "transform round trip r_rt = {:.3e}",
