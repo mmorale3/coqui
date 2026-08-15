@@ -30,3 +30,16 @@ Append-only. Newest at the bottom. Each entry: date, decision, why.
 - **2026-08-14 — Energy observables** = the `[rpa]` driver's printed/stored set:
   Hartree + Exchange (printed, `rpa.cpp:104-119`), 1e/HF/RPA (h5 `RPA` group).
   One driver gives all three requested errors (Coulomb, exchange, RPA) per run.
+- **2026-08-14 — Knob 2 must not touch the collation matrices.** First M1 cut
+  leaked the filter into the returned Xskau/Xskbu (accumulated from the filtered
+  Gram arrays), contaminating Theta and every downstream contraction (E_x drifted
+  ~0.16 Ha on Si at alpha=2). Fix: selection keeps FILTERED arrays for the Gram
+  (diagonal + pivot columns) and UNFILTERED twins for the collation values
+  (comm_buff carries an extra X section, xdup=2, when the knob is active).
+  Same treatment in chol_metric_impl and chol_metric_impl_ibz. Twin b-side gets
+  the identical q-phase factor. Cost when active: 2x the selection-side orbital
+  memory + 2x the per-pivot gather volume; zero when alpha=0.
+- **2026-08-14 — Bitwise regression caveat.** The 'w'+FFT selection path uses
+  FFTW FFT_MEASURE plans (runtime-tuned), so run-to-run results differ at the
+  1e-11 level even on identical binaries. "Bitwise" acceptance is therefore
+  checked as: identical point count + energies within 1e-9 across a re-run pair.

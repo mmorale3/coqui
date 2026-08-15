@@ -349,6 +349,10 @@ class thc
   double memory_frac = 0.75;
   bool use_least_squares = false;
 
+  // knob 2 helper: gaussian filter table F(ik,ig) = exp(-alpha |k+G|^2 / Gc^2)
+  // on the wavefunction G-grid, Gc^2 = 2*ecut_wfc (a.u.)
+  nda::array<RealType,2> isdf_filter_table(long nk) const;
+
   // ISDF interpolation-point selection knobs (selection-only; defaults are no-ops)
   // knob 2: gaussian filter applied to orbital G-coefficients used by the selection surrogate
   double isdf_filter_alpha = 0.0;
