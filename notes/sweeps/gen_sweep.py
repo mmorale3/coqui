@@ -38,6 +38,10 @@ CONFIGS = {
     "mbare_s3":   {"isdf_metric": "bare", "isdf_pool_factor": 3.0},
     # composition
     "f050_mbare": {"isdf_filter_alpha": 0.5, "isdf_metric": "bare"},
+    # M4b optimized rank-1 sigmoid (w, t in Ha; ncpp-optimized, see decisions)
+    "wsig":       {"isdf_pair_weight": "sigmoid", "isdf_weight_params": [0.1107, 0.1634]},
+    "wsig_matten": {"isdf_pair_weight": "sigmoid", "isdf_weight_params": [0.1107, 0.1634],
+                    "isdf_metric": "attenuated"},
 }
 
 C_LIST = [4, 6, 8, 10, 12]
