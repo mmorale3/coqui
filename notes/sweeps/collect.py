@@ -11,11 +11,11 @@ Usage: python3 collect.py --root RUNDIR [--csv results.csv]
 import argparse, csv, os, re, sys
 
 PATTERNS = {
-    "e_1e":      re.compile(r"One-electron energy:\s+([-\d.eE+]+)"),
-    "e_hf":      re.compile(r"Hartree-Fock energy:\s+([-\d.eE+]+)"),
-    "e_rpa":     re.compile(r"RPA energy:\s+([-\d.eE+]+)"),
-    "e_x":       re.compile(r"Exchange energy:\s+([-\d.eE+]+)"),
-    "e_hartree": re.compile(r"Hartree energy:\s+([-\d.eE+]+)"),
+    "e_1e":      re.compile(r"One-electron energy:\s+([-+]?\d[\d.eE+-]*)"),
+    "e_hf":      re.compile(r"Hartree-Fock energy:\s+([-+]?\d[\d.eE+-]*)"),
+    "e_rpa":     re.compile(r"RPA energy:\s+([-+]?\d[\d.eE+-]*)"),
+    "e_x":       re.compile(r"Exchange energy:\s+([-+]?\d[\d.eE+-]*)"),
+    "e_hartree": re.compile(r"Hartree energy:\s+([-+]?\d[\d.eE+-]*)"),
 }
 SEL = re.compile(r"ISDF point selection \((\w+)\): nchol = (\d+), final max \|D\| = ([-\d.eE+]+), c_mu = [^=]+= ([\d.eE+-]+)")
 DONE = re.compile(r"RPA energy routines end")

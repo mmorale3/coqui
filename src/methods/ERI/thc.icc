@@ -114,22 +114,29 @@ inline void isdf_laplace_quadrature(int NL, double xmin, double xmax,
 // knob 3: serial full pivoted Cholesky on a COPY of K (n x n, PSD, replicated);
 // returns the first n_keep pivot indices (into K's original ordering) in
 // elimination order. Runs identically on every rank -> deterministic.
-inline nda::array<long,1> pivoted_chol_order(nda::array<ComplexType,2> K, long n_keep)
+inline std::pair<nda::array<long,1>,long> pivoted_chol_order(nda::array<ComplexType,2> K, long n_keep)
 {
   long n = K.extent(0);
   utils::check(K.extent(1) == n and n_keep > 0 and n_keep <= n,
                "pivoted_chol_order: bad shapes n={} keep={}", n, n_keep);
   nda::array<long,1> perm(n), sel(n_keep);
+  sel() = -1;
   for(long i=0;i<n;++i) perm(i)=i;
   nda::array<RealType,1> d(n);
   for(long i=0;i<n;++i) d(i) = std::real(K(i,i));
   double d0 = *std::max_element(d.begin(), d.end());
+  long nsel = 0;
   for(long m=0;m<n_keep;++m) {
     long imax=m; RealType dmax = -1.0;
     for(long i=m;i<n;++i) if(d(i) > dmax) { dmax = d(i); imax = i; }
-    utils::check(dmax > 1e-14*std::max(d0,1.0),
-        "pivoted_chol_order: pool rank exhausted at {} < requested {} (residual {}). "
-        "Reduce isdf_pool_factor or nIpts.", m, n_keep, dmax);
+    if(dmax <= 1e-14*std::max(d0,1.0)) {
+      // numerical rank of the metric on the pool is exhausted; the caller tops
+      // up the remaining points from the pass-1 ordering
+      app_log(1, "[WARNING] pivoted_chol_order: metric rank exhausted at {} < requested {} "
+                 "(residual {}); remaining points fall back to the pass-1 ordering.",
+              m, n_keep, dmax);
+      break;
+    }
     if(imax != m) {
       for(long j=0;j<n;++j) std::swap(K(m,j), K(imax,j));
       for(long i=0;i<n;++i) std::swap(K(i,m), K(i,imax));
@@ -146,8 +153,9 @@ inline nda::array<long,1> pivoted_chol_order(nda::array<ComplexType,2> K, long n
       d(i) = std::real(K(i,i));
     }
     sel(m) = perm(m);
+    nsel = m+1;
   }
-  return sel;
+  return {sel, nsel};
 }
 } // namespace detail
 
@@ -1821,7 +1829,17 @@ auto thc::chol_metric_impl(int iq, int nIpts, nda::range a_range, nda::range b_r
     nda::array<ComplexType,2> T1(N1,N1), K(N1,N1);
     nda::blas::gemm(ell, W, T1);
     nda::blas::gemm(T1, nda::dagger(ell), K);
-    auto order = detail::pivoted_chol_order(K, nIpts_target);
+    auto [order, nsel] = detail::pivoted_chol_order(K, nIpts_target);
+    if(nsel < nIpts_target) {
+      // metric rank saturated: top up with unused pool points in pass-1 order
+      std::vector<bool> used(N1, false);
+      for(long i=0;i<nsel;++i) used[order(i)] = true;
+      long fill = nsel;
+      for(long j=0;j<N1 and fill<nIpts_target;++j)
+        if(!used[j]) { order(fill++) = j; used[j] = true; }
+      app_log(1, "[WARNING] ISDF re-ranking: {} points metric-ranked, {} topped up from the pass-1 ordering.",
+              nsel, nIpts_target-nsel);
+    }
     // (6) subset/reorder the pool outputs consistently
     nda::array<long,1> rn_new(nmax); rn_new() = 0;
     std::vector<memory::array<MEM,ComplexType,3>> Pa_new;
