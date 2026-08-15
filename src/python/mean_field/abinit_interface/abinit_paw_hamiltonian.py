@@ -1,0 +1,687 @@
+"""
+abinit_paw_hamiltonian.py -- assemble + emit the PAW augmentation of /Hamiltonian.
+
+Ties the validated kernels together:
+  paw_radial  -> channel maps, multipole moments, compensation qfuncl, qq_nt
+  paw_qvan    -> augmentation_function_isp{nt} = Q^IJ(G)
+  paw_deltaC  -> Onecenter/deltaC (nh^4 AE-PS one-center exchange)
+
+Two layers:
+  * build_paw_augmentation(species, miller_g, recip, omega)
+        pure computation -> dict of arrays (ijtoh, qq_nt, Q^IJ(G) per nt, deltaC per nt,
+        + the Species radial block).  Locally validated vs the QE reference h5.
+  * write_paw_block(...)  writes those into an open h5 with the CoQuI schema
+        (pp_type="paw"; /Hamiltonian/paw augmentation datasets + /Hamiltonian/Species/nt{i}).
+
+The shared NC-like datasets (miller_g, scf_local_potential, pp_local_component,
+per-k projectors, dion) come from the WFK/POT via abinit_hamiltonian and are passed
+through unchanged; only the augmentation + Species radial data is PAW-specific.
+
+`species` is a normalized per-species dict (produced by a QE-h5 adapter for testing
+or by the ABINIT PAW-XML adapter in production):
+    r, rab, mesh, kkbeta, nqlc, lmax_rho, lll (nbeta,),
+    u_ae, u_ps (nbeta,nr)  partial waves in u=r*R form,
+    pfunc, ptfunc (nbeta,nbeta,nr) [optional; else built from u_ae/u_ps],
+    qfuncl (nqlc,nij_beta,nr) [optional; else built from moments*shape_by_L],
+    shape_by_L (nqlc,nr) or (nr,) [needed only if qfuncl absent],
+    zp, symbol, n_qn (nbeta,) [n quantum numbers, optional].
+"""
+
+import numpy as np
+import paw_radial as pr
+from paw_qvan import augmentation_function
+from paw_deltaC import compute_deltaC
+
+
+def _radial_hartree(nc, r):
+    """Spherical Hartree potential of a radial density nc(r):
+      V_H(r) = 4*pi [ (1/r) int_0^r nc r'^2 dr' + int_r^inf nc r' dr' ]  ->  Q/r at large r.
+    """
+    dr = np.diff(r)
+    q_in = np.concatenate([[0.0], np.cumsum(0.5 * (nc[1:]*r[1:]**2 + nc[:-1]*r[:-1]**2) * dr)])
+    seg = 0.5 * (nc[1:]*r[1:] + nc[:-1]*r[:-1]) * dr
+    tail = np.concatenate([np.cumsum(seg[::-1])[::-1], [0.0]])
+    rsafe = np.where(r < 1e-12, 1.0, r)
+    return 4.0 * np.pi * (q_in / rsafe + tail)
+
+
+def _poisson_over_r(nwk, r):
+    """V_H(r) from nwk = 4*pi*r^2*rho (ABINIT poisson/r convention):
+      V_H(r) = (1/r) int_0^r nwk dr' + int_r^inf nwk/r' dr'.
+    """
+    dr = np.diff(r)
+    cum = np.concatenate([[0.0], np.cumsum(0.5 * (nwk[1:] + nwk[:-1]) * dr)])
+    f = nwk / np.where(r < 1e-12, 1.0, r)
+    seg = 0.5 * (f[1:] + f[:-1]) * dr
+    tail = np.concatenate([np.cumsum(seg[::-1])[::-1], [0.0]])
+    return cum / np.where(r < 1e-12, 1.0, r) + tail
+
+
+def reconstruct_vhtnzc(parse, shape_by_L):
+    """The PS ionic HARTREE potential vhtnzc = v_H[tilde-n_Zc] (Ha), -> -zval/r.
+
+    Two routes, both following ABINIT:
+
+    1. PREFERRED, and what ABINIT actually does when the dataset provides it
+       (m_pawpsp.F90:3716-3730, vlocopt=2): vhtnzc IS
+       blochl_local_ionic_potential / sqrt(4*pi).  PAW-XML stores radial functions
+       as L=0 expansion coefficients, i.e. sqrt(4*pi) times the physical function.
+
+    2. FALLBACK for datasets carrying only zero_potential (m_pawpsp.F90:3749-3767
+       + :2233-2282, vlocopt=0 'Vbare' -> VH(tnzc) conversion):
+         vhtnzc = zero_potential/sqrt(4*pi) + vh,
+         vh     = poisson[ tncore*4*pi*r^2 + g0*r^2*(qcore - Z) ] / r,
+         qcore  = int (ncore - tncore) * 4*pi*r^2 dr    (AE - PS core charge),
+         g0     = normalized l=0 compensation shape (int g0 r^2 = 1).
+       The compensation charge (qcore - Z) makes the enclosed charge -> -zval.
+
+    Hartree-only ON PURPOSE: ABINIT's own vlocr may additionally subtract a frozen
+    atomic XC term for its DFT SCF bookkeeping; CoQui's frozen D^0 is XC-free by
+    design (GW/HF baseline), so vxc1 is excluded.
+
+    CAUTION: the 1/sqrt(4*pi) normalization of zero_potential changes vhtnzc only
+    INSIDE the augmentation sphere; the -zval/r asymptote comes entirely from the
+    poisson term and is insensitive to it.  A tail check therefore cannot validate
+    this function.  The two routes above are independent and must be compared
+    against each other, which is what the cross-check below does (they agree to
+    2e-5 relative on the Si data sets tested).  This feeds dion via assemble_dij0.
+
+    Returns None if the inputs for both routes are missing.
+    """
+    r = parse["r"]
+    s4pi = np.sqrt(4.0 * np.pi)
+    direct = None
+    if parse.get("vbar") is not None:
+        v = np.asarray(parse["vbar"], float)
+        nn = min(len(r), len(v))
+        if nn == len(r):
+            direct = v / s4pi
+
+    recon = None
+    zpot = parse.get("zero_potential")
+    if not (zpot is None or parse.get("ae_core") is None or parse.get("ps_core") is None
+            or parse.get("znucl") is None):
+        Z = float(parse["znucl"])
+        ncore = np.asarray(parse["ae_core"], float) / s4pi
+        tncore = np.asarray(parse["ps_core"], float) / s4pi
+        qcore = np.trapezoid((ncore - tncore) * 4.0 * np.pi * r**2, r)  # AE - PS core charge
+        G = np.asarray(shape_by_L[0], float)
+        G = G / np.trapezoid(G, r)                                      # g0*r^2, unit monopole
+        nwk = tncore * 4.0 * np.pi * r**2 + G * (qcore - Z)
+        recon = np.asarray(zpot, float) / s4pi + _poisson_over_r(nwk, r)
+
+    if direct is not None and recon is not None:
+        # Independent cross-check inside the augmentation sphere, where dij0 and
+        # every one-center integral actually sample this potential.
+        rc = parse.get("paw_radius")
+        k = len(r) if rc is None else min(len(r), int(np.searchsorted(r, rc)) + 1)
+        sl = slice(1, k)
+        scale = max(1e-30, np.abs(direct[sl]).max())
+        rel = np.abs(direct[sl] - recon[sl]).max() / scale
+        if rel > 1e-3:
+            raise RuntimeError(
+                "abinit2coqui: the two independent constructions of v_H[n~_Zc] "
+                "disagree by %.3e relative inside r < rpaw. Route 1 = "
+                "blochl_local_ionic_potential/sqrt(4pi); route 2 = "
+                "zero_potential/sqrt(4pi) + poisson[tncore + (qcore-Z)g0]. "
+                "One of the two radial functions has an unexpected normalization."
+                % rel)
+    return direct if direct is not None else recon
+
+
+def ionic_hartree_potentials(parse, shape_by_L):
+    """(vhnzc, vhtnzc): the frozen AE / PS ionic HARTREE potentials (Ha).
+
+      vhnzc  = v_H[n_core] - Z/r     (AE side; -> -Zval/r, 0 stored at r=0
+                                      since every consumer integrates u_i u_j
+                                      ~ r^2 against it)
+      vhtnzc = v_H[tilde-n_Zc]       (PS side; reconstruct_vhtnzc, XC-free)
+
+    These are the potentials assemble_dij0 integrates for the frozen D^0, and
+    (times 2, Ry/UPF convention) the Species/paw/{ae_vloc, vloc_ps} exports
+    The on-disk pair is consistent with `dion` by construction.
+    Either may be None when the XML lacks the inputs.
+    """
+    vhtnzc = reconstruct_vhtnzc(parse, shape_by_L)
+    if parse.get("znucl") is None or parse.get("ae_core") is None:
+        return None, vhtnzc
+    r = parse["r"]
+    Z = float(parse["znucl"])
+    rsafe = np.where(r < 1e-12, 1.0, r)
+    ncore = np.asarray(parse["ae_core"], float) / np.sqrt(4.0 * np.pi)
+    vhnzc = _radial_hartree(ncore, r) - Z / rsafe
+    vhnzc[r < 1e-12] = 0.0
+    if vhtnzc is not None:
+        vhtnzc = np.asarray(vhtnzc, float)[:len(r)]
+    return vhnzc, vhtnzc
+
+
+def check_shape_function(parse, shape_by_L, r, rab):
+    """Plan B2: cross-check the analytic compensation shape against the XML's
+    tabulated <shape_function> values (when present); fail loudly on mismatch.
+
+    The tabulated function is g(r) (density convention); the analytic
+    shape_by_L[0] is g_0(r)*r^2. Both are compared after normalizing to a
+    unit monopole, so only the shape matters. Returns the max abs deviation
+    (0.0 when nothing to check).
+    """
+    tab = parse.get("shape_tab")
+    if tab is None:
+        return 0.0
+    ana = np.asarray(shape_by_L[0], float).copy()
+    tabr2 = np.asarray(tab, float)[:r.size] * r ** 2
+    na = np.trapezoid(ana, r)
+    nt = np.trapezoid(tabr2, r)
+    if abs(na) < 1e-300 or abs(nt) < 1e-300:
+        raise RuntimeError("check_shape_function: degenerate shape normalization")
+    ana /= na
+    tabr2 /= nt
+    err = float(np.max(np.abs(ana - tabr2)) / np.max(np.abs(ana)))
+    if err > 1e-5:
+        raise RuntimeError(
+            "abinit2coqui: analytic '%s' compensation shape (rc=%.6f) deviates "
+            "from the XML's tabulated <shape_function> by %.2e (rel L-inf, "
+            "tol 1e-5). The dataset uses a shape this converter does not "
+            "reproduce -- augmentation Q^IJ(G) would be silently wrong "
+            "for this dataset." % (parse["shape_type"],
+                                              parse["shape_rc"], err))
+    return err
+
+
+def assemble_dij0(parse, u_ae, u_ps, shape_by_L, kkbeta):
+    """Frozen PAW D^0 (kinetic + ionic Hartree + compensation).
+
+    ABINIT PAW-XML stores ONLY the kinetic_energy_differences (kij) in
+    <kinetic_energy_differences>; the frozen D^0 needs the ionic part added
+    (see [[reference_coqui_paw_hf_deeq_architecture]]).  This reproduces ABINIT's
+    atompaw_dij0 (shared/common/src/39_libpaw/m_paw_atom.F90, opt_init==0):
+
+      D0[i,j] = kij + <u_ae,i u_ae,j | vhnzc> - <u_ps,i u_ps,j | vhtnzc>
+                    - intvh * <u_ae,i u_ae,j - u_ps,i u_ps,j>       (same-l pairs)
+      vhnzc  = v_H[ae_core] - Z/r        (exact; poisson(ncore)-Z, /r -> -Zval/r)
+      vhtnzc = v_H[tilde-n_Zc]           (the PS ionic Hartree, -> -Zval/r)
+      intvh  = <vhtnzc * g0 * r^2>,  g0 = l=0 compensation shape (unit monopole)
+    All radial integrals run over dr up to the augmentation radius (kkbeta); the
+    AE and PS partial waves match beyond it.  Verified to reproduce ABINIT's dumped
+    D^0 to ~4 digits for Si (s2s2 1193.74 vs 1193.70, p1p1 0.137, p2p2 2.638).
+
+    XC-FREE: vhtnzc here is the PS ionic HARTREE potential v_H[tilde-n_Zc] only
+    (reconstruct_vhtnzc = zero_potential + v_H[tncore + compensation]).  ABINIT's
+    stored local potential additionally subtracts a frozen atomic XC term
+    (vlocr = vbare + vh - vxc1, m_pawpsp.F90) for its DFT SCF bookkeeping; CoQui's
+    frozen D^0 is XC-free by design (it is a self-consistent GW/HF static baseline,
+    no DFT XC -- exchange/correlation come from e_hf + e_rpa), so vxc1 is
+    deliberately EXCLUDED.  Including it would double-count XC against the exact
+    exchange.  This also matches QE's dion convention (XC-free).  If zero_potential
+    or the core densities are missing, we fall back to kinetic-only D^0.
+    """
+    ked = np.asarray(parse["dij0"], float)
+    ns = len(parse["states"])
+    ked = ked.reshape(ns, ns) if ked.size == ns * ns else ked
+    vhnzc, vhtnzc = ionic_hartree_potentials(parse, shape_by_L)
+    if vhnzc is None or vhtnzc is None:
+        return ked                                    # kinetic-only fallback
+    r = parse["r"]
+    lll = np.array([s["l"] for s in parse["states"]], int)
+    g0r2 = np.asarray(shape_by_L[0], float)            # g0(r)*r^2 (r^2 convention)
+    g0r2 = g0r2 / np.trapezoid(g0r2, r)                # unit monopole: int g0 r^2 dr = 1
+    k = int(kkbeta)                                    # cut at augmentation radius
+    intvh = np.trapezoid((vhtnzc * g0r2)[:k], r[:k])
+    D = np.array(ked, float).copy()
+    for i in range(ns):
+        for j in range(ns):
+            if lll[i] != lll[j]:
+                continue
+            aa = u_ae[i] * u_ae[j]
+            pp = u_ps[i] * u_ps[j]
+            D[i, j] += np.trapezoid((aa * vhnzc)[:k], r[:k])
+            D[i, j] -= np.trapezoid((pp * vhtnzc)[:k], r[:k])
+            D[i, j] -= intvh * np.trapezoid((aa - pp)[:k], r[:k])
+    return D
+
+
+def abinit_species_adapter(parse):
+    """Normalize an abinit_pawxml.parse_pawxml() dict into a species dict.
+
+    ABINIT PAW-XML stores partial waves as R (radial function); QE/CoQuI use the
+    u = r*R (times-r) form, so multiply by r.  The compensation shape is the
+    analytic atompaw 'bessel' shape at shape_rc (paw_radial.shape_bessel); moments
+    come from the AE-PS partial-wave difference and are exact regardless of shape.
+    """
+    r = parse["r"]
+    a, d = parse["a"], parse["d"]
+    rab = a * d * np.exp(d * np.arange(parse["nr"]))     # dr/di on r=a(exp(di)-1)
+    lll = np.array([s["l"] for s in parse["states"]], dtype=int)
+    lmax = int(max(lll))
+    nqlc = 2 * lmax + 1
+    lmax_rho = 2 * lmax
+    kkbeta = int(np.searchsorted(r, parse["paw_radius"])) + 1   # inclusive of rc
+    u_ae = parse["phi_ae"] * r                            # R -> u = r*R
+    u_ps = parse["phi_ps"] * r
+    # per-L compensation shape (bessel), in the *r^2 convention
+    if parse["shape_type"] == "bessel":
+        shape_by_L = np.stack([pr.shape_bessel(r, parse["shape_rc"], L) for L in range(nqlc)])
+    elif parse["shape_type"] in ("gauss", "gaussian"):
+        shape_by_L = np.stack([pr.shape_gauss(r, parse["shape_rc"])] * nqlc)
+    elif parse["shape_type"] in ("sinc", "sinc2"):
+        shape_by_L = np.stack([pr.shape_sinc(r, parse["shape_rc"])] * nqlc)
+    else:
+        raise NotImplementedError("shape_type=%s" % parse["shape_type"])
+    zp = float(sum(s.get("f", 0.0) for s in parse["states"]))
+    # Plan B2: tabulated-vs-analytic compensation shape check (hard error).
+    check_shape_function(parse, shape_by_L, r, rab)
+    dij0 = assemble_dij0(parse, u_ae, u_ps, shape_by_L, kkbeta)  # kinetic + ionic Hartree (frozen D^0)
+    # Frozen core number densities n_core(r) (= L=0 moment / sqrt(4pi)); feed the
+    # core-valence Hartree (CoQui rho_core_AE / rho_core_PS, LM=00 channel).
+    s4pi = np.sqrt(4.0 * np.pi)
+    ae_rho_atc = np.asarray(parse["ae_core"], float) / s4pi if parse.get("ae_core") is not None else None
+    rho_atc_ps = np.asarray(parse["ps_core"], float) / s4pi if parse.get("ps_core") is not None else None
+    d = dict(r=r, rab=rab, mesh=parse["nr"], kkbeta=kkbeta, nqlc=nqlc,
+             lmax_rho=lmax_rho, lll=lll, u_ae=u_ae, u_ps=u_ps,
+             proj=parse["proj"], shape_by_L=shape_by_L, dij0=dij0,
+             exx_X=parse.get("exx_X"), zp=zp,
+             exx_core_core=float(parse.get("exx_core_core") or 0.0),
+             n_qn=[s.get("n") for s in parse["states"]])
+    if ae_rho_atc is not None: d["ae_rho_atc"] = ae_rho_atc
+    if rho_atc_ps is not None: d["rho_atc_ps"] = rho_atc_ps
+    # Plan B2 exports:
+    # beta: projectors in the QE u = r*R form (Species/beta, full mesh)
+    d["beta"] = parse["proj"] * r
+    # occupations of the valence channels (Species/paw/oc)
+    d["oc"] = np.array([s.get("f", 0.0) for s in parse["states"]], float)
+    # ae_vloc / vloc_ps: frozen ionic HARTREE potentials, HARTREE on disk
+    # (schema_version 2; readers scale only legacy files). Same
+    # arrays assemble_dij0 integrates, so dion and the exported pair are
+    # mutually consistent. XC-free by design (see reconstruct_vhtnzc); this
+    # deviates from QE's UPF ae_vloc (which carries the frozen atomic XC)
+    # deliberately -- CoQui's D-matrix baseline is XC-free (plan I2).
+    vhnzc, vhtnzc = ionic_hartree_potentials(parse, shape_by_L)
+    if vhnzc is not None:
+        d["ae_vloc"] = vhnzc
+    if vhtnzc is not None:
+        d["vloc_ps"] = vhtnzc
+    # AE core orbitals for the native ex_cvij builder, u = r*R form
+    if parse.get("core_ae_wfc") is not None:
+        cs = parse.get("core_states") or []
+        if len(cs) != parse["core_ae_wfc"].shape[0] or any(
+                st.get("l") is None for st in cs):
+            raise RuntimeError(
+                "abinit2coqui: XML provides ae_core_wavefunction blocks but "
+                "no usable core-state (n, l) metadata -- cannot emit Core/ "
+                "metadata.")
+        d["core"] = dict(
+            n=np.array([st.get("n") if st.get("n") is not None else -1
+                        for st in cs], float),
+            l=np.array([st["l"] for st in cs], float),
+            ae_wfc=parse["core_ae_wfc"] * r)
+    return d
+
+
+def build_paw_augmentation(species, miller_g, recip, omega):
+    """Compute all PAW augmentation arrays for a list of species dicts."""
+    nsp = len(species)
+    per_sp = []
+    nhm = 0
+    for nt, sp in enumerate(species):
+        r, rab = sp["r"], sp["rab"]
+        mesh = sp["mesh"]; nqlc = sp["nqlc"]; lll = np.asarray(sp["lll"], int)
+        ch = pr.enumerate_channels(lll)
+        nh = ch["nh"]
+        nhm = max(nhm, nh)
+
+        pfunc = sp.get("pfunc")
+        ptfunc = sp.get("ptfunc")
+        if pfunc is None:
+            pfunc = pr.pair_products(sp["u_ae"])
+        if ptfunc is None:
+            ptfunc = pr.pair_products(sp["u_ps"])
+
+        mom = pr.multipole_moments(pfunc, ptfunc, r, rab, lll, nqlc, mesh)
+        qfuncl = sp.get("qfuncl")
+        if qfuncl is None:
+            qfuncl = pr.build_qfuncl(mom, sp["shape_by_L"], r, rab, lll, nqlc, mesh)
+
+        qqq = pr.compute_qqq(mom, len(lll))
+        qq_nt = pr.compute_qq_nt(qqq, ch["indv"], ch["nhtolm"])
+
+        qgm = augmentation_function(qfuncl, r, rab, sp["kkbeta"], nqlc, lll,
+                                    ch["indv"], ch["nhtolm"], nh, omega, miller_g, recip)
+        deltaC = compute_deltaC(pfunc, ptfunc, qfuncl, r, rab, ch["indv"], ch["nhtolm"],
+                                lll, nh, sp["lmax_rho"])
+        per_sp.append(dict(ch=ch, nh=nh, qqq=qqq, qq_nt=qq_nt, moments=mom,
+                           qfuncl=qfuncl, pfunc=pfunc, ptfunc=ptfunc,
+                           qgm=qgm, deltaC=deltaC))
+    return dict(nsp=nsp, nhm=nhm, per_sp=per_sp)
+
+
+# --- h5 writer helpers (nda complex convention) ---------------------------
+def _mk_writers(h5py):
+    VLEN = h5py.special_dtype(vlen=str)
+
+    def wreal(g, k, a, dt=None):
+        a = np.ascontiguousarray(a)
+        g.create_dataset(k, data=a if dt is None else a.astype(dt))
+
+    def wcplx(g, k, a):
+        a = np.ascontiguousarray(a).astype(np.complex128)
+        ds = g.create_dataset(k, data=np.ascontiguousarray(np.stack([a.real, a.imag], -1)))
+        ds.attrs.create("__complex__", "1", dtype=VLEN)
+    return VLEN, wreal, wcplx
+
+
+def write_species_block(h5root, species, aug, h5py):
+    """Write /Hamiltonian/Species/nt{i} radial + Onecenter/deltaC (+ paw/ subgroup)."""
+    VLEN, wreal, wcplx = _mk_writers(h5py)
+    H = h5root["Hamiltonian"]
+    Sg = H.require_group("Species")
+    Sg.attrs.create("number_of_species", np.int32(len(species)))
+    for nt, sp in enumerate(species):
+        g = Sg.create_group("nt%d" % nt)
+        g.attrs.create("species_kind", "paw", dtype=VLEN)
+        ch = aug["per_sp"][nt]["ch"]
+        nbeta = len(sp["lll"])
+        # Schema 3 omits data that no reader consumes: the kbeta, qqq and
+        # species-level dion datasets, the q_with_l/nqf/nqlc/lmax/lmax_rho/zp
+        # attributes, and paw pfunc/ptfunc/augmom/oc. `beta` is kept as the
+        # enabler for a native projector build.
+        for k, v in [("mesh", sp["mesh"]), ("kkbeta", sp["kkbeta"]), ("nbeta", nbeta),
+                     ("nh", ch["nh"])]:
+            g.attrs.create(k, np.int32(v))
+        wreal(g, "r", sp["r"], np.float64)
+        wreal(g, "rab", sp["rab"], np.float64)
+        wreal(g, "lll", np.asarray(sp["lll"], np.int32), np.int32)
+        wreal(g, "indv", ch["indv"].astype(np.int32), np.int32)
+        wreal(g, "nhtol", ch["nhtol"].astype(np.int32), np.int32)
+        wreal(g, "nhtolm", ch["nhtolm"].astype(np.int32), np.int32)
+        wreal(g, "aewfc", sp["u_ae"], np.float64)
+        wreal(g, "pswfc", sp["u_ps"], np.float64)
+        wreal(g, "qfuncl", aug["per_sp"][nt]["qfuncl"], np.float64)
+        if "beta" in sp:
+            wreal(g, "beta", sp["beta"], np.float64)
+        # paw/ subgroup (radial local pots + core densities)
+        pg = g.create_group("paw")
+        # mandatory augmentation attrs (pseudopot.cpp read_vnl_h5:765-767):
+        #   lmax_aug = lmax_rho ; raug = -1.0 (sentinel -> use iraug) ; iraug = kkbeta
+        pg.attrs.create("lmax_aug", np.int32(sp["lmax_rho"]))
+        pg.attrs.create("raug", np.float64(-1.0))
+        pg.attrs.create("iraug", np.int32(sp["kkbeta"]))
+        for key in ("ae_vloc", "vloc_ps", "ae_rho_atc", "rho_atc_ps"):
+            if key in sp:
+                wreal(pg, key, sp[key], np.float64)
+        # Core/ group (AE core orbitals, pw2coqui GIPAW schema: float64 n/l,
+        # ae_wfc (ncore, mesh) in u = r*R form) -- input for the native
+        # ex_cvij builder. Only when the XML provided them.
+        if "core" in sp:
+            cg = g.create_group("Core")
+            ncore = int(sp["core"]["ae_wfc"].shape[0])
+            cg.attrs.create("ncore_orbitals", np.int32(ncore))
+            wreal(cg, "n", sp["core"]["n"], np.float64)
+            wreal(cg, "l", sp["core"]["l"], np.float64)
+            wreal(cg, "ae_wfc", sp["core"]["ae_wfc"], np.float64)
+        # core-core exact-exchange energy (Ha): frozen additive constant to
+        # the total energy; frozen-core analogue of QE's etot terms.
+        if sp.get("exx_core_core"):
+            g.attrs.create("exx_core_core", np.float64(sp["exx_core_core"]))
+        # Onecenter/deltaC
+        og = g.create_group("Onecenter")
+        wreal(og, "deltaC", aug["per_sp"][nt]["deltaC"], np.float64)
+        # Onecenter/ex_cvij: frozen core-valence exact-exchange kernel. Expand the
+        # ln-basis <exact_exchange_X_matrix> to the nh basis (nonzero only for the
+        # same lm, exactly ABINIT's `if(ilm==jlm) ex_cvij=...`); contracts linearly
+        # with becsum in CoQui (factor 1). ns×ns exx_X is indexed by beta channel.
+        exxln = sp.get("exx_X")
+        if exxln is not None:
+            ch = aug["per_sp"][nt]["ch"]
+            indv = np.asarray(ch["indv"], int); nhtolm = np.asarray(ch["nhtolm"], int)
+            nh_a = int(ch["nh"]); exxln = np.asarray(exxln, float)
+            ex_cv = np.zeros((nh_a, nh_a))
+            for I in range(nh_a):
+                for J in range(nh_a):
+                    if nhtolm[I] == nhtolm[J]:
+                        ex_cv[I, J] = exxln[indv[I] - 1, indv[J] - 1]
+            wreal(og, "ex_cvij", ex_cv, np.float64)
+
+
+def _paw_channels(sp):
+    """psp-like `channels` list for reuse of abinit_hamiltonian.build_beta_k.
+    One channel per beta: chi = r*proj (u-form) so the existing r^1 radial
+    transform yields INT proj(r) j_l(qr) r^2 dr (the QE beta(k+G) convention)."""
+    r = sp["r"]
+    proj = sp["proj"]                                  # (nbeta, nr) R-form projectors
+    lll = np.asarray(sp["lll"], int)
+    chans = []
+    for b in range(len(lll)):
+        chans.append(dict(l=int(lll[b]), r=r, chi=(r * proj[b])[:, None],
+                          ekb=[float(np.diag(sp["dij0"])[b])]))
+    return chans
+
+
+def _scatter_to_box(values, miller, mesh):
+    """Place values (ngm,) at integer miller triples into an (n1,n2,n3) box."""
+    box = np.zeros(tuple(int(n) for n in mesh), complex)
+    idx = [np.mod(miller[:, d], mesh[d]) for d in range(3)]
+    box[idx[0], idx[1], idx[2]] = values
+    return box
+
+
+def write_hamiltonian_paw(h5root, w, vtrial, paw_parses, verbose=True,
+                          rho_den=None, xc_name="pbe"):
+    """Emit /Hamiltonian (pp_type='paw') from ABINIT WFK + POT + PAW-XML parses.
+
+    Reuses abinit_hamiltonian for the shared block (dense grid, scf_local_potential,
+    per-k PAW projectors beta(k+G) via r*proj), and the builders here for the
+    augmentation (ijtoh, qq_nt, Q^IJ(G)) + Species radial + Onecenter/deltaC.
+
+    Conventions (validated by reproducing ABINIT's KS eigenvalues to ~1e-5 Ha via
+    the generalized eigenproblem, see validate_h0_paw.py): PAW projectors use the
+    r*proj (=> r^1) radial transform; potentials and dion are in Rydberg. The
+    static `dion` is ABINIT's frozen Dij0 (kinetic + ionic, XC-free); `deeq` is left
+    to CoQuI's native reconstruction from the Species block.
+    """
+    import h5py
+    import abinit_hamiltonian as ah
+    VLEN, wreal, wcplx = _mk_writers(h5py)
+
+    recv, rprimd = w["recv"], w["rprimd"]
+    vol = abs(np.linalg.det(rprimd))
+    tau = w["xred"] @ rprimd
+    typat = w["typat"]; nat = len(typat)
+    nsp = len(paw_parses); nspin = w["nsppol"]; npol = 1; nk = w["nkpt"]
+
+    species = [abinit_species_adapter(p) for p in paw_parses]
+
+    # dense grid + KS potential (from POT vtrial), same as the norm-conserving
+    # path (miller_g = ecutrho-style sphere)
+    ngfft = tuple(int(x) for x in np.array(vtrial).shape[1:4])
+    miller_g, (I1, I2, I3) = ah.dense_sphere(ngfft, rprimd, recv)
+    ngm = miller_g.shape[0]
+    vloc = np.array(vtrial)[0, :, :, :, 0].astype(float)
+    Vg = np.fft.fftn(vloc) / vloc.size
+    vks_flat = Vg[I1, I2, I3]
+    Gcart = miller_g @ recv
+    Gn = np.linalg.norm(Gcart, axis=1)
+
+    # projector bookkeeping (one channel per beta -> nh in beta order).
+    # proj_per_atom is per-SPECIES (length nsp, QE nh(1:nsp) convention,
+    # convention); projector_offset stays per-atom.
+    nh_sp = np.array([sum(2 * int(l) + 1 for l in s["lll"]) for s in species],
+                     dtype=np.int32)
+    nh_atom = np.array([nh_sp[typat[a] - 1] for a in range(nat)], dtype=np.int32)
+    proj_off = np.concatenate([[0], np.cumsum(nh_atom)[:-1]]).astype(np.int32)
+    nkb = int(nh_atom.sum())
+    nhm = int(nh_sp.max())
+
+    # ---- local ionic potential pp_local_component (QE vltot convention) ----
+    # PAW-XML stores every radial function as its L=0 spherical-harmonic expansion
+    # coefficient, i.e. sqrt(4*pi) TIMES the physical radial function.  ABINIT
+    # divides each local-potential variant by sqrt(4*pi) on read
+    # (m_pawpsp.F90:3730 blochl, :3745 kresse_joubert, :3767 zero_potential), and
+    # blochl_local_ionic_potential/sqrt(4*pi) IS v_H[n~_Zc]: it already carries the
+    # VALENCE-only -zval/r tail, with the frozen core screening included.
+    #
+    # This normalization is easy to get wrong and hard to detect.  Dropping the
+    # 1/sqrt(4*pi) rescales the tail to -zval*sqrt(4*pi)/r, close enough to
+    # -Z_nuc/r to invite a frozen-core Hartree screening term that does not
+    # belong.  That pair of errors nearly cancels in the long range but not at
+    # short range or at G=0, and it corrupts the volume dependence of the
+    # one-body energy while leaving the lattice constant plausible.  The
+    # invariants worth checking are Qtail = 4.000000 exactly and, for Si,
+    # alpha_Z = 8.858468 against ABINIT's epsatm = 8.858424 (5 ppm).
+    #
+    # The Coulomb split then makes the sin-transform integrand short-ranged and the
+    # -Q/r long range analytic: V(G!=0) = FT[v+Q/r] - 4*pi*Q/(vol*G^2), with the G=0
+    # term the finite "alpha" reference.  Q is the EXACT zval, not the numerical
+    # plateau: a dataset-noise-driven Q leaks a spurious monopole into every G.
+    vloc_tot = np.zeros(ngm, dtype=complex)
+    small = Gn < 1e-8
+    Gs = np.where(small, 1.0, Gn)
+    for a in range(nat):
+        p = paw_parses[typat[a] - 1]
+        zval = float(sum(s.get("f", 0.0) for s in p["states"]))
+        r = p["r"]; vbar = p["vbar"]
+        nn = min(len(r), len(vbar))
+        r = r[:nn]
+        vion = np.asarray(vbar, float)[:nn] / np.sqrt(4.0 * np.pi)
+        # The tail MUST be -zval/r. A mis-normalized or core-unscreened potential
+        # shows up here, and nowhere else that any other check looks.
+        Qtail = -float((r * vion)[-1])
+        if abs(Qtail - zval) > 1e-3 * max(1.0, zval):
+            raise RuntimeError(
+                "abinit2coqui: blochl_local_ionic_potential/sqrt(4pi) has tail "
+                "-%.6f/r but the dataset's valence charge is %.6f. The PAW-XML "
+                "local ionic potential must go as -zval/r (core screening "
+                "included). Check the L=0 sqrt(4pi) convention of this dataset."
+                % (Qtail, zval))
+        rvsr = r * vion + zval                             # short-ranged: -> 0 at large r
+        sr = (4 * np.pi / vol) * np.trapezoid(
+            rvsr[None, :] * np.sin(np.outer(Gs, r)) / Gs[:, None], r, axis=1)
+        sr -= np.where(small, 0.0, 4.0 * np.pi * zval / (vol * Gs**2))
+        sr[small] = (4 * np.pi / vol) * np.trapezoid(rvsr * r, r)   # finite alpha
+        vloc_tot += np.exp(-1j * (Gcart @ tau[a])) * sr
+
+    # augmentation (validated builders)
+    atomic_id = (typat - 1).astype(np.int32)
+    aug = build_paw_augmentation(species, miller_g, recv, vol)
+
+    # ---- write /Hamiltonian/paw ----
+    H = h5root.create_group("Hamiltonian")
+    # Version 2 of the schema put every energy-valued dataset in HARTREE on
+    # disk (ABINIT is natively Ha, so there are no conversion factors below).
+    # Version 3 additionally pins /Orbitals@ecutrho to HARTREE (the exact
+    # inscribed-sphere cutoff) and omits datasets that no reader consumes:
+    # the core-zeroed vxc, the species-level
+    # kbeta/qqq/dion/q_with_l/nqf/nqlc/lmax/lmax_rho/zp entries, and
+    # paw pfunc/ptfunc/augmom/oc.
+    H.attrs.create("schema_version", np.int32(3))
+    H.attrs.create("pp_type", "paw", dtype=VLEN)
+    g = H.create_group("paw")
+    for k, val in [("number_of_nspins", nspin), ("number_of_polarizations", npol),
+                   ("number_of_kpoints", nk), ("max_npw", int(w["npw"][:nk].max())),
+                   ("number_of_atoms", nat), ("number_of_species", nsp),
+                   ("total_num_of_proj", nkb), ("max_proj_per_atom", nhm),
+                   ("ngm", ngm), ("lspinorbit_nl", 0), ("lspinorbit_loc", 0)]:
+        g.attrs.create(k, np.int32(val))
+    wreal(g, "miller_g", miller_g, np.int32)
+    wcplx(g, "pp_local_component", vloc_tot)                    # Hartree (schema 2)
+    wcplx(g, "scf_local_potential", vks_flat.reshape(nspin, npol * npol, ngm))
+    # vxc_with_nlcc (HARTREE on disk, schema >= 2 -- add_vxc applies no scale;
+    # the old "Ry on disk" comment here was stale, the values were always the
+    # Ha-native vxc_grid output). Written only when a DEN was provided (plan
+    # B2): vxc_with_nlcc = f(rho_DEN + sum_a tilde-n_core). For PAW, rho_DEN
+    # is ABINIT's smooth rhor (tilde-n + nhat); the smooth-grid vxc is the
+    # operator the G0W0 Sigma - Vxc subtraction needs (one-center XC lives in
+    # Dij, outside the plane-wave dataset, exactly as in the QE PAW path).
+    # (schema 3) Without --den the datasets are OMITTED -- the pre-audit
+    # zeros were indistinguishable from a genuine XC-free source. The
+    # valence-only "vxc" variant is dead at read and no longer written.
+    if rho_den is not None:
+        import xc_functionals as xcf
+        rho_r = np.asarray(rho_den, float)
+        if rho_r.ndim != 3:
+            raise NotImplementedError(
+                "abinit2coqui PAW vxc: nsppol=1 only (got shape %s)" % (rho_r.shape,))
+        if tuple(rho_r.shape) != tuple(ngfft):
+            raise RuntimeError("abinit2coqui: DEN grid %s != POT grid %s"
+                               % (rho_r.shape, ngfft))
+        # add the frozen PS core densities (NLCC analogue) in G space
+        core_g = np.zeros(ngm, complex)
+        for a in range(nat):
+            p = paw_parses[typat[a] - 1]
+            if p.get("ps_core") is None:
+                continue
+            rr = p["r"]
+            tnc = np.asarray(p["ps_core"], float) / np.sqrt(4.0 * np.pi)
+            small = Gn < 1e-8
+            Gs = np.where(small, 1.0, Gn)
+            # 4pi/vol INT tnc(r) sin(Gr)/(Gr) r^2 dr  (spherical FT)
+            ft = (4 * np.pi / vol) * np.trapezoid(
+                tnc[None, :] * np.sin(np.outer(Gs, rr)) * rr[None, :]
+                / Gs[:, None], rr, axis=1)
+            ft[small] = (4 * np.pi / vol) * np.trapezoid(tnc * rr * rr, rr)
+            core_g += np.exp(-1j * (Gcart @ tau[a])) * ft
+        core_r = np.real(np.fft.ifftn(
+            _scatter_to_box(core_g, miller_g, rho_r.shape))) * rho_r.size
+        vxc_nlcc_r = xcf.vxc_grid(rho_r + core_r, recv, xc_name)
+        vgn = np.fft.fftn(vxc_nlcc_r) / vxc_nlcc_r.size
+        wcplx(g, "vxc_with_nlcc",
+              vgn[I1, I2, I3].reshape(nspin, npol * npol, ngm))
+    else:
+        print("# abinit2coqui: no --den -> vxc_with_nlcc omitted "
+              "(GW@DFT Sigma - Vxc subtraction unavailable from this file)")
+    wreal(g, "proj_per_atom", nh_sp, np.int32)
+    wreal(g, "projector_offset", proj_off, np.int32)
+    wreal(g, "npw", np.array(w["npw"][:nk]), np.int32)
+    wreal(g, "atomic_id", atomic_id, np.int32)
+    # dion (nsp,nhm,nhm): D^0 from dij0, m-diagonal, Hartree (schema 2)
+    dion = np.zeros((nsp, nhm, nhm), np.float64)
+    for isp, s in enumerate(species):
+        ch = aug["per_sp"][isp]["ch"]; nh = ch["nh"]
+        for I in range(nh):
+            for J in range(nh):
+                if ch["nhtolm"][I] == ch["nhtolm"][J]:
+                    dion[isp, I, J] = s["dij0"][ch["indv"][I] - 1, ch["indv"][J] - 1]
+    wreal(g, "dion", dion, np.float64)
+    # per-k PAW projectors beta(k+G) = r*proj transform
+    for ik in range(nk):
+        n = int(w["npw"][ik]); mill_k = w["kg"][ik][:n]
+        kcart = w["kpts_crys"][ik] @ recv
+        cols = []
+        for a in range(nat):
+            s = species[typat[a] - 1]
+            psp = dict(channels=_paw_channels(s))
+            beta, _ = ah.build_beta_k(psp, mill_k, kcart, recv, tau[a], vol)
+            cols.append(beta)
+        beta_all = np.concatenate(cols, axis=1) if cols else np.zeros((n, 0), complex)
+        wreal(g, "miller_k" + str(ik), mill_k.astype(np.int32), np.int32)
+        wcplx(g, "projector_k" + str(ik), beta_all.T)          # (nkb, npw)
+
+    # augmentation + Species blocks (validated)
+    write_paw_augmentation(h5root, aug, atomic_id, miller_g, ngm, h5py)
+    write_species_block(h5root, species, aug, h5py)
+    if verbose:
+        print("#   /Hamiltonian(paw): ngm=%d nkb=%d nhm=%d ngfft=%s nsp=%d"
+              % (ngm, nkb, nhm, ngfft, nsp))
+    return dict(ngm=ngm, nkb=nkb, nhm=nhm, ngfft=ngfft)
+
+
+def write_paw_augmentation(h5root, aug, atomic_id, miller_g, ngm, h5py):
+    """Write the augmentation-only datasets into /Hamiltonian/paw:
+    ijtoh, qq_nt, augmentation_function_isp{nt}.  (The NC-like datasets --
+    potentials, projectors, dion -- are written separately by the NC emitter
+    into the same 'paw' group.)"""
+    VLEN, wreal, wcplx = _mk_writers(h5py)
+    H = h5root["Hamiltonian"]
+    g = H["paw"] if "paw" in H else H.create_group("paw")
+    nsp = aug["nsp"]; nhm = aug["nhm"]
+    # ijtoh (nsp,nhm,nhm), qq_nt (nsp,nhm,nhm) padded to nhm
+    ijtoh = np.zeros((nsp, nhm, nhm), np.int32)
+    qq_nt = np.zeros((nsp, nhm, nhm), np.float64)
+    for nt in range(nsp):
+        nh = aug["per_sp"][nt]["nh"]
+        ijtoh[nt, :nh, :nh] = aug["per_sp"][nt]["ch"]["ijtoh"]
+        qq_nt[nt, :nh, :nh] = aug["per_sp"][nt]["qq_nt"]
+    wreal(g, "ijtoh", ijtoh, np.int32)
+    wreal(g, "qq_nt", qq_nt, np.float64)
+    for nt in range(nsp):
+        # QE names the dataset with the 0-based species index
+        wcplx(g, "augmentation_function_isp%d" % nt, aug["per_sp"][nt]["qgm"])

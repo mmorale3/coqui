@@ -73,7 +73,8 @@ namespace coqui_py {
 
     /* FFT grid */
     auto ecutrho () const { return _mf->ecutrho(); }
-    auto fft_grid() const { return _mf->fft_grid_dim(); }
+    auto fft_grid() const { return _mf->fft_grid_dim(); }          // smooth grid (dffts)
+    auto fft_grid_aug() const { return _mf->fft_grid_dim_aug(); }  // dense grid (dfftp)
     auto ecutwfc () const { return _mf->wfc_truncated_grid()->ecut(); }
     auto fft_grid_wfc() const { return _mf->wfc_truncated_grid()->mesh(); }
 
