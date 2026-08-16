@@ -1232,11 +1232,16 @@ auto thc::chol_metric_impl(int iq, int nIpts, nda::range a_range, nda::range b_r
       // weighted selection then costs the same as the unweighted one.
       auto fw = [&](double e) -> double {
         double x = std::abs(e - mu);
+        double f;
         if(isdf_pair_weight == "exp")
-          return std::exp(-isdf_weight_params[0]*x);
-        if(isdf_pair_weight == "sigmoid")
-          return 1.0/(1.0 + std::exp((x - isdf_weight_params[0])/isdf_weight_params[1]));
-        return std::pow(x + isdf_eta, -isdf_weight_params[0]);   // "power"
+          f = std::exp(-isdf_weight_params[0]*x);
+        else if(isdf_pair_weight == "sigmoid")
+          f = 1.0/(1.0 + std::exp((x - isdf_weight_params[0])/isdf_weight_params[1]));
+        else
+          f = std::pow(x + isdf_eta, -isdf_weight_params[0]);   // "power"
+        // floor guards against rank collapse when the weight window covers only
+        // a small fraction of a large orbital set
+        return std::max(f, isdf_weight_floor);
       };
       lap_c = nda::array<RealType,1>(1); lap_c(0) = 1.0;
       wtab_a = nda::array<RealType,3>(1, nspins*nkpts, a_range.size());

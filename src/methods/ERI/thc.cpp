@@ -127,6 +127,7 @@ thc::thc(mf::MF *mf_,
   isdf_laplace_terms( io::get_value_with_default<int>(pt,"isdf_laplace_terms",4) ),
   isdf_eta( io::get_value_with_default<double>(pt,"isdf_eta",0.01) ),
   isdf_weight_params( io::get_array_with_default<double>(pt,"isdf_weight_params",std::vector<double>{}) ),
+  isdf_weight_floor( io::get_value_with_default<double>(pt,"isdf_weight_floor",0.0) ),
   isdf_metric( io::get_value_with_default<std::string>(pt,"isdf_metric","l2") ),
   isdf_pool_factor( io::get_value_with_default<double>(pt,"isdf_pool_factor",2.0) ),
   isdf_metric_qavg( io::get_value_with_default<bool>(pt,"isdf_metric_qavg",true) ),
@@ -192,8 +193,8 @@ void thc::print_metadata()
   app_log(2,"  ISDF point-selection options:");
   std::string wp_str;
   for(auto v : isdf_weight_params) wp_str += (wp_str.empty() ? "" : ", ") + std::to_string(v);
-  app_log(2,"    isdf_filter_alpha = {} | isdf_pair_weight = {} | isdf_laplace_terms = {} | isdf_eta = {} | isdf_weight_params = [{}]",
-          isdf_filter_alpha, isdf_pair_weight, isdf_laplace_terms, isdf_eta, wp_str);
+  app_log(2,"    isdf_filter_alpha = {} | isdf_pair_weight = {} | isdf_laplace_terms = {} | isdf_eta = {} | isdf_weight_params = [{}] | isdf_weight_floor = {}",
+          isdf_filter_alpha, isdf_pair_weight, isdf_laplace_terms, isdf_eta, wp_str, isdf_weight_floor);
   app_log(2,"    isdf_metric = {} | isdf_pool_factor = {} | isdf_metric_qavg = {} | isdf_metric_gcut = {} | isdf_metric_omega = {}",
           isdf_metric, isdf_pool_factor, isdf_metric_qavg, isdf_metric_gcut, isdf_metric_omega);
   utils::memory_report(2);

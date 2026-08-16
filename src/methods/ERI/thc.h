@@ -362,6 +362,7 @@ class thc
   int isdf_laplace_terms = 4;
   double isdf_eta = 0.01;
   std::vector<double> isdf_weight_params;
+  double isdf_weight_floor = 0.0;
   // knob 3: Coulomb-metric re-ranking of a pooled candidate set, "l2" | "bare" | "attenuated"
   std::string isdf_metric = "l2";
   double isdf_pool_factor = 2.0;
