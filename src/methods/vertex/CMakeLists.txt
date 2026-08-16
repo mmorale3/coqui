@@ -25,3 +25,7 @@ install(TARGETS vertex_lib
 if (BUILD_UNIT_TESTS)
   add_subdirectory(tests)
 endif()
+
+# notes/ladder_opt_spec.md B0: the distributed dense-pipeline bench (always built -- it is
+# the design/regression harness for the SLATE ladder path, and it is small)
+add_subdirectory(bench)
