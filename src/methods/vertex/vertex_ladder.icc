@@ -142,6 +142,10 @@ namespace solvers {
       long nq_ext = 0, nq_full = 0, nab = 0;
       long nproc = 1, lsize = 1;     // (s,q)-unit groups x intra-group ranks
       double gb_local = 0.0;         // total rank-local physics allocation, GB
+      // optimization increment A: what is actually materialized on this rank
+      long nnu_loc = 0;              // nu slices of Cb kept here (A.4)
+      bool want_Kb = false;          // Kb allocated (one-rung output requested) (A.2)
+      bool any_solve = false;        // Kbig/Rm allocated (a resolvent solve is requested)
     };
 
     inline const char *prof_phase_name(int p) {
@@ -149,7 +153,7 @@ namespace solvers {
         case ladder_prof::P_DCHI0:   return "d/E legs + chi0 (Cb)";
         case ladder_prof::P_KERNEL:  return "K rung blocks (Kb)";
         case ladder_prof::P_KPACK:   return "Kbig pack + D stack";
-        case ladder_prof::P_XK:      return "XK = Xh.Kt product";
+        case ladder_prof::P_XK:      return "Rm rows = -Xh.Kt/nk";
         case ladder_prof::P_LAM:     return "lambda_max power it.";
         case ladder_prof::P_RESOLV:  return "resolvent inverse";
         case ladder_prof::P_PROJD:   return "projections to N_m";
@@ -240,17 +244,21 @@ namespace solvers {
                 shape, ne, gb);
       };
       const double dk = double(pr.nk), dc2 = double(pr.nc2), dm = double(pr.Nm);
-      const double dD = double(pr.Dsz), dnu = double(pr.nnu), dab = double(pr.nab);
+      const double dD = double(pr.Dsz), dab = double(pr.nab);
+      // optimization increment A: the table reports what this rank ACTUALLY allocates --
+      // Cb only on its own nu slices, Kb only with a one-rung output, Kbig/Rm only with a
+      // solve, and XK not at all.
+      const double dnul = double(pr.nnu_loc);
+      const double dkb = pr.want_Kb ? dk : 0.0, dsD = pr.any_solve ? dD : 0.0;
       row("G_CC",   "(nt,ns,nk,nc,nc)",  double(pr.nt) * double(pr.ns) * dk *
                                          double(pr.nc) * double(pr.nc));
       row("Dmat+Dcj", "2 x (nk,nc2,Nm)", 2.0 * dk * dc2 * dm);
-      row("Cb",     "(nk,nnu,nc2,nc2)",  dk * dnu * dc2 * dc2);
-      row("Kb",     "(nk,nk,nc2,nc2)",   dk * dk * dc2 * dc2);
+      row("Cb",     "(nk,nnu_loc,nc2,nc2)", dk * dnul * dc2 * dc2);
+      row("Kb",     "(nk,nk,nc2,nc2)",   dkb * dkb * dc2 * dc2);
       row("Pf+Bf",  "(nt|nw_b,nc2^2)",   2.0 * double(pr.nt) * dc2 * dc2);
       row("Y1+Y2",  "2 x (nk,nc2,Nm)",   2.0 * dk * dc2 * dm);
-      row("Rm",     "(D,D)",             dD * dD);
-      row("Kbig",   "(D,D)",             dD * dD);
-      row("XK",     "(D,D)",             dD * dD);
+      row("Rm",     "(D,D)",             dsD * dsD);
+      row("Kbig",   "(D,D)",             dsD * dsD);
       row("XD..Zl", "4 x (D,Nm)",        4.0 * dD * dm);
       row("Dstack_c", "(D,Nm)",          dD * dm);
       if (pr.nab > 0) {
@@ -258,9 +266,11 @@ namespace solvers {
         row("XE..ZlE", "5 x (D,nab)",     5.0 * dD * dab);
       }
       pr.gb_local = tot;
-      app_log(1, "  [ladder-prof {}] TOTAL rank-local = {:.3f} GB   (the three (D,D) "
-                 "arrays Rm/Kbig/XK alone = {:.3f} GB, Kb = {:.3f} GB)",
-              tag, tot, 3.0 * dD * dD * z, dk * dk * dc2 * dc2 * z);
+      app_log(1, "  [ladder-prof {}] TOTAL rank-local = {:.3f} GB   (the (D,D) arrays "
+                 "Rm/Kbig = {:.3f} GB, Kb = {:.3f} GB; nu slices kept = {} of {}; the "
+                 "historic path allocated 3 x (D,D) = {:.3f} GB plus Kb and all {} nu)",
+              tag, tot, 2.0 * dsD * dsD * z, dkb * dkb * dc2 * dc2 * z,
+              pr.nnu_loc, pr.nnu, 3.0 * dD * dD * z, pr.nnu);
       app_log_flush();
     }
 
@@ -576,15 +586,43 @@ namespace solvers {
                        "pair_space_ladder: transfer mesh does not connect k = {} to "
                        "k' = {}.", ik, ikp);
 
+      // P3: intra-group coordinates (lsize = 1 without a group communicator). Needed
+      // BEFORE the allocations: increment A sizes Cb by the rank's OWN nu count.
+      const long lrank = (g_comm != nullptr) ? g_comm->rank() : 0;
+      const long lsize = (g_comm != nullptr) ? g_comm->size() : 1;
+      // ---- OPTIMIZATION INCREMENT A (notes/ladder_opt_spec.md), memory ------------------
+      // Three D^2-class arrays of the historic path are gone on the production (whalf)
+      // path; the ARITHMETIC is untouched (gate A: the ladder observables are identical to
+      // all printed digits), only what is materialized changes.
+      //   A.2 `Kb` is built ONLY when a one-rung output is requested -- otherwise the rung
+      //       block goes straight into Kbig's (ikp, ik) block (the twist-pack composed with
+      //       the Kbig transpose), and the group reduce moves from Kb to Kbig. The two
+      //       reduces are exact either way: the (ik, ikp) writes are DISJOINT, so every
+      //       summand but one is a hard zero and no rounding can depend on the order.
+      //   A.3 `XK` is never formed: the row blocks are accumulated into Rm with
+      //       alpha = -1/nk, the power iteration runs on -Rm (|(-Rm)v| = |Rm v|, and IEEE
+      //       negation is exact at every step, so the estimate is unchanged) and the +I
+      //       lands on the diagonal afterwards.
+      //   A.4 `Cb` keeps only the nu slices this rank actually solves. It is now built
+      //       nu-locally over ALL ik instead of ik-split + all-reduced: the per-ik values
+      //       are the same expression on the same operands (bit-identical), the reduce
+      //       disappears entirely, and the extra chi0 work is < 1% of a unit wall.
+      // Kbig/Rm exist only where a resolvent solve is requested (the pure one-rung gate
+      // paths allocate neither).
+      const bool want_Kb = (Pi_onerung != nullptr or Pi_onerung_loc != nullptr);
+      const bool any_solve = (Pi_ladder != nullptr or Pi_lad_loc != nullptr);
+      const long nnu_loc = (nnu > lrank) ? (nnu - lrank + lsize - 1) / lsize : 0;
+      const long kb_nk = want_Kb ? nk : 0, kb_nc2 = want_Kb ? nc2 : 0;
+      const long sD = any_solve ? Dsz : 0;
       nda::array<ComplexType, 3> Dmat(nk, nc2, Nm), Dcj(nk, nc2, Nm);
-      nda::array<ComplexType, 4> Cb(nk, nnu, nc2, nc2);
-      nda::array<ComplexType, 4> Kb(nk, nk, nc2, nc2);
+      nda::array<ComplexType, 4> Cb(nk, nnu_loc, nc2, nc2);
+      nda::array<ComplexType, 4> Kb(kb_nk, kb_nk, kb_nc2, kb_nc2);
       nda::array<ComplexType, 2> Pf(nt, nc2 * nc2), Bf(nw_b, nc2 * nc2);
       nda::array<ComplexType, 2> U1(Nm, nc2), U2(Nm, nc2), WU2(Nm, nc2), wb(nc2, nc2);
       nda::array<ComplexType, 3> Y1(nk, nc2, Nm), Y2(nk, nc2, Nm);
       nda::array<ComplexType, 2> KtY1(nc2, Nm), T2(Nm, Nm);
-      nda::matrix<ComplexType> Rm(Dsz, Dsz);
-      nda::array<ComplexType, 2> Kbig(Dsz, Dsz), XK(Dsz, Dsz);
+      nda::matrix<ComplexType> Rm(sD, sD);
+      nda::array<ComplexType, 2> Kbig(sD, sD);
       nda::array<ComplexType, 2> XD(Dsz, Nm), KXD(Dsz, Nm), XKXD(Dsz, Nm), Zl(Dsz, Nm);
       nda::array<ComplexType, 2> Dstack_c(Dsz, Nm);
       // I3 power-iteration workspace (allocated only when the watchdog is requested, so
@@ -601,14 +639,12 @@ namespace solvers {
       nda::array<ComplexType, 2> XE(lD, nab), KXE(lD, nab), XKXE(lD, nab), ZlE(lD, nab);
       nda::array<ComplexType, 2> Estack_c(lD, nab);
 
-      // P3: intra-group coordinates (lsize = 1 without a group communicator)
-      const long lrank = (g_comm != nullptr) ? g_comm->rank() : 0;
-      const long lsize = (g_comm != nullptr) ? g_comm->size() : 1;
       if (prof) {
         prof->ns = ns; prof->nk = nk; prof->nc = nc; prof->nc2 = nc2;
         prof->Nm = Nm; prof->Dsz = Dsz; prof->nnu = nnu; prof->nt = nt;
         prof->nq_ext = nq_ext; prof->nq_full = nq_full; prof->nab = nab;
         prof->nproc = nproc; prof->lsize = lsize;
+        prof->nnu_loc = nnu_loc; prof->want_Kb = want_Kb; prof->any_solve = any_solve;
         prof->rss_alloc = prof_rss_gb();
         if (rank == 0 and lrank == 0) prof_alloc_table(*prof, "core");
         prof->t_setup = pwatch.lap();
@@ -631,7 +667,6 @@ namespace solvers {
           if (lsize > 1) {
             Dmat() = ComplexType(0.0);
             Dcj() = ComplexType(0.0);
-            Cb() = ComplexType(0.0);
             if (want_loc) { Emat() = ComplexType(0.0); Ecj() = ComplexType(0.0); }
           }
           for (long ik = 0; ik < nk; ++ik) {
@@ -656,6 +691,13 @@ namespace solvers {
                       Emat(ik, a * nc + b, m * norb + n2) = e;
                       Ecj(ik, a * nc + b, m * norb + n2) = std::conj(e);
                     }
+          }
+          // A.4: the chi0 blocks, for THIS rank's nu slices only and over ALL ik -- no
+          // reduce, and the (nk, nnu, nc2, nc2) replicated store shrinks to the ~nnu/lsize
+          // slices the solves below actually read. Same expression, same operands per ik,
+          // so every kept value is bit-identical to the historic ik-split + all-reduce.
+          for (long ik = 0; ik < nk and nnu_loc > 0; ++ik) {
+            const long ikpq = kpq(iq, ik);
             for (long s = 0; s < nt; ++s) {
               const long sm = tools.t_mirror(s);
               for (long p1p = 0; p1p < nc; ++p1p)
@@ -666,17 +708,18 @@ namespace solvers {
                           G_CC(sm, is, ik, a, p1p) * G_CC(s, is, ikpq, p3, b);
             }
             nda::blas::gemm(ComplexType(-1.0), tools.Twt_bb, Pf, ComplexType(0.0), Bf);
-            for (long jn = 0; jn < nnu; ++jn)
+            for (long jl = 0; jl < nnu_loc; ++jl) {
+              const long jn = lrank + jl * lsize;
               for (long r = 0; r < nc2; ++r)
                 for (long c = 0; c < nc2; ++c)
-                  Cb(ik, jn, r, c) = Bf(nu_list[jn], r * nc2 + c);
+                  Cb(ik, jl, r, c) = Bf(nu_list[jn], r * nc2 + c);
+            }
           }
           pph.end();
           pph.begin(ladder_prof::P_MPI);
           if (lsize > 1) {
             g_comm->all_reduce_in_place_n(Dmat.data(), Dmat.size(), std::plus<>{});
             g_comm->all_reduce_in_place_n(Dcj.data(), Dcj.size(), std::plus<>{});
-            g_comm->all_reduce_in_place_n(Cb.data(), Cb.size(), std::plus<>{});
             if (want_loc) {
               g_comm->all_reduce_in_place_n(Emat.data(), Emat.size(), std::plus<>{});
               g_comm->all_reduce_in_place_n(Ecj.data(), Ecj.size(), std::plus<>{});
@@ -690,7 +733,10 @@ namespace solvers {
           // q_star(qx), PQ-TRANSPOSED for trev transfers (memo (P2)).
           // P3: flattened (ik, ik') split over group ranks, same disjoint-write reduce.
           pph.begin(ladder_prof::P_KERNEL);
-          if (lsize > 1) Kb() = ComplexType(0.0);
+          if (lsize > 1) {
+            if (want_Kb) Kb() = ComplexType(0.0);
+            else if (any_solve) Kbig() = ComplexType(0.0);
+          }
           for (long ik = 0; ik < nk; ++ik) {
             const long ikpq = kpq(iq, ik);
             for (long ikp = 0; ikp < nk; ++ikp) {
@@ -709,30 +755,48 @@ namespace solvers {
               nda::blas::gemm(nda::transpose(U1), WU2, wb);
               // twist-pack (the anchor's to_wmat):
               //   K_{(p1' nc + p3),(p1 nc + p3')} = wb_{(p1 nc + p1'),(p3 nc + p3')}
-              for (long p1 = 0; p1 < nc; ++p1)
-                for (long p1p = 0; p1p < nc; ++p1p)
-                  for (long p3 = 0; p3 < nc; ++p3)
-                    for (long p3p = 0; p3p < nc; ++p3p)
-                      Kb(ik, ikp, p1p * nc + p3, p1 * nc + p3p) =
-                          wb(p1 * nc + p1p, p3 * nc + p3p);
+              // A.2: with no one-rung output requested, Kb's ONLY consumer is the Kbig
+              // pack Kbig(ikp*nc2 + r, ik*nc2 + c) = Kb(ik, ikp, c, r) -- so the twist-pack
+              // is composed with that transpose and written straight into Kbig's (ikp, ik)
+              // block. Same values, same orientation, one fewer D^2-class array.
+              if (want_Kb) {
+                for (long p1 = 0; p1 < nc; ++p1)
+                  for (long p1p = 0; p1p < nc; ++p1p)
+                    for (long p3 = 0; p3 < nc; ++p3)
+                      for (long p3p = 0; p3p < nc; ++p3p)
+                        Kb(ik, ikp, p1p * nc + p3, p1 * nc + p3p) =
+                            wb(p1 * nc + p1p, p3 * nc + p3p);
+              } else {
+                for (long p1 = 0; p1 < nc; ++p1)
+                  for (long p1p = 0; p1p < nc; ++p1p)
+                    for (long p3 = 0; p3 < nc; ++p3)
+                      for (long p3p = 0; p3p < nc; ++p3p)
+                        Kbig(ikp * nc2 + (p1 * nc + p3p), ik * nc2 + (p1p * nc + p3)) =
+                            wb(p1 * nc + p1p, p3 * nc + p3p);
+              }
             }
           }
           pph.end();
           pph.begin(ladder_prof::P_MPI);
-          if (lsize > 1)
-            g_comm->all_reduce_in_place_n(Kb.data(), Kb.size(), std::plus<>{});
+          if (lsize > 1) {
+            // disjoint (ik, ikp) writes => the sum is exact whichever array carries it
+            if (want_Kb) g_comm->all_reduce_in_place_n(Kb.data(), Kb.size(), std::plus<>{});
+            else if (any_solve)
+              g_comm->all_reduce_in_place_n(Kbig.data(), Kbig.size(), std::plus<>{});
+          }
           pph.end();
           // --- Kt[(k'),(k)] = K(k,k')^T and conj(D) stack (nu-independent) -------------
           // P3: packed only where a resolvent solve actually runs on this rank.
           pph.begin(ladder_prof::P_KPACK);
-          const bool solves_here = ((Pi_ladder != nullptr or Pi_lad_loc != nullptr)
-                                    and lrank < std::min(lsize, nnu));
+          const bool solves_here = (any_solve and lrank < std::min(lsize, nnu));
           if (solves_here) {
-            for (long ikp = 0; ikp < nk; ++ikp)
-              for (long ik = 0; ik < nk; ++ik)
-                for (long r = 0; r < nc2; ++r)
-                  for (long c = 0; c < nc2; ++c)
-                    Kbig(ikp * nc2 + r, ik * nc2 + c) = Kb(ik, ikp, c, r);
+            // A.2: without Kb the rung blocks are already IN Kbig (see the build above)
+            if (want_Kb)
+              for (long ikp = 0; ikp < nk; ++ikp)
+                for (long ik = 0; ik < nk; ++ik)
+                  for (long r = 0; r < nc2; ++r)
+                    for (long c = 0; c < nc2; ++c)
+                      Kbig(ikp * nc2 + r, ik * nc2 + c) = Kb(ik, ikp, c, r);
             if (Pi_ladder != nullptr)
               for (long ik = 0; ik < nk; ++ik)
                 for (long r = 0; r < nc2; ++r) Dstack_c(ik * nc2 + r, all) = Dcj(ik, r, all);
@@ -744,14 +808,16 @@ namespace solvers {
           pph.end();
           // --- per requested nu: one-rung rebuild + resummation ------------------------
           // P3: each nu is owned by exactly one group rank (write-once globally).
-          for (long jn = 0; jn < nnu; ++jn) {
-            if (jn % lsize != lrank) continue;
+          // A.4: the owned nu are jn = lrank + jl*lsize, and Cb carries exactly those
+          // slices (jl), in the same increasing-jn order as the historic skip loop.
+          for (long jl = 0; jl < nnu_loc; ++jl) {
+            const long jn = lrank + jl * lsize;
             pph.begin(ladder_prof::P_ONERUNG);
             if (Pi_onerung != nullptr) {
               for (long ik = 0; ik < nk; ++ik) {
-                nda::blas::gemm(Cb(ik, jn, all, all), Dmat(ik, all, all),
+                nda::blas::gemm(Cb(ik, jl, all, all), Dmat(ik, all, all),
                                 Y1(ik, all, all));
-                nda::blas::gemm(nda::transpose(Cb(ik, jn, all, all)), Dcj(ik, all, all),
+                nda::blas::gemm(nda::transpose(Cb(ik, jl, all, all)), Dcj(ik, all, all),
                                 Y2(ik, all, all));
               }
               auto Pr = (*Pi_onerung)(jn, iq, all, all);
@@ -767,9 +833,9 @@ namespace solvers {
             // Q4-C3b: the SAME one-rung contraction with the E legs (the G2 pin target)
             if (Pi_onerung_loc != nullptr) {
               for (long ik = 0; ik < nk; ++ik) {
-                nda::blas::gemm(Cb(ik, jn, all, all), Emat(ik, all, all),
+                nda::blas::gemm(Cb(ik, jl, all, all), Emat(ik, all, all),
                                 Y1e(ik, all, all));
-                nda::blas::gemm(nda::transpose(Cb(ik, jn, all, all)), Ecj(ik, all, all),
+                nda::blas::gemm(nda::transpose(Cb(ik, jl, all, all)), Ecj(ik, all, all),
                                 Y2e(ik, all, all));
               }
               auto Pre = (*Pi_onerung_loc)(jn, iq, all, all);
@@ -783,27 +849,31 @@ namespace solvers {
                 }
             }
             pph.end();
-            if (Pi_ladder == nullptr and Pi_lad_loc == nullptr) continue;
+            if (not any_solve) continue;
             // Pi_ladder = -spin conj(D)^T (1 - Xh Kt)^{-1} Xh Kt Xh D
+            // A.3: the row blocks of Xh.Kt go STRAIGHT into Rm with alpha = -1/nk, so the
+            // (D, D) XK array never exists. Rm holds -XK until the +I below.
             pph.begin(ladder_prof::P_XK);
             for (long ikp = 0; ikp < nk; ++ikp) {
               auto Krows = Kbig(nda::range(ikp * nc2, (ikp + 1) * nc2), all);
-              auto Xrows = XK(nda::range(ikp * nc2, (ikp + 1) * nc2), all);
-              nda::blas::gemm(ComplexType(1.0 / nk), Cb(ikp, jn, all, all), Krows,
-                              ComplexType(0.0), Xrows);
+              auto Rrows = Rm(nda::range(ikp * nc2, (ikp + 1) * nc2), all);
+              nda::blas::gemm(ComplexType(-1.0 / nk), Cb(ikp, jl, all, all), Krows,
+                              ComplexType(0.0), Rrows);
             }
             pph.end();
             pph.begin(ladder_prof::P_LAM);
             if (lam_max != nullptr) {
-              // I3: rho(Xh Kt) by power iteration on the assembled XK. Fixed seed =>
-              // reproducible; 20 sweeps or a 1e-3 relative change. |XK v| with |v| = 1
-              // converges to the dominant |eigenvalue| -- the margin eq 6's resolvent
-              // (1 - Xh Kt)^-1 has left.
+              // I3: rho(Xh Kt) by power iteration. Fixed seed => reproducible; 20 sweeps
+              // or a 1e-3 relative change. |XK v| with |v| = 1 converges to the dominant
+              // |eigenvalue| -- the margin eq 6's resolvent (1 - Xh Kt)^-1 has left.
+              // A.3: iterated on -XK (= Rm here). Every step flips a sign that IEEE
+              // negation carries exactly: |(-XK)v| = |XK v| and (-x)/lam = -(x/lam), so
+              // the lam sequence, the break tests and the reported estimate are unchanged.
               const double seed = 1.0 / std::sqrt(double(Dsz));
               for (long i = 0; i < Dsz; ++i) pv(i) = ComplexType(seed, 0.0);
               double lam = 0.0, lam_prev = -1.0;
               for (int itp = 0; itp < 20; ++itp) {
-                nda::blas::gemv(XK, pv, pw);
+                nda::blas::gemv(Rm, pv, pw);
                 double n2 = 0.0;
                 for (long i = 0; i < Dsz; ++i) n2 += std::norm(pw(i));
                 lam = std::sqrt(n2);
@@ -819,8 +889,6 @@ namespace solvers {
             // THC-collapse D and, at Q4-C3b, the MLWF E) share the one inverse. Moving it
             // ahead of the D block below changes no arithmetic on the historic path.
             pph.begin(ladder_prof::P_RESOLV);
-            Rm() = ComplexType(0.0);
-            Rm() -= XK;
             for (long i = 0; i < Dsz; ++i) Rm(i, i) += ComplexType(1.0);
             nda::inverse_in_place(Rm);
             pph.end();
@@ -828,14 +896,14 @@ namespace solvers {
             if (Pi_ladder != nullptr) {
               for (long ik = 0; ik < nk; ++ik) {
                 auto Drows = XD(nda::range(ik * nc2, (ik + 1) * nc2), all);
-                nda::blas::gemm(ComplexType(1.0 / nk), Cb(ik, jn, all, all),
+                nda::blas::gemm(ComplexType(1.0 / nk), Cb(ik, jl, all, all),
                                 Dmat(ik, all, all), ComplexType(0.0), Drows);
               }
               nda::blas::gemm(Kbig, XD, KXD);
               for (long ikp = 0; ikp < nk; ++ikp) {
                 auto Kr = KXD(nda::range(ikp * nc2, (ikp + 1) * nc2), all);
                 auto Xr = XKXD(nda::range(ikp * nc2, (ikp + 1) * nc2), all);
-                nda::blas::gemm(ComplexType(1.0 / nk), Cb(ikp, jn, all, all), Kr,
+                nda::blas::gemm(ComplexType(1.0 / nk), Cb(ikp, jl, all, all), Kr,
                                 ComplexType(0.0), Xr);
               }
               nda::blas::gemm(Rm, XKXD, Zl);
@@ -849,14 +917,14 @@ namespace solvers {
             if (Pi_lad_loc != nullptr) {
               for (long ik = 0; ik < nk; ++ik) {
                 auto Erows = XE(nda::range(ik * nc2, (ik + 1) * nc2), all);
-                nda::blas::gemm(ComplexType(1.0 / nk), Cb(ik, jn, all, all),
+                nda::blas::gemm(ComplexType(1.0 / nk), Cb(ik, jl, all, all),
                                 Emat(ik, all, all), ComplexType(0.0), Erows);
               }
               nda::blas::gemm(Kbig, XE, KXE);
               for (long ikp = 0; ikp < nk; ++ikp) {
                 auto Kr = KXE(nda::range(ikp * nc2, (ikp + 1) * nc2), all);
                 auto Xr = XKXE(nda::range(ikp * nc2, (ikp + 1) * nc2), all);
-                nda::blas::gemm(ComplexType(1.0 / nk), Cb(ikp, jn, all, all), Kr,
+                nda::blas::gemm(ComplexType(1.0 / nk), Cb(ikp, jl, all, all), Kr,
                                 ComplexType(0.0), Xr);
               }
               nda::blas::gemm(Rm, XKXE, ZlE);

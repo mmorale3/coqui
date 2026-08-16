@@ -197,6 +197,10 @@ namespace solvers {
     // stashed at that pure-RPA point (_pol_pi0_qPQ) instead of gathering it here.
     const bool pol_readout = (_vertex != nullptr and _vertex->pol_vertex_active()
                               and not _vertex->active());
+    // A.1: only the injection that runs inside THIS eval_Pi_qdep may hand its inu = 0 row
+    // to the readout below (the bosonic closure calls eval_Pi_qdep outside update_w, and
+    // that row must not survive into a later iteration's readout).
+    _pol_nu0_row.reset();
     auto dPi_tqPQ = eval_Pi_qdep(mb_state, thc);
 
     // evaluate screened interaction (dW_tqPQ) and reset polarizability (dPi_tqPQ)
@@ -726,6 +730,14 @@ namespace solvers {
                  "{}, Np = {}).", Pl.shape(0), Pl.shape(1), Nm, tmap.shape(0),
                  tmap.shape(1), tmap.shape(2), nq_g, Np);
 
+    // A.1 (notes/ladder_opt_spec.md): stash the inu = 0 row for the eps_M readout of THIS
+    // update_w. Half node 0 IS the nw_b/2 node eval_pol_ladder_nu0 pins (ladder_whalf_gate
+    // node_map_resid), and the whalf return is already all_reduced/replicated, so the
+    // readout consumes it verbatim -- bit-identical to the second, independent pair-space
+    // ladder pass it replaces, minus that pass's entire wall (measured 20% of the combined
+    // ladder wall, at 70% idle: profiling results section 1.2).
+    _pol_nu0_row.emplace(nda::array<ComplexType, 3>(Pl(0, nda::ellipsis{})));
+
     auto t_rng = dPi_tqPQ.local_range(0);
     auto q_rng = dPi_tqPQ.local_range(1);
     auto P_rng = dPi_tqPQ.local_range(2);
@@ -888,8 +900,25 @@ namespace solvers {
       return;
     }
 
-    // the ladder at inu = 0 in the readout vertex's secondary basis + upfold
-    auto Pl_qmm = _pol_vtx->eval_pol_ladder_nu0(mb_state, thc);   // (nq, Nm, Nm)
+    // the ladder at inu = 0 in the readout vertex's secondary basis + upfold.
+    // A.1: when the injection already ran in THIS update_w it produced exactly this row as
+    // half node 0 of its whalf pass, so consume that instead of re-solving the pair-space
+    // ladder from scratch (the injection's row is the SAME iteration's G and W0bar -- the
+    // readout's invariant). Consume-once: reset so no later call can read a stale row.
+    // With the injection disabled (or any standalone caller) the row is absent and the
+    // historic self-contained evaluation runs unchanged.
+    nda::array<ComplexType, 3> Pl_qmm;
+    if (_pol_nu0_row.has_value()) {
+      Pl_qmm = std::move(_pol_nu0_row.value());
+      _pol_nu0_row.reset();
+      utils::check(Pl_qmm.shape(0) == nq,
+                   "pol_ladder_eps_readout: cached inu = 0 ladder row has {} q rows, "
+                   "expected {}.", Pl_qmm.shape(0), nq);
+      app_log(2, "  [scGW-tilde L2] eps_M readout: reusing the injection's inu = 0 ladder "
+                 "row (no second pair-space ladder pass).");
+    } else {
+      Pl_qmm = _pol_vtx->eval_pol_ladder_nu0(mb_state, thc);      // (nq, Nm, Nm)
+    }
     auto const &tmap = _pol_vtx->secondary_transfer();            // (nq, Nm, Np)
     const long Nm = Pl_qmm.shape(1);
     utils::check(tmap.shape(0) == nq and tmap.shape(1) == Nm and tmap.shape(2) == Np,

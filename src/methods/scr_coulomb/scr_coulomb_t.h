@@ -289,6 +289,23 @@ namespace solvers {
     // the corrections -- in edmft mode the post-correction Pi is NOT the readout baseline
     // (the kernel is W-bar_0[P^RPA], R-Q3-1). Empty until the first ladder-readout pass.
     nda::array<ComplexType, 3> _pol_pi0_qPQ;
+    // OPTIMIZATION INCREMENT A.1 (notes/ladder_opt_spec.md; profiling results section 1.2,
+    // shortlist item 1): the injection's inu = 0 ladder row, (nq_ibz, N_m, N_m), stashed by
+    // inject_pol_ladder and CONSUMED by pol_ladder_eps_readout instead of re-running the
+    // whole pair-space ladder. eval_pol_ladder_whalf evaluates nu_h[j] = nw_b/2 + j and
+    // eval_pol_ladder_nu0 evaluates {nw_b/2}, so half node 0 IS the readout's node (the
+    // ladder_whalf_gate node_map_resid pins it); both calls sit in ONE update_w with the
+    // same G and the same W0bar (verified end-to-end: between eval_Pi_qdep and the readout
+    // only dyson_W_from_Pi_tau / eps_inv_head_t / eval_cvv_eps_inv_head run, all read-only
+    // on mb_state.sG_tskij, and _W0b_qmm is written only inside vertex_t::build_w0, which
+    // runs once per iteration BEFORE the injection).
+    // LIFETIME, so a stale row can never be read: cleared in update_w immediately before
+    // eval_Pi_qdep (the only place the injection can fill it -- the bosonic closure also
+    // reaches eval_Pi_qdep directly, and that row must not survive into a later update_w),
+    // and cleared again on consumption. Absent => the readout falls back to its own
+    // eval_pol_ladder_nu0 call, which therefore stays fully functional for standalone
+    // callers (injection disabled, gates, tests).
+    std::optional<nda::array<ComplexType, 3>> _pol_nu0_row;
     // the L2 readout: ladder at nu = 0, upfold via the readout vertex's t(q), redo the
     // single-frequency Dyson with P0 and P0 + dP_ladder, report eps_M(q) both ways.
     // eps_inv_head_q (the loop's OWN q-resolved eps^-1 head on the PH-sym tau half grid,
