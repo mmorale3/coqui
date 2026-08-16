@@ -68,6 +68,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <string>
 #include <vector>
 #include <sys/resource.h>
@@ -136,6 +137,8 @@ namespace {
   struct opts {
     long nk = 64, nc2 = 121, Nm = 243;      // kp444 preset
     long g = 1, nb = -1, nsolve = 1;
+    long threads = 1;                       // label only: the launcher sets the env
+    double maxgb = 64.0;                    // per-rank matrix-share budget (guard)
     bool check = false, residual = false, verbose = false;
     std::string preset = "kp444";
     long D() const { return nk * nc2; }
@@ -225,6 +228,8 @@ int main(int argc, char **argv) {
     else if (a == "--g") o.g = std::stol(next());
     else if (a == "--nb") o.nb = std::stol(next());
     else if (a == "--nsolve") o.nsolve = std::stol(next());
+    else if (a == "--threads") o.threads = std::stol(next());
+    else if (a == "--maxgb") o.maxgb = std::stod(next());
     else if (a == "--check") o.check = true;
     else if (a == "--residual") o.residual = true;
     else if (a == "--verbose") o.verbose = true;
@@ -233,6 +238,13 @@ int main(int argc, char **argv) {
   if (o.preset == "tiny")       { o.nk = 4;   o.nc2 = 121; o.Nm = 60;  }
   else if (o.preset == "kp444") { o.nk = 64;  o.nc2 = 121; o.Nm = 243; }
   else if (o.preset == "kp666") { o.nk = 216; o.nc2 = 121; o.Nm = 245; }
+  // B0-ext: the scale-out rungs. x2 exists so the D ladder 26 136 -> 52 272 -> 104 544 can
+  // be FIT on the 8/3 n^3 profile -- the documented estimation method for any point too
+  // expensive to run outright (spec B0-ext item 1).
+  else if (o.preset == "kp666x2") { o.nk = 432; o.nc2 = 121; o.Nm = 245; }
+  // the 4x problem: one (D,D) is 174.9 GB, so per-rank replication is impossible by
+  // construction and g = 1 is not even representable -- that is the point of the preset.
+  else if (o.preset == "kp666x4") { o.nk = 864; o.nc2 = 121; o.Nm = 245; }
   else utils::check(o.preset == "custom", "ladder_slate_bench: unknown preset {}", o.preset);
   const long D = o.D(), nc2 = o.nc2, Nm = o.Nm;
   if (o.nb <= 0) o.nb = nc2;
@@ -255,6 +267,13 @@ int main(int argc, char **argv) {
              "grid {} x {}; tile nb = {}; solves per grid = {}",
           world.size(), o.g, ngrid, px, py, o.nb, o.nsolve);
   const double gb = 16.0 / (1024.0 * 1024.0 * 1024.0);
+  {
+    auto env = [](const char *k) { const char *v = std::getenv(k); return v ? v : "unset"; };
+    app_log(1, "  threads: --threads label = {} ; OMP_NUM_THREADS = {} , MKL_NUM_THREADS = "
+               "{} , OPENBLAS_NUM_THREADS = {} (the LAUNCHER owns these; the label is only "
+               "echoed into the scan row)", o.threads, env("OMP_NUM_THREADS"),
+            env("MKL_NUM_THREADS"), env("OPENBLAS_NUM_THREADS"));
+  }
   app_log(1, "  per-rank dense footprint: matrix (D*D/g) = {:.3f} GB, RHS+solution "
              "(2*D*N_m/g) = {:.3f} GB{}",
           double(D) * double(D) * gb / double(o.g),
@@ -266,6 +285,15 @@ int main(int argc, char **argv) {
   // ncb). ncb is chosen small enough that make_distributed_array's cap (shape/grid) never
   // shrinks it, which would silently break the tiling match.
   const long ncb = std::max(1l, Nm / std::max(px, py));
+  {
+    const double gb_rank = double(D) * double(D) * gb / double(o.g);
+    utils::check(gb_rank <= o.maxgb,
+                 "ladder_slate_bench: the matrix share is {:.1f} GB/rank at D = {} and "
+                 "g = {}, over the {:.1f} GB/rank budget (--maxgb). One full (D,D) is "
+                 "{:.1f} GB: at this size per-rank replication is not representable, "
+                 "which is exactly what the 4x preset is for -- raise g.",
+                 gb_rank, D, o.g, o.maxgb, double(D) * double(D) * gb);
+  }
   auto A = make_distributed_array<dmat_t>(gcomm, shape_t<2>{px, py}, shape_t<2>{D, D},
                                           shape_t<2>{o.nb, o.nb}, true);
   auto B = make_distributed_array<dmat_t>(gcomm, shape_t<2>{px, py}, shape_t<2>{D, Nm},
@@ -436,12 +464,13 @@ int main(int argc, char **argv) {
           flops / std::max(tsolve, 1e-30) / 1e9 / double(o.g), lam_last);
   // ONE machine-parseable row per design point -- this is what the scan table is built
   // from (scalars only: rusty's bundled fmt cannot format containers)
-  app_log(1, "  [bench] SCAN {} np {} g {} grids {} nb {} D {} Nm {} nsolve {} build "
+  app_log(1, "  [bench] SCAN {} np {} g {} t {} grids {} nb {} D {} Nm {} nsolve {} build "
              "{:.4f} lam {:.4f} rhs {:.4f} solve {:.4f} proj {:.4f} tsolve {:.4f} "
-             "gbrank {:.3f} gfrank {:.3f} solveshr {:.2f}",
-          o.preset, world.size(), o.g, ngrid, o.nb, D, Nm, o.nsolve,
+             "gbrank {:.3f} gfrank {:.3f} gfcore {:.3f} solveshr {:.2f}",
+          o.preset, world.size(), o.g, o.threads, ngrid, o.nb, D, Nm, o.nsolve,
           t_build / n, t_lam / n, t_rhs / n, solve_mean / n, t_proj / n, tsolve, rmax,
           flops / std::max(tsolve, 1e-30) / 1e9 / double(o.g),
+          flops / std::max(tsolve, 1e-30) / 1e9 / double(o.g) / double(std::max(o.threads, 1l)),
           3600.0 * double(ngrid * o.nsolve) / std::max(solve_mean, 1e-30));
   app_log(1, "  [bench] throughput: {} concurrent grids x {} solves = {} solves in "
              "{:.4f} s => {:.2f} solves/hour on {} ranks",
