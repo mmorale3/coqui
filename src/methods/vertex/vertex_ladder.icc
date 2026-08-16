@@ -259,11 +259,11 @@ namespace solvers {
       row("Y1+Y2",  "2 x (nk,nc2,Nm)",   2.0 * dk * dc2 * dm);
       row("Rm",     "(D,D)",             dsD * dsD);
       row("Kbig",   "(D,D)",             dsD * dsD);
-      row("XD..Zl", "4 x (D,Nm)",        4.0 * dD * dm);
+      row("XD..XKXD", "3 x (D,Nm)",      3.0 * dD * dm);
       row("Dstack_c", "(D,Nm)",          dD * dm);
       if (pr.nab > 0) {
         row("E legs", "4 x (nk,nc2,nab)", 4.0 * dk * dc2 * dab);
-        row("XE..ZlE", "5 x (D,nab)",     5.0 * dD * dab);
+        row("XE..XKXE", "4 x (D,nab)",    4.0 * dD * dab);
       }
       pr.gb_local = tot;
       app_log(1, "  [ladder-prof {}] TOTAL rank-local = {:.3f} GB   (the (D,D) arrays "
@@ -623,8 +623,22 @@ namespace solvers {
       nda::array<ComplexType, 2> KtY1(nc2, Nm), T2(Nm, Nm);
       nda::matrix<ComplexType> Rm(sD, sD);
       nda::array<ComplexType, 2> Kbig(sD, sD);
-      nda::array<ComplexType, 2> XD(Dsz, Nm), KXD(Dsz, Nm), XKXD(Dsz, Nm), Zl(Dsz, Nm);
+      nda::array<ComplexType, 2> XD(Dsz, Nm), KXD(Dsz, Nm);
       nda::array<ComplexType, 2> Dstack_c(Dsz, Nm);
+      // ---- INCREMENT B: LU factor + multi-RHS solve instead of an explicit inverse -----
+      // R-Q3-4 still holds -- this is the SAME exact dense solve, and arguably more exact:
+      // getrf (8/3 n^3) + getrs against the factors replaces getrf + getri (8 n^3) + a
+      // gemm, i.e. 3x less arithmetic on the phase that is 92% of the kp666 ladder. B0
+      // measures the swap at 1 100 s vs the production zgetri's 2 684 s per kp666 solve
+      // (2.4x) with the solution matching serial LAPACK to 6e-16.
+      // LAYOUT: nda's getrs requires the RHS in FORTRAN order (its static_assert), while
+      // getrf on the C-layout Rm factorizes the Fortran view = Rm^T and getrs then applies
+      // op = 'T', which solves Rm X = B exactly as intended. Both RHS families (the THC
+      // collapse D and the Q4-C3b MLWF E) reuse the ONE factorization, exactly as they
+      // reused the one inverse.
+      using fmat_t = nda::basic_array<ComplexType, 2, nda::F_layout, 'A', nda::heap<>>;
+      fmat_t XKXD(Dsz, Nm);
+      nda::array<int, 1> ipiv(sD);
       // I3 power-iteration workspace (allocated only when the watchdog is requested, so
       // the historic path's allocation profile is untouched)
       const long lam_d = (lam_max != nullptr) ? Dsz : 0;
@@ -636,7 +650,8 @@ namespace solvers {
       nda::array<ComplexType, 3> Emat(lnk, lnc2, nab), Ecj(lnk, lnc2, nab);
       nda::array<ComplexType, 3> Y1e(lnk, lnc2, nab), Y2e(lnk, lnc2, nab);
       nda::array<ComplexType, 2> KtY1e(lnc2, nab), T2e(nab, nab);
-      nda::array<ComplexType, 2> XE(lD, nab), KXE(lD, nab), XKXE(lD, nab), ZlE(lD, nab);
+      nda::array<ComplexType, 2> XE(lD, nab), KXE(lD, nab);
+      fmat_t XKXE(lD, nab);   // B: the second RHS family, same factors, same layout rule
       nda::array<ComplexType, 2> Estack_c(lD, nab);
 
       if (prof) {
@@ -890,7 +905,15 @@ namespace solvers {
             // ahead of the D block below changes no arithmetic on the historic path.
             pph.begin(ladder_prof::P_RESOLV);
             for (long i = 0; i < Dsz; ++i) Rm(i, i) += ComplexType(1.0);
-            nda::inverse_in_place(Rm);
+            {
+              const int info = nda::lapack::getrf(Rm, ipiv);
+              utils::check(info == 0,
+                           "pair_space_ladder: the resolvent LU failed (getrf info = {}) "
+                           "at nu index {} of transfer {} -- (1 - Xh Kt) is singular to "
+                           "working precision (particle-hole instability; lambda_max was "
+                           "{:.6f}).", info, jn, iq,
+                           (lam_max != nullptr) ? (*lam_max)(jn) : -1.0);
+            }
             pph.end();
             pph.begin(ladder_prof::P_PROJD);
             if (Pi_ladder != nullptr) {
@@ -906,9 +929,14 @@ namespace solvers {
                 nda::blas::gemm(ComplexType(1.0 / nk), Cb(ikp, jl, all, all), Kr,
                                 ComplexType(0.0), Xr);
               }
-              nda::blas::gemm(Rm, XKXD, Zl);
+              // B: solve against the factors in place -- XKXD becomes Zl
+              {
+                const int info = nda::lapack::getrs(Rm, XKXD, ipiv);
+                utils::check(info == 0, "pair_space_ladder: resolvent getrs info = {}.",
+                             info);
+              }
               auto Pl = (*Pi_ladder)(jn, iq, all, all);
-              nda::blas::gemm(ComplexType(-spinfac), nda::transpose(Dstack_c), Zl,
+              nda::blas::gemm(ComplexType(-spinfac), nda::transpose(Dstack_c), XKXD,
                               ComplexType(1.0), Pl);
             }
             pph.end();
@@ -927,9 +955,13 @@ namespace solvers {
                 nda::blas::gemm(ComplexType(1.0 / nk), Cb(ikp, jl, all, all), Kr,
                                 ComplexType(0.0), Xr);
               }
-              nda::blas::gemm(Rm, XKXE, ZlE);
+              {
+                const int info = nda::lapack::getrs(Rm, XKXE, ipiv);
+                utils::check(info == 0, "pair_space_ladder: orbital getrs info = {}.",
+                             info);
+              }
               auto Po = (*Pi_lad_loc)(jn, iq, all, all);
-              nda::blas::gemm(ComplexType(-spinfac), nda::transpose(Estack_c), ZlE,
+              nda::blas::gemm(ComplexType(-spinfac), nda::transpose(Estack_c), XKXE,
                               ComplexType(1.0), Po);
             }
             pph.end();
