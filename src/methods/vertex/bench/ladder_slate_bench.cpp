@@ -213,9 +213,15 @@ namespace {
 }  // namespace
 
 int main(int argc, char **argv) {
-  mpi3::environment env(argc, argv);
+  // SLATE's OpenMP tasks issue MPI calls concurrently during the solve, so threaded
+  // SLATE (t > 1) requires MPI_THREAD_MULTIPLE; plain env(argc, argv) initializes
+  // without thread support and segfaults inside UCX at the first threaded exchange.
+  mpi3::environment env(argc, argv, mpi3::thread_level::multiple);
   auto world = mpi3::environment::get_world_instance();
   setup_loggers(world.root(), 2, 0);
+  app_log(1, "MPI thread level provided = {} (required multiple = {}; below that, run t = 1 only)",
+          static_cast<int>(mpi3::environment::thread_support()),
+          static_cast<int>(mpi3::thread_level::multiple));
 
   opts o;
   for (int i = 1; i < argc; ++i) {
