@@ -25,6 +25,7 @@
 #include <tuple>
 #include <iomanip>
 #include <optional>
+#include <string>
 
 #include "configuration.hpp"
 #include "IO/ptree/ptree_utilities.hpp"
@@ -347,6 +348,27 @@ class thc
   double distr_tol = 0.2;
   double memory_frac = 0.75;
   bool use_least_squares = false;
+
+  // knob 2 helper: gaussian filter table F(ik,ig) = exp(-alpha |k+G|^2 / Gc^2)
+  // on the wavefunction G-grid, Gc^2 = 2*ecut_wfc (a.u.)
+  nda::array<RealType,2> isdf_filter_table(long nk) const;
+
+  // ISDF interpolation-point selection knobs (selection-only; defaults are no-ops)
+  // knob 2: gaussian filter applied to orbital G-coefficients used by the selection surrogate
+  double isdf_filter_alpha = 0.0;
+  // knob 1: separable pair weights, "none" | "gap" | "exp" | "sigmoid" | "power"
+  // (the last three are rank-1 parametrized families, see isdf_weight_params)
+  std::string isdf_pair_weight = "none";
+  int isdf_laplace_terms = 4;
+  double isdf_eta = 0.01;
+  std::vector<double> isdf_weight_params;
+  double isdf_weight_floor = 0.0;
+  // knob 3: Coulomb-metric re-ranking of a pooled candidate set, "l2" | "bare" | "attenuated"
+  std::string isdf_metric = "l2";
+  double isdf_pool_factor = 2.0;
+  bool isdf_metric_qavg = true;
+  double isdf_metric_gcut = 0.0;
+  double isdf_metric_omega = 0.0;
 
   //fft plans
   int howmany_fft = -1;

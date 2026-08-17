@@ -110,8 +110,15 @@ double rpa_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_
   // code-vs-code comparison (e.g. ABINIT with fock_icutcoul=3, bare Coulomb).
   // Re-evaluates the Fock matrix with exchange only; sF_skij is unused past here.
   if (mb_solver.hf != nullptr) {
-    mb_solver.hf->evaluate(sF_skij, sDm_skij.local(), mb_eri.hf_eri->get(),
-                           dyson.sS_skij().local(), false, true);
+    // Fall back over the same ERI slots as the Fock build above: hf_eri may be
+    // empty when the input provides a single `interaction` (only corr_eri set).
+    auto eval_exchange_only = [&](auto& x_eri) {
+      mb_solver.hf->evaluate(sF_skij, sDm_skij.local(), x_eri,
+                             dyson.sS_skij().local(), false, true);
+    };
+    if (mb_eri.hf_eri)            eval_exchange_only(mb_eri.hf_eri->get());
+    else if (mb_eri.exchange_eri) eval_exchange_only(mb_eri.exchange_eri->get());
+    else                          eval_exchange_only(mb_eri.corr_eri->get());
     mpi->comm.barrier();
     auto e_x = eval_hf_energy(sDm_skij, sF_skij, dyson.sH0_skij(), k_weight, false);
     app_log(2, "Exchange energy:           {} a.u.\n", std::get<1>(e_x));
@@ -121,7 +128,11 @@ double rpa_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_
 
   // Term-by-term split of e_1e, for the cross-code PAW energy ledger. sF_skij
   // is dead past the exchange evaluation above, so it doubles as workspace.
-  print_e1_decomposition(*mf, dyson.PSP(), sDm_skij, sF_skij, k_weight, e_1e_new);
+  // Only meaningful for plane-wave backends carrying a QE-style pseudopotential;
+  // on other sources (pyscf, model) the pieces are undefined (and the parallel
+  // set_kinetic/set_vnl path faults at np > 1).
+  if (mf->mf_type() == mf::qe_source or mf->mf_type() == mf::bdft_source)
+    print_e1_decomposition(*mf, dyson.PSP(), sDm_skij, sF_skij, k_weight, e_1e_new);
 
   Timer.start("WRITE");
   if (mpi->comm.root()) {

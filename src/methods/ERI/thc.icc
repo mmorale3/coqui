@@ -39,6 +39,126 @@
 namespace methods
 {
 
+// knob 2 (isdf_filter_alpha): gaussian attenuation of the orbital PW coefficients,
+// used ONLY while selecting interpolation points. F(ik,ig) = exp(-alpha |k+G|^2/Gc^2),
+// Gc^2 = 2*ecut_wfc so that F = exp(-alpha) at the wavefunction-sphere edge.
+inline nda::array<RealType,2> thc::isdf_filter_table(long nk) const
+{
+  auto wfc_g = mf->wfc_truncated_grid();
+  utils::check(wfc_g != nullptr, "isdf_filter_table: no wavefunction G-grid.");
+  auto gv = wfc_g->g_vectors();
+  long ngw = wfc_g->size();
+  double Gc2 = 2.0 * wfc_g->ecut();
+  utils::check(Gc2 > 0.0, "isdf_filter_table: invalid wfc ecut: {}", Gc2);
+  auto kpts = mf->kpts();
+  utils::check(nk <= kpts.extent(0), "isdf_filter_table: nk out of range.");
+  nda::array<RealType,2> F(nk, ngw);
+  for (long ik = 0; ik < nk; ++ik) {
+    for (long ig = 0; ig < ngw; ++ig) {
+      double kGx = kpts(ik,0) + gv(ig,0);
+      double kGy = kpts(ik,1) + gv(ig,1);
+      double kGz = kpts(ik,2) + gv(ig,2);
+      F(ik,ig) = std::exp(-isdf_filter_alpha * (kGx*kGx + kGy*kGy + kGz*kGz) / Gc2);
+    }
+  }
+  return F;
+}
+
+namespace detail
+{
+// Multiply the rows of a locally-stored (rows, ngw) block of 'w'-read orbital
+// coefficients by the per-k filter row. Global row index = row0 + local row,
+// decomposed as ((is*nk + ik)*norb + ib)*npol + ip.
+template<typename Arr>
+void apply_isdf_filter(Arr&& A, long row0, long nk, long norb, long npol,
+                       nda::array<RealType,2> const& F)
+{
+  long nrow = A.extent(0), ngw = A.extent(1);
+  utils::check(ngw == F.extent(1), "apply_isdf_filter: G-count mismatch: {} vs {}",
+               ngw, F.extent(1));
+  for (long r = 0; r < nrow; ++r) {
+    long ik = ((row0 + r) / (norb*npol)) % nk;
+    for (long ig = 0; ig < ngw; ++ig)
+      A(r,ig) *= F(ik,ig);
+  }
+}
+// knob 1 (isdf_pair_weight="gap"): log-midpoint quadrature of 1/x = int_0^inf e^{-xt} dt,
+// giving 1/x ~ sum_p c_p exp(-t_p x) on [xmin,xmax] with c_p, t_p > 0. Selection-grade
+// accuracy is all that is needed (the pivot ordering is a discrete choice).
+inline void isdf_laplace_quadrature(int NL, double xmin, double xmax,
+                                    nda::array<RealType,1>& t, nda::array<RealType,1>& c)
+{
+  utils::check(NL >= 1 and xmin > 0.0 and xmax > xmin,
+               "isdf_laplace_quadrature: invalid NL/xmin/xmax: {} {} {}", NL, xmin, xmax);
+  t = nda::array<RealType,1>(NL);
+  c = nda::array<RealType,1>(NL);
+  double slo = std::log(0.05/xmax), shi = std::log(30.0/xmin);
+  double h = (shi-slo)/NL;
+  for(int j=0; j<NL; ++j) {
+    double s = slo + (j+0.5)*h;
+    t(j) = std::exp(s);
+    c(j) = h*t(j);
+  }
+  // diagnostic: worst relative error of the expansion over the target interval
+  double emax = 0.0;
+  for(int i=0; i<200; ++i) {
+    double x = xmin*std::exp( (std::log(xmax)-std::log(xmin))*i/199.0 );
+    double s = 0.0;
+    for(int j=0; j<NL; ++j) s += c(j)*std::exp(-t(j)*x);
+    emax = std::max(emax, std::abs(s*x - 1.0));
+  }
+  app_log(2, "  isdf pair-weight Laplace expansion: NL = {}, x range = [{:.3e},{:.3e}], max rel err = {:.2e}",
+          NL, xmin, xmax, emax);
+}
+
+// knob 3: serial full pivoted Cholesky on a COPY of K (n x n, PSD, replicated);
+// returns the first n_keep pivot indices (into K's original ordering) in
+// elimination order. Runs identically on every rank -> deterministic.
+inline std::pair<nda::array<long,1>,long> pivoted_chol_order(nda::array<ComplexType,2> K, long n_keep)
+{
+  long n = K.extent(0);
+  utils::check(K.extent(1) == n and n_keep > 0 and n_keep <= n,
+               "pivoted_chol_order: bad shapes n={} keep={}", n, n_keep);
+  nda::array<long,1> perm(n), sel(n_keep);
+  sel() = -1;
+  for(long i=0;i<n;++i) perm(i)=i;
+  nda::array<RealType,1> d(n);
+  for(long i=0;i<n;++i) d(i) = std::real(K(i,i));
+  double d0 = *std::max_element(d.begin(), d.end());
+  long nsel = 0;
+  for(long m=0;m<n_keep;++m) {
+    long imax=m; RealType dmax = -1.0;
+    for(long i=m;i<n;++i) if(d(i) > dmax) { dmax = d(i); imax = i; }
+    if(dmax <= 1e-14*std::max(d0,1.0)) {
+      // numerical rank of the metric on the pool is exhausted; the caller tops
+      // up the remaining points from the pass-1 ordering
+      app_log(1, "[WARNING] pivoted_chol_order: metric rank exhausted at {} < requested {} "
+                 "(residual {}); remaining points fall back to the pass-1 ordering.",
+              m, n_keep, dmax);
+      break;
+    }
+    if(imax != m) {
+      for(long j=0;j<n;++j) std::swap(K(m,j), K(imax,j));
+      for(long i=0;i<n;++i) std::swap(K(i,m), K(i,imax));
+      std::swap(d(m), d(imax));
+      std::swap(perm(m), perm(imax));
+    }
+    RealType lmm = std::sqrt(dmax);
+    K(m,m) = lmm;
+    for(long i=m+1;i<n;++i) K(i,m) = K(i,m)/lmm;
+    // full trailing update (both triangles): pivot swaps exchange full rows and
+    // columns, so the upper triangle must be kept current as well
+    for(long i=m+1;i<n;++i) {
+      for(long j=m+1;j<n;++j) K(i,j) -= K(i,m)*std::conj(K(j,m));
+      d(i) = std::real(K(i,i));
+    }
+    sel(m) = perm(m);
+    nsel = m+1;
+  }
+  return {sel, nsel};
+}
+} // namespace detail
+
 template<MEMORY_SPACE MEM, bool Ipts_only, bool return_Ruv>
 auto thc::chol_metric_impl_ibz(int iq, int nIpts, nda::range a_range, nda::range b_range, int block_size)
 {
@@ -155,44 +275,74 @@ auto thc::chol_metric_impl_ibz(int iq, int nIpts, nda::range a_range, nda::range
        {nspins*nkpts_ibz*a_range.size(),rho_g.nnr()},{nspins*nkpts_ibz*a_range.size(),ir_rgrid.size()},
        {0,r0},{1,1});  
 
-  if( not mf->has_wfc_grid() or mf->fft_grid_dim() == rho_g.mesh() )
-  {  
-    auto dPsia = mf::read_distributed_orbital_set<local_CArray_t>(*mf,mpi->comm,'r',{mpi->comm.size(),1},
-				       nda::range(0,nspins),nda::range(0,nkpts_ibz),a_range,{1,1}); 
-    auto dPloc = dPsia.local();
-    nda::tensor::scale(Znorm, dPloc);
-    local_CArray_t T = dPloc;
-    long ir = 0;
-    for( auto& v : ir_r_set )
-      for( auto i : v )
-        dPloc(all,ir++) = T(all,i); 
-    math::nda::redistribute(dPsia,distPsia);  
-  } else {
-    auto wfc_to_rho = swfc_to_rho.local();
-    auto dPsia = mf::read_distributed_orbital_set<local_CArray_t>(*mf,mpi->comm,'w',{mpi->comm.size(),1},
-                                     nda::range(0,nspins),nda::range(0,nkpts_ibz),a_range,{1,1});
-    auto dPsir = memory::darray_t<local_CArray_t,boost::mpi3::communicator>(
-             std::addressof(mpi->comm),{mpi->comm.size(),1},{dPsia.global_shape()[0],rho_g.nnr()},{dPsia.local_shape()[0],rho_g.nnr()},
-             dPsia.origin(),{1,1});
-    auto psir = dPsir.local();
-    auto P4d = nda::reshape(psir,
-          std::array<long,4>{psir.extent(0),rho_g.mesh(0),rho_g.mesh(1),rho_g.mesh(2)});
-    math::nda::fft<true> F(P4d,math::fft::FFT_MEASURE);
-    psir() = ComplexType(0.0);
-    if constexpr (MEM==HOST_MEMORY) {
-      nda::copy_select(true,1,wfc_to_rho,ComplexType(1.0),dPsia.local(),ComplexType(0.0),psir);
-    } else { 
-      auto wfc_to_rho_dev = memory::to_memory_space<MEM>(wfc_to_rho);
-      nda::copy_select(true,1,wfc_to_rho_dev,ComplexType(1.0),dPsia.local(),ComplexType(0.0),psir);
+  bool use_filter = (isdf_filter_alpha > 0.0);
+  utils::check(not use_filter or mf->has_wfc_grid(),
+      "isdf_filter_alpha > 0 requires a plane-wave mean field with a wavefunction G-grid.");
+  utils::check(isdf_pair_weight == "none",
+      "isdf_pair_weight != none is not implemented in the symmetry-adapted (ibz) selection; "
+      "use a symmetry-free mean field or isdf_pair_weight = \"none\".");
+  utils::check(isdf_metric == "l2",
+      "isdf_metric != l2 is not yet implemented in the symmetry-adapted (ibz) selection; "
+      "use a symmetry-free mean field or isdf_metric = \"l2\".");
+  auto fill_dist = [&](auto& target, bool do_filter) {
+    if( not mf->has_wfc_grid() or (mf->fft_grid_dim() == rho_g.mesh() and not do_filter) )
+    {
+      auto dPsia = mf::read_distributed_orbital_set<local_CArray_t>(*mf,mpi->comm,'r',{mpi->comm.size(),1},
+                                       nda::range(0,nspins),nda::range(0,nkpts_ibz),a_range,{1,1});
+      auto dPloc = dPsia.local();
+      nda::tensor::scale(Znorm, dPloc);
+      local_CArray_t T = dPloc;
+      long ir = 0;
+      for( auto& v : ir_r_set )
+        for( auto i : v )
+          dPloc(all,ir++) = T(all,i);
+      math::nda::redistribute(dPsia,target);
+    } else {
+      auto wfc_to_rho = swfc_to_rho.local();
+      auto dPsia = mf::read_distributed_orbital_set<local_CArray_t>(*mf,mpi->comm,'w',{mpi->comm.size(),1},
+                                       nda::range(0,nspins),nda::range(0,nkpts_ibz),a_range,{1,1});
+      if(do_filter) {
+        if constexpr (MEM==HOST_MEMORY) {
+          // this impl carries no explicit npol factor in the row index (see shapes above)
+          detail::apply_isdf_filter(dPsia.local(), dPsia.origin()[0], nkpts_ibz,
+                                    a_range.size(), 1, isdf_filter_table(nkpts_ibz));
+        } else {
+          utils::check(false, "isdf_filter_alpha > 0: device path not implemented; run the CPU build.");
+        }
+      }
+      auto dPsir = memory::darray_t<local_CArray_t,boost::mpi3::communicator>(
+               std::addressof(mpi->comm),{mpi->comm.size(),1},{dPsia.global_shape()[0],rho_g.nnr()},{dPsia.local_shape()[0],rho_g.nnr()},
+               dPsia.origin(),{1,1});
+      auto psir = dPsir.local();
+      auto P4d = nda::reshape(psir,
+            std::array<long,4>{psir.extent(0),rho_g.mesh(0),rho_g.mesh(1),rho_g.mesh(2)});
+      math::nda::fft<true> F(P4d,math::fft::FFT_MEASURE);
+      psir() = ComplexType(0.0);
+      if constexpr (MEM==HOST_MEMORY) {
+        nda::copy_select(true,1,wfc_to_rho,ComplexType(1.0),dPsia.local(),ComplexType(0.0),psir);
+      } else {
+        auto wfc_to_rho_dev = memory::to_memory_space<MEM>(wfc_to_rho);
+        nda::copy_select(true,1,wfc_to_rho_dev,ComplexType(1.0),dPsia.local(),ComplexType(0.0),psir);
+      }
+      F.backward(P4d);
+      nda::tensor::scale(Znorm, psir);
+      local_CArray_t T = psir;
+      long ir = 0;
+      for( auto& v : ir_r_set )
+        for( auto i : v )
+          psir(all,ir++) = T(all,i);
+      math::nda::redistribute(dPsir,target);
     }
-    F.backward(P4d);
-    nda::tensor::scale(Znorm, psir);
-    local_CArray_t T = psir;
-    long ir = 0;
-    for( auto& v : ir_r_set )
-      for( auto i : v )
-        psir(all,ir++) = T(all,i);
-    math::nda::redistribute(dPsir,distPsia);
+  };
+  fill_dist(distPsia, use_filter);
+  // knob 2: unfiltered twin supplies the collation (X) values
+  std::optional<decltype(distPsia)> distPsiaX;
+  if(use_filter) {
+    distPsiaX.emplace(std::addressof(mpi->comm),std::array<long,2>{1,mpi->comm.size()},
+       std::array<long,2>{nspins*nkpts_ibz*a_range.size(),rho_g.nnr()},
+       std::array<long,2>{nspins*nkpts_ibz*a_range.size(),long(ir_rgrid.size())},
+       std::array<long,2>{0,r0},std::array<long,2>{1,1});
+    fill_dist(*distPsiaX, false);
   }
   Timer.stop("DistOrbs");
 
@@ -211,6 +361,9 @@ auto thc::chol_metric_impl_ibz(int iq, int nIpts, nda::range a_range, nda::range
   
   // 4D views into local sector of Psi
   auto Psia = nda::reshape(distPsia.local(),shape_t<4>{nspins,nkpts_ibz,a_range.size(),r_range.size()});
+  // collation source: the unfiltered twin when knob 2 is active, else Psia itself
+  auto PsiaX = nda::reshape((use_filter ? distPsiaX->local() : distPsia.local()),
+                            shape_t<4>{nspins,nkpts_ibz,a_range.size(),r_range.size()});
 
   /*********************************************
                  Diagonal/Residual 
@@ -307,8 +460,10 @@ auto thc::chol_metric_impl_ibz(int iq, int nIpts, nda::range a_range, nda::range
   /* iterative construction of cholesky matrix  */
   /**************************************************************************/
 
+  // knob 2: with filtering active the buffer also carries the unfiltered (X) values
+  const long xdup = ( use_filter ? 2 : 1 );
   memory::array<MEM,ComplexType,1> comm_buff(block_size*(nmax +
-                max_ns_per_kibz*nspins*nkpts_ibz*a_range.size()));
+                xdup*max_ns_per_kibz*nspins*nkpts_ibz*a_range.size()));
 
   memory::array<MEM,ComplexType,4> Lr(nspins,nkpts_ibz,block_size*max_ns_per_kibz,r_range.size());
   auto Tab = memory::array<MEM,ComplexType,2>::zeros({block_size,r_range.size()});
@@ -345,11 +500,18 @@ auto thc::chol_metric_impl_ibz(int iq, int nIpts, nda::range a_range, nda::range
 
     auto Paki = memory::array_view<MEM,ComplexType,3>({nspins*nkpts_ibz*a_range.size(),
                                                        block_size,max_ns_per_kibz},comm_buff.data());
-    auto Rc = memory::array_view<MEM,ComplexType,2>({nmax,block_size},Paki.data()+Paki.size()); 
+    // unfiltered (X) section, present only when knob 2 is active (xdup==2)
+    auto PakiX = memory::array_view<MEM,ComplexType,3>({(xdup-1)*nspins*nkpts_ibz*a_range.size(),
+                                                       block_size,max_ns_per_kibz},Paki.data()+Paki.size());
+    auto Rc = memory::array_view<MEM,ComplexType,2>({nmax,block_size},PakiX.data()+PakiX.size());
     auto Paki4d = memory::array_view<MEM,ComplexType,4>({nspins,nkpts_ibz,a_range.size(),
                                                          block_size*max_ns_per_kibz},Paki.data());
     auto Paki5d = memory::array_view<MEM,ComplexType,5>({nspins,nkpts_ibz,a_range.size(),
                                                          block_size,max_ns_per_kibz},Paki.data());
+    // collation source: aliases the filtered section unless the X twin is active
+    auto PakiX5d = memory::array_view<MEM,ComplexType,5>({nspins,nkpts_ibz,a_range.size(),
+                                                         block_size,max_ns_per_kibz},
+                                                         (use_filter ? PakiX.data() : Paki.data()));
 
     Timer.start("ip_setup_comm");
     comm_buff() = ComplexType(0.0);
@@ -361,12 +523,20 @@ auto thc::chol_metric_impl_ibz(int iq, int nIpts, nda::range a_range, nda::range
         ur(n) = ir_rgrid(lr);
         // conj(Psia(:,ru))
         if constexpr (MEM==HOST_MEMORY) {
-          for( auto ispin : itertools::range(nspins) ) 
-            for( auto k : itertools::range(nkpts_ibz) ) { 
-              Paki5d(ispin,k,all,n,0) = nda::conj(Psia(ispin,k,all,lr)); 
-              for( auto [i,is] : itertools::enumerate(Skibz(k,nda::range(ns_per_kibz(k)-1))) ) 
-                Paki5d(ispin,k,all,n,i+1) = nda::conj(Psia(ispin,k,all,Sr_to_r(is,lr))); 
+          for( auto ispin : itertools::range(nspins) )
+            for( auto k : itertools::range(nkpts_ibz) ) {
+              Paki5d(ispin,k,all,n,0) = nda::conj(Psia(ispin,k,all,lr));
+              for( auto [i,is] : itertools::enumerate(Skibz(k,nda::range(ns_per_kibz(k)-1))) )
+                Paki5d(ispin,k,all,n,i+1) = nda::conj(Psia(ispin,k,all,Sr_to_r(is,lr)));
             }
+          if(use_filter) {
+            for( auto ispin : itertools::range(nspins) )
+              for( auto k : itertools::range(nkpts_ibz) ) {
+                PakiX5d(ispin,k,all,n,0) = nda::conj(PsiaX(ispin,k,all,lr));
+                for( auto [i,is] : itertools::enumerate(Skibz(k,nda::range(ns_per_kibz(k)-1))) )
+                  PakiX5d(ispin,k,all,n,i+1) = nda::conj(PsiaX(ispin,k,all,Sr_to_r(is,lr)));
+              }
+          }
         } else {
           nda::tensor::set_device_synchronization(false);
           nda::tensor::assign(nda::conj(Psia(all,all,all,lr)),Paki5d(all,all,all,n,0));
@@ -383,8 +553,8 @@ auto thc::chol_metric_impl_ibz(int iq, int nIpts, nda::range a_range, nda::range
     Timer.start("ip_COMM");
     if(mpi->comm.size()>1) mpi->comm.all_reduce_in_place_n(ur.data(), block_size, std::plus<>{}); 
     if(mpi->comm.size()>1) 
-      local_comm.all_reduce_in_place_n(reinterpret_cast<RealType*>(comm_buff.data()), 
-                2*block_size*(max_ns_per_kibz*nspins*nkpts_ibz*a_range.size()+nchol),std::plus<>{}); 
+      local_comm.all_reduce_in_place_n(reinterpret_cast<RealType*>(comm_buff.data()),
+                2*block_size*(xdup*max_ns_per_kibz*nspins*nkpts_ibz*a_range.size()+nchol),std::plus<>{});
     arch::synchronize();
     Timer.stop("ip_COMM");
 
@@ -542,14 +712,14 @@ auto thc::chol_metric_impl_ibz(int iq, int nIpts, nda::range a_range, nda::range
       auto& pska = Pskau.back();
       for( auto ispin : itertools::range(nspins) )
         for( auto [ik, k] : itertools::enumerate(k_subrange) ) 
-          pska(ispin,ik,all) = Paki5d(ispin,kp_to_ibz(k),a_subrange,piv(i),loc_in_Ks(k));
+          pska(ispin,ik,all) = PakiX5d(ispin,kp_to_ibz(k),a_subrange,piv(i),loc_in_Ks(k));
     }
 
     // resize data structures
     if(nchol+newv > nmax) {
       int nmax_new = nmax + 2*int(sqrt(a_range.size()*b_range.size()));
       comm_buff = memory::array<MEM,ComplexType,1>(block_size*(nmax_new +
-                max_ns_per_kibz*nspins*nkpts_ibz*a_range.size()));
+                xdup*max_ns_per_kibz*nspins*nkpts_ibz*a_range.size()));
       {
         auto rn_ = nda::array<long,1>::zeros({nmax_new});
         rn_(nda::range(nmax)) = rn(); 
@@ -608,6 +778,7 @@ auto thc::chol_metric_impl_ibz(int iq, int nIpts, nda::range a_range, nda::range
           std::string("Error: Cholesky algorithm failed in thc::chol_metric_impl_ibz. \n") +
           std::string("       Found invalid residual:{}"),curr_max);
 
+    old_max = curr_max;
     // stopping condition when thresh is set
     if( thresh > 0.0 and thresh > curr_max) {
       if (nIpts > 0 and nchol < nIpts) {
@@ -615,9 +786,13 @@ auto thc::chol_metric_impl_ibz(int iq, int nIpts, nda::range a_range, nda::range
       }
       break;
     }
-    old_max = find_max();
-  }  
+  }
   Timer.stop("IpIter");
+  // selection summary. old_max is the residual tracked at loop exit; when the loop stops on
+  // nIpts it corresponds to the residual before the downdate of the last accepted block.
+  app_log(2, "  ISDF point selection (chol_metric_impl_ibz): nchol = {}, final max |D| = {}, c_mu = nchol/sqrt(na*nb) = {} (na = {}, nb = {})",
+          nchol, old_max, double(nchol)/std::sqrt(double(a_range.size()*b_range.size())),
+          a_range.size(), b_range.size());
 
   if constexpr (Ipts_only) {
     Timer.stop("IntPts");
@@ -784,8 +959,17 @@ auto thc::chol_metric_impl(int iq, int nIpts, nda::range a_range, nda::range b_r
                                    b_range.size() == mf->nbnd()), 
                "Error in chol_metric_impl: Rotation and range simultaneously used. ");
 
+  // knob 3: Coulomb-metric re-ranking. Pass 1 runs to an inflated pool size
+  // (nIpts is re-targeted here so every stop/clamp below uses the pool size);
+  // pass 2 reduces the pool back to nIpts_target after the loop.
+  utils::check(isdf_metric == "l2" or nIpts > 0,
+               "Error in thc::chol_metric_impl: isdf_metric != l2 requires an explicit nIpts (>0).");
+  const int nIpts_target = nIpts;
+  const bool rerank = (isdf_metric != "l2" and nIpts > 0);
+  if(rerank) nIpts = int(std::ceil(isdf_pool_factor * nIpts));
+
   // storage space, to be adjusted synamically later on
-  int nmax = (nIpts > 0 ? nIpts : 6*int(sqrt(a_range.size()*b_range.size()))); 
+  int nmax = (nIpts > 0 ? nIpts : 6*int(sqrt(a_range.size()*b_range.size())));
   long nspins = mf->nspin_in_basis();
   long npol = mf->npol_in_basis();
   long nkpts = mf->nkpts();
@@ -804,70 +988,95 @@ auto thc::chol_metric_impl(int iq, int nIpts, nda::range a_range, nda::range b_r
     utils::check(nproc_per_pool <= b_range.size(), "Error in chol_metric_impl: Too many processors. Decrease # of processors or increase distr_tol. ");
 
   Timer.start("DistOrbs");
-  // read orbitals in real space and redistribute 
-  bool custom_grid = (mf->has_wfc_grid() and mf->fft_grid_dim() != rho_g.mesh());
-  auto distPsia = mf::read_distributed_orbital_set<local_CArray_t>(*mf,mpi->comm,
+  // read orbitals in real space and redistribute
+  bool use_filter = (isdf_filter_alpha > 0.0);
+  utils::check(not use_filter or mf->has_wfc_grid(),
+      "isdf_filter_alpha > 0 requires a plane-wave mean field with a wavefunction G-grid.");
+  // filtering acts on the PW coefficients, so it forces the 'w'-read + FFT path
+  bool custom_grid = (mf->has_wfc_grid() and (mf->fft_grid_dim() != rho_g.mesh() or use_filter));
+
+  // a-side builder: read + (optional knob-2 filter) + scatter/FFT + rotation + Znorm
+  auto build_dista = [&](bool do_filter) {
+    auto dPa = mf::read_distributed_orbital_set<local_CArray_t>(*mf,mpi->comm,
                (custom_grid?'w':'r'),
                (custom_grid?std::array<long,2>{mpi->comm.size(),1}:std::array<long,2>{1,mpi->comm.size()}),
                nda::range(0,nspins),nda::range(0,nkpts),
-               (C_skai!=nullptr?nda::range(mf->nbnd()):a_range),{1,1}); 
-
-  if(custom_grid) {
-    auto wfc_to_rho = memory::to_memory_space<MEM>(swfc_to_rho.local());
-    auto dPsir = memory::darray_t<local_CArray_t,boost::mpi3::communicator>(
-             std::addressof(mpi->comm),{mpi->comm.size(),1}, {distPsia.global_shape()[0],rho_g.nnr()},
-             {distPsia.local_shape()[0],rho_g.nnr()}, distPsia.origin(),{1,1});
-    auto psir = dPsir.local();
-    auto P4d = nda::reshape(psir,
-          std::array<long,4>{psir.extent(0),rho_g.mesh(0),rho_g.mesh(1),rho_g.mesh(2)});
-    math::nda::fft<true> F(P4d,math::fft::FFT_MEASURE);
-    psir() = ComplexType(0.0);
-    nda::copy_select(true,1,wfc_to_rho,ComplexType(1.0),distPsia.local(),ComplexType(0.0),psir);
-    F.backward(P4d);
-    math::nda::redistribute_in_place(dPsir,{1,mpi->comm.size()},{1,1});
-    distPsia = std::move(dPsir);
-  }
-  // If a rotation matrix is provided, rotate orbitals
-  if(C_skai!=nullptr) {
-    // multiply by conj(C) on the left
-    long skap = nspins*nkpts*a_range.size()*npol; 
-    long nnr_loc = distPsia.local_shape()[1];
-    auto dPsir = memory::darray_t<local_CArray_t,boost::mpi3::communicator>(
-             std::addressof(mpi->comm),{1,mpi->comm.size()},{skap,distPsia.global_shape()[1]},
-             {skap,distPsia.local_shape()[1]},
-             distPsia.origin(),{1,1});
-    utils::check(dPsir.local_shape()[1] == nnr_loc, "Shape mismatch.");
-
-    // conjugate distPsia and dPsir afterwards, to avoid needing to modify C_skai
-    // Currently, C_skai is a spinor rotation, so merge polarization into nnr_loc
-    auto Pi = nda::reshape(distPsia.local(),std::array<long,4>{nspins,nkpts,mf->nbnd(),npol*nnr_loc});
-    auto Pa = nda::reshape(dPsir.local(),std::array<long,4>{nspins,nkpts,a_range.size(),npol*nnr_loc});
-    if constexpr (MEM==HOST_MEMORY) {
-      nda::tensor::scale(ComplexType(1.0), distPsia.local(), nda::tensor::op::CONJ);
-      for( auto is : itertools::range(nspins) ) {
-        for( auto ik : itertools::range(nkpts) ) {
-          nda::blas::gemm((*C_skai)(is,ik,all,all),Pi(is,ik,all,all),Pa(is,ik,all,all));
+               (C_skai!=nullptr?nda::range(mf->nbnd()):a_range),{1,1});
+    if(custom_grid) {
+      if(do_filter) {
+        if constexpr (MEM==HOST_MEMORY) {
+          detail::apply_isdf_filter(dPa.local(), dPa.origin()[0], nkpts,
+                                    (C_skai!=nullptr ? mf->nbnd() : long(a_range.size())), npol,
+                                    isdf_filter_table(nkpts));
+        } else {
+          utils::check(false, "isdf_filter_alpha > 0: device path not implemented; run the CPU build.");
         }
-      }  
-      nda::tensor::scale(ComplexType(1.0), dPsir.local(), nda::tensor::op::CONJ);
-    } else {
-      nda::tensor::contract(nda::conj(*C_skai),"skai",Pi,"skir",Pa,"skar");
+      }
+      auto wfc_to_rho = memory::to_memory_space<MEM>(swfc_to_rho.local());
+      auto dPsir = memory::darray_t<local_CArray_t,boost::mpi3::communicator>(
+               std::addressof(mpi->comm),{mpi->comm.size(),1}, {dPa.global_shape()[0],rho_g.nnr()},
+               {dPa.local_shape()[0],rho_g.nnr()}, dPa.origin(),{1,1});
+      auto psir = dPsir.local();
+      auto P4d = nda::reshape(psir,
+            std::array<long,4>{psir.extent(0),rho_g.mesh(0),rho_g.mesh(1),rho_g.mesh(2)});
+      math::nda::fft<true> F(P4d,math::fft::FFT_MEASURE);
+      psir() = ComplexType(0.0);
+      nda::copy_select(true,1,wfc_to_rho,ComplexType(1.0),dPa.local(),ComplexType(0.0),psir);
+      F.backward(P4d);
+      math::nda::redistribute_in_place(dPsir,{1,mpi->comm.size()},{1,1});
+      dPa = std::move(dPsir);
     }
-    mpi->comm.barrier(); 
-    distPsia = std::move(dPsir);
-  }
-  nda::tensor::scale(Znorm, distPsia.local());
-  utils::check(distPsia.local_shape()[0] == nspins*nkpts*a_range.size()*npol, "Shape mismatch"); 
-  
-  // Similar to distPsia
-  decltype(distPsia)* distPsib;
-  if( single_psi ) 
-    distPsib = std::addressof(distPsia);
-  else {
+    // If a rotation matrix is provided, rotate orbitals
+    if(C_skai!=nullptr) {
+      // multiply by conj(C) on the left
+      long skap = nspins*nkpts*a_range.size()*npol;
+      long nnr_loc = dPa.local_shape()[1];
+      auto dPsir = memory::darray_t<local_CArray_t,boost::mpi3::communicator>(
+               std::addressof(mpi->comm),{1,mpi->comm.size()},{skap,dPa.global_shape()[1]},
+               {skap,dPa.local_shape()[1]},
+               dPa.origin(),{1,1});
+      utils::check(dPsir.local_shape()[1] == nnr_loc, "Shape mismatch.");
+
+      // conjugate dPa and dPsir afterwards, to avoid needing to modify C_skai
+      // Currently, C_skai is a spinor rotation, so merge polarization into nnr_loc
+      auto Pi = nda::reshape(dPa.local(),std::array<long,4>{nspins,nkpts,mf->nbnd(),npol*nnr_loc});
+      auto Pa = nda::reshape(dPsir.local(),std::array<long,4>{nspins,nkpts,a_range.size(),npol*nnr_loc});
+      if constexpr (MEM==HOST_MEMORY) {
+        nda::tensor::scale(ComplexType(1.0), dPa.local(), nda::tensor::op::CONJ);
+        for( auto is : itertools::range(nspins) ) {
+          for( auto ik : itertools::range(nkpts) ) {
+            nda::blas::gemm((*C_skai)(is,ik,all,all),Pi(is,ik,all,all),Pa(is,ik,all,all));
+          }
+        }
+        nda::tensor::scale(ComplexType(1.0), dPsir.local(), nda::tensor::op::CONJ);
+      } else {
+        nda::tensor::contract(nda::conj(*C_skai),"skai",Pi,"skir",Pa,"skar");
+      }
+      mpi->comm.barrier();
+      dPa = std::move(dPsir);
+    }
+    nda::tensor::scale(Znorm, dPa.local());
+    utils::check(dPa.local_shape()[0] == nspins*nkpts*a_range.size()*npol, "Shape mismatch");
+    return dPa;
+  };
+  auto distPsia = build_dista(use_filter);
+  using darr_t = decltype(distPsia);
+
+  // b-side builder; distribution is aligned with `ref` (heap-allocated, caller owns)
+  auto build_distb = [&](bool do_filter, darr_t& ref) -> darr_t* {
+    darr_t* p = nullptr;
     if(custom_grid) {
       auto wfc_to_rho = memory::to_memory_space<MEM>(swfc_to_rho.local());
       auto Psib = mf::read_distributed_orbital_set<local_CArray_t>(*mf,mpi->comm,'w',{mpi->comm.size(),1},
-                          nda::range(0,nspins),nda::range(0,nkpts),b_range,{1}); 
+                          nda::range(0,nspins),nda::range(0,nkpts),b_range,{1});
+      if(do_filter) {
+        if constexpr (MEM==HOST_MEMORY) {
+          detail::apply_isdf_filter(Psib.local(), Psib.origin()[0], nkpts,
+                                    long(b_range.size()), npol, isdf_filter_table(nkpts));
+        } else {
+          utils::check(false, "isdf_filter_alpha > 0: device path not implemented; run the CPU build.");
+        }
+      }
       auto dPsir = memory::darray_t<local_CArray_t,boost::mpi3::communicator>(
              std::addressof(mpi->comm),{mpi->comm.size(),1},{Psib.global_shape()[0],rho_g.nnr()},{Psib.local_shape()[0],rho_g.nnr()},
              Psib.origin(),{1,1});
@@ -878,26 +1087,46 @@ auto thc::chol_metric_impl(int iq, int nIpts, nda::range a_range, nda::range b_r
       psir() = ComplexType(0.0);
       nda::copy_select(true,1,wfc_to_rho,ComplexType(1.0),Psib.local(),ComplexType(0.0),psir);
       F.backward(P4d);
-      // stealing the distribution from distPsia 
-      distPsib = new memory::darray_t<local_CArray_t,mpi3::communicator>(std::addressof(mpi->comm),
-                          {1,mpi->comm.size()},dPsir.global_shape(),{dPsir.global_shape()[0],distPsia.local_shape()[1]},
-                          distPsia.origin(),{1,1});
-      math::nda::redistribute(dPsir,*distPsib);
+      // stealing the distribution from ref
+      p = new memory::darray_t<local_CArray_t,mpi3::communicator>(std::addressof(mpi->comm),
+                          {1,mpi->comm.size()},dPsir.global_shape(),{dPsir.global_shape()[0],ref.local_shape()[1]},
+                          ref.origin(),{1,1});
+      math::nda::redistribute(dPsir,*p);
     } else {
       auto Psib = mf::read_distributed_orbital_set<local_CArray_t>(*mf,mpi->comm,'r',{1,mpi->comm.size()},
-                          nda::range(0,nspins),nda::range(0,nkpts),b_range,{1}); 
-      distPsib = new memory::darray_t<local_CArray_t,mpi3::communicator>(std::addressof(mpi->comm),
+                          nda::range(0,nspins),nda::range(0,nkpts),b_range,{1});
+      p = new memory::darray_t<local_CArray_t,mpi3::communicator>(std::addressof(mpi->comm),
                           Psib.grid(),Psib.global_shape(),Psib.local_shape(),
                           Psib.origin(),Psib.block_size());
-      *distPsib = Psib;
-      //*distPsib = std::move(Psib);
+      *p = Psib;
     }
-    utils::check(distPsia.local_range(1) == distPsib->local_range(1), "Error in chol_metric_impl: Range mismatch.");
-    nda::tensor::scale(Znorm, distPsib->local());
-  }
+    utils::check(ref.local_range(1) == p->local_range(1), "Error in chol_metric_impl: Range mismatch.");
+    nda::tensor::scale(Znorm, p->local());
+    return p;
+  };
+
+  darr_t* distPsib;
+  if( single_psi )
+    distPsib = std::addressof(distPsia);
+  else
+    distPsib = build_distb(use_filter, distPsia);
   utils::check(distPsia.local_range(1) == distPsib->local_range(1), "Error: Distribution error.");
   if(b_range.size() > 0)
-    utils::check(distPsib->local_shape()[0]==nspins*nkpts*b_range.size()*npol,"Shape mismatch"); 
+    utils::check(distPsib->local_shape()[0]==nspins*nkpts*b_range.size()*npol,"Shape mismatch");
+
+  // knob 2: unfiltered twins supply the collation (X) values — the filter may only
+  // choose the points, never the orbital values returned to the solve.
+  std::optional<darr_t> distPsiaX;
+  darr_t* distPsibX = nullptr;
+  if(use_filter) {
+    distPsiaX.emplace(build_dista(false));
+    utils::check(distPsiaX->local_range(1) == distPsia.local_range(1),
+                 "chol_metric_impl: unfiltered twin distribution mismatch.");
+    if( single_psi )
+      distPsibX = std::addressof(*distPsiaX);
+    else
+      distPsibX = build_distb(false, *distPsiaX);
+  }
   Timer.stop("DistOrbs");
 
   // when thresh = 0.0, set block_size to 1 until a more robust algorithm is found.
@@ -935,20 +1164,97 @@ auto thc::chol_metric_impl(int iq, int nIpts, nda::range a_range, nda::range b_r
         // phase(i, j, k) = exp(i * Gab * r) where r = (i, j, k) * translational vectors
         utils::rspace_phase_factor(mf->lattv(),Gab,phase);
         // Pb(b,i) = Pb(b,i) * phase_1D(r_range(i))
-        if constexpr (MEM == HOST_MEMORY) {
-          for( auto b : itertools::range(b_range.size()) ) 
-            for( auto p : itertools::range(npol) ) 
-              Psib(is,k,b,p,all) *= phase_1D(r_range);
-        } else {
-          nda::tensor::contract(phase_1D(r_range),"i",Psib(is,k,all,all,all),"bpi",Psib(is,k,all,all,all),"bpi");
-        }
+        auto apply_phase = [&](auto Pb5) {
+          if constexpr (MEM == HOST_MEMORY) {
+            for( auto b : itertools::range(b_range.size()) )
+              for( auto p : itertools::range(npol) )
+                Pb5(is,k,b,p,all) *= phase_1D(r_range);
+          } else {
+            nda::tensor::contract(phase_1D(r_range),"i",Pb5(is,k,all,all,all),"bpi",Pb5(is,k,all,all,all),"bpi");
+          }
+        };
+        apply_phase(Psib);
+        if(use_filter)
+          apply_phase(nda::reshape(distPsibX->local(),
+              shape_t<5>{nspins,nkpts,b_range.size(),npol,r_range.size()}));
       }
     }
   }
 
   /*********************************************
-                 Diagonal/Residual 
+                 Diagonal/Residual
   *********************************************/
+
+  // knob 1: separable pair weights. "gap": w_ia = 1/(|e_i-mu| + |e_a-mu| + eta),
+  // Laplace-expanded into NL nonnegative separable terms f_p(n) = exp(-t_p |e_n-mu|).
+  // The weight enters the SELECTION Gram only (diagonal + pivot columns below);
+  // collation values and everything downstream are untouched.
+  bool use_weight = (isdf_pair_weight != "none");
+  nda::array<RealType,1> lap_c, lap_t;
+  nda::array<RealType,3> wtab_a, wtab_b;   // (NL, ns*nk, na/nb)
+  if(use_weight) {
+    if constexpr (MEM != HOST_MEMORY)
+      utils::check(false, "isdf_pair_weight != none: device path not implemented; run the CPU build.");
+    utils::check(C_skai == nullptr,
+        "isdf_pair_weight != none is incompatible with rotated-orbital selection (no band energies).");
+    auto eigval = mf->eigval();
+    auto kmap = mf->kp_to_ibz();
+    double mu = mf->efermi();
+    if(isdf_pair_weight == "gap") {
+      double dmax = 1e-12;
+      for(long is=0; is<nspins; ++is)
+        for(long ik=0; ik<nkpts; ++ik)
+          for(auto n : a_range)
+            dmax = std::max(dmax, std::abs(eigval(is,kmap(ik),n) - mu));
+      for(long is=0; is<nspins; ++is)
+        for(long ik=0; ik<nkpts; ++ik)
+          for(auto n : b_range)
+            dmax = std::max(dmax, std::abs(eigval(is,kmap(ik),n) - mu));
+      detail::isdf_laplace_quadrature(isdf_laplace_terms, isdf_eta, 2.0*dmax + isdf_eta,
+                                      lap_t, lap_c);
+      // fold e^{-t_p eta} of the regularizer into the coefficients:
+      // x = |e_i-mu| + |e_a-mu| + eta  =>  c_p e^{-t_p eta} e^{-t_p|e_i-mu|} e^{-t_p|e_a-mu|}
+      long NL = isdf_laplace_terms;
+      wtab_a = nda::array<RealType,3>(NL, nspins*nkpts, a_range.size());
+      wtab_b = nda::array<RealType,3>(NL, nspins*nkpts, b_range.size());
+      for(long p=0; p<NL; ++p) {
+        lap_c(p) *= std::exp(-lap_t(p)*isdf_eta);
+        for(long is=0; is<nspins; ++is)
+          for(long ik=0; ik<nkpts; ++ik) {
+            for(auto [ia,n] : itertools::enumerate(a_range))
+              wtab_a(p,is*nkpts+ik,ia) = std::exp(-lap_t(p)*std::abs(eigval(is,kmap(ik),n)-mu));
+            for(auto [ib,n] : itertools::enumerate(b_range))
+              wtab_b(p,is*nkpts+ik,ib) = std::exp(-lap_t(p)*std::abs(eigval(is,kmap(ik),n)-mu));
+          }
+      }
+    } else {
+      // rank-1 parametrized families (M4b): w_ia = f(e_i) f(e_a), N_L = 1;
+      // weighted selection then costs the same as the unweighted one.
+      auto fw = [&](double e) -> double {
+        double x = std::abs(e - mu);
+        double f;
+        if(isdf_pair_weight == "exp")
+          f = std::exp(-isdf_weight_params[0]*x);
+        else if(isdf_pair_weight == "sigmoid")
+          f = 1.0/(1.0 + std::exp((x - isdf_weight_params[0])/isdf_weight_params[1]));
+        else
+          f = std::pow(x + isdf_eta, -isdf_weight_params[0]);   // "power"
+        // floor guards against rank collapse when the weight window covers only
+        // a small fraction of a large orbital set
+        return std::max(f, isdf_weight_floor);
+      };
+      lap_c = nda::array<RealType,1>(1); lap_c(0) = 1.0;
+      wtab_a = nda::array<RealType,3>(1, nspins*nkpts, a_range.size());
+      wtab_b = nda::array<RealType,3>(1, nspins*nkpts, b_range.size());
+      for(long is=0; is<nspins; ++is)
+        for(long ik=0; ik<nkpts; ++ik) {
+          for(auto [ia,n] : itertools::enumerate(a_range))
+            wtab_a(0,is*nkpts+ik,ia) = fw(eigval(is,kmap(ik),n));
+          for(auto [ib,n] : itertools::enumerate(b_range))
+            wtab_b(0,is*nkpts+ik,ib) = fw(eigval(is,kmap(ik),n));
+        }
+    }
+  }
 
   nda::array<RealType,1> lmax_res_val(block_size,0.0);
   // linear indexes of the locations of the maximum residuals (not in order)
@@ -958,6 +1264,37 @@ auto thc::chol_metric_impl(int iq, int nIpts, nda::range a_range, nda::range b_r
   // batched dot gemm in gpu!!!
   memory::array<MEM,ComplexType,1> Diag(r_range.size(),0.0);
   if constexpr (MEM==HOST_MEMORY) {
+    if(use_weight) {
+      // C^w_gg = sum_p c_p A^p_sk(g) conj(B^p_sk(g)) per (s,k); A^p(g) = sum_i f_p(i)|u_i(g)|^2
+      long NL = wtab_a.extent(0);
+      nda::array<RealType,1> accA(NL), accB(NL);
+      for( auto is : itertools::range(nspins) ) {
+        for( auto k : itertools::range(nkpts) ) {
+          long ka = k;
+          long kb = mf->qk_to_k2(iq,ka);
+          for( auto p : itertools::range(npol) ) {
+            for( auto r : itertools::range(r_range.size()) ) {
+              accA() = 0.0; accB() = 0.0;
+              for( auto [ia,i] : itertools::enumerate(a_range) ) {
+                (void) i;
+                RealType v = std::norm(Psia(is,ka,ia,p,r));
+                for(long l=0; l<NL; ++l) accA(l) += wtab_a(l,is*nkpts+ka,ia)*v;
+              }
+              if( single_psi ) {
+                for(long l=0; l<NL; ++l) Diag(r) += lap_c(l)*accA(l)*accA(l);
+              } else {
+                for( auto [ib,i] : itertools::enumerate(b_range) ) {
+                  (void) i;
+                  RealType v = std::norm(Psib(is,kb,ib,p,r));
+                  for(long l=0; l<NL; ++l) accB(l) += wtab_b(l,is*nkpts+kb,ib)*v;
+                }
+                for(long l=0; l<NL; ++l) Diag(r) += lap_c(l)*accA(l)*accB(l);
+              }
+            }
+          }
+        }
+      }
+    } else {
     for( auto is : itertools::range(nspins) ) {
       for( auto k : itertools::range(nkpts) ) {
         long ka = k;
@@ -974,6 +1311,7 @@ auto thc::chol_metric_impl(int iq, int nIpts, nda::range a_range, nda::range b_r
           }
         }
       }
+    }
     }
   } else {
     memory::device_array<ComplexType,4> Lr(nspins,nkpts,npol,r_range.size());
@@ -1055,9 +1393,11 @@ auto thc::chol_metric_impl(int iq, int nIpts, nda::range a_range, nda::range b_r
   // add bucket structure to minimize wasted space/reallocation
 
   const long b_scale = ( single_psi ? 0 : 1 );
+  // knob 2: with filtering active the buffer also carries the unfiltered (X) values
+  const long xdup = ( use_filter ? 2 : 1 );
 
   memory::array<MEM,ComplexType,1> comm_buff(block_size*(nmax +
-                nspins*nkpts*(a_range.size()+b_scale*b_range.size())*npol));
+                xdup*nspins*nkpts*(a_range.size()+b_scale*b_range.size())*npol));
   memory::array<MEM,ComplexType,5> Lr(nspins,nkpts,npol,block_size,r_range.size());
   memory::array<MEM,ComplexType,5> Rr;
   if(not single_psi) 
@@ -1083,23 +1423,38 @@ auto thc::chol_metric_impl(int iq, int nIpts, nda::range a_range, nda::range b_r
     utils::check( old_max > 1e-14, " Error in thc::chol_metric_impl: Reached truncation error of 1e-14 without convergence. This likely means that nIpts is too large. Current number of cholesky vectors = {}. Set nIpts to a value equal or larger than this. ",nchol);   
 
     // stopping condition when thresh is set
-    if( thresh > 0.0 and thresh > old_max) break;
+    if( thresh > 0.0 and thresh > old_max) {
+      if (nIpts > 0 and nchol < nIpts) {
+        app_log(1, "[WARNING] thresh={} reached after {} interpolating points, before reaching requested nIpts={}.", thresh, nchol, nIpts);
+      }
+      break;
+    }
 
-    utils::check( std::isfinite(old_max), 
-          std::string("Error: Cholesky algorithm failed in thc::chol_metric_impl. \n") + 
+    utils::check( std::isfinite(old_max),
+          std::string("Error: Cholesky algorithm failed in thc::chol_metric_impl. \n") +
           std::string("       Found invalid residual:{}"),old_max); 
 
     auto Paki = memory::array_view<MEM,ComplexType,2>({nspins*nkpts*a_range.size()*npol,block_size},
                                                     comm_buff.data());
     auto Pbki = memory::array_view<MEM,ComplexType,2>({nspins*nkpts*b_range.size()*npol*b_scale,block_size},
                                                     comm_buff.data() + Paki.size());
-    auto Rc = memory::array_view<MEM,ComplexType,2>({nmax,block_size}, Pbki.data() + Pbki.size()); 
-    // the layout of Paki is being chosen as nda::layout_prop_e::strided_1d, 
+    // unfiltered (X) sections, present only when knob 2 is active (xdup==2)
+    auto PakiX = memory::array_view<MEM,ComplexType,2>({(xdup-1)*nspins*nkpts*a_range.size()*npol,block_size},
+                                                    Pbki.data() + Pbki.size());
+    auto PbkiX = memory::array_view<MEM,ComplexType,2>({(xdup-1)*nspins*nkpts*b_range.size()*npol*b_scale,block_size},
+                                                    PakiX.data() + PakiX.size());
+    auto Rc = memory::array_view<MEM,ComplexType,2>({nmax,block_size}, PbkiX.data() + PbkiX.size());
+    // the layout of Paki is being chosen as nda::layout_prop_e::strided_1d,
     // which prevents the use of reshaped_view, how to fix this in nda?
     auto Paki5d = memory::array_view<MEM,ComplexType,5>({nspins,nkpts,a_range.size(),npol,block_size},
                                                         Paki.data());
     auto Pbki5d = memory::array_view<MEM,ComplexType,5>({nspins,nkpts,b_scale*b_range.size(),npol,block_size},
                                                         Pbki.data());
+    // collation sources: alias the filtered sections unless the X twins are active
+    auto PakiX5d = memory::array_view<MEM,ComplexType,5>({nspins,nkpts,a_range.size(),npol,block_size},
+                                                        (use_filter ? PakiX.data() : Paki.data()));
+    auto PbkiX5d = memory::array_view<MEM,ComplexType,5>({nspins,nkpts,b_scale*b_range.size(),npol,block_size},
+                                                        (use_filter ? PbkiX.data() : Pbki.data()));
 
     Timer.start("ip_setup_comm");
     comm_buff() = ComplexType(0.0);
@@ -1112,11 +1467,16 @@ auto thc::chol_metric_impl(int iq, int nIpts, nda::range a_range, nda::range b_r
         // conj(Psia(:,ru))
         if constexpr (MEM==HOST_MEMORY) {
           Paki(all,n) = nda::conj(distPsia.local()(all,lr));
-          if(not single_psi) 
+          if(not single_psi)
             Pbki(all,n) = nda::conj(distPsib->local()(all,lr));
+          if(use_filter) {
+            PakiX(all,n) = nda::conj(distPsiaX->local()(all,lr));
+            if(not single_psi)
+              PbkiX(all,n) = nda::conj(distPsibX->local()(all,lr));
+          }
         } else {
           nda::tensor::assign(nda::conj(distPsia.local()(all,lr)),Paki(all,n));
-          if(not single_psi) 
+          if(not single_psi)
             nda::tensor::assign(nda::conj(distPsib->local()(all,lr)),Pbki(all,n));
         }
         if(nchol > 0) 
@@ -1126,8 +1486,8 @@ auto thc::chol_metric_impl(int iq, int nIpts, nda::range a_range, nda::range b_r
     Timer.stop("ip_setup_comm");
     Timer.start("ip_COMM");
     if(mpi->comm.size()>1) mpi->comm.all_reduce_in_place_n(ur.data(), block_size, std::plus<>{}); 
-    if(mpi->comm.size()>1) mpi->comm.all_reduce_in_place_n(comm_buff.data(), 
-		block_size*(nspins*nkpts*(a_range.size()+b_scale*b_range.size())*npol+nchol),std::plus<>{}); 
+    if(mpi->comm.size()>1) mpi->comm.all_reduce_in_place_n(comm_buff.data(),
+		block_size*(xdup*nspins*nkpts*(a_range.size()+b_scale*b_range.size())*npol+nchol),std::plus<>{});
     Timer.stop("ip_COMM");
 
     // contruct new cholesky vector L(p,ik,ia,ib)
@@ -1137,6 +1497,48 @@ auto thc::chol_metric_impl(int iq, int nIpts, nda::range a_range, nda::range b_r
     Timer.start("ip_chol");
     Tab() = ComplexType(0.0);
     if constexpr (MEM==HOST_MEMORY) {
+      if(use_weight) {
+        // C^w column: per separable term, weight the GATHERED factor rows by f_l and
+        // accumulate the per-(s,k) Hadamard product with coefficient c_l.
+        long NL = wtab_a.extent(0);
+        memory::array<MEM,ComplexType,2> WP(std::max(a_range.size(),b_range.size()),block_size);
+        auto L3D = nda::reshape(Lr,shape_t<3>{nspins*nkpts*npol,block_size,r_range.size()});
+        auto R3D = nda::reshape(Rr,shape_t<3>{nspins*nkpts*npol,block_size,r_range.size()});
+        auto L2D = nda::reshape(Lr,shape_t<2>{nspins*nkpts*npol,block_size*r_range.size()});
+        auto T1D = nda::reshape(Tab,shape_t<1>{block_size*r_range.size()});
+        for(long l=0; l<NL; ++l) {
+          for( auto is : itertools::range(nspins) ) {
+            for( auto k : itertools::range(nkpts) ) {
+              long ka = k;
+              long kb = mf->qk_to_k2(iq, ka);
+              for( auto p : itertools::range(npol) ) {
+                auto WPa = WP(nda::range(a_range.size()),all);
+                for( auto [ia,i] : itertools::enumerate(a_range) ) {
+                  (void) i;
+                  WPa(ia,all) = wtab_a(l,is*nkpts+ka,ia)*Paki5d(is,ka,ia,p,all);
+                }
+                nda::blas::gemm(nda::transpose(WPa),Psia(is,ka,all,p,all),Lr(is,ka,p,all,all));
+                if(not single_psi) {
+                  auto WPb = WP(nda::range(b_range.size()),all);
+                  for( auto [ib,i] : itertools::enumerate(b_range) ) {
+                    (void) i;
+                    WPb(ib,all) = wtab_b(l,is*nkpts+kb,ib)*Pbki5d(is,kb,ib,p,all);
+                  }
+                  nda::blas::gemm(nda::transpose(WPb),Psib(is,kb,all,p,all),Rr(is,kb,p,all,all));
+                }
+              }
+            }
+          }
+          if(single_psi) {
+            for( auto isk : itertools::range(nspins*nkpts*npol) )
+              T1D(all) += ComplexType(lap_c(l))*nda::conj(L2D(isk,all))*L2D(isk,all);
+          } else {
+            for( auto ib : itertools::range(block_size) )
+              for( auto r : itertools::range(r_range.size()) )
+                Tab(ib,r) += ComplexType(lap_c(l))*nda::blas::dotc(L3D(all,ib,r),R3D(all,ib,r));
+          }
+        }
+      } else {
       for( auto is : itertools::range(nspins) ) {
         for( auto k : itertools::range(nkpts) ) {
           long ka = k;
@@ -1144,7 +1546,7 @@ auto thc::chol_metric_impl(int iq, int nIpts, nda::range a_range, nda::range b_r
           for( auto p : itertools::range(npol) ) {
             nda::blas::gemm(nda::transpose(Paki5d(is,ka,all,p,all)),
                             Psia(is,ka,all,p,all),Lr(is,ka,p,all,all));
-            if(not single_psi) 
+            if(not single_psi)
               nda::blas::gemm(nda::transpose(Pbki5d(is,kb,all,p,all)),
                               Psib(is,kb,all,p,all),Rr(is,kb,p,all,all));
           }
@@ -1158,9 +1560,10 @@ auto thc::chol_metric_impl(int iq, int nIpts, nda::range a_range, nda::range b_r
           T1D(all) += nda::conj(L2D(isk,all))*L2D(isk,all);
       } else {
         auto R3D = nda::reshape(Rr,shape_t<3>{nspins*nkpts*npol,block_size,r_range.size()});
-        for( auto ib : itertools::range(block_size) ) 
-          for( auto r : itertools::range(r_range.size()) ) 
-            Tab(ib,r) = nda::blas::dotc(L3D(all,ib,r),R3D(all,ib,r)); 
+        for( auto ib : itertools::range(block_size) )
+          for( auto r : itertools::range(r_range.size()) )
+            Tab(ib,r) = nda::blas::dotc(L3D(all,ib,r),R3D(all,ib,r));
+      }
       }
     } else {
       if(single_psi) {
@@ -1256,7 +1659,7 @@ auto thc::chol_metric_impl(int iq, int nIpts, nda::range a_range, nda::range b_r
       for( auto ispin : itertools::range(nspins) )
         for( auto p : itertools::range(npol) )
           for( auto [ik,k] : itertools::enumerate(k_subrange) )
-            pska(ispin*npol+p,ik,all) = Paki5d(ispin,k,a_subrange,p,piv(i));
+            pska(ispin*npol+p,ik,all) = PakiX5d(ispin,k,a_subrange,p,piv(i));
       if(not single_psi) {
         Pskbu.emplace_back(memory::array<MEM,ComplexType,3>(nspins*npol,k_subrange.size(),b_subrange.size()));
         auto& pskb = Pskbu.back();
@@ -1264,7 +1667,7 @@ auto thc::chol_metric_impl(int iq, int nIpts, nda::range a_range, nda::range b_r
         for( auto ispin : itertools::range(nspins) )
           for( auto p : itertools::range(npol) )
             for( auto [ik,k] : itertools::enumerate(k_subrange) )
-              pskb(ispin*npol+p,ik,all) = Pbki5d(ispin,k,b_subrange,p,piv(i));
+              pskb(ispin*npol+p,ik,all) = PbkiX5d(ispin,k,b_subrange,p,piv(i));
       }
     }
 
@@ -1272,7 +1675,7 @@ auto thc::chol_metric_impl(int iq, int nIpts, nda::range a_range, nda::range b_r
     if(nchol+newv > nmax) {
       int nmax_new = nmax + 2*int(sqrt(a_range.size()*b_range.size()));
       comm_buff = memory::array<MEM,ComplexType,1>(block_size*(nmax_new +
-                nspins*nkpts*(a_range.size()+b_scale*b_range.size())*npol));
+                xdup*nspins*nkpts*(a_range.size()+b_scale*b_range.size())*npol));
       {
         auto rn_ = nda::array<long,1>::zeros({nmax_new});
         rn_(nda::range(nmax)) = rn(); 
@@ -1331,11 +1734,139 @@ auto thc::chol_metric_impl(int iq, int nIpts, nda::range a_range, nda::range b_r
           std::string("Error: Cholesky algorithm failed in thc::chol_metric_impl. \n") +
           std::string("       Found invalid residual:{}"),curr_max);
 
-    // stopping condition when thresh is set
-    if( thresh > 0.0 and thresh > curr_max) break;
     old_max = curr_max;
+    // stopping condition when thresh is set
+    if( thresh > 0.0 and thresh > curr_max) {
+      if (nIpts > 0 and nchol < nIpts) {
+        app_log(1, "[WARNING] thresh={} reached after {} interpolating points, before reaching requested nIpts={}.", thresh, nchol, nIpts);
+      }
+      break;
+    }
   }
   Timer.stop("IpIter");
+  // selection summary. old_max is the residual tracked at loop exit; when the loop stops on
+  // nIpts it corresponds to the residual before the downdate of the last accepted block.
+  app_log(2, "  ISDF point selection (chol_metric_impl): nchol = {}, final max |D| = {}, c_mu = nchol/sqrt(na*nb) = {} (na = {}, nb = {})",
+          nchol, old_max, double(nchol)/std::sqrt(double(a_range.size()*b_range.size())),
+          a_range.size(), b_range.size());
+
+  // knob 3, pass 2: exact Coulomb-metric re-ranking of the pool.
+  // K_PP = ell (L^H vbar L) ell^H with ell = L[P,:], L(g,v) = conj(R(v,g));
+  // exact because the Schur complement vanishes on eliminated pivots.
+  if(rerank and nchol > nIpts_target) {
+    Timer.start("IpRerank");
+    const long N1 = nchol;
+    const long nnr_glob = distPsia.global_shape()[1];
+    // (1) ell: owner ranks fill the columns of R at their local pivot points
+    nda::array<ComplexType,2> ell(N1, N1); ell() = ComplexType(0.0);
+    for(long j=0;j<N1;++j) {
+      long g = rn(j);
+      if(g >= r_range.first() and g < r_range.first()+long(r_range.size())) {
+        long lr = g - r_range.first();
+        for(long v=0;v<N1;++v) ell(j,v) = std::conj(R(v,lr));
+      }
+    }
+    mpi->comm.all_reduce_in_place_n(ell.data(), N1*N1, std::plus<>{});
+    // (2) rows of the factor to full grid, conjugate -> columns of L, batched FFT
+    auto dR = memory::darray_t<local_CArray_t,mpi3::communicator>(
+        std::addressof(mpi->comm), {1,mpi->comm.size()}, {N1, nnr_glob},
+        {N1, long(r_range.size())}, {0, r_range.first()}, {1,1});
+    dR.local() = R(nda::range(N1), nda::range(long(r_range.size())));
+    math::nda::redistribute_in_place(dR, {mpi->comm.size(),1}, {1,1});
+    auto rows = dR.local();
+    if(rows.extent(0) > 0) {
+      nda::tensor::scale(ComplexType(1.0), rows, nda::tensor::op::CONJ);
+      auto rows4 = nda::reshape(rows, std::array<long,4>{rows.extent(0),
+                         rho_g.mesh(0), rho_g.mesh(1), rho_g.mesh(2)});
+      // FFT_ESTIMATE: MEASURE planning would overwrite the (already loaded) data
+      math::nda::fft<true> Ff(rows4, math::fft::FFT_ESTIMATE);
+      Ff.forward(rows4);
+    }
+    // (3) vbar on the truncated G list (overall scale irrelevant to pivoting)
+    const long ngm = rho_g.size();
+    nda::array<RealType,1> vbar(ngm); vbar() = 0.0;
+    {
+      memory::unified_array<ComplexType,1> vq_buf(ngm);
+      nda::array<RealType,1> v_zero3 = {0.0,0.0,0.0};
+      auto Qpts_all = mf->Qpts();
+      long nq_avg = (isdf_metric_qavg ? Qpts_all.extent(0) : 1);
+      for(long iq_=0; iq_<nq_avg; ++iq_) {
+        vG.evaluate(vq_buf, mf->lattv(), rho_g.g_vectors(), v_zero3, Qpts_all(iq_,all));
+        for(long ig=0; ig<ngm; ++ig) vbar(ig) += std::real(vq_buf(ig));
+      }
+      auto gv = rho_g.g_vectors();
+      if(isdf_metric == "attenuated") {
+        double om = (isdf_metric_omega > 0.0 ? isdf_metric_omega
+                                             : 2.0*M_PI/std::cbrt(volume()));
+        for(long ig=0; ig<ngm; ++ig) {
+          double g2 = gv(ig,0)*gv(ig,0)+gv(ig,1)*gv(ig,1)+gv(ig,2)*gv(ig,2);
+          vbar(ig) *= std::exp(-g2/(4.0*om*om));
+        }
+      }
+      if(isdf_metric_gcut > 0.0)
+        for(long ig=0; ig<ngm; ++ig) {
+          double g2 = gv(ig,0)*gv(ig,0)+gv(ig,1)*gv(ig,1)+gv(ig,2)*gv(ig,2);
+          if(0.5*g2 > isdf_metric_gcut) vbar(ig) = 0.0;
+        }
+    }
+    // (4) V(i,ig) = sqrt(vbar) * hatL rows; G-distribute; M = conj(V V^H)
+    auto g2fft = rho_g.gv_to_fft();
+    auto dV = memory::darray_t<local_CArray_t,mpi3::communicator>(
+        std::addressof(mpi->comm), {mpi->comm.size(),1}, {N1, ngm},
+        {rows.extent(0), ngm}, {dR.origin()[0], 0}, {1,1});
+    {
+      auto Vloc = dV.local();
+      for(long i=0;i<rows.extent(0);++i)
+        for(long ig=0; ig<ngm; ++ig)
+          Vloc(i,ig) = std::sqrt(std::max<RealType>(vbar(ig),RealType(0.0))) * rows(i, g2fft(ig));
+    }
+    math::nda::redistribute_in_place(dV, {1,mpi->comm.size()}, {1,1});
+    nda::array<ComplexType,2> W(N1,N1); W() = ComplexType(0.0);
+    {
+      auto Vg = dV.local();
+      if(Vg.extent(1) > 0)
+        nda::blas::gemm(Vg, nda::dagger(Vg), W);
+    }
+    mpi->comm.all_reduce_in_place_n(W.data(), N1*N1, std::plus<>{});
+    for(long i=0;i<N1;++i)
+      for(long j=0;j<N1;++j) W(i,j) = std::conj(W(i,j));
+    // (5) K = ell M ell^H and deterministic dense pivoted Cholesky
+    nda::array<ComplexType,2> T1(N1,N1), K(N1,N1);
+    nda::blas::gemm(ell, W, T1);
+    nda::blas::gemm(T1, nda::dagger(ell), K);
+    auto [order, nsel] = detail::pivoted_chol_order(K, nIpts_target);
+    if(nsel < nIpts_target) {
+      // metric rank saturated: top up with unused pool points in pass-1 order
+      std::vector<bool> used(N1, false);
+      for(long i=0;i<nsel;++i) used[order(i)] = true;
+      long fill = nsel;
+      for(long j=0;j<N1 and fill<nIpts_target;++j)
+        if(!used[j]) { order(fill++) = j; used[j] = true; }
+      app_log(1, "[WARNING] ISDF re-ranking: {} points metric-ranked, {} topped up from the pass-1 ordering.",
+              nsel, nIpts_target-nsel);
+    }
+    // (6) subset/reorder the pool outputs consistently
+    nda::array<long,1> rn_new(nmax); rn_new() = 0;
+    std::vector<memory::array<MEM,ComplexType,3>> Pa_new;
+    std::vector<memory::array<MEM,ComplexType,3>> Pb_new;
+    Pa_new.reserve(nIpts_target);
+    if(not single_psi) Pb_new.reserve(nIpts_target);
+    for(long i=0;i<nIpts_target;++i) {
+      rn_new(i) = rn(order(i));
+      Pa_new.push_back(std::move(Pskau[order(i)]));
+      if(not single_psi) Pb_new.push_back(std::move(Pskbu[order(i)]));
+    }
+    rn = std::move(rn_new);
+    Pskau = std::move(Pa_new);
+    if(not single_psi) Pskbu = std::move(Pb_new);
+    nchol = nIpts_target;
+    Timer.stop("IpRerank");
+    app_log(2, "  ISDF Coulomb re-ranking: pool {} -> {} points (metric = {}, qavg = {}, gcut = {}, omega = {})",
+            N1, nchol, isdf_metric, isdf_metric_qavg, isdf_metric_gcut, isdf_metric_omega);
+  } else if(rerank) {
+    app_log(1, "[WARNING] ISDF Coulomb re-ranking skipped: pool ({}) <= target nIpts ({}).",
+            nchol, nIpts_target);
+  }
 
   if constexpr (Ipts_only) {
     Timer.stop("IntPts");
@@ -1361,6 +1892,7 @@ auto thc::chol_metric_impl(int iq, int nIpts, nda::range a_range, nda::range b_r
   local_IArray_t ipts = rn(nda::range(nchol));
 
   if( not single_psi ) delete distPsib;
+  if( use_filter and not single_psi ) delete distPsibX;
 
   // collect collation matrices from distributed data
   utils::check(Pskau.size() ==  nchol,
