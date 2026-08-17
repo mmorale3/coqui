@@ -23,6 +23,10 @@
 #include <vector>
 #include <stdexcept>
 #include <stack>
+#include <cstdlib>       // getenv: the COQUI_MPI_THREAD_MULTIPLE init knob (increment B)
+#include <cctype>
+#include <optional>
+#include <string>
 #include "cxxopts.hpp"
 #include "configuration.hpp"
 #include "IO/AppAbort.hpp"
@@ -50,9 +54,27 @@ void run(mpi3::communicator & comm, InputParser &parser);
 
 /** @file main.cpp
  */
+/** notes/ladder_b_integration_design.md section 5: the MPI thread level has to be chosen at
+ *  MPI_Init, which happens BEFORE any TOML is parsed -- so the knob is an ENVIRONMENT
+ *  variable. Threaded SLATE (the ladder's g > 1 path with OMP_NUM_THREADS > 1) issues
+ *  concurrent MPI calls from its OpenMP tasks and segfaults inside UCX without
+ *  MPI_THREAD_MULTIPLE (measured, notes/ladder_opt_results.md section 2.9.6); requesting
+ *  MULTIPLE costs nothing at t = 1 (section 2.9.7) but does add locking to every MPI op, so
+ *  it stays opt-in. UNSET => exactly the historic thread-single call. */
+static bool coqui_want_thread_multiple() {
+  const char *v = std::getenv("COQUI_MPI_THREAD_MULTIPLE");
+  if (v == nullptr) return false;
+  std::string s(v);
+  for (auto &c : s) c = char(std::tolower(static_cast<unsigned char>(c)));
+  return (s == "1" or s == "true" or s == "yes" or s == "on");
+}
+
 int main(int argc, char** argv)
 {
-  mpi3::environment env(argc, argv);
+  const bool want_thread_multiple = coqui_want_thread_multiple();
+  std::optional<mpi3::environment> env_;
+  if (want_thread_multiple) env_.emplace(argc, argv, mpi3::thread_level::multiple);
+  else                      env_.emplace(argc, argv);
   auto world = mpi3::environment::get_world_instance();
   bool root(world.root());
 
@@ -140,6 +162,17 @@ int main(int argc, char** argv)
                   " |  Correlated Quantum Interface  |\n" +
                   "  --------------------------------");
   app_log(1, welcome);
+  // increment B: every run states the MPI thread support it actually got, so a threaded
+  // SLATE configuration proves its own support instead of assuming it (the fda0fd5 bench
+  // pattern). Scalars only -- rusty's bundled fmt cannot format containers or enums.
+  app_log(2, "  MPI thread level: requested {} (COQUI_MPI_THREAD_MULTIPLE = {}), provided "
+             "{} (MPI_THREAD_MULTIPLE = {}, MPI_THREAD_SINGLE = {})",
+          static_cast<int>(want_thread_multiple ? mpi3::thread_level::multiple
+                                                : mpi3::thread_level::single),
+          want_thread_multiple ? 1 : 0,
+          static_cast<int>(mpi3::environment::thread_support()),
+          static_cast<int>(mpi3::thread_level::multiple),
+          static_cast<int>(mpi3::thread_level::single));
 
   // !!!! assume a single input for now
   std::string myinput = inputs[0];

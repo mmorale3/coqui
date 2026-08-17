@@ -254,6 +254,22 @@ add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${C
 set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
                     TIMEOUT ${COQUI_VERTEX_TEST_TIMEOUT})
 
+# Ladder optimization INCREMENT B (notes/ladder_b_integration_design.md): the DISTRIBUTED
+# (SLATE) solve path behind ladder_solve_grid = g. Gate B's A/B of the two solve paths on
+# one fixture state -- the whalf evaluator, the whalf gate, the lambda_max watchdog and the
+# Q4-C3b E-leg family, each at g = 2 against g = 1. Needs >= 2 ranks (it SKIPS at np = 1,
+# which is what ctest's default CTEST_NPROC = 1 gives); links scr_coulomb_lib for the
+# readout-vertex plumbing that carries the knob.
+set(TEST_ID methods_vertex_ladder_slate)
+
+add_executable(test_${TEST_ID} test_vertex_ladder_slate.cpp)
+target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield eri_lib hf_lib
+                      vertex_lib gw_lib scf_lib scr_coulomb_lib)
+
+add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
+set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
+                    TIMEOUT ${COQUI_VERTEX_TEST_TIMEOUT})
+
 # ISDF-Vertex: ABSOLUTE normalization/sign cross-check of Sigma^C against CoQui's own
 # bare second-order exchange (GF2 exchange channel, pyscf-pinned). With C = full band
 # range and W -> Z the vertex functional IS the bare second-order exchange, so the two

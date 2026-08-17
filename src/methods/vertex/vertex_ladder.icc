@@ -84,13 +84,22 @@
  * in the eval_Pi_rpa_dc convention) -- vertex_t::ladder_loc_gate below.
  */
 
+#include <algorithm>
 #include <chrono>
+#include <cstdlib>
+#include <optional>
 #include <string>
 #include <vector>
 #include <sys/resource.h>
 
 #include "utilities/check.hpp"
 #include "utilities/interpolation_utils.hpp"   // P4a: WS_rgrid for the R-space kernel
+// INCREMENT B (notes/ladder_b_integration_design.md): the distributed dense solve path
+#include "utilities/proc_grid_partition.hpp"
+#include "numerics/distributed_array/nda.hpp"
+#include "numerics/distributed_array/slate_ops.hpp"
+#include "mpi3/environment.hpp"
+#include "mpi3/communicator.hpp"
 
 namespace methods {
 namespace solvers {
@@ -996,6 +1005,565 @@ namespace solvers {
       }
     }
 
+    // ===================================================================================
+    // INCREMENT B -- THE DISTRIBUTED (SLATE) SOLVE PATH
+    // (design: notes/ladder_b_integration_design.md; spec: notes/ladder_opt_spec.md
+    //  "Increment B"; measurements: notes/ladder_opt_results.md sections 2.8-2.9.8)
+    //
+    // At g > 1 the resolvent of ONE (s, q, nu) is solved COOPERATIVELY by g ranks: the
+    // (D, D) operator lives as (nb x nb)-tiled distributed blocks, no rank ever holds a
+    // full copy, and slate_ops::lu_solve does the factor + multi-RHS solve. g = 1 is
+    // untouched -- it does not enter this function at all.
+    //
+    // WHAT IS THE SAME AS THE PER-RANK PATH (so the 1e-12 gate is a reassociation gate,
+    // not an approximation gate):
+    //   * the chi0 blocks Cb(ik) are the SAME expression on the SAME operands per ik;
+    //   * each (ikp, ik) rung block goes through the anchor's OWN leg builder
+    //     (vertex_pi::detail::build_U_legs) with the same q_star/trev rung read and the
+    //     same twist-pack composed with the Kbig transpose -- the tile owner RECOMPUTES
+    //     the (N_m x nc2) legs instead of communicating them (spec B.3: the K build was
+    //     measured at 0.2% of the unit wall, so correctness beats cleverness here);
+    //   * the resolvent is I - XK with XK assembled row-block-wise exactly as before.
+    // WHAT IS REASSOCIATED: the historic path forms KXD = Kbig . XD and then
+    // XKXD = (1/nk) Cb . KXD; here XK is already the assembled operator, so XKXD = XK . XD
+    // is ONE distributed gemm. Mathematically identical
+    // (sum_ik (1/nk) Cb(ikp) Kbig[ikp,ik] XD[ik]), different summation order -- and it is
+    // what makes Kbig unnecessary, leaving Rm as the only (D, D)-class object.
+    //
+    // OUTPUT CONTRACT (design item 5, unchanged): the (s, q) unit list strides over the
+    // n_ranks/g grids, every grid runs ALL nu of its units, and the GRID ROOT writes each
+    // (jn, iq) cell exactly once -- so the caller's zeros-elsewhere all_reduce reproduces
+    // the replicated result, and lam_max keeps its max-reduce semantics.
+    // ===================================================================================
+
+    /** The measured tile default at production D (notes/ladder_opt_results.md 2.9.1:
+     *  nb = 484 is 23% faster AND 37% smaller than the nc2 = 121 default at small g,
+     *  because SLATE's workspace scales with the tile COUNT). A constant, not a knob
+     *  (design item 6); it is clamped down when D/max(px,py) is smaller. */
+    inline constexpr long ladder_slate_nb = 484;
+
+    /** Ascending divisors of n. */
+    inline std::vector<long> ladder_divisors(long n) {
+      std::vector<long> d;
+      for (long i = 1; i * i <= n; ++i)
+        if (n % i == 0) {
+          d.push_back(i);
+          if (i != n / i) d.push_back(n / i);
+        }
+      std::sort(d.begin(), d.end());
+      return d;
+    }
+
+    /** Per-rank footprint of the two solve paths, GB. DOMINANT TERMS ONLY (it exists to
+     *  choose g, not to predict MaxRSS): the (D, D)-class operators, the (D, N_m + nab)
+     *  RHS families and the replicated (nk, nc2, .) legs plus one chi0 nu slice. The
+     *  historic path carries TWO (D, D) (Rm and Kbig); the SLATE path carries one (D, D)
+     *  slice of size D^2/g and never forms Kbig at all. */
+    inline double ladder_mem_gb(long g, long Dsz, long Nm, long nab, long nk, long nc2) {
+      const double z = double(sizeof(ComplexType)) / (1024.0 * 1024.0 * 1024.0);
+      const double D = double(Dsz), M = double(Nm) + double(nab);
+      const double K = double(nk), C = double(nc2);
+      const double repl = 2.0 * K * C * (double(Nm) + double(nab)) + K * C * C;
+      if (g <= 1)
+        return z * (2.0 * D * D + 4.0 * D * M + 2.0 * D + repl + 2.0 * K * C * double(Nm));
+      return z * (D * D / double(g) + 3.0 * D * M / double(g) + M * M + repl);
+    }
+
+    /** Resolve the ladder_solve_grid knob. g_knob > 0 is taken verbatim (validated);
+     *  g_knob == 0 is the AUTO fit test of design section 1: g = 1 when the per-rank path
+     *  fits the budget, else the SMALLEST g that fits -- preferring divisors of the
+     *  intra-node group so a solve grid stays node-local (measured: fewer, fatter,
+     *  node-local grids win, notes/ladder_opt_results.md 2.9.7). Pure function of
+     *  dimensions and rank counts => every rank resolves the same g. */
+    inline long resolve_ladder_solve_grid(long g_knob, double budget_gb, long Dsz, long Nm,
+                                          long nab, long nk, long nc2, long nproc,
+                                          long node_sz, const char *tag) {
+      if (g_knob > 0) {
+        utils::check(nproc % g_knob == 0,
+                     "ladder_solve_grid = {} does not divide the communicator size {} "
+                     "({} path): every solve grid must be full.", g_knob, nproc, tag);
+        return g_knob;
+      }
+      const double m1 = ladder_mem_gb(1, Dsz, Nm, nab, nk, nc2);
+      if (m1 <= budget_gb or nproc == 1) {
+        app_log(2, "  [ladder-B {}] solve grid AUTO -> g = 1 (per-rank LAPACK): estimated "
+                   "{:.3f} GB/rank <= budget {:.3f} GB (D = {}, N_m = {}, nab = {}).",
+                tag, m1, budget_gb, Dsz, Nm, nab);
+        return 1;
+      }
+      auto first_fit = [&](std::vector<long> const &ds) -> long {
+        for (long g : ds) {
+          if (g <= 1 or nproc % g != 0) continue;
+          if (ladder_mem_gb(g, Dsz, Nm, nab, nk, nc2) <= budget_gb) return g;
+        }
+        return 0l;
+      };
+      long g = first_fit(ladder_divisors(std::min(node_sz, nproc)));
+      if (g == 0) g = first_fit(ladder_divisors(nproc));
+      if (g == 0) {
+        g = nproc;
+        app_log(1, "  [ladder-B {}] solve grid AUTO: no g fits the {:.3f} GB/rank budget "
+                   "(g = 1 needs {:.3f} GB, the widest grid g = {} needs {:.3f} GB) -- "
+                   "using the widest grid. Raise ladder_solve_budget_gb or the rank count.",
+                tag, budget_gb, m1, nproc, ladder_mem_gb(nproc, Dsz, Nm, nab, nk, nc2));
+        return g;
+      }
+      app_log(1, "  [ladder-B {}] solve grid AUTO -> g = {} (SLATE): g = 1 needs {:.3f} "
+                 "GB/rank, over the {:.3f} GB budget; g = {} needs {:.3f} GB/rank "
+                 "(D = {}, N_m = {}, nab = {}, {} concurrent grids).",
+              tag, g, m1, budget_gb, g, ladder_mem_gb(g, Dsz, Nm, nab, nk, nc2), Dsz, Nm,
+              nab, nproc / g);
+      return g;
+    }
+
+    /** The AUTO mode must resolve the SAME g on every rank, and node_comm.size() is not
+     *  guaranteed uniform across nodes -- so on the auto path the node size is reduced to
+     *  its global minimum first. Deliberately a NO-OP (and no collective at all) unless
+     *  g_knob == 0, so the historic path gains no MPI call. */
+    inline long ladder_auto_node_size(long g_knob, boost::mpi3::communicator &comm,
+                                      long node_sz) {
+      if (g_knob != 0) return node_sz;
+      return comm.all_reduce_value(node_sz, boost::mpi3::min<>{});
+    }
+
+    /** The g > 1 precondition on MPI thread support (design section 5): SLATE's OpenMP
+     *  tasks issue concurrent MPI calls, which segfaults inside UCX unless MPI was
+     *  initialized at MPI_THREAD_MULTIPLE (measured, results 2.9.6). t = 1 is safe at any
+     *  level (measured, 2.9.7), so the abort is conditional on the thread count. */
+    inline void ladder_slate_thread_guard(long g, const char *tag) {
+      long omp_t = 1;
+      if (const char *e = std::getenv("OMP_NUM_THREADS")) {
+        const long v = std::atol(e);
+        if (v > 0) omp_t = v;
+      }
+      const int provided = static_cast<int>(boost::mpi3::environment::thread_support());
+      const int need = static_cast<int>(boost::mpi3::thread_level::multiple);
+      utils::check(omp_t <= 1 or provided >= need,
+                   "ladder_solve_grid = {} with OMP_NUM_THREADS = {} requires MPI to be "
+                   "initialized at MPI_THREAD_MULTIPLE (provided level {}, required {}): "
+                   "SLATE's OpenMP tasks issue concurrent MPI calls and segfault without "
+                   "it. Set COQUI_MPI_THREAD_MULTIPLE=1 in the environment, or run the "
+                   "{} path with OMP_NUM_THREADS=1.", g, omp_t, provided, need, tag);
+    }
+
+    /**
+     * The g > 1 core. Same inputs and the same output contract as pair_space_ladder, with
+     * these deliberate restrictions (each aborts rather than silently changing the answer):
+     *   * a resolvent output is required (Pi_ladder and/or Pi_lad_loc) -- there is nothing
+     *     to distribute on a pure one-rung call;
+     *   * the ONE-RUNG outputs are not supported here: they need the full (nk, nk) K-block
+     *     store, which is exactly the (D, D)-class object this path exists to avoid.
+     * Both RHS families ride ONE lu_solve as a single (D, N_m + nab) multi-RHS block, and
+     * the (N_m + nab)^2 projection is taken in one distributed gemm whose diagonal blocks
+     * are the two outputs (design item 3).
+     */
+    inline void pair_space_ladder_slate(nda::MemoryArrayOfRank<5> auto const &G_CC,
+                                        nda::array<ComplexType, 4> const &Xb,
+                                        nda::array<ComplexType, 3> const &W0b,
+                                        nda::array<long, 2> const &kmq,
+                                        nda::array<long, 2> const &kpq,
+                                        vertex_pi::iaft_tools const &tools,
+                                        std::vector<long> const &nu_list,
+                                        nda::array<ComplexType, 4> *Pi_ladder,
+                                        boost::mpi3::communicator &comm, long g,
+                                        vertex_sym::sym_ctx const *symc = nullptr,
+                                        nda::array<double, 1> *lam_max = nullptr,
+                                        nda::array<ComplexType, 4> const *U_skia = nullptr,
+                                        nda::array<ComplexType, 4> *Pi_lad_loc = nullptr,
+                                        ladder_prof *prof = nullptr) {
+      using math::nda::make_distributed_array;
+      using dmat_t = nda::array<ComplexType, 2, nda::F_layout>;
+      using shp2 = std::array<long, 2>;
+      prof_watch pwatch;
+      if (prof) prof->rss_entry = prof_rss_gb();
+      decltype(nda::range::all) all;
+      const long nt = G_CC.shape(0), ns = G_CC.shape(1), nk = G_CC.shape(2);
+      const long nc = G_CC.shape(3), Nm = Xb.shape(2);
+      const long nw_b = tools.nw_b;
+      const long nc2 = nc * nc, Dsz = nc2 * nk;
+      const long nnu = long(nu_list.size());
+      const double spinfac = (ns == 1) ? 2.0 : 1.0;
+      const bool sym = (symc != nullptr and symc->active);
+      const long nq_w = W0b.shape(0), nq_full = kmq.shape(0);
+      const bool want_loc = (Pi_lad_loc != nullptr);
+      utils::check(Pi_ladder != nullptr or want_loc,
+                   "pair_space_ladder_slate: no resolvent output requested.");
+      utils::check(not want_loc or U_skia != nullptr,
+                   "pair_space_ladder_slate: the orbital output needs the MLWF legs "
+                   "U_skia.");
+      const long norb = want_loc ? U_skia->shape(2) : 0;
+      const long nab = norb * norb;
+      if (want_loc)
+        utils::check(U_skia->shape(0) == ns and U_skia->shape(1) == nk and
+                     U_skia->shape(3) == nc,
+                     "pair_space_ladder_slate: U_skia is {} x {} x {} x {}, expected {} x "
+                     "{} x norb x {}.", U_skia->shape(0), U_skia->shape(1),
+                     U_skia->shape(2), U_skia->shape(3), ns, nk, nc);
+      // the combined multi-RHS block: [ D-family | E-family ]
+      const long ncD = (Pi_ladder != nullptr) ? Nm : 0;
+      const long ncE = want_loc ? nab : 0;
+      const long Ntot = ncD + ncE;
+      long nq_ext = (Pi_ladder != nullptr) ? Pi_ladder->shape(1) : Pi_lad_loc->shape(1);
+      if (Pi_ladder != nullptr)
+        utils::check(Pi_ladder->shape(0) == nnu and Pi_ladder->shape(2) == Nm and
+                     Pi_ladder->shape(3) == Nm,
+                     "pair_space_ladder_slate: Pi_ladder is {} x {} x {} x {}, expected {} "
+                     "x {} x {} x {}.", Pi_ladder->shape(0), Pi_ladder->shape(1),
+                     Pi_ladder->shape(2), Pi_ladder->shape(3), nnu, nq_ext, Nm, Nm);
+      if (want_loc)
+        utils::check(Pi_lad_loc->shape(0) == nnu and Pi_lad_loc->shape(1) == nq_ext and
+                     Pi_lad_loc->shape(2) == nab and Pi_lad_loc->shape(3) == nab,
+                     "pair_space_ladder_slate: Pi_lad_loc is {} x {} x {} x {}, expected {} "
+                     "x {} x {} x {}.", Pi_lad_loc->shape(0), Pi_lad_loc->shape(1),
+                     Pi_lad_loc->shape(2), Pi_lad_loc->shape(3), nnu, nq_ext, nab, nab);
+      if (sym) {
+        utils::check(nq_w == symc->nq_ibz and nq_ext == symc->nq_ibz and
+                     nq_full == symc->nq_full and nk == symc->nk_full,
+                     "pair_space_ladder_slate: symmetry context dimension mismatch "
+                     "(nq_w = {}, nq_ext = {}, nq_full = {}, nk = {} vs ctx {}, {}, {}).",
+                     nq_w, nq_ext, nq_full, nk, symc->nq_ibz, symc->nq_full, symc->nk_full);
+        utils::check(symc->naux == Nm and symc->nc == nc,
+                     "pair_space_ladder_slate: symmetry context Xhat mismatch (naux = {} "
+                     "vs N_m = {}, nc = {} vs {}).", symc->naux, Nm, symc->nc, nc);
+      } else {
+        utils::check(nq_w == nq_full and nq_ext == nq_full,
+                     "pair_space_ladder_slate: inconsistent q axes without a symmetry "
+                     "context (nq_w = {}, nq_full = {}, nq_ext = {}).", nq_w, nq_full,
+                     nq_ext);
+      }
+      utils::check(kmq.shape(1) == nk and kpq.shape(0) >= nq_ext and kpq.shape(1) == nk,
+                   "pair_space_ladder_slate: kmq/kpq shape mismatch.");
+      for (auto m : nu_list)
+        utils::check(m >= 0 and m < nw_b,
+                     "pair_space_ladder_slate: nu index {} out of range.", m);
+      if (Pi_ladder != nullptr) (*Pi_ladder)() = ComplexType(0.0);
+      if (want_loc) (*Pi_lad_loc)() = ComplexType(0.0);
+      if (lam_max != nullptr) {
+        utils::check(Pi_ladder != nullptr,
+                     "pair_space_ladder_slate: lam_max requires the resummed-ladder "
+                     "output.");
+        utils::check(lam_max->shape(0) == nnu,
+                     "pair_space_ladder_slate: lam_max has {} rows, expected nnu = {}.",
+                     lam_max->shape(0), nnu);
+        (*lam_max)() = 0.0;
+      }
+
+      // qx lookup: kmq(qx, k) = k'  =>  qx_of(k, k')   (pair_space_ladder verbatim)
+      nda::array<long, 2> qx_of(nk, nk);
+      qx_of() = -1;
+      for (long iqx = 0; iqx < nq_full; ++iqx)
+        for (long ik = 0; ik < nk; ++ik) qx_of(ik, kmq(iqx, ik)) = iqx;
+      for (long ik = 0; ik < nk; ++ik)
+        for (long ikp = 0; ikp < nk; ++ikp)
+          utils::check(qx_of(ik, ikp) >= 0,
+                       "pair_space_ladder_slate: transfer mesh does not connect k = {} to "
+                       "k' = {}.", ik, ikp);
+
+      // ---- grid geometry (design item 1) --------------------------------------------
+      const long nproc = comm.size();
+      utils::check(g > 1, "pair_space_ladder_slate: g = {} -- the g <= 1 path belongs to "
+                          "pair_space_ladder.", g);
+      utils::check(nproc % g == 0,
+                   "pair_space_ladder_slate: ladder_solve_grid = {} does not divide the "
+                   "communicator size {}.", g, nproc);
+      const long ngrid = nproc / g;
+      const int gid = int(comm.rank() / g), grank = int(comm.rank() % g);
+      auto gcomm = comm.split(gid, grank);
+      const long px = utils::find_proc_grid_min_diff(g, Dsz, Dsz), py = g / px;
+      const long pmax = std::max(px, py);
+      // the CONTRACTED axis must carry the same tile size in every operand, and the
+      // make_distributed_array cap (shape/grid) must never shrink it -- otherwise the
+      // tilings silently disagree. Choosing nb <= D/max(px,py) and ncb <= Ntot/max(px,py)
+      // makes the cap inert on both axes of every operand.
+      const long nb = std::max(1l, std::min(ladder_slate_nb, Dsz / pmax));
+      const long ncb = std::max(1l, Ntot / pmax);
+      utils::check(Dsz >= px and Dsz >= py and Ntot >= px and Ntot >= py,
+                   "pair_space_ladder_slate: the solve grid {} x {} is too fine for this "
+                   "problem (D = {}, RHS columns = {}): every distributed axis needs at "
+                   "least one row per process row. Lower ladder_solve_grid.", px, py, Dsz,
+                   Ntot);
+      app_log(2, "  [ladder-B] SLATE solve path: g = {} ranks/grid ({} x {} process grid), "
+                 "{} concurrent grids over {} ranks; D = {}, RHS columns = {}, tile nb = "
+                 "{} x {}; estimated {:.3f} GB/rank.", g, px, py, ngrid, nproc, Dsz, Ntot,
+              nb, ncb, ladder_mem_gb(g, Dsz, Nm, nab, nk, nc2));
+
+      auto Rm = make_distributed_array<dmat_t>(gcomm, shp2{px, py}, shp2{Dsz, Dsz},
+                                               shp2{nb, nb}, true);
+      auto Xl = make_distributed_array<dmat_t>(gcomm, shp2{px, py}, shp2{Dsz, Ntot},
+                                               shp2{nb, ncb}, false);
+      auto Cl = make_distributed_array<dmat_t>(gcomm, shp2{px, py}, shp2{Dsz, Ntot},
+                                               shp2{nb, ncb}, false);
+      auto Bm = make_distributed_array<dmat_t>(gcomm, shp2{px, py}, shp2{Dsz, Ntot},
+                                               shp2{nb, ncb}, false);
+      auto Pd = make_distributed_array<dmat_t>(gcomm, shp2{px, py}, shp2{Ntot, Ntot},
+                                               shp2{ncb, ncb}, false);
+      // the power-iteration iterate: a (D, 1) array cannot live on a 2D grid (the factory
+      // needs shape >= grid on every axis), so it carries py IDENTICAL columns -- the norm
+      // of one column is the reduced total over py, and the extra columns cost
+      // 20 * 2 * D^2 * (py - 1) flops, per mille of the D^3 solve (the bench's idiom).
+      const long lam_c = (lam_max != nullptr) ? py : 0;
+      std::optional<decltype(Rm)> V1, V2;
+      if (lam_max != nullptr) {
+        V1.emplace(make_distributed_array<dmat_t>(gcomm, shp2{px, py}, shp2{Dsz, lam_c},
+                                                  shp2{nb, 1}, false));
+        V2.emplace(make_distributed_array<dmat_t>(gcomm, shp2{px, py}, shp2{Dsz, lam_c},
+                                                  shp2{nb, 1}, false));
+      }
+      const long org_r = Rm.origin()[0], org_c = Rm.origin()[1];
+      // Xl / Cl / Bm share shape, tiling and grid, hence the same local window
+      const long lo_r = Xl.origin()[0], lo_c = Xl.origin()[1];
+      utils::check(Cl.origin()[0] == lo_r and Cl.origin()[1] == lo_c and
+                   Bm.origin()[0] == lo_r and Bm.origin()[1] == lo_c,
+                   "pair_space_ladder_slate: the RHS-family operands landed on different "
+                   "local windows -- the tilings disagree.");
+
+      // rank-local replicated work arrays (all (nk, nc2, .)-class -- never (D, D))
+      nda::array<ComplexType, 3> Dmat(nk, nc2, Nm), Dcj(nk, nc2, Nm);
+      const long lnk = want_loc ? nk : 0, lnc2 = want_loc ? nc2 : 0;
+      nda::array<ComplexType, 3> Emat(lnk, lnc2, nab);
+      nda::array<ComplexType, 3> Cb(nk, nc2, nc2);
+      nda::array<ComplexType, 2> Pf(nt, nc2 * nc2), Bf(nw_b, nc2 * nc2);
+      nda::array<ComplexType, 2> Lblk(nc2, Ntot), Xblk(nc2, Ntot);
+      nda::array<ComplexType, 2> Pbuf(Ntot, Ntot);
+      if (prof) {
+        prof->ns = ns; prof->nk = nk; prof->nc = nc; prof->nc2 = nc2;
+        prof->Nm = Nm; prof->Dsz = Dsz; prof->nnu = nnu; prof->nt = nt;
+        prof->nq_ext = nq_ext; prof->nq_full = nq_full; prof->nab = nab;
+        prof->nproc = ngrid; prof->lsize = g;
+        prof->nnu_loc = nnu; prof->want_Kb = false; prof->any_solve = true;
+        prof->gb_local = ladder_mem_gb(g, Dsz, Nm, nab, nk, nc2);
+        prof->rss_alloc = prof_rss_gb();
+        prof->t_setup = pwatch.lap();
+      }
+      prof_phase pph(prof);
+
+      // --- the (s, q) unit loop: grids stride the list the way ranks do at g = 1 -------
+      for (long sq = gid; sq < ns * nq_ext; sq += ngrid) {
+        prof_watch uwatch;
+        const long is = sq / nq_ext;
+        const long iq = sq % nq_ext;
+        // ---- the nu-INDEPENDENT legs: d(k) (and the Q4-C3b MLWF map E) ---------------
+        pph.begin(ladder_prof::P_DCHI0);
+        for (long ik = 0; ik < nk; ++ik) {
+          const long ikpq = kpq(iq, ik);
+          for (long a = 0; a < nc; ++a)
+            for (long b = 0; b < nc; ++b)
+              for (long N = 0; N < Nm; ++N) {
+                Dmat(ik, a * nc + b, N) =
+                    Xb(is, ik, N, a) * std::conj(Xb(is, ikpq, N, b));
+                Dcj(ik, a * nc + b, N) = std::conj(Dmat(ik, a * nc + b, N));
+              }
+          if (want_loc)
+            for (long a = 0; a < nc; ++a)
+              for (long b = 0; b < nc; ++b)
+                for (long m = 0; m < norb; ++m)
+                  for (long n2 = 0; n2 < norb; ++n2)
+                    Emat(ik, a * nc + b, m * norb + n2) =
+                        (*U_skia)(is, ik, m, a) * std::conj((*U_skia)(is, ikpq, n2, b));
+        }
+        // the LEFT projection legs conj([D|E]) -- nu-independent, so filled once per unit
+        {
+          auto cl = Cl.local();
+          for (long i = 0; i < cl.shape(0); ++i) {
+            const long gr = lo_r + i, ik = gr / nc2, r = gr % nc2;
+            for (long j = 0; j < cl.shape(1); ++j) {
+              const long gc = lo_c + j;
+              cl(i, j) = (gc < ncD) ? Dcj(ik, r, gc)
+                                    : std::conj(Emat(ik, r, gc - ncD));
+            }
+          }
+        }
+        pph.end();
+
+        for (long jn = 0; jn < nnu; ++jn) {
+          // ---- chi0 at THIS nu, over all ik (nk, nc2, nc2) ---------------------------
+          // REBUILT PER nu on this path (the g = 1 path keeps nnu_loc slices at once):
+          // the grid solves its nu sequentially, so keeping one slice is what bounds the
+          // per-rank replicated store. The redundancy is in the tau fill + one
+          // (nw_b x nt) x (nt x nc2^2) gemm per ik, ~1e-4 of a production solve.
+          // Every kept value is the SAME expression on the SAME operands as at g = 1.
+          pph.begin(ladder_prof::P_DCHI0);
+          for (long ik = 0; ik < nk; ++ik) {
+            const long ikpq = kpq(iq, ik);
+            for (long s = 0; s < nt; ++s) {
+              const long sm = tools.t_mirror(s);
+              for (long p1p = 0; p1p < nc; ++p1p)
+                for (long p3 = 0; p3 < nc; ++p3)
+                  for (long a = 0; a < nc; ++a)
+                    for (long b = 0; b < nc; ++b)
+                      Pf(s, (p1p * nc + p3) * nc2 + (a * nc + b)) =
+                          G_CC(sm, is, ik, a, p1p) * G_CC(s, is, ikpq, p3, b);
+            }
+            nda::blas::gemm(ComplexType(-1.0), tools.Twt_bb, Pf, ComplexType(0.0), Bf);
+            for (long r = 0; r < nc2; ++r)
+              for (long c = 0; c < nc2; ++c) Cb(ik, r, c) = Bf(nu_list[jn], r * nc2 + c);
+          }
+          pph.end();
+
+          // ---- the owned tiles of Rm = -XK ------------------------------------------
+          // Rm[(ikp),(ik)] = -(1/nk) Cb(ikp) . Kblk(ikp, ik), Kblk the twist-packed rung
+          // composed with the Kbig transpose (A.2's orientation, verbatim).
+          pph.begin(ladder_prof::P_KERNEL);
+          {
+            auto loc = Rm.local();
+            const long lm = loc.shape(0), ln = loc.shape(1);
+            if (lm > 0 and ln > 0) {
+              nda::array<ComplexType, 2> U1(Nm, nc2), U2(Nm, nc2), WU2(Nm, nc2);
+              nda::array<ComplexType, 2> wb(nc2, nc2), Kblk(nc2, nc2), blk(nc2, nc2);
+              const long ikp0 = org_r / nc2, ikp1 = (org_r + lm - 1) / nc2;
+              const long ik0 = org_c / nc2, ik1 = (org_c + ln - 1) / nc2;
+              for (long ikp = ikp0; ikp <= ikp1; ++ikp) {
+                const long ikppq = kpq(iq, ikp);
+                for (long ik = ik0; ik <= ik1; ++ik) {
+                  const long ikpq = kpq(iq, ik);
+                  const long iqx = qx_of(ik, ikp);
+                  const long jsx = sym ? symc->q_isym(iqx) : 0l;
+                  const long qsx = sym ? symc->q_star(iqx) : iqx;
+                  const bool trx = sym ? bool(symc->q_trev(iqx)) : false;
+                  vertex_pi::detail::build_U_legs(Xb, symc, nda::range(0, nc), is, ik, ikp,
+                                                  ikpq, ikppq, jsx, U1, U2);
+                  if (trx)
+                    nda::blas::gemm(nda::transpose(W0b(qsx, all, all)), U2, WU2);
+                  else
+                    nda::blas::gemm(W0b(qsx, all, all), U2, WU2);
+                  nda::blas::gemm(nda::transpose(U1), WU2, wb);
+                  for (long p1 = 0; p1 < nc; ++p1)
+                    for (long p1p = 0; p1p < nc; ++p1p)
+                      for (long p3 = 0; p3 < nc; ++p3)
+                        for (long p3p = 0; p3p < nc; ++p3p)
+                          Kblk(p1 * nc + p3p, p1p * nc + p3) =
+                              wb(p1 * nc + p1p, p3 * nc + p3p);
+                  nda::blas::gemm(ComplexType(-1.0 / nk), Cb(ikp, all, all), Kblk,
+                                  ComplexType(0.0), blk);
+                  const long r0 = std::max(org_r, ikp * nc2);
+                  const long r1 = std::min(org_r + lm, (ikp + 1) * nc2);
+                  const long c0 = std::max(org_c, ik * nc2);
+                  const long c1 = std::min(org_c + ln, (ik + 1) * nc2);
+                  for (long i = r0; i < r1; ++i)
+                    for (long j = c0; j < c1; ++j)
+                      loc(i - org_r, j - org_c) = blk(i - ikp * nc2, j - ik * nc2);
+                }
+              }
+            }
+          }
+          pph.end();
+
+          // ---- I3 watchdog: the SAME 20-step power iteration, distributed ------------
+          pph.begin(ladder_prof::P_LAM);
+          if (lam_max != nullptr) {
+            const double seed = 1.0 / std::sqrt(double(Dsz));
+            V1.value().local()() = ComplexType(seed, 0.0);
+            double lam = 0.0, lam_prev = -1.0;
+            for (int itp = 0; itp < 20; ++itp) {
+              math::nda::slate_ops::multiply(Rm, V1.value(), V2.value());
+              double n2 = 0.0;
+              for (auto const &z : V2.value().local()) n2 += std::norm(z);
+              n2 = gcomm.all_reduce_value(n2, std::plus<>{});
+              n2 /= double(py);   // py identical column copies
+              lam = std::sqrt(n2);
+              if (lam <= 0.0) break;
+              {
+                auto v2 = V2.value().local();
+                auto v1 = V1.value().local();
+                for (long i = 0; i < v2.shape(0); ++i)
+                  for (long j = 0; j < v2.shape(1); ++j) v1(i, j) = v2(i, j) / lam;
+              }
+              if (lam_prev > 0.0 and std::abs(lam - lam_prev) <= 1e-3 * lam) break;
+              lam_prev = lam;
+            }
+            if (grank == 0) (*lam_max)(jn) = std::max((*lam_max)(jn), lam);
+          }
+          pph.end();
+
+          // ---- the RHS legs Xh.[D|E] and the multi-RHS block XK . Xh [D|E] ------------
+          pph.begin(ladder_prof::P_KPACK);
+          {
+            auto xl = Xl.local();
+            const long lm = xl.shape(0), ln = xl.shape(1);
+            if (lm > 0 and ln > 0) {
+              const long ik0 = lo_r / nc2, ik1 = (lo_r + lm - 1) / nc2;
+              for (long ik = ik0; ik <= ik1; ++ik) {
+                for (long r = 0; r < nc2; ++r) {
+                  for (long N = 0; N < ncD; ++N) Lblk(r, N) = Dmat(ik, r, N);
+                  for (long N = 0; N < ncE; ++N) Lblk(r, ncD + N) = Emat(ik, r, N);
+                }
+                nda::blas::gemm(ComplexType(1.0 / nk), Cb(ik, all, all), Lblk,
+                                ComplexType(0.0), Xblk);
+                const long r0 = std::max(lo_r, ik * nc2);
+                const long r1 = std::min(lo_r + lm, (ik + 1) * nc2);
+                for (long i = r0; i < r1; ++i)
+                  for (long j = 0; j < ln; ++j)
+                    xl(i - lo_r, j) = Xblk(i - ik * nc2, lo_c + j);
+              }
+            }
+          }
+          pph.end();
+          pph.begin(ladder_prof::P_XK);
+          // Rm still holds -XK here, so XKX = -(Rm) . Xh[D|E] in ONE distributed gemm
+          math::nda::slate_ops::multiply(ComplexType(-1.0), Rm, Xl, ComplexType(0.0), Bm);
+          pph.end();
+
+          // ---- the resolvent: +I on the owned diagonal, then ONE lu_solve ------------
+          pph.begin(ladder_prof::P_RESOLV);
+          {
+            auto loc = Rm.local();
+            for (long i = 0; i < loc.shape(0); ++i) {
+              const long gi = org_r + i;
+              if (gi >= org_c and gi < org_c + loc.shape(1))
+                loc(i, gi - org_c) += ComplexType(1.0);
+            }
+            const long info = math::nda::slate_ops::lu_solve(Rm, Bm);
+            utils::check(info == 0,
+                         "pair_space_ladder: the resolvent LU failed (getrf info = {}) "
+                         "at nu index {} of transfer {} -- (1 - Xh Kt) is singular to "
+                         "working precision (particle-hole instability; lambda_max was "
+                         "{:.6f}).", info, jn, iq,
+                         (lam_max != nullptr) ? (*lam_max)(jn) : -1.0);
+          }
+          pph.end();
+
+          // ---- projection to (N_m + nab)^2 and the write-once output ------------------
+          pph.begin(ladder_prof::P_PROJD);
+          math::nda::slate_ops::multiply(ComplexType(-spinfac),
+                                         math::nda::transpose(Cl), Bm, ComplexType(0.0),
+                                         Pd);
+          pph.end();
+          pph.begin(ladder_prof::P_MPI);
+          {
+            Pbuf() = ComplexType(0.0);
+            auto pl = Pd.local();
+            for (long i = 0; i < pl.shape(0); ++i)
+              for (long j = 0; j < pl.shape(1); ++j)
+                Pbuf(Pd.origin()[0] + i, Pd.origin()[1] + j) = pl(i, j);
+            // disjoint writes => the sum is exact whatever the reduction order
+            gcomm.all_reduce_in_place_n(Pbuf.data(), Pbuf.size(), std::plus<>{});
+            if (grank == 0) {
+              if (Pi_ladder != nullptr)
+                for (long M = 0; M < Nm; ++M)
+                  for (long N = 0; N < Nm; ++N) (*Pi_ladder)(jn, iq, M, N) = Pbuf(M, N);
+              if (want_loc)
+                for (long M = 0; M < nab; ++M)
+                  for (long N = 0; N < nab; ++N)
+                    (*Pi_lad_loc)(jn, iq, M, N) = Pbuf(ncD + M, ncD + N);
+            }
+          }
+          pph.end();
+        }
+        if (prof) {
+          const double tu = uwatch.lap();
+          prof->t_unit_sum += tu;
+          prof->t_unit_max = std::max(prof->t_unit_max, tu);
+          prof->t_unit_min = (prof->nunit == 0) ? tu : std::min(prof->t_unit_min, tu);
+          ++prof->nunit;
+          if (prof->nunit == 1) prof->rss_unit1 = prof_rss_gb();
+        }
+      }
+      if (prof) {
+        prof->t_loop = pwatch.lap();
+        prof->rss_exit = prof_rss_gb();
+      }
+    }
+
     // =================================================================================
     // P4a (notes/scgwt_parallel_memory_design.md section 4b.1): the R-space kernel
     //   K = sum_L (1/w_L) R_L^T W^_L C_L,   w_PQ(L) = (1/N_k) sum_qx e^{-i qx.L} W0bar_PQ(qx)
@@ -1691,6 +2259,33 @@ namespace solvers {
     const long nq_ext = MF->nqpts_ibz(), Nm = _Xb_skma.shape(2);
     nda::array<ComplexType, 4> Pl(nw_half, nq_ext, Nm, Nm);
     if (lam_max != nullptr) *lam_max = nda::array<double, 1>(nw_half);
+    // ---- INCREMENT B: the solve-grid dispatch (notes/ladder_b_integration_design.md) --
+    // g = 1 (the default, and the knob-unset case) falls through to the historic branches
+    // BELOW, untouched -- same calls, same allocations, bitwise the pre-B result.
+    const long nc_w = subspace_rank();
+    const long g_slv = vertex_ladder_detail::resolve_ladder_solve_grid(
+        _ladder_solve_grid, _ladder_solve_budget_gb, nc_w * nc_w * MF->nkpts(), Nm, 0,
+        MF->nkpts(), nc_w * nc_w, mpi->comm.size(),
+        vertex_ladder_detail::ladder_auto_node_size(_ladder_solve_grid, mpi->comm,
+                                                    mpi->node_comm.size()), "whalf");
+    if (g_slv > 1) {
+      vertex_ladder_detail::ladder_slate_thread_guard(g_slv, "ladder whalf");
+      vertex_ladder_detail::pair_space_ladder_slate(G_CC, _Xb_skma, _W0b_qmm.value(), kmq,
+                                                    kpq, tools, nu_h, &Pl, mpi->comm,
+                                                    g_slv, symc, lam_max, nullptr, nullptr,
+                                                    &prof);
+      cwatch.lap();
+      mpi->comm.barrier();
+      prof.t_barrier = cwatch.lap();
+      mpi->comm.all_reduce_in_place_n(Pl.data(), Pl.size(), std::plus<>{});
+      if (lam_max != nullptr)
+        mpi->comm.all_reduce_in_place_n(lam_max->data(), lam_max->size(),
+                                        boost::mpi3::max<>{});
+      prof.t_reduce = cwatch.lap();
+      prof.t_call = twatch.lap();
+      vertex_ladder_detail::prof_report(prof, mpi->comm, "whalf-slate");
+      return Pl;
+    }
     // scheduling: the eval_pol_ladder_nu0 rule (node groups when internode > 1, else the
     // P2 rank round-robin), unchanged -- with nnu > 1 the group mode also spreads nu.
     if (mpi->internode_comm.size() > 1)
@@ -1774,6 +2369,26 @@ namespace solvers {
     nda::array<ComplexType, 4> Ploc(nw_half, nq_ext, nab, nab);
     if (Pi_onerung_loc != nullptr)
       *Pi_onerung_loc = nda::array<ComplexType, 4>(nw_half, nq_ext, nab, nab);
+    // INCREMENT B: the same solve-grid dispatch as eval_pol_ladder_whalf. The ONE-RUNG
+    // output is the one thing the distributed path cannot serve -- it needs the full
+    // (nk, nk, nc2, nc2) K store, which is the (D, D)-class object this path exists to
+    // avoid -- so a one-rung request stays on the per-rank path (it is a gate-only output).
+    const long g_slv = (Pi_onerung_loc != nullptr)
+        ? 1l
+        : vertex_ladder_detail::resolve_ladder_solve_grid(
+              _ladder_solve_grid, _ladder_solve_budget_gb, nc * nc * nk, 0, nab, nk,
+              nc * nc, mpi->comm.size(),
+              vertex_ladder_detail::ladder_auto_node_size(_ladder_solve_grid, mpi->comm,
+                                                          mpi->node_comm.size()),
+              "whalf-loc");
+    if (g_slv > 1) {
+      vertex_ladder_detail::ladder_slate_thread_guard(g_slv, "ladder whalf-loc");
+      vertex_ladder_detail::pair_space_ladder_slate(G_CC, _Xb_skma, _W0b_qmm.value(), kmq,
+                                                    kpq, tools, nu_h, nullptr, mpi->comm,
+                                                    g_slv, symc, nullptr, &U_skia, &Ploc);
+      mpi->comm.all_reduce_in_place_n(Ploc.data(), Ploc.size(), std::plus<>{});
+      return Ploc;
+    }
     if (mpi->internode_comm.size() > 1)
       vertex_ladder_detail::pair_space_ladder(G_CC, _Xb_skma, _W0b_qmm.value(), kmq,
                                               kpq, tools, nu_h, nullptr, nullptr,

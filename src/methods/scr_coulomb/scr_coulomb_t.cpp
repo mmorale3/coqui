@@ -392,6 +392,10 @@ namespace solvers {
         _vertex->pol_isdf_rank(), _vertex->pol_isdf_svd_tol(),
         _vertex->pol_isdf_thresh(), _vertex->pol_isdf_cond_max(), "static");
     _pol_vtx->set_isdf_distr_tol(_vertex->pol_isdf_distr_tol());
+    // increment B: the ladder solve-grid knobs live on the knob carrier; the READOUT
+    // instance is the one that actually runs eval_pol_ladder_whalf, so they travel here.
+    _pol_vtx->set_ladder_solve(_vertex->ladder_solve_grid(),
+                               _vertex->ladder_solve_budget_gb());
     app_log(1, "  [scGW-tilde L2] ladder readout instance: C window = [{}, {}), "
                "secondary rank knob = {}, div_treatment = {} (kernel head follows "
                "build_w0's policy; W0bar is SAME-iteration -- coincides with "

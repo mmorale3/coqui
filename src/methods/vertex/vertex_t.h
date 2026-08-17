@@ -815,6 +815,14 @@ namespace solvers {
     double _pol_isdf_thresh = -1.0;
     double _pol_isdf_cond_max = -1.0;
     double _pol_isdf_distr_tol = -1.0;
+    // ---- ladder solve geometry (notes/ladder_b_integration_design.md, increment B) -----
+    // g = ranks per SOLVE GRID for the resummed ladder's dense resolvent.
+    //   1 (default) = today's per-rank LAPACK path, bit-identical to the pre-B tree;
+    //   > 1         = g ranks cooperate on one (s,q,nu) resolvent through SLATE;
+    //   0           = AUTO, decided by the per-rank memory fit test against
+    //                 _ladder_solve_budget_gb (fits => 1, else the smallest g that fits).
+    long _ladder_solve_grid = 1;
+    double _ladder_solve_budget_gb = 8.0;
     // DIAGNOSTIC (default OFF, not physical): THE CONSTANT-RUNG ABSOLUTE PIN.
     //
     // X^L = pi^dyn - Pi^{C,0}(tau=0) must VANISH when the screening is genuinely static.
@@ -1376,6 +1384,29 @@ namespace solvers {
     double pol_isdf_thresh() const { return _pol_isdf_thresh; }
     double pol_isdf_cond_max() const { return _pol_isdf_cond_max; }
     double pol_isdf_distr_tol() const { return _pol_isdf_distr_tol; }
+
+    /**
+     * INCREMENT B (notes/ladder_b_integration_design.md sections 1-2): the ladder's dense
+     * resolvent gets a SOLVE-GRID dimension g = ranks cooperating on one (s,q,nu) solve.
+     *   g = 1 (default) : today's per-rank LAPACK path -- bit-identical to the pre-B tree,
+     *                     threading comes from the BLAS library.
+     *   g > 1           : the SLATE distributed path (no rank holds a full (D,D)); requires
+     *                     nproc % g == 0 and, with OMP_NUM_THREADS > 1, MPI_THREAD_MULTIPLE
+     *                     (env knob COQUI_MPI_THREAD_MULTIPLE=1, main.cpp).
+     *   g = 0           : AUTO -- the per-rank memory fit test against budget_gb picks the
+     *                     smallest g whose per-rank footprint fits.
+     * budget_gb <= 0 keeps the 8 GB default. Numerics: g = 1 is bitwise the historic path;
+     * g > 1 is the SAME exact dense solve reassociated, gated at <= 1e-12 relative.
+     */
+    void set_ladder_solve(long grid, double budget_gb) {
+      utils::check(grid >= 0, "vertex_t::set_ladder_solve: ladder_solve_grid must be >= 0 "
+                              "(0 = auto, 1 = per-rank LAPACK, > 1 = SLATE grid); got {}.",
+                   grid);
+      _ladder_solve_grid = grid;
+      if (budget_gb > 0.0) _ladder_solve_budget_gb = budget_gb;
+    }
+    long ladder_solve_grid() const { return _ladder_solve_grid; }
+    double ladder_solve_budget_gb() const { return _ladder_solve_budget_gb; }
 
     /**
      * scGW-tilde increment L2 (vertex_ladder.icc): the resummed pair-space ladder

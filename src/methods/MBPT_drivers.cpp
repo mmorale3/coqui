@@ -279,6 +279,17 @@ inline void ensure_checkpoint(std::shared_ptr<mf::MF> mf, std::string const& out
  *                 the nu -> tau -> nu round trip r_rt, and the resolvent margin
  *                 lambda_max = rho(chi0 Xi) -- which ABORTS at 1 (particle-hole
  *                 instability) and warns above 0.9.
+ *  - ladder_solve_grid: 1  Ranks per SOLVE GRID for the ladder's dense resolvent
+ *                 (notes/ladder_b_integration_design.md, increment B). 1 (default) is the
+ *                 per-rank LAPACK path -- bit-identical to the pre-B tree, and its
+ *                 threading comes from the BLAS library (t = OMP_NUM_THREADS as launched).
+ *                 g > 1 makes g ranks cooperate on each (s,q,nu) solve through SLATE, so
+ *                 no rank ever holds a full (D,D); it requires nproc % g == 0 and, at
+ *                 OMP_NUM_THREADS > 1, MPI_THREAD_MULTIPLE (env COQUI_MPI_THREAD_MULTIPLE=1
+ *                 -- SLATE's OpenMP tasks issue concurrent MPI calls). 0 = AUTO: g = 1 if
+ *                 the per-rank footprint fits ladder_solve_budget_gb, else the smallest g
+ *                 that fits (preferring divisors of the intra-node group).
+ *  - ladder_solve_budget_gb: 8.0  Per-rank memory budget the AUTO mode fits against.
  */
 template<typename eri_t>
 void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
@@ -461,6 +472,15 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     auto pol_vertex_isdf_thresh = io::get_value_with_default<double>(pt,"pol_vertex_isdf_thresh",vertex_isdf_thresh);
     auto pol_vertex_isdf_cond_max = io::get_value_with_default<double>(pt,"pol_vertex_isdf_cond_max",vertex_isdf_cond_max);
     auto pol_vertex_isdf_distr_tol = io::get_value_with_default<double>(pt,"pol_vertex_isdf_distr_tol",vertex_isdf_distr_tol);
+    // INCREMENT B (notes/ladder_b_integration_design.md section 2): the ladder's dense
+    // resolvent gets a SOLVE GRID. ladder_solve_grid = 1 (default) is today's per-rank
+    // LAPACK path and is bit-identical to the pre-B tree; > 1 makes g ranks cooperate on
+    // each (s,q,nu) solve through SLATE; 0 is AUTO (the per-rank memory fit test against
+    // ladder_solve_budget_gb). Threads are deliberately NOT a TOML knob -- t is
+    // OMP_NUM_THREADS as launched, and t > 1 at g > 1 additionally needs the environment
+    // knob COQUI_MPI_THREAD_MULTIPLE=1 (main.cpp).
+    auto ladder_solve_grid = io::get_value_with_default<long>(pt,"ladder_solve_grid",1);
+    auto ladder_solve_budget_gb = io::get_value_with_default<double>(pt,"ladder_solve_budget_gb",8.0);
 
     simple_dyson dyson(mf.get(), &ft, mu_tol, mu_update_alg);
     if (io::get_value_with_default<bool>(pt,"iter_alg.enable", true)) {
@@ -492,6 +512,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
                           pol_vertex_isdf_rank, pol_vertex_isdf_svd_tol,
                           pol_vertex_isdf_thresh, pol_vertex_isdf_cond_max,
                           pol_vertex_isdf_distr_tol, pol_vertex_inject);
+    vertex.set_ladder_solve(ladder_solve_grid, ladder_solve_budget_gb);
     scr_eri.set_cvv_rspace_tol(cvv_rspace_tol);
     if (vertex.enabled()) {
       utils::check(screen_type == "rpa" or screen_type == "rpa_k",
@@ -703,6 +724,15 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
         io::get_value_with_default<double>(pt,"vertex_isdf_cond_max",-1.0));
     auto pol_vertex_isdf_distr_tol = io::get_value_with_default<double>(pt,"pol_vertex_isdf_distr_tol",
         io::get_value_with_default<double>(pt,"vertex_isdf_distr_tol",-1.0));
+    // INCREMENT B (notes/ladder_b_integration_design.md section 2): the ladder's dense
+    // resolvent gets a SOLVE GRID. ladder_solve_grid = 1 (default) is today's per-rank
+    // LAPACK path and is bit-identical to the pre-B tree; > 1 makes g ranks cooperate on
+    // each (s,q,nu) solve through SLATE; 0 is AUTO (the per-rank memory fit test against
+    // ladder_solve_budget_gb). Threads are deliberately NOT a TOML knob -- t is
+    // OMP_NUM_THREADS as launched, and t > 1 at g > 1 additionally needs the environment
+    // knob COQUI_MPI_THREAD_MULTIPLE=1 (main.cpp).
+    auto ladder_solve_grid = io::get_value_with_default<long>(pt,"ladder_solve_grid",1);
+    auto ladder_solve_budget_gb = io::get_value_with_default<double>(pt,"ladder_solve_budget_gb",8.0);
     if (io::get_value_with_default<bool>(pt,"iter_alg.enable", true)) {
       iter_solver = std::make_unique<iter_scf::iter_scf_t>(iter_scf::make_iter_scf(pt, 0.7, true));
     } else {
@@ -717,6 +747,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
                                       pol_vertex_isdf_rank, pol_vertex_isdf_svd_tol,
                                       pol_vertex_isdf_thresh, pol_vertex_isdf_cond_max,
                                       pol_vertex_isdf_distr_tol, pol_vertex_inject);
+    pol_vertex_carrier.set_ladder_solve(ladder_solve_grid, ladder_solve_budget_gb);
     if (pol_vertex_carrier.pol_vertex_enabled()) scr_eri.set_vertex(&pol_vertex_carrier);
     MBState mb_state(mpi, ft, output);
     qp_scf_loop(mb_state, eri, ft, qp_params, mb_solver_t(&hf,&gw,&scr_eri), iter_solver.get(),
@@ -800,6 +831,15 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
         io::get_value_with_default<double>(pt,"vertex_isdf_cond_max",-1.0));
     auto pol_vertex_isdf_distr_tol = io::get_value_with_default<double>(pt,"pol_vertex_isdf_distr_tol",
         io::get_value_with_default<double>(pt,"vertex_isdf_distr_tol",-1.0));
+    // INCREMENT B (notes/ladder_b_integration_design.md section 2): the ladder's dense
+    // resolvent gets a SOLVE GRID. ladder_solve_grid = 1 (default) is today's per-rank
+    // LAPACK path and is bit-identical to the pre-B tree; > 1 makes g ranks cooperate on
+    // each (s,q,nu) solve through SLATE; 0 is AUTO (the per-rank memory fit test against
+    // ladder_solve_budget_gb). Threads are deliberately NOT a TOML knob -- t is
+    // OMP_NUM_THREADS as launched, and t > 1 at g > 1 additionally needs the environment
+    // knob COQUI_MPI_THREAD_MULTIPLE=1 (main.cpp).
+    auto ladder_solve_grid = io::get_value_with_default<long>(pt,"ladder_solve_grid",1);
+    auto ladder_solve_budget_gb = io::get_value_with_default<double>(pt,"ladder_solve_budget_gb",8.0);
     if (io::get_value_with_default<bool>(pt,"iter_alg.enable", true)) {
       iter_solver = std::make_unique<iter_scf::iter_scf_t>(iter_scf::make_iter_scf(pt));
     } else {
@@ -814,6 +854,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
                                       pol_vertex_isdf_rank, pol_vertex_isdf_svd_tol,
                                       pol_vertex_isdf_thresh, pol_vertex_isdf_cond_max,
                                       pol_vertex_isdf_distr_tol, pol_vertex_inject);
+    pol_vertex_carrier.set_ladder_solve(ladder_solve_grid, ladder_solve_budget_gb);
     if (pol_vertex_carrier.pol_vertex_enabled()) scr_eri.set_vertex(&pol_vertex_carrier);
     // Project 2 increment Q5 (notes/q5_option2_outer_loop_spec.md §1): the Option-2
     // re-QP-ization knobs. Parsed with an EMPTY default -- absent means INERT, i.e. the qp
@@ -1004,6 +1045,15 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
     auto pol_vertex_isdf_thresh = io::get_value_with_default<double>(pt,"pol_vertex_isdf_thresh",vertex_isdf_thresh);
     auto pol_vertex_isdf_cond_max = io::get_value_with_default<double>(pt,"pol_vertex_isdf_cond_max",vertex_isdf_cond_max);
     auto pol_vertex_isdf_distr_tol = io::get_value_with_default<double>(pt,"pol_vertex_isdf_distr_tol",vertex_isdf_distr_tol);
+    // INCREMENT B (notes/ladder_b_integration_design.md section 2): the ladder's dense
+    // resolvent gets a SOLVE GRID. ladder_solve_grid = 1 (default) is today's per-rank
+    // LAPACK path and is bit-identical to the pre-B tree; > 1 makes g ranks cooperate on
+    // each (s,q,nu) solve through SLATE; 0 is AUTO (the per-rank memory fit test against
+    // ladder_solve_budget_gb). Threads are deliberately NOT a TOML knob -- t is
+    // OMP_NUM_THREADS as launched, and t > 1 at g > 1 additionally needs the environment
+    // knob COQUI_MPI_THREAD_MULTIPLE=1 (main.cpp).
+    auto ladder_solve_grid = io::get_value_with_default<long>(pt,"ladder_solve_grid",1);
+    auto ladder_solve_budget_gb = io::get_value_with_default<double>(pt,"ladder_solve_budget_gb",8.0);
 
     simple_dyson dyson(mf.get(), &ft, mu_tol, mu_update_alg);
     if (io::get_value_with_default<bool>(pt,"iter_alg.enable", true)) {
@@ -1035,6 +1085,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
                           pol_vertex_isdf_rank, pol_vertex_isdf_svd_tol,
                           pol_vertex_isdf_thresh, pol_vertex_isdf_cond_max,
                           pol_vertex_isdf_distr_tol, pol_vertex_inject);
+    vertex.set_ladder_solve(ladder_solve_grid, ladder_solve_budget_gb);
     scr_eri.set_cvv_rspace_tol(cvv_rspace_tol);
     if (vertex.enabled()) {
       utils::check(screen_type == "rpa" or screen_type == "rpa_k",
@@ -1171,6 +1222,15 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
         io::get_value_with_default<double>(pt,"vertex_isdf_cond_max",-1.0));
     auto pol_vertex_isdf_distr_tol = io::get_value_with_default<double>(pt,"pol_vertex_isdf_distr_tol",
         io::get_value_with_default<double>(pt,"vertex_isdf_distr_tol",-1.0));
+    // INCREMENT B (notes/ladder_b_integration_design.md section 2): the ladder's dense
+    // resolvent gets a SOLVE GRID. ladder_solve_grid = 1 (default) is today's per-rank
+    // LAPACK path and is bit-identical to the pre-B tree; > 1 makes g ranks cooperate on
+    // each (s,q,nu) solve through SLATE; 0 is AUTO (the per-rank memory fit test against
+    // ladder_solve_budget_gb). Threads are deliberately NOT a TOML knob -- t is
+    // OMP_NUM_THREADS as launched, and t > 1 at g > 1 additionally needs the environment
+    // knob COQUI_MPI_THREAD_MULTIPLE=1 (main.cpp).
+    auto ladder_solve_grid = io::get_value_with_default<long>(pt,"ladder_solve_grid",1);
+    auto ladder_solve_budget_gb = io::get_value_with_default<double>(pt,"ladder_solve_budget_gb",8.0);
     if (io::get_value_with_default<bool>(pt,"iter_alg.enable", true)) {
       iter_solver = std::make_unique<iter_scf::iter_scf_t>(iter_scf::make_iter_scf(pt));
     } else {
@@ -1185,6 +1245,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
                                       pol_vertex_isdf_rank, pol_vertex_isdf_svd_tol,
                                       pol_vertex_isdf_thresh, pol_vertex_isdf_cond_max,
                                       pol_vertex_isdf_distr_tol, pol_vertex_inject);
+    pol_vertex_carrier.set_ladder_solve(ladder_solve_grid, ladder_solve_budget_gb);
     if (pol_vertex_carrier.pol_vertex_enabled()) scr_eri.set_vertex(&pol_vertex_carrier);
 
     // Project 2 increment Q5 (notes/q5_option2_outer_loop_spec.md §1): the Option-2
