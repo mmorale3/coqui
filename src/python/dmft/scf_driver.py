@@ -344,7 +344,13 @@ def run_gw_edmft(h_int, embedding, inner_loop_alg=1, *, proj_info=None, params: 
         embed_params     = params.pop('dmft_embed')
         impurity_params  = params.pop('impurity')
         imp_iaft_params  = impurity_params.pop('iaft', {})
-        iterative_params = impurity_params.pop('iter_alg', None)
+        # ``convert_gw_edmft_params`` always populates 'iter_alg' (io.py supplies the
+        # {"alg": "damping", "mixing": 0.3} default), but a caller that hands
+        # ``run_gw_edmft`` an already-internal params dict without the section used to
+        # leave this None and blow up much later inside the EDMFT inner loop with a bare
+        # ``'NoneType' object has no attribute 'get'``. Degrade to an empty mapping so the
+        # per-call-site defaults below (mixing=0.7) apply instead.
+        iterative_params = impurity_params.pop('iter_alg', None) or {}
     except KeyError as e:
         raise KeyError(f"run_gw_edmft: Missing required params key: {e.args[0]}")
 
@@ -480,7 +486,11 @@ def qpgw_stage_greens_func_source(coqui_chkpt_h5):
         with HDFArchive(coqui_chkpt_h5, 'r') as ar:
             if "embed" in ar.keys():
                 return "embed", ar["embed/final_iter"]
-    except (OSError, KeyError):
+    # RuntimeError is what TRIQS's h5 raises for an unopenable archive -- the C++ h5
+    # layer's error, NOT a python OSError. Without it in the tuple this guard never fired
+    # on a real TRIQS host and a missing/unreadable checkpoint aborted the Option-2 cycle
+    # with a raw HDF5 traceback instead of falling back to "no injection".
+    except (OSError, RuntimeError, KeyError):
         pass
     return None, -1
 
@@ -620,7 +630,9 @@ def _option2_cycle_diagnostics(mf, proj_info, dmft_state, coqui_chkpt_h5,
             if "pi_lad_loc_orb_wabcd" in grp.keys():
                 pi_lad_orb = np.asarray(grp["pi_lad_loc_orb_wabcd"])
             ovlp = np.asarray(ar["system/S_skij"])
-    except (OSError, KeyError, ValueError, TypeError) as e:
+    # RuntimeError: TRIQS's h5 raises it (not OSError) when the archive or a dataset in it
+    # cannot be read. A diagnostic must never take a production run down.
+    except (OSError, RuntimeError, KeyError, ValueError, TypeError) as e:
         coqui.app_log(2, f"[Q5-b] lattice-stage fields not available this cycle: {e}")
     fields['gap_eV'] = ol.heff_gap_eV(e_ska, mf.nelec())
 
@@ -689,7 +701,8 @@ def _save_mott_chain_trail(solver_chkpt_h5, trail):
             grp = ar["q5_outer_loop"]
             grp["mott_chain_trail"] = np.asarray(trail, dtype=float)
             grp["mott_chain_labels"] = list(outer_loop_diag.MOTT_CHAIN_TRAIL_LABELS)
-    except (OSError, KeyError) as e:
+    # RuntimeError: TRIQS's h5 error class for an unwritable/unopenable archive.
+    except (OSError, RuntimeError, KeyError) as e:
         coqui.app_log(1, f"[Q5-b] could not store the Mott-chain trail: {e}")
 
 

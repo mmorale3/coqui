@@ -352,6 +352,28 @@ def apply_impurity_retardation_mode(delta_iw, u_weiss_iw, Vloc, nu_mesh,
                    "with Z_B < 1, which double-counts screening (R-Q4-5 AMENDMENT). "
                    "The Casula-Werner standard is static_u_source = \"u0\".")
 
+    # ---- domain-of-validity meters (diagnostic only; nothing below changes the result) ---
+    # R-Q4-5 guarantees 0 < Z_B <= 1, and casula_werner_zb clamps S < 0. Neither guards the
+    # OTHER end: an overscreened U(inu) makes S large and Z_B underflow, and Delta -> Z_B
+    # Delta then annihilates the hybridization -- the impurity silently decouples from the
+    # bath and the QMC solves an atomic-limit problem that looks perfectly healthy (sign
+    # ~ 1). Measured on SVO kp444 beta=1000 with the qpGW lattice stage, 2026-08-17:
+    # Ubar(0) = -0.196 Ha, S = 97.0, Z_B = 8e-43.
+    if z_b < 1e-3:
+        app_log(1, f"WARNING: Z_B = {z_b:.3e} for {name or 'this impurity'} is effectively "
+                   f"ZERO (Casula-Werner exponent S = {-np.log(z_b):.4g}). Mode (a) hands the "
+                   f"solver Delta -> Z_B Delta, so the impurity is DECOUPLED from the bath and "
+                   f"the impurity solution is an atomic-limit artefact, not an EDMFT solution. "
+                   f"This means U(inu) is far outside the weakly-retarded regime mode (a) "
+                   f"assumes; use retardation=\"dynamic\", or fix the screening first (see the "
+                   f"Q4-c causality monitor above).")
+    if np.real(u_bar[0]) <= 0.0 and static_u_source == "u0":
+        app_log(1, f"WARNING: Ubar(inu = 0) = {np.real(u_bar[0]):.6f} a.u. <= 0 for "
+                   f"{name or 'this impurity'}: the SCREENED static interaction handed to the "
+                   f"solver by static_u_source = \"u0\" is ATTRACTIVE. That is an overscreening "
+                   f"artefact of W, not a physical Hubbard U; the mode (a) result is not "
+                   f"trustworthy until the screening is fixed.")
+
     return delta_iw * z_b, Vloc_out, np.zeros_like(u_weiss_iw), z_b
 
 

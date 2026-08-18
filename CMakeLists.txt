@@ -470,14 +470,27 @@ endif(ENABLE_CPPTRACE)
 ########################
 if(COQUI_PYTHON_SUPPORT)
   find_package(Python COMPONENTS Interpreter Development NumPy)
-  # Fetch the c2py library
-  FetchContent_Declare(
-    c2py
-    GIT_REPOSITORY https://github.com/flatironinstitute/c2py
-    GIT_TAG        unstable
-    EXCLUDE_FROM_ALL
-  )
-  FetchContent_MakeAvailable(c2py)
+  # Fetch the c2py library.
+  #
+  # h5 -- pulled in transitively by nda once PythonSupport=ON, see the nda block above --
+  # now fetches c2py ITSELF through nda's external_dependency(), which add_subdirectory()s
+  # it under _deps/nda-build/deps/h5/deps/c2py_src and thereby defines the c2py,
+  # c2py_warnings and c2py::c2py targets. FetchContent has no record of that population,
+  # so an unconditional FetchContent_MakeAvailable(c2py) here aborts the configure with
+  #   "_add_library cannot create target \"c2py_warnings\" because another target with the
+  #    same name already exists"  (CMP0002).
+  # Both paths track flatironinstitute/c2py @ unstable, so reuse whatever is already there.
+  if(TARGET c2py::c2py)
+    message(STATUS "c2py already provided by a dependency (h5 via nda); reusing its targets.")
+  else()
+    FetchContent_Declare(
+      c2py
+      GIT_REPOSITORY https://github.com/flatironinstitute/c2py
+      GIT_TAG        unstable
+      EXCLUDE_FROM_ALL
+    )
+    FetchContent_MakeAvailable(c2py)
+  endif()
 
   if (COQUI_UPDATE_PYTHON_BINDINGS)
     find_program(clair-c2py clair-c2py REQUIRED)

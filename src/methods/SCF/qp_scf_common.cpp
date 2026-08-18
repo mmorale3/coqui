@@ -1883,15 +1883,45 @@ template<typename comm_t, typename X_t>
 double solve_iterative(utils::mpi_context_t<comm_t> &context, iter_scf::iter_scf_t& iter_solver,
                        long it, std::string h5_prefix, X_t &sHeff_skij, const X_t &sS_skij) {
   double conv = 0;
-  if (it == 1) {
-    // Just check changes w.r.t. mf
+  // Which "scf/iter{ref_it}" holds the object this iteration is measured against, and is it
+  // a QP Hamiltonian at all?
+  //
+  // A qpGW run that RESTARTS from a plain-GW checkpoint -- which is exactly what the
+  // GW+EDMFT lattice stage does (dmft/io.py always emits 'restart': True for the [qpgw]
+  // block, and the workflow REQUIRES a pre-existing GW checkpoint) -- starts at
+  // it = init_it + 1 with init_it > 0, so it never sees the it == 1 branch below. The
+  // else branch then asks the iterative solver for "scf/iter{it-1}/Heff_skij", but a
+  // checkpoint written by the DYSON scf holds F_skij (+ system/H0_skij), never Heff_skij.
+  // nda::h5_read then threw INSIDE the `node_comm.root()` guard, i.e. on one rank only:
+  // the root unwound qp_scf_loop's shared arrays into MPI_Win_free while every other rank
+  // sat in the node_comm.broadcast_n below -- a hard deadlock, no error message
+  // (observed 2026-08-17 on svo kp444 restart, qp_map=mode_a, iteration 13).
+  //
+  // Treat "no QP Hamiltonian in the previous iteration" exactly like the first qp
+  // iteration: there is nothing to damp against yet, so report the change w.r.t. the
+  // reference Hamiltonian and (for DIIS) start the history here. it == 1 keeps ref_it = 0
+  // and is therefore bit-identical to the previous behaviour.
+  const long ref_it = (it == 1) ? 0 : it - 1;
+  const std::string ref_grp_name = "scf/iter" + std::to_string(ref_it);
+  bool prev_is_qp = false;
+  if (context.comm.root()) {
+    h5::file file(h5_prefix + ".mbpt.h5", 'r');
+    h5::group grp(file);
+    prev_is_qp = grp.has_subgroup(ref_grp_name) and
+                 grp.open_group(ref_grp_name).has_dataset("Heff_skij");
+  }
+  context.comm.broadcast_n(&prev_is_qp, 1, 0);
+
+  if (it == 1 or not prev_is_qp) {
+    // Just check changes w.r.t. mf (or, on a dyson-checkpoint restart, w.r.t. the
+    // effective one-body Hamiltonian F + H0 of the iteration we are continuing from).
     if (context.node_comm.root()) {
       auto H_mf = nda::make_regular(sHeff_skij.local());
       std::string filename = h5_prefix + ".mbpt.h5";
       h5::file file(filename, 'r');
       h5::group grp(file);
-      if (grp.has_subgroup("scf/iter0")) {
-        auto iter_grp = grp.open_group("scf/iter0");
+      if (grp.has_subgroup(ref_grp_name)) {
+        auto iter_grp = grp.open_group(ref_grp_name);
         if (iter_grp.has_dataset("Heff_skij")) {
           // checkpoint from a qp scf
           nda::h5_read(iter_grp, "Heff_skij", H_mf);
@@ -1916,15 +1946,21 @@ double solve_iterative(utils::mpi_context_t<comm_t> &context, iter_scf::iter_scf
     }
     context.comm.barrier();
   } else {
+    // prev_is_qp is true here, so "scf/iter{it-1}/Heff_skij" exists on every rank's view of
+    // the file. The check is kept as a collective-safe assertion: everything below runs on
+    // the node root ONLY, so anything that throws there deadlocks the other ranks in the
+    // broadcast instead of failing. utils::check aborts the job with a message instead.
+    utils::check(prev_is_qp,
+                 "qp_scf_common::solve_iterative: \"{}/Heff_skij\" is missing in {}.mbpt.h5, "
+                 "so the qp Hamiltonian of the previous iteration cannot be damped against.",
+                 ref_grp_name, h5_prefix);
     iter_solver.metadata_log();
     if (context.node_comm.root()) {
       std::string filename = h5_prefix + ".mbpt.h5";
       h5::file file(filename, 'r');
       h5::group grp(file);
-      if (grp.has_subgroup("scf/iter" + std::to_string(it-1))) {
-        auto scf_grp = grp.open_group("scf");
-        conv = iter_solver.solve(sHeff_skij.local(), "Heff_skij", scf_grp, it);
-      }
+      auto scf_grp = grp.open_group("scf");
+      conv = iter_solver.solve(sHeff_skij.local(), "Heff_skij", scf_grp, it);
     }
     context.node_comm.broadcast_n(&conv, 1, 0);
   }
