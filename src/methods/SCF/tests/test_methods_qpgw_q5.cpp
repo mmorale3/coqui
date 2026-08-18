@@ -490,9 +490,14 @@ namespace bdft_tests {
     // ceiling it must beat; the gate is set at the measured class, i.e. equality.
     // The absolute energies above carry ~1e-14 run-to-run noise (FP reduction order); the
     // gate is INTRA-run (both trajectories in one process), so that noise cancels.
+    // d_gap alone is held to one ulp of the ~12 eV gap rather than equality: on the
+    // python-enabled rusty build (coqui_edmft, 2026-08-17) it measures 6.450e-16 eV with
+    // d_e and d_E still exactly 0.0 -- i.e. gap_eV() alone is build-sensitive at sub-ulp
+    // level even on bitwise-identical E_ska (attributed pre-existing by rebuilding the
+    // unmodified source; same class as the FFTW_MEASURE bitwise-gate finding).
     REQUIRE(one.final_iter == c3.final_iter);
     REQUIRE(d_e == 0.0);
-    REQUIRE(d_gap == 0.0);
+    REQUIRE(d_gap <= 2e-15);
     REQUIRE(d_E == 0.0);
     // non-vacuous: the legs really did move (a frozen loop would compose trivially)
     REQUIRE(c1.gap_eV() != c3.gap_eV());
