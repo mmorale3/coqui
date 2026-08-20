@@ -68,22 +68,26 @@ namespace analyt_cont {
       std::visit( [&](auto&& v) { v.init(std::forward<Args>(args)...); }, _ac_var);
     }
 
+    // T-3b: the evaluate family is `const` all the way down (AC_t -> pade_driver ->
+    // pade_t), so a single AC_t can be shared read-only across the threads of the
+    // qp_approx / solve_qp_eqn regions (notes/coqui_threading_t3a.md section 4.2 item 4).
+    // std::visit over a const variant hands the visitor a `const pade_driver&`.
     template<nda::MemoryArrayOfRank<1> mesh_w_t, nda::MemoryArray Array_w_t>
-    void evaluate(mesh_w_t &&w_mesh, Array_w_t &&A_w) {
+    void evaluate(mesh_w_t &&w_mesh, Array_w_t &&A_w) const {
       std::visit( [&](auto&& v) { v.evaluate(w_mesh, A_w); }, _ac_var);
     }
 
     template<nda::MemoryArray Array_w_t>
-    void evaluate(ComplexType w, Array_w_t &&A) {
+    void evaluate(ComplexType w, Array_w_t &&A) const {
       std::visit( [&](auto&& v) { v.evaluate(w, A); }, _ac_var);
     }
 
     template<nda::MemoryArrayOfRank<1> mesh_w_t, nda::MemoryArrayOfRank<1> Array_w_1D_t>
-    void evaluate(mesh_w_t &&w_mesh, Array_w_1D_t &&A_w, long idx) {
+    void evaluate(mesh_w_t &&w_mesh, Array_w_1D_t &&A_w, long idx) const {
       std::visit( [&](auto&& v) { v.evaluate(w_mesh, A_w, idx); }, _ac_var);
     }
 
-    ComplexType evaluate(ComplexType w, long idx) {
+    ComplexType evaluate(ComplexType w, long idx) const {
       return std::visit( [&](auto&& v) { return v.evaluate(w, idx); }, _ac_var);
     }
 

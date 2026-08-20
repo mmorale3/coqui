@@ -120,8 +120,15 @@ namespace solvers {
     // Pre-register every timer print_timers() reads: TimerManager::elapsed() aborts on an
     // unregistered name, and these phases are conditional (EVALUATE_W only runs on the THC
     // path, the IMAG_FT pair only when a transform is needed).
+    // T-3b (timers only, notes/coqui_threading_t3a.md section 4.5): the THC-RPA sub-timers
+    // below were being COLLECTED by rpa_pi.icc but never printed on the scr_coulomb path, so
+    // PI_HADPROD_R / PI_PRIM_TO_AUX / PI_FT_R were invisible on the qpGW path and only the
+    // aggregate EVALUATE_PI could be read. Purely additive: measurement, not threading --
+    // row 9 (the Pi Hadamard) stays UNTOUCHED per RULING R-T3-1 item 4.
     for (auto const &v : {"EVALUATE_PI", "DYSON_W", "EVALUATE_W",
-                          "IMAG_FT_TtoW", "IMAG_FT_WtoT", "FT_REDISTRIBUTE"})
+                          "IMAG_FT_TtoW", "IMAG_FT_WtoT", "FT_REDISTRIBUTE",
+                          "EVALUATE_PI_R", "PI_ALLOC_R", "PI_HADPROD_R",
+                          "EVALUATE_PI_K", "PI_ALLOC_K", "PI_PRIM_TO_AUX", "PI_FT_R"})
       _Timer.add(v);
   }
 
@@ -129,6 +136,15 @@ namespace solvers {
     app_log(2, "\n  SCREENED-COULOMB timers");
     app_log(2, "  -----------------------");
     app_log(2, "    Evaluate Pi (RPA + vertex): {0:.3f} sec", _Timer.elapsed("EVALUATE_PI"));
+    // T-3b (t3a section 4.5): the RPA Pi internals, previously collected but never printed.
+    // Zero rows mean that flavour of the RPA kernel did not run on this path.
+    app_log(2, "      - RPA Pi, R space:        {0:.3f} sec", _Timer.elapsed("EVALUATE_PI_R"));
+    app_log(2, "      - RPA Pi, k space:        {0:.3f} sec", _Timer.elapsed("EVALUATE_PI_K"));
+    app_log(2, "        - Gij->Guv:             {0:.3f} sec", _Timer.elapsed("PI_PRIM_TO_AUX"));
+    app_log(2, "        - Hadamard product:     {0:.3f} sec", _Timer.elapsed("PI_HADPROD_R"));
+    app_log(2, "        - FT k<->R:             {0:.3f} sec", _Timer.elapsed("PI_FT_R"));
+    app_log(2, "        - alloc/zero (R + k):   {0:.3f} sec",
+            _Timer.elapsed("PI_ALLOC_R") + _Timer.elapsed("PI_ALLOC_K"));
     app_log(2, "    Dyson W:                    {0:.3f} sec", _Timer.elapsed("DYSON_W"));
     app_log(2, "      - solve (1-Z.Pi)^-1:      {0:.3f} sec", _Timer.elapsed("EVALUATE_W"));
     app_log(2, "    Imaginary FT tau->w:        {0:.3f} sec", _Timer.elapsed("IMAG_FT_TtoW"));

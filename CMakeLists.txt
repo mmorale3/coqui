@@ -314,9 +314,56 @@ if(COQUI_MKL_THREADED_LINK)
 endif()
 
 ######################################################################
-# FFTW: not using MKL's FFTW yet, figure out how if requested 
+# Host OpenMP -- increment T-3b, notes/coqui_threading_spec.md rev 3 section 7.2 item 5
+#
+# This is CoQui's OWN threading of its OWN loops (the `omp_threads` knob, see
+# src/utilities/omp_threads.hpp). It is NOT the pre-existing ENABLE_OPENMP option a few
+# dozen lines above -- that one selects an OpenMP *device offload* backend and turns on
+# ENABLE_DEVICE. Do not conflate them.
+#
+# The flag is applied to the `utils` target PUBLICly, and every CoQui library reaches utils
+# transitively, so all C++ TUs are compiled with the same -fopenmp state. That uniformity is
+# deliberate and not cosmetic: the threaded regions live in headers/templates (pade_t.hpp's
+# init, thc_gw.icc's Hadamard) that are instantiated in several targets, and compiling one
+# instantiation with OpenMP and another without would be an ODR violation whose symptom is
+# a region that silently does not thread.
+#
+# DEFAULT: ON on Linux, OFF on Apple. The Mac trap is documented in
+# notes/coqui_threading_t0.md section 5 -- duplicate OpenMP runtimes make any t>1 run die
+# with OMP Error #179, so all threaded validation happens on Linux and Mac work runs at
+# omp_threads = 1 anyway.
+######################################################################
+if(APPLE)
+  set(COQUI_HOST_OPENMP_DEFAULT OFF)
+else()
+  set(COQUI_HOST_OPENMP_DEFAULT ON)
+endif()
+option(COQUI_ENABLE_HOST_OPENMP
+       "Build CoQui's own OpenMP regions (the omp_threads knob)"
+       ${COQUI_HOST_OPENMP_DEFAULT})
+if(COQUI_ENABLE_HOST_OPENMP)
+  find_package(OpenMP COMPONENTS CXX)
+  if(OpenMP_CXX_FOUND)
+    message(STATUS "Host OpenMP enabled: ${OpenMP_CXX_FLAGS} (the omp_threads knob is live)")
+  else()
+    message(STATUS "Host OpenMP requested but not found: the omp_threads knob will warn and "
+                   "CoQui's own loops stay serial")
+  endif()
+else()
+  message(STATUS "Host OpenMP disabled (COQUI_ENABLE_HOST_OPENMP=OFF): CoQui's own loops "
+                 "stay serial")
+endif()
+
+######################################################################
+# FFTW: not using MKL's FFTW yet, figure out how if requested
 ######################################################################
 if(ENABLE_FFTW)
+  # T-3a section 2.3 row 8: DOUBLE_OPENMP_LIB was already requested here but never linked
+  # (src/numerics/fft/CMakeLists.txt linked FFTW::Double only). The component list is left
+  # exactly as it was -- FindFFTW searches for every flavour unconditionally and exports
+  # FFTW::DoubleThreads / FFTW::DoubleOpenMP whenever it finds them, so nothing has to be
+  # promoted to a REQUIRED component to pick one. See src/numerics/fft/CMakeLists.txt for
+  # WHICH one gets linked and why.
   find_package(FFTW REQUIRED DOUBLE_OPENMP_LIB)
   add_compile_definitions(ENABLE_FFTW)
 endif()

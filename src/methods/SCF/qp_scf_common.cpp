@@ -28,6 +28,7 @@
 #include "nda/linalg/det_and_inverse.hpp"
 #include "numerics/nda_functions.hpp"
 #include "numerics/ac/AC_t.hpp"
+#include "utilities/omp_threads.hpp"
 
 #include "hamiltonian/one_body_hamiltonian.hpp"
 #include "hamiltonian/pseudo/pseudopot.h"
@@ -1232,36 +1233,98 @@ void solve_qp_eqn(sArray_t<Array_view_3D_t> &sE_ska,
     app_log(2, "  - eta:                                        {}", qp_params.eta);
     app_log(2, "  - tolerance for quasi-particle equation:      {}\n", qp_params.tol);
     AC.init(iw_mesh, Sigma_loc_2D, qp_params.Nfit);
+
+    // ---------------- T-3b threaded regions 2-3 of 4 ----------------
+    // notes/coqui_threading_t3a.md section 2.3 ROW 6 / section 3.1: the four per-state
+    // root-finding loops. Not on the A-leg hot path (the `gw` + qp_type=sc* run modes reach
+    // them), but they are the same code family as the qp_approx map region and R-T3-1 item 1
+    // puts them in scope.
+    //
+    // SAFETY INVENTORY (spec section 7.2 item 2, hazards from t3a section 4.4):
+    //   * the bodies make no MPI call -- E_loc_1D is rank-local and every I writes one
+    //     distinct element; the all_reduce/barrier tail sits after the dispatch;
+    //   * `AC` is shared and read-only: AC_t/pade_driver/pade_t::evaluate are all `const`
+    //     as of this increment, and AC.init ran above the loops;
+    //   * the shared `res`/`conv` scratch declared OUTSIDE each loop is now declared inside
+    //     the body (they were never read after the loop);
+    //   * app_warning moved OUT: non-convergent states are collected and logged after the
+    //     loop, sorted by I so the message order is thread-count independent.
+    //
+    // THE ONE VERBOSITY CAVEAT: qp_eqn_bisection logs its iterations with app_log(6, ...)
+    // from inside its own while loops (qp_solvers.hpp:159/168/177/185/194). Logging from a
+    // worker thread is forbidden by spec section 7.2 item 2, and at verbosity >= 6 those
+    // lines are the point of the run -- so the regions fall back to the serial path there
+    // instead of dropping or interleaving them.
+    auto qp_nthr = [&](long niter) -> long {
+      return (__app_output_level__ >= 6) ? 1l : utils::omp_threads_for(niter);
+    };
+    const size_t dim1_u = size_t(dim1);
+    // (I, residual) of the states whose solver did not converge; logged after the loop.
+    std::vector<std::pair<size_t, double>> qp_noconv;
+    auto qp_log_noconv = [&](const char *what, bool with_res) {
+      std::sort(qp_noconv.begin(), qp_noconv.end(),
+                [](auto const &a, auto const &b) { return a.first < b.first; });
+      for (auto const &e : qp_noconv) {
+        auto [is, ik, ia] = I_to_ska(e.first);
+        if (with_res)
+          app_warning("{} fails to converge at (s,k,a) = ({},{},{}); residual = {}",
+                      what, is, ik, ia, e.second);
+        else
+          app_warning("{} fails to converge at (s,k,a) = ({},{},{})", what, is, ik, ia);
+      }
+    };
     if (qp_params.qp_type == "sc" or qp_params.qp_type == "sc_bisection") {
-      double res;
-      for (size_t I = 0; I < dim1; ++I) {
+      [[maybe_unused]] const long nthr = qp_nthr(dim1);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(nthr) if (nthr > 1)
+#endif
+      for (size_t I = 0; I < dim1_u; ++I) {
+        double res;
         std::tie(E_loc_1D(I), res) =
             qp_eqn_bisection(Vhf_loc_1D(I).real(), AC, I, mu, E_loc_1D(I).real(), qp_params.tol, qp_params.eta);
       }
     } else if (qp_params.qp_type == "sc_newton") {
-      bool conv;
-      double res;
-      for (size_t I = 0; I < dim1; ++I) {
+      [[maybe_unused]] const long nthr = qp_nthr(dim1);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(nthr) if (nthr > 1)
+#endif
+      for (size_t I = 0; I < dim1_u; ++I) {
+        bool conv;
+        double res;
         std::tie(E_loc_1D(I), res, conv) =
             qp_eqn_secant(Vhf_loc_1D(I).real(), AC, I, mu, E_loc_1D(I).real(), 400, qp_params.tol, qp_params.eta);
         if (!conv) {
-          auto [is, ik, ia] = I_to_ska(I);
-          app_warning("secant method fails to converge at (s,k,a) = ({},{},{}); residual = {}", is, ik, ia, res);
+#ifdef _OPENMP
+#pragma omp critical (coqui_qp_noconv)
+#endif
+          qp_noconv.emplace_back(I, res);
         }
       }
+      qp_log_noconv("secant method", true);
     } else if (qp_params.qp_type == "linearized") {
-      for (size_t I = 0; I < dim1; ++I) {
+      [[maybe_unused]] const long nthr = qp_nthr(dim1);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(nthr) if (nthr > 1)
+#endif
+      for (size_t I = 0; I < dim1_u; ++I) {
         E_loc_1D(I) = qp_eqn_linearized(Vhf_loc_1D(I).real(), AC, I, mu, E_loc_1D(I).real(), qp_params.eta);
       }
     } else if (qp_params.qp_type == "spectral") {
-      bool conv;
-      for (size_t I = 0; I < dim1; ++I) {
+      [[maybe_unused]] const long nthr = qp_nthr(dim1);
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(nthr) if (nthr > 1)
+#endif
+      for (size_t I = 0; I < dim1_u; ++I) {
+        bool conv;
         std::tie(E_loc_1D(I), conv) = qp_eqn_spectral(Vhf_loc_1D(I).real(), AC, I, mu, E_loc_1D(I).real(), qp_params.tol, qp_params.eta);
         if (!conv) {
-          auto [is, ik, ia] = I_to_ska(I);
-          app_warning("spectral method fails to converge at (s,k,a) = ({},{},{})", is, ik, ia);
+#ifdef _OPENMP
+#pragma omp critical (coqui_qp_noconv)
+#endif
+          qp_noconv.emplace_back(I, 0.0);
         }
       }
+      qp_log_noconv("spectral method", false);
     } else {
       utils::check(false, "solve_qp_eqn: unknown type of qp equation: {}", qp_params.qp_type);
     }
@@ -1625,19 +1688,52 @@ auto qp_approx(const sArray_t<Array_view_5D_t> &sSigma_tskij,
   auto Sigma_loc_2D = nda::reshape(dSigma_wskab.local(), std::array<long, 2>{nw, dim1});
   AC.init(iw_mesh, Sigma_loc_2D, qp_params.Nfit);
 
+  // ---------------- T-3b threaded region 4 of 4 ----------------
+  // notes/coqui_threading_t3a.md section 2.3 ROW 2 / section 3.1: the per-state map
+  // evaluation, 14% of the QP-map phase (+1.9 s at 24r x 4t, +4.3 s at 12r x 8t).
+  //
+  // SAFETY INVENTORY (spec section 7.2 item 2, hazards from t3a section 4.3):
+  //   * ⚠ CORRECTION TO t3a section 4.3, found by measurement during T-3b. That note said
+  //     "the body itself makes no MPI call -- the writes are plain stores". THE WRITES are,
+  //     but `shared_array::local()` is NOT: it is
+  //         Array_view_t(_shape, _win->base(0))
+  //     and mpi3::shared_window::base() -> query() -> **MPI_Win_shared_query**
+  //     (numerics/shared_array/nda.hpp:194, extern/mpi_wrapper/mpi3/shared_window.hpp:47-57).
+  //     The original loop called sE_ska.local() twice and sVcorr_skij.local() once PER
+  //     ITERATION, so threading it as written put three MPI calls per state on worker threads
+  //     at MPI_THREAD_SINGLE -- undefined behaviour, and a spec section 7.2 item 2 violation.
+  //     Both views are therefore hoisted to locals BEFORE the region; the body now touches
+  //     nothing but the window's memory. (It is also strictly less work per state.)
+  //   * the loop sits BETWEEN the two win().fence() calls, and I_to_skab (:1511-1519) maps
+  //     every I to a distinct (s,k,a,b), so the stores are disjoint element stores;
+  //   * no HDF5, no logging;
+  //   * `AC` is shared and read-only (AC_t/pade_driver/pade_t::evaluate are `const`);
+  //   * the off_diag_mode string dispatch and its utils::check(false, ...) else-branch used
+  //     to be INSIDE the body -- hoisted out, because an abort raised from a worker thread
+  //     is a bad failure mode (and it removes a per-I string compare).
+  //
+  // DETERMINISM: iterations are independent, nothing is reassociated.
+  utils::check(qp_params.off_diag_mode == "qp_energy" or qp_params.off_diag_mode == "fermi",
+               "qp_approx: unknown off-diagonal mode: {}", qp_params.off_diag_mode);
+  const bool odm_qp_energy = (qp_params.off_diag_mode == "qp_energy");
+  const size_t dim1_u = size_t(dim1);
+  [[maybe_unused]] const long nthr = utils::omp_threads_for(dim1);
   sVcorr_skij.win().fence();
-  for (size_t I = 0; I < dim1; ++I) {
+  auto Vcorr_loc = sVcorr_skij.local();   // hoisted: local() is an MPI call, see above
+  auto E_ska_loc = sE_ska.local();        // hoisted: same
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(nthr) if (nthr > 1)
+#endif
+  for (size_t I = 0; I < dim1_u; ++I) {
     auto [s, k, a, b] = I_to_skab(I);
-    if (qp_params.off_diag_mode == "qp_energy") {
-      double eps_a = sE_ska.local()(s, k, a).real() - mu;
-      double eps_b = sE_ska.local()(s, k, b).real() - mu;
-      sVcorr_skij.local()(s, k, a, b) = 0.5 * ( AC.evaluate(ComplexType(eps_a, qp_params.eta), I)
-                                                 + AC.evaluate(ComplexType(eps_b, qp_params.eta), I) );
-    } else if (qp_params.off_diag_mode == "fermi") {
-      double eps_a = (a == b)? sE_ska.local()(s, k, a).real() - mu : 0.0;
-      sVcorr_skij.local()(s, k, a, b) = AC.evaluate(ComplexType(eps_a, qp_params.eta), I);
+    if (odm_qp_energy) {
+      double eps_a = E_ska_loc(s, k, a).real() - mu;
+      double eps_b = E_ska_loc(s, k, b).real() - mu;
+      Vcorr_loc(s, k, a, b) = 0.5 * ( AC.evaluate(ComplexType(eps_a, qp_params.eta), I)
+                                        + AC.evaluate(ComplexType(eps_b, qp_params.eta), I) );
     } else {
-      utils::check(false, "qp_approx: unknown off-diagonal mode: {}", qp_params.off_diag_mode);
+      double eps_a = (a == b)? E_ska_loc(s, k, a).real() - mu : 0.0;
+      Vcorr_loc(s, k, a, b) = AC.evaluate(ComplexType(eps_a, qp_params.eta), I);
     }
   }
   sVcorr_skij.win().fence();

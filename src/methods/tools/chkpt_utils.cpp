@@ -21,6 +21,7 @@
 
 #include "chkpt_utils.h"
 #include "utilities/blas_threads.hpp"
+#include "utilities/omp_threads.hpp"
 
 namespace methods {
   namespace chkpt {
@@ -69,6 +70,9 @@ void write_metadata(communicator_t &comm, const mf::MF &mf, const imag_axes_ft::
     auto run_grp = grp.create_group("run_parameters");
     h5::h5_write(run_grp, "blas_threads", utils::blas_threads());
     h5::h5_write(run_grp, "blas_threads_backend", utils::blas_threads_backend_name());
+    // T-3b: same reasoning for CoQui's own thread count. omp_threads = 1 is both the
+    // default and what every pre-T-3b checkpoint implicitly recorded.
+    h5::h5_write(run_grp, "omp_threads", utils::omp_threads());
 
     auto iaft_grp = grp.create_group("imaginary_fourier_transform");
     std::string iaft_basis = imag_axes_ft::basis_enum_to_string(ft.basis());

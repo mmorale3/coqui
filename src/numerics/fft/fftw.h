@@ -27,8 +27,24 @@
 #include "configuration.hpp"
 #include "numerics/fft/fft_define.hpp"
 
-namespace math::fft::impl::host 
+namespace math::fft::impl::host
 {
+
+/**
+ * One-shot FFTW threading setup -- T-3b item 3.3 (notes/coqui_threading_t3a.md section 2.3
+ * row 8 / section 3.3).
+ *
+ * CMake has requested FFTW's threaded double library since the FFTW block was written
+ * (find_package(FFTW REQUIRED DOUBLE_OPENMP_LIB)) but the FFT target linked only
+ * FFTW::Double and neither fftw_init_threads() nor fftw_plan_with_nthreads() was ever
+ * called, so the capability was paid for and never used. This is the missing call.
+ *
+ * `nthreads` comes from the `omp_threads` TOML knob, NOT from the OpenMP environment:
+ * fftw_plan_with_nthreads is a planner setting, so it must be called before any plan is
+ * created (main() does, right after the knob is read). `nthreads <= 1` is a no-op, which
+ * keeps every existing input file on the serial planner it has always used.
+ */
+void init_threads(long nthreads);
 
 // batched FFT interface
 fftplan_t create_plan_many_impl_(int rank, const int *n, int howmany,

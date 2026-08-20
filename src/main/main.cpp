@@ -37,6 +37,7 @@
 #include "mpi3/communicator.hpp"
 #include "utilities/mpi_context.h"
 #include "utilities/blas_threads.hpp"
+#include "utilities/omp_threads.hpp"
 
 #include "mean_field/MF.hpp"
 #include "mean_field/mf_utils.hpp"
@@ -49,6 +50,13 @@
 #include "wannier/wan90.h"
 
 namespace mpi3 = boost::mpi3;
+
+#if defined(ENABLE_FFTW)
+// T-3b item 3.3 (notes/coqui_threading_t3a.md section 2.3 row 8): defined in
+// numerics/fft/fftw.cpp. Forward-declared rather than included so main.cpp does not need
+// fftw3.h on its include path.
+namespace math::fft::impl::host { void init_threads(long nthreads); }
+#endif
 
 template<MEMORY_SPACE MEM>
 void run(mpi3::communicator & comm, InputParser &parser);
@@ -258,6 +266,24 @@ int main(int argc, char** argv)
   // behaviour for every existing input file.
   utils::set_blas_threads(
       io::get_value_with_default<long>(parser.get_root(), "blas_threads", 0l));
+
+  // T-3b (notes/coqui_threading_spec.md rev 3 section 7.2 item 1, FABLE RULING R-T3-1):
+  // the `omp_threads` knob. Read at the same place and for the same two reasons as
+  // blas_threads -- it is a per-process setting, and the THC/ISDF build (which FFTW's plan
+  // thread count below belongs to) runs before any solver block is entered. Absent or <= 1
+  // => every T-3b region takes its serial path, i.e. exactly today's behaviour for every
+  // existing input file. NOTE: this deliberately never touches OMP_NUM_THREADS.
+  utils::set_omp_threads(
+      io::get_value_with_default<long>(parser.get_root(), "omp_threads", 1l));
+
+#if defined(ENABLE_FFTW)
+  // T-3a section 2.3 row 8 / section 3.3: CMake has been requesting FFTW's threaded double
+  // library all along (CMakeLists.txt find_package(FFTW ... DOUBLE_OPENMP_LIB)) while the
+  // FFT target linked only the serial one and fftw_init_threads() was called nowhere in the
+  // tree. Both are fixed; the plan thread count comes from the SAME knob, so FFTW never
+  // reads the OpenMP environment either. One-shot, before any plan is created.
+  math::fft::impl::host::init_threads(utils::omp_threads());
+#endif
 
   // dispatch based on compute
   if(compute == "default") {
@@ -578,10 +604,12 @@ void run(mpi3::communicator &comm, InputParser &parser)
       }
       mpi_context->comm.barrier();
 
-    } else if (cname == "blas_threads") {
+    } else if (cname == "blas_threads" or cname == "omp_threads") {
 
-      // Global run setting, not a calculation block: consumed in main() before dispatch
-      // (T-2 option (c)). Named here only so it does not trip the unknown-block abort.
+      // Global run settings, not calculation blocks: consumed in main() before dispatch
+      // (blas_threads = T-2 option (c), omp_threads = T-3b). Named here only so they do not
+      // trip the unknown-block abort. THIS IS THE SECOND OF THE TWO PARSE SITES -- a new
+      // top-level key must be added both where it is read (main(), above) and here.
 
     } else {
 

@@ -91,8 +91,11 @@ namespace analyt_cont {
       _pade_kernel.init(iw_fit, A_fit);
     }
 
+    // T-3b: the evaluate family is `const` (t3a section 4.2 item 4). The kernel is shared
+    // across threads in the qp_approx / solve_qp_eqn regions, so read-onlyness is pinned by
+    // the type system rather than by inspection.
     template<nda::MemoryArrayOfRank<1> mesh_w_t, nda::MemoryArray Array_w_t>
-    void evaluate(mesh_w_t &&w_mesh, Array_w_t &&A_w) {
+    void evaluate(mesh_w_t &&w_mesh, Array_w_t &&A_w) const {
       using Aw_value_type = typename std::decay_t<Array_w_t>::value_type;
       static_assert(nda::is_complex_v<Aw_value_type>, "pade_driver::evaluate: A_w is not complex");
       utils::check(w_mesh.shape(0) == A_w.shape(0), "pade_driver::evaluate: nw is not consistent");
@@ -103,7 +106,7 @@ namespace analyt_cont {
     }
 
     template<nda::MemoryArray Array_w_t>
-    void evaluate(ComplexType w, Array_w_t &&A) {
+    void evaluate(ComplexType w, Array_w_t &&A) const {
       using Aw_value_type = typename std::decay_t<Array_w_t>::value_type;
       static_assert(nda::is_complex_v<Aw_value_type>, "pade_driver::evaluate: A_w is not complex");
 
@@ -116,14 +119,14 @@ namespace analyt_cont {
     }
 
     template<nda::MemoryArrayOfRank<1> mesh_w_t, nda::MemoryArrayOfRank<1> Array_w_1D_t>
-    void evaluate(mesh_w_t &&w_mesh, Array_w_1D_t &&A_w, long d1) {
+    void evaluate(mesh_w_t &&w_mesh, Array_w_1D_t &&A_w, long d1) const {
       using Aw_value_type = typename std::decay_t<Array_w_1D_t>::value_type;
       static_assert(nda::is_complex_v<Aw_value_type>, "pade_driver::evaluate: A_w is not complex");
 
       A_w = _pade_kernel.evaluate(w_mesh, d1);
     }
 
-    ComplexType evaluate(ComplexType w, long d1) {
+    ComplexType evaluate(ComplexType w, long d1) const {
       return _pade_kernel.evaluate(w, d1);
     }
 

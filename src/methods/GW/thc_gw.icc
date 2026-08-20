@@ -1,6 +1,9 @@
 #ifndef COQUI_THC_GW_ICC
 #define COQUI_THC_GW_ICC
 
+#include <algorithm>
+#include <vector>
+
 #include "mpi3/communicator.hpp"
 #include "nda/nda.hpp"
 #include "nda/blas.hpp"
@@ -13,6 +16,7 @@
 #include "IO/app_loggers.h"
 #include "utilities/Timer.hpp"
 #include "utilities/kpoint_utils.hpp"
+#include "utilities/omp_threads.hpp"
 
 #include "mean_field/MF.hpp"
 #include "methods/ERI/detail/concepts.hpp"
@@ -363,38 +367,129 @@ namespace methods {
 
       _Timer.start("SIGMA_HADPROD_K");
       Sigma_skPQ() = 0.0;
-      for (size_t isk=0; isk<ns*nkpts_ibz; isk++) {
-        size_t is = isk/nkpts_ibz;
-        size_t ik = isk%nkpts_ibz;
-        long ks = MF->ks_to_k(isym,ik);
-        auto Sigma_k = Sigma_skPQ(is,ik,nda::ellipsis{});
 
-        for (size_t iq=0; iq<nqs; iq++) {
+      // ---------------- T-3b threaded region: the Sigma Hadamard product ----------------
+      // notes/coqui_threading_t3a.md section 2.3 ROW 3 / section 3.2. 35% (t4) / 41% (t8) of
+      // the Sigma phase, +3.60 s at 24r x 4t and +13.29 s at 12r x 8t off parity.
+      //
+      // WHAT IS THREADED, AND WHAT DELIBERATELY IS NOT (R-T3-1 item 1):
+      //   * NOT the `iq` loop -- it accumulates Sigma_k += across q, i.e. it is a reduction;
+      //   * NOT the `isk` loop -- ns*nkpts_ibz = 13 on the reference fixture, which is a
+      //     1.6x imbalance over 8 threads, exactly the layout that needs the help most;
+      //   * threading is a BLOCKING OF THE TILE'S LEADING P INDEX (Np_loc ~ 424) into
+      //     fixed PBLK-row blocks; each block walks the whole (isk, iq) term list on its own
+      //     rows, and OpenMP distributes blocks over the team.
+      // The blocking also turned out to be a large WIN IN ITS OWN RIGHT, not just a way to
+      // divide the work: a block's Sigma/G/W stripes stay in cache across the whole `terms`
+      // walk, where the original whole-tile form streamed 8.6 MB per term. On the reference
+      // fixture the phase went 14.9 s -> 4.6 s at 24 r x MKL4 and 24.9 s -> 5.2 s at
+      // 12 r x MKL8, i.e. 2.2-2.5x FASTER than the 11.4 s all-MPI parity figure that t3a
+      // section 3.2 identified as the bandwidth floor. That floor was a floor for the
+      // unblocked loop.
+      //
+      // DETERMINISM -- and why the chunk boundaries are FIXED BY THE KNOB, not by the team.
+      // Splitting over the OUTPUT index means every element's accumulation order over
+      // (isk, iq) is exactly the serial order, so no floating-point REASSOCIATION happens at
+      // any thread count. That is not the same as bitwise invariance, and the difference was
+      // MEASURED, not assumed. The first version of this region derived its stripe from
+      // omp_get_thread_num()/omp_get_num_threads(); at omp_threads = 8 that produced a
+      // 4.4e-16 (one ulp) move in Heff which VARIED RUN TO RUN between two states -- measured
+      // over 5 samples on the ac_pade fixture, 3 on the mats_lin fixture, and 3 more with
+      // MKL_NUM_THREADS = 1 so that MKL could not be the cause. Mechanism: the elementwise
+      // kernel's vector peel/tail and pointer alignment depend on the chunk's LENGTH and
+      // OFFSET, and the runtime team size is not a guaranteed constant, so the boundaries --
+      // and with them the last bit -- moved between runs.
+      // ⚠ Why one ulp matters here: the ac_pade QP map amplifies it by ~2e11 (that same ulp
+      // ends up as 8.4e-05 a.u. = 2.3 meV in Heff after the second iteration), while the
+      // Matsubara-native map (qp_map = mats_lin) keeps it at 1e-15. The amplifier is the AC
+      // (notes/silent_ac_defect_spec.md territory), not this region -- but a threaded run must
+      // not be the thing that pokes it, and it must never be nondeterministic.
+      // So: (a) omp_threads <= 1 runs the ORIGINAL whole-tile expression, byte-for-byte the
+      // pre-T-3b code path; (b) above 1, the tile is cut into fixed PBLK-row blocks whose
+      // boundaries depend on nothing but PBLK -- identical for every thread count and every
+      // run -- and OpenMP only decides WHICH thread takes which block, which cannot change a
+      // single bit.
+      // MEASURED on the Si kp444 nb100 A fixture with this structure (24 r x MKL4 and
+      // 12 r x MKL8): omp_threads = 1, 2, 4 and 6 are BITWISE identical to the serial path and
+      // reproducible; omp_threads = 8 leaves a 1-2 ulp residue in Heff after one iteration.
+      // The residue is NOT this loop's block structure (which is thread-count independent by
+      // construction above) -- it survives with the AC map replaced by qp_map = mats_lin and
+      // with MKL_NUM_THREADS = 1, and the whole W stage is bitwise identical, so it enters
+      // between W and Heff. Whatever its origin, treat omp_threads <= 6 as the reproducible
+      // regime on this workload until the T-4 MKL study closes it out; see the T-3b report.
+      //
+      // SAFETY INVENTORY (spec section 7.2 item 2): every mean-field / symmetry lookup
+      // (ks_to_k, Qs, qp_to_ibz, qk_to_k2, qp_trev, kp_trev, kp_trev_pair, qminus) is
+      // HOISTED into the serial term-list build below -- each of those goes through
+      // MF::var's std::visit, and hoisting them keeps the parallel body free of everything
+      // but local array memory: no MPI, no HDF5, no logging, no aborts. `had_prod2` /
+      // `had_prod2_conj` are stateless nda::map functors; `terms` is read-only once built.
+      // The expression is elementwise on views, so no BLAS runs inside the region and
+      // omp_threads x blas_threads oversubscription cannot arise.
+      struct had_term_t { long is, ik, ikmq, iqs, mode; };
+      std::vector<had_term_t> terms;
+      terms.reserve(size_t(ns*nkpts_ibz*std::max(nqs, 1l)));
+      for (long isk=0; isk<ns*nkpts_ibz; isk++) {
+        long is = isk/nkpts_ibz;
+        long ik = isk%nkpts_ibz;
+        long ks = MF->ks_to_k(isym,ik);
+
+        for (long iq=0; iq<nqs; iq++) {
           long qp = MF->Qs(isym,iq);   // qpoint index in the 1st BZ which can be mapped to IBZ through isym
           long qs = MF->qp_to_ibz(qp); // associated qp index in the IBZ
-          auto W_q = W_qtPQ(qs, it, nda::ellipsis{});
 
           if (qp_trev(qp)) {
             long ksmqs_m = MF->qk_to_k2(qminus(qs),ks); // ksmqs_m + G = ks + qs = ks - (-qs)
-            if (kp_trev(ksmqs_m)) {
-              auto G_kmq = G_skPQ(is, kp_trev_pair(ksmqs_m), nda::ellipsis{});
-              Sigma_k += nda::conj(had_prod2(W_q, G_kmq));
-            } else {
-              auto G_kmq = G_skPQ(is, ksmqs_m, nda::ellipsis{});
-              Sigma_k += had_prod2_conj(G_kmq, W_q);
-            }
+            if (kp_trev(ksmqs_m)) terms.push_back({is, ik, kp_trev_pair(ksmqs_m), qs, 0});
+            else                  terms.push_back({is, ik, ksmqs_m,               qs, 1});
           } else {
             long ksmqs = MF->qk_to_k2(qs,ks);
-            if (kp_trev(ksmqs)) {
-              auto G_kmq = G_skPQ(is, kp_trev_pair(ksmqs), nda::ellipsis{});
-              Sigma_k += had_prod2_conj(W_q, G_kmq);
-            } else {
-              auto G_kmq = G_skPQ(is, ksmqs, nda::ellipsis{});
-              Sigma_k += had_prod2(G_kmq, W_q);
-            } // if ( kp_trev )
+            if (kp_trev(ksmqs)) terms.push_back({is, ik, kp_trev_pair(ksmqs), qs, 2});
+            else                terms.push_back({is, ik, ksmqs,               qs, 3});
           } // if ( qp_trev )
         } // iq
       } // isk
+
+      // One accumulator for both paths, so the four symmetry cases exist once.
+      auto accumulate = [&](auto &&Sigma_k, auto &&G_kmq, auto &&W_q, long mode) {
+        switch (mode) {
+          case 0:  Sigma_k += nda::conj(had_prod2(W_q, G_kmq)); break;
+          case 1:  Sigma_k += had_prod2_conj(G_kmq, W_q);       break;
+          case 2:  Sigma_k += had_prod2_conj(W_q, G_kmq);       break;
+          default: Sigma_k += had_prod2(G_kmq, W_q);            break;
+        }
+      };
+
+      const long np_tile = Np_loc;    // structured bindings must not appear in omp clauses
+      [[maybe_unused]] const long nthr = utils::omp_threads_for(np_tile);
+      if (nthr <= 1) {
+        // The pre-T-3b path, whole-tile views included: this is what the determinism gate
+        // (spec section 7.2 item 4) is a claim about, so it is not merely "the chunked loop
+        // with one chunk" -- it is the same expression on the same view type as before.
+        for (auto const &T : terms)
+          accumulate(Sigma_skPQ(T.is, T.ik, nda::ellipsis{}),
+                     G_skPQ(T.is, T.ikmq, nda::ellipsis{}),
+                     W_qtPQ(T.iqs, it, nda::ellipsis{}), T.mode);
+      } else {
+        // PBLK = rows of P per block. Fixed, so the block boundaries -- and therefore every
+        // element's arithmetic -- are independent of the thread count and of the runtime team
+        // size (see DETERMINISM above). 8 rows x Nq_loc complex is O(100 KB) per block per
+        // array, small enough that a block's Sigma stripe stays resident across the whole
+        // `terms` walk, and 424/8 = 53 blocks balance any team up to a few tens of threads.
+        constexpr long PBLK = 8;
+        const long nblk = (np_tile + PBLK - 1) / PBLK;
+#ifdef _OPENMP
+#pragma omp parallel for schedule(static) num_threads(nthr)
+#endif
+        for (long ib = 0; ib < nblk; ++ib) {
+          const long p0 = ib*PBLK, p1 = std::min(np_tile, p0 + PBLK);
+          auto p_rng = nda::range(p0, p1);
+          for (auto const &T : terms)
+            accumulate(Sigma_skPQ(T.is, T.ik, p_rng, nda::range::all),
+                       G_skPQ(T.is, T.ikmq, p_rng, nda::range::all),
+                       W_qtPQ(T.iqs, it, p_rng, nda::range::all), T.mode);
+        }
+      }
 
       /*for (size_t iq=0; iq<nqs; iq++) {
         long qp = MF->Qs(isym,iq);   // qpoint index

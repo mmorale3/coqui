@@ -20,6 +20,7 @@
 
 
 #include <map>
+#include "IO/app_loggers.h"
 #include "utilities/check.hpp"
 #include "numerics/fft/fft_define.hpp"
 #include "numerics/fft/fftw.h"
@@ -29,6 +30,23 @@ namespace math::fft::impl::host
 
 // Note: right now this assumes alignment to 16 Bytes in order to use advanced execute interface, should I check?
 //int fftw_alignment_of(double *p);
+
+// T-3b item 3.3: see the doc comment in fftw.h. One-shot; `nthreads <= 1` leaves the
+// serial planner in place, which is what every pre-T-3b input file gets.
+void init_threads(long nthreads)
+{
+  static bool done = false;
+  if (done) return;
+  done = true;
+  if (nthreads <= 1) return;
+  if (fftw_init_threads() == 0) {
+    app_warning("omp_threads = {} was requested but fftw_init_threads() failed; FFTs stay "
+                "single-threaded.", nthreads);
+    return;
+  }
+  fftw_plan_with_nthreads(static_cast<int>(nthreads));
+  app_log(2, "  FFTW planner thread count set to {} (from omp_threads).", nthreads);
+}
 
 fftplan_t create_plan_many_impl_(int rank, const int *n, int howmany,
                              ComplexType *in, const int *inembed,
