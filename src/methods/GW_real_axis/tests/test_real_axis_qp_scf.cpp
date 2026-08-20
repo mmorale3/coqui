@@ -383,15 +383,25 @@ namespace bdft_tests {
       app_log(1, "  cross-val: HOMO diff = {:+.4f} Ha, LUMO diff = {:+.4f} Ha",
               e_h_qp - e_h_imag_ref, e_l_qp - e_l_imag_ref);
     }
-    // LUMO QP energy cross-validates against imag-axis Pade-AC reference
-    // to ~0.05 Ha (this fixture: alpha=8 with eta=0.05; reference: alpha=24).
-    REQUIRE(std::abs(e_l_qp - e_l_imag_ref) < 0.10);
-    // HOMO is currently OFF by ~0.4 Ha. Investigation pending: the real-
-    // axis Re Sigma_c at deep occupied frequencies (w_rel < -0.5 Ha) may
-    // differ from imag-axis Pade extrapolation -- either Pade artifact in
-    // the extrapolation region (likely) or a systematic real-axis kernel
-    // issue at large negative omega (possible). Flag and investigate
-    // separately. For now we assert finiteness + ordering only on HOMO.
+    // RE-PINNED ON THE GAP (2026-08-20, notes/real_axis_refs_audit.md
+    // section 8.6). This case does not subtract V_xc^KS from sH_0 (see the
+    // sibling case's comment), so BOTH absolute QP levels carry a common
+    // double-counted-V_xc shift and neither is individually comparable to
+    // the imag-axis reference. The old per-LUMO assertion
+    //     REQUIRE(|e_l_qp - e_l_imag_ref| < 0.10)
+    // was satisfied by an ACCIDENT of that shift on the pre-fix chain: the
+    // same build had the HOMO 0.496 Ha off, the gap 0.509 Ha off, and the
+    // QP gap-OPENING with the wrong sign (G0W0 closing an insulator's gap
+    // by 0.161 Ha where the reference opens it by 0.348 Ha). The gap
+    // cancels the common shift and is the physical quantity: with the
+    // five Pi/W/Sigma fixes the gap error is 0.065 Ha (opening +0.283 Ha,
+    // right sign, 81% of the reference), measured in the audit note.
+    // Same 0.10 Ha tolerance as before -- moved to the meaningful
+    // quantity, not loosened.
+    const double gap_qp  = e_l_qp - e_h_qp;
+    const double gap_ref = e_l_imag_ref - e_h_imag_ref;
+    REQUIRE(std::abs(gap_qp - gap_ref) < 0.10);
+    REQUIRE(gap_qp - (e_l_ks - e_h_ks) > 0.0);   // G0W0 must OPEN the KS gap
     REQUIRE(std::isfinite(e_h_qp));
     REQUIRE(e_h_qp < e_l_qp);
   }
