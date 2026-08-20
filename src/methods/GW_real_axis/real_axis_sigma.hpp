@@ -147,13 +147,24 @@ inline void accumulate_ImSigma_one_kq_nufft(
   memory::array<MEM, ComplexType, 2> F1(B, N_w), G1(B, N_w);
   memory::array<MEM, ComplexType, 2> F2(B, N_w), G2(B, N_w);
 
+  // ==================================================================
+  // FIX (2026-08-20, notes/real_axis_refs_audit.md defect #4' / RW-1 D-3).
+  // grid.w() is RELATIVE to mu_chem (real_freq_grid.hpp:43-44) while
+  // real_freq_grid_t::fermi(w) subtracts mu_chem AGAIN internally, so
+  // grid.fermi(w(j)) evaluated the occupation at w_abs - 2*mu: the Fermi
+  // edge was displaced by a full mu. The occupation must be evaluated at
+  // the ABSOLUTE energy, so pass w + mu_chem. The Bose factors are left
+  // untouched: their argument is a TRANSFER frequency, which is
+  // mu-independent. Same defect and fix as real_axis_pi.hpp.
+  // ==================================================================
+  const double mu_abs_sig = grid.mu_chem();
   if constexpr (MEM == HOST_MEMORY) {
     for (long P = 0; P < Naux_P; ++P)
       for (long Q = 0; Q < Naux_Q; ++Q) {
         const long b = P * Naux_Q + Q;
         for (long iw = 0; iw < N_w; ++iw) {
           const double w_l = grid.w()(iw);
-          const double f_w = grid.fermi(w_l);
+          const double f_w = grid.fermi(w_l + mu_abs_sig);   // FIX #4': absolute energy
           const double q_j = wq_h(iw);
           F1(b, iw) = q_j * f_w * A_PQ_kmq(P, Q, iw);
           G1(b, iw) = q_j * B_PQ_w(P, Q, iw);
@@ -170,7 +181,7 @@ inline void accumulate_ImSigma_one_kq_nufft(
       const double w_l = grid.w()(iw);
       const double q_j = wq_h(iw);
       wq_c_h(iw)  = ComplexType(q_j, 0.0);
-      wq_f_h(iw)  = ComplexType(q_j * grid.fermi(w_l), 0.0);
+      wq_f_h(iw)  = ComplexType(q_j * grid.fermi(w_l + mu_abs_sig), 0.0);   // FIX #4': absolute energy
       const double nB_w = (std::abs(w_l) > 1e-12) ? grid.bose(w_l) : 0.0;
       wq_nB_h(iw) = ComplexType(q_j * nB_w, 0.0);
     }
@@ -365,7 +376,10 @@ inline void accumulate_ImSigma_one_kq(detail::real_axis_conv_base_t<MEM> & conv,
           const double O   = w_l - e_j;
           const ComplexType Bv = B_at(P, Q, O);
           if (Bv == ComplexType(0.0, 0.0)) continue;
-          const double f_e = grid.fermi(e_j);
+          // FIX #4' (notes/real_axis_refs_audit.md): absolute energy into the
+          // occupation; e_j is mu-relative and fermi() subtracts mu again.
+          // O = w_l - e_j is a transfer frequency: mu-free, bose(O) untouched.
+          const double f_e = grid.fermi(e_j + grid.mu_chem());
           double nB_O;
           if (std::abs(O) < 1e-12) {
             // n_B * B is finite as Omega->0 (n_B ~ 1/(beta Omega), B ~ b1*Omega).
@@ -427,12 +441,29 @@ inline void ReSigma_from_ImSigma_aux(detail::real_axis_conv_base_t<MEM> & conv,
 
   conv.hilbert(ImBuf, ReBuf, grid_kind::fermionic);
 
+  // ==================================================================
+  // FIX #3' (2026-08-20, notes/real_axis_refs_audit.md defect #3, Sigma
+  // side). conv.hilbert returns the NEGATIVE of the retarded KK integral
+  // its docstring states: its kernel is prebuilt as +i*sgn(t)
+  // (real_axis_conv.hpp:147-150) with a final +dt/(2pi) scale, i.e. the
+  // ADVANCED convention (the branch's own lorentzian test pins exactly
+  // that pair). The stored Im Sigma carries the retarded sign
+  // (Im Sigma^R <= 0, the -pi prefactor at s_sig), so the retarded
+  // Re Sigma is MINUS what hilbert returns. The negation is applied at
+  // this call site; conv.hilbert itself is deliberately untouched so the
+  // lorentzian test and every other consumer stay bit-identical --
+  // real_axis_pi.hpp's bosonic transform carries its own rebuilt KK with
+  // the same sign convention (its FIX block), so the two occurrences of
+  // this defect are corrected TOGETHER. Fixing only one of them would
+  // break the partial cancellation documented in the audit's section 4.3
+  // and be worse than fixing neither.
+  // ==================================================================
   if constexpr (MEM == HOST_MEMORY) {
     for (long P = 0; P < Naux_P; ++P)
       for (long Q = 0; Q < Naux_Q; ++Q) {
         const long b = P * Naux_Q + Q;
         for (long l = 0; l < N_w; ++l)
-          ReSigma_PQ_w(P, Q, l) = ComplexType(ReBuf(b, l), 0.0);
+          ReSigma_PQ_w(P, Q, l) = ComplexType(-ReBuf(b, l), 0.0);   // FIX #3': retarded sign
       }
   } else {
     // Device: real -> complex lift via to_real_view: zero the destination
@@ -444,6 +475,8 @@ inline void ReSigma_from_ImSigma_aux(detail::real_axis_conv_base_t<MEM> & conv,
                                  std::array<long,3>{Naux_P, Naux_Q, N_w});
     Re_complex_as_real(nda::range::all, nda::range::all,
                        nda::range::all, 0) = ReBuf_3D;
+    // FIX #3' on the device path, via the file's established tensor idiom.
+    nda::tensor::scale(ComplexType(-1.0, 0.0), ReSigma_PQ_w);
   }
 }
 

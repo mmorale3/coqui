@@ -506,6 +506,34 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
   // Step 2 distribution model: each rank works on its local (P_loc, Q_loc)
   // slice for ALL (s, k, q). The (P, Q) partitioning replaces the previous
   // (s, k, q) partitioning + allreduce. No comm in Step 2.
+  //
+  // ================================================================
+  // RW-1 DEVIATION FROM origin/real_axis (notes/rw1_port_report.md).
+  //
+  // SPIN DEGENERACY. accumulate_ImPi_one_kq computes the PER-SPIN bubble,
+  // and the loops below sum it over the s axis. For a spin-polarized run
+  // (ns == 2) that sum is the whole polarization; for a closed-shell run
+  // (ns == 1) the single stored channel stands for BOTH spins and must be
+  // counted twice. The branch has no such factor anywhere in
+  // src/methods/GW_real_axis/ (verified by grep over every file of the
+  // module at 711af68), so on every ns == 1 fixture its Pi -- and hence
+  // its W, its eps_inf, and its Sigma_c -- is a factor of two too small.
+  //
+  // This is exactly the imaginary-axis convention
+  //     methods/scr_coulomb/rpa_pi.icc:46   sp_factor = (ns == 2)? -1 : -2
+  //     methods/scr_coulomb/rpa_pi.icc:312  factor    = (ns == 2)? -1/nk : -2/nk
+  // (the -1 there is the fermion-loop sign, carried on the real axis by the
+  // -pi prefactor in real_axis_pi.hpp).
+  //
+  // MEASURED, gate RW-1-a on qe_lih222 (ns = 1): with the branch's weight
+  // the forward-mapped real-axis Pi(i nu = 0) equals the production
+  // Matsubara Pi times 0.4825 / 0.4929 / 0.5072 for eta = 0.05 / 0.025 /
+  // 0.0125 Ha -- i.e. exactly 1/2 in the eta -> 0 limit, with the correct
+  // sign and BZ weight. With the factor below the same series reads
+  // 0.965 / 0.986 / 0.999.
+  // ================================================================
+  const double ns_factor = (ns == 2) ? 1.0 : 2.0;
+
   double dt2_alloc = 0.0, dt2_ftR = 0.0, dt2_kernel = 0.0, dt2_ftq = 0.0;
   if (do_rspace) {
     // P0 (memory-redesign): per-R streaming. The previous version allocated
@@ -562,7 +590,7 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
         // (b) per-R Pi kernel; accumulates over s.
         auto t2c = t_now();
         accumulate_ImPi_one_kq<MEM>(conv, A_aux_one_R, A_aux_one_R,
-                                     ImPi_one_R, 1.0);
+                                     ImPi_one_R, ns_factor);   // RW-1: spin degeneracy
         dt2_kernel += sec_since(t2c);
       }
 
@@ -613,7 +641,7 @@ void real_axis_scr_coulomb_base_t<MEM>::update_w(
                  "real_axis_scr_coulomb_t::update_w: k-space Pi branch only "
                  "supports IBZ == FBZ (got Nk={}, Nq_ibz={}, Nq={})",
                  Nk, Nq_ibz, Nq);
-    const double k_weight = 1.0 / static_cast<double>(Nk);
+    const double k_weight = ns_factor / static_cast<double>(Nk);  // RW-1: spin degeneracy
     for (long iq = 0; iq < Nq_ibz; ++iq) {
       if (iq == iq_gamma) continue;
       auto ImPi_q_view = ImPi_loc(iq, _, _, _);

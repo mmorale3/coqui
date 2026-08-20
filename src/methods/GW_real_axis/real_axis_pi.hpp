@@ -91,6 +91,31 @@ inline void accumulate_ImPi_one_kq(detail::real_axis_conv_base_t<MEM> & conv,
   auto const& w    = grid.w();
   auto const& wq_h = grid.w_weights();
 
+  // ==================================================================
+  // RW-1 DEVIATION FROM origin/real_axis (notes/rw1_port_report.md).
+  //
+  // FERMI FACTOR ENERGY ARGUMENT. real_freq_grid_t::w() is RELATIVE to the
+  // chemical potential -- "Fermionic w_j: full window [-w_max, +w_max],
+  // relative to mu (absolute omega = w + mu_chem)" (real_freq_grid.hpp:
+  // 43-44, 109), which is how every other consumer reads it (e.g. the
+  // QP-pole spectral function: w_abs = grid.w()(iw) + grid.mu_chem(),
+  // real_axis_qp_scf_driver.hpp:263). But real_freq_grid_t::fermi(w)
+  // subtracts mu_chem ITSELF:
+  //     fermi(w, mu, beta) = 1/(exp(beta*(w - mu)) + 1)   (:396-403)
+  // so the branch's  grid.fermi(w(j))  evaluates the occupation at
+  // w_abs - 2*mu_chem: the Fermi edge is displaced by a full mu.
+  //
+  // (The same file's other call site, real_axis_div_utils.hpp:368, passes
+  // grid.fermi(wp - mu), which is displaced differently again -- the two
+  // are mutually inconsistent, so at most one of them can be right. That
+  // routine is dead code in the RW-1 slice, so it is left as the branch
+  // has it and only FLAGGED here.)
+  //
+  // Passing the absolute energy is the only reading under which the
+  // occupation of a band at eigenvalue eps flips exactly at eps = mu.
+  // ==================================================================
+  const double mu_abs = grid.mu_chem();
+
   const long B   = Naux_P * Naux_Q;
   const long N_t = conv.N_t();
 
@@ -112,7 +137,7 @@ inline void accumulate_ImPi_one_kq(detail::real_axis_conv_base_t<MEM> & conv,
       for (long iQ = 0; iQ < Naux_Q; ++iQ) {
         const long b = iP * Naux_Q + iQ;
         for (long j = 0; j < N_w; ++j) {
-          const double f_w  = grid.fermi(w(j));
+          const double f_w  = grid.fermi(w(j) + mu_abs);   // RW-1: absolute energy
           const double fb_w = 1.0 - f_w;
           const double q_j  = wq_h(j);
           Aless_k (b, j) = f_w  * q_j * A_PQ_k (iP, iQ, j);
@@ -130,7 +155,7 @@ inline void accumulate_ImPi_one_kq(detail::real_axis_conv_base_t<MEM> & conv,
     // we can do the broadcast multiply via cuTENSOR.
     nda::array<ComplexType, 1> f_wq_h(N_w), fb_wq_h(N_w);
     for (long j = 0; j < N_w; ++j) {
-      const double f_w  = grid.fermi(w(j));
+      const double f_w  = grid.fermi(w(j) + mu_abs);   // RW-1: absolute energy
       const double fb_w = 1.0 - f_w;
       const double q_j  = wq_h(j);
       f_wq_h(j)  = ComplexType(f_w  * q_j, 0.0);
@@ -261,11 +286,91 @@ inline void RePi_from_ImPi(detail::real_axis_conv_base_t<MEM> & conv,
   auto RePi_2D = nda::reshape(RePi_PQ_O,
                               std::array<long,2>{B, N_O});
 
-  // hilbert takes mutable rarray<2> by reference. Stage through scratch.
-  memory::array<MEM, double, 2> ImBuf(B, N_O), ReBuf(B, N_O);
-  ImBuf = ImPi_2D;
-  conv.hilbert(ImBuf, ReBuf, grid_kind::bosonic);
-  RePi_2D = ReBuf;
+  // ==================================================================
+  // RW-1 DEVIATION FROM origin/real_axis (notes/rw1_port_report.md).
+  //
+  // The branch calls   conv.hilbert(ImBuf, ReBuf, grid_kind::bosonic)
+  // here. That routine is WRONG FOR A BOSONIC QUANTITY on two counts,
+  // and the two compound into a clean factor of -1/2 that the RW-1 gate
+  // measures directly (the Re Pi probe in test_real_axis_w_lehmann.cpp;
+  // qe_lih222, <RePi_code(Omega_1)/KK_full(0)> = -0.477 / -0.506 / -0.512
+  // for eta = 0.05 / 0.025 / 0.0125 Ha, i.e. -1/2 as eta -> 0).
+  //
+  // (1) HALF AXIS. conv.hilbert integrates over the grid points it is
+  //     given. The bosonic grid is the POSITIVE half axis by construction
+  //     (real_freq_grid.hpp:81-85 rejects Omega <= 0) and Im Pi is ODD, so
+  //     the Omega' < 0 image contributes an equal amount that is dropped.
+  //     Correct:
+  //       Re Pi(Om) = (1/pi) PV int_{-inf}^{inf} dOm' Im Pi(Om')/(Om'-Om)
+  //                 = (2/pi) PV int_0^inf dOm' Om' Im Pi(Om')/(Om'^2-Om^2)
+  //     Half-axis-only loses exactly a factor 2 at Om = 0.
+  //
+  // (2) SIGN. conv.hilbert's docstring states
+  //       Re X(w) = (1/pi) PV int dw' Im X(w') / (w' - w)
+  //     but the implementation is the NEGATIVE of that: the kernel is
+  //     prebuilt as +i*sgn(t_k) (real_axis_conv.hpp:147-150) and the final
+  //     scale is +dt/(2pi) (:430), while the stated identity carries a
+  //     leading minus. The branch's own fermionic test pins the
+  //     IMPLEMENTATION, not the docstring: real_axis_conv_lorentzian_hilbert
+  //     feeds Im X = +gamma/((w-x0)^2+gamma^2) and expects
+  //     Re X = +(w-x0)/(...), which is the KK pair of the ADVANCED function
+  //     1/(w-x0-i*gamma), not of the retarded one. Consequence on the branch:
+  //     the Pi handed to the Dyson step is not a causal response function --
+  //     its Re and Im parts are not a Kramers-Kronig pair.
+  //
+  // conv.hilbert itself is LEFT UNTOUCHED so the fermionic path and the
+  // branch's conv tests stay bit-identical; the corrected bosonic transform
+  // is rebuilt here from the same public NUFFT primitives:
+  //
+  //   F(t)      = sum_j wq_j Im Pi(Om_j) exp(+i Om_j t)      (type 1)
+  //   F_odd(t)  = F(t) - conj(F(t)) = 2i Im F(t)             (the Om<0 image)
+  //   Re Pi(Om) = (dt/2pi) Re sum_k 2 sgn(t_k) Im F(t_k) exp(-i Om t_k)
+  //                                                          (type 2)
+  //
+  // (the -i sgn(t) kernel of the correct identity times the 2i of the odd
+  // extension leaves the real weight 2 sgn(t)).
+  //
+  // MEM != HOST_MEMORY routes through a host copy: RW-1 is host-only by
+  // ruling, and this keeps the device build compiling without a device on
+  // which to validate a fused kernel.
+  // ==================================================================
+  const long N_t_ = conv.N_t();
+  auto const& grid_ = conv.grid();
+  auto const& Om_wq = grid_.Omega_weights();
+  auto const& t_k   = grid_.t();
+
+  memory::array<MEM, ComplexType, 2> C(B, N_O), F(B, N_t_), H(B, N_t_), R(B, N_O);
+  {
+    nda::array<double, 2> Im_h(B, N_O);
+    Im_h = nda::array<double, 2>(memory::to_memory_space<HOST_MEMORY>(ImPi_2D));
+    nda::array<ComplexType, 2> C_h(B, N_O);
+    for (long b = 0; b < B; ++b)
+      for (long j = 0; j < N_O; ++j)
+        C_h(b, j) = ComplexType(Im_h(b, j) * Om_wq(j), 0.0);
+    C = memory::to_memory_space<MEM>(C_h);
+  }
+  conv.forward(C, F, grid_kind::bosonic);
+  {
+    nda::array<ComplexType, 2> F_h(B, N_t_), H_h(B, N_t_);
+    F_h = nda::array<ComplexType, 2>(memory::to_memory_space<HOST_MEMORY>(F));
+    for (long k = 0; k < N_t_; ++k) {
+      const double sg = (t_k(k) > 0.0) ? 2.0 : ((t_k(k) < 0.0) ? -2.0 : 0.0);
+      for (long b = 0; b < B; ++b)
+        H_h(b, k) = ComplexType(sg * F_h(b, k).imag(), 0.0);
+    }
+    H = memory::to_memory_space<MEM>(H_h);
+  }
+  conv.backward(H, R, grid_kind::bosonic);
+  {
+    const double s = grid_.dt() / (2.0 * M_PI);
+    nda::array<ComplexType, 2> R_h(B, N_O);
+    R_h = nda::array<ComplexType, 2>(memory::to_memory_space<HOST_MEMORY>(R));
+    nda::array<double, 2> Re_h(B, N_O);
+    for (long b = 0; b < B; ++b)
+      for (long j = 0; j < N_O; ++j)
+        Re_h(b, j) = s * R_h(b, j).real();
+    RePi_2D = memory::to_memory_space<MEM>(Re_h);
+  }
 }
 
 } // namespace real_axis
