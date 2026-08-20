@@ -104,6 +104,15 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 option(ENABLE_ROCM " Build device code with ROCM backend" OFF)
 option(ENABLE_OPENMP " Build device code with OPENMP backend" OFF)
 option(ENABLE_FFTW "Build using FFTW3 library." ON)
+# RW-1 (notes/rw_real_axis_w_spec.md "Build ruling"): DELIBERATE DEVIATION from
+# origin/real_axis, where this option defaults ON. cmake/finufft.cmake pulls FINUFFT
+# with FetchContent at CONFIGURE time, i.e. it needs the network. Rusty compute nodes
+# configure without network and the production trees (coqui_scgwt / coqui_prof /
+# coqui_thread) must not grow a silent network dependency. RW builds turn it ON
+# explicitly; with it OFF the real-axis module and every finufft target vanish from
+# the build and the tree behaves exactly as it did pre-RW (gate RW-1-c).
+option(ENABLE_FINUFFT "Enable FINUFFT non-uniform FFT backend" OFF)
+option(ENABLE_CUFINUFFT "Enable cuFINUFFT (GPU NUFFT) backend. Requires CUDA + ENABLE_FINUFFT." OFF)
 option(ENABLE_HEFFTE "Build using heFFTe library." OFF)
 option(ENABLE_SLATE "Build using Slate library." ON)
 option(ENABLE_CUTENSOR "Build using cutensor library. Must set CUTENSOR_ROOT" OFF)
@@ -645,6 +654,30 @@ if(ENABLE_WANNIER90)
     target_include_directories(Wannier90_lib PRIVATE "${GFORTRAN_INCLUDE_DIR}")
     add_compile_definitions(ENABLE_WANNIER90)
 endif(ENABLE_WANNIER90)
+
+######################################################################
+# FINUFFT: Flatiron Institute NUFFT library
+######################################################################
+if(ENABLE_FINUFFT)
+  include(${CMAKE_SOURCE_DIR}/cmake/finufft.cmake)
+  add_compile_definitions(ENABLE_FINUFFT)
+endif()
+
+# cuFINUFFT (GPU NUFFT) -- enables the device-side dispatch in
+# numerics/fft/cufinufft.cpp. The CUDA target is built by the same FINUFFT
+# FetchContent superbuild via FINUFFT_USE_CUDA, so ENABLE_CUFINUFFT requires
+# ENABLE_FINUFFT to be on.
+if(ENABLE_CUFINUFFT)
+  if(NOT ENABLE_FINUFFT)
+    message(FATAL_ERROR
+      "ENABLE_CUFINUFFT requires ENABLE_FINUFFT=ON (cuFINUFFT is built as "
+      "part of the FINUFFT superbuild via FINUFFT_USE_CUDA).")
+  endif()
+  add_compile_definitions(COQUI_HAVE_CUFINUFFT)
+  message(STATUS "cuFINUFFT: enabled (defined COQUI_HAVE_CUFINUFFT). "
+                 "Ensure CUDA is available and FINUFFT_USE_CUDA was set in "
+                 "the FetchContent flow (see cmake/finufft.cmake).")
+endif()
 
 ######################################################################
 # cppdlr: Discrete Lehmann Representation backend (optional)

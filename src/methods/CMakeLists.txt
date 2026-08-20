@@ -12,6 +12,11 @@ add_subdirectory(GF2)
 add_subdirectory(embedding)
 add_subdirectory(SCF)
 add_subdirectory(pproc)
+# RW-1 (notes/rw_real_axis_w_spec.md): the P(omega)/W(omega) leaf slice ported from
+# origin/real_axis. Header-only -- no library target -- and it only exists when
+# ENABLE_FINUFFT is ON (its own CMakeLists returns early otherwise), so with the flag
+# OFF (the default in this tree) nothing here changes the build at all.
+add_subdirectory(GW_real_axis)
 add_subdirectory(tests)
 
 SET(SRCS

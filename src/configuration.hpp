@@ -23,6 +23,7 @@
 #define COQUI_TOP_CONFIGURATION_HPP
 
 #include<complex>
+#include<cstdlib>
 #include "config.h"
 
 #include "nda/nda.hpp"
@@ -157,9 +158,108 @@ auto to_memory_space(auto &&A)
   } else if constexpr (MEM==UNIFIED_MEMORY) {
     return nda::to_unified(A);
   } else {
-    return to_memory_space<DEFAULT_MEMORY_SPACE>(A); 
+    return to_memory_space<DEFAULT_MEMORY_SPACE>(A);
   }
 }
+
+// =====================================================================
+// Buffered arrays — backed by a static-fallback dynamic-bucket allocator
+// for cheap reuse across hot-loop scratch allocations.
+// =====================================================================
+namespace detail
+{
+
+  template<MEMORY_SPACE MEM>
+  using static_allocator_t = nda::mem::static_fallback<nda::mem::dynamic_bucket<to_nda_address_space(MEM)>>;
+
+  template<MEMORY_SPACE MEM>
+  using buffered_handle_t = nda::heap_basic<static_allocator_t<MEM>>;
+
+}
+
+  template<typename T, int N, typename Layout = nda::C_layout>
+  using host_buffered_array = nda::array<T,N,Layout,detail::buffered_handle_t<HOST_MEMORY>>;
+
+#if defined(ENABLE_DEVICE)
+
+  template<typename T, int N, typename Layout = nda::C_layout>
+  using device_buffered_array = nda::array<T,N,Layout,detail::buffered_handle_t<DEVICE_MEMORY>>;
+
+  template<typename T, int N, typename Layout = nda::C_layout>
+  using unified_buffered_array = nda::array<T,N,Layout,detail::buffered_handle_t<UNIFIED_MEMORY>>;
+
+  template<typename T, int N, typename Layout = nda::C_layout>
+  using default_buffered_array = device_buffered_array<T,N,Layout>;
+
+#else
+
+  template<typename T, int N, typename Layout = nda::C_layout>
+  using device_buffered_array = host_buffered_array<T,N,Layout>;
+
+  template<typename T, int N, typename Layout = nda::C_layout>
+  using unified_buffered_array = host_buffered_array<T,N,Layout>;
+
+  template<typename T, int N, typename Layout = nda::C_layout>
+  using default_buffered_array = host_buffered_array<T,N,Layout>;
+
+#endif
+
+  template<MEMORY_SPACE MEM, typename T, int N, typename Layout = nda::C_layout>
+  using buffered_array = std::conditional_t<MEM==HOST_MEMORY,    host_buffered_array<T,N,Layout>,
+                         std::conditional_t<MEM==DEVICE_MEMORY,  device_buffered_array<T,N,Layout>,
+                         std::conditional_t<MEM==UNIFIED_MEMORY, unified_buffered_array<T,N,Layout>,
+                                                                 default_buffered_array<T,N,Layout>>>>;
+
+// =====================================================================
+// to_real_view: reinterpret a complex nda array as a (rank+1)-d real
+// array view, with the new innermost dimension = 2 (real, imag).
+// Trivial pass-through for real-valued inputs. Required by the cusparse
+// interface for complex×real mixed CSR multiplies.
+// =====================================================================
+template<nda::MemoryArray A_t>
+auto to_real_view(A_t && a) {
+  using A = std::decay_t<A_t>;
+  using value_type = typename A::value_type;
+  using real_t = nda::remove_complex_t<value_type>;
+  constexpr int rank = nda::get_rank<A>;
+  constexpr MEMORY_SPACE MEM = get_memory_space<A>();
+
+  if constexpr (nda::is_complex_v<value_type>) {
+    static_assert(A::is_stride_order_C() or A::is_stride_order_Fortran(),
+                  "to_real_view: stride order must be C or Fortran");
+    if (a.indexmap().min_stride() != 1) std::abort();  // to_real_view requires unit min_stride
+    if constexpr (A::is_stride_order_C()) {
+      std::array<long,rank+1> shape;
+      std::copy_n(a.shape().begin(), rank, shape.begin());
+      shape[rank] = 2;
+      std::array<long,rank+1> str;
+      std::transform(a.strides().begin(), a.strides().end(), str.begin(),
+                     [](auto const& x) { return 2*x; });
+      str[rank] = 1;
+      nda::idx_map<rank+1, 0, nda::C_stride_order<rank+1>, nda::layout_prop_e::none> idxm(shape, str);
+      if constexpr (std::is_const_v<std::remove_pointer_t<decltype(a.data())>>)
+        return memory::array_view<MEM, const real_t, rank+1>(idxm, reinterpret_cast<real_t const*>(a.data()));
+      else
+        return memory::array_view<MEM, real_t, rank+1>(idxm, reinterpret_cast<real_t*>(a.data()));
+    } else {
+      std::array<long,rank+1> shape;
+      std::copy_n(a.shape().begin(), rank, shape.begin()+1);
+      shape[0] = 2;
+      std::array<long,rank+1> str;
+      std::transform(a.strides().begin(), a.strides().end(), str.begin()+1,
+                     [](auto const& x) { return 2*x; });
+      str[0] = 1;
+      nda::idx_map<rank+1, 0, nda::Fortran_stride_order<rank+1>, nda::layout_prop_e::none> idxm(shape, str);
+      if constexpr (std::is_const_v<std::remove_pointer_t<decltype(a.data())>>)
+        return memory::array_view<MEM, const real_t, rank+1, nda::F_stride_layout>(idxm, reinterpret_cast<real_t const*>(a.data()));
+      else
+        return memory::array_view<MEM, real_t, rank+1, nda::F_stride_layout>(idxm, reinterpret_cast<real_t*>(a.data()));
+    }
+  } else {
+    return a();
+  }
+}
+
 
 }
 
