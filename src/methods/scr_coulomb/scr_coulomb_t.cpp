@@ -116,6 +116,24 @@ namespace solvers {
       utils::check(diff <= 1e-6, "scr_coulomb_t: IAFT grid is not compatible with particle-hole symmetry. {}, {}",
                    tau_mesh(it), tau_mesh(imt));
     }
+
+    // Pre-register every timer print_timers() reads: TimerManager::elapsed() aborts on an
+    // unregistered name, and these phases are conditional (EVALUATE_W only runs on the THC
+    // path, the IMAG_FT pair only when a transform is needed).
+    for (auto const &v : {"EVALUATE_PI", "DYSON_W", "EVALUATE_W",
+                          "IMAG_FT_TtoW", "IMAG_FT_WtoT", "FT_REDISTRIBUTE"})
+      _Timer.add(v);
+  }
+
+  void scr_coulomb_t::print_timers() {
+    app_log(2, "\n  SCREENED-COULOMB timers");
+    app_log(2, "  -----------------------");
+    app_log(2, "    Evaluate Pi (RPA + vertex): {0:.3f} sec", _Timer.elapsed("EVALUATE_PI"));
+    app_log(2, "    Dyson W:                    {0:.3f} sec", _Timer.elapsed("DYSON_W"));
+    app_log(2, "      - solve (1-Z.Pi)^-1:      {0:.3f} sec", _Timer.elapsed("EVALUATE_W"));
+    app_log(2, "    Imaginary FT tau->w:        {0:.3f} sec", _Timer.elapsed("IMAG_FT_TtoW"));
+    app_log(2, "    Imaginary FT w->tau:        {0:.3f} sec", _Timer.elapsed("IMAG_FT_WtoT"));
+    app_log(2, "      - FT_REDISTRIBUTE:        {0:.3f} sec\n", _Timer.elapsed("FT_REDISTRIBUTE"));
   }
 
   void scr_coulomb_t::update_w(MBState &mb_state, THC_ERI auto &thc, long h5_iter) {
@@ -201,12 +219,21 @@ namespace solvers {
     // to the readout below (the bosonic closure calls eval_Pi_qdep outside update_w, and
     // that row must not survive into a later iteration's readout).
     _pol_nu0_row.reset();
+    // T-1 item 2 (notes/coqui_threading_spec.md rev 2): this stage was the largest UNTIMED
+    // block in the code. T-0 could only bound it by subtraction -- 59% of wall on the LiF
+    // kp444 fixture, threading at ~1.42x, with no timer block of its own
+    // (notes/coqui_threading_t0.md section 2.1). Without these meters T-2's "no phase
+    // regresses at t=1" gate cannot be evaluated on the biggest phase in the run.
+    _Timer.start("EVALUATE_PI");
     auto dPi_tqPQ = eval_Pi_qdep(mb_state, thc);
+    _Timer.stop("EVALUATE_PI");
 
     // evaluate screened interaction (dW_tqPQ) and reset polarizability (dPi_tqPQ)
     // a) dPi_tqPQ is reset during dyson_W_from_Pi_tau()
     // b) pgrid and bsize of dW_tqPQ are forced to be the same as in dPi_tqPQ
+    _Timer.start("DYSON_W");
     auto dW_tqPQ = dyson_W_from_Pi_tau<false>(dPi_tqPQ, thc, true);
+    _Timer.stop("DYSON_W");
     // scGW-tilde C4 (div_treatment = "cvv"): the q -> 0 HEAD comes from the
     // covariant-velocity subtracted head (eval_cvv_eps_inv_head) INSTEAD of the
     // stored/gygi extrapolation; the q-RESOLVED eps_inv (diagnostics + dump) is
@@ -324,6 +351,8 @@ namespace solvers {
     if (_vertex != nullptr and _vertex->active() and _vertex->rung() == dynamic_rung
         and _vertex->secondary() and _vertex->w_cache_enabled())
       _vertex->cache_w(mb_state, thc);
+
+    print_timers();
   }
 
   // scGW-tilde C4: see the declaration in scr_coulomb_t.h for the contract. The

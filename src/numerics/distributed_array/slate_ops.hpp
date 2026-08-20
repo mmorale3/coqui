@@ -27,19 +27,84 @@
  */ 
 
 #include <functional>
+#include <cstdlib>       // getenv/atol: the OMP_NUM_THREADS thread-safety guard below
 
 #include "utilities/check.hpp"
 #include "nda/nda.hpp"
 #include "nda/tensor.hpp"
+#include "mpi3/environment.hpp"
 #include "numerics/distributed_array/ops.hpp"
 #include "numerics/distributed_array/detail/ops_aux.hpp"
 #include "numerics/distributed_array/detail/slate_aux.hpp"
 #if defined(ENABLE_SLATE)
 #include "slate/slate.hh"
-#endif 
+#endif
 
 namespace math::nda::slate_ops
 {
+
+/** ---------------------------------------------------------------------------------
+ *  SLATE THREAD-SAFETY GUARD  (notes/coqui_threading_spec.md rev 2, T-1 item 1)
+ *
+ *  SLATE's host paths run at its default Target::HostTask, so its OpenMP tasks issue
+ *  MPI calls directly (Tile::recv -> MPI_Wait, reached through listBcast). With
+ *  OMP_NUM_THREADS > 1 and MPI initialized below MPI_THREAD_MULTIPLE that is an
+ *  immediate SIGSEGV inside UCX: job 6890365 died 36 s in, on the THC/ISDF build path
+ *  (least_squares_solve, thc.icc:1621), and the only diagnostic was a wall of
+ *  "event_base_loop: reentrant invocation". Backtrace and attribution:
+ *  notes/coqui_threading_t0.md section 1.3.
+ *
+ *  Until now only the ladder carried a guard (vertex_ladder.icc); the THC path -- the
+ *  one that actually crashed -- was uncovered. The predicate lives here so every
+ *  slate_ops entry point shares ONE definition of "unsafe", and the ladder's own
+ *  richer message delegates to it rather than re-deriving it.
+ *
+ *  Scope of the hazard: every slate_ops entry point short-circuits to serial
+ *  LAPACK/BLAS when the operand's communicator has size 1, so only comm.size() > 1
+ *  can reach SLATE at all -- which is exactly what is tested here. The recommended
+ *  production recipe (OMP_NUM_THREADS=1 + blas_threads/MKL_NUM_THREADS=N) never trips
+ *  it: MKL's threading layer makes no MPI calls and SLATE's task layer stays serial.
+ * ---------------------------------------------------------------------------------- */
+namespace detail {
+
+/// OMP_NUM_THREADS as the OpenMP runtime will read it; 1 when unset or unparseable.
+inline long omp_threads_requested() {
+  static const long t = [] {
+    if (const char *e = std::getenv("OMP_NUM_THREADS")) {
+      const long v = std::atol(e);
+      if (v > 0) return v;
+    }
+    return 1L;
+  }();
+  return t;
+}
+
+/// True when SLATE's OpenMP task layer would issue concurrent MPI below MULTIPLE.
+inline bool slate_threading_unsafe(long comm_size) {
+  if (comm_size <= 1) return false;                // serial short-circuit: SLATE not entered
+  if (omp_threads_requested() <= 1) return false;   // task layer stays serial
+  return static_cast<int>(boost::mpi3::environment::thread_support())
+       < static_cast<int>(boost::mpi3::thread_level::multiple);
+}
+
+/// Loud abort in place of the UCX segfault. `op` names the slate_ops entry point.
+inline void slate_thread_guard(long comm_size, const char *op) {
+  if (not slate_threading_unsafe(comm_size)) return;
+  utils::check(false,
+               "slate_ops::{}: OMP_NUM_THREADS = {} on a {}-rank operand, with MPI "
+               "initialized below MPI_THREAD_MULTIPLE (provided level {}, required {}). "
+               "SLATE's OpenMP tasks issue concurrent MPI calls and WILL segfault inside "
+               "UCX (job 6890365). Fix, in order of preference: (1) run with "
+               "OMP_NUM_THREADS=1 and thread the BLAS layer instead -- set blas_threads "
+               "in the TOML (or MKL_NUM_THREADS in the environment), which needs no MPI "
+               "thread support at all; or (2) set COQUI_MPI_THREAD_MULTIPLE=1 to request "
+               "MPI_THREAD_MULTIPLE at init.",
+               op, omp_threads_requested(), comm_size,
+               static_cast<int>(boost::mpi3::environment::thread_support()),
+               static_cast<int>(boost::mpi3::thread_level::multiple));
+}
+
+} // namespace detail
 
 /***************************************************************************/
 /*  				Lapack	  				   */
@@ -52,6 +117,7 @@ void svd(A_t&& A, B_t&& U, std::vector<double> S, C_t&& VH)
   using dA_t = typename std::decay_t<A_t>;
   using dB_t = typename std::decay_t<B_t>;
   using dC_t = typename std::decay_t<C_t>;
+  detail::slate_thread_guard(A.communicator()->size(), "svd");
 #if defined(ENABLE_SLATE)
   static_assert(std::is_same_v<typename dA_t::value_type, typename dB_t::value_type>,
                                "Value mismatch");
@@ -74,6 +140,7 @@ void eig(A_t&& A, std::vector<double> L, B_t&& X)
 {
   using dA_t = typename std::decay_t<A_t>;
   using dB_t = typename std::decay_t<B_t>;
+  detail::slate_thread_guard(A.communicator()->size(), "eig");
 #if defined(ENABLE_SLATE)
   static_assert(std::is_same_v<typename dA_t::value_type, typename dB_t::value_type>,
                                "Value mismatch");
@@ -153,6 +220,7 @@ long lu_solve(DistributedMatrix auto&& A, DistributedMatrix auto&& B)
   constexpr bool _dev_ = ::nda::mem::have_device_compatible_addr_space<
 							 typename dA_t::Array_t,
                              typename dB_t::Array_t>;
+  detail::slate_thread_guard(A.communicator()->size(), "lu_solve");
 #if defined(ENABLE_SLATE)
 
   auto slate_lu = [&](auto &a, auto &b) {
@@ -287,6 +355,7 @@ long least_squares_solve(DistributedMatrix auto&& A, DistributedMatrix auto&& B)
 
   } // constexpr (not _dev_)
 
+  detail::slate_thread_guard(A.communicator()->size(), "least_squares_solve");
 #if defined(ENABLE_SLATE)
 
   auto slate_ls = [&](auto &a, auto &b) {
@@ -374,6 +443,7 @@ void inverse(DistributedMatrix auto&& A)
     return;
   }
 
+  detail::slate_thread_guard(A.communicator()->size(), "inverse");
 #if defined(ENABLE_SLATE)
 
   auto As = detail::to_slate_view<dA_t::is_stride_order_C()>(A);
@@ -424,6 +494,7 @@ auto determinant(DistributedMatrix auto&&A, std::vector<std::pair<long,long>> &d
     }
   }
 
+  detail::slate_thread_guard(A.communicator()->size(), "determinant");
 #if defined(ENABLE_SLATE)
   if constexpr (::nda::mem::on_host<local_Array_t>) {
     auto As = detail::to_slate_view<dA_t::is_stride_order_C()>(A);
@@ -477,6 +548,7 @@ void cholesky(DistributedMatrix auto&& A, char UPLO = "L")
     return;
   }
 
+  detail::slate_thread_guard(A.communicator()->size(), "cholesky");
 #if defined(ENABLE_SLATE)
 
   auto As = detail::to_slate_view<dA_t::is_stride_order_C()>(A);
@@ -541,6 +613,7 @@ auto multiply_impl(T a, A_t&& A, B_t&& B, T b, C_t&& C)
     return std::forward<C_t>(C);
   }
 
+  detail::slate_thread_guard(C.communicator()->size(), "multiply");
 #if defined(ENABLE_SLATE)
   // C is fixed
   auto As = detail::to_slate_view<dA_t::is_stride_order_C()>(A);

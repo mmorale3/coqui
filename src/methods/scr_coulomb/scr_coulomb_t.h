@@ -103,6 +103,18 @@ namespace solvers {
     void update_w(MBState &mb_state, Cholesky_ERI auto &chol, long h5_iter=-1);
 
     /**
+     * Report the screened-Coulomb phase walls.
+     *
+     * T-1 item 2 of notes/coqui_threading_spec.md (rev 2). This class owns the two
+     * heaviest phases in a qpGW run -- the RPA polarizability and the W Dyson solve --
+     * and until now printed neither, so they showed up only as the unexplained 59%
+     * remainder of "MBPT solvers" in the QP-SCF block (notes/coqui_threading_t0.md
+     * section 2.1). Timers are CUMULATIVE over iterations, matching the THC-GW and
+     * THC-Cholesky blocks.
+     */
+    void print_timers();
+
+    /**
      * Evaluate the screened interaction from a imaginary-time polarizability
      * @tparam w_out - true: output W(iw); false: output W(t)
      * @param dPi_tqPQ_pos - [INPUT] Polarization function with particle-hole symmetry

@@ -252,8 +252,66 @@ cmake_print_properties(TARGETS MPI::MPI_CXX PROPERTIES INTERFACE_LINK_LIBRARIES 
 ######################################################################
 #find_package(BLAS REQUIRED)
 #find_package(LAPACK REQUIRED)
-#cmake_print_properties(TARGETS BLAS::BLAS PROPERTIES INTERFACE_LINK_LIBRARIES) 
+#cmake_print_properties(TARGETS BLAS::BLAS PROPERTIES INTERFACE_LINK_LIBRARIES)
 #cmake_print_properties(TARGETS LAPACK::LAPACK PROPERTIES INTERFACE_LINK_LIBRARIES)
+
+######################################################################
+# MKL threading layer link order
+#   T-2 option (a) -- notes/coqui_threading_spec.md rev 2 section 3
+#
+# Because find_package(BLAS) is commented out just above, MKL enters the link ONLY through
+# the slate / blaspp / lapackpp imported targets -- and those were configured against
+# libmkl_sequential. ELF first-definition-wins then hands every MKL entry point to the
+# SEQUENTIAL layer, so MKL_NUM_THREADS (and the new `blas_threads` knob) are silently
+# inert. Verified on the production binary: DT_NEEDED listed mkl_sequential ahead of
+# mkl_gnu_thread (notes/coqui_threading_t0.md section 1.4), and the measured cost was a
+# 933 s -> 215 s solve left on the table.
+#
+# The only workaround so far was to LD_PRELOAD libmkl_gnu_thread at the application exec
+# (runs/ladder_prof/preload_wrap.sh) -- which poisons every non-CoQui process in the job
+# script and therefore cannot live in the harness shell. This puts the threading layer on
+# the link line AHEAD of the imported targets that drag in the sequential one, retiring
+# the preload for new builds.
+#
+# IT MUST BE A LINK *OPTION*, NOT A LINK LIBRARY. The obvious spelling --
+#   target_link_libraries(... "-Wl,--no-as-needed" <path> "-Wl,--as-needed")
+# -- does NOT work: CMake treats a full-path library as a reorderable/dedupable item and
+# hoists it to the END of the link line (verified on the generated link.txt: the two bare
+# -Wl flags stayed put at positions 53-54 while libmkl_gnu_thread.so was moved to 73,
+# still behind -lmkl_sequential at 62). Link OPTIONS are emitted verbatim, ahead of both
+# the objects and the whole library list, so passing the library THROUGH -Wl, makes it the
+# first shared-object input and therefore the first MKL entry in DT_NEEDED.
+#
+# --push-state/--no-as-needed ... --pop-state is required because the layer is placed
+# before anything that references an MKL symbol, so a default --as-needed linker would
+# drop it again; pop-state restores the previous setting so no other dependency changes.
+#
+# This is a NO-OP wherever MKL is not the BLAS in use -- the Mac dev tree links OpenBLAS,
+# finds nothing, and the interface target stays empty.
+######################################################################
+option(COQUI_MKL_THREADED_LINK
+       "Link MKL's GNU OpenMP threading layer ahead of the sequential layer" ON)
+add_library(coqui_blas_threading INTERFACE)
+if(COQUI_MKL_THREADED_LINK)
+  find_library(COQUI_MKL_GNU_THREAD
+               NAMES mkl_gnu_thread
+               HINTS $ENV{MKLROOT} ${MKLROOT} $ENV{MKL_ROOT} ${MKL_ROOT}
+               PATH_SUFFIXES lib lib/intel64 lib/intel64_lin
+                             latest/lib latest/lib/intel64)
+  if(COQUI_MKL_GNU_THREAD)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+      target_link_options(coqui_blas_threading INTERFACE
+        "-Wl,--push-state,--no-as-needed,${COQUI_MKL_GNU_THREAD},--pop-state")
+    else()
+      target_link_libraries(coqui_blas_threading INTERFACE ${COQUI_MKL_GNU_THREAD})
+    endif()
+    message(STATUS "MKL threading layer placed ahead of the sequential layer: ${COQUI_MKL_GNU_THREAD}")
+    message(STATUS "  -> MKL_NUM_THREADS / blas_threads are live WITHOUT preload_wrap.sh")
+  else()
+    message(STATUS "MKL threading layer not found (MKLROOT unset, or a non-MKL BLAS is in "
+                   "use): BLAS threading follows whatever slate/blaspp linked.")
+  endif()
+endif()
 
 ######################################################################
 # FFTW: not using MKL's FFTW yet, figure out how if requested 

@@ -20,6 +20,7 @@
 
 
 #include "chkpt_utils.h"
+#include "utilities/blas_threads.hpp"
 
 namespace methods {
   namespace chkpt {
@@ -57,6 +58,17 @@ void write_metadata(communicator_t &comm, const mf::MF &mf, const imag_axes_ft::
 
     auto mf_grp = grp.create_group("mean_field");
     nda::h5_write(mf_grp, "eigvals", mf.eigval(), false);
+
+    // T-2 option (c) (notes/coqui_threading_spec.md rev 2 section 3): the threading
+    // setting travels with the results, so a checkpoint is self-describing about how it
+    // was produced. This is the first run-parameter group in the checkpoint; the setting
+    // is read through the accessor rather than widened into write_metadata's signature,
+    // which would touch all five call sites for one scalar.
+    // blas_threads = 0 means "never requested" -- the library/environment default was in
+    // force, which is what every pre-T-2 checkpoint implicitly recorded.
+    auto run_grp = grp.create_group("run_parameters");
+    h5::h5_write(run_grp, "blas_threads", utils::blas_threads());
+    h5::h5_write(run_grp, "blas_threads_backend", utils::blas_threads_backend_name());
 
     auto iaft_grp = grp.create_group("imaginary_fourier_transform");
     std::string iaft_basis = imag_axes_ft::basis_enum_to_string(ft.basis());

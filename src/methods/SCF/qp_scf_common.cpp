@@ -1770,6 +1770,9 @@ void add_qpscf_vcorr(MBState &mb_state,
   auto [ns, nkpts, nbnd, nbnd2] = sHeff_skij.shape();
   auto nt = FT.nt_f();
 
+  auto &qpt = qp_stage_timer();   // T-1 item 2: instrument the previously untimed QP stage
+  qpt.start("QP_G_BUILD");
+
   mb_state.sSigma_tskij.emplace(make_shared_array<Array_view_5D_t>(*mpi, {nt, ns, nkpts, nbnd, nbnd}));
   mb_state.sG_tskij.emplace(make_shared_array<Array_view_5D_t>(*mpi, {nt, ns, nkpts, nbnd, nbnd}));
   if (sG_ext == nullptr) {
@@ -1794,17 +1797,23 @@ void add_qpscf_vcorr(MBState &mb_state,
     mpi->comm.barrier();
   }
   FT.check_leakage(mb_state.sG_tskij.value(), imag_axes_ft::fermion, "Green's function");
+  qpt.stop("QP_G_BUILD");
 
   // compute screen interaction
   utils::check(mb_solver.scr_eri!=nullptr, "add_qpscf_vcorr: mb_solver.scr_eri == nullptr.");
+  qpt.start("QP_SCR_COULOMB");
   mb_solver.scr_eri->update_w(mb_state, eri, mb_solver.corr->iter());
-  
+  qpt.stop("QP_SCR_COULOMB");
+
   // compute dynamic self-energy in the primary basis
+  qpt.start("QP_SIGMA");
   mb_solver.corr->evaluate(mb_state, eri);
   FT.check_leakage(mb_state.sSigma_tskij.value(), imag_axes_ft::fermion, "Self-energy");
+  qpt.stop("QP_SIGMA");
 
   // Project 2 increment QM3: build the mode-A evaluator context HERE -- this is the only
   // window in which mb_state.dW_qtPQ is alive (it is reset below).
+  qpt.start("QP_MAP");
   qp_modea::modea_ctx modea_ctx;
   build_modea_ctx_if_needed(modea_ctx, mb_state, mb_solver, eri, sMO_skia, sE_ska, mu, FT,
                             qp_params, false);
@@ -1816,12 +1825,15 @@ void add_qpscf_vcorr(MBState &mb_state,
                                modea_ctx.active ? std::addressof(modea_ctx) : nullptr);
   if (mpi->node_comm.root()) sHeff_skij.local() += sVcorr_skij.local();
   mpi->comm.barrier();
- 
+  qpt.stop("QP_MAP");
+
   // deallocation
   mb_state.dW_qtPQ.reset();
   mb_state.sG_tskij.reset();
   mb_state.sSigma_tskij.reset();
   mpi->comm.barrier();
+
+  print_qp_stage_timers();
 }
 
 

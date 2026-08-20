@@ -35,6 +35,7 @@
 #include "numerics/iter_scf/iter_scf_t.hpp"
 #include "numerics/shared_array/nda.hpp"
 #include "utilities/proc_grid_partition.hpp"
+#include "utilities/Timer.hpp"
 #include "hamiltonian/pseudo/pseudopot.h"
 
 namespace methods {
@@ -295,6 +296,38 @@ struct q6_lineshape_t {
   long n_states = 0;            // gap-window diagonals entering the aggregates
 };
 inline q6_lineshape_t &q6_lineshape() { static q6_lineshape_t x; return x; }
+
+/**
+ * Process-wide timers for the quasi-particle stage of a qpGW iteration.
+ *
+ * T-1 item 2 of notes/coqui_threading_spec.md (rev 2). add_qpscf_vcorr is a free function,
+ * so there is no object to hang a TimerManager on; this follows the q6_lineshape()
+ * accessor pattern directly above. The stage it covers -- the analytic-continuation /
+ * QP map -- was part of the 59% that T-0 could only measure by subtraction
+ * (notes/coqui_threading_t0.md section 2.1). Cumulative over iterations, like every other
+ * timer block in the code.
+ */
+inline utils::TimerManager &qp_stage_timer() {
+  static utils::TimerManager t = [] {
+    utils::TimerManager tm;
+    // Pre-register: TimerManager::elapsed() aborts on an unregistered name, and the
+    // Green's-function branch below is conditional on the caller.
+    for (auto const &v : {"QP_G_BUILD", "QP_SCR_COULOMB", "QP_SIGMA", "QP_MAP"}) tm.add(v);
+    return tm;
+  }();
+  return t;
+}
+
+/// Report the quasi-particle stage walls (see qp_stage_timer).
+inline void print_qp_stage_timers() {
+  auto &t = qp_stage_timer();
+  app_log(2, "\n  QP-STAGE timers");
+  app_log(2, "  ---------------");
+  app_log(2, "    Green's function build:  {0:.3f} sec", t.elapsed("QP_G_BUILD"));
+  app_log(2, "    Screened Coulomb (W):    {0:.3f} sec", t.elapsed("QP_SCR_COULOMB"));
+  app_log(2, "    Self-energy (Sigma):     {0:.3f} sec", t.elapsed("QP_SIGMA"));
+  app_log(2, "    QP map (AC / Pade):      {0:.3f} sec\n", t.elapsed("QP_MAP"));
+}
 
 /**
  * Given a dynamic self-energy, solve the quasi-particle equation and update sE_ska in-place

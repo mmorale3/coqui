@@ -1131,11 +1131,12 @@ namespace solvers {
      *  initialized at MPI_THREAD_MULTIPLE (measured, results 2.9.6). t = 1 is safe at any
      *  level (measured, 2.9.7), so the abort is conditional on the thread count. */
     inline void ladder_slate_thread_guard(long g, const char *tag) {
-      long omp_t = 1;
-      if (const char *e = std::getenv("OMP_NUM_THREADS")) {
-        const long v = std::atol(e);
-        if (v > 0) omp_t = v;
-      }
+      // T-1 (notes/coqui_threading_spec.md rev 2): the "is this unsafe?" predicate now has
+      // ONE definition, math::nda::slate_ops::detail::, shared with the generic guard that
+      // covers every other slate_ops call site (the THC path that actually crashed in job
+      // 6890365 was uncovered while only this one existed). The ladder keeps its own
+      // message because it can name ladder_solve_grid and the offending path.
+      const long omp_t = math::nda::slate_ops::detail::omp_threads_requested();
       const int provided = static_cast<int>(boost::mpi3::environment::thread_support());
       const int need = static_cast<int>(boost::mpi3::thread_level::multiple);
       utils::check(omp_t <= 1 or provided >= need,
