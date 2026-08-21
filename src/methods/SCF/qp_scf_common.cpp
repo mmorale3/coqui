@@ -19,6 +19,7 @@
  */
 
 
+#include <cstdlib>
 #include <algorithm>
 #include <functional>
 #include <utility>
@@ -87,6 +88,9 @@ namespace {
     opts.eta_far = qp_params.qp_modea_eta_far;
     opts.wsupp = qp_params.qp_modea_wsupp;
     opts.wfit = qp_params.qp_modea_wfit;
+    opts.spectral_eta = qp_params.qp_modea_spectral_eta;
+    opts.spectral_npole = qp_params.qp_modea_spectral_npole;
+    opts.spectral_gamma = qp_params.qp_modea_spectral_gamma;
     opts.wrtol = qp_params.qp_modea_wrtol;
     opts.wrank = qp_params.qp_modea_wrank;
     opts.wsketch = qp_params.qp_modea_wsketch;
@@ -100,8 +104,21 @@ namespace {
     utils::check(opts.route == "cd" or opts.route == "expansion",
                  "qp_modea: unknown qp_modea_route = {}. Valid: \"cd\", \"expansion\".",
                  opts.route);
-    utils::check(opts.wfit == "tau" or opts.wfit == "nu",
-                 "qp_modea: unknown qp_modea_wfit = {}. Valid: \"tau\", \"nu\".", opts.wfit);
+    utils::check(opts.wfit == "tau" or opts.wfit == "nu" or opts.wfit == "spectral",
+                 "qp_modea: unknown qp_modea_wfit = {}. Valid: \"tau\", \"nu\", \"spectral\".",
+                 opts.wfit);
+#ifndef ENABLE_FINUFFT
+    utils::check(opts.wfit != "spectral",
+                 "qp_modea: qp_modea_wfit = \"spectral\" (the RW-2 spectral-quadrature W^c "
+                 "representation) needs the real-axis W chain, which is only compiled with "
+                 "-DENABLE_FINUFFT=ON. This binary was built without it. Rebuild with the "
+                 "flag, or use qp_modea_wfit = \"tau\" / \"nu\".");
+#endif
+    utils::check(opts.spectral_eta > 0.0,
+                 "qp_modea: qp_modea_spectral_eta = {} must be > 0.", opts.spectral_eta);
+    utils::check(opts.spectral_gamma == "ls" or opts.spectral_gamma == "spectral",
+                 "qp_modea: unknown qp_modea_spectral_gamma = {}. Valid: \"ls\", "
+                 "\"spectral\".", opts.spectral_gamma);
     utils::check(opts.eta_far >= 0.0,
                  "qp_modea: qp_modea_eta_far = {} must be >= 0 (0 = the rev-3.1 mu fallback).",
                  opts.eta_far);
@@ -324,6 +341,77 @@ namespace {
                                           "{:>12.4e} {:>12.4e} {:>10.3g}{}",
                   is, ik, i, er * HA2EV, d, cl, ratio,
                   hit ? (eta_far > 0.0 ? "  * eta_far" : "  * clamped") : "");
+        }
+      }
+
+      // ---- THE CANCELLATION METER (RW-2, notes/rw_real_axis_w_spec.md gate RW-2-c(i)) ---
+      // Promoted from the throwaway M-0b probe patch (runs/edmft_q45/metal_mode/m0b/
+      // m0b_probe.patch) so the RW-2 acceptance number is measurable on a production binary.
+      // Env-gated on QPGW_SABS_PROBE, so with the variable unset NOTHING changes -- no code
+      // path, no output. Reports, per gap-window state and per evaluation offset eta:
+      //   Sabs = sum_{J,p} |M_ii,Jp| |n_B(om_p) + f(eps_J)| / |z - (eps_J - om_p)|
+      // against the actual |Sigma^c_ii(z)| from the SAME pole slab. Sabs/|Sigma| is the
+      // number of digits of cancellation the representation demands: the LS routes read
+      // 1e4-1e5 on the SVO metal, the spectral quadrature is expected O(1-10) because its
+      // numerators are sign-definite (wc_spectral.hpp section 5). The head sector is split
+      // out because it is the one part of the spectral rep that is still a least-squares
+      // object (poles p >= 2*nbin, i.e. |om_p| on the DLR auxiliary grid at q = Gamma).
+      if (cd and std::getenv("QPGW_SABS_PROBE") != nullptr) {
+        const double pi_b = M_PI / ctx->beta;
+        const double om_cut = 3.0 * pi_b;
+        const long offJ = (is * ctx->nk + ik) * ctx->nJ;
+        const long nbody = 2 * ctx->diag.sp_nbin;      // 0 on the tau/nu routes
+        {
+          long nlow = 0; double nB_low = 0.0, nB_tot = 0.0, om_min = 1e300, om_max = -1e300;
+          for (long p = 0; p < ctx->npk; ++p) {
+            const double o = ctx->om(p);
+            om_min = std::min(om_min, std::abs(o)); om_max = std::max(om_max, std::abs(o));
+            nB_tot += std::abs(ctx->nB(p));
+            if (std::abs(o) < om_cut) { ++nlow; nB_low += std::abs(ctx->nB(p)); }
+          }
+          app_log(lvl, "  M0B WPOLES (s,k) = ({},{}): npk = {}, |om_p| in [{:.4e}, {:.4e}] a.u.; "
+                       "3 pi/beta = {:.4e} a.u.; {} poles below it carry sum|n_B| = {:.4e} of "
+                       "{:.4e} ({:.2f} %)", is, ik, ctx->npk, om_min, om_max, om_cut, nlow,
+                  nB_low, nB_tot, (nB_tot > 0.0 ? 100.0 * nB_low / nB_tot : 0.0));
+        }
+        const double etas[4] = {0.0, pi_b, 2.0 * pi_b, 10.0 * pi_b};
+        for (long i : win) {
+          const ComplexType SA = XA.eval(i, i, eps(i) - mu);
+          for (int e = 0; e < 4; ++e) {
+            const ComplexType z(eps(i), etas[e]);
+            const ComplexType SB = modea_sigma_diag(*ctx, *blk, i, z);
+            double sabs = 0.0, sabs_low = 0.0, sabs_head = 0.0, wmax = 0.0, dmin = 1e300;
+            double npos_num = 0.0, nneg_num = 0.0;
+            for (long J = 0; J < ctx->nJ; ++J) {
+              const double eJ = ctx->epsJ(offJ + J), fJ = ctx->fJ(offJ + J);
+              for (long p = 0; p < ctx->npk; ++p) {
+                const ComplexType Mii = blk->M(i, i, J * ctx->npk + p);
+                const double w = ctx->nB(p) + fJ;
+                const double num = std::abs(Mii) * std::abs(w);
+                const double den = std::abs(z - ComplexType(eJ - ctx->om(p), 0.0));
+                dmin = std::min(dmin, den);
+                const double t = (den > 0.0) ? num / den : 0.0;
+                sabs += t; wmax = std::max(wmax, t);
+                if (std::abs(ctx->om(p)) < om_cut) sabs_low += t;
+                if (nbody > 0 and p >= nbody) sabs_head += t;
+                // the SIGN AUDIT of wc_spectral.hpp section 5: Re[M_ii] * (n_B + f) should
+                // be >= 0 for every (J, p) in the spectral body sector.
+                const double sgn = Mii.real() * w;
+                if (sgn >= 0.0) npos_num += std::abs(sgn); else nneg_num += std::abs(sgn);
+              }
+            }
+            app_log(lvl, "  M0B SIGMA  ({},{}): i = {:>3}  eps-mu = {:+9.4f} eV  eta = "
+                         "{:.4e}  |Sigma_B| = {:.6e}  Sabs = {:.6e}  Sabs/|Sigma| = {:.4e}  "
+                         "low-om share = {:6.2f} %  head share = {:6.2f} %  neg-numerator "
+                         "share = {:6.2f} %  max term = {:.6e}  min|den| = {:.4e}  "
+                         "|Sigma_A(AC)| = {:.6e}",
+                    is, ik, i, (eps(i) - mu) * HA2EV, etas[e], std::abs(SB), sabs,
+                    (std::abs(SB) > 0.0 ? sabs / std::abs(SB) : 0.0),
+                    (sabs > 0.0 ? 100.0 * sabs_low / sabs : 0.0),
+                    (sabs > 0.0 ? 100.0 * sabs_head / sabs : 0.0),
+                    (npos_num + nneg_num > 0.0 ? 100.0 * nneg_num / (npos_num + nneg_num) : 0.0),
+                    wmax, dmin, std::abs(SA));
+          }
         }
       }
 
@@ -693,7 +781,8 @@ namespace {
                "antiherm={:.4e} taudev={:.4e} | dIN={:.4e} clIN={:.4e} rIN={:.4e} | "
                "wrank={:.1e} Np={} rmax={} rmean={:.2f} wtrunc={:.3e} "
                "tfit={:.2f} tfac={:.2f} tsand={:.2f} | etafar={:.4e} neta={} imoff={:.4e} "
-               "spacing={:.4e} antiin={:.4e}",
+               "spacing={:.4e} antiin={:.4e} | speta={:.4e} spNO={} spnbin={} sphead={} "
+               "spwidth={:.3e} spsym={:.3e} sppsd={:.3e} sphrec={:.3e} spwall={:.2f}",
             ctx->opts.wfit, ctx->diag.gap_edge > -1 ? qp_modea::last_run().wrtol : -1.0,
             ctx->eta, ctx->diag.res_ratio_worst, ctx->diag.rec_rel_worst,
             ctx->diag.gap_edge, ctx->npk, dmax_worst, iters_worst, min_den_worst,
@@ -701,7 +790,10 @@ namespace {
             ratio_in_worst, ctx->opts.wrank, qp_modea::last_run().Np,
             ctx->diag.wrank_max, ctx->diag.wrank_mean, ctx->diag.wtrunc_worst,
             ctx->diag.t_fit, ctx->diag.t_fac, ctx->diag.t_sand,
-            eta_far, n_eta, im_off_worst, spacing_worst, anti_in_worst);
+            eta_far, n_eta, im_off_worst, spacing_worst, anti_in_worst,
+            ctx->diag.sp_eta, ctx->diag.sp_NO, ctx->diag.sp_nbin, ctx->diag.sp_nhead,
+            ctx->diag.sp_width, ctx->diag.sp_sym, ctx->diag.sp_psdneg,
+            ctx->diag.sp_headrec, ctx->diag.sp_wall);
     if (n_noconv > 0)
       app_warning("qp_approx (mode_a): the inner QP-consistency loop hit the cap ({}) on {} "
                   "(s,k) blocks with max|d eps| = {:.3e}. This is the physical "
@@ -1613,6 +1705,12 @@ auto qp_approx(const sArray_t<Array_view_5D_t> &sSigma_tskij,
             qp_params.qp_modea_wsupp, qp_params.qp_modea_wfit, qp_params.qp_modea_wrtol,
             qp_params.qp_modea_wrank, qp_params.qp_modea_wsketch,
             qp_params.qp_modea_wunion);
+  if (qp_params.qp_modea_wfit == "spectral")
+    app_log(2, "  - spectral knobs (RW-2):  spectral_eta = {:.4g} a.u. ({:.4g} eV), "
+               "spectral_npole = {} positive-Omega nodes after coarsening, spectral_gamma = {}",
+            qp_params.qp_modea_spectral_eta,
+            qp_params.qp_modea_spectral_eta * 27.211386245988,
+            qp_params.qp_modea_spectral_npole, qp_params.qp_modea_spectral_gamma);
   sVcorr_skij.set_zero();
   sVcorr_skij.win().fence();
   if (qp_params.qp_map == "mode_a" or qp_params.qp_map == "mode_b") {

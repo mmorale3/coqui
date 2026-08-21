@@ -688,9 +688,21 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     io::tolower(qp_params.qp_modea_wsupp);
     qp_params.qp_modea_wfit = io::get_value_with_default<std::string>(pt,"qp_modea_wfit","tau");
     io::tolower(qp_params.qp_modea_wfit);
-    utils::check(qp_params.qp_modea_wfit=="tau" or qp_params.qp_modea_wfit=="nu",
-                 "evgw: unknown qp_modea_wfit: {}. Valid options: \"tau\", \"nu\".",
-                 qp_params.qp_modea_wfit);
+    utils::check(qp_params.qp_modea_wfit=="tau" or qp_params.qp_modea_wfit=="nu"
+                 or qp_params.qp_modea_wfit=="spectral",
+                 "evgw: unknown qp_modea_wfit: {}. Valid options: \"tau\", \"nu\", "
+                 "\"spectral\".", qp_params.qp_modea_wfit);
+    // RW-2: the spectral-quadrature W^c representation (notes/rw_real_axis_w_spec.md).
+    qp_params.qp_modea_spectral_eta =
+        io::get_value_with_default<double>(pt,"qp_modea_spectral_eta",0.0125);
+    utils::check(qp_params.qp_modea_spectral_eta > 0.0,
+                 "evgw: qp_modea_spectral_eta = {} must be > 0.",
+                 qp_params.qp_modea_spectral_eta);
+    qp_params.qp_modea_spectral_npole =
+        io::get_value_with_default<long>(pt,"qp_modea_spectral_npole",64);
+    qp_params.qp_modea_spectral_gamma =
+        io::get_value_with_default<std::string>(pt,"qp_modea_spectral_gamma","spectral");
+    io::tolower(qp_params.qp_modea_spectral_gamma);
     qp_params.qp_modea_wrtol = io::get_value_with_default<double>(pt,"qp_modea_wrtol",-1.0);
     utils::check(qp_params.qp_modea_wrtol < 1.0,
                  "evgw: qp_modea_wrtol must be < 1 (negative selects the doctrine default).");
@@ -795,9 +807,21 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     io::tolower(qp_params.qp_modea_wsupp);
     qp_params.qp_modea_wfit = io::get_value_with_default<std::string>(pt,"qp_modea_wfit","tau");
     io::tolower(qp_params.qp_modea_wfit);
-    utils::check(qp_params.qp_modea_wfit=="tau" or qp_params.qp_modea_wfit=="nu",
-                 "qpgw: unknown qp_modea_wfit: {}. Valid options: \"tau\", \"nu\".",
-                 qp_params.qp_modea_wfit);
+    utils::check(qp_params.qp_modea_wfit=="tau" or qp_params.qp_modea_wfit=="nu"
+                 or qp_params.qp_modea_wfit=="spectral",
+                 "qpgw: unknown qp_modea_wfit: {}. Valid options: \"tau\", \"nu\", "
+                 "\"spectral\".", qp_params.qp_modea_wfit);
+    // RW-2: the spectral-quadrature W^c representation (notes/rw_real_axis_w_spec.md).
+    qp_params.qp_modea_spectral_eta =
+        io::get_value_with_default<double>(pt,"qp_modea_spectral_eta",0.0125);
+    utils::check(qp_params.qp_modea_spectral_eta > 0.0,
+                 "qpgw: qp_modea_spectral_eta = {} must be > 0.",
+                 qp_params.qp_modea_spectral_eta);
+    qp_params.qp_modea_spectral_npole =
+        io::get_value_with_default<long>(pt,"qp_modea_spectral_npole",64);
+    qp_params.qp_modea_spectral_gamma =
+        io::get_value_with_default<std::string>(pt,"qp_modea_spectral_gamma","spectral");
+    io::tolower(qp_params.qp_modea_spectral_gamma);
     qp_params.qp_modea_wrtol = io::get_value_with_default<double>(pt,"qp_modea_wrtol",-1.0);
     utils::check(qp_params.qp_modea_wrtol < 1.0,
                  "qpgw: qp_modea_wrtol must be < 1 (negative selects the doctrine default).");
@@ -1186,9 +1210,21 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
     io::tolower(qp_params.qp_modea_wsupp);
     qp_params.qp_modea_wfit = io::get_value_with_default<std::string>(pt,"qp_modea_wfit","tau");
     io::tolower(qp_params.qp_modea_wfit);
-    utils::check(qp_params.qp_modea_wfit=="tau" or qp_params.qp_modea_wfit=="nu",
-                 "qpgw: unknown qp_modea_wfit: {}. Valid options: \"tau\", \"nu\".",
-                 qp_params.qp_modea_wfit);
+    utils::check(qp_params.qp_modea_wfit=="tau" or qp_params.qp_modea_wfit=="nu"
+                 or qp_params.qp_modea_wfit=="spectral",
+                 "qpgw: unknown qp_modea_wfit: {}. Valid options: \"tau\", \"nu\", "
+                 "\"spectral\".", qp_params.qp_modea_wfit);
+    // RW-2: the spectral-quadrature W^c representation (notes/rw_real_axis_w_spec.md).
+    qp_params.qp_modea_spectral_eta =
+        io::get_value_with_default<double>(pt,"qp_modea_spectral_eta",0.0125);
+    utils::check(qp_params.qp_modea_spectral_eta > 0.0,
+                 "qpgw: qp_modea_spectral_eta = {} must be > 0.",
+                 qp_params.qp_modea_spectral_eta);
+    qp_params.qp_modea_spectral_npole =
+        io::get_value_with_default<long>(pt,"qp_modea_spectral_npole",64);
+    qp_params.qp_modea_spectral_gamma =
+        io::get_value_with_default<std::string>(pt,"qp_modea_spectral_gamma","spectral");
+    io::tolower(qp_params.qp_modea_spectral_gamma);
     qp_params.qp_modea_wrtol = io::get_value_with_default<double>(pt,"qp_modea_wrtol",-1.0);
     utils::check(qp_params.qp_modea_wrtol < 1.0,
                  "qpgw: qp_modea_wrtol must be < 1 (negative selects the doctrine default).");

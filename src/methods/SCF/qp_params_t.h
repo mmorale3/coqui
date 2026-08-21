@@ -96,6 +96,35 @@ struct qp_params_t {
   // kernel -> residues x tanh(hw/2)); "nu" = the support-constrained LS directly on the
   // bosonic Matsubara nodes. Both are MEASURED by gate QM3-b.
   std::string qp_modea_wfit = "tau";
+  // RW-2 (notes/rw_real_axis_w_spec.md): qp_modea_wfit = "spectral" replaces the least-
+  // squares pole fit above by a SIGN-DEFINITE quadrature of the computed Im W^c(Omega, q)
+  // from the real-axis module (needs -DENABLE_FINUFFT=ON). Motivation: on a metal the LS
+  // residues are mixed sign and the contracted Sigma^c needs 4-5.5 digits of cancellation
+  // (notes/qpgw_metal_mode_m0.md section 8b). The two knobs below are FLAGGED defaults:
+  //   spectral_eta   -- Lorentzian width of the QP-pole A(w), a.u. Drives the whole grid
+  //                     stack; smaller is more accurate and quadratically more expensive.
+  //   spectral_npole -- target positive-Omega node count after coarsening (pole count is
+  //                     2x this plus the head sector). <= 0 keeps every Omega node.
+  //   spectral_gamma -- "spectral" (default; FABLE RULING 2026-08-21 on the section-4.5d
+  //                     A/B, flipping the earlier protective ruling now that the data is
+  //                     in) takes the Gamma BODY from the quadrature and leaves only the
+  //                     scalar head on LS poles; "ls" keeps the whole q = Gamma column on
+  //                     an appended support-constrained LS pole set. Measured on SVO
+  //                     (notes/rw2_report.md section 4.5d): "ls" reintroduces the
+  //                     mixed-sign LS cancellation on the ONE transfer that dominates
+  //                     Sabs (100% head share, 49.97% negative numerators, transient
+  //                     U(0) = -15 eV at the first map) while "spectral" passes every
+  //                     RW-2-c gate (Sabs/|Sigma| 2.4-3.6 at map 2, neg share 0.11%,
+  //                     U(0) positive both maps, causality at machine zero). The Gamma
+  //                     hole "ls" guarded against does not exist on this path -- the
+  //                     Gamma body is COMPUTED on the real axis (the section-3.3 fix),
+  //                     not dropped. Known open item: the "spectral" mode's scalar-head
+  //                     LS fit is unconstrained (6 sub-3pi/beta poles on SVO
+  //                     contaminating eta=0 PROBE rows only, not the map) -- the support
+  //                     constraint there is the filed follow-up, report section 7 item 1.
+  std::string qp_modea_spectral_gamma = "spectral";
+  double qp_modea_spectral_eta = 0.0125;
+  long   qp_modea_spectral_npole = 64;
   // truncated-SVD cut of the SUPPORT-CONSTRAINED W^c pole fit, relative to the largest
   // singular value. Negative selects the shared doctrine value, imag_axes_ft::
   // dlr_pole_fit_rel_tol = 1e-8, which is the DEFAULT and reproduces the QM2-b chain.

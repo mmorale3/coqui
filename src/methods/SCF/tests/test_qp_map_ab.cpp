@@ -93,7 +93,9 @@ namespace bdft_tests {
                           const std::string &tag = "", double eta = 0.0,
                           double wrtol = -1.0, double wrank = 1e-10, long wsketch = 0,
                           double eta_far = 0.0, bool gate = true, double wunion = -1.0,
-                          const std::string &div = "ignore_g0") {
+                          const std::string &div = "ignore_g0",
+                          double sp_eta = 0.0125, long sp_npole = 64,
+                          const std::string &sp_gamma = "ls") {
       const std::string output = "qp_map_ab_" + map + "_" + mode + tag;
       solvers::hf_t hf;
       solvers::gw_t gw(&ft, div, output);
@@ -111,6 +113,9 @@ namespace bdft_tests {
       qp_params.qp_modea_wrank = wrank;
       qp_params.qp_modea_wsketch = wsketch;
       qp_params.qp_modea_wunion = wunion;
+      qp_params.qp_modea_spectral_eta = sp_eta;         // RW-2, only read when wfit=spectral
+      qp_params.qp_modea_spectral_npole = sp_npole;
+      qp_params.qp_modea_spectral_gamma = sp_gamma;
       qp_modea::last_run() = qp_modea::last_run_t{};
       iter_scf::iter_scf_t iter_sol(iter_scf::damp_t(0.7));
       MBState mb_state(mpi_context, ft, output);
@@ -367,6 +372,66 @@ namespace bdft_tests {
     app_log(1, "@@MODEA_GAP lih222/qpscf: ac_pade = {:.4f} eV, mode_a = {:.4f} eV "
                "(d = {:+.4f} eV); stored references: ac_pade 11.8024, mode_b 11.8537",
             rows[0].gap_eV(), rows[1].gap_eV(), rows[1].gap_eV() - rows[0].gap_eV());
+  }
+
+  /**
+   * GATE RW-2-b (notes/rw_real_axis_w_spec.md): the INSULATOR leg of the spectral-quadrature
+   * W^c representation. REPORT-ONLY -- spectral is the METAL path; on a gapped fixture the
+   * support-constrained LS fit has real prior information to use and the spectral rep is
+   * eta-limited, so the gap shift is expected at the ~0.1 eV class of RW-1 section 7 and is
+   * printed, never gated. What IS asserted is that the run completes, that the tau anchor
+   * holds against its own (spectral) reconstruction class, and that the representation is
+   * definite (the sppsd census).
+   *
+   * COST. The real-axis chain is a Naux^2-wide NUFFT batch over N_t times, so its cost scales
+   * as Np^2 / eta^2 and the production Np = 192 at eta = 0.0125 is not a laptop object. This
+   * case therefore runs a REDUCED THC rank and a coarse eta on BOTH legs, so the LS and
+   * spectral rows share every other convention and the difference is the representation. The
+   * absolute gap is consequently not the production one -- the DIFFERENCE is the readout.
+   * Dot-tagged: run explicitly, one at a time.
+   */
+  TEST_CASE("qp_map_rw2b_lih222", "[.rw2b]") {
+    using namespace qp_map_ab_detail;
+    auto& mpi_context = utils::make_unit_test_mpi_context();
+    imag_axes_ft::IAFT ft(1000.0, 1.2, imag_axes_ft::dlr_basis);
+    auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_lih222"));
+
+    const int    prefac  = std::getenv("RW2B_PREFAC")  ? std::atoi(std::getenv("RW2B_PREFAC"))  : 4;
+    const int    niter   = std::getenv("RW2B_NITER")   ? std::atoi(std::getenv("RW2B_NITER"))   : 20;
+    const double sp_eta  = std::getenv("RW2B_ETA")     ? std::atof(std::getenv("RW2B_ETA"))     : 0.05;
+    const long   sp_np   = std::getenv("RW2B_NPOLE")   ? std::atol(std::getenv("RW2B_NPOLE"))   : 64;
+    const std::string sp_g = std::getenv("RW2B_GAMMA") ? std::getenv("RW2B_GAMMA") : "ls";
+    app_log(1, "@@RW2B config: thc prefactor = {}, niter = {}, spectral_eta = {:.4g} a.u., "
+               "spectral_npole = {}, spectral_gamma = {}", prefac, niter, sp_eta, sp_np, sp_g);
+
+    std::vector<ab_row> rows;
+    rows.push_back(run_map(mpi_context, mf, ft, "ac_pade", "qpscf", prefac, 1e-10, niter, 1e-6));
+    // gate = false on both mode_a rows: the run_map inner-consistency assertion is calibrated
+    // to the PRODUCTION THC rank and iteration budget, and this case deliberately runs a
+    // reduced one so the real-axis chain (a Naux^2-wide NUFFT batch) is affordable. The
+    // diagnostics are all still logged and the RW-2-b assertions are below.
+    rows.push_back(run_map(mpi_context, mf, ft, "mode_a", "qpscf", prefac, 1e-10, niter, 1e-6,
+                           "tau", "_ls", 0.0, -1.0, 1e-10, 0, 0.0, /*gate*/ false));
+    rows.push_back(run_map(mpi_context, mf, ft, "mode_a", "qpscf", prefac, 1e-10, niter, 1e-6,
+                           "spectral", "_sp", 0.0, -1.0, 1e-10, 0, 0.0, /*gate*/ false, -1.0,
+                           "ignore_g0", sp_eta, sp_np, sp_g));
+    report_and_check(rows);
+    auto const &L = rows[2].lr;
+    app_log(1, "@@RW2B lih222/qpscf: ac_pade = {:.4f} eV, mode_a(tau/LS) = {:.4f} eV, "
+               "mode_a(spectral) = {:.4f} eV; spectral - LS = {:+.4f} eV, spectral - ac_pade "
+               "= {:+.4f} eV", rows[0].gap_eV(), rows[1].gap_eV(), rows[2].gap_eV(),
+            rows[2].gap_eV() - rows[1].gap_eV(), rows[2].gap_eV() - rows[0].gap_eV());
+    app_log(1, "@@RW2B spectral census: eta = {:.4g} a.u., N_Omega = {}, bins = {}, head "
+               "poles = {}, npk = {}, worst bin width = {:.3e}, ImW symmetry = {:.3e}, "
+               "definiteness = {:.3e}, head reconstruction = {:.3e}, Lehmann meter (rec) = "
+               "{:.4e}, tau anchor = {:.4e} (ratio {:.3g}), real-axis wall = {:.2f} s",
+            L.sp_eta, L.sp_NO, L.sp_nbin, L.sp_nhead, L.npk, L.sp_width, L.sp_sym,
+            L.sp_psdneg, L.sp_headrec, L.rec_rel, L.tau_dev,
+            (L.anchor_expect > 0.0 ? L.tau_dev / L.anchor_expect : 0.0), L.sp_wall);
+    // The representation must be definite and the pole count as requested; both are
+    // structural, not accuracy statements.
+    REQUIRE(L.sp_nbin > 0);
+    REQUIRE(L.sp_psdneg < 1e-8);
   }
 
   TEST_CASE("qp_map_modea_si222", "[methods][qpgw][qp_map_ab][modea2]") {

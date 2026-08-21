@@ -174,7 +174,34 @@ namespace qp_modea {
     double eta = 0.0;                  // evaluation offset i*eta (stress only)
     double eta_far = 0.0;              // rev 4: OUT-OF-STRIP offset i*eta_far (0 = mu fallback)
     std::string wsupp = "auto";        // {"auto","off",<value in a.u.>}
-    std::string wfit = "tau";          // {tau, nu}
+    std::string wfit = "tau";          // {tau, nu, spectral}
+    // RW-2 (notes/rw_real_axis_w_spec.md): the spectral-quadrature W^c representation.
+    // Active only when wfit == "spectral"; both are FLAGGED agent-chosen defaults.
+    //   spectral_eta   -- Lorentzian width of the QP-pole spectral function A(w) fed to the
+    //                     real-axis chain, a.u. Sets the whole grid stack (dw <= eta/2,
+    //                     dOmega <= eta, Nyquist-hard N_t), so cost ~ 1/eta^2 in memory and
+    //                     ~1/eta^2 .. 1/eta^3 in time. 0.0125 is the smallest value of the
+    //                     RW-1 eta series; larger values are cheaper and less accurate, and
+    //                     the Lehmann meter below reports the price.
+    //   spectral_npole -- target number of POSITIVE-Omega quadrature nodes after coarsening
+    //                     (the pole count is 2x this, plus the head sector). <= 0 keeps every
+    //                     Omega node, which is unaffordable at production Np: the residue
+    //                     slabs and the per-(s,k) sandwich are both LINEAR in npk.
+    //   spectral_gamma -- which representation the q = Gamma COLUMN uses. "ls" (default,
+    //                     the Fable ruling of 2026-08-20) puts the WHOLE Gamma column --
+    //                     body plus the eps_inv_head augmentation -- on an appended
+    //                     support-constrained LS pole set, so the one transfer that carries
+    //                     the 1/q^2 head and the largest |W| keeps exactly the production
+    //                     representation. "spectral" instead takes the Gamma BODY from the
+    //                     quadrature like every other q (the real-axis chain is asked to
+    //                     Dyson Gamma, so it is computed, not zeroed) and leaves only the
+    //                     scalar head on appended LS poles. MEASURED on SVO, both maps:
+    //                     "ls" gives Sabs/|Sigma^c| = 6.4e5 (head share 100 %) at the first
+    //                     map, "spectral" gives 2.4-3.6 -- see notes/rw2_report.md section
+    //                     4.5. The default follows the ruling, not the measurement.
+    std::string spectral_gamma = "ls";
+    double spectral_eta = 0.0125;
+    long   spectral_npole = 64;
     double wrtol = -1.0;               // masked-fit SVD cut; < 0 = the shared doctrine value
     // W^c residue-slab compression (stage 1b of wc_band_elements.hpp). wrank is a RELATIVE
     // eigenvalue cut on each Hermitian slab W^(p)_PQ: <= 0 disables the factorization and
@@ -229,6 +256,10 @@ namespace qp_modea {
     bool converged_inner = false;  // every block's inner-consistency loop met consist_tol
     long iters = 0, n_support = 0, np_total = 0, nJ = 0, npk = 0;
     std::string wfit;
+    // RW-2 spectral census (zero unless wfit == "spectral")
+    double sp_eta = 0.0, sp_width = 0.0, sp_sym = 0.0, sp_psdneg = 0.0;
+    double sp_headrec = 0.0, sp_wall = 0.0;
+    long   sp_NO = 0, sp_nbin = 0, sp_nhead = 0;
     // stage-1b (low-rank W^c slabs), last context build
     double wrank = 0.0;            // the knob value in force
     long wrank_max = 0;            // worst retained rank over (q,p)
@@ -284,6 +315,17 @@ namespace qp_modea {
     double rec_budget = 0.0;
     double fit_err_worst = 0.0;        // worst-q fit residual ON ITS OWN grid (NOT a quality
                                        // number -- see binding requirement 3)
+    // ---- RW-2 spectral path (all zero on the tau/nu routes) ----------------------------
+    double sp_eta = 0.0;               // qp_modea_spectral_eta in force
+    long   sp_NO = 0, sp_Nw = 0, sp_Nt = 0;   // the derived real-axis grid
+    long   sp_nbin = 0;                // positive-Omega poles after coarsening
+    long   sp_nhead = 0;               // appended head-sector poles
+    double sp_width = 0.0;             // worst relative Omega width of a merged bin
+    double sp_negfrac = 0.0;           // negative share of the trace weight (a noise meter)
+    double sp_sym = 0.0;               // max|ImW_PQ - ImW_QP| / max|ImW|
+    double sp_psdneg = 0.0;            // worst |min eig| / max eig of a residue slab
+    double sp_headrec = 0.0;           // head-sector fit reconstruction on the bosonic mesh
+    double sp_wall = 0.0;              // real-axis chain wall time (s)
     double res_ratio_worst = 0.0;
     double wall_s = 0.0;               // context build wall time
     double mem_mb = 0.0;               // peak extra memory (per rank, residue slabs + buffers)

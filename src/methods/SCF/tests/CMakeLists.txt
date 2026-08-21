@@ -10,6 +10,17 @@ target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield eri_li
 add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
 set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR})
 
+# RW-2 (notes/rw_real_axis_w_spec.md): gate RW-2-a, the TOY gate of the spectral-quadrature
+# W^c pole representation. Pure math on a closed-form Drude W^c -- no fixture, no FINUFFT --
+# so it builds and runs in every configuration.
+set(TEST_ID methods_wc_spectral)
+
+add_executable(test_${TEST_ID} test_wc_spectral.cpp)
+target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield scf_lib)
+
+add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
+set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR})
+
 # Project 2 increment Q2: the qp_map A/B surrogate-spread gate (full qp-scf
 # loops on real fixtures -- separate executable so ctest can target it).
 set(TEST_ID methods_qp_map_ab)

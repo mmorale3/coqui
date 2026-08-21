@@ -80,6 +80,7 @@
 #include "methods/GW_real_axis/real_freq_grid.hpp"
 #include "methods/GW_real_axis/real_axis_mb_state.hpp"
 #include "methods/GW_real_axis/real_axis_scr_coulomb_t.h"
+#include "methods/GW_real_axis/real_axis_qp_A.hpp"
 
 // Matsubara branch.
 #include "methods/mb_state/mb_state.hpp"
@@ -102,58 +103,13 @@ namespace bdft_tests {
   using methods::real_axis::real_axis_scr_coulomb_t;
   using cval_t = std::complex<double>;
 
+  // RW-2: the grid sizing rule and the QP-pole Lorentzian A builder were PROMOTED out of
+  // this harness into methods/GW_real_axis/real_axis_qp_A.hpp, so the production spectral
+  // path (qp_modea_wfit = "spectral") and this gate share one implementation. Neither is
+  // changed in content -- the derivations that used to live here are in that file's header.
   namespace rw1 {
-
-  // ------------------------------------------------------------------
-  // Grid sizing for a given eta. Everything here is derived, not tuned.
-  //
-  //  * w grid: the spectral function is a sum of Lorentzians of width eta;
-  //    trapezoid quadrature of a Lorentzian with spacing h has error
-  //    ~ exp(-2 pi eta / h), so h = eta/2 buys ~e^{-4pi} ~ 3e-6. We take
-  //    h <= eta/2 across the whole [-w_max, w_max] window (the poles are
-  //    spread over the full bandwidth, so a dense-block layout would not
-  //    help here).
-  //  * t window: the two legs of the bubble decay as exp(-eta|t|) each, so
-  //    the product decays as exp(-2 eta |t|) and truncating at |t| = T/2
-  //    costs ~exp(-eta T). T = T_DECADES/eta with T_DECADES = 9.2 gives
-  //    ~1e-4.
-  //  * dt: the Nyquist condition max(|w|, Omega) dt <= pi is enforced as a
-  //    HARD ERROR by real_freq_grid_t (:104-118). We take the branch's own
-  //    safety factor 2: dt = 0.5 pi / freq_max.
-  //  * Omega grid: the features of Im W^c inherit the ~2 eta width of the
-  //    bubble, and the forward spectral integral below uses the grid's own
-  //    trapezoid weights, so dOmega <= eta (again exponential, ~e^{-4pi}).
-  //    This is the piece the branch's own defaults (N_Omega = 64 on
-  //    [0, 2 w_max]) do NOT satisfy at these eta -- it is a property of the
-  //    gate, not of the ported code.
-  // ------------------------------------------------------------------
-  struct grid_sizing_t {
-    long   N_w;
-    long   N_Omega;
-    long   N_t;
-    double T_window;
-    double dw;
-    double dOmega;
-    double dt;
-  };
-
-  inline grid_sizing_t size_grids(double eta, double w_max, double Omega_max) {
-    grid_sizing_t g;
-    const double freq_max = std::max(w_max, Omega_max);
-    g.dt = 0.5 * M_PI / freq_max;
-    const double T_target = 9.2 / eta;
-    g.N_t = 2;
-    while (static_cast<double>(g.N_t) * g.dt < T_target) g.N_t *= 2;
-    g.T_window = g.dt * static_cast<double>(g.N_t);
-    const double h_target = 0.5 * eta;
-    g.N_w = static_cast<long>(std::ceil(2.0 * w_max / h_target)) + 1;
-    if (g.N_w % 2 == 0) ++g.N_w;            // keep w = 0 on the grid
-    g.dw = 2.0 * w_max / static_cast<double>(g.N_w - 1);
-    g.N_Omega = static_cast<long>(std::ceil(Omega_max / eta));
-    g.dOmega  = Omega_max / static_cast<double>(g.N_Omega);
-    return g;
-  }
-
+    using methods::real_axis::grid_sizing_t;
+    using methods::real_axis::size_grids;
   } // namespace rw1
 
   // =====================================================================
@@ -191,7 +147,7 @@ namespace bdft_tests {
             use_rspace ? "R-space" : "k-space");
 
     auto eigval = mf->eigval();
-    auto kp2ibz = mf->kp_to_ibz();
+    [[maybe_unused]] auto kp2ibz = mf->kp_to_ibz();
 
     double e_min =  std::numeric_limits<double>::infinity();
     double e_max = -std::numeric_limits<double>::infinity();
@@ -496,27 +452,18 @@ namespace bdft_tests {
 
       real_axis_mb_state_t state(grid);
       state.mpi = mpi_context;
+      // A lives at IBZ k (update_w hard-checks the shape); both fixtures of this gate have
+      // IBZ == FBZ, which is asserted here rather than assumed.
+      REQUIRE(mf->nkpts_ibz() == Nk);
       state.A_wskij.emplace(*state.mpi,
           std::array<long, 5>{gs.N_w, ns, Nk, nbnd, nbnd});
       if (state.A_wskij->node_comm()->root()) {
-        auto A = state.A_wskij->local();
-        A = cval_t(0.0, 0.0);
-        // build_A_from_QP_poles with MO = 1 (licensed by PIN P1) and
-        // E_ska = eps_KS -- i.e. exactly the G_0 of the Matsubara branch,
-        // Lorentzian-broadened by eta.
-        for (long s = 0; s < ns; ++s)
-          for (long k = 0; k < Nk; ++k) {
-            const long kibz = kp2ibz(k);
-            for (long n = 0; n < nbnd; ++n) {
-              const double e_n = eigval(s, kibz, n);
-              for (long iw = 0; iw < gs.N_w; ++iw) {
-                const double w_abs = grid.w()(iw) + grid.mu_chem();
-                A(iw, s, k, n, n) = cval_t(
-                    (1.0 / M_PI) * eta
-                        / ((w_abs - e_n) * (w_abs - e_n) + eta * eta), 0.0);
-              }
-            }
-          }
+        // The promoted builder (real_axis_qp_A.hpp) with MO = identity -- licensed by PIN P1
+        // -- and E = eps_KS, i.e. exactly the G_0 of the Matsubara branch, Lorentzian-
+        // broadened by eta. Identical arithmetic to the loop this call replaced.
+        methods::real_axis::build_A_from_QP_poles(
+            state.A_wskij->local(), grid, eigval,
+            (nda::array<ComplexType, 4> const*)nullptr, eta);
       }
       state.A_wskij->node_sync();
 

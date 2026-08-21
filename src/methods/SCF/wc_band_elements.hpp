@@ -337,7 +337,19 @@
 #include "numerics/sparse/sparse.hpp"
 #include "numerics/shared_array/nda.hpp"
 #include "methods/SCF/qp_modea.hpp"
+#include "methods/SCF/wc_spectral.hpp"
 #include "methods/mb_state/mb_state.hpp"
+
+#ifdef ENABLE_FINUFFT
+// RW-2: the spectral-quadrature W^c path. Only reachable with qp_modea_wfit = "spectral";
+// with the flag OFF the knob value is rejected with a clear message at parse time and this
+// translation unit is byte-identical in behavior to pre-RW-2 (gate RW-2-b / the RW-1-c
+// flag-off inertness class).
+#include "methods/GW_real_axis/real_freq_grid.hpp"
+#include "methods/GW_real_axis/real_axis_mb_state.hpp"
+#include "methods/GW_real_axis/real_axis_scr_coulomb_t.h"
+#include "methods/GW_real_axis/real_axis_qp_A.hpp"
+#endif
 
 namespace methods {
 namespace qp_modea {
@@ -637,6 +649,194 @@ namespace qp_modea {
       return R;
     }
 
+    // -------------------------------------------------------------------------------------
+    //  RW-2: the SPECTRAL-QUADRATURE W^c representation
+    //  (derivation + sign convention: methods/SCF/wc_spectral.hpp)
+    // -------------------------------------------------------------------------------------
+
+    /** Everything the spectral path produces before the residue slabs are filled. */
+    struct spectral_ctx_t {
+      bool on = false;
+      // the real-axis grid actually used
+      double eta = 0.0, w_max = 0.0, Omega_max = 0.0;
+      long   N_w = 0, N_t = 0, N_O = 0;
+      double dw = 0.0, dOmega = 0.0, T_window = 0.0, dt = 0.0;
+      // the quadrature
+      wc_spectral::quad_grid_t qg;          // (N_O + 1) quadrature nodes / weights / src
+      wc_spectral::bin_plan_t plan;         // node -> pole coarsening
+      // this rank's tile of Im W^c(q, P, Q, Omega)
+      nda::array<double, 4> ImW;            // (nq_ibz, nPloc, nQloc, N_O)
+      long P0 = 0, Q0 = 0, nPl = 0, nQl = 0;
+      // the q = Gamma slot: appended LS poles carrying the WHOLE Gamma column (body + head).
+      bool  gamma_ls = true;                // qp_modea_spectral_gamma == "ls"
+      long npole_gamma = 0;
+      nda::array<double, 1> om_gamma;       // (npole_gamma)
+      nda::array<ComplexType, 1> r_head;    // ("spectral" mode) scalar eps_inv_head residues
+      double gamma_rec = 0.0;               // Gamma-slot reconstruction rel err on the nu mesh
+      long iq_gamma = 0;                    // IBZ index of the Gamma transfer
+      // diagnostics
+      double t_wall = 0.0;
+      double imw_sym = 0.0;                 // max|ImW_PQ - ImW_QP| / max|ImW|
+      double psd_neg = 0.0;                 // most negative eigenvalue share of a residue slab
+      long   n_neg_trace = 0;
+      double neg_frac = 0.0, width_worst = 0.0;
+      long   nbin = 0;
+    };
+
+#ifdef ENABLE_FINUFFT
+    /**
+     * Run the RW-1 real-axis chain on the CURRENT QP spectrum and leave Im W^c(q,P,Q,Omega)
+     * plus the quadrature grid in `sp`. Called once per mode-A context build.
+     *
+     * Convention pins, all inherited from the RW-1 gate and re-asserted here:
+     *   - the SAME THC eri as the imaginary-axis side (`thc`), so the factorization is common
+     *     mode and cancels out of every comparison;
+     *   - the SAME beta and the SAME mu (grid.mu_chem() is the loop's mu);
+     *   - the SAME div_treatment string, so the q = Gamma BODY is treated identically on both
+     *     axes: under ignore_g0 both zero it, otherwise both solve the Dyson equation there
+     *     with the regularized auxiliary V. (The q -> 0 HEAD is NOT taken from this chain --
+     *     see the head sector in build_modea_context.)
+     *   - eta enters ONLY through A; the grids are sized from eta by the RW-1 rules
+     *     (real_axis_qp_A.hpp), and real_freq_grid_t enforces Nyquist as a hard error.
+     */
+    template<typename thc_t>
+    void build_spectral_W(spectral_ctx_t &sp, thc_t &thc,
+                          const sArray_t<Array_view_4D_t> &sMO_skia,
+                          const sArray_t<Array_view_3D_t> &sE_ska,
+                          double mu, double beta, modea_opts const &opts,
+                          std::string const &div_treatment, int lvl) {
+      using methods::real_axis::real_freq_grid_t;
+      using methods::real_axis::real_axis_mb_state_t;
+      using methods::real_axis::real_axis_scr_coulomb_t;
+      const auto t0 = std::chrono::steady_clock::now();
+
+      auto mpi = thc.mpi();
+      auto MF  = thc.MF();
+      const long ns      = sE_ska.shape()[0];
+      const long nk_ibz  = sE_ska.shape()[1];
+      const long nbnd    = sE_ska.shape()[2];
+      const long Naux    = thc.Np();
+      const long Nq_ibz  = MF->nqpts_ibz();
+
+      utils::check(nk_ibz == MF->nkpts_ibz(),
+                   "qp_modea (spectral): the QP block carries {} k-points but the mean field "
+                   "has {} in the IBZ.", nk_ibz, MF->nkpts_ibz());
+
+      // ---- the frequency window, from the CURRENT QP spectrum (absolute energies) --------
+      double e_min = 1e300, e_max = -1e300;
+      {
+        auto E = sE_ska.local();
+        for (long s = 0; s < ns; ++s)
+          for (long k = 0; k < nk_ibz; ++k)
+            for (long a = 0; a < nbnd; ++a) {
+              const double e = E(s, k, a).real();
+              e_min = std::min(e_min, e); e_max = std::max(e_max, e);
+            }
+      }
+      sp.eta       = opts.spectral_eta;
+      sp.w_max     = std::max(std::abs(e_min), std::abs(e_max)) + 2.0;
+      sp.Omega_max = 2.0 * sp.w_max;
+      auto gs = methods::real_axis::size_grids(sp.eta, sp.w_max, sp.Omega_max);
+      sp.N_w = gs.N_w; sp.N_t = gs.N_t; sp.N_O = gs.N_Omega;
+      sp.dw = gs.dw; sp.dOmega = gs.dOmega; sp.dt = gs.dt; sp.T_window = gs.T_window;
+
+      app_log(lvl, "  - SPECTRAL W^c (RW-2):         eta = {:.4e} a.u. ({:.4g} eV); eps range "
+                   "[{:+.4f}, {:+.4f}] Ha -> w_max = {:.4f}, Omega_max = {:.4f}",
+              sp.eta, sp.eta * 27.211386245988, e_min, e_max, sp.w_max, sp.Omega_max);
+      // THE CHEMICAL POTENTIAL. real_freq_grid_t::mu_chem is set once at construction and has
+      // no setter, and it feeds BOTH the absolute-energy Fermi factors inside the fixed Pi
+      // kernel AND the w_abs = w + mu convention of the A builder. It must therefore be the
+      // LIVE loop mu at every rebuild -- on a metal it moves iteration to iteration. (The
+      // branch's own dispatcher instead sets it once to the KS direct-gap midpoint; that is
+      // defect #7 of notes/real_axis_refs_audit.md section 8.7a and it cannot occur here
+      // because the context build is handed the loop's mu, but it is asserted and logged.)
+      utils::check(std::isfinite(mu), "qp_modea (spectral): non-finite mu.");
+      app_log(lvl, "  - SPECTRAL mu (LIVE):          grid.mu_chem() = {:.12f} a.u. -- the "
+                   "CURRENT loop mu, rebuilt every outer iteration", mu);
+      app_log(lvl, "  - SPECTRAL grids (derived):    N_w = {} (dw = {:.5f} = eta/{:.2f}), "
+                   "N_t = {} (T = {:.1f} = {:.1f}/eta, dt = {:.4f}), N_Omega = {} "
+                   "(dOmega = {:.5f} = eta/{:.2f})",
+              sp.N_w, sp.dw, sp.eta / sp.dw, sp.N_t, sp.T_window, sp.T_window * sp.eta,
+              sp.dt, sp.N_O, sp.dOmega, sp.eta / sp.dOmega);
+
+      // GUARD. Every grid size is DERIVED from the QP spectrum through
+      // w_max = max|eps| + 2, so a spectrum that has run away makes them run away with it:
+      // measured on the RW-2-d leg, after a first map that left dmax(H_eff) at 1.7e+04 a.u.
+      // the second map's sizing came out N_w = 1366129, N_t = 4194304, N_Omega = 683064 and
+      // the job died of resources instead of saying why. A physics divergence must not
+      // present as an OOM, so it is turned into a diagnosable abort here. The cap is far
+      // above any converged case (SVO at eta = 0.05 needs N_w = 381, N_t = 2048,
+      // N_Omega = 190; lih222 at eta = 0.0125 needs 1187 / 4096 / 657).
+      {
+        constexpr long grid_cap = 1L << 17;      // 131072
+        utils::check(sp.N_w <= grid_cap and sp.N_t <= grid_cap and sp.N_O <= grid_cap,
+                     "qp_modea (spectral): the derived real-axis grids are unreasonable "
+                     "(N_w = {}, N_t = {}, N_Omega = {}, cap {}). They are set by the CURRENT "
+                     "QP spectrum through w_max = max|eps| + 2 = {:.4g} a.u. (eps range "
+                     "[{:+.4g}, {:+.4g}] Ha) and by qp_modea_spectral_eta = {:.4g}. A window "
+                     "this wide means the quasiparticle spectrum has run away -- look at "
+                     "dmax(H_eff) of the previous iteration -- not that the grid rule is "
+                     "wrong. Fix the divergence, or raise eta.",
+                     sp.N_w, sp.N_t, sp.N_O, grid_cap, sp.w_max, e_min, e_max, sp.eta);
+      }
+
+      real_freq_grid_t grid = real_freq_grid_t::make_uniform(
+          beta, mu, sp.w_max, sp.N_w, sp.Omega_max, sp.N_O, sp.N_t, sp.T_window);
+
+      real_axis_mb_state_t state(grid);
+      state.mpi = mpi;
+      state.A_wskij.emplace(*state.mpi,
+          std::array<long, 5>{sp.N_w, ns, nk_ibz, nbnd, nbnd});
+      if (state.A_wskij->node_comm()->root()) {
+        auto MO_loc = sMO_skia.local();
+        methods::real_axis::build_A_from_QP_poles(state.A_wskij->local(), grid,
+                                                  sE_ska.local(), &MO_loc, sp.eta);
+      }
+      state.A_wskij->node_sync();
+
+      // The k-space Pi branch hard-requires IBZ == FBZ; R-space is the production default
+      // for Nk > 1 and is the only legal choice on a symmetry-reduced mesh.
+      const bool use_rspace = (MF->nkpts() > 1);
+
+      // THE q = Gamma BODY. The real-axis chain zeroes Pi AND W at Gamma when and only when
+      // it is constructed with div_treatment == "ignore_g0" (real_axis_scr_coulomb_t.h:341,
+      // :634, :875) -- the RW-1 gate's known structural difference D1. The IMAGINARY-axis
+      // chain never does that: it solves the Dyson equation at Gamma with the regularized
+      // auxiliary V = thc.Z(0) whatever div_treatment says, and the stored dW_qtPQ that the
+      // LS routes fit therefore HAS a Gamma body. Zeroing it here would drop one q of nq
+      // from Sigma^c and is measurable: on qe_lih222 it left the Lehmann meter at exactly
+      // 1.0 (100 % relative) at q = 0. So the solver is always constructed with a
+      // non-ignore_g0 string and the two axes treat the Gamma BODY identically.
+      // This does NOT touch the q -> 0 HEAD, which stays the production Matsubara
+      // eps_inv_head (spec item 3); the module's own eps_inv_head_O is computed as a side
+      // effect of this choice and is never read.
+      real_axis_scr_coulomb_t scr_re(&grid, "rpa", "gygi", 1e-9);
+      (void)div_treatment;
+      scr_re.update_w(state, thc, /*verbose*/ false, use_rspace);
+      utils::check(state.ImW_qPQO.has_value(),
+                   "qp_modea (spectral): the real-axis chain produced no Im W^c.");
+
+      // ---- keep this rank's (P,Q) tile, plus the grid's own nodes/weights ---------------
+      auto Pr = state.ImW_qPQO->local_range(1);
+      auto Qr = state.ImW_qPQO->local_range(2);
+      sp.P0 = Pr.first(); sp.Q0 = Qr.first();
+      sp.nPl = Pr.size(); sp.nQl = Qr.size();
+      sp.ImW = nda::array<double, 4>(state.ImW_qPQO->local());
+      {
+        nda::array<double, 1> Og(grid.Omega()), Ogw(grid.Omega_weights());
+        sp.qg = wc_spectral::make_quad_grid(Og, Ogw);
+      }
+      utils::check(sp.ImW.shape()[0] == Nq_ibz and sp.ImW.shape()[3] == sp.N_O,
+                   "qp_modea (spectral): Im W^c tile has shape ({}, {}, {}, {}), expected "
+                   "({}, {}, {}, {}).", sp.ImW.shape()[0], sp.ImW.shape()[1],
+                   sp.ImW.shape()[2], sp.ImW.shape()[3], Nq_ibz, sp.nPl, sp.nQl, sp.N_O);
+      (void)Naux;
+      sp.t_wall = std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - t0).count();
+      sp.on = true;
+    }
+#endif // ENABLE_FINUFFT
+
   } // detail
 
   /**
@@ -724,17 +924,10 @@ namespace qp_modea {
       }
     }
 
-    auto mpf = (opts.wfit == "nu")
-                   ? imag_axes_ft::masked_pole_fit::from_matsubara(pf, zb, gap_edge, opts.wrtol)
-                   : imag_axes_ft::masked_pole_fit::from_tau(pf, gap_edge, opts.wrtol);
-    const long npk = mpf.nkeep;
-    ctx.npk = npk;
-    ctx.om = nda::array<double, 1>(npk);
-    ctx.nB = nda::array<double, 1>(npk);
-    for (long p = 0; p < npk; ++p) {
-      ctx.om(p) = mpf.om(p);
-      ctx.nB(p) = sigma_route_b::stable_nB(ctx.beta, ctx.om(p));
-    }
+    // RW-2: the pole set itself is built AFTER the stage-1 preamble below, because the
+    // spectral route needs the Gamma-head decision (and the head's own Matsubara data) to
+    // size its appended head sector. Nothing between here and there depends on npk.
+    const bool spectral = (opts.wfit == "spectral");
     ctx.diag.gap_edge = gap_edge;
     {   // global QP band edges of the CURRENT spectrum -- the strip test needs them
       double lo = -1e300, hi = 1e300;
@@ -747,7 +940,6 @@ namespace qp_modea {
           }
       ctx.vbm = lo; ctx.cbm = hi;
     }
-    ctx.diag.n_support = npk;
     ctx.diag.np_total = pf.np;
 
     // reality of the tau <-> nu kernels: if Ttw_bb is real then Hermiticity of the STORED
@@ -758,12 +950,6 @@ namespace qp_modea {
       for (auto const &v : T) im = std::max(im, std::abs(std::imag(ComplexType(v))));
       ctx.diag.ttw_imag = im;
     }
-
-    app_log(lvl, "  - W^c support constraint:      |eps_p| >= {:.6g} a.u. ({:.4g} eV) -- "
-                 "{} of {} auxiliary nodes retained, {} singular directions",
-            gap_edge, gap_edge * 27.211386245988, npk, pf.np, mpf.n_kept);
-    app_log(lvl, "  - W^c pole-fit route:          {} ({} rows), SVD cut rel_tol = {:.2g}",
-            opts.wfit, mpf.nrow, mpf.rel_tol);
 
     // ---------------- stage 1: per-q residue slabs ------------------------------------
     auto &dW = mb_state.dW_qtPQ.value();
@@ -829,6 +1015,201 @@ namespace qp_modea {
       app_log(lvl, "  - Gamma head:                  OFF (div_treatment = {})", div_treatment);
     }
 
+    // ================= THE POLE SET ===================================================
+    // Two representation classes share everything downstream of this block: a list of pole
+    // energies ctx.om(p) and, per q, a residue slab sWres(q, p, P, Q) such that
+    //     W^c_PQ(q, z) = sum_p sWres(q, p, P, Q) / (z - om_p).
+    std::optional<imag_axes_ft::masked_pole_fit> mpf_opt;
+    detail::spectral_ctx_t sp;
+    long npk = 0;
+    if (not spectral) {
+      mpf_opt = (opts.wfit == "nu")
+                    ? imag_axes_ft::masked_pole_fit::from_matsubara(pf, zb, gap_edge, opts.wrtol)
+                    : imag_axes_ft::masked_pole_fit::from_tau(pf, gap_edge, opts.wrtol);
+      npk = mpf_opt->nkeep;
+      ctx.om = nda::array<double, 1>(npk);
+      ctx.nB = nda::array<double, 1>(npk);
+      for (long p = 0; p < npk; ++p) {
+        ctx.om(p) = mpf_opt->om(p);
+        ctx.nB(p) = sigma_route_b::stable_nB(ctx.beta, ctx.om(p));
+      }
+      app_log(lvl, "  - W^c support constraint:      |eps_p| >= {:.6g} a.u. ({:.4g} eV) -- "
+                   "{} of {} auxiliary nodes retained, {} singular directions",
+              gap_edge, gap_edge * 27.211386245988, npk, pf.np, mpf_opt->n_kept);
+      app_log(lvl, "  - W^c pole-fit route:          {} ({} rows), SVD cut rel_tol = {:.2g}",
+              opts.wfit, mpf_opt->nrow, mpf_opt->rel_tol);
+      // RW-2 spec item 5: on a metal E_PH is the k-mesh level spacing, not a physical gap,
+      // so the support constraint strips REAL low-omega weight from W^c. Measured on SVO
+      // (notes/qpgw_metal_mode_m0.md section 8a): 12 of 74 nodes, i.e. everything below
+      // 0.52 eV, gone at the first map and 1 of 74 at the second -- set by the k mesh.
+      if (gap_edge > 0.0 and gap_edge < 10.0 * M_PI / ctx.beta)
+        app_warning("qp_modea: the W^c support constraint is active at gap_edge = {:.4g} a.u. "
+                    "({:.4g} eV), which is INSIDE the Matsubara mesh-spacing class 10 pi/beta "
+                    "= {:.4g} a.u. On a metal E_PH is the k-mesh level spacing rather than a "
+                    "physical particle-hole gap, so this is stripping physical low-frequency "
+                    "weight from W^c and how much is stripped depends on the k mesh. Use "
+                    "qp_modea_wfit = \"spectral\" (the computed-support representation), or "
+                    "qp_modea_wsupp = off.",
+                    gap_edge, gap_edge * 27.211386245988, 10.0 * M_PI / ctx.beta);
+    } else {
+#ifndef ENABLE_FINUFFT
+      utils::check(false,
+                   "qp_modea: qp_modea_wfit = \"spectral\" needs the real-axis W chain, which "
+                   "is only compiled with -DENABLE_FINUFFT=ON. Rebuild with that flag (see "
+                   "notes/rw1_port_report.md section 8) or use qp_modea_wfit = tau|nu.");
+#else
+      // ---- (a) the computed Im W^c(q, P, Q, Omega) ----------------------------------
+      detail::build_spectral_W(sp, thc, sMO_skia, sE_ska, mu, ctx.beta, opts,
+                               div_treatment, lvl);
+
+      // ---- (b) the trace weights t_j = tr A_j, summed over q -------------------------
+      // A_j = -(1/pi) w_j Im W^c(Omega_j) is the residue matrix of the pole at +Omega_j
+      // (wc_spectral.hpp eq. B) and is positive semi-definite; its trace steers the
+      // coarsening. The diagonal lives on whichever ranks own (P == Q), so reduce.
+      const long NQD = sp.qg.Om.shape(0);
+      nda::array<double, 1> tj(NQD);
+      tj() = 0.0;
+      double imw_num = 0.0, imw_den = 0.0;
+      for (long iq = 0; iq < nq_ibz; ++iq)
+        for (long iP = 0; iP < sp.nPl; ++iP) {
+          const long Pg = sp.P0 + iP;
+          for (long iQ = 0; iQ < sp.nQl; ++iQ) {
+            const long Qg = sp.Q0 + iQ;
+            for (long j = 0; j < sp.N_O; ++j)
+              imw_den = std::max(imw_den, std::abs(sp.ImW(iq, iP, iQ, j)));
+            if (Pg != Qg) continue;
+            for (long j = 0; j < NQD; ++j)
+              tj(j) += -wc_spectral::inv_pi * sp.qg.Ow(j)
+                     * sp.ImW(iq, iP, iQ, sp.qg.src(j));
+          }
+        }
+      mpi->comm.all_reduce_in_place_n(tj.data(), tj.size(), std::plus<>{});
+      // (P,Q) symmetry of the stored Im W^c -- the premise that makes the elementwise
+      // imaginary part the matrix spectral function. Only measurable where a rank owns
+      // both (P,Q) and (Q,P); a square-ish proc grid does for most of them.
+      for (long iq = 0; iq < nq_ibz; ++iq)
+        for (long iP = 0; iP < sp.nPl; ++iP)
+          for (long iQ = 0; iQ < sp.nQl; ++iQ) {
+            const long Pg = sp.P0 + iP, Qg = sp.Q0 + iQ;
+            if (Pg < sp.Q0 or Pg >= sp.Q0 + sp.nQl) continue;
+            if (Qg < sp.P0 or Qg >= sp.P0 + sp.nPl) continue;
+            for (long j = 0; j < sp.N_O; ++j)
+              imw_num = std::max(imw_num, std::abs(sp.ImW(iq, iP, iQ, j)
+                                                 - sp.ImW(iq, Qg - sp.P0, Pg - sp.Q0, j)));
+          }
+      imw_num = mpi->comm.all_reduce_value(imw_num, boost::mpi3::max<>{});
+      imw_den = mpi->comm.all_reduce_value(imw_den, boost::mpi3::max<>{});
+      sp.imw_sym = (imw_den > 0.0) ? imw_num / imw_den : 0.0;
+
+      // ---- (c) coarsening ------------------------------------------------------------
+      sp.plan = wc_spectral::build_bins(sp.qg.Om, tj, opts.spectral_npole);
+      sp.nbin = sp.plan.nbin;
+      sp.n_neg_trace = sp.plan.n_neg;
+      sp.neg_frac = sp.plan.neg_frac;
+      sp.width_worst = sp.plan.width_worst;
+
+      // ---- (d) THE q = GAMMA SLOT (per-q HYBRID; Fable ruling, 2026-08-20) -------------
+      // The ported real-axis chain is asked here to Dyson Gamma like the Matsubara side
+      // does (see the div_treatment note in build_spectral_W), but the Gamma column is
+      // special on three counts -- it carries the 1/q^2 head, it is the largest |W| of the
+      // mesh, and it is the one q whose real-axis treatment on the branch is a hard-coded
+      // zero rather than a computed object. The RULING is therefore a PER-Q HYBRID: the
+      // spectral quadrature represents q != Gamma, and Gamma keeps the EXISTING LS
+      // representation of its whole Matsubara column (body + eps_inv_head augmentation),
+      // on an APPENDED pole set. Every q's representation is logged.
+      //
+      // [DEVIATIONS, flagged: (i) this sector is NOT sign-definite -- it is exactly the LS
+      //  object the body used to be, on 1 of nq transfers, and the Sabs probe reports its
+      //  share of Sabs separately so any residual cancellation is measured; (ii) the fit is
+      //  the "nu" route rather than the production "tau" default, which the QM3-b survey
+      //  measured as the better-conditioned of the two at REAL z by an order in the residue
+      //  ratio (qp_params_t.h: nu 1e-8 -> 4.3e2 vs tau 1e-8 -> 6.0e3); (iii) it carries the
+      //  SAME support constraint gap_edge the production LS path uses.]
+      sp.iq_gamma = 0;                 // the Gamma transfer, div_utils / embed_eri_t convention
+      sp.gamma_ls = (opts.spectral_gamma != "spectral");
+      if (sp.gamma_ls) {
+        auto gfit = imag_axes_ft::masked_pole_fit::from_matsubara(pf, zb, gap_edge, opts.wrtol);
+        sp.npole_gamma = gfit.nkeep;
+        sp.om_gamma = nda::array<double, 1>(sp.npole_gamma);
+        for (long p = 0; p < sp.npole_gamma; ++p) sp.om_gamma(p) = gfit.om(p);
+      } else if (head_on) {
+        // "spectral" Gamma: the BODY comes from the quadrature like every other q, and only
+        // the SCALAR eps_inv_head rides appended LS poles (unconstrained -- the head is not
+        // a particle-hole spectrum and the support constraint does not apply to it).
+        auto const &eih = mb_state.eps_inv_head.value();
+        utils::check(eih.shape(0) == nt_half,
+                     "qp_modea (spectral): eps_inv_head has {} nodes, dW(tau) has {}.",
+                     eih.shape(0), nt_half);
+        nda::array<ComplexType, 2> ht(nt_half, 1), hw_half(nw_half, 1), hw(nwb, 1);
+        for (long t = 0; t < nt_half; ++t) ht(t, 0) = ComplexType(eih(t).real(), 0.0);
+        FT.tau_to_w_PHsym(ht, hw_half);
+        for (long iw = 0; iw < nwb; ++iw) hw(iw, 0) = hw_half(half_of(iw), 0);
+        auto hfit = imag_axes_ft::masked_pole_fit::from_matsubara(pf, zb, 0.0, opts.wrtol);
+        auto hc = hfit.coeffs(hw);
+        sp.npole_gamma = hfit.nkeep;
+        sp.om_gamma = nda::array<double, 1>(sp.npole_gamma);
+        sp.r_head   = nda::array<ComplexType, 1>(sp.npole_gamma);
+        double hn = 0.0, hd = 0.0;
+        for (long p = 0; p < sp.npole_gamma; ++p) {
+          sp.om_gamma(p) = hfit.om(p);
+          sp.r_head(p)   = hfit.residue_scale(p) * hc(p, 0);
+        }
+        for (long m = 0; m < nwb; ++m) {
+          ComplexType rec(0.0, 0.0);
+          for (long p = 0; p < sp.npole_gamma; ++p) rec += sp.r_head(p) / (zb(m) - sp.om_gamma(p));
+          hn = std::max(hn, std::abs(rec - hw(m, 0)));
+          hd = std::max(hd, std::abs(hw(m, 0)));
+        }
+        sp.gamma_rec = (hd > 0.0) ? hn / hd : 0.0;
+      }
+
+      // ---- (e) the pole list ---------------------------------------------------------
+      npk = 2 * sp.nbin + sp.npole_gamma;
+      ctx.om = nda::array<double, 1>(npk);
+      ctx.nB = nda::array<double, 1>(npk);
+      {
+        auto om_s = wc_spectral::pole_list(sp.plan);
+        for (long p = 0; p < 2 * sp.nbin; ++p) ctx.om(p) = om_s(p);
+        for (long p = 0; p < sp.npole_gamma; ++p) ctx.om(2 * sp.nbin + p) = sp.om_gamma(p);
+        for (long p = 0; p < npk; ++p)
+          ctx.nB(p) = sigma_route_b::stable_nB(ctx.beta, ctx.om(p));
+      }
+      app_log(lvl, "  - W^c pole-fit route:          {} -- SPECTRAL QUADRATURE at "
+                   "the {} transfers ({} Omega nodes (+1 virtual at Omega_0/2) -> "
+                   "{} bins -> {} poles at +-Omega), appended LS poles at q = Gamma (IBZ "
+                   "index {}, {} poles, support |eps_p| >= {:.6g} a.u.) => npk {}",
+              sp.gamma_ls ? "PER-Q HYBRID (spectral_gamma = ls)"
+                          : "SPECTRAL AT EVERY q (spectral_gamma = spectral; only the "
+                            "eps_inv_head rides the appended poles)",
+              sp.gamma_ls ? nq_ibz - 1 : nq_ibz, sp.N_O, sp.nbin, 2 * sp.nbin, sp.iq_gamma,
+              sp.npole_gamma, sp.gamma_ls ? gap_edge : 0.0, npk);
+      app_log(lvl, "  - SPECTRAL coarsening:         worst relative bin width = {:.3e}; "
+                   "|Omega| in [{:.4e}, {:.4e}] a.u.; trace weight negative at {} of {} "
+                   "nodes ({:.2e} of the total)",
+              sp.width_worst, sp.plan.om_c(0), sp.plan.om_c(sp.nbin - 1),
+              sp.n_neg_trace, sp.qg.Om.shape(0), sp.neg_frac);
+      app_log(lvl, "  - SPECTRAL Im W^c symmetry:    max|ImW_PQ - ImW_QP| / max|ImW| = {:.3e} "
+                   "(REPORTED, not required: the -Omega residue is the TRANSPOSE -A^T, so a "
+                   "non-symmetric Im W^c is handled exactly; a value near 0 only means the "
+                   "transpose happens to be a no-op on this fixture); real-axis chain wall "
+                   "{:.2f} s", sp.imw_sym, sp.t_wall);
+      app_log(lvl, "  - SPECTRAL Gamma slot:         q = {} carries {} appended LS poles "
+                   "representing {}; the eps_inv_head augmentation is unchanged from the "
+                   "tau/nu routes",
+              sp.iq_gamma, sp.npole_gamma,
+              sp.gamma_ls ? "the WHOLE Matsubara column (body + head)"
+                          : "the eps_inv_head SCALAR only (the body is spectral)");
+      // memory forecast: the two objects that are LINEAR in npk.
+      app_log(lvl, "  - SPECTRAL cost forecast:      residue slabs {:.1f} GB (node-shared), "
+                   "sandwich {:.1f} GB per owned (s,k) block",
+              double(nq_ibz) * double(npk) * double(NP) * double(NP) * 16.0 / 1.073741824e9,
+              double(nbnd) * double(nbnd) * double(nkpts) * double(nbnd) * double(npk)
+                  * 16.0 / 1.073741824e9);
+#endif
+    }
+    ctx.npk = npk;
+    ctx.diag.n_support = npk;
+
     auto sWres = make_shared_array<nda::array_view<ComplexType, 4>>(
         *mpi, {nq_ibz, npk, NP, NP});
     auto sWt = make_shared_array<nda::array_view<ComplexType, 3>>(*mpi, {nt_half, NP, NP});
@@ -836,7 +1217,11 @@ namespace qp_modea {
     sWres.win().fence();
 
     nda::array<ComplexType, 2> Wt(nt_half, nc), Whalf(nw_half, nc), Ww(nwb, nc);
-    nda::array<ComplexType, 2> Wf((opts.wfit == "nu") ? 0 : ntf, (opts.wfit == "nu") ? 0 : nc);
+    nda::array<ComplexType, 2> Wf((opts.wfit == "tau") ? ntf : 0, (opts.wfit == "tau") ? nc : 0);
+    // RW-2: the spectral fill needs an internode all_reduce of sWres before the rep can be
+    // read back, so its Lehmann meter runs in a second pass and the per-q reference is kept.
+    nda::array<ComplexType, 3> Ww_all(spectral ? nq_ibz : 0, spectral ? nwb : 0,
+                                      spectral ? nc : 0);
     double herm_num = 0.0, herm_den = 0.0, rec_worst = 0.0, fit_worst = 0.0, ratio_worst = 0.0;
     double rec_abs_worst = 0.0, rec_abs_den = 0.0, rec_abs_sum = 0.0, w_max_sum = 0.0;
     long rec_q = -1, rec_abs_q = -1;
@@ -868,6 +1253,50 @@ namespace qp_modea {
           for (long j = 0; j < nc; ++j) Ww(iw, j) = Whalf(half_of(iw), j);
       }
 
+      if (spectral and sp.gamma_ls and iq == sp.iq_gamma) {
+        // ---- THE GAMMA SLOT: the EXISTING LS representation, appended pole set ---------
+        // Ww here is the FULL Matsubara Gamma column -- body plus the eps_inv_head
+        // augmentation applied to Wt above -- so this is bit-for-bit the object the tau/nu
+        // routes fit, on the same support-constrained node set, written into the appended
+        // pole range. Node-comm column chunking, so it is node-complete and must NOT be
+        // included in the internode all_reduce below (it is written after it).
+        for (long m = 0; m < nwb; ++m)
+          for (long j = 0; j < nc; ++j) Ww_all(iq, m, j) = Ww(m, j);
+        mpi->node_comm.barrier();
+        continue;
+      }
+      if (spectral) {
+        // ---- SPECTRAL FILL (RW-2, wc_spectral.hpp eq. B) -----------------------------
+        // Poles 0..nbin-1 sit at +Omega_b with residue A_b = -(1/pi) sum_{j in b} w_j
+        // Im W^c(Omega_j); poles nbin..2nbin-1 sit at -Omega_b with residue -A_b^T -- the
+        // TRANSPOSE, because the bosonic reflection of a MATRIX response is
+        // Im W_PQ(-Omega) = -Im W_QP(Omega) and Im W^c is NOT (P,Q)-symmetric in general
+        // (measured 5.3e-01 on SVO against 1.1e-13 on qe_lih222). The transpose is applied
+        // by writing the -Omega element at the SWAPPED global position, which keeps every
+        // access inside this rank's own tile: the union of the tiles covers all (P,Q), so
+        // the union of the swapped writes covers all (Q,P).
+        // This rank writes its OWN global (P,Q) tile of the real-axis distribution -- a
+        // different partition from the (c0, c1) column chunk used above -- so the slabs
+        // are completed by an internode all_reduce after the loop.
+        for (long p = 0; p < sp.nbin; ++p) {
+          const long lo = sp.plan.lo(p), hi = sp.plan.hi(p);
+          for (long iP = 0; iP < sp.nPl; ++iP)
+            for (long iQ = 0; iQ < sp.nQl; ++iQ) {
+              double acc = 0.0;
+              for (long j = lo; j < hi; ++j)
+                acc += sp.qg.Ow(j) * sp.ImW(iq, iP, iQ, sp.qg.src(j));
+              const ComplexType A(-wc_spectral::inv_pi * acc, 0.0);
+              sWres.local()(iq, p, sp.P0 + iP, sp.Q0 + iQ) = A;
+              sWres.local()(iq, sp.nbin + p, sp.Q0 + iQ, sp.P0 + iP) = -A;
+            }
+        }
+        for (long m = 0; m < nwb; ++m)
+          for (long j = 0; j < nc; ++j) Ww_all(iq, m, j) = Ww(m, j);
+        mpi->node_comm.barrier();
+        continue;
+      }
+
+      auto const &mpf = *mpf_opt;
       nda::array<ComplexType, 2> cfit;
       if (opts.wfit == "nu") {
         cfit = mpf.coeffs(Ww);
@@ -959,6 +1388,141 @@ namespace qp_modea {
       mpi->node_comm.barrier();
     }
     sWres.win().fence();
+
+    if (spectral) {
+      // ---- complete the body slabs across nodes -------------------------------------
+      // Each rank wrote its own global (P,Q) tile of the real-axis distribution and zeros
+      // elsewhere, so the internode sum is the completion (within a node the tiles are
+      // already disjoint). This is the ONE collective the spectral path adds.
+      sWres.all_reduce();
+      sWres.win().fence();
+
+      // ---- the q = Gamma slot, on the appended LS pole range ------------------------
+      // Written with the (c0, c1) column chunking, which is node-complete, so it must come
+      // AFTER the all_reduce above or it would be double counted.
+      if (not sp.gamma_ls) {
+        // "spectral" Gamma: only the rank-one head sector rides the appended poles.
+        for (long p = 0; p < sp.npole_gamma; ++p)
+          for (long j = 0; j < nc; ++j)
+            sWres.local()(sp.iq_gamma, 2 * sp.nbin + p, (c0 + j) / NP, (c0 + j) % NP)
+                = sp.r_head(p) * Hcol(j);
+        sWres.win().fence();
+        app_log(lvl, "  - SPECTRAL Gamma head fit:     bosonic-mesh reconstruction of the "
+                     "scalar eps_inv_head on its {} appended poles = {:.4e}",
+                sp.npole_gamma, sp.gamma_rec);
+      } else {
+        auto gfit = imag_axes_ft::masked_pole_fit::from_matsubara(pf, zb, gap_edge, opts.wrtol);
+        nda::array<ComplexType, 2> Wg(nwb, nc);
+        for (long m = 0; m < nwb; ++m)
+          for (long j = 0; j < nc; ++j) Wg(m, j) = Ww_all(sp.iq_gamma, m, j);
+        auto cg = gfit.coeffs(Wg);
+        for (long p = 0; p < sp.npole_gamma; ++p)
+          for (long j = 0; j < nc; ++j) cg(p, j) *= gfit.residue_scale(p);
+        double gn = 0.0, gd = 0.0;
+        for (long m = 0; m < nwb; ++m)
+          for (long j = 0; j < nc; ++j) {
+            ComplexType rec(0.0);
+            for (long p = 0; p < sp.npole_gamma; ++p) rec += cg(p, j) / (zb(m) - sp.om_gamma(p));
+            gn = std::max(gn, std::abs(rec - Wg(m, j)));
+            gd = std::max(gd, std::abs(Wg(m, j)));
+          }
+        sp.gamma_rec = mpi->comm.all_reduce_value((gd > 0.0) ? gn / gd : 0.0,
+                                                  boost::mpi3::max<>{});
+        for (long p = 0; p < sp.npole_gamma; ++p)
+          for (long j = 0; j < nc; ++j)
+            sWres.local()(sp.iq_gamma, 2 * sp.nbin + p, (c0 + j) / NP, (c0 + j) % NP) = cg(p, j);
+        sWres.win().fence();
+        app_log(lvl, "  - SPECTRAL Gamma LS fit:       bosonic-mesh reconstruction of the "
+                     "q = {} column on its {} appended poles = {:.4e}",
+                sp.iq_gamma, sp.npole_gamma, sp.gamma_rec);
+      }
+
+      // ---- THE PRODUCTION METER (spec item 4) --------------------------------------
+      // The Lehmann forward map of the quadrature representation, evaluated at the bosonic
+      // Matsubara nodes, against the STORED W^c(i nu) of the imaginary-axis solver. This is
+      // the two-sided anchor: it is the same number the LS routes report as
+      // rec_rel_worst, so the tau-anchor gate downstream scales with it unchanged.
+      // The STATIC node nu = 0 sits ON the real axis, where the dispersion relation carries
+      // an extra boundary term i Im W^c(Omega -> 0). That term is ANTISYMMETRIC in (P,Q)
+      // (section 2 of wc_spectral.hpp) and is a logarithm, not a pole, so no real-residue
+      // pole set can carry it: if the stored W^c(i nu = 0) has an imaginary part, the
+      // quadrature misses exactly that much there and nowhere else. The meter is therefore
+      // split -- nu = 0 vs nu != 0 -- and the imaginary content of the reference at nu = 0
+      // is reported, so a large meter can be attributed instead of guessed.
+      double nu0_dev = 0.0, nu0_den = 0.0, nu0_imag = 0.0;
+      for (long iq = 0; iq < nq_ibz; ++iq) {
+        double num = 0.0, den = 0.0, rmax = 0.0;
+        for (long j = 0; j < nc; ++j) {
+          const long Pg = (c0 + j) / NP, Qg = (c0 + j) % NP;
+          for (long p = 0; p < npk; ++p)
+            rmax = std::max(rmax, std::abs(sWres.local()(iq, p, Pg, Qg)));
+          for (long m = 0; m < nwb; ++m) {
+            const ComplexType z = zb(m);
+            ComplexType rec(0.0);
+            for (long p = 0; p < npk; ++p)
+              rec += sWres.local()(iq, p, Pg, Qg) / (z - ctx.om(p));
+            num = std::max(num, std::abs(rec - Ww_all(iq, m, j)));
+            den = std::max(den, std::abs(Ww_all(iq, m, j)));
+            if (std::abs(z) < 1e-12) {
+              nu0_dev = std::max(nu0_dev, std::abs(rec - Ww_all(iq, m, j)));
+              nu0_den = std::max(nu0_den, std::abs(Ww_all(iq, m, j)));
+              nu0_imag = std::max(nu0_imag, std::abs(Ww_all(iq, m, j).imag()));
+            }
+          }
+        }
+        if (den > 0.0 and num / den > rec_worst) { rec_worst = num / den; rec_q = iq; }
+        if (num > rec_abs_worst) { rec_abs_worst = num; rec_abs_q = iq; rec_abs_den = den; }
+        if (den > 0.0) ratio_worst = std::max(ratio_worst, rmax / den);
+        rec_abs_sum += num;
+        w_max_sum += den;
+      }
+      Ww_all = nda::array<ComplexType, 3>();
+      nu0_dev  = mpi->comm.all_reduce_value(nu0_dev,  boost::mpi3::max<>{});
+      nu0_den  = mpi->comm.all_reduce_value(nu0_den,  boost::mpi3::max<>{});
+      nu0_imag = mpi->comm.all_reduce_value(nu0_imag, boost::mpi3::max<>{});
+      app_log(lvl, "  - SPECTRAL static node:        rel dev at nu = 0 is {:.4e}; the stored "
+                   "reference there carries max|Im W^c| / max|W^c| = {:.3e} (the part the "
+                   "real-residue pole class cannot represent -- see the nu = 0 boundary term "
+                   "in wc_spectral.hpp section 2)",
+              (nu0_den > 0.0 ? nu0_dev / nu0_den : 0.0),
+              (nu0_den > 0.0 ? nu0_imag / nu0_den : 0.0));
+
+      // ---- definiteness audit of the merged residue slabs --------------------------
+      // Eq. (C) says the SYMMETRIC part of A_b is positive semi-definite; its diagonal is
+      // the diagonal of A_b itself, which is the cheap necessary condition probed here
+      // (diagonalizing a (Np x Np) slab per (q, b) is what stage 1b does anyway).
+      // Reported, never gated: a violation means the computed Im W^c does not have a
+      // negative semi-definite symmetric part, which is a statement about the real-axis
+      // chain, not about this representation.
+      {
+        double worst = 0.0;
+        for (long iq = 0; iq < nq_ibz; ++iq) {
+          if (sp.gamma_ls and iq == sp.iq_gamma) continue;   // LS slabs there, not quadrature
+          for (long b = 0; b < sp.nbin; ++b) {
+            double dmin = 1e300, dmax = -1e300;
+            for (long j = 0; j < nc; ++j) {
+              const long Pg = (c0 + j) / NP, Qg = (c0 + j) % NP;
+              if (Pg != Qg) continue;
+              const double d = sWres.local()(iq, b, Pg, Qg).real();
+              dmin = std::min(dmin, d); dmax = std::max(dmax, d);
+            }
+            if (dmax > 0.0 and dmin < 0.0) worst = std::max(worst, -dmin / dmax);
+          }
+        }
+        sp.psd_neg = mpi->comm.all_reduce_value(worst, boost::mpi3::max<>{});
+      }
+      app_log(lvl, "  - SPECTRAL definiteness:       worst |min diag| / max diag of a merged "
+                   "residue slab = {:.3e} (eq. B predicts 0: A_b is positive semi-definite)",
+              sp.psd_neg);
+      auto &SPD = ctx.diag;
+      SPD.sp_eta = sp.eta;
+      SPD.sp_NO = sp.N_O; SPD.sp_Nw = sp.N_w; SPD.sp_Nt = sp.N_t;
+      SPD.sp_nbin = sp.nbin; SPD.sp_nhead = sp.npole_gamma;
+      SPD.sp_width = sp.width_worst; SPD.sp_negfrac = sp.neg_frac;
+      SPD.sp_sym = sp.imw_sym; SPD.sp_psdneg = sp.psd_neg;
+      SPD.sp_headrec = sp.gamma_rec; SPD.sp_wall = sp.t_wall;
+    }
+
     ctx.diag.w_herm_rel = (herm_den > 0.0) ? herm_num / herm_den : 0.0;
     ctx.diag.w_herm_rel = mpi->comm.all_reduce_value(ctx.diag.w_herm_rel, boost::mpi3::max<>{});
     ctx.diag.rec_rel_worst = mpi->comm.all_reduce_value(rec_worst, boost::mpi3::max<>{});
@@ -1763,7 +2327,17 @@ namespace qp_modea {
     LR.npk = npk;
     LR.wfit = opts.wfit;
     LR.res_ratio = ctx.diag.res_ratio_worst;
-    LR.wrtol = mpf.rel_tol;
+    LR.wrtol = mpf_opt.has_value() ? mpf_opt->rel_tol : opts.wrtol;
+    // RW-2 spectral census (all zero on the tau/nu routes)
+    LR.sp_eta = ctx.diag.sp_eta;
+    LR.sp_NO = ctx.diag.sp_NO;
+    LR.sp_nbin = ctx.diag.sp_nbin;
+    LR.sp_nhead = ctx.diag.sp_nhead;
+    LR.sp_width = ctx.diag.sp_width;
+    LR.sp_sym = ctx.diag.sp_sym;
+    LR.sp_psdneg = ctx.diag.sp_psdneg;
+    LR.sp_headrec = ctx.diag.sp_headrec;
+    LR.sp_wall = ctx.diag.sp_wall;
     LR.wrank = opts.wrank;
     LR.wrank_max = ctx.diag.wrank_max;
     LR.wrank_mean = ctx.diag.wrank_mean;
