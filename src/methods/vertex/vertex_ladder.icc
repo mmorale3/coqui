@@ -805,8 +805,26 @@ namespace solvers {
           if (lsize > 1) {
             // disjoint (ik, ikp) writes => the sum is exact whichever array carries it
             if (want_Kb) g_comm->all_reduce_in_place_n(Kb.data(), Kb.size(), std::plus<>{});
-            else if (any_solve)
-              g_comm->all_reduce_in_place_n(Kbig.data(), Kbig.size(), std::plus<>{});
+            else if (any_solve) {
+              // MPI carries an int element count, and Kbig is the ONE (D, D)-scale buffer
+              // on this path: D^2 crosses INT_MAX between the 6^3 and 8^3 meshes
+              // (lif kp888: D = 61952, D^2 = 3.84e9 -- job 6926160 died in the mpi3
+              // wrapper with std::system_error on exactly this call; 6^3 D = 26136,
+              // D^2 = 6.8e8, which is why the g-scan never saw it). Reduce in bounded
+              // slabs: the reduction is elementwise, so the slabbed result is IDENTICAL,
+              // not merely equivalent. COQUI_ALLREDUCE_CHUNK (debug) shrinks the slab so
+              // small fixtures exercise the multi-slab path; unset = 2^30 elements.
+              static const long kchunk = [] {
+                const char *e = std::getenv("COQUI_ALLREDUCE_CHUNK");
+                const long v = e ? std::atol(e) : 0l;
+                return (v > 0) ? v : (1l << 30);
+              }();
+              auto *kp = Kbig.data();
+              const long ktot = Kbig.size();
+              for (long off = 0; off < ktot; off += kchunk)
+                g_comm->all_reduce_in_place_n(kp + off, std::min(kchunk, ktot - off),
+                                              std::plus<>{});
+            }
           }
           pph.end();
           // --- Kt[(k'),(k)] = K(k,k')^T and conj(D) stack (nu-independent) -------------
