@@ -1134,8 +1134,19 @@ namespace qp_modea {
         for (long p = 0; p < sp.npole_gamma; ++p) sp.om_gamma(p) = gfit.om(p);
       } else if (head_on) {
         // "spectral" Gamma: the BODY comes from the quadrature like every other q, and only
-        // the SCALAR eps_inv_head rides appended LS poles (unconstrained -- the head is not
-        // a particle-hole spectrum and the support constraint does not apply to it).
+        // the SCALAR eps_inv_head rides appended LS poles.
+        //
+        // RW-2 FOLLOW-UP (report section 7 item 1, second half; the first implementation
+        // fit this UNCONSTRAINED with a comment claiming the support constraint "does not
+        // apply" to the head -- WRONG on both counts). eps_inv_head - 1 is built from the
+        // particle-hole polarization, so its spectral support obeys the same E_PH bound as
+        // the body; and on a metal under gygi_metal the head DATA is the enforced metallic
+        // zero plus noise, so an unconstrained fit resolves NOISE into sub-mesh-spacing
+        // poles whose n_B ~ 1/(beta*omega_p) weights are exactly the M-0b amplification
+        // class. Measured on SVO (rw2 leg 6917684): 6 poles below 3 pi/beta, down to
+        // |om_p| = 1.57e-06 a.u., carrying 86.7% of Sum|n_B| -- contaminating the eta = 0
+        // probe rows. The constrained fit removes them; the Gamma-head reconstruction
+        // meter (sp.gamma_rec, logged every build) reports what the constraint costs.
         auto const &eih = mb_state.eps_inv_head.value();
         utils::check(eih.shape(0) == nt_half,
                      "qp_modea (spectral): eps_inv_head has {} nodes, dW(tau) has {}.",
@@ -1144,7 +1155,8 @@ namespace qp_modea {
         for (long t = 0; t < nt_half; ++t) ht(t, 0) = ComplexType(eih(t).real(), 0.0);
         FT.tau_to_w_PHsym(ht, hw_half);
         for (long iw = 0; iw < nwb; ++iw) hw(iw, 0) = hw_half(half_of(iw), 0);
-        auto hfit = imag_axes_ft::masked_pole_fit::from_matsubara(pf, zb, 0.0, opts.wrtol);
+        auto hfit = imag_axes_ft::masked_pole_fit::from_matsubara(pf, zb, gap_edge,
+                                                                  opts.wrtol);
         auto hc = hfit.coeffs(hw);
         sp.npole_gamma = hfit.nkeep;
         sp.om_gamma = nda::array<double, 1>(sp.npole_gamma);
