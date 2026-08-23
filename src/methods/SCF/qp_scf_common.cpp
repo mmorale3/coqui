@@ -104,6 +104,8 @@ namespace {
     opts.tc_krylov = qp_params.qp_tc_krylov;
     opts.tc_krylov_tol = qp_params.qp_tc_krylov_tol;
     opts.cd_bstore_cap_gb = qp_params.qp_tc_bstore_gb;
+    opts.cd_bfactor = qp_params.qp_tc_bfactor;
+    opts.cd_batch_mb = qp_params.qp_tc_batch_mb;
     opts.iter = 1;
     std::string div = "ignore_g0";
     if constexpr (requires { mb_solver.corr->iter(); })
@@ -148,6 +150,12 @@ namespace {
                  "qp_modea: qp_tc_krylov_tol = {} must be in (0, 1).", opts.tc_krylov_tol);
     utils::check(opts.cd_bstore_cap_gb >= 0.0,
                  "qp_modea: qp_tc_bstore_gb = {} must be >= 0.", opts.cd_bstore_cap_gb);
+    utils::check(opts.cd_bfactor == "auto" or opts.cd_bfactor == "store"
+                 or opts.cd_bfactor == "recompute",
+                 "qp_modea: unknown qp_tc_bfactor = {}. Valid: \"auto\", \"store\", "
+                 "\"recompute\".", opts.cd_bfactor);
+    utils::check(opts.cd_batch_mb > 0.0,
+                 "qp_modea: qp_tc_batch_mb = {} must be > 0.", opts.cd_batch_mb);
 
     app_log(2, "\n* {} quasiparticle map (Project 2 increment QM3): building the "
                "evaluator context", qp_params.qp_map);
@@ -1744,6 +1752,11 @@ auto qp_approx(const sArray_t<Array_view_5D_t> &sSigma_tskij,
                "store cap = {:.2f} GB",
             qp_params.qp_tc_krylov ? "warm-started GMRES" : "dense",
             qp_params.qp_tc_krylov_tol, qp_params.qp_tc_bstore_gb);
+  if (qp_params.qp_modea_wfit == "contour")
+    app_log(2, "  - contour evaluator (TC-4): band factors = {}, residue batch budget = "
+               "{:.0f} MB (the evaluator's persistent work space; it sets how many "
+               "residue targets one batched call carries)",
+            qp_params.qp_tc_bfactor, qp_params.qp_tc_batch_mb);
   if (qp_params.qp_modea_wfit == "spectral")
     app_log(2, "  - spectral knobs (RW-2):  spectral_eta = {:.4g} a.u. ({:.4g} eV), "
                "spectral_npole = {} positive-Omega nodes after coarsening, spectral_gamma = {}",

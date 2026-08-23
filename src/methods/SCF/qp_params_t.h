@@ -240,14 +240,39 @@ struct qp_params_t {
   //                     qpscf block needs nbnd^2 and the dense inverse amortizes.
   //   qp_tc_krylov_tol  its relative-residual target. dense == Krylov measured 3.3e-13.
   //   qp_tc_bstore_gb   cap, in GB per owned (s,k) block, on the eq-1 residue term's
-  //                     band-factor store B_J(P,a). It is 0 (= OFF) by default so a
-  //                     production-size run cannot enable it by accident: the store is
-  //                     nJ x Np x nbnd complex, ~1 MB on qe_lih222 but ~1.3 TB at
-  //                     (64 k-points, Np 364, nbnd 60). FIXTURE-SCALE ONLY -- the
-  //                     production path must recompute B inside the evaluator (TC-4).
+  //                     band-factor STORE B_J(P,a) -- nJ x Np x nbnd complex, ~1 MB on
+  //                     qe_lih222 but ~1.25 GB at (64 k-points, Np 364, nbnd 60). It is
+  //                     0 by default, which under qp_tc_bfactor = "auto" selects the
+  //                     recompute path.
+  // ---- increment TC-4: the band-factor representation and the residue batching ----
+  //   qp_tc_bfactor     "auto" (default) | "store" | "recompute". The eq-1 residue term
+  //                     needs the band-pair factor B_J(P,a) for every internal state it
+  //                     visits. "recompute" keeps only B's two factors -- XCe at
+  //                     nsym x Np x nbnd per owned block and XCi at ns*nkpts x Np x nbnd
+  //                     shared by every block on the rank (22 MB at the production sizes
+  //                     above, against 1.25 GB PER BLOCK for the store) -- and forms B_J
+  //                     on demand at Np*nbnd flops, i.e. 0.06 % of the Np^3 Dyson solve
+  //                     that consumes it. "store" materializes B and needs a
+  //                     qp_tc_bstore_gb large enough to hold it. "auto" stores when the
+  //                     cap admits it and recomputes otherwise, so the DEFAULT (cap 0)
+  //                     is the recompute path. Both produce the same expression term by
+  //                     term and agree bitwise.
+  //   qp_tc_batch_mb    residue-evaluation batch budget, MB. It sizes the evaluator's
+  //                     PERSISTENT work space (allocated once per residue source, grown
+  //                     never shrunk), not a per-call allocation.
+  //                     It caps the number of residue targets one batched call carries,
+  //                     hence the (nt x Np^2) transform buffer inside the contour source
+  //                     and the (nt x nbnd x nbnd) sandwich buffer in the assembly; 64 MB
+  //                     is ~15 targets at (Np 364, nbnd 60) and thousands at fixture
+  //                     scale. Raising it deepens the batch and the gemms. The
+  //                     batching is what turns the transform contraction
+  //                     R(z) = sum_j F(z,j) Pi(q, s_j) into one gemm per (q, chunk);
+  //                     results do not depend on the value beyond gemm reassociation.
   bool        qp_tc_krylov = false;
   double      qp_tc_krylov_tol = 1e-12;
   double      qp_tc_bstore_gb = 0.0;
+  std::string qp_tc_bfactor = "auto";
+  double      qp_tc_batch_mb = 64.0;
 };
 
 } // methods

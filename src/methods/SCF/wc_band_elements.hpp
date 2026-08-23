@@ -1904,7 +1904,11 @@ namespace qp_modea {
 
     // ---------------- MO collocation columns ------------------------------------------
     // internal leg: XCi(s, k_full) = X(k_full) . C(kp_to_ibz(k_full))   [derivation 1]
-    nda::array<ComplexType, 3> XCi(ns * nkpts, NP, nbnd);
+    // TC-4 F5: held by shared_ptr because the band-factor RECOMPUTE path keeps it alive
+    // inside the context -- ONE copy per rank, shared by every owned block, against
+    // nJ x Np x nbnd PER BLOCK for the store it replaces.
+    auto pXCi = std::make_shared<nda::array<ComplexType, 3>>(ns * nkpts, NP, nbnd);
+    auto &XCi = *pXCi;
     {
       auto kp_to_ibz = MF->kp_to_ibz();
       for (long sk = 0; sk < ns * nkpts; ++sk) {
@@ -1940,21 +1944,48 @@ namespace qp_modea {
     auto qp_trev = MF->qp_trev();
     auto qminus = MF->qminus();
     const double pref = 1.0 / double(nkpts);
-    // TC-3: the band-factor capture. Fixture-scale only -- guarded by an explicit cap and
-    // by the requirement that the stage-2 helper split be off (see the tripwire below).
-    bool cd_bstore_on = (opts.cd_bstore_cap_gb > 0.0);
-    if (cd_bstore_on) {
-      const double gb = double(nJ) * double(NP) * double(nbnd) * 16.0 / 1.073741824e9;
-      utils::check(gb <= opts.cd_bstore_cap_gb,
-                   "qp_modea (cd bstore): the eq-1 residue band-factor store needs {:.2f} GB "
-                   "per owned (s,k) block (nJ = {}, Np = {}, nbnd = {}) but the cap "
-                   "cd_bstore_cap_gb is {:.2f}. This store is FIXTURE-SCALE ONLY; the "
-                   "production path must recompute B inside the evaluator.",
-                   gb, nJ, NP, nbnd, opts.cd_bstore_cap_gb);
+    // TC-3/TC-4: the eq-1 residue source's band factors, in one of two representations
+    // (modea_ctx::cd_band_store). The bookkeeping is filled for the block's WHOLE star
+    // below, independently of the stage-2 work split, so neither representation cares
+    // about the rank/group layout.
+    utils::check(opts.cd_bfactor == "auto" or opts.cd_bfactor == "store"
+                 or opts.cd_bfactor == "recompute",
+                 "qp_modea: unknown cd_bfactor = \"{}\". Valid: \"auto\", \"store\", "
+                 "\"recompute\".", opts.cd_bfactor);
+    const double bstore_gb = double(nJ) * double(NP) * double(nbnd) * 16.0 / 1.073741824e9;
+    const bool cd_band_on = contour or (opts.cd_bstore_cap_gb > 0.0)
+                            or (opts.cd_bfactor != "auto");
+    bool cd_bstore_on = false;      // materialize B_J(P,a)?
+    if (cd_band_on) {
+      if (opts.cd_bfactor == "store") {
+        // an EXPLICIT request that does not fit is an error, not a silent downgrade
+        utils::check(bstore_gb <= opts.cd_bstore_cap_gb,
+                     "qp_modea (cd bstore): cd_bfactor = \"store\" needs {:.2f} GB per owned "
+                     "(s,k) block (nJ = {}, Np = {}, nbnd = {}) but the cap "
+                     "qp_tc_bstore_gb is {:.2f}. Raise the cap or use cd_bfactor = "
+                     "\"recompute\" (the production default), which keeps the two FACTORS "
+                     "of B instead and costs Np*nbnd flops per residue target.",
+                     bstore_gb, nJ, NP, nbnd, opts.cd_bstore_cap_gb);
+        cd_bstore_on = true;
+      } else if (opts.cd_bfactor == "auto") {
+        cd_bstore_on = (opts.cd_bstore_cap_gb > 0.0) and (bstore_gb <= opts.cd_bstore_cap_gb);
+      }
       ctx.cd_pref = pref;
       ctx.have_bstore = true;
-      app_log(lvl, "  - TC-3 band-factor store:      ON, {:.3f} GB per owned (s,k) block "
-                   "(nJ = {} x Np = {} x nbnd = {})", gb, nJ, NP, nbnd);
+      const double xce_mb = double(nsym) * double(NP) * double(nbnd) * 16.0 / 1.048576e6;
+      const double xci_mb = double(ns) * double(nkpts) * double(NP) * double(nbnd) * 16.0
+                            / 1.048576e6;
+      if (cd_bstore_on)
+        app_log(lvl, "  - band factors (eq-1):         STORE, {:.3f} GB per owned (s,k) block "
+                     "(nJ = {} x Np = {} x nbnd = {}); cd_bfactor = {}, cap {:.2f} GB",
+                bstore_gb, nJ, NP, nbnd, opts.cd_bfactor, opts.cd_bstore_cap_gb);
+      else
+        app_log(lvl, "  - band factors (eq-1):         RECOMPUTE, {:.1f} MB per owned (s,k) "
+                     "block (XCe: nsym {} x Np {} x nbnd {}) + {:.1f} MB shared per rank "
+                     "(XCi: ns*nkpts {} x Np x nbnd); the store it replaces would be "
+                     "{:.3f} GB PER BLOCK. cd_bfactor = {}, cap {:.2f} GB",
+                xce_mb, nsym, NP, nbnd, xci_mb, ns * nkpts, bstore_gb, opts.cd_bfactor,
+                opts.cd_bstore_cap_gb);
     }
 
     // ---------------- the SYMMETRY CENSUS (permanent, level 2) -------------------------
@@ -2096,18 +2127,83 @@ namespace qp_modea {
         blk.M = nda::array<ComplexType, 3>(nbnd, nbnd, nP_flat);
         blk.M() = ComplexType(0.0);
       }
-      // TC-3: the eq-1 residue source's band factors (modea_ctx::cd_band_store).
-      const bool bst = cd_bstore_on and own;
+      // ---- TC-3/TC-4: the eq-1 residue source's band factors -------------------------
+      // Built here for the block's WHOLE star, in its own loop over (isym, q). It does
+      // NOT ride on the stage-2 work split below: the split hands different (isym, q)
+      // pairs to different members of a helper group, and the residue evaluator needs
+      // every internal state J of the block regardless of who computed its sandwich.
+      // The cost is nsym small gemms for XCe plus nqpts index lookups.
+      const bool bst = cd_band_on and own;
       qp_modea::modea_ctx::cd_band_store bs;
       if (bst) {
         bs.is = is;
         bs.ik = ik;
-        bs.B = nda::array<ComplexType, 3>(nJ, NP, nbnd);
-        bs.B() = ComplexType(0.0);
+        bs.nbnd = nbnd;
+        bs.NP = NP;
+        bs.stored = cd_bstore_on;
+        bs.XCi = pXCi;
+        bs.XCe = nda::array<ComplexType, 3>(nsym, NP, nbnd);
+        bs.isym_of_qp = nda::array<long, 1>(nqpts);
+        bs.skg_of_qp = nda::array<long, 1>(nqpts);
+        bs.gconj_of_qp = nda::array<int, 1>(nqpts);
+        bs.isym_of_qp() = -1;
+        bs.skg_of_qp() = -1;
+        bs.gconj_of_qp() = 0;
         bs.qs_of_J = nda::array<long, 1>(nJ);
         bs.qs_of_J() = -1;
         bs.wconj_of_J = nda::array<int, 1>(nJ);
         bs.wconj_of_J() = 0;
+        if (bs.stored) {
+          bs.B = nda::array<ComplexType, 3>(nJ, NP, nbnd);
+          bs.B() = ComplexType(0.0);
+        }
+        nda::array<ComplexType, 2> XCe_b(NP, nbnd), DC_b(nbnd, nbnd);
+        for (long isym = 0; isym < nsym; ++isym) {
+          const long ks = MF->ks_to_k(isym, ik);
+          if (isym == 0) {
+            XCe_b = XCi(is * nkpts + ks, all, all);
+          } else {
+            auto [cjg, D] = MF->symmetry_rotation(isym, ik);
+            utils::check(not cjg, "qp_modea (band factors): symmetry_rotation(isym = {}, "
+                                  "k = {}) reports the conjugation flag.", isym, ik);
+            math::sparse::csrmm(ComplexType(1.0), *D,
+                                nda::make_regular(sMO_skia.local()(is, ik, all, all)),
+                                ComplexType(0.0), DC_b);
+            nda::blas::gemm(thc.X(is, 0, ks), DC_b, XCe_b);
+          }
+          bs.XCe(isym, all, all) = XCe_b;
+          for (long iq = 0; iq < MF->nq_per_s(isym); ++iq) {
+            const long qp = MF->Qs(isym, iq);
+            const long qs = MF->qp_to_ibz(qp);
+            const bool wconj = qp_trev(qp);
+            const long kk = wconj ? MF->qk_to_k2(qminus(qs), ks) : MF->qk_to_k2(qs, ks);
+            const bool gconj = kp_trev(kk);
+            const long kg = gconj ? kp_trev_pair(kk) : kk;
+            bs.isym_of_qp(qp) = isym;
+            bs.skg_of_qp(qp) = is * nkpts + kg;
+            bs.gconj_of_qp(qp) = gconj ? 1 : 0;
+            for (long n = 0; n < nbnd; ++n) {
+              const long J = qp * nbnd + n;
+              bs.qs_of_J(J) = qs;
+              bs.wconj_of_J(J) = wconj ? 1 : 0;
+            }
+            if (bs.stored) {
+              auto U = XCi(is * nkpts + kg, all, all);
+              for (long n = 0; n < nbnd; ++n) {
+                const long J = qp * nbnd + n;
+                for (long P = 0; P < NP; ++P) {
+                  const ComplexType u = gconj ? std::conj(U(P, n)) : U(P, n);
+                  for (long a = 0; a < nbnd; ++a)
+                    bs.B(J, P, a) = std::conj(XCe_b(P, a)) * u;
+                }
+              }
+            }
+          }
+        }
+        for (long qp = 0; qp < nqpts; ++qp)
+          utils::check(bs.isym_of_qp(qp) >= 0,
+                       "qp_modea (band factors): full-BZ transfer q' = {} of block ({},{}) "
+                       "is in no (isym, q) star.", qp, is, ik);
       }
 
       long pair = 0, npair_mine = 0;
@@ -2154,22 +2250,6 @@ namespace qp_modea {
             const double e = sE_ska.local()(is, kg_ibz, n).real();
             ctx.epsJ((is * nk_ibz + ik) * nJ + J) = e;
             ctx.fJ((is * nk_ibz + ik) * nJ + J) = sigma_route_b::stable_nF(ctx.beta, e - mu);
-          }
-
-          // TC-3: capture B_J(P,a) = conj(XCe(P,a)) * u(P,n) and the (IBZ q, trev) pair.
-          // This is the SAME B the dense sandwich below builds, taken here so the eq-1
-          // residue source never re-derives the symmetry bookkeeping.
-          if (bst) {
-            for (long n = 0; n < nbnd; ++n) {
-              const long J = qp * nbnd + n;
-              bs.qs_of_J(J) = qs;
-              bs.wconj_of_J(J) = wconj ? 1 : 0;
-              for (long P = 0; P < NP; ++P) {
-                const ComplexType u = gconj ? std::conj(U(P, n)) : U(P, n);
-                for (long a = 0; a < nbnd; ++a)
-                  bs.B(J, P, a) = std::conj(XCe(P, a)) * u;
-              }
-            }
           }
 
           if (union_on) {
@@ -2313,15 +2393,7 @@ namespace qp_modea {
           for (long a = 0; a < nbnd; ++a)
             for (long Pf = 0; Pf < nP_flat; ++Pf) ctx.Mdiag(is, ik, a, Pf) = blk.M(a, a, Pf);
         ctx.blocks.push_back(std::move(blk));
-        if (bst) {
-          for (long J = 0; J < nJ; ++J)
-            utils::check(bs.qs_of_J(J) >= 0,
-                         "qp_modea (cd bstore): internal state J = {} of block ({},{}) was "
-                         "never visited. The band-factor capture requires the stage-2 helper "
-                         "split to be OFF (group size 1), so that the block's owner computes "
-                         "every (isym, q) pair itself.", J, is, ik);
-          ctx.bstore.push_back(std::move(bs));
-        }
+        if (bst) ctx.bstore.push_back(std::move(bs));
       }
     }
 
@@ -2337,12 +2409,12 @@ namespace qp_modea {
     // turns (J, z) into <aJ|W^c(q_J, z)|Jb>. The closure OWNS its inputs through
     // shared_ptr, so the context is self-contained afterwards.
     if (contour) {
+      // TC-4 F5: the band factors are always available here -- `cd_band_on` is true
+      // whenever `contour` is, and the representation (store or recompute) was chosen
+      // above. No cap and no rank/group layout can turn this route off any more.
       utils::check(ctx.have_bstore,
-                   "qp_modea: qp_modea_wfit = \"contour\" needs the eq-1 band-factor store, "
-                   "which is fixture-scale only. Set qp_tc_bstore_gb to a cap large enough "
-                   "for nJ x Np x nbnd complex per owned (s,k) block (see modea_ctx::"
-                   "cd_band_store) -- it is 0 by default precisely so a production-size run "
-                   "cannot enable it by accident.");
+                   "qp_modea: qp_modea_wfit = \"contour\" has no eq-1 band factors; this is "
+                   "an internal inconsistency (cd_band_on must follow `contour`).");
       const long nk_lin = [&]() {
         auto kg = MF->kp_grid();
         return std::min({long(kg(0)), long(kg(1)), long(kg(2))});
@@ -2379,8 +2451,15 @@ namespace qp_modea {
       clo.delta = pctx->geom.delta;
       qp_modea::cd_line_prepare(*ctx.cdl, ctx, clo);
       ctx.cdl->route = "contour";
-      ctx.cdl->residue = p_contour::make_contour_residue_source_owning(
-          ctx, pctx, tf, sPc, thc, sopt, sstat);
+      // TC-4: how many residue targets one batched call carries. The two buffers it sizes
+      // are the (nt x Np^2) transform buffer inside the source (twice, for the mirror
+      // rows) and the (nt x nbnd^2) sandwich buffer in the assembly.
+      const double per_target = 16.0 * (double(nbnd) * double(nbnd)
+                                        + 2.0 * double(NP) * double(NP));
+      const long batch_max = std::max(1L, long(opts.cd_batch_mb * 1.048576e6 / per_target));
+      ctx.cdl->batch_max = batch_max;
+      ctx.cdl->residue_batch = p_contour::make_contour_residue_batch_owning(
+          ctx, pctx, tf, sPc, thc, sopt, sstat, batch_max);
       ctx.cdl->stats = sstat;
       ctx.have_cdl = true;
 
@@ -2390,6 +2469,11 @@ namespace qp_modea {
                    "factorization cond = {:.3e}; P sampling wall {:.2f} s; line solver = {}",
               npk, pctx->c.rank, clo.delta, clo.delta * 27.211386245988, tf->cond,
               t_sample, opts.tc_krylov ? "warm-started GMRES" : "dense");
+      app_log(lvl, "  - TC-4 residue batching:       {} targets per call ({:.0f} MB budget, "
+                   "{:.2f} MB/target: 2 x Np^2 transform + nbnd^2 sandwich; the transform "
+                   "buffer is allocated ONCE by the source, not per call); band factors "
+                   "{}", batch_max, opts.cd_batch_mb, per_target / 1.048576e6,
+              cd_bstore_on ? "STORED" : "RECOMPUTED");
     }
 
     ctx.active = true;
@@ -2407,12 +2491,21 @@ namespace qp_modea {
     const double m_mq = any_work ? double(nbnd) * double(nbnd) * double(nbnd) * double(npk) * sz
                                  : 0.0;
     const double m_dia = need_diag ? double(ns) * nk_ibz * nbnd * nP_flat * sz : 0.0;
+    // TC-4: the eq-1 band factors, which OUTLIVE the build (the residue source reads them
+    // for the whole inner loop). This is the term the recompute path exists to shrink:
+    // nJ x Np x nbnd PER OWNED BLOCK stored, against nsym x Np x nbnd per block plus ONE
+    // shared ns*nkpts x Np x nbnd recomputed.
+    const double m_bf = cd_band_on
+        ? double(ctx.bstore.size()) * double(NP) * double(nbnd) * sz
+              * (cd_bstore_on ? double(nJ) : double(nsym))
+          + double(ns) * double(nkpts) * double(NP) * double(nbnd) * sz
+        : 0.0;
     // the two footprints the build actually passes through: stage 1c (the dense slabs, the
     // factors and the union data all live) and stage 2 (whatever was freed above is gone,
     // the blocks and the pair buffer are up).
     const double m_s1 = m_res + m_v + m_qb + m_a + m_dia;
     const double m_s2 = (lowrank ? 0.0 : m_res) + (union_on ? 0.0 : m_v) + m_qb + m_a
-                        + m_blk + m_mq + m_dia;
+                        + m_blk + m_mq + m_dia + m_bf;
     double mem = std::max(m_s1, m_s2);
     ctx.diag.mem_mb = mpi->comm.all_reduce_value(mem, boost::mpi3::max<>{});
     ctx.diag.wall_s = std::chrono::duration<double>(
@@ -2452,8 +2545,9 @@ namespace qp_modea {
                  "(peak)", ctx.diag.wall_s, ctx.diag.mem_mb);
     app_log(lvl, "  - context build memory:        stage 1c {:.0f} MB (dense slabs {:.0f} + "
                  "slab factors {:.0f} + union basis {:.0f} + coefficients {:.0f}), stage 2 "
-                 "{:.0f} MB (blocks {:.0f} + pair buffer {:.0f}); freed after stage 1c: {}",
-            m_s1, m_res, m_v, m_qb, m_a, m_s2, m_blk, m_mq,
+                 "{:.0f} MB (blocks {:.0f} + pair buffer {:.0f} + band factors {:.0f}); "
+                 "freed after stage 1c: {}",
+            m_s1, m_res, m_v, m_qb, m_a, m_s2, m_blk, m_mq, m_bf,
             (lowrank ? (union_on ? "dense slabs + slab factors" : "dense slabs") : "nothing"));
     app_log(lvl, "  - context build breakdown:     stage 1 (gather + fit) {:.2f} s, stage 1b "
                  "(slab factorization) {:.2f} s, stage 1c (union subspace) {:.2f} s, stage 2 "

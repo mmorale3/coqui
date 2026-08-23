@@ -753,6 +753,17 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
         io::get_value_with_default<double>(pt,"qp_tc_bstore_gb",0.0);
     utils::check(qp_params.qp_tc_bstore_gb >= 0.0,
                  "evgw: qp_tc_bstore_gb = {} must be >= 0.", qp_params.qp_tc_bstore_gb);
+    qp_params.qp_tc_bfactor =
+        io::get_value_with_default<std::string>(pt,"qp_tc_bfactor","auto");
+    io::tolower(qp_params.qp_tc_bfactor);
+    utils::check(qp_params.qp_tc_bfactor == "auto" or qp_params.qp_tc_bfactor == "store"
+                 or qp_params.qp_tc_bfactor == "recompute",
+                 "evgw: unknown qp_tc_bfactor = {}. Valid: \"auto\", \"store\", "
+                 "\"recompute\".", qp_params.qp_tc_bfactor);
+    qp_params.qp_tc_batch_mb =
+        io::get_value_with_default<double>(pt,"qp_tc_batch_mb",64.0);
+    utils::check(qp_params.qp_tc_batch_mb > 0.0,
+                 "evgw: qp_tc_batch_mb = {} must be > 0.", qp_params.qp_tc_batch_mb);
     // RW-2: the spectral-quadrature W^c representation (notes/rw_real_axis_w_spec.md).
     qp_params.qp_modea_spectral_eta =
         io::get_value_with_default<double>(pt,"qp_modea_spectral_eta",0.0125);
@@ -917,6 +928,17 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
         io::get_value_with_default<double>(pt,"qp_tc_bstore_gb",0.0);
     utils::check(qp_params.qp_tc_bstore_gb >= 0.0,
                  "qpgw: qp_tc_bstore_gb = {} must be >= 0.", qp_params.qp_tc_bstore_gb);
+    qp_params.qp_tc_bfactor =
+        io::get_value_with_default<std::string>(pt,"qp_tc_bfactor","auto");
+    io::tolower(qp_params.qp_tc_bfactor);
+    utils::check(qp_params.qp_tc_bfactor == "auto" or qp_params.qp_tc_bfactor == "store"
+                 or qp_params.qp_tc_bfactor == "recompute",
+                 "qpgw: unknown qp_tc_bfactor = {}. Valid: \"auto\", \"store\", "
+                 "\"recompute\".", qp_params.qp_tc_bfactor);
+    qp_params.qp_tc_batch_mb =
+        io::get_value_with_default<double>(pt,"qp_tc_batch_mb",64.0);
+    utils::check(qp_params.qp_tc_batch_mb > 0.0,
+                 "qpgw: qp_tc_batch_mb = {} must be > 0.", qp_params.qp_tc_batch_mb);
     // RW-2: the spectral-quadrature W^c representation (notes/rw_real_axis_w_spec.md).
     qp_params.qp_modea_spectral_eta =
         io::get_value_with_default<double>(pt,"qp_modea_spectral_eta",0.0125);
@@ -1380,6 +1402,17 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
         io::get_value_with_default<double>(pt,"qp_tc_bstore_gb",0.0);
     utils::check(qp_params.qp_tc_bstore_gb >= 0.0,
                  "qpgw: qp_tc_bstore_gb = {} must be >= 0.", qp_params.qp_tc_bstore_gb);
+    qp_params.qp_tc_bfactor =
+        io::get_value_with_default<std::string>(pt,"qp_tc_bfactor","auto");
+    io::tolower(qp_params.qp_tc_bfactor);
+    utils::check(qp_params.qp_tc_bfactor == "auto" or qp_params.qp_tc_bfactor == "store"
+                 or qp_params.qp_tc_bfactor == "recompute",
+                 "qpgw: unknown qp_tc_bfactor = {}. Valid: \"auto\", \"store\", "
+                 "\"recompute\".", qp_params.qp_tc_bfactor);
+    qp_params.qp_tc_batch_mb =
+        io::get_value_with_default<double>(pt,"qp_tc_batch_mb",64.0);
+    utils::check(qp_params.qp_tc_batch_mb > 0.0,
+                 "qpgw: qp_tc_batch_mb = {} must be > 0.", qp_params.qp_tc_batch_mb);
     // RW-2: the spectral-quadrature W^c representation (notes/rw_real_axis_w_spec.md).
     qp_params.qp_modea_spectral_eta =
         io::get_value_with_default<double>(pt,"qp_modea_spectral_eta",0.0125);

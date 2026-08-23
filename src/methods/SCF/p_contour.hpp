@@ -157,9 +157,12 @@
  *                   the fixtures use; FLAGGED for anisotropic meshes.
  */
 
+#include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <complex>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -702,16 +705,17 @@ namespace p_contour {
 
   /**
    * ===========================================================================
-   * THE eq-1 RESIDUE SOURCE, FED BY THE CONTOUR  (TC-3)
+   * THE eq-1 RESIDUE SOURCE, FED BY THE CONTOUR  (TC-3, batched at TC-4)
    * ===========================================================================
    *
-   * Returns a `qp_modea::cd_residue_fn` that answers, for one internal state J at one
-   * target z, the sandwich <aJ|W^c(q_J, z)|Jb>. The chain per call is
+   * Answers, for a LIST of internal states J at their targets z, the sandwiches
+   * <aJ|W^c(q_J, z)|Jb>. The chain is
    *
-   *   1. the transform rows for z and for its conjugate mirror -conj(z), from the
-   *      REUSABLE factorization (tilted_contour::transform_factor_t) -- one (r x nD)
-   *      mat-vec each, never a factorization;
-   *   2. R(z) = sum_j F(z,j) Pi_contour(q_J, j, :, :) and the same at the mirror;
+   *   1. the transform rows for every z and for every conjugate mirror -conj(z), from
+   *      the REUSABLE factorization (tilted_contour::transform_factor_t) -- ONE gemm
+   *      for the whole chunk, never a factorization;
+   *   2. R(z) = sum_j F(z,j) Pi_contour(q_J, j, :, :), which for all targets SHARING a
+   *      transfer q is the single gemm (n_z x rank) x (rank x Np^2);
    *   3. eq (SIGN):  Pi(z) = -[ R(z) + R(-conj z)^dag ];
    *   4. CoQuI's own Dyson chain, W^c = ([I - Z.Pi]^{-1} - I).Z with Z = thc.Z(q_J);
    *   5. the trev-q rule and the band sandwich, EXACTLY as stage 2 does it:
@@ -719,79 +723,225 @@ namespace p_contour {
    *          else  : T = W.Bc,  Ms = B^T . T
    *      times the 1/nkpts prefactor stage 2 folds in.
    *
+   * STEPS 1 AND 2 ARE THE BATCHED ONES and they are the reason the batching exists: at
+   * rank r and grid nD both were BLAS-2 passes per target, r*nD and r*Np^2, which at the
+   * fixture sizes outweigh the Np^3 Dyson solve they feed. Steps 4-5 stay per target --
+   * different z means a different dielectric matrix, and there is nothing to share.
+   * Grouping by q is a pure REORDERING of independent targets: each one still gets its
+   * own row of F and its own solve, and the results are written back in the caller's
+   * order. [gate: the [TC-4 batch] leg of tc3b1_identity_lih222 (batched vs per-target,
+   *  0.000e+00) and tc_contour_batch_scaling (the same two primitives at Np = 364)]
+   *
    * The band factors B and the (IBZ q, trev) pair come from `modea_ctx::cd_band_store`,
-   * captured in stage 2 -- the evaluator re-derives no symmetry bookkeeping.
+   * which supplies them from its store or recomputes them (TC-4 F5); either way the
+   * evaluator re-derives no symmetry bookkeeping.
    */
+  namespace detail {
+
+    /**
+     * The evaluator's work space, OWNED BY THE SOURCE and grown once.
+     *
+     * `Rb` is the big one -- (2 x chunk, Np^2) -- and at the production sizes it IS the
+     * batch budget, tens to hundreds of MB. The evaluator is called once per (s,k)
+     * evaluation point, tens of thousands of times per SCF iteration, so allocating it
+     * per call would be that many malloc/free cycles of a buffer far larger than any
+     * cache. Buffers only ever GROW here; a shorter target list reuses the allocation.
+     */
+    struct residue_scratch_t {
+      nda::array<ComplexType, 1> zz;   ///< (>= 2*nt) the target list + its mirrors
+      nda::array<ComplexType, 2> F;    ///< (>= 2*nt, r); grown by transform_factor_t
+      nda::array<ComplexType, 2> Fc, Rb, Bb;
+      nda::matrix<ComplexType> Pi, W, B, Bc, T, Mr;
+
+      /** @param nz    2*nt, the target-plus-mirror count of this call
+       *  @param nrow  2*chunk, the depth of the per-transfer contraction buffers */
+      void reserve(long nz, long nrow, long r, long NP, long nbnd) {
+        if (zz.size() < nz) zz.resize(nz);
+        if (Fc.shape()[0] < nrow or Fc.shape()[1] != r) Fc.resize(nrow, r);
+        if (Rb.shape()[0] < nrow or Rb.shape()[1] != NP * NP) Rb.resize(nrow, NP * NP);
+        if (Pi.shape()[0] != NP) { Pi.resize(NP, NP); W.resize(NP, NP); }
+        if (B.shape()[0] != NP or B.shape()[1] != nbnd) {
+          B.resize(NP, nbnd); Bc.resize(NP, nbnd); T.resize(NP, nbnd); Bb.resize(NP, nbnd);
+        }
+        if (Mr.shape()[0] != nbnd) Mr.resize(nbnd, nbnd);
+      }
+    };
+
+    /**
+     * The batched residue evaluation, shared by every maker below. `nt` targets are read
+     * from the first entries of Js/zs and written to the first slices of Ms.
+     */
+    template<typename thc_t>
+    void contour_residue_batch(qp_modea::modea_ctx const &ctx,
+                               ctx_t const &pctx,
+                               tc::transform_factor_t const &tf,
+                               sArray_t<Array_view_4D_t> const &sPi,
+                               thc_t &thc,
+                               methods::wc_line::solve_stats_t *sstat,
+                               residue_scratch_t &sc,
+                               long nchunk, long is, long ik, long nt,
+                               nda::array<long, 1> const &Js,
+                               nda::array<ComplexType, 1> const &zs,
+                               nda::array<ComplexType, 3> &Ms) {
+      decltype(nda::range::all) all;
+      const long NP = thc.Np();
+      const long r = pctx.c.rank;
+      const long nbnd = ctx.nbnd;
+      if (nt <= 0) return;
+      utils::check(Js.size() >= nt and zs.size() >= nt and Ms.shape()[0] >= nt
+                   and Ms.shape()[1] == nbnd and Ms.shape()[2] == nbnd,
+                   "p_contour::contour_residue_batch: {} targets against J {}, z {}, "
+                   "Ms ({}, {}, {}); nbnd = {}.", nt, Js.size(), zs.size(),
+                   Ms.shape()[0], Ms.shape()[1], Ms.shape()[2], nbnd);
+      const long bi = ctx.bstore_index(is, ik);
+      utils::check(bi >= 0, "contour residue source: no band store for ({}, {}).", is, ik);
+      auto const &bs = ctx.bstore[std::size_t(bi)];
+
+      const long nc_max = std::max(1L, (nchunk > 0) ? std::min(nchunk, nt) : nt);
+      sc.reserve(2 * nt, 2 * nc_max, r, NP, nbnd);
+      auto &Fc = sc.Fc;
+      auto &Rb = sc.Rb;
+      auto &Pi = sc.Pi;
+      auto &W = sc.W;
+      auto &B = sc.B;
+      auto &Bc = sc.Bc;
+      auto &T = sc.T;
+      auto &Mr = sc.Mr;
+      auto &Bb = sc.Bb;
+
+      // (1) THE TRANSFORM ROWS, for the whole call in ONE gemm: rows [0, nt) are the
+      //     resonant targets, rows [nt, 2nt) their conjugate mirrors. This step is
+      //     q-INDEPENDENT -- it costs r*nD per row and nD is the 2500-point adapted
+      //     grid, which is why it is batched across the call and not merely within a
+      //     transfer, where the groups can be a single target wide.
+      auto zv = sc.zz(nda::range(0, 2 * nt));
+      for (long i = 0; i < nt; ++i) {
+        zv(i) = zs(i);
+        zv(nt + i) = tc::mirror_target(zs(i));
+      }
+      auto &F = sc.F;                                     // (2*nt, r), sized by apply_many
+      tf.apply_many(nda::make_regular(zv), F);
+
+      // group the targets by IBZ transfer -- the axis the Pi slab is shared over
+      std::vector<long> ord(static_cast<std::size_t>(nt));
+      for (long i = 0; i < nt; ++i) ord[static_cast<std::size_t>(i)] = i;
+      std::stable_sort(ord.begin(), ord.end(), [&](long a, long b) {
+        return bs.qs_of_J(Js(a)) < bs.qs_of_J(Js(b));
+      });
+
+      long g0 = 0;
+      while (g0 < nt) {
+        const long qs = bs.qs_of_J(Js(ord[std::size_t(g0)]));
+        long g1 = g0;
+        while (g1 < nt and bs.qs_of_J(Js(ord[std::size_t(g1)])) == qs) ++g1;
+        auto Pislab = nda::reshape(sPi.local()(qs, all, all, all),
+                                   std::array<long, 2>{r, NP * NP});
+        auto Zq = thc.Z(int(qs));
+
+        for (long c0 = g0; c0 < g1; c0 += nc_max) {
+          const long nc = std::min(nc_max, g1 - c0);
+          // (2) R = F . Pi(q_s) -- ONE gemm for the chunk, (2nc x r) x (r x Np^2)
+          for (long i = 0; i < nc; ++i) {
+            const long slot = ord[std::size_t(c0 + i)];
+            for (long j = 0; j < r; ++j) {
+              Fc(i, j) = F(slot, j);
+              Fc(nc + i, j) = F(nt + slot, j);
+            }
+          }
+          auto Fv = Fc(nda::range(0, 2 * nc), all);
+          auto Rv = Rb(nda::range(0, 2 * nc), all);
+          nda::blas::gemm(ComplexType(1.0), Fv, Pislab, ComplexType(0.0), Rv);
+
+          for (long i = 0; i < nc; ++i) {
+            const long slot = ord[std::size_t(c0 + i)];
+            const long J = Js(slot);
+            const bool wconj = (bs.wconj_of_J(J) != 0);
+            // (3) eq (SIGN): Pi = -[ R + Rm^dag ]
+            for (long P = 0; P < NP; ++P)
+              for (long Q = 0; Q < NP; ++Q)
+                Pi(P, Q) = -(Rv(i, P * NP + Q) + std::conj(Rv(nc + i, Q * NP + P)));
+            // (4) CoQuI's Dyson chain
+            methods::wc_line::dyson_wc_line(Zq, Pi, W, sstat);
+            // (5) the trev-q rule + the band sandwich, stage 2's exact form
+            bs.band(J, Bb);
+            for (long P = 0; P < NP; ++P)
+              for (long a = 0; a < nbnd; ++a) {
+                B(P, a) = Bb(P, a);
+                Bc(P, a) = std::conj(Bb(P, a));
+              }
+            if (wconj) {
+              nda::blas::gemm(W, B, T);
+              nda::blas::gemm(nda::transpose(Bc), T, Mr);
+              for (long a = 0; a < nbnd; ++a)
+                for (long b = 0; b < nbnd; ++b)
+                  Ms(slot, a, b) = ctx.cd_pref * std::conj(Mr(a, b));
+            } else {
+              nda::blas::gemm(W, Bc, T);
+              nda::blas::gemm(nda::transpose(B), T, Mr);
+              for (long a = 0; a < nbnd; ++a)
+                for (long b = 0; b < nbnd; ++b) Ms(slot, a, b) = ctx.cd_pref * Mr(a, b);
+            }
+          }
+        }
+        g0 = g1;
+      }
+    }
+
+  } // namespace detail
+
   /**
    * The OWNING variant: every input is held by shared_ptr inside the closure, so the
    * returned function is valid after the builder's scope ends. This is what
    * build_modea_context installs on modea_ctx.
    */
   template<typename thc_t>
-  qp_modea::cd_residue_fn make_contour_residue_source_owning(
+  qp_modea::cd_residue_batch_fn make_contour_residue_batch_owning(
       qp_modea::modea_ctx const &ctx,
       std::shared_ptr<ctx_t> pctx,
       std::shared_ptr<tc::transform_factor_t> tf,
       std::shared_ptr<sArray_t<Array_view_4D_t>> sPi,
       thc_t &thc,
       std::shared_ptr<methods::wc_line::solve_opts_t> sopt,
-      std::shared_ptr<methods::wc_line::solve_stats_t> sstat) {
-    const long NP = thc.Np();
-    const long r = pctx->c.rank;
+      std::shared_ptr<methods::wc_line::solve_stats_t> sstat,
+      long nchunk) {
     utils::check(ctx.have_bstore,
-                 "p_contour::make_contour_residue_source_owning: no band-factor store.");
-    return [&ctx, pctx, tf, sPi, &thc, sopt, sstat, NP, r]
-           (long is, long ik, long J, ComplexType z, nda::array<ComplexType, 2> &Ms) {
-      const long nbnd = ctx.nbnd;
-      const long bi = ctx.bstore_index(is, ik);
-      utils::check(bi >= 0, "contour residue source: no band store for ({}, {}).", is, ik);
-      auto const &bs = ctx.bstore[std::size_t(bi)];
-      const long qs = bs.qs_of_J(J);
-      const bool wconj = (bs.wconj_of_J(J) != 0);
-
-      nda::array<ComplexType, 1> Fz(r), Fm(r);
-      tf->apply(z, Fz);
-      tf->apply(tc::mirror_target(z), Fm);
-      nda::matrix<ComplexType> R(NP, NP), Rm(NP, NP), Pi(NP, NP);
-      R() = ComplexType(0.0);
-      Rm() = ComplexType(0.0);
-      for (long j = 0; j < r; ++j) {
-        const ComplexType a = Fz(j), b = Fm(j);
-        for (long P = 0; P < NP; ++P)
-          for (long Q = 0; Q < NP; ++Q) {
-            const ComplexType v = sPi->local()(qs, j, P, Q);
-            R(P, Q) += a * v;
-            Rm(P, Q) += b * v;
-          }
-      }
-      for (long P = 0; P < NP; ++P)
-        for (long Q = 0; Q < NP; ++Q)
-          Pi(P, Q) = -(R(P, Q) + std::conj(Rm(Q, P)));          // eq (SIGN)
-
-      auto Zq = thc.Z(int(qs));
-      nda::matrix<ComplexType> W(NP, NP);
-      methods::wc_line::dyson_wc_line(Zq, Pi, W, sstat.get());
-
-      nda::matrix<ComplexType> B(NP, nbnd), Bc(NP, nbnd), T(NP, nbnd), Mr(nbnd, nbnd);
-      for (long P = 0; P < NP; ++P)
-        for (long a = 0; a < nbnd; ++a) {
-          B(P, a) = bs.B(J, P, a);
-          Bc(P, a) = std::conj(B(P, a));
-        }
-      if (wconj) {
-        nda::blas::gemm(W, B, T);
-        nda::blas::gemm(nda::transpose(Bc), T, Mr);
-        for (long a = 0; a < nbnd; ++a)
-          for (long b = 0; b < nbnd; ++b) Ms(a, b) = ctx.cd_pref * std::conj(Mr(a, b));
-      } else {
-        nda::blas::gemm(W, Bc, T);
-        nda::blas::gemm(nda::transpose(B), T, Mr);
-        for (long a = 0; a < nbnd; ++a)
-          for (long b = 0; b < nbnd; ++b) Ms(a, b) = ctx.cd_pref * Mr(a, b);
-      }
+                 "p_contour::make_contour_residue_batch_owning: no band factors.");
+    auto sc = std::make_shared<detail::residue_scratch_t>();
+    return [&ctx, pctx, tf, sPi, &thc, sopt, sstat, sc, nchunk]
+           (long is, long ik, long nt, nda::array<long, 1> const &Js,
+            nda::array<ComplexType, 1> const &zs, nda::array<ComplexType, 3> &Ms) {
+      detail::contour_residue_batch(ctx, *pctx, *tf, *sPi, thc, sstat.get(), *sc, nchunk,
+                                    is, ik, nt, Js, zs, Ms);
     };
   }
 
+  /** The non-owning batched variant (the unit gates hold their own inputs). */
+  template<typename thc_t>
+  qp_modea::cd_residue_batch_fn make_contour_residue_batch(
+      qp_modea::modea_ctx const &ctx,
+      ctx_t const &pctx,
+      tc::transform_factor_t const &tf,
+      sArray_t<Array_view_4D_t> const &sPi,      // (nq_ibz, rank, Np, Np)
+      thc_t &thc,
+      methods::wc_line::solve_opts_t const &sopt,
+      methods::wc_line::solve_stats_t &sstat,
+      long nchunk = 0) {
+    utils::check(ctx.have_bstore,
+                 "p_contour::make_contour_residue_batch: the mode-A context carries no "
+                 "band factors; build it with modea_opts::cd_bfactor / cd_bstore_cap_gb.");
+    auto sc = std::make_shared<detail::residue_scratch_t>();
+    return [&ctx, &pctx, &tf, &sPi, &thc, &sopt, &sstat, sc, nchunk]
+           (long is, long ik, long nt, nda::array<long, 1> const &Js,
+            nda::array<ComplexType, 1> const &zs, nda::array<ComplexType, 3> &Ms) {
+      detail::contour_residue_batch(ctx, pctx, tf, sPi, thc, &sstat, *sc, nchunk,
+                                    is, ik, nt, Js, zs, Ms);
+    };
+  }
+
+  /**
+   * The SCALAR variant, kept for callers that hold one (J, z) at a time. It is the batch
+   * core at nt = 1, so there is exactly ONE implementation of the algebra.
+   */
   template<typename thc_t>
   qp_modea::cd_residue_fn make_contour_residue_source(
       qp_modea::modea_ctx const &ctx,
@@ -801,64 +951,23 @@ namespace p_contour {
       thc_t &thc,
       methods::wc_line::solve_opts_t const &sopt,
       methods::wc_line::solve_stats_t &sstat) {
-    const long NP = thc.Np();
-    const long r = pctx.c.rank;
     utils::check(ctx.have_bstore,
                  "p_contour::make_contour_residue_source: the mode-A context carries no "
-                 "band-factor store; build it with modea_opts::cd_bstore_cap_gb > 0.");
-    return [&ctx, &pctx, &tf, &sPi, &thc, &sopt, &sstat, NP, r]
+                 "band factors; build it with modea_opts::cd_bfactor / cd_bstore_cap_gb.");
+    auto sc = std::make_shared<detail::residue_scratch_t>();
+    return [&ctx, &pctx, &tf, &sPi, &thc, &sopt, &sstat, sc]
            (long is, long ik, long J, ComplexType z, nda::array<ComplexType, 2> &Ms) {
       const long nbnd = ctx.nbnd;
-      const long bi = ctx.bstore_index(is, ik);
-      utils::check(bi >= 0, "contour residue source: no band store for ({}, {}).", is, ik);
-      auto const &bs = ctx.bstore[std::size_t(bi)];
-      const long qs = bs.qs_of_J(J);
-      const bool wconj = (bs.wconj_of_J(J) != 0);
-
-      // (1)-(2) the two transform rows and the two half-responses
-      nda::array<ComplexType, 1> Fz(r), Fm(r);
-      tf.apply(z, Fz);
-      tf.apply(tc::mirror_target(z), Fm);
-      nda::matrix<ComplexType> R(NP, NP), Rm(NP, NP), Pi(NP, NP);
-      R() = ComplexType(0.0);
-      Rm() = ComplexType(0.0);
-      for (long j = 0; j < r; ++j) {
-        const ComplexType a = Fz(j), b = Fm(j);
-        for (long P = 0; P < NP; ++P)
-          for (long Q = 0; Q < NP; ++Q) {
-            const ComplexType v = sPi.local()(qs, j, P, Q);
-            R(P, Q) += a * v;
-            Rm(P, Q) += b * v;
-          }
-      }
-      // (3) eq (SIGN): Pi = -[ R + Rm^dag ]
-      for (long P = 0; P < NP; ++P)
-        for (long Q = 0; Q < NP; ++Q)
-          Pi(P, Q) = -(R(P, Q) + std::conj(Rm(Q, P)));
-
-      // (4) CoQuI's Dyson chain
-      auto Zq = thc.Z(int(qs));
-      nda::matrix<ComplexType> W(NP, NP);
-      methods::wc_line::dyson_wc_line(Zq, Pi, W, &sstat);
-
-      // (5) the trev-q rule + the band sandwich, stage 2's exact form
-      nda::matrix<ComplexType> B(NP, nbnd), Bc(NP, nbnd), T(NP, nbnd), Mr(nbnd, nbnd);
-      for (long P = 0; P < NP; ++P)
-        for (long a = 0; a < nbnd; ++a) {
-          B(P, a) = bs.B(J, P, a);
-          Bc(P, a) = std::conj(B(P, a));
-        }
-      if (wconj) {
-        nda::blas::gemm(W, B, T);
-        nda::blas::gemm(nda::transpose(Bc), T, Mr);
-        for (long a = 0; a < nbnd; ++a)
-          for (long b = 0; b < nbnd; ++b) Ms(a, b) = ctx.cd_pref * std::conj(Mr(a, b));
-      } else {
-        nda::blas::gemm(W, Bc, T);
-        nda::blas::gemm(nda::transpose(B), T, Mr);
-        for (long a = 0; a < nbnd; ++a)
-          for (long b = 0; b < nbnd; ++b) Ms(a, b) = ctx.cd_pref * Mr(a, b);
-      }
+      nda::array<long, 1> Js(1);
+      nda::array<ComplexType, 1> zs(1);
+      nda::array<ComplexType, 3> M1(1, nbnd, nbnd);
+      Js(0) = J;
+      zs(0) = z;
+      detail::contour_residue_batch(ctx, pctx, tf, sPi, thc, &sstat, *sc, 1,
+                                    is, ik, 1L, Js, zs, M1);
+      Ms.resize(nbnd, nbnd);
+      for (long a = 0; a < nbnd; ++a)
+        for (long b = 0; b < nbnd; ++b) Ms(a, b) = M1(0, a, b);
     };
   }
 

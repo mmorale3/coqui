@@ -44,10 +44,21 @@
  *
  *   TC-2-c      band truncation along the contour on/off: identical to the
  *               truncation tolerance, with the measured band-work speedup.
+ *
+ * The TC-3 gates b(0)/b(1)/b(2) and the TC-4 prerequisites ride in the same file:
+ *
+ *   TC-4 batch  the batched residue evaluation against the per-target path
+ *               (cd_line_ctx::batch_max = 1), on one context and one contour --
+ *               a reordering identity, gated at 1e-14, with the wall times.
+ *
+ *   TC-4 F5     band factors RECOMPUTED (a second context with no store cap at
+ *               all) against STORED, scored on B_J(P,a) itself and on Sigma^c
+ *               through the same contour objects. Both gated at 1e-14.
  */
 
 #undef NDEBUG
 
+#include <chrono>
 #include <cmath>
 #include <complex>
 #include <limits>
@@ -882,11 +893,443 @@ namespace bdft_tests {
       // THE GATE is the transform's accuracy at the targets the CD actually asks for.
       // (b) is a map-class difference and is reported, not gated.
       REQUIRE(tf_inbasis < 1e-3);
+
+      // =================================================================
+      //  TC-4 (i) -- THE BATCHED TRANSFORM.
+      //
+      //  The residue source contracts R(z) = sum_j F(z,j) Pi(q, s_j) and
+      //  builds F's rows from the (r x nD) pseudo-inverse. Both were a
+      //  BLAS-2 pass per target; batched they are one gemm per call (the
+      //  rows) and one gemm per (q, chunk) (the contraction). Grouping the
+      //  targets by transfer is a pure REORDERING of independent solves, so
+      //  the two paths must agree at the gemm reassociation class.
+      //
+      //  cd_line_ctx::batch_max = 1 IS the per-target path: one target per
+      //  call, one row per gemm, one solve. 0 = every target of an
+      //  evaluation point in one call.
+      // =================================================================
+      {
+        methods::wc_line::solve_stats_t st1, stN;
+        auto src1 = pc::make_contour_residue_batch(ctx, pctx, tf, sPc, thc, sopt, st1);
+        auto srcN = pc::make_contour_residue_batch(ctx, pctx, tf, sPc, thc, sopt, stN);
+        qp_modea::cd_line_ctx cb1, cbN;
+        qp_modea::cd_line_prepare(cb1, ctx, clo3);
+        qp_modea::cd_line_prepare(cbN, ctx, clo3);
+        cb1.residue_batch = src1;
+        cb1.batch_max = 1;                 // the per-target reference
+        cb1.route = "contour";
+        cbN.residue_batch = srcN;
+        cbN.batch_max = 0;                 // one call per evaluation point
+        cbN.route = "contour";
+
+        nda::array<ComplexType, 2> Sa(nbnd, nbnd), Sb2(nbnd, nbnd);
+        double num_b = 0.0, den_b = 0.0, t1 = 0.0, tN = 0.0;
+        long nb_pt = 0;
+        for (auto const &blk : ctx.blocks) {
+          const long off2 = (blk.is * ctx.nk + blk.ik) * ctx.nJ;
+          for (long ig = 0; ig < 24; ++ig) {
+            const double w0 = wlo + (whi - wlo) * double(ig) / 23.0;
+            double g2 = 1e300;
+            for (long J = 0; J < ctx.nJ; ++J)
+              g2 = std::min(g2, std::abs(w0 - ctx.epsJ(off2 + J)));
+            if (g2 < 2e-2) continue;
+            const ComplexType z(w0, 0.0);
+            auto c0 = std::chrono::steady_clock::now();
+            qp_modea::modea_sigma_at_cdline(ctx, blk, cb1, z, Sa);
+            auto c1 = std::chrono::steady_clock::now();
+            qp_modea::modea_sigma_at_cdline(ctx, blk, cbN, z, Sb2);
+            auto c2 = std::chrono::steady_clock::now();
+            t1 += std::chrono::duration<double>(c1 - c0).count();
+            tN += std::chrono::duration<double>(c2 - c1).count();
+            for (long i = 0; i < nbnd; ++i)
+              for (long j = 0; j < nbnd; ++j) {
+                num_b = std::max(num_b, std::abs(Sa(i, j) - Sb2(i, j)));
+                den_b = std::max(den_b, std::abs(Sa(i, j)));
+              }
+            ++nb_pt;
+          }
+        }
+        const double rel_b = (den_b > 0.0) ? num_b / den_b : 0.0;
+        app_log(2, "[TC-4 batch] {}: batched vs per-target residue evaluation over {} "
+                   "evaluation points, {} residue targets: worst |dSigma^c| = {:.3e} over "
+                   "max|Sigma^c| = {:.4g} -> {:.3e} RELATIVE (gate 1e-14; the two differ "
+                   "only by gemm reassociation)",
+                mf_src, nb_pt, cbN.n_res_eval, num_b, den_b, rel_b);
+        app_log(2, "[TC-4 batch] {}: END-TO-END Sigma^c wall {:.3f} s per-target vs {:.3f} "
+                   "s batched -> {:.2f}x. The batch depth here is one evaluation point's "
+                   "targets ({:.1f} on average over {} IBZ q), and the closed-form Iterm "
+                   "-- which batching cannot touch -- is in both numbers.",
+                mf_src, t1, tN, (tN > 0.0 ? t1 / tN : 0.0),
+                double(cbN.n_res_eval) / double(std::max(1L, nb_pt)), mf->nqpts_ibz());
+
+        // the residue SOURCE alone, on one long target list: what the refactor actually
+        // changed, with the Iterm and the assembly out of the way.
+        {
+          const long off2 = (ctx.blocks[0].is * ctx.nk + ctx.blocks[0].ik) * ctx.nJ;
+          std::vector<long> Jl;
+          std::vector<ComplexType> zl;
+          for (long ig = 0; ig < 24 and long(Jl.size()) < 512; ++ig) {
+            const double w0 = wlo + (whi - wlo) * double(ig) / 23.0;
+            for (long J = 0; J < ctx.nJ; ++J) {
+              const double eJ = ctx.epsJ(off2 + J), fJ = ctx.fJ(off2 + J);
+              const double sgJ = ((w0 > eJ) ? 1.0 : 0.0) - fJ;
+              if (std::abs(sgJ) < 1e-14) continue;
+              Jl.push_back(J);
+              zl.push_back(ComplexType(eJ - w0, dlt));
+            }
+          }
+          const long nL = long(Jl.size());
+          nda::array<long, 1> Ja(nL);
+          nda::array<ComplexType, 1> za(nL);
+          for (long i = 0; i < nL; ++i) {
+            Ja(i) = Jl[std::size_t(i)];
+            za(i) = zl[std::size_t(i)];
+          }
+          nda::array<ComplexType, 3> Ma(nL, nbnd, nbnd), Mb(nL, nbnd, nbnd);
+          nda::array<long, 1> J1(1);
+          nda::array<ComplexType, 1> z1(1);
+          nda::array<ComplexType, 3> M1(1, nbnd, nbnd);
+          const long is0 = ctx.blocks[0].is, ik0 = ctx.blocks[0].ik;
+          auto d0 = std::chrono::steady_clock::now();
+          for (long i = 0; i < nL; ++i) {          // the per-target path
+            J1(0) = Ja(i);
+            z1(0) = za(i);
+            src1(is0, ik0, 1L, J1, z1, M1);
+            for (long a = 0; a < nbnd; ++a)
+              for (long b2 = 0; b2 < nbnd; ++b2) Ma(i, a, b2) = M1(0, a, b2);
+          }
+          auto d1 = std::chrono::steady_clock::now();
+          srcN(is0, ik0, nL, Ja, za, Mb);          // one batched call
+          auto d2 = std::chrono::steady_clock::now();
+          double nS = 0.0, dS = 0.0;
+          for (long i = 0; i < nL; ++i)
+            for (long a = 0; a < nbnd; ++a)
+              for (long b2 = 0; b2 < nbnd; ++b2) {
+                nS = std::max(nS, std::abs(Ma(i, a, b2) - Mb(i, a, b2)));
+                dS = std::max(dS, std::abs(Ma(i, a, b2)));
+              }
+          const double ts1 = std::chrono::duration<double>(d1 - d0).count();
+          const double tsN = std::chrono::duration<double>(d2 - d1).count();
+          app_log(2, "[TC-4 batch] {}: RESIDUE SOURCE alone, {} targets in one call vs one "
+                     "at a time: {:.4f} s vs {:.4f} s -> {:.2f}x; worst |dMs| = {:.3e} over "
+                     "max|Ms| = {:.4g}. At Np = {} the (rank x Np^2) Pi slab is {:.2f} MB "
+                     "and fits in cache, so this fixture cannot show the production win, "
+                     "which is that the slab is streamed ONCE per chunk instead of once "
+                     "per target.",
+                  mf_src, nL, ts1, tsN, (tsN > 0.0 ? ts1 / tsN : 0.0), nS, dS, thc.Np(),
+                  double(pctx.c.rank) * thc.Np() * thc.Np() * 16.0 / 1.048576e6);
+          REQUIRE(nL > 100);
+          REQUIRE((dS > 0.0 ? nS / dS : 0.0) < 1e-14);
+        }
+        REQUIRE(nb_pt >= 4);
+        REQUIRE(cbN.n_res_eval > 100);
+        REQUIRE(rel_b < 1e-14);
+      }
+
+      // =================================================================
+      //  TC-4 (ii) -- F5, THE BAND-FACTOR RECOMPUTE PATH.
+      //
+      //  A SECOND mode-A context, built with cd_bfactor = "recompute" and
+      //  NO store cap at all, so modea_ctx::cd_band_store carries only the
+      //  two FACTORS of B_J(P,a) -- XCe per symmetry class and the shared
+      //  XCi -- and forms B on demand. Scored two ways against the first
+      //  context, which stores B:
+      //     (a) B_J(P,a) itself, over every J of every owned block;
+      //     (b) Sigma^c through the SAME contour objects (pctx, tf, sPc),
+      //         so the only variable is where B came from.
+      // =================================================================
+      {
+        qp_modea::modea_ctx ctxr;
+        qp_modea::modea_opts optr = opts;
+        optr.cd_bstore_cap_gb = 0.0;          // no store admitted at all
+        optr.cd_bfactor = "recompute";
+        qp_modea::build_modea_context(ctxr, mb_state, thc, sMO, sE, mu, ft, optr,
+                                      "ignore_g0", false);
+        REQUIRE(ctxr.have_bstore);
+        REQUIRE(ctxr.bstore.size() == ctx.bstore.size());
+        REQUIRE(ctx.bstore[0].stored);
+        REQUIRE(not ctxr.bstore[0].stored);
+        REQUIRE(ctxr.bstore[0].B.size() == 0);
+
+        // (a) the band factors themselves
+        double num_B = 0.0, den_B = 0.0;
+        long nJ_chk = 0;
+        {
+          nda::array<ComplexType, 2> Bs(thc.Np(), nbnd), Br(thc.Np(), nbnd);
+          for (std::size_t b = 0; b < ctx.bstore.size(); ++b) {
+            auto const &bss = ctx.bstore[b];
+            auto const &bsr = ctxr.bstore[b];
+            REQUIRE(bss.is == bsr.is);
+            REQUIRE(bss.ik == bsr.ik);
+            for (long J = 0; J < ctx.nJ; ++J) {
+              REQUIRE(bss.qs_of_J(J) == bsr.qs_of_J(J));
+              REQUIRE(bss.wconj_of_J(J) == bsr.wconj_of_J(J));
+              bss.band(J, Bs);
+              bsr.band(J, Br);
+              for (long P = 0; P < thc.Np(); ++P)
+                for (long a = 0; a < nbnd; ++a) {
+                  num_B = std::max(num_B, std::abs(Bs(P, a) - Br(P, a)));
+                  den_B = std::max(den_B, std::abs(Bs(P, a)));
+                }
+              ++nJ_chk;
+            }
+          }
+        }
+        const double rel_B = (den_B > 0.0) ? num_B / den_B : 0.0;
+
+        // (b) Sigma^c, same contour, the band factors the only variable
+        methods::wc_line::solve_stats_t str;
+        auto srcr = pc::make_contour_residue_batch(ctxr, pctx, tf, sPc, thc, sopt, str);
+        qp_modea::cd_line_ctx cr;
+        qp_modea::cd_line_prepare(cr, ctxr, clo3);
+        cr.residue_batch = srcr;
+        cr.route = "contour";
+        methods::wc_line::solve_stats_t sts;
+        auto srcs = pc::make_contour_residue_batch(ctx, pctx, tf, sPc, thc, sopt, sts);
+        qp_modea::cd_line_ctx cs;
+        qp_modea::cd_line_prepare(cs, ctx, clo3);
+        cs.residue_batch = srcs;
+        cs.route = "contour";
+
+        nda::array<ComplexType, 2> Ss(nbnd, nbnd), Sr(nbnd, nbnd);
+        double num_S = 0.0, den_S = 0.0;
+        long ns_pt = 0;
+        for (std::size_t b = 0; b < ctx.blocks.size(); ++b) {
+          auto const &blk = ctx.blocks[b];
+          auto const &blr = ctxr.blocks[b];
+          REQUIRE(blk.is == blr.is);
+          REQUIRE(blk.ik == blr.ik);
+          const long off2 = (blk.is * ctx.nk + blk.ik) * ctx.nJ;
+          for (long ig = 0; ig < 24; ++ig) {
+            const double w0 = wlo + (whi - wlo) * double(ig) / 23.0;
+            double g2 = 1e300;
+            for (long J = 0; J < ctx.nJ; ++J)
+              g2 = std::min(g2, std::abs(w0 - ctx.epsJ(off2 + J)));
+            if (g2 < 2e-2) continue;
+            const ComplexType z(w0, 0.0);
+            qp_modea::modea_sigma_at_cdline(ctx, blk, cs, z, Ss);
+            qp_modea::modea_sigma_at_cdline(ctxr, blr, cr, z, Sr);
+            for (long i = 0; i < nbnd; ++i)
+              for (long j = 0; j < nbnd; ++j) {
+                num_S = std::max(num_S, std::abs(Ss(i, j) - Sr(i, j)));
+                den_S = std::max(den_S, std::abs(Ss(i, j)));
+              }
+            ++ns_pt;
+          }
+        }
+        const double rel_S = (den_S > 0.0) ? num_S / den_S : 0.0;
+        app_log(2, "[TC-4 F5] {}: band factors RECOMPUTED vs STORED. (a) B_J(P,a) over "
+                   "{} internal states x {} blocks: worst |dB| = {:.3e} over max|B| = "
+                   "{:.4g} -> {:.3e} RELATIVE. (b) Sigma^c through the same contour over "
+                   "{} evaluation points: worst |dSigma^c| = {:.3e} over max|Sigma^c| = "
+                   "{:.4g} -> {:.3e} RELATIVE. Gate 1e-14 on both.",
+                mf_src, ctx.nJ, ctx.bstore.size(), num_B, den_B, rel_B,
+                ns_pt, num_S, den_S, rel_S);
+        app_log(2, "[TC-4 F5] {}: the store this replaces is nJ {} x Np {} x nbnd {} = "
+                   "{:.3f} MB per owned (s,k) block; the recompute path keeps nsym x Np x "
+                   "nbnd per block plus ONE shared ns*nkpts x Np x nbnd.",
+                mf_src, ctx.nJ, thc.Np(), nbnd,
+                double(ctx.nJ) * thc.Np() * nbnd * 16.0 / 1.048576e6);
+        REQUIRE(nJ_chk == long(ctx.bstore.size()) * ctx.nJ);
+        REQUIRE(ns_pt >= 4);
+        REQUIRE(rel_B < 1e-14);
+        REQUIRE(rel_S < 1e-14);
+
+        // ---------------------------------------------------------------
+        //  TC-4 (iii) -- the PRODUCTION WIRING with DEFAULT knobs.
+        //
+        //  Before F5, qp_modea_wfit = "contour" ABORTED unless qp_tc_bstore_gb
+        //  was set to admit the nJ x Np x nbnd store, and the store itself
+        //  aborted unless the stage-2 helper split was off. Here the whole
+        //  route is built with the DEFAULTS -- no cap, cd_bfactor = "auto" --
+        //  and its evaluator must reproduce the hand-assembled one above.
+        // ---------------------------------------------------------------
+        qp_modea::modea_ctx ctxc;
+        qp_modea::modea_opts optc = opts;
+        optc.wfit = "contour";
+        optc.cd_bstore_cap_gb = 0.0;          // the DEFAULT: no store admitted
+        optc.cd_bfactor = "auto";             // the DEFAULT: -> recompute
+        optc.level = 2;                       // PRINT the production banner: it is the
+                                              // only place the band-factor / batching
+                                              // report lines are formatted at all
+        qp_modea::build_modea_context(ctxc, mb_state, thc, sMO, sE, mu, ft, optc,
+                                      "ignore_g0", false);
+        REQUIRE(ctxc.have_cdl);
+        REQUIRE(ctxc.cdl->on);
+        REQUIRE(bool(ctxc.cdl->residue_batch));
+        REQUIRE(ctxc.have_bstore);
+        REQUIRE(not ctxc.bstore[0].stored);
+        REQUIRE(ctxc.bstore[0].B.size() == 0);
+        REQUIRE(ctxc.cdl->batch_max > 0);
+
+        nda::array<ComplexType, 2> Sw(nbnd, nbnd);
+        double num_w = 0.0, den_w2 = 0.0;
+        long nw_pt = 0;
+        for (std::size_t b = 0; b < ctx.blocks.size(); ++b) {
+          auto const &blk = ctx.blocks[b];
+          auto const &blc = ctxc.blocks[b];
+          const long off2 = (blk.is * ctx.nk + blk.ik) * ctx.nJ;
+          for (long ig = 0; ig < 24; ++ig) {
+            const double w0 = wlo + (whi - wlo) * double(ig) / 23.0;
+            double g2 = 1e300;
+            for (long J = 0; J < ctx.nJ; ++J)
+              g2 = std::min(g2, std::abs(w0 - ctx.epsJ(off2 + J)));
+            if (g2 < 2e-2) continue;
+            const ComplexType z(w0, 0.0);
+            qp_modea::modea_sigma_at_cdline(ctx, blk, cs, z, Ss);
+            qp_modea::modea_sigma_at_cdline(ctxc, blc, *ctxc.cdl, z, Sw);
+            for (long i = 0; i < nbnd; ++i)
+              for (long j = 0; j < nbnd; ++j) {
+                num_w = std::max(num_w, std::abs(Ss(i, j) - Sw(i, j)));
+                den_w2 = std::max(den_w2, std::abs(Ss(i, j)));
+              }
+            ++nw_pt;
+          }
+        }
+        const double rel_w = (den_w2 > 0.0) ? num_w / den_w2 : 0.0;
+        app_log(2, "[TC-4 wiring] {}: qp_modea_wfit = \"contour\" with DEFAULT knobs "
+                   "(qp_tc_bstore_gb = 0, qp_tc_bfactor = auto -> RECOMPUTE, batch_max = "
+                   "{}): the context builds and its Sigma^c reproduces the hand-assembled "
+                   "contour evaluator over {} evaluation points to {:.3e} RELATIVE "
+                   "(worst |dSigma^c| = {:.3e} over {:.4g}). Before F5 this configuration "
+                   "ABORTED.",
+                mf_src, ctxc.cdl->batch_max, nw_pt, rel_w, num_w, den_w2);
+        REQUIRE(nw_pt >= 4);
+        REQUIRE(rel_w < 1e-12);
+      }
     }
   }
 
   TEST_CASE("tc3b1_identity_lih222", "[methods][tc_contour]") {
     run_tc3b1_gate("qe_lih222");
+  }
+
+  // =====================================================================
+  //  TC-4 -- the batched transform at PRODUCTION SHAPE.
+  //
+  //  The unit fixture runs at Np = 32, where the (rank x Np^2) Pi slab is
+  //  ~1 MB and never leaves cache, so it cannot show what the batching is
+  //  for: at Np = 364 the slab is ~370 MB and the per-target loop streams
+  //  it ONCE PER TARGET. This case measures the two batched primitives at
+  //  that shape on synthetic data -- no fixture, no physics.
+  //
+  //  `apply_many` vs `apply` is the PRODUCTION code, verbatim. The
+  //  contraction leg compares the gemm this file now issues against the
+  //  triple loop it replaced, at the same shape; it is a SHAPE PROBE of
+  //  the kernel, not a call into the evaluator.
+  // =====================================================================
+  TEST_CASE("tc_contour_batch_scaling", "[methods][tc_contour]") {
+    auto &mpi_context = utils::make_unit_test_mpi_context();
+    if (mpi_context->comm.size() != 1) return;
+    decltype(nda::range::all) all;
+
+    // the tc3_report production row; the two batch depths are the 64 MB default and the
+    // 256 MB setting of qp_tc_batch_mb at these sizes
+    const long NP = 364, r = 101, nD = 2500;
+    const long nt = 59;
+    // a transform factorization of the right shape (values irrelevant to the timing)
+    tilted_contour::transform_factor_t tf;
+    tf.r = r;
+    tf.nD = nD;
+    tf.D.resize(nD);
+    tf.rw.resize(nD);
+    for (long k = 0; k < nD; ++k) {
+      tf.D(k) = 0.1 + 3.0 * double(k) / double(nD - 1);
+      tf.rw(k) = 0.5 + 0.5 * double(k % 7) / 7.0;
+    }
+    tf.Ainv = nda::array<ComplexType, 2>(r, nD);
+    for (long j = 0; j < r; ++j)
+      for (long k = 0; k < nD; ++k)
+        tf.Ainv(j, k) = ComplexType(std::sin(0.01 * double(j * nD + k)),
+                                    std::cos(0.013 * double(j + 3 * k))) / double(nD);
+    nda::array<ComplexType, 1> z(2 * nt);
+    for (long t = 0; t < 2 * nt; ++t)
+      z(t) = ComplexType(-0.4 + 0.9 * double(t) / double(2 * nt - 1), 0.04);
+
+    nda::array<ComplexType, 2> F(2 * nt, r), Frow_out(2 * nt, r);
+    nda::array<ComplexType, 1> Frow(r);
+    auto a0 = std::chrono::steady_clock::now();
+    for (long t = 0; t < 2 * nt; ++t) {
+      tf.apply(z(t), Frow);
+      for (long j = 0; j < r; ++j) Frow_out(t, j) = Frow(j);
+    }
+    auto a1 = std::chrono::steady_clock::now();
+    tf.apply_many(z, F);
+    auto a2 = std::chrono::steady_clock::now();
+    double dF = 0.0, mF = 0.0;
+    for (long t = 0; t < 2 * nt; ++t)
+      for (long j = 0; j < r; ++j) {
+        dF = std::max(dF, std::abs(F(t, j) - Frow_out(t, j)));
+        mF = std::max(mF, std::abs(Frow_out(t, j)));
+      }
+    const double t_row = std::chrono::duration<double>(a1 - a0).count();
+    const double t_bat = std::chrono::duration<double>(a2 - a1).count();
+
+    // the contraction leg: R(t, PQ) = sum_j F(t,j) Pi(j, PQ)
+    nda::array<ComplexType, 2> Pislab(r, NP * NP);
+    for (long j = 0; j < r; ++j)
+      for (long pq = 0; pq < NP * NP; ++pq)
+        Pislab(j, pq) = ComplexType(double((j * 7 + pq) % 13) - 6.0,
+                                    double((j * 3 + pq) % 11) - 5.0) * 1e-3;
+    nda::array<ComplexType, 2> Rb(2 * nt, NP * NP), Rl(2 * nt, NP * NP);
+    auto b0 = std::chrono::steady_clock::now();
+    for (long t = 0; t < 2 * nt; ++t) {                 // the loop this replaced
+      for (long pq = 0; pq < NP * NP; ++pq) Rl(t, pq) = ComplexType(0.0);
+      for (long j = 0; j < r; ++j) {
+        const ComplexType a = F(t, j);
+        for (long pq = 0; pq < NP * NP; ++pq) Rl(t, pq) += a * Pislab(j, pq);
+      }
+    }
+    auto b1 = std::chrono::steady_clock::now();
+    nda::blas::gemm(ComplexType(1.0), F, Pislab, ComplexType(0.0), Rb);
+    auto b2 = std::chrono::steady_clock::now();
+    double dR = 0.0, mR = 0.0;
+    for (long t = 0; t < 2 * nt; ++t)
+      for (long pq = 0; pq < NP * NP; ++pq) {
+        dR = std::max(dR, std::abs(Rb(t, pq) - Rl(t, pq)));
+        mR = std::max(mR, std::abs(Rl(t, pq)));
+      }
+    const double t_loop = std::chrono::duration<double>(b1 - b0).count();
+    const double t_gemm = std::chrono::duration<double>(b2 - b1).count();
+
+    app_log(2, "[TC-4 shape] production shape Np = {}, rank = {}, nD = {}, {} targets "
+               "(x2 with the conjugate mirrors). TRANSFORM ROWS: {:.4f} s one at a time "
+               "vs {:.4f} s in one gemm -> {:.2f}x; max|dF| = {:.3e} over max|F| = {:.3e}",
+            NP, r, nD, nt, t_row, t_bat, (t_bat > 0.0 ? t_row / t_bat : 0.0), dF, mF);
+    app_log(2, "[TC-4 shape] CONTRACTION R = F.Pi: {:.4f} s per-target loop vs {:.4f} s "
+               "one gemm -> {:.2f}x; max|dR| = {:.3e} over max|R| = {:.3e}. The Pi slab is "
+               "{:.0f} MB, streamed once per target by the loop and once per chunk by the "
+               "gemm -- {}x less traffic at this batch depth.",
+            t_loop, t_gemm, (t_gemm > 0.0 ? t_loop / t_gemm : 0.0), dR, mR,
+            double(r) * NP * NP * 16.0 / 1.048576e6, 2 * nt);
+    REQUIRE(dF / std::max(mF, 1e-300) < 1e-13);
+    REQUIRE(dR / std::max(mR, 1e-300) < 1e-13);
+
+    // the same contraction at the 64 MB DEFAULT batch depth (~15 targets at these sizes),
+    // so the shipped default is the one that carries a number
+    {
+      const long nc = 15;
+      auto Fs = F(nda::range(0, 2 * nc), all);
+      nda::array<ComplexType, 2> Rs(2 * nc, NP * NP);
+      auto c0 = std::chrono::steady_clock::now();
+      for (long t = 0; t < 2 * nc; ++t) {
+        for (long pq = 0; pq < NP * NP; ++pq) Rs(t, pq) = ComplexType(0.0);
+        for (long j = 0; j < r; ++j) {
+          const ComplexType a = F(t, j);
+          for (long pq = 0; pq < NP * NP; ++pq) Rs(t, pq) += a * Pislab(j, pq);
+        }
+      }
+      auto c1 = std::chrono::steady_clock::now();
+      nda::array<ComplexType, 2> Rg(2 * nc, NP * NP);
+      nda::blas::gemm(ComplexType(1.0), nda::make_regular(Fs), Pislab,
+                      ComplexType(0.0), Rg);
+      auto c2 = std::chrono::steady_clock::now();
+      const double tl = std::chrono::duration<double>(c1 - c0).count();
+      const double tg = std::chrono::duration<double>(c2 - c1).count();
+      app_log(2, "[TC-4 shape] the same contraction at the SHIPPED 64 MB default "
+                 "({} targets): {:.4f} s loop vs {:.4f} s gemm -> {:.2f}x",
+              nc, tl, tg, (tg > 0.0 ? tl / tg : 0.0));
+    }
   }
 
   // =====================================================================

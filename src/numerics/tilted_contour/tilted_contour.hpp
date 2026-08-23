@@ -654,6 +654,14 @@ namespace tilted_contour {
     nda::array<double, 1> rw;       ///< (nD) the `gram` row weights sqrt(2 a(x))
     double cond = 0.0;
     long r = 0, nD = 0;
+    /**
+     * (nt, nD) right-hand-side scratch for `apply_many`, GROW-ONLY. It is (batch x 2500)
+     * complex, so allocating it per call would be a multi-MB malloc on every one of the
+     * tens of thousands of residue evaluations an SCF iteration makes. Mutable because
+     * the factorization is consumed through a const reference; single-threaded, like the
+     * rest of the evaluator.
+     */
+    mutable nda::array<dcomplex, 2> bwork;
 
     /** F(z, :) -- the transform row for one target. */
     void apply(dcomplex z, nda::array<dcomplex, 1> &Frow) const {
@@ -665,6 +673,33 @@ namespace tilted_contour {
         for (long k = 0; k < nD; ++k) acc += Ainv(j, k) * b(k);
         Frow(j) = acc;
       }
+    }
+
+    /**
+     * The rows for a WHOLE target list, as ONE gemm:
+     *      Frows = B A^{+T},   B(t, k) = rw_k / (z_t - D_k),
+     * which is `apply` for every t and nothing else -- the same pseudo-inverse, the same
+     * right-hand side. The eq-1 CD assembly asks for tens of thousands of rows per
+     * evaluation and each one is a (r x nD) BLAS-2 pass here; batching turns the whole
+     * chunk into a single (nt x nD) x (nD x r) BLAS-3 call, which is where the nD = 2500
+     * grid stops dominating the residue evaluation.
+     * [gate: tc_contour_batch_scaling scores apply_many against a loop over `apply` at
+     *  the production shape, and the [TC-4 batch] leg of tc3b1_identity_lih222 scores
+     *  the whole batched evaluator against the per-target path.]
+     */
+    void apply_many(nda::array<dcomplex, 1> const &z,
+                    nda::array<dcomplex, 2> &Frows) const {
+      const long nt = z.size();
+      // GROW-ONLY on both buffers: only the first nt rows of Frows are written, and a
+      // shorter target list reuses the allocation instead of triggering a realloc.
+      if (Frows.shape()[0] < nt or Frows.shape()[1] != r) Frows.resize(nt, r);
+      if (nt == 0) return;
+      if (bwork.shape()[0] < nt or bwork.shape()[1] != nD) bwork.resize(nt, nD);
+      auto B = bwork(nda::range(0, nt), nda::range::all);
+      for (long t = 0; t < nt; ++t)
+        for (long k = 0; k < nD; ++k) B(t, k) = rw(k) / (z(t) - D(k));
+      auto Fv = Frows(nda::range(0, nt), nda::range::all);
+      nda::blas::gemm(dcomplex(1.0), B, nda::transpose(Ainv), dcomplex(0.0), Fv);
     }
   };
 

@@ -228,10 +228,25 @@ namespace qp_modea {
     double      tc_rho = 0.65;
     std::string tc_profile = "flat";   // {flat, growing}
     bool        tc_trunc = false;      // band truncation along the contour
-    // TC-3: capture the per-block band factors B_J(P,a) in stage 2 so the eq-1 residue
-    // source can sandwich an arbitrary W^c. Fixture-scale only -- see modea_ctx::
-    // cd_band_store. <= 0 disables; otherwise the cap in GB the store may occupy.
+    // TC-3/TC-4: the per-block band factors B_J(P,a) the eq-1 residue source sandwiches
+    // an arbitrary W^c with -- see modea_ctx::cd_band_store. TWO representations:
+    //   "recompute" (the PRODUCTION default) keeps only the two ingredients B is a product
+    //     of, XCe (nsym x Np x nbnd) and XCi (ns*nkpts x Np x nbnd, ONE copy shared by
+    //     every owned block), and forms B_J on demand at Np*nbnd flops -- 0.06 % of the
+    //     Np^3 Dyson solve that consumes it.
+    //   "store" materializes B at nJ x Np x nbnd complex per owned block, which is 1 MB on
+    //     qe_lih222 and ~1.25 GB at (64 k-points, Np 364, nbnd 60).
+    //   "auto" (default) takes "store" when cd_bstore_cap_gb admits it and "recompute"
+    //     otherwise -- i.e. recompute unless a cap was set deliberately.
+    // cd_bstore_cap_gb is that cap, in GB per owned (s,k) block; <= 0 = no store.
+    std::string cd_bfactor = "auto";   // {auto, store, recompute}
     double      cd_bstore_cap_gb = 0.0;
+    // TC-4: the residue-evaluation BATCH budget, in MB. It caps how many residue targets
+    // one batched call carries, hence the (nt x Np^2) transform buffer inside the contour
+    // source -- which that source ALLOCATES ONCE and reuses -- and the
+    // (nt x nbnd x nbnd) sandwich buffer here. 64 MB is ~15 targets at (Np 364,
+    // nbnd 60). Results do not depend on it beyond the gemm reassociation class.
+    double      cd_batch_mb = 64.0;
     // TC-3 line-solver knobs (qp_tc_krylov / qp_tc_krylov_tol). The economics: the
     // DIAGONAL path needs nbnd right-hand sides per (q, z) and warm-started GMRES wins
     // (measured ~5 iterations per solve); a full qpscf block needs nbnd^2 and the dense
@@ -400,23 +415,63 @@ namespace qp_modea {
     nda::array<ComplexType, 4> Mdiag;
     bool have_diag = false;
 
-    // ---- TC-3: the CONTOUR residue source's per-block band factors --------------------
+    // ---- TC-3/TC-4: the CONTOUR residue source's per-block band factors ---------------
     // The eq-1 residue term needs <aJ|W^c(q_J, z)|Jb> at targets z that move inside the
     // self-consistency loop, so the sandwich cannot be precomputed the way blk.M is. What
-    // CAN be precomputed is its two fixed ingredients: the band-pair factor
-    //     B_J(P, a) = conj(XCe(P,a)) * u(P, n),     J = q'*nbnd + n
-    // and the (IBZ transfer, trev flag) that say WHICH W^c matrix it multiplies. Captured
-    // in stage 2, where the symmetry bookkeeping already exists, so the evaluator never
-    // re-derives it.
-    // MEMORY: nJ * NP * nbnd complex per owned block -- 1 MB on qe_lih222, but
-    // nkpts*nbnd * NP * nbnd = 1.3 TB at the production (64 k-points, Np 364, nbnd 60)
-    // sizes. It is therefore FIXTURE-SCALE ONLY, guarded by `cd_bstore_cap_gb`, and the
-    // production path must recompute B inside the evaluator (a TC-4 item).
+    // it needs per internal state J = q'*nbnd + n is the band-pair factor
+    //     B_J(P, a) = conj(XCe(isym(q'), P, a)) * u(P, n),
+    //     u(P, n)   = XCi(is*nkpts + kg(q'), P, n), conjugated when kg was trev-folded,
+    // plus the (IBZ transfer, trev flag) that say WHICH W^c matrix it multiplies.
+    //
+    // TWO REPRESENTATIONS, and the production one is the RECOMPUTE path:
+    //   * `stored` = true materializes B at nJ x Np x nbnd complex per owned block --
+    //     1 MB on qe_lih222, ~1.25 GB at (64 k-points, Np 364, nbnd 60). Guarded by
+    //     `modea_opts::cd_bstore_cap_gb`, which is 0 by default.
+    //   * `stored` = false keeps only the FACTORS: XCe at nsym x Np x nbnd per block and
+    //     XCi at ns*nkpts x Np x nbnd shared by every block on the rank (22 MB at the
+    //     production sizes above, against 1.25 GB PER BLOCK for the store). `band()` then
+    //     forms B_J on demand -- Np*nbnd complex mults, against the Np^3 Dyson solve that
+    //     consumes it, so it does not appear in any profile.
+    //   The recompute path produces the SAME EXPRESSION, term by term, so the two agree
+    //   bitwise (gate: the [TC-4 F5] leg of tc3b1_identity_lih222, which scores B
+    //   itself and Sigma^c through the same contour, both at 0.000e+00).
+    //
+    // The bookkeeping below is filled for EVERY (isym, q) pair of the block's star,
+    // independently of which pairs this rank computed sandwiches for -- it costs nsym
+    // small gemms and nqpts index lookups, and it is what makes the store usable under
+    // ANY rank/group layout, including the stage-2 helper split.
     struct cd_band_store {
       long is = -1, ik = -1;
-      nda::array<ComplexType, 3> B;    // (nJ, NP, nbnd)
+      long nbnd = 0, NP = 0;
+      bool stored = false;             // B materialized (else recomputed from XCe/XCi)
+      nda::array<ComplexType, 3> B;    // (nJ, NP, nbnd) -- STORED path only
+      // RECOMPUTE path ingredients
+      std::shared_ptr<const nda::array<ComplexType, 3>> XCi;  // (ns*nkpts, NP, nbnd), shared
+      nda::array<ComplexType, 3> XCe;  // (nsym, NP, nbnd) external leg per symmetry class
+      nda::array<long, 1> isym_of_qp;  // (nqpts) which class handles this full-BZ transfer
+      nda::array<long, 1> skg_of_qp;   // (nqpts) flat internal-leg index is*nkpts + kg
+      nda::array<int, 1>  gconj_of_qp; // (nqpts) the trev-k conjugation of the internal leg
+      // both paths
       nda::array<long, 1> qs_of_J;     // (nJ) IBZ transfer index
       nda::array<int, 1>  wconj_of_J;  // (nJ) the trev-q conjugation rule
+
+      /** B_J(P, a) for one internal state, from the store or from its two factors. */
+      void band(long J, nda::array<ComplexType, 2> &Bout) const {
+        Bout.resize(NP, nbnd);
+        if (stored) {
+          for (long P = 0; P < NP; ++P)
+            for (long a = 0; a < nbnd; ++a) Bout(P, a) = B(J, P, a);
+          return;
+        }
+        const long qp = J / nbnd, n = J - qp * nbnd;
+        const long isym = isym_of_qp(qp), skg = skg_of_qp(qp);
+        const bool gconj = (gconj_of_qp(qp) != 0);
+        auto const &Xi = *XCi;
+        for (long P = 0; P < NP; ++P) {
+          const ComplexType u = gconj ? std::conj(Xi(skg, P, n)) : Xi(skg, P, n);
+          for (long a = 0; a < nbnd; ++a) Bout(P, a) = std::conj(XCe(isym, P, a)) * u;
+        }
+      }
     };
     std::vector<cd_band_store> bstore;
     double cd_pref = 0.0;              // 1/nkpts, folded in by the residue source
@@ -817,11 +872,33 @@ namespace qp_modea {
       std::function<void(long /*is*/, long /*ik*/, long /*J*/, ComplexType /*z*/,
                          nda::array<ComplexType, 2> & /*Msand*/)>;
 
+  /**
+   * The BATCHED residue source (TC-4): Msand(t, a, b) = <aJ_t|W^c(q_{J_t}, z_t)|J_t b>
+   * for a whole list of (J, z) targets, in the SAME order. This is the interface the
+   * evaluator uses; a source that only implements the scalar form above is driven one
+   * target at a time and costs the same as before. The contour source implements it
+   * natively, which is where the transform contraction becomes a gemm.
+   */
+  using cd_residue_batch_fn =
+      std::function<void(long /*is*/, long /*ik*/, long /*nt*/,
+                         nda::array<long, 1> const & /*J, first nt entries*/,
+                         nda::array<ComplexType, 1> const & /*z, first nt entries*/,
+                         nda::array<ComplexType, 3> & /*Msand, first nt slices*/)>;
+
   struct cd_line_ctx {
     bool on = false;
     double delta = 0.0;
     nda::array<double, 1> th_neg;    // (npk) theta(-om_p), the only cached quantity
     cd_residue_fn residue;
+    cd_residue_batch_fn residue_batch;   // preferred when set
+    /**
+     * Residue targets per batched call, i.e. the depth of the (nt x nbnd x nbnd) sandwich
+     * buffer and, inside the contour source, of the (nt x Np^2) transform buffer.
+     * <= 0 = no cap (every target of one evaluation point in one call), which is what the
+     * unit fixtures want; production sets it from `modea_opts::cd_batch_mb`. 1 forces the
+     * per-target path, which is the batching gate's reference.
+     */
+    long batch_max = 0;
     std::string route = "fit";       // what the log line names
     // census, accumulated over the evaluator's calls
     mutable long n_res_eval = 0, n_res_skip = 0;
@@ -881,6 +958,12 @@ namespace qp_modea {
 
   /**
    * Sigma^c_ab(z) by the eq-1 CD assembly. The drop-in sibling of `modea_sigma_at`.
+   *
+   * TC-4: the residue targets are collected FIRST and evaluated in batches, so a source
+   * that can share work across targets (the contour's transform contraction) sees them
+   * all at once. The assembly loop below is untouched -- same predicate, same order, same
+   * accumulation -- it only reads its Ms out of the batch buffer instead of calling the
+   * source itself, so the batching cannot reassociate the sum over J.
    */
   inline void modea_sigma_at_cdline(modea_ctx const &ctx, sk_block const &blk,
                                     cd_line_ctx const &cl, ComplexType z,
@@ -888,11 +971,50 @@ namespace qp_modea {
     const long nbnd = ctx.nbnd, npk = ctx.npk, nJ = ctx.nJ;
     const long off = (blk.is * ctx.nk + blk.ik) * nJ;
     utils::check(cl.on, "modea_sigma_at_cdline: the cd-line context is not prepared.");
-    utils::check(bool(cl.residue), "modea_sigma_at_cdline: no residue source installed.");
+    utils::check(bool(cl.residue) or bool(cl.residue_batch),
+                 "modea_sigma_at_cdline: no residue source installed.");
 
     S() = ComplexType(0.0);
     nda::array<ComplexType, 1> K(npk);
-    nda::array<ComplexType, 2> Ms(nbnd, nbnd);
+
+    // ---- the residue TARGET LIST, by the assembly loop's own predicate ----------------
+    std::vector<long> Jt;
+    std::vector<ComplexType> zt;
+    for (long J = 0; J < nJ; ++J) {
+      const double e = ctx.epsJ(off + J), f = ctx.fJ(off + J);
+      const double ReA0 = (z - e).real();
+      const double th0 = (std::abs(ReA0) < 1e-14) ? 0.5 : (ReA0 > 0.0 ? 1.0 : 0.0);
+      if (std::abs(th0 - f) < 1e-14) continue;                 // sigma_J = 0: skipped
+      Jt.push_back(J);
+      zt.push_back(ComplexType(e - z.real(), cl.delta));        // eq (EXACT)
+    }
+    const long nt = long(Jt.size());
+    const long cap = (cl.batch_max > 0) ? std::min(cl.batch_max, std::max(nt, 1L))
+                                        : std::max(nt, 1L);
+    nda::array<ComplexType, 3> Msb(cap, nbnd, nbnd);
+    nda::array<ComplexType, 2> Ms1(nbnd, nbnd);
+    nda::array<long, 1> Jc(cap);
+    nda::array<ComplexType, 1> zc(cap);
+    long lo = 0, hi = 0;                        // the target window currently in Msb
+    auto fill_batch = [&](long i0) {
+      lo = i0;
+      hi = std::min(nt, i0 + cap);
+      const long nc = hi - lo;
+      if (cl.residue_batch) {
+        for (long i = 0; i < nc; ++i) {
+          Jc(i) = Jt[std::size_t(lo + i)];
+          zc(i) = zt[std::size_t(lo + i)];
+        }
+        cl.residue_batch(blk.is, blk.ik, nc, Jc, zc, Msb);
+      } else {
+        for (long i = 0; i < nc; ++i) {
+          cl.residue(blk.is, blk.ik, Jt[std::size_t(lo + i)], zt[std::size_t(lo + i)], Ms1);
+          for (long a = 0; a < nbnd; ++a)
+            for (long b = 0; b < nbnd; ++b) Msb(i, a, b) = Ms1(a, b);
+        }
+      }
+    };
+    long it = 0;
 
     for (long J = 0; J < nJ; ++J) {
       const double e = ctx.epsJ(off + J), f = ctx.fJ(off + J);
@@ -928,10 +1050,13 @@ namespace qp_modea {
       }
       if (std::abs(sg) < 1e-14) { ++cl.n_res_skip; continue; }
       ++cl.n_res_eval;
-      const ComplexType zres(e - z.real(), cl.delta);        // eq (EXACT)
-      cl.residue(blk.is, blk.ik, J, zres, Ms);
+      utils::check(it < nt and Jt[std::size_t(it)] == J,
+                   "modea_sigma_at_cdline: the residue target list and the assembly loop "
+                   "disagree at J = {} (target slot {} of {}).", J, it, nt);
+      if (it >= hi) fill_batch(it);
       for (long a = 0; a < nbnd; ++a)
-        for (long b = 0; b < nbnd; ++b) S(a, b) += sg * Ms(a, b);
+        for (long b = 0; b < nbnd; ++b) S(a, b) += sg * Msb(it - lo, a, b);
+      ++it;
     }
   }
 
