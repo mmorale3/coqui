@@ -36,6 +36,20 @@ add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${C
 set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
                     TIMEOUT 14400)
 
+# increment TC-3 (notes/tc_coqui_impl_spec.md, spec M4): W on the line + the eq-1 CD
+# assembly. Gate TC-3-a -- the single-pole Lehmann SIGN pin (closed form, machine
+# precision), the Dyson-chain pin against the campaign's RPA W^c, dense == warm-started
+# GMRES, and the multipole eq-1 corroboration. Pure math + a JSON reference: no fixture,
+# no MPI, builds and runs in every configuration.
+set(TEST_ID methods_tc_wline)
+
+add_executable(test_${TEST_ID} test_methods_tc_wline.cpp)
+target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield scf_lib)
+
+add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
+set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
+                    TIMEOUT 3600)
+
 # Project 2 increment Q2: the qp_map A/B surrogate-spread gate (full qp-scf
 # loops on real fixtures -- separate executable so ctest can target it).
 set(TEST_ID methods_qp_map_ab)

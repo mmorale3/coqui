@@ -77,6 +77,7 @@
 #include "methods/SCF/simple_dyson.h"
 #include "methods/SCF/scf_common.hpp"
 #include "methods/SCF/p_contour.hpp"
+#include "methods/SCF/wc_line.hpp"
 #include "methods/scr_coulomb/scr_coulomb_t.h"
 #include "numerics/imag_axes_ft/IAFT.hpp"
 #include "hamiltonian/one_body_hamiltonian.hpp"
@@ -193,6 +194,11 @@ namespace bdft_tests {
 
     // the production Pi(q, tau) and Pi(q, i nu), from the SAME G
     solvers::scr_coulomb_t scr_im(&ft, "rpa", "ignore_g0");
+    // update_w FIRST (the RW-1 gate's order): it fills mb_state.dW_qtPQ, which the
+    // TC-3-b(0) leg below reads as the production W^c reference. eval_Pi_qdep is
+    // idempotent given sG_tskij, so the Pi it returns is the same bubble.
+    scr_im.update_w(mb_state, thc, -1);
+    REQUIRE(mb_state.dW_qtPQ.has_value());
     const long nw_half = (ft.nw_b() % 2 == 0) ? ft.nw_b() / 2 : ft.nw_b() / 2 + 1;
     nda::array<ComplexType, 4> Pi_tau, Pi_im_qwPQ;
     long ntp = 0;
@@ -440,6 +446,74 @@ namespace bdft_tests {
             frob_worst, wq, wn, cell_worst, budget, frob_worst / budget, gate_ii);
     REQUIRE(frob_worst < gate_ii);
     REQUIRE(cell_worst < gate_ii);
+
+    // =================================================================
+    //  TC-3-b(0) -- W ON THE LINE, at fixture scale.
+    //  The chain the CD assembly actually rides: contour Pi(q, s_j)
+    //  -> transform to z = i nu -> eq (SIGN) -> CoQuI's Dyson chain with
+    //  Z = thc.Z(q) -> W^c(q, i nu), against the PRODUCTION W^c(q, i nu)
+    //  that the imaginary-axis solver stored in dW_qtPQ. This is Fable
+    //  review point 1 -- "assembled in ONE consistent convention" -- at
+    //  fixture scale, and it needs none of the mode-A band bookkeeping.
+    // =================================================================
+    {
+      // the production W^c(q, i nu) from the SAME update_w that ran above
+      const long nt_half = mb_state.dW_qtPQ.value().global_shape()[1];
+      nda::array<ComplexType, 4> Wc_im(Nq_ibz, nw_half, Naux, Naux);
+      {
+        auto const &dW = mb_state.dW_qtPQ.value();
+        nda::array<ComplexType, 4> Wt(nt_half, Nq_ibz, Naux, Naux);
+        Wt() = ComplexType(0.0);
+        for (long iq = 0; iq < Nq_ibz; ++iq)
+          for (long it = 0; it < nt_half; ++it)
+            if (iq >= dW.local_range(0).first() and iq < dW.local_range(0).last()
+                and it >= dW.local_range(1).first() and it < dW.local_range(1).last())
+              Wt(it, iq, all, all) =
+                  dW.local()(iq - dW.local_range(0).first(),
+                             it - dW.local_range(1).first(), all, all);
+        mpi_context->comm.all_reduce_in_place_n(Wt.data(), Wt.size(), std::plus<>{});
+        nda::array<ComplexType, 4> Ww(nw_half, Nq_ibz, Naux, Naux);
+        ft.tau_to_w_PHsym(Wt, Ww);
+        for (long iq = 0; iq < Nq_ibz; ++iq)
+          for (long n = 0; n < nw_half; ++n)
+            Wc_im(iq, n, all, all) = Ww(n, iq, all, all);
+      }
+
+      double worst = 0.0, cond_worst = 0.0;
+      long wq2 = -1, wn2 = -1;
+      nda::array<ComplexType, 2> Pz(Naux, Naux);
+      nda::matrix<ComplexType> Wg(Naux, Naux), Rz2(Naux, Naux);
+      methods::wc_line::solve_stats_t wst;
+      for (long iq = 0; iq < Nq_ibz; ++iq) {
+        auto Zq = thc.Z(int(iq));
+        for (long t = 0; t < long(keep.size()); ++t) {
+          Rz2() = ComplexType(0.0);
+          for (long j = 0; j < r; ++j)
+            for (long P = 0; P < Naux; ++P)
+              for (long Q = 0; Q < Naux; ++Q)
+                Rz2(P, Q) += tr.F(t, j) * sPc.local()(iq, j, P, Q);
+          pc::polarization_from_contour(Rz2, Rz2, Pz);      // eq (SIGN)
+          methods::wc_line::dyson_wc_line(Zq, Pz, Wg, &wst);
+          const long n = keep[std::size_t(t)];
+          double num = 0.0, den = 0.0;
+          for (long P = 0; P < Naux; ++P)
+            for (long Q = 0; Q < Naux; ++Q) {
+              const ComplexType ex = Wc_im(iq, n, P, Q);
+              num += std::norm(Wg(P, Q) - ex);
+              den += std::norm(ex);
+            }
+          const double fr = std::sqrt(num / std::max(den, 1e-300));
+          if (fr > worst) { worst = fr; wq2 = iq; wn2 = n; }
+        }
+      }
+      cond_worst = wst.cond_hint;
+      app_log(2, "[TC-3-b(0)] W^c(q, i nu) via contour Pi -> eq (SIGN) -> CoQuI Dyson "
+                 "chain, vs the PRODUCTION W^c from dW_qtPQ, nu >= gamma: worst "
+                 "Frobenius rel = {:.3e} (q = {}, nu index {}) over {} q x {} targets; "
+                 "max |[I - Z.Pi]^-1| = {:.3e}",
+              worst, wq2, wn2, Nq_ibz, keep.size(), cond_worst);
+      REQUIRE(worst < 1e-3);
+    }
 
     // =================================================================
     //  TC-2-c -- band truncation along the contour
