@@ -101,6 +101,9 @@ namespace {
     opts.tc_rho = qp_params.qp_tc_rho;
     opts.tc_profile = qp_params.qp_tc_profile;
     opts.tc_trunc = qp_params.qp_tc_trunc;
+    opts.tc_krylov = qp_params.qp_tc_krylov;
+    opts.tc_krylov_tol = qp_params.qp_tc_krylov_tol;
+    opts.cd_bstore_cap_gb = qp_params.qp_tc_bstore_gb;
     opts.iter = 1;
     std::string div = "ignore_g0";
     if constexpr (requires { mb_solver.corr->iter(); })
@@ -141,6 +144,10 @@ namespace {
     utils::check(opts.tc_profile == "flat" or opts.tc_profile == "growing",
                  "qp_modea: unknown qp_tc_profile = {}. Valid: \"flat\", \"growing\".",
                  opts.tc_profile);
+    utils::check(opts.tc_krylov_tol > 0.0 and opts.tc_krylov_tol < 1.0,
+                 "qp_modea: qp_tc_krylov_tol = {} must be in (0, 1).", opts.tc_krylov_tol);
+    utils::check(opts.cd_bstore_cap_gb >= 0.0,
+                 "qp_modea: qp_tc_bstore_gb = {} must be >= 0.", opts.cd_bstore_cap_gb);
 
     app_log(2, "\n* {} quasiparticle map (Project 2 increment QM3): building the "
                "evaluator context", qp_params.qp_map);
@@ -1732,6 +1739,11 @@ auto qp_approx(const sArray_t<Array_view_5D_t> &sSigma_tskij,
                                         : "0 = the eq-8 recipe, 1.2 W_band/N_k floor",
             qp_params.qp_tc_rho, qp_params.qp_tc_profile,
             qp_params.qp_tc_trunc ? "on" : "off");
+  if (qp_params.qp_modea_wfit == "contour")
+    app_log(2, "  - contour solver (TC-3):  line solver = {} (tol {:.1e}), band-factor "
+               "store cap = {:.2f} GB",
+            qp_params.qp_tc_krylov ? "warm-started GMRES" : "dense",
+            qp_params.qp_tc_krylov_tol, qp_params.qp_tc_bstore_gb);
   if (qp_params.qp_modea_wfit == "spectral")
     app_log(2, "  - spectral knobs (RW-2):  spectral_eta = {:.4g} a.u. ({:.4g} eV), "
                "spectral_npole = {} positive-Omega nodes after coarsening, spectral_gamma = {}",

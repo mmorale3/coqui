@@ -632,6 +632,87 @@ namespace tilted_contour {
   }
 
   /**
+   * A REUSABLE factorization of the least-squares transform.
+   *
+   * `build_transform` solves for a fixed target list in one `gelss` call, which is right
+   * when the targets are known up front. The eq-1 CD assembly is not like that: its
+   * targets are z = eps_J - omega + i delta and both eps_J and omega move inside the
+   * self-consistency loop, so rows are needed ONE AT A TIME, tens of thousands of them.
+   *
+   * Factor once, apply forever: with A the `gram`-weighted kernel (nD x r) and
+   * b(z) its weighted right-hand side, the minimum-norm solution is
+   *      F(z, :) = ( A^+ b(z) )^T ,     A^+ = V S^{-1} U^dag  (r x nD),
+   * so a row costs one (r x nD) mat-vec instead of a factorization. The pseudo-inverse is
+   * formed once from the SAME SVD `gelss` would use, with the same rcond, so a row from
+   * here and a row from `build_transform` are the same object.
+   * [verified -- gate: the TC-3-b(1)/TC-3-b(2) legs use this exclusively; a direct
+   *  row-vs-row check against build_transform is `tilted_contour_factor_rows`.]
+   */
+  struct transform_factor_t {
+    nda::array<dcomplex, 2> Ainv;   ///< (r, nD) the pseudo-inverse
+    nda::array<double, 1> D;        ///< (nD) the pole grid, Delta_k = dmin + x_k
+    nda::array<double, 1> rw;       ///< (nD) the `gram` row weights sqrt(2 a(x))
+    double cond = 0.0;
+    long r = 0, nD = 0;
+
+    /** F(z, :) -- the transform row for one target. */
+    void apply(dcomplex z, nda::array<dcomplex, 1> &Frow) const {
+      Frow.resize(r);
+      nda::array<dcomplex, 1> b(nD);
+      for (long k = 0; k < nD; ++k) b(k) = rw(k) / (z - D(k));
+      for (long j = 0; j < r; ++j) {
+        dcomplex acc(0.0, 0.0);
+        for (long k = 0; k < nD; ++k) acc += Ainv(j, k) * b(k);
+        Frow(j) = acc;
+      }
+    }
+  };
+
+  /** Build the reusable factorization of the `gram`-weighted LS transform. */
+  inline transform_factor_t factor_transform(contour_t const &c) {
+    const long nD = c.x.size(), r = c.rank;
+    transform_factor_t tf;
+    tf.r = r;
+    tf.nD = nD;
+    tf.D.resize(nD);
+    tf.rw.resize(nD);
+    for (long k = 0; k < nD; ++k) {
+      tf.D(k) = c.p.dmin + c.x(k);
+      tf.rw(k) = std::sqrt(2.0 * c.a(k));
+    }
+    nda::matrix<dcomplex, nda::F_layout> A(nD, r);
+    {
+      const dcomplex rot = std::exp(dcomplex(0.0, -c.g.theta));
+      for (long k = 0; k < nD; ++k)
+        for (long j = 0; j < r; ++j)
+          A(k, j) = std::exp(dcomplex(0.0, -1.0) * tf.D(k) * c.s(j) * rot) * tf.rw(k);
+    }
+    // SVD: A = U S V^dag  ->  A^+ = V S^{-1} U^dag
+    nda::matrix<dcomplex, nda::F_layout> U(nD, nD), Vt(r, r);
+    nda::array<double, 1> S(std::min(nD, r));
+    {
+      nda::matrix<dcomplex, nda::F_layout> Ac(A);
+      nda::lapack::gesvd(Ac, S, U, Vt);
+    }
+    const double rcond = std::numeric_limits<double>::epsilon() * double(std::max(nD, r));
+    const double cut = rcond * S(0);
+    tf.cond = (S(S.size() - 1) > 0.0) ? S(0) / S(S.size() - 1)
+                                      : std::numeric_limits<double>::infinity();
+    tf.Ainv = nda::array<dcomplex, 2>(r, nD);
+    tf.Ainv() = dcomplex(0.0, 0.0);
+    for (long j = 0; j < r; ++j)
+      for (long k = 0; k < nD; ++k) {
+        dcomplex acc(0.0, 0.0);
+        for (long m = 0; m < S.size(); ++m) {
+          if (S(m) <= cut) continue;
+          acc += std::conj(Vt(m, j)) * (1.0 / S(m)) * std::conj(U(k, m));
+        }
+        tf.Ainv(j, k) = acc;
+      }
+    return tf;
+  }
+
+  /**
    * The mirror combination for a SCALAR response:
    *   P(z_t) = R(z_t) + conj(R(z'_t)),   z'_t = -conj(z_t).
    * For a MATRIX response with Hermitian residues the conjugation becomes the

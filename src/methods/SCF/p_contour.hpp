@@ -175,6 +175,8 @@
 #include "numerics/tilted_contour/tilted_contour.hpp"
 #include "methods/HF/thc_solver_comm.hpp"
 #include "methods/SCF/scf_common.hpp"
+#include "methods/SCF/wc_line.hpp"
+#include "methods/SCF/qp_modea.hpp"
 #include "methods/mb_state/mb_state.hpp"
 
 namespace methods {
@@ -212,6 +214,7 @@ namespace p_contour {
     double mu = 0.0, zeta_max = 0.0;
     long   nk_lin = 0, n_occ = 0, n_emp = 0;
     long   n_valence_clusters = 0;
+    bool   window_floored = false;   ///< Dmin > zeta_max: W_target took its delta floor
   };
 
   /**
@@ -262,9 +265,23 @@ namespace p_contour {
       if (occ[std::size_t(i)] - occ[std::size_t(i - 1)] > cut) ++g.n_valence_clusters;
     g.W_band = mu - occ[std::size_t(lo)];
 
-    g.W_target = std::max(g.zeta_max - g.dmin, 1e-6);
     g.delta_mesh = delta_mesh_const * g.W_band / double(g.nk_lin);
     g.delta = (o.delta > 0.0) ? o.delta : g.delta_mesh;   // eq 8 at eta_targ, no 3.5x
+    // ⚠ W_target's FLOOR. The campaign's convention is W_target = zeta_max - Dmin, with
+    // the residue targets running over w in [Dmin, Dmin + W_target] -- which silently
+    // assumes Dmin < zeta_max, i.e. that the particle-hole edge lies INSIDE the QP
+    // window. On a wide-gap insulator it does not: LiH's converged mode-A gap is
+    // 12.9 eV against zeta_max = 10 eV, W_target hit its 1e-6 guard, tan(theta) =
+    // rho*delta/W_target exploded and S sin(theta) reached 5.1e+07 -- the beta guard
+    // below fired, correctly, at the second outer iteration.
+    // The regime is actually the EASY one: when Dmin > zeta_max every residue target
+    // sits BELOW the particle-hole edge, where a(D) = (D - w) sin th + d cos th is large
+    // for every transition, so eq 3 imposes no real constraint. What it must not do is
+    // divide by zero. Flooring W_target at delta bounds tan(theta) <= rho and leaves S
+    // finite, without touching the Dmin < zeta_max case the campaign measured.
+    // [FLAGGED: the campaign never ran a fixture with Dmin > zeta_max.]
+    g.W_target = std::max(g.zeta_max - g.dmin, g.delta);
+    g.window_floored = (g.zeta_max - g.dmin) < g.delta;
     utils::check(g.delta > 0.0,
                  "p_contour: the delta recipe produced {} (W_band = {}, N_k = {}); set "
                  "qp_tc_delta explicitly.", g.delta, g.W_band, g.nk_lin);
@@ -669,10 +686,180 @@ namespace p_contour {
                  "p_contour: beta = {:.4g} does not exceed S sin(theta) = {:.4g} "
                  "(ratio {:.3f}). The occupation factor no longer cancels the contour's "
                  "growth on the deepest states and the complex-time legs overflow. "
+                 "THE GEOMETRY THAT PRODUCED IT: Delta in [{:.4g}, {:.4g}] a.u., "
+                 "W_band = {:.4g}, N_k = {}, delta = {:.4g}, zeta_max = {:.4g}, "
+                 "W_target = {:.4g}{}, theta = {:.4g}, gamma = {:.4g}, S = {:.4g}. "
                  "Raise beta, raise qp_tc_delta (which shortens S) or lower qp_tc_rho "
-                 "(which lowers the tilt).", beta, Ssin, ctx.beta_guard);
+                 "(which lowers the tilt).",
+                 beta, Ssin, ctx.beta_guard, ctx.geom.dmin, ctx.geom.dmax,
+                 ctx.geom.W_band, ctx.geom.nk_lin, ctx.geom.delta, ctx.geom.zeta_max,
+                 ctx.geom.W_target,
+                 ctx.geom.window_floored ? " (FLOORED: Dmin > zeta_max)" : "",
+                 ctx.c.g.theta, ctx.c.g.gamma, ctx.c.g.S);
     ctx.on = true;
     return ctx;
+  }
+
+  /**
+   * ===========================================================================
+   * THE eq-1 RESIDUE SOURCE, FED BY THE CONTOUR  (TC-3)
+   * ===========================================================================
+   *
+   * Returns a `qp_modea::cd_residue_fn` that answers, for one internal state J at one
+   * target z, the sandwich <aJ|W^c(q_J, z)|Jb>. The chain per call is
+   *
+   *   1. the transform rows for z and for its conjugate mirror -conj(z), from the
+   *      REUSABLE factorization (tilted_contour::transform_factor_t) -- one (r x nD)
+   *      mat-vec each, never a factorization;
+   *   2. R(z) = sum_j F(z,j) Pi_contour(q_J, j, :, :) and the same at the mirror;
+   *   3. eq (SIGN):  Pi(z) = -[ R(z) + R(-conj z)^dag ];
+   *   4. CoQuI's own Dyson chain, W^c = ([I - Z.Pi]^{-1} - I).Z with Z = thc.Z(q_J);
+   *   5. the trev-q rule and the band sandwich, EXACTLY as stage 2 does it:
+   *          wconj : T = W.B ,  Ms = conj( Bc^T . T )
+   *          else  : T = W.Bc,  Ms = B^T . T
+   *      times the 1/nkpts prefactor stage 2 folds in.
+   *
+   * The band factors B and the (IBZ q, trev) pair come from `modea_ctx::cd_band_store`,
+   * captured in stage 2 -- the evaluator re-derives no symmetry bookkeeping.
+   */
+  /**
+   * The OWNING variant: every input is held by shared_ptr inside the closure, so the
+   * returned function is valid after the builder's scope ends. This is what
+   * build_modea_context installs on modea_ctx.
+   */
+  template<typename thc_t>
+  qp_modea::cd_residue_fn make_contour_residue_source_owning(
+      qp_modea::modea_ctx const &ctx,
+      std::shared_ptr<ctx_t> pctx,
+      std::shared_ptr<tc::transform_factor_t> tf,
+      std::shared_ptr<sArray_t<Array_view_4D_t>> sPi,
+      thc_t &thc,
+      std::shared_ptr<methods::wc_line::solve_opts_t> sopt,
+      std::shared_ptr<methods::wc_line::solve_stats_t> sstat) {
+    const long NP = thc.Np();
+    const long r = pctx->c.rank;
+    utils::check(ctx.have_bstore,
+                 "p_contour::make_contour_residue_source_owning: no band-factor store.");
+    return [&ctx, pctx, tf, sPi, &thc, sopt, sstat, NP, r]
+           (long is, long ik, long J, ComplexType z, nda::array<ComplexType, 2> &Ms) {
+      const long nbnd = ctx.nbnd;
+      const long bi = ctx.bstore_index(is, ik);
+      utils::check(bi >= 0, "contour residue source: no band store for ({}, {}).", is, ik);
+      auto const &bs = ctx.bstore[std::size_t(bi)];
+      const long qs = bs.qs_of_J(J);
+      const bool wconj = (bs.wconj_of_J(J) != 0);
+
+      nda::array<ComplexType, 1> Fz(r), Fm(r);
+      tf->apply(z, Fz);
+      tf->apply(tc::mirror_target(z), Fm);
+      nda::matrix<ComplexType> R(NP, NP), Rm(NP, NP), Pi(NP, NP);
+      R() = ComplexType(0.0);
+      Rm() = ComplexType(0.0);
+      for (long j = 0; j < r; ++j) {
+        const ComplexType a = Fz(j), b = Fm(j);
+        for (long P = 0; P < NP; ++P)
+          for (long Q = 0; Q < NP; ++Q) {
+            const ComplexType v = sPi->local()(qs, j, P, Q);
+            R(P, Q) += a * v;
+            Rm(P, Q) += b * v;
+          }
+      }
+      for (long P = 0; P < NP; ++P)
+        for (long Q = 0; Q < NP; ++Q)
+          Pi(P, Q) = -(R(P, Q) + std::conj(Rm(Q, P)));          // eq (SIGN)
+
+      auto Zq = thc.Z(int(qs));
+      nda::matrix<ComplexType> W(NP, NP);
+      methods::wc_line::dyson_wc_line(Zq, Pi, W, sstat.get());
+
+      nda::matrix<ComplexType> B(NP, nbnd), Bc(NP, nbnd), T(NP, nbnd), Mr(nbnd, nbnd);
+      for (long P = 0; P < NP; ++P)
+        for (long a = 0; a < nbnd; ++a) {
+          B(P, a) = bs.B(J, P, a);
+          Bc(P, a) = std::conj(B(P, a));
+        }
+      if (wconj) {
+        nda::blas::gemm(W, B, T);
+        nda::blas::gemm(nda::transpose(Bc), T, Mr);
+        for (long a = 0; a < nbnd; ++a)
+          for (long b = 0; b < nbnd; ++b) Ms(a, b) = ctx.cd_pref * std::conj(Mr(a, b));
+      } else {
+        nda::blas::gemm(W, Bc, T);
+        nda::blas::gemm(nda::transpose(B), T, Mr);
+        for (long a = 0; a < nbnd; ++a)
+          for (long b = 0; b < nbnd; ++b) Ms(a, b) = ctx.cd_pref * Mr(a, b);
+      }
+    };
+  }
+
+  template<typename thc_t>
+  qp_modea::cd_residue_fn make_contour_residue_source(
+      qp_modea::modea_ctx const &ctx,
+      ctx_t const &pctx,
+      tc::transform_factor_t const &tf,
+      sArray_t<Array_view_4D_t> const &sPi,      // (nq_ibz, rank, Np, Np)
+      thc_t &thc,
+      methods::wc_line::solve_opts_t const &sopt,
+      methods::wc_line::solve_stats_t &sstat) {
+    const long NP = thc.Np();
+    const long r = pctx.c.rank;
+    utils::check(ctx.have_bstore,
+                 "p_contour::make_contour_residue_source: the mode-A context carries no "
+                 "band-factor store; build it with modea_opts::cd_bstore_cap_gb > 0.");
+    return [&ctx, &pctx, &tf, &sPi, &thc, &sopt, &sstat, NP, r]
+           (long is, long ik, long J, ComplexType z, nda::array<ComplexType, 2> &Ms) {
+      const long nbnd = ctx.nbnd;
+      const long bi = ctx.bstore_index(is, ik);
+      utils::check(bi >= 0, "contour residue source: no band store for ({}, {}).", is, ik);
+      auto const &bs = ctx.bstore[std::size_t(bi)];
+      const long qs = bs.qs_of_J(J);
+      const bool wconj = (bs.wconj_of_J(J) != 0);
+
+      // (1)-(2) the two transform rows and the two half-responses
+      nda::array<ComplexType, 1> Fz(r), Fm(r);
+      tf.apply(z, Fz);
+      tf.apply(tc::mirror_target(z), Fm);
+      nda::matrix<ComplexType> R(NP, NP), Rm(NP, NP), Pi(NP, NP);
+      R() = ComplexType(0.0);
+      Rm() = ComplexType(0.0);
+      for (long j = 0; j < r; ++j) {
+        const ComplexType a = Fz(j), b = Fm(j);
+        for (long P = 0; P < NP; ++P)
+          for (long Q = 0; Q < NP; ++Q) {
+            const ComplexType v = sPi.local()(qs, j, P, Q);
+            R(P, Q) += a * v;
+            Rm(P, Q) += b * v;
+          }
+      }
+      // (3) eq (SIGN): Pi = -[ R + Rm^dag ]
+      for (long P = 0; P < NP; ++P)
+        for (long Q = 0; Q < NP; ++Q)
+          Pi(P, Q) = -(R(P, Q) + std::conj(Rm(Q, P)));
+
+      // (4) CoQuI's Dyson chain
+      auto Zq = thc.Z(int(qs));
+      nda::matrix<ComplexType> W(NP, NP);
+      methods::wc_line::dyson_wc_line(Zq, Pi, W, &sstat);
+
+      // (5) the trev-q rule + the band sandwich, stage 2's exact form
+      nda::matrix<ComplexType> B(NP, nbnd), Bc(NP, nbnd), T(NP, nbnd), Mr(nbnd, nbnd);
+      for (long P = 0; P < NP; ++P)
+        for (long a = 0; a < nbnd; ++a) {
+          B(P, a) = bs.B(J, P, a);
+          Bc(P, a) = std::conj(B(P, a));
+        }
+      if (wconj) {
+        nda::blas::gemm(W, B, T);
+        nda::blas::gemm(nda::transpose(Bc), T, Mr);
+        for (long a = 0; a < nbnd; ++a)
+          for (long b = 0; b < nbnd; ++b) Ms(a, b) = ctx.cd_pref * std::conj(Mr(a, b));
+      } else {
+        nda::blas::gemm(W, Bc, T);
+        nda::blas::gemm(nda::transpose(B), T, Mr);
+        for (long a = 0; a < nbnd; ++a)
+          for (long b = 0; b < nbnd; ++b) Ms(a, b) = ctx.cd_pref * Mr(a, b);
+      }
+    };
   }
 
   /** One-line banner + the geometry table. */
@@ -686,9 +873,11 @@ namespace p_contour {
             g.W_band * ha_to_eV, g.n_valence_clusters, g.nk_lin);
     app_log(lvl, "  - TC geometry:                 delta = {:.6g} a.u. ({:.4g} eV; "
                  "recipe floor {:.4g} eV = {} W_band/N_k -- FLAGGED constant), "
-                 "W_target = {:.4g} eV, rho = {:.3g}, profile = {}",
+                 "W_target = {:.4g} eV{}, rho = {:.3g}, profile = {}",
             g.delta, g.delta * ha_to_eV, g.delta_mesh * ha_to_eV, delta_mesh_const,
-            g.W_target * ha_to_eV, o.rho, o.profile);
+            g.W_target * ha_to_eV,
+            g.window_floored ? " [FLOORED at delta: Dmin > zeta_max]" : "",
+            o.rho, o.profile);
     app_log(lvl, "  - TC contour:                  theta = {:.6f} rad (tan {:.4g}), "
                  "gamma = {:.4g}, S = {:.4g} a.u. ({:.3g} fs); eps = {:.0e}, "
                  "eps_tr = {:.0e}",

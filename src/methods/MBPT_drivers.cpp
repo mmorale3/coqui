@@ -712,6 +712,16 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
                  "evgw: unknown qp_tc_profile: {}. Valid options: \"flat\", \"growing\".",
                  qp_params.qp_tc_profile);
     qp_params.qp_tc_trunc = io::get_value_with_default<bool>(pt,"qp_tc_trunc",false);
+    qp_params.qp_tc_krylov = io::get_value_with_default<bool>(pt,"qp_tc_krylov",false);
+    qp_params.qp_tc_krylov_tol =
+        io::get_value_with_default<double>(pt,"qp_tc_krylov_tol",1e-12);
+    utils::check(qp_params.qp_tc_krylov_tol > 0.0 and qp_params.qp_tc_krylov_tol < 1.0,
+                 "evgw: qp_tc_krylov_tol = {} must be in (0, 1).",
+                 qp_params.qp_tc_krylov_tol);
+    qp_params.qp_tc_bstore_gb =
+        io::get_value_with_default<double>(pt,"qp_tc_bstore_gb",0.0);
+    utils::check(qp_params.qp_tc_bstore_gb >= 0.0,
+                 "evgw: qp_tc_bstore_gb = {} must be >= 0.", qp_params.qp_tc_bstore_gb);
     // RW-2: the spectral-quadrature W^c representation (notes/rw_real_axis_w_spec.md).
     qp_params.qp_modea_spectral_eta =
         io::get_value_with_default<double>(pt,"qp_modea_spectral_eta",0.0125);
@@ -851,6 +861,16 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
                  "qpgw: unknown qp_tc_profile: {}. Valid options: \"flat\", \"growing\".",
                  qp_params.qp_tc_profile);
     qp_params.qp_tc_trunc = io::get_value_with_default<bool>(pt,"qp_tc_trunc",false);
+    qp_params.qp_tc_krylov = io::get_value_with_default<bool>(pt,"qp_tc_krylov",false);
+    qp_params.qp_tc_krylov_tol =
+        io::get_value_with_default<double>(pt,"qp_tc_krylov_tol",1e-12);
+    utils::check(qp_params.qp_tc_krylov_tol > 0.0 and qp_params.qp_tc_krylov_tol < 1.0,
+                 "qpgw: qp_tc_krylov_tol = {} must be in (0, 1).",
+                 qp_params.qp_tc_krylov_tol);
+    qp_params.qp_tc_bstore_gb =
+        io::get_value_with_default<double>(pt,"qp_tc_bstore_gb",0.0);
+    utils::check(qp_params.qp_tc_bstore_gb >= 0.0,
+                 "qpgw: qp_tc_bstore_gb = {} must be >= 0.", qp_params.qp_tc_bstore_gb);
     // RW-2: the spectral-quadrature W^c representation (notes/rw_real_axis_w_spec.md).
     qp_params.qp_modea_spectral_eta =
         io::get_value_with_default<double>(pt,"qp_modea_spectral_eta",0.0125);
@@ -1274,6 +1294,16 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
                  "qpgw: unknown qp_tc_profile: {}. Valid options: \"flat\", \"growing\".",
                  qp_params.qp_tc_profile);
     qp_params.qp_tc_trunc = io::get_value_with_default<bool>(pt,"qp_tc_trunc",false);
+    qp_params.qp_tc_krylov = io::get_value_with_default<bool>(pt,"qp_tc_krylov",false);
+    qp_params.qp_tc_krylov_tol =
+        io::get_value_with_default<double>(pt,"qp_tc_krylov_tol",1e-12);
+    utils::check(qp_params.qp_tc_krylov_tol > 0.0 and qp_params.qp_tc_krylov_tol < 1.0,
+                 "qpgw: qp_tc_krylov_tol = {} must be in (0, 1).",
+                 qp_params.qp_tc_krylov_tol);
+    qp_params.qp_tc_bstore_gb =
+        io::get_value_with_default<double>(pt,"qp_tc_bstore_gb",0.0);
+    utils::check(qp_params.qp_tc_bstore_gb >= 0.0,
+                 "qpgw: qp_tc_bstore_gb = {} must be >= 0.", qp_params.qp_tc_bstore_gb);
     // RW-2: the spectral-quadrature W^c representation (notes/rw_real_axis_w_spec.md).
     qp_params.qp_modea_spectral_eta =
         io::get_value_with_default<double>(pt,"qp_modea_spectral_eta",0.0125);

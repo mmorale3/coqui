@@ -78,6 +78,8 @@
 #include "methods/SCF/scf_common.hpp"
 #include "methods/SCF/p_contour.hpp"
 #include "methods/SCF/wc_line.hpp"
+#include "methods/SCF/wc_band_elements.hpp"
+#include <format>
 #include "methods/scr_coulomb/scr_coulomb_t.h"
 #include "numerics/imag_axes_ft/IAFT.hpp"
 #include "hamiltonian/one_body_hamiltonian.hpp"
@@ -542,6 +544,349 @@ namespace bdft_tests {
               dg.trunc_ratio);
       REQUIRE(num / std::max(den, 1e-300) < 10.0 * o.eps);
     }
+  }
+
+  // =====================================================================
+  //  GATE TC-3-b(1) -- THE DECOMPOSITION IDENTITY.
+  //
+  //  The eq-1 CD assembly with the FIT's OWN W^c feeding BOTH terms must
+  //  reproduce the route-B closed form (modea_sigma_at) exactly, up to the
+  //  bosonic leftover and the nu quadrature. No contour is involved: this is
+  //  what validates the decomposition, the sigma_m weights, the residue
+  //  argument eps_J - z and the imaginary-axis quadrature on a REAL mode-A
+  //  context, before any contour W is attached. It is the TC-3 analogue of
+  //  TC-2-a(i) -- a bare identity rather than a comparison.
+  // =====================================================================
+  static void run_tc3b1_gate(char const *mf_src) {
+    auto &mpi_context = utils::make_unit_test_mpi_context();
+    if (mpi_context->comm.size() != 1) return;
+    decltype(nda::range::all) all;
+
+    auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, mf_src));
+    const int nIpts = mf->nbnd() * 2;
+    thc_reader_t thc(mf, make_thc_reader_ptree(nIpts, "", "incore", "", "bdft", 1e-8,
+                                               mf->ecutrho(), 1, 1024));
+    const long ns = mf->nspin(), Nk_ibz = mf->nkpts_ibz(), nbnd = mf->nbnd();
+    const double beta = 1000.0;
+    auto eigval = mf->eigval();
+    double e_min = 1e300, e_max = -1e300;
+    for (long s = 0; s < ns; ++s)
+      for (long k = 0; k < Nk_ibz; ++k)
+        for (long n = 0; n < nbnd; ++n) {
+          e_min = std::min(e_min, eigval(s, k, n));
+          e_max = std::max(e_max, eigval(s, k, n));
+        }
+    const double w_max = std::max(std::abs(e_min), std::abs(e_max)) + 2.0;
+
+    imag_axes_ft::IAFT ft(beta, w_max + 1.0, imag_axes_ft::dlr_basis, "high");
+    MBState mb_state(mpi_context, ft, std::string("coqui_tc3b1_") + mf_src);
+    simple_dyson dyson(mf.get(), &ft);
+    mb_state.sF_skij.emplace(math::shm::make_shared_array<Array_view_4D_t>(
+        *mpi_context, {ns, Nk_ibz, nbnd, nbnd}));
+    mb_state.sDm_skij.emplace(math::shm::make_shared_array<Array_view_4D_t>(
+        *mpi_context, {ns, Nk_ibz, nbnd, nbnd}));
+    mb_state.sG_tskij.emplace(math::shm::make_shared_array<Array_view_5D_t>(
+        *mpi_context, {ft.nt_f(), ns, Nk_ibz, nbnd, nbnd}));
+    mb_state.sSigma_tskij.emplace(math::shm::make_shared_array<Array_view_5D_t>(
+        *mpi_context, {ft.nt_f(), ns, Nk_ibz, nbnd, nbnd}));
+    hamilt::set_fock(*mf, dyson.PSP(), mb_state.sF_skij.value(), true);
+    if (mpi_context->node_comm.root()) mb_state.sSigma_tskij.value().local() = ComplexType(0.0);
+    mb_state.sSigma_tskij.value().communicator()->barrier();
+    double mu = 0.0;
+    update_G(dyson, *mf, ft, mb_state.sDm_skij.value(), mb_state.sG_tskij.value(),
+             mb_state.sF_skij.value(), mb_state.sSigma_tskij.value(), mu, false);
+    solvers::scr_coulomb_t scr_im(&ft, "rpa", "ignore_g0");
+    scr_im.update_w(mb_state, thc, -1);
+
+    auto sE = math::shm::make_shared_array<Array_view_3D_t>(
+        *mpi_context, {ns, Nk_ibz, nbnd});
+    auto sMO = math::shm::make_shared_array<Array_view_4D_t>(
+        *mpi_context, {ns, Nk_ibz, nbnd, nbnd});
+    if (mpi_context->node_comm.root()) {
+      sE.local() = ComplexType(0.0);
+      sMO.local() = ComplexType(0.0);
+      for (long s = 0; s < ns; ++s)
+        for (long k = 0; k < Nk_ibz; ++k)
+          for (long n = 0; n < nbnd; ++n) {
+            sE.local()(s, k, n) = ComplexType(eigval(s, k, n), 0.0);
+            sMO.local()(s, k, n, n) = ComplexType(1.0, 0.0);
+          }
+    }
+    sE.communicator()->barrier();
+    sMO.communicator()->barrier();
+
+    // the mode-A context on the PRODUCTION tau route -- the pole rep both sides share
+    qp_modea::modea_ctx ctx;
+    qp_modea::modea_opts opts;
+    opts.wfit = "tau";
+    opts.level = 3;
+    opts.cd_bstore_cap_gb = 4.0;      // TC-3: capture B_J(P,a) in stage 2
+    qp_modea::build_modea_context(ctx, mb_state, thc, sMO, sE, mu, ft, opts,
+                                  "ignore_g0", false);
+    REQUIRE(ctx.blocks.size() > 0);
+    REQUIRE(ctx.npk > 0);
+
+    // the smallest |om_p| sets the bosonic leftover: exp(-beta*om_min)
+    double om_min = 1e300;
+    for (long p = 0; p < ctx.npk; ++p) om_min = std::min(om_min, std::abs(ctx.om(p)));
+    const double leftover = std::exp(-beta * om_min);
+
+    qp_modea::cd_line_opts clo;
+    clo.on = true;
+    clo.delta = 0.0;              // the fit source is exact ON the real axis here:
+                                  // this leg tests the DECOMPOSITION, not the contour
+    qp_modea::cd_line_ctx cl;
+    qp_modea::cd_line_prepare(cl, ctx, clo);
+    cl.residue = qp_modea::fit_residue_source(ctx, ctx.blocks);
+    cl.route = "fit";
+
+    // evaluate at a spread of REAL energies inside the QP window, avoiding the CD
+    // singularity omega = eps_J (which the strip/clamp machinery guards in production)
+    nda::array<ComplexType, 2> Sb(nbnd, nbnd), Sc(nbnd, nbnd);
+    double worst = 0.0, den_worst = 0.0;
+    long nz_used = 0;
+    // Evaluation energies must stay OFF the internal pole set: omega = eps_J is the CD
+    // branch point (the nu integrand acquires a real-axis pole there). Every QP energy
+    // IS an eps_J (the q = 0 member), so scan a grid across the QP window instead and
+    // keep the points with a healthy clearance -- which is exactly what the production
+    // strip/clamp machinery guarantees for the states it evaluates.
+    const double wlo = ctx.vbm - 0.25, whi = ctx.cbm + 0.25;
+    for (auto const &blk : ctx.blocks) {
+      const long off = (blk.is * ctx.nk + blk.ik) * ctx.nJ;
+      for (long ig = 0; ig < 24; ++ig) {
+        const double w0 = wlo + (whi - wlo) * double(ig) / 23.0;
+        double gap = 1e300;
+        for (long J = 0; J < ctx.nJ; ++J)
+          gap = std::min(gap, std::abs(w0 - ctx.epsJ(off + J)));
+        if (gap < 2e-2) continue;                    // clear of the CD branch point
+        const ComplexType z(w0, 0.0);
+        qp_modea::modea_sigma_at(ctx, blk, z, Sb);
+        qp_modea::modea_sigma_at_cdline(ctx, blk, cl, z, Sc);
+        double num = 0.0, den = 0.0;
+        for (long i = 0; i < nbnd; ++i)
+          for (long j = 0; j < nbnd; ++j) {
+            num = std::max(num, std::abs(Sb(i, j) - Sc(i, j)));
+            den = std::max(den, std::abs(Sb(i, j)));
+          }
+        if (den > 0.0 and num / den > worst) { worst = num / den; den_worst = den; }
+        ++nz_used;
+      }
+    }
+    app_log(2, "[TC-3-b(1)] {}: eq-1 CD assembly (fit W on BOTH terms) vs route-B "
+               "modea_sigma_at, {} evaluation points over {} blocks, nbnd = {}, "
+               "npk = {}, nJ = {}: worst rel = {:.3e} (over max|Sigma| = {:.4g}); "
+               "Iterm CLOSED FORM (eq K); bosonic leftover exp(-beta*min|om_p|) = {:.2e}; "
+               "residue evaluations {} of {} (skipped {} where sigma_J = 0, "
+               "{:.1f}%); max |sigma_J| = {:.4f}; strictly fractional sigma_J at "
+               "{} state-evaluations",
+            mf_src, nz_used, ctx.blocks.size(), nbnd, ctx.npk, ctx.nJ, worst,
+            den_worst, leftover, cl.n_res_eval,
+            cl.n_res_eval + cl.n_res_skip, cl.n_res_skip,
+            100.0 * double(cl.n_res_skip) / double(std::max(1L, cl.n_res_eval + cl.n_res_skip)),
+            cl.sigma_abs_max, cl.n_frac);
+    app_log(2, "[TC-3-b(1)] CD branch-point tripwire: min |Re A_J| over all evaluations = "
+               "{:.3e} a.u.; {} (J, z) pairs within 1e-6 of the branch point",
+            cl.min_absReA, cl.n_branch);
+    REQUIRE(nz_used >= 4);
+    REQUIRE(worst < 1e-10);   // an ALGEBRAIC identity: only the bosonic leftover
+    REQUIRE(ctx.have_bstore);
+    REQUIRE(ctx.bstore.size() == ctx.blocks.size());
+
+    // =================================================================
+    //  GATE TC-3-b(2) -- the CONTOUR residue source.
+    //
+    //  Four Sigma^c's on the SAME mode-A context, so the two error
+    //  sources separate cleanly:
+    //    (1) route B                                    -- the reference
+    //    (2) eq-1, FIT source, delta = 0                -- = (1), the identity above
+    //    (3) eq-1, FIT source, delta = delta_contour    -- (3)-(1) is the BROADENING
+    //    (4) eq-1, CONTOUR source, delta = delta_contour-- (4)-(3) is the TRANSFORM
+    //  Comparing (4) against (1) directly would charge the transform for the
+    //  broadening, which is the mistake models.py's `delta_eval` flag exists to
+    //  prevent ("that mistake cost 15 meV of spurious error in an earlier C2").
+    // =================================================================
+    {
+      pc::opts_t po;
+      po.eps = 1e-6;
+      po.rho = 0.65;
+      po.profile = "flat";
+      po.zeta_max = 10.0 / pc::ha_to_eV;
+      po.nx = 2500;
+      long nk_lin = 1;
+      {
+        auto kg = mf->kp_grid();
+        nk_lin = std::min({long(kg(0)), long(kg(1)), long(kg(2))});
+      }
+      auto pctx = pc::build_contour_for_spectrum(sE.local(), mu, nk_lin, beta, po);
+      pc::log_contour(pctx, po, 2);
+      const long rr = pctx.c.rank;
+      auto sPc = math::shm::make_shared_array<Array_view_4D_t>(
+          *mpi_context, {mf->nqpts_ibz(), rr, thc.Np(), thc.Np()});
+      pc::ctx_t dg2;
+      pc::sample_P_at_times(sPc, pctx.t_node, thc, sMO, sE, mu, beta, -1.0, &dg2);
+      auto tf = tilted_contour::factor_transform(pctx.c);
+      app_log(2, "[TC-3-b(2)] transform factorization: {} nodes x {} grid points, "
+                 "cond = {:.3e}", tf.r, tf.nD, tf.cond);
+
+      methods::wc_line::solve_opts_t sopt;
+      methods::wc_line::solve_stats_t sstat;
+      auto csrc = pc::make_contour_residue_source(ctx, pctx, tf, sPc, thc, sopt, sstat);
+
+      const double dlt = pctx.geom.delta;
+      qp_modea::cd_line_opts clo3;
+      clo3.on = true;
+      clo3.delta = dlt;
+      qp_modea::cd_line_ctx cl_fit_d, cl_ctr;
+      qp_modea::cd_line_prepare(cl_fit_d, ctx, clo3);
+      cl_fit_d.residue = qp_modea::fit_residue_source(ctx, ctx.blocks);
+      qp_modea::cd_line_prepare(cl_ctr, ctx, clo3);
+      cl_ctr.residue = csrc;
+      cl_ctr.route = "contour";
+
+      nda::array<ComplexType, 2> S1(nbnd, nbnd), S3(nbnd, nbnd), S4(nbnd, nbnd);
+      double d_broad = 0.0, d_trans = 0.0, d_total = 0.0, den_w = 0.0;
+      double zre_lo = 1e300, zre_hi = -1e300, tf_inbasis = 0.0;
+      double tf_below = 0.0, tf_inside = 0.0;
+      long npt = 0, n_probe = 0, n_below_dmin = 0;
+      for (auto const &blk : ctx.blocks) {
+        const long off = (blk.is * ctx.nk + blk.ik) * ctx.nJ;
+        for (long ig = 0; ig < 24; ++ig) {
+          const double w0 = wlo + (whi - wlo) * double(ig) / 23.0;
+          double gap = 1e300;
+          for (long J = 0; J < ctx.nJ; ++J)
+            gap = std::min(gap, std::abs(w0 - ctx.epsJ(off + J)));
+          if (gap < 2e-2) continue;
+          const ComplexType z(w0, 0.0);
+          // the CONTRIBUTING residue targets (sigma_J != 0) and the transform's
+          // in-basis accuracy AT THEM -- the direct test of whether the target sits
+          // inside what the contour represents
+          for (long J = 0; J < ctx.nJ; ++J) {
+            const double eJ = ctx.epsJ(off + J), fJ = ctx.fJ(off + J);
+            const double sgJ = ((w0 > eJ) ? 1.0 : 0.0) - fJ;
+            if (std::abs(sgJ) < 1e-14) continue;
+            const double zr = eJ - w0;
+            zre_lo = std::min(zre_lo, zr);
+            zre_hi = std::max(zre_hi, zr);
+            if (n_probe < 300) {
+              nda::array<ComplexType, 1> Fr(pctx.c.rank);
+              tf.apply(ComplexType(zr, dlt), Fr);
+              const ComplexType rot = std::exp(ComplexType(0.0, -pctx.c.g.theta));
+              double e = 0.0;
+              for (long k = 0; k < pctx.c.x.size(); k += 37) {
+                const double Dk = pctx.c.p.dmin + pctx.c.x(k);
+                ComplexType acc(0.0, 0.0);
+                for (long j = 0; j < pctx.c.rank; ++j)
+                  acc += Fr(j) * std::exp(ComplexType(0.0, -1.0) * Dk * pctx.c.s(j) * rot);
+                const ComplexType ex = 1.0 / (ComplexType(zr, dlt) - Dk);
+                e = std::max(e, std::abs(acc - ex) / std::abs(ex));
+              }
+              tf_inbasis = std::max(tf_inbasis, e);
+              if (std::abs(zr) < pctx.geom.dmin) {
+                ++n_below_dmin;
+                tf_below = std::max(tf_below, e);
+              } else {
+                tf_inside = std::max(tf_inside, e);
+              }
+              ++n_probe;
+            }
+          }
+          qp_modea::modea_sigma_at(ctx, blk, z, S1);
+          qp_modea::modea_sigma_at_cdline(ctx, blk, cl_fit_d, z, S3);
+          qp_modea::modea_sigma_at_cdline(ctx, blk, cl_ctr, z, S4);
+          double nb = 0.0, nt = 0.0, ntot = 0.0, den = 0.0;
+          for (long i = 0; i < nbnd; ++i)
+            for (long j = 0; j < nbnd; ++j) {
+              nb = std::max(nb, std::abs(S3(i, j) - S1(i, j)));
+              nt = std::max(nt, std::abs(S4(i, j) - S3(i, j)));
+              ntot = std::max(ntot, std::abs(S4(i, j) - S1(i, j)));
+              den = std::max(den, std::abs(S1(i, j)));
+            }
+          if (den > 0.0) {
+            d_broad = std::max(d_broad, nb / den);
+            d_trans = std::max(d_trans, nt / den);
+            d_total = std::max(d_total, ntot / den);
+            den_w = std::max(den_w, den);
+          }
+          ++npt;
+        }
+      }
+      app_log(2, "[TC-3-b(2)] {}: Sigma^c over {} evaluation points, delta = {:.6g} a.u. "
+                 "({:.4g} eV); CONTRIBUTING residue targets (sigma_J != 0) have Re z in "
+                 "[{:.4g}, {:.4g}] a.u.; the contour's design window is |Re z| in "
+                 "[Dmin, Dmin+W] = [{:.4g}, {:.4g}] a.u.",
+              mf_src, npt, dlt, dlt * pc::ha_to_eV, zre_lo, zre_hi,
+              pctx.geom.dmin, pctx.geom.dmin + pctx.geom.W_target);
+      app_log(2, "[TC-3-b(2)] {}: TRANSFORM IN-BASIS ACCURACY at the contributing targets "
+                 "(F applied to 1/(z-Delta) over the adapted grid): worst = {:.3e} over {} "
+                 "probed targets. SPLIT BY WINDOW: targets with |Re z| >= Dmin = {:.4g} "
+                 "(inside) give {:.3e}; the {} of {} targets with |Re z| BELOW Dmin give "
+                 "{:.3e}",
+              mf_src, tf_inbasis, n_probe, pctx.geom.dmin, tf_inside, n_below_dmin,
+              n_probe, tf_below);
+      app_log(2, "[TC-3-b(2)] {}: Sigma^c differences, all relative to max|Sigma^c| = "
+                 "{:.4g}:  (a) delta BROADENING, fit-W on the delta line vs route B = "
+                 "{:.3e};  (b) FIT-vs-CONTOUR on the SAME line = {:.3e};  (c) total, "
+                 "contour vs route B = {:.3e}",
+              mf_src, den_w, d_broad, d_trans, d_total);
+      app_log(2, "[TC-3-b(2)] {}: READ (b) AS THE MAP-CLASS DIFFERENCE, NOT AN ERROR. The "
+                 "transform is accurate at these targets ({:.3e} in-basis, above), and the "
+                 "contour W^c agrees with the PRODUCTION imaginary-axis W^c to 2.1e-06 "
+                 "(gate TC-3-b(0)). Both W's are evaluated on the SAME line, so (b) is the "
+                 "LS pole fit's own real-axis error -- the standing QM3-b caveat "
+                 "(sigma_route_b.hpp) quantified, and the defect this route removes.",
+              mf_src, tf_inbasis);
+
+      // (a) is dominated by delta itself: at N_k = 2 the eq-8 recipe gives delta = 1.19 eV.
+      // Scan the fit source alone (no contour rebuild) to show the broadening collapsing.
+      {
+        std::string trail;
+        for (double fac : {1.0, 0.25, 0.0625, 0.015625}) {
+          qp_modea::cd_line_opts co;
+          co.on = true;
+          co.delta = dlt * fac;
+          qp_modea::cd_line_ctx cf;
+          qp_modea::cd_line_prepare(cf, ctx, co);
+          cf.residue = qp_modea::fit_residue_source(ctx, ctx.blocks);
+          double db = 0.0, dn = 0.0;
+          for (auto const &blk2 : ctx.blocks) {
+            const long off2 = (blk2.is * ctx.nk + blk2.ik) * ctx.nJ;
+            for (long ig = 0; ig < 24; ig += 6) {
+              const double w2 = wlo + (whi - wlo) * double(ig) / 23.0;
+              double g2 = 1e300;
+              for (long J = 0; J < ctx.nJ; ++J)
+                g2 = std::min(g2, std::abs(w2 - ctx.epsJ(off2 + J)));
+              if (g2 < 2e-2) continue;
+              qp_modea::modea_sigma_at(ctx, blk2, ComplexType(w2, 0.0), S1);
+              qp_modea::modea_sigma_at_cdline(ctx, blk2, cf, ComplexType(w2, 0.0), S3);
+              for (long i = 0; i < nbnd; ++i)
+                for (long j = 0; j < nbnd; ++j) {
+                  db = std::max(db, std::abs(S3(i, j) - S1(i, j)));
+                  dn = std::max(dn, std::abs(S1(i, j)));
+                }
+            }
+          }
+          trail += std::format("  delta = {:.4g} eV -> {:.3e}",
+                               co.delta * pc::ha_to_eV, db / std::max(dn, 1e-300));
+        }
+        app_log(2, "[TC-3-b(2)] {}: the delta BROADENING collapses with delta (fit source, "
+                   "same contour geometry):{}", mf_src, trail);
+      }
+      app_log(2, "[TC-3-b(2)] {}: line solves {} (dense), max |[I - Z.Pi]^-1| = {:.3e}; "
+                 "residue evaluations {} of {} ({:.1f}% skipped where sigma_J = 0)",
+              mf_src, sstat.n_solve, sstat.cond_hint, cl_ctr.n_res_eval,
+              cl_ctr.n_res_eval + cl_ctr.n_res_skip,
+              100.0 * double(cl_ctr.n_res_skip)
+                  / double(std::max(1L, cl_ctr.n_res_eval + cl_ctr.n_res_skip)));
+      REQUIRE(npt >= 4);
+      REQUIRE(n_probe > 100);
+      // THE GATE is the transform's accuracy at the targets the CD actually asks for.
+      // (b) is a map-class difference and is reported, not gated.
+      REQUIRE(tf_inbasis < 1e-3);
+    }
+  }
+
+  TEST_CASE("tc3b1_identity_lih222", "[methods][tc_contour]") {
+    run_tc3b1_gate("qe_lih222");
   }
 
   // =====================================================================

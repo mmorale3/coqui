@@ -935,6 +935,11 @@ namespace qp_modea {
     // TC-2: the tilted-contour route. Inert for every other wfit -- nothing above or
     // below this flag reads it except the one branch in THE POLE SET block.
     const bool contour = (opts.wfit == "contour");
+    // TC-3: the contour route needs BOTH halves of eq 1. Its imaginary-axis term is the
+    // EXISTING pole representation (blk.M / ctx.om), so the pole set below is built by the
+    // production tau route exactly as wfit = "tau" would; only the RESIDUE W-source is
+    // replaced. `use_nu_fit` therefore selects nu-vs-tau, and "contour" reads as "tau".
+    const bool use_nu_fit = (opts.wfit == "nu");
     ctx.diag.gap_edge = gap_edge;
     {   // global QP band edges of the CURRENT spectrum -- the strip test needs them
       double lo = -1e300, hi = 1e300;
@@ -1029,57 +1034,8 @@ namespace qp_modea {
     std::optional<imag_axes_ft::masked_pole_fit> mpf_opt;
     detail::spectral_ctx_t sp;
     long npk = 0;
-    if (contour) {
-      // ================== TC-2: P ON THE TILTED CONTOUR =========================
-      // A SIBLING of the spectral route: same knob family, same G provenance (the
-      // CURRENT QP spectrum and MOs, frozen for the inner loop), same seam. What it
-      // produces here is P_PQ(q, s_j) on the contour nodes plus the transform F;
-      // turning that into the residue slabs sWres the rest of this file consumes is
-      // W ON THE LINE, which is increment TC-3.
-      const long nk_lin = [&]() {
-        auto kg = MF->kp_grid();
-        return std::min({long(kg(0)), long(kg(1)), long(kg(2))});
-      }();
-      p_contour::opts_t po;
-      po.eps = opts.tc_eps;
-      po.delta = opts.tc_delta;
-      po.rho = opts.tc_rho;
-      po.profile = opts.tc_profile;
-      po.trunc = opts.tc_trunc;
-      po.level = lvl;
-      auto pctx = p_contour::build_contour_for_spectrum(sE_ska.local(), mu, nk_lin,
-                                                        ctx.beta, po);
-      p_contour::log_contour(pctx, po, lvl);
-
-      auto sPc = make_shared_array<nda::array_view<ComplexType, 4>>(
-          *mpi, {nq_ibz, pctx.c.rank, NP, NP});
-      const auto t_pc = std::chrono::steady_clock::now();
-      p_contour::sample_P_at_times(sPc, pctx.t_node, thc, sMO_skia, sE_ska, mu,
-                                   ctx.beta, po.trunc ? po.eps : -1.0, &pctx);
-      pctx.t_wall = std::chrono::duration<double>(
-          std::chrono::steady_clock::now() - t_pc).count();
-      double pmax = 0.0;
-      for (auto const &v : sPc.local()) pmax = std::max(pmax, std::abs(v));
-      pmax = mpi->comm.all_reduce_value(pmax, boost::mpi3::max<>{});
-      app_log(lvl, "  - TC P samples:                {} q x {} nodes x {}^2 = {:.2f} MB "
-                   "(node-shared); max|P(q, s_j)| = {:.4e}; band truncation {} "
-                   "(kept greater leg [{}, {}], lesser leg [{}, {}] of {}; band-work "
-                   "ratio {:.3f}); wall {:.2f} s",
-              nq_ibz, pctx.c.rank, NP,
-              double(nq_ibz) * double(pctx.c.rank) * double(NP) * double(NP) * 16.0
-                  / 1.048576e6,
-              pmax, po.trunc ? "ON" : "off", pctx.nband_p_min, pctx.nband_p_max,
-              pctx.nband_n_min, pctx.nband_n_max, nbnd, pctx.trunc_ratio, pctx.t_wall);
-      utils::check(false,
-                   "qp_modea: qp_modea_wfit = \"contour\" reaches the end of increment "
-                   "TC-2. The tilted contour, the transform F and P_PQ(q, s_j) are all "
-                   "built and reported above; what is NOT implemented yet is W on the "
-                   "line -- W^c(z) = v[1 - v P(z)]^{{-1}} v P(z) v at the CD target list, "
-                   "and the eq-1 assembly with the derived sigma_m signs -- which is "
-                   "increment TC-3 (notes/tc_coqui_impl_spec.md). Use qp_modea_wfit = "
-                   "\"tau\", \"nu\" or \"spectral\" for a production run.");
-    } else if (not spectral) {
-      mpf_opt = (opts.wfit == "nu")
+    if (not spectral) {
+      mpf_opt = use_nu_fit
                     ? imag_axes_ft::masked_pole_fit::from_matsubara(pf, zb, gap_edge, opts.wrtol)
                     : imag_axes_ft::masked_pole_fit::from_tau(pf, gap_edge, opts.wrtol);
       npk = mpf_opt->nkeep;
@@ -1285,7 +1241,11 @@ namespace qp_modea {
     sWres.win().fence();
 
     nda::array<ComplexType, 2> Wt(nt_half, nc), Whalf(nw_half, nc), Ww(nwb, nc);
-    nda::array<ComplexType, 2> Wf((opts.wfit == "tau") ? ntf : 0, (opts.wfit == "tau") ? nc : 0);
+    // NOTE the `not spectral` guard: the spectral path never touches Wf and used to
+    // allocate it empty. use_nu_fit alone would start allocating it there -- harmless but
+    // a behaviour change, and the no-op gate compares memory-sensitive diagnostics.
+    const bool need_Wf = (not use_nu_fit) and (not spectral);
+    nda::array<ComplexType, 2> Wf(need_Wf ? ntf : 0, need_Wf ? nc : 0);
     // RW-2: the spectral fill needs an internode all_reduce of sWres before the rep can be
     // read back, so its Lehmann meter runs in a second pass and the per-q reference is kept.
     nda::array<ComplexType, 3> Ww_all(spectral ? nq_ibz : 0, spectral ? nwb : 0,
@@ -1366,7 +1326,7 @@ namespace qp_modea {
 
       auto const &mpf = *mpf_opt;
       nda::array<ComplexType, 2> cfit;
-      if (opts.wfit == "nu") {
+      if (use_nu_fit) {
         cfit = mpf.coeffs(Ww);
         if (nc > 0) {
           fit_worst = std::max(fit_worst, mpf.fit_error(Ww, cfit));
@@ -1441,13 +1401,13 @@ namespace qp_modea {
                        "rec = {:.3e}  own-grid = {:.3e}  residue ratio = {:.3e}",
                   name, f.nkeep, f.np_all, f.n_kept, (den > 0.0 ? num / den : 0.0), own, rr);
         };
-        auto const &data = (opts.wfit == "nu") ? Ww : Wf;
+        auto const &data = use_nu_fit ? Ww : Wf;
         for (double rt : {1e-8, 1e-6, 1e-4, 1e-2}) {
-          auto f0 = (opts.wfit == "nu")
+          auto f0 = use_nu_fit
                         ? imag_axes_ft::masked_pole_fit::from_matsubara(pf, zb, 0.0, rt)
                         : imag_axes_ft::masked_pole_fit::from_tau(pf, 0.0, rt);
           probe(std::format("plain,      rel_tol = {:.0e}", rt), f0, data);
-          auto f1 = (opts.wfit == "nu")
+          auto f1 = use_nu_fit
                         ? imag_axes_ft::masked_pole_fit::from_matsubara(pf, zb, gap_edge, rt)
                         : imag_axes_ft::masked_pole_fit::from_tau(pf, gap_edge, rt);
           probe(std::format("support-constrained, rel_tol = {:.0e}", rt), f1, data);
@@ -1980,6 +1940,22 @@ namespace qp_modea {
     auto qp_trev = MF->qp_trev();
     auto qminus = MF->qminus();
     const double pref = 1.0 / double(nkpts);
+    // TC-3: the band-factor capture. Fixture-scale only -- guarded by an explicit cap and
+    // by the requirement that the stage-2 helper split be off (see the tripwire below).
+    bool cd_bstore_on = (opts.cd_bstore_cap_gb > 0.0);
+    if (cd_bstore_on) {
+      const double gb = double(nJ) * double(NP) * double(nbnd) * 16.0 / 1.073741824e9;
+      utils::check(gb <= opts.cd_bstore_cap_gb,
+                   "qp_modea (cd bstore): the eq-1 residue band-factor store needs {:.2f} GB "
+                   "per owned (s,k) block (nJ = {}, Np = {}, nbnd = {}) but the cap "
+                   "cd_bstore_cap_gb is {:.2f}. This store is FIXTURE-SCALE ONLY; the "
+                   "production path must recompute B inside the evaluator.",
+                   gb, nJ, NP, nbnd, opts.cd_bstore_cap_gb);
+      ctx.cd_pref = pref;
+      ctx.have_bstore = true;
+      app_log(lvl, "  - TC-3 band-factor store:      ON, {:.3f} GB per owned (s,k) block "
+                   "(nJ = {} x Np = {} x nbnd = {})", gb, nJ, NP, nbnd);
+    }
 
     // ---------------- the SYMMETRY CENSUS (permanent, level 2) -------------------------
     // Two things the kp444 post-mortem needed and no log carried:
@@ -2120,6 +2096,19 @@ namespace qp_modea {
         blk.M = nda::array<ComplexType, 3>(nbnd, nbnd, nP_flat);
         blk.M() = ComplexType(0.0);
       }
+      // TC-3: the eq-1 residue source's band factors (modea_ctx::cd_band_store).
+      const bool bst = cd_bstore_on and own;
+      qp_modea::modea_ctx::cd_band_store bs;
+      if (bst) {
+        bs.is = is;
+        bs.ik = ik;
+        bs.B = nda::array<ComplexType, 3>(nJ, NP, nbnd);
+        bs.B() = ComplexType(0.0);
+        bs.qs_of_J = nda::array<long, 1>(nJ);
+        bs.qs_of_J() = -1;
+        bs.wconj_of_J = nda::array<int, 1>(nJ);
+        bs.wconj_of_J() = 0;
+      }
 
       long pair = 0, npair_mine = 0;
       for (long isym = 0; isym < nsym; ++isym) {
@@ -2165,6 +2154,22 @@ namespace qp_modea {
             const double e = sE_ska.local()(is, kg_ibz, n).real();
             ctx.epsJ((is * nk_ibz + ik) * nJ + J) = e;
             ctx.fJ((is * nk_ibz + ik) * nJ + J) = sigma_route_b::stable_nF(ctx.beta, e - mu);
+          }
+
+          // TC-3: capture B_J(P,a) = conj(XCe(P,a)) * u(P,n) and the (IBZ q, trev) pair.
+          // This is the SAME B the dense sandwich below builds, taken here so the eq-1
+          // residue source never re-derives the symmetry bookkeeping.
+          if (bst) {
+            for (long n = 0; n < nbnd; ++n) {
+              const long J = qp * nbnd + n;
+              bs.qs_of_J(J) = qs;
+              bs.wconj_of_J(J) = wconj ? 1 : 0;
+              for (long P = 0; P < NP; ++P) {
+                const ComplexType u = gconj ? std::conj(U(P, n)) : U(P, n);
+                for (long a = 0; a < nbnd; ++a)
+                  bs.B(J, P, a) = std::conj(XCe(P, a)) * u;
+              }
+            }
           }
 
           if (union_on) {
@@ -2308,6 +2313,15 @@ namespace qp_modea {
           for (long a = 0; a < nbnd; ++a)
             for (long Pf = 0; Pf < nP_flat; ++Pf) ctx.Mdiag(is, ik, a, Pf) = blk.M(a, a, Pf);
         ctx.blocks.push_back(std::move(blk));
+        if (bst) {
+          for (long J = 0; J < nJ; ++J)
+            utils::check(bs.qs_of_J(J) >= 0,
+                         "qp_modea (cd bstore): internal state J = {} of block ({},{}) was "
+                         "never visited. The band-factor capture requires the stage-2 helper "
+                         "split to be OFF (group size 1), so that the block's owner computes "
+                         "every (isym, q) pair itself.", J, is, ik);
+          ctx.bstore.push_back(std::move(bs));
+        }
       }
     }
 
@@ -2315,6 +2329,68 @@ namespace qp_modea {
     mpi->comm.all_reduce_in_place_n(ctx.fJ.data(), ctx.fJ.size(), std::plus<>{});
     if (need_diag)
       mpi->comm.all_reduce_in_place_n(ctx.Mdiag.data(), ctx.Mdiag.size(), std::plus<>{});
+
+    // ================= TC-3: THE CONTOUR RESIDUE SOURCE ==============================
+    // Everything above ran the production tau route, so blk.M / ctx.om carry the eq-1
+    // IMAGINARY-AXIS term. What is added here is the residue term's W-source: the tilted
+    // contour, its sampled Pi, a reusable transform factorization, and the closure that
+    // turns (J, z) into <aJ|W^c(q_J, z)|Jb>. The closure OWNS its inputs through
+    // shared_ptr, so the context is self-contained afterwards.
+    if (contour) {
+      utils::check(ctx.have_bstore,
+                   "qp_modea: qp_modea_wfit = \"contour\" needs the eq-1 band-factor store, "
+                   "which is fixture-scale only. Set qp_tc_bstore_gb to a cap large enough "
+                   "for nJ x Np x nbnd complex per owned (s,k) block (see modea_ctx::"
+                   "cd_band_store) -- it is 0 by default precisely so a production-size run "
+                   "cannot enable it by accident.");
+      const long nk_lin = [&]() {
+        auto kg = MF->kp_grid();
+        return std::min({long(kg(0)), long(kg(1)), long(kg(2))});
+      }();
+      p_contour::opts_t po;
+      po.eps = opts.tc_eps;
+      po.delta = opts.tc_delta;
+      po.rho = opts.tc_rho;
+      po.profile = opts.tc_profile;
+      po.trunc = opts.tc_trunc;
+      po.level = lvl;
+      auto pctx = std::make_shared<p_contour::ctx_t>(
+          p_contour::build_contour_for_spectrum(sE_ska.local(), mu, nk_lin, ctx.beta, po));
+      p_contour::log_contour(*pctx, po, lvl);
+
+      auto sPc = std::make_shared<sArray_t<Array_view_4D_t>>(
+          make_shared_array<nda::array_view<ComplexType, 4>>(
+              *mpi, {nq_ibz, pctx->c.rank, NP, NP}));
+      const auto t_pc = std::chrono::steady_clock::now();
+      p_contour::sample_P_at_times(*sPc, pctx->t_node, thc, sMO_skia, sE_ska, mu,
+                                   ctx.beta, po.trunc ? po.eps : -1.0, pctx.get());
+      const double t_sample = std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - t_pc).count();
+      auto tf = std::make_shared<tilted_contour::transform_factor_t>(
+          tilted_contour::factor_transform(pctx->c));
+      auto sopt = std::make_shared<wc_line::solve_opts_t>();
+      sopt->krylov = opts.tc_krylov;
+      sopt->tol = opts.tc_krylov_tol;
+      auto sstat = std::make_shared<wc_line::solve_stats_t>();
+
+      ctx.cdl = std::make_shared<qp_modea::cd_line_ctx>();
+      qp_modea::cd_line_opts clo;
+      clo.on = true;
+      clo.delta = pctx->geom.delta;
+      qp_modea::cd_line_prepare(*ctx.cdl, ctx, clo);
+      ctx.cdl->route = "contour";
+      ctx.cdl->residue = p_contour::make_contour_residue_source_owning(
+          ctx, pctx, tf, sPc, thc, sopt, sstat);
+      ctx.cdl->stats = sstat;
+      ctx.have_cdl = true;
+
+      app_log(lvl, "  - TC-3 CONTOUR ROUTE:          eq-1 CD assembly; imaginary-axis term "
+                   "from the tau pole set ({} poles, CLOSED FORM), residue term from the "
+                   "contour ({} nodes, delta = {:.6g} a.u. = {:.4g} eV); transform "
+                   "factorization cond = {:.3e}; P sampling wall {:.2f} s; line solver = {}",
+              npk, pctx->c.rank, clo.delta, clo.delta * 27.211386245988, tf->cond,
+              t_sample, opts.tc_krylov ? "warm-started GMRES" : "dense");
+    }
 
     ctx.active = true;
     ctx.have_cd = true;

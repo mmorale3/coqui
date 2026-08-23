@@ -147,6 +147,8 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <functional>
+#include <memory>
 
 #include "configuration.hpp"
 #include "nda/nda.hpp"
@@ -161,6 +163,8 @@
 #include "numerics/imag_axes_ft/IAFT.hpp"
 #include "numerics/imag_axes_ft/dlr_pole_fit.hpp"
 #include "methods/SCF/sigma_route_b.hpp"
+#include "methods/SCF/sigma_cd_line.hpp"
+#include "methods/SCF/wc_line.hpp"
 #include "methods/SCF/sigma_real_axis.hpp"
 
 namespace methods {
@@ -224,6 +228,16 @@ namespace qp_modea {
     double      tc_rho = 0.65;
     std::string tc_profile = "flat";   // {flat, growing}
     bool        tc_trunc = false;      // band truncation along the contour
+    // TC-3: capture the per-block band factors B_J(P,a) in stage 2 so the eq-1 residue
+    // source can sandwich an arbitrary W^c. Fixture-scale only -- see modea_ctx::
+    // cd_band_store. <= 0 disables; otherwise the cap in GB the store may occupy.
+    double      cd_bstore_cap_gb = 0.0;
+    // TC-3 line-solver knobs (qp_tc_krylov / qp_tc_krylov_tol). The economics: the
+    // DIAGONAL path needs nbnd right-hand sides per (q, z) and warm-started GMRES wins
+    // (measured ~5 iterations per solve); a full qpscf block needs nbnd^2 and the dense
+    // inverse amortizes. Default dense = the reference path.
+    bool        tc_krylov = false;
+    double      tc_krylov_tol = 1e-12;
     long iter = 1;                     // outer iteration (1 => Route-A root refinement)
     int level = 2;                     // logging level for the per-iteration banner
   };
@@ -364,6 +378,8 @@ namespace qp_modea {
    * The mode-A evaluator context: everything Sigma^c needs at ARBITRARY z, frozen for the
    * whole inner-consistency loop (spec section 4).
    */
+  struct cd_line_ctx;                  // TC-3, defined below
+
   struct modea_ctx {
     bool active = false;
     bool have_cd = false;              // route == cd (residue slabs present)
@@ -383,6 +399,41 @@ namespace qp_modea {
     // diagonal residues for the evGW leg, replicated: (ns, nk, nbnd, nJ*npk)
     nda::array<ComplexType, 4> Mdiag;
     bool have_diag = false;
+
+    // ---- TC-3: the CONTOUR residue source's per-block band factors --------------------
+    // The eq-1 residue term needs <aJ|W^c(q_J, z)|Jb> at targets z that move inside the
+    // self-consistency loop, so the sandwich cannot be precomputed the way blk.M is. What
+    // CAN be precomputed is its two fixed ingredients: the band-pair factor
+    //     B_J(P, a) = conj(XCe(P,a)) * u(P, n),     J = q'*nbnd + n
+    // and the (IBZ transfer, trev flag) that say WHICH W^c matrix it multiplies. Captured
+    // in stage 2, where the symmetry bookkeeping already exists, so the evaluator never
+    // re-derives it.
+    // MEMORY: nJ * NP * nbnd complex per owned block -- 1 MB on qe_lih222, but
+    // nkpts*nbnd * NP * nbnd = 1.3 TB at the production (64 k-points, Np 364, nbnd 60)
+    // sizes. It is therefore FIXTURE-SCALE ONLY, guarded by `cd_bstore_cap_gb`, and the
+    // production path must recompute B inside the evaluator (a TC-4 item).
+    struct cd_band_store {
+      long is = -1, ik = -1;
+      nda::array<ComplexType, 3> B;    // (nJ, NP, nbnd)
+      nda::array<long, 1> qs_of_J;     // (nJ) IBZ transfer index
+      nda::array<int, 1>  wconj_of_J;  // (nJ) the trev-q conjugation rule
+    };
+    std::vector<cd_band_store> bstore;
+    double cd_pref = 0.0;              // 1/nkpts, folded in by the residue source
+    bool have_bstore = false;
+
+    // TC-3: the eq-1 CD line evaluator, when qp_modea_wfit = "contour". Holds the
+    // residue source as a std::function whose closure OWNS the contour objects (the
+    // sampled Pi, the transform factorization), so the context is self-contained once
+    // build_modea_context returns. `have_cdl` is what modea_vxc_cd dispatches on.
+    std::shared_ptr<cd_line_ctx> cdl;
+    bool have_cdl = false;
+
+    long bstore_index(long is, long ik) const {
+      for (size_t b = 0; b < bstore.size(); ++b)
+        if (bstore[b].is == is and bstore[b].ik == ik) return long(b);
+      return -1;
+    }
 
     // ---- SYMMETRY BOOKKEEPING (the per-isym anchor breakdown, 2026-08-13) --------------
     // Every full-BZ transfer q' is handled by EXACTLY ONE (isym, q-in-star) pair of the
@@ -696,6 +747,194 @@ namespace qp_modea {
    * separately (cc->im_off) as a diagnostic. At eta_far = 0 nothing here changes: every
    * evaluation point is real and anti_in is a sub-block of the full residual.
    */
+  // =====================================================================================
+  //  TC-3: THE eq-1 CD LINE EVALUATOR -- the sibling of the route-B closed form
+  // =====================================================================================
+  //
+  // Route B evaluates Sigma^c from a POLE representation of W^c:
+  //     Sigma^c_ab(z) = sum_{J,p} M(a,b,J*npk+p) (n_B(om_p) + f_J) / (z - (eps_J - om_p))
+  // which is exact at finite T but needs poles -- and at REAL z it evaluates the FITTED
+  // measure at real arguments, the standing QM3-b caveat (sigma_route_b.hpp).
+  //
+  // The eq-1 contour-deformation form needs only W^c at POINTS, which is what the tilted
+  // contour supplies. With A_J = z - eps_J (complex; z carries the strip machinery's
+  // i*eta_far when it is on):
+  //
+  //     Sigma^c_ab(z) = sum_J [ Iterm_ab(A_J)  +  sigma_J * <aJ|W^c(eps_J - z)|Jb> ]
+  //     sigma_J       = theta(Re A_J) - f(eps_J)                             (SIGMA_M)
+  //
+  // exact up to the bosonic leftover of sigma_cd_line.hpp eq (R). Note the residue
+  // argument eps_J - z, NOT z - eps_J: they agree only for an EVEN W^c, which the
+  // physical one is but a fitted pole set is not (gate tc_sigma_cd_nonsym_poles).
+  //
+  // THE TWO TERMS HAVE DIFFERENT SOURCES, and that is the whole point:
+  //
+  //  * Iterm is the CONTINUOUS imaginary-axis integral
+  //        Iterm_ab(A) = -(1/2pi) Int dnu <aJ|W^c(i nu)|Jb> / (A + i nu),
+  //    taken from the EXISTING imaginary-axis machinery -- the same blk.M and ctx.om the
+  //    route-B path uses. For a pole representation that integral has a CLOSED FORM,
+  //        Iterm_ab(A) = sum_p M(a,b,J*npk+p) * K(p, A),
+  //        K(p, A)     = ( theta(Re A) - theta(-om_p) ) / (A + om_p),              (K)
+  //    obtained by closing the nu contour upward, and (K) is what is used.
+  //
+  //    ⚠ WHY THE CLOSED FORM AND NOT A QUADRATURE. (K) is not an approximation: it is
+  //    the EXACT value of the integral of the fitted rational W^c, so it cannot be less
+  //    accurate than any quadrature of the same integrand. It is also the only affordable
+  //    choice. On the real nu axis the integrand has a pole at nu = iA, i.e. at distance
+  //    |Re A| = |omega - eps_J| from the contour, and on a real fixture that distance is
+  //    the QP LEVEL SPACING -- every evaluation energy is itself an eps_J (the q = 0
+  //    member), and near-degenerate internal states across the q mesh drive it to zero.
+  //    MEASURED on qe_lih222: a symmetric tan-substituted Gauss-Legendre rule with 512
+  //    nodes leaves min |Re A| = 2.4e-02 a.u. BELOW its smallest node on 288 of 17408
+  //    (J, z) pairs and the assembly is then wrong by 3.6e-01. The closed form has no
+  //    such requirement, and its denominators (A + om_p) are EXACTLY route B's own, so
+  //    the Iterm is no worse conditioned than the path it replaces.
+  //    `sigma_cd_line::tan_quadrature` / `imag_axis_term` remain for the unit pins, where
+  //    the continuous form is the independent reference.
+  //  * The RESIDUE term is where the contour enters, through `cd_line_ctx::residue`.
+  //    It is evaluated at (eps_J - Re z) + i*delta: the contour can only deliver W^c on
+  //    the line Im z = delta, and delta IS the scheme's sampling depth (the campaign's
+  //    models.py carries the same `delta_eval` caveat for its like-for-like comparison).
+  //
+  // sigma_J vanishes for the states on the "wrong side" of the evaluation energy -- about
+  // half of them -- and those residue evaluations are SKIPPED, which is the single largest
+  // saving in the whole evaluator. The census is reported.
+  //
+  struct cd_line_opts {
+    bool   on = false;
+    double delta = 0.0;      // Im z of the residue targets (a.u.)
+    long   n_nu = 0;         // UNUSED by the evaluator (the Iterm is closed form, eq K);
+    double nu_scale = 0.0;   // kept so a caller can request the quadrature reference
+  };
+
+  /**
+   * The residue source: fills Msand(a,b) = <aJ|W^c(q_J, z)|Jb> for one internal state J
+   * at one target z. `fit_residue_source` below is the pole-rep implementation (which
+   * makes the whole assembly an IDENTITY against route B -- gate TC-3-b(1)); the contour
+   * implementation is installed by the caller that owns the contour context.
+   */
+  using cd_residue_fn =
+      std::function<void(long /*is*/, long /*ik*/, long /*J*/, ComplexType /*z*/,
+                         nda::array<ComplexType, 2> & /*Msand*/)>;
+
+  struct cd_line_ctx {
+    bool on = false;
+    double delta = 0.0;
+    nda::array<double, 1> th_neg;    // (npk) theta(-om_p), the only cached quantity
+    cd_residue_fn residue;
+    std::string route = "fit";       // what the log line names
+    // census, accumulated over the evaluator's calls
+    mutable long n_res_eval = 0, n_res_skip = 0;
+    mutable double sigma_abs_max = 0.0, sigma_frac_max = 0.0;
+    mutable long n_frac = 0;         // states with a strictly FRACTIONAL sigma_J
+    // THE CD BRANCH POINT. Re A_J = 0 means the evaluation energy sits exactly on an
+    // internal G pole: the nu integrand acquires a pole ON the real nu axis. The
+    // integral is then a PRINCIPAL VALUE and theta must be 1/2 there. With the closed
+    // form (K) there is no resolution requirement, but |Re A| -> 0 still means the
+    // residue and integral terms are individually large and cancelling, so it is the
+    // CD analogue of the route-B `min_den` tripwire and is reported, never silently
+    // accepted.
+    mutable double min_absReA = 1e300;
+    mutable long   n_branch = 0;     // |Re A_J| below the quadrature's smallest node
+    // the line solver's own census, shared with whoever owns the residue source
+    std::shared_ptr<wc_line::solve_stats_t> stats;
+  };
+
+  /**
+   * Prepare the evaluator. The Iterm uses the closed form (K), so there is no
+   * quadrature grid to build; what is cached is theta(-om_p), which is fixed by the
+   * pole set alone.
+   */
+  inline void cd_line_prepare(cd_line_ctx &cl, modea_ctx const &ctx,
+                              cd_line_opts const &o) {
+    utils::check(ctx.npk > 0, "cd_line_prepare: the context carries no W^c poles.");
+    cl.th_neg = nda::array<double, 1>(ctx.npk);
+    for (long p = 0; p < ctx.npk; ++p) cl.th_neg(p) = (ctx.om(p) < 0.0) ? 1.0 : 0.0;
+    cl.delta = o.delta;
+    cl.on = true;
+  }
+
+  /**
+   * The pole-rep residue source: <aJ|W^c(z)|Jb> = sum_p M(a,b,J*npk+p)/(z - om_p).
+   * Using it for BOTH terms turns the assembly into an identity against route B, which
+   * is what validates the decomposition, the quadrature and the sigma weights before any
+   * contour is attached (gate TC-3-b(1)).
+   */
+  inline cd_residue_fn fit_residue_source(modea_ctx const &ctx,
+                                          std::vector<sk_block> const &blocks) {
+    return [&ctx, &blocks](long is, long ik, long J, ComplexType z,
+                           nda::array<ComplexType, 2> &Ms) {
+      const long nbnd = ctx.nbnd, npk = ctx.npk;
+      long bi = -1;
+      for (size_t b = 0; b < blocks.size(); ++b)
+        if (blocks[b].is == is and blocks[b].ik == ik) { bi = long(b); break; }
+      utils::check(bi >= 0, "fit_residue_source: no block ({}, {}).", is, ik);
+      auto const &M = blocks[size_t(bi)].M;
+      for (long a = 0; a < nbnd; ++a)
+        for (long b = 0; b < nbnd; ++b) {
+          ComplexType s(0.0);
+          for (long p = 0; p < npk; ++p) s += M(a, b, J * npk + p) / (z - ctx.om(p));
+          Ms(a, b) = s;
+        }
+    };
+  }
+
+  /**
+   * Sigma^c_ab(z) by the eq-1 CD assembly. The drop-in sibling of `modea_sigma_at`.
+   */
+  inline void modea_sigma_at_cdline(modea_ctx const &ctx, sk_block const &blk,
+                                    cd_line_ctx const &cl, ComplexType z,
+                                    nda::array<ComplexType, 2> &S) {
+    const long nbnd = ctx.nbnd, npk = ctx.npk, nJ = ctx.nJ;
+    const long off = (blk.is * ctx.nk + blk.ik) * nJ;
+    utils::check(cl.on, "modea_sigma_at_cdline: the cd-line context is not prepared.");
+    utils::check(bool(cl.residue), "modea_sigma_at_cdline: no residue source installed.");
+
+    S() = ComplexType(0.0);
+    nda::array<ComplexType, 1> K(npk);
+    nda::array<ComplexType, 2> Ms(nbnd, nbnd);
+
+    for (long J = 0; J < nJ; ++J) {
+      const double e = ctx.epsJ(off + J), f = ctx.fJ(off + J);
+      const ComplexType A = z - e;
+
+      // ---- the imaginary-axis term, closed form (K), from the EXISTING pole rep ----
+      // theta(Re A) with the 1/2 principal-value convention at Re A = 0 (where the
+      // evaluation energy sits exactly on an internal G pole).
+      const double ReA0 = A.real();
+      const double th0 = (std::abs(ReA0) < 1e-14) ? 0.5 : (ReA0 > 0.0 ? 1.0 : 0.0);
+      for (long p = 0; p < npk; ++p)
+        K(p) = (th0 - cl.th_neg(p)) / (A + ctx.om(p));
+      for (long a = 0; a < nbnd; ++a)
+        for (long b = 0; b < nbnd; ++b) {
+          ComplexType s(0.0);
+          for (long p = 0; p < npk; ++p) s += blk.M(a, b, J * npk + p) * K(p);
+          S(a, b) += s;
+        }
+
+      // ---- the residue term (SIGMA_M); skipped wherever sigma_J vanishes ----
+      // theta(0) = 1/2: at Re A = 0 the nu integrand has a pole on the real axis, the
+      // integral above is its PRINCIPAL VALUE (the tan-substituted grid is symmetric in
+      // nu and W^c(i nu) is even, so the +nu and -nu terms cancel exactly there), and the
+      // residue picks up HALF the crossing. Away from 0 this is the ordinary step.
+      cl.min_absReA = std::min(cl.min_absReA, std::abs(ReA0));
+      if (std::abs(ReA0) < 1e-6) ++cl.n_branch;
+      const double sg = th0 - f;
+      cl.sigma_abs_max = std::max(cl.sigma_abs_max, std::abs(sg));
+      if (std::abs(sg) > 1e-12 and std::abs(sg) < 1.0 - 1e-12) {
+        ++cl.n_frac;
+        cl.sigma_frac_max = std::max(cl.sigma_frac_max,
+                                     std::min(std::abs(sg), std::abs(1.0 - std::abs(sg))));
+      }
+      if (std::abs(sg) < 1e-14) { ++cl.n_res_skip; continue; }
+      ++cl.n_res_eval;
+      const ComplexType zres(e - z.real(), cl.delta);        // eq (EXACT)
+      cl.residue(blk.is, blk.ik, J, zres, Ms);
+      for (long a = 0; a < nbnd; ++a)
+        for (long b = 0; b < nbnd; ++b) S(a, b) += sg * Ms(a, b);
+    }
+  }
+
   inline double modea_vxc_cd(modea_ctx const &ctx, sk_block const &blk,
                              nda::MemoryArrayOfRank<1> auto const &eps,
                              nda::array<ComplexType, 2> &V, long *argmin = nullptr,
@@ -738,15 +977,27 @@ namespace qp_modea {
       else cc->exc_hi = std::max(cc->exc_hi, eps(a) - strip.hi);
     }
 
+    // TC-3: when the context carries a cd-line evaluator (qp_modea_wfit = "contour")
+    // the Sigma^c SOURCE changes and nothing else does -- the strip evaluation points
+    // z_a above, the census, the V = (D + D')/2 symmetrization and the anti-Hermitian
+    // tripwire below are all untouched. `min_den` stays the route-B tripwire; the
+    // cd-line path reports its own (min |Re A_J|) on cl.
+    const bool cdl_on = ctx.have_cdl and bool(ctx.cdl) and ctx.cdl->on;
+    nda::array<ComplexType, 2> Srow(nbnd, nbnd);
     for (long a = 0; a < nbnd; ++a) {
       const ComplexType z = z_a(a);
       const double md = ctx.pole_weights(blk.is, blk.ik, z, w);
       if (md < min_den and argmin != nullptr) *argmin = a;
       min_den = std::min(min_den, md);
+      if (cdl_on) modea_sigma_at_cdline(ctx, blk, *ctx.cdl, z, Srow);
       for (long b = 0; b < nbnd; ++b) {
         ComplexType s(0.0);
-        auto Mab = blk.M(a, b, nda::range::all);
-        for (long P = 0; P < nP; ++P) s += Mab(P) * w(P);
+        if (cdl_on) {
+          s = Srow(a, b);
+        } else {
+          auto Mab = blk.M(a, b, nda::range::all);
+          for (long P = 0; P < nP; ++P) s += Mab(P) * w(P);
+        }
         D(a, b) = s;
         if (cc != nullptr and far(a) == 1)
           cc->im_off = std::max(cc->im_off, std::abs(s.imag()));
@@ -755,10 +1006,15 @@ namespace qp_modea {
     for (long b = 0; b < nbnd; ++b) {
       const ComplexType z = z_a(b);
       ctx.pole_weights(blk.is, blk.ik, z, w);
+      if (cdl_on) modea_sigma_at_cdline(ctx, blk, *ctx.cdl, z, Srow);
       for (long a = 0; a < nbnd; ++a) {
         ComplexType s(0.0);
-        auto Mab = blk.M(a, b, nda::range::all);
-        for (long P = 0; P < nP; ++P) s += Mab(P) * w(P);
+        if (cdl_on) {
+          s = Srow(a, b);
+        } else {
+          auto Mab = blk.M(a, b, nda::range::all);
+          for (long P = 0; P < nP; ++P) s += Mab(P) * w(P);
+        }
         Dp(a, b) = s;
         if (cc != nullptr and far(b) == 1)
           cc->im_off = std::max(cc->im_off, std::abs(s.imag()));

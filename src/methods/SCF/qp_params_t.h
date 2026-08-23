@@ -232,6 +232,22 @@ struct qp_params_t {
   double      qp_tc_rho = 0.65;
   std::string qp_tc_profile = "flat";
   bool        qp_tc_trunc = false;
+  // ---- increment TC-3: the line solver and the eq-1 residue band-factor store ----
+  //   qp_tc_krylov      warm-started GMRES instead of the dense inverse for the
+  //                     contracted <nm|W^c|mn>. The economics (measured, notes/
+  //                     tc3_report.md): the DIAGONAL path needs nbnd right-hand sides
+  //                     per (q, z) and Krylov wins at ~5 iterations per solve; a full
+  //                     qpscf block needs nbnd^2 and the dense inverse amortizes.
+  //   qp_tc_krylov_tol  its relative-residual target. dense == Krylov measured 3.3e-13.
+  //   qp_tc_bstore_gb   cap, in GB per owned (s,k) block, on the eq-1 residue term's
+  //                     band-factor store B_J(P,a). It is 0 (= OFF) by default so a
+  //                     production-size run cannot enable it by accident: the store is
+  //                     nJ x Np x nbnd complex, ~1 MB on qe_lih222 but ~1.3 TB at
+  //                     (64 k-points, Np 364, nbnd 60). FIXTURE-SCALE ONLY -- the
+  //                     production path must recompute B inside the evaluator (TC-4).
+  bool        qp_tc_krylov = false;
+  double      qp_tc_krylov_tol = 1e-12;
+  double      qp_tc_bstore_gb = 0.0;
 };
 
 } // methods

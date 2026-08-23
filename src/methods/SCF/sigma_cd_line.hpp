@@ -64,6 +64,22 @@
  *
  *      sigma_m = theta(w - eps_m) - f(eps_m).                          (SIGMA_M)
  *
+ * ⚠ THE RESIDUE ARGUMENT IS -A = eps_m - w, NOT +A. Writing (R) without assuming
+ * anything about the pole set, sum_j w_j/(A+om_j) = -W^c(-A), so
+ *
+ *      Sigma^c(w) = I(A)  +  sigma_m * W^c(eps_m - w)  +  bosonic.       (EXACT)
+ *
+ * The familiar form with W^c(w - eps_m) is the SAME thing only when W^c is EVEN.
+ * The physical W^c is even, so for a contour-evaluated W the two agree -- but a
+ * FITTED pole set (the tau/nu routes' masked_pole_fit, on a deliberately NONSYM
+ * auxiliary node set) is even only on the imaginary axis, and at real argument
+ * the two forms differ by O(1).
+ * MEASURED on random non-symmetric pole sets, deviation from the exact finite-T
+ * closed form of sigma_route_b, normalized by a non-cancelling scale:
+ *      W^c(eps_m - w) : 2.4e-16      W^c(w - eps_m) : 1.1e+01
+ * [verified -- gate: tc_sigma_cd_nonsym_poles. The single-pole pin cannot see
+ *  this: its PH pair is exactly even.]
+ *
  * Its beta -> infinity limit is exactly the three cases above (f -> a step at
  * mu), so this is the DERIVED convention, not a different one -- but it also
  * carries the fractional occupations that a metal actually has, at no cost,
@@ -247,8 +263,9 @@ namespace sigma_cd_line {
    *                  i*eta itself through `z_res`).
    * @param eps       (n_m) internal-state energies, ABSOLUTE.
    * @param W_iv      (n_m, n_nu) contracted <nm|W^c(i nu)|mn>.
-   * @param W_line    (n_m) contracted <nm|W^c(w - eps_m + i delta)|mn>; only the
-   *                  entries with a nonzero sigma_m are read.
+   * @param W_line    (n_m) contracted <nm|W^c(eps_m - w + i delta)|mn> -- note the
+   *                  argument sign, eq (EXACT) above; only the entries with a
+   *                  nonzero sigma_m are read.
    * @param st_sigma  (n_m) OPTIONAL out: the sigma_m actually used.
    */
   inline dcomplex assemble(double omega, double mu, double beta,
@@ -276,7 +293,12 @@ namespace sigma_cd_line {
     return s;
   }
 
-  /** The residue-target list eq 1 needs at one evaluation energy. */
+  /**
+   * The residue-target list eq 1 needs at one evaluation energy:
+   *      z_m = (eps_m - omega) + i delta,   eq (EXACT) -- NOT omega - eps_m.
+   * The window is unchanged (|Re z| <= zeta_max either way, just mirrored), and
+   * the transform's conjugate-mirror rows cover both halves.
+   */
   inline void residue_targets(double omega, double delta, double mu, double beta,
                               nda::MemoryArrayOfRank<1> auto const &eps,
                               nda::array<dcomplex, 1> &z,
@@ -286,7 +308,7 @@ namespace sigma_cd_line {
     sg.resize(nm);
     for (long m = 0; m < nm; ++m) {
       const double e = double(std::real(ComplexType(eps(m))));
-      z(m) = dcomplex(omega - e, delta);
+      z(m) = dcomplex(e - omega, delta);
       sg(m) = sigma_m_weight(omega, e, mu, beta);
     }
   }

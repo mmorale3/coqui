@@ -187,6 +187,124 @@ namespace bdft_tests {
   }
 
   // =====================================================================
+  //  DOES THE FINITE-T sigma_m MATTER?  (Fable review point, section 6 item 5)
+  //
+  //  sigma_m = theta(w - eps_m) - f(eps_m) reduces to the campaign's +1/-1/0
+  //  table as beta -> infinity. The question the SVO metal leg asks is whether
+  //  the FRACTIONAL value matters for states within k_B T of mu. That is a
+  //  property of the weight, not of the fixture, so it is answered here: score
+  //  the exact finite-T Lehmann against eq 1 with (a) the fractional sigma_m
+  //  and (b) the T = 0 step, as beta*|eps_m - mu| is swept through 1.
+  // =====================================================================
+  TEST_CASE("tc_sigma_cd_fractional_occupation", "[methods][tc_wline]") {
+    const double r = 1.3, wp = 2.2, mu = 0.0, beta = 100.0;
+    app_log(2, "[TC-3-a fractional] beta = {:.4g}; one G pole at eps_m, one plasmon pair "
+               "(r = {:.3g}, omega_p = {:.3g}); the exact finite-T Lehmann vs eq 1 with "
+               "(a) sigma_m = theta - f  and  (b) sigma_m = theta - step(mu - eps_m)",
+            beta, r, wp);
+    app_log(2, "[TC-3-a fractional] {:>12} {:>10} {:>12} {:>12} {:>12}",
+            "beta*(eps-mu)", "f(eps)", "sigma_m", "(a) frac", "(b) T=0 step");
+    double worst_frac = 0.0, worst_step = 0.0, worst_step_at_small = 0.0;
+    for (double be : {-8.0, -3.0, -1.0, -0.3, 0.0, 0.3, 1.0, 3.0, 8.0}) {
+      const double eps = be / beta;
+      const double om = eps + 3.7;            // a fixed A = 3.7 > 0, well off any pole
+      const double A = om - eps;
+      nda::array<double, 1> wv(2), ov(2);
+      wv(0) = r;  wv(1) = -r;
+      ov(0) = wp; ov(1) = -wp;
+      const dcomplex I = scd::imag_axis_term_poles(A, wv, ov);
+      const double f = scd::stable_nF(beta, eps - mu);
+      const double sg_frac = scd::sigma_m_weight(om, eps, mu, beta);
+      const double sg_step = ((om > eps) ? 1.0 : 0.0) - ((eps < mu) ? 1.0 : 0.0);
+      const dcomplex Wl = wc_pair(dcomplex(-A, 0.0), r, wp);      // eq (EXACT)
+      const dcomplex ex = exact_lehmann(dcomplex(om, 0.0), eps, mu, r, wp, beta);
+      const double ea = std::abs(I + sg_frac * Wl - ex) / std::abs(ex);
+      const double eb = std::abs(I + sg_step * Wl - ex) / std::abs(ex);
+      app_log(2, "[TC-3-a fractional] {:>12.2f} {:>10.4f} {:>12.4f} {:>12.3e} {:>12.3e}",
+              be, f, sg_frac, ea, eb);
+      worst_frac = std::max(worst_frac, ea);
+      worst_step = std::max(worst_step, eb);
+      if (std::abs(be) <= 3.0) worst_step_at_small = std::max(worst_step_at_small, eb);
+    }
+    app_log(2, "[TC-3-a fractional] VERDICT: the fractional sigma_m is exact to {:.3e} "
+               "everywhere; the T = 0 step is wrong by up to {:.3e} overall and {:.3e} "
+               "for |beta(eps-mu)| <= 3 -- i.e. the difference is entirely carried by the "
+               "states within a few k_B T of mu, which is precisely the population a "
+               "METAL has and an insulator does not (the qe_lih222 census reports ZERO "
+               "strictly fractional sigma_J).",
+            worst_frac, worst_step, worst_step_at_small);
+    REQUIRE(worst_frac < 1e-13);
+    REQUIRE(worst_step_at_small > 1e-2);   // the step form MUST be visibly wrong near mu
+  }
+
+  // =====================================================================
+  //  THE RESIDUE ARGUMENT -- eq (EXACT) on a NON-SYMMETRIC pole set
+  // =====================================================================
+  //
+  // The single-pole pin above uses a PH pair, which is exactly EVEN, so it
+  // cannot distinguish W^c(eps_m - w) from W^c(w - eps_m). A fitted W^c is even
+  // only on the imaginary axis (masked_pole_fit runs on a deliberately NONSYM
+  // auxiliary node set -- wc_band_elements.hpp), so at real argument the two
+  // differ by O(1). This pins the one eq (EXACT) requires.
+  //
+  TEST_CASE("tc_sigma_cd_nonsym_poles", "[methods][tc_wline]") {
+    double worst_minus = 0.0, worst_plus = 0.0, worst_left = 0.0;
+    long n = 0;
+    // deterministic non-symmetric pole sets
+    for (int c = 0; c < 6; ++c)
+      for (int d = 0; d < 6; ++d)
+        for (int e = 0; e < 3; ++e) {
+          const long npk = 5;
+          nda::array<double, 1> om(npk), wr(npk);
+          nda::array<dcomplex, 1> w(npk);
+          for (long j = 0; j < npk; ++j) {
+            om(j) = -5.3 + 2.17 * double(j) + 0.31 * double(c);   // no +- pairing
+            wr(j) = 0.4 + 0.9 * std::cos(1.7 * double(j) + 0.5 * double(d));
+            w(j) = dcomplex(wr(j), 0.23 * std::sin(2.1 * double(j)));
+          }
+          const double beta = (e == 0) ? 1000.0 : (e == 1 ? 3000.0 : 10000.0);
+          const double eps = -7.0 + 14.0 * double(c) / 5.0;
+          const double omg = -7.0 + 14.0 * double(d) / 5.0;
+          const double mu = 0.0, A = omg - eps;
+          if (std::abs(A) < 0.3 or std::abs(eps - mu) < 0.3) continue;
+          bool near = false;
+          for (long j = 0; j < npk; ++j)
+            if (std::abs(A + om(j)) < 0.3 or std::abs(A - om(j)) < 0.3) near = true;
+          if (near) continue;
+
+          // the EXACT finite-T closed form (sigma_route_b), any pole set
+          const double f = scd::stable_nF(beta, eps - mu);
+          dcomplex routeB(0.0, 0.0);
+          double scale = 0.0;
+          for (long j = 0; j < npk; ++j) {
+            routeB += w(j) * (scd::stable_nB(beta, om(j)) + f) / (A + om(j));
+            scale += std::abs(w(j) / (A + om(j)));
+          }
+          auto Wc = [&](dcomplex z) {
+            dcomplex t(0.0, 0.0);
+            for (long j = 0; j < npk; ++j) t += w(j) / (z - om(j));
+            return t;
+          };
+          const dcomplex I = scd::imag_axis_term_poles(A, w, om);
+          const double sg = scd::sigma_m_weight(omg, eps, mu, beta);
+          worst_minus = std::max(worst_minus,
+                                 std::abs(I + sg * Wc(dcomplex(-A, 0.0)) - routeB) / scale);
+          worst_plus = std::max(worst_plus,
+                                std::abs(I + sg * Wc(dcomplex(A, 0.0)) - routeB) / scale);
+          worst_left = std::max(worst_left, scd::thermal_leftover_bound(beta, om));
+          ++n;
+        }
+    app_log(2, "[TC-3-a nonsym] eq (EXACT) on {} NON-SYMMETRIC pole sets, deviation from "
+               "the exact finite-T closed form normalized by sum |w/(A+om)| (which cannot "
+               "cancel): W^c(eps_m - w) gives {:.3e}; W^c(w - eps_m) gives {:.3e}; "
+               "bosonic leftover {:.3e}",
+            n, worst_minus, worst_plus, worst_left);
+    REQUIRE(n > 20);
+    REQUIRE(worst_minus < 1e-13);      // the exact argument
+    REQUIRE(worst_plus > 1e-2);        // the even-only argument MUST fail here
+  }
+
+  // =====================================================================
   //  W ON THE LINE -- CoQuI's Dyson chain vs the campaign's RPA W^c
   // =====================================================================
   TEST_CASE("tc_wc_line_dyson", "[methods][tc_wline]") {
@@ -359,7 +477,7 @@ namespace bdft_tests {
         const double w = om_v[io];
         nda::array<dcomplex, 1> W_line(nm);
         for (long m = 0; m < nm; ++m)
-          W_line(m) = wc_band(nb, m, dcomplex(w - eps(m), 0.0));
+          W_line(m) = wc_band(nb, m, dcomplex(eps(m) - w, 0.0));  // eq (EXACT)
         const dcomplex got = scd::assemble(w, mu, beta, eps, q.nu, q.w, W_iv, W_line);
         const dcomplex ex = exd[io];
         worst = std::max(worst, std::abs(got - ex) / std::abs(ex));
