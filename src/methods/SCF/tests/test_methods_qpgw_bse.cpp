@@ -84,6 +84,9 @@ namespace bdft_tests {
       double node_map_resid = -1.0, ph_sym_resid = -1.0;
       double lam_scaled = -1.0, lam_scale = 1.0;
       bool sym_active = false;
+      // DA Phase 2 (notes/qsgwhat_discrepancy_spec.md): the pre/post-secondary-fold head
+      // meter of the LAST build_w0 of the run (-1 = never measured).
+      double hs_pre = -1.0, hs_post = -1.0, hs_atten = -1.0;
       double gap_eV() const { return (e_lumo - e_homo) * HA2EV; }
     };
 
@@ -103,7 +106,10 @@ namespace bdft_tests {
                            std::string const &map, std::string const &pol_mode,
                            std::string const &inject, nda::range window,
                            int thc_prefactor, double thc_tol, int niter, double conv_tol,
-                           bool gates = false, const std::string &div = "ignore_g0") {
+                           bool gates = false, const std::string &div = "ignore_g0",
+                           // DA Phase 2 knobs (D-1 / D-4 / D-7); the defaults are the
+                           // committed values, so every pre-existing caller is untouched.
+                           bool tda = false, double head_scale = 1.0, bool qnu = false) {
       const std::string output = "qpgw_bse_" + tag;
       solvers::hf_t hf;
       solvers::gw_t gw(&ft, div, output);
@@ -119,6 +125,7 @@ namespace bdft_tests {
       // scr_eri only. It must outlive qp_scf_loop -- same stack frame.
       solvers::vertex_t vtx(&ft, "none", nda::range(0, 0), mf->nbnd(), div);
       vtx.set_pol_vertex(pol_mode, "w0_prev", window, -1, 1e-8, -1.0, -1.0, -1.0, inject);
+      vtx.set_ladder_da(tda, head_scale, qnu);
       if (vtx.pol_vertex_enabled()) scr_eri.set_vertex(&vtx);
       REQUIRE(not scr_eri.has_active_vertex());     // Sigma stays GW-form on this path
 
@@ -138,6 +145,13 @@ namespace bdft_tests {
       row.lam_max = scr_eri.pol_lambda_max();
       row.r_rt = scr_eri.pol_round_trip();
       row.lad_ratio = scr_eri.pol_ladder_ratio();
+      // DA D-7: the head meter of the loop's LAST build_w0 (reset_w0 clears it at the top
+      // of every build, so what stands here is the final iteration's).
+      if (auto *pvh = scr_eri.pol_vertex_instance(); pvh != nullptr) {
+        row.hs_pre = pvh->w0_head_share_pre();
+        row.hs_post = pvh->w0_head_share_post();
+        row.hs_atten = pvh->w0_head_attenuation();
+      }
 
       nda::array<ComplexType, 3> E_ska;
       {
@@ -409,6 +423,143 @@ namespace bdft_tests {
     REQUIRE(r1.sym_resid >= 0.0);
     REQUIRE(r1.sym_resid < 1e-12);
     REQUIRE(r1.node_map_resid == 0.0);
+#endif
+  }
+
+  /**
+   * ==========================================================================================
+   * DA PHASE 2 -- the D-1 / D-4 / D-7 knob gates (notes/qsgwhat_discrepancy_spec.md)
+   * ==========================================================================================
+   * These three knobs exist to MEASURE factors in the Questaal-paper discrepancy analysis,
+   * so the discipline is the standing one: knob-absent must be BITWISE the committed path,
+   * and knob-present must be demonstrably non-vacuous (finding F-DA-1 was exactly a knob
+   * that parsed, logged, and did nothing).
+   *
+   * Leg (a) baseline: inject on, gygi div (so a head EXISTS to scale), at the reduced
+   *         kernel head the fixture needs (see the FIXTURE CHOICE note below).
+   * Leg (b) D-7 ladder_qnu_meter = true: the meters are PURE OBSERVERS, so every physics
+   *         number must be BITWISE leg (a). This is the strongest of the three gates --
+   *         the (q,nu) accumulators sit inside the injection's innermost write loop.
+   * Leg (c) D-1 ladder_tda = true: the kernel's resonant<->anti-resonant coupling block is
+   *         zeroed. Must MOVE the answer (non-vacuous) and stay sane.
+   * Leg (d) D-4 ladder_head_scale -> 0.0: the analytic q->0 head is removed from the ladder
+   *         kernel W-bar_0. Must MOVE the answer -- this is the leg F-DA-1 proved did not
+   *         exist before (vertex_div_treatment = "ignore_g0" was numerically inert at
+   *         9.3e-08 eV on the LiF production runs).
+   * All shifts are RECORDED, never gated on a value: the fixture is a toy and the physics
+   * numbers belong to the production legs.
+   */
+  TEST_CASE("qpgw_bse_da_knobs_si222", "[methods][qpgw][bse][da]") {
+#ifndef ENABLE_DLR
+    SUCCEED("qpgw_bse_da_knobs_si222 skipped: build has ENABLE_DLR=OFF.");
+#else
+    using namespace qpgw_bse_detail;
+    auto& mpi_context = utils::make_unit_test_mpi_context();
+    imag_axes_ft::IAFT ft(1000.0, 1.2, imag_axes_ft::dlr_basis);
+    // FIXTURE CHOICE, MEASURED not assumed. The head knob needs a head, so div = "gygi"
+    // (under "ignore_g0" no head is inserted at all and D-4 is CORRECTLY inert). But the
+    // gygi head at a 2^3 mesh is enormous relative to the body -- N_k*madelung is an O(1/N_k)
+    // object -- and it drives the ladder past the particle-hole instability on BOTH toy
+    // fixtures: MEASURED rho(Xh Kt) = 1.688 (qe_lih222, C = [1,3)), 1.474 (pyscf_si222,
+    // C = [2,6)) and 1.007 (pyscf_si222, C = [3,5)), i.e. the eq-6 resolvent abort fires
+    // before any leg finishes. The DA legs therefore run at a REDUCED kernel head
+    // (ladder_head_scale = HS0 = 0.25) and the D-4 non-vacuity leg drops it to 0. That
+    // exercises the knob at TWO non-default values, which is strictly stronger evidence
+    // that it reaches the kernel than a single on/off pair would be. The knob-ABSENT
+    // bitwise requirement is carried by the three pre-existing test cases above, which run
+    // with every DA knob at its committed default and reproduce their stored references.
+    // The window is narrowed to C = [3,5) for the same reason (rho stays in regime at the
+    // reduced head): it is the minimal window that still straddles the gap (Si nocc = 4:
+    // band 3 occupied, band 4 empty), so the four pairs per k are (3,3) and (4,4) with
+    // character 0 and (3,4)/(4,3) with characters +1/-1 -- both of the characters the D-1
+    // mask distinguishes are present, which is what the gate needs.
+    constexpr double HS0 = 0.25;
+    auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "pyscf_si222"));
+    const long b1 = std::min<long>(5, mf->nbnd());
+    nda::range window(3, b1);
+    REQUIRE(window.size() == 2);
+
+    auto ra = run_qpgw(mpi_context, mf, ft, "da_base", "ac_pade", "ladder", "ladder_n2",
+                       window, 10, 1e-8, 12, 1e-5, false, "gygi", false, HS0, false);
+    auto rb = run_qpgw(mpi_context, mf, ft, "da_meter", "ac_pade", "ladder", "ladder_n2",
+                       window, 10, 1e-8, 12, 1e-5, false, "gygi", false, HS0, true);
+    // gates = true on the TDA leg: ladder_whalf_gate re-earns, FOR THE TRUNCATED KERNEL,
+    // the PH-symmetry licence that the injection's nu -> tau transform depends on.
+    auto rc = run_qpgw(mpi_context, mf, ft, "da_tda", "ac_pade", "ladder", "ladder_n2",
+                       window, 10, 1e-8, 12, 1e-5, true, "gygi", true, HS0, true);
+    auto rd = run_qpgw(mpi_context, mf, ft, "da_head0", "ac_pade", "ladder", "ladder_n2",
+                       window, 10, 1e-8, 12, 1e-5, false, "gygi", false, 0.0, true);
+
+    // ---- leg (b): the D-7 meters are pure observers -> BITWISE --------------------------
+    app_log(1, "@@DA D-7 pure-observer leg: e_hf d = {:.3e}, gap d = {:.3e} eV, "
+               "eps_ladder d = {:.3e}, lambda_nu0 d = {:.3e}, lad_ratio d = {:.3e}",
+            std::abs(rb.e_hf - ra.e_hf), std::abs(rb.gap_eV() - ra.gap_eV()),
+            std::abs(rb.eps_ladder - ra.eps_ladder),
+            std::abs(rb.lam_nu0 - ra.lam_nu0),
+            std::abs(rb.lad_ratio - ra.lad_ratio));
+    REQUIRE(rb.e_hf == ra.e_hf);
+    REQUIRE(rb.e_homo == ra.e_homo);
+    REQUIRE(rb.e_lumo == ra.e_lumo);
+    REQUIRE(rb.final_iter == ra.final_iter);
+    REQUIRE(rb.eps_rpa == ra.eps_rpa);
+    REQUIRE(rb.eps_ladder == ra.eps_ladder);
+    REQUIRE(rb.lam_nu0 == ra.lam_nu0);
+    REQUIRE(rb.lam_max == ra.lam_max);
+    REQUIRE(rb.lad_ratio == ra.lad_ratio);
+    // ... and the meter it enables actually produced numbers (H1b, the fold attenuation)
+    app_log(1, "@@DA D-7 head meter (H1b): share PRE-fold = {:.6e}, POST-fold = {:.6e}, "
+               "attenuation = {:.6f}", rb.hs_pre, rb.hs_post, rb.hs_atten);
+    REQUIRE(rb.hs_pre > 0.0);
+    REQUIRE(rb.hs_post > 0.0);
+    REQUIRE(rb.hs_atten > 0.0);
+    REQUIRE(std::isfinite(rb.hs_atten));
+    // ... and the baseline leg, which never asked for it, has none
+    REQUIRE(ra.hs_pre == -1.0);
+
+    // ---- leg (c): the D-1 TDA knob is non-vacuous ---------------------------------------
+    app_log(1, "@@DA D-1 TDA leg: gap OFF = {:.6f} eV, TDA ON = {:.6f} eV "
+               "(shift {:+.6f} eV); eps_M(q_min) {:.6f} -> {:.6f}; lambda_max {:.6f} -> "
+               "{:.6f}; ||P^lad||/||P^RPA|| {:.3e} -> {:.3e}",
+            ra.gap_eV(), rc.gap_eV(), rc.gap_eV() - ra.gap_eV(), ra.eps_ladder,
+            rc.eps_ladder, ra.lam_max, rc.lam_max, ra.lad_ratio, rc.lad_ratio);
+    REQUIRE(std::isfinite(rc.gap_eV()));
+    REQUIRE(rc.gap_eV() > 0.0);
+    REQUIRE(std::isfinite(rc.lam_max));
+    REQUIRE(rc.lam_max < 1.0);
+    REQUIRE(rc.lad_ratio > 0.0);
+    REQUIRE(rc.gap_eV() != ra.gap_eV());          // the knob reached the kernel
+    // The TDA mask is nu-INDEPENDENT and exchanges the two characters under nu -> -nu, so
+    // the truncated P^lad should stay PH-symmetric -- otherwise the injection's PH-sym
+    // transform would be illegitimate on this leg. MEASURE FIRST, THEN GATE: the residual
+    // is 3.02e-06 relative under TDA against 1.08e-08 for the untruncated kernel, i.e. the
+    // truncation DEGRADES the symmetry by ~300x without breaking it. That is expected and
+    // recorded rather than explained away -- the res <-> ares mirror also flips q, so the
+    // two blocks are exact mirrors only up to the q -> -q relabeling of the IBZ transfer
+    // axis, and the character assignment itself is only as sharp as the C-window density
+    // matrix is occupation-diagonal (this fixture measures crispness 0.45 / off-diagonal
+    // 0.26 and the code WARNS about it). 3e-06 is four orders below the ladder effects
+    // being measured, so the transform stays licensed; the gate is 10x the measurement.
+    app_log(1, "@@DA D-1 PH-symmetry licence UNDER TDA: node-map resid = {:.3e}, "
+               "PH-symmetry resid = {:.3e}; one-rung-vs-anchor (untruncated) = {:.3e}",
+            rc.node_map_resid, rc.ph_sym_resid, rc.sym_resid);
+    REQUIRE(rc.node_map_resid == 0.0);
+    REQUIRE(rc.ph_sym_resid < 3e-5);
+
+    // ---- leg (d): the D-4 kernel-head knob is non-vacuous (the F-DA-1 repair) -----------
+    app_log(1, "@@DA D-4 head-off leg (kernel head scale {:.2f} -> 0): gap head-ON = "
+               "{:.6f} eV, head-OFF = {:.6f} eV (shift {:+.6f} eV); eps_M(q_min) {:.6f} -> "
+               "{:.6f}; lambda_max {:.6f} -> {:.6f}; head share PRE-fold {:.6e} -> {:.6e}",
+            HS0, ra.gap_eV(), rd.gap_eV(), rd.gap_eV() - ra.gap_eV(),
+            ra.eps_ladder, rd.eps_ladder, ra.lam_max, rd.lam_max, rb.hs_pre, rd.hs_pre);
+    REQUIRE(std::isfinite(rd.gap_eV()));
+    REQUIRE(rd.gap_eV() > 0.0);
+    REQUIRE(std::isfinite(rd.lam_max));
+    REQUIRE(rd.lam_max < 1.0);
+    // F-DA-1's falsifier: the old zero-code route moved the LiF gap by 9.3e-08 eV. A knob
+    // that actually reaches the ladder kernel's head must do far better than that.
+    REQUIRE(std::abs(rd.gap_eV() - ra.gap_eV()) > 1e-6);
+    // head_scale = 0 removes the head from W-bar_0, so the meter must report a ZERO head
+    REQUIRE(rd.hs_pre == 0.0);
 #endif
   }
 

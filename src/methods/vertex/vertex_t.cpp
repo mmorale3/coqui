@@ -4560,8 +4560,17 @@ namespace solvers {
       for (long P = 0; P < Np; ++P) chi_max = std::max(chi_max, std::abs(chi(iq_gamma, P)));
       if (xi != 0.0 and chi_max != 0.0) {
         chi_g = nda::array<ComplexType, 1>(chi(iq_gamma, all));
-        _w0_head_c = ComplexType(double(nkpts) * xi);            // build_head_rank1's c
+        // DA D-4 (notes/qsgwhat_discrepancy_spec.md Phase 2; finding F-DA-1): the ladder
+        // kernel's q -> 0 head scale. _ladder_head_scale = 1.0 is the committed policy and
+        // multiplies by EXACTLY 1.0 (IEEE), so the knob-absent path is bitwise. This is the
+        // ONLY site the knob acts: one W0, one policy, and W0 is the ladder rung W-bar_0.
+        _w0_head_c = ComplexType(double(nkpts) * xi * _ladder_head_scale);
         _w0_head_applied = true;
+        if (_ladder_head_scale != 1.0)
+          app_log(1, "  [DA D-4] ladder_head_scale = {:.6g}: the analytic rank-1 q -> 0 "
+                     "head of the static rung W0(Gamma) -- i.e. the head INSIDE the ladder "
+                     "kernel W-bar_0 -- is scaled by this factor. The loop's own RPA W and "
+                     "its div_treatment are untouched.", _ladder_head_scale);
       } else {
         app_log(1, "  [WARNING] W0: gygi head insertion requested but the head data are "
                    "unusable\n"
@@ -4698,6 +4707,68 @@ namespace solvers {
       Wb() = ComplexType(0.0);
       Wb(_W0_qPQ.value().local_range(0), P_rng, Q_rng) = _W0_qPQ.value().local();
       mpi->comm.all_reduce_in_place_n(Wb.data(), Wb.size(), std::plus<>{});
+    }
+
+    // ---- DA D-7 / H1b: the PRE- vs POST-FOLD head meter --------------------------------
+    // (notes/qsgwhat_discrepancy_spec.md Phase 2; CLAUDE.md section 7 "q -> 0 head" hazard:
+    // "a basis optimized for subspace pair densities may represent [the head] poorly".)
+    // PURE OBSERVER -- nothing below is written back into W0 or W0bar.
+    //
+    // The inserted head is EXACTLY rank-1, H = c_eff chi chi^dag with
+    //   c_eff = _w0_head_c * (1 + _w0_eps_head)     (the two head_block_add weights),
+    // so ||H||_F = |c_eff| ||chi||^2 pre-fold and ||t H t^dag||_F = |c_eff| ||t chi||^2
+    // post-fold -- no refold needed. What the ladder kernel actually sees is the head's
+    // weight RELATIVE to the body it rides on, so the reported meter is each one's share of
+    // its own rung's Frobenius norm and the RATIO of the two shares: attenuation < 1 means
+    // the secondary basis represents the head worse than it represents the body, which is
+    // hypothesis H1b.
+    if (_ladder_qnu_meter and _w0_head_applied and secondary() and chi_g.size() > 0) {
+      const ComplexType c_eff = _w0_head_c * ComplexType(1.0 + _w0_eps_head);
+      double chi2 = 0.0;
+      for (long P = 0; P < Np; ++P) chi2 += std::norm(chi_g(P));
+      // t(Gamma) . chi   (N_m); _t_qmP is replicated (nq, N_m, Np)
+      double tchi2 = 0.0;
+      if (_t_qmP.shape(0) > iq_gamma and _t_qmP.shape(2) == Np) {
+        for (long m = 0; m < _t_qmP.shape(1); ++m) {
+          ComplexType acc(0.0);
+          for (long P = 0; P < Np; ++P) acc += _t_qmP(iq_gamma, m, P) * chi_g(P);
+          tchi2 += std::norm(acc);
+        }
+      }
+      // ||W0(Gamma)||_F over the (P,Q) block distribution, and ||W0bar(Gamma)||_F
+      double w0g2_loc = 0.0;
+      {
+        auto W0 = _W0_qPQ.value().local();
+        for (long ip = 0; ip < W0.shape(1); ++ip)
+          for (long jq = 0; jq < W0.shape(2); ++jq)
+            w0g2_loc += std::norm(W0(iq_gamma, ip, jq));
+      }
+      const double w0g2 = mpi->comm.all_reduce_value(w0g2_loc, std::plus<>{});
+      double wbg2 = 0.0;
+      {
+        auto const &Wb = _W0b_qmm.value();
+        for (long m = 0; m < Wb.shape(1); ++m)
+          for (long n = 0; n < Wb.shape(2); ++n) wbg2 += std::norm(Wb(iq_gamma, m, n));
+      }
+      const double h_pre = std::abs(c_eff) * chi2;
+      const double h_post = std::abs(c_eff) * tchi2;
+      const double n_pre = std::sqrt(std::max(w0g2, 0.0));
+      const double n_post = std::sqrt(std::max(wbg2, 0.0));
+      _w0_head_share_pre = h_pre / std::max(n_pre, 1e-300);
+      _w0_head_share_post = h_post / std::max(n_post, 1e-300);
+      _w0_head_atten = _w0_head_share_post / std::max(_w0_head_share_pre, 1e-300);
+      app_log(1, "  [DA D-7 head] pre/post-fold head meter at Gamma (H1b): "
+                 "|c_eff| = {:.6e}; ||chi||^2 = {:.6e} -> ||t.chi||^2 = {:.6e} "
+                 "(kept {:.4f});\n"
+                 "    ||H||_F = {:.6e} of ||W0(G)||_F = {:.6e}  => head share PRE  = "
+                 "{:.6e}\n"
+                 "    ||H_bar||_F = {:.6e} of ||W0bar(G)||_F = {:.6e}  => head share POST = "
+                 "{:.6e}\n"
+                 "    ATTENUATION (post share / pre share) = {:.6f}   [< 1 = the fold "
+                 "represents the head worse than the body = H1b]",
+              std::abs(c_eff), chi2, tchi2, (chi2 > 0.0 ? tchi2 / chi2 : 0.0),
+              h_pre, n_pre, _w0_head_share_pre, h_post, n_post, _w0_head_share_post,
+              _w0_head_atten);
     }
 
     {

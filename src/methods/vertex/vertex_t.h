@@ -685,6 +685,16 @@ namespace solvers {
     double _w0_eps_head = 0.0;
     ComplexType _w0_head_c = ComplexType(0.0);
     bool _w0_head_applied = false;
+    // DA D-7 / H1b: the PRE- vs POST-FOLD head meter of the LAST build_w0
+    // (notes/qsgwhat_discrepancy_spec.md Phase 2; theory notes section 7 hazard). The head
+    // is rank-1, H = c_eff chi chi^dag with c_eff = c (1 + Re eps^-1_head), so
+    // ||H||_F = |c_eff| ||chi||^2 in the GLOBAL basis and |c_eff| ||t chi||^2 after the
+    // Option-A fold. What is reported is each one's SHARE of its own rung's Frobenius norm,
+    // and the ratio of the two shares = the attenuation the secondary basis applies to the
+    // head relative to the body. -1 = never measured (meter off / no head).
+    double _w0_head_share_pre = -1.0;
+    double _w0_head_share_post = -1.0;
+    double _w0_head_atten = -1.0;
 
     // ---- IBZ k-point symmetry (notes/vertex_ibz_symmetry.md) -------------------------
     // Geometry-fixed symmetry contexts, built lazily on the first symmetric
@@ -823,6 +833,33 @@ namespace solvers {
     //                 _ladder_solve_budget_gb (fits => 1, else the smallest g that fits).
     long _ladder_solve_grid = 1;
     double _ladder_solve_budget_gb = 8.0;
+    // ---- DA Phase 2 knobs (notes/qsgwhat_discrepancy_spec.md D-1 / D-4 / D-7) ----------
+    // ALL THREE ARE DIAGNOSTICS, ALL DEFAULT-INERT (knob-absent = bitwise fallthrough).
+    //
+    // D-1 _ladder_tda: Tamm-Dancoff truncation of the ladder KERNEL. In the (hole at k,
+    //   particle at k+q) orbital-pair space of vertex_ladder.icc the pairs split by
+    //   OCCUPATION CHARACTER -- +1 "resonant" (a occupied at k, b empty at k+q), -1
+    //   "anti-resonant" (a empty, b occupied), 0 otherwise (same-occupation pairs, whose
+    //   chi0 weight vanishes for a QP-like G). The TDA is realized by ZEROING the kernel
+    //   blocks that CONNECT characters of opposite sign, i.e. the resonant/anti-resonant
+    //   COUPLING block B of H = [[A, B], [-B*, -A*]]. That is exactly the paper's
+    //   "Hermitian matrix with half as many rows and columns" (Cunningham et al., PRB 108,
+    //   165104, section III A): with B = 0 the two blocks decouple and each is the mirror
+    //   of the other, so P^lad becomes the TDA polarization. DELETING the anti-resonant
+    //   pairs instead would destroy the nu -> -nu symmetry of P and is NOT the TDA.
+    bool _ladder_tda = false;
+    // D-4 _ladder_head_scale: multiplies the ANALYTIC rank-1 q->0 head that build_w0
+    //   inserts into the static rung W0(Gamma) -- i.e. the head INSIDE the ladder kernel
+    //   W-bar_0, and nothing else (not the loop's own RPA W, not the Sigma^C/Pi^C head
+    //   insertions, which are vertex_bl_head_scale). Finding F-DA-1
+    //   (notes/qsgwhat_discrepancy_results.md section 4c) showed vertex_div_treatment never
+    //   reaches this head, so its contribution to Delta_lad had never been measurable.
+    //   1.0 = the committed policy (bitwise), 0.0 = head-free kernel.
+    double _ladder_head_scale = 1.0;
+    // D-7 _ladder_qnu_meter: the (q, nu) decomposition meters of the injected P^lad and of
+    //   the Dyson-W change it drives, plus the pre/post-fold head meter (H1b). PURE
+    //   OBSERVERS -- they add print-only arithmetic, never touch a physics array.
+    bool _ladder_qnu_meter = false;
     // DIAGNOSTIC (default OFF, not physical): THE CONSTANT-RUNG ABSOLUTE PIN.
     //
     // X^L = pi^dyn - Pi^{C,0}(tau=0) must VANISH when the screening is genuinely static.
@@ -1152,6 +1189,9 @@ namespace solvers {
       _w0_eps_head = 0.0;
       _w0_head_c = ComplexType(0.0);
       _w0_head_applied = false;
+      _w0_head_share_pre = -1.0;
+      _w0_head_share_post = -1.0;
+      _w0_head_atten = -1.0;
     }
     // global-aux W0, (P,Q)-block-distributed (nq_ibz, Np, Np)
     memory::darray_t<nda::array<ComplexType, 3>, mpi3::communicator> const& W0_qPQ() const {
@@ -1172,6 +1212,10 @@ namespace solvers {
     double w0_eps_inv_head() const { return _w0_eps_head; }
     ComplexType w0_head_c() const { return _w0_head_c; }
     bool w0_head_applied() const { return _w0_head_applied; }
+    // DA D-7 / H1b pre-post fold head meter of the last build_w0 (-1 = not measured)
+    double w0_head_share_pre() const { return _w0_head_share_pre; }
+    double w0_head_share_post() const { return _w0_head_share_post; }
+    double w0_head_attenuation() const { return _w0_head_atten; }
     // "v1_skip" fallback: the Gamma cell of the rung transfer is dropped BY THE KERNEL
     // (as for Z / dW -- the stored W0(Gamma) is the regularized body either way). Kept
     // as a flag on the handle so the S3+ kernels inherit the policy from the ONE W0.
@@ -1407,6 +1451,26 @@ namespace solvers {
     }
     long ladder_solve_grid() const { return _ladder_solve_grid; }
     double ladder_solve_budget_gb() const { return _ladder_solve_budget_gb; }
+
+    /**
+     * DA Phase 2 knob surface (notes/qsgwhat_discrepancy_spec.md, Phase 2 D-1/D-4/D-7).
+     * See the member declarations for what each one does and why it exists. All three are
+     * default-inert: tda = false leaves the kernel untouched, head_scale = 1.0 multiplies
+     * the head coefficient by exactly 1.0 (IEEE-exact), qnu_meter = false emits nothing.
+     * scr_coulomb_t::ensure_pol_vertex copies them from the knob carrier onto the READOUT
+     * instance, which is the vertex that actually builds W0 and runs the ladder.
+     */
+    void set_ladder_da(bool tda, double head_scale, bool qnu_meter) {
+      utils::check(std::isfinite(head_scale) and head_scale >= 0.0,
+                   "vertex_t::set_ladder_da: ladder_head_scale must be finite and >= 0 "
+                   "(got {}).", head_scale);
+      _ladder_tda = tda;
+      _ladder_head_scale = head_scale;
+      _ladder_qnu_meter = qnu_meter;
+    }
+    bool ladder_tda() const { return _ladder_tda; }
+    double ladder_head_scale() const { return _ladder_head_scale; }
+    bool ladder_qnu_meter() const { return _ladder_qnu_meter; }
 
     /**
      * scGW-tilde increment L2 (vertex_ladder.icc): the resummed pair-space ladder

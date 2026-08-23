@@ -441,11 +441,21 @@ namespace solvers {
     // instance is the one that actually runs eval_pol_ladder_whalf, so they travel here.
     _pol_vtx->set_ladder_solve(_vertex->ladder_solve_grid(),
                                _vertex->ladder_solve_budget_gb());
+    // DA Phase 2 (notes/qsgwhat_discrepancy_spec.md): the D-1/D-4/D-7 knobs travel to the
+    // READOUT instance for the same reason the solve-grid knobs do -- this is the vertex
+    // that actually builds W0 (the ladder rung W-bar_0) and runs the pair-space ladder.
+    // Finding F-DA-1 was precisely a knob that did NOT travel here.
+    _pol_vtx->set_ladder_da(_vertex->ladder_tda(), _vertex->ladder_head_scale(),
+                            _vertex->ladder_qnu_meter());
     app_log(1, "  [scGW-tilde L2] ladder readout instance: C window = [{}, {}), "
                "secondary rank knob = {}, div_treatment = {} (kernel head follows "
                "build_w0's policy; W0bar is SAME-iteration -- coincides with "
                "pol_vertex_kernel = \"w0_prev\" at a fixed point, R4 note).",
             w.first(), w.last(), _vertex->pol_isdf_rank(), _div_treatment);
+    app_log(1, "  [scGW-tilde L2] DA Phase-2 knobs on the readout instance: ladder_tda = "
+               "{}, ladder_head_scale = {:.6g}, ladder_qnu_meter = {}.",
+            _vertex->ladder_tda() ? "true" : "false", _vertex->ladder_head_scale(),
+            _vertex->ladder_qnu_meter() ? "true" : "false");
   }
 
   template<nda::MemoryArrayOfRank<4> Array_t, typename communicator_t>
@@ -803,6 +813,18 @@ namespace solvers {
     nda::array<ComplexType, 2> tq_Q(Nm, nQl), td_P(nPl, Nm), tmp(Nm, nQl);
     double nC = 0.0;
     std::vector<double> qmax(size_t(nq_g), 0.0);
+    // ---- DA D-7: the (q, nu) decomposition meter (notes/qsgwhat_discrepancy_spec.md) ----
+    // PURE OBSERVER. Accumulates, in the GLOBAL THC aux basis (i.e. AFTER the upfold, which
+    // is what the Dyson actually sees), the squared Frobenius norm of the injected P^lad
+    // per (q, i.nu) and -- alongside the RPA polarization it corrects -- per (q, tau). Every
+    // physics write below is untouched, and with the knob off no accumulator is even sized.
+    const bool qnu_meter = (_vertex != nullptr and _vertex->ladder_qnu_meter());
+    std::vector<double> lad_qw, lad_qt, rpa_qt;
+    if (qnu_meter) {
+      lad_qw.assign(size_t(nq_g * nw_h), 0.0);
+      lad_qt.assign(size_t(nq_g * nt_h), 0.0);
+      rpa_qt.assign(size_t(nq_g * nt_h), 0.0);
+    }
     // a rank with an empty local block still joins the reductions below
     const long nq_own = (nPl > 0 and nQl > 0 and ntl > 0) ? nql : 0;
     for (long iql = 0; iql < nq_own; ++iql) {
@@ -818,6 +840,13 @@ namespace solvers {
         nda::blas::gemm(Pl(j, iq, all, all), tq_Q, tmp);
         nda::blas::gemm(td_P, tmp, A(j, all, all));
       }
+      if (qnu_meter)
+        for (long j = 0; j < nw_h; ++j) {
+          double s = 0.0;
+          for (long i = 0; i < nPl; ++i)
+            for (long jj = 0; jj < nQl; ++jj) s += std::norm(A(j, i, jj));
+          lad_qw[size_t(iq * nw_h + j)] += s;
+        }
       // nu -> tau on the flattened local block through the PUBLIC PH-sym transform
       auto A2 = nda::reshape(A, shape_t<2>{nw_h, nPl * nQl});
       auto B2 = nda::reshape(B, shape_t<2>{nt_h, nPl * nQl});
@@ -829,6 +858,11 @@ namespace solvers {
             const double a = std::abs(v);
             nC = std::max(nC, a);
             qmax[size_t(iq)] = std::max(qmax[size_t(iq)], a);
+            if (qnu_meter) {
+              const size_t o = size_t(iq * nt_h + t_rng.first() + it);
+              lad_qt[o] += a * a;
+              rpa_qt[o] += std::norm(Pi_loc(it, iql, i, j));   // BEFORE the +=
+            }
             Pi_loc(it, iql, i, j) += v;
           }
     }
@@ -894,6 +928,65 @@ namespace solvers {
       oss << std::scientific << std::setprecision(2);
       for (long q = 0; q < nq_g; ++q) oss << (q ? " " : "") << qmax[size_t(q)];
       app_log(1, "  [qpGW Q3] ||P^lad||_max by transfer q (q=0 is Gamma): {}", oss.str());
+    }
+    // ---- DA D-7 report: WHERE IN (q, nu) THE INJECTED CORRECTION LIVES -----------------
+    if (qnu_meter) {
+      comm.all_reduce_in_place_n(lad_qw.data(), lad_qw.size(), std::plus<>{});
+      comm.all_reduce_in_place_n(lad_qt.data(), lad_qt.size(), std::plus<>{});
+      comm.all_reduce_in_place_n(rpa_qt.data(), rpa_qt.size(), std::plus<>{});
+      auto MF = thc.MF();
+      // star multiplicity of each IBZ transfer (the weight its cell carries in any q sum)
+      std::vector<long> mult(size_t(nq_g), 0);
+      {
+        auto q2i = MF->qp_to_ibz();
+        for (long i = 0; i < q2i.shape(0); ++i) {
+          const long ib = q2i(i);
+          if (ib >= 0 and ib < nq_g) ++mult[size_t(ib)];
+        }
+      }
+      double tot_w = 0.0;
+      for (auto v : lad_qw) tot_w += v;
+      app_log(1, "\n  [DA D-7] (q, nu) DECOMPOSITION of the injected P^lad "
+                 "(global THC aux basis, Frobenius norms).");
+      app_log(1, "  [DA D-7]   q-marginal (sum over the {} PH-sym nu nodes), and the "
+                 "tau-summed strength relative to P^RPA:", nw_h);
+      app_log(1, "  [DA D-7]   {:>4} {:>12} {:>6} {:>14} {:>10} {:>14} {:>14} {:>10}",
+              "iq", "|q|^2", "mult", "||P^lad(q)||", "share", "||P^lad(q)||_t",
+              "||P^RPA(q)||_t", "ratio");
+      for (long q = 0; q < nq_g; ++q) {
+        double sw = 0.0, st = 0.0, sr = 0.0;
+        for (long j = 0; j < nw_h; ++j) sw += lad_qw[size_t(q * nw_h + j)];
+        for (long it = 0; it < nt_h; ++it) {
+          st += lad_qt[size_t(q * nt_h + it)];
+          sr += rpa_qt[size_t(q * nt_h + it)];
+        }
+        auto qp = MF->Qpts_ibz(q);
+        const double q2 = qp(0) * qp(0) + qp(1) * qp(1) + qp(2) * qp(2);
+        app_log(1, "  [DA D-7]   {:>4} {:>12.5e} {:>6} {:>14.6e} {:>10.4f} {:>14.6e} "
+                   "{:>14.6e} {:>10.4e}",
+                q, q2, mult[size_t(q)], std::sqrt(sw),
+                (tot_w > 0.0 ? sw / tot_w : 0.0), std::sqrt(st), std::sqrt(sr),
+                std::sqrt(st) / std::max(std::sqrt(sr), 1e-300));
+      }
+      {
+        std::ostringstream o2;
+        o2 << std::scientific << std::setprecision(3);
+        for (long j = 0; j < nw_h; ++j) {
+          double s = 0.0;
+          for (long q = 0; q < nq_g; ++q) s += lad_qw[size_t(q * nw_h + j)];
+          o2 << (j ? " " : "") << std::sqrt(s);
+        }
+        app_log(1, "  [DA D-7]   nu-marginal ||P^lad(nu)|| (PH-sym half grid, node 0 = "
+                   "i.nu = 0): {}", o2.str());
+      }
+      for (long q = 0; q < nq_g; ++q) {
+        std::ostringstream o3;
+        o3 << std::scientific << std::setprecision(3);
+        for (long j = 0; j < nw_h; ++j)
+          o3 << (j ? " " : "") << std::sqrt(lad_qw[size_t(q * nw_h + j)]);
+        app_log(1, "  [DA D-7]   ||P^lad(q = {}, nu)||: {}", q, o3.str());
+      }
+      app_log(1, "");
     }
     app_log(1, "  [qpGW Q3] ladder resolvent margin: lambda_max(inu = 0) = {:.6f}, "
                "max over nu = {:.6f}{}", _pol_lam_nu0, _pol_lam_max,
@@ -1006,10 +1099,24 @@ namespace solvers {
     nda::array<ComplexType, 1> chi_c(Np), buf(Np);
     double eps_rpa_qmin = -1.0, eps_lad_qmin = -1.0, qmin_abs2 = 1e300;
     long iq_min = -1;
+    // ---- DA D-7: the per-q Dyson-W change driven by P^lad ------------------------------
+    // PURE OBSERVER, and the direct answer to "does the ladder act at small q?": for every
+    // IBZ transfer (INCLUDING Gamma, which the eps_M head loop must skip) compare the
+    // single-frequency i.nu = 0 dW built from P^RPA against the one built from
+    // P^RPA + P^lad. ||dW_lad(q)||_F / ||dW_RPA(q)||_F is the relative screening change
+    // that q's cell contributes; Delta eps_M(q) is the same statement in the head channel.
+    const bool qnu_meter = (_vertex != nullptr and _vertex->ladder_qnu_meter());
+    std::vector<double> dw_rel(size_t(nq), 0.0), dw_abs(size_t(nq), 0.0);
+    std::vector<double> deps(size_t(nq), 0.0), eps_r(size_t(nq), -1.0);
+    // hoisted out of the q loop: at production Np these are ~100 MB each per rank, and the
+    // readout is already replicated-Np^2-heavy (Z_qPQ)
+    nda::array<ComplexType, 2> W_rpa(qnu_meter ? Np : 0, qnu_meter ? Np : 0);
+    nda::array<ComplexType, 2> W_lad(qnu_meter ? Np : 0, qnu_meter ? Np : 0);
     for (long iq = 0; iq < nq; ++iq) {
       auto qpts = MF->Qpts_ibz(iq);
       const double q_abs2 = qpts(0) * qpts(0) + qpts(1) * qpts(1) + qpts(2) * qpts(2);
-      if (q_abs2 < 1e-12) continue;                               // Gamma: no head here
+      const bool is_gamma = (q_abs2 < 1e-12);
+      if (is_gamma and not qnu_meter) continue;                   // Gamma: no head here
       // upfold: dP = t^dag Pl t
       auto tq = tmap(iq, all, all);
       nda::blas::gemm(Pl_qmm(iq, all, all), tq, tmpM);            // Pl . t   (Nm x Np)
@@ -1019,7 +1126,7 @@ namespace solvers {
       nda::blas::gemm(td, tmpM, dP);                              // t^dag Pl t
       const double factor = (q_abs2 / fpi) * MF->volume();
       chi_c = nda::conj(Chi_bar(iq, all));
-      auto eps_of = [&](bool with_ladder) {
+      auto eps_of = [&](bool with_ladder, nda::array<ComplexType, 2> *dW_out) {
         // A = I - Z (P0 [+ dP]);  dW = (A^{-1} - I) Z;  head contraction
         A() = Pi0_qPQ(iq, all, all);
         if (with_ladder) A += dP;
@@ -1031,12 +1138,29 @@ namespace solvers {
         nda::inverse_in_place(Am);
         for (long P = 0; P < Np; ++P) Am(P, P) -= ComplexType(1.0);
         nda::blas::gemm(Am, Z_qPQ(iq, all, all), ZP);
+        if (dW_out != nullptr) (*dW_out)() = ZP;
         nda::blas::gemv(ZP, chi_c, buf);
         const ComplexType eih = factor * nda::blas::dot(Chi_bar(iq, all), buf);
         return 1.0 / (1.0 + eih.real());
       };
-      const double e_rpa = eps_of(false);
-      const double e_lad = eps_of(true);
+      const double e_rpa = eps_of(false, qnu_meter ? std::addressof(W_rpa) : nullptr);
+      // The +ladder leg is evaluated by the SAME call in both modes -- the meter only asks
+      // it to also hand back dW, so eps_lad (a physics readout consumed by the Q3 gates)
+      // is bitwise what the historic path produced.
+      const double e_lad = eps_of(true, qnu_meter ? std::addressof(W_lad) : nullptr);
+      if (qnu_meter) {
+        double dn = 0.0, rn = 0.0;
+        for (long P = 0; P < Np; ++P)
+          for (long Q = 0; Q < Np; ++Q) {
+            dn += std::norm(W_lad(P, Q) - W_rpa(P, Q));
+            rn += std::norm(W_rpa(P, Q));
+          }
+        dw_abs[size_t(iq)] = std::sqrt(dn);
+        dw_rel[size_t(iq)] = std::sqrt(dn) / std::max(std::sqrt(rn), 1e-300);
+        deps[size_t(iq)] = is_gamma ? 0.0 : (e_lad - e_rpa);
+        eps_r[size_t(iq)] = is_gamma ? -1.0 : e_rpa;
+        if (is_gamma) continue;                                   // no head at Gamma
+      }
       app_log(2, "  [scGW-tilde L2]   q {} (|q|^2 = {:.4e}): eps_M RPA = {:.6f}, "
                  "+ladder = {:.6f}", iq, q_abs2, e_rpa, e_lad);
       if (q_abs2 < qmin_abs2) {
@@ -1045,6 +1169,25 @@ namespace solvers {
         eps_lad_qmin = e_lad;
         iq_min = iq;
       }
+    }
+    if (qnu_meter) {
+      app_log(1, "\n  [DA D-7] per-q DYSON-W CHANGE driven by P^lad (i.nu = 0). "
+                 "dW = (eps^-1 - I) Z; the\n"
+                 "  [DA D-7] Gamma row carries no eps_M head by construction (marked -).");
+      app_log(1, "  [DA D-7]   {:>4} {:>12} {:>14} {:>12} {:>12} {:>12}",
+              "iq", "|q|^2", "||dW_lad||_F", "rel to dW", "eps_M(RPA)", "D eps_M");
+      for (long iq = 0; iq < nq; ++iq) {
+        auto qp2 = MF->Qpts_ibz(iq);
+        const double q2 = qp2(0) * qp2(0) + qp2(1) * qp2(1) + qp2(2) * qp2(2);
+        if (eps_r[size_t(iq)] < 0.0)
+          app_log(1, "  [DA D-7]   {:>4} {:>12.5e} {:>14.6e} {:>12.5e} {:>12} {:>12}",
+                  iq, q2, dw_abs[size_t(iq)], dw_rel[size_t(iq)], "-", "-");
+        else
+          app_log(1, "  [DA D-7]   {:>4} {:>12.5e} {:>14.6e} {:>12.5e} {:>12.6f} "
+                     "{:>+12.6f}", iq, q2, dw_abs[size_t(iq)], dw_rel[size_t(iq)],
+                  eps_r[size_t(iq)], deps[size_t(iq)]);
+      }
+      app_log(1, "");
     }
     if (iq_min >= 0) {
       app_log(1, "  [scGW-tilde L2] ladder eps_M readout (inu = 0, q_min = {}): "

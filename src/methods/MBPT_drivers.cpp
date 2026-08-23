@@ -290,6 +290,22 @@ inline void ensure_checkpoint(std::shared_ptr<mf::MF> mf, std::string const& out
  *                 the per-rank footprint fits ladder_solve_budget_gb, else the smallest g
  *                 that fits (preferring divisors of the intra-node group).
  *  - ladder_solve_budget_gb: 8.0  Per-rank memory budget the AUTO mode fits against.
+ *  - ladder_tda: false  DIAGNOSTIC (notes/qsgwhat_discrepancy_spec.md D-1). Tamm-Dancoff
+ *                 truncation of the ladder KERNEL: zero the blocks of the rung that couple
+ *                 resonant (occ at k, empty at k+q) to anti-resonant pairs, i.e. B = 0 in
+ *                 H = [[A, B], [-B*, -A*]] -- the Hermitian half-size reduction Cunningham
+ *                 et al. (PRB 108, 165104) adopt. Our production ladder is TDA-FREE; this
+ *                 exists to MEASURE the TDA factor on our own machinery.
+ *  - ladder_head_scale: 1.0  DIAGNOSTIC (D-4). Multiplies the analytic rank-1 q -> 0 head
+ *                 that build_w0 inserts into the static rung W0(Gamma) -- the head INSIDE
+ *                 the ladder kernel W-bar_0. 1.0 = the committed gygi policy (bitwise),
+ *                 0.0 = head-free kernel. It does NOT touch the loop's own RPA W, its
+ *                 div_treatment, or the Sigma^C/Pi^C head insertions (vertex_bl_head_scale).
+ *                 NOTE finding F-DA-1: vertex_div_treatment does NOT reach this head.
+ *  - ladder_qnu_meter: false  DIAGNOSTIC (D-7), report-only. Prints the (q, nu)
+ *                 decomposition of the injected P^lad, the per-q Dyson-W change it drives
+ *                 (||dW_lad(q)||, Delta eps_M(q)), and the pre/post-secondary-fold head
+ *                 meter at Gamma (hypothesis H1b).
  */
 template<typename eri_t>
 void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
@@ -481,6 +497,20 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     // knob COQUI_MPI_THREAD_MULTIPLE=1 (main.cpp).
     auto ladder_solve_grid = io::get_value_with_default<long>(pt,"ladder_solve_grid",1);
     auto ladder_solve_budget_gb = io::get_value_with_default<double>(pt,"ladder_solve_budget_gb",8.0);
+    // DA Phase 2 (notes/qsgwhat_discrepancy_spec.md): three DIAGNOSTIC knobs on the ladder
+    // tier, all default-inert (knob-absent = bitwise fallthrough).
+    //  - ladder_tda        : Tamm-Dancoff truncation of the ladder KERNEL (D-1). Zeroes the
+    //                        resonant<->anti-resonant coupling block, i.e. the paper's
+    //                        Hermitian half-size reduction. Default false (we are TDA-FREE).
+    //  - ladder_head_scale : scales the analytic rank-1 q->0 head inserted into the static
+    //                        rung W0(Gamma) = the ladder kernel W-bar_0 (D-4). 1.0 = the
+    //                        committed policy, 0.0 = head-free kernel. Does NOT touch the
+    //                        loop's own RPA W, div_treatment, or the Sigma^C/Pi^C heads.
+    //  - ladder_qnu_meter  : the (q, nu) decomposition meters of P^lad and of the Dyson-W
+    //                        change, plus the pre/post-fold head meter (D-7). Report-only.
+    auto ladder_tda = io::get_value_with_default<bool>(pt,"ladder_tda",false);
+    auto ladder_head_scale = io::get_value_with_default<double>(pt,"ladder_head_scale",1.0);
+    auto ladder_qnu_meter = io::get_value_with_default<bool>(pt,"ladder_qnu_meter",false);
 
     simple_dyson dyson(mf.get(), &ft, mu_tol, mu_update_alg);
     if (io::get_value_with_default<bool>(pt,"iter_alg.enable", true)) {
@@ -513,6 +543,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
                           pol_vertex_isdf_thresh, pol_vertex_isdf_cond_max,
                           pol_vertex_isdf_distr_tol, pol_vertex_inject);
     vertex.set_ladder_solve(ladder_solve_grid, ladder_solve_budget_gb);
+    vertex.set_ladder_da(ladder_tda, ladder_head_scale, ladder_qnu_meter);
     scr_eri.set_cvv_rspace_tol(cvv_rspace_tol);
     if (vertex.enabled()) {
       utils::check(screen_type == "rpa" or screen_type == "rpa_k",
@@ -775,6 +806,20 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     // knob COQUI_MPI_THREAD_MULTIPLE=1 (main.cpp).
     auto ladder_solve_grid = io::get_value_with_default<long>(pt,"ladder_solve_grid",1);
     auto ladder_solve_budget_gb = io::get_value_with_default<double>(pt,"ladder_solve_budget_gb",8.0);
+    // DA Phase 2 (notes/qsgwhat_discrepancy_spec.md): three DIAGNOSTIC knobs on the ladder
+    // tier, all default-inert (knob-absent = bitwise fallthrough).
+    //  - ladder_tda        : Tamm-Dancoff truncation of the ladder KERNEL (D-1). Zeroes the
+    //                        resonant<->anti-resonant coupling block, i.e. the paper's
+    //                        Hermitian half-size reduction. Default false (we are TDA-FREE).
+    //  - ladder_head_scale : scales the analytic rank-1 q->0 head inserted into the static
+    //                        rung W0(Gamma) = the ladder kernel W-bar_0 (D-4). 1.0 = the
+    //                        committed policy, 0.0 = head-free kernel. Does NOT touch the
+    //                        loop's own RPA W, div_treatment, or the Sigma^C/Pi^C heads.
+    //  - ladder_qnu_meter  : the (q, nu) decomposition meters of P^lad and of the Dyson-W
+    //                        change, plus the pre/post-fold head meter (D-7). Report-only.
+    auto ladder_tda = io::get_value_with_default<bool>(pt,"ladder_tda",false);
+    auto ladder_head_scale = io::get_value_with_default<double>(pt,"ladder_head_scale",1.0);
+    auto ladder_qnu_meter = io::get_value_with_default<bool>(pt,"ladder_qnu_meter",false);
     if (io::get_value_with_default<bool>(pt,"iter_alg.enable", true)) {
       iter_solver = std::make_unique<iter_scf::iter_scf_t>(iter_scf::make_iter_scf(pt, 0.7, true));
     } else {
@@ -790,6 +835,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
                                       pol_vertex_isdf_thresh, pol_vertex_isdf_cond_max,
                                       pol_vertex_isdf_distr_tol, pol_vertex_inject);
     pol_vertex_carrier.set_ladder_solve(ladder_solve_grid, ladder_solve_budget_gb);
+    pol_vertex_carrier.set_ladder_da(ladder_tda, ladder_head_scale, ladder_qnu_meter);
     if (pol_vertex_carrier.pol_vertex_enabled()) scr_eri.set_vertex(&pol_vertex_carrier);
     MBState mb_state(mpi, ft, output);
     qp_scf_loop(mb_state, eri, ft, qp_params, mb_solver_t(&hf,&gw,&scr_eri), iter_solver.get(),
@@ -924,6 +970,20 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     // knob COQUI_MPI_THREAD_MULTIPLE=1 (main.cpp).
     auto ladder_solve_grid = io::get_value_with_default<long>(pt,"ladder_solve_grid",1);
     auto ladder_solve_budget_gb = io::get_value_with_default<double>(pt,"ladder_solve_budget_gb",8.0);
+    // DA Phase 2 (notes/qsgwhat_discrepancy_spec.md): three DIAGNOSTIC knobs on the ladder
+    // tier, all default-inert (knob-absent = bitwise fallthrough).
+    //  - ladder_tda        : Tamm-Dancoff truncation of the ladder KERNEL (D-1). Zeroes the
+    //                        resonant<->anti-resonant coupling block, i.e. the paper's
+    //                        Hermitian half-size reduction. Default false (we are TDA-FREE).
+    //  - ladder_head_scale : scales the analytic rank-1 q->0 head inserted into the static
+    //                        rung W0(Gamma) = the ladder kernel W-bar_0 (D-4). 1.0 = the
+    //                        committed policy, 0.0 = head-free kernel. Does NOT touch the
+    //                        loop's own RPA W, div_treatment, or the Sigma^C/Pi^C heads.
+    //  - ladder_qnu_meter  : the (q, nu) decomposition meters of P^lad and of the Dyson-W
+    //                        change, plus the pre/post-fold head meter (D-7). Report-only.
+    auto ladder_tda = io::get_value_with_default<bool>(pt,"ladder_tda",false);
+    auto ladder_head_scale = io::get_value_with_default<double>(pt,"ladder_head_scale",1.0);
+    auto ladder_qnu_meter = io::get_value_with_default<bool>(pt,"ladder_qnu_meter",false);
     if (io::get_value_with_default<bool>(pt,"iter_alg.enable", true)) {
       iter_solver = std::make_unique<iter_scf::iter_scf_t>(iter_scf::make_iter_scf(pt));
     } else {
@@ -939,6 +999,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
                                       pol_vertex_isdf_thresh, pol_vertex_isdf_cond_max,
                                       pol_vertex_isdf_distr_tol, pol_vertex_inject);
     pol_vertex_carrier.set_ladder_solve(ladder_solve_grid, ladder_solve_budget_gb);
+    pol_vertex_carrier.set_ladder_da(ladder_tda, ladder_head_scale, ladder_qnu_meter);
     if (pol_vertex_carrier.pol_vertex_enabled()) scr_eri.set_vertex(&pol_vertex_carrier);
     // Project 2 increment Q5 (notes/q5_option2_outer_loop_spec.md §1): the Option-2
     // re-QP-ization knobs. Parsed with an EMPTY default -- absent means INERT, i.e. the qp
@@ -1138,6 +1199,20 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
     // knob COQUI_MPI_THREAD_MULTIPLE=1 (main.cpp).
     auto ladder_solve_grid = io::get_value_with_default<long>(pt,"ladder_solve_grid",1);
     auto ladder_solve_budget_gb = io::get_value_with_default<double>(pt,"ladder_solve_budget_gb",8.0);
+    // DA Phase 2 (notes/qsgwhat_discrepancy_spec.md): three DIAGNOSTIC knobs on the ladder
+    // tier, all default-inert (knob-absent = bitwise fallthrough).
+    //  - ladder_tda        : Tamm-Dancoff truncation of the ladder KERNEL (D-1). Zeroes the
+    //                        resonant<->anti-resonant coupling block, i.e. the paper's
+    //                        Hermitian half-size reduction. Default false (we are TDA-FREE).
+    //  - ladder_head_scale : scales the analytic rank-1 q->0 head inserted into the static
+    //                        rung W0(Gamma) = the ladder kernel W-bar_0 (D-4). 1.0 = the
+    //                        committed policy, 0.0 = head-free kernel. Does NOT touch the
+    //                        loop's own RPA W, div_treatment, or the Sigma^C/Pi^C heads.
+    //  - ladder_qnu_meter  : the (q, nu) decomposition meters of P^lad and of the Dyson-W
+    //                        change, plus the pre/post-fold head meter (D-7). Report-only.
+    auto ladder_tda = io::get_value_with_default<bool>(pt,"ladder_tda",false);
+    auto ladder_head_scale = io::get_value_with_default<double>(pt,"ladder_head_scale",1.0);
+    auto ladder_qnu_meter = io::get_value_with_default<bool>(pt,"ladder_qnu_meter",false);
 
     simple_dyson dyson(mf.get(), &ft, mu_tol, mu_update_alg);
     if (io::get_value_with_default<bool>(pt,"iter_alg.enable", true)) {
@@ -1170,6 +1245,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
                           pol_vertex_isdf_thresh, pol_vertex_isdf_cond_max,
                           pol_vertex_isdf_distr_tol, pol_vertex_inject);
     vertex.set_ladder_solve(ladder_solve_grid, ladder_solve_budget_gb);
+    vertex.set_ladder_da(ladder_tda, ladder_head_scale, ladder_qnu_meter);
     scr_eri.set_cvv_rspace_tol(cvv_rspace_tol);
     if (vertex.enabled()) {
       utils::check(screen_type == "rpa" or screen_type == "rpa_k",
@@ -1357,6 +1433,20 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
     // knob COQUI_MPI_THREAD_MULTIPLE=1 (main.cpp).
     auto ladder_solve_grid = io::get_value_with_default<long>(pt,"ladder_solve_grid",1);
     auto ladder_solve_budget_gb = io::get_value_with_default<double>(pt,"ladder_solve_budget_gb",8.0);
+    // DA Phase 2 (notes/qsgwhat_discrepancy_spec.md): three DIAGNOSTIC knobs on the ladder
+    // tier, all default-inert (knob-absent = bitwise fallthrough).
+    //  - ladder_tda        : Tamm-Dancoff truncation of the ladder KERNEL (D-1). Zeroes the
+    //                        resonant<->anti-resonant coupling block, i.e. the paper's
+    //                        Hermitian half-size reduction. Default false (we are TDA-FREE).
+    //  - ladder_head_scale : scales the analytic rank-1 q->0 head inserted into the static
+    //                        rung W0(Gamma) = the ladder kernel W-bar_0 (D-4). 1.0 = the
+    //                        committed policy, 0.0 = head-free kernel. Does NOT touch the
+    //                        loop's own RPA W, div_treatment, or the Sigma^C/Pi^C heads.
+    //  - ladder_qnu_meter  : the (q, nu) decomposition meters of P^lad and of the Dyson-W
+    //                        change, plus the pre/post-fold head meter (D-7). Report-only.
+    auto ladder_tda = io::get_value_with_default<bool>(pt,"ladder_tda",false);
+    auto ladder_head_scale = io::get_value_with_default<double>(pt,"ladder_head_scale",1.0);
+    auto ladder_qnu_meter = io::get_value_with_default<bool>(pt,"ladder_qnu_meter",false);
     if (io::get_value_with_default<bool>(pt,"iter_alg.enable", true)) {
       iter_solver = std::make_unique<iter_scf::iter_scf_t>(iter_scf::make_iter_scf(pt));
     } else {
@@ -1372,6 +1462,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
                                       pol_vertex_isdf_thresh, pol_vertex_isdf_cond_max,
                                       pol_vertex_isdf_distr_tol, pol_vertex_inject);
     pol_vertex_carrier.set_ladder_solve(ladder_solve_grid, ladder_solve_budget_gb);
+    pol_vertex_carrier.set_ladder_da(ladder_tda, ladder_head_scale, ladder_qnu_meter);
     if (pol_vertex_carrier.pol_vertex_enabled()) scr_eri.set_vertex(&pol_vertex_carrier);
 
     // Project 2 increment Q5 (notes/q5_option2_outer_loop_spec.md §1): the Option-2

@@ -439,6 +439,128 @@ namespace solvers {
       }
     }
 
+    // ==================================================================================
+    // DA D-1: THE TAMM-DANCOFF TRUNCATION OF THE LADDER KERNEL
+    // (notes/qsgwhat_discrepancy_spec.md Phase 2 D-1; the paper's TDA is Cunningham et
+    //  al., PRB 108, 165104, section III A / eq 18.)
+    //
+    // WHAT THE PAIR SPACE IS. The ladder's pair index r = (a nc + b) at k carries the hole
+    // leg a on the k line and the particle leg b on the k+q line (file header). With a
+    // QP-like G, chi0 is pair-diagonal with the Lindhard weight (f_a - f_b) / (i.nu + e_a
+    // - e_b): it VANISHES unless the two legs have different occupation, and the pole sits
+    // at +(e_b - e_a) when a is occupied ("resonant", character +1) and at -(e_a - e_b)
+    // when a is empty ("anti-resonant", character -1). Same-occupation pairs (character 0)
+    // carry no chi0 weight in that limit; they are left alone here.
+    //
+    // WHAT THE TDA IS. The full two-particle Hamiltonian is H = [[A, B], [-B*, -A*]] on
+    // (resonant, anti-resonant); the TDA drops the COUPLING block B, leaving a Hermitian
+    // problem with half as many rows and columns -- the paper's own words. In this code
+    // the only place characters are coupled is the rung K(k, k'), so the TDA is exactly:
+    // ZERO every kernel element whose row pair and column pair have OPPOSITE character.
+    // The anti-resonant block itself is KEPT: deleting it would leave P^lad with only the
+    // +E poles, destroying the nu -> -nu symmetry the PH-sym transform of the injection
+    // relies on. That would not be the TDA, it would be a broken polarization.
+    //
+    // FIDELITY CAVEAT, MEASURED NOT ASSUMED: the character is read off the C-window
+    // density matrix dm = -G(beta) (simple_dyson::solve_dyson's convention) in whatever
+    // basis G_CC is expressed. If G is not close to occupation-diagonal there, the
+    // resonant/anti-resonant split is not sharp and the truncation is only approximately
+    // the paper's. build_tda_ctx therefore reports BOTH the crispness of the occupations
+    // and the off-diagonal weight of dm, and the caller logs them.
+    // ==================================================================================
+    struct tda_ctx {
+      nda::array<double, 3> occ;   // (ns, nk, nc) diagonal occupations from dm = -G(beta)
+      double fuzz = 0.0;           // max over (s,k,a) of min(n, 1-n): 0 = perfectly crisp
+      double offdiag = 0.0;        // max |dm_ab| (a != b) / max |dm_aa|
+      long n_occ = 0, n_emp = 0;   // (s,k,band) counts on each side of the 0.5 threshold
+    };
+
+    /**
+     * The one log line that makes a TDA leg auditable: how crisp the occupations are, how
+     * diagonal dm is (the two fidelity caveats above), and what fraction of the KERNEL the
+     * coupling mask removes -- computed exactly for the Gamma external transfer, where the
+     * pair at k is (a, b) with both legs at k, so the counts factorize over k.
+     */
+    inline void log_tda_ctx(tda_ctx const &c, long nc) {
+      const long ns = c.occ.shape(0), nk = c.occ.shape(1);
+      double R = 0.0, D = 0.0;
+      for (long is = 0; is < ns; ++is)
+        for (long ik = 0; ik < nk; ++ik) {
+          long no = 0;
+          for (long a = 0; a < nc; ++a) if (c.occ(is, ik, a) > 0.5) ++no;
+          R += double(no) * double(nc - no);          // resonant pairs at this k
+          D += double(nc) * double(nc);
+        }
+      R /= std::max(double(ns), 1.0);
+      D /= std::max(double(ns), 1.0);
+      const double frac = (D > 0.0) ? 2.0 * R * R / (D * D) : 0.0;
+      // INDEPENDENT VALIDATOR of the occupation extraction: sum_a n_a averaged over k is
+      // the number of electrons per spin the C window holds. For a gapped insulator with a
+      // window of N_v occupied bands it must come out at N_v to the crispness class -- if
+      // it does not, the dm convention (Dm = -G(beta)) or the basis is wrong, and the
+      // character assignment below is meaningless.
+      double nel = 0.0;
+      for (long is = 0; is < ns; ++is)
+        for (long ik = 0; ik < nk; ++ik)
+          for (long a = 0; a < nc; ++a) nel += c.occ(is, ik, a);
+      nel /= std::max(double(nk), 1.0);
+      app_log(1, "  [DA D-1] TDA ON: the resonant<->anti-resonant COUPLING block of the "
+                 "ladder kernel is zeroed\n"
+                 "    (H = [[A, B], [-B*, -A*]] -> B = 0; the paper's Hermitian half-size "
+                 "reduction).\n"
+                 "    occupations from dm = -G(beta): {} occupied / {} empty (s,k,band) "
+                 "slots, crispness max min(n, 1-n) = {:.3e}\n"
+                 "    (0 = perfectly sharp), dm off-diagonal weight = {:.3e}; masked "
+                 "fraction of the Gamma-transfer kernel = {:.4f};\n"
+                 "    validator sum_a <n_a>_k = {:.6f} electrons in the C window (must "
+                 "equal the number of\n"
+                 "    occupied bands the window holds, x nspin-convention).",
+              c.n_occ, c.n_emp, c.fuzz, c.offdiag, frac, nel);
+      if (c.fuzz > 1e-2 or c.offdiag > 1e-2)
+        app_log(1, "  [WARNING] DA D-1: the C-window G is not sharply occupation-diagonal "
+                   "(crispness {:.3e}, off-diagonal {:.3e}).\n"
+                   "            The resonant/anti-resonant split -- and hence this TDA -- "
+                   "is only approximate here.", c.fuzz, c.offdiag);
+    }
+
+    /** character of the pair (a at k, b at k+q): +1 resonant, -1 anti-resonant, 0 else. */
+    inline int tda_pair_char(double na, double nb) {
+      const bool oa = (na > 0.5), ob = (nb > 0.5);
+      if (oa and not ob) return 1;
+      if (ob and not oa) return -1;
+      return 0;
+    }
+
+    /** Occupations + diagnostics from the SAME G_CC the kernel contracts. */
+    inline tda_ctx build_tda_ctx(nda::array<ComplexType, 5> const &G_CC,
+                                 imag_axes_ft::IAFT const &ft) {
+      const long nt = G_CC.shape(0), ns = G_CC.shape(1), nk = G_CC.shape(2);
+      const long nc = G_CC.shape(3);
+      const long dim1 = ns * nk * nc * nc;
+      auto G2 = nda::reshape(G_CC, std::array<long, 2>{nt, dim1});
+      nda::array<ComplexType, 1> gb(dim1);
+      ft.tau_to_beta(G2, gb);
+      auto dm = nda::reshape(gb, std::array<long, 4>{ns, nk, nc, nc});
+      tda_ctx c;
+      c.occ = nda::array<double, 3>(ns, nk, nc);
+      double dmax = 0.0, omax = 0.0;
+      for (long is = 0; is < ns; ++is)
+        for (long ik = 0; ik < nk; ++ik) {
+          for (long a = 0; a < nc; ++a) {
+            const double n = -dm(is, ik, a, a).real();       // Dm = -G(beta)
+            c.occ(is, ik, a) = n;
+            c.fuzz = std::max(c.fuzz, std::min(n, 1.0 - n));
+            dmax = std::max(dmax, std::abs(n));
+            if (n > 0.5) ++c.n_occ; else ++c.n_emp;
+          }
+          for (long a = 0; a < nc; ++a)
+            for (long b = 0; b < nc; ++b)
+              if (a != b) omax = std::max(omax, std::abs(dm(is, ik, a, b)));
+        }
+      c.offdiag = omax / std::max(dmax, 1e-300);
+      return c;
+    }
+
     /**
      * THE PAIR-SPACE LADDER CORE (file header for the derivation and conventions).
      * For the bosonic nodes in nu_list, accumulate the one-rung rebuild and/or the
@@ -505,7 +627,9 @@ namespace solvers {
                                   nda::array<ComplexType, 4> *Pi_lad_loc = nullptr,
                                   nda::array<ComplexType, 4> *Pi_onerung_loc = nullptr,
                                   // profiling meters (pure observer; nullptr = historic path)
-                                  ladder_prof *prof = nullptr) {
+                                  ladder_prof *prof = nullptr,
+                                  // DA D-1: nullptr = no truncation = bitwise historic path
+                                  tda_ctx const *tda = nullptr) {
       prof_watch pwatch;
       if (prof) prof->rss_entry = prof_rss_gb();
       decltype(nda::range::all) all;
@@ -777,6 +901,17 @@ namespace solvers {
               else
                 nda::blas::gemm(W0b(qsx, all, all), U2, WU2);
               nda::blas::gemm(nda::transpose(U1), WU2, wb);
+              // DA D-1: the resonant/anti-resonant COUPLING mask. Row pair (p1', p3) lives
+              // at k (hole p1' at k, particle p3 at k+q), column pair (p1, p3') at k'.
+              // With tda == nullptr this returns true immediately and the writes below are
+              // EXACTLY the historic expression -- bitwise, not merely equal.
+              auto keep = [&](long p1, long p1p, long p3, long p3p) -> bool {
+                if (tda == nullptr) return true;
+                const int cr = tda_pair_char(tda->occ(is, ik, p1p), tda->occ(is, ikpq, p3));
+                const int cc = tda_pair_char(tda->occ(is, ikp, p1),
+                                             tda->occ(is, ikppq, p3p));
+                return cr * cc >= 0;
+              };
               // twist-pack (the anchor's to_wmat):
               //   K_{(p1' nc + p3),(p1 nc + p3')} = wb_{(p1 nc + p1'),(p3 nc + p3')}
               // A.2: with no one-rung output requested, Kb's ONLY consumer is the Kbig
@@ -789,14 +924,16 @@ namespace solvers {
                     for (long p3 = 0; p3 < nc; ++p3)
                       for (long p3p = 0; p3p < nc; ++p3p)
                         Kb(ik, ikp, p1p * nc + p3, p1 * nc + p3p) =
-                            wb(p1 * nc + p1p, p3 * nc + p3p);
+                            keep(p1, p1p, p3, p3p) ? wb(p1 * nc + p1p, p3 * nc + p3p)
+                                                   : ComplexType(0.0);
               } else {
                 for (long p1 = 0; p1 < nc; ++p1)
                   for (long p1p = 0; p1p < nc; ++p1p)
                     for (long p3 = 0; p3 < nc; ++p3)
                       for (long p3p = 0; p3p < nc; ++p3p)
                         Kbig(ikp * nc2 + (p1 * nc + p3p), ik * nc2 + (p1p * nc + p3)) =
-                            wb(p1 * nc + p1p, p3 * nc + p3p);
+                            keep(p1, p1p, p3, p3p) ? wb(p1 * nc + p1p, p3 * nc + p3p)
+                                                   : ComplexType(0.0);
               }
             }
           }
@@ -1189,7 +1326,9 @@ namespace solvers {
                                         nda::array<double, 1> *lam_max = nullptr,
                                         nda::array<ComplexType, 4> const *U_skia = nullptr,
                                         nda::array<ComplexType, 4> *Pi_lad_loc = nullptr,
-                                        ladder_prof *prof = nullptr) {
+                                        ladder_prof *prof = nullptr,
+                                        // DA D-1: nullptr = bitwise historic path
+                                        tda_ctx const *tda = nullptr) {
       using math::nda::make_distributed_array;
       using dmat_t = nda::array<ComplexType, 2, nda::F_layout>;
       using shp2 = std::array<long, 2>;
@@ -1446,12 +1585,23 @@ namespace solvers {
                   else
                     nda::blas::gemm(W0b(qsx, all, all), U2, WU2);
                   nda::blas::gemm(nda::transpose(U1), WU2, wb);
+                  // DA D-1: the SAME coupling mask as the per-rank path (see there for the
+                  // derivation). tda == nullptr => bitwise the historic write.
+                  auto keep = [&](long p1, long p1p, long p3, long p3p) -> bool {
+                    if (tda == nullptr) return true;
+                    const int cr = tda_pair_char(tda->occ(is, ik, p1p),
+                                                 tda->occ(is, ikpq, p3));
+                    const int cc = tda_pair_char(tda->occ(is, ikp, p1),
+                                                 tda->occ(is, ikppq, p3p));
+                    return cr * cc >= 0;
+                  };
                   for (long p1 = 0; p1 < nc; ++p1)
                     for (long p1p = 0; p1p < nc; ++p1p)
                       for (long p3 = 0; p3 < nc; ++p3)
                         for (long p3p = 0; p3p < nc; ++p3p)
                           Kblk(p1 * nc + p3p, p1p * nc + p3) =
-                              wb(p1 * nc + p1p, p3 * nc + p3p);
+                              keep(p1, p1p, p3, p3p) ? wb(p1 * nc + p1p, p3 * nc + p3p)
+                                                     : ComplexType(0.0);
                   nda::blas::gemm(ComplexType(-1.0 / nk), Cb(ikp, all, all), Kblk,
                                   ComplexType(0.0), blk);
                   const long r0 = std::max(org_r, ikp * nc2);
@@ -2152,6 +2302,15 @@ namespace solvers {
     }
 
     vertex_pi::iaft_tools tools(*_ft);
+    // DA D-1 (notes/qsgwhat_discrepancy_spec.md Phase 2): the TDA context, built from the
+    // SAME G_CC the kernel contracts. Absent unless the knob is on => bitwise fallthrough.
+    std::optional<vertex_ladder_detail::tda_ctx> tdac;
+    vertex_ladder_detail::tda_ctx const *tdap = nullptr;
+    if (_ladder_tda) {
+      tdac = vertex_ladder_detail::build_tda_ctx(G_CC, *_ft);
+      tdap = std::addressof(tdac.value());
+      vertex_ladder_detail::log_tda_ctx(*tdap, nc);
+    }
     std::vector<long> nu0 = {tools.nw_b / 2};   // the inu = 0 node of the full mesh
     nda::array<ComplexType, 4> Pl(1, nq_ext, Nm, Nm);
     auto mpi = thc.mpi();
@@ -2172,13 +2331,13 @@ namespace solvers {
                                               mpi->internode_comm.rank(),
                                               mpi->internode_comm.size(), symc,
                                               std::addressof(mpi->node_comm), nullptr,
-                                              nullptr, nullptr, nullptr, &prof);
+                                              nullptr, nullptr, nullptr, &prof, tdap);
     else
       vertex_ladder_detail::pair_space_ladder(G_CC, _Xb_skma, _W0b_qmm.value(), kmq,
                                               kpq, tools, nu0, nullptr, &Pl,
                                               mpi->comm.rank(), mpi->comm.size(), symc,
                                               nullptr, nullptr,
-                                              nullptr, nullptr, nullptr, &prof);
+                                              nullptr, nullptr, nullptr, &prof, tdap);
     cwatch.lap();
     mpi->comm.barrier();
     prof.t_barrier = cwatch.lap();
@@ -2270,6 +2429,14 @@ namespace solvers {
     prof.t_inputs = cwatch.lap();
 
     vertex_pi::iaft_tools tools(*_ft);
+    // DA D-1: see eval_pol_ladder_nu0. nullptr unless the knob is on => bitwise.
+    std::optional<vertex_ladder_detail::tda_ctx> tdac;
+    vertex_ladder_detail::tda_ctx const *tdap = nullptr;
+    if (_ladder_tda) {
+      tdac = vertex_ladder_detail::build_tda_ctx(G_CC, *_ft);
+      tdap = std::addressof(tdac.value());
+      vertex_ladder_detail::log_tda_ctx(*tdap, subspace_rank());
+    }
     const long nw_b = tools.nw_b;
     const long nw_half = (nw_b % 2 == 0) ? nw_b / 2 : nw_b / 2 + 1;
     std::vector<long> nu_h(nw_half);
@@ -2292,7 +2459,7 @@ namespace solvers {
       vertex_ladder_detail::pair_space_ladder_slate(G_CC, _Xb_skma, _W0b_qmm.value(), kmq,
                                                     kpq, tools, nu_h, &Pl, mpi->comm,
                                                     g_slv, symc, lam_max, nullptr, nullptr,
-                                                    &prof);
+                                                    &prof, tdap);
       cwatch.lap();
       mpi->comm.barrier();
       prof.t_barrier = cwatch.lap();
@@ -2313,13 +2480,13 @@ namespace solvers {
                                               mpi->internode_comm.rank(),
                                               mpi->internode_comm.size(), symc,
                                               std::addressof(mpi->node_comm), lam_max,
-                                              nullptr, nullptr, nullptr, &prof);
+                                              nullptr, nullptr, nullptr, &prof, tdap);
     else
       vertex_ladder_detail::pair_space_ladder(G_CC, _Xb_skma, _W0b_qmm.value(), kmq,
                                               kpq, tools, nu_h, nullptr, &Pl,
                                               mpi->comm.rank(), mpi->comm.size(), symc,
                                               nullptr, lam_max,
-                                              nullptr, nullptr, nullptr, &prof);
+                                              nullptr, nullptr, nullptr, &prof, tdap);
     cwatch.lap();
     // the idle-rank meter: a rank that finished its (s,q) units early waits here. The
     // all_reduce below already synchronizes, so this only SPLITS an existing wait.
@@ -2800,13 +2967,26 @@ namespace solvers {
     vertex_sym::sym_ctx const *symc = nullptr;
     ladder_inputs(mb_state, thc, G_CC, kmq, kpq, symc);
     vertex_pi::iaft_tools tools(*_ft);
+    // DA D-1: the full-mesh REFERENCE must carry the same kernel as the half-grid object it
+    // is compared against, or node_map_resid would measure the knob instead of the map.
+    // Under TDA this also turns ph_sym_resid into the licence the PH-sym transform needs
+    // FOR THE TRUNCATED kernel -- the mask is nu-independent and exchanges the two
+    // characters under nu -> -nu, so the symmetry should survive; the gate is what says so.
+    std::optional<vertex_ladder_detail::tda_ctx> tdac;
+    vertex_ladder_detail::tda_ctx const *tdap = nullptr;
+    if (_ladder_tda) {
+      tdac = vertex_ladder_detail::build_tda_ctx(G_CC, *_ft);
+      tdap = std::addressof(tdac.value());
+    }
     const long nw_b = tools.nw_b, i0 = nw_b / 2;
     std::vector<long> nu_all(nw_b);
     for (long m = 0; m < nw_b; ++m) nu_all[m] = m;
     nda::array<ComplexType, 4> Pf(nw_b, nq_ext, Nm, Nm);
     vertex_ladder_detail::pair_space_ladder(G_CC, _Xb_skma, _W0b_qmm.value(), kmq, kpq,
                                             tools, nu_all, nullptr, &Pf,
-                                            mpi->comm.rank(), mpi->comm.size(), symc);
+                                            mpi->comm.rank(), mpi->comm.size(), symc,
+                                            nullptr, nullptr, nullptr, nullptr, nullptr,
+                                            nullptr, tdap);
     mpi->comm.all_reduce_in_place_n(Pf.data(), Pf.size(), std::plus<>{});
     double fmax = 0.0;
     for (auto const &v : Pf) fmax = std::max(fmax, std::abs(v));
@@ -2832,7 +3012,8 @@ namespace solvers {
       nda::array<double, 1> lam_s(1);
       vertex_ladder_detail::pair_space_ladder(G_CC, _Xb_skma, W0s, kmq, kpq, tools, nu0,
                                               nullptr, &Ps, mpi->comm.rank(),
-                                              mpi->comm.size(), symc, nullptr, &lam_s);
+                                              mpi->comm.size(), symc, nullptr, &lam_s,
+                                              nullptr, nullptr, nullptr, nullptr, tdap);
       mpi->comm.all_reduce_in_place_n(lam_s.data(), lam_s.size(), boost::mpi3::max<>{});
       out.lam_nu0_scaled = lam_s(0);
     }
