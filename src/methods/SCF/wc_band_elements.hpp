@@ -338,6 +338,10 @@
 #include "numerics/shared_array/nda.hpp"
 #include "methods/SCF/qp_modea.hpp"
 #include "methods/SCF/wc_spectral.hpp"
+// TC-2 (notes/tc_coqui_impl_spec.md): P on the tilted contour, reachable only through
+// qp_modea_wfit = "contour". ENABLE-flag-free -- plain complex arithmetic in the existing
+// THC kernels -- and inert for every other wfit (gate TC-2-b).
+#include "methods/SCF/p_contour.hpp"
 #include "methods/mb_state/mb_state.hpp"
 
 #ifdef ENABLE_FINUFFT
@@ -928,6 +932,9 @@ namespace qp_modea {
     // spectral route needs the Gamma-head decision (and the head's own Matsubara data) to
     // size its appended head sector. Nothing between here and there depends on npk.
     const bool spectral = (opts.wfit == "spectral");
+    // TC-2: the tilted-contour route. Inert for every other wfit -- nothing above or
+    // below this flag reads it except the one branch in THE POLE SET block.
+    const bool contour = (opts.wfit == "contour");
     ctx.diag.gap_edge = gap_edge;
     {   // global QP band edges of the CURRENT spectrum -- the strip test needs them
       double lo = -1e300, hi = 1e300;
@@ -1022,7 +1029,56 @@ namespace qp_modea {
     std::optional<imag_axes_ft::masked_pole_fit> mpf_opt;
     detail::spectral_ctx_t sp;
     long npk = 0;
-    if (not spectral) {
+    if (contour) {
+      // ================== TC-2: P ON THE TILTED CONTOUR =========================
+      // A SIBLING of the spectral route: same knob family, same G provenance (the
+      // CURRENT QP spectrum and MOs, frozen for the inner loop), same seam. What it
+      // produces here is P_PQ(q, s_j) on the contour nodes plus the transform F;
+      // turning that into the residue slabs sWres the rest of this file consumes is
+      // W ON THE LINE, which is increment TC-3.
+      const long nk_lin = [&]() {
+        auto kg = MF->kp_grid();
+        return std::min({long(kg(0)), long(kg(1)), long(kg(2))});
+      }();
+      p_contour::opts_t po;
+      po.eps = opts.tc_eps;
+      po.delta = opts.tc_delta;
+      po.rho = opts.tc_rho;
+      po.profile = opts.tc_profile;
+      po.trunc = opts.tc_trunc;
+      po.level = lvl;
+      auto pctx = p_contour::build_contour_for_spectrum(sE_ska.local(), mu, nk_lin,
+                                                        ctx.beta, po);
+      p_contour::log_contour(pctx, po, lvl);
+
+      auto sPc = make_shared_array<nda::array_view<ComplexType, 4>>(
+          *mpi, {nq_ibz, pctx.c.rank, NP, NP});
+      const auto t_pc = std::chrono::steady_clock::now();
+      p_contour::sample_P_at_times(sPc, pctx.t_node, thc, sMO_skia, sE_ska, mu,
+                                   ctx.beta, po.trunc ? po.eps : -1.0, &pctx);
+      pctx.t_wall = std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - t_pc).count();
+      double pmax = 0.0;
+      for (auto const &v : sPc.local()) pmax = std::max(pmax, std::abs(v));
+      pmax = mpi->comm.all_reduce_value(pmax, boost::mpi3::max<>{});
+      app_log(lvl, "  - TC P samples:                {} q x {} nodes x {}^2 = {:.2f} MB "
+                   "(node-shared); max|P(q, s_j)| = {:.4e}; band truncation {} "
+                   "(kept greater leg [{}, {}], lesser leg [{}, {}] of {}; band-work "
+                   "ratio {:.3f}); wall {:.2f} s",
+              nq_ibz, pctx.c.rank, NP,
+              double(nq_ibz) * double(pctx.c.rank) * double(NP) * double(NP) * 16.0
+                  / 1.048576e6,
+              pmax, po.trunc ? "ON" : "off", pctx.nband_p_min, pctx.nband_p_max,
+              pctx.nband_n_min, pctx.nband_n_max, nbnd, pctx.trunc_ratio, pctx.t_wall);
+      utils::check(false,
+                   "qp_modea: qp_modea_wfit = \"contour\" reaches the end of increment "
+                   "TC-2. The tilted contour, the transform F and P_PQ(q, s_j) are all "
+                   "built and reported above; what is NOT implemented yet is W on the "
+                   "line -- W^c(z) = v[1 - v P(z)]^{{-1}} v P(z) v at the CD target list, "
+                   "and the eq-1 assembly with the derived sigma_m signs -- which is "
+                   "increment TC-3 (notes/tc_coqui_impl_spec.md). Use qp_modea_wfit = "
+                   "\"tau\", \"nu\" or \"spectral\" for a production run.");
+    } else if (not spectral) {
       mpf_opt = (opts.wfit == "nu")
                     ? imag_axes_ft::masked_pole_fit::from_matsubara(pf, zb, gap_edge, opts.wrtol)
                     : imag_axes_ft::masked_pole_fit::from_tau(pf, gap_edge, opts.wrtol);

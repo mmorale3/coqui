@@ -174,7 +174,7 @@ namespace qp_modea {
     double eta = 0.0;                  // evaluation offset i*eta (stress only)
     double eta_far = 0.0;              // rev 4: OUT-OF-STRIP offset i*eta_far (0 = mu fallback)
     std::string wsupp = "auto";        // {"auto","off",<value in a.u.>}
-    std::string wfit = "tau";          // {tau, nu, spectral}
+    std::string wfit = "tau";          // {tau, nu, spectral, contour}
     // RW-2 (notes/rw_real_axis_w_spec.md): the spectral-quadrature W^c representation.
     // Active only when wfit == "spectral"; both are FLAGGED agent-chosen defaults.
     //   spectral_eta   -- Lorentzian width of the QP-pole spectral function A(w) fed to the
@@ -217,6 +217,13 @@ namespace qp_modea {
     // tolerance. Measured in that file's header: R/Np is 1.00 at 1e-10 and 0.81 at 1e-8, so
     // the restructure has nothing to compress at the accuracy class the gates require.
     double wunion = -1.0;
+    // ---- increment TC-2: the tilted-contour route (wfit == "contour") ----------
+    // Documented on qp_params_t.h; inert for every other wfit.
+    double      tc_eps = 1e-6;
+    double      tc_delta = 0.0;        // a.u.; 0 = the eq-8 recipe (1.2 W_band/N_k floor)
+    double      tc_rho = 0.65;
+    std::string tc_profile = "flat";   // {flat, growing}
+    bool        tc_trunc = false;      // band truncation along the contour
     long iter = 1;                     // outer iteration (1 => Route-A root refinement)
     int level = 2;                     // logging level for the per-iteration banner
   };

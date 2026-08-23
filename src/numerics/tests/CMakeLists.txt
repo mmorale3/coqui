@@ -27,3 +27,16 @@ target_link_libraries(test_${TEST_ID} PRIVATE catch_main utils numerics)
 add_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}")
 set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR})
 
+# increment TC-1 (notes/tc_coqui_impl_spec.md): the offline tilted-contour builder.
+# Pure math (nda + LAPACK), no MPI, no fixture -- it builds and runs in every
+# configuration. Gate TC-1-a reads the campaign reference JSON produced by
+# tc_validation/tests/export_tc1_reference.py.
+set(TEST_ID tilted_contour)
+
+add_executable(test_${TEST_ID} test_tilted_contour.cpp)
+target_link_libraries(test_${TEST_ID} PRIVATE catch_main utils numerics)
+
+add_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}")
+set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
+                     TIMEOUT 3600)
+

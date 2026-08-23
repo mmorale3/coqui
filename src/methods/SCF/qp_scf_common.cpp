@@ -95,6 +95,12 @@ namespace {
     opts.wrank = qp_params.qp_modea_wrank;
     opts.wsketch = qp_params.qp_modea_wsketch;
     opts.wunion = qp_params.qp_modea_wunion;
+    // TC-2 (notes/tc_coqui_impl_spec.md): the tilted-contour route's knob family.
+    opts.tc_eps = qp_params.qp_tc_eps;
+    opts.tc_delta = qp_params.qp_tc_delta;
+    opts.tc_rho = qp_params.qp_tc_rho;
+    opts.tc_profile = qp_params.qp_tc_profile;
+    opts.tc_trunc = qp_params.qp_tc_trunc;
     opts.iter = 1;
     std::string div = "ignore_g0";
     if constexpr (requires { mb_solver.corr->iter(); })
@@ -104,9 +110,10 @@ namespace {
     utils::check(opts.route == "cd" or opts.route == "expansion",
                  "qp_modea: unknown qp_modea_route = {}. Valid: \"cd\", \"expansion\".",
                  opts.route);
-    utils::check(opts.wfit == "tau" or opts.wfit == "nu" or opts.wfit == "spectral",
-                 "qp_modea: unknown qp_modea_wfit = {}. Valid: \"tau\", \"nu\", \"spectral\".",
-                 opts.wfit);
+    utils::check(opts.wfit == "tau" or opts.wfit == "nu" or opts.wfit == "spectral"
+                 or opts.wfit == "contour",
+                 "qp_modea: unknown qp_modea_wfit = {}. Valid: \"tau\", \"nu\", "
+                 "\"spectral\", \"contour\".", opts.wfit);
 #ifndef ENABLE_FINUFFT
     utils::check(opts.wfit != "spectral",
                  "qp_modea: qp_modea_wfit = \"spectral\" (the RW-2 spectral-quadrature W^c "
@@ -122,6 +129,18 @@ namespace {
     utils::check(opts.eta_far >= 0.0,
                  "qp_modea: qp_modea_eta_far = {} must be >= 0 (0 = the rev-3.1 mu fallback).",
                  opts.eta_far);
+    // TC-2: the tilted-contour knobs. Validated unconditionally so a typo is caught at
+    // parse time on every route, but they steer nothing unless wfit == "contour".
+    utils::check(opts.tc_eps > 0.0 and opts.tc_eps < 1.0,
+                 "qp_modea: qp_tc_eps = {} must be in (0, 1).", opts.tc_eps);
+    utils::check(opts.tc_delta >= 0.0,
+                 "qp_modea: qp_tc_delta = {} must be >= 0 (0 selects the eq-8 recipe).",
+                 opts.tc_delta);
+    utils::check(opts.tc_rho >= 0.0 and opts.tc_rho < 1.0,
+                 "qp_modea: qp_tc_rho = {} must be in [0, 1).", opts.tc_rho);
+    utils::check(opts.tc_profile == "flat" or opts.tc_profile == "growing",
+                 "qp_modea: unknown qp_tc_profile = {}. Valid: \"flat\", \"growing\".",
+                 opts.tc_profile);
 
     app_log(2, "\n* {} quasiparticle map (Project 2 increment QM3): building the "
                "evaluator context", qp_params.qp_map);
@@ -1705,6 +1724,14 @@ auto qp_approx(const sArray_t<Array_view_5D_t> &sSigma_tskij,
             qp_params.qp_modea_wsupp, qp_params.qp_modea_wfit, qp_params.qp_modea_wrtol,
             qp_params.qp_modea_wrank, qp_params.qp_modea_wsketch,
             qp_params.qp_modea_wunion);
+  if (qp_params.qp_modea_wfit == "contour")
+    app_log(2, "  - contour knobs (TC-2):   qp_tc_eps = {:.1e}, qp_tc_delta = {:.4g} a.u. "
+               "({}), qp_tc_rho = {:.3g}, qp_tc_profile = {}, qp_tc_trunc = {}",
+            qp_params.qp_tc_eps, qp_params.qp_tc_delta,
+            qp_params.qp_tc_delta > 0.0 ? "explicit"
+                                        : "0 = the eq-8 recipe, 1.2 W_band/N_k floor",
+            qp_params.qp_tc_rho, qp_params.qp_tc_profile,
+            qp_params.qp_tc_trunc ? "on" : "off");
   if (qp_params.qp_modea_wfit == "spectral")
     app_log(2, "  - spectral knobs (RW-2):  spectral_eta = {:.4g} a.u. ({:.4g} eV), "
                "spectral_npole = {} positive-Omega nodes after coarsening, spectral_gamma = {}",

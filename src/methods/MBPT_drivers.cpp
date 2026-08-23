@@ -689,9 +689,29 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     qp_params.qp_modea_wfit = io::get_value_with_default<std::string>(pt,"qp_modea_wfit","tau");
     io::tolower(qp_params.qp_modea_wfit);
     utils::check(qp_params.qp_modea_wfit=="tau" or qp_params.qp_modea_wfit=="nu"
-                 or qp_params.qp_modea_wfit=="spectral",
+                 or qp_params.qp_modea_wfit=="spectral"
+                 or qp_params.qp_modea_wfit=="contour",
                  "evgw: unknown qp_modea_wfit: {}. Valid options: \"tau\", \"nu\", "
-                 "\"spectral\".", qp_params.qp_modea_wfit);
+                 "\"spectral\", \"contour\".", qp_params.qp_modea_wfit);
+    // TC-2 (notes/tc_coqui_impl_spec.md): the tilted-contour route, a SIBLING of the
+    // RW-2 "spectral" knob family. Every value is documented on qp_params_t.h.
+    qp_params.qp_tc_eps = io::get_value_with_default<double>(pt,"qp_tc_eps",1e-6);
+    utils::check(qp_params.qp_tc_eps > 0.0 and qp_params.qp_tc_eps < 1.0,
+                 "evgw: qp_tc_eps = {} must be in (0, 1).", qp_params.qp_tc_eps);
+    qp_params.qp_tc_delta = io::get_value_with_default<double>(pt,"qp_tc_delta",0.0);
+    utils::check(qp_params.qp_tc_delta >= 0.0,
+                 "evgw: qp_tc_delta = {} must be >= 0 (0 selects the eq-8 recipe).",
+                 qp_params.qp_tc_delta);
+    qp_params.qp_tc_rho = io::get_value_with_default<double>(pt,"qp_tc_rho",0.65);
+    utils::check(qp_params.qp_tc_rho >= 0.0 and qp_params.qp_tc_rho < 1.0,
+                 "evgw: qp_tc_rho = {} must be in [0, 1).", qp_params.qp_tc_rho);
+    qp_params.qp_tc_profile =
+        io::get_value_with_default<std::string>(pt,"qp_tc_profile","flat");
+    io::tolower(qp_params.qp_tc_profile);
+    utils::check(qp_params.qp_tc_profile=="flat" or qp_params.qp_tc_profile=="growing",
+                 "evgw: unknown qp_tc_profile: {}. Valid options: \"flat\", \"growing\".",
+                 qp_params.qp_tc_profile);
+    qp_params.qp_tc_trunc = io::get_value_with_default<bool>(pt,"qp_tc_trunc",false);
     // RW-2: the spectral-quadrature W^c representation (notes/rw_real_axis_w_spec.md).
     qp_params.qp_modea_spectral_eta =
         io::get_value_with_default<double>(pt,"qp_modea_spectral_eta",0.0125);
@@ -808,9 +828,29 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     qp_params.qp_modea_wfit = io::get_value_with_default<std::string>(pt,"qp_modea_wfit","tau");
     io::tolower(qp_params.qp_modea_wfit);
     utils::check(qp_params.qp_modea_wfit=="tau" or qp_params.qp_modea_wfit=="nu"
-                 or qp_params.qp_modea_wfit=="spectral",
+                 or qp_params.qp_modea_wfit=="spectral"
+                 or qp_params.qp_modea_wfit=="contour",
                  "qpgw: unknown qp_modea_wfit: {}. Valid options: \"tau\", \"nu\", "
-                 "\"spectral\".", qp_params.qp_modea_wfit);
+                 "\"spectral\", \"contour\".", qp_params.qp_modea_wfit);
+    // TC-2 (notes/tc_coqui_impl_spec.md): the tilted-contour route, a SIBLING of the
+    // RW-2 "spectral" knob family. Every value is documented on qp_params_t.h.
+    qp_params.qp_tc_eps = io::get_value_with_default<double>(pt,"qp_tc_eps",1e-6);
+    utils::check(qp_params.qp_tc_eps > 0.0 and qp_params.qp_tc_eps < 1.0,
+                 "qpgw: qp_tc_eps = {} must be in (0, 1).", qp_params.qp_tc_eps);
+    qp_params.qp_tc_delta = io::get_value_with_default<double>(pt,"qp_tc_delta",0.0);
+    utils::check(qp_params.qp_tc_delta >= 0.0,
+                 "qpgw: qp_tc_delta = {} must be >= 0 (0 selects the eq-8 recipe).",
+                 qp_params.qp_tc_delta);
+    qp_params.qp_tc_rho = io::get_value_with_default<double>(pt,"qp_tc_rho",0.65);
+    utils::check(qp_params.qp_tc_rho >= 0.0 and qp_params.qp_tc_rho < 1.0,
+                 "qpgw: qp_tc_rho = {} must be in [0, 1).", qp_params.qp_tc_rho);
+    qp_params.qp_tc_profile =
+        io::get_value_with_default<std::string>(pt,"qp_tc_profile","flat");
+    io::tolower(qp_params.qp_tc_profile);
+    utils::check(qp_params.qp_tc_profile=="flat" or qp_params.qp_tc_profile=="growing",
+                 "qpgw: unknown qp_tc_profile: {}. Valid options: \"flat\", \"growing\".",
+                 qp_params.qp_tc_profile);
+    qp_params.qp_tc_trunc = io::get_value_with_default<bool>(pt,"qp_tc_trunc",false);
     // RW-2: the spectral-quadrature W^c representation (notes/rw_real_axis_w_spec.md).
     qp_params.qp_modea_spectral_eta =
         io::get_value_with_default<double>(pt,"qp_modea_spectral_eta",0.0125);
@@ -1211,9 +1251,29 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
     qp_params.qp_modea_wfit = io::get_value_with_default<std::string>(pt,"qp_modea_wfit","tau");
     io::tolower(qp_params.qp_modea_wfit);
     utils::check(qp_params.qp_modea_wfit=="tau" or qp_params.qp_modea_wfit=="nu"
-                 or qp_params.qp_modea_wfit=="spectral",
+                 or qp_params.qp_modea_wfit=="spectral"
+                 or qp_params.qp_modea_wfit=="contour",
                  "qpgw: unknown qp_modea_wfit: {}. Valid options: \"tau\", \"nu\", "
-                 "\"spectral\".", qp_params.qp_modea_wfit);
+                 "\"spectral\", \"contour\".", qp_params.qp_modea_wfit);
+    // TC-2 (notes/tc_coqui_impl_spec.md): the tilted-contour route, a SIBLING of the
+    // RW-2 "spectral" knob family. Every value is documented on qp_params_t.h.
+    qp_params.qp_tc_eps = io::get_value_with_default<double>(pt,"qp_tc_eps",1e-6);
+    utils::check(qp_params.qp_tc_eps > 0.0 and qp_params.qp_tc_eps < 1.0,
+                 "qpgw: qp_tc_eps = {} must be in (0, 1).", qp_params.qp_tc_eps);
+    qp_params.qp_tc_delta = io::get_value_with_default<double>(pt,"qp_tc_delta",0.0);
+    utils::check(qp_params.qp_tc_delta >= 0.0,
+                 "qpgw: qp_tc_delta = {} must be >= 0 (0 selects the eq-8 recipe).",
+                 qp_params.qp_tc_delta);
+    qp_params.qp_tc_rho = io::get_value_with_default<double>(pt,"qp_tc_rho",0.65);
+    utils::check(qp_params.qp_tc_rho >= 0.0 and qp_params.qp_tc_rho < 1.0,
+                 "qpgw: qp_tc_rho = {} must be in [0, 1).", qp_params.qp_tc_rho);
+    qp_params.qp_tc_profile =
+        io::get_value_with_default<std::string>(pt,"qp_tc_profile","flat");
+    io::tolower(qp_params.qp_tc_profile);
+    utils::check(qp_params.qp_tc_profile=="flat" or qp_params.qp_tc_profile=="growing",
+                 "qpgw: unknown qp_tc_profile: {}. Valid options: \"flat\", \"growing\".",
+                 qp_params.qp_tc_profile);
+    qp_params.qp_tc_trunc = io::get_value_with_default<bool>(pt,"qp_tc_trunc",false);
     // RW-2: the spectral-quadrature W^c representation (notes/rw_real_axis_w_spec.md).
     qp_params.qp_modea_spectral_eta =
         io::get_value_with_default<double>(pt,"qp_modea_spectral_eta",0.0125);

@@ -193,6 +193,45 @@ struct qp_params_t {
   // spacing (~1e-3 a.u. at kp222) or the evaluation rides single poles of the fit instead of
   // the eta-smoothed spectral density. The measured spacing is reported every outer iteration.
   double qp_modea_eta_far = 0.0;
+
+  // ---- increment TC-2 (notes/tc_coqui_impl_spec.md): P ON THE TILTED CONTOUR ----
+  // Reached only through qp_modea_wfit = "contour", which is a SIBLING of the RW-2
+  // "spectral" route: same knob family, same G provenance (the current QP spectrum
+  // and MOs), same downstream consumption. ENABLE-flag-free -- it is plain complex
+  // arithmetic in the existing THC kernels. With the knob absent every value below
+  // is inert and the tau/nu/spectral paths are bit-for-bit unchanged (gate TC-2-b).
+  //
+  //   qp_tc_eps      rank tolerance of the contour builder. The rank is taken at
+  //                  lambda > eps^2 lambda_max (BINDING correction 1 of
+  //                  notes/tilted_contour_validation_results.md section 2.1 -- the
+  //                  spec's own lambda > eps lambda_max delivers only sqrt(eps)),
+  //                  and the contour length uses eps_tr = eps^2 (correction 4).
+  //   qp_tc_delta    Im z of the target line, a.u. 0 selects the eq-8 recipe
+  //                  delta = eta_targ with the mesh floor 1.2 W_band / N_k.
+  //                  FLAGGED CONSTANT: the spec writes 0.7; results section 5.4
+  //                  measured the 1 %-crossing at 0.81-3.99 x that prediction,
+  //                  median 1.69, i.e. a fitted constant of ~1.2. And the adopted
+  //                  sub-meV tier samples at eta_targ, NOT 3.5 eta_targ
+  //                  (section 7.2 item 5), so there is no 3.5x continuation here.
+  //   qp_tc_rho      tan(theta) W_target / delta, in [0, 1). 0.65 is the spec's
+  //                  no-tuning value; the campaign confirmed rho* = 0.60-0.80 at
+  //                  production meshes and rho = 0.65 within 15 % of optimal for
+  //                  the semiconductor and the metal, 26 % for the wide-gap
+  //                  insulator (section 4.1a).
+  //   qp_tc_profile  "flat" (the adopted tier) or "growing" (the eq-8 growing-eta
+  //                  profile). MEASURED gain 1.00x at 8^3 rising to 1.25-2.79x at
+  //                  24^3 -- it pays only at >= 16^3 (section 4.2), so the default
+  //                  is flat.
+  //   qp_tc_trunc    band truncation along the contour: at node s only transitions
+  //                  with a(Delta) s <~ ln(1/eps) survive, so the band sums shrink.
+  //                  Measured 1.2-1.6x in the campaign, 2.1-2.6x here on the unit
+  //                  fixtures (gate TC-2-c); the deviation from the samples it
+  //                  drops is at the qp_tc_eps class.
+  double      qp_tc_eps = 1e-6;
+  double      qp_tc_delta = 0.0;
+  double      qp_tc_rho = 0.65;
+  std::string qp_tc_profile = "flat";
+  bool        qp_tc_trunc = false;
 };
 
 } // methods
