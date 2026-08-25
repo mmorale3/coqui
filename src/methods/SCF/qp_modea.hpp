@@ -1030,22 +1030,51 @@ namespace qp_modea {
    * accumulation -- it only reads its Ms out of the batch buffer instead of calling the
    * source itself, so the batching cannot reassociate the sum over J.
    */
+  /**
+   * F6: the same assembly restricted to internal states J in [J0, J1), accumulating into S.
+   * BOTH terms of eq 1 are sums over J -- the closed-form Iterm over blk.M AND the residue
+   * term -- so a J-partition distributes the whole evaluator, including the residue targets
+   * that cost ~2.66 s each at production Np (notes §14). Since J = qp*nbnd + n, a J-range on
+   * a qp boundary is exactly the qp-aligned P-slice of `modea_sigma_at_range`: ONE partition
+   * distributes storage, the Iterm and the residues together.
+   *
+   * Summing partials over any partition of [0, nJ) reproduces the whole call to the
+   * reassociation class. Pinned at `tc_f6_slice_identity`.
+   * ⚠ The census counters accumulate PER PARTITION, so a partitioned run's n_res_eval /
+   * n_res_skip are the sum over partitions (correct), but min_absReA / sigma_abs_max are
+   * per-partition maxima that the caller must reduce.
+   */
+  inline void modea_sigma_at_cdline_range(modea_ctx const &ctx, sk_block const &blk,
+                                          cd_line_ctx const &cl, ComplexType z,
+                                          nda::array<ComplexType, 2> &S,
+                                          long J0, long J1, bool accumulate);
+
   inline void modea_sigma_at_cdline(modea_ctx const &ctx, sk_block const &blk,
                                     cd_line_ctx const &cl, ComplexType z,
                                     nda::array<ComplexType, 2> &S) {
+    modea_sigma_at_cdline_range(ctx, blk, cl, z, S, 0, ctx.nJ, false);
+  }
+
+  inline void modea_sigma_at_cdline_range(modea_ctx const &ctx, sk_block const &blk,
+                                          cd_line_ctx const &cl, ComplexType z,
+                                          nda::array<ComplexType, 2> &S,
+                                          long J0, long J1, bool accumulate) {
     const long nbnd = ctx.nbnd, npk = ctx.npk, nJ = ctx.nJ;
+    utils::check(J0 >= 0 and J1 <= nJ and J0 <= J1,
+                 "modea_sigma_at_cdline_range: [{}, {}) out of range for nJ = {}.",
+                 J0, J1, nJ);
     const long off = (blk.is * ctx.nk + blk.ik) * nJ;
     utils::check(cl.on, "modea_sigma_at_cdline: the cd-line context is not prepared.");
     utils::check(bool(cl.residue) or bool(cl.residue_batch),
                  "modea_sigma_at_cdline: no residue source installed.");
 
-    S() = ComplexType(0.0);
+    if (not accumulate) S() = ComplexType(0.0);
     nda::array<ComplexType, 1> K(npk);
 
     // ---- the residue TARGET LIST, by the assembly loop's own predicate ----------------
     std::vector<long> Jt;
     std::vector<ComplexType> zt;
-    for (long J = 0; J < nJ; ++J) {
+    for (long J = J0; J < J1; ++J) {
       const double e = ctx.epsJ(off + J), f = ctx.fJ(off + J);
       const double ReA0 = (z - e).real();
       const double th0 = (std::abs(ReA0) < 1e-14) ? 0.5 : (ReA0 > 0.0 ? 1.0 : 0.0);
@@ -1081,7 +1110,7 @@ namespace qp_modea {
     };
     long it = 0;
 
-    for (long J = 0; J < nJ; ++J) {
+    for (long J = J0; J < J1; ++J) {
       const double e = ctx.epsJ(off + J), f = ctx.fJ(off + J);
       const ComplexType A = z - e;
 
@@ -1235,6 +1264,45 @@ namespace qp_modea {
   }
 
   /** Sigma^c_ab(z) for a single ABSOLUTE z (used by the anchor gate and the delta_i table). */
+  /**
+   * ---------------------------------------------------------------------------------------
+   * F6 (TC-4): THE SLICEABLE CONSUME -- Sigma^c over a RANGE of the flat pole index P.
+   * ---------------------------------------------------------------------------------------
+   * `blk.M` is (nbnd, nbnd, nJ*npk) and is OWNER-ONLY: it is the memory wall (∝ nbnd^3) and,
+   * through this contraction, the serialization wall (∝ nbnd^4) that stalled the nb100 legs
+   * and the m3d SVO map (notes/tc4_si_tier.md §13). The fix is to partition P across the
+   * block's helper group so each rank stores and contracts 1/gsize of it, and to sum the
+   * partials with ONE small (nbnd^2) reduction.
+   *
+   * This is that contraction with an explicit [P0, P1) range. Summing the partials over any
+   * partition of [0, nJ*npk) reproduces the whole to the reduction-reassociation class --
+   * pinned at `tc_f6_slice_identity`. `modea_sigma_at` is the whole-range call and is
+   * therefore UNCHANGED, bit for bit.
+   *
+   * ⚠ THE SLICE MUST BE qp-ALIGNED IN PRODUCTION. P = (qp*nbnd + n)*npk + p is qp-MAJOR, so
+   * a transfer qp owns the contiguous block [qp*nbnd*npk, (qp+1)*nbnd*npk). Stage 2 already
+   * assigns each (isym, q) pair to exactly one group member (`pair % gsize == grank`), so
+   * partitioning P along qp boundaries makes the member that COMPUTES a pair the member that
+   * STORES it -- which removes the stage-2 `reduce_in_place_n` of Mq entirely and closes the
+   * owner-only ACCUMULATE (∝ nbnd^3·nq·npk) for free, not just the consume.
+   */
+  inline void modea_sigma_at_range(modea_ctx const &ctx, sk_block const &blk, ComplexType z,
+                                   nda::array<ComplexType, 2> &S, long P0, long P1,
+                                   bool accumulate = false) {
+    const long nbnd = ctx.nbnd, nP = ctx.nJ * ctx.npk;
+    utils::check(P0 >= 0 and P1 <= nP and P0 <= P1,
+                 "modea_sigma_at_range: [{}, {}) out of range for nP = {}.", P0, P1, nP);
+    nda::array<ComplexType, 1> w(nP);
+    ctx.pole_weights(blk.is, blk.ik, z, w);
+    for (long a = 0; a < nbnd; ++a)
+      for (long b = 0; b < nbnd; ++b) {
+        ComplexType s(0.0);
+        auto Mab = blk.M(a, b, nda::range::all);
+        for (long P = P0; P < P1; ++P) s += Mab(P) * w(P);
+        if (accumulate) S(a, b) += s; else S(a, b) = s;
+      }
+  }
+
   inline void modea_sigma_at(modea_ctx const &ctx, sk_block const &blk, ComplexType z,
                              nda::array<ComplexType, 2> &S) {
     const long nbnd = ctx.nbnd, nP = ctx.nJ * ctx.npk;

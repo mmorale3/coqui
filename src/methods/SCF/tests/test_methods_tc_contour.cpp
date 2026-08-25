@@ -1208,6 +1208,166 @@ namespace bdft_tests {
   }
 
   // =====================================================================
+  //  F6 -- THE SLICEABLE CONSUME. The de-risking pin for the blk.M
+  //  partition (notes/tc4_si_tier.md §13/§15).
+  //
+  //  blk.M is owner-only and carries BOTH walls: memory ∝ nbnd³ and, through
+  //  its contraction, serialization ∝ nbnd⁴. The fix partitions the flat pole
+  //  index P (equivalently the internal state J, since P is qp-major) across
+  //  the block's helper group. This pin is the algebraic precondition for
+  //  that: summing partials over ANY partition must reproduce the whole call.
+  //
+  //  Two kernels, because the two routes have different hot paths:
+  //    (a) modea_sigma_at_range      -- the tau/route-B P-contraction
+  //    (b) modea_sigma_at_cdline_range -- the contour assembly, where BOTH
+  //        the closed-form Iterm AND the residue targets are sums over J, so
+  //        one J-partition distributes the 2.66 s/target residue work too.
+  // =====================================================================
+  TEST_CASE("tc_f6_slice_identity", "[methods][tc_contour]") {
+    auto &mpi_context = utils::make_unit_test_mpi_context();
+    if (mpi_context->comm.size() != 1) return;
+    decltype(nda::range::all) all;
+
+    auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_lih222"));
+    const int nIpts = mf->nbnd() * 2;
+    thc_reader_t thc(mf, make_thc_reader_ptree(nIpts, "", "incore", "", "bdft", 1e-8,
+                                               mf->ecutrho(), 1, 1024));
+    const long ns = mf->nspin(), Nk_ibz = mf->nkpts_ibz(), nbnd = mf->nbnd();
+    const double beta = 1000.0;
+    auto eigval = mf->eigval();
+    double e_min = 1e300, e_max = -1e300;
+    for (long s = 0; s < ns; ++s)
+      for (long k = 0; k < Nk_ibz; ++k)
+        for (long n = 0; n < nbnd; ++n) {
+          e_min = std::min(e_min, eigval(s, k, n));
+          e_max = std::max(e_max, eigval(s, k, n));
+        }
+    const double w_max = std::max(std::abs(e_min), std::abs(e_max)) + 2.0;
+
+    imag_axes_ft::IAFT ft(beta, w_max + 1.0, imag_axes_ft::dlr_basis, "high");
+    MBState mb_state(mpi_context, ft, "coqui_tc4_f6");
+    simple_dyson dyson(mf.get(), &ft);
+    mb_state.sF_skij.emplace(math::shm::make_shared_array<Array_view_4D_t>(
+        *mpi_context, {ns, Nk_ibz, nbnd, nbnd}));
+    mb_state.sDm_skij.emplace(math::shm::make_shared_array<Array_view_4D_t>(
+        *mpi_context, {ns, Nk_ibz, nbnd, nbnd}));
+    mb_state.sG_tskij.emplace(math::shm::make_shared_array<Array_view_5D_t>(
+        *mpi_context, {ft.nt_f(), ns, Nk_ibz, nbnd, nbnd}));
+    mb_state.sSigma_tskij.emplace(math::shm::make_shared_array<Array_view_5D_t>(
+        *mpi_context, {ft.nt_f(), ns, Nk_ibz, nbnd, nbnd}));
+    hamilt::set_fock(*mf, dyson.PSP(), mb_state.sF_skij.value(), true);
+    if (mpi_context->node_comm.root()) mb_state.sSigma_tskij.value().local() = ComplexType(0.0);
+    mb_state.sSigma_tskij.value().communicator()->barrier();
+    double mu = 0.0;
+    update_G(dyson, *mf, ft, mb_state.sDm_skij.value(), mb_state.sG_tskij.value(),
+             mb_state.sF_skij.value(), mb_state.sSigma_tskij.value(), mu, false);
+    solvers::scr_coulomb_t scr_im(&ft, "rpa", "ignore_g0");
+    scr_im.update_w(mb_state, thc, -1);
+
+    auto sE = math::shm::make_shared_array<Array_view_3D_t>(
+        *mpi_context, {ns, Nk_ibz, nbnd});
+    auto sMO = math::shm::make_shared_array<Array_view_4D_t>(
+        *mpi_context, {ns, Nk_ibz, nbnd, nbnd});
+    if (mpi_context->node_comm.root()) {
+      sE.local() = ComplexType(0.0);
+      sMO.local() = ComplexType(0.0);
+      for (long s = 0; s < ns; ++s)
+        for (long k = 0; k < Nk_ibz; ++k)
+          for (long n = 0; n < nbnd; ++n) {
+            sE.local()(s, k, n) = ComplexType(eigval(s, k, n), 0.0);
+            sMO.local()(s, k, n, n) = ComplexType(1.0, 0.0);
+          }
+    }
+    sE.communicator()->barrier();
+    sMO.communicator()->barrier();
+
+    qp_modea::modea_ctx ctx;
+    qp_modea::modea_opts opts;
+    opts.wfit = "tau";
+    opts.level = 3;
+    opts.cd_bfactor = "recompute";
+    qp_modea::build_modea_context(ctx, mb_state, thc, sMO, sE, mu, ft, opts,
+                                  "ignore_g0", false);
+    REQUIRE(ctx.blocks.size() > 0);
+    auto const &blk = ctx.blocks[0];
+    const long nP = ctx.nJ * ctx.npk;
+    const double zr = 0.5 * (ctx.vbm + ctx.cbm);
+    const ComplexType z(zr, 0.0);
+
+    // ---- (a) the tau/route-B P-contraction ------------------------------
+    nda::array<ComplexType, 2> Sfull(nbnd, nbnd), Spart(nbnd, nbnd);
+    qp_modea::modea_sigma_at(ctx, blk, z, Sfull);
+    double worst_a = 0.0, mag_a = 0.0;
+    std::string trail_a;
+    for (long G : {2L, 3L, 5L, 8L}) {
+      Spart() = ComplexType(0.0);
+      for (long g = 0; g < G; ++g) {
+        const long P0 = (nP * g) / G, P1 = (nP * (g + 1)) / G;
+        qp_modea::modea_sigma_at_range(ctx, blk, z, Spart, P0, P1, true);
+      }
+      double num = 0.0, den = 0.0;
+      for (long i = 0; i < nbnd; ++i)
+        for (long j = 0; j < nbnd; ++j) {
+          num = std::max(num, std::abs(Spart(i, j) - Sfull(i, j)));
+          den = std::max(den, std::abs(Sfull(i, j)));
+        }
+      worst_a = std::max(worst_a, num);
+      mag_a = std::max(mag_a, den);
+      trail_a += std::format("  G={}: {:.3e}", G, den > 0.0 ? num / den : 0.0);
+    }
+
+    // ---- (b) the CONTOUR assembly, partitioned over J --------------------
+    // Both eq-1 terms are sums over J, so ONE J-partition distributes the
+    // Iterm AND the residue targets.
+    qp_modea::cd_line_opts clo;
+    clo.on = true;
+    clo.delta = 0.0;
+    qp_modea::cd_line_ctx clf, clp;
+    qp_modea::cd_line_prepare(clf, ctx, clo);
+    clf.residue = qp_modea::fit_residue_source(ctx, ctx.blocks);
+    qp_modea::cd_line_prepare(clp, ctx, clo);
+    clp.residue = qp_modea::fit_residue_source(ctx, ctx.blocks);
+
+    nda::array<ComplexType, 2> Cfull(nbnd, nbnd), Cpart(nbnd, nbnd);
+    qp_modea::modea_sigma_at_cdline(ctx, blk, clf, z, Cfull);
+    double worst_b = 0.0, mag_b = 0.0;
+    std::string trail_b;
+    for (long G : {2L, 3L, 5L, 8L}) {
+      Cpart() = ComplexType(0.0);
+      for (long g = 0; g < G; ++g) {
+        const long J0 = (ctx.nJ * g) / G, J1 = (ctx.nJ * (g + 1)) / G;
+        qp_modea::modea_sigma_at_cdline_range(ctx, blk, clp, z, Cpart, J0, J1, true);
+      }
+      double num = 0.0, den = 0.0;
+      for (long i = 0; i < nbnd; ++i)
+        for (long j = 0; j < nbnd; ++j) {
+          num = std::max(num, std::abs(Cpart(i, j) - Cfull(i, j)));
+          den = std::max(den, std::abs(Cfull(i, j)));
+        }
+      worst_b = std::max(worst_b, num);
+      mag_b = std::max(mag_b, den);
+      trail_b += std::format("  G={}: {:.3e}", G, den > 0.0 ? num / den : 0.0);
+    }
+
+    // the residue census must be PARTITION-INVARIANT: the same targets are
+    // evaluated, only grouped differently.
+    const long ev_full = clf.n_res_eval, ev_part = clp.n_res_eval;
+
+    app_log(2, "[F6 slice] qe_lih222 block ({},{}): nJ = {}, npk = {}, nP = {}. "
+               "(a) tau P-contraction, partials vs whole:{}  -> worst {:.3e} over "
+               "max|Sigma| = {:.4g}. (b) CONTOUR assembly partitioned over J:{}  -> "
+               "worst {:.3e} over max|Sigma| = {:.4g}. Residue evaluations: whole {} vs "
+               "partitioned {} over the 4 partitions (must be 4x the whole -- the same "
+               "targets, regrouped).",
+            blk.is, blk.ik, ctx.nJ, ctx.npk, nP, trail_a, worst_a, mag_a,
+            trail_b, worst_b, mag_b, ev_full, ev_part);
+
+    REQUIRE(worst_a / std::max(mag_a, 1e-300) < 1e-14);
+    REQUIRE(worst_b / std::max(mag_b, 1e-300) < 1e-14);
+    REQUIRE(ev_part == 4 * ev_full);   // 4 partitions, same target set each time
+  }
+
+  // =====================================================================
   //  TC-4 -- THE EXPLICIT STRIP WINDOW (qp_modea_strip_lo / _hi).
   //
   //  Two pins, on the TAU route: the strip machinery lives in strip_of /
@@ -1390,6 +1550,75 @@ namespace bdft_tests {
     REQUIRE(dcl > 1e-12);        // and it is not a no-op
     REQUIRE(dback == 0.0);       // unset restores the default exactly
     REQUIRE(n_in_ref < nbnd);    // the fixture really is strip-limited by default
+
+    // =================================================================
+    //  DIAGNOSTIC (not a gate): WAS THE TC-3 @@MODEA_GAP PIN ITSELF
+    //  CLAMP-MEASURED? The +54.5 meV contour-vs-ac_pade number of the
+    //  TC-3 report is read from the per-k HOMO/LUMO of this fixture. If
+    //  those states are OUT of the default strip, that pin is measuring
+    //  Sigma^c(mu) for the very states that define it.
+    //  Census EVERY block at the DEFAULT strip.
+    // =================================================================
+    {
+      long nb_tot = 0, n_in_tot = 0, n_homo_out = 0, n_lumo_out = 0;
+      long vbm_blk = -1, vbm_a = -1, cbm_blk = -1, cbm_a = -1;
+      double vbm_e = -1e300, cbm_e = 1e300;
+      for (std::size_t bi = 0; bi < ctx.blocks.size(); ++bi) {
+        auto const &b = ctx.blocks[bi];
+        long homo = -1, lumo = -1;
+        for (long a = 0; a < nbnd; ++a) {
+          const double e = sE.local()(b.is, b.ik, a).real();
+          if (e < ctx.mu and (homo < 0 or e > sE.local()(b.is, b.ik, homo).real())) homo = a;
+          if (e >= ctx.mu and (lumo < 0 or e < sE.local()(b.is, b.ik, lumo).real())) lumo = a;
+          if (e >= lo_ref and e <= hi_ref) ++n_in_tot;
+          ++nb_tot;
+          if (e < ctx.mu and e > vbm_e) { vbm_e = e; vbm_blk = long(bi); vbm_a = a; }
+          if (e >= ctx.mu and e < cbm_e) { cbm_e = e; cbm_blk = long(bi); cbm_a = a; }
+        }
+        if (homo >= 0) {
+          const double eh = sE.local()(b.is, b.ik, homo).real();
+          if (eh < lo_ref or eh > hi_ref) ++n_homo_out;
+        }
+        if (lumo >= 0) {
+          const double el = sE.local()(b.is, b.ik, lumo).real();
+          if (el < lo_ref or el > hi_ref) ++n_lumo_out;
+        }
+      }
+      const bool vbm_in = (vbm_e >= lo_ref and vbm_e <= hi_ref);
+      const bool cbm_in = (cbm_e >= lo_ref and cbm_e <= hi_ref);
+      app_log(2, "[TC-4 strip/TC-3 audit] qe_lih222 DEFAULT strip ({:+.6f}, {:+.6f}) a.u. "
+                 "over ALL {} blocks: IN-STRIP {} of {} states ({:.1f}%). THE JUDGE STATES: "
+                 "per-k HOMO out of strip in {} of {} blocks, per-k LUMO in {} of {}. "
+                 "GLOBAL VBM (block {}, band {}, eps-mu = {:+.4f} eV) is {}; GLOBAL CBM "
+                 "(block {}, band {}, eps-mu = {:+.4f} eV) is {}.",
+              lo_ref, hi_ref, ctx.blocks.size(), n_in_tot, nb_tot,
+              100.0 * double(n_in_tot) / double(std::max(1L, nb_tot)),
+              n_homo_out, ctx.blocks.size(), n_lumo_out, ctx.blocks.size(),
+              vbm_blk, vbm_a, (vbm_e - ctx.mu) * 27.211386245988,
+              vbm_in ? "IN STRIP" : "*** OUT OF STRIP (clamped to mu) ***",
+              cbm_blk, cbm_a, (cbm_e - ctx.mu) * 27.211386245988,
+              cbm_in ? "IN STRIP" : "*** OUT OF STRIP (clamped to mu) ***");
+      // TWO SEPARATE QUESTIONS, and conflating them would overstate the finding:
+      //  (1) are the states that DEFINE the metric evaluated exactly?
+      //  (2) was the self-consistent map they were read from built with those states
+      //      -- and the rest of the spectrum -- evaluated exactly?
+      app_log(2, "[TC-4 strip/TC-3 audit] VERDICT (1) THE METRIC STATES: the @@MODEA_GAP "
+                 "fundamental gap is global VBM -> global CBM, and both are {}. So the "
+                 "+54.5 meV contour-vs-ac_pade number is {} a direct clamp artefact.",
+              (vbm_in and cbm_in) ? "IN STRIP (evaluated exactly, eta -> 0)"
+                                  : "NOT both in strip",
+              (vbm_in and cbm_in) ? "NOT" : "PARTLY");
+      app_log(2, "[TC-4 strip/TC-3 audit] VERDICT (2) THE MAP THEY WERE READ FROM: {} of {} "
+                 "states ({:.1f}%) were clamped to mu, and per-k HOMO/LUMO were clamped in "
+                 "{}/{} of {} blocks. Those all feed H_eff through self-consistency, so the "
+                 "pin is NOT clamp-FREE either: the metric states are exact, the map around "
+                 "them is not. Re-taking it with an explicit window is worth doing, but it "
+                 "is a SECOND-ORDER correction here -- unlike si444/nb60, where the band "
+                 "edges THEMSELVES were clamped and the metric was first-order invalid.",
+              nb_tot - n_in_tot, nb_tot,
+              100.0 * double(nb_tot - n_in_tot) / double(std::max(1L, nb_tot)),
+              n_homo_out, n_lumo_out, ctx.blocks.size());
+    }
   }
 
   // =====================================================================
