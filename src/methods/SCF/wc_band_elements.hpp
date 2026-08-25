@@ -2124,8 +2124,7 @@ namespace qp_modea {
       blk.is = is;
       blk.ik = ik;
       if (own) {
-        blk.M = nda::array<ComplexType, 3>(nbnd, nbnd, nP_flat);
-        blk.M() = ComplexType(0.0);
+        blk.alloc_poles(nbnd, nP_flat);
       }
       // ---- TC-3/TC-4: the eq-1 residue source's band factors -------------------------
       // Built here for the block's WHOLE star, in its own loop over (isym, q). It does
@@ -2369,7 +2368,7 @@ namespace qp_modea {
               for (long p = 0; p < npk; ++p) {
                 const long Pf = (qp * nbnd + n) * npk + p;
                 for (long a = 0; a < nbnd; ++a)
-                  for (long b = 0; b < nbnd; ++b) blk.M(a, b, Pf) += Mq(n, a, b, p);
+                  for (long b = 0; b < nbnd; ++b) blk.add_pole(a, b, Pf, Mq(n, a, b, p));
               }
           }
         }
@@ -2391,7 +2390,8 @@ namespace qp_modea {
       if (own) {
         if (need_diag)
           for (long a = 0; a < nbnd; ++a)
-            for (long Pf = 0; Pf < nP_flat; ++Pf) ctx.Mdiag(is, ik, a, Pf) = blk.M(a, a, Pf);
+            for (long Pf = 0; Pf < nP_flat; ++Pf)
+              ctx.Mdiag(is, ik, a, Pf) = blk.pole_diag(a, Pf);   // LOCAL read
         ctx.blocks.push_back(std::move(blk));
         if (bst) ctx.bstore.push_back(std::move(bs));
       }

@@ -432,7 +432,7 @@ namespace {
             for (long J = 0; J < ctx->nJ; ++J) {
               const double eJ = ctx->epsJ(offJ + J), fJ = ctx->fJ(offJ + J);
               for (long p = 0; p < ctx->npk; ++p) {
-                const ComplexType Mii = blk->M(i, i, J * ctx->npk + p);
+                const ComplexType Mii = blk->pole_diag(i, J * ctx->npk + p);  // LOCAL read
                 const double w = ctx->nB(p) + fJ;
                 const double num = std::abs(Mii) * std::abs(w);
                 const double den = std::abs(z - ComplexType(eJ - ctx->om(p), 0.0));

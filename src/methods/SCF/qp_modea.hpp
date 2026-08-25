@@ -334,10 +334,119 @@ namespace qp_modea {
    *  class. Measured headroom on lih222 is three orders, so 10x is generous. NOT a tunable. */
   inline constexpr double modea_tau_anchor_mult = 10.0;
 
-  /** per-external-(s,k) cached residue slab. */
-  struct sk_block {
+  /**
+   * ---------------------------------------------------------------------------------------
+   * per-external-(s,k) cached residue slab -- ENCAPSULATED (F6 part 2, TC-4)
+   * ---------------------------------------------------------------------------------------
+   * M(a, b, P) with the flat pole index P = (q'*nbnd + n)*npk + p, 1/nk folded in.
+   *
+   * ⚠ WHY THIS IS A CLASS AND NOT A STRUCT WITH A PUBLIC ARRAY.
+   * This store is the mode-A memory wall (∝ nbnd^3, owner-only) and, through its
+   * contraction, the serialization wall (∝ nbnd^4) that stalled the nb100 legs and the m3d
+   * SVO map (notes/tc4_si_tier.md §13). The fix is to PARTITION P across the block's helper
+   * group, which turns every read into a partial sum needing a collective -- and a partial
+   * sum whose collective is MISSED, in a branch no gate reaches, is a silent hang. That is
+   * the m3d/thc.Z failure one level up.
+   *
+   * When M was a public array the consumer list was "whatever grep finds", and grep found
+   * NINE sites across three files and TWO routes (mode A and mode B). It is private now so
+   * that the COMPILER enumerates them: every read must go through one of the accessors
+   * below, each of which carries an explicit collective contract.
+   *
+   *   pole(a,b,P) / pole_diag(i,P)   LOCAL reads. Under slicing, valid only for P inside
+   *                                  this rank's range -- checked when sliced.
+   *   contract_elem(a,b,w,P0,P1)     THE CONTRACTION, and THE COLLECTIVE-CONTRACT CARRIER.
+   *                                  Returns this rank's PARTIAL sum over [P0,P1) ∩ slice.
+   *                                  Under slicing every call site must be paired with the
+   *                                  owner's op-broadcast and the group reduction, at a
+   *                                  point whose collective count is fixed by the sweep
+   *                                  index and NOT by per-state work.
+   *   alloc_poles / add_pole         stage 2 of build_modea_context ONLY.
+   *
+   * THIS INCREMENT IS ENCAPSULATION ONLY: no slicing is performed, `sliced()` is false
+   * everywhere, and every accessor reduces to exactly the loop it replaced -- bit for bit
+   * (gate: the whole suite, @@MODEA_GAP and the F6 pins reproduce with zero change).
+   */
+  class sk_block {
+   public:
     long is = -1, ik = -1;
-    nda::array<ComplexType, 3> M;   // (nbnd, nbnd, nJ*npk) residues, 1/nk folded in
+
+    // ---- construction: stage 2 of build_modea_context ONLY -----------------------------
+    void alloc_poles(long nbnd, long nP) {
+      M_ = nda::array<ComplexType, 3>(nbnd, nbnd, nP);
+      M_() = ComplexType(0.0);
+      nP_total_ = nP;
+      P_lo_ = 0;
+      P_hi_ = nP;
+      sliced_ = false;
+    }
+    /** accumulate one residue into the store (stage-2 fill). */
+    void add_pole(long a, long b, long P, ComplexType v) { M_(a, b, local(P)) += v; }
+
+    // ---- LOCAL reads -------------------------------------------------------------------
+    ComplexType pole(long a, long b, long P) const {
+      if (sliced_) return M_(a, b, local(P));
+      return M_(a, b, P);
+    }
+    ComplexType pole_diag(long i, long P) const { return pole(i, i, P); }
+
+    /**
+     * THE CONTRACTION. s = sum_P M(a,b,P) w(P) over [P0, P1) intersected with this rank's
+     * slice -- i.e. a PARTIAL sum once sliced, the whole sum while it is not.
+     * ⚠ Every call site is a collective-contract site under slicing. See the class note.
+     */
+    ComplexType contract_elem(long a, long b, nda::array<ComplexType, 1> const &w,
+                              long P0, long P1) const {
+      ComplexType s(0.0);
+      auto Mab = M_(a, b, nda::range::all);
+      if (not sliced_) {
+        for (long P = P0; P < P1; ++P) s += Mab(P) * w(P);
+        return s;
+      }
+      const long lo = std::max(P0, P_lo_), hi = std::min(P1, P_hi_);
+      for (long P = lo; P < hi; ++P) s += Mab(P - P_lo_) * w(P);
+      return s;
+    }
+
+    long nP_total() const { return nP_total_; }
+    long P_lo() const { return P_lo_; }
+    long P_hi() const { return P_hi_; }
+    bool sliced() const { return sliced_; }
+    bool has_poles() const { return M_.size() > 0; }
+
+    /**
+     * ⚠ THE ONE CHECKPOINT (F6 part 2 entry point; not called yet).
+     * Declaring a slice is the ONLY way to become sliced, so this is where the stored
+     * band-factor incompatibility is caught -- a hard abort naming the reason, not an
+     * unsupported-by-convention state.
+     */
+    void set_slice(long P0, long P1, bool band_factors_stored) {
+      utils::check(not band_factors_stored,
+                   "qp_modea (F6): a P-SLICED residue store cannot be combined with STORED "
+                   "band factors (qp_tc_bfactor = \"store\"). B is nJ x Np x nbnd and is NOT "
+                   "sliced, so a sliced run would keep the FULL B on every rank and "
+                   "re-create the very memory wall the slice exists to remove. Use "
+                   "qp_tc_bfactor = \"auto\" or \"recompute\" (the production default), or "
+                   "slice B over J in step with the residue store first.");
+      utils::check(P0 >= 0 and P1 <= nP_total_ and P0 <= P1,
+                   "qp_modea (F6): slice [{}, {}) out of range for nP = {}.",
+                   P0, P1, nP_total_);
+      P_lo_ = P0;
+      P_hi_ = P1;
+      sliced_ = (P0 != 0 or P1 != nP_total_);
+    }
+
+   private:
+    long local(long P) const {
+      utils::check(P >= P_lo_ and P < P_hi_,
+                   "qp_modea (F6): pole index {} is outside this rank's slice [{}, {}). A "
+                   "LOCAL accessor was used for a pole this rank does not hold.",
+                   P, P_lo_, P_hi_);
+      return P - P_lo_;
+    }
+    nda::array<ComplexType, 3> M_;   // (nbnd, nbnd, P_hi_ - P_lo_)
+    long nP_total_ = 0, P_lo_ = 0, P_hi_ = 0;
+    bool sliced_ = false;
   };
 
   /** diagnostics collected once per context build (all logged, none of them a gate). */
@@ -1011,11 +1120,12 @@ namespace qp_modea {
       for (size_t b = 0; b < blocks.size(); ++b)
         if (blocks[b].is == is and blocks[b].ik == ik) { bi = long(b); break; }
       utils::check(bi >= 0, "fit_residue_source: no block ({}, {}).", is, ik);
-      auto const &M = blocks[size_t(bi)].M;
+      auto const &B = blocks[size_t(bi)];
       for (long a = 0; a < nbnd; ++a)
         for (long b = 0; b < nbnd; ++b) {
           ComplexType s(0.0);
-          for (long p = 0; p < npk; ++p) s += M(a, b, J * npk + p) / (z - ctx.om(p));
+          for (long p = 0; p < npk; ++p)
+            s += B.pole(a, b, J * npk + p) / (z - ctx.om(p));   // LOCAL: J is this rank's
           Ms(a, b) = s;
         }
     };
@@ -1124,7 +1234,7 @@ namespace qp_modea {
       for (long a = 0; a < nbnd; ++a)
         for (long b = 0; b < nbnd; ++b) {
           ComplexType s(0.0);
-          for (long p = 0; p < npk; ++p) s += blk.M(a, b, J * npk + p) * K(p);
+          for (long p = 0; p < npk; ++p) s += blk.pole(a, b, J * npk + p) * K(p);
           S(a, b) += s;
         }
 
@@ -1214,8 +1324,7 @@ namespace qp_modea {
         if (cdl_on) {
           s = Srow(a, b);
         } else {
-          auto Mab = blk.M(a, b, nda::range::all);
-          for (long P = 0; P < nP; ++P) s += Mab(P) * w(P);
+          s = blk.contract_elem(a, b, w, 0, nP);   // COLLECTIVE-CONTRACT SITE once sliced
         }
         D(a, b) = s;
         if (cc != nullptr and far(a) == 1)
@@ -1231,8 +1340,7 @@ namespace qp_modea {
         if (cdl_on) {
           s = Srow(a, b);
         } else {
-          auto Mab = blk.M(a, b, nda::range::all);
-          for (long P = 0; P < nP; ++P) s += Mab(P) * w(P);
+          s = blk.contract_elem(a, b, w, 0, nP);   // COLLECTIVE-CONTRACT SITE once sliced
         }
         Dp(a, b) = s;
         if (cc != nullptr and far(b) == 1)
@@ -1296,9 +1404,7 @@ namespace qp_modea {
     ctx.pole_weights(blk.is, blk.ik, z, w);
     for (long a = 0; a < nbnd; ++a)
       for (long b = 0; b < nbnd; ++b) {
-        ComplexType s(0.0);
-        auto Mab = blk.M(a, b, nda::range::all);
-        for (long P = P0; P < P1; ++P) s += Mab(P) * w(P);
+        const ComplexType s = blk.contract_elem(a, b, w, P0, P1);
         if (accumulate) S(a, b) += s; else S(a, b) = s;
       }
   }
@@ -1309,12 +1415,8 @@ namespace qp_modea {
     nda::array<ComplexType, 1> w(nP);
     ctx.pole_weights(blk.is, blk.ik, z, w);
     for (long a = 0; a < nbnd; ++a)
-      for (long b = 0; b < nbnd; ++b) {
-        ComplexType s(0.0);
-        auto Mab = blk.M(a, b, nda::range::all);
-        for (long P = 0; P < nP; ++P) s += Mab(P) * w(P);
-        S(a, b) = s;
-      }
+      for (long b = 0; b < nbnd; ++b)
+        S(a, b) = blk.contract_elem(a, b, w, 0, nP);   // COLLECTIVE-CONTRACT SITE
   }
 
   /** the anti-Hermitian residual of a raw map, max|V - V^dag| / max|V|. */
@@ -1336,10 +1438,7 @@ namespace qp_modea {
     nda::array<ComplexType, 1> w(nP);
     const double md = ctx.pole_weights(blk.is, blk.ik, z, w);
     if (min_den != nullptr) *min_den = md;
-    ComplexType s(0.0);
-    auto Mii = blk.M(i, i, nda::range::all);
-    for (long P = 0; P < nP; ++P) s += Mii(P) * w(P);
-    return s;
+    return blk.contract_elem(i, i, w, 0, nP);   // COLLECTIVE-CONTRACT SITE once sliced
   }
 
   /**
@@ -1562,7 +1661,7 @@ namespace qp_modea {
     for (long J = 0; J < nJ; ++J) {
       const double e = ctx.epsJ(off + J), f = ctx.fJ(off + J);
       for (long p = 0; p < npk; ++p) {
-        const ComplexType R = blk.M(a, b, J * npk + p) * (ctx.nB(p) + f);
+        const ComplexType R = blk.pole(a, b, J * npk + p) * (ctx.nB(p) + f);
         const double E = e - ctx.om(p);
         for (long i = 0; i < nt; ++i) out(i) += R * g(E, tau(i));
       }
@@ -1604,7 +1703,7 @@ namespace qp_modea {
       if (s < 0 or s >= out.shape(0)) continue;
       const double e = ctx.epsJ(off + J), f = ctx.fJ(off + J);
       for (long p = 0; p < npk; ++p) {
-        const ComplexType R = blk.M(a, b, J * npk + p) * (ctx.nB(p) + f);
+        const ComplexType R = blk.pole(a, b, J * npk + p) * (ctx.nB(p) + f);
         const double E = e - ctx.om(p);
         for (long i = 0; i < nt; ++i) out(s, i) += R * g(E, tau(i));
       }

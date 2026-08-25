@@ -1362,9 +1362,35 @@ namespace bdft_tests {
             blk.is, blk.ik, ctx.nJ, ctx.npk, nP, trail_a, worst_a, mag_a,
             trail_b, worst_b, mag_b, ev_full, ev_part);
 
+    // ---- (c) ACCESSOR EXACTNESS -- the encapsulation's own bit-identity statement ----
+    // contract_elem() takes the ROW-VIEW path (textually the loop it replaced); pole()
+    // takes the per-element path. They are independent implementations over the same
+    // data, so exact agreement is the statement "the accessors reduce to the loop they
+    // replaced". It is a WITHIN-RUN check and therefore immune to this tree's
+    // PRE-EXISTING run-to-run nondeterminism (the randomized W^c slab sketch,
+    // qp_modea_wsketch = 0 = automatic), which makes a cross-build byte comparison
+    // impossible for reasons that have nothing to do with this refactor.
+    double d_acc = 0.0, m_acc = 0.0;
+    {
+      nda::array<ComplexType, 1> w(nP);
+      ctx.pole_weights(blk.is, blk.ik, z, w);
+      for (long a = 0; a < nbnd; ++a)
+        for (long b = 0; b < nbnd; ++b) {
+          ComplexType ref(0.0);
+          for (long P = 0; P < nP; ++P) ref += blk.pole(a, b, P) * w(P);
+          const ComplexType got = blk.contract_elem(a, b, w, 0, nP);
+          d_acc = std::max(d_acc, std::abs(got - ref));
+          m_acc = std::max(m_acc, std::abs(ref));
+        }
+    }
+    app_log(2, "[F6 slice] ACCESSOR EXACTNESS: contract_elem (row-view path) vs pole() "
+               "(per-element path) over all {}x{} elements: max|d| = {:.3e} over "
+               "max|S| = {:.4g} (gate: EXACTLY 0).", nbnd, nbnd, d_acc, m_acc);
+
     REQUIRE(worst_a / std::max(mag_a, 1e-300) < 1e-14);
     REQUIRE(worst_b / std::max(mag_b, 1e-300) < 1e-14);
     REQUIRE(ev_part == 4 * ev_full);   // 4 partitions, same target set each time
+    REQUIRE(d_acc == 0.0);             // the accessors ARE the loop they replaced
   }
 
   // =====================================================================
