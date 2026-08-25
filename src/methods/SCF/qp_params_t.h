@@ -309,6 +309,47 @@ struct qp_params_t {
   //   grows with |eps - mu| and the deep conduction tail dominates).
   double      qp_modea_strip_lo = 0.0;
   double      qp_modea_strip_hi = 0.0;
+  // ---- TC-5: THE AMORTIZED W^c TILE CACHE (methods/SCF/wc_grid.hpp) ----
+  //   ⚠ THE KNOB IS THE ACCURACY TARGET, NOT THE GRID SPACING.
+  //   qp_tc_wgrid_mev   the ABSOLUTE residue-tier accuracy target in meV
+  //                     (default 1.0). h is derived from the MEASURED sizing law
+  //                        dSigma[meV] = K (h/delta)^p / delta[eV],  p = 2.81,
+  //                     with K = 32.4 (SVO's -- conservative for ANY system by
+  //                     ruling; no metallicity auto-detection), a 3x safety
+  //                     factor for the measured fit spread, and h clamped to
+  //                     delta/2 (past which the 3-point stencil overshoots and
+  //                     can be worse than linear).
+  //                     0 DISABLES the cache and restores the per-target Np^3
+  //                     Dyson path exactly -- the identity pin's reference.
+  //                     [notes/tilted_contour_validation_results.md section 8]
+  //   qp_tc_wgrid_h     EXPERT override: h directly, a.u. > 0 bypasses the law.
+  //   qp_tc_wgrid_audit samples per (q, outer iteration) at which W^c is
+  //                     evaluated EXACTLY and compared with the interpolation
+  //                     (default 16; 0 = off, NOT recommended).
+  //                     ⚠ WHY IT EXISTS: section 8.7 measured K/|Sigma| spanning
+  //                     1.3-417. On a spectrum whose weight is CONCENTRATED on a
+  //                     single in-range pole a fixed constant is wrong by 75x and
+  //                     NOTHING in the sizing inputs reveals it -- the grid is
+  //                     silently under-resolved and Sigma still looks plausible.
+  //                     The law sizes; the sample proves.
+  //   qp_tc_wgrid_audit_hard  (default true) ABORT when the measured error
+  //                     exceeds 10x the target. Failure behaviour is defined:
+  //                     always log predicted-vs-measured and the worst (q, Re z);
+  //                     WARN and continue up to 10x; HARD ABORT above it, because
+  //                     an order-of-magnitude breach means every downstream number
+  //                     is untrustworthy. Set false to push through deliberately
+  //                     on a diagnostic run.
+  //                     ⚠ HARVESTABLE: the audit result is carried into the
+  //                     [Q6] qpgw summary line as
+  //                         wgrid_aud = <measured>/<predicted> meV (worst q = ..,
+  //                                     Re z = ..)
+  //                     -- measured FIRST -- so a breach is actionable from the
+  //                     log alone and harvest scripts can grep `wgrid_aud`.
+  //                     Both values read -1 when the cache or the audit is off.
+  double      qp_tc_wgrid_mev = 1.0;
+  double      qp_tc_wgrid_h = 0.0;
+  long        qp_tc_wgrid_audit = 16;
+  bool        qp_tc_wgrid_audit_hard = true;
 };
 
 } // methods

@@ -2468,8 +2468,93 @@ namespace qp_modea {
                                         + 2.0 * double(NP) * double(NP));
       const long batch_max = std::max(1L, long(opts.cd_batch_mb * 1.048576e6 / per_target));
       ctx.cdl->batch_max = batch_max;
+      // ================= TC-5: THE AMORTIZED W^c TILE CACHE ======================
+      // W^c(omega + i delta) is delta-smooth, so build it ONCE on a target-line
+      // grid and interpolate, instead of one Np^3 Dyson per scattered residue
+      // target. Sized from the MEASURED law (notes/tilted_contour_validation_
+      // results.md section 8), filled HERE -- the lockstep point next to
+      // gather_Z_tiles -- and AUDITED, because section 8.7 showed the law's
+      // constant is not universal.
+      std::shared_ptr<wc_grid::wc_grid_t> wgrid;
+      wc_grid::wgrid_audit_t waudit;
+      if (opts.wgrid_mev > 0.0) {
+        // ⚠ zmax FROM THE STRIP WINDOW, not from E_PH. A CLAMPED state sits at
+        // z = mu where sigma_J vanishes identically and contributes NO residue
+        // target, so only IN-STRIP evaluation energies bound the target set.
+        const auto strip = qp_modea::strip_of(ctx);
+        double Elo = 1e300, Ehi = -1e300;
+        for (long is2 = 0; is2 < ns; ++is2)
+          for (long ik2 = 0; ik2 < nk_ibz; ++ik2)
+            for (long a = 0; a < nbnd; ++a) {
+              const double e = sE_ska.local()(is2, ik2, a).real();
+              Elo = std::min(Elo, e);
+              Ehi = std::max(Ehi, e);
+            }
+        const double wlo = strip.active ? std::max(strip.lo, Elo) : Elo;
+        const double whi = strip.active ? std::min(strip.hi, Ehi) : Ehi;
+        double eJlo = 1e300, eJhi = -1e300;
+        for (long i = 0; i < ctx.epsJ.size(); ++i) {
+          eJlo = std::min(eJlo, ctx.epsJ(i));
+          eJhi = std::max(eJhi, ctx.epsJ(i));
+        }
+        const double zmax = std::max(std::abs(eJhi - wlo), std::abs(eJlo - whi));
+        auto geom = wc_grid::size_wc_grid(opts.wgrid_mev, pctx->geom.delta, zmax,
+                                          opts.wgrid_h);
+        app_log(lvl, "  - TC-5 grid window:            in-strip omega in [{:.6g}, {:.6g}] "
+                     "a.u. ({}), eps_J in [{:.6g}, {:.6g}] -> |Re z| <= {:.6g} a.u. "
+                     "({:.4g} eV)", wlo, whi,
+                strip.active ? "STRIP-BOUNDED" : "strip inactive: full QP range",
+                eJlo, eJhi, zmax, zmax * 27.211386245988);
+        wgrid = wc_grid::fill_wc_grid(thc, *sZq, *sPc, *tf, geom, pctx->c.rank, lvl);
+
+        // ---- the audit: samples partitioned, measured LOCALLY, reduced, THEN judged
+        if (opts.wgrid_audit > 0 and ctx.bstore.size() > 0 and ctx.nJ > 0) {
+          auto const &bs0 = ctx.bstore[0];
+          std::vector<double> zs;
+          std::vector<long> qs;
+          const long nsamp = opts.wgrid_audit;
+          auto [a0, a1] = itertools::chunk_range(0, nsamp, mpi->comm.size(),
+                                                 mpi->comm.rank());
+          // ⚠ SAMPLE THE CONTRIBUTING TARGETS ONLY. A J with sigma_J = 0 is never
+          // evaluated, and eps_J - omega for such a J can land outside the grid --
+          // auditing there measures an extrapolation nobody performs. Use the SAME
+          // predicate and the SAME span the grid was sized from.
+          const long off0 = (ctx.blocks.empty() ? 0
+                             : (ctx.blocks[0].is * nk_ibz + ctx.blocks[0].ik)) * ctx.nJ;
+          for (long t = a0; t < a1; ++t) {
+            for (long trial = 0; trial < 4 * ctx.nJ; ++trial) {
+              const long J = ((t + trial) * 7919L + 13L) % ctx.nJ;
+              const double om = wlo + (double((t + trial) % 17) / 16.0) * (whi - wlo);
+              const double eJ = ctx.epsJ(off0 + J), fJ = ctx.fJ(off0 + J);
+              const double sg = ((om > eJ) ? 1.0 : 0.0) - fJ;
+              if (std::abs(sg) < 1e-14) continue;          // sigma_J = 0: never evaluated
+              const double zr = eJ - om;
+              if (std::abs(zr) > zmax) continue;           // outside the sized grid
+              zs.push_back(zr);
+              qs.push_back(bs0.qs_of_J(J));
+              break;
+            }
+          }
+          waudit = wc_grid::audit_wc_grid(*wgrid, thc, *sZq, *sPc, *tf,
+                                          pctx->c.rank, zs, qs);
+          waudit.n_sample = long(zs.size());
+          // ⚠ REDUCE BEFORE JUDGING: report_wc_grid_audit can ABORT, and an abort
+          // on one rank while the others proceed is a hang.
+          waudit.dW_rel = mpi->comm.all_reduce_value(waudit.dW_rel,
+                                                     boost::mpi3::max<>{});
+          wc_grid::report_wc_grid_audit(waudit, geom, opts.wgrid_audit_hard, lvl);
+          // carried into the [Q6] summary line as `wgrid_aud` so a breach is
+          // harvestable per map, not only visible in the banner
+          auto &LRw = last_run();
+          LRw.wgrid_meas_mev = waudit.meas_mev;
+          LRw.wgrid_pred_mev = waudit.pred_mev;
+          LRw.wgrid_worst_q = waudit.worst_q;
+          LRw.wgrid_worst_z = waudit.worst_z;
+        }
+      }
+
       ctx.cdl->residue_batch = p_contour::make_contour_residue_batch_owning(
-          ctx, pctx, tf, sPc, sZq, NP, sopt, sstat, batch_max);
+          ctx, pctx, tf, sPc, sZq, NP, sopt, sstat, batch_max, wgrid);
       ctx.cdl->stats = sstat;
       ctx.have_cdl = true;
 

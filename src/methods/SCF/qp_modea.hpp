@@ -261,6 +261,14 @@ namespace qp_modea {
     // inverse amortizes. Default dense = the reference path.
     bool        tc_krylov = false;
     double      tc_krylov_tol = 1e-12;
+    // ---- TC-5: the amortized W^c tile cache (methods/SCF/wc_grid.hpp) ----------
+    // THE KNOB IS THE TARGET, NOT THE SPACING: h is derived from the measured
+    // sizing law dSigma = K (h/delta)^p / delta. 0 disables the cache and restores
+    // the per-target Dyson path exactly.
+    double      wgrid_mev = 1.0;        // absolute residue-tier target, meV
+    double      wgrid_h = 0.0;          // EXPERT: h in a.u.; > 0 bypasses the law
+    long        wgrid_audit = 16;       // audit samples per (q, iteration); 0 = off
+    bool        wgrid_audit_hard = true;// abort on a >10x breach
     long iter = 1;                     // outer iteration (1 => Route-A root refinement)
     int level = 2;                     // logging level for the per-iteration banner
   };
@@ -317,6 +325,12 @@ namespace qp_modea {
     double union_tail = 0.0;       // worst per-slab 2-norm projection residual / max|s|
     double union_frob = 0.0;       // worst per-slab Frobenius projection residual
     double t_union = 0.0;          // stage-1c wall time
+    // ---- TC-5 grid audit, harvestable from the [Q6] line as `wgrid_aud` ----
+    // -1 = the cache was off (qp_tc_wgrid_mev = 0) or the audit was disabled.
+    double wgrid_meas_mev = -1.0;  // MEASURED residue-tier error
+    double wgrid_pred_mev = -1.0;  // what the sizing law predicted
+    long   wgrid_worst_q = -1;     // WHERE the worst sample sat: IBZ transfer ...
+    double wgrid_worst_z = 0.0;    // ... and its Re z (a.u.)
     long Np = 0;                   // THC auxiliary basis size (the compression denominator)
     // the slab rank ladder: max / mean retained rank over (q,p) at the FIXED tolerances
     // detail::wrank_ladder = {1e-2, 1e-4, 1e-6, 1e-8, 1e-10}. THE low-rank measurement --

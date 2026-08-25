@@ -89,6 +89,7 @@
 #include "methods/SCF/scf_common.hpp"
 #include "methods/SCF/p_contour.hpp"
 #include "methods/SCF/wc_line.hpp"
+#include "methods/SCF/wc_grid.hpp"
 #include "methods/SCF/wc_band_elements.hpp"
 #include <format>
 #include "methods/scr_coulomb/scr_coulomb_t.h"
@@ -1152,6 +1153,10 @@ namespace bdft_tests {
         optc.wfit = "contour";
         optc.cd_bstore_cap_gb = 0.0;          // the DEFAULT: no store admitted
         optc.cd_bfactor = "auto";             // the DEFAULT: -> recompute
+        // ⚠ TC-5 cache OFF here: this pin tests the F5 band-factor WIRING, so its
+        // reference must be the exact per-target evaluator. With the cache on it
+        // would be measuring the interpolation error instead (and did: 1.7e-4).
+        optc.wgrid_mev = 0.0;
         optc.level = 2;                       // PRINT the production banner: it is the
                                               // only place the band-factor / batching
                                               // report lines are formatted at all
@@ -1199,12 +1204,349 @@ namespace bdft_tests {
                 mf_src, ctxc.cdl->batch_max, nw_pt, rel_w, num_w, den_w2);
         REQUIRE(nw_pt >= 4);
         REQUIRE(rel_w < 1e-12);
+
+        // ---- TC-5 PRODUCTION PATH: cache ON at the DEFAULT knobs -----------
+        // Builds the grid, runs the reflection assert, runs the audit with the
+        // hard abort ARMED, and evaluates Sigma^c through the interpolated
+        // cache. Reaching the REQUIREs means all three passed on live data.
+        qp_modea::modea_ctx ctxw;
+        qp_modea::modea_opts optw = opts;
+        optw.wfit = "contour";
+        optw.cd_bstore_cap_gb = 0.0;
+        optw.cd_bfactor = "auto";
+        optw.level = 2;
+        REQUIRE(optw.wgrid_mev == 1.0);            // the shipped default
+        REQUIRE(optw.wgrid_audit == 16);
+        REQUIRE(optw.wgrid_audit_hard);            // abort ARMED
+        qp_modea::build_modea_context(ctxw, mb_state, thc, sMO, sE, mu, ft, optw,
+                                      "ignore_g0", false);
+        REQUIRE(ctxw.have_cdl);
+        nda::array<ComplexType, 2> Sw2(nbnd, nbnd), Sr2(nbnd, nbnd);
+        double dw2 = 0.0, sw2 = 0.0;
+        long nw2 = 0;
+        for (std::size_t b = 0; b < ctx.blocks.size(); ++b) {
+          auto const &blk = ctx.blocks[b];
+          auto const &blw = ctxw.blocks[b];
+          const long off4 = (blk.is * ctx.nk + blk.ik) * ctx.nJ;
+          for (long ig = 0; ig < 24; ig += 3) {
+            const double w0 = wlo + (whi - wlo) * double(ig) / 23.0;
+            double g4 = 1e300;
+            for (long J = 0; J < ctx.nJ; ++J)
+              g4 = std::min(g4, std::abs(w0 - ctx.epsJ(off4 + J)));
+            if (g4 < 2e-2) continue;
+            const ComplexType z(w0, 0.0);
+            qp_modea::modea_sigma_at_cdline(ctxw, blw, *ctxw.cdl, z, Sw2);
+            qp_modea::modea_sigma_at_cdline(ctx, blk, cs, z, Sr2);
+            for (long i = 0; i < nbnd; ++i)
+              for (long j = 0; j < nbnd; ++j) {
+                dw2 = std::max(dw2, std::abs(Sw2(i, j) - Sr2(i, j)));
+                sw2 = std::max(sw2, std::abs(Sr2(i, j)));
+              }
+            ++nw2;
+          }
+        }
+        app_log(2, "[TC-5 production] {}: wfit = contour with DEFAULT knobs (cache ON, "
+                   "target 1.0 meV, audit 16 samples, HARD ABORT ARMED): the context "
+                   "builds, the reflection assert and the audit both pass on live data, "
+                   "and Sigma^c over {} evaluation points differs from the exact "
+                   "per-target evaluator by {:.4g} meV (target 1.0 meV).",
+                mf_src, nw2, dw2 * 27.211386245988 * 1e3);
+        REQUIRE(nw2 >= 4);
+        REQUIRE(dw2 * 27.211386245988 * 1e3 < 1.0);   // within the requested target
+
+        // ---- the [Q6] harvest field, populated by the audit ------------------
+        // A unit test emits no [Q6] line (that is scf_driver's qpgw loop), so what
+        // is gated here is the PLUMBING that line reads: last_run() must carry the
+        // measured/predicted pair and the worst sample's location. Without this
+        // the field would render its -1 sentinel forever and nobody would notice.
+        {
+          auto const &LRw = qp_modea::last_run();
+          app_log(2, "[TC-5 Q6 field] {}: last_run carries wgrid_aud = {:.4g}/{:.4g} meV "
+                     "(worst q = {}, Re z = {:+.6g}) -- exactly as the [Q6] qpgw summary "
+                     "line renders it for harvest scripts.",
+                  mf_src, LRw.wgrid_meas_mev, LRw.wgrid_pred_mev, LRw.wgrid_worst_q,
+                  LRw.wgrid_worst_z);
+          REQUIRE(LRw.wgrid_meas_mev >= 0.0);   // populated, not the -1 sentinel
+          REQUIRE(LRw.wgrid_pred_mev > 0.0);
+          REQUIRE(LRw.wgrid_worst_q >= 0);
+        }
+      }
+
+      // =================================================================
+      //  TC-5 -- THE AMORTIZED W^c TILE CACHE, on this fixture.
+      //   (c) IDENTITY: Sigma^c from the interpolated cache vs the
+      //       per-target Dyson path, gated at the law's own prediction.
+      //   (c') the mev = 0 path is the per-target path, BITWISE.
+      //   (d) AUDIT vs TRUTH: the audit's measured |dW|/|W| must equal a
+      //       directly computed one.
+      //   (b) the reflection assert already fired inside fill_wc_grid --
+      //       reaching this line at all means it passed.
+      // =================================================================
+      {
+        const double HA = 27.211386245988;
+        // zmax from the ACTUAL contributing targets of this fixture
+        double zmax = 0.0;
+        for (auto const &blk : ctx.blocks) {
+          const long off2 = (blk.is * ctx.nk + blk.ik) * ctx.nJ;
+          for (long ig = 0; ig < 24; ++ig) {
+            const double w0 = wlo + (whi - wlo) * double(ig) / 23.0;
+            for (long J = 0; J < ctx.nJ; ++J) {
+              const double eJ = ctx.epsJ(off2 + J), fJ = ctx.fJ(off2 + J);
+              if (std::abs(((w0 > eJ) ? 1.0 : 0.0) - fJ) < 1e-14) continue;
+              zmax = std::max(zmax, std::abs(eJ - w0));
+            }
+          }
+        }
+        methods::wc_line::solve_stats_t stR0;
+        auto srcR0 = pc::make_contour_residue_batch(ctx, pctx, tf, sPc, *sZt, thc.Np(),
+                                                    sopt, stR0, 0, nullptr);
+        qp_modea::cd_line_ctx cR0;
+        qp_modea::cd_line_prepare(cR0, ctx, clo3);
+        cR0.residue_batch = srcR0;
+
+        methods::wc_line::solve_stats_t stG, stR;
+
+        // ⚠ AN h-SCAN, NOT A SINGLE POINT. The Axis-D law was fitted on the
+        // synthetic RPA model; whether its CONSTANT transfers to CoQuI's actual
+        // W^c is precisely what section 8.7 says cannot be assumed. Scanning h
+        // separates the two questions: the EXPONENT tests the mechanism (delta-
+        // smoothness), the CONSTANT tests the calibration.
+        {
+          std::string trail;
+          double e_prev = 0.0, h_prev = 0.0, slope = 0.0;
+          for (double hod : {0.4, 0.2, 0.1, 0.05}) {
+            auto gs = methods::wc_grid::size_wc_grid(1.0, dlt, zmax, hod * dlt);
+            auto ws = methods::wc_grid::fill_wc_grid(thc, *sZt, sPc, tf, gs,
+                                                     pctx.c.rank, 4);
+            methods::wc_line::solve_stats_t sts2;
+            auto srcs2 = pc::make_contour_residue_batch(ctx, pctx, tf, sPc, *sZt,
+                                                        thc.Np(), sopt, sts2, 0, ws.get());
+            qp_modea::cd_line_ctx cs2;
+            qp_modea::cd_line_prepare(cs2, ctx, clo3);
+            cs2.residue_batch = srcs2;
+            nda::array<ComplexType, 2> Sa(nbnd, nbnd), Sb(nbnd, nbnd);
+            double dd = 0.0;
+            for (auto const &blk : ctx.blocks) {
+              const long off3 = (blk.is * ctx.nk + blk.ik) * ctx.nJ;
+              for (long ig = 0; ig < 24; ig += 4) {
+                const double w0 = wlo + (whi - wlo) * double(ig) / 23.0;
+                double g3 = 1e300;
+                for (long J = 0; J < ctx.nJ; ++J)
+                  g3 = std::min(g3, std::abs(w0 - ctx.epsJ(off3 + J)));
+                if (g3 < 2e-2) continue;
+                const ComplexType z(w0, 0.0);
+                qp_modea::modea_sigma_at_cdline(ctx, blk, cs2, z, Sa);
+                qp_modea::modea_sigma_at_cdline(ctx, blk, cR0, z, Sb);
+                for (long i = 0; i < nbnd; ++i)
+                  for (long j = 0; j < nbnd; ++j)
+                    dd = std::max(dd, std::abs(Sa(i, j) - Sb(i, j)));
+              }
+            }
+            const double mev = dd * 27.211386245988 * 1e3;
+            trail += std::format("  h/d={:.2f} N={} -> {:.4g} meV", hod, ws->g.N, mev);
+            if (e_prev > 0.0 and mev > 0.0)
+              slope = std::log(e_prev / mev) / std::log(h_prev / hod);
+            e_prev = mev; h_prev = hod;
+          }
+          app_log(2, "[TC-5 law] {}: Sigma identity vs h on REAL CoQuI W^c (delta = "
+                     "{:.4g} eV):{}  -> last-interval exponent {:.2f} (Axis-D model law "
+                     "predicts {:.2f})", mf_src, dlt * 27.211386245988, trail, slope,
+                  methods::wc_grid::wgrid_p);
+          REQUIRE(slope > 1.5);   // the MECHANISM: delta-smooth convergence in h
+        }
+
+        auto geom = methods::wc_grid::size_wc_grid(1.0, dlt, zmax);
+        auto wg = methods::wc_grid::fill_wc_grid(thc, *sZt, sPc, tf, geom,
+                                                 pctx.c.rank, 2);
+        REQUIRE(wg->g.N >= 3);
+        // the reflection assert ran inside the fill; record what it measured
+        const double refl = (wg->refl_scale > 0.0) ? wg->refl_dev / wg->refl_scale : 0.0;
+
+        auto srcG = pc::make_contour_residue_batch(ctx, pctx, tf, sPc, *sZt, thc.Np(),
+                                                   sopt, stG, 0, wg.get());
+        auto srcR = pc::make_contour_residue_batch(ctx, pctx, tf, sPc, *sZt, thc.Np(),
+                                                   sopt, stR, 0, nullptr);
+        qp_modea::cd_line_ctx cG, cR;
+        qp_modea::cd_line_prepare(cG, ctx, clo3);
+        qp_modea::cd_line_prepare(cR, ctx, clo3);
+        cG.residue_batch = srcG;
+        cR.residue_batch = srcR;
+        cG.route = cR.route = "contour";
+
+        nda::array<ComplexType, 2> SG(nbnd, nbnd), SR(nbnd, nbnd);
+        double dmax = 0.0, smax = 0.0;
+        long npt5 = 0;
+        for (auto const &blk : ctx.blocks) {
+          const long off2 = (blk.is * ctx.nk + blk.ik) * ctx.nJ;
+          for (long ig = 0; ig < 24; ++ig) {
+            const double w0 = wlo + (whi - wlo) * double(ig) / 23.0;
+            double g2 = 1e300;
+            for (long J = 0; J < ctx.nJ; ++J)
+              g2 = std::min(g2, std::abs(w0 - ctx.epsJ(off2 + J)));
+            if (g2 < 2e-2) continue;
+            const ComplexType z(w0, 0.0);
+            qp_modea::modea_sigma_at_cdline(ctx, blk, cG, z, SG);
+            qp_modea::modea_sigma_at_cdline(ctx, blk, cR, z, SR);
+            for (long i = 0; i < nbnd; ++i)
+              for (long j = 0; j < nbnd; ++j) {
+                dmax = std::max(dmax, std::abs(SG(i, j) - SR(i, j)));
+                smax = std::max(smax, std::abs(SR(i, j)));
+              }
+            ++npt5;
+          }
+        }
+        const double d_mev = dmax * HA * 1e3;
+
+        // (d) AUDIT vs TRUTH on the same grid
+        std::vector<double> azs;
+        std::vector<long> aqs;
+        auto const &bs0 = ctx.bstore[0];
+        // CONTRIBUTING targets only, and inside the sized grid -- the same
+        // predicate and span the grid was built from.
+        for (long t = 0; t < 12; ++t) {
+          for (long trial = 0; trial < 4 * ctx.nJ; ++trial) {
+            const long J = ((t + trial) * 7919L + 13L) % ctx.nJ;
+            const double om = wlo + (double((t + trial) % 11) / 10.0) * (whi - wlo);
+            const double eJ = ctx.epsJ(J), fJ = ctx.fJ(J);
+            if (std::abs(((om > eJ) ? 1.0 : 0.0) - fJ) < 1e-14) continue;
+            if (std::abs(eJ - om) > zmax) continue;
+            azs.push_back(eJ - om);
+            aqs.push_back(bs0.qs_of_J(J));
+            break;
+          }
+        }
+        auto A = methods::wc_grid::audit_wc_grid(*wg, thc, *sZt, sPc, tf,
+                                                 pctx.c.rank, azs, aqs);
+        // recompute the same quantity independently
+        double dref = 0.0;
+        {
+          nda::matrix<ComplexType> Pi(thc.Np(), thc.Np()), Wex(thc.Np(), thc.Np()),
+                                   Wgot(thc.Np(), thc.Np());
+          nda::array<ComplexType, 1> zz(2);
+          nda::array<ComplexType, 2> F;
+          for (std::size_t t = 0; t < azs.size(); ++t) {
+            const ComplexType z(azs[t], dlt);
+            methods::wc_grid::detail::pi_at(tf, sPc, aqs[t], pctx.c.rank, thc.Np(),
+                                            z, Pi, zz, F);
+            auto Zq = sZt->local()(aqs[t], nda::range::all, nda::range::all);
+            methods::wc_line::dyson_wc_line(Zq, Pi, Wex, nullptr);
+            wg->at(aqs[t], z, Wgot);
+            double dv = 0.0, sc2 = 0.0;
+            for (long P = 0; P < thc.Np(); ++P)
+              for (long Q = 0; Q < thc.Np(); ++Q) {
+                dv = std::max(dv, std::abs(Wgot(P, Q) - Wex(P, Q)));
+                sc2 = std::max(sc2, std::abs(Wex(P, Q)));
+              }
+            dref = std::max(dref, (sc2 > 0.0) ? dv / sc2 : 0.0);
+          }
+        }
+
+        app_log(2, "[TC-5] {}: target 1.0 meV -> h/delta = {:.4f}, h = {:.6g} a.u., "
+                   "N = {} grid points over |Re z| <= {:.4g} eV (vs {} residue targets "
+                   "per map at this fixture scale); law predicts {:.4g} meV.",
+                mf_src, wg->g.h_over_delta, wg->g.h, wg->g.N, zmax * HA,
+                cR.n_res_eval, wg->g.pred_mev);
+        app_log(2, "[TC-5] {}: IDENTITY, cache vs per-target Dyson over {} evaluation "
+                   "points: max |dSigma^c| = {:.3e} a.u. = {:.4g} meV over max|Sigma^c| = "
+                   "{:.4g}; law prediction {:.4g} meV.",
+                mf_src, npt5, dmax, d_mev, smax, wg->g.pred_mev);
+        app_log(2, "[TC-5] {}: REFLECTION assert (inside the fill) measured {:.3e} "
+                   "relative; AUDIT measured |dW|/|W| = {:.3e} vs an independent "
+                   "recomputation {:.3e} (must agree exactly).",
+                mf_src, refl, A.dW_rel, dref);
+
+        REQUIRE(npt5 >= 4);
+        REQUIRE(refl < 1e-8);            // (b) the bosonic reflection identity
+        REQUIRE(A.dW_rel == dref);       // (d) the audit measures what it claims
+        REQUIRE(A.n_sample >= 8);
+        // (c) the identity, gated at the law's own prediction with the same 3x
+        // margin the sizing already carries
+        REQUIRE(d_mev < 3.0 * wg->g.pred_mev + 1e-9);
+
+        // (c') mev = 0 is the per-target path, BITWISE
+        {
+          nda::array<ComplexType, 2> S0(nbnd, nbnd);
+          double d0 = 0.0;
+          auto const &blk = ctx.blocks[0];
+          const ComplexType z(wlo + 0.37 * (whi - wlo), 0.0);
+          qp_modea::modea_sigma_at_cdline(ctx, blk, cR, z, SR);
+          methods::wc_line::solve_stats_t st0;
+          auto src0 = pc::make_contour_residue_batch(ctx, pctx, tf, sPc, *sZt, thc.Np(),
+                                                     sopt, st0, 0, nullptr);
+          qp_modea::cd_line_ctx c0;
+          qp_modea::cd_line_prepare(c0, ctx, clo3);
+          c0.residue_batch = src0;
+          qp_modea::modea_sigma_at_cdline(ctx, blk, c0, z, S0);
+          for (long i = 0; i < nbnd; ++i)
+            for (long j = 0; j < nbnd; ++j)
+              d0 = std::max(d0, std::abs(S0(i, j) - SR(i, j)));
+          app_log(2, "[TC-5] {}: cache-OFF path vs cache-OFF path (the qp_tc_wgrid_mev = 0 "
+                     "reference): max |dSigma^c| = {:.3e} (gate: EXACTLY 0)", mf_src, d0);
+          REQUIRE(d0 == 0.0);
+        }
       }
     }
   }
 
   TEST_CASE("tc3b1_identity_lih222", "[methods][tc_contour]") {
     run_tc3b1_gate("qe_lih222");
+  }
+
+  // =====================================================================
+  //  TC-5 (a) -- THE SIZING LAW. Pure function; no fixture.
+  //  The knob is the ACCURACY TARGET, so this pins that h is derived from
+  //  the Axis-D law, that the delta/2 quadratic-validity clamp bites, and
+  //  that the grid actually covers the target set.
+  // =====================================================================
+  TEST_CASE("tc5_sizing_law", "[methods][tc_contour]") {
+    using namespace methods::wc_grid;
+    const double HA = 27.211386245988;
+
+    // (i) the law is reproduced exactly: h/delta = (T d_eV / (3 K))^(1/p)
+    {
+      const double delta = 3.6325 / HA;          // si444's delta, in a.u.
+      const double zmax = 50.0 / HA;
+      auto g = size_wc_grid(1.0, delta, zmax);
+      const double d_eV = delta * HA;
+      const double want = std::pow(1.0 * d_eV / (wgrid_safety * wgrid_K), 1.0 / wgrid_p);
+      REQUIRE(std::abs(g.h_over_delta - want) < 1e-12);
+      REQUIRE(not g.clamped);
+      REQUIRE(not g.expert);
+      // the prediction is self-consistent with the target and the safety factor
+      REQUIRE(std::abs(g.pred_mev - 1.0 / wgrid_safety) < 1e-9);
+      // and the grid covers zmax with the pad + stencil margin
+      REQUIRE(g.omega(g.N - 1) >= zmax);
+      REQUIRE(g.N >= 3);
+      app_log(2, "[TC-5 sizing] si444-like: delta = {:.6g} a.u. ({:.4g} eV), target 1 meV "
+                 "-> h/delta = {:.6f}, h = {:.6g} a.u., N = {} (covers |Re z| <= {:.4g} eV); "
+                 "predicted {:.4g} meV = target/{:.0f}",
+              delta, d_eV, g.h_over_delta, g.h, g.N, zmax * HA, g.pred_mev, wgrid_safety);
+    }
+    // (ii) THE CLAMP: a loose target must not push h past delta/2
+    {
+      auto g = size_wc_grid(1e6, 3.6325 / HA, 50.0 / HA);
+      REQUIRE(g.clamped);
+      REQUIRE(std::abs(g.h_over_delta - wgrid_hmax_over_delta) < 1e-15);
+      app_log(2, "[TC-5 sizing] CLAMP: a 1e6 meV target resolves to h/delta = {:.3f}, not "
+                 "past the {:.2f} quadratic-validity bound", g.h_over_delta,
+              wgrid_hmax_over_delta);
+    }
+    // (iii) a tighter target shrinks h as target^(1/p)
+    {
+      auto a = size_wc_grid(1.0, 2.0 / HA, 40.0 / HA);
+      auto b = size_wc_grid(0.1, 2.0 / HA, 40.0 / HA);
+      const double ratio = a.h / b.h;
+      REQUIRE(std::abs(ratio - std::pow(10.0, 1.0 / wgrid_p)) < 1e-9);
+      REQUIRE(b.N > a.N);
+      app_log(2, "[TC-5 sizing] 1.0 -> 0.1 meV: h shrinks {:.4f}x = 10^(1/{:.2f}), N grows "
+                 "{} -> {}", ratio, wgrid_p, a.N, b.N);
+    }
+    // (iv) the EXPERT override bypasses the law
+    {
+      auto g = size_wc_grid(1.0, 2.0 / HA, 40.0 / HA, 0.037);
+      REQUIRE(g.expert);
+      REQUIRE(std::abs(g.h - 0.037) < 1e-15);
+    }
   }
 
   // =====================================================================
@@ -1880,6 +2222,45 @@ namespace bdft_tests {
       app_log(2, "[TC-4 mrank] NOTE: at 1 rank the collective degenerates and the "
                  "divergence cannot bite. Run under mpiexec -n 2..4 for the regression "
                  "this case exists for.");
+
+    // ---- (Z5) TC-5: THE COLLECTIVE GRID FILL AT >1 RANK --------------------
+    // The fill partitions (iq, j) across ranks and assembles with ONE reduction.
+    // Trip counts differ per rank BY DESIGN, so this is the gate that the fill is
+    // lockstep-safe (no collective inside the loop) and that every rank ends up
+    // with the SAME table -- and then that DIVERGENT per-rank reads still agree.
+    double z5_spread = 0.0, z5_read = 0.0;
+    {
+      double zmax5 = 0.0;
+      for (long J = 0; J < ctx.nJ; ++J)
+        zmax5 = std::max(zmax5, std::abs(ctx.epsJ(J) - ctx.mu));
+      auto g5 = methods::wc_grid::size_wc_grid(1.0, pctx.geom.delta, zmax5);
+      auto w5 = methods::wc_grid::fill_wc_grid(thc, *sZt, sPc, tf, g5, pctx.c.rank, 4);
+      mpi_context->comm.barrier();          // reaching here at all = no deadlock
+      // every rank must hold the SAME table
+      double chk = 0.0;
+      for (long iq = 0; iq < w5->nq; ++iq)
+        for (long j = 0; j < w5->g.N; ++j)
+          for (long P = 0; P < NP; ++P)
+            chk += std::abs(w5->W->local()(iq, j, P, P)) * double((iq + 1) * (j + 2) % 13 + 1);
+      const double hi5 = mpi_context->comm.all_reduce_value(chk, boost::mpi3::max<>{});
+      const double lo5 = mpi_context->comm.all_reduce_value(chk, boost::mpi3::min<>{});
+      z5_spread = std::abs(hi5 - lo5);
+      // DIVERGENT per-rank reads through the cache: rank r reads its own targets
+      nda::matrix<ComplexType> Wr(NP, NP);
+      for (long t = 0; t < 1 + long(crank % 4); ++t) {
+        const double zr = (double((crank + t) % 7) / 6.0) * zmax5 * 0.9;
+        w5->at(0, ComplexType(zr, pctx.geom.delta), Wr);
+        z5_read = std::max(z5_read, std::abs(Wr(0, 0)));
+      }
+      z5_read = mpi_context->comm.all_reduce_value(z5_read, boost::mpi3::max<>{});
+      mpi_context->comm.barrier();
+      app_log(2, "[TC-4 mrank/(Z5)] TC-5 grid fill at {} rank(s): N = {}, nq = {}, "
+                 "{} fill solves partitioned; inter-rank table spread = {:.3e}; "
+                 "divergent per-rank cache reads completed (max |W(0,0)| = {:.4g}).",
+              csize, w5->g.N, w5->nq, w5->nq * w5->g.N, z5_spread, z5_read);
+      REQUIRE(z5_spread < 1e-9);
+      REQUIRE(z5_read > 0.0);
+    }
 
     REQUIRE(z1 == 0.0);                 // the table IS thc.Z, bit for bit
     REQUIRE(z2 < 1e-9);                 // replicated, not sharded

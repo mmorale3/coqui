@@ -179,6 +179,7 @@
 #include "methods/HF/thc_solver_comm.hpp"
 #include "methods/SCF/scf_common.hpp"
 #include "methods/SCF/wc_line.hpp"
+#include "methods/SCF/wc_grid.hpp"
 #include "methods/SCF/qp_modea.hpp"
 #include "methods/mb_state/mb_state.hpp"
 
@@ -846,7 +847,8 @@ namespace p_contour {
                                       long nchunk, long is, long ik, long nt,
                                       nda::array<long, 1> const &Js,
                                       nda::array<ComplexType, 1> const &zs,
-                                      nda::array<ComplexType, 3> &Ms) {
+                                      nda::array<ComplexType, 3> &Ms,
+                                      wc_grid::wc_grid_t const *wg = nullptr) {
       decltype(nda::range::all) all;
       const long r = pctx.c.rank;
       const long nbnd = ctx.nbnd;
@@ -859,6 +861,48 @@ namespace p_contour {
       const long bi = ctx.bstore_index(is, ik);
       utils::check(bi >= 0, "contour residue source: no band store for ({}, {}).", is, ik);
       auto const &bs = ctx.bstore[std::size_t(bi)];
+
+      // ===================================================================
+      //  TC-5: THE AMORTIZED PATH. W^c was built ONCE on the target-line
+      //  grid (wc_grid::fill_wc_grid, at the lockstep point next to
+      //  gather_Z_tiles), so a residue read is a local interpolation: no
+      //  transform rows, no Pi contraction, no Dyson, and -- as with the Z
+      //  tiles -- NOTHING here can reach a communicator.
+      // ===================================================================
+      if (wg != nullptr) {
+        sc.reserve(2, 2, r, NP, nbnd);
+        auto &W = sc.W;
+        auto &B = sc.B;
+        auto &Bc = sc.Bc;
+        auto &T = sc.T;
+        auto &Mr = sc.Mr;
+        auto &Bb = sc.Bb;
+        for (long i = 0; i < nt; ++i) {
+          const long J = Js(i);
+          const long qs = bs.qs_of_J(J);
+          const bool wconj = (bs.wconj_of_J(J) != 0);
+          wg->at(qs, zs(i), W);
+          bs.band(J, Bb);
+          for (long P = 0; P < NP; ++P)
+            for (long a = 0; a < nbnd; ++a) {
+              B(P, a) = Bb(P, a);
+              Bc(P, a) = std::conj(Bb(P, a));
+            }
+          if (wconj) {
+            nda::blas::gemm(W, B, T);
+            nda::blas::gemm(nda::transpose(Bc), T, Mr);
+            for (long a = 0; a < nbnd; ++a)
+              for (long b = 0; b < nbnd; ++b)
+                Ms(i, a, b) = ctx.cd_pref * std::conj(Mr(a, b));
+          } else {
+            nda::blas::gemm(W, Bc, T);
+            nda::blas::gemm(nda::transpose(B), T, Mr);
+            for (long a = 0; a < nbnd; ++a)
+              for (long b = 0; b < nbnd; ++b) Ms(i, a, b) = ctx.cd_pref * Mr(a, b);
+          }
+        }
+        return;
+      }
 
       const long nc_max = std::max(1L, (nchunk > 0) ? std::min(nchunk, nt) : nt);
       sc.reserve(2 * nt, 2 * nc_max, r, NP, nbnd);
@@ -973,15 +1017,16 @@ namespace p_contour {
       long NP,
       std::shared_ptr<methods::wc_line::solve_opts_t> sopt,
       std::shared_ptr<methods::wc_line::solve_stats_t> sstat,
-      long nchunk) {
+      long nchunk,
+      std::shared_ptr<wc_grid::wc_grid_t> wg = nullptr) {   // TC-5 cache; null = per-target
     utils::check(ctx.have_bstore,
                  "p_contour::make_contour_residue_batch_owning: no band factors.");
     auto sc = std::make_shared<detail::residue_scratch_t>();
-    return [&ctx, pctx, tf, sPi, sZ, NP, sopt, sstat, sc, nchunk]
+    return [&ctx, pctx, tf, sPi, sZ, NP, sopt, sstat, sc, nchunk, wg]
            (long is, long ik, long nt, nda::array<long, 1> const &Js,
             nda::array<ComplexType, 1> const &zs, nda::array<ComplexType, 3> &Ms) {
       detail::contour_residue_batch(ctx, *pctx, *tf, *sPi, *sZ, NP, sstat.get(), *sc,
-                                    nchunk, is, ik, nt, Js, zs, Ms);
+                                    nchunk, is, ik, nt, Js, zs, Ms, wg.get());
     };
   }
 
@@ -995,16 +1040,17 @@ namespace p_contour {
       long NP,
       methods::wc_line::solve_opts_t const &sopt,
       methods::wc_line::solve_stats_t &sstat,
-      long nchunk = 0) {
+      long nchunk = 0,
+      wc_grid::wc_grid_t const *wg = nullptr) {
     utils::check(ctx.have_bstore,
                  "p_contour::make_contour_residue_batch: the mode-A context carries no "
                  "band factors; build it with modea_opts::cd_bfactor / cd_bstore_cap_gb.");
     auto sc = std::make_shared<detail::residue_scratch_t>();
-    return [&ctx, &pctx, &tf, &sPi, &sZ, NP, &sopt, &sstat, sc, nchunk]
+    return [&ctx, &pctx, &tf, &sPi, &sZ, NP, &sopt, &sstat, sc, nchunk, wg]
            (long is, long ik, long nt, nda::array<long, 1> const &Js,
             nda::array<ComplexType, 1> const &zs, nda::array<ComplexType, 3> &Ms) {
       detail::contour_residue_batch(ctx, pctx, tf, sPi, sZ, NP, &sstat, *sc, nchunk,
-                                    is, ik, nt, Js, zs, Ms);
+                                    is, ik, nt, Js, zs, Ms, wg);
     };
   }
 
@@ -1020,12 +1066,13 @@ namespace p_contour {
       sArray_t<Array_view_3D_t> const &sZ,       // (nq_ibz, Np, Np) from gather_Z_tiles
       long NP,
       methods::wc_line::solve_opts_t const &sopt,
-      methods::wc_line::solve_stats_t &sstat) {
+      methods::wc_line::solve_stats_t &sstat,
+      wc_grid::wc_grid_t const *wg = nullptr) {
     utils::check(ctx.have_bstore,
                  "p_contour::make_contour_residue_source: the mode-A context carries no "
                  "band factors; build it with modea_opts::cd_bfactor / cd_bstore_cap_gb.");
     auto sc = std::make_shared<detail::residue_scratch_t>();
-    return [&ctx, &pctx, &tf, &sPi, &sZ, NP, &sopt, &sstat, sc]
+    return [&ctx, &pctx, &tf, &sPi, &sZ, NP, &sopt, &sstat, sc, wg]
            (long is, long ik, long J, ComplexType z, nda::array<ComplexType, 2> &Ms) {
       const long nbnd = ctx.nbnd;
       nda::array<long, 1> Js(1);
@@ -1034,7 +1081,7 @@ namespace p_contour {
       Js(0) = J;
       zs(0) = z;
       detail::contour_residue_batch(ctx, pctx, tf, sPi, sZ, NP, &sstat, *sc, 1,
-                                    is, ik, 1L, Js, zs, M1);
+                                    is, ik, 1L, Js, zs, M1, wg);
       Ms.resize(nbnd, nbnd);
       for (long a = 0; a < nbnd; ++a)
         for (long b = 0; b < nbnd; ++b) Ms(a, b) = M1(0, a, b);

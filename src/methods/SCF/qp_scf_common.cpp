@@ -108,6 +108,10 @@ namespace {
     opts.cd_batch_mb = qp_params.qp_tc_batch_mb;
     opts.strip_lo = qp_params.qp_modea_strip_lo;
     opts.strip_hi = qp_params.qp_modea_strip_hi;
+    opts.wgrid_mev = qp_params.qp_tc_wgrid_mev;
+    opts.wgrid_h = qp_params.qp_tc_wgrid_h;
+    opts.wgrid_audit = qp_params.qp_tc_wgrid_audit;
+    opts.wgrid_audit_hard = qp_params.qp_tc_wgrid_audit_hard;
     opts.iter = 1;
     std::string div = "ignore_g0";
     if constexpr (requires { mb_solver.corr->iter(); })
@@ -158,6 +162,14 @@ namespace {
                  "\"recompute\".", opts.cd_bfactor);
     utils::check(opts.cd_batch_mb > 0.0,
                  "qp_modea: qp_tc_batch_mb = {} must be > 0.", opts.cd_batch_mb);
+    utils::check(opts.wgrid_mev >= 0.0,
+                 "qp_modea: qp_tc_wgrid_mev = {} must be >= 0 (0 = cache off).",
+                 opts.wgrid_mev);
+    utils::check(opts.wgrid_h >= 0.0,
+                 "qp_modea: qp_tc_wgrid_h = {} must be >= 0 (0 = derive from the law).",
+                 opts.wgrid_h);
+    utils::check(opts.wgrid_audit >= 0,
+                 "qp_modea: qp_tc_wgrid_audit = {} must be >= 0.", opts.wgrid_audit);
     // TC-4: the explicit strip window. Both or neither -- a one-sided window silently
     // paired with an E_PH bound is exactly the kind of mis-set that reads as physics.
     utils::check(opts.strip_lo >= 0.0 and opts.strip_hi >= 0.0,
@@ -1785,6 +1797,15 @@ auto qp_approx(const sArray_t<Array_view_5D_t> &sSigma_tskij,
                "store cap = {:.2f} GB",
             qp_params.qp_tc_krylov ? "warm-started GMRES" : "dense",
             qp_params.qp_tc_krylov_tol, qp_params.qp_tc_bstore_gb);
+  if (qp_params.qp_modea_wfit == "contour")
+    app_log(2, "  - W^c grid (TC-5):        qp_tc_wgrid_mev = {:.4g} meV{}, audit = {} "
+               "samples/q (hard abort {}); the knob is the ACCURACY TARGET -- h is derived "
+               "from the measured law dSigma = K (h/delta)^2.81 / delta",
+            qp_params.qp_tc_wgrid_mev,
+            qp_params.qp_tc_wgrid_mev <= 0.0 ? " (CACHE OFF: per-target Dyson)"
+              : (qp_params.qp_tc_wgrid_h > 0.0 ? " (EXPERT h override)" : ""),
+            qp_params.qp_tc_wgrid_audit,
+            qp_params.qp_tc_wgrid_audit_hard ? "ON" : "off");
   if (qp_params.qp_modea_wfit == "contour")
     app_log(2, "  - contour evaluator (TC-4): band factors = {}, residue batch budget = "
                "{:.0f} MB (the evaluator's persistent work space; it sets how many "

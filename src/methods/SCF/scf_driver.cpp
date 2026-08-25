@@ -481,12 +481,14 @@ double qp_scf_loop(
       app_log(1, "[Q6] qpgw iteration summary  it = {}: dmax(H_eff) = {:.3e} a.u., "
                  "dmax(map inner) = {:.3e}, inner-consist iters = {}, band-reorder = {} "
                  "(python-side meter), strip census in-strip/eta-far/clamped = {}/{}/{}, "
+                 "wgrid_aud = {:.4g}/{:.4g} meV (worst q = {}, Re z = {:+.6g}), "
                  "lambda_max = {:.6f}, ||P^lad||/||P^RPA|| = {:.6e}, r_rt = {:.3e}, "
                  "lineshape max |Sigma^c - V^xc|/|Sigma^c| iw_0/iw_top = {:.6e}/{:.6e} "
                  "(mean {:.6e}/{:.6e}, {} states; ABS discard max iw_0/iw_top = "
                  "{:.6e}/{:.6e} a.u.)",
               it, Heff_conv, LR.dmax, LR.iters, -1,
               LR.n_eval - LR.n_clamp, LR.n_eta, LR.n_clamp - LR.n_eta,
+              LR.wgrid_meas_mev, LR.wgrid_pred_mev, LR.wgrid_worst_q, LR.wgrid_worst_z,
               lam_max, lad_ratio, r_rt,
               LS.frac_w0_max, LS.frac_top_max, LS.frac_w0_mean, LS.frac_top_mean,
               LS.n_states, LS.abs_w0_max, LS.abs_top_max);

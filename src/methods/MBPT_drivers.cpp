@@ -727,6 +727,25 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     utils::check((qp_params.qp_modea_strip_lo > 0.0) == (qp_params.qp_modea_strip_hi > 0.0),
                  "evgw: qp_modea_strip_lo and qp_modea_strip_hi must be set TOGETHER (both > 0 "
                  "for an explicit window, both 0 for the E_PH strip).");
+    // TC-5: the amortized W^c tile cache. THE KNOB IS THE ACCURACY TARGET, not
+    // the spacing; h is derived from the measured sizing law. 0 = cache off.
+    qp_params.qp_tc_wgrid_mev =
+        io::get_value_with_default<double>(pt,"qp_tc_wgrid_mev",1.0);
+    utils::check(qp_params.qp_tc_wgrid_mev >= 0.0,
+                 "evgw: qp_tc_wgrid_mev = {} must be >= 0 (0 = cache off).",
+                 qp_params.qp_tc_wgrid_mev);
+    qp_params.qp_tc_wgrid_h =
+        io::get_value_with_default<double>(pt,"qp_tc_wgrid_h",0.0);
+    utils::check(qp_params.qp_tc_wgrid_h >= 0.0,
+                 "evgw: qp_tc_wgrid_h = {} must be >= 0 (0 = derive from the law)."
+                 , qp_params.qp_tc_wgrid_h);
+    qp_params.qp_tc_wgrid_audit =
+        io::get_value_with_default<long>(pt,"qp_tc_wgrid_audit",16);
+    utils::check(qp_params.qp_tc_wgrid_audit >= 0,
+                 "evgw: qp_tc_wgrid_audit = {} must be >= 0.",
+                 qp_params.qp_tc_wgrid_audit);
+    qp_params.qp_tc_wgrid_audit_hard =
+        io::get_value_with_default<bool>(pt,"qp_tc_wgrid_audit_hard",true);
     qp_params.qp_modea_wsupp = io::get_value_with_default<std::string>(pt,"qp_modea_wsupp","auto");
     io::tolower(qp_params.qp_modea_wsupp);
     qp_params.qp_modea_wfit = io::get_value_with_default<std::string>(pt,"qp_modea_wfit","tau");
@@ -914,6 +933,25 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     utils::check((qp_params.qp_modea_strip_lo > 0.0) == (qp_params.qp_modea_strip_hi > 0.0),
                  "qpgw: qp_modea_strip_lo and qp_modea_strip_hi must be set TOGETHER (both > 0 "
                  "for an explicit window, both 0 for the E_PH strip).");
+    // TC-5: the amortized W^c tile cache. THE KNOB IS THE ACCURACY TARGET, not
+    // the spacing; h is derived from the measured sizing law. 0 = cache off.
+    qp_params.qp_tc_wgrid_mev =
+        io::get_value_with_default<double>(pt,"qp_tc_wgrid_mev",1.0);
+    utils::check(qp_params.qp_tc_wgrid_mev >= 0.0,
+                 "qpgw: qp_tc_wgrid_mev = {} must be >= 0 (0 = cache off).",
+                 qp_params.qp_tc_wgrid_mev);
+    qp_params.qp_tc_wgrid_h =
+        io::get_value_with_default<double>(pt,"qp_tc_wgrid_h",0.0);
+    utils::check(qp_params.qp_tc_wgrid_h >= 0.0,
+                 "qpgw: qp_tc_wgrid_h = {} must be >= 0 (0 = derive from the law)."
+                 , qp_params.qp_tc_wgrid_h);
+    qp_params.qp_tc_wgrid_audit =
+        io::get_value_with_default<long>(pt,"qp_tc_wgrid_audit",16);
+    utils::check(qp_params.qp_tc_wgrid_audit >= 0,
+                 "qpgw: qp_tc_wgrid_audit = {} must be >= 0.",
+                 qp_params.qp_tc_wgrid_audit);
+    qp_params.qp_tc_wgrid_audit_hard =
+        io::get_value_with_default<bool>(pt,"qp_tc_wgrid_audit_hard",true);
     qp_params.qp_modea_wsupp = io::get_value_with_default<std::string>(pt,"qp_modea_wsupp","auto");
     io::tolower(qp_params.qp_modea_wsupp);
     qp_params.qp_modea_wfit = io::get_value_with_default<std::string>(pt,"qp_modea_wfit","tau");
@@ -1400,6 +1438,25 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
     utils::check((qp_params.qp_modea_strip_lo > 0.0) == (qp_params.qp_modea_strip_hi > 0.0),
                  "qpgw: qp_modea_strip_lo and qp_modea_strip_hi must be set TOGETHER (both > 0 "
                  "for an explicit window, both 0 for the E_PH strip).");
+    // TC-5: the amortized W^c tile cache. THE KNOB IS THE ACCURACY TARGET, not
+    // the spacing; h is derived from the measured sizing law. 0 = cache off.
+    qp_params.qp_tc_wgrid_mev =
+        io::get_value_with_default<double>(pt,"qp_tc_wgrid_mev",1.0);
+    utils::check(qp_params.qp_tc_wgrid_mev >= 0.0,
+                 "qpgw: qp_tc_wgrid_mev = {} must be >= 0 (0 = cache off).",
+                 qp_params.qp_tc_wgrid_mev);
+    qp_params.qp_tc_wgrid_h =
+        io::get_value_with_default<double>(pt,"qp_tc_wgrid_h",0.0);
+    utils::check(qp_params.qp_tc_wgrid_h >= 0.0,
+                 "qpgw: qp_tc_wgrid_h = {} must be >= 0 (0 = derive from the law)."
+                 , qp_params.qp_tc_wgrid_h);
+    qp_params.qp_tc_wgrid_audit =
+        io::get_value_with_default<long>(pt,"qp_tc_wgrid_audit",16);
+    utils::check(qp_params.qp_tc_wgrid_audit >= 0,
+                 "qpgw: qp_tc_wgrid_audit = {} must be >= 0.",
+                 qp_params.qp_tc_wgrid_audit);
+    qp_params.qp_tc_wgrid_audit_hard =
+        io::get_value_with_default<bool>(pt,"qp_tc_wgrid_audit_hard",true);
     qp_params.qp_modea_wsupp = io::get_value_with_default<std::string>(pt,"qp_modea_wsupp","auto");
     io::tolower(qp_params.qp_modea_wsupp);
     qp_params.qp_modea_wfit = io::get_value_with_default<std::string>(pt,"qp_modea_wfit","tau");
