@@ -1208,6 +1208,191 @@ namespace bdft_tests {
   }
 
   // =====================================================================
+  //  TC-4 -- THE EXPLICIT STRIP WINDOW (qp_modea_strip_lo / _hi).
+  //
+  //  Two pins, on the TAU route: the strip machinery lives in strip_of /
+  //  modea_vxc_cd and is route-INDEPENDENT, so this exercises exactly the
+  //  knob without paying for a contour build.
+  //
+  //  (i)  DEFAULT IDENTITY. Knob unset => strip_of returns the E_PH-derived
+  //       bounds EXACTLY (operator==, not a tolerance) and the census is the
+  //       one the old formula predicts. This is the "bit-identical when
+  //       unset" guarantee.
+  //  (ii) WINDOWED. A window sized to pull a KNOWN set of states in-strip:
+  //       the census must match the count computed independently from eps,
+  //       and the in-strip V elements must be BIT-IDENTICAL to a direct
+  //       evaluation at z = eps + i*eta -- i.e. the window really delivers
+  //       exact evaluation, not a differently-clamped one.
+  // =====================================================================
+  TEST_CASE("tc_strip_window_lih222", "[methods][tc_contour]") {
+    auto &mpi_context = utils::make_unit_test_mpi_context();
+    if (mpi_context->comm.size() != 1) return;
+    decltype(nda::range::all) all;
+
+    auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_lih222"));
+    const int nIpts = mf->nbnd() * 2;
+    thc_reader_t thc(mf, make_thc_reader_ptree(nIpts, "", "incore", "", "bdft", 1e-8,
+                                               mf->ecutrho(), 1, 1024));
+    const long ns = mf->nspin(), Nk_ibz = mf->nkpts_ibz(), nbnd = mf->nbnd();
+    const double beta = 1000.0;
+    auto eigval = mf->eigval();
+    double e_min = 1e300, e_max = -1e300;
+    for (long s = 0; s < ns; ++s)
+      for (long k = 0; k < Nk_ibz; ++k)
+        for (long n = 0; n < nbnd; ++n) {
+          e_min = std::min(e_min, eigval(s, k, n));
+          e_max = std::max(e_max, eigval(s, k, n));
+        }
+    const double w_max = std::max(std::abs(e_min), std::abs(e_max)) + 2.0;
+
+    imag_axes_ft::IAFT ft(beta, w_max + 1.0, imag_axes_ft::dlr_basis, "high");
+    MBState mb_state(mpi_context, ft, "coqui_tc4_strip");
+    simple_dyson dyson(mf.get(), &ft);
+    mb_state.sF_skij.emplace(math::shm::make_shared_array<Array_view_4D_t>(
+        *mpi_context, {ns, Nk_ibz, nbnd, nbnd}));
+    mb_state.sDm_skij.emplace(math::shm::make_shared_array<Array_view_4D_t>(
+        *mpi_context, {ns, Nk_ibz, nbnd, nbnd}));
+    mb_state.sG_tskij.emplace(math::shm::make_shared_array<Array_view_5D_t>(
+        *mpi_context, {ft.nt_f(), ns, Nk_ibz, nbnd, nbnd}));
+    mb_state.sSigma_tskij.emplace(math::shm::make_shared_array<Array_view_5D_t>(
+        *mpi_context, {ft.nt_f(), ns, Nk_ibz, nbnd, nbnd}));
+    hamilt::set_fock(*mf, dyson.PSP(), mb_state.sF_skij.value(), true);
+    if (mpi_context->node_comm.root()) mb_state.sSigma_tskij.value().local() = ComplexType(0.0);
+    mb_state.sSigma_tskij.value().communicator()->barrier();
+    double mu = 0.0;
+    update_G(dyson, *mf, ft, mb_state.sDm_skij.value(), mb_state.sG_tskij.value(),
+             mb_state.sF_skij.value(), mb_state.sSigma_tskij.value(), mu, false);
+    solvers::scr_coulomb_t scr_im(&ft, "rpa", "ignore_g0");
+    scr_im.update_w(mb_state, thc, -1);
+
+    auto sE = math::shm::make_shared_array<Array_view_3D_t>(
+        *mpi_context, {ns, Nk_ibz, nbnd});
+    auto sMO = math::shm::make_shared_array<Array_view_4D_t>(
+        *mpi_context, {ns, Nk_ibz, nbnd, nbnd});
+    if (mpi_context->node_comm.root()) {
+      sE.local() = ComplexType(0.0);
+      sMO.local() = ComplexType(0.0);
+      for (long s = 0; s < ns; ++s)
+        for (long k = 0; k < Nk_ibz; ++k)
+          for (long n = 0; n < nbnd; ++n) {
+            sE.local()(s, k, n) = ComplexType(eigval(s, k, n), 0.0);
+            sMO.local()(s, k, n, n) = ComplexType(1.0, 0.0);
+          }
+    }
+    sE.communicator()->barrier();
+    sMO.communicator()->barrier();
+
+    qp_modea::modea_ctx ctx;
+    qp_modea::modea_opts opts;
+    opts.wfit = "tau";
+    opts.level = 3;
+    qp_modea::build_modea_context(ctx, mb_state, thc, sMO, sE, mu, ft, opts,
+                                  "ignore_g0", false);
+    REQUIRE(ctx.blocks.size() > 0);
+    REQUIRE(ctx.diag.gap_edge > 0.0);
+
+    // ---- (i) DEFAULT IDENTITY: unset knobs == the E_PH formula, EXACTLY ----
+    REQUIRE(ctx.opts.strip_lo == 0.0);
+    REQUIRE(ctx.opts.strip_hi == 0.0);
+    REQUIRE(not qp_modea::strip_window_set(ctx.opts));
+    const double d_ref = 0.95 * ctx.diag.gap_edge;
+    const double lo_ref = ctx.vbm - d_ref, hi_ref = ctx.cbm + d_ref;
+    auto s0 = qp_modea::strip_of(ctx);
+    REQUIRE(s0.lo == lo_ref);            // operator==, not Approx: bit-identical
+    REQUIRE(s0.hi == hi_ref);
+    REQUIRE(s0.active == (ctx.diag.gap_edge > 0.0 and ctx.cbm > ctx.vbm));
+
+    auto const &blk = ctx.blocks[0];
+    nda::array<double, 1> eps(nbnd);
+    for (long a = 0; a < nbnd; ++a) eps(a) = sE.local()(blk.is, blk.ik, a).real();
+
+    nda::array<ComplexType, 2> V0(nbnd, nbnd), V1(nbnd, nbnd), Vr(nbnd, nbnd);
+    qp_modea::clamp_census cc0, cc1;
+    qp_modea::modea_vxc_cd(ctx, blk, eps, V0, nullptr, &cc0);
+    long n_in_ref = 0;
+    for (long a = 0; a < nbnd; ++a)
+      if (eps(a) >= lo_ref and eps(a) <= hi_ref) ++n_in_ref;
+    REQUIRE(cc0.n_eval == nbnd);
+    REQUIRE(cc0.n_eval - cc0.n_clamp == n_in_ref);   // the census the old formula predicts
+
+    // ---- (ii) WINDOWED: pull a KNOWN state set in-strip -------------------
+    // A window wide enough to admit every band of this block, so the expected
+    // set is exactly "all of them" and the reference is unambiguous.
+    double emax_off = 0.0;
+    for (long a = 0; a < nbnd; ++a) emax_off = std::max(emax_off, std::abs(eps(a) - ctx.mu));
+    ctx.opts.strip_lo = emax_off + 0.05;
+    ctx.opts.strip_hi = emax_off + 0.05;
+    REQUIRE(qp_modea::strip_window_set(ctx.opts));
+    auto s1 = qp_modea::strip_of(ctx);
+    REQUIRE(s1.active);
+    REQUIRE(s1.lo == ctx.mu - ctx.opts.strip_lo);
+    REQUIRE(s1.hi == ctx.mu + ctx.opts.strip_hi);
+    REQUIRE(s1.lo < lo_ref);                          // strictly wider than the E_PH strip
+    REQUIRE(s1.hi > hi_ref);
+    qp_modea::modea_vxc_cd(ctx, blk, eps, V1, nullptr, &cc1);
+    REQUIRE(cc1.n_eval == nbnd);
+    REQUIRE(cc1.n_clamp == 0);                        // EVERY state now in-strip
+    REQUIRE(cc1.n_eval - cc1.n_clamp == nbnd);
+
+    // the reference: Sigma^c evaluated DIRECTLY at z = eps + i*eta for every state,
+    // assembled with modea_vxc_cd's own V = (D + D')/2 convention.
+    {
+      nda::array<ComplexType, 3> S(nbnd, nbnd, nbnd);   // S(a_of_z, i, j)
+      nda::array<ComplexType, 2> Srow(nbnd, nbnd);
+      for (long a = 0; a < nbnd; ++a) {
+        qp_modea::modea_sigma_at(ctx, blk, ComplexType(eps(a), ctx.eta), Srow);
+        for (long i = 0; i < nbnd; ++i)
+          for (long j = 0; j < nbnd; ++j) S(a, i, j) = Srow(i, j);
+      }
+      for (long a = 0; a < nbnd; ++a)
+        for (long b = 0; b < nbnd; ++b)
+          Vr(a, b) = 0.5 * (S(a, a, b) + S(b, a, b));
+    }
+    double dwin = 0.0, vmag = 0.0;
+    for (long a = 0; a < nbnd; ++a)
+      for (long b = 0; b < nbnd; ++b) {
+        dwin = std::max(dwin, std::abs(V1(a, b) - Vr(a, b)));
+        vmag = std::max(vmag, std::abs(Vr(a, b)));
+      }
+
+    // and the windowed map must DIFFER from the clamped one -- otherwise the pin
+    // would pass on a knob that does nothing.
+    double dcl = 0.0;
+    for (long a = 0; a < nbnd; ++a)
+      for (long b = 0; b < nbnd; ++b) dcl = std::max(dcl, std::abs(V1(a, b) - V0(a, b)));
+
+    // ---- (iii) restoring the default restores the default, exactly --------
+    ctx.opts.strip_lo = 0.0;
+    ctx.opts.strip_hi = 0.0;
+    auto s2 = qp_modea::strip_of(ctx);
+    REQUIRE(s2.lo == lo_ref);
+    REQUIRE(s2.hi == hi_ref);
+    nda::array<ComplexType, 2> V2(nbnd, nbnd);
+    qp_modea::clamp_census cc2;
+    qp_modea::modea_vxc_cd(ctx, blk, eps, V2, nullptr, &cc2);
+    double dback = 0.0;
+    for (long a = 0; a < nbnd; ++a)
+      for (long b = 0; b < nbnd; ++b) dback = std::max(dback, std::abs(V2(a, b) - V0(a, b)));
+
+    app_log(2, "[TC-4 strip] qe_lih222, block ({},{}): E_PH = {:.6f} a.u.; DEFAULT strip "
+               "({:+.6f}, {:+.6f}) a.u. = {:.4f} eV wide -> IN-STRIP {} of {} states. "
+               "EXPLICIT window +-{:.4f} a.u. ({:.4f} eV) -> IN-STRIP {} of {}. "
+               "Windowed V vs DIRECT evaluation at eps + i*eta: {:.3e} over max|V| = {:.4g} "
+               "(gate: bit-identical). Windowed vs clamped: {:.3e} (must be NON-zero, else "
+               "the knob does nothing). Default restored: {:.3e} (gate: exactly 0).",
+            blk.is, blk.ik, ctx.diag.gap_edge, lo_ref, hi_ref,
+            (hi_ref - lo_ref) * 27.211386245988, n_in_ref, nbnd,
+            ctx.opts.strip_lo == 0.0 ? emax_off + 0.05 : ctx.opts.strip_lo,
+            (emax_off + 0.05) * 27.211386245988, nbnd - cc1.n_clamp, nbnd,
+            dwin, vmag, dcl, dback);
+
+    REQUIRE(dwin == 0.0);        // the window delivers EXACT evaluation, bit for bit
+    REQUIRE(dcl > 1e-12);        // and it is not a no-op
+    REQUIRE(dback == 0.0);       // unset restores the default exactly
+    REQUIRE(n_in_ref < nbnd);    // the fixture really is strip-limited by default
+  }
+
+  // =====================================================================
   //  TC-4 -- THE MULTI-RANK COLLECTIVE-FREE GATE.  ⚠ THE LIVELOCK REGRESSION.
   //
   //  WHAT IT CATCHES. thc_reader_t::Z(iq) is an MPI COLLECTIVE over the THC

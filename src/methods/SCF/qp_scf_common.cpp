@@ -106,6 +106,8 @@ namespace {
     opts.cd_bstore_cap_gb = qp_params.qp_tc_bstore_gb;
     opts.cd_bfactor = qp_params.qp_tc_bfactor;
     opts.cd_batch_mb = qp_params.qp_tc_batch_mb;
+    opts.strip_lo = qp_params.qp_modea_strip_lo;
+    opts.strip_hi = qp_params.qp_modea_strip_hi;
     opts.iter = 1;
     std::string div = "ignore_g0";
     if constexpr (requires { mb_solver.corr->iter(); })
@@ -156,6 +158,17 @@ namespace {
                  "\"recompute\".", opts.cd_bfactor);
     utils::check(opts.cd_batch_mb > 0.0,
                  "qp_modea: qp_tc_batch_mb = {} must be > 0.", opts.cd_batch_mb);
+    // TC-4: the explicit strip window. Both or neither -- a one-sided window silently
+    // paired with an E_PH bound is exactly the kind of mis-set that reads as physics.
+    utils::check(opts.strip_lo >= 0.0 and opts.strip_hi >= 0.0,
+                 "qp_modea: qp_modea_strip_lo = {} / qp_modea_strip_hi = {} are HALF-WIDTHS "
+                 "below and above mu and must be >= 0 (0 = unset = the E_PH strip).",
+                 opts.strip_lo, opts.strip_hi);
+    utils::check((opts.strip_lo > 0.0) == (opts.strip_hi > 0.0),
+                 "qp_modea: qp_modea_strip_lo = {} and qp_modea_strip_hi = {} must be set "
+                 "TOGETHER (both > 0 for an explicit window, both 0 for the E_PH-derived "
+                 "strip). A one-sided window is never intended.",
+                 opts.strip_lo, opts.strip_hi);
 
     app_log(2, "\n* {} quasiparticle map (Project 2 increment QM3): building the "
                "evaluator context", qp_params.qp_map);
@@ -845,17 +858,37 @@ namespace {
     exc_lo_worst = comm.all_reduce_value(exc_lo_worst, boost::mpi3::max<>{});
     exc_hi_worst = comm.all_reduce_value(exc_hi_worst, boost::mpi3::max<>{});
     if (cd and not mode_b) {
-      app_log(lvl, "  - mode_a STRIP CLAMP:         strip = (VBM - 0.95 E_PH, CBM + 0.95 "
-                   "E_PH) = ({:+.6f}, {:+.6f}) a.u. with VBM {:+.6f}, CBM {:+.6f}, E_PH "
-                   "{:.6f} ({})", strip.lo, strip.hi, ctx->vbm, ctx->cbm,
-              ctx->diag.gap_edge, strip.active ? "ACTIVE" : "INACTIVE (no support "
-                                                            "constraint this iteration)");
-      app_log(lvl, "  - mode_a strip census:        {} of {} evaluation energies out of strip "
+      const bool swin = qp_modea::strip_window_set(ctx->opts);
+      app_log(lvl, "  - mode_a STRIP CLAMP:         strip = {} = ({:+.6f}, {:+.6f}) a.u. = "
+                   "({:+.4f}, {:+.4f}) eV, i.e. mu {:+.4f} eV {:+.4f} / {:+.4f} eV; with "
+                   "VBM {:+.6f}, CBM {:+.6f}, E_PH {:.6f} ({})",
+              swin ? "EXPLICIT WINDOW [mu - qp_modea_strip_lo, mu + qp_modea_strip_hi]"
+                   : "(VBM - 0.95 E_PH, CBM + 0.95 E_PH)",
+              strip.lo, strip.hi, strip.lo * HA2EV, strip.hi * HA2EV, ctx->mu * HA2EV,
+              (strip.lo - ctx->mu) * HA2EV, (strip.hi - ctx->mu) * HA2EV,
+              ctx->vbm, ctx->cbm, ctx->diag.gap_edge,
+              strip.active ? "ACTIVE" : "INACTIVE (no support constraint this iteration)");
+      if (swin)
+        app_log(lvl, "  - mode_a STRIP WINDOW (TC-4): EXPLICIT: strip_lo = {:.6f} a.u. "
+                     "({:.4f} eV) below mu, strip_hi = {:.6f} a.u. ({:.4f} eV) above mu. The "
+                     "E_PH strip it REPLACES would have been ({:+.6f}, {:+.6f}) a.u. -- "
+                     "{:.4f} eV wide against {:.4f} eV now. gap_edge and the W^c support "
+                     "constraint are UNCHANGED by this knob; check the census below, because "
+                     "a mis-sized window fails as a clamp artefact, not as an error.",
+                ctx->opts.strip_lo, ctx->opts.strip_lo * HA2EV,
+                ctx->opts.strip_hi, ctx->opts.strip_hi * HA2EV,
+                ctx->vbm - 0.95 * ctx->diag.gap_edge, ctx->cbm + 0.95 * ctx->diag.gap_edge,
+                (ctx->cbm + 0.95 * ctx->diag.gap_edge
+                 - (ctx->vbm - 0.95 * ctx->diag.gap_edge)) * HA2EV,
+                (strip.hi - strip.lo) * HA2EV);
+      app_log(lvl, "  - mode_a strip census:        IN-STRIP {} / eta-far {} / CLAMPED {} of "
+                   "{} evaluation energies; out of strip {} "
                    "({} in the gap window; {} evaluated at eps + i eta_far, {} clamped to mu) "
                    "over {} (s,k) blocks; THE JUDGE STATES: per-k HOMO out of strip in {} of "
                    "{} blocks, LUMO in {} of {}; worst excursion {:.4f} a.u. below / {:.4f} "
                    "a.u. above",
-              n_clamp, n_eval, n_clamp_win, n_eta, n_clamp - n_eta, n_blocks, n_homo_cl,
+              n_eval - n_clamp, n_eta, n_clamp - n_eta, n_eval,
+              n_clamp, n_clamp_win, n_eta, n_clamp - n_eta, n_blocks, n_homo_cl,
               n_blocks, n_lumo_cl, n_blocks, exc_lo_worst, exc_hi_worst);
       if (n_clamp_win > 0)
         app_warning("qp_approx (mode_a): {} GAP-WINDOW evaluation energies were OUT OF STRIP "

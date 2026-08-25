@@ -177,6 +177,14 @@ namespace qp_modea {
     double consist_tol = 1e-8;         // a.u.
     double eta = 0.0;                  // evaluation offset i*eta (stress only)
     double eta_far = 0.0;              // rev 4: OUT-OF-STRIP offset i*eta_far (0 = mu fallback)
+    // TC-4: the EXPLICIT STRIP WINDOW (qp_modea_strip_lo / qp_modea_strip_hi), HALF-WIDTHS
+    // below and above mu in a.u. Both 0 (the default) = unset = the E_PH-derived strip
+    // EXACTLY, bit for bit. Both > 0 replaces it with [mu - strip_lo, mu + strip_hi]. It
+    // overrides the STRIP ONLY: gap_edge, the W^c support constraint and the retained pole
+    // set are untouched, which is what makes this an evaluation-coverage knob rather than a
+    // representation knob. See the note above strip_of.
+    double strip_lo = 0.0;
+    double strip_hi = 0.0;
     std::string wsupp = "auto";        // {"auto","off",<value in a.u.>}
     std::string wfit = "tau";          // {tau, nu, spectral, contour}
     // RW-2 (notes/rw_real_axis_w_spec.md): the spectral-quadrature W^c representation.
@@ -757,16 +765,73 @@ namespace qp_modea {
     }
   };
 
+  /**
+   * ---------------------------------------------------------------------------------------
+   * TC-4 (2026-08-25): THE EXPLICIT STRIP WINDOW -- qp_modea_strip_lo / qp_modea_strip_hi
+   * ---------------------------------------------------------------------------------------
+   * ⚠ THE DEFAULT STRIP IS METAL-TUNED, AND IT IS WRONG FOR AN INSULATOR QP STUDY.
+   *
+   * The E_PH-derived strip [VBM - 0.95 E_PH, CBM + 0.95 E_PH] is a window of order the gap,
+   * straddling the gap. That is right for a metal, where everything that matters sits within
+   * k_BT of mu. On a gapped system with a wide band window it admits almost nothing:
+   * MEASURED on the TC-4 si444/nb60 legs, 12-15 of 780 states were in strip and the BAND
+   * EDGES THEMSELVES were clamped to mu, so the harvested VBM/CBM/gap metrics were reading
+   * Sigma^c(mu) rather than the contour. Two legs differing by 1.75x in delta agreed to
+   * 0.01 meV because they shared a clamp set. [notes/tc4_si_tier.md section 11]
+   *
+   * This is the same pathology the rev-4 note above diagnosed on kp222; eta_far fixes it by
+   * evaluating EVERY out-of-strip state at eps + i eta_far, but that is all-or-nothing and
+   * the cost is prohibitive: the residue-target count grows with |eps - mu| (it is the
+   * number of internal states between eps and mu, EXACTLY ZERO at mu), so the deep
+   * conduction tail dominates and full coverage of a 60-band window is ~10^3 x the residue
+   * work of the clamped run. What is wanted instead is a CHOSEN window: the states the
+   * metric needs evaluated exactly, everything else still clamped and therefore still free.
+   *
+   * That is this knob. Both half-widths 0 = unset = the E_PH strip, BIT FOR BIT (gate
+   * `tc_strip_window_default_identity`). Both > 0 replaces the bounds with
+   *
+   *      strip = [ mu - qp_modea_strip_lo , mu + qp_modea_strip_hi ]
+   *
+   * and forces the strip ACTIVE (an explicit window means the caller wants clamping, even
+   * where the support constraint is off). Exactly one set is rejected at parse time -- a
+   * one-sided window is never what anyone means, and silently pairing it with an E_PH bound
+   * would hide the mistake.
+   *
+   * ⚠ WHAT IT DOES NOT TOUCH: gap_edge, the W^c support constraint, the retained pole set,
+   * the fit, the contour geometry. It changes WHICH EVALUATION POINTS are exact, not the
+   * map's construction. `qp_modea_wsupp` would change all of those at once -- it drives the
+   * support constraint and the strip together -- which is why it is NOT the knob for this.
+   *
+   * ⚠ THE KNOWN CAVEAT, stated because it is a real limitation and not a rounding error:
+   * states outside the window are still clamped to mu (or to eps + i eta_far), and they
+   * still feed H_eff through self-consistency. The rev-4 kp222 lesson was about METRIC
+   * states being clamped, which a correctly sized window fixes outright; the residual
+   * effect of deep-state clamping is second order for delta-tier DIFFERENCES taken at a
+   * FIXED clamp policy, which is what the TC-4 study measures. A band-structure deliverable,
+   * where every band at every k is the metric, must WIDEN THE WINDOW rather than trust
+   * eta_far to stand in for it.
+   */
   inline strip_t strip_of(modea_ctx const &ctx) {
     strip_t s;
     const double d = 0.95 * ctx.diag.gap_edge;   // the same margin as modeb_in_strip
-    s.active = (ctx.diag.gap_edge > 0.0 and ctx.cbm > ctx.vbm);
-    s.lo = ctx.vbm - d;
-    s.hi = ctx.cbm + d;
+    const bool win = (ctx.opts.strip_lo > 0.0 and ctx.opts.strip_hi > 0.0);
+    s.active = win or (ctx.diag.gap_edge > 0.0 and ctx.cbm > ctx.vbm);
+    if (win) {
+      s.lo = ctx.mu - ctx.opts.strip_lo;
+      s.hi = ctx.mu + ctx.opts.strip_hi;
+    } else {
+      s.lo = ctx.vbm - d;
+      s.hi = ctx.cbm + d;
+    }
     s.mu = ctx.mu;
     s.eta = ctx.eta;
     s.eta_far = ctx.eta_far;
     return s;
+  }
+
+  /** true when an explicit window is in force (for the banner and the census). */
+  inline bool strip_window_set(modea_opts const &o) {
+    return (o.strip_lo > 0.0 and o.strip_hi > 0.0);
   }
 
   /** clamp bookkeeping of ONE map assembly (one (s,k) block, one inner sweep). */

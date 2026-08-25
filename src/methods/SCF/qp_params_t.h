@@ -273,6 +273,42 @@ struct qp_params_t {
   double      qp_tc_bstore_gb = 0.0;
   std::string qp_tc_bfactor = "auto";
   double      qp_tc_batch_mb = 64.0;
+  // ---- TC-4: THE EXPLICIT STRIP WINDOW (mode-A CD route) ----
+  //   qp_modea_strip_lo / qp_modea_strip_hi   HALF-WIDTHS below and above mu, a.u.
+  //   Both 0 (DEFAULT) = unset = the E_PH-derived strip
+  //   (VBM - 0.95 E_PH, CBM + 0.95 E_PH) EXACTLY, bit for bit. Both > 0 replaces it with
+  //   [mu - strip_lo, mu + strip_hi] and forces the strip active. Exactly one set is a
+  //   parse error -- a one-sided window is never intended and pairing it with an E_PH
+  //   bound would hide the mistake.
+  //
+  //   ⚠ WHY IT EXISTS. The E_PH strip is a window of order the GAP, so on a gapped system
+  //   with a wide band window it admits almost nothing: MEASURED on the TC-4 si444/nb60
+  //   legs, 12-15 of 780 states were in strip and the BAND EDGES were clamped to mu, i.e.
+  //   the harvested VBM/CBM/gap were reading Sigma^c(mu), not the contour. The default is
+  //   correct for a METAL (SVO) and wrong for any insulator QP or band-structure study.
+  //   [notes/tc4_si_tier.md section 11]
+  //
+  //   It overrides the STRIP ONLY. gap_edge, the W^c support constraint, the retained pole
+  //   set, the fit and the contour geometry are untouched -- an evaluation-coverage knob,
+  //   not a representation knob. qp_modea_wsupp is NOT an alternative: it drives the
+  //   support constraint and the strip TOGETHER, and widening it to cover a valence
+  //   manifold guts the constrained fit (and is silently disabled past the outermost
+  //   auxiliary node).
+  //
+  //   SIZING, for a QP tier: cover the full valence manifold plus the conduction bands the
+  //   metric names, with margin --
+  //       strip_lo ~ (mu - VBM) + valence bandwidth + margin
+  //       strip_hi ~ (CBM - mu) + (top of the needed conduction bands - CBM) + margin
+  //   The resolved window and the census are printed in the banner; check them, because a
+  //   mis-sized window fails silently as a clamp artefact rather than as an error.
+  //
+  //   ⚠ CAVEAT: states outside the window are still clamped and still feed H_eff through
+  //   self-consistency. That residual is second order for delta-tier DIFFERENCES at a fixed
+  //   clamp policy; a band-structure deliverable must WIDEN THE WINDOW rather than rely on
+  //   qp_modea_eta_far, whose cost is ~10^3 x at a 60-band window (the residue-target count
+  //   grows with |eps - mu| and the deep conduction tail dominates).
+  double      qp_modea_strip_lo = 0.0;
+  double      qp_modea_strip_hi = 0.0;
 };
 
 } // methods

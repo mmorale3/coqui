@@ -715,6 +715,18 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     qp_params.qp_modea_eta_far = io::get_value_with_default<double>(pt,"qp_modea_eta_far",0.0);
     utils::check(qp_params.qp_modea_eta_far >= 0.0,
                  "evgw: qp_modea_eta_far must be >= 0 (0 = the mu fallback of spec rev 3.1).");
+    // TC-4: the explicit strip window (half-widths below/above mu, a.u.). Both 0 = unset =
+    // the E_PH-derived strip, bit for bit. See qp_params_t.h and notes/tc4_si_tier.md s11.
+    qp_params.qp_modea_strip_lo =
+        io::get_value_with_default<double>(pt,"qp_modea_strip_lo",0.0);
+    qp_params.qp_modea_strip_hi =
+        io::get_value_with_default<double>(pt,"qp_modea_strip_hi",0.0);
+    utils::check(qp_params.qp_modea_strip_lo >= 0.0 and qp_params.qp_modea_strip_hi >= 0.0,
+                 "evgw: qp_modea_strip_lo / qp_modea_strip_hi are HALF-WIDTHS below and above "
+                 "mu and must be >= 0 (0 = unset = the E_PH strip).");
+    utils::check((qp_params.qp_modea_strip_lo > 0.0) == (qp_params.qp_modea_strip_hi > 0.0),
+                 "evgw: qp_modea_strip_lo and qp_modea_strip_hi must be set TOGETHER (both > 0 "
+                 "for an explicit window, both 0 for the E_PH strip).");
     qp_params.qp_modea_wsupp = io::get_value_with_default<std::string>(pt,"qp_modea_wsupp","auto");
     io::tolower(qp_params.qp_modea_wsupp);
     qp_params.qp_modea_wfit = io::get_value_with_default<std::string>(pt,"qp_modea_wfit","tau");
@@ -890,6 +902,18 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     qp_params.qp_modea_eta_far = io::get_value_with_default<double>(pt,"qp_modea_eta_far",0.0);
     utils::check(qp_params.qp_modea_eta_far >= 0.0,
                  "qpgw: qp_modea_eta_far must be >= 0 (0 = the mu fallback of spec rev 3.1).");
+    // TC-4: the explicit strip window (half-widths below/above mu, a.u.). Both 0 = unset =
+    // the E_PH-derived strip, bit for bit. See qp_params_t.h and notes/tc4_si_tier.md s11.
+    qp_params.qp_modea_strip_lo =
+        io::get_value_with_default<double>(pt,"qp_modea_strip_lo",0.0);
+    qp_params.qp_modea_strip_hi =
+        io::get_value_with_default<double>(pt,"qp_modea_strip_hi",0.0);
+    utils::check(qp_params.qp_modea_strip_lo >= 0.0 and qp_params.qp_modea_strip_hi >= 0.0,
+                 "qpgw: qp_modea_strip_lo / qp_modea_strip_hi are HALF-WIDTHS below and above "
+                 "mu and must be >= 0 (0 = unset = the E_PH strip).");
+    utils::check((qp_params.qp_modea_strip_lo > 0.0) == (qp_params.qp_modea_strip_hi > 0.0),
+                 "qpgw: qp_modea_strip_lo and qp_modea_strip_hi must be set TOGETHER (both > 0 "
+                 "for an explicit window, both 0 for the E_PH strip).");
     qp_params.qp_modea_wsupp = io::get_value_with_default<std::string>(pt,"qp_modea_wsupp","auto");
     io::tolower(qp_params.qp_modea_wsupp);
     qp_params.qp_modea_wfit = io::get_value_with_default<std::string>(pt,"qp_modea_wfit","tau");
@@ -1364,6 +1388,18 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
     qp_params.qp_modea_eta_far = io::get_value_with_default<double>(pt,"qp_modea_eta_far",0.0);
     utils::check(qp_params.qp_modea_eta_far >= 0.0,
                  "qpgw: qp_modea_eta_far must be >= 0 (0 = the mu fallback of spec rev 3.1).");
+    // TC-4: the explicit strip window (half-widths below/above mu, a.u.). Both 0 = unset =
+    // the E_PH-derived strip, bit for bit. See qp_params_t.h and notes/tc4_si_tier.md s11.
+    qp_params.qp_modea_strip_lo =
+        io::get_value_with_default<double>(pt,"qp_modea_strip_lo",0.0);
+    qp_params.qp_modea_strip_hi =
+        io::get_value_with_default<double>(pt,"qp_modea_strip_hi",0.0);
+    utils::check(qp_params.qp_modea_strip_lo >= 0.0 and qp_params.qp_modea_strip_hi >= 0.0,
+                 "qpgw: qp_modea_strip_lo / qp_modea_strip_hi are HALF-WIDTHS below and above "
+                 "mu and must be >= 0 (0 = unset = the E_PH strip).");
+    utils::check((qp_params.qp_modea_strip_lo > 0.0) == (qp_params.qp_modea_strip_hi > 0.0),
+                 "qpgw: qp_modea_strip_lo and qp_modea_strip_hi must be set TOGETHER (both > 0 "
+                 "for an explicit window, both 0 for the E_PH strip).");
     qp_params.qp_modea_wsupp = io::get_value_with_default<std::string>(pt,"qp_modea_wsupp","auto");
     io::tolower(qp_params.qp_modea_wsupp);
     qp_params.qp_modea_wfit = io::get_value_with_default<std::string>(pt,"qp_modea_wfit","tau");
