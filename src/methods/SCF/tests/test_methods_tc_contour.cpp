@@ -738,10 +738,13 @@ namespace bdft_tests {
       auto tf = tilted_contour::factor_transform(pctx.c);
       app_log(2, "[TC-3-b(2)] transform factorization: {} nodes x {} grid points, "
                  "cond = {:.3e}", tf.r, tf.nD, tf.cond);
+      // TC-4 livelock fix: thc.Z(q) is COLLECTIVE, so the tiles are gathered once here
+      // (all ranks in lockstep) and the evaluator never touches the reader again.
+      auto sZt = pc::gather_Z_tiles(thc);
 
       methods::wc_line::solve_opts_t sopt;
       methods::wc_line::solve_stats_t sstat;
-      auto csrc = pc::make_contour_residue_source(ctx, pctx, tf, sPc, thc, sopt, sstat);
+      auto csrc = pc::make_contour_residue_source(ctx, pctx, tf, sPc, *sZt, thc.Np(), sopt, sstat);
 
       const double dlt = pctx.geom.delta;
       qp_modea::cd_line_opts clo3;
@@ -910,8 +913,8 @@ namespace bdft_tests {
       // =================================================================
       {
         methods::wc_line::solve_stats_t st1, stN;
-        auto src1 = pc::make_contour_residue_batch(ctx, pctx, tf, sPc, thc, sopt, st1);
-        auto srcN = pc::make_contour_residue_batch(ctx, pctx, tf, sPc, thc, sopt, stN);
+        auto src1 = pc::make_contour_residue_batch(ctx, pctx, tf, sPc, *sZt, thc.Np(), sopt, st1);
+        auto srcN = pc::make_contour_residue_batch(ctx, pctx, tf, sPc, *sZt, thc.Np(), sopt, stN);
         qp_modea::cd_line_ctx cb1, cbN;
         qp_modea::cd_line_prepare(cb1, ctx, clo3);
         qp_modea::cd_line_prepare(cbN, ctx, clo3);
@@ -1079,13 +1082,13 @@ namespace bdft_tests {
 
         // (b) Sigma^c, same contour, the band factors the only variable
         methods::wc_line::solve_stats_t str;
-        auto srcr = pc::make_contour_residue_batch(ctxr, pctx, tf, sPc, thc, sopt, str);
+        auto srcr = pc::make_contour_residue_batch(ctxr, pctx, tf, sPc, *sZt, thc.Np(), sopt, str);
         qp_modea::cd_line_ctx cr;
         qp_modea::cd_line_prepare(cr, ctxr, clo3);
         cr.residue_batch = srcr;
         cr.route = "contour";
         methods::wc_line::solve_stats_t sts;
-        auto srcs = pc::make_contour_residue_batch(ctx, pctx, tf, sPc, thc, sopt, sts);
+        auto srcs = pc::make_contour_residue_batch(ctx, pctx, tf, sPc, *sZt, thc.Np(), sopt, sts);
         qp_modea::cd_line_ctx cs;
         qp_modea::cd_line_prepare(cs, ctx, clo3);
         cs.residue_batch = srcs;
@@ -1202,6 +1205,247 @@ namespace bdft_tests {
 
   TEST_CASE("tc3b1_identity_lih222", "[methods][tc_contour]") {
     run_tc3b1_gate("qe_lih222");
+  }
+
+  // =====================================================================
+  //  TC-4 -- THE MULTI-RANK COLLECTIVE-FREE GATE.  ⚠ THE LIVELOCK REGRESSION.
+  //
+  //  WHAT IT CATCHES. thc_reader_t::Z(iq) is an MPI COLLECTIVE over the THC
+  //  array's communicator (thc_reader_t.hpp:720: it loops over EVERY rank,
+  //  broadcasting the requested iq from each in turn). The contour residue
+  //  evaluator runs inside the per-rank work loop of modea_vxc_cd, where
+  //  ranks carry different (s,k) blocks, different target counts and
+  //  different q-transfer sets -- so calling Z(q) there gives mismatched
+  //  collective sequences and MPI deadlocks as a 100 %-CPU spin.
+  //
+  //  MEASURED IN PRODUCTION: the m3d SVO run, 60 ranks, hung 19 h in
+  //  PMPI_Gather <- gather_sub_matrix <- thc_reader_t::Z <- contour_residue_batch.
+  //  The single-rank gates cannot see it -- the gather degenerates at size 1 --
+  //  which is exactly why this case exists.
+  //
+  //  IT RUNS AT ANY SIZE so the single-process suite exercises the code path,
+  //  but the DIVERGENCE only bites at > 1 rank. Under mpiexec -n 2..4 the
+  //  pre-fix evaluator HANGS here; the fixed one completes.
+  //
+  //  Three checks, in order of what they isolate:
+  //    (Z1) the pre-gathered tiles equal thc.Z(iq) on EVERY rank, all iq;
+  //    (Z2) every rank holds the same tiles (they are replicated, not sharded);
+  //    (Z3) DELIBERATELY DIVERGENT per-rank batches complete, and agree with a
+  //         differently-chunked re-evaluation of the same targets.
+  // =====================================================================
+  TEST_CASE("tc_contour_multirank_zseq", "[methods][tc_contour]") {
+    auto &mpi_context = utils::make_unit_test_mpi_context();
+    decltype(nda::range::all) all;
+    const int csize = mpi_context->comm.size();
+    const int crank = mpi_context->comm.rank();
+
+    auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_lih222"));
+    const int nIpts = mf->nbnd() * 2;
+    thc_reader_t thc(mf, make_thc_reader_ptree(nIpts, "", "incore", "", "bdft", 1e-8,
+                                               mf->ecutrho(), 1, 1024));
+    const long ns = mf->nspin(), Nk_ibz = mf->nkpts_ibz(), nbnd = mf->nbnd();
+    const double beta = 1000.0;
+    auto eigval = mf->eigval();
+    double e_min = 1e300, e_max = -1e300;
+    for (long s = 0; s < ns; ++s)
+      for (long k = 0; k < Nk_ibz; ++k)
+        for (long n = 0; n < nbnd; ++n) {
+          e_min = std::min(e_min, eigval(s, k, n));
+          e_max = std::max(e_max, eigval(s, k, n));
+        }
+    const double w_max = std::max(std::abs(e_min), std::abs(e_max)) + 2.0;
+
+    imag_axes_ft::IAFT ft(beta, w_max + 1.0, imag_axes_ft::dlr_basis, "high");
+    MBState mb_state(mpi_context, ft, "coqui_tc4_mrank");
+    simple_dyson dyson(mf.get(), &ft);
+    mb_state.sF_skij.emplace(math::shm::make_shared_array<Array_view_4D_t>(
+        *mpi_context, {ns, Nk_ibz, nbnd, nbnd}));
+    mb_state.sDm_skij.emplace(math::shm::make_shared_array<Array_view_4D_t>(
+        *mpi_context, {ns, Nk_ibz, nbnd, nbnd}));
+    mb_state.sG_tskij.emplace(math::shm::make_shared_array<Array_view_5D_t>(
+        *mpi_context, {ft.nt_f(), ns, Nk_ibz, nbnd, nbnd}));
+    mb_state.sSigma_tskij.emplace(math::shm::make_shared_array<Array_view_5D_t>(
+        *mpi_context, {ft.nt_f(), ns, Nk_ibz, nbnd, nbnd}));
+    hamilt::set_fock(*mf, dyson.PSP(), mb_state.sF_skij.value(), true);
+    if (mpi_context->node_comm.root()) mb_state.sSigma_tskij.value().local() = ComplexType(0.0);
+    mb_state.sSigma_tskij.value().communicator()->barrier();
+    double mu = 0.0;
+    update_G(dyson, *mf, ft, mb_state.sDm_skij.value(), mb_state.sG_tskij.value(),
+             mb_state.sF_skij.value(), mb_state.sSigma_tskij.value(), mu, false);
+    solvers::scr_coulomb_t scr_im(&ft, "rpa", "ignore_g0");
+    scr_im.update_w(mb_state, thc, -1);
+
+    auto sE = math::shm::make_shared_array<Array_view_3D_t>(
+        *mpi_context, {ns, Nk_ibz, nbnd});
+    auto sMO = math::shm::make_shared_array<Array_view_4D_t>(
+        *mpi_context, {ns, Nk_ibz, nbnd, nbnd});
+    if (mpi_context->node_comm.root()) {
+      sE.local() = ComplexType(0.0);
+      sMO.local() = ComplexType(0.0);
+      for (long s = 0; s < ns; ++s)
+        for (long k = 0; k < Nk_ibz; ++k)
+          for (long n = 0; n < nbnd; ++n) {
+            sE.local()(s, k, n) = ComplexType(eigval(s, k, n), 0.0);
+            sMO.local()(s, k, n, n) = ComplexType(1.0, 0.0);
+          }
+    }
+    sE.communicator()->barrier();
+    sMO.communicator()->barrier();
+
+    qp_modea::modea_ctx ctx;
+    qp_modea::modea_opts opts;
+    opts.wfit = "tau";
+    opts.level = 3;
+    opts.cd_bfactor = "recompute";      // the production representation
+    qp_modea::build_modea_context(ctx, mb_state, thc, sMO, sE, mu, ft, opts,
+                                  "ignore_g0", false);
+    REQUIRE(ctx.have_bstore);
+
+    pc::opts_t po;
+    po.eps = 1e-6;
+    po.rho = 0.65;
+    po.profile = "flat";
+    po.zeta_max = 10.0 / pc::ha_to_eV;
+    po.nx = 2500;
+    long nk_lin = 1;
+    {
+      auto kg = mf->kp_grid();
+      nk_lin = std::min({long(kg(0)), long(kg(1)), long(kg(2))});
+    }
+    auto pctx = pc::build_contour_for_spectrum(sE.local(), mu, nk_lin, beta, po);
+    const long rr = pctx.c.rank;
+    const long NP = thc.Np();
+    const long nq = mf->nqpts_ibz();
+    auto sPc = math::shm::make_shared_array<Array_view_4D_t>(
+        *mpi_context, {nq, rr, NP, NP});
+    pc::ctx_t dg;
+    pc::sample_P_at_times(sPc, pctx.t_node, thc, sMO, sE, mu, beta, -1.0, &dg);
+    auto tf = tilted_contour::factor_transform(pctx.c);
+
+    // ---- the fix under test: ONE lockstep acquisition of every Z tile ----
+    auto sZt = pc::gather_Z_tiles(thc);
+
+    // ---- (Z1) the table equals thc.Z(iq) on every rank, for every iq -------
+    // thc.Z is called here in LOCKSTEP (same iq, same trip count on all ranks),
+    // which is legal; it is the divergent call inside the evaluator that is not.
+    double z1 = 0.0, zmag = 0.0;
+    for (long iq = 0; iq < nq; ++iq) {
+      auto Zref = thc.Z(int(iq));
+      for (long P = 0; P < NP; ++P)
+        for (long Q = 0; Q < NP; ++Q) {
+          z1 = std::max(z1, std::abs(sZt->local()(iq, P, Q) - Zref(P, Q)));
+          zmag = std::max(zmag, std::abs(Zref(P, Q)));
+        }
+    }
+    z1 = mpi_context->comm.all_reduce_value(z1, boost::mpi3::max<>{});
+    zmag = mpi_context->comm.all_reduce_value(zmag, boost::mpi3::max<>{});
+
+    // ---- (Z2) every rank holds the SAME tiles ------------------------------
+    double chk_re = 0.0, chk_im = 0.0;
+    for (long iq = 0; iq < nq; ++iq)
+      for (long P = 0; P < NP; ++P)
+        for (long Q = 0; Q < NP; ++Q) {
+          const ComplexType v = sZt->local()(iq, P, Q);
+          chk_re += v.real() * double((iq + 1) * (P + 2) % 7 + 1);
+          chk_im += v.imag() * double((iq + 1) * (Q + 3) % 5 + 1);
+        }
+    const double hi_re = mpi_context->comm.all_reduce_value(chk_re, boost::mpi3::max<>{});
+    const double lo_re = mpi_context->comm.all_reduce_value(chk_re, boost::mpi3::min<>{});
+    const double hi_im = mpi_context->comm.all_reduce_value(chk_im, boost::mpi3::max<>{});
+    const double lo_im = mpi_context->comm.all_reduce_value(chk_im, boost::mpi3::min<>{});
+    const double z2 = std::max(std::abs(hi_re - lo_re), std::abs(hi_im - lo_im));
+
+    // ---- (Z3) DELIBERATELY DIVERGENT per-rank batches ----------------------
+    // Rank r evaluates a DIFFERENT NUMBER of targets, in a DIFFERENT q order, on
+    // a block IT owns. Pre-fix, each rank then issues its own count of collective
+    // thc.Z(q) calls and the job deadlocks right here. There is no assertion that
+    // can be written for a hang: COMPLETING IS THE ASSERTION.
+    REQUIRE(ctx.blocks.size() > 0);
+    methods::wc_line::solve_opts_t sopt;
+    methods::wc_line::solve_stats_t stA, stB;
+    auto srcA = pc::make_contour_residue_batch(ctx, pctx, tf, sPc, *sZt, NP, sopt, stA);
+    auto srcB = pc::make_contour_residue_batch(ctx, pctx, tf, sPc, *sZt, NP, sopt, stB, 1);
+
+    auto const &blk = ctx.blocks[0];
+    const long nloc = 1 + long(crank % 5);          // 1..5, DIFFERENT per rank
+    nda::array<long, 1> Js(nloc);
+    nda::array<ComplexType, 1> zs(nloc);
+    const long off = (blk.is * ctx.nk + blk.ik) * ctx.nJ;
+    for (long i = 0; i < nloc; ++i) {
+      // a rank-dependent stride, so the SET and ORDER of q-transfers differ too
+      Js(i) = ((long(crank) + 1) * 37 + i * 11) % ctx.nJ;
+      zs(i) = ComplexType(ctx.epsJ(off + Js(i)) - ctx.vbm, pctx.geom.delta);
+    }
+    // ⚠ THE MECHANISM, MEASURED. Inserting `for (i < nloc) thc.Z(i % nq);` right here --
+    // i.e. exactly what the evaluator used to do, a per-rank number of collective Z
+    // calls -- deadlocks this case at 2 ranks in seconds: rank 0 (nloc = 1) leaves its
+    // loop while rank 1 (nloc = 2) still waits inside its second Z, and both spin at
+    // 99-100 % CPU indefinitely (killed at 2 m 41 s). That is the m3d signature
+    // reproduced on a fixture. The lines below must therefore never reach a collective.
+    nda::array<ComplexType, 3> MA(nloc, nbnd, nbnd), MB(nloc, nbnd, nbnd);
+    srcA(blk.is, blk.ik, nloc, Js, zs, MA);          // one call, all targets
+    srcB(blk.is, blk.ik, nloc, Js, zs, MB);          // nchunk = 1, target by target
+    mpi_context->comm.barrier();                      // if we get here, no deadlock
+
+    double z3 = 0.0, mmag = 0.0;
+    for (long i = 0; i < nloc; ++i)
+      for (long a = 0; a < nbnd; ++a)
+        for (long b = 0; b < nbnd; ++b) {
+          z3 = std::max(z3, std::abs(MA(i, a, b) - MB(i, a, b)));
+          mmag = std::max(mmag, std::abs(MA(i, a, b)));
+        }
+    z3 = mpi_context->comm.all_reduce_value(z3, boost::mpi3::max<>{});
+    mmag = mpi_context->comm.all_reduce_value(mmag, boost::mpi3::max<>{});
+    const long ntot = mpi_context->comm.all_reduce_value(nloc, std::plus<>{});
+
+    // ---- (Z4) THE STORED BAND-FACTOR PATH IS EQUALLY AFFECTED, AND EQUALLY FIXED ----
+    // thc.Z(q) sat on the SHARED code path: `bs.band()` is the only representation-
+    // dependent call in the evaluator and it is purely local, so "store" and "recompute"
+    // reached the same collective and were broken identically at > 1 rank. One context
+    // per representation, the same divergent batch through both.
+    qp_modea::modea_ctx ctxs;
+    qp_modea::modea_opts opts_s = opts;
+    opts_s.cd_bfactor = "store";
+    opts_s.cd_bstore_cap_gb = 4.0;
+    qp_modea::build_modea_context(ctxs, mb_state, thc, sMO, sE, mu, ft, opts_s,
+                                  "ignore_g0", false);
+    REQUIRE(ctxs.have_bstore);
+    REQUIRE(ctxs.bstore[0].stored);
+    methods::wc_line::solve_stats_t stS;
+    auto srcS = pc::make_contour_residue_batch(ctxs, pctx, tf, sPc, *sZt, NP, sopt, stS);
+    nda::array<ComplexType, 3> MS(nloc, nbnd, nbnd);
+    auto const &blks = ctxs.blocks[0];
+    REQUIRE(blks.is == blk.is);
+    REQUIRE(blks.ik == blk.ik);
+    srcS(blks.is, blks.ik, nloc, Js, zs, MS);
+    mpi_context->comm.barrier();                      // the stored path, also no deadlock
+    double z4 = 0.0;
+    for (long i = 0; i < nloc; ++i)
+      for (long a = 0; a < nbnd; ++a)
+        for (long b = 0; b < nbnd; ++b)
+          z4 = std::max(z4, std::abs(MA(i, a, b) - MS(i, a, b)));
+    z4 = mpi_context->comm.all_reduce_value(z4, boost::mpi3::max<>{});
+
+    app_log(2, "[TC-4 mrank] qe_lih222 on {} rank(s): NO DEADLOCK. Z tiles {} x {} x {} "
+               "({:.2f} MB/node). (Z1) table vs thc.Z(iq), worst over all ranks and all "
+               "iq = {:.3e} over max|Z| = {:.4g}. (Z2) inter-rank tile spread = {:.3e}. "
+               "(Z3) {} divergent targets total ({} on rank {}), batched vs nchunk=1 "
+               "worst = {:.3e} over max|Ms| = {:.4g}. (Z4) STORED band factors vs "
+               "RECOMPUTE through the same divergent batch = {:.3e} -- both "
+               "representations share the Z access, so both were broken and both are "
+               "fixed.",
+            csize, nq, NP, NP, double(nq) * NP * NP * 16.0 / 1.048576e6,
+            z1, zmag, z2, ntot, nloc, crank, z3, mmag, z4);
+    if (csize == 1)
+      app_log(2, "[TC-4 mrank] NOTE: at 1 rank the collective degenerates and the "
+                 "divergence cannot bite. Run under mpiexec -n 2..4 for the regression "
+                 "this case exists for.");
+
+    REQUIRE(z1 == 0.0);                 // the table IS thc.Z, bit for bit
+    REQUIRE(z2 < 1e-9);                 // replicated, not sharded
+    REQUIRE(z3 / std::max(mmag, 1e-300) < 1e-14);
+    REQUIRE(z4 / std::max(mmag, 1e-300) < 1e-14);
+    REQUIRE(ntot >= csize);
   }
 
   // =====================================================================

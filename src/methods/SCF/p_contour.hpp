@@ -736,6 +736,65 @@ namespace p_contour {
    * which supplies them from its store or recomputes them (TC-4 F5); either way the
    * evaluator re-derives no symmetry bookkeeping.
    */
+  // ===========================================================================
+  //  THE Z TILES -- and THE COLLECTIVE-FREE INVARIANT
+  // ===========================================================================
+  /**
+   * ⚠⚠ INVARIANT, LOAD-BEARING: `detail::contour_residue_batch` AND EVERYTHING IT
+   * CALLS MUST BE FREE OF MPI COLLECTIVES.
+   *
+   * The evaluator runs inside the per-rank work loop of `modea_vxc_cd`, where every
+   * rank carries DIFFERENT (s, k) blocks, a different number of residue targets, and a
+   * different set of q-transfers. Any collective reached from there has a call sequence
+   * that differs across ranks, and MPI deadlocks -- as a spin, not a crash.
+   *
+   * MEASURED: the m3d SVO run (60 ranks) hung for 19 h at 100 % CPU on every rank, in
+   *   PMPI_Gather <- boost::mpi3 gather <- math::nda::gather_sub_matrix
+   *   <- thc_reader_t::Z(int, bool) <- p_contour::detail::contour_residue_batch.
+   *
+   * `thc_reader_t::Z(iq)` (thc_reader_t.hpp:720) is that collective: in the `incore`
+   * path it loops over EVERY rank of the THC array's communicator, broadcasting the
+   * requested iq from each in turn and gathering that rank's tile. It supports
+   * different iq per rank, but ONLY if every rank calls it the same number of times, in
+   * lockstep. The repository already knew this -- scr_coulomb_t.cpp:1341 pads its own
+   * call count with the comment "prevent dead block in thc.Z() in case nq_loc is not
+   * the same for all processors".
+   *
+   * THE FIX is to acquire every tile ONCE, here, where all ranks are in lockstep, and
+   * hand the evaluator a plain node-shared array. `contour_residue_batch` therefore
+   * takes NO reader handle at all -- not `thc`, not an ERI object, nothing that can
+   * reach a communicator. That is the invariant made structural rather than remembered:
+   * to reintroduce the deadlock one would have to add a parameter, not just a call.
+   *
+   * Cost: nq_ibz collectives per context build (once per SCF iteration), against the
+   * O(n_eval x nJ) it replaces. Memory: nq_ibz x Np^2 complex, ONE COPY PER NODE.
+   *
+   * [gate: tc_contour_multirank_zseq, which runs deliberately divergent per-rank target
+   *  lists under mpiexec -- it hangs on the pre-fix code and completes on this one.]
+   */
+  template<typename thc_t>
+  std::shared_ptr<sArray_t<Array_view_3D_t>> gather_Z_tiles(thc_t &thc) {
+    decltype(nda::range::all) all;
+    auto mpi = thc.mpi();
+    const long nq = thc.nqpts_ibz();
+    const long NP = thc.Np();
+    auto sZ = std::make_shared<sArray_t<Array_view_3D_t>>(
+        math::shm::make_shared_array<Array_view_3D_t>(*mpi, {nq, NP, NP}));
+    sZ->set_zero();
+    sZ->win().fence();
+    mpi->comm.barrier();
+    for (long iq = 0; iq < nq; ++iq) {
+      // COLLECTIVE, and deliberately so: the SAME iq on every rank, in a loop whose
+      // trip count is nq_ibz on every rank. This is the only place the contour route
+      // touches the reader after the context is built.
+      auto Zq = thc.template Z<HOST_MEMORY>(int(iq));
+      if (mpi->node_comm.root()) sZ->local()(iq, all, all) = Zq;
+    }
+    sZ->win().fence();
+    mpi->comm.barrier();
+    return sZ;
+  }
+
   namespace detail {
 
     /**
@@ -770,21 +829,25 @@ namespace p_contour {
     /**
      * The batched residue evaluation, shared by every maker below. `nt` targets are read
      * from the first entries of Js/zs and written to the first slices of Ms.
+     *
+     * ⚠ COLLECTIVE-FREE BY CONSTRUCTION -- see the invariant on `gather_Z_tiles` above.
+     * It takes the Coulomb tiles as a plain node-shared array and holds NO reader handle,
+     * so there is nothing in scope here that can reach an MPI communicator. Keep it that
+     * way: this function runs where every rank has different work.
      */
-    template<typename thc_t>
-    void contour_residue_batch(qp_modea::modea_ctx const &ctx,
-                               ctx_t const &pctx,
-                               tc::transform_factor_t const &tf,
-                               sArray_t<Array_view_4D_t> const &sPi,
-                               thc_t &thc,
-                               methods::wc_line::solve_stats_t *sstat,
-                               residue_scratch_t &sc,
-                               long nchunk, long is, long ik, long nt,
-                               nda::array<long, 1> const &Js,
-                               nda::array<ComplexType, 1> const &zs,
-                               nda::array<ComplexType, 3> &Ms) {
+    inline void contour_residue_batch(qp_modea::modea_ctx const &ctx,
+                                      ctx_t const &pctx,
+                                      tc::transform_factor_t const &tf,
+                                      sArray_t<Array_view_4D_t> const &sPi,
+                                      sArray_t<Array_view_3D_t> const &sZ,
+                                      long NP,
+                                      methods::wc_line::solve_stats_t *sstat,
+                                      residue_scratch_t &sc,
+                                      long nchunk, long is, long ik, long nt,
+                                      nda::array<long, 1> const &Js,
+                                      nda::array<ComplexType, 1> const &zs,
+                                      nda::array<ComplexType, 3> &Ms) {
       decltype(nda::range::all) all;
-      const long NP = thc.Np();
       const long r = pctx.c.rank;
       const long nbnd = ctx.nbnd;
       if (nt <= 0) return;
@@ -829,6 +892,12 @@ namespace p_contour {
         return bs.qs_of_J(Js(a)) < bs.qs_of_J(Js(b));
       });
 
+      auto Zloc = sZ.local();
+      utils::check(Zloc.shape()[1] == NP and Zloc.shape()[2] == NP,
+                   "p_contour::contour_residue_batch: the Z tile table is ({}, {}, {}), "
+                   "expected (nq_ibz, {}, {}). It must come from gather_Z_tiles.",
+                   Zloc.shape()[0], Zloc.shape()[1], Zloc.shape()[2], NP, NP);
+
       long g0 = 0;
       while (g0 < nt) {
         const long qs = bs.qs_of_J(Js(ord[std::size_t(g0)]));
@@ -836,7 +905,8 @@ namespace p_contour {
         while (g1 < nt and bs.qs_of_J(Js(ord[std::size_t(g1)])) == qs) ++g1;
         auto Pislab = nda::reshape(sPi.local()(qs, all, all, all),
                                    std::array<long, 2>{r, NP * NP});
-        auto Zq = thc.Z(int(qs));
+        // the PRE-GATHERED tile -- a local read, never thc.Z(qs), which is collective
+        auto Zq = Zloc(qs, all, all);
 
         for (long c0 = g0; c0 < g1; c0 += nc_max) {
           const long nc = std::min(nc_max, g1 - c0);
@@ -894,35 +964,35 @@ namespace p_contour {
    * returned function is valid after the builder's scope ends. This is what
    * build_modea_context installs on modea_ctx.
    */
-  template<typename thc_t>
-  qp_modea::cd_residue_batch_fn make_contour_residue_batch_owning(
+  inline qp_modea::cd_residue_batch_fn make_contour_residue_batch_owning(
       qp_modea::modea_ctx const &ctx,
       std::shared_ptr<ctx_t> pctx,
       std::shared_ptr<tc::transform_factor_t> tf,
       std::shared_ptr<sArray_t<Array_view_4D_t>> sPi,
-      thc_t &thc,
+      std::shared_ptr<sArray_t<Array_view_3D_t>> sZ,   // from gather_Z_tiles, NOT a reader
+      long NP,
       std::shared_ptr<methods::wc_line::solve_opts_t> sopt,
       std::shared_ptr<methods::wc_line::solve_stats_t> sstat,
       long nchunk) {
     utils::check(ctx.have_bstore,
                  "p_contour::make_contour_residue_batch_owning: no band factors.");
     auto sc = std::make_shared<detail::residue_scratch_t>();
-    return [&ctx, pctx, tf, sPi, &thc, sopt, sstat, sc, nchunk]
+    return [&ctx, pctx, tf, sPi, sZ, NP, sopt, sstat, sc, nchunk]
            (long is, long ik, long nt, nda::array<long, 1> const &Js,
             nda::array<ComplexType, 1> const &zs, nda::array<ComplexType, 3> &Ms) {
-      detail::contour_residue_batch(ctx, *pctx, *tf, *sPi, thc, sstat.get(), *sc, nchunk,
-                                    is, ik, nt, Js, zs, Ms);
+      detail::contour_residue_batch(ctx, *pctx, *tf, *sPi, *sZ, NP, sstat.get(), *sc,
+                                    nchunk, is, ik, nt, Js, zs, Ms);
     };
   }
 
   /** The non-owning batched variant (the unit gates hold their own inputs). */
-  template<typename thc_t>
-  qp_modea::cd_residue_batch_fn make_contour_residue_batch(
+  inline qp_modea::cd_residue_batch_fn make_contour_residue_batch(
       qp_modea::modea_ctx const &ctx,
       ctx_t const &pctx,
       tc::transform_factor_t const &tf,
       sArray_t<Array_view_4D_t> const &sPi,      // (nq_ibz, rank, Np, Np)
-      thc_t &thc,
+      sArray_t<Array_view_3D_t> const &sZ,       // (nq_ibz, Np, Np) from gather_Z_tiles
+      long NP,
       methods::wc_line::solve_opts_t const &sopt,
       methods::wc_line::solve_stats_t &sstat,
       long nchunk = 0) {
@@ -930,10 +1000,10 @@ namespace p_contour {
                  "p_contour::make_contour_residue_batch: the mode-A context carries no "
                  "band factors; build it with modea_opts::cd_bfactor / cd_bstore_cap_gb.");
     auto sc = std::make_shared<detail::residue_scratch_t>();
-    return [&ctx, &pctx, &tf, &sPi, &thc, &sopt, &sstat, sc, nchunk]
+    return [&ctx, &pctx, &tf, &sPi, &sZ, NP, &sopt, &sstat, sc, nchunk]
            (long is, long ik, long nt, nda::array<long, 1> const &Js,
             nda::array<ComplexType, 1> const &zs, nda::array<ComplexType, 3> &Ms) {
-      detail::contour_residue_batch(ctx, pctx, tf, sPi, thc, &sstat, *sc, nchunk,
+      detail::contour_residue_batch(ctx, pctx, tf, sPi, sZ, NP, &sstat, *sc, nchunk,
                                     is, ik, nt, Js, zs, Ms);
     };
   }
@@ -942,20 +1012,20 @@ namespace p_contour {
    * The SCALAR variant, kept for callers that hold one (J, z) at a time. It is the batch
    * core at nt = 1, so there is exactly ONE implementation of the algebra.
    */
-  template<typename thc_t>
-  qp_modea::cd_residue_fn make_contour_residue_source(
+  inline qp_modea::cd_residue_fn make_contour_residue_source(
       qp_modea::modea_ctx const &ctx,
       ctx_t const &pctx,
       tc::transform_factor_t const &tf,
       sArray_t<Array_view_4D_t> const &sPi,      // (nq_ibz, rank, Np, Np)
-      thc_t &thc,
+      sArray_t<Array_view_3D_t> const &sZ,       // (nq_ibz, Np, Np) from gather_Z_tiles
+      long NP,
       methods::wc_line::solve_opts_t const &sopt,
       methods::wc_line::solve_stats_t &sstat) {
     utils::check(ctx.have_bstore,
                  "p_contour::make_contour_residue_source: the mode-A context carries no "
                  "band factors; build it with modea_opts::cd_bfactor / cd_bstore_cap_gb.");
     auto sc = std::make_shared<detail::residue_scratch_t>();
-    return [&ctx, &pctx, &tf, &sPi, &thc, &sopt, &sstat, sc]
+    return [&ctx, &pctx, &tf, &sPi, &sZ, NP, &sopt, &sstat, sc]
            (long is, long ik, long J, ComplexType z, nda::array<ComplexType, 2> &Ms) {
       const long nbnd = ctx.nbnd;
       nda::array<long, 1> Js(1);
@@ -963,7 +1033,7 @@ namespace p_contour {
       nda::array<ComplexType, 3> M1(1, nbnd, nbnd);
       Js(0) = J;
       zs(0) = z;
-      detail::contour_residue_batch(ctx, pctx, tf, sPi, thc, &sstat, *sc, 1,
+      detail::contour_residue_batch(ctx, pctx, tf, sPi, sZ, NP, &sstat, *sc, 1,
                                     is, ik, 1L, Js, zs, M1);
       Ms.resize(nbnd, nbnd);
       for (long a = 0; a < nbnd; ++a)

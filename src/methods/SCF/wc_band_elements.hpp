@@ -2440,6 +2440,16 @@ namespace qp_modea {
           std::chrono::steady_clock::now() - t_pc).count();
       auto tf = std::make_shared<tilted_contour::transform_factor_t>(
           tilted_contour::factor_transform(pctx->c));
+      // ⚠ TC-4 LIVELOCK FIX. thc_reader_t::Z(iq) is an MPI COLLECTIVE over the THC
+      // array's communicator; the evaluator runs where every rank has different work, so
+      // calling it from there deadlocks (m3d SVO, 60 ranks, 19 h at 100 % CPU). Acquire
+      // every tile HERE instead -- this point is reached by all ranks in lockstep -- and
+      // hand the evaluator a plain node-shared table. See the invariant on
+      // p_contour::gather_Z_tiles.
+      const auto t_zg = std::chrono::steady_clock::now();
+      auto sZq = p_contour::gather_Z_tiles(thc);
+      const double t_zgather = std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - t_zg).count();
       auto sopt = std::make_shared<wc_line::solve_opts_t>();
       sopt->krylov = opts.tc_krylov;
       sopt->tol = opts.tc_krylov_tol;
@@ -2459,7 +2469,7 @@ namespace qp_modea {
       const long batch_max = std::max(1L, long(opts.cd_batch_mb * 1.048576e6 / per_target));
       ctx.cdl->batch_max = batch_max;
       ctx.cdl->residue_batch = p_contour::make_contour_residue_batch_owning(
-          ctx, pctx, tf, sPc, thc, sopt, sstat, batch_max);
+          ctx, pctx, tf, sPc, sZq, NP, sopt, sstat, batch_max);
       ctx.cdl->stats = sstat;
       ctx.have_cdl = true;
 
@@ -2469,6 +2479,11 @@ namespace qp_modea {
                    "factorization cond = {:.3e}; P sampling wall {:.2f} s; line solver = {}",
               npk, pctx->c.rank, clo.delta, clo.delta * 27.211386245988, tf->cond,
               t_sample, opts.tc_krylov ? "warm-started GMRES" : "dense");
+      app_log(lvl, "  - TC-4 Z tiles pre-gathered:   {} x Np {} x Np, {:.1f} MB per NODE, "
+                   "{:.2f} s. The evaluator is COLLECTIVE-FREE: thc.Z(q) is a collective "
+                   "and the per-rank work loop must never reach one (the m3d 60-rank "
+                   "livelock).",
+              nq_ibz, NP, double(nq_ibz) * NP * NP * 16.0 / 1.048576e6, t_zgather);
       app_log(lvl, "  - TC-4 residue batching:       {} targets per call ({:.0f} MB budget, "
                    "{:.2f} MB/target: 2 x Np^2 transform + nbnd^2 sandwich; the transform "
                    "buffer is allocated ONCE by the source, not per call); band factors "
