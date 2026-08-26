@@ -1561,10 +1561,16 @@ namespace bdft_tests {
       const double zmax = 50.0 / HA;
       auto g = size_wc_grid(1.0, delta, zmax);
       const double d_eV = delta * HA;
-      const double want = std::pow(1.0 * d_eV / (wgrid_safety * wgrid_K), 1.0 / wgrid_p);
+      // ⚠ the delta CREDIT is capped at wgrid_delta_sat_eV (Axis D3). si444's
+      // 3.63 eV is ABOVE it, so the law's effective divisor is the ceiling, not
+      // d_eV. This is not a loosened gate -- it is the corrected law, and the
+      // uncapped form is what sized d35_w into its hard abort.
+      const double d_eff = std::min(d_eV, wgrid_delta_sat_eV);
+      const double want = std::pow(1.0 * d_eff / (wgrid_safety * wgrid_K), 1.0 / wgrid_p);
       REQUIRE(std::abs(g.h_over_delta - want) < 1e-12);
       REQUIRE(not g.clamped);
       REQUIRE(not g.expert);
+      REQUIRE(g.delta_sat);                       // this fixture IS above the ceiling
       // the prediction is self-consistent with the target and the safety factor
       REQUIRE(std::abs(g.pred_mev - 1.0 / wgrid_safety) < 1e-9);
       // and the grid covers zmax with the pad + stencil margin
@@ -1593,6 +1599,47 @@ namespace bdft_tests {
       REQUIRE(b.N > a.N);
       app_log(2, "[TC-5 sizing] 1.0 -> 0.1 meV: h shrinks {:.4f}x = 10^(1/{:.2f}), N grows "
                  "{} -> {}", ratio, wgrid_p, a.N, b.N);
+    }
+    // (iii-b) ⚠ THE delta-CREDIT CEILING -- the d35_w regression.
+    // The law's 1/delta prefactor claims the Sigma error falls as 1/delta at fixed
+    // h/delta. Axis D3 measured that this STOPS being true above ~2 eV (error flat
+    // or rising where the law predicts a 0.15x fall), so the credit is capped. The
+    // uncapped law sized tc4_444nb60_d35_w to h = 6.32 eV at delta = 12.95 eV and
+    // the run-time audit hard-aborted at 14.93 meV against a 0.333 meV prediction.
+    {
+      // (a) BELOW the ceiling: BIT-IDENTICAL. min() is the identity there, so every
+      //     small-delta result the campaign validated is untouched.
+      const double dlo = 2.0 / HA;                 // 2.0 eV < 2.4 eV ceiling
+      auto glo = size_wc_grid(1.0, dlo, 40.0 / HA);
+      const double want_lo =
+          std::pow(1.0 * (dlo * HA) / (wgrid_safety * wgrid_K), 1.0 / wgrid_p);
+      REQUIRE(std::abs(glo.h_over_delta - want_lo) < 1e-15);   // exact, not "close"
+      REQUIRE(not glo.delta_sat);
+
+      // (b) ABOVE the ceiling: strictly finer than the uncapped law would give
+      const double dhi = 12.95 / HA;               // d35_w's delta
+      auto ghi = size_wc_grid(1.0, dhi, 78.0 / HA);
+      const double uncapped =
+          std::pow(1.0 * (dhi * HA) / (wgrid_safety * wgrid_K), 1.0 / wgrid_p);
+      const double capped =
+          std::pow(1.0 * wgrid_delta_sat_eV / (wgrid_safety * wgrid_K), 1.0 / wgrid_p);
+      REQUIRE(ghi.delta_sat);
+      REQUIRE(std::abs(ghi.h_over_delta - capped) < 1e-15);
+      REQUIRE(ghi.h_over_delta < uncapped);        // the ceiling BIT
+      // the concrete d35 numbers: h must land far below the 6.32 eV that aborted
+      const double h_eV = ghi.h * HA, h_unc_eV = uncapped * dhi * HA;
+      REQUIRE(h_eV < 4.0);
+      REQUIRE(h_unc_eV > 6.0);                     // what the old law would have picked
+      REQUIRE(ghi.N > long(std::ceil(78.0 / h_unc_eV)) + 3);   // strictly more points
+      app_log(2, "[TC-5 sizing/D3] delta-credit ceiling = {:.2f} eV. BELOW it "
+                 "(delta = 2.0 eV) h/delta = {:.6f}, bit-identical to the uncapped "
+                 "law. ABOVE it, at d35_w's delta = 12.95 eV and target 1 meV: "
+                 "h = {:.3f} eV (N = {}) vs the UNCAPPED law's h = {:.3f} eV "
+                 "(N = {}) -- the sizing that the run-time audit hard-aborted at "
+                 "14.93 meV. Uncapped under-prediction across the D3 envelope was "
+                 "11.45x; capped it is 2.09x, inside the {:.0f}x safety factor.",
+              wgrid_delta_sat_eV, glo.h_over_delta, h_eV, ghi.N, h_unc_eV,
+              long(std::ceil(78.0 / h_unc_eV)) + 3, wgrid_safety);
     }
     // (iv) the EXPERT override bypasses the law
     {

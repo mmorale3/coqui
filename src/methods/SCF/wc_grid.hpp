@@ -116,6 +116,36 @@ namespace wc_grid {
   /** past h = delta/2 the 3-point stencil overshoots and can be worse than
    *  linear (Axis D 8.1) -- the validity clamp, not a tuning choice. */
   inline constexpr double wgrid_hmax_over_delta = 0.5;
+  /**
+   * ⚠⚠ THE delta-CREDIT CEILING (Axis D3, 2026-08-26) -- the constant that stops
+   * the law promising accuracy it does not deliver at large delta.
+   *
+   * The law carries a 1/delta prefactor: at fixed h/delta it claims the Sigma error
+   * falls as 1/delta. MEASURED (tests/run_D3_absh.py, si444 + si222, delta swept
+   * 2.4 -> 16 eV at matched h/delta) that is FALSE above ~2 eV -- the error is FLAT
+   * or RISING where the law predicts a 0.15-0.23x fall:
+   *
+   *     h/delta ~ 0.49 :  delta = 2.4 -> 16 eV,  measured 0.987 -> 3.230 meV
+   *                       (the law predicts a factor 0.15; measured 3.27)
+   *
+   * MECHANISM: delta buys smoothness only while it is the SMALLEST scale in the
+   * problem. Once delta exceeds the spectral feature spacing, the curvature of W
+   * along the line is set by the SPECTRUM's own structure, not by delta, and
+   * further delta buys nothing. So the credit must stop -- at the scale where it
+   * stopped being earned.
+   *
+   * THE COST OF NOT HAVING THIS: tc4_444nb60_d35_w, at delta = 0.476 a.u. =
+   * 12.95 eV, was sized to h = 6.32 eV (N = 16 over 78 eV) because the law divided
+   * by 12.95. The run-time audit measured 14.93 meV against a 0.333 meV prediction
+   * and hard-aborted -- the audit's first legitimate kill. Across the whole D3
+   * envelope this ceiling cuts the worst under-prediction from 11.45x to 2.09x,
+   * i.e. back inside the 3x safety factor the law was always meant to carry.
+   *
+   * ⚠ Legs with delta <= this value are BIT-IDENTICAL: min() is the identity there,
+   * and every result validated at small delta (section 8.2's 1/delta growth, which
+   * this does NOT touch) stands unchanged.
+   */
+  inline constexpr double wgrid_delta_sat_eV = 2.4;
   /** the RELATIVE-error constant of the same fit, for the audit's conversion
    *  from a measured |dW|/|W| back to a Sigma-equivalent meV (Axis D 8.1). */
   inline constexpr double wgrid_Crel = 1.1e-3;
@@ -130,6 +160,7 @@ namespace wc_grid {
     double h_over_delta = 0.0;
     bool   clamped = false;    ///< h/delta hit the 1/2 validity bound
     bool   expert = false;     ///< h came from qp_tc_wgrid_h, not the law
+    bool   delta_sat = false;  ///< delta exceeded the credit ceiling (Axis D3)
     double omega(long j) const { return double(j) * h; }
   };
 
@@ -158,13 +189,20 @@ namespace wc_grid {
     } else {
       utils::check(target_mev > 0.0,
                    "wc_grid: the accuracy target must be > 0 meV (got {}).", target_mev);
-      const double d_eV = delta_au * ha_to_eV;
-      double r = std::pow(target_mev * d_eV / (wgrid_safety * wgrid_K), 1.0 / wgrid_p);
+      // ⚠ the delta CREDIT is capped (wgrid_delta_sat_eV); the h/delta RESOLUTION
+      // is not. The two roles of delta are different: h/delta is the stencil's
+      // resolution of the analytic distance and is real, while 1/delta is the
+      // conversion from a relative W error to an absolute Sigma error and is the
+      // part that stops being earned once delta exceeds the feature spacing.
+      const double d_eff = std::min(delta_au * ha_to_eV, wgrid_delta_sat_eV);
+      double r = std::pow(target_mev * d_eff / (wgrid_safety * wgrid_K), 1.0 / wgrid_p);
       g.clamped = (r > wgrid_hmax_over_delta);
       g.h = std::min(r, wgrid_hmax_over_delta) * delta_au;
     }
     g.h_over_delta = g.h / delta_au;
-    g.pred_mev = wgrid_K * std::pow(g.h_over_delta, wgrid_p) / (delta_au * ha_to_eV);
+    g.delta_sat = (delta_au * ha_to_eV > wgrid_delta_sat_eV);
+    g.pred_mev = wgrid_K * std::pow(g.h_over_delta, wgrid_p)
+               / std::min(delta_au * ha_to_eV, wgrid_delta_sat_eV);
     // omega in [0, (N-1) h] must cover zmax, plus ONE pad cell, plus the
     // 3-point stencil's centre-node clamp needing an interior neighbour.
     g.N = long(std::ceil(zmax_au / g.h)) + 3;
