@@ -2507,14 +2507,14 @@ namespace qp_modea {
                 eJlo, eJhi, zmax, zmax * 27.211386245988);
         wgrid = wc_grid::fill_wc_grid(thc, *sZq, *sPc, *tf, geom, pctx->c.rank, lvl);
 
-        // ---- the audit: samples partitioned, measured LOCALLY, reduced, THEN judged
-        if (opts.wgrid_audit > 0 and ctx.bstore.size() > 0 and ctx.nJ > 0) {
-          auto const &bs0 = ctx.bstore[0];
-          std::vector<double> zs;
-          std::vector<long> qs;
-          const long nsamp = opts.wgrid_audit;
-          auto [a0, a1] = itertools::chunk_range(0, nsamp, mpi->comm.size(),
-                                                 mpi->comm.rank());
+        // ---- the audit: EVERY RANK enters. See run_wc_grid_audit's banner comment:
+        // the guard here may test only rank-uniform quantities. Owning no block is
+        // normal (nblk = ns*nk_ibz can be far smaller than the rank count) and costs
+        // nothing but an empty sample list.
+        if (opts.wgrid_audit > 0) {
+          const bool can_sample = (not ctx.bstore.empty()) and ctx.nJ > 0;
+          const long off0 = (ctx.blocks.empty() ? 0
+                             : (ctx.blocks[0].is * nk_ibz + ctx.blocks[0].ik)) * ctx.nJ;
           // ⚠ SAMPLE THE CONTRIBUTING TARGETS ONLY. A J with sigma_J = 0 is never
           // evaluated, and eps_J - omega for such a J can land outside the grid --
           // auditing there measures an extrapolation nobody performs. Use the SAME
@@ -2525,40 +2525,30 @@ namespace qp_modea {
           // partitioned thinly across many ranks. The old reading (a global total,
           // chunked over ranks) degenerated to ONE sample on a 60-rank run and its
           // coverage statement was therefore close to vacuous.
-          const long off0 = (ctx.blocks.empty() ? 0
-                             : (ctx.blocks[0].is * nk_ibz + ctx.blocks[0].ik)) * ctx.nJ;
-          const long ntot_s = opts.wgrid_audit * nq_ibz;
-          auto [b0, b1] = itertools::chunk_range(0, ntot_s, mpi->comm.size(),
-                                                 mpi->comm.rank());
-          for (long t = b0; t < b1; ++t) {
-            const long q_want = t % nq_ibz;
-            for (long trial = 0; trial < 8 * ctx.nJ; ++trial) {
-              const long J = ((t + trial) * 7919L + 13L) % ctx.nJ;
-              if (bs0.qs_of_J(J) != q_want) continue;      // cover THIS transfer
-              const double om = wlo + (double((t + trial) % 17) / 16.0) * (whi - wlo);
-              const double eJ = ctx.epsJ(off0 + J), fJ = ctx.fJ(off0 + J);
-              const double sg = ((om > eJ) ? 1.0 : 0.0) - fJ;
-              if (std::abs(sg) < 1e-14) continue;          // sigma_J = 0: never evaluated
-              const double zr = eJ - om;
-              if (std::abs(zr) > zmax) continue;           // outside the sized grid
-              zs.push_back(zr);
-              qs.push_back(q_want);
-              break;
+          auto sampler = [&](long b0, long b1, std::vector<double> &zs,
+                             std::vector<long> &qs) {
+            if (not can_sample) return;               // owns no block: contributes none
+            for (long t = b0; t < b1; ++t) {
+              const long q_want = t % nq_ibz;
+              for (long trial = 0; trial < 8 * ctx.nJ; ++trial) {
+                const long J = ((t + trial) * 7919L + 13L) % ctx.nJ;
+                if (ctx.bstore[0].qs_of_J(J) != q_want) continue; // cover THIS transfer
+                const double om = wlo + (double((t + trial) % 17) / 16.0) * (whi - wlo);
+                const double eJ = ctx.epsJ(off0 + J), fJ = ctx.fJ(off0 + J);
+                const double sg = ((om > eJ) ? 1.0 : 0.0) - fJ;
+                if (std::abs(sg) < 1e-14) continue;        // sigma_J = 0: not evaluated
+                const double zr = eJ - om;
+                if (std::abs(zr) > zmax) continue;         // outside the sized grid
+                zs.push_back(zr);
+                qs.push_back(q_want);
+                break;
+              }
             }
-          }
-          waudit = wc_grid::audit_wc_grid(*wgrid, thc, *sZq, *sPc, *tf,
-                                          pctx->c.rank, zs, qs);
-          // ⚠ REDUCE BEFORE JUDGING: report_wc_grid_audit can ABORT, and an abort
-          // on one rank while the others proceed is a hang. The ABSOLUTE error is
-          // what reduces meaningfully -- the relative one is recomputed from it
-          // against the grid-global scale, which every rank already agrees on.
-          waudit.n_sample = mpi->comm.all_reduce_value(long(zs.size()), std::plus<>{});
-          waudit.dW_abs = mpi->comm.all_reduce_value(waudit.dW_abs,
-                                                     boost::mpi3::max<>{});
-          waudit.w_local = mpi->comm.all_reduce_value(waudit.w_local,
-                                                      boost::mpi3::max<>{});
-          wc_grid::report_wc_grid_audit(waudit, geom, wgrid->w_max,
-                                        opts.wgrid_audit_hard, lvl);
+          };
+          waudit = wc_grid::run_wc_grid_audit(mpi->comm, *wgrid, thc, *sZq, *sPc, *tf,
+                                              pctx->c.rank, opts.wgrid_audit, nq_ibz,
+                                              geom, opts.wgrid_audit_hard, lvl,
+                                              sampler);
           utils::check(waudit.n_sample > 0,
                        "wc_grid AUDIT: no contributing residue target could be sampled "
                        "for ANY transfer -- the audit measured nothing and its verdict "

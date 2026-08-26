@@ -1269,15 +1269,12 @@ namespace bdft_tests {
           auto w6 = methods::wc_grid::fill_wc_grid(thc, *sZt, sPc, tf, g6,
                                                    pctx.c.rank, 4);
           const long NPq = thc.Np();
-          nda::matrix<ComplexType> Pi6(NPq, NPq), Wex6(NPq, NPq), Wgot6(NPq, NPq);
-          nda::array<ComplexType, 1> zz6(2);
-          nda::array<ComplexType, 2> F6;
+          nda::matrix<ComplexType> Wex6(NPq, NPq), Wgot6(NPq, NPq);
           auto probe = [&](double frac, double &rel, double &absd) {
             const ComplexType z6(frac * w6->g.h, dlt);
-            methods::wc_grid::detail::pi_at(tf, sPc, 3, pctx.c.rank, NPq, z6, Pi6,
-                                            zz6, F6);
-            auto Zq6 = sZt->local()(3, nda::range::all, nda::range::all);
-            methods::wc_line::dyson_wc_line(Zq6, Pi6, Wex6, nullptr);
+            // ⚠ THE SAME exact reference the AUDIT uses -- see detail::exact_W_at.
+            methods::wc_grid::detail::exact_W_at(tf, sPc, *sZt, 3, pctx.c.rank, NPq,
+                                                 z6, Wex6);
             w6->at(3, z6, Wgot6);
             absd = 0.0;
             for (long P = 0; P < NPq; ++P)
@@ -1483,16 +1480,11 @@ namespace bdft_tests {
         // recompute the same quantity independently
         double dref_abs = 0.0;
         {
-          nda::matrix<ComplexType> Pi(thc.Np(), thc.Np()), Wex(thc.Np(), thc.Np()),
-                                   Wgot(thc.Np(), thc.Np());
-          nda::array<ComplexType, 1> zz(2);
-          nda::array<ComplexType, 2> F;
+          nda::matrix<ComplexType> Wex(thc.Np(), thc.Np()), Wgot(thc.Np(), thc.Np());
           for (std::size_t t = 0; t < azs.size(); ++t) {
             const ComplexType z(azs[t], dlt);
-            methods::wc_grid::detail::pi_at(tf, sPc, aqs[t], pctx.c.rank, thc.Np(),
-                                            z, Pi, zz, F);
-            auto Zq = sZt->local()(aqs[t], nda::range::all, nda::range::all);
-            methods::wc_line::dyson_wc_line(Zq, Pi, Wex, nullptr);
+            methods::wc_grid::detail::exact_W_at(tf, sPc, *sZt, aqs[t], pctx.c.rank,
+                                                thc.Np(), z, Wex);
             wg->at(aqs[t], z, Wgot);
             double dv = 0.0;
             for (long P = 0; P < thc.Np(); ++P)
@@ -2321,6 +2313,108 @@ namespace bdft_tests {
               csize, w5->g.N, w5->nq, w5->nq * w5->g.N, z5_spread, z5_read);
       REQUIRE(z5_spread < 1e-9);
       REQUIRE(z5_read > 0.0);
+    }
+
+    // ---- (Z6) TC-5: THE AUDIT WHEN SOME RANKS OWN NO BLOCK -----------------
+    // ⚠ THE REGRESSION THIS CASE EXISTS FOR. The audit's reduces once sat inside
+    // `if (ctx.bstore.size() > 0)`, i.e. under "does THIS rank own a block". Blocks
+    // number ns*nk_ibz, which on production layouts is FAR smaller than the rank
+    // count: the si444 _w leg had 13 blocks on 60 ranks, so 47 ranks skipped the
+    // region, the reduces did not pair up, and the run hard-aborted reporting
+    // -4432936712292794320 samples and |dW| = 9.043e+02 against a grid whose global
+    // max|W| was 2.513e-03 -- a "physics breach" that was pure reduction garbage.
+    //
+    // NO RANK COUNT AVAILABLE HERE CAN REPRODUCE THAT BY OWNERSHIP ALONE: qe_lih222
+    // has nblk = ns*nk_ibz = 8, so at 1/2/4 ranks every rank owns a block and the
+    // old guard was uniform BY ACCIDENT. The condition is therefore INJECTED: the
+    // sampler contributes nothing on odd ranks, which is exactly what a rank without
+    // a block does. Pre-fix the equivalent structure hangs or reduces garbage; the
+    // driver reduces unconditionally, so the count must come out EXACTLY right.
+    {
+      double zmax6 = 0.0;
+      for (long J = 0; J < ctx.nJ; ++J)
+        zmax6 = std::max(zmax6, std::abs(ctx.epsJ(J) - ctx.mu));
+      auto g6 = methods::wc_grid::size_wc_grid(1.0, pctx.geom.delta, zmax6);
+      auto w6 = methods::wc_grid::fill_wc_grid(thc, *sZt, sPc, tf, g6, pctx.c.rank, 4);
+      const long nsamp6 = 4;
+      const long ntot6 = nsamp6 * nq;
+      const bool contributes = (crank % 2 == 0);     // odd ranks: "own no block"
+      auto [e0, e1] = itertools::chunk_range(0, ntot6, csize, crank);
+      const long expect_local = contributes ? (e1 - e0) : 0;
+      const long expect = mpi_context->comm.all_reduce_value(expect_local,
+                                                             std::plus<>{});
+      // one sample per t, always in-grid, so the count is exactly predictable
+      auto sampler6 = [&](long b0, long b1, std::vector<double> &zv,
+                          std::vector<long> &qv) {
+        if (not contributes) return;
+        for (long t = b0; t < b1; ++t) {
+          qv.push_back(t % nq);
+          zv.push_back(((t % 2) ? -1.0 : 1.0)
+                       * (double((t / 2) % 5) / 4.0) * zmax6 * 0.85);
+        }
+      };
+      auto A6 = methods::wc_grid::run_wc_grid_audit(
+          mpi_context->comm, *w6, thc, *sZt, sPc, tf, pctx.c.rank, nsamp6, nq, g6,
+          false /* never abort: this gate is about the reduce, not the verdict */,
+          4, sampler6);
+      mpi_context->comm.barrier();        // reaching here at all = collectives paired
+
+      // the reduced |dW| must equal the max over the CONTRIBUTING ranks, computed
+      // here by an independent reduce every rank enters
+      double dloc = 0.0, zloc = 0.0;
+      long qloc = -1;
+      if (contributes) {
+        nda::matrix<ComplexType> We6(NP, NP), Wg6(NP, NP);
+        std::vector<double> zv;
+        std::vector<long> qv;
+        sampler6(e0, e1, zv, qv);
+        for (std::size_t i = 0; i < zv.size(); ++i) {
+          const ComplexType z6(zv[i], g6.delta);
+          methods::wc_grid::detail::exact_W_at(tf, sPc, *sZt, qv[i], pctx.c.rank, NP,
+                                               z6, We6);
+          w6->at(qv[i], z6, Wg6);
+          for (long P = 0; P < NP; ++P)
+            for (long Q = 0; Q < NP; ++Q) {
+              const double d = std::abs(Wg6(P, Q) - We6(P, Q));
+              if (d > dloc) { dloc = d; qloc = qv[i]; zloc = zv[i]; }
+            }
+        }
+      }
+      const double dref = mpi_context->comm.all_reduce_value(dloc,
+                                                             boost::mpi3::max<>{});
+      // and the LOCATION must be the one belonging to that max, not some other
+      // rank's -- elect the same owner independently and compare its (q, Re z)
+      long own_ref = (dloc == dref) ? long(crank) : long(csize);
+      own_ref = mpi_context->comm.all_reduce_value(own_ref, boost::mpi3::min<>{});
+      double lref[2] = {double(qloc), zloc};
+      mpi_context->comm.broadcast_n(lref, 2, int(own_ref));
+
+      // and the degenerate case: NOBODY contributes. Still collective, still 0.
+      auto A6z = methods::wc_grid::run_wc_grid_audit(
+          mpi_context->comm, *w6, thc, *sZt, sPc, tf, pctx.c.rank, nsamp6, nq, g6,
+          false, 4,
+          [](long, long, std::vector<double> &, std::vector<long> &) {});
+      mpi_context->comm.barrier();
+
+      app_log(2, "[TC-4 mrank/(Z6)] TC-5 audit with {} of {} rank(s) owning no "
+                 "samples: reduced count = {} (expected {}, bound {}); reduced "
+                 "max|dW| = {:.3e} vs independent reference {:.3e}; worst at q = {}, "
+                 "Re z = {:+.6g} (reference q = {}, Re z = {:+.6g}); empty-sampler "
+                 "leg reduced count = {}. Pre-fix this structure reduced across a "
+                 "SUBSET and produced a garbage count.",
+              csize - long(mpi_context->comm.all_reduce_value(long(contributes),
+                                                              std::plus<>{})),
+              csize, A6.n_sample, expect, ntot6, A6.dW_abs, dref, A6.worst_q,
+              A6.worst_z, long(std::lrint(lref[0])), lref[1], A6z.n_sample);
+
+      REQUIRE(A6.n_sample == expect);          // the reduce paired up, exactly
+      REQUIRE(A6.n_sample >= 0);
+      REQUIRE(A6.n_sample <= ntot6);           // the bound the driver now asserts
+      REQUIRE(A6.dW_abs == dref);              // and the error reduce likewise
+      REQUIRE(A6.worst_q == long(std::lrint(lref[0])));   // location follows the max
+      REQUIRE(A6.worst_z == lref[1]);
+      REQUIRE(A6z.n_sample == 0);              // nobody sampled: 0, not garbage
+      if (csize > 1) REQUIRE(expect < ntot6);  // the injection really did bite
     }
 
     REQUIRE(z1 == 0.0);                 // the table IS thc.Z, bit for bit

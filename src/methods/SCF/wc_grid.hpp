@@ -273,6 +273,26 @@ namespace wc_grid {
         for (long Q = 0; Q < NP; ++Q)
           Pi(P, Q) = -(R(0, P * NP + Q) + std::conj(R(1, Q * NP + P)));
     }
+    /**
+     * ⚠ THE ONE EXACT REFERENCE. Both the audit and the read-path gate call THIS --
+     * divergence between two "exact" references is how a defect hides: whichever one
+     * the gate uses passes, and the other ships. Anything comparing against "the
+     * exact W^c" must come through here.
+     */
+    inline void exact_W_at(tc::transform_factor_t const &tf,
+                    sArray_t<Array_view_4D_t> const &sPi,
+                    sArray_t<Array_view_3D_t> const &sZ,
+                    long qs, long r, long NP, ComplexType z,
+                    nda::matrix<ComplexType> &Wex) {
+      decltype(nda::range::all) all;
+      nda::matrix<ComplexType> Pi(NP, NP);
+      nda::array<ComplexType, 1> zz(2);
+      nda::array<ComplexType, 2> F;
+      pi_at(tf, sPi, qs, r, NP, z, Pi, zz, F);
+      auto Zq = sZ.local()(qs, all, all);
+      methods::wc_line::dyson_wc_line(Zq, Pi, Wex, nullptr);
+    }
+
   } // namespace detail
 
   /**
@@ -423,16 +443,13 @@ namespace wc_grid {
     A.n_sample = long(zs.size());
     if (zs.empty()) return A;
     const long NP = G.NP;
-    nda::matrix<ComplexType> Pi(NP, NP), Wex(NP, NP), Wgot(NP, NP);
-    nda::array<ComplexType, 1> zz(2);
-    nda::array<ComplexType, 2> F;
+    nda::matrix<ComplexType> Wex(NP, NP), Wgot(NP, NP);
     for (std::size_t s = 0; s < zs.size(); ++s) {
       const long q = qs[s];
       const ComplexType z(zs[s], G.g.delta);
-      // EXACT: one Dyson at the real target
-      detail::pi_at(tf, sPi, q, rank_contour, NP, z, Pi, zz, F);
-      auto Zq = sZ.local()(q, all, all);
-      methods::wc_line::dyson_wc_line(Zq, Pi, Wex, nullptr);
+      // EXACT: THE shared reference (detail::exact_W_at) -- the same call the
+      // read-path gate makes, so the two cannot disagree about what "exact" means
+      detail::exact_W_at(tf, sPi, sZ, q, rank_contour, NP, z, Wex);
       G.at(q, z, Wgot);
       double dev = 0.0, sc = 0.0;
       for (long P = 0; P < NP; ++P)
@@ -509,6 +526,81 @@ namespace wc_grid {
                   "Lower qp_tc_wgrid_mev if the residue tier carries the physics.",
                   A.meas_mev, G.target_mev, A.pred_mev);
     }
+  }
+
+  /**
+   * ⚠⚠ THE COLLECTIVE-CARRYING AUDIT DRIVER. EVERY RANK MUST CALL THIS whenever
+   * the audit is enabled -- the guard at the call site may test ONLY quantities
+   * that are uniform across ranks (`wgrid_audit > 0`), never rank-local ownership.
+   *
+   * WHY IT IS A SEPARATE FUNCTION. The first version of this code inlined the
+   * reduces under `ctx.bstore.size() > 0`, i.e. under "does THIS rank own a
+   * block". On the si444 _w leg (nblk = 13, 60 ranks) 47 ranks never entered,
+   * the reduces did not pair up, and the run hard-aborted on a garbage sample
+   * count (-4.4e18) and a garbage |dW| (9.0e+02 against a grid whose global
+   * max|W| is 2.5e-03 -- arithmetically impossible for bounded Lagrange weights,
+   * which is what identified the reduce rather than the physics). Owning no
+   * block is NORMAL and must cost nothing but an empty sample list: `sample`
+   * simply appends nothing, and this function still reduces.
+   *
+   * @param sample  called once, collective-free, to append this rank's local
+   *                samples; it may append none.
+   */
+  template<typename comm_t, typename thc_t, typename sampler_t>
+  wgrid_audit_t run_wc_grid_audit(comm_t &comm, wc_grid_t const &G, thc_t &thc,
+                                  sArray_t<Array_view_3D_t> const &sZ,
+                                  sArray_t<Array_view_4D_t> const &sPi,
+                                  tc::transform_factor_t const &tf, long rank_contour,
+                                  long nsamp_per_q, long nq_ibz,
+                                  wc_grid_geom_t const &geom, bool hard, int lvl,
+                                  sampler_t &&sample) {
+    std::vector<double> zs;
+    std::vector<long> qs;
+    const long ntot = nsamp_per_q * nq_ibz;
+    auto [b0, b1] = itertools::chunk_range(0, ntot, comm.size(), comm.rank());
+    sample(b0, b1, zs, qs);                       // collective-free, may add nothing
+    utils::check(zs.size() == qs.size(),
+                 "run_wc_grid_audit: sampler returned {} z but {} q", zs.size(),
+                 qs.size());
+    utils::check(long(zs.size()) <= b1 - b0,
+                 "run_wc_grid_audit: sampler returned {} samples for a slice of {} -- "
+                 "the global count would exceed its own bound", zs.size(), b1 - b0);
+
+    wgrid_audit_t A;
+    A.pred_mev = geom.pred_mev;
+    if (not zs.empty())
+      A = audit_wc_grid(G, thc, sZ, sPi, tf, rank_contour, zs, qs);
+
+    // ---- from here to the verdict: COLLECTIVE, entered by every rank
+    A.n_sample = comm.all_reduce_value(long(zs.size()), std::plus<>{});
+    const double dloc = A.dW_abs;
+    A.dW_abs = comm.all_reduce_value(A.dW_abs, boost::mpi3::max<>{});
+    // ⚠ THE LOCATION MUST COME FROM THE RANK THAT HOLDS THE MAX. Reducing w_local by
+    // an independent max, and printing worst_q/worst_z from whichever rank happens to
+    // log, attributes the worst error to a sample that is not the worst one -- the
+    // leg-1 banner did exactly that ("worst at q = 3 ... LOCAL max|W| = 4.184e+01")
+    // and the plausible-looking location sent the investigation after the physics.
+    // Elect the owner, then broadcast ITS triple.
+    long owner = (dloc == A.dW_abs) ? long(comm.rank()) : long(comm.size());
+    owner = comm.all_reduce_value(owner, boost::mpi3::min<>{});
+    if (owner >= long(comm.size())) owner = 0;          // no samples anywhere
+    double loc[3] = {double(A.worst_q), A.worst_z, A.w_local};
+    comm.broadcast_n(loc, 3, int(owner));
+    A.worst_q = long(std::lrint(loc[0]));
+    A.worst_z = loc[1];
+    A.w_local = loc[2];
+    // ⚠ THE BOUNDS CHECK LANDS BEFORE THE VERDICT. A count outside [0, ntot] proves
+    // the reduce itself is invalid, and then the |dW| beside it is invalid too --
+    // reporting a physics breach from it (as the leg-1 abort did) points the
+    // investigation at the wrong subsystem entirely.
+    utils::check(A.n_sample >= 0 and A.n_sample <= ntot,
+                 "wc_grid AUDIT: reduced sample count {} is outside its own bound "
+                 "[0, {}] (= qp_tc_wgrid_audit x nq_ibz). The reduce did not pair up "
+                 "across ranks -- some rank did not enter run_wc_grid_audit. Every "
+                 "number on the audit line is invalid; do not read it as physics.",
+                 A.n_sample, ntot);
+    report_wc_grid_audit(A, geom, G.w_max, hard, lvl);
+    return A;
   }
 
 } // namespace wc_grid
