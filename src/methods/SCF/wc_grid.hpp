@@ -181,6 +181,15 @@ namespace wc_grid {
     std::shared_ptr<sArray_t<Array_view_4D_t>> W;   ///< (nq, N, NP, NP), omega >= 0
     double refl_dev = 0.0;      ///< the bosonic reflection assert, measured
     double refl_scale = 0.0;
+    /**
+     * max |W^c| over the WHOLE filled grid. ⚠ THE AUDIT NORMALIZES BY THIS, not by
+     * the sample's own max|W|. |W^c| varies by orders of magnitude across (q, omega)
+     * -- MEASURED 40x on qe_lih222 alone -- so a per-sample ratio can read enormous
+     * with no wrong value anywhere, purely because that sample sits where screening
+     * is weak. What reaches Sigma is the absolute error against the scale that
+     * actually contributes, which is this one.
+     */
+    double w_max = 0.0;
     double t_fill = 0.0;
     long   n_solve = 0;
 
@@ -314,6 +323,15 @@ namespace wc_grid {
     mpi->comm.barrier();
     G->t_fill = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - t0).count();
+    {   // the GLOBAL |W| scale the audit normalizes by
+      double m = 0.0;
+      auto Wl = G->W->local();
+      for (long iq = 0; iq < nq; ++iq)
+        for (long j = 0; j < geom.N; ++j)
+          for (long P = 0; P < NP; ++P)
+            for (long Q = 0; Q < NP; ++Q) m = std::max(m, std::abs(Wl(iq, j, P, Q)));
+      G->w_max = m;
+    }
 
     // ---- ⚠ THE BOSONIC REFLECTION ASSERT ---------------------------------
     // W^c(z) = conj(W^c(-conj z)) is ELEMENTWISE only for real-symmetric
@@ -376,8 +394,10 @@ namespace wc_grid {
    *     downstream number is untrustworthy.
    */
   struct wgrid_audit_t {
-    long   n_sample = 0;
-    double dW_rel = 0.0;          ///< measured max |dW| / max|W| at the samples
+    long   n_sample = 0;          ///< GLOBAL count (the caller reduces it)
+    double dW_abs = 0.0;          ///< measured max |dW| -- the raw quantity
+    double w_local = 0.0;         ///< max|W| AT the worst sample (diagnostic only)
+    double dW_rel = 0.0;          ///< dW_abs / grid-global max|W|  <- THE measure
     double meas_mev = 0.0;        ///< Sigma-equivalent, via the Axis-D relation
     double pred_mev = 0.0;
     long   worst_q = -1;
@@ -420,9 +440,18 @@ namespace wc_grid {
           dev = std::max(dev, std::abs(Wgot(P, Q) - Wex(P, Q)));
           sc = std::max(sc, std::abs(Wex(P, Q)));
         }
-      const double rel = (sc > 0.0) ? dev / sc : 0.0;
-      if (rel > A.dW_rel) { A.dW_rel = rel; A.worst_q = q; A.worst_z = zs[s]; }
+      // ⚠ normalize by the GRID-GLOBAL scale, not this sample's own max|W|:
+      // |W| varies by orders of magnitude across (q, omega), so a per-sample ratio
+      // reports a huge number wherever screening happens to be weak, with nothing
+      // wrong. `sc` is kept for the log so the two are distinguishable next time.
+      if (dev > A.dW_abs) {
+        A.dW_abs = dev;
+        A.w_local = sc;
+        A.worst_q = q;
+        A.worst_z = zs[s];
+      }
     }
+    A.dW_rel = (G.w_max > 0.0) ? A.dW_abs / G.w_max : 0.0;
     return A;
   }
 
@@ -434,8 +463,10 @@ namespace wc_grid {
    * and the decision is taken on an already-agreed value.
    */
   inline void report_wc_grid_audit(wgrid_audit_t &A, wc_grid_geom_t const &geom,
-                                   bool hard, int lvl) {
+                                   double w_max_global, bool hard, int lvl) {
     A.pred_mev = geom.pred_mev;
+    // recomputed from the REDUCED absolute error against the global scale
+    A.dW_rel = (w_max_global > 0.0) ? A.dW_abs / w_max_global : 0.0;
     // Convert the measured RELATIVE W error to a Sigma-equivalent meV by the
     // same fit family that sized the grid: the predicted relative error at this
     // h/delta is Crel (h/delta)^p, so the measured/predicted RATIO carries over.
@@ -444,12 +475,15 @@ namespace wc_grid {
     A.breached = (A.meas_mev > geom.target_mev);
     auto const &G = geom;
 
-    app_log(lvl, "  - TC-5 GRID AUDIT:             {} samples: measured |dW|/|W| = {:.3e} "
-                 "(predicted {:.3e}) -> Sigma-equivalent {:.4g} meV against a target of "
-                 "{:.4g} meV and a law prediction of {:.4g} meV; worst at q = {}, "
-                 "Re z = {:+.6g} a.u.",
-            A.n_sample, A.dW_rel, pred_rel, A.meas_mev, G.target_mev, A.pred_mev,
-            A.worst_q, A.worst_z);
+    app_log(lvl, "  - TC-5 GRID AUDIT:             {} samples: max |dW| = {:.3e} ABS; "
+                 "/ grid-global max|W| = {:.3e} -> {:.3e} rel (predicted {:.3e}) -> "
+                 "Sigma-equivalent {:.4g} meV against a target of {:.4g} meV and a law "
+                 "prediction of {:.4g} meV. Worst at q = {}, Re z = {:+.6g} a.u., where "
+                 "the LOCAL max|W| = {:.3e} (local/global = {:.2e}; a small ratio there "
+                 "means a weakly-screened sample, NOT a wrong value).",
+            A.n_sample, A.dW_abs, w_max_global, A.dW_rel, pred_rel, A.meas_mev,
+            G.target_mev, A.pred_mev, A.worst_q, A.worst_z, A.w_local,
+            (w_max_global > 0.0 ? A.w_local / w_max_global : 0.0));
 
     if (A.meas_mev > 10.0 * G.target_mev) {
       utils::check(not hard,

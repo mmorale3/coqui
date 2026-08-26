@@ -1254,6 +1254,69 @@ namespace bdft_tests {
         REQUIRE(nw2 >= 4);
         REQUIRE(dw2 * 27.211386245988 * 1e3 < 1.0);   // within the requested target
 
+        // ---- GATE: REFLECTED READS AND READS INSIDE THE FIRST CELL -----------
+        // ⚠ WHY SYNTHETIC TARGETS. The _w leg-1 abort landed at |Re z| = 0.014 with
+        // h = 0.042 -- INSIDE the first grid cell, where the dagger reflection, the
+        // omega = 0 origin and the one-sided stencil all meet. A wide-gap fixture
+        // like qe_lih222 has NO contributing target that close to zero, so the
+        // physics gates cannot reach that code path however long they run. This is
+        // a READ-PATH gate, so it constructs the targets directly.
+        {
+          double zmax6 = 0.0;
+          for (long J = 0; J < ctx.nJ; ++J)
+            zmax6 = std::max(zmax6, std::abs(ctx.epsJ(J) - ctx.mu));
+          auto g6 = methods::wc_grid::size_wc_grid(1.0, dlt, zmax6);
+          auto w6 = methods::wc_grid::fill_wc_grid(thc, *sZt, sPc, tf, g6,
+                                                   pctx.c.rank, 4);
+          const long NPq = thc.Np();
+          nda::matrix<ComplexType> Pi6(NPq, NPq), Wex6(NPq, NPq), Wgot6(NPq, NPq);
+          nda::array<ComplexType, 1> zz6(2);
+          nda::array<ComplexType, 2> F6;
+          auto probe = [&](double frac, double &rel, double &absd) {
+            const ComplexType z6(frac * w6->g.h, dlt);
+            methods::wc_grid::detail::pi_at(tf, sPc, 3, pctx.c.rank, NPq, z6, Pi6,
+                                            zz6, F6);
+            auto Zq6 = sZt->local()(3, nda::range::all, nda::range::all);
+            methods::wc_line::dyson_wc_line(Zq6, Pi6, Wex6, nullptr);
+            w6->at(3, z6, Wgot6);
+            absd = 0.0;
+            for (long P = 0; P < NPq; ++P)
+              for (long Q = 0; Q < NPq; ++Q)
+                absd = std::max(absd, std::abs(Wgot6(P, Q) - Wex6(P, Q)));
+            rel = absd / w6->w_max;   // the GRID-GLOBAL scale, as the audit now uses
+          };
+          double worst = 0.0, worst_sym = 0.0;
+          std::string trail;
+          for (double frac : {0.0, 0.05, 0.33, 0.5, 0.9, 1.0, 1.5, 2.5}) {
+            double rp = 0.0, ap = 0.0, rm = 0.0, am = 0.0;
+            probe(+frac, rp, ap);
+            probe(-frac, rm, am);
+            worst = std::max({worst, rp, rm});
+            // the DAGGER must make +x and -x mirror images: same |dW|
+            worst_sym = std::max(worst_sym, std::abs(ap - am));
+            trail += std::format("  |z|/h={:.2f}:{:.2e}/{:.2e}", frac, rp, rm);
+          }
+          // omega = 0 exactly: W^c(i delta) must be HERMITIAN, else the w<0 branch
+          // (dagger) and the w>=0 branch (no dagger) disagree AT the origin.
+          double herm = 0.0, hscale = 0.0;
+          for (long P = 0; P < NPq; ++P)
+            for (long Q = 0; Q < NPq; ++Q) {
+              herm = std::max(herm, std::abs(w6->W->local()(3, 0, P, Q)
+                                    - std::conj(w6->W->local()(3, 0, Q, P))));
+              hscale = std::max(hscale, std::abs(w6->W->local()(3, 0, P, Q)));
+            }
+          app_log(2, "[TC-5 read] {}: reflected + first-cell reads, h = {:.6g} a.u., "
+                     "grid-global max|W| = {:.3e}. +x/-x rel error:{}", mf_src,
+                  w6->g.h, w6->w_max, trail);
+          app_log(2, "[TC-5 read] {}: worst rel = {:.3e} (gate 1e-3 -- a wrong-VALUE "
+                     "defect is O(1) or worse, not O(1e-5)); dagger +/- asymmetry = "
+                     "{:.3e}; W^c(i delta) Hermiticity = {:.3e} over {:.3e}.",
+                  mf_src, worst, worst_sym, herm, hscale);
+          REQUIRE(worst < 1e-3);              // no wrong-value defect near omega = 0
+          REQUIRE(worst_sym < 1e-12);         // the dagger reflection is exact
+          REQUIRE(herm / std::max(hscale, 1e-300) < 1e-8);   // W(i delta) Hermitian
+        }
+
         // ---- the [Q6] harvest field, populated by the audit ------------------
         // A unit test emits no [Q6] line (that is scf_driver's qpgw loop), so what
         // is gated here is the PLUMBING that line reads: last_run() must carry the
@@ -1418,7 +1481,7 @@ namespace bdft_tests {
         auto A = methods::wc_grid::audit_wc_grid(*wg, thc, *sZt, sPc, tf,
                                                  pctx.c.rank, azs, aqs);
         // recompute the same quantity independently
-        double dref = 0.0;
+        double dref_abs = 0.0;
         {
           nda::matrix<ComplexType> Pi(thc.Np(), thc.Np()), Wex(thc.Np(), thc.Np()),
                                    Wgot(thc.Np(), thc.Np());
@@ -1431,13 +1494,11 @@ namespace bdft_tests {
             auto Zq = sZt->local()(aqs[t], nda::range::all, nda::range::all);
             methods::wc_line::dyson_wc_line(Zq, Pi, Wex, nullptr);
             wg->at(aqs[t], z, Wgot);
-            double dv = 0.0, sc2 = 0.0;
+            double dv = 0.0;
             for (long P = 0; P < thc.Np(); ++P)
-              for (long Q = 0; Q < thc.Np(); ++Q) {
+              for (long Q = 0; Q < thc.Np(); ++Q)
                 dv = std::max(dv, std::abs(Wgot(P, Q) - Wex(P, Q)));
-                sc2 = std::max(sc2, std::abs(Wex(P, Q)));
-              }
-            dref = std::max(dref, (sc2 > 0.0) ? dv / sc2 : 0.0);
+            dref_abs = std::max(dref_abs, dv);
           }
         }
 
@@ -1453,11 +1514,11 @@ namespace bdft_tests {
         app_log(2, "[TC-5] {}: REFLECTION assert (inside the fill) measured {:.3e} "
                    "relative; AUDIT measured |dW|/|W| = {:.3e} vs an independent "
                    "recomputation {:.3e} (must agree exactly).",
-                mf_src, refl, A.dW_rel, dref);
+                mf_src, refl, A.dW_abs, dref_abs);
 
         REQUIRE(npt5 >= 4);
         REQUIRE(refl < 1e-8);            // (b) the bosonic reflection identity
-        REQUIRE(A.dW_rel == dref);       // (d) the audit measures what it claims
+        REQUIRE(A.dW_abs == dref_abs);   // (d) the audit measures what it claims
         REQUIRE(A.n_sample >= 8);
         // (c) the identity, gated at the law's own prediction with the same 3x
         // margin the sizing already carries
