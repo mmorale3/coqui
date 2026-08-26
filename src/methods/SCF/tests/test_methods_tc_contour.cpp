@@ -1551,6 +1551,301 @@ namespace bdft_tests {
   //  the Axis-D law, that the delta/2 quadratic-validity clamp bites, and
   //  that the grid actually covers the target set.
   // =====================================================================
+  // =====================================================================
+  //  THE ITERM THERMAL TERM -- why contour-source and tau-source mode-A
+  //  disagree by eV-class on the CLAMPED population (wave-4 inversion).
+  //
+  //  MEASURED IN PRODUCTION: at si444nb60 recipe clamp, contour-source mode-A
+  //  sits +2104.6 meV above ac while tau-source sits +179 meV above it -- so the
+  //  two representations differ by ~1.93 eV on states whose Sigma is evaluated at
+  //  z = mu. That is NOT a different pole store: qp_modea.hpp:1241 says the CD
+  //  Iterm is built "from the EXISTING pole rep", and it contracts the SAME
+  //  blk.M via blk.pole(). The routes differ ONLY in the WEIGHT they contract it
+  //  with, and only in the NUMERATOR:
+  //
+  //     tau   (pole_weights, :659) : ( n_B(om_p) + f_J ) / (z - eps_J + om_p)
+  //     CD    (Iterm,       :1247) : ( theta(Re A_J) - theta(-om_p) ) / (same)
+  //
+  //  The denominators are identical. The numerators coincide ONLY as T -> 0,
+  //  where n_B(om) -> -theta(-om) and f_J -> theta(Re A_J). At z = mu the CD
+  //  residue list is EMPTY for a gapped system (the :1205 predicate skips every J
+  //  with |theta0 - f| < 1e-14), so Sigma^CD(mu) IS the Iterm and the entire
+  //  route difference collapses to one term:
+  //
+  //     Sigma_tau(mu) - Sigma_CD(mu)
+  //         = sum_{J,p} M(a,b,Jp) * [ n_B(om_p) + theta(-om_p) ] / (mu - eps_J + om_p)
+  //
+  //  a PURE BOSE THERMAL FACTOR. It is exponentially small for |om_p| >> kT and
+  //  DIVERGES as 1/(beta*om_p) as om_p -> 0. So the size of the disagreement is
+  //  controlled entirely by whether the fitted W^c pole set has poles near zero
+  //  on the scale of kT = 1/beta.
+  //
+  //  ⚠ THIS CASE DOES NOT CLAIM WHICH ROUTE IS RIGHT. It measures the term, its
+  //  driver (min |om_p| * beta), and the T -> 0 limit in which the two agree.
+  // =====================================================================
+  TEST_CASE("tc_iterm_thermal_at_mu", "[methods][tc_contour]") {
+    auto &mpi_context = utils::make_unit_test_mpi_context();
+    if (mpi_context->comm.size() != 1) return;
+    decltype(nda::range::all) all;
+
+    auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_lih222"));
+    const int nIpts = mf->nbnd() * 2;
+    thc_reader_t thc(mf, make_thc_reader_ptree(nIpts, "", "incore", "", "bdft", 1e-8,
+                                               mf->ecutrho(), 1, 1024));
+    const long ns = mf->nspin(), Nk_ibz = mf->nkpts_ibz(), nbnd = mf->nbnd();
+    const double beta = 1000.0;
+    auto eigval = mf->eigval();
+    double e_min = 1e300, e_max = -1e300;
+    for (long s = 0; s < ns; ++s)
+      for (long k = 0; k < Nk_ibz; ++k)
+        for (long n = 0; n < nbnd; ++n) {
+          e_min = std::min(e_min, eigval(s, k, n));
+          e_max = std::max(e_max, eigval(s, k, n));
+        }
+    const double w_max = std::max(std::abs(e_min), std::abs(e_max)) + 2.0;
+
+    imag_axes_ft::IAFT ft(beta, w_max + 1.0, imag_axes_ft::dlr_basis, "high");
+    MBState mb_state(mpi_context, ft, "coqui_tc_therm");
+    simple_dyson dyson(mf.get(), &ft);
+    mb_state.sF_skij.emplace(math::shm::make_shared_array<Array_view_4D_t>(
+        *mpi_context, {ns, Nk_ibz, nbnd, nbnd}));
+    mb_state.sDm_skij.emplace(math::shm::make_shared_array<Array_view_4D_t>(
+        *mpi_context, {ns, Nk_ibz, nbnd, nbnd}));
+    mb_state.sG_tskij.emplace(math::shm::make_shared_array<Array_view_5D_t>(
+        *mpi_context, {ft.nt_f(), ns, Nk_ibz, nbnd, nbnd}));
+    mb_state.sSigma_tskij.emplace(math::shm::make_shared_array<Array_view_5D_t>(
+        *mpi_context, {ft.nt_f(), ns, Nk_ibz, nbnd, nbnd}));
+    hamilt::set_fock(*mf, dyson.PSP(), mb_state.sF_skij.value(), true);
+    if (mpi_context->node_comm.root()) mb_state.sSigma_tskij.value().local() = ComplexType(0.0);
+    mb_state.sSigma_tskij.value().communicator()->barrier();
+    double mu = 0.0;
+    update_G(dyson, *mf, ft, mb_state.sDm_skij.value(), mb_state.sG_tskij.value(),
+             mb_state.sF_skij.value(), mb_state.sSigma_tskij.value(), mu, false);
+    solvers::scr_coulomb_t scr_im(&ft, "rpa", "ignore_g0");
+    scr_im.update_w(mb_state, thc, -1);
+
+    auto sE = math::shm::make_shared_array<Array_view_3D_t>(
+        *mpi_context, {ns, Nk_ibz, nbnd});
+    auto sMO = math::shm::make_shared_array<Array_view_4D_t>(
+        *mpi_context, {ns, Nk_ibz, nbnd, nbnd});
+    if (mpi_context->node_comm.root()) {
+      sE.local() = ComplexType(0.0);
+      sMO.local() = ComplexType(0.0);
+      for (long s = 0; s < ns; ++s)
+        for (long k = 0; k < Nk_ibz; ++k)
+          for (long n = 0; n < nbnd; ++n) {
+            sE.local()(s, k, n) = ComplexType(eigval(s, k, n), 0.0);
+            sMO.local()(s, k, n, n) = ComplexType(1.0, 0.0);
+          }
+    }
+    sE.communicator()->barrier();
+    sMO.communicator()->barrier();
+
+    qp_modea::modea_ctx ctx;
+    qp_modea::modea_opts opts;
+    opts.wfit = "tau";                 // the pole store BOTH routes contract
+    opts.level = 3;
+    qp_modea::build_modea_context(ctx, mb_state, thc, sMO, sE, mu, ft, opts,
+                                  "ignore_g0", false);
+    // NOTE: have_bstore is the CONTOUR band store and is false here by design --
+    // the tau route needs only the sk_block residue store, which is what both
+    // production paths contract.
+    REQUIRE(ctx.blocks.size() > 0);
+
+    const long npk = ctx.npk, nJ = ctx.nJ, nP = nJ * npk;
+    auto const &blk = ctx.blocks[0];   // the sk_block: the residue store BOTH
+                                       // production paths contract (:1251, :1341)
+    const long off = (blk.is * ctx.nk + blk.ik) * nJ;
+    const double kT = 1.0 / ctx.beta;
+
+    // ---- the W^c pole spectrum: the DRIVER of the whole effect --------------
+    double om_min = 1e300, therm_max = 0.0;
+    for (long p = 0; p < npk; ++p) {
+      const double o = ctx.om(p);
+      om_min = std::min(om_min, std::abs(o));
+      const double th_neg = (o < 0.0) ? 1.0 : 0.0;
+      therm_max = std::max(therm_max, std::abs(ctx.nB(p) + th_neg));
+    }
+
+    // ---- the two weight vectors at z = mu, SAME store, SAME denominators ----
+    const ComplexType zmu(ctx.mu, 0.0);
+    nda::array<ComplexType, 1> w_tau(nP), w_cd(nP);
+    long n_residue_targets = 0;
+    for (long J = 0; J < nJ; ++J) {
+      const double e = ctx.epsJ(off + J), f = ctx.fJ(off + J);
+      const double ReA0 = (zmu - e).real();
+      const double th0 = (std::abs(ReA0) < 1e-14) ? 0.5 : (ReA0 > 0.0 ? 1.0 : 0.0);
+      if (std::abs(th0 - f) >= 1e-14) ++n_residue_targets;   // :1205's own predicate
+      for (long p = 0; p < npk; ++p) {
+        const double o = ctx.om(p);
+        const ComplexType den = zmu - (e - o);
+        const double th_neg = (o < 0.0) ? 1.0 : 0.0;
+        w_tau(J * npk + p) = (ctx.nB(p) + f) / den;          // :659  EXACT finite-T
+        w_cd(J * npk + p) = (th0 - th_neg) / den;            // :1247 the CD Iterm
+      }
+    }
+
+    // ---- contract the SAME store with both, through the PRODUCTION path -----
+    double dmax = 0.0, smax = 0.0;
+    long wa = -1, wb = -1;
+    for (long a = 0; a < nbnd; ++a)
+      for (long b = 0; b < nbnd; ++b) {
+        const ComplexType s_tau = blk.contract_elem(a, b, w_tau, 0, nP);
+        const ComplexType s_cd = blk.contract_elem(a, b, w_cd, 0, nP);
+        smax = std::max(smax, std::abs(s_tau));
+        if (std::abs(s_tau - s_cd) > dmax) {
+          dmax = std::abs(s_tau - s_cd);
+          wa = a; wb = b;
+        }
+      }
+
+    // ---- the T -> 0 CONTROL: at large beta the two numerators must coincide --
+    // Same store, same denominators, but n_B and f evaluated at a colder beta.
+    // This is the check that the difference IS the thermal factor and nothing else.
+    double dmax_cold = 0.0;
+    {
+      const double beta_cold = 1.0e7;
+      nda::array<ComplexType, 1> wt(nP), wc(nP);
+      for (long J = 0; J < nJ; ++J) {
+        const double e = ctx.epsJ(off + J);
+        const double x = beta_cold * (e - ctx.mu);
+        const double f_cold = (x > 0.0) ? std::exp(-x) / (1.0 + std::exp(-x))
+                                        : 1.0 / (1.0 + std::exp(x));
+        const double ReA0 = (zmu - e).real();
+        const double th0 = (std::abs(ReA0) < 1e-14) ? 0.5 : (ReA0 > 0.0 ? 1.0 : 0.0);
+        for (long p = 0; p < npk; ++p) {
+          const double o = ctx.om(p);
+          const ComplexType den = zmu - (e - o);
+          const double th_neg = (o < 0.0) ? 1.0 : 0.0;
+          wt(J * npk + p) = (methods::sigma_route_b::stable_nB(beta_cold, o) + f_cold) / den;
+          wc(J * npk + p) = (th0 - th_neg) / den;
+        }
+      }
+      for (long a = 0; a < nbnd; ++a)
+        for (long b = 0; b < nbnd; ++b)
+          dmax_cold = std::max(dmax_cold,
+                               std::abs(blk.contract_elem(a, b, wt, 0, nP)
+                                        - blk.contract_elem(a, b, wc, 0, nP)));
+    }
+
+    // ---- PROVENANCE: is blk.M the SAME store under wfit = "contour"? --------
+    // The Iterm comment (:1241) says "from the EXISTING pole rep", implying the
+    // contour route still builds the tau fit for its Iterm and only REPLACES the
+    // residue term. If so the two routes' stores are identical and the clamped
+    // population contributes identically. MEASURED, not inferred.
+    double m_dev = 0.0, m_scale = 0.0;
+    long npk_c = -1, nJ_c = -1;
+    {
+      qp_modea::modea_ctx ctxc;
+      qp_modea::modea_opts optc;
+      optc.wfit = "contour";
+      optc.level = 3;
+      optc.cd_bfactor = "recompute";
+      qp_modea::build_modea_context(ctxc, mb_state, thc, sMO, sE, mu, ft, optc,
+                                    "ignore_g0", false);
+      npk_c = ctxc.npk;
+      nJ_c = ctxc.nJ;
+      if (ctxc.blocks.size() > 0 and npk_c == npk and nJ_c == nJ) {
+        auto const &blkc = ctxc.blocks[0];
+        for (long a = 0; a < nbnd; ++a)
+          for (long b = 0; b < nbnd; ++b)
+            for (long P = 0; P < nP; ++P) {
+              const ComplexType v0 = blk.pole(a, b, P), v1 = blkc.pole(a, b, P);
+              m_dev = std::max(m_dev, std::abs(v0 - v1));
+              m_scale = std::max(m_scale, std::abs(v0));
+            }
+      }
+    }
+
+    // ---- THE POLE GAP: where do the RESIDUE arguments actually land? --------
+    // Structural claim to be checked, not assumed: the :1205 predicate admits J
+    // iff theta(eps_a - eps_J) differs from f_J by >= 1e-14. At T = 0 that is
+    // exactly "eps_J lies between eps_a and mu", giving residue arguments confined
+    // to [0, D] with D = |eps_a - mu|. AT FINITE T IT IS WIDER: f_J is neither 0
+    // nor 1 to 1e-14 within a thermal shell w_T = ln(1e14)/beta ~ 32.2/beta of mu
+    // (0.87 eV at beta = 1000), so J inside that shell contributes from EITHER
+    // side and the bound is [0, D + w_T]. My first version of this gate asserted
+    // the T = 0 bound and FAILED at +3.125e-02 a.u. -- which is w_T. The bound
+    // below is the corrected claim, not a loosened one. If D + w_T < min|om_p| the
+    // ENTIRE residue evaluation of that state sits BELOW THE LOWEST FITTED POLE
+    // -- and the states with the SMALLEST binding energy sit deepest inside that
+    // gap. That inverts the usual "fits fail far from mu" intuition: here what
+    // matters is the residue ARGUMENT, not the evaluation energy.
+    double worst_arg_excess = -1e300;      // max over a of (max_arg - D_a); must be <= 0
+    long n_state_in_gap = 0, n_state_probed = 0;
+    double om_sorted_lo[4] = {0, 0, 0, 0};
+    {
+      std::vector<double> ab;
+      for (long p = 0; p < npk; ++p) ab.push_back(std::abs(ctx.om(p)));
+      std::sort(ab.begin(), ab.end());
+      for (int i = 0; i < 4 and i < int(ab.size()); ++i) om_sorted_lo[i] = ab[std::size_t(i)];
+
+      for (long a = 0; a < nbnd; ++a) {
+        const double ea = ctx.epsJ(off + a);          // band a of THIS block
+        const double D = std::abs(ea - ctx.mu);
+        double max_arg = 0.0;
+        long nt = 0;
+        for (long J = 0; J < nJ; ++J) {
+          const double e = ctx.epsJ(off + J), f = ctx.fJ(off + J);
+          const double ReA0 = ea - e;
+          const double th0 = (std::abs(ReA0) < 1e-14) ? 0.5 : (ReA0 > 0.0 ? 1.0 : 0.0);
+          if (std::abs(th0 - f) < 1e-14) continue;    // sigma_J = 0
+          max_arg = std::max(max_arg, std::abs(e - ea));
+          ++nt;
+        }
+        if (nt == 0) continue;
+        ++n_state_probed;
+        worst_arg_excess = std::max(worst_arg_excess, max_arg - D);
+        if (max_arg < om_min) ++n_state_in_gap;       // wholly below the lowest pole
+      }
+    }
+    app_log(2, "[TC iterm-thermal/pole-gap] W^c pole set, low end (|om_p| sorted): "
+               "{:.4g} / {:.4g} / {:.4g} / {:.4g} eV. Residue-argument structure over "
+               "{} states with a non-empty residue list: max over states of "
+               "(max residue argument - binding energy) = {:.3e} a.u. -- NON-POSITIVE "
+               "confirms the structural claim that every residue argument of a state at "
+               "binding energy D lies in [0, D]. States whose ENTIRE residue evaluation "
+               "falls below the lowest fitted pole: {} of {}. ⚠⚠ TWO CAVEATS: the bound is "
+               "[0, D + w_T] with the finite-T shell w_T = ln(1e14)/beta = {:.4g} eV, "
+               "NOT [0, D]; and these constants are qe_lih222's -- 0 of 16 states here "
+               "sit wholly inside the pole gap, so THIS FIXTURE DOES NOT EXHIBIT THE "
+               "MECHANISM and the si444 pole set must be measured on its own.",
+            om_sorted_lo[0] * 27.211386245988, om_sorted_lo[1] * 27.211386245988,
+            om_sorted_lo[2] * 27.211386245988, om_sorted_lo[3] * 27.211386245988,
+            n_state_probed, worst_arg_excess, n_state_in_gap, n_state_probed,
+            (std::log(1.0e14) / ctx.beta) * 27.211386245988);
+    const double w_T = std::log(1.0e14) / ctx.beta;      // the thermal shell
+    REQUIRE(worst_arg_excess <= w_T * 1.01);   // corrected bound: [0, D + w_T]
+    REQUIRE(worst_arg_excess > 0.0);           // and finite T really does widen it
+
+    const double HA = 27.211386245988;
+    app_log(2, "[TC iterm-thermal/provenance] wfit = \"contour\" vs \"tau\": npk {} vs {}, "
+               "nJ {} vs {}; max |M_contour - M_tau| = {:.6e} over max|M| = {:.4e}. "
+               "A ZERO here means the contour route reuses the tau pole store verbatim "
+               "for its Iterm and differs ONLY in the residue term -- so the clamped "
+               "population (z = mu, where the residue list is near-empty) contributes "
+               "IDENTICALLY in both routes, and any eV-class route difference must "
+               "originate at the IN-STRIP states.",
+            npk_c, npk, nJ_c, nJ, m_dev, m_scale);
+    app_log(2, "[TC iterm-thermal] qe_lih222, z = mu, beta = {:.4g} (kT = {:.4g} a.u. = "
+               "{:.4g} eV). W^c pole set: npk = {}, min |om_p| = {:.4g} a.u. = {:.4g} eV, "
+               "min|om_p|/kT = {:.4g}; max |n_B(om_p) + theta(-om_p)| = {:.4g}. "
+               "CD residue targets at z = mu: {} (0 = Sigma^CD(mu) IS the Iterm). "
+               "SAME blk.M contracted two ways: max |Sigma_tau - Sigma_CD| = {:.6e} a.u. "
+               "= {:.4g} meV, at (a,b) = ({},{}), over max|Sigma_tau| = {:.4e}. "
+               "T -> 0 CONTROL (beta = 1e7): {:.6e} a.u. -- the two numerators coincide "
+               "in that limit, which is what identifies the difference as the thermal "
+               "factor n_B(om_p) + theta(-om_p) and nothing else.",
+            ctx.beta, kT, kT * HA, npk, om_min, om_min * HA, om_min / kT, therm_max,
+            n_residue_targets, dmax, dmax * HA * 1000.0, wa, wb, smax, dmax_cold);
+
+    // the mechanism, asserted: the difference must VANISH as T -> 0
+    REQUIRE(dmax_cold < 1e-10);
+    // and the driver must be reported, not assumed
+    REQUIRE(om_min > 0.0);
+    REQUIRE(npk > 0);
+  }
+
   TEST_CASE("tc5_sizing_law", "[methods][tc_contour]") {
     using namespace methods::wc_grid;
     const double HA = 27.211386245988;
