@@ -285,3 +285,17 @@ target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield eri_li
 add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
 set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
                     TIMEOUT ${COQUI_VERTEX_TEST_TIMEOUT})
+
+# scGW-tilde Tier 1.5, increment T15-a (notes/tier15_ward_legs_plan.md): the discrete-Ward
+# leg vertex ALGEBRA (ward_legs.hpp) on exact rational data -- closed-form pole sums vs dense
+# Matsubara oracles (gate P0), the q = 0 matrix telescoping of proposal eq 22 (G-g), the
+# Z-link + positivity (G-h), R = 0 bitwise (G-i), the window complement identity. Pure toy.
+set(TEST_ID methods_vertex_ward_legs)
+
+add_executable(test_${TEST_ID} test_vertex_ward_legs.cpp)
+target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield eri_lib hf_lib
+                      vertex_lib gw_lib scf_lib)
+
+add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
+set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
+                    TIMEOUT ${COQUI_VERTEX_TEST_TIMEOUT})
