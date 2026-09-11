@@ -313,3 +313,17 @@ target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield eri_li
 add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
 set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
                     TIMEOUT ${COQUI_VERTEX_TEST_TIMEOUT})
+
+# scGW-tilde Tier 2 full frequency, increment D1 (notes/dynbse_plan.md): the two-family DLR
+# algebra of the resummed DYNAMIC-rung BSE (dynbse.hpp) against a dense Matsubara BSE oracle on
+# an exact rational toy -- the static limit, the first iterate and the resummed vertex, at
+# inu = 0 and inu != 0; then the fitted-residue (shared aux grid) pathway. Pure toy.
+set(TEST_ID methods_vertex_dynbse)
+
+add_executable(test_${TEST_ID} test_vertex_dynbse.cpp)
+target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield eri_lib hf_lib
+                      vertex_lib gw_lib scf_lib)
+
+add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
+set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
+                    TIMEOUT ${COQUI_VERTEX_TEST_TIMEOUT})
