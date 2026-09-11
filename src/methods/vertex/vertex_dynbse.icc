@@ -759,6 +759,70 @@ namespace solvers {
     return d;
   }
 
+  vertex_t::dynbse_nu0_result vertex_t::eval_pol_dynbse_nu0(MBState &mb_state, THC_ERI auto &thc) {
+    decltype(nda::range::all) all;
+    namespace vd = vertex_dynbse_detail;
+    vertex_ladder_detail::prof_watch twatch;
+    dynbse_nu0_result r;
+    utils::check(active() and secondary(), "vertex_t::eval_pol_dynbse_nu0: requires an ACTIVE secondary-basis vertex.");
+    utils::check(not _wannier, "vertex_t::eval_pol_dynbse_nu0: window mode only.");
+    utils::check(_W0b_qmm.has_value(), "vertex_t::eval_pol_dynbse_nu0: W0bar is absent -- build_w0 must run first.");
+    utils::check(_Wb_qwmm.has_value(),
+                 "vertex_t::eval_pol_dynbse_nu0: the W-bar cache is absent -- cache_w must run on this instance "
+                 "(the dynamic readout folds THIS iteration's dW).");
+    auto MF = thc.MF();
+    auto mpi = thc.mpi();
+    utils::check(MF->nkpts() == MF->nkpts_ibz() and MF->nqpts() == MF->nqpts_ibz(),
+                 "vertex_t::eval_pol_dynbse_nu0: nosym meshes only (D3).");
+    nda::array<ComplexType, 5> G_CC;
+    nda::array<long, 2> kmq, kpq;
+    vertex_sym::sym_ctx const *symc = nullptr;
+    ladder_inputs(mb_state, thc, G_CC, kmq, kpq, symc);
+    utils::check(symc == nullptr or not symc->active, "vertex_t::eval_pol_dynbse_nu0: nosym only.");
+    vertex_pi::iaft_tools tools(*_ft);
+    const long nq = MF->nqpts(), Nm = _Xb_skma.shape(2);
+    std::vector<long> nu0 = {tools.m0};
+    nda::array<ComplexType, 4> Ps(1, nq, Nm, Nm), P1(1, nq, Nm, Nm), Pg(1, nq, Nm, Nm), Pd(1, nq, Nm, Nm);
+    vd::dyn_opts o;
+    o.tol = _dyn_tol; o.maxit = _dyn_maxit; o.gmres_m = _dyn_gmres; o.sign_ks = _dyn_sign;
+    vd::dyn_meter met;
+    vd::pair_space_ladder_dyn(G_CC, _Xb_skma, _W0b_qmm.value(), _Wb_qwmm.value(), kmq, kpq, tools, nu0,
+                              &Ps, nullptr, &Pg, &Pd, mpi->comm.rank(), mpi->comm.size(), o, &met);
+    // the pure one dynamic rung (T_s = 0, one application) as its own column
+    {
+      vd::dyn_opts o1 = o;
+      o1.one_rung_only = true;
+      vd::dyn_meter met1;
+      vd::pair_space_ladder_dyn(G_CC, _Xb_skma, _W0b_qmm.value(), _Wb_qwmm.value(), kmq, kpq, tools, nu0,
+                                nullptr, &P1, nullptr, nullptr, mpi->comm.rank(), mpi->comm.size(), o1, &met1);
+    }
+    for (auto *A : {&Ps, &P1, &Pg, &Pd}) mpi->comm.all_reduce_in_place_n(A->data(), A->size(), std::plus<>{});
+    met.reduce(mpi->comm);
+    const double hs = vertex_ladder_detail::hermitize_mn(Ps), h1 = vertex_ladder_detail::hermitize_mn(P1);
+    const double hg = vertex_ladder_detail::hermitize_mn(Pg), hd = vertex_ladder_detail::hermitize_mn(Pd);
+    r.Pi_static = nda::array<ComplexType, 3>(nq, Nm, Nm); r.Pi_static = Ps(0, all, all, all);
+    r.Pi_dyn1 = nda::array<ComplexType, 3>(nq, Nm, Nm);   r.Pi_dyn1 = P1(0, all, all, all);
+    r.Pi_gam1 = nda::array<ComplexType, 3>(nq, Nm, Nm);   r.Pi_gam1 = Pg(0, all, all, all);
+    r.Pi_dyn = nda::array<ComplexType, 3>(nq, Nm, Nm);    r.Pi_dyn = Pd(0, all, all, all);
+    r.ritz_max = met.ritz_max; r.refit_err = met.refit_err_max; r.fit_err_G = met.fit_err_G; r.rr_G = met.rr_G;
+    r.herm_dyn = hd; r.it_max = met.it_max; r.it_sum = met.it_sum; r.nunits = met.nunits;
+    r.all_converged = (met.nconv == met.nunits); r.t_solve = met.t_solve; r.rss_gb = met.rss_max_gb;
+    r.t_total = twatch.lap();
+    auto mx = [](nda::array<ComplexType, 3> const &A) { double m = 0.0; for (auto const &v : A) m = std::max(m, std::abs(v)); return m; };
+    app_log(1, "  [scGW-tilde T2] dynamic-rung ladder at inu = 0: {} units, applications max {} (mean {:.1f}), "
+               "all converged {}, watchdog max |Ritz(K_d L_s)| {:.3f}; G pole fit {:.2e} (rr {:.2f}), tau refit "
+               "{:.2e}; (M,N) asymmetry static {:.1e} / one-rung {:.1e} / Gamma1 {:.1e} / resummed {:.1e}; "
+               "|static| {:.3e} |one-rung| {:.3e} |Gamma1| {:.3e} |resummed| {:.3e}; wall {:.1f} s (solve {:.1f} s "
+               "on the slowest rank), RSS {:.2f} GB",
+            met.nunits, met.it_max, (met.nunits > 0) ? double(met.it_sum) / double(met.nunits) : 0.0, r.all_converged,
+            met.ritz_max, met.fit_err_G, met.rr_G, met.refit_err_max, hs, h1, hg, hd, mx(r.Pi_static), mx(r.Pi_dyn1),
+            mx(r.Pi_gam1), mx(r.Pi_dyn), r.t_total, met.t_solve, met.rss_max_gb);
+    if (met.ritz_max >= 1.0)
+      app_log(1, "  [scGW-tilde T2] WARNING: the dynamic remainder's watchdog is >= 1 on some unit -- the resummed "
+                 "column is not to be trusted there; Gamma_1 is the reportable number.");
+    return r;
+  }
+
 } // namespace solvers
 } // namespace methods
 

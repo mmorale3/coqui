@@ -331,6 +331,9 @@ namespace solvers {
     // last readout values at q_min (RPA, +ladder); -1 before the first readout
     double _pol_eps_rpa = -1.0, _pol_eps_ladder = -1.0;
     double _pol_eps_dlam = -1.0;   // Tier 1.5: eps_M with chi0_Lambda alone (RPA + Delta P^Lambda)
+    // scGW-tilde Tier 2 full frequency (D3): the dynamic-rung columns at q_min, inu = 0
+    double _pol_eps_dyn_static = -1.0, _pol_eps_dyn_pc = -1.0, _pol_eps_dyn_gam1 = -1.0, _pol_eps_dyn = -1.0;
+    double _pol_dyn_ritz = -1.0;
     // Q3: the LOOP's own eps_M(q_min, inu = 0) from eps_inv_head_q -- the other route of
     // the Q3-b(i) identity (tau-Dyson of the injected Pi vs the readout's single-frequency
     // Dyson). -1 before the first readout.
@@ -379,6 +382,12 @@ namespace solvers {
     // Tier 1.5: the "+DeltaLambda" column (RPA + the zero-rung Lambda term) at q_min;
     // -1 unless pol_vertex_legs = "ward"
     double pol_eps_dlam() const { return _pol_eps_dlam; }
+    /** Tier 2 (D3): eps_M(q_min, inu = 0) with the dynamic-rung ladder columns: {static
+     *  (sign-corrected), static + one dynamic rung, Gamma_1, resummed}; -1 when not run. */
+    std::array<double, 4> pol_eps_dyn() const {
+      return {_pol_eps_dyn_static, _pol_eps_dyn_pc, _pol_eps_dyn_gam1, _pol_eps_dyn};
+    }
+    double pol_dyn_ritz() const { return _pol_dyn_ritz; }
     // Q3: the loop-side eps_M(q_min, inu = 0) of the same iteration (gate Q3-b(i))
     double pol_eps_loop() const { return _pol_eps_loop; }
     // Q3: the last injection's watchdog / meter values (gate Q3-c); -1 if never injected

@@ -863,6 +863,11 @@ namespace solvers {
     // scGW-tilde TIER 1.5 (notes/tier15_ward_legs_plan.md): the LEG VERTEX of the ladder's
     // pair propagators, "bare" (historic, bitwise) | "ward" (the discrete-Ward Lambda0).
     std::string _ladder_legs = "bare";
+    // scGW-tilde Tier 2 full frequency (notes/dynbse_plan.md): the ladder's rung, "static"
+    // (historic, bitwise) | "dynamic" (the resummed full-frequency W rung), + its solve knobs.
+    std::string _ladder_rung = "static";
+    double _dyn_tol = 1e-8, _dyn_sign = -1.0;
+    long _dyn_maxit = 30, _dyn_gmres = 4;
     // DIAGNOSTIC (default OFF, not physical): THE CONSTANT-RUNG ABSOLUTE PIN.
     //
     // X^L = pi^dyn - Pi^{C,0}(tau=0) must VANISH when the screening is genuinely static.
@@ -1510,6 +1515,45 @@ namespace solvers {
     bool ladder_ward_legs() const { return _ladder_legs == "ward"; }
 
     /**
+     * scGW-tilde Tier 2 FULL FREQUENCY (notes/dynbse_plan.md, increment D3): the ladder's RUNG.
+     *   "static"  : the historic W0bar rung (bitwise);
+     *   "dynamic" : the full-frequency screened rung W(inu'), resummed to all orders
+     *               (vertex_dynbse.icc, pair_space_ladder_dyn) -- the eps_M readout gains the
+     *               columns +static (sign-corrected), +static+Pi^C_dyn (one dynamic rung),
+     *               +Gamma_1 and +resummed; inu = 0 only at D3.
+     * tol / maxit / gmres_m : the dynamic-remainder solve (GMRES(m), 0 = Neumann);
+     * sign_ks : the static-rung sign convention in the dynamic driver (-1 = the derived sign,
+     *           memory l2-resolvent-sign-finding; +1 = the as-implemented L2 convention).
+     * Dynamic rungs XOR Tier-1.5 legs (never both). Travels to the READOUT instance.
+     */
+    void set_ladder_rung(std::string rung, double tol, long maxit, long gmres_m, double sign_ks) {
+      utils::check(rung == "static" or rung == "dynamic",
+                   "vertex_t::set_ladder_rung: unknown pol_vertex_rung \"{}\". Valid options are "
+                   "\"static\" (default), \"dynamic\".", rung);
+      if (rung == "dynamic") {
+        utils::check(_ft->basis() == imag_axes_ft::dlr_basis,
+                     "pol_vertex_rung = \"dynamic\" requires the DLR IAFT backend (iaft basis = \"dlr\").");
+        utils::check(_ladder_legs != "ward",
+                     "pol_vertex_rung = \"dynamic\" and pol_vertex_legs = \"ward\" double count "
+                     "(proposal eq 24 cor. ii): choose one.");
+        utils::check(sign_ks == -1.0 or sign_ks == 1.0, "pol_vertex_dyn_sign must be -1 or +1 (got {}).", sign_ks);
+      }
+      _ladder_rung = rung;
+      _dyn_tol = tol; _dyn_maxit = maxit; _dyn_gmres = gmres_m; _dyn_sign = sign_ks;
+      if (rung == "dynamic")
+        app_log(1, "  [scGW-tilde T2] pol_vertex_rung = \"dynamic\": the ladder is resummed with the "
+                   "FULL-FREQUENCY screened rung W(inu') (notes/dynbse_plan.md; two-family DLR "
+                   "representation, static part exact, dynamic remainder by GMRES({}) to {:.1e}, "
+                   "maxit {}); rung sign convention {:+.0f}.", gmres_m, tol, maxit, sign_ks);
+    }
+    std::string ladder_rung() const { return _ladder_rung; }
+    bool ladder_dynamic_rung() const { return _ladder_rung == "dynamic"; }
+    double ladder_dyn_tol() const { return _dyn_tol; }
+    long ladder_dyn_maxit() const { return _dyn_maxit; }
+    long ladder_dyn_gmres() const { return _dyn_gmres; }
+    double ladder_dyn_sign() const { return _dyn_sign; }
+
+    /**
      * scGW-tilde increment L2 (vertex_ladder.icc): the resummed pair-space ladder
      * polarization at the inu = 0 bosonic node, (nq, N_m, N_m) in THIS vertex's
      * secondary aux basis (all rungs >= 1; the n = 1 term is the static-rung Pi^C,
@@ -1668,6 +1712,25 @@ namespace solvers {
       double dyn_vs_static = -1.0, gam1_vs_static = -1.0;
     };
     dynbse_diag dynbse_gate(MBState &mb_state, THC_ERI auto &thc);
+
+    /**
+     * scGW-tilde Tier 2 full frequency, increment D3: the inu = 0 columns of the dynamic-rung
+     * ladder on the readout instance (nosym window mode; requires W0bar and the W-bar cache):
+     * (nq, N_m, N_m) blocks of rungs >= 1, (M,N)-Hermitized --
+     *   Pi_static : the static ladder (K_s = sign_ks Kbig/nk; the sign-corrected L2 at -1)
+     *   Pi_dyn1   : the one bare dynamic rung (the Pi^C anchor's dynamic part)
+     *   Pi_gam1   : the first iterate (one dynamic rung dressed by static ladders)
+     *   Pi_dyn    : the resummed dynamic-rung vertex
+     * with the solve meters.
+     */
+    struct dynbse_nu0_result {
+      nda::array<ComplexType, 3> Pi_static, Pi_dyn1, Pi_gam1, Pi_dyn;
+      double ritz_max = -1.0, refit_err = -1.0, fit_err_G = -1.0, rr_G = -1.0, herm_dyn = -1.0;
+      long it_max = 0, it_sum = 0, nunits = 0;
+      bool all_converged = false;
+      double t_total = 0.0, t_solve = 0.0, rss_gb = 0.0;
+    };
+    dynbse_nu0_result eval_pol_dynbse_nu0(MBState &mb_state, THC_ERI auto &thc);
 
     /**
      * scGW-tilde increment L1 (vertex_ladder.icc): the C-window pair bubble

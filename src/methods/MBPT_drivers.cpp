@@ -289,6 +289,16 @@ inline void ensure_checkpoint(std::shared_ptr<mf::MF> mf, std::string const& out
  *                 term Delta P^Lambda to the ladder's output (eq 27, the Tier-1.5
  *                 composite), (M,N)-Hermitized. The eps_M readout gains a "+DeltaLambda"
  *                 column (chi0_Lambda alone). Requires ladder_solve_grid = 1 (T15-b).
+ *  - pol_vertex_rung: "static" scGW-tilde TIER 2 FULL FREQUENCY (notes/dynbse_plan.md): the
+ *                 ladder's RUNG. {choices: "static", "dynamic"}. "static" is the historic
+ *                 W0bar rung (bitwise). "dynamic" resums the ladder with the FULL-FREQUENCY
+ *                 screened rung W(inu') (two-family DLR representation of the loop frequency,
+ *                 static part exact, dynamic remainder by GMRES); the eps_M readout gains the
+ *                 columns +static(sign-corrected) / +static+Pi^C_dyn / +Gamma_1 / +resummed at
+ *                 inu = 0 (D3: readout only, nosym meshes, ladder_solve_grid = 1). Knobs:
+ *                 pol_vertex_dyn_tol (1e-8), pol_vertex_dyn_maxit (30), pol_vertex_dyn_gmres
+ *                 (4; 0 = Neumann), pol_vertex_dyn_sign (-1 = the derived rung sign, +1 = the
+ *                 as-implemented L2 convention). XOR pol_vertex_legs = "ward".
  *  - ladder_solve_grid: 1  Ranks per SOLVE GRID for the ladder's dense resolvent
  *                 (notes/ladder_b_integration_design.md, increment B). 1 (default) is the
  *                 per-rank LAPACK path -- bit-identical to the pre-B tree, and its
@@ -558,6 +568,16 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
       auto pol_vertex_legs = io::get_value_with_default<std::string>(pt,"pol_vertex_legs","bare");
       io::tolower(pol_vertex_legs);
       vertex.set_ladder_legs(pol_vertex_legs);
+      // scGW-tilde Tier 2 full frequency (notes/dynbse_plan.md D3): the ladder's rung (default-inert)
+      {
+        auto pol_vertex_rung = io::get_value_with_default<std::string>(pt,"pol_vertex_rung","static");
+        io::tolower(pol_vertex_rung);
+        vertex.set_ladder_rung(pol_vertex_rung,
+            io::get_value_with_default<double>(pt,"pol_vertex_dyn_tol",1e-8),
+            io::get_value_with_default<long>(pt,"pol_vertex_dyn_maxit",30),
+            io::get_value_with_default<long>(pt,"pol_vertex_dyn_gmres",4),
+            io::get_value_with_default<double>(pt,"pol_vertex_dyn_sign",-1.0));
+      }
     }
     scr_eri.set_cvv_rspace_tol(cvv_rspace_tol);
     if (vertex.enabled()) {
@@ -897,6 +917,16 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
       auto pol_vertex_legs = io::get_value_with_default<std::string>(pt,"pol_vertex_legs","bare");
       io::tolower(pol_vertex_legs);
       pol_vertex_carrier.set_ladder_legs(pol_vertex_legs);
+      // scGW-tilde Tier 2 full frequency (notes/dynbse_plan.md D3): the ladder's rung (default-inert)
+      {
+        auto pol_vertex_rung = io::get_value_with_default<std::string>(pt,"pol_vertex_rung","static");
+        io::tolower(pol_vertex_rung);
+        pol_vertex_carrier.set_ladder_rung(pol_vertex_rung,
+            io::get_value_with_default<double>(pt,"pol_vertex_dyn_tol",1e-8),
+            io::get_value_with_default<long>(pt,"pol_vertex_dyn_maxit",30),
+            io::get_value_with_default<long>(pt,"pol_vertex_dyn_gmres",4),
+            io::get_value_with_default<double>(pt,"pol_vertex_dyn_sign",-1.0));
+      }
     }
     if (pol_vertex_carrier.pol_vertex_enabled()) scr_eri.set_vertex(&pol_vertex_carrier);
     MBState mb_state(mpi, ft, output);
@@ -1108,6 +1138,16 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
       auto pol_vertex_legs = io::get_value_with_default<std::string>(pt,"pol_vertex_legs","bare");
       io::tolower(pol_vertex_legs);
       pol_vertex_carrier.set_ladder_legs(pol_vertex_legs);
+      // scGW-tilde Tier 2 full frequency (notes/dynbse_plan.md D3): the ladder's rung (default-inert)
+      {
+        auto pol_vertex_rung = io::get_value_with_default<std::string>(pt,"pol_vertex_rung","static");
+        io::tolower(pol_vertex_rung);
+        pol_vertex_carrier.set_ladder_rung(pol_vertex_rung,
+            io::get_value_with_default<double>(pt,"pol_vertex_dyn_tol",1e-8),
+            io::get_value_with_default<long>(pt,"pol_vertex_dyn_maxit",30),
+            io::get_value_with_default<long>(pt,"pol_vertex_dyn_gmres",4),
+            io::get_value_with_default<double>(pt,"pol_vertex_dyn_sign",-1.0));
+      }
     }
     if (pol_vertex_carrier.pol_vertex_enabled()) scr_eri.set_vertex(&pol_vertex_carrier);
     // Project 2 increment Q5 (notes/q5_option2_outer_loop_spec.md §1): the Option-2
@@ -1359,6 +1399,16 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
       auto pol_vertex_legs = io::get_value_with_default<std::string>(pt,"pol_vertex_legs","bare");
       io::tolower(pol_vertex_legs);
       vertex.set_ladder_legs(pol_vertex_legs);
+      // scGW-tilde Tier 2 full frequency (notes/dynbse_plan.md D3): the ladder's rung (default-inert)
+      {
+        auto pol_vertex_rung = io::get_value_with_default<std::string>(pt,"pol_vertex_rung","static");
+        io::tolower(pol_vertex_rung);
+        vertex.set_ladder_rung(pol_vertex_rung,
+            io::get_value_with_default<double>(pt,"pol_vertex_dyn_tol",1e-8),
+            io::get_value_with_default<long>(pt,"pol_vertex_dyn_maxit",30),
+            io::get_value_with_default<long>(pt,"pol_vertex_dyn_gmres",4),
+            io::get_value_with_default<double>(pt,"pol_vertex_dyn_sign",-1.0));
+      }
     }
     scr_eri.set_cvv_rspace_tol(cvv_rspace_tol);
     if (vertex.enabled()) {
@@ -1623,6 +1673,16 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
       auto pol_vertex_legs = io::get_value_with_default<std::string>(pt,"pol_vertex_legs","bare");
       io::tolower(pol_vertex_legs);
       pol_vertex_carrier.set_ladder_legs(pol_vertex_legs);
+      // scGW-tilde Tier 2 full frequency (notes/dynbse_plan.md D3): the ladder's rung (default-inert)
+      {
+        auto pol_vertex_rung = io::get_value_with_default<std::string>(pt,"pol_vertex_rung","static");
+        io::tolower(pol_vertex_rung);
+        pol_vertex_carrier.set_ladder_rung(pol_vertex_rung,
+            io::get_value_with_default<double>(pt,"pol_vertex_dyn_tol",1e-8),
+            io::get_value_with_default<long>(pt,"pol_vertex_dyn_maxit",30),
+            io::get_value_with_default<long>(pt,"pol_vertex_dyn_gmres",4),
+            io::get_value_with_default<double>(pt,"pol_vertex_dyn_sign",-1.0));
+      }
     }
     if (pol_vertex_carrier.pol_vertex_enabled()) scr_eri.set_vertex(&pol_vertex_carrier);
 

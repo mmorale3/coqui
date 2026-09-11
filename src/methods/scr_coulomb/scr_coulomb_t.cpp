@@ -288,7 +288,11 @@ namespace solvers {
     // scGW-tilde L2: the ladder eps_M readout (report-only; see pol_ladder_eps_readout).
     // Q3: eps_inv_head_q carries the loop's OWN q-resolved head, so the readout also
     // reports the loop-side eps_M(q_min) -- the second route of gate Q3-b(i).
-    if (pol_readout)
+    // Tier 2 (D3): the DYNAMIC-rung readout needs THIS iteration's dW folded into the readout
+    // instance's W-bar cache, so it runs after the dW publication below; the static readout
+    // keeps its historic place (bitwise).
+    const bool pol_dyn_readout = (pol_readout and _pol_vtx != nullptr and _pol_vtx->ladder_dynamic_rung());
+    if (pol_readout and not pol_dyn_readout)
       pol_ladder_eps_readout(mb_state, thc, _pol_pi0_qPQ, std::addressof(eps_inv_head_q));
 
     // make routine to transposed distributed arrays over any 2 indices, so should
@@ -312,6 +316,11 @@ namespace solvers {
     dW_tqPQ.reset();
 
     mb_state.screen_type = _screen_type;
+
+    if (pol_dyn_readout) {
+      _pol_vtx->cache_w(mb_state, thc);
+      pol_ladder_eps_readout(mb_state, thc, _pol_pi0_qPQ, std::addressof(eps_inv_head_q));
+    }
 
     if (h5_iter>=0) {
       dump_eps_inv_head(eps_inv_head_q, eps_inv_head,
@@ -449,6 +458,9 @@ namespace solvers {
                             _vertex->ladder_qnu_meter());
     // Tier 1.5 (notes/tier15_ward_legs_plan.md): the leg vertex travels the same way.
     _pol_vtx->set_ladder_legs(_vertex->ladder_legs());
+    // Tier 2 full frequency (notes/dynbse_plan.md D3): the rung and its solve knobs too.
+    _pol_vtx->set_ladder_rung(_vertex->ladder_rung(), _vertex->ladder_dyn_tol(), _vertex->ladder_dyn_maxit(),
+                              _vertex->ladder_dyn_gmres(), _vertex->ladder_dyn_sign());
     app_log(1, "  [scGW-tilde L2] ladder readout instance: C window = [{}, {}), "
                "secondary rank knob = {}, div_treatment = {} (kernel head follows "
                "build_w0's policy; W0bar is SAME-iteration -- coincides with "
@@ -1085,6 +1097,15 @@ namespace solvers {
     const long Nm = Pl_qmm.shape(1);
     utils::check(tmap.shape(0) == nq and tmap.shape(1) == Nm and tmap.shape(2) == Np,
                  "pol_ladder_eps_readout: transfer map shape mismatch.");
+    // Tier 2 (D3): the dynamic-rung columns at inu = 0
+    const bool dyn_rung = _pol_vtx->ladder_dynamic_rung();
+    std::optional<vertex_t::dynbse_nu0_result> dres;
+    if (dyn_rung) {
+      dres.emplace(_pol_vtx->eval_pol_dynbse_nu0(mb_state, thc));
+      utils::check(dres->Pi_dyn.shape(0) == nq and dres->Pi_dyn.shape(1) == Nm,
+                   "pol_ladder_eps_readout: dynamic-rung block shape mismatch.");
+      _pol_dyn_ritz = dres->ritz_max;
+    }
 
     // replicated Z(q, P, Q) (same gather pattern as gather_nu0_row)
     nda::array<ComplexType, 3> Z_qPQ(nq, Np, Np);
@@ -1116,6 +1137,9 @@ namespace solvers {
     const double fpi = 4.0 * 3.14159265358979323846;
     nda::array<ComplexType, 2> dP(Np, Np), tmpM(Nm, Np), A(Np, Np);
     nda::array<ComplexType, 2> dPd(ward_legs ? Np : 0, ward_legs ? Np : 0);
+    const long Nd = dyn_rung ? Np : 0;
+    nda::array<ComplexType, 2> dPs(Nd, Nd), dP1(Nd, Nd), dPg(Nd, Nd), dPy(Nd, Nd);
+    double eps_ds_qmin = -1.0, eps_dp_qmin = -1.0, eps_dg_qmin = -1.0, eps_dy_qmin = -1.0;
     nda::matrix<ComplexType> Am(Np, Np);
     nda::array<ComplexType, 1> chi_c(Np), buf(Np);
     double eps_rpa_qmin = -1.0, eps_lad_qmin = -1.0, eps_dlm_qmin = -1.0, qmin_abs2 = 1e300;
@@ -1149,6 +1173,17 @@ namespace solvers {
         nda::blas::gemm(Pd_qmm(iq, all, all), tq, tmpM);
         nda::blas::gemm(td, tmpM, dPd);
       }
+      if (dyn_rung) {                                             // the four dynamic-rung blocks
+        auto up = [&](nda::array<ComplexType, 3> const &B, nda::array<ComplexType, 2> &out) {
+          nda::blas::gemm(B(iq, all, all), tq, tmpM);
+          nda::blas::gemm(td, tmpM, out);
+        };
+        up(dres->Pi_static, dPs);
+        up(dres->Pi_dyn1, dP1);
+        up(dres->Pi_gam1, dPg);
+        up(dres->Pi_dyn, dPy);
+        dP1 += dPs;                                               // static + one dynamic rung
+      }
       const double factor = (q_abs2 / fpi) * MF->volume();
       chi_c = nda::conj(Chi_bar(iq, all));
       auto eps_of = [&](nda::array<ComplexType, 2> const *add, nda::array<ComplexType, 2> *dW_out) {
@@ -1175,6 +1210,11 @@ namespace solvers {
       const double e_lad = eps_of(std::addressof(dP), qnu_meter ? std::addressof(W_lad) : nullptr);
       // Tier 1.5: chi0_Lambda alone (the zero-rung Lambda term on top of RPA)
       const double e_dlm = ward_legs ? eps_of(std::addressof(dPd), nullptr) : -1.0;
+      // Tier 2: the dynamic-rung columns (all rungs >= 1 on top of RPA)
+      const double e_ds = dyn_rung ? eps_of(std::addressof(dPs), nullptr) : -1.0;
+      const double e_dp = dyn_rung ? eps_of(std::addressof(dP1), nullptr) : -1.0;
+      const double e_dg = dyn_rung ? eps_of(std::addressof(dPg), nullptr) : -1.0;
+      const double e_dy = dyn_rung ? eps_of(std::addressof(dPy), nullptr) : -1.0;
       if (qnu_meter) {
         double dn = 0.0, rn = 0.0;
         for (long P = 0; P < Np; ++P)
@@ -1192,6 +1232,10 @@ namespace solvers {
         app_log(2, "  [scGW-tilde L2]   q {} (|q|^2 = {:.4e}): eps_M RPA = {:.6f}, "
                    "+DeltaLambda = {:.6f}, +ladder(Lambda legs) = {:.6f}", iq, q_abs2, e_rpa,
                 e_dlm, e_lad);
+      else if (dyn_rung)
+        app_log(2, "  [scGW-tilde L2]   q {} (|q|^2 = {:.4e}): eps_M RPA = {:.6f}, +ladder(L2) = {:.6f}, "
+                   "+static(sign-corr.) = {:.6f}, +static+Pi^C_dyn = {:.6f}, +Gamma1 = {:.6f}, +resummed = {:.6f}",
+                iq, q_abs2, e_rpa, e_lad, e_ds, e_dp, e_dg, e_dy);
       else
         app_log(2, "  [scGW-tilde L2]   q {} (|q|^2 = {:.4e}): eps_M RPA = {:.6f}, "
                    "+ladder = {:.6f}", iq, q_abs2, e_rpa, e_lad);
@@ -1200,6 +1244,7 @@ namespace solvers {
         eps_rpa_qmin = e_rpa;
         eps_lad_qmin = e_lad;
         eps_dlm_qmin = e_dlm;
+        eps_ds_qmin = e_ds; eps_dp_qmin = e_dp; eps_dg_qmin = e_dg; eps_dy_qmin = e_dy;
         iq_min = iq;
       }
     }
@@ -1235,6 +1280,17 @@ namespace solvers {
                    "{:.6f}, +DeltaLambda (chi0_Lambda alone) = {:.6f}, +ladder on Lambda legs "
                    "(eq 27 composite) = {:.6f}  [G-j targets at Si 4^3: ~4.8 / 5.4-5.6]",
                 iq_min, eps_rpa_qmin, eps_dlm_qmin, eps_lad_qmin);
+      if (dyn_rung) {
+        _pol_eps_dyn_static = eps_ds_qmin; _pol_eps_dyn_pc = eps_dp_qmin;
+        _pol_eps_dyn_gam1 = eps_dg_qmin; _pol_eps_dyn = eps_dy_qmin;
+        app_log(1, "  [scGW-tilde T2] dynamic-rung eps_M readout (inu = 0, q_min = {}): RPA = {:.6f}, "
+                   "+ladder(L2 as implemented) = {:.6f}, +static ladder (sign-corrected) = {:.6f}, "
+                   "+static+Pi^C_dyn (one dynamic rung) = {:.6f}, +Gamma_1 (static-dressed one dynamic rung) "
+                   "= {:.6f}, +RESUMMED dynamic-rung ladder = {:.6f}  [references at Si 4^3 q_min: RPA 4.028, "
+                   "L2 4.443, G0W0-class 5.747]; watchdog max |Ritz(K_d L_s)| = {:.3f}, converged {}",
+                iq_min, eps_rpa_qmin, eps_lad_qmin, eps_ds_qmin, eps_dp_qmin, eps_dg_qmin, eps_dy_qmin,
+                dres->ritz_max, dres->all_converged);
+      }
     }
     // Q3-b(i): the SAME q_min read off the loop's own screening. Same G, same kernel, two
     // evaluation routes -- the tau-space Dyson of the (injected) Pi against the readout's

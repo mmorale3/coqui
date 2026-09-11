@@ -107,4 +107,60 @@ namespace bdft_tests {
 #endif
   }
 
+  TEST_CASE("dynbse_readout", "[methods][vertex][scgwt][dynbse]") {
+#ifndef ENABLE_DLR
+    SUCCEED("dynbse_readout skipped: build has ENABLE_DLR=OFF.");
+#else
+    auto &mpi_context = utils::make_unit_test_mpi_context();
+    imag_axes_ft::IAFT ft(1000, 6.0, imag_axes_ft::dlr_basis, "low");
+    std::string output = "coqui_d3_readout";
+
+    auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_lih222"));
+    thc_reader_t thc(mf, make_thc_reader_ptree(mf->nbnd() * 8, "", "incore", "", "bdft",
+                                               1e-10, mf->ecutrho(), 1, 1024));
+    auto eri = mb_eri_t(thc, thc);
+
+    auto run = [&](std::string const &rung, int niter) {
+      solvers::hf_t hf;
+      solvers::gw_t gw(&ft, "ignore_g0", output);
+      solvers::scr_coulomb_t scr_eri(&ft, "rpa", "ignore_g0");
+      simple_dyson dyson(mf.get(), &ft);
+      MBState mb_state(mpi_context, ft, output);
+      iter_scf::iter_scf_t iter_sol("damping");
+      solvers::vertex_t vtx(&ft, "none", nda::range(0, 0), mf->nbnd());
+      vtx.set_pol_vertex("ladder", "w0_prev", nda::range(0, 4), -1, 1e-8, -1.0, -1.0, -1.0);
+      vtx.set_ladder_rung(rung, 1e-8, 30, 4, -1.0);
+      scr_eri.set_vertex(&vtx);
+      auto [e_hf, e_corr] = scf_loop(mb_state, dyson, eri, ft,
+                                     solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol,
+                                     niter, false, 1e-9, true);
+      auto [er, el] = scr_eri.pol_eps_readout();
+      auto ed = scr_eri.pol_eps_dyn();
+      const double ritz = scr_eri.pol_dyn_ritz();
+      mpi_context->comm.barrier();
+      if (mpi_context->comm.root()) remove((output + ".mbpt.h5").c_str());
+      mpi_context->comm.barrier();
+      return std::make_tuple(e_hf, e_corr, er, el, ed, ritz);
+    };
+    auto [h0, c0, r0, l0, d0, z0] = run("static", 2);
+    auto [h1, c1, r1, l1, d1, z1] = run("dynamic", 2);
+    app_log(1, "dynbse_readout: static rung: e_corr {} eps RPA {} +ladder {} ; dynamic rung: e_corr {} eps RPA {} "
+               "+ladder(L2) {} ; +static(sign-corr.) {} +static+Pi^C_dyn {} +Gamma1 {} +resummed {} ; Ritz {}",
+            c0, r0, l0, c1, r1, l1, d1[0], d1[1], d1[2], d1[3], z1);
+    // the loop and the historic columns are bitwise (the dynamic rung is a readout-only column)
+    REQUIRE(h1 == h0);
+    REQUIRE(c1 == c0);
+    REQUIRE(r1 == r0);
+    REQUIRE(l1 == l0);
+    REQUIRE(d0[3] == -1.0);
+    for (double v : d1) { REQUIRE(std::isfinite(v)); REQUIRE(v > 0.0); }
+    REQUIRE(z1 >= 0.0);
+    REQUIRE(z1 < 1.0);
+    // the sign-corrected static column differs from the as-implemented L2 (the even-order sign)
+    REQUIRE(d1[0] != l1);
+    // the dynamic rungs move eps_M away from the static ladder
+    REQUIRE(d1[3] != d1[0]);
+#endif
+  }
+
 } // namespace bdft_tests
