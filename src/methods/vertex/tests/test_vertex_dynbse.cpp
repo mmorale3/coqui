@@ -374,7 +374,7 @@ namespace bdft_tests {
   };
 
   inline solver_out run_solver(dyn_toy const &T, imag_axes_ft::IAFT const &ft, cplx inu,
-                               bool fitted, double tol, long maxit) {
+                               bool fitted, double tol, long maxit, long gmres_m = 0) {
     solver_out o;
     auto b = db::build_freq_basis(ft);
     o.dsq_err = b.dsq_fit_err;
@@ -435,7 +435,13 @@ namespace bdft_tests {
       R.K0(iq, all_, all_) = T.Z(iq, all_, all_) + R.Wd0(iq, all_, all_);
     }
     auto S = db::build_static_resolvent(b, P, R, inu, fitted);
-    o.res = db::solve_dyson(b, P, R, S, inu, fitted, T.Dc, tol, maxit, false);
+    if (gmres_m > 0) {
+      auto kd = [&](db::tf_vector const &F, nda::array<cplx, 4> const &Fsum, db::tf_vector &y) {
+        return db::kd_apply(b, R, F, Fsum, y);
+      };
+      o.res = db::solve_dyson_gmres(b, P, kd, S, inu, fitted, T.Dc, tol, maxit, gmres_m, nullptr);
+    } else
+      o.res = db::solve_dyson(b, P, R, S, inu, fitted, T.Dc, tol, maxit, false);
     o.P = db::collapse(T.Dc, o.res.Gsum);
     o.P0 = db::collapse(T.Dc, o.res.Gsum0);
     o.P1 = db::collapse(T.Dc, o.res.Gsum1);
@@ -592,6 +598,87 @@ namespace bdft_tests {
       app_log(1, "dynbse (K) inu = {:.3f}i: kd_apply pointwise |err| {:.3e} (scale {:.3e}); tau refit err {:.3e}",
               inu.imag(), errK, scK, fe);
       REQUIRE(errK < 1e-6 * scK);
+      // (G): the grouped l0_apply vs the per-(j,l) reference on random two-family inputs, on the
+      // union set (no confluence) and on a shared set (G refit on the vertex grid: confluent
+      // products through the Dsq/Dcb tables), with and without the Cb_cst override
+      {
+        std::mt19937 rng(7 + long(inu.imag() * 10));
+        std::uniform_real_distribution<double> u(-1.0, 1.0);
+        auto rand_tf = [&](db::tf_vector &V) {
+          for (auto &v : V.fam) v = cplx(u(rng), u(rng));
+          for (auto &v : V.cst) v = cplx(u(rng), u(rng));
+        };
+        auto compare = [&](db::freq_basis const &bb, db::pair_poles const &PP, bool sh, const char *tag) {
+          const long npp = bb.np;
+          db::tf_vector Xr(npp, nk, nc, 3), Fa(npp, nk, nc, 3), Fb(npp, nk, nc, 3);
+          nda::array<cplx, 4> Sa(nk, nc, nc, 3), Sb(nk, nc, nc, 3);
+          rand_tf(Xr);
+          // no components on the union extension (the exact G poles): a physical vector never
+          // carries them (the refit targets the DLR part), and a confluent product there has no table
+          for (long a = bb.np_fit; a < npp; ++a) Xr.fam(all_, a, all_, all_, all_, all_) = cplx(0.0);
+          db::l0_apply_ref(bb, PP, inu, sh, Xr, Fa, Sa);
+          db::l0_apply(bb, PP, inu, sh, Xr, Fb, Sb);
+          double df = 0.0, sf = 0.0, ds = 0.0, ss = 0.0;
+          for (long i = 0; i < long(Fa.fam.size()); ++i) {
+            df = std::max(df, std::abs(Fa.fam.data()[i] - Fb.fam.data()[i]));
+            sf = std::max(sf, std::abs(Fa.fam.data()[i]));
+          }
+          for (long i = 0; i < long(Sa.size()); ++i) {
+            ds = std::max(ds, std::abs(Sa.data()[i] - Sb.data()[i]));
+            ss = std::max(ss, std::abs(Sa.data()[i]));
+          }
+          // the Cb_cst override: with Cb_cst = the pole-route Cb the sums must agree too
+          nda::array<cplx, 3> Cbk(nk, nc2, nc2);
+          Cbk() = cplx(0.0);
+          for (long k = 0; k < nk; ++k)
+            for (long j = 0; j < PP.ng; ++j)
+              for (long l = 0; l < PP.ng; ++l) {
+                const cplx Tjl = wl::two_pole(PP.fdG[size_t(j)], PP.epsG(j), PP.fdG[size_t(l)], PP.epsG(l), inu, j == l).T;
+                for (long p1p = 0; p1p < nc; ++p1p)
+                  for (long p3 = 0; p3 < nc; ++p3)
+                    for (long a = 0; a < nc; ++a)
+                      for (long bq = 0; bq < nc; ++bq)
+                        Cbk(k, p1p * nc + p3, a * nc + bq) += Tjl * PP.gk(j, k, a, p1p) * PP.gkq(l, k, p3, bq);
+              }
+          db::tf_vector Fc(npp, nk, nc, 3);
+          nda::array<cplx, 4> Sc(nk, nc, nc, 3);
+          db::l0_apply(bb, PP, inu, sh, Xr, Fc, Sc, &Cbk);
+          double dc = 0.0, dfc = 0.0;
+          for (long i = 0; i < long(Sa.size()); ++i) dc = std::max(dc, std::abs(Sa.data()[i] - Sc.data()[i]));
+          for (long i = 0; i < long(Fa.fam.size()); ++i) dfc = std::max(dfc, std::abs(Fb.fam.data()[i] - Fc.fam.data()[i]));
+          app_log(1, "dynbse (G) inu = {:.3f}i [{}]: grouped vs ref |dF| {:.3e} (scale {:.3e}), |dFsum| {:.3e} "
+                     "(scale {:.3e}); with Cb_cst: |dFsum| {:.3e}, |dF| {:.3e}", inu.imag(), tag, df, sf, ds, ss, dc, dfc);
+          REQUIRE(df < 1e-11 * sf);
+          REQUIRE(ds < 1e-11 * std::max(ss, 1e-3));
+          REQUIRE(dc < 1e-9 * std::max(ss, 1e-3));
+          REQUIRE(dfc == 0.0);
+        };
+        compare(b, P, false, "union set");
+        // the shared set: G refit on the aux grid (as run_solver's fitted path)
+        {
+          auto b2 = db::build_freq_basis(ft);
+          const long np2 = b2.np;
+          nda::array<cplx, 4> gk2(np2, nk, nc, nc), gkq2(np2, nk, nc, nc);
+          for (long k = 0; k < nk; ++k) {
+            nda::array<cplx, 2> Fq(nt, nc * nc);
+            Fq() = cplx(0.0);
+            auto const &tk = T.t[size_t(k)];
+            for (long i = 0; i < nt; ++i)
+              for (long j = 0; j < tk.ng; ++j) {
+                const double Kf = imag_axes_ft::dlr_kF(beta, b2.s(i), tk.lam(j));
+                for (long a = 0; a < nc; ++a)
+                  for (long bq = 0; bq < nc; ++bq) Fq(i, a * nc + bq) += tk.g(j, a, bq) * Kf;
+              }
+            auto c = b2.pf.coeffs(Fq);
+            for (long pq = 0; pq < np2; ++pq)
+              for (long a = 0; a < nc; ++a)
+                for (long bq = 0; bq < nc; ++bq) gk2(pq, k, a, bq) = c(pq, a * nc + bq);
+          }
+          for (long k = 0; k < nk; ++k) gkq2(all_, k, all_, all_) = gk2(all_, T.kpq[size_t(k)], all_, all_);
+          auto P2 = db::make_pair_poles(beta, b2.eps, gk2, gkq2, 0);
+          compare(b2, P2, true, "shared set");
+        }
+      }
     }
     for (cplx inu : {cplx(0.0), I_ * cplx(2.0 * M_PI * 2.0 / beta)}) {
       app_log(1, "dynbse: ---- inu = {:.4f} i ----", inu.imag());
@@ -631,6 +718,24 @@ namespace bdft_tests {
       REQUIRE(dC < 1e-7);
       REQUIRE(so.res.converged);
       REQUIRE(so.res.contraction < 1.0);
+      // (E) GMRES(4) on the same problem: same answer, fewer operator applications
+      {
+        auto sg = run_solver(T, ft, inu, false, 1e-8, 40, 4);
+        std::string hg;
+        for (double h : sg.res.history) {
+          char buf[32];
+          std::snprintf(buf, sizeof(buf), " %.1e", h);
+          hg += buf;
+        }
+        const double dG = rel_diff(sg.P, Pdy), dG1 = rel_diff(sg.P1, so.P1), dG0 = rel_diff(sg.P0, so.P0);
+        app_log(1, "dynbse (E) GMRES(4): vs oracle {:.3e}; first iterate vs Neumann's {:.3e}, static {:.3e}; "
+                   "operator applications {}, converged {}, max |Ritz(K_d L_s)| {:.3f}; cycle residuals:{}",
+                dG, dG1, dG0, sg.res.iterations, sg.res.converged, sg.res.contraction, hg);
+        REQUIRE(dG < 1e-7);
+        REQUIRE(dG1 < 1e-12);
+        REQUIRE(dG0 == 0.0);
+        REQUIRE(sg.res.converged);
+      }
       // (D) the fitted, shared-grid pathway
       auto sf = run_solver(T, ft, inu, true, 1e-8, 60);
       const double dAf = rel_diff(sf.P0, Pst), dCf = rel_diff(sf.P, Pdy);

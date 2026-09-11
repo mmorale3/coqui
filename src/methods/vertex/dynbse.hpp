@@ -289,8 +289,8 @@ namespace dynbse {
    * inu = 0 the two families coincide: the shifted input is folded into the unshifted one and
    * only family 0 is produced.
    */
-  inline void l0_apply(freq_basis const &b, pair_poles const &P, cplx inu, bool shared,
-                       tf_vector const &X, tf_vector &F, nda::array<cplx, 4> &Fsum) {
+  inline void l0_apply_ref(freq_basis const &b, pair_poles const &P, cplx inu, bool shared,
+                           tf_vector const &X, tf_vector &F, nda::array<cplx, 4> &Fsum) {
     decltype(nda::range::all) all;
     const long np = b.np, nk = P.nk, nc = P.nc, ng = P.ng, nR = X.nR;
     utils::check(X.np == np and X.nk == nk and X.nc == nc, "dynbse::l0_apply: shape mismatch.");
@@ -431,6 +431,312 @@ namespace dynbse {
   }
 
   /**
+   * F = L0 X, the GROUPED (production) form of l0_apply_ref: identical terms, reassociated so
+   * that the G-pole double sum never meets the vertex nodes. Per (k, r) and input family the
+   * partial fractions of every term factor through the two (nc x nc) "pole-summed legs"
+   *   Ghat_j = sum_l g_l(k+q)^T / D_jl,   Gtil_l = sum_j g_j(k)^T / D_jl,   D_jl = e_j - e_l + inu
+   * (l == j excluded at inu = 0, where it is the confluent U_j^2 handled separately), so that
+   * every output is built from Q_j(a) = g_j^T V_a Ghat_j and R_l(a) = Gtil_l V_a g_l^T --
+   * O(ng np nc^3) small gemms per (k, r, family) instead of O(ng^2 np nc^3). Confluent products
+   * (a == the G node of j or l; U_j^2 at inu = 0) collect the double/triple-pole matrices and
+   * are re-expanded with the Dsq/Dcb tables; their frequency sums use the exact f', f''/2.
+   *
+   * `Cb_cst` (nk, nc^2, nc^2) or nullptr: when given, the frequency sum of the CONSTANT part of
+   * X is taken as Cb_cst(k) . X.cst(k) instead of the pole route -- the production driver passes
+   * the ladder's own tau-route chi0 here so the static limit reproduces the L2 resolvent to
+   * working precision (the two-family output itself is unchanged).
+   */
+  inline void l0_apply(freq_basis const &b, pair_poles const &P, cplx inu, bool shared,
+                       tf_vector const &X, tf_vector &F, nda::array<cplx, 4> &Fsum,
+                       nda::array<cplx, 3> const *Cb_cst = nullptr) {
+    decltype(nda::range::all) all;
+    const long np = b.np, nk = P.nk, nc = P.nc, ng = P.ng, nR = X.nR, nc2 = nc * nc;
+    utils::check(X.np == np and X.nk == nk and X.nc == nc, "dynbse::l0_apply: shape mismatch.");
+    utils::check(not shared or (ng == np and P.gnode(0) == 0), "dynbse::l0_apply: shared node sets differ.");
+    utils::check(P.gnode(ng - 1) < np, "dynbse::l0_apply: G node map exceeds the vertex node set.");
+    if (Cb_cst != nullptr)
+      utils::check(Cb_cst->shape(0) == nk and Cb_cst->shape(1) == nc2 and Cb_cst->shape(2) == nc2,
+                   "dynbse::l0_apply: Cb_cst shape mismatch.");
+    const bool nu0 = (inu == cplx(0.0));
+    const long nfam_in = nu0 ? 1 : 2;
+    F.zero();
+    Fsum() = cplx(0.0);
+
+    // per-k pole-summed legs: Ghat_j(b, p3) = sum_l gkq(l, p3, b)/D_jl ; Gtil_l(p1', a) = sum_j gk(j, a, p1')/D_jl
+    nda::array<cplx, 3> Ghat(ng, nc, nc), Gtil(ng, nc, nc);
+    nda::array<cplx, 2> gjT(nc, nc), glT(nc, nc);
+    // per-(k, r) accumulators: single poles per family, double poles per family, triple poles;
+    // the constant part's single and double poles kept apart (their sums may be overridden)
+    nda::array<cplx, 4> F1(2, np, nc, nc), M2(2, np, nc, nc), F1c(2, np, nc, nc);
+    nda::array<cplx, 3> M3(np, nc, nc), M2c(np, nc, nc);
+    // workspaces
+    nda::array<cplx, 3> Vt(nc, np, nc);            // Vt(x, a, y) = V_a(x, y)
+    nda::array<cplx, 3> Sv(np, nc, nc);            // Sv(a, x, y) = V_a(x, y)
+    nda::array<cplx, 2> Pj(nc, np * nc), Qj(nc * np, nc);
+    nda::array<cplx, 2> Sl_out(np * nc, nc), Slt(nc, np * nc), Rl(nc, np * nc);
+    nda::array<cplx, 2> C(nc, nc), T(nc, nc), Bm(nc, nc);
+
+    for (long ik = 0; ik < nk; ++ik) {
+      Ghat() = cplx(0.0);
+      Gtil() = cplx(0.0);
+      for (long j = 0; j < ng; ++j)
+        for (long l = 0; l < ng; ++l) {
+          if (nu0 and j == l) continue;
+          const cplx w = cplx(1.0) / (cplx(P.epsG(j) - P.epsG(l)) + inu);
+          for (long x = 0; x < nc; ++x)
+            for (long y = 0; y < nc; ++y) {
+              Ghat(j, x, y) += w * P.gkq(l, ik, y, x);
+              Gtil(l, x, y) += w * P.gk(j, ik, y, x);
+            }
+        }
+      for (long r = 0; r < nR; ++r) {
+        F1() = cplx(0.0); M2() = cplx(0.0); M3() = cplx(0.0); F1c() = cplx(0.0); M2c() = cplx(0.0);
+        C() = X.cst(ik, all, all, r);
+        bool anyc = false;
+        for (auto const &v : C) anyc = anyc or (v != cplx(0.0));
+        for (long fin = 0; fin < nfam_in; ++fin) {
+          bool anyv = false;
+          for (long a = 0; a < np; ++a)
+            for (long x = 0; x < nc; ++x)
+              for (long y = 0; y < nc; ++y) {
+                cplx v = X.fam(fin, a, ik, x, y, r);
+                if (nu0) v += X.fam(1, a, ik, x, y, r);
+                Vt(x, a, y) = v;
+                Sv(a, x, y) = v;
+                anyv = anyv or (v != cplx(0.0));
+              }
+          if (not anyv) continue;
+          auto Vt2 = nda::reshape(Vt, std::array<long, 2>{nc, np * nc});
+          auto Sv2 = nda::reshape(Sv, std::array<long, 2>{np * nc, nc});
+          // ---- j side: Q_j(a) = g_j^T V_a Ghat_j ----------------------------------------------
+          for (long j = 0; j < ng; ++j) {
+            const long nj = P.gnode(j);
+            const double ej = P.epsG(j);
+            for (long x = 0; x < nc; ++x)
+              for (long y = 0; y < nc; ++y) gjT(x, y) = P.gk(j, ik, y, x);
+            nda::blas::gemm(gjT, Vt2, Pj);                                   // (p1', (a b))
+            auto Pj2 = nda::reshape(Pj, std::array<long, 2>{nc * np, nc});   // ((p1' a), b)
+            nda::blas::gemm(Pj2, Ghat(j, all, all), Qj);                     // ((p1' a), p3)
+            auto Q3 = nda::reshape(Qj, std::array<long, 3>{nc, np, nc});
+            for (long a = 0; a < np; ++a) {
+              const double ea = b.eps(a);
+              if (fin == 0) {
+                if (a == nj) {
+                  for (long x = 0; x < nc; ++x)
+                    for (long y = 0; y < nc; ++y) M2(0, nj, x, y) += Q3(x, a, y);
+                } else {
+                  const cplx c = cplx(1.0 / (ej - ea));
+                  for (long x = 0; x < nc; ++x)
+                    for (long y = 0; y < nc; ++y) {
+                      F1(0, nj, x, y) += c * Q3(x, a, y);
+                      F1(0, a, x, y) -= c * Q3(x, a, y);
+                    }
+                }
+              } else {
+                // U_j S_a = [U_j - S_a] / (e_j - e_a + inu)
+                const cplx c = cplx(1.0) / (cplx(ej - ea) + inu);
+                for (long x = 0; x < nc; ++x)
+                  for (long y = 0; y < nc; ++y) {
+                    F1(0, nj, x, y) += c * Q3(x, a, y);
+                    F1(1, a, x, y) -= c * Q3(x, a, y);
+                  }
+              }
+            }
+          }
+          // ---- l side: R_l(a) = Gtil_l V_a g_l^T ---------------------------------------------
+          for (long l = 0; l < ng; ++l) {
+            const long nl = P.gnode(l);
+            const double el = P.epsG(l);
+            for (long x = 0; x < nc; ++x)
+              for (long y = 0; y < nc; ++y) glT(x, y) = P.gkq(l, ik, y, x);   // (b, p3)
+            nda::blas::gemm(Sv2, glT, Sl_out);                                 // ((a x), p3)
+            auto So = nda::reshape(Sl_out, std::array<long, 3>{np, nc, nc});
+            for (long a = 0; a < np; ++a)
+              for (long x = 0; x < nc; ++x)
+                for (long y = 0; y < nc; ++y) Slt(x, a * nc + y) = So(a, x, y);   // (x, (a p3))
+            nda::blas::gemm(Gtil(l, all, all), Slt, Rl);                       // (p1', (a p3))
+            auto R3 = nda::reshape(Rl, std::array<long, 3>{nc, np, nc});
+            for (long a = 0; a < np; ++a) {
+              const double ea = b.eps(a);
+              if (fin == 0) {
+                if (nu0) {
+                  // - U_l U_a
+                  if (a == nl) {
+                    for (long x = 0; x < nc; ++x)
+                      for (long y = 0; y < nc; ++y) M2(0, nl, x, y) -= R3(x, a, y);
+                  } else {
+                    const cplx c = cplx(1.0 / (el - ea));
+                    for (long x = 0; x < nc; ++x)
+                      for (long y = 0; y < nc; ++y) {
+                        F1(0, nl, x, y) -= c * R3(x, a, y);
+                        F1(0, a, x, y) += c * R3(x, a, y);
+                      }
+                  }
+                } else {
+                  // - S_l U_a = -[U_a - S_l] / (e_a - e_l + inu)
+                  const cplx c = cplx(1.0) / (cplx(ea - el) + inu);
+                  for (long x = 0; x < nc; ++x)
+                    for (long y = 0; y < nc; ++y) {
+                      F1(0, a, x, y) -= c * R3(x, a, y);
+                      F1(1, nl, x, y) += c * R3(x, a, y);
+                    }
+                }
+              } else {
+                // - S_l S_a
+                if (a == nl) {
+                  for (long x = 0; x < nc; ++x)
+                    for (long y = 0; y < nc; ++y) M2(1, nl, x, y) -= R3(x, a, y);
+                } else {
+                  const cplx c = cplx(1.0 / (el - ea));
+                  for (long x = 0; x < nc; ++x)
+                    for (long y = 0; y < nc; ++y) {
+                      F1(1, nl, x, y) -= c * R3(x, a, y);
+                      F1(1, a, x, y) += c * R3(x, a, y);
+                    }
+                }
+              }
+            }
+          }
+          // ---- inu = 0: the confluent U_j^2 x U_a terms (j == l) ----------------------------
+          if (nu0) {
+            for (long j = 0; j < ng; ++j) {
+              const long nj = P.gnode(j);
+              const double ej = P.epsG(j);
+              for (long x = 0; x < nc; ++x)
+                for (long y = 0; y < nc; ++y) {
+                  gjT(x, y) = P.gk(j, ik, y, x);
+                  glT(x, y) = P.gkq(j, ik, y, x);
+                }
+              nda::blas::gemm(gjT, Vt2, Pj);                                 // (p1', (a b))
+              auto Pj2 = nda::reshape(Pj, std::array<long, 2>{nc * np, nc});
+              nda::blas::gemm(Pj2, glT, Qj);                                 // ((p1' a), p3) = B_j(a)
+              auto B3 = nda::reshape(Qj, std::array<long, 3>{nc, np, nc});
+              for (long a = 0; a < np; ++a) {
+                const double ea = b.eps(a);
+                if (a == nj) {
+                  for (long x = 0; x < nc; ++x)
+                    for (long y = 0; y < nc; ++y) M3(nj, x, y) += B3(x, a, y);
+                } else {
+                  const double dd = ea - ej;
+                  const cplx c2 = cplx(1.0 / (ej - ea)), c1 = cplx(1.0 / (dd * dd));
+                  for (long x = 0; x < nc; ++x)
+                    for (long y = 0; y < nc; ++y) {
+                      M2(0, nj, x, y) += c2 * B3(x, a, y);
+                      F1(0, nj, x, y) -= c1 * B3(x, a, y);
+                      F1(0, a, x, y) += c1 * B3(x, a, y);
+                    }
+                }
+              }
+            }
+          }
+        }
+        // ---- the constant part ----------------------------------------------------------------
+        if (anyc) {
+          for (long j = 0; j < ng; ++j) {
+            const long nj = P.gnode(j);
+            for (long x = 0; x < nc; ++x)
+              for (long y = 0; y < nc; ++y) gjT(x, y) = P.gk(j, ik, y, x);
+            nda::blas::gemm(gjT, C, T);
+            nda::blas::gemm(T, Ghat(j, all, all), Bm);              // Qc_j
+            for (long x = 0; x < nc; ++x)
+              for (long y = 0; y < nc; ++y) F1c(0, nj, x, y) += Bm(x, y);
+            if (nu0) {
+              for (long x = 0; x < nc; ++x)
+                for (long y = 0; y < nc; ++y) glT(x, y) = P.gkq(j, ik, y, x);
+              nda::blas::gemm(T, glT, Bm);                          // Bc_j = g_j^T C g_j^T
+              for (long x = 0; x < nc; ++x)
+                for (long y = 0; y < nc; ++y) M2c(nj, x, y) += Bm(x, y);
+            }
+          }
+          const long fo = nu0 ? 0 : 1;
+          for (long l = 0; l < ng; ++l) {
+            const long nl = P.gnode(l);
+            for (long x = 0; x < nc; ++x)
+              for (long y = 0; y < nc; ++y) glT(x, y) = P.gkq(l, ik, y, x);
+            nda::blas::gemm(C, glT, T);
+            nda::blas::gemm(Gtil(l, all, all), T, Bm);              // Rc_l
+            for (long x = 0; x < nc; ++x)
+              for (long y = 0; y < nc; ++y) F1c(fo, nl, x, y) -= Bm(x, y);
+          }
+        }
+        // ---- assemble: single poles, re-expanded double/triple poles, the frequency sums -------
+        for (long f = 0; f < 2; ++f)
+          for (long n = 0; n < np; ++n) {
+            bool any1 = false, any2 = false, anyc1 = false;
+            for (long x = 0; x < nc; ++x)
+              for (long y = 0; y < nc; ++y) {
+                any1 = any1 or (F1(f, n, x, y) != cplx(0.0));
+                any2 = any2 or (M2(f, n, x, y) != cplx(0.0));
+                anyc1 = anyc1 or (F1c(f, n, x, y) != cplx(0.0));
+              }
+            if (any1 or anyc1) {
+              const cplx wh(b.fhalf(n));
+              for (long x = 0; x < nc; ++x)
+                for (long y = 0; y < nc; ++y) {
+                  const cplx v = F1(f, n, x, y), vc = F1c(f, n, x, y);
+                  F.fam(f, n, ik, x, y, r) += v + vc;
+                  Fsum(ik, x, y, r) += wh * v;
+                  if (Cb_cst == nullptr) Fsum(ik, x, y, r) += wh * vc;
+                }
+            }
+            if (any2) {
+              utils::check(n < b.np_fit, "dynbse::l0_apply: a confluent double pole at node {} outside the DLR set.", n);
+              const cplx w1(b.fd[size_t(n)].f1);
+              for (long x = 0; x < nc; ++x)
+                for (long y = 0; y < nc; ++y) Fsum(ik, x, y, r) += w1 * M2(f, n, x, y);
+              for (long c = 0; c < np; ++c) {
+                const cplx dc = b.Dsq(n, c);
+                if (dc == cplx(0.0)) continue;
+                for (long x = 0; x < nc; ++x)
+                  for (long y = 0; y < nc; ++y) F.fam(f, c, ik, x, y, r) += dc * M2(f, n, x, y);
+              }
+            }
+          }
+        for (long n = 0; n < np; ++n) {
+          bool any2c = false, any3 = false;
+          for (long x = 0; x < nc; ++x)
+            for (long y = 0; y < nc; ++y) {
+              any2c = any2c or (M2c(n, x, y) != cplx(0.0));
+              any3 = any3 or (M3(n, x, y) != cplx(0.0));
+            }
+          if (any2c) {
+            utils::check(n < b.np_fit, "dynbse::l0_apply: a confluent double pole at node {} outside the DLR set.", n);
+            const cplx w1(b.fd[size_t(n)].f1);
+            if (Cb_cst == nullptr)
+              for (long x = 0; x < nc; ++x)
+                for (long y = 0; y < nc; ++y) Fsum(ik, x, y, r) += w1 * M2c(n, x, y);
+            for (long c = 0; c < np; ++c) {
+              const cplx dc = b.Dsq(n, c);
+              if (dc == cplx(0.0)) continue;
+              for (long x = 0; x < nc; ++x)
+                for (long y = 0; y < nc; ++y) F.fam(0, c, ik, x, y, r) += dc * M2c(n, x, y);
+            }
+          }
+          if (any3) {
+            utils::check(n < b.np_fit, "dynbse::l0_apply: a confluent triple pole at node {} outside the DLR set.", n);
+            const cplx w2(0.5 * b.fd[size_t(n)].f2);
+            for (long x = 0; x < nc; ++x)
+              for (long y = 0; y < nc; ++y) Fsum(ik, x, y, r) += w2 * M3(n, x, y);
+            for (long c = 0; c < np; ++c) {
+              const cplx dc = b.Dcb(n, c);
+              if (dc == cplx(0.0)) continue;
+              for (long x = 0; x < nc; ++x)
+                for (long y = 0; y < nc; ++y) F.fam(0, c, ik, x, y, r) += dc * M3(n, x, y);
+            }
+          }
+        }
+        // the constant part's frequency sum from the supplied chi0
+        if (Cb_cst != nullptr and anyc)
+          for (long p = 0; p < nc2; ++p) {
+            cplx sacc(0.0);
+            for (long pp = 0; pp < nc2; ++pp) sacc += (*Cb_cst)(ik, p, pp) * C(pp / nc, pp % nc);
+            Fsum(ik, p / nc, p % nc, r) += sacc;
+          }
+      }
+    }
+  }
+
+  /**
    * The explicit pair-space rung of the toy/gate form: K(q'; s) as (nc^2 x nc^2) matrices on the
    * tau grid (rows (p1' nc + p3), columns (a nc + b)), q' = k - k' through the map kmk(k, k'),
    * plus the instantaneous value K0(q') (the static rung W0bar = the full rung at inu' = 0) and
@@ -538,6 +844,26 @@ namespace dynbse {
     nda::array<cplx, 2> Ts;      // (D, D)
   };
 
+  /** T_s = K_s (1 - Cb K_s)^-1 from the dense block-diagonal Cb held by S and the static rung Ks. */
+  inline void finish_static_resolvent(static_resolvent &S, nda::array<cplx, 2> const &Ks) {
+    const long D = S.D;
+    // T_s = K_s (1 - Cb K_s)^-1
+    nda::matrix<cplx> M(D, D);
+    nda::array<cplx, 2> CbK(D, D);
+    nda::blas::gemm(S.Cb, Ks, CbK);
+    for (long i = 0; i < D; ++i)
+      for (long jj = 0; jj < D; ++jj) M(i, jj) = ((i == jj) ? cplx(1.0) : cplx(0.0)) - CbK(i, jj);
+    const long nan_cb = nan_count(S.Cb), nan_ks = nan_count(Ks), nan_cbk = nan_count(CbK), nan_m0 = nan_count(M);
+    nda::inverse_in_place(M);
+    S.Ts = nda::array<cplx, 2>(D, D);
+    nda::array<cplx, 2> Minv(D, D);
+    Minv() = M;
+    nda::blas::gemm(Ks, Minv, S.Ts);
+    utils::check(nan_cb + nan_ks + nan_cbk + nan_m0 + nan_count(M) + nan_count(S.Ts) == 0,
+                 "dynbse::build_static_resolvent: NaN (Cb {} Ks {} CbK {} 1-CbK {} inv {} Ts {}).",
+                 nan_cb, nan_ks, nan_cbk, nan_m0, nan_count(M), nan_count(S.Ts));
+  }
+
   inline static_resolvent build_static_resolvent(freq_basis const &b, pair_poles const &P,
                                                  pair_rung const &R, cplx inu, bool shared) {
     (void)b; (void)shared;
@@ -569,21 +895,24 @@ namespace dynbse {
         for (long p = 0; p < nc2; ++p)
           for (long pp = 0; pp < nc2; ++pp) Ks(ik * nc2 + p, ikp * nc2 + pp) = R.K0(iq, p, pp);
       }
-    // T_s = K_s (1 - Cb K_s)^-1
-    nda::matrix<cplx> M(D, D);
-    nda::array<cplx, 2> CbK(D, D);
-    nda::blas::gemm(S.Cb, Ks, CbK);
-    for (long i = 0; i < D; ++i)
-      for (long jj = 0; jj < D; ++jj) M(i, jj) = ((i == jj) ? cplx(1.0) : cplx(0.0)) - CbK(i, jj);
-    const long nan_cb = nan_count(S.Cb), nan_ks = nan_count(Ks), nan_cbk = nan_count(CbK), nan_m0 = nan_count(M);
-    nda::inverse_in_place(M);
-    S.Ts = nda::array<cplx, 2>(D, D);
-    nda::array<cplx, 2> Minv(D, D);
-    Minv() = M;
-    nda::blas::gemm(Ks, Minv, S.Ts);
-    utils::check(nan_cb + nan_ks + nan_cbk + nan_m0 + nan_count(M) + nan_count(S.Ts) == 0,
-                 "dynbse::build_static_resolvent: NaN (Cb {} Ks {} CbK {} 1-CbK {} inv {} Ts {}).",
-                 nan_cb, nan_ks, nan_cbk, nan_m0, nan_count(M), nan_count(S.Ts));
+    finish_static_resolvent(S, Ks);
+    return S;
+  }
+
+  /** the production builder: Cb_k (nk, nc^2, nc^2) the per-k chi0 (any route), Ks (D, D) the
+   *  static rung mapping the pair vector at k' (column) to k (row), D = nk nc^2. */
+  inline static_resolvent build_static_resolvent_from(nda::array<cplx, 3> const &Cb_k,
+                                                      nda::array<cplx, 2> const &Ks) {
+    static_resolvent S;
+    const long nk = Cb_k.shape(0), nc2 = Cb_k.shape(1), D = nk * nc2;
+    utils::check(Ks.shape(0) == D and Ks.shape(1) == D, "dynbse::build_static_resolvent_from: Ks shape.");
+    S.D = D; S.nk = nk; S.nc = long(std::lround(std::sqrt(double(nc2))));
+    S.Cb = nda::array<cplx, 2>(D, D);
+    S.Cb() = cplx(0.0);
+    for (long ik = 0; ik < nk; ++ik)
+      for (long p = 0; p < nc2; ++p)
+        for (long pp = 0; pp < nc2; ++pp) S.Cb(ik * nc2 + p, ik * nc2 + pp) = Cb_k(ik, p, pp);
+    finish_static_resolvent(S, Ks);
     return S;
   }
 
@@ -595,7 +924,8 @@ namespace dynbse {
    */
   inline void ls_apply(freq_basis const &b, pair_poles const &P, static_resolvent const &S, cplx inu,
                        bool shared, nda::array<cplx, 4> const &Dc, tf_vector const &y,
-                       tf_vector &Gamma, nda::array<cplx, 4> &Gsum) {
+                       tf_vector &Gamma, nda::array<cplx, 4> &Gsum,
+                       nda::array<cplx, 3> const *Cb_cst = nullptr) {
     decltype(nda::range::all) all;
     const long nk = P.nk, nc = P.nc, nc2 = nc * nc, nR = y.nR, D = S.D;
     tf_vector X(b.np, nk, nc, nR);
@@ -603,7 +933,7 @@ namespace dynbse {
     X.cst() = Dc + y.cst;
     tf_vector F(b.np, nk, nc, nR);
     nda::array<cplx, 4> Fsum(nk, nc, nc, nR);
-    l0_apply(b, P, inu, shared, X, F, Fsum);
+    l0_apply(b, P, inu, shared, X, F, Fsum, Cb_cst);
     // c = T_s Fsum  (D x nR)
     nda::array<cplx, 2> fs(D, nR), cs(D, nR), cb(D, nR);
     for (long ik = 0; ik < nk; ++ik)
@@ -617,7 +947,7 @@ namespace dynbse {
         for (long r = 0; r < nR; ++r) Xc.cst(ik, p / nc, p % nc, r) = cs(ik * nc2 + p, r);
     tf_vector F2(b.np, nk, nc, nR);
     nda::array<cplx, 4> F2sum(nk, nc, nc, nR);
-    l0_apply(b, P, inu, shared, Xc, F2, F2sum);
+    l0_apply(b, P, inu, shared, Xc, F2, F2sum, Cb_cst);
     Gamma.fam() = F.fam + F2.fam;
     Gamma.cst() = cplx(0.0);
     for (long ik = 0; ik < nk; ++ik)
@@ -645,10 +975,16 @@ namespace dynbse {
    * tol |y_{n+1}| or when maxit is reached (the result then carries the last iterate; the caller
    * decides). The observable is sum_iw Gamma; the caller applies the D^dag legs.
    */
-  inline dyson_result solve_dyson(freq_basis const &b, pair_poles const &P, pair_rung const &R,
-                                  static_resolvent const &S, cplx inu, bool shared,
-                                  nda::array<cplx, 4> const &Dc, double tol, long maxit,
-                                  bool anderson = true) {
+  /**
+   * KdOp: double(tf_vector const& F, nda::array<cplx,4> const& Fsum, tf_vector& y) -- applies the
+   * dynamic remainder K_d to the two-family F (with its exact frequency sums) and returns the tau
+   * refit error. The toy form is kd_apply(b, R, ...); the production driver supplies the THC rung.
+   */
+  template<class KdOp>
+  inline dyson_result solve_dyson_op(freq_basis const &b, pair_poles const &P, KdOp &&kd,
+                                     static_resolvent const &S, cplx inu, bool shared,
+                                     nda::array<cplx, 4> const &Dc, double tol, long maxit,
+                                     bool anderson = true, nda::array<cplx, 3> const *Cb_cst = nullptr) {
     const long nk = P.nk, nc = P.nc, nR = Dc.shape(3), np = b.np;
     dyson_result out;
     out.Gsum = nda::array<cplx, 4>(nk, nc, nc, nR);
@@ -659,13 +995,13 @@ namespace dynbse {
     nda::array<cplx, 4> Gsum(nk, nc, nc, nR);
     double dprev = -1.0;
     for (long it = 0; it <= maxit; ++it) {
-      ls_apply(b, P, S, inu, shared, Dc, y, Gamma, Gsum);
+      ls_apply(b, P, S, inu, shared, Dc, y, Gamma, Gsum, Cb_cst);
       if (it == 0) out.Gsum0 = Gsum;
       if (it == 1) out.Gsum1 = Gsum;
       out.Gsum = Gsum;
       out.iterations = it;
       if (it == maxit) break;
-      const double fe = kd_apply(b, R, Gamma, Gsum, ynew);
+      const double fe = kd(Gamma, Gsum, ynew);
       out.fit_err_max = std::max(out.fit_err_max, fe);
       // convergence on the update
       double d2 = 0.0, n2 = 0.0;
@@ -710,13 +1046,231 @@ namespace dynbse {
       dprev = d;
       if (out.residual <= tol) {
         // one more L_s application on the converged y gives the final Gamma
-        ls_apply(b, P, S, inu, shared, Dc, y, Gamma, Gsum);
+        ls_apply(b, P, S, inu, shared, Dc, y, Gamma, Gsum, Cb_cst);
         out.Gsum = Gsum;
         out.iterations = it + 1;
         out.converged = true;
         break;
       }
     }
+    return out;
+  }
+
+  inline dyson_result solve_dyson(freq_basis const &b, pair_poles const &P, pair_rung const &R,
+                                  static_resolvent const &S, cplx inu, bool shared,
+                                  nda::array<cplx, 4> const &Dc, double tol, long maxit,
+                                  bool anderson = true) {
+    auto kd = [&](tf_vector const &F, nda::array<cplx, 4> const &Fsum, tf_vector &y) {
+      return kd_apply(b, R, F, Fsum, y);
+    };
+    return solve_dyson_op(b, P, kd, S, inu, shared, Dc, tol, maxit, anderson, nullptr);
+  }
+
+
+  // ==================================================================================
+  // GMRES(m) ON THE DYNAMIC REMAINDER, batched over the right-hand-side columns
+  // ==================================================================================
+
+  /** per-column inner products <a, b>_r = sum conj(a) b over (fam, node, k, pair) -- (nR) */
+  inline void tf_dots(tf_vector const &a, tf_vector const &b, nda::array<cplx, 1> &out) {
+    const long nR = a.nR;
+    out() = cplx(0.0);
+    const long nfam = a.fam.shape(0) * a.fam.shape(1) * a.fam.shape(2) * a.fam.shape(3) * a.fam.shape(4);
+    const long ncst = a.cst.shape(0) * a.cst.shape(1) * a.cst.shape(2);
+    const cplx *pa = a.fam.data(), *pb = b.fam.data();
+    for (long i = 0; i < nfam; ++i)
+      for (long r = 0; r < nR; ++r) out(r) += std::conj(pa[i * nR + r]) * pb[i * nR + r];
+    pa = a.cst.data(); pb = b.cst.data();
+    for (long i = 0; i < ncst; ++i)
+      for (long r = 0; r < nR; ++r) out(r) += std::conj(pa[i * nR + r]) * pb[i * nR + r];
+  }
+  /** y += alpha_r x (per column) */
+  inline void tf_axpy(nda::array<cplx, 1> const &alpha, tf_vector const &x, tf_vector &y) {
+    const long nR = x.nR;
+    const long nfam = long(x.fam.size()) / nR, ncst = long(x.cst.size()) / nR;
+    cplx *py = y.fam.data(); const cplx *px = x.fam.data();
+    for (long i = 0; i < nfam; ++i)
+      for (long r = 0; r < nR; ++r) py[i * nR + r] += alpha(r) * px[i * nR + r];
+    py = y.cst.data(); px = x.cst.data();
+    for (long i = 0; i < ncst; ++i)
+      for (long r = 0; r < nR; ++r) py[i * nR + r] += alpha(r) * px[i * nR + r];
+  }
+  /** x *= s_r per column */
+  inline void tf_scale(nda::array<cplx, 1> const &sc, tf_vector &x) {
+    const long nR = x.nR;
+    const long nfam = long(x.fam.size()) / nR, ncst = long(x.cst.size()) / nR;
+    cplx *px = x.fam.data();
+    for (long i = 0; i < nfam; ++i)
+      for (long r = 0; r < nR; ++r) px[i * nR + r] *= sc(r);
+    px = x.cst.data();
+    for (long i = 0; i < ncst; ++i)
+      for (long r = 0; r < nR; ++r) px[i * nR + r] *= sc(r);
+  }
+
+  /**
+   * Restarted GMRES(m) on (1 - K_d L_s) y = K_d L_s D, every right-hand-side column solved with its
+   * own Arnoldi coefficients (the operator applications are batched over the columns). Same
+   * result contract as solve_dyson_op (Gsum, Gsum1 = the first iterate, Gsum0 = the static limit);
+   * `contraction` reports the largest |Ritz value| of K_d L_s seen in the last cycle (the
+   * watchdog), `residual` the largest relative residual over the columns, `history` the cycle
+   * residuals. Converged when every column's residual <= tol |rhs_r|.
+   */
+  template<class KdOp>
+  inline dyson_result solve_dyson_gmres(freq_basis const &b, pair_poles const &P, KdOp &&kd,
+                                        static_resolvent const &S, cplx inu, bool shared,
+                                        nda::array<cplx, 4> const &Dc, double tol, long maxit, long m,
+                                        nda::array<cplx, 3> const *Cb_cst = nullptr) {
+    const long nk = P.nk, nc = P.nc, nR = Dc.shape(3), np = b.np;
+    utils::check(m >= 1, "dynbse::solve_dyson_gmres: m >= 1.");
+    dyson_result out;
+    out.Gsum = nda::array<cplx, 4>(nk, nc, nc, nR);
+    out.Gsum1 = nda::array<cplx, 4>(nk, nc, nc, nR);
+    out.Gsum0 = nda::array<cplx, 4>(nk, nc, nc, nR);
+    nda::array<cplx, 4> Dzero(nk, nc, nc, nR), Gsum(nk, nc, nc, nR);
+    Dzero() = cplx(0.0);
+    tf_vector y(np, nk, nc, nR), Gamma(np, nk, nc, nR), rhs(np, nk, nc, nR), w(np, nk, nc, nR), r(np, nk, nc, nR);
+    // the operator: A v = v - K_d L_s v   (L_s v with a zero external leg)
+    auto apply_A = [&](tf_vector const &v, tf_vector &Av) {
+      ls_apply(b, P, S, inu, shared, Dzero, v, Gamma, Gsum, Cb_cst);
+      const double fe = kd(Gamma, Gsum, Av);
+      out.fit_err_max = std::max(out.fit_err_max, fe);
+      Av.fam() = v.fam - Av.fam;
+      Av.cst() = v.cst - Av.cst;
+    };
+    // rhs = K_d L_s D ; the static limit and the first iterate
+    ls_apply(b, P, S, inu, shared, Dc, y, Gamma, Gsum, Cb_cst);
+    out.Gsum0 = Gsum;
+    out.fit_err_max = std::max(out.fit_err_max, kd(Gamma, Gsum, rhs));
+    ls_apply(b, P, S, inu, shared, Dc, rhs, Gamma, Gsum, Cb_cst);
+    out.Gsum1 = Gsum;
+    nda::array<cplx, 1> rhs_norm2(nR), dots(nR), sc(nR);
+    tf_dots(rhs, rhs, rhs_norm2);
+    std::vector<tf_vector> V;
+    V.reserve(size_t(m + 1));
+    for (long j = 0; j <= m; ++j) V.emplace_back(np, nk, nc, nR);
+    nda::array<cplx, 3> H(m + 1, m, nR);          // Hessenberg per column
+    nda::array<cplx, 1> beta(nR);
+    y.zero();
+    long it = 0;
+    bool done = false;
+    double ritz_max = 0.0;
+    while (not done and it < maxit) {
+      // r = rhs - A y
+      apply_A(y, w);
+      r.fam() = rhs.fam - w.fam;
+      r.cst() = rhs.cst - w.cst;
+      tf_dots(r, r, dots);
+      double rel = 0.0;
+      for (long c = 0; c < nR; ++c) {
+        beta(c) = cplx(std::sqrt(std::real(dots(c))));
+        const double nr = std::sqrt(std::max(std::real(rhs_norm2(c)), 1e-300));
+        rel = std::max(rel, std::real(beta(c)) / nr);
+      }
+      out.residual = rel;
+      out.history.push_back(rel);
+      if (rel <= tol) { done = true; break; }
+      for (long c = 0; c < nR; ++c) sc(c) = (std::real(beta(c)) > 0.0) ? cplx(1.0) / beta(c) : cplx(0.0);
+      V[0].fam() = r.fam; V[0].cst() = r.cst;
+      tf_scale(sc, V[0]);
+      H() = cplx(0.0);
+      long jdone = 0;
+      for (long j = 0; j < m; ++j) {
+        apply_A(V[size_t(j)], w);
+        ++it;
+        for (long i = 0; i <= j; ++i) {
+          tf_dots(V[size_t(i)], w, dots);
+          for (long c = 0; c < nR; ++c) { H(i, j, c) = dots(c); sc(c) = -dots(c); }
+          tf_axpy(sc, V[size_t(i)], w);
+        }
+        tf_dots(w, w, dots);
+        for (long c = 0; c < nR; ++c) {
+          const double hn = std::sqrt(std::max(std::real(dots(c)), 0.0));
+          H(j + 1, j, c) = cplx(hn);
+          sc(c) = (hn > 1e-300) ? cplx(1.0 / hn) : cplx(0.0);
+        }
+        V[size_t(j + 1)].fam() = w.fam; V[size_t(j + 1)].cst() = w.cst;
+        tf_scale(sc, V[size_t(j + 1)]);
+        jdone = j + 1;
+        // least squares per column: min || beta e1 - H_j z ||, via the normal equations (m small)
+        double rel_j = 0.0;
+        for (long c = 0; c < nR; ++c) {
+          const long n = jdone;
+          nda::matrix<cplx> N(n, n);
+          nda::array<cplx, 1> g(n);
+          for (long a = 0; a < n; ++a) {
+            g(a) = std::conj(H(0, a, c)) * beta(c);
+            for (long bb2 = 0; bb2 < n; ++bb2) {
+              cplx acc(0.0);
+              for (long i = 0; i <= n; ++i) acc += std::conj(H(i, a, c)) * H(i, bb2, c);
+              N(a, bb2) = acc;
+            }
+          }
+          nda::inverse_in_place(N);
+          // residual = || beta e1 - H z ||
+          nda::array<cplx, 1> z(n);
+          for (long a = 0; a < n; ++a) { cplx acc(0.0); for (long bb2 = 0; bb2 < n; ++bb2) acc += N(a, bb2) * g(bb2); z(a) = acc; }
+          double res2 = 0.0;
+          for (long i = 0; i <= n; ++i) {
+            cplx acc = (i == 0) ? beta(c) : cplx(0.0);
+            for (long a = 0; a < n; ++a) acc -= H(i, a, c) * z(a);
+            res2 += std::norm(acc);
+          }
+          const double nr = std::sqrt(std::max(std::real(rhs_norm2(c)), 1e-300));
+          rel_j = std::max(rel_j, std::sqrt(res2) / nr);
+        }
+        if (rel_j <= tol or it >= maxit) break;
+      }
+      // update y with the least-squares solution of this cycle, and the Ritz estimate of K_d L_s
+      for (long c = 0; c < nR; ++c) {
+        const long n = jdone;
+        nda::matrix<cplx> N(n, n);
+        nda::array<cplx, 1> g(n), z(n);
+        for (long a = 0; a < n; ++a) {
+          g(a) = std::conj(H(0, a, c)) * beta(c);
+          for (long bb2 = 0; bb2 < n; ++bb2) {
+            cplx acc(0.0);
+            for (long i = 0; i <= n; ++i) acc += std::conj(H(i, a, c)) * H(i, bb2, c);
+            N(a, bb2) = acc;
+          }
+        }
+        nda::inverse_in_place(N);
+        for (long a = 0; a < n; ++a) { cplx acc(0.0); for (long bb2 = 0; bb2 < n; ++bb2) acc += N(a, bb2) * g(bb2); z(a) = acc; }
+        for (long a = 0; a < n; ++a) {
+          nda::array<cplx, 1> al(nR);
+          al() = cplx(0.0);
+          al(c) = z(a);
+          tf_axpy(al, V[size_t(a)], y);
+        }
+        // Ritz values of A = 1 - K_d L_s from the square part of H: |1 - lambda_A| = |Ritz of K_d L_s|
+        if (n >= 1) {
+          nda::matrix<cplx> Hs(n, n);
+          for (long a = 0; a < n; ++a)
+            for (long bb2 = 0; bb2 < n; ++bb2) Hs(a, bb2) = H(a, bb2, c);
+          // power iteration on (1 - Hs) for the dominant |Ritz| of K_d L_s (n <= m, cheap)
+          nda::array<cplx, 1> v(n), u(n);
+          for (long a = 0; a < n; ++a) v(a) = cplx(1.0 / std::sqrt(double(n)));
+          double lam = 0.0;
+          for (int itp = 0; itp < 50; ++itp) {
+            for (long a = 0; a < n; ++a) {
+              cplx acc = v(a);
+              for (long bb2 = 0; bb2 < n; ++bb2) acc -= Hs(a, bb2) * v(bb2);
+              u(a) = acc;
+            }
+            double nn = 0.0;
+            for (long a = 0; a < n; ++a) nn += std::norm(u(a));
+            lam = std::sqrt(nn);
+            if (lam <= 0.0) break;
+            for (long a = 0; a < n; ++a) v(a) = u(a) / lam;
+          }
+          ritz_max = std::max(ritz_max, lam);
+        }
+      }
+      out.contraction = ritz_max;
+    }
+    out.iterations = it;
+    out.converged = done;
+    ls_apply(b, P, S, inu, shared, Dc, y, Gamma, Gsum, Cb_cst);
+    out.Gsum = Gsum;
     return out;
   }
 
