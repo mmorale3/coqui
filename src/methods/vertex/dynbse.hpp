@@ -131,6 +131,8 @@ namespace dynbse {
     nda::array<double, 1> eps;            // (np) the node set
     nda::array<double, 1> s;              // (nt) backend tau values
     nda::array<double, 2> KF;             // (nt, np) K_F(s_i, eps_a)
+    nda::array<double, 2> KF2;            // (nt, np) tau[U_a^2] = -K_F(s_i, eps_a) (s_i - beta f_a): the
+                                          // kernel of the inu = 0 second family at the union's G nodes
     std::vector<fermi_derivs> fd;         // f, f', f'', f''' at the nodes
     nda::array<double, 1> fhalf;          // (np) f(eps_a) - 1/2 (the symmetric-sum weight)
     nda::array<cplx, 2> Dsq;              // (np, np): U_a^2 ~ sum_c Dsq(a, c) U_c
@@ -159,10 +161,12 @@ namespace dynbse {
     // the triple-pole table: tau function of U_a^3 is (1/2) d^2/de^2 K_F
     //                       = (1/2) K_F(s,e) [ (s - beta f(e))^2 + beta f'(e) ]
     nda::array<cplx, 2> F2(b.nt, b.np), F3(b.nt, b.np);
+    b.KF2 = nda::array<double, 2>(b.nt, b.np);
     for (long a = 0; a < b.np; ++a)
       for (long i = 0; i < b.nt; ++i) {
         const double u = b.s(i) - b.beta * b.fd[size_t(a)].f;
         F2(i, a) = cplx(-b.KF(i, a) * u);
+        b.KF2(i, a) = -b.KF(i, a) * u;
         F3(i, a) = cplx(0.5 * b.KF(i, a) * (u * u + b.beta * b.fd[size_t(a)].f1));
       }
     auto c2 = b.pf.coeffs(F2);                          // (np, np): column a = coefficients of U_a^2
@@ -186,7 +190,7 @@ namespace dynbse {
   inline void extend_freq_basis(freq_basis &b, nda::array<double, 1> const &extra) {
     const long ne = extra.shape(0), np0 = b.np, np1 = np0 + ne;
     nda::array<double, 1> eps(np1), fhalf(np1);
-    nda::array<double, 2> KF(b.nt, np1);
+    nda::array<double, 2> KF(b.nt, np1), KF2(b.nt, np1);
     nda::array<cplx, 2> Dsq(np1, np1), Dcb(np1, np1);
     Dsq() = cplx(0.0);
     Dcb() = cplx(0.0);
@@ -194,6 +198,7 @@ namespace dynbse {
       eps(a) = b.eps(a);
       fhalf(a) = b.fhalf(a);
       KF(nda::range::all, a) = b.KF(nda::range::all, a);
+      KF2(nda::range::all, a) = b.KF2(nda::range::all, a);
       Dsq(a, nda::range(np0)) = b.Dsq(a, nda::range::all);
       Dcb(a, nda::range(np0)) = b.Dcb(a, nda::range::all);
     }
@@ -202,14 +207,96 @@ namespace dynbse {
       eps(a) = extra(e);
       b.fd.push_back(fermi_all(b.beta, extra(e)));
       fhalf(a) = b.fd[size_t(a)].f - 0.5;
-      for (long i = 0; i < b.nt; ++i) KF(i, a) = imag_axes_ft::dlr_kF(b.beta, b.s(i), extra(e));
+      for (long i = 0; i < b.nt; ++i) {
+        KF(i, a) = imag_axes_ft::dlr_kF(b.beta, b.s(i), extra(e));
+        KF2(i, a) = -KF(i, a) * (b.s(i) - b.beta * b.fd[size_t(a)].f);
+      }
     }
     b.np = np1;
     b.eps = std::move(eps);
     b.fhalf = std::move(fhalf);
     b.KF = std::move(KF);
+    b.KF2 = std::move(KF2);
     b.Dsq = std::move(Dsq);
     b.Dcb = std::move(Dcb);
+  }
+
+  /**
+   * A regularized pole fit onto an ARBITRARY node set (the dlr_pole_fit machinery: real thin SVD of
+   * the kernel on the backend tau grid, rank fixed from the spectrum at rel_tol). Used to put G's
+   * residues on the UNION scheme's G grid (a half-spacing-shifted copy of the vertex grid), so that
+   * no G node coincides with a vertex node and the pair algebra never meets a confluent product.
+   */
+  struct node_pole_fit {
+    long np = 0, nt = 0, n_kept = 0;
+    double beta = 0.0, s_max = 0.0, s_min_kept = 0.0;
+    nda::array<double, 1> eps, s;
+    nda::array<double, 2> Kmat;                 // (nt, np)
+    nda::array<double, 2> Ut, Vs;               // (n_kept, nt), (np, n_kept) with 1/sigma folded in
+    void build(double beta_, nda::array<double, 1> const &s_grid, nda::array<double, 1> const &nodes, double rtol = 1e-8) {
+      beta = beta_; nt = s_grid.shape(0); np = nodes.shape(0);
+      s = s_grid; eps = nodes;
+      Kmat = nda::array<double, 2>(nt, np);
+      for (long i = 0; i < nt; ++i)
+        for (long p = 0; p < np; ++p) Kmat(i, p) = imag_axes_ft::dlr_kF(beta, s(i), eps(p));
+      nda::matrix<double, nda::F_layout> A(nt, np);
+      A() = Kmat;
+      const long ms = std::min(nt, np);
+      nda::vector<double> sig(ms);
+      nda::matrix<double, nda::F_layout> U(nt, nt), VT(np, np);
+      const int info = nda::lapack::gesvd(A, sig, U, VT);
+      utils::check(info == 0, "dynbse::node_pole_fit: gesvd failed (info = {}).", info);
+      s_max = sig(0);
+      n_kept = 0;
+      while (n_kept < ms and sig(n_kept) > rtol * s_max) ++n_kept;
+      utils::check(n_kept > 0, "dynbse::node_pole_fit: no singular direction kept.");
+      s_min_kept = sig(n_kept - 1);
+      Ut = nda::array<double, 2>(n_kept, nt);
+      Vs = nda::array<double, 2>(np, n_kept);
+      for (long k = 0; k < n_kept; ++k) {
+        for (long i = 0; i < nt; ++i) Ut(k, i) = U(i, k);
+        for (long p = 0; p < np; ++p) Vs(p, k) = VT(k, p) / sig(k);
+      }
+    }
+    /** residues of tau-grid data (nt, d) -> (np, d) */
+    nda::array<cplx, 2> coeffs(nda::MemoryArrayOfRank<2> auto const &F) const {
+      const long d = F.shape(1);
+      nda::array<cplx, 2> c(np, d);
+      c() = cplx(0.0);
+      for (long jd = 0; jd < d; ++jd)
+        for (long k = 0; k < n_kept; ++k) {
+          cplx g(0.0);
+          for (long i = 0; i < nt; ++i) g += Ut(k, i) * F(i, jd);
+          for (long p = 0; p < np; ++p) c(p, jd) += Vs(p, k) * g;
+        }
+      return c;
+    }
+    double fit_error(nda::MemoryArrayOfRank<2> auto const &F, nda::array<cplx, 2> const &c) const {
+      const long d = F.shape(1);
+      double num = 0.0, den = 0.0;
+      for (long i = 0; i < nt; ++i)
+        for (long jd = 0; jd < d; ++jd) {
+          cplx rec(0.0);
+          for (long p = 0; p < np; ++p) rec += Kmat(i, p) * c(p, jd);
+          num = std::max(num, std::abs(F(i, jd) - rec));
+          den = std::max(den, std::abs(F(i, jd)));
+        }
+      return (den > 0.0) ? num / den : num;
+    }
+  };
+
+  /** the union scheme's G grid: the midpoints of the (sorted) vertex nodes plus one node beyond
+   *  each end at half the end spacing -- np_fit + 1 nodes, none coinciding with a vertex node. */
+  inline nda::array<double, 1> shifted_nodes(freq_basis const &b) {
+    const long n = b.np_fit;
+    std::vector<double> e(static_cast<size_t>(n), 0.0);
+    for (long a = 0; a < n; ++a) e[size_t(a)] = b.eps(a);
+    std::sort(e.begin(), e.end());
+    nda::array<double, 1> g(n + 1);
+    g(0) = e[0] - 0.5 * (e[1] - e[0]);
+    for (long a = 0; a + 1 < n; ++a) g(a + 1) = 0.5 * (e[size_t(a)] + e[size_t(a + 1)]);
+    g(n) = e[size_t(n - 1)] + 0.5 * (e[size_t(n - 1)] - e[size_t(n - 2)]);
+    return g;
   }
 
   // ==================================================================================
@@ -237,7 +324,7 @@ namespace dynbse {
    */
   inline pair_poles make_pair_poles(double beta, nda::array<double, 1> const &epsG,
                                     nda::array<cplx, 4> const &gk, nda::array<cplx, 4> const &gkq,
-                                    long gnode0 = 0) {
+                                    long gnode0 = 0, nda::array<long, 1> const *gmap = nullptr) {
     pair_poles p;
     p.ng = epsG.shape(0);
     p.nk = gk.shape(1);
@@ -249,7 +336,7 @@ namespace dynbse {
     p.gnode = nda::array<long, 1>(p.ng);
     for (long j = 0; j < p.ng; ++j) {
       p.fdG[size_t(j)] = fermi_all(beta, epsG(j));
-      p.gnode(j) = gnode0 + j;
+      p.gnode(j) = (gmap != nullptr) ? (*gmap)(j) : gnode0 + j;
     }
     return p;
   }
@@ -294,8 +381,8 @@ namespace dynbse {
     decltype(nda::range::all) all;
     const long np = b.np, nk = P.nk, nc = P.nc, ng = P.ng, nR = X.nR;
     utils::check(X.np == np and X.nk == nk and X.nc == nc, "dynbse::l0_apply: shape mismatch.");
-    utils::check(not shared or (ng == np and P.gnode(0) == 0), "dynbse::l0_apply: shared node sets differ.");
-    utils::check(P.gnode(ng - 1) < np, "dynbse::l0_apply: G node map exceeds the vertex node set.");
+    for (long j = 0; j < ng; ++j)
+      utils::check(P.gnode(j) < np and (not shared or P.gnode(j) < b.np_fit), "dynbse::l0_apply: G node map out of range.");
     const bool nu0 = (inu == cplx(0.0));
     F.zero();
     Fsum() = cplx(0.0);
@@ -430,6 +517,487 @@ namespace dynbse {
           }
   }
 
+  // ==================================================================================
+  // THE TWISTED-PAIR BASIS AT inu != 0  (increment D2e)
+  // ==================================================================================
+  //
+  // At inu != 0 the shifted family is carried as the TWISTED PAIRS T_a = U_a S_a instead of S_a:
+  //   S_a = U_a - i nu T_a,   T_a = [U_a - S_a]/(i nu),   tau[T_a] = K_F(s, e_a) phi_nu(s),
+  //   phi_nu(s) = (1 - e^{i nu s})/(i nu)  (bounded: -> -s),   (1/beta) sum_iw T_a = 0 EXACTLY.
+  // Every partial-fraction coefficient is then bounded by node gaps (never 1/nu), which is
+  // what the {U, S} representation lacked: its index-confluent pairs [U_j - S_j]/(i nu) put
+  // +-1/nu-sized canceling content into both families and the per-family refit noise
+  // re-entered the iteration at the physical level (1/nu = beta/2pi = 159 at beta = 1000).
+  // The confluent products that remain are re-expanded through two nu-dependent tables,
+  // in the Dsq/Dcb pattern (exact large parts + a fitted bounded remainder):
+  //   R1_j = U_j^2 S_j     = (beta f_j / i nu) U_j              + fit[K_F(s,e_j) psi_nu(s)],
+  //   R3_j = U_j^2 S_j^2   = (2 beta f_j/(i nu)^2) U_j - (beta f_j/i nu) T_j
+  //                                                        + fit[K_F(s,e_j)(2 xi_nu(s) - s psi_nu(s))],
+  //   psi_nu = (e^{i nu s} - 1 - i nu s)/(i nu)^2 (-> s^2/2),  xi_nu = (e^{i nu s} - 1 - i nu s - (i nu s)^2/2)/(i nu)^3,
+  // with the exact frequency sums  sum R1_j = f'_j/(i nu),  sum R3_j = 2 f'_j/(i nu)^2,  sum U_j^2 = f'_j.
+  // The fits target {K_F(.,e_c)} U {K_F(.,e_c) phi_nu} on a dense tau grid (real-embedded SVD,
+  // columns normalized, relative truncation). U_j^2 keeps the Dsq re-expansion.
+
+  struct shift_tables {
+    cplx inu = cplx(0.0);
+    long np = 0, np_fit = 0;
+    nda::array<cplx, 1> r1u, r3u, r3t;        // exact parts on U_j / U_j / T_j
+    nda::array<cplx, 1> s1, s3;               // exact frequency sums of R1_j, R3_j
+    nda::array<cplx, 2> R1U, R1T, R3U, R3T;   // (np, np): the fitted remainders onto U_c / T_c
+    double fit_err = 0.0;                     // max relative residual of the two fits
+    double cond_kept = 0.0;                   // s_max / s_min_kept of the fit system
+  };
+
+  namespace shift_detail {
+    inline cplx phi_nu(cplx inu, double s) {
+      const cplx x = inu * s;
+      if (std::abs(x) < 0.5) {
+        // -(s) sum_{k>=1} x^{k-1}/k!
+        cplx acc(1.0), term(1.0);
+        for (int k = 2; k <= 22; ++k) { term *= x / double(k); acc += term; }
+        return -s * acc;
+      }
+      return (cplx(1.0) - std::exp(x)) / inu;
+    }
+    inline cplx psi_nu(cplx inu, double s) {
+      const cplx x = inu * s;
+      if (std::abs(x) < 0.5) {
+        // s^2 sum_{k>=2} x^{k-2}/k!
+        cplx acc(0.5), term(0.5);
+        for (int k = 3; k <= 24; ++k) { term *= x / double(k); acc += term; }
+        return s * s * acc;
+      }
+      return (std::exp(x) - cplx(1.0) - x) / (inu * inu);
+    }
+    inline cplx xi_nu(cplx inu, double s) {
+      const cplx x = inu * s;
+      if (std::abs(x) < 0.5) {
+        // s^3 sum_{k>=3} x^{k-3}/k!
+        cplx acc(1.0 / 6.0), term(1.0 / 6.0);
+        for (int k = 4; k <= 25; ++k) { term *= x / double(k); acc += term; }
+        return s * s * s * acc;
+      }
+      return (std::exp(x) - cplx(1.0) - x - x * x / 2.0) / (inu * inu * inu);
+    }
+  } // namespace shift_detail
+
+  /**
+   * mode 0: the fitted tables (default). mode 1: the EXACT partial-fraction tables through Dsq --
+   *   R1_j = U_j^2 S_j   = [U_j^2 - T_j]/(i nu)            -> R1U(j,c) = Dsq(j,c)/(i nu), R1T(j,j) = -1/(i nu)
+   *   R3_j = U_j^2 S_j^2 = [U_j^2 + S_j^2]/(i nu)^2 - 2 T_j/(i nu)^2, S_j^2 = sum_c Dsq(j,c)(U_c - i nu T_c)
+   *                                                      -> R3U(j,c) = 2 Dsq(j,c)/(i nu)^2, R3T(j,c) = -Dsq(j,c)/(i nu), R3T(j,j) -= 2/(i nu)^2
+   * (1/nu-amplified but with Dsq's accuracy only) -- the diagnostic of the fit route.
+   */
+  inline shift_tables build_shift_tables(freq_basis const &b, cplx inu, double rtol = 1e-11, int mode = 0) {
+    using namespace shift_detail;
+    utils::check(inu != cplx(0.0), "dynbse::build_shift_tables: inu = 0 has no shifted family.");
+    shift_tables st;
+    if (mode == 1) {
+      st.inu = inu; st.np = b.np; st.np_fit = b.np_fit;
+      const long np = b.np;
+      st.r1u = nda::array<cplx, 1>(np); st.r3u = nda::array<cplx, 1>(np); st.r3t = nda::array<cplx, 1>(np);
+      st.s1 = nda::array<cplx, 1>(np); st.s3 = nda::array<cplx, 1>(np);
+      st.R1U = nda::array<cplx, 2>(np, np); st.R1T = nda::array<cplx, 2>(np, np);
+      st.R3U = nda::array<cplx, 2>(np, np); st.R3T = nda::array<cplx, 2>(np, np);
+      st.R1U() = cplx(0.0); st.R1T() = cplx(0.0); st.R3U() = cplx(0.0); st.R3T() = cplx(0.0);
+      const cplx in2 = inu * inu;
+      for (long j = 0; j < np; ++j) {
+        const double f1 = b.fd[size_t(j)].f1;
+        st.r1u(j) = cplx(0.0); st.r3u(j) = cplx(0.0); st.r3t(j) = cplx(0.0);
+        st.s1(j) = cplx(f1) / inu;
+        st.s3(j) = cplx(2.0 * f1) / in2;
+        if (j >= b.np_fit) continue;
+        for (long c = 0; c < np; ++c) {
+          const cplx d = b.Dsq(j, c);
+          st.R1U(j, c) += d / inu;
+          st.R3U(j, c) += cplx(2.0) * d / in2;
+          st.R3T(j, c) += -d / inu;
+        }
+        st.R1T(j, j) += cplx(-1.0) / inu;
+        st.R3T(j, j) += cplx(-2.0) / in2;
+      }
+      st.fit_err = b.dsq_fit_err;
+      st.cond_kept = 0.0;
+      return st;
+    }
+    st.inu = inu;
+    st.np = b.np;
+    st.np_fit = b.np_fit;
+    const long np = b.np, npf = b.np_fit, nt = b.nt;
+    const double beta = b.beta;
+    st.r1u = nda::array<cplx, 1>(np); st.r3u = nda::array<cplx, 1>(np); st.r3t = nda::array<cplx, 1>(np);
+    st.s1 = nda::array<cplx, 1>(np); st.s3 = nda::array<cplx, 1>(np);
+    // The FULL tau-functions are fitted (no analytic split): tau[U_j^2 S_j] = K_F [beta f_j/(i nu)
+    // + psi_nu(s)] and tau[U_j^2 S_j^2] = K_F [2 beta f_j/(i nu)^2 - (beta f_j/(i nu)) phi_nu + 2 xi_nu
+    // - s psi_nu] are benign (Dcb-class: for f_j = 1 the bracket vanishes at s = beta where K_F
+    // peaks), whereas their "exact part + remainder" pieces are two huge canceling functions --
+    // fitting the remainder alone lost the cancellation at large beta (R3 wrong by O(1) at
+    // beta = 1000). The exact frequency sums are kept.
+    for (long j = 0; j < np; ++j) {
+      const double f1 = b.fd[size_t(j)].f1;
+      st.r1u(j) = cplx(0.0);
+      st.r3u(j) = cplx(0.0);
+      st.r3t(j) = cplx(0.0);
+      st.s1(j) = cplx(f1) / inu;
+      st.s3(j) = cplx(2.0 * f1) / (inu * inu);
+    }
+    // ---- the dense tau grid: the backend nodes and three interior points per interval -------
+    std::vector<double> ss;
+    ss.reserve(size_t(4 * nt + 8));
+    std::vector<double> s0(static_cast<size_t>(nt), 0.0);
+    for (long i = 0; i < nt; ++i) s0[size_t(i)] = b.s(i);
+    std::sort(s0.begin(), s0.end());
+    for (long i = 0; i < nt; ++i) {
+      ss.push_back(s0[size_t(i)]);
+      if (i + 1 < nt) {
+        const double a = s0[size_t(i)], c = s0[size_t(i + 1)];
+        ss.push_back(a + 0.25 * (c - a)); ss.push_back(a + 0.5 * (c - a)); ss.push_back(a + 0.75 * (c - a));
+      }
+    }
+    const long ntau = long(ss.size());
+    // ---- the basis: K_F(s, e_c) and K_F(s, e_c) phi_nu(s), c < np_fit; columns normalized --------
+    const long ncol = 2 * npf;
+    nda::array<cplx, 2> A(ntau, ncol);
+    nda::array<double, 1> cn(ncol);
+    for (long c = 0; c < npf; ++c) {
+      double n1 = 0.0, n2 = 0.0;
+      for (long i = 0; i < ntau; ++i) {
+        const double kf = imag_axes_ft::dlr_kF(beta, ss[size_t(i)], b.eps(c));
+        const cplx ph = phi_nu(inu, ss[size_t(i)]);
+        A(i, c) = cplx(kf);
+        A(i, npf + c) = cplx(kf) * ph;
+        n1 += kf * kf;
+        n2 += std::norm(A(i, npf + c));
+      }
+      cn(c) = std::sqrt(std::max(n1, 1e-300));
+      cn(npf + c) = std::sqrt(std::max(n2, 1e-300));
+      for (long i = 0; i < ntau; ++i) { A(i, c) /= cn(c); A(i, npf + c) /= cn(npf + c); }
+    }
+    // ---- real embedding [Ar -Ai; Ai Ar] (2 ntau x 2 ncol), thin SVD -------------------------
+    const long M = 2 * ntau, N = 2 * ncol;
+    nda::matrix<double, nda::F_layout> Ar(M, N);
+    for (long i = 0; i < ntau; ++i)
+      for (long c = 0; c < ncol; ++c) {
+        Ar(i, c) = A(i, c).real();          Ar(i, ncol + c) = -A(i, c).imag();
+        Ar(ntau + i, c) = A(i, c).imag();   Ar(ntau + i, ncol + c) = A(i, c).real();
+      }
+    const long ms = std::min(M, N);
+    nda::vector<double> sig(ms);
+    nda::matrix<double, nda::F_layout> U(M, M), VT(N, N);
+    {
+      nda::matrix<double, nda::F_layout> Acopy(M, N);
+      Acopy() = Ar;
+      const int info = nda::lapack::gesvd(Acopy, sig, U, VT);
+      utils::check(info == 0, "dynbse::build_shift_tables: gesvd failed (info = {}).", info);
+    }
+    long nk = 0;
+    while (nk < ms and sig(nk) > rtol * sig(0)) ++nk;
+    utils::check(nk > 0, "dynbse::build_shift_tables: no singular direction kept.");
+    st.cond_kept = sig(0) / sig(nk - 1);
+    // ---- targets: t1_j = K_F psi, t3_j = K_F (2 xi - s psi), j < np_fit; solve, unscale --------
+    st.R1U = nda::array<cplx, 2>(np, np); st.R1T = nda::array<cplx, 2>(np, np);
+    st.R3U = nda::array<cplx, 2>(np, np); st.R3T = nda::array<cplx, 2>(np, np);
+    st.R1U() = cplx(0.0); st.R1T() = cplx(0.0); st.R3U() = cplx(0.0); st.R3T() = cplx(0.0);
+    nda::array<double, 1> Fr(M), g(nk), x(N);
+    double err_max = 0.0;
+    for (int which = 1; which <= 3; which += 2)
+      for (long j = 0; j < npf; ++j) {
+        double fmax = 0.0;
+        const double fj = b.fd[size_t(j)].f;
+        const cplx bfj(beta * fj);
+        for (long i = 0; i < ntau; ++i) {
+          const double s = ss[size_t(i)];
+          const double kf = imag_axes_ft::dlr_kF(beta, s, b.eps(j));
+          const cplx t = (which == 1)
+              ? cplx(kf) * (bfj / inu + psi_nu(inu, s))
+              : cplx(kf) * (cplx(2.0) * bfj / (inu * inu) - (bfj / inu) * phi_nu(inu, s) + cplx(2.0) * xi_nu(inu, s) - s * psi_nu(inu, s));
+          Fr(i) = t.real();
+          Fr(ntau + i) = t.imag();
+          fmax = std::max(fmax, std::abs(t));
+        }
+        // x = V S^-1 U^T F on the kept directions
+        for (long k = 0; k < nk; ++k) {
+          double acc = 0.0;
+          for (long i = 0; i < M; ++i) acc += U(i, k) * Fr(i);
+          g(k) = acc / sig(k);
+        }
+        for (long c = 0; c < N; ++c) {
+          double acc = 0.0;
+          for (long k = 0; k < nk; ++k) acc += VT(k, c) * g(k);
+          x(c) = acc;
+        }
+        // residual on the dense grid
+        double rmax = 0.0;
+        for (long i = 0; i < M; ++i) {
+          double acc = 0.0;
+          for (long c = 0; c < N; ++c) acc += Ar(i, c) * x(c);
+          rmax = std::max(rmax, std::abs(acc - Fr(i)));
+        }
+        err_max = std::max(err_max, (fmax > 0.0) ? rmax / fmax : rmax);
+        for (long c = 0; c < npf; ++c) {
+          const cplx xu = cplx(x(c), x(ncol + c)) / cn(c);
+          const cplx xt = cplx(x(npf + c), x(ncol + npf + c)) / cn(npf + c);
+          if (which == 1) { st.R1U(j, c) = xu; st.R1T(j, c) = xt; }
+          else            { st.R3U(j, c) = xu; st.R3T(j, c) = xt; }
+        }
+      }
+    st.fit_err = err_max;
+    return st;
+  }
+
+  /**
+   * F = L0 X at inu != 0 in the {U, T} basis (family 1 = the twisted pairs T_a). Grouped form:
+   * with the diagonal (j == l) separated,
+   *   L0 = sum_{j != l} [g_j (x) g_l / D_jl] (U_j - U_l + i nu T_l) + sum_j [g_j (x) g_j] T_j,
+   * so with Q_j = g_j^T X Ghat_j, R_l = Gtil_l X g_l^T, B_j = g_j^T X g_j^T (pair maps applied to
+   * every component of X: the constant, the U_a and the T_a)
+   *   F = sum_j U_j . Q_j  -  sum_l U_l . R_l  +  i nu sum_l T_l . R_l  +  sum_j T_j . B_j ,
+   * and "U_j ." / "T_l ." are the elementary single-pole multiplications of a {C, U, T} vector
+   * (partial fractions with node-gap denominators; the confluent U_j^2 -> Dsq, U_j T_j -> R1_j,
+   * T_j T_j -> R3_j). Frequency sums: U -> f - 1/2, T -> 0, Dsq -> f', R1 -> f'/(i nu), R3 -> 2 f'/(i nu)^2.
+   */
+  inline void l0_apply_shift(freq_basis const &b, pair_poles const &P, shift_tables const &st,
+                             tf_vector const &X, tf_vector &F, nda::array<cplx, 4> &Fsum,
+                             nda::array<cplx, 3> const *Cb_cst) {
+    decltype(nda::range::all) all;
+    const cplx inu = st.inu;
+    const long np = b.np, nk = P.nk, nc = P.nc, ng = P.ng, nR = X.nR, nc2 = nc * nc;
+    utils::check(st.np == np, "dynbse::l0_apply_shift: table / basis size mismatch.");
+    F.zero();
+    Fsum() = cplx(0.0);
+    // per-k pole-summed legs, diagonal EXCLUDED
+    nda::array<cplx, 3> Ghat(ng, nc, nc), Gtil(ng, nc, nc);
+    nda::array<cplx, 2> gjT(nc, nc), glT(nc, nc);
+    // accumulators (per (k, r)); index 0 = the family/constant-independent part, 1 = the
+    // constant part of X (kept apart for the Cb_cst override of its frequency sum)
+    nda::array<cplx, 5> AU(2, 2, np, nc, nc), AT(2, 2, np, nc, nc);   // [part][unused=0][node] single poles: AU(part,0,...) U, AT(part,0,...) T
+    nda::array<cplx, 4> M2(2, np, nc, nc), A1(2, np, nc, nc), A3(2, np, nc, nc);   // [part][node]
+    // workspaces: the input components stacked as columns (x, (comp), y): comp = 0 (C), 1..np (U), np+1..2np (T)
+    const long ncomp = 1 + 2 * np;
+    nda::array<cplx, 3> Vt(nc, ncomp, nc), Sv(ncomp, nc, nc);
+    nda::array<cplx, 2> Pj(nc, ncomp * nc), Qj(nc * ncomp, nc), Bj(nc * ncomp, nc);
+    nda::array<cplx, 2> Sl_out(ncomp * nc, nc), Slt(nc, ncomp * nc), Rl(nc, ncomp * nc);
+
+    // ---- the elementary multiplications --------------------------------------------------
+    // mulU(j, comp c, matrix V, part): U_j x (component c of the vector)
+    auto mulU = [&](long j, long c, auto const &V, int part) {
+      const long nj = P.gnode(j);
+      const double ej = P.epsG(j);
+      if (c == 0) {                                   // U_j . C
+        for (long x = 0; x < nc; ++x) for (long y = 0; y < nc; ++y) AU(part, 0, nj, x, y) += V(x, y);
+      } else if (c <= np) {                           // U_j . U_a
+        const long a = c - 1;
+        if (a == nj) {
+          for (long x = 0; x < nc; ++x) for (long y = 0; y < nc; ++y) M2(part, nj, x, y) += V(x, y);
+        } else {
+          const cplx w = cplx(1.0 / (ej - b.eps(a)));
+          for (long x = 0; x < nc; ++x) for (long y = 0; y < nc; ++y) {
+            AU(part, 0, nj, x, y) += w * V(x, y);
+            AU(part, 0, a, x, y) -= w * V(x, y);
+          }
+        }
+      } else {                                        // U_j . T_a
+        const long a = c - 1 - np;
+        if (a == nj) {                                // U_j T_j = R1_j
+          for (long x = 0; x < nc; ++x) for (long y = 0; y < nc; ++y) A1(part, nj, x, y) += V(x, y);
+        } else {
+          // [T_a - U_j S_a]/(e_a - e_j),  U_j S_a = [U_j - U_a + i nu T_a]/(e_j - e_a + i nu)
+          const double ea = b.eps(a);
+          const cplx w = cplx(1.0 / (ea - ej));
+          const cplx d = cplx(ej - ea) + inu;
+          const cplx wd = w / d;
+          for (long x = 0; x < nc; ++x) for (long y = 0; y < nc; ++y) {
+            const cplx v = V(x, y);
+            AT(part, 0, a, x, y) += (w - inu * wd) * v;
+            AU(part, 0, nj, x, y) -= wd * v;
+            AU(part, 0, a, x, y) += wd * v;
+          }
+        }
+      }
+    };
+    // mulT(l, comp c, V, part): T_l x (component c)
+    auto mulT = [&](long l, long c, auto const &V, int part) {
+      const long nl = P.gnode(l);
+      const double el = P.epsG(l);
+      if (c == 0) {                                   // T_l . C
+        for (long x = 0; x < nc; ++x) for (long y = 0; y < nc; ++y) AT(part, 0, nl, x, y) += V(x, y);
+      } else if (c <= np) {                           // T_l . U_a
+        const long a = c - 1;
+        if (a == nl) {                                // U_l T_l = R1_l
+          for (long x = 0; x < nc; ++x) for (long y = 0; y < nc; ++y) A1(part, nl, x, y) += V(x, y);
+        } else {
+          // [T_l - U_a S_l]/(e_l - e_a),  U_a S_l = [U_a - U_l + i nu T_l]/(e_a - e_l + i nu)
+          const double ea = b.eps(a);
+          const cplx w = cplx(1.0 / (el - ea));
+          const cplx d = cplx(ea - el) + inu;
+          const cplx wd = w / d;
+          for (long x = 0; x < nc; ++x) for (long y = 0; y < nc; ++y) {
+            const cplx v = V(x, y);
+            AT(part, 0, nl, x, y) += (w - inu * wd) * v;
+            AU(part, 0, a, x, y) -= wd * v;
+            AU(part, 0, nl, x, y) += wd * v;
+          }
+        }
+      } else {                                        // T_l . T_a
+        const long a = c - 1 - np;
+        if (a == nl) {                                // T_l^2 = R3_l
+          for (long x = 0; x < nc; ++x) for (long y = 0; y < nc; ++y) A3(part, nl, x, y) += V(x, y);
+        } else {
+          // [T_l - U_l S_a - U_a S_l + T_a]/g^2, g = e_l - e_a,
+          // U_l S_a = [U_l - U_a + i nu T_a]/d_la, U_a S_l = [U_a - U_l + i nu T_l]/d_al
+          const double ea = b.eps(a);
+          const double g = el - ea;
+          const cplx w2 = cplx(1.0 / (g * g));
+          const cplx dla = cplx(el - ea) + inu, dal = cplx(ea - el) + inu;
+          const cplx wla = w2 / dla, wal = w2 / dal;
+          for (long x = 0; x < nc; ++x) for (long y = 0; y < nc; ++y) {
+            const cplx v = V(x, y);
+            AT(part, 0, nl, x, y) += (w2 - inu * wal) * v;
+            AT(part, 0, a, x, y) += (w2 - inu * wla) * v;
+            AU(part, 0, nl, x, y) += (wal - wla) * v;
+            AU(part, 0, a, x, y) += (wla - wal) * v;
+          }
+        }
+      }
+    };
+
+    for (long ik = 0; ik < nk; ++ik) {
+      Ghat() = cplx(0.0);
+      Gtil() = cplx(0.0);
+      for (long j = 0; j < ng; ++j)
+        for (long l = 0; l < ng; ++l) {
+          if (j == l) continue;
+          const cplx w = cplx(1.0) / (cplx(P.epsG(j) - P.epsG(l)) + inu);
+          for (long x = 0; x < nc; ++x)
+            for (long y = 0; y < nc; ++y) {
+              Ghat(j, x, y) += w * P.gkq(l, ik, y, x);
+              Gtil(l, x, y) += w * P.gk(j, ik, y, x);
+            }
+        }
+      for (long r = 0; r < nR; ++r) {
+        AU() = cplx(0.0); AT() = cplx(0.0); M2() = cplx(0.0); A1() = cplx(0.0); A3() = cplx(0.0);
+        // the input components: C, U_a, T_a  (the constant part is component 0 = "part 1")
+        bool anyc = false, anyv = false;
+        for (long x = 0; x < nc; ++x)
+          for (long y = 0; y < nc; ++y) {
+            const cplx cv = X.cst(ik, x, y, r);
+            Vt(x, 0, y) = cv; Sv(0, x, y) = cv;
+            anyc = anyc or (cv != cplx(0.0));
+            for (long a = 0; a < np; ++a) {
+              const cplx u = X.fam(0, a, ik, x, y, r), t = X.fam(1, a, ik, x, y, r);
+              Vt(x, 1 + a, y) = u; Sv(1 + a, x, y) = u;
+              Vt(x, 1 + np + a, y) = t; Sv(1 + np + a, x, y) = t;
+              anyv = anyv or (u != cplx(0.0)) or (t != cplx(0.0));
+            }
+          }
+        if (not anyc and not anyv) continue;
+        auto Vt2 = nda::reshape(Vt, std::array<long, 2>{nc, ncomp * nc});
+        auto Sv2 = nda::reshape(Sv, std::array<long, 2>{ncomp * nc, nc});
+        auto part_of = [&](long c) { return (c == 0) ? 1 : 0; };
+        for (long j = 0; j < ng; ++j) {
+          for (long x = 0; x < nc; ++x)
+            for (long y = 0; y < nc; ++y) { gjT(x, y) = P.gk(j, ik, y, x); glT(x, y) = P.gkq(j, ik, y, x); }
+          nda::blas::gemm(gjT, Vt2, Pj);                                    // (p1', (c b))
+          auto Pj2 = nda::reshape(Pj, std::array<long, 2>{nc * ncomp, nc});
+          nda::blas::gemm(Pj2, Ghat(j, all, all), Qj);                      // Q_j(c): ((p1' c), p3)
+          nda::blas::gemm(Pj2, glT, Bj);                                    // B_j(c): ((p1' c), p3)
+          auto Q3 = nda::reshape(Qj, std::array<long, 3>{nc, ncomp, nc});
+          auto B3 = nda::reshape(Bj, std::array<long, 3>{nc, ncomp, nc});
+          for (long c = 0; c < ncomp; ++c) {
+            if (c == 0 and not anyc) continue;
+            mulU(j, c, Q3(all, c, all), part_of(c));        // + U_j . Q_j
+            mulT(j, c, B3(all, c, all), part_of(c));        // + T_j . B_j
+          }
+        }
+        for (long l = 0; l < ng; ++l) {
+          for (long x = 0; x < nc; ++x)
+            for (long y = 0; y < nc; ++y) glT(x, y) = P.gkq(l, ik, y, x);
+          nda::blas::gemm(Sv2, glT, Sl_out);                                // ((c x), p3)
+          auto So = nda::reshape(Sl_out, std::array<long, 3>{ncomp, nc, nc});
+          for (long c = 0; c < ncomp; ++c)
+            for (long x = 0; x < nc; ++x)
+              for (long y = 0; y < nc; ++y) Slt(x, c * nc + y) = So(c, x, y);
+          nda::blas::gemm(Gtil(l, all, all), Slt, Rl);                      // R_l(c): (p1', (c p3))
+          auto R3v = nda::reshape(Rl, std::array<long, 3>{nc, ncomp, nc});
+          nda::array<cplx, 2> mV(nc, nc), tV(nc, nc);
+          for (long c = 0; c < ncomp; ++c) {
+            if (c == 0 and not anyc) continue;
+            mV() = -R3v(all, c, all);
+            tV() = inu * R3v(all, c, all);
+            mulU(l, c, mV, part_of(c));                     // - U_l . R_l
+            mulT(l, c, tV, part_of(c));                     // + i nu T_l . R_l
+          }
+        }
+        // ---- assemble ----------------------------------------------------------------------
+        for (int part = 0; part < 2; ++part) {
+          const bool sum_this = (part == 0) or (Cb_cst == nullptr);
+          for (long n = 0; n < np; ++n) {
+            const cplx wh(b.fhalf(n));
+            for (long x = 0; x < nc; ++x)
+              for (long y = 0; y < nc; ++y) {
+                const cplx u = AU(part, 0, n, x, y), t = AT(part, 0, n, x, y);
+                F.fam(0, n, ik, x, y, r) += u;
+                F.fam(1, n, ik, x, y, r) += t;
+                if (sum_this) Fsum(ik, x, y, r) += wh * u;           // T sums to 0 exactly
+              }
+            // U_n^2 -> Dsq ; U_n^2 S_n -> R1 ; U_n^2 S_n^2 -> R3
+            bool any2 = false, any1 = false, any3 = false;
+            for (long x = 0; x < nc; ++x)
+              for (long y = 0; y < nc; ++y) {
+                any2 = any2 or (M2(part, n, x, y) != cplx(0.0));
+                any1 = any1 or (A1(part, n, x, y) != cplx(0.0));
+                any3 = any3 or (A3(part, n, x, y) != cplx(0.0));
+              }
+            if (any2 or any1 or any3)
+              utils::check(n < b.np_fit, "dynbse::l0_apply_shift: a confluent product at node {} outside the DLR set.", n);
+            if (any2) {
+              const cplx w1(b.fd[size_t(n)].f1);
+              for (long x = 0; x < nc; ++x)
+                for (long y = 0; y < nc; ++y) {
+                  if (sum_this) Fsum(ik, x, y, r) += w1 * M2(part, n, x, y);
+                  for (long c = 0; c < np; ++c) {
+                    const cplx dc = b.Dsq(n, c);
+                    if (dc != cplx(0.0)) F.fam(0, c, ik, x, y, r) += dc * M2(part, n, x, y);
+                  }
+                }
+            }
+            if (any1) {
+              for (long x = 0; x < nc; ++x)
+                for (long y = 0; y < nc; ++y) {
+                  const cplx v = A1(part, n, x, y);
+                  if (sum_this) Fsum(ik, x, y, r) += st.s1(n) * v;
+                  F.fam(0, n, ik, x, y, r) += st.r1u(n) * v;
+                  for (long c = 0; c < np; ++c) {
+                    F.fam(0, c, ik, x, y, r) += st.R1U(n, c) * v;
+                    F.fam(1, c, ik, x, y, r) += st.R1T(n, c) * v;
+                  }
+                }
+            }
+            if (any3) {
+              for (long x = 0; x < nc; ++x)
+                for (long y = 0; y < nc; ++y) {
+                  const cplx v = A3(part, n, x, y);
+                  if (sum_this) Fsum(ik, x, y, r) += st.s3(n) * v;
+                  F.fam(0, n, ik, x, y, r) += st.r3u(n) * v;
+                  F.fam(1, n, ik, x, y, r) += st.r3t(n) * v;
+                  for (long c = 0; c < np; ++c) {
+                    F.fam(0, c, ik, x, y, r) += st.R3U(n, c) * v;
+                    F.fam(1, c, ik, x, y, r) += st.R3T(n, c) * v;
+                  }
+                }
+            }
+          }
+        }
+        if (Cb_cst != nullptr and anyc)
+          for (long p = 0; p < nc2; ++p) {
+            cplx sacc(0.0);
+            for (long pp = 0; pp < nc2; ++pp) sacc += (*Cb_cst)(ik, p, pp) * X.cst(ik, pp / nc, pp % nc, r);
+            Fsum(ik, p / nc, p % nc, r) += sacc;
+          }
+      }
+    }
+  }
+
   /**
    * F = L0 X, the GROUPED (production) form of l0_apply_ref: identical terms, reassociated so
    * that the G-pole double sum never meets the vertex nodes. Per (k, r) and input family the
@@ -448,12 +1016,22 @@ namespace dynbse {
    */
   inline void l0_apply(freq_basis const &b, pair_poles const &P, cplx inu, bool shared,
                        tf_vector const &X, tf_vector &F, nda::array<cplx, 4> &Fsum,
-                       nda::array<cplx, 3> const *Cb_cst = nullptr) {
+                       nda::array<cplx, 3> const *Cb_cst = nullptr, shift_tables const *st = nullptr) {
     decltype(nda::range::all) all;
+    // inu != 0: the {U, T} twisted-pair basis (D2e). The {U, S} branches below this dispatch are
+    // the inu = 0 (folded, single-family) path only.
+    if (inu != cplx(0.0)) {
+      utils::check(st != nullptr and st->inu == inu,
+                   "dynbse::l0_apply: inu != 0 needs the shift tables built for this inu (build_shift_tables).");
+      for (long j = 0; j < P.ng; ++j)
+        utils::check(P.gnode(j) < b.np and (not shared or P.gnode(j) < b.np_fit), "dynbse::l0_apply: G node map out of range.");
+      l0_apply_shift(b, P, *st, X, F, Fsum, Cb_cst);
+      return;
+    }
     const long np = b.np, nk = P.nk, nc = P.nc, ng = P.ng, nR = X.nR, nc2 = nc * nc;
     utils::check(X.np == np and X.nk == nk and X.nc == nc, "dynbse::l0_apply: shape mismatch.");
-    utils::check(not shared or (ng == np and P.gnode(0) == 0), "dynbse::l0_apply: shared node sets differ.");
-    utils::check(P.gnode(ng - 1) < np, "dynbse::l0_apply: G node map exceeds the vertex node set.");
+    for (long j = 0; j < ng; ++j)
+      utils::check(P.gnode(j) < np and (not shared or P.gnode(j) < b.np_fit), "dynbse::l0_apply: G node map out of range.");
     if (Cb_cst != nullptr)
       utils::check(Cb_cst->shape(0) == nk and Cb_cst->shape(1) == nc2 and Cb_cst->shape(2) == nc2,
                    "dynbse::l0_apply: Cb_cst shape mismatch.");
@@ -680,15 +1258,22 @@ namespace dynbse {
                 }
             }
             if (any2) {
-              utils::check(n < b.np_fit, "dynbse::l0_apply: a confluent double pole at node {} outside the DLR set.", n);
               const cplx w1(b.fd[size_t(n)].f1);
               for (long x = 0; x < nc; ++x)
                 for (long y = 0; y < nc; ++y) Fsum(ik, x, y, r) += w1 * M2(f, n, x, y);
-              for (long c = 0; c < np; ++c) {
-                const cplx dc = b.Dsq(n, c);
-                if (dc == cplx(0.0)) continue;
+              if (n < b.np_fit) {
+                for (long c = 0; c < np; ++c) {
+                  const cplx dc = b.Dsq(n, c);
+                  if (dc == cplx(0.0)) continue;
+                  for (long x = 0; x < nc; ++x)
+                    for (long y = 0; y < nc; ++y) F.fam(f, c, ik, x, y, r) += dc * M2(f, n, x, y);
+                }
+              } else {
+                // the union's G node: U_n^2 is kept as the second family's basis function
+                // (tau kernel KF2 = -K_F (s - beta f_n)), no re-expansion
+                utils::check(f == 0, "dynbse::l0_apply: a double pole of the shifted family at a G node.");
                 for (long x = 0; x < nc; ++x)
-                  for (long y = 0; y < nc; ++y) F.fam(f, c, ik, x, y, r) += dc * M2(f, n, x, y);
+                  for (long y = 0; y < nc; ++y) F.fam(1, n, ik, x, y, r) += M2(0, n, x, y);
               }
             }
           }
@@ -700,16 +1285,20 @@ namespace dynbse {
               any3 = any3 or (M3(n, x, y) != cplx(0.0));
             }
           if (any2c) {
-            utils::check(n < b.np_fit, "dynbse::l0_apply: a confluent double pole at node {} outside the DLR set.", n);
             const cplx w1(b.fd[size_t(n)].f1);
             if (Cb_cst == nullptr)
               for (long x = 0; x < nc; ++x)
                 for (long y = 0; y < nc; ++y) Fsum(ik, x, y, r) += w1 * M2c(n, x, y);
-            for (long c = 0; c < np; ++c) {
-              const cplx dc = b.Dsq(n, c);
-              if (dc == cplx(0.0)) continue;
+            if (n < b.np_fit) {
+              for (long c = 0; c < np; ++c) {
+                const cplx dc = b.Dsq(n, c);
+                if (dc == cplx(0.0)) continue;
+                for (long x = 0; x < nc; ++x)
+                  for (long y = 0; y < nc; ++y) F.fam(0, c, ik, x, y, r) += dc * M2c(n, x, y);
+              }
+            } else {
               for (long x = 0; x < nc; ++x)
-                for (long y = 0; y < nc; ++y) F.fam(0, c, ik, x, y, r) += dc * M2c(n, x, y);
+                for (long y = 0; y < nc; ++y) F.fam(1, n, ik, x, y, r) += M2c(n, x, y);
             }
           }
           if (any3) {
@@ -764,10 +1353,14 @@ namespace dynbse {
    * Returns the maximal refit error of the tau products.
    */
   inline double kd_apply(freq_basis const &b, pair_rung const &R, tf_vector const &F,
-                         nda::array<cplx, 4> const &Fsum, tf_vector &y) {
+                         nda::array<cplx, 4> const &Fsum, tf_vector &y, cplx inu = cplx(0.0)) {
     const long np = b.np, nt = b.nt, nk = F.nk, nc = F.nc, nc2 = nc * nc, nR = F.nR;
     y.zero();
-    const long nfam = 2;
+    const bool nu0 = (inu == cplx(0.0));
+    // inu = 0: family 1 (U_a^2 at the union's G nodes, kernel KF2) is an ordinary fermionic
+    // function -> its tau values join family 0's and ONE refit (into family 0) follows;
+    // inu != 0: family 1 = the twisted pairs (kernel K_F, the phi_nu factor rides along) -> its own refit.
+    const long nfam = nu0 ? 1 : 2;
     // tau values of each family: (nt, nk, nc2, nR)
     nda::array<cplx, 4> Fs(nt, nk, nc2, nR), Ys(nt, nk, nc2, nR);
     nda::array<cplx, 1> v(nc2), w(nc2);
@@ -776,16 +1369,17 @@ namespace dynbse {
       Fs() = cplx(0.0);
       for (long ik = 0; ik < nk; ++ik)
         for (long r = 0; r < nR; ++r)
-          for (long a = 0; a < np; ++a) {
-            pack_pair(F.fam(fam, a, ik, nda::range::all, nda::range::all, r), nc, v);
-            bool anyv = false;
-            for (auto const &x : v) anyv = anyv or (x != cplx(0.0));
-            if (not anyv) continue;
-            for (long i = 0; i < nt; ++i) {
-              const double kf = b.KF(i, a);
-              for (long p = 0; p < nc2; ++p) Fs(i, ik, p, r) += kf * v(p);
+          for (long ff = fam; ff < (nu0 ? 2 : fam + 1); ++ff)
+            for (long a = 0; a < np; ++a) {
+              pack_pair(F.fam(ff, a, ik, nda::range::all, nda::range::all, r), nc, v);
+              bool anyv = false;
+              for (auto const &x : v) anyv = anyv or (x != cplx(0.0));
+              if (not anyv) continue;
+              for (long i = 0; i < nt; ++i) {
+                const double kf = (ff == 1 and nu0) ? b.KF2(i, a) : b.KF(i, a);
+                for (long p = 0; p < nc2; ++p) Fs(i, ik, p, r) += kf * v(p);
+              }
             }
-          }
       // the rung product on the tau grid, summed over k'
       Ys() = cplx(0.0);
       for (long ik = 0; ik < nk; ++ik)
@@ -827,6 +1421,94 @@ namespace dynbse {
         }
       }
     return fit_err;
+  }
+
+  /**
+   * The PHYSICAL (tau-value) inner product on the vertex-grid functions: <u, v> = sum over
+   * (family, k, pair, column) of the tau-grid dot product of the functions the coefficients
+   * represent, G_ab = sum_i K_F(s_i, e_a) K_F(s_i, e_b) (a, b < np_fit; the union's G nodes carry no
+   * iterate content). The coefficient inner product is blind to the near-confluent pairs whose
+   * coefficients grow with every L0 application while their values cancel; in the tau metric the
+   * Arnoldi process and the residual see the functions (measured on lih222 at the first bosonic
+   * node: coefficient-norm Ritz 2.6 and a stalled GMRES, physical readouts continuous in nu).
+   */
+  struct tf_metric {
+    long np = 0, np_fit = 0;
+    nda::array<cplx, 2> G;         // (np, np), zero outside the np_fit block
+  };
+  inline tf_metric build_tf_metric(freq_basis const &b) {
+    tf_metric m;
+    m.np = b.np; m.np_fit = b.np_fit;
+    m.G = nda::array<cplx, 2>(b.np, b.np);
+    m.G() = cplx(0.0);
+    double gmax = 0.0;
+    for (long a = 0; a < b.np_fit; ++a)
+      for (long c = 0; c < b.np_fit; ++c) {
+        double acc = 0.0;
+        for (long i = 0; i < b.nt; ++i) acc += b.KF(i, a) * b.KF(i, c);
+        m.G(a, c) = cplx(acc);
+        gmax = std::max(gmax, std::abs(acc));
+      }
+    // normalized so that a unit coefficient on the largest-norm node has unit norm
+    if (gmax > 0.0) m.G() /= cplx(gmax);
+    return m;
+  }
+
+  /** per-column inner products <a, b>_r = sum conj(a) b over (fam, node, k, pair) -- (nR);
+   *  with a metric: the tau-value inner product (family blocks through G, the constant plainly). */
+  inline void tf_dots(tf_vector const &a, tf_vector const &b, nda::array<cplx, 1> &out,
+                      tf_metric const *met = nullptr) {
+    const long nR = a.nR;
+    out() = cplx(0.0);
+    if (met != nullptr) {
+      const long np = a.np, nk = a.nk, nc = a.nc, nrest = nk * nc * nc * nR;
+      utils::check(met->np == np, "dynbse::tf_dots: metric size mismatch.");
+      // Gb(fam) = G . b(fam) as (np, nrest) gemm, then sum conj(a) Gb per column
+      nda::array<cplx, 2> Gb(np, nrest), bc(np, nrest);
+      for (long fam = 0; fam < 2; ++fam) {
+        auto bv = nda::reshape(b.fam(fam, nda::ellipsis{}), std::array<long, 2>{np, nrest});
+        bc() = bv;
+        nda::blas::gemm(met->G, bc, Gb);
+        auto av = nda::reshape(a.fam(fam, nda::ellipsis{}), std::array<long, 2>{np, nrest});
+        for (long p = 0; p < np; ++p)
+          for (long i = 0; i < nrest; ++i) out(i % nR) += std::conj(av(p, i)) * Gb(p, i);
+      }
+      const cplx *pa = a.cst.data(); const cplx *pb = b.cst.data();
+      const long ncst = long(a.cst.size()) / nR;
+      for (long i = 0; i < ncst; ++i)
+        for (long r = 0; r < nR; ++r) out(r) += std::conj(pa[i * nR + r]) * pb[i * nR + r];
+      return;
+    }
+    const long nfam = a.fam.shape(0) * a.fam.shape(1) * a.fam.shape(2) * a.fam.shape(3) * a.fam.shape(4);
+    const long ncst = a.cst.shape(0) * a.cst.shape(1) * a.cst.shape(2);
+    const cplx *pa = a.fam.data(), *pb = b.fam.data();
+    for (long i = 0; i < nfam; ++i)
+      for (long r = 0; r < nR; ++r) out(r) += std::conj(pa[i * nR + r]) * pb[i * nR + r];
+    pa = a.cst.data(); pb = b.cst.data();
+    for (long i = 0; i < ncst; ++i)
+      for (long r = 0; r < nR; ++r) out(r) += std::conj(pa[i * nR + r]) * pb[i * nR + r];
+  }
+  /** y += alpha_r x (per column) */
+  inline void tf_axpy(nda::array<cplx, 1> const &alpha, tf_vector const &x, tf_vector &y) {
+    const long nR = x.nR;
+    const long nfam = long(x.fam.size()) / nR, ncst = long(x.cst.size()) / nR;
+    cplx *py = y.fam.data(); const cplx *px = x.fam.data();
+    for (long i = 0; i < nfam; ++i)
+      for (long r = 0; r < nR; ++r) py[i * nR + r] += alpha(r) * px[i * nR + r];
+    py = y.cst.data(); px = x.cst.data();
+    for (long i = 0; i < ncst; ++i)
+      for (long r = 0; r < nR; ++r) py[i * nR + r] += alpha(r) * px[i * nR + r];
+  }
+  /** x *= s_r per column */
+  inline void tf_scale(nda::array<cplx, 1> const &sc, tf_vector &x) {
+    const long nR = x.nR;
+    const long nfam = long(x.fam.size()) / nR, ncst = long(x.cst.size()) / nR;
+    cplx *px = x.fam.data();
+    for (long i = 0; i < nfam; ++i)
+      for (long r = 0; r < nR; ++r) px[i * nR + r] *= sc(r);
+    px = x.cst.data();
+    for (long i = 0; i < ncst; ++i)
+      for (long r = 0; r < nR; ++r) px[i * nR + r] *= sc(r);
   }
 
   // ==================================================================================
@@ -925,7 +1607,7 @@ namespace dynbse {
   inline void ls_apply(freq_basis const &b, pair_poles const &P, static_resolvent const &S, cplx inu,
                        bool shared, nda::array<cplx, 4> const &Dc, tf_vector const &y,
                        tf_vector &Gamma, nda::array<cplx, 4> &Gsum,
-                       nda::array<cplx, 3> const *Cb_cst = nullptr) {
+                       nda::array<cplx, 3> const *Cb_cst = nullptr, shift_tables const *st = nullptr) {
     decltype(nda::range::all) all;
     const long nk = P.nk, nc = P.nc, nc2 = nc * nc, nR = y.nR, D = S.D;
     tf_vector X(b.np, nk, nc, nR);
@@ -933,7 +1615,7 @@ namespace dynbse {
     X.cst() = Dc + y.cst;
     tf_vector F(b.np, nk, nc, nR);
     nda::array<cplx, 4> Fsum(nk, nc, nc, nR);
-    l0_apply(b, P, inu, shared, X, F, Fsum, Cb_cst);
+    l0_apply(b, P, inu, shared, X, F, Fsum, Cb_cst, st);
     // c = T_s Fsum  (D x nR)
     nda::array<cplx, 2> fs(D, nR), cs(D, nR), cb(D, nR);
     for (long ik = 0; ik < nk; ++ik)
@@ -947,7 +1629,7 @@ namespace dynbse {
         for (long r = 0; r < nR; ++r) Xc.cst(ik, p / nc, p % nc, r) = cs(ik * nc2 + p, r);
     tf_vector F2(b.np, nk, nc, nR);
     nda::array<cplx, 4> F2sum(nk, nc, nc, nR);
-    l0_apply(b, P, inu, shared, Xc, F2, F2sum, Cb_cst);
+    l0_apply(b, P, inu, shared, Xc, F2, F2sum, Cb_cst, st);
     Gamma.fam() = F.fam + F2.fam;
     Gamma.cst() = cplx(0.0);
     for (long ik = 0; ik < nk; ++ik)
@@ -960,6 +1642,7 @@ namespace dynbse {
   struct dyson_result {
     long iterations = 0;
     bool converged = false;
+    bool stagnated = false;        // the residual stopped decreasing (the tau-refit floor): stopped early
     double contraction = -1.0;     // last |dy_n|/|dy_{n-1}| (before the tolerance was met)
     double residual = -1.0;        // last |dy|/|y|
     std::vector<double> history;   // |dy|/|y| per iteration
@@ -984,7 +1667,8 @@ namespace dynbse {
   inline dyson_result solve_dyson_op(freq_basis const &b, pair_poles const &P, KdOp &&kd,
                                      static_resolvent const &S, cplx inu, bool shared,
                                      nda::array<cplx, 4> const &Dc, double tol, long maxit,
-                                     bool anderson = true, nda::array<cplx, 3> const *Cb_cst = nullptr) {
+                                     bool anderson = true, nda::array<cplx, 3> const *Cb_cst = nullptr,
+                                     shift_tables const *st = nullptr, tf_metric const *metric = nullptr) {
     const long nk = P.nk, nc = P.nc, nR = Dc.shape(3), np = b.np;
     dyson_result out;
     out.Gsum = nda::array<cplx, 4>(nk, nc, nc, nR);
@@ -995,7 +1679,7 @@ namespace dynbse {
     nda::array<cplx, 4> Gsum(nk, nc, nc, nR);
     double dprev = -1.0;
     for (long it = 0; it <= maxit; ++it) {
-      ls_apply(b, P, S, inu, shared, Dc, y, Gamma, Gsum, Cb_cst);
+      ls_apply(b, P, S, inu, shared, Dc, y, Gamma, Gsum, Cb_cst, st);
       if (it == 0) out.Gsum0 = Gsum;
       if (it == 1) out.Gsum1 = Gsum;
       out.Gsum = Gsum;
@@ -1003,20 +1687,43 @@ namespace dynbse {
       if (it == maxit) break;
       const double fe = kd(Gamma, Gsum, ynew);
       out.fit_err_max = std::max(out.fit_err_max, fe);
-      // convergence on the update
+      // convergence on the update (the tau metric when given)
       double d2 = 0.0, n2 = 0.0;
-      for (long i = 0; i < long(ynew.fam.size()); ++i) {
-        const cplx dv = ynew.fam.data()[i] - y.fam.data()[i];
-        d2 += std::norm(dv); n2 += std::norm(ynew.fam.data()[i]);
-      }
-      for (long i = 0; i < long(ynew.cst.size()); ++i) {
-        const cplx dv = ynew.cst.data()[i] - y.cst.data()[i];
-        d2 += std::norm(dv); n2 += std::norm(ynew.cst.data()[i]);
+      if (metric != nullptr) {
+        tf_vector dy(np, nk, nc, nR);
+        dy.fam() = ynew.fam - y.fam;
+        dy.cst() = ynew.cst - y.cst;
+        nda::array<cplx, 1> dd(nR), nn(nR);
+        tf_dots(dy, dy, dd, metric);
+        tf_dots(ynew, ynew, nn, metric);
+        for (long r = 0; r < nR; ++r) { d2 += std::real(dd(r)); n2 += std::real(nn(r)); }
+      } else {
+        for (long i = 0; i < long(ynew.fam.size()); ++i) {
+          const cplx dv = ynew.fam.data()[i] - y.fam.data()[i];
+          d2 += std::norm(dv); n2 += std::norm(ynew.fam.data()[i]);
+        }
+        for (long i = 0; i < long(ynew.cst.size()); ++i) {
+          const cplx dv = ynew.cst.data()[i] - y.cst.data()[i];
+          d2 += std::norm(dv); n2 += std::norm(ynew.cst.data()[i]);
+        }
       }
       const double d = std::sqrt(d2), n = std::sqrt(std::max(n2, 1e-300));
       out.residual = d / n;
       out.history.push_back(out.residual);
       if (dprev > 0.0) out.contraction = d / dprev;
+      // stagnation: three consecutive iterations without a 30% decrease -> the refit floor
+      {
+        const auto &h = out.history;
+        const size_t m_ = h.size();
+        if (m_ >= 4 and h[m_ - 1] > 0.7 * h[m_ - 2] and h[m_ - 2] > 0.7 * h[m_ - 3] and h[m_ - 3] > 0.7 * h[m_ - 4]
+            and h[m_ - 1] < 1e-3) {
+          out.stagnated = true;
+          ls_apply(b, P, S, inu, shared, Dc, ynew, Gamma, Gsum, Cb_cst, st);
+          out.Gsum = Gsum;
+          out.iterations = it + 1;
+          break;
+        }
+      }
       // Anderson(2): x_{n+1} = ynew - theta (ynew - ynew_prev), theta from the secular equation
       if (anderson and it >= 1) {
         // r_n = ynew - y (the fixed-point residual at y), r_{n-1} = ynew_prev - yprev
@@ -1046,7 +1753,7 @@ namespace dynbse {
       dprev = d;
       if (out.residual <= tol) {
         // one more L_s application on the converged y gives the final Gamma
-        ls_apply(b, P, S, inu, shared, Dc, y, Gamma, Gsum, Cb_cst);
+        ls_apply(b, P, S, inu, shared, Dc, y, Gamma, Gsum, Cb_cst, st);
         out.Gsum = Gsum;
         out.iterations = it + 1;
         out.converged = true;
@@ -1059,53 +1766,17 @@ namespace dynbse {
   inline dyson_result solve_dyson(freq_basis const &b, pair_poles const &P, pair_rung const &R,
                                   static_resolvent const &S, cplx inu, bool shared,
                                   nda::array<cplx, 4> const &Dc, double tol, long maxit,
-                                  bool anderson = true) {
+                                  bool anderson = true, shift_tables const *st = nullptr) {
     auto kd = [&](tf_vector const &F, nda::array<cplx, 4> const &Fsum, tf_vector &y) {
-      return kd_apply(b, R, F, Fsum, y);
+      return kd_apply(b, R, F, Fsum, y, inu);
     };
-    return solve_dyson_op(b, P, kd, S, inu, shared, Dc, tol, maxit, anderson, nullptr);
+    return solve_dyson_op(b, P, kd, S, inu, shared, Dc, tol, maxit, anderson, nullptr, st);
   }
 
 
   // ==================================================================================
   // GMRES(m) ON THE DYNAMIC REMAINDER, batched over the right-hand-side columns
   // ==================================================================================
-
-  /** per-column inner products <a, b>_r = sum conj(a) b over (fam, node, k, pair) -- (nR) */
-  inline void tf_dots(tf_vector const &a, tf_vector const &b, nda::array<cplx, 1> &out) {
-    const long nR = a.nR;
-    out() = cplx(0.0);
-    const long nfam = a.fam.shape(0) * a.fam.shape(1) * a.fam.shape(2) * a.fam.shape(3) * a.fam.shape(4);
-    const long ncst = a.cst.shape(0) * a.cst.shape(1) * a.cst.shape(2);
-    const cplx *pa = a.fam.data(), *pb = b.fam.data();
-    for (long i = 0; i < nfam; ++i)
-      for (long r = 0; r < nR; ++r) out(r) += std::conj(pa[i * nR + r]) * pb[i * nR + r];
-    pa = a.cst.data(); pb = b.cst.data();
-    for (long i = 0; i < ncst; ++i)
-      for (long r = 0; r < nR; ++r) out(r) += std::conj(pa[i * nR + r]) * pb[i * nR + r];
-  }
-  /** y += alpha_r x (per column) */
-  inline void tf_axpy(nda::array<cplx, 1> const &alpha, tf_vector const &x, tf_vector &y) {
-    const long nR = x.nR;
-    const long nfam = long(x.fam.size()) / nR, ncst = long(x.cst.size()) / nR;
-    cplx *py = y.fam.data(); const cplx *px = x.fam.data();
-    for (long i = 0; i < nfam; ++i)
-      for (long r = 0; r < nR; ++r) py[i * nR + r] += alpha(r) * px[i * nR + r];
-    py = y.cst.data(); px = x.cst.data();
-    for (long i = 0; i < ncst; ++i)
-      for (long r = 0; r < nR; ++r) py[i * nR + r] += alpha(r) * px[i * nR + r];
-  }
-  /** x *= s_r per column */
-  inline void tf_scale(nda::array<cplx, 1> const &sc, tf_vector &x) {
-    const long nR = x.nR;
-    const long nfam = long(x.fam.size()) / nR, ncst = long(x.cst.size()) / nR;
-    cplx *px = x.fam.data();
-    for (long i = 0; i < nfam; ++i)
-      for (long r = 0; r < nR; ++r) px[i * nR + r] *= sc(r);
-    px = x.cst.data();
-    for (long i = 0; i < ncst; ++i)
-      for (long r = 0; r < nR; ++r) px[i * nR + r] *= sc(r);
-  }
 
   /**
    * Restarted GMRES(m) on (1 - K_d L_s) y = K_d L_s D, every right-hand-side column solved with its
@@ -1119,7 +1790,8 @@ namespace dynbse {
   inline dyson_result solve_dyson_gmres(freq_basis const &b, pair_poles const &P, KdOp &&kd,
                                         static_resolvent const &S, cplx inu, bool shared,
                                         nda::array<cplx, 4> const &Dc, double tol, long maxit, long m,
-                                        nda::array<cplx, 3> const *Cb_cst = nullptr) {
+                                        nda::array<cplx, 3> const *Cb_cst = nullptr, shift_tables const *st = nullptr,
+                                        tf_metric const *metric = nullptr) {
     const long nk = P.nk, nc = P.nc, nR = Dc.shape(3), np = b.np;
     utils::check(m >= 1, "dynbse::solve_dyson_gmres: m >= 1.");
     dyson_result out;
@@ -1131,20 +1803,20 @@ namespace dynbse {
     tf_vector y(np, nk, nc, nR), Gamma(np, nk, nc, nR), rhs(np, nk, nc, nR), w(np, nk, nc, nR), r(np, nk, nc, nR);
     // the operator: A v = v - K_d L_s v   (L_s v with a zero external leg)
     auto apply_A = [&](tf_vector const &v, tf_vector &Av) {
-      ls_apply(b, P, S, inu, shared, Dzero, v, Gamma, Gsum, Cb_cst);
+      ls_apply(b, P, S, inu, shared, Dzero, v, Gamma, Gsum, Cb_cst, st);
       const double fe = kd(Gamma, Gsum, Av);
       out.fit_err_max = std::max(out.fit_err_max, fe);
       Av.fam() = v.fam - Av.fam;
       Av.cst() = v.cst - Av.cst;
     };
     // rhs = K_d L_s D ; the static limit and the first iterate
-    ls_apply(b, P, S, inu, shared, Dc, y, Gamma, Gsum, Cb_cst);
+    ls_apply(b, P, S, inu, shared, Dc, y, Gamma, Gsum, Cb_cst, st);
     out.Gsum0 = Gsum;
     out.fit_err_max = std::max(out.fit_err_max, kd(Gamma, Gsum, rhs));
-    ls_apply(b, P, S, inu, shared, Dc, rhs, Gamma, Gsum, Cb_cst);
+    ls_apply(b, P, S, inu, shared, Dc, rhs, Gamma, Gsum, Cb_cst, st);
     out.Gsum1 = Gsum;
     nda::array<cplx, 1> rhs_norm2(nR), dots(nR), sc(nR);
-    tf_dots(rhs, rhs, rhs_norm2);
+    tf_dots(rhs, rhs, rhs_norm2, metric);
     std::vector<tf_vector> V;
     V.reserve(size_t(m + 1));
     for (long j = 0; j <= m; ++j) V.emplace_back(np, nk, nc, nR);
@@ -1159,7 +1831,7 @@ namespace dynbse {
       apply_A(y, w);
       r.fam() = rhs.fam - w.fam;
       r.cst() = rhs.cst - w.cst;
-      tf_dots(r, r, dots);
+      tf_dots(r, r, dots, metric);
       double rel = 0.0;
       for (long c = 0; c < nR; ++c) {
         beta(c) = cplx(std::sqrt(std::real(dots(c))));
@@ -1169,6 +1841,15 @@ namespace dynbse {
       out.residual = rel;
       out.history.push_back(rel);
       if (rel <= tol) { done = true; break; }
+      // stagnation: two consecutive cycles without a 30% decrease (below 1e-3) -> the refit floor
+      {
+        const auto &h = out.history;
+        const size_t m_ = h.size();
+        if (m_ >= 3 and h[m_ - 1] > 0.7 * h[m_ - 2] and h[m_ - 2] > 0.7 * h[m_ - 3] and h[m_ - 1] < 1e-3) {
+          out.stagnated = true;
+          break;
+        }
+      }
       for (long c = 0; c < nR; ++c) sc(c) = (std::real(beta(c)) > 0.0) ? cplx(1.0) / beta(c) : cplx(0.0);
       V[0].fam() = r.fam; V[0].cst() = r.cst;
       tf_scale(sc, V[0]);
@@ -1178,11 +1859,11 @@ namespace dynbse {
         apply_A(V[size_t(j)], w);
         ++it;
         for (long i = 0; i <= j; ++i) {
-          tf_dots(V[size_t(i)], w, dots);
+          tf_dots(V[size_t(i)], w, dots, metric);
           for (long c = 0; c < nR; ++c) { H(i, j, c) = dots(c); sc(c) = -dots(c); }
           tf_axpy(sc, V[size_t(i)], w);
         }
-        tf_dots(w, w, dots);
+        tf_dots(w, w, dots, metric);
         for (long c = 0; c < nR; ++c) {
           const double hn = std::sqrt(std::max(std::real(dots(c)), 0.0));
           H(j + 1, j, c) = cplx(hn);
@@ -1269,7 +1950,7 @@ namespace dynbse {
     }
     out.iterations = it;
     out.converged = done;
-    ls_apply(b, P, S, inu, shared, Dc, y, Gamma, Gsum, Cb_cst);
+    ls_apply(b, P, S, inu, shared, Dc, y, Gamma, Gsum, Cb_cst, st);
     out.Gsum = Gsum;
     return out;
   }

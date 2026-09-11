@@ -25,6 +25,7 @@
 #undef NDEBUG
 
 #include <cmath>
+#include <optional>
 #include <cstdio>
 #include <string>
 #include <complex>
@@ -370,17 +371,48 @@ namespace bdft_tests {
   struct solver_out {
     nda::array<cplx, 2> P, P0, P1;
     db::dyson_result res;
-    double dsq_err = 0.0;
+    double dsq_err = 0.0, shift_fit_err = 0.0;
   };
 
   inline solver_out run_solver(dyn_toy const &T, imag_axes_ft::IAFT const &ft, cplx inu,
-                               bool fitted, double tol, long maxit, long gmres_m = 0) {
+                               int fitted, double tol, long maxit, long gmres_m = 0, int table_mode = 0) {
     solver_out o;
     auto b = db::build_freq_basis(ft);
     o.dsq_err = b.dsq_fit_err;
     const long nk = T.nk, nc = T.nc, nc2 = T.nc2, nt = b.nt;
     db::pair_poles P;
-    if (not fitted) {
+    if (fitted == 2) {
+      // the PRODUCTION union scheme: G refit on the half-spacing-shifted grid (no node coincides
+      // with a vertex node), the basis extended by those nodes
+      const long np_fit = b.np;
+      auto gnodes = db::shifted_nodes(b);
+      db::node_pole_fit npf;
+      npf.build(T.beta, b.s, gnodes, 1e-8);
+      const long ng = gnodes.shape(0);
+      nda::array<cplx, 4> gk(ng, nk, nc, nc), gkq(ng, nk, nc, nc);
+      double fe = 0.0;
+      for (long k = 0; k < nk; ++k) {
+        nda::array<cplx, 2> F(nt, nc * nc);
+        F() = cplx(0.0);
+        auto const &tk = T.t[size_t(k)];
+        for (long i = 0; i < nt; ++i)
+          for (long j = 0; j < tk.ng; ++j) {
+            const double K = imag_axes_ft::dlr_kF(T.beta, b.s(i), tk.lam(j));
+            for (long a = 0; a < nc; ++a)
+              for (long bb = 0; bb < nc; ++bb) F(i, a * nc + bb) += tk.g(j, a, bb) * K;
+          }
+        auto c = npf.coeffs(F);
+        fe = std::max(fe, npf.fit_error(F, c));
+        for (long p = 0; p < ng; ++p)
+          for (long a = 0; a < nc; ++a)
+            for (long bb = 0; bb < nc; ++bb) gk(p, k, a, bb) = c(p, a * nc + bb);
+      }
+      app_log(1, "dynbse union/fitted: G refit on {} shifted nodes, fit_error {:.3e}, kept {} of {} (s_min/s_max {:.2e})",
+              ng, fe, npf.n_kept, ng, npf.s_min_kept / npf.s_max);
+      for (long k = 0; k < nk; ++k) gkq(all_, k, all_, all_) = gk(all_, T.kpq[size_t(k)], all_, all_);
+      db::extend_freq_basis(b, gnodes);
+      P = db::make_pair_poles(T.beta, gnodes, gk, gkq, np_fit);
+    } else if (fitted == 0) {
       // the union of the two toys' exact poles (zero residues cross-wise), appended to the
       // vertex node set (union basis: the refit still targets the DLR part)
       auto set = assemble({T.t[0], T.t[1]});
@@ -434,14 +466,22 @@ namespace bdft_tests {
       }
       R.K0(iq, all_, all_) = T.Z(iq, all_, all_) + R.Wd0(iq, all_, all_);
     }
-    auto S = db::build_static_resolvent(b, P, R, inu, fitted);
+    const bool shared = (fitted == 1);
+    auto S = db::build_static_resolvent(b, P, R, inu, shared);
+    std::optional<db::shift_tables> stab;
+    db::shift_tables const *stp = nullptr;
+    if (inu != cplx(0.0)) {
+      stab.emplace(db::build_shift_tables(b, inu, 1e-11, table_mode));
+      stp = std::addressof(stab.value());
+      o.shift_fit_err = stab->fit_err;
+    }
     if (gmres_m > 0) {
       auto kd = [&](db::tf_vector const &F, nda::array<cplx, 4> const &Fsum, db::tf_vector &y) {
-        return db::kd_apply(b, R, F, Fsum, y);
+        return db::kd_apply(b, R, F, Fsum, y, inu);
       };
-      o.res = db::solve_dyson_gmres(b, P, kd, S, inu, fitted, T.Dc, tol, maxit, gmres_m, nullptr);
+      o.res = db::solve_dyson_gmres(b, P, kd, S, inu, shared, T.Dc, tol, maxit, gmres_m, nullptr, stp);
     } else
-      o.res = db::solve_dyson(b, P, R, S, inu, fitted, T.Dc, tol, maxit, false);
+      o.res = db::solve_dyson(b, P, R, S, inu, shared, T.Dc, tol, maxit, false, stp);
     o.P = db::collapse(T.Dc, o.res.Gsum);
     o.P0 = db::collapse(T.Dc, o.res.Gsum0);
     o.P1 = db::collapse(T.Dc, o.res.Gsum1);
@@ -497,10 +537,11 @@ namespace bdft_tests {
       const long np = b.np;
       auto P = db::make_pair_poles(beta, set.epsG, gk, gkq, np_fit);
       const bool nu0 = (inu == cplx(0.0));
+      // family 1 is the twisted pair T_c = U_c S_c at inu != 0 (D2e); at inu = 0 the families coincide
       auto eval_tf = [&](db::tf_vector const &V, long k, cplx z, long r, nda::array<cplx, 2> &out) {
         out() = cplx(0.0);
         for (long c = 0; c < np; ++c) {
-          const cplx u = 1.0 / (z - b.eps(c)), sh = nu0 ? u : 1.0 / (z + inu - b.eps(c));
+          const cplx u = 1.0 / (z - b.eps(c)), sh = nu0 ? u : u / (z + inu - b.eps(c));
           for (long i = 0; i < nc; ++i)
             for (long jj = 0; jj < nc; ++jj)
               out(i, jj) += V.fam(0, c, k, i, jj, r) * u + V.fam(1, c, k, i, jj, r) * sh;
@@ -514,7 +555,11 @@ namespace bdft_tests {
       X.fam(0, 3, 0, 0, 1, 0) = cplx(1.0);
       X.fam(1, 7, 1, 1, 0, 0) = cplx(0.7, -0.2);
       X.cst(0, 1, 1, 0) = cplx(0.3);
-      db::l0_apply(b, P, inu, false, X, F, Fsum);
+      std::optional<db::shift_tables> stL;
+      db::shift_tables const *stLp = nullptr;
+      if (not nu0) { stL.emplace(db::build_shift_tables(b, inu)); stLp = std::addressof(stL.value()); }
+      if (stLp) app_log(1, "dynbse shift tables (inu = {:.3f}i): fit err {:.3e}, kept condition {:.3e}", inu.imag(), stLp->fit_err, stLp->cond_kept);
+      db::l0_apply(b, P, inu, false, X, F, Fsum, nullptr, stLp);
       double errL = 0.0, scL = 0.0;
       for (long k = 0; k < nk; ++k)
         for (long n : {0l, 3l, 17l, -6l}) {
@@ -573,7 +618,7 @@ namespace bdft_tests {
       nda::array<cplx, 4> Fs(nk, nc, nc, 1);
       Fs() = cplx(0.0);
       Fs(0, 0, 1, 0) = cplx(b.fd[size_t(ia)].f - b.fd[size_t(ib)].f);
-      const double fe = db::kd_apply(b, R, Fin, Fs, y);
+      const double fe = db::kd_apply(b, R, Fin, Fs, y, inu);
       double errK = 0.0, scK = 0.0;
       for (long k = 0; k < nk; ++k)
         for (long n : {0l, 3l, 17l, -6l}) {
@@ -616,12 +661,52 @@ namespace bdft_tests {
           // no components on the union extension (the exact G poles): a physical vector never
           // carries them (the refit targets the DLR part), and a confluent product there has no table
           for (long a = bb.np_fit; a < npp; ++a) Xr.fam(all_, a, all_, all_, all_, all_) = cplx(0.0);
-          db::l0_apply_ref(bb, PP, inu, sh, Xr, Fa, Sa);
-          db::l0_apply(bb, PP, inu, sh, Xr, Fb, Sb);
+          std::optional<db::shift_tables> stG;
+          db::shift_tables const *stGp = nullptr;
+          if (not nu0) { stG.emplace(db::build_shift_tables(bb, inu)); stGp = std::addressof(stG.value()); }
+          // the reference is in the {U, S} basis: at inu != 0 its family-1 input means S_a, the
+          // grouped code's means T_a = U_a S_a -- feed the reference the SAME FUNCTION by
+          // converting T -> S: T_a = [U_a - S_a]/(i nu)  =>  x^T T_a = (x^T/(i nu)) U_a - (x^T/(i nu)) S_a
+          db::tf_vector Xs(npp, nk, nc, 3);
+          Xs.cst() = Xr.cst;
+          Xs.fam() = Xr.fam;
+          if (not nu0) {
+            for (long a = 0; a < npp; ++a)
+              for (long k = 0; k < nk; ++k)
+                for (long x = 0; x < nc; ++x)
+                  for (long y = 0; y < nc; ++y)
+                    for (long rr = 0; rr < 3; ++rr) {
+                      const cplx t = Xr.fam(1, a, k, x, y, rr) / inu;
+                      Xs.fam(0, a, k, x, y, rr) = Xr.fam(0, a, k, x, y, rr) + t;
+                      Xs.fam(1, a, k, x, y, rr) = -t;
+                    }
+          }
+          db::l0_apply_ref(bb, PP, inu, sh, Xs, Fa, Sa);
+          db::l0_apply(bb, PP, inu, sh, Xr, Fb, Sb, nullptr, stGp);
           double df = 0.0, sf = 0.0, ds = 0.0, ss = 0.0;
-          for (long i = 0; i < long(Fa.fam.size()); ++i) {
-            df = std::max(df, std::abs(Fa.fam.data()[i] - Fb.fam.data()[i]));
-            sf = std::max(sf, std::abs(Fa.fam.data()[i]));
+          if (nu0) {
+            for (long i = 0; i < long(Fa.fam.size()); ++i) {
+              df = std::max(df, std::abs(Fa.fam.data()[i] - Fb.fam.data()[i]));
+              sf = std::max(sf, std::abs(Fa.fam.data()[i]));
+            }
+          } else {
+            // pointwise values at a few fermionic frequencies (each output in its own basis)
+            for (long k = 0; k < nk; ++k)
+              for (long n : {0l, 2l, 9l, -5l, 40l})
+                for (long rr = 0; rr < 3; ++rr) {
+                  const cplx z = I_ * cplx((2.0 * n + 1.0) * M_PI / beta);
+                  for (long x = 0; x < nc; ++x)
+                    for (long y = 0; y < nc; ++y) {
+                      cplx va(0.0), vb(0.0);
+                      for (long c = 0; c < npp; ++c) {
+                        const cplx u = 1.0 / (z - bb.eps(c)), sS = 1.0 / (z + inu - bb.eps(c));
+                        va += Fa.fam(0, c, k, x, y, rr) * u + Fa.fam(1, c, k, x, y, rr) * sS;
+                        vb += Fb.fam(0, c, k, x, y, rr) * u + Fb.fam(1, c, k, x, y, rr) * u * sS;
+                      }
+                      df = std::max(df, std::abs(va - vb));
+                      sf = std::max(sf, std::abs(va));
+                    }
+                }
           }
           for (long i = 0; i < long(Sa.size()); ++i) {
             ds = std::max(ds, std::abs(Sa.data()[i] - Sb.data()[i]));
@@ -642,14 +727,14 @@ namespace bdft_tests {
               }
           db::tf_vector Fc(npp, nk, nc, 3);
           nda::array<cplx, 4> Sc(nk, nc, nc, 3);
-          db::l0_apply(bb, PP, inu, sh, Xr, Fc, Sc, &Cbk);
+          db::l0_apply(bb, PP, inu, sh, Xr, Fc, Sc, &Cbk, stGp);
           double dc = 0.0, dfc = 0.0;
           for (long i = 0; i < long(Sa.size()); ++i) dc = std::max(dc, std::abs(Sa.data()[i] - Sc.data()[i]));
           for (long i = 0; i < long(Fa.fam.size()); ++i) dfc = std::max(dfc, std::abs(Fb.fam.data()[i] - Fc.fam.data()[i]));
           app_log(1, "dynbse (G) inu = {:.3f}i [{}]: grouped vs ref |dF| {:.3e} (scale {:.3e}), |dFsum| {:.3e} "
                      "(scale {:.3e}); with Cb_cst: |dFsum| {:.3e}, |dF| {:.3e}", inu.imag(), tag, df, sf, ds, ss, dc, dfc);
-          REQUIRE(df < 1e-11 * sf);
-          REQUIRE(ds < 1e-11 * std::max(ss, 1e-3));
+          REQUIRE(df < (nu0 ? 1e-11 : 1e-7) * sf);           // inu != 0: the tables' fit class
+          REQUIRE(ds < (nu0 ? 1e-11 : 1e-7) * std::max(ss, 1e-3));
           REQUIRE(dc < 1e-9 * std::max(ss, 1e-3));
           REQUIRE(dfc == 0.0);
         };
@@ -782,8 +867,8 @@ namespace bdft_tests {
                  "{:.3e}, refit {:.3e}; history:{}", fitted ? "shared/fitted" : "union/exact", rel_diff(so.P, Pdy),
               rel_diff(so.P1, Pdy), so.res.iterations, so.res.converged, so.res.contraction, so.res.fit_err_max, hist_of(so.res));
       app_log(1, "dynbse small-nu [{}]: GMRES(4) vs oracle {:.3e}, {} applications, converged {}, max |Ritz| {:.3e}; "
-                 "history:{}", fitted ? "shared/fitted" : "union/exact", rel_diff(sg.P, Pdy), sg.res.iterations,
-              sg.res.converged, sg.res.contraction, hist_of(sg.res));
+                 "shift-table fit {:.2e}; history:{}", fitted ? "shared/fitted" : "union/exact", rel_diff(sg.P, Pdy),
+              sg.res.iterations, sg.res.converged, sg.res.contraction, sg.shift_fit_err, hist_of(sg.res));
       // family scales of the first iterate's y: the 1/nu cancellation hazard made visible
       {
         auto b = db::build_freq_basis(ft);
@@ -827,6 +912,113 @@ namespace bdft_tests {
       }
     }
     SUCCEED("measured");
+  }
+
+
+  // ---------------------------------------------------------------------------------------
+  // (T) the twisted-pair tables: R1_j = U_j^2 S_j and R3_j = U_j^2 S_j^2 evaluated at Matsubara
+  // points from the tables vs their closed forms, at beta 10 / 100 / 1000 (nu = 2pi/beta).
+  // ---------------------------------------------------------------------------------------
+  TEST_CASE("dynbse_shift_tables", "[methods][vertex][scgwt][dynbse]") {
+    for (double beta : {10.0, 100.0, 1000.0}) {
+      imag_axes_ft::IAFT ft(beta, 8.0, imag_axes_ft::dlr_basis, "high");
+      auto b = db::build_freq_basis(ft);
+      const cplx inu = I_ * cplx(2.0 * M_PI / beta);
+      auto st = db::build_shift_tables(b, inu);
+      const long np = b.np;
+      double e1 = 0.0, e3 = 0.0, c1 = 0.0, c3 = 0.0, x1 = 0.0, x3 = 0.0;
+      long jworst1 = -1, jworst3 = -1;
+      for (long j = 0; j < np; ++j) {
+        const double ej = b.eps(j);
+        double s1 = 0.0, s3 = 0.0, d1 = 0.0, d3 = 0.0;
+        for (long n : {0l, 1l, 3l, 10l, 40l, -2l, -20l}) {
+          const cplx z = I_ * cplx((2.0 * n + 1.0) * M_PI / beta);
+          const cplx u = 1.0 / (z - ej), sS = 1.0 / (z + inu - ej);
+          const cplx r1 = u * u * sS, r3 = u * u * sS * sS;
+          cplx t1 = st.r1u(j) * u, t3 = st.r3u(j) * u + st.r3t(j) * u * sS;
+          for (long c = 0; c < np; ++c) {
+            const cplx uc = 1.0 / (z - b.eps(c)), tc = uc / (z + inu - b.eps(c));
+            t1 += st.R1U(j, c) * uc + st.R1T(j, c) * tc;
+            t3 += st.R3U(j, c) * uc + st.R3T(j, c) * tc;
+          }
+          d1 = std::max(d1, std::abs(t1 - r1)); s1 = std::max(s1, std::abs(r1));
+          d3 = std::max(d3, std::abs(t3 - r3)); s3 = std::max(s3, std::abs(r3));
+        }
+        if (d1 / s1 > e1) { e1 = d1 / s1; jworst1 = j; }
+        if (d3 / s3 > e3) { e3 = d3 / s3; jworst3 = j; }
+        for (long c = 0; c < np; ++c) {
+          c1 = std::max({c1, std::abs(st.R1U(j, c)), std::abs(st.R1T(j, c))});
+          c3 = std::max({c3, std::abs(st.R3U(j, c)), std::abs(st.R3T(j, c))});
+        }
+        x1 = std::max(x1, std::abs(st.r1u(j)));
+        x3 = std::max({x3, std::abs(st.r3u(j)), std::abs(st.r3t(j))});
+      }
+      app_log(1, "dynbse (T) beta {}: np {}, tables fit err {:.2e} (kept cond {:.2e}); R1 max rel err {:.2e} (node {} eps {:.3e}), "
+                 "R3 {:.2e} (node {} eps {:.3e}); max |exact| R1 {:.2e} R3 {:.2e}; max |fit coeff| R1 {:.2e} R3 {:.2e}",
+              beta, np, st.fit_err, st.cond_kept, e1, jworst1, b.eps(jworst1), e3, jworst3, b.eps(jworst3), x1, x3, c1, c3);
+      CHECK(e1 < 1e-6);
+      CHECK(e3 < 1e-3);      // the order-4 object at the far nodes: 8e-5 at beta 1000 (tiny in absolute terms)
+    }
+  }
+
+
+  // shared vs union at small nu WITHOUT the oracle: the union solution is the reference (it has no
+  // confluent product at all); the shared path with the fitted tables (mode 0) and with the exact
+  // 1/nu-amplified Dsq tables (mode 1).
+  TEST_CASE("dynbse_small_nu_shared", "[methods][vertex][scgwt][dynbse]") {
+    for (double beta : {100.0, 1000.0}) {
+      auto T = make_dyn_toy(0.10, 0.02);
+      T.beta = beta;
+      const cplx inu = I_ * cplx(2.0 * M_PI / beta);
+      imag_axes_ft::IAFT ft(beta, 8.0, imag_axes_ft::dlr_basis, "high");
+      auto hist_of = [](db::dyson_result const &r) {
+        std::string h;
+        for (double x : r.history) { char buf[32]; std::snprintf(buf, sizeof(buf), " %.1e", x); h += buf; }
+        return h;
+      };
+      auto su = run_solver(T, ft, inu, false, 1e-9, 40, 4, 0);
+      app_log(1, "dynbse shared-vs-union beta {}: union GMRES(4) {} applications, converged {}, Ritz {:.3e}; history:{}",
+              beta, su.res.iterations, su.res.converged, su.res.contraction, hist_of(su.res));
+      for (int mode = 0; mode < 2; ++mode) {
+        auto sg = run_solver(T, ft, inu, true, 1e-9, 40, 4, mode);
+        auto sn = run_solver(T, ft, inu, true, 1e-9, 40, 0, mode);
+        app_log(1, "dynbse shared-vs-union beta {} tables mode {} ({}): GMRES vs union {:.3e} (static {:.3e}, Gamma1 {:.3e}), "
+                   "{} applications, converged {}, stagnated {}, Ritz {:.3e}, table err {:.2e}; Neumann vs union {:.3e}, "
+                   "contraction {:.3e}; GMRES history:{}",
+                beta, mode, mode ? "exact/Dsq" : "fitted", rel_diff(sg.P, su.P), rel_diff(sg.P0, su.P0), rel_diff(sg.P1, su.P1),
+                sg.res.iterations, sg.res.converged, sg.res.stagnated, sg.res.contraction, sg.shift_fit_err,
+                rel_diff(sn.P, su.P), sn.res.contraction, hist_of(sg.res));
+      }
+    }
+    SUCCEED("measured");
+  }
+
+
+  // the PRODUCTION union scheme on the toy: G refit on the shifted grid vs the exact-pole union
+  // reference, at beta 100 / 1000 and inu = 0 / 2pi/beta (no oracle: the exact union IS the reference)
+  TEST_CASE("dynbse_union_fitted", "[methods][vertex][scgwt][dynbse]") {
+    for (double beta : {100.0, 1000.0}) {
+      auto T = make_dyn_toy(0.10, 0.02);
+      T.beta = beta;
+      imag_axes_ft::IAFT ft(beta, 8.0, imag_axes_ft::dlr_basis, "high");
+      auto hist_of = [](db::dyson_result const &r) {
+        std::string h;
+        for (double x : r.history) { char buf[32]; std::snprintf(buf, sizeof(buf), " %.1e", x); h += buf; }
+        return h;
+      };
+      for (cplx inu : {cplx(0.0), I_ * cplx(2.0 * M_PI / beta)}) {
+        auto su = run_solver(T, ft, inu, 0, 1e-9, 40, 4);
+        auto sf = run_solver(T, ft, inu, 2, 1e-9, 40, 4);
+        auto sn = run_solver(T, ft, inu, 2, 1e-9, 40, 0);
+        app_log(1, "dynbse union/fitted beta {} inu {:.4f}i: vs exact union -- static {:.3e}, Gamma1 {:.3e}, resummed "
+                   "{:.3e} (Neumann {:.3e}); GMRES {} applications, converged {}, stagnated {}, Ritz {:.3e} (exact union "
+                   "Ritz {:.3e}, {} applications); refit {:.2e}; history:{}",
+                beta, inu.imag(), rel_diff(sf.P0, su.P0), rel_diff(sf.P1, su.P1), rel_diff(sf.P, su.P), rel_diff(sn.P, su.P),
+                sf.res.iterations, sf.res.converged, sf.res.stagnated, sf.res.contraction, su.res.contraction,
+                su.res.iterations, sf.res.fit_err_max, hist_of(sf.res));
+        CHECK(rel_diff(sf.P, su.P) < 1e-5);
+      }
+    }
   }
 
 } // namespace bdft_tests

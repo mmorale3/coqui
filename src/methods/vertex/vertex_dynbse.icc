@@ -34,6 +34,8 @@
  */
 
 #include <cstdio>
+#include <cstdlib>
+#include <optional>
 #include <random>
 #include <string>
 
@@ -54,6 +56,14 @@ namespace solvers {
       bool one_rung_only = false; // T_s = 0 and one application: the pure one dynamic rung
       double sign_ks = -1.0;      // K = sign_ks * (THC rung) / nk  (-1 = the derived sign)
       bool static_only = false;   // no dynamic solve: the static column only (gate G-A)
+      bool union_nodes = false;   // G's residues on the half-spacing-SHIFTED grid (no node coincides
+                                  // with a vertex node: no confluent product, no re-expansion table;
+                                  // D2e finding) -- false = the shared aux grid with Dsq/Dcb (inu = 0 only)
+      double gap_mask = 0.0;      // union scheme: DROP the G nodes with |eps| < gap_mask (Ha, relative to
+                                  // mu = 0 of the pole variable). A gapped G has no spectral weight there;
+                                  // the DLR fit's O(1) in-gap residues (T15 lesson) otherwise feed a loop
+                                  // through the near-confluent double-pole products at inu != 0 (gain
+                                  // ~1/gap: measured Ritz 2.6 on lih222 at the first node). 0 = no mask.
     };
 
     struct dyn_meter {
@@ -157,6 +167,22 @@ namespace solvers {
       }
     }
 
+    /** the mean-field gap of the band window over the full BZ: (occupied max, empty min) from the
+     *  occupations; the pole variable is measured from mu, and for a semiconductor mu sits inside
+     *  the (wider) quasiparticle gap, so |eps| < 0.45 x this gap is spectral-weight-free. */
+    template<class MFT>
+    inline std::pair<double, double> window_mf_gap(MFT const &MF, nda::range bw) {
+      double ev = -1e300, ec = 1e300;
+      const long ns = MF->nspin(), nk = MF->nkpts();
+      for (long is = 0; is < ns; ++is)
+        for (long ik = 0; ik < nk; ++ik)
+          for (long n = bw.first(); n < bw.last(); ++n) {
+            const double e = MF->eigval(is, ik, n), o = MF->occ(is, ik, n);
+            if (o > 0.5) ev = std::max(ev, e); else ec = std::min(ec, e);
+          }
+      return {ev, ec};
+    }
+
     /** the static rung Kbig (D x D) of pair_space_ladder, nosym, for (is, iq): Kbig(ikp nc2 + (p1 nc + p3'),
      *  ik nc2 + (p1' nc + p3)) = [U1^T W0b(qx_of(ik, ikp)) U2](p1 nc + p1', p3 nc + p3'). */
     inline void build_kbig(nda::array<cplx, 4> const &Xb, nda::array<cplx, 3> const &W0b, long is, long iq,
@@ -245,19 +271,52 @@ namespace solvers {
         }
       for (auto m : nu_list) utils::check(m >= 0 and m < nw_b, "pair_space_ladder_dyn: nu index {} out of range.", m);
 
-      // ---- the vertex basis and G's residues on it --------------------------------------------
+      // ---- the vertex basis and G's residues --------------------------------------------------
       tools.init_poles();
       auto b = db::build_freq_basis(*tools.ft);
-      const long np = b.np;
-      utils::check(np == tools.np, "pair_space_ladder_dyn: vertex basis size {} != tools.np {}.", np, tools.np);
+      const long np_fit = b.np;
+      utils::check(np_fit == tools.np, "pair_space_ladder_dyn: vertex basis size {} != tools.np {}.", np_fit, tools.np);
       {
         double de = 0.0, ds = 0.0;
-        for (long p = 0; p < np; ++p) de = std::max(de, std::abs(b.eps(p) - tools.epsl(p)));
+        for (long p = 0; p < np_fit; ++p) de = std::max(de, std::abs(b.eps(p) - tools.epsl(p)));
         for (long i = 0; i < nt; ++i) ds = std::max(ds, std::abs(b.s(i) - tools.s_phys(i)));
         utils::check(de < 1e-10 and ds < 1e-10, "pair_space_ladder_dyn: vertex basis / tools grids differ ({}, {}).", de, ds);
       }
       if (met) met->dsq_err = std::max(met->dsq_err, b.dsq_fit_err);
-      nda::array<cplx, 5> gC(ns, np, nk, nc, nc);
+      // union scheme: G on the shifted grid, appended to the vertex basis (gnode0 = np_fit);
+      // shared scheme: G on the vertex grid itself (gnode0 = 0)
+      nda::array<double, 1> epsG;
+      db::node_pole_fit npf;
+      long n_masked = 0;
+      nda::array<long, 1> gmap;                 // shared + mask: the G nodes' indices in the vertex grid
+      if (opt.union_nodes) {
+        auto all_nodes = db::shifted_nodes(b);
+        std::vector<double> keep;
+        for (long j = 0; j < all_nodes.shape(0); ++j) {
+          if (std::abs(all_nodes(j)) < opt.gap_mask) { ++n_masked; continue; }
+          keep.push_back(all_nodes(j));
+        }
+        epsG = nda::array<double, 1>(long(keep.size()));
+        for (long j = 0; j < long(keep.size()); ++j) epsG(j) = keep[size_t(j)];
+        npf.build(tools.beta, b.s, epsG, 1e-8);
+        db::extend_freq_basis(b, epsG);
+      } else if (opt.gap_mask > 0.0) {
+        // the SHARED grid without its in-gap nodes: G is refit on the kept vertex nodes
+        std::vector<long> keep;
+        for (long a = 0; a < np_fit; ++a) {
+          if (std::abs(b.eps(a)) < opt.gap_mask) { ++n_masked; continue; }
+          keep.push_back(a);
+        }
+        epsG = nda::array<double, 1>(long(keep.size()));
+        gmap = nda::array<long, 1>(long(keep.size()));
+        for (long j = 0; j < long(keep.size()); ++j) { gmap(j) = keep[size_t(j)]; epsG(j) = b.eps(keep[size_t(j)]); }
+        npf.build(tools.beta, b.s, epsG, 1e-8);
+      } else {
+        epsG = b.eps;
+      }
+      const bool use_npf = opt.union_nodes or (opt.gap_mask > 0.0);
+      const long ng = epsG.shape(0), np = b.np, gnode0 = opt.union_nodes ? np_fit : 0;
+      nda::array<cplx, 5> gC(ns, ng, nk, nc, nc);
       {
         nda::array<cplx, 2> Fg(nt, nc2);
         for (long is = 0; is < ns; ++is)
@@ -265,16 +324,24 @@ namespace solvers {
             for (long i = 0; i < nt; ++i)
               for (long a = 0; a < nc; ++a)
                 for (long bb2 = 0; bb2 < nc; ++bb2) Fg(i, a * nc + bb2) = G_CC(i, is, k, a, bb2);
-            auto c = b.pf.coeffs(Fg);
+            auto c = use_npf ? npf.coeffs(Fg) : b.pf.coeffs(Fg);
             if (met) {
-              met->fit_err_G = std::max(met->fit_err_G, b.pf.fit_error(Fg, c));
-              met->rr_G = std::max(met->rr_G, b.pf.residue_ratio(Fg, c));
+              met->fit_err_G = std::max(met->fit_err_G, use_npf ? npf.fit_error(Fg, c) : b.pf.fit_error(Fg, c));
+              double cm = 0.0, fm = 0.0;
+              for (auto const &v : c) cm = std::max(cm, std::abs(v));
+              for (auto const &v : Fg) fm = std::max(fm, std::abs(v));
+              met->rr_G = std::max(met->rr_G, (fm > 0.0) ? cm / fm : 0.0);
             }
-            for (long p = 0; p < np; ++p)
+            for (long p = 0; p < ng; ++p)
               for (long a = 0; a < nc; ++a)
                 for (long bb2 = 0; bb2 < nc; ++bb2) gC(is, p, k, a, bb2) = c(p, a * nc + bb2);
           }
       }
+      if (rank == 0)
+        app_log(2, "  [dynbse] node set: {} ({} vertex nodes, {} G nodes ({} in-gap nodes masked at |eps| < {:.4f} Ha), "
+                   "{} total); G fit error {:.2e}, residue ratio {:.2f}",
+                opt.union_nodes ? "UNION (G on the shifted grid)" : "SHARED (G on the vertex grid)", np_fit, ng, n_masked, opt.gap_mask, np,
+                met ? met->fit_err_G : 0.0, met ? met->rr_G : 0.0);
       // ---- W_dyn(q', s) on the tau grid and its inu' = 0 value ---------------------------------
       // full-mesh unfold of the PH-sym half grid (the same mirror map as eval_Pi_C), then the
       // bosonic inu -> tau transform Ttw_bb (nt, nw_b); W_d(s) = W_dyn(s) (its tau form), the
@@ -318,6 +385,7 @@ namespace solvers {
       if (met) met->t_setup += watch.lap();
 
       const cplx scale_k(opt.sign_ks / double(nk), 0.0);
+      const auto metric = db::build_tf_metric(b);       // the tau-value inner product of the solves
       const long nb = std::min(Nm, 16l);
       nda::array<cplx, 2> Kbig(D, D), Ks(D, D);
       nda::array<cplx, 3> Cb_k(nk, nc2, nc2);
@@ -339,37 +407,46 @@ namespace solvers {
         Ks() = Kbig * scale_k;
         if (met) met->t_kbig += watch.lap();
         // the pair poles of this unit (shared grid: gnode identity)
-        nda::array<cplx, 4> gk(np, nk, nc, nc), gkq(np, nk, nc, nc);
+        nda::array<cplx, 4> gk(ng, nk, nc, nc), gkq(ng, nk, nc, nc);
         for (long k = 0; k < nk; ++k) {
           gk(all, k, all, all) = gC(is, all, k, all, all);
           gkq(all, k, all, all) = gC(is, all, kpq(iq, k), all, all);
         }
-        auto P = db::make_pair_poles(tools.beta, b.eps, gk, gkq, 0);
+        auto P = db::make_pair_poles(tools.beta, epsG, gk, gkq, gnode0, (gmap.size() > 0) ? &gmap : nullptr);
+        const bool shared = not opt.union_nodes;
         // the dynamic rung operator of this unit
         auto Wq_s = [&](long i) { return [&, i](long iqp) { return Wd_s(iqp, i, all, all); }; };
         auto Wq_0 = [&](long iqp) { return Wd0(iqp, all, all); };
         long kd_calls = 0;
+        cplx inu_cur(0.0);            // set per nu node below; the kd operator reads it
         auto kd = [&](db::tf_vector const &F, nda::array<cplx, 4> const &Fsum, db::tf_vector &y) {
           y.zero();
           double fe = 0.0;
+          const bool nu0 = (inu_cur == cplx(0.0));
           const bool dbg = (rank == 0 and sq == 0);
           auto nrm = [](auto const &A) { double n = 0.0; for (auto const &v : A) n += std::norm(v); return std::sqrt(n); };
           if (dbg)
             app_log(2, "  [dynbse dbg] kd call {}: |F fam0| {:.3e} |F fam1| {:.3e} |F cst| {:.3e} |Fsum| {:.3e}",
                     kd_calls, nrm(F.fam(0, nda::ellipsis{})), nrm(F.fam(1, nda::ellipsis{})), nrm(F.cst), nrm(Fsum));
-          for (long fam = 0; fam < 2; ++fam) {
+          // inu = 0: family 1 (U_j^2 at the union's G nodes, kernel KF2) joins family 0 in ONE refit;
+          // inu != 0: family 1 = the twisted pairs, its own refit (the phi_nu factor rides along)
+          const long nfam = nu0 ? 1 : 2;
+          for (long fam = 0; fam < nfam; ++fam) {
             bool anyf = false;
-            for (auto const &v : F.fam(fam, nda::ellipsis{})) { if (v != cplx(0.0)) { anyf = true; break; } }
+            for (long ff = fam; ff < (nu0 ? 2 : fam + 1) and not anyf; ++ff)
+              for (auto const &v : F.fam(ff, nda::ellipsis{})) { if (v != cplx(0.0)) { anyf = true; break; } }
             if (not anyf) continue;
-            // tau values (nt, nk, nc2, Nm) = KF (nt, np) . fam (np, nk nc2 Nm)
-            auto fam2 = nda::reshape(F.fam(fam, nda::ellipsis{}), std::array<long, 2>{np, nk * nc2 * Nm});
-            nda::array<cplx, 2> famc(np, nk * nc2 * Nm);
-            famc() = fam2;
+            // tau values (nt, nk, nc2, Nm) = KF (nt, np) . fam (np, nk nc2 Nm)   [+ KF2 . fam1 at inu = 0]
             auto Fs2 = nda::reshape(Fs, std::array<long, 2>{nt, nk * nc2 * Nm});
-            nda::array<cplx, 2> KFc(nt, np);
-            for (long i = 0; i < nt; ++i)
-              for (long p = 0; p < np; ++p) KFc(i, p) = cplx(b.KF(i, p));
-            nda::blas::gemm(KFc, famc, Fs2);
+            Fs2() = cplx(0.0);
+            nda::array<cplx, 2> famc(np, nk * nc2 * Nm), KFc(nt, np);
+            for (long ff = fam; ff < (nu0 ? 2 : fam + 1); ++ff) {
+              auto fam2 = nda::reshape(F.fam(ff, nda::ellipsis{}), std::array<long, 2>{np, nk * nc2 * Nm});
+              famc() = fam2;
+              for (long i = 0; i < nt; ++i)
+                for (long p = 0; p < np; ++p) KFc(i, p) = cplx((ff == 1 and nu0) ? b.KF2(i, p) : b.KF(i, p));
+              nda::blas::gemm(cplx(1.0), KFc, famc, cplx(1.0), Fs2);
+            }
             for (long i = 0; i < nt; ++i) {
               Fs3() = Fs(i, all, all, all);
               thc_rung_apply(Xb, is, iq, kpq, qx_of, Wq_s(i), scale_k, Fs3, Os3, nb);
@@ -406,6 +483,18 @@ namespace solvers {
         for (long jn = 0; jn < nnu; ++jn) {
           const long m = nu_list[jn];
           const cplx inu = (m == tools.m0) ? cplx(0.0) : cplx(tools.ft->omega(tools.wn_b(m)));
+          inu_cur = inu;
+          // inu != 0: the twisted-pair tables of this node (D2e); built once per (unit, nu)
+          std::optional<db::shift_tables> stab;
+          db::shift_tables const *stp = nullptr;
+          if (inu != cplx(0.0)) {
+            stab.emplace(db::build_shift_tables(b, inu));
+            stp = std::addressof(stab.value());
+            if (met) met->dsq_err = std::max(met->dsq_err, stab->fit_err);
+            if (rank == 0 and sq == 0)
+              app_log(2, "  [dynbse] shift tables at nu node {} (inu = {:.4e}i): fit err {:.3e}, kept condition {:.3e}",
+                      m, inu.imag(), stab->fit_err, stab->cond_kept);
+          }
           build_cb_tau(G_CC, tools, is, iq, m, kpq, Cb_k);
           if (met) met->t_cb += watch.lap();
           // Cb D (the bubble's pair block) for the "rungs >= 1" subtraction
@@ -442,17 +531,17 @@ namespace solvers {
           if (opt.static_only) {
             db::tf_vector y0(np, nk, nc, Nm), Gamma(np, nk, nc, Nm);
             nda::array<cplx, 4> Gsum(nk, nc, nc, Nm);
-            db::ls_apply(b, P, S, inu, true, Dc, y0, Gamma, Gsum, &Cb_k);
+            db::ls_apply(b, P, S, inu, shared, Dc, y0, Gamma, Gsum, &Cb_k, stp);
             res.Gsum0 = Gsum;
             res.Gsum1 = Gsum;
             res.Gsum = Gsum;
             res.converged = true;
           } else if (opt.one_rung_only) {
-            res = db::solve_dyson_op(b, P, kd, S, inu, true, Dc, opt.tol, 1, false, &Cb_k);
+            res = db::solve_dyson_op(b, P, kd, S, inu, shared, Dc, opt.tol, 1, false, &Cb_k, stp);
           } else if (opt.gmres_m > 0) {
-            res = db::solve_dyson_gmres(b, P, kd, S, inu, true, Dc, opt.tol, opt.maxit, opt.gmres_m, &Cb_k);
+            res = db::solve_dyson_gmres(b, P, kd, S, inu, shared, Dc, opt.tol, opt.maxit, opt.gmres_m, &Cb_k, stp, &metric);
           } else {
-            res = db::solve_dyson_op(b, P, kd, S, inu, true, Dc, opt.tol, opt.maxit, false, &Cb_k);
+            res = db::solve_dyson_op(b, P, kd, S, inu, shared, Dc, opt.tol, opt.maxit, false, &Cb_k, stp, &metric);
           }
           if (rank == 0 and sq == 0) {
             std::string hist;
@@ -461,9 +550,9 @@ namespace solvers {
               std::snprintf(buf, sizeof(buf), " %.2e", h);
               hist += buf;
             }
-            app_log(2, "  [dynbse] unit (s {}, q {}) nu node {}: {} applications, converged {}, watchdog {:.3e}, "
-                       "refit {:.3e}; residuals:{}", is, iq, m, res.iterations, res.converged, res.contraction,
-                    res.fit_err_max, hist);
+            app_log(2, "  [dynbse] unit (s {}, q {}) nu node {}: {} applications, converged {}, stagnated {}, "
+                       "watchdog {:.3e}, refit {:.3e}; residuals:{}", is, iq, m, res.iterations, res.converged,
+                    res.stagnated, res.contraction, res.fit_err_max, hist);
           }
           if (met) {
             met->t_solve += watch.lap();
@@ -472,7 +561,7 @@ namespace solvers {
             met->it_max = std::max(met->it_max, res.iterations);
             met->it_sum += res.iterations;
             ++met->nunits;
-            if (res.converged) ++met->nconv;
+            if (res.converged or res.stagnated) ++met->nconv;   // stagnated at the refit floor counts as done
           }
           readout(res.Gsum0, Pi_static);
           if (opt.one_rung_only) {
@@ -522,7 +611,7 @@ namespace solvers {
     utils::check(symc == nullptr or not symc->active, "vertex_t::dynbse_gate: nosym only.");
     vertex_pi::iaft_tools tools(*_ft);
     const long nw_b = tools.nw_b, nk = MF->nkpts(), nq = MF->nqpts(), Nm = _Xb_skma.shape(2);
-    const long nc = subspace_rank(), nc2 = nc * nc, ns = G_CC.shape(1);
+    const long nc = subspace_rank(), nc2 = nc * nc;
     const long rank = mpi->comm.rank(), size = mpi->comm.size();
     std::vector<long> nus = {tools.m0, tools.m0 + 1};
     const long nnu = long(nus.size());
@@ -542,6 +631,14 @@ namespace solvers {
       return (sm > 0.0) ? dm / sm : dm;
     };
 
+    // the in-gap mask of the union scheme from the window's mean-field gap
+    double gap_mask = 0.0;
+    {
+      auto [ev, ec] = vd::window_mf_gap(MF, _band_window);
+      gap_mask = (ec > ev) ? 0.45 * (ec - ev) : 0.0;
+      app_log(1, "  [D2 gate] window mean-field gap: occupied max {:.4f}, empty min {:.4f} Ha (gap {:.4f}); union G nodes "
+                 "masked at |eps| < {:.4f} Ha", ev, ec, ec - ev, gap_mask);
+    }
     // ---- (A0) the rung operator vs Kbig (rank 0, unit (0, 0)) --------------------------------
     {
       nda::array<long, 2> qx_of(nk, nk);
@@ -576,6 +673,7 @@ namespace solvers {
     nda::array<ComplexType, 4> Ps(nnu, nq, Nm, Nm);
     {
       vd::dyn_opts o;
+      o.gap_mask = gap_mask;
       o.static_only = true;
       vd::dyn_meter met;
       vd::pair_space_ladder_dyn(G_CC, _Xb_skma, W0b, Wbh, kmq, kpq, tools, nus, &Ps, nullptr, nullptr, nullptr,
@@ -607,6 +705,7 @@ namespace solvers {
     {
       nda::array<ComplexType, 4> P1(nnu, nq, Nm, Nm);
       vd::dyn_opts o;
+      o.gap_mask = gap_mask;
       o.one_rung_only = true;
       vd::dyn_meter met;
       vd::pair_space_ladder_dyn(G_CC, _Xb_skma, W0b, Wbh, kmq, kpq, tools, nus, nullptr, &P1, nullptr, nullptr,
@@ -694,6 +793,34 @@ namespace solvers {
       }
     }
 
+    // ---- (B2) the nu-continuity of the Neumann orders 2 and 3 (node 1 vs node 0) -------------
+    // Each order is a readout of a physical object continuous in nu; a jump between the two
+    // nodes (2 pi/beta apart) at order n localizes the numerical defect at that order.
+    {
+      for (long nord = 2; nord <= 3; ++nord) {
+        nda::array<ComplexType, 4> Pn(nnu, nq, Nm, Nm);
+        vd::dyn_opts o;
+        o.gap_mask = gap_mask;
+        o.gmres_m = 0;
+        o.maxit = nord;
+        o.tol = 0.0;
+        vd::dyn_meter met;
+        vd::pair_space_ladder_dyn(G_CC, _Xb_skma, W0b, Wbh, kmq, kpq, tools, nus, nullptr, nullptr, nullptr, &Pn,
+                                  rank, size, o, &met);
+        mpi->comm.all_reduce_in_place_n(Pn.data(), Pn.size(), std::plus<>{});
+        double d0 = 0.0, s0 = 0.0, dS = 0.0;
+        for (long iq = 0; iq < nq; ++iq)
+          for (long M = 0; M < Nm; ++M)
+            for (long N = 0; N < Nm; ++N) {
+              d0 = std::max(d0, std::abs(Pn(1, iq, M, N) - Pn(0, iq, M, N)));
+              s0 = std::max(s0, std::abs(Pn(0, iq, M, N)));
+              dS = std::max(dS, std::abs(Pn(0, iq, M, N) - Ps(0, iq, M, N)));
+            }
+        app_log(1, "  [D2 gate] (B2) Neumann order {}: nu-continuity node 1 vs 0 = {:.3e} (|P| {:.3e}; |P - static| at node 0 "
+                   "{:.3e})", nord, (s0 > 0.0) ? d0 / s0 : d0, s0, dS);
+      }
+    }
+
     // ---- (C) the resummed vertex at inu = 0: Neumann and GMRES, Hermiticity, meters --------
     // (inu = 0 only here: in the {U, S} two-family representation the index-confluent pairs carry
     //  coefficients +-1/(i nu) that cancel only in values, and at the first positive node of a
@@ -701,8 +828,36 @@ namespace solvers {
     //  level of the physical content -- measured: Ritz 2e3, the solve stalls. The bounded
     //  representation T_a = U_a S_a of the shifted family is increment D2e; the one-rung column
     //  above is continuous into that node because its readout cancels exactly.)
+    // ---- (C') the inu != 0 EXPERIMENT (reported, not asserted): union grid + mask + tau metric ----
+    // D2e status: the physical readouts are nu-continuous order by order (B2), the tau-metric GMRES
+    // readout at the first positive node is continuous with inu = 0, but the iteration carries a
+    // spurious mode (watchdog ~2.6 union / ~40 shared+mask on lih222 at beta = 1000) -- open.
     {
-      std::vector<long> nu0 = {tools.m0};
+      std::vector<long> nu1 = {tools.m0 + 1};
+      nda::array<ComplexType, 4> Pe(1, nq, Nm, Nm), Pge(1, nq, Nm, Nm);
+      vd::dyn_opts oe;
+      oe.gap_mask = gap_mask;
+      oe.gmres_m = 4;
+      oe.maxit = 8;
+      oe.union_nodes = true;
+      vd::dyn_meter mete;
+      vd::pair_space_ladder_dyn(G_CC, _Xb_skma, W0b, Wbh, kmq, kpq, tools, nu1, nullptr, nullptr, &Pge, &Pe,
+                                rank, size, oe, &mete);
+      mpi->comm.all_reduce_in_place_n(Pe.data(), Pe.size(), std::plus<>{});
+      mete.reduce(mpi->comm);
+      double ds = 0.0, ss = 0.0;
+      for (long iq = 0; iq < nq; ++iq)
+        for (long M = 0; M < Nm; ++M)
+          for (long N = 0; N < Nm; ++N) {
+            ds = std::max(ds, std::abs(Pe(0, iq, M, N) - Ps(1, iq, M, N)));
+            ss = std::max(ss, std::abs(Ps(1, iq, M, N)));
+          }
+      app_log(1, "  [D2 gate] (C') inu != 0 experiment (union + mask, tau metric, GMRES(4), 8 applications): "
+                 "|resummed - static| / |static| at node 1 = {:.3e} (node 0's asserted value below), watchdog {:.3e}, "
+                 "converged {}, refit {:.2e}", (ss > 0.0) ? ds / ss : ds, mete.ritz_max, mete.nconv == mete.nunits, mete.refit_err_max);
+    }
+    {
+      std::vector<long> nu0 = {tools.m0};          // the asserted solve: inu = 0, the D4 configuration
       const long nnu0 = 1;
       nda::array<ComplexType, 4> Pg(nnu0, nq, Nm, Nm), Pd(nnu0, nq, Nm, Nm), Pd2(nnu0, nq, Nm, Nm), Pg2(nnu0, nq, Nm, Nm);
       vd::dyn_opts o;
@@ -785,6 +940,8 @@ namespace solvers {
     nda::array<ComplexType, 4> Ps(1, nq, Nm, Nm), P1(1, nq, Nm, Nm), Pg(1, nq, Nm, Nm), Pd(1, nq, Nm, Nm);
     vd::dyn_opts o;
     o.tol = _dyn_tol; o.maxit = _dyn_maxit; o.gmres_m = _dyn_gmres; o.sign_ks = _dyn_sign;
+    // D3/D4 configuration at inu = 0: the shared aux grid with the Dsq/Dcb tables, no mask (the
+    // union grid / in-gap mask / twisted-pair basis are the inu != 0 machinery of D2e, still open)
     vd::dyn_meter met;
     vd::pair_space_ladder_dyn(G_CC, _Xb_skma, _W0b_qmm.value(), _Wb_qwmm.value(), kmq, kpq, tools, nu0,
                               &Ps, nullptr, &Pg, &Pd, mpi->comm.rank(), mpi->comm.size(), o, &met);
