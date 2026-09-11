@@ -279,6 +279,16 @@ inline void ensure_checkpoint(std::shared_ptr<mf::MF> mf, std::string const& out
  *                 the nu -> tau -> nu round trip r_rt, and the resolvent margin
  *                 lambda_max = rho(chi0 Xi) -- which ABORTS at 1 (particle-hole
  *                 instability) and warns above 0.9.
+ *  - pol_vertex_legs: "bare" scGW-tilde TIER 1.5 (notes/tier15_ward_legs_plan.md; the
+ *                 proposal's section 4.6): the LEG VERTEX of the ladder's pair
+ *                 propagators. {choices: "bare", "ward"}. "bare" is the historic pair
+ *                 propagator (bitwise). "ward" inserts the discrete-Ward vertex
+ *                 Lambda0 = 1 - [Sigma(iw+inu) - Sigma(iw)]/inu at the vertex of every
+ *                 pair propagator, built from the loop's own stored Sigma through its
+ *                 DLR pole products (no difference quotient), and adds the zero-rung
+ *                 term Delta P^Lambda to the ladder's output (eq 27, the Tier-1.5
+ *                 composite), (M,N)-Hermitized. The eps_M readout gains a "+DeltaLambda"
+ *                 column (chi0_Lambda alone). Requires ladder_solve_grid = 1 (T15-b).
  *  - ladder_solve_grid: 1  Ranks per SOLVE GRID for the ladder's dense resolvent
  *                 (notes/ladder_b_integration_design.md, increment B). 1 (default) is the
  *                 per-rank LAPACK path -- bit-identical to the pre-B tree, and its
@@ -544,6 +554,11 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
                           pol_vertex_isdf_distr_tol, pol_vertex_inject);
     vertex.set_ladder_solve(ladder_solve_grid, ladder_solve_budget_gb);
     vertex.set_ladder_da(ladder_tda, ladder_head_scale, ladder_qnu_meter);
+    {   // scGW-tilde Tier 1.5: the ladder's leg vertex (default-inert)
+      auto pol_vertex_legs = io::get_value_with_default<std::string>(pt,"pol_vertex_legs","bare");
+      io::tolower(pol_vertex_legs);
+      vertex.set_ladder_legs(pol_vertex_legs);
+    }
     scr_eri.set_cvv_rspace_tol(cvv_rspace_tol);
     if (vertex.enabled()) {
       utils::check(screen_type == "rpa" or screen_type == "rpa_k",
@@ -878,6 +893,11 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
                                       pol_vertex_isdf_distr_tol, pol_vertex_inject);
     pol_vertex_carrier.set_ladder_solve(ladder_solve_grid, ladder_solve_budget_gb);
     pol_vertex_carrier.set_ladder_da(ladder_tda, ladder_head_scale, ladder_qnu_meter);
+    {   // scGW-tilde Tier 1.5: the ladder's leg vertex (default-inert)
+      auto pol_vertex_legs = io::get_value_with_default<std::string>(pt,"pol_vertex_legs","bare");
+      io::tolower(pol_vertex_legs);
+      pol_vertex_carrier.set_ladder_legs(pol_vertex_legs);
+    }
     if (pol_vertex_carrier.pol_vertex_enabled()) scr_eri.set_vertex(&pol_vertex_carrier);
     MBState mb_state(mpi, ft, output);
     qp_scf_loop(mb_state, eri, ft, qp_params, mb_solver_t(&hf,&gw,&scr_eri), iter_solver.get(),
@@ -1084,6 +1104,11 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
                                       pol_vertex_isdf_distr_tol, pol_vertex_inject);
     pol_vertex_carrier.set_ladder_solve(ladder_solve_grid, ladder_solve_budget_gb);
     pol_vertex_carrier.set_ladder_da(ladder_tda, ladder_head_scale, ladder_qnu_meter);
+    {   // scGW-tilde Tier 1.5: the ladder's leg vertex (default-inert)
+      auto pol_vertex_legs = io::get_value_with_default<std::string>(pt,"pol_vertex_legs","bare");
+      io::tolower(pol_vertex_legs);
+      pol_vertex_carrier.set_ladder_legs(pol_vertex_legs);
+    }
     if (pol_vertex_carrier.pol_vertex_enabled()) scr_eri.set_vertex(&pol_vertex_carrier);
     // Project 2 increment Q5 (notes/q5_option2_outer_loop_spec.md §1): the Option-2
     // re-QP-ization knobs. Parsed with an EMPTY default -- absent means INERT, i.e. the qp
@@ -1330,6 +1355,11 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
                           pol_vertex_isdf_distr_tol, pol_vertex_inject);
     vertex.set_ladder_solve(ladder_solve_grid, ladder_solve_budget_gb);
     vertex.set_ladder_da(ladder_tda, ladder_head_scale, ladder_qnu_meter);
+    {   // scGW-tilde Tier 1.5: the ladder's leg vertex (default-inert)
+      auto pol_vertex_legs = io::get_value_with_default<std::string>(pt,"pol_vertex_legs","bare");
+      io::tolower(pol_vertex_legs);
+      vertex.set_ladder_legs(pol_vertex_legs);
+    }
     scr_eri.set_cvv_rspace_tol(cvv_rspace_tol);
     if (vertex.enabled()) {
       utils::check(screen_type == "rpa" or screen_type == "rpa_k",
@@ -1589,6 +1619,11 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
                                       pol_vertex_isdf_distr_tol, pol_vertex_inject);
     pol_vertex_carrier.set_ladder_solve(ladder_solve_grid, ladder_solve_budget_gb);
     pol_vertex_carrier.set_ladder_da(ladder_tda, ladder_head_scale, ladder_qnu_meter);
+    {   // scGW-tilde Tier 1.5: the ladder's leg vertex (default-inert)
+      auto pol_vertex_legs = io::get_value_with_default<std::string>(pt,"pol_vertex_legs","bare");
+      io::tolower(pol_vertex_legs);
+      pol_vertex_carrier.set_ladder_legs(pol_vertex_legs);
+    }
     if (pol_vertex_carrier.pol_vertex_enabled()) scr_eri.set_vertex(&pol_vertex_carrier);
 
     // Project 2 increment Q5 (notes/q5_option2_outer_loop_spec.md §1): the Option-2

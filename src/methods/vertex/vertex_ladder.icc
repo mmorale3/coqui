@@ -96,6 +96,7 @@
 #include "utilities/interpolation_utils.hpp"   // P4a: WS_rgrid for the R-space kernel
 // INCREMENT B (notes/ladder_b_integration_design.md): the distributed dense solve path
 #include "utilities/proc_grid_partition.hpp"
+#include "methods/vertex/ward_legs.hpp"          // Tier 1.5: the discrete-Ward leg vertex
 #include "numerics/distributed_array/nda.hpp"
 #include "numerics/distributed_array/slate_ops.hpp"
 #include "mpi3/environment.hpp"
@@ -440,6 +441,218 @@ namespace solvers {
     }
 
     // ==================================================================================
+    // TIER 1.5 -- THE DISCRETE-WARD LEG VERTEX ON THE PAIR PROPAGATOR
+    // (notes/tier15_ward_legs_plan.md; proposal section 4.6; algebra in ward_legs.hpp)
+    //
+    // With pol_vertex_legs = "ward" every pair propagator Cb of the kernels below gets
+    //   Cb(k; q, nu) += Dchi0(k; q, nu)     (ward_legs::add_pair_correction, eq 21),
+    // built from the DLR pole residues of the loop's OWN stored G and Sigma_c, and the
+    // resummed output additionally carries the zero-rung term
+    //   Delta P^Lambda(q, nu) = -spin/nk sum_k conj(D_k)^T Dchi0_k D_k
+    // (the pair bubble's own correction; the resolvent keeps its "rungs >= 1" contract
+    // but is evaluated on the Lambda-corrected legs -- proposal eq 27). With
+    // ward == nullptr nothing below is allocated or executed: the historic path is bitwise.
+    // ==================================================================================
+
+    /** the nu = 0 row of the Lambda tables = the nu -> 0 limit extrapolated from this many
+     *  bosonic Matsubara nodes (ward_legs::build_s_tables). 3: weights (3, -3, 1); the
+     *  extrapolation error ~ (6 pi / (beta gap))^3, the noise amplification 7. */
+    inline constexpr long ward_nu0_extrap = 3;
+
+    /** per-nu meters of the ward legs: MAX over the units this rank executed (the caller
+     *  inits and reduces; the kernel never zeroes them). */
+    struct ward_meter {
+      nda::array<double, 2> gamma_trace;   // (nnu, 2): |vertex-traced Cb| at the Gamma
+                                           // transfer, bare (0) and Lambda-corrected (1)
+      nda::array<double, 1> pole_vs_tau;   // (nnu): max |Cb_pole - Cb_tau| / max |Cb_tau|
+      void init(long nnu) {
+        gamma_trace = nda::array<double, 2>(nnu, 2);
+        gamma_trace() = 0.0;
+        pole_vs_tau = nda::array<double, 1>(nnu);
+        pole_vs_tau() = 0.0;
+      }
+      void reduce_max(boost::mpi3::communicator &comm) {
+        comm.all_reduce_in_place_n(gamma_trace.data(), gamma_trace.size(), boost::mpi3::max<>{});
+        comm.all_reduce_in_place_n(pole_vs_tau.data(), pole_vs_tau.size(), boost::mpi3::max<>{});
+      }
+    };
+
+    struct ward_args {
+      ward_legs::ward_ctx const *ctx = nullptr;       // the Lambda correction (nullptr = bare legs)
+      nda::array<ComplexType, 4> *Pi_dlam = nullptr;  // (nnu, nq_ext, Nm, Nm) Delta P^Lambda, or null
+      nda::array<ComplexType, 4> *Pi_bub = nullptr;   // (nnu, nq_ext, Nm, Nm) the BARE zero-rung
+                                                      // bubble -spin/nk sum_k conj(D)^T Cb D (the
+                                                      // normalization pin of the gate), or null
+      ward_meter *meter = nullptr;
+    };
+
+    /** (M,N)-Hermitize every (j, iq) block in place; returns max over blocks of
+     *  |P - P^dag|_max / |P|_max (the asymmetry BEFORE the projection). */
+    inline double hermitize_mn(nda::array<ComplexType, 4> &P) {
+      const long n0 = P.shape(0), n1 = P.shape(1), Nm = P.shape(2);
+      double worst = 0.0;
+      for (long j = 0; j < n0; ++j)
+        for (long iq = 0; iq < n1; ++iq) {
+          double asym = 0.0, scale = 0.0;
+          for (long m = 0; m < Nm; ++m)
+            for (long n = m; n < Nm; ++n) {
+              const ComplexType a = P(j, iq, m, n), b = std::conj(P(j, iq, n, m));
+              asym = std::max(asym, std::abs(a - b));
+              scale = std::max({scale, std::abs(a), std::abs(b)});
+              const ComplexType h = 0.5 * (a + b);
+              P(j, iq, m, n) = h;
+              P(j, iq, n, m) = std::conj(h);
+            }
+          if (scale > 0.0) worst = std::max(worst, asym / scale);
+        }
+      return worst;
+    }
+
+    /**
+     * The ward context from the loop's state: aux-grid DLR pole fits (iaft_tools::
+     * pole_coeffs, the regularized map of dlr_pole_fit.hpp) of G and Sigma_c on the FULL
+     * BZ per (s, k), sliced into the C-restricted blocks ward_legs needs (external labels
+     * in bw, internal band sums over ALL nb), and the S tables at the kernel's nu nodes.
+     * The fit_error / residue_ratio maxima (over s, k; G and Sigma_c separately) are
+     * returned for the caller's gate. Replicated: every rank fits everything (~1e9 flops
+     * at Si 4^3; distribute over k when 8^3 needs it).
+     */
+    inline ward_legs::ward_ctx
+    build_ward_legs(MBState &mb_state, auto const &MF, imag_axes_ft::IAFT const &ft,
+                    nda::range bw, vertex_pi::iaft_tools &tools,
+                    std::vector<long> const &nu_list,
+                    double &fit_err_G, double &fit_err_S, double &rr_G, double &rr_S) {
+      decltype(nda::range::all) all;
+      utils::check(mb_state.sG_tskij.has_value(), "ward legs: mb_state carries no G.");
+      utils::check(mb_state.sSigma_tskij.has_value(),
+                   "pol_vertex_legs = \"ward\": mb_state carries no dynamic self-energy "
+                   "(sSigma_tskij) at update_w time -- Lambda0 is built from the loop's "
+                   "own stored Sigma and cannot run without it.");
+      auto G_tskij = mb_state.sG_tskij.value().local();
+      auto S_tskij = mb_state.sSigma_tskij.value().local();
+      const long nt = G_tskij.shape(0), ns = G_tskij.shape(1), nk_ibz = G_tskij.shape(2);
+      const long nb = G_tskij.shape(3);
+      utils::check(S_tskij.shape(0) == nt and S_tskij.shape(1) == ns and
+                   S_tskij.shape(2) == nk_ibz and S_tskij.shape(3) == nb and
+                   S_tskij.shape(4) == nb,
+                   "ward legs: Sigma ({} x {} x {} x {} x {}) and G ({} x {} x {} x {} x {}) "
+                   "shapes differ.", S_tskij.shape(0), S_tskij.shape(1), S_tskij.shape(2),
+                   S_tskij.shape(3), S_tskij.shape(4), nt, ns, nk_ibz, nb, nb);
+      utils::check(nt == tools.nt_f, "ward legs: G tau axis {} != nt_f {}.", nt, tools.nt_f);
+      const long nk = MF->nkpts();
+      const bool sym_mesh = (nk != MF->nkpts_ibz());
+      auto kp_to_ibz = MF->kp_to_ibz();
+      auto kp_trev = MF->kp_trev();
+      const long nc = long(bw.size());
+      utils::check(nc > 0 and bw.first() >= 0 and bw.last() <= nb,
+                   "ward legs: window [{}, {}) outside the band range {}.", bw.first(),
+                   bw.last(), nb);
+      tools.init_poles();
+      const long np = tools.np;
+      nda::array<ComplexType, 5> gC(ns, np, nk, nc, nc), gA(ns, np, nk, nb, nc);
+      nda::array<ComplexType, 5> gB(ns, np, nk, nc, nb), RA(ns, np, nk, nc, nb);
+      nda::array<ComplexType, 5> RB(ns, np, nk, nb, nc);
+      nda::array<ComplexType, 2> F(nt, nb * nb);
+      fit_err_G = fit_err_S = rr_G = rr_S = 0.0;
+      auto fill = [&](auto const &X, long is, long kp) {
+        const long kib = sym_mesh ? long(kp_to_ibz(kp)) : kp;
+        const bool trev = sym_mesh and bool(kp_trev(kp));
+        for (long it = 0; it < nt; ++it)
+          for (long a = 0; a < nb; ++a)
+            for (long b = 0; b < nb; ++b)
+              F(it, a * nb + b) = trev ? X(it, is, kib, b, a) : X(it, is, kib, a, b);
+      };
+      for (long is = 0; is < ns; ++is)
+        for (long kp = 0; kp < nk; ++kp)
+          for (int which = 0; which < 2; ++which) {
+            if (which == 0) fill(G_tskij, is, kp);
+            else fill(S_tskij, is, kp);
+            auto c = tools.pole_coeffs(F);                             // (np, nb*nb)
+            const double fe = tools.pfit.fit_error(F, c);
+            const double rr = tools.pfit.residue_ratio(F, c);
+            auto c3 = nda::reshape(c, std::array<long, 3>{np, nb, nb});
+            if (which == 0) {
+              fit_err_G = std::max(fit_err_G, fe);
+              rr_G = std::max(rr_G, rr);
+              gC(is, all, kp, all, all) = c3(all, bw, bw);
+              gA(is, all, kp, all, all) = c3(all, all, bw);
+              gB(is, all, kp, all, all) = c3(all, bw, all);
+            } else {
+              fit_err_S = std::max(fit_err_S, fe);
+              rr_S = std::max(rr_S, rr);
+              RA(is, all, kp, all, all) = c3(all, bw, all);
+              RB(is, all, kp, all, all) = c3(all, all, bw);
+            }
+          }
+      const long nnu = long(nu_list.size());
+      nda::array<ComplexType, 1> inu(nnu);
+      for (long jn = 0; jn < nnu; ++jn) inu(jn) = ft.omega(tools.wn_b(nu_list[jn]));
+      // the nu = 0 row as the nu -> 0 limit from ward_nu0_extrap Matsubara nodes: on the
+      // DLR-FITTED residues the derivative branches are not controlled by the fit (see
+      // ward_legs::build_s_tables; measured 4e2 off vs 4e-4 with K = 3 on the exact toy)
+      auto tab = ward_legs::build_s_tables(tools.beta, tools.epsl, tools.epsl, true, inu,
+                                           ward_nu0_extrap);
+      // T15-b diagnostic (level 2): the fitted residues per aux node and the S-table scale
+      // per nu -- the bilinear hazard of dlr_pole_fit.hpp made visible for THIS data.
+      {
+        std::vector<double> gmax(size_t(np), 0.0), rmax(size_t(np), 0.0);
+        for (long is = 0; is < ns; ++is)
+          for (long p = 0; p < np; ++p)
+            for (long kp = 0; kp < nk; ++kp) {
+              for (long a = 0; a < nb; ++a)
+                for (long b = 0; b < nc; ++b) {
+                  gmax[size_t(p)] = std::max(gmax[size_t(p)], std::abs(gA(is, p, kp, a, b)));
+                  rmax[size_t(p)] = std::max(rmax[size_t(p)], std::abs(RB(is, p, kp, a, b)));
+                }
+            }
+        app_log(2, "  [scGW-tilde T1.5]   aux node   eps_p (Ha)   beta*eps_p   max|g_p|   max|R_p|");
+        for (long p = 0; p < np; ++p)
+          app_log(2, "  [scGW-tilde T1.5]   {:>8} {:>12.5e} {:>12.4e} {:>10.3e} {:>10.3e}", p,
+                  tools.epsl(p), tools.beta * tools.epsl(p), gmax[size_t(p)], rmax[size_t(p)]);
+        for (long jn = 0; jn < nnu; ++jn) {
+          double smax = 0.0, tmax = 0.0;
+          long pm = -1, lm = -1, mm = -1;
+          for (long m = 0; m < np; ++m)
+            for (long p = 0; p < np; ++p)
+              for (long l = 0; l < np; ++l) {
+                const double v = std::abs(tab.Sm(jn, m, p, l));
+                if (v > smax) { smax = v; pm = p; lm = l; mm = m; }
+              }
+          for (long l = 0; l < np; ++l)
+            for (long m = 0; m < np; ++m) tmax = std::max(tmax, std::abs(tab.Tb(jn, l, m)));
+          app_log(2, "  [scGW-tilde T1.5]   nu node {}: max|S| = {:.3e} at (p, l, m) = ({}, {}, {}), "
+                     "max|T| = {:.3e}", nu_list[jn], smax, pm, lm, mm, tmax);
+        }
+      }
+      return ward_legs::build_ward_ctx(std::move(tab), gC, gA, gB, RA, RB);
+    }
+
+    inline void log_ward_fit(double feG, double feS, double rrG, double rrS, const char *who) {
+      app_log(1, "  [scGW-tilde T1.5] ward legs ({}): aux-grid DLR pole fits -- fit_error max "
+                 "G = {:.3e}, Sigma_c = {:.3e}; residue ratio max G = {:.3g}, Sigma_c = {:.3g}; "
+                 "the inu = 0 Lambda row = the nu -> 0 limit from {} Matsubara nodes",
+              who, feG, feS, rrG, rrS, ward_nu0_extrap);
+      imag_axes_ft::dlr_pole_fit_gate(feG, "ward legs: G pole fit", 1e-3, 1e-2, rrG);
+      imag_axes_ft::dlr_pole_fit_gate(feS, "ward legs: Sigma_c pole fit", 1e-3, 1e-2, rrS);
+    }
+
+    inline void log_ward_meters(ward_meter const &m, double asym_l, double asym_d,
+                                std::vector<long> const &nu_list, long nw_b, const char *who) {
+      app_log(1, "  [scGW-tilde T1.5] ward legs ({}): (M,N) Hermitization applied; max "
+                 "asymmetry before it: ladder {:.3e}, Delta P^Lambda {:.3e}", who, asym_l, asym_d);
+      app_log(1, "  [scGW-tilde T1.5]   {:>6} {:>14} {:>14} {:>12} {:>14}", "n_nu",
+              "|tr bare|", "|tr Lambda|", "ratio", "pole-vs-tau");
+      for (long jn = 0; jn < long(nu_list.size()); ++jn) {
+        const double tb = m.gamma_trace(jn, 0), tl = m.gamma_trace(jn, 1);
+        app_log(1, "  [scGW-tilde T1.5]   {:>6} {:>14.6e} {:>14.6e} {:>12.3e} {:>14.3e}",
+                nu_list[jn] - nw_b / 2, tb, tl, (tb > 0.0) ? tl / tb : 0.0, m.pole_vs_tau(jn));
+      }
+      app_log(1, "  [scGW-tilde T1.5]   (G-g meter: the vertex-traced pair propagator at "
+                 "the Gamma transfer; the Lambda column is the C1 violation left -- fit "
+                 "class at a full band window, the window truncation otherwise)");
+    }
+
+    // ==================================================================================
     // DA D-1: THE TAMM-DANCOFF TRUNCATION OF THE LADDER KERNEL
     // (notes/qsgwhat_discrepancy_spec.md Phase 2 D-1; the paper's TDA is Cunningham et
     //  al., PRB 108, 165104, section III A / eq 18.)
@@ -629,7 +842,9 @@ namespace solvers {
                                   // profiling meters (pure observer; nullptr = historic path)
                                   ladder_prof *prof = nullptr,
                                   // DA D-1: nullptr = no truncation = bitwise historic path
-                                  tda_ctx const *tda = nullptr) {
+                                  tda_ctx const *tda = nullptr,
+                                  // Tier 1.5: nullptr = bare legs = bitwise historic path
+                                  ward_args const *ward = nullptr) {
       prof_watch pwatch;
       if (prof) prof->rss_entry = prof_rss_gb();
       decltype(nda::range::all) all;
@@ -657,13 +872,17 @@ namespace solvers {
                      "pair_space_ladder: U_skia is {} x {} x {} x {}, expected {} x {} x "
                      "norb x {}.", U_skia->shape(0), U_skia->shape(1), U_skia->shape(2),
                      U_skia->shape(3), ns, nk, nc);
-      utils::check(Pi_onerung != nullptr or Pi_ladder != nullptr or want_loc,
+      const bool want_ward_out = (ward != nullptr and
+                                  (ward->Pi_dlam != nullptr or ward->Pi_bub != nullptr));
+      utils::check(Pi_onerung != nullptr or Pi_ladder != nullptr or want_loc or want_ward_out,
                    "pair_space_ladder: no output requested.");
       long nq_ext = -1;
       if (Pi_onerung != nullptr) nq_ext = Pi_onerung->shape(1);
       else if (Pi_ladder != nullptr) nq_ext = Pi_ladder->shape(1);
       else if (Pi_lad_loc != nullptr) nq_ext = Pi_lad_loc->shape(1);
-      else nq_ext = Pi_onerung_loc->shape(1);
+      else if (Pi_onerung_loc != nullptr) nq_ext = Pi_onerung_loc->shape(1);
+      else if (ward->Pi_dlam != nullptr) nq_ext = ward->Pi_dlam->shape(1);
+      else nq_ext = ward->Pi_bub->shape(1);
       for (auto const &o : {Pi_onerung, Pi_ladder})
         if (o != nullptr)
           utils::check(o->shape(1) == nq_ext,
@@ -699,6 +918,32 @@ namespace solvers {
       if (Pi_ladder != nullptr) (*Pi_ladder)() = ComplexType(0.0);
       if (Pi_lad_loc != nullptr) (*Pi_lad_loc)() = ComplexType(0.0);
       if (Pi_onerung_loc != nullptr) (*Pi_onerung_loc)() = ComplexType(0.0);
+      // Tier 1.5 outputs (zeroed here, indexed by POSITION in nu_list like the others);
+      // the meters are max-accumulated and belong to the caller.
+      if (ward != nullptr) {
+        for (auto const &o : {ward->Pi_dlam, ward->Pi_bub})
+          if (o != nullptr) {
+            utils::check(o->shape(0) == nnu and o->shape(1) == nq_ext and
+                         o->shape(2) == Nm and o->shape(3) == Nm,
+                         "pair_space_ladder: Tier 1.5 output is {} x {} x {} x {}, expected "
+                         "{} x {} x {} x {}.", o->shape(0), o->shape(1), o->shape(2),
+                         o->shape(3), nnu, nq_ext, Nm, Nm);
+            (*o)() = ComplexType(0.0);
+          }
+        if (ward->meter != nullptr)
+          utils::check(ward->meter->gamma_trace.shape(0) == nnu and
+                       ward->meter->pole_vs_tau.shape(0) == nnu,
+                       "pair_space_ladder: Tier 1.5 meter sized {} / {}, expected nnu = {}.",
+                       ward->meter->gamma_trace.shape(0), ward->meter->pole_vs_tau.shape(0),
+                       nnu);
+        if (ward->ctx != nullptr)
+          utils::check(ward->ctx->ns == ns and ward->ctx->nk == nk and ward->ctx->nc == nc and
+                       ward->ctx->nnu == nnu,
+                       "pair_space_ladder: Tier 1.5 context (ns {}, nk {}, nc {}, nnu {}) "
+                       "does not match the kernel (ns {}, nk {}, nc {}, nnu {}).",
+                       ward->ctx->ns, ward->ctx->nk, ward->ctx->nc, ward->ctx->nnu,
+                       ns, nk, nc, nnu);
+      }
       if (lam_max != nullptr) {
         utils::check(Pi_ladder != nullptr,
                      "pair_space_ladder: lam_max requires the resummed-ladder output.");
@@ -786,6 +1031,9 @@ namespace solvers {
       nda::array<ComplexType, 2> XE(lD, nab), KXE(lD, nab);
       fmat_t XKXE(lD, nab);   // B: the second RHS family, same factors, same layout rule
       nda::array<ComplexType, 2> Estack_c(lD, nab);
+      // Tier 1.5 workspaces: sized 0 unless the Lambda legs are requested
+      const long wn2 = (ward != nullptr and ward->ctx != nullptr) ? nc2 : 0;
+      nda::array<ComplexType, 2> Wd(wn2, wn2), Wp(wn2, wn2);
 
       if (prof) {
         prof->ns = ns; prof->nk = nk; prof->nc = nc; prof->nc2 = nc2;
@@ -885,7 +1133,10 @@ namespace solvers {
             if (want_Kb) Kb() = ComplexType(0.0);
             else if (any_solve) Kbig() = ComplexType(0.0);
           }
-          for (long ik = 0; ik < nk; ++ik) {
+          // Tier 1.5: a bubble-only call (ward->Pi_bub with no rung output) requests no
+          // rung at all -- Kb AND Kbig are then 0-sized, so the build must not run.
+          const bool want_rung = want_Kb or any_solve;
+          for (long ik = 0; ik < nk and want_rung; ++ik) {
             const long ikpq = kpq(iq, ik);
             for (long ikp = 0; ikp < nk; ++ikp) {
               if ((ik * nk + ikp) % lsize != lrank) continue;
@@ -991,6 +1242,69 @@ namespace solvers {
           // slices (jl), in the same increasing-jn order as the historic skip loop.
           for (long jl = 0; jl < nnu_loc; ++jl) {
             const long jn = lrank + jl * lsize;
+            // ---- TIER 1.5: the zero-rung bubble term(s) and the Lambda legs ---------------
+            // Runs BEFORE the one-rung / resolvent blocks so they see the corrected Cb; Y1
+            // is free here (the one-rung block below overwrites it per ik). Absent unless
+            // `ward` is passed: the historic path executes none of this.
+            if (ward != nullptr) {
+              // +spin/nk: PINNED by ward_legs_gate against eval_pol_pi0 (the pair kernel's
+              // bare bubble +spin/nk conj(D)^T Cb D IS the RPA bubble; with -spin it came
+              // out as exactly -Pi0, rel diff 2.000). The rung terms keep their own -spin
+              // (bilinear in Cb; pinned by L1-b), so no other sign moves.
+              const ComplexType pbub(spinfac / double(nk), 0.0);
+              bool gamma_unit = true;
+              for (long ik = 0; ik < nk and gamma_unit; ++ik) gamma_unit = (kpq(iq, ik) == ik);
+              for (long ik = 0; ik < nk; ++ik) {
+                const long ikpq = kpq(iq, ik);
+                auto Cbk = Cb(ik, jl, all, all);
+                if (ward->Pi_bub != nullptr) {
+                  nda::blas::gemm(Cbk, Dmat(ik, all, all), Y1(ik, all, all));
+                  nda::blas::gemm(pbub, nda::transpose(Dcj(ik, all, all)), Y1(ik, all, all),
+                                  ComplexType(1.0), (*ward->Pi_bub)(jn, iq, all, all));
+                }
+                if (ward->ctx == nullptr) continue;
+                if (ward->meter != nullptr) {
+                  ward_legs::pole_bare_bubble(*ward->ctx, is, jn, ik, ikpq, Wp);
+                  double d = 0.0, sc = 0.0;
+                  for (long r = 0; r < nc2; ++r)
+                    for (long c = 0; c < nc2; ++c) {
+                      d = std::max(d, std::abs(Wp(r, c) - Cbk(r, c)));
+                      sc = std::max(sc, std::abs(Cbk(r, c)));
+                    }
+                  if (sc > 0.0)
+                    ward->meter->pole_vs_tau(jn) = std::max(ward->meter->pole_vs_tau(jn), d / sc);
+                }
+                Wd() = ComplexType(0.0);
+                ward_legs::add_pair_correction(*ward->ctx, is, jn, ik, ikpq, Wd);
+                if (ward->Pi_dlam != nullptr or Pi_ladder != nullptr) {
+                  nda::blas::gemm(Wd, Dmat(ik, all, all), Y1(ik, all, all));
+                  if (ward->Pi_dlam != nullptr)
+                    nda::blas::gemm(pbub, nda::transpose(Dcj(ik, all, all)), Y1(ik, all, all),
+                                    ComplexType(1.0), (*ward->Pi_dlam)(jn, iq, all, all));
+                  // the composite contract (eq 27): Delta P^Lambda rides with the rungs
+                  if (Pi_ladder != nullptr)
+                    nda::blas::gemm(pbub, nda::transpose(Dcj(ik, all, all)), Y1(ik, all, all),
+                                    ComplexType(1.0), (*Pi_ladder)(jn, iq, all, all));
+                }
+                if (ward->meter != nullptr and gamma_unit) {
+                  double tb = 0.0, tl = 0.0;
+                  for (long p1p = 0; p1p < nc; ++p1p)
+                    for (long p3 = 0; p3 < nc; ++p3) {
+                      ComplexType sb(0.0), sl(0.0);
+                      for (long a = 0; a < nc; ++a) {
+                        const long r = p1p * nc + p3, c = a * nc + a;
+                        sb += Cbk(r, c);
+                        sl += Cbk(r, c) + Wd(r, c);
+                      }
+                      tb = std::max(tb, std::abs(sb));
+                      tl = std::max(tl, std::abs(sl));
+                    }
+                  ward->meter->gamma_trace(jn, 0) = std::max(ward->meter->gamma_trace(jn, 0), tb);
+                  ward->meter->gamma_trace(jn, 1) = std::max(ward->meter->gamma_trace(jn, 1), tl);
+                }
+                Cbk += Wd;
+              }
+            }
             pph.begin(ladder_prof::P_ONERUNG);
             if (Pi_onerung != nullptr) {
               for (long ik = 0; ik < nk; ++ik) {
@@ -2263,7 +2577,8 @@ namespace solvers {
    * pi_c_accumulate_w contract; pair_space_ladder header).
    */
   nda::array<ComplexType, 3> vertex_t::eval_pol_ladder_nu0(MBState &mb_state,
-                                                           THC_ERI auto &thc) {
+                                                           THC_ERI auto &thc,
+                                                           nda::array<ComplexType, 3> *Pi_dlam) {
     decltype(nda::range::all) all;
     utils::check(active() and secondary(),
                  "vertex_t::eval_pol_ladder_nu0: requires an ACTIVE secondary-basis "
@@ -2313,6 +2628,24 @@ namespace solvers {
     }
     std::vector<long> nu0 = {tools.nw_b / 2};   // the inu = 0 node of the full mesh
     nda::array<ComplexType, 4> Pl(1, nq_ext, Nm, Nm);
+    // Tier 1.5: the ward legs (nullptr = bare = the bitwise historic path)
+    std::optional<ward_legs::ward_ctx> wctx;
+    vertex_ladder_detail::ward_args wargs;
+    vertex_ladder_detail::ward_meter wmeter;
+    nda::array<ComplexType, 4> Pd(0, 0, 0, 0);
+    vertex_ladder_detail::ward_args const *wp = nullptr;
+    if (ladder_ward_legs()) {
+      double feG = 0.0, feS = 0.0, rrG = 0.0, rrS = 0.0;
+      wctx.emplace(vertex_ladder_detail::build_ward_legs(mb_state, MF, *_ft, _band_window,
+                                                         tools, nu0, feG, feS, rrG, rrS));
+      vertex_ladder_detail::log_ward_fit(feG, feS, rrG, rrS, "nu0");
+      wargs.ctx = std::addressof(wctx.value());
+      Pd = nda::array<ComplexType, 4>(1, nq_ext, Nm, Nm);
+      wargs.Pi_dlam = std::addressof(Pd);
+      wmeter.init(1);
+      wargs.meter = std::addressof(wmeter);
+      wp = std::addressof(wargs);
+    }
     auto mpi = thc.mpi();
     // P3 (C.3): NODE-GROUP scheduling -- (s, q) pairs over the internode grid, builds
     // cooperatively inside each node (disjoint writes, bitwise assembly), the nu = 0
@@ -2331,19 +2664,30 @@ namespace solvers {
                                               mpi->internode_comm.rank(),
                                               mpi->internode_comm.size(), symc,
                                               std::addressof(mpi->node_comm), nullptr,
-                                              nullptr, nullptr, nullptr, &prof, tdap);
+                                              nullptr, nullptr, nullptr, &prof, tdap, wp);
     else
       vertex_ladder_detail::pair_space_ladder(G_CC, _Xb_skma, _W0b_qmm.value(), kmq,
                                               kpq, tools, nu0, nullptr, &Pl,
                                               mpi->comm.rank(), mpi->comm.size(), symc,
                                               nullptr, nullptr,
-                                              nullptr, nullptr, nullptr, &prof, tdap);
+                                              nullptr, nullptr, nullptr, &prof, tdap, wp);
     cwatch.lap();
     mpi->comm.barrier();
     prof.t_barrier = cwatch.lap();
     mpi->comm.all_reduce_in_place_n(Pl.data(), Pl.size(), std::plus<>{});
     prof.t_reduce = cwatch.lap();
     prof.t_call = twatch.lap();
+    if (wp != nullptr) {
+      mpi->comm.all_reduce_in_place_n(Pd.data(), Pd.size(), std::plus<>{});
+      wmeter.reduce_max(mpi->comm);
+      const double asym_l = vertex_ladder_detail::hermitize_mn(Pl);
+      const double asym_d = vertex_ladder_detail::hermitize_mn(Pd);
+      vertex_ladder_detail::log_ward_meters(wmeter, asym_l, asym_d, nu0, tools.nw_b, "nu0");
+      if (Pi_dlam != nullptr) {
+        *Pi_dlam = nda::array<ComplexType, 3>(nq_ext, Nm, Nm);
+        (*Pi_dlam)() = Pd(0, all, all, all);
+      }
+    }
     vertex_ladder_detail::prof_report(prof, mpi->comm, "nu0");
     nda::array<ComplexType, 3> out(nq_ext, Nm, Nm);
     out = Pl(0, all, all, all);
@@ -2407,7 +2751,8 @@ namespace solvers {
    */
   nda::array<ComplexType, 4>
   vertex_t::eval_pol_ladder_whalf(MBState &mb_state, THC_ERI auto &thc,
-                                  nda::array<double, 1> *lam_max) {
+                                  nda::array<double, 1> *lam_max,
+                                  nda::array<ComplexType, 4> *Pi_dlam) {
     utils::check(active() and secondary(),
                  "vertex_t::eval_pol_ladder_whalf: requires an ACTIVE secondary-basis "
                  "vertex (the readout instance).");
@@ -2445,6 +2790,24 @@ namespace solvers {
     const long nq_ext = MF->nqpts_ibz(), Nm = _Xb_skma.shape(2);
     nda::array<ComplexType, 4> Pl(nw_half, nq_ext, Nm, Nm);
     if (lam_max != nullptr) *lam_max = nda::array<double, 1>(nw_half);
+    // Tier 1.5: the ward legs (nullptr = bare = the bitwise historic path)
+    std::optional<ward_legs::ward_ctx> wctx;
+    vertex_ladder_detail::ward_args wargs;
+    vertex_ladder_detail::ward_meter wmeter;
+    nda::array<ComplexType, 4> Pd(0, 0, 0, 0);
+    vertex_ladder_detail::ward_args const *wp = nullptr;
+    if (ladder_ward_legs()) {
+      double feG = 0.0, feS = 0.0, rrG = 0.0, rrS = 0.0;
+      wctx.emplace(vertex_ladder_detail::build_ward_legs(mb_state, MF, *_ft, _band_window,
+                                                         tools, nu_h, feG, feS, rrG, rrS));
+      vertex_ladder_detail::log_ward_fit(feG, feS, rrG, rrS, "whalf");
+      wargs.ctx = std::addressof(wctx.value());
+      Pd = nda::array<ComplexType, 4>(nw_half, nq_ext, Nm, Nm);
+      wargs.Pi_dlam = std::addressof(Pd);
+      wmeter.init(nw_half);
+      wargs.meter = std::addressof(wmeter);
+      wp = std::addressof(wargs);
+    }
     // ---- INCREMENT B: the solve-grid dispatch (notes/ladder_b_integration_design.md) --
     // g = 1 (the default, and the knob-unset case) falls through to the historic branches
     // BELOW, untouched -- same calls, same allocations, bitwise the pre-B result.
@@ -2455,6 +2818,9 @@ namespace solvers {
         vertex_ladder_detail::ladder_auto_node_size(_ladder_solve_grid, mpi->comm,
                                                     mpi->node_comm.size()), "whalf");
     if (g_slv > 1) {
+      utils::check(wp == nullptr,
+                   "pol_vertex_legs = \"ward\" is wired on the per-rank resolvent path only "
+                   "(T15-b); set ladder_solve_grid = 1 (resolved g = {}).", g_slv);
       vertex_ladder_detail::ladder_slate_thread_guard(g_slv, "ladder whalf");
       vertex_ladder_detail::pair_space_ladder_slate(G_CC, _Xb_skma, _W0b_qmm.value(), kmq,
                                                     kpq, tools, nu_h, &Pl, mpi->comm,
@@ -2480,13 +2846,13 @@ namespace solvers {
                                               mpi->internode_comm.rank(),
                                               mpi->internode_comm.size(), symc,
                                               std::addressof(mpi->node_comm), lam_max,
-                                              nullptr, nullptr, nullptr, &prof, tdap);
+                                              nullptr, nullptr, nullptr, &prof, tdap, wp);
     else
       vertex_ladder_detail::pair_space_ladder(G_CC, _Xb_skma, _W0b_qmm.value(), kmq,
                                               kpq, tools, nu_h, nullptr, &Pl,
                                               mpi->comm.rank(), mpi->comm.size(), symc,
                                               nullptr, lam_max,
-                                              nullptr, nullptr, nullptr, &prof, tdap);
+                                              nullptr, nullptr, nullptr, &prof, tdap, wp);
     cwatch.lap();
     // the idle-rank meter: a rank that finished its (s,q) units early waits here. The
     // all_reduce below already synchronizes, so this only SPLITS an existing wait.
@@ -2498,6 +2864,14 @@ namespace solvers {
                                       boost::mpi3::max<>{});
     prof.t_reduce = cwatch.lap();
     prof.t_call = twatch.lap();
+    if (wp != nullptr) {
+      mpi->comm.all_reduce_in_place_n(Pd.data(), Pd.size(), std::plus<>{});
+      wmeter.reduce_max(mpi->comm);
+      const double asym_l = vertex_ladder_detail::hermitize_mn(Pl);
+      const double asym_d = vertex_ladder_detail::hermitize_mn(Pd);
+      vertex_ladder_detail::log_ward_meters(wmeter, asym_l, asym_d, nu_h, nw_b, "whalf");
+      if (Pi_dlam != nullptr) *Pi_dlam = Pd;
+    }
     vertex_ladder_detail::prof_report(prof, mpi->comm, "whalf");
     return Pl;
   }
@@ -3127,6 +3501,121 @@ namespace solvers {
    * zeros-elsewhere all_reduce, so every variant must be BITWISE the replicated
    * reference (max abs diff exactly 0.0) -- stronger than the FP floor.
    */
+  /**
+   * Tier 1.5 increment T15-b gates (vertex_t.h for the field-by-field contract). Nosym
+   * window mode on the loop's own state; three PH-sym nodes (inu = 0 first).
+   */
+  vertex_t::ward_legs_diag vertex_t::ward_legs_gate(MBState &mb_state, THC_ERI auto &thc) {
+    decltype(nda::range::all) all;
+    ward_legs_diag d;
+    utils::check(active() and secondary(),
+                 "vertex_t::ward_legs_gate: requires an ACTIVE secondary-basis vertex.");
+    utils::check(not _wannier, "vertex_t::ward_legs_gate: window mode only.");
+    utils::check(_W0b_qmm.has_value(),
+                 "vertex_t::ward_legs_gate: W0bar is absent -- build_w0 must run first.");
+    auto MF = thc.MF();
+    auto mpi = thc.mpi();
+    utils::check(MF->nkpts() == MF->nkpts_ibz(),
+                 "vertex_t::ward_legs_gate: nosym meshes only (eval_pol_pi0 is nosym).");
+    nda::array<ComplexType, 5> G_CC;
+    nda::array<long, 2> kmq, kpq;
+    vertex_sym::sym_ctx const *symc = nullptr;
+    ladder_inputs(mb_state, thc, G_CC, kmq, kpq, symc);
+    vertex_pi::iaft_tools tools(*_ft);
+    const long nw_b = tools.nw_b;
+    utils::check(nw_b / 2 + 2 < nw_b, "vertex_t::ward_legs_gate: bosonic mesh too small.");
+    std::vector<long> nus = {nw_b / 2, nw_b / 2 + 1, nw_b / 2 + 2};
+    const long nnu = long(nus.size()), nq_ext = MF->nqpts_ibz(), Nm = _Xb_skma.shape(2);
+    const long rank = mpi->comm.rank(), size = mpi->comm.size();
+    auto max_abs4 = [](nda::array<ComplexType, 4> const &A) {
+      double m = 0.0;
+      for (auto const &v : A) m = std::max(m, std::abs(v));
+      return m;
+    };
+
+    // (1) the BARE zero-rung bubble of the pair kernel vs eval_pol_pi0's Hadamard bubble
+    //     at inu = 0: -spin/nk sum_k conj(D)^T Cb D must BE the RPA bubble of the
+    //     secondary basis (the file header's prefactor statement, now pinned).
+    {
+      nda::array<ComplexType, 4> Pb(nnu, nq_ext, Nm, Nm);
+      vertex_ladder_detail::ward_args wa;
+      wa.Pi_bub = std::addressof(Pb);
+      vertex_ladder_detail::pair_space_ladder(G_CC, _Xb_skma, _W0b_qmm.value(), kmq, kpq,
+                                              tools, nus, nullptr, nullptr, rank, size, symc,
+                                              nullptr, nullptr, nullptr, nullptr, nullptr,
+                                              nullptr, nullptr, std::addressof(wa));
+      mpi->comm.all_reduce_in_place_n(Pb.data(), Pb.size(), std::plus<>{});
+      auto Pi0 = eval_pol_pi0(mb_state, thc);            // (nt_half, nq, Nm, Nm), tau
+      const long nt_h = Pi0.shape(0);
+      const long nw_half = (nw_b % 2 == 0) ? nw_b / 2 : nw_b / 2 + 1;
+      utils::check(Pi0.shape(1) == nq_ext and Pi0.shape(2) == Nm,
+                   "vertex_t::ward_legs_gate: eval_pol_pi0 shape mismatch.");
+      nda::array<ComplexType, 4> Pw(nw_half, nq_ext, Nm, Nm);
+      auto P2 = nda::reshape(Pi0, std::array<long, 2>{nt_h, nq_ext * Nm * Nm});
+      auto W2 = nda::reshape(Pw, std::array<long, 2>{nw_half, nq_ext * Nm * Nm});
+      _ft->tau_to_w_PHsym(P2, W2);
+      // per node: |Pb - Pw|, |Pb - Pw^T| (M <-> N), |Pb - conj(Pw)|, all relative to |Pw|.
+      // At inu = 0 the RPA object is Hermitian (Pw^T = conj Pw); at inu != 0 the three
+      // candidates differ and say which frequency row the pair kernel's Cb(nu) IS.
+      for (long jn = 0; jn < std::min(nnu, nw_half); ++jn) {
+        double d0 = 0.0, dT = 0.0, dC = 0.0, smax = 0.0;
+        for (long iq = 0; iq < nq_ext; ++iq)
+          for (long m = 0; m < Nm; ++m)
+            for (long n = 0; n < Nm; ++n) {
+              const ComplexType a = Pb(jn, iq, m, n), w = Pw(jn, iq, m, n);
+              d0 = std::max(d0, std::abs(a - w));
+              dT = std::max(dT, std::abs(a - Pw(jn, iq, n, m)));
+              dC = std::max(dC, std::abs(a - std::conj(w)));
+              smax = std::max(smax, std::abs(w));
+            }
+        if (smax > 0.0) { d0 /= smax; dT /= smax; dC /= smax; }
+        if (jn == 0) d.bub_pin = d0;
+        app_log(1, "  [T15-b gate] pair-kernel zero-rung bubble vs eval_pol_pi0 at node {} (inu "
+                   "= {}): rel diff vs Pw {:.3e}, vs Pw^T {:.3e}, vs conj(Pw) {:.3e} (scale "
+                   "{:.3e})", jn, nus[size_t(jn)] - nw_b / 2, d0, dT, dC, smax);
+      }
+    }
+    // (2) the Lambda legs: Delta P^Lambda, the resummed ladder on Lambda legs, the meters
+    {
+      double feG = 0.0, feS = 0.0, rrG = 0.0, rrS = 0.0;
+      auto wctx = vertex_ladder_detail::build_ward_legs(mb_state, MF, *_ft, _band_window,
+                                                        tools, nus, feG, feS, rrG, rrS);
+      d.fit_err_G = feG;
+      d.fit_err_S = feS;
+      d.rr_G = rrG;
+      d.rr_S = rrS;
+      vertex_ladder_detail::log_ward_fit(feG, feS, rrG, rrS, "gate");
+      nda::array<ComplexType, 4> Pl(nnu, nq_ext, Nm, Nm), Pd(nnu, nq_ext, Nm, Nm);
+      vertex_ladder_detail::ward_meter wm;
+      wm.init(nnu);
+      vertex_ladder_detail::ward_args wa;
+      wa.ctx = std::addressof(wctx);
+      wa.Pi_dlam = std::addressof(Pd);
+      wa.meter = std::addressof(wm);
+      vertex_ladder_detail::pair_space_ladder(G_CC, _Xb_skma, _W0b_qmm.value(), kmq, kpq,
+                                              tools, nus, nullptr, std::addressof(Pl), rank,
+                                              size, symc, nullptr, nullptr, nullptr, nullptr,
+                                              nullptr, nullptr, nullptr, std::addressof(wa));
+      mpi->comm.all_reduce_in_place_n(Pl.data(), Pl.size(), std::plus<>{});
+      mpi->comm.all_reduce_in_place_n(Pd.data(), Pd.size(), std::plus<>{});
+      wm.reduce_max(mpi->comm);
+      d.asym_ladder = vertex_ladder_detail::hermitize_mn(Pl);
+      d.asym_dlam = vertex_ladder_detail::hermitize_mn(Pd);
+      vertex_ladder_detail::log_ward_meters(wm, d.asym_ladder, d.asym_dlam, nus, nw_b, "gate");
+      d.pole_vs_tau = 0.0;
+      for (long jn = 0; jn < nnu; ++jn) {
+        d.gamma_bare[jn] = wm.gamma_trace(jn, 0);
+        d.gamma_lam[jn] = wm.gamma_trace(jn, 1);
+        d.pole_vs_tau = std::max(d.pole_vs_tau, wm.pole_vs_tau(jn));
+      }
+      d.dlam_max = max_abs4(Pd);
+      d.ladder_max = max_abs4(Pl);
+      app_log(1, "  [T15-b gate] |Delta P^Lambda|_max = {:.3e}, |ladder on Lambda legs "
+                 "(incl. Delta)|_max = {:.3e}", d.dlam_max, d.ladder_max);
+    }
+    return d;
+  }
+
   vertex_t::ladder_p3_diag vertex_t::ladder_p3_gate(MBState &mb_state, THC_ERI auto &thc) {
     decltype(nda::range::all) all;
     ladder_p3_diag out;

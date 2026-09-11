@@ -51,6 +51,8 @@
 #include "nda/linalg/eigenelements.hpp"
 #include "numerics/nda_functions.hpp"
 #include "methods/vertex/ward_legs.hpp"
+#include "numerics/imag_axes_ft/IAFT.hpp"
+#include "numerics/imag_axes_ft/dlr_pole_fit.hpp"
 
 namespace bdft_tests {
 
@@ -542,6 +544,275 @@ namespace bdft_tests {
                  "{:.3e}, telescoping residual / bare = {:.3e}", smax, worst);
       REQUIRE(worst < 1e-8);
     }
+  }
+
+  // ======================================================================================
+  // PHYSICS PROBE (T15-b): the SIGN and size of the eq-21 correction in the interband
+  // channel on the imaginary axis. Scalar toys: a valence-like pole at k (h < 0) and a
+  // conduction-like pole at k+q (h > 0), each dressed by satellite-like Sigma poles on its
+  // own side. The bare pair element (1/beta) sum G_v G_c is a screening-like (negative)
+  // number; the proposal's coherent-pole bookkeeping (eq 26) predicts Delta of the SAME
+  // sign at ~ (1/Z - 1) relative size. Reported, not asserted -- this is what the LiH
+  // fixture readout (T15-b) contradicted (anti-screening ~3x the RPA head at |q|^2 ~ 0.5).
+  TEST_CASE("ward_legs_interband_sign", "[methods][vertex][scgwt][tier15]") {
+    auto &mpi = utils::make_unit_test_mpi_context();
+    (void)mpi;
+    for (double beta : {10.0, 1000.0}) {
+      for (double rs : {0.10, 0.15, 0.20}) {
+        // k: valence at -0.5 with its main Sigma weight below; k+q: conduction at +0.5 with
+        // its main weight above (a small weight on the other side keeps every G pole off
+        // the Sigma nodes -- exact coincidences would divide by zero in the toy's tables)
+        auto tv = make_toy(1, {-2.0, -1.5, 1.5, 2.0}, {rs, rs, 0.03, 0.03}, 5u);
+        auto tc = make_toy(1, {-2.0, -1.5, 1.5, 2.0}, {0.03, 0.03, rs, rs}, 6u);
+        tv.h(0, 0) = cplx(-0.5);
+        tc.h(0, 0) = cplx(0.5);
+        // rebuild the exact pole data for the shifted h (make_toy drew a random h)
+        auto rebuild = [&](toy_k &t) {
+          const long N = t.ng;
+          nda::matrix<cplx> Hb(N, N);
+          Hb() = cplx(0.0);
+          Hb(0, 0) = t.h(0, 0);
+          for (long p = 0; p < t.np; ++p) {
+            const long o = 1 + p;
+            const cplx b = std::sqrt(t.R(p, 0, 0));   // R = b b^*, b real >= 0
+            Hb(0, o) = b;
+            Hb(o, 0) = b;
+            Hb(o, o) = cplx(t.epsS(p));
+          }
+          auto [ev, U] = nda::linalg::eigenelements(Hb);
+          for (long j = 0; j < N; ++j) {
+            t.lam(j) = ev(j);
+            t.g(j, 0, 0) = U(0, j) * std::conj(U(0, j));
+          }
+        };
+        rebuild(tv);
+        rebuild(tc);
+        // Z of the valence QP pole (the pole nearest -0.3) and its Lambda0(E;0)
+        long jv = 0;
+        for (long j = 0; j < tv.ng; ++j)
+          if (std::abs(tv.lam(j) + 0.5) < std::abs(tv.lam(jv) + 0.5)) jv = j;
+        const double Zv = tv.g(jv, 0, 0).real();
+        auto set = assemble({tv, tc});
+        nda::array<cplx, 1> inu(3);
+        inu(0) = cplx(0.0);
+        inu(1) = I_ * (2.0 * M_PI / beta);
+        inu(2) = I_ * (2.0 * M_PI * 4.0 / beta);
+        auto tab = wl::build_s_tables(beta, set.epsS, set.epsG, false, inu);
+        auto blk = wl::slice_blocks(set.g, set.R, nda::range(0, 1));
+        auto ctx = wl::build_ward_ctx(tab, blk.gC, blk.gA, blk.gB, blk.RA, blk.RB);
+        for (long jn = 0; jn < 3; ++jn) {
+          nda::array<cplx, 2> Xb(1, 1), Xl(1, 1);
+          wl::pole_bare_bubble(ctx, 0, jn, 0, 1, Xb);
+          Xl() = cplx(0.0);
+          wl::add_pair_correction(ctx, 0, jn, 0, 1, Xl);
+          app_log(1, "ward_legs_interband_sign: beta {} rs {} Z_v {:.4f} lam_v {:+.4f} node {}: "
+                     "bare (v,c) = {:+.6e}{:+.3e}i, Delta = {:+.6e}{:+.3e}i, Delta/bare = {:+.4f}",
+                  beta, rs, Zv, tv.lam(jv), jn, Xb(0, 0).real(), Xb(0, 0).imag(),
+                  Xl(0, 0).real(), Xl(0, 0).imag(), (Xl(0, 0) / Xb(0, 0)).real());
+        }
+      }
+    }
+  }
+
+  // PHYSICS PROBE 2 (T15-b): the SAME-BAND (intraband) channel of a FILLED band at finite q.
+  // Both poles occupied (valence at k and at k+q, dispersion E_k != E_{k+q}); the bare pair
+  // element carries the Pauli factor f(E_k) - f(E_{k+q}) = 0 (plus the tiny QP -> satellite
+  // piece). With a q-INDEPENDENT Lambda0(k) the residue bracket becomes
+  // Lambda0(E_k) - Lambda0(E_{k+q}) -- O(dispersion x dLambda/dE) over the same denominator,
+  // i.e. O(1) at any finite q: a Pauli-blocking violation of the ansatz in the channel whose
+  // density vertex is O(1). Reported, not asserted.
+  TEST_CASE("ward_legs_intraband_probe", "[methods][vertex][scgwt][tier15]") {
+    auto &mpi = utils::make_unit_test_mpi_context();
+    (void)mpi;
+    const double beta = 1000.0;
+    for (double disp : {0.0, 0.05, 0.15, 0.30}) {
+      for (double rs : {0.10, 0.20}) {
+        auto ta = make_toy(1, {-2.0, -1.5, 1.5, 2.0}, {rs, rs, 0.03, 0.03}, 5u);
+        auto tb = make_toy(1, {-2.0, -1.5, 1.5, 2.0}, {rs, rs, 0.03, 0.03}, 7u);
+        ta.h(0, 0) = cplx(-0.5);
+        tb.h(0, 0) = cplx(-0.5 + disp);
+        auto rebuild = [&](toy_k &t) {
+          const long N = t.ng;
+          nda::matrix<cplx> Hb(N, N);
+          Hb() = cplx(0.0);
+          Hb(0, 0) = t.h(0, 0);
+          for (long p = 0; p < t.np; ++p) {
+            const long o = 1 + p;
+            const cplx b = std::sqrt(t.R(p, 0, 0));
+            Hb(0, o) = b;
+            Hb(o, 0) = b;
+            Hb(o, o) = cplx(t.epsS(p));
+          }
+          auto [ev, U] = nda::linalg::eigenelements(Hb);
+          for (long j = 0; j < N; ++j) {
+            t.lam(j) = ev(j);
+            t.g(j, 0, 0) = U(0, j) * std::conj(U(0, j));
+          }
+        };
+        rebuild(ta);
+        rebuild(tb);
+        auto set = assemble({ta, tb});
+        nda::array<cplx, 1> inu(2);
+        inu(0) = cplx(0.0);
+        inu(1) = I_ * (2.0 * M_PI / beta);
+        auto tab = wl::build_s_tables(beta, set.epsS, set.epsG, false, inu);
+        auto blk = wl::slice_blocks(set.g, set.R, nda::range(0, 1));
+        auto ctx = wl::build_ward_ctx(tab, blk.gC, blk.gA, blk.gB, blk.RA, blk.RB);
+        for (long jn = 0; jn < 2; ++jn) {
+          nda::array<cplx, 2> Xb(1, 1), Xl(1, 1);
+          wl::pole_bare_bubble(ctx, 0, jn, 0, 1, Xb);
+          Xl() = cplx(0.0);
+          wl::add_pair_correction(ctx, 0, jn, 0, 1, Xl);
+          app_log(1, "ward_legs_intraband_probe: disp {:.2f} rs {} node {}: bare (occ,occ) = "
+                     "{:+.6e}{:+.3e}i, Delta = {:+.6e}{:+.3e}i", disp, rs, jn, Xb(0, 0).real(),
+                  Xb(0, 0).imag(), Xl(0, 0).real(), Xl(0, 0).imag());
+        }
+      }
+    }
+  }
+
+  // ======================================================================================
+  // FITTED-RESIDUE PROBE (T15-b): the production pathway on exact data. The exact toy's
+  // G(tau) and Sigma_c(tau) are sampled on the fixture's DLR grid (beta 1000, wmax 6, prec
+  // low), pole-fitted with dlr_pole_fit (the aux NONSYM grid, shared node set), and the
+  // ward algebra is run on the FITTED residues (shared = true) -- exactly what
+  // build_ward_legs does. Compared against the exact-residue result at q = 0: the traced
+  // pair propagator (bare and Lambda) at nu = 0 and at the first two nu != 0 nodes.
+  // This isolates the "bilinear in the residues" hazard at the nu = 0 derivative branches.
+  TEST_CASE("ward_legs_fitted_residues", "[methods][vertex][scgwt][tier15]") {
+#ifndef ENABLE_DLR
+    SUCCEED("ward_legs_fitted_residues skipped: build has ENABLE_DLR=OFF.");
+#else
+    auto &mpi = utils::make_unit_test_mpi_context();
+    (void)mpi;
+    imag_axes_ft::IAFT ft(1000, 6.0, imag_axes_ft::dlr_basis, "low");
+    const double beta = ft.beta();
+    imag_axes_ft::dlr_pole_fit pf(ft);
+    const long nt = pf.nt, np = pf.np, nb = 3;
+    // an insulator-like toy: h with eigenvalues straddling mu = 0, Sigma poles away from mu
+    auto t = make_toy(nb, {-2.2, -1.4, -0.9, 1.1, 1.6, 2.4}, {0.3, 0.25, 0.2, 0.2, 0.25, 0.3}, 17u);
+    for (long i = 0; i < nb; ++i) t.h(i, i) += cplx((i - 1) * 0.6);   // spread ~[-0.6, 0.6]
+    {
+      const long N = t.ng;
+      nda::matrix<cplx> Hb(N, N);
+      Hb() = cplx(0.0);
+      for (long i = 0; i < nb; ++i)
+        for (long j = 0; j < nb; ++j) Hb(i, j) = t.h(i, j);
+      std::mt19937 gen(17u);
+      std::normal_distribution<double> nd(0.0, 1.0);
+      for (long p = 0; p < t.np; ++p) {
+        // regenerate a B_p consistent with R_p = B B^dag: Cholesky-free route -- use the
+        // eigen-decomposition of R_p (PSD) to get B = V sqrt(D)
+        nda::matrix<cplx> Rm(nb, nb);
+        for (long i = 0; i < nb; ++i)
+          for (long j = 0; j < nb; ++j) Rm(i, j) = t.R(p, i, j);
+        auto [ev, V] = nda::linalg::eigenelements(Rm);
+        const long o = nb * (p + 1);
+        for (long i = 0; i < nb; ++i) {
+          for (long j = 0; j < nb; ++j) {
+            const cplx b = V(i, j) * std::sqrt(std::max(ev(j), 0.0));
+            Hb(i, o + j) = b;
+            Hb(o + j, i) = std::conj(b);
+          }
+          Hb(o + i, o + i) = cplx(t.epsS(p));
+        }
+      }
+      auto [ev, U] = nda::linalg::eigenelements(Hb);
+      for (long j = 0; j < N; ++j) {
+        t.lam(j) = ev(j);
+        for (long i = 0; i < nb; ++i)
+          for (long k = 0; k < nb; ++k) t.g(j, i, k) = U(i, j) * std::conj(U(k, j));
+      }
+      double gap_lo = -1e300, gap_hi = 1e300;
+      for (long j = 0; j < N; ++j) {
+        if (t.lam(j) < 0.0) gap_lo = std::max(gap_lo, t.lam(j));
+        else gap_hi = std::min(gap_hi, t.lam(j));
+      }
+      app_log(1, "ward_legs_fitted_residues: toy poles in [{:.3f}, {:.3f}], gap ({:.3f}, {:.3f}); "
+                 "aux grid np = {} nodes, min |eps| = {:.3e} Ha (beta*eps = {:.3e})",
+              t.lam(0), t.lam(N - 1), gap_lo, gap_hi, np, pf.min_abs_node / beta, pf.min_abs_node);
+    }
+    // tau samples on the backend grid: F(tau) = sum_j c_j K_F(tau, e_j)
+    auto sample = [&](nda::array<double, 1> const &e, nda::array<cplx, 3> const &c,
+                      long ncoef) {
+      nda::array<cplx, 2> F(nt, nb * nb);
+      F() = cplx(0.0);
+      for (long i = 0; i < nt; ++i)
+        for (long j = 0; j < ncoef; ++j) {
+          const double K = imag_axes_ft::dlr_kF(beta, pf.s_phys(i), e(j));
+          for (long a = 0; a < nb; ++a)
+            for (long b = 0; b < nb; ++b) F(i, a * nb + b) += c(j, a, b) * K;
+        }
+      return F;
+    };
+    auto FG = sample(t.lam, t.g, t.ng);
+    auto FS = sample(t.epsS, t.R, t.np);
+    auto cG = pf.coeffs(FG);
+    auto cS = pf.coeffs(FS);
+    app_log(1, "ward_legs_fitted_residues: fit_error G {:.3e}, Sigma {:.3e}; residue ratio G "
+               "{:.3g}, Sigma {:.3g}", pf.fit_error(FG, cG), pf.fit_error(FS, cS),
+            pf.residue_ratio(FG, cG), pf.residue_ratio(FS, cS));
+    // fitted residues into the (1, np, 1, nb, nb) layout
+    nda::array<cplx, 5> gF(1, np, 1, nb, nb), RF(1, np, 1, nb, nb);
+    for (long p = 0; p < np; ++p)
+      for (long a = 0; a < nb; ++a)
+        for (long b = 0; b < nb; ++b) {
+          gF(0, p, 0, a, b) = cG(p, a * nb + b);
+          RF(0, p, 0, a, b) = cS(p, a * nb + b);
+        }
+    nda::array<cplx, 1> inu(3);
+    inu(0) = cplx(0.0);
+    inu(1) = I_ * (2.0 * M_PI / beta);
+    inu(2) = I_ * (2.0 * M_PI * 2.0 / beta);
+    // fitted route: shared aux nodes -- the nu = 0 row as the exact derivative branches
+    // (K = 0) and as the nu -> 0 limit from K = 2, 3, 4 Matsubara nodes
+    for (long K : {0l, 2l, 3l, 4l}) {
+    auto tabF = wl::build_s_tables(beta, pf.epsl, pf.epsl, true, inu, K);
+    auto blkF = wl::slice_blocks(gF, RF, nda::range(0, nb));
+    auto ctxF = wl::build_ward_ctx(tabF, blkF.gC, blkF.gA, blkF.gB, blkF.RA, blkF.RB);
+    // exact route: the toy's own poles
+    auto set = assemble({t});
+    auto tabE = wl::build_s_tables(beta, set.epsS, set.epsG, false, inu);
+    auto blkE = wl::slice_blocks(set.g, set.R, nda::range(0, nb));
+    auto ctxE = wl::build_ward_ctx(tabE, blkE.gC, blkE.gA, blkE.gB, blkE.RA, blkE.RB);
+    const long nc2 = nb * nb;
+    for (long jn = 0; jn < 3; ++jn) {
+      nda::array<cplx, 2> XbF(nc2, nc2), XlF(nc2, nc2), XbE(nc2, nc2), XlE(nc2, nc2);
+      wl::pole_bare_bubble(ctxF, 0, jn, 0, 0, XbF);
+      wl::pole_bare_bubble(ctxE, 0, jn, 0, 0, XbE);
+      XlF() = cplx(0.0);
+      XlE() = cplx(0.0);
+      wl::add_pair_correction(ctxF, 0, jn, 0, 0, XlF);
+      wl::add_pair_correction(ctxE, 0, jn, 0, 0, XlE);
+      double db = 0.0, dl = 0.0, sb = 0.0, sl = 0.0;
+      nda::array<cplx, 2> trE(nb, nb), trF(nb, nb), trbE(nb, nb), trbF(nb, nb);
+      trE() = cplx(0.0); trF() = cplx(0.0); trbE() = cplx(0.0); trbF() = cplx(0.0);
+      for (long r = 0; r < nc2; ++r)
+        for (long c = 0; c < nc2; ++c) {
+          db = std::max(db, std::abs(XbF(r, c) - XbE(r, c)));
+          dl = std::max(dl, std::abs(XlF(r, c) - XlE(r, c)));
+          sb = std::max(sb, std::abs(XbE(r, c)));
+          sl = std::max(sl, std::abs(XlE(r, c)));
+        }
+      for (long p1p = 0; p1p < nb; ++p1p)
+        for (long p3 = 0; p3 < nb; ++p3)
+          for (long a = 0; a < nb; ++a) {
+            const long r = p1p * nb + p3, c = a * nb + a;
+            trbE(p3, p1p) += XbE(r, c);
+            trbF(p3, p1p) += XbF(r, c);
+            trE(p3, p1p) += XbE(r, c) + XlE(r, c);
+            trF(p3, p1p) += XbF(r, c) + XlF(r, c);
+          }
+      app_log(1, "ward_legs_fitted_residues [nu0_extrap {}]: node {}: |bare_fit - bare_exact| "
+                 "{:.3e} (scale {:.3e}); |Delta_fit - Delta_exact| {:.3e} (scale {:.3e}); traced "
+                 "q=0: bare exact {:.3e} fit {:.3e}; Lambda-corrected exact {:.3e} fit {:.3e}",
+              K, jn, db, sb, dl, sl, max_abs(trbE), max_abs(trbF), max_abs(trE), max_abs(trF));
+      REQUIRE(db < 1e-4 * sb);                          // the bare bubble: fit class at every node
+      if (jn > 0) REQUIRE(dl < 1e-3 * sl);              // nu != 0: fit class always
+      if (jn == 0 and K == 3) REQUIRE(dl < 1e-2 * sl);  // nu = 0 via the limit: extrapolation class
+    }
+    }
+#endif
   }
 
 } // namespace bdft_tests

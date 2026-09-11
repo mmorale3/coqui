@@ -4812,14 +4812,18 @@ namespace solvers {
   // scGW-tilde L1/L2 (vertex_ladder.icc)
   template nda::array<ComplexType, 4> vertex_t::eval_pol_pi0(MBState&, thc_reader_t&);
   template vertex_t::ladder_l1_diag vertex_t::ladder_l1_gates(MBState&, thc_reader_t&);
-  template nda::array<ComplexType, 3> vertex_t::eval_pol_ladder_nu0(MBState&, thc_reader_t&);
+  template nda::array<ComplexType, 3> vertex_t::eval_pol_ladder_nu0(MBState&, thc_reader_t&,
+                                                                      nda::array<ComplexType, 3>*);
   template vertex_t::ladder_p4_diag vertex_t::ladder_p4_gates(MBState&, thc_reader_t&);
   template vertex_t::ladder_sym_diag vertex_t::ladder_sym_gate(MBState&, thc_reader_t&);
   template vertex_t::ladder_p3_diag vertex_t::ladder_p3_gate(MBState&, thc_reader_t&);
 
   // qpGW Q3 (notes/q3_bse_tier_spec.md increment I1)
   template nda::array<ComplexType, 4>
-  vertex_t::eval_pol_ladder_whalf(MBState&, thc_reader_t&, nda::array<double, 1>*);
+  vertex_t::eval_pol_ladder_whalf(MBState&, thc_reader_t&, nda::array<double, 1>*,
+                                  nda::array<ComplexType, 4>*);
+  // scGW-tilde Tier 1.5 (notes/tier15_ward_legs_plan.md, increment T15-b)
+  template vertex_t::ward_legs_diag vertex_t::ward_legs_gate(MBState&, thc_reader_t&);
   template vertex_t::ladder_whalf_diag
   vertex_t::ladder_whalf_gate(MBState&, thc_reader_t&, double);
 

@@ -447,6 +447,8 @@ namespace solvers {
     // Finding F-DA-1 was precisely a knob that did NOT travel here.
     _pol_vtx->set_ladder_da(_vertex->ladder_tda(), _vertex->ladder_head_scale(),
                             _vertex->ladder_qnu_meter());
+    // Tier 1.5 (notes/tier15_ward_legs_plan.md): the leg vertex travels the same way.
+    _pol_vtx->set_ladder_legs(_vertex->ladder_legs());
     app_log(1, "  [scGW-tilde L2] ladder readout instance: C window = [{}, {}), "
                "secondary rank knob = {}, div_treatment = {} (kernel head follows "
                "build_w0's policy; W0bar is SAME-iteration -- coincides with "
@@ -778,7 +780,12 @@ namespace solvers {
     ladder_meter::watch lwatch, ltot;
     const double rss_in = ladder_meter::rss_gb();
     nda::array<double, 1> lam;
-    auto Pl = _pol_vtx->eval_pol_ladder_whalf(mb_state, thc, &lam);  // (nw_h, nq, Nm, Nm)
+    // Tier 1.5: with legs = "ward" the whalf pass also returns Delta P^Lambda (its inu = 0
+    // row feeds the readout's "+DeltaLambda" column); Pl then already contains it (eq 27).
+    const bool ward_legs = _pol_vtx->ladder_ward_legs();
+    nda::array<ComplexType, 4> Pd;
+    auto Pl = _pol_vtx->eval_pol_ladder_whalf(mb_state, thc, &lam,
+                                              ward_legs ? std::addressof(Pd) : nullptr);
     const double t_eval = lwatch.lap();
     const double rss_eval = ladder_meter::rss_gb();
     auto const &tmap = _pol_vtx->secondary_transfer();               // (nq, Nm, Np)
@@ -796,6 +803,8 @@ namespace solvers {
     // ladder pass it replaces, minus that pass's entire wall (measured 20% of the combined
     // ladder wall, at 70% idle: profiling results section 1.2).
     _pol_nu0_row.emplace(nda::array<ComplexType, 3>(Pl(0, nda::ellipsis{})));
+    if (ward_legs) _pol_nu0_dlam.emplace(nda::array<ComplexType, 3>(Pd(0, nda::ellipsis{})));
+    else _pol_nu0_dlam.reset();
 
     auto t_rng = dPi_tqPQ.local_range(0);
     auto q_rng = dPi_tqPQ.local_range(1);
@@ -1050,16 +1059,27 @@ namespace solvers {
     // With the injection disabled (or any standalone caller) the row is absent and the
     // historic self-contained evaluation runs unchanged.
     nda::array<ComplexType, 3> Pl_qmm;
+    // Tier 1.5: the "+DeltaLambda" column = RPA + the zero-rung Lambda term alone
+    const bool ward_legs = _pol_vtx->ladder_ward_legs();
+    nda::array<ComplexType, 3> Pd_qmm;
     if (_pol_nu0_row.has_value()) {
       Pl_qmm = std::move(_pol_nu0_row.value());
       _pol_nu0_row.reset();
+      if (ward_legs) {
+        utils::check(_pol_nu0_dlam.has_value(),
+                     "pol_ladder_eps_readout: legs = \"ward\" but the injection cached no "
+                     "Delta P^Lambda row.");
+        Pd_qmm = std::move(_pol_nu0_dlam.value());
+        _pol_nu0_dlam.reset();
+      }
       utils::check(Pl_qmm.shape(0) == nq,
                    "pol_ladder_eps_readout: cached inu = 0 ladder row has {} q rows, "
                    "expected {}.", Pl_qmm.shape(0), nq);
       app_log(2, "  [scGW-tilde L2] eps_M readout: reusing the injection's inu = 0 ladder "
                  "row (no second pair-space ladder pass).");
     } else {
-      Pl_qmm = _pol_vtx->eval_pol_ladder_nu0(mb_state, thc);      // (nq, Nm, Nm)
+      Pl_qmm = _pol_vtx->eval_pol_ladder_nu0(mb_state, thc,
+                                             ward_legs ? std::addressof(Pd_qmm) : nullptr);
     }
     auto const &tmap = _pol_vtx->secondary_transfer();            // (nq, Nm, Np)
     const long Nm = Pl_qmm.shape(1);
@@ -1095,9 +1115,10 @@ namespace solvers {
     auto Chi_bar = thc.basis_bar_head();                          // (nq, Np)
     const double fpi = 4.0 * 3.14159265358979323846;
     nda::array<ComplexType, 2> dP(Np, Np), tmpM(Nm, Np), A(Np, Np);
+    nda::array<ComplexType, 2> dPd(ward_legs ? Np : 0, ward_legs ? Np : 0);
     nda::matrix<ComplexType> Am(Np, Np);
     nda::array<ComplexType, 1> chi_c(Np), buf(Np);
-    double eps_rpa_qmin = -1.0, eps_lad_qmin = -1.0, qmin_abs2 = 1e300;
+    double eps_rpa_qmin = -1.0, eps_lad_qmin = -1.0, eps_dlm_qmin = -1.0, qmin_abs2 = 1e300;
     long iq_min = -1;
     // ---- DA D-7: the per-q Dyson-W change driven by P^lad ------------------------------
     // PURE OBSERVER, and the direct answer to "does the ladder act at small q?": for every
@@ -1124,12 +1145,16 @@ namespace solvers {
       for (long m = 0; m < Nm; ++m)
         for (long P = 0; P < Np; ++P) td(P, m) = std::conj(tq(m, P));
       nda::blas::gemm(td, tmpM, dP);                              // t^dag Pl t
+      if (ward_legs) {                                            // t^dag Pd t
+        nda::blas::gemm(Pd_qmm(iq, all, all), tq, tmpM);
+        nda::blas::gemm(td, tmpM, dPd);
+      }
       const double factor = (q_abs2 / fpi) * MF->volume();
       chi_c = nda::conj(Chi_bar(iq, all));
-      auto eps_of = [&](bool with_ladder, nda::array<ComplexType, 2> *dW_out) {
-        // A = I - Z (P0 [+ dP]);  dW = (A^{-1} - I) Z;  head contraction
+      auto eps_of = [&](nda::array<ComplexType, 2> const *add, nda::array<ComplexType, 2> *dW_out) {
+        // A = I - Z (P0 [+ add]);  dW = (A^{-1} - I) Z;  head contraction
         A() = Pi0_qPQ(iq, all, all);
-        if (with_ladder) A += dP;
+        if (add != nullptr) A += *add;
         nda::array<ComplexType, 2> ZP(Np, Np);
         nda::blas::gemm(Z_qPQ(iq, all, all), A, ZP);
         Am() = ZP;
@@ -1143,11 +1168,13 @@ namespace solvers {
         const ComplexType eih = factor * nda::blas::dot(Chi_bar(iq, all), buf);
         return 1.0 / (1.0 + eih.real());
       };
-      const double e_rpa = eps_of(false, qnu_meter ? std::addressof(W_rpa) : nullptr);
+      const double e_rpa = eps_of(nullptr, qnu_meter ? std::addressof(W_rpa) : nullptr);
       // The +ladder leg is evaluated by the SAME call in both modes -- the meter only asks
       // it to also hand back dW, so eps_lad (a physics readout consumed by the Q3 gates)
       // is bitwise what the historic path produced.
-      const double e_lad = eps_of(true, qnu_meter ? std::addressof(W_lad) : nullptr);
+      const double e_lad = eps_of(std::addressof(dP), qnu_meter ? std::addressof(W_lad) : nullptr);
+      // Tier 1.5: chi0_Lambda alone (the zero-rung Lambda term on top of RPA)
+      const double e_dlm = ward_legs ? eps_of(std::addressof(dPd), nullptr) : -1.0;
       if (qnu_meter) {
         double dn = 0.0, rn = 0.0;
         for (long P = 0; P < Np; ++P)
@@ -1161,12 +1188,18 @@ namespace solvers {
         eps_r[size_t(iq)] = is_gamma ? -1.0 : e_rpa;
         if (is_gamma) continue;                                   // no head at Gamma
       }
-      app_log(2, "  [scGW-tilde L2]   q {} (|q|^2 = {:.4e}): eps_M RPA = {:.6f}, "
-                 "+ladder = {:.6f}", iq, q_abs2, e_rpa, e_lad);
+      if (ward_legs)
+        app_log(2, "  [scGW-tilde L2]   q {} (|q|^2 = {:.4e}): eps_M RPA = {:.6f}, "
+                   "+DeltaLambda = {:.6f}, +ladder(Lambda legs) = {:.6f}", iq, q_abs2, e_rpa,
+                e_dlm, e_lad);
+      else
+        app_log(2, "  [scGW-tilde L2]   q {} (|q|^2 = {:.4e}): eps_M RPA = {:.6f}, "
+                   "+ladder = {:.6f}", iq, q_abs2, e_rpa, e_lad);
       if (q_abs2 < qmin_abs2) {
         qmin_abs2 = q_abs2;
         eps_rpa_qmin = e_rpa;
         eps_lad_qmin = e_lad;
+        eps_dlm_qmin = e_dlm;
         iq_min = iq;
       }
     }
@@ -1196,6 +1229,12 @@ namespace solvers {
               eps_lad_qmin - eps_rpa_qmin);
       _pol_eps_rpa = eps_rpa_qmin;
       _pol_eps_ladder = eps_lad_qmin;
+      _pol_eps_dlam = eps_dlm_qmin;
+      if (ward_legs)
+        app_log(1, "  [scGW-tilde T1.5] Tier-1.5 eps_M readout (inu = 0, q_min = {}): RPA = "
+                   "{:.6f}, +DeltaLambda (chi0_Lambda alone) = {:.6f}, +ladder on Lambda legs "
+                   "(eq 27 composite) = {:.6f}  [G-j targets at Si 4^3: ~4.8 / 5.4-5.6]",
+                iq_min, eps_rpa_qmin, eps_dlm_qmin, eps_lad_qmin);
     }
     // Q3-b(i): the SAME q_min read off the loop's own screening. Same G, same kernel, two
     // evaluation routes -- the tau-space Dyson of the (injected) Pi against the readout's

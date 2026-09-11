@@ -318,6 +318,8 @@ namespace solvers {
     // eval_pol_ladder_nu0 call, which therefore stays fully functional for standalone
     // callers (injection disabled, gates, tests).
     std::optional<nda::array<ComplexType, 3>> _pol_nu0_row;
+    // Tier 1.5: the inu = 0 row of Delta P^Lambda from the same whalf pass (legs = "ward")
+    std::optional<nda::array<ComplexType, 3>> _pol_nu0_dlam;
     // the L2 readout: ladder at nu = 0, upfold via the readout vertex's t(q), redo the
     // single-frequency Dyson with P0 and P0 + dP_ladder, report eps_M(q) both ways.
     // eps_inv_head_q (the loop's OWN q-resolved eps^-1 head on the PH-sym tau half grid,
@@ -328,6 +330,7 @@ namespace solvers {
                                 nda::array<ComplexType, 2> const *eps_inv_head_q = nullptr);
     // last readout values at q_min (RPA, +ladder); -1 before the first readout
     double _pol_eps_rpa = -1.0, _pol_eps_ladder = -1.0;
+    double _pol_eps_dlam = -1.0;   // Tier 1.5: eps_M with chi0_Lambda alone (RPA + Delta P^Lambda)
     // Q3: the LOOP's own eps_M(q_min, inu = 0) from eps_inv_head_q -- the other route of
     // the Q3-b(i) identity (tau-Dyson of the injected Pi vs the readout's single-frequency
     // Dyson). -1 before the first readout.
@@ -373,6 +376,9 @@ namespace solvers {
     std::pair<double, double> pol_eps_readout() const {
       return {_pol_eps_rpa, _pol_eps_ladder};
     }
+    // Tier 1.5: the "+DeltaLambda" column (RPA + the zero-rung Lambda term) at q_min;
+    // -1 unless pol_vertex_legs = "ward"
+    double pol_eps_dlam() const { return _pol_eps_dlam; }
     // Q3: the loop-side eps_M(q_min, inu = 0) of the same iteration (gate Q3-b(i))
     double pol_eps_loop() const { return _pol_eps_loop; }
     // Q3: the last injection's watchdog / meter values (gate Q3-c); -1 if never injected

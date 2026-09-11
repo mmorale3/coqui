@@ -860,6 +860,9 @@ namespace solvers {
     //   the Dyson-W change it drives, plus the pre/post-fold head meter (H1b). PURE
     //   OBSERVERS -- they add print-only arithmetic, never touch a physics array.
     bool _ladder_qnu_meter = false;
+    // scGW-tilde TIER 1.5 (notes/tier15_ward_legs_plan.md): the LEG VERTEX of the ladder's
+    // pair propagators, "bare" (historic, bitwise) | "ward" (the discrete-Ward Lambda0).
+    std::string _ladder_legs = "bare";
     // DIAGNOSTIC (default OFF, not physical): THE CONSTANT-RUNG ABSOLUTE PIN.
     //
     // X^L = pi^dyn - Pi^{C,0}(tau=0) must VANISH when the screening is genuinely static.
@@ -1473,13 +1476,48 @@ namespace solvers {
     bool ladder_qnu_meter() const { return _ladder_qnu_meter; }
 
     /**
+     * scGW-tilde TIER 1.5 (notes/tier15_ward_legs_plan.md; proposal section 4.6): the LEG
+     * VERTEX of the ladder's pair propagators.
+     *   "bare" (default) : the historic pair propagator -- bitwise the pre-Tier-1.5 tree.
+     *   "ward"           : Lambda0 = 1 - [Sigma(iw+inu) - Sigma(iw)]/inu inserted at the
+     *                      vertex of every pair propagator (the telescoping discrete-Ward
+     *                      vertex, eq 21), evaluated through the DLR pole products of
+     *                      ward_legs.hpp from the loop's OWN stored Sigma. The kernel then
+     *                      returns Delta P^Lambda (the zero-rung term) + rungs >= 1 on the
+     *                      Lambda legs (eq 27, the Tier-1.5 composite), (M,N)-Hermitized.
+     * Travels to the READOUT instance with the DA knobs (scr_coulomb_t::ensure_pol_vertex).
+     * The Sigma-side double-count guard is the pol_vertex one (an ACTIVE vertex_type is
+     * already excluded whenever the ladder is active).
+     */
+    void set_ladder_legs(std::string legs) {
+      utils::check(legs == "bare" or legs == "ward",
+                   "vertex_t::set_ladder_legs: unknown pol_vertex_legs \"{}\". Valid options "
+                   "are \"bare\" (default), \"ward\".", legs);
+      if (legs == "ward")
+        utils::check(_ft->basis() == imag_axes_ft::dlr_basis,
+                     "pol_vertex_legs = \"ward\" requires the DLR IAFT backend "
+                     "(iaft basis = \"dlr\").");
+      _ladder_legs = legs;
+      if (legs == "ward")
+        app_log(1, "  [scGW-tilde T1.5] pol_vertex_legs = \"ward\": the ladder's pair "
+                   "propagators carry the discrete-Ward leg vertex Lambda0 (proposal "
+                   "section 4.6, eq 21; notes/tier15_ward_legs_plan.md) built from the "
+                   "loop's own stored Sigma;\n  the kernel returns Delta P^Lambda + rungs "
+                   ">= 1 on Lambda-legs (eq 27), (M,N)-Hermitized. Static rungs on Lambda "
+                   "legs XOR a dynamical-rung BSE -- never both (eq 24 cor. ii).");
+    }
+    std::string ladder_legs() const { return _ladder_legs; }
+    bool ladder_ward_legs() const { return _ladder_legs == "ward"; }
+
+    /**
      * scGW-tilde increment L2 (vertex_ladder.icc): the resummed pair-space ladder
      * polarization at the inu = 0 bosonic node, (nq, N_m, N_m) in THIS vertex's
      * secondary aux basis (all rungs >= 1; the n = 1 term is the static-rung Pi^C,
      * pinned by gate L1-b at machine precision). Requires an ACTIVE static-rung
      * secondary vertex with W0bar built (build_w0 this iteration). Replicated.
      */
-    nda::array<ComplexType, 3> eval_pol_ladder_nu0(MBState &mb_state, THC_ERI auto &thc);
+    nda::array<ComplexType, 3> eval_pol_ladder_nu0(MBState &mb_state, THC_ERI auto &thc,
+                                                   nda::array<ComplexType, 3> *Pi_dlam = nullptr);
 
     /**
      * Q3 increment I1 (notes/q3_bse_tier_spec.md section 4): the same resummed ladder at
@@ -1490,7 +1528,8 @@ namespace solvers {
      * Replicated; same guards as eval_pol_ladder_nu0.
      */
     nda::array<ComplexType, 4> eval_pol_ladder_whalf(MBState &mb_state, THC_ERI auto &thc,
-                                                     nda::array<double, 1> *lam_max = nullptr);
+                                                     nda::array<double, 1> *lam_max = nullptr,
+                                                     nda::array<ComplexType, 4> *Pi_dlam = nullptr);
 
     /**
      * Q4-C3b (notes/q4_c3b_orbital_ladder_dc_spec.md): the ORBITAL / chi-convention local
@@ -1579,6 +1618,33 @@ namespace solvers {
       double grpN_max_diff = -1.0;  // one group of all ranks vs replicated
     };
     ladder_p3_diag ladder_p3_gate(MBState &mb_state, THC_ERI auto &thc);
+
+    /**
+     * scGW-tilde TIER 1.5 increment T15-b gates (notes/tier15_ward_legs_plan.md section
+     * 6), on the very state the loop used (nosym window mode; requires W0bar):
+     *   bub_pin        : the pair kernel's BARE zero-rung bubble -spin/nk sum_k conj(D)^T Cb D
+     *                    at inu = 0 vs eval_pol_pi0's Hadamard bubble (the normalization of
+     *                    Delta P^Lambda is that of the RPA bubble) -- machine class;
+     *   fit_err, rr    : the aux-grid DLR pole-fit reconstruction errors / residue ratios
+     *                    of G and Sigma_c (the fit-class floor every fixture G-g inherits);
+     *   gamma_*        : the G-g meter at the Gamma transfer -- |vertex-traced pair
+     *                    propagator|, bare vs Lambda-corrected, at the first three PH-sym
+     *                    nodes (ratio ~ fit class at a full band window; the window
+     *                    truncation's C1 violation otherwise);
+     *   pole_vs_tau    : max |Cb_pole - Cb_tau| / |Cb_tau| (the pole route's representation
+     *                    error on real data);
+     *   asym_*         : (M,N) asymmetry of the ladder / Delta P^Lambda outputs before the
+     *                    Hermitization;  dlam_max / ladder_max: the scales.
+     */
+    struct ward_legs_diag {
+      double bub_pin = -1.0;
+      double fit_err_G = -1.0, fit_err_S = -1.0, rr_G = -1.0, rr_S = -1.0;
+      double gamma_bare[3] = {-1.0, -1.0, -1.0}, gamma_lam[3] = {-1.0, -1.0, -1.0};
+      double pole_vs_tau = -1.0;
+      double asym_ladder = -1.0, asym_dlam = -1.0;
+      double dlam_max = -1.0, ladder_max = -1.0;
+    };
+    ward_legs_diag ward_legs_gate(MBState &mb_state, THC_ERI auto &thc);
 
     /**
      * scGW-tilde increment L1 (vertex_ladder.icc): the C-window pair bubble

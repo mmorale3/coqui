@@ -156,20 +156,40 @@ namespace ward_legs {
   struct s_tables {
     long np = 0, ng = 0, nnu = 0;
     bool shared = false;
+    long nu0_extrap = 0;                // > 0: the nu = 0 rows of Sm/Sl are the nu -> 0 limit
+                                        // extrapolated from that many Matsubara nodes (see below)
     nda::array<cplx, 1> inu;            // (nnu) the bosonic values i nu (exactly 0 at nu = 0)
     nda::array<cplx, 4> Sm;             // (nnu, ng, np, ng)
     nda::array<cplx, 4> Sl;             // (nnu, ng, np, ng)
     nda::array<cplx, 3> Tb;             // (nnu, ng, ng)
   };
 
+  /**
+   * THE nu = 0 ROW ON A FITTED REPRESENTATION (nu0_extrap > 0). At nu = 0 the S tables use
+   * the derivative branches (f', f''/2, f'''/6 at same-index nodes; 1/(a-b)^2, 1/(a-b)^3
+   * at distinct ones): exact for an EXACT pole set (gate P1), but on a DLR-FITTED
+   * representation the expansion coefficients at in-gap nodes are O(1) (they are not
+   * spectral weights) and the derivative along the axis is not what the fit controls --
+   * measured on the exact toy pushed through dlr_pole_fit (test "ward_legs_fitted_
+   * residues"): the nu != 0 correction is fit class (7e-5), the nu = 0 one is off by 4e2
+   * (the beta^3 same-node branches at the node nearest mu). Dropping the same-node
+   * pieces is NOT the cure (they are part of the axis functional: the bare bubble loses
+   * two digits without them). What IS controlled by the fit are the values at bosonic
+   * MATSUBARA nu, so the nu = 0 row is taken as the nu -> 0 LIMIT: S(0) := sum_k w_k
+   * S(i 2 pi k / beta), k = 1..K, Lagrange weights to 0 (K = 3: 3, -3, 1). For a gapped
+   * system that limit differs from the true static value by the thermal intraband term
+   * ~ e^{-beta gap}; the extrapolation error is ~ (2 pi K / (beta gap))^K. Tb (the bare
+   * kernel) is left exact -- the production bare bubble is the tau route anyway.
+   */
   inline s_tables build_s_tables(double beta, nda::array<double, 1> const &epsS,
                                  nda::array<double, 1> const &epsG, bool shared,
-                                 nda::array<cplx, 1> const &inu_list) {
+                                 nda::array<cplx, 1> const &inu_list, long nu0_extrap = 0) {
     s_tables t;
     t.np = epsS.shape(0);
     t.ng = epsG.shape(0);
     t.nnu = inu_list.shape(0);
     t.shared = shared;
+    t.nu0_extrap = nu0_extrap;
     utils::check(t.np > 0 and t.ng > 0 and t.nnu > 0, "ward_legs::build_s_tables: empty input.");
     if (shared) {
       utils::check(t.np == t.ng, "ward_legs::build_s_tables: shared node sets differ in size "
@@ -223,6 +243,32 @@ namespace ward_legs {
             t.Sm(jn, m, p, l) = S;
             t.Sl(jn, l, p, m) = S;
           }
+        }
+      }
+    }
+    if (nu0_extrap > 0) {
+      const long K = nu0_extrap;
+      utils::check(K >= 1 and K <= 6, "ward_legs::build_s_tables: nu0_extrap = {} (use 1..6).", K);
+      bool any0 = false;
+      for (long jn = 0; jn < t.nnu; ++jn) any0 = any0 or (inu_list(jn) == cplx(0.0));
+      if (any0) {
+        nda::array<cplx, 1> nuk(K);
+        for (long k = 0; k < K; ++k) nuk(k) = cplx(0.0, 2.0 * M_PI * double(k + 1) / beta);
+        auto tk = build_s_tables(beta, epsS, epsG, shared, nuk, 0);
+        std::vector<double> w(size_t(K), 1.0);           // Lagrange weights to x = 0, nodes x = 1..K
+        for (long k = 0; k < K; ++k)
+          for (long j = 0; j < K; ++j)
+            if (j != k) w[size_t(k)] *= (0.0 - double(j + 1)) / (double(k + 1) - double(j + 1));
+        for (long jn = 0; jn < t.nnu; ++jn) {
+          if (inu_list(jn) != cplx(0.0)) continue;
+          for (long m = 0; m < t.ng; ++m)
+            for (long p = 0; p < t.np; ++p)
+              for (long l = 0; l < t.ng; ++l) {
+                cplx acc(0.0);
+                for (long k = 0; k < K; ++k) acc += w[size_t(k)] * tk.Sm(k, m, p, l);
+                t.Sm(jn, m, p, l) = acc;
+                t.Sl(jn, l, p, m) = acc;
+              }
         }
       }
     }
