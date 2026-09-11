@@ -39,6 +39,7 @@
 #include "vertex_sigma.icc"  // ISDF-Vertex Phase 1c: fused G^3 W^2 Sigma^C kernel
 #include "vertex_sigma_r.icc" // INCREMENT S5: the static-vertex response cut Sigma^{C,r}
 #include "vertex_ladder.icc"  // scGW-tilde ladder polarization (C0 scaffolding; L1-L3)
+#include "vertex_dynbse.icc"  // scGW-tilde Tier 2 full frequency: the dynamic-rung BSE driver (D2)
 
 namespace methods {
 namespace solvers {
@@ -4824,6 +4825,8 @@ namespace solvers {
                                   nda::array<ComplexType, 4>*);
   // scGW-tilde Tier 1.5 (notes/tier15_ward_legs_plan.md, increment T15-b)
   template vertex_t::ward_legs_diag vertex_t::ward_legs_gate(MBState&, thc_reader_t&);
+  // scGW-tilde Tier 2 full frequency (notes/dynbse_plan.md, increment D2)
+  template vertex_t::dynbse_diag vertex_t::dynbse_gate(MBState&, thc_reader_t&);
   template vertex_t::ladder_whalf_diag
   vertex_t::ladder_whalf_gate(MBState&, thc_reader_t&, double);
 

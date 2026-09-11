@@ -327,3 +327,16 @@ target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield eri_li
 add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
 set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
                     TIMEOUT ${COQUI_VERTEX_TEST_TIMEOUT})
+
+# scGW-tilde Tier 2 full frequency, increment D2 (notes/dynbse_plan.md): the production driver's
+# gates on lih222 -- the THC rung operator vs Kbig, the static limit vs the (sign-corrected) L2
+# resolvent, the one bare dynamic rung vs pi_c_accumulate_w, GMRES vs Neumann, Hermiticity.
+set(TEST_ID methods_vertex_dynbse_gate)
+
+add_executable(test_${TEST_ID} test_vertex_dynbse_gate.cpp)
+target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield eri_lib hf_lib
+                      vertex_lib gw_lib scf_lib scr_coulomb_lib)
+
+add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
+set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR}
+                    TIMEOUT ${COQUI_VERTEX_TEST_TIMEOUT})

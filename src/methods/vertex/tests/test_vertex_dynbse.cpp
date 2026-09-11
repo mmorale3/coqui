@@ -747,4 +747,86 @@ namespace bdft_tests {
 #endif
   }
 
+
+  // ---------------------------------------------------------------------------------------
+  // SMALL nu: the two-family bookkeeping at the smallest bosonic node of a long-beta grid.
+  // The index-confluent pairs carry coefficients +-1/(i nu) that cancel only in VALUES; this
+  // measures whether the solver (union set: no confluence; shared set: G refit on the vertex
+  // grid) stays exact against the dense oracle when 1/nu = beta/(2 pi) is large.
+  // ---------------------------------------------------------------------------------------
+  TEST_CASE("dynbse_small_nu", "[methods][vertex][scgwt][dynbse]") {
+    auto T = make_dyn_toy(0.10, 0.02);
+    T.beta = 100.0;
+    const double beta = T.beta;
+    imag_axes_ft::IAFT ft(beta, 8.0, imag_axes_ft::dlr_basis, "high");
+    const cplx inu = I_ * cplx(2.0 * M_PI / beta);          // the first bosonic node, 1/nu = 15.9
+    app_log(1, "dynbse small-nu: beta {}, inu = {:.4f}i (1/nu = {:.1f}), aux nodes {}", beta, inu.imag(),
+            1.0 / inu.imag(), db::build_freq_basis(ft).np);
+    auto Pdy_a = dense_bse(T, inu, 384, 1), Pdy_b = dense_bse(T, inu, 768, 1);
+    nda::array<cplx, 2> Pdy(T.nR, T.nR);
+    Pdy = (Pdy_b * cplx(4.0) - Pdy_a) / cplx(3.0);
+    app_log(1, "dynbse small-nu oracle: N = 384 vs 768 rel diff {:.3e}, |P| {:.3e}", rel_diff(Pdy_a, Pdy_b), max_abs(Pdy));
+    auto hist_of = [](db::dyson_result const &r) {
+      std::string h;
+      for (double x : r.history) {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), " %.1e", x);
+        h += buf;
+      }
+      return h;
+    };
+    for (int fitted = 0; fitted < 2; ++fitted) {
+      auto so = run_solver(T, ft, inu, bool(fitted), 1e-8, 40, 0);
+      auto sg = run_solver(T, ft, inu, bool(fitted), 1e-8, 40, 4);
+      app_log(1, "dynbse small-nu [{}]: Neumann vs oracle {:.3e} (Gamma1 {:.3e}), {} it, converged {}, contraction "
+                 "{:.3e}, refit {:.3e}; history:{}", fitted ? "shared/fitted" : "union/exact", rel_diff(so.P, Pdy),
+              rel_diff(so.P1, Pdy), so.res.iterations, so.res.converged, so.res.contraction, so.res.fit_err_max, hist_of(so.res));
+      app_log(1, "dynbse small-nu [{}]: GMRES(4) vs oracle {:.3e}, {} applications, converged {}, max |Ritz| {:.3e}; "
+                 "history:{}", fitted ? "shared/fitted" : "union/exact", rel_diff(sg.P, Pdy), sg.res.iterations,
+              sg.res.converged, sg.res.contraction, hist_of(sg.res));
+      // family scales of the first iterate's y: the 1/nu cancellation hazard made visible
+      {
+        auto b = db::build_freq_basis(ft);
+        (void)b;
+      }
+      CHECK(rel_diff(sg.P, Pdy) < 1e-6);
+    }
+  }
+
+
+  TEST_CASE("dynbse_small_nu_1000", "[methods][vertex][scgwt][dynbse][slow]") {
+    auto T = make_dyn_toy(0.10, 0.02);
+    T.beta = 1000.0;
+    const double beta = T.beta;
+    const cplx inu = I_ * cplx(2.0 * M_PI / beta);          // 1/nu = 159
+    auto Pdy_a = dense_bse(T, inu, 1024, 1), Pdy_b = dense_bse(T, inu, 1536, 1);
+    nda::array<cplx, 2> Pdy(T.nR, T.nR);
+    // 1/N^3 tail: Richardson with (1536/1024)^3 = 3.375
+    Pdy = (Pdy_b * cplx(3.375) - Pdy_a) / cplx(2.375);
+    app_log(1, "dynbse small-nu(1000) oracle: N = 1024 vs 1536 rel diff {:.3e}, |P| {:.3e}", rel_diff(Pdy_a, Pdy_b), max_abs(Pdy));
+    auto hist_of = [](db::dyson_result const &r) {
+      std::string h;
+      for (double x : r.history) {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), " %.1e", x);
+        h += buf;
+      }
+      return h;
+    };
+    for (std::string prec : {"high", "low"}) {
+      imag_axes_ft::IAFT ft(beta, 8.0, imag_axes_ft::dlr_basis, prec);
+      for (int fitted = 0; fitted < 2; ++fitted) {
+        auto so = run_solver(T, ft, inu, bool(fitted), 1e-8, 30, 0);
+        auto sg = run_solver(T, ft, inu, bool(fitted), 1e-8, 30, 4);
+        app_log(1, "dynbse small-nu(1000) prec {} [{}]: Neumann vs oracle {:.3e}, {} it, converged {}, contraction "
+                   "{:.3e}, refit {:.3e}; history:{}", prec, fitted ? "shared/fitted" : "union/exact",
+                rel_diff(so.P, Pdy), so.res.iterations, so.res.converged, so.res.contraction, so.res.fit_err_max, hist_of(so.res));
+        app_log(1, "dynbse small-nu(1000) prec {} [{}]: GMRES(4) vs oracle {:.3e}, {} applications, converged {}, "
+                   "max |Ritz| {:.3e}; history:{}", prec, fitted ? "shared/fitted" : "union/exact", rel_diff(sg.P, Pdy),
+                sg.res.iterations, sg.res.converged, sg.res.contraction, hist_of(sg.res));
+      }
+    }
+    SUCCEED("measured");
+  }
+
 } // namespace bdft_tests

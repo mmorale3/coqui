@@ -1647,6 +1647,29 @@ namespace solvers {
     ward_legs_diag ward_legs_gate(MBState &mb_state, THC_ERI auto &thc);
 
     /**
+     * scGW-tilde Tier 2 full frequency, increment D2 (notes/dynbse_plan.md; vertex_dynbse.icc):
+     * the resummed DYNAMIC-rung BSE driver's gates on the readout instance (nosym window mode;
+     * requires W0bar AND the W-bar cache -- call update_w + cache_w first):
+     *   a0_resid       : THC rung operator (nu'-constant W) vs the explicit Kbig -- machine class;
+     *   a_resid        : static limit vs the SIGN-CORRECTED L2 resolvent -ladder(-W0) -- 1e-12 class;
+     *   a_l2_diff      : static limit vs the as-implemented L2 (the even-order rung sign; reported);
+     *   b_resid        : one bare dynamic rung vs pi_c_accumulate_w(Z = 0, W_dyn - W_dyn(0)) -- fit class;
+     *   gmres_vs_neumann / gam1_consistency : the two solvers agree; ritz_max / contraction_max /
+     *   it_max : the watchdog and iteration counts; herm : (M,N) asymmetry of the resummed vertex;
+     *   dyn_vs_static / gam1_vs_static : the dynamic correction at inu = 0 relative to the static ladder.
+     */
+    struct dynbse_diag {
+      double a0_resid = -1.0, a_resid = -1.0, a_l2_diff = -1.0, b_resid = -1.0, b_continuity = -1.0;
+      double fit_err_G = -1.0, rr_G = -1.0, dsq_err = -1.0, wtau_sym = -1.0, refit_err_1 = -1.0, refit_err = -1.0;
+      double gmres_vs_neumann = -1.0, gam1_consistency = -1.0, ritz_max = -1.0, contraction_max = -1.0;
+      long it_max = 0, it_max_neumann = 0;
+      bool all_converged = false;
+      double herm = -1.0, static_max = 0.0, onerung_max = 0.0, dyn_max = 0.0, gam1_max = 0.0;
+      double dyn_vs_static = -1.0, gam1_vs_static = -1.0;
+    };
+    dynbse_diag dynbse_gate(MBState &mb_state, THC_ERI auto &thc);
+
+    /**
      * scGW-tilde increment L1 (vertex_ladder.icc): the C-window pair bubble
      * Pi-bar^0_MN(q, tau_pos) in the SECONDARY aux basis, (nt_half, nq, N_m, N_m),
      * replicated -- house RPA conventions (rpa_pi.icc Hadamard pairing, -spin/Nk,

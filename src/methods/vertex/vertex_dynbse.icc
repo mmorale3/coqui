@@ -1,0 +1,765 @@
+#ifndef COQUI_VERTEX_DYNBSE_ICC
+#define COQUI_VERTEX_DYNBSE_ICC
+
+/**
+ * scGW-tilde Tier 2, FULL FREQUENCY: the resummed DYNAMIC-rung BSE polarization in the ladder's
+ * pair space (notes/dynbse_plan.md D0.1; the algebra in dynbse.hpp, increment D1; this file is
+ * increment D2: the production driver, its THC rung operator and the gates).
+ *
+ * THE OBJECT (plan section 1), per external (q, inu), pair r = (a nc + b), a on the k line, b on
+ * the k+q line, D = nc^2 nk, one right-hand side per secondary aux index N:
+ *
+ *   Gamma_N(k,iw) = d_N(k) + sum_{k'} (1/beta) sum_{iw'} K_s+d(k' <- k; iw - iw') L0(k',iw') Gamma_N(k',iw')
+ *   P_MN(q,inu)   = (spin/nk) sum_k conj(d_M(k))^T [ (1/beta) sum_iw L0(k,iw) Gamma_N(k,iw) ]
+ *
+ * with the rung split K = K_s + K_d: K_s = sign_ks * Kbig / nk the STATIC (W0bar) rung of
+ * pair_space_ladder in exactly its twist-packed orientation (Kbig[(k'),(k)] maps the L0-output
+ * pair (p1'p3) at k to the L0-input pair (p1 p3') at k'), K_d(inu') = the same THC contraction
+ * with W_dyn(inu') - W_dyn(0) (the cache _Wb_qwmm) in place of W0bar, applied in tau
+ * (plan section 4). sign_ks = -1 is the DERIVED sign (memory l2-resolvent-sign-finding: the
+ * house bubble +spin/nk D^dag Cb D and the anchor -spin/nk^2 D^dag Cb K Cb D force the rung -W);
+ * sign_ks = +1 reproduces the as-implemented L2 resolvent up to an overall sign of the rung part.
+ *
+ * The static part is resummed exactly (one dense LU per unit, T_s = K_s (1 - Cb K_s)^-1, the L2
+ * solve) and the dynamic remainder is solved by GMRES(m) / Neumann on
+ * (1 - K_d L_s) y = K_d L_s d (dynbse.hpp). Output columns (rungs >= 1, i.e. minus the bubble):
+ * static (the sign-corrected L2), the one bare dynamic rung D^dag L0 K_d L0 D (the Pi^C anchor's
+ * dynamic part), Gamma_1 (one dynamic rung dressed by static ladders) and the resummed vertex.
+ *
+ * NOSYM full mesh only at D2 (the external and transfer meshes coincide); the (s, q) units are
+ * round-robined over (rank, nproc) and every (jn, iq) cell is written by exactly one rank, so the
+ * caller's zeros-elsewhere all_reduce reproduces the replicated result (the pair_space_ladder
+ * contract). The k-sum of the rung is the direct gemm form at D2 (the FFT is the D2b' optimization;
+ * the gemm path stays as its machine-precision cross-check).
+ */
+
+#include <cstdio>
+#include <random>
+#include <string>
+
+#include "methods/vertex/dynbse.hpp"
+
+namespace methods {
+namespace solvers {
+
+  namespace vertex_dynbse_detail {
+
+    using cplx = ComplexType;
+    namespace db = dynbse;
+
+    struct dyn_opts {
+      double tol = 1e-8;          // relative residual on the dynamic remainder
+      long maxit = 30;            // operator applications
+      long gmres_m = 6;           // 0 = plain Neumann
+      bool one_rung_only = false; // T_s = 0 and one application: the pure one dynamic rung
+      double sign_ks = -1.0;      // K = sign_ks * (THC rung) / nk  (-1 = the derived sign)
+      bool static_only = false;   // no dynamic solve: the static column only (gate G-A)
+    };
+
+    struct dyn_meter {
+      double fit_err_G = 0.0, rr_G = 0.0;     // aux-grid pole fits of G
+      double dsq_err = 0.0;                   // the confluent re-expansion tables
+      double refit_err_max = 0.0;             // tau refit inside K_d
+      double wtau_sym = 0.0;                  // max |W_d(s) - W_d(beta - s)| / max |W_d|
+      double ritz_max = 0.0;                  // watchdog: max over units of |Ritz(K_d L_s)| / contraction
+      long it_max = 0, it_sum = 0, nunits = 0, nconv = 0;
+      double t_setup = 0.0, t_kbig = 0.0, t_cb = 0.0, t_lu = 0.0, t_solve = 0.0, t_read = 0.0;
+      double rss_max_gb = 0.0;
+      void reduce(boost::mpi3::communicator &comm) {
+        auto mx = [&](double &v) { v = comm.all_reduce_value(v, boost::mpi3::max<>{}); };
+        auto sm = [&](long &v) { v = comm.all_reduce_value(v, std::plus<>{}); };
+        mx(fit_err_G); mx(rr_G); mx(dsq_err); mx(refit_err_max); mx(wtau_sym); mx(ritz_max);
+        it_max = comm.all_reduce_value(it_max, boost::mpi3::max<>{});
+        sm(it_sum); sm(nunits); sm(nconv);
+        mx(t_setup); mx(t_kbig); mx(t_cb); mx(t_lu); mx(t_solve); mx(t_read); mx(rss_max_gb);
+      }
+    };
+
+    /**
+     * The THC rung applied to a pair-space block F (nk, nc2, nR) at fixed (is, iq):
+     *   out(k', (p1 p3'), N) = (scale) sum_k sum_PQ X(k',P,p1) conj(X(k'+q,Q,p3')) W_PQ(qx_of(k,k'))
+     *                           sum_{p1' p3} conj(X(k,P,p1')) F(k,(p1'p3),N) X(k+q,Q,p3)
+     * with W(q') supplied by `Wq(iq')` -> a (Nm x Nm) view. Exactly pair_space_ladder's Kbig
+     * orientation (row k', column k; the rung read at qx_of(k, k')). Direct k-sum by gemms
+     * (per (P,Q) a (nk x nk)(nk x nb) product after a gather through qx_of); N in blocks of nb.
+     */
+    template<class WqFn>
+    inline void thc_rung_apply(nda::array<cplx, 4> const &Xb, long is, long iq,
+                               nda::array<long, 2> const &kpq, nda::array<long, 2> const &qx_of,
+                               WqFn &&Wq, cplx scale, nda::array<cplx, 3> const &F,
+                               nda::array<cplx, 3> &out, long nb) {
+      decltype(nda::range::all) all;
+      const long nk = F.shape(0), nc2 = F.shape(1), nR = F.shape(2), Nm = Xb.shape(2);
+      const long nc = Xb.shape(3);
+      utils::check(nc * nc == nc2, "thc_rung_apply: pair dimension mismatch.");
+      nb = std::max(1l, std::min(nb, nR));
+      out() = cplx(0.0);
+      nda::array<cplx, 2> Xc(Nm, nc), Xkq(Nm, nc), XkT(nc, Nm), Xcq(Nm, nc);
+      nda::array<cplx, 2> Fk(nc, nc * nb);           // (p1', (p3 N))
+      nda::array<cplx, 2> A(Nm, nc * nb);            // (P, (p3 N))
+      nda::array<cplx, 2> A2(Nm * nb, nc);           // ((P N), p3)
+      nda::array<cplx, 2> Y2(Nm * nb, Nm);           // ((P N), Q)
+      nda::array<cplx, 4> Y(Nm, Nm, nk, nb), Z(Nm, Nm, nk, nb);
+      nda::array<cplx, 2> Wm(nk, nk), Zk(Nm, Nm * nb), B(nc, Nm * nb), B2(nc * nb, Nm), O2(nc * nb, nc);
+      for (long n0 = 0; n0 < nR; n0 += nb) {
+        const long nbl = std::min(nb, nR - n0);
+        // ---- legs in: Y(P, Q, k, N) ----------------------------------------------------------
+        for (long k = 0; k < nk; ++k) {
+          const long kq = kpq(iq, k);
+          for (long P = 0; P < Nm; ++P)
+            for (long a = 0; a < nc; ++a) {
+              Xc(P, a) = std::conj(Xb(is, k, P, a));
+              Xkq(P, a) = Xb(is, kq, P, a);
+            }
+          for (long p1p = 0; p1p < nc; ++p1p)
+            for (long p3 = 0; p3 < nc; ++p3)
+              for (long n = 0; n < nbl; ++n) Fk(p1p, p3 * nb + n) = F(k, p1p * nc + p3, n0 + n);
+          if (nbl < nb)
+            for (long p1p = 0; p1p < nc; ++p1p)
+              for (long p3 = 0; p3 < nc; ++p3)
+                for (long n = nbl; n < nb; ++n) Fk(p1p, p3 * nb + n) = cplx(0.0);
+          nda::blas::gemm(Xc, Fk, A);                                    // (P, (p3 N))
+          for (long P = 0; P < Nm; ++P)
+            for (long n = 0; n < nb; ++n)
+              for (long p3 = 0; p3 < nc; ++p3) A2(P * nb + n, p3) = A(P, p3 * nb + n);
+          nda::blas::gemm(A2, nda::transpose(Xkq), Y2);                  // ((P N), Q)
+          for (long P = 0; P < Nm; ++P)
+            for (long Q = 0; Q < Nm; ++Q)
+              for (long n = 0; n < nb; ++n) Y(P, Q, k, n) = Y2(P * nb + n, Q);
+        }
+        // ---- the k-sum with the rung: Z(P, Q, k', N) = sum_k W_PQ(qx_of(k, k')) Y(P, Q, k, N) ----
+        for (long P = 0; P < Nm; ++P)
+          for (long Q = 0; Q < Nm; ++Q) {
+            for (long kp = 0; kp < nk; ++kp)
+              for (long k = 0; k < nk; ++k) Wm(kp, k) = Wq(qx_of(k, kp))(P, Q);
+            nda::blas::gemm(Wm, Y(P, Q, all, all), Z(P, Q, all, all));
+          }
+        // ---- legs out: out(k', (p1 p3'), N) = scale sum_PQ X(k',P,p1) Z(P,Q,k',N) conj(X(k'+q,Q,p3')) --
+        for (long kp = 0; kp < nk; ++kp) {
+          const long kq = kpq(iq, kp);
+          for (long P = 0; P < Nm; ++P)
+            for (long a = 0; a < nc; ++a) {
+              XkT(a, P) = Xb(is, kp, P, a);
+              Xcq(P, a) = std::conj(Xb(is, kq, P, a));
+            }
+          for (long P = 0; P < Nm; ++P)
+            for (long Q = 0; Q < Nm; ++Q)
+              for (long n = 0; n < nb; ++n) Zk(P, Q * nb + n) = Z(P, Q, kp, n);
+          nda::blas::gemm(XkT, Zk, B);                                   // (p1, (Q N))
+          for (long p1 = 0; p1 < nc; ++p1)
+            for (long n = 0; n < nb; ++n)
+              for (long Q = 0; Q < Nm; ++Q) B2(p1 * nb + n, Q) = B(p1, Q * nb + n);
+          nda::blas::gemm(B2, Xcq, O2);                                  // ((p1 N), p3')
+          for (long p1 = 0; p1 < nc; ++p1)
+            for (long p3p = 0; p3p < nc; ++p3p)
+              for (long n = 0; n < nbl; ++n) out(kp, p1 * nc + p3p, n0 + n) = scale * O2(p1 * nb + n, p3p);
+        }
+      }
+    }
+
+    /** the static rung Kbig (D x D) of pair_space_ladder, nosym, for (is, iq): Kbig(ikp nc2 + (p1 nc + p3'),
+     *  ik nc2 + (p1' nc + p3)) = [U1^T W0b(qx_of(ik, ikp)) U2](p1 nc + p1', p3 nc + p3'). */
+    inline void build_kbig(nda::array<cplx, 4> const &Xb, nda::array<cplx, 3> const &W0b, long is, long iq,
+                           nda::array<long, 2> const &kpq, nda::array<long, 2> const &qx_of,
+                           nda::array<cplx, 2> &Kbig) {
+      decltype(nda::range::all) all;
+      const long nk = kpq.shape(1), Nm = Xb.shape(2), nc = Xb.shape(3), nc2 = nc * nc;
+      nda::array<cplx, 2> U1(Nm, nc2), U2(Nm, nc2), WU2(Nm, nc2), wb(nc2, nc2);
+      Kbig() = cplx(0.0);
+      for (long ik = 0; ik < nk; ++ik) {
+        const long ikpq = kpq(iq, ik);
+        for (long ikp = 0; ikp < nk; ++ikp) {
+          const long iqx = qx_of(ik, ikp);
+          const long ikppq = kpq(iq, ikp);
+          vertex_pi::detail::build_U_legs(Xb, nullptr, nda::range(0, nc), is, ik, ikp, ikpq, ikppq, 0l, U1, U2);
+          nda::blas::gemm(W0b(iqx, all, all), U2, WU2);
+          nda::blas::gemm(nda::transpose(U1), WU2, wb);
+          for (long p1 = 0; p1 < nc; ++p1)
+            for (long p1p = 0; p1p < nc; ++p1p)
+              for (long p3 = 0; p3 < nc; ++p3)
+                for (long p3p = 0; p3p < nc; ++p3p)
+                  Kbig(ikp * nc2 + (p1 * nc + p3p), ik * nc2 + (p1p * nc + p3)) = wb(p1 * nc + p1p, p3 * nc + p3p);
+        }
+      }
+    }
+
+    /** the tau-route chi0 of the ladder (A.4 block) at bosonic node m: Cb(k, (p1'p3), (ab)) */
+    inline void build_cb_tau(nda::MemoryArrayOfRank<5> auto const &G_CC, vertex_pi::iaft_tools const &tools,
+                             long is, long iq, long m, nda::array<long, 2> const &kpq,
+                             nda::array<cplx, 3> &Cb) {
+      const long nt = G_CC.shape(0), nk = G_CC.shape(2), nc = G_CC.shape(3), nc2 = nc * nc;
+      nda::array<cplx, 2> Pf(nt, nc2 * nc2), Bf(tools.nw_b, nc2 * nc2);
+      for (long ik = 0; ik < nk; ++ik) {
+        const long ikpq = kpq(iq, ik);
+        for (long s = 0; s < nt; ++s) {
+          const long sm = tools.t_mirror(s);
+          for (long p1p = 0; p1p < nc; ++p1p)
+            for (long p3 = 0; p3 < nc; ++p3)
+              for (long a = 0; a < nc; ++a)
+                for (long b = 0; b < nc; ++b)
+                  Pf(s, (p1p * nc + p3) * nc2 + (a * nc + b)) = G_CC(sm, is, ik, a, p1p) * G_CC(s, is, ikpq, p3, b);
+        }
+        nda::blas::gemm(cplx(-1.0), tools.Twt_bb, Pf, cplx(0.0), Bf);
+        for (long r = 0; r < nc2; ++r)
+          for (long c = 0; c < nc2; ++c) Cb(ik, r, c) = Bf(m, r * nc2 + c);
+      }
+    }
+
+    /**
+     * THE DRIVER. Outputs (nnu, nq, Nm, Nm), any may be null; all are ZEROED here and indexed by
+     * position in nu_list; every (jn, iq) cell written by exactly one rank (the caller all-reduces).
+     *   Pi_static : the static ladder, rungs >= 1  ( (spin/nk) D^dag [Cb Gamma_s - Cb D] )
+     *   Pi_dyn1   : the one bare dynamic rung        ( (spin/nk) D^dag [sum_iw L0 K_d L0 D] )
+     *   Pi_gam1   : the first iterate, rungs >= 1
+     *   Pi_dyn    : the resummed vertex, rungs >= 1
+     * Wbh = the cache _Wb_qwmm (nq, nw_half, Nm, Nm): W_dyn on the positive half mesh.
+     */
+    inline void pair_space_ladder_dyn(nda::MemoryArrayOfRank<5> auto const &G_CC,    // (nt,ns,nk,nc,nc)
+                                      nda::array<cplx, 4> const &Xb,                 // (ns,nk,Nm,nc)
+                                      nda::array<cplx, 3> const &W0b,                // (nq,Nm,Nm)
+                                      nda::array<cplx, 4> const &Wbh,                // (nq,nw_half,Nm,Nm)
+                                      nda::array<long, 2> const &kmq, nda::array<long, 2> const &kpq,
+                                      vertex_pi::iaft_tools &tools, std::vector<long> const &nu_list,
+                                      nda::array<cplx, 4> *Pi_static, nda::array<cplx, 4> *Pi_dyn1,
+                                      nda::array<cplx, 4> *Pi_gam1, nda::array<cplx, 4> *Pi_dyn,
+                                      long rank, long nproc, dyn_opts const &opt, dyn_meter *met) {
+      decltype(nda::range::all) all;
+      vertex_ladder_detail::prof_watch watch;
+      const long nt = G_CC.shape(0), ns = G_CC.shape(1), nk = G_CC.shape(2), nc = G_CC.shape(3);
+      const long Nm = Xb.shape(2), nc2 = nc * nc, D = nc2 * nk;
+      const long nq = W0b.shape(0), nw_b = tools.nw_b;
+      const long nw_half = (nw_b % 2 == 0) ? nw_b / 2 : nw_b / 2 + 1;
+      const long nnu = long(nu_list.size());
+      const double spinfac = (ns == 1) ? 2.0 : 1.0;
+      utils::check(kmq.shape(0) == nq and kpq.shape(0) == nq and kmq.shape(1) == nk,
+                   "pair_space_ladder_dyn: nosym mesh expected (nq_w = {}, kmq {} x {}).", nq, kmq.shape(0), kmq.shape(1));
+      utils::check(Wbh.shape(0) == nq and Wbh.shape(1) == nw_half and Wbh.shape(2) == Nm and Wbh.shape(3) == Nm,
+                   "pair_space_ladder_dyn: W cache shape ({}, {}, {}, {}) != ({}, {}, {}, {}).",
+                   Wbh.shape(0), Wbh.shape(1), Wbh.shape(2), Wbh.shape(3), nq, nw_half, Nm, Nm);
+      utils::check(nt == tools.nt_f, "pair_space_ladder_dyn: G tau axis {} != nt_f {}.", nt, tools.nt_f);
+      for (auto *o : {Pi_static, Pi_dyn1, Pi_gam1, Pi_dyn})
+        if (o != nullptr) {
+          utils::check(o->shape(0) == nnu and o->shape(1) == nq and o->shape(2) == Nm and o->shape(3) == Nm,
+                       "pair_space_ladder_dyn: output shape mismatch.");
+          (*o)() = cplx(0.0);
+        }
+      for (auto m : nu_list) utils::check(m >= 0 and m < nw_b, "pair_space_ladder_dyn: nu index {} out of range.", m);
+
+      // ---- the vertex basis and G's residues on it --------------------------------------------
+      tools.init_poles();
+      auto b = db::build_freq_basis(*tools.ft);
+      const long np = b.np;
+      utils::check(np == tools.np, "pair_space_ladder_dyn: vertex basis size {} != tools.np {}.", np, tools.np);
+      {
+        double de = 0.0, ds = 0.0;
+        for (long p = 0; p < np; ++p) de = std::max(de, std::abs(b.eps(p) - tools.epsl(p)));
+        for (long i = 0; i < nt; ++i) ds = std::max(ds, std::abs(b.s(i) - tools.s_phys(i)));
+        utils::check(de < 1e-10 and ds < 1e-10, "pair_space_ladder_dyn: vertex basis / tools grids differ ({}, {}).", de, ds);
+      }
+      if (met) met->dsq_err = std::max(met->dsq_err, b.dsq_fit_err);
+      nda::array<cplx, 5> gC(ns, np, nk, nc, nc);
+      {
+        nda::array<cplx, 2> Fg(nt, nc2);
+        for (long is = 0; is < ns; ++is)
+          for (long k = 0; k < nk; ++k) {
+            for (long i = 0; i < nt; ++i)
+              for (long a = 0; a < nc; ++a)
+                for (long bb2 = 0; bb2 < nc; ++bb2) Fg(i, a * nc + bb2) = G_CC(i, is, k, a, bb2);
+            auto c = b.pf.coeffs(Fg);
+            if (met) {
+              met->fit_err_G = std::max(met->fit_err_G, b.pf.fit_error(Fg, c));
+              met->rr_G = std::max(met->rr_G, b.pf.residue_ratio(Fg, c));
+            }
+            for (long p = 0; p < np; ++p)
+              for (long a = 0; a < nc; ++a)
+                for (long bb2 = 0; bb2 < nc; ++bb2) gC(is, p, k, a, bb2) = c(p, a * nc + bb2);
+          }
+      }
+      // ---- W_dyn(q', s) on the tau grid and its inu' = 0 value ---------------------------------
+      // full-mesh unfold of the PH-sym half grid (the same mirror map as eval_Pi_C), then the
+      // bosonic inu -> tau transform Ttw_bb (nt, nw_b); W_d(s) = W_dyn(s) (its tau form), the
+      // constant part of K_d is -W_dyn(inu'=0) acting on the frequency sums.
+      const long lpos0 = std::max(tools.m0, tools.w_mirror_b(tools.m0)) - nw_b / 2;
+      nda::array<cplx, 4> Wd_s(nq, nt, Nm, Nm);
+      nda::array<cplx, 3> Wd0(nq, Nm, Nm);
+      {
+        nda::array<cplx, 2> Wq(nw_b, Nm * Nm), Wt(nt, Nm * Nm);
+        double dsym = 0.0, wmax = 0.0;
+        for (long iqp = 0; iqp < nq; ++iqp) {
+          for (long l = 0; l < nw_b; ++l) {
+            const long lpos = std::max(l, tools.w_mirror_b(l)) - nw_b / 2;
+            for (long P = 0; P < Nm; ++P)
+              for (long Q = 0; Q < Nm; ++Q) Wq(l, P * Nm + Q) = Wbh(iqp, lpos, P, Q);
+          }
+          nda::blas::gemm(tools.Ttw_bb, Wq, Wt);
+          for (long i = 0; i < nt; ++i)
+            for (long P = 0; P < Nm; ++P)
+              for (long Q = 0; Q < Nm; ++Q) Wd_s(iqp, i, P, Q) = Wt(i, P * Nm + Q);
+          for (long i = 0; i < nt; ++i) {
+            const long im = tools.t_mirror(i);
+            for (long P = 0; P < Nm; ++P)
+              for (long Q = 0; Q < Nm; ++Q) {
+                dsym = std::max(dsym, std::abs(Wd_s(iqp, i, P, Q) - Wd_s(iqp, im, P, Q)));
+                wmax = std::max(wmax, std::abs(Wd_s(iqp, i, P, Q)));
+              }
+          }
+          Wd0(iqp, all, all) = Wbh(iqp, lpos0, all, all);
+        }
+        if (met) met->wtau_sym = std::max(met->wtau_sym, (wmax > 0.0) ? dsym / wmax : 0.0);
+      }
+      // ---- transfer lookup ---------------------------------------------------------------------
+      nda::array<long, 2> qx_of(nk, nk);
+      qx_of() = -1;
+      for (long iqx = 0; iqx < nq; ++iqx)
+        for (long ik = 0; ik < nk; ++ik) qx_of(ik, kmq(iqx, ik)) = iqx;
+      for (long ik = 0; ik < nk; ++ik)
+        for (long ikp = 0; ikp < nk; ++ikp)
+          utils::check(qx_of(ik, ikp) >= 0, "pair_space_ladder_dyn: transfer mesh does not connect k = {} to k' = {}.", ik, ikp);
+      if (met) met->t_setup += watch.lap();
+
+      const cplx scale_k(opt.sign_ks / double(nk), 0.0);
+      const long nb = std::min(Nm, 16l);
+      nda::array<cplx, 2> Kbig(D, D), Ks(D, D);
+      nda::array<cplx, 3> Cb_k(nk, nc2, nc2);
+      nda::array<cplx, 4> Dc(nk, nc, nc, Nm), CbD(nk, nc, nc, Nm), Vout(nk, nc, nc, Nm);
+      nda::array<cplx, 3> Fs3(nk, nc2, Nm), Os3(nk, nc2, Nm);
+      nda::array<cplx, 4> Fs(nt, nk, nc2, Nm), Ys(nt, nk, nc2, Nm);
+      nda::array<cplx, 2> Yc2(nt, nk * nc2 * Nm);
+
+      for (long sq = rank; sq < ns * nq; sq += nproc) {
+        const long is = sq / nq, iq = sq % nq;
+        // ---- the legs and the static rung of this unit ------------------------------------------
+        for (long k = 0; k < nk; ++k) {
+          const long kq = kpq(iq, k);
+          for (long a = 0; a < nc; ++a)
+            for (long bb2 = 0; bb2 < nc; ++bb2)
+              for (long N = 0; N < Nm; ++N) Dc(k, a, bb2, N) = Xb(is, k, N, a) * std::conj(Xb(is, kq, N, bb2));
+        }
+        build_kbig(Xb, W0b, is, iq, kpq, qx_of, Kbig);
+        Ks() = Kbig * scale_k;
+        if (met) met->t_kbig += watch.lap();
+        // the pair poles of this unit (shared grid: gnode identity)
+        nda::array<cplx, 4> gk(np, nk, nc, nc), gkq(np, nk, nc, nc);
+        for (long k = 0; k < nk; ++k) {
+          gk(all, k, all, all) = gC(is, all, k, all, all);
+          gkq(all, k, all, all) = gC(is, all, kpq(iq, k), all, all);
+        }
+        auto P = db::make_pair_poles(tools.beta, b.eps, gk, gkq, 0);
+        // the dynamic rung operator of this unit
+        auto Wq_s = [&](long i) { return [&, i](long iqp) { return Wd_s(iqp, i, all, all); }; };
+        auto Wq_0 = [&](long iqp) { return Wd0(iqp, all, all); };
+        long kd_calls = 0;
+        auto kd = [&](db::tf_vector const &F, nda::array<cplx, 4> const &Fsum, db::tf_vector &y) {
+          y.zero();
+          double fe = 0.0;
+          const bool dbg = (rank == 0 and sq == 0);
+          auto nrm = [](auto const &A) { double n = 0.0; for (auto const &v : A) n += std::norm(v); return std::sqrt(n); };
+          if (dbg)
+            app_log(2, "  [dynbse dbg] kd call {}: |F fam0| {:.3e} |F fam1| {:.3e} |F cst| {:.3e} |Fsum| {:.3e}",
+                    kd_calls, nrm(F.fam(0, nda::ellipsis{})), nrm(F.fam(1, nda::ellipsis{})), nrm(F.cst), nrm(Fsum));
+          for (long fam = 0; fam < 2; ++fam) {
+            bool anyf = false;
+            for (auto const &v : F.fam(fam, nda::ellipsis{})) { if (v != cplx(0.0)) { anyf = true; break; } }
+            if (not anyf) continue;
+            // tau values (nt, nk, nc2, Nm) = KF (nt, np) . fam (np, nk nc2 Nm)
+            auto fam2 = nda::reshape(F.fam(fam, nda::ellipsis{}), std::array<long, 2>{np, nk * nc2 * Nm});
+            nda::array<cplx, 2> famc(np, nk * nc2 * Nm);
+            famc() = fam2;
+            auto Fs2 = nda::reshape(Fs, std::array<long, 2>{nt, nk * nc2 * Nm});
+            nda::array<cplx, 2> KFc(nt, np);
+            for (long i = 0; i < nt; ++i)
+              for (long p = 0; p < np; ++p) KFc(i, p) = cplx(b.KF(i, p));
+            nda::blas::gemm(KFc, famc, Fs2);
+            for (long i = 0; i < nt; ++i) {
+              Fs3() = Fs(i, all, all, all);
+              thc_rung_apply(Xb, is, iq, kpq, qx_of, Wq_s(i), scale_k, Fs3, Os3, nb);
+              Ys(i, all, all, all) = Os3;
+            }
+            auto Ys2 = nda::reshape(Ys, std::array<long, 2>{nt, nk * nc2 * Nm});
+            Yc2() = Ys2;
+            auto c = b.pf.coeffs(Yc2);
+            const double fef = b.pf.fit_error(Yc2, c);
+            fe = std::max(fe, fef);
+            if (dbg)
+              app_log(2, "  [dynbse dbg]   fam {}: |F(s)| {:.3e} |W F(s)| {:.3e} refit {:.3e} |coeffs| {:.3e}", fam,
+                      nrm(Fs), nrm(Ys), fef, nrm(c));
+            for (long p = 0; p < b.np_fit; ++p)
+              for (long k = 0; k < nk; ++k)
+                for (long r = 0; r < nc2; ++r)
+                  for (long N = 0; N < Nm; ++N) y.fam(fam, p, k, r / nc, r % nc, N) = c(p, (k * nc2 + r) * Nm + N);
+          }
+          // the constant part: -W_dyn(0) on the frequency sums
+          for (long k = 0; k < nk; ++k)
+            for (long r = 0; r < nc2; ++r)
+              for (long N = 0; N < Nm; ++N) Fs3(k, r, N) = Fsum(k, r / nc, r % nc, N);
+          thc_rung_apply(Xb, is, iq, kpq, qx_of, Wq_0, -scale_k, Fs3, Os3, nb);
+          for (long k = 0; k < nk; ++k)
+            for (long r = 0; r < nc2; ++r)
+              for (long N = 0; N < Nm; ++N) y.cst(k, r / nc, r % nc, N) = Os3(k, r, N);
+          if (dbg)
+            app_log(2, "  [dynbse dbg]   -> |y fam0| {:.3e} |y fam1| {:.3e} |y cst| {:.3e}", nrm(y.fam(0, nda::ellipsis{})),
+                    nrm(y.fam(1, nda::ellipsis{})), nrm(y.cst));
+          ++kd_calls;
+          return fe;
+        };
+        // ---- per requested nu ---------------------------------------------------------------
+        for (long jn = 0; jn < nnu; ++jn) {
+          const long m = nu_list[jn];
+          const cplx inu = (m == tools.m0) ? cplx(0.0) : cplx(tools.ft->omega(tools.wn_b(m)));
+          build_cb_tau(G_CC, tools, is, iq, m, kpq, Cb_k);
+          if (met) met->t_cb += watch.lap();
+          // Cb D (the bubble's pair block) for the "rungs >= 1" subtraction
+          for (long k = 0; k < nk; ++k)
+            for (long r = 0; r < nc2; ++r)
+              for (long N = 0; N < Nm; ++N) {
+                cplx acc(0.0);
+                for (long c = 0; c < nc2; ++c) acc += Cb_k(k, r, c) * Dc(k, c / nc, c % nc, N);
+                CbD(k, r / nc, r % nc, N) = acc;
+              }
+          auto readout = [&](nda::array<cplx, 4> const &Gsum, nda::array<cplx, 4> *out) {
+            if (out == nullptr) return;
+            Vout() = Gsum - CbD;
+            auto Pblk = db::collapse(Dc, Vout);
+            for (long M = 0; M < Nm; ++M)
+              for (long N = 0; N < Nm; ++N) (*out)(jn, iq, M, N) = cplx(spinfac / double(nk)) * Pblk(M, N);
+          };
+          // the static resolvent (or T_s = 0 for the pure one-rung column)
+          db::static_resolvent S;
+          if (opt.one_rung_only) {
+            S.D = D; S.nk = nk; S.nc = nc;
+            S.Cb = nda::array<cplx, 2>(D, D);
+            S.Cb() = cplx(0.0);
+            for (long k = 0; k < nk; ++k)
+              for (long r = 0; r < nc2; ++r)
+                for (long c = 0; c < nc2; ++c) S.Cb(k * nc2 + r, k * nc2 + c) = Cb_k(k, r, c);
+            S.Ts = nda::array<cplx, 2>(D, D);
+            S.Ts() = cplx(0.0);
+          } else {
+            S = db::build_static_resolvent_from(Cb_k, Ks);
+          }
+          if (met) met->t_lu += watch.lap();
+          db::dyson_result res;
+          if (opt.static_only) {
+            db::tf_vector y0(np, nk, nc, Nm), Gamma(np, nk, nc, Nm);
+            nda::array<cplx, 4> Gsum(nk, nc, nc, Nm);
+            db::ls_apply(b, P, S, inu, true, Dc, y0, Gamma, Gsum, &Cb_k);
+            res.Gsum0 = Gsum;
+            res.Gsum1 = Gsum;
+            res.Gsum = Gsum;
+            res.converged = true;
+          } else if (opt.one_rung_only) {
+            res = db::solve_dyson_op(b, P, kd, S, inu, true, Dc, opt.tol, 1, false, &Cb_k);
+          } else if (opt.gmres_m > 0) {
+            res = db::solve_dyson_gmres(b, P, kd, S, inu, true, Dc, opt.tol, opt.maxit, opt.gmres_m, &Cb_k);
+          } else {
+            res = db::solve_dyson_op(b, P, kd, S, inu, true, Dc, opt.tol, opt.maxit, false, &Cb_k);
+          }
+          if (rank == 0 and sq == 0) {
+            std::string hist;
+            for (double h : res.history) {
+              char buf[32];
+              std::snprintf(buf, sizeof(buf), " %.2e", h);
+              hist += buf;
+            }
+            app_log(2, "  [dynbse] unit (s {}, q {}) nu node {}: {} applications, converged {}, watchdog {:.3e}, "
+                       "refit {:.3e}; residuals:{}", is, iq, m, res.iterations, res.converged, res.contraction,
+                    res.fit_err_max, hist);
+          }
+          if (met) {
+            met->t_solve += watch.lap();
+            met->refit_err_max = std::max(met->refit_err_max, res.fit_err_max);
+            met->ritz_max = std::max(met->ritz_max, res.contraction);
+            met->it_max = std::max(met->it_max, res.iterations);
+            met->it_sum += res.iterations;
+            ++met->nunits;
+            if (res.converged) ++met->nconv;
+          }
+          readout(res.Gsum0, Pi_static);
+          if (opt.one_rung_only) {
+            // Gsum1 = Cb D + sum L0 K_d L0 D  (T_s = 0): the pure one dynamic rung
+            readout(res.Gsum1, Pi_dyn1);
+          } else {
+            readout(res.Gsum1, Pi_gam1);
+            readout(res.Gsum, Pi_dyn);
+          }
+          if (met) {
+            met->t_read += watch.lap();
+            met->rss_max_gb = std::max(met->rss_max_gb, vertex_ladder_detail::prof_rss_gb());
+          }
+        }
+      }
+    }
+
+  } // namespace vertex_dynbse_detail
+
+  /**
+   * THE D2 GATES on the readout instance (nosym window mode; requires W0bar and the W-bar cache):
+   *   a0_resid  : the THC rung operator with a nu'-constant W (= W0bar) vs the explicit Kbig on a
+   *               random pair block -- machine class (pins the leg conjugation and the k-sum orientation);
+   *   a_resid   : the static limit of the driver vs the SIGN-CORRECTED L2 resolvent
+   *               -pair_space_ladder(-W0bar) -- 1e-12 class (same tau-route Cb, same Kbig, same legs);
+   *   a_l2_diff : the same vs the as-implemented L2 (the even-order sign; O(lambda^2), reported);
+   *   b_resid   : the one bare dynamic rung vs pi_c_accumulate_w(Z = 0, W_dyn - W_dyn(0)) -- fit class;
+   *   herm      : |P - P^dag| / |P| of the resummed vertex; ritz / iterations / fit meters.
+   */
+  vertex_t::dynbse_diag vertex_t::dynbse_gate(MBState &mb_state, THC_ERI auto &thc) {
+    decltype(nda::range::all) all;
+    namespace vd = vertex_dynbse_detail;
+    dynbse_diag d;
+    utils::check(active() and secondary(), "vertex_t::dynbse_gate: requires an ACTIVE secondary-basis vertex.");
+    utils::check(not _wannier, "vertex_t::dynbse_gate: window mode only.");
+    utils::check(_W0b_qmm.has_value(), "vertex_t::dynbse_gate: W0bar is absent -- build_w0 must run first.");
+    utils::check(_Wb_qwmm.has_value(),
+                 "vertex_t::dynbse_gate: the W-bar cache is absent -- run update_w and cache_w first.");
+    auto MF = thc.MF();
+    auto mpi = thc.mpi();
+    utils::check(MF->nkpts() == MF->nkpts_ibz() and MF->nqpts() == MF->nqpts_ibz(),
+                 "vertex_t::dynbse_gate: nosym meshes only at D2.");
+    nda::array<ComplexType, 5> G_CC;
+    nda::array<long, 2> kmq, kpq;
+    vertex_sym::sym_ctx const *symc = nullptr;
+    ladder_inputs(mb_state, thc, G_CC, kmq, kpq, symc);
+    utils::check(symc == nullptr or not symc->active, "vertex_t::dynbse_gate: nosym only.");
+    vertex_pi::iaft_tools tools(*_ft);
+    const long nw_b = tools.nw_b, nk = MF->nkpts(), nq = MF->nqpts(), Nm = _Xb_skma.shape(2);
+    const long nc = subspace_rank(), nc2 = nc * nc, ns = G_CC.shape(1);
+    const long rank = mpi->comm.rank(), size = mpi->comm.size();
+    std::vector<long> nus = {tools.m0, tools.m0 + 1};
+    const long nnu = long(nus.size());
+    auto const &W0b = _W0b_qmm.value();
+    auto const &Wbh = _Wb_qwmm.value();
+    auto max_abs4 = [](nda::array<ComplexType, 4> const &A) {
+      double m = 0.0;
+      for (auto const &v : A) m = std::max(m, std::abs(v));
+      return m;
+    };
+    auto rel4 = [&](nda::array<ComplexType, 4> const &A, nda::array<ComplexType, 4> const &B) {
+      double dm = 0.0, sm = 0.0;
+      for (long i = 0; i < long(A.size()); ++i) {
+        dm = std::max(dm, std::abs(A.data()[i] - B.data()[i]));
+        sm = std::max(sm, std::abs(B.data()[i]));
+      }
+      return (sm > 0.0) ? dm / sm : dm;
+    };
+
+    // ---- (A0) the rung operator vs Kbig (rank 0, unit (0, 0)) --------------------------------
+    {
+      nda::array<long, 2> qx_of(nk, nk);
+      qx_of() = -1;
+      for (long iqx = 0; iqx < nq; ++iqx)
+        for (long ik = 0; ik < nk; ++ik) qx_of(ik, kmq(iqx, ik)) = iqx;
+      const long D = nc2 * nk;
+      nda::array<ComplexType, 2> Kbig(D, D);
+      vd::build_kbig(_Xb_skma, W0b, 0, 0, kpq, qx_of, Kbig);
+      std::mt19937 rng(11);
+      std::uniform_real_distribution<double> u(-1.0, 1.0);
+      const long nR = 5;
+      nda::array<ComplexType, 3> F(nk, nc2, nR), O(nk, nc2, nR);
+      for (auto &v : F) v = ComplexType(u(rng), u(rng));
+      auto Wq = [&](long iqp) { return W0b(iqp, all, all); };
+      vd::thc_rung_apply(_Xb_skma, 0, 0, kpq, qx_of, Wq, ComplexType(1.0), F, O, 3);
+      double dm = 0.0, sm = 0.0;
+      for (long kp = 0; kp < nk; ++kp)
+        for (long r = 0; r < nc2; ++r)
+          for (long n = 0; n < nR; ++n) {
+            ComplexType acc(0.0);
+            for (long k = 0; k < nk; ++k)
+              for (long c = 0; c < nc2; ++c) acc += Kbig(kp * nc2 + r, k * nc2 + c) * F(k, c, n);
+            dm = std::max(dm, std::abs(acc - O(kp, r, n)));
+            sm = std::max(sm, std::abs(acc));
+          }
+      d.a0_resid = (sm > 0.0) ? dm / sm : dm;
+      app_log(1, "  [D2 gate] (A0) THC rung operator vs explicit Kbig: rel diff {:.3e} (scale {:.3e})", d.a0_resid, sm);
+    }
+
+    // ---- (A) the static limit vs the L2 resolvent, both signs --------------------------------
+    nda::array<ComplexType, 4> Ps(nnu, nq, Nm, Nm);
+    {
+      vd::dyn_opts o;
+      o.static_only = true;
+      vd::dyn_meter met;
+      vd::pair_space_ladder_dyn(G_CC, _Xb_skma, W0b, Wbh, kmq, kpq, tools, nus, &Ps, nullptr, nullptr, nullptr,
+                                rank, size, o, &met);
+      mpi->comm.all_reduce_in_place_n(Ps.data(), Ps.size(), std::plus<>{});
+      met.reduce(mpi->comm);
+      d.fit_err_G = met.fit_err_G;
+      d.rr_G = met.rr_G;
+      d.dsq_err = met.dsq_err;
+      d.wtau_sym = met.wtau_sym;
+      nda::array<ComplexType, 4> Pl(nnu, nq, Nm, Nm), Plm(nnu, nq, Nm, Nm);
+      nda::array<ComplexType, 3> W0m(nq, Nm, Nm);
+      W0m() = -W0b;
+      vertex_ladder_detail::pair_space_ladder(G_CC, _Xb_skma, W0b, kmq, kpq, tools, nus, nullptr, &Pl, rank, size, symc);
+      vertex_ladder_detail::pair_space_ladder(G_CC, _Xb_skma, W0m, kmq, kpq, tools, nus, nullptr, &Plm, rank, size, symc);
+      mpi->comm.all_reduce_in_place_n(Pl.data(), Pl.size(), std::plus<>{});
+      mpi->comm.all_reduce_in_place_n(Plm.data(), Plm.size(), std::plus<>{});
+      Plm() = -Plm;                                   // the sign-corrected L2
+      d.a_resid = rel4(Ps, Plm);
+      d.a_l2_diff = rel4(Ps, Pl);
+      d.static_max = max_abs4(Ps);
+      app_log(1, "  [D2 gate] (A) static limit vs the sign-corrected L2 (-ladder(-W0)): rel diff {:.3e}; vs the "
+                 "as-implemented L2: {:.3e} (|static| {:.3e}); G fit {:.3e} (rr {:.3g}), Dsq/Dcb {:.3e}, "
+                 "W_d(s) PH-sym resid {:.3e}",
+              d.a_resid, d.a_l2_diff, d.static_max, d.fit_err_G, d.rr_G, d.dsq_err, d.wtau_sym);
+    }
+
+    // ---- (B) one bare dynamic rung vs the anchor's phase 2 -----------------------------------
+    {
+      nda::array<ComplexType, 4> P1(nnu, nq, Nm, Nm);
+      vd::dyn_opts o;
+      o.one_rung_only = true;
+      vd::dyn_meter met;
+      vd::pair_space_ladder_dyn(G_CC, _Xb_skma, W0b, Wbh, kmq, kpq, tools, nus, nullptr, &P1, nullptr, nullptr,
+                                rank, size, o, &met);
+      mpi->comm.all_reduce_in_place_n(P1.data(), P1.size(), std::plus<>{});
+      met.reduce(mpi->comm);
+      d.refit_err_1 = met.refit_err_max;
+      // the anchor: K_d = W_dyn(inu') - W_dyn(0) split as the anchor needs it -- the CONSTANT
+      // -W_dyn(0) is its instantaneous rung (phase 1: pair bubbles at the external nu; the phase-2
+      // DLR tau transform cannot carry a constant in nu'), the full W_dyn(inu') its dynamic rung
+      const long lpos0 = std::max(tools.m0, tools.w_mirror_b(tools.m0)) - nw_b / 2;
+      nda::array<ComplexType, 3> Zm(nq, Nm, Nm);
+      for (long iqp = 0; iqp < nq; ++iqp) Zm(iqp, all, all) = -Wbh(iqp, lpos0, all, all);
+      nda::array<ComplexType, 4> Wdyn(nq, nw_b, Nm, Nm);
+      for (long iqp = 0; iqp < nq; ++iqp)
+        for (long l = 0; l < nw_b; ++l) {
+          const long lpos = std::max(l, tools.w_mirror_b(l)) - nw_b / 2;
+          Wdyn(iqp, l, all, all) = Wbh(iqp, lpos, all, all);
+        }
+      nda::array<ComplexType, 4> PiC(nw_b, nq, Nm, Nm);
+      PiC() = ComplexType(0.0);
+      vertex_pi::pi_c_accumulate_w(*_ft, tools, G_CC, _Xb_skma, Zm, &Wdyn, kmq, kpq, nda::range(0, nc), PiC,
+                                   rank, size, false, nullptr, symc);
+      mpi->comm.all_reduce_in_place_n(PiC.data(), PiC.size(), std::plus<>{});
+      double dm = 0.0, sm = 0.0;
+      for (long jn = 0; jn < nnu; ++jn)
+        for (long iq = 0; iq < nq; ++iq)
+          for (long M = 0; M < Nm; ++M)
+            for (long N = 0; N < Nm; ++N) {
+              dm = std::max(dm, std::abs(P1(jn, iq, M, N) - PiC(nus[size_t(jn)], iq, M, N)));
+              sm = std::max(sm, std::abs(PiC(nus[size_t(jn)], iq, M, N)));
+            }
+      // the anchor is compared at inu = 0 (its instantaneous + dynamic phases are exact there);
+      // at the first positive node the one-rung term must be CONTINUOUS in nu (the node is
+      // 2 pi / beta above zero): |P1(nu_1) - P1(0)| / |P1(0)| is the meter, and the anchor's own
+      // jump between the two nodes is reported next to it
+      {
+        double d0 = 0.0, s0 = 0.0;
+        for (long iq = 0; iq < nq; ++iq)
+          for (long M = 0; M < Nm; ++M)
+            for (long N = 0; N < Nm; ++N) {
+              d0 = std::max(d0, std::abs(P1(1, iq, M, N) - P1(0, iq, M, N)));
+              s0 = std::max(s0, std::abs(P1(0, iq, M, N)));
+            }
+        d.b_continuity = (s0 > 0.0) ? d0 / s0 : d0;
+        double da = 0.0, sa = 0.0;
+        for (long iq = 0; iq < nq; ++iq)
+          for (long M = 0; M < Nm; ++M)
+            for (long N = 0; N < Nm; ++N) {
+              da = std::max(da, std::abs(PiC(nus[1], iq, M, N) - PiC(nus[0], iq, M, N)));
+              sa = std::max(sa, std::abs(PiC(nus[0], iq, M, N)));
+            }
+        app_log(1, "  [D2 gate] (B) nu-continuity of the one dynamic rung, node 1 vs 0: driver {:.3e}, anchor {:.3e}",
+                d.b_continuity, (sa > 0.0) ? da / sa : da);
+      }
+      {
+        double dm0 = 0.0, sm0 = 0.0;
+        for (long iq = 0; iq < nq; ++iq)
+          for (long M = 0; M < Nm; ++M)
+            for (long N = 0; N < Nm; ++N) {
+              dm0 = std::max(dm0, std::abs(P1(0, iq, M, N) - PiC(nus[0], iq, M, N)));
+              sm0 = std::max(sm0, std::abs(PiC(nus[0], iq, M, N)));
+            }
+        d.b_resid = (sm0 > 0.0) ? dm0 / sm0 : dm0;      // the gate: inu = 0
+      }
+      d.onerung_max = sm;
+      app_log(1, "  [D2 gate] (B) one bare dynamic rung vs pi_c_accumulate_w(Z = 0, W_dyn - W_dyn(0)): rel diff "
+                 "{:.3e} (|anchor| {:.3e}, |static| {:.3e}); tau refit err {:.3e}",
+              d.b_resid, sm, d.static_max, d.refit_err_1);
+      // per-node detail
+      for (long jn = 0; jn < nnu; ++jn) {
+        double dj = 0.0, sj = 0.0;
+        for (long iq = 0; iq < nq; ++iq)
+          for (long M = 0; M < Nm; ++M)
+            for (long N = 0; N < Nm; ++N) {
+              dj = std::max(dj, std::abs(P1(jn, iq, M, N) - PiC(nus[size_t(jn)], iq, M, N)));
+              sj = std::max(sj, std::abs(PiC(nus[size_t(jn)], iq, M, N)));
+            }
+        double pj = 0.0;
+        for (long iq = 0; iq < nq; ++iq)
+          for (long M = 0; M < Nm; ++M)
+            for (long N = 0; N < Nm; ++N) pj = std::max(pj, std::abs(P1(jn, iq, M, N)));
+        app_log(1, "  [D2 gate] (B) node {} (n = {}): rel diff {:.3e}, |anchor| {:.3e}, |P1| {:.3e}", jn,
+                tools.wn_b(nus[size_t(jn)]), (sj > 0.0) ? dj / sj : dj, sj, pj);
+      }
+    }
+
+    // ---- (C) the resummed vertex at inu = 0: Neumann and GMRES, Hermiticity, meters --------
+    // (inu = 0 only here: in the {U, S} two-family representation the index-confluent pairs carry
+    //  coefficients +-1/(i nu) that cancel only in values, and at the first positive node of a
+    //  beta = 1000 grid (1/nu = 159) the per-family tau refit noise re-enters the iteration at the
+    //  level of the physical content -- measured: Ritz 2e3, the solve stalls. The bounded
+    //  representation T_a = U_a S_a of the shifted family is increment D2e; the one-rung column
+    //  above is continuous into that node because its readout cancels exactly.)
+    {
+      std::vector<long> nu0 = {tools.m0};
+      const long nnu0 = 1;
+      nda::array<ComplexType, 4> Pg(nnu0, nq, Nm, Nm), Pd(nnu0, nq, Nm, Nm), Pd2(nnu0, nq, Nm, Nm), Pg2(nnu0, nq, Nm, Nm);
+      vd::dyn_opts o;
+      o.gmres_m = 4;
+      o.maxit = 12;
+      vd::dyn_meter met;
+      vd::pair_space_ladder_dyn(G_CC, _Xb_skma, W0b, Wbh, kmq, kpq, tools, nu0, nullptr, nullptr, &Pg, &Pd,
+                                rank, size, o, &met);
+      mpi->comm.all_reduce_in_place_n(Pg.data(), Pg.size(), std::plus<>{});
+      mpi->comm.all_reduce_in_place_n(Pd.data(), Pd.size(), std::plus<>{});
+      met.reduce(mpi->comm);
+      vd::dyn_opts o2;
+      o2.gmres_m = 0;
+      o2.maxit = 12;
+      vd::dyn_meter met2;
+      vd::pair_space_ladder_dyn(G_CC, _Xb_skma, W0b, Wbh, kmq, kpq, tools, nu0, nullptr, nullptr, &Pg2, &Pd2,
+                                rank, size, o2, &met2);
+      mpi->comm.all_reduce_in_place_n(Pg2.data(), Pg2.size(), std::plus<>{});
+      mpi->comm.all_reduce_in_place_n(Pd2.data(), Pd2.size(), std::plus<>{});
+      met2.reduce(mpi->comm);
+      d.gmres_vs_neumann = rel4(Pd, Pd2);
+      d.gam1_consistency = rel4(Pg, Pg2);
+      d.ritz_max = met.ritz_max;
+      d.contraction_max = met2.ritz_max;
+      d.it_max = met.it_max;
+      d.it_max_neumann = met2.it_max;
+      d.all_converged = (met.nconv == met.nunits) and (met2.nconv == met2.nunits);
+      d.refit_err = std::max(met.refit_err_max, met2.refit_err_max);
+      d.dyn_max = max_abs4(Pd);
+      d.gam1_max = max_abs4(Pg);
+      d.herm = vertex_ladder_detail::hermitize_mn(Pd);
+      // the dynamic correction relative to the static ladder (inu = 0)
+      for (long jn = 0; jn < nnu0; ++jn) {
+        double ds = 0.0, ss = 0.0, d1 = 0.0;
+        for (long iq = 0; iq < nq; ++iq)
+          for (long M = 0; M < Nm; ++M)
+            for (long N = 0; N < Nm; ++N) {
+              ds = std::max(ds, std::abs(Pd(jn, iq, M, N) - Ps(jn, iq, M, N)));
+              d1 = std::max(d1, std::abs(Pg(jn, iq, M, N) - Ps(jn, iq, M, N)));
+              ss = std::max(ss, std::abs(Ps(jn, iq, M, N)));
+            }
+        if (jn == 0) { d.dyn_vs_static = (ss > 0.0) ? ds / ss : ds; d.gam1_vs_static = (ss > 0.0) ? d1 / ss : d1; }
+        app_log(1, "  [D2 gate] (C) node {}: |resummed - static| / |static| = {:.3e}, |Gamma1 - static| / |static| "
+                   "= {:.3e}", jn, (ss > 0.0) ? ds / ss : ds, (ss > 0.0) ? d1 / ss : d1);
+      }
+      app_log(1, "  [D2 gate] (C) resummed: GMRES(4) vs Neumann rel diff {:.3e} (Gamma1 {:.3e}); max |Ritz(K_d L_s)| "
+                 "{:.3f}, Neumann contraction {:.3f}; applications max {} / {}; all converged {}; tau refit "
+                 "{:.3e}; Hermiticity {:.3e}; walls: setup {:.2f} kbig {:.2f} cb {:.2f} lu {:.2f} solve {:.2f} "
+                 "read {:.2f} s; RSS {:.2f} GB",
+              d.gmres_vs_neumann, d.gam1_consistency, d.ritz_max, d.contraction_max, d.it_max, d.it_max_neumann,
+              d.all_converged, d.refit_err, d.herm, met.t_setup, met.t_kbig, met.t_cb, met.t_lu, met.t_solve,
+              met.t_read, met.rss_max_gb);
+    }
+    return d;
+  }
+
+} // namespace solvers
+} // namespace methods
+
+#endif // COQUI_VERTEX_DYNBSE_ICC
