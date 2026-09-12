@@ -682,7 +682,10 @@ namespace solvers {
         for (long q = 0; q < nq; ++q) qlist.push_back(q);
       }
       const long nql = long(qlist.size());
-      for (long sq = rank; sq < ns * nql; sq += nproc) {
+      // the parallel unit is (s, q, nu) [2026-09-12]: with a long nu list and few transfers (the eps cuts)
+      // the former (s, q) units left most ranks idle; the per-(s, q) setup below is cheap next to a solve
+      for (long u = rank; u < ns * nql * nnu; u += nproc) {
+        const long sq = u / nnu, jn_unit = u % nnu;
         const long is = sq / nql, iq = qlist[size_t(sq % nql)];
         // ---- the legs and the static rung of this unit ------------------------------------------
         for (long k = 0; k < nk; ++k) {
@@ -713,7 +716,7 @@ namespace solvers {
           const long nR = F.nR;           // the RHS block width of this solve
           utils::check(nR == nR_cur and y.nR == nR and Fsum.shape(3) == nR, "pair_space_ladder_dyn: kd block width mismatch.");
           const bool nu0 = (inu_cur == cplx(0.0));
-          const bool dbg = (rank == 0 and sq == 0);
+          const bool dbg = (rank == 0 and u == 0);
           auto nrm = [](auto const &A) { double n = 0.0; for (auto const &v : A) n += std::norm(v); return std::sqrt(n); };
           if (dbg)
             app_log(2, "  [dynbse dbg] kd call {}: |F fam0| {:.3e} |F fam1| {:.3e} |F cst| {:.3e} |Fsum| {:.3e}",
@@ -769,8 +772,9 @@ namespace solvers {
           ++kd_calls;
           return fe;
         };
-        // ---- per requested nu ---------------------------------------------------------------
-        for (long jn = 0; jn < nnu; ++jn) {
+        // ---- the requested nu of this unit ---------------------------------------------------
+        {
+          const long jn = jn_unit;
           const long m = nu_list[jn];
           const cplx inu = (m == tools.m0) ? cplx(0.0) : cplx(tools.ft->omega(tools.wn_b(m)));
           inu_cur = inu;
@@ -781,7 +785,7 @@ namespace solvers {
             stab.emplace(db::build_shift_tables(b, inu));
             stp = std::addressof(stab.value());
             if (met) met->dsq_err = std::max(met->dsq_err, stab->fit_err);
-            if (rank == 0 and sq == 0)
+            if (rank == 0 and u == 0)
               app_log(2, "  [dynbse] shift tables at nu node {} (inu = {:.4e}i): fit err {:.3e}, kept condition {:.3e}",
                       m, inu.imag(), stab->fit_err, stab->cond_kept);
           }
@@ -864,7 +868,7 @@ namespace solvers {
           res.readout_converged = rconv_unit;
           res.contraction = ritz_unit;
           res.fit_err_max = refit_unit;
-          if (rank == 0 and sq == 0) {
+          if (rank == 0 and u == 0) {
             std::string hist;
             for (double h : res.history) {
               char buf[32];
