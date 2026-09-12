@@ -12,6 +12,7 @@
 
 #undef NDEBUG
 
+#include <cstdlib>
 #include <cmath>
 #include <complex>
 #include <string>
@@ -55,7 +56,7 @@ namespace bdft_tests {
                                                1e-10, mf->ecutrho(), 1, 1024));
     auto eri = mb_eri_t(thc, thc);
 
-    auto gate_at = [&](nda::range window, int niter) {
+    auto gate_at = [&](nda::range window, int niter, bool quick) {
       solvers::hf_t hf;
       solvers::gw_t gw(&ft, "ignore_g0", output);
       solvers::scr_coulomb_t scr_eri(&ft, "rpa", "ignore_g0");
@@ -76,14 +77,25 @@ namespace bdft_tests {
       REQUIRE(mb_state.dW_qtPQ.has_value());
       pv->cache_w(mb_state, thc);
       REQUIRE(pv->has_cached_w());
-      auto g = pv->dynbse_gate(mb_state, thc);
+      auto g = pv->dynbse_gate(mb_state, thc, quick);
       mpi_context->comm.barrier();
       if (mpi_context->comm.root()) remove((output + ".mbpt.h5").c_str());
       mpi_context->comm.barrier();
       return g;
     };
 
-    auto g = gate_at(nda::range(0, 4), 2);
+    if (std::getenv("COQUI_DYNBSE_QUICK") != nullptr) {
+      // the quick leg (A0 / A0-FT / A0' only): the mesh-Fourier k-sum IS the direct rung operator
+      auto gq = gate_at(nda::range(0, 4), 1, true);
+      app_log(1, "dynbse_gate quick: A0 {:.3e}; A0-FT {:.3e} (mesh check {:.2e})", gq.a0_resid, gq.a0_ft_resid, gq.a0_ft_check);
+      REQUIRE(gq.a0_resid < 1e-12);
+      REQUIRE(gq.a0_ft_check >= 0.0);
+      REQUIRE(gq.a0_ft_check < 1e-10);
+      REQUIRE(gq.a0_ft_resid >= 0.0);
+      REQUIRE(gq.a0_ft_resid < 1e-11);
+      return;
+    }
+    auto g = gate_at(nda::range(0, 4), 2, false);
     app_log(1, "dynbse_gate [C = [0,4) of {}]: A0 {:.3e}; A {:.3e} (vs as-implemented L2 {:.3e}); B {:.3e} "
                "(|anchor| {:.3e}, |static| {:.3e}); GMRES vs Neumann {:.3e}, Gamma1 {:.3e}; Ritz {:.3f} / "
                "contraction {:.3f}; applications {} / {}; converged {}; refit {:.3e}; herm {:.3e}; dyn vs static "
@@ -94,6 +106,8 @@ namespace bdft_tests {
             g.dsq_err, g.wtau_sym);
     REQUIRE(g.a0_resid >= 0.0);
     REQUIRE(g.a0_resid < 1e-12);                  // the THC rung operator IS Kbig
+    REQUIRE(g.a0_ft_resid >= 0.0);
+    REQUIRE(g.a0_ft_resid < 1e-11);               // (A0-FT) the mesh-Fourier k-sum IS the direct rung operator
     REQUIRE(g.a_resid < 1e-10);                   // the static limit IS the (sign-corrected) L2 resolvent
     REQUIRE(g.b_resid < 1e-3);                    // one dynamic rung = the anchor at inu = 0 (fit class)
     REQUIRE(g.b_continuity < 1e-2);               // and continuous into the first positive node

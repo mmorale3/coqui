@@ -4826,7 +4826,7 @@ namespace solvers {
   // scGW-tilde Tier 1.5 (notes/tier15_ward_legs_plan.md, increment T15-b)
   template vertex_t::ward_legs_diag vertex_t::ward_legs_gate(MBState&, thc_reader_t&);
   // scGW-tilde Tier 2 full frequency (notes/dynbse_plan.md, increment D2)
-  template vertex_t::dynbse_diag vertex_t::dynbse_gate(MBState&, thc_reader_t&);
+  template vertex_t::dynbse_diag vertex_t::dynbse_gate(MBState&, thc_reader_t&, bool);
   template vertex_t::dynbse_nu0_result vertex_t::eval_pol_dynbse_nu0(MBState&, thc_reader_t&);
   template vertex_t::dynbse_cut_result vertex_t::eval_pol_dynbse_cut(MBState&, thc_reader_t&, std::vector<long> const&,
                                                                      std::vector<long> const&);

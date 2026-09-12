@@ -64,6 +64,9 @@ namespace solvers {
       long rhs_block = 0;         // solve the Nm right-hand-side columns in blocks of this width (0 = all at
                                   // once): the Krylov basis (m + 1 tf_vectors of width nR) is the memory
                                   // driver; each block converges to tol independently (differences at tol)
+      nda::array<double, 2> const *kcrys = nullptr;  // (nk, 3) crystal coordinates of the k mesh: when given
+                                                     // (and ksum_ft), the rung's k-sum runs through kmesh_ft
+      bool ksum_ft = true;
       std::vector<long> const *q_subset = nullptr;   // evaluate only these transfers (all q when null);
                                                      // the outputs keep the full q axis (zeros elsewhere)
       double gap_mask = 0.0;      // union scheme: DROP the G nodes with |eps| < gap_mask (Ha, relative to
@@ -82,6 +85,7 @@ namespace solvers {
       long it_max = 0, it_sum = 0, nunits = 0, nconv = 0;
       double t_setup = 0.0, t_kbig = 0.0, t_cb = 0.0, t_lu = 0.0, t_solve = 0.0, t_read = 0.0;
       double rss_max_gb = 0.0;
+      bool ksum_ft = false;         // the rung's k-sum ran through the mesh Fourier transform
       void reduce(boost::mpi3::communicator &comm) {
         auto mx = [&](double &v) { v = comm.all_reduce_value(v, boost::mpi3::max<>{}); };
         auto sm = [&](long &v) { v = comm.all_reduce_value(v, std::plus<>{}); };
@@ -162,6 +166,190 @@ namespace solvers {
           for (long P = 0; P < Nm; ++P)
             for (long Q = 0; Q < Nm; ++Q)
               for (long n = 0; n < nb; ++n) Zk(P, Q * nb + n) = Z(P, Q, kp, n);
+          nda::blas::gemm(XkT, Zk, B);                                   // (p1, (Q N))
+          for (long p1 = 0; p1 < nc; ++p1)
+            for (long n = 0; n < nb; ++n)
+              for (long Q = 0; Q < Nm; ++Q) B2(p1 * nb + n, Q) = B(p1, Q * nb + n);
+          nda::blas::gemm(B2, Xcq, O2);                                  // ((p1 N), p3')
+          for (long p1 = 0; p1 < nc; ++p1)
+            for (long p3p = 0; p3p < nc; ++p3p)
+              for (long n = 0; n < nbl; ++n) out(kp, p1 * nc + p3p, n0 + n) = scale * O2(p1 * nb + n, p3p);
+        }
+      }
+    }
+
+    /**
+     * The k-mesh Fourier transform of the rung's k-sum (2026-09-12). On the full nosym mesh the k-sum
+     *   Z(k') = sum_k W(k - k') Y(k)
+     * is a circular convolution on the abelian group of the mesh, so with the characters
+     *   U(R, k) = exp(-2 pi i m_k . m_R / n)   (m = integer mesh coordinates, R labeled by the same set)
+     * it is Z = U^-1 [ A (.) (U Y) ],  A(R) = sum_q exp(+2 pi i m_q . m_R / n) W(q),  U^-1 = conj(U)/nk.
+     * Two dense (nk x nk) gemms on (nk x Nm^2 nb) blocks replace the Nm^2 tiny (nk x nk)(nk x nb) gemms
+     * and their gathers of thc_rung_apply (nk^2 -> nk log nk is not the point at nk = 64: the point is
+     * ONE gemm-efficient contraction instead of Nm^2 overhead-bound ones). The mesh dimensions are
+     * inferred from the crystal coordinates; build() verifies unitarity and the convolution identity
+     * against the direct sum on random data (1e-10) and reports `ok` -- the driver falls back to the
+     * direct sum otherwise.
+     */
+    struct kmesh_ft {
+      long nk = 0;
+      nda::array<cplx, 2> U;        // (R, k): forward, unnormalized
+      nda::array<cplx, 2> Uinv;     // (k, R): conj(U)^T / nk
+      nda::array<cplx, 2> Uq;       // (R, q): exp(+2 pi i m_q . m_R / n) -- the transform of the rung
+      bool ok = false;
+      double check = -1.0;          // the convolution identity residual of build()
+      void build(nda::array<double, 2> const &kcrys, nda::array<long, 2> const &kmq, nda::array<long, 2> const &kpq) {
+        decltype(nda::range::all) all;
+        nk = kcrys.shape(0);
+        const long nq = kmq.shape(0);
+        ok = false;
+        if (nq != nk or kcrys.shape(1) != 3) return;
+        // mesh dimensions per direction from the distinct fractional coordinates
+        long n[3];
+        nda::array<long, 2> mk(nk, 3);
+        for (int a = 0; a < 3; ++a) {
+          std::vector<double> v;
+          for (long k = 0; k < nk; ++k) {
+            double x = kcrys(k, a) - std::floor(kcrys(k, a));
+            if (x > 1.0 - 1e-8) x = 0.0;
+            bool found = false;
+            for (double y : v) if (std::abs(x - y) < 1e-8) { found = true; break; }
+            if (not found) v.push_back(x);
+          }
+          n[a] = long(v.size());
+          for (long k = 0; k < nk; ++k) {
+            double x = kcrys(k, a) - std::floor(kcrys(k, a));
+            if (x > 1.0 - 1e-8) x = 0.0;
+            const double m = x * double(n[a]);
+            if (std::abs(m - std::round(m)) > 1e-6) return;      // not a Gamma-centered uniform mesh
+            mk(k, a) = long(std::round(m)) % n[a];
+          }
+        }
+        if (n[0] * n[1] * n[2] != nk) return;
+        // the transfer q_x's integer coordinates from k - kmq(q_x, k) (any k; use k = 0)
+        nda::array<long, 2> mq(nq, 3);
+        for (long iqx = 0; iqx < nq; ++iqx) {
+          const long k2 = kmq(iqx, 0);
+          for (int a = 0; a < 3; ++a) mq(iqx, a) = ((mk(0, a) - mk(k2, a)) % n[a] + n[a]) % n[a];
+        }
+        U = nda::array<cplx, 2>(nk, nk);
+        Uinv = nda::array<cplx, 2>(nk, nk);
+        Uq = nda::array<cplx, 2>(nk, nq);
+        for (long R = 0; R < nk; ++R) {
+          for (long k = 0; k < nk; ++k) {
+            double ph = 0.0;
+            for (int a = 0; a < 3; ++a) ph += double(mk(k, a) * mk(R, a)) / double(n[a]);
+            const cplx e = std::exp(cplx(0.0, -2.0 * M_PI * ph));
+            U(R, k) = e;
+            Uinv(k, R) = std::conj(e) / double(nk);
+          }
+          for (long q = 0; q < nq; ++q) {
+            double ph = 0.0;
+            for (int a = 0; a < 3; ++a) ph += double(mq(q, a) * mk(R, a)) / double(n[a]);
+            Uq(R, q) = std::exp(cplx(0.0, 2.0 * M_PI * ph));
+          }
+        }
+        // self-check: the convolution identity on random data against the direct sum
+        nda::array<long, 2> qx_of(nk, nk);
+        qx_of() = -1;
+        for (long iqx = 0; iqx < nq; ++iqx)
+          for (long ik = 0; ik < nk; ++ik) qx_of(ik, kmq(iqx, ik)) = iqx;
+        for (long ik = 0; ik < nk; ++ik)
+          for (long ikp = 0; ikp < nk; ++ikp) if (qx_of(ik, ikp) < 0) return;
+        const long nc_t = 3;
+        nda::array<cplx, 2> Y(nk, nc_t), Wq(nq, 1), Zd(nk, nc_t), Yh(nk, nc_t), Zf(nk, nc_t), A(nk, 1);
+        std::mt19937_64 gen(7);
+        std::uniform_real_distribution<double> ur(-1.0, 1.0);
+        for (auto &v : Y) v = cplx(ur(gen), ur(gen));
+        for (auto &v : Wq) v = cplx(ur(gen), ur(gen));
+        for (long kp = 0; kp < nk; ++kp)
+          for (long c = 0; c < nc_t; ++c) {
+            cplx acc(0.0);
+            for (long k = 0; k < nk; ++k) acc += Wq(qx_of(k, kp), 0) * Y(k, c);
+            Zd(kp, c) = acc;
+          }
+        nda::blas::gemm(U, Y, Yh);
+        nda::blas::gemm(Uq, Wq, A);
+        for (long R = 0; R < nk; ++R)
+          for (long c = 0; c < nc_t; ++c) Yh(R, c) *= A(R, 0);
+        nda::blas::gemm(Uinv, Yh, Zf);
+        double d = 0.0, sc = 0.0;
+        for (long k = 0; k < nk; ++k)
+          for (long c = 0; c < nc_t; ++c) { d = std::max(d, std::abs(Zf(k, c) - Zd(k, c))); sc = std::max(sc, std::abs(Zd(k, c))); }
+        check = (sc > 0.0) ? d / sc : d;
+        ok = (check < 1e-10);
+        (void)kpq;
+      }
+    };
+
+    /** thc_rung_apply with the k-sum done by the mesh Fourier transform (see kmesh_ft): identical
+     *  contraction, out(k', (p1 p3'), N) = scale sum_k sum_PQ X(k',P,p1) conj(X(k'+q,Q,p3')) W_PQ(k-k')
+     *  sum_{p1' p3} conj(X(k,P,p1')) F(k,(p1'p3),N) X(k+q,Q,p3). */
+    template<class WqFn>
+    inline void thc_rung_apply_ft(nda::array<cplx, 4> const &Xb, long is, long iq,
+                                  nda::array<long, 2> const &kpq, kmesh_ft const &kft,
+                                  WqFn &&Wq, cplx scale, nda::array<cplx, 3> const &F,
+                                  nda::array<cplx, 3> &out, long nb) {
+      decltype(nda::range::all) all;
+      const long nk = F.shape(0), nc2 = F.shape(1), nR = F.shape(2), Nm = Xb.shape(2);
+      const long nc = Xb.shape(3), nq = kft.Uq.shape(1);
+      utils::check(nc * nc == nc2 and kft.ok and kft.nk == nk, "thc_rung_apply_ft: mesh transform not usable.");
+      nb = std::max(1l, std::min(nb, nR));
+      out() = cplx(0.0);
+      const long M = Nm * Nm * nb;
+      nda::array<cplx, 2> Xc(Nm, nc), Xkq(Nm, nc), XkT(nc, Nm), Xcq(Nm, nc);
+      nda::array<cplx, 2> Fk(nc, nc * nb), A(Nm, nc * nb), A2(Nm * nb, nc), Y2(Nm * nb, Nm);
+      nda::array<cplx, 2> Yk(nk, M), Yh(nk, M);                       // (k | R, (P Q n))
+      nda::array<cplx, 2> Wall(nq, Nm * Nm), Ah(nk, Nm * Nm);          // the rung at all q, and its transform
+      nda::array<cplx, 2> Zk(Nm, Nm * nb), B(nc, Nm * nb), B2(nc * nb, Nm), O2(nc * nb, nc);
+      // the rung's transform A(R, (P Q)) once per call (the same for every N block)
+      for (long q = 0; q < nq; ++q) {
+        auto W = Wq(q);
+        for (long P = 0; P < Nm; ++P)
+          for (long Q = 0; Q < Nm; ++Q) Wall(q, P * Nm + Q) = W(P, Q);
+      }
+      nda::blas::gemm(kft.Uq, Wall, Ah);
+      for (long n0 = 0; n0 < nR; n0 += nb) {
+        const long nbl = std::min(nb, nR - n0);
+        // ---- legs in: Yk(k, (P Q n)) -------------------------------------------------------------
+        for (long k = 0; k < nk; ++k) {
+          const long kq = kpq(iq, k);
+          for (long P = 0; P < Nm; ++P)
+            for (long a = 0; a < nc; ++a) {
+              Xc(P, a) = std::conj(Xb(is, k, P, a));
+              Xkq(P, a) = Xb(is, kq, P, a);
+            }
+          for (long p1p = 0; p1p < nc; ++p1p)
+            for (long p3 = 0; p3 < nc; ++p3)
+              for (long n = 0; n < nb; ++n) Fk(p1p, p3 * nb + n) = (n < nbl) ? F(k, p1p * nc + p3, n0 + n) : cplx(0.0);
+          nda::blas::gemm(Xc, Fk, A);                                    // (P, (p3 N))
+          for (long P = 0; P < Nm; ++P)
+            for (long n = 0; n < nb; ++n)
+              for (long p3 = 0; p3 < nc; ++p3) A2(P * nb + n, p3) = A(P, p3 * nb + n);
+          nda::blas::gemm(A2, nda::transpose(Xkq), Y2);                  // ((P N), Q)
+          for (long P = 0; P < Nm; ++P)
+            for (long Q = 0; Q < Nm; ++Q)
+              for (long n = 0; n < nb; ++n) Yk(k, (P * Nm + Q) * nb + n) = Y2(P * nb + n, Q);
+        }
+        // ---- the k-sum: Yh = U Yk; Yh(R, PQ n) *= A(R, PQ); Yk = Uinv Yh ------------------------
+        nda::blas::gemm(kft.U, Yk, Yh);
+        for (long R = 0; R < nk; ++R)
+          for (long PQ = 0; PQ < Nm * Nm; ++PQ) {
+            const cplx a = Ah(R, PQ);
+            for (long n = 0; n < nb; ++n) Yh(R, PQ * nb + n) *= a;
+          }
+        nda::blas::gemm(kft.Uinv, Yh, Yk);                               // Yk now holds Z(k', (P Q n))
+        // ---- legs out ------------------------------------------------------------------------------
+        for (long kp = 0; kp < nk; ++kp) {
+          const long kq = kpq(iq, kp);
+          for (long P = 0; P < Nm; ++P)
+            for (long a = 0; a < nc; ++a) {
+              XkT(a, P) = Xb(is, kp, P, a);
+              Xcq(P, a) = std::conj(Xb(is, kq, P, a));
+            }
+          for (long P = 0; P < Nm; ++P)
+            for (long Q = 0; Q < Nm; ++Q)
+              for (long n = 0; n < nb; ++n) Zk(P, Q * nb + n) = Yk(kp, (P * Nm + Q) * nb + n);
           nda::blas::gemm(XkT, Zk, B);                                   // (p1, (Q N))
           for (long p1 = 0; p1 < nc; ++p1)
             for (long n = 0; n < nb; ++n)
@@ -395,6 +583,18 @@ namespace solvers {
       const auto metric = db::build_tf_metric(b);       // the tau-value inner product of the solves
       const long nb = std::min(Nm, 16l);
       const long nrb = (opt.rhs_block > 0) ? std::min(opt.rhs_block, Nm) : Nm;   // RHS column block width
+      // the mesh Fourier transform of the rung's k-sum (self-checked; direct sum otherwise)
+      kmesh_ft kft;
+      if (opt.ksum_ft and opt.kcrys != nullptr) kft.build(*opt.kcrys, kmq, kpq);
+      const bool use_ft = kft.ok;
+      if (rank == 0)
+        app_log(2, "  [dynbse] rung k-sum: {} (mesh transform check {:.2e})", use_ft ? "mesh Fourier transform" : "direct",
+                kft.check);
+      if (met) met->ksum_ft = use_ft;
+      auto rung_apply = [&](auto &&Wfn, cplx sc, nda::array<cplx, 3> const &Fin, nda::array<cplx, 3> &Oout, long is_, long iq_) {
+        if (use_ft) thc_rung_apply_ft(Xb, is_, iq_, kpq, kft, Wfn, sc, Fin, Oout, nb);
+        else thc_rung_apply(Xb, is_, iq_, kpq, qx_of, Wfn, sc, Fin, Oout, nb);
+      };
       nda::array<cplx, 2> Kbig(D, D), Ks(D, D);
       nda::array<cplx, 3> Cb_k(nk, nc2, nc2);
       nda::array<cplx, 4> Dc(nk, nc, nc, Nm);
@@ -481,7 +681,7 @@ namespace solvers {
             }
             for (long i = 0; i < nt; ++i) {
               Fs3() = Fs(i, all, all, all);
-              thc_rung_apply(Xb, is, iq, kpq, qx_of, Wq_s(i), scale_k, Fs3, Os3, nb);
+              rung_apply(Wq_s(i), scale_k, Fs3, Os3, is, iq);
               Ys(i, all, all, all) = Os3;
             }
             auto Ys2 = nda::reshape(Ys, std::array<long, 2>{nt, nk * nc2 * nR});
@@ -501,7 +701,7 @@ namespace solvers {
           for (long k = 0; k < nk; ++k)
             for (long r = 0; r < nc2; ++r)
               for (long N = 0; N < nR; ++N) Fs3(k, r, N) = Fsum(k, r / nc, r % nc, N);
-          thc_rung_apply(Xb, is, iq, kpq, qx_of, Wq_0, -scale_k, Fs3, Os3, nb);
+          rung_apply(Wq_0, -scale_k, Fs3, Os3, is, iq);
           for (long k = 0; k < nk; ++k)
             for (long r = 0; r < nc2; ++r)
               for (long N = 0; N < nR; ++N) y.cst(k, r / nc, r % nc, N) = Os3(k, r, N);
@@ -653,7 +853,7 @@ namespace solvers {
    *   b_resid   : the one bare dynamic rung vs pi_c_accumulate_w(Z = 0, W_dyn - W_dyn(0)) -- fit class;
    *   herm      : |P - P^dag| / |P| of the resummed vertex; ritz / iterations / fit meters.
    */
-  vertex_t::dynbse_diag vertex_t::dynbse_gate(MBState &mb_state, THC_ERI auto &thc) {
+  vertex_t::dynbse_diag vertex_t::dynbse_gate(MBState &mb_state, THC_ERI auto &thc, bool quick) {
     decltype(nda::range::all) all;
     namespace vd = vertex_dynbse_detail;
     dynbse_diag d;
@@ -671,6 +871,7 @@ namespace solvers {
     vertex_sym::sym_ctx const *symc = nullptr;
     ladder_inputs(mb_state, thc, G_CC, kmq, kpq, symc);
     utils::check(symc == nullptr or not symc->active, "vertex_t::dynbse_gate: nosym only.");
+    const nda::array<double, 2> kc(MF->kpts_crystal());       // the mesh transform of the rung's k-sum
     vertex_pi::iaft_tools tools(*_ft);
     const long nw_b = tools.nw_b, nk = MF->nkpts(), nq = MF->nqpts(), Nm = _Xb_skma.shape(2);
     const long nc = subspace_rank(), nc2 = nc * nc;
@@ -729,6 +930,30 @@ namespace solvers {
           }
       d.a0_resid = (sm > 0.0) ? dm / sm : dm;
       app_log(1, "  [D2 gate] (A0) THC rung operator vs explicit Kbig: rel diff {:.3e} (scale {:.3e})", d.a0_resid, sm);
+      // the mesh-Fourier k-sum (2026-09-12): the same operator through kmesh_ft, timed against the direct sum
+      {
+        vd::kmesh_ft kft;
+        kft.build(kc, kmq, kpq);
+        d.a0_ft_check = kft.check;
+        if (kft.ok) {
+          nda::array<ComplexType, 3> Of(nk, nc2, nR);
+          vertex_ladder_detail::prof_watch tw;
+          vd::thc_rung_apply_ft(_Xb_skma, 0, 0, kpq, kft, Wq, ComplexType(1.0), F, Of, 3);
+          const double t_ft = tw.lap();
+          vd::thc_rung_apply(_Xb_skma, 0, 0, kpq, qx_of, Wq, ComplexType(1.0), F, O, 3);
+          const double t_direct = tw.lap();
+          double df = 0.0;
+          for (long kp = 0; kp < nk; ++kp)
+            for (long r = 0; r < nc2; ++r)
+              for (long n = 0; n < nR; ++n) df = std::max(df, std::abs(Of(kp, r, n) - O(kp, r, n)));
+          d.a0_ft_resid = (sm > 0.0) ? df / sm : df;
+          app_log(1, "  [D2 gate] (A0-FT) mesh-Fourier k-sum vs the direct sum: rel diff {:.3e} (mesh check {:.2e}); wall {:.3f} s "
+                     "vs {:.3f} s (Nm = {}, nk = {}, nR = {})", d.a0_ft_resid, kft.check, t_ft, t_direct, Nm, nk, nR);
+        } else {
+          app_log(1, "  [D2 gate] (A0-FT) mesh transform NOT usable (check {:.2e}): the driver uses the direct sum", kft.check);
+        }
+      }
+      if (quick) return d;
       // ---- the SIGNED dominant eigenvalue of Xh Kt = (1/nk) Cb Kbig at inu = 0 (the L2 resolvent's operator):
       // the Bethe-Salpeter series with the kernel -W is a geometric series in K'Cb = -(1/nk) Kbig Cb,
       // i.e. its resolvent is (1 + Xh Kt)^-1 and the particle-hole instability sits at lambda(Xh Kt) -> -1;
@@ -775,6 +1000,7 @@ namespace solvers {
     nda::array<ComplexType, 4> Ps(nnu, nq, Nm, Nm);
     {
       vd::dyn_opts o;
+      o.kcrys = std::addressof(kc);
       o.gap_mask = gap_mask;
       o.static_only = true;
       vd::dyn_meter met;
@@ -810,6 +1036,7 @@ namespace solvers {
     {
       nda::array<ComplexType, 4> P1(nnu, nq, Nm, Nm);
       vd::dyn_opts o;
+      o.kcrys = std::addressof(kc);
       o.gap_mask = gap_mask;
       o.one_rung_only = true;
       vd::dyn_meter met;
@@ -905,6 +1132,7 @@ namespace solvers {
       for (long nord = 2; nord <= 3; ++nord) {
         nda::array<ComplexType, 4> Pn(nnu, nq, Nm, Nm);
         vd::dyn_opts o;
+        o.kcrys = std::addressof(kc);
         o.gap_mask = gap_mask;
         o.gmres_m = 0;
         o.maxit = nord;
@@ -942,6 +1170,7 @@ namespace solvers {
       nda::array<ComplexType, 4> Pe(1, nq, Nm, Nm), Pge(1, nq, Nm, Nm);
       for (int variant = 0; variant < 3; ++variant) {
         vd::dyn_opts oe;
+        oe.kcrys = std::addressof(kc);
         oe.gap_mask = (variant == 0) ? 0.0 : gap_mask;     // 0: union, no mask; 1: union + mask; 2: shared + mask
         oe.gmres_m = 12;
         oe.maxit = 36;
@@ -976,6 +1205,7 @@ namespace solvers {
       const long nnu0 = 1;
       nda::array<ComplexType, 4> Pg(nnu0, nq, Nm, Nm), Pd(nnu0, nq, Nm, Nm), Pd2(nnu0, nq, Nm, Nm), Pg2(nnu0, nq, Nm, Nm);
       vd::dyn_opts o;
+      o.kcrys = std::addressof(kc);
       o.gmres_m = 4;
       o.maxit = 12;
       vd::dyn_meter met;
@@ -985,6 +1215,7 @@ namespace solvers {
       mpi->comm.all_reduce_in_place_n(Pd.data(), Pd.size(), std::plus<>{});
       met.reduce(mpi->comm);
       vd::dyn_opts o2;
+      o2.kcrys = std::addressof(kc);
       o2.gmres_m = 0;
       o2.maxit = 12;
       vd::dyn_meter met2;
@@ -1064,11 +1295,13 @@ namespace solvers {
     vertex_sym::sym_ctx const *symc = nullptr;
     ladder_inputs(mb_state, thc, G_CC, kmq, kpq, symc);
     utils::check(symc == nullptr or not symc->active, "vertex_t::eval_pol_dynbse_nu0: nosym only.");
+    const nda::array<double, 2> kc(MF->kpts_crystal());
     vertex_pi::iaft_tools tools(*_ft);
     const long nq = MF->nqpts(), Nm = _Xb_skma.shape(2);
     std::vector<long> nu0 = {tools.m0};
     nda::array<ComplexType, 4> Ps(1, nq, Nm, Nm), P1(1, nq, Nm, Nm), Pg(1, nq, Nm, Nm), Pd(1, nq, Nm, Nm);
     vd::dyn_opts o;
+    o.kcrys = std::addressof(kc);
     o.tol = _dyn_tol; o.maxit = _dyn_maxit; o.gmres_m = _dyn_gmres; o.sign_ks = _dyn_sign;
     o.rhs_block = _dyn_rhs_block;
     // D3/D4 configuration at inu = 0: the shared aux grid with the Dsq/Dcb tables, no mask (the
@@ -1140,6 +1373,7 @@ namespace solvers {
     vertex_sym::sym_ctx const *symc = nullptr;
     ladder_inputs(mb_state, thc, G_CC, kmq, kpq, symc);
     utils::check(symc == nullptr or not symc->active, "vertex_t::eval_pol_dynbse_cut: nosym only.");
+    const nda::array<double, 2> kc(MF->kpts_crystal());
     vertex_pi::iaft_tools tools(*_ft);
     const long nq = MF->nqpts(), Nm = _Xb_skma.shape(2), nn = long(half_nodes.size());
     std::vector<long> nus;
@@ -1151,6 +1385,7 @@ namespace solvers {
     r.qsel = qsel;
     nda::array<ComplexType, 4> Ps(nn, nq, Nm, Nm), P1(nn, nq, Nm, Nm), Pg(nn, nq, Nm, Nm), Pd(nn, nq, Nm, Nm);
     vd::dyn_opts o;
+    o.kcrys = std::addressof(kc);
     o.tol = _dyn_tol; o.maxit = _dyn_maxit; o.gmres_m = std::max<long>(_dyn_gmres, 12); o.sign_ks = _dyn_sign;
     o.rhs_block = _dyn_rhs_block;
     o.union_nodes = true;

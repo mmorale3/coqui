@@ -1733,6 +1733,7 @@ namespace solvers {
       double fit_err_G = -1.0, rr_G = -1.0, dsq_err = -1.0, wtau_sym = -1.0, refit_err_1 = -1.0, refit_err = -1.0;
       double gmres_vs_neumann = -1.0, gam1_consistency = -1.0, ritz_max = -1.0, contraction_max = -1.0;
       double block_resid = -1.0;      // (C'') RHS-blocked vs unblocked solve
+      double a0_ft_resid = -1.0, a0_ft_check = -1.0;   // (A0-FT) mesh-Fourier k-sum vs direct; the mesh identity check
       double nu1_resid = -1.0, nu1_gfit = -1.0;   // (C') union no-mask at the first positive node: |resummed - static|/|static|, G fit
       bool nu1_done = false;
       long it_max = 0, it_max_neumann = 0;
@@ -1740,7 +1741,7 @@ namespace solvers {
       double herm = -1.0, static_max = 0.0, onerung_max = 0.0, dyn_max = 0.0, gam1_max = 0.0;
       double dyn_vs_static = -1.0, gam1_vs_static = -1.0;
     };
-    dynbse_diag dynbse_gate(MBState &mb_state, THC_ERI auto &thc);
+    dynbse_diag dynbse_gate(MBState &mb_state, THC_ERI auto &thc, bool quick = false);
 
     /**
      * scGW-tilde Tier 2 full frequency, increment D3: the inu = 0 columns of the dynamic-rung
