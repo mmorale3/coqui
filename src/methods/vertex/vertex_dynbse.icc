@@ -311,7 +311,11 @@ namespace solvers {
 
     /** thc_rung_apply with the k-sum done by the mesh Fourier transform (see kmesh_ft): identical
      *  contraction, out(k', (p1 p3'), N) = scale sum_k sum_PQ X(k',P,p1) conj(X(k'+q,Q,p3')) W_PQ(k-k')
-     *  sum_{p1' p3} conj(X(k,P,p1')) F(k,(p1'p3),N) X(k+q,Q,p3). */
+     *  sum_{p1' p3} conj(X(k,P,p1')) F(k,(p1'p3),N) X(k+q,Q,p3).
+     *  Layout (2026-09-12): the k-sum buffers hold (k | R, (P n Q)) so that every intermediate of the
+     *  leg gemms is a plain reinterpretation -- A(P, (n p3)) = A2((P n), p3), Y2((P n), Q) = one
+     *  contiguous row, Z row (P, (n Q)) feeds the leg-out gemm directly, B(p1, (n Q)) = B2((p1 n), Q) --
+     *  no transposes of the (Nm x Nm x nb) blocks (they dominated the wall: memory traffic, not flops). */
     template<class WqFn>
     inline void thc_rung_apply_ft(nda::array<cplx, 4> const &Xb, long is, long iq,
                                   nda::array<long, 2> const &kpq, kmesh_ft const &kft,
@@ -323,13 +327,14 @@ namespace solvers {
       utils::check(nc * nc == nc2 and kft.ok and kft.nk == nk, "thc_rung_apply_ft: mesh transform not usable.");
       nb = std::max(1l, std::min(nb, nR));
       out() = cplx(0.0);
-      const long M = Nm * Nm * nb;
-      nda::array<cplx, 2> Xc(Nm, nc), Xkq(Nm, nc), XkT(nc, Nm), Xcq(Nm, nc);
-      nda::array<cplx, 2> Fk(nc, nc * nb), A(Nm, nc * nb), A2(Nm * nb, nc), Y2(Nm * nb, Nm);
-      nda::array<cplx, 2> Yk(nk, M), Yh(nk, M);                       // (k | R, (P Q n))
+      const long M = Nm * nb * Nm;                                   // (P n Q)
+      nda::array<cplx, 2> Xc(Nm, nc), XkqT(nc, Nm), XkT(nc, Nm), Xcq(Nm, nc);
+      nda::array<cplx, 2> Fk(nc, nb * nc);                            // (p1', (n p3))
+      nda::array<cplx, 2> A(Nm, nb * nc);                             // (P, (n p3)) == A2((P n), p3)
+      nda::array<cplx, 2> Yk(nk, M), Yh(nk, M);                       // (k | R, (P n Q))
       nda::array<cplx, 2> Wall(nq, Nm * Nm), Ah(nk, Nm * Nm);          // the rung at all q, and its transform
-      nda::array<cplx, 2> Zk(Nm, Nm * nb), B(nc, Nm * nb), B2(nc * nb, Nm), O2(nc * nb, nc);
-      // row index of k in the k-sum buffers: the mesh's lexicographic order on the FFT route
+      nda::array<cplx, 2> B(nc, nb * Nm);                             // (p1, (n Q)) == B2((p1 n), Q)
+      nda::array<cplx, 2> O2(nc * nb, nc);                            // ((p1 n), p3')
       auto row = [&](long k) { return kft.fft ? kft.lex_k(k) : k; };
       // the rung's transform A(R, (P Q)) once per call (the same for every N block)
       for (long q = 0; q < nq; ++q) {
@@ -351,46 +356,44 @@ namespace solvers {
       } else
 #endif
       nda::blas::gemm(kft.Uq, Wall, Ah);
+      const cplx inv_nk = kft.fft ? cplx(1.0 / double(nk)) : cplx(1.0);
+      auto A2 = nda::reshape(A, std::array<long, 2>{Nm * nb, nc});     // ((P n), p3): the same memory as A
+      auto B2 = nda::reshape(B, std::array<long, 2>{nc * nb, Nm});     // ((p1 n), Q): the same memory as B
       for (long n0 = 0; n0 < nR; n0 += nb) {
         const long nbl = std::min(nb, nR - n0);
-        // ---- legs in: Yk(k, (P Q n)) -------------------------------------------------------------
+        // ---- legs in: Yk(k, (P n Q)) -------------------------------------------------------------
         for (long k = 0; k < nk; ++k) {
           const long kq = kpq(iq, k);
           for (long P = 0; P < Nm; ++P)
             for (long a = 0; a < nc; ++a) {
               Xc(P, a) = std::conj(Xb(is, k, P, a));
-              Xkq(P, a) = Xb(is, kq, P, a);
+              XkqT(a, P) = Xb(is, kq, P, a);
             }
           for (long p1p = 0; p1p < nc; ++p1p)
-            for (long p3 = 0; p3 < nc; ++p3)
-              for (long n = 0; n < nb; ++n) Fk(p1p, p3 * nb + n) = (n < nbl) ? F(k, p1p * nc + p3, n0 + n) : cplx(0.0);
-          nda::blas::gemm(Xc, Fk, A);                                    // (P, (p3 N))
-          for (long P = 0; P < Nm; ++P)
             for (long n = 0; n < nb; ++n)
-              for (long p3 = 0; p3 < nc; ++p3) A2(P * nb + n, p3) = A(P, p3 * nb + n);
-          nda::blas::gemm(A2, nda::transpose(Xkq), Y2);                  // ((P N), Q)
-          const long rk = row(k);
-          for (long P = 0; P < Nm; ++P)
-            for (long Q = 0; Q < Nm; ++Q)
-              for (long n = 0; n < nb; ++n) Yk(rk, (P * Nm + Q) * nb + n) = Y2(P * nb + n, Q);
+              for (long p3 = 0; p3 < nc; ++p3) Fk(p1p, n * nc + p3) = (n < nbl) ? F(k, p1p * nc + p3, n0 + n) : cplx(0.0);
+          nda::blas::gemm(Xc, Fk, A);                                    // (P, (n p3))
+          auto Yrow = nda::reshape(Yk(row(k), all), std::array<long, 2>{Nm * nb, Nm});   // ((P n), Q)
+          nda::blas::gemm(A2, XkqT, Yrow);                               // ((P n), Q) = sum_p3 A2 X(k+q, Q, p3)
         }
-        // ---- the k-sum: Yh = U Yk; Yh(R, PQ n) *= A(R, PQ); Yk = Uinv Yh ------------------------
+        // ---- the k-sum: Yh = U Yk; Yh(R, P n Q) *= A(R, P Q); Yk = Uinv Yh ---------------------
 #if defined(ENABLE_FFTW)
         if (kft.fft) math::fft::impl::host::fwdfft(plan_y, Yk.data(), Yh.data());
         else
 #endif
         nda::blas::gemm(kft.U, Yk, Yh);
-        const cplx inv_nk = kft.fft ? cplx(1.0 / double(nk)) : cplx(1.0);
         for (long R = 0; R < nk; ++R)
-          for (long PQ = 0; PQ < Nm * Nm; ++PQ) {
-            const cplx a = Ah(R, PQ) * inv_nk;
-            for (long n = 0; n < nb; ++n) Yh(R, PQ * nb + n) *= a;
-          }
+          for (long P = 0; P < Nm; ++P)
+            for (long n = 0; n < nb; ++n) {
+              cplx *y = &Yh(R, (P * nb + n) * Nm);
+              const cplx *a = &Ah(R, P * Nm);
+              for (long Q = 0; Q < Nm; ++Q) y[Q] *= a[Q] * inv_nk;
+            }
 #if defined(ENABLE_FFTW)
         if (kft.fft) math::fft::impl::host::invfft(plan_y, Yh.data(), Yk.data());   // unnormalized backward
         else
 #endif
-        nda::blas::gemm(kft.Uinv, Yh, Yk);                               // Yk now holds Z(k', (P Q n))
+        nda::blas::gemm(kft.Uinv, Yh, Yk);                               // Yk now holds Z(k', (P n Q))
         // ---- legs out ------------------------------------------------------------------------------
         for (long kp = 0; kp < nk; ++kp) {
           const long kq = kpq(iq, kp);
@@ -399,15 +402,9 @@ namespace solvers {
               XkT(a, P) = Xb(is, kp, P, a);
               Xcq(P, a) = std::conj(Xb(is, kq, P, a));
             }
-          const long rkp = row(kp);
-          for (long P = 0; P < Nm; ++P)
-            for (long Q = 0; Q < Nm; ++Q)
-              for (long n = 0; n < nb; ++n) Zk(P, Q * nb + n) = Yk(rkp, (P * Nm + Q) * nb + n);
-          nda::blas::gemm(XkT, Zk, B);                                   // (p1, (Q N))
-          for (long p1 = 0; p1 < nc; ++p1)
-            for (long n = 0; n < nb; ++n)
-              for (long Q = 0; Q < Nm; ++Q) B2(p1 * nb + n, Q) = B(p1, Q * nb + n);
-          nda::blas::gemm(B2, Xcq, O2);                                  // ((p1 N), p3')
+          auto Zrow = nda::reshape(Yk(row(kp), all), std::array<long, 2>{Nm, nb * Nm});  // (P, (n Q))
+          nda::blas::gemm(XkT, Zrow, B);                                 // (p1, (n Q))
+          nda::blas::gemm(B2, Xcq, O2);                                  // ((p1 n), p3')
           for (long p1 = 0; p1 < nc; ++p1)
             for (long p3p = 0; p3p < nc; ++p3p)
               for (long n = 0; n < nbl; ++n) out(kp, p1 * nc + p3p, n0 + n) = scale * O2(p1 * nb + n, p3p);
