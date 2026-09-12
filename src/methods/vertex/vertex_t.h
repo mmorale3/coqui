@@ -860,6 +860,13 @@ namespace solvers {
     //   the Dyson-W change it drives, plus the pre/post-fold head meter (H1b). PURE
     //   OBSERVERS -- they add print-only arithmetic, never touch a physics array.
     bool _ladder_qnu_meter = false;
+    // eps(q_i, i nu) cuts (2026-09-11): the number of transfers q_i (q_min plus evenly spaced
+    // |q| ranks) at which the readout reports eps_M(q_i, i nu_j) on EVERY PH-sym bosonic half
+    // node for every column it evaluates (RPA, ladder, Lambda legs, the loop's own head).
+    // 0 = off (default, bitwise). Report-only.
+    long _eps_cut_nq = 0;
+    long _eps_cut_dyn_nnu = 0;   // rung = dynamic: evaluate the dynamic columns of the cut on the lowest n half
+                                 // nodes only (0 = all); the cost driver of the cut (one dynamic solve per node x q)
     // scGW-tilde TIER 1.5 (notes/tier15_ward_legs_plan.md): the LEG VERTEX of the ladder's
     // pair propagators, "bare" (historic, bitwise) | "ward" (the discrete-Ward Lambda0).
     std::string _ladder_legs = "bare";
@@ -867,7 +874,8 @@ namespace solvers {
     // (historic, bitwise) | "dynamic" (the resummed full-frequency W rung), + its solve knobs.
     std::string _ladder_rung = "static";
     double _dyn_tol = 1e-8, _dyn_sign = -1.0;
-    long _dyn_maxit = 30, _dyn_gmres = 4;
+    long _dyn_maxit = 30, _dyn_gmres = 12;
+    long _dyn_rhs_block = 32;    // pol_vertex_dyn_rhs_block: RHS column block width of the dynamic solves
     // DIAGNOSTIC (default OFF, not physical): THE CONSTANT-RUNG ABSOLUTE PIN.
     //
     // X^L = pi^dyn - Pi^{C,0}(tau=0) must VANISH when the screening is genuinely static.
@@ -1479,6 +1487,15 @@ namespace solvers {
     bool ladder_tda() const { return _ladder_tda; }
     double ladder_head_scale() const { return _ladder_head_scale; }
     bool ladder_qnu_meter() const { return _ladder_qnu_meter; }
+    /** eps(q_i, i nu) cut instrumentation (2026-09-11, report-only): see _eps_cut_nq. */
+    void set_eps_cut(long nq, long dyn_nnu = 0) {
+      utils::check(nq >= 0 and dyn_nnu >= 0, "vertex_t::set_eps_cut: pol_eps_cut / pol_eps_cut_dyn_nnu must be >= 0 (got {}, {}).",
+                   nq, dyn_nnu);
+      _eps_cut_nq = nq;
+      _eps_cut_dyn_nnu = dyn_nnu;
+    }
+    long eps_cut_nq() const { return _eps_cut_nq; }
+    long eps_cut_dyn_nnu() const { return _eps_cut_dyn_nnu; }
 
     /**
      * scGW-tilde TIER 1.5 (notes/tier15_ward_legs_plan.md; proposal section 4.6): the LEG
@@ -1551,6 +1568,14 @@ namespace solvers {
     double ladder_dyn_tol() const { return _dyn_tol; }
     long ladder_dyn_maxit() const { return _dyn_maxit; }
     long ladder_dyn_gmres() const { return _dyn_gmres; }
+    /** pol_vertex_dyn_rhs_block (default 32): the dynamic-rung solves run the Nm right-hand-side
+     *  columns in blocks of this width (0 = all at once); the Krylov basis (gmres_m + 1 vectors of
+     *  the block width) is the memory driver of the solve. Results agree to the solve tolerance. */
+    void set_ladder_dyn_rhs_block(long nb) {
+      utils::check(nb >= 0, "vertex_t::set_ladder_dyn_rhs_block: pol_vertex_dyn_rhs_block must be >= 0 (got {}).", nb);
+      _dyn_rhs_block = nb;
+    }
+    long ladder_dyn_rhs_block() const { return _dyn_rhs_block; }
     double ladder_dyn_sign() const { return _dyn_sign; }
 
     /**
@@ -1704,8 +1729,12 @@ namespace solvers {
      */
     struct dynbse_diag {
       double a0_resid = -1.0, a_resid = -1.0, a_l2_diff = -1.0, b_resid = -1.0, b_continuity = -1.0;
+      double lam_xhkt_re = 0.0, lam_xhkt_im = 0.0;   // the signed dominant eigenvalue of Xh Kt (the sign pin)
       double fit_err_G = -1.0, rr_G = -1.0, dsq_err = -1.0, wtau_sym = -1.0, refit_err_1 = -1.0, refit_err = -1.0;
       double gmres_vs_neumann = -1.0, gam1_consistency = -1.0, ritz_max = -1.0, contraction_max = -1.0;
+      double block_resid = -1.0;      // (C'') RHS-blocked vs unblocked solve
+      double nu1_resid = -1.0, nu1_gfit = -1.0;   // (C') union no-mask at the first positive node: |resummed - static|/|static|, G fit
+      bool nu1_done = false;
       long it_max = 0, it_max_neumann = 0;
       bool all_converged = false;
       double herm = -1.0, static_max = 0.0, onerung_max = 0.0, dyn_max = 0.0, gam1_max = 0.0;
@@ -1731,6 +1760,20 @@ namespace solvers {
       double t_total = 0.0, t_solve = 0.0, rss_gb = 0.0;
     };
     dynbse_nu0_result eval_pol_dynbse_nu0(MBState &mb_state, THC_ERI auto &thc);
+    /** eps(q_i, i nu) cuts (2026-09-11): the four dynamic-rung columns {static, static + one dynamic
+     *  rung, Gamma_1, resummed} on a list of PH-sym bosonic HALF nodes at a subset of transfers,
+     *  (4, n_nodes, nq, Nm, Nm) replicated (zeros at transfers outside the subset). The inu != 0
+     *  framework: union {U, T} basis, in-gap mask, tau metric, GMRES(>= 12), readout stop. */
+    struct dynbse_cut_result {
+      std::vector<long> half_nodes, qsel;
+      nda::array<ComplexType, 5> Pi;
+      double ritz_max = -1.0, refit_err = -1.0, fit_err_G = -1.0;
+      long it_max = 0, it_sum = 0, nunits = 0;
+      bool all_converged = false;
+      double t_total = 0.0, t_solve = 0.0, rss_gb = 0.0;
+    };
+    dynbse_cut_result eval_pol_dynbse_cut(MBState &mb_state, THC_ERI auto &thc, std::vector<long> const &half_nodes,
+                                          std::vector<long> const &qsel);
 
     /**
      * scGW-tilde increment L1 (vertex_ladder.icc): the C-window pair bubble

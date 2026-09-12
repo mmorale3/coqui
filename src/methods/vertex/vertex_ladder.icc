@@ -38,7 +38,10 @@
  * phase 1 factorizes into b41(nu) x b23(nu)). The geometric series therefore closes
  * frequency-diagonally in the D-dimensional pair space, per (s, q, nu):
  *
- *   Pi_ladder = -spin * conj(D)^T (1 - Xh Kt)^{-1} Xh Kt Xh D     (all rungs >= 1),
+ *   Pi_ladder = -spin * conj(D)^T (1 + Xh Kt)^{-1} Xh Kt Xh D     (all rungs >= 1),
+ *   [resolvent sign derived 2026-09-11, notes/dynbse/l2_resolvent_sign_derivation.md: the
+ *    kernel of the -W ladder is K' = -Kbig/nk, so the geometric series in Xh Kt alternates;
+ *    before that date the code resummed (1 - Xh Kt)^{-1}, exact at first order only]
  *   Xh = blockdiag_k( chi0(k) ) / nk,   Kt[(k'),(k)] = K(k,k')^T,
  *   D  = stack_k( d(k) ),
  *
@@ -54,7 +57,7 @@
  * sandwich contracted onto the impurity's MLWF product basis instead of the THC
  * density points:
  *
- *   P^lad_loc(q, nu)_{(mn),(m'n')} = -spin [ E(q)^dag (1 - Xh Kt)^{-1} Xh Kt Xh E(q) ],
+ *   P^lad_loc(q, nu)_{(mn),(m'n')} = -spin [ E(q)^dag (1 + Xh Kt)^{-1} Xh Kt Xh E(q) ],
  *   E(k; q)_{(a nc + b), (m norb + n)} = U_{m a}(k) . conj(U_{n b}(k + q)),
  *
  * with U(k) the ONE fermionic projector (projector_t::C_skIai restricted to the ladder
@@ -978,9 +981,8 @@ namespace solvers {
       //       reduces are exact either way: the (ik, ikp) writes are DISJOINT, so every
       //       summand but one is a hard zero and no rounding can depend on the order.
       //   A.3 `XK` is never formed: the row blocks are accumulated into Rm with
-      //       alpha = -1/nk, the power iteration runs on -Rm (|(-Rm)v| = |Rm v|, and IEEE
-      //       negation is exact at every step, so the estimate is unchanged) and the +I
-      //       lands on the diagonal afterwards.
+      //       alpha = +1/nk (the derived resolvent 1 + Xh Kt, 2026-09-11), the power
+      //       iteration runs on Rm = XK, and the +I lands on the diagonal afterwards.
       //   A.4 `Cb` keeps only the nu slices this rank actually solves. It is now built
       //       nu-locally over ALL ik instead of ik-split + all-reduced: the per-ik values
       //       are the same expression on the same operands (bit-identical), the reduce
@@ -1343,14 +1345,21 @@ namespace solvers {
             }
             pph.end();
             if (not any_solve) continue;
-            // Pi_ladder = -spin conj(D)^T (1 - Xh Kt)^{-1} Xh Kt Xh D
-            // A.3: the row blocks of Xh.Kt go STRAIGHT into Rm with alpha = -1/nk, so the
-            // (D, D) XK array never exists. Rm holds -XK until the +I below.
+            // Pi_ladder = -spin conj(D)^T (1 + Xh Kt)^{-1} Xh Kt Xh D
+            // A.3: the row blocks of Xh.Kt go STRAIGHT into Rm with alpha = +1/nk, so the
+            // (D, D) XK array never exists. Rm holds +XK until the +I below.
+            // SIGN (2026-09-11, notes/dynbse/l2_resolvent_sign_derivation.md): the BSE
+            // recursion P^(2) = P^(1) (P^(0))^-1 P^(1) with the pinned P^(0) = +(spin/nk) D^dag Cb D
+            // and P^(1) = -(spin/nk^2) D^dag Cb Kbig Cb D fixes the resolvent to (1 + Xh Kt)^-1:
+            // the kernel is K' = -Kbig/nk and the series in Xh Kt alternates. The former
+            // alpha = -1/nk resummed (1 - Xh Kt)^-1, exact only at first order (its even
+            // orders had the wrong sign). Pinned by the signed dominant eigenvalue of Xh Kt
+            // (negative: lih222 -0.1272, D2 gate (A0')).
             pph.begin(ladder_prof::P_XK);
             for (long ikp = 0; ikp < nk; ++ikp) {
               auto Krows = Kbig(nda::range(ikp * nc2, (ikp + 1) * nc2), all);
               auto Rrows = Rm(nda::range(ikp * nc2, (ikp + 1) * nc2), all);
-              nda::blas::gemm(ComplexType(-1.0 / nk), Cb(ikp, jl, all, all), Krows,
+              nda::blas::gemm(ComplexType(1.0 / nk), Cb(ikp, jl, all, all), Krows,
                               ComplexType(0.0), Rrows);
             }
             pph.end();
@@ -1358,10 +1367,10 @@ namespace solvers {
             if (lam_max != nullptr) {
               // I3: rho(Xh Kt) by power iteration. Fixed seed => reproducible; 20 sweeps
               // or a 1e-3 relative change. |XK v| with |v| = 1 converges to the dominant
-              // |eigenvalue| -- the margin eq 6's resolvent (1 - Xh Kt)^-1 has left.
-              // A.3: iterated on -XK (= Rm here). Every step flips a sign that IEEE
-              // negation carries exactly: |(-XK)v| = |XK v| and (-x)/lam = -(x/lam), so
-              // the lam sequence, the break tests and the reported estimate are unchanged.
+              // |eigenvalue| -- the margin the resolvent (1 + Xh Kt)^-1 has left (the
+              // dominant eigenvalue is NEGATIVE for an attractive rung; the instability is
+              // at -1, and |lambda| is the distance to it).
+              // A.3: iterated on Rm (= +XK here, before the +I).
               const double seed = 1.0 / std::sqrt(double(Dsz));
               for (long i = 0; i < Dsz; ++i) pv(i) = ComplexType(seed, 0.0);
               double lam = 0.0, lam_prev = -1.0;
@@ -1387,7 +1396,7 @@ namespace solvers {
               const int info = nda::lapack::getrf(Rm, ipiv);
               utils::check(info == 0,
                            "pair_space_ladder: the resolvent LU failed (getrf info = {}) "
-                           "at nu index {} of transfer {} -- (1 - Xh Kt) is singular to "
+                           "at nu index {} of transfer {} -- (1 + Xh Kt) is singular to "
                            "working precision (particle-hole instability; lambda_max was "
                            "{:.6f}).", info, jn, iq,
                            (lam_max != nullptr) ? (*lam_max)(jn) : -1.0);
@@ -1916,7 +1925,8 @@ namespace solvers {
                           Kblk(p1 * nc + p3p, p1p * nc + p3) =
                               keep(p1, p1p, p3, p3p) ? wb(p1 * nc + p1p, p3 * nc + p3p)
                                                      : ComplexType(0.0);
-                  nda::blas::gemm(ComplexType(-1.0 / nk), Cb(ikp, all, all), Kblk,
+                  // SIGN: alpha = +1/nk (the derived resolvent 1 + Xh Kt; see the dense kernel)
+                  nda::blas::gemm(ComplexType(1.0 / nk), Cb(ikp, all, all), Kblk,
                                   ComplexType(0.0), blk);
                   const long r0 = std::max(org_r, ikp * nc2);
                   const long r1 = std::min(org_r + lm, (ikp + 1) * nc2);
@@ -1982,8 +1992,8 @@ namespace solvers {
           }
           pph.end();
           pph.begin(ladder_prof::P_XK);
-          // Rm still holds -XK here, so XKX = -(Rm) . Xh[D|E] in ONE distributed gemm
-          math::nda::slate_ops::multiply(ComplexType(-1.0), Rm, Xl, ComplexType(0.0), Bm);
+          // Rm still holds +XK here, so XKX = Rm . Xh[D|E] in ONE distributed gemm
+          math::nda::slate_ops::multiply(ComplexType(1.0), Rm, Xl, ComplexType(0.0), Bm);
           pph.end();
 
           // ---- the resolvent: +I on the owned diagonal, then ONE lu_solve ------------
@@ -1998,7 +2008,7 @@ namespace solvers {
             const long info = math::nda::slate_ops::lu_solve(Rm, Bm);
             utils::check(info == 0,
                          "pair_space_ladder: the resolvent LU failed (getrf info = {}) "
-                         "at nu index {} of transfer {} -- (1 - Xh Kt) is singular to "
+                         "at nu index {} of transfer {} -- (1 + Xh Kt) is singular to "
                          "working precision (particle-hole instability; lambda_max was "
                          "{:.6f}).", info, jn, iq,
                          (lam_max != nullptr) ? (*lam_max)(jn) : -1.0);

@@ -296,6 +296,18 @@ namespace solvers {
     // Np^2-per-q replicated: readout-scale only (documented memory note).
     template<nda::MemoryArrayOfRank<4> Array_t, typename communicator_t>
     nda::array<ComplexType, 3> gather_nu0_row(memory::darray_t<Array_t, communicator_t> &dPi_tqPQ);
+    // eps(q_i, i nu) cuts (2026-09-11, pol_eps_cut > 0): the selected IBZ transfers (q_min plus
+    // evenly spaced |q| ranks, chosen once) and -- on RANK 0 ONLY -- the RPA Pi rows
+    // (n_sel, nw_half, Np, Np) on every PH-sym bosonic half node, gathered at the same point
+    // as _pol_pi0_qPQ (the PURE-RPA point) and consumed by the readout's cut report.
+    std::vector<long> _pol_cut_q;
+    std::optional<nda::array<ComplexType, 4>> _pol_pi_cut;
+    long _pol_cut_calls = 0;
+    // the last cut at q_min (= selection 0), rank 0: (nw_half, 8) = {eps_rpa, eps_lad, eps_dlm, eps_loop,
+    // then the dynamic-rung columns static / static+dyn1 / Gamma_1 / resummed (-1 unless rung = dynamic)}
+    nda::array<double, 2> _pol_eps_cut_qmin;
+    template<nda::MemoryArrayOfRank<4> Array_t, typename communicator_t>
+    void gather_cut_rows(THC_ERI auto &thc, memory::darray_t<Array_t, communicator_t> &dPi_tqPQ);
     // Q4 (R-Q4-3): the PURE-RPA inu = 0 row stashed by eval_Pi_qdep at the point where the
     // ladder kernel is built. update_w's readout consumes it instead of gathering after
     // the corrections -- in edmft mode the post-correction Pi is NOT the readout baseline
@@ -390,6 +402,11 @@ namespace solvers {
     double pol_dyn_ritz() const { return _pol_dyn_ritz; }
     // Q3: the loop-side eps_M(q_min, inu = 0) of the same iteration (gate Q3-b(i))
     double pol_eps_loop() const { return _pol_eps_loop; }
+    /** eps(q_i, i nu) cuts: the last cut at q_min on rank 0, (nw_half, 8) columns
+     *  {RPA, +ladder, +DeltaLambda (-1 unless legs = ward), loop-side (-1 if absent), then the
+     *  dynamic-rung columns static / static+dyn1 / Gamma_1 / resummed (-1 unless rung = dynamic)};
+     *  empty on other ranks and before the first cut. */
+    nda::array<double, 2> const &pol_eps_cut_qmin() const { return _pol_eps_cut_qmin; }
     // Q3: the last injection's watchdog / meter values (gate Q3-c); -1 if never injected
     double pol_lambda_nu0() const { return _pol_lam_nu0; }
     double pol_lambda_max() const { return _pol_lam_max; }

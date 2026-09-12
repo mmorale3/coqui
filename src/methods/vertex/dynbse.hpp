@@ -1639,10 +1639,26 @@ namespace dynbse {
     (void)all;
   }
 
+  // the readout block D^dag Gsum (the physical observable of the iteration)
+  inline nda::array<cplx, 2> collapse(nda::array<cplx, 4> const &Dleft, nda::array<cplx, 4> const &Gsum) {
+    const long nk = Gsum.shape(0), nc = Gsum.shape(1), nR = Gsum.shape(3), nL = Dleft.shape(3);
+    nda::array<cplx, 2> P(nL, nR);
+    P() = cplx(0.0);
+    for (long rl = 0; rl < nL; ++rl)
+      for (long r = 0; r < nR; ++r)
+        for (long ik = 0; ik < nk; ++ik)
+          for (long a = 0; a < nc; ++a)
+            for (long bb = 0; bb < nc; ++bb)
+              P(rl, r) += std::conj(Dleft(ik, a, bb, rl)) * Gsum(ik, a, bb, r);
+    return P;
+  }
+
   struct dyson_result {
     long iterations = 0;
     bool converged = false;
     bool stagnated = false;        // the residual stopped decreasing (the tau-refit floor): stopped early
+    bool readout_converged = false; // GMRES: the physical readout (D^dag Gsum) moved by less than readout_tol
+    std::vector<double> readout_history;   // per cycle: |Delta P| / |P| of the readout block
     double contraction = -1.0;     // last |dy_n|/|dy_{n-1}| (before the tolerance was met)
     double residual = -1.0;        // last |dy|/|y|
     std::vector<double> history;   // |dy|/|y| per iteration
@@ -1791,7 +1807,7 @@ namespace dynbse {
                                         static_resolvent const &S, cplx inu, bool shared,
                                         nda::array<cplx, 4> const &Dc, double tol, long maxit, long m,
                                         nda::array<cplx, 3> const *Cb_cst = nullptr, shift_tables const *st = nullptr,
-                                        tf_metric const *metric = nullptr) {
+                                        tf_metric const *metric = nullptr, double readout_tol = 0.0) {
     const long nk = P.nk, nc = P.nc, nR = Dc.shape(3), np = b.np;
     utils::check(m >= 1, "dynbse::solve_dyson_gmres: m >= 1.");
     dyson_result out;
@@ -1826,6 +1842,14 @@ namespace dynbse {
     long it = 0;
     bool done = false;
     double ritz_max = 0.0;
+    // the readout of the current iterate (the physical observable D^dag sum_iw L0 Gamma): a
+    // convergence criterion blind to the readout-invisible modes of the iteration
+    nda::array<cplx, 2> Pprev(nR, nR);
+    bool have_prev = false;
+    auto readout_of = [&]() {
+      ls_apply(b, P, S, inu, shared, Dc, y, Gamma, Gsum, Cb_cst, st);
+      return collapse(Dc, Gsum);
+    };
     while (not done and it < maxit) {
       // r = rhs - A y
       apply_A(y, w);
@@ -1901,7 +1925,7 @@ namespace dynbse {
         }
         if (rel_j <= tol or it >= maxit) break;
       }
-      // update y with the least-squares solution of this cycle, and the Ritz estimate of K_d L_s
+      // (the update of y and the Ritz estimate follow; the readout check comes after the update)
       for (long c = 0; c < nR; ++c) {
         const long n = jdone;
         nda::matrix<cplx> N(n, n);
@@ -1947,6 +1971,22 @@ namespace dynbse {
         }
       }
       out.contraction = ritz_max;
+      if (readout_tol > 0.0) {
+        auto Pnow = readout_of();
+        if (have_prev) {
+          double dm = 0.0, sm = 0.0;
+          for (long i = 0; i < nR; ++i)
+            for (long j = 0; j < nR; ++j) {
+              dm = std::max(dm, std::abs(Pnow(i, j) - Pprev(i, j)));
+              sm = std::max(sm, std::abs(Pnow(i, j)));
+            }
+          const double rel = (sm > 0.0) ? dm / sm : dm;
+          out.readout_history.push_back(rel);
+          if (rel <= readout_tol) { out.readout_converged = true; done = true; }
+        }
+        Pprev = Pnow;
+        have_prev = true;
+      }
     }
     out.iterations = it;
     out.converged = done;
@@ -1956,18 +1996,6 @@ namespace dynbse {
   }
 
   /** the readout block: P(r', r) = sum_k sum_{ab} conj(Dleft(k, a, b, r')) Gsum(k, a, b, r) */
-  inline nda::array<cplx, 2> collapse(nda::array<cplx, 4> const &Dleft, nda::array<cplx, 4> const &Gsum) {
-    const long nk = Gsum.shape(0), nc = Gsum.shape(1), nR = Gsum.shape(3), nL = Dleft.shape(3);
-    nda::array<cplx, 2> P(nL, nR);
-    P() = cplx(0.0);
-    for (long rl = 0; rl < nL; ++rl)
-      for (long r = 0; r < nR; ++r)
-        for (long ik = 0; ik < nk; ++ik)
-          for (long a = 0; a < nc; ++a)
-            for (long bb = 0; bb < nc; ++bb)
-              P(rl, r) += std::conj(Dleft(ik, a, bb, rl)) * Gsum(ik, a, bb, r);
-    return P;
-  }
 
 } // namespace dynbse
 } // namespace solvers

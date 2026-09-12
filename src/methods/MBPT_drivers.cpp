@@ -297,7 +297,9 @@ inline void ensure_checkpoint(std::shared_ptr<mf::MF> mf, std::string const& out
  *                 columns +static(sign-corrected) / +static+Pi^C_dyn / +Gamma_1 / +resummed at
  *                 inu = 0 (D3: readout only, nosym meshes, ladder_solve_grid = 1). Knobs:
  *                 pol_vertex_dyn_tol (1e-8), pol_vertex_dyn_maxit (30), pol_vertex_dyn_gmres
- *                 (4; 0 = Neumann), pol_vertex_dyn_sign (-1 = the derived rung sign, +1 = the
+ *                 (12 since 2026-09-11 -- the inu != 0 stall was the m = 4 restart; 0 = Neumann),
+ *                 pol_vertex_dyn_rhs_block (32: the RHS columns of the dynamic solves in blocks of
+ *                 this width -- the Krylov basis is the memory driver; 0 = all at once), pol_vertex_dyn_sign (-1 = the derived rung sign, +1 = the
  *                 as-implemented L2 convention). XOR pol_vertex_legs = "ward".
  *  - ladder_solve_grid: 1  Ranks per SOLVE GRID for the ladder's dense resolvent
  *                 (notes/ladder_b_integration_design.md, increment B). 1 (default) is the
@@ -326,6 +328,17 @@ inline void ensure_checkpoint(std::shared_ptr<mf::MF> mf, std::string const& out
  *                 decomposition of the injected P^lad, the per-q Dyson-W change it drives
  *                 (||dW_lad(q)||, Delta eps_M(q)), and the pre/post-secondary-fold head
  *                 meter at Gamma (hypothesis H1b).
+ *  - pol_eps_cut: 0  DIAGNOSTIC (2026-09-11), report-only. When > 0, the ladder readout also
+ *                 reports eps_M(q_i, i nu_j) at pol_eps_cut transfers (q_min plus evenly
+ *                 spaced |q| ranks) on EVERY PH-sym bosonic half node, for every column it
+ *                 evaluates (RPA, +ladder, +DeltaLambda when legs = ward) and for the loop's
+ *                 own eps^-1 head (the in-loop framework: RPA scGW, or L3 with the injection
+ *                 on). Lines are tagged "[eps-cut]" for harvesting. Memory: rank 0 holds
+ *                 pol_eps_cut x nw_half x Np^2 complex RPA rows between the kernel build and
+ *                 the readout; the ladder is evaluated on all half nodes (one whalf pass).
+ *  - pol_eps_cut_dyn_nnu: 0  with pol_vertex_rung = "dynamic": the dynamic columns of the cut are
+ *                 evaluated on the lowest n half nodes only (0 = all 21-ish nodes); one dynamic
+ *                 solve per (node, transfer) is the cut's cost driver.
  */
 template<typename eri_t>
 void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
@@ -564,6 +577,8 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
                           pol_vertex_isdf_distr_tol, pol_vertex_inject);
     vertex.set_ladder_solve(ladder_solve_grid, ladder_solve_budget_gb);
     vertex.set_ladder_da(ladder_tda, ladder_head_scale, ladder_qnu_meter);
+    vertex.set_eps_cut(io::get_value_with_default<long>(pt,"pol_eps_cut",0),      // eps(q_i, i nu) cuts
+                       io::get_value_with_default<long>(pt,"pol_eps_cut_dyn_nnu",0));
     {   // scGW-tilde Tier 1.5: the ladder's leg vertex (default-inert)
       auto pol_vertex_legs = io::get_value_with_default<std::string>(pt,"pol_vertex_legs","bare");
       io::tolower(pol_vertex_legs);
@@ -575,8 +590,9 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
         vertex.set_ladder_rung(pol_vertex_rung,
             io::get_value_with_default<double>(pt,"pol_vertex_dyn_tol",1e-8),
             io::get_value_with_default<long>(pt,"pol_vertex_dyn_maxit",30),
-            io::get_value_with_default<long>(pt,"pol_vertex_dyn_gmres",4),
+            io::get_value_with_default<long>(pt,"pol_vertex_dyn_gmres",12),
             io::get_value_with_default<double>(pt,"pol_vertex_dyn_sign",-1.0));
+        vertex.set_ladder_dyn_rhs_block(io::get_value_with_default<long>(pt,"pol_vertex_dyn_rhs_block",32));
       }
     }
     scr_eri.set_cvv_rspace_tol(cvv_rspace_tol);
@@ -924,8 +940,9 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
         pol_vertex_carrier.set_ladder_rung(pol_vertex_rung,
             io::get_value_with_default<double>(pt,"pol_vertex_dyn_tol",1e-8),
             io::get_value_with_default<long>(pt,"pol_vertex_dyn_maxit",30),
-            io::get_value_with_default<long>(pt,"pol_vertex_dyn_gmres",4),
+            io::get_value_with_default<long>(pt,"pol_vertex_dyn_gmres",12),
             io::get_value_with_default<double>(pt,"pol_vertex_dyn_sign",-1.0));
+        pol_vertex_carrier.set_ladder_dyn_rhs_block(io::get_value_with_default<long>(pt,"pol_vertex_dyn_rhs_block",32));
       }
     }
     if (pol_vertex_carrier.pol_vertex_enabled()) scr_eri.set_vertex(&pol_vertex_carrier);
@@ -1145,8 +1162,9 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
         pol_vertex_carrier.set_ladder_rung(pol_vertex_rung,
             io::get_value_with_default<double>(pt,"pol_vertex_dyn_tol",1e-8),
             io::get_value_with_default<long>(pt,"pol_vertex_dyn_maxit",30),
-            io::get_value_with_default<long>(pt,"pol_vertex_dyn_gmres",4),
+            io::get_value_with_default<long>(pt,"pol_vertex_dyn_gmres",12),
             io::get_value_with_default<double>(pt,"pol_vertex_dyn_sign",-1.0));
+        pol_vertex_carrier.set_ladder_dyn_rhs_block(io::get_value_with_default<long>(pt,"pol_vertex_dyn_rhs_block",32));
       }
     }
     if (pol_vertex_carrier.pol_vertex_enabled()) scr_eri.set_vertex(&pol_vertex_carrier);
@@ -1395,6 +1413,8 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
                           pol_vertex_isdf_distr_tol, pol_vertex_inject);
     vertex.set_ladder_solve(ladder_solve_grid, ladder_solve_budget_gb);
     vertex.set_ladder_da(ladder_tda, ladder_head_scale, ladder_qnu_meter);
+    vertex.set_eps_cut(io::get_value_with_default<long>(pt,"pol_eps_cut",0),      // eps(q_i, i nu) cuts
+                       io::get_value_with_default<long>(pt,"pol_eps_cut_dyn_nnu",0));
     {   // scGW-tilde Tier 1.5: the ladder's leg vertex (default-inert)
       auto pol_vertex_legs = io::get_value_with_default<std::string>(pt,"pol_vertex_legs","bare");
       io::tolower(pol_vertex_legs);
@@ -1406,8 +1426,9 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
         vertex.set_ladder_rung(pol_vertex_rung,
             io::get_value_with_default<double>(pt,"pol_vertex_dyn_tol",1e-8),
             io::get_value_with_default<long>(pt,"pol_vertex_dyn_maxit",30),
-            io::get_value_with_default<long>(pt,"pol_vertex_dyn_gmres",4),
+            io::get_value_with_default<long>(pt,"pol_vertex_dyn_gmres",12),
             io::get_value_with_default<double>(pt,"pol_vertex_dyn_sign",-1.0));
+        vertex.set_ladder_dyn_rhs_block(io::get_value_with_default<long>(pt,"pol_vertex_dyn_rhs_block",32));
       }
     }
     scr_eri.set_cvv_rspace_tol(cvv_rspace_tol);
@@ -1680,8 +1701,9 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
         pol_vertex_carrier.set_ladder_rung(pol_vertex_rung,
             io::get_value_with_default<double>(pt,"pol_vertex_dyn_tol",1e-8),
             io::get_value_with_default<long>(pt,"pol_vertex_dyn_maxit",30),
-            io::get_value_with_default<long>(pt,"pol_vertex_dyn_gmres",4),
+            io::get_value_with_default<long>(pt,"pol_vertex_dyn_gmres",12),
             io::get_value_with_default<double>(pt,"pol_vertex_dyn_sign",-1.0));
+        pol_vertex_carrier.set_ladder_dyn_rhs_block(io::get_value_with_default<long>(pt,"pol_vertex_dyn_rhs_block",32));
       }
     }
     if (pol_vertex_carrier.pol_vertex_enabled()) scr_eri.set_vertex(&pol_vertex_carrier);

@@ -99,6 +99,12 @@ namespace bdft_tests {
     REQUIRE(g.b_continuity < 1e-2);               // and continuous into the first positive node
     // the resummed solve at inu = 0: both solvers agree, converged, contractive
     REQUIRE(g.gmres_vs_neumann < 1e-6);
+    REQUIRE(g.block_resid >= 0.0);
+    REQUIRE(g.block_resid < 1e-6);                // (C'') RHS column blocking = the unblocked solve (tol class)
+    REQUIRE(g.nu1_gfit >= 0.0);
+    REQUIRE(g.nu1_gfit < 1e-4);                   // (C') the union grid without a mask represents G
+    REQUIRE(g.nu1_done);                          // and the first positive node converges (GMRES(12), readout stop)
+    REQUIRE(std::abs(g.nu1_resid - g.dyn_vs_static) < 0.05 * g.dyn_vs_static);   // nu-continuity of the resummed correction
     REQUIRE(g.gam1_consistency < 1e-12);
     REQUIRE(g.all_converged);
     REQUIRE(g.ritz_max < 1.0);
@@ -129,7 +135,9 @@ namespace bdft_tests {
       iter_scf::iter_scf_t iter_sol("damping");
       solvers::vertex_t vtx(&ft, "none", nda::range(0, 0), mf->nbnd());
       vtx.set_pol_vertex("ladder", "w0_prev", nda::range(0, 4), -1, 1e-8, -1.0, -1.0, -1.0);
-      vtx.set_ladder_rung(rung, 1e-8, 30, 4, -1.0);
+      vtx.set_ladder_rung(rung, 1e-8, 30, 12, -1.0);
+      vtx.set_eps_cut(1, 3);                    // the eps(q_i, i nu) cut report (report-only; q_min and the 3 lowest nodes
+                                                //  for the dynamic columns keep the test short)
       scr_eri.set_vertex(&vtx);
       auto [e_hf, e_corr] = scf_loop(mb_state, dyson, eri, ft,
                                      solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol,
@@ -137,13 +145,57 @@ namespace bdft_tests {
       auto [er, el] = scr_eri.pol_eps_readout();
       auto ed = scr_eri.pol_eps_dyn();
       const double ritz = scr_eri.pol_dyn_ritz();
+      nda::array<double, 2> cut(scr_eri.pol_eps_cut_qmin());
+      const double eloop = scr_eri.pol_eps_loop();
       mpi_context->comm.barrier();
       if (mpi_context->comm.root()) remove((output + ".mbpt.h5").c_str());
       mpi_context->comm.barrier();
-      return std::make_tuple(e_hf, e_corr, er, el, ed, ritz);
+      return std::make_tuple(e_hf, e_corr, er, el, ed, ritz, cut, eloop);
     };
-    auto [h0, c0, r0, l0, d0, z0] = run("static", 2);
-    auto [h1, c1, r1, l1, d1, z1] = run("dynamic", 2);
+    auto [h0, c0, r0, l0, d0, z0, cut0, eloop0] = run("static", 2);
+    auto [h1, c1, r1, l1, d1, z1, cut1, eloop1] = run("dynamic", 2);
+    // the eps(q_i, i nu) cut (rank 0): node 0 of the q_min cut IS the readout (same rows, same
+    // Dyson; the ladder node 0 of the whalf pass vs eval_pol_ladder_nu0 = the node-map class),
+    // the loop-side column at node 0 IS the Q3 loop-side value, every node is finite and the
+    // static screening decays along i nu (eps_M(i nu_max) < eps_M(0)).
+    if (mpi_context->comm.root()) {
+      REQUIRE(cut0.shape(0) > 1);
+      REQUIRE(cut0.shape(1) == 8);
+      app_log(1, "dynbse_readout: eps-cut q_min node 0: RPA {} (readout {}), +ladder {} (readout {}), loop {} (Q3 {}); "
+                 "last node: RPA {} +ladder {} loop {}", cut0(0, 0), r0, cut0(0, 1), l0, cut0(0, 3), eloop0,
+              cut0(cut0.shape(0) - 1, 0), cut0(cut0.shape(0) - 1, 1), cut0(cut0.shape(0) - 1, 3));
+      REQUIRE(std::abs(cut0(0, 0) - r0) < 1e-10);
+      REQUIRE(std::abs(cut0(0, 1) - l0) < 1e-8);
+      REQUIRE(std::abs(cut0(0, 3) - eloop0) < 1e-10);
+      for (long j = 0; j < cut0.shape(0); ++j) {
+        REQUIRE(std::isfinite(cut0(j, 0))); REQUIRE(cut0(j, 0) > 0.0);
+        REQUIRE(std::isfinite(cut0(j, 1))); REQUIRE(cut0(j, 1) > 0.0);
+        REQUIRE(std::isfinite(cut0(j, 3))); REQUIRE(cut0(j, 3) > 0.0);
+        REQUIRE(cut0(j, 2) == -1.0);            // legs = bare: no DeltaLambda column
+      }
+      REQUIRE(cut0(cut0.shape(0) - 1, 0) < cut0(0, 0));
+      REQUIRE(cut0(cut0.shape(0) - 1, 1) < cut0(0, 1));
+      // the cut is report-only: bitwise across the rung modes
+      REQUIRE(cut1.shape(0) == cut0.shape(0));
+      for (long j = 0; j < cut0.shape(0); ++j)
+        for (long c = 0; c < 4; ++c) REQUIRE(cut1(j, c) == cut0(j, c));
+      // the dynamic-rung cut (union basis, GMRES(12), all half nodes): node 0 agrees with the
+      // inu = 0 readout columns (shared grid) to the refit class, every node is finite, and the
+      // resummed column is nu-continuous at the first positive node
+      app_log(1, "dynbse_readout: dynamic cut q_min node 0: static {} (nu0 {}), +dyn1 {} (nu0 {}), Gamma1 {} (nu0 {}), "
+                 "resummed {} (nu0 {}); node 1 resummed {}; last node resummed {}",
+              cut1(0, 4), d1[0], cut1(0, 5), d1[1], cut1(0, 6), d1[2], cut1(0, 7), d1[3], cut1(1, 7),
+              cut1(cut1.shape(0) - 1, 7));
+      for (long j = 0; j < 3; ++j)
+        for (int c = 4; c < 8; ++c) { REQUIRE(std::isfinite(cut1(j, c))); REQUIRE(cut1(j, c) > 0.0); }
+      for (long j = 3; j < cut1.shape(0); ++j)
+        for (int c = 4; c < 8; ++c) REQUIRE(cut1(j, c) == -1.0);        // beyond the 3 requested nodes
+      for (int c = 0; c < 4; ++c) REQUIRE(std::abs(cut1(0, 4 + c) - d1[c]) < 1e-3 * std::abs(d1[c] - 1.0));
+      REQUIRE(std::abs(cut1(1, 7) - cut1(0, 7)) < 0.05 * std::abs(cut1(0, 7) - 1.0));
+      REQUIRE(cut1(2, 7) < cut1(0, 7));
+      for (long j = 0; j < cut0.shape(0); ++j)
+        for (int c = 4; c < 8; ++c) REQUIRE(cut0(j, c) == -1.0);
+    }
     app_log(1, "dynbse_readout: static rung: e_corr {} eps RPA {} +ladder {} ; dynamic rung: e_corr {} eps RPA {} "
                "+ladder(L2) {} ; +static(sign-corr.) {} +static+Pi^C_dyn {} +Gamma1 {} +resummed {} ; Ritz {}",
             c0, r0, l0, c1, r1, l1, d1[0], d1[1], d1[2], d1[3], z1);
@@ -156,8 +208,9 @@ namespace bdft_tests {
     for (double v : d1) { REQUIRE(std::isfinite(v)); REQUIRE(v > 0.0); }
     REQUIRE(z1 >= 0.0);
     REQUIRE(z1 < 1.0);
-    // the sign-corrected static column differs from the as-implemented L2 (the even-order sign)
-    REQUIRE(d1[0] != l1);
+    // 2026-09-11: pair_space_ladder resums the derived resolvent (1 + Xh Kt)^-1, so the dynbse
+    // driver's static column IS the L2 readout (gate A class, through the same upfold + Dyson)
+    REQUIRE(std::abs(d1[0] - l1) < 1e-8);
     // the dynamic rungs move eps_M away from the static ladder
     REQUIRE(d1[3] != d1[0]);
 #endif

@@ -461,6 +461,7 @@ namespace solvers {
     // Tier 2 full frequency (notes/dynbse_plan.md D3): the rung and its solve knobs too.
     _pol_vtx->set_ladder_rung(_vertex->ladder_rung(), _vertex->ladder_dyn_tol(), _vertex->ladder_dyn_maxit(),
                               _vertex->ladder_dyn_gmres(), _vertex->ladder_dyn_sign());
+    _pol_vtx->set_ladder_dyn_rhs_block(_vertex->ladder_dyn_rhs_block());
     app_log(1, "  [scGW-tilde L2] ladder readout instance: C window = [{}, {}), "
                "secondary rank knob = {}, div_treatment = {} (kernel head follows "
                "build_w0's policy; W0bar is SAME-iteration -- coincides with "
@@ -497,6 +498,88 @@ namespace solvers {
     }
     dPi_tqPQ.communicator()->all_reduce_in_place_n(out.data(), out.size(), std::plus<>{});
     return out;
+  }
+
+  /**
+   * eps(q_i, i nu) cuts (2026-09-11): select the transfers once (q_min plus evenly spaced
+   * ranks of |q| among the non-Gamma IBZ transfers) and gather the RPA Pi rows at those
+   * transfers on EVERY PH-sym bosonic half node j (the same folded transform rows
+   * tau_to_w_PHsym applies, iw = nw_b/2 + j), reduced to rank 0 only (the per-(q, nu)
+   * single-frequency Dysons of the cut report are rank-0 work; nothing is replicated).
+   */
+  template<nda::MemoryArrayOfRank<4> Array_t, typename communicator_t>
+  void scr_coulomb_t::gather_cut_rows(THC_ERI auto &thc,
+                                      memory::darray_t<Array_t, communicator_t> &dPi_tqPQ) {
+    auto [nt_h, nq, Np, Nq2] = dPi_tqPQ.global_shape();
+    auto MF = thc.MF();
+    const long nsel_req = _vertex->eps_cut_nq();
+    if (_pol_cut_q.empty()) {
+      std::vector<std::pair<double, long>> qs;
+      for (long iq = 0; iq < nq; ++iq) {
+        auto qp = MF->Qpts_ibz(iq);
+        const double q2 = qp(0) * qp(0) + qp(1) * qp(1) + qp(2) * qp(2);
+        if (q2 > 1e-12) qs.emplace_back(q2, iq);
+      }
+      std::sort(qs.begin(), qs.end());
+      const long navail = long(qs.size());
+      const long nsel = std::min(nsel_req, navail);
+      for (long i = 0; i < nsel; ++i) {
+        const long r = (nsel == 1) ? 0 : std::lround(double(i) * double(navail - 1) / double(nsel - 1));
+        _pol_cut_q.push_back(qs[size_t(r)].second);
+      }
+      std::string sel;
+      for (long i = 0; i < nsel; ++i) {
+        auto qp = MF->Qpts_ibz(_pol_cut_q[size_t(i)]);
+        char buf[96];
+        std::snprintf(buf, sizeof(buf), " iq %ld (|q| %.6f)", _pol_cut_q[size_t(i)],
+                      std::sqrt(qp(0) * qp(0) + qp(1) * qp(1) + qp(2) * qp(2)));
+        sel += buf;
+      }
+      app_log(1, "  [eps-cut] transfers selected ({} of {} non-Gamma IBZ q, by |q| rank):{}", nsel, navail, sel);
+    }
+    const long nsel = long(_pol_cut_q.size());
+    if (nsel == 0) { _pol_pi_cut.reset(); return; }
+    const long nt_b = _ft->nt_b(), nw_b = _ft->nw_b();
+    const long nt_half = (nt_b % 2 == 0) ? nt_b / 2 : nt_b / 2 + 1;
+    const long nw_half = (nw_b % 2 == 0) ? nw_b / 2 : nw_b / 2 + 1;
+    utils::check(nt_h == nt_half, "gather_cut_rows: PH-sym tau half grid mismatch ({} vs {}).", nt_h, nt_half);
+    auto Twt = _ft->Twt_bb();                                   // (nw_b, nt_b)
+    nda::array<ComplexType, 2> Tpos(nw_half, nt_half);
+    for (long n = 0; n < nw_half; ++n) {
+      const long iw = nw_b / 2 + n;
+      for (long it = 0; it < nt_half; ++it) {
+        const long imt = nt_b - it - 1;
+        Tpos(n, it) = (it == imt) ? Twt(iw, it) : Twt(iw, it) + Twt(iw, imt);
+      }
+    }
+    std::vector<long> sel_of(size_t(nq), -1);
+    for (long s = 0; s < nsel; ++s) sel_of[size_t(_pol_cut_q[size_t(s)])] = s;
+    auto t_rng = dPi_tqPQ.local_range(0);
+    auto q_rng = dPi_tqPQ.local_range(1);
+    auto P_rng = dPi_tqPQ.local_range(2);
+    auto Q_rng = dPi_tqPQ.local_range(3);
+    auto Pi_loc = dPi_tqPQ.local();
+    nda::array<ComplexType, 4> out(nsel, nw_half, Np, Nq2);
+    out() = ComplexType(0.0);
+    for (long iq = 0; iq < long(q_rng.size()); ++iq) {
+      const long s = sel_of[size_t(q_rng.first() + iq)];
+      if (s < 0) continue;
+      for (long it = 0; it < long(t_rng.size()); ++it)
+        for (long n = 0; n < nw_half; ++n) {
+          const ComplexType r = Tpos(n, t_rng.first() + it);
+          for (long iP = 0; iP < long(P_rng.size()); ++iP)
+            for (long iQ = 0; iQ < long(Q_rng.size()); ++iQ)
+              out(s, n, P_rng.first() + iP, Q_rng.first() + iQ) += r * Pi_loc(it, iq, iP, iQ);
+        }
+    }
+    dPi_tqPQ.communicator()->reduce_in_place_n(out.data(), out.size(), std::plus<>{}, 0);
+    if (dPi_tqPQ.communicator()->rank() == 0) {
+      app_log(2, "  [eps-cut] RPA rows gathered on rank 0: {} q x {} nu nodes x {}^2 ({:.3f} GB)", nsel, nw_half, Np,
+              double(out.size()) * 16.0 / 1.0e9);
+      _pol_pi_cut.emplace(std::move(out));
+    } else {
+      _pol_pi_cut.reset();
+    }
   }
 
   /**
@@ -1142,6 +1225,10 @@ namespace solvers {
     double eps_ds_qmin = -1.0, eps_dp_qmin = -1.0, eps_dg_qmin = -1.0, eps_dy_qmin = -1.0;
     nda::matrix<ComplexType> Am(Np, Np);
     nda::array<ComplexType, 1> chi_c(Np), buf(Np);
+    // eps(q_i, i nu) cut state (2026-09-11): the per-transfer captures of its eps lambda
+    long iq_cut = -1;
+    double factor_cut = 0.0;
+    nda::array<ComplexType, 2> Z_qPQ_cut;
     double eps_rpa_qmin = -1.0, eps_lad_qmin = -1.0, eps_dlm_qmin = -1.0, qmin_abs2 = 1e300;
     long iq_min = -1;
     // ---- DA D-7: the per-q Dyson-W change driven by P^lad ------------------------------
@@ -1234,7 +1321,7 @@ namespace solvers {
                 e_dlm, e_lad);
       else if (dyn_rung)
         app_log(2, "  [scGW-tilde L2]   q {} (|q|^2 = {:.4e}): eps_M RPA = {:.6f}, +ladder(L2) = {:.6f}, "
-                   "+static(sign-corr.) = {:.6f}, +static+Pi^C_dyn = {:.6f}, +Gamma1 = {:.6f}, +resummed = {:.6f}",
+                   "+static(dynbse driver) = {:.6f}, +static+Pi^C_dyn = {:.6f}, +Gamma1 = {:.6f}, +resummed = {:.6f}",
                 iq, q_abs2, e_rpa, e_lad, e_ds, e_dp, e_dg, e_dy);
       else
         app_log(2, "  [scGW-tilde L2]   q {} (|q|^2 = {:.4e}): eps_M RPA = {:.6f}, "
@@ -1284,14 +1371,142 @@ namespace solvers {
         _pol_eps_dyn_static = eps_ds_qmin; _pol_eps_dyn_pc = eps_dp_qmin;
         _pol_eps_dyn_gam1 = eps_dg_qmin; _pol_eps_dyn = eps_dy_qmin;
         app_log(1, "  [scGW-tilde T2] dynamic-rung eps_M readout (inu = 0, q_min = {}): RPA = {:.6f}, "
-                   "+ladder(L2 as implemented) = {:.6f}, +static ladder (sign-corrected) = {:.6f}, "
+                   "+ladder(L2, resolvent 1 + Xh Kt) = {:.6f}, +static ladder (dynbse driver; must equal L2) = {:.6f}, "
                    "+static+Pi^C_dyn (one dynamic rung) = {:.6f}, +Gamma_1 (static-dressed one dynamic rung) "
-                   "= {:.6f}, +RESUMMED dynamic-rung ladder = {:.6f}  [references at Si 4^3 q_min: RPA 4.028, "
-                   "L2 4.443, G0W0-class 5.747]; watchdog max |Ritz(K_d L_s)| = {:.3f}, converged {}",
+                   "= {:.6f}, +RESUMMED dynamic-rung ladder = {:.6f}  [references at Si 4^3 q_min, C = [0,8): RPA 4.028, "
+                   "static 4.699 (former 1 - Xh Kt resolvent 4.443), resummed 5.399, G0W0-class 5.747]; watchdog max "
+                   "|Ritz(K_d L_s)| = {:.3f}, converged {}",
                 iq_min, eps_rpa_qmin, eps_lad_qmin, eps_ds_qmin, eps_dp_qmin, eps_dg_qmin, eps_dy_qmin,
                 dres->ritz_max, dres->all_converged);
       }
     }
+    // ---- eps(q_i, i nu) cuts (2026-09-11, pol_eps_cut > 0; report-only) -------------------
+    // Every column the readout evaluates, on EVERY PH-sym bosonic half node, at the selected
+    // transfers: RPA (the gathered rows), +ladder (eval_pol_ladder_whalf: the same pair-space
+    // ladder at all nodes), +DeltaLambda (legs = ward), and the loop's OWN eps^-1 head
+    // (eps_inv_head_q -> i nu), which is the in-loop framework's eps_M (RPA scGW, or L3 with
+    // the injection on). Node j <-> iw = nw_b/2 + j, nu_j = wn_b(iw) pi / beta (>= 0).
+    if (_vertex != nullptr and _vertex->eps_cut_nq() > 0 and not _pol_cut_q.empty()) {
+      ++_pol_cut_calls;
+      const long nsel = long(_pol_cut_q.size());
+      nda::array<ComplexType, 4> Pd_all;
+      auto Pl_all = _pol_vtx->eval_pol_ladder_whalf(mb_state, thc, nullptr,
+                                                    ward_legs ? std::addressof(Pd_all) : nullptr);
+      const long nw_half = Pl_all.shape(0);
+      utils::check(Pl_all.shape(1) == nq and Pl_all.shape(2) == Nm, "eps-cut: whalf ladder shape mismatch.");
+      const bool have_loop = (eps_inv_head_q != nullptr);
+      nda::array<ComplexType, 2> eloop_w(nw_half, std::max(nsel, 1l));
+      if (have_loop) {
+        const long nt_h = eps_inv_head_q->shape(0);
+        nda::array<ComplexType, 2> et(nt_h, nsel);
+        for (long s = 0; s < nsel; ++s)
+          for (long it = 0; it < nt_h; ++it) et(it, s) = (*eps_inv_head_q)(it, _pol_cut_q[size_t(s)]);
+        _ft->tau_to_w_PHsym(et, eloop_w);
+      }
+      const double beta = _ft->beta();
+      auto wn_b = _ft->wn_mesh_b();
+      const long nw_b = _ft->nw_b();
+      // the dynamic-rung columns on every half node at the selected transfers (collective)
+      std::optional<vertex_t::dynbse_cut_result> dcut;
+      long n_dyn_nodes = 0;
+      if (dyn_rung) {
+        const long nn = (_vertex->eps_cut_dyn_nnu() > 0) ? std::min(_vertex->eps_cut_dyn_nnu(), nw_half) : nw_half;
+        std::vector<long> hn(static_cast<size_t>(nn), 0l);
+        for (long j = 0; j < nn; ++j) hn[size_t(j)] = j;
+        dcut.emplace(_pol_vtx->eval_pol_dynbse_cut(mb_state, thc, hn, _pol_cut_q));
+        n_dyn_nodes = nn;
+      }
+      if (thc.mpi()->comm.rank() == 0) {
+        utils::check(_pol_pi_cut.has_value(), "eps-cut: rank 0 holds no gathered RPA rows.");
+        auto const &Pc = _pol_pi_cut.value();
+        utils::check(Pc.shape(0) == nsel and Pc.shape(1) == nw_half and Pc.shape(2) == Np,
+                     "eps-cut: gathered rows shape mismatch.");
+        _pol_eps_cut_qmin = nda::array<double, 2>(nw_half, 8);
+        _pol_eps_cut_qmin() = -1.0;
+        nda::array<ComplexType, 2> dPc[4];
+        for (auto &A : dPc) A = nda::array<ComplexType, 2>(dyn_rung ? Np : 0, dyn_rung ? Np : 0);
+        nda::array<ComplexType, 2> Arow(Np, Np), ZPc(Np, Np);
+        auto eps_row = [&](nda::array<ComplexType, 2> const &Pi0, nda::array<ComplexType, 2> const *add) {
+          Arow() = Pi0;
+          if (add != nullptr) Arow += *add;
+          nda::blas::gemm(Z_qPQ_cut, Arow, ZPc);
+          Am() = ZPc;
+          Am() *= ComplexType(-1.0);
+          for (long P = 0; P < Np; ++P) Am(P, P) += ComplexType(1.0);
+          nda::inverse_in_place(Am);
+          for (long P = 0; P < Np; ++P) Am(P, P) -= ComplexType(1.0);
+          nda::blas::gemm(Am, Z_qPQ_cut, ZPc);
+          nda::blas::gemv(ZPc, chi_c, buf);
+          const ComplexType eih = factor_cut * nda::blas::dot(Chi_bar(iq_cut, all), buf);
+          return 1.0 / (1.0 + eih.real());
+        };
+        app_log(1, "\n  [eps-cut] call {}: eps_M(q_i, i nu_j) on the PH-sym bosonic half grid; columns: RPA, "
+                   "+ladder (static L2, resolvent 1 + Xh Kt){}, loop-side (the loop's own eps^-1 head{}){}",
+                _pol_cut_calls, ward_legs ? ", +DeltaLambda (chi0_Lambda alone)" : "",
+                have_loop ? "" : ": absent",
+                dyn_rung ? ", then the dynamic-rung columns: +static (dynbse driver), +static+Pi^C_dyn, +Gamma_1, +resummed" : "");
+        app_log(1, "  [eps-cut]   {:>4} {:>4} {:>10} {:>3} {:>6} {:>12} {:>12} {:>12}{} {:>12}{}", "call", "iq", "|q|",
+                "j", "wn", "nu(Ha)", "eps_rpa", "eps_lad", ward_legs ? "      eps_dlm" : "", "eps_loop",
+                dyn_rung ? "      eps_dst      eps_dp1      eps_dg1      eps_dyn" : "");
+        for (long s = 0; s < nsel; ++s) {
+          iq_cut = _pol_cut_q[size_t(s)];
+          auto qpc = MF->Qpts_ibz(iq_cut);
+          const double q2c = qpc(0) * qpc(0) + qpc(1) * qpc(1) + qpc(2) * qpc(2);
+          factor_cut = (q2c / fpi) * MF->volume();
+          chi_c = nda::conj(Chi_bar(iq_cut, all));
+          Z_qPQ_cut = Z_qPQ(iq_cut, all, all);
+          auto tqc = tmap(iq_cut, all, all);
+          nda::array<ComplexType, 2> tdc(Np, Nm);
+          for (long m = 0; m < Nm; ++m)
+            for (long P = 0; P < Np; ++P) tdc(P, m) = std::conj(tqc(m, P));
+          for (long j = 0; j < nw_half; ++j) {
+            nda::blas::gemm(Pl_all(j, iq_cut, all, all), tqc, tmpM);
+            nda::blas::gemm(tdc, tmpM, dP);
+            if (ward_legs) {
+              nda::blas::gemm(Pd_all(j, iq_cut, all, all), tqc, tmpM);
+              nda::blas::gemm(tdc, tmpM, dPd);
+            }
+            auto Pi0 = nda::array<ComplexType, 2>(Pc(s, j, all, all));
+            const double e_rpa = eps_row(Pi0, nullptr);
+            const double e_lad = eps_row(Pi0, std::addressof(dP));
+            const double e_dlm = ward_legs ? eps_row(Pi0, std::addressof(dPd)) : -1.0;
+            const double e_loop = have_loop ? 1.0 / (1.0 + eloop_w(j, s).real()) : -1.0;
+            double e_d[4] = {-1.0, -1.0, -1.0, -1.0};
+            if (dyn_rung and j < n_dyn_nodes) {
+              for (int c = 0; c < 4; ++c) {
+                nda::blas::gemm(dcut->Pi(c, j, iq_cut, all, all), tqc, tmpM);
+                nda::blas::gemm(tdc, tmpM, dPc[c]);
+                e_d[c] = eps_row(Pi0, std::addressof(dPc[c]));
+              }
+            }
+            if (s == 0) {
+              _pol_eps_cut_qmin(j, 0) = e_rpa; _pol_eps_cut_qmin(j, 1) = e_lad;
+              _pol_eps_cut_qmin(j, 2) = e_dlm; _pol_eps_cut_qmin(j, 3) = e_loop;
+              for (int c = 0; c < 4; ++c) _pol_eps_cut_qmin(j, 4 + c) = e_d[c];
+            }
+            const long wn = wn_b(nw_b / 2 + j);
+            std::string dyn_cols;
+            if (dyn_rung)
+            {
+              char buf[96];
+              std::snprintf(buf, sizeof(buf), " %12.6f %12.6f %12.6f %12.6f", e_d[0], e_d[1], e_d[2], e_d[3]);
+              dyn_cols = buf;
+            }
+            if (ward_legs)
+              app_log(1, "  [eps-cut]   {:>4} {:>4} {:>10.6f} {:>3} {:>6} {:>12.6e} {:>12.6f} {:>12.6f} {:>12.6f} {:>12.6f}{}",
+                      _pol_cut_calls, iq_cut, std::sqrt(q2c), j, wn, double(wn) * M_PI / beta, e_rpa, e_lad, e_dlm, e_loop,
+                      dyn_cols);
+            else
+              app_log(1, "  [eps-cut]   {:>4} {:>4} {:>10.6f} {:>3} {:>6} {:>12.6e} {:>12.6f} {:>12.6f} {:>12.6f}{}",
+                      _pol_cut_calls, iq_cut, std::sqrt(q2c), j, wn, double(wn) * M_PI / beta, e_rpa, e_lad, e_loop,
+                      dyn_cols);
+          }
+        }
+        app_log(1, "");
+      }
+      _pol_pi_cut.reset();
+    }
+
     // Q3-b(i): the SAME q_min read off the loop's own screening. Same G, same kernel, two
     // evaluation routes -- the tau-space Dyson of the (injected) Pi against the readout's
     // single-frequency inu = 0 Dyson above. With the injection ON the two must agree to
@@ -1644,6 +1859,7 @@ namespace solvers {
       ensure_pol_vertex(thc);
       _pol_vtx->build_w0(mb_state, thc, dPi_rpa);   // build_w0 only READS dPi
       _pol_pi0_qPQ = gather_nu0_row(dPi_rpa);       // the readout's RPA baseline
+      if (_vertex->eps_cut_nq() > 0) gather_cut_rows(thc, dPi_rpa);   // eps(q_i, i nu) cuts (report-only)
     };
     auto inject_pol_tier = [&](auto &dPi) {
       if (pol_readout and _vertex->pol_vertex_inject_enabled())

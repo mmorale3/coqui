@@ -4828,6 +4828,8 @@ namespace solvers {
   // scGW-tilde Tier 2 full frequency (notes/dynbse_plan.md, increment D2)
   template vertex_t::dynbse_diag vertex_t::dynbse_gate(MBState&, thc_reader_t&);
   template vertex_t::dynbse_nu0_result vertex_t::eval_pol_dynbse_nu0(MBState&, thc_reader_t&);
+  template vertex_t::dynbse_cut_result vertex_t::eval_pol_dynbse_cut(MBState&, thc_reader_t&, std::vector<long> const&,
+                                                                     std::vector<long> const&);
   template vertex_t::ladder_whalf_diag
   vertex_t::ladder_whalf_gate(MBState&, thc_reader_t&, double);
 
