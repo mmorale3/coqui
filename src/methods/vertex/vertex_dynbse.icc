@@ -81,6 +81,8 @@ namespace solvers {
       nda::array<double, 2> const *kcrys = nullptr;  // (nk, 3) crystal coordinates of the k mesh: when given
                                                      // (and ksum_ft), the rung's k-sum runs through kmesh_ft
       bool ksum_ft = true;
+      int table_mode = 0;         // inu != 0 twisted-pair tables: 0 = fitted on the dense tau grid (default), 1 = the
+                                  // exact partial fractions through Dsq (1/nu-amplified; the diagnostic route)
       long union_stride = 1;      // union grid: keep every union_stride-th shifted G node (plus the last); the
                                   // inu != 0 L0 cost scales as ng (1 + 2 (np_fit + ng)) -> stride 2 is ~5x cheaper
                                   // IF G still fits (node_pole_fit error reported as the G fit; gate it)
@@ -110,7 +112,10 @@ namespace solvers {
       long n_apps = 0;                      // K_d applications (all units, all blocks)
       double rss_max_gb = 0.0;
       bool ksum_ft = false;         // the rung's k-sum ran through the mesh Fourier transform
+      nda::array<double, 2> unit_diag;   // per unit (nunits_all x 12): is iq m apps conv stag rconv |Ritz| refit shift-fit
+                                         // shift-cond last-readout-step; zeros for units restored from the dump
       void reduce(boost::mpi3::communicator &comm) {
+        if (unit_diag.size() > 0) comm.all_reduce_in_place_n(unit_diag.data(), unit_diag.size(), std::plus<>{});
         auto mx = [&](double &v) { v = comm.all_reduce_value(v, boost::mpi3::max<>{}); };
         auto sm = [&](long &v) { v = comm.all_reduce_value(v, std::plus<>{}); };
         mx(fit_err_G); mx(rr_G); mx(dsq_err); mx(refit_err_max); mx(wtau_sym); mx(ritz_max);
@@ -783,6 +788,7 @@ namespace solvers {
       }
       long pos = rank;
       long units_taken = 0;
+      if (met) { met->unit_diag = nda::array<double, 2>(nunits_all, 12); met->unit_diag() = 0.0; }
       for (long u = next_unit(pos); u >= 0; u = next_unit(pos)) {
         ++units_taken;
         const long sq = u / nnu, jn_unit = u % nnu;
@@ -948,7 +954,7 @@ namespace solvers {
           std::optional<db::shift_tables> stab;
           db::shift_tables const *stp = nullptr;
           if (inu != cplx(0.0)) {
-            stab.emplace(db::build_shift_tables(b, inu));
+            stab.emplace(db::build_shift_tables(b, inu, 1e-11, opt.table_mode));
             stp = std::addressof(stab.value());
             if (met) met->dsq_err = std::max(met->dsq_err, stab->fit_err);
             if (rank == 0 and units_taken == 1)
@@ -1051,6 +1057,14 @@ namespace solvers {
           res.readout_converged = rconv_unit;
           res.contraction = ritz_unit;
           res.fit_err_max = refit_unit;
+          if (met) {
+            auto row = met->unit_diag(u, nda::range::all);
+            row(0) = double(is); row(1) = double(iq); row(2) = double(m); row(3) = double(res.iterations);
+            row(4) = res.converged ? 1.0 : 0.0; row(5) = res.stagnated ? 1.0 : 0.0; row(6) = res.readout_converged ? 1.0 : 0.0;
+            row(7) = res.contraction; row(8) = res.fit_err_max;
+            row(9) = (stp != nullptr) ? stp->fit_err : 0.0; row(10) = (stp != nullptr) ? stp->cond_kept : 0.0;
+            row(11) = res.readout_history.empty() ? -1.0 : res.readout_history.back();
+          }
           if (rank == 0 and units_taken == 1) {
             std::string hist;
             for (double h : res.history) {
@@ -1649,6 +1663,7 @@ namespace solvers {
     o.rhs_block = _dyn_rhs_block;
     o.dense_rung = _dyn_dense;
     o.union_stride = _dyn_union_stride;
+    o.table_mode = _dyn_table_mode;
     o.sched_comm = mpi->comm.get();      // dynamic longest-first scheduling of the (s, q, nu) units
     if (_dyn_dump) o.dump_prefix = mb_state.coqui_prefix + ".dynunits.cut.g" + std::to_string(gen);
     o.union_nodes = true;
@@ -1691,6 +1706,16 @@ namespace solvers {
             met.fit_err_G, met.refit_err_max, r.t_total, met.t_solve, met.t_rung, met.t_refit, met.t_l0, met.t_ts, met.t_orth,
             met.t_solve - met.t_rung - met.t_refit - met.t_l0 - met.t_ts - met.t_orth, met.n_apps, met.rss_max_gb,
             utils::omp_threads());
+    if (met.unit_diag.size() > 0) {
+      app_log(2, "  [dynbse cut units]   s   q  node  apps conv stag rconv    |Ritz|     refit   shift-fit  shift-cond  last-readout-step  (table mode {})", o.table_mode);
+      for (long u = 0; u < met.unit_diag.shape(0); ++u) {
+        auto row = met.unit_diag(u, nda::range::all);
+        if (row(3) <= 0.0) continue;   // restored from the dump
+        app_log(2, "  [dynbse cut units] {:3d} {:3d} {:5d} {:5d} {:4d} {:4d} {:5d} {:9.3e} {:9.3e} {:9.3e} {:9.3e} {:9.3e}",
+                long(row(0)), long(row(1)), long(row(2)), long(row(3)), long(row(4)), long(row(5)), long(row(6)), row(7), row(8),
+                row(9), row(10), row(11));
+      }
+    }
     if (met.fit_err_G > 1e-4 or not r.all_converged)
       app_log(1, "  [scGW-tilde T2] WARNING: the dynamic cut's G pole fit ({:.2e}) or convergence ({}) is not clean -- "
                  "its columns are not to be trusted at that level.", met.fit_err_G, r.all_converged);

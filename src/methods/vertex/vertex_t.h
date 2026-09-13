@@ -879,6 +879,7 @@ namespace solvers {
     bool _dyn_dump = false;      // pol_vertex_dyn_dump: per-unit dump + restart files of the dynamic solves
     bool _dyn_dense = true;      // pol_vertex_dyn_dense: the dense per-tau rung K_d(s) (nt/2 x D x D per unit)
     long _dyn_union_stride = 1;  // pol_vertex_dyn_union_stride: keep every n-th shifted G node of the union grid
+    int _dyn_table_mode = 0;     // pol_vertex_dyn_table_mode: 0 fitted twisted-pair tables, 1 exact partial fractions
     // DIAGNOSTIC (default OFF, not physical): THE CONSTANT-RUNG ABSOLUTE PIN.
     //
     // X^L = pi^dyn - Pi^{C,0}(tau=0) must VANISH when the screening is genuinely static.
@@ -1596,6 +1597,13 @@ namespace solvers {
       _dyn_union_stride = n;
     }
     long ladder_dyn_union_stride() const { return _dyn_union_stride; }
+    /** pol_vertex_dyn_table_mode (default 0): the inu != 0 twisted-pair tables R1/R3 -- 0 = fitted on the dense tau grid,
+     *  1 = the exact partial fractions through the Dsq re-expansion (1/nu-amplified; the diagnostic route). */
+    void set_ladder_dyn_table_mode(int m) {
+      utils::check(m == 0 or m == 1, "vertex_t::set_ladder_dyn_table_mode: pol_vertex_dyn_table_mode must be 0 or 1 (got {}).", m);
+      _dyn_table_mode = m;
+    }
+    int ladder_dyn_table_mode() const { return _dyn_table_mode; }
     double ladder_dyn_sign() const { return _dyn_sign; }
 
     /**
