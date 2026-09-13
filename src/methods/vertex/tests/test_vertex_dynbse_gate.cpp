@@ -141,7 +141,7 @@ namespace bdft_tests {
                                                1e-10, mf->ecutrho(), 1, 1024));
     auto eri = mb_eri_t(thc, thc);
 
-    auto run = [&](std::string const &rung, int niter, bool dump = false, bool dense = true) {
+    auto run = [&](std::string const &rung, int niter, bool dump = false, bool dense = true, long ustride = 1) {
       solvers::hf_t hf;
       solvers::gw_t gw(&ft, "ignore_g0", output);
       solvers::scr_coulomb_t scr_eri(&ft, "rpa", "ignore_g0");
@@ -155,6 +155,7 @@ namespace bdft_tests {
                                                 //  for the dynamic columns keep the test short)
       vtx.set_ladder_dyn_dump(dump);            // per-unit dump / restart files of the dynamic solves
       vtx.set_ladder_dyn_dense(dense);          // the dense per-tau rung (default) vs the THC streaming route
+      vtx.set_ladder_dyn_union_stride(ustride); // the inu != 0 union grid's G-node stride
       scr_eri.set_vertex(&vtx);
       auto [e_hf, e_corr] = scf_loop(mb_state, dyson, eri, ft,
                                      solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol,
@@ -173,6 +174,13 @@ namespace bdft_tests {
     auto [h1, c1, r1, l1, d1, z1, cut1, eloop1] = run("dynamic", 2, true);     // writes the unit dump files
     auto [h2, c2, r2, l2, d2, z2, cut2, eloop2] = run("dynamic", 2, true);     // loads them: no unit is re-solved
     auto [h3, c3, r3, l3, d3, z3, cut3, eloop3] = run("dynamic", 2, false, false);   // the THC streaming rung
+    auto [h4, c4, r4, l4, d4, z4, cut4, eloop4] = run("dynamic", 2, false, true, 2);  // union stride 2 at inu != 0
+    if (mpi_context->comm.root()) {
+      app_log(1, "dynbse_readout: union stride 2 vs 1 at nodes 1, 2: resummed {} vs {}, {} vs {}", cut4(1, 7), cut1(1, 7),
+              cut4(2, 7), cut1(2, 7));
+      for (long j = 1; j < 3; ++j)
+        for (int c = 4; c < 8; ++c) REQUIRE(std::abs(cut4(j, c) - cut1(j, c)) < 2e-3 * std::abs(cut1(j, c) - 1.0));
+    }
     {
       // the dense per-tau rung and the THC streaming route are the same operator (solve-tolerance class)
       app_log(1, "dynbse_readout: dense vs THC rung: resummed {} vs {}, Gamma1 {} vs {}", d1[3], d3[3], d1[2], d3[2]);

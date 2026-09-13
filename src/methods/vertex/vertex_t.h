@@ -878,6 +878,7 @@ namespace solvers {
     long _dyn_rhs_block = 32;    // pol_vertex_dyn_rhs_block: RHS column block width of the dynamic solves
     bool _dyn_dump = false;      // pol_vertex_dyn_dump: per-unit dump + restart files of the dynamic solves
     bool _dyn_dense = true;      // pol_vertex_dyn_dense: the dense per-tau rung K_d(s) (nt/2 x D x D per unit)
+    long _dyn_union_stride = 1;  // pol_vertex_dyn_union_stride: keep every n-th shifted G node of the union grid
     // DIAGNOSTIC (default OFF, not physical): THE CONSTANT-RUNG ABSOLUTE PIN.
     //
     // X^L = pi^dyn - Pi^{C,0}(tau=0) must VANISH when the screening is genuinely static.
@@ -1588,6 +1589,13 @@ namespace solvers {
      *  27 GB at C = [0,12)); false = the THC pair-space streaming route (memory-bandwidth-bound). */
     void set_ladder_dyn_dense(bool on) { _dyn_dense = on; }
     bool ladder_dyn_dense() const { return _dyn_dense; }
+    /** pol_vertex_dyn_union_stride (default 1): the inu != 0 union grid keeps every n-th shifted G node (plus the
+     *  last); the pair-pole cost falls ~n^2 while the G pole fit must stay clean (reported; gate it). */
+    void set_ladder_dyn_union_stride(long n) {
+      utils::check(n >= 1, "vertex_t::set_ladder_dyn_union_stride: pol_vertex_dyn_union_stride must be >= 1 (got {}).", n);
+      _dyn_union_stride = n;
+    }
+    long ladder_dyn_union_stride() const { return _dyn_union_stride; }
     double ladder_dyn_sign() const { return _dyn_sign; }
 
     /**

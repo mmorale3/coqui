@@ -81,6 +81,9 @@ namespace solvers {
       nda::array<double, 2> const *kcrys = nullptr;  // (nk, 3) crystal coordinates of the k mesh: when given
                                                      // (and ksum_ft), the rung's k-sum runs through kmesh_ft
       bool ksum_ft = true;
+      long union_stride = 1;      // union grid: keep every union_stride-th shifted G node (plus the last); the
+                                  // inu != 0 L0 cost scales as ng (1 + 2 (np_fit + ng)) -> stride 2 is ~5x cheaper
+                                  // IF G still fits (node_pole_fit error reported as the G fit; gate it)
       bool dense_rung = true;     // the DENSE per-tau rung (2026-09-13): K_d(s) = build_kbig(W_d(s)) on the PH-sym
                                   // half of the tau nodes (nt/2 x D x D per unit, 5.4 GB at Si 4^3/8) and every
                                   // application = nt (D x D)(D x nR) gemms (compute-bound) instead of the THC
@@ -568,8 +571,10 @@ namespace solvers {
       if (opt.union_nodes) {
         auto all_nodes = db::shifted_nodes(b);
         std::vector<double> keep;
+        const long stride = std::max(1l, opt.union_stride);
         for (long j = 0; j < all_nodes.shape(0); ++j) {
           if (std::abs(all_nodes(j)) < opt.gap_mask) { ++n_masked; continue; }
+          if (stride > 1 and (j % stride) != 0 and j != all_nodes.shape(0) - 1) { ++n_masked; continue; }
           keep.push_back(all_nodes(j));
         }
         epsG = nda::array<double, 1>(long(keep.size()));
@@ -1643,6 +1648,7 @@ namespace solvers {
     o.tol = _dyn_tol; o.maxit = _dyn_maxit; o.gmres_m = std::max<long>(_dyn_gmres, 12); o.sign_ks = _dyn_sign;
     o.rhs_block = _dyn_rhs_block;
     o.dense_rung = _dyn_dense;
+    o.union_stride = _dyn_union_stride;
     o.sched_comm = mpi->comm.get();      // dynamic longest-first scheduling of the (s, q, nu) units
     if (_dyn_dump) o.dump_prefix = mb_state.coqui_prefix + ".dynunits.cut.g" + std::to_string(gen);
     o.union_nodes = true;
