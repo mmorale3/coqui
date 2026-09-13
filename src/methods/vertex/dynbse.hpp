@@ -73,6 +73,7 @@
  * (G-A) and pi_c_accumulate_w's one rung (G-B).
  */
 
+#include <chrono>
 #include <cmath>
 #include <complex>
 #include <vector>
@@ -80,6 +81,7 @@
 
 #include "configuration.hpp"
 #include "utilities/check.hpp"
+#include "utilities/omp_threads.hpp"
 #include "IO/app_loggers.h"
 #include "nda/nda.hpp"
 #include "nda/blas.hpp"
@@ -765,6 +767,10 @@ namespace dynbse {
     utils::check(st.np == np, "dynbse::l0_apply_shift: table / basis size mismatch.");
     F.zero();
     Fsum() = cplx(0.0);
+    // host threads over k (omp_threads knob): every k writes its own F(.., ik, ..) / Fsum(ik, ..) slices; the
+    // workspaces and accumulators are per iteration (no shared mutable state, no MPI in the body)
+#pragma omp parallel for schedule(dynamic, 1) num_threads(utils::omp_threads())
+    for (long ik = 0; ik < nk; ++ik) {
     // per-k pole-summed legs, diagonal EXCLUDED
     nda::array<cplx, 3> Ghat(ng, nc, nc), Gtil(ng, nc, nc);
     nda::array<cplx, 2> gjT(nc, nc), glT(nc, nc);
@@ -861,7 +867,6 @@ namespace dynbse {
       }
     };
 
-    for (long ik = 0; ik < nk; ++ik) {
       Ghat() = cplx(0.0);
       Gtil() = cplx(0.0);
       for (long j = 0; j < ng; ++j)
@@ -1039,6 +1044,10 @@ namespace dynbse {
     const long nfam_in = nu0 ? 1 : 2;
     F.zero();
     Fsum() = cplx(0.0);
+    // host threads over k (omp_threads knob): every k writes its own F(.., ik, ..) / Fsum(ik, ..) slices; the
+    // workspaces and accumulators are per iteration (no shared mutable state, no MPI in the body)
+#pragma omp parallel for schedule(dynamic, 1) num_threads(utils::omp_threads())
+    for (long ik = 0; ik < nk; ++ik) {
 
     // per-k pole-summed legs: Ghat_j(b, p3) = sum_l gkq(l, p3, b)/D_jl ; Gtil_l(p1', a) = sum_j gk(j, a, p1')/D_jl
     nda::array<cplx, 3> Ghat(ng, nc, nc), Gtil(ng, nc, nc);
@@ -1054,7 +1063,6 @@ namespace dynbse {
     nda::array<cplx, 2> Sl_out(np * nc, nc), Slt(nc, np * nc), Rl(nc, np * nc);
     nda::array<cplx, 2> C(nc, nc), T(nc, nc), Bm(nc, nc);
 
-    for (long ik = 0; ik < nk; ++ik) {
       Ghat() = cplx(0.0);
       Gtil() = cplx(0.0);
       for (long j = 0; j < ng; ++j)
@@ -1604,18 +1612,31 @@ namespace dynbse {
    *   sum_iw Gamma = Fsum + Cb T_s Fsum.
    * Returns Gamma (two-family) and Gsum. `Dc` is the constant external leg D (nk, nc, nc, nR).
    */
+  /** wall-time sinks of the solver internals (seconds, cumulative; the driver resets and reads them per
+   *  unit): the L0 pair-pole applications, the static-resolvent gemms (T_s, Cb), the Arnoldi
+   *  orthogonalization. Not thread-safe by design: the solver runs outside any omp region. */
+  struct solve_timers {
+    double t_l0 = 0.0, t_ts = 0.0, t_orth = 0.0;
+    void reset() { t_l0 = t_ts = t_orth = 0.0; }
+  };
+  inline solve_timers &solve_timers_state() { static solve_timers t; return t; }
+  inline double wall_now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+
   inline void ls_apply(freq_basis const &b, pair_poles const &P, static_resolvent const &S, cplx inu,
                        bool shared, nda::array<cplx, 4> const &Dc, tf_vector const &y,
                        tf_vector &Gamma, nda::array<cplx, 4> &Gsum,
                        nda::array<cplx, 3> const *Cb_cst = nullptr, shift_tables const *st = nullptr) {
     decltype(nda::range::all) all;
+    auto &stt = solve_timers_state();
     const long nk = P.nk, nc = P.nc, nc2 = nc * nc, nR = y.nR, D = S.D;
     tf_vector X(b.np, nk, nc, nR);
     X.fam() = y.fam;
     X.cst() = Dc + y.cst;
     tf_vector F(b.np, nk, nc, nR);
     nda::array<cplx, 4> Fsum(nk, nc, nc, nR);
+    double tw = wall_now();
     l0_apply(b, P, inu, shared, X, F, Fsum, Cb_cst, st);
+    stt.t_l0 += wall_now() - tw; tw = wall_now();
     // c = T_s Fsum  (D x nR)
     nda::array<cplx, 2> fs(D, nR), cs(D, nR), cb(D, nR);
     for (long ik = 0; ik < nk; ++ik)
@@ -1623,6 +1644,7 @@ namespace dynbse {
         for (long r = 0; r < nR; ++r) fs(ik * nc2 + p, r) = Fsum(ik, p / nc, p % nc, r);
     nda::blas::gemm(S.Ts, fs, cs);
     nda::blas::gemm(S.Cb, cs, cb);
+    stt.t_ts += wall_now() - tw; tw = wall_now();
     tf_vector Xc(b.np, nk, nc, nR);
     for (long ik = 0; ik < nk; ++ik)
       for (long p = 0; p < nc2; ++p)
@@ -1630,6 +1652,7 @@ namespace dynbse {
     tf_vector F2(b.np, nk, nc, nR);
     nda::array<cplx, 4> F2sum(nk, nc, nc, nR);
     l0_apply(b, P, inu, shared, Xc, F2, F2sum, Cb_cst, st);
+    stt.t_l0 += wall_now() - tw;
     Gamma.fam() = F.fam + F2.fam;
     Gamma.cst() = cplx(0.0);
     for (long ik = 0; ik < nk; ++ik)
@@ -1882,12 +1905,14 @@ namespace dynbse {
       for (long j = 0; j < m; ++j) {
         apply_A(V[size_t(j)], w);
         ++it;
+        const double tw_o = wall_now();
         for (long i = 0; i <= j; ++i) {
           tf_dots(V[size_t(i)], w, dots, metric);
           for (long c = 0; c < nR; ++c) { H(i, j, c) = dots(c); sc(c) = -dots(c); }
           tf_axpy(sc, V[size_t(i)], w);
         }
         tf_dots(w, w, dots, metric);
+        solve_timers_state().t_orth += wall_now() - tw_o;
         for (long c = 0; c < nR; ++c) {
           const double hn = std::sqrt(std::max(std::real(dots(c)), 0.0));
           H(j + 1, j, c) = cplx(hn);

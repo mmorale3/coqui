@@ -93,6 +93,7 @@ namespace solvers {
       long it_max = 0, it_sum = 0, nunits = 0, nconv = 0;
       double t_setup = 0.0, t_kbig = 0.0, t_cb = 0.0, t_lu = 0.0, t_solve = 0.0, t_read = 0.0;
       double t_rung = 0.0, t_refit = 0.0;   // inside the solve: the rung applications (all tau nodes), the tau refits
+      double t_l0 = 0.0, t_ts = 0.0, t_orth = 0.0;   // the L0 pole algebra, the static-resolvent gemms, the Arnoldi dots
       long n_apps = 0;                      // K_d applications (all units, all blocks)
       double rss_max_gb = 0.0;
       bool ksum_ft = false;         // the rung's k-sum ran through the mesh Fourier transform
@@ -103,7 +104,7 @@ namespace solvers {
         it_max = comm.all_reduce_value(it_max, boost::mpi3::max<>{});
         sm(it_sum); sm(nunits); sm(nconv);
         mx(t_setup); mx(t_kbig); mx(t_cb); mx(t_lu); mx(t_solve); mx(t_read); mx(rss_max_gb);
-        mx(t_rung); mx(t_refit); sm(n_apps);
+        mx(t_rung); mx(t_refit); sm(n_apps); mx(t_l0); mx(t_ts); mx(t_orth);
       }
     };
 
@@ -877,6 +878,7 @@ namespace solvers {
           for (long N0 = 0; N0 < Nm; N0 += nrb) {
             const long N1 = std::min(Nm, N0 + nrb), nR = N1 - N0;
             size_scratch(nR);
+            db::solve_timers_state().reset();
             Dblk() = Dc(all, all, all, nda::range(N0, N1));
             // Cb D (the bubble's pair block) for the "rungs >= 1" subtraction
             for (long k = 0; k < nk; ++k)
@@ -909,6 +911,10 @@ namespace solvers {
                                           &metric, opt.readout_tol);
             } else {
               res = db::solve_dyson_op(b, P, kd, S, inu, shared, Dblk, opt.tol, opt.maxit, false, &Cb_k, stp, &metric);
+            }
+            if (met) {
+              auto const &stt = db::solve_timers_state();
+              met->t_l0 += stt.t_l0; met->t_ts += stt.t_ts; met->t_orth += stt.t_orth;
             }
             it_unit = std::max(it_unit, res.iterations);
             conv_unit = conv_unit and res.converged;
@@ -1466,12 +1472,12 @@ namespace solvers {
                "all converged {}, watchdog max |Ritz(K_d L_s)| {:.3f}; G pole fit {:.2e} (rr {:.2f}), tau refit "
                "{:.2e}; (M,N) asymmetry static {:.1e} / one-rung {:.1e} / Gamma1 {:.1e} / resummed {:.1e}; "
                "|static| {:.3e} |one-rung| {:.3e} |Gamma1| {:.3e} |resummed| {:.3e}; wall {:.1f} s (solve {:.1f} s "
-               "on the slowest rank: rung {:.1f} s, refit {:.1f} s, rest {:.1f} s; {} applications, {:.1f} s each), "
-               "RSS {:.2f} GB, omp_threads {}",
+               "on the slowest rank: rung {:.1f} s, refit {:.1f} s, L0 {:.1f} s, T_s gemms {:.1f} s, Arnoldi {:.1f} s, rest "
+               "{:.1f} s; {} applications, {:.1f} s each), RSS {:.2f} GB, omp_threads {}",
             met.nunits, met.it_max, (met.nunits > 0) ? double(met.it_sum) / double(met.nunits) : 0.0, r.all_converged,
             met.ritz_max, met.fit_err_G, met.rr_G, met.refit_err_max, hs, h1, hg, hd, mx(r.Pi_static), mx(r.Pi_dyn1),
-            mx(r.Pi_gam1), mx(r.Pi_dyn), r.t_total, met.t_solve, met.t_rung, met.t_refit,
-            met.t_solve - met.t_rung - met.t_refit, met.n_apps,
+            mx(r.Pi_gam1), mx(r.Pi_dyn), r.t_total, met.t_solve, met.t_rung, met.t_refit, met.t_l0, met.t_ts, met.t_orth,
+            met.t_solve - met.t_rung - met.t_refit - met.t_l0 - met.t_ts - met.t_orth, met.n_apps,
             (met.n_apps > 0) ? met.t_solve * double(mpi->comm.size()) / double(met.n_apps) : 0.0, met.rss_max_gb,
             utils::omp_threads());
     if (met.ritz_max >= 1.0)
@@ -1557,11 +1563,13 @@ namespace solvers {
     app_log(1, "  [scGW-tilde T2] dynamic-rung ladder on {} nu nodes x {} transfers (union basis, mask {:.4f} Ha, "
                "GMRES({}), RHS blocks {}, readout tol 1e-6): {} units, applications max {} (mean {:.1f}), all done {}, "
                "watchdog max |Ritz(K_d L_s)| {:.3f}; G pole fit {:.2e}, tau refit {:.2e}; wall {:.1f} s (solve {:.1f} s on "
-               "the slowest rank: rung {:.1f} s, refit {:.1f} s, rest {:.1f} s; {} applications), RSS {:.2f} GB, omp_threads {}",
+               "the slowest rank: rung {:.1f} s, refit {:.1f} s, L0 {:.1f} s, T_s gemms {:.1f} s, Arnoldi {:.1f} s, rest {:.1f} s; "
+               "{} applications), RSS {:.2f} GB, omp_threads {}",
             nn, long(qsel.size()), o.gap_mask, o.gmres_m, o.rhs_block, met.nunits, met.it_max,
             (met.nunits > 0) ? double(met.it_sum) / double(met.nunits) : 0.0, r.all_converged, met.ritz_max,
-            met.fit_err_G, met.refit_err_max, r.t_total, met.t_solve, met.t_rung, met.t_refit,
-            met.t_solve - met.t_rung - met.t_refit, met.n_apps, met.rss_max_gb, utils::omp_threads());
+            met.fit_err_G, met.refit_err_max, r.t_total, met.t_solve, met.t_rung, met.t_refit, met.t_l0, met.t_ts, met.t_orth,
+            met.t_solve - met.t_rung - met.t_refit - met.t_l0 - met.t_ts - met.t_orth, met.n_apps, met.rss_max_gb,
+            utils::omp_threads());
     if (met.fit_err_G > 1e-4 or not r.all_converged)
       app_log(1, "  [scGW-tilde T2] WARNING: the dynamic cut's G pole fit ({:.2e}) or convergence ({}) is not clean -- "
                  "its columns are not to be trusted at that level.", met.fit_err_G, r.all_converged);
