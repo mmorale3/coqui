@@ -38,6 +38,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <optional>
 #include <random>
 #include <string>
@@ -98,6 +99,60 @@ namespace solvers {
                                   // through the near-confluent double-pole products at inu != 0 (gain
                                   // ~1/gap: measured Ritz 2.6 on lih222 at the first node). 0 = no mask.
     };
+
+
+    /**
+     * D2f: a VERTEX-LOCAL imaginary-axis grid for the dynamic pair algebra. The loop's DLR precision
+     * ("low" = 1e-6 on the Si runs) is what the small-nu twisted algebra inherits: at beta = 1000 the
+     * union scheme at the first bosonic node converges to the dense oracle (2e-6, 25 applications) at
+     * prec "high" and stalls at a 3e-2 residual floor at prec "low" (dynbse_small_nu_1000). With prec
+     * non-empty the pair algebra runs on IAFT(beta, wmax, dlr, prec): G_CC is interpolated onto the
+     * finer tau grid through the loop's DLR (exact to the loop's class), W(inu) keeps the LOOP's
+     * bosonic labels (the cut's nodes) and reaches the vertex tau nodes through Ttw_v = T Ttw_loop,
+     * the pair bubbles come back to the loop's inu through Twt_v = Twt_loop R. Empty prec = the loop.
+     */
+    struct dyn_tools_holder {
+      std::unique_ptr<imag_axes_ft::IAFT> ftv;
+      std::unique_ptr<vertex_pi::iaft_tools> tools;
+    };
+    inline dyn_tools_holder make_dyn_tools(imag_axes_ft::IAFT const &ft, std::string const &prec,
+                                           nda::array<ComplexType, 5> &G_CC) {
+      dyn_tools_holder h;
+      if (prec.empty()) {
+        h.tools = std::make_unique<vertex_pi::iaft_tools>(ft);
+        return h;
+      }
+      h.ftv = std::make_unique<imag_axes_ft::IAFT>(ft.beta(), ft.wmax(), imag_axes_ft::dlr_basis, prec);
+      vertex_pi::iaft_tools tl(ft);
+      h.tools = std::make_unique<vertex_pi::iaft_tools>(*h.ftv);
+      auto &tv = *h.tools;
+      const long nt_l = tl.nt_f, nt_v = tv.nt_f;
+      nda::array<ComplexType, 2> T(nt_v, nt_l), R(nt_l, nt_v);
+      T() = ft.construct_tau_interpolate_matrix(h.ftv->tau_mesh());     // values(tau_loop) -> values(tau_v)
+      R() = h.ftv->construct_tau_interpolate_matrix(ft.tau_mesh());     // values(tau_v)    -> values(tau_loop)
+      {
+        const long ns = G_CC.shape(1), nk = G_CC.shape(2), nc = G_CC.shape(3);
+        utils::check(G_CC.shape(0) == nt_l, "make_dyn_tools: G_CC tau extent {} != loop nt {}.", G_CC.shape(0), nt_l);
+        auto G2 = nda::reshape(G_CC, std::array<long, 2>{nt_l, ns * nk * nc * nc});
+        nda::array<ComplexType, 2> Gv2(nt_v, ns * nk * nc * nc);
+        nda::blas::gemm(T, G2, Gv2);
+        nda::array<ComplexType, 5> Gv(nt_v, ns, nk, nc, nc);
+        Gv() = nda::reshape(Gv2, std::array<long, 5>{nt_v, ns, nk, nc, nc});
+        G_CC = std::move(Gv);
+      }
+      tv.nw_b = tl.nw_b;
+      tv.wn_b = tl.wn_b;
+      tv.m0 = tl.m0;
+      tv.w_mirror_b = tl.w_mirror_b;
+      nda::array<ComplexType, 2> Ttw(nt_v, tl.nw_b), Twt(tl.nw_b, nt_v);
+      nda::blas::gemm(T, tl.Ttw_bb, Ttw);
+      nda::blas::gemm(tl.Twt_bb, R, Twt);
+      tv.Ttw_bb = std::move(Ttw);
+      tv.Twt_bb = std::move(Twt);
+      app_log(1, "  [dynbse] vertex-local imaginary-axis grid: prec \"{}\" (loop \"{}\"): tau nodes {} -> {}, "
+                 "bosonic labels kept from the loop ({} nodes)", prec, ft.prec(), nt_l, nt_v, tl.nw_b);
+      return h;
+    }
 
     struct dyn_meter {
       double fit_err_G = 0.0, rr_G = 0.0;     // aux-grid pole fits of G
@@ -1135,7 +1190,8 @@ namespace solvers {
     ladder_inputs(mb_state, thc, G_CC, kmq, kpq, symc);
     utils::check(symc == nullptr or not symc->active, "vertex_t::dynbse_gate: nosym only.");
     const nda::array<double, 2> kc(MF->kpts_crystal());       // the mesh transform of the rung's k-sum
-    vertex_pi::iaft_tools tools(*_ft);
+    auto tools_h = vd::make_dyn_tools(*_ft, _dyn_iaft_prec, G_CC);
+    auto &tools = *tools_h.tools;
     const long nw_b = tools.nw_b, nk = MF->nkpts(), nq = MF->nqpts(), Nm = _Xb_skma.shape(2);
     const long nc = subspace_rank(), nc2 = nc * nc;
     const long rank = mpi->comm.rank(), size = mpi->comm.size();
@@ -1560,7 +1616,8 @@ namespace solvers {
     ladder_inputs(mb_state, thc, G_CC, kmq, kpq, symc);
     utils::check(symc == nullptr or not symc->active, "vertex_t::eval_pol_dynbse_nu0: nosym only.");
     const nda::array<double, 2> kc(MF->kpts_crystal());
-    vertex_pi::iaft_tools tools(*_ft);
+    auto tools_h = vd::make_dyn_tools(*_ft, _dyn_iaft_prec, G_CC);
+    auto &tools = *tools_h.tools;
     const long nq = MF->nqpts(), Nm = _Xb_skma.shape(2);
     std::vector<long> nu0 = {tools.m0};
     nda::array<ComplexType, 4> Ps(1, nq, Nm, Nm), P1(1, nq, Nm, Nm), Pg(1, nq, Nm, Nm), Pd(1, nq, Nm, Nm);
@@ -1647,7 +1704,8 @@ namespace solvers {
     ladder_inputs(mb_state, thc, G_CC, kmq, kpq, symc);
     utils::check(symc == nullptr or not symc->active, "vertex_t::eval_pol_dynbse_cut: nosym only.");
     const nda::array<double, 2> kc(MF->kpts_crystal());
-    vertex_pi::iaft_tools tools(*_ft);
+    auto tools_h = vd::make_dyn_tools(*_ft, _dyn_iaft_prec, G_CC);
+    auto &tools = *tools_h.tools;
     const long nq = MF->nqpts(), Nm = _Xb_skma.shape(2), nn = long(half_nodes.size());
     std::vector<long> nus;
     for (long j : half_nodes) {

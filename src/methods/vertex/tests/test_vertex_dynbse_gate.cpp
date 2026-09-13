@@ -49,7 +49,8 @@ namespace bdft_tests {
     SUCCEED("dynbse_gate skipped: build has ENABLE_DLR=OFF.");
 #else
     auto &mpi_context = utils::make_unit_test_mpi_context();
-    imag_axes_ft::IAFT ft(1000, 6.0, imag_axes_ft::dlr_basis, "low");
+    imag_axes_ft::IAFT ft(1000, 6.0, imag_axes_ft::dlr_basis,
+                          std::getenv("COQUI_DYNBSE_TEST_PREC") ? std::string(std::getenv("COQUI_DYNBSE_TEST_PREC")) : std::string("low"));
     std::string output = "coqui_d2_gates";
 
     auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_lih222"));
@@ -133,7 +134,8 @@ namespace bdft_tests {
     SUCCEED("dynbse_readout skipped: build has ENABLE_DLR=OFF.");
 #else
     auto &mpi_context = utils::make_unit_test_mpi_context();
-    imag_axes_ft::IAFT ft(1000, 6.0, imag_axes_ft::dlr_basis, "low");
+    imag_axes_ft::IAFT ft(1000, 6.0, imag_axes_ft::dlr_basis,
+                          std::getenv("COQUI_DYNBSE_TEST_PREC") ? std::string(std::getenv("COQUI_DYNBSE_TEST_PREC")) : std::string("low"));
     std::string output = "coqui_d3_readout";
 
     auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_lih222"));
@@ -156,6 +158,7 @@ namespace bdft_tests {
       vtx.set_ladder_dyn_dump(dump);            // per-unit dump / restart files of the dynamic solves
       vtx.set_ladder_dyn_dense(dense);          // the dense per-tau rung (default) vs the THC streaming route
       vtx.set_ladder_dyn_union_stride(ustride); // the inu != 0 union grid's G-node stride
+      if (char const *vp = std::getenv("COQUI_DYNBSE_TEST_VPREC")) vtx.set_ladder_dyn_iaft_prec(vp);   // vertex-local DLR precision
       scr_eri.set_vertex(&vtx);
       auto [e_hf, e_corr] = scf_loop(mb_state, dyson, eri, ft,
                                      solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol,

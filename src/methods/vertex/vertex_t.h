@@ -880,6 +880,7 @@ namespace solvers {
     bool _dyn_dense = true;      // pol_vertex_dyn_dense: the dense per-tau rung K_d(s) (nt/2 x D x D per unit)
     long _dyn_union_stride = 1;  // pol_vertex_dyn_union_stride: keep every n-th shifted G node of the union grid
     int _dyn_table_mode = 0;     // pol_vertex_dyn_table_mode: 0 fitted twisted-pair tables, 1 exact partial fractions
+    std::string _dyn_iaft_prec;  // pol_vertex_dyn_iaft_prec: "" = the loop's grid; "medium"/"high" = a vertex-local finer DLR
     // DIAGNOSTIC (default OFF, not physical): THE CONSTANT-RUNG ABSOLUTE PIN.
     //
     // X^L = pi^dyn - Pi^{C,0}(tau=0) must VANISH when the screening is genuinely static.
@@ -1604,6 +1605,15 @@ namespace solvers {
       _dyn_table_mode = m;
     }
     int ladder_dyn_table_mode() const { return _dyn_table_mode; }
+    /** pol_vertex_dyn_iaft_prec (default "" = the loop's imaginary-axis grid): the dynamic pair algebra runs on its own
+     *  DLR of this precision ("low" 1e-6, "medium" 1e-10, "high" 1e-13) with G and W interpolated from the loop's grid;
+     *  the small-nu twisted algebra needs a finer class than the loop's "low" (dynbse_small_nu_1000). */
+    void set_ladder_dyn_iaft_prec(std::string const &p) {
+      utils::check(p.empty() or p == "low" or p == "medium" or p == "high",
+                   "vertex_t::set_ladder_dyn_iaft_prec: pol_vertex_dyn_iaft_prec must be \"\", low, medium or high (got {}).", p);
+      _dyn_iaft_prec = p;
+    }
+    std::string const &ladder_dyn_iaft_prec() const { return _dyn_iaft_prec; }
     double ladder_dyn_sign() const { return _dyn_sign; }
 
     /**

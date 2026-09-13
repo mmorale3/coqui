@@ -898,7 +898,7 @@ namespace bdft_tests {
       }
       return h;
     };
-    for (std::string prec : {"high", "low"}) {
+    for (std::string prec : {"high", "medium", "low"}) {
       imag_axes_ft::IAFT ft(beta, 8.0, imag_axes_ft::dlr_basis, prec);
       for (int fitted = 0; fitted < 2; ++fitted) {
         auto so = run_solver(T, ft, inu, bool(fitted), 1e-8, 30, 0);
