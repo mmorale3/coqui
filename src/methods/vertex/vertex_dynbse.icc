@@ -92,6 +92,8 @@ namespace solvers {
       double ritz_max = 0.0;                  // watchdog: max over units of |Ritz(K_d L_s)| / contraction
       long it_max = 0, it_sum = 0, nunits = 0, nconv = 0;
       double t_setup = 0.0, t_kbig = 0.0, t_cb = 0.0, t_lu = 0.0, t_solve = 0.0, t_read = 0.0;
+      double t_rung = 0.0, t_refit = 0.0;   // inside the solve: the rung applications (all tau nodes), the tau refits
+      long n_apps = 0;                      // K_d applications (all units, all blocks)
       double rss_max_gb = 0.0;
       bool ksum_ft = false;         // the rung's k-sum ran through the mesh Fourier transform
       void reduce(boost::mpi3::communicator &comm) {
@@ -101,6 +103,7 @@ namespace solvers {
         it_max = comm.all_reduce_value(it_max, boost::mpi3::max<>{});
         sm(it_sum); sm(nunits); sm(nconv);
         mx(t_setup); mx(t_kbig); mx(t_cb); mx(t_lu); mx(t_solve); mx(t_read); mx(rss_max_gb);
+        mx(t_rung); mx(t_refit); sm(n_apps);
       }
     };
 
@@ -795,16 +798,19 @@ namespace solvers {
                 for (long p = 0; p < np; ++p) KFc(i, p) = cplx((ff == 1 and nu0) ? b.KF2(i, p) : b.KF(i, p));
               nda::blas::gemm(cplx(1.0), KFc, famc, cplx(1.0), Fs2);
             }
+            vertex_ladder_detail::prof_watch kwatch;
 #pragma omp parallel for schedule(dynamic, 1) num_threads(nthr)
             for (long i = 0; i < nt; ++i) {
               auto Fi = Fs(i, all, all, all);
               auto Oi = Ys(i, all, all, all);
               rung_apply(Wq_s(i), scale_k, Fi, Oi, is, iq);
             }
+            if (met) met->t_rung += kwatch.lap();
             auto Ys2 = nda::reshape(Ys, std::array<long, 2>{nt, nk * nc2 * nR});
             Yc2() = Ys2;
             auto c = b.pf.coeffs(Yc2);
             const double fef = b.pf.fit_error(Yc2, c);
+            if (met) met->t_refit += kwatch.lap();
             fe = std::max(fe, fef);
             if (dbg)
               app_log(2, "  [dynbse dbg]   fam {}: |F(s)| {:.3e} |W F(s)| {:.3e} refit {:.3e} |coeffs| {:.3e}", fam,
@@ -826,6 +832,7 @@ namespace solvers {
             app_log(2, "  [dynbse dbg]   -> |y fam0| {:.3e} |y fam1| {:.3e} |y cst| {:.3e}", nrm(y.fam(0, nda::ellipsis{})),
                     nrm(y.fam(1, nda::ellipsis{})), nrm(y.cst));
           ++kd_calls;
+          if (met) ++met->n_apps;
           return fe;
         };
         // ---- the requested nu of this unit ---------------------------------------------------
@@ -1459,10 +1466,14 @@ namespace solvers {
                "all converged {}, watchdog max |Ritz(K_d L_s)| {:.3f}; G pole fit {:.2e} (rr {:.2f}), tau refit "
                "{:.2e}; (M,N) asymmetry static {:.1e} / one-rung {:.1e} / Gamma1 {:.1e} / resummed {:.1e}; "
                "|static| {:.3e} |one-rung| {:.3e} |Gamma1| {:.3e} |resummed| {:.3e}; wall {:.1f} s (solve {:.1f} s "
-               "on the slowest rank), RSS {:.2f} GB",
+               "on the slowest rank: rung {:.1f} s, refit {:.1f} s, rest {:.1f} s; {} applications, {:.1f} s each), "
+               "RSS {:.2f} GB, omp_threads {}",
             met.nunits, met.it_max, (met.nunits > 0) ? double(met.it_sum) / double(met.nunits) : 0.0, r.all_converged,
             met.ritz_max, met.fit_err_G, met.rr_G, met.refit_err_max, hs, h1, hg, hd, mx(r.Pi_static), mx(r.Pi_dyn1),
-            mx(r.Pi_gam1), mx(r.Pi_dyn), r.t_total, met.t_solve, met.rss_max_gb);
+            mx(r.Pi_gam1), mx(r.Pi_dyn), r.t_total, met.t_solve, met.t_rung, met.t_refit,
+            met.t_solve - met.t_rung - met.t_refit, met.n_apps,
+            (met.n_apps > 0) ? met.t_solve * double(mpi->comm.size()) / double(met.n_apps) : 0.0, met.rss_max_gb,
+            utils::omp_threads());
     if (met.ritz_max >= 1.0)
       app_log(1, "  [scGW-tilde T2] WARNING: the dynamic remainder's watchdog is >= 1 on some unit -- the resummed "
                  "column is not to be trusted there; Gamma_1 is the reportable number.");
@@ -1545,11 +1556,12 @@ namespace solvers {
     r.t_total = twatch.lap();
     app_log(1, "  [scGW-tilde T2] dynamic-rung ladder on {} nu nodes x {} transfers (union basis, mask {:.4f} Ha, "
                "GMRES({}), RHS blocks {}, readout tol 1e-6): {} units, applications max {} (mean {:.1f}), all done {}, "
-               "watchdog max |Ritz(K_d L_s)| {:.3f}; G pole fit {:.2e}, tau refit {:.2e}; wall {:.1f} s (solve {:.1f} s), "
-               "RSS {:.2f} GB",
+               "watchdog max |Ritz(K_d L_s)| {:.3f}; G pole fit {:.2e}, tau refit {:.2e}; wall {:.1f} s (solve {:.1f} s on "
+               "the slowest rank: rung {:.1f} s, refit {:.1f} s, rest {:.1f} s; {} applications), RSS {:.2f} GB, omp_threads {}",
             nn, long(qsel.size()), o.gap_mask, o.gmres_m, o.rhs_block, met.nunits, met.it_max,
             (met.nunits > 0) ? double(met.it_sum) / double(met.nunits) : 0.0, r.all_converged, met.ritz_max,
-            met.fit_err_G, met.refit_err_max, r.t_total, met.t_solve, met.rss_max_gb);
+            met.fit_err_G, met.refit_err_max, r.t_total, met.t_solve, met.t_rung, met.t_refit,
+            met.t_solve - met.t_rung - met.t_refit, met.n_apps, met.rss_max_gb, utils::omp_threads());
     if (met.fit_err_G > 1e-4 or not r.all_converged)
       app_log(1, "  [scGW-tilde T2] WARNING: the dynamic cut's G pole fit ({:.2e}) or convergence ({}) is not clean -- "
                  "its columns are not to be trusted at that level.", met.fit_err_G, r.all_converged);
