@@ -82,6 +82,9 @@
 #include "configuration.hpp"
 #include "utilities/check.hpp"
 #include "utilities/omp_threads.hpp"
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #include "IO/app_loggers.h"
 #include "nda/nda.hpp"
 #include "nda/blas.hpp"
@@ -2019,15 +2022,32 @@ namespace dynbse {
     if (met != nullptr) {
       const long np = a.np, nk = a.nk, nc = a.nc, nrest = nk * nc * nc * nR;
       utils::check(met->np == np, "dynbse::tf_dots: metric size mismatch.");
-      // Gb(fam) = G . b(fam) as (np, nrest) gemm, then sum conj(a) Gb per column
-      nda::array<cplx, 2> Gb(np, nrest), bc(np, nrest);
+      // Gb(fam) = G . b(fam) as (np, nrest) gemm (on the contiguous view, no copy), then the per-column
+      // sums conj(a) Gb with a contiguous inner loop over the columns; the p loop is threaded (omp_threads)
+      // with per-thread accumulators combined in a fixed order (1e-12-class reproducible, not bitwise)
+      nda::array<cplx, 2> Gb(np, nrest);
+      const long nthr = std::max(1l, std::min(utils::omp_threads(), np));
+      nda::array<cplx, 2> acc(nthr, nR);
       for (long fam = 0; fam < 2; ++fam) {
         auto bv = nda::reshape(b.fam(fam, nda::ellipsis{}), std::array<long, 2>{np, nrest});
-        bc() = bv;
-        nda::blas::gemm(met->G, bc, Gb);
+        nda::blas::gemm(met->G, bv, Gb);
         auto av = nda::reshape(a.fam(fam, nda::ellipsis{}), std::array<long, 2>{np, nrest});
-        for (long p = 0; p < np; ++p)
-          for (long i = 0; i < nrest; ++i) out(i % nR) += std::conj(av(p, i)) * Gb(p, i);
+        acc() = cplx(0.0);
+#pragma omp parallel for schedule(static) num_threads(nthr)
+        for (long p = 0; p < np; ++p) {
+#ifdef _OPENMP
+          const long t = omp_get_thread_num();
+#else
+          const long t = 0;
+#endif
+          const cplx *ap = &av(p, 0);
+          const cplx *gp = &Gb(p, 0);
+          cplx *o = &acc(t, 0);
+          for (long i0 = 0; i0 < nrest; i0 += nR)
+            for (long r = 0; r < nR; ++r) o[r] += std::conj(ap[i0 + r]) * gp[i0 + r];
+        }
+        for (long t = 0; t < nthr; ++t)
+          for (long r = 0; r < nR; ++r) out(r) += acc(t, r);
       }
       const cplx *pa = a.cst.data(); const cplx *pb = b.cst.data();
       const long ncst = long(a.cst.size()) / nR;
