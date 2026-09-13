@@ -81,6 +81,10 @@ namespace solvers {
       nda::array<double, 2> const *kcrys = nullptr;  // (nk, 3) crystal coordinates of the k mesh: when given
                                                      // (and ksum_ft), the rung's k-sum runs through kmesh_ft
       bool ksum_ft = true;
+      bool dense_rung = true;     // the DENSE per-tau rung (2026-09-13): K_d(s) = build_kbig(W_d(s)) on the PH-sym
+                                  // half of the tau nodes (nt/2 x D x D per unit, 5.4 GB at Si 4^3/8) and every
+                                  // application = nt (D x D)(D x nR) gemms (compute-bound) instead of the THC
+                                  // pair-space streaming (memory-bound: ~180 GB of traffic per application on Si)
       std::vector<long> const *q_subset = nullptr;   // evaluate only these transfers (all q when null);
                                                      // the outputs keep the full q axis (zeros elsewhere)
       double gap_mask = 0.0;      // union scheme: DROP the G nodes with |eps| < gap_mask (Ha, relative to
@@ -457,9 +461,9 @@ namespace solvers {
 
     /** the static rung Kbig (D x D) of pair_space_ladder, nosym, for (is, iq): Kbig(ikp nc2 + (p1 nc + p3'),
      *  ik nc2 + (p1' nc + p3)) = [U1^T W0b(qx_of(ik, ikp)) U2](p1 nc + p1', p3 nc + p3'). */
-    inline void build_kbig(nda::array<cplx, 4> const &Xb, nda::array<cplx, 3> const &W0b, long is, long iq,
+    inline void build_kbig(nda::array<cplx, 4> const &Xb, nda::MemoryArrayOfRank<3> auto const &W0b, long is, long iq,
                            nda::array<long, 2> const &kpq, nda::array<long, 2> const &qx_of,
-                           nda::array<cplx, 2> &Kbig) {
+                           nda::MemoryArrayOfRank<2> auto &&Kbig) {
       decltype(nda::range::all) all;
       const long nk = kpq.shape(1), Nm = Xb.shape(2), nc = Xb.shape(3), nc2 = nc * nc;
       nda::array<cplx, 2> U1(Nm, nc2), U2(Nm, nc2), WU2(Nm, nc2), wb(nc2, nc2);
@@ -803,6 +807,35 @@ namespace solvers {
         }
         build_kbig(Xb, W0b, is, iq, kpq, qx_of, Kbig);
         Ks() = Kbig * scale_k;
+        // the dense per-tau rungs K_d(s) (PH-symmetric: one block per mirror pair) and the constant part
+        std::vector<long> trep(static_cast<size_t>(nt), -1);
+        long ndist = 0;
+        nda::array<cplx, 3> Kd_s;
+        nda::array<cplx, 2> Kd0;
+        if (opt.dense_rung) {
+          std::vector<long> reps;
+          for (long i = 0; i < nt; ++i) {
+            const long im = tools.t_mirror(i);
+            const long r0 = std::min(i, im);
+            long slot = -1;
+            for (long r = 0; r < long(reps.size()); ++r) if (reps[size_t(r)] == r0) { slot = r; break; }
+            if (slot < 0) { slot = long(reps.size()); reps.push_back(r0); }
+            trep[size_t(i)] = slot;
+          }
+          ndist = long(reps.size());
+          Kd_s = nda::array<cplx, 3>(ndist, D, D);
+          Kd0 = nda::array<cplx, 2>(D, D);
+#pragma omp parallel for schedule(dynamic, 1) num_threads(nthr)
+          for (long r = 0; r < ndist; ++r) {
+            auto Wr = Wd_s(all, reps[size_t(r)], all, all);
+            auto Kr = Kd_s(r, all, all);
+            build_kbig(Xb, Wr, is, iq, kpq, qx_of, Kr);
+          }
+          build_kbig(Xb, Wd0, is, iq, kpq, qx_of, Kd0);
+          if (rank == 0 and units_taken == 1)
+            app_log(2, "  [dynbse] dense tau rungs: {} distinct PH-sym tau nodes of {}, {:.2f} GB per rank", ndist, nt,
+                    double(ndist) * double(D) * double(D) * 16.0 / 1.0e9);
+        }
         if (met) met->t_kbig += watch.lap();
         // the pair poles of this unit (shared grid: gnode identity)
         nda::array<cplx, 4> gk(ng, nk, nc, nc), gkq(ng, nk, nc, nc);
@@ -848,11 +881,21 @@ namespace solvers {
               nda::blas::gemm(cplx(1.0), KFc, famc, cplx(1.0), Fs2);
             }
             vertex_ladder_detail::prof_watch kwatch;
+            if (opt.dense_rung) {
+              // Ys(i) = scale_k K_d(s_i) Fs(i): nt gemms (D x D)(D x nR) on the mirrored blocks
 #pragma omp parallel for schedule(dynamic, 1) num_threads(nthr)
-            for (long i = 0; i < nt; ++i) {
-              auto Fi = Fs(i, all, all, all);
-              auto Oi = Ys(i, all, all, all);
-              rung_apply(Wq_s(i), scale_k, Fi, Oi, is, iq);
+              for (long i = 0; i < nt; ++i) {
+                auto Fi = nda::reshape(Fs(i, all, all, all), std::array<long, 2>{D, nR});
+                auto Oi = nda::reshape(Ys(i, all, all, all), std::array<long, 2>{D, nR});
+                nda::blas::gemm(scale_k, Kd_s(trep[size_t(i)], all, all), Fi, cplx(0.0), Oi);
+              }
+            } else {
+#pragma omp parallel for schedule(dynamic, 1) num_threads(nthr)
+              for (long i = 0; i < nt; ++i) {
+                auto Fi = Fs(i, all, all, all);
+                auto Oi = Ys(i, all, all, all);
+                rung_apply(Wq_s(i), scale_k, Fi, Oi, is, iq);
+              }
             }
             if (met) met->t_rung += kwatch.lap();
             auto Ys2 = nda::reshape(Ys, std::array<long, 2>{nt, nk * nc2 * nR});
@@ -873,7 +916,13 @@ namespace solvers {
           for (long k = 0; k < nk; ++k)
             for (long r = 0; r < nc2; ++r)
               for (long N = 0; N < nR; ++N) Fs3(k, r, N) = Fsum(k, r / nc, r % nc, N);
-          rung_apply(Wq_0, -scale_k, Fs3, Os3, is, iq);
+          if (opt.dense_rung) {
+            auto F2 = nda::reshape(Fs3, std::array<long, 2>{D, nR});
+            auto O2 = nda::reshape(Os3, std::array<long, 2>{D, nR});
+            nda::blas::gemm(-scale_k, Kd0, F2, cplx(0.0), O2);
+          } else {
+            rung_apply(Wq_0, -scale_k, Fs3, Os3, is, iq);
+          }
           for (long k = 0; k < nk; ++k)
             for (long r = 0; r < nc2; ++r)
               for (long N = 0; N < nR; ++N) y.cst(k, r / nc, r % nc, N) = Os3(k, r, N);
@@ -1500,6 +1549,7 @@ namespace solvers {
     o.kcrys = std::addressof(kc);
     o.tol = _dyn_tol; o.maxit = _dyn_maxit; o.gmres_m = _dyn_gmres; o.sign_ks = _dyn_sign;
     o.rhs_block = _dyn_rhs_block;
+    o.dense_rung = _dyn_dense;
     o.sched_comm = mpi->comm.get();      // dynamic longest-first scheduling of the (s, q, nu) units
     o.readout_tol = 1e-6;                // the physical readout's own stop (the 1e-8 residual is below the refit floor)
     if (_dyn_dump) o.dump_prefix = mb_state.coqui_prefix + ".dynunits.nu0.g" + std::to_string(gen);
@@ -1592,6 +1642,7 @@ namespace solvers {
     o.kcrys = std::addressof(kc);
     o.tol = _dyn_tol; o.maxit = _dyn_maxit; o.gmres_m = std::max<long>(_dyn_gmres, 12); o.sign_ks = _dyn_sign;
     o.rhs_block = _dyn_rhs_block;
+    o.dense_rung = _dyn_dense;
     o.sched_comm = mpi->comm.get();      // dynamic longest-first scheduling of the (s, q, nu) units
     if (_dyn_dump) o.dump_prefix = mb_state.coqui_prefix + ".dynunits.cut.g" + std::to_string(gen);
     o.union_nodes = true;

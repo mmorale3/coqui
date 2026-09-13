@@ -877,6 +877,7 @@ namespace solvers {
     long _dyn_maxit = 30, _dyn_gmres = 12;
     long _dyn_rhs_block = 32;    // pol_vertex_dyn_rhs_block: RHS column block width of the dynamic solves
     bool _dyn_dump = false;      // pol_vertex_dyn_dump: per-unit dump + restart files of the dynamic solves
+    bool _dyn_dense = true;      // pol_vertex_dyn_dense: the dense per-tau rung K_d(s) (nt/2 x D x D per unit)
     // DIAGNOSTIC (default OFF, not physical): THE CONSTANT-RUNG ABSOLUTE PIN.
     //
     // X^L = pi^dyn - Pi^{C,0}(tau=0) must VANISH when the screening is genuinely static.
@@ -1582,6 +1583,11 @@ namespace solvers {
      *  re-solving (a walltime kill loses only the units in flight). */
     void set_ladder_dyn_dump(bool on) { _dyn_dump = on; }
     bool ladder_dyn_dump() const { return _dyn_dump; }
+    /** pol_vertex_dyn_dense (default true): the dynamic rung as dense per-tau blocks K_d(s) = Kbig[W_d(s)] on the
+     *  PH-symmetric half of the tau nodes (compute-bound gemms; nt/2 x D^2 complex per rank: 5.4 GB at Si 4^3/8,
+     *  27 GB at C = [0,12)); false = the THC pair-space streaming route (memory-bandwidth-bound). */
+    void set_ladder_dyn_dense(bool on) { _dyn_dense = on; }
+    bool ladder_dyn_dense() const { return _dyn_dense; }
     double ladder_dyn_sign() const { return _dyn_sign; }
 
     /**

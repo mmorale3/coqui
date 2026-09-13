@@ -301,7 +301,9 @@ inline void ensure_checkpoint(std::shared_ptr<mf::MF> mf, std::string const& out
  *                 pol_vertex_dyn_rhs_block (32: the RHS columns of the dynamic solves in blocks of
  *                 this width -- the Krylov basis is the memory driver; 0 = all at once),
  *                 pol_vertex_dyn_dump (false: per-unit dump + restart files
- *                 "<prefix>.dynunits.<tag>.g<call>.r<rank>.bin" of the dynamic solves), pol_vertex_dyn_sign (-1 = the derived rung sign, +1 = the
+ *                 "<prefix>.dynunits.<tag>.g<call>.r<rank>.bin" of the dynamic solves),
+ *                 pol_vertex_dyn_dense (true: the dense per-tau rung K_d(s), nt/2 x D^2 per rank;
+ *                 false: the THC pair-space streaming route), pol_vertex_dyn_sign (-1 = the derived rung sign, +1 = the
  *                 as-implemented L2 convention). XOR pol_vertex_legs = "ward".
  *  - ladder_solve_grid: 1  Ranks per SOLVE GRID for the ladder's dense resolvent
  *                 (notes/ladder_b_integration_design.md, increment B). 1 (default) is the
@@ -596,6 +598,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
             io::get_value_with_default<double>(pt,"pol_vertex_dyn_sign",-1.0));
         vertex.set_ladder_dyn_rhs_block(io::get_value_with_default<long>(pt,"pol_vertex_dyn_rhs_block",32));
         vertex.set_ladder_dyn_dump(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_dump",false));
+        vertex.set_ladder_dyn_dense(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_dense",true));
       }
     }
     scr_eri.set_cvv_rspace_tol(cvv_rspace_tol);
@@ -947,6 +950,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
             io::get_value_with_default<double>(pt,"pol_vertex_dyn_sign",-1.0));
         pol_vertex_carrier.set_ladder_dyn_rhs_block(io::get_value_with_default<long>(pt,"pol_vertex_dyn_rhs_block",32));
         pol_vertex_carrier.set_ladder_dyn_dump(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_dump",false));
+        pol_vertex_carrier.set_ladder_dyn_dense(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_dense",true));
       }
     }
     if (pol_vertex_carrier.pol_vertex_enabled()) scr_eri.set_vertex(&pol_vertex_carrier);
@@ -1170,6 +1174,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
             io::get_value_with_default<double>(pt,"pol_vertex_dyn_sign",-1.0));
         pol_vertex_carrier.set_ladder_dyn_rhs_block(io::get_value_with_default<long>(pt,"pol_vertex_dyn_rhs_block",32));
         pol_vertex_carrier.set_ladder_dyn_dump(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_dump",false));
+        pol_vertex_carrier.set_ladder_dyn_dense(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_dense",true));
       }
     }
     if (pol_vertex_carrier.pol_vertex_enabled()) scr_eri.set_vertex(&pol_vertex_carrier);
@@ -1435,6 +1440,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
             io::get_value_with_default<double>(pt,"pol_vertex_dyn_sign",-1.0));
         vertex.set_ladder_dyn_rhs_block(io::get_value_with_default<long>(pt,"pol_vertex_dyn_rhs_block",32));
         vertex.set_ladder_dyn_dump(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_dump",false));
+        vertex.set_ladder_dyn_dense(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_dense",true));
       }
     }
     scr_eri.set_cvv_rspace_tol(cvv_rspace_tol);
@@ -1711,6 +1717,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
             io::get_value_with_default<double>(pt,"pol_vertex_dyn_sign",-1.0));
         pol_vertex_carrier.set_ladder_dyn_rhs_block(io::get_value_with_default<long>(pt,"pol_vertex_dyn_rhs_block",32));
         pol_vertex_carrier.set_ladder_dyn_dump(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_dump",false));
+        pol_vertex_carrier.set_ladder_dyn_dense(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_dense",true));
       }
     }
     if (pol_vertex_carrier.pol_vertex_enabled()) scr_eri.set_vertex(&pol_vertex_carrier);

@@ -141,7 +141,7 @@ namespace bdft_tests {
                                                1e-10, mf->ecutrho(), 1, 1024));
     auto eri = mb_eri_t(thc, thc);
 
-    auto run = [&](std::string const &rung, int niter, bool dump = false) {
+    auto run = [&](std::string const &rung, int niter, bool dump = false, bool dense = true) {
       solvers::hf_t hf;
       solvers::gw_t gw(&ft, "ignore_g0", output);
       solvers::scr_coulomb_t scr_eri(&ft, "rpa", "ignore_g0");
@@ -154,6 +154,7 @@ namespace bdft_tests {
       vtx.set_eps_cut(1, 3);                    // the eps(q_i, i nu) cut report (report-only; q_min and the 3 lowest nodes
                                                 //  for the dynamic columns keep the test short)
       vtx.set_ladder_dyn_dump(dump);            // per-unit dump / restart files of the dynamic solves
+      vtx.set_ladder_dyn_dense(dense);          // the dense per-tau rung (default) vs the THC streaming route
       scr_eri.set_vertex(&vtx);
       auto [e_hf, e_corr] = scf_loop(mb_state, dyson, eri, ft,
                                      solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol,
@@ -171,6 +172,15 @@ namespace bdft_tests {
     auto [h0, c0, r0, l0, d0, z0, cut0, eloop0] = run("static", 2);
     auto [h1, c1, r1, l1, d1, z1, cut1, eloop1] = run("dynamic", 2, true);     // writes the unit dump files
     auto [h2, c2, r2, l2, d2, z2, cut2, eloop2] = run("dynamic", 2, true);     // loads them: no unit is re-solved
+    auto [h3, c3, r3, l3, d3, z3, cut3, eloop3] = run("dynamic", 2, false, false);   // the THC streaming rung
+    {
+      // the dense per-tau rung and the THC streaming route are the same operator (solve-tolerance class)
+      app_log(1, "dynbse_readout: dense vs THC rung: resummed {} vs {}, Gamma1 {} vs {}", d1[3], d3[3], d1[2], d3[2]);
+      for (int c = 0; c < 4; ++c) REQUIRE(std::abs(d3[c] - d1[c]) < 1e-7 * std::max(1.0, std::abs(d1[c] - 1.0)));
+      if (mpi_context->comm.root())
+        for (long j = 0; j < 3; ++j)
+          for (int c = 4; c < 8; ++c) REQUIRE(std::abs(cut3(j, c) - cut1(j, c)) < 1e-6 * std::max(1.0, std::abs(cut1(j, c) - 1.0)));
+    }
     {
       // the restart path: every dynamic column is bitwise what the solving run produced
       for (int c = 0; c < 4; ++c) REQUIRE(d2[c] == d1[c]);
