@@ -40,6 +40,8 @@
 #include <string>
 
 #include "methods/vertex/dynbse.hpp"
+#include "utilities/omp_threads.hpp"
+#include <mpi.h>
 #if defined(ENABLE_FFTW)
 #include "numerics/fft/fftw.h"
 #endif
@@ -67,6 +69,9 @@ namespace solvers {
       long rhs_block = 0;         // solve the Nm right-hand-side columns in blocks of this width (0 = all at
                                   // once): the Krylov basis (m + 1 tf_vectors of width nR) is the memory
                                   // driver; each block converges to tol independently (differences at tol)
+      MPI_Comm sched_comm = MPI_COMM_NULL;           // when set: DYNAMIC scheduling of the (s, q, nu) units through
+                                                     // a shared task counter (one-sided MPI on rank 0), longest
+                                                     // units first; MPI_COMM_NULL = static round-robin
       nda::array<double, 2> const *kcrys = nullptr;  // (nk, 3) crystal coordinates of the k mesh: when given
                                                      // (and ksum_ft), the rung's k-sum runs through kmesh_ft
       bool ksum_ft = true;
@@ -110,8 +115,8 @@ namespace solvers {
     template<class WqFn>
     inline void thc_rung_apply(nda::array<cplx, 4> const &Xb, long is, long iq,
                                nda::array<long, 2> const &kpq, nda::array<long, 2> const &qx_of,
-                               WqFn &&Wq, cplx scale, nda::array<cplx, 3> const &F,
-                               nda::array<cplx, 3> &out, long nb) {
+                               WqFn &&Wq, cplx scale, nda::MemoryArrayOfRank<3> auto const &F,
+                               nda::MemoryArrayOfRank<3> auto &&out, long nb) {
       decltype(nda::range::all) all;
       const long nk = F.shape(0), nc2 = F.shape(1), nR = F.shape(2), Nm = Xb.shape(2);
       const long nc = Xb.shape(3);
@@ -319,8 +324,8 @@ namespace solvers {
     template<class WqFn>
     inline void thc_rung_apply_ft(nda::array<cplx, 4> const &Xb, long is, long iq,
                                   nda::array<long, 2> const &kpq, kmesh_ft const &kft,
-                                  WqFn &&Wq, cplx scale, nda::array<cplx, 3> const &F,
-                                  nda::array<cplx, 3> &out, long nb) {
+                                  WqFn &&Wq, cplx scale, nda::MemoryArrayOfRank<3> auto const &F,
+                                  nda::MemoryArrayOfRank<3> auto &&out, long nb) {
       decltype(nda::range::all) all;
       const long nk = F.shape(0), nc2 = F.shape(1), nR = F.shape(2), Nm = Xb.shape(2);
       const long nc = Xb.shape(3), nq = kft.Uq.shape(1);
@@ -348,10 +353,13 @@ namespace solvers {
       if (kft.fft) {
         const int nd[3] = {kft.ndim[0], kft.ndim[1], kft.ndim[2]};
         const int Mw = int(Nm * Nm), My = int(M);
-        plan_w = math::fft::impl::host::create_plan_many_impl_(3, nd, Mw, Wall.data(), nd, Mw, 1, Ah.data(), nd, Mw, 1,
-                                                                math::fft::FFT_ESTIMATE);
-        plan_y = math::fft::impl::host::create_plan_many_impl_(3, nd, My, Yk.data(), nd, My, 1, Yh.data(), nd, My, 1,
-                                                                math::fft::FFT_ESTIMATE);
+#pragma omp critical(coqui_dynbse_fftw_plan)
+        {   // FFTW planning is not thread-safe (execution is): the tau nodes run in parallel
+          plan_w = math::fft::impl::host::create_plan_many_impl_(3, nd, Mw, Wall.data(), nd, Mw, 1, Ah.data(), nd, Mw, 1,
+                                                                  math::fft::FFT_ESTIMATE);
+          plan_y = math::fft::impl::host::create_plan_many_impl_(3, nd, My, Yk.data(), nd, My, 1, Yh.data(), nd, My, 1,
+                                                                  math::fft::FFT_ESTIMATE);
+        }
         math::fft::impl::host::invfft(plan_w, Wall.data(), Ah.data());     // A(R) = sum_q e^{+i q.R} W(q)
       } else
 #endif
@@ -412,8 +420,11 @@ namespace solvers {
       }
 #if defined(ENABLE_FFTW)
       if (kft.fft) {
-        math::fft::impl::host::destroy_plan(plan_w);
-        math::fft::impl::host::destroy_plan(plan_y);
+#pragma omp critical(coqui_dynbse_fftw_plan)
+        {
+          math::fft::impl::host::destroy_plan(plan_w);
+          math::fft::impl::host::destroy_plan(plan_y);
+        }
       }
 #endif
     }
@@ -649,10 +660,14 @@ namespace solvers {
         app_log(2, "  [dynbse] rung k-sum: {} (mesh transform check {:.2e})",
                 use_ft ? (kft.fft ? "mesh FFT (FFTW)" : "dense mesh Fourier transform") : "direct", kft.check);
       if (met) met->ksum_ft = use_ft;
-      auto rung_apply = [&](auto &&Wfn, cplx sc, nda::array<cplx, 3> const &Fin, nda::array<cplx, 3> &Oout, long is_, long iq_) {
+      auto rung_apply = [&](auto &&Wfn, cplx sc, auto const &Fin, auto &&Oout, long is_, long iq_) {
         if (use_ft) thc_rung_apply_ft(Xb, is_, iq_, kpq, kft, Wfn, sc, Fin, Oout, nb);
         else thc_rung_apply(Xb, is_, iq_, kpq, qx_of, Wfn, sc, Fin, Oout, nb);
       };
+      // host threads (the omp_threads knob; the global OMP_NUM_THREADS stays 1 per the T-3b contract): the
+      // tau nodes of a rung application are independent; the body holds no MPI, no HDF5, no shared writes
+      // (each tau writes its own Ys slice; the rung buffers are per call)
+      const long nthr = std::max(1l, utils::omp_threads());
       nda::array<cplx, 2> Kbig(D, D), Ks(D, D);
       nda::array<cplx, 3> Cb_k(nk, nc2, nc2);
       nda::array<cplx, 4> Dc(nk, nc, nc, Nm);
@@ -683,10 +698,50 @@ namespace solvers {
       }
       const long nql = long(qlist.size());
       // the parallel unit is (s, q, nu) [2026-09-12]: with a long nu list and few transfers (the eps cuts)
-      // the former (s, q) units left most ranks idle; the per-(s, q) setup below is cheap next to a solve
-      for (long u = rank; u < ns * nql * nnu; u += nproc) {
+      // the former (s, q) units left most ranks idle; the per-(s, q) setup below is cheap next to a solve.
+      // Scheduling [2026-09-13]: with opt.sched_comm the units are handed out through a shared counter
+      // (MPI_Fetch_and_op on rank 0's window) in LONGEST-FIRST order -- the nu != 0 (union-grid) units,
+      // highest node first, then nu = 0 -- so the tail is one unit long instead of one round; without
+      // it the static round-robin of before (bitwise the same unit list).
+      const long nunits_all = ns * nql * nnu;
+      std::vector<long> order(static_cast<size_t>(nunits_all), 0l);
+      for (long u = 0; u < nunits_all; ++u) order[size_t(u)] = u;
+      std::stable_sort(order.begin(), order.end(), [&](long a, long b) {
+        const long ja = a % nnu, jb = b % nnu;
+        const bool za = (nu_list[size_t(ja)] == tools.m0), zb = (nu_list[size_t(jb)] == tools.m0);
+        if (za != zb) return zb;                          // nu != 0 before nu = 0
+        return nu_list[size_t(ja)] > nu_list[size_t(jb)]; // then the higher node first
+      });
+      const bool dyn_sched = (opt.sched_comm != MPI_COMM_NULL);
+      MPI_Win win = MPI_WIN_NULL;
+      long *counter = nullptr;
+      if (dyn_sched) {
+        MPI_Win_allocate((rank == 0) ? sizeof(long) : 0, sizeof(long), MPI_INFO_NULL, opt.sched_comm, &counter, &win);
+        if (rank == 0) *counter = 0;
+        MPI_Win_fence(0, win);
+      }
+      auto next_unit = [&](long &pos) -> long {   // returns the unit index, or -1 when the list is exhausted
+        if (dyn_sched) {
+          const long one = 1;
+          long got = 0;
+          MPI_Win_lock(MPI_LOCK_SHARED, 0, 0, win);
+          MPI_Fetch_and_op(&one, &got, MPI_LONG, 0, 0, MPI_SUM, win);
+          MPI_Win_unlock(0, win);
+          return (got < nunits_all) ? order[size_t(got)] : -1;
+        }
+        const long u = pos;
+        pos += nproc;
+        return (u < nunits_all) ? u : -1;
+      };
+      long pos = rank;
+      long units_taken = 0;
+      for (long u = next_unit(pos); u >= 0; u = next_unit(pos)) {
+        ++units_taken;
         const long sq = u / nnu, jn_unit = u % nnu;
         const long is = sq / nql, iq = qlist[size_t(sq % nql)];
+        if (rank == 0)
+          app_log(2, "  [dynbse] rank 0 takes unit {} (s {}, q {}, nu node {}), its {}-th{}", u, is, iq,
+                  nu_list[size_t(jn_unit)], units_taken, dyn_sched ? " (dynamic scheduling)" : "");
         // ---- the legs and the static rung of this unit ------------------------------------------
         for (long k = 0; k < nk; ++k) {
           const long kq = kpq(iq, k);
@@ -716,7 +771,7 @@ namespace solvers {
           const long nR = F.nR;           // the RHS block width of this solve
           utils::check(nR == nR_cur and y.nR == nR and Fsum.shape(3) == nR, "pair_space_ladder_dyn: kd block width mismatch.");
           const bool nu0 = (inu_cur == cplx(0.0));
-          const bool dbg = (rank == 0 and u == 0);
+          const bool dbg = (rank == 0 and units_taken == 1);
           auto nrm = [](auto const &A) { double n = 0.0; for (auto const &v : A) n += std::norm(v); return std::sqrt(n); };
           if (dbg)
             app_log(2, "  [dynbse dbg] kd call {}: |F fam0| {:.3e} |F fam1| {:.3e} |F cst| {:.3e} |Fsum| {:.3e}",
@@ -740,10 +795,11 @@ namespace solvers {
                 for (long p = 0; p < np; ++p) KFc(i, p) = cplx((ff == 1 and nu0) ? b.KF2(i, p) : b.KF(i, p));
               nda::blas::gemm(cplx(1.0), KFc, famc, cplx(1.0), Fs2);
             }
+#pragma omp parallel for schedule(dynamic, 1) num_threads(nthr)
             for (long i = 0; i < nt; ++i) {
-              Fs3() = Fs(i, all, all, all);
-              rung_apply(Wq_s(i), scale_k, Fs3, Os3, is, iq);
-              Ys(i, all, all, all) = Os3;
+              auto Fi = Fs(i, all, all, all);
+              auto Oi = Ys(i, all, all, all);
+              rung_apply(Wq_s(i), scale_k, Fi, Oi, is, iq);
             }
             auto Ys2 = nda::reshape(Ys, std::array<long, 2>{nt, nk * nc2 * nR});
             Yc2() = Ys2;
@@ -785,7 +841,7 @@ namespace solvers {
             stab.emplace(db::build_shift_tables(b, inu));
             stp = std::addressof(stab.value());
             if (met) met->dsq_err = std::max(met->dsq_err, stab->fit_err);
-            if (rank == 0 and u == 0)
+            if (rank == 0 and units_taken == 1)
               app_log(2, "  [dynbse] shift tables at nu node {} (inu = {:.4e}i): fit err {:.3e}, kept condition {:.3e}",
                       m, inu.imag(), stab->fit_err, stab->cond_kept);
           }
@@ -868,7 +924,7 @@ namespace solvers {
           res.readout_converged = rconv_unit;
           res.contraction = ritz_unit;
           res.fit_err_max = refit_unit;
-          if (rank == 0 and u == 0) {
+          if (rank == 0 and units_taken == 1) {
             std::string hist;
             for (double h : res.history) {
               char buf[32];
@@ -900,6 +956,10 @@ namespace solvers {
             met->rss_max_gb = std::max(met->rss_max_gb, vertex_ladder_detail::prof_rss_gb());
           }
         }
+      }
+      if (dyn_sched) {
+        MPI_Win_fence(0, win);
+        MPI_Win_free(&win);
       }
     }
 
@@ -1367,6 +1427,8 @@ namespace solvers {
     o.kcrys = std::addressof(kc);
     o.tol = _dyn_tol; o.maxit = _dyn_maxit; o.gmres_m = _dyn_gmres; o.sign_ks = _dyn_sign;
     o.rhs_block = _dyn_rhs_block;
+    o.sched_comm = mpi->comm.get();      // dynamic longest-first scheduling of the (s, q, nu) units
+    o.readout_tol = 1e-6;                // the physical readout's own stop (the 1e-8 residual is below the refit floor)
     // D3/D4 configuration at inu = 0: the shared aux grid with the Dsq/Dcb tables, no mask (the
     // union grid / in-gap mask / twisted-pair basis are the inu != 0 machinery of D2e, still open)
     vd::dyn_meter met;
@@ -1451,6 +1513,7 @@ namespace solvers {
     o.kcrys = std::addressof(kc);
     o.tol = _dyn_tol; o.maxit = _dyn_maxit; o.gmres_m = std::max<long>(_dyn_gmres, 12); o.sign_ks = _dyn_sign;
     o.rhs_block = _dyn_rhs_block;
+    o.sched_comm = mpi->comm.get();      // dynamic longest-first scheduling of the (s, q, nu) units
     o.union_nodes = true;
     // NO in-gap mask: the symmetric |eps| < 0.45 gap mask is centered at mu, not on the gap, and on
     // lih222 it removed the nodes the occupied top (0.027 Ha) needs (G pole fit 2.5e-1). The union
