@@ -1671,6 +1671,9 @@ namespace solvers {
     // lih222 it removed the nodes the occupied top (0.027 Ha) needs (G pole fit 2.5e-1). The union
     // grid without a mask represents G to the node_pole_fit class; GMRES(>= 12) handles the rest.
     o.gap_mask = 0.0;
+    // EXPERIMENT (small-nu spurious mode): COQUI_DYNBSE_UNION=0 runs the cut on the SHARED node set
+    // (exact confluent algebra + the twisted R1/R3 tables) instead of the union grid.
+    if (char const *e = std::getenv("COQUI_DYNBSE_UNION")) o.union_nodes = (std::atoi(e) != 0);
     o.readout_tol = 1e-6;
     o.q_subset = std::addressof(qsel);
     vd::dyn_meter met;

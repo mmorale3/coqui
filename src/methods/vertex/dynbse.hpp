@@ -217,6 +217,28 @@ namespace dynbse {
         KF2(i, a) = -KF(i, a) * (b.s(i) - b.beta * b.fd[size_t(a)].f);
       }
     }
+    // the double / triple-pole re-expansions of the EXTENSION nodes on the DLR set (same closed-form
+    // tau functions as build_freq_basis, fitted on the vertex pole fit): used by the small-nu fold of
+    // the twisted family (T_a -> U_a^2 - i nu U_a^3 for |eps_a| >> |nu|); a confluent product on an
+    // extension node remains an error.
+    if (ne > 0) {
+      nda::array<cplx, 2> F2e(b.nt, ne), F3e(b.nt, ne);
+      for (long e = 0; e < ne; ++e) {
+        const long a = np0 + e;
+        for (long i = 0; i < b.nt; ++i) {
+          const double u = b.s(i) - b.beta * b.fd[size_t(a)].f;
+          F2e(i, e) = cplx(-KF(i, a) * u);
+          F3e(i, e) = cplx(0.5 * KF(i, a) * (u * u + b.beta * b.fd[size_t(a)].f1));
+        }
+      }
+      auto c2e = b.pf.coeffs(F2e);   // (np0, ne)
+      auto c3e = b.pf.coeffs(F3e);
+      for (long e = 0; e < ne; ++e)
+        for (long cc = 0; cc < np0; ++cc) {
+          Dsq(np0 + e, cc) = c2e(cc, e);
+          Dcb(np0 + e, cc) = c3e(cc, e);
+        }
+    }
     b.np = np1;
     b.eps = std::move(eps);
     b.fhalf = std::move(fhalf);
@@ -664,13 +686,21 @@ namespace dynbse {
     const long ncol = 2 * npf;
     nda::array<cplx, 2> A(ntau, ncol);
     nda::array<double, 1> cn(ncol);
+    // EXPERIMENT (small-nu spurious mode): keep the twisted column T_c only when |eps_c| <= ratio |nu|
+    // (for |eps_c| >> |nu| the twist is invisible on K_F's support and T_c ~ -s K_F(eps_c) lies in the
+    // U span to the DLR class); env COQUI_DYNBSE_TKEEP = ratio, unset / 0 = keep all.
+    double tkeep = 0.0;
+    if (char const *e = std::getenv("COQUI_DYNBSE_TKEEP")) tkeep = std::atof(e);
+    long n_tkept = 0;
     for (long c = 0; c < npf; ++c) {
+      const bool keep_t = (tkeep <= 0.0) or (std::abs(b.eps(c)) <= tkeep * std::abs(inu));
+      if (keep_t) ++n_tkept;
       double n1 = 0.0, n2 = 0.0;
       for (long i = 0; i < ntau; ++i) {
         const double kf = imag_axes_ft::dlr_kF(beta, ss[size_t(i)], b.eps(c));
         const cplx ph = phi_nu(inu, ss[size_t(i)]);
         A(i, c) = cplx(kf);
-        A(i, npf + c) = cplx(kf) * ph;
+        A(i, npf + c) = keep_t ? cplx(kf) * ph : cplx(0.0);
         n1 += kf * kf;
         n2 += std::norm(A(i, npf + c));
       }
@@ -699,6 +729,9 @@ namespace dynbse {
     while (nk < ms and sig(nk) > rtol * sig(0)) ++nk;
     utils::check(nk > 0, "dynbse::build_shift_tables: no singular direction kept.");
     st.cond_kept = sig(0) / sig(nk - 1);
+    if (tkeep > 0.0)
+      app_log(2, "  [dynbse shift tables] inu = {:.4e}i: T columns kept {} of {} (|eps_c| <= {} |nu|), kept condition {:.3e}",
+              inu.imag(), n_tkept, npf, tkeep, st.cond_kept);
     // ---- targets: t1_j = K_F psi, t3_j = K_F (2 xi - s psi), j < np_fit; solve, unscale --------
     st.R1U = nda::array<cplx, 2>(np, np); st.R1T = nda::array<cplx, 2>(np, np);
     st.R3U = nda::array<cplx, 2>(np, np); st.R3T = nda::array<cplx, 2>(np, np);
@@ -764,6 +797,8 @@ namespace dynbse {
     F.zero();
     Fsum() = cplx(0.0);
     const long ncomp = 1 + 2 * np;
+    double tfold = 0.0;
+    if (char const *e = std::getenv("COQUI_DYNBSE_TFOLD")) tfold = std::atof(e);
 #pragma omp parallel for schedule(dynamic, 1) num_threads(utils::omp_threads())
     for (long ik = 0; ik < nk; ++ik) {
       nda::array<cplx, 3> Ghat(ng, nc, nc), Gtil(ng, nc, nc);
@@ -994,6 +1029,25 @@ namespace dynbse {
           }
         }
       }
+      // EXPERIMENT (small-nu spurious mode): fold the twisted components T_a of the DLR nodes with
+      // |eps_a| >= ratio |nu| back into the U family through T_a = U_a^2 - i nu U_a^3 + O((nu/eps_a)^2)
+      // (Dsq / Dcb re-expansions); env COQUI_DYNBSE_TFOLD = ratio, unset / 0 = off. The frequency sums
+      // are untouched (T sums to 0 exactly; they were accumulated from the product form).
+      if (tfold > 0.0)
+        for (long a = 0; a < np; ++a) {                 // DLR and extension nodes (both carry Dsq / Dcb rows)
+          if (std::abs(b.eps(a)) < tfold * std::abs(inu)) continue;
+          for (long x = 0; x < nc; ++x)
+            for (long y = 0; y < nc; ++y)
+              for (long r = 0; r < nR; ++r) {
+                const cplx t = F.fam(1, a, ik, x, y, r);
+                if (t == cplx(0.0)) continue;
+                for (long c = 0; c < np; ++c) {
+                  const cplx dc = b.Dsq(a, c) - inu * b.Dcb(a, c);
+                  if (dc != cplx(0.0)) F.fam(0, c, ik, x, y, r) += dc * t;
+                }
+                F.fam(1, a, ik, x, y, r) = cplx(0.0);
+              }
+        }
       if (Cb_cst != nullptr and anyc)
         for (long r = 0; r < nR; ++r)
           for (long p = 0; p < nc2; ++p) {
@@ -2433,6 +2487,10 @@ namespace dynbse {
     long it = 0;
     bool done = false;
     double ritz_max = 0.0;
+    const bool ritz_prof = (std::getenv("COQUI_DYNBSE_RITZ") != nullptr);
+    double ritz_best = -1.0;
+    long c_best = -1, n_best = 0;
+    nda::array<cplx, 1> v_best;
     // the readout of the current iterate (the physical observable D^dag sum_iw L0 Gamma): a
     // convergence criterion blind to the readout-invisible modes of the iteration
     nda::array<cplx, 2> Pprev(nR, nR);
@@ -2469,6 +2527,7 @@ namespace dynbse {
       V[0].fam() = r.fam; V[0].cst() = r.cst;
       tf_scale(sc, V[0]);
       H() = cplx(0.0);
+      ritz_best = -1.0; c_best = -1;
       long jdone = 0;
       for (long j = 0; j < m; ++j) {
         apply_A(V[size_t(j)], w);
@@ -2560,10 +2619,52 @@ namespace dynbse {
             if (lam <= 0.0) break;
             for (long a = 0; a < n; ++a) v(a) = u(a) / lam;
           }
+          if (lam > ritz_best) { ritz_best = lam; c_best = c; v_best = v; n_best = n; }
           ritz_max = std::max(ritz_max, lam);
         }
       }
       out.contraction = ritz_max;
+      if (ritz_prof and c_best >= 0) {
+        // the Ritz vector of the dominant |Ritz(K_d L_s)| in the pair basis: family and node weights
+        nda::array<double, 2> wf(2, np);
+        wf() = 0.0;
+        double wc = 0.0, wt = 0.0;
+        for (long p = 0; p < np; ++p)
+          for (long k = 0; k < nk; ++k)
+            for (long a = 0; a < nc; ++a)
+              for (long bb2 = 0; bb2 < nc; ++bb2) {
+                cplx x0(0.0), x1(0.0);
+                for (long i = 0; i < n_best; ++i) {
+                  x0 += v_best(i) * V[size_t(i)].fam(0, p, k, a, bb2, c_best);
+                  x1 += v_best(i) * V[size_t(i)].fam(1, p, k, a, bb2, c_best);
+                }
+                wf(0, p) += std::norm(x0); wf(1, p) += std::norm(x1);
+              }
+        for (long k = 0; k < nk; ++k)
+          for (long a = 0; a < nc; ++a)
+            for (long bb2 = 0; bb2 < nc; ++bb2) {
+              cplx x(0.0);
+              for (long i = 0; i < n_best; ++i) x += v_best(i) * V[size_t(i)].cst(k, a, bb2, c_best);
+              wc += std::norm(x);
+            }
+        double wu = 0.0;
+        for (long p = 0; p < np; ++p) { wu += wf(0, p); wt += wf(1, p); }
+        const double tot = std::max(wu + wt + wc, 1e-300);
+        std::string top;
+        for (int fam_ = 0; fam_ < 2; ++fam_) {
+          std::vector<long> idx(static_cast<size_t>(np), 0l);
+          for (long p = 0; p < np; ++p) idx[size_t(p)] = p;
+          std::sort(idx.begin(), idx.end(), [&](long x, long y) { return wf(fam_, x) > wf(fam_, y); });
+          top += (fam_ == 0) ? "  U:" : "  T:";
+          for (long t = 0; t < std::min<long>(6, np); ++t) {
+            char buf[64];
+            std::snprintf(buf, sizeof(buf), " (%.3g:%.2f)", b.eps(idx[size_t(t)]), wf(fam_, idx[size_t(t)]) / tot);
+            top += buf;
+          }
+        }
+        app_log(2, "  [dynbse ritz] inu = {:.4e}i cycle {}: dominant |Ritz| {:.3e} (column {}); weights U {:.3f} T {:.3f} cst {:.3f};"
+                   " top nodes (eps:weight){}", inu.imag(), out.history.size(), ritz_best, c_best, wu / tot, wt / tot, wc / tot, top);
+      }
       if (readout_tol > 0.0) {
         auto Pnow = readout_of();
         if (have_prev) {
