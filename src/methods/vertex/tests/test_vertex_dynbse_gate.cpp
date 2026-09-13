@@ -13,6 +13,7 @@
 #undef NDEBUG
 
 #include <cstdlib>
+#include <filesystem>
 #include <cmath>
 #include <complex>
 #include <string>
@@ -140,7 +141,7 @@ namespace bdft_tests {
                                                1e-10, mf->ecutrho(), 1, 1024));
     auto eri = mb_eri_t(thc, thc);
 
-    auto run = [&](std::string const &rung, int niter) {
+    auto run = [&](std::string const &rung, int niter, bool dump = false) {
       solvers::hf_t hf;
       solvers::gw_t gw(&ft, "ignore_g0", output);
       solvers::scr_coulomb_t scr_eri(&ft, "rpa", "ignore_g0");
@@ -152,6 +153,7 @@ namespace bdft_tests {
       vtx.set_ladder_rung(rung, 1e-8, 30, 12, -1.0);
       vtx.set_eps_cut(1, 3);                    // the eps(q_i, i nu) cut report (report-only; q_min and the 3 lowest nodes
                                                 //  for the dynamic columns keep the test short)
+      vtx.set_ladder_dyn_dump(dump);            // per-unit dump / restart files of the dynamic solves
       scr_eri.set_vertex(&vtx);
       auto [e_hf, e_corr] = scf_loop(mb_state, dyson, eri, ft,
                                      solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol,
@@ -167,7 +169,24 @@ namespace bdft_tests {
       return std::make_tuple(e_hf, e_corr, er, el, ed, ritz, cut, eloop);
     };
     auto [h0, c0, r0, l0, d0, z0, cut0, eloop0] = run("static", 2);
-    auto [h1, c1, r1, l1, d1, z1, cut1, eloop1] = run("dynamic", 2);
+    auto [h1, c1, r1, l1, d1, z1, cut1, eloop1] = run("dynamic", 2, true);     // writes the unit dump files
+    auto [h2, c2, r2, l2, d2, z2, cut2, eloop2] = run("dynamic", 2, true);     // loads them: no unit is re-solved
+    {
+      // the restart path: every dynamic column is bitwise what the solving run produced
+      for (int c = 0; c < 4; ++c) REQUIRE(d2[c] == d1[c]);
+      if (mpi_context->comm.root())
+        for (long j = 0; j < cut1.shape(0); ++j)
+          for (int c = 4; c < 8; ++c) REQUIRE(cut2(j, c) == cut1(j, c));
+      mpi_context->comm.barrier();
+      if (mpi_context->comm.root()) {
+        namespace fs = std::filesystem;
+        for (auto const &e : fs::directory_iterator(fs::current_path())) {
+          const std::string fn = e.path().filename().string();
+          if (fn.rfind(output + ".dynunits.", 0) == 0) fs::remove(e.path());
+        }
+      }
+      mpi_context->comm.barrier();
+    }
     // the eps(q_i, i nu) cut (rank 0): node 0 of the q_min cut IS the readout (same rows, same
     // Dyson; the ladder node 0 of the whalf pass vs eval_pol_ladder_nu0 = the node-map class),
     // the loop-side column at node 0 IS the Q3 loop-side value, every node is finite and the

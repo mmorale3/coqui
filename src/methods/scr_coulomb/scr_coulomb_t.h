@@ -303,6 +303,7 @@ namespace solvers {
     std::vector<long> _pol_cut_q;
     std::optional<nda::array<ComplexType, 4>> _pol_pi_cut;
     long _pol_cut_calls = 0;
+    long _pol_dyn_calls = 0;     // readout calls of the dynamic nu = 0 evaluator (the dump generation)
     // the last cut at q_min (= selection 0), rank 0: (nw_half, 8) = {eps_rpa, eps_lad, eps_dlm, eps_loop,
     // then the dynamic-rung columns static / static+dyn1 / Gamma_1 / resummed (-1 unless rung = dynamic)}
     nda::array<double, 2> _pol_eps_cut_qmin;

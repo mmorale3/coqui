@@ -876,6 +876,7 @@ namespace solvers {
     double _dyn_tol = 1e-8, _dyn_sign = -1.0;
     long _dyn_maxit = 30, _dyn_gmres = 12;
     long _dyn_rhs_block = 32;    // pol_vertex_dyn_rhs_block: RHS column block width of the dynamic solves
+    bool _dyn_dump = false;      // pol_vertex_dyn_dump: per-unit dump + restart files of the dynamic solves
     // DIAGNOSTIC (default OFF, not physical): THE CONSTANT-RUNG ABSOLUTE PIN.
     //
     // X^L = pi^dyn - Pi^{C,0}(tau=0) must VANISH when the screening is genuinely static.
@@ -1576,6 +1577,11 @@ namespace solvers {
       _dyn_rhs_block = nb;
     }
     long ladder_dyn_rhs_block() const { return _dyn_rhs_block; }
+    /** pol_vertex_dyn_dump (default false): every finished (s, q, nu) unit of the dynamic solves is appended
+     *  to "<prefix>.dynunits.<tag>.g<call>.r<rank>.bin"; a rerun of the same leg loads them instead of
+     *  re-solving (a walltime kill loses only the units in flight). */
+    void set_ladder_dyn_dump(bool on) { _dyn_dump = on; }
+    bool ladder_dyn_dump() const { return _dyn_dump; }
     double ladder_dyn_sign() const { return _dyn_sign; }
 
     /**
@@ -1760,7 +1766,7 @@ namespace solvers {
       bool all_converged = false;
       double t_total = 0.0, t_solve = 0.0, rss_gb = 0.0;
     };
-    dynbse_nu0_result eval_pol_dynbse_nu0(MBState &mb_state, THC_ERI auto &thc);
+    dynbse_nu0_result eval_pol_dynbse_nu0(MBState &mb_state, THC_ERI auto &thc, long gen = 0);
     /** eps(q_i, i nu) cuts (2026-09-11): the four dynamic-rung columns {static, static + one dynamic
      *  rung, Gamma_1, resummed} on a list of PH-sym bosonic HALF nodes at a subset of transfers,
      *  (4, n_nodes, nq, Nm, Nm) replicated (zeros at transfers outside the subset). The inu != 0
@@ -1774,7 +1780,7 @@ namespace solvers {
       double t_total = 0.0, t_solve = 0.0, rss_gb = 0.0;
     };
     dynbse_cut_result eval_pol_dynbse_cut(MBState &mb_state, THC_ERI auto &thc, std::vector<long> const &half_nodes,
-                                          std::vector<long> const &qsel);
+                                          std::vector<long> const &qsel, long gen = 0);
 
     /**
      * scGW-tilde increment L1 (vertex_ladder.icc): the C-window pair bubble

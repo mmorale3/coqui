@@ -462,6 +462,7 @@ namespace solvers {
     _pol_vtx->set_ladder_rung(_vertex->ladder_rung(), _vertex->ladder_dyn_tol(), _vertex->ladder_dyn_maxit(),
                               _vertex->ladder_dyn_gmres(), _vertex->ladder_dyn_sign());
     _pol_vtx->set_ladder_dyn_rhs_block(_vertex->ladder_dyn_rhs_block());
+    _pol_vtx->set_ladder_dyn_dump(_vertex->ladder_dyn_dump());
     app_log(1, "  [scGW-tilde L2] ladder readout instance: C window = [{}, {}), "
                "secondary rank knob = {}, div_treatment = {} (kernel head follows "
                "build_w0's policy; W0bar is SAME-iteration -- coincides with "
@@ -1184,7 +1185,8 @@ namespace solvers {
     const bool dyn_rung = _pol_vtx->ladder_dynamic_rung();
     std::optional<vertex_t::dynbse_nu0_result> dres;
     if (dyn_rung) {
-      dres.emplace(_pol_vtx->eval_pol_dynbse_nu0(mb_state, thc));
+      ++_pol_dyn_calls;
+      dres.emplace(_pol_vtx->eval_pol_dynbse_nu0(mb_state, thc, _pol_dyn_calls));
       utils::check(dres->Pi_dyn.shape(0) == nq and dres->Pi_dyn.shape(1) == Nm,
                    "pol_ladder_eps_readout: dynamic-rung block shape mismatch.");
       _pol_dyn_ritz = dres->ritz_max;
@@ -1413,7 +1415,7 @@ namespace solvers {
         const long nn = (_vertex->eps_cut_dyn_nnu() > 0) ? std::min(_vertex->eps_cut_dyn_nnu(), nw_half) : nw_half;
         std::vector<long> hn(static_cast<size_t>(nn), 0l);
         for (long j = 0; j < nn; ++j) hn[size_t(j)] = j;
-        dcut.emplace(_pol_vtx->eval_pol_dynbse_cut(mb_state, thc, hn, _pol_cut_q));
+        dcut.emplace(_pol_vtx->eval_pol_dynbse_cut(mb_state, thc, hn, _pol_cut_q, _pol_cut_calls));
         n_dyn_nodes = nn;
       }
       if (thc.mpi()->comm.rank() == 0) {

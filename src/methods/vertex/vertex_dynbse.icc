@@ -35,6 +35,9 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <map>
 #include <optional>
 #include <random>
 #include <string>
@@ -69,6 +72,9 @@ namespace solvers {
       long rhs_block = 0;         // solve the Nm right-hand-side columns in blocks of this width (0 = all at
                                   // once): the Krylov basis (m + 1 tf_vectors of width nR) is the memory
                                   // driver; each block converges to tol independently (differences at tol)
+      std::string dump_prefix;    // when non-empty: every finished unit's four (Nm x Nm) blocks are appended to
+                                  // "<dump_prefix>.r<rank>.bin" and units found in ANY such file at entry are
+                                  // loaded instead of solved (a restart after a walltime kill loses nothing)
       MPI_Comm sched_comm = MPI_COMM_NULL;           // when set: DYNAMIC scheduling of the (s, q, nu) units through
                                                      // a shared task counter (one-sided MPI on rank 0), longest
                                                      // units first; MPI_COMM_NULL = static round-robin
@@ -737,12 +743,54 @@ namespace solvers {
         pos += nproc;
         return (u < nunits_all) ? u : -1;
       };
+      // ---- per-unit dump / restart --------------------------------------------------------------
+      // record: 5 longs {is, iq, m, Nm, 4} + 4 x Nm^2 complex (static, dyn1, gam1, dyn; zeros when not requested)
+      std::map<std::tuple<long, long, long>, std::vector<cplx>> dumped;
+      std::ofstream dump_out;
+      if (not opt.dump_prefix.empty()) {
+        namespace fs = std::filesystem;
+        const fs::path pfx(opt.dump_prefix);
+        const std::string stem = pfx.filename().string() + ".r";
+        const fs::path dir = pfx.parent_path().empty() ? fs::path(".") : pfx.parent_path();
+        long nrec = 0;
+        if (fs::exists(dir))
+          for (auto const &e : fs::directory_iterator(dir)) {
+            const std::string fn = e.path().filename().string();
+            if (fn.rfind(stem, 0) != 0 or fn.size() < stem.size() + 4 or fn.substr(fn.size() - 4) != ".bin") continue;
+            std::ifstream in(e.path(), std::ios::binary);
+            while (in) {
+              long hdr[5];
+              if (not in.read(reinterpret_cast<char *>(hdr), sizeof(hdr))) break;
+              if (hdr[3] != Nm or hdr[4] != 4) break;
+              std::vector<cplx> blk(static_cast<size_t>(4 * Nm * Nm));
+              if (not in.read(reinterpret_cast<char *>(blk.data()), std::streamsize(blk.size() * sizeof(cplx)))) break;
+              dumped[std::make_tuple(hdr[0], hdr[1], hdr[2])] = std::move(blk);
+              ++nrec;
+            }
+          }
+        if (rank == 0)
+          app_log(1, "  [dynbse] unit dump \"{}.r*.bin\": {} finished units found (loaded, not re-solved)", opt.dump_prefix, nrec);
+        dump_out.open(opt.dump_prefix + ".r" + std::to_string(rank) + ".bin", std::ios::binary | std::ios::app);
+      }
       long pos = rank;
       long units_taken = 0;
       for (long u = next_unit(pos); u >= 0; u = next_unit(pos)) {
         ++units_taken;
         const long sq = u / nnu, jn_unit = u % nnu;
         const long is = sq / nql, iq = qlist[size_t(sq % nql)];
+        if (not dumped.empty()) {
+          auto it_d = dumped.find(std::make_tuple(is, iq, nu_list[size_t(jn_unit)]));
+          if (it_d != dumped.end()) {
+            auto const &blk = it_d->second;
+            nda::array<cplx, 4> *outs[4] = {Pi_static, Pi_dyn1, Pi_gam1, Pi_dyn};
+            for (int c = 0; c < 4; ++c)
+              if (outs[c] != nullptr)
+                for (long M = 0; M < Nm; ++M)
+                  for (long N = 0; N < Nm; ++N) (*outs[c])(jn_unit, iq, M, N) = blk[size_t((c * Nm + M) * Nm + N)];
+            if (met) { ++met->nunits; ++met->nconv; }
+            continue;
+          }
+        }
         if (rank == 0)
           app_log(2, "  [dynbse] rank 0 takes unit {} (s {}, q {}, nu node {}), its {}-th{}", u, is, iq,
                   nu_list[size_t(jn_unit)], units_taken, dyn_sched ? " (dynamic scheduling)" : "");
@@ -930,6 +978,18 @@ namespace solvers {
               readout(res.Gsum1, Pi_gam1);
               readout(res.Gsum, Pi_dyn);
             }
+          }
+          if (dump_out.is_open()) {
+            const long hdr[5] = {is, iq, m, Nm, 4};
+            dump_out.write(reinterpret_cast<char const *>(hdr), sizeof(hdr));
+            nda::array<cplx, 4> *outs[4] = {Pi_static, Pi_dyn1, Pi_gam1, Pi_dyn};
+            std::vector<cplx> blk(static_cast<size_t>(4 * Nm * Nm), cplx(0.0));
+            for (int c = 0; c < 4; ++c)
+              if (outs[c] != nullptr)
+                for (long M = 0; M < Nm; ++M)
+                  for (long N = 0; N < Nm; ++N) blk[size_t((c * Nm + M) * Nm + N)] = (*outs[c])(jn, iq, M, N);
+            dump_out.write(reinterpret_cast<char const *>(blk.data()), std::streamsize(blk.size() * sizeof(cplx)));
+            dump_out.flush();
           }
           res.iterations = it_unit;
           res.converged = conv_unit;
@@ -1411,7 +1471,7 @@ namespace solvers {
     return d;
   }
 
-  vertex_t::dynbse_nu0_result vertex_t::eval_pol_dynbse_nu0(MBState &mb_state, THC_ERI auto &thc) {
+  vertex_t::dynbse_nu0_result vertex_t::eval_pol_dynbse_nu0(MBState &mb_state, THC_ERI auto &thc, long gen) {
     decltype(nda::range::all) all;
     namespace vd = vertex_dynbse_detail;
     vertex_ladder_detail::prof_watch twatch;
@@ -1442,6 +1502,7 @@ namespace solvers {
     o.rhs_block = _dyn_rhs_block;
     o.sched_comm = mpi->comm.get();      // dynamic longest-first scheduling of the (s, q, nu) units
     o.readout_tol = 1e-6;                // the physical readout's own stop (the 1e-8 residual is below the refit floor)
+    if (_dyn_dump) o.dump_prefix = mb_state.coqui_prefix + ".dynunits.nu0.g" + std::to_string(gen);
     // D3/D4 configuration at inu = 0: the shared aux grid with the Dsq/Dcb tables, no mask (the
     // union grid / in-gap mask / twisted-pair basis are the inu != 0 machinery of D2e, still open)
     vd::dyn_meter met;
@@ -1451,6 +1512,7 @@ namespace solvers {
     {
       vd::dyn_opts o1 = o;
       o1.one_rung_only = true;
+      if (_dyn_dump) o1.dump_prefix = mb_state.coqui_prefix + ".dynunits.nu0r1.g" + std::to_string(gen);
       vd::dyn_meter met1;
       vd::pair_space_ladder_dyn(G_CC, _Xb_skma, _W0b_qmm.value(), _Wb_qwmm.value(), kmq, kpq, tools, nu0,
                                 nullptr, &P1, nullptr, nullptr, mpi->comm.rank(), mpi->comm.size(), o1, &met1);
@@ -1497,7 +1559,7 @@ namespace solvers {
    */
   vertex_t::dynbse_cut_result vertex_t::eval_pol_dynbse_cut(MBState &mb_state, THC_ERI auto &thc,
                                                             std::vector<long> const &half_nodes,
-                                                            std::vector<long> const &qsel) {
+                                                            std::vector<long> const &qsel, long gen) {
     decltype(nda::range::all) all;
     namespace vd = vertex_dynbse_detail;
     vertex_ladder_detail::prof_watch twatch;
@@ -1531,6 +1593,7 @@ namespace solvers {
     o.tol = _dyn_tol; o.maxit = _dyn_maxit; o.gmres_m = std::max<long>(_dyn_gmres, 12); o.sign_ks = _dyn_sign;
     o.rhs_block = _dyn_rhs_block;
     o.sched_comm = mpi->comm.get();      // dynamic longest-first scheduling of the (s, q, nu) units
+    if (_dyn_dump) o.dump_prefix = mb_state.coqui_prefix + ".dynunits.cut.g" + std::to_string(gen);
     o.union_nodes = true;
     // NO in-gap mask: the symmetric |eps| < 0.45 gap mask is centered at mu, not on the gap, and on
     // lih222 it removed the nodes the occupied top (0.027 Ha) needs (G pole fit 2.5e-1). The union
@@ -1544,6 +1607,7 @@ namespace solvers {
     {
       vd::dyn_opts o1 = o;
       o1.one_rung_only = true;
+      if (_dyn_dump) o1.dump_prefix = mb_state.coqui_prefix + ".dynunits.cutr1.g" + std::to_string(gen);
       vd::dyn_meter met1;
       vd::pair_space_ladder_dyn(G_CC, _Xb_skma, _W0b_qmm.value(), _Wb_qwmm.value(), kmq, kpq, tools, nus,
                                 nullptr, &P1, nullptr, nullptr, mpi->comm.rank(), mpi->comm.size(), o1, &met1);
