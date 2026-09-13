@@ -4210,92 +4210,92 @@ namespace solvers {
     // Identical arithmetic to the legacy fold-at-consumption path (eval_Pi_C):
     // augment BEFORE tau_to_w_PHsym, per-q transform on the same (nt_half, Np, Np)
     // tau-storage slices.
-    nda::array<ComplexType, 4> W_wq(nqpts_ibz, nw_half, Np, Np);
+    // ---- MEMORY-LEAN per-q pipeline (2026-09-13) ------------------------------------------
+    // The former path gathered the FULL dW into a replicated tau slab (nq x nt_half x Np^2)
+    // and a replicated omega slab (nq x nw_half x Np^2): 2 x 11 GB per rank on Si 4^3 (Np = 738),
+    // which capped a genoa node at 32 ranks (the dynamic readout OOM-killed at 96). The
+    // transform and the fold were already per q on one rank each; now every q slice is
+    // gathered on its own (gather_dW_one_q: bit-identical to slicing the replicated
+    // array), transformed, folded and dropped, so only ONE q of tau- and omega-domain W is
+    // alive per rank. Same values, same per-q reductions -> bit-identical W-bar.
+    const bool eta_diag = (ns * nkpts * nc * nc <= 4096);
+    const long lpos0 = std::max(tools.m0, tools.w_mirror_b(tools.m0)) - nw_b / 2;
+    const long lposm = std::max(nw_b - 1, tools.w_mirror_b(nw_b - 1)) - nw_b / 2;
+    // the two omega slices the eta diagnostic reads, for every q (replicated, small)
+    nda::array<ComplexType, 4> W_diag(eta_diag ? nqpts_ibz : 0, 2, eta_diag ? Np : 0, eta_diag ? Np : 0);
+    if (eta_diag) W_diag() = ComplexType(0.0);
+    _Wb_qwmm.emplace(nda::array<ComplexType, 4>(nqpts_ibz, nw_half, _Nm, _Nm));
+    _Wb_qwmm.value()() = ComplexType(0.0);
     {
-      // M1 item #1: gather the RPA-grid dW into the replicated tau slab (bit-identical).
-      nda::array<ComplexType, 4> W_qtPQ = vertex_redist_detail::gather_dW_replicated(
-          mb_state.dW_qtPQ.value(), mpi->comm, nqpts_ibz, nt_half, Np);
-
-      if (head_ok) {
-        if (_bl_head_static_all and _rung == linear_rung) {
-          // H1 (see _bl_head_static_all): the cached B-L rung must be analytic-head-free
-          // in its dynamic part, exactly like eval_Sigma_C's Wt_qtPQ -- the static-weight
-          // head rides the instantaneous slot at the consumer.
-          app_log(1, "  cache_w head insertion [H1 STATIC]: dynamic piece SKIPPED for the "
-                     "cached B-L rung (dW is analytic-head-free).");
-        } else if (mb_state.eps_inv_head.has_value()) {
-          auto& eps = mb_state.eps_inv_head.value();
-          utils::check(eps.shape(0) == nt_half,
-                       "vertex_t::cache_w: eps_inv_head size {} != nt_half = {}.",
-                       eps.shape(0), nt_half);
-          for (long it = 0; it < nt_half; ++it)
-            W_qtPQ(iq_gamma, it, all, all) += ComplexType(eps(it).real()) * H_PQ;
-          app_log(1, "  cache_w head insertion: dynamic piece applied to dW(Gamma, tau) "
-                     "with eps_inv_head(tau=0) = {}\n"
-                     "  (SAME-iteration eps_inv_head, captured at fill time)",
-                  eps(0).real());
-        } else {
-          app_log(1, "  [WARNING] cache_w: dW is present but eps_inv_head is not in "
-                     "MBState -- the DYNAMIC head\n"
-                     "            piece is skipped for the cached rung.");
+      bool head_logged = false;
+      nda::array<ComplexType, 3> W_w(nw_half, Np, Np);
+      nda::array<ComplexType, 2> tmp(_Nm, Np);
+      long my_nfold = 0;
+      for (long iq = 0; iq < nqpts_ibz; ++iq) {
+        // the collective per-q gather (every rank participates; the owner keeps the slab)
+        nda::array<ComplexType, 3> W_t = vertex_redist_detail::gather_dW_one_q(
+            mb_state.dW_qtPQ.value(), mpi->comm, iq, nt_half, Np);
+        if (iq % mpi->comm.size() != mpi->comm.rank()) continue;
+        ++my_nfold;
+        if (head_ok and iq == iq_gamma) {
+          if (_bl_head_static_all and _rung == linear_rung) {
+            // H1 (see _bl_head_static_all): the cached B-L rung must be analytic-head-free
+            // in its dynamic part, exactly like eval_Sigma_C's Wt_qtPQ -- the static-weight
+            // head rides the instantaneous slot at the consumer.
+            app_log(1, "  cache_w head insertion [H1 STATIC]: dynamic piece SKIPPED for the "
+                       "cached B-L rung (dW is analytic-head-free).");
+          } else if (mb_state.eps_inv_head.has_value()) {
+            auto& eps = mb_state.eps_inv_head.value();
+            utils::check(eps.shape(0) == nt_half,
+                         "vertex_t::cache_w: eps_inv_head size {} != nt_half = {}.",
+                         eps.shape(0), nt_half);
+            for (long it = 0; it < nt_half; ++it)
+              W_t(it, all, all) += ComplexType(eps(it).real()) * H_PQ;
+            app_log(1, "  cache_w head insertion: dynamic piece applied to dW(Gamma, tau) "
+                       "with eps_inv_head(tau=0) = {}\n"
+                       "  (SAME-iteration eps_inv_head, captured at fill time)",
+                    eps(0).real());
+          } else {
+            app_log(1, "  [WARNING] cache_w: dW is present but eps_inv_head is not in "
+                       "MBState -- the DYNAMIC head\n"
+                       "            piece is skipped for the cached rung.");
+          }
+          head_logged = true;
         }
-      }
-
-      // M3 item #7 (notes/vertex_parallelization_M3.md): the per-q tau_to_w_PHsym
-      // transform was SERIAL AND REDUNDANT on every rank. Distribute over mpi->comm
-      // (each rank transforms its q subset), then GATHER W_wq (zero-init + all_reduce =
-      // exact partition gather; the eta diagnostic below reads the full-q W_wq). The fold
-      // is likewise distributed below. Per-rank transform+fold WORK drops ~1/P.
-      W_wq() = ComplexType(0.0);
-      for (long iq = mpi->comm.rank(); iq < nqpts_ibz; iq += mpi->comm.size()) {
-        auto W_t = W_qtPQ(iq, nda::ellipsis{});
-        auto W_w = W_wq(iq, nda::ellipsis{});
+        // tau -> omega on the PH-sym half mesh (per q, on its owner: the same call as before)
         _ft->tau_to_w_PHsym(W_t, W_w);
+        if (eta_diag) {
+          W_diag(iq, 0, all, all) = W_w(lpos0, all, all);
+          W_diag(iq, 1, all, all) = W_w(lposm, all, all);
+        }
+        // fold on the half mesh: Wbar(q, nu) = t(q) Wdyn(q, nu) t(q)^dag (same fold_core gemms)
+        auto t_q = _t_qmP(iq, all, all);
+        for (long lp = 0; lp < nw_half; ++lp)
+          vertex_secondary_detail::fold_core(t_q, W_w(lp, all, all), tmp,
+                                             _Wb_qwmm.value()(iq, lp, all, all));
       }
-      mpi->comm.all_reduce_in_place_n(W_wq.data(), W_wq.size(), std::plus<>{});
+      (void)head_logged;
+      // exact partition gathers (zero-padded all_reduce): bit-identical
+      mpi->comm.all_reduce_in_place_n(_Wb_qwmm.value().data(), _Wb_qwmm.value().size(),
+                                      std::plus<>{});
+      if (eta_diag) mpi->comm.all_reduce_in_place_n(W_diag.data(), W_diag.size(), std::plus<>{});
+      const long total_fold = mpi->comm.all_reduce_value(my_nfold, std::plus<>{});
+      app_log(2, "  Refinement 2 W-bar fold distributed over {} ranks: this rank folded "
+                 "{} of {} q-points (~1/P work; one q of W alive per rank).", mpi->comm.size(), my_nfold,
+              total_fold);
     }
 
     // ---- eta(q) diagnostics on the rung ACTUALLY cached (test-scale gate) ------------
-    // (moved here from the consumption site: the global-basis Wdyn no longer exists
-    //  at eval time in the cached mode; same labels/slices as before)
-    if (ns * nkpts * nc * nc <= 4096) {
-      const long lpos0 = std::max(tools.m0, tools.w_mirror_b(tools.m0)) - nw_b / 2;
-      const long lposm = std::max(nw_b - 1, tools.w_mirror_b(nw_b - 1)) - nw_b / 2;
+    if (eta_diag) {
       vertex_secondary_detail::eta_max_over_q(
           "dW(nu_0)", X_glob, orb0_glob, nc, _Xb_skma, _t_qmP, kmq,
-          [&](long iq) { return W_wq(iq, lpos0, all, all); });
+          [&](long iq) { return W_diag(iq, 0, all, all); });
       vertex_secondary_detail::eta_max_over_q(
           "dW(nu_max)", X_glob, orb0_glob, nc, _Xb_skma, _t_qmP, kmq,
-          [&](long iq) { return W_wq(iq, lposm, all, all); });
+          [&](long iq) { return W_diag(iq, 1, all, all); });
     } else {
       app_log(2, "  Refinement 2: eta diagnostic skipped (N_pair = {} > 4096).",
               ns * nkpts * nc * nc);
-    }
-
-    // ---- fold on the half mesh: Wbar(q, nu) = t(q) Wdyn(q, nu) t(q)^dag --------------
-    // (same fold_core gemms on the same values as the legacy full-mesh fold; the
-    //  mirrored nu points are pure copies, reconstructed at consumption)
-    _Wb_qwmm.emplace(nda::array<ComplexType, 4>(nqpts_ibz, nw_half, _Nm, _Nm));
-    {
-      // M3 item #7: distribute the per-q fold over mpi->comm; each q is folded on exactly
-      // ONE rank (so the fold reduction is byte-identical to serial FOR THAT q -- no
-      // per-q reassociation), then GATHER (zero-init + all_reduce = exact partition). The
-      // ONLY reduction is the zero-padded gather (bit-identical). Per-rank fold work ~1/P.
-      _Wb_qwmm.value()() = ComplexType(0.0);
-      nda::array<ComplexType, 2> tmp(_Nm, Np);
-      long my_nfold = 0;
-      for (long iq = mpi->comm.rank(); iq < nqpts_ibz; iq += mpi->comm.size()) {
-        ++my_nfold;
-        auto t_q = _t_qmP(iq, all, all);
-        for (long lp = 0; lp < nw_half; ++lp)
-          vertex_secondary_detail::fold_core(t_q, W_wq(iq, lp, all, all), tmp,
-                                             _Wb_qwmm.value()(iq, lp, all, all));
-      }
-      mpi->comm.all_reduce_in_place_n(_Wb_qwmm.value().data(), _Wb_qwmm.value().size(),
-                                      std::plus<>{});
-      const long total_fold = mpi->comm.all_reduce_value(my_nfold, std::plus<>{});
-      app_log(2, "  Refinement 2 W-bar fold distributed over {} ranks: this rank folded "
-                 "{} of {} q-points (~1/P work).", mpi->comm.size(), my_nfold, total_fold);
     }
 
     // ---- footprint: the memory point of the exercise ---------------------------------
