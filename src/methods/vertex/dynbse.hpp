@@ -908,14 +908,10 @@ namespace dynbse {
         for (long l = 0; l < ng; ++l) {
           for (long x = 0; x < nc; ++x)
             for (long y = 0; y < nc; ++y) glT(x, y) = P.gkq(l, ik, y, x);
-          nda::blas::gemm(Sv2, glT, Sl_out);                                    // ((c r x), p3)
-          auto So = nda::reshape(Sl_out, std::array<long, 4>{ncomp, nR, nc, nc});
-          for (long c = 0; c < ncomp; ++c)
-            for (long r = 0; r < nR; ++r)
-              for (long x = 0; x < nc; ++x)
-                for (long y = 0; y < nc; ++y) Slt(x, (c * nR + r) * nc + y) = So(c, r, x, y);
-          nda::blas::gemm(Gtil(l, all, all), Slt, Rl);                          // R_l(c, r): (p1', (c r p3))
-          auto R4 = nda::reshape(Rl, std::array<long, 4>{nc, ncomp, nR, nc});
+          nda::blas::gemm(Gtil(l, all, all), Vt2, Pj);                          // (p1', (c r y))
+          auto Pl2 = nda::reshape(Pj, std::array<long, 2>{nc * ncomp * nR, nc});
+          nda::blas::gemm(Pl2, glT, Qj);                                        // R_l(c, r): ((p1' c r), p3)
+          auto R4 = nda::reshape(Qj, std::array<long, 4>{nc, ncomp, nR, nc});
           for (long c = 0; c < ncomp; ++c) {
             if (c == 0 and not anyc) continue;
             for (long x = 0; x < nc; ++x)
@@ -1349,20 +1345,16 @@ namespace dynbse {
             }
           }
         }
-        // ---- l side: R_l(a, r) = Gtil_l V_{a r} g_l^T -------------------------------------------
+        // ---- l side: R_l(a, r) = [Gtil_l V_{a r}] g_l^T (the j-side pattern: no transposes) ------
         for (long l = 0; l < ng; ++l) {
           const long nl = P.gnode(l);
           const double el = P.epsG(l);
           for (long x = 0; x < nc; ++x)
             for (long y = 0; y < nc; ++y) glT(x, y) = P.gkq(l, ik, y, x);      // (b, p3)
-          nda::blas::gemm(Sv2, glT, Sl_out);                                    // ((a r x), p3)
-          auto So = nda::reshape(Sl_out, std::array<long, 4>{np, nR, nc, nc});
-          for (long a = 0; a < np; ++a)
-            for (long r = 0; r < nR; ++r)
-              for (long x = 0; x < nc; ++x)
-                for (long y = 0; y < nc; ++y) Slt(x, (a * nR + r) * nc + y) = So(a, r, x, y);   // (x, (a r p3))
-          nda::blas::gemm(Gtil(l, all, all), Slt, Rl);                          // (p1', (a r p3))
-          auto R4 = nda::reshape(Rl, std::array<long, 4>{nc, np, nR, nc});
+          nda::blas::gemm(Gtil(l, all, all), Vt2, Pj);                          // (p1', (a r y))
+          auto Pl2 = nda::reshape(Pj, std::array<long, 2>{nc * np * nR, nc});   // ((p1' a r), y)
+          nda::blas::gemm(Pl2, glT, Qj);                                        // ((p1' a r), p3)
+          auto R4 = nda::reshape(Qj, std::array<long, 4>{nc, np, nR, nc});
           for (long a = 0; a < np; ++a) {
             const double ea = b.eps(a);
             // - U_l U_a
