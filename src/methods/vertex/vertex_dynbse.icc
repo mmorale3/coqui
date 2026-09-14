@@ -616,8 +616,17 @@ namespace solvers {
                    "(the streaming/THC rung's symmetric q_star read is not wired yet).");
       const long nnu = long(nu_list.size());
       const double spinfac = (ns == 1) ? 2.0 : 1.0;
-      utils::check(kmq.shape(0) == nq and kpq.shape(0) == nq and kmq.shape(1) == nk,
-                   "pair_space_ladder_dyn: nosym mesh expected (nq_w = {}, kmq {} x {}).", nq, kmq.shape(0), kmq.shape(1));
+      if (sym) {
+        // symmetric mesh: outputs / W caches carry nq_ibz (= nq), while kmq/kpq carry the FULL transfer
+        // mesh (nq_full) so the internal k-sums reach every transfer (mapped to q_star for the rung read).
+        utils::check(nq == symc->nq_ibz and kmq.shape(0) == symc->nq_full and kpq.shape(0) == symc->nq_full and
+                     kmq.shape(1) == nk and symc->nk_full == nk,
+                     "pair_space_ladder_dyn: symmetry mesh mismatch (nq_w = {}, nq_ibz = {}, kmq {} x {}, nq_full = {}).",
+                     nq, symc->nq_ibz, kmq.shape(0), kmq.shape(1), symc->nq_full);
+      } else {
+        utils::check(kmq.shape(0) == nq and kpq.shape(0) == nq and kmq.shape(1) == nk,
+                     "pair_space_ladder_dyn: nosym mesh expected (nq_w = {}, kmq {} x {}).", nq, kmq.shape(0), kmq.shape(1));
+      }
       utils::check(Wbh.shape(0) == nq and Wbh.shape(1) == nw_half and Wbh.shape(2) == Nm and Wbh.shape(3) == Nm,
                    "pair_space_ladder_dyn: W cache shape ({}, {}, {}, {}) != ({}, {}, {}, {}).",
                    Wbh.shape(0), Wbh.shape(1), Wbh.shape(2), Wbh.shape(3), nq, nw_half, Nm, Nm);
@@ -745,7 +754,9 @@ namespace solvers {
       // ---- transfer lookup ---------------------------------------------------------------------
       nda::array<long, 2> qx_of(nk, nk);
       qx_of() = -1;
-      for (long iqx = 0; iqx < nq; ++iqx)
+      // the transfer index spans the FULL mesh (kmq rows = nq_full; = nq on a nosym mesh). Under symmetry
+      // build_kbig maps qx_of(ik, ikp) to q_star for the IBZ-stored rung read.
+      for (long iqx = 0; iqx < kmq.shape(0); ++iqx)
         for (long ik = 0; ik < nk; ++ik) qx_of(ik, kmq(iqx, ik)) = iqx;
       for (long ik = 0; ik < nk; ++ik)
         for (long ikp = 0; ikp < nk; ++ikp)
