@@ -530,9 +530,15 @@ namespace solvers {
      *  ik nc2 + (p1' nc + p3)) = [U1^T W0b(qx_of(ik, ikp)) U2](p1 nc + p1', p3 nc + p3'). */
     inline void build_kbig(nda::array<cplx, 4> const &Xb, nda::MemoryArrayOfRank<3> auto const &W0b, long is, long iq,
                            nda::array<long, 2> const &kpq, nda::array<long, 2> const &qx_of,
-                           nda::MemoryArrayOfRank<2> auto &&Kbig) {
+                           nda::MemoryArrayOfRank<2> auto &&Kbig, vertex_sym::sym_ctx const *symc = nullptr) {
+      // IBZ symmetry (mirrors vertex_ladder::pair_space_ladder's rung read): the internal (ik, ikp)
+      // run over the FULL BZ; with an active symc the transfer's rung is read from the IBZ-stored W0b
+      // at q_star(iqx) -- PQ-TRANSPOSED for a time-reversal transfer -- and the four legs use the
+      // effective (rotation + trev-conj) columns Xhat via build_U_legs with jsym = q_isym(iqx). With
+      // symc == nullptr this is bitwise the historic nosym expression (jsx = 0, qsx = iqx, no transpose).
       decltype(nda::range::all) all;
       const long nk = kpq.shape(1), Nm = Xb.shape(2), nc = Xb.shape(3), nc2 = nc * nc;
+      const bool sym = (symc != nullptr and symc->active);
       nda::array<cplx, 2> U1(Nm, nc2), U2(Nm, nc2), WU2(Nm, nc2), wb(nc2, nc2);
       Kbig() = cplx(0.0);
       for (long ik = 0; ik < nk; ++ik) {
@@ -540,8 +546,14 @@ namespace solvers {
         for (long ikp = 0; ikp < nk; ++ikp) {
           const long iqx = qx_of(ik, ikp);
           const long ikppq = kpq(iq, ikp);
-          vertex_pi::detail::build_U_legs(Xb, nullptr, nda::range(0, nc), is, ik, ikp, ikpq, ikppq, 0l, U1, U2);
-          nda::blas::gemm(W0b(iqx, all, all), U2, WU2);
+          const long jsx = sym ? symc->q_isym(iqx) : 0l;
+          const long qsx = sym ? symc->q_star(iqx) : iqx;
+          const bool trx = sym ? bool(symc->q_trev(iqx)) : false;
+          vertex_pi::detail::build_U_legs(Xb, symc, nda::range(0, nc), is, ik, ikp, ikpq, ikppq, jsx, U1, U2);
+          if (trx)
+            nda::blas::gemm(nda::transpose(W0b(qsx, all, all)), U2, WU2);
+          else
+            nda::blas::gemm(W0b(qsx, all, all), U2, WU2);
           nda::blas::gemm(nda::transpose(U1), WU2, wb);
           for (long p1 = 0; p1 < nc; ++p1)
             for (long p1p = 0; p1p < nc; ++p1p)
@@ -591,13 +603,17 @@ namespace solvers {
                                       vertex_pi::iaft_tools &tools, std::vector<long> const &nu_list,
                                       nda::array<cplx, 4> *Pi_static, nda::array<cplx, 4> *Pi_dyn1,
                                       nda::array<cplx, 4> *Pi_gam1, nda::array<cplx, 4> *Pi_dyn,
-                                      long rank, long nproc, dyn_opts const &opt, dyn_meter *met) {
+                                      long rank, long nproc, dyn_opts const &opt, dyn_meter *met,
+                                      vertex_sym::sym_ctx const *symc = nullptr) {
       decltype(nda::range::all) all;
       vertex_ladder_detail::prof_watch watch;
+      const bool sym = (symc != nullptr and symc->active);
       const long nt = G_CC.shape(0), ns = G_CC.shape(1), nk = G_CC.shape(2), nc = G_CC.shape(3);
       const long Nm = Xb.shape(2), nc2 = nc * nc, D = nc2 * nk;
       const long nq = W0b.shape(0), nw_b = tools.nw_b;
       const long nw_half = (nw_b % 2 == 0) ? nw_b / 2 : nw_b / 2 + 1;
+      utils::check(not sym or opt.dense_rung, "pair_space_ladder_dyn: IBZ symmetry currently requires the dense rung "
+                   "(the streaming/THC rung's symmetric q_star read is not wired yet).");
       const long nnu = long(nu_list.size());
       const double spinfac = (ns == 1) ? 2.0 : 1.0;
       utils::check(kmq.shape(0) == nq and kpq.shape(0) == nq and kmq.shape(1) == nk,
@@ -883,7 +899,7 @@ namespace solvers {
             for (long bb2 = 0; bb2 < nc; ++bb2)
               for (long N = 0; N < Nm; ++N) Dc(k, a, bb2, N) = Xb(is, k, N, a) * std::conj(Xb(is, kq, N, bb2));
         }
-        build_kbig(Xb, W0b, is, iq, kpq, qx_of, Kbig);
+        build_kbig(Xb, W0b, is, iq, kpq, qx_of, Kbig, symc);
         Ks() = Kbig * scale_k;
         // the dense per-tau rungs K_d(s) (PH-symmetric: one block per mirror pair) and the constant part
         std::vector<long> trep(static_cast<size_t>(nt), -1);
@@ -907,9 +923,9 @@ namespace solvers {
           for (long r = 0; r < ndist; ++r) {
             auto Wr = Wd_s(all, reps[size_t(r)], all, all);
             auto Kr = Kd_s(r, all, all);
-            build_kbig(Xb, Wr, is, iq, kpq, qx_of, Kr);
+            build_kbig(Xb, Wr, is, iq, kpq, qx_of, Kr, symc);
           }
-          build_kbig(Xb, Wd0, is, iq, kpq, qx_of, Kd0);
+          build_kbig(Xb, Wd0, is, iq, kpq, qx_of, Kd0, symc);
           if (rank == 0 and units_taken == 1)
             app_log(2, "  [dynbse] dense tau rungs: {} distinct PH-sym tau nodes of {}, {:.2f} GB per rank", ndist, nt,
                     double(ndist) * double(D) * double(D) * 16.0 / 1.0e9);
@@ -1621,17 +1637,14 @@ namespace solvers {
                  "(the dynamic readout folds THIS iteration's dW).");
     auto MF = thc.MF();
     auto mpi = thc.mpi();
-    utils::check(MF->nkpts() == MF->nkpts_ibz() and MF->nqpts() == MF->nqpts_ibz(),
-                 "vertex_t::eval_pol_dynbse_nu0: nosym meshes only (D3).");
     nda::array<ComplexType, 5> G_CC;
     nda::array<long, 2> kmq, kpq;
     vertex_sym::sym_ctx const *symc = nullptr;
-    ladder_inputs(mb_state, thc, G_CC, kmq, kpq, symc);
-    utils::check(symc == nullptr or not symc->active, "vertex_t::eval_pol_dynbse_nu0: nosym only.");
+    ladder_inputs(mb_state, thc, G_CC, kmq, kpq, symc);   // full-BZ G_CC/kmq/kpq + (on a sym mesh) an active symc
     const nda::array<double, 2> kc(MF->kpts_crystal());
     auto tools_h = vd::make_dyn_tools(*_ft, _dyn_iaft_prec, G_CC);
     auto &tools = *tools_h.tools;
-    const long nq = MF->nqpts(), Nm = _Xb_skma.shape(2);
+    const long nq = long(_W0b_qmm.value().shape(0)), Nm = _Xb_skma.shape(2);   // nq_ibz on a symmetric mesh
     std::vector<long> nu0 = {tools.m0};
     nda::array<ComplexType, 4> Ps(1, nq, Nm, Nm), P1(1, nq, Nm, Nm), Pg(1, nq, Nm, Nm), Pd(1, nq, Nm, Nm);
     vd::dyn_opts o;
@@ -1650,7 +1663,7 @@ namespace solvers {
     // union grid / in-gap mask / twisted-pair basis are the inu != 0 machinery of D2e, still open)
     vd::dyn_meter met;
     vd::pair_space_ladder_dyn(G_CC, _Xb_skma, _W0b_qmm.value(), _Wb_qwmm.value(), kmq, kpq, tools, nu0,
-                              &Ps, nullptr, &Pg, &Pd, mpi->comm.rank(), mpi->comm.size(), o, &met);
+                              &Ps, nullptr, &Pg, &Pd, mpi->comm.rank(), mpi->comm.size(), o, &met, symc);
     // the pure one dynamic rung (T_s = 0, one application) as its own column
     {
       vd::dyn_opts o1 = o;
@@ -1658,7 +1671,7 @@ namespace solvers {
       if (_dyn_dump) o1.dump_prefix = mb_state.coqui_prefix + ".dynunits.nu0r1.g" + std::to_string(gen);
       vd::dyn_meter met1;
       vd::pair_space_ladder_dyn(G_CC, _Xb_skma, _W0b_qmm.value(), _Wb_qwmm.value(), kmq, kpq, tools, nu0,
-                                nullptr, &P1, nullptr, nullptr, mpi->comm.rank(), mpi->comm.size(), o1, &met1);
+                                nullptr, &P1, nullptr, nullptr, mpi->comm.rank(), mpi->comm.size(), o1, &met1, symc);
     }
     for (auto *A : {&Ps, &P1, &Pg, &Pd}) mpi->comm.all_reduce_in_place_n(A->data(), A->size(), std::plus<>{});
     met.reduce(mpi->comm);
@@ -1718,12 +1731,11 @@ namespace solvers {
     nda::array<ComplexType, 5> G_CC;
     nda::array<long, 2> kmq, kpq;
     vertex_sym::sym_ctx const *symc = nullptr;
-    ladder_inputs(mb_state, thc, G_CC, kmq, kpq, symc);
-    utils::check(symc == nullptr or not symc->active, "vertex_t::eval_pol_dynbse_cut: nosym only.");
+    ladder_inputs(mb_state, thc, G_CC, kmq, kpq, symc);   // full-BZ G_CC/kmq/kpq + (on a sym mesh) an active symc
     const nda::array<double, 2> kc(MF->kpts_crystal());
     auto tools_h = vd::make_dyn_tools(*_ft, _dyn_iaft_prec, G_CC);
     auto &tools = *tools_h.tools;
-    const long nq = MF->nqpts(), Nm = _Xb_skma.shape(2), nn = long(half_nodes.size());
+    const long nq = long(_W0b_qmm.value().shape(0)), Nm = _Xb_skma.shape(2), nn = long(half_nodes.size());   // nq_ibz on a symmetric mesh
     std::vector<long> nus;
     for (long j : half_nodes) {
       utils::check(j >= 0 and tools.m0 + j < tools.nw_b, "vertex_t::eval_pol_dynbse_cut: half node {} out of range.", j);
@@ -1757,14 +1769,14 @@ namespace solvers {
     o.q_subset = std::addressof(qsel);
     vd::dyn_meter met;
     vd::pair_space_ladder_dyn(G_CC, _Xb_skma, _W0b_qmm.value(), _Wb_qwmm.value(), kmq, kpq, tools, nus,
-                              &Ps, nullptr, &Pg, &Pd, mpi->comm.rank(), mpi->comm.size(), o, &met);
+                              &Ps, nullptr, &Pg, &Pd, mpi->comm.rank(), mpi->comm.size(), o, &met, symc);
     {
       vd::dyn_opts o1 = o;
       o1.one_rung_only = true;
       if (_dyn_dump) o1.dump_prefix = mb_state.coqui_prefix + ".dynunits.cutr1.g" + std::to_string(gen);
       vd::dyn_meter met1;
       vd::pair_space_ladder_dyn(G_CC, _Xb_skma, _W0b_qmm.value(), _Wb_qwmm.value(), kmq, kpq, tools, nus,
-                                nullptr, &P1, nullptr, nullptr, mpi->comm.rank(), mpi->comm.size(), o1, &met1);
+                                nullptr, &P1, nullptr, nullptr, mpi->comm.rank(), mpi->comm.size(), o1, &met1, symc);
     }
     for (auto *A : {&Ps, &P1, &Pg, &Pd}) mpi->comm.all_reduce_in_place_n(A->data(), A->size(), std::plus<>{});
     met.reduce(mpi->comm);
