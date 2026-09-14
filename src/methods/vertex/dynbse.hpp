@@ -2684,8 +2684,11 @@ namespace dynbse {
             top += buf;
           }
         }
-        app_log(2, "  [dynbse ritz] inu = {:.4e}i cycle {}: dominant |Ritz| {:.3e} (column {}); weights U {:.3f} T {:.3f} cst {:.3f};"
-                   " top nodes (eps:weight){}", inu.imag(), out.history.size(), ritz_best, c_best, wu / tot, wt / tot, wc / tot, top);
+        // printed from the OWNING rank (stdout, not the root-only app_log): the unit may live on any rank
+        std::printf("  [dynbse ritz] inu = %.4ei cycle %ld: dominant |Ritz| %.3e (column %ld); weights U %.3f T %.3f cst %.3f;"
+                    " top nodes (eps:weight)%s\n", inu.imag(), long(out.history.size()), ritz_best, c_best, wu / tot, wt / tot,
+                    wc / tot, top.c_str());
+        std::fflush(stdout);
       }
       if (readout_tol > 0.0) {
         auto Pnow = readout_of();
