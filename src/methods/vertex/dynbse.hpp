@@ -128,6 +128,7 @@ namespace dynbse {
   // THE FREQUENCY BASIS
   // ==================================================================================
 
+  struct node_pole_fit;
   struct freq_basis {
     double beta = 0.0;
     long np = 0, nt = 0;
@@ -145,6 +146,7 @@ namespace dynbse {
     nda::array<cplx, 2> Dqt;              // (np, np): U_a^4 ~ sum_c Dqt(a, c) U_c (the small-nu fold's third term)
     double dsq_fit_err = 0.0;             // max refit error of the double/triple-pole tau functions
     imag_axes_ft::dlr_pole_fit pf;        // the regularized tau -> coefficient map
+    std::shared_ptr<node_pole_fit> npf_mask;   // set by mask_freq_basis: the refit onto the MASKED node set
   };
 
   inline freq_basis build_freq_basis(imag_axes_ft::IAFT const &ft) {
@@ -193,74 +195,6 @@ namespace dynbse {
         b.Dqt(a, cc) = c4(cc, a);
       }
     return b;
-  }
-
-  /**
-   * Append exact extra poles to the node set (the union set of the exact-pole tests): the refit
-   * still targets the first np_fit (DLR) nodes; the extension carries K_F columns and Fermi data
-   * but no double/triple-pole tables (a confluent product on an extension node is an error).
-   */
-  inline void extend_freq_basis(freq_basis &b, nda::array<double, 1> const &extra) {
-    const long ne = extra.shape(0), np0 = b.np, np1 = np0 + ne;
-    nda::array<double, 1> eps(np1), fhalf(np1);
-    nda::array<double, 2> KF(b.nt, np1), KF2(b.nt, np1);
-    nda::array<cplx, 2> Dsq(np1, np1), Dcb(np1, np1), Dqt(np1, np1);
-    Dsq() = cplx(0.0);
-    Dcb() = cplx(0.0);
-    Dqt() = cplx(0.0);
-    for (long a = 0; a < np0; ++a) {
-      eps(a) = b.eps(a);
-      fhalf(a) = b.fhalf(a);
-      KF(nda::range::all, a) = b.KF(nda::range::all, a);
-      KF2(nda::range::all, a) = b.KF2(nda::range::all, a);
-      Dsq(a, nda::range(np0)) = b.Dsq(a, nda::range::all);
-      Dcb(a, nda::range(np0)) = b.Dcb(a, nda::range::all);
-      Dqt(a, nda::range(np0)) = b.Dqt(a, nda::range::all);
-    }
-    for (long e = 0; e < ne; ++e) {
-      const long a = np0 + e;
-      eps(a) = extra(e);
-      b.fd.push_back(fermi_all(b.beta, extra(e)));
-      fhalf(a) = b.fd[size_t(a)].f - 0.5;
-      for (long i = 0; i < b.nt; ++i) {
-        KF(i, a) = imag_axes_ft::dlr_kF(b.beta, b.s(i), extra(e));
-        KF2(i, a) = -KF(i, a) * (b.s(i) - b.beta * b.fd[size_t(a)].f);
-      }
-    }
-    // the double / triple-pole re-expansions of the EXTENSION nodes on the DLR set (same closed-form
-    // tau functions as build_freq_basis, fitted on the vertex pole fit): used by the small-nu fold of
-    // the twisted family (T_a -> U_a^2 - i nu U_a^3 for |eps_a| >> |nu|); a confluent product on an
-    // extension node remains an error.
-    if (ne > 0) {
-      nda::array<cplx, 2> F2e(b.nt, ne), F3e(b.nt, ne), F4e(b.nt, ne);
-      for (long e = 0; e < ne; ++e) {
-        const long a = np0 + e;
-        for (long i = 0; i < b.nt; ++i) {
-          const double u = b.s(i) - b.beta * b.fd[size_t(a)].f;
-          const double bf1 = b.beta * b.fd[size_t(a)].f1, bf2 = b.beta * b.fd[size_t(a)].f2;
-          F2e(i, e) = cplx(-KF(i, a) * u);
-          F3e(i, e) = cplx(0.5 * KF(i, a) * (u * u + bf1));
-          F4e(i, e) = cplx((1.0 / 6.0) * KF(i, a) * (-u * u * u - 3.0 * bf1 * u + bf2));
-        }
-      }
-      auto c2e = b.pf.coeffs(F2e);   // (np0, ne)
-      auto c3e = b.pf.coeffs(F3e);
-      auto c4e = b.pf.coeffs(F4e);
-      for (long e = 0; e < ne; ++e)
-        for (long cc = 0; cc < np0; ++cc) {
-          Dsq(np0 + e, cc) = c2e(cc, e);
-          Dcb(np0 + e, cc) = c3e(cc, e);
-          Dqt(np0 + e, cc) = c4e(cc, e);
-        }
-    }
-    b.np = np1;
-    b.eps = std::move(eps);
-    b.fhalf = std::move(fhalf);
-    b.KF = std::move(KF);
-    b.KF2 = std::move(KF2);
-    b.Dsq = std::move(Dsq);
-    b.Dcb = std::move(Dcb);
-    b.Dqt = std::move(Dqt);
   }
 
   /**
@@ -326,6 +260,132 @@ namespace dynbse {
       return (den > 0.0) ? num / den : num;
     }
   };
+
+  /** tau data (nt, d) -> coefficients (np, d) on the basis' refit target (the DLR fit, or the masked fit) */
+  inline nda::array<cplx, 2> basis_coeffs(freq_basis const &b, nda::MemoryArrayOfRank<2> auto const &F) {
+    return b.npf_mask ? b.npf_mask->coeffs(F) : b.pf.coeffs(F);
+  }
+  inline double basis_fit_error(freq_basis const &b, nda::MemoryArrayOfRank<2> auto const &F, nda::array<cplx, 2> const &c) {
+    return b.npf_mask ? b.npf_mask->fit_error(F, c) : b.pf.fit_error(F, c);
+  }
+
+  /**
+   * D2f: drop the vertex nodes with lo < eps < hi (the in-gap nodes of a gapped system, measured from mu) from
+   * the basis BEFORE the union extension. The pair function's poles sit at the band energies, so in-gap nodes
+   * are pure DLR redundancy -- and at small nu they carry the dominant spurious mode of the resummation
+   * (Si q_min nu_1: |Ritz| 427 on the six nodes inside (-0.023, +0.01) Ha; harmless 0.29 at nu = 0). The
+   * double/triple/quartic tables are refitted on the kept set with the regularized node_pole_fit (rtol).
+   */
+  inline void mask_freq_basis(freq_basis &b, double lo, double hi, double rtol = 1e-8) {
+    utils::check(b.np == b.np_fit, "dynbse::mask_freq_basis: mask before the union extension.");
+    std::vector<long> keep;
+    for (long a = 0; a < b.np; ++a)
+      if (not (b.eps(a) > lo and b.eps(a) < hi)) keep.push_back(a);
+    const long npk = long(keep.size()), nt = b.nt;
+    if (npk == b.np) return;
+    utils::check(npk >= 2, "dynbse::mask_freq_basis: the mask ({}, {}) leaves {} nodes.", lo, hi, npk);
+    nda::array<double, 1> eps(npk), fhalf(npk);
+    nda::array<double, 2> KF(nt, npk), KF2(nt, npk);
+    std::vector<fermi_derivs> fd;
+    for (long k = 0; k < npk; ++k) {
+      const long a = keep[size_t(k)];
+      eps(k) = b.eps(a); fhalf(k) = b.fhalf(a); fd.push_back(b.fd[size_t(a)]);
+      KF(nda::range::all, k) = b.KF(nda::range::all, a);
+      KF2(nda::range::all, k) = b.KF2(nda::range::all, a);
+    }
+    auto npf = std::make_shared<node_pole_fit>();
+    npf->build(b.beta, b.s, eps, rtol);
+    nda::array<cplx, 2> F2(nt, npk), F3(nt, npk), F4(nt, npk);
+    for (long k = 0; k < npk; ++k)
+      for (long i = 0; i < nt; ++i) {
+        const double u = b.s(i) - b.beta * fd[size_t(k)].f;
+        const double bf1 = b.beta * fd[size_t(k)].f1, bf2 = b.beta * fd[size_t(k)].f2;
+        F2(i, k) = cplx(-KF(i, k) * u);
+        F3(i, k) = cplx(0.5 * KF(i, k) * (u * u + bf1));
+        F4(i, k) = cplx((1.0 / 6.0) * KF(i, k) * (-u * u * u - 3.0 * bf1 * u + bf2));
+      }
+    auto c2 = npf->coeffs(F2), c3 = npf->coeffs(F3), c4 = npf->coeffs(F4);
+    b.dsq_fit_err = std::max(npf->fit_error(F2, c2), npf->fit_error(F3, c3));
+    nda::array<cplx, 2> Dsq(npk, npk), Dcb(npk, npk), Dqt(npk, npk);
+    for (long a = 0; a < npk; ++a)
+      for (long cc = 0; cc < npk; ++cc) { Dsq(a, cc) = c2(cc, a); Dcb(a, cc) = c3(cc, a); Dqt(a, cc) = c4(cc, a); }
+    app_log(1, "  [dynbse] vertex basis mask ({:.4f}, {:.4f}) Ha: {} of {} nodes kept ({} in-gap nodes dropped); "
+               "double/triple-pole refit {:.2e}, fit rank {} of {}", lo, hi, npk, b.np, b.np - npk, b.dsq_fit_err,
+            npf->n_kept, npk);
+    b.np = b.np_fit = npk;
+    b.eps = std::move(eps); b.fhalf = std::move(fhalf); b.fd = std::move(fd);
+    b.KF = std::move(KF); b.KF2 = std::move(KF2);
+    b.Dsq = std::move(Dsq); b.Dcb = std::move(Dcb); b.Dqt = std::move(Dqt);
+    b.npf_mask = npf;
+  }
+
+  /**
+   * Append exact extra poles to the node set (the union set of the exact-pole tests): the refit
+   * still targets the first np_fit (DLR) nodes; the extension carries K_F columns and Fermi data
+   * but no double/triple-pole tables (a confluent product on an extension node is an error).
+   */
+  inline void extend_freq_basis(freq_basis &b, nda::array<double, 1> const &extra) {
+    const long ne = extra.shape(0), np0 = b.np, np1 = np0 + ne;
+    nda::array<double, 1> eps(np1), fhalf(np1);
+    nda::array<double, 2> KF(b.nt, np1), KF2(b.nt, np1);
+    nda::array<cplx, 2> Dsq(np1, np1), Dcb(np1, np1), Dqt(np1, np1);
+    Dsq() = cplx(0.0);
+    Dcb() = cplx(0.0);
+    Dqt() = cplx(0.0);
+    for (long a = 0; a < np0; ++a) {
+      eps(a) = b.eps(a);
+      fhalf(a) = b.fhalf(a);
+      KF(nda::range::all, a) = b.KF(nda::range::all, a);
+      KF2(nda::range::all, a) = b.KF2(nda::range::all, a);
+      Dsq(a, nda::range(np0)) = b.Dsq(a, nda::range::all);
+      Dcb(a, nda::range(np0)) = b.Dcb(a, nda::range::all);
+      Dqt(a, nda::range(np0)) = b.Dqt(a, nda::range::all);
+    }
+    for (long e = 0; e < ne; ++e) {
+      const long a = np0 + e;
+      eps(a) = extra(e);
+      b.fd.push_back(fermi_all(b.beta, extra(e)));
+      fhalf(a) = b.fd[size_t(a)].f - 0.5;
+      for (long i = 0; i < b.nt; ++i) {
+        KF(i, a) = imag_axes_ft::dlr_kF(b.beta, b.s(i), extra(e));
+        KF2(i, a) = -KF(i, a) * (b.s(i) - b.beta * b.fd[size_t(a)].f);
+      }
+    }
+    // the double / triple-pole re-expansions of the EXTENSION nodes on the DLR set (same closed-form
+    // tau functions as build_freq_basis, fitted on the vertex pole fit): used by the small-nu fold of
+    // the twisted family (T_a -> U_a^2 - i nu U_a^3 for |eps_a| >> |nu|); a confluent product on an
+    // extension node remains an error.
+    if (ne > 0) {
+      nda::array<cplx, 2> F2e(b.nt, ne), F3e(b.nt, ne), F4e(b.nt, ne);
+      for (long e = 0; e < ne; ++e) {
+        const long a = np0 + e;
+        for (long i = 0; i < b.nt; ++i) {
+          const double u = b.s(i) - b.beta * b.fd[size_t(a)].f;
+          const double bf1 = b.beta * b.fd[size_t(a)].f1, bf2 = b.beta * b.fd[size_t(a)].f2;
+          F2e(i, e) = cplx(-KF(i, a) * u);
+          F3e(i, e) = cplx(0.5 * KF(i, a) * (u * u + bf1));
+          F4e(i, e) = cplx((1.0 / 6.0) * KF(i, a) * (-u * u * u - 3.0 * bf1 * u + bf2));
+        }
+      }
+      auto c2e = basis_coeffs(b, F2e);   // (np0, ne)
+      auto c3e = basis_coeffs(b, F3e);
+      auto c4e = basis_coeffs(b, F4e);
+      for (long e = 0; e < ne; ++e)
+        for (long cc = 0; cc < np0; ++cc) {
+          Dsq(np0 + e, cc) = c2e(cc, e);
+          Dcb(np0 + e, cc) = c3e(cc, e);
+          Dqt(np0 + e, cc) = c4e(cc, e);
+        }
+    }
+    b.np = np1;
+    b.eps = std::move(eps);
+    b.fhalf = std::move(fhalf);
+    b.KF = std::move(KF);
+    b.KF2 = std::move(KF2);
+    b.Dsq = std::move(Dsq);
+    b.Dcb = std::move(Dcb);
+    b.Dqt = std::move(Dqt);
+  }
 
   /** the union scheme's G grid: the midpoints of the (sorted) vertex nodes plus one node beyond
    *  each end at half the end spacing -- np_fit + 1 nodes, none coinciding with a vertex node. */
@@ -2034,8 +2094,8 @@ namespace dynbse {
       auto Y2 = nda::reshape(Ys, std::array<long, 2>{nt, nk * nc2 * nR});
       nda::array<cplx, 2> Yc(nt, nk * nc2 * nR);
       Yc() = Y2;
-      auto c = b.pf.coeffs(Yc);
-      fit_err = std::max(fit_err, b.pf.fit_error(Yc, c));
+      auto c = basis_coeffs(b, Yc);
+      fit_err = std::max(fit_err, basis_fit_error(b, Yc, c));
       for (long a = 0; a < b.np_fit; ++a)
         for (long ik = 0; ik < nk; ++ik)
           for (long p = 0; p < nc2; ++p)

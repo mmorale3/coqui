@@ -35,6 +35,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -82,6 +83,7 @@ namespace solvers {
       nda::array<double, 2> const *kcrys = nullptr;  // (nk, 3) crystal coordinates of the k mesh: when given
                                                      // (and ksum_ft), the rung's k-sum runs through kmesh_ft
       bool ksum_ft = true;
+      double vmask_lo = 0.0, vmask_hi = 0.0;   // the in-gap vertex-node mask (pol_vertex_dyn_vmask), active when hi > lo
       double tfold = 0.0;         // the small-nu fold ratio (pol_vertex_dyn_tfold): T_a with |eps_a| >= tfold |nu| folded into U
       int table_mode = 0;         // inu != 0 twisted-pair tables: 0 = fitted on the dense tau grid (default), 1 = the
                                   // exact partial fractions through Dsq (1/nu-amplified; the diagnostic route)
@@ -614,9 +616,15 @@ namespace solvers {
       // ---- the vertex basis and G's residues --------------------------------------------------
       tools.init_poles();
       auto b = db::build_freq_basis(*tools.ft);
+      // D2f: the in-gap vertex-node mask (pol_vertex_dyn_vmask = [lo, hi] relative to mu; env COQUI_DYNBSE_VMASK="lo,hi"
+      // overrides for experiments)
+      double vlo = opt.vmask_lo, vhi = opt.vmask_hi;
+      if (char const *e = std::getenv("COQUI_DYNBSE_VMASK")) { vlo = std::atof(e); if (char const *cm = std::strchr(e, ',')) vhi = std::atof(cm + 1); }
+      const bool vmasked = (vhi > vlo);
+      if (vmasked) db::mask_freq_basis(b, vlo, vhi);
       const long np_fit = b.np;
-      utils::check(np_fit == tools.np, "pair_space_ladder_dyn: vertex basis size {} != tools.np {}.", np_fit, tools.np);
-      {
+      if (not vmasked) {
+        utils::check(np_fit == tools.np, "pair_space_ladder_dyn: vertex basis size {} != tools.np {}.", np_fit, tools.np);
         double de = 0.0, ds = 0.0;
         for (long p = 0; p < np_fit; ++p) de = std::max(de, std::abs(b.eps(p) - tools.epsl(p)));
         for (long i = 0; i < nt; ++i) ds = std::max(ds, std::abs(b.s(i) - tools.s_phys(i)));
@@ -635,6 +643,7 @@ namespace solvers {
         const long stride = std::max(1l, opt.union_stride);
         for (long j = 0; j < all_nodes.shape(0); ++j) {
           if (std::abs(all_nodes(j)) < opt.gap_mask) { ++n_masked; continue; }
+          if (vmasked and all_nodes(j) > vlo and all_nodes(j) < vhi) { ++n_masked; continue; }   // no G node inside the gap either
           if (stride > 1 and (j % stride) != 0 and j != all_nodes.shape(0) - 1) { ++n_masked; continue; }
           keep.push_back(all_nodes(j));
         }
@@ -666,9 +675,9 @@ namespace solvers {
             for (long i = 0; i < nt; ++i)
               for (long a = 0; a < nc; ++a)
                 for (long bb2 = 0; bb2 < nc; ++bb2) Fg(i, a * nc + bb2) = G_CC(i, is, k, a, bb2);
-            auto c = use_npf ? npf.coeffs(Fg) : b.pf.coeffs(Fg);
+            auto c = use_npf ? npf.coeffs(Fg) : db::basis_coeffs(b, Fg);
             if (met) {
-              met->fit_err_G = std::max(met->fit_err_G, use_npf ? npf.fit_error(Fg, c) : b.pf.fit_error(Fg, c));
+              met->fit_err_G = std::max(met->fit_err_G, use_npf ? npf.fit_error(Fg, c) : db::basis_fit_error(b, Fg, c));
               double cm = 0.0, fm = 0.0;
               for (auto const &v : c) cm = std::max(cm, std::abs(v));
               for (auto const &v : Fg) fm = std::max(fm, std::abs(v));
@@ -968,8 +977,8 @@ namespace solvers {
             if (met) met->t_rung += kwatch.lap();
             auto Ys2 = nda::reshape(Ys, std::array<long, 2>{nt, nk * nc2 * nR});
             Yc2() = Ys2;
-            auto c = b.pf.coeffs(Yc2);
-            const double fef = b.pf.fit_error(Yc2, c);
+            auto c = db::basis_coeffs(b, Yc2);
+            const double fef = db::basis_fit_error(b, Yc2, c);
             if (met) met->t_refit += kwatch.lap();
             fe = std::max(fe, fef);
             if (dbg)
