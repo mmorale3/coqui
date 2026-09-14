@@ -880,6 +880,7 @@ namespace solvers {
     bool _dyn_dense = true;      // pol_vertex_dyn_dense: the dense per-tau rung K_d(s) (nt/2 x D x D per unit)
     long _dyn_union_stride = 1;  // pol_vertex_dyn_union_stride: keep every n-th shifted G node of the union grid
     int _dyn_table_mode = 0;     // pol_vertex_dyn_table_mode: 0 fitted twisted-pair tables, 1 exact partial fractions
+    double _dyn_tfold = 0.0;     // pol_vertex_dyn_tfold: the small-nu fold ratio (0 = off)
     std::string _dyn_iaft_prec;  // pol_vertex_dyn_iaft_prec: "" = the loop's grid; "medium"/"high" = a vertex-local finer DLR
     // DIAGNOSTIC (default OFF, not physical): THE CONSTANT-RUNG ABSOLUTE PIN.
     //
@@ -1614,6 +1615,14 @@ namespace solvers {
       _dyn_iaft_prec = p;
     }
     std::string const &ladder_dyn_iaft_prec() const { return _dyn_iaft_prec; }
+    /** pol_vertex_dyn_tfold (default 0 = off): at inu != 0 the twisted pair components with |eps_a| >= tfold |nu| are
+     *  folded into the unshifted family (T_a = U_a^2 - i nu U_a^3 + (i nu)^2 U_a^4, error (nu/eps_a)^3): removes the
+     *  tau-metric near-null directions behind the small-nu spurious modes of the resummation (Si: ratio 30). */
+    void set_ladder_dyn_tfold(double r) {
+      utils::check(r >= 0.0, "vertex_t::set_ladder_dyn_tfold: pol_vertex_dyn_tfold must be >= 0 (got {}).", r);
+      _dyn_tfold = r;
+    }
+    double ladder_dyn_tfold() const { return _dyn_tfold; }
     double ladder_dyn_sign() const { return _dyn_sign; }
 
     /**

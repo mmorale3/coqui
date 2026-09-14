@@ -82,6 +82,7 @@ namespace solvers {
       nda::array<double, 2> const *kcrys = nullptr;  // (nk, 3) crystal coordinates of the k mesh: when given
                                                      // (and ksum_ft), the rung's k-sum runs through kmesh_ft
       bool ksum_ft = true;
+      double tfold = 0.0;         // the small-nu fold ratio (pol_vertex_dyn_tfold): T_a with |eps_a| >= tfold |nu| folded into U
       int table_mode = 0;         // inu != 0 twisted-pair tables: 0 = fitted on the dense tau grid (default), 1 = the
                                   // exact partial fractions through Dsq (1/nu-amplified; the diagnostic route)
       long union_stride = 1;      // union grid: keep every union_stride-th shifted G node (plus the last); the
@@ -843,6 +844,7 @@ namespace solvers {
       }
       long pos = rank;
       long units_taken = 0;
+      db::tfold_ratio_ref() = opt.tfold;
       if (met) { met->unit_diag = nda::array<double, 2>(nunits_all, 12); met->unit_diag() = 0.0; }
       for (long u = next_unit(pos); u >= 0; u = next_unit(pos)) {
         ++units_taken;
@@ -1722,6 +1724,7 @@ namespace solvers {
     o.dense_rung = _dyn_dense;
     o.union_stride = _dyn_union_stride;
     o.table_mode = _dyn_table_mode;
+    o.tfold = _dyn_tfold;
     o.sched_comm = mpi->comm.get();      // dynamic longest-first scheduling of the (s, q, nu) units
     if (_dyn_dump) o.dump_prefix = mb_state.coqui_prefix + ".dynunits.cut.g" + std::to_string(gen);
     o.union_nodes = true;
@@ -1768,7 +1771,7 @@ namespace solvers {
             met.t_solve - met.t_rung - met.t_refit - met.t_l0 - met.t_ts - met.t_orth, met.n_apps, met.rss_max_gb,
             utils::omp_threads());
     if (met.unit_diag.size() > 0) {
-      app_log(2, "  [dynbse cut units]   s   q  node  apps conv stag rconv    |Ritz|     refit   shift-fit  shift-cond  last-readout-step  (table mode {})", o.table_mode);
+      app_log(2, "  [dynbse cut units]   s   q  node  apps conv stag rconv    |Ritz|     refit   shift-fit  shift-cond  last-readout-step  (table mode {}, fold ratio {})", o.table_mode, o.tfold);
       for (long u = 0; u < met.unit_diag.shape(0); ++u) {
         auto row = met.unit_diag(u, nda::range::all);
         if (row(3) <= 0.0) continue;   // restored from the dump

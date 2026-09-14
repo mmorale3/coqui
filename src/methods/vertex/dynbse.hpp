@@ -142,6 +142,7 @@ namespace dynbse {
     nda::array<double, 1> fhalf;          // (np) f(eps_a) - 1/2 (the symmetric-sum weight)
     nda::array<cplx, 2> Dsq;              // (np, np): U_a^2 ~ sum_c Dsq(a, c) U_c
     nda::array<cplx, 2> Dcb;              // (np, np): U_a^3 ~ sum_c Dcb(a, c) U_c
+    nda::array<cplx, 2> Dqt;              // (np, np): U_a^4 ~ sum_c Dqt(a, c) U_c (the small-nu fold's third term)
     double dsq_fit_err = 0.0;             // max refit error of the double/triple-pole tau functions
     imag_axes_ft::dlr_pole_fit pf;        // the regularized tau -> coefficient map
   };
@@ -165,24 +166,31 @@ namespace dynbse {
     // the double-pole table: tau function of U_a^2 is d/de K_F = -K_F(s,e) [s - beta f(e)];
     // the triple-pole table: tau function of U_a^3 is (1/2) d^2/de^2 K_F
     //                       = (1/2) K_F(s,e) [ (s - beta f(e))^2 + beta f'(e) ]
-    nda::array<cplx, 2> F2(b.nt, b.np), F3(b.nt, b.np);
+    // the quartic-pole table: tau function of U_a^4 is (1/6) d^3/de^3 K_F
+    //                       = (1/6) K_F(s,e) [ -(s - beta f)^3 - 3 beta f'(e) (s - beta f) + beta f''(e) ]
+    nda::array<cplx, 2> F2(b.nt, b.np), F3(b.nt, b.np), F4(b.nt, b.np);
     b.KF2 = nda::array<double, 2>(b.nt, b.np);
     for (long a = 0; a < b.np; ++a)
       for (long i = 0; i < b.nt; ++i) {
         const double u = b.s(i) - b.beta * b.fd[size_t(a)].f;
+        const double bf1 = b.beta * b.fd[size_t(a)].f1, bf2 = b.beta * b.fd[size_t(a)].f2;
         F2(i, a) = cplx(-b.KF(i, a) * u);
         b.KF2(i, a) = -b.KF(i, a) * u;
-        F3(i, a) = cplx(0.5 * b.KF(i, a) * (u * u + b.beta * b.fd[size_t(a)].f1));
+        F3(i, a) = cplx(0.5 * b.KF(i, a) * (u * u + bf1));
+        F4(i, a) = cplx((1.0 / 6.0) * b.KF(i, a) * (-u * u * u - 3.0 * bf1 * u + bf2));
       }
     auto c2 = b.pf.coeffs(F2);                          // (np, np): column a = coefficients of U_a^2
     auto c3 = b.pf.coeffs(F3);
+    auto c4 = b.pf.coeffs(F4);
     b.dsq_fit_err = std::max(b.pf.fit_error(F2, c2), b.pf.fit_error(F3, c3));
     b.Dsq = nda::array<cplx, 2>(b.np, b.np);
     b.Dcb = nda::array<cplx, 2>(b.np, b.np);
+    b.Dqt = nda::array<cplx, 2>(b.np, b.np);
     for (long a = 0; a < b.np; ++a)
       for (long cc = 0; cc < b.np; ++cc) {
         b.Dsq(a, cc) = c2(cc, a);
         b.Dcb(a, cc) = c3(cc, a);
+        b.Dqt(a, cc) = c4(cc, a);
       }
     return b;
   }
@@ -196,9 +204,10 @@ namespace dynbse {
     const long ne = extra.shape(0), np0 = b.np, np1 = np0 + ne;
     nda::array<double, 1> eps(np1), fhalf(np1);
     nda::array<double, 2> KF(b.nt, np1), KF2(b.nt, np1);
-    nda::array<cplx, 2> Dsq(np1, np1), Dcb(np1, np1);
+    nda::array<cplx, 2> Dsq(np1, np1), Dcb(np1, np1), Dqt(np1, np1);
     Dsq() = cplx(0.0);
     Dcb() = cplx(0.0);
+    Dqt() = cplx(0.0);
     for (long a = 0; a < np0; ++a) {
       eps(a) = b.eps(a);
       fhalf(a) = b.fhalf(a);
@@ -206,6 +215,7 @@ namespace dynbse {
       KF2(nda::range::all, a) = b.KF2(nda::range::all, a);
       Dsq(a, nda::range(np0)) = b.Dsq(a, nda::range::all);
       Dcb(a, nda::range(np0)) = b.Dcb(a, nda::range::all);
+      Dqt(a, nda::range(np0)) = b.Dqt(a, nda::range::all);
     }
     for (long e = 0; e < ne; ++e) {
       const long a = np0 + e;
@@ -222,21 +232,25 @@ namespace dynbse {
     // the twisted family (T_a -> U_a^2 - i nu U_a^3 for |eps_a| >> |nu|); a confluent product on an
     // extension node remains an error.
     if (ne > 0) {
-      nda::array<cplx, 2> F2e(b.nt, ne), F3e(b.nt, ne);
+      nda::array<cplx, 2> F2e(b.nt, ne), F3e(b.nt, ne), F4e(b.nt, ne);
       for (long e = 0; e < ne; ++e) {
         const long a = np0 + e;
         for (long i = 0; i < b.nt; ++i) {
           const double u = b.s(i) - b.beta * b.fd[size_t(a)].f;
+          const double bf1 = b.beta * b.fd[size_t(a)].f1, bf2 = b.beta * b.fd[size_t(a)].f2;
           F2e(i, e) = cplx(-KF(i, a) * u);
-          F3e(i, e) = cplx(0.5 * KF(i, a) * (u * u + b.beta * b.fd[size_t(a)].f1));
+          F3e(i, e) = cplx(0.5 * KF(i, a) * (u * u + bf1));
+          F4e(i, e) = cplx((1.0 / 6.0) * KF(i, a) * (-u * u * u - 3.0 * bf1 * u + bf2));
         }
       }
       auto c2e = b.pf.coeffs(F2e);   // (np0, ne)
       auto c3e = b.pf.coeffs(F3e);
+      auto c4e = b.pf.coeffs(F4e);
       for (long e = 0; e < ne; ++e)
         for (long cc = 0; cc < np0; ++cc) {
           Dsq(np0 + e, cc) = c2e(cc, e);
           Dcb(np0 + e, cc) = c3e(cc, e);
+          Dqt(np0 + e, cc) = c4e(cc, e);
         }
     }
     b.np = np1;
@@ -246,6 +260,7 @@ namespace dynbse {
     b.KF2 = std::move(KF2);
     b.Dsq = std::move(Dsq);
     b.Dcb = std::move(Dcb);
+    b.Dqt = std::move(Dqt);
   }
 
   /**
@@ -784,6 +799,10 @@ namespace dynbse {
   }
 
 
+  /** the small-nu fold ratio (set by the driver from dyn_opts::tfold before the units loop; 0 = off) */
+  inline double &tfold_ratio_ref() { static double r = 0.0; return r; }
+  inline double tfold_ratio() { return tfold_ratio_ref(); }
+
   /** l0_apply_shift with the RHS columns batched into the gemms (the inu != 0 twin of l0_apply_cols): the
    *  same terms and tables, per (k, G node) ONE (nc x nc)(nc x ncomp nR nc) gemm and its two follow-ups
    *  instead of nR sets. Gated against l0_apply_ref by the toy tests (L)/(G) at inu != 0. */
@@ -797,8 +816,8 @@ namespace dynbse {
     F.zero();
     Fsum() = cplx(0.0);
     const long ncomp = 1 + 2 * np;
-    double tfold = 0.0;
-    if (char const *e = std::getenv("COQUI_DYNBSE_TFOLD")) tfold = std::atof(e);
+    double tfold = tfold_ratio();
+    if (char const *e = std::getenv("COQUI_DYNBSE_TFOLD")) tfold = std::atof(e);   // experiment override
 #pragma omp parallel for schedule(dynamic, 1) num_threads(utils::omp_threads())
     for (long ik = 0; ik < nk; ++ik) {
       nda::array<cplx, 3> Ghat(ng, nc, nc), Gtil(ng, nc, nc);
@@ -1029,10 +1048,13 @@ namespace dynbse {
           }
         }
       }
-      // EXPERIMENT (small-nu spurious mode): fold the twisted components T_a of the DLR nodes with
-      // |eps_a| >= ratio |nu| back into the U family through T_a = U_a^2 - i nu U_a^3 + O((nu/eps_a)^2)
-      // (Dsq / Dcb re-expansions); env COQUI_DYNBSE_TFOLD = ratio, unset / 0 = off. The frequency sums
-      // are untouched (T sums to 0 exactly; they were accumulated from the product form).
+      // THE SMALL-nu FOLD (D2f): the twisted components T_a with |eps_a| >= ratio |nu| are nearly degenerate
+      // with U_a^2 (the twist is invisible on K_F's support) -- tau-metric near-null directions that carry
+      // the spurious Ritz values of the resummation at small nu (Si q_min: Ritz 38-60 at nu_2..nu_5 and a
+      // -13 % dip of the resummed eps; the fold restores a smooth monotone curve for nu >= nu_2). They are
+      // folded into the U family through T_a = U_a^2 - i nu U_a^3 + (i nu)^2 U_a^4 + O((nu/eps_a)^3) with
+      // the Dsq / Dcb / Dqt re-expansions (vertex and extension nodes). The frequency sums are untouched
+      // (T sums to 0 exactly; they were accumulated from the product form). ratio = pol_vertex_dyn_tfold.
       if (tfold > 0.0)
         for (long a = 0; a < np; ++a) {                 // DLR and extension nodes (both carry Dsq / Dcb rows)
           if (std::abs(b.eps(a)) < tfold * std::abs(inu)) continue;
@@ -1042,7 +1064,7 @@ namespace dynbse {
                 const cplx t = F.fam(1, a, ik, x, y, r);
                 if (t == cplx(0.0)) continue;
                 for (long c = 0; c < np; ++c) {
-                  const cplx dc = b.Dsq(a, c) - inu * b.Dcb(a, c);
+                  const cplx dc = b.Dsq(a, c) - inu * b.Dcb(a, c) + inu * inu * b.Dqt(a, c);
                   if (dc != cplx(0.0)) F.fam(0, c, ik, x, y, r) += dc * t;
                 }
                 F.fam(1, a, ik, x, y, r) = cplx(0.0);

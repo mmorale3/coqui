@@ -159,6 +159,7 @@ namespace bdft_tests {
       vtx.set_ladder_dyn_dense(dense);          // the dense per-tau rung (default) vs the THC streaming route
       vtx.set_ladder_dyn_union_stride(ustride); // the inu != 0 union grid's G-node stride
       if (char const *vp = std::getenv("COQUI_DYNBSE_TEST_VPREC")) vtx.set_ladder_dyn_iaft_prec(vp);   // vertex-local DLR precision
+      if (char const *tf = std::getenv("COQUI_DYNBSE_TEST_TFOLD")) vtx.set_ladder_dyn_tfold(std::atof(tf));   // the small-nu fold ratio
       scr_eri.set_vertex(&vtx);
       auto [e_hf, e_corr] = scf_loop(mb_state, dyson, eri, ft,
                                      solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol,
