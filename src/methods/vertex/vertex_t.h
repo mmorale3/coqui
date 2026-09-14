@@ -881,6 +881,7 @@ namespace solvers {
     long _dyn_union_stride = 1;  // pol_vertex_dyn_union_stride: keep every n-th shifted G node of the union grid
     int _dyn_table_mode = 0;     // pol_vertex_dyn_table_mode: 0 fitted twisted-pair tables, 1 exact partial fractions
     double _dyn_tfold = 0.0;     // pol_vertex_dyn_tfold: the small-nu fold ratio (0 = off)
+    double _dyn_vmask_lo = 0.0, _dyn_vmask_hi = 0.0;   // pol_vertex_dyn_vmask_lo/_hi (Ha, about mu): in-gap vertex nodes dropped
     std::string _dyn_iaft_prec;  // pol_vertex_dyn_iaft_prec: "" = the loop's grid; "medium"/"high" = a vertex-local finer DLR
     // DIAGNOSTIC (default OFF, not physical): THE CONSTANT-RUNG ABSOLUTE PIN.
     //
@@ -1623,6 +1624,16 @@ namespace solvers {
       _dyn_tfold = r;
     }
     double ladder_dyn_tfold() const { return _dyn_tfold; }
+    /** pol_vertex_dyn_vmask_lo / _hi (default off): the vertex DLR nodes with lo < eps < hi (Ha, measured from mu) and the
+     *  union's shifted G nodes in that interval are dropped -- the in-gap nodes of a gapped system carry no pair poles and
+     *  host the small-nu spurious mode of the resummation (Si q_min nu_1: |Ritz| 427 on six nodes inside (-0.023, +0.01) Ha).
+     *  Choose the interval strictly inside the quasiparticle gap; the reported table refit / G fit errors gate it. */
+    void set_ladder_dyn_vmask(double lo, double hi) {
+      utils::check(hi >= lo, "vertex_t::set_ladder_dyn_vmask: pol_vertex_dyn_vmask_hi must be >= _lo (got {}, {}).", lo, hi);
+      _dyn_vmask_lo = lo; _dyn_vmask_hi = hi;
+    }
+    double ladder_dyn_vmask_lo() const { return _dyn_vmask_lo; }
+    double ladder_dyn_vmask_hi() const { return _dyn_vmask_hi; }
     double ladder_dyn_sign() const { return _dyn_sign; }
 
     /**

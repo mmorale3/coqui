@@ -468,6 +468,7 @@ namespace solvers {
     _pol_vtx->set_ladder_dyn_table_mode(_vertex->ladder_dyn_table_mode());
     _pol_vtx->set_ladder_dyn_iaft_prec(_vertex->ladder_dyn_iaft_prec());
     _pol_vtx->set_ladder_dyn_tfold(_vertex->ladder_dyn_tfold());
+    _pol_vtx->set_ladder_dyn_vmask(_vertex->ladder_dyn_vmask_lo(), _vertex->ladder_dyn_vmask_hi());
     app_log(1, "  [scGW-tilde L2] ladder readout instance: C window = [{}, {}), "
                "secondary rank knob = {}, div_treatment = {} (kernel head follows "
                "build_w0's policy; W0bar is SAME-iteration -- coincides with "

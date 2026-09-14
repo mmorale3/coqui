@@ -1637,6 +1637,8 @@ namespace solvers {
     o.tol = _dyn_tol; o.maxit = _dyn_maxit; o.gmres_m = _dyn_gmres; o.sign_ks = _dyn_sign;
     o.rhs_block = _dyn_rhs_block;
     o.dense_rung = _dyn_dense;
+    o.tfold = _dyn_tfold;
+    o.vmask_lo = _dyn_vmask_lo; o.vmask_hi = _dyn_vmask_hi;
     o.sched_comm = mpi->comm.get();      // dynamic longest-first scheduling of the (s, q, nu) units
     o.readout_tol = 1e-6;                // the physical readout's own stop (the 1e-8 residual is below the refit floor)
     if (_dyn_dump) o.dump_prefix = mb_state.coqui_prefix + ".dynunits.nu0.g" + std::to_string(gen);
@@ -1734,6 +1736,7 @@ namespace solvers {
     o.union_stride = _dyn_union_stride;
     o.table_mode = _dyn_table_mode;
     o.tfold = _dyn_tfold;
+    o.vmask_lo = _dyn_vmask_lo; o.vmask_hi = _dyn_vmask_hi;
     o.sched_comm = mpi->comm.get();      // dynamic longest-first scheduling of the (s, q, nu) units
     if (_dyn_dump) o.dump_prefix = mb_state.coqui_prefix + ".dynunits.cut.g" + std::to_string(gen);
     o.union_nodes = true;
