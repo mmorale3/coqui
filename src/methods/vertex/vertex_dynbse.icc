@@ -64,6 +64,7 @@ namespace solvers {
       long maxit = 30;            // operator applications
       long gmres_m = 6;           // 0 = plain Neumann
       bool one_rung_only = false; // T_s = 0 and one application: the pure one dynamic rung
+      bool gamma1_only = false;   // stop at the first iterate (Gamma_1); skip the resummation GMRES
       double sign_ks = -1.0;      // K = sign_ks * (THC rung) / nk  (-1 = the derived sign)
       bool static_only = false;   // no dynamic solve: the static column only (gate G-A)
       bool union_nodes = false;   // G's residues on the half-spacing-SHIFTED grid (no node coincides
@@ -1082,7 +1083,7 @@ namespace solvers {
               res = db::solve_dyson_op(b, P, kd, S, inu, shared, Dblk, opt.tol, 1, false, &Cb_k, stp);
             } else if (opt.gmres_m > 0) {
               res = db::solve_dyson_gmres(b, P, kd, S, inu, shared, Dblk, opt.tol, opt.maxit, opt.gmres_m, &Cb_k, stp,
-                                          &metric, opt.readout_tol);
+                                          &metric, opt.readout_tol, opt.gamma1_only);
             } else {
               res = db::solve_dyson_op(b, P, kd, S, inu, shared, Dblk, opt.tol, opt.maxit, false, &Cb_k, stp, &metric);
             }
@@ -1102,6 +1103,7 @@ namespace solvers {
               readout(res.Gsum1, Pi_dyn1);
             } else {
               readout(res.Gsum1, Pi_gam1);
+              // gamma1_only: res.Gsum == res.Gsum1, so the resummed slot repeats Gamma_1 (logged by the caller)
               readout(res.Gsum, Pi_dyn);
             }
           }
@@ -1639,6 +1641,8 @@ namespace solvers {
     o.dense_rung = _dyn_dense;
     o.tfold = _dyn_tfold;
     o.vmask_lo = _dyn_vmask_lo; o.vmask_hi = _dyn_vmask_hi;
+    o.gamma1_only = _dyn_gamma1_only;
+    if (_dyn_gamma1_only) app_log(1, "  [scGW-tilde T2] pol_vertex_dyn_gamma1_only: GMRES resummation SKIPPED; the resummed column repeats Gamma_1.");
     o.sched_comm = mpi->comm.get();      // dynamic longest-first scheduling of the (s, q, nu) units
     o.readout_tol = 1e-6;                // the physical readout's own stop (the 1e-8 residual is below the refit floor)
     if (_dyn_dump) o.dump_prefix = mb_state.coqui_prefix + ".dynunits.nu0.g" + std::to_string(gen);
@@ -1737,6 +1741,8 @@ namespace solvers {
     o.table_mode = _dyn_table_mode;
     o.tfold = _dyn_tfold;
     o.vmask_lo = _dyn_vmask_lo; o.vmask_hi = _dyn_vmask_hi;
+    o.gamma1_only = _dyn_gamma1_only;
+    if (_dyn_gamma1_only) app_log(1, "  [scGW-tilde T2] pol_vertex_dyn_gamma1_only: GMRES resummation SKIPPED; the resummed column repeats Gamma_1.");
     o.sched_comm = mpi->comm.get();      // dynamic longest-first scheduling of the (s, q, nu) units
     if (_dyn_dump) o.dump_prefix = mb_state.coqui_prefix + ".dynunits.cut.g" + std::to_string(gen);
     o.union_nodes = true;

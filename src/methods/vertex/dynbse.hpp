@@ -2534,7 +2534,8 @@ namespace dynbse {
                                         static_resolvent const &S, cplx inu, bool shared,
                                         nda::array<cplx, 4> const &Dc, double tol, long maxit, long m,
                                         nda::array<cplx, 3> const *Cb_cst = nullptr, shift_tables const *st = nullptr,
-                                        tf_metric const *metric = nullptr, double readout_tol = 0.0) {
+                                        tf_metric const *metric = nullptr, double readout_tol = 0.0,
+                                        bool gamma1_only = false) {
     const long nk = P.nk, nc = P.nc, nR = Dc.shape(3), np = b.np;
     utils::check(m >= 1, "dynbse::solve_dyson_gmres: m >= 1.");
     dyson_result out;
@@ -2558,6 +2559,11 @@ namespace dynbse {
     out.fit_err_max = std::max(out.fit_err_max, kd(Gamma, Gsum, rhs));
     ls_apply(b, P, S, inu, shared, Dc, rhs, Gamma, Gsum, Cb_cst, st);
     out.Gsum1 = Gsum;
+    // Gamma_1 = static + one dynamic rung on static-ladder legs = D^dag L_s K_d L_s D, which is exactly the
+    // first iterate (Gsum1) built above -- BEFORE the GMRES while-loop. A Gamma_1-only request stops here,
+    // skipping the ~10-25 resummation applications (5-8x cheaper). out.Gsum is set to Gsum1 so the resummed
+    // slot carries a defined value (the caller logs that resummation was skipped).
+    if (gamma1_only) { out.Gsum = Gsum; out.iterations = 1; out.converged = true; return out; }
     nda::array<cplx, 1> rhs_norm2(nR), dots(nR), sc(nR);
     tf_dots(rhs, rhs, rhs_norm2, metric);
     std::vector<tf_vector> V;

@@ -882,6 +882,7 @@ namespace solvers {
     int _dyn_table_mode = 0;     // pol_vertex_dyn_table_mode: 0 fitted twisted-pair tables, 1 exact partial fractions
     double _dyn_tfold = 0.0;     // pol_vertex_dyn_tfold: the small-nu fold ratio (0 = off)
     double _dyn_vmask_lo = 0.0, _dyn_vmask_hi = 0.0;   // pol_vertex_dyn_vmask_lo/_hi (Ha, about mu): in-gap vertex nodes dropped
+    bool _dyn_gamma1_only = false;   // pol_vertex_dyn_gamma1_only: stop at Gamma_1 (skip the resummation GMRES)
     std::string _dyn_iaft_prec;  // pol_vertex_dyn_iaft_prec: "" = the loop's grid; "medium"/"high" = a vertex-local finer DLR
     // DIAGNOSTIC (default OFF, not physical): THE CONSTANT-RUNG ABSOLUTE PIN.
     //
@@ -1634,6 +1635,11 @@ namespace solvers {
     }
     double ladder_dyn_vmask_lo() const { return _dyn_vmask_lo; }
     double ladder_dyn_vmask_hi() const { return _dyn_vmask_hi; }
+    /** pol_vertex_dyn_gamma1_only (default false): evaluate only Gamma_1 (static + one dynamic rung on static-ladder
+     *  legs), the first iterate, and skip the resummation GMRES -- 5-8x cheaper; the resummed column then repeats
+     *  Gamma_1. Use when only the one-rung (quadratic) dynamic vertex is wanted. */
+    void set_ladder_dyn_gamma1_only(bool on) { _dyn_gamma1_only = on; }
+    bool ladder_dyn_gamma1_only() const { return _dyn_gamma1_only; }
     double ladder_dyn_sign() const { return _dyn_sign; }
 
     /**
