@@ -805,9 +805,12 @@ namespace solvers {
   } // vertex_wannier_detail
 
   void vertex_t::set_wannier_projector(methods::projector_t const &proj, bool loewdin) {
-    utils::check(enabled(),
-                 "vertex_t::set_wannier_projector: the vertex is disabled (vertex_type = "
-                 "\"none\"); nothing to project onto.");
+    // W-int-0: the projector defines the C subspace for EITHER the Sigma^C vertex (enabled()) OR the
+    // pol-vertex ladder (pol_vertex_enabled()); the two are mutually exclusive (double-count guard R5),
+    // and pol_vertex="ladder" is the coarse->fine interpolation path, so accept a pol-vertex-only vertex.
+    utils::check(enabled() or pol_vertex_enabled(),
+                 "vertex_t::set_wannier_projector: neither the Sigma^C vertex (vertex_type) nor the "
+                 "pol-vertex ladder is configured; nothing to project onto.");
     utils::check(proj.nImps() == 1,
                  "vertex_t::set_wannier_projector: only a single impurity is supported "
                  "(nImps = {}); merge the shells in the wan.h5 reader.", proj.nImps());
