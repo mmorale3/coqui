@@ -229,7 +229,11 @@ inline void ensure_checkpoint(std::shared_ptr<mf::MF> mf, std::string const& out
  *                 (not at Gamma) with a shared point set, so it is capped in the SOLVE, not
  *                 by pruning interpolating vectors.
  *  - vertex_wannier_file: "" Path to a TRIQS-compatible wan.h5 (proj_mat + band_window;
- *                 gw solver only). When set, the vertex subspace C becomes the span of
+ *                 gw solver only). Applies to the Sigma^C vertex (vertex_type != "none")
+ *                 AND to a pol-vertex-only run (vertex_type = "none", pol_vertex =
+ *                 "ladder"): the latter is the coarse->fine interpolation path, whose
+ *                 dynamic-rung output is Pi_loc(q) in the MLWF-pair frame (W-int-0/1,
+ *                 notes/wannier_coarse_vertex_plan.md). When set, the vertex subspace C becomes the span of
  *                 the M Wannier orbitals |w_a(k)> = sum_i U_ia(k)|psi_i(k)> read from the
  *                 file (a general fixed projector P = U U^dag, notes/
  *                 wannier_projector_theory.md), replacing the vertex_band_window C. The
@@ -644,6 +648,25 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
       // scGW-tilde L2: a pol-vertex-only run (vertex_type = "none") attaches the knob
       // carrier to scr_eri so update_w can run the ladder READOUT. Never attached to
       // gw -- Sigma stays GW-form, and has_active_vertex() stays false (no injection).
+      // W-int-1: the coarse->fine interpolation path IS a pol-vertex-only run on a Wannier
+      // projector (notes/wannier_coarse_vertex_plan.md): vertex_type = "none" + pol_vertex =
+      // "ladder" + vertex_wannier_file. set_wannier_projector accepts a pol-vertex-only vertex
+      // (ddb4e7f) and scr_coulomb's readout instance inherits U (ensure_pol_vertex ->
+      // adopt_wannier), so the dynbse then produces / dumps Pi_loc(q) in the MLWF-pair frame.
+      // Same one-projector-per-run rule (demand D2) as the Sigma^C branch above.
+      if (not vertex_wannier_file.empty()) {
+        if (screen_type.substr(0,8) == "gw_edmft") {
+          auto embed_file = io::get_value_with_default<std::string>(pt,"wannier_file","");
+          utils::check(embed_file == vertex_wannier_file,
+                       "vertex_wannier_file = \"{}\" differs from the gw_edmft embedding "
+                       "wannier_file = \"{}\": one projector P per run is required (demand "
+                       "D2, notes/wannier_projector_theory.md section 1.5); use the SAME "
+                       "wan.h5 for both.", vertex_wannier_file, embed_file);
+        }
+        auto vtx_trans_home = io::get_value_with_default<bool>(pt,"translate_home_cell",false);
+        methods::projector_t proj(*mf, vertex_wannier_file, vtx_trans_home);
+        vertex.set_wannier_projector(proj, vertex_wannier_loewdin);
+      }
       scr_eri.set_vertex(&vertex);
     }
 
@@ -1507,6 +1530,25 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
       // scGW-tilde L2: a pol-vertex-only run (vertex_type = "none") attaches the knob
       // carrier to scr_eri so update_w can run the ladder READOUT. Never attached to
       // gw -- Sigma stays GW-form, and has_active_vertex() stays false (no injection).
+      // W-int-1: the coarse->fine interpolation path IS a pol-vertex-only run on a Wannier
+      // projector (notes/wannier_coarse_vertex_plan.md): vertex_type = "none" + pol_vertex =
+      // "ladder" + vertex_wannier_file. set_wannier_projector accepts a pol-vertex-only vertex
+      // (ddb4e7f) and scr_coulomb's readout instance inherits U (ensure_pol_vertex ->
+      // adopt_wannier), so the dynbse then produces / dumps Pi_loc(q) in the MLWF-pair frame.
+      // Same one-projector-per-run rule (demand D2) as the Sigma^C branch above.
+      if (not vertex_wannier_file.empty()) {
+        if (screen_type.substr(0,8) == "gw_edmft") {
+          auto embed_file = io::get_value_with_default<std::string>(pt,"wannier_file","");
+          utils::check(embed_file == vertex_wannier_file,
+                       "vertex_wannier_file = \"{}\" differs from the gw_edmft embedding "
+                       "wannier_file = \"{}\": one projector P per run is required (demand "
+                       "D2, notes/wannier_projector_theory.md section 1.5); use the SAME "
+                       "wan.h5 for both.", vertex_wannier_file, embed_file);
+        }
+        auto vtx_trans_home = io::get_value_with_default<bool>(pt,"translate_home_cell",false);
+        methods::projector_t proj(*mf, vertex_wannier_file, vtx_trans_home);
+        vertex.set_wannier_projector(proj, vertex_wannier_loewdin);
+      }
       scr_eri.set_vertex(&vertex);
     }
 
