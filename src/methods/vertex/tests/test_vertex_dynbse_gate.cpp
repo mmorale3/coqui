@@ -38,11 +38,23 @@
 #include "methods/SCF/simple_dyson.h"
 #include "methods/SCF/scf_driver.hpp"
 #include "methods/vertex/vertex_t.h"
+#include "methods/embedding/projector_t.h"
 #include "methods/scr_coulomb/cvv_head.hpp"
 
 namespace bdft_tests {
 
   using namespace methods;
+
+  inline projector_t make_degenerate_projector(mf::MF &mf, long W0, long M) {
+    using cplx = std::complex<double>;
+    const long nk = mf.nkpts(), ns = mf.nspin();
+    nda::array<cplx, 5> C_ksIai(nk, ns, 1, M, M); C_ksIai() = cplx(0.0);
+    for (long ik = 0; ik < nk; ++ik) for (long is = 0; is < ns; ++is)
+      for (long a = 0; a < M; ++a) C_ksIai(ik, is, 0, a, a) = cplx(1.0);
+    nda::array<long, 3> bw(1, 1, 2); bw(0, 0, 0) = W0 + 1; bw(0, 0, 1) = W0 + M;
+    auto kc = nda::make_regular(mf.kpts_crystal());
+    return projector_t(mf, C_ksIai, bw, kc, false, false);
+  }
 
   TEST_CASE("dynbse_gate", "[methods][vertex][scgwt][dynbse]") {
 #ifndef ENABLE_DLR
@@ -142,6 +154,31 @@ namespace bdft_tests {
     thc_reader_t thc(mf, make_thc_reader_ptree(mf->nbnd() * 8, "", "incore", "", "bdft",
                                                1e-10, mf->ecutrho(), 1, 1024));
     auto eri = mb_eri_t(thc, thc);
+
+    // W-int-0 empirical gate: the full Wannier-vertex DUMP chain (pol-vertex "ladder" + wannier ->
+    // set_wannier_projector -> scr_coulomb adopt_wannier + dump path -> dynbse E-leg -> Pi_loc dumped).
+    if (std::getenv("COQUI_DYNBSE_TEST_WAN")) {
+      solvers::hf_t hf; solvers::gw_t gw(&ft, "ignore_g0", output);
+      solvers::scr_coulomb_t scr_eri(&ft, "rpa", "ignore_g0");
+      simple_dyson dyson(mf.get(), &ft); MBState mb_state(mpi_context, ft, output);
+      iter_scf::iter_scf_t iter_sol("damping");
+      solvers::vertex_t vtx(&ft, "none", nda::range(0, 0), mf->nbnd());
+      vtx.set_pol_vertex("ladder", "w0_prev", nda::range(0, 4), -1, 1e-8, -1.0, -1.0, -1.0);
+      vtx.set_ladder_rung("dynamic", 1e-8, 30, 12, -1.0);
+      vtx.set_ladder_dyn_gamma1_only(true); vtx.set_ladder_dyn_dump(true);
+      auto proj = make_degenerate_projector(*mf, 0, 4); vtx.set_wannier_projector(proj, true);
+      REQUIRE(vtx.wannier()); REQUIRE(vtx.subspace_rank() == 4);
+      scr_eri.set_vertex(&vtx);
+      auto [e_hf, e_corr] = scf_loop(mb_state, dyson, eri, ft,
+                                     solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol, 2, false, 1e-9, true);
+      app_log(1, "dynbse_readout WANNIER dump smoke: e_hf {:.8f}, e_corr {:.8f} (Pi_loc dumped, nab = {})",
+              e_hf, e_corr, vtx.subspace_rank() * vtx.subspace_rank());
+      REQUIRE(std::isfinite(e_hf)); REQUIRE(std::isfinite(e_corr));
+      mpi_context->comm.barrier();
+      if (mpi_context->comm.root()) remove((output + ".mbpt.h5").c_str());
+      mpi_context->comm.barrier();
+      return;
+    }
 
     auto run = [&](std::string const &rung, int niter, bool dump = false, bool dense = true, long ustride = 1) {
       solvers::hf_t hf;

@@ -1161,6 +1161,20 @@ namespace solvers {
       return;
     }
 
+    // W-int-0: the WANNIER-vertex DUMP path. In Wannier mode the vertex polarization is the MLWF-pair
+    // Pi_loc (mesh-independent, for coarse->fine interpolation), which the aux eps readout below cannot
+    // consume (and eval_pol_ladder_nu0 is window-only). So run ONLY the dynamic vertex, which dumps
+    // Pi_loc(q) when pol_vertex_dyn_dump is set, and return -- bypassing the aux static ladder + eps.
+    if (_pol_vtx->wannier() and _pol_vtx->ladder_dynamic_rung()) {
+      ++_pol_dyn_calls;
+      auto dres = _pol_vtx->eval_pol_dynbse_nu0(mb_state, thc, _pol_dyn_calls);
+      _pol_dyn_ritz = dres.ritz_max;
+      app_log(1, "  [scGW-tilde T2] Wannier-vertex DUMP: Pi_loc(q) produced in the MLWF-pair frame "
+                 "({} q x {} x {}) -- dumped for coarse->fine interpolation; the aux eps readout is bypassed.",
+              dres.Pi_gam1.shape(0), dres.Pi_gam1.shape(1), dres.Pi_gam1.shape(2));
+      return;
+    }
+
     // the ladder at inu = 0 in the readout vertex's secondary basis + upfold.
     // A.1: when the injection already ran in THIS update_w it produced exactly this row as
     // half node 0 of its whalf pass, so consume that instead of re-solving the pair-space
