@@ -39,18 +39,28 @@
 #include "methods/SCF/scf_driver.hpp"
 #include "methods/vertex/vertex_t.h"
 #include "methods/embedding/projector_t.h"
+#include <filesystem>
+#include <fstream>
+#include <map>
+#include <array>
+#include <cmath>
+#include "nda/blas.hpp"
 #include "methods/scr_coulomb/cvv_head.hpp"
 
 namespace bdft_tests {
 
   using namespace methods;
 
-  inline projector_t make_degenerate_projector(mf::MF &mf, long W0, long M) {
+  // proj_mat convention (test_vertex_wannier.cpp): |w_a> = sum_i V_{i,a} |psi_{W0+i}>, C_{a,i} = conj(V_{i,a});
+  // V = nullptr is the degenerate identity projector (window physics in the band gauge).
+  inline projector_t make_degenerate_projector(mf::MF &mf, long W0, long M,
+                                               nda::array<std::complex<double>, 2> const *V = nullptr) {
     using cplx = std::complex<double>;
     const long nk = mf.nkpts(), ns = mf.nspin();
     nda::array<cplx, 5> C_ksIai(nk, ns, 1, M, M); C_ksIai() = cplx(0.0);
     for (long ik = 0; ik < nk; ++ik) for (long is = 0; is < ns; ++is)
-      for (long a = 0; a < M; ++a) C_ksIai(ik, is, 0, a, a) = cplx(1.0);
+      for (long a = 0; a < M; ++a)
+        for (long i = 0; i < M; ++i) C_ksIai(ik, is, 0, a, i) = V ? std::conj((*V)(i, a)) : cplx(a == i ? 1.0 : 0.0);
     nda::array<long, 3> bw(1, 1, 2); bw(0, 0, 0) = W0 + 1; bw(0, 0, 1) = W0 + M;
     auto kc = nda::make_regular(mf.kpts_crystal());
     return projector_t(mf, C_ksIai, bw, kc, false, false);
@@ -158,25 +168,99 @@ namespace bdft_tests {
     // W-int-0 empirical gate: the full Wannier-vertex DUMP chain (pol-vertex "ladder" + wannier ->
     // set_wannier_projector -> scr_coulomb adopt_wannier + dump path -> dynbse E-leg -> Pi_loc dumped).
     if (std::getenv("COQUI_DYNBSE_TEST_WAN")) {
-      solvers::hf_t hf; solvers::gw_t gw(&ft, "ignore_g0", output);
-      solvers::scr_coulomb_t scr_eri(&ft, "rpa", "ignore_g0");
-      simple_dyson dyson(mf.get(), &ft); MBState mb_state(mpi_context, ft, output);
-      iter_scf::iter_scf_t iter_sol("damping");
-      solvers::vertex_t vtx(&ft, "none", nda::range(0, 0), mf->nbnd());
-      vtx.set_pol_vertex("ladder", "w0_prev", nda::range(0, 4), -1, 1e-8, -1.0, -1.0, -1.0);
-      vtx.set_ladder_rung("dynamic", 1e-8, 30, 12, -1.0);
-      vtx.set_ladder_dyn_gamma1_only(true); vtx.set_ladder_dyn_dump(true);
-      auto proj = make_degenerate_projector(*mf, 0, 4); vtx.set_wannier_projector(proj, true);
-      REQUIRE(vtx.wannier()); REQUIRE(vtx.subspace_rank() == 4);
-      scr_eri.set_vertex(&vtx);
-      auto [e_hf, e_corr] = scf_loop(mb_state, dyson, eri, ft,
-                                     solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol, 2, false, 1e-9, true);
-      app_log(1, "dynbse_readout WANNIER dump smoke: e_hf {:.8f}, e_corr {:.8f} (Pi_loc dumped, nab = {})",
-              e_hf, e_corr, vtx.subspace_rank() * vtx.subspace_rank());
-      REQUIRE(std::isfinite(e_hf)); REQUIRE(std::isfinite(e_corr));
-      mpi_context->comm.barrier();
-      if (mpi_context->comm.root()) remove((output + ".mbpt.h5").c_str());
-      mpi_context->comm.barrier();
+      // W-int-0/1 empirical gate: the full Wannier-vertex DUMP chain (pol-vertex "ladder" + wannier ->
+      // set_wannier_projector -> scr_coulomb adopt_wannier + dump path -> ladder_inputs G_bar + the rotated
+      // X_bar -> identity pair legs -> Pi_loc dumped), run for the SAME C (window [0,4)) in two gauges: the
+      // degenerate identity projector and a fixed complex unitary mix V of the window bands. Pi_loc(q) then
+      // differs by the pair-frame rotation only, so its gauge INVARIANTS (tr H, tr H^2, tr H^3 of the
+      // Hermitized block, per q) must agree -- the W-int-1 frame-consistency oracle (W-int-0 mixed a
+      // band-frame G with the MLWF-frame X_bar and applied U twice; invisible for V = 1).
+      using cplx = std::complex<double>;
+      auto run_wan = [&](std::string const &tag, nda::array<cplx, 2> const *V) {
+        const std::string out = "coqui_d3_wan_" + tag;
+        solvers::hf_t hf; solvers::gw_t gw(&ft, "ignore_g0", out);
+        solvers::scr_coulomb_t scr_eri(&ft, "rpa", "ignore_g0");
+        simple_dyson dyson(mf.get(), &ft); MBState mb_state(mpi_context, ft, out);
+        iter_scf::iter_scf_t iter_sol("damping");
+        solvers::vertex_t vtx(&ft, "none", nda::range(0, 0), mf->nbnd());
+        vtx.set_pol_vertex("ladder", "w0_prev", nda::range(0, 4), -1, 1e-8, -1.0, -1.0, -1.0);
+        vtx.set_ladder_rung("dynamic", 1e-8, 30, 12, -1.0);
+        vtx.set_ladder_dyn_gamma1_only(true); vtx.set_ladder_dyn_dump(true);
+        auto proj = make_degenerate_projector(*mf, 0, 4, V); vtx.set_wannier_projector(proj, true);
+        REQUIRE(vtx.wannier()); REQUIRE(vtx.subspace_rank() == 4); REQUIRE(vtx.isometry_defect() < 1e-10);
+        scr_eri.set_vertex(&vtx);
+        auto [e_hf, e_corr] = scf_loop(mb_state, dyson, eri, ft,
+                                       solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol, 2, false, 1e-9, true);
+        app_log(1, "dynbse_readout WANNIER dump smoke [{}]: e_hf {:.8f}, e_corr {:.8f} (Pi_loc dumped, nab = 16)",
+                tag, e_hf, e_corr);
+        REQUIRE(std::isfinite(e_hf)); REQUIRE(std::isfinite(e_corr));
+        mpi_context->comm.barrier();
+        // read back the dumped Gamma_1 blocks: record = 5 longs {is, iq, m, nout, 4} + 4 nout^2 complex
+        std::map<std::pair<long, long>, nda::array<cplx, 2>> blocks;
+        for (auto const &e : std::filesystem::directory_iterator(".")) {
+          const std::string fn = e.path().filename().string();
+          if (fn.rfind(out + ".dynunits.nu0.g", 0) != 0 or fn.substr(fn.size() - 4) != ".bin") continue;
+          std::ifstream in(e.path(), std::ios::binary);
+          long hdr[5];
+          while (in.read(reinterpret_cast<char *>(hdr), sizeof(hdr))) {
+            const long n = hdr[3];
+            std::vector<cplx> blk(size_t(4 * n * n));
+            if (not in.read(reinterpret_cast<char *>(blk.data()), std::streamsize(blk.size() * sizeof(cplx)))) break;
+            nda::array<cplx, 2> P(n, n);
+            for (long a = 0; a < n; ++a)
+              for (long b = 0; b < n; ++b) P(a, b) = blk[size_t((2 * n + a) * n + b)];   // column 2 = gam1
+            blocks[{hdr[0], hdr[1]}] = P;
+          }
+        }
+        mpi_context->comm.barrier();
+        if (mpi_context->comm.root()) {
+          remove((out + ".mbpt.h5").c_str());
+          for (auto const &e : std::filesystem::directory_iterator("."))
+            if (e.path().filename().string().rfind(out + ".dynunits.", 0) == 0) std::filesystem::remove(e.path());
+        }
+        mpi_context->comm.barrier();
+        return std::make_tuple(e_hf, e_corr, blocks);
+      };
+      // a fixed complex unitary on the 4 window bands: a product of complex Givens rotations
+      nda::array<cplx, 2> V(4, 4); V() = cplx(0.0);
+      for (long a = 0; a < 4; ++a) V(a, a) = cplx(1.0);
+      auto givens = [&](long p, long q, double th, double ph) {   // V <- V . G(p, q; th, ph), G unitary
+        const double c = std::cos(th), s = std::sin(th); const cplx eph(std::cos(ph), std::sin(ph));
+        for (long i = 0; i < 4; ++i) {
+          const cplx vp = V(i, p), vq = V(i, q);
+          V(i, p) = vp * c - vq * s * std::conj(eph);
+          V(i, q) = vp * s * eph + vq * c;
+        }
+      };
+      givens(0, 1, 0.7, 0.3); givens(1, 2, 1.1, -0.8); givens(2, 3, 0.4, 1.9); givens(0, 3, 0.9, 0.5);
+      auto [h_id, c_id, b_id] = run_wan("id", nullptr);
+      auto [h_V, c_V, b_V] = run_wan("V", &V);
+      // the SAME C: the loop energies do not depend on the gauge (the pol-vertex readout is not fed back)
+      app_log(1, "dynbse_readout WANNIER gauge: |D e_hf| = {:.2e}, |D e_corr| = {:.2e}, {} / {} Pi_loc blocks",
+              std::abs(h_id - h_V), std::abs(c_id - c_V), b_id.size(), b_V.size());
+      REQUIRE(std::abs(h_id - h_V) < 1e-8); REQUIRE(std::abs(c_id - c_V) < 1e-8);
+      REQUIRE(b_id.size() == b_V.size()); REQUIRE(b_id.size() > 0);
+      double worst = 0.0, fro_worst = 0.0;
+      for (auto const &[key, P1] : b_id) {
+        REQUIRE(b_V.count(key) == 1);
+        auto const &P2 = b_V.at(key);
+        const long n = P1.shape(0);
+        auto invariants = [&](nda::array<cplx, 2> const &P) {
+          nda::array<cplx, 2> H(n, n), H2(n, n), H3(n, n);
+          for (long a = 0; a < n; ++a) for (long b = 0; b < n; ++b) H(a, b) = 0.5 * (P(a, b) + std::conj(P(b, a)));
+          nda::blas::gemm(H, H, H2); nda::blas::gemm(H2, H, H3);
+          double t1 = 0.0, t2 = 0.0, t3 = 0.0, f = 0.0;
+          for (long a = 0; a < n; ++a) { t1 += H(a, a).real(); t2 += H2(a, a).real(); t3 += H3(a, a).real(); }
+          for (long a = 0; a < n; ++a) for (long b = 0; b < n; ++b) f += std::norm(P(a, b));
+          return std::array<double, 4>{t1, t2, t3, std::sqrt(f)};
+        };
+        auto i1 = invariants(P1), i2 = invariants(P2);
+        for (int c = 0; c < 3; ++c) worst = std::max(worst, std::abs(i1[c] - i2[c]) / std::max(std::abs(i1[c]), 1e-300));
+        fro_worst = std::max(fro_worst, std::abs(i1[3] - i2[3]) / i1[3]);
+      }
+      app_log(1, "dynbse_readout WANNIER gauge oracle: max rel mismatch of (tr H, tr H^2, tr H^3) over (s, q) = {:.3e}, "
+                 "of |Pi_loc|_F = {:.3e}  (gauge-invariant; the identity-vs-V frame test)", worst, fro_worst);
+      REQUIRE(worst < 1e-6); REQUIRE(fro_worst < 1e-6);
       return;
     }
 

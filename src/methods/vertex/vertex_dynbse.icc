@@ -85,10 +85,13 @@ namespace solvers {
                                                      // (and ksum_ft), the rung's k-sum runs through kmesh_ft
       bool ksum_ft = true;
       double vmask_lo = 0.0, vmask_hi = 0.0;   // the in-gap vertex-node mask (pol_vertex_dyn_vmask), active when hi > lo
-      nda::array<ComplexType, 4> const *U_skia = nullptr;   // W-int-0: MLWF legs (ns,nk,norb,nc); non-null => the
-                                  // outputs are the Wannier-PAIR polarization (nab=norb^2) via the E-leg sandwich
-                                  // E(k;q)_{(ab),(mn)} = U_{ma}(k) conj(U_{nb}(k+q)) -- the mesh-independent frame for
-                                  // coarse->fine interpolation (notes/wannier_coarse_vertex_plan.md). nullptr = aux (Nm).
+      bool wannier_pairs = false; // W-int-0/1: the outputs are the Wannier-PAIR polarization Pi_loc(q) (nout = nc^2)
+                                  // instead of the aux frame (Nm). The inputs G_CC / Xb are then ALREADY in the MLWF
+                                  // frame (ladder_inputs: G_bar = U^dag G U; the rotated secondary collocation X_bar
+                                  // = X U, nc = M), so the external legs are the IDENTITY on the (a, b) pair labels --
+                                  // the mesh-independent frame for coarse->fine interpolation
+                                  // (notes/wannier_coarse_vertex_plan.md). W-int-0 put U on the legs of band-frame
+                                  // inputs, which mixed frames for any non-degenerate U (W-int-1 finding).
       double tfold = 0.0;         // the small-nu fold ratio (pol_vertex_dyn_tfold): T_a with |eps_a| >= tfold |nu| folded into U
       int table_mode = 0;         // inu != 0 twisted-pair tables: 0 = fitted on the dense tau grid (default), 1 = the
                                   // exact partial fractions through Dsq (1/nu-amplified; the diagnostic route)
@@ -612,11 +615,10 @@ namespace solvers {
       decltype(nda::range::all) all;
       vertex_ladder_detail::prof_watch watch;
       const bool sym = (symc != nullptr and symc->active);
-      const bool wan = (opt.U_skia != nullptr);   // W-int-0: Wannier-pair output frame
+      const bool wan = opt.wannier_pairs;   // W-int-0/1: Wannier-pair output frame (inputs already MLWF-rotated)
       const long nt = G_CC.shape(0), ns = G_CC.shape(1), nk = G_CC.shape(2), nc = G_CC.shape(3);
       const long Nm = Xb.shape(2), nc2 = nc * nc, D = nc2 * nk;
-      const long norb = wan ? opt.U_skia->shape(2) : nc;   // MLWF count
-      const long nout = wan ? norb * norb : Nm;             // external-leg / output dimension (aux Nm, or Wannier pair)
+      const long nout = wan ? nc2 : Nm;                     // external-leg / output dimension (aux Nm, or Wannier pair)
       const long nq = W0b.shape(0), nw_b = tools.nw_b;
       const long nw_half = (nw_b % 2 == 0) ? nw_b / 2 : nw_b / 2 + 1;
       utils::check(not sym or opt.dense_rung, "pair_space_ladder_dyn: IBZ symmetry currently requires the dense rung "
@@ -813,13 +815,9 @@ namespace solvers {
         Yc2 = nda::array<cplx, 2>(nt, nk * nc2 * nR);
       };
 
-      if (wan) {
-        utils::check(opt.U_skia->shape(0) == ns and opt.U_skia->shape(1) == nk and opt.U_skia->shape(3) == nc,
-                     "pair_space_ladder_dyn: U_skia is {} x {} x {} x {}, expected {} x nk x norb x {}.",
-                     opt.U_skia->shape(0), opt.U_skia->shape(1), opt.U_skia->shape(2), opt.U_skia->shape(3), ns, nc);
-        if (rank == 0) app_log(1, "  [dynbse] Wannier-pair output: norb = {}, nout = nab = {} (aux Nm = {} used only "
-                               "internally for the rung)", norb, nout, Nm);
-      }
+      if (wan and rank == 0)
+        app_log(1, "  [dynbse] Wannier-pair output: M = {} MLWFs, nout = nab = {} (identity pair legs on the MLWF-frame "
+                   "inputs; aux Nm = {} used only internally for the rung)", nc, nout, Nm);
       std::vector<long> qlist;
       if (opt.q_subset != nullptr) {
         qlist = *opt.q_subset;
@@ -921,13 +919,13 @@ namespace solvers {
         for (long k = 0; k < nk; ++k) {
           const long kq = kpq(iq, k);
           if (wan) {
-            // E(k;q)_{(a b),(m norb + n)} = U_{m a}(k) conj(U_{n b}(k+q)) -- hole leg unconj, particle leg conj
-            auto const &U = *opt.U_skia;
+            // W-int-1: the inputs are in the MLWF frame, so the Wannier-PAIR readout is the identity on the
+            // pair labels: column N = a nc + b picks the (hole a at k, particle b at k+q) MLWF pair. For a
+            // unitary U this equals W-int-0's U-leg sandwich on band-frame inputs; for an isometry (M < nW,
+            // a disentangled C) it is the only consistent form (the kernel runs on the M-dim C).
             for (long a = 0; a < nc; ++a)
               for (long bb2 = 0; bb2 < nc; ++bb2)
-                for (long mm = 0; mm < norb; ++mm)
-                  for (long nn2 = 0; nn2 < norb; ++nn2)
-                    Dc(k, a, bb2, mm * norb + nn2) = U(is, k, mm, a) * std::conj(U(is, kq, nn2, bb2));
+                for (long N = 0; N < nout; ++N) Dc(k, a, bb2, N) = (N == a * nc + bb2) ? cplx(1.0) : cplx(0.0);
           } else {
             for (long a = 0; a < nc; ++a)
               for (long bb2 = 0; bb2 < nc; ++bb2)
@@ -1680,7 +1678,7 @@ namespace solvers {
     auto tools_h = vd::make_dyn_tools(*_ft, _dyn_iaft_prec, G_CC);
     auto &tools = *tools_h.tools;
     const long nq = long(_W0b_qmm.value().shape(0)), Nm = _Xb_skma.shape(2);   // nq_ibz on a symmetric mesh
-    const long nout = _wannier ? long(_U_skia.shape(2) * _U_skia.shape(2)) : Nm;   // W-int-0: Wannier-pair (nab) or aux (Nm)
+    const long nout = _wannier ? _M * _M : Nm;   // W-int-0/1: Wannier-pair (nab = M^2) or aux (Nm)
     std::vector<long> nu0 = {tools.m0};
     nda::array<ComplexType, 4> Ps(1, nq, nout, nout), P1(1, nq, nout, nout), Pg(1, nq, nout, nout), Pd(1, nq, nout, nout);
     vd::dyn_opts o;
@@ -1694,7 +1692,7 @@ namespace solvers {
     if (_dyn_gamma1_only) app_log(1, "  [scGW-tilde T2] pol_vertex_dyn_gamma1_only: GMRES resummation SKIPPED; the resummed column repeats Gamma_1.");
     o.sched_comm = mpi->comm.get();      // dynamic longest-first scheduling of the (s, q, nu) units
     o.readout_tol = 1e-6;                // the physical readout's own stop (the 1e-8 residual is below the refit floor)
-    if (_wannier) { o.U_skia = &_U_skia; app_log(1, "  [scGW-tilde T2] Wannier-pair vertex output (W-int-0): Pi_loc(q) in the MLWF pair basis (nab = {}) -- dumped for coarse->fine interpolation.", nout); }
+    if (_wannier) { o.wannier_pairs = true; app_log(1, "  [scGW-tilde T2] Wannier-pair vertex output (W-int-0/1): Pi_loc(q) in the MLWF pair basis (M = {}, nab = {}; G_bar / X_bar inputs, identity pair legs) -- dumped for coarse->fine interpolation.", _M, nout); }
     if (_dyn_dump) o.dump_prefix = mb_state.coqui_prefix + ".dynunits.nu0.g" + std::to_string(gen);
     // D3/D4 configuration at inu = 0: the shared aux grid with the Dsq/Dcb tables, no mask (the
     // union grid / in-gap mask / twisted-pair basis are the inu != 0 machinery of D2e, still open)

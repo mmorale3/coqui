@@ -2727,8 +2727,17 @@ namespace solvers {
     const long nq_ext = MF->nqpts_ibz(), nq_full = MF->nqpts();
     const bool sym_mesh = (MF->nkpts() != MF->nkpts_ibz()) or (nq_full != nq_ext);
     G_CC = nda::array<ComplexType, 5>(nt, ns, nk, nc, nc);
-    vertex_ladder_detail::expand_G_CC_fullbz(G_tskij, _band_window, sym_mesh,
-                                             MF->kp_to_ibz(), MF->kp_trev(), G_CC);
+    if (_wannier) {
+      // W-int-1: in Wannier mode the secondary collocation _Xb_skma is ALREADY the MLWF-rotated
+      // X_bar = X U (build_secondary_basis' rotated point selection, nc = M), so the kernel's G must
+      // be in the same frame: G_bar = U^dag G|_W U (the Sigma^C / Pi^C kernels' convention). Feeding
+      // the band-window block here (the W-int-0 state) mixed frames for any non-degenerate U.
+      vertex_wannier_detail::build_Gbar_fullbz(G_tskij, _U_skia, _band_window, sym_mesh,
+                                               MF->kp_to_ibz(), MF->kp_trev(), G_CC);
+    } else {
+      vertex_ladder_detail::expand_G_CC_fullbz(G_tskij, _band_window, sym_mesh,
+                                               MF->kp_to_ibz(), MF->kp_trev(), G_CC);
+    }
     kmq = nda::array<long, 2>(nq_full, nk);
     kpq = nda::array<long, 2>(nq_full, nk);
     auto qmin = MF->qminus();
@@ -2739,7 +2748,7 @@ namespace solvers {
       }
     symc = nullptr;
     if (sym_mesh) {
-      build_sym_ctx(thc, _Xb_skma, _band_window.first(), _sym_secondary);
+      build_sym_ctx(thc, _Xb_skma, _band_window.first(), _sym_secondary, _wannier ? &_U_skia : nullptr);
       symc = &_sym_secondary.value();
     }
   }
