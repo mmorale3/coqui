@@ -45,6 +45,8 @@
 #include <array>
 #include <cmath>
 #include "nda/blas.hpp"
+#include "h5/h5.hpp"
+#include "nda/h5.hpp"
 #include "methods/scr_coulomb/cvv_head.hpp"
 
 namespace bdft_tests {
@@ -261,6 +263,96 @@ namespace bdft_tests {
       app_log(1, "dynbse_readout WANNIER gauge oracle: max rel mismatch of (tr H, tr H^2, tr H^3) over (s, q) = {:.3e}, "
                  "of |Pi_loc|_F = {:.3e}  (gauge-invariant; the identity-vs-V frame test)", worst, fro_worst);
       REQUIRE(worst < 1e-6); REQUIRE(fro_worst < 1e-6);
+      return;
+    }
+
+    if (std::getenv("COQUI_DYNBSE_TEST_WINT")) {
+      // W-int-1b/4 gate (notes/wannier_coarse_vertex_plan.md): the frozen-point aux frame + the consumer.
+      //  A  window, dynamic Gamma_1, dumps <A>.secpts.h5 + <A>.pol_nu0.g2.h5
+      //  B  window, the points FROZEN from A          -> the dumped Pi(q)_{MN} == A's, eps readout == A's
+      //  V  a unitary MLWF mix V of the same window, frame "aux", points frozen from A -> Pi == A's: the point
+      //     frame is GAUGE-INVARIANT (the C-space alone defines it)
+      //  C  window, static rung, points frozen from A, the eps readout CONSUMES A's dumped static column
+      //     (pol_vertex_interp_file) -> eps_M(ladder) == A's (the consumer V0: coarse = fine)
+      using cplx = std::complex<double>;
+      struct res_t { double e_corr, er, el; nda::array<cplx, 3> Ps, Pg; };
+      auto run_w = [&](std::string const &tag, std::string const &rung, std::string const &points, std::string const &interp,
+                       nda::array<cplx, 2> const *V) {
+        const std::string out = "coqui_d3_wint_" + tag;
+        solvers::hf_t hf; solvers::gw_t gw(&ft, "ignore_g0", out);
+        solvers::scr_coulomb_t scr_eri(&ft, "rpa", "ignore_g0");
+        simple_dyson dyson(mf.get(), &ft); MBState mb_state(mpi_context, ft, out);
+        iter_scf::iter_scf_t iter_sol("damping");
+        solvers::vertex_t vtx(&ft, "none", nda::range(0, 0), mf->nbnd());
+        vtx.set_pol_vertex("ladder", "w0_prev", nda::range(0, 4), -1, 1e-8, -1.0, -1.0, -1.0);
+        vtx.set_ladder_rung(rung, 1e-8, 30, 12, -1.0);
+        vtx.set_ladder_dyn_gamma1_only(true); vtx.set_ladder_dyn_dump(rung == "dynamic");
+        vtx.set_isdf_points(points, points.empty()); vtx.set_wannier_frame("aux");
+        vtx.set_pol_interp(interp, "static");
+        if (V) { auto proj = make_degenerate_projector(*mf, 0, 4, V); vtx.set_wannier_projector(proj, true); }
+        scr_eri.set_vertex(&vtx);
+        auto [e_hf, e_corr] = scf_loop(mb_state, dyson, eri, ft,
+                                       solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol, 2, false, 1e-9, true);
+        auto [er, el] = scr_eri.pol_eps_readout();
+        res_t r{e_corr, er, el, {}, {}};
+        mpi_context->comm.barrier();
+        if (rung == "dynamic") {
+          h5::file f(out + ".pol_nu0.g2.h5", 'r'); h5::group g(f);
+          nda::h5_read(g, "Pi_static", r.Ps); nda::h5_read(g, "Pi_gam1", r.Pg);
+        }
+        app_log(1, "dynbse_readout W-int gate [{}]: e_corr {:.10f}, eps_M RPA {:.8f} ladder {:.8f}{}", tag, e_corr, er, el,
+                rung == "dynamic" ? " (Pi dumped)" : "");
+        mpi_context->comm.barrier();
+        if (mpi_context->comm.root() and tag != "A") {
+          remove((out + ".mbpt.h5").c_str());
+          for (auto const &e : std::filesystem::directory_iterator("."))
+            if (e.path().filename().string().rfind(out + ".", 0) == 0) std::filesystem::remove(e.path());
+        }
+        mpi_context->comm.barrier();
+        return r;
+      };
+      auto relmax = [](nda::array<cplx, 3> const &A, nda::array<cplx, 3> const &B) {
+        double d = 0.0, n = 0.0;
+        for (long i = 0; i < A.size(); ++i) { d = std::max(d, std::abs(A.data()[i] - B.data()[i])); n = std::max(n, std::abs(B.data()[i])); }
+        return d / n;
+      };
+      nda::array<cplx, 2> V(4, 4); V() = cplx(0.0);
+      for (long a = 0; a < 4; ++a) V(a, a) = cplx(1.0);
+      auto givens = [&](long p, long q, double th, double ph) {
+        const double c = std::cos(th), s = std::sin(th); const cplx eph(std::cos(ph), std::sin(ph));
+        for (long i = 0; i < 4; ++i) { const cplx vp = V(i, p), vq = V(i, q); V(i, p) = vp * c - vq * s * std::conj(eph); V(i, q) = vp * s * eph + vq * c; }
+      };
+      givens(0, 1, 0.7, 0.3); givens(1, 2, 1.1, -0.8); givens(2, 3, 0.4, 1.9); givens(0, 3, 0.9, 0.5);
+      const std::string pts = "coqui_d3_wint_A.secpts.h5", nu0 = "coqui_d3_wint_A.pol_nu0.g2.h5";
+      auto A = run_w("A", "dynamic", "", "", nullptr);
+      REQUIRE(std::filesystem::exists(pts)); REQUIRE(std::filesystem::exists(nu0));
+      auto B = run_w("B", "dynamic", pts, "", nullptr);
+      auto W = run_w("V", "dynamic", pts, "", &V);
+      auto C = run_w("C", "static", pts, nu0, nullptr);
+      //  CW the PRODUCTION consumer: Wannier mode (a unitary mix V of the same window, X_bar = X U on the frozen
+      //     points), static rung, consuming A's (window-run) static column -- the point frame is gauge-invariant,
+      //     so eps_M(ladder) == A's again
+      auto CW = run_w("CW", "static", pts, nu0, &V);
+      const double dB = relmax(B.Pg, A.Pg), dW = relmax(W.Pg, A.Pg), dBs = relmax(B.Ps, A.Ps), dWs = relmax(W.Ps, A.Ps);
+      app_log(1, "dynbse_readout W-int gate: FROZEN points reproduce the selection: |dPi_gam1| {:.2e} |dPi_static| {:.2e}; "
+                 "the point frame is gauge-invariant (unitary V, aux frame): {:.2e} / {:.2e}; eps_M(ladder) A {:.10f} B {:.10f} "
+                 "CONSUMER window {:.10f} (|d| = {:.2e}) Wannier {:.10f} (|d| = {:.2e}); e_corr A-B {:.1e} A-V {:.1e} A-C {:.1e} A-CW {:.1e} "
+                 "(a Wannier-mode DYNAMIC run dumps and returns before the eps readout: V.el = {:.1f} by design)",
+              dB, dBs, dW, dWs, A.el, B.el, C.el, std::abs(C.el - A.el), CW.el, std::abs(CW.el - A.el),
+              std::abs(A.e_corr - B.e_corr), std::abs(A.e_corr - W.e_corr), std::abs(A.e_corr - C.e_corr),
+              std::abs(A.e_corr - CW.e_corr), W.el);
+      REQUIRE(dB < 1e-10); REQUIRE(dBs < 1e-10);
+      REQUIRE(dW < 1e-8); REQUIRE(dWs < 1e-8);
+      REQUIRE(std::abs(B.el - A.el) < 1e-9);
+      REQUIRE(std::abs(C.el - A.el) < 1e-8); REQUIRE(std::abs(C.er - A.er) < 1e-10);
+      REQUIRE(std::abs(CW.el - A.el) < 1e-8); REQUIRE(std::abs(CW.er - A.er) < 1e-10);
+      mpi_context->comm.barrier();
+      if (mpi_context->comm.root()) {
+        remove("coqui_d3_wint_A.mbpt.h5");
+        for (auto const &e : std::filesystem::directory_iterator("."))
+          if (e.path().filename().string().rfind("coqui_d3_wint_A.", 0) == 0) std::filesystem::remove(e.path());
+      }
+      mpi_context->comm.barrier();
       return;
     }
 

@@ -477,6 +477,10 @@ namespace solvers {
     _pol_vtx->set_ladder_dyn_tfold(_vertex->ladder_dyn_tfold());
     _pol_vtx->set_ladder_dyn_vmask(_vertex->ladder_dyn_vmask_lo(), _vertex->ladder_dyn_vmask_hi());
     _pol_vtx->set_ladder_dyn_gamma1_only(_vertex->ladder_dyn_gamma1_only());
+    // W-int-1b: the coarse->fine interpolation knobs travel to the readout instance too
+    _pol_vtx->set_isdf_points(_vertex->isdf_points_file(), _vertex->isdf_points_dump());
+    _pol_vtx->set_wannier_frame(_vertex->wannier_frame());
+    _pol_vtx->set_pol_interp(_vertex->pol_interp_file(), _vertex->pol_interp_col());
     app_log(1, "  [scGW-tilde L2] ladder readout instance: C window = [{}, {}), "
                "secondary rank knob = {}, div_treatment = {} (kernel head follows "
                "build_w0's policy; W0bar is SAME-iteration -- coincides with "
@@ -1201,6 +1205,46 @@ namespace solvers {
                    "expected {}.", Pl_qmm.shape(0), nq);
       app_log(2, "  [scGW-tilde L2] eps_M readout: reusing the injection's inu = 0 ladder "
                  "row (no second pair-space ladder pass).");
+    } else if (not _pol_vtx->pol_interp_file().empty()) {
+      // W-int-4 (notes/wannier_coarse_vertex_plan.md): the fine-mesh CONSUMER. Pi(q)_{MN} on THIS mesh's q list
+      // in the frozen-point secondary frame comes from the file (a coarse run's <prefix>.pol_nu0.g<n>.h5 -- the
+      // V0 gate -- or the offline Route-B interpolant written in the same layout) instead of the ladder solve;
+      // the upfold + eps readout below run unchanged. Requires pol_vertex_isdf_points_file = the coarse points.
+      utils::check(not ward_legs, "pol_ladder_eps_readout: pol_vertex_interp_file with legs = \"ward\" is not supported.");
+      utils::check(not _pol_vtx->isdf_points_file().empty(),
+                   "pol_ladder_eps_readout: pol_vertex_interp_file needs pol_vertex_isdf_points_file (the secondary "
+                   "frame of the file is the coarse run's point set).");
+      const std::string col = "Pi_" + _pol_vtx->pol_interp_col();
+      nda::array<double, 2> qf;
+      nda::array<ComplexType, 3> Pf;
+      {
+        h5::file f(_pol_vtx->pol_interp_file(), 'r');
+        h5::group g(f);
+        nda::h5_read(g, "q", qf);
+        nda::h5_read(g, col, Pf);
+      }
+      const long Nm_v = _pol_vtx->secondary_rank();
+      utils::check(Pf.shape(1) == Nm_v and Pf.shape(2) == Nm_v and Pf.shape(0) == qf.shape(0),
+                   "pol_ladder_eps_readout: {} in {} is {} x {} x {}, expected nq x {} x {} (the frozen-point rank).",
+                   col, _pol_vtx->pol_interp_file(), Pf.shape(0), Pf.shape(1), Pf.shape(2), Nm_v, Nm_v);
+      auto lat = MF->lattv();
+      auto Q = MF->Qpts();
+      Pl_qmm = nda::array<ComplexType, 3>(nq, Nm_v, Nm_v);
+      for (long iq = 0; iq < nq; ++iq) {
+        double qc[3];
+        for (long i = 0; i < 3; ++i) { double v = 0.0; for (long j = 0; j < 3; ++j) v += lat(i, j) * Q(iq, j); qc[i] = v / (2.0 * M_PI); }
+        long hit = -1;
+        for (long jq = 0; jq < qf.shape(0) and hit < 0; ++jq) {
+          bool same = true;
+          for (long i = 0; i < 3 and same; ++i) { const double d = qf(jq, i) - qc[i]; same = std::abs(d - std::round(d)) < 1e-5; }
+          if (same) hit = jq;
+        }
+        utils::check(hit >= 0, "pol_ladder_eps_readout: q = ({:.6f}, {:.6f}, {:.6f}) (crystal) of this mesh is absent "
+                               "from {} (interpolate onto the full fine mesh).", qc[0], qc[1], qc[2], _pol_vtx->pol_interp_file());
+        Pl_qmm(iq, all, all) = Pf(hit, all, all);
+      }
+      app_log(1, "  [W-int-4] eps readout consumes {} from {} ({} q matched on this mesh's q list; frozen points, "
+                 "N_m = {}).", col, _pol_vtx->pol_interp_file(), nq, Nm_v);
     } else {
       Pl_qmm = _pol_vtx->eval_pol_ladder_nu0(mb_state, thc,
                                              ward_legs ? std::addressof(Pd_qmm) : nullptr);

@@ -35,6 +35,9 @@
 #include "methods/GW/g0_div_utils.hpp"  // S2: eps_inv_head_w at i.nu = 0 (the v2 head machinery)
 #include "vertex_t.h"
 #include "vertex_wannier_detail.hpp"  // W-int-1: the MLWF-frame helpers, needed by vertex_ladder.icc::ladder_inputs
+#include "h5/h5.hpp"
+#include "nda/h5.hpp"
+#include "utilities/kpoint_utils.hpp"
 #include "vertex_secondary_fold.hpp"  // Impl 2: distributed downfold of dW (no full Np^2 gather)
 #include "vertex_pi.icc"
 #include "vertex_sigma.icc"  // ISDF-Vertex Phase 1c: fused G^3 W^2 Sigma^C kernel
@@ -1236,7 +1239,57 @@ namespace solvers {
       // requires nkpts == nkpts_ibz (thc.cpp:207) -- Wannier+secondary is nosym only.
       nda::array<long, 1> ipts;
       nda::array<ComplexType, 4> Xa(ns, nkpts, nc, 0);   // (ns, nk, nc, Nm), filled below
-      if (not _wannier) {
+      const bool frozen = not _isdf_points_file.empty();
+      if (frozen) {
+        // W-int-1b: FROZEN secondary points (coarse->fine interpolation, notes/wannier_coarse_vertex_plan.md):
+        // the point list of the coarse run is reused on THIS mesh -- no selection. The collocation is gathered
+        // at the given points in the selection's convention (thc::collocation_at_points), rotated by U in
+        // Wannier mode (X_bar = X U); the transfer t(q) below is rebuilt on this mesh as usual. The points are
+        // density-FFT-grid indices, so the FFT mesh must match; the gather serves IBZ k only (nosym meshes).
+        utils::check(MF->nkpts() == MF->nkpts_ibz(),
+                     "vertex_t::build_secondary_basis: frozen secondary points are nosym-only for now "
+                     "(the collocation gather serves IBZ k only).");
+        nda::array<long, 1> mesh_in;
+        long nW_in = 0, W0_in = -1;
+        {
+          h5::file f(_isdf_points_file, 'r');
+          h5::group g(f);
+          nda::h5_read(g, "ipts", ipts);
+          nda::h5_read(g, "fft_mesh", mesh_in);
+          h5::h5_read(g, "window_size", nW_in);
+          h5::h5_read(g, "window_first", W0_in);
+        }
+        auto mesh_now = builder.rho_mesh();
+        utils::check(mesh_in.size() == 3 and mesh_in(0) == mesh_now(0) and mesh_in(1) == mesh_now(1) and
+                     mesh_in(2) == mesh_now(2),
+                     "vertex_t::build_secondary_basis: frozen points were selected on FFT mesh {} x {} x {}, "
+                     "this run's density grid is {} x {} x {} (same cell + same THC ecut required).",
+                     mesh_in(0), mesh_in(1), mesh_in(2), mesh_now(0), mesh_now(1), mesh_now(2));
+        utils::check(nW_in == long(_band_window.size()) and W0_in == long(_band_window.first()),
+                     "vertex_t::build_secondary_basis: frozen points belong to the band window [{}, {}), this "
+                     "run's is [{}, {}).", W0_in, W0_in + nW_in, _band_window.first(), _band_window.last());
+        const long Nm = ipts.extent(0);
+        auto Xw = builder.collocation_at_points(ipts, nda::range(0, nkpts), _band_window);   // (ns, nk, nW, Nm)
+        Xa = nda::array<ComplexType, 4>(ns, nkpts, nc, Nm);
+        Xa() = ComplexType(0.0);
+        const long nW = long(_band_window.size());
+        for (long is = 0; is < ns; ++is)
+          for (long ik = 0; ik < nkpts; ++ik)
+            for (long a = 0; a < nc; ++a)
+              for (long m = 0; m < Nm; ++m) {
+                if (_wannier) {
+                  ComplexType acc(0.0);
+                  for (long i = 0; i < nW; ++i) acc += Xw(is, ik, i, m) * _U_skia(is, ik, i, a);
+                  Xa(is, ik, a, m) = acc;
+                } else {
+                  Xa(is, ik, a, m) = Xw(is, ik, a, m);
+                }
+              }
+        app_log(1, "  [W-int] secondary ISDF points FROZEN from {}: N_m = {} (FFT mesh {} x {} x {}, window [{}, {}), "
+                   "{}); no point selection on this mesh.",
+                _isdf_points_file, Nm, mesh_now(0), mesh_now(1), mesh_now(2), _band_window.first(),
+                _band_window.last(), _wannier ? "X_bar = X U" : "window");
+      } else if (not _wannier) {
         auto [ip, dXa, dXb] = builder.interpolating_points<HOST_MEMORY>(
             int(iq_gamma), int(Nm_req), _band_window, _band_window);
         (void)dXb;   // empty optional for a_range == b_range at Gamma (single_psi path)
@@ -1305,7 +1358,7 @@ namespace solvers {
       // gather the distributed collocation (already assembled into Xa above), then
       // transpose to the kernels' (aux, orb) layout. Any fixed per-point phase/scale
       // convention of the selection output is absorbed by the least-squares transfer.
-      mpi->comm.all_reduce_in_place_n(Xa.data(), Xa.size(), std::plus<>{});
+      if (not frozen) mpi->comm.all_reduce_in_place_n(Xa.data(), Xa.size(), std::plus<>{});   // frozen: replicated
       _Xb_skma = nda::array<ComplexType, 4>(ns, nkpts, Nm, nc);
       for (long is = 0; is < ns; ++is)
         for (long ik = 0; ik < nkpts; ++ik)
@@ -1313,6 +1366,21 @@ namespace solvers {
             for (long m = 0; m < Nm; ++m)
               _Xb_skma(is, ik, m, a) = Xa(is, ik, a, m);
       _Nm = Nm;
+      _sec_ipts = ipts;
+      if (_isdf_points_dump and mpi->comm.root()) {
+        // W-int-1b: the point list for a fine-mesh run to freeze (pol_vertex_isdf_points_file)
+        const std::string fn = _run_prefix + ".secpts.h5";
+        h5::file f(fn, 'w');
+        h5::group g(f);
+        nda::h5_write(g, "ipts", ipts);
+        nda::h5_write(g, "fft_mesh", builder.rho_mesh());
+        h5::h5_write(g, "window_size", long(_band_window.size()));
+        h5::h5_write(g, "window_first", long(_band_window.first()));
+        h5::h5_write(g, "wannier", long(_wannier ? 1 : 0));
+        h5::h5_write(g, "nm", Nm);
+        app_log(1, "  [W-int] secondary ISDF points written to {} (N_m = {}) -- freeze them on the fine mesh with "
+                   "pol_vertex_isdf_points_file.", fn, Nm);
+      }
     }
 
     // ---- conditioning cap (vertex_isdf_cond_max): applied PER Q in the transfer solve ---
@@ -4193,6 +4261,7 @@ namespace solvers {
 
   long vertex_t::ensure_secondary_basis(MBState &mb_state, THC_ERI auto const &thc) {
     decltype(nda::range::all) all;
+    _run_prefix = mb_state.coqui_prefix;   // W-int-1b: for the <prefix>.secpts.h5 / .pol_nu0 dumps
     auto mpi = thc.mpi();
     auto MF = thc.MF();
     const long nkpts = MF->nkpts();

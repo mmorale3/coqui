@@ -631,6 +631,14 @@ namespace solvers {
     double _iso_defect = 0.0;
     // wan.h5 the projector was built from (shared-object demand D2)
     std::string _wannier_file;
+    // W-int-1b (notes/wannier_coarse_vertex_plan.md): the coarse->fine interpolation knobs
+    std::string _isdf_points_file;      // pol_vertex_isdf_points_file: FREEZE the secondary ISDF points from this file
+    bool _isdf_points_dump = false;     // pol_vertex_isdf_points_dump: write <prefix>.secpts.h5 after the selection
+    nda::array<long, 1> _sec_ipts;      // the secondary points in use (density-FFT-grid indices)
+    std::string _wannier_frame = "aux"; // pol_vertex_wannier_frame: the dynbse output frame in Wannier mode ("aux" | "pair")
+    std::string _pol_interp_file;       // pol_vertex_interp_file: the eps readout consumes this Pi(q)_{MN} (frozen points)
+    std::string _pol_interp_col = "gam1";
+    std::string _run_prefix;            // mb_state.coqui_prefix, captured at ensure_secondary_basis for the dumps
 
     // q->0 policy on the rung transfers: "ignore_g0" (v2 default), "gygi"-class,
     // or "v1_skip" (the v1 blanket Gamma-skip fallback). See the constructor doc
@@ -1600,6 +1608,22 @@ namespace solvers {
      *  re-solving (a walltime kill loses only the units in flight). */
     void set_ladder_dyn_dump(bool on) { _dyn_dump = on; }
     bool ladder_dyn_dump() const { return _dyn_dump; }
+    /** W-int-1b: pol_vertex_isdf_points_file (freeze the secondary ISDF points from a coarse run's
+     *  <prefix>.secpts.h5) / pol_vertex_isdf_points_dump (write this run's points). */
+    void set_isdf_points(std::string const &file, bool dump) { _isdf_points_file = file; _isdf_points_dump = dump; }
+    std::string const &isdf_points_file() const { return _isdf_points_file; }
+    bool isdf_points_dump() const { return _isdf_points_dump; }
+    nda::array<long, 1> const &secondary_points() const { return _sec_ipts; }
+    /** pol_vertex_wannier_frame ("aux" | "pair"): in Wannier mode the dynbse outputs are the aux/point-frame
+     *  Pi(q)_{MN} on the (frozen-able) secondary points -- the interpolable frame -- or the same-cell MLWF-pair
+     *  Pi_loc (the W-int-0 frame, = the Delta = 0 block of the pair-separation-resolved response). */
+    void set_wannier_frame(std::string f) { _wannier_frame = std::move(f); }
+    std::string const &wannier_frame() const { return _wannier_frame; }
+    /** pol_vertex_interp_file / _col: the eps readout takes Pi(q)_{MN} (this mesh's q, the frozen points) from
+     *  the file (a coarse run's <prefix>.pol_nu0.g<n>.h5, or the offline Route-B interpolant) instead of solving. */
+    void set_pol_interp(std::string const &file, std::string const &col) { _pol_interp_file = file; _pol_interp_col = col; }
+    std::string const &pol_interp_file() const { return _pol_interp_file; }
+    std::string const &pol_interp_col() const { return _pol_interp_col; }
     /** pol_vertex_dyn_dense (default true): the dynamic rung as dense per-tau blocks K_d(s) = Kbig[W_d(s)] on the
      *  PH-symmetric half of the tau nodes (compute-bound gemms; nt/2 x D^2 complex per rank: 5.4 GB at Si 4^3/8,
      *  27 GB at C = [0,12)); false = the THC pair-space streaming route (memory-bandwidth-bound). */

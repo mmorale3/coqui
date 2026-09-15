@@ -609,6 +609,13 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
             io::get_value_with_default<double>(pt,"pol_vertex_dyn_sign",-1.0));
         vertex.set_ladder_dyn_rhs_block(io::get_value_with_default<long>(pt,"pol_vertex_dyn_rhs_block",32));
         vertex.set_ladder_dyn_dump(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_dump",false));
+        // W-int-1b (notes/wannier_coarse_vertex_plan.md): freeze / dump the secondary ISDF points, the Wannier output
+        // frame, and the fine-mesh consumer of an interpolated Pi(q)_{MN}
+        vertex.set_isdf_points(io::get_value_with_default<std::string>(pt,"pol_vertex_isdf_points_file",""),
+                            io::get_value_with_default<bool>(pt,"pol_vertex_isdf_points_dump",false));
+        vertex.set_wannier_frame(io::get_value_with_default<std::string>(pt,"pol_vertex_wannier_frame","aux"));
+        vertex.set_pol_interp(io::get_value_with_default<std::string>(pt,"pol_vertex_interp_file",""),
+                           io::get_value_with_default<std::string>(pt,"pol_vertex_interp_col","gam1"));
         vertex.set_ladder_dyn_dense(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_dense",true));
         vertex.set_ladder_dyn_union_stride(io::get_value_with_default<long>(pt,"pol_vertex_dyn_union_stride",1));
         vertex.set_ladder_dyn_table_mode(io::get_value_with_default<int>(pt,"pol_vertex_dyn_table_mode",0));
@@ -987,6 +994,13 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
             io::get_value_with_default<double>(pt,"pol_vertex_dyn_sign",-1.0));
         pol_vertex_carrier.set_ladder_dyn_rhs_block(io::get_value_with_default<long>(pt,"pol_vertex_dyn_rhs_block",32));
         pol_vertex_carrier.set_ladder_dyn_dump(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_dump",false));
+        // W-int-1b (notes/wannier_coarse_vertex_plan.md): freeze / dump the secondary ISDF points, the Wannier output
+        // frame, and the fine-mesh consumer of an interpolated Pi(q)_{MN}
+        pol_vertex_carrier.set_isdf_points(io::get_value_with_default<std::string>(pt,"pol_vertex_isdf_points_file",""),
+                            io::get_value_with_default<bool>(pt,"pol_vertex_isdf_points_dump",false));
+        pol_vertex_carrier.set_wannier_frame(io::get_value_with_default<std::string>(pt,"pol_vertex_wannier_frame","aux"));
+        pol_vertex_carrier.set_pol_interp(io::get_value_with_default<std::string>(pt,"pol_vertex_interp_file",""),
+                           io::get_value_with_default<std::string>(pt,"pol_vertex_interp_col","gam1"));
         pol_vertex_carrier.set_ladder_dyn_dense(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_dense",true));
         pol_vertex_carrier.set_ladder_dyn_union_stride(io::get_value_with_default<long>(pt,"pol_vertex_dyn_union_stride",1));
         pol_vertex_carrier.set_ladder_dyn_table_mode(io::get_value_with_default<int>(pt,"pol_vertex_dyn_table_mode",0));
@@ -1218,6 +1232,13 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
             io::get_value_with_default<double>(pt,"pol_vertex_dyn_sign",-1.0));
         pol_vertex_carrier.set_ladder_dyn_rhs_block(io::get_value_with_default<long>(pt,"pol_vertex_dyn_rhs_block",32));
         pol_vertex_carrier.set_ladder_dyn_dump(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_dump",false));
+        // W-int-1b (notes/wannier_coarse_vertex_plan.md): freeze / dump the secondary ISDF points, the Wannier output
+        // frame, and the fine-mesh consumer of an interpolated Pi(q)_{MN}
+        pol_vertex_carrier.set_isdf_points(io::get_value_with_default<std::string>(pt,"pol_vertex_isdf_points_file",""),
+                            io::get_value_with_default<bool>(pt,"pol_vertex_isdf_points_dump",false));
+        pol_vertex_carrier.set_wannier_frame(io::get_value_with_default<std::string>(pt,"pol_vertex_wannier_frame","aux"));
+        pol_vertex_carrier.set_pol_interp(io::get_value_with_default<std::string>(pt,"pol_vertex_interp_file",""),
+                           io::get_value_with_default<std::string>(pt,"pol_vertex_interp_col","gam1"));
         pol_vertex_carrier.set_ladder_dyn_dense(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_dense",true));
         pol_vertex_carrier.set_ladder_dyn_union_stride(io::get_value_with_default<long>(pt,"pol_vertex_dyn_union_stride",1));
         pol_vertex_carrier.set_ladder_dyn_table_mode(io::get_value_with_default<int>(pt,"pol_vertex_dyn_table_mode",0));
@@ -1491,6 +1512,13 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
             io::get_value_with_default<double>(pt,"pol_vertex_dyn_sign",-1.0));
         vertex.set_ladder_dyn_rhs_block(io::get_value_with_default<long>(pt,"pol_vertex_dyn_rhs_block",32));
         vertex.set_ladder_dyn_dump(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_dump",false));
+        // W-int-1b (notes/wannier_coarse_vertex_plan.md): freeze / dump the secondary ISDF points, the Wannier output
+        // frame, and the fine-mesh consumer of an interpolated Pi(q)_{MN}
+        vertex.set_isdf_points(io::get_value_with_default<std::string>(pt,"pol_vertex_isdf_points_file",""),
+                            io::get_value_with_default<bool>(pt,"pol_vertex_isdf_points_dump",false));
+        vertex.set_wannier_frame(io::get_value_with_default<std::string>(pt,"pol_vertex_wannier_frame","aux"));
+        vertex.set_pol_interp(io::get_value_with_default<std::string>(pt,"pol_vertex_interp_file",""),
+                           io::get_value_with_default<std::string>(pt,"pol_vertex_interp_col","gam1"));
         vertex.set_ladder_dyn_dense(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_dense",true));
         vertex.set_ladder_dyn_union_stride(io::get_value_with_default<long>(pt,"pol_vertex_dyn_union_stride",1));
         vertex.set_ladder_dyn_table_mode(io::get_value_with_default<int>(pt,"pol_vertex_dyn_table_mode",0));
@@ -1794,6 +1822,13 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
             io::get_value_with_default<double>(pt,"pol_vertex_dyn_sign",-1.0));
         pol_vertex_carrier.set_ladder_dyn_rhs_block(io::get_value_with_default<long>(pt,"pol_vertex_dyn_rhs_block",32));
         pol_vertex_carrier.set_ladder_dyn_dump(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_dump",false));
+        // W-int-1b (notes/wannier_coarse_vertex_plan.md): freeze / dump the secondary ISDF points, the Wannier output
+        // frame, and the fine-mesh consumer of an interpolated Pi(q)_{MN}
+        pol_vertex_carrier.set_isdf_points(io::get_value_with_default<std::string>(pt,"pol_vertex_isdf_points_file",""),
+                            io::get_value_with_default<bool>(pt,"pol_vertex_isdf_points_dump",false));
+        pol_vertex_carrier.set_wannier_frame(io::get_value_with_default<std::string>(pt,"pol_vertex_wannier_frame","aux"));
+        pol_vertex_carrier.set_pol_interp(io::get_value_with_default<std::string>(pt,"pol_vertex_interp_file",""),
+                           io::get_value_with_default<std::string>(pt,"pol_vertex_interp_col","gam1"));
         pol_vertex_carrier.set_ladder_dyn_dense(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_dense",true));
         pol_vertex_carrier.set_ladder_dyn_union_stride(io::get_value_with_default<long>(pt,"pol_vertex_dyn_union_stride",1));
         pol_vertex_carrier.set_ladder_dyn_table_mode(io::get_value_with_default<int>(pt,"pol_vertex_dyn_table_mode",0));

@@ -1678,7 +1678,8 @@ namespace solvers {
     auto tools_h = vd::make_dyn_tools(*_ft, _dyn_iaft_prec, G_CC);
     auto &tools = *tools_h.tools;
     const long nq = long(_W0b_qmm.value().shape(0)), Nm = _Xb_skma.shape(2);   // nq_ibz on a symmetric mesh
-    const long nout = _wannier ? _M * _M : Nm;   // W-int-0/1: Wannier-pair (nab = M^2) or aux (Nm)
+    const bool pair_frame = _wannier and (_wannier_frame == "pair");   // W-int-1b: "aux" (points) is the interpolable frame
+    const long nout = pair_frame ? _M * _M : Nm;
     std::vector<long> nu0 = {tools.m0};
     nda::array<ComplexType, 4> Ps(1, nq, nout, nout), P1(1, nq, nout, nout), Pg(1, nq, nout, nout), Pd(1, nq, nout, nout);
     vd::dyn_opts o;
@@ -1692,7 +1693,11 @@ namespace solvers {
     if (_dyn_gamma1_only) app_log(1, "  [scGW-tilde T2] pol_vertex_dyn_gamma1_only: GMRES resummation SKIPPED; the resummed column repeats Gamma_1.");
     o.sched_comm = mpi->comm.get();      // dynamic longest-first scheduling of the (s, q, nu) units
     o.readout_tol = 1e-6;                // the physical readout's own stop (the 1e-8 residual is below the refit floor)
-    if (_wannier) { o.wannier_pairs = true; app_log(1, "  [scGW-tilde T2] Wannier-pair vertex output (W-int-0/1): Pi_loc(q) in the MLWF pair basis (M = {}, nab = {}; G_bar / X_bar inputs, identity pair legs) -- dumped for coarse->fine interpolation.", _M, nout); }
+    if (_wannier) {
+      o.wannier_pairs = pair_frame;
+      if (pair_frame) app_log(1, "  [scGW-tilde T2] Wannier-pair vertex output (W-int-0/1): Pi_loc(q) in the MLWF pair basis (M = {}, nab = {}; G_bar / X_bar inputs, identity pair legs) -- the SAME-CELL pair block.", _M, nout);
+      else app_log(1, "  [scGW-tilde T2] Wannier-C vertex output in the aux/point frame (W-int-1b): Pi(q)_{{MN}} on the N_m = {} secondary points (M = {} MLWFs, G_bar / X_bar inputs) -- the interpolable frame (freeze the points on the fine mesh).", nout, _M);
+    }
     if (_dyn_dump) o.dump_prefix = mb_state.coqui_prefix + ".dynunits.nu0.g" + std::to_string(gen);
     // D3/D4 configuration at inu = 0: the shared aux grid with the Dsq/Dcb tables, no mask (the
     // union grid / in-gap mask / twisted-pair basis are the inu != 0 machinery of D2e, still open)
@@ -1716,6 +1721,36 @@ namespace solvers {
     r.Pi_dyn1 = nda::array<ComplexType, 3>(nq, nout, nout);   r.Pi_dyn1 = P1(0, all, all, all);
     r.Pi_gam1 = nda::array<ComplexType, 3>(nq, nout, nout);   r.Pi_gam1 = Pg(0, all, all, all);
     r.Pi_dyn = nda::array<ComplexType, 3>(nq, nout, nout);    r.Pi_dyn = Pd(0, all, all, all);
+    if (_dyn_dump and mpi->comm.root()) {
+      // W-int-1b: the assembled inu = 0 columns as ONE h5 (the offline Route-B tool's input, and the fine-mesh
+      // consumer's format: pol_vertex_interp_file). q in crystal coordinates (this run's Qpts order).
+      const std::string fn = mb_state.coqui_prefix + ".pol_nu0.g" + std::to_string(gen) + ".h5";
+      auto lat = MF->lattv();                          // rows a_i (bohr); a_i . b_j = 2 pi delta_ij
+      auto Q = MF->Qpts();                             // Cartesian (bohr^-1, 2 pi included)
+      nda::array<double, 2> qc(nq, 3);
+      for (long iq = 0; iq < nq; ++iq)
+        for (long i = 0; i < 3; ++i) {
+          double v = 0.0;
+          for (long j = 0; j < 3; ++j) v += lat(i, j) * Q(iq, j);
+          qc(iq, i) = v / (2.0 * M_PI);
+        }
+      h5::file f(fn, 'w');
+      h5::group g(f);
+      nda::h5_write(g, "q", qc);
+      nda::h5_write(g, "Pi_static", r.Pi_static);
+      nda::h5_write(g, "Pi_dyn1", r.Pi_dyn1);
+      nda::h5_write(g, "Pi_gam1", r.Pi_gam1);
+      nda::h5_write(g, "Pi_dyn", r.Pi_dyn);
+      h5::h5_write(g, "nout", nout);
+      h5::h5_write(g, "frame", std::string(pair_frame ? "pair" : "aux"));
+      h5::h5_write(g, "wannier", long(_wannier ? 1 : 0));
+      h5::h5_write(g, "nm", Nm);
+      h5::h5_write(g, "window_first", long(_band_window.first()));
+      h5::h5_write(g, "window_size", long(_band_window.size()));
+      if (_sec_ipts.size() > 0) nda::h5_write(g, "ipts", _sec_ipts);
+      app_log(1, "  [W-int] inu = 0 vertex columns written to {} ({} q x {} x {}, frame {}).", fn, nq, nout, nout,
+              pair_frame ? "pair" : "aux");
+    }
     r.ritz_max = met.ritz_max; r.refit_err = met.refit_err_max; r.fit_err_G = met.fit_err_G; r.rr_G = met.rr_G;
     r.herm_dyn = hd; r.it_max = met.it_max; r.it_sum = met.it_sum; r.nunits = met.nunits;
     r.all_converged = (met.nconv == met.nunits); r.t_solve = met.t_solve; r.rss_gb = met.rss_max_gb;

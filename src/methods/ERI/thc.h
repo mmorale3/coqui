@@ -134,6 +134,15 @@ class thc
                      std::optional<_darray_t_<MEM,4>>
                     >;
 
+  /**
+   * W-int-1b (coarse->fine vertex interpolation, notes/wannier_coarse_vertex_plan.md): the collocation
+   * of the orbitals a_rg at a GIVEN point list IPts (density-FFT-grid indices), for all k in kp_rg, in the
+   * interpolating_points output convention X(s, k, a, u) = u_{a k}(r_u) e^{i k.r_u}. Lets a fine-mesh
+   * run FREEZE the ISDF points selected on a coarse mesh. Replicated host array (ns, nk, na, Np).
+   * (The convention is psi_{a k}(r_u) = u_{a k}(r_u) e^{i k.r_u}; pinned by the W-int-1b gate.)
+   */
+  nda::array<ComplexType,4> collocation_at_points(nda::array<long,1> const& IPts, nda::range kp_rg, nda::range a_rg);
+  nda::array<long,1> rho_mesh() const { return nda::array<long,1>{long(rho_g.mesh(0)), long(rho_g.mesh(1)), long(rho_g.mesh(2))}; }
   template<MEMORY_SPACE MEM = HOST_MEMORY>
   auto interpolating_points(nda::MemoryArrayOfRank<4> auto const& C_skai,
               int iq = 0, int max = -1, double* eff_thresh = nullptr)

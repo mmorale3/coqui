@@ -548,6 +548,18 @@ void thc::write_meta_data(h5::group& gh5, std::string format)
 // definition of more complicated templates
 #include "methods/ERI/thc.icc"
 
+// W-int-1b: defined AFTER the .icc bodies (load_basis_subset_fft_grid has a deduced return type)
+nda::array<ComplexType,4> methods::thc::collocation_at_points(nda::array<long,1> const& IPts, nda::range kp_rg, nda::range a_rg)
+{
+  // load_basis_subset_fft_grid returns Psia(s, k, a, u) = u_{a k}(r_u) e^{i k.r_u} = psi_{a k}(r_u), which IS the
+  // interpolating_points (chol_metric_impl) collocation convention at the selected points -- verified to 7e-14
+  // against the selection output on the same points (W-int-1b gate).
+  auto [Psia, Psib] = load_basis_subset_fft_grid<HOST_MEMORY>(IPts, 0, kp_rg, a_rg, nda::range(0, 0));
+  (void)Psib;
+  return nda::array<ComplexType,4>(Psia);
+}
+
+
 
 // instantiation of "public" templates
 namespace methods 
