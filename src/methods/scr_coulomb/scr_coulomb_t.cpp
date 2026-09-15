@@ -446,6 +446,13 @@ namespace solvers {
         _vertex->pol_isdf_rank(), _vertex->pol_isdf_svd_tol(),
         _vertex->pol_isdf_thresh(), _vertex->pol_isdf_cond_max(), "static");
     _pol_vtx->set_isdf_distr_tol(_vertex->pol_isdf_distr_tol());
+    // W-int-0: if the user vertex is Wannierized, the private readout instance inherits the MLWF state
+    // so the pol-vertex/dynbse runs in the mesh-independent Wannier-pair frame (coarse->fine interpolation).
+    if (_vertex->wannier()) {
+      _pol_vtx->adopt_wannier(*_vertex);
+      app_log(1, "  [scGW-tilde L2] readout instance inherits the Wannier projector (M = {}): the vertex "
+                 "polarization is produced in the MLWF-pair frame.", _vertex->subspace_rank());
+    }
     // increment B: the ladder solve-grid knobs live on the knob carrier; the READOUT
     // instance is the one that actually runs eval_pol_ladder_whalf, so they travel here.
     _pol_vtx->set_ladder_solve(_vertex->ladder_solve_grid(),

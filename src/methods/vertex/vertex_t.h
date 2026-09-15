@@ -575,6 +575,17 @@ namespace solvers {
      */
     void set_wannier_projector(methods::projector_t const &proj, bool loewdin = true);
 
+    /** W-int-0: copy the installed MLWF state (U, M, W_rng) from another already-Wannierized vertex.
+     *  scr_coulomb's private readout instance (which actually runs the pol-vertex/dynbse) uses this to
+     *  inherit the projector set on the user's vertex, since set_wannier_projector needs the projector_t
+     *  object (not just U). Same-class access to src's privates. No-op semantics: only call when src is
+     *  Wannier; the readout instance is created "2nd_exchange"-enabled so active() holds after adoption. */
+    void adopt_wannier(vertex_t const &src) {
+      utils::check(src._wannier and src._M > 0, "vertex_t::adopt_wannier: source vertex is not in Wannier mode.");
+      _wannier = src._wannier; _M = src._M; _U_skia = src._U_skia; _band_window = src._band_window;
+      _wannier_file = src._wannier_file; _iso_defect = src._iso_defect;
+    }
+
     // WANNIER MODE predicate: a general U has been installed (window mode = false)
     bool wannier() const { return _wannier; }
     // subspace rank M (= _band_window.size() in window mode, = _U.shape(3) in
