@@ -1665,7 +1665,7 @@ namespace solvers {
     vertex_ladder_detail::prof_watch twatch;
     dynbse_nu0_result r;
     utils::check(active() and secondary(), "vertex_t::eval_pol_dynbse_nu0: requires an ACTIVE secondary-basis vertex.");
-    utils::check(not _wannier, "vertex_t::eval_pol_dynbse_nu0: window mode only.");
+    // W-int-0: _wannier => the outputs are the MLWF-pair polarization (dumped for coarse->fine interpolation).
     utils::check(_W0b_qmm.has_value(), "vertex_t::eval_pol_dynbse_nu0: W0bar is absent -- build_w0 must run first.");
     utils::check(_Wb_qwmm.has_value(),
                  "vertex_t::eval_pol_dynbse_nu0: the W-bar cache is absent -- cache_w must run on this instance "
@@ -1680,8 +1680,9 @@ namespace solvers {
     auto tools_h = vd::make_dyn_tools(*_ft, _dyn_iaft_prec, G_CC);
     auto &tools = *tools_h.tools;
     const long nq = long(_W0b_qmm.value().shape(0)), Nm = _Xb_skma.shape(2);   // nq_ibz on a symmetric mesh
+    const long nout = _wannier ? long(_U_skia.shape(2) * _U_skia.shape(2)) : Nm;   // W-int-0: Wannier-pair (nab) or aux (Nm)
     std::vector<long> nu0 = {tools.m0};
-    nda::array<ComplexType, 4> Ps(1, nq, Nm, Nm), P1(1, nq, Nm, Nm), Pg(1, nq, Nm, Nm), Pd(1, nq, Nm, Nm);
+    nda::array<ComplexType, 4> Ps(1, nq, nout, nout), P1(1, nq, nout, nout), Pg(1, nq, nout, nout), Pd(1, nq, nout, nout);
     vd::dyn_opts o;
     o.kcrys = std::addressof(kc);
     o.tol = _dyn_tol; o.maxit = _dyn_maxit; o.gmres_m = _dyn_gmres; o.sign_ks = _dyn_sign;
@@ -1693,6 +1694,7 @@ namespace solvers {
     if (_dyn_gamma1_only) app_log(1, "  [scGW-tilde T2] pol_vertex_dyn_gamma1_only: GMRES resummation SKIPPED; the resummed column repeats Gamma_1.");
     o.sched_comm = mpi->comm.get();      // dynamic longest-first scheduling of the (s, q, nu) units
     o.readout_tol = 1e-6;                // the physical readout's own stop (the 1e-8 residual is below the refit floor)
+    if (_wannier) { o.U_skia = &_U_skia; app_log(1, "  [scGW-tilde T2] Wannier-pair vertex output (W-int-0): Pi_loc(q) in the MLWF pair basis (nab = {}) -- dumped for coarse->fine interpolation.", nout); }
     if (_dyn_dump) o.dump_prefix = mb_state.coqui_prefix + ".dynunits.nu0.g" + std::to_string(gen);
     // D3/D4 configuration at inu = 0: the shared aux grid with the Dsq/Dcb tables, no mask (the
     // union grid / in-gap mask / twisted-pair basis are the inu != 0 machinery of D2e, still open)
@@ -1712,10 +1714,10 @@ namespace solvers {
     met.reduce(mpi->comm);
     const double hs = vertex_ladder_detail::hermitize_mn(Ps), h1 = vertex_ladder_detail::hermitize_mn(P1);
     const double hg = vertex_ladder_detail::hermitize_mn(Pg), hd = vertex_ladder_detail::hermitize_mn(Pd);
-    r.Pi_static = nda::array<ComplexType, 3>(nq, Nm, Nm); r.Pi_static = Ps(0, all, all, all);
-    r.Pi_dyn1 = nda::array<ComplexType, 3>(nq, Nm, Nm);   r.Pi_dyn1 = P1(0, all, all, all);
-    r.Pi_gam1 = nda::array<ComplexType, 3>(nq, Nm, Nm);   r.Pi_gam1 = Pg(0, all, all, all);
-    r.Pi_dyn = nda::array<ComplexType, 3>(nq, Nm, Nm);    r.Pi_dyn = Pd(0, all, all, all);
+    r.Pi_static = nda::array<ComplexType, 3>(nq, nout, nout); r.Pi_static = Ps(0, all, all, all);
+    r.Pi_dyn1 = nda::array<ComplexType, 3>(nq, nout, nout);   r.Pi_dyn1 = P1(0, all, all, all);
+    r.Pi_gam1 = nda::array<ComplexType, 3>(nq, nout, nout);   r.Pi_gam1 = Pg(0, all, all, all);
+    r.Pi_dyn = nda::array<ComplexType, 3>(nq, nout, nout);    r.Pi_dyn = Pd(0, all, all, all);
     r.ritz_max = met.ritz_max; r.refit_err = met.refit_err_max; r.fit_err_G = met.fit_err_G; r.rr_G = met.rr_G;
     r.herm_dyn = hd; r.it_max = met.it_max; r.it_sum = met.it_sum; r.nunits = met.nunits;
     r.all_converged = (met.nconv == met.nunits); r.t_solve = met.t_solve; r.rss_gb = met.rss_max_gb;

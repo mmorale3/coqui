@@ -1194,8 +1194,14 @@ namespace solvers {
     if (dyn_rung) {
       ++_pol_dyn_calls;
       dres.emplace(_pol_vtx->eval_pol_dynbse_nu0(mb_state, thc, _pol_dyn_calls));
-      utils::check(dres->Pi_dyn.shape(0) == nq and dres->Pi_dyn.shape(1) == Nm,
-                   "pol_ladder_eps_readout: dynamic-rung block shape mismatch.");
+      // W-int-0: in Wannier mode eval_pol_dynbse_nu0 dumped Pi_loc(q) in the MLWF-pair basis (nab != Nm);
+      // consumed OFFLINE for coarse->fine interpolation, not by this aux eps readout -- skip the aux shape
+      // check + the dynamic-column upfold below. The static ladder eps columns are unaffected.
+      if (not _pol_vtx->wannier())
+        utils::check(dres->Pi_dyn.shape(0) == nq and dres->Pi_dyn.shape(1) == Nm,
+                     "pol_ladder_eps_readout: dynamic-rung block shape mismatch.");
+      else
+        app_log(1, "  [scGW-tilde T2] Wannier mode: dynamic-rung eps columns SKIPPED (Pi_loc dumped for interpolation).");
       _pol_dyn_ritz = dres->ritz_max;
     }
 
@@ -1269,7 +1275,7 @@ namespace solvers {
         nda::blas::gemm(Pd_qmm(iq, all, all), tq, tmpM);
         nda::blas::gemm(td, tmpM, dPd);
       }
-      if (dyn_rung) {                                             // the four dynamic-rung blocks
+      if (dyn_rung and not _pol_vtx->wannier()) {                // the four dynamic-rung blocks (aux; skipped in Wannier mode)
         auto up = [&](nda::array<ComplexType, 3> const &B, nda::array<ComplexType, 2> &out) {
           nda::blas::gemm(B(iq, all, all), tq, tmpM);
           nda::blas::gemm(td, tmpM, out);
