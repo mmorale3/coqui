@@ -85,6 +85,10 @@ namespace solvers {
                                                      // (and ksum_ft), the rung's k-sum runs through kmesh_ft
       bool ksum_ft = true;
       double vmask_lo = 0.0, vmask_hi = 0.0;   // the in-gap vertex-node mask (pol_vertex_dyn_vmask), active when hi > lo
+      nda::array<ComplexType, 4> const *U_skia = nullptr;   // W-int-0: MLWF legs (ns,nk,norb,nc); non-null => the
+                                  // outputs are the Wannier-PAIR polarization (nab=norb^2) via the E-leg sandwich
+                                  // E(k;q)_{(ab),(mn)} = U_{ma}(k) conj(U_{nb}(k+q)) -- the mesh-independent frame for
+                                  // coarse->fine interpolation (notes/wannier_coarse_vertex_plan.md). nullptr = aux (Nm).
       double tfold = 0.0;         // the small-nu fold ratio (pol_vertex_dyn_tfold): T_a with |eps_a| >= tfold |nu| folded into U
       int table_mode = 0;         // inu != 0 twisted-pair tables: 0 = fitted on the dense tau grid (default), 1 = the
                                   // exact partial fractions through Dsq (1/nu-amplified; the diagnostic route)
@@ -608,8 +612,11 @@ namespace solvers {
       decltype(nda::range::all) all;
       vertex_ladder_detail::prof_watch watch;
       const bool sym = (symc != nullptr and symc->active);
+      const bool wan = (opt.U_skia != nullptr);   // W-int-0: Wannier-pair output frame
       const long nt = G_CC.shape(0), ns = G_CC.shape(1), nk = G_CC.shape(2), nc = G_CC.shape(3);
       const long Nm = Xb.shape(2), nc2 = nc * nc, D = nc2 * nk;
+      const long norb = wan ? opt.U_skia->shape(2) : nc;   // MLWF count
+      const long nout = wan ? norb * norb : Nm;             // external-leg / output dimension (aux Nm, or Wannier pair)
       const long nq = W0b.shape(0), nw_b = tools.nw_b;
       const long nw_half = (nw_b % 2 == 0) ? nw_b / 2 : nw_b / 2 + 1;
       utils::check(not sym or opt.dense_rung, "pair_space_ladder_dyn: IBZ symmetry currently requires the dense rung "
@@ -633,8 +640,8 @@ namespace solvers {
       utils::check(nt == tools.nt_f, "pair_space_ladder_dyn: G tau axis {} != nt_f {}.", nt, tools.nt_f);
       for (auto *o : {Pi_static, Pi_dyn1, Pi_gam1, Pi_dyn})
         if (o != nullptr) {
-          utils::check(o->shape(0) == nnu and o->shape(1) == nq and o->shape(2) == Nm and o->shape(3) == Nm,
-                       "pair_space_ladder_dyn: output shape mismatch.");
+          utils::check(o->shape(0) == nnu and o->shape(1) == nq and o->shape(2) == nout and o->shape(3) == nout,
+                       "pair_space_ladder_dyn: output shape mismatch (nout = {}).", nout);
           (*o)() = cplx(0.0);
         }
       for (auto m : nu_list) utils::check(m >= 0 and m < nw_b, "pair_space_ladder_dyn: nu index {} out of range.", m);
@@ -766,7 +773,7 @@ namespace solvers {
       const cplx scale_k(opt.sign_ks / double(nk), 0.0);
       const auto metric = db::build_tf_metric(b);       // the tau-value inner product of the solves
       const long nb = std::min(Nm, 16l);
-      const long nrb = (opt.rhs_block > 0) ? std::min(opt.rhs_block, Nm) : Nm;   // RHS column block width
+      const long nrb = (opt.rhs_block > 0) ? std::min(opt.rhs_block, nout) : nout;   // RHS column block width
       // the mesh Fourier transform of the rung's k-sum (self-checked; direct sum otherwise)
       kmesh_ft kft;
       // the transform pays off when nk is large (the direct sum's Nm^2 tiny gemms are overhead-bound
@@ -787,7 +794,7 @@ namespace solvers {
       const long nthr = std::max(1l, utils::omp_threads());
       nda::array<cplx, 2> Kbig(D, D), Ks(D, D);
       nda::array<cplx, 3> Cb_k(nk, nc2, nc2);
-      nda::array<cplx, 4> Dc(nk, nc, nc, Nm);
+      nda::array<cplx, 4> Dc(nk, nc, nc, nout);   // external legs: aux (Nm) or Wannier-pair (nab) columns
       // per-block scratch, sized to the current RHS block width nR (the kd operator reads F.nR)
       nda::array<cplx, 4> Dblk, CbD, Vout, Fs, Ys;
       nda::array<cplx, 3> Fs3, Os3;
@@ -806,6 +813,13 @@ namespace solvers {
         Yc2 = nda::array<cplx, 2>(nt, nk * nc2 * nR);
       };
 
+      if (wan) {
+        utils::check(opt.U_skia->shape(0) == ns and opt.U_skia->shape(1) == nk and opt.U_skia->shape(3) == nc,
+                     "pair_space_ladder_dyn: U_skia is {} x {} x {} x {}, expected {} x nk x norb x {}.",
+                     opt.U_skia->shape(0), opt.U_skia->shape(1), opt.U_skia->shape(2), opt.U_skia->shape(3), ns, nc);
+        if (rank == 0) app_log(1, "  [dynbse] Wannier-pair output: norb = {}, nout = nab = {} (aux Nm = {} used only "
+                               "internally for the rung)", norb, nout, Nm);
+      }
       std::vector<long> qlist;
       if (opt.q_subset != nullptr) {
         qlist = *opt.q_subset;
@@ -868,8 +882,8 @@ namespace solvers {
             while (in) {
               long hdr[5];
               if (not in.read(reinterpret_cast<char *>(hdr), sizeof(hdr))) break;
-              if (hdr[3] != Nm or hdr[4] != 4) break;
-              std::vector<cplx> blk(static_cast<size_t>(4 * Nm * Nm));
+              if (hdr[3] != nout or hdr[4] != 4) break;
+              std::vector<cplx> blk(static_cast<size_t>(4 * nout * nout));
               if (not in.read(reinterpret_cast<char *>(blk.data()), std::streamsize(blk.size() * sizeof(cplx)))) break;
               dumped[std::make_tuple(hdr[0], hdr[1], hdr[2])] = std::move(blk);
               ++nrec;
@@ -894,8 +908,8 @@ namespace solvers {
             nda::array<cplx, 4> *outs[4] = {Pi_static, Pi_dyn1, Pi_gam1, Pi_dyn};
             for (int c = 0; c < 4; ++c)
               if (outs[c] != nullptr)
-                for (long M = 0; M < Nm; ++M)
-                  for (long N = 0; N < Nm; ++N) (*outs[c])(jn_unit, iq, M, N) = blk[size_t((c * Nm + M) * Nm + N)];
+                for (long M = 0; M < nout; ++M)
+                  for (long N = 0; N < nout; ++N) (*outs[c])(jn_unit, iq, M, N) = blk[size_t((c * nout + M) * nout + N)];
             if (met) { ++met->nunits; ++met->nconv; }
             continue;
           }
@@ -903,12 +917,22 @@ namespace solvers {
         if (rank == 0)
           app_log(2, "  [dynbse] rank 0 takes unit {} (s {}, q {}, nu node {}), its {}-th{}", u, is, iq,
                   nu_list[size_t(jn_unit)], units_taken, dyn_sched ? " (dynamic scheduling)" : "");
-        // ---- the legs and the static rung of this unit ------------------------------------------
+        // ---- the external legs of this unit: aux (window) or the MLWF pair E (Wannier, W-int-0) --------
         for (long k = 0; k < nk; ++k) {
           const long kq = kpq(iq, k);
-          for (long a = 0; a < nc; ++a)
-            for (long bb2 = 0; bb2 < nc; ++bb2)
-              for (long N = 0; N < Nm; ++N) Dc(k, a, bb2, N) = Xb(is, k, N, a) * std::conj(Xb(is, kq, N, bb2));
+          if (wan) {
+            // E(k;q)_{(a b),(m norb + n)} = U_{m a}(k) conj(U_{n b}(k+q)) -- hole leg unconj, particle leg conj
+            auto const &U = *opt.U_skia;
+            for (long a = 0; a < nc; ++a)
+              for (long bb2 = 0; bb2 < nc; ++bb2)
+                for (long mm = 0; mm < norb; ++mm)
+                  for (long nn2 = 0; nn2 < norb; ++nn2)
+                    Dc(k, a, bb2, mm * norb + nn2) = U(is, k, mm, a) * std::conj(U(is, kq, nn2, bb2));
+          } else {
+            for (long a = 0; a < nc; ++a)
+              for (long bb2 = 0; bb2 < nc; ++bb2)
+                for (long N = 0; N < Nm; ++N) Dc(k, a, bb2, N) = Xb(is, k, N, a) * std::conj(Xb(is, kq, N, bb2));
+          }
         }
         build_kbig(Xb, W0b, is, iq, kpq, qx_of, Kbig, symc);
         Ks() = Kbig * scale_k;
@@ -1077,8 +1101,8 @@ namespace solvers {
           long it_unit = 0;
           bool conv_unit = true, stag_unit = false, rconv_unit = false;
           double ritz_unit = 0.0, refit_unit = 0.0;
-          for (long N0 = 0; N0 < Nm; N0 += nrb) {
-            const long N1 = std::min(Nm, N0 + nrb), nR = N1 - N0;
+          for (long N0 = 0; N0 < nout; N0 += nrb) {
+            const long N1 = std::min(nout, N0 + nrb), nR = N1 - N0;
             size_scratch(nR);
             db::solve_timers_state().reset();
             Dblk() = Dc(all, all, all, nda::range(N0, N1));
@@ -1093,8 +1117,8 @@ namespace solvers {
             auto readout = [&](nda::array<cplx, 4> const &Gsum, nda::array<cplx, 4> *out) {
               if (out == nullptr) return;
               Vout() = Gsum - CbD;
-              auto Pblk = db::collapse(Dc, Vout);                    // (Nm, nR): the full left leg
-              for (long M = 0; M < Nm; ++M)
+              auto Pblk = db::collapse(Dc, Vout);                    // (nout, nR): the full left leg (aux or Wannier pair)
+              for (long M = 0; M < nout; ++M)
                 for (long N = 0; N < nR; ++N) (*out)(jn, iq, M, N0 + N) = cplx(spinfac / double(nk)) * Pblk(M, N);
             };
             if (opt.static_only) {
@@ -1135,14 +1159,14 @@ namespace solvers {
             }
           }
           if (dump_out.is_open()) {
-            const long hdr[5] = {is, iq, m, Nm, 4};
+            const long hdr[5] = {is, iq, m, nout, 4};
             dump_out.write(reinterpret_cast<char const *>(hdr), sizeof(hdr));
             nda::array<cplx, 4> *outs[4] = {Pi_static, Pi_dyn1, Pi_gam1, Pi_dyn};
-            std::vector<cplx> blk(static_cast<size_t>(4 * Nm * Nm), cplx(0.0));
+            std::vector<cplx> blk(static_cast<size_t>(4 * nout * nout), cplx(0.0));
             for (int c = 0; c < 4; ++c)
               if (outs[c] != nullptr)
-                for (long M = 0; M < Nm; ++M)
-                  for (long N = 0; N < Nm; ++N) blk[size_t((c * Nm + M) * Nm + N)] = (*outs[c])(jn, iq, M, N);
+                for (long M = 0; M < nout; ++M)
+                  for (long N = 0; N < nout; ++N) blk[size_t((c * nout + M) * nout + N)] = (*outs[c])(jn, iq, M, N);
             dump_out.write(reinterpret_cast<char const *>(blk.data()), std::streamsize(blk.size() * sizeof(cplx)));
             dump_out.flush();
           }
@@ -1175,7 +1199,7 @@ namespace solvers {
             }
             app_log(2, "  [dynbse] unit (s {}, q {}) nu node {}: {} applications (max over {} RHS blocks of {}), converged {}, "
                        "stagnated {}, readout-converged {}, watchdog {:.3e}, refit {:.3e}; last block's residuals:{}; readout "
-                       "steps:{}", is, iq, m, res.iterations, (Nm + nrb - 1) / nrb, nrb, res.converged, res.stagnated,
+                       "steps:{}", is, iq, m, res.iterations, (nout + nrb - 1) / nrb, nrb, res.converged, res.stagnated,
                     res.readout_converged, res.contraction, res.fit_err_max, hist, rhist);
           }
           if (met) {
