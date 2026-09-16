@@ -580,33 +580,34 @@ nda::array<ComplexType,4> methods::thc::collocation_at_points(nda::array<long,1>
   auto slist = utils::find_inverse_symmetry(ksymms, symm_list);
   utils::check(long(slist.size()) == nsym - 1, "thc::collocation_at_points: slist size mismatch.");
   const long nu = IPts.shape(0), ns = mf->nspin_in_basis(), na = a_rg.size();
-  // symmetry slot of every full-mesh k (0 = identity, i + 1 = the i-th image of its IBZ point), as in the ISDF path
-  nda::array<long, 1> loc_in_Ks(nkpts); loc_in_Ks() = 0;
+  // the SYMMETRY INDEX (0-based row of the inverse-symmetry list, -1 = identity) of every full-mesh k, exactly as the
+  // ISDF path assigns it: image i of IBZ point kib is Ks(kib, i) and uses symmetry Skibz(kib, i) (NOT "the i-th
+  // symmetry": stars have different sizes, so the two differ on general meshes -- the Si kp444 sym trap 2026-09-16);
+  // a time-reversal image shares its partner's symmetry.
+  nda::array<long, 1> sym_of_k(nkpts); sym_of_k() = -1;
   for (long k = 0; k < nkpts_ibz; ++k) {
-    if (trev_pair(k) >= 0) loc_in_Ks(trev_pair(k)) = 0;
+    if (trev_pair(k) >= 0) sym_of_k(trev_pair(k)) = -1;
     for (long i = 0; i < ns_per_kibz(k) - 1; ++i) {
-      const long ik = Ks(k, i);
-      loc_in_Ks(ik) = i + 1;
-      if (trev_pair(ik) >= 0) loc_in_Ks(trev_pair(ik)) = i + 1;
+      const long ik = Ks(k, i), is = Skibz(k, i);
+      sym_of_k(ik) = is;
+      if (trev_pair(ik) >= 0) sym_of_k(trev_pair(ik)) = is;
     }
-  }
-  // rotated point lists per symmetry slot (slot 0 = the points themselves)
-  nda::array<long, 2> rot(nsym, nu);
-  for (long is = 0; is < nsym; ++is) {
-    rot(is, all) = IPts;
-    if (is > 0) utils::transform_r(symm_list[slist(is - 1)], nda::array<long, 1>::zeros({3}), rho_g.mesh(), rot(is, all));
   }
   auto kpts_c = mf->kpts_crystal();
   nda::array<ComplexType,4> X(ns, nkpts, na, nu);
   auto ph_rot = memory::unified_array<ComplexType, 1>::zeros({nu});
   auto ph_k = memory::unified_array<ComplexType, 1>::zeros({nu});
-  for (long is = 0; is < nsym; ++is) {
-    // every IBZ k at this slot's rotated points (one call per slot; the phase e^{i k_ibz . r_rot} is removed below)
-    nda::array<long, 1> pts = rot(is, all);
+  for (long is = -1; is < nsym - 1; ++is) {
+    // the points rotated by the INVERSE of symmetry is (identity for is = -1), then every IBZ k sampled there
+    nda::array<long, 1> pts = IPts;
+    if (is >= 0) utils::transform_r(symm_list[slist(is)], nda::array<long, 1>::zeros({3}), rho_g.mesh(), pts);
+    bool any = false;
+    for (long k = 0; k < nkpts and not any; ++k) any = (sym_of_k(k) == is);
+    if (not any) continue;
     auto [Psia, Psib] = load_basis_subset_fft_grid<HOST_MEMORY>(pts, 0, nda::range(0, nkpts_ibz), a_rg, nda::range(0, 0));
     (void)Psib;
     for (long k = 0; k < nkpts; ++k) {
-      if (loc_in_Ks(k) != is) continue;
+      if (sym_of_k(k) != is) continue;
       const long kib = kp_to_ibz(k);
       const bool trev = (k >= nkpts - ntrev);
       utils::rspace_phase_factor(kpts_c(kib, all), rho_g.mesh(), pts, ph_rot);      // e^{i k_ibz . r_rot}
