@@ -4153,7 +4153,10 @@ namespace solvers {
     if (head_insertion) {
       head_ok = vertex_head_detail::build_head_rank1(thc, iq_gamma, nkpts, H_PQ,
                                                                     _bl_head_scale);
-      if (not head_ok)
+      if (not head_ok and _bl_head_scale == 0.0)
+        app_log(1, "  [W-int-3] cache_w: vertex_bl_head_scale = 0 -- the dynamic rung W-bar(q, i nu) carries NO analytic "
+                   "q -> 0 head (body-only vertex kernel).");
+      else if (not head_ok)
         app_log(1, "  [WARNING] cache_w: gygi head insertion requested but head data "
                    "are unusable\n"
                    "            (madelung == 0 or empty basis_head) -- caching WITHOUT "
@@ -4528,6 +4531,9 @@ namespace solvers {
                      "head of the static rung W0(Gamma) -- i.e. the head INSIDE the ladder "
                      "kernel W-bar_0 -- is scaled by this factor. The loop's own RPA W and "
                      "its div_treatment are untouched.", _ladder_head_scale);
+      } else if (_bl_head_scale == 0.0) {
+        app_log(1, "  [W-int-3] W0: vertex_bl_head_scale = 0 -- the static rung W-bar_0 carries NO analytic q -> 0 head "
+                   "(body-only vertex kernel; the loop's RPA W keeps its {} head).", _div_treatment);
       } else {
         app_log(1, "  [WARNING] W0: gygi head insertion requested but the head data are "
                    "unusable\n"

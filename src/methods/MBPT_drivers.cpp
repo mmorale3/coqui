@@ -581,6 +581,10 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     vertex.set_bl_w0_head_from_w(vertex_bl_w0_head_from_w);
     vertex.set_bl_pidyn_const_rung(vertex_bl_pidyn_const_rung);
     vertex.set_bl_head_static_all(vertex_bl_head_static_all);
+    // W-int-3: vertex_bl_head_scale (default 1) multiplies the madelung weight of every analytic q -> 0 head the
+    // vertex kernel inserts (Sigma^C / Pi^C, the ladder rung W-bar_0 and the dynamic W-bar cache); 0 = a head-free
+    // (body-only) vertex, the interpolable coarse object. The loop's RPA W keeps its own div_treatment.
+    vertex.set_bl_head_scale(io::get_value_with_default<double>(pt,"vertex_bl_head_scale",1.0));
     vertex.set_isdf_distr_tol(vertex_isdf_distr_tol);
     if (not vertex_div_treatment.empty()) vertex.set_div_treatment(vertex_div_treatment);
     // scGW-tilde (C0): validate + store the ladder knobs (double-count guard and the
@@ -1484,6 +1488,10 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
     vertex.set_bl_w0_head_from_w(vertex_bl_w0_head_from_w);
     vertex.set_bl_pidyn_const_rung(vertex_bl_pidyn_const_rung);
     vertex.set_bl_head_static_all(vertex_bl_head_static_all);
+    // W-int-3: vertex_bl_head_scale (default 1) multiplies the madelung weight of every analytic q -> 0 head the
+    // vertex kernel inserts (Sigma^C / Pi^C, the ladder rung W-bar_0 and the dynamic W-bar cache); 0 = a head-free
+    // (body-only) vertex, the interpolable coarse object. The loop's RPA W keeps its own div_treatment.
+    vertex.set_bl_head_scale(io::get_value_with_default<double>(pt,"vertex_bl_head_scale",1.0));
     vertex.set_isdf_distr_tol(vertex_isdf_distr_tol);
     if (not vertex_div_treatment.empty()) vertex.set_div_treatment(vertex_div_treatment);
     // scGW-tilde (C0): validate + store the ladder knobs (double-count guard and the

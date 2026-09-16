@@ -463,6 +463,11 @@ namespace solvers {
     // Finding F-DA-1 was precisely a knob that did NOT travel here.
     _pol_vtx->set_ladder_da(_vertex->ladder_tda(), _vertex->ladder_head_scale(),
                             _vertex->ladder_qnu_meter());
+    // W-int-3 (notes/wannier_coarse_vertex_plan.md, the q -> 0 head): the knob carrier's B-L head scale travels too.
+    // It multiplies the madelung weight of EVERY analytic q -> 0 head the vertex kernel inserts (build_w0's static
+    // rung W-bar_0 AND cache_w's dynamic W-bar(q, i nu)); 0 = a fully HEAD-FREE (body-only) coarse vertex, the
+    // theory's interpolable object; the loop's own RPA W and its div_treatment are untouched. Default 1 = bitwise.
+    _pol_vtx->set_bl_head_scale(_vertex->bl_head_scale());
     // Tier 1.5 (notes/tier15_ward_legs_plan.md): the leg vertex travels the same way.
     _pol_vtx->set_ladder_legs(_vertex->ladder_legs());
     // Tier 2 full frequency (notes/dynbse_plan.md D3): the rung and its solve knobs too.
