@@ -1245,10 +1245,9 @@ namespace solvers {
         // the point list of the coarse run is reused on THIS mesh -- no selection. The collocation is gathered
         // at the given points in the selection's convention (thc::collocation_at_points), rotated by U in
         // Wannier mode (X_bar = X U); the transfer t(q) below is rebuilt on this mesh as usual. The points are
-        // density-FFT-grid indices, so the FFT mesh must match; the gather serves IBZ k only (nosym meshes).
-        utils::check(MF->nkpts() == MF->nkpts_ibz(),
-                     "vertex_t::build_secondary_basis: frozen secondary points are nosym-only for now "
-                     "(the collocation gather serves IBZ k only).");
+        // density-FFT-grid indices, so the FFT mesh must match. Symmetric meshes: the gather builds the image
+        // k-points from the IBZ orbitals exactly as the ISDF selection path does (W-int-4s).
+        // (W-int-4s) on a symmetric mesh the gather reproduces the ISDF path's image-k convention (thc::collocation_at_points)
         nda::array<long, 1> mesh_in;
         long nW_in = 0, W0_in = -1;
         {

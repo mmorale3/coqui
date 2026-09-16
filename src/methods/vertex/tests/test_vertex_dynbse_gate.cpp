@@ -266,7 +266,9 @@ namespace bdft_tests {
       return;
     }
 
-    if (std::getenv("COQUI_DYNBSE_TEST_WINT")) {
+    // W-int-1b/4 gate as a lambda over the mesh: nosym (qe_lih222) and, with COQUI_DYNBSE_TEST_WINT_SYM, the SYMMETRIC
+    // qe_lih222_sym fixture (W-int-4s: the frozen-point gather builds the image k-points from the IBZ orbitals).
+    auto wint_gate = [&](std::shared_ptr<mf::MF> mfw, auto &eriw, std::string const &mesh_tag) {
       // W-int-1b/4 gate (notes/wannier_coarse_vertex_plan.md): the frozen-point aux frame + the consumer.
       //  A  window, dynamic Gamma_1, dumps <A>.secpts.h5 + <A>.pol_nu0.g2.h5
       //  B  window, the points FROZEN from A          -> the dumped Pi(q)_{MN} == A's, eps readout == A's
@@ -278,20 +280,20 @@ namespace bdft_tests {
       struct res_t { double e_corr, er, el; nda::array<cplx, 3> Ps, Pg; };
       auto run_w = [&](std::string const &tag, std::string const &rung, std::string const &points, std::string const &interp,
                        nda::array<cplx, 2> const *V) {
-        const std::string out = "coqui_d3_wint_" + tag;
+        const std::string out = "coqui_d3_wint_" + mesh_tag + "_" + tag;
         solvers::hf_t hf; solvers::gw_t gw(&ft, "ignore_g0", out);
         solvers::scr_coulomb_t scr_eri(&ft, "rpa", "ignore_g0");
-        simple_dyson dyson(mf.get(), &ft); MBState mb_state(mpi_context, ft, out);
+        simple_dyson dyson(mfw.get(), &ft); MBState mb_state(mpi_context, ft, out);
         iter_scf::iter_scf_t iter_sol("damping");
-        solvers::vertex_t vtx(&ft, "none", nda::range(0, 0), mf->nbnd());
+        solvers::vertex_t vtx(&ft, "none", nda::range(0, 0), mfw->nbnd());
         vtx.set_pol_vertex("ladder", "w0_prev", nda::range(0, 4), -1, 1e-8, -1.0, -1.0, -1.0);
         vtx.set_ladder_rung(rung, 1e-8, 30, 12, -1.0);
         vtx.set_ladder_dyn_gamma1_only(true); vtx.set_ladder_dyn_dump(rung == "dynamic");
         vtx.set_isdf_points(points, points.empty()); vtx.set_wannier_frame("aux");
         vtx.set_pol_interp(interp, "static");
-        if (V) { auto proj = make_degenerate_projector(*mf, 0, 4, V); vtx.set_wannier_projector(proj, true); }
+        if (V) { auto proj = make_degenerate_projector(*mfw, 0, 4, V); vtx.set_wannier_projector(proj, true); }
         scr_eri.set_vertex(&vtx);
-        auto [e_hf, e_corr] = scf_loop(mb_state, dyson, eri, ft,
+        auto [e_hf, e_corr] = scf_loop(mb_state, dyson, eriw, ft,
                                        solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol, 2, false, 1e-9, true);
         auto [er, el] = scr_eri.pol_eps_readout();
         res_t r{e_corr, er, el, {}, {}};
@@ -300,7 +302,7 @@ namespace bdft_tests {
           h5::file f(out + ".pol_nu0.g2.h5", 'r'); h5::group g(f);
           nda::h5_read(g, "Pi_static", r.Ps); nda::h5_read(g, "Pi_gam1", r.Pg);
         }
-        app_log(1, "dynbse_readout W-int gate [{}]: e_corr {:.10f}, eps_M RPA {:.8f} ladder {:.8f}{}", tag, e_corr, er, el,
+        app_log(1, "dynbse_readout W-int gate {} [{}]: e_corr {:.10f}, eps_M RPA {:.8f} ladder {:.8f}{}", mesh_tag, tag, e_corr, er, el,
                 rung == "dynamic" ? " (Pi dumped)" : "");
         mpi_context->comm.barrier();
         if (mpi_context->comm.root() and tag != "A") {
@@ -323,7 +325,7 @@ namespace bdft_tests {
         for (long i = 0; i < 4; ++i) { const cplx vp = V(i, p), vq = V(i, q); V(i, p) = vp * c - vq * s * std::conj(eph); V(i, q) = vp * s * eph + vq * c; }
       };
       givens(0, 1, 0.7, 0.3); givens(1, 2, 1.1, -0.8); givens(2, 3, 0.4, 1.9); givens(0, 3, 0.9, 0.5);
-      const std::string pts = "coqui_d3_wint_A.secpts.h5", nu0 = "coqui_d3_wint_A.pol_nu0.g2.h5";
+      const std::string pts = "coqui_d3_wint_" + mesh_tag + "_A.secpts.h5", nu0 = "coqui_d3_wint_" + mesh_tag + "_A.pol_nu0.g2.h5";
       auto A = run_w("A", "dynamic", "", "", nullptr);
       REQUIRE(std::filesystem::exists(pts)); REQUIRE(std::filesystem::exists(nu0));
       auto B = run_w("B", "dynamic", pts, "", nullptr);
@@ -334,11 +336,11 @@ namespace bdft_tests {
       //     so eps_M(ladder) == A's again
       auto CW = run_w("CW", "static", pts, nu0, &V);
       const double dB = relmax(B.Pg, A.Pg), dW = relmax(W.Pg, A.Pg), dBs = relmax(B.Ps, A.Ps), dWs = relmax(W.Ps, A.Ps);
-      app_log(1, "dynbse_readout W-int gate: FROZEN points reproduce the selection: |dPi_gam1| {:.2e} |dPi_static| {:.2e}; "
+      app_log(1, "dynbse_readout W-int gate ({}): FROZEN points reproduce the selection: |dPi_gam1| {:.2e} |dPi_static| {:.2e}; "
                  "the point frame is gauge-invariant (unitary V, aux frame): {:.2e} / {:.2e}; eps_M(ladder) A {:.10f} B {:.10f} "
                  "CONSUMER window {:.10f} (|d| = {:.2e}) Wannier {:.10f} (|d| = {:.2e}); e_corr A-B {:.1e} A-V {:.1e} A-C {:.1e} A-CW {:.1e} "
                  "(a Wannier-mode DYNAMIC run dumps and returns before the eps readout: V.el = {:.1f} by design)",
-              dB, dBs, dW, dWs, A.el, B.el, C.el, std::abs(C.el - A.el), CW.el, std::abs(CW.el - A.el),
+              mesh_tag, dB, dBs, dW, dWs, A.el, B.el, C.el, std::abs(C.el - A.el), CW.el, std::abs(CW.el - A.el),
               std::abs(A.e_corr - B.e_corr), std::abs(A.e_corr - W.e_corr), std::abs(A.e_corr - C.e_corr),
               std::abs(A.e_corr - CW.e_corr), W.el);
       REQUIRE(dB < 1e-10); REQUIRE(dBs < 1e-10);
@@ -348,12 +350,19 @@ namespace bdft_tests {
       REQUIRE(std::abs(CW.el - A.el) < 1e-8); REQUIRE(std::abs(CW.er - A.er) < 1e-10);
       mpi_context->comm.barrier();
       if (mpi_context->comm.root()) {
-        remove("coqui_d3_wint_A.mbpt.h5");
+        remove(("coqui_d3_wint_" + mesh_tag + "_A.mbpt.h5").c_str());
         for (auto const &e : std::filesystem::directory_iterator("."))
-          if (e.path().filename().string().rfind("coqui_d3_wint_A.", 0) == 0) std::filesystem::remove(e.path());
+          if (e.path().filename().string().rfind("coqui_d3_wint_" + mesh_tag + "_A.", 0) == 0) std::filesystem::remove(e.path());
       }
       mpi_context->comm.barrier();
-      return;
+    };
+    if (std::getenv("COQUI_DYNBSE_TEST_WINT")) { wint_gate(mf, eri, "nosym"); return; }
+    if (std::getenv("COQUI_DYNBSE_TEST_WINT_SYM")) {
+      auto mfs = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_lih222_sym"));
+      thc_reader_t thcs(mfs, make_thc_reader_ptree(mfs->nbnd() * 8, "", "incore", "", "bdft", 1e-10, mfs->ecutrho(), 1, 1024));
+      auto eris = mb_eri_t(thcs, thcs);
+      app_log(1, "dynbse_readout W-int gate on the SYMMETRIC mesh: nkpts {} (IBZ {})", mfs->nkpts(), mfs->nkpts_ibz());
+      wint_gate(mfs, eris, "sym"); return;
     }
 
     auto run = [&](std::string const &rung, int niter, bool dump = false, bool dense = true, long ustride = 1) {
