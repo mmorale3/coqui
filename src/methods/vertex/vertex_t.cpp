@@ -951,7 +951,16 @@ namespace solvers {
           for (long is = 0; is < ctx.ns; ++is) {
             if (wan) {
               // DU(nbnd, M) = Dcols(nbnd, nW) . U(ik)(nW, M)
-              nda::blas::gemm(Dcols, (*U_skia)(is, ik, all, all), DU);
+              // W-int-4w (2026-09-16): for a CONJUGATED rotation (cj) the kernel applies conj to the whole effective column
+              // X_bar(ksrc) dloc, so the C-sector block must be dloc = U(ksrc)^dag D conj(U(k')): with U(k') unconjugated the
+              // Wannier point frame lost its gauge invariance for any complex U on meshes with time-reversal images (15 % on
+              // qe_lih223_sym); real U and TRIM-only meshes (every 2^3 fixture, the July Si kp222 test) were unaffected.
+              if (cj) {
+                auto Uc = nda::make_regular(nda::conj((*U_skia)(is, ik, all, all)));
+                nda::blas::gemm(Dcols, Uc, DU);
+              } else {
+                nda::blas::gemm(Dcols, (*U_skia)(is, ik, all, all), DU);
+              }
               // d(M, M) = U(ksrc)^dag(M, nW) . DU[W_rng rows](nW, M)
               for (long p = 0; p < nW; ++p)
                 for (long a = 0; a < nc; ++a) dW_win(p, a) = DU(C0_global + p, a);

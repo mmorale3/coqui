@@ -55,14 +55,38 @@ namespace bdft_tests {
 
   // proj_mat convention (test_vertex_wannier.cpp): |w_a> = sum_i V_{i,a} |psi_{W0+i}>, C_{a,i} = conj(V_{i,a});
   // V = nullptr is the degenerate identity projector (window physics in the band gauge).
+  // trs_images: on a symmetric mesh give the time-reversal images (the last nkpts_trev_pairs k) U(-k) = conj(U(k)),
+  // the relation real MLWFs satisfy (a k-independent complex V is NOT time-reversal consistent).
   inline projector_t make_degenerate_projector(mf::MF &mf, long W0, long M,
-                                               nda::array<std::complex<double>, 2> const *V = nullptr) {
+                                               nda::array<std::complex<double>, 2> const *V = nullptr,
+                                               bool trs_images = false) {
     using cplx = std::complex<double>;
-    const long nk = mf.nkpts(), ns = mf.nspin();
+    const long nk = mf.nkpts(), ns = mf.nspin(), ntrev = mf.nkpts_trev_pairs();
     nda::array<cplx, 5> C_ksIai(nk, ns, 1, M, M); C_ksIai() = cplx(0.0);
+    // trs_pairs: a fully time-reversal-consistent complex gauge, U(-k) = conj(U(k)) for EVERY (k, -k) pair of the
+    // mesh and U real at the TRIM points (the relation real MLWFs satisfy; a k-independent complex V cannot).
+    const bool trs_pairs = std::getenv("COQUI_DYNBSE_TEST_WINT_V") and std::string(std::getenv("COQUI_DYNBSE_TEST_WINT_V")) == "trs2";
+    nda::array<double, 2> kcr(mf.kpts_crystal());
+    auto minus_k = [&](long ik) {   // index of -k (mod 1), -1 if absent
+      for (long j = 0; j < nk; ++j) {
+        bool same = true;
+        for (int d = 0; d < 3 and same; ++d) { const double x = kcr(j, d) + kcr(ik, d); same = std::abs(x - std::round(x)) < 1e-6; }
+        if (same) return j;
+      }
+      return -1L;
+    };
     for (long ik = 0; ik < nk; ++ik) for (long is = 0; is < ns; ++is)
       for (long a = 0; a < M; ++a)
-        for (long i = 0; i < M; ++i) C_ksIai(ik, is, 0, a, i) = V ? std::conj((*V)(i, a)) : cplx(a == i ? 1.0 : 0.0);
+        for (long i = 0; i < M; ++i) {
+          cplx u = V ? (*V)(i, a) : cplx(a == i ? 1.0 : 0.0);
+          if (trs_images and ik >= nk - ntrev) u = std::conj(u);
+          if (trs_pairs and V) {
+            const long jk = minus_k(ik);
+            if (jk == ik) u = cplx(u.real(), 0.0);          // TRIM point: real part of V (re-orthonormalized by Loewdin at load)
+            else if (jk >= 0 and jk < ik) u = std::conj(u);   // the second member of the pair gets conj(V)
+          }
+          C_ksIai(ik, is, 0, a, i) = std::conj(u);
+        }
     nda::array<long, 3> bw(1, 1, 2); bw(0, 0, 0) = W0 + 1; bw(0, 0, 1) = W0 + M;
     auto kc = nda::make_regular(mf.kpts_crystal());
     return projector_t(mf, C_ksIai, bw, kc, false, false);
@@ -278,6 +302,7 @@ namespace bdft_tests {
       //     (pol_vertex_interp_file) -> eps_M(ladder) == A's (the consumer V0: coarse = fine)
       using cplx = std::complex<double>;
       struct res_t { double e_corr, er, el; nda::array<cplx, 3> Ps, Pg; };
+      bool trs_images = false;   // set with the V flavour below (captured by reference)
       auto run_w = [&](std::string const &tag, std::string const &rung, std::string const &points, std::string const &interp,
                        nda::array<cplx, 2> const *V) {
         const std::string out = "coqui_d3_wint_" + mesh_tag + "_" + tag;
@@ -291,7 +316,7 @@ namespace bdft_tests {
         vtx.set_ladder_dyn_gamma1_only(true); vtx.set_ladder_dyn_dump(rung == "dynamic");
         vtx.set_isdf_points(points, points.empty()); vtx.set_wannier_frame("aux");
         vtx.set_pol_interp(interp, "static");
-        if (V) { auto proj = make_degenerate_projector(*mfw, 0, 4, V); vtx.set_wannier_projector(proj, true); }
+        if (V) { auto proj = make_degenerate_projector(*mfw, 0, 4, V, trs_images); vtx.set_wannier_projector(proj, true); }
         scr_eri.set_vertex(&vtx);
         auto [e_hf, e_corr] = scf_loop(mb_state, dyson, eriw, ft,
                                        solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol, 2, false, 1e-9, true);
@@ -324,7 +349,11 @@ namespace bdft_tests {
         const double c = std::cos(th), s = std::sin(th); const cplx eph(std::cos(ph), std::sin(ph));
         for (long i = 0; i < 4; ++i) { const cplx vp = V(i, p), vq = V(i, q); V(i, p) = vp * c - vq * s * std::conj(eph); V(i, q) = vp * s * eph + vq * c; }
       };
-      givens(0, 1, 0.7, 0.3); givens(1, 2, 1.1, -0.8); givens(2, 3, 0.4, 1.9); givens(0, 3, 0.9, 0.5);
+      const std::string vflavour = std::getenv("COQUI_DYNBSE_TEST_WINT_V") ? std::getenv("COQUI_DYNBSE_TEST_WINT_V") : "complex";
+      if (vflavour == "real") { givens(0, 1, 0.7, 0.0); givens(1, 2, 1.1, 0.0); givens(2, 3, 0.4, 0.0); givens(0, 3, 0.9, 0.0); }
+      else { givens(0, 1, 0.7, 0.3); givens(1, 2, 1.1, -0.8); givens(2, 3, 0.4, 1.9); givens(0, 3, 0.9, 0.5); }
+      trs_images = (vflavour == "trs");   // "trs2" = the fully TRS-consistent k-dependent gauge (handled in make_degenerate_projector)
+      app_log(1, "dynbse_readout W-int gate ({}): Wannier V flavour = {} (real | trs = conj(V) on the trev images | complex)", mesh_tag, vflavour);
       const std::string pts = "coqui_d3_wint_" + mesh_tag + "_A.secpts.h5", nu0 = "coqui_d3_wint_" + mesh_tag + "_A.pol_nu0.g2.h5";
       auto A = run_w("A", "dynamic", "", "", nullptr);
       REQUIRE(std::filesystem::exists(pts)); REQUIRE(std::filesystem::exists(nu0));
@@ -344,11 +373,7 @@ namespace bdft_tests {
               std::abs(A.e_corr - B.e_corr), std::abs(A.e_corr - W.e_corr), std::abs(A.e_corr - C.e_corr),
               std::abs(A.e_corr - CW.e_corr), W.el);
       REQUIRE(dB < 1e-10); REQUIRE(dBs < 1e-10);
-      if (mfw->nkpts_trev_pairs() == 0) { REQUIRE(dW < 1e-8); REQUIRE(dWs < 1e-8); }
-      else app_log(1, "  [WARNING] OPEN BUG W-int-4w: Wannier mode on a symmetric mesh WITH time-reversal images breaks the "
-                      "gauge invariance of the point frame (|dPi| = {:.2e} here; 1e-12 on TRIM-only meshes). The Wannier "
-                      "sym path (build_sym_ctx U-aware / build_Gbar_fullbz trev transpose) is not validated for trev images; "
-                      "the window path is. NOT gated here (the disentangled-C symmetric consumer must wait for the fix).", dW);
+      REQUIRE(dW < 1e-8); REQUIRE(dWs < 1e-8);   // W-int-4w fixed (conj(U) on the conjugated rotations of build_sym_ctx): holds with trev images too
       REQUIRE(std::abs(B.el - A.el) < 1e-9);
       REQUIRE(std::abs(C.el - A.el) < 1e-8); REQUIRE(std::abs(C.er - A.er) < 1e-10);
       REQUIRE(std::abs(CW.el - A.el) < 1e-8); REQUIRE(std::abs(CW.er - A.er) < 1e-10);
