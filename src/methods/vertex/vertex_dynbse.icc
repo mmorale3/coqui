@@ -1839,13 +1839,17 @@ namespace solvers {
     vd::dyn_meter met;
     vd::pair_space_ladder_dyn(G_CC, _Xb_skma, _W0b_qmm.value(), _Wb_qwmm.value(), kmq, kpq, tools, nus,
                               &Ps, nullptr, &Pg, &Pd, mpi->comm.rank(), mpi->comm.size(), o, &met, symc);
-    {
+    if (_dyn_cut_r1) {
       vd::dyn_opts o1 = o;
       o1.one_rung_only = true;
       if (_dyn_dump) o1.dump_prefix = mb_state.coqui_prefix + ".dynunits.cutr1.g" + std::to_string(gen);
       vd::dyn_meter met1;
       vd::pair_space_ladder_dyn(G_CC, _Xb_skma, _W0b_qmm.value(), _Wb_qwmm.value(), kmq, kpq, tools, nus,
                                 nullptr, &P1, nullptr, nullptr, mpi->comm.rank(), mpi->comm.size(), o1, &met1, symc);
+    } else {
+      // pol_vertex_dyn_cut_r1 = false: the one-bare-rung column is not computed (Pi_dyn1 below = Pi_static)
+      P1() = ComplexType(0.0);
+      app_log(1, "  [scGW-tilde T2] pol_vertex_dyn_cut_r1 = false: the one-bare-dynamic-rung pass is SKIPPED; the Pi_dyn1 column repeats Pi_static.");
     }
     for (auto *A : {&Ps, &P1, &Pg, &Pd}) mpi->comm.all_reduce_in_place_n(A->data(), A->size(), std::plus<>{});
     met.reduce(mpi->comm);

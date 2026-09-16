@@ -483,6 +483,7 @@ namespace solvers {
     _pol_vtx->set_ladder_dyn_vmask(_vertex->ladder_dyn_vmask_lo(), _vertex->ladder_dyn_vmask_hi());
     _pol_vtx->set_ladder_dyn_gamma1_only(_vertex->ladder_dyn_gamma1_only());
     _pol_vtx->set_ladder_dyn_all_nu(_vertex->ladder_dyn_all_nu());
+    _pol_vtx->set_ladder_dyn_cut_r1(_vertex->ladder_dyn_cut_r1());
     // W-int-1b: the coarse->fine interpolation knobs travel to the readout instance too
     _pol_vtx->set_isdf_points(_vertex->isdf_points_file(), _vertex->isdf_points_dump());
     _pol_vtx->set_wannier_frame(_vertex->wannier_frame());

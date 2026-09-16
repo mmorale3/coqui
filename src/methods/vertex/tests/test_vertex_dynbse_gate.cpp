@@ -492,7 +492,8 @@ namespace bdft_tests {
       // as <G>.pol_wh_dyn.g1.h5; D: the loop with Gamma_1 injected from that file. Checks: the dump's static column ==
       // the injected static-rung ladder (same object, union-grid route: refit class), and D's loop-side eps_M == the
       // dynamic readout's Gamma_1 column of G (the same P^{C,L} through two consumers).
-      auto run_g = [&](std::string const &tag, bool all_nu, std::string const &points, std::string const &interp, std::string const &col) {
+      auto run_g = [&](std::string const &tag, bool all_nu, std::string const &points, std::string const &interp, std::string const &col,
+                       bool cut_r1 = true) {
         const std::string out = "coqui_d3_winj_" + tag;
         solvers::hf_t hf; solvers::gw_t gw(&ft, "ignore_g0", out);
         solvers::scr_coulomb_t scr_eri(&ft, "rpa", "ignore_g0");
@@ -502,6 +503,7 @@ namespace bdft_tests {
         vtx.set_pol_vertex("ladder", "w0_prev", nda::range(0, 4), -1, 1e-8, -1.0, -1.0, -1.0, all_nu ? "none" : "ladder_n2");
         vtx.set_ladder_rung(all_nu ? "dynamic" : "static", 1e-8, 30, 12, -1.0);
         vtx.set_ladder_dyn_gamma1_only(true); vtx.set_ladder_dyn_dump(all_nu); vtx.set_ladder_dyn_all_nu(all_nu);
+        vtx.set_ladder_dyn_cut_r1(cut_r1);
         vtx.set_isdf_points(points, points.empty()); vtx.set_pol_interp(interp, col);
         scr_eri.set_vertex(&vtx);
         auto [e_hf, e_corr] = scf_loop(mb_state, dyson, erin, ft, solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol, 1, false, 1e-9, true);
@@ -510,7 +512,7 @@ namespace bdft_tests {
         app_log(1, "dynbse_readout W-int-4f INJ [{}]: e_corr {:.12f}, dynamic readout (static {:.10f}, one rung {:.10f}, Gamma_1 {:.10f}), loop-side {:.10f}",
                 tag, e_corr, ed[0], ed[1], ed[2], eloop);
         mpi_context->comm.barrier();
-        if (mpi_context->comm.root() and tag != "G") {
+        if (mpi_context->comm.root() and tag != "G" and tag != "G2") {
           remove((out + ".mbpt.h5").c_str());
           for (auto const &e : std::filesystem::directory_iterator("."))
             if (e.path().filename().string().rfind(out + ".", 0) == 0) std::filesystem::remove(e.path());
@@ -529,6 +531,30 @@ namespace bdft_tests {
         for (long i = 0; i < Ps.size(); ++i) { d += std::norm(Ps.data()[i] - Pl.data()[i]); n += std::norm(Pl.data()[i]); }
         app_log(1, "dynbse_readout W-int-4f INJ: all-nu dump's static column vs the injected static-rung ladder: rel Frobenius {:.2e}", std::sqrt(d / n));
         REQUIRE(std::sqrt(d / n) < 1e-8);
+      }
+      {   // G2: the production setting pol_vertex_dyn_cut_r1 = false (the one-bare-rung pass skipped): the Gamma_1 and
+          // static columns are bitwise those of G (the r1 pass is a separate solve), Pi_dyn1 repeats Pi_static
+        auto [edg2, elg2] = run_g("G2", true, "", "", "gam1", false);
+        REQUIRE(std::abs(edg2[0] - edg[0]) < 1e-12); REQUIRE(std::abs(edg2[2] - edg[2]) < 1e-12);
+        nda::array<std::complex<double>, 4> Pg, Pg2, Ps2, P12;
+        { h5::file f("coqui_d3_winj_G.pol_wh_dyn.g1.h5", 'r'); h5::group g(f); nda::h5_read(g, "Pi_gam1", Pg); }
+        { h5::file f("coqui_d3_winj_G2.pol_wh_dyn.g1.h5", 'r'); h5::group g(f); nda::h5_read(g, "Pi_gam1", Pg2);
+          nda::h5_read(g, "Pi_static", Ps2); nda::h5_read(g, "Pi_dyn1", P12); }
+        REQUIRE(Pg2.shape() == Pg.shape());
+        double dg = 0.0, d1 = 0.0, n = 0.0;
+        for (long i = 0; i < Pg.size(); ++i) {
+          dg = std::max(dg, std::abs(Pg2.data()[i] - Pg.data()[i])); d1 = std::max(d1, std::abs(P12.data()[i] - Ps2.data()[i]));
+          n = std::max(n, std::abs(Pg.data()[i]));
+        }
+        app_log(1, "dynbse_readout W-int-4f INJ: cut_r1 = false vs true: max |d Pi_gam1| {:.2e} (max |Pi_gam1| {:.2e}); max |Pi_dyn1 - Pi_static| {:.2e}", dg, n, d1);
+        REQUIRE(dg == 0.0); REQUIRE(d1 == 0.0);
+        mpi_context->comm.barrier();
+        if (mpi_context->comm.root()) {
+          remove("coqui_d3_winj_G2.mbpt.h5");
+          for (auto const &e : std::filesystem::directory_iterator("."))
+            if (e.path().filename().string().rfind("coqui_d3_winj_G2.", 0) == 0) std::filesystem::remove(e.path());
+        }
+        mpi_context->comm.barrier();
       }
       auto [edd, eld] = run_g("D", false, "coqui_d3_winj_G.secpts.h5", "coqui_d3_winj_G.pol_wh_dyn.g1.h5", "gam1");
       app_log(1, "dynbse_readout W-int-4f INJ: Gamma_1 consumed in the W-Dyson: loop-side eps_M {:.10f} vs the dynamic readout's Gamma_1 column {:.10f} (|d| = {:.2e})",

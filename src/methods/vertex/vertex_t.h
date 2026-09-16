@@ -897,6 +897,7 @@ namespace solvers {
     long _dyn_rhs_block = 32;    // pol_vertex_dyn_rhs_block: RHS column block width of the dynamic solves
     bool _dyn_dump = false;      // pol_vertex_dyn_dump: per-unit dump + restart files of the dynamic solves
     bool _dyn_all_nu = false;    // pol_vertex_dyn_all_nu: the all-q x all-node dynamic-rung dump (W-int-4f coarse side)
+    bool _dyn_cut_r1 = true;     // pol_vertex_dyn_cut_r1: false skips the one-bare-rung (Pi_dyn1) pass of the cut / all-nu dump
     bool _dyn_dense = true;      // pol_vertex_dyn_dense: the dense per-tau rung K_d(s) (nt/2 x D x D per unit)
     long _dyn_union_stride = 1;  // pol_vertex_dyn_union_stride: keep every n-th shifted G node of the union grid
     int _dyn_table_mode = 0;     // pol_vertex_dyn_table_mode: 0 fitted twisted-pair tables, 1 exact partial fractions
@@ -1530,6 +1531,11 @@ namespace solvers {
      *  the full-frequency vertex object in the frozen-able point frame for the fine W-Dyson feed (col "gam1"). */
     void set_ladder_dyn_all_nu(bool on) { _dyn_all_nu = on; }
     bool ladder_dyn_all_nu() const { return _dyn_all_nu; }
+    /** pol_vertex_dyn_cut_r1 (default true): the cut / all-nu dump also runs the one-BARE-dynamic-rung pass (the Pi_dyn1
+     *  column, D^dag L0 K_d L0 D: a diagnostic, ~35 % of the cut wall at prec high). false skips it and writes
+     *  Pi_dyn1 = Pi_static -- the production setting for the Gamma_1 (col "gam1") coarse dump. */
+    void set_ladder_dyn_cut_r1(bool on) { _dyn_cut_r1 = on; }
+    bool ladder_dyn_cut_r1() const { return _dyn_cut_r1; }
 
     /**
      * scGW-tilde TIER 1.5 (notes/tier15_ward_legs_plan.md; proposal section 4.6): the LEG

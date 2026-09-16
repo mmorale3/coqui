@@ -314,7 +314,8 @@ inline void ensure_checkpoint(std::shared_ptr<mf::MF> mf, std::string const& out
  *                 "medium"/"high": the dynamic pair algebra on its own finer DLR), pol_vertex_dyn_table_mode (0: fitted twisted-pair
  *                 tables at inu != 0; 1: the exact partial fractions through Dsq, a diagnostic), pol_vertex_dyn_union_stride (1: keep every
  *                 n-th shifted G node of the inu != 0 union grid -- ~n^2 cheaper pair-pole algebra, gate
- *                 the reported G fit), pol_vertex_dyn_sign (-1 = the derived rung sign, +1 = the
+ *                 the reported G fit), pol_vertex_dyn_cut_r1 (true: the cut / all-nu dump also runs the one-bare-rung
+ *                 Pi_dyn1 pass; false skips it, Pi_dyn1 = Pi_static -- the production Gamma_1 dump), pol_vertex_dyn_sign (-1 = the derived rung sign, +1 = the
  *                 as-implemented L2 convention). XOR pol_vertex_legs = "ward".
  *  - ladder_solve_grid: 1  Ranks per SOLVE GRID for the ladder's dense resolvent
  *                 (notes/ladder_b_integration_design.md, increment B). 1 (default) is the
@@ -629,6 +630,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
                                          io::get_value_with_default<double>(pt,"pol_vertex_dyn_vmask_hi",0.0));
         vertex.set_ladder_dyn_gamma1_only(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_gamma1_only",false));
         vertex.set_ladder_dyn_all_nu(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_all_nu",false));
+        vertex.set_ladder_dyn_cut_r1(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_cut_r1",true));
       }
     }
     scr_eri.set_cvv_rspace_tol(cvv_rspace_tol);
@@ -1015,6 +1017,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
                                                      io::get_value_with_default<double>(pt,"pol_vertex_dyn_vmask_hi",0.0));
         pol_vertex_carrier.set_ladder_dyn_gamma1_only(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_gamma1_only",false));
         pol_vertex_carrier.set_ladder_dyn_all_nu(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_all_nu",false));
+        pol_vertex_carrier.set_ladder_dyn_cut_r1(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_cut_r1",true));
       }
     }
     if (pol_vertex_carrier.pol_vertex_enabled()) scr_eri.set_vertex(&pol_vertex_carrier);
@@ -1254,6 +1257,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
                                                      io::get_value_with_default<double>(pt,"pol_vertex_dyn_vmask_hi",0.0));
         pol_vertex_carrier.set_ladder_dyn_gamma1_only(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_gamma1_only",false));
         pol_vertex_carrier.set_ladder_dyn_all_nu(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_all_nu",false));
+        pol_vertex_carrier.set_ladder_dyn_cut_r1(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_cut_r1",true));
       }
     }
     if (pol_vertex_carrier.pol_vertex_enabled()) scr_eri.set_vertex(&pol_vertex_carrier);
@@ -1539,6 +1543,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
                                          io::get_value_with_default<double>(pt,"pol_vertex_dyn_vmask_hi",0.0));
         vertex.set_ladder_dyn_gamma1_only(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_gamma1_only",false));
         vertex.set_ladder_dyn_all_nu(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_all_nu",false));
+        vertex.set_ladder_dyn_cut_r1(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_cut_r1",true));
       }
     }
     scr_eri.set_cvv_rspace_tol(cvv_rspace_tol);
@@ -1850,6 +1855,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
                                                      io::get_value_with_default<double>(pt,"pol_vertex_dyn_vmask_hi",0.0));
         pol_vertex_carrier.set_ladder_dyn_gamma1_only(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_gamma1_only",false));
         pol_vertex_carrier.set_ladder_dyn_all_nu(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_all_nu",false));
+        pol_vertex_carrier.set_ladder_dyn_cut_r1(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_cut_r1",true));
       }
     }
     if (pol_vertex_carrier.pol_vertex_enabled()) scr_eri.set_vertex(&pol_vertex_carrier);
