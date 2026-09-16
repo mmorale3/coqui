@@ -628,6 +628,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
         vertex.set_ladder_dyn_vmask(io::get_value_with_default<double>(pt,"pol_vertex_dyn_vmask_lo",0.0),
                                          io::get_value_with_default<double>(pt,"pol_vertex_dyn_vmask_hi",0.0));
         vertex.set_ladder_dyn_gamma1_only(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_gamma1_only",false));
+        vertex.set_ladder_dyn_all_nu(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_all_nu",false));
       }
     }
     scr_eri.set_cvv_rspace_tol(cvv_rspace_tol);
@@ -1013,6 +1014,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
         pol_vertex_carrier.set_ladder_dyn_vmask(io::get_value_with_default<double>(pt,"pol_vertex_dyn_vmask_lo",0.0),
                                                      io::get_value_with_default<double>(pt,"pol_vertex_dyn_vmask_hi",0.0));
         pol_vertex_carrier.set_ladder_dyn_gamma1_only(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_gamma1_only",false));
+        pol_vertex_carrier.set_ladder_dyn_all_nu(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_all_nu",false));
       }
     }
     if (pol_vertex_carrier.pol_vertex_enabled()) scr_eri.set_vertex(&pol_vertex_carrier);
@@ -1251,6 +1253,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
         pol_vertex_carrier.set_ladder_dyn_vmask(io::get_value_with_default<double>(pt,"pol_vertex_dyn_vmask_lo",0.0),
                                                      io::get_value_with_default<double>(pt,"pol_vertex_dyn_vmask_hi",0.0));
         pol_vertex_carrier.set_ladder_dyn_gamma1_only(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_gamma1_only",false));
+        pol_vertex_carrier.set_ladder_dyn_all_nu(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_all_nu",false));
       }
     }
     if (pol_vertex_carrier.pol_vertex_enabled()) scr_eri.set_vertex(&pol_vertex_carrier);
@@ -1535,6 +1538,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
         vertex.set_ladder_dyn_vmask(io::get_value_with_default<double>(pt,"pol_vertex_dyn_vmask_lo",0.0),
                                          io::get_value_with_default<double>(pt,"pol_vertex_dyn_vmask_hi",0.0));
         vertex.set_ladder_dyn_gamma1_only(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_gamma1_only",false));
+        vertex.set_ladder_dyn_all_nu(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_all_nu",false));
       }
     }
     scr_eri.set_cvv_rspace_tol(cvv_rspace_tol);
@@ -1845,6 +1849,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
         pol_vertex_carrier.set_ladder_dyn_vmask(io::get_value_with_default<double>(pt,"pol_vertex_dyn_vmask_lo",0.0),
                                                      io::get_value_with_default<double>(pt,"pol_vertex_dyn_vmask_hi",0.0));
         pol_vertex_carrier.set_ladder_dyn_gamma1_only(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_gamma1_only",false));
+        pol_vertex_carrier.set_ladder_dyn_all_nu(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_all_nu",false));
       }
     }
     if (pol_vertex_carrier.pol_vertex_enabled()) scr_eri.set_vertex(&pol_vertex_carrier);

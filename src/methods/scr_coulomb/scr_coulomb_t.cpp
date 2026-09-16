@@ -482,6 +482,7 @@ namespace solvers {
     _pol_vtx->set_ladder_dyn_tfold(_vertex->ladder_dyn_tfold());
     _pol_vtx->set_ladder_dyn_vmask(_vertex->ladder_dyn_vmask_lo(), _vertex->ladder_dyn_vmask_hi());
     _pol_vtx->set_ladder_dyn_gamma1_only(_vertex->ladder_dyn_gamma1_only());
+    _pol_vtx->set_ladder_dyn_all_nu(_vertex->ladder_dyn_all_nu());
     // W-int-1b: the coarse->fine interpolation knobs travel to the readout instance too
     _pol_vtx->set_isdf_points(_vertex->isdf_points_file(), _vertex->isdf_points_dump());
     _pol_vtx->set_wannier_frame(_vertex->wannier_frame());
@@ -1236,6 +1237,56 @@ namespace solvers {
     }
   }
 
+
+  // W-int-4f coarse side: the dynamic-rung ladder on ALL transfers x ALL PH-sym half nodes, written as the full-frequency
+  // vertex object <prefix>.pol_wh_dyn.g<n>.h5 (four columns; the fine W-Dyson feed reads one of them by name).
+  void scr_coulomb_t::dump_pol_dyn_all_nu(MBState &mb_state, THC_ERI auto &thc, long gen) {
+    decltype(nda::range::all) all;
+    auto MF = thc.MF();
+    const long nw_b = _ft->nw_b();
+    const long nw_h = (nw_b % 2 == 0) ? nw_b / 2 : nw_b / 2 + 1;
+    const long nq = MF->nqpts_ibz();
+    std::vector<long> nodes(static_cast<size_t>(nw_h));
+    std::vector<long> qs(static_cast<size_t>(nq));
+    for (long j = 0; j < nw_h; ++j) nodes[size_t(j)] = j;
+    for (long iq = 0; iq < nq; ++iq) qs[size_t(iq)] = iq;
+    app_log(1, "  [W-int-4f] all-nu dynamic-rung dump: {} half nodes x {} transfers (Gamma_1-only = {}).", nw_h, nq,
+            _pol_vtx->ladder_dyn_gamma1_only());
+    auto r = _pol_vtx->eval_pol_dynbse_cut(mb_state, thc, nodes, qs, gen);
+    _pol_dyn_ritz = std::max(_pol_dyn_ritz, r.ritz_max);
+    if (thc.mpi()->comm.root()) {
+      auto lat = MF->lattv();
+      auto Q = MF->Qpts();
+      nda::array<double, 2> qc(nq, 3);
+      for (long iq = 0; iq < nq; ++iq)
+        for (long i = 0; i < 3; ++i) { double v = 0.0; for (long j = 0; j < 3; ++j) v += lat(i, j) * Q(iq, j); qc(iq, i) = v / (2.0 * M_PI); }
+      nda::array<long, 1> nu_half(nw_h);
+      { auto wb = _ft->wn_mesh_b(); for (long j = 0; j < nw_h; ++j) nu_half(j) = long(wb(nw_b / 2 + j)); }
+      const long Nm = r.Pi.shape(3);
+      const std::string fn = mb_state.coqui_prefix + ".pol_wh_dyn.g" + std::to_string(gen) + ".h5";
+      h5::file f(fn, 'w');
+      h5::group g(f);
+      nda::h5_write(g, "q", qc);
+      nda::h5_write(g, "nu_half", nu_half);
+      h5::h5_write(g, "beta", _ft->beta());
+      h5::h5_write(g, "nw_b", nw_b);
+      const char *names[4] = {"Pi_static", "Pi_dyn1", "Pi_gam1", "Pi_dyn"};
+      for (int c = 0; c < 4; ++c) {
+        nda::array<ComplexType, 4> P(nw_h, nq, Nm, Nm);
+        P = r.Pi(c, all, all, all, all);
+        nda::h5_write(g, names[c], P);
+      }
+      h5::h5_write(g, "nout", Nm);
+      h5::h5_write(g, "frame", std::string("aux"));
+      h5::h5_write(g, "wannier", long(_pol_vtx->wannier() ? 1 : 0));
+      h5::h5_write(g, "nm", Nm);
+      h5::h5_write(g, "window_first", long(_pol_vtx->pol_band_window().first()));
+      h5::h5_write(g, "window_size", long(_pol_vtx->pol_band_window().size()));
+      if (_pol_vtx->secondary_points().size() > 0) nda::h5_write(g, "ipts", _pol_vtx->secondary_points());
+      app_log(1, "  [W-int-4f] all-nu dynamic-rung columns written to {} ({} half nodes x {} q x {} x {}; watchdog max |Ritz| "
+                 "{:.3f}, all converged {}).", fn, nw_h, nq, Nm, Nm, r.ritz_max, r.all_converged);
+    }
+  }
   /**
    * scGW-tilde L2, the ladder eps_M readout (stance i -- report-only, PDF section 4.2
    * placement (i)): per q at inu = 0,
@@ -1267,6 +1318,7 @@ namespace solvers {
       ++_pol_dyn_calls;
       auto dres = _pol_vtx->eval_pol_dynbse_nu0(mb_state, thc, _pol_dyn_calls);
       _pol_dyn_ritz = dres.ritz_max;
+      if (_pol_vtx->ladder_dyn_all_nu()) dump_pol_dyn_all_nu(mb_state, thc, _pol_dyn_calls);
       app_log(1, "  [scGW-tilde T2] Wannier-vertex DUMP: Pi_loc(q) produced in the MLWF-pair frame "
                  "({} q x {} x {}) -- dumped for coarse->fine interpolation; the aux eps readout is bypassed.",
               dres.Pi_gam1.shape(0), dres.Pi_gam1.shape(1), dres.Pi_gam1.shape(2));
@@ -1358,6 +1410,7 @@ namespace solvers {
     if (dyn_rung) {
       ++_pol_dyn_calls;
       dres.emplace(_pol_vtx->eval_pol_dynbse_nu0(mb_state, thc, _pol_dyn_calls));
+      if (_pol_vtx->ladder_dyn_all_nu()) dump_pol_dyn_all_nu(mb_state, thc, _pol_dyn_calls);
       // W-int-0: in Wannier mode eval_pol_dynbse_nu0 dumped Pi_loc(q) in the MLWF-pair basis (nab != Nm);
       // consumed OFFLINE for coarse->fine interpolation, not by this aux eps readout -- skip the aux shape
       // check + the dynamic-column upfold below. The static ladder eps columns are unaffected.

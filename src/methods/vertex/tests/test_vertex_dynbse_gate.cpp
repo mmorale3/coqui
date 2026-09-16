@@ -488,8 +488,57 @@ namespace bdft_tests {
       REQUIRE(std::abs(ha - hb) < 1e-12); REQUIRE(std::abs(ca - cb) < 1e-12);
       REQUIRE(std::abs(la - lb) < 1e-10); REQUIRE(std::abs(ea - eb) < 1e-10);
       REQUIRE(std::abs(la - ra) > 1e-4);   // the injection did something
+      // G: the coarse-side Gamma_1 UPGRADE -- the dynamic rung at ALL q x ALL half nodes (pol_vertex_dyn_all_nu) dumped
+      // as <G>.pol_wh_dyn.g1.h5; D: the loop with Gamma_1 injected from that file. Checks: the dump's static column ==
+      // the injected static-rung ladder (same object, union-grid route: refit class), and D's loop-side eps_M == the
+      // dynamic readout's Gamma_1 column of G (the same P^{C,L} through two consumers).
+      auto run_g = [&](std::string const &tag, bool all_nu, std::string const &points, std::string const &interp, std::string const &col) {
+        const std::string out = "coqui_d3_winj_" + tag;
+        solvers::hf_t hf; solvers::gw_t gw(&ft, "ignore_g0", out);
+        solvers::scr_coulomb_t scr_eri(&ft, "rpa", "ignore_g0");
+        simple_dyson dyson(mfn.get(), &ft); MBState mb_state(mpi_context, ft, out);
+        iter_scf::iter_scf_t iter_sol("damping");
+        solvers::vertex_t vtx(&ft, "none", nda::range(0, 0), mfn->nbnd());
+        vtx.set_pol_vertex("ladder", "w0_prev", nda::range(0, 4), -1, 1e-8, -1.0, -1.0, -1.0, all_nu ? "none" : "ladder_n2");
+        vtx.set_ladder_rung(all_nu ? "dynamic" : "static", 1e-8, 30, 12, -1.0);
+        vtx.set_ladder_dyn_gamma1_only(true); vtx.set_ladder_dyn_dump(all_nu); vtx.set_ladder_dyn_all_nu(all_nu);
+        vtx.set_isdf_points(points, points.empty()); vtx.set_pol_interp(interp, col);
+        scr_eri.set_vertex(&vtx);
+        auto [e_hf, e_corr] = scf_loop(mb_state, dyson, erin, ft, solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol, 1, false, 1e-9, true);
+        auto ed = scr_eri.pol_eps_dyn();
+        const double eloop = scr_eri.pol_eps_loop();
+        app_log(1, "dynbse_readout W-int-4f INJ [{}]: e_corr {:.12f}, dynamic readout (static {:.10f}, one rung {:.10f}, Gamma_1 {:.10f}), loop-side {:.10f}",
+                tag, e_corr, ed[0], ed[1], ed[2], eloop);
+        mpi_context->comm.barrier();
+        if (mpi_context->comm.root() and tag != "G") {
+          remove((out + ".mbpt.h5").c_str());
+          for (auto const &e : std::filesystem::directory_iterator("."))
+            if (e.path().filename().string().rfind(out + ".", 0) == 0) std::filesystem::remove(e.path());
+        }
+        mpi_context->comm.barrier();
+        return std::make_pair(ed, eloop);
+      };
+      auto [edg, elg] = run_g("G", true, "", "", "gam1");
+      REQUIRE(std::filesystem::exists("coqui_d3_winj_G.pol_wh_dyn.g1.h5"));
+      {   // the dump's static column vs the injected whalf ladder of run A (both dumps carry all nodes)
+        nda::array<std::complex<double>, 4> Ps, Pl;
+        { h5::file f("coqui_d3_winj_G.pol_wh_dyn.g1.h5", 'r'); h5::group g(f); nda::h5_read(g, "Pi_static", Ps); }
+        { h5::file f("coqui_d3_winj_A.pol_wh.g1.h5", 'r'); h5::group g(f); nda::h5_read(g, "Pi_ladder", Pl); }
+        REQUIRE(Ps.shape() == Pl.shape());
+        double d = 0.0, n = 0.0;
+        for (long i = 0; i < Ps.size(); ++i) { d += std::norm(Ps.data()[i] - Pl.data()[i]); n += std::norm(Pl.data()[i]); }
+        app_log(1, "dynbse_readout W-int-4f INJ: all-nu dump's static column vs the injected static-rung ladder: rel Frobenius {:.2e}", std::sqrt(d / n));
+        REQUIRE(std::sqrt(d / n) < 1e-8);
+      }
+      auto [edd, eld] = run_g("D", false, "coqui_d3_winj_G.secpts.h5", "coqui_d3_winj_G.pol_wh_dyn.g1.h5", "gam1");
+      app_log(1, "dynbse_readout W-int-4f INJ: Gamma_1 consumed in the W-Dyson: loop-side eps_M {:.10f} vs the dynamic readout's Gamma_1 column {:.10f} (|d| = {:.2e})",
+              eld, edg[2], std::abs(eld - edg[2]));
+      REQUIRE(std::abs(eld - edg[2]) < 1e-5);   // the nu -> tau -> nu round trip of the injection (1.6e-7 here; 3e-4 on Si kp888)
       mpi_context->comm.barrier();
       if (mpi_context->comm.root()) {
+        remove("coqui_d3_winj_G.mbpt.h5");
+        for (auto const &e : std::filesystem::directory_iterator("."))
+          if (e.path().filename().string().rfind("coqui_d3_winj_G.", 0) == 0) std::filesystem::remove(e.path());
         remove("coqui_d3_winj_A.mbpt.h5");
         for (auto const &e : std::filesystem::directory_iterator("."))
           if (e.path().filename().string().rfind("coqui_d3_winj_A.", 0) == 0) std::filesystem::remove(e.path());

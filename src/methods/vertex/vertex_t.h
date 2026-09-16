@@ -896,6 +896,7 @@ namespace solvers {
     long _dyn_maxit = 30, _dyn_gmres = 12;
     long _dyn_rhs_block = 32;    // pol_vertex_dyn_rhs_block: RHS column block width of the dynamic solves
     bool _dyn_dump = false;      // pol_vertex_dyn_dump: per-unit dump + restart files of the dynamic solves
+    bool _dyn_all_nu = false;    // pol_vertex_dyn_all_nu: the all-q x all-node dynamic-rung dump (W-int-4f coarse side)
     bool _dyn_dense = true;      // pol_vertex_dyn_dense: the dense per-tau rung K_d(s) (nt/2 x D x D per unit)
     long _dyn_union_stride = 1;  // pol_vertex_dyn_union_stride: keep every n-th shifted G node of the union grid
     int _dyn_table_mode = 0;     // pol_vertex_dyn_table_mode: 0 fitted twisted-pair tables, 1 exact partial fractions
@@ -1523,6 +1524,12 @@ namespace solvers {
     }
     long eps_cut_nq() const { return _eps_cut_nq; }
     long eps_cut_dyn_nnu() const { return _eps_cut_dyn_nnu; }
+    /** W-int-4f coarse side: pol_vertex_dyn_all_nu (default false) -- after the inu = 0 readout, run the dynamic-rung
+     *  ladder on EVERY transfer x EVERY PH-sym half node (eval_pol_dynbse_cut over all q / all nodes; needs
+     *  pol_vertex_dyn_dump) and write <prefix>.pol_wh_dyn.g<n>.h5 with the four columns (static, dyn1, gam1, dyn),
+     *  the full-frequency vertex object in the frozen-able point frame for the fine W-Dyson feed (col "gam1"). */
+    void set_ladder_dyn_all_nu(bool on) { _dyn_all_nu = on; }
+    bool ladder_dyn_all_nu() const { return _dyn_all_nu; }
 
     /**
      * scGW-tilde TIER 1.5 (notes/tier15_ward_legs_plan.md; proposal section 4.6): the LEG

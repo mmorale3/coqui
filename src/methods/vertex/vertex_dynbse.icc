@@ -1791,13 +1791,12 @@ namespace solvers {
     vertex_ladder_detail::prof_watch twatch;
     dynbse_cut_result r;
     utils::check(active() and secondary(), "vertex_t::eval_pol_dynbse_cut: requires an ACTIVE secondary-basis vertex.");
-    utils::check(not _wannier, "vertex_t::eval_pol_dynbse_cut: window mode only.");
+    utils::check(not _wannier or _wannier_frame != "pair",
+                 "vertex_t::eval_pol_dynbse_cut: Wannier mode in the aux/point frame only (the pair frame is inu = 0 only).");
     utils::check(_W0b_qmm.has_value(), "vertex_t::eval_pol_dynbse_cut: W0bar is absent -- build_w0 must run first.");
     utils::check(_Wb_qwmm.has_value(), "vertex_t::eval_pol_dynbse_cut: the W-bar cache is absent -- cache_w must run.");
     auto MF = thc.MF();
     auto mpi = thc.mpi();
-    utils::check(MF->nkpts() == MF->nkpts_ibz() and MF->nqpts() == MF->nqpts_ibz(),
-                 "vertex_t::eval_pol_dynbse_cut: nosym meshes only.");
     nda::array<ComplexType, 5> G_CC;
     nda::array<long, 2> kmq, kpq;
     vertex_sym::sym_ctx const *symc = nullptr;

@@ -358,6 +358,7 @@ namespace solvers {
     // transform run on the LOCAL (P, Q) block only; no replicated (nu|t, q, Np, Np) array
     // is ever formed. Called from update_w between the readout's build_w0 hook and the
     // Dyson (ordering pinned by R-Q3-3).
+    void dump_pol_dyn_all_nu(MBState &mb_state, THC_ERI auto &thc, long gen);   // W-int-4f coarse side
     template<nda::MemoryArrayOfRank<4> Array_t, typename communicator_t>
     void inject_pol_ladder(MBState &mb_state, THC_ERI auto &thc,
                            memory::darray_t<Array_t, communicator_t> &dPi_tqPQ);
