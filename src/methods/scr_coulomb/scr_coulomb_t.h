@@ -343,6 +343,7 @@ namespace solvers {
                                 nda::array<ComplexType, 2> const *eps_inv_head_q = nullptr);
     // last readout values at q_min (RPA, +ladder); -1 before the first readout
     double _pol_eps_rpa = -1.0, _pol_eps_ladder = -1.0;
+    long _pol_inj_calls = 0;   // W-int-4f: injection call counter (the .pol_wh.g<n>.h5 dump generation)
     double _pol_eps_dlam = -1.0;   // Tier 1.5: eps_M with chi0_Lambda alone (RPA + Delta P^Lambda)
     // scGW-tilde Tier 2 full frequency (D3): the dynamic-rung columns at q_min, inu = 0
     double _pol_eps_dyn_static = -1.0, _pol_eps_dyn_pc = -1.0, _pol_eps_dyn_gam1 = -1.0, _pol_eps_dyn = -1.0;

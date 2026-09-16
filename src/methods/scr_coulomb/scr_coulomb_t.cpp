@@ -898,12 +898,101 @@ namespace solvers {
     // row feeds the readout's "+DeltaLambda" column); Pl then already contains it (eq 27).
     const bool ward_legs = _pol_vtx->ladder_ward_legs();
     nda::array<ComplexType, 4> Pd;
-    auto Pl = _pol_vtx->eval_pol_ladder_whalf(mb_state, thc, &lam,
-                                              ward_legs ? std::addressof(Pd) : nullptr);
+    nda::array<ComplexType, 4> Pl;
+    ++_pol_inj_calls;
+    auto MF = thc.MF();
+    auto lat = MF->lattv();
+    auto Q = MF->Qpts();
+    auto q_crys = [&](long iq, double *qc) {
+      for (long i = 0; i < 3; ++i) { double v = 0.0; for (long j = 0; j < 3; ++j) v += lat(i, j) * Q(iq, j); qc[i] = v / (2.0 * M_PI); }
+    };
+    const long nw_h_ft = (_ft->nw_b() % 2 == 0) ? _ft->nw_b() / 2 : _ft->nw_b() / 2 + 1;
+    nda::array<long, 1> nu_half(nw_h_ft);
+    { auto wb = _ft->wn_mesh_b(); for (long j = 0; j < nw_h_ft; ++j) nu_half(j) = long(wb(_ft->nw_b() / 2 + j)); }
+    const bool from_file = not _pol_vtx->pol_interp_file().empty();
+    if (from_file) {
+      // W-int-4f (notes/wannier_coarse_vertex_plan.md): the FULL-FREQUENCY consumer. P^{C,L}(q, i nu_j) on this mesh's
+      // q list at ALL PH-sym half nodes comes from the file (a coarse run's <prefix>.pol_wh.g<n>.h5, or the offline
+      // Route-B interpolant in the same layout) in the frozen-point secondary frame, instead of the ladder solve; the
+      // upfold + nu -> tau + the += into the RPA polarization below run unchanged, so the W-Dyson, W and Sigma of the
+      // fine loop all see the interpolated vertex. Requires the same imaginary-axis grid (checked on the node list).
+      utils::check(not ward_legs, "inject_pol_ladder: pol_vertex_interp_file with legs = \"ward\" is not supported.");
+      utils::check(not _pol_vtx->isdf_points_file().empty(),
+                   "inject_pol_ladder: pol_vertex_interp_file needs pol_vertex_isdf_points_file (the file's secondary "
+                   "frame is the coarse run's point set).");
+      const std::string col = "Pi_" + _pol_vtx->pol_interp_col();
+      nda::array<double, 2> qf;
+      nda::array<ComplexType, 4> Pf;
+      nda::array<long, 1> nu_f;
+      double beta_f = -1.0;
+      {
+        h5::file f(_pol_vtx->pol_interp_file(), 'r');
+        h5::group g(f);
+        utils::check(g.has_dataset("nu_half"),
+                     "inject_pol_ladder: {} carries no nu_half axis -- an inu = 0-only dump cannot feed the W-Dyson "
+                     "(dump the coarse run's whalf / all-nu columns).", _pol_vtx->pol_interp_file());
+        nda::h5_read(g, "q", qf);
+        nda::h5_read(g, col, Pf);
+        nda::h5_read(g, "nu_half", nu_f);
+        if (g.has_dataset("beta")) h5::h5_read(g, "beta", beta_f);
+      }
+      utils::check(long(nu_f.size()) == nw_h_ft, "inject_pol_ladder: {} has {} half nodes, this run's IAFT has {} -- the "
+                   "coarse and fine runs must share beta / basis / precision.", _pol_vtx->pol_interp_file(), nu_f.size(), nw_h_ft);
+      for (long j = 0; j < nw_h_ft; ++j)
+        utils::check(nu_f(j) == nu_half(j), "inject_pol_ladder: half node {} is Matsubara index {} in the file, {} here.",
+                     j, nu_f(j), nu_half(j));
+      if (beta_f > 0.0) utils::check(std::abs(beta_f - _ft->beta()) < 1e-8, "inject_pol_ladder: beta {} (file) != {} (run).", beta_f, _ft->beta());
+      const long Nm_v = _pol_vtx->secondary_rank();
+      utils::check(Pf.shape(0) == nw_h_ft and Pf.shape(2) == Nm_v and Pf.shape(3) == Nm_v and Pf.shape(1) == qf.shape(0),
+                   "inject_pol_ladder: {} in {} is {} x {} x {} x {}, expected {} x nq x {} x {}.", col, _pol_vtx->pol_interp_file(),
+                   Pf.shape(0), Pf.shape(1), Pf.shape(2), Pf.shape(3), nw_h_ft, Nm_v, Nm_v);
+      Pl = nda::array<ComplexType, 4>(nw_h_ft, nq_g, Nm_v, Nm_v);
+      for (long iq = 0; iq < nq_g; ++iq) {
+        double qc[3]; q_crys(iq, qc);
+        long hit = -1;
+        for (long jq = 0; jq < qf.shape(0) and hit < 0; ++jq) {
+          bool same = true;
+          for (long i = 0; i < 3 and same; ++i) { const double d = qf(jq, i) - qc[i]; same = std::abs(d - std::round(d)) < 1e-5; }
+          if (same) hit = jq;
+        }
+        utils::check(hit >= 0, "inject_pol_ladder: q = ({:.6f}, {:.6f}, {:.6f}) (crystal) of this mesh is absent from {}.",
+                     qc[0], qc[1], qc[2], _pol_vtx->pol_interp_file());
+        Pl(all, iq, all, all) = Pf(all, hit, all, all);
+      }
+      lam = nda::array<double, 1>(nw_h_ft); lam() = 0.0;
+      app_log(1, "  [W-int-4f] W-Dyson injection consumes {} from {} ({} half nodes x {} q matched; frozen points, N_m = {}).",
+              col, _pol_vtx->pol_interp_file(), nw_h_ft, nq_g, Nm_v);
+    } else {
+      Pl = _pol_vtx->eval_pol_ladder_whalf(mb_state, thc, &lam, ward_legs ? std::addressof(Pd) : nullptr);
+    }
     const double t_eval = lwatch.lap();
     const double rss_eval = ladder_meter::rss_gb();
     auto const &tmap = _pol_vtx->secondary_transfer();               // (nq, Nm, Np)
     const long nw_h = Pl.shape(0), Nm = Pl.shape(2);
+    if (_pol_vtx->ladder_dyn_dump() and not from_file and thc.mpi()->comm.root()) {
+      // W-int-4f: the coarse run's FULL-FREQUENCY injection object (the resummed static-rung ladder at every PH-sym
+      // half node, the L3 object) in the frozen-able secondary frame -- the offline Route-B tool's input, and the fine
+      // consumer's format (pol_vertex_interp_file, col "ladder").
+      const std::string fn = mb_state.coqui_prefix + ".pol_wh.g" + std::to_string(_pol_inj_calls) + ".h5";
+      nda::array<double, 2> qc(nq_g, 3);
+      for (long iq = 0; iq < nq_g; ++iq) { double v[3]; q_crys(iq, v); for (long i = 0; i < 3; ++i) qc(iq, i) = v[i]; }
+      h5::file f(fn, 'w');
+      h5::group g(f);
+      nda::h5_write(g, "q", qc);
+      nda::h5_write(g, "nu_half", nu_half);
+      h5::h5_write(g, "beta", _ft->beta());
+      h5::h5_write(g, "nw_b", long(_ft->nw_b()));
+      nda::h5_write(g, "Pi_ladder", Pl);
+      h5::h5_write(g, "nout", Nm);
+      h5::h5_write(g, "frame", std::string("aux"));
+      h5::h5_write(g, "wannier", long(_pol_vtx->wannier() ? 1 : 0));
+      h5::h5_write(g, "nm", Nm);
+      h5::h5_write(g, "window_first", long(_pol_vtx->pol_band_window().first()));
+      h5::h5_write(g, "window_size", long(_pol_vtx->pol_band_window().size()));
+      if (_pol_vtx->secondary_points().size() > 0) nda::h5_write(g, "ipts", _pol_vtx->secondary_points());
+      app_log(1, "  [W-int-4f] full-frequency ladder injection object written to {} ({} half nodes x {} q x {} x {}).",
+              fn, nw_h, nq_g, Nm, Nm);
+    }
     utils::check(Pl.shape(1) == nq_g and tmap.shape(0) == nq_g and tmap.shape(1) == Nm
                  and tmap.shape(2) == Np,
                  "inject_pol_ladder: shape mismatch (ladder {}x{}x{}, t {}x{}x{}, Pi q = "
@@ -1221,7 +1310,12 @@ namespace solvers {
         h5::file f(_pol_vtx->pol_interp_file(), 'r');
         h5::group g(f);
         nda::h5_read(g, "q", qf);
-        nda::h5_read(g, col, Pf);
+        if (g.has_dataset("nu_half")) {   // an all-nu file: its half node 0 IS the inu = 0 node
+          nda::array<ComplexType, 4> P4; nda::h5_read(g, col, P4);
+          Pf = nda::array<ComplexType, 3>(P4.shape(1), P4.shape(2), P4.shape(3)); Pf = P4(0, all, all, all);
+        } else {
+          nda::h5_read(g, col, Pf);
+        }
       }
       const long Nm_v = _pol_vtx->secondary_rank();
       utils::check(Pf.shape(1) == Nm_v and Pf.shape(2) == Nm_v and Pf.shape(0) == qf.shape(0),

@@ -443,6 +443,60 @@ namespace bdft_tests {
       mpi_context->comm.barrier();
       return;
     }
+    if (std::getenv("COQUI_DYNBSE_TEST_WINT_INJ")) {
+      // W-int-4f V0 gate (notes/wannier_coarse_vertex_plan.md): the FULL-FREQUENCY W-Dyson feed. A injects the direct
+      // resummed ladder at every PH-sym half node (pol_vertex_inject = ladder_n2, the L3 object) and dumps it
+      // (<A>.pol_wh.g1.h5 + <A>.secpts.h5); B runs the same loop with the injection READ from that file on A's frozen
+      // points (never solving the ladder). Same G -> same P_RPA + P^{C,L} -> same W, Sigma: e_hf / e_corr / the loop-side
+      // eps_M / the readout must be IDENTICAL (bit level). C = the same with a fixture of the SYMMETRIC mesh's own dump.
+      std::string fxn = std::getenv("COQUI_DYNBSE_TEST_WINT_INJ"); if (fxn == "1" or fxn.empty()) fxn = "qe_lih222";
+      auto mfn = std::make_shared<mf::MF>(mf::default_MF(mpi_context, fxn));
+      thc_reader_t thcn(mfn, make_thc_reader_ptree(mfn->nbnd() * 8, "", "incore", "", "bdft", 1e-10, mfn->ecutrho(), 1, 1024));
+      auto erin = mb_eri_t(thcn, thcn);
+      auto run_i = [&](std::string const &tag, std::string const &points, std::string const &interp, int niter) {
+        const std::string out = "coqui_d3_winj_" + tag;
+        solvers::hf_t hf; solvers::gw_t gw(&ft, "ignore_g0", out);
+        solvers::scr_coulomb_t scr_eri(&ft, "rpa", "ignore_g0");
+        simple_dyson dyson(mfn.get(), &ft); MBState mb_state(mpi_context, ft, out);
+        iter_scf::iter_scf_t iter_sol("damping");
+        solvers::vertex_t vtx(&ft, "none", nda::range(0, 0), mfn->nbnd());
+        vtx.set_pol_vertex("ladder", "w0_prev", nda::range(0, 4), -1, 1e-8, -1.0, -1.0, -1.0, "ladder_n2");
+        vtx.set_ladder_rung("static", 1e-8, 30, 12, -1.0);
+        vtx.set_ladder_dyn_dump(interp.empty());          // A dumps the injection object
+        vtx.set_isdf_points(points, points.empty());       // A dumps its points, B freezes them
+        vtx.set_pol_interp(interp, "ladder");
+        scr_eri.set_vertex(&vtx);
+        auto [e_hf, e_corr] = scf_loop(mb_state, dyson, erin, ft, solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol, niter, false, 1e-9, true);
+        auto [er, el] = scr_eri.pol_eps_readout();
+        const double eloop = scr_eri.pol_eps_loop();
+        app_log(1, "dynbse_readout W-int-4f INJ [{}]: e_hf {:.12f} e_corr {:.12f} eps_M readout RPA {:.10f} +ladder {:.10f} loop-side {:.10f}",
+                tag, e_hf, e_corr, er, el, eloop);
+        mpi_context->comm.barrier();
+        if (mpi_context->comm.root() and tag != "A") {
+          remove((out + ".mbpt.h5").c_str());
+          for (auto const &e : std::filesystem::directory_iterator("."))
+            if (e.path().filename().string().rfind(out + ".", 0) == 0) std::filesystem::remove(e.path());
+        }
+        mpi_context->comm.barrier();
+        return std::make_tuple(e_hf, e_corr, er, el, eloop);
+      };
+      auto [ha, ca, ra, la, ea] = run_i("A", "", "", 1);
+      REQUIRE(std::filesystem::exists("coqui_d3_winj_A.pol_wh.g1.h5")); REQUIRE(std::filesystem::exists("coqui_d3_winj_A.secpts.h5"));
+      auto [hb, cb, rb, lb, eb] = run_i("B", "coqui_d3_winj_A.secpts.h5", "coqui_d3_winj_A.pol_wh.g1.h5", 1);
+      app_log(1, "dynbse_readout W-int-4f INJ gate: |d e_hf| {:.2e} |d e_corr| {:.2e} |d eps_M(readout +ladder)| {:.2e} |d eps_M(loop)| {:.2e}",
+              std::abs(ha - hb), std::abs(ca - cb), std::abs(la - lb), std::abs(ea - eb));
+      REQUIRE(std::abs(ha - hb) < 1e-12); REQUIRE(std::abs(ca - cb) < 1e-12);
+      REQUIRE(std::abs(la - lb) < 1e-10); REQUIRE(std::abs(ea - eb) < 1e-10);
+      REQUIRE(std::abs(la - ra) > 1e-4);   // the injection did something
+      mpi_context->comm.barrier();
+      if (mpi_context->comm.root()) {
+        remove("coqui_d3_winj_A.mbpt.h5");
+        for (auto const &e : std::filesystem::directory_iterator("."))
+          if (e.path().filename().string().rfind("coqui_d3_winj_A.", 0) == 0) std::filesystem::remove(e.path());
+      }
+      mpi_context->comm.barrier();
+      return;
+    }
     if (std::getenv("COQUI_DYNBSE_TEST_WINT")) { wint_gate(mf, eri, "nosym"); return; }
     if (std::getenv("COQUI_DYNBSE_TEST_WINT_SYM")) {
       // the fixture name is the env value ("1" = qe_lih222_sym; use qe_lih223_sym for a mesh with non-TRIM k-points)
