@@ -356,6 +356,57 @@ namespace bdft_tests {
       }
       mpi_context->comm.barrier();
     };
+    if (std::getenv("COQUI_DYNBSE_TEST_WINT_CROSS")) {
+      // STAR-CLOSURE probe (kp888 finding 2026-09-16): points selected on the NOSYM mesh, frozen on the SYMMETRIC mesh.
+      // The vertex's IBZ machinery assumes the secondary point set is closed under the group (the sym selection
+      // builds it from irreducible r-grid sectors). Runs: A_nosym (window, dynamic, dumps points + Pi), A_sym (own
+      // star-closed selection: the direct sym reference), C_sym (A_nosym's points frozen on the sym mesh, consuming
+      // A_nosym's static column). Reported: eps_M(ladder, q_min) of the three -- C_sym vs A_sym beyond the ~1e-4
+      // sym/nosym leakage class means the non-star-closed frozen points break the symmetric consumer.
+      using cplx = std::complex<double>;
+      auto mfs = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_lih222_sym"));
+      thc_reader_t thcs(mfs, make_thc_reader_ptree(mfs->nbnd() * 8, "", "incore", "", "bdft", 1e-10, mfs->ecutrho(), 1, 1024));
+      auto eris = mb_eri_t(thcs, thcs);
+      auto run_x = [&](std::string const &tag, std::shared_ptr<mf::MF> mfw, auto &eriw, std::string const &rung, bool dump,
+                       std::string const &points, std::string const &interp) {
+        const std::string out = "coqui_d3_wcross_" + tag;
+        solvers::hf_t hf; solvers::gw_t gw(&ft, "ignore_g0", out);
+        solvers::scr_coulomb_t scr_eri(&ft, "rpa", "ignore_g0");
+        simple_dyson dyson(mfw.get(), &ft); MBState mb_state(mpi_context, ft, out);
+        iter_scf::iter_scf_t iter_sol("damping");
+        solvers::vertex_t vtx(&ft, "none", nda::range(0, 0), mfw->nbnd());
+        vtx.set_pol_vertex("ladder", "w0_prev", nda::range(0, 4), -1, 1e-8, -1.0, -1.0, -1.0);
+        vtx.set_ladder_rung(rung, 1e-8, 30, 12, -1.0);
+        vtx.set_ladder_dyn_gamma1_only(true); vtx.set_ladder_dyn_dump(dump);
+        vtx.set_isdf_points(points, dump); vtx.set_pol_interp(interp, "static");
+        scr_eri.set_vertex(&vtx);
+        auto [e_hf, e_corr] = scf_loop(mb_state, dyson, eriw, ft, solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol, 2, false, 1e-9, true);
+        auto [er, el] = scr_eri.pol_eps_readout();
+        app_log(1, "dynbse_readout W-int CROSS [{}]: e_corr {:.10f}, eps_M RPA {:.8f} ladder {:.8f}", tag, e_corr, er, el);
+        mpi_context->comm.barrier();
+        if (mpi_context->comm.root() and tag != "A_nosym") {
+          remove((out + ".mbpt.h5").c_str());
+          for (auto const &e : std::filesystem::directory_iterator("."))
+            if (e.path().filename().string().rfind(out + ".", 0) == 0) std::filesystem::remove(e.path());
+        }
+        mpi_context->comm.barrier();
+        return std::make_pair(er, el);
+      };
+      auto [ra, la] = run_x("A_nosym", mf, eri, "dynamic", true, "", "");
+      auto [rs, ls] = run_x("A_sym", mfs, eris, "static", false, "", "");
+      auto [rc, lc] = run_x("C_sym", mfs, eris, "static", false, "coqui_d3_wcross_A_nosym.secpts.h5", "coqui_d3_wcross_A_nosym.pol_nu0.g2.h5");
+      app_log(1, "dynbse_readout W-int CROSS: eps_M(ladder, q_min): nosym direct {:.8f} | sym direct (star-closed points) {:.8f} | "
+                 "sym consumer on NOSYM-selected frozen points {:.8f}  => C_sym - A_sym = {:+.2e} (rel {:.1e}); RPA sym {:.8f} nosym {:.8f}",
+              la, ls, lc, lc - ls, std::abs(lc - ls) / std::abs(ls - rs), rs, ra);
+      mpi_context->comm.barrier();
+      if (mpi_context->comm.root()) {
+        remove("coqui_d3_wcross_A_nosym.mbpt.h5");
+        for (auto const &e : std::filesystem::directory_iterator("."))
+          if (e.path().filename().string().rfind("coqui_d3_wcross_A_nosym.", 0) == 0) std::filesystem::remove(e.path());
+      }
+      mpi_context->comm.barrier();
+      return;
+    }
     if (std::getenv("COQUI_DYNBSE_TEST_WINT")) { wint_gate(mf, eri, "nosym"); return; }
     if (std::getenv("COQUI_DYNBSE_TEST_WINT_SYM")) {
       auto mfs = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_lih222_sym"));
