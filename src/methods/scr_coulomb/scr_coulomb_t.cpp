@@ -28,6 +28,7 @@
 #include "methods/HF/thc_solver_comm.hpp"
 #include "methods/GW/g0_div_utils.hpp"
 #include "methods/vertex/vertex_t.h"
+#include "nda/linalg/eigenelements.hpp"
 #include "hamiltonian/one_body_hamiltonian.hpp"   // scGW-tilde C4: H0 for the CVV velocity
 #include "hamiltonian/pseudo/pseudopot.h"
 #include "cvv_head.hpp"
@@ -486,6 +487,7 @@ namespace solvers {
     _pol_vtx->set_ladder_dyn_cut_r1(_vertex->ladder_dyn_cut_r1());
     _pol_vtx->set_ladder_dyn_bubble_only(_vertex->ladder_dyn_bubble_only());
     _pol_vtx->set_ladder_dyn_all_nu_nodes(_vertex->ladder_dyn_all_nu_nodes());
+    _pol_vtx->set_ladder_dyn_fit(_vertex->ladder_dyn_fit_file(), _vertex->ladder_dyn_fit_rank());
     // W-int-1b: the coarse->fine interpolation knobs travel to the readout instance too
     _pol_vtx->set_isdf_points(_vertex->isdf_points_file(), _vertex->isdf_points_dump());
     _pol_vtx->set_wannier_frame(_vertex->wannier_frame());
@@ -1299,12 +1301,89 @@ namespace solvers {
       h5::h5_write(g, "nw_b", nw_b);
       if (rd.has_value()) {
         const char *names[4] = {"Pi_static", "Pi_dyn1", "Pi_gam1", "Pi_dyn"};
+        // LFF-aux L-3: the on-demand fit. With a sampled-node dump and pol_vertex_dyn_fit_file, each column is refit at ALL
+        // nodes in the nu-basis learned from the file's matching column (its top-K nu-modes; K = fit_rank or the number of
+        // sampled nodes), by least squares on the sampled rows; the fit is exact at the sampled nodes when K = |nodes|.
+        const std::string fit_file = _pol_vtx->ladder_dyn_fit_file();
+        const bool do_fit = subset and not fit_file.empty();
+        const long Kfit = (_pol_vtx->ladder_dyn_fit_rank() > 0) ? std::min<long>(_pol_vtx->ladder_dyn_fit_rank(), long(nodes.size()))
+                                                               : long(nodes.size());
+        std::optional<h5::file> ff;
+        if (do_fit) {
+          ff.emplace(fit_file, 'r');
+          h5::group gf(ff.value());
+          nda::array<long, 1> nu_f;
+          nda::h5_read(gf, "nu_half", nu_f);
+          utils::check(nu_f.size() == nw_h, "dump_pol_dyn_all_nu: the fit file {} has {} half nodes, this run {}.", fit_file, nu_f.size(), nw_h);
+          for (long j = 0; j < nw_h; ++j)
+            utils::check(nu_f(j) == nu_half(j), "dump_pol_dyn_all_nu: the fit file's half node {} is Matsubara index {}, {} here.", j, nu_f(j), nu_half(j));
+          app_log(1, "  [LFF L-3] on-demand fit: {} sampled nodes -> all {} nodes in the nu-basis of {} ({} modes per column).",
+                  nodes.size(), nw_h, fit_file, Kfit);
+        }
+        const long NS = long(nodes.size()), ncol = nq * Nm * Nm;
         for (int c = 0; c < 4; ++c) {
           nda::array<ComplexType, 4> P(nw_h, nq, Nm, Nm);
           P() = ComplexType(0.0);
-          for (long j = 0; j < long(nodes.size()); ++j) P(nodes[size_t(j)], all, all, all) = rd->Pi(c, j, all, all, all);
+          for (long j = 0; j < NS; ++j) P(nodes[size_t(j)], all, all, all) = rd->Pi(c, j, all, all, all);
+          bool fitted = false;
+          if (do_fit) {
+            h5::group gf(ff.value());
+            if (gf.has_dataset(names[c])) {
+              nda::array<ComplexType, 4> T;
+              nda::h5_read(gf, names[c], T);
+              utils::check(T.shape(0) == nw_h and T.shape(1) == nq and T.shape(2) == Nm and T.shape(3) == Nm,
+                           "dump_pol_dyn_all_nu: the fit file's {} is {} x {} x {} x {}, expected {} x {} x {} x {}.", names[c],
+                           T.shape(0), T.shape(1), T.shape(2), T.shape(3), nw_h, nq, Nm, Nm);
+              auto T2 = nda::reshape(T, std::array<long, 2>{nw_h, ncol});
+              // the nu-modes: eigenvectors of the (nw_h x nw_h) Gram G = T2 T2^dag (descending eigenvalues = the SVD modes)
+              nda::matrix<ComplexType> G(nw_h, nw_h);
+              nda::blas::gemm(T2, nda::dagger(T2), G);
+              for (long a = 0; a < nw_h; ++a) for (long b = 0; b < a; ++b) { G(a, b) = 0.5 * (G(a, b) + std::conj(G(b, a))); G(b, a) = std::conj(G(a, b)); }
+              auto [lam, V] = nda::linalg::eigenelements(G);   // ascending
+              double ltot = 0.0, lkept = 0.0;
+              for (long a = 0; a < nw_h; ++a) ltot += std::max(0.0, lam(a));
+              nda::matrix<ComplexType> Phi(nw_h, Kfit), PhiS(NS, Kfit);
+              for (long k = 0; k < Kfit; ++k) {
+                const long a = nw_h - 1 - k;
+                lkept += std::max(0.0, lam(a));
+                for (long j = 0; j < nw_h; ++j) Phi(j, k) = V(j, a);
+                for (long j = 0; j < NS; ++j) PhiS(j, k) = V(nodes[size_t(j)], a);
+              }
+              // least squares on the sampled rows: A = (PhiS^dag PhiS)^-1 PhiS^dag P_S  (K x K normal equations)
+              nda::matrix<ComplexType> N(Kfit, Kfit);
+              nda::blas::gemm(nda::dagger(PhiS), PhiS, N);
+              nda::inverse_in_place(N);
+              nda::matrix<ComplexType> PS(NS, ncol), B(Kfit, ncol), A(Kfit, ncol), Pfull(nw_h, ncol);
+              for (long j = 0; j < NS; ++j) { auto row = nda::reshape(rd->Pi(c, j, all, all, all), std::array<long, 1>{ncol}); PS(j, all) = row; }
+              nda::blas::gemm(nda::dagger(PhiS), PS, B);
+              nda::blas::gemm(N, B, A);
+              nda::blas::gemm(Phi, A, Pfull);
+              // the residual at the sampled rows (exact when Kfit = NS) and the Hermitized full object
+              double rs = 0.0, ns = 0.0;
+              for (long j = 0; j < NS; ++j)
+                for (long i = 0; i < ncol; ++i) {
+                  ComplexType f = 0.0;
+                  for (long k = 0; k < Kfit; ++k) f += PhiS(j, k) * A(k, i);
+                  rs += std::norm(f - PS(j, i)); ns += std::norm(PS(j, i));
+                }
+              for (long j = 0; j < nw_h; ++j)
+                for (long iq = 0; iq < nq; ++iq)
+                  for (long M = 0; M < Nm; ++M)
+                    for (long Nn = 0; Nn < Nm; ++Nn)
+                      P(j, iq, M, Nn) = 0.5 * (Pfull(j, (iq * Nm + M) * Nm + Nn) + std::conj(Pfull(j, (iq * Nm + Nn) * Nm + M)));
+              fitted = true;
+              double pmax = 0.0;
+              for (auto const &v : P) pmax = std::max(pmax, std::abs(v));
+              app_log(1, "  [LFF L-3]   {}: {} modes carry {:.6f} of the basis column's |.|^2; residual at the sampled nodes {:.2e}; "
+                         "max |P| {:.3e}", names[c], Kfit, (ltot > 0.0) ? lkept / ltot : 0.0, (ns > 0.0) ? std::sqrt(rs / ns) : 0.0, pmax);
+            } else {
+              app_log(1, "  [LFF L-3]   {}: not in the fit file -- written at the sampled nodes only.", names[c]);
+            }
+          }
           nda::h5_write(g, names[c], P);
+          (void)fitted;
         }
+        if (do_fit) { h5::h5_write(g, "lff_fit_file", fit_file); h5::h5_write(g, "lff_fit_rank", Kfit); }
       }
       nda::h5_write(g, "Pi_bub", Pb);
       h5::h5_write(g, "nout", Nm);

@@ -900,6 +900,8 @@ namespace solvers {
     bool _dyn_cut_r1 = true;     // pol_vertex_dyn_cut_r1: false skips the one-bare-rung (Pi_dyn1) pass of the cut / all-nu dump
     bool _dyn_bubble_only = false;        // pol_vertex_dyn_bubble_only: the all-nu dump writes ONLY the window bubble column
     std::vector<long> _dyn_all_nu_nodes;  // pol_vertex_dyn_all_nu_nodes: the sampled half nodes of the all-nu dump (empty = all)
+    std::string _dyn_fit_file;            // pol_vertex_dyn_fit_file: a previous full all-nu dump = the learned nu-basis (LFF L-3)
+    long _dyn_fit_rank = 0;               // pol_vertex_dyn_fit_rank: number of nu-modes (0 = the number of sampled nodes)
     bool _dyn_dense = true;      // pol_vertex_dyn_dense: the dense per-tau rung K_d(s) (nt/2 x D x D per unit)
     long _dyn_union_stride = 1;  // pol_vertex_dyn_union_stride: keep every n-th shifted G node of the union grid
     int _dyn_table_mode = 0;     // pol_vertex_dyn_table_mode: 0 fitted twisted-pair tables, 1 exact partial fractions
@@ -1548,6 +1550,16 @@ namespace solvers {
     bool ladder_dyn_bubble_only() const { return _dyn_bubble_only; }
     void set_ladder_dyn_all_nu_nodes(std::vector<long> const &nodes) { _dyn_all_nu_nodes = nodes; }
     std::vector<long> const &ladder_dyn_all_nu_nodes() const { return _dyn_all_nu_nodes; }
+    /** LFF-aux L-3 (notes/lff_aux_plan.md): the ON-DEMAND FIT of the sampled-node dump. pol_vertex_dyn_fit_file = a previous
+     *  FULL all-nu dump (the previous scGW iteration's <prefix>.pol_wh_dyn.g<n>.h5, or any full evaluation on the same
+     *  grid): its columns supply the nu-basis (the top-K left singular vectors of the (n_nu, nq Nm^2) unfolding, K =
+     *  pol_vertex_dyn_fit_rank or the number of sampled nodes); each column of the sampled-node dump is refit by least
+     *  squares in that basis and written at ALL nodes, so the consumer reads the file unchanged. Measured on Si kp444 (plan
+     *  §5, round 2): 5 nodes (nu = 0 + 3 pivots + the highest node) reproduce the 40-node Gamma_1 object in the W-Dyson to
+     *  0.01 % of the vertex effect on e_corr. */
+    void set_ladder_dyn_fit(std::string const &file, long rank) { _dyn_fit_file = file; _dyn_fit_rank = rank; }
+    std::string const &ladder_dyn_fit_file() const { return _dyn_fit_file; }
+    long ladder_dyn_fit_rank() const { return _dyn_fit_rank; }
 
     /**
      * scGW-tilde TIER 1.5 (notes/tier15_ward_legs_plan.md; proposal section 4.6): the LEG

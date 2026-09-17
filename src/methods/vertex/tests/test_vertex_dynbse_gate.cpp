@@ -13,6 +13,7 @@
 #undef NDEBUG
 
 #include <cstdlib>
+#include <algorithm>
 #include <filesystem>
 #include <cmath>
 #include <complex>
@@ -494,7 +495,7 @@ namespace bdft_tests {
       // the injected static-rung ladder (same object, union-grid route: refit class), and D's loop-side eps_M == the
       // dynamic readout's Gamma_1 column of G (the same P^{C,L} through two consumers).
       auto run_g = [&](std::string const &tag, bool all_nu, std::string const &points, std::string const &interp, std::string const &col,
-                       bool cut_r1 = true, bool bubble_only = false, std::vector<long> nodes = {}) {
+                       bool cut_r1 = true, bool bubble_only = false, std::vector<long> nodes = {}, std::string const &fit_file = "") {
         const std::string out = "coqui_d3_winj_" + tag;
         solvers::hf_t hf; solvers::gw_t gw(&ft, "ignore_g0", out);
         solvers::scr_coulomb_t scr_eri(&ft, "rpa", "ignore_g0");
@@ -505,7 +506,7 @@ namespace bdft_tests {
         vtx.set_ladder_rung(all_nu ? "dynamic" : "static", 1e-8, 30, 12, -1.0);
         vtx.set_ladder_dyn_gamma1_only(true); vtx.set_ladder_dyn_dump(all_nu); vtx.set_ladder_dyn_all_nu(all_nu);
         vtx.set_ladder_dyn_cut_r1(cut_r1);
-        vtx.set_ladder_dyn_bubble_only(bubble_only); vtx.set_ladder_dyn_all_nu_nodes(nodes);
+        vtx.set_ladder_dyn_bubble_only(bubble_only); vtx.set_ladder_dyn_all_nu_nodes(nodes); vtx.set_ladder_dyn_fit(fit_file, 0);
         vtx.set_isdf_points(points, points.empty()); vtx.set_pol_interp(interp, col);
         scr_eri.set_vertex(&vtx);
         auto [e_hf, e_corr] = scf_loop(mb_state, dyson, erin, ft, solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol, 1, false, 1e-9, true);
@@ -514,7 +515,7 @@ namespace bdft_tests {
         app_log(1, "dynbse_readout W-int-4f INJ [{}]: e_corr {:.12f}, dynamic readout (static {:.10f}, one rung {:.10f}, Gamma_1 {:.10f}), loop-side {:.10f}",
                 tag, e_corr, ed[0], ed[1], ed[2], eloop);
         mpi_context->comm.barrier();
-        if (mpi_context->comm.root() and tag != "G" and tag != "G2" and tag != "GB" and tag != "GS") {
+        if (mpi_context->comm.root() and tag != "G" and tag != "G2" and tag != "GB" and tag != "GS" and tag != "GF") {
           remove((out + ".mbpt.h5").c_str());
           for (auto const &e : std::filesystem::directory_iterator("."))
             if (e.path().filename().string().rfind(out + ".", 0) == 0) std::filesystem::remove(e.path());
@@ -625,9 +626,33 @@ namespace bdft_tests {
         app_log(1, "dynbse_readout LFF-aux H: sampled nodes {{0, 2}}: max |d Pi_gam1| at the sampled nodes {:.2e}, max |Pi_gam1| at the "
                    "unsampled nodes {:.2e} (max |Pi_gam1| {:.2e}); Pi_bub vs the full dump {:.2e}", ds_in, ds_out, ng, dbs);
         REQUIRE(ds_in < 1e-12 * ng); REQUIRE(ds_out == 0.0); REQUIRE(dbs == 0.0);
+        {   // L-3: the on-demand fit. GF: nodes {0, 2, last} + fit_file = G's full dump (self-trained basis, 3 modes) -> the
+            // written Pi_gam1 equals G's at the sampled nodes (least squares exact there) and approximates it elsewhere.
+          const long nwh = PgG.shape(0);
+          const std::vector<long> fnodes{0, nwh / 4, nwh / 2, nwh - 1};   // nu = 0, two interior nodes, the tail node
+          run_g("GF", true, "", "", "gam1", false, false, fnodes, "coqui_d3_winj_G.pol_wh_dyn.g1.h5");
+          nda::array<std::complex<double>, 4> PgF;
+          rd4("coqui_d3_winj_GF.pol_wh_dyn.g1.h5", "Pi_gam1", PgF);
+          REQUIRE(PgF.shape() == PgG.shape());
+          double d_in = 0.0, n_in = 0.0, d_out = 0.0, n_out = 0.0;
+          for (long j = 0; j < nwh; ++j) {
+            const bool in = (std::find(fnodes.begin(), fnodes.end(), j) != fnodes.end());
+            double dj = 0.0, nj = 0.0;
+            for (long iq = 0; iq < PgG.shape(1); ++iq)
+              for (long M = 0; M < PgG.shape(2); ++M)
+                for (long N = 0; N < PgG.shape(3); ++N) { dj += std::norm(PgF(j, iq, M, N) - PgG(j, iq, M, N)); nj += std::norm(PgG(j, iq, M, N)); }
+            if (in) { d_in += dj; n_in += nj; } else { d_out += dj; n_out += nj; }
+          }
+          app_log(1, "dynbse_readout LFF-aux L-3: on-demand fit ({} sampled nodes, self-trained basis): rel Frobenius error at the sampled "
+                     "nodes {:.2e} (= the source dump's own non-Hermiticity, the written object is Hermitized), at the {} unsampled "
+                     "nodes {:.2e}", fnodes.size(), std::sqrt(d_in / n_in), nwh - long(fnodes.size()), std::sqrt(d_out / n_out));
+          REQUIRE(std::sqrt(d_in / n_in) < 1e-4);      // exact at the sampled nodes up to the Hermitization (K modes = K nodes)
+          REQUIRE(std::sqrt(d_out / n_out) < 0.15);    // the 4-mode reconstruction of the 21-node object (printed)
+          REQUIRE(n_out > 0.0);
+        }
         mpi_context->comm.barrier();
         if (mpi_context->comm.root())
-          for (auto const &t : {std::string("GB"), std::string("GS")}) {
+          for (auto const &t : {std::string("GB"), std::string("GS"), std::string("GF")}) {
             remove(("coqui_d3_winj_" + t + ".mbpt.h5").c_str());
             for (auto const &e : std::filesystem::directory_iterator("."))
               if (e.path().filename().string().rfind("coqui_d3_winj_" + t + ".", 0) == 0) std::filesystem::remove(e.path());

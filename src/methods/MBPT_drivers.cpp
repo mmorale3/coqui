@@ -633,6 +633,8 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
         vertex.set_ladder_dyn_cut_r1(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_cut_r1",true));
         vertex.set_ladder_dyn_bubble_only(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_bubble_only",false));
         vertex.set_ladder_dyn_all_nu_nodes(io::get_array_with_default<long>(pt,"pol_vertex_dyn_all_nu_nodes",std::vector<long>{}));
+        vertex.set_ladder_dyn_fit(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_fit_file",""),
+                                 io::get_value_with_default<long>(pt,"pol_vertex_dyn_fit_rank",0));
       }
     }
     scr_eri.set_cvv_rspace_tol(cvv_rspace_tol);
@@ -1022,6 +1024,8 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
         pol_vertex_carrier.set_ladder_dyn_cut_r1(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_cut_r1",true));
         pol_vertex_carrier.set_ladder_dyn_bubble_only(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_bubble_only",false));
         pol_vertex_carrier.set_ladder_dyn_all_nu_nodes(io::get_array_with_default<long>(pt,"pol_vertex_dyn_all_nu_nodes",std::vector<long>{}));
+        pol_vertex_carrier.set_ladder_dyn_fit(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_fit_file",""),
+                                 io::get_value_with_default<long>(pt,"pol_vertex_dyn_fit_rank",0));
       }
     }
     if (pol_vertex_carrier.pol_vertex_enabled()) scr_eri.set_vertex(&pol_vertex_carrier);
@@ -1264,6 +1268,8 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
         pol_vertex_carrier.set_ladder_dyn_cut_r1(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_cut_r1",true));
         pol_vertex_carrier.set_ladder_dyn_bubble_only(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_bubble_only",false));
         pol_vertex_carrier.set_ladder_dyn_all_nu_nodes(io::get_array_with_default<long>(pt,"pol_vertex_dyn_all_nu_nodes",std::vector<long>{}));
+        pol_vertex_carrier.set_ladder_dyn_fit(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_fit_file",""),
+                                 io::get_value_with_default<long>(pt,"pol_vertex_dyn_fit_rank",0));
       }
     }
     if (pol_vertex_carrier.pol_vertex_enabled()) scr_eri.set_vertex(&pol_vertex_carrier);
@@ -1552,6 +1558,8 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
         vertex.set_ladder_dyn_cut_r1(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_cut_r1",true));
         vertex.set_ladder_dyn_bubble_only(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_bubble_only",false));
         vertex.set_ladder_dyn_all_nu_nodes(io::get_array_with_default<long>(pt,"pol_vertex_dyn_all_nu_nodes",std::vector<long>{}));
+        vertex.set_ladder_dyn_fit(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_fit_file",""),
+                                 io::get_value_with_default<long>(pt,"pol_vertex_dyn_fit_rank",0));
       }
     }
     scr_eri.set_cvv_rspace_tol(cvv_rspace_tol);
@@ -1866,6 +1874,8 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
         pol_vertex_carrier.set_ladder_dyn_cut_r1(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_cut_r1",true));
         pol_vertex_carrier.set_ladder_dyn_bubble_only(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_bubble_only",false));
         pol_vertex_carrier.set_ladder_dyn_all_nu_nodes(io::get_array_with_default<long>(pt,"pol_vertex_dyn_all_nu_nodes",std::vector<long>{}));
+        pol_vertex_carrier.set_ladder_dyn_fit(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_fit_file",""),
+                                 io::get_value_with_default<long>(pt,"pol_vertex_dyn_fit_rank",0));
       }
     }
     if (pol_vertex_carrier.pol_vertex_enabled()) scr_eri.set_vertex(&pol_vertex_carrier);
