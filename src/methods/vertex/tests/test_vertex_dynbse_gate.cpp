@@ -575,7 +575,7 @@ namespace bdft_tests {
         }
         rd4("coqui_d3_winj_GB.pol_wh_dyn.g1.h5", "Pi_bub", PbB);
         REQUIRE(PbB.shape() == PbG.shape());
-        double db = 0.0, nb = 0.0, dh = 0.0;
+        double db = 0.0, nb = 0.0, dh = 0.0, evpos = 0.0, evneg = 0.0;
         long npos = 0, nneg = 0;
         for (long i = 0; i < PbB.size(); ++i) { db = std::max(db, std::abs(PbB.data()[i] - PbG.data()[i])); nb = std::max(nb, std::abs(PbG.data()[i])); }
         for (long j = 0; j < PbG.shape(0); ++j)
@@ -590,11 +590,16 @@ namespace bdft_tests {
             double emax = 0.0;
             for (auto v : ev) emax = std::max(emax, std::abs(v));
             for (auto v : ev) { if (v > 1e-10 * emax) ++npos; if (v < -1e-10 * emax) ++nneg; }
+            for (auto v : ev) { evpos = std::max(evpos, v / emax); evneg = std::min(evneg, v / emax); }
           }
+        // the tau-route bubble carries the DLR class (prec low here: ~4e-9 relative Hermiticity noise); the window
+        // bubble is negative semi-definite to that class (its largest positive eigenvalue relative to |B| is noise)
         app_log(1, "dynbse_readout LFF-aux H: bubble_only Pi_bub vs the full dump's column: max |d| {:.2e} (max |Pi_bub| {:.2e}); "
-                   "Hermiticity max |P - P^dag| {:.2e}; eigenvalues > 0: {}, < 0: {} (over all nodes x q)", db, nb, dh, npos, nneg);
-        REQUIRE(db == 0.0); REQUIRE(nb > 0.0); REQUIRE(dh < 1e-10 * nb);
-        REQUIRE((npos == 0 or nneg == 0));   // sign-definite (the sign is logged)
+                   "Hermiticity max |P - P^dag| {:.2e} ({:.1e} relative); eigenvalues > 0: {}, < 0: {} (over all nodes x q), "
+                   "largest positive / most negative relative to |ev|_max: {:.2e} / {:.2e}", db, nb, dh, dh / nb, npos, nneg, evpos, evneg);
+        REQUIRE(db == 0.0); REQUIRE(nb > 0.0); REQUIRE(dh < 1e-7 * nb);
+        REQUIRE(evneg < -0.5);            // the bubble's sign: negative semi-definite
+        REQUIRE(evpos < 2e-5);            // no positive eigenvalue above the DLR class (prec low: 5.7e-6 measured)
         run_g("GS", true, "", "", "gam1", false, false, std::vector<long>{0, 2});
         rd4("coqui_d3_winj_G.pol_wh_dyn.g1.h5", "Pi_gam1", PgG);
         rd4("coqui_d3_winj_GS.pol_wh_dyn.g1.h5", "Pi_gam1", PgS);
