@@ -47,6 +47,7 @@
 #include "nda/blas.hpp"
 #include "h5/h5.hpp"
 #include "nda/h5.hpp"
+#include "nda/linalg/eigenelements.hpp"
 #include "methods/scr_coulomb/cvv_head.hpp"
 
 namespace bdft_tests {
@@ -493,7 +494,7 @@ namespace bdft_tests {
       // the injected static-rung ladder (same object, union-grid route: refit class), and D's loop-side eps_M == the
       // dynamic readout's Gamma_1 column of G (the same P^{C,L} through two consumers).
       auto run_g = [&](std::string const &tag, bool all_nu, std::string const &points, std::string const &interp, std::string const &col,
-                       bool cut_r1 = true) {
+                       bool cut_r1 = true, bool bubble_only = false, std::vector<long> nodes = {}) {
         const std::string out = "coqui_d3_winj_" + tag;
         solvers::hf_t hf; solvers::gw_t gw(&ft, "ignore_g0", out);
         solvers::scr_coulomb_t scr_eri(&ft, "rpa", "ignore_g0");
@@ -504,6 +505,7 @@ namespace bdft_tests {
         vtx.set_ladder_rung(all_nu ? "dynamic" : "static", 1e-8, 30, 12, -1.0);
         vtx.set_ladder_dyn_gamma1_only(true); vtx.set_ladder_dyn_dump(all_nu); vtx.set_ladder_dyn_all_nu(all_nu);
         vtx.set_ladder_dyn_cut_r1(cut_r1);
+        vtx.set_ladder_dyn_bubble_only(bubble_only); vtx.set_ladder_dyn_all_nu_nodes(nodes);
         vtx.set_isdf_points(points, points.empty()); vtx.set_pol_interp(interp, col);
         scr_eri.set_vertex(&vtx);
         auto [e_hf, e_corr] = scf_loop(mb_state, dyson, erin, ft, solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol, 1, false, 1e-9, true);
@@ -512,7 +514,7 @@ namespace bdft_tests {
         app_log(1, "dynbse_readout W-int-4f INJ [{}]: e_corr {:.12f}, dynamic readout (static {:.10f}, one rung {:.10f}, Gamma_1 {:.10f}), loop-side {:.10f}",
                 tag, e_corr, ed[0], ed[1], ed[2], eloop);
         mpi_context->comm.barrier();
-        if (mpi_context->comm.root() and tag != "G" and tag != "G2") {
+        if (mpi_context->comm.root() and tag != "G" and tag != "G2" and tag != "GB" and tag != "GS") {
           remove((out + ".mbpt.h5").c_str());
           for (auto const &e : std::filesystem::directory_iterator("."))
             if (e.path().filename().string().rfind(out + ".", 0) == 0) std::filesystem::remove(e.path());
@@ -554,6 +556,77 @@ namespace bdft_tests {
           for (auto const &e : std::filesystem::directory_iterator("."))
             if (e.path().filename().string().rfind("coqui_d3_winj_G2.", 0) == 0) std::filesystem::remove(e.path());
         }
+        mpi_context->comm.barrier();
+      }
+      {   // H (LFF-aux L-0, notes/lff_aux_plan.md): the window-bubble column and the sampled-node subset.
+          // GB: bubble_only -> the file carries Pi_bub only, bitwise the Pi_bub column of the full dump G, Hermitian and
+          // sign-definite at every (node, q). GS: nodes {0, 2} -> nu_sampled == {0, 2}, the dynamic columns equal G's
+          // at those nodes and are zero elsewhere, Pi_bub still at every node.
+        auto rd4 = [](std::string const &fn, std::string const &ds, nda::array<std::complex<double>, 4> &A) {
+          h5::file f(fn, 'r'); h5::group g(f); nda::h5_read(g, ds, A); };
+        nda::array<std::complex<double>, 4> PbG, PbB, PgG, PgS, PbS, PsS;
+        rd4("coqui_d3_winj_G.pol_wh_dyn.g1.h5", "Pi_bub", PbG);
+        run_g("GB", true, "", "", "gam1", false, true);
+        {
+          h5::file f("coqui_d3_winj_GB.pol_wh_dyn.g1.h5", 'r'); h5::group g(f);
+          REQUIRE(g.has_dataset("Pi_bub")); REQUIRE(not g.has_dataset("Pi_gam1"));
+          nda::array<long, 1> ns; nda::h5_read(g, "nu_sampled", ns);
+          REQUIRE(ns.size() == PbG.shape(0));
+        }
+        rd4("coqui_d3_winj_GB.pol_wh_dyn.g1.h5", "Pi_bub", PbB);
+        REQUIRE(PbB.shape() == PbG.shape());
+        double db = 0.0, nb = 0.0, dh = 0.0;
+        long npos = 0, nneg = 0;
+        for (long i = 0; i < PbB.size(); ++i) { db = std::max(db, std::abs(PbB.data()[i] - PbG.data()[i])); nb = std::max(nb, std::abs(PbG.data()[i])); }
+        for (long j = 0; j < PbG.shape(0); ++j)
+          for (long iq = 0; iq < PbG.shape(1); ++iq) {
+            nda::array<std::complex<double>, 2> H(PbG(j, iq, nda::ellipsis{}));
+            for (long M = 0; M < H.shape(0); ++M)
+              for (long N = 0; N < H.shape(1); ++N) dh = std::max(dh, std::abs(H(M, N) - std::conj(H(N, M))));
+            nda::array<std::complex<double>, 2> Hh(H);
+            for (long M = 0; M < H.shape(0); ++M)
+              for (long N = 0; N < H.shape(1); ++N) Hh(M, N) = 0.5 * (H(M, N) + std::conj(H(N, M)));
+            auto ev = nda::linalg::eigenvalues(Hh);
+            double emax = 0.0;
+            for (auto v : ev) emax = std::max(emax, std::abs(v));
+            for (auto v : ev) { if (v > 1e-10 * emax) ++npos; if (v < -1e-10 * emax) ++nneg; }
+          }
+        app_log(1, "dynbse_readout LFF-aux H: bubble_only Pi_bub vs the full dump's column: max |d| {:.2e} (max |Pi_bub| {:.2e}); "
+                   "Hermiticity max |P - P^dag| {:.2e}; eigenvalues > 0: {}, < 0: {} (over all nodes x q)", db, nb, dh, npos, nneg);
+        REQUIRE(db == 0.0); REQUIRE(nb > 0.0); REQUIRE(dh < 1e-10 * nb);
+        REQUIRE((npos == 0 or nneg == 0));   // sign-definite (the sign is logged)
+        run_g("GS", true, "", "", "gam1", false, false, std::vector<long>{0, 2});
+        rd4("coqui_d3_winj_G.pol_wh_dyn.g1.h5", "Pi_gam1", PgG);
+        rd4("coqui_d3_winj_GS.pol_wh_dyn.g1.h5", "Pi_gam1", PgS);
+        rd4("coqui_d3_winj_GS.pol_wh_dyn.g1.h5", "Pi_bub", PbS);
+        {
+          h5::file f("coqui_d3_winj_GS.pol_wh_dyn.g1.h5", 'r'); h5::group g(f);
+          nda::array<long, 1> ns; nda::h5_read(g, "nu_sampled", ns);
+          REQUIRE(ns.size() == 2); REQUIRE(ns(0) == 0); REQUIRE(ns(1) == 2);
+        }
+        REQUIRE(PgS.shape() == PgG.shape());
+        double ds_in = 0.0, ds_out = 0.0, ng = 0.0, dbs = 0.0;
+        for (long j = 0; j < PgG.shape(0); ++j) {
+          const bool in = (j == 0 or j == 2);
+          for (long iq = 0; iq < PgG.shape(1); ++iq)
+            for (long M = 0; M < PgG.shape(2); ++M)
+              for (long N = 0; N < PgG.shape(3); ++N) {
+                const double d = std::abs(PgS(j, iq, M, N) - PgG(j, iq, M, N));
+                if (in) ds_in = std::max(ds_in, d); else ds_out = std::max(ds_out, std::abs(PgS(j, iq, M, N)));
+                ng = std::max(ng, std::abs(PgG(j, iq, M, N)));
+                dbs = std::max(dbs, std::abs(PbS(j, iq, M, N) - PbG(j, iq, M, N)));
+              }
+        }
+        app_log(1, "dynbse_readout LFF-aux H: sampled nodes {{0, 2}}: max |d Pi_gam1| at the sampled nodes {:.2e}, max |Pi_gam1| at the "
+                   "unsampled nodes {:.2e} (max |Pi_gam1| {:.2e}); Pi_bub vs the full dump {:.2e}", ds_in, ds_out, ng, dbs);
+        REQUIRE(ds_in < 1e-12 * ng); REQUIRE(ds_out == 0.0); REQUIRE(dbs == 0.0);
+        mpi_context->comm.barrier();
+        if (mpi_context->comm.root())
+          for (auto const &t : {std::string("GB"), std::string("GS")}) {
+            remove(("coqui_d3_winj_" + t + ".mbpt.h5").c_str());
+            for (auto const &e : std::filesystem::directory_iterator("."))
+              if (e.path().filename().string().rfind("coqui_d3_winj_" + t + ".", 0) == 0) std::filesystem::remove(e.path());
+          }
         mpi_context->comm.barrier();
       }
       auto [edd, eld] = run_g("D", false, "coqui_d3_winj_G.secpts.h5", "coqui_d3_winj_G.pol_wh_dyn.g1.h5", "gam1");

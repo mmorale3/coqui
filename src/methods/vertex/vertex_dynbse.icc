@@ -109,6 +109,13 @@ namespace solvers {
                                   // the DLR fit's O(1) in-gap residues (T15 lesson) otherwise feed a loop
                                   // through the near-confluent double-pole products at inu != 0 (gain
                                   // ~1/gap: measured Ritz 2.6 on lih222 at the first node). 0 = no mask.
+      // LFF-aux L-0 (notes/lff_aux_plan.md): the WINDOW BUBBLE column. When Pi_bub is non-null every unit also writes
+      // Pi_bub(jn, iq, M, N) = (spin/nk) [D^dag Cb D](M, N) -- the C-window pair bubble in the output frame, the object
+      // the dumped "rungs >= 1" columns are corrections TO (the reference of the multiplicative local-field factor).
+      // bubble_only = true evaluates ONLY that column: no rung (no Kbig / K_d(s) / resolvent), no solve, no unit dump;
+      // the other outputs stay zero. ~1 s per unit.
+      nda::array<cplx, 4> *Pi_bub = nullptr;
+      bool bubble_only = false;
     };
 
 
@@ -640,12 +647,13 @@ namespace solvers {
                    "pair_space_ladder_dyn: W cache shape ({}, {}, {}, {}) != ({}, {}, {}, {}).",
                    Wbh.shape(0), Wbh.shape(1), Wbh.shape(2), Wbh.shape(3), nq, nw_half, Nm, Nm);
       utils::check(nt == tools.nt_f, "pair_space_ladder_dyn: G tau axis {} != nt_f {}.", nt, tools.nt_f);
-      for (auto *o : {Pi_static, Pi_dyn1, Pi_gam1, Pi_dyn})
+      for (auto *o : {Pi_static, Pi_dyn1, Pi_gam1, Pi_dyn, opt.Pi_bub})
         if (o != nullptr) {
           utils::check(o->shape(0) == nnu and o->shape(1) == nq and o->shape(2) == nout and o->shape(3) == nout,
                        "pair_space_ladder_dyn: output shape mismatch (nout = {}).", nout);
           (*o)() = cplx(0.0);
         }
+      utils::check(not opt.bubble_only or opt.Pi_bub != nullptr, "pair_space_ladder_dyn: bubble_only needs the Pi_bub output.");
       for (auto m : nu_list) utils::check(m >= 0 and m < nw_b, "pair_space_ladder_dyn: nu index {} out of range.", m);
 
       // ---- the vertex basis and G's residues --------------------------------------------------
@@ -794,7 +802,8 @@ namespace solvers {
       // tau nodes of a rung application are independent; the body holds no MPI, no HDF5, no shared writes
       // (each tau writes its own Ys slice; the rung buffers are per call)
       const long nthr = std::max(1l, utils::omp_threads());
-      nda::array<cplx, 2> Kbig(D, D), Ks(D, D);
+      nda::array<cplx, 2> Kbig, Ks;
+      if (not opt.bubble_only) { Kbig = nda::array<cplx, 2>(D, D); Ks = nda::array<cplx, 2>(D, D); }
       nda::array<cplx, 3> Cb_k(nk, nc2, nc2);
       nda::array<cplx, 4> Dc(nk, nc, nc, nout);   // external legs: aux (Nm) or Wannier-pair (nab) columns
       // per-block scratch, sized to the current RHS block width nR (the kd operator reads F.nR)
@@ -899,6 +908,35 @@ namespace solvers {
         ++units_taken;
         const long sq = u / nnu, jn_unit = u % nnu;
         const long is = sq / nql, iq = qlist[size_t(sq % nql)];
+        if (opt.Pi_bub != nullptr) {
+          // LFF-aux L-0: the window bubble of this unit in the output frame, (spin/nk) D^dag Cb(q, i nu) D. The legs
+          // and Cb are the unit's own (rebuilt below for the solve: cheap, and the solve path stays untouched).
+          const long m_b = nu_list[size_t(jn_unit)];
+          for (long k = 0; k < nk; ++k) {
+            const long kq = kpq(iq, k);
+            for (long a = 0; a < nc; ++a)
+              for (long bb2 = 0; bb2 < nc; ++bb2)
+                for (long N = 0; N < nout; ++N)
+                  Dc(k, a, bb2, N) = wan ? ((N == a * nc + bb2) ? cplx(1.0) : cplx(0.0))
+                                         : Xb(is, k, N, a) * std::conj(Xb(is, kq, N, bb2));
+          }
+          build_cb_tau(G_CC, tools, is, iq, m_b, kpq, Cb_k);
+          nda::array<cplx, 4> CbDf(nk, nc, nc, nout);
+          for (long k = 0; k < nk; ++k) {
+            auto Ck = Cb_k(k, all, all);                                                      // (nc2, nc2)
+            auto Dk = nda::reshape(Dc(k, all, all, all), std::array<long, 2>{nc2, nout});     // (nc2, nout)
+            auto Ok = nda::reshape(CbDf(k, all, all, all), std::array<long, 2>{nc2, nout});
+            nda::blas::gemm(Ck, Dk, Ok);
+          }
+          auto Pb = db::collapse(Dc, CbDf);                                                   // (nout, nout)
+          for (long M = 0; M < nout; ++M)
+            for (long N = 0; N < nout; ++N) (*opt.Pi_bub)(jn_unit, iq, M, N) = cplx(spinfac / double(nk)) * Pb(M, N);
+          if (met) met->t_cb += watch.lap();
+          if (opt.bubble_only) {
+            if (met) { ++met->nunits; ++met->nconv; }
+            continue;
+          }
+        }
         if (not dumped.empty()) {
           auto it_d = dumped.find(std::make_tuple(is, iq, nu_list[size_t(jn_unit)]));
           if (it_d != dumped.end()) {
@@ -1785,7 +1823,7 @@ namespace solvers {
    */
   vertex_t::dynbse_cut_result vertex_t::eval_pol_dynbse_cut(MBState &mb_state, THC_ERI auto &thc,
                                                             std::vector<long> const &half_nodes,
-                                                            std::vector<long> const &qsel, long gen) {
+                                                            std::vector<long> const &qsel, long gen, bool bubble_only) {
     decltype(nda::range::all) all;
     namespace vd = vertex_dynbse_detail;
     vertex_ladder_detail::prof_watch twatch;
@@ -1813,7 +1851,11 @@ namespace solvers {
     r.half_nodes = half_nodes;
     r.qsel = qsel;
     nda::array<ComplexType, 4> Ps(nn, nq, Nm, Nm), P1(nn, nq, Nm, Nm), Pg(nn, nq, Nm, Nm), Pd(nn, nq, Nm, Nm);
+    nda::array<ComplexType, 4> Pb(nn, nq, Nm, Nm);   // LFF-aux L-0: the window bubble column (always evaluated: cheap)
     vd::dyn_opts o;
+    o.Pi_bub = std::addressof(Pb);
+    o.bubble_only = bubble_only;
+    if (bubble_only) app_log(1, "  [scGW-tilde T2] pol_vertex_dyn_bubble_only: ONLY the window bubble column Pi_bub = (spin/nk) D^dag Cb D is evaluated (no rung, no solve).");
     o.kcrys = std::addressof(kc);
     o.tol = _dyn_tol; o.maxit = _dyn_maxit; o.gmres_m = std::max<long>(_dyn_gmres, 12); o.sign_ks = _dyn_sign;
     o.rhs_block = _dyn_rhs_block;
@@ -1839,9 +1881,10 @@ namespace solvers {
     vd::dyn_meter met;
     vd::pair_space_ladder_dyn(G_CC, _Xb_skma, _W0b_qmm.value(), _Wb_qwmm.value(), kmq, kpq, tools, nus,
                               &Ps, nullptr, &Pg, &Pd, mpi->comm.rank(), mpi->comm.size(), o, &met, symc);
-    if (_dyn_cut_r1) {
+    if (_dyn_cut_r1 and not bubble_only) {
       vd::dyn_opts o1 = o;
       o1.one_rung_only = true;
+      o1.Pi_bub = nullptr;
       if (_dyn_dump) o1.dump_prefix = mb_state.coqui_prefix + ".dynunits.cutr1.g" + std::to_string(gen);
       vd::dyn_meter met1;
       vd::pair_space_ladder_dyn(G_CC, _Xb_skma, _W0b_qmm.value(), _Wb_qwmm.value(), kmq, kpq, tools, nus,
@@ -1849,9 +1892,11 @@ namespace solvers {
     } else {
       // pol_vertex_dyn_cut_r1 = false: the one-bare-rung column is not computed (Pi_dyn1 below = Pi_static)
       P1() = ComplexType(0.0);
-      app_log(1, "  [scGW-tilde T2] pol_vertex_dyn_cut_r1 = false: the one-bare-dynamic-rung pass is SKIPPED; the Pi_dyn1 column repeats Pi_static.");
+      if (not bubble_only)
+        app_log(1, "  [scGW-tilde T2] pol_vertex_dyn_cut_r1 = false: the one-bare-dynamic-rung pass is SKIPPED; the Pi_dyn1 column repeats Pi_static.");
     }
-    for (auto *A : {&Ps, &P1, &Pg, &Pd}) mpi->comm.all_reduce_in_place_n(A->data(), A->size(), std::plus<>{});
+    for (auto *A : {&Ps, &P1, &Pg, &Pd, &Pb}) mpi->comm.all_reduce_in_place_n(A->data(), A->size(), std::plus<>{});
+    r.Pi_bub = std::move(Pb);
     met.reduce(mpi->comm);
     r.Pi = nda::array<ComplexType, 5>(4, nn, nq, Nm, Nm);
     r.Pi(0, all, all, all, all) = Ps;
@@ -1863,12 +1908,12 @@ namespace solvers {
     r.it_max = met.it_max; r.it_sum = met.it_sum; r.nunits = met.nunits;
     r.all_converged = (met.nconv == met.nunits); r.t_solve = met.t_solve; r.rss_gb = met.rss_max_gb;
     r.t_total = twatch.lap();
-    app_log(1, "  [scGW-tilde T2] dynamic-rung ladder on {} nu nodes x {} transfers (union basis, mask {:.4f} Ha, "
+    app_log(1, "  [scGW-tilde T2] {} on {} nu nodes x {} transfers (union basis, mask {:.4f} Ha, "
                "GMRES({}), RHS blocks {}, readout tol 1e-6): {} units, applications max {} (mean {:.1f}), all done {}, "
                "watchdog max |Ritz(K_d L_s)| {:.3f}; G pole fit {:.2e}, tau refit {:.2e}; wall {:.1f} s (solve {:.1f} s on "
                "the slowest rank: rung {:.1f} s, refit {:.1f} s, L0 {:.1f} s, T_s gemms {:.1f} s, Arnoldi {:.1f} s, rest {:.1f} s; "
                "{} applications), RSS {:.2f} GB, omp_threads {}",
-            nn, long(qsel.size()), o.gap_mask, o.gmres_m, o.rhs_block, met.nunits, met.it_max,
+            bubble_only ? "window bubble (bubble_only)" : "dynamic-rung ladder", nn, long(qsel.size()), o.gap_mask, o.gmres_m, o.rhs_block, met.nunits, met.it_max,
             (met.nunits > 0) ? double(met.it_sum) / double(met.nunits) : 0.0, r.all_converged, met.ritz_max,
             met.fit_err_G, met.refit_err_max, r.t_total, met.t_solve, met.t_rung, met.t_refit, met.t_l0, met.t_ts, met.t_orth,
             met.t_solve - met.t_rung - met.t_refit - met.t_l0 - met.t_ts - met.t_orth, met.n_apps, met.rss_max_gb,
@@ -1883,7 +1928,7 @@ namespace solvers {
                 row(9), row(10), row(11));
       }
     }
-    if (met.fit_err_G > 1e-4 or not r.all_converged)
+    if ((met.fit_err_G > 1e-4 or not r.all_converged) and not bubble_only)
       app_log(1, "  [scGW-tilde T2] WARNING: the dynamic cut's G pole fit ({:.2e}) or convergence ({}) is not clean -- "
                  "its columns are not to be trusted at that level.", met.fit_err_G, r.all_converged);
     return r;

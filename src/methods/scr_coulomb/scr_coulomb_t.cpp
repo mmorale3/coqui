@@ -484,6 +484,8 @@ namespace solvers {
     _pol_vtx->set_ladder_dyn_gamma1_only(_vertex->ladder_dyn_gamma1_only());
     _pol_vtx->set_ladder_dyn_all_nu(_vertex->ladder_dyn_all_nu());
     _pol_vtx->set_ladder_dyn_cut_r1(_vertex->ladder_dyn_cut_r1());
+    _pol_vtx->set_ladder_dyn_bubble_only(_vertex->ladder_dyn_bubble_only());
+    _pol_vtx->set_ladder_dyn_all_nu_nodes(_vertex->ladder_dyn_all_nu_nodes());
     // W-int-1b: the coarse->fine interpolation knobs travel to the readout instance too
     _pol_vtx->set_isdf_points(_vertex->isdf_points_file(), _vertex->isdf_points_dump());
     _pol_vtx->set_wannier_frame(_vertex->wannier_frame());
@@ -1247,14 +1249,35 @@ namespace solvers {
     const long nw_b = _ft->nw_b();
     const long nw_h = (nw_b % 2 == 0) ? nw_b / 2 : nw_b / 2 + 1;
     const long nq = MF->nqpts_ibz();
-    std::vector<long> nodes(static_cast<size_t>(nw_h));
+    std::vector<long> nodes_all(static_cast<size_t>(nw_h));
     std::vector<long> qs(static_cast<size_t>(nq));
-    for (long j = 0; j < nw_h; ++j) nodes[size_t(j)] = j;
+    for (long j = 0; j < nw_h; ++j) nodes_all[size_t(j)] = j;
     for (long iq = 0; iq < nq; ++iq) qs[size_t(iq)] = iq;
-    app_log(1, "  [W-int-4f] all-nu dynamic-rung dump: {} half nodes x {} transfers (Gamma_1-only = {}).", nw_h, nq,
-            _pol_vtx->ladder_dyn_gamma1_only());
-    auto r = _pol_vtx->eval_pol_dynbse_cut(mb_state, thc, nodes, qs, gen);
-    _pol_dyn_ritz = std::max(_pol_dyn_ritz, r.ritz_max);
+    // LFF-aux L-0 (notes/lff_aux_plan.md): the dynamic columns on the SAMPLED half nodes (pol_vertex_dyn_all_nu_nodes;
+    // all nodes when empty), the window bubble Pi_bub on ALL nodes; bubble_only skips the dynamic columns altogether.
+    const bool bub_only = _pol_vtx->ladder_dyn_bubble_only();
+    std::vector<long> nodes = _pol_vtx->ladder_dyn_all_nu_nodes();
+    if (nodes.empty()) nodes = nodes_all;
+    std::sort(nodes.begin(), nodes.end());
+    nodes.erase(std::unique(nodes.begin(), nodes.end()), nodes.end());
+    for (long j : nodes)
+      utils::check(j >= 0 and j < nw_h, "dump_pol_dyn_all_nu: pol_vertex_dyn_all_nu_nodes entry {} outside [0, {}).", j, nw_h);
+    const bool subset = (long(nodes.size()) != nw_h);
+    app_log(1, "  [W-int-4f] all-nu dynamic-rung dump: {} of {} half nodes x {} transfers (Gamma_1-only = {}, bubble_only = {}).",
+            nodes.size(), nw_h, nq, _pol_vtx->ladder_dyn_gamma1_only(), bub_only);
+    std::optional<vertex_t::dynbse_cut_result> rd;   // the dynamic columns on the sampled nodes
+    if (not bub_only) {
+      rd.emplace(_pol_vtx->eval_pol_dynbse_cut(mb_state, thc, nodes, qs, gen, false));
+      _pol_dyn_ritz = std::max(_pol_dyn_ritz, rd->ritz_max);
+    }
+    // the bubble at ALL nodes: the dynamic call's own column when it covered every node, else a bubble-only pass
+    nda::array<ComplexType, 4> Pb;
+    if (rd.has_value() and not subset) {
+      Pb = std::move(rd->Pi_bub);
+    } else {
+      auto rb = _pol_vtx->eval_pol_dynbse_cut(mb_state, thc, nodes_all, qs, gen, true);
+      Pb = std::move(rb.Pi_bub);
+    }
     if (thc.mpi()->comm.root()) {
       auto lat = MF->lattv();
       auto Q = MF->Qpts();
@@ -1263,20 +1286,27 @@ namespace solvers {
         for (long i = 0; i < 3; ++i) { double v = 0.0; for (long j = 0; j < 3; ++j) v += lat(i, j) * Q(iq, j); qc(iq, i) = v / (2.0 * M_PI); }
       nda::array<long, 1> nu_half(nw_h);
       { auto wb = _ft->wn_mesh_b(); for (long j = 0; j < nw_h; ++j) nu_half(j) = long(wb(nw_b / 2 + j)); }
-      const long Nm = r.Pi.shape(3);
+      nda::array<long, 1> nu_sampled(long(nodes.size()));
+      for (long j = 0; j < long(nodes.size()); ++j) nu_sampled(j) = nodes[size_t(j)];
+      const long Nm = Pb.shape(2);
       const std::string fn = mb_state.coqui_prefix + ".pol_wh_dyn.g" + std::to_string(gen) + ".h5";
       h5::file f(fn, 'w');
       h5::group g(f);
       nda::h5_write(g, "q", qc);
       nda::h5_write(g, "nu_half", nu_half);
+      nda::h5_write(g, "nu_sampled", nu_sampled);
       h5::h5_write(g, "beta", _ft->beta());
       h5::h5_write(g, "nw_b", nw_b);
-      const char *names[4] = {"Pi_static", "Pi_dyn1", "Pi_gam1", "Pi_dyn"};
-      for (int c = 0; c < 4; ++c) {
-        nda::array<ComplexType, 4> P(nw_h, nq, Nm, Nm);
-        P = r.Pi(c, all, all, all, all);
-        nda::h5_write(g, names[c], P);
+      if (rd.has_value()) {
+        const char *names[4] = {"Pi_static", "Pi_dyn1", "Pi_gam1", "Pi_dyn"};
+        for (int c = 0; c < 4; ++c) {
+          nda::array<ComplexType, 4> P(nw_h, nq, Nm, Nm);
+          P() = ComplexType(0.0);
+          for (long j = 0; j < long(nodes.size()); ++j) P(nodes[size_t(j)], all, all, all) = rd->Pi(c, j, all, all, all);
+          nda::h5_write(g, names[c], P);
+        }
       }
+      nda::h5_write(g, "Pi_bub", Pb);
       h5::h5_write(g, "nout", Nm);
       h5::h5_write(g, "frame", std::string("aux"));
       h5::h5_write(g, "wannier", long(_pol_vtx->wannier() ? 1 : 0));
@@ -1284,10 +1314,16 @@ namespace solvers {
       h5::h5_write(g, "window_first", long(_pol_vtx->pol_band_window().first()));
       h5::h5_write(g, "window_size", long(_pol_vtx->pol_band_window().size()));
       if (_pol_vtx->secondary_points().size() > 0) nda::h5_write(g, "ipts", _pol_vtx->secondary_points());
-      app_log(1, "  [W-int-4f] all-nu dynamic-rung columns written to {} ({} half nodes x {} q x {} x {}; watchdog max |Ritz| "
-                 "{:.3f}, all converged {}).", fn, nw_h, nq, Nm, Nm, r.ritz_max, r.all_converged);
+      if (rd.has_value())
+        app_log(1, "  [W-int-4f] all-nu dynamic-rung columns written to {} ({} half nodes ({} sampled) x {} q x {} x {} + the window "
+                   "bubble Pi_bub; watchdog max |Ritz| {:.3f}, all converged {}).", fn, nw_h, nodes.size(), nq, Nm, Nm,
+                rd->ritz_max, rd->all_converged);
+      else
+        app_log(1, "  [W-int-4f] bubble_only: the window bubble column Pi_bub written to {} ({} half nodes x {} q x {} x {}; no "
+                   "dynamic columns).", fn, nw_h, nq, Nm, Nm);
     }
   }
+
   /**
    * scGW-tilde L2, the ladder eps_M readout (stance i -- report-only, PDF section 4.2
    * placement (i)): per q at inu = 0,

@@ -898,6 +898,8 @@ namespace solvers {
     bool _dyn_dump = false;      // pol_vertex_dyn_dump: per-unit dump + restart files of the dynamic solves
     bool _dyn_all_nu = false;    // pol_vertex_dyn_all_nu: the all-q x all-node dynamic-rung dump (W-int-4f coarse side)
     bool _dyn_cut_r1 = true;     // pol_vertex_dyn_cut_r1: false skips the one-bare-rung (Pi_dyn1) pass of the cut / all-nu dump
+    bool _dyn_bubble_only = false;        // pol_vertex_dyn_bubble_only: the all-nu dump writes ONLY the window bubble column
+    std::vector<long> _dyn_all_nu_nodes;  // pol_vertex_dyn_all_nu_nodes: the sampled half nodes of the all-nu dump (empty = all)
     bool _dyn_dense = true;      // pol_vertex_dyn_dense: the dense per-tau rung K_d(s) (nt/2 x D x D per unit)
     long _dyn_union_stride = 1;  // pol_vertex_dyn_union_stride: keep every n-th shifted G node of the union grid
     int _dyn_table_mode = 0;     // pol_vertex_dyn_table_mode: 0 fitted twisted-pair tables, 1 exact partial fractions
@@ -1536,6 +1538,16 @@ namespace solvers {
      *  Pi_dyn1 = Pi_static -- the production setting for the Gamma_1 (col "gam1") coarse dump. */
     void set_ladder_dyn_cut_r1(bool on) { _dyn_cut_r1 = on; }
     bool ladder_dyn_cut_r1() const { return _dyn_cut_r1; }
+    /** LFF-aux L-0 (notes/lff_aux_plan.md). pol_vertex_dyn_bubble_only (default false): the all-nu dump evaluates ONLY the
+     *  C-window bubble Pi_bub(q, i nu) = (spin/nk) D^dag Cb D in the secondary frame at every q x every half node (no rung,
+     *  no solve; ~1 s per unit) and writes it as the "Pi_bub" column of <prefix>.pol_wh_dyn.g<n>.h5 -- the reference the
+     *  dumped corrections are measured against. Every all-nu dump also carries Pi_bub (cheap).
+     *  pol_vertex_dyn_all_nu_nodes (default empty = all): the dynamic columns are evaluated on THIS subset of half nodes
+     *  only (the sparse sampling of the fit); the other nodes are written as zeros, "nu_sampled" lists the subset. */
+    void set_ladder_dyn_bubble_only(bool on) { _dyn_bubble_only = on; }
+    bool ladder_dyn_bubble_only() const { return _dyn_bubble_only; }
+    void set_ladder_dyn_all_nu_nodes(std::vector<long> const &nodes) { _dyn_all_nu_nodes = nodes; }
+    std::vector<long> const &ladder_dyn_all_nu_nodes() const { return _dyn_all_nu_nodes; }
 
     /**
      * scGW-tilde TIER 1.5 (notes/tier15_ward_legs_plan.md; proposal section 4.6): the LEG
@@ -1880,13 +1892,14 @@ namespace solvers {
     struct dynbse_cut_result {
       std::vector<long> half_nodes, qsel;
       nda::array<ComplexType, 5> Pi;
+      nda::array<ComplexType, 4> Pi_bub;   // LFF-aux L-0: the window bubble (spin/nk) D^dag Cb D per (node, q), same frame
       double ritz_max = -1.0, refit_err = -1.0, fit_err_G = -1.0;
       long it_max = 0, it_sum = 0, nunits = 0;
       bool all_converged = false;
       double t_total = 0.0, t_solve = 0.0, rss_gb = 0.0;
     };
     dynbse_cut_result eval_pol_dynbse_cut(MBState &mb_state, THC_ERI auto &thc, std::vector<long> const &half_nodes,
-                                          std::vector<long> const &qsel, long gen = 0);
+                                          std::vector<long> const &qsel, long gen = 0, bool bubble_only = false);
 
     /**
      * scGW-tilde increment L1 (vertex_ladder.icc): the C-window pair bubble
