@@ -495,7 +495,8 @@ namespace bdft_tests {
       // the injected static-rung ladder (same object, union-grid route: refit class), and D's loop-side eps_M == the
       // dynamic readout's Gamma_1 column of G (the same P^{C,L} through two consumers).
       auto run_g = [&](std::string const &tag, bool all_nu, std::string const &points, std::string const &interp, std::string const &col,
-                       bool cut_r1 = true, bool bubble_only = false, std::vector<long> nodes = {}, std::string const &fit_file = "") {
+                       bool cut_r1 = true, bool bubble_only = false, std::vector<long> nodes = {}, std::string const &fit_file = "",
+                       std::string const &mu_file = "") {
         const std::string out = "coqui_d3_winj_" + tag;
         solvers::hf_t hf; solvers::gw_t gw(&ft, "ignore_g0", out);
         solvers::scr_coulomb_t scr_eri(&ft, "rpa", "ignore_g0");
@@ -507,6 +508,7 @@ namespace bdft_tests {
         vtx.set_ladder_dyn_gamma1_only(true); vtx.set_ladder_dyn_dump(all_nu); vtx.set_ladder_dyn_all_nu(all_nu);
         vtx.set_ladder_dyn_cut_r1(cut_r1);
         vtx.set_ladder_dyn_bubble_only(bubble_only); vtx.set_ladder_dyn_all_nu_nodes(nodes); vtx.set_ladder_dyn_fit(fit_file, 0);
+        vtx.set_ladder_dyn_resum_mu_file(mu_file);
         vtx.set_isdf_points(points, points.empty()); vtx.set_pol_interp(interp, col);
         scr_eri.set_vertex(&vtx);
         auto [e_hf, e_corr] = scf_loop(mb_state, dyson, erin, ft, solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol, 1, false, 1e-9, true);
@@ -630,7 +632,21 @@ namespace bdft_tests {
             // written Pi_gam1 equals G's at the sampled nodes (least squares exact there) and approximates it elsewhere.
           const long nwh = PgG.shape(0);
           const std::vector<long> fnodes{0, nwh / 4, nwh / 2, nwh - 1};   // nu = 0, two interior nodes, the tail node
-          run_g("GF", true, "", "", "gam1", false, false, fnodes, "coqui_d3_winj_G.pol_wh_dyn.g1.h5");
+          if (mpi_context->comm.root()) {   // a constant mu table (2.0 at every node): Pi_dyn must come out as 2 Pi_gam1
+            std::ofstream mf("coqui_d3_winj_mu.txt");
+            mf << "# j nu mu (test: constant 2)\n";
+            for (long j = 0; j < nwh; ++j) mf << j << " 0 2.0\n";
+          }
+          mpi_context->comm.barrier();
+          run_g("GF", true, "", "", "gam1", false, false, fnodes, "coqui_d3_winj_G.pol_wh_dyn.g1.h5", "coqui_d3_winj_mu.txt");
+          {
+            nda::array<std::complex<double>, 4> Pg_, Pd_;
+            rd4("coqui_d3_winj_GF.pol_wh_dyn.g1.h5", "Pi_gam1", Pg_); rd4("coqui_d3_winj_GF.pol_wh_dyn.g1.h5", "Pi_dyn", Pd_);
+            double dm = 0.0, nm = 0.0;
+            for (long i = 0; i < Pg_.size(); ++i) { dm = std::max(dm, std::abs(Pd_.data()[i] - 2.0 * Pg_.data()[i])); nm = std::max(nm, std::abs(Pg_.data()[i])); }
+            app_log(1, "dynbse_readout LFF mu: Pi_dyn vs 2 x Pi_gam1 (constant mu table): max |d| {:.2e} (max |Pi_gam1| {:.2e})", dm, nm);
+            REQUIRE(dm <= 1e-12 * nm);
+          }
           nda::array<std::complex<double>, 4> PgF;
           rd4("coqui_d3_winj_GF.pol_wh_dyn.g1.h5", "Pi_gam1", PgF);
           REQUIRE(PgF.shape() == PgG.shape());
@@ -653,6 +669,7 @@ namespace bdft_tests {
         mpi_context->comm.barrier();
         if (mpi_context->comm.root())
           for (auto const &t : {std::string("GB"), std::string("GS"), std::string("GF")}) {
+            remove("coqui_d3_winj_mu.txt");
             remove(("coqui_d3_winj_" + t + ".mbpt.h5").c_str());
             for (auto const &e : std::filesystem::directory_iterator("."))
               if (e.path().filename().string().rfind("coqui_d3_winj_" + t + ".", 0) == 0) std::filesystem::remove(e.path());

@@ -635,6 +635,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
         vertex.set_ladder_dyn_all_nu_nodes(io::get_array_with_default<long>(pt,"pol_vertex_dyn_all_nu_nodes",std::vector<long>{}));
         vertex.set_ladder_dyn_fit(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_fit_file",""),
                                  io::get_value_with_default<long>(pt,"pol_vertex_dyn_fit_rank",0));
+        vertex.set_ladder_dyn_resum_mu_file(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_resum_mu_file",""));
       }
     }
     scr_eri.set_cvv_rspace_tol(cvv_rspace_tol);
@@ -1026,6 +1027,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
         pol_vertex_carrier.set_ladder_dyn_all_nu_nodes(io::get_array_with_default<long>(pt,"pol_vertex_dyn_all_nu_nodes",std::vector<long>{}));
         pol_vertex_carrier.set_ladder_dyn_fit(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_fit_file",""),
                                  io::get_value_with_default<long>(pt,"pol_vertex_dyn_fit_rank",0));
+        pol_vertex_carrier.set_ladder_dyn_resum_mu_file(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_resum_mu_file",""));
       }
     }
     if (pol_vertex_carrier.pol_vertex_enabled()) scr_eri.set_vertex(&pol_vertex_carrier);
@@ -1270,6 +1272,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
         pol_vertex_carrier.set_ladder_dyn_all_nu_nodes(io::get_array_with_default<long>(pt,"pol_vertex_dyn_all_nu_nodes",std::vector<long>{}));
         pol_vertex_carrier.set_ladder_dyn_fit(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_fit_file",""),
                                  io::get_value_with_default<long>(pt,"pol_vertex_dyn_fit_rank",0));
+        pol_vertex_carrier.set_ladder_dyn_resum_mu_file(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_resum_mu_file",""));
       }
     }
     if (pol_vertex_carrier.pol_vertex_enabled()) scr_eri.set_vertex(&pol_vertex_carrier);
@@ -1560,6 +1563,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
         vertex.set_ladder_dyn_all_nu_nodes(io::get_array_with_default<long>(pt,"pol_vertex_dyn_all_nu_nodes",std::vector<long>{}));
         vertex.set_ladder_dyn_fit(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_fit_file",""),
                                  io::get_value_with_default<long>(pt,"pol_vertex_dyn_fit_rank",0));
+        vertex.set_ladder_dyn_resum_mu_file(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_resum_mu_file",""));
       }
     }
     scr_eri.set_cvv_rspace_tol(cvv_rspace_tol);
@@ -1876,6 +1880,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
         pol_vertex_carrier.set_ladder_dyn_all_nu_nodes(io::get_array_with_default<long>(pt,"pol_vertex_dyn_all_nu_nodes",std::vector<long>{}));
         pol_vertex_carrier.set_ladder_dyn_fit(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_fit_file",""),
                                  io::get_value_with_default<long>(pt,"pol_vertex_dyn_fit_rank",0));
+        pol_vertex_carrier.set_ladder_dyn_resum_mu_file(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_resum_mu_file",""));
       }
     }
     if (pol_vertex_carrier.pol_vertex_enabled()) scr_eri.set_vertex(&pol_vertex_carrier);

@@ -21,6 +21,7 @@
 
 #include <unordered_set>
 #include <sstream>
+#include <fstream>
 #include <iomanip>
 #include <chrono>
 #include <sys/resource.h>
@@ -488,6 +489,7 @@ namespace solvers {
     _pol_vtx->set_ladder_dyn_bubble_only(_vertex->ladder_dyn_bubble_only());
     _pol_vtx->set_ladder_dyn_all_nu_nodes(_vertex->ladder_dyn_all_nu_nodes());
     _pol_vtx->set_ladder_dyn_fit(_vertex->ladder_dyn_fit_file(), _vertex->ladder_dyn_fit_rank());
+    _pol_vtx->set_ladder_dyn_resum_mu_file(_vertex->ladder_dyn_resum_mu_file());
     // W-int-1b: the coarse->fine interpolation knobs travel to the readout instance too
     _pol_vtx->set_isdf_points(_vertex->isdf_points_file(), _vertex->isdf_points_dump());
     _pol_vtx->set_wannier_frame(_vertex->wannier_frame());
@@ -1321,6 +1323,28 @@ namespace solvers {
                   nodes.size(), nw_h, fit_file, Kfit);
         }
         const long NS = long(nodes.size()), ncol = nq * Nm * Nm;
+        // LFF: the Gamma_1 -> resummed factor mu(nu_j) (pol_vertex_dyn_resum_mu_file): Pi_dyn = mu Pi_gam1
+        std::vector<double> mu_tab;
+        const std::string mu_file = _pol_vtx->ladder_dyn_resum_mu_file();
+        if (not mu_file.empty()) {
+          std::ifstream fin(mu_file);
+          utils::check(fin.good(), "dump_pol_dyn_all_nu: cannot open pol_vertex_dyn_resum_mu_file {}.", mu_file);
+          std::string line;
+          while (std::getline(fin, line)) {
+            const auto h = line.find('#');
+            if (h != std::string::npos) line = line.substr(0, h);
+            std::istringstream ls(line);
+            std::vector<double> v; double x;
+            while (ls >> x) v.push_back(x);
+            if (v.empty()) continue;
+            mu_tab.push_back(v.back());   // "mu" or "j nu mu": the last number of the line
+          }
+          utils::check(long(mu_tab.size()) == nw_h, "dump_pol_dyn_all_nu: {} has {} mu values, this run has {} half nodes.",
+                       mu_file, mu_tab.size(), nw_h);
+          app_log(1, "  [LFF mu] resummation factor from {}: Pi_dyn = mu(nu) Pi_gam1 with mu(0) = {:.4f}, mu(nu_max) = {:.4f}.",
+                  mu_file, mu_tab.front(), mu_tab.back());
+        }
+        nda::array<ComplexType, 4> P_gam1;   // the written Gamma_1 column (kept for the mu-scaled Pi_dyn)
         for (int c = 0; c < 4; ++c) {
           nda::array<ComplexType, 4> P(nw_h, nq, Nm, Nm);
           P() = ComplexType(0.0);
@@ -1380,10 +1404,20 @@ namespace solvers {
               app_log(1, "  [LFF L-3]   {}: not in the fit file -- written at the sampled nodes only.", names[c]);
             }
           }
+          if (c == 2 and not mu_tab.empty()) P_gam1 = P;
+          if (c == 3 and not mu_tab.empty()) {
+            for (long j = 0; j < nw_h; ++j) P(j, all, all, all) = ComplexType(mu_tab[size_t(j)]) * P_gam1(j, all, all, all);
+            app_log(1, "  [LFF mu]   Pi_dyn written as mu(nu) x Pi_gam1 ({} nodes).", nw_h);
+          }
           nda::h5_write(g, names[c], P);
           (void)fitted;
         }
         if (do_fit) { h5::h5_write(g, "lff_fit_file", fit_file); h5::h5_write(g, "lff_fit_rank", Kfit); }
+        if (not mu_tab.empty()) {
+          nda::array<double, 1> mu_a(nw_h);
+          for (long j = 0; j < nw_h; ++j) mu_a(j) = mu_tab[size_t(j)];
+          nda::h5_write(g, "lff_mu", mu_a);
+        }
       }
       nda::h5_write(g, "Pi_bub", Pb);
       h5::h5_write(g, "nout", Nm);

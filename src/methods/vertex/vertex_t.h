@@ -902,6 +902,7 @@ namespace solvers {
     std::vector<long> _dyn_all_nu_nodes;  // pol_vertex_dyn_all_nu_nodes: the sampled half nodes of the all-nu dump (empty = all)
     std::string _dyn_fit_file;            // pol_vertex_dyn_fit_file: a previous full all-nu dump = the learned nu-basis (LFF L-3)
     long _dyn_fit_rank = 0;               // pol_vertex_dyn_fit_rank: number of nu-modes (0 = the number of sampled nodes)
+    std::string _dyn_resum_mu_file;       // pol_vertex_dyn_resum_mu_file: mu(nu_j) per half node -> Pi_dyn = mu Pi_gam1 (LFF)
     bool _dyn_dense = true;      // pol_vertex_dyn_dense: the dense per-tau rung K_d(s) (nt/2 x D x D per unit)
     long _dyn_union_stride = 1;  // pol_vertex_dyn_union_stride: keep every n-th shifted G node of the union grid
     int _dyn_table_mode = 0;     // pol_vertex_dyn_table_mode: 0 fitted twisted-pair tables, 1 exact partial fractions
@@ -1558,6 +1559,12 @@ namespace solvers {
      *  §5, round 2): 5 nodes (nu = 0 + 3 pivots + the highest node) reproduce the 40-node Gamma_1 object in the W-Dyson to
      *  0.01 % of the vertex effect on e_corr. */
     void set_ladder_dyn_fit(std::string const &file, long rank) { _dyn_fit_file = file; _dyn_fit_rank = rank; }
+    /** LFF (notes/lff_aux_plan.md, "Gamma_1 -> resummed"): pol_vertex_dyn_resum_mu_file = a text table of mu(nu_j), one value
+     *  per PH-sym half node (n_nu lines: "j nu mu" or "mu"; '#' comments). The all-nu dump then writes Pi_dyn = mu(nu_j) x
+     *  Pi_gam1 (the fitted / evaluated Gamma_1 column) -- the fully resummed vertex to 2-3 % of the correction on Si
+     *  (matrix-level mu_F is q-independent to 0.2 %); the consumer selects it with pol_vertex_interp_col = "dyn". */
+    void set_ladder_dyn_resum_mu_file(std::string const &f) { _dyn_resum_mu_file = f; }
+    std::string const &ladder_dyn_resum_mu_file() const { return _dyn_resum_mu_file; }
     std::string const &ladder_dyn_fit_file() const { return _dyn_fit_file; }
     long ladder_dyn_fit_rank() const { return _dyn_fit_rank; }
 
