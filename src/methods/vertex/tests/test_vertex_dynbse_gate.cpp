@@ -457,6 +457,132 @@ namespace bdft_tests {
       auto mfn = std::make_shared<mf::MF>(mf::default_MF(mpi_context, fxn));
       thc_reader_t thcn(mfn, make_thc_reader_ptree(mfn->nbnd() * 8, "", "incore", "", "bdft", 1e-10, mfn->ecutrho(), 1, 1024));
       auto erin = mb_eri_t(thcn, thcn);
+      auto section_m = [&]() {
+      {   // LFF-aux L-6 (Route 2) gate, section M: the PAIR-RESOLVED static-ladder vertex in Sigma (vertex_sigma_pair.icc).
+            // R0: plain GW; XS: B-S Sigma^{C,x} (vertex_type 2nd_exchange, rung static, secondary frame at run G's frozen
+            // points, bl_drop 1 drops Sigma^{C,r}); P1: pair col static1 + outer static = the SAME diagram through the pair
+            // machinery (the exact identity, G2); P0: pair at scale 0 (bit-identical to R0); PS: col static + outer dynamic
+            // (the production object; G1: its Pi-check == the all-nu dump's Pi_static column at the half nodes); PH: PS at
+            // scale 1/2 (linearity).
+          using S5 = nda::array<std::complex<double>, 5>;
+          auto read_sig = [&](std::string const &fn, S5 &S) {
+            h5::file f(fn, 'r'); h5::group g(f);
+            auto it = g.open_group("scf").open_group("iter1");
+            nda::h5_read(it, "Sigma_tskij", S);
+          };
+          long m0b = -1;
+          { auto wb = ft.wn_mesh_b(); for (long l = 0; l < wb.shape(0); ++l) if (wb(l) == 0) m0b = l; }
+          REQUIRE(m0b >= 0);
+          auto run_p = [&](std::string const &tag, int kind, std::string const &col, std::string const &outer, double scale, S5 &Sig) {
+            // kind: 0 = plain GW, 1 = B-S Sigma^{C,x}, 2 = the pair vertex
+            const std::string out = "coqui_d3_winj_" + tag;
+            solvers::hf_t hf; solvers::gw_t gw(&ft, "ignore_g0", out);
+            solvers::scr_coulomb_t scr_eri(&ft, "rpa", "ignore_g0");
+            simple_dyson dyson(mfn.get(), &ft); MBState mb_state(mpi_context, ft, out);
+            iter_scf::iter_scf_t iter_sol("damping");
+            std::array<double, 4> m{0.0, 0.0, 0.0, 0.0}; std::array<double, 2> d{0.0, 0.0};
+            double e_corr = 0.0, pichk = -1.0;
+            if (kind == 1) {
+              solvers::vertex_t vtx(&ft, "2nd_exchange", nda::range(0, 4), mfn->nbnd(), "ignore_g0", "secondary", -1, 1e-8, -1.0, -1.0, "static");
+              vtx.set_isdf_points("coqui_d3_winj_G.secpts.h5", false);
+              vtx.set_bl_drop(1);
+              scr_eri.set_vertex(&vtx); gw.set_vertex(&vtx);
+              e_corr = std::get<1>(scf_loop(mb_state, dyson, erin, ft, solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol, 1, false, 1e-9, true));
+            } else if (kind == 2) {
+              solvers::vertex_t vtx(&ft, "none", nda::range(0, 0), mfn->nbnd());
+              vtx.set_pol_vertex("ladder", "w0_prev", nda::range(0, 4), -1, 1e-8, -1.0, -1.0, -1.0, "none");
+              vtx.set_ladder_rung("static", 1e-8, 30, 12, -1.0);
+              vtx.set_isdf_points("coqui_d3_winj_G.secpts.h5", false);
+              vtx.set_sigma_pair(true, col, outer, scale, true, true);
+              scr_eri.set_vertex(&vtx);
+              e_corr = std::get<1>(scf_loop(mb_state, dyson, erin, ft, solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol, 1, false, 1e-9, true));
+              m = scr_eri.sigma_pair_meter(); d = gw.sigma_pair_dsigma();
+              if (col == "static") {   // G1: the P side's own object from the same amplitudes vs the dump's static column
+                nda::array<std::complex<double>, 4> Pc, Ps;
+                { h5::file f(out + ".sigpair.h5", 'r'); h5::group g(f); nda::h5_read(g, "Pi_check", Pc); }
+                { h5::file f("coqui_d3_winj_G.pol_wh_dyn.g1.h5", 'r'); h5::group g(f); nda::h5_read(g, "Pi_static", Ps); }
+                REQUIRE(Pc.shape(1) == Ps.shape(1)); REQUIRE(Pc.shape(2) == Ps.shape(2));
+                double dd = 0.0, nn = 0.0;
+                for (long j = 0; j < Ps.shape(0); ++j)
+                  for (long iq = 0; iq < Ps.shape(1); ++iq)
+                    for (long M = 0; M < Ps.shape(2); ++M)
+                      for (long N = 0; N < Ps.shape(3); ++N) { dd += std::norm(Pc(m0b + j, iq, M, N) - Ps(j, iq, M, N)); nn += std::norm(Ps(j, iq, M, N)); }
+                pichk = std::sqrt(dd / nn);
+              }
+            } else {
+              e_corr = std::get<1>(scf_loop(mb_state, dyson, erin, ft, solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol, 1, false, 1e-9, true));
+            }
+            mpi_context->comm.barrier();
+            read_sig(out + ".mbpt.h5", Sig);
+            app_log(1, "dynbse_readout LFF-Sigma pair [{}]: kind {} col {} outer {} scale {}: e_corr {:.12f}, max|dSigma| {:.6e} (anti-Hermitian {:.2e}, "
+                       "|K_s - K_s^dag|/|K_s| {:.2e}, wall {:.1f} s), added {:.6e} vs max|Sigma^GW| {:.4e}; Pi-check vs the dump's static column {:.3e}",
+                    tag, kind, col, outer, scale, e_corr, m[0], m[1], m[2], m[3], d[0], d[1], pichk);
+            mpi_context->comm.barrier();
+            if (mpi_context->comm.root()) {
+              remove((out + ".mbpt.h5").c_str());
+              for (auto const &e : std::filesystem::directory_iterator("."))
+                if (e.path().filename().string().rfind(out + ".", 0) == 0) std::filesystem::remove(e.path());
+            }
+            mpi_context->comm.barrier();
+            return std::make_tuple(e_corr, m, d, pichk);
+          };
+          S5 S_r0, S_xs, S_p1, S_p0, S_ps, S_ph;
+          auto [cr0, mr0, dr0, kr0] = run_p("R0", 0, "static", "static", 1.0, S_r0);
+          auto [cxs, mxs, dxs, kxs] = run_p("XS", 1, "static", "static", 1.0, S_xs);
+          auto [cp1, mp1, dp1, kp1] = run_p("P1", 2, "static1", "static", 1.0, S_p1);
+          auto [cp0, mp0, dp0, kp0] = run_p("P0", 2, "static", "dynamic", 0.0, S_p0);
+          auto [cps, mps, dps, kps] = run_p("PS", 2, "static", "dynamic", 1.0, S_ps);
+          auto [cph, mph, dph, kph] = run_p("PH", 2, "static", "dynamic", 0.5, S_ph);
+          S5 S_pt;
+          auto [cpt, mpt, dpt, kpt] = run_p("PT", 2, "static", "static", 1.0, S_pt);   // the resummed ladder with the static outer W (a complete diagram set: Hermitian?)
+          REQUIRE(S_xs.shape() == S_r0.shape()); REQUIRE(S_p1.shape() == S_r0.shape());
+          const long nb = 4;
+          auto win_diff = [&](S5 const &A, S5 const &B, double fac, S5 const &Cc, double &num, double &den, double &mx) {
+            // num = || (A - R0) - fac (B - R0) ||_F on the C block, den = || (B - R0) ||_F, mx = max abs of the same difference
+            num = den = mx = 0.0;
+            for (long it = 0; it < A.shape(0); ++it)
+              for (long is = 0; is < A.shape(1); ++is)
+                for (long ik = 0; ik < A.shape(2); ++ik)
+                  for (long i = 0; i < nb; ++i)
+                    for (long j = 0; j < nb; ++j) {
+                      const auto da = A(it, is, ik, i, j) - Cc(it, is, ik, i, j), db = B(it, is, ik, i, j) - Cc(it, is, ik, i, j);
+                      num += std::norm(da - fac * db); den += std::norm(db); mx = std::max(mx, std::abs(da - fac * db));
+                    }
+            num = std::sqrt(num); den = std::sqrt(den);
+          };
+          double n1, d1, x1, n0, d0, x0, nh, dh_, xh, nfull, dfull, xfull;
+          win_diff(S_p1, S_xs, 1.0, S_r0, n1, d1, x1);          // G2: the exact identity
+          win_diff(S_p0, S_r0, 1.0, S_r0, n0, d0, x0);          // G3: scale 0 -> bitwise R0
+          win_diff(S_ph, S_ps, 0.5, S_r0, nh, dh_, xh);         // linearity
+          win_diff(S_ps, S_xs, 1.0, S_r0, nfull, dfull, xfull); // the production object vs the one-rung static diagram (a size, not a gate)
+          // the off-window rows of Sigma must be untouched by the pair vertex (it is C-C by construction)
+          double off = 0.0;
+          for (long it = 0; it < S_ps.shape(0); ++it)
+            for (long is = 0; is < S_ps.shape(1); ++is)
+              for (long ik = 0; ik < S_ps.shape(2); ++ik)
+                for (long i = 0; i < S_ps.shape(3); ++i)
+                  for (long j = 0; j < S_ps.shape(4); ++j)
+                    if (i >= nb or j >= nb) off = std::max(off, std::abs(S_ps(it, is, ik, i, j) - S_r0(it, is, ik, i, j)));
+          app_log(1, "dynbse_readout LFF-Sigma pair gate: EXACT IDENTITY one static rung + static outer W vs B-S Sigma^(C,x): rel Frobenius {:.3e} "
+                     "(max |d| {:.3e}, |Sigma^(C,x)|_F {:.4e}, max |dSigma_pair| {:.4e}); e_corr XS {:+.10f} P1 {:+.10f} (R0 {:+.10f}); "
+                     "scale 0: max |Sigma(P0) - Sigma(R0)| {:.2e}; linearity |dSigma(1/2) - dSigma(1)/2| {:.2e} rel {:.2e}; resummed + dynamic outer W vs "
+                     "the static diagram: rel {:.3e}; off-window leakage {:.2e}; Pi-check(PS) {:.3e}; anti-Hermitian residual before Hermitization "
+                     "(P1 one rung + static W {:.2e}, PT resummed + static W {:.2e}, PS resummed + dynamic W {:.2e}); K_s hermiticity {:.2e}; "
+                     "e_corr: R0 {:+.8f} P1 {:+.8f} PT {:+.8f} PS {:+.8f}",
+                  n1 / d1, x1, d1, mp1[0], cxs, cp1, cr0, x0, xh, (dh_ > 0.0 ? nh / dh_ : 0.0), nfull / std::max(dfull, 1e-300), off, kps, mp1[1], mpt[1], mps[1], mps[2],
+                  cr0, cp1, cpt, cps);
+          REQUIRE(d1 > 0.0);
+          REQUIRE(n1 / d1 < 1e-8);                 // the exact identity (3e-12 measured; the leg/W variants miss it by 39-59 %)
+          REQUIRE(x0 == 0.0);                      // scale 0: bit-identical to plain GW
+          REQUIRE(nh <= 1e-12 * dh_);              // linear in the scale
+          REQUIRE(off == 0.0);                     // C-C only
+          REQUIRE(kps >= 0.0); REQUIRE(kps < 1e-8); // the P side's own object from the same amplitudes == the dump's static column
+          REQUIRE(mp1[1] < 1e-8);                  // the one-rung static diagram is Hermitian by itself (the one-sided insertion with a
+                                                   // dynamic outer W is not -- 6.7e-2 measured, Hermitized, logged above)
+          REQUIRE(std::abs(cps - cr0) > 1e-10);    // the production object changes the correlation energy
+        }
+};
+      if (std::getenv("COQUI_DYNBSE_TEST_M_ONLY")) { section_m(); return; }   // re-run section M alone on an existing run-G dump
       auto run_i = [&](std::string const &tag, std::string const &points, std::string const &interp, int niter) {
         const std::string out = "coqui_d3_winj_" + tag;
         solvers::hf_t hf; solvers::gw_t gw(&ft, "ignore_g0", out);
@@ -761,6 +887,7 @@ namespace bdft_tests {
         REQUIRE(xk_diff >= 0.0); REQUIRE(xk_diff < 1e-10);   // exchange_with_kernel(Z) == the code's own exchange (K term + head correction)
         REQUIRE(dn > 0.0);                                   // the Sigma side runs without the P side
       }
+      section_m();
       mpi_context->comm.barrier();
       if (mpi_context->comm.root()) {
         remove("coqui_d3_winj_G.mbpt.h5");

@@ -384,6 +384,8 @@ namespace solvers {
     // LFF-Sigma (Route 1): the vertex correction of W for Sigma ONLY, from THIS iteration's W -- after every other
     // consumer of dW (the kernel cache above included), so W, W-bar and the readout are exactly those without the knob.
     if (_vertex != nullptr and _vertex->sigma_lff_enabled()) build_sigma_lff(mb_state, thc, t_pgrid, t_bsize);
+    // LFF-Sigma Route 2 (L-6): the pair-resolved static-ladder vertex in Sigma, on the readout instance (same placement)
+    if (_vertex != nullptr and _vertex->sigma_pair_enabled()) build_sigma_pair(mb_state, thc);
 
     print_timers();
   }
@@ -2614,6 +2616,49 @@ namespace solvers {
   // extractor, and published as (mb_state.dWsig_qtPQ, eps_inv_head_sig) for a SECOND GW contraction in gw_t::evaluate,
   // on top of Sigma^GW. W, the kernel caches, the readout and every other consumer of dW are untouched; scale = 0 is
   // bit-identical to the run without the knob. Cost: N_m-class algebra per (q, nu) + one extra Sigma contraction.
+  // ---- LFF-Sigma Route 2 (L-6, notes/lff_aux_plan.md): the pair-resolved static-ladder vertex in Sigma -----------
+  // The readout instance (_pol_vtx) carries the frozen secondary frame, W-bar_0 (build_w0 at the pure-RPA point of this
+  // update) and, on demand, the W-bar cache; the knobs live on the knob carrier (_vertex). The result is the C-window
+  // block dSigma(tau) in band labels, published for gw_t::evaluate (added to Sigma after Sigma^GW).
+  void scr_coulomb_t::build_sigma_pair(MBState &mb_state, THC_ERI auto &thc) {
+    utils::check(_vertex != nullptr and _vertex->pol_vertex_active() and not _vertex->active(),
+                 "build_sigma_pair: pol_vertex_sigma = \"pair\" needs the ladder machinery (pol_vertex = \"ladder\", a non-empty "
+                 "window) and an INACTIVE vertex_type.");
+    ensure_pol_vertex(thc);
+    utils::check(_pol_vtx != nullptr, "build_sigma_pair: no readout instance.");
+    vertex_t::sigma_pair_opts o;
+    o.col = _vertex->sigma_pair_col();
+    o.outer = _vertex->sigma_pair_outer();
+    o.scale = _vertex->sigma_pair_scale();
+    o.hermitize = _vertex->sigma_pair_herm();
+    o.nu_diag = _vertex->sigma_pair_diag();
+    o.sign_ks = _vertex->ladder_dyn_sign();
+    nda::array<ComplexType, 4> Pchk;
+    if (_vertex->sigma_pair_diag()) {
+      // the P side's own object from the same amplitudes (gate G1): dumped with the run prefix for the test / offline check
+      const long nq = thc.MF()->nqpts_ibz(), Nm = _pol_vtx->secondary_rank(), nw_b = _ft->nw_b();
+      Pchk = nda::array<ComplexType, 4>(nw_b, nq, Nm, Nm);
+      o.Pi_check = std::addressof(Pchk);
+    }
+    nda::array<ComplexType, 5> dS;
+    vertex_t::sigma_pair_meter met;
+    _pol_vtx->eval_sigma_pair(mb_state, thc, o, dS, &met);
+    if (_vertex->sigma_pair_diag() and thc.mpi()->comm.root()) {
+      const std::string fn = mb_state.coqui_prefix + ".sigpair.h5";
+      h5::file f(fn, 'w');
+      h5::group g(f);
+      nda::h5_write(g, "Pi_check", Pchk);
+      nda::h5_write(g, "nu_spec", met.nu_spec);
+      nda::h5_write(g, "dSigma_tskab", dS);
+      h5::h5_write(g, "col", o.col);
+      h5::h5_write(g, "outer", o.outer);
+      app_log(1, "  [LFF-Sigma pair] diagnostics written to {} (Pi_check (nw_b, nq, N_m, N_m), nu_spec, dSigma_tskab)", fn);
+    }
+    mb_state.dSigma_pair_tskab.emplace(std::move(dS));
+    mb_state.sigma_pair_window = {_pol_vtx->band_window().first(), long(_pol_vtx->band_window().size())};
+    _sig_pair_meter = {met.dsig_max, met.dsig_herm, met.ks_herm, met.t_total};
+  }
+
   void scr_coulomb_t::build_sigma_lff(MBState &mb_state, THC_ERI auto &thc, std::array<long, 4> t_pgrid, std::array<long, 4> t_bsize) {
     decltype(nda::range::all) all;
     using math::nda::make_distributed_array;
@@ -2917,6 +2962,7 @@ namespace solvers {
 
   template void scr_coulomb_t::update_w(MBState&, thc_reader_t&, long);
   template void scr_coulomb_t::build_sigma_lff(MBState&, thc_reader_t&, std::array<long, 4>, std::array<long, 4>);
+  template void scr_coulomb_t::build_sigma_pair(MBState&, thc_reader_t&);
   template nda::array<ComplexType, 4> scr_coulomb_t::read_pol_interp_column(std::string const&, long, long,
                                                                             nda::array<long, 1> const&, thc_reader_t&);
   template void scr_coulomb_t::fold_rpa_pi_secondary(

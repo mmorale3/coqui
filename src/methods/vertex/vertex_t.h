@@ -908,6 +908,14 @@ namespace solvers {
     std::string _sigma_lff = "none";        // pol_vertex_sigma
     std::string _sigma_lff_bub = "window";  // pol_vertex_sigma_bub: Pi_0 = the dump's window bubble ("window") | the loop's RPA Pi folded ("full")
     double _sigma_lff_scale = 1.0;          // pol_vertex_sigma_scale: multiplies the correction (0 = bit-identical off)
+    // LFF-aux L-6, Route 2 (notes/lff_aux_plan.md): the PAIR-RESOLVED static-ladder vertex in Sigma (vertex_sigma_pair.icc),
+    // pol_vertex_sigma = "pair"; evaluated on the readout instance at the update_w tail, added to Sigma by gw_t::evaluate
+    bool _sigma_pair = false;
+    std::string _sigma_pair_col = "static";      // pol_vertex_sigma_pair_col: "static" (T_s, resummed) | "static1" (one rung K_s)
+    std::string _sigma_pair_outer = "dynamic";   // pol_vertex_sigma_pair_outer: the outer W-bar: "dynamic" (W-bar(q, i nu)) | "static" (W-bar_0)
+    double _sigma_pair_scale = 1.0;              // pol_vertex_sigma_scale (shared with "lff"): multiplies the correction
+    bool _sigma_pair_herm = true;                // pol_vertex_sigma_pair_herm: Hermitize dSigma in (i, j)
+    bool _sigma_pair_diag = false;               // pol_vertex_sigma_pair_diag: the nu-rank meter of the amplitude + the Pi-check dump
     double _sigma_lff_pinv_tol = 1e-3;      // pol_vertex_sigma_pinv_tol: relative eigenvalue cutoff of Pi_0^-1 -- the vertex lives on the
                                             // bubble's strong modes (Si kp444: 49 of 156 carry 99.9 % of |tr B|; |Gamma_eff - 1| is bounded and
                                             // stable for 1e-1..1e-3, blows up below 1e-4 where dPi / Pi_0 is unbounded)
@@ -1598,6 +1606,45 @@ namespace solvers {
                 with_static ? "-> the static self-energy" : "DROPPED");
     }
     bool sigma_lff_enabled() const { return _sigma_lff != "none"; }
+    /** LFF-aux L-6 (Route 2): pol_vertex_sigma = "pair" -- the pair-resolved STATIC-LADDER vertex in Sigma, from the same
+     *  pair-space machinery as the polarization ladder (the left vertex D^dag (1 + Cb T_s) on the right GW leg, contracted
+     *  with W-bar(q, i nu) and G on the C window; vertex_sigma_pair.icc). Independent of pol_vertex_inject (the P side). */
+    void set_sigma_pair(bool on, std::string const &col, std::string const &outer, double scale, bool hermitize, bool diag) {
+      utils::check(col == "static" or col == "static1",
+                   "vertex_t::set_sigma_pair: unknown pol_vertex_sigma_pair_col \"{}\". Valid options are \"static\" (default), \"static1\".", col);
+      utils::check(outer == "dynamic" or outer == "static",
+                   "vertex_t::set_sigma_pair: unknown pol_vertex_sigma_pair_outer \"{}\". Valid options are \"dynamic\" (default), \"static\".", outer);
+      _sigma_pair = on; _sigma_pair_col = col; _sigma_pair_outer = outer; _sigma_pair_scale = scale; _sigma_pair_herm = hermitize;
+      _sigma_pair_diag = diag;
+      if (on)
+        app_log(1, "  [LFF-Sigma pair] pol_vertex_sigma = \"pair\": Sigma = G W-bar Lambda_s with the pair-resolved static-ladder vertex "
+                   "(column \"{}\", outer W-bar \"{}\", scale {}, Hermitized {}, diagnostics {}).", col, outer, scale, hermitize, diag);
+    }
+    bool sigma_pair_enabled() const { return _sigma_pair; }
+    std::string const &sigma_pair_col() const { return _sigma_pair_col; }
+    std::string const &sigma_pair_outer() const { return _sigma_pair_outer; }
+    double sigma_pair_scale() const { return _sigma_pair_scale; }
+    bool sigma_pair_herm() const { return _sigma_pair_herm; }
+    bool sigma_pair_diag() const { return _sigma_pair_diag; }
+    struct sigma_pair_opts {
+      std::string col = "static";     // "static" = A~ = [Cb T_s]^T D^*  |  "static1" = [Cb K_s]^T D^*
+      std::string outer = "dynamic";  // "dynamic" = W-bar_0 + [W_dyn(nu) - W_dyn(0)]  |  "static" = W-bar_0
+      double sign_ks = -1.0;          // the ladder's rung sign (pol_vertex_dyn_sign)
+      double scale = 1.0;
+      bool hermitize = true;
+      bool nu_diag = false;           // the Gram spectrum over nu of the amplitude (meter nu_spec)
+      nda::array<ComplexType, 4> *Pi_check = nullptr;   // (nw_b, nq, Nm, Nm): (spin/nk) A~^T (Cb D), the P side's own object (gate G1)
+    };
+    struct sigma_pair_meter {
+      double dsig_max = 0.0, dsig_herm = 0.0, ks_herm = 0.0;
+      double t_total = 0.0, t_setup = 0.0, t_ks = 0.0, t_cb = 0.0, t_lu = 0.0, t_amp = 0.0, t_con = 0.0, rss_gb = 0.0;
+      long nunits = 0;
+      nda::array<double, 1> nu_spec;   // normalized Gram eigenvalues over nu, descending, max over units (nu_diag)
+    };
+    /** The pair-resolved static-ladder vertex self-energy on the C window: dSig (nt, ns, nk, nc, nc), replicated.
+     *  Runs on the READOUT instance (secondary frame, W-bar_0 of this update; cache_w called on demand for outer = dynamic). */
+    void eval_sigma_pair(MBState &mb_state, THC_ERI auto &thc, sigma_pair_opts const &opt,
+                         nda::array<ComplexType, 5> &dSig, sigma_pair_meter *met = nullptr);
     std::string const &sigma_lff_bub() const { return _sigma_lff_bub; }
     double sigma_lff_scale() const { return _sigma_lff_scale; }
     double sigma_lff_pinv_tol() const { return _sigma_lff_pinv_tol; }

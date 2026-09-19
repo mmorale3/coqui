@@ -1,0 +1,342 @@
+#ifndef COQUI_VERTEX_SIGMA_PAIR_ICC
+#define COQUI_VERTEX_SIGMA_PAIR_ICC
+
+/**
+ * LFF-aux L-6, ROUTE 2 (notes/lff_aux_plan.md, 2026-09-19): the PAIR-RESOLVED static-ladder vertex in the
+ * SELF-ENERGY, built from the same pair-space machinery as the polarization ladder (dynbse.hpp /
+ * vertex_dynbse.icc) in the frozen secondary frame of the readout instance.
+ *
+ * Conventions (all inherited from the P side; nothing new is defined here):
+ *   pair space P = (k, a, b), D = nk nc^2, row k nc^2 + a nc + b;  D_N(k,a,b) = Xb(k,N,a) Xb(k+q,N,b)^*
+ *   Cb(q, i nu)(k; (p1'p3),(ab)) = -int e^{i nu tau} G_{a p1'}(k, beta-tau) G_{p3 b}(k+q, tau)   (build_cb_tau)
+ *   K_s = (sign_ks / nk) Kbig[W-bar_0]  (build_kbig),  T_s = K_s (1 - Cb K_s)^-1  (static_resolvent)
+ *   P side:  Pi = (spin/nk) D^dag Cb (1 + T_s Cb) D  =  Lambda(-nu)^dag Cb D  with the LEFT vertex
+ *            Lambda(-nu)^dag = D^dag (1 + Cb T_s)(nu).
+ * Sigma side (MEASURED against the B-S Sigma^{C,x} kernel, section M of test_vertex_dynbse_gate, 2026-09-19): in the
+ * code's THC collocation convention the LEFT GW leg is X_i(k) X_c(k')^* = D_M(k',c,i)^* and the RIGHT leg is
+ * X_c'(k') X_j(k)^* = D_N(k',c',j), a RIGHT-type pair density, so its ladder dressing is the P side's own right vertex,
+ *            D_N  ->  D_N + A_N,     A(q, i nu) = T_s(nu) Cb(nu) D     (one rung: K_s Cb D)
+ * at +nu with no conjugation, and W enters as W_NM (N on the dressed leg). The four other assignments were measured:
+ * the left-vertex form [Cb T_s]^T D^* misses the diagram by 39 % (Frobenius), its conjugate by 59 %; the right vertex
+ * with W_MN agrees to 1.5e-10 (W-bar_0's own anti-Hermitian part), with W_NM to 3e-12 = the exact identity.
+ * Then, with the loop's bosonic nu -> tau transform Ttw (the same rows the dynamic rung uses for W),
+ *     dSigma_ij(k, tau) = -(scale/nk) sum_q sum_cc' G_cc'(k', tau) [Ttw . H](tau; k', (c,i), (c',j)),
+ *     H(nu; k', ci, c'j) = sum_MN D_M(k',c,i)^* W-bar_NM(q, nu) A_N(k',c',j; nu),
+ * W-bar(q, nu) = W-bar_0 + [W_dyn(nu) - W_dyn(0)] (the cache _Wb_qwmm, even in nu as in the dynamic rung) or
+ * W-bar_0 alone ("outer static"). Externals i, j and the internal c, c' all in the C window (the B-S
+ * "C-restricted externals" convention); the result is Hermitized in (i, j) and the residual metered.
+ *
+ * Every (s, q) unit is independent (all bosonic nodes of the unit are evaluated inside it: one D x D LU per
+ * node for col "static"); units are round-robin over ranks and the (nt, ns, nk, nc, nc) result is all-reduced.
+ */
+
+namespace methods {
+namespace solvers {
+
+  namespace vertex_sigma_pair_detail {
+
+    using cplx = ComplexType;
+    namespace db = dynbse;
+    namespace vd = vertex_dynbse_detail;
+
+    /** Cb(q, i nu) at ALL bosonic nodes: Cb_all(l, k, (p1'p3), (ab)) -- build_cb_tau's arithmetic with every row kept. */
+    inline void build_cb_all(nda::MemoryArrayOfRank<5> auto const &G_CC, vertex_pi::iaft_tools const &tools,
+                             long is, long iq, nda::array<long, 2> const &kpq, nda::array<cplx, 4> &Cb_all) {
+      const long nt = G_CC.shape(0), nk = G_CC.shape(2), nc = G_CC.shape(3), nc2 = nc * nc, nw_b = tools.nw_b;
+      utils::check(Cb_all.shape(0) == nw_b and Cb_all.shape(1) == nk and Cb_all.shape(2) == nc2 and Cb_all.shape(3) == nc2,
+                   "vertex_sigma_pair::build_cb_all: output shape.");
+      nda::array<cplx, 2> Pf(nt, nc2 * nc2), Bf(nw_b, nc2 * nc2);
+      for (long ik = 0; ik < nk; ++ik) {
+        const long ikpq = kpq(iq, ik);
+        for (long s = 0; s < nt; ++s) {
+          const long sm = tools.t_mirror(s);
+          for (long p1p = 0; p1p < nc; ++p1p)
+            for (long p3 = 0; p3 < nc; ++p3)
+              for (long a = 0; a < nc; ++a)
+                for (long b = 0; b < nc; ++b)
+                  Pf(s, (p1p * nc + p3) * nc2 + (a * nc + b)) = G_CC(sm, is, ik, a, p1p) * G_CC(s, is, ikpq, p3, b);
+        }
+        nda::blas::gemm(cplx(-1.0), tools.Twt_bb, Pf, cplx(0.0), Bf);
+        for (long l = 0; l < nw_b; ++l)
+          for (long r = 0; r < nc2; ++r)
+            for (long c = 0; c < nc2; ++c) Cb_all(l, ik, r, c) = Bf(l, r * nc2 + c);
+      }
+    }
+
+    /**
+     * THE DRIVER. dSig (nt, ns, nk, nc, nc) is ZEROED here and accumulated by the units this rank owns (the caller
+     * all-reduces and Hermitizes). Wbh = the cache _Wb_qwmm (nq, nw_half, Nm, Nm), read only for outer = "dynamic".
+     * opt.Pi_check (nw_b, nq, Nm, Nm), when non-null, receives (spin/nk) D^dag Cb A = the static-ladder correction
+     * of Pi in the P side's own normalization (gate G1: == the dump's Pi_static column at the +nu half nodes).
+     * opt.nu_diag: the Gram spectrum over nu of A per unit (max over units, normalized, descending) -> met->nu_spec.
+     */
+    inline void eval_pair_sigma(nda::MemoryArrayOfRank<5> auto const &G_CC,    // (nt,ns,nk,nc,nc) full BZ
+                                nda::array<cplx, 4> const &Xb,                 // (ns,nk,Nm,nc)
+                                nda::array<cplx, 3> const &W0b,                // (nq,Nm,Nm)
+                                nda::array<cplx, 4> const *Wbh,                // (nq,nw_half,Nm,Nm) or nullptr
+                                nda::array<long, 2> const &kmq, nda::array<long, 2> const &kpq,
+                                vertex_pi::iaft_tools const &tools, long rank, long nproc,
+                                vertex_t::sigma_pair_opts const &opt, nda::array<cplx, 5> &dSig,
+                                vertex_t::sigma_pair_meter *met) {
+      decltype(nda::range::all) all;
+      vertex_ladder_detail::prof_watch watch;
+      const long nt = G_CC.shape(0), ns = G_CC.shape(1), nk = G_CC.shape(2), nc = G_CC.shape(3);
+      const long Nm = Xb.shape(2), nc2 = nc * nc, D = nc2 * nk, nq = W0b.shape(0), nw_b = tools.nw_b;
+      const long nw_half = (nw_b % 2 == 0) ? nw_b / 2 : nw_b / 2 + 1;
+      const bool dyn_outer = (opt.outer == "dynamic");
+      const bool one_rung = (opt.col == "static1");
+      utils::check(opt.col == "static" or opt.col == "static1",
+                   "vertex_sigma_pair: unknown column \"{}\" (static | static1).", opt.col);
+      utils::check(opt.outer == "dynamic" or opt.outer == "static",
+                   "vertex_sigma_pair: unknown outer W \"{}\" (dynamic | static).", opt.outer);
+      utils::check(kmq.shape(0) == nq and kpq.shape(0) == nq and kmq.shape(1) == nk,
+                   "vertex_sigma_pair: nosym mesh expected (nq = {}, kmq {} x {}).", nq, kmq.shape(0), kmq.shape(1));
+      utils::check(nt == tools.nt_f, "vertex_sigma_pair: G tau axis {} != nt_f {}.", nt, tools.nt_f);
+      if (dyn_outer) {
+        utils::check(Wbh != nullptr and Wbh->shape(0) == nq and Wbh->shape(1) == nw_half and Wbh->shape(2) == Nm and
+                     Wbh->shape(3) == Nm, "vertex_sigma_pair: the W-bar cache is absent or mis-shaped (outer = dynamic).");
+      }
+      utils::check(dSig.shape(0) == nt and dSig.shape(1) == ns and dSig.shape(2) == nk and dSig.shape(3) == nc and
+                   dSig.shape(4) == nc, "vertex_sigma_pair: dSigma shape.");
+      dSig() = cplx(0.0);
+      if (opt.Pi_check != nullptr) {
+        utils::check(opt.Pi_check->shape(0) == nw_b and opt.Pi_check->shape(1) == nq and opt.Pi_check->shape(2) == Nm and
+                     opt.Pi_check->shape(3) == Nm, "vertex_sigma_pair: Pi_check shape.");
+        (*opt.Pi_check)() = cplx(0.0);
+      }
+      const double spinfac = (ns == 1) ? 2.0 : 1.0;
+      const cplx scale_k(opt.sign_ks / double(nk), 0.0);
+      // transfer lookup (build_kbig's qx_of) and the full-mesh nu unfold of the PH-sym half cache (the dynamic rung's map)
+      nda::array<long, 2> qx_of(nk, nk);
+      qx_of() = -1;
+      for (long iqx = 0; iqx < nq; ++iqx)
+        for (long ik = 0; ik < nk; ++ik) qx_of(ik, kmq(iqx, ik)) = iqx;
+      for (long ik = 0; ik < nk; ++ik)
+        for (long ikp = 0; ikp < nk; ++ikp)
+          utils::check(qx_of(ik, ikp) >= 0, "vertex_sigma_pair: transfer mesh does not connect k = {} to k' = {}.", ik, ikp);
+      const long lpos0 = std::max(tools.m0, tools.w_mirror_b(tools.m0)) - nw_b / 2;
+      auto lpos_of = [&](long l) { return std::max(l, tools.w_mirror_b(l)) - nw_b / 2; };
+      if (met) { met->t_setup += watch.lap(); met->nu_spec = nda::array<double, 1>(nw_b); met->nu_spec() = 0.0; }
+
+      nda::array<cplx, 2> Kbig(D, D), Ks(D, D), Dm(D, Nm), Dconj(D, Nm), Amp(D, Nm), CbD(D, Nm), CbA;
+      nda::array<cplx, 4> Cb_all(nw_b, nk, nc2, nc2);
+      nda::array<cplx, 2> Hall(nw_b, nk * nc2 * nc2), Ht(nt, nk * nc2 * nc2);
+      nda::array<cplx, 2> Wq(Nm, Nm), Bk(nc2, Nm), Hk(nc2, nc2), Pchk;
+      nda::array<cplx, 3> Astore;
+      if (opt.Pi_check != nullptr) { CbA = nda::array<cplx, 2>(D, Nm); Pchk = nda::array<cplx, 2>(Nm, Nm); }
+      if (opt.nu_diag) Astore = nda::array<cplx, 3>(nw_b, D, Nm);
+      const long nunits = ns * nq;
+      for (long u = rank; u < nunits; u += nproc) {
+        const long is = u / nq, iq = u % nq;
+        // ---- the external legs (pair densities) of this transfer ------------------------------------
+        for (long k = 0; k < nk; ++k) {
+          const long kq = kpq(iq, k);
+          for (long a = 0; a < nc; ++a)
+            for (long b = 0; b < nc; ++b)
+              for (long N = 0; N < Nm; ++N) {
+                const cplx v = Xb(is, k, N, a) * std::conj(Xb(is, kq, N, b));
+                Dm(k * nc2 + a * nc + b, N) = v;
+                Dconj(k * nc2 + a * nc + b, N) = std::conj(v);
+              }
+        }
+        // ---- the static rung and its hermiticity meter ---------------------------------------------
+        vd::build_kbig(Xb, W0b, is, iq, kpq, qx_of, Kbig, nullptr);
+        Ks() = Kbig * scale_k;
+        if (met) {
+          double dh = 0.0, kmx = 0.0;
+          for (long i = 0; i < D; ++i)
+            for (long j = 0; j < D; ++j) {
+              dh = std::max(dh, std::abs(Ks(i, j) - std::conj(Ks(j, i))));
+              kmx = std::max(kmx, std::abs(Ks(i, j)));
+            }
+          met->ks_herm = std::max(met->ks_herm, (kmx > 0.0) ? dh / kmx : 0.0);
+          met->t_ks += watch.lap();
+        }
+        // ---- the pair bubble at every bosonic node ---------------------------------------------------
+        build_cb_all(G_CC, tools, is, iq, kpq, Cb_all);
+        if (met) met->t_cb += watch.lap();
+        // ---- per node: the amplitude A~(nu) = [Cb T_s]^T D^*  and  H(nu) = D . W-bar(nu) . A~(nu) ---------
+        for (long l = 0; l < nw_b; ++l) {
+          nda::array<cplx, 3> Cb_k(nk, nc2, nc2);
+          Cb_k() = Cb_all(l, all, all, all);
+          db::static_resolvent S;
+          if (one_rung) {
+            S.D = D; S.nk = nk; S.nc = nc;
+            S.Cb = nda::array<cplx, 2>(D, D);
+            S.Cb() = cplx(0.0);
+            for (long k = 0; k < nk; ++k)
+              for (long r = 0; r < nc2; ++r)
+                for (long c = 0; c < nc2; ++c) S.Cb(k * nc2 + r, k * nc2 + c) = Cb_k(k, r, c);
+          } else {
+            S = db::build_static_resolvent_from(Cb_k, Ks);      // the D x D LU of (1 - Cb K_s)
+          }
+          if (met) met->t_lu += watch.lap();
+          // Cb D (block-diagonal Cb: nk gemms) and the dressed amplitude A = (T_s | K_s) . Cb D  (D x Nm)
+          for (long k = 0; k < nk; ++k) {
+            auto Ck = Cb_k(k, all, all);
+            auto Dk = Dm(nda::range(k * nc2, (k + 1) * nc2), all);
+            auto Ok = CbD(nda::range(k * nc2, (k + 1) * nc2), all);
+            nda::blas::gemm(Ck, Dk, Ok);
+          }
+          nda::blas::gemm(one_rung ? Ks : S.Ts, CbD, Amp);
+          if (opt.Pi_check != nullptr) {
+            // (spin/nk) D^dag (Cb A): the P side's static-ladder correction from these amplitudes
+            for (long k = 0; k < nk; ++k) {
+              auto Ck = Cb_k(k, all, all);
+              auto Ak = Amp(nda::range(k * nc2, (k + 1) * nc2), all);
+              auto Ok = CbA(nda::range(k * nc2, (k + 1) * nc2), all);
+              nda::blas::gemm(Ck, Ak, Ok);
+            }
+            nda::blas::gemm(nda::transpose(Dconj), CbA, Pchk);        // (Nm x D)(D x Nm)
+            for (long M = 0; M < Nm; ++M)
+              for (long N = 0; N < Nm; ++N) (*opt.Pi_check)(l, iq, M, N) = cplx(spinfac / double(nk)) * Pchk(M, N);
+          }
+          if (opt.nu_diag) Astore(l, all, all) = Amp;
+          if (met) met->t_amp += watch.lap();
+          // W-bar(q, nu): W-bar_0 (+ the dynamic fluctuation of the cache, even in nu)
+          Wq() = W0b(iq, all, all);
+          if (dyn_outer) {
+            const long lp = lpos_of(l);
+            for (long M = 0; M < Nm; ++M)
+              for (long N = 0; N < Nm; ++N) Wq(M, N) += (*Wbh)(iq, lp, M, N) - (*Wbh)(iq, lpos0, M, N);
+          }
+          for (long kp = 0; kp < nk; ++kp) {
+            auto Ak = Amp(nda::range(kp * nc2, (kp + 1) * nc2), all);     // (nc2, Nm): rows (c', j), the dressed right leg
+            auto Dk = Dconj(nda::range(kp * nc2, (kp + 1) * nc2), all);   // (nc2, Nm): rows (c, i), the left leg D^*
+            nda::blas::gemm(Ak, Wq, Bk);                                  // B(c'j, M) = sum_N A(c'j, N) W(N, M)
+            nda::blas::gemm(Dk, nda::transpose(Bk), Hk);                 // H(ci, c'j) = sum_M D^*(ci, M) B(c'j, M)
+            for (long r = 0; r < nc2; ++r)
+              for (long c = 0; c < nc2; ++c) Hall(l, (kp * nc2 + r) * nc2 + c) = Hk(r, c);
+          }
+          if (met) met->t_con += watch.lap();
+        }
+        // ---- nu -> tau (one gemm) and the tau-local contraction with G ------------------------------
+        nda::blas::gemm(tools.Ttw_bb, Hall, Ht);                          // (nt x nw_b)(nw_b x nk nc^4)
+        const cplx pref(-opt.scale / double(nk), 0.0);
+        for (long kp = 0; kp < nk; ++kp) {
+          const long k = kpq(iq, kp);                                     // k = k' + q
+          for (long it = 0; it < nt; ++it)
+            for (long i = 0; i < nc; ++i)
+              for (long j = 0; j < nc; ++j) {
+                cplx acc(0.0);
+                for (long c = 0; c < nc; ++c)
+                  for (long cp = 0; cp < nc; ++cp)
+                    acc += G_CC(it, is, kp, c, cp) * Ht(it, (kp * nc2 + c * nc + i) * nc2 + cp * nc + j);
+                dSig(it, is, k, i, j) += pref * acc;
+              }
+        }
+        if (opt.nu_diag) {
+          // the Gram matrix over nu of the amplitude (all pairs and legs), normalized spectrum, max over units
+          nda::matrix<cplx> Gm(nw_b, nw_b);
+          const long len = D * Nm;
+          for (long l = 0; l < nw_b; ++l)
+            for (long l2 = l; l2 < nw_b; ++l2) {
+              cplx acc(0.0);
+              cplx const *a = Astore.data() + l * len;
+              cplx const *b = Astore.data() + l2 * len;
+              for (long n = 0; n < len; ++n) acc += std::conj(a[n]) * b[n];
+              Gm(l, l2) = acc; Gm(l2, l) = std::conj(acc);
+            }
+          auto [lam, V] = nda::linalg::eigenelements(Gm);   // ascending
+          double tr = 0.0;
+          for (long l = 0; l < nw_b; ++l) tr += std::max(lam(l), 0.0);
+          if (met and tr > 0.0)
+            for (long l = 0; l < nw_b; ++l) met->nu_spec(l) = std::max(met->nu_spec(l), std::max(lam(nw_b - 1 - l), 0.0) / tr);
+        }
+        if (met) { ++met->nunits; met->t_con += watch.lap(); met->rss_gb = std::max(met->rss_gb, vertex_ladder_detail::prof_rss_gb()); }
+      }
+    }
+
+  } // namespace vertex_sigma_pair_detail
+
+  /**
+   * The pair-resolved static-ladder vertex self-energy on the ladder's C window (see the file header). Runs on the
+   * READOUT instance (frozen secondary frame; W-bar_0 from build_w0 this update; the W-bar cache from cache_w, called
+   * here on demand when outer = "dynamic"). dSig OUT: (nt, ns, nk, nc, nc), replicated, Hermitized in (i, j).
+   */
+  void vertex_t::eval_sigma_pair(MBState &mb_state, THC_ERI auto &thc, sigma_pair_opts const &opt,
+                                 nda::array<ComplexType, 5> &dSig, sigma_pair_meter *met) {
+    decltype(nda::range::all) all;
+    namespace vs = vertex_sigma_pair_detail;
+    vertex_ladder_detail::prof_watch twatch;
+    utils::check(active() and secondary(), "vertex_t::eval_sigma_pair: requires an ACTIVE secondary-basis vertex (the readout instance).");
+    utils::check(not _wannier, "vertex_t::eval_sigma_pair: the pair-resolved Sigma vertex runs in the band (window) frame only.");
+    utils::check(_W0b_qmm.has_value(), "vertex_t::eval_sigma_pair: W0bar is absent -- build_w0 must run first.");
+    auto MF = thc.MF();
+    auto mpi = thc.mpi();
+    if (opt.outer == "dynamic" and not _Wb_qwmm.has_value()) {
+      app_log(1, "  [LFF-Sigma pair] outer W = dynamic: folding this iteration's W into the W-bar cache (cache_w on demand).");
+      cache_w(mb_state, thc);
+    }
+    nda::array<ComplexType, 5> G_CC;
+    nda::array<long, 2> kmq, kpq;
+    vertex_sym::sym_ctx const *symc = nullptr;
+    ladder_inputs(mb_state, thc, G_CC, kmq, kpq, symc);
+    utils::check(symc == nullptr, "vertex_t::eval_sigma_pair: the symmetric mesh is not wired (nosym only).");
+    utils::check(MF->nkpts() == MF->nkpts_ibz(), "vertex_t::eval_sigma_pair: nosym mesh expected.");
+    vertex_pi::iaft_tools tools(*_ft);                 // the LOOP's grid: Sigma(tau) lives there
+    const long nt = G_CC.shape(0), ns = G_CC.shape(1), nk = G_CC.shape(2), nc = G_CC.shape(3);
+    dSig = nda::array<ComplexType, 5>(nt, ns, nk, nc, nc);
+    sigma_pair_meter mloc;
+    vs::eval_pair_sigma(G_CC, _Xb_skma, _W0b_qmm.value(), _Wb_qwmm.has_value() ? std::addressof(_Wb_qwmm.value()) : nullptr,
+                        kmq, kpq, tools, mpi->comm.rank(), mpi->comm.size(), opt, dSig, &mloc);
+    mpi->comm.all_reduce_in_place_n(dSig.data(), dSig.size(), std::plus<>{});
+    if (opt.Pi_check != nullptr) mpi->comm.all_reduce_in_place_n(opt.Pi_check->data(), opt.Pi_check->size(), std::plus<>{});
+    // meters: the anti-Hermitian residual in (i, j) at fixed tau, then the Hermitization
+    double dmax = 0.0, dherm = 0.0;
+    for (long it = 0; it < nt; ++it)
+      for (long is = 0; is < ns; ++is)
+        for (long k = 0; k < nk; ++k)
+          for (long i = 0; i < nc; ++i)
+            for (long j = 0; j < nc; ++j) {
+              dmax = std::max(dmax, std::abs(dSig(it, is, k, i, j)));
+              dherm = std::max(dherm, std::abs(dSig(it, is, k, i, j) - std::conj(dSig(it, is, k, j, i))));
+            }
+    if (opt.hermitize)
+      for (long it = 0; it < nt; ++it)
+        for (long is = 0; is < ns; ++is)
+          for (long k = 0; k < nk; ++k)
+            for (long i = 0; i < nc; ++i)
+              for (long j = i; j < nc; ++j) {
+                const ComplexType h = 0.5 * (dSig(it, is, k, i, j) + std::conj(dSig(it, is, k, j, i)));
+                dSig(it, is, k, i, j) = h;
+                dSig(it, is, k, j, i) = std::conj(h);
+              }
+    mloc.dsig_max = dmax; mloc.dsig_herm = (dmax > 0.0) ? dherm / dmax : 0.0;
+    mloc.ks_herm = mpi->comm.all_reduce_value(mloc.ks_herm, boost::mpi3::max<>{});
+    mloc.nunits = mpi->comm.all_reduce_value(mloc.nunits, std::plus<>{});
+    mloc.rss_gb = mpi->comm.all_reduce_value(mloc.rss_gb, boost::mpi3::max<>{});
+    for (auto *t : {&mloc.t_setup, &mloc.t_ks, &mloc.t_cb, &mloc.t_lu, &mloc.t_amp, &mloc.t_con})
+      *t = mpi->comm.all_reduce_value(*t, boost::mpi3::max<>{});
+    if (opt.nu_diag and mloc.nu_spec.size() > 0)
+      mpi->comm.all_reduce_in_place_n(mloc.nu_spec.data(), mloc.nu_spec.size(), boost::mpi3::max<>{});
+    mloc.t_total = twatch.lap();
+    std::string spec;
+    if (opt.nu_diag and mloc.nu_spec.size() > 0) {
+      double cum = 0.0; long n2 = -1, n3 = -1, n4 = -1;
+      for (long l = 0; l < mloc.nu_spec.size(); ++l) {
+        cum += mloc.nu_spec(l);
+        if (n2 < 0 and 1.0 - cum < 1e-2) n2 = l + 1;
+        if (n3 < 0 and 1.0 - cum < 1e-3) n3 = l + 1;
+        if (n4 < 0 and 1.0 - cum < 1e-4) n4 = l + 1;
+      }
+      char buf[256];
+      std::snprintf(buf, sizeof(buf), "; nu-rank of A~ (Gram tail, max over units): 1e-2 -> %ld modes, 1e-3 -> %ld, 1e-4 -> %ld of %ld; top weights %.3f %.3f %.3f %.3f",
+                    n2, n3, n4, long(mloc.nu_spec.size()), mloc.nu_spec(0), mloc.nu_spec.size() > 1 ? mloc.nu_spec(1) : 0.0,
+                    mloc.nu_spec.size() > 2 ? mloc.nu_spec(2) : 0.0, mloc.nu_spec.size() > 3 ? mloc.nu_spec(3) : 0.0);
+      spec = buf;
+    }
+    app_log(1, "  [LFF-Sigma pair] col {} outer {} scale {}: {} (s, q) units on {} bosonic nodes (C = [{}, {}), N_m = {}): "
+               "max |dSigma(tau)| = {:.4e}, anti-Hermitian residual {:.3e} ({}), |K_s - K_s^dag|/|K_s| = {:.2e}; wall {:.1f} s "
+               "(slowest rank: rung {:.1f}, Cb {:.1f}, LU {:.1f}, amplitude {:.1f}, contraction {:.1f}), RSS {:.2f} GB{}",
+            opt.col, opt.outer, opt.scale, mloc.nunits, tools.nw_b, _band_window.first(), _band_window.last(), _Xb_skma.shape(2),
+            mloc.dsig_max, mloc.dsig_herm, opt.hermitize ? "Hermitized" : "NOT Hermitized", mloc.ks_herm, mloc.t_total,
+            mloc.t_ks, mloc.t_cb, mloc.t_lu, mloc.t_amp, mloc.t_con, mloc.rss_gb, spec);
+    if (met) *met = mloc;
+    (void)all;
+  }
+
+} // namespace solvers
+} // namespace methods
+
+#endif // COQUI_VERTEX_SIGMA_PAIR_ICC

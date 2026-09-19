@@ -300,12 +300,17 @@ namespace solvers {
     // vertex correction of W seen by Sigma only -- from the interp file's dPi (+ Pi_0) in the frozen secondary frame
     // and THIS iteration's W (update_w tail; t_pgrid / t_bsize = the (t, q, P, Q) layout of the loop's dPi).
     void build_sigma_lff(MBState &mb_state, THC_ERI auto &thc, std::array<long, 4> t_pgrid, std::array<long, 4> t_bsize);
+    // LFF-Sigma Route 2 (L-6): the pair-resolved static-ladder vertex self-energy, evaluated on the READOUT instance
+    // (frozen secondary frame; W-bar_0 of this update, the W-bar cache on demand) and published as mb_state.dSigma_pair_tskab
+    void build_sigma_pair(MBState &mb_state, THC_ERI auto &thc);
     // the interp file's column "Pi_<col>", q-matched to this mesh: (nw_half, nq, N_m, N_m), replicated (the read the
     // injection and the Sigma vertex share; every check of the W-int-4f consumer applies)
     nda::array<ComplexType, 4> read_pol_interp_column(std::string const &col, long nq_g, long nw_h_ft,
                                                       nda::array<long, 1> const &nu_half, THC_ERI auto &thc);
     // {the local vertex scalar tr(P dPi P)/tr(P Pi_0 P) at (q_1, nu_0), |dW~|_F/|dW|_F, eps_inv_head_sig(tau_0), eps_inv_head(tau_0)} of the last build
     std::array<double, 4> _sig_lff_meter{0.0, 0.0, 0.0, 0.0};
+    // {max |dSigma_pair|, anti-Hermitian residual, |K_s - K_s^dag|/|K_s|, wall s} of the last build_sigma_pair
+    std::array<double, 4> _sig_pair_meter{0.0, 0.0, 0.0, 0.0};
     // pol_vertex_sigma_bub = "full": the loop's RPA Pi folded to the frozen secondary frame at the PH-sym half nodes,
     // (nq, nw_half, N_m, N_m) replicated; stashed at the pure-RPA point of eval_Pi_qdep, consumed by build_sigma_lff
     template<nda::MemoryArrayOfRank<4> Array_t, typename communicator_t>
@@ -443,6 +448,8 @@ namespace solvers {
     vertex_t* pol_vertex_instance() { return _pol_vtx.get(); }
     // LFF-Sigma meters of the last build_sigma_lff (gate + logs)
     std::array<double, 4> sigma_lff_meter() const { return _sig_lff_meter; }
+    // LFF-Sigma pair (L-6) meters of the last build_sigma_pair (gate + logs)
+    std::array<double, 4> sigma_pair_meter() const { return _sig_pair_meter; }
 
   private:
 

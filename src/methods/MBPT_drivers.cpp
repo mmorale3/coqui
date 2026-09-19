@@ -271,7 +271,14 @@ inline void ensure_checkpoint(std::shared_ptr<mf::MF> mf, std::string const& out
  *                 an existing vertex input needs only pol_vertex = "ladder".
  *  - pol_vertex_sigma: "none" LFF-Sigma (Route 1): the local-field-factor vertex in the SELF-ENERGY, Sigma = G W~,
  *                 W~ = W Gamma_eff, Gamma_eff = Pi_0^-1 (Pi_0 + dPi) in the frozen secondary frame of pol_vertex_interp_file
- *                 (needs pol_vertex_isdf_points_file). Independent of pol_vertex_inject (the P side). {choices: "none", "lff"}
+ *                 (needs pol_vertex_isdf_points_file). Independent of pol_vertex_inject (the P side).
+ *                 "pair" (LFF-aux L-6, Route 2): the PAIR-RESOLVED static-ladder vertex in Sigma from the same pair-space
+ *                 machinery as the polarization ladder (the left vertex D^dag (1 + Cb T_s) on the right GW leg, contracted
+ *                 with W-bar(q, i nu) and G on the ladder's C window; nosym mesh). pol_vertex_sigma_pair_col ("static" =
+ *                 the resummed T_s ladder | "static1" = one static rung K_s -- with pol_vertex_sigma_pair_outer = "static"
+ *                 this is exactly the B-S Sigma^{C,x} diagram), pol_vertex_sigma_pair_outer ("dynamic" = W-bar(q, i nu) |
+ *                 "static" = W-bar_0), pol_vertex_sigma_scale, pol_vertex_sigma_pair_herm (true), pol_vertex_sigma_pair_diag
+ *                 (false: the nu-rank meter of the amplitude + a <prefix>.sigpair.h5 dump). {choices: "none", "lff", "pair"}
  *  - pol_vertex_sigma_bub: "window" Pi_0 of the vertex: the dump's window bubble ("Pi_bub") or the loop's RPA Pi folded
  *                 to the frame ("full"). pol_vertex_sigma_scale (1.0) multiplies the correction; pol_vertex_sigma_pinv_tol
  *                 (1e-3) = the relative eigenvalue cutoff of Pi_0^-1 (the vertex is restricted to the bubble's strong modes;
@@ -649,12 +656,19 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
         {   // LFF-Sigma (Route 1): the local-field-factor vertex in Sigma, a separate knob from pol_vertex_inject (P side)
           auto sig_mode = io::get_value_with_default<std::string>(pt,"pol_vertex_sigma","none"); io::tolower(sig_mode);
           auto sig_bub = io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_bub","window"); io::tolower(sig_bub);
-          vertex.set_sigma_lff(sig_mode, sig_bub,
+          vertex.set_sigma_lff(sig_mode == "pair" ? std::string("none") : sig_mode, sig_bub,
               io::get_value_with_default<double>(pt,"pol_vertex_sigma_scale",1.0),
               io::get_value_with_default<double>(pt,"pol_vertex_sigma_pinv_tol",1e-3),
               io::get_value_with_default<double>(pt,"pol_vertex_sigma_head_scale",1.0),
               io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_col",""),
               io::get_value_with_default<bool>(pt,"pol_vertex_sigma_static",true));
+          // LFF-aux L-6 (Route 2): pol_vertex_sigma = "pair" -- the pair-resolved static-ladder vertex in Sigma
+          vertex.set_sigma_pair(sig_mode == "pair",
+              io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_pair_col","static"),
+              io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_pair_outer","dynamic"),
+              io::get_value_with_default<double>(pt,"pol_vertex_sigma_scale",1.0),
+              io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_herm",true),
+              io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_diag",false));
         }
       }
     }
@@ -1051,12 +1065,19 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
         {   // LFF-Sigma (Route 1): the local-field-factor vertex in Sigma, a separate knob from pol_vertex_inject (P side)
           auto sig_mode = io::get_value_with_default<std::string>(pt,"pol_vertex_sigma","none"); io::tolower(sig_mode);
           auto sig_bub = io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_bub","window"); io::tolower(sig_bub);
-          pol_vertex_carrier.set_sigma_lff(sig_mode, sig_bub,
+          pol_vertex_carrier.set_sigma_lff(sig_mode == "pair" ? std::string("none") : sig_mode, sig_bub,
               io::get_value_with_default<double>(pt,"pol_vertex_sigma_scale",1.0),
               io::get_value_with_default<double>(pt,"pol_vertex_sigma_pinv_tol",1e-3),
               io::get_value_with_default<double>(pt,"pol_vertex_sigma_head_scale",1.0),
               io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_col",""),
               io::get_value_with_default<bool>(pt,"pol_vertex_sigma_static",true));
+          // LFF-aux L-6 (Route 2): pol_vertex_sigma = "pair" -- the pair-resolved static-ladder vertex in Sigma
+          pol_vertex_carrier.set_sigma_pair(sig_mode == "pair",
+              io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_pair_col","static"),
+              io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_pair_outer","dynamic"),
+              io::get_value_with_default<double>(pt,"pol_vertex_sigma_scale",1.0),
+              io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_herm",true),
+              io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_diag",false));
         }
       }
     }
@@ -1306,12 +1327,19 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
         {   // LFF-Sigma (Route 1): the local-field-factor vertex in Sigma, a separate knob from pol_vertex_inject (P side)
           auto sig_mode = io::get_value_with_default<std::string>(pt,"pol_vertex_sigma","none"); io::tolower(sig_mode);
           auto sig_bub = io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_bub","window"); io::tolower(sig_bub);
-          pol_vertex_carrier.set_sigma_lff(sig_mode, sig_bub,
+          pol_vertex_carrier.set_sigma_lff(sig_mode == "pair" ? std::string("none") : sig_mode, sig_bub,
               io::get_value_with_default<double>(pt,"pol_vertex_sigma_scale",1.0),
               io::get_value_with_default<double>(pt,"pol_vertex_sigma_pinv_tol",1e-3),
               io::get_value_with_default<double>(pt,"pol_vertex_sigma_head_scale",1.0),
               io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_col",""),
               io::get_value_with_default<bool>(pt,"pol_vertex_sigma_static",true));
+          // LFF-aux L-6 (Route 2): pol_vertex_sigma = "pair" -- the pair-resolved static-ladder vertex in Sigma
+          pol_vertex_carrier.set_sigma_pair(sig_mode == "pair",
+              io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_pair_col","static"),
+              io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_pair_outer","dynamic"),
+              io::get_value_with_default<double>(pt,"pol_vertex_sigma_scale",1.0),
+              io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_herm",true),
+              io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_diag",false));
         }
       }
     }
@@ -1607,12 +1635,19 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
         {   // LFF-Sigma (Route 1): the local-field-factor vertex in Sigma, a separate knob from pol_vertex_inject (P side)
           auto sig_mode = io::get_value_with_default<std::string>(pt,"pol_vertex_sigma","none"); io::tolower(sig_mode);
           auto sig_bub = io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_bub","window"); io::tolower(sig_bub);
-          vertex.set_sigma_lff(sig_mode, sig_bub,
+          vertex.set_sigma_lff(sig_mode == "pair" ? std::string("none") : sig_mode, sig_bub,
               io::get_value_with_default<double>(pt,"pol_vertex_sigma_scale",1.0),
               io::get_value_with_default<double>(pt,"pol_vertex_sigma_pinv_tol",1e-3),
               io::get_value_with_default<double>(pt,"pol_vertex_sigma_head_scale",1.0),
               io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_col",""),
               io::get_value_with_default<bool>(pt,"pol_vertex_sigma_static",true));
+          // LFF-aux L-6 (Route 2): pol_vertex_sigma = "pair" -- the pair-resolved static-ladder vertex in Sigma
+          vertex.set_sigma_pair(sig_mode == "pair",
+              io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_pair_col","static"),
+              io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_pair_outer","dynamic"),
+              io::get_value_with_default<double>(pt,"pol_vertex_sigma_scale",1.0),
+              io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_herm",true),
+              io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_diag",false));
         }
       }
     }
@@ -1934,12 +1969,19 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
         {   // LFF-Sigma (Route 1): the local-field-factor vertex in Sigma, a separate knob from pol_vertex_inject (P side)
           auto sig_mode = io::get_value_with_default<std::string>(pt,"pol_vertex_sigma","none"); io::tolower(sig_mode);
           auto sig_bub = io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_bub","window"); io::tolower(sig_bub);
-          pol_vertex_carrier.set_sigma_lff(sig_mode, sig_bub,
+          pol_vertex_carrier.set_sigma_lff(sig_mode == "pair" ? std::string("none") : sig_mode, sig_bub,
               io::get_value_with_default<double>(pt,"pol_vertex_sigma_scale",1.0),
               io::get_value_with_default<double>(pt,"pol_vertex_sigma_pinv_tol",1e-3),
               io::get_value_with_default<double>(pt,"pol_vertex_sigma_head_scale",1.0),
               io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_col",""),
               io::get_value_with_default<bool>(pt,"pol_vertex_sigma_static",true));
+          // LFF-aux L-6 (Route 2): pol_vertex_sigma = "pair" -- the pair-resolved static-ladder vertex in Sigma
+          pol_vertex_carrier.set_sigma_pair(sig_mode == "pair",
+              io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_pair_col","static"),
+              io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_pair_outer","dynamic"),
+              io::get_value_with_default<double>(pt,"pol_vertex_sigma_scale",1.0),
+              io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_herm",true),
+              io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_diag",false));
         }
       }
     }

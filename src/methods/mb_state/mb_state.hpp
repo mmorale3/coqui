@@ -124,6 +124,11 @@ public:
   // (a delta(tau): routed through the static self-energy F by gw_t::evaluate, not through tau); (nq, Np, Np) on the
   // HF exchange grid {1, np_P, np_Q}
   std::optional<dArray_t<nda::array<ComplexType, 3> > > dWsig_inf_qPQ;
+  // LFF-Sigma Route 2 (L-6): the pair-resolved static-ladder vertex self-energy on the ladder's C window,
+  // (nt, ns, nk, nc, nc) replicated, sigma_pair_window = {first band, size}. Built at the update_w tail on the readout
+  // instance, added to Sigma (the C block) and released by gw_t::evaluate.
+  std::optional<nda::array<ComplexType, 5> > dSigma_pair_tskab;
+  std::array<long, 2> sigma_pair_window{0, 0};
 
   /** Quasiparticle SCF specific */
   // Effective QP Hamiltonian in QP-SCF

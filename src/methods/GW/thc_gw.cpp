@@ -179,6 +179,43 @@ namespace methods {
                 dfmax, fmax, dfmax / std::max(fmax, 1e-300));
         mb_state.dWsig_inf_qPQ.reset();
       }
+      // LFF-Sigma Route 2 (L-6): the pair-resolved static-ladder vertex self-energy (scr_coulomb_t::build_sigma_pair,
+      // the C-window block in band labels, replicated) accumulated on top of Sigma^GW; released here.
+      _sigma_pair_dmax = 0.0; _sigma_pair_smax = 0.0;
+      if (mb_state.dSigma_pair_tskab.has_value()) {
+        auto &sSigma = mb_state.sSigma_tskij.value();
+        auto const &dS = mb_state.dSigma_pair_tskab.value();
+        const long b0 = mb_state.sigma_pair_window[0], nb = mb_state.sigma_pair_window[1];
+        auto S_loc = sSigma.local();
+        utils::check(S_loc.shape(0) == dS.shape(0) and S_loc.shape(1) == dS.shape(1) and S_loc.shape(2) == dS.shape(2) and
+                     dS.shape(3) == nb and dS.shape(4) == nb and b0 + nb <= S_loc.shape(3),
+                     "gw_t::evaluate: dSigma_pair_tskab ({}, {}, {}, {}, {}) does not fit Sigma ({}, {}, {}, {}, {}) at window [{}, {}).",
+                     dS.shape(0), dS.shape(1), dS.shape(2), dS.shape(3), dS.shape(4), S_loc.shape(0), S_loc.shape(1),
+                     S_loc.shape(2), S_loc.shape(3), S_loc.shape(4), b0, b0 + nb);
+        double dmax = 0.0, smax = 0.0;
+        {
+          const int node_rank = sSigma.node_comm()->rank(), node_size = sSigma.node_comm()->size();
+          const long nts = S_loc.shape(0), ns = S_loc.shape(1), nk = S_loc.shape(2);
+          sSigma.win().fence();
+          for (long it = node_rank; it < nts; it += node_size)
+            for (long is = 0; is < ns; ++is)
+              for (long ik = 0; ik < nk; ++ik)
+                for (long i = 0; i < nb; ++i)
+                  for (long j = 0; j < nb; ++j) {
+                    auto &sv = S_loc(it, is, ik, b0 + i, b0 + j);
+                    const auto dv = dS(it, is, ik, i, j);
+                    dmax = std::max(dmax, std::abs(dv)); smax = std::max(smax, std::abs(sv));
+                    sv += dv;
+                  }
+          sSigma.win().fence();
+        }
+        dmax = mb_state.mpi->comm.all_reduce_value(dmax, boost::mpi3::max<>{});
+        smax = mb_state.mpi->comm.all_reduce_value(smax, boost::mpi3::max<>{});
+        _sigma_pair_dmax = dmax; _sigma_pair_smax = smax;
+        app_log(1, "  [LFF-Sigma pair] vertex self-energy ADDED on the C block [{}, {}): max |dSigma(tau)| = {:.4e} vs max |Sigma^GW(tau)| = {:.4e} (ratio {:.3e})",
+                b0, b0 + nb, dmax, smax, dmax / std::max(smax, 1e-300));
+        mb_state.dSigma_pair_tskab.reset();
+      }
       _Timer.stop("TOTAL");
 
       print_thc_gw_timers();
