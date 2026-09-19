@@ -26,8 +26,8 @@
  * W-bar_0 alone ("outer static"). Externals i, j and the internal c, c' all in the C window (the B-S
  * "C-restricted externals" convention); the result is Hermitized in (i, j) and the residual metered.
  *
- * Every (s, q) unit is independent (all bosonic nodes of the unit are evaluated inside it: one D x D LU per
- * node for col "static"); units are round-robin over ranks and the (nt, ns, nk, nc, nc) result is all-reduced.
+ * Every (s, q) unit is independent (all bosonic nodes of the unit are evaluated inside it: one D x D LU + an Nm-column
+ * solve per node for col "static"); units are round-robin over ranks and the (nt, ns, nk, nc, nc) result is all-reduced.
  */
 
 namespace methods {
@@ -119,6 +119,9 @@ namespace solvers {
       if (met) { met->t_setup += watch.lap(); met->nu_spec = nda::array<double, 1>(nw_b); met->nu_spec() = 0.0; }
 
       nda::array<cplx, 2> Kbig(D, D), Ks(D, D), Dm(D, Nm), Dconj(D, Nm), Amp(D, Nm), CbD(D, Nm), CbA;
+      nda::matrix<cplx> Mlu(one_rung ? 0 : D, one_rung ? 0 : D);                     // the LU of 1 - Cb K_s
+      nda::matrix<cplx, nda::F_layout> Yf(one_rung ? 0 : D, one_rung ? 0 : Nm);      // getrs wants a Fortran-layout RHS
+      nda::array<int, 1> ipiv(one_rung ? 0 : D);
       nda::array<cplx, 4> Cb_all(nw_b, nk, nc2, nc2);
       nda::array<cplx, 2> Hall(nw_b, nk * nc2 * nc2), Ht(nt, nk * nc2 * nc2);
       nda::array<cplx, 2> Wq(Nm, Nm), Bk(nc2, Nm), Hk(nc2, nc2), Pchk;
@@ -159,26 +162,33 @@ namespace solvers {
         for (long l = 0; l < nw_b; ++l) {
           nda::array<cplx, 3> Cb_k(nk, nc2, nc2);
           Cb_k() = Cb_all(l, all, all, all);
-          db::static_resolvent S;
-          if (one_rung) {
-            S.D = D; S.nk = nk; S.nc = nc;
-            S.Cb = nda::array<cplx, 2>(D, D);
-            S.Cb() = cplx(0.0);
-            for (long k = 0; k < nk; ++k)
-              for (long r = 0; r < nc2; ++r)
-                for (long c = 0; c < nc2; ++c) S.Cb(k * nc2 + r, k * nc2 + c) = Cb_k(k, r, c);
-          } else {
-            S = db::build_static_resolvent_from(Cb_k, Ks);      // the D x D LU of (1 - Cb K_s)
-          }
-          if (met) met->t_lu += watch.lap();
-          // Cb D (block-diagonal Cb: nk gemms) and the dressed amplitude A = (T_s | K_s) . Cb D  (D x Nm)
+          // Cb D (block-diagonal Cb: nk gemms) and the dressed amplitude A = (T_s | K_s) . Cb D  (D x Nm):
+          //   T_s Cb D = K_s (1 - Cb K_s)^-1 Cb D  ->  ONE LU of M = 1 - Cb K_s and a solve with Nm right-hand sides
+          //   (not the inverse + a D x D gemm of build_static_resolvent: 4-5x cheaper at D = 4096; identical to rounding)
           for (long k = 0; k < nk; ++k) {
             auto Ck = Cb_k(k, all, all);
             auto Dk = Dm(nda::range(k * nc2, (k + 1) * nc2), all);
             auto Ok = CbD(nda::range(k * nc2, (k + 1) * nc2), all);
             nda::blas::gemm(Ck, Dk, Ok);
           }
-          nda::blas::gemm(one_rung ? Ks : S.Ts, CbD, Amp);
+          if (one_rung) {
+            nda::blas::gemm(Ks, CbD, Amp);
+          } else {
+            for (long k = 0; k < nk; ++k) {                       // M = 1 - Cb K_s (Cb block-diagonal: nk gemms)
+              auto Ck = Cb_k(k, all, all);
+              auto Kk = Ks(nda::range(k * nc2, (k + 1) * nc2), all);
+              auto Mk = Mlu(nda::range(k * nc2, (k + 1) * nc2), all);
+              nda::blas::gemm(cplx(-1.0), Ck, Kk, cplx(0.0), Mk);
+            }
+            for (long i = 0; i < D; ++i) Mlu(i, i) += cplx(1.0);
+            Yf() = CbD;
+            const int info_f = nda::lapack::getrf(Mlu, ipiv);
+            utils::check(info_f == 0, "vertex_sigma_pair: getrf of (1 - Cb K_s) failed (info {}) at node {}, q {}.", info_f, l, iq);
+            const int info_s = nda::lapack::getrs(Mlu, Yf, ipiv);
+            utils::check(info_s == 0, "vertex_sigma_pair: getrs failed (info {}).", info_s);
+            if (met) met->t_lu += watch.lap();
+            nda::blas::gemm(Ks, Yf, Amp);
+          }
           if (opt.Pi_check != nullptr) {
             // (spin/nk) D^dag (Cb A): the P side's static-ladder correction from these amplitudes
             for (long k = 0; k < nk; ++k) {
