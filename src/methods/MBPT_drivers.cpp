@@ -269,6 +269,16 @@ inline void ensure_checkpoint(std::shared_ptr<mf::MF> mf, std::string const& out
  *                 the ladder's C-window and secondary-basis knobs. Each key ABSENT
  *                 inherits the corresponding vertex_* value, so a ladder run on top of
  *                 an existing vertex input needs only pol_vertex = "ladder".
+ *  - pol_vertex_sigma: "none" LFF-Sigma (Route 1): the local-field-factor vertex in the SELF-ENERGY, Sigma = G W~,
+ *                 W~ = W Gamma_eff, Gamma_eff = Pi_0^-1 (Pi_0 + dPi) in the frozen secondary frame of pol_vertex_interp_file
+ *                 (needs pol_vertex_isdf_points_file). Independent of pol_vertex_inject (the P side). {choices: "none", "lff"}
+ *  - pol_vertex_sigma_bub: "window" Pi_0 of the vertex: the dump's window bubble ("Pi_bub") or the loop's RPA Pi folded
+ *                 to the frame ("full"). pol_vertex_sigma_scale (1.0) multiplies the correction; pol_vertex_sigma_pinv_tol
+ *                 (1e-3) = the relative eigenvalue cutoff of Pi_0^-1 (the vertex is restricted to the bubble's strong modes;
+ *                 unbounded below ~1e-4); pol_vertex_sigma_head_scale (1.0) scales the q -> 0
+ *                 head of the correction (0 = body only); pol_vertex_sigma_col ("") = the dPi column (default: the injected one);
+ *                 pol_vertex_sigma_static (true) = the instantaneous part (the vertex's nu -> inf limit times the bare
+ *                 Coulomb) through the static self-energy (false: dropped; it is never sent through tau).
  *  - pol_vertex_inject: "none" In-loop INJECTION of the ladder polarization (Project 2
  *                 increment Q3, notes/q3_bse_tier_spec.md; qpgw / evgw / gw solvers).
  *                 {choices: "none", "ladder_n2"}. "none" leaves the ladder a report-only
@@ -636,6 +646,16 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
         vertex.set_ladder_dyn_fit(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_fit_file",""),
                                  io::get_value_with_default<long>(pt,"pol_vertex_dyn_fit_rank",0));
         vertex.set_ladder_dyn_resum_mu_file(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_resum_mu_file",""));
+        {   // LFF-Sigma (Route 1): the local-field-factor vertex in Sigma, a separate knob from pol_vertex_inject (P side)
+          auto sig_mode = io::get_value_with_default<std::string>(pt,"pol_vertex_sigma","none"); io::tolower(sig_mode);
+          auto sig_bub = io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_bub","window"); io::tolower(sig_bub);
+          vertex.set_sigma_lff(sig_mode, sig_bub,
+              io::get_value_with_default<double>(pt,"pol_vertex_sigma_scale",1.0),
+              io::get_value_with_default<double>(pt,"pol_vertex_sigma_pinv_tol",1e-3),
+              io::get_value_with_default<double>(pt,"pol_vertex_sigma_head_scale",1.0),
+              io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_col",""),
+              io::get_value_with_default<bool>(pt,"pol_vertex_sigma_static",true));
+        }
       }
     }
     scr_eri.set_cvv_rspace_tol(cvv_rspace_tol);
@@ -1028,6 +1048,16 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
         pol_vertex_carrier.set_ladder_dyn_fit(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_fit_file",""),
                                  io::get_value_with_default<long>(pt,"pol_vertex_dyn_fit_rank",0));
         pol_vertex_carrier.set_ladder_dyn_resum_mu_file(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_resum_mu_file",""));
+        {   // LFF-Sigma (Route 1): the local-field-factor vertex in Sigma, a separate knob from pol_vertex_inject (P side)
+          auto sig_mode = io::get_value_with_default<std::string>(pt,"pol_vertex_sigma","none"); io::tolower(sig_mode);
+          auto sig_bub = io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_bub","window"); io::tolower(sig_bub);
+          pol_vertex_carrier.set_sigma_lff(sig_mode, sig_bub,
+              io::get_value_with_default<double>(pt,"pol_vertex_sigma_scale",1.0),
+              io::get_value_with_default<double>(pt,"pol_vertex_sigma_pinv_tol",1e-3),
+              io::get_value_with_default<double>(pt,"pol_vertex_sigma_head_scale",1.0),
+              io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_col",""),
+              io::get_value_with_default<bool>(pt,"pol_vertex_sigma_static",true));
+        }
       }
     }
     if (pol_vertex_carrier.pol_vertex_enabled()) scr_eri.set_vertex(&pol_vertex_carrier);
@@ -1273,6 +1303,16 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
         pol_vertex_carrier.set_ladder_dyn_fit(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_fit_file",""),
                                  io::get_value_with_default<long>(pt,"pol_vertex_dyn_fit_rank",0));
         pol_vertex_carrier.set_ladder_dyn_resum_mu_file(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_resum_mu_file",""));
+        {   // LFF-Sigma (Route 1): the local-field-factor vertex in Sigma, a separate knob from pol_vertex_inject (P side)
+          auto sig_mode = io::get_value_with_default<std::string>(pt,"pol_vertex_sigma","none"); io::tolower(sig_mode);
+          auto sig_bub = io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_bub","window"); io::tolower(sig_bub);
+          pol_vertex_carrier.set_sigma_lff(sig_mode, sig_bub,
+              io::get_value_with_default<double>(pt,"pol_vertex_sigma_scale",1.0),
+              io::get_value_with_default<double>(pt,"pol_vertex_sigma_pinv_tol",1e-3),
+              io::get_value_with_default<double>(pt,"pol_vertex_sigma_head_scale",1.0),
+              io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_col",""),
+              io::get_value_with_default<bool>(pt,"pol_vertex_sigma_static",true));
+        }
       }
     }
     if (pol_vertex_carrier.pol_vertex_enabled()) scr_eri.set_vertex(&pol_vertex_carrier);
@@ -1564,6 +1604,16 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
         vertex.set_ladder_dyn_fit(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_fit_file",""),
                                  io::get_value_with_default<long>(pt,"pol_vertex_dyn_fit_rank",0));
         vertex.set_ladder_dyn_resum_mu_file(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_resum_mu_file",""));
+        {   // LFF-Sigma (Route 1): the local-field-factor vertex in Sigma, a separate knob from pol_vertex_inject (P side)
+          auto sig_mode = io::get_value_with_default<std::string>(pt,"pol_vertex_sigma","none"); io::tolower(sig_mode);
+          auto sig_bub = io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_bub","window"); io::tolower(sig_bub);
+          vertex.set_sigma_lff(sig_mode, sig_bub,
+              io::get_value_with_default<double>(pt,"pol_vertex_sigma_scale",1.0),
+              io::get_value_with_default<double>(pt,"pol_vertex_sigma_pinv_tol",1e-3),
+              io::get_value_with_default<double>(pt,"pol_vertex_sigma_head_scale",1.0),
+              io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_col",""),
+              io::get_value_with_default<bool>(pt,"pol_vertex_sigma_static",true));
+        }
       }
     }
     scr_eri.set_cvv_rspace_tol(cvv_rspace_tol);
@@ -1881,6 +1931,16 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
         pol_vertex_carrier.set_ladder_dyn_fit(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_fit_file",""),
                                  io::get_value_with_default<long>(pt,"pol_vertex_dyn_fit_rank",0));
         pol_vertex_carrier.set_ladder_dyn_resum_mu_file(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_resum_mu_file",""));
+        {   // LFF-Sigma (Route 1): the local-field-factor vertex in Sigma, a separate knob from pol_vertex_inject (P side)
+          auto sig_mode = io::get_value_with_default<std::string>(pt,"pol_vertex_sigma","none"); io::tolower(sig_mode);
+          auto sig_bub = io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_bub","window"); io::tolower(sig_bub);
+          pol_vertex_carrier.set_sigma_lff(sig_mode, sig_bub,
+              io::get_value_with_default<double>(pt,"pol_vertex_sigma_scale",1.0),
+              io::get_value_with_default<double>(pt,"pol_vertex_sigma_pinv_tol",1e-3),
+              io::get_value_with_default<double>(pt,"pol_vertex_sigma_head_scale",1.0),
+              io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_col",""),
+              io::get_value_with_default<bool>(pt,"pol_vertex_sigma_static",true));
+        }
       }
     }
     if (pol_vertex_carrier.pol_vertex_enabled()) scr_eri.set_vertex(&pol_vertex_carrier);

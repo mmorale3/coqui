@@ -902,6 +902,18 @@ namespace solvers {
     std::vector<long> _dyn_all_nu_nodes;  // pol_vertex_dyn_all_nu_nodes: the sampled half nodes of the all-nu dump (empty = all)
     std::string _dyn_fit_file;            // pol_vertex_dyn_fit_file: a previous full all-nu dump = the learned nu-basis (LFF L-3)
     long _dyn_fit_rank = 0;               // pol_vertex_dyn_fit_rank: number of nu-modes (0 = the number of sampled nodes)
+    // LFF-Sigma (Route 1, notes/lff_aux_plan.md 2026-09-19): the local-field-factor vertex in the SELF-ENERGY,
+    // Sigma = G W~ with W~ = W Gamma_eff, Gamma_eff = Pi_0^-1 (Pi_0 + dPi) in the frozen secondary frame -- controlled
+    // SEPARATELY from the P-side injection (pol_vertex_inject). "none" (default) | "lff".
+    std::string _sigma_lff = "none";        // pol_vertex_sigma
+    std::string _sigma_lff_bub = "window";  // pol_vertex_sigma_bub: Pi_0 = the dump's window bubble ("window") | the loop's RPA Pi folded ("full")
+    double _sigma_lff_scale = 1.0;          // pol_vertex_sigma_scale: multiplies the correction (0 = bit-identical off)
+    double _sigma_lff_pinv_tol = 1e-3;      // pol_vertex_sigma_pinv_tol: relative eigenvalue cutoff of Pi_0^-1 -- the vertex lives on the
+                                            // bubble's strong modes (Si kp444: 49 of 156 carry 99.9 % of |tr B|; |Gamma_eff - 1| is bounded and
+                                            // stable for 1e-1..1e-3, blows up below 1e-4 where dPi / Pi_0 is unbounded)
+    double _sigma_lff_head_scale = 1.0;     // pol_vertex_sigma_head_scale: the q -> 0 head of the correction (0 = body only)
+    std::string _sigma_lff_col;             // pol_vertex_sigma_col: the dPi column ("" = pol_vertex_interp_col)
+    bool _sigma_lff_static = true;          // pol_vertex_sigma_static: include the instantaneous part (nu -> inf limit) via the static self-energy
     std::string _dyn_resum_mu_file;       // pol_vertex_dyn_resum_mu_file: mu(nu_j) per half node -> Pi_dyn = mu Pi_gam1 (LFF)
     bool _dyn_dense = true;      // pol_vertex_dyn_dense: the dense per-tau rung K_d(s) (nt/2 x D x D per unit)
     long _dyn_union_stride = 1;  // pol_vertex_dyn_union_stride: keep every n-th shifted G node of the union grid
@@ -1567,6 +1579,31 @@ namespace solvers {
     std::string const &ladder_dyn_resum_mu_file() const { return _dyn_resum_mu_file; }
     std::string const &ladder_dyn_fit_file() const { return _dyn_fit_file; }
     long ladder_dyn_fit_rank() const { return _dyn_fit_rank; }
+    /** LFF-Sigma (Route 1): Sigma = G W~, W~ = W Gamma_eff with the aux-frame (local-field-factor) vertex of the injected
+     *  dPi -- Del Sole / Reining / Godby's collapse of Hedin's G W Gamma for a vertex acting on the density index only.
+     *  Independent of pol_vertex_inject: the P side and the Sigma side of the vertex are separate input knobs. */
+    void set_sigma_lff(std::string const &mode, std::string const &bub, double scale, double pinv_tol, double head_scale,
+                       std::string const &col, bool with_static = true) {
+      utils::check(mode == "none" or mode == "lff",
+                   "vertex_t::set_sigma_lff: unknown pol_vertex_sigma \"{}\". Valid options are \"none\" (default), \"lff\".", mode);
+      utils::check(bub == "window" or bub == "full",
+                   "vertex_t::set_sigma_lff: unknown pol_vertex_sigma_bub \"{}\". Valid options are \"window\" (default), \"full\".", bub);
+      utils::check(pinv_tol >= 0.0 and pinv_tol < 1.0, "vertex_t::set_sigma_lff: pol_vertex_sigma_pinv_tol = {} must be in [0, 1).", pinv_tol);
+      _sigma_lff = mode; _sigma_lff_bub = bub; _sigma_lff_scale = scale; _sigma_lff_pinv_tol = pinv_tol;
+      _sigma_lff_head_scale = head_scale; _sigma_lff_col = col; _sigma_lff_static = with_static;
+      if (mode != "none")
+        app_log(1, "  [LFF-Sigma] pol_vertex_sigma = \"{}\": Sigma = G W~, W~ = W Gamma_eff (Gamma_eff = Pi_0^-1 (Pi_0 + dPi) in the frozen "
+                   "secondary frame; Pi_0 = \"{}\"; scale {}; pinv tol {:.1e}; head scale {}; column \"{}\"; instantaneous part {}).",
+                mode, bub, scale, pinv_tol, head_scale, col.empty() ? std::string("<pol_vertex_interp_col>") : col,
+                with_static ? "-> the static self-energy" : "DROPPED");
+    }
+    bool sigma_lff_enabled() const { return _sigma_lff != "none"; }
+    std::string const &sigma_lff_bub() const { return _sigma_lff_bub; }
+    double sigma_lff_scale() const { return _sigma_lff_scale; }
+    double sigma_lff_pinv_tol() const { return _sigma_lff_pinv_tol; }
+    double sigma_lff_head_scale() const { return _sigma_lff_head_scale; }
+    std::string const &sigma_lff_col() const { return _sigma_lff_col; }
+    bool sigma_lff_static() const { return _sigma_lff_static; }
 
     /**
      * scGW-tilde TIER 1.5 (notes/tier15_ward_legs_plan.md; proposal section 4.6): the LEG

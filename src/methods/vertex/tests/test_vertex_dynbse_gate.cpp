@@ -50,6 +50,8 @@
 #include "nda/h5.hpp"
 #include "nda/linalg/eigenelements.hpp"
 #include "methods/scr_coulomb/cvv_head.hpp"
+#include "methods/HF/thc_exchange_kernel.hpp"
+#include "utilities/proc_grid_partition.hpp"
 
 namespace bdft_tests {
 
@@ -552,7 +554,10 @@ namespace bdft_tests {
           n = std::max(n, std::abs(Pg.data()[i]));
         }
         app_log(1, "dynbse_readout W-int-4f INJ: cut_r1 = false vs true: max |d Pi_gam1| {:.2e} (max |Pi_gam1| {:.2e}); max |Pi_dyn1 - Pi_static| {:.2e}", dg, n, d1);
-        REQUIRE(dg == 0.0); REQUIRE(d1 == 0.0);
+        // the two dumps come from separate solves under DYNAMIC unit scheduling (a shared task counter): the (s, q, nu)
+        // -> rank assignment is timing-dependent, so the all_reduce order of the unit results can differ between runs
+        // (measured 2.5e-8 on 8e2 = 3e-11 relative, 2026-09-19); the identity holds to reduction-order noise.
+        REQUIRE(dg <= 1e-9 * n); REQUIRE(d1 == 0.0);
         mpi_context->comm.barrier();
         if (mpi_context->comm.root()) {
           remove("coqui_d3_winj_G2.mbpt.h5");
@@ -627,7 +632,8 @@ namespace bdft_tests {
         }
         app_log(1, "dynbse_readout LFF-aux H: sampled nodes {{0, 2}}: max |d Pi_gam1| at the sampled nodes {:.2e}, max |Pi_gam1| at the "
                    "unsampled nodes {:.2e} (max |Pi_gam1| {:.2e}); Pi_bub vs the full dump {:.2e}", ds_in, ds_out, ng, dbs);
-        REQUIRE(ds_in < 1e-12 * ng); REQUIRE(ds_out == 0.0); REQUIRE(dbs == 0.0);
+        // ds_in: two separate GMRES solves under dynamic unit scheduling -> reduction-order noise (1.2e-11 relative measured)
+        REQUIRE(ds_in < 1e-9 * ng); REQUIRE(ds_out == 0.0); REQUIRE(dbs == 0.0);
         {   // L-3: the on-demand fit. GF: nodes {0, 2, last} + fit_file = G's full dump (self-trained basis, 3 modes) -> the
             // written Pi_gam1 equals G's at the sampled nodes (least squares exact there) and approximates it elsewhere.
           const long nwh = PgG.shape(0);
@@ -680,6 +686,81 @@ namespace bdft_tests {
       app_log(1, "dynbse_readout W-int-4f INJ: Gamma_1 consumed in the W-Dyson: loop-side eps_M {:.10f} vs the dynamic readout's Gamma_1 column {:.10f} (|d| = {:.2e})",
               eld, edg[2], std::abs(eld - edg[2]));
       REQUIRE(std::abs(eld - edg[2]) < 1e-5);   // the nu -> tau -> nu round trip of the injection (1.6e-7 here; 3e-4 on Si kp888)
+      {   // LFF-Sigma (Route 1) gate, section L: the local-field-factor vertex in SIGMA from the same dump (col gam1 +
+          // Pi_bub), switched separately from the P-side injection. SP: the injection alone; S0: + the Sigma vertex at
+          // scale 0 (bit-identical to SP); S1: scale 1 (window bubble); Sh: scale 1/2 (the vertex self-energy is LINEAR in
+          // the scale); SF: the "full" bubble (a different, diluted vertex); SN: the Sigma side WITHOUT the P side.
+        double xk_diff = -1.0;
+        auto run_s = [&](std::string const &tag, std::string const &inject, std::string const &mode, std::string const &bub, double scale, bool with_static = true) {
+          const std::string out = "coqui_d3_winj_" + tag;
+          solvers::hf_t hf; solvers::gw_t gw(&ft, "ignore_g0", out);
+          solvers::scr_coulomb_t scr_eri(&ft, "rpa", "ignore_g0");
+          simple_dyson dyson(mfn.get(), &ft); MBState mb_state(mpi_context, ft, out);
+          iter_scf::iter_scf_t iter_sol("damping");
+          solvers::vertex_t vtx(&ft, "none", nda::range(0, 0), mfn->nbnd());
+          vtx.set_pol_vertex("ladder", "w0_prev", nda::range(0, 4), -1, 1e-8, -1.0, -1.0, -1.0, inject);
+          vtx.set_ladder_rung("static", 1e-8, 30, 12, -1.0);
+          vtx.set_ladder_dyn_gamma1_only(true); vtx.set_ladder_dyn_cut_r1(false);
+          vtx.set_isdf_points("coqui_d3_winj_G.secpts.h5", false); vtx.set_pol_interp("coqui_d3_winj_G.pol_wh_dyn.g1.h5", "gam1");
+          vtx.set_sigma_lff(mode, bub, scale, 1e-3, 1.0, "", with_static);   // the strong-mode cutoff (1e-8 admits the bubble's null directions: |Gamma - 1| ~ 1e4)
+          scr_eri.set_vertex(&vtx);
+          auto [e_hf, e_corr] = scf_loop(mb_state, dyson, erin, ft, solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol, 1, false, 1e-9, true);
+          auto [dmax, smax, dfmax] = gw.sigma_lff_dsigma(); auto m = scr_eri.sigma_lff_meter();
+          if (tag == "SD") {   // the exchange contraction with a custom kernel, driven with the bare Z, must reproduce hf_t's exchange
+            auto &Dm = mb_state.sDm_skij.value();
+            auto shp = Dm.shape();
+            auto sF1 = math::shm::make_shared_array<nda::array_view<ComplexType, 4>>(*mpi_context, shp);
+            auto sF2 = math::shm::make_shared_array<nda::array_view<ComplexType, 4>>(*mpi_context, shp);
+            hf.evaluate(sF1, Dm.local(), thcn, dyson.sS_skij().local(), false, true);
+            const long np = mpi_context->comm.size();
+            const long npP = utils::find_proc_grid_min_diff(np, 1, 1), npQ = np / npP;
+            auto dU = thcn.dZ({1, npP, npQ});
+            solvers::lff_sigma_detail::exchange_with_kernel(Dm.local(), dU, sF2, thcn);
+            hf.HF_K_correction(sF2, Dm.local(), dyson.sS_skij().local(), mfn->madelung());
+            double d = 0.0, n = 0.0;
+            if (mpi_context->node_comm.root()) {
+              auto a = sF1.local(); auto b = sF2.local();
+              for (long i = 0; i < a.size(); ++i) { d = std::max(d, std::abs(a.data()[i] - b.data()[i])); n = std::max(n, std::abs(a.data()[i])); }
+            }
+            d = mpi_context->comm.all_reduce_value(d, boost::mpi3::max<>{}); n = mpi_context->comm.all_reduce_value(n, boost::mpi3::max<>{});
+            xk_diff = d;
+            app_log(1, "dynbse_readout LFF-Sigma exchange-kernel identity: max |F_x(hf_t) - F_x(exchange_with_kernel(Z) + head)| = {:.3e} (max |F_x| = {:.3e})", d, n);
+          }
+          app_log(1, "dynbse_readout LFF-Sigma [{}]: inject {} sigma {} ({}, scale {}, static {}): e_hf {:.12f} e_corr {:.12f}, max|dSigma_dyn| {:.6e} (max|Sigma| {:.4e}), "
+                     "max|dF| {:.6e}, local vertex(q_1, nu_0) {:+.4f}, |dW~_dyn|_F/|dW|_F {:.3e}, heads at nu_0: correction {:+.5f} vs loop {:+.5f}",
+                  tag, inject, mode, bub, scale, with_static, e_hf, e_corr, dmax, smax, dfmax, m[0], m[1], m[2], m[3]);
+          mpi_context->comm.barrier();
+          if (mpi_context->comm.root()) {
+            remove((out + ".mbpt.h5").c_str());
+            for (auto const &e : std::filesystem::directory_iterator("."))
+              if (e.path().filename().string().rfind(out + ".", 0) == 0) std::filesystem::remove(e.path());
+          }
+          mpi_context->comm.barrier();
+          return std::make_tuple(e_corr, dmax, m, dfmax);
+        };
+        auto [cp, dp, mp, fp] = run_s("SP", "ladder_n2", "none", "window", 1.0);
+        auto [c0, d0, m0, f0] = run_s("S0", "ladder_n2", "lff", "window", 0.0);
+        auto [c1, d1, m1, f1] = run_s("S1", "ladder_n2", "lff", "window", 1.0);
+        auto [ch, dh, mh, fh] = run_s("Sh", "ladder_n2", "lff", "window", 0.5);
+        auto [cf, df, mf_, ff] = run_s("SF", "ladder_n2", "lff", "full", 1.0);
+        auto [cn, dn, mn, fn] = run_s("SN", "none", "lff", "window", 1.0);
+        auto [cd, dd, md, fd] = run_s("SD", "ladder_n2", "lff", "window", 1.0, false);   // the instantaneous part dropped
+        app_log(1, "dynbse_readout LFF-Sigma gate: |e_corr(S0) - e_corr(SP)| {:.2e} (dSigma(S0) {:.2e}, dF(S0) {:.2e}); scale 1: d e_corr {:+.6e}, max|dSigma_dyn| {:.4e}, max|dF| {:.4e}; "
+                   "linearity |dSigma(1/2) - dSigma(1)/2| {:.2e}, |dF(1/2) - dF(1)/2| {:.2e}; full bubble: d e_corr {:+.6e}, max|dSigma_dyn| {:.4e}; Sigma side alone: d e_corr {:+.6e}; "
+                   "static dropped: max|dSigma_dyn| {:.4e} (== S1's), max|dF| {:.2e}; vertex(q_1, nu_0) {:+.4f}, head correction at nu_0 {:+.5f} (loop {:+.5f})",
+                std::abs(c0 - cp), d0, f0, c1 - cp, d1, f1, std::abs(dh - 0.5 * d1), std::abs(fh - 0.5 * f1), cf - cp, df, cn - cp, dd, fd, m1[0], m1[2], m1[3]);
+        REQUIRE(c0 == cp);                                   // scale 0: bit-identical to the injection alone
+        REQUIRE(d0 == 0.0); REQUIRE(f0 == 0.0);
+        REQUIRE(d1 > 0.0); REQUIRE(f1 > 0.0); REQUIRE(m1[1] > 0.0);
+        REQUIRE(std::abs(dh - 0.5 * d1) <= 1e-12 * d1);     // the dynamic vertex self-energy is linear in the scale
+        REQUIRE(std::abs(fh - 0.5 * f1) <= 1e-12 * f1);     // so is the instantaneous part
+        REQUIRE(std::abs(c1 - cp) > 1e-10);                  // it changes the correlation energy
+        REQUIRE(df > 0.0); REQUIRE(std::abs(df - d1) > 1e-10 * d1);   // the full bubble is a different (diluted) vertex
+        REQUIRE(fd == 0.0); REQUIRE(dd == d1);               // dropping the instantaneous part leaves the dynamic one untouched
+        REQUIRE(m1[0] > 0.0);                                // the LiH toy's ladder raises eps_M: the local vertex is positive at nu = 0
+        REQUIRE(xk_diff >= 0.0); REQUIRE(xk_diff < 1e-10);   // exchange_with_kernel(Z) == the code's own exchange (K term + head correction)
+        REQUIRE(dn > 0.0);                                   // the Sigma side runs without the P side
+      }
       mpi_context->comm.barrier();
       if (mpi_context->comm.root()) {
         remove("coqui_d3_winj_G.mbpt.h5");

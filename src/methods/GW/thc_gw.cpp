@@ -41,6 +41,7 @@
 #include "methods/vertex/vertex_t.h"
 #include "methods/GW/gw_t.h"
 #include "methods/GW/thc_gw.icc"
+#include "methods/HF/thc_exchange_kernel.hpp"
 
 namespace methods {
   namespace solvers {
@@ -105,6 +106,79 @@ namespace methods {
       // disabled path is bit-identical to plain scGW.
       if (_vertex != nullptr and _vertex->active())
         _vertex->eval_Sigma_C(mb_state, thc);
+
+      // LFF-Sigma (Route 1, notes/lff_aux_plan.md 2026-09-19): the local-field-factor vertex in Sigma. The SAME GW
+      // contraction, driven with the vertex correction of W that scr_coulomb_t::build_sigma_lff published
+      // (dW~ = scale x Herm[W (Gamma_eff - 1)], body + its extrapolated head), accumulated on top of Sigma^GW (+ Sigma^C).
+      // Computed into its own buffer so Sigma^GW's contraction is untouched; the correction is released here.
+      if (mb_state.dWsig_qtPQ.has_value()) {
+        utils::check(mb_state.eps_inv_head_sig.has_value(), "gw_t::evaluate: dWsig_qtPQ without eps_inv_head_sig.");
+        auto &sSigma = mb_state.sSigma_tskij.value();
+        auto sDS = math::shm::make_shared_array<nda::array_view<ComplexType, 5>>(*mb_state.mpi, sSigma.shape());
+        sDS.set_zero();
+        thc_gw_Xqindep(mb_state.sG_tskij.value().local(), sDS, thc, mb_state.dWsig_qtPQ.value(), mb_state.eps_inv_head_sig.value());
+        double dmax = 0.0, smax = 0.0;
+        {
+          auto S_loc = sSigma.local();
+          auto D_loc = sDS.local();
+          const int node_rank = sSigma.node_comm()->rank(), node_size = sSigma.node_comm()->size();
+          const long nts = S_loc.shape(0);
+          const long chunk = long(S_loc.size() / std::max(nts, 1l));
+          sSigma.win().fence();
+          for (long it = node_rank; it < nts; it += node_size) {
+            auto s_t = S_loc(it, nda::ellipsis{});
+            auto d_t = D_loc(it, nda::ellipsis{});
+            for (long n = 0; n < chunk; ++n) {
+              const double ad = std::abs(d_t.data()[n]), as = std::abs(s_t.data()[n]);
+              dmax = std::max(dmax, ad); smax = std::max(smax, as);
+              s_t.data()[n] += d_t.data()[n];
+            }
+          }
+          sSigma.win().fence();
+        }
+        dmax = mb_state.mpi->comm.all_reduce_value(dmax, boost::mpi3::max<>{});
+        smax = mb_state.mpi->comm.all_reduce_value(smax, boost::mpi3::max<>{});
+        _sigma_lff_dmax = dmax; _sigma_lff_smax = smax;
+        app_log(1, "  [LFF-Sigma] vertex self-energy ADDED: max |dSigma(tau)| = {:.4e} vs max |Sigma^GW(tau)| = {:.4e} (ratio {:.3e}); "
+                   "eps_inv_head_sig(tau_0) = {:.4e}", dmax, smax, dmax / std::max(smax, 1e-300), mb_state.eps_inv_head_sig.value()(0).real());
+        mb_state.dWsig_qtPQ.reset();
+        mb_state.eps_inv_head_sig.reset();
+      }
+      // LFF-Sigma: the INSTANTANEOUS part of the vertex correction (the vertex's nu -> inf limit times the bare Coulomb)
+      // is a static exchange-like self-energy: the THC exchange contraction with that kernel, added to F (the Dyson reads
+      // F + Sigma(tau) after this call; e_hf then carries it). Body only: the q -> 0 head of the static piece is NOT
+      // included (the exchange head correction is madelung x the vertex's tail, a rigid shift of the window; flagged).
+      _sigma_lff_dfmax = 0.0;
+      if (mb_state.dWsig_inf_qPQ.has_value()) {
+        utils::check(mb_state.sDm_skij.has_value() and mb_state.sF_skij.has_value(), "gw_t::evaluate: the static LFF-Sigma piece needs Dm and F.");
+        auto &sF = mb_state.sF_skij.value();
+        auto sDF = math::shm::make_shared_array<nda::array_view<ComplexType, 4>>(*mb_state.mpi, sF.shape());
+        lff_sigma_detail::exchange_with_kernel(mb_state.sDm_skij.value().local(), mb_state.dWsig_inf_qPQ.value(), sDF, thc);
+        double dfmax = 0.0, fmax = 0.0;
+        {
+          auto F_loc = sF.local();
+          auto D_loc = sDF.local();
+          const int node_rank = sF.node_comm()->rank(), node_size = sF.node_comm()->size();
+          const long nsk = F_loc.shape(0) * F_loc.shape(1);
+          const long chunk = long(F_loc.size() / std::max(nsk, 1l));
+          sF.win().fence();
+          for (long isk = node_rank; isk < nsk; isk += node_size) {
+            auto f = F_loc(isk / F_loc.shape(1), isk % F_loc.shape(1), nda::ellipsis{});
+            auto d = D_loc(isk / F_loc.shape(1), isk % F_loc.shape(1), nda::ellipsis{});
+            for (long n = 0; n < chunk; ++n) {
+              dfmax = std::max(dfmax, std::abs(d.data()[n])); fmax = std::max(fmax, std::abs(f.data()[n]));
+              f.data()[n] += d.data()[n];
+            }
+          }
+          sF.win().fence();
+        }
+        dfmax = mb_state.mpi->comm.all_reduce_value(dfmax, boost::mpi3::max<>{});
+        fmax = mb_state.mpi->comm.all_reduce_value(fmax, boost::mpi3::max<>{});
+        _sigma_lff_dfmax = dfmax;
+        app_log(1, "  [LFF-Sigma] instantaneous part ADDED to the static self-energy: max |dF| = {:.4e} vs max |F| = {:.4e} (ratio {:.3e})",
+                dfmax, fmax, dfmax / std::max(fmax, 1e-300));
+        mb_state.dWsig_inf_qPQ.reset();
+      }
       _Timer.stop("TOTAL");
 
       print_thc_gw_timers();

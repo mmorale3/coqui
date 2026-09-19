@@ -296,6 +296,21 @@ namespace solvers {
     // Np^2-per-q replicated: readout-scale only (documented memory note).
     template<nda::MemoryArrayOfRank<4> Array_t, typename communicator_t>
     nda::array<ComplexType, 3> gather_nu0_row(memory::darray_t<Array_t, communicator_t> &dPi_tqPQ);
+    // LFF-Sigma (Route 1, notes/lff_aux_plan.md 2026-09-19): build mb_state.dWsig_qtPQ / eps_inv_head_sig -- the
+    // vertex correction of W seen by Sigma only -- from the interp file's dPi (+ Pi_0) in the frozen secondary frame
+    // and THIS iteration's W (update_w tail; t_pgrid / t_bsize = the (t, q, P, Q) layout of the loop's dPi).
+    void build_sigma_lff(MBState &mb_state, THC_ERI auto &thc, std::array<long, 4> t_pgrid, std::array<long, 4> t_bsize);
+    // the interp file's column "Pi_<col>", q-matched to this mesh: (nw_half, nq, N_m, N_m), replicated (the read the
+    // injection and the Sigma vertex share; every check of the W-int-4f consumer applies)
+    nda::array<ComplexType, 4> read_pol_interp_column(std::string const &col, long nq_g, long nw_h_ft,
+                                                      nda::array<long, 1> const &nu_half, THC_ERI auto &thc);
+    // {the local vertex scalar tr(P dPi P)/tr(P Pi_0 P) at (q_1, nu_0), |dW~|_F/|dW|_F, eps_inv_head_sig(tau_0), eps_inv_head(tau_0)} of the last build
+    std::array<double, 4> _sig_lff_meter{0.0, 0.0, 0.0, 0.0};
+    // pol_vertex_sigma_bub = "full": the loop's RPA Pi folded to the frozen secondary frame at the PH-sym half nodes,
+    // (nq, nw_half, N_m, N_m) replicated; stashed at the pure-RPA point of eval_Pi_qdep, consumed by build_sigma_lff
+    template<nda::MemoryArrayOfRank<4> Array_t, typename communicator_t>
+    void fold_rpa_pi_secondary(memory::darray_t<Array_t, communicator_t> &dPi_tqPQ, THC_ERI auto &thc);
+    std::optional<nda::array<ComplexType, 4>> _sig_pi0_qwmm;
     // eps(q_i, i nu) cuts (2026-09-11, pol_eps_cut > 0): the selected IBZ transfers (q_min plus
     // evenly spaced |q| ranks, chosen once) and -- on RANK 0 ONLY -- the RPA Pi rows
     // (n_sel, nw_half, Np, Np) on every PH-sym bosonic half node, gathered at the same point
@@ -426,6 +441,8 @@ namespace solvers {
     // re-run the anchor identity on the very state the loop used. nullptr before the
     // first update_w with an active pol vertex.
     vertex_t* pol_vertex_instance() { return _pol_vtx.get(); }
+    // LFF-Sigma meters of the last build_sigma_lff (gate + logs)
+    std::array<double, 4> sigma_lff_meter() const { return _sig_lff_meter; }
 
   private:
 

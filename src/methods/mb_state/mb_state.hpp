@@ -115,6 +115,15 @@ public:
   std::string screen_type = "";
   // Head (G=G'=0) of the inverse dielectric function in the long wavelength limit (q->0 and w->0)
   std::optional<nda::array<ComplexType, 1> > eps_inv_head;
+  // LFF-Sigma (Route 1): the vertex correction of the screened interaction seen by Sigma ONLY --
+  // dW~ = scale x Herm[W (Gamma_eff - 1)] in the dW_qtPQ layout, and the q -> 0 head of that correction
+  // (the eps_inv_head convention). Built at the update_w tail, consumed and released by gw_t::evaluate.
+  std::optional<dArray_t<nda::array<ComplexType, 4> > > dWsig_qtPQ;
+  std::optional<nda::array<ComplexType, 1> > eps_inv_head_sig;
+  // LFF-Sigma: the INSTANTANEOUS part of the vertex correction, dW~(i nu -> inf) = Herm[Z t^dag G1(inf) t] per q
+  // (a delta(tau): routed through the static self-energy F by gw_t::evaluate, not through tau); (nq, Np, Np) on the
+  // HF exchange grid {1, np_P, np_Q}
+  std::optional<dArray_t<nda::array<ComplexType, 3> > > dWsig_inf_qPQ;
 
   /** Quasiparticle SCF specific */
   // Effective QP Hamiltonian in QP-SCF

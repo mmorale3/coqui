@@ -29,6 +29,8 @@
 #include "methods/HF/thc_solver_comm.hpp"
 #include "methods/GW/g0_div_utils.hpp"
 #include "methods/vertex/vertex_t.h"
+#include "methods/vertex/vertex_secondary_fold.hpp"
+#include "utilities/proc_grid_partition.hpp"
 #include "nda/linalg/eigenelements.hpp"
 #include "hamiltonian/one_body_hamiltonian.hpp"   // scGW-tilde C4: H0 for the CVV velocity
 #include "hamiltonian/pseudo/pseudopot.h"
@@ -378,6 +380,10 @@ namespace solvers {
     if (_vertex != nullptr and _vertex->active() and _vertex->rung() == dynamic_rung
         and _vertex->secondary() and _vertex->w_cache_enabled())
       _vertex->cache_w(mb_state, thc);
+
+    // LFF-Sigma (Route 1): the vertex correction of W for Sigma ONLY, from THIS iteration's W -- after every other
+    // consumer of dW (the kernel cache above included), so W, W-bar and the readout are exactly those without the knob.
+    if (_vertex != nullptr and _vertex->sigma_lff_enabled()) build_sigma_lff(mb_state, thc, t_pgrid, t_bsize);
 
     print_timers();
   }
@@ -934,47 +940,10 @@ namespace solvers {
                    "inject_pol_ladder: pol_vertex_interp_file needs pol_vertex_isdf_points_file (the file's secondary "
                    "frame is the coarse run's point set).");
       const std::string col = "Pi_" + _pol_vtx->pol_interp_col();
-      nda::array<double, 2> qf;
-      nda::array<ComplexType, 4> Pf;
-      nda::array<long, 1> nu_f;
-      double beta_f = -1.0;
-      {
-        h5::file f(_pol_vtx->pol_interp_file(), 'r');
-        h5::group g(f);
-        utils::check(g.has_dataset("nu_half"),
-                     "inject_pol_ladder: {} carries no nu_half axis -- an inu = 0-only dump cannot feed the W-Dyson "
-                     "(dump the coarse run's whalf / all-nu columns).", _pol_vtx->pol_interp_file());
-        nda::h5_read(g, "q", qf);
-        nda::h5_read(g, col, Pf);
-        nda::h5_read(g, "nu_half", nu_f);
-        if (g.has_dataset("beta")) h5::h5_read(g, "beta", beta_f);
-      }
-      utils::check(long(nu_f.size()) == nw_h_ft, "inject_pol_ladder: {} has {} half nodes, this run's IAFT has {} -- the "
-                   "coarse and fine runs must share beta / basis / precision.", _pol_vtx->pol_interp_file(), nu_f.size(), nw_h_ft);
-      for (long j = 0; j < nw_h_ft; ++j)
-        utils::check(nu_f(j) == nu_half(j), "inject_pol_ladder: half node {} is Matsubara index {} in the file, {} here.",
-                     j, nu_f(j), nu_half(j));
-      if (beta_f > 0.0) utils::check(std::abs(beta_f - _ft->beta()) < 1e-8, "inject_pol_ladder: beta {} (file) != {} (run).", beta_f, _ft->beta());
-      const long Nm_v = _pol_vtx->secondary_rank();
-      utils::check(Pf.shape(0) == nw_h_ft and Pf.shape(2) == Nm_v and Pf.shape(3) == Nm_v and Pf.shape(1) == qf.shape(0),
-                   "inject_pol_ladder: {} in {} is {} x {} x {} x {}, expected {} x nq x {} x {}.", col, _pol_vtx->pol_interp_file(),
-                   Pf.shape(0), Pf.shape(1), Pf.shape(2), Pf.shape(3), nw_h_ft, Nm_v, Nm_v);
-      Pl = nda::array<ComplexType, 4>(nw_h_ft, nq_g, Nm_v, Nm_v);
-      for (long iq = 0; iq < nq_g; ++iq) {
-        double qc[3]; q_crys(iq, qc);
-        long hit = -1;
-        for (long jq = 0; jq < qf.shape(0) and hit < 0; ++jq) {
-          bool same = true;
-          for (long i = 0; i < 3 and same; ++i) { const double d = qf(jq, i) - qc[i]; same = std::abs(d - std::round(d)) < 1e-5; }
-          if (same) hit = jq;
-        }
-        utils::check(hit >= 0, "inject_pol_ladder: q = ({:.6f}, {:.6f}, {:.6f}) (crystal) of this mesh is absent from {}.",
-                     qc[0], qc[1], qc[2], _pol_vtx->pol_interp_file());
-        Pl(all, iq, all, all) = Pf(all, hit, all, all);
-      }
+      Pl = read_pol_interp_column(_pol_vtx->pol_interp_col(), nq_g, nw_h_ft, nu_half, thc);   // the shared W-int-4f read
       lam = nda::array<double, 1>(nw_h_ft); lam() = 0.0;
       app_log(1, "  [W-int-4f] W-Dyson injection consumes {} from {} ({} half nodes x {} q matched; frozen points, N_m = {}).",
-              col, _pol_vtx->pol_interp_file(), nw_h_ft, nq_g, Nm_v);
+              col, _pol_vtx->pol_interp_file(), nw_h_ft, nq_g, _pol_vtx->secondary_rank());
     } else {
       Pl = _pol_vtx->eval_pol_ladder_whalf(mb_state, thc, &lam, ward_legs ? std::addressof(Pd) : nullptr);
     }
@@ -2241,6 +2210,8 @@ namespace solvers {
       ensure_pol_vertex(thc);
       _pol_vtx->build_w0(mb_state, thc, dPi_rpa);   // build_w0 only READS dPi
       _pol_pi0_qPQ = gather_nu0_row(dPi_rpa);       // the readout's RPA baseline
+      // LFF-Sigma, pol_vertex_sigma_bub = "full": the vertex's Pi_0 = THIS RPA Pi folded to the frozen frame
+      if (_vertex->sigma_lff_enabled() and _vertex->sigma_lff_bub() == "full") fold_rpa_pi_secondary(dPi_rpa, thc);
       if (_vertex->eps_cut_nq() > 0) gather_cut_rows(thc, dPi_rpa);   // eps(q_i, i nu) cuts (report-only)
     };
     auto inject_pol_tier = [&](auto &dPi) {
@@ -2517,7 +2488,439 @@ namespace solvers {
   using Arrv = nda::array_view<ComplexType, 5>;
   using Arrv2 = nda::array_view<ComplexType, 5, nda::C_layout>;
 
+  // W-int-4f / LFF-Sigma: the interp file's column "Pi_<col>" on this mesh's q list at the PH-sym half nodes, in the
+  // frozen-point secondary frame -- ONE read shared by the W-Dyson injection (inject_pol_ladder) and the Sigma vertex
+  // (build_sigma_lff); every consistency check of the consumer (node list, beta, N_m, q matching) lives here.
+  nda::array<ComplexType, 4> scr_coulomb_t::read_pol_interp_column(std::string const &colname, long nq_g, long nw_h_ft,
+                                                                    nda::array<long, 1> const &nu_half, THC_ERI auto &thc) {
+    decltype(nda::range::all) all;
+    utils::check(_pol_vtx != nullptr and not _pol_vtx->pol_interp_file().empty(),
+                 "read_pol_interp_column: no pol_vertex_interp_file.");
+    auto MF = thc.MF();
+    auto lat = MF->lattv();
+    auto Q = MF->Qpts();
+    auto q_crys = [&](long iq, double *qc) {
+      for (long i = 0; i < 3; ++i) { double v = 0.0; for (long j = 0; j < 3; ++j) v += lat(i, j) * Q(iq, j); qc[i] = v / (2.0 * M_PI); }
+    };
+    const std::string col = "Pi_" + colname;
+    nda::array<double, 2> qf;
+    nda::array<ComplexType, 4> Pf;
+    nda::array<long, 1> nu_f;
+    double beta_f = -1.0;
+    {
+      h5::file f(_pol_vtx->pol_interp_file(), 'r');
+      h5::group g(f);
+      utils::check(g.has_dataset("nu_half"),
+                   "inject_pol_ladder: {} carries no nu_half axis -- an inu = 0-only dump cannot feed the W-Dyson "
+                   "(dump the coarse run's whalf / all-nu columns).", _pol_vtx->pol_interp_file());
+      nda::h5_read(g, "q", qf);
+      nda::h5_read(g, col, Pf);
+      nda::h5_read(g, "nu_half", nu_f);
+      if (g.has_dataset("beta")) h5::h5_read(g, "beta", beta_f);
+    }
+    utils::check(long(nu_f.size()) == nw_h_ft, "inject_pol_ladder: {} has {} half nodes, this run's IAFT has {} -- the "
+                 "coarse and fine runs must share beta / basis / precision.", _pol_vtx->pol_interp_file(), nu_f.size(), nw_h_ft);
+    for (long j = 0; j < nw_h_ft; ++j)
+      utils::check(nu_f(j) == nu_half(j), "inject_pol_ladder: half node {} is Matsubara index {} in the file, {} here.",
+                   j, nu_f(j), nu_half(j));
+    if (beta_f > 0.0) utils::check(std::abs(beta_f - _ft->beta()) < 1e-8, "inject_pol_ladder: beta {} (file) != {} (run).", beta_f, _ft->beta());
+    const long Nm_v = _pol_vtx->secondary_rank();
+    utils::check(Pf.shape(0) == nw_h_ft and Pf.shape(2) == Nm_v and Pf.shape(3) == Nm_v and Pf.shape(1) == qf.shape(0),
+                 "inject_pol_ladder: {} in {} is {} x {} x {} x {}, expected {} x nq x {} x {}.", col, _pol_vtx->pol_interp_file(),
+                 Pf.shape(0), Pf.shape(1), Pf.shape(2), Pf.shape(3), nw_h_ft, Nm_v, Nm_v);
+    nda::array<ComplexType, 4> Pl(nw_h_ft, nq_g, Nm_v, Nm_v);
+    for (long iq = 0; iq < nq_g; ++iq) {
+      double qc[3]; q_crys(iq, qc);
+      long hit = -1;
+      for (long jq = 0; jq < qf.shape(0) and hit < 0; ++jq) {
+        bool same = true;
+        for (long i = 0; i < 3 and same; ++i) { const double d = qf(jq, i) - qc[i]; same = std::abs(d - std::round(d)) < 1e-5; }
+        if (same) hit = jq;
+      }
+      utils::check(hit >= 0, "inject_pol_ladder: q = ({:.6f}, {:.6f}, {:.6f}) (crystal) of this mesh is absent from {}.",
+                   qc[0], qc[1], qc[2], _pol_vtx->pol_interp_file());
+      Pl(all, iq, all, all) = Pf(all, hit, all, all);
+    }
+    return Pl;
+  }
+
+  namespace sigma_lff_detail {
+    // the PH mirror of the bosonic mesh (wn(mirror(l)) = -wn(l)), the map fold_dW_distributed unfolds the half mesh with
+    inline nda::array<long, 1> bosonic_mirror(const imag_axes_ft::IAFT &ft) {
+      const long nw_b = ft.nw_b();
+      auto wb = ft.wn_mesh_b();
+      nda::array<long, 1> mirror(nw_b);
+      for (long l = 0; l < nw_b; ++l) {
+        mirror(l) = -1;
+        for (long m = 0; m < nw_b; ++m) if (wb(m) == -wb(l)) { mirror(l) = m; break; }
+        utils::check(mirror(l) >= 0, "sigma_lff: the bosonic Matsubara mesh is not PH-symmetric (no mirror of node {}).", l);
+      }
+      return mirror;
+    }
+  }
+
+  // LFF-Sigma, pol_vertex_sigma_bub = "full": fold the loop's RPA Pi(tau) (the (t, q, P, Q) darray of eval_Pi_qdep,
+  // BEFORE any injection) to the frozen secondary frame at the PH-sym half nodes, with the same distributed fold the
+  // dynamic W-bar cache uses (a (q, t, P, Q) copy first: that routine's layout). Replicated (nq, nw_half, N_m, N_m).
+  template<nda::MemoryArrayOfRank<4> Array_t, typename communicator_t>
+  void scr_coulomb_t::fold_rpa_pi_secondary(memory::darray_t<Array_t, communicator_t> &dPi_tqPQ, THC_ERI auto &thc) {
+    decltype(nda::range::all) all;
+    using math::nda::make_distributed_array;
+    auto mpi = thc.mpi();
+    auto MF = thc.MF();
+    const long nq = MF->nqpts_ibz(), Np = thc.Np(), Nm = _pol_vtx->secondary_rank();
+    const long nw_b = _ft->nw_b(), nw_h = (nw_b % 2 == 0) ? nw_b / 2 : nw_b / 2 + 1;
+    auto gs = dPi_tqPQ.global_shape();
+    const long nt_h = gs[0];
+    utils::check(gs[1] == nq and gs[2] == Np and gs[3] == Np,
+                 "fold_rpa_pi_secondary: unexpected Pi global shape ({}, {}, {}, {}).", gs[0], gs[1], gs[2], gs[3]);
+    auto pg = dPi_tqPQ.grid();
+    auto bs = dPi_tqPQ.block_size();
+    auto dPi_qtPQ = make_distributed_array<nda::array<ComplexType, 4>>(
+        mpi->comm, {pg[1], pg[0], pg[2], pg[3]}, {gs[1], gs[0], gs[2], gs[3]}, {bs[1], bs[0], bs[2], bs[3]});
+    {
+      auto A = dPi_tqPQ.local();
+      auto B = dPi_qtPQ.local();
+      const long ntl = dPi_tqPQ.local_shape()[0], nql = dPi_tqPQ.local_shape()[1];
+      for (long iq = 0; iq < nql; ++iq)
+        for (long it = 0; it < ntl; ++it) B(iq, it, nda::ellipsis{}) = A(it, iq, nda::ellipsis{});
+    }
+    auto mirror = sigma_lff_detail::bosonic_mirror(*_ft);
+    nda::array<ComplexType, 4> Pb(nq, nw_b, Nm, Nm);
+    auto no_head = [](auto &&, long, nda::range const &, nda::range const &) {};
+    auto xform = [&](nda::MemoryArrayOfRank<3> auto &&Xt, nda::MemoryArrayOfRank<3> auto &&Xw) { _ft->tau_to_w_PHsym(Xt, Xw); };
+    vertex_secondary_detail::fold_dW_distributed(dPi_qtPQ, _pol_vtx->secondary_transfer(), nq, nt_h, Np, Nm, nw_b, nw_h,
+                                                 mirror, 0, false, no_head, xform, Pb, mpi->comm);
+    _sig_pi0_qwmm.emplace(nda::array<ComplexType, 4>(nq, nw_h, Nm, Nm));
+    for (long iq = 0; iq < nq; ++iq)
+      for (long j = 0; j < nw_h; ++j) _sig_pi0_qwmm.value()(iq, j, all, all) = Pb(iq, nw_b / 2 + j, all, all);
+    app_log(1, "  [LFF-Sigma] pol_vertex_sigma_bub = \"full\": the loop's RPA Pi folded to the frozen secondary frame, "
+               "(nq, nw_half, N_m) = ({}, {}, {}).", nq, nw_h, Nm);
+  }
+
+  // ---------------------------------------------------------------------------------------------------------------
+  // LFF-Sigma (Route 1, notes/lff_aux_plan.md 2026-09-19): the local-field-factor vertex in the SELF-ENERGY.
+  // With a vertex that acts on the aux (density) index only, Hedin's Sigma = i G W Gamma collapses to Sigma = G W~ with
+  // W~ = W Gamma_eff (Del Sole, Reining, Godby 1994); here Gamma_eff = Pi_0^-1 (Pi_0 + dPi) in the frozen secondary
+  // frame, so that P = Pi_0 Gamma_eff reproduces the injected polarization by construction:
+  //     Gamma_eff - 1 = Pi_0^-1 dPi,       dW~(q, i nu) = scale x Herm[ W-bar(q, i nu) (Gamma_eff - 1) ],
+  // W-bar = t (Z + dW) t^dag = THIS iteration's full W folded to the frame at every PH-sym half node (no Gamma-head
+  // insertion: the loop's dW(Gamma) is head-free and the correction's own q -> 0 head is extracted below exactly as the
+  // loop extracts eps_inv_head from dW). The Hermitization is a CONVENTION (W Gamma is not Hermitian, Sigma must be;
+  // the Gamma^1/2 W Gamma^1/2 split is the alternative -- neither is derived from the ladder's leg structure yet).
+  // dPi = the interp file's column (the injected one by default); Pi_0 = the file's window bubble ("Pi_bub",
+  // pol_vertex_sigma_bub = "window") or the loop's RPA Pi folded to the frame ("full"). The correction is upfolded to
+  // the THC frame with the injection's adjoint map, transformed nu -> tau, its head extracted with the loop's own
+  // extractor, and published as (mb_state.dWsig_qtPQ, eps_inv_head_sig) for a SECOND GW contraction in gw_t::evaluate,
+  // on top of Sigma^GW. W, the kernel caches, the readout and every other consumer of dW are untouched; scale = 0 is
+  // bit-identical to the run without the knob. Cost: N_m-class algebra per (q, nu) + one extra Sigma contraction.
+  void scr_coulomb_t::build_sigma_lff(MBState &mb_state, THC_ERI auto &thc, std::array<long, 4> t_pgrid, std::array<long, 4> t_bsize) {
+    decltype(nda::range::all) all;
+    using math::nda::make_distributed_array;
+    utils::check(_vertex != nullptr and _vertex->pol_vertex_active() and not _vertex->active(),
+                 "build_sigma_lff: pol_vertex_sigma needs the ladder machinery (pol_vertex = \"ladder\") and an INACTIVE vertex_type.");
+    ensure_pol_vertex(thc);
+    utils::check(not _pol_vtx->pol_interp_file().empty() and not _pol_vtx->isdf_points_file().empty(),
+                 "build_sigma_lff: pol_vertex_sigma = \"lff\" needs pol_vertex_interp_file (dPi and the window bubble) and "
+                 "pol_vertex_isdf_points_file (its frozen frame).");
+    utils::check(mb_state.dW_qtPQ.has_value(), "build_sigma_lff: dW_qtPQ is not stored (must run at the update_w tail).");
+    ladder_meter::watch sw;
+    auto mpi = thc.mpi();
+    auto MF = thc.MF();
+    const long nq = MF->nqpts_ibz(), Np = thc.Np(), Nm = _pol_vtx->secondary_rank();
+    const long nw_b = _ft->nw_b(), nw_h = (nw_b % 2 == 0) ? nw_b / 2 : nw_b / 2 + 1;
+    const long nt_h = long(mb_state.dW_qtPQ.value().global_shape()[1]);
+    nda::array<long, 1> nu_half(nw_h);
+    { auto wb = _ft->wn_mesh_b(); for (long j = 0; j < nw_h; ++j) nu_half(j) = long(wb(nw_b / 2 + j)); }
+    const std::string col = _vertex->sigma_lff_col().empty() ? _pol_vtx->pol_interp_col() : _vertex->sigma_lff_col();
+    const bool full_bub = (_vertex->sigma_lff_bub() == "full");
+    const double scale = _vertex->sigma_lff_scale(), tol = _vertex->sigma_lff_pinv_tol(), hscale = _vertex->sigma_lff_head_scale();
+    auto const &tmap = _pol_vtx->secondary_transfer();               // (nq, Nm, Np)
+    utils::check(tmap.shape(0) == nq and tmap.shape(1) == Nm and tmap.shape(2) == Np,
+                 "build_sigma_lff: secondary transfer is {}x{}x{}, expected {}x{}x{}.", tmap.shape(0), tmap.shape(1), tmap.shape(2), nq, Nm, Np);
+
+    // ---- 1. dPi and Pi_0 in the frozen frame at the half nodes: (nw_h, nq, Nm, Nm), replicated ---------------------
+    auto dP = read_pol_interp_column(col, nq, nw_h, nu_half, thc);
+    nda::array<ComplexType, 4> P0;
+    if (full_bub) {
+      utils::check(_sig_pi0_qwmm.has_value(), "build_sigma_lff: the folded RPA bubble is missing (eval_Pi_qdep stash).");
+      P0 = nda::array<ComplexType, 4>(nw_h, nq, Nm, Nm);
+      for (long j = 0; j < nw_h; ++j)
+        for (long iq = 0; iq < nq; ++iq) P0(j, iq, all, all) = _sig_pi0_qwmm.value()(iq, j, all, all);
+    }
+    auto Bd = read_pol_interp_column("bub", nq, nw_h, nu_half, thc);   // the dump's window bubble (LFF L-0: always written)
+    if (not full_bub) P0 = Bd;
+    // normalization / sign diagnostics of the local vertex at (q_1, nu_0) and (Gamma, nu_0): the strong-subspace scalar
+    // tr(P dPi P) / tr(P B P) (the Si analysis: +0.50 at q_min, nu = 0) and, for "full", tr(Pib) / tr(B_dump) (Pib must
+    // be >= the window bubble in magnitude: more transitions; a normalization mismatch shows up here first)
+    double v_q1 = 0.0, v_q0 = 0.0, pb_q1 = 0.0, pb_q0 = 0.0, v_tail = 0.0;
+    {
+      for (long iq : {std::min(1l, nq - 1), 0l, -1l}) {
+        const long jn = (iq < 0) ? nw_h - 1 : 0;            // -1: the tail node at q_1
+        if (iq < 0) iq = std::min(1l, nq - 1);
+        nda::matrix<ComplexType> Bm(Nm, Nm);
+        for (long a = 0; a < Nm; ++a)
+          for (long b = 0; b < Nm; ++b) Bm(a, b) = 0.5 * (P0(jn, iq, a, b) + std::conj(P0(jn, iq, b, a)));
+        auto [lam, V] = nda::linalg::eigenelements(Bm);
+        double lmax = 0.0;
+        for (long a = 0; a < Nm; ++a) lmax = std::max(lmax, std::abs(lam(a)));
+        double num = 0.0, den = 0.0, trb = 0.0, trd = 0.0;
+        for (long b = 0; b < Nm; ++b) {
+          if (std::abs(lam(b)) <= tol * lmax) continue;
+          // <v_b| dPi |v_b> and lam_b on the strong subspace
+          ComplexType d = 0.0;
+          for (long a = 0; a < Nm; ++a)
+            for (long c = 0; c < Nm; ++c) d += std::conj(V(a, b)) * dP(jn, iq, a, c) * V(c, b);
+          num += d.real(); den += lam(b);
+        }
+        for (long a = 0; a < Nm; ++a) { trb += Bd(jn, iq, a, a).real(); trd += P0(jn, iq, a, a).real(); }
+        const double v = num / (std::abs(den) > 1e-300 ? den : 1e-300), pb = trd / (std::abs(trb) > 1e-300 ? trb : 1e-300);
+        if (jn > 0) v_tail = v; else if (iq == 0) { v_q0 = v; pb_q0 = pb; } else { v_q1 = v; pb_q1 = pb; }
+      }
+    }
+    const double t_read = sw.lap();
+
+    // ---- 2. the frame metric M(q) = t t^dag (t is NOT an isometry), its inverse, and Z t^dag (replicated per q) -----------
+    // DERIVED (2026-09-19): with the code's maps -- kernels fold as W-bar = t W t^dag, polarizations upfold as
+    // Pi = t^dag Pi_S t -- the primary-frame vertex operator that reproduces P = Pi_0 + t^dag dPi_S t on the window
+    // subspace is Gamma - 1 = t^dag G1 t with G1 = M^-1 B^-1 dPi_S (window bubble B = the dump's Pi_bub, primary
+    // t^dag B t) or G1 = Pib^-1 M dPi_S (full bubble: Pib = t Pi_0 t^dag, the projector t^dag M^-1 t on Pi_0). Folding
+    // W to W-bar and upfolding the product would insert a spurious t^dag t on the left of W (measured: 50x on the head),
+    // so W stays in the PRIMARY frame: dW~ = scale x Herm[ (Z + dW) t^dag G1 t ], built block-wise below.
+    nda::array<ComplexType, 3> Mq(nq, Nm, Nm), Minv(nq, Nm, Nm), Zt(nq, Np, Nm);
+    double mcond_max = 0.0;
+    {
+      nda::matrix<ComplexType> Mm(Nm, Nm), VL(Nm, Nm);
+      for (long iq = 0; iq < nq; ++iq) {
+        auto t_q = tmap(iq, all, all);                                   // (Nm x Np)
+        nda::blas::gemm(t_q, nda::dagger(t_q), Mm);                     // M = t t^dag
+        Mq(iq, all, all) = Mm;
+        auto [lam, V] = nda::linalg::eigenelements(Mm);
+        double lmax = 0.0, lmin = 1e300;
+        for (long a = 0; a < Nm; ++a) { lmax = std::max(lmax, std::abs(lam(a))); lmin = std::min(lmin, std::abs(lam(a))); }
+        mcond_max = std::max(mcond_max, lmax / std::max(lmin, 1e-300));
+        for (long b = 0; b < Nm; ++b)
+          for (long a = 0; a < Nm; ++a) VL(a, b) = (std::abs(lam(b)) > 1e-12 * lmax) ? V(a, b) / lam(b) : ComplexType(0.0);
+        nda::blas::gemm(VL, nda::dagger(V), Mm);
+        Minv(iq, all, all) = Mm;
+        nda::array<ComplexType, 2> Zq = thc.Z(int(iq));                 // collective: every rank, every q
+        nda::blas::gemm(Zq, nda::dagger(t_q), Zt(iq, all, all));        // (Np x Np)(Np x Nm)
+      }
+    }
+    const double t_fold = sw.lap();
+
+    // ---- 3. G1(q, nu_j) = M^-1 B^-1 dPi (window) | Pib^-1 M dPi (full), B / Pib regularized (strong modes) -----------
+    nda::array<ComplexType, 4> G1(nw_h, nq, Nm, Nm);
+    G1() = ComplexType(0.0);
+    double g_max = 0.0, g_q1 = 0.0, g_q0 = 0.0;
+    long ncut_max = 0;
+    {
+      nda::matrix<ComplexType> Bm(Nm, Nm), VL(Nm, Nm), Binv(Nm, Nm), dPm(Nm, Nm), T1(Nm, Nm), T2(Nm, Nm);
+      for (long iq = 0; iq < nq; ++iq) {
+        if (iq % mpi->comm.size() != mpi->comm.rank()) continue;
+        for (long j = 0; j < nw_h; ++j) {
+          for (long a = 0; a < Nm; ++a)
+            for (long b = 0; b < Nm; ++b) Bm(a, b) = 0.5 * (P0(j, iq, a, b) + std::conj(P0(j, iq, b, a)));
+          auto [lam, V] = nda::linalg::eigenelements(Bm);
+          double lmax = 0.0;
+          for (long a = 0; a < Nm; ++a) lmax = std::max(lmax, std::abs(lam(a)));
+          long ncut = 0;
+          for (long b = 0; b < Nm; ++b) {
+            const bool keep = std::abs(lam(b)) > tol * lmax;
+            if (not keep) ++ncut;
+            for (long a = 0; a < Nm; ++a) VL(a, b) = keep ? V(a, b) / lam(b) : ComplexType(0.0);
+          }
+          ncut_max = std::max(ncut_max, ncut);
+          nda::blas::gemm(VL, nda::dagger(V), Binv);                     // Pi_0^-1 on the strong subspace
+          dPm = dP(j, iq, all, all);
+          if (full_bub) {
+            nda::blas::gemm(Mq(iq, all, all), dPm, T1);                  // M dPi
+            nda::blas::gemm(Binv, T1, T2);                               // Pib^-1 M dPi
+          } else {
+            nda::blas::gemm(Binv, dPm, T1);                              // B^-1 dPi
+            nda::blas::gemm(Minv(iq, all, all), T1, T2);                 // M^-1 B^-1 dPi
+          }
+          double nG = 0.0;
+          for (long a = 0; a < Nm; ++a)
+            for (long b = 0; b < Nm; ++b) { G1(j, iq, a, b) = T2(a, b); nG += std::norm(T2(a, b)); }
+          const double g = std::sqrt(nG / double(Nm));
+          g_max = std::max(g_max, g);
+          if (j == 0 and iq == std::min(1l, nq - 1)) g_q1 = g;
+          if (j == 0 and iq == 0) g_q0 = g;
+        }
+      }
+    }
+    mpi->comm.all_reduce_in_place_n(G1.data(), G1.size(), std::plus<>{});
+    g_max = mpi->comm.all_reduce_value(g_max, boost::mpi3::max<>{});
+    g_q1 = mpi->comm.all_reduce_value(g_q1, boost::mpi3::max<>{});
+    g_q0 = mpi->comm.all_reduce_value(g_q0, boost::mpi3::max<>{});
+    ncut_max = mpi->comm.all_reduce_value(ncut_max, boost::mpi3::max<>{});
+    const double t_alg = sw.lap();
+
+    // ---- 4. per q: Y(nu_j) = (Z + dW(i nu_j)) t^dag (Np x Nm, replicated), my (P, Q) block of dW~, nu -> tau -------------
+    auto dWs_tqPQ = make_distributed_array<nda::array<ComplexType, 4>>(mpi->comm, t_pgrid, {nt_h, nq, Np, Np}, t_bsize);
+    double r_num = 0.0, r_den = 0.0, r1_num = 0.0, r1_den = 0.0;
+    double sinf_num = 0.0, sinf_den = 0.0;   // |dW~_inf|_F^2 and |Z|_F^2 over my HF block
+    {
+      auto const &dW = mb_state.dW_qtPQ.value();                          // (q, t, P, Q), q NOT split
+      auto org = dW.origin();
+      auto lsh = dW.local_shape();
+      auto grd = dW.grid();
+      utils::check(grd[0] == 1, "build_sigma_lff: the q axis of dW_qtPQ must not be split (grid[0] = {}).", grd[0]);
+      const long t_org = org[1], P_org = org[2], Q_org = org[3];
+      const long t_bs = lsh[1], P_bs = lsh[2], Q_bs = lsh[3], np_Q = grd[3];
+      nda::range Ps(P_org, P_org + P_bs), Qs(Q_org, Q_org + Q_bs);
+      auto t_rng = dWs_tqPQ.local_range(0);
+      auto P_rng = dWs_tqPQ.local_range(2);
+      auto Q_rng = dWs_tqPQ.local_range(3);
+      utils::check(P_rng.first() == P_org and long(P_rng.size()) == P_bs and Q_rng.first() == Q_org and long(Q_rng.size()) == Q_bs
+                   and long(dWs_tqPQ.local_range(1).size()) == nq,
+                   "build_sigma_lff: the (t, q, P, Q) target layout does not match the (P, Q) partition of dW_qtPQ.");
+      const long ntl = long(t_rng.size());
+      boost::mpi3::communicator t_pool = mpi->comm.split(int(P_org * np_Q + Q_org), mpi->comm.rank());
+      auto W_loc = dW.local();
+      auto loc = dWs_tqPQ.local();
+      loc() = ComplexType(0.0);
+      nda::array<ComplexType, 3> W_bt(nt_h, P_bs, Q_bs), W_bw(nw_h, P_bs, Q_bs), Y(nw_h, Np, Nm), A(nw_h, P_bs, Q_bs), Bt(nt_h, P_bs, Q_bs);
+      nda::array<ComplexType, 2> tmpPm(P_bs, Nm), tmpPQ(P_bs, Q_bs), Sinf(P_bs, Q_bs);
+      // the INSTANTANEOUS part dW~_inf = Herm[Z t^dag G1(nu_last) t] (the vertex's nu -> inf limit times the bare Coulomb):
+      // a delta(tau) the bosonic tau machinery cannot carry -> subtracted from every node here (the remainder decays) and
+      // published on the HF exchange grid for the static self-energy (gw_t::evaluate), or dropped (pol_vertex_sigma_static)
+      const long np_hf_P = long(utils::find_proc_grid_min_diff(long(mpi->comm.size()), 1, 1)), np_hf_Q = long(mpi->comm.size()) / np_hf_P;
+      auto dWinf = make_distributed_array<nda::array<ComplexType, 3>>(mpi->comm, {1, np_hf_P, np_hf_Q}, {nq, Np, Np});
+      auto inf_loc = dWinf.local();
+      auto inf_P = dWinf.local_range(1);
+      auto inf_Q = dWinf.local_range(2);
+      inf_loc() = ComplexType(0.0);
+      nda::array<ComplexType, 2> Sfull(Np, Np), tmpNm(Np, Nm);
+      for (long iq = 0; iq < nq; ++iq) {
+        auto t_q = tmap(iq, all, all);
+        // (0) the instantaneous kernel of this q, replicated: Sfull = scale/2 [ (Z t^dag) G1(inf) t + h.c. ]
+        nda::blas::gemm(Zt(iq, all, all), G1(nw_h - 1, iq, all, all), tmpNm);      // (Np x Nm)(Nm x Nm)
+        nda::blas::gemm(tmpNm, t_q, Sfull);                                          // (Np x Nm)(Nm x Np)
+        for (long i = 0; i < Np; ++i)
+          for (long k = i; k < Np; ++k) {
+            const ComplexType v = 0.5 * scale * (Sfull(i, k) + std::conj(Sfull(k, i)));
+            Sfull(i, k) = v; Sfull(k, i) = std::conj(v);
+          }
+        inf_loc(iq, all, all) = Sfull(inf_P, inf_Q);
+        Sinf() = Sfull(Ps, Qs);
+        for (long i = 0; i < P_bs; ++i)
+          for (long k = 0; k < Q_bs; ++k) { sinf_num += std::norm(Sinf(i, k)); }
+        // (a) Y_dW = dW(q, i nu) t^dag: my block's full-t slab (t-pool all_reduce over the disjoint t partition), tau -> nu,
+        //     times t^dag on my Q range; the comm all_reduce sums the disjoint (P, Q) block partials -> replicated Y(q)
+        W_bt() = ComplexType(0.0);
+        if (t_bs > 0) W_bt(nda::range(t_org, t_org + t_bs), all, all) = W_loc(iq, all, all, all);
+        t_pool.all_reduce_in_place_n(W_bt.data(), W_bt.size(), std::plus<>{});
+        Y() = ComplexType(0.0);
+        _ft->tau_to_w_PHsym(W_bt, W_bw);                                   // every rank of the t-pool (its own t-range is kept below)
+        if (t_pool.rank() == 0)
+          for (long j = 0; j < nw_h; ++j) {
+            nda::blas::gemm(W_bw(j, all, all), nda::dagger(t_q(all, Qs)), tmpPm);   // (P_bs x Q_bs)(Q_bs x Nm)
+            for (long i = 0; i < P_bs; ++i)
+              for (long m = 0; m < Nm; ++m) Y(j, P_org + i, m) += tmpPm(i, m);
+          }
+        mpi->comm.all_reduce_in_place_n(Y.data(), Y.size(), std::plus<>{});
+        for (long j = 0; j < nw_h; ++j)                                      // (b) + Z t^dag
+          for (long i = 0; i < Np; ++i)
+            for (long m = 0; m < Nm; ++m) Y(j, i, m) += Zt(iq, i, m);
+        // (c) my block of dW~ = scale/2 [ Y G1 t + t^dag G1^dag Y^dag ]
+        double nW = 0.0, nD = 0.0;
+        for (long j = 0; j < nw_h; ++j) {
+          nda::blas::gemm(Y(j, Ps, all), G1(j, iq, all, all), tmpPm);        // (P_bs x Nm)(Nm x Nm)
+          nda::blas::gemm(tmpPm, t_q(all, Qs), tmpPQ);                        // (P_bs x Nm)(Nm x Q_bs)
+          A(j, all, all) = tmpPQ;
+          nda::blas::gemm(nda::dagger(t_q(all, Ps)), nda::dagger(G1(j, iq, all, all)), tmpPm);   // t_P^dag G1^dag
+          nda::blas::gemm(tmpPm, nda::dagger(Y(j, Qs, all)), tmpPQ);                             // (P_bs x Nm)(Nm x Q_bs)
+          for (long i = 0; i < P_bs; ++i)
+            for (long k = 0; k < Q_bs; ++k) {
+              A(j, i, k) = 0.5 * scale * (A(j, i, k) + tmpPQ(i, k)) - Sinf(i, k);   // the dynamic remainder (-> 0 as nu -> inf)
+              nD += std::norm(A(j, i, k)); nW += std::norm(W_bw(j, i, k));
+            }
+          if (j == 0 and iq == std::min(1l, nq - 1) and t_pool.rank() == 0) {
+            for (long i = 0; i < P_bs; ++i)
+              for (long k = 0; k < Q_bs; ++k) { r1_num += std::norm(A(j, i, k)); r1_den += std::norm(W_bw(j, i, k)); }
+          }
+        }
+        if (t_pool.rank() == 0) { r_num += nD; r_den += nW; }
+        // (d) nu -> tau on my block; keep my t-range
+        auto A2 = nda::reshape(A, shape_t<2>{nw_h, P_bs * Q_bs});
+        auto B2 = nda::reshape(Bt, shape_t<2>{nt_h, P_bs * Q_bs});
+        _ft->w_to_tau_PHsym(A2, B2);
+        for (long it = 0; it < ntl; ++it) loc(it, iq, all, all) = Bt(t_rng.first() + it, all, all);
+      }
+      // |dW~_inf|_F over my HF block vs |Z|_F (the size of the instantaneous piece relative to the bare Coulomb)
+      for (long iq = 0; iq < nq; ++iq) {
+        nda::array<ComplexType, 2> Zq = thc.Z(int(iq));                    // collective
+        for (long i : inf_P) for (long k : inf_Q) sinf_den += std::norm(Zq(i, k));
+      }
+      sinf_num = 0.0;
+      for (long iq = 0; iq < nq; ++iq)
+        for (long i = 0; i < long(inf_P.size()); ++i)
+          for (long k = 0; k < long(inf_Q.size()); ++k) sinf_num += std::norm(inf_loc(iq, i, k));
+      if (_vertex->sigma_lff_static()) mb_state.dWsig_inf_qPQ.emplace(std::move(dWinf));
+      else mb_state.dWsig_inf_qPQ.reset();
+    }
+    sinf_num = mpi->comm.all_reduce_value(sinf_num, std::plus<>{}); sinf_den = mpi->comm.all_reduce_value(sinf_den, std::plus<>{});
+    const double r_inf = std::sqrt(sinf_num / std::max(sinf_den, 1e-300));
+    r_num = mpi->comm.all_reduce_value(r_num, std::plus<>{}); r_den = mpi->comm.all_reduce_value(r_den, std::plus<>{});
+    r1_num = mpi->comm.all_reduce_value(r1_num, std::plus<>{}); r1_den = mpi->comm.all_reduce_value(r1_den, std::plus<>{});
+    const double r_max = std::sqrt(r_num / std::max(r_den, 1e-300)), r_q1 = std::sqrt(r1_num / std::max(r1_den, 1e-300));
+    // ---- 5. the q -> 0 head of the correction, with the loop's own extractor (eps_inv_head convention) --------------
+    const bool cvv = (_div_treatment == "cvv");
+    auto [eih_q, eih] = div_utils::eps_inv_head_t(dWs_tqPQ, thc, *MF, _ft, cvv ? "ignore_g0" : _div_treatment);
+    for (auto &v : eih) v *= hscale;
+    // ---- 6. publish in the layout gw_t consumes (the same transposition update_w applies to dW) --------------------
+    {
+      auto gsh = dWs_tqPQ.global_shape();
+      mb_state.dWsig_qtPQ.emplace(make_distributed_array<nda::array<ComplexType, 4>>(
+          mpi->comm, {t_pgrid[1], t_pgrid[0], t_pgrid[2], t_pgrid[3]}, {gsh[1], gsh[0], gsh[2], gsh[3]},
+          {t_bsize[1], t_bsize[0], t_bsize[2], t_bsize[3]}));
+      auto A = dWs_tqPQ.local();
+      auto B = mb_state.dWsig_qtPQ.value().local();
+      const long ntl = dWs_tqPQ.local_shape()[0], nql = dWs_tqPQ.local_shape()[1];
+      for (long iq = 0; iq < nql; ++iq)
+        for (long it = 0; it < ntl; ++it) B(iq, it, nda::ellipsis{}) = A(it, iq, nda::ellipsis{});
+    }
+    mb_state.eps_inv_head_sig = eih;
+    const double t_up = sw.lap();
+    // the q -> 0 heads at i nu = 0 (the static limit; tau_0 is the Matsubara sum, tail-dominated): the correction vs the loop's
+    double h0_sig = 0.0, h0 = 0.0;
+    {
+      auto head_nu0 = [&](nda::array<ComplexType, 1> const &ht) {
+        nda::array<ComplexType, 1> et(ht.shape(0)), ew(nw_h);
+        et() = ht;
+        auto a2 = nda::reshape(et, shape_t<2>{long(et.shape(0)), 1});
+        auto b2 = nda::reshape(ew, shape_t<2>{nw_h, 1});
+        _ft->tau_to_w_PHsym(a2, b2);
+        return ew(0).real();
+      };
+      h0_sig = head_nu0(eih);
+      if (mb_state.eps_inv_head.has_value() and long(mb_state.eps_inv_head.value().shape(0)) == nt_h) h0 = head_nu0(mb_state.eps_inv_head.value());
+    }
+    _sig_lff_meter = {v_q1, r_max, h0_sig, h0};
+    app_log(1, "  [LFF-Sigma] instantaneous part |dW~_inf|_F / |Z|_F = {:.3e} (the local vertex at the tail node: {:+.4f}; {}); "
+               "heads at i nu = 0: eps^-1 - 1 = {:+.5f} (loop), correction {:+.5f} (expected sign = that of the vertex at q_1: {:+.4f})",
+            r_inf, v_tail, _vertex->sigma_lff_static() ? "-> the static self-energy" : "DROPPED (pol_vertex_sigma_static = false)",
+            h0, h0_sig, v_q1);
+    app_log(1, "  [LFF-Sigma] local vertex scalar tr(P dPi P)/tr(P Pi_0 P) at nu_0: q_1 {:+.4f}, Gamma {:+.4f}; tr(Pi_0)/tr(B_dump) at nu_0: q_1 {:.4f}, Gamma {:.4f}"
+               " (1 by definition for the window bubble)", v_q1, v_q0, pb_q1, pb_q0);
+    _sig_lff_meter[0] = v_q1;
+    app_log(1, "  [LFF-Sigma] dW~ = {} x Herm[(Z + dW) t^dag G1 t], G1 = {} (column {}), N_m = {}, {} half nodes x {} q; frame metric cond(t t^dag) {:.2e}:\n"
+               "              |G1| rms max {:.3e} (q_1, nu_0: {:.3e}; Gamma, nu_0: {:.3e}); |dW~|_F / |dW|_F all (q, nu) {:.3e} (q_1, nu_0: {:.3e});\n"
+               "              Pi_0^-1 cut {} of {} modes at most (tol {:.1e}); heads at i nu = 0: correction {:+.5f} vs the loop's {:+.5f} "
+               "(ratio {:.3f}, head scale {}); wall read {:.1f} s, metric+Z {:.1f} s, G1 {:.1f} s, blocks+head {:.1f} s",
+            scale, full_bub ? "Pib^-1 M dPi (full RPA bubble folded)" : "M^-1 B^-1 dPi (window bubble)", col, Nm, nw_h, nq, mcond_max,
+            g_max, g_q1, g_q0, r_max, r_q1, ncut_max, Nm, tol, h0_sig, h0,
+            (std::abs(h0) > 1e-300 ? h0_sig / h0 : 0.0), hscale, t_read, t_fold, t_alg, t_up);
+  }
+
   template void scr_coulomb_t::update_w(MBState&, thc_reader_t&, long);
+  template void scr_coulomb_t::build_sigma_lff(MBState&, thc_reader_t&, std::array<long, 4>, std::array<long, 4>);
+  template nda::array<ComplexType, 4> scr_coulomb_t::read_pol_interp_column(std::string const&, long, long,
+                                                                            nda::array<long, 1> const&, thc_reader_t&);
+  template void scr_coulomb_t::fold_rpa_pi_secondary(
+      memory::darray_t<memory::array<HOST_MEMORY, ComplexType, 4>, mpi3::communicator>&, thc_reader_t&);
 
   template memory::darray_t<Arr4D, mpi3::communicator>
   scr_coulomb_t::dyson_W_from_Pi_tau<true>(memory::darray_t<Arr4D, mpi3::communicator> &, thc_reader_t&, bool,
