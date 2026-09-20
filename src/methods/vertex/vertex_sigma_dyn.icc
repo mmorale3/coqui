@@ -1,0 +1,233 @@
+#ifndef COQUI_VERTEX_SIGMA_DYN_ICC
+#define COQUI_VERTEX_SIGMA_DYN_ICC
+
+/**
+ * LFF-aux L-7 (notes/lff_aux_plan.md, 2026-09-20): the DYNAMIC-RUNG vertex in the SELF-ENERGY -- the Sigma-side
+ * contraction of the amputated pair vertex produced by the dynamic-rung ladder solver (dynbse.hpp /
+ * pair_space_ladder_dyn), i.e. the L-6 junction dressing with the full-frequency rung.
+ *
+ * THE OBJECT. Per transfer (q, i nu) the BSE in 2+1 form (dynbse_algorithm.pdf) gives the pair amplitude P = L_s (d + y)
+ * with y = K_d * P the dynamic remainder; the AMPUTATED vertex of the right GW junction is
+ *     Gamma - d = K * P = K_s P^sum + y,       A(i omega'; nu) := K_s Gsum + y(i omega'; nu),
+ * a TWO-frequency object (Gsum = P^sum is the solver's readout; y its iterate). Columns (opt col):
+ *     static_dyn : y = 0, A = K_s Gsum0                       (== the L-6 "static" column through this path: gate N1)
+ *     dyn1_bare  : T_s = 0, A = K_s Cb d + y_1, y_1 = K_d L_0 d (the ONE bare dynamic rung; with the dynamic outer W
+ *                  == the G^3 W^2 second-order exchange Sigma^C of the dynamic-rung theory: gate N2)
+ *     dyn1       : A = K_s Gsum1 + y_1                         (Gamma_1: one dynamic rung dressed by static ladders)
+ *     dyn        : A = K_s Gsum + y                            (the resummed ladder)
+ * THE CONTRACTION (the L-6 junction, vertex_sigma_pair.icc, with a frequency-dependent A): with k = k' + q,
+ *     dSigma_ij(k, i omega) = -(scale/nk) sum_q sum_nu W-bar_NM(q, nu) D*_M(k'; c, i) [G(k') A_N(.; nu)]_{(c j)}(i omega - i nu),
+ * a PRODUCT G(k', i omega') A(i omega'; nu) in the fermionic frequency omega' = omega - nu (the pair's own frequency) and a
+ * convolution over nu with the outer W-bar. In the two-family pole basis of the solver, A = A_cst + sum_a AU_a U_a + sum_a
+ * AT_a T_a (U_a = 1/(z - e_a), T_a = U_a S_a, S_a = 1/(z + i nu - e_a)); left-multiplying by G(k', z) = sum_j g_j U_j
+ * (half_l0_left: exact partial fractions) gives F = G A_cst + sum_p FU_p U_p + sum_p FT_p T_p, and then
+ *   (i)  constant part:  [G A_cst](i omega - i nu) summed over nu with W-bar(nu)  ->  G(k', tau) . Ttw[W-bar A_cst](tau)   (the L-6 route);
+ *   (ii) U family:       sum_nu B_p(nu) U_p(i omega - i nu)  ->  Ttw[B_p](tau) K_F(tau, e_p),   B_p = D* W-bar FU_p        (pointwise);
+ *   (iii) T family:      T_p(i omega - i nu; nu) = U_p(i omega) U_p(i omega - i nu), so the nu-sum is the convolution
+ *                        E_p(tau) = Ttw[B^T_p](tau) K_F(tau, e_p) times U_p(i omega) in FREQUENCY -- a fermionic tau-convolution,
+ *                        done EXACTLY by the pole fit of E_p onto the vertex nodes and the partial fractions
+ *                        U_p U_p' = (U_p - U_p')/(e_p - e_p'), U_p^2 -> K_F2 (tau[U_p^2] = d K_F / d e, exact).
+ *   The twisted family cannot go through Ttw pointwise (its tau image carries phi_nu(tau) = (1 - e^{i nu tau})/(i nu), an
+ *   oscillatory function of nu that no bosonic DLR represents); (iii) never forms it.
+ * ACCUMULATION. The nu-sum needs EVERY bosonic node (the caller runs the driver on the full mesh, both signs); each unit
+ * (s, q, node m) deposits its Ttw_bb(tau_i, m)-weighted objects into replicated accumulators
+ *     S_cst(tau, s, k, i, j),  RU(tau, s, k, p, i, j),  RT(tau, s, k, p, i, j)
+ * (k = k' + q folded in), all-reduced by the caller; sigma_dyn_finish assembles dSigma from them.
+ */
+
+namespace methods {
+namespace solvers {
+  namespace vertex_dynbse_detail {
+
+    struct sigma_dyn_hook {
+      std::string col = "dyn1";          // static_dyn | dyn1_bare | dyn1 | dyn
+      std::string outer = "dynamic";     // the outer W-bar: "dynamic" (W-bar_0 + W-bar_d(nu)) | "static" (W-bar_0)
+      // accumulators over the units this rank owns (allocated by the driver once the basis is known)
+      nda::array<ComplexType, 5> S_cst;  // (nt, ns, nk, nc, nc)
+      nda::array<ComplexType, 6> RU, RT; // (nt, ns, nk, np, nc, nc)
+      std::optional<dynbse::freq_basis> basis;   // the (union-extended) basis of the run, for the finish
+      long np = 0;
+      // meters
+      double t_sig = 0.0, ks_herm = 0.0, amax = 0.0, ymax = 0.0;
+      long nunits = 0, nblocks = 0;
+      // scratch (sized on demand)
+      nda::array<ComplexType, 5> AU, AT;
+      long nR_cur = -1;
+      void init(long nt, long ns, long nk, long np_, long nc, dynbse::freq_basis const &b) {
+        np = np_;
+        S_cst = nda::array<ComplexType, 5>(nt, ns, nk, nc, nc); S_cst() = ComplexType(0.0);
+        RU = nda::array<ComplexType, 6>(nt, ns, nk, np, nc, nc); RU() = ComplexType(0.0);
+        RT = nda::array<ComplexType, 6>(nt, ns, nk, np, nc, nc); RT() = ComplexType(0.0);
+        basis = b;
+      }
+    };
+
+    /** one RHS block of one unit: deposit the block's contribution to S_cst / RU / RT (see the file header) */
+    inline void sigma_dyn_accumulate(sigma_dyn_hook &h, dynbse::freq_basis const &b, dynbse::pair_poles const &P, ComplexType inu,
+                                     dynbse::dyson_result const &res, nda::array<ComplexType, 2> const &Ks,
+                                     nda::array<ComplexType, 4> const &Dc, long N0, long N1,
+                                     nda::array<ComplexType, 2> const &Wout, nda::MemoryArrayOfRank<5> auto const &G_CC,
+                                     nda::array<long, 2> const &kpq, long is, long iq, long m,
+                                     vertex_pi::iaft_tools const &tools) {
+      using cplx = ComplexType;
+      decltype(nda::range::all) all;
+      vertex_ladder_detail::prof_watch watch;
+      const long nt = G_CC.shape(0), nk = P.nk, nc = P.nc, nc2 = nc * nc, D = nk * nc2, nR = N1 - N0, Nm = Dc.shape(3), np = b.np;
+      const bool nu0 = (inu == cplx(0.0));
+      utils::check(h.np == np, "sigma_dyn_accumulate: basis size changed ({} vs {}).", np, h.np);
+      // ---- the column: which Gsum and which y --------------------------------------------------------------
+      nda::array<cplx, 4> const *Gs = nullptr;
+      dynbse::tf_vector const *yv = nullptr;
+      if (h.col == "static_dyn") { Gs = &res.Gsum0; }
+      else if (h.col == "dyn1_bare") { Gs = &res.Gsum0; yv = &res.y1; }
+      else if (h.col == "dyn1") { Gs = &res.Gsum1; yv = &res.y1; }
+      else if (h.col == "dyn") { Gs = &res.Gsum; yv = &res.y; }
+      else utils::check(false, "sigma_dyn_accumulate: unknown column \"{}\".", h.col);
+      if (yv != nullptr) utils::check(res.has_y and yv->nR == nR, "sigma_dyn_accumulate: the solver did not keep y (col {}).", h.col);
+      // ---- A_cst = K_s Gsum + y.cst  (D x nR) ----------------------------------------------------------------
+      nda::array<cplx, 2> gs(D, nR), Acst(D, nR);
+      for (long ik = 0; ik < nk; ++ik)
+        for (long p = 0; p < nc2; ++p)
+          for (long r = 0; r < nR; ++r) gs(ik * nc2 + p, r) = (*Gs)(ik, p / nc, p % nc, r);
+      nda::blas::gemm(Ks, gs, Acst);
+      if (yv != nullptr)
+        for (long ik = 0; ik < nk; ++ik)
+          for (long p = 0; p < nc2; ++p)
+            for (long r = 0; r < nR; ++r) Acst(ik * nc2 + p, r) += yv->cst(ik, p / nc, p % nc, r);
+      for (auto const &v : Acst) h.amax = std::max(h.amax, std::abs(v));
+      auto Wblk = Wout(nda::range(N0, N1), all);                  // (nR, Nm): rows N of the dressed leg
+      // ---- (i) the constant part: the L-6 contraction, G(tau)-closed here, Ttw-weighted into S_cst ---------------
+      {
+        nda::array<cplx, 2> Ak(nc2, nR), Bk(nc2, Nm), Dconj(nc2, Nm), Hk(nc2, nc2);
+        for (long ik = 0; ik < nk; ++ik) {
+          const long k = kpq(iq, ik);
+          Ak() = Acst(nda::range(ik * nc2, (ik + 1) * nc2), all);
+          nda::blas::gemm(Ak, Wblk, Bk);                             // B(c'j, M) = sum_N A(c'j, N) W(N, M)
+          for (long c = 0; c < nc; ++c)
+            for (long i = 0; i < nc; ++i)
+              for (long M = 0; M < Nm; ++M) Dconj(c * nc + i, M) = std::conj(Dc(ik, c, i, M));
+          nda::blas::gemm(Dconj, nda::transpose(Bk), Hk);           // H(ci, c'j) = sum_M D*(ci, M) B(c'j, M)
+          for (long it = 0; it < nt; ++it) {
+            const cplx w = tools.Ttw_bb(it, m);
+            for (long i = 0; i < nc; ++i)
+              for (long j = 0; j < nc; ++j) {
+                cplx acc(0.0);
+                for (long c = 0; c < nc; ++c)
+                  for (long cp = 0; cp < nc; ++cp) acc += G_CC(it, is, ik, c, cp) * Hk(c * nc + i, cp * nc + j);
+                h.S_cst(it, is, k, i, j) += w * acc;
+              }
+          }
+        }
+      }
+      // ---- (ii)/(iii) the families of y: G-multiplied, leg-contracted, Ttw-weighted into RU / RT ------------------
+      if (yv != nullptr) {
+        bool any = false;
+        for (auto const &v : yv->fam) if (v != cplx(0.0)) { any = true; break; }
+        for (auto const &v : yv->fam) h.ymax = std::max(h.ymax, std::abs(v));
+        if (any) {
+          if (h.nR_cur != nR) {
+            h.AU = nda::array<cplx, 5>(np, nk, nc, nc, nR);
+            h.AT = nda::array<cplx, 5>(np, nk, nc, nc, nR);
+            h.nR_cur = nR;
+          }
+          dynbse::half_l0_left(b, P, inu, *yv, h.AU, h.AT);
+          nda::array<cplx, 2> Dconj(nc2, Nm);
+          nda::array<cplx, 2> Bk(nc2, Nm), Hc(nc, nc), Hsum(nc, nc);
+          for (int fam = 0; fam < (nu0 ? 1 : 2); ++fam) {
+            auto &A = (fam == 0) ? h.AU : h.AT;
+            auto &R = (fam == 0) ? h.RU : h.RT;
+            for (long ik = 0; ik < nk; ++ik) {
+              const long k = kpq(iq, ik);
+              for (long c = 0; c < nc; ++c)
+                for (long i = 0; i < nc; ++i)
+                  for (long M = 0; M < Nm; ++M) Dconj(c * nc + i, M) = std::conj(Dc(ik, c, i, M));
+              for (long p = 0; p < np; ++p) {
+                auto Ap = nda::reshape(A(p, ik, all, all, all), std::array<long, 2>{nc2, nR});   // rows (c, j)
+                bool anyp = false;
+                for (auto const &v : Ap) if (v != cplx(0.0)) { anyp = true; break; }
+                if (not anyp) continue;
+                nda::blas::gemm(Ap, Wblk, Bk);                       // B(cj, M) = sum_N A(cj, N) W(N, M)
+                Hsum() = cplx(0.0);
+                for (long c = 0; c < nc; ++c) {
+                  auto Dcv = Dconj(nda::range(c * nc, (c + 1) * nc), all);   // (i, M)
+                  auto Bcv = Bk(nda::range(c * nc, (c + 1) * nc), all);      // (j, M)
+                  nda::blas::gemm(Dcv, nda::transpose(Bcv), Hc);              // H(i, j) = sum_M D*(ci, M) B(cj, M)
+                  Hsum += Hc;
+                }
+                for (long it = 0; it < nt; ++it) {
+                  const cplx w = tools.Ttw_bb(it, m);
+                  for (long i = 0; i < nc; ++i)
+                    for (long j = 0; j < nc; ++j) R(it, is, k, p, i, j) += w * Hsum(i, j);
+                }
+              }
+            }
+          }
+        }
+      }
+      ++h.nblocks;
+      h.t_sig += watch.lap();
+    }
+
+    /** the assembly after the all-reduce of the accumulators: dSig (nt, ns, nk, nc, nc) = -(scale/nk) [S_cst + Sigma_U + Sigma_T] */
+    inline void sigma_dyn_finish(sigma_dyn_hook const &h, double scale, long nk_norm, nda::array<ComplexType, 5> &dSig,
+                                 double &e_fit_err) {
+      using cplx = ComplexType;
+      utils::check(h.basis.has_value(), "sigma_dyn_finish: no basis (the driver did not run).");
+      auto const &b = h.basis.value();
+      const long nt = h.S_cst.shape(0), ns = h.S_cst.shape(1), nk = h.S_cst.shape(2), nc = h.S_cst.shape(3), nc2 = nc * nc;
+      const long np = b.np, npf = b.np_fit;
+      utils::check(h.np == np and h.RU.shape(3) == np, "sigma_dyn_finish: node count mismatch.");
+      dSig = nda::array<cplx, 5>(nt, ns, nk, nc, nc);
+      dSig() = cplx(0.0);
+      // ---- (iii): E_p(tau) = K_F(tau, e_p) RT_p(tau), refit onto the vertex nodes, times U_p by partial fractions ---------
+      // the batch of tau functions: columns (s, k, p, i, j)
+      const long nb = ns * nk * np * nc2;
+      nda::array<cplx, 2> E(nt, nb);
+      bool anyT = false;
+      for (auto const &v : h.RT) if (v != cplx(0.0)) { anyT = true; break; }
+      e_fit_err = 0.0;
+      nda::array<cplx, 2> ec;
+      if (anyT) {
+        for (long it = 0; it < nt; ++it) {
+          long col = 0;
+          for (long is = 0; is < ns; ++is)
+            for (long k = 0; k < nk; ++k)
+              for (long p = 0; p < np; ++p) {
+                const double kf = b.KF(it, p);
+                for (long i = 0; i < nc; ++i)
+                  for (long j = 0; j < nc; ++j) E(it, col++) = cplx(kf) * h.RT(it, is, k, p, i, j);
+              }
+        }
+        ec = dynbse::basis_coeffs(b, E);                  // (npf, nb): E_p = sum_{p'} ec(p') U_{p'}
+        e_fit_err = dynbse::basis_fit_error(b, E, ec);
+      }
+      // tau[U_p U_p'](it): (nt, np, npf)
+      nda::array<double, 3> Tpp(nt, np, npf);
+      for (long it = 0; it < nt; ++it)
+        for (long p = 0; p < np; ++p)
+          for (long pp = 0; pp < npf; ++pp)
+            Tpp(it, p, pp) = (p == pp) ? b.KF2(it, p) : (b.KF(it, p) - b.KF(it, pp)) / (b.eps(p) - b.eps(pp));
+      const cplx pref(-scale / double(nk_norm), 0.0);
+#pragma omp parallel for collapse(2) schedule(static) num_threads(utils::omp_threads())
+      for (long is = 0; is < ns; ++is)
+        for (long k = 0; k < nk; ++k)
+          for (long it = 0; it < nt; ++it)
+            for (long i = 0; i < nc; ++i)
+              for (long j = 0; j < nc; ++j) {
+                cplx acc = h.S_cst(it, is, k, i, j);
+                for (long p = 0; p < np; ++p) acc += cplx(b.KF(it, p)) * h.RU(it, is, k, p, i, j);   // (ii)
+                if (anyT) {
+                  for (long p = 0; p < np; ++p) {
+                    const long col = ((is * nk + k) * np + p) * nc2 + i * nc + j;
+                    for (long pp = 0; pp < npf; ++pp) acc += cplx(Tpp(it, p, pp)) * ec(pp, col);           // (iii)
+                  }
+                }
+                dSig(it, is, k, i, j) = pref * acc;
+              }
+    }
+
+  } // namespace vertex_dynbse_detail
+} // namespace solvers
+} // namespace methods
+
+#endif // COQUI_VERTEX_SIGMA_DYN_ICC

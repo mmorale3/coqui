@@ -2316,6 +2316,78 @@ namespace dynbse {
    *   sum_iw Gamma = Fsum + Cb T_s Fsum.
    * Returns Gamma (two-family) and Gsum. `Dc` is the constant external leg D (nk, nc, nc, nR).
    */
+  /**
+   * LFF-Sigma L-7 (the dynamic-rung vertex in Sigma, notes/lff_aux_plan.md): the LEFT multiplication of a two-family
+   * vector by ONE Green's function, G(k, z) = sum_j g_j(k) U_j(z), acting on the pair's ROW index -- the k' line of the
+   * self-energy junction:   F(k, z)_{(c y), r} = sum_x G_{c x}(k, z) X(k, z)_{(x y), r}.
+   * Exact partial fractions on the {U, T} components (the rules of l0_apply_shift_cols's mulU without the second leg):
+   *   U_j . U_a = (U_j - U_a) / (e_j - e_a)  (a != j);  U_j . U_j = U_j^2 -> Dsq (the shared scheme only);
+   *   U_j . T_a = wt T_a - wd U_j + wd U_a,  w = 1/(e_a - e_j), d = e_j - e_a + inu, wd = w/d, wt = w - inu wd  (a != j; the
+   *   confluent R1_j = U_j T_j never occurs: the T family of a K_d output has no content at a G node -- asserted).
+   * The CONSTANT component of X is NOT handled here (the caller multiplies it by the exact G(tau)); X.cst is ignored.
+   * Outputs AU, AT: (np, nk, nc, nc, nR), the coefficient blocks of the U_c and T_c families (AT stays zero at inu = 0).
+   */
+  inline void half_l0_left(freq_basis const &b, pair_poles const &P, cplx inu, tf_vector const &X,
+                           nda::array<cplx, 5> &AU, nda::array<cplx, 5> &AT) {
+    decltype(nda::range::all) all;
+    const long np = b.np, nk = P.nk, nc = P.nc, ng = P.ng, nR = X.nR;
+    const bool nu0 = (inu == cplx(0.0));
+    utils::check(AU.shape(0) == np and AU.shape(1) == nk and AU.shape(2) == nc and AU.shape(3) == nc and AU.shape(4) == nR,
+                 "dynbse::half_l0_left: AU shape.");
+    utils::check(AT.shape() == AU.shape(), "dynbse::half_l0_left: AT shape.");
+    utils::check(X.np == np and X.nk == nk and X.nc == nc, "dynbse::half_l0_left: X / basis mismatch.");
+    AU() = cplx(0.0);
+    AT() = cplx(0.0);
+#pragma omp parallel for schedule(dynamic, 1) num_threads(utils::omp_threads())
+    for (long ik = 0; ik < nk; ++ik) {
+      nda::array<cplx, 2> g(nc, nc), V(nc, nc * nR), Wv(nc, nc * nR);
+      auto add = [&](nda::array<cplx, 5> &A, long node, cplx w) {
+        for (long c = 0; c < nc; ++c)
+          for (long y = 0; y < nc; ++y)
+            for (long r = 0; r < nR; ++r) A(node, ik, c, y, r) += w * Wv(c, y * nR + r);
+      };
+      for (long j = 0; j < ng; ++j) {
+        const long nj = P.gnode(j);
+        const double ej = P.epsG(j);
+        g() = P.gk(j, ik, all, all);
+        for (long f = 0; f < (nu0 ? 1 : 2); ++f)
+          for (long a = 0; a < np; ++a) {
+            bool any = false;
+            for (long x = 0; x < nc; ++x)
+              for (long y = 0; y < nc; ++y)
+                for (long r = 0; r < nR; ++r) {
+                  const cplx v = X.fam(f, a, ik, x, y, r);
+                  V(x, y * nR + r) = v;
+                  any = any or (v != cplx(0.0));
+                }
+            if (not any) continue;
+            nda::blas::gemm(g, V, Wv);
+            const double ea = b.eps(a);
+            if (f == 0) {
+              if (a == nj) {
+                utils::check(nj < b.np_fit, "dynbse::half_l0_left: confluent U_j^2 at an extension node (no Dsq row).");
+                for (long c2 = 0; c2 < np; ++c2)
+                  if (b.Dsq(nj, c2) != cplx(0.0)) add(AU, c2, b.Dsq(nj, c2));
+              } else {
+                const cplx w = cplx(1.0 / (ej - ea));
+                add(AU, nj, w);
+                add(AU, a, -w);
+              }
+            } else {
+              utils::check(a != nj, "dynbse::half_l0_left: the confluent U_j T_j product (R1) is not supported here.");
+              const cplx w = cplx(1.0 / (ea - ej));
+              const cplx d = cplx(ej - ea) + inu;
+              const cplx wd = w / d;
+              const cplx wt = w - inu * wd;
+              add(AT, a, wt);
+              add(AU, nj, -wd);
+              add(AU, a, wd);
+            }
+          }
+      }
+    }
+  }
+
   /** wall-time sinks of the solver internals (seconds, cumulative; the driver resets and reads them per
    *  unit): the L0 pair-pole applications, the static-resolvent gemms (T_s, Cb), the Arnoldi
    *  orthogonalization. Not thread-safe by design: the solver runs outside any omp region. */
@@ -2393,6 +2465,11 @@ namespace dynbse {
     nda::array<cplx, 4> Gsum;      // (nk, nc, nc, nR) sum_iw Gamma of the converged vertex
     nda::array<cplx, 4> Gsum1;     // the first iterate (static-dressed one dynamic rung)
     nda::array<cplx, 4> Gsum0;     // the static ladder (y = 0)
+    // LFF-Sigma L-7 (keep_y): the dynamic remainders themselves -- the amputated vertex of the self-energy junction is
+    // A = K_s Gsum + y (Gamma - d = K_s P^sum + K_d * P), so the Sigma contraction needs y, not only its frequency sum
+    bool has_y = false;
+    tf_vector y1;                  // the first iterate y_1 = K_d L_s d (K_d L_0 d for one_rung_only)
+    tf_vector y;                   // the final iterate (== y1 for gamma1_only / one application)
   };
 
   /**
@@ -2411,7 +2488,8 @@ namespace dynbse {
                                      static_resolvent const &S, cplx inu, bool shared,
                                      nda::array<cplx, 4> const &Dc, double tol, long maxit,
                                      bool anderson = true, nda::array<cplx, 3> const *Cb_cst = nullptr,
-                                     shift_tables const *st = nullptr, tf_metric const *metric = nullptr) {
+                                     shift_tables const *st = nullptr, tf_metric const *metric = nullptr,
+                                     bool keep_y = false) {
     const long nk = P.nk, nc = P.nc, nR = Dc.shape(3), np = b.np;
     dyson_result out;
     out.Gsum = nda::array<cplx, 4>(nk, nc, nc, nR);
@@ -2424,9 +2502,10 @@ namespace dynbse {
     for (long it = 0; it <= maxit; ++it) {
       ls_apply(b, P, S, inu, shared, Dc, y, Gamma, Gsum, Cb_cst, st);
       if (it == 0) out.Gsum0 = Gsum;
-      if (it == 1) out.Gsum1 = Gsum;
+      if (it == 1) { out.Gsum1 = Gsum; if (keep_y) { out.has_y = true; out.y1 = y; } }
       out.Gsum = Gsum;
       out.iterations = it;
+      if (keep_y) out.y = y;
       if (it == maxit) break;
       const double fe = kd(Gamma, Gsum, ynew);
       out.fit_err_max = std::max(out.fit_err_max, fe);
@@ -2464,6 +2543,7 @@ namespace dynbse {
           ls_apply(b, P, S, inu, shared, Dc, ynew, Gamma, Gsum, Cb_cst, st);
           out.Gsum = Gsum;
           out.iterations = it + 1;
+          if (keep_y) out.y = ynew;
           break;
         }
       }
@@ -2500,6 +2580,7 @@ namespace dynbse {
         out.Gsum = Gsum;
         out.iterations = it + 1;
         out.converged = true;
+        if (keep_y) { out.y = y; if (not out.has_y) { out.has_y = true; out.y1 = y; } }
         break;
       }
     }
@@ -2535,7 +2616,7 @@ namespace dynbse {
                                         nda::array<cplx, 4> const &Dc, double tol, long maxit, long m,
                                         nda::array<cplx, 3> const *Cb_cst = nullptr, shift_tables const *st = nullptr,
                                         tf_metric const *metric = nullptr, double readout_tol = 0.0,
-                                        bool gamma1_only = false) {
+                                        bool gamma1_only = false, bool keep_y = false) {
     const long nk = P.nk, nc = P.nc, nR = Dc.shape(3), np = b.np;
     utils::check(m >= 1, "dynbse::solve_dyson_gmres: m >= 1.");
     dyson_result out;
@@ -2559,11 +2640,12 @@ namespace dynbse {
     out.fit_err_max = std::max(out.fit_err_max, kd(Gamma, Gsum, rhs));
     ls_apply(b, P, S, inu, shared, Dc, rhs, Gamma, Gsum, Cb_cst, st);
     out.Gsum1 = Gsum;
+    if (keep_y) { out.has_y = true; out.y1 = rhs; }
     // Gamma_1 = static + one dynamic rung on static-ladder legs = D^dag L_s K_d L_s D, which is exactly the
     // first iterate (Gsum1) built above -- BEFORE the GMRES while-loop. A Gamma_1-only request stops here,
     // skipping the ~10-25 resummation applications (5-8x cheaper). out.Gsum is set to Gsum1 so the resummed
     // slot carries a defined value (the caller logs that resummation was skipped).
-    if (gamma1_only) { out.Gsum = Gsum; out.iterations = 1; out.converged = true; return out; }
+    if (gamma1_only) { out.Gsum = Gsum; out.iterations = 1; out.converged = true; if (keep_y) out.y = rhs; return out; }
     nda::array<cplx, 1> rhs_norm2(nR), dots(nR), sc(nR);
     tf_dots(rhs, rhs, rhs_norm2, metric);
     std::vector<tf_vector> V;
@@ -2777,6 +2859,7 @@ namespace dynbse {
     out.converged = done;
     ls_apply(b, P, S, inu, shared, Dc, y, Gamma, Gsum, Cb_cst, st);
     out.Gsum = Gsum;
+    if (keep_y) out.y = y;
     return out;
   }
 

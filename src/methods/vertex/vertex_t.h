@@ -916,6 +916,7 @@ namespace solvers {
     double _sigma_pair_scale = 1.0;              // pol_vertex_sigma_scale (shared with "lff"): multiplies the correction
     bool _sigma_pair_herm = true;                // pol_vertex_sigma_pair_herm: Hermitize dSigma in (i, j)
     bool _sigma_pair_diag = false;               // pol_vertex_sigma_pair_diag: the nu-rank meter of the amplitude + the Pi-check dump
+    std::string _sigma_pair_side = "right";      // pol_vertex_sigma_pair_side: the dressed junction, "right" | "left" | "both" (static path)
     double _sigma_lff_pinv_tol = 1e-3;      // pol_vertex_sigma_pinv_tol: relative eigenvalue cutoff of Pi_0^-1 -- the vertex lives on the
                                             // bubble's strong modes (Si kp444: 49 of 156 carry 99.9 % of |tr B|; |Gamma_eff - 1| is bounded and
                                             // stable for 1e-1..1e-3, blows up below 1e-4 where dPi / Pi_0 is unbounded)
@@ -1007,6 +1008,7 @@ namespace solvers {
     // ⚠ Dropping a cut breaks Phi-derivability exactly as the head projection does
     // (CLAUDE.md section 2.1). DIAGNOSTIC ONLY -- these energies are not conserving.
     int _bl_drop = 0;
+    bool _skip_pi_c = false;   // TEST-LEVEL: omit Pi^C of an active vertex (set_skip_pi_c)
     // ---- P0.3: THE Gamma-HEAD STRENGTH lambda -----------------------------------------
     // Multiplies the madelung constant xi at EVERY point where the vertex builds its
     // analytic rank-1 Gamma head -- vertex_head_detail::build_head_rank1 (which serves
@@ -1609,17 +1611,29 @@ namespace solvers {
     /** LFF-aux L-6 (Route 2): pol_vertex_sigma = "pair" -- the pair-resolved STATIC-LADDER vertex in Sigma, from the same
      *  pair-space machinery as the polarization ladder (the left vertex D^dag (1 + Cb T_s) on the right GW leg, contracted
      *  with W-bar(q, i nu) and G on the C window; vertex_sigma_pair.icc). Independent of pol_vertex_inject (the P side). */
-    void set_sigma_pair(bool on, std::string const &col, std::string const &outer, double scale, bool hermitize, bool diag) {
-      utils::check(col == "static" or col == "static1",
-                   "vertex_t::set_sigma_pair: unknown pol_vertex_sigma_pair_col \"{}\". Valid options are \"static\" (default), \"static1\".", col);
+    void set_sigma_pair(bool on, std::string const &col, std::string const &outer, double scale, bool hermitize, bool diag,
+                        std::string const &side = "right") {
+      utils::check(col == "static" or col == "static1" or col == "static_dyn" or col == "dyn1_bare" or col == "dyn1" or col == "dyn",
+                   "vertex_t::set_sigma_pair: unknown pol_vertex_sigma_pair_col \"{}\". Valid options are \"static\" (default), \"static1\" "
+                   "(the static-ladder path) and \"static_dyn\", \"dyn1_bare\", \"dyn1\", \"dyn\" (the dynamic-rung path, L-7).", col);
       utils::check(outer == "dynamic" or outer == "static",
                    "vertex_t::set_sigma_pair: unknown pol_vertex_sigma_pair_outer \"{}\". Valid options are \"dynamic\" (default), \"static\".", outer);
+      utils::check(side == "right" or side == "left" or side == "both",
+                   "vertex_t::set_sigma_pair: unknown pol_vertex_sigma_pair_side \"{}\". Valid options are \"right\" (default), \"left\", \"both\".", side);
+      utils::check(side == "right" or col == "static" or col == "static1",
+                   "vertex_t::set_sigma_pair: pol_vertex_sigma_pair_side = \"{}\" is implemented on the static-ladder path only (col static | static1).", side);
       _sigma_pair = on; _sigma_pair_col = col; _sigma_pair_outer = outer; _sigma_pair_scale = scale; _sigma_pair_herm = hermitize;
-      _sigma_pair_diag = diag;
+      _sigma_pair_diag = diag; _sigma_pair_side = side;
       if (on)
-        app_log(1, "  [LFF-Sigma pair] pol_vertex_sigma = \"pair\": Sigma = G W-bar Lambda_s with the pair-resolved static-ladder vertex "
-                   "(column \"{}\", outer W-bar \"{}\", scale {}, Hermitized {}, diagnostics {}).", col, outer, scale, hermitize, diag);
+        app_log(1, "  [LFF-Sigma pair] pol_vertex_sigma = \"pair\": Sigma = G W-bar Lambda with the pair-resolved {} vertex "
+                   "(column \"{}\", outer W-bar \"{}\", junction \"{}\", scale {}, Hermitized {}, diagnostics {}).",
+                sigma_pair_dynamic() ? "DYNAMIC-rung ladder" : "static-ladder", col, outer, side, scale, hermitize, diag);
     }
+    /** L-7: the dynamic-rung columns run through eval_sigma_pair_dyn (vertex_sigma_dyn.icc) */
+    bool sigma_pair_dynamic() const {
+      return _sigma_pair_col == "static_dyn" or _sigma_pair_col == "dyn1_bare" or _sigma_pair_col == "dyn1" or _sigma_pair_col == "dyn";
+    }
+    std::string const &sigma_pair_side() const { return _sigma_pair_side; }
     bool sigma_pair_enabled() const { return _sigma_pair; }
     std::string const &sigma_pair_col() const { return _sigma_pair_col; }
     std::string const &sigma_pair_outer() const { return _sigma_pair_outer; }
@@ -1627,8 +1641,10 @@ namespace solvers {
     bool sigma_pair_herm() const { return _sigma_pair_herm; }
     bool sigma_pair_diag() const { return _sigma_pair_diag; }
     struct sigma_pair_opts {
-      std::string col = "static";     // "static" = A~ = [Cb T_s]^T D^*  |  "static1" = [Cb K_s]^T D^*
+      std::string col = "static";     // static | static1 (vertex_sigma_pair.icc) | static_dyn | dyn1_bare | dyn1 | dyn (vertex_sigma_dyn.icc)
       std::string outer = "dynamic";  // "dynamic" = W-bar_0 + [W_dyn(nu) - W_dyn(0)]  |  "static" = W-bar_0
+      std::string side = "right";     // the dressed junction: "right" (A = T_s Cb D on the right leg) | "left" (A~ = [Cb T_s]^T D^* on
+                                      // the left leg) | "both" (the average of the two one-sided insertions) -- static path only
       double sign_ks = -1.0;          // the ladder's rung sign (pol_vertex_dyn_sign)
       double scale = 1.0;
       bool hermitize = true;
@@ -1640,11 +1656,18 @@ namespace solvers {
       double t_total = 0.0, t_setup = 0.0, t_ks = 0.0, t_cb = 0.0, t_lu = 0.0, t_amp = 0.0, t_con = 0.0, rss_gb = 0.0;
       long nunits = 0;
       nda::array<double, 1> nu_spec;   // normalized Gram eigenvalues over nu, descending, max over units (nu_diag)
+      // L-7 (the dynamic path): the T-family refit error, the solver's G pole fit / tau refit / watchdog, solve wall, convergence
+      double e_fit_err = 0.0, fit_err_G = 0.0, refit_err = 0.0, ritz_max = 0.0, t_solve = 0.0;
+      bool all_converged = true;
     };
     /** The pair-resolved static-ladder vertex self-energy on the C window: dSig (nt, ns, nk, nc, nc), replicated.
      *  Runs on the READOUT instance (secondary frame, W-bar_0 of this update; cache_w called on demand for outer = dynamic). */
     void eval_sigma_pair(MBState &mb_state, THC_ERI auto &thc, sigma_pair_opts const &opt,
                          nda::array<ComplexType, 5> &dSig, sigma_pair_meter *met = nullptr);
+    /** L-7: the DYNAMIC-rung vertex in Sigma (vertex_sigma_dyn.icc): the dynbse solver on every bosonic node with the Sigma
+     *  hook armed; opt.col = static_dyn | dyn1_bare | dyn1 | dyn. Same output contract as eval_sigma_pair. */
+    void eval_sigma_pair_dyn(MBState &mb_state, THC_ERI auto &thc, sigma_pair_opts const &opt,
+                             nda::array<ComplexType, 5> &dSig, sigma_pair_meter *met = nullptr);
     std::string const &sigma_lff_bub() const { return _sigma_lff_bub; }
     double sigma_lff_scale() const { return _sigma_lff_scale; }
     double sigma_lff_pinv_tol() const { return _sigma_lff_pinv_tol; }
@@ -2031,6 +2054,11 @@ namespace solvers {
       _bl_drop = which;
     }
     int bl_drop() const { return _bl_drop; }
+    /** TEST-LEVEL (L-7 gate N2): skip the polarization cut Pi^C of an ACTIVE dynamic-rung vertex, so that (Sigma - Sigma_R0)
+     *  of a one-iteration run is the G^3 W^2 self-energy cut alone on the RPA W (the pair-resolved reference). Not a physics
+     *  knob: the two cuts belong together (CLAUDE.md invariant 1). */
+    void set_skip_pi_c(bool on) { _skip_pi_c = on; }
+    bool skip_pi_c() const { return _skip_pi_c; }
 
     /** DIAGNOSTIC, default OFF -- THE CONSTANT-RUNG ABSOLUTE PIN. Forces pi^dyn's total
      *  rung to be W0bar at every frequency, i.e. exactly Pi^{C,0}'s rung, so X^L must

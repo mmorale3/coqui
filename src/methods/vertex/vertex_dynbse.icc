@@ -49,6 +49,7 @@
 #include <mpi.h>
 #if defined(ENABLE_FFTW)
 #include "numerics/fft/fftw.h"
+#include "methods/vertex/vertex_sigma_dyn.icc"   // LFF-Sigma L-7: the Sigma hook of the dynamic-rung solver
 #endif
 
 namespace methods {
@@ -104,6 +105,9 @@ namespace solvers {
                                   // pair-space streaming (memory-bound: ~180 GB of traffic per application on Si)
       std::vector<long> const *q_subset = nullptr;   // evaluate only these transfers (all q when null);
                                                      // the outputs keep the full q axis (zeros elsewhere)
+      // LFF-Sigma L-7 (vertex_sigma_dyn.icc): when non-null, every unit also contracts its amputated vertex
+      // A = K_s Gsum + y into the self-energy accumulators of the hook (the solvers then keep their y iterates)
+      sigma_dyn_hook *sigma = nullptr;
       double gap_mask = 0.0;      // union scheme: DROP the G nodes with |eps| < gap_mask (Ha, relative to
                                   // mu = 0 of the pole variable). A gapped G has no spectral weight there;
                                   // the DLR fit's O(1) in-gap residues (T15 lesson) otherwise feed a loop
@@ -781,6 +785,18 @@ namespace solvers {
       if (met) met->t_setup += watch.lap();
 
       const cplx scale_k(opt.sign_ks / double(nk), 0.0);
+      const bool keep_y = (opt.sigma != nullptr);
+      if (opt.sigma != nullptr) {
+        utils::check(not wan, "pair_space_ladder_dyn: the Sigma hook needs the aux-frame legs (not the Wannier-pair frame).");
+        utils::check(not opt.bubble_only, "pair_space_ladder_dyn: the Sigma hook needs the solve (bubble_only set).");
+        utils::check(long(nu_list.size()) == nw_b, "pair_space_ladder_dyn: the Sigma hook needs EVERY bosonic node ({} of {} given).",
+                     nu_list.size(), nw_b);
+        utils::check(opt.dump_prefix.empty(), "pair_space_ladder_dyn: the Sigma hook and the unit dump/restart are exclusive.");
+        opt.sigma->init(nt, ns, nk, np, nc, b);
+        if (rank == 0)
+          app_log(1, "  [LFF-Sigma dyn] Sigma hook armed: col {}, outer W {}; accumulators (nt {}, nk {}, np {}, nc {}) x 3, {:.2f} GB per rank",
+                  opt.sigma->col, opt.sigma->outer, nt, nk, np, nc, double(nt * ns * nk * nc2) * (2.0 * double(np) + 1.0) * 16.0 / 1e9);
+      }
       const auto metric = db::build_tf_metric(b);       // the tau-value inner product of the solves
       const long nb = std::min(Nm, 16l);
       const long nrb = (opt.rhs_block > 0) ? std::min(opt.rhs_block, nout) : nout;   // RHS column block width
@@ -972,6 +988,16 @@ namespace solvers {
         }
         build_kbig(Xb, W0b, is, iq, kpq, qx_of, Kbig, symc);
         Ks() = Kbig * scale_k;
+        if (opt.sigma != nullptr) {
+          double dh = 0.0, kmx = 0.0;
+          for (long i = 0; i < D; ++i)
+            for (long j = 0; j < D; ++j) {
+              dh = std::max(dh, std::abs(Ks(i, j) - std::conj(Ks(j, i))));
+              kmx = std::max(kmx, std::abs(Ks(i, j)));
+            }
+          opt.sigma->ks_herm = std::max(opt.sigma->ks_herm, (kmx > 0.0) ? dh / kmx : 0.0);
+          ++opt.sigma->nunits;
+        }
         // the dense per-tau rungs K_d(s) (PH-symmetric: one block per mirror pair) and the constant part
         std::vector<long> trep(static_cast<size_t>(nt), -1);
         long ndist = 0;
@@ -1167,12 +1193,12 @@ namespace solvers {
               res.Gsum = Gsum;
               res.converged = true;
             } else if (opt.one_rung_only) {
-              res = db::solve_dyson_op(b, P, kd, S, inu, shared, Dblk, opt.tol, 1, false, &Cb_k, stp);
+              res = db::solve_dyson_op(b, P, kd, S, inu, shared, Dblk, opt.tol, 1, false, &Cb_k, stp, nullptr, keep_y);
             } else if (opt.gmres_m > 0) {
               res = db::solve_dyson_gmres(b, P, kd, S, inu, shared, Dblk, opt.tol, opt.maxit, opt.gmres_m, &Cb_k, stp,
-                                          &metric, opt.readout_tol, opt.gamma1_only);
+                                          &metric, opt.readout_tol, opt.gamma1_only, keep_y);
             } else {
-              res = db::solve_dyson_op(b, P, kd, S, inu, shared, Dblk, opt.tol, opt.maxit, false, &Cb_k, stp, &metric);
+              res = db::solve_dyson_op(b, P, kd, S, inu, shared, Dblk, opt.tol, opt.maxit, false, &Cb_k, stp, &metric, keep_y);
             }
             if (met) {
               auto const &stt = db::solve_timers_state();
@@ -1184,6 +1210,17 @@ namespace solvers {
             rconv_unit = rconv_unit or res.readout_converged;
             ritz_unit = std::max(ritz_unit, res.contraction);
             refit_unit = std::max(refit_unit, res.fit_err_max);
+            if (opt.sigma != nullptr) {
+              // LFF-Sigma L-7: the outer W-bar of this node, then the block's deposit into the accumulators
+              nda::array<cplx, 2> Wout(Nm, Nm);
+              Wout() = W0b(iq, all, all);
+              if (opt.sigma->outer == "dynamic") {
+                const long lp = std::max(m, tools.w_mirror_b(m)) - nw_b / 2;
+                for (long M = 0; M < Nm; ++M)
+                  for (long N = 0; N < Nm; ++N) Wout(M, N) += Wbh(iq, lp, M, N) - Wd0(iq, M, N);
+              }
+              sigma_dyn_accumulate(*opt.sigma, b, P, inu, res, Ks, Dc, N0, N1, Wout, G_CC, kpq, is, iq, m, tools);
+            }
             readout(res.Gsum0, Pi_static);
             if (opt.one_rung_only) {
               // Gsum1 = Cb D + sum L0 K_d L0 D  (T_s = 0): the pure one dynamic rung
@@ -1934,6 +1971,116 @@ namespace solvers {
     return r;
   }
 
+
+  /**
+   * LFF-Sigma L-7: the DYNAMIC-rung vertex in Sigma (vertex_sigma_dyn.icc), on the READOUT instance: the dynamic-rung
+   * ladder solver of eval_pol_dynbse_cut on EVERY bosonic node (both signs) x every transfer, with the Sigma hook armed;
+   * opt.col selects static_dyn | dyn1_bare | dyn1 | dyn (the solver mode follows: static_only | one_rung_only |
+   * gamma1_only | full GMRES). dSig OUT: (nt, ns, nk, nc, nc), replicated, Hermitized in (i, j) when opt.hermitize.
+   */
+  void vertex_t::eval_sigma_pair_dyn(MBState &mb_state, THC_ERI auto &thc, sigma_pair_opts const &opt,
+                                     nda::array<ComplexType, 5> &dSig, sigma_pair_meter *met) {
+    decltype(nda::range::all) all;
+    namespace vd = vertex_dynbse_detail;
+    vertex_ladder_detail::prof_watch twatch;
+    utils::check(active() and secondary(), "vertex_t::eval_sigma_pair_dyn: requires an ACTIVE secondary-basis vertex (the readout instance).");
+    utils::check(not _wannier, "vertex_t::eval_sigma_pair_dyn: the dynamic pair-resolved Sigma vertex runs in the band (window) frame only.");
+    utils::check(_W0b_qmm.has_value(), "vertex_t::eval_sigma_pair_dyn: W0bar is absent -- build_w0 must run first.");
+    utils::check(opt.col == "static_dyn" or opt.col == "dyn1_bare" or opt.col == "dyn1" or opt.col == "dyn",
+                 "vertex_t::eval_sigma_pair_dyn: unknown column \"{}\" (static_dyn | dyn1_bare | dyn1 | dyn).", opt.col);
+    utils::check(opt.outer == "dynamic" or opt.outer == "static", "vertex_t::eval_sigma_pair_dyn: unknown outer W \"{}\".", opt.outer);
+    auto MF = thc.MF();
+    auto mpi = thc.mpi();
+    if (not _Wb_qwmm.has_value()) {
+      app_log(1, "  [LFF-Sigma dyn] folding this iteration's W into the W-bar cache (cache_w on demand).");
+      cache_w(mb_state, thc);
+    }
+    nda::array<ComplexType, 5> G_CC;
+    nda::array<long, 2> kmq, kpq;
+    vertex_sym::sym_ctx const *symc = nullptr;
+    ladder_inputs(mb_state, thc, G_CC, kmq, kpq, symc);
+    utils::check(symc == nullptr or not symc->active, "vertex_t::eval_sigma_pair_dyn: the symmetric mesh is not wired (nosym only).");
+    utils::check(MF->nkpts() == MF->nkpts_ibz(), "vertex_t::eval_sigma_pair_dyn: nosym mesh expected.");
+    const nda::array<double, 2> kc(MF->kpts_crystal());
+    auto tools_h = vd::make_dyn_tools(*_ft, _dyn_iaft_prec, G_CC);
+    auto &tools = *tools_h.tools;
+    utils::check(tools.nw_b == _ft->nw_b() and tools.nt_f == _ft->nt_f(),
+                 "vertex_t::eval_sigma_pair_dyn: the Sigma hook needs the LOOP's grid (pol_vertex_dyn_iaft_prec must not refine it).");
+    const long nq = long(_W0b_qmm.value().shape(0)), nw_b = tools.nw_b;
+    std::vector<long> nus(static_cast<size_t>(nw_b)), qs(static_cast<size_t>(nq));
+    for (long l = 0; l < nw_b; ++l) nus[size_t(l)] = l;
+    for (long iq = 0; iq < nq; ++iq) qs[size_t(iq)] = iq;
+    vd::sigma_dyn_hook hook;
+    hook.col = opt.col;
+    hook.outer = opt.outer;
+    vd::dyn_opts o;
+    o.kcrys = std::addressof(kc);
+    o.tol = _dyn_tol; o.maxit = _dyn_maxit; o.gmres_m = std::max<long>(_dyn_gmres, 12); o.sign_ks = opt.sign_ks;
+    o.rhs_block = _dyn_rhs_block;
+    o.dense_rung = _dyn_dense;
+    o.union_stride = _dyn_union_stride;
+    o.table_mode = _dyn_table_mode;
+    o.tfold = _dyn_tfold;
+    o.vmask_lo = _dyn_vmask_lo; o.vmask_hi = _dyn_vmask_hi;
+    o.static_only = (opt.col == "static_dyn");
+    o.one_rung_only = (opt.col == "dyn1_bare");
+    o.gamma1_only = (opt.col == "dyn1");
+    o.sched_comm = mpi->comm.get();
+    o.union_nodes = true;
+    o.gap_mask = 0.0;
+    if (char const *e = std::getenv("COQUI_DYNBSE_UNION")) o.union_nodes = (std::atoi(e) != 0);
+    o.readout_tol = 1e-6;
+    o.q_subset = std::addressof(qs);
+    o.sigma = std::addressof(hook);
+    vd::dyn_meter dmet;
+    vd::pair_space_ladder_dyn(G_CC, _Xb_skma, _W0b_qmm.value(), _Wb_qwmm.value(), kmq, kpq, tools, nus,
+                              nullptr, nullptr, nullptr, nullptr, mpi->comm.rank(), mpi->comm.size(), o, &dmet, symc);
+    mpi->comm.all_reduce_in_place_n(hook.S_cst.data(), hook.S_cst.size(), std::plus<>{});
+    mpi->comm.all_reduce_in_place_n(hook.RU.data(), hook.RU.size(), std::plus<>{});
+    mpi->comm.all_reduce_in_place_n(hook.RT.data(), hook.RT.size(), std::plus<>{});
+    dmet.reduce(mpi->comm);
+    hook.ks_herm = mpi->comm.all_reduce_value(hook.ks_herm, boost::mpi3::max<>{});
+    hook.amax = mpi->comm.all_reduce_value(hook.amax, boost::mpi3::max<>{});
+    hook.ymax = mpi->comm.all_reduce_value(hook.ymax, boost::mpi3::max<>{});
+    hook.t_sig = mpi->comm.all_reduce_value(hook.t_sig, boost::mpi3::max<>{});
+    hook.nunits = mpi->comm.all_reduce_value(hook.nunits, std::plus<>{});
+    double e_fit = 0.0;
+    vd::sigma_dyn_finish(hook, opt.scale, MF->nkpts(), dSig, e_fit);
+    const long nt = dSig.shape(0), ns = dSig.shape(1), nk = dSig.shape(2), nc = dSig.shape(3);
+    double dmax = 0.0, dherm = 0.0;
+    for (long it = 0; it < nt; ++it)
+      for (long is = 0; is < ns; ++is)
+        for (long k = 0; k < nk; ++k)
+          for (long i = 0; i < nc; ++i)
+            for (long j = 0; j < nc; ++j) {
+              dmax = std::max(dmax, std::abs(dSig(it, is, k, i, j)));
+              dherm = std::max(dherm, std::abs(dSig(it, is, k, i, j) - std::conj(dSig(it, is, k, j, i))));
+            }
+    if (opt.hermitize)
+      for (long it = 0; it < nt; ++it)
+        for (long is = 0; is < ns; ++is)
+          for (long k = 0; k < nk; ++k)
+            for (long i = 0; i < nc; ++i)
+              for (long j = i; j < nc; ++j) {
+                const ComplexType hv = 0.5 * (dSig(it, is, k, i, j) + std::conj(dSig(it, is, k, j, i)));
+                dSig(it, is, k, i, j) = hv;
+                dSig(it, is, k, j, i) = std::conj(hv);
+              }
+    sigma_pair_meter mloc;
+    mloc.dsig_max = dmax; mloc.dsig_herm = (dmax > 0.0) ? dherm / dmax : 0.0; mloc.ks_herm = hook.ks_herm;
+    mloc.nunits = hook.nunits; mloc.t_total = twatch.lap(); mloc.t_amp = hook.t_sig; mloc.rss_gb = dmet.rss_max_gb;
+    mloc.e_fit_err = e_fit; mloc.fit_err_G = dmet.fit_err_G; mloc.refit_err = dmet.refit_err_max; mloc.ritz_max = dmet.ritz_max;
+    mloc.t_solve = dmet.t_solve; mloc.all_converged = (dmet.nconv == dmet.nunits);
+    app_log(1, "  [LFF-Sigma dyn] col {} outer {} scale {}: {} (s, q, nu) units on ALL {} bosonic nodes (union basis, GMRES({}), RHS blocks {}, "
+               "C = [{}, {}), N_m = {}, n_p = {}): max |dSigma(tau)| = {:.4e}, anti-Hermitian residual {:.3e} ({}), |K_s - K_s^dag|/|K_s| = {:.2e}; "
+               "max |A_cst| {:.3e}, max |y| {:.3e}; E-refit (T family) {:.2e}, G pole fit {:.2e}, tau refit {:.2e}, watchdog {:.3f}, all converged {}; "
+               "wall {:.1f} s (solve {:.1f} s, Sigma deposits {:.1f} s on the slowest rank), RSS {:.2f} GB",
+            opt.col, opt.outer, opt.scale, dmet.nunits, nw_b, o.gmres_m, o.rhs_block, _band_window.first(), _band_window.last(), _Xb_skma.shape(2),
+            hook.np, dmax, mloc.dsig_herm, opt.hermitize ? "Hermitized" : "NOT Hermitized", hook.ks_herm, hook.amax, hook.ymax, e_fit,
+            dmet.fit_err_G, dmet.refit_err_max, dmet.ritz_max, mloc.all_converged, mloc.t_total, dmet.t_solve, hook.t_sig, dmet.rss_max_gb);
+    if (met) *met = mloc;
+    (void)all;
+  }
 } // namespace solvers
 } // namespace methods
 

@@ -2135,6 +2135,10 @@ namespace solvers {
       // must be unrepresentable rather than merely discouraged. B-L keeps the seam (its
       // P^{C,L} is injected here, increment S7).
       if (_vertex != nullptr and _vertex->rung() == static_rung) return;
+      if (_vertex != nullptr and _vertex->active() and _vertex->skip_pi_c()) {
+        app_log(1, "  [ISDF-Vertex] TEST switch set_skip_pi_c: the Pi^C cut is OMITTED (P = RPA); Sigma^C alone (a gate reference, not a theory).");
+        return;
+      }
       if (_vertex != nullptr and _vertex->active()) {
         auto dPi_C_tqPQ = _vertex->eval_Pi_C(mb_state, thc, dPi.grid(),
                                              dPi.block_size(), dPi.global_shape());
@@ -2633,8 +2637,10 @@ namespace solvers {
     o.hermitize = _vertex->sigma_pair_herm();
     o.nu_diag = _vertex->sigma_pair_diag();
     o.sign_ks = _vertex->ladder_dyn_sign();
+    o.side = _vertex->sigma_pair_side();
+    const bool dyn = _vertex->sigma_pair_dynamic();
     nda::array<ComplexType, 4> Pchk;
-    if (_vertex->sigma_pair_diag()) {
+    if (_vertex->sigma_pair_diag() and not dyn) {
       // the P side's own object from the same amplitudes (gate G1): dumped with the run prefix for the test / offline check
       const long nq = thc.MF()->nqpts_ibz(), Nm = _pol_vtx->secondary_rank(), nw_b = _ft->nw_b();
       Pchk = nda::array<ComplexType, 4>(nw_b, nq, Nm, Nm);
@@ -2642,14 +2648,18 @@ namespace solvers {
     }
     nda::array<ComplexType, 5> dS;
     vertex_t::sigma_pair_meter met;
-    _pol_vtx->eval_sigma_pair(mb_state, thc, o, dS, &met);
+    if (dyn) _pol_vtx->eval_sigma_pair_dyn(mb_state, thc, o, dS, &met);   // L-7: the dynamic-rung ladder in Sigma
+    else _pol_vtx->eval_sigma_pair(mb_state, thc, o, dS, &met);
     if (_vertex->sigma_pair_diag() and thc.mpi()->comm.root()) {
       const std::string fn = mb_state.coqui_prefix + ".sigpair.h5";
       h5::file f(fn, 'w');
       h5::group g(f);
-      nda::h5_write(g, "Pi_check", Pchk);
-      nda::h5_write(g, "nu_spec", met.nu_spec);
+      if (not dyn) {
+        nda::h5_write(g, "Pi_check", Pchk);
+        nda::h5_write(g, "nu_spec", met.nu_spec);
+      }
       nda::h5_write(g, "dSigma_tskab", dS);
+      h5::h5_write(g, "side", o.side);
       h5::h5_write(g, "col", o.col);
       h5::h5_write(g, "outer", o.outer);
       app_log(1, "  [LFF-Sigma pair] diagnostics written to {} (Pi_check (nw_b, nq, N_m, N_m), nu_spec, dSigma_tskab)", fn);

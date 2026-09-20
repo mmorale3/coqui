@@ -278,7 +278,15 @@ inline void ensure_checkpoint(std::shared_ptr<mf::MF> mf, std::string const& out
  *                 the resummed T_s ladder | "static1" = one static rung K_s -- with pol_vertex_sigma_pair_outer = "static"
  *                 this is exactly the B-S Sigma^{C,x} diagram), pol_vertex_sigma_pair_outer ("dynamic" = W-bar(q, i nu) |
  *                 "static" = W-bar_0), pol_vertex_sigma_scale, pol_vertex_sigma_pair_herm (true), pol_vertex_sigma_pair_diag
- *                 (false: the nu-rank meter of the amplitude + a <prefix>.sigpair.h5 dump). {choices: "none", "lff", "pair"}
+ *                 (false: the nu-rank meter of the amplitude + a <prefix>.sigpair.h5 dump), pol_vertex_sigma_pair_side
+ *                 ("right" = the ladder on the right GW junction | "left" = on the left junction, A~ = [Cb T_s]^T D^* | "both"
+ *                 = the average; static path only). L-7 (vertex_sigma_dyn.icc): pol_vertex_sigma_pair_col = "dyn1" (Gamma_1:
+ *                 one FULL-FREQUENCY rung dressed by static ladders, A = K_s Gsum1 + y_1) | "dyn" (the resummed dynamic-rung
+ *                 ladder, A = K_s Gsum + y) | "dyn1_bare" (T_s = 0: the one bare dynamic rung; with outer "dynamic" == the
+ *                 G^3 W^2 second-order exchange Sigma^C) | "static_dyn" (y = 0 through the dynamic path == "static"): the
+ *                 dynbse solver runs on EVERY bosonic node (both signs) x every transfer at the update_w tail -- the cost of
+ *                 an all-nu dynamic dump -- and the two-frequency amputated vertex is contracted in tau (the twisted family
+ *                 by exact partial fractions). {choices: "none", "lff", "pair"}
  *  - pol_vertex_sigma_bub: "window" Pi_0 of the vertex: the dump's window bubble ("Pi_bub") or the loop's RPA Pi folded
  *                 to the frame ("full"). pol_vertex_sigma_scale (1.0) multiplies the correction; pol_vertex_sigma_pinv_tol
  *                 (1e-3) = the relative eigenvalue cutoff of Pi_0^-1 (the vertex is restricted to the bubble's strong modes;
@@ -668,7 +676,8 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
               io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_pair_outer","dynamic"),
               io::get_value_with_default<double>(pt,"pol_vertex_sigma_scale",1.0),
               io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_herm",true),
-              io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_diag",false));
+              io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_diag",false),
+              io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_pair_side","right"));
         }
       }
     }
@@ -1077,7 +1086,8 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
               io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_pair_outer","dynamic"),
               io::get_value_with_default<double>(pt,"pol_vertex_sigma_scale",1.0),
               io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_herm",true),
-              io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_diag",false));
+              io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_diag",false),
+              io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_pair_side","right"));
         }
       }
     }
@@ -1339,7 +1349,8 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
               io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_pair_outer","dynamic"),
               io::get_value_with_default<double>(pt,"pol_vertex_sigma_scale",1.0),
               io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_herm",true),
-              io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_diag",false));
+              io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_diag",false),
+              io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_pair_side","right"));
         }
       }
     }
@@ -1647,7 +1658,8 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
               io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_pair_outer","dynamic"),
               io::get_value_with_default<double>(pt,"pol_vertex_sigma_scale",1.0),
               io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_herm",true),
-              io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_diag",false));
+              io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_diag",false),
+              io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_pair_side","right"));
         }
       }
     }
@@ -1981,7 +1993,8 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
               io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_pair_outer","dynamic"),
               io::get_value_with_default<double>(pt,"pol_vertex_sigma_scale",1.0),
               io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_herm",true),
-              io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_diag",false));
+              io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_diag",false),
+              io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_pair_side","right"));
         }
       }
     }

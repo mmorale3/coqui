@@ -473,8 +473,9 @@ namespace bdft_tests {
           long m0b = -1;
           { auto wb = ft.wn_mesh_b(); for (long l = 0; l < wb.shape(0); ++l) if (wb(l) == 0) m0b = l; }
           REQUIRE(m0b >= 0);
+          std::string side_cur = "right";   // the junction of the next kind-2 run (section N sets it)
           auto run_p = [&](std::string const &tag, int kind, std::string const &col, std::string const &outer, double scale, S5 &Sig) {
-            // kind: 0 = plain GW, 1 = B-S Sigma^{C,x}, 2 = the pair vertex
+            // kind: 0 = plain GW, 1 = B-S Sigma^{C,x} (static rung), 2 = the pair vertex, 3 = the DYNAMIC-rung B-S Sigma^C (G^3 W^2)
             const std::string out = "coqui_d3_winj_" + tag;
             solvers::hf_t hf; solvers::gw_t gw(&ft, "ignore_g0", out);
             solvers::scr_coulomb_t scr_eri(&ft, "rpa", "ignore_g0");
@@ -482,10 +483,12 @@ namespace bdft_tests {
             iter_scf::iter_scf_t iter_sol("damping");
             std::array<double, 4> m{0.0, 0.0, 0.0, 0.0}; std::array<double, 2> d{0.0, 0.0};
             double e_corr = 0.0, pichk = -1.0;
-            if (kind == 1) {
-              solvers::vertex_t vtx(&ft, "2nd_exchange", nda::range(0, 4), mfn->nbnd(), "ignore_g0", "secondary", -1, 1e-8, -1.0, -1.0, "static");
+            if (kind == 1 or kind == 3) {
+              solvers::vertex_t vtx(&ft, "2nd_exchange", nda::range(0, 4), mfn->nbnd(), "ignore_g0", "secondary", -1, 1e-8, -1.0, -1.0,
+                                    kind == 1 ? "static" : "dynamic");
               vtx.set_isdf_points("coqui_d3_winj_G.secpts.h5", false);
               vtx.set_bl_drop(1);
+              if (kind == 3) vtx.set_skip_pi_c(true);   // the G^3 W^2 cut alone on the RPA W: the reference for the one-bare-rung pair column (N2)
               scr_eri.set_vertex(&vtx); gw.set_vertex(&vtx);
               e_corr = std::get<1>(scf_loop(mb_state, dyson, erin, ft, solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol, 1, false, 1e-9, true));
             } else if (kind == 2) {
@@ -493,11 +496,11 @@ namespace bdft_tests {
               vtx.set_pol_vertex("ladder", "w0_prev", nda::range(0, 4), -1, 1e-8, -1.0, -1.0, -1.0, "none");
               vtx.set_ladder_rung("static", 1e-8, 30, 12, -1.0);
               vtx.set_isdf_points("coqui_d3_winj_G.secpts.h5", false);
-              vtx.set_sigma_pair(true, col, outer, scale, true, true);
+              vtx.set_sigma_pair(true, col, outer, scale, true, true, side_cur);
               scr_eri.set_vertex(&vtx);
               e_corr = std::get<1>(scf_loop(mb_state, dyson, erin, ft, solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol, 1, false, 1e-9, true));
               m = scr_eri.sigma_pair_meter(); d = gw.sigma_pair_dsigma();
-              if (col == "static") {   // G1: the P side's own object from the same amplitudes vs the dump's static column
+              if (col == "static" or col == "static1") {   // G1: the P side's own object from the same amplitudes vs the dump's static column
                 nda::array<std::complex<double>, 4> Pc, Ps;
                 { h5::file f(out + ".sigpair.h5", 'r'); h5::group g(f); nda::h5_read(g, "Pi_check", Pc); }
                 { h5::file f("coqui_d3_winj_G.pol_wh_dyn.g1.h5", 'r'); h5::group g(f); nda::h5_read(g, "Pi_static", Ps); }
@@ -580,6 +583,80 @@ namespace bdft_tests {
           REQUIRE(mp1[1] < 1e-8);                  // the one-rung static diagram is Hermitian by itself (the one-sided insertion with a
                                                    // dynamic outer W is not -- 6.7e-2 measured, Hermitized, logged above)
           REQUIRE(std::abs(cps - cr0) > 1e-10);    // the production object changes the correlation energy
+          if (std::getenv("COQUI_DYNBSE_TEST_SKIP_N") == nullptr) {
+            // ---- section N (2026-09-20): L-6b the junction side + L-7 the DYNAMIC-rung vertex in Sigma (vertex_sigma_dyn.icc) ----
+            // N1: the dynamic path with y = 0 (col static_dyn) == the static path (col static): the same amplitude K_s Gsum0 = T_s Cb D
+            //     (Cb_cst route) through the tau-closure of vertex_sigma_dyn -- an identity to the Cb round trip;
+            // N2: the ONE BARE dynamic rung (col dyn1_bare, T_s = 0) with the dynamic outer W == the G^3 W^2 second-order exchange
+            //     Sigma^C of the dynamic-rung B-S theory (vertex_type 2nd_exchange, rung dynamic, secondary frame, bl_drop 1):
+            //     the four terms [W_0 W_0] + [W_d W_0] + [W_0 W_d] + [W_d W_d] at one rung -- the exact identity of the dynamic path
+            //     (the twisted family, the E refit, the nu accumulation over both signs), to the pole-fit / refit class;
+            // N3: dyn1 (Gamma_1) and dyn (resummed): sizes, linearity in the scale, C-C only, Hermiticity residual;
+            // N4: the LEFT junction: (a) one rung + static W on the left leg == Sigma^{C,x} too (the crossed diagram is unique);
+            //     (b) resummed + dynamic W: |Sigma_L - Sigma_R^dag| / |Sigma_R| (is the mirror insertion the Hermitian conjugate?);
+            //     (c) side both == (Sigma_R + Sigma_L) / 2 (linearity) and its distance from the Hermitized one-sided object.
+            S5 S_xd, S_sd, S_d1b, S_d1, S_d1h, S_dr, S_pl1, S_pls, S_pb;
+            auto [cxd, mxd, dxd, kxd] = run_p("XD", 3, "static", "static", 1.0, S_xd);
+            auto [csd, msd, dsd, ksd] = run_p("SD", 2, "static_dyn", "dynamic", 1.0, S_sd);
+            auto [cd1b, md1b, dd1b, kd1b] = run_p("D1B", 2, "dyn1_bare", "dynamic", 1.0, S_d1b);
+            auto [cd1, md1, dd1, kd1] = run_p("D1", 2, "dyn1", "dynamic", 1.0, S_d1);
+            auto [cd1h, md1h, dd1h, kd1h] = run_p("D1H", 2, "dyn1", "dynamic", 0.5, S_d1h);
+            // COQUI_DYNBSE_TEST_SKIP_DR: reuse the Gamma_1 column in place of the resummed one (39 min on 2 ranks; measured 2026-09-19:
+            // e_corr -0.10505671, max|dSigma| 1.3601e-02, anti-Hermitian 4.75e-02 vs Gamma_1 -0.10531543 / 1.3606e-02 / 3.99e-02)
+            const bool skip_dr = (std::getenv("COQUI_DYNBSE_TEST_SKIP_DR") != nullptr);
+            auto [cdr, mdr, ddr, kdr] = skip_dr ? std::make_tuple(cd1, md1, dd1, kd1) : run_p("DR", 2, "dyn", "dynamic", 1.0, S_dr);
+            if (skip_dr) S_dr = S_d1;
+            side_cur = "left";
+            auto [cpl1, mpl1, dpl1, kpl1] = run_p("PL1", 2, "static1", "static", 1.0, S_pl1);
+            auto [cpls, mpls, dpls, kpls] = run_p("PLS", 2, "static", "dynamic", 1.0, S_pls);
+            side_cur = "both";
+            auto [cpb, mpb, dpb, kpb] = run_p("PB", 2, "static", "dynamic", 1.0, S_pb);
+            side_cur = "right";
+            double n_sd, d_sd, x_sd, n_xd, d_xd, x_xd, n_l1, d_l1, x_l1, n_h, d_h, x_h, n_b, d_b, x_b;
+            win_diff(S_sd, S_ps, 1.0, S_r0, n_sd, d_sd, x_sd);            // N1
+            win_diff(S_d1b, S_xd, 1.0, S_r0, n_xd, d_xd, x_xd);           // N2
+            win_diff(S_pl1, S_xs, 1.0, S_r0, n_l1, d_l1, x_l1);           // N4a
+            win_diff(S_d1h, S_d1, 0.5, S_r0, n_h, d_h, x_h);              // N3 linearity
+            // N4b: the left insertion vs the Hermitian conjugate of the right one (both un-Hermitized would be the clean
+            // statement; the runs are Hermitized, so compare the Hermitized objects: equal iff the mirror identity holds)
+            double n_lr = 0.0, d_lr = 0.0, n_bh = 0.0;
+            for (long it = 0; it < S_ps.shape(0); ++it)
+              for (long is = 0; is < S_ps.shape(1); ++is)
+                for (long ik = 0; ik < S_ps.shape(2); ++ik)
+                  for (long i = 0; i < nb; ++i)
+                    for (long j = 0; j < nb; ++j) {
+                      const auto dr_ = S_ps(it, is, ik, i, j) - S_r0(it, is, ik, i, j);
+                      const auto dl_ = S_pls(it, is, ik, i, j) - S_r0(it, is, ik, i, j);
+                      const auto db_ = S_pb(it, is, ik, i, j) - S_r0(it, is, ik, i, j);
+                      n_lr += std::norm(dl_ - dr_); d_lr += std::norm(dr_); n_bh += std::norm(db_ - 0.5 * (dr_ + dl_));
+                    }
+            n_lr = std::sqrt(n_lr); d_lr = std::sqrt(d_lr); n_bh = std::sqrt(n_bh);
+            double off_d = 0.0;
+            for (long it = 0; it < S_dr.shape(0); ++it)
+              for (long is = 0; is < S_dr.shape(1); ++is)
+                for (long ik = 0; ik < S_dr.shape(2); ++ik)
+                  for (long i = 0; i < S_dr.shape(3); ++i)
+                    for (long j = 0; j < S_dr.shape(4); ++j)
+                      if (i >= nb or j >= nb) off_d = std::max(off_d, std::abs(S_dr(it, is, ik, i, j) - S_r0(it, is, ik, i, j)));
+            app_log(1, "dynbse_readout LFF-Sigma DYN gate: N1 static limit of the dynamic path vs the static path: rel {:.3e} (max |d| {:.3e}); "
+                       "N2 EXACT IDENTITY one bare dynamic rung + dynamic outer W vs the DYNAMIC B-S Sigma^C (G^3 W^2): rel Frobenius {:.3e} "
+                       "(max |d| {:.3e}, |Sigma^C_dyn|_F {:.4e}); e_corr XD {:+.10f} D1B {:+.10f} (R0 {:+.10f}, XS {:+.10f}); "
+                       "N3 sizes: max|dSigma| dyn1 {:.4e} dyn {:.4e} (static {:.4e}), anti-Hermitian residual dyn1 {:.2e} dyn {:.2e} (static {:.2e}), "
+                       "e_corr dyn1 {:+.8f} dyn {:+.8f} (PS {:+.8f}), linearity |dSigma(1/2) - dSigma(1)/2| rel {:.2e}, off-window {:.2e}; "
+                       "N4a left one rung + static W vs Sigma^(C,x): rel {:.3e}; N4b |Sigma_L - Sigma_R| / |Sigma_R| (resummed + dynamic W, Hermitized) "
+                       "{:.3e} (e_corr PL {:+.8f} PLS {:+.8f}); N4c |both - (R + L)/2| {:.2e}",
+                    n_sd / d_sd, x_sd, n_xd / std::max(d_xd, 1e-300), x_xd, d_xd, cxd, cd1b, cr0, cxs,
+                    md1[0], mdr[0], mps[0], md1[1], mdr[1], mps[1], cd1, cdr, cps, (d_h > 0.0 ? n_h / d_h : 0.0), off_d,
+                    n_l1 / d_l1, (d_lr > 0.0 ? n_lr / d_lr : 0.0), cpl1, cpls, n_bh);
+            REQUIRE(n_sd / d_sd < 1e-8);           // N1: the dynamic path reproduces the static-ladder Sigma vertex
+            REQUIRE(d_xd > 0.0);
+            REQUIRE(n_xd / d_xd < 1e-3);           // N2: the exact identity with the dynamic Sigma^C (pole-fit / refit class)
+            REQUIRE(n_h <= 1e-10 * d_h);           // N3: linear in the scale
+            REQUIRE(off_d == 0.0);                 // C-C only
+            REQUIRE(n_l1 / d_l1 < 1e-8);           // N4a: the left one-rung insertion is the same crossed diagram
+            REQUIRE(n_bh < 1e-10);                 // N4c: both == the average of the two one-sided insertions
+            REQUIRE(std::abs(cd1 - cr0) > 1e-10);  // the dynamic vertex changes the correlation energy
+          }
         }
 };
       if (std::getenv("COQUI_DYNBSE_TEST_M_ONLY")) { section_m(); return; }   // re-run section M alone on an existing run-G dump
@@ -897,6 +974,140 @@ namespace bdft_tests {
         for (auto const &e : std::filesystem::directory_iterator("."))
           if (e.path().filename().string().rfind("coqui_d3_winj_A.", 0) == 0) std::filesystem::remove(e.path());
       }
+      mpi_context->comm.barrier();
+      return;
+    }
+    if (std::getenv("COQUI_DYNBSE_TEST_SIGPAIR_SYMW")) {
+      // ---- L-6c (2026-09-20): the pair-resolved Sigma vertex in WANNIER mode and on the SYMMETRIC mesh ----------------------
+      // (W) nosym fixture: the one-rung static object (col static1, outer static) in the band frame vs in a Wannier frame that is a
+      //     unitary mix V of the SAME window (M = |C|): the C-space object is gauge-invariant, so the band-frame dSigma must agree
+      //     (the MLWF-frame contraction rotated back with U dSigma_bar U^dag); V = 1 must reproduce it to rounding.
+      // (S) symmetric fixture (qe_lih222_sym): the same one-rung object on the IBZ externals vs the B-S Sigma^{C,x} on the symmetric
+      //     mesh (its own IBZ path), both at the pair run's own (star-closed) points: the exact identity again.
+      using S5 = nda::array<std::complex<double>, 5>;
+      auto read_sig = [&](std::string const &fn, S5 &S) {
+        h5::file f(fn, 'r'); h5::group g(f);
+        auto it = g.open_group("scf").open_group("iter1");
+        nda::h5_read(it, "Sigma_tskij", S);
+      };
+      // kind: 0 plain GW, 1 B-S Sigma^{C,x} (static rung, bl_drop 1), 2 the pair vertex (col static1, outer static; the eps readout
+      // CONSUMES `interp` -- the static nu = 0 ladder readout is window/nosym-only, exactly as the W-int gate's consumer runs),
+      // 4 the dynamic band run that dumps the points and the nu0 column (2 iterations, as run_w's A)
+      auto run_sw = [&](std::string const &tag, std::shared_ptr<mf::MF> mfw, auto &eriw, int kind, std::string const &points,
+                        std::string const &interp, nda::array<std::complex<double>, 2> const *V, bool keep, S5 &Sig) {
+        const std::string out = "coqui_d3_sigsw_" + tag;
+        solvers::hf_t hf; solvers::gw_t gw(&ft, "ignore_g0", out);
+        solvers::scr_coulomb_t scr_eri(&ft, "rpa", "ignore_g0");
+        simple_dyson dyson(mfw.get(), &ft); MBState mb_state(mpi_context, ft, out);
+        iter_scf::iter_scf_t iter_sol("damping");
+        double e_corr = 0.0;
+        std::array<double, 4> m{0.0, 0.0, 0.0, 0.0};
+        if (kind == 1) {
+          solvers::vertex_t vtx(&ft, "2nd_exchange", nda::range(0, 4), mfw->nbnd(), "ignore_g0", "secondary", -1, 1e-8, -1.0, -1.0, "static");
+          vtx.set_isdf_points(points, points.empty());
+          vtx.set_bl_drop(1);
+          scr_eri.set_vertex(&vtx); gw.set_vertex(&vtx);
+          e_corr = std::get<1>(scf_loop(mb_state, dyson, eriw, ft, solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol, 1, false, 1e-9, true));
+        } else if (kind == 2) {
+          solvers::vertex_t vtx(&ft, "none", nda::range(0, 0), mfw->nbnd());
+          vtx.set_pol_vertex("ladder", "w0_prev", nda::range(0, 4), -1, 1e-8, -1.0, -1.0, -1.0, "none");
+          vtx.set_ladder_rung("static", 1e-8, 30, 12, -1.0);
+          vtx.set_isdf_points(points, points.empty());
+          vtx.set_wannier_frame("aux");
+          vtx.set_pol_interp(interp, "static");
+          if (V) { auto proj = make_degenerate_projector(*mfw, 0, 4, V, false); vtx.set_wannier_projector(proj, true); }
+          vtx.set_sigma_pair(true, "static1", "static", 1.0, true, false, "right");
+          scr_eri.set_vertex(&vtx);
+          e_corr = std::get<1>(scf_loop(mb_state, dyson, eriw, ft, solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol, 1, false, 1e-9, true));
+          m = scr_eri.sigma_pair_meter();
+        } else if (kind == 4) {
+          solvers::vertex_t vtx(&ft, "none", nda::range(0, 0), mfw->nbnd());
+          vtx.set_pol_vertex("ladder", "w0_prev", nda::range(0, 4), -1, 1e-8, -1.0, -1.0, -1.0, "none");
+          vtx.set_ladder_rung("dynamic", 1e-8, 30, 12, -1.0);
+          vtx.set_ladder_dyn_gamma1_only(true); vtx.set_ladder_dyn_dump(true);
+          vtx.set_isdf_points("", true); vtx.set_wannier_frame("aux");
+          scr_eri.set_vertex(&vtx);
+          e_corr = std::get<1>(scf_loop(mb_state, dyson, eriw, ft, solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol, 2, false, 1e-9, true));
+        } else {
+          e_corr = std::get<1>(scf_loop(mb_state, dyson, eriw, ft, solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol, 1, false, 1e-9, true));
+        }
+        mpi_context->comm.barrier();
+        read_sig(out + ".mbpt.h5", Sig);
+        app_log(1, "dynbse_readout LFF-Sigma pair sym/Wannier [{}]: kind {} points \"{}\" Wannier {}: e_corr {:.12f}, max|dSigma| {:.6e} (anti-Hermitian {:.2e}, wall {:.1f} s)",
+                tag, kind, points, V != nullptr, e_corr, m[0], m[1], m[3]);
+        mpi_context->comm.barrier();
+        if (mpi_context->comm.root() and not keep) {
+          remove((out + ".mbpt.h5").c_str());
+          for (auto const &e : std::filesystem::directory_iterator("."))
+            if (e.path().filename().string().rfind(out + ".", 0) == 0) std::filesystem::remove(e.path());
+        }
+        mpi_context->comm.barrier();
+        return e_corr;
+      };
+      auto cdiff = [&](S5 const &A, S5 const &B, S5 const &R, long nb, long nk_cmp, double &rel, double &mx) {
+        // || (A - R) - (B - R) ||_F / || B - R ||_F on the C block, the first nk_cmp k-points
+        double num = 0.0, den = 0.0; mx = 0.0;
+        for (long it = 0; it < A.shape(0); ++it)
+          for (long is = 0; is < A.shape(1); ++is)
+            for (long ik = 0; ik < nk_cmp; ++ik)
+              for (long i = 0; i < nb; ++i)
+                for (long j = 0; j < nb; ++j) {
+                  const auto da = A(it, is, ik, i, j) - R(it, is, ik, i, j), db = B(it, is, ik, i, j) - R(it, is, ik, i, j);
+                  num += std::norm(da - db); den += std::norm(db); mx = std::max(mx, std::abs(da - db));
+                }
+        rel = std::sqrt(num) / std::max(std::sqrt(den), 1e-300);
+      };
+      const long nb = 4;
+      // (W) the Wannier frame on the nosym fixture
+      nda::array<std::complex<double>, 2> V(4, 4), I4(4, 4);
+      V() = std::complex<double>(0.0); I4() = std::complex<double>(0.0);
+      for (long a = 0; a < 4; ++a) { V(a, a) = 1.0; I4(a, a) = 1.0; }
+      auto givens = [&](long p, long q, double th, double ph) {
+        const double c = std::cos(th), s = std::sin(th); const std::complex<double> eph(std::cos(ph), std::sin(ph));
+        for (long i = 0; i < 4; ++i) { const auto vp = V(i, p), vq = V(i, q); V(i, p) = vp * c - vq * s * std::conj(eph); V(i, q) = vp * s * eph + vq * c; }
+      };
+      givens(0, 1, 0.7, 0.3); givens(1, 2, 1.1, -0.8); givens(2, 3, 0.4, 1.9); givens(0, 3, 0.9, 0.5);
+      S5 S_r0, S_p1, S_pi, S_pv, S_a;
+      const std::string ptsn = "coqui_d3_sigsw_A.secpts.h5", nu0n = "coqui_d3_sigsw_A.pol_nu0.g2.h5";
+      double ca = run_sw("A", mf, eri, 4, "", "", nullptr, true, S_a);           // band, dynamic: dumps the points + the nu0 column
+      REQUIRE(std::filesystem::exists(ptsn)); REQUIRE(std::filesystem::exists(nu0n));
+      double cr0 = run_sw("R0", mf, eri, 0, "", "", nullptr, false, S_r0);
+      double cp1 = run_sw("P1", mf, eri, 2, ptsn, nu0n, nullptr, false, S_p1);  // band frame on A's points, readout consumes A's column
+      double cpi = run_sw("PI", mf, eri, 2, ptsn, nu0n, &I4, false, S_pi);      // Wannier V = 1 on the same points
+      double cpv = run_sw("PV", mf, eri, 2, ptsn, nu0n, &V, false, S_pv);       // Wannier unitary mix V
+      (void)ca;
+      double relI, mxI, relV, mxV;
+      cdiff(S_pi, S_p1, S_r0, nb, S_r0.shape(2), relI, mxI);
+      cdiff(S_pv, S_p1, S_r0, nb, S_r0.shape(2), relV, mxV);
+      app_log(1, "dynbse_readout LFF-Sigma pair WANNIER gate: band frame vs Wannier V = 1: rel {:.3e} (max |d| {:.2e}); vs a unitary mix V of the window: "
+                 "rel {:.3e} (max |d| {:.2e}); e_corr band {:+.10f} V=1 {:+.10f} V {:+.10f} (R0 {:+.10f})", relI, mxI, relV, mxV, cp1, cpi, cpv, cr0);
+      REQUIRE(relI < 1e-9);
+      REQUIRE(relV < 1e-7);   // the C-space object is gauge-invariant (the W-int point-frame gate holds at 1e-8)
+      // (S) the symmetric mesh
+      std::string fx = std::getenv("COQUI_DYNBSE_TEST_SIGPAIR_SYMW"); if (fx == "1" or fx.empty()) fx = "qe_lih222_sym";
+      auto mfs = std::make_shared<mf::MF>(mf::default_MF(mpi_context, fx));
+      thc_reader_t thcs(mfs, make_thc_reader_ptree(mfs->nbnd() * 8, "", "incore", "", "bdft", 1e-10, mfs->ecutrho(), 1, 1024));
+      auto eris = mb_eri_t(thcs, thcs);
+      app_log(1, "dynbse_readout LFF-Sigma pair SYM gate on {}: nkpts {} (IBZ {}), nqpts {} (IBZ {})", fx, mfs->nkpts(), mfs->nkpts_ibz(), mfs->nqpts(), mfs->nqpts_ibz());
+      S5 S_sr0, S_sp1, S_sxs, S_sa;
+      const std::string ptss = "coqui_d3_sigsw_SA.secpts.h5", nu0s = "coqui_d3_sigsw_SA.pol_nu0.g2.h5";
+      double csa = run_sw("SA", mfs, eris, 4, "", "", nullptr, true, S_sa);       // the sym mesh's own star-closed points + nu0 column
+      REQUIRE(std::filesystem::exists(ptss)); REQUIRE(std::filesystem::exists(nu0s));
+      double csr0 = run_sw("SR0", mfs, eris, 0, "", "", nullptr, false, S_sr0);
+      double csp1 = run_sw("SP1", mfs, eris, 2, ptss, nu0s, nullptr, false, S_sp1);   // the pair vertex on the sym mesh (IBZ externals)
+      double csxs = run_sw("SXS", mfs, eris, 1, ptss, "", nullptr, false, S_sxs);     // B-S Sigma^{C,x} on the sym mesh at the same points
+      (void)csa;
+      REQUIRE(S_sp1.shape(2) == mfs->nkpts_ibz());
+      double relS, mxS;
+      cdiff(S_sp1, S_sxs, S_sr0, nb, mfs->nkpts_ibz(), relS, mxS);
+      app_log(1, "dynbse_readout LFF-Sigma pair SYM gate: one rung + static W on the SYMMETRIC mesh vs B-S Sigma^(C,x) (sym): rel Frobenius {:.3e} "
+                 "(max |d| {:.2e}); e_corr SP1 {:+.10f} SXS {:+.10f} (SR0 {:+.10f}); nosym P1 {:+.10f} XS-equivalent identity on nosym: see section M",
+              relS, mxS, csp1, csxs, csr0, cp1);
+      REQUIRE(relS < 1e-6);   // the symmetric path's own accuracy floor is the C-sector rotation unitarity (~1e-8 class)
+      mpi_context->comm.barrier();
+      if (mpi_context->comm.root())
+        for (auto const &e : std::filesystem::directory_iterator("."))
+          if (e.path().filename().string().rfind("coqui_d3_sigsw_", 0) == 0) std::filesystem::remove(e.path());
       mpi_context->comm.barrier();
       return;
     }

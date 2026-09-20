@@ -4793,6 +4793,8 @@ namespace solvers {
   template vertex_t::dynbse_nu0_result vertex_t::eval_pol_dynbse_nu0(MBState&, thc_reader_t&, long);
   template void vertex_t::eval_sigma_pair(MBState&, thc_reader_t&, vertex_t::sigma_pair_opts const&,
                                           nda::array<ComplexType, 5>&, vertex_t::sigma_pair_meter*);
+  template void vertex_t::eval_sigma_pair_dyn(MBState&, thc_reader_t&, vertex_t::sigma_pair_opts const&,
+                                          nda::array<ComplexType, 5>&, vertex_t::sigma_pair_meter*);
   template vertex_t::dynbse_cut_result vertex_t::eval_pol_dynbse_cut(MBState&, thc_reader_t&, std::vector<long> const&,
                                                                      std::vector<long> const&, long, bool);
   template vertex_t::ladder_whalf_diag
