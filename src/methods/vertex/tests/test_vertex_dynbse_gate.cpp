@@ -1081,8 +1081,6 @@ namespace bdft_tests {
       cdiff(S_pv, S_p1, S_r0, nb, S_r0.shape(2), relV, mxV);
       app_log(1, "dynbse_readout LFF-Sigma pair WANNIER gate: band frame vs Wannier V = 1: rel {:.3e} (max |d| {:.2e}); vs a unitary mix V of the window: "
                  "rel {:.3e} (max |d| {:.2e}); e_corr band {:+.10f} V=1 {:+.10f} V {:+.10f} (R0 {:+.10f})", relI, mxI, relV, mxV, cp1, cpi, cpv, cr0);
-      REQUIRE(relI < 1e-9);
-      REQUIRE(relV < 1e-7);   // the C-space object is gauge-invariant (the W-int point-frame gate holds at 1e-8)
       // (S) the symmetric mesh
       std::string fx = std::getenv("COQUI_DYNBSE_TEST_SIGPAIR_SYMW"); if (fx == "1" or fx.empty()) fx = "qe_lih222_sym";
       auto mfs = std::make_shared<mf::MF>(mf::default_MF(mpi_context, fx));
@@ -1103,6 +1101,8 @@ namespace bdft_tests {
       app_log(1, "dynbse_readout LFF-Sigma pair SYM gate: one rung + static W on the SYMMETRIC mesh vs B-S Sigma^(C,x) (sym): rel Frobenius {:.3e} "
                  "(max |d| {:.2e}); e_corr SP1 {:+.10f} SXS {:+.10f} (SR0 {:+.10f}); nosym P1 {:+.10f} XS-equivalent identity on nosym: see section M",
               relS, mxS, csp1, csxs, csr0, cp1);
+      REQUIRE(relI < 1e-9);
+      REQUIRE(relV < 1e-7);   // the C-space object is gauge-invariant (the W-int point-frame gate holds at 1e-8)
       REQUIRE(relS < 1e-6);   // the symmetric path's own accuracy floor is the C-sector rotation unitarity (~1e-8 class)
       mpi_context->comm.barrier();
       if (mpi_context->comm.root())

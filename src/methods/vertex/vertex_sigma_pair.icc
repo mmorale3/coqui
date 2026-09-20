@@ -77,7 +77,13 @@ namespace solvers {
                                 nda::array<long, 2> const &kmq, nda::array<long, 2> const &kpq,
                                 vertex_pi::iaft_tools const &tools, long rank, long nproc,
                                 vertex_t::sigma_pair_opts const &opt, nda::array<cplx, 5> &dSig,
-                                vertex_t::sigma_pair_meter *met, vertex_sym::sym_ctx const *symc = nullptr) {
+                                vertex_t::sigma_pair_meter *met, vertex_sym::sym_ctx const *symc = nullptr,
+                                nda::array<cplx, 5> const *G_close = nullptr) {
+      // G_close (L-6c, Wannier frame): the G of the tau CLOSURE sum_cc' G_cc'(k', tau) H(ci, c'j). The closure pairs the
+      // CONJUGATED collocation with G's first index (the validated band-frame pattern), the ladder's pair bubble pairs the
+      // unconjugated one -- so under a unitary change of the window basis the ladder wants G-bar = U^dag G U (the P side's
+      // Wannier inputs, G_CC here) while the closure wants U^T G U^* (measured: a complex V gave rel 0.83 with G-bar;
+      // the two coincide for real U, for U = 1 and for time-reversal images, where the transpose is the conjugate).
       decltype(nda::range::all) all;
       vertex_ladder_detail::prof_watch watch;
       const long nt = G_CC.shape(0), ns = G_CC.shape(1), nk = G_CC.shape(2), nc = G_CC.shape(3);
@@ -159,15 +165,32 @@ namespace solvers {
         const long qsx = sym ? symc->q_star(iq) : iq;            // the stored (IBZ) transfer of this unit's external q
         const bool trx = sym ? bool(symc->q_trev(iq)) : false;   // read W-bar(q) PQ-transposed for a time-reversal transfer
         // ---- the external legs (pair densities) of this transfer ------------------------------------
+        // symmetric mesh: W-bar(q) is stored at q_star in the aux frame of the mapping symmetry q_isym(q), so the legs
+        // that couple the pair to it are the EFFECTIVE columns Xhat(is, jsym, k) (rotation into that frame + the trev
+        // conjugation; identity for jsym = 0) -- the rung builder's own routing (build_U_legs). The C-window bands carry
+        // no rotation (identity D by convention), so G_CC(k') pairs with them unchanged.
+        const long jsx = sym ? symc->q_isym(iq) : 0;
         for (long k = 0; k < nk; ++k) {
           const long kq = kpq(iq, k);
-          for (long a = 0; a < nc; ++a)
-            for (long b = 0; b < nc; ++b)
-              for (long N = 0; N < Nm; ++N) {
-                const cplx v = Xb(is, k, N, a) * std::conj(Xb(is, kq, N, b));
-                Dm(k * nc2 + a * nc + b, N) = v;
-                Dconj(k * nc2 + a * nc + b, N) = std::conj(v);
-              }
+          if (sym) {
+            auto Xk = symc->Xhat(is, jsx, k, all, all);
+            auto Xkq = symc->Xhat(is, jsx, kq, all, all);
+            for (long a = 0; a < nc; ++a)
+              for (long b = 0; b < nc; ++b)
+                for (long N = 0; N < Nm; ++N) {
+                  const cplx v = Xk(N, a) * std::conj(Xkq(N, b));
+                  Dm(k * nc2 + a * nc + b, N) = v;
+                  Dconj(k * nc2 + a * nc + b, N) = std::conj(v);
+                }
+          } else {
+            for (long a = 0; a < nc; ++a)
+              for (long b = 0; b < nc; ++b)
+                for (long N = 0; N < Nm; ++N) {
+                  const cplx v = Xb(is, k, N, a) * std::conj(Xb(is, kq, N, b));
+                  Dm(k * nc2 + a * nc + b, N) = v;
+                  Dconj(k * nc2 + a * nc + b, N) = std::conj(v);
+                }
+          }
         }
         // ---- the static rung and its hermiticity meter ---------------------------------------------
         vd::build_kbig(Xb, W0b, is, iq, kpq, qx_of, Kbig, symc);
@@ -302,9 +325,15 @@ namespace solvers {
             for (long i = 0; i < nc; ++i)
               for (long j = 0; j < nc; ++j) {
                 cplx acc(0.0);
-                for (long c = 0; c < nc; ++c)
-                  for (long cp = 0; cp < nc; ++cp)
-                    acc += G_CC(it, is, kp, c, cp) * Ht(it, (kp * nc2 + c * nc + i) * nc2 + cp * nc + j);
+                if (G_close != nullptr) {
+                  for (long c = 0; c < nc; ++c)
+                    for (long cp = 0; cp < nc; ++cp)
+                      acc += (*G_close)(it, is, kp, c, cp) * Ht(it, (kp * nc2 + c * nc + i) * nc2 + cp * nc + j);
+                } else {
+                  for (long c = 0; c < nc; ++c)
+                    for (long cp = 0; cp < nc; ++cp)
+                      acc += G_CC(it, is, kp, c, cp) * Ht(it, (kp * nc2 + c * nc + i) * nc2 + cp * nc + j);
+                }
                 dSig(it, is, k, i, j) += pref * acc;
               }
         }
@@ -363,25 +392,51 @@ namespace solvers {
     const long nk = sym ? symc->nk_ibz : nk_full;      // the EXTERNAL k axis of Sigma (the IBZ under symmetry)
     dSig = nda::array<ComplexType, 5>(nt, ns, nk, nc, nc);
     sigma_pair_meter mloc;
+    std::optional<nda::array<ComplexType, 5>> G_close;
+    if (_wannier) {
+      // the closure's G in the MLWF frame: U^T G_W U^* from the band-window block of the loop's G (see eval_pair_sigma)
+      const long M = nc, nW = long(_band_window.size());
+      nda::array<ComplexType, 5> Gw(nt, ns, nk_full, nW, nW);
+      vertex_ladder_detail::expand_G_CC_fullbz(mb_state.sG_tskij.value().local(), _band_window,
+                                               MF->nkpts() != MF->nkpts_ibz(), MF->kp_to_ibz(), MF->kp_trev(), Gw);
+      G_close.emplace(nt, ns, nk_full, M, M);
+      nda::array<ComplexType, 2> Ut(M, nW), Uc(nW, M), S(nW, nW), T1(M, nW), R(M, M);
+      for (long is = 0; is < ns; ++is)
+        for (long k = 0; k < nk_full; ++k) {
+          for (long a = 0; a < nW; ++a)
+            for (long m = 0; m < M; ++m) { Ut(m, a) = _U_skia(is, k, a, m); Uc(a, m) = std::conj(_U_skia(is, k, a, m)); }
+          for (long it = 0; it < nt; ++it) {
+            S() = Gw(it, is, k, all, all);
+            nda::blas::gemm(Ut, S, T1);                                   // U^T G
+            nda::blas::gemm(T1, Uc, R);                                   // (U^T G) U^*
+            G_close.value()(it, is, k, all, all) = R;
+          }
+        }
+    }
     vs::eval_pair_sigma(G_CC, _Xb_skma, _W0b_qmm.value(), _Wb_qwmm.has_value() ? std::addressof(_Wb_qwmm.value()) : nullptr,
-                        kmq, kpq, tools, mpi->comm.rank(), mpi->comm.size(), opt, dSig, &mloc, symc);
+                        kmq, kpq, tools, mpi->comm.rank(), mpi->comm.size(), opt, dSig, &mloc, symc,
+                        G_close.has_value() ? std::addressof(G_close.value()) : nullptr);
     mpi->comm.all_reduce_in_place_n(dSig.data(), dSig.size(), std::plus<>{});
     if (_wannier) {
-      // L-6c: the contraction ran in the MLWF frame (G_bar = U^dag G U, X_bar = X U, nc = M); the self-energy block goes back
-      // to the band window as U dSigma_bar U^dag (the adjoint of the downfold), nW = |C| bands, U(s, k) = _U_skia(s, k, :, :)
+      // L-6c: the contraction ran in the MLWF frame (X_bar = X U; the closure with U^T G U^*, see eval_pair_sigma), so the
+      // block it produces carries the closure's TRANSPOSED convention, dSigma_bar = U^T dSigma U^* (it transforms as V^T . V^*
+      // under U -> U V, like its closure G): back to the band window with U^* dSigma_bar U^T (the inverse of that map; NOT
+      // U dSigma_bar U^dag, which is the inverse of the P side's U^dag G U convention -- measured rel 0.83 with a complex V),
+      // nW = |C| bands, U(s, k) = _U_skia(s, k, :, :)
       const long M = nc, nW = long(_band_window.size());
       utils::check(_U_skia.shape(0) == ns and _U_skia.shape(1) >= nk and _U_skia.shape(2) == nW and _U_skia.shape(3) == M,
                    "vertex_t::eval_sigma_pair: Wannier projector shape ({}, {}, {}, {}) vs (ns {}, nk {}, nW {}, M {}).",
                    _U_skia.shape(0), _U_skia.shape(1), _U_skia.shape(2), _U_skia.shape(3), ns, nk, nW, M);
       nda::array<ComplexType, 5> dSb(nt, ns, nk, nW, nW);
-      nda::array<ComplexType, 2> U(nW, M), T1(nW, M), S(M, M), Sb(nW, nW);
+      nda::array<ComplexType, 2> Uc(nW, M), Ut(M, nW), T1(nW, M), S(M, M), Sb(nW, nW);
       for (long is = 0; is < ns; ++is)
         for (long k = 0; k < nk; ++k) {
-          U() = _U_skia(is, k, all, all);
+          for (long a = 0; a < nW; ++a)
+            for (long m = 0; m < M; ++m) { Uc(a, m) = std::conj(_U_skia(is, k, a, m)); Ut(m, a) = _U_skia(is, k, a, m); }
           for (long it = 0; it < nt; ++it) {
             S() = dSig(it, is, k, all, all);
-            nda::blas::gemm(U, S, T1);                                   // U dSigma_bar
-            nda::blas::gemm(T1, nda::dagger(U), Sb);                     // (U dSigma_bar) U^dag
+            nda::blas::gemm(Uc, S, T1);                                  // U^* dSigma_bar
+            nda::blas::gemm(T1, Ut, Sb);                                 // (U^* dSigma_bar) U^T
             dSb(it, is, k, all, all) = Sb;
           }
         }
