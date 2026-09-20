@@ -18,21 +18,39 @@
  * THE CONTRACTION (the L-6 junction, vertex_sigma_pair.icc, with a frequency-dependent A): with k = k' + q,
  *     dSigma_ij(k, i omega) = -(scale/nk) sum_q sum_nu W-bar_NM(q, nu) D*_M(k'; c, i) [G(k') A_N(.; nu)]_{(c j)}(i omega - i nu),
  * a PRODUCT G(k', i omega') A(i omega'; nu) in the fermionic frequency omega' = omega - nu (the pair's own frequency) and a
- * convolution over nu with the outer W-bar. In the two-family pole basis of the solver, A = A_cst + sum_a AU_a U_a + sum_a
- * AT_a T_a (U_a = 1/(z - e_a), T_a = U_a S_a, S_a = 1/(z + i nu - e_a)); left-multiplying by G(k', z) = sum_j g_j U_j
- * (half_l0_left: exact partial fractions) gives F = G A_cst + sum_p FU_p U_p + sum_p FT_p T_p, and then
- *   (i)  constant part:  [G A_cst](i omega - i nu) summed over nu with W-bar(nu)  ->  G(k', tau) . Ttw[W-bar A_cst](tau)   (the L-6 route);
- *   (ii) U family:       sum_nu B_p(nu) U_p(i omega - i nu)  ->  Ttw[B_p](tau) K_F(tau, e_p),   B_p = D* W-bar FU_p        (pointwise);
- *   (iii) T family:      T_p(i omega - i nu; nu) = U_p(i omega) U_p(i omega - i nu), so the nu-sum is the convolution
- *                        E_p(tau) = Ttw[B^T_p](tau) K_F(tau, e_p) times U_p(i omega) in FREQUENCY -- a fermionic tau-convolution,
- *                        done EXACTLY by the pole fit of E_p onto the vertex nodes and the partial fractions
- *                        U_p U_p' = (U_p - U_p')/(e_p - e_p'), U_p^2 -> K_F2 (tau[U_p^2] = d K_F / d e, exact).
+ * convolution over nu with the outer W-bar. In the two-family pole basis of the solver, A = A_cst + sum_a fam0_a U_a + sum_a
+ * fam1_a T_a (U_a(z) = 1/(z - e_a), T_a(z) = U_a(z) S_a(z), S_a(z) = 1/(z + i nu - e_a) = U_a(i omega)). The three parts:
+ *   (i)  cst + U (the PRODUCT ROUTE, sigma_dyn_precompute): G . (A_cst + sum_a fam0_a U_a) is formed NUMERICALLY on the loop's
+ *        fermionic Matsubara nodes and transformed to tau with the fermionic DLR (every pole simple in the union scheme, so the
+ *        product is exactly representable); the legs per tau; summed over nu with the bosonic weights Ttw(tau, m) into S_cst.
+ *        (No partial fractions: the first version's per-node U pieces (U_j - U_a)/(e_j - e_a) cancel over the nodes by ~200x
+ *        on LiH, which no nu-sampled reconstruction survives.) At nu = 0 the solver's second family is U_a^2: added here too.
+ *   (ii) T (nu != 0): G(z) T_a(z) = sum_j g_j [U_a U_j - T_a] / (i nu - Delta_aj), Delta_aj = e_a - e_j (the G poles j) -- the
+ *        partial fractions of the pole route, organized per vertex node a. With the leg-contracted Y_a(nu) = D^* W-bar fam1_a(nu)
+ *        and kappa_aj(nu) = 1/(i nu - Delta_aj): RT_a -= Ttw kappa_aj [g_j Y_a] (the T_a piece: E_a(tau) = K_F(tau, a) RT_a(tau),
+ *        times U_a(i omega) in frequency = the exact fermionic convolution through the refit of E_a onto the vertex nodes and
+ *        U_a U_a' = (U_a - U_a')/(e_a - e_a'), U_a^2 -> K_F2), and RU_a += Ttw kappa_aj / Delta_aj [g_j Y_a], RU_{n_j} -= the same
+ *        (U_a U_j = (U_a - U_j)/Delta_aj; the finish multiplies K_F). The kappa factor is what makes the nu-transform legal:
+ *        Y_a(nu) itself does NOT decay in nu (measured: |Y_a| at the last node >= its mid-nu value, LiH), its bosonic transform
+ *        does not exist -- the first product route pushed Y_a through Ttw and missed the one-bare-rung identity by 34 %.
  *   The twisted family cannot go through Ttw pointwise (its tau image carries phi_nu(tau) = (1 - e^{i nu tau})/(i nu), an
- *   oscillatory function of nu that no bosonic DLR represents); (iii) never forms it.
+ *   oscillatory function of nu that no bosonic DLR represents); (ii) never forms it.
  * ACCUMULATION. The nu-sum needs EVERY bosonic node (the caller runs the driver on the full mesh, both signs); each unit
  * (s, q, node m) deposits its Ttw_bb(tau_i, m)-weighted objects into replicated accumulators
- *     S_cst(tau, s, k, i, j),  RU(tau, s, k, p, i, j),  RT(tau, s, k, p, i, j)
- * (k = k' + q folded in), all-reduced by the caller; sigma_dyn_finish assembles dSigma from them.
+ *     S_cst(tau, s, k, i, j)  [cst + U],  RT(tau, s, k, a, i, j)  [the T_a pieces],  RU(tau, s, k, p, i, j)  [the U pieces of (ii)]
+ * (k = k' + q folded in), all-reduced by the caller; sigma_dyn_finish assembles dSigma from them. Env COQUI_SIGDYN_ROUTE=poles
+ * runs the a134219 deposits (half_l0_left on the whole y) as a cross-check; COQUI_SIGDYN_FAMILIES = cst | cstU | cstT isolates.
+ * THE SAMPLED MODE (L-8, 2026-09-20): the nu-sum is linear, so with the per-node objects H(m) known on a SUBSET S of
+ * nodes and a learned nu-basis phi_a(m) (the top-K modes of a reference all-node run's objects, per object type),
+ * H(m) ~ sum_a c_a phi_a(m) with c fitted on S gives Sigma(tau) = sum_m Ttw(tau, m) H(m) = sum_{s in S} Tt(tau, s) H(s),
+ * Tt = Ttw . R, R = Phi_all . pinv(Phi_S) the nu-RECONSTRUCTION -- the same deposits with the weights Tt in place of the Ttw
+ * rows for the merged cst + U object (hook.W_cst, one global basis); for the T family the object reconstructed is Y_a(m) alone
+ * (one basis per vertex node a, hook.R_T), and the kappa factors are applied on the reconstruction, W_kappa(a, j, tau) =
+ * sum_m' Ttw(tau, m') R_a(m', m) kappa_aj(m') (hook.wk, per sampled node), so the 1/Delta split of the U pieces cancels
+ * exactly. The reference run writes its per-node objects (dump mode) to <prefix>.sigdyn.h5 (Hc (nw_b, ns, nt, nk, nc, nc),
+ * HT (nw_b, ns, np, nk, nc, nc) = the trace proxy sum_c Y_a(c i, c j), plus Ttw / KF / KF2 for offline analysis); the consumer
+ * learns the bases from that file (vertex_t::eval_sigma_pair_dyn), K < |S| (least squares; K = |S| interpolation amplifies
+ * through the sparse-node transform).
  */
 
 namespace methods {
@@ -43,27 +61,69 @@ namespace solvers {
       std::string col = "dyn1";          // static_dyn | dyn1_bare | dyn1 | dyn
       std::string outer = "dynamic";     // the outer W-bar: "dynamic" (W-bar_0 + W-bar_d(nu)) | "static" (W-bar_0)
       // accumulators over the units this rank owns (allocated by the driver once the basis is known)
-      nda::array<ComplexType, 5> S_cst;  // (nt, ns, nk, nc, nc)
-      nda::array<ComplexType, 6> RU, RT; // (nt, ns, nk, np, nc, nc)
-      std::optional<dynbse::freq_basis> basis;   // the (union-extended) basis of the run, for the finish
-      long np = 0;
-      // meters
-      double t_sig = 0.0, ks_herm = 0.0, amax = 0.0, ymax = 0.0;
-      long nunits = 0, nblocks = 0;
-      // scratch (sized on demand)
+      nda::array<ComplexType, 5> S_cst;  // (nt, ns, nk, nc, nc): the merged cst + U object (the product route)
+      nda::array<ComplexType, 6> RT;     // (nt, ns, nk, np, nc, nc): the T family per node a: E_a(tau) = K_F(tau, a) RT_a(tau) in the finish
+      nda::array<ComplexType, 6> RU;     // (nt, ns, nk, np, nc, nc): the U-pole pieces of the T family's partial fractions (K_F in the finish);
+                                         // the pole route (cross-check) also deposits its U family here
+      // the pole route (cross-check only): env COQUI_SIGDYN_ROUTE=poles; its scratch
+      bool poles = false;
+      // diagnostics: env COQUI_SIGDYN_FAMILIES = all (default) | cst | cstU | cstT -- which parts of y the deposits carry
+      bool use_U = true, use_T = true;
       nda::array<ComplexType, 5> AU, AT;
       long nR_cur = -1;
-      void init(long nt, long ns, long nk, long np_, long nc, dynbse::freq_basis const &b) {
+      std::optional<dynbse::freq_basis> basis;   // the (union-extended) basis of the run, for the finish
+      long np = 0;
+      // the sampled mode (L-8): the deposit weights of the merged cst + U object, W_cst(tau, m) = [Ttw . R_c](tau, m) (empty = the
+      // Ttw_bb rows, the all-node mode); for the T family the nu-RECONSTRUCTION R_a(m', m) of its per-node object Y_a (nw_b x nw_b,
+      // columns nonzero at the sampled nodes; ONE basis per vertex node a) -- the kappa factors 1/(i nu - (e_a - e_j)) of the
+      // partial fractions are applied to the reconstructed nu-profile (the wk cache below), so the 1/(e_a - e_j) split of the
+      // U pieces cancels exactly as in exact arithmetic (reconstructing the split pieces themselves is what failed: they
+      // cancel over the nodes by ~200x on LiH)
+      nda::array<ComplexType, 2> W_cst;
+      nda::array<ComplexType, 3> R_T;
+      std::map<long, nda::array<ComplexType, 3>> wk;   // per sampled node m: W_kappa(a, j, tau) = sum_m' Ttw(tau, m') R_a(m', m) kappa_aj(m')
+      bool sampled = false;              // the weights are the sampled-mode ones (the driver then accepts a node subset)
+      // dump mode: the per-node objects (before any weighting), for the nu-basis of a later sampled run
+      bool dump = false;
+      nda::array<ComplexType, 6> Hc_n;   // (nw_b, ns, nt, nk, nc, nc): the merged cst + U object per node
+      nda::array<ComplexType, 6> HT_n;   // (nw_b, ns, np, nk, nc, nc): the T family's trace proxy per (node, a)
+      // the product route's per-call precomputations (sigma_dyn_precompute)
+      bool pre_ok = false;
+      nda::array<ComplexType, 5> Gw;     // (nw_f, ns, nk, nc, nc): G on the fermionic Matsubara nodes
+      nda::array<ComplexType, 1> iw;     // (nw_f)
+      nda::array<double, 1> eps_pre;     // the node set of the first unit (every unit must share it: the kappa tables assume it)
+      // meters (conv_*: the product route's convention checks -- w_to_tau[1/(iw - e_a)] against +KF and -KF, tau_to_w[G] against
+      // the pole-fit G on the Matsubara nodes; fam1_ext: the largest T-family coefficient on an extension node a >= np_fit, which
+      // the T route does not carry)
+      double t_sig = 0.0, ks_herm = 0.0, amax = 0.0, ymax = 0.0;
+      double conv_kf = -1.0, conv_kf_neg = -1.0, conv_g = -1.0, fam1_ext = 0.0;
+      long nunits = 0, nblocks = 0;
+      void init(long nt, long ns, long nk, long np_, long nc, dynbse::freq_basis const &b, long nw_b) {
         np = np_;
+        utils::check(R_T.size() == 0 or R_T.shape(0) == np, "sigma_dyn_hook: the reference dump's np ({}) differs from this run's ({}).",
+                     R_T.size() == 0 ? 0 : R_T.shape(0), np);
         S_cst = nda::array<ComplexType, 5>(nt, ns, nk, nc, nc); S_cst() = ComplexType(0.0);
-        RU = nda::array<ComplexType, 6>(nt, ns, nk, np, nc, nc); RU() = ComplexType(0.0);
         RT = nda::array<ComplexType, 6>(nt, ns, nk, np, nc, nc); RT() = ComplexType(0.0);
+        RU = nda::array<ComplexType, 6>(nt, ns, nk, np, nc, nc); RU() = ComplexType(0.0);
+        poles = (std::getenv("COQUI_SIGDYN_ROUTE") != nullptr and std::string(std::getenv("COQUI_SIGDYN_ROUTE")) == "poles");
+        wk.clear();
+        if (auto const *f = std::getenv("COQUI_SIGDYN_FAMILIES"); f != nullptr) {
+          const std::string fs(f);
+          use_U = (fs == "all" or fs == "cstU"); use_T = (fs == "all" or fs == "cstT");
+        }
         basis = b;
+        if (dump) {
+          Hc_n = nda::array<ComplexType, 6>(nw_b, ns, nt, nk, nc, nc); Hc_n() = ComplexType(0.0);
+          HT_n = nda::array<ComplexType, 6>(nw_b, ns, np, nk, nc, nc); HT_n() = ComplexType(0.0);
+        }
       }
+      // the deposit weight of node m at tau node it, per object type (the Ttw row unless sampled weights were set)
+      ComplexType wc(vertex_pi::iaft_tools const &tools, long it, long m) const { return W_cst.size() > 0 ? W_cst(it, m) : tools.Ttw_bb(it, m); }
     };
 
-    /** one RHS block of one unit: deposit the block's contribution to S_cst / RU / RT (see the file header) */
-    inline void sigma_dyn_accumulate(sigma_dyn_hook &h, dynbse::freq_basis const &b, dynbse::pair_poles const &P, ComplexType inu,
+    /** THE POLE ROUTE (the a134219 deposits, kept for the route cross-check: env COQUI_SIGDYN_ROUTE=poles): the U family through
+     *  half_l0_left's partial fractions into RU (per p), the T family's coefficient into RT (per p, K_F applied in the finish) */
+    inline void sigma_dyn_accumulate_poles(sigma_dyn_hook &h, dynbse::freq_basis const &b, dynbse::pair_poles const &P, ComplexType inu,
                                      dynbse::dyson_result const &res, nda::array<ComplexType, 2> const &Ks,
                                      nda::array<ComplexType, 4> const &Dc, long N0, long N1,
                                      nda::array<ComplexType, 2> const &Wout, nda::MemoryArrayOfRank<5> auto const &G_CC,
@@ -130,7 +190,13 @@ namespace solvers {
             h.AT = nda::array<cplx, 5>(np, nk, nc, nc, nR);
             h.nR_cur = nR;
           }
-          dynbse::half_l0_left(b, P, inu, *yv, h.AU, h.AT);
+          if (h.use_U and h.use_T) dynbse::half_l0_left(b, P, inu, *yv, h.AU, h.AT);
+          else {
+            dynbse::tf_vector ym = *yv;
+            if (not h.use_U) ym.fam(0, all, all, all, all, all) = cplx(0.0);
+            if (not h.use_T) ym.fam(1, all, all, all, all, all) = cplx(0.0);
+            dynbse::half_l0_left(b, P, inu, ym, h.AU, h.AT);
+          }
           nda::array<cplx, 2> Dconj(nc2, Nm);
           nda::array<cplx, 2> Bk(nc2, Nm), Hc(nc, nc), Hsum(nc, nc);
           for (int fam = 0; fam < (nu0 ? 1 : 2); ++fam) {
@@ -168,7 +234,330 @@ namespace solvers {
       h.t_sig += watch.lap();
     }
 
-    /** the assembly after the all-reduce of the accumulators: dSig (nt, ns, nk, nc, nc) = -(scale/nk) [S_cst + Sigma_U + Sigma_T] */
+    /**
+     * The PRODUCT ROUTE (2026-09-20, replaces the partial fractions of half_l0_left in the deposits): G(k', z) A(z; nu) is
+     * formed NUMERICALLY on the loop's fermionic Matsubara nodes and transformed to tau with the fermionic DLR (in the
+     * union scheme every pole is simple, so the product is exactly representable). No 1/(e_j - e_a) coefficients, no
+     * confluence, and the U family no longer exists as a separate object:
+     *   cst + U :  A_cU(i w_n) = A_cst + sum_a fam0_a U_a(i w_n);  F_t = tau[G . A_cU]  (w_to_tau);  the leg contraction per tau;
+     *              deposit S_cst(tau, s, k, i, j) += w_cst(tau, m) H(tau; k'; i, j)                       [one accumulator, Hc]
+     *   T       :  T_a(i w - i nu) = U_a(i w) U_a(i w - i nu), so G(i w') T_a(i w') fam1_a -> U_a(i w) . [Q_a(i w') fam1_a] with
+     *              Q_a = tau[G U_a] (precomputed once per call for a < np_fit: (ns, np_fit, nt, nk, nc, nc)); the leg
+     *              contraction of fam1_a with W-bar(nu) and D^* gives Y_a(k'; c, i, x, j), and H_a(tau; k'; i, j) =
+     *              sum_cx Q_a(tau; k', c, x) Y_a(c, i, x, j); deposit RT(tau, s, k, a, i, j) += w_T(a, tau, m) H_a;
+     *              the finish refits E_a(tau) = RT(tau, a) onto the vertex nodes and multiplies by U_a in frequency
+     *              (U_a U_a' partial fractions, U_a^2 -> K_F2 exact) -- as before, without the K_F factor (it is inside Q_a).
+     * The dump keeps the per-node objects for the nu-bases: Hc_n (the merged cst + U object, tau-resolved) and, for the
+     * T family, the trace proxy sum_c Y_a(c, i, c, j) per (m, a) (the nu-dependence of Y_a is that of W-bar(nu) fam1_a(nu),
+     * shared by all its entries, so any fixed contraction over (c, x) spans the same nu-modes).
+     */
+    inline void sigma_dyn_precompute(sigma_dyn_hook &h, dynbse::freq_basis const &b, nda::MemoryArrayOfRank<5> auto const &G_CC,
+                                     vertex_pi::iaft_tools const &tools) {
+      using cplx = ComplexType;
+      const long nt = G_CC.shape(0), ns = G_CC.shape(1), nk = G_CC.shape(2), nc = G_CC.shape(3), nc2 = nc * nc;
+      auto const *ft = tools.ft;
+      const long nw_f = ft->nw_f(), npf = b.np_fit;
+      auto wf = ft->wn_mesh_f();
+      // G on the fermionic Matsubara nodes: (nw_f, ns nk nc2) from the exact G_CC(tau)
+      nda::array<cplx, 2> Gt(nt, ns * nk * nc2), Gw(nw_f, ns * nk * nc2);
+      for (long it = 0; it < nt; ++it)
+        for (long is = 0; is < ns; ++is)
+          for (long k = 0; k < nk; ++k)
+            for (long p = 0; p < nc2; ++p) Gt(it, (is * nk + k) * nc2 + p) = G_CC(it, is, k, p / nc, p % nc);
+      ft->tau_to_w(Gt, Gw, imag_axes_ft::fermion);
+      h.Gw = nda::array<cplx, 5>(nw_f, ns, nk, nc, nc);
+      for (long n = 0; n < nw_f; ++n)
+        for (long is = 0; is < ns; ++is)
+          for (long k = 0; k < nk; ++k)
+            for (long p = 0; p < nc2; ++p) h.Gw(n, is, k, p / nc, p % nc) = Gw(n, (is * nk + k) * nc2 + p);
+      h.iw = nda::array<cplx, 1>(nw_f);
+      for (long n = 0; n < nw_f; ++n) h.iw(n) = ft->omega(wf(n));
+      // the convention check: the fermionic w_to_tau of U_a = 1/(i w_n - e_a) must be KF(tau, a) (dlr_kF carries the sign of the
+      // standard transform); measured against +KF and -KF
+      {
+        nda::array<cplx, 2> Uw(nw_f, npf), Ut(nt, npf);
+        for (long n = 0; n < nw_f; ++n)
+          for (long a = 0; a < npf; ++a) Uw(n, a) = cplx(1.0) / (h.iw(n) - b.eps(a));
+        ft->w_to_tau(Uw, Ut, imag_axes_ft::fermion);
+        double dp = 0.0, dm = 0.0, sc = 0.0;
+        for (long it = 0; it < nt; ++it)
+          for (long a = 0; a < npf; ++a) {
+            dp = std::max(dp, std::abs(Ut(it, a) - cplx(b.KF(it, a))));
+            dm = std::max(dm, std::abs(Ut(it, a) + cplx(b.KF(it, a))));
+            sc = std::max(sc, std::abs(b.KF(it, a)));
+          }
+        h.conv_kf = dp / sc; h.conv_kf_neg = dm / sc;
+      }
+      h.eps_pre = b.eps;
+      h.pre_ok = true;
+    }
+
+    /** one RHS block of one unit: deposit the block's contribution to S_cst / RT (see the file header; the product route) */
+    inline void sigma_dyn_accumulate(sigma_dyn_hook &h, dynbse::freq_basis const &b, dynbse::pair_poles const &P, ComplexType inu,
+                                     dynbse::dyson_result const &res, nda::array<ComplexType, 2> const &Ks,
+                                     nda::array<ComplexType, 4> const &Dc, long N0, long N1,
+                                     nda::array<ComplexType, 2> const &Wout, nda::MemoryArrayOfRank<5> auto const &G_CC,
+                                     nda::array<long, 2> const &kpq, long is, long iq, long m,
+                                     vertex_pi::iaft_tools const &tools) {
+      using cplx = ComplexType;
+      decltype(nda::range::all) all;
+      vertex_ladder_detail::prof_watch watch;
+      const long nt = G_CC.shape(0), nk = P.nk, nc = P.nc, nc2 = nc * nc, D = nk * nc2, nR = N1 - N0, Nm = Dc.shape(3), np = b.np;
+      const bool nu0 = (inu == cplx(0.0));
+      const long ng = P.ng, npf = b.np_fit;
+      utils::check(h.np == np, "sigma_dyn_accumulate: basis size changed ({} vs {}).", np, h.np);
+      if (h.poles) { sigma_dyn_accumulate_poles(h, b, P, inu, res, Ks, Dc, N0, N1, Wout, G_CC, kpq, is, iq, m, tools); return; }
+      if (not h.pre_ok) sigma_dyn_precompute(h, b, G_CC, tools);
+      utils::check(h.eps_pre.shape(0) == b.eps.shape(0) and nda::max_element(nda::abs(h.eps_pre - b.eps)) == 0.0,
+                   "sigma_dyn_accumulate: the unit's node set differs from the first unit's.");
+      const long nw_f = h.Gw.shape(0);
+      if (h.conv_g < 0.0) {   // tau_to_w[G_CC] against the pole-fit G = sum_j gk_j / (i w_n - e_j) of this unit (spin is)
+        double d = 0.0, sc = 0.0;
+        for (long n = 0; n < nw_f; ++n)
+          for (long ik = 0; ik < nk; ++ik)
+            for (long c = 0; c < nc; ++c)
+              for (long x = 0; x < nc; ++x) {
+                cplx gp(0.0);
+                for (long j = 0; j < P.ng; ++j) gp += P.gk(j, ik, c, x) / (h.iw(n) - P.epsG(j));
+                d = std::max(d, std::abs(gp - h.Gw(n, is, ik, c, x)));
+                sc = std::max(sc, std::abs(h.Gw(n, is, ik, c, x)));
+              }
+        h.conv_g = (sc > 0.0) ? d / sc : d;
+      }
+      // ---- the column: which Gsum and which y --------------------------------------------------------------
+      nda::array<cplx, 4> const *Gs = nullptr;
+      dynbse::tf_vector const *yv = nullptr;
+      if (h.col == "static_dyn") { Gs = &res.Gsum0; }
+      else if (h.col == "dyn1_bare") { Gs = &res.Gsum0; yv = &res.y1; }
+      else if (h.col == "dyn1") { Gs = &res.Gsum1; yv = &res.y1; }
+      else if (h.col == "dyn") { Gs = &res.Gsum; yv = &res.y; }
+      else utils::check(false, "sigma_dyn_accumulate: unknown column \"{}\".", h.col);
+      if (yv != nullptr) utils::check(res.has_y and yv->nR == nR, "sigma_dyn_accumulate: the solver did not keep y (col {}).", h.col);
+      // ---- A_cst = K_s Gsum + y.cst  (D x nR) ----------------------------------------------------------------
+      nda::array<cplx, 2> gs(D, nR), Acst(D, nR);
+      for (long ik = 0; ik < nk; ++ik)
+        for (long p = 0; p < nc2; ++p)
+          for (long r = 0; r < nR; ++r) gs(ik * nc2 + p, r) = (*Gs)(ik, p / nc, p % nc, r);
+      nda::blas::gemm(Ks, gs, Acst);
+      if (yv != nullptr)
+        for (long ik = 0; ik < nk; ++ik)
+          for (long p = 0; p < nc2; ++p)
+            for (long r = 0; r < nR; ++r) Acst(ik * nc2 + p, r) += yv->cst(ik, p / nc, p % nc, r);
+      for (auto const &v : Acst) h.amax = std::max(h.amax, std::abs(v));
+      if (yv != nullptr) for (auto const &v : yv->fam) h.ymax = std::max(h.ymax, std::abs(v));
+      if (yv != nullptr and yv->fam.shape(0) > 1)
+        for (long a = npf; a < np; ++a)
+          for (long ik = 0; ik < nk; ++ik)
+            for (long x = 0; x < nc; ++x)
+              for (long y = 0; y < nc; ++y)
+                for (long r = 0; r < nR; ++r) h.fam1_ext = std::max(h.fam1_ext, std::abs(yv->fam(1, a, ik, x, y, r)));
+      auto Wblk = Wout(nda::range(N0, N1), all);                  // (nR, Nm): rows N of the dressed leg
+      // ---- (cst + U): A_cU on the Matsubara nodes, the product with G, the tau image, the legs -----------------------
+      {
+        // Uw(n, a) = 1/(i w_n - e_a); A_w(n; k' x y r) = Acst + sum_a Uw(n, a) fam0(a; k' x y r)   (one gemm)
+        nda::array<cplx, 2> Aw(nw_f, D * nR), Fw(nw_f, D * nR), Ft(nt, D * nR);
+        for (long n = 0; n < nw_f; ++n)
+          for (long row = 0; row < D; ++row)
+            for (long r = 0; r < nR; ++r) Aw(n, row * nR + r) = Acst(row, r);
+        if (yv != nullptr) {
+          nda::array<cplx, 2> Uw(nw_f, np), famf(np, D * nR);
+          for (long n = 0; n < nw_f; ++n)
+            for (long a = 0; a < np; ++a) Uw(n, a) = cplx(1.0) / (h.iw(n) - b.eps(a));
+          auto fill = [&](long f) {
+            for (long a = 0; a < np; ++a)
+              for (long ik = 0; ik < nk; ++ik)
+                for (long x = 0; x < nc; ++x)
+                  for (long y = 0; y < nc; ++y)
+                    for (long r = 0; r < nR; ++r) famf(a, (ik * nc2 + x * nc + y) * nR + r) = yv->fam(f, a, ik, x, y, r);
+          };
+          if (h.use_U) { fill(0); nda::blas::gemm(cplx(1.0), Uw, famf, cplx(1.0), Aw); }
+          if (h.use_T and nu0) {
+            // the nu = 0 second family: T_a(z; 0) = U_a(z)^2 (the solver's KF2 family at the union's G nodes) -- exact here
+            for (auto &v : Uw) v = v * v;
+            fill(1); nda::blas::gemm(cplx(1.0), Uw, famf, cplx(1.0), Aw);
+          }
+        }
+        // F_w(n; k', c, y, r) = sum_x G(n; k')_{c x} A_w(n; k', x, y, r)
+        nda::array<cplx, 2> g(nc, nc), V(nc, nc * nR), Wv(nc, nc * nR);
+        for (long n = 0; n < nw_f; ++n)
+          for (long ik = 0; ik < nk; ++ik) {
+            g() = h.Gw(n, is, ik, all, all);
+            for (long x = 0; x < nc; ++x)
+              for (long y = 0; y < nc; ++y)
+                for (long r = 0; r < nR; ++r) V(x, y * nR + r) = Aw(n, (ik * nc2 + x * nc + y) * nR + r);
+            nda::blas::gemm(g, V, Wv);
+            for (long c = 0; c < nc; ++c)
+              for (long y = 0; y < nc; ++y)
+                for (long r = 0; r < nR; ++r) Fw(n, (ik * nc2 + c * nc + y) * nR + r) = Wv(c, y * nR + r);
+          }
+        tools.ft->w_to_tau(Fw, Ft, imag_axes_ft::fermion);
+        // the legs per (tau, k'): B(c y, M) = sum_r F_t(c y, r) W(r, M);  H(i, j) = sum_c sum_M D^*(c i, M) B(c j, M)
+        nda::array<cplx, 2> Ak(nc2, nR), Bk(nc2, Nm), Dconj(nc2, Nm), Hc(nc, nc), Hsum(nc, nc);
+        for (long ik = 0; ik < nk; ++ik) {
+          const long k = kpq(iq, ik);
+          for (long c = 0; c < nc; ++c)
+            for (long i = 0; i < nc; ++i)
+              for (long M = 0; M < Nm; ++M) Dconj(c * nc + i, M) = std::conj(Dc(ik, c, i, M));
+          for (long it = 0; it < nt; ++it) {
+            for (long p = 0; p < nc2; ++p)
+              for (long r = 0; r < nR; ++r) Ak(p, r) = Ft(it, (ik * nc2 + p) * nR + r);
+            nda::blas::gemm(Ak, Wblk, Bk);
+            Hsum() = cplx(0.0);
+            for (long c = 0; c < nc; ++c) {
+              auto Dcv = Dconj(nda::range(c * nc, (c + 1) * nc), all);
+              auto Bcv = Bk(nda::range(c * nc, (c + 1) * nc), all);
+              nda::blas::gemm(Dcv, nda::transpose(Bcv), Hc);
+              Hsum += Hc;
+            }
+            const cplx w = h.wc(tools, it, m);
+            for (long i = 0; i < nc; ++i)
+              for (long j = 0; j < nc; ++j) {
+                h.S_cst(it, is, k, i, j) += w * Hsum(i, j);
+                if (h.dump) h.Hc_n(m, is, it, k, i, j) += Hsum(i, j);
+              }
+          }
+        }
+      }
+      // ---- the T family (nu != 0): G(z) T_a(z) = sum_j g_j [U_a U_j - T_a] / (i nu - (e_a - e_j))  (Delta_aj := e_a - e_j) --------------
+      // per vertex node a the leg-contracted object Y_a(c i, x j) = sum_M D^*(c i, M) sum_N fam1_a(x j, N) W(N, M) and its G-products
+      // M_aj(i j) = sum_cx g_j(c, x) Y_a(c i, x j); with kappa_aj(nu) = 1/(i nu - Delta_aj) the deposits are
+      //     RT_a  -= w kappa_aj M_aj            (the T_a piece: E_a(tau) = K_F(tau, a) RT_a(tau), times U_a(i w) in the finish)
+      //     RU_a  += w kappa_aj / Delta_aj M_aj,   RU_{n_j} -= w kappa_aj / Delta_aj M_aj      (U_a U_j = (U_a - U_j) / Delta_aj)
+      // All-node mode: w = Ttw(tau, m), the j-sums at the coefficient level (== the pole route's half_l0_left on fam1). Sampled mode:
+      // the nu-profile that is reconstructed is Y_a(m) alone (smooth, low rank); kappa is applied on the reconstruction,
+      // W_kappa(a, j, tau) = sum_m' Ttw(tau, m') R_a(m', m) kappa_aj(m'), so the 1/Delta split cancels exactly. (The first product
+      // route pushed Y_a(nu) itself through the bosonic transform: Y_a does not decay in nu -- the transform needs the kappa.)
+      if (yv != nullptr and not nu0 and h.use_T) {
+        nda::array<cplx, 3> const *Wk = nullptr;
+        if (h.sampled) {
+          auto itw = h.wk.find(m);
+          if (itw == h.wk.end()) {
+            utils::check(h.R_T.size() > 0, "sigma_dyn_accumulate: sampled mode without the T-family reconstruction.");
+            const long nw_b = tools.nw_b;
+            nda::array<cplx, 3> W(np, ng, nt);
+            W() = cplx(0.0);
+            nda::array<cplx, 1> inu_all(nw_b);
+            for (long mm = 0; mm < nw_b; ++mm) inu_all(mm) = tools.ft->omega(tools.wn_b(mm));
+            for (long a = 0; a < np; ++a)
+              for (long mm = 0; mm < nw_b; ++mm) {
+                const cplx r = h.R_T(a, mm, m);
+                if (r == cplx(0.0)) continue;
+                for (long j = 0; j < ng; ++j) {
+                  const cplx rk = r / (inu_all(mm) - cplx(b.eps(a) - P.epsG(j)));
+                  for (long it = 0; it < nt; ++it) W(a, j, it) += tools.Ttw_bb(it, mm) * rk;
+                }
+              }
+            itw = h.wk.emplace(m, std::move(W)).first;
+          }
+          Wk = &itw->second;
+        }
+        std::vector<char> hasT(size_t(np), 0);
+        for (long a = 0; a < np; ++a)
+          for (long ik = 0; ik < nk and not hasT[size_t(a)]; ++ik)
+            for (long p = 0; p < nc2 and not hasT[size_t(a)]; ++p)
+              for (long r = 0; r < nR; ++r) if (yv->fam(1, a, ik, p / nc, p % nc, r) != cplx(0.0)) { hasT[size_t(a)] = 1; break; }
+        nda::array<cplx, 2> famA(nc2, nR), Bw(nc2, Nm), Dconj(nc2, Nm), Y(nc2, nc2), Ym(nc2, nc2), Gmat(ng, nc2), Mj(ng, nc2);
+        nda::array<cplx, 2> kap(np, ng), kapd(np, ng);       // kappa_aj, kappa_aj / Delta_aj at this node
+        for (long a = 0; a < np; ++a)
+          for (long j = 0; j < ng; ++j) {
+            const double d = b.eps(a) - P.epsG(j);
+            if (hasT[size_t(a)])
+              utils::check(std::abs(d) > 1e-10, "sigma_dyn_accumulate: confluent U_j T_a (e_a = e_j = {}) is not supported (R1).", b.eps(a));
+            kap(a, j) = cplx(1.0) / (inu - cplx(d));
+            kapd(a, j) = (std::abs(d) > 1e-10) ? kap(a, j) / cplx(d) : cplx(0.0);
+          }
+        nda::array<cplx, 3> M3(np, ng, nc2);                 // M_aj(i j) of one k'
+        nda::array<cplx, 2> CT(nc2, 1), CUa(nc2, 1), CUj(ng, nc2), Ha(nt, nc2), Ms(ng, nc2), WkA(nt, ng), WkJ(nt, np), MsJ(np, nc2);
+        for (long ik = 0; ik < nk; ++ik) {
+          const long k = kpq(iq, ik);
+          for (long c = 0; c < nc; ++c)
+            for (long i = 0; i < nc; ++i)
+              for (long M = 0; M < Nm; ++M) Dconj(c * nc + i, M) = std::conj(Dc(ik, c, i, M));
+          for (long j = 0; j < ng; ++j)
+            for (long c = 0; c < nc; ++c)
+              for (long x = 0; x < nc; ++x) Gmat(j, c * nc + x) = P.gk(j, ik, c, x);
+          M3() = cplx(0.0);
+          CUj() = cplx(0.0);
+          for (long a = 0; a < np; ++a) {
+            if (not hasT[size_t(a)]) continue;
+            for (long p = 0; p < nc2; ++p)
+              for (long r = 0; r < nR; ++r) famA(p, r) = yv->fam(1, a, ik, p / nc, p % nc, r);   // rows (x, j)
+            nda::blas::gemm(famA, Wblk, Bw);                                                     // Bw(x j, M)
+            nda::blas::gemm(Dconj, nda::transpose(Bw), Y);                                       // Y(c i, x j)
+            for (long c = 0; c < nc; ++c)
+              for (long i = 0; i < nc; ++i)
+                for (long x = 0; x < nc; ++x)
+                  for (long j = 0; j < nc; ++j) Ym(c * nc + x, i * nc + j) = Y(c * nc + i, x * nc + j);
+            nda::blas::gemm(Gmat, Ym, Mj);                                                       // M_aj(i j) = sum_cx g_j(c, x) Y(c i, x j)
+            M3(a, all, all) = Mj;
+            if (h.dump)
+              for (long i = 0; i < nc; ++i)
+                for (long j = 0; j < nc; ++j) {
+                  cplx tr(0.0);
+                  for (long c = 0; c < nc; ++c) tr += Y(c * nc + i, c * nc + j);
+                  h.HT_n(m, is, a, k, i, j) += tr;
+                }
+            if (not h.sampled) {
+              // the j-sums at the coefficient level, then one deposit per (a): RT_a, RU_a; the RU_{n_j} pieces summed over a below
+              CT() = cplx(0.0); CUa() = cplx(0.0);
+              for (long j = 0; j < ng; ++j)
+                for (long q = 0; q < nc2; ++q) {
+                  CT(q, 0) -= kap(a, j) * Mj(j, q);
+                  CUa(q, 0) += kapd(a, j) * Mj(j, q);
+                  CUj(j, q) += kapd(a, j) * Mj(j, q);
+                }
+              for (long it = 0; it < nt; ++it) {
+                const cplx w = tools.Ttw_bb(it, m);
+                for (long q = 0; q < nc2; ++q) {
+                  h.RT(it, is, k, a, q / nc, q % nc) += w * CT(q, 0);
+                  h.RU(it, is, k, a, q / nc, q % nc) += w * CUa(q, 0);
+                }
+              }
+            } else {
+              // RT_a(tau) -= sum_j W_kappa(a, j, tau) M_aj;  RU_a(tau) += sum_j W_kappa(a, j, tau) M_aj / Delta_aj
+              for (long it = 0; it < nt; ++it)
+                for (long j = 0; j < ng; ++j) WkA(it, j) = (*Wk)(a, j, it);
+              nda::blas::gemm(WkA, Mj, Ha);
+              for (long it = 0; it < nt; ++it)
+                for (long q = 0; q < nc2; ++q) h.RT(it, is, k, a, q / nc, q % nc) -= Ha(it, q);
+              for (long j = 0; j < ng; ++j) {
+                const cplx dinv = (kap(a, j) != cplx(0.0)) ? kapd(a, j) / kap(a, j) : cplx(0.0);   // 1 / Delta_aj
+                for (long q = 0; q < nc2; ++q) Ms(j, q) = dinv * Mj(j, q);
+              }
+              nda::blas::gemm(WkA, Ms, Ha);
+              for (long it = 0; it < nt; ++it)
+                for (long q = 0; q < nc2; ++q) h.RU(it, is, k, a, q / nc, q % nc) += Ha(it, q);
+            }
+          }
+          // the RU_{n_j} pieces: -sum_a kappa_aj / Delta_aj M_aj at the G pole j (node n_j)
+          if (not h.sampled) {
+            for (long j = 0; j < ng; ++j) {
+              const long nj = P.gnode(j);
+              for (long it = 0; it < nt; ++it) {
+                const cplx w = tools.Ttw_bb(it, m);
+                for (long q = 0; q < nc2; ++q) h.RU(it, is, k, nj, q / nc, q % nc) -= w * CUj(j, q);
+              }
+            }
+          } else {
+            for (long j = 0; j < ng; ++j) {
+              const long nj = P.gnode(j);
+              for (long a = 0; a < np; ++a) {
+                const cplx dinv = (kap(a, j) != cplx(0.0)) ? kapd(a, j) / kap(a, j) : cplx(0.0);
+                for (long it = 0; it < nt; ++it) WkJ(it, a) = (*Wk)(a, j, it);
+                for (long q = 0; q < nc2; ++q) MsJ(a, q) = dinv * M3(a, j, q);
+              }
+              nda::blas::gemm(WkJ, MsJ, Ha);
+              for (long it = 0; it < nt; ++it)
+                for (long q = 0; q < nc2; ++q) h.RU(it, is, k, nj, q / nc, q % nc) -= Ha(it, q);
+            }
+          }
+        }
+      }
+      ++h.nblocks;
+      h.t_sig += watch.lap();
+    }
+
+    /** the assembly after the all-reduce of the accumulators: dSig (nt, ns, nk, nc, nc) = -(scale/nk) [S_cst + sum_p K_F RU_p + Sigma_T] */
     inline void sigma_dyn_finish(sigma_dyn_hook const &h, double scale, long nk_norm, nda::array<ComplexType, 5> &dSig,
                                  double &e_fit_err) {
       using cplx = ComplexType;
@@ -176,11 +565,10 @@ namespace solvers {
       auto const &b = h.basis.value();
       const long nt = h.S_cst.shape(0), ns = h.S_cst.shape(1), nk = h.S_cst.shape(2), nc = h.S_cst.shape(3), nc2 = nc * nc;
       const long np = b.np, npf = b.np_fit;
-      utils::check(h.np == np and h.RU.shape(3) == np, "sigma_dyn_finish: node count mismatch.");
+      utils::check(h.np == np and h.RT.shape(3) == np and h.RU.shape(3) == np, "sigma_dyn_finish: node count mismatch.");
       dSig = nda::array<cplx, 5>(nt, ns, nk, nc, nc);
       dSig() = cplx(0.0);
-      // ---- (iii): E_p(tau) = K_F(tau, e_p) RT_p(tau), refit onto the vertex nodes, times U_p by partial fractions ---------
-      // the batch of tau functions: columns (s, k, p, i, j)
+      // the T family: E_a(tau) = K_F(tau, a) RT_a(tau) (every node a), refit onto the vertex nodes, times U_a by partial fractions
       const long nb = ns * nk * np * nc2;
       nda::array<cplx, 2> E(nt, nb);
       bool anyT = false;
@@ -192,21 +580,19 @@ namespace solvers {
           long col = 0;
           for (long is = 0; is < ns; ++is)
             for (long k = 0; k < nk; ++k)
-              for (long p = 0; p < np; ++p) {
-                const double kf = b.KF(it, p);
+              for (long a = 0; a < np; ++a)
                 for (long i = 0; i < nc; ++i)
-                  for (long j = 0; j < nc; ++j) E(it, col++) = cplx(kf) * h.RT(it, is, k, p, i, j);
-              }
+                  for (long j = 0; j < nc; ++j) E(it, col++) = cplx(b.KF(it, a)) * h.RT(it, is, k, a, i, j);
         }
-        ec = dynbse::basis_coeffs(b, E);                  // (npf, nb): E_p = sum_{p'} ec(p') U_{p'}
+        ec = dynbse::basis_coeffs(b, E);                  // (npf, nb): E_a = sum_{a'} ec(a') U_{a'}
         e_fit_err = dynbse::basis_fit_error(b, E, ec);
       }
-      // tau[U_p U_p'](it): (nt, np, npf)
+      // tau[U_a U_a'](it): (nt, np, npf)
       nda::array<double, 3> Tpp(nt, np, npf);
       for (long it = 0; it < nt; ++it)
-        for (long p = 0; p < np; ++p)
+        for (long a = 0; a < np; ++a)
           for (long pp = 0; pp < npf; ++pp)
-            Tpp(it, p, pp) = (p == pp) ? b.KF2(it, p) : (b.KF(it, p) - b.KF(it, pp)) / (b.eps(p) - b.eps(pp));
+            Tpp(it, a, pp) = (a == pp) ? b.KF2(it, a) : (b.KF(it, a) - b.KF(it, pp)) / (b.eps(a) - b.eps(pp));
       const cplx pref(-scale / double(nk_norm), 0.0);
 #pragma omp parallel for collapse(2) schedule(static) num_threads(utils::omp_threads())
       for (long is = 0; is < ns; ++is)
@@ -215,11 +601,11 @@ namespace solvers {
             for (long i = 0; i < nc; ++i)
               for (long j = 0; j < nc; ++j) {
                 cplx acc = h.S_cst(it, is, k, i, j);
-                for (long p = 0; p < np; ++p) acc += cplx(b.KF(it, p)) * h.RU(it, is, k, p, i, j);   // (ii)
+                for (long p = 0; p < np; ++p) acc += cplx(b.KF(it, p)) * h.RU(it, is, k, p, i, j);
                 if (anyT) {
-                  for (long p = 0; p < np; ++p) {
-                    const long col = ((is * nk + k) * np + p) * nc2 + i * nc + j;
-                    for (long pp = 0; pp < npf; ++pp) acc += cplx(Tpp(it, p, pp)) * ec(pp, col);           // (iii)
+                  for (long a = 0; a < np; ++a) {
+                    const long col = ((is * nk + k) * np + a) * nc2 + i * nc + j;
+                    for (long pp = 0; pp < npf; ++pp) acc += cplx(Tpp(it, a, pp)) * ec(pp, col);
                   }
                 }
                 dSig(it, is, k, i, j) = pref * acc;

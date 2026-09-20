@@ -789,10 +789,11 @@ namespace solvers {
       if (opt.sigma != nullptr) {
         utils::check(not wan, "pair_space_ladder_dyn: the Sigma hook needs the aux-frame legs (not the Wannier-pair frame).");
         utils::check(not opt.bubble_only, "pair_space_ladder_dyn: the Sigma hook needs the solve (bubble_only set).");
-        utils::check(long(nu_list.size()) == nw_b, "pair_space_ladder_dyn: the Sigma hook needs EVERY bosonic node ({} of {} given).",
+        utils::check(long(nu_list.size()) == nw_b or opt.sigma->sampled,
+                     "pair_space_ladder_dyn: the Sigma hook needs EVERY bosonic node ({} of {} given) unless sampled weights are set.",
                      nu_list.size(), nw_b);
         utils::check(opt.dump_prefix.empty(), "pair_space_ladder_dyn: the Sigma hook and the unit dump/restart are exclusive.");
-        opt.sigma->init(nt, ns, nk, np, nc, b);
+        opt.sigma->init(nt, ns, nk, np, nc, b, nw_b);
         if (rank == 0)
           app_log(1, "  [LFF-Sigma dyn] Sigma hook armed: col {}, outer W {}; accumulators (nt {}, nk {}, np {}, nc {}) x 3, {:.2f} GB per rank",
                   opt.sigma->col, opt.sigma->outer, nt, nk, np, nc, double(nt * ns * nk * nc2) * (2.0 * double(np) + 1.0) * 16.0 / 1e9);
@@ -2006,13 +2007,129 @@ namespace solvers {
     auto &tools = *tools_h.tools;
     utils::check(tools.nw_b == _ft->nw_b() and tools.nt_f == _ft->nt_f(),
                  "vertex_t::eval_sigma_pair_dyn: the Sigma hook needs the LOOP's grid (pol_vertex_dyn_iaft_prec must not refine it).");
-    const long nq = long(_W0b_qmm.value().shape(0)), nw_b = tools.nw_b;
-    std::vector<long> nus(static_cast<size_t>(nw_b)), qs(static_cast<size_t>(nq));
-    for (long l = 0; l < nw_b; ++l) nus[size_t(l)] = l;
+    const long nq = long(_W0b_qmm.value().shape(0)), nw_b = tools.nw_b, nt_l = tools.nt_f;
+    std::vector<long> nus, qs(static_cast<size_t>(nq));
     for (long iq = 0; iq < nq; ++iq) qs[size_t(iq)] = iq;
     vd::sigma_dyn_hook hook;
     hook.col = opt.col;
     hook.outer = opt.outer;
+    hook.dump = opt.dyn_dump;
+    // ---- L-8: the nu-SAMPLED mode: the deposit weights Tt = Ttw . Phi_all . pinv(Phi_S) from a reference dump's nu-bases ----
+    const bool sampled = not opt.dyn_nodes.empty();
+    if (sampled) {
+      utils::check(not opt.dyn_fit_file.empty(), "vertex_t::eval_sigma_pair_dyn: the sampled mode needs the reference dump (pol_vertex_sigma_dyn_fit_file).");
+      utils::check(not opt.dyn_dump, "vertex_t::eval_sigma_pair_dyn: the dump is written by the ALL-node run, not by a sampled one.");
+      nus = opt.dyn_nodes;
+      std::sort(nus.begin(), nus.end()); nus.erase(std::unique(nus.begin(), nus.end()), nus.end());
+      for (long m : nus) utils::check(m >= 0 and m < nw_b, "vertex_t::eval_sigma_pair_dyn: sampled node {} outside [0, {}).", m, nw_b);
+      const long nS = long(nus.size());
+      const long K = (opt.dyn_fit_rank > 0) ? std::min<long>(opt.dyn_fit_rank, nS) : std::max<long>(1, std::min<long>(6, nS - 3));
+      // the Gram matrices over nodes: ONE for the constant part, one PER VERTEX NODE p for the U and T families
+      long np_ref = 0;
+      nda::array<ComplexType, 2> Gc;
+      nda::array<ComplexType, 3> GT;
+      if (mpi->comm.root()) {
+        h5::file f(opt.dyn_fit_file, 'r');
+        h5::group g(f);
+        nda::array<ComplexType, 6> H;
+        nda::h5_read(g, "Hc", H);
+        utils::check(H.shape(0) == nw_b, "vertex_t::eval_sigma_pair_dyn: the reference dump has {} nodes, this run {}.", H.shape(0), nw_b);
+        {
+          const long rows = long(H.size()) / nw_b;
+          auto H2 = nda::reshape(H, std::array<long, 2>{nw_b, rows});
+          Gc = nda::array<ComplexType, 2>(nw_b, nw_b);
+          nda::blas::gemm(H2, nda::dagger(H2), Gc);                       // G(m, m') = sum_rows H(m, row) H(m', row)^*
+        }
+        {
+          nda::h5_read(g, "HT", H);                                        // (nw_b, ns, np, nk, nc, nc): the T family's trace proxy
+          np_ref = H.shape(2);
+          auto &G3 = GT;
+          G3 = nda::array<ComplexType, 3>(np_ref, nw_b, nw_b);
+          const long ns_r = H.shape(1), rows_p = H.shape(3) * H.shape(4) * H.shape(5);
+          nda::array<ComplexType, 2> Hp(nw_b, ns_r * rows_p), Gm(nw_b, nw_b);
+          for (long pp = 0; pp < np_ref; ++pp) {
+            for (long m = 0; m < nw_b; ++m)
+              for (long s = 0; s < ns_r; ++s) {
+                auto src = nda::reshape(H(m, s, pp, all, all, all), std::array<long, 1>{rows_p});
+                for (long r = 0; r < rows_p; ++r) Hp(m, s * rows_p + r) = src(r);
+              }
+            nda::blas::gemm(Hp, nda::dagger(Hp), Gm);
+            G3(pp, all, all) = Gm;
+          }
+        }
+      }
+      mpi->comm.broadcast_value(np_ref, 0);
+      if (not mpi->comm.root()) { Gc = nda::array<ComplexType, 2>(nw_b, nw_b); GT = nda::array<ComplexType, 3>(np_ref, nw_b, nw_b); }
+      mpi->comm.broadcast_n(Gc.data(), Gc.size(), 0);
+      mpi->comm.broadcast_n(GT.data(), GT.size(), 0);
+      nda::array<ComplexType, 2> const &Ttw = tools.Ttw_bb;               // (nt, nw_b)
+      // the weights of one basis: Tt = Ttw . Phi_all . pinv(Phi_S) scattered onto the sampled node indices; returns the kept weight
+      // the nu-reconstruction of one object type, in REGRESSION form: with the Gram matrix G = H H^dag of the reference objects
+      // over the nodes, the least-squares predictor of all nodes from the sampled ones is R = G(:, S) G(S, S)^-1 (the Nystrom
+      // form; G(S, S)^-1 through its top-Kr eigenpairs -- Kr < |S| regularizes). Measured on the LiH dump (11 of 41 nodes, at the
+      // Sigma level): the cst + U object needs Kr ~ |S| - 2 (K 6: 5.0e-2, K 9: 3.5e-3), the per-a T objects are at 5e-4 already
+      // at K 6; the earlier "top-K eigenvectors + pinv(Phi_S)" form agrees at small K and degrades beyond K ~ |S| - 2.
+      // Rout(m', m) is nonzero at the sampled columns m = nus[s] only; returns the kept spectral weight of G (nK_out: modes to 1e-4)
+      auto weights_of = [&](nda::array<ComplexType, 2> const &Gin, long Kr, nda::array<ComplexType, 2> &Rout, long &nK_out) -> double {
+        Rout = nda::array<ComplexType, 2>(nw_b, nw_b);
+        Rout() = ComplexType(0.0);
+        double tr = 0.0;
+        for (long m = 0; m < nw_b; ++m) tr += Gin(m, m).real();
+        nK_out = 0;
+        if (tr <= 0.0) return 0.0;
+        Kr = std::max(1L, std::min(Kr, nS));
+        nda::matrix<ComplexType> Gss(nS, nS);
+        for (long s = 0; s < nS; ++s)
+          for (long s2 = 0; s2 < nS; ++s2) Gss(s, s2) = Gin(nus[size_t(s)], nus[size_t(s2)]);
+        auto [lam, V] = nda::linalg::eigenelements(Gss);                   // ascending; eigenvectors as columns
+        nda::array<ComplexType, 2> Ginv(nS, nS), GcS(nw_b, nS), R(nw_b, nS);
+        Ginv() = ComplexType(0.0);
+        for (long a = 0; a < Kr; ++a) {
+          const long ia = nS - 1 - a;
+          const double l = double(lam(ia));
+          if (l <= 1e-14 * double(lam(nS - 1))) break;
+          for (long s = 0; s < nS; ++s)
+            for (long s2 = 0; s2 < nS; ++s2) Ginv(s, s2) += V(s, ia) * std::conj(V(s2, ia)) / l;
+        }
+        for (long mp = 0; mp < nw_b; ++mp)
+          for (long s = 0; s < nS; ++s) GcS(mp, s) = Gin(mp, nus[size_t(s)]);
+        nda::blas::gemm(GcS, Ginv, R);                                     // R = G(:, S) G(S, S)^-1
+        for (long s = 0; s < nS; ++s)
+          for (long mp = 0; mp < nw_b; ++mp) Rout(mp, nus[size_t(s)]) = R(mp, s);
+        // the spectral weight of the full Gram kept by its top-Kr modes (a smoothness meter of the object, for the log)
+        nda::matrix<ComplexType> Gm(nw_b, nw_b);
+        Gm() = Gin;
+        auto [lamf, Vf] = nda::linalg::eigenelements(Gm);
+        double cum = 0.0, wk = 0.0;
+        for (long a = 0; a < nw_b; ++a) { const double l = std::max(double(lamf(nw_b - 1 - a)), 0.0) / tr; cum += l; if (a < Kr) wk += l; if (nK_out == 0 and 1.0 - cum < 1e-4) nK_out = a + 1; }
+        return wk;
+      };
+      long nKc = 0, nKt = 0;
+      const long Kc = std::max(K, nS - 2);                                // the cst + U object: the regression needs nearly all of |S|
+      nda::array<ComplexType, 2> Rc;
+      const double wc_ = weights_of(Gc, Kc, Rc, nKc);
+      hook.W_cst = nda::array<ComplexType, 2>(nt_l, nw_b);
+      nda::blas::gemm(Ttw, Rc, hook.W_cst);                                // the cst + U deposits: Tt = Ttw . R_c
+      hook.R_T = nda::array<ComplexType, 3>(np_ref, nw_b, nw_b);
+      double wt_min = 1.0;
+      long nKt_max = 0;
+      for (long pp = 0; pp < np_ref; ++pp) {
+        nda::array<ComplexType, 2> R2, Gp(nw_b, nw_b);
+        Gp() = GT(pp, all, all);
+        const double wt_ = weights_of(Gp, K, R2, nKt);
+        hook.R_T(pp, all, all) = R2;                                       // the T family: the reconstruction itself (kappa applied per unit)
+        if (nKt > 0) { wt_min = std::min(wt_min, wt_); nKt_max = std::max(nKt_max, nKt); }
+      }
+      char buf[300];
+      std::snprintf(buf, sizeof(buf), " cst+U: modes to 1e-4 %ld, kept weight %.6f (Kr %ld); T (per a): modes to 1e-4 up to %ld, kept weight >= %.6f (Kr %ld); regression form",
+                    nKc, wc_, Kc, nKt_max, wt_min, K);
+      std::string spec_log(buf);
+      hook.sampled = true;
+      app_log(1, "  [LFF-Sigma dyn] SAMPLED mode: {} of {} nodes, nu-bases from {} --{}", nS, nw_b, opt.dyn_fit_file, spec_log);
+    } else {
+      nus.resize(static_cast<size_t>(nw_b));
+      for (long l = 0; l < nw_b; ++l) nus[size_t(l)] = l;
+    }
     vd::dyn_opts o;
     o.kcrys = std::addressof(kc);
     o.tol = _dyn_tol; o.maxit = _dyn_maxit; o.gmres_m = std::max<long>(_dyn_gmres, 12); o.sign_ks = opt.sign_ks;
@@ -2036,8 +2153,36 @@ namespace solvers {
     vd::pair_space_ladder_dyn(G_CC, _Xb_skma, _W0b_qmm.value(), _Wb_qwmm.value(), kmq, kpq, tools, nus,
                               nullptr, nullptr, nullptr, nullptr, mpi->comm.rank(), mpi->comm.size(), o, &dmet, symc);
     mpi->comm.all_reduce_in_place_n(hook.S_cst.data(), hook.S_cst.size(), std::plus<>{});
-    mpi->comm.all_reduce_in_place_n(hook.RU.data(), hook.RU.size(), std::plus<>{});
     mpi->comm.all_reduce_in_place_n(hook.RT.data(), hook.RT.size(), std::plus<>{});
+    mpi->comm.all_reduce_in_place_n(hook.RU.data(), hook.RU.size(), std::plus<>{});
+    if (hook.dump) {
+      // L-8: the per-node objects of the all-node run -> <prefix>.sigdyn.h5 (the nu-bases of a later sampled run)
+      for (auto *A : {&hook.Hc_n, &hook.HT_n}) mpi->comm.all_reduce_in_place_n(A->data(), A->size(), std::plus<>{});
+      if (mpi->comm.root()) {
+        const std::string fn = opt.dump_prefix + ".sigdyn.h5";
+        h5::file f(fn, 'w');
+        h5::group g(f);
+        nda::h5_write(g, "Hc", hook.Hc_n);
+        nda::h5_write(g, "HT", hook.HT_n);
+        nda::array<long, 1> nodes(nw_b);
+        for (long l = 0; l < nw_b; ++l) nodes(l) = l;
+        nda::h5_write(g, "nodes", nodes);
+        h5::h5_write(g, "np", hook.np);
+        h5::h5_write(g, "np_fit", hook.basis.value().np_fit);
+        nda::h5_write(g, "eps", hook.basis.value().eps);
+        nda::h5_write(g, "Ttw", tools.Ttw_bb);                 // (nt, nw_b): the bosonic nu -> tau transform of the loop
+        nda::h5_write(g, "KF", hook.basis.value().KF);          // (nt, np) K_F(tau_i, e_p)
+        nda::h5_write(g, "KF2", hook.basis.value().KF2);        // (nt, np) tau[U_p^2]
+        nda::h5_write(g, "tau", hook.basis.value().s);          // (nt)
+        nda::h5_write(g, "wn_b", tools.wn_b);                   // (nw_b) bosonic Matsubara integers
+        h5::h5_write(g, "beta", tools.beta);
+        h5::h5_write(g, "col", opt.col);
+        h5::h5_write(g, "outer", opt.outer);
+        app_log(1, "  [LFF-Sigma dyn] per-node objects written to {} (Hc (nw_b, ns, nt, nk, nc, nc): cst + U; HT (nw_b, ns, np, nk, nc, nc): the T proxy): {:.2f} GB",
+                fn, double(hook.Hc_n.size() + hook.HT_n.size()) * 16.0 / 1e9);
+      }
+      hook.Hc_n = nda::array<ComplexType, 6>(); hook.HT_n = nda::array<ComplexType, 6>();
+    }
     dmet.reduce(mpi->comm);
     hook.ks_herm = mpi->comm.all_reduce_value(hook.ks_herm, boost::mpi3::max<>{});
     hook.amax = mpi->comm.all_reduce_value(hook.amax, boost::mpi3::max<>{});
@@ -2071,13 +2216,24 @@ namespace solvers {
     mloc.nunits = hook.nunits; mloc.t_total = twatch.lap(); mloc.t_amp = hook.t_sig; mloc.rss_gb = dmet.rss_max_gb;
     mloc.e_fit_err = e_fit; mloc.fit_err_G = dmet.fit_err_G; mloc.refit_err = dmet.refit_err_max; mloc.ritz_max = dmet.ritz_max;
     mloc.t_solve = dmet.t_solve; mloc.all_converged = (dmet.nconv == dmet.nunits);
-    app_log(1, "  [LFF-Sigma dyn] col {} outer {} scale {}: {} (s, q, nu) units on ALL {} bosonic nodes (union basis, GMRES({}), RHS blocks {}, "
+    app_log(1, "  [LFF-Sigma dyn] col {} outer {} scale {}: {} (s, q, nu) units on {} of {} bosonic nodes (union basis, GMRES({}), RHS blocks {}, "
                "C = [{}, {}), N_m = {}, n_p = {}): max |dSigma(tau)| = {:.4e}, anti-Hermitian residual {:.3e} ({}), |K_s - K_s^dag|/|K_s| = {:.2e}; "
                "max |A_cst| {:.3e}, max |y| {:.3e}; E-refit (T family) {:.2e}, G pole fit {:.2e}, tau refit {:.2e}, watchdog {:.3f}, all converged {}; "
                "wall {:.1f} s (solve {:.1f} s, Sigma deposits {:.1f} s on the slowest rank), RSS {:.2f} GB",
-            opt.col, opt.outer, opt.scale, dmet.nunits, nw_b, o.gmres_m, o.rhs_block, _band_window.first(), _band_window.last(), _Xb_skma.shape(2),
+            opt.col, opt.outer, opt.scale, dmet.nunits, long(nus.size()), nw_b, o.gmres_m, o.rhs_block, _band_window.first(), _band_window.last(), _Xb_skma.shape(2),
             hook.np, dmax, mloc.dsig_herm, opt.hermitize ? "Hermitized" : "NOT Hermitized", hook.ks_herm, hook.amax, hook.ymax, e_fit,
             dmet.fit_err_G, dmet.refit_err_max, dmet.ritz_max, mloc.all_converged, mloc.t_total, dmet.t_solve, hook.t_sig, dmet.rss_max_gb);
+    if (hook.conv_kf >= 0.0)
+      app_log(1, "  [LFF-Sigma dyn] product-route checks: w_to_tau[U_a] vs +KF {:.2e} / vs -KF {:.2e}; tau_to_w[G] vs pole-fit G {:.2e}; "
+                 "max |fam1| on extension nodes {:.2e}{}", hook.conv_kf, hook.conv_kf_neg, hook.conv_g, hook.fam1_ext,
+              hook.poles ? " (POLE ROUTE active: COQUI_SIGDYN_ROUTE=poles)" : "");
+    else if (hook.poles) app_log(1, "  [LFF-Sigma dyn] POLE ROUTE active (COQUI_SIGDYN_ROUTE=poles).");
+    {
+      double fro = 0.0;
+      for (auto const &v : dSig) fro += std::norm(v);
+      app_log(1, "  [LFF-Sigma dyn] |dSigma|_F = {:.10e} (families: U {} T {}; route {})", std::sqrt(fro), hook.use_U ? "on" : "OFF",
+              hook.use_T ? "on" : "OFF", hook.poles ? "poles" : "product");
+    }
     if (met) *met = mloc;
     (void)all;
   }

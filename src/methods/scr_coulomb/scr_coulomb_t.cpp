@@ -2638,6 +2638,9 @@ namespace solvers {
     o.nu_diag = _vertex->sigma_pair_diag();
     o.sign_ks = _vertex->ladder_dyn_sign();
     o.side = _vertex->sigma_pair_side();
+    o.dyn_dump = _vertex->sigma_dyn_dump(); o.dyn_nodes = _vertex->sigma_dyn_nodes();
+    o.dyn_fit_file = _vertex->sigma_dyn_fit_file(); o.dyn_fit_rank = _vertex->sigma_dyn_fit_rank();
+    o.dump_prefix = mb_state.coqui_prefix;
     const bool dyn = _vertex->sigma_pair_dynamic();
     nda::array<ComplexType, 4> Pchk;
     if (_vertex->sigma_pair_diag() and not dyn) {

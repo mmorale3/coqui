@@ -474,6 +474,7 @@ namespace bdft_tests {
           { auto wb = ft.wn_mesh_b(); for (long l = 0; l < wb.shape(0); ++l) if (wb(l) == 0) m0b = l; }
           REQUIRE(m0b >= 0);
           std::string side_cur = "right";   // the junction of the next kind-2 run (section N sets it)
+          bool sd_dump = false; std::vector<long> sd_nodes; std::string sd_fit; long sd_rank = 0;   // L-8: the next kind-2 run's sampled-mode knobs
           auto run_p = [&](std::string const &tag, int kind, std::string const &col, std::string const &outer, double scale, S5 &Sig) {
             // kind: 0 = plain GW, 1 = B-S Sigma^{C,x} (static rung), 2 = the pair vertex, 3 = the DYNAMIC-rung B-S Sigma^C (G^3 W^2)
             const std::string out = "coqui_d3_winj_" + tag;
@@ -497,6 +498,7 @@ namespace bdft_tests {
               vtx.set_ladder_rung("static", 1e-8, 30, 12, -1.0);
               vtx.set_isdf_points("coqui_d3_winj_G.secpts.h5", false);
               vtx.set_sigma_pair(true, col, outer, scale, true, true, side_cur);
+              vtx.set_sigma_dyn(sd_dump, sd_nodes, sd_fit, sd_rank);
               scr_eri.set_vertex(&vtx);
               e_corr = std::get<1>(scf_loop(mb_state, dyson, erin, ft, solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol, 1, false, 1e-9, true));
               m = scr_eri.sigma_pair_meter(); d = gw.sigma_pair_dsigma();
@@ -524,11 +526,58 @@ namespace bdft_tests {
             if (mpi_context->comm.root()) {
               remove((out + ".mbpt.h5").c_str());
               for (auto const &e : std::filesystem::directory_iterator("."))
-                if (e.path().filename().string().rfind(out + ".", 0) == 0) std::filesystem::remove(e.path());
+                if (e.path().filename().string().rfind(out + ".", 0) == 0 and e.path().extension() != ".h5" ) std::filesystem::remove(e.path());
+              for (auto const &e : std::filesystem::directory_iterator("."))
+                if (e.path().filename().string().rfind(out + ".", 0) == 0 and e.path().filename().string().find(".sigdyn.h5") == std::string::npos) std::filesystem::remove(e.path());
             }
             mpi_context->comm.barrier();
             return std::make_tuple(e_corr, m, d, pichk);
           };
+          if (auto const *only = std::getenv("COQUI_DYNBSE_TEST_N_ONLY"); only != nullptr) {
+            // diagnostics: run ONE dynamic-path column (dyn1_bare | dyn1 | static_dyn) and stop -- for the route / family
+            // cross-checks of vertex_sigma_dyn.icc (COQUI_SIGDYN_ROUTE, COQUI_SIGDYN_FAMILIES); the driver logs |dSigma|_F
+            S5 S_one;
+            auto [c1, m1, d1, k1] = run_p("D1B", 2, only, "dynamic", 1.0, S_one);
+            app_log(1, "dynbse_readout LFF-Sigma N_ONLY {}: e_corr {:+.12f}, max|dSigma| {:.6e}, anti-Hermitian {:.3e}", only, c1, m1[0], m1[1]);
+            mpi_context->comm.barrier();
+            return;
+          }
+          if (std::getenv("COQUI_DYNBSE_TEST_SIGDYN_SAMPLED")) {
+            // ---- L-8 gate: the nu-SAMPLED dynamic Sigma vertex vs the all-node one -------------------------------------------
+            // D1D: col dyn1 on ALL nodes, writing the per-node objects; D1S: col dyn1 on 9 nodes (the S1 recipe's structure:
+            // nu = 0, three interior pivots and the tail node, both signs) with the nu-bases learned from D1D (K = 9:
+            // interpolation, exact at the samples). Reported: the relative Frobenius distance of the two dSigma on the C block.
+            S5 S_r0s, S_d1d, S_d1s;
+            auto [cr0s, mr0s, dr0s, kr0s] = run_p("R0", 0, "static", "static", 1.0, S_r0s);
+            sd_dump = true;
+            auto [cd1d, md1d, dd1d, kd1d] = run_p("D1D", 2, "dyn1", "dynamic", 1.0, S_d1d);
+            sd_dump = false;
+            REQUIRE(std::filesystem::exists("coqui_d3_winj_D1D.sigdyn.h5"));
+            if (std::getenv("COQUI_DYNBSE_TEST_SIGDYN_DUMP_ONLY")) return;   // keep the dump for offline analysis
+            const long nwb = ft.wn_mesh_b().shape(0), hm = nwb / 2;   // LiH: 41 nodes, nu = 0 at 20
+            // an evenly spread set (in node index ~ log nu): nu = 0 and +-4, 8, 12, 16, 20 -> 11 of 41 nodes; K = 6 per basis (least squares)
+            sd_nodes = {m0b}; for (long j : {4l, 8l, 12l, 16l, hm}) { sd_nodes.push_back(m0b + j); sd_nodes.push_back(m0b - j); }
+            sd_fit = "coqui_d3_winj_D1D.sigdyn.h5"; sd_rank = 6;
+            auto [cd1s, md1s, dd1s, kd1s] = run_p("D1S", 2, "dyn1", "dynamic", 1.0, S_d1s);
+            sd_nodes.clear(); sd_fit.clear(); sd_rank = 0;
+            double num = 0.0, den = 0.0, mx = 0.0;
+            for (long it = 0; it < S_d1d.shape(0); ++it)
+              for (long is = 0; is < S_d1d.shape(1); ++is)
+                for (long ik = 0; ik < S_d1d.shape(2); ++ik)
+                  for (long i = 0; i < 4; ++i)
+                    for (long j = 0; j < 4; ++j) {
+                      const auto da = S_d1s(it, is, ik, i, j) - S_r0s(it, is, ik, i, j), db = S_d1d(it, is, ik, i, j) - S_r0s(it, is, ik, i, j);
+                      num += std::norm(da - db); den += std::norm(db); mx = std::max(mx, std::abs(da - db));
+                    }
+            app_log(1, "dynbse_readout LFF-Sigma SAMPLED gate: dyn1 on {} of {} nodes (K = {}, per-p U/T bases) vs all nodes: rel Frobenius {:.3e} (max |d| {:.3e}); "
+                       "e_corr all {:+.10f} sampled {:+.10f} (R0 {:+.10f}); max|dSigma| all {:.6e} sampled {:.6e}; anti-Hermitian all {:.2e} sampled {:.2e}",
+                    11, nwb, 6, std::sqrt(num) / std::max(std::sqrt(den), 1e-300), mx, cd1d, cd1s, cr0s, md1d[0], md1s[0], md1d[1], md1s[1]);
+            REQUIRE(den > 0.0);
+            REQUIRE(std::sqrt(num) / std::sqrt(den) < 5e-2);
+            if (mpi_context->comm.root()) remove("coqui_d3_winj_D1D.sigdyn.h5");
+            mpi_context->comm.barrier();
+            return;
+          }
           S5 S_r0, S_xs, S_p1, S_p0, S_ps, S_ph;
           auto [cr0, mr0, dr0, kr0] = run_p("R0", 0, "static", "static", 1.0, S_r0);
           auto [cxs, mxs, dxs, kxs] = run_p("XS", 1, "static", "static", 1.0, S_xs);

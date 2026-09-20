@@ -917,6 +917,10 @@ namespace solvers {
     bool _sigma_pair_herm = true;                // pol_vertex_sigma_pair_herm: Hermitize dSigma in (i, j)
     bool _sigma_pair_diag = false;               // pol_vertex_sigma_pair_diag: the nu-rank meter of the amplitude + the Pi-check dump
     std::string _sigma_pair_side = "right";      // pol_vertex_sigma_pair_side: the dressed junction, "right" | "left" | "both" (static path)
+    bool _sigma_dyn_dump = false;                // pol_vertex_sigma_dyn_dump: the all-node run writes its per-node objects (L-8 reference)
+    std::vector<long> _sigma_dyn_nodes;          // pol_vertex_sigma_dyn_nodes: the sampled FULL-mesh nodes (empty = all)
+    std::string _sigma_dyn_fit_file;             // pol_vertex_sigma_dyn_fit_file: the reference dump for the sampled mode
+    long _sigma_dyn_fit_rank = 0;                // pol_vertex_sigma_dyn_fit_rank: K (0 = the number of sampled nodes)
     double _sigma_lff_pinv_tol = 1e-3;      // pol_vertex_sigma_pinv_tol: relative eigenvalue cutoff of Pi_0^-1 -- the vertex lives on the
                                             // bubble's strong modes (Si kp444: 49 of 156 carry 99.9 % of |tr B|; |Gamma_eff - 1| is bounded and
                                             // stable for 1e-1..1e-3, blows up below 1e-4 where dPi / Pi_0 is unbounded)
@@ -1634,6 +1638,16 @@ namespace solvers {
       return _sigma_pair_col == "static_dyn" or _sigma_pair_col == "dyn1_bare" or _sigma_pair_col == "dyn1" or _sigma_pair_col == "dyn";
     }
     std::string const &sigma_pair_side() const { return _sigma_pair_side; }
+    /** L-8: the nu-sampled dynamic Sigma vertex (vertex_sigma_dyn.icc, "THE SAMPLED MODE") and its reference dump. */
+    void set_sigma_dyn(bool dump, std::vector<long> const &nodes, std::string const &fit_file, long fit_rank) {
+      utils::check(nodes.empty() or not fit_file.empty(),
+                   "vertex_t::set_sigma_dyn: pol_vertex_sigma_dyn_nodes needs pol_vertex_sigma_dyn_fit_file (the all-node reference dump).");
+      _sigma_dyn_dump = dump; _sigma_dyn_nodes = nodes; _sigma_dyn_fit_file = fit_file; _sigma_dyn_fit_rank = fit_rank;
+    }
+    bool sigma_dyn_dump() const { return _sigma_dyn_dump; }
+    std::vector<long> const &sigma_dyn_nodes() const { return _sigma_dyn_nodes; }
+    std::string const &sigma_dyn_fit_file() const { return _sigma_dyn_fit_file; }
+    long sigma_dyn_fit_rank() const { return _sigma_dyn_fit_rank; }
     bool sigma_pair_enabled() const { return _sigma_pair; }
     std::string const &sigma_pair_col() const { return _sigma_pair_col; }
     std::string const &sigma_pair_outer() const { return _sigma_pair_outer; }
@@ -1650,6 +1664,12 @@ namespace solvers {
       bool hermitize = true;
       bool nu_diag = false;           // the Gram spectrum over nu of the amplitude (meter nu_spec)
       nda::array<ComplexType, 4> *Pi_check = nullptr;   // (nw_b, nq, Nm, Nm): (spin/nk) A~^T (Cb D), the P side's own object (gate G1)
+      // L-8 (the dynamic path only): the nu-SAMPLED evaluation with a learned rank-K nu-basis, and the reference dump
+      bool dyn_dump = false;            // write the per-node objects to <dump_prefix>.sigdyn.h5 (the all-node reference)
+      std::vector<long> dyn_nodes;      // FULL-mesh node indices to evaluate (empty = all nodes, the exact nu-sum)
+      std::string dyn_fit_file;         // the reference dump the nu-bases are learned from (needed with dyn_nodes)
+      long dyn_fit_rank = 0;            // K modes per object type (0 = |dyn_nodes|: interpolation)
+      std::string dump_prefix;          // the run prefix for the dump
     };
     struct sigma_pair_meter {
       double dsig_max = 0.0, dsig_herm = 0.0, ks_herm = 0.0;

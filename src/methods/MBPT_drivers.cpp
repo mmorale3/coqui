@@ -286,7 +286,11 @@ inline void ensure_checkpoint(std::shared_ptr<mf::MF> mf, std::string const& out
  *                 G^3 W^2 second-order exchange Sigma^C) | "static_dyn" (y = 0 through the dynamic path == "static"): the
  *                 dynbse solver runs on EVERY bosonic node (both signs) x every transfer at the update_w tail -- the cost of
  *                 an all-nu dynamic dump -- and the two-frequency amputated vertex is contracted in tau (the twisted family
- *                 by exact partial fractions). {choices: "none", "lff", "pair"}
+ *                 by exact partial fractions). L-8 (the chain-capable form): pol_vertex_sigma_dyn_dump (false; the all-node
+ *                 run writes its per-node objects to <prefix>.sigdyn.h5), pol_vertex_sigma_dyn_nodes ([] = all nodes; a list
+ *                 of FULL-mesh bosonic node indices evaluates only those and reconstructs the nu-sum in the rank-K nu-basis
+ *                 learned from pol_vertex_sigma_dyn_fit_file, K = pol_vertex_sigma_dyn_fit_rank (0 = the number of nodes)).
+ *                 {choices: "none", "lff", "pair"}
  *  - pol_vertex_sigma_bub: "window" Pi_0 of the vertex: the dump's window bubble ("Pi_bub") or the loop's RPA Pi folded
  *                 to the frame ("full"). pol_vertex_sigma_scale (1.0) multiplies the correction; pol_vertex_sigma_pinv_tol
  *                 (1e-3) = the relative eigenvalue cutoff of Pi_0^-1 (the vertex is restricted to the bubble's strong modes;
@@ -678,6 +682,10 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
               io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_herm",true),
               io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_diag",false),
               io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_pair_side","right"));
+          vertex.set_sigma_dyn(io::get_value_with_default<bool>(pt,"pol_vertex_sigma_dyn_dump",false),
+              io::get_array_with_default<long>(pt,"pol_vertex_sigma_dyn_nodes",std::vector<long>{}),
+              io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_dyn_fit_file",""),
+              io::get_value_with_default<long>(pt,"pol_vertex_sigma_dyn_fit_rank",0));
         }
       }
     }
@@ -1088,6 +1096,10 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
               io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_herm",true),
               io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_diag",false),
               io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_pair_side","right"));
+          pol_vertex_carrier.set_sigma_dyn(io::get_value_with_default<bool>(pt,"pol_vertex_sigma_dyn_dump",false),
+              io::get_array_with_default<long>(pt,"pol_vertex_sigma_dyn_nodes",std::vector<long>{}),
+              io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_dyn_fit_file",""),
+              io::get_value_with_default<long>(pt,"pol_vertex_sigma_dyn_fit_rank",0));
         }
       }
     }
@@ -1351,6 +1363,10 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
               io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_herm",true),
               io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_diag",false),
               io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_pair_side","right"));
+          pol_vertex_carrier.set_sigma_dyn(io::get_value_with_default<bool>(pt,"pol_vertex_sigma_dyn_dump",false),
+              io::get_array_with_default<long>(pt,"pol_vertex_sigma_dyn_nodes",std::vector<long>{}),
+              io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_dyn_fit_file",""),
+              io::get_value_with_default<long>(pt,"pol_vertex_sigma_dyn_fit_rank",0));
         }
       }
     }
@@ -1660,6 +1676,10 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
               io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_herm",true),
               io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_diag",false),
               io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_pair_side","right"));
+          vertex.set_sigma_dyn(io::get_value_with_default<bool>(pt,"pol_vertex_sigma_dyn_dump",false),
+              io::get_array_with_default<long>(pt,"pol_vertex_sigma_dyn_nodes",std::vector<long>{}),
+              io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_dyn_fit_file",""),
+              io::get_value_with_default<long>(pt,"pol_vertex_sigma_dyn_fit_rank",0));
         }
       }
     }
@@ -1995,6 +2015,10 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
               io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_herm",true),
               io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_diag",false),
               io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_pair_side","right"));
+          pol_vertex_carrier.set_sigma_dyn(io::get_value_with_default<bool>(pt,"pol_vertex_sigma_dyn_dump",false),
+              io::get_array_with_default<long>(pt,"pol_vertex_sigma_dyn_nodes",std::vector<long>{}),
+              io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_dyn_fit_file",""),
+              io::get_value_with_default<long>(pt,"pol_vertex_sigma_dyn_fit_rank",0));
         }
       }
     }
