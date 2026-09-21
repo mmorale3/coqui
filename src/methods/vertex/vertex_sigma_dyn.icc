@@ -54,6 +54,7 @@
  */
 
 #include <set>
+#include "utilities/omp_threads.hpp"
 #include "methods/vertex/vertex_debug.hpp"
 namespace methods {
 namespace solvers {
@@ -471,8 +472,11 @@ namespace solvers {
           }
         tools.ft->w_to_tau(Fw, Ft, imag_axes_ft::fermion);
         // the legs per (tau, k'): B(c y, M) = sum_r F_t(c y, r) W(r, M);  H(i, j) = sum_c sum_M D^*(c i, M) B(c j, M)
-        nda::array<cplx, 2> Ak(nc2, nR), Bk(nc2, Nm), Dconj(nc2, Nm), Hc(nc, nc), Hsum(nc, nc);
+        // P11: OpenMP over k' -- every k' deposits into its own external k = kpq(iq, k') (a bijection), the inputs are
+        // read-only, the scratch is per iteration: no races, bitwise the serial order per k
+#pragma omp parallel for schedule(dynamic, 1) num_threads(utils::omp_threads())
         for (long ik = 0; ik < nk; ++ik) {
+          nda::array<cplx, 2> Ak(nc2, nR), Bk(nc2, Nm), Dconj(nc2, Nm), Hc(nc, nc), Hsum(nc, nc);
           const long k = kpq(iq, ik);
           for (long c = 0; c < nc; ++c)
             for (long i = 0; i < nc; ++i)
@@ -545,7 +549,6 @@ namespace solvers {
           for (long ik = 0; ik < nk and not hasT[size_t(a)]; ++ik)
             for (long p = 0; p < nc2 and not hasT[size_t(a)]; ++p)
               for (long r = 0; r < nR; ++r) if (yv->fam(1, a, ik, p / nc, p % nc, r) != cplx(0.0)) { hasT[size_t(a)] = 1; break; }
-        nda::array<cplx, 2> famA(nc2, nR), Bw(nc2, Nm), Dconj(nc2, Nm), Y(nc2, nc2), Ym(nc2, nc2), Gmat(ng, nc2), Mj(ng, nc2);
         nda::array<cplx, 2> kap(np, ng), kapd(np, ng);       // kappa_aj, kappa_aj / Delta_aj at this node
         for (long a = 0; a < np; ++a)
           for (long j = 0; j < ng; ++j) {
@@ -555,9 +558,12 @@ namespace solvers {
             kap(a, j) = cplx(1.0) / (inu - cplx(d));
             kapd(a, j) = (std::abs(d) > 1e-10) ? kap(a, j) / cplx(d) : cplx(0.0);
           }
-        nda::array<cplx, 3> M3(np, ng, nc2);                 // M_aj(i j) of one k'
-        nda::array<cplx, 2> CT(nc2, 1), CUa(nc2, 1), CUj(ng, nc2), Ha(nt, nc2), Ms(ng, nc2), WkA(nt, ng), WkJ(nt, np), MsJ(np, nc2);
+        // P11: OpenMP over k' (see the cst legs above); the per-k' scratch is allocated per iteration
+#pragma omp parallel for schedule(dynamic, 1) num_threads(utils::omp_threads())
         for (long ik = 0; ik < nk; ++ik) {
+          nda::array<cplx, 2> famA(nc2, nR), Bw(nc2, Nm), Dconj(nc2, Nm), Y(nc2, nc2), Ym(nc2, nc2), Gmat(ng, nc2), Mj(ng, nc2);
+          nda::array<cplx, 3> M3(np, ng, nc2);               // M_aj(i j) of one k'
+          nda::array<cplx, 2> CT(nc2, 1), CUa(nc2, 1), CUj(ng, nc2), Ha(nt, nc2), Ms(ng, nc2), WkA(nt, ng), WkJ(nt, np), MsJ(np, nc2);
           const long k = kpq(iq, ik);
           for (long c = 0; c < nc; ++c)
             for (long i = 0; i < nc; ++i)
