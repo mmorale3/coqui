@@ -2270,15 +2270,16 @@ namespace solvers {
     hook.refit = opt.dyn_refit; hook.refit_rtol = opt.dyn_refit_rtol;
     hook.symc = symc; hook.ibz = (sym_ and opt.ibz);   // P1: the IBZ solve + star fold (the driver's units are the IBZ transfers)
     // ---- L-8: the nu-SAMPLED mode: the deposit weights Tt = Ttw . Phi_all . pinv(Phi_S) from a reference dump's nu-bases ----
-    const bool sampled = not opt.dyn_nodes.empty();
+    const bool auto_nodes = (opt.dyn_nodes.empty() and opt.dyn_auto_nodes > 0);   // P14b
+    const bool sampled = not opt.dyn_nodes.empty() or auto_nodes;
     if (sampled) {
       utils::check(not opt.dyn_fit_file.empty(), "vertex_t::eval_sigma_pair_dyn: the sampled mode needs the reference dump (pol_vertex_sigma_dyn_fit_file).");
       utils::check(not opt.dyn_dump, "vertex_t::eval_sigma_pair_dyn: the dump is written by the ALL-node run, not by a sampled one.");
-      nus = opt.dyn_nodes;
-      std::sort(nus.begin(), nus.end()); nus.erase(std::unique(nus.begin(), nus.end()), nus.end());
-      for (long m : nus) utils::check(m >= 0 and m < nw_b, "vertex_t::eval_sigma_pair_dyn: sampled node {} outside [0, {}).", m, nw_b);
-      const long nS = long(nus.size());
-      const long K = (opt.dyn_fit_rank > 0) ? std::min<long>(opt.dyn_fit_rank, nS) : std::max<long>(1, std::min<long>(6, nS - 3));
+      if (not auto_nodes) {
+        nus = opt.dyn_nodes;
+        std::sort(nus.begin(), nus.end()); nus.erase(std::unique(nus.begin(), nus.end()), nus.end());
+        for (long m : nus) utils::check(m >= 0 and m < nw_b, "vertex_t::eval_sigma_pair_dyn: sampled node {} outside [0, {}).", m, nw_b);
+      }
       // the Gram matrices over nodes: ONE for the constant part, one PER VERTEX NODE p for the U and T families
       long np_ref = 0;
       nda::array<ComplexType, 2> Gc;
@@ -2329,6 +2330,34 @@ namespace solvers {
       mpi->comm.broadcast_n(hook.eps_ref.data(), hook.eps_ref.size(), 0);
       mpi->comm.broadcast_n(Gc.data(), Gc.size(), 0);
       mpi->comm.broadcast_n(GT.data(), GT.size(), 0);
+      if (auto_nodes) {
+        // P14b: the sampled nodes from the dump's own nu-modes -- the trace-normalized Gram matrices of the cst + U object and of
+        // every T-family node summed (one Gram over nodes that carries both object types), nu = 0 and the two tails forced,
+        // the rest the row pivots of the top-K modes (nusamp::pivot_nodes); deterministic on every rank (same Gram)
+        nda::array<ComplexType, 2> Gsum(nw_b, nw_b);
+        Gsum() = ComplexType(0.0);
+        auto add_norm = [&](nda::array<ComplexType, 2> const &G) {
+          double tr = 0.0;
+          for (long m = 0; m < nw_b; ++m) tr += G(m, m).real();
+          if (tr <= 0.0) return;
+          for (long m = 0; m < nw_b; ++m) for (long m2 = 0; m2 < nw_b; ++m2) Gsum(m, m2) += G(m, m2) / tr;
+        };
+        add_norm(Gc);
+        for (long pp = 0; pp < np_ref; ++pp) { nda::array<ComplexType, 2> Gp(nw_b, nw_b); Gp() = GT(pp, all, all); add_norm(Gp); }
+        long m0 = -1;
+        for (long m = 0; m < nw_b; ++m) if (tools.wn_b(m) == 0) m0 = m;
+        std::vector<long> forced;
+        if (m0 >= 0) forced.push_back(m0);
+        forced.push_back(0); forced.push_back(nw_b - 1);
+        const long Kn = std::max<long>(long(forced.size()), std::min<long>(opt.dyn_auto_nodes, nw_b));
+        nus = nusamp::pivot_nodes(Gsum, Kn, forced);
+        std::string lst;
+        for (long m : nus) lst += std::to_string(tools.wn_b(m)) + " ";
+        app_log(1, "  [LFF-Sigma dyn] P14b: {} sampled nodes chosen from {} (nu = 0 and the tails forced, pivots of the top-{} nu-modes of the dump): w_n = {}",
+                nus.size(), opt.dyn_fit_file, Kn, lst);
+      }
+      const long nS = long(nus.size());
+      const long K = (opt.dyn_fit_rank > 0) ? std::min<long>(opt.dyn_fit_rank, nS) : std::max<long>(1, std::min<long>(6, nS - 3));
       nda::array<ComplexType, 2> const &Ttw = tools.Ttw_bb;               // (nt, nw_b)
       // the weights of one basis: Tt = Ttw . Phi_all . pinv(Phi_S) scattered onto the sampled node indices; returns the kept weight
       // the nu-reconstruction of one object type (nu_sampling.hpp, P14): R = G(:, S) G(S, S)^-1_Kr (regression form) at the

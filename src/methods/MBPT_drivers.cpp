@@ -290,7 +290,9 @@ inline void ensure_checkpoint(std::shared_ptr<mf::MF> mf, std::string const& out
  *                 by exact partial fractions). L-8 (the chain-capable form): pol_vertex_sigma_dyn_dump (false; the all-node
  *                 run writes its per-node objects to <prefix>.sigdyn.h5), pol_vertex_sigma_dyn_nodes ([] = all nodes; a list
  *                 of FULL-mesh bosonic node indices evaluates only those and reconstructs the nu-sum in the rank-K nu-basis
- *                 learned from pol_vertex_sigma_dyn_fit_file, K = pol_vertex_sigma_dyn_fit_rank (0 = the number of nodes)).
+ *                 learned from pol_vertex_sigma_dyn_fit_file, K = pol_vertex_sigma_dyn_fit_rank (0 = the number of nodes);
+ *                 pol_vertex_sigma_dyn_auto_nodes (0; P14b) = choose that many sampled nodes from the dump's own nu-modes
+ *                 instead of listing them).
  *                 The 2026-09-21 performance program (notes/vertex_perf_plan.md): pol_vertex_sigma_pair_ibz (false; P1: the
  *                 ladder solved on the IBZ transfers, the star folded in the band basis), pol_vertex_sigma_dyn_ckpt_minutes
  *                 (0; P20: the Sigma accumulators checkpointed every so many minutes, restartable), pol_vertex_sigma_dyn_refit
@@ -730,6 +732,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
               io::get_array_with_default<long>(pt,"pol_vertex_sigma_dyn_nodes",std::vector<long>{}),
               io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_dyn_fit_file",""),
               io::get_value_with_default<long>(pt,"pol_vertex_sigma_dyn_fit_rank",0));
+          vertex.set_sigma_dyn_auto_nodes(io::get_value_with_default<long>(pt,"pol_vertex_sigma_dyn_auto_nodes",0));
         }
       }
     }
@@ -1163,6 +1166,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
               io::get_array_with_default<long>(pt,"pol_vertex_sigma_dyn_nodes",std::vector<long>{}),
               io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_dyn_fit_file",""),
               io::get_value_with_default<long>(pt,"pol_vertex_sigma_dyn_fit_rank",0));
+          pol_vertex_carrier.set_sigma_dyn_auto_nodes(io::get_value_with_default<long>(pt,"pol_vertex_sigma_dyn_auto_nodes",0));
         }
       }
     }
@@ -1448,6 +1452,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
               io::get_array_with_default<long>(pt,"pol_vertex_sigma_dyn_nodes",std::vector<long>{}),
               io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_dyn_fit_file",""),
               io::get_value_with_default<long>(pt,"pol_vertex_sigma_dyn_fit_rank",0));
+          pol_vertex_carrier.set_sigma_dyn_auto_nodes(io::get_value_with_default<long>(pt,"pol_vertex_sigma_dyn_auto_nodes",0));
         }
       }
     }
@@ -1779,6 +1784,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
               io::get_array_with_default<long>(pt,"pol_vertex_sigma_dyn_nodes",std::vector<long>{}),
               io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_dyn_fit_file",""),
               io::get_value_with_default<long>(pt,"pol_vertex_sigma_dyn_fit_rank",0));
+          vertex.set_sigma_dyn_auto_nodes(io::get_value_with_default<long>(pt,"pol_vertex_sigma_dyn_auto_nodes",0));
         }
       }
     }
@@ -2136,6 +2142,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
               io::get_array_with_default<long>(pt,"pol_vertex_sigma_dyn_nodes",std::vector<long>{}),
               io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_dyn_fit_file",""),
               io::get_value_with_default<long>(pt,"pol_vertex_sigma_dyn_fit_rank",0));
+          pol_vertex_carrier.set_sigma_dyn_auto_nodes(io::get_value_with_default<long>(pt,"pol_vertex_sigma_dyn_auto_nodes",0));
         }
       }
     }

@@ -501,6 +501,7 @@ namespace bdft_tests {
           std::string side_cur = "right";   // the junction of the next kind-2 run (section N sets it)
           bool sd_dump = false; std::vector<long> sd_nodes; std::string sd_fit; long sd_rank = 0;   // L-8: the next kind-2 run's sampled-mode knobs
           bool sd_ckpt = false;   // P20: the next kind-2 run checkpoints its Sigma accumulators after every unit (and keeps the files)
+          long sd_auto = 0;       // P14b: the next kind-2 run chooses this many sampled nodes from the dump (in place of sd_nodes)
           std::string sd_acc = std::getenv("COQUI_DYNBSE_TEST_SIGDYN_ACC") ? std::getenv("COQUI_DYNBSE_TEST_SIGDYN_ACC") : "split";   // P4-C14: split | single
           auto run_p = [&](std::string const &tag, int kind, std::string const &col, std::string const &outer, double scale, S5 &Sig) {
             // kind: 0 = plain GW, 1 = B-S Sigma^{C,x} (static rung), 2 = the pair vertex, 3 = the DYNAMIC-rung B-S Sigma^C (G^3 W^2)
@@ -529,6 +530,7 @@ namespace bdft_tests {
               vtx.set_isdf_points("coqui_d3_winj_G.secpts.h5", false);
               vtx.set_sigma_pair(true, col, outer, scale, true, true, side_cur);
               vtx.set_sigma_dyn(sd_dump, sd_nodes, sd_fit, sd_rank);
+              if (sd_auto > 0) vtx.set_sigma_dyn_auto_nodes(sd_auto);   // P14b
               if (sd_ckpt) vtx.set_sigma_dyn_ckpt_minutes(1e-9);   // P20: a checkpoint after every unit
               if (auto *rf = std::getenv("COQUI_DYNBSE_TEST_SIGDYN_REFIT")) vtx.set_sigma_dyn_refit(rf);   // P12: fit | union
               vtx.set_sigma_dyn_acc(sd_acc);   // P4-C14: split | single
@@ -714,10 +716,13 @@ namespace bdft_tests {
             if (std::getenv("COQUI_DYNBSE_TEST_SIGDYN_DUMP_ONLY")) return;   // keep the dump for offline analysis
             const long nwb = ft.wn_mesh_b().shape(0), hm = nwb / 2;   // LiH: 41 nodes, nu = 0 at 20
             // an evenly spread set (in node index ~ log nu): nu = 0 and +-4, 8, 12, 16, 20 -> 11 of 41 nodes; K = 6 per basis (least squares)
-            sd_nodes = {m0b}; for (long j : {4l, 8l, 12l, 16l, hm}) { sd_nodes.push_back(m0b + j); sd_nodes.push_back(m0b - j); }
+            // COQUI_DYNBSE_TEST_SIGDYN_SAMPLED=auto: the 11 nodes chosen by the dump's own nu-modes instead (P14b)
+            const bool auto_mode = (std::string(std::getenv("COQUI_DYNBSE_TEST_SIGDYN_SAMPLED")) == "auto");
             sd_fit = "coqui_d3_winj_D1D.sigdyn.h5"; sd_rank = 6;
+            if (auto_mode) sd_auto = 11;
+            else { sd_nodes = {m0b}; for (long j : {4l, 8l, 12l, 16l, hm}) { sd_nodes.push_back(m0b + j); sd_nodes.push_back(m0b - j); } }
             auto [cd1s, md1s, dd1s, kd1s] = run_p("D1S", 2, "dyn1", "dynamic", 1.0, S_d1s);
-            sd_nodes.clear(); sd_fit.clear(); sd_rank = 0;
+            sd_nodes.clear(); sd_fit.clear(); sd_rank = 0; sd_auto = 0;
             double num = 0.0, den = 0.0, mx = 0.0;
             for (long it = 0; it < S_d1d.shape(0); ++it)
               for (long is = 0; is < S_d1d.shape(1); ++is)
@@ -727,9 +732,10 @@ namespace bdft_tests {
                       const auto da = S_d1s(it, is, ik, i, j) - S_r0s(it, is, ik, i, j), db = S_d1d(it, is, ik, i, j) - S_r0s(it, is, ik, i, j);
                       num += std::norm(da - db); den += std::norm(db); mx = std::max(mx, std::abs(da - db));
                     }
-            app_log(1, "dynbse_readout LFF-Sigma SAMPLED gate: dyn1 on {} of {} nodes (K = {}, per-p U/T bases) vs all nodes: rel Frobenius {:.3e} (max |d| {:.3e}); "
+            app_log(1, "dynbse_readout LFF-Sigma SAMPLED gate: dyn1 on {} of {} nodes ({}; K = {}, per-p U/T bases) vs all nodes: rel Frobenius {:.3e} (max |d| {:.3e}); "
                        "e_corr all {:+.10f} sampled {:+.10f} (R0 {:+.10f}); max|dSigma| all {:.6e} sampled {:.6e}; anti-Hermitian all {:.2e} sampled {:.2e}",
-                    11, nwb, 6, std::sqrt(num) / std::max(std::sqrt(den), 1e-300), mx, cd1d, cd1s, cr0s, md1d[0], md1s[0], md1d[1], md1s[1]);
+                    11, nwb, auto_mode ? "chosen by the dump's nu-modes, P14b" : "the fixed evenly spread set", 6,
+                    std::sqrt(num) / std::max(std::sqrt(den), 1e-300), mx, cd1d, cd1s, cr0s, md1d[0], md1s[0], md1d[1], md1s[1]);
             REQUIRE(den > 0.0);
             REQUIRE(std::sqrt(num) / std::sqrt(den) < 5e-2);
             if (mpi_context->comm.root()) remove("coqui_d3_winj_D1D.sigdyn.h5");

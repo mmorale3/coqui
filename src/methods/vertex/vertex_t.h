@@ -948,6 +948,7 @@ namespace vertex_pi { struct iaft_tools; }
     std::string _sigma_interp_projector;         // pol_vertex_sigma_interp_projector: the fine mesh's Wannier projector file (P16)
     std::string _sigma_dyn_fit_file;             // pol_vertex_sigma_dyn_fit_file: the reference dump for the sampled mode
     long _sigma_dyn_fit_rank = 0;                // pol_vertex_sigma_dyn_fit_rank: K (0 = the number of sampled nodes)
+    long _sigma_dyn_auto_nodes = 0;              // pol_vertex_sigma_dyn_auto_nodes: choose this many sampled nodes automatically (P14b)
     double _sigma_lff_pinv_tol = 1e-3;      // pol_vertex_sigma_pinv_tol: relative eigenvalue cutoff of Pi_0^-1 -- the vertex lives on the
                                             // bubble's strong modes (Si kp444: 49 of 156 carry 99.9 % of |tr B|; |Gamma_eff - 1| is bounded and
                                             // stable for 1e-1..1e-3, blows up below 1e-4 where dPi / Pi_0 is unbounded)
@@ -1692,6 +1693,16 @@ namespace vertex_pi { struct iaft_tools; }
                    "vertex_t::set_sigma_dyn: pol_vertex_sigma_dyn_nodes needs pol_vertex_sigma_dyn_fit_file (the all-node reference dump).");
       _sigma_dyn_dump = dump; _sigma_dyn_nodes = nodes; _sigma_dyn_fit_file = fit_file; _sigma_dyn_fit_rank = fit_rank;
     }
+    /** P14b (vertex_perf_plan.md): pol_vertex_sigma_dyn_auto_nodes = K > 0 chooses the K sampled nodes from the reference dump
+     *  itself -- nu = 0 and the two tail nodes forced, the rest the row pivots of the top-K nu-modes of the dump's Gram matrix
+     *  (the cst + U object and the T family's per-node objects, trace-normalized and summed; nusamp::pivot_nodes) -- in place
+     *  of an explicit pol_vertex_sigma_dyn_nodes list. Needs pol_vertex_sigma_dyn_fit_file. */
+    void set_sigma_dyn_auto_nodes(long K) {
+      utils::check(K == 0 or not _sigma_dyn_fit_file.empty(), "vertex_t::set_sigma_dyn_auto_nodes: needs pol_vertex_sigma_dyn_fit_file (the all-node reference dump).");
+      utils::check(K == 0 or _sigma_dyn_nodes.empty(), "vertex_t::set_sigma_dyn_auto_nodes: pol_vertex_sigma_dyn_nodes and pol_vertex_sigma_dyn_auto_nodes are exclusive.");
+      _sigma_dyn_auto_nodes = K;
+    }
+    long sigma_dyn_auto_nodes() const { return _sigma_dyn_auto_nodes; }
     bool sigma_dyn_dump() const { return _sigma_dyn_dump; }
     std::vector<long> const &sigma_dyn_nodes() const { return _sigma_dyn_nodes; }
     std::string const &sigma_dyn_fit_file() const { return _sigma_dyn_fit_file; }
@@ -1759,6 +1770,7 @@ namespace vertex_pi { struct iaft_tools; }
       std::vector<long> dyn_nodes;      // FULL-mesh node indices to evaluate (empty = all nodes, the exact nu-sum)
       std::string dyn_fit_file;         // the reference dump the nu-bases are learned from (needed with dyn_nodes)
       long dyn_fit_rank = 0;            // K modes per object type (0 = |dyn_nodes|: interpolation)
+      long dyn_auto_nodes = 0;          // P14b: choose this many sampled nodes from the reference dump (with dyn_nodes empty)
       std::string dump_prefix;          // the run prefix for the dump
       bool ibz = false;                 // P1: solve the Sigma-side ladder on the IBZ transfers only and fold the star (sym meshes)
       double dyn_ckpt_minutes = 0.0;    // P20: the Sigma-accumulator checkpoint interval of the dynamic solve (0 = off)

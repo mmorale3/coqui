@@ -1293,6 +1293,7 @@ namespace solvers {
     o.dyn_acc = v.sigma_dyn_acc();   // P4-C14
     o.dyn_dump = v.sigma_dyn_dump(); o.dyn_nodes = v.sigma_dyn_nodes();
     o.dyn_fit_file = v.sigma_dyn_fit_file(); o.dyn_fit_rank = v.sigma_dyn_fit_rank();
+    o.dyn_auto_nodes = v.sigma_dyn_auto_nodes();   // P14b
     o.dump_prefix = mb_state.coqui_prefix;
     return o;
   }
