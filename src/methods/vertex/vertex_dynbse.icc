@@ -883,8 +883,9 @@ namespace solvers {
         utils::check(opt.dump_prefix.empty(), "pair_space_ladder_dyn: the Sigma hook and the unit dump/restart are exclusive.");
         opt.sigma->init(nt, ns, nk, np, nc, b, nw_b);
         if (rank == 0)
-          app_log(1, "  [LFF-Sigma dyn] Sigma hook armed: col {}, outer W {}; accumulators (nt {}, nk {}, np {}, nc {}) x 3, {:.2f} GB per rank",
-                  opt.sigma->col, opt.sigma->outer, nt, nk, np, nc, double(nt * ns * nk * nc2) * (2.0 * double(np) + 1.0) * 16.0 / 1e9);
+          app_log(1, "  [LFF-Sigma dyn] Sigma hook armed: col {}, outer W {}; accumulators (nt {}, nk {}, np {}, nc {}) {}, {:.2f} GB per rank",
+                  opt.sigma->col, opt.sigma->outer, nt, nk, np, nc, opt.sigma->single_acc ? "in ONE tau-resolved object (P4-C14)" : "x 3",
+                  double(nt * ns * nk * nc2) * (opt.sigma->single_acc ? 1.0 : 2.0 * double(np) + 1.0) * 16.0 / 1e9);
       }
       // ---- P20: the Sigma-accumulator checkpoint -----------------------------------------------
       std::set<std::tuple<long, long, long>> sig_done;         // units whose deposits are already in the accumulators (all ranks)
@@ -901,10 +902,15 @@ namespace solvers {
           h5::file f(fn, 'r');
           h5::group g(f);
           nda::array<ComplexType, 5> Sc; nda::array<ComplexType, 6> Rt, Ru; nda::array<long, 2> done;
-          nda::h5_read(g, "S_cst", Sc); nda::h5_read(g, "RT", Rt); nda::h5_read(g, "RU", Ru); nda::h5_read(g, "done", done);
+          nda::h5_read(g, "S_cst", Sc); nda::h5_read(g, "done", done);
+          const bool split_file = g.has_dataset("RT");
+          if (split_file) { nda::h5_read(g, "RT", Rt); nda::h5_read(g, "RU", Ru); }
+          utils::check(split_file == (not opt.sigma->single_acc), "pair_space_ladder_dyn: the Sigma checkpoint {} was written by the {} accumulator mode, this run uses the {} one.",
+                       fn, split_file ? "split" : "single", opt.sigma->single_acc ? "single" : "split");
           utils::check(Sc.shape() == opt.sigma->S_cst.shape() and Rt.shape() == opt.sigma->RT.shape() and Ru.shape() == opt.sigma->RU.shape(),
                        "pair_space_ladder_dyn: the Sigma checkpoint {} has other accumulator shapes than this run.", fn);
-          opt.sigma->S_cst += Sc; opt.sigma->RT += Rt; opt.sigma->RU += Ru;
+          opt.sigma->S_cst += Sc;
+          if (split_file) { opt.sigma->RT += Rt; opt.sigma->RU += Ru; }
           for (long i = 0; i < done.shape(0); ++i) {
             sig_done.emplace(done(i, 0), done(i, 1), done(i, 2));
             sig_mine.push_back({done(i, 0), done(i, 1), done(i, 2)});
@@ -941,7 +947,8 @@ namespace solvers {
         {
           h5::file f(fn + ".tmp", 'w');
           h5::group g(f);
-          nda::h5_write(g, "S_cst", opt.sigma->S_cst); nda::h5_write(g, "RT", opt.sigma->RT); nda::h5_write(g, "RU", opt.sigma->RU);
+          nda::h5_write(g, "S_cst", opt.sigma->S_cst);
+          if (not opt.sigma->single_acc) { nda::h5_write(g, "RT", opt.sigma->RT); nda::h5_write(g, "RU", opt.sigma->RU); }   // P4-C14
           nda::h5_write(g, "done", done);
         }
         std::filesystem::rename(fn + ".tmp", fn);                 // atomic replacement: a kill during the write keeps the previous file
@@ -2232,6 +2239,8 @@ namespace solvers {
     hook.col = opt.col;
     hook.outer = opt.outer;
     hook.dump = opt.dyn_dump;
+    hook.single_acc = (opt.dyn_acc == "single");   // P4-C14
+    hook.refit = opt.dyn_refit; hook.refit_rtol = opt.dyn_refit_rtol;
     hook.symc = symc; hook.ibz = (sym_ and opt.ibz);   // P1: the IBZ solve + star fold (the driver's units are the IBZ transfers)
     // ---- L-8: the nu-SAMPLED mode: the deposit weights Tt = Ttw . Phi_all . pinv(Phi_S) from a reference dump's nu-bases ----
     const bool sampled = not opt.dyn_nodes.empty();
@@ -2425,8 +2434,8 @@ namespace solvers {
                                 nullptr, nullptr, nullptr, nullptr, mpi->comm.rank(), mpi->comm.size(), o, &dmet, symc);
     hook.flush_unit();                                               // P1: the last unit's star fold
     mpi->comm.all_reduce_in_place_n(hook.S_cst.data(), hook.S_cst.size(), std::plus<>{});
-    mpi->comm.all_reduce_in_place_n(hook.RT.data(), hook.RT.size(), std::plus<>{});
-    mpi->comm.all_reduce_in_place_n(hook.RU.data(), hook.RU.size(), std::plus<>{});
+    if (hook.RT.size() > 0) mpi->comm.all_reduce_in_place_n(hook.RT.data(), hook.RT.size(), std::plus<>{});   // P4-C14: empty in the single mode
+    if (hook.RU.size() > 0) mpi->comm.all_reduce_in_place_n(hook.RU.data(), hook.RU.size(), std::plus<>{});
     if (hook.dump) {
       // L-8: the per-node objects of the all-node run -> <prefix>.sigdyn.h5 (the nu-bases of a later sampled run)
       for (auto *A : {&hook.Hc_n, &hook.HT_n}) mpi->comm.all_reduce_in_place_n(A->data(), A->size(), std::plus<>{});

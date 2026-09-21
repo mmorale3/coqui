@@ -291,6 +291,13 @@ inline void ensure_checkpoint(std::shared_ptr<mf::MF> mf, std::string const& out
  *                 run writes its per-node objects to <prefix>.sigdyn.h5), pol_vertex_sigma_dyn_nodes ([] = all nodes; a list
  *                 of FULL-mesh bosonic node indices evaluates only those and reconstructs the nu-sum in the rank-K nu-basis
  *                 learned from pol_vertex_sigma_dyn_fit_file, K = pol_vertex_sigma_dyn_fit_rank (0 = the number of nodes)).
+ *                 The 2026-09-21 performance program (notes/vertex_perf_plan.md): pol_vertex_sigma_pair_ibz (false; P1: the
+ *                 ladder solved on the IBZ transfers, the star folded in the band basis), pol_vertex_sigma_dyn_ckpt_minutes
+ *                 (0; P20: the Sigma accumulators checkpointed every so many minutes, restartable), pol_vertex_sigma_dyn_refit
+ *                 ("fit" | "union", P12) + _rtol (1e-8), pol_vertex_sigma_share (false; P3: the P-side all-nu readout's
+ *                 solves feed the Sigma deposits), pol_vertex_sigma_dyn_acc ("split" | "single", P4-C14: one tau-resolved
+ *                 accumulator, memory / (2 n_p + 1)), pol_vertex_sigma_interp_dump / _file / _projector (P16: the coarse
+ *                 run's Wannier-frame dSigma consumed on a finer mesh).
  *                 {choices: "none", "lff", "pair"}
  *  - pol_vertex_sigma_bub: "window" Pi_0 of the vertex: the dump's window bubble ("Pi_bub") or the loop's RPA Pi folded
  *                 to the frame ("full"). pol_vertex_sigma_scale (1.0) multiplies the correction; pol_vertex_sigma_pinv_tol
@@ -715,6 +722,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
           vertex.set_sigma_dyn_refit(io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_dyn_refit","fit"),
                                       io::get_value_with_default<double>(pt,"pol_vertex_sigma_dyn_refit_rtol",1e-8));
           vertex.set_sigma_share(io::get_value_with_default<bool>(pt,"pol_vertex_sigma_share",false));
+          vertex.set_sigma_dyn_acc(io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_dyn_acc","split"));
           vertex.set_sigma_interp(io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_interp_dump",""),
                                   io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_interp_file",""),
                                   io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_interp_projector",""));
@@ -1147,6 +1155,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
           pol_vertex_carrier.set_sigma_dyn_refit(io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_dyn_refit","fit"),
                                       io::get_value_with_default<double>(pt,"pol_vertex_sigma_dyn_refit_rtol",1e-8));
           pol_vertex_carrier.set_sigma_share(io::get_value_with_default<bool>(pt,"pol_vertex_sigma_share",false));
+          pol_vertex_carrier.set_sigma_dyn_acc(io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_dyn_acc","split"));
           pol_vertex_carrier.set_sigma_interp(io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_interp_dump",""),
                                   io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_interp_file",""),
                                   io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_interp_projector",""));
@@ -1431,6 +1440,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
           pol_vertex_carrier.set_sigma_dyn_refit(io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_dyn_refit","fit"),
                                       io::get_value_with_default<double>(pt,"pol_vertex_sigma_dyn_refit_rtol",1e-8));
           pol_vertex_carrier.set_sigma_share(io::get_value_with_default<bool>(pt,"pol_vertex_sigma_share",false));
+          pol_vertex_carrier.set_sigma_dyn_acc(io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_dyn_acc","split"));
           pol_vertex_carrier.set_sigma_interp(io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_interp_dump",""),
                                   io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_interp_file",""),
                                   io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_interp_projector",""));
@@ -1761,6 +1771,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
           vertex.set_sigma_dyn_refit(io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_dyn_refit","fit"),
                                       io::get_value_with_default<double>(pt,"pol_vertex_sigma_dyn_refit_rtol",1e-8));
           vertex.set_sigma_share(io::get_value_with_default<bool>(pt,"pol_vertex_sigma_share",false));
+          vertex.set_sigma_dyn_acc(io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_dyn_acc","split"));
           vertex.set_sigma_interp(io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_interp_dump",""),
                                   io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_interp_file",""),
                                   io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_interp_projector",""));
@@ -2117,6 +2128,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
           pol_vertex_carrier.set_sigma_dyn_refit(io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_dyn_refit","fit"),
                                       io::get_value_with_default<double>(pt,"pol_vertex_sigma_dyn_refit_rtol",1e-8));
           pol_vertex_carrier.set_sigma_share(io::get_value_with_default<bool>(pt,"pol_vertex_sigma_share",false));
+          pol_vertex_carrier.set_sigma_dyn_acc(io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_dyn_acc","split"));
           pol_vertex_carrier.set_sigma_interp(io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_interp_dump",""),
                                   io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_interp_file",""),
                                   io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_interp_projector",""));

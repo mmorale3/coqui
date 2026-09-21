@@ -93,6 +93,20 @@ namespace solvers {
       bool initialized = false;
       std::set<long> nodes_active;
       std::vector<long> nodes_done;      // the nodes deposited by the calls so far (the next call runs the rest)
+      // P4-C14 (vertex_perf_plan.md): the SINGLE-accumulator mode (pol_vertex_sigma_dyn_acc = single). The finish is a fixed
+      // linear map of the node-resolved accumulators -- RU: sum_p K_F(tau, p) RU_p(tau); RT: E_a = K_F(., a) RT_a -> the
+      // fixed-rank refit C (np' x nt) -> the tau[U_a U_p'] table -- so its tau x tau' matrices M_a(tau, tau') = sum_p' Tpp(tau,
+      // a, p') C(p', tau') K_F(tau', a) fold into the DEPOSIT weights: V_T(a; tau, m) = sum_tau' M_a(tau, tau') Ttw(tau', m) for
+      // the T pieces, K_F(tau, p) Ttw(tau, m) for the U pieces, and everything lands in S_cst (Su under ibz): the memory and the
+      // all-reduce volume drop by 2 np + 1, the star fold runs once per unit. Not bitwise against the split path (the same
+      // linear map applied in another order: rounding x cond(C)); the E-refit error is then not available (reported < 0).
+      bool single_acc = false;
+      std::string refit = "fit";         // the refit target the single mode folds in (P12: fit | union)
+      double refit_rtol = 1e-8;
+      bool vt_ok = false;
+      nda::array<double, 3> Ma;          // (np, nt, nt): M_a(tau, tau')
+      nda::array<ComplexType, 3> VT;     // (np, nt, nw_b): V_T(a; tau, m) (complex: the Ttw rows are)
+      std::map<long, nda::array<ComplexType, 3>> wkT, wkU;   // sampled mode: the wk tables with M_a (T) / K_F(., a) (U) folded in
       // dump mode: the per-node objects (before any weighting), for the nu-basis of a later sampled run
       bool dump = false;
       nda::array<ComplexType, 6> Hc_n;   // (nw_b, ns, nt, nk, nc, nc): the merged cst + U object per node
@@ -131,8 +145,10 @@ namespace solvers {
         if (ibz) {
           utils::check(symc->nk_full == nk_full, "sigma_dyn_hook: sym context nk_full {} vs G's k axis {}.", symc->nk_full, nk_full);
           Su = nda::array<ComplexType, 4>(nt, nk_full, nc, nc); Su() = ComplexType(0.0);
-          RTu = nda::array<ComplexType, 5>(nt, nk_full, np, nc, nc); RTu() = ComplexType(0.0);
-          RUu = nda::array<ComplexType, 5>(nt, nk_full, np, nc, nc); RUu() = ComplexType(0.0);
+          if (not single_acc) {
+            RTu = nda::array<ComplexType, 5>(nt, nk_full, np, nc, nc); RTu() = ComplexType(0.0);
+            RUu = nda::array<ComplexType, 5>(nt, nk_full, np, nc, nc); RUu() = ComplexType(0.0);
+          }
         }
         nk = nk_ext;
         utils::check(R_T.size() == 0 or R_T.shape(0) == np, "sigma_dyn_hook: the reference dump's np ({}) differs from this run's ({}).",
@@ -143,9 +159,13 @@ namespace solvers {
                          "sigma_dyn_hook: pole node {} of the reference dump is {} vs {} in this run (the nu-bases transfer across k meshes, "
                          "not across imaginary-axis grids).", a, eps_ref(a), b.eps(a));
         S_cst = nda::array<ComplexType, 5>(nt, ns, nk, nc, nc); S_cst() = ComplexType(0.0);
-        RT = nda::array<ComplexType, 6>(nt, ns, nk, np, nc, nc); RT() = ComplexType(0.0);
-        RU = nda::array<ComplexType, 6>(nt, ns, nk, np, nc, nc); RU() = ComplexType(0.0);
+        if (not single_acc) {
+          RT = nda::array<ComplexType, 6>(nt, ns, nk, np, nc, nc); RT() = ComplexType(0.0);
+          RU = nda::array<ComplexType, 6>(nt, ns, nk, np, nc, nc); RU() = ComplexType(0.0);
+        }
         poles = (vertex_debug::text("sigdyn_route", "product") == "poles");   // vertex_debug: sigdyn_route = poles | product
+        utils::check(not (poles and single_acc), "sigma_dyn_hook: the pole route needs the split accumulators (pol_vertex_sigma_dyn_acc = split).");
+        vt_ok = false; wkT.clear(); wkU.clear();
         wk.clear();
         if (auto fam = vertex_debug::get("sigdyn_families"); fam.has_value()) {   // vertex_debug: sigdyn_families = U | T | UT
           const std::string fs(*fam);
@@ -161,14 +181,15 @@ namespace solvers {
        *  changes and once more by the wrapper before the all-reduce */
       void flush_unit() {
         if (not ibz or unit_iq < 0) return;
-        const long np_ = RTu.shape(2);
+        const long np_ = (RTu.size() > 0) ? RTu.shape(2) : 0;   // P4-C14: the single mode folds S alone
         decltype(nda::range::all) all;
         vertex_sym::fold_star_into_ibz(*symc, unit_iq, Su, S_cst(all, unit_is, all, all, all), &n_trev_images);
         for (long a = 0; a < np_; ++a) {
           vertex_sym::fold_star_into_ibz(*symc, unit_iq, RTu(all, all, a, all, all), RT(all, unit_is, all, a, all, all));
           vertex_sym::fold_star_into_ibz(*symc, unit_iq, RUu(all, all, a, all, all), RU(all, unit_is, all, a, all, all));
         }
-        Su() = ComplexType(0.0); RTu() = ComplexType(0.0); RUu() = ComplexType(0.0);
+        Su() = ComplexType(0.0);
+        if (np_ > 0) { RTu() = ComplexType(0.0); RUu() = ComplexType(0.0); }
         unit_is = unit_iq = unit_m = -1;
       }
       /** P1: the deposit targets of block (is, iq, m): the unit scratch under ibz (flushing the previous unit), else the accumulators */
@@ -180,6 +201,56 @@ namespace solvers {
       // the deposit weight of node m at tau node it, per object type (the Ttw row unless sampled weights were set)
       ComplexType wc(vertex_pi::iaft_tools const &tools, long it, long m) const { return W_cst.size() > 0 ? W_cst(it, m) : tools.Ttw_bb(it, m); }
     };
+
+    /** P4-C14: the single-accumulator tables M_a(tau, tau') and V_T(a; tau, m) from the basis and the refit target (see the hook) */
+    inline void sigma_dyn_single_tables(sigma_dyn_hook &h, vertex_pi::iaft_tools const &tools) {
+      using cplx = ComplexType;
+      if (h.vt_ok) return;
+      utils::check(h.basis.has_value(), "sigma_dyn_single_tables: no basis.");
+      auto const &b = h.basis.value();
+      const long nt = b.nt, np = b.np, nw_b = tools.nw_b;
+      utils::check(h.refit == "fit" or h.refit == "union", "sigma_dyn_single_tables: refit must be fit | union (got \"{}\").", h.refit);
+      const long npf = (h.refit == "union") ? np : b.np_fit;
+      // the refit's linear map C (npf x nt): the fixed-rank fit applied to the unit vectors
+      nda::array<cplx, 2> I(nt, nt);
+      I() = cplx(0.0);
+      for (long i = 0; i < nt; ++i) I(i, i) = cplx(1.0);
+      nda::array<cplx, 2> C;
+      if (h.refit == "union") {
+        dynbse::node_pole_fit upf;
+        upf.build(b.beta, b.s, b.eps, h.refit_rtol);
+        C = upf.coeffs(I);
+      } else {
+        C = dynbse::basis_coeffs(b, I);
+      }
+      utils::check(C.shape(0) == npf and C.shape(1) == nt, "sigma_dyn_single_tables: the refit map is ({}, {}), expected ({}, {}).", C.shape(0), C.shape(1), npf, nt);
+      // tau[U_a U_p'](tau) as in the finish
+      nda::array<double, 3> Tpp(nt, np, npf);
+      for (long it = 0; it < nt; ++it)
+        for (long a = 0; a < np; ++a)
+          for (long pp = 0; pp < npf; ++pp)
+            Tpp(it, a, pp) = (a == pp) ? b.KF2(it, a) : (b.KF(it, a) - b.KF(it, pp)) / (b.eps(a) - b.eps(pp));
+      h.Ma = nda::array<double, 3>(np, nt, nt);
+      h.VT = nda::array<cplx, 3>(np, nt, nw_b);
+      double cim = 0.0;
+      for (long a = 0; a < np; ++a) {
+        for (long it = 0; it < nt; ++it)
+          for (long jt = 0; jt < nt; ++jt) {
+            cplx acc(0.0);
+            for (long pp = 0; pp < npf; ++pp) acc += cplx(Tpp(it, a, pp)) * C(pp, jt);
+            cim = std::max(cim, std::abs(acc.imag()));
+            h.Ma(a, it, jt) = acc.real() * b.KF(jt, a);
+          }
+        for (long it = 0; it < nt; ++it)
+          for (long m = 0; m < nw_b; ++m) {
+            cplx acc(0.0);
+            for (long jt = 0; jt < nt; ++jt) acc += h.Ma(a, it, jt) * tools.Ttw_bb(jt, m);
+            h.VT(a, it, m) = acc;
+          }
+      }
+      utils::check(cim < 1e-12, "sigma_dyn_single_tables: the refit map is not real ({}).", cim);
+      h.vt_ok = true;
+    }
 
     /** THE POLE ROUTE (the a134219 deposits, kept for the route cross-check: env COQUI_SIGDYN_ROUTE=poles): the U family through
      *  half_l0_left's partial fractions into RU (per p), the T family's coefficient into RT (per p, K_F applied in the finish) */
@@ -543,7 +614,23 @@ namespace solvers {
             itw = h.wk.emplace(m, std::move(W)).first;
           }
           Wk = &itw->second;
-        }
+          if (h.single_acc and h.wkT.find(m) == h.wkT.end()) {
+            // P4-C14: W_kappa with M_a (the T pieces) and K_F(., a) (the U pieces) folded in, per sampled node
+            sigma_dyn_single_tables(h, tools);
+            nda::array<cplx, 3> WT(np, ng, nt), WU(np, ng, nt);
+            for (long a = 0; a < np; ++a)
+              for (long j = 0; j < ng; ++j)
+                for (long it = 0; it < nt; ++it) {
+                  cplx acc(0.0);
+                  for (long jt = 0; jt < nt; ++jt) acc += h.Ma(a, it, jt) * (*Wk)(a, j, jt);
+                  WT(a, j, it) = acc;
+                  WU(a, j, it) = cplx(b.KF(it, a)) * (*Wk)(a, j, it);
+                }
+            h.wkT.emplace(m, std::move(WT)); h.wkU.emplace(m, std::move(WU));
+          }
+        } else if (h.single_acc) sigma_dyn_single_tables(h, tools);
+        nda::array<cplx, 3> const *WkT = (h.single_acc and h.sampled) ? &h.wkT.at(m) : nullptr;
+        nda::array<cplx, 3> const *WkU = (h.single_acc and h.sampled) ? &h.wkU.at(m) : nullptr;
         std::vector<char> hasT(size_t(np), 0);
         for (long a = 0; a < np; ++a)
           for (long ik = 0; ik < nk and not hasT[size_t(a)]; ++ik)
@@ -607,6 +694,14 @@ namespace solvers {
                 }
               for (long it = 0; it < nt; ++it) {
                 const cplx w = tools.Ttw_bb(it, m);
+                if (h.single_acc) {   // P4-C14: the T piece through V_T(a; tau, m), the U piece through K_F(tau, a) w, both into S
+                  const cplx vt = h.VT(a, it, m), vu = cplx(b.KF(it, a)) * w;
+                  for (long q = 0; q < nc2; ++q) {
+                    const cplx d = vt * CT(q, 0) + vu * CUa(q, 0);
+                    if (h.ibz) h.Su(it, k, q / nc, q % nc) += d; else h.S_cst(it, is, k, q / nc, q % nc) += d;
+                  }
+                  continue;
+                }
                 for (long q = 0; q < nc2; ++q) {
                   if (h.ibz) { h.RTu(it, k, a, q / nc, q % nc) += w * CT(q, 0); h.RUu(it, k, a, q / nc, q % nc) += w * CUa(q, 0); }
                   else { h.RT(it, is, k, a, q / nc, q % nc) += w * CT(q, 0); h.RU(it, is, k, a, q / nc, q % nc) += w * CUa(q, 0); }
@@ -615,17 +710,26 @@ namespace solvers {
             } else {
               // RT_a(tau) -= sum_j W_kappa(a, j, tau) M_aj;  RU_a(tau) += sum_j W_kappa(a, j, tau) M_aj / Delta_aj
               for (long it = 0; it < nt; ++it)
-                for (long j = 0; j < ng; ++j) WkA(it, j) = (*Wk)(a, j, it);
+                for (long j = 0; j < ng; ++j) WkA(it, j) = h.single_acc ? (*WkT)(a, j, it) : (*Wk)(a, j, it);   // P4-C14: M_a folded in
               nda::blas::gemm(WkA, Mj, Ha);
               for (long it = 0; it < nt; ++it)
-                for (long q = 0; q < nc2; ++q) { if (h.ibz) h.RTu(it, k, a, q / nc, q % nc) -= Ha(it, q); else h.RT(it, is, k, a, q / nc, q % nc) -= Ha(it, q); }
+                for (long q = 0; q < nc2; ++q) {
+                  if (h.single_acc) { if (h.ibz) h.Su(it, k, q / nc, q % nc) -= Ha(it, q); else h.S_cst(it, is, k, q / nc, q % nc) -= Ha(it, q); }
+                  else if (h.ibz) h.RTu(it, k, a, q / nc, q % nc) -= Ha(it, q); else h.RT(it, is, k, a, q / nc, q % nc) -= Ha(it, q);
+                }
               for (long j = 0; j < ng; ++j) {
                 const cplx dinv = (kap(a, j) != cplx(0.0)) ? kapd(a, j) / kap(a, j) : cplx(0.0);   // 1 / Delta_aj
                 for (long q = 0; q < nc2; ++q) Ms(j, q) = dinv * Mj(j, q);
               }
+              if (h.single_acc)
+                for (long it = 0; it < nt; ++it)
+                  for (long j = 0; j < ng; ++j) WkA(it, j) = (*WkU)(a, j, it);   // P4-C14: K_F(., a) folded in
               nda::blas::gemm(WkA, Ms, Ha);
               for (long it = 0; it < nt; ++it)
-                for (long q = 0; q < nc2; ++q) { if (h.ibz) h.RUu(it, k, a, q / nc, q % nc) += Ha(it, q); else h.RU(it, is, k, a, q / nc, q % nc) += Ha(it, q); }
+                for (long q = 0; q < nc2; ++q) {
+                  if (h.single_acc) { if (h.ibz) h.Su(it, k, q / nc, q % nc) += Ha(it, q); else h.S_cst(it, is, k, q / nc, q % nc) += Ha(it, q); }
+                  else if (h.ibz) h.RUu(it, k, a, q / nc, q % nc) += Ha(it, q); else h.RU(it, is, k, a, q / nc, q % nc) += Ha(it, q);
+                }
             }
           }
           // the RU_{n_j} pieces: -sum_a kappa_aj / Delta_aj M_aj at the G pole j (node n_j)
@@ -633,8 +737,11 @@ namespace solvers {
             for (long j = 0; j < ng; ++j) {
               const long nj = P.gnode(j);
               for (long it = 0; it < nt; ++it) {
-                const cplx w = tools.Ttw_bb(it, m);
-                for (long q = 0; q < nc2; ++q) { if (h.ibz) h.RUu(it, k, nj, q / nc, q % nc) -= w * CUj(j, q); else h.RU(it, is, k, nj, q / nc, q % nc) -= w * CUj(j, q); }
+                const cplx w = h.single_acc ? cplx(b.KF(it, nj)) * tools.Ttw_bb(it, m) : tools.Ttw_bb(it, m);   // P4-C14: K_F(., n_j) folded in
+                for (long q = 0; q < nc2; ++q) {
+                  if (h.single_acc) { if (h.ibz) h.Su(it, k, q / nc, q % nc) -= w * CUj(j, q); else h.S_cst(it, is, k, q / nc, q % nc) -= w * CUj(j, q); }
+                  else if (h.ibz) h.RUu(it, k, nj, q / nc, q % nc) -= w * CUj(j, q); else h.RU(it, is, k, nj, q / nc, q % nc) -= w * CUj(j, q);
+                }
               }
             }
           } else {
@@ -646,8 +753,13 @@ namespace solvers {
                 for (long q = 0; q < nc2; ++q) MsJ(a, q) = dinv * M3(a, j, q);
               }
               nda::blas::gemm(WkJ, MsJ, Ha);
-              for (long it = 0; it < nt; ++it)
-                for (long q = 0; q < nc2; ++q) { if (h.ibz) h.RUu(it, k, nj, q / nc, q % nc) -= Ha(it, q); else h.RU(it, is, k, nj, q / nc, q % nc) -= Ha(it, q); }
+              for (long it = 0; it < nt; ++it) {
+                const cplx kf = h.single_acc ? cplx(b.KF(it, nj)) : cplx(1.0);   // P4-C14: K_F(., n_j) folded in
+                for (long q = 0; q < nc2; ++q) {
+                  if (h.single_acc) { if (h.ibz) h.Su(it, k, q / nc, q % nc) -= kf * Ha(it, q); else h.S_cst(it, is, k, q / nc, q % nc) -= kf * Ha(it, q); }
+                  else if (h.ibz) h.RUu(it, k, nj, q / nc, q % nc) -= Ha(it, q); else h.RU(it, is, k, nj, q / nc, q % nc) -= Ha(it, q);
+                }
+              }
             }
           }
         }
@@ -669,9 +781,16 @@ namespace solvers {
       const long nt = h.S_cst.shape(0), ns = h.S_cst.shape(1), nk = h.S_cst.shape(2), nc = h.S_cst.shape(3), nc2 = nc * nc;
       const long np = b.np, npf = (refit == "union") ? b.np : b.np_fit;
       utils::check(refit == "fit" or refit == "union", "sigma_dyn_finish: refit must be fit | union (got \"{}\").", refit);
-      utils::check(h.np == np and h.RT.shape(3) == np and h.RU.shape(3) == np, "sigma_dyn_finish: node count mismatch.");
       dSig = nda::array<cplx, 5>(nt, ns, nk, nc, nc);
       dSig() = cplx(0.0);
+      if (h.single_acc) {   // P4-C14: everything is in S_cst already (the finish's maps were folded into the deposit weights)
+        utils::check(h.refit == refit, "sigma_dyn_finish: the single accumulator was deposited for refit = {}, the finish asks {}.", h.refit, refit);
+        const cplx pref1(-scale / double(nk_norm), 0.0);
+        for (long i = 0; i < long(dSig.size()); ++i) dSig.data()[i] = pref1 * h.S_cst.data()[i];
+        e_fit_err = -1.0;   // not available in this mode
+        return;
+      }
+      utils::check(h.np == np and h.RT.shape(3) == np and h.RU.shape(3) == np, "sigma_dyn_finish: node count mismatch.");
       // the T family: E_a(tau) = K_F(tau, a) RT_a(tau) (every node a), refit onto the vertex nodes, times U_a by partial fractions
       const long nb = ns * nk * np * nc2;
       nda::array<cplx, 2> E(nt, nb);

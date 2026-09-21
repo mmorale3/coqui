@@ -120,6 +120,7 @@ namespace bdft_tests {
       solvers::vertex_t vtx(&ft, "none", nda::range(0, 0), mf->nbnd());
       vtx.set_pol_vertex("ladder", "w0_prev", window, -1, 1e-8, -1.0, -1.0, -1.0);
       if (auto *rm = std::getenv("COQUI_DYNBSE_TEST_RESOLVENT")) vtx.set_ladder_dyn_resolvent(rm);   // P7: inverse | lu
+      if (auto *ac = std::getenv("COQUI_DYNBSE_TEST_SIGDYN_ACC")) vtx.set_sigma_dyn_acc(ac);   // P4-C14: split | single
       if (auto *wc = std::getenv("COQUI_DYNBSE_TEST_WCACHE")) vtx.set_wcache_mode(wc);   // P19: replicated | shared
       scr_eri.set_vertex(&vtx);
       auto [e_hf, e_corr] = scf_loop(mb_state, dyson, eri, ft,
@@ -221,6 +222,7 @@ namespace bdft_tests {
         auto proj = make_degenerate_projector(*mf, 0, 4, V); vtx.set_wannier_projector(proj, true);
         REQUIRE(vtx.wannier()); REQUIRE(vtx.subspace_rank() == 4); REQUIRE(vtx.isometry_defect() < 1e-10);
         if (auto *rm = std::getenv("COQUI_DYNBSE_TEST_RESOLVENT")) vtx.set_ladder_dyn_resolvent(rm);   // P7: inverse | lu
+        if (auto *ac = std::getenv("COQUI_DYNBSE_TEST_SIGDYN_ACC")) vtx.set_sigma_dyn_acc(ac);   // P4-C14: split | single
         if (auto *wc = std::getenv("COQUI_DYNBSE_TEST_WCACHE")) vtx.set_wcache_mode(wc);   // P19: replicated | shared
         scr_eri.set_vertex(&vtx);
         auto [e_hf, e_corr] = scf_loop(mb_state, dyson, eri, ft,
@@ -328,6 +330,7 @@ namespace bdft_tests {
         vtx.set_ladder_dyn_dense(not stream_cur);
         if (V) { auto proj = make_degenerate_projector(*mfw, 0, 4, V, trs_images); vtx.set_wannier_projector(proj, true); }
         if (auto *rm = std::getenv("COQUI_DYNBSE_TEST_RESOLVENT")) vtx.set_ladder_dyn_resolvent(rm);   // P7: inverse | lu
+        if (auto *ac = std::getenv("COQUI_DYNBSE_TEST_SIGDYN_ACC")) vtx.set_sigma_dyn_acc(ac);   // P4-C14: split | single
         if (auto *wc = std::getenv("COQUI_DYNBSE_TEST_WCACHE")) vtx.set_wcache_mode(wc);   // P19: replicated | shared
         scr_eri.set_vertex(&vtx);
         auto [e_hf, e_corr] = scf_loop(mb_state, dyson, eriw, ft,
@@ -439,6 +442,7 @@ namespace bdft_tests {
         vtx.set_ladder_dyn_gamma1_only(true); vtx.set_ladder_dyn_dump(dump);
         vtx.set_isdf_points(points, dump); vtx.set_pol_interp(interp, "static");
         if (auto *rm = std::getenv("COQUI_DYNBSE_TEST_RESOLVENT")) vtx.set_ladder_dyn_resolvent(rm);   // P7: inverse | lu
+        if (auto *ac = std::getenv("COQUI_DYNBSE_TEST_SIGDYN_ACC")) vtx.set_sigma_dyn_acc(ac);   // P4-C14: split | single
         if (auto *wc = std::getenv("COQUI_DYNBSE_TEST_WCACHE")) vtx.set_wcache_mode(wc);   // P19: replicated | shared
         scr_eri.set_vertex(&vtx);
         auto [e_hf, e_corr] = scf_loop(mb_state, dyson, eriw, ft, solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol, 2, false, 1e-9, true);
@@ -497,6 +501,7 @@ namespace bdft_tests {
           std::string side_cur = "right";   // the junction of the next kind-2 run (section N sets it)
           bool sd_dump = false; std::vector<long> sd_nodes; std::string sd_fit; long sd_rank = 0;   // L-8: the next kind-2 run's sampled-mode knobs
           bool sd_ckpt = false;   // P20: the next kind-2 run checkpoints its Sigma accumulators after every unit (and keeps the files)
+          std::string sd_acc = std::getenv("COQUI_DYNBSE_TEST_SIGDYN_ACC") ? std::getenv("COQUI_DYNBSE_TEST_SIGDYN_ACC") : "split";   // P4-C14: split | single
           auto run_p = [&](std::string const &tag, int kind, std::string const &col, std::string const &outer, double scale, S5 &Sig) {
             // kind: 0 = plain GW, 1 = B-S Sigma^{C,x} (static rung), 2 = the pair vertex, 3 = the DYNAMIC-rung B-S Sigma^C (G^3 W^2)
             const std::string out = "coqui_d3_winj_" + tag;
@@ -513,6 +518,7 @@ namespace bdft_tests {
               vtx.set_bl_drop(1);
               if (kind == 3) vtx.set_skip_pi_c(true);   // the G^3 W^2 cut alone on the RPA W: the reference for the one-bare-rung pair column (N2)
               if (auto *rm = std::getenv("COQUI_DYNBSE_TEST_RESOLVENT")) vtx.set_ladder_dyn_resolvent(rm);   // P7: inverse | lu
+              if (auto *ac = std::getenv("COQUI_DYNBSE_TEST_SIGDYN_ACC")) vtx.set_sigma_dyn_acc(ac);   // P4-C14: split | single
               if (auto *wc = std::getenv("COQUI_DYNBSE_TEST_WCACHE")) vtx.set_wcache_mode(wc);   // P19: replicated | shared
               scr_eri.set_vertex(&vtx); gw.set_vertex(&vtx);
               e_corr = std::get<1>(scf_loop(mb_state, dyson, erin, ft, solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol, 1, false, 1e-9, true));
@@ -525,6 +531,7 @@ namespace bdft_tests {
               vtx.set_sigma_dyn(sd_dump, sd_nodes, sd_fit, sd_rank);
               if (sd_ckpt) vtx.set_sigma_dyn_ckpt_minutes(1e-9);   // P20: a checkpoint after every unit
               if (auto *rf = std::getenv("COQUI_DYNBSE_TEST_SIGDYN_REFIT")) vtx.set_sigma_dyn_refit(rf);   // P12: fit | union
+              vtx.set_sigma_dyn_acc(sd_acc);   // P4-C14: split | single
               if (auto *rm = std::getenv("COQUI_DYNBSE_TEST_RESOLVENT")) vtx.set_ladder_dyn_resolvent(rm);   // P7: inverse | lu
               if (auto *wc = std::getenv("COQUI_DYNBSE_TEST_WCACHE")) vtx.set_wcache_mode(wc);   // P19: replicated | shared
               scr_eri.set_vertex(&vtx);
@@ -649,6 +656,47 @@ namespace bdft_tests {
             S5 S_one;
             auto [c1, m1, d1, k1] = run_p("D1B", 2, only, "dynamic", 1.0, S_one);
             app_log(1, "dynbse_readout LFF-Sigma N_ONLY {}: e_corr {:+.12f}, max|dSigma| {:.6e}, anti-Hermitian {:.3e}", only, c1, m1[0], m1[1]);
+            mpi_context->comm.barrier();
+            return;
+          }
+          if (std::getenv("COQUI_DYNBSE_TEST_SIGDYN_ACC1")) {
+            // ---- P4-C14 gate: the single tau-resolved accumulator vs the split (node-resolved) ones -------------------------------
+            // A1 / A2: col dyn1, outer dynamic on all nodes, split (writing the per-node dump) / single; then the SAMPLED mode (the
+            // 11-node recipe of the SAMPLED gate on A1's dump) split / single. The two paths apply the same fixed linear maps in
+            // another order: rounding x cond(refit) -- reported; REQUIRE < 1e-6 relative on the C block.
+            S5 S_a1, S_a2, S_a3, S_a4;
+            sd_acc = "split"; sd_dump = true;
+            auto [ca1, ma1, da1, ka1] = run_p("A1", 2, "dyn1", "dynamic", 1.0, S_a1);
+            sd_dump = false;
+            REQUIRE(std::filesystem::exists("coqui_d3_winj_A1.sigdyn.h5"));
+            sd_acc = "single";
+            auto [ca2, ma2, da2, ka2] = run_p("A2", 2, "dyn1", "dynamic", 1.0, S_a2);
+            auto rel4 = [&](S5 const &A, S5 const &B) {
+              double num = 0.0, den = 0.0, mx = 0.0;
+              for (long it = 0; it < A.shape(0); ++it)
+                for (long is = 0; is < A.shape(1); ++is)
+                  for (long ik = 0; ik < A.shape(2); ++ik)
+                    for (long i = 0; i < 4; ++i)
+                      for (long j = 0; j < 4; ++j) { num += std::norm(A(it, is, ik, i, j) - B(it, is, ik, i, j)); den += std::norm(A(it, is, ik, i, j)); mx = std::max(mx, std::abs(A(it, is, ik, i, j) - B(it, is, ik, i, j))); }
+              return std::make_pair(std::sqrt(num) / std::max(std::sqrt(den), 1e-300), mx);
+            };
+            auto [r12, m12] = rel4(S_a1, S_a2);
+            app_log(1, "dynbse_readout LFF-Sigma ACC gate (P4-C14), all nodes: single vs split accumulators: rel Frobenius {:.3e} (max |d| {:.3e}); "
+                       "e_corr {:+.12f} vs {:+.12f}; max|dSigma| {:.6e} vs {:.6e}", r12, m12, ca2, ca1, ma2[0], ma1[0]);
+            REQUIRE(r12 < 1e-6);
+            const long nwb = ft.wn_mesh_b().shape(0), hm = nwb / 2;
+            sd_nodes = {m0b}; for (long j : {4l, 8l, 12l, 16l, hm}) { sd_nodes.push_back(m0b + j); sd_nodes.push_back(m0b - j); }
+            sd_fit = "coqui_d3_winj_A1.sigdyn.h5"; sd_rank = 6;
+            sd_acc = "split";
+            auto [ca3, ma3, da3, ka3] = run_p("A3", 2, "dyn1", "dynamic", 1.0, S_a3);
+            sd_acc = "single";
+            auto [ca4, ma4, da4, ka4] = run_p("A4", 2, "dyn1", "dynamic", 1.0, S_a4);
+            sd_nodes.clear(); sd_fit.clear(); sd_rank = 0; sd_acc = "split";
+            auto [r34, m34] = rel4(S_a3, S_a4);
+            app_log(1, "dynbse_readout LFF-Sigma ACC gate (P4-C14), sampled (11 of {} nodes, K = 6): single vs split accumulators: rel Frobenius {:.3e} (max |d| {:.3e}); "
+                       "e_corr {:+.12f} vs {:+.12f}", nwb, r34, m34, ca4, ca3);
+            REQUIRE(r34 < 1e-6);
+            if (mpi_context->comm.root()) remove("coqui_d3_winj_A1.sigdyn.h5");
             mpi_context->comm.barrier();
             return;
           }
@@ -832,6 +880,7 @@ namespace bdft_tests {
         vtx.set_isdf_points(points, points.empty());       // A dumps its points, B freezes them
         vtx.set_pol_interp(interp, "ladder");
         if (auto *rm = std::getenv("COQUI_DYNBSE_TEST_RESOLVENT")) vtx.set_ladder_dyn_resolvent(rm);   // P7: inverse | lu
+        if (auto *ac = std::getenv("COQUI_DYNBSE_TEST_SIGDYN_ACC")) vtx.set_sigma_dyn_acc(ac);   // P4-C14: split | single
         if (auto *wc = std::getenv("COQUI_DYNBSE_TEST_WCACHE")) vtx.set_wcache_mode(wc);   // P19: replicated | shared
         scr_eri.set_vertex(&vtx);
         auto [e_hf, e_corr] = scf_loop(mb_state, dyson, erin, ft, solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol, niter, false, 1e-9, true);
@@ -877,6 +926,7 @@ namespace bdft_tests {
         vtx.set_ladder_dyn_resum_mu_file(mu_file);
         vtx.set_isdf_points(points, points.empty()); vtx.set_pol_interp(interp, col);
         if (auto *rm = std::getenv("COQUI_DYNBSE_TEST_RESOLVENT")) vtx.set_ladder_dyn_resolvent(rm);   // P7: inverse | lu
+        if (auto *ac = std::getenv("COQUI_DYNBSE_TEST_SIGDYN_ACC")) vtx.set_sigma_dyn_acc(ac);   // P4-C14: split | single
         if (auto *wc = std::getenv("COQUI_DYNBSE_TEST_WCACHE")) vtx.set_wcache_mode(wc);   // P19: replicated | shared
         scr_eri.set_vertex(&vtx);
         auto [e_hf, e_corr] = scf_loop(mb_state, dyson, erin, ft, solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol, 1, false, 1e-9, true);
@@ -1070,6 +1120,7 @@ namespace bdft_tests {
           vtx.set_isdf_points("coqui_d3_winj_G.secpts.h5", false); vtx.set_pol_interp("coqui_d3_winj_G.pol_wh_dyn.g1.h5", "gam1");
           vtx.set_sigma_lff(mode, bub, scale, 1e-3, 1.0, "", with_static);   // the strong-mode cutoff (1e-8 admits the bubble's null directions: |Gamma - 1| ~ 1e4)
           if (auto *rm = std::getenv("COQUI_DYNBSE_TEST_RESOLVENT")) vtx.set_ladder_dyn_resolvent(rm);   // P7: inverse | lu
+          if (auto *ac = std::getenv("COQUI_DYNBSE_TEST_SIGDYN_ACC")) vtx.set_sigma_dyn_acc(ac);   // P4-C14: split | single
           if (auto *wc = std::getenv("COQUI_DYNBSE_TEST_WCACHE")) vtx.set_wcache_mode(wc);   // P19: replicated | shared
           scr_eri.set_vertex(&vtx);
           auto [e_hf, e_corr] = scf_loop(mb_state, dyson, erin, ft, solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol, 1, false, 1e-9, true);
@@ -1181,6 +1232,7 @@ namespace bdft_tests {
           vtx.set_isdf_points(points, points.empty());
           vtx.set_bl_drop(1);
           if (auto *rm = std::getenv("COQUI_DYNBSE_TEST_RESOLVENT")) vtx.set_ladder_dyn_resolvent(rm);   // P7: inverse | lu
+          if (auto *ac = std::getenv("COQUI_DYNBSE_TEST_SIGDYN_ACC")) vtx.set_sigma_dyn_acc(ac);   // P4-C14: split | single
           if (auto *wc = std::getenv("COQUI_DYNBSE_TEST_WCACHE")) vtx.set_wcache_mode(wc);   // P19: replicated | shared
           scr_eri.set_vertex(&vtx); gw.set_vertex(&vtx);
           e_corr = std::get<1>(scf_loop(mb_state, dyson, eriw, ft, solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol, 1, false, 1e-9, true));
@@ -1195,6 +1247,7 @@ namespace bdft_tests {
           vtx.set_sigma_pair(true, col_cur, outer_cur, 1.0, true, false, "right");
           vtx.set_sigma_pair_ibz(ibz_cur);
           if (auto *rm = std::getenv("COQUI_DYNBSE_TEST_RESOLVENT")) vtx.set_ladder_dyn_resolvent(rm);   // P7: inverse | lu
+          if (auto *ac = std::getenv("COQUI_DYNBSE_TEST_SIGDYN_ACC")) vtx.set_sigma_dyn_acc(ac);   // P4-C14: split | single
           if (auto *wc = std::getenv("COQUI_DYNBSE_TEST_WCACHE")) vtx.set_wcache_mode(wc);   // P19: replicated | shared
           scr_eri.set_vertex(&vtx);
           e_corr = std::get<1>(scf_loop(mb_state, dyson, eriw, ft, solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol, 1, false, 1e-9, true));
@@ -1206,6 +1259,7 @@ namespace bdft_tests {
           vtx.set_ladder_dyn_gamma1_only(true); vtx.set_ladder_dyn_dump(true);
           vtx.set_isdf_points("", true); vtx.set_wannier_frame("aux");
           if (auto *rm = std::getenv("COQUI_DYNBSE_TEST_RESOLVENT")) vtx.set_ladder_dyn_resolvent(rm);   // P7: inverse | lu
+          if (auto *ac = std::getenv("COQUI_DYNBSE_TEST_SIGDYN_ACC")) vtx.set_sigma_dyn_acc(ac);   // P4-C14: split | single
           if (auto *wc = std::getenv("COQUI_DYNBSE_TEST_WCACHE")) vtx.set_wcache_mode(wc);   // P19: replicated | shared
           scr_eri.set_vertex(&vtx);
           e_corr = std::get<1>(scf_loop(mb_state, dyson, eriw, ft, solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol, 2, false, 1e-9, true));
@@ -1512,6 +1566,7 @@ namespace bdft_tests {
       if (char const *tf = std::getenv("COQUI_DYNBSE_TEST_TFOLD")) vtx.set_ladder_dyn_tfold(std::atof(tf));   // the small-nu fold ratio
       if (std::getenv("COQUI_DYNBSE_TEST_G1")) vtx.set_ladder_dyn_gamma1_only(true);   // Gamma_1 only (skip the resummation GMRES)
       if (auto *rm = std::getenv("COQUI_DYNBSE_TEST_RESOLVENT")) vtx.set_ladder_dyn_resolvent(rm);   // P7: inverse | lu
+      if (auto *ac = std::getenv("COQUI_DYNBSE_TEST_SIGDYN_ACC")) vtx.set_sigma_dyn_acc(ac);   // P4-C14: split | single
       if (auto *wc = std::getenv("COQUI_DYNBSE_TEST_WCACHE")) vtx.set_wcache_mode(wc);   // P19: replicated | shared
       scr_eri.set_vertex(&vtx);
       auto [e_hf, e_corr] = scf_loop(mb_state, dyson, eri, ft,

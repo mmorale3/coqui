@@ -1290,6 +1290,7 @@ namespace solvers {
     o.ibz = v.sigma_pair_ibz();
     o.dyn_ckpt_minutes = v.sigma_dyn_ckpt_minutes();   // P20
     o.dyn_refit = v.sigma_dyn_refit(); o.dyn_refit_rtol = v.sigma_dyn_refit_rtol();   // P12
+    o.dyn_acc = v.sigma_dyn_acc();   // P4-C14
     o.dyn_dump = v.sigma_dyn_dump(); o.dyn_nodes = v.sigma_dyn_nodes();
     o.dyn_fit_file = v.sigma_dyn_fit_file(); o.dyn_fit_rank = v.sigma_dyn_fit_rank();
     o.dump_prefix = mb_state.coqui_prefix;

@@ -941,6 +941,7 @@ namespace vertex_pi { struct iaft_tools; }
     double _sigma_dyn_ckpt_minutes = 0.0;        // pol_vertex_sigma_dyn_ckpt_minutes: the Sigma-accumulator checkpoint interval (P20; 0 = off)
     std::string _sigma_dyn_refit = "fit";        // pol_vertex_sigma_dyn_refit: fit | union (P12)
     double _sigma_dyn_refit_rtol = 1e-8;         // pol_vertex_sigma_dyn_refit_rtol (P12)
+    std::string _sigma_dyn_acc = "split";        // pol_vertex_sigma_dyn_acc: split | single (P4-C14)
     bool _sigma_share = false;                   // pol_vertex_sigma_share: one solve feeds the P readout and the Sigma deposits (P3)
     std::string _sigma_interp_dump;              // pol_vertex_sigma_interp_dump: a Wannier projector file -> the coarse run dumps dSigma in the Wannier frame (P16)
     std::string _sigma_interp_file;              // pol_vertex_sigma_interp_file: the coarse run's dump the fine run consumes instead of solving (P16)
@@ -1726,6 +1727,16 @@ namespace vertex_pi { struct iaft_tools; }
     }
     std::string const &sigma_dyn_refit() const { return _sigma_dyn_refit; }
     double sigma_dyn_refit_rtol() const { return _sigma_dyn_refit_rtol; }
+    /** pol_vertex_sigma_dyn_acc (default "split"; P4-C14): the dynamic Sigma hook's accumulators -- "split" keeps the
+     *  node-resolved RT / RU next to S_cst (the finish applies K_F and the E-refit), "single" folds the finish's fixed linear
+     *  maps into the deposit weights and keeps ONE tau-resolved object: memory and all-reduce volume / (2 n_p + 1), one star
+     *  fold per unit under the IBZ solve. Not bitwise against split (the same linear map in another order); the E-refit
+     *  error is then not reported. */
+    void set_sigma_dyn_acc(std::string const &m) {
+      utils::check(m == "split" or m == "single", "vertex_t::set_sigma_dyn_acc: pol_vertex_sigma_dyn_acc must be split | single (got \"{}\").", m);
+      _sigma_dyn_acc = m;
+    }
+    std::string const &sigma_dyn_acc() const { return _sigma_dyn_acc; }
     long sigma_dyn_fit_rank() const { return _sigma_dyn_fit_rank; }
     bool sigma_pair_enabled() const { return _sigma_pair; }
     std::string const &sigma_pair_col() const { return _sigma_pair_col; }
@@ -1753,6 +1764,7 @@ namespace vertex_pi { struct iaft_tools; }
       double dyn_ckpt_minutes = 0.0;    // P20: the Sigma-accumulator checkpoint interval of the dynamic solve (0 = off)
       std::string dyn_refit = "fit";    // P12: the E-refit target of the T family: fit (the DLR nodes) | union (all union nodes)
       double dyn_refit_rtol = 1e-8;     // P12: the union fit's rank cutoff
+      std::string dyn_acc = "split";    // P4-C14: the Sigma accumulators: split (S_cst, RT, RU per node) | single (one tau-resolved object)
     };
     struct sigma_pair_meter {
       double dsig_max = 0.0, dsig_herm = 0.0, ks_herm = 0.0;
