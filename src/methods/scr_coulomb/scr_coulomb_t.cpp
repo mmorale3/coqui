@@ -490,6 +490,7 @@ namespace solvers {
     _pol_vtx->set_ladder_dyn_resolvent(_vertex->ladder_dyn_resolvent());
     _pol_vtx->set_ladder_dyn_union_stride(_vertex->ladder_dyn_union_stride());
     _pol_vtx->set_ladder_dyn_table_mode(_vertex->ladder_dyn_table_mode());
+    _pol_vtx->set_ladder_dyn_schedule(_vertex->ladder_dyn_schedule());
     _pol_vtx->set_ladder_dyn_iaft_prec(_vertex->ladder_dyn_iaft_prec());
     _pol_vtx->set_ladder_dyn_tfold(_vertex->ladder_dyn_tfold());
     _pol_vtx->set_ladder_dyn_vmask(_vertex->ladder_dyn_vmask_lo(), _vertex->ladder_dyn_vmask_hi());

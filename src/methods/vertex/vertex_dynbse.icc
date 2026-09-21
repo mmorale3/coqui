@@ -83,6 +83,10 @@ namespace solvers {
       MPI_Comm sched_comm = MPI_COMM_NULL;           // when set: DYNAMIC scheduling of the (s, q, nu) units through
                                                      // a shared task counter (one-sided MPI on rank 0), longest
                                                      // units first; MPI_COMM_NULL = static round-robin
+      std::string schedule = "longest";   // P5 (vertex_perf_plan.md): the unit order handed out by the scheduler -- "longest": the
+                                          // heuristic (nu != 0 units, highest node first, then nu = 0); "measured": by the wall
+                                          // time of the same (s, q, nu) unit in a previous call (unit_cost), unseen units first
+      std::map<std::tuple<long, long, long>, double> const *unit_cost = nullptr;   // (is, iq, m) -> seconds (dyn_meter::merge_unit_cost)
       nda::array<double, 2> const *kcrys = nullptr;  // (nk, 3) crystal coordinates of the k mesh: when given
                                                      // (and ksum_ft), the rung's k-sum runs through kmesh_ft
       bool ksum_ft = true;
@@ -193,8 +197,16 @@ namespace solvers {
       long n_apps = 0;                      // K_d applications (all units, all blocks)
       double rss_max_gb = 0.0;
       bool ksum_ft = false;         // the rung's k-sum ran through the mesh Fourier transform
-      nda::array<double, 2> unit_diag;   // per unit (nunits_all x 12): is iq m apps conv stag rconv |Ritz| refit shift-fit
-                                         // shift-cond last-readout-step; zeros for units restored from the dump
+      nda::array<double, 2> unit_diag;   // per unit (nunits_all x 13): is iq m apps conv stag rconv |Ritz| refit shift-fit
+                                         // shift-cond last-readout-step wall-seconds; zeros for units restored from the dump
+      /** P5: fold the (reduced) per-unit wall times into the (is, iq, m) -> seconds table of dyn_opts::unit_cost */
+      void merge_unit_cost(std::map<std::tuple<long, long, long>, double> &cost) const {
+        if (unit_diag.size() == 0 or unit_diag.shape(1) < 13) return;
+        for (long u = 0; u < unit_diag.shape(0); ++u) {
+          if (unit_diag(u, 3) <= 0.0) continue;   // restored from the dump: not measured
+          cost[std::make_tuple(long(unit_diag(u, 0)), long(unit_diag(u, 1)), long(unit_diag(u, 2)))] = unit_diag(u, 12);
+        }
+      }
       void reduce(boost::mpi3::communicator &comm) {
         if (unit_diag.size() > 0) comm.all_reduce_in_place_n(unit_diag.data(), unit_diag.size(), std::plus<>{});
         auto mx = [&](double &v) { v = comm.all_reduce_value(v, boost::mpi3::max<>{}); };
@@ -865,12 +877,36 @@ namespace solvers {
       const long nunits_all = ns * nql * nnu;
       std::vector<long> order(static_cast<size_t>(nunits_all), 0l);
       for (long u = 0; u < nunits_all; ++u) order[size_t(u)] = u;
-      std::stable_sort(order.begin(), order.end(), [&](long a, long b) {
+      auto heuristic_before = [&](long a, long b) {
         const long ja = a % nnu, jb = b % nnu;
         const bool za = (nu_list[size_t(ja)] == tools.m0), zb = (nu_list[size_t(jb)] == tools.m0);
         if (za != zb) return zb;                          // nu != 0 before nu = 0
         return nu_list[size_t(ja)] > nu_list[size_t(jb)]; // then the higher node first
+      };
+      // P5: with schedule = "measured" the units solved in a previous call (same (s, q, nu)) go longest-first by their
+      // measured wall time; the unseen ones (unknown length) first of all; ties and the rest by the heuristic
+      const bool measured = (opt.schedule == "measured" and opt.unit_cost != nullptr and not opt.unit_cost->empty());
+      std::vector<double> ucost;
+      long n_measured = 0;
+      if (measured) {
+        ucost.assign(static_cast<size_t>(nunits_all), -1.0);
+        for (long u = 0; u < nunits_all; ++u) {
+          const long sq_u = u / nnu, jn_u = u % nnu;
+          const auto it = opt.unit_cost->find(std::make_tuple(sq_u / nql, qlist[size_t(sq_u % nql)], nu_list[size_t(jn_u)]));
+          if (it != opt.unit_cost->end()) { ucost[size_t(u)] = it->second; ++n_measured; }
+        }
+      }
+      std::stable_sort(order.begin(), order.end(), [&](long a, long b) {
+        if (measured) {
+          const double ca = ucost[size_t(a)], cb = ucost[size_t(b)];
+          const bool ka = (ca >= 0.0), kb = (cb >= 0.0);
+          if (ka != kb) return kb;                        // unseen units first
+          if (ka and ca != cb) return ca > cb;            // longest measured first
+        }
+        return heuristic_before(a, b);
       });
+      if (measured and rank == 0)
+        app_log(2, "  [dynbse] unit order: measured wall times for {} of {} units (the heuristic for the rest)", n_measured, nunits_all);
       const bool dyn_sched = (opt.sched_comm != MPI_COMM_NULL);
       MPI_Win win = MPI_WIN_NULL;
       long *counter = nullptr;
@@ -924,9 +960,10 @@ namespace solvers {
       long pos = rank;
       long units_taken = 0;
       db::tfold_ratio_ref() = opt.tfold;
-      if (met) { met->unit_diag = nda::array<double, 2>(nunits_all, 12); met->unit_diag() = 0.0; }
+      if (met) { met->unit_diag = nda::array<double, 2>(nunits_all, 13); met->unit_diag() = 0.0; }
       for (long u = next_unit(pos); u >= 0; u = next_unit(pos)) {
         ++units_taken;
+        const double t_unit0 = db::wall_now();
         const long sq = u / nnu, jn_unit = u % nnu;
         const long is = sq / nql, iq = qlist[size_t(sq % nql)];
         if (opt.Pi_bub != nullptr) {
@@ -1265,6 +1302,7 @@ namespace solvers {
             row(7) = res.contraction; row(8) = res.fit_err_max;
             row(9) = (stp != nullptr) ? stp->fit_err : 0.0; row(10) = (stp != nullptr) ? stp->cond_kept : 0.0;
             row(11) = res.readout_history.empty() ? -1.0 : res.readout_history.back();
+            row(12) = db::wall_now() - t_unit0;             // P5: the unit's wall time (schedule = "measured")
           }
           if (rank == 0 and units_taken == 1) {
             std::string hist;
@@ -1777,6 +1815,7 @@ namespace solvers {
     o.gamma1_only = _dyn_gamma1_only;
     if (_dyn_gamma1_only) app_log(1, "  [scGW-tilde T2] pol_vertex_dyn_gamma1_only: GMRES resummation SKIPPED; the resummed column repeats Gamma_1.");
     o.sched_comm = mpi->comm.get();      // dynamic longest-first scheduling of the (s, q, nu) units
+    o.schedule = _dyn_schedule; o.unit_cost = std::addressof(_dyn_unit_cost);   // P5
     o.readout_tol = 1e-6;                // the physical readout's own stop (the 1e-8 residual is below the refit floor)
     if (_wannier) {
       o.wannier_pairs = pair_frame;
@@ -1800,6 +1839,7 @@ namespace solvers {
     }
     for (auto *A : {&Ps, &P1, &Pg, &Pd}) mpi->comm.all_reduce_in_place_n(A->data(), A->size(), std::plus<>{});
     met.reduce(mpi->comm);
+    met.merge_unit_cost(_dyn_unit_cost);   // P5: the measured unit times for the next call's order
     const double hs = vertex_ladder_detail::hermitize_mn(Ps), h1 = vertex_ladder_detail::hermitize_mn(P1);
     const double hg = vertex_ladder_detail::hermitize_mn(Pg), hd = vertex_ladder_detail::hermitize_mn(Pd);
     r.Pi_static = nda::array<ComplexType, 3>(nq, nout, nout); r.Pi_static = Ps(0, all, all, all);
@@ -1915,6 +1955,7 @@ namespace solvers {
     o.gamma1_only = _dyn_gamma1_only;
     if (_dyn_gamma1_only) app_log(1, "  [scGW-tilde T2] pol_vertex_dyn_gamma1_only: GMRES resummation SKIPPED; the resummed column repeats Gamma_1.");
     o.sched_comm = mpi->comm.get();      // dynamic longest-first scheduling of the (s, q, nu) units
+    o.schedule = _dyn_schedule; o.unit_cost = std::addressof(_dyn_unit_cost);   // P5
     if (_dyn_dump) o.dump_prefix = mb_state.coqui_prefix + ".dynunits.cut.g" + std::to_string(gen);
     o.union_nodes = true;
     // NO in-gap mask: the symmetric |eps| < 0.45 gap mask is centered at mu, not on the gap, and on
@@ -1946,6 +1987,7 @@ namespace solvers {
     for (auto *A : {&Ps, &P1, &Pg, &Pd, &Pb}) mpi->comm.all_reduce_in_place_n(A->data(), A->size(), std::plus<>{});
     r.Pi_bub = std::move(Pb);
     met.reduce(mpi->comm);
+    met.merge_unit_cost(_dyn_unit_cost);   // P5: the measured unit times for the next call's order
     r.Pi = nda::array<ComplexType, 5>(4, nn, nq, Nm, Nm);
     r.Pi(0, all, all, all, all) = Ps;
     r.Pi(1, all, all, all, all) = Ps;
@@ -2143,6 +2185,7 @@ namespace solvers {
     o.one_rung_only = (opt.col == "dyn1_bare");
     o.gamma1_only = (opt.col == "dyn1");
     o.sched_comm = mpi->comm.get();
+    o.schedule = _dyn_schedule; o.unit_cost = std::addressof(_dyn_unit_cost);   // P5
     o.union_nodes = true;
     o.gap_mask = 0.0;
     if (char const *e = std::getenv("COQUI_DYNBSE_UNION")) o.union_nodes = (std::atoi(e) != 0);
@@ -2184,6 +2227,7 @@ namespace solvers {
       hook.Hc_n = nda::array<ComplexType, 6>(); hook.HT_n = nda::array<ComplexType, 6>();
     }
     dmet.reduce(mpi->comm);
+    dmet.merge_unit_cost(_dyn_unit_cost);   // P5
     hook.ks_herm = mpi->comm.all_reduce_value(hook.ks_herm, boost::mpi3::max<>{});
     hook.amax = mpi->comm.all_reduce_value(hook.amax, boost::mpi3::max<>{});
     hook.ymax = mpi->comm.all_reduce_value(hook.ymax, boost::mpi3::max<>{});

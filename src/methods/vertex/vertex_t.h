@@ -31,6 +31,8 @@
 // must also compile against pre-S2 checkouts.
 #define VERTEX_W0_API 1
 
+#include <map>
+#include <tuple>
 #include "configuration.hpp"
 #include "nda/nda.hpp"
 #include "numerics/distributed_array/nda.hpp"
@@ -935,6 +937,8 @@ namespace solvers {
     std::string _dyn_resolvent = "inverse";   // pol_vertex_dyn_resolvent: inverse (T_s dense) | lu (P7: factor once, solve per application)
     long _dyn_union_stride = 1;  // pol_vertex_dyn_union_stride: keep every n-th shifted G node of the union grid
     int _dyn_table_mode = 0;     // pol_vertex_dyn_table_mode: 0 fitted twisted-pair tables, 1 exact partial fractions
+    std::string _dyn_schedule = "longest";                       // pol_vertex_dyn_schedule: longest (heuristic) | measured (P5)
+    std::map<std::tuple<long, long, long>, double> _dyn_unit_cost;   // (is, iq, m) -> wall seconds of the dynamic units solved so far
     double _dyn_tfold = 0.0;     // pol_vertex_dyn_tfold: the small-nu fold ratio (0 = off)
     double _dyn_vmask_lo = 0.0, _dyn_vmask_hi = 0.0;   // pol_vertex_dyn_vmask_lo/_hi (Ha, about mu): in-gap vertex nodes dropped
     bool _dyn_gamma1_only = false;   // pol_vertex_dyn_gamma1_only: stop at Gamma_1 (skip the resummation GMRES)
@@ -1831,6 +1835,14 @@ namespace solvers {
       _dyn_table_mode = m;
     }
     int ladder_dyn_table_mode() const { return _dyn_table_mode; }
+    /** pol_vertex_dyn_schedule (default "longest"): the order in which the dynamic scheduler hands out the (s, q, nu) units --
+     *  "longest" = the heuristic (nu != 0 units, highest node first, then nu = 0); "measured" (P5) = longest-first by the wall
+     *  time of the same unit in a previous call of this object (an SCF iteration reuses the previous one's), unseen first. */
+    void set_ladder_dyn_schedule(std::string const &m) {
+      utils::check(m == "longest" or m == "measured", "vertex_t::set_ladder_dyn_schedule: pol_vertex_dyn_schedule must be longest | measured (got \"{}\").", m);
+      _dyn_schedule = m;
+    }
+    std::string const &ladder_dyn_schedule() const { return _dyn_schedule; }
     /** pol_vertex_dyn_iaft_prec (default "" = the loop's imaginary-axis grid): the dynamic pair algebra runs on its own
      *  DLR of this precision ("low" 1e-6, "medium" 1e-10, "high" 1e-13) with G and W interpolated from the loop's grid;
      *  the small-nu twisted algebra needs a finer class than the loop's "low" (dynbse_small_nu_1000). */
