@@ -496,6 +496,7 @@ namespace bdft_tests {
           REQUIRE(m0b >= 0);
           std::string side_cur = "right";   // the junction of the next kind-2 run (section N sets it)
           bool sd_dump = false; std::vector<long> sd_nodes; std::string sd_fit; long sd_rank = 0;   // L-8: the next kind-2 run's sampled-mode knobs
+          bool sd_ckpt = false;   // P20: the next kind-2 run checkpoints its Sigma accumulators after every unit (and keeps the files)
           auto run_p = [&](std::string const &tag, int kind, std::string const &col, std::string const &outer, double scale, S5 &Sig) {
             // kind: 0 = plain GW, 1 = B-S Sigma^{C,x} (static rung), 2 = the pair vertex, 3 = the DYNAMIC-rung B-S Sigma^C (G^3 W^2)
             const std::string out = "coqui_d3_winj_" + tag;
@@ -522,6 +523,7 @@ namespace bdft_tests {
               vtx.set_isdf_points("coqui_d3_winj_G.secpts.h5", false);
               vtx.set_sigma_pair(true, col, outer, scale, true, true, side_cur);
               vtx.set_sigma_dyn(sd_dump, sd_nodes, sd_fit, sd_rank);
+              if (sd_ckpt) vtx.set_sigma_dyn_ckpt_minutes(1e-9);   // P20: a checkpoint after every unit
               if (auto *rm = std::getenv("COQUI_DYNBSE_TEST_RESOLVENT")) vtx.set_ladder_dyn_resolvent(rm);   // P7: inverse | lu
               if (auto *wc = std::getenv("COQUI_DYNBSE_TEST_WCACHE")) vtx.set_wcache_mode(wc);   // P19: replicated | shared
               scr_eri.set_vertex(&vtx);
@@ -553,11 +555,42 @@ namespace bdft_tests {
               for (auto const &e : std::filesystem::directory_iterator("."))
                 if (e.path().filename().string().rfind(out + ".", 0) == 0 and e.path().extension() != ".h5" ) std::filesystem::remove(e.path());
               for (auto const &e : std::filesystem::directory_iterator("."))
-                if (e.path().filename().string().rfind(out + ".", 0) == 0 and e.path().filename().string().find(".sigdyn.h5") == std::string::npos) std::filesystem::remove(e.path());
+                if (e.path().filename().string().rfind(out + ".", 0) == 0 and e.path().filename().string().find(".sigdyn.h5") == std::string::npos
+                    and not (sd_ckpt and e.path().filename().string().find(".sigdyn_ckpt.") != std::string::npos)) std::filesystem::remove(e.path());
             }
             mpi_context->comm.barrier();
             return std::make_tuple(e_corr, m, d, pichk);
           };
+          if (std::getenv("COQUI_DYNBSE_TEST_SIGDYN_CKPT")) {
+            // ---- P20 gate: the Sigma-accumulator checkpoint / restart of the dynamic Sigma solve ---------------------------------
+            // CK1 (a) solves every unit and checkpoints after each; (b) the same prefix again: every unit is loaded, none solved;
+            // (c) rank 1's checkpoint removed: rank 1's units are re-solved, rank 0's loaded. All three dSigma must agree.
+            S5 S_a, S_b, S_c;
+            sd_ckpt = true;
+            auto [ca_, ma_, da_, ka_] = run_p("CK1", 2, "dyn1_bare", "dynamic", 1.0, S_a);
+            REQUIRE(std::filesystem::exists("coqui_d3_winj_CK1.sigdyn_ckpt.r0.h5"));
+            auto [cb_, mb_, db_, kb_] = run_p("CK1", 2, "dyn1_bare", "dynamic", 1.0, S_b);
+            mpi_context->comm.barrier();
+            if (mpi_context->comm.root()) remove("coqui_d3_winj_CK1.sigdyn_ckpt.r1.h5");
+            mpi_context->comm.barrier();
+            auto [cc_, mc_, dc_, kc_] = run_p("CK1", 2, "dyn1_bare", "dynamic", 1.0, S_c);
+            sd_ckpt = false;
+            double dab = 0.0, dac = 0.0, na = 0.0;
+            for (long i = 0; i < S_a.size(); ++i) {
+              dab = std::max(dab, std::abs(S_a.data()[i] - S_b.data()[i])); dac = std::max(dac, std::abs(S_a.data()[i] - S_c.data()[i]));
+              na = std::max(na, std::abs(S_a.data()[i]));
+            }
+            app_log(1, "dynbse_readout LFF-Sigma CKPT gate (P20): solve + checkpoint vs full restart |dSigma| {:.2e}, vs the partial restart (rank 1 re-solved) {:.2e} "
+                       "(max |Sigma| {:.3e}); e_corr {:+.12f} {:+.12f} {:+.12f}", dab, dac, na, ca_, cb_, cc_);
+            REQUIRE(dab == 0.0);
+            REQUIRE(dac < 1e-12 * na);
+            mpi_context->comm.barrier();
+            if (mpi_context->comm.root())
+              for (auto const &e : std::filesystem::directory_iterator("."))
+                if (e.path().filename().string().rfind("coqui_d3_winj_CK1.", 0) == 0) std::filesystem::remove(e.path());
+            mpi_context->comm.barrier();
+            return;
+          }
           if (auto const *only = std::getenv("COQUI_DYNBSE_TEST_N_ONLY"); only != nullptr) {
             // diagnostics: run ONE dynamic-path column (dyn1_bare | dyn1 | static_dyn) and stop -- for the route / family
             // cross-checks of vertex_sigma_dyn.icc (COQUI_SIGDYN_ROUTE, COQUI_SIGDYN_FAMILIES); the driver logs |dSigma|_F

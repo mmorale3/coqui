@@ -2737,6 +2737,7 @@ namespace solvers {
     o.sign_ks = _vertex->ladder_dyn_sign();
     o.side = _vertex->sigma_pair_side();
     o.ibz = _vertex->sigma_pair_ibz();
+    o.dyn_ckpt_minutes = _vertex->sigma_dyn_ckpt_minutes();   // P20
     o.dyn_dump = _vertex->sigma_dyn_dump(); o.dyn_nodes = _vertex->sigma_dyn_nodes();
     o.dyn_fit_file = _vertex->sigma_dyn_fit_file(); o.dyn_fit_rank = _vertex->sigma_dyn_fit_rank();
     o.dump_prefix = mb_state.coqui_prefix;

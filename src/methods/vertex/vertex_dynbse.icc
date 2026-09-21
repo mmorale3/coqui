@@ -33,6 +33,9 @@
  * the gemm path stays as its machine-precision cross-check).
  */
 
+#include <array>
+#include <tuple>
+#include <set>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -120,6 +123,12 @@ namespace solvers {
       // LFF-Sigma L-7 (vertex_sigma_dyn.icc): when non-null, every unit also contracts its amputated vertex
       // A = K_s Gsum + y into the self-energy accumulators of the hook (the solvers then keep their y iterates)
       sigma_dyn_hook *sigma = nullptr;
+      std::string sigma_ckpt;            // P20 (vertex_perf_plan.md): prefix of the Sigma-accumulator checkpoint files
+                                         // "<sigma_ckpt>.r<rank>.h5" (empty = off): every rank writes its partial S_cst / RT / RU
+                                         // and the list of units it has deposited every sigma_ckpt_minutes and at the end; at
+                                         // entry the files of a previous run are loaded (rank r takes files r, r + P, ...) and
+                                         // their units are skipped -- a walltime kill loses at most one interval
+      double sigma_ckpt_minutes = 30.0;
       double gap_mask = 0.0;      // union scheme: DROP the G nodes with |eps| < gap_mask (Ha, relative to
                                   // mu = 0 of the pole variable). A gapped G has no spectral weight there;
                                   // the DLR fit's O(1) in-gap residues (T15 lesson) otherwise feed a loop
@@ -877,6 +886,69 @@ namespace solvers {
           app_log(1, "  [LFF-Sigma dyn] Sigma hook armed: col {}, outer W {}; accumulators (nt {}, nk {}, np {}, nc {}) x 3, {:.2f} GB per rank",
                   opt.sigma->col, opt.sigma->outer, nt, nk, np, nc, double(nt * ns * nk * nc2) * (2.0 * double(np) + 1.0) * 16.0 / 1e9);
       }
+      // ---- P20: the Sigma-accumulator checkpoint -----------------------------------------------
+      std::set<std::tuple<long, long, long>> sig_done;         // units whose deposits are already in the accumulators (all ranks)
+      std::vector<std::array<long, 3>> sig_mine;                 // the units whose deposits sit in THIS rank's accumulators
+      std::vector<std::string> sig_consumed;                     // checkpoint files beyond this run's rank count, merged into this rank's
+      double t_ckpt_last = db::wall_now();
+      const bool sig_ckpt = (opt.sigma != nullptr and not opt.sigma_ckpt.empty());
+      if (sig_ckpt) {
+        namespace fs = std::filesystem;
+        long nfiles = 0, nloaded = 0;
+        for (long r = rank;; r += nproc) {
+          const std::string fn = opt.sigma_ckpt + ".r" + std::to_string(r) + ".h5";
+          if (not fs::exists(fn)) break;
+          h5::file f(fn, 'r');
+          h5::group g(f);
+          nda::array<ComplexType, 5> Sc; nda::array<ComplexType, 6> Rt, Ru; nda::array<long, 2> done;
+          nda::h5_read(g, "S_cst", Sc); nda::h5_read(g, "RT", Rt); nda::h5_read(g, "RU", Ru); nda::h5_read(g, "done", done);
+          utils::check(Sc.shape() == opt.sigma->S_cst.shape() and Rt.shape() == opt.sigma->RT.shape() and Ru.shape() == opt.sigma->RU.shape(),
+                       "pair_space_ladder_dyn: the Sigma checkpoint {} has other accumulator shapes than this run.", fn);
+          opt.sigma->S_cst += Sc; opt.sigma->RT += Rt; opt.sigma->RU += Ru;
+          for (long i = 0; i < done.shape(0); ++i) {
+            sig_done.emplace(done(i, 0), done(i, 1), done(i, 2));
+            sig_mine.push_back({done(i, 0), done(i, 1), done(i, 2)});
+          }
+          if (r != rank) sig_consumed.push_back(fn);            // merged into this rank's file at the next write, then removed
+          nloaded += done.shape(0); ++nfiles;
+        }
+        long tot_files = nfiles, tot_units = nloaded;
+        // the union of every rank's done set is what every rank must skip
+        std::vector<long> mine;
+        for (auto const &t : sig_done) { mine.push_back(std::get<0>(t)); mine.push_back(std::get<1>(t)); mine.push_back(std::get<2>(t)); }
+        if (opt.sched_comm != MPI_COMM_NULL) {
+          int cnt = int(mine.size());
+          std::vector<int> cnts(static_cast<size_t>(nproc)), disp(static_cast<size_t>(nproc));
+          MPI_Allgather(&cnt, 1, MPI_INT, cnts.data(), 1, MPI_INT, opt.sched_comm);
+          long tot = 0;
+          for (long r = 0; r < nproc; ++r) { disp[size_t(r)] = int(tot); tot += cnts[size_t(r)]; }
+          std::vector<long> all(static_cast<size_t>(tot));
+          MPI_Allgatherv(mine.data(), cnt, MPI_LONG, all.data(), cnts.data(), disp.data(), MPI_LONG, opt.sched_comm);
+          for (long i = 0; i + 2 < tot; i += 3) sig_done.emplace(all[size_t(i)], all[size_t(i + 1)], all[size_t(i + 2)]);
+          MPI_Allreduce(MPI_IN_PLACE, &tot_files, 1, MPI_LONG, MPI_SUM, opt.sched_comm);
+          MPI_Allreduce(MPI_IN_PLACE, &tot_units, 1, MPI_LONG, MPI_SUM, opt.sched_comm);
+        }
+        if (rank == 0)
+          app_log(1, "  [LFF-Sigma dyn] Sigma checkpoint \"{}.r*.h5\": {} files, {} finished units loaded (skipped); interval {:.1f} min",
+                  opt.sigma_ckpt, tot_files, tot_units, opt.sigma_ckpt_minutes);
+      }
+      auto write_sig_ckpt = [&]() {
+        if (not sig_ckpt) return;
+        opt.sigma->flush_unit();
+        const std::string fn = opt.sigma_ckpt + ".r" + std::to_string(rank) + ".h5";
+        nda::array<long, 2> done(long(sig_mine.size()), 3);
+        for (long i = 0; i < done.shape(0); ++i) for (int c = 0; c < 3; ++c) done(i, c) = sig_mine[size_t(i)][size_t(c)];
+        {
+          h5::file f(fn + ".tmp", 'w');
+          h5::group g(f);
+          nda::h5_write(g, "S_cst", opt.sigma->S_cst); nda::h5_write(g, "RT", opt.sigma->RT); nda::h5_write(g, "RU", opt.sigma->RU);
+          nda::h5_write(g, "done", done);
+        }
+        std::filesystem::rename(fn + ".tmp", fn);                 // atomic replacement: a kill during the write keeps the previous file
+        for (auto const &c : sig_consumed) std::filesystem::remove(c);
+        sig_consumed.clear();
+        t_ckpt_last = db::wall_now();
+      };
       const auto metric = db::build_tf_metric(b);       // the tau-value inner product of the solves
       const long nb = std::min(Nm, 16l);
       const long nrb = (opt.rhs_block > 0) ? std::min(opt.rhs_block, nout) : nout;   // RHS column block width
@@ -1057,6 +1129,10 @@ namespace solvers {
             if (met) { ++met->nunits; ++met->nconv; }
             continue;
           }
+        }
+        if (sig_ckpt and sig_done.count(std::make_tuple(is, iq, nu_list[size_t(jn_unit)]))) {
+          if (met) { ++met->nunits; ++met->nconv; }
+          continue;                                             // P20: the deposits of this unit are in a loaded checkpoint
         }
         if (not dumped.empty()) {
           auto it_d = dumped.find(std::make_tuple(is, iq, nu_list[size_t(jn_unit)]));
@@ -1367,6 +1443,10 @@ namespace solvers {
             row(11) = res.readout_history.empty() ? -1.0 : res.readout_history.back();
             row(12) = db::wall_now() - t_unit0;             // P5: the unit's wall time (schedule = "measured")
           }
+          if (sig_ckpt) {
+            sig_mine.push_back({is, iq, nu_list[size_t(jn_unit)]});
+            if (db::wall_now() - t_ckpt_last > 60.0 * opt.sigma_ckpt_minutes) write_sig_ckpt();
+          }
           if (rank == 0 and units_taken == 1) {
             std::string hist;
             for (double h : res.history) {
@@ -1400,6 +1480,7 @@ namespace solvers {
           }
         }
       }
+      write_sig_ckpt();                                         // P20: the finished run's accumulators (a restart loads them)
       if (dyn_sched) {
         MPI_Win_fence(0, win);
         MPI_Win_free(&win);
@@ -2264,6 +2345,7 @@ namespace solvers {
     o.readout_tol = 1e-6;
     o.q_subset = std::addressof(qs);
     o.sigma = std::addressof(hook);
+    if (opt.dyn_ckpt_minutes > 0.0) { o.sigma_ckpt = mb_state.coqui_prefix + ".sigdyn_ckpt"; o.sigma_ckpt_minutes = opt.dyn_ckpt_minutes; }   // P20
     vd::dyn_meter dmet;
     vd::pair_space_ladder_dyn(G_CC, _Xb_skma, _W0b_qmm.value(), wb_cache(), kmq, kpq, tools, nus,
                               nullptr, nullptr, nullptr, nullptr, mpi->comm.rank(), mpi->comm.size(), o, &dmet, symc);

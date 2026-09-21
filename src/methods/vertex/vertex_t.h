@@ -930,6 +930,7 @@ namespace solvers {
     bool _sigma_dyn_dump = false;                // pol_vertex_sigma_dyn_dump: the all-node run writes its per-node objects (L-8 reference)
     std::vector<long> _sigma_dyn_nodes;          // pol_vertex_sigma_dyn_nodes: the sampled FULL-mesh nodes (empty = all)
     bool _sigma_pair_ibz = false;                // pol_vertex_sigma_pair_ibz: the IBZ solve + star fold of the Sigma-side vertex (P1)
+    double _sigma_dyn_ckpt_minutes = 0.0;        // pol_vertex_sigma_dyn_ckpt_minutes: the Sigma-accumulator checkpoint interval (P20; 0 = off)
     std::string _sigma_dyn_fit_file;             // pol_vertex_sigma_dyn_fit_file: the reference dump for the sampled mode
     long _sigma_dyn_fit_rank = 0;                // pol_vertex_sigma_dyn_fit_rank: K (0 = the number of sampled nodes)
     double _sigma_lff_pinv_tol = 1e-3;      // pol_vertex_sigma_pinv_tol: relative eigenvalue cutoff of Pi_0^-1 -- the vertex lives on the
@@ -1681,6 +1682,11 @@ namespace solvers {
     std::string const &sigma_dyn_fit_file() const { return _sigma_dyn_fit_file; }
     void set_sigma_pair_ibz(bool on) { _sigma_pair_ibz = on; }
     bool sigma_pair_ibz() const { return _sigma_pair_ibz; }
+    /** pol_vertex_sigma_dyn_ckpt_minutes (default 0 = off; P20): every rank writes its partial Sigma accumulators and the
+     *  units it deposited to <prefix>.sigdyn_ckpt.r<rank>.h5 at this interval and at the end of the dynamic Sigma solve; a
+     *  later run with the same prefix loads them and skips those units (a walltime kill loses one interval at most). */
+    void set_sigma_dyn_ckpt_minutes(double m) { _sigma_dyn_ckpt_minutes = m; }
+    double sigma_dyn_ckpt_minutes() const { return _sigma_dyn_ckpt_minutes; }
     long sigma_dyn_fit_rank() const { return _sigma_dyn_fit_rank; }
     bool sigma_pair_enabled() const { return _sigma_pair; }
     std::string const &sigma_pair_col() const { return _sigma_pair_col; }
@@ -1705,6 +1711,7 @@ namespace solvers {
       long dyn_fit_rank = 0;            // K modes per object type (0 = |dyn_nodes|: interpolation)
       std::string dump_prefix;          // the run prefix for the dump
       bool ibz = false;                 // P1: solve the Sigma-side ladder on the IBZ transfers only and fold the star (sym meshes)
+      double dyn_ckpt_minutes = 0.0;    // P20: the Sigma-accumulator checkpoint interval of the dynamic solve (0 = off)
     };
     struct sigma_pair_meter {
       double dsig_max = 0.0, dsig_herm = 0.0, ks_herm = 0.0;
