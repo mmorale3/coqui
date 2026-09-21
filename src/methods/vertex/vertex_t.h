@@ -932,6 +932,7 @@ namespace solvers {
     bool _sigma_lff_static = true;          // pol_vertex_sigma_static: include the instantaneous part (nu -> inf limit) via the static self-energy
     std::string _dyn_resum_mu_file;       // pol_vertex_dyn_resum_mu_file: mu(nu_j) per half node -> Pi_dyn = mu Pi_gam1 (LFF)
     bool _dyn_dense = true;      // pol_vertex_dyn_dense: the dense per-tau rung K_d(s) (nt/2 x D x D per unit)
+    std::string _dyn_resolvent = "inverse";   // pol_vertex_dyn_resolvent: inverse (T_s dense) | lu (P7: factor once, solve per application)
     long _dyn_union_stride = 1;  // pol_vertex_dyn_union_stride: keep every n-th shifted G node of the union grid
     int _dyn_table_mode = 0;     // pol_vertex_dyn_table_mode: 0 fitted twisted-pair tables, 1 exact partial fractions
     double _dyn_tfold = 0.0;     // pol_vertex_dyn_tfold: the small-nu fold ratio (0 = off)
@@ -1808,6 +1809,14 @@ namespace solvers {
      *  27 GB at C = [0,12)); false = the THC pair-space streaming route (memory-bandwidth-bound). */
     void set_ladder_dyn_dense(bool on) { _dyn_dense = on; }
     bool ladder_dyn_dense() const { return _dyn_dense; }
+    /** pol_vertex_dyn_resolvent (default "inverse"): the static resolvent T_s = K_s (1 - Cb K_s)^-1 of the dynamic solver --
+     *  "inverse" forms the explicit inverse and stores T_s dense (D x D); "lu" (P7) factorizes 1 - Cb K_s once (getrf, built
+     *  blockwise) and applies T_s as a solve + one K_s gemm: no D^3 inverse, D^2 fewer words, identical to rounding. */
+    void set_ladder_dyn_resolvent(std::string const &m) {
+      utils::check(m == "inverse" or m == "lu", "vertex_t::set_ladder_dyn_resolvent: pol_vertex_dyn_resolvent must be inverse | lu (got \"{}\").", m);
+      _dyn_resolvent = m;
+    }
+    std::string const &ladder_dyn_resolvent() const { return _dyn_resolvent; }
     /** pol_vertex_dyn_union_stride (default 1): the inu != 0 union grid keeps every n-th shifted G node (plus the
      *  last); the pair-pole cost falls ~n^2 while the G pole fit must stay clean (reported; gate it). */
     void set_ladder_dyn_union_stride(long n) {

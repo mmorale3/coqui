@@ -475,6 +475,26 @@ namespace bdft_tests {
       stp = std::addressof(stab.value());
       o.shift_fit_err = stab->fit_err;
     }
+    {   // P7 (vertex_perf_plan.md): the LU form of the static resolvent (factor once, solve per application) == the dense
+        // inverse form, on one L_s application to a random two-family vector
+      auto Slu = db::build_static_resolvent(b, P, R, inu, shared, "lu");
+      const long nR = T.Dc.shape(3);
+      db::tf_vector y(b.np, nk, nc, nR), G1(b.np, nk, nc, nR), G2(b.np, nk, nc, nR);
+      { long sd = 12345; auto rnd = [&]() { sd = (1103515245L * sd + 12345L) % 2147483648L; return double(sd) / 2147483648.0 - 0.5; };
+        for (auto &v : y.fam) v = cplx(rnd(), rnd());
+        for (auto &v : y.cst) v = cplx(rnd(), rnd());
+        // the solver invariant: the dynamic remainder lives on the DLR (fit) nodes only -- kd writes p < np_fit, and the
+        // shifted L0 (inu != 0) refuses confluent products at the union nodes
+        for (long f = 0; f < 2; ++f) for (long pp = b.np_fit; pp < b.np; ++pp) y.fam(f, pp, nda::ellipsis{}) = cplx(0.0); }
+      nda::array<cplx, 4> Gs1(nk, nc, nc, nR), Gs2(nk, nc, nc, nR);
+      db::ls_apply(b, P, S, inu, shared, T.Dc, y, G1, Gs1, nullptr, stp);
+      db::ls_apply(b, P, Slu, inu, shared, T.Dc, y, G2, Gs2, nullptr, stp);
+      double d = 0.0, n = 0.0;
+      for (long i = 0; i < G1.fam.size(); ++i) { d = std::max(d, std::abs(G1.fam.data()[i] - G2.fam.data()[i])); n = std::max(n, std::abs(G1.fam.data()[i])); }
+      for (long i = 0; i < Gs1.size(); ++i) { d = std::max(d, std::abs(Gs1.data()[i] - Gs2.data()[i])); n = std::max(n, std::abs(Gs1.data()[i])); }
+      app_log(1, "dynbse P7: static resolvent LU form vs dense inverse (inu = {:.3e}i): max |d| {:.3e} / max {:.3e}", inu.imag(), d, n);
+      REQUIRE(d < 1e-11 * std::max(n, 1e-300));
+    }
     if (gmres_m > 0) {
       auto kd = [&](db::tf_vector const &F, nda::array<cplx, 4> const &Fsum, db::tf_vector &y) {
         return db::kd_apply(b, R, F, Fsum, y, inu);

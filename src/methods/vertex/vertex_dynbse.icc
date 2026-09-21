@@ -100,6 +100,9 @@ namespace solvers {
       long union_stride = 1;      // union grid: keep every union_stride-th shifted G node (plus the last); the
                                   // inu != 0 L0 cost scales as ng (1 + 2 (np_fit + ng)) -> stride 2 is ~5x cheaper
                                   // IF G still fits (node_pole_fit error reported as the G fit; gate it)
+      std::string resolvent = "inverse";   // P7 (vertex_perf_plan.md): the static resolvent T_s = K_s (1 - Cb K_s)^-1 --
+                                  // "inverse": the explicit inverse, T_s stored dense (D x D); "lu": the LU factors of
+                                  // 1 - Cb K_s (built blockwise, no D^3 inverse), T_s applied as getrs + one K_s gemm
       bool dense_rung = true;     // the DENSE per-tau rung (2026-09-13): K_d(s) = build_kbig(W_d(s)) on the PH-sym
                                   // half of the tau nodes (nt/2 x D x D per unit, 5.4 GB at Si 4^3/8) and every
                                   // application = nt (D x D)(D x nR) gemms (compute-bound) instead of the THC
@@ -1149,15 +1152,19 @@ namespace solvers {
           db::static_resolvent S;
           if (opt.one_rung_only) {
             S.D = D; S.nk = nk; S.nc = nc;
-            S.Cb = nda::array<cplx, 2>(D, D);
-            S.Cb() = cplx(0.0);
-            for (long k = 0; k < nk; ++k)
-              for (long r = 0; r < nc2; ++r)
-                for (long c = 0; c < nc2; ++c) S.Cb(k * nc2 + r, k * nc2 + c) = Cb_k(k, r, c);
-            S.Ts = nda::array<cplx, 2>(D, D);
-            S.Ts() = cplx(0.0);
+            if (opt.resolvent == "lu") {
+              S.mode = "lu"; S.zero = true;                  // P7: T_s = 0 without the dense zero matrices
+            } else {
+              S.Cb = nda::array<cplx, 2>(D, D);
+              S.Cb() = cplx(0.0);
+              for (long k = 0; k < nk; ++k)
+                for (long r = 0; r < nc2; ++r)
+                  for (long c = 0; c < nc2; ++c) S.Cb(k * nc2 + r, k * nc2 + c) = Cb_k(k, r, c);
+              S.Ts = nda::array<cplx, 2>(D, D);
+              S.Ts() = cplx(0.0);
+            }
           } else {
-            S = db::build_static_resolvent_from(Cb_k, Ks);
+            S = db::build_static_resolvent_from(Cb_k, Ks, opt.resolvent);
           }
           if (met) met->t_lu += watch.lap();
           // ---- the RHS column blocks: each block is an independent solve of width nR ----------
@@ -1764,6 +1771,7 @@ namespace solvers {
     o.tol = _dyn_tol; o.maxit = _dyn_maxit; o.gmres_m = _dyn_gmres; o.sign_ks = _dyn_sign;
     o.rhs_block = _dyn_rhs_block;
     o.dense_rung = _dyn_dense;
+    o.resolvent = _dyn_resolvent;
     o.tfold = _dyn_tfold;
     o.vmask_lo = _dyn_vmask_lo; o.vmask_hi = _dyn_vmask_hi;
     o.gamma1_only = _dyn_gamma1_only;
@@ -1899,6 +1907,7 @@ namespace solvers {
     o.tol = _dyn_tol; o.maxit = _dyn_maxit; o.gmres_m = std::max<long>(_dyn_gmres, 12); o.sign_ks = _dyn_sign;
     o.rhs_block = _dyn_rhs_block;
     o.dense_rung = _dyn_dense;
+    o.resolvent = _dyn_resolvent;
     o.union_stride = _dyn_union_stride;
     o.table_mode = _dyn_table_mode;
     o.tfold = _dyn_tfold;
@@ -2125,6 +2134,7 @@ namespace solvers {
     o.tol = _dyn_tol; o.maxit = _dyn_maxit; o.gmres_m = std::max<long>(_dyn_gmres, 12); o.sign_ks = opt.sign_ks;
     o.rhs_block = _dyn_rhs_block;
     o.dense_rung = _dyn_dense;
+    o.resolvent = _dyn_resolvent;
     o.union_stride = _dyn_union_stride;
     o.table_mode = _dyn_table_mode;
     o.tfold = _dyn_tfold;

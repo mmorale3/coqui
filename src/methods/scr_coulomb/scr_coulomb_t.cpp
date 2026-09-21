@@ -487,6 +487,7 @@ namespace solvers {
     _pol_vtx->set_ladder_dyn_rhs_block(_vertex->ladder_dyn_rhs_block());
     _pol_vtx->set_ladder_dyn_dump(_vertex->ladder_dyn_dump());
     _pol_vtx->set_ladder_dyn_dense(_vertex->ladder_dyn_dense());
+    _pol_vtx->set_ladder_dyn_resolvent(_vertex->ladder_dyn_resolvent());
     _pol_vtx->set_ladder_dyn_union_stride(_vertex->ladder_dyn_union_stride());
     _pol_vtx->set_ladder_dyn_table_mode(_vertex->ladder_dyn_table_mode());
     _pol_vtx->set_ladder_dyn_iaft_prec(_vertex->ladder_dyn_iaft_prec());

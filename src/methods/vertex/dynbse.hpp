@@ -2234,9 +2234,48 @@ namespace dynbse {
    */
   struct static_resolvent {
     long D = 0, nk = 0, nc = 0;
-    nda::array<cplx, 2> Cb;      // (D, D) block diagonal
-    nda::array<cplx, 2> Ts;      // (D, D)
+    std::string mode = "inverse";   // "inverse": T_s stored dense; "lu": the LU factors of 1 - Cb K_s, T_s applied as a solve (P7)
+    nda::array<cplx, 2> Cb;      // (D, D) block diagonal                          [inverse]
+    nda::array<cplx, 2> Ts;      // (D, D)                                          [inverse]
+    nda::array<cplx, 3> Cb_k;    // (nk, nc^2, nc^2) the diagonal blocks of Cb        [lu]
+    nda::matrix<cplx> Mlu;       // (D, D) the LU factors of M = 1 - Cb K_s (getrf)   [lu]
+    nda::array<int, 1> ipiv;     // its pivots                                        [lu]
+    nda::array<cplx, 2> const *Ks = nullptr;   // the caller's static rung (D, D); it must outlive the resolvent  [lu]
+    bool own_ks = false;         // the static rung is the owned copy in Cb (the toy builder)        [lu]
+    bool zero = false;           // T_s = 0 (the pure one-rung column): no solve       [lu]
   };
+
+  /**
+   * P7 (vertex_perf_plan.md, 2026-09-21): the static resolvent WITHOUT the explicit inverse. T_s = K_s M^-1 with
+   * M = 1 - Cb K_s is never formed: M is assembled blockwise (Cb is block diagonal in k: nk gemms of nc^2 x nc^2 by
+   * nc^2 x D instead of one D^3 gemm), factorized once (getrf, 2/3 D^3) and every application T_s f = K_s (M^-1 f) is a
+   * getrs plus one K_s gemm -- the same 4 D^2 nR per application as the dense form (T_s gemm + dense Cb gemm) and a
+   * 9x cheaper build (the dense form: CbK gemm 2 D^3 + inverse 2 D^3 + K_s M^-1 gemm 2 D^3); memory D^2 (Mlu) + the
+   * caller's K_s instead of Cb + T_s + K_s dense and the three D^2 build temporaries.
+   */
+  inline void finish_static_resolvent_lu(static_resolvent &S, nda::array<cplx, 2> const &Ks) {
+    decltype(nda::range::all) all;
+    const long D = S.D, nk = S.nk, nc2 = S.nc * S.nc;
+    utils::check(S.Cb_k.shape(0) == nk and S.Cb_k.shape(1) == nc2 and S.Cb_k.shape(2) == nc2,
+                 "dynbse::finish_static_resolvent_lu: Cb_k shape.");
+    utils::check(Ks.shape(0) == D and Ks.shape(1) == D, "dynbse::finish_static_resolvent_lu: Ks shape.");
+    S.mode = "lu";
+    S.zero = false;
+    S.Mlu = nda::matrix<cplx>(D, D);
+    for (long k = 0; k < nk; ++k) {                                   // M = 1 - Cb K_s, one block row per k
+      auto Ck = S.Cb_k(k, all, all);
+      auto Kk = Ks(nda::range(k * nc2, (k + 1) * nc2), all);
+      auto Mk = S.Mlu(nda::range(k * nc2, (k + 1) * nc2), all);
+      nda::blas::gemm(cplx(-1.0), Ck, Kk, cplx(0.0), Mk);
+    }
+    for (long i = 0; i < D; ++i) S.Mlu(i, i) += cplx(1.0);
+    const long nan_cb = nan_count(S.Cb_k), nan_ks = nan_count(Ks), nan_m = nan_count(S.Mlu);
+    utils::check(nan_cb + nan_ks + nan_m == 0, "dynbse::finish_static_resolvent_lu: NaN (Cb {} Ks {} 1-CbK {}).", nan_cb, nan_ks, nan_m);
+    S.ipiv = nda::array<int, 1>(D);
+    const int info = nda::lapack::getrf(S.Mlu, S.ipiv);
+    utils::check(info == 0, "dynbse::finish_static_resolvent_lu: getrf of (1 - Cb K_s) failed (info {}).", info);
+    S.Ks = std::addressof(Ks);
+  }
 
   /** T_s = K_s (1 - Cb K_s)^-1 from the dense block-diagonal Cb held by S and the static rung Ks. */
   inline void finish_static_resolvent(static_resolvent &S, nda::array<cplx, 2> const &Ks) {
@@ -2259,13 +2298,14 @@ namespace dynbse {
   }
 
   inline static_resolvent build_static_resolvent(freq_basis const &b, pair_poles const &P,
-                                                 pair_rung const &R, cplx inu, bool shared) {
+                                                 pair_rung const &R, cplx inu, bool shared,
+                                                 std::string const &mode = "inverse") {
     (void)b; (void)shared;
     static_resolvent S;
     const long nk = P.nk, nc = P.nc, nc2 = nc * nc, ng = P.ng, D = nk * nc2;
     S.D = D; S.nk = nk; S.nc = nc;
-    S.Cb = nda::array<cplx, 2>(D, D);
-    S.Cb() = cplx(0.0);
+    nda::array<cplx, 3> Cb_k(nk, nc2, nc2);
+    Cb_k() = cplx(0.0);
     for (long ik = 0; ik < nk; ++ik)
       for (long j = 0; j < ng; ++j)
         for (long l = 0; l < ng; ++l) {
@@ -2278,7 +2318,7 @@ namespace dynbse {
             for (long p3 = 0; p3 < nc; ++p3)
               for (long a = 0; a < nc; ++a)
                 for (long bb = 0; bb < nc; ++bb)
-                  S.Cb(ik * nc2 + p1p * nc + p3, ik * nc2 + a * nc + bb) +=
+                  Cb_k(ik, p1p * nc + p3, a * nc + bb) +=
                       T * P.gk(j, ik, a, p1p) * P.gkq(l, ik, p3, bb);
         }
     // K_s (D x D)
@@ -2289,6 +2329,20 @@ namespace dynbse {
         for (long p = 0; p < nc2; ++p)
           for (long pp = 0; pp < nc2; ++pp) Ks(ik * nc2 + p, ikp * nc2 + pp) = R.K0(iq, p, pp);
       }
+    if (mode == "lu") {
+      // the toy builder has no long-lived K_s to reference: the LU form keeps its own copy in the (otherwise unused) Cb
+      // slot and marks it (own_ks), so no pointer into the returned object is needed
+      S.Cb_k = Cb_k;
+      S.Cb = Ks;
+      finish_static_resolvent_lu(S, S.Cb);
+      S.Ks = nullptr; S.own_ks = true;
+      return S;
+    }
+    S.Cb = nda::array<cplx, 2>(D, D);
+    S.Cb() = cplx(0.0);
+    for (long ik = 0; ik < nk; ++ik)
+      for (long p = 0; p < nc2; ++p)
+        for (long pp = 0; pp < nc2; ++pp) S.Cb(ik * nc2 + p, ik * nc2 + pp) = Cb_k(ik, p, pp);
     finish_static_resolvent(S, Ks);
     return S;
   }
@@ -2296,11 +2350,18 @@ namespace dynbse {
   /** the production builder: Cb_k (nk, nc^2, nc^2) the per-k chi0 (any route), Ks (D, D) the
    *  static rung mapping the pair vector at k' (column) to k (row), D = nk nc^2. */
   inline static_resolvent build_static_resolvent_from(nda::array<cplx, 3> const &Cb_k,
-                                                      nda::array<cplx, 2> const &Ks) {
+                                                      nda::array<cplx, 2> const &Ks,
+                                                      std::string const &mode = "inverse") {
     static_resolvent S;
     const long nk = Cb_k.shape(0), nc2 = Cb_k.shape(1), D = nk * nc2;
     utils::check(Ks.shape(0) == D and Ks.shape(1) == D, "dynbse::build_static_resolvent_from: Ks shape.");
+    utils::check(mode == "inverse" or mode == "lu", "dynbse::build_static_resolvent_from: mode {} (inverse | lu).", mode);
     S.D = D; S.nk = nk; S.nc = long(std::lround(std::sqrt(double(nc2))));
+    if (mode == "lu") {                            // P7: the caller's Ks is referenced, not copied (it outlives the unit)
+      S.Cb_k = Cb_k;
+      finish_static_resolvent_lu(S, Ks);
+      return S;
+    }
     S.Cb = nda::array<cplx, 2>(D, D);
     S.Cb() = cplx(0.0);
     for (long ik = 0; ik < nk; ++ik)
@@ -2418,8 +2479,31 @@ namespace dynbse {
     for (long ik = 0; ik < nk; ++ik)
       for (long p = 0; p < nc2; ++p)
         for (long r = 0; r < nR; ++r) fs(ik * nc2 + p, r) = Fsum(ik, p / nc, p % nc, r);
-    nda::blas::gemm(S.Ts, fs, cs);
-    nda::blas::gemm(S.Cb, cs, cb);
+    if (S.mode == "lu") {
+      // P7: c = T_s Fsum = K_s [(1 - Cb K_s)^-1 Fsum] through the stored LU; Cb c blockwise (Cb is block diagonal in k)
+      if (S.zero) {
+        cs() = cplx(0.0);
+        cb() = cplx(0.0);
+      } else {
+        utils::check(S.own_ks or S.Ks != nullptr, "dynbse::ls_apply: the LU resolvent has no static rung.");
+        nda::array<cplx, 2> const &Ksr = S.own_ks ? S.Cb : *S.Ks;
+        nda::matrix<cplx, nda::F_layout> Y(D, nR);          // getrs wants a Fortran-layout right-hand side
+        Y() = fs;
+        const int info = nda::lapack::getrs(S.Mlu, Y, S.ipiv);
+        utils::check(info == 0, "dynbse::ls_apply: getrs failed (info {}).", info);
+        nda::array<cplx, 2> z(D, nR);
+        z() = Y;
+        nda::blas::gemm(Ksr, z, cs);
+        for (long ik = 0; ik < nk; ++ik) {
+          auto rows = nda::range(ik * nc2, (ik + 1) * nc2);
+          auto cbk = cb(rows, all);
+          nda::blas::gemm(S.Cb_k(ik, all, all), cs(rows, all), cbk);
+        }
+      }
+    } else {
+      nda::blas::gemm(S.Ts, fs, cs);
+      nda::blas::gemm(S.Cb, cs, cb);
+    }
     stt.t_ts += wall_now() - tw; tw = wall_now();
     tf_vector Xc(b.np, nk, nc, nR);
     for (long ik = 0; ik < nk; ++ik)
