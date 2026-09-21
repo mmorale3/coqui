@@ -20,6 +20,7 @@
 
 
 
+#include <cstdlib>
 #include <filesystem>
 #include <optional>
 
@@ -197,6 +198,40 @@ auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_ax
     }
     mpi->comm.barrier();
     Timer.stop("DYSON");
+    // CAUSALITY METER (vertex_perf_plan.md P22, 2026-09-21; the in-loop form of notes/lff/tools/lff_causality.py): a causal G has
+    // -G_ii(tau) >= 0 and a causal Sigma has Sigma_ii(tau) <= 0 on the band diagonal at every (tau, s, k). A too-small
+    // imaginary-axis window leaves a small NON-causal residue that a Dyson loop with semicore states amplifies geometrically
+    // (MgO drift, AlAs / LiF divergence at the 1.5 x bandwidth window). Logged every iteration (level 2), at level 1 when the
+    // residue exceeds 1e-6 or grows by more than 3x per iteration. Env COQUI_SCF_CAUSALITY_METER=0 disables it.
+    if (std::getenv("COQUI_SCF_CAUSALITY_METER") == nullptr or std::string(std::getenv("COQUI_SCF_CAUSALITY_METER")) != "0") {
+      double gmin = 1e300, smax = -1e300;
+      long nviol = 0;
+      if (mpi->node_comm.root()) {
+        auto G = sG_tskij.local();
+        auto S = sSigma_tskij.local();
+        const long nt = G.shape(0), ns = G.shape(1), nk = G.shape(2), nb = G.shape(3);
+        for (long is = 0; is < ns; ++is)
+          for (long ik = 0; ik < nk; ++ik)
+            for (long i = 0; i < nb; ++i) {
+              double gm = 1e300;
+              for (long it = 0; it < nt; ++it) {
+                gm = std::min(gm, -G(it, is, ik, i, i).real());
+                smax = std::max(smax, S(it, is, ik, i, i).real());
+              }
+              gmin = std::min(gmin, gm);
+              if (gm < -1e-6) ++nviol;
+            }
+      }
+      gmin = -mpi->comm.all_reduce_value(-gmin, boost::mpi3::max<>{});
+      smax = mpi->comm.all_reduce_value(smax, boost::mpi3::max<>{});
+      nviol = mpi->comm.all_reduce_value(nviol, std::plus<>{});
+      static double gmin_prev = 0.0;
+      const bool warn = (gmin < -1e-6) or (gmin_prev < 0.0 and gmin < 3.0 * gmin_prev);
+      app_log(warn ? 1 : 2, "  [causality] iteration {}: min(-G_ii(tau)) = {:.3e}, max(Sigma_ii(tau)) = {:.3e}, violators (min < -1e-6) = {}{}",
+              output_iter, gmin, smax, nviol,
+              warn ? "  <-- a non-causal residue is present or growing: check the imaginary-axis window (iaft wmax ~ 5 x the bandwidth)" : "");
+      gmin_prev = gmin;
+    }
 
 
     auto k_weight = mf->k_weight();
