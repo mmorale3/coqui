@@ -4820,6 +4820,7 @@ namespace solvers {
                                           nda::array<ComplexType, 5>&, vertex_t::sigma_pair_meter*);
   template void vertex_t::eval_sigma_pair_dyn(MBState&, thc_reader_t&, vertex_t::sigma_pair_opts const&,
                                           nda::array<ComplexType, 5>&, vertex_t::sigma_pair_meter*);
+  template long vertex_t::arm_shared_sigma_hook(MBState&, thc_reader_t&, vertex_t::sigma_pair_opts const&, std::vector<long> const&);   // P3
   template vertex_t::dynbse_cut_result vertex_t::eval_pol_dynbse_cut(MBState&, thc_reader_t&, std::vector<long> const&,
                                                                      std::vector<long> const&, long, bool);
   template vertex_t::ladder_whalf_diag

@@ -50,6 +50,8 @@
 
 namespace methods {
 namespace solvers {
+namespace vertex_dynbse_detail { struct sigma_dyn_hook; }   // P3: the shared Sigma hook (defined in vertex_sigma_dyn.icc)
+namespace vertex_pi { struct iaft_tools; }
 
   /**
    * Rung mode of the vertex correction (notes/static_vertex_implementation_plan.md
@@ -681,6 +683,11 @@ namespace solvers {
     // rotation (the same unfolding point as the kernels' planned IBZ support) -- no
     // layout change needed, only the accessor.
     std::optional<nda::array<ComplexType, 4>> _Wb_qwmm;
+    // P3: the Sigma hook shared between the P-side driver call and the Sigma-side call of one update (type-erased: the hook
+    // type is defined in vertex_sigma_dyn.icc); armed by arm_shared_sigma_hook, consumed by eval_sigma_pair_dyn
+    std::shared_ptr<void> _shared_hook;
+    std::vector<long> _shared_hook_nodes;        // the full Sigma node set the hook was prepared for
+    std::string _shared_hook_col, _shared_hook_outer;
     // P19 (vertex_perf_plan.md, 2026-09-21): pol_vertex_wcache = "shared" keeps ONE copy of the cache per NUMA node
     // (math::shm::shared_array, the Xhat_shm pattern of vertex_sym) instead of one per rank; every consumer reads the
     // cache through wb_cache(), a view onto whichever storage is in use. "replicated" (default) = the historic per-rank array.
@@ -934,6 +941,7 @@ namespace solvers {
     double _sigma_dyn_ckpt_minutes = 0.0;        // pol_vertex_sigma_dyn_ckpt_minutes: the Sigma-accumulator checkpoint interval (P20; 0 = off)
     std::string _sigma_dyn_refit = "fit";        // pol_vertex_sigma_dyn_refit: fit | union (P12)
     double _sigma_dyn_refit_rtol = 1e-8;         // pol_vertex_sigma_dyn_refit_rtol (P12)
+    bool _sigma_share = false;                   // pol_vertex_sigma_share: one solve feeds the P readout and the Sigma deposits (P3)
     std::string _sigma_dyn_fit_file;             // pol_vertex_sigma_dyn_fit_file: the reference dump for the sampled mode
     long _sigma_dyn_fit_rank = 0;                // pol_vertex_sigma_dyn_fit_rank: K (0 = the number of sampled nodes)
     double _sigma_lff_pinv_tol = 1e-3;      // pol_vertex_sigma_pinv_tol: relative eigenvalue cutoff of Pi_0^-1 -- the vertex lives on the
@@ -1683,6 +1691,12 @@ namespace solvers {
     bool sigma_dyn_dump() const { return _sigma_dyn_dump; }
     std::vector<long> const &sigma_dyn_nodes() const { return _sigma_dyn_nodes; }
     std::string const &sigma_dyn_fit_file() const { return _sigma_dyn_fit_file; }
+    /** pol_vertex_sigma_share (default false; P3): the (s, q, nu) units shared by the P-side dynamic readout and the dynamic
+     *  Sigma vertex are solved ONCE -- the readout instance arms the Sigma hook on the P-side driver call for the P nodes
+     *  that belong to the Sigma node set, and the Sigma-side call solves only the remaining nodes. Both run on the same
+     *  W-bar cache within one update, so the shared units are identical solves (not only at self-consistency). */
+    void set_sigma_share(bool on) { _sigma_share = on; }
+    bool sigma_share() const { return _sigma_share; }
     void set_sigma_pair_ibz(bool on) { _sigma_pair_ibz = on; }
     bool sigma_pair_ibz() const { return _sigma_pair_ibz; }
     /** pol_vertex_sigma_dyn_ckpt_minutes (default 0 = off; P20): every rank writes its partial Sigma accumulators and the
@@ -1745,6 +1759,13 @@ namespace solvers {
      *  hook armed; opt.col = static_dyn | dyn1_bare | dyn1 | dyn. Same output contract as eval_sigma_pair. */
     void eval_sigma_pair_dyn(MBState &mb_state, THC_ERI auto &thc, sigma_pair_opts const &opt,
                              nda::array<ComplexType, 5> &dSig, sigma_pair_meter *met = nullptr);
+    /** P3: prepare the Sigma hook for the FULL Sigma node set of `opt` and arm it on the next P-side driver call, whose
+     *  nodes `p_nodes` (full bosonic indices) are deposited for the Sigma side as they are solved; returns the number of
+     *  nodes the P-side call will deposit (0 = nothing shared: the Sigma-side call solves everything as before). */
+    long arm_shared_sigma_hook(MBState &mb_state, THC_ERI auto &thc, sigma_pair_opts const &opt, std::vector<long> const &p_nodes);
+    void prepare_sigma_dyn_hook(vertex_dynbse_detail::sigma_dyn_hook &hook, sigma_pair_opts const &opt, THC_ERI auto &thc,
+                                vertex_pi::iaft_tools const &tools, vertex_sym::sym_ctx const *symc, bool sym_, std::vector<long> &nus);
+    bool shared_sigma_hook_armed() const { return _shared_hook != nullptr; }
     std::string const &sigma_lff_bub() const { return _sigma_lff_bub; }
     double sigma_lff_scale() const { return _sigma_lff_scale; }
     double sigma_lff_pinv_tol() const { return _sigma_lff_pinv_tol; }

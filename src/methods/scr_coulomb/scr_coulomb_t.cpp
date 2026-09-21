@@ -561,6 +561,7 @@ namespace solvers {
     _pol_vtx->set_wannier_frame(_vertex->wannier_frame());
     _pol_vtx->set_pol_interp(_vertex->pol_interp_file(), _vertex->pol_interp_col());
     _pol_vtx->set_pol_chain(_vertex->pol_chain());
+    _pol_vtx->set_sigma_share(_vertex->sigma_share());
     app_log(1, "  [scGW-tilde L2] ladder readout instance: C window = [{}, {}), "
                "secondary rank knob = {}, div_treatment = {} (kernel head follows "
                "build_w0's policy; W0bar is SAME-iteration -- coincides with "
@@ -1275,6 +1276,25 @@ namespace solvers {
   }
 
 
+  /** the pair-resolved Sigma vertex's options from the user's vertex object (build_sigma_pair and the P3 arming) */
+  static vertex_t::sigma_pair_opts sigma_pair_opts_of(vertex_t const &v, MBState const &mb_state) {
+    vertex_t::sigma_pair_opts o;
+    o.col = v.sigma_pair_col();
+    o.outer = v.sigma_pair_outer();
+    o.scale = v.sigma_pair_scale();
+    o.hermitize = v.sigma_pair_herm();
+    o.nu_diag = v.sigma_pair_diag();
+    o.sign_ks = v.ladder_dyn_sign();
+    o.side = v.sigma_pair_side();
+    o.ibz = v.sigma_pair_ibz();
+    o.dyn_ckpt_minutes = v.sigma_dyn_ckpt_minutes();   // P20
+    o.dyn_refit = v.sigma_dyn_refit(); o.dyn_refit_rtol = v.sigma_dyn_refit_rtol();   // P12
+    o.dyn_dump = v.sigma_dyn_dump(); o.dyn_nodes = v.sigma_dyn_nodes();
+    o.dyn_fit_file = v.sigma_dyn_fit_file(); o.dyn_fit_rank = v.sigma_dyn_fit_rank();
+    o.dump_prefix = mb_state.coqui_prefix;
+    return o;
+  }
+
   // W-int-4f coarse side: the dynamic-rung ladder on ALL transfers x ALL PH-sym half nodes, written as the full-frequency
   // vertex object <prefix>.pol_wh_dyn.g<n>.h5 (four columns; the fine W-Dyson feed reads one of them by name).
   void scr_coulomb_t::dump_pol_dyn_all_nu(MBState &mb_state, THC_ERI auto &thc, long gen) {
@@ -1331,6 +1351,16 @@ namespace solvers {
             nodes.size(), nw_h, nq, _pol_vtx->ladder_dyn_gamma1_only(), bub_only);
     std::optional<vertex_t::dynbse_cut_result> rd;   // the dynamic columns on the sampled nodes
     if (not bub_only) {
+      // P3 (vertex_perf_plan.md): with pol_vertex_sigma_share the Sigma hook of the dynamic pair vertex rides THIS solve for
+      // the P nodes that belong to the Sigma node set (the same units on the same W-bar cache); build_sigma_pair, later in
+      // this update, solves only the remaining nodes
+      if (_vertex != nullptr and _vertex->sigma_share() and _vertex->sigma_pair_enabled() and _vertex->sigma_pair_dynamic()
+          and long(qs.size()) == nq and not _pol_vtx->wannier()) {
+        const long m0 = _ft->nw_b() / 2;
+        std::vector<long> p_full;
+        for (long j : nodes) p_full.push_back(m0 + j);
+        _pol_vtx->arm_shared_sigma_hook(mb_state, thc, sigma_pair_opts_of(*_vertex, mb_state), p_full);
+      }
       rd.emplace(_pol_vtx->eval_pol_dynbse_cut(mb_state, thc, nodes, qs, gen, false));
       _pol_dyn_ritz = std::max(_pol_dyn_ritz, rd->ritz_max);
     }
@@ -2743,19 +2773,7 @@ namespace solvers {
                  "window) and an INACTIVE vertex_type.");
     ensure_pol_vertex(thc);
     utils::check(_pol_vtx != nullptr, "build_sigma_pair: no readout instance.");
-    vertex_t::sigma_pair_opts o;
-    o.col = _vertex->sigma_pair_col();
-    o.outer = _vertex->sigma_pair_outer();
-    o.scale = _vertex->sigma_pair_scale();
-    o.hermitize = _vertex->sigma_pair_herm();
-    o.nu_diag = _vertex->sigma_pair_diag();
-    o.sign_ks = _vertex->ladder_dyn_sign();
-    o.side = _vertex->sigma_pair_side();
-    o.ibz = _vertex->sigma_pair_ibz();
-    o.dyn_ckpt_minutes = _vertex->sigma_dyn_ckpt_minutes();   // P20
-    o.dyn_dump = _vertex->sigma_dyn_dump(); o.dyn_nodes = _vertex->sigma_dyn_nodes();
-    o.dyn_fit_file = _vertex->sigma_dyn_fit_file(); o.dyn_fit_rank = _vertex->sigma_dyn_fit_rank();
-    o.dump_prefix = mb_state.coqui_prefix;
+    vertex_t::sigma_pair_opts o = sigma_pair_opts_of(*_vertex, mb_state);
     const bool dyn = _vertex->sigma_pair_dynamic();
     nda::array<ComplexType, 4> Pchk;
     if (_vertex->sigma_pair_diag() and not dyn) {

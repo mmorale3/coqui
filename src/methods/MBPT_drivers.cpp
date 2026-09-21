@@ -710,6 +710,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
           vertex.set_sigma_dyn_ckpt_minutes(io::get_value_with_default<double>(pt,"pol_vertex_sigma_dyn_ckpt_minutes",0.0));
           vertex.set_sigma_dyn_refit(io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_dyn_refit","fit"),
                                       io::get_value_with_default<double>(pt,"pol_vertex_sigma_dyn_refit_rtol",1e-8));
+          vertex.set_sigma_share(io::get_value_with_default<bool>(pt,"pol_vertex_sigma_share",false));
           vertex.set_sigma_dyn(io::get_value_with_default<bool>(pt,"pol_vertex_sigma_dyn_dump",false),
               io::get_array_with_default<long>(pt,"pol_vertex_sigma_dyn_nodes",std::vector<long>{}),
               io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_dyn_fit_file",""),
@@ -1138,6 +1139,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
           pol_vertex_carrier.set_sigma_dyn_ckpt_minutes(io::get_value_with_default<double>(pt,"pol_vertex_sigma_dyn_ckpt_minutes",0.0));
           pol_vertex_carrier.set_sigma_dyn_refit(io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_dyn_refit","fit"),
                                       io::get_value_with_default<double>(pt,"pol_vertex_sigma_dyn_refit_rtol",1e-8));
+          pol_vertex_carrier.set_sigma_share(io::get_value_with_default<bool>(pt,"pol_vertex_sigma_share",false));
           pol_vertex_carrier.set_sigma_dyn(io::get_value_with_default<bool>(pt,"pol_vertex_sigma_dyn_dump",false),
               io::get_array_with_default<long>(pt,"pol_vertex_sigma_dyn_nodes",std::vector<long>{}),
               io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_dyn_fit_file",""),
@@ -1418,6 +1420,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
           pol_vertex_carrier.set_sigma_dyn_ckpt_minutes(io::get_value_with_default<double>(pt,"pol_vertex_sigma_dyn_ckpt_minutes",0.0));
           pol_vertex_carrier.set_sigma_dyn_refit(io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_dyn_refit","fit"),
                                       io::get_value_with_default<double>(pt,"pol_vertex_sigma_dyn_refit_rtol",1e-8));
+          pol_vertex_carrier.set_sigma_share(io::get_value_with_default<bool>(pt,"pol_vertex_sigma_share",false));
           pol_vertex_carrier.set_sigma_dyn(io::get_value_with_default<bool>(pt,"pol_vertex_sigma_dyn_dump",false),
               io::get_array_with_default<long>(pt,"pol_vertex_sigma_dyn_nodes",std::vector<long>{}),
               io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_dyn_fit_file",""),
@@ -1744,6 +1747,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
           vertex.set_sigma_dyn_ckpt_minutes(io::get_value_with_default<double>(pt,"pol_vertex_sigma_dyn_ckpt_minutes",0.0));
           vertex.set_sigma_dyn_refit(io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_dyn_refit","fit"),
                                       io::get_value_with_default<double>(pt,"pol_vertex_sigma_dyn_refit_rtol",1e-8));
+          vertex.set_sigma_share(io::get_value_with_default<bool>(pt,"pol_vertex_sigma_share",false));
           vertex.set_sigma_dyn(io::get_value_with_default<bool>(pt,"pol_vertex_sigma_dyn_dump",false),
               io::get_array_with_default<long>(pt,"pol_vertex_sigma_dyn_nodes",std::vector<long>{}),
               io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_dyn_fit_file",""),
@@ -2096,6 +2100,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
           pol_vertex_carrier.set_sigma_dyn_ckpt_minutes(io::get_value_with_default<double>(pt,"pol_vertex_sigma_dyn_ckpt_minutes",0.0));
           pol_vertex_carrier.set_sigma_dyn_refit(io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_dyn_refit","fit"),
                                       io::get_value_with_default<double>(pt,"pol_vertex_sigma_dyn_refit_rtol",1e-8));
+          pol_vertex_carrier.set_sigma_share(io::get_value_with_default<bool>(pt,"pol_vertex_sigma_share",false));
           pol_vertex_carrier.set_sigma_dyn(io::get_value_with_default<bool>(pt,"pol_vertex_sigma_dyn_dump",false),
               io::get_array_with_default<long>(pt,"pol_vertex_sigma_dyn_nodes",std::vector<long>{}),
               io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_dyn_fit_file",""),

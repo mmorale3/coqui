@@ -562,6 +562,57 @@ namespace bdft_tests {
             mpi_context->comm.barrier();
             return std::make_tuple(e_corr, m, d, pichk);
           };
+          if (std::getenv("COQUI_DYNBSE_TEST_SIGDYN_SHARE")) {
+            // ---- P3 gate: one solve feeding the P readout and the Sigma deposits ---------------------------------------------
+            // SH0 / SH1: the P-side all-nu dynamic readout (every half node) AND the dynamic pair vertex in Sigma (col dyn1, outer
+            // dynamic, every node) in one run, without / with pol_vertex_sigma_share: the 21 nu >= 0 nodes are then deposited by
+            // the P-side solve and the Sigma-side call solves the 20 others. Sigma and the P dump must agree (the same units on
+            // the same W-bar cache): Pi_gam1 bitwise, Sigma to rounding.
+            auto run_sh = [&](std::string const &tag, bool share, S5 &Sig, nda::array<std::complex<double>, 4> &Pg) {
+              const std::string out = "coqui_d3_winj_" + tag;
+              solvers::hf_t hf; solvers::gw_t gw(&ft, "ignore_g0", out);
+              solvers::scr_coulomb_t scr_eri(&ft, "rpa", "ignore_g0");
+              simple_dyson dyson(mfn.get(), &ft); MBState mb_state(mpi_context, ft, out);
+              iter_scf::iter_scf_t iter_sol("damping");
+              solvers::vertex_t vtx(&ft, "none", nda::range(0, 0), mfn->nbnd());
+              vtx.set_pol_vertex("ladder", "w0_prev", nda::range(0, 4), -1, 1e-8, -1.0, -1.0, -1.0, "none");
+              vtx.set_ladder_rung("dynamic", 1e-8, 30, 12, -1.0);
+              vtx.set_ladder_dyn_gamma1_only(true); vtx.set_ladder_dyn_all_nu(true);
+              vtx.set_isdf_points("coqui_d3_winj_G.secpts.h5", false);
+              vtx.set_sigma_pair(true, "dyn1", "dynamic", 1.0, true, false, "right");
+              vtx.set_sigma_share(share);
+              scr_eri.set_vertex(&vtx);
+              const double e_corr = std::get<1>(scf_loop(mb_state, dyson, erin, ft, solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol, 1, false, 1e-9, true));
+              mpi_context->comm.barrier();
+              read_sig(out + ".mbpt.h5", Sig);
+              { h5::file f(out + ".pol_wh_dyn.g1.h5", 'r'); h5::group g(f); nda::h5_read(g, "Pi_gam1", Pg); }
+              app_log(1, "dynbse_readout LFF-Sigma SHARE [{}]: share {}: e_corr {:.12f}, max|dSigma| {:.6e}, wall {:.1f} s", tag, share, e_corr,
+                      scr_eri.sigma_pair_meter()[0], scr_eri.sigma_pair_meter()[3]);
+              mpi_context->comm.barrier();
+              if (mpi_context->comm.root()) {
+                remove((out + ".mbpt.h5").c_str());
+                for (auto const &e : std::filesystem::directory_iterator("."))
+                  if (e.path().filename().string().rfind(out + ".", 0) == 0) std::filesystem::remove(e.path());
+              }
+              mpi_context->comm.barrier();
+              return e_corr;
+            };
+            // COQUI_DYNBSE_TEST_SIGDYN_SHARE=repro runs SH0 twice instead (the run-to-run floor of the dynamically scheduled P solve)
+            const bool repro = (std::string(std::getenv("COQUI_DYNBSE_TEST_SIGDYN_SHARE")) == "repro");
+            S5 S0, S1;
+            nda::array<std::complex<double>, 4> P0, P1;
+            const double c0 = run_sh("SH0", false, S0, P0), c1 = run_sh("SH1", not repro, S1, P1);
+            double ds = 0.0, ns_ = 0.0, dp = 0.0, np_ = 0.0;
+            for (long i = 0; i < S0.size(); ++i) { ds = std::max(ds, std::abs(S0.data()[i] - S1.data()[i])); ns_ = std::max(ns_, std::abs(S0.data()[i])); }
+            for (long i = 0; i < P0.size(); ++i) { dp = std::max(dp, std::abs(P0.data()[i] - P1.data()[i])); np_ = std::max(np_, std::abs(P0.data()[i])); }
+            app_log(1, "dynbse_readout LFF-Sigma SHARE gate (P3): {}: |dSigma| {:.2e} (max |Sigma| {:.3e}), "
+                       "|dPi_gam1| {:.2e} (max |Pi_gam1| {:.3e}); e_corr {:+.12f} vs {:+.12f}",
+                    repro ? "the separate-solve run repeated (run-to-run floor)" : "one solve for P and Sigma vs separate solves", ds, ns_, dp, np_, c1, c0);
+            REQUIRE(dp < 1e-9 * np_);
+            REQUIRE(ds < 1e-11 * ns_);
+            mpi_context->comm.barrier();
+            return;
+          }
           if (std::getenv("COQUI_DYNBSE_TEST_SIGDYN_CKPT")) {
             // ---- P20 gate: the Sigma-accumulator checkpoint / restart of the dynamic Sigma solve ---------------------------------
             // CK1 (a) solves every unit and checkpoints after each; (b) the same prefix again: every unit is loaded, none solved;

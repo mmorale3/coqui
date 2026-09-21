@@ -53,6 +53,7 @@
  * through the sparse-node transform).
  */
 
+#include <set>
 #include "methods/vertex/vertex_debug.hpp"
 namespace methods {
 namespace solvers {
@@ -85,6 +86,12 @@ namespace solvers {
       nda::array<double, 1> eps_ref;     // the pole node set the reference dump was built on (must equal the run's: same beta / wmax / prec)
       std::map<long, nda::array<ComplexType, 3>> wk;   // per sampled node m: W_kappa(a, j, tau) = sum_m' Ttw(tau, m') R_a(m', m) kappa_aj(m')
       bool sampled = false;              // the weights are the sampled-mode ones (the driver then accepts a node subset)
+      // P3 (vertex_perf_plan.md): a SHARED hook lives across two driver calls -- the P-side readout (nu >= 0 nodes) and the
+      // Sigma-side call (the remaining nodes) -- so the accumulators must survive a second init, and the deposits are
+      // restricted to the nodes of the Sigma node set (nodes_active; empty = every node the driver runs)
+      bool initialized = false;
+      std::set<long> nodes_active;
+      std::vector<long> nodes_done;      // the nodes deposited by the calls so far (the next call runs the rest)
       // dump mode: the per-node objects (before any weighting), for the nu-basis of a later sampled run
       bool dump = false;
       nda::array<ComplexType, 6> Hc_n;   // (nw_b, ns, nt, nk, nc, nc): the merged cst + U object per node
@@ -111,6 +118,11 @@ namespace solvers {
       double conv_kf = -1.0, conv_kf_neg = -1.0, conv_g = -1.0, fam1_ext = 0.0;
       long nunits = 0, nblocks = 0;
       void init(long nt, long ns, long nk, long np_, long nc, dynbse::freq_basis const &b, long nw_b) {
+        if (initialized) {   // P3: the second driver call of a shared hook keeps the accumulators
+          utils::check(np == np_ and S_cst.shape(0) == nt and S_cst.shape(3) == nc, "sigma_dyn_hook: a shared hook re-initialized with other sizes.");
+          return;
+        }
+        initialized = true;
         np = np_;
         ibz = (symc != nullptr and symc->active and ibz);
         const long nk_full = nk;
@@ -355,6 +367,7 @@ namespace solvers {
       utils::check(h.np == np, "sigma_dyn_accumulate: basis size changed ({} vs {}).", np, h.np);
       utils::check(not h.poles or not h.ibz, "sigma_dyn_accumulate: the pole route has no IBZ fold.");
       if (h.poles) { sigma_dyn_accumulate_poles(h, b, P, inu, res, Ks, Dc, N0, N1, Wout, G_CC, kpq, is, iq, m, tools); return; }
+      if (not h.nodes_active.empty() and h.nodes_active.count(m) == 0) return;   // P3: a node outside the Sigma node set (the P-side call)
       h.begin_block(is, iq, m);
       if (not h.pre_ok) sigma_dyn_precompute(h, b, G_CC, tools);
       utils::check(h.eps_pre.shape(0) == b.eps.shape(0) and nda::max_element(nda::abs(h.eps_pre - b.eps)) == 0.0,

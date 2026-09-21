@@ -877,9 +877,9 @@ namespace solvers {
       if (opt.sigma != nullptr) {
         utils::check(not wan, "pair_space_ladder_dyn: the Sigma hook needs the aux-frame legs (not the Wannier-pair frame).");
         utils::check(not opt.bubble_only, "pair_space_ladder_dyn: the Sigma hook needs the solve (bubble_only set).");
-        utils::check(long(nu_list.size()) == nw_b or opt.sigma->sampled,
-                     "pair_space_ladder_dyn: the Sigma hook needs EVERY bosonic node ({} of {} given) unless sampled weights are set.",
-                     nu_list.size(), nw_b);
+        utils::check(long(nu_list.size()) == nw_b or opt.sigma->sampled or not opt.sigma->nodes_active.empty() or opt.sigma->initialized,
+                     "pair_space_ladder_dyn: the Sigma hook needs EVERY bosonic node ({} of {} given) unless sampled weights are set "
+                     "(or the hook is a P3 shared one: its node set over the P-side call and the Sigma-side call).", nu_list.size(), nw_b);
         utils::check(opt.dump_prefix.empty(), "pair_space_ladder_dyn: the Sigma hook and the unit dump/restart are exclusive.");
         opt.sigma->init(nt, ns, nk, np, nc, b, nw_b);
         if (rank == 0)
@@ -2117,9 +2117,15 @@ namespace solvers {
     if (auto u = vertex_debug::get("dynbse_union"); u.has_value()) o.union_nodes = (std::atoi(u->c_str()) != 0);   // vertex_debug: dynbse_union = 0 | 1
     o.readout_tol = 1e-6;
     o.q_subset = std::addressof(qsel);
+    if (_shared_hook != nullptr and not bubble_only) {   // P3: the Sigma hook armed by arm_shared_sigma_hook rides the main solve
+      utils::check(o.dump_prefix.empty(), "vertex_t::eval_pol_dynbse_cut: the shared Sigma hook and the unit dump are exclusive.");
+      utils::check(qsel.size() == size_t(nq), "vertex_t::eval_pol_dynbse_cut: the shared Sigma hook needs every transfer (no q subset).");
+      o.sigma = std::static_pointer_cast<vd::sigma_dyn_hook>(_shared_hook).get();
+    }
     vd::dyn_meter met;
     vd::pair_space_ladder_dyn(G_CC, _Xb_skma, _W0b_qmm.value(), wb_cache(), kmq, kpq, tools, nus,
                               &Ps, nullptr, &Pg, &Pd, mpi->comm.rank(), mpi->comm.size(), o, &met, symc);
+    if (o.sigma != nullptr) { o.sigma->flush_unit(); o.sigma = nullptr; }   // P3: the last unit's star fold; the cut_r1 pass carries no hook
     if (_dyn_cut_r1 and not bubble_only) {
       vd::dyn_opts o1 = o;
       o1.one_rung_only = true;
@@ -2175,45 +2181,54 @@ namespace solvers {
   }
 
 
-  /**
-   * LFF-Sigma L-7: the DYNAMIC-rung vertex in Sigma (vertex_sigma_dyn.icc), on the READOUT instance: the dynamic-rung
-   * ladder solver of eval_pol_dynbse_cut on EVERY bosonic node (both signs) x every transfer, with the Sigma hook armed;
-   * opt.col selects static_dyn | dyn1_bare | dyn1 | dyn (the solver mode follows: static_only | one_rung_only |
-   * gamma1_only | full GMRES). dSig OUT: (nt, ns, nk, nc, nc), replicated, Hermitized in (i, j) when opt.hermitize.
-   */
-  void vertex_t::eval_sigma_pair_dyn(MBState &mb_state, THC_ERI auto &thc, sigma_pair_opts const &opt,
-                                     nda::array<ComplexType, 5> &dSig, sigma_pair_meter *met) {
-    decltype(nda::range::all) all;
+  long vertex_t::arm_shared_sigma_hook(MBState &mb_state, THC_ERI auto &thc, sigma_pair_opts const &opt, std::vector<long> const &p_nodes) {
     namespace vd = vertex_dynbse_detail;
-    vertex_ladder_detail::prof_watch twatch;
-    utils::check(active() and secondary(), "vertex_t::eval_sigma_pair_dyn: requires an ACTIVE secondary-basis vertex (the readout instance).");
-    utils::check(not _wannier, "vertex_t::eval_sigma_pair_dyn: the dynamic pair-resolved Sigma vertex runs in the band (window) frame only.");
-    utils::check(_W0b_qmm.has_value(), "vertex_t::eval_sigma_pair_dyn: W0bar is absent -- build_w0 must run first.");
-    utils::check(opt.col == "static_dyn" or opt.col == "dyn1_bare" or opt.col == "dyn1" or opt.col == "dyn",
-                 "vertex_t::eval_sigma_pair_dyn: unknown column \"{}\" (static_dyn | dyn1_bare | dyn1 | dyn).", opt.col);
-    utils::check(opt.outer == "dynamic" or opt.outer == "static", "vertex_t::eval_sigma_pair_dyn: unknown outer W \"{}\".", opt.outer);
-    auto MF = thc.MF();
-    auto mpi = thc.mpi();
-    if (not has_cached_w()) {
-      app_log(1, "  [LFF-Sigma dyn] folding this iteration's W into the W-bar cache (cache_w on demand).");
-      cache_w(mb_state, thc);
+    _shared_hook.reset();
+    // the P-side solve is the resummed one (or Gamma_1 only with pol_vertex_dyn_gamma1_only): the amplitude it deposits is the
+    // Sigma column's only for col = dyn (resummed) or dyn1 (Gamma_1); the other columns keep their own solves
+    const bool compatible = (opt.col == "dyn1" and _dyn_gamma1_only) or (opt.col == "dyn" and not _dyn_gamma1_only);
+    if (not compatible) {
+      if (opt.col == "dyn1" or opt.col == "dyn")
+        app_log(1, "  [LFF-Sigma dyn] P3: pol_vertex_sigma_share ignored -- the P-side solve is {} and the Sigma column is {} (separate solves)",
+                _dyn_gamma1_only ? "Gamma_1 only" : "resummed", opt.col);
+      return 0;
     }
+    utils::check(not _dyn_dump, "vertex_t::arm_shared_sigma_hook: pol_vertex_sigma_share and the unit dump/restart are exclusive.");
+    auto MF = thc.MF();
+    if (not has_cached_w()) cache_w(mb_state, thc);
     nda::array<ComplexType, 5> G_CC;
     nda::array<long, 2> kmq, kpq;
     vertex_sym::sym_ctx const *symc = nullptr;
     ladder_inputs(mb_state, thc, G_CC, kmq, kpq, symc);
     const bool sym_ = (symc != nullptr and symc->active);
-    utils::check(sym_ or MF->nkpts() == MF->nkpts_ibz(), "vertex_t::eval_sigma_pair_dyn: a symmetry-reduced mesh without a symmetry context.");
-    utils::check(not sym_ or opt.ibz, "vertex_t::eval_sigma_pair_dyn: a symmetric mesh needs pol_vertex_sigma_pair_ibz = true (P1: the IBZ solve + star fold).");
-    const nda::array<double, 2> kc(MF->kpts_crystal());
     auto tools_h = vd::make_dyn_tools(*_ft, _dyn_iaft_prec, G_CC);
     auto &tools = *tools_h.tools;
-    utils::check(tools.nw_b == _ft->nw_b() and tools.nt_f == _ft->nt_f(),
-                 "vertex_t::eval_sigma_pair_dyn: the Sigma hook needs the LOOP's grid (pol_vertex_dyn_iaft_prec must not refine it).");
-    const long nq = long(_W0b_qmm.value().shape(0)), nw_b = tools.nw_b, nt_l = tools.nt_f;
-    std::vector<long> nus, qs(static_cast<size_t>(nq));
-    for (long iq = 0; iq < nq; ++iq) qs[size_t(iq)] = iq;
-    vd::sigma_dyn_hook hook;
+    std::vector<long> nus;
+    auto hook = std::make_shared<vd::sigma_dyn_hook>();
+    prepare_sigma_dyn_hook(*hook, opt, thc, tools, symc, sym_, nus);
+    // the P-side nodes that belong to the Sigma node set are deposited by the P-side call
+    std::vector<long> shared;
+    for (long m : p_nodes) if (std::find(nus.begin(), nus.end(), m) != nus.end()) shared.push_back(m);
+    if (shared.empty()) return 0;
+    hook->nodes_active = std::set<long>(shared.begin(), shared.end());
+    hook->nodes_done = shared;
+    _shared_hook = hook;
+    _shared_hook_nodes = nus;
+    _shared_hook_col = opt.col; _shared_hook_outer = opt.outer;
+    app_log(1, "  [LFF-Sigma dyn] P3: the Sigma hook armed on the P-side readout for {} of its {} nodes ({} Sigma nodes in total)",
+            shared.size(), p_nodes.size(), nus.size());
+    return long(shared.size());
+  }
+
+  /** P3: the Sigma hook's preparation (the column, the outer W, the sym context, the sampled-mode weights from the reference
+   *  dump, the node list `nus` it will run on) -- shared by eval_sigma_pair_dyn and arm_shared_sigma_hook. */
+  void vertex_t::prepare_sigma_dyn_hook(vertex_dynbse_detail::sigma_dyn_hook &hook, sigma_pair_opts const &opt, THC_ERI auto &thc,
+                                        vertex_pi::iaft_tools const &tools, vertex_sym::sym_ctx const *symc, bool sym_,
+                                        std::vector<long> &nus) {
+    decltype(nda::range::all) all;
+    auto mpi = thc.mpi();
+    const long nw_b = tools.nw_b, nt_l = tools.nt_f;
+    namespace vd = vertex_dynbse_detail;
     hook.col = opt.col;
     hook.outer = opt.outer;
     hook.dump = opt.dyn_dump;
@@ -2323,6 +2338,64 @@ namespace solvers {
       nus.resize(static_cast<size_t>(nw_b));
       for (long l = 0; l < nw_b; ++l) nus[size_t(l)] = l;
     }
+  }
+
+  /**
+   * LFF-Sigma L-7: the DYNAMIC-rung vertex in Sigma (vertex_sigma_dyn.icc), on the READOUT instance: the dynamic-rung
+   * ladder solver of eval_pol_dynbse_cut on EVERY bosonic node (both signs) x every transfer, with the Sigma hook armed;
+   * opt.col selects static_dyn | dyn1_bare | dyn1 | dyn (the solver mode follows: static_only | one_rung_only |
+   * gamma1_only | full GMRES). dSig OUT: (nt, ns, nk, nc, nc), replicated, Hermitized in (i, j) when opt.hermitize.
+   */
+  void vertex_t::eval_sigma_pair_dyn(MBState &mb_state, THC_ERI auto &thc, sigma_pair_opts const &opt,
+                                     nda::array<ComplexType, 5> &dSig, sigma_pair_meter *met) {
+    decltype(nda::range::all) all;
+    namespace vd = vertex_dynbse_detail;
+    vertex_ladder_detail::prof_watch twatch;
+    utils::check(active() and secondary(), "vertex_t::eval_sigma_pair_dyn: requires an ACTIVE secondary-basis vertex (the readout instance).");
+    utils::check(not _wannier, "vertex_t::eval_sigma_pair_dyn: the dynamic pair-resolved Sigma vertex runs in the band (window) frame only.");
+    utils::check(_W0b_qmm.has_value(), "vertex_t::eval_sigma_pair_dyn: W0bar is absent -- build_w0 must run first.");
+    utils::check(opt.col == "static_dyn" or opt.col == "dyn1_bare" or opt.col == "dyn1" or opt.col == "dyn",
+                 "vertex_t::eval_sigma_pair_dyn: unknown column \"{}\" (static_dyn | dyn1_bare | dyn1 | dyn).", opt.col);
+    utils::check(opt.outer == "dynamic" or opt.outer == "static", "vertex_t::eval_sigma_pair_dyn: unknown outer W \"{}\".", opt.outer);
+    auto MF = thc.MF();
+    auto mpi = thc.mpi();
+    if (not has_cached_w()) {
+      app_log(1, "  [LFF-Sigma dyn] folding this iteration's W into the W-bar cache (cache_w on demand).");
+      cache_w(mb_state, thc);
+    }
+    nda::array<ComplexType, 5> G_CC;
+    nda::array<long, 2> kmq, kpq;
+    vertex_sym::sym_ctx const *symc = nullptr;
+    ladder_inputs(mb_state, thc, G_CC, kmq, kpq, symc);
+    const bool sym_ = (symc != nullptr and symc->active);
+    utils::check(sym_ or MF->nkpts() == MF->nkpts_ibz(), "vertex_t::eval_sigma_pair_dyn: a symmetry-reduced mesh without a symmetry context.");
+    utils::check(not sym_ or opt.ibz, "vertex_t::eval_sigma_pair_dyn: a symmetric mesh needs pol_vertex_sigma_pair_ibz = true (P1: the IBZ solve + star fold).");
+    const nda::array<double, 2> kc(MF->kpts_crystal());
+    auto tools_h = vd::make_dyn_tools(*_ft, _dyn_iaft_prec, G_CC);
+    auto &tools = *tools_h.tools;
+    utils::check(tools.nw_b == _ft->nw_b() and tools.nt_f == _ft->nt_f(),
+                 "vertex_t::eval_sigma_pair_dyn: the Sigma hook needs the LOOP's grid (pol_vertex_dyn_iaft_prec must not refine it).");
+    const long nq = long(_W0b_qmm.value().shape(0)), nw_b = tools.nw_b, nt_l = tools.nt_f;
+    std::vector<long> nus, qs(static_cast<size_t>(nq));
+    for (long iq = 0; iq < nq; ++iq) qs[size_t(iq)] = iq;
+    // ---- the hook (P3: a hook armed by arm_shared_sigma_hook on the P-side call is reused; its nodes are skipped) --------
+    std::shared_ptr<vd::sigma_dyn_hook> hook_h;
+    const bool shared_in = (_shared_hook != nullptr and _shared_hook_col == opt.col and _shared_hook_outer == opt.outer);
+    if (shared_in) {
+      hook_h = std::static_pointer_cast<vd::sigma_dyn_hook>(_shared_hook);
+      _shared_hook.reset();
+      nus = _shared_hook_nodes;
+      utils::check(hook_h->symc == symc and hook_h->ibz == (sym_ and opt.ibz), "vertex_t::eval_sigma_pair_dyn: the shared hook was armed for another mesh context.");
+      std::vector<long> rest;
+      for (long m : nus) if (std::find(hook_h->nodes_done.begin(), hook_h->nodes_done.end(), m) == hook_h->nodes_done.end()) rest.push_back(m);
+      app_log(1, "  [LFF-Sigma dyn] P3 shared hook: {} of {} nodes deposited by the P-side readout, {} left for this call", nus.size() - rest.size(), nus.size(), rest.size());
+      hook_h->nodes_active.clear();
+      nus = rest;
+    } else {
+      hook_h = std::make_shared<vd::sigma_dyn_hook>();
+      prepare_sigma_dyn_hook(*hook_h, opt, thc, tools, symc, sym_, nus);
+    }
+    vd::sigma_dyn_hook &hook = *hook_h;
     vd::dyn_opts o;
     o.kcrys = std::addressof(kc);
     o.shm_mpi = (_wcache == "shared") ? mpi.get() : nullptr;   // P19: node-shared W_d tables with the shared cache
@@ -2347,8 +2420,9 @@ namespace solvers {
     o.sigma = std::addressof(hook);
     if (opt.dyn_ckpt_minutes > 0.0) { o.sigma_ckpt = mb_state.coqui_prefix + ".sigdyn_ckpt"; o.sigma_ckpt_minutes = opt.dyn_ckpt_minutes; }   // P20
     vd::dyn_meter dmet;
-    vd::pair_space_ladder_dyn(G_CC, _Xb_skma, _W0b_qmm.value(), wb_cache(), kmq, kpq, tools, nus,
-                              nullptr, nullptr, nullptr, nullptr, mpi->comm.rank(), mpi->comm.size(), o, &dmet, symc);
+    if (not nus.empty())
+      vd::pair_space_ladder_dyn(G_CC, _Xb_skma, _W0b_qmm.value(), wb_cache(), kmq, kpq, tools, nus,
+                                nullptr, nullptr, nullptr, nullptr, mpi->comm.rank(), mpi->comm.size(), o, &dmet, symc);
     hook.flush_unit();                                               // P1: the last unit's star fold
     mpi->comm.all_reduce_in_place_n(hook.S_cst.data(), hook.S_cst.size(), std::plus<>{});
     mpi->comm.all_reduce_in_place_n(hook.RT.data(), hook.RT.size(), std::plus<>{});
