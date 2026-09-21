@@ -1364,6 +1364,57 @@ namespace bdft_tests {
       return;
     }
     if (std::getenv("COQUI_DYNBSE_TEST_WINT")) { wint_gate(mf, eri, "nosym"); return; }
+    if (std::getenv("COQUI_DYNBSE_TEST_SIGINTERP")) {
+      // ---- P16 (vertex_perf_plan.md): the Wannier-frame interpolation of the pair Sigma vertex, same-mesh identity -------------
+      //  I0  the pair vertex (window [0, 2) = the LiH projector's window, col static1, outer static) that DUMPS the Wannier-frame
+      //      object with its R grid (pol_vertex_sigma_interp_dump = lih_wan.h5)
+      //  I1  the same run CONSUMING I0's dump on the same mesh with the same projector: k -> R -> k is the identity on the coarse
+      //      mesh and the projector is unitary on its window, so dSigma (hence Sigma) must be reproduced to rounding
+      using S5 = nda::array<std::complex<double>, 5>;
+      auto [outdir_w, prefix_w] = utils::utest_filename("qe_lih222");
+      const std::string wan = outdir_w + "/lih_wan.h5";
+      REQUIRE(std::filesystem::exists(wan));
+      auto run_si = [&](std::string const &tag, std::string const &dump_proj, std::string const &interp, std::string const &proj_f, S5 &Sig) {
+        const std::string out = "coqui_d3_siginterp_" + tag;
+        solvers::hf_t hf; solvers::gw_t gw(&ft, "ignore_g0", out);
+        solvers::scr_coulomb_t scr_eri(&ft, "rpa", "ignore_g0");
+        simple_dyson dyson(mf.get(), &ft); MBState mb_state(mpi_context, ft, out);
+        iter_scf::iter_scf_t iter_sol("damping");
+        solvers::vertex_t vtx(&ft, "none", nda::range(0, 0), mf->nbnd());
+        vtx.set_pol_vertex("ladder", "w0_prev", nda::range(0, 2), -1, 1e-8, -1.0, -1.0, -1.0, "none");
+        vtx.set_ladder_rung("static", 1e-8, 30, 12, -1.0);
+        vtx.set_isdf_points("", true);
+        vtx.set_sigma_pair(true, "static1", "static", 1.0, true, false, "right");
+        vtx.set_sigma_interp(dump_proj, interp, proj_f);
+        scr_eri.set_vertex(&vtx);
+        const double e_corr = std::get<1>(scf_loop(mb_state, dyson, eri, ft, solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol, 1, false, 1e-9, true));
+        mpi_context->comm.barrier();
+        { h5::file f(out + ".mbpt.h5", 'r'); h5::group g(f); auto it = g.open_group("scf").open_group("iter1"); nda::h5_read(it, "Sigma_tskij", Sig); }
+        app_log(1, "dynbse_readout LFF-Sigma INTERP [{}]: e_corr {:.12f}, max|dSigma| {:.6e}", tag, e_corr, scr_eri.sigma_pair_meter()[0]);
+        mpi_context->comm.barrier();
+        return e_corr;
+      };
+      S5 S0, S1;
+      const double c0 = run_si("I0", wan, "", "", S0);
+      REQUIRE(std::filesystem::exists("coqui_d3_siginterp_I0.sigpair_wan.h5"));
+      const double c1 = run_si("I1", "", "coqui_d3_siginterp_I0.sigpair_wan.h5", wan, S1);
+      double d = 0.0, n = 0.0;
+      for (long it = 0; it < S0.shape(0); ++it)
+        for (long is = 0; is < S0.shape(1); ++is)
+          for (long ik = 0; ik < S0.shape(2); ++ik)
+            for (long i = 0; i < 2; ++i)
+              for (long j = 0; j < 2; ++j) { d = std::max(d, std::abs(S0(it, is, ik, i, j) - S1(it, is, ik, i, j))); n = std::max(n, std::abs(S0(it, is, ik, i, j))); }
+      app_log(1, "dynbse_readout LFF-Sigma INTERP gate (P16): the Wannier-frame dump consumed on the same mesh vs the solve: max |dSigma| {:.2e} "
+                 "(max |Sigma| {:.3e}); e_corr {:+.12f} vs {:+.12f} (|d| {:.1e})", d, n, c1, c0, std::abs(c1 - c0));
+      REQUIRE(d < 1e-10 * n);
+      REQUIRE(std::abs(c1 - c0) < 1e-10);
+      mpi_context->comm.barrier();
+      if (mpi_context->comm.root())
+        for (auto const &e : std::filesystem::directory_iterator("."))
+          if (e.path().filename().string().rfind("coqui_d3_siginterp_", 0) == 0) std::filesystem::remove(e.path());
+      mpi_context->comm.barrier();
+      return;
+    }
     if (std::getenv("COQUI_DYNBSE_TEST_CHAIN")) {
       // ---- P18 (vertex_perf_plan.md, 2026-09-21): the in-process vertex chain == the scripted chain of one-iteration restarts.
       //  CA  the seed: a dynamic Gamma_1 run (1 iteration) that dumps its points and its all-nu object CA.g1

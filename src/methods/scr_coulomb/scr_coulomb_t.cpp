@@ -30,6 +30,7 @@
 #include "methods/HF/thc_solver_comm.hpp"
 #include "methods/GW/g0_div_utils.hpp"
 #include "methods/vertex/vertex_t.h"
+#include "methods/vertex/vertex_sigma_interp.hpp"
 #include "methods/vertex/nu_sampling.hpp"
 #include "methods/vertex/vertex_secondary_fold.hpp"
 #include "utilities/proc_grid_partition.hpp"
@@ -2784,8 +2785,24 @@ namespace solvers {
     }
     nda::array<ComplexType, 5> dS;
     vertex_t::sigma_pair_meter met;
-    if (dyn) _pol_vtx->eval_sigma_pair_dyn(mb_state, thc, o, dS, &met);   // L-7: the dynamic-rung ladder in Sigma
+    const long w0 = _pol_vtx->band_window().first(), ncw = long(_pol_vtx->band_window().size());
+    nda::array<double, 1> tau_f(_ft->tau_mesh_f());
+    if (not _vertex->sigma_interp_file().empty()) {
+      // P16: the fine consumer -- the coarse run's Wannier-frame dSigma interpolated onto this mesh's window (no solve)
+      ladder_meter::watch iw;
+      utils::check(not _vertex->sigma_interp_projector().empty(), "build_sigma_pair: pol_vertex_sigma_interp_file needs pol_vertex_sigma_interp_projector (this mesh's Wannier file).");
+      projector_t proj_f(*thc.MF(), _vertex->sigma_interp_projector());
+      dS = vertex_sigma_interp::interpolate_sigma_pair(*thc.MF(), proj_f, _vertex->sigma_interp_file(), tau_f, _ft->beta(), w0, ncw, thc.mpi()->comm);
+      for (auto const &v : dS) met.dsig_max = std::max(met.dsig_max, std::abs(v));
+      met.dsig_herm = 0.0; met.ks_herm = 0.0; met.t_total = iw.lap();
+    } else if (dyn) _pol_vtx->eval_sigma_pair_dyn(mb_state, thc, o, dS, &met);   // L-7: the dynamic-rung ladder in Sigma
     else _pol_vtx->eval_sigma_pair(mb_state, thc, o, dS, &met);
+    if (not _vertex->sigma_interp_dump().empty() and _vertex->sigma_interp_file().empty()) {
+      // P16: the coarse producer -- dSigma downfolded to the Wannier frame with its k list and R grid, for a finer mesh
+      projector_t proj_c(*thc.MF(), _vertex->sigma_interp_dump());
+      const std::string fn = mb_state.coqui_prefix + ".sigpair_wan.h5";
+      vertex_sigma_interp::dump_sigma_pair_wannier(*thc.MF(), proj_c, dS, w0, tau_f, _ft->beta(), thc.mpi()->comm, fn, o.col, o.outer);
+    }
     if (_vertex->sigma_pair_diag() and thc.mpi()->comm.root()) {
       const std::string fn = mb_state.coqui_prefix + ".sigpair.h5";
       h5::file f(fn, 'w');

@@ -942,6 +942,9 @@ namespace vertex_pi { struct iaft_tools; }
     std::string _sigma_dyn_refit = "fit";        // pol_vertex_sigma_dyn_refit: fit | union (P12)
     double _sigma_dyn_refit_rtol = 1e-8;         // pol_vertex_sigma_dyn_refit_rtol (P12)
     bool _sigma_share = false;                   // pol_vertex_sigma_share: one solve feeds the P readout and the Sigma deposits (P3)
+    std::string _sigma_interp_dump;              // pol_vertex_sigma_interp_dump: a Wannier projector file -> the coarse run dumps dSigma in the Wannier frame (P16)
+    std::string _sigma_interp_file;              // pol_vertex_sigma_interp_file: the coarse run's dump the fine run consumes instead of solving (P16)
+    std::string _sigma_interp_projector;         // pol_vertex_sigma_interp_projector: the fine mesh's Wannier projector file (P16)
     std::string _sigma_dyn_fit_file;             // pol_vertex_sigma_dyn_fit_file: the reference dump for the sampled mode
     long _sigma_dyn_fit_rank = 0;                // pol_vertex_sigma_dyn_fit_rank: K (0 = the number of sampled nodes)
     double _sigma_lff_pinv_tol = 1e-3;      // pol_vertex_sigma_pinv_tol: relative eigenvalue cutoff of Pi_0^-1 -- the vertex lives on the
@@ -1697,6 +1700,16 @@ namespace vertex_pi { struct iaft_tools; }
      *  W-bar cache within one update, so the shared units are identical solves (not only at self-consistency). */
     void set_sigma_share(bool on) { _sigma_share = on; }
     bool sigma_share() const { return _sigma_share; }
+    /** P16 (vertex_sigma_interp.hpp): the coarse -> fine interpolation of the pair-resolved Sigma vertex in the Wannier frame.
+     *  The coarse (NOSYM) run sets pol_vertex_sigma_interp_dump = <its Wannier projector file> and writes
+     *  <prefix>.sigpair_wan.h5; the fine run sets pol_vertex_sigma_interp_file = that dump and
+     *  pol_vertex_sigma_interp_projector = <its own projector file> and consumes it instead of solving. */
+    void set_sigma_interp(std::string const &dump_proj, std::string const &file, std::string const &proj) {
+      _sigma_interp_dump = dump_proj; _sigma_interp_file = file; _sigma_interp_projector = proj;
+    }
+    std::string const &sigma_interp_dump() const { return _sigma_interp_dump; }
+    std::string const &sigma_interp_file() const { return _sigma_interp_file; }
+    std::string const &sigma_interp_projector() const { return _sigma_interp_projector; }
     void set_sigma_pair_ibz(bool on) { _sigma_pair_ibz = on; }
     bool sigma_pair_ibz() const { return _sigma_pair_ibz; }
     /** pol_vertex_sigma_dyn_ckpt_minutes (default 0 = off; P20): every rank writes its partial Sigma accumulators and the
