@@ -16,7 +16,11 @@
  * (interpolate_sigma_pair). Requirements: a NOSYM coarse mesh (the full BZ is what the R transform needs), the same
  * imaginary-axis grid (beta and the tau nodes are checked), a fine projector on the fine mesh whose window is the
  * fine pair vertex's window (nc_f = |W_rng|), unitary projectors (the round trip downfold -> upfold is the identity
- * on the window only then; the measured unitarity defect is reported).
+ * on the window only then; the measured unitarity defect is reported), and -- not checkable here -- the SAME Wannier
+ * functions on both meshes: the Wannier-frame object is covariant under a k-INDEPENDENT unitary of the orbitals (the
+ * upfold undoes it) but not under a k-dependent gauge difference between two separately generated projector files
+ * (notes/CLAUDE.md section 8, demand D2: one U per run). Coarse and fine projectors must come from one Wannierization
+ * (the fine one by interpolation of the coarse MLWFs, or both from a common set with the same projections and gauge).
  */
 
 #include <string>
