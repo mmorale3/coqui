@@ -21,6 +21,19 @@ target_link_libraries(test_${TEST_ID} catch_main utils numerics meanfield scf_li
 add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
 set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR})
 
+# P25 / G32 (notes/vertex_perf_plan.md): the small-q fit of epsilon_inf (eps_inf_fit = true), the
+# pure function of methods/scr_coulomb/eps_inf_fit.hpp alone -- synthetic eps(q) = eps_inf + A q^2
+# (+ B q^4) recovered to round-off, q = 0 excluded, the degenerate inputs refused. Header-only math:
+# no fixture, no MPI, builds and runs in every configuration. Separate executable so the existing
+# suites keep their exact tallies.
+set(TEST_ID methods_eps_inf_fit)
+
+add_executable(test_${TEST_ID} test_eps_inf_fit.cpp)
+target_link_libraries(test_${TEST_ID} catch_main utils numerics)
+
+add_mpi_unit_test(test_${TEST_ID} "${PROJECT_UNIT_TEST_DIR}/test_${TEST_ID}" ${CTEST_NPROC})
+set_tests_properties(test_${TEST_ID} PROPERTIES WORKING_DIRECTORY ${PROJECT_UNIT_TEST_DIR})
+
 # increment TC-2 (notes/tc_coqui_impl_spec.md, spec M3): P on the tilted contour --
 # the complex-time ISDF kernel against the production imaginary-axis Pi, at t = -i tau
 # (the contraction) and through the tilted transform at z = i nu (the M3 gate), plus

@@ -289,6 +289,45 @@ namespace solvers {
                  "    epsilon_inf = {:.6f}   [eps^-1_head(inu=0) = {:.6e} {:+.6e}i]\n",
               eps_inf, eps_inv_static.real(), eps_inv_static.imag());
     }
+    // P25 / G32 (notes/vertex_perf_plan.md; [gw] eps_inf_fit = true, default off): epsilon_inf from the
+    // SMALL-q FIT eps_M(q) = eps_inf + A |q|^2 (+ B |q|^4) of the loop's OWN static dielectric function
+    // on the smallest nonzero |q| of the IBZ mesh -- eps_M(q) = 1 / (1 + Re[eps^-1_{00}(q, i nu = 0) - 1])
+    // from eps_inv_head_q (the q-resolved head of THIS dW, div_treatment-independent), reported next to
+    // the stored head above as the check of the div_treatment's q -> 0 recipe. Report-only, all ranks
+    // evaluate the same replicated numbers; off = bitwise fallthrough of every existing line and dataset.
+    std::optional<eps_fit::eps_inf_fit_t> eps_inf_fit_res;
+    if (_eps_inf_fit) {
+      eps_inf_fit_res = eval_eps_inf_fit(eps_inv_head_q, *thc.MF());
+      auto const &f = eps_inf_fit_res.value();
+      // the stored head's epsilon_inf (the line above), recomputed here so that block stays untouched
+      double eps_inf_head = 0.0;
+      {
+        long nw_half = (_ft->nw_b() % 2 == 0) ? _ft->nw_b() / 2 : _ft->nw_b() / 2 + 1;
+        nda::array<ComplexType, 2> eih_w(nw_half, 1);
+        auto eih_t = nda::reshape(eps_inv_head, shape_t<2>{eps_inv_head.shape(0), 1});
+        _ft->tau_to_w_PHsym(eih_t, eih_w);
+        eps_inf_head = 1.0 / (1.0 + eih_w(0, 0).real());
+      }
+      if (f.ok) {
+        std::string qs, bs;
+        for (size_t i = 0; i < f.q_used.size(); ++i) {
+          char buf[48];
+          std::snprintf(buf, sizeof(buf), "%s%.6f", (i == 0) ? "" : ", ", f.q_used[i]);
+          qs += buf;
+        }
+        if (f.degree >= 2) {
+          char buf[48];
+          std::snprintf(buf, sizeof(buf), ", B = %+.6e", f.coeffs[2]);
+          bs = buf;
+        }
+        app_log(1, "    eps_inf (small-q fit, {} points |q| = {}; degree {} in |q|^2): {:.6f}, "
+                   "A = {:+.6e}{}, residual = {:.3e}   [stored head - fit = {:+.6e}]\n",
+                f.q_used.size(), qs, f.degree, f.eps_inf, f.coeffs[1], bs, f.residual,
+                eps_inf_head - f.eps_inf);
+      } else {
+        app_log(1, "    eps_inf (small-q fit): skipped -- fewer than 2 distinct nonzero |q| on the IBZ mesh.\n");
+      }
+    }
 
     // scGW-tilde L2: the ladder eps_M readout (report-only; see pol_ladder_eps_readout).
     // Q3: eps_inv_head_q carries the loop's OWN q-resolved head, so the readout also
@@ -330,7 +369,8 @@ namespace solvers {
     if (h5_iter>=0) {
       dump_eps_inv_head(eps_inv_head_q, eps_inv_head,
                         mb_state.coqui_prefix, h5_iter,
-                        thc.mpi()->comm, *thc.MF());
+                        thc.mpi()->comm, *thc.MF(),
+                        eps_inf_fit_res.has_value() ? std::addressof(eps_inf_fit_res.value()) : nullptr);
       // Q4 C3: publish the ladder half of the eq-7 bosonic DC next to the other scf/iter
       // outputs so BOTH consumers can read it -- python's DC assembly (weiss.py) and the
       // C++ bosonic closure (downfold_edmft_impl). Written only when THIS update_w
@@ -2470,7 +2510,8 @@ namespace solvers {
   void scr_coulomb_t::dump_eps_inv_head(const nda::ArrayOfRank<2> auto &eps_inv_head_tq,
                                         const nda::ArrayOfRank<1> auto &eps_inv_head_t,
                                         std::string coqui_h5_prefix, long iter,
-                                        comm_t &comm, mf::MF &mf) {
+                                        comm_t &comm, mf::MF &mf,
+                                        eps_fit::eps_inf_fit_t const *fit) {
     if (comm.root()) {
       long nw_half = (_ft->nw_b() % 2 == 0) ? _ft->nw_b() / 2 : _ft->nw_b() / 2 + 1;
       nda::array<ComplexType, 2> eps_inv_head_wq(nw_half, mf.nqpts_ibz());
@@ -2505,8 +2546,43 @@ namespace solvers {
       double epsilon_inf = 1.0 / (1.0 + eps_inv_head_w(0).real());
       nda::h5_write(iter_grp, "eps_head_w", eps_head_w, false);
       h5::h5_write(iter_grp, "epsilon_inf", epsilon_inf);
+      // P25 / G32 (eps_inf_fit = true): the small-q fit next to the stored head -- the constant term,
+      // the coefficients c_k of eps_M(q) = sum_k c_k |q|^{2k}, the |q| and eps_M(q) used, the RMS misfit.
+      if (fit != nullptr and fit->ok) {
+        const long ncf = static_cast<long>(fit->coeffs.size()), nqa = static_cast<long>(fit->q_used.size());
+        nda::array<double, 1> cf(ncf), qa(nqa), eu(nqa);
+        for (long i = 0; i < cf.shape(0); ++i) cf(i) = fit->coeffs[size_t(i)];
+        for (long i = 0; i < qa.shape(0); ++i) qa(i) = fit->q_used[size_t(i)];
+        for (long i = 0; i < eu.shape(0); ++i) eu(i) = fit->eps_used[size_t(i)];
+        h5::h5_write(iter_grp, "epsilon_inf_fit", fit->eps_inf);
+        h5::h5_write(iter_grp, "epsilon_inf_fit_residual", fit->residual);
+        nda::h5_write(iter_grp, "epsilon_inf_fit_coeffs", cf, false);
+        nda::h5_write(iter_grp, "epsilon_inf_fit_qabs", qa, false);
+        nda::h5_write(iter_grp, "epsilon_inf_fit_eps", eu, false);
+      }
     }
     comm.barrier();
+  }
+
+  // P25 / G32: eps_M(q) = 1 / (1 + Re[eps^-1_{00}(q, i nu = 0) - 1]) at every IBZ transfer from the
+  // q-resolved tau head, then eps_fit::fit_eps_inf on the smallest nonzero Cartesian |q|. The |q|-only
+  // fit is exact for a cubic cell; for a lower symmetry eps(q -> 0) is direction-dependent and the fit
+  // averages over the directions the smallest IBZ transfers happen to sample (stated in the plan).
+  eps_fit::eps_inf_fit_t scr_coulomb_t::eval_eps_inf_fit(const nda::ArrayOfRank<2> auto &eps_inv_head_tq,
+                                                          mf::MF &mf) const {
+    const long nq = eps_inv_head_tq.shape(1);
+    utils::check(nq == mf.nqpts_ibz(), "eval_eps_inf_fit: eps_inv_head_tq has {} q rows, expected nqpts_ibz = {}.",
+                 nq, mf.nqpts_ibz());
+    long nw_half = (_ft->nw_b() % 2 == 0) ? _ft->nw_b() / 2 : _ft->nw_b() / 2 + 1;
+    nda::array<ComplexType, 2> eih_wq(nw_half, nq);
+    _ft->tau_to_w_PHsym(eps_inv_head_tq, eih_wq);   // i nu = 0 = index 0 of the PH-sym bosonic half grid
+    std::vector<double> q_abs(static_cast<size_t>(nq)), eps_q(static_cast<size_t>(nq));
+    for (long iq = 0; iq < nq; ++iq) {
+      auto qp = mf.Qpts_ibz(iq);                     // Cartesian, bohr^-1, 2 pi included (bz_symmetry.hpp)
+      q_abs[size_t(iq)] = std::sqrt(qp(0) * qp(0) + qp(1) * qp(1) + qp(2) * qp(2));
+      eps_q[size_t(iq)] = 1.0 / (1.0 + eih_wq(0, iq).real());
+    }
+    return eps_fit::fit_eps_inf(q_abs, eps_q, _eps_inf_fit_npts);
   }
 
 
@@ -3035,7 +3111,7 @@ namespace solvers {
   // instantiate templates
   template void scr_coulomb_t::dump_eps_inv_head(
       const nda::array<ComplexType,2> &, const nda::array<ComplexType,1> &,
-      std::string, long, mpi3::communicator &, mf::MF &);
+      std::string, long, mpi3::communicator &, mf::MF &, eps_fit::eps_inf_fit_t const *);
 
 
 }  // solvers
