@@ -19,6 +19,7 @@
  */
 
 
+#include <filesystem>
 #include <unordered_set>
 #include <sstream>
 #include <fstream>
@@ -177,6 +178,19 @@ namespace solvers {
 
     utils::check(thc.mpi() == mb_state.mpi,
                  "scr_coulomb_t::update_w: THC_ERI and MBState should have the same MPI context.");
+    // P18 (vertex_perf_plan.md): the in-process vertex chain. From the second dynamic readout on, the injected all-nu
+    // object is the dump THIS run wrote at the previous update (the scripted chains' "restart + inject the previous run's
+    // dump", without the restart); the user's pol_vertex_interp_file seeds the first update. Every consumer reads the
+    // file name from the vertex objects, so the substitution is made here, once per update.
+    if (h5_iter >= 0 and _vertex != nullptr and _vertex->pol_chain() and _pol_dyn_calls > 0) {
+      utils::check(_pol_vtx != nullptr and _pol_vtx->ladder_dyn_all_nu(),
+                   "scr_coulomb_t::update_w: pol_vertex_chain needs the all-nu dump (pol_vertex_dyn_all_nu = true).");
+      const std::string prev = mb_state.coqui_prefix + ".pol_wh_dyn.g" + std::to_string(_pol_dyn_calls) + ".h5";
+      utils::check(std::filesystem::exists(prev), "scr_coulomb_t::update_w: pol_vertex_chain: the previous update's dump {} is missing.", prev);
+      _vertex->set_pol_interp(prev, _vertex->pol_interp_col());
+      _pol_vtx->set_pol_interp(prev, _pol_vtx->pol_interp_col());
+      app_log(1, "  [vertex chain] update {}: injecting this run's previous all-nu dump {} (generation {})", h5_iter, prev, _pol_dyn_calls);
+    }
 
     // ---- ISDF-Vertex BOOTSTRAP: a SCREENED rung for Pi^C on the first update ---------
     // Pi^C = -2 dPhi_2^C/dW is a functional of the SCREENED interaction, but on the very
@@ -546,6 +560,7 @@ namespace solvers {
     _pol_vtx->set_isdf_points(_vertex->isdf_points_file(), _vertex->isdf_points_dump());
     _pol_vtx->set_wannier_frame(_vertex->wannier_frame());
     _pol_vtx->set_pol_interp(_vertex->pol_interp_file(), _vertex->pol_interp_col());
+    _pol_vtx->set_pol_chain(_vertex->pol_chain());
     app_log(1, "  [scGW-tilde L2] ladder readout instance: C window = [{}, {}), "
                "secondary rank knob = {}, div_treatment = {} (kernel head follows "
                "build_w0's policy; W0bar is SAME-iteration -- coincides with "

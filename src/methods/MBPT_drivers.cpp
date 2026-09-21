@@ -337,6 +337,8 @@ inline void ensure_checkpoint(std::shared_ptr<mf::MF> mf, std::string const& out
  *                 pol_vertex_dyn_schedule ("longest": the unit order heuristic; "measured": longest-first by the previous
  *                 call's measured unit times -- P5),
  *                 pol_vertex_wcache ("replicated": the W-bar cache once per rank; "shared": once per NUMA node -- P19),
+ *                 pol_vertex_chain (false; true: the in-process vertex chain -- every update after the first injects the
+ *                 all-nu dump this run wrote at the previous update instead of pol_vertex_interp_file -- P18),
  *                 pol_vertex_dyn_dump (false: per-unit dump + restart files
  *                 "<prefix>.dynunits.<tag>.g<call>.r<rank>.bin" of the dynamic solves),
  *                 pol_vertex_dyn_dense (true: the dense per-tau rung K_d(s), nt/2 x D^2 per rank;
@@ -667,6 +669,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
         vertex.set_wcache_mode(io::get_value_with_default<std::string>(pt,"pol_vertex_wcache","replicated"));
         vertex.set_pol_interp(io::get_value_with_default<std::string>(pt,"pol_vertex_interp_file",""),
                            io::get_value_with_default<std::string>(pt,"pol_vertex_interp_col","gam1"));
+        vertex.set_pol_chain(io::get_value_with_default<bool>(pt,"pol_vertex_chain",false));
         vertex.set_ladder_dyn_dense(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_dense",true));
         vertex.set_ladder_dyn_resolvent(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_resolvent","inverse"));
         vertex.set_ladder_dyn_union_stride(io::get_value_with_default<long>(pt,"pol_vertex_dyn_union_stride",1));
@@ -1092,6 +1095,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
         pol_vertex_carrier.set_wcache_mode(io::get_value_with_default<std::string>(pt,"pol_vertex_wcache","replicated"));
         pol_vertex_carrier.set_pol_interp(io::get_value_with_default<std::string>(pt,"pol_vertex_interp_file",""),
                            io::get_value_with_default<std::string>(pt,"pol_vertex_interp_col","gam1"));
+        pol_vertex_carrier.set_pol_chain(io::get_value_with_default<bool>(pt,"pol_vertex_chain",false));
         pol_vertex_carrier.set_ladder_dyn_dense(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_dense",true));
         pol_vertex_carrier.set_ladder_dyn_resolvent(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_resolvent","inverse"));
         pol_vertex_carrier.set_ladder_dyn_union_stride(io::get_value_with_default<long>(pt,"pol_vertex_dyn_union_stride",1));
@@ -1369,6 +1373,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
         pol_vertex_carrier.set_wcache_mode(io::get_value_with_default<std::string>(pt,"pol_vertex_wcache","replicated"));
         pol_vertex_carrier.set_pol_interp(io::get_value_with_default<std::string>(pt,"pol_vertex_interp_file",""),
                            io::get_value_with_default<std::string>(pt,"pol_vertex_interp_col","gam1"));
+        pol_vertex_carrier.set_pol_chain(io::get_value_with_default<bool>(pt,"pol_vertex_chain",false));
         pol_vertex_carrier.set_ladder_dyn_dense(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_dense",true));
         pol_vertex_carrier.set_ladder_dyn_resolvent(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_resolvent","inverse"));
         pol_vertex_carrier.set_ladder_dyn_union_stride(io::get_value_with_default<long>(pt,"pol_vertex_dyn_union_stride",1));
@@ -1692,6 +1697,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
         vertex.set_wcache_mode(io::get_value_with_default<std::string>(pt,"pol_vertex_wcache","replicated"));
         vertex.set_pol_interp(io::get_value_with_default<std::string>(pt,"pol_vertex_interp_file",""),
                            io::get_value_with_default<std::string>(pt,"pol_vertex_interp_col","gam1"));
+        vertex.set_pol_chain(io::get_value_with_default<bool>(pt,"pol_vertex_chain",false));
         vertex.set_ladder_dyn_dense(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_dense",true));
         vertex.set_ladder_dyn_resolvent(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_resolvent","inverse"));
         vertex.set_ladder_dyn_union_stride(io::get_value_with_default<long>(pt,"pol_vertex_dyn_union_stride",1));
@@ -2041,6 +2047,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
         pol_vertex_carrier.set_wcache_mode(io::get_value_with_default<std::string>(pt,"pol_vertex_wcache","replicated"));
         pol_vertex_carrier.set_pol_interp(io::get_value_with_default<std::string>(pt,"pol_vertex_interp_file",""),
                            io::get_value_with_default<std::string>(pt,"pol_vertex_interp_col","gam1"));
+        pol_vertex_carrier.set_pol_chain(io::get_value_with_default<bool>(pt,"pol_vertex_chain",false));
         pol_vertex_carrier.set_ladder_dyn_dense(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_dense",true));
         pol_vertex_carrier.set_ladder_dyn_resolvent(io::get_value_with_default<std::string>(pt,"pol_vertex_dyn_resolvent","inverse"));
         pol_vertex_carrier.set_ladder_dyn_union_stride(io::get_value_with_default<long>(pt,"pol_vertex_dyn_union_stride",1));

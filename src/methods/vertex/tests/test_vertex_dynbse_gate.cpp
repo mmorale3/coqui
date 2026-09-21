@@ -1312,6 +1312,74 @@ namespace bdft_tests {
       return;
     }
     if (std::getenv("COQUI_DYNBSE_TEST_WINT")) { wint_gate(mf, eri, "nosym"); return; }
+    if (std::getenv("COQUI_DYNBSE_TEST_CHAIN")) {
+      // ---- P18 (vertex_perf_plan.md, 2026-09-21): the in-process vertex chain == the scripted chain of one-iteration restarts.
+      //  CA  the seed: a dynamic Gamma_1 run (1 iteration) that dumps its points and its all-nu object CA.g1
+      //  CC  pol_vertex_chain = true, 2 iterations restarted from CA's checkpoint: iteration 1 injects CA.g1 (the seed) and dumps
+      //      CC.g1; iteration 2 injects CC.g1 (this run's previous dump) and dumps CC.g2
+      //  CS1 1 iteration restarted from CA's checkpoint injecting CA.g1 (= CC's iteration 1)          -> CS1.g1 == CC.g1
+      //  CS2 1 iteration restarted from CS1's checkpoint injecting CS1.g1 (= CC's iteration 2)        -> CS2.g1 == CC.g2
+      // The damping mixer reads the previous iteration from the checkpoint, so the restarted state is the in-memory one -- with
+      // mu re-solved at every Dyson step (const_mu = false): a restart's first Dyson step re-solves mu unconditionally.
+      using cplx = std::complex<double>;
+      namespace fs = std::filesystem;
+      auto run_chain = [&](std::string const &tag, int niter, bool chain, std::string const &interp, std::string const &points,
+                           std::string const &restart_from) {
+        const std::string out = "coqui_d3_chain_" + tag;
+        if (not restart_from.empty()) {
+          mpi_context->comm.barrier();
+          if (mpi_context->comm.root()) fs::copy_file(restart_from + ".mbpt.h5", out + ".mbpt.h5", fs::copy_options::overwrite_existing);
+          mpi_context->comm.barrier();
+        }
+        solvers::hf_t hf; solvers::gw_t gw(&ft, "ignore_g0", out);
+        solvers::scr_coulomb_t scr_eri(&ft, "rpa", "ignore_g0");
+        simple_dyson dyson(mf.get(), &ft); MBState mb_state(mpi_context, ft, out);
+        iter_scf::iter_scf_t iter_sol("damping");
+        solvers::vertex_t vtx(&ft, "none", nda::range(0, 0), mf->nbnd());
+        vtx.set_pol_vertex("ladder", "w0_prev", nda::range(0, 4), -1, 1e-8, -1.0, -1.0, -1.0, "none");
+        vtx.set_ladder_rung("dynamic", 1e-8, 30, 12, -1.0);
+        vtx.set_ladder_dyn_gamma1_only(true); vtx.set_ladder_dyn_all_nu(true);
+        vtx.set_isdf_points(points, points.empty()); vtx.set_pol_interp(interp, "gam1"); vtx.set_pol_chain(chain);
+        scr_eri.set_vertex(&vtx);
+        // const_mu = false: a restart's initial Dyson step always re-solves mu (scf_loop), so the in-process loop must too
+        auto [e_hf, e_corr] = scf_loop(mb_state, dyson, eri, ft, solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol, niter,
+                                       not restart_from.empty(), 1e-9, false);
+        app_log(1, "dynbse_readout CHAIN [{}]: chain {} niter {} restart {}: e_corr {:.12f}", tag, chain, niter,
+                restart_from.empty() ? "no" : restart_from, e_corr);
+        mpi_context->comm.barrier();
+        return e_corr;
+      };
+      auto rd4 = [&](std::string const &fn, nda::array<cplx, 4> &A) { h5::file f(fn, 'r'); h5::group g(f); nda::h5_read(g, "Pi_gam1", A); };
+      auto relmax4 = [&](nda::array<cplx, 4> const &A, nda::array<cplx, 4> const &B) {
+        double d = 0.0, n = 0.0;
+        for (long i = 0; i < A.size(); ++i) { d = std::max(d, std::abs(A.data()[i] - B.data()[i])); n = std::max(n, std::abs(B.data()[i])); }
+        return (n > 0.0) ? d / n : d;
+      };
+      const std::string pts = "coqui_d3_chain_CA.secpts.h5", seed = "coqui_d3_chain_CA.pol_wh_dyn.g1.h5";
+      run_chain("CA", 1, false, "", "", "");
+      REQUIRE(fs::exists(pts)); REQUIRE(fs::exists(seed));
+      const double ecc = run_chain("CC", 2, true, seed, pts, "coqui_d3_chain_CA");
+      REQUIRE(fs::exists("coqui_d3_chain_CC.pol_wh_dyn.g1.h5")); REQUIRE(fs::exists("coqui_d3_chain_CC.pol_wh_dyn.g2.h5"));
+      run_chain("CS1", 1, false, seed, pts, "coqui_d3_chain_CA");
+      const double ecs2 = run_chain("CS2", 1, false, "coqui_d3_chain_CS1.pol_wh_dyn.g1.h5", pts, "coqui_d3_chain_CS1");
+      nda::array<cplx, 4> C1, C2, S1, S2;
+      rd4("coqui_d3_chain_CC.pol_wh_dyn.g1.h5", C1); rd4("coqui_d3_chain_CC.pol_wh_dyn.g2.h5", C2);
+      rd4("coqui_d3_chain_CS1.pol_wh_dyn.g1.h5", S1); rd4("coqui_d3_chain_CS2.pol_wh_dyn.g1.h5", S2);
+      const double d1 = relmax4(C1, S1), d2 = relmax4(C2, S2), d12 = relmax4(C2, C1);
+      app_log(1, "dynbse_readout CHAIN gate (P18): in-process chain vs one-iteration restarts on qe_lih222: |dPi_gam1| iteration 1 {:.2e}, "
+                 "iteration 2 {:.2e} (the chain moved the object by {:.2e} between the iterations); e_corr chain {:.12f} restarts {:.12f} "
+                 "(|d| {:.1e})", d1, d2, d12, ecc, ecs2, std::abs(ecc - ecs2));
+      REQUIRE(d1 < 1e-12);
+      REQUIRE(d2 < 1e-10);
+      REQUIRE(d12 > 1e-6);                                   // the second iteration did consume a different (its own) object
+      REQUIRE(std::abs(ecc - ecs2) < 1e-10);
+      mpi_context->comm.barrier();
+      if (mpi_context->comm.root())
+        for (auto const &e : fs::directory_iterator("."))
+          if (e.path().filename().string().rfind("coqui_d3_chain_", 0) == 0) fs::remove(e.path());
+      mpi_context->comm.barrier();
+      return;
+    }
     if (std::getenv("COQUI_DYNBSE_TEST_WINT_SYM")) {
       // the fixture name is the env value ("1" = qe_lih222_sym; use qe_lih223_sym for a mesh with non-TRIM k-points)
       std::string fx = std::getenv("COQUI_DYNBSE_TEST_WINT_SYM"); if (fx == "1" or fx.empty()) fx = "qe_lih222_sym";

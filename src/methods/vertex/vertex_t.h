@@ -640,6 +640,7 @@ namespace solvers {
     std::string _wannier_frame = "aux"; // pol_vertex_wannier_frame: the dynbse output frame in Wannier mode ("aux" | "pair")
     std::string _pol_interp_file;       // pol_vertex_interp_file: the eps readout consumes this Pi(q)_{MN} (frozen points)
     std::string _pol_interp_col = "gam1";
+    bool _pol_chain = false;            // pol_vertex_chain (P18): from the second update on, consume THIS run's previous all-nu dump
     std::string _run_prefix;            // mb_state.coqui_prefix, captured at ensure_secondary_basis for the dumps
 
     // q->0 policy on the rung transfers: "ignore_g0" (v2 default), "gygi"-class,
@@ -1838,6 +1839,13 @@ namespace solvers {
     void set_pol_interp(std::string const &file, std::string const &col) { _pol_interp_file = file; _pol_interp_col = col; }
     std::string const &pol_interp_file() const { return _pol_interp_file; }
     std::string const &pol_interp_col() const { return _pol_interp_col; }
+    /** pol_vertex_chain (default false; P18 of vertex_perf_plan.md): the in-process vertex chain. The scripted chains restart
+     *  the loop every iteration and inject the previous restart's all-nu dump (pol_vertex_interp_file); with the knob on,
+     *  ONE run does the same: update 1 injects the user's file (the seed), every later update injects the dump this run
+     *  wrote at the previous update (<prefix>.pol_wh_dyn.g<n>.h5, so pol_vertex_dyn_all_nu must be on). Identical to the
+     *  scripted chain of one-iteration restarts. */
+    void set_pol_chain(bool on) { _pol_chain = on; }
+    bool pol_chain() const { return _pol_chain; }
     /** pol_vertex_dyn_dense (default true): the dynamic rung as dense per-tau blocks K_d(s) = Kbig[W_d(s)] on the
      *  PH-symmetric half of the tau nodes (compute-bound gemms; nt/2 x D^2 complex per rank: 5.4 GB at Si 4^3/8,
      *  27 GB at C = [0,12)); false = the THC pair-space streaming route (memory-bandwidth-bound). */
