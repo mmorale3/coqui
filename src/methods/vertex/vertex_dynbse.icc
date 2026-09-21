@@ -222,6 +222,23 @@ namespace solvers {
       }
     };
 
+    /** P6 (vertex_perf_plan.md): the symmetry classes of the transfers for the streaming rung on a symmetric mesh. The
+     *  dense rung (build_kbig) reads, for every (k, k'), the IBZ-stored W at q_star(k - k') (PQ-transposed for a
+     *  time-reversal transfer) and takes the four legs from Xhat(is, q_isym(k - k'), .). Grouping the full-mesh transfers
+     *  by js = q_isym(q') makes every class term a function of k - k' alone with a fixed leg set,
+     *    out(k') = sum_js Legs_out[js](k') . sum_k Wmask_js(k - k') . Legs_in[js](k) F(k),
+     *  Wmask_js(q') = W(q_star(q'))^(T if trev) on the class and 0 elsewhere, so the k-sum (gather or mesh FFT) runs
+     *  unchanged per class. Returns {0} on a nosym mesh (one class, identity legs, W read at q'). */
+    inline std::vector<long> rung_sym_classes(vertex_sym::sym_ctx const *symc) {
+      std::vector<long> cls;
+      if (symc == nullptr or not symc->active) { cls.push_back(0); return cls; }
+      for (long qp = 0; qp < symc->nq_full; ++qp) {
+        const long js = symc->q_isym(qp);
+        if (std::find(cls.begin(), cls.end(), js) == cls.end()) cls.push_back(js);
+      }
+      return cls;
+    }
+
     /**
      * The THC rung applied to a pair-space block F (nk, nc2, nR) at fixed (is, iq):
      *   out(k', (p1 p3'), N) = (scale) sum_k sum_PQ X(k',P,p1) conj(X(k'+q,Q,p3')) W_PQ(qx_of(k,k'))
@@ -234,7 +251,7 @@ namespace solvers {
     inline void thc_rung_apply(nda::array<cplx, 4> const &Xb, long is, long iq,
                                nda::array<long, 2> const &kpq, nda::array<long, 2> const &qx_of,
                                WqFn &&Wq, cplx scale, nda::MemoryArrayOfRank<3> auto const &F,
-                               nda::MemoryArrayOfRank<3> auto &&out, long nb) {
+                               nda::MemoryArrayOfRank<3> auto &&out, long nb, vertex_sym::sym_ctx const *symc = nullptr) {
       decltype(nda::range::all) all;
       const long nk = F.shape(0), nc2 = F.shape(1), nR = F.shape(2), Nm = Xb.shape(2);
       const long nc = Xb.shape(3);
@@ -248,6 +265,14 @@ namespace solvers {
       nda::array<cplx, 2> Y2(Nm * nb, Nm);           // ((P N), Q)
       nda::array<cplx, 4> Y(Nm, Nm, nk, nb), Z(Nm, Nm, nk, nb);
       nda::array<cplx, 2> Wm(nk, nk), Zk(Nm, Nm * nb), B(nc, Nm * nb), B2(nc * nb, Nm), O2(nc * nb, nc);
+      const bool sym = (symc != nullptr and symc->active);
+      for (long js : rung_sym_classes(symc)) {                      // P6: one pass per symmetry class (nosym: one pass)
+      auto X = [&](long k, long P, long a) -> cplx { return sym ? symc->Xhat(is, js, k, P, a) : Xb(is, k, P, a); };
+      auto Wc = [&](long qp, long P, long Q) -> cplx {              // the class-masked rung at the full-mesh transfer q'
+        if (not sym) return Wq(qp)(P, Q);
+        if (symc->q_isym(qp) != js) return cplx(0.0);
+        return symc->q_trev(qp) ? Wq(symc->q_star(qp))(Q, P) : Wq(symc->q_star(qp))(P, Q);
+      };
       for (long n0 = 0; n0 < nR; n0 += nb) {
         const long nbl = std::min(nb, nR - n0);
         // ---- legs in: Y(P, Q, k, N) ----------------------------------------------------------
@@ -255,8 +280,8 @@ namespace solvers {
           const long kq = kpq(iq, k);
           for (long P = 0; P < Nm; ++P)
             for (long a = 0; a < nc; ++a) {
-              Xc(P, a) = std::conj(Xb(is, k, P, a));
-              Xkq(P, a) = Xb(is, kq, P, a);
+              Xc(P, a) = std::conj(X(k, P, a));
+              Xkq(P, a) = X(kq, P, a);
             }
           for (long p1p = 0; p1p < nc; ++p1p)
             for (long p3 = 0; p3 < nc; ++p3)
@@ -278,7 +303,7 @@ namespace solvers {
         for (long P = 0; P < Nm; ++P)
           for (long Q = 0; Q < Nm; ++Q) {
             for (long kp = 0; kp < nk; ++kp)
-              for (long k = 0; k < nk; ++k) Wm(kp, k) = Wq(qx_of(k, kp))(P, Q);
+              for (long k = 0; k < nk; ++k) Wm(kp, k) = Wc(qx_of(k, kp), P, Q);
             nda::blas::gemm(Wm, Y(P, Q, all, all), Z(P, Q, all, all));
           }
         // ---- legs out: out(k', (p1 p3'), N) = scale sum_PQ X(k',P,p1) Z(P,Q,k',N) conj(X(k'+q,Q,p3')) --
@@ -286,8 +311,8 @@ namespace solvers {
           const long kq = kpq(iq, kp);
           for (long P = 0; P < Nm; ++P)
             for (long a = 0; a < nc; ++a) {
-              XkT(a, P) = Xb(is, kp, P, a);
-              Xcq(P, a) = std::conj(Xb(is, kq, P, a));
+              XkT(a, P) = X(kp, P, a);
+              Xcq(P, a) = std::conj(X(kq, P, a));
             }
           for (long P = 0; P < Nm; ++P)
             for (long Q = 0; Q < Nm; ++Q)
@@ -299,9 +324,10 @@ namespace solvers {
           nda::blas::gemm(B2, Xcq, O2);                                  // ((p1 N), p3')
           for (long p1 = 0; p1 < nc; ++p1)
             for (long p3p = 0; p3p < nc; ++p3p)
-              for (long n = 0; n < nbl; ++n) out(kp, p1 * nc + p3p, n0 + n) = scale * O2(p1 * nb + n, p3p);
+              for (long n = 0; n < nbl; ++n) out(kp, p1 * nc + p3p, n0 + n) += scale * O2(p1 * nb + n, p3p);
         }
       }
+      }   // symmetry classes
     }
 
     /**
@@ -443,7 +469,7 @@ namespace solvers {
     inline void thc_rung_apply_ft(nda::array<cplx, 4> const &Xb, long is, long iq,
                                   nda::array<long, 2> const &kpq, kmesh_ft const &kft,
                                   WqFn &&Wq, cplx scale, nda::MemoryArrayOfRank<3> auto const &F,
-                                  nda::MemoryArrayOfRank<3> auto &&out, long nb) {
+                                  nda::MemoryArrayOfRank<3> auto &&out, long nb, vertex_sym::sym_ctx const *symc = nullptr) {
       decltype(nda::range::all) all;
       const long nk = F.shape(0), nc2 = F.shape(1), nR = F.shape(2), Nm = Xb.shape(2);
       const long nc = Xb.shape(3), nq = kft.Uq.shape(1);
@@ -459,13 +485,6 @@ namespace solvers {
       nda::array<cplx, 2> B(nc, nb * Nm);                             // (p1, (n Q)) == B2((p1 n), Q)
       nda::array<cplx, 2> O2(nc * nb, nc);                            // ((p1 n), p3')
       auto row = [&](long k) { return kft.fft ? kft.lex_k(k) : k; };
-      // the rung's transform A(R, (P Q)) once per call (the same for every N block)
-      for (long q = 0; q < nq; ++q) {
-        auto W = Wq(q);
-        const long rq = kft.fft ? kft.lex_q(q) : q;
-        for (long P = 0; P < Nm; ++P)
-          for (long Q = 0; Q < Nm; ++Q) Wall(rq, P * Nm + Q) = W(P, Q);
-      }
 #if defined(ENABLE_FFTW)
       math::fft::fftplan_t plan_w, plan_y;
       if (kft.fft) {
@@ -478,13 +497,31 @@ namespace solvers {
           plan_y = math::fft::impl::host::create_plan_many_impl_(3, nd, My, Yk.data(), nd, My, 1, Yh.data(), nd, My, 1,
                                                                   math::fft::FFT_ESTIMATE);
         }
-        math::fft::impl::host::invfft(plan_w, Wall.data(), Ah.data());     // A(R) = sum_q e^{+i q.R} W(q)
-      } else
+      }
 #endif
-      nda::blas::gemm(kft.Uq, Wall, Ah);
       const cplx inv_nk = kft.fft ? cplx(1.0 / double(nk)) : cplx(1.0);
       auto A2 = nda::reshape(A, std::array<long, 2>{Nm * nb, nc});     // ((P n), p3): the same memory as A
       auto B2 = nda::reshape(B, std::array<long, 2>{nc * nb, Nm});     // ((p1 n), Q): the same memory as B
+      const bool sym = (symc != nullptr and symc->active);
+      for (long js : rung_sym_classes(symc)) {                        // P6: one pass per symmetry class (nosym: one pass)
+      auto X = [&](long k, long P, long a) -> cplx { return sym ? symc->Xhat(is, js, k, P, a) : Xb(is, k, P, a); };
+      // the rung's transform A(R, (P Q)) once per class (the same for every N block): the class-masked rung table
+      for (long q = 0; q < nq; ++q) {
+        const long rq = kft.fft ? kft.lex_q(q) : q;
+        if (sym and symc->q_isym(q) != js) {
+          for (long PQ = 0; PQ < Nm * Nm; ++PQ) Wall(rq, PQ) = cplx(0.0);
+          continue;
+        }
+        auto W = Wq(sym ? symc->q_star(q) : q);
+        const bool tr = sym and bool(symc->q_trev(q));
+        for (long P = 0; P < Nm; ++P)
+          for (long Q = 0; Q < Nm; ++Q) Wall(rq, P * Nm + Q) = tr ? W(Q, P) : W(P, Q);
+      }
+#if defined(ENABLE_FFTW)
+      if (kft.fft) math::fft::impl::host::invfft(plan_w, Wall.data(), Ah.data());     // A(R) = sum_q e^{+i q.R} W(q)
+      else
+#endif
+      nda::blas::gemm(kft.Uq, Wall, Ah);
       for (long n0 = 0; n0 < nR; n0 += nb) {
         const long nbl = std::min(nb, nR - n0);
         // ---- legs in: Yk(k, (P n Q)) -------------------------------------------------------------
@@ -492,8 +529,8 @@ namespace solvers {
           const long kq = kpq(iq, k);
           for (long P = 0; P < Nm; ++P)
             for (long a = 0; a < nc; ++a) {
-              Xc(P, a) = std::conj(Xb(is, k, P, a));
-              XkqT(a, P) = Xb(is, kq, P, a);
+              Xc(P, a) = std::conj(X(k, P, a));
+              XkqT(a, P) = X(kq, P, a);
             }
           for (long p1p = 0; p1p < nc; ++p1p)
             for (long n = 0; n < nb; ++n)
@@ -525,17 +562,18 @@ namespace solvers {
           const long kq = kpq(iq, kp);
           for (long P = 0; P < Nm; ++P)
             for (long a = 0; a < nc; ++a) {
-              XkT(a, P) = Xb(is, kp, P, a);
-              Xcq(P, a) = std::conj(Xb(is, kq, P, a));
+              XkT(a, P) = X(kp, P, a);
+              Xcq(P, a) = std::conj(X(kq, P, a));
             }
           auto Zrow = nda::reshape(Yk(row(kp), all), std::array<long, 2>{Nm, nb * Nm});  // (P, (n Q))
           nda::blas::gemm(XkT, Zrow, B);                                 // (p1, (n Q))
           nda::blas::gemm(B2, Xcq, O2);                                  // ((p1 n), p3')
           for (long p1 = 0; p1 < nc; ++p1)
             for (long p3p = 0; p3p < nc; ++p3p)
-              for (long n = 0; n < nbl; ++n) out(kp, p1 * nc + p3p, n0 + n) = scale * O2(p1 * nb + n, p3p);
+              for (long n = 0; n < nbl; ++n) out(kp, p1 * nc + p3p, n0 + n) += scale * O2(p1 * nb + n, p3p);
         }
       }
+      }   // symmetry classes
 #if defined(ENABLE_FFTW)
       if (kft.fft) {
 #pragma omp critical(coqui_dynbse_fftw_plan)
@@ -651,8 +689,9 @@ namespace solvers {
       const long nout = wan ? nc2 : Nm;                     // external-leg / output dimension (aux Nm, or Wannier pair)
       const long nq = W0b.shape(0), nw_b = tools.nw_b;
       const long nw_half = (nw_b % 2 == 0) ? nw_b / 2 : nw_b / 2 + 1;
-      utils::check(not sym or opt.dense_rung, "pair_space_ladder_dyn: IBZ symmetry currently requires the dense rung "
-                   "(the streaming/THC rung's symmetric q_star read is not wired yet).");
+      if (sym and not opt.dense_rung and rank == 0)   // P6: the streaming rung runs per symmetry class of the transfers
+        app_log(2, "  [dynbse] streaming THC rung on the symmetric mesh: {} symmetry classes of the {} transfers per application",
+                rung_sym_classes(symc).size(), symc->nq_full);
       const long nnu = long(nu_list.size());
       const double spinfac = (ns == 1) ? 2.0 : 1.0;
       if (sym) {
@@ -848,8 +887,8 @@ namespace solvers {
                 use_ft ? (kft.fft ? "mesh FFT (FFTW)" : "dense mesh Fourier transform") : "direct", kft.check);
       if (met) met->ksum_ft = use_ft;
       auto rung_apply = [&](auto &&Wfn, cplx sc, auto const &Fin, auto &&Oout, long is_, long iq_) {
-        if (use_ft) thc_rung_apply_ft(Xb, is_, iq_, kpq, kft, Wfn, sc, Fin, Oout, nb);
-        else thc_rung_apply(Xb, is_, iq_, kpq, qx_of, Wfn, sc, Fin, Oout, nb);
+        if (use_ft) thc_rung_apply_ft(Xb, is_, iq_, kpq, kft, Wfn, sc, Fin, Oout, nb, symc);   // P6: symc (nullptr on nosym)
+        else thc_rung_apply(Xb, is_, iq_, kpq, qx_of, Wfn, sc, Fin, Oout, nb, symc);
       };
       // host threads (the omp_threads knob; the global OMP_NUM_THREADS stays 1 per the T-3b contract): the
       // tau nodes of a rung application are independent; the body holds no MPI, no HDF5, no shared writes

@@ -311,6 +311,7 @@ namespace bdft_tests {
       using cplx = std::complex<double>;
       struct res_t { double e_corr, er, el; nda::array<cplx, 3> Ps, Pg; };
       bool trs_images = false;   // set with the V flavour below (captured by reference)
+      bool stream_cur = false;   // P6: the streaming THC rung (per symmetry class on the symmetric mesh) instead of the dense one
       auto run_w = [&](std::string const &tag, std::string const &rung, std::string const &points, std::string const &interp,
                        nda::array<cplx, 2> const *V) {
         const std::string out = "coqui_d3_wint_" + mesh_tag + "_" + tag;
@@ -324,6 +325,7 @@ namespace bdft_tests {
         vtx.set_ladder_dyn_gamma1_only(true); vtx.set_ladder_dyn_dump(rung == "dynamic");
         vtx.set_isdf_points(points, points.empty()); vtx.set_wannier_frame("aux");
         vtx.set_pol_interp(interp, "static");
+        vtx.set_ladder_dyn_dense(not stream_cur);
         if (V) { auto proj = make_degenerate_projector(*mfw, 0, 4, V, trs_images); vtx.set_wannier_projector(proj, true); }
         if (auto *rm = std::getenv("COQUI_DYNBSE_TEST_RESOLVENT")) vtx.set_ladder_dyn_resolvent(rm);   // P7: inverse | lu
         if (auto *wc = std::getenv("COQUI_DYNBSE_TEST_WCACHE")) vtx.set_wcache_mode(wc);   // P19: replicated | shared
@@ -368,6 +370,17 @@ namespace bdft_tests {
       auto A = run_w("A", "dynamic", "", "", nullptr);
       REQUIRE(std::filesystem::exists(pts)); REQUIRE(std::filesystem::exists(nu0));
       auto B = run_w("B", "dynamic", pts, "", nullptr);
+      {   // P6: the streaming THC rung (on the symmetric mesh: one pass per symmetry class of the transfers, legs from Xhat,
+          // the IBZ-stored W at q_star, transposed on time-reversal transfers) is the same operator as the dense per-tau rung:
+          // the static column and the one-rung Gamma_1 column agree to rounding (frozen points, the same aux frame as A)
+        stream_cur = true;
+        auto AS = run_w("AS", "dynamic", pts, "", nullptr);
+        stream_cur = false;
+        const double dS = relmax(AS.Pg, A.Pg), dSs = relmax(AS.Ps, A.Ps);
+        app_log(1, "dynbse_readout W-int gate ({}): P6 streaming THC rung vs the dense per-tau rung: |dPi_gam1| {:.2e} |dPi_static| {:.2e}; "
+                   "e_corr {:.10f} vs {:.10f}", mesh_tag, dS, dSs, AS.e_corr, A.e_corr);
+        REQUIRE(dS < 1e-9); REQUIRE(dSs < 1e-9);
+      }
       auto W = run_w("V", "dynamic", pts, "", &V);
       auto C = run_w("C", "static", pts, nu0, nullptr);
       //  CW the PRODUCTION consumer: Wannier mode (a unitary mix V of the same window, X_bar = X U on the frozen
