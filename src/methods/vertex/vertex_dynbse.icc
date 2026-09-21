@@ -49,6 +49,7 @@
 #include <mpi.h>
 #if defined(ENABLE_FFTW)
 #include "numerics/fft/fftw.h"
+#include "methods/vertex/vertex_debug.hpp"
 #include "methods/vertex/vertex_sigma_dyn.icc"   // LFF-Sigma L-7: the Sigma hook of the dynamic-rung solver
 #include "methods/vertex/nu_sampling.hpp"       // P14: the sampled-nu service (reconstruction from a node subset)
 #endif
@@ -724,7 +725,10 @@ namespace solvers {
       // D2f: the in-gap vertex-node mask (pol_vertex_dyn_vmask = [lo, hi] relative to mu; env COQUI_DYNBSE_VMASK="lo,hi"
       // overrides for experiments)
       double vlo = opt.vmask_lo, vhi = opt.vmask_hi;
-      if (char const *e = std::getenv("COQUI_DYNBSE_VMASK")) { vlo = std::atof(e); if (char const *cm = std::strchr(e, ',')) vhi = std::atof(cm + 1); }
+      if (auto vm = vertex_debug::get("dynbse_vmask"); vm.has_value()) {   // vertex_debug: dynbse_vmask = lo,hi  (Ha about mu)
+        vlo = std::atof(vm->c_str());
+        if (const char *cm = std::strchr(vm->c_str(), ',')) vhi = std::atof(cm + 1);
+      }
       const bool vmasked = (vhi > vlo);
       if (vmasked) db::mask_freq_basis(b, vlo, vhi);
       const long np_fit = b.np;
@@ -2029,7 +2033,7 @@ namespace solvers {
     o.gap_mask = 0.0;
     // EXPERIMENT (small-nu spurious mode): COQUI_DYNBSE_UNION=0 runs the cut on the SHARED node set
     // (exact confluent algebra + the twisted R1/R3 tables) instead of the union grid.
-    if (char const *e = std::getenv("COQUI_DYNBSE_UNION")) o.union_nodes = (std::atoi(e) != 0);
+    if (auto u = vertex_debug::get("dynbse_union"); u.has_value()) o.union_nodes = (std::atoi(u->c_str()) != 0);   // vertex_debug: dynbse_union = 0 | 1
     o.readout_tol = 1e-6;
     o.q_subset = std::addressof(qsel);
     vd::dyn_meter met;
@@ -2256,7 +2260,7 @@ namespace solvers {
     o.schedule = _dyn_schedule; o.unit_cost = std::addressof(_dyn_unit_cost);   // P5
     o.union_nodes = true;
     o.gap_mask = 0.0;
-    if (char const *e = std::getenv("COQUI_DYNBSE_UNION")) o.union_nodes = (std::atoi(e) != 0);
+    if (auto u = vertex_debug::get("dynbse_union"); u.has_value()) o.union_nodes = (std::atoi(u->c_str()) != 0);   // vertex_debug: dynbse_union = 0 | 1
     o.readout_tol = 1e-6;
     o.q_subset = std::addressof(qs);
     o.sigma = std::addressof(hook);

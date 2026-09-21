@@ -53,6 +53,7 @@
  * through the sparse-node transform).
  */
 
+#include "methods/vertex/vertex_debug.hpp"
 namespace methods {
 namespace solvers {
   namespace vertex_dynbse_detail {
@@ -131,10 +132,10 @@ namespace solvers {
         S_cst = nda::array<ComplexType, 5>(nt, ns, nk, nc, nc); S_cst() = ComplexType(0.0);
         RT = nda::array<ComplexType, 6>(nt, ns, nk, np, nc, nc); RT() = ComplexType(0.0);
         RU = nda::array<ComplexType, 6>(nt, ns, nk, np, nc, nc); RU() = ComplexType(0.0);
-        poles = (std::getenv("COQUI_SIGDYN_ROUTE") != nullptr and std::string(std::getenv("COQUI_SIGDYN_ROUTE")) == "poles");
+        poles = (vertex_debug::text("sigdyn_route", "product") == "poles");   // vertex_debug: sigdyn_route = poles | product
         wk.clear();
-        if (auto const *f = std::getenv("COQUI_SIGDYN_FAMILIES"); f != nullptr) {
-          const std::string fs(f);
+        if (auto fam = vertex_debug::get("sigdyn_families"); fam.has_value()) {   // vertex_debug: sigdyn_families = U | T | UT
+          const std::string fs(*fam);
           use_U = (fs == "all" or fs == "cstU"); use_T = (fs == "all" or fs == "cstT");
         }
         basis = b;

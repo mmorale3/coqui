@@ -1,5 +1,8 @@
 #ifndef COQUI_VERTEX_SIGMA_PAIR_ICC
 #define COQUI_VERTEX_SIGMA_PAIR_ICC
+#include "methods/vertex/vertex_debug.hpp"
+#include <set>
+#include <cstdlib>
 
 /**
  * LFF-aux L-6, ROUTE 2 (notes/lff_aux_plan.md, 2026-09-19): the PAIR-RESOLVED static-ladder vertex in the
@@ -166,6 +169,30 @@ namespace solvers {
       if (opt.nu_diag) Astore = nda::array<cplx, 3>(nw_b, D, Nm);
       nda::array<cplx, 4> dSq;                                            // P1: one unit's contribution on the full k mesh
       if (ibz) dSq = nda::array<cplx, 4>(nt, nk, nc, nc);
+      // P1 diagnostic dump (COQUI_SIGPAIR_IBZ_DUMP=<file prefix>): every unit's deposit -- the full-k object of the IBZ path,
+      // the IBZ-k deposit of the full-mesh path -- and the symmetry tables, for the offline per-image check of the fold
+      const auto dump_opt = sym ? vertex_debug::get("sigpair_ibz_dump") : std::nullopt;   // vertex_debug: sigpair_ibz_dump = <file prefix>
+      const char *dump_env = dump_opt ? dump_opt->c_str() : nullptr;
+      nda::array<cplx, 4> dS_unit;
+      if (dump_env != nullptr and not ibz) dS_unit = nda::array<cplx, 4>(nt, nk_ext, nc, nc);
+      auto dump_unit = [&](long is_, long iq_, nda::array<cplx, 4> const &A) {
+        const std::string fn = std::string(dump_env) + (ibz ? ".ibz" : ".full") + ".r" + std::to_string(rank) + ".h5";
+        static std::set<std::string> opened;
+        h5::file f(fn, opened.count(fn) ? 'a' : 'w');
+        opened.insert(fn);
+        h5::group g(f);
+        nda::h5_write(g, "unit_" + std::to_string(is_) + "_" + std::to_string(iq_), A);
+        if (ibz and not g.has_dataset("q_star")) {
+          nda::h5_write(g, "q_star", symc->q_star); nda::h5_write(g, "q_isym", symc->q_isym);
+          nda::array<long, 1> qt(symc->nq_full); for (long q = 0; q < symc->nq_full; ++q) qt(q) = symc->q_trev(q) ? 1 : 0;
+          nda::h5_write(g, "q_trev", qt); nda::h5_write(g, "krot", symc->krot); nda::h5_write(g, "ktrev_pair", symc->ktrev_pair);
+          nda::h5_write(g, "qminus", symc->qminus); nda::h5_write(g, "Dc", symc->Dc);
+          nda::array<long, 2> cj(symc->nsym, symc->nk_full);
+          for (long a = 0; a < symc->nsym; ++a) for (long b = 0; b < symc->nk_full; ++b) cj(a, b) = symc->cjg(a, b) ? 1 : 0;
+          nda::h5_write(g, "cjg", cj);
+          nda::h5_write(g, "kpq", kpq);
+        }
+      };
       const long nunits = ns * nq_units;
       for (long u = rank; u < nunits; u += nproc) {
         const long is = u / nq_units, iq = u % nq_units;
@@ -326,6 +353,7 @@ namespace solvers {
         nda::blas::gemm(tools.Ttw_bb, Hall, Ht);                          // (nt x nw_b)(nw_b x nk nc^4)
         const cplx pref(-opt.scale / double(nk), 0.0);
         if (ibz) dSq() = cplx(0.0);
+        if (dS_unit.size() > 0) dS_unit() = cplx(0.0);
         for (long kp = 0; kp < nk; ++kp) {
           const long k = kpq(iq, kp);                                     // k = k' + q
           if (not ibz and k >= nk_ext) continue;                         // symmetric full-mesh path: IBZ representatives only
@@ -344,9 +372,33 @@ namespace solvers {
                 }
                 if (ibz) dSq(it, k, i, j) += pref * acc;
                 else dSig(it, is, k, i, j) += pref * acc;
+                if (dS_unit.size() > 0) dS_unit(it, k, i, j) += pref * acc;
               }
         }
         if (ibz) vertex_sym::fold_star_into_ibz(*symc, iq, dSq, dSig(all, is, all, all, all), &n_trev_images, &n_cjg_rot);
+        if (dump_env != nullptr) dump_unit(is, iq, ibz ? dSq : dS_unit);
+        if (ibz and vertex_debug::flag("sigpair_ibz_diag")) {   // vertex_debug: sigpair_ibz_diag
+          // P1 diagnostic: the Hermiticity of this unit's deposit at the IBZ and the non-IBZ externals, and its star
+          double ah_ibz = 0.0, ah_out = 0.0, mx = 0.0;
+          for (long k = 0; k < nk; ++k)
+            for (long it = 0; it < nt; ++it)
+              for (long i = 0; i < nc; ++i)
+                for (long j = 0; j < nc; ++j) {
+                  const double d = std::abs(dSq(it, k, i, j) - std::conj(dSq(it, k, j, i)));
+                  mx = std::max(mx, std::abs(dSq(it, k, i, j)));
+                  if (k < nk_ext) ah_ibz = std::max(ah_ibz, d); else ah_out = std::max(ah_out, d);
+                }
+          std::string star;
+          for (long qp = 0; qp < symc->nq_full; ++qp)
+            if (symc->q_star(qp) == iq) {
+              long ncj = 0;
+              for (long k = 0; k < nk_ext; ++k) if (symc->q_isym(qp) != 0 and symc->cjg(symc->q_isym(qp), k)) ++ncj;
+              star += " (" + std::to_string(qp) + ", js " + std::to_string(symc->q_isym(qp)) + (symc->q_trev(qp) ? ", trev" : "") +
+                      ", cjg at " + std::to_string(ncj) + " IBZ k)";
+            }
+          app_log(1, "  [P1 diag] unit is {} iq {}: max |dSq| {:.3e}, anti-Hermitian at the IBZ k {:.3e}, at the other k {:.3e}; qminus {}; star:{}",
+                  is, iq, mx, ah_ibz, ah_out, symc->qminus(iq), star);
+        }
         if (opt.nu_diag) {
           // the Gram matrix over nu of the amplitude (all pairs and legs), normalized spectrum, max over units
           nda::matrix<cplx> Gm(nw_b, nw_b);

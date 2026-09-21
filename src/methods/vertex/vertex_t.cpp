@@ -24,6 +24,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "methods/vertex/vertex_debug.hpp"
 #include "nda/lapack.hpp"
 #include "nda/linalg/eigenelements.hpp"
 
@@ -2951,8 +2952,7 @@ namespace solvers {
       // T6 R-DECAY DIAGNOSTIC, q-side (read-only; env COQUI_VERTEX_RDECAY=1): Delta_w
       // on the full transfer mesh. Full-q only (nosym runs) -- an IBZ-stored aux-frame
       // q-object does not star-unfold elementwise (the collocation rotation intervenes).
-      if (const char *rd = std::getenv("COQUI_VERTEX_RDECAY");
-          rd and rd[0] == '1' and Dw.shape(0) == nqpts and mb_state.mpi->comm.root())
+      if (vertex_debug::flag("vertex_rdecay") and Dw.shape(0) == nqpts and mb_state.mpi->comm.root())   // vertex_debug: vertex_rdecay
         vertex_rdecay_detail::log_rshell_decay_q(MF, Dw,
                                                  lin ? "Delta_w^L" : "Delta_w");
 
@@ -3026,8 +3026,7 @@ namespace solvers {
     // points are gauge copies, identity D; symmetry.hpp:910) -- exactly the rule a
     // coarse-grid interpolation would use. G_CC is logged as the long-range CONTRAST
     // (interpolate Sigma/Pi, never G -- CLAUDE.md section 8).
-    if (const char *rd = std::getenv("COQUI_VERTEX_RDECAY");
-        rd and rd[0] == '1' and mb_state.mpi->comm.root()) {
+    if (vertex_debug::flag("vertex_rdecay") and mb_state.mpi->comm.root()) {   // vertex_debug: vertex_rdecay
       nda::array<ComplexType, 5> Sfull(nt, ns, nkpts, nc, nc);
       if (not sym_mesh) {
         Sfull = Sigma_C;

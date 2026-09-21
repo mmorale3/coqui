@@ -92,6 +92,7 @@
 #include "numerics/nda_functions.hpp"
 #include "numerics/imag_axes_ft/IAFT.hpp"
 #include "numerics/imag_axes_ft/dlr_pole_fit.hpp"
+#include "methods/vertex/vertex_debug.hpp"
 #include "methods/vertex/ward_legs.hpp"
 
 namespace methods {
@@ -765,7 +766,7 @@ namespace dynbse {
     // (for |eps_c| >> |nu| the twist is invisible on K_F's support and T_c ~ -s K_F(eps_c) lies in the
     // U span to the DLR class); env COQUI_DYNBSE_TKEEP = ratio, unset / 0 = keep all.
     double tkeep = 0.0;
-    if (char const *e = std::getenv("COQUI_DYNBSE_TKEEP")) tkeep = std::atof(e);
+    tkeep = vertex_debug::number("dynbse_tkeep", tkeep);   // vertex_debug: dynbse_tkeep
     long n_tkept = 0;
     for (long c = 0; c < npf; ++c) {
       const bool keep_t = (tkeep <= 0.0) or (std::abs(b.eps(c)) <= tkeep * std::abs(inu));
@@ -877,7 +878,7 @@ namespace dynbse {
     Fsum() = cplx(0.0);
     const long ncomp = 1 + 2 * np;
     double tfold = tfold_ratio();
-    if (char const *e = std::getenv("COQUI_DYNBSE_TFOLD")) tfold = std::atof(e);   // experiment override
+    tfold = vertex_debug::number("dynbse_tfold", tfold);   // vertex_debug: dynbse_tfold (experiment override)
 #pragma omp parallel for schedule(dynamic, 1) num_threads(utils::omp_threads())
     for (long ik = 0; ik < nk; ++ik) {
       nda::array<cplx, 3> Ghat(ng, nc, nc), Gtil(ng, nc, nc);
@@ -2741,7 +2742,7 @@ namespace dynbse {
     long it = 0;
     bool done = false;
     double ritz_max = 0.0;
-    const bool ritz_prof = (std::getenv("COQUI_DYNBSE_RITZ") != nullptr);
+    const bool ritz_prof = vertex_debug::flag("dynbse_ritz");   // vertex_debug: dynbse_ritz (the Ritz profile of the GMRES cycles)
     double ritz_best = -1.0;
     long c_best = -1, n_best = 0;
     nda::array<cplx, 1> v_best;

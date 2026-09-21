@@ -20,6 +20,7 @@
 
 
 
+#include "methods/vertex/vertex_debug.hpp"
 #include <cstdlib>
 #include <filesystem>
 #include <optional>
@@ -202,8 +203,8 @@ auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_ax
     // -G_ii(tau) >= 0 and a causal Sigma has Sigma_ii(tau) <= 0 on the band diagonal at every (tau, s, k). A too-small
     // imaginary-axis window leaves a small NON-causal residue that a Dyson loop with semicore states amplifies geometrically
     // (MgO drift, AlAs / LiF divergence at the 1.5 x bandwidth window). Logged every iteration (level 2), at level 1 when the
-    // residue exceeds 1e-6 or grows by more than 3x per iteration. Env COQUI_SCF_CAUSALITY_METER=0 disables it.
-    if (std::getenv("COQUI_SCF_CAUSALITY_METER") == nullptr or std::string(std::getenv("COQUI_SCF_CAUSALITY_METER")) != "0") {
+    // residue exceeds 1e-6 or grows by more than 3x per iteration. vertex_debug = "scf_causality_meter=0" disables it.
+    if (vertex_debug::text("scf_causality_meter", "1") != "0") {   // vertex_debug: scf_causality_meter = 0 disables it
       double gmin = 1e300, smax = -1e300;
       long nviol = 0;
       if (mpi->node_comm.root()) {

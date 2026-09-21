@@ -41,6 +41,7 @@
 #include "methods/SCF/simple_dyson.h"
 #include "methods/embedding/embed_t.h"
 #include "methods/embedding/embed_eri_t.h"
+#include "methods/vertex/vertex_debug.hpp"
 #include "methods/vertex/vertex_t.h"
 #include "numerics/imag_axes_ft/IAFT.hpp"
 #include "numerics/iter_scf/iter_scf_utils.hpp"
@@ -658,6 +659,8 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
         vertex.set_ladder_dyn_dump(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_dump",false));
         // W-int-1b (notes/wannier_coarse_vertex_plan.md): freeze / dump the secondary ISDF points, the Wannier output
         // frame, and the fine-mesh consumer of an interpolated Pi(q)_{MN}
+        vertex_debug::set(io::get_value_with_default<std::string>(pt,"vertex_debug",""));   // P23: the diagnostic switches
+        if (not vertex_debug::list().empty()) app_log(1, "  vertex_debug switches: {}", vertex_debug::list());
         vertex.set_isdf_points(io::get_value_with_default<std::string>(pt,"pol_vertex_isdf_points_file",""),
                             io::get_value_with_default<bool>(pt,"pol_vertex_isdf_points_dump",false));
         vertex.set_wannier_frame(io::get_value_with_default<std::string>(pt,"pol_vertex_wannier_frame","aux"));
@@ -1080,6 +1083,8 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
         pol_vertex_carrier.set_ladder_dyn_dump(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_dump",false));
         // W-int-1b (notes/wannier_coarse_vertex_plan.md): freeze / dump the secondary ISDF points, the Wannier output
         // frame, and the fine-mesh consumer of an interpolated Pi(q)_{MN}
+        vertex_debug::set(io::get_value_with_default<std::string>(pt,"vertex_debug",""));   // P23: the diagnostic switches
+        if (not vertex_debug::list().empty()) app_log(1, "  vertex_debug switches: {}", vertex_debug::list());
         pol_vertex_carrier.set_isdf_points(io::get_value_with_default<std::string>(pt,"pol_vertex_isdf_points_file",""),
                             io::get_value_with_default<bool>(pt,"pol_vertex_isdf_points_dump",false));
         pol_vertex_carrier.set_wannier_frame(io::get_value_with_default<std::string>(pt,"pol_vertex_wannier_frame","aux"));
@@ -1354,6 +1359,8 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
         pol_vertex_carrier.set_ladder_dyn_dump(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_dump",false));
         // W-int-1b (notes/wannier_coarse_vertex_plan.md): freeze / dump the secondary ISDF points, the Wannier output
         // frame, and the fine-mesh consumer of an interpolated Pi(q)_{MN}
+        vertex_debug::set(io::get_value_with_default<std::string>(pt,"vertex_debug",""));   // P23: the diagnostic switches
+        if (not vertex_debug::list().empty()) app_log(1, "  vertex_debug switches: {}", vertex_debug::list());
         pol_vertex_carrier.set_isdf_points(io::get_value_with_default<std::string>(pt,"pol_vertex_isdf_points_file",""),
                             io::get_value_with_default<bool>(pt,"pol_vertex_isdf_points_dump",false));
         pol_vertex_carrier.set_wannier_frame(io::get_value_with_default<std::string>(pt,"pol_vertex_wannier_frame","aux"));
@@ -1674,6 +1681,8 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
         vertex.set_ladder_dyn_dump(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_dump",false));
         // W-int-1b (notes/wannier_coarse_vertex_plan.md): freeze / dump the secondary ISDF points, the Wannier output
         // frame, and the fine-mesh consumer of an interpolated Pi(q)_{MN}
+        vertex_debug::set(io::get_value_with_default<std::string>(pt,"vertex_debug",""));   // P23: the diagnostic switches
+        if (not vertex_debug::list().empty()) app_log(1, "  vertex_debug switches: {}", vertex_debug::list());
         vertex.set_isdf_points(io::get_value_with_default<std::string>(pt,"pol_vertex_isdf_points_file",""),
                             io::get_value_with_default<bool>(pt,"pol_vertex_isdf_points_dump",false));
         vertex.set_wannier_frame(io::get_value_with_default<std::string>(pt,"pol_vertex_wannier_frame","aux"));
@@ -2020,6 +2029,8 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
         pol_vertex_carrier.set_ladder_dyn_dump(io::get_value_with_default<bool>(pt,"pol_vertex_dyn_dump",false));
         // W-int-1b (notes/wannier_coarse_vertex_plan.md): freeze / dump the secondary ISDF points, the Wannier output
         // frame, and the fine-mesh consumer of an interpolated Pi(q)_{MN}
+        vertex_debug::set(io::get_value_with_default<std::string>(pt,"vertex_debug",""));   // P23: the diagnostic switches
+        if (not vertex_debug::list().empty()) app_log(1, "  vertex_debug switches: {}", vertex_debug::list());
         pol_vertex_carrier.set_isdf_points(io::get_value_with_default<std::string>(pt,"pol_vertex_isdf_points_file",""),
                             io::get_value_with_default<bool>(pt,"pol_vertex_isdf_points_dump",false));
         pol_vertex_carrier.set_wannier_frame(io::get_value_with_default<std::string>(pt,"pol_vertex_wannier_frame","aux"));

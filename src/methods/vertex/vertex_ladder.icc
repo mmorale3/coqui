@@ -87,6 +87,7 @@
  * in the eval_Pi_rpa_dc convention) -- vertex_t::ladder_loc_gate below.
  */
 
+#include "methods/vertex/vertex_debug.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
@@ -1205,8 +1206,7 @@ namespace solvers {
               // not merely equivalent. COQUI_ALLREDUCE_CHUNK (debug) shrinks the slab so
               // small fixtures exercise the multi-slab path; unset = 2^30 elements.
               static const long kchunk = [] {
-                const char *e = std::getenv("COQUI_ALLREDUCE_CHUNK");
-                const long v = e ? std::atol(e) : 0l;
+                const long v = long(vertex_debug::number("allreduce_chunk", 0.0));   // vertex_debug: allreduce_chunk (elements)
                 return (v > 0) ? v : (1l << 30);
               }();
               auto *kp = Kbig.data();
