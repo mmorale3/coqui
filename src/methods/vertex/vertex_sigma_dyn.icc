@@ -639,12 +639,17 @@ namespace solvers {
 
     /** the assembly after the all-reduce of the accumulators: dSig (nt, ns, nk, nc, nc) = -(scale/nk) [S_cst + sum_p K_F RU_p + Sigma_T] */
     inline void sigma_dyn_finish(sigma_dyn_hook const &h, double scale, long nk_norm, nda::array<ComplexType, 5> &dSig,
-                                 double &e_fit_err) {
+                                 double &e_fit_err, std::string const &refit = "fit", double refit_rtol = 1e-8) {
+      // P12 (vertex_perf_plan.md): refit = "fit" expands E_a = K_F(., a) RT_a onto the DLR (vertex) nodes with the basis'
+      // regularized fit (np_fit coefficients); "union" expands it onto ALL np nodes of the union grid (the vertex nodes and the
+      // shifted G nodes) with a node_pole_fit of rank fixed at refit_rtol -- twice the coefficients, the same tau[U_a U_p]
+      // partial-fraction table extended to the union nodes (no confluence: the shifted nodes coincide with none).
       using cplx = ComplexType;
       utils::check(h.basis.has_value(), "sigma_dyn_finish: no basis (the driver did not run).");
       auto const &b = h.basis.value();
       const long nt = h.S_cst.shape(0), ns = h.S_cst.shape(1), nk = h.S_cst.shape(2), nc = h.S_cst.shape(3), nc2 = nc * nc;
-      const long np = b.np, npf = b.np_fit;
+      const long np = b.np, npf = (refit == "union") ? b.np : b.np_fit;
+      utils::check(refit == "fit" or refit == "union", "sigma_dyn_finish: refit must be fit | union (got \"{}\").", refit);
       utils::check(h.np == np and h.RT.shape(3) == np and h.RU.shape(3) == np, "sigma_dyn_finish: node count mismatch.");
       dSig = nda::array<cplx, 5>(nt, ns, nk, nc, nc);
       dSig() = cplx(0.0);
@@ -664,8 +669,15 @@ namespace solvers {
                 for (long i = 0; i < nc; ++i)
                   for (long j = 0; j < nc; ++j) E(it, col++) = cplx(b.KF(it, a)) * h.RT(it, is, k, a, i, j);
         }
-        ec = dynbse::basis_coeffs(b, E);                  // (npf, nb): E_a = sum_{a'} ec(a') U_{a'}
-        e_fit_err = dynbse::basis_fit_error(b, E, ec);
+        if (refit == "union") {
+          dynbse::node_pole_fit upf;
+          upf.build(b.beta, b.s, b.eps, refit_rtol);        // the union node set as the fit target
+          ec = upf.coeffs(E);                                // (np, nb)
+          e_fit_err = upf.fit_error(E, ec);
+        } else {
+          ec = dynbse::basis_coeffs(b, E);                  // (npf, nb): E_a = sum_{a'} ec(a') U_{a'}
+          e_fit_err = dynbse::basis_fit_error(b, E, ec);
+        }
       }
       // tau[U_a U_a'](it): (nt, np, npf)
       nda::array<double, 3> Tpp(nt, np, npf);

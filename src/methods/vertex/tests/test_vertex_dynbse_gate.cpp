@@ -524,6 +524,7 @@ namespace bdft_tests {
               vtx.set_sigma_pair(true, col, outer, scale, true, true, side_cur);
               vtx.set_sigma_dyn(sd_dump, sd_nodes, sd_fit, sd_rank);
               if (sd_ckpt) vtx.set_sigma_dyn_ckpt_minutes(1e-9);   // P20: a checkpoint after every unit
+              if (auto *rf = std::getenv("COQUI_DYNBSE_TEST_SIGDYN_REFIT")) vtx.set_sigma_dyn_refit(rf);   // P12: fit | union
               if (auto *rm = std::getenv("COQUI_DYNBSE_TEST_RESOLVENT")) vtx.set_ladder_dyn_resolvent(rm);   // P7: inverse | lu
               if (auto *wc = std::getenv("COQUI_DYNBSE_TEST_WCACHE")) vtx.set_wcache_mode(wc);   // P19: replicated | shared
               scr_eri.set_vertex(&vtx);

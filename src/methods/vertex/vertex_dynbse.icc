@@ -2389,7 +2389,7 @@ namespace solvers {
     hook.t_sig = mpi->comm.all_reduce_value(hook.t_sig, boost::mpi3::max<>{});
     hook.nunits = mpi->comm.all_reduce_value(hook.nunits, std::plus<>{});
     double e_fit = 0.0;
-    vd::sigma_dyn_finish(hook, opt.scale, MF->nkpts(), dSig, e_fit);
+    vd::sigma_dyn_finish(hook, opt.scale, MF->nkpts(), dSig, e_fit, opt.dyn_refit, opt.dyn_refit_rtol);   // P12
     const long nt = dSig.shape(0), ns = dSig.shape(1), nk = dSig.shape(2), nc = dSig.shape(3);
     double dmax = 0.0, dherm = 0.0;
     for (long it = 0; it < nt; ++it)

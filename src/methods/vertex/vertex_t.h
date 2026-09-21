@@ -932,6 +932,8 @@ namespace solvers {
     std::vector<long> _sigma_dyn_nodes;          // pol_vertex_sigma_dyn_nodes: the sampled FULL-mesh nodes (empty = all)
     bool _sigma_pair_ibz = false;                // pol_vertex_sigma_pair_ibz: the IBZ solve + star fold of the Sigma-side vertex (P1)
     double _sigma_dyn_ckpt_minutes = 0.0;        // pol_vertex_sigma_dyn_ckpt_minutes: the Sigma-accumulator checkpoint interval (P20; 0 = off)
+    std::string _sigma_dyn_refit = "fit";        // pol_vertex_sigma_dyn_refit: fit | union (P12)
+    double _sigma_dyn_refit_rtol = 1e-8;         // pol_vertex_sigma_dyn_refit_rtol (P12)
     std::string _sigma_dyn_fit_file;             // pol_vertex_sigma_dyn_fit_file: the reference dump for the sampled mode
     long _sigma_dyn_fit_rank = 0;                // pol_vertex_sigma_dyn_fit_rank: K (0 = the number of sampled nodes)
     double _sigma_lff_pinv_tol = 1e-3;      // pol_vertex_sigma_pinv_tol: relative eigenvalue cutoff of Pi_0^-1 -- the vertex lives on the
@@ -1688,6 +1690,15 @@ namespace solvers {
      *  later run with the same prefix loads them and skips those units (a walltime kill loses one interval at most). */
     void set_sigma_dyn_ckpt_minutes(double m) { _sigma_dyn_ckpt_minutes = m; }
     double sigma_dyn_ckpt_minutes() const { return _sigma_dyn_ckpt_minutes; }
+    /** pol_vertex_sigma_dyn_refit (default "fit"; P12): the refit target of the T family's E_a = K_F RT_a in the finish --
+     *  "fit" = the DLR (vertex) nodes with the basis' regularized fit, "union" = every node of the union grid with a
+     *  node_pole_fit of rank fixed at pol_vertex_sigma_dyn_refit_rtol (1e-8). Reported as the finish's refit error. */
+    void set_sigma_dyn_refit(std::string const &m, double rtol = 1e-8) {
+      utils::check(m == "fit" or m == "union", "vertex_t::set_sigma_dyn_refit: pol_vertex_sigma_dyn_refit must be fit | union (got \"{}\").", m);
+      _sigma_dyn_refit = m; _sigma_dyn_refit_rtol = rtol;
+    }
+    std::string const &sigma_dyn_refit() const { return _sigma_dyn_refit; }
+    double sigma_dyn_refit_rtol() const { return _sigma_dyn_refit_rtol; }
     long sigma_dyn_fit_rank() const { return _sigma_dyn_fit_rank; }
     bool sigma_pair_enabled() const { return _sigma_pair; }
     std::string const &sigma_pair_col() const { return _sigma_pair_col; }
@@ -1713,6 +1724,8 @@ namespace solvers {
       std::string dump_prefix;          // the run prefix for the dump
       bool ibz = false;                 // P1: solve the Sigma-side ladder on the IBZ transfers only and fold the star (sym meshes)
       double dyn_ckpt_minutes = 0.0;    // P20: the Sigma-accumulator checkpoint interval of the dynamic solve (0 = off)
+      std::string dyn_refit = "fit";    // P12: the E-refit target of the T family: fit (the DLR nodes) | union (all union nodes)
+      double dyn_refit_rtol = 1e-8;     // P12: the union fit's rank cutoff
     };
     struct sigma_pair_meter {
       double dsig_max = 0.0, dsig_herm = 0.0, ks_herm = 0.0;
