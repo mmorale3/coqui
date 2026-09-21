@@ -687,6 +687,162 @@ namespace methods {
     app_log(1, "####### wannier interpolation routines end #######\n");
   }
 
+  // P24 / G31 (notes/vertex_perf_plan.md): the interpolation kernel of the qp_gaps fine-mesh report.
+  // The chain is the "quasiparticle" branch of wannier_interpolation above -- projector downfold on
+  // the coarse full-BZ mesh, k -> R with utils::k_to_R_coefficients on the Wigner-Seitz R grid,
+  // R -> k with utils::R_to_k_coefficients (1/degeneracy weights) -- with two deliberate differences:
+  // (i) the target k list is the uniform fine mesh (crystal coordinates (i/n1, j/n2, l/n3), all points),
+  // (ii) the imaginary part of H(R) is kept. With (ii) the round trip k -> R -> k is the identity on the
+  // coarse mesh (e^{ik.T} = 1 for every supercell vector T at a mesh k, and the WS copies of an R class
+  // carry weights 1/deg summing to 1), so the fine-mesh bands at a coarse k are EXACTLY the eigenvalues
+  // of the downfolded Heff(k) -- the gate of test_methods_pproc. H(R) obeys H(-R) = H(R)^dag, so the
+  // interpolant is Hermitian at every k up to rounding; it is Hermitized explicitly before heev.
+  auto pproc_t::interpolate_qp_bands_on_mesh(utils::mpi_context_t<mpi3::communicator> &context, mf::MF &mf,
+                                             projector_t const& proj,
+                                             nda::array_view<ComplexType, 4> Heff_skij_full,
+                                             nda::array<long, 2> const& Rpts_idx,
+                                             nda::array<long, 1> const& Rpts_weights,
+                                             std::array<long, 3> const& mesh)
+    -> std::tuple<nda::array<double, 2>, nda::array<RealType, 3>>
+  {
+    decltype(nda::range::all) all;
+    const long ns = mf.nspin();
+    const long nkpts = mf.nkpts();
+    const long nRpts = Rpts_idx.shape(0);
+    const long nImp = proj.nImps();
+    const long nImpOrbs = proj.nImpOrbs();
+    utils::check(nImp == 1, "interpolate_qp_bands_on_mesh: nImp != 1");
+    utils::check(Heff_skij_full.shape()[0] == ns and Heff_skij_full.shape()[1] == nkpts,
+                 "interpolate_qp_bands_on_mesh: Heff_skij_full is ({}, {}, ...), expected the full BZ ({}, {}, ...).",
+                 Heff_skij_full.shape()[0], Heff_skij_full.shape()[1], ns, nkpts);
+    utils::check(Rpts_weights.shape(0) == nRpts, "interpolate_qp_bands_on_mesh: Rpts_idx / Rpts_weights size mismatch.");
+    utils::check(mesh[0] > 0 and mesh[1] > 0 and mesh[2] > 0,
+                 "interpolate_qp_bands_on_mesh: mesh ({}, {}, {}) must be positive.", mesh[0], mesh[1], mesh[2]);
+
+    // 1. downfold Heff to the Wannier basis on the coarse full-BZ mesh: H_ab(k) = C(k) Heff_W(k) C(k)^dag
+    auto H_skIab = proj.downfold_k(Heff_skij_full, context.comm);   // (ns, nkpts, nImp, a, b)
+
+    // 2. k -> R on the WS grid (H(R) = 1/Nk sum_k e^{-ikR} H(k)); the imaginary part is KEPT (see above)
+    nda::array<ComplexType, 5> H_sRIab(ns, nRpts, nImp, nImpOrbs, nImpOrbs);
+    {
+      math::shm::shared_array<nda::array_view<ComplexType, 2>> sf_Rk(
+          std::addressof(context.comm), std::addressof(context.internode_comm), std::addressof(context.node_comm),
+          {nRpts, nkpts});
+      utils::k_to_R_coefficients(context.comm, Rpts_idx, mf.kpts(), mf.lattv(), sf_Rk);
+      auto f_Rk = sf_Rk.local();
+      for (long is = 0; is < ns; ++is) {
+        auto H_kab_2D = nda::reshape(H_skIab(is, nda::ellipsis{}),
+                                     std::array<long, 2>{nkpts, nImp*nImpOrbs*nImpOrbs});
+        auto H_Rab_2D = nda::reshape(H_sRIab(is, nda::ellipsis{}),
+                                     std::array<long, 2>{nRpts, nImp*nImpOrbs*nImpOrbs});
+        nda::blas::gemm(f_Rk, H_kab_2D, H_Rab_2D);
+      }
+      double max_imag = 0.0;
+      nda::for_each(H_sRIab.shape(),
+                    [&H_sRIab, &max_imag](auto ...i) { max_imag = std::max(max_imag, std::abs(H_sRIab(i...).imag())); });
+      app_log(2, "  interpolate_qp_bands_on_mesh: {} R vectors; largest |Im H(R)| = {:.3e} Ha (kept).", nRpts, max_imag);
+    }
+
+    // 3. the fine mesh: crystal coordinates for the report, cartesian for the phases
+    const long nkf = mesh[0]*mesh[1]*mesh[2];
+    nda::array<double, 2> kpts_crys(nkf, 3), kpts_cart(nkf, 3);
+    {
+      auto recv = mf.recv();
+      long ik = 0;
+      for (long i = 0; i < mesh[0]; ++i)
+        for (long j = 0; j < mesh[1]; ++j)
+          for (long l = 0; l < mesh[2]; ++l, ++ik) {
+            kpts_crys(ik, 0) = double(i) / double(mesh[0]);
+            kpts_crys(ik, 1) = double(j) / double(mesh[1]);
+            kpts_crys(ik, 2) = double(l) / double(mesh[2]);
+            for (int d = 0; d < 3; ++d)
+              kpts_cart(ik, d) = kpts_crys(ik, 0) * recv(0, d) + kpts_crys(ik, 1) * recv(1, d) + kpts_crys(ik, 2) * recv(2, d);
+          }
+    }
+
+    // 4. R -> k on the fine mesh: H(k) = sum_R e^{ikR} H(R) / deg(R)
+    nda::array<ComplexType, 4> H_skab(ns, nkf, nImpOrbs, nImpOrbs);
+    {
+      math::shm::shared_array<nda::array_view<ComplexType, 2>> sf_kR(
+          std::addressof(context.comm), std::addressof(context.internode_comm), std::addressof(context.node_comm),
+          {nkf, nRpts});
+      utils::R_to_k_coefficients(context.comm, Rpts_idx, Rpts_weights, kpts_cart, mf.lattv(), sf_kR);
+      auto f_kR = sf_kR.local();
+      for (long is = 0; is < ns; ++is) {
+        auto H_Rab_2D = nda::reshape(H_sRIab(is, nda::ellipsis{}),
+                                     std::array<long, 2>{nRpts, nImp*nImpOrbs*nImpOrbs});
+        auto H_kab_2D = nda::reshape(H_skab(is, nda::ellipsis{}),
+                                     std::array<long, 2>{nkf, nImp*nImpOrbs*nImpOrbs});
+        nda::blas::gemm(f_kR, H_Rab_2D, H_kab_2D);
+      }
+    }
+
+    // 5. Hermitize, diagonalize (round robin over (s, k)), reduce
+    nda::array<RealType, 3> E_ska(ns, nkf, nImpOrbs);
+    E_ska() = 0.0;
+    nda::array<ComplexType, 2> Hk(nImpOrbs, nImpOrbs);
+    for (long isk = context.comm.rank(); isk < ns*nkf; isk += context.comm.size()) {
+      const long is = isk / nkf;
+      const long ik = isk % nkf;
+      for (long a = 0; a < nImpOrbs; ++a)
+        for (long b = 0; b < nImpOrbs; ++b)
+          Hk(a, b) = 0.5 * (H_skab(is, ik, a, b) + std::conj(H_skab(is, ik, b, a)));
+      E_ska(is, ik, all) = nda::linalg::eigenvalues(Hk);
+    }
+    context.comm.all_reduce_in_place_n(E_ska.data(), E_ska.size(), std::plus<>{});
+
+    return std::make_tuple(std::move(kpts_crys), std::move(E_ska));
+  }
+
+  auto pproc_t::qp_bands_on_mesh(mf::MF &mf, std::string project_file, std::array<long, 3> const& mesh,
+                                 std::string grp_name, long iter, bool translate_home_cell)
+    -> std::tuple<nda::array<double, 2>, nda::array<RealType, 3>>
+  {
+    std::string filename = _scf_output + ".mbpt.h5";
+    // resolve the iteration and the Heff_skij location exactly as wannier_interpolation does
+    // (Dyson-SCF writes qp_approx/Heff_skij, QP-SCF writes Heff_skij directly); broadcast as numbers
+    long has_qp_approx = 0;
+    if (_context.comm.root()) {
+      h5::file file(filename, 'r');
+      utils::check(h5::group(file).has_subgroup(grp_name),
+                   "qp_bands_on_mesh: {} does not exist in {}", grp_name, filename);
+      auto grp = h5::group(file).open_group(grp_name);
+      if (iter == -1) h5::h5_read(grp, "final_iter", iter);
+      auto iter_grp = grp.open_group("iter"+std::to_string(iter));
+      has_qp_approx = (iter_grp.has_subgroup("qp_approx")) ? 1 : 0;
+      utils::check(has_qp_approx ? iter_grp.open_group("qp_approx").has_dataset("Heff_skij")
+                                 : iter_grp.has_dataset("Heff_skij"),
+                   "qp_bands_on_mesh: Heff_skij not found in {}/iter{} (run compute_qp_on_ibz_kmesh first).",
+                   grp_name, iter);
+    }
+    _context.comm.broadcast_n(&iter, 1, 0);
+    _context.comm.broadcast_n(&has_qp_approx, 1, 0);
+    std::string Heff_path = grp_name + "/iter" + std::to_string(iter) + (has_qp_approx ? "/qp_approx/Heff_skij" : "/Heff_skij");
+
+    // the R grid: the Wannier90 converter's (r_vector, r_degeneracy) when present, else the WS grid of the mesh
+    nda::array<long, 2> Rpts_idx;
+    nda::array<long, 1> Rpts_weights;
+    {
+      h5::file file(project_file, 'r');
+      auto dft_grp = h5::group(file).open_group("dft_input");
+      if (dft_grp.has_dataset("r_vector") and dft_grp.has_dataset("r_degeneracy")) {
+        nda::h5_read(dft_grp, "r_vector", Rpts_idx);
+        nda::h5_read(dft_grp, "r_degeneracy", Rpts_weights);
+      } else {
+        std::tie(Rpts_weights, Rpts_idx) = utils::WS_rgrid(mf.lattv(), mf.kp_grid());
+      }
+    }
+
+    projector_t proj(mf, project_file, translate_home_cell);
+    app_log(1, "  [qp_gaps] Wannier interpolation of {} ({} Wannier orbitals, primary bands [{}, {})) onto the {}x{}x{} mesh",
+            Heff_path, proj.nImpOrbs(), proj.W_rng()[0].first(), proj.W_rng()[0].last(), mesh[0], mesh[1], mesh[2]);
+
+    auto sHeff_skij_full = unfold_1e_hamiltonian(_context, mf, filename, Heff_path, false);
+    auto res = interpolate_qp_bands_on_mesh(_context, mf, proj, sHeff_skij_full.local(), Rpts_idx, Rpts_weights, mesh);
+    _context.comm.barrier();
+    return res;
+  }
+
   void pproc_t::compute_qp_on_ibz_kmesh(mf::MF &mf, const qp_params_t &qp_params, 
                                         std::string grp_name, long iter) {
 

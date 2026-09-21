@@ -11,3 +11,7 @@ endif()
 target_link_libraries(pproc_lib PUBLIC scr_coulomb_lib scf_lib)
 install(TARGETS pproc_lib
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+
+if (BUILD_UNIT_TESTS)
+    add_subdirectory(tests)
+endif()

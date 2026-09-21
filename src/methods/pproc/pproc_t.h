@@ -22,6 +22,8 @@
 #ifndef COQUI_PPROC_T_HPP
 #define COQUI_PPROC_T_HPP
 
+#include <array>
+#include <tuple>
 #include "mpi3/communicator.hpp"
 #include "nda/nda.hpp"
 #include "nda/h5.hpp"
@@ -43,6 +45,8 @@
 
 namespace methods {
   namespace mpi3 = boost::mpi3;
+
+  class projector_t;   // methods/embedding/projector_t.h (the Wannier projector of qp_bands_on_mesh)
 
   // TODO This should not be a class! Separate these into free functions.
   // TODO Useful features:
@@ -115,6 +119,43 @@ namespace methods {
      * Results are written to {grp_name}/iter{N}/cvv_eps in the checkpoint.
      */
     void cvv_eps(mf::MF &mf, ptree const& pt, std::string grp_name="scf", long iter=-1);
+
+    /**
+     * P24 / G31 (notes/vertex_perf_plan.md): Wannier interpolation of the quasiparticle Hamiltonian
+     * of {grp_name}/iter{N} (qp_approx/Heff_skij when present, Heff_skij otherwise) onto a UNIFORM
+     * fine k mesh -- all n1*n2*n3 points of the mesh in crystal coordinates, not the IBZ -- with the
+     * "quasiparticle" machinery of wannier_interpolation (IBZ -> full-BZ unfold, projector downfold,
+     * k -> R on the Wigner-Seitz R grid of the mean-field mesh, R -> k on the fine mesh), followed by
+     * a per-k Hermitization and diagonalization (interpolate_qp_bands_on_mesh). Unlike the band-path
+     * route, the imaginary part of H(R) is KEPT, so the interpolation is exact on the mean-field mesh:
+     * at a mesh k the interpolated bands are the eigenvalues of the downfolded Heff(k) (the identity
+     * gate of test_methods_pproc). Consumed by the qp_gaps post-processing (qp_gaps_interp = true).
+     * Writes nothing to the checkpoint.
+     * @param mf - [INPUT] mean-field instance (mesh, lattice, symmetry maps)
+     * @param project_file - [INPUT] h5 file with the Wannier projection matrices (dft_input/proj_mat)
+     * @param mesh - [INPUT] the fine mesh (n1, n2, n3)
+     * @return (kpts_crys (nk_fine, 3), E_ska (ns, nk_fine, nImpOrbs) in Ha, ascending per k)
+     */
+    auto qp_bands_on_mesh(mf::MF &mf, std::string project_file, std::array<long, 3> const& mesh,
+                          std::string grp_name="scf", long iter=-1, bool translate_home_cell=false)
+      -> std::tuple<nda::array<double, 2>, nda::array<RealType, 3>>;
+
+    /**
+     * The interpolation kernel of qp_bands_on_mesh, checkpoint-free (the unit-test entry).
+     * @param Heff_skij_full - [INPUT] the QP Hamiltonian on the FULL BZ in the primary (DFT band)
+     *                         basis, (ns, nkpts, nbnd, nbnd), k ordered as mf.kpts()
+     * @param Rpts_idx / Rpts_weights - [INPUT] the R grid (integer lattice coordinates) and its
+     *                         Wigner-Seitz degeneracies (utils::WS_rgrid or dft_input/r_vector)
+     * @param mesh - [INPUT] the fine mesh (n1, n2, n3); k index = (i*n2 + j)*n3 + l, k = (i/n1, j/n2, l/n3)
+     * @return (kpts_crys (nk_fine, 3), E_ska (ns, nk_fine, nImpOrbs) in Ha, ascending per k)
+     */
+    static auto interpolate_qp_bands_on_mesh(utils::mpi_context_t<mpi3::communicator> &context, mf::MF &mf,
+                                             projector_t const& proj,
+                                             nda::array_view<ComplexType, 4> Heff_skij_full,
+                                             nda::array<long, 2> const& Rpts_idx,
+                                             nda::array<long, 1> const& Rpts_weights,
+                                             std::array<long, 3> const& mesh)
+      -> std::tuple<nda::array<double, 2>, nda::array<RealType, 3>>;
 
   private:
     template<nda::ArrayOfRank<4> local_Array_4D_t, typename communicator_t>
