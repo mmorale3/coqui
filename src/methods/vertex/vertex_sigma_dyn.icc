@@ -401,6 +401,23 @@ namespace solvers {
               for (long y = 0; y < nc; ++y)
                 for (long r = 0; r < nR; ++r) h.fam1_ext = std::max(h.fam1_ext, std::abs(yv->fam(1, a, ik, x, y, r)));
       auto Wblk = Wout(nda::range(N0, N1), all);                  // (nR, Nm): rows N of the dressed leg
+      // P4 / C13 (vertex_perf_plan.md): the external leg contracted with the outer W ONCE per block and k' --
+      //   DW(k'; c i, N) = sum_M conj(Dc(k', c, i, M)) W(N, M)      (nk x nc^2 x nR, 2 nk nc^2 Nm nR flops per block)
+      // so that every (tau, k') / (a, k') contraction below is a (nc^2 x nR)(nR x nc^2) gemm instead of the two
+      // (nc^2 x nR)(nR x Nm) + (nc^2 x Nm)(Nm x nc^2) ones (the M-contraction repeated nt / np times): ~7x on the legs.
+      // The summation order changes (sum_N sum_M -> sum_M sum_N): rounding class. COQUI_SIGDYN_LEGS=wm restores the old order.
+      static const bool legs_wm = (vertex_debug::text("sigdyn_legs", "dw") == "wm");   // vertex_debug: sigdyn_legs = dw | wm
+      nda::array<cplx, 3> DWall(legs_wm ? 0 : nk, nc2, nR);
+      if (not legs_wm) {
+        nda::array<cplx, 2> Dck(nc2, Nm);
+        for (long ik = 0; ik < nk; ++ik) {
+          for (long c = 0; c < nc; ++c)
+            for (long i = 0; i < nc; ++i)
+              for (long M = 0; M < Nm; ++M) Dck(c * nc + i, M) = std::conj(Dc(ik, c, i, M));
+          auto DWk = DWall(ik, all, all);
+          nda::blas::gemm(Dck, nda::transpose(Wblk), DWk);          // (nc^2 x Nm)(Nm x nR)
+        }
+      }
       // ---- (cst + U): A_cU on the Matsubara nodes, the product with G, the tau image, the legs -----------------------
       {
         // Uw(n, a) = 1/(i w_n - e_a); A_w(n; k' x y r) = Acst + sum_a Uw(n, a) fam0(a; k' x y r)   (one gemm)
@@ -450,13 +467,22 @@ namespace solvers {
           for (long it = 0; it < nt; ++it) {
             for (long p = 0; p < nc2; ++p)
               for (long r = 0; r < nR; ++r) Ak(p, r) = Ft(it, (ik * nc2 + p) * nR + r);
-            nda::blas::gemm(Ak, Wblk, Bk);
             Hsum() = cplx(0.0);
-            for (long c = 0; c < nc; ++c) {
-              auto Dcv = Dconj(nda::range(c * nc, (c + 1) * nc), all);
-              auto Bcv = Bk(nda::range(c * nc, (c + 1) * nc), all);
-              nda::blas::gemm(Dcv, nda::transpose(Bcv), Hc);
-              Hsum += Hc;
+            if (legs_wm) {
+              nda::blas::gemm(Ak, Wblk, Bk);
+              for (long c = 0; c < nc; ++c) {
+                auto Dcv = Dconj(nda::range(c * nc, (c + 1) * nc), all);
+                auto Bcv = Bk(nda::range(c * nc, (c + 1) * nc), all);
+                nda::blas::gemm(Dcv, nda::transpose(Bcv), Hc);
+                Hsum += Hc;
+              }
+            } else {
+              for (long c = 0; c < nc; ++c) {                       // H(i, j) = sum_c sum_N DW(c i, N) F_t(c j, N)
+                auto DWc = DWall(ik, nda::range(c * nc, (c + 1) * nc), all);
+                auto Acv = Ak(nda::range(c * nc, (c + 1) * nc), all);
+                nda::blas::gemm(DWc, nda::transpose(Acv), Hc);
+                Hsum += Hc;
+              }
             }
             const cplx w = h.wc(tools, it, m);
             for (long i = 0; i < nc; ++i)
@@ -532,8 +558,12 @@ namespace solvers {
             if (not hasT[size_t(a)]) continue;
             for (long p = 0; p < nc2; ++p)
               for (long r = 0; r < nR; ++r) famA(p, r) = yv->fam(1, a, ik, p / nc, p % nc, r);   // rows (x, j)
-            nda::blas::gemm(famA, Wblk, Bw);                                                     // Bw(x j, M)
-            nda::blas::gemm(Dconj, nda::transpose(Bw), Y);                                       // Y(c i, x j)
+            if (legs_wm) {
+              nda::blas::gemm(famA, Wblk, Bw);                                                   // Bw(x j, M)
+              nda::blas::gemm(Dconj, nda::transpose(Bw), Y);                                     // Y(c i, x j)
+            } else {
+              nda::blas::gemm(DWall(ik, all, all), nda::transpose(famA), Y);                     // Y(c i, x j) = sum_N DW(c i, N) famA(x j, N)
+            }
             for (long c = 0; c < nc; ++c)
               for (long i = 0; i < nc; ++i)
                 for (long x = 0; x < nc; ++x)
