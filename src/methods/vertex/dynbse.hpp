@@ -2701,9 +2701,15 @@ namespace dynbse {
                                         nda::array<cplx, 4> const &Dc, double tol, long maxit, long m,
                                         nda::array<cplx, 3> const *Cb_cst = nullptr, shift_tables const *st = nullptr,
                                         tf_metric const *metric = nullptr, double readout_tol = 0.0,
-                                        bool gamma1_only = false, bool keep_y = false) {
+                                        bool gamma1_only = false, bool keep_y = false,
+                                        tf_vector const *y0 = nullptr) {
+    // P9 (vertex_perf_plan.md): y0 = an initial guess of the dynamic remainder (a warm start; null = y = 0). Every cycle
+    // starts from the true residual r = rhs - A y, so a guess only changes the path, not the converged solution; with
+    // y = 0 the first application A y is an exact zero and is skipped (one K_d application per block saved, bitwise).
     const long nk = P.nk, nc = P.nc, nR = Dc.shape(3), np = b.np;
     utils::check(m >= 1, "dynbse::solve_dyson_gmres: m >= 1.");
+    utils::check(y0 == nullptr or (y0->np == np and y0->nk == nk and y0->nc == nc and y0->nR == nR),
+                 "dynbse::solve_dyson_gmres: the warm-start vector has another shape than the solve.");
     dyson_result out;
     out.Gsum = nda::array<cplx, 4>(nk, nc, nc, nR);
     out.Gsum1 = nda::array<cplx, 4>(nk, nc, nc, nR);
@@ -2738,7 +2744,7 @@ namespace dynbse {
     for (long j = 0; j <= m; ++j) V.emplace_back(np, nk, nc, nR);
     nda::array<cplx, 3> H(m + 1, m, nR);          // Hessenberg per column
     nda::array<cplx, 1> beta(nR);
-    y.zero();
+    if (y0 != nullptr) { y.fam() = y0->fam; y.cst() = y0->cst; } else y.zero();
     long it = 0;
     bool done = false;
     double ritz_max = 0.0;
@@ -2755,10 +2761,15 @@ namespace dynbse {
       return collapse(Dc, Gsum);
     };
     while (not done and it < maxit) {
-      // r = rhs - A y
-      apply_A(y, w);
-      r.fam() = rhs.fam - w.fam;
-      r.cst() = rhs.cst - w.cst;
+      // r = rhs - A y   (y = 0 on the first cycle of a cold start: r = rhs without the application)
+      if (it == 0 and y0 == nullptr) {
+        r.fam() = rhs.fam;
+        r.cst() = rhs.cst;
+      } else {
+        apply_A(y, w);
+        r.fam() = rhs.fam - w.fam;
+        r.cst() = rhs.cst - w.cst;
+      }
       tf_dots(r, r, dots, metric);
       double rel = 0.0;
       for (long c = 0; c < nR; ++c) {
