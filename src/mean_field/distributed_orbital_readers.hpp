@@ -97,16 +97,21 @@ auto read_distributed_orbital_set(MF& mfobj, comm_t& comm, char OT,
       long sz = comm.size();
       long ps = (sz%nspin==0?nspin:1);
       long n_ = sz/ps;
-      long pk = utils::find_proc_grid_max_rows(n_,nkpts);
-      pgrid = {ps,pk,n_/pk,1};
+      // P21: the bounded (k, band) grid -- the historic gcd grid when it fits, else the repair (see find_proc_grid_kb)
+      auto kb = utils::find_proc_grid_kb(n_, nkpts, nbnd);
+      utils::check(kb[0] > 0, "read_distributed_orbital_set: {} ranks cannot be laid out over {} k-points x {} bands "
+                              "(one band per rank at most); use at most {} ranks.", sz, nkpts, nbnd, ps * nkpts * nbnd);
+      pgrid = {ps,kb[0],kb[1],1};
     }
   } else if constexpr (rank==5){ 
     if( (np0 == 0) or ((OT=='r') and (pgrid[rank-1]!=1)) ) {
       long sz = comm.size();
       long ps = (sz%nspin==0?nspin:1); 
       long n_ = sz/ps;
-      long pk = utils::find_proc_grid_max_rows(n_,nkpts);
-      pgrid = {ps,pk,n_/pk,1,1};
+      auto kb = utils::find_proc_grid_kb(n_, nkpts, nbnd);
+      utils::check(kb[0] > 0, "read_distributed_orbital_set: {} ranks cannot be laid out over {} k-points x {} bands "
+                              "(one band per rank at most); use at most {} ranks.", sz, nkpts, nbnd, ps * nkpts * nbnd);
+      pgrid = {ps,kb[0],kb[1],1,1};
     }
   }
   if(np0 == 0) pgrid_out = pgrid;

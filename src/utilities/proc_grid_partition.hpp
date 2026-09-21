@@ -22,6 +22,7 @@
 #ifndef UTILITIES_PROC_GRID_PARTITION_HPP
 #define UTILITIES_PROC_GRID_PARTITION_HPP
 
+#include <array>
 #include "utilities/check.hpp"
 
 namespace utils
@@ -52,6 +53,24 @@ inline long find_proc_grid_max_rows(long size, long nkpts)
   for(long i=1; i<nk/2+1; ++i)
     if( nk%i == 0 and np%(nk/i) == 0 ) return nk/i;
   return 1;
+}
+
+/**
+ * P21 (notes/vertex_perf_plan.md, 2026-09-21): the BOUNDED (k, band) grid of `size` ranks for an array with nkpts
+ * k-points and nbnd bands, {pk, pb} with pk * pb = size, pk <= nkpts, pb <= nbnd -- the repair of the historic
+ * chooser find_proc_grid_max_rows (the gcd of size and nkpts), which puts every rank on the band axis when size and
+ * nkpts are coprime (64 ranks, 13 IBZ k: pk = 1, pb = 64 > 60 bands -> "make_distributed_array: Too many processors").
+ * Bit-for-bit rule: the historic grid is kept whenever it fits (pb_old <= nbnd); only a grid that would abort is
+ * replaced, by the largest divisor pk of size with pk <= nkpts whose pb = size / pk fits (chunk_range handles k
+ * pools that do not divide nkpts). Returns {0, 0} when no such grid exists (size > nkpts * nbnd in effect).
+ */
+inline std::array<long, 2> find_proc_grid_kb(long size, long nkpts, long nbnd)
+{
+  const long pk_old = find_proc_grid_max_rows(size, nkpts);
+  if (size / pk_old <= nbnd) return {pk_old, size / pk_old};
+  for (long pk = std::min(size, nkpts); pk >= 1; --pk)
+    if (size % pk == 0 and size / pk <= nbnd) return {pk, size / pk};
+  return {0, 0};
 }
 
 /**
