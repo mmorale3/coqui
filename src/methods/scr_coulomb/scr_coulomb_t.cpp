@@ -29,6 +29,7 @@
 #include "methods/HF/thc_solver_comm.hpp"
 #include "methods/GW/g0_div_utils.hpp"
 #include "methods/vertex/vertex_t.h"
+#include "methods/vertex/nu_sampling.hpp"
 #include "methods/vertex/vertex_secondary_fold.hpp"
 #include "utilities/proc_grid_partition.hpp"
 #include "nda/linalg/eigenelements.hpp"
@@ -496,7 +497,7 @@ namespace solvers {
     _pol_vtx->set_ladder_dyn_cut_r1(_vertex->ladder_dyn_cut_r1());
     _pol_vtx->set_ladder_dyn_bubble_only(_vertex->ladder_dyn_bubble_only());
     _pol_vtx->set_ladder_dyn_all_nu_nodes(_vertex->ladder_dyn_all_nu_nodes());
-    _pol_vtx->set_ladder_dyn_fit(_vertex->ladder_dyn_fit_file(), _vertex->ladder_dyn_fit_rank());
+    _pol_vtx->set_ladder_dyn_fit(_vertex->ladder_dyn_fit_file(), _vertex->ladder_dyn_fit_rank(), _vertex->ladder_dyn_fit_mode(), _vertex->ladder_dyn_fit_auto_nodes());
     _pol_vtx->set_ladder_dyn_resum_mu_file(_vertex->ladder_dyn_resum_mu_file());
     // W-int-1b: the coarse->fine interpolation knobs travel to the readout instance too
     _pol_vtx->set_isdf_points(_vertex->isdf_points_file(), _vertex->isdf_points_dump());
@@ -1232,6 +1233,36 @@ namespace solvers {
     // all nodes when empty), the window bubble Pi_bub on ALL nodes; bubble_only skips the dynamic columns altogether.
     const bool bub_only = _pol_vtx->ladder_dyn_bubble_only();
     std::vector<long> nodes = _pol_vtx->ladder_dyn_all_nu_nodes();
+    // P14: pol_vertex_dyn_fit_auto_nodes = K -> the K sampled half nodes chosen from the fit file's Gamma_1 (else static) column:
+    // nu = 0 and the highest node forced, the rest the row pivots of the top-K nu-modes (nu_sampling.hpp)
+    if (nodes.empty() and _pol_vtx->ladder_dyn_fit_auto_nodes() > 0 and not _pol_vtx->ladder_dyn_fit_file().empty()) {
+      const long Kn = _pol_vtx->ladder_dyn_fit_auto_nodes();
+      std::vector<long> chosen;
+      if (thc.mpi()->comm.root()) {
+        h5::file ff(_pol_vtx->ladder_dyn_fit_file(), 'r');
+        h5::group gf(ff);
+        const char *pref[3] = {"Pi_gam1", "Pi_dyn", "Pi_static"};
+        std::string col;
+        for (auto *c : pref) if (gf.has_dataset(c)) { col = c; break; }
+        utils::check(not col.empty(), "dump_pol_dyn_all_nu: the fit file {} has no Pi_gam1 / Pi_dyn / Pi_static column for the automatic node choice.",
+                     _pol_vtx->ladder_dyn_fit_file());
+        nda::array<ComplexType, 4> T;
+        nda::h5_read(gf, col, T);
+        utils::check(T.shape(0) == nw_h, "dump_pol_dyn_all_nu: the fit file's {} has {} half nodes, this run {}.", col, T.shape(0), nw_h);
+        auto T2 = nda::reshape(T, std::array<long, 2>{nw_h, long(T.size()) / nw_h});
+        auto G = nusamp::gram(T2);
+        chosen = nusamp::pivot_nodes(G, Kn, std::vector<long>{0L, nw_h - 1});
+        std::string lst;
+        for (long n : chosen) lst += std::to_string(n) + " ";
+        app_log(1, "  [LFF L-3] automatic sampled nodes ({} of {}, from the {} column of {}): {}", chosen.size(), nw_h, col,
+                _pol_vtx->ladder_dyn_fit_file(), lst);
+      }
+      long nch = long(chosen.size());
+      thc.mpi()->comm.broadcast_value(nch, 0);
+      chosen.resize(size_t(nch));
+      thc.mpi()->comm.broadcast_n(chosen.data(), nch, 0);
+      nodes = chosen;
+    }
     if (nodes.empty()) nodes = nodes_all;
     std::sort(nodes.begin(), nodes.end());
     nodes.erase(std::unique(nodes.begin(), nodes.end()), nodes.end());
@@ -1330,35 +1361,23 @@ namespace solvers {
                            "dump_pol_dyn_all_nu: the fit file's {} is {} x {} x {} x {}, expected {} x {} x {} x {}.", names[c],
                            T.shape(0), T.shape(1), T.shape(2), T.shape(3), nw_h, nq, Nm, Nm);
               auto T2 = nda::reshape(T, std::array<long, 2>{nw_h, ncol});
-              // the nu-modes: eigenvectors of the (nw_h x nw_h) Gram G = T2 T2^dag (descending eigenvalues = the SVD modes)
-              nda::matrix<ComplexType> G(nw_h, nw_h);
-              nda::blas::gemm(T2, nda::dagger(T2), G);
-              for (long a = 0; a < nw_h; ++a) for (long b = 0; b < a; ++b) { G(a, b) = 0.5 * (G(a, b) + std::conj(G(b, a))); G(b, a) = std::conj(G(a, b)); }
-              auto [lam, V] = nda::linalg::eigenelements(G);   // ascending
-              double ltot = 0.0, lkept = 0.0;
-              for (long a = 0; a < nw_h; ++a) ltot += std::max(0.0, lam(a));
-              nda::matrix<ComplexType> Phi(nw_h, Kfit), PhiS(NS, Kfit);
-              for (long k = 0; k < Kfit; ++k) {
-                const long a = nw_h - 1 - k;
-                lkept += std::max(0.0, lam(a));
-                for (long j = 0; j < nw_h; ++j) Phi(j, k) = V(j, a);
-                for (long j = 0; j < NS; ++j) PhiS(j, k) = V(nodes[size_t(j)], a);
-              }
-              // least squares on the sampled rows: A = (PhiS^dag PhiS)^-1 PhiS^dag P_S  (K x K normal equations)
-              nda::matrix<ComplexType> N(Kfit, Kfit);
-              nda::blas::gemm(nda::dagger(PhiS), PhiS, N);
-              nda::inverse_in_place(N);
-              nda::matrix<ComplexType> PS(NS, ncol), B(Kfit, ncol), A(Kfit, ncol), Pfull(nw_h, ncol);
+              // the nu-modes of the basis column (its Gram over the nodes) and the reconstruction R (nw_h x NS) of all nodes
+              // from the sampled ones (nu_sampling.hpp): "modes" = the L-3 least squares on the top-K modes (exact at the
+              // sampled nodes when K = NS), "regression" = G(:,S) G(S,S)^-1_K (P14)
+              const std::string fmode = _pol_vtx->ladder_dyn_fit_mode();
+              auto G = nusamp::gram(T2);
+              double lkept = 0.0;
+              const long nto = nusamp::modes_to(G, 1e-4, Kfit, &lkept);
+              (void)nto;
+              auto R = nusamp::reconstruction(G, nodes, Kfit, fmode);
+              nda::matrix<ComplexType> PS(NS, ncol), Pfull(nw_h, ncol);
               for (long j = 0; j < NS; ++j) { auto row = nda::reshape(rd->Pi(c, j, all, all, all), std::array<long, 1>{ncol}); PS(j, all) = row; }
-              nda::blas::gemm(nda::dagger(PhiS), PS, B);
-              nda::blas::gemm(N, B, A);
-              nda::blas::gemm(Phi, A, Pfull);
+              nda::blas::gemm(R, PS, Pfull);
               // the residual at the sampled rows (exact when Kfit = NS) and the Hermitized full object
               double rs = 0.0, ns = 0.0;
               for (long j = 0; j < NS; ++j)
                 for (long i = 0; i < ncol; ++i) {
-                  ComplexType f = 0.0;
-                  for (long k = 0; k < Kfit; ++k) f += PhiS(j, k) * A(k, i);
+                  const ComplexType f = Pfull(nodes[size_t(j)], i);
                   rs += std::norm(f - PS(j, i)); ns += std::norm(PS(j, i));
                 }
               for (long j = 0; j < nw_h; ++j)
@@ -1369,8 +1388,8 @@ namespace solvers {
               fitted = true;
               double pmax = 0.0;
               for (auto const &v : P) pmax = std::max(pmax, std::abs(v));
-              app_log(1, "  [LFF L-3]   {}: {} modes carry {:.6f} of the basis column's |.|^2; residual at the sampled nodes {:.2e}; "
-                         "max |P| {:.3e}", names[c], Kfit, (ltot > 0.0) ? lkept / ltot : 0.0, (ns > 0.0) ? std::sqrt(rs / ns) : 0.0, pmax);
+              app_log(1, "  [LFF L-3]   {}: {} modes carry {:.6f} of the basis column's |.|^2 ({} form); residual at the sampled nodes {:.2e}; "
+                         "max |P| {:.3e}", names[c], Kfit, lkept, fmode, (ns > 0.0) ? std::sqrt(rs / ns) : 0.0, pmax);
             } else {
               app_log(1, "  [LFF L-3]   {}: not in the fit file -- written at the sampled nodes only.", names[c]);
             }

@@ -902,6 +902,9 @@ namespace solvers {
     std::vector<long> _dyn_all_nu_nodes;  // pol_vertex_dyn_all_nu_nodes: the sampled half nodes of the all-nu dump (empty = all)
     std::string _dyn_fit_file;            // pol_vertex_dyn_fit_file: a previous full all-nu dump = the learned nu-basis (LFF L-3)
     long _dyn_fit_rank = 0;               // pol_vertex_dyn_fit_rank: number of nu-modes (0 = the number of sampled nodes)
+    std::string _dyn_fit_mode = "modes";  // pol_vertex_dyn_fit_mode: modes (the L-3 least squares on the top-K modes) | regression (P14)
+    long _dyn_fit_auto_nodes = 0;         // pol_vertex_dyn_fit_auto_nodes: K > 0 = choose the K sampled nodes from the fit file's modes
+                                          // (nu = 0 and the highest node forced, the rest by column-pivoted QR of the mode matrix)
     // LFF-Sigma (Route 1, notes/lff_aux_plan.md 2026-09-19): the local-field-factor vertex in the SELF-ENERGY,
     // Sigma = G W~ with W~ = W Gamma_eff, Gamma_eff = Pi_0^-1 (Pi_0 + dPi) in the frozen secondary frame -- controlled
     // SEPARATELY from the P-side injection (pol_vertex_inject). "none" (default) | "lff".
@@ -1584,7 +1587,12 @@ namespace solvers {
      *  squares in that basis and written at ALL nodes, so the consumer reads the file unchanged. Measured on Si kp444 (plan
      *  §5, round 2): 5 nodes (nu = 0 + 3 pivots + the highest node) reproduce the 40-node Gamma_1 object in the W-Dyson to
      *  0.01 % of the vertex effect on e_corr. */
-    void set_ladder_dyn_fit(std::string const &file, long rank) { _dyn_fit_file = file; _dyn_fit_rank = rank; }
+    void set_ladder_dyn_fit(std::string const &file, long rank, std::string const &mode = "modes", long auto_nodes = 0) {
+      utils::check(mode == "modes" or mode == "regression", "vertex_t::set_ladder_dyn_fit: pol_vertex_dyn_fit_mode must be modes | regression (got \"{}\").", mode);
+      _dyn_fit_file = file; _dyn_fit_rank = rank; _dyn_fit_mode = mode; _dyn_fit_auto_nodes = auto_nodes;
+    }
+    std::string const &ladder_dyn_fit_mode() const { return _dyn_fit_mode; }
+    long ladder_dyn_fit_auto_nodes() const { return _dyn_fit_auto_nodes; }
     /** LFF (notes/lff_aux_plan.md, "Gamma_1 -> resummed"): pol_vertex_dyn_resum_mu_file = a text table of mu(nu_j), one value
      *  per PH-sym half node (n_nu lines: "j nu mu" or "mu"; '#' comments). The all-nu dump then writes Pi_dyn = mu(nu_j) x
      *  Pi_gam1 (the fitted / evaluated Gamma_1 column) -- the fully resummed vertex to 2-3 % of the correction on Si

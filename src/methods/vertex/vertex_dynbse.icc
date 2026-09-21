@@ -50,6 +50,7 @@
 #if defined(ENABLE_FFTW)
 #include "numerics/fft/fftw.h"
 #include "methods/vertex/vertex_sigma_dyn.icc"   // LFF-Sigma L-7: the Sigma hook of the dynamic-rung solver
+#include "methods/vertex/nu_sampling.hpp"       // P14: the sampled-nu service (reconstruction from a node subset)
 #endif
 
 namespace methods {
@@ -2035,6 +2036,17 @@ namespace solvers {
         nda::h5_read(g, "Hc", H);
         utils::check(H.shape(0) == nw_b, "vertex_t::eval_sigma_pair_dyn: the reference dump has {} nodes, this run {}.", H.shape(0), nw_b);
         {
+          // P13: the reference may come from ANOTHER k mesh (the nu-modes are set by the pair continuum, not by the mesh);
+          // what must agree is the imaginary-axis grid: the bosonic node labels and the pole node set
+          nda::array<long, 1> wn_ref;
+          nda::h5_read(g, "wn_b", wn_ref);
+          utils::check(wn_ref.shape(0) == nw_b, "vertex_t::eval_sigma_pair_dyn: the reference dump's bosonic mesh has {} nodes, this run {}.", wn_ref.shape(0), nw_b);
+          for (long m = 0; m < nw_b; ++m)
+            utils::check(wn_ref(m) == tools.wn_b(m), "vertex_t::eval_sigma_pair_dyn: bosonic node {} of the reference dump is w_n = {}, this run {} "
+                                                     "(same beta / wmax / prec required).", m, wn_ref(m), tools.wn_b(m));
+          nda::h5_read(g, "eps", hook.eps_ref);
+        }
+        {
           const long rows = long(H.size()) / nw_b;
           auto H2 = nda::reshape(H, std::array<long, 2>{nw_b, rows});
           Gc = nda::array<ComplexType, 2>(nw_b, nw_b);
@@ -2059,17 +2071,14 @@ namespace solvers {
         }
       }
       mpi->comm.broadcast_value(np_ref, 0);
-      if (not mpi->comm.root()) { Gc = nda::array<ComplexType, 2>(nw_b, nw_b); GT = nda::array<ComplexType, 3>(np_ref, nw_b, nw_b); }
+      if (not mpi->comm.root()) { Gc = nda::array<ComplexType, 2>(nw_b, nw_b); GT = nda::array<ComplexType, 3>(np_ref, nw_b, nw_b); hook.eps_ref = nda::array<double, 1>(np_ref); }
+      mpi->comm.broadcast_n(hook.eps_ref.data(), hook.eps_ref.size(), 0);
       mpi->comm.broadcast_n(Gc.data(), Gc.size(), 0);
       mpi->comm.broadcast_n(GT.data(), GT.size(), 0);
       nda::array<ComplexType, 2> const &Ttw = tools.Ttw_bb;               // (nt, nw_b)
       // the weights of one basis: Tt = Ttw . Phi_all . pinv(Phi_S) scattered onto the sampled node indices; returns the kept weight
-      // the nu-reconstruction of one object type, in REGRESSION form: with the Gram matrix G = H H^dag of the reference objects
-      // over the nodes, the least-squares predictor of all nodes from the sampled ones is R = G(:, S) G(S, S)^-1 (the Nystrom
-      // form; G(S, S)^-1 through its top-Kr eigenpairs -- Kr < |S| regularizes). Measured on the LiH dump (11 of 41 nodes, at the
-      // Sigma level): the cst + U object needs Kr ~ |S| - 2 (K 6: 5.0e-2, K 9: 3.5e-3), the per-a T objects are at 5e-4 already
-      // at K 6; the earlier "top-K eigenvectors + pinv(Phi_S)" form agrees at small K and degrades beyond K ~ |S| - 2.
-      // Rout(m', m) is nonzero at the sampled columns m = nus[s] only; returns the kept spectral weight of G (nK_out: modes to 1e-4)
+      // the nu-reconstruction of one object type (nu_sampling.hpp, P14): R = G(:, S) G(S, S)^-1_Kr (regression form) at the
+      // sampled columns m = nus[s], zero elsewhere; returns the spectral weight of G kept by its top-Kr modes (nK_out: modes to 1e-4)
       auto weights_of = [&](nda::array<ComplexType, 2> const &Gin, long Kr, nda::array<ComplexType, 2> &Rout, long &nK_out) -> double {
         Rout = nda::array<ComplexType, 2>(nw_b, nw_b);
         Rout() = ComplexType(0.0);
@@ -2078,30 +2087,11 @@ namespace solvers {
         nK_out = 0;
         if (tr <= 0.0) return 0.0;
         Kr = std::max(1L, std::min(Kr, nS));
-        nda::matrix<ComplexType> Gss(nS, nS);
-        for (long s = 0; s < nS; ++s)
-          for (long s2 = 0; s2 < nS; ++s2) Gss(s, s2) = Gin(nus[size_t(s)], nus[size_t(s2)]);
-        auto [lam, V] = nda::linalg::eigenelements(Gss);                   // ascending; eigenvectors as columns
-        nda::array<ComplexType, 2> Ginv(nS, nS), GcS(nw_b, nS), R(nw_b, nS);
-        Ginv() = ComplexType(0.0);
-        for (long a = 0; a < Kr; ++a) {
-          const long ia = nS - 1 - a;
-          const double l = double(lam(ia));
-          if (l <= 1e-14 * double(lam(nS - 1))) break;
-          for (long s = 0; s < nS; ++s)
-            for (long s2 = 0; s2 < nS; ++s2) Ginv(s, s2) += V(s, ia) * std::conj(V(s2, ia)) / l;
-        }
-        for (long mp = 0; mp < nw_b; ++mp)
-          for (long s = 0; s < nS; ++s) GcS(mp, s) = Gin(mp, nus[size_t(s)]);
-        nda::blas::gemm(GcS, Ginv, R);                                     // R = G(:, S) G(S, S)^-1
+        auto R = nusamp::reconstruction(Gin, nus, Kr, "regression");     // (nw_b, nS)
         for (long s = 0; s < nS; ++s)
           for (long mp = 0; mp < nw_b; ++mp) Rout(mp, nus[size_t(s)]) = R(mp, s);
-        // the spectral weight of the full Gram kept by its top-Kr modes (a smoothness meter of the object, for the log)
-        nda::matrix<ComplexType> Gm(nw_b, nw_b);
-        Gm() = Gin;
-        auto [lamf, Vf] = nda::linalg::eigenelements(Gm);
-        double cum = 0.0, wk = 0.0;
-        for (long a = 0; a < nw_b; ++a) { const double l = std::max(double(lamf(nw_b - 1 - a)), 0.0) / tr; cum += l; if (a < Kr) wk += l; if (nK_out == 0 and 1.0 - cum < 1e-4) nK_out = a + 1; }
+        double wk = 0.0;
+        nK_out = nusamp::modes_to(Gin, 1e-4, Kr, &wk);
         return wk;
       };
       long nKc = 0, nKt = 0;

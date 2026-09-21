@@ -81,6 +81,7 @@ namespace solvers {
       // cancel over the nodes by ~200x on LiH)
       nda::array<ComplexType, 2> W_cst;
       nda::array<ComplexType, 3> R_T;
+      nda::array<double, 1> eps_ref;     // the pole node set the reference dump was built on (must equal the run's: same beta / wmax / prec)
       std::map<long, nda::array<ComplexType, 3>> wk;   // per sampled node m: W_kappa(a, j, tau) = sum_m' Ttw(tau, m') R_a(m', m) kappa_aj(m')
       bool sampled = false;              // the weights are the sampled-mode ones (the driver then accepts a node subset)
       // dump mode: the per-node objects (before any weighting), for the nu-basis of a later sampled run
@@ -102,6 +103,11 @@ namespace solvers {
         np = np_;
         utils::check(R_T.size() == 0 or R_T.shape(0) == np, "sigma_dyn_hook: the reference dump's np ({}) differs from this run's ({}).",
                      R_T.size() == 0 ? 0 : R_T.shape(0), np);
+        if (R_T.size() > 0 and eps_ref.size() > 0)
+          for (long a = 0; a < np; ++a)
+            utils::check(std::abs(eps_ref(a) - b.eps(a)) <= 1e-10 * (1.0 + std::abs(b.eps(a))),
+                         "sigma_dyn_hook: pole node {} of the reference dump is {} vs {} in this run (the nu-bases transfer across k meshes, "
+                         "not across imaginary-axis grids).", a, eps_ref(a), b.eps(a));
         S_cst = nda::array<ComplexType, 5>(nt, ns, nk, nc, nc); S_cst() = ComplexType(0.0);
         RT = nda::array<ComplexType, 6>(nt, ns, nk, np, nc, nc); RT() = ComplexType(0.0);
         RU = nda::array<ComplexType, 6>(nt, ns, nk, np, nc, nc); RU() = ComplexType(0.0);
