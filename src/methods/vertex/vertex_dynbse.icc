@@ -1214,6 +1214,33 @@ namespace solvers {
           if (rank == 0 and units_taken == 1)
             app_log(2, "  [dynbse] dense tau rungs: {} distinct PH-sym tau nodes of {}, {:.2f} GB per rank", ndist, nt,
                     double(ndist) * double(D) * double(D) * 16.0 / 1.0e9);
+          if (rank == 0 and units_taken == 1 and vertex_debug::flag("rung_rank")) {
+            // P10 measurement (vertex_perf_plan.md; vertex_debug rung_rank = 1): the tau rank of the dense rung -- the singular
+            // values of the (ndist x D^2) stack [K_d(s_r)]_r; a low-rank-over-tau rung (P10) pays only if the rank at 1e-8 is
+            // well below ndist. Logged once, for the first unit of rank 0 (an (ndist x ndist) Gram eigenproblem).
+            nda::matrix<cplx> Gm(ndist, ndist);
+            for (long r = 0; r < ndist; ++r)
+              for (long r2 = 0; r2 <= r; ++r2) {
+                cplx acc(0.0);
+                auto const *a = Kd_s(r, all, all).data();
+                auto const *bptr = Kd_s(r2, all, all).data();
+                for (long i = 0; i < D * D; ++i) acc += std::conj(a[i]) * bptr[i];
+                Gm(r, r2) = acc; Gm(r2, r) = std::conj(acc);
+              }
+            auto [lam, V] = nda::linalg::eigenelements(Gm);   // ascending
+            double tr = 0.0;
+            for (long r = 0; r < ndist; ++r) tr += std::max(double(lam(r)), 0.0);
+            std::string sv;
+            long n8 = 0, n4 = 0;
+            for (long r = ndist - 1; r >= 0; --r) {
+              const double s1 = std::sqrt(std::max(double(lam(r)), 0.0) / std::max(tr, 1e-300));   // singular value / Frobenius norm
+              if (s1 > 1e-8) ++n8;
+              if (s1 > 1e-4) ++n4;
+              char buf[32]; std::snprintf(buf, sizeof(buf), "%.1e ", s1); sv += buf;
+            }
+            app_log(1, "  [dynbse] P10 rung-rank meter (unit s {} q {}): {} tau nodes, singular values / |K_d|_F: {}-> rank {} at 1e-4, {} at 1e-8",
+                    is, iq, ndist, sv, n4, n8);
+          }
         }
         if (met) met->t_kbig += watch.lap();
         // the pair poles of this unit (shared grid: gnode identity)
