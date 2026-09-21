@@ -2117,8 +2117,9 @@ namespace solvers {
     nda::array<long, 2> kmq, kpq;
     vertex_sym::sym_ctx const *symc = nullptr;
     ladder_inputs(mb_state, thc, G_CC, kmq, kpq, symc);
-    utils::check(symc == nullptr or not symc->active, "vertex_t::eval_sigma_pair_dyn: the symmetric mesh is not wired (nosym only).");
-    utils::check(MF->nkpts() == MF->nkpts_ibz(), "vertex_t::eval_sigma_pair_dyn: nosym mesh expected.");
+    const bool sym_ = (symc != nullptr and symc->active);
+    utils::check(sym_ or MF->nkpts() == MF->nkpts_ibz(), "vertex_t::eval_sigma_pair_dyn: a symmetry-reduced mesh without a symmetry context.");
+    utils::check(not sym_ or opt.ibz, "vertex_t::eval_sigma_pair_dyn: a symmetric mesh needs pol_vertex_sigma_pair_ibz = true (P1: the IBZ solve + star fold).");
     const nda::array<double, 2> kc(MF->kpts_crystal());
     auto tools_h = vd::make_dyn_tools(*_ft, _dyn_iaft_prec, G_CC);
     auto &tools = *tools_h.tools;
@@ -2131,6 +2132,7 @@ namespace solvers {
     hook.col = opt.col;
     hook.outer = opt.outer;
     hook.dump = opt.dyn_dump;
+    hook.symc = symc; hook.ibz = (sym_ and opt.ibz);   // P1: the IBZ solve + star fold (the driver's units are the IBZ transfers)
     // ---- L-8: the nu-SAMPLED mode: the deposit weights Tt = Ttw . Phi_all . pinv(Phi_S) from a reference dump's nu-bases ----
     const bool sampled = not opt.dyn_nodes.empty();
     if (sampled) {
@@ -2261,6 +2263,7 @@ namespace solvers {
     vd::dyn_meter dmet;
     vd::pair_space_ladder_dyn(G_CC, _Xb_skma, _W0b_qmm.value(), wb_cache(), kmq, kpq, tools, nus,
                               nullptr, nullptr, nullptr, nullptr, mpi->comm.rank(), mpi->comm.size(), o, &dmet, symc);
+    hook.flush_unit();                                               // P1: the last unit's star fold
     mpi->comm.all_reduce_in_place_n(hook.S_cst.data(), hook.S_cst.size(), std::plus<>{});
     mpi->comm.all_reduce_in_place_n(hook.RT.data(), hook.RT.size(), std::plus<>{});
     mpi->comm.all_reduce_in_place_n(hook.RU.data(), hook.RU.size(), std::plus<>{});

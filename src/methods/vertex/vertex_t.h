@@ -929,6 +929,7 @@ namespace solvers {
     std::string _sigma_pair_side = "right";      // pol_vertex_sigma_pair_side: the dressed junction, "right" | "left" | "both" (static path)
     bool _sigma_dyn_dump = false;                // pol_vertex_sigma_dyn_dump: the all-node run writes its per-node objects (L-8 reference)
     std::vector<long> _sigma_dyn_nodes;          // pol_vertex_sigma_dyn_nodes: the sampled FULL-mesh nodes (empty = all)
+    bool _sigma_pair_ibz = false;                // pol_vertex_sigma_pair_ibz: the IBZ solve + star fold of the Sigma-side vertex (P1)
     std::string _sigma_dyn_fit_file;             // pol_vertex_sigma_dyn_fit_file: the reference dump for the sampled mode
     long _sigma_dyn_fit_rank = 0;                // pol_vertex_sigma_dyn_fit_rank: K (0 = the number of sampled nodes)
     double _sigma_lff_pinv_tol = 1e-3;      // pol_vertex_sigma_pinv_tol: relative eigenvalue cutoff of Pi_0^-1 -- the vertex lives on the
@@ -1678,6 +1679,8 @@ namespace solvers {
     bool sigma_dyn_dump() const { return _sigma_dyn_dump; }
     std::vector<long> const &sigma_dyn_nodes() const { return _sigma_dyn_nodes; }
     std::string const &sigma_dyn_fit_file() const { return _sigma_dyn_fit_file; }
+    void set_sigma_pair_ibz(bool on) { _sigma_pair_ibz = on; }
+    bool sigma_pair_ibz() const { return _sigma_pair_ibz; }
     long sigma_dyn_fit_rank() const { return _sigma_dyn_fit_rank; }
     bool sigma_pair_enabled() const { return _sigma_pair; }
     std::string const &sigma_pair_col() const { return _sigma_pair_col; }
@@ -1701,11 +1704,13 @@ namespace solvers {
       std::string dyn_fit_file;         // the reference dump the nu-bases are learned from (needed with dyn_nodes)
       long dyn_fit_rank = 0;            // K modes per object type (0 = |dyn_nodes|: interpolation)
       std::string dump_prefix;          // the run prefix for the dump
+      bool ibz = false;                 // P1: solve the Sigma-side ladder on the IBZ transfers only and fold the star (sym meshes)
     };
     struct sigma_pair_meter {
       double dsig_max = 0.0, dsig_herm = 0.0, ks_herm = 0.0;
       double t_total = 0.0, t_setup = 0.0, t_ks = 0.0, t_cb = 0.0, t_lu = 0.0, t_amp = 0.0, t_con = 0.0, rss_gb = 0.0;
       long nunits = 0;
+      long n_trev_images = 0;          // P1: time-reversal star images folded (their rule is validated on zincblende only)
       nda::array<double, 1> nu_spec;   // normalized Gram eigenvalues over nu, descending, max over units (nu_diag)
       // L-7 (the dynamic path): the T-family refit error, the solver's G pole fit / tau refit / watchdog, solve wall, convergence
       double e_fit_err = 0.0, fit_err_G = 0.0, refit_err = 0.0, ritz_max = 0.0, t_solve = 0.0;

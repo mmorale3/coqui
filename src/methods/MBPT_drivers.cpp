@@ -700,6 +700,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
               io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_herm",true),
               io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_diag",false),
               io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_pair_side","right"));
+          vertex.set_sigma_pair_ibz(io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_ibz",false));
           vertex.set_sigma_dyn(io::get_value_with_default<bool>(pt,"pol_vertex_sigma_dyn_dump",false),
               io::get_array_with_default<long>(pt,"pol_vertex_sigma_dyn_nodes",std::vector<long>{}),
               io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_dyn_fit_file",""),
@@ -1121,6 +1122,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
               io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_herm",true),
               io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_diag",false),
               io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_pair_side","right"));
+          pol_vertex_carrier.set_sigma_pair_ibz(io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_ibz",false));
           pol_vertex_carrier.set_sigma_dyn(io::get_value_with_default<bool>(pt,"pol_vertex_sigma_dyn_dump",false),
               io::get_array_with_default<long>(pt,"pol_vertex_sigma_dyn_nodes",std::vector<long>{}),
               io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_dyn_fit_file",""),
@@ -1394,6 +1396,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
               io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_herm",true),
               io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_diag",false),
               io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_pair_side","right"));
+          pol_vertex_carrier.set_sigma_pair_ibz(io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_ibz",false));
           pol_vertex_carrier.set_sigma_dyn(io::get_value_with_default<bool>(pt,"pol_vertex_sigma_dyn_dump",false),
               io::get_array_with_default<long>(pt,"pol_vertex_sigma_dyn_nodes",std::vector<long>{}),
               io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_dyn_fit_file",""),
@@ -1713,6 +1716,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
               io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_herm",true),
               io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_diag",false),
               io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_pair_side","right"));
+          vertex.set_sigma_pair_ibz(io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_ibz",false));
           vertex.set_sigma_dyn(io::get_value_with_default<bool>(pt,"pol_vertex_sigma_dyn_dump",false),
               io::get_array_with_default<long>(pt,"pol_vertex_sigma_dyn_nodes",std::vector<long>{}),
               io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_dyn_fit_file",""),
@@ -2058,6 +2062,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
               io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_herm",true),
               io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_diag",false),
               io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_pair_side","right"));
+          pol_vertex_carrier.set_sigma_pair_ibz(io::get_value_with_default<bool>(pt,"pol_vertex_sigma_pair_ibz",false));
           pol_vertex_carrier.set_sigma_dyn(io::get_value_with_default<bool>(pt,"pol_vertex_sigma_dyn_dump",false),
               io::get_array_with_default<long>(pt,"pol_vertex_sigma_dyn_nodes",std::vector<long>{}),
               io::get_value_with_default<std::string>(pt,"pol_vertex_sigma_dyn_fit_file",""),

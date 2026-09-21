@@ -93,6 +93,16 @@ namespace solvers {
       nda::array<ComplexType, 5> Gw;     // (nw_f, ns, nk, nc, nc): G on the fermionic Matsubara nodes
       nda::array<ComplexType, 1> iw;     // (nw_f)
       nda::array<double, 1> eps_pre;     // the node set of the first unit (every unit must share it: the kappa tables assume it)
+      // P1 (2026-09-21): the IBZ solve on a symmetric mesh. The driver's units are the IBZ transfers (identity-frame legs);
+      // each unit's deposits go to a FULL-k scratch (the block loop of one unit is consecutive), and when the unit changes
+      // (or at flush) the scratch is folded onto the IBZ externals through the star of its transfer (fold_star_into_ibz).
+      vertex_sym::sym_ctx const *symc = nullptr;
+      bool ibz = false;
+      long nk_ext = 0;                   // the k axis of the accumulators (nk_ibz under ibz, else the full mesh)
+      nda::array<ComplexType, 4> Su;     // (nt, nk_full, nc, nc): the current unit's cst + U deposit
+      nda::array<ComplexType, 5> RTu, RUu;   // (nt, nk_full, np, nc, nc)
+      long unit_is = -1, unit_iq = -1, unit_m = -1;
+      long n_trev_images = 0;
       // meters (conv_*: the product route's convention checks -- w_to_tau[1/(iw - e_a)] against +KF and -KF, tau_to_w[G] against
       // the pole-fit G on the Matsubara nodes; fam1_ext: the largest T-family coefficient on an extension node a >= np_fit, which
       // the T route does not carry)
@@ -101,6 +111,16 @@ namespace solvers {
       long nunits = 0, nblocks = 0;
       void init(long nt, long ns, long nk, long np_, long nc, dynbse::freq_basis const &b, long nw_b) {
         np = np_;
+        ibz = (symc != nullptr and symc->active and ibz);
+        const long nk_full = nk;
+        nk_ext = ibz ? symc->nk_ibz : nk;
+        if (ibz) {
+          utils::check(symc->nk_full == nk_full, "sigma_dyn_hook: sym context nk_full {} vs G's k axis {}.", symc->nk_full, nk_full);
+          Su = nda::array<ComplexType, 4>(nt, nk_full, nc, nc); Su() = ComplexType(0.0);
+          RTu = nda::array<ComplexType, 5>(nt, nk_full, np, nc, nc); RTu() = ComplexType(0.0);
+          RUu = nda::array<ComplexType, 5>(nt, nk_full, np, nc, nc); RUu() = ComplexType(0.0);
+        }
+        nk = nk_ext;
         utils::check(R_T.size() == 0 or R_T.shape(0) == np, "sigma_dyn_hook: the reference dump's np ({}) differs from this run's ({}).",
                      R_T.size() == 0 ? 0 : R_T.shape(0), np);
         if (R_T.size() > 0 and eps_ref.size() > 0)
@@ -119,9 +139,29 @@ namespace solvers {
         }
         basis = b;
         if (dump) {
-          Hc_n = nda::array<ComplexType, 6>(nw_b, ns, nt, nk, nc, nc); Hc_n() = ComplexType(0.0);
-          HT_n = nda::array<ComplexType, 6>(nw_b, ns, np, nk, nc, nc); HT_n() = ComplexType(0.0);
+          Hc_n = nda::array<ComplexType, 6>(nw_b, ns, nt, nk_full, nc, nc); Hc_n() = ComplexType(0.0);
+          HT_n = nda::array<ComplexType, 6>(nw_b, ns, np, nk_full, nc, nc); HT_n() = ComplexType(0.0);
         }
+      }
+      /** P1: fold the current unit's full-k scratch onto the IBZ accumulators (a no-op unless ibz); called when the unit
+       *  changes and once more by the wrapper before the all-reduce */
+      void flush_unit() {
+        if (not ibz or unit_iq < 0) return;
+        const long np_ = RTu.shape(2);
+        decltype(nda::range::all) all;
+        vertex_sym::fold_star_into_ibz(*symc, unit_iq, Su, S_cst(all, unit_is, all, all, all), &n_trev_images);
+        for (long a = 0; a < np_; ++a) {
+          vertex_sym::fold_star_into_ibz(*symc, unit_iq, RTu(all, all, a, all, all), RT(all, unit_is, all, a, all, all));
+          vertex_sym::fold_star_into_ibz(*symc, unit_iq, RUu(all, all, a, all, all), RU(all, unit_is, all, a, all, all));
+        }
+        Su() = ComplexType(0.0); RTu() = ComplexType(0.0); RUu() = ComplexType(0.0);
+        unit_is = unit_iq = unit_m = -1;
+      }
+      /** P1: the deposit targets of block (is, iq, m): the unit scratch under ibz (flushing the previous unit), else the accumulators */
+      void begin_block(long is, long iq, long m) {
+        if (not ibz) return;
+        if (unit_iq >= 0 and (is != unit_is or iq != unit_iq or m != unit_m)) flush_unit();
+        unit_is = is; unit_iq = iq; unit_m = m;
       }
       // the deposit weight of node m at tau node it, per object type (the Ttw row unless sampled weights were set)
       ComplexType wc(vertex_pi::iaft_tools const &tools, long it, long m) const { return W_cst.size() > 0 ? W_cst(it, m) : tools.Ttw_bb(it, m); }
@@ -312,7 +352,9 @@ namespace solvers {
       const bool nu0 = (inu == cplx(0.0));
       const long ng = P.ng, npf = b.np_fit;
       utils::check(h.np == np, "sigma_dyn_accumulate: basis size changed ({} vs {}).", np, h.np);
+      utils::check(not h.poles or not h.ibz, "sigma_dyn_accumulate: the pole route has no IBZ fold.");
       if (h.poles) { sigma_dyn_accumulate_poles(h, b, P, inu, res, Ks, Dc, N0, N1, Wout, G_CC, kpq, is, iq, m, tools); return; }
+      h.begin_block(is, iq, m);
       if (not h.pre_ok) sigma_dyn_precompute(h, b, G_CC, tools);
       utils::check(h.eps_pre.shape(0) == b.eps.shape(0) and nda::max_element(nda::abs(h.eps_pre - b.eps)) == 0.0,
                    "sigma_dyn_accumulate: the unit's node set differs from the first unit's.");
@@ -418,7 +460,8 @@ namespace solvers {
             const cplx w = h.wc(tools, it, m);
             for (long i = 0; i < nc; ++i)
               for (long j = 0; j < nc; ++j) {
-                h.S_cst(it, is, k, i, j) += w * Hsum(i, j);
+                if (h.ibz) h.Su(it, k, i, j) += w * Hsum(i, j);
+                else h.S_cst(it, is, k, i, j) += w * Hsum(i, j);
                 if (h.dump) h.Hc_n(m, is, it, k, i, j) += Hsum(i, j);
               }
           }
@@ -515,8 +558,8 @@ namespace solvers {
               for (long it = 0; it < nt; ++it) {
                 const cplx w = tools.Ttw_bb(it, m);
                 for (long q = 0; q < nc2; ++q) {
-                  h.RT(it, is, k, a, q / nc, q % nc) += w * CT(q, 0);
-                  h.RU(it, is, k, a, q / nc, q % nc) += w * CUa(q, 0);
+                  if (h.ibz) { h.RTu(it, k, a, q / nc, q % nc) += w * CT(q, 0); h.RUu(it, k, a, q / nc, q % nc) += w * CUa(q, 0); }
+                  else { h.RT(it, is, k, a, q / nc, q % nc) += w * CT(q, 0); h.RU(it, is, k, a, q / nc, q % nc) += w * CUa(q, 0); }
                 }
               }
             } else {
@@ -525,14 +568,14 @@ namespace solvers {
                 for (long j = 0; j < ng; ++j) WkA(it, j) = (*Wk)(a, j, it);
               nda::blas::gemm(WkA, Mj, Ha);
               for (long it = 0; it < nt; ++it)
-                for (long q = 0; q < nc2; ++q) h.RT(it, is, k, a, q / nc, q % nc) -= Ha(it, q);
+                for (long q = 0; q < nc2; ++q) { if (h.ibz) h.RTu(it, k, a, q / nc, q % nc) -= Ha(it, q); else h.RT(it, is, k, a, q / nc, q % nc) -= Ha(it, q); }
               for (long j = 0; j < ng; ++j) {
                 const cplx dinv = (kap(a, j) != cplx(0.0)) ? kapd(a, j) / kap(a, j) : cplx(0.0);   // 1 / Delta_aj
                 for (long q = 0; q < nc2; ++q) Ms(j, q) = dinv * Mj(j, q);
               }
               nda::blas::gemm(WkA, Ms, Ha);
               for (long it = 0; it < nt; ++it)
-                for (long q = 0; q < nc2; ++q) h.RU(it, is, k, a, q / nc, q % nc) += Ha(it, q);
+                for (long q = 0; q < nc2; ++q) { if (h.ibz) h.RUu(it, k, a, q / nc, q % nc) += Ha(it, q); else h.RU(it, is, k, a, q / nc, q % nc) += Ha(it, q); }
             }
           }
           // the RU_{n_j} pieces: -sum_a kappa_aj / Delta_aj M_aj at the G pole j (node n_j)
@@ -541,7 +584,7 @@ namespace solvers {
               const long nj = P.gnode(j);
               for (long it = 0; it < nt; ++it) {
                 const cplx w = tools.Ttw_bb(it, m);
-                for (long q = 0; q < nc2; ++q) h.RU(it, is, k, nj, q / nc, q % nc) -= w * CUj(j, q);
+                for (long q = 0; q < nc2; ++q) { if (h.ibz) h.RUu(it, k, nj, q / nc, q % nc) -= w * CUj(j, q); else h.RU(it, is, k, nj, q / nc, q % nc) -= w * CUj(j, q); }
               }
             }
           } else {
@@ -554,7 +597,7 @@ namespace solvers {
               }
               nda::blas::gemm(WkJ, MsJ, Ha);
               for (long it = 0; it < nt; ++it)
-                for (long q = 0; q < nc2; ++q) h.RU(it, is, k, nj, q / nc, q % nc) -= Ha(it, q);
+                for (long q = 0; q < nc2; ++q) { if (h.ibz) h.RUu(it, k, nj, q / nc, q % nc) -= Ha(it, q); else h.RU(it, is, k, nj, q / nc, q % nc) -= Ha(it, q); }
             }
           }
         }

@@ -820,6 +820,13 @@ namespace solvers {
     for (long is = 0; is < ctx.nsym; ++is)
       for (long ik = 0; ik < ctx.nk_full; ++ik)
         ctx.krot(is, ik) = MF->ks_to_k(int(is), int(ik));
+    ctx.ktrev_pair = nda::array<long, 1>(ctx.nk_full);
+    for (long ik = 0; ik < ctx.nk_full; ++ik) ctx.ktrev_pair(ik) = long(kp_trev_pair(ik));
+    ctx.qminus = nda::array<long, 1>(ctx.nq_full);
+    {
+      auto qm = MF->qminus();
+      for (long iq = 0; iq < ctx.nq_full; ++iq) ctx.qminus(iq) = long(qm(iq));
+    }
 
     // direction self-check: the same map on the Q mesh must send q' -> +/- qs.
     // (Derivation memo section 3.1: slist = find_inverse_symmetry(qsymms) in the MF

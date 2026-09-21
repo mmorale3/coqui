@@ -77,6 +77,10 @@ namespace vertex_sym {
 
     // momentum rotation map: krot(js, k) = ks_to_k(js, k) (full-BZ, symmetry.hpp:564)
     nda::array<long, 2> krot;
+    // time-reversal partner of every full-BZ k (kp_trev_pair) and the -q map of every full-BZ transfer (qminus);
+    // P1, the star fold of the Sigma-side vertex
+    nda::array<long, 1> ktrev_pair;
+    nda::array<long, 1> qminus;
 
     // effective C-window collocation columns: (ns, nsym, nk_full, naux, nc).
     // NODE-SHARED (vertex parallelization M3, change-list item #9): the storage is a
@@ -102,6 +106,111 @@ namespace vertex_sym {
     // Xhat is built from -- the accuracy floor of the whole symmetry path.
     double d_unitarity_max = 0.0;
   };
+
+  /**
+   * P1 (vertex_perf_plan.md, 2026-09-21): the STAR FOLD of a Sigma-side vertex contribution. dSq(t, p, i, j) is the
+   * contribution of ONE unit -- the ladder solved at the IBZ transfer iq in the identity frame -- to the C-window
+   * self-energy at every p of the full mesh, in the mean field's band basis at p. Every image q' of the star of iq
+   * (q_star(q') = iq; S_js q' = +qs, or -qs for a time-reversal image, js = q_isym(q')) contributes to the IBZ externals
+   * the covariant object (the single-transfer rule of Sigma^{C,r}, vertex_sigma_r.icc; both external legs sit at k):
+   *
+   *     Sigma_{q'}(k)_{ij} = < R psi_{k,i} | Sigma_{S q'}(S k) | R psi_{k,j} >,
+   *
+   * with the transported orbitals R psi_{k,j} exactly as the kernels build them (Xhat, build_sym_ctx):
+   *     no conjugation (cjg(js, k) false):  R psi_{k,j} =      sum_a Dc(js, k)(a, j) psi_{S k, a},      S k = krot(js, k),
+   *     conjugated     (cjg(js, k) true):   R psi_{k,j} = conj(sum_a Dc(js, k)(a, j) psi_{ksrc, a}),   ksrc = krot(js, -k).
+   * Hence (Dc = Dc(js, k), B(p) = the unit's object at p for the transfer the covariance needs)
+   *     plain:       Y = Dc^dag B(S k) Dc,            B = Sigma_{qs}   (trev = false)  or  Sigma_{-qs}  (trev = true),
+   *     conjugated:  Y = conj(Dc^dag B(ksrc) Dc),     B = Sigma_{-qs}  (trev = false)  or  Sigma_{qs}   (trev = true),
+   * because the conjugated matrix element turns the kernel into its complex conjugate, Sigma_{q}(p)(r, r')^* =
+   * Sigma_{-q}(-p)(r, r') (time reversal). Sigma_{qs}(p) = dSq(p); Sigma_{-qs}(p) is dSq(p) when -qs = qs (a TRIM transfer),
+   * conj(dSq(-p)) when p and -p are a time-reversal pair of the mesh (psi_{-p} = psi_p^* in the code's gauge), and
+   * otherwise the (non-conjugated) star image of -qs at p, one level deep. Anything else is refused with a message.
+   * n_trev / n_cjg count the time-reversal images and the conjugated rotations applied (the log reports them).
+   */
+  namespace detail {
+    struct fold_scratch {
+      nda::array<ComplexType, 2> X, Dm, T, Y;
+      fold_scratch(long nc) : X(nc, nc), Dm(nc, nc), T(nc, nc), Y(nc, nc) {}
+    };
+    /** B(p) = Sigma_{-qs}(p) from the unit's dSq = Sigma_{qs}(.) (see fold_star_into_ibz); the result in `out` (nt x nc x nc) */
+    template<class DSQ>
+    inline void minus_transfer_at(sym_ctx const &c, long iq, DSQ const &dSq, long p, nda::array<ComplexType, 3> &out,
+                                  fold_scratch &w, int depth) {
+      decltype(nda::range::all) all;
+      const long nt = dSq.shape(0), nc = dSq.shape(2);
+      if (c.qminus(iq) == iq) {                                   // -qs = qs: a TRIM transfer
+        for (long it = 0; it < nt; ++it) out(it, all, all) = dSq(it, p, all, all);
+        return;
+      }
+      const long pm = c.ktrev_pair(p);
+      if (pm != p) {                                              // psi_{-p} = psi_p^* : Sigma_{-qs}(p)_{ab} = conj(Sigma_{qs}(-p)_{ab})
+        for (long it = 0; it < nt; ++it)
+          for (long a = 0; a < nc; ++a)
+            for (long b = 0; b < nc; ++b) out(it, a, b) = std::conj(dSq(it, pm, a, b));
+        return;
+      }
+      // p is a TRIM point and -qs != qs: -qs must be a plain star image of qs, folded at p one level deep
+      const long qm = c.qminus(iq);
+      utils::check(depth == 0 and c.q_star(qm) == iq and not c.q_trev(qm) and not c.cjg(c.q_isym(qm), p),
+                   "fold_star_into_ibz: Sigma_{{-q}} at a TRIM point p = {} for the non-TRIM IBZ transfer {} is not reachable "
+                   "(-q = {}: star {}, trev {}, conjugated rotation {}). This star fold needs the -q unit; run with "
+                   "pol_vertex_sigma_pair_ibz = false on this mesh.", p, iq, qm, c.q_star(qm), int(c.q_trev(qm)),
+                   int(c.q_star(qm) == iq and c.cjg(c.q_isym(qm), p)));
+      const long js = c.q_isym(qm), sp = c.krot(js, p);
+      for (long a = 0; a < nc; ++a)
+        for (long j = 0; j < nc; ++j) w.Dm(a, j) = c.Dc(js, p, a, j);
+      for (long it = 0; it < nt; ++it) {
+        for (long a = 0; a < nc; ++a)
+          for (long b = 0; b < nc; ++b) w.X(a, b) = dSq(it, sp, a, b);
+        nda::blas::gemm(w.X, w.Dm, w.T);
+        nda::blas::gemm(nda::dagger(w.Dm), w.T, w.Y);
+        out(it, all, all) = w.Y;
+      }
+    }
+  }
+
+  inline void fold_star_into_ibz(sym_ctx const &c, long iq, nda::ArrayOfRank<4> auto const &dSq, nda::ArrayOfRank<4> auto &&dSig,
+                                 long *n_trev = nullptr, long *n_cjg = nullptr) {
+    decltype(nda::range::all) all;
+    const long nt = dSq.shape(0), nc = dSq.shape(2), nk_ibz = dSig.shape(1);
+    utils::check(dSq.shape(1) == c.nk_full and dSig.shape(1) == c.nk_ibz and dSq.shape(3) == nc and dSig.shape(2) == nc,
+                 "fold_star_into_ibz: shapes (dSq {} x {} x {} x {}, dSig {} x {} x {} x {}, nk_full {}, nk_ibz {}).",
+                 dSq.shape(0), dSq.shape(1), dSq.shape(2), dSq.shape(3), dSig.shape(0), dSig.shape(1), dSig.shape(2), dSig.shape(3),
+                 c.nk_full, c.nk_ibz);
+    utils::check(c.qminus.size() == c.nq_full and c.ktrev_pair.size() == c.nk_full, "fold_star_into_ibz: the sym context has no qminus / ktrev_pair maps.");
+    detail::fold_scratch w(nc);
+    nda::array<ComplexType, 3> B(nt, nc, nc);
+    for (long qp = 0; qp < c.nq_full; ++qp) {
+      if (c.q_star(qp) != iq) continue;
+      const long js = c.q_isym(qp);
+      const bool trev = c.q_trev(qp);
+      if (trev and n_trev) ++(*n_trev);
+      for (long k = 0; k < nk_ibz; ++k) {
+        const bool cj = (js != 0) and c.cjg(js, k);
+        if (cj and n_cjg) ++(*n_cjg);
+        const long pt = cj ? c.krot(js, c.ktrev_pair(k)) : c.krot(js, k);
+        const bool minus = (trev != cj);
+        if (minus) detail::minus_transfer_at(c, iq, dSq, pt, B, w, 0);
+        else for (long it = 0; it < nt; ++it) B(it, all, all) = dSq(it, pt, all, all);
+        if (js == 0) {                                            // the identity slot (Dc unset): the IBZ transfer itself or its trev image
+          for (long it = 0; it < nt; ++it)
+            for (long i = 0; i < nc; ++i)
+              for (long j = 0; j < nc; ++j) dSig(it, k, i, j) += B(it, i, j);
+          continue;
+        }
+        for (long a = 0; a < nc; ++a)
+          for (long j = 0; j < nc; ++j) w.Dm(a, j) = c.Dc(js, k, a, j);
+        for (long it = 0; it < nt; ++it) {
+          w.X() = B(it, all, all);
+          nda::blas::gemm(w.X, w.Dm, w.T);                              // T = B D
+          nda::blas::gemm(nda::dagger(w.Dm), w.T, w.Y);                 // Y = D^dag B D
+          for (long i = 0; i < nc; ++i)
+            for (long j = 0; j < nc; ++j) dSig(it, k, i, j) += cj ? std::conj(w.Y(i, j)) : w.Y(i, j);
+        }
+      }
+    }
+  }
 
 } // vertex_sym
 } // solvers

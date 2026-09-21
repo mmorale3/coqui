@@ -93,8 +93,13 @@ namespace solvers {
       // W-bar are read at q_star(q) (PQ-TRANSPOSED for a time-reversal transfer, as build_kbig does), the legs are the full-BZ
       // collocations, and dSigma is accumulated for the IBZ representatives only (the first nk_ibz points of the full list).
       const bool sym = (symc != nullptr and symc->active);
-      const long nq_units = sym ? symc->nq_full : nq;
+      // P1 (2026-09-21): the IBZ solve. With opt.ibz the units run over the IBZ transfers only (identity-frame legs, W-bar read
+      // directly), each unit deposits its contribution for EVERY k of the full mesh into a scratch, and the star fold
+      // (vertex_sym::fold_star_into_ibz) rotates it onto the IBZ externals -- nq_ibz solves instead of nq_full.
+      const bool ibz = sym and opt.ibz;
+      const long nq_units = (sym and not ibz) ? symc->nq_full : nq;
       const long nk_ext = sym ? symc->nk_ibz : nk;
+      long n_trev_images = 0, n_cjg_rot = 0;
       const long nw_half = (nw_b % 2 == 0) ? nw_b / 2 : nw_b / 2 + 1;
       const bool dyn_outer = (opt.outer == "dynamic");
       const bool one_rung = (opt.col == "static1");
@@ -159,20 +164,22 @@ namespace solvers {
       nda::array<cplx, 3> Astore;
       if (opt.Pi_check != nullptr) { CbA = nda::array<cplx, 2>(D, Nm); Pchk = nda::array<cplx, 2>(Nm, Nm); }
       if (opt.nu_diag) Astore = nda::array<cplx, 3>(nw_b, D, Nm);
+      nda::array<cplx, 4> dSq;                                            // P1: one unit's contribution on the full k mesh
+      if (ibz) dSq = nda::array<cplx, 4>(nt, nk, nc, nc);
       const long nunits = ns * nq_units;
       for (long u = rank; u < nunits; u += nproc) {
         const long is = u / nq_units, iq = u % nq_units;
-        const long qsx = sym ? symc->q_star(iq) : iq;            // the stored (IBZ) transfer of this unit's external q
-        const bool trx = sym ? bool(symc->q_trev(iq)) : false;   // read W-bar(q) PQ-transposed for a time-reversal transfer
+        const long qsx = (sym and not ibz) ? symc->q_star(iq) : iq;            // the stored (IBZ) transfer of this unit's external q
+        const bool trx = (sym and not ibz) ? bool(symc->q_trev(iq)) : false;   // read W-bar(q) PQ-transposed for a time-reversal transfer
         // ---- the external legs (pair densities) of this transfer ------------------------------------
         // symmetric mesh: W-bar(q) is stored at q_star in the aux frame of the mapping symmetry q_isym(q), so the legs
         // that couple the pair to it are the EFFECTIVE columns Xhat(is, jsym, k) (rotation into that frame + the trev
         // conjugation; identity for jsym = 0) -- the rung builder's own routing (build_U_legs). The C-window bands carry
         // no rotation (identity D by convention), so G_CC(k') pairs with them unchanged.
-        const long jsx = sym ? symc->q_isym(iq) : 0;
+        const long jsx = (sym and not ibz) ? symc->q_isym(iq) : 0;
         for (long k = 0; k < nk; ++k) {
           const long kq = kpq(iq, k);
-          if (sym) {
+          if (sym and not ibz) {
             auto Xk = symc->Xhat(is, jsx, k, all, all);
             auto Xkq = symc->Xhat(is, jsx, kq, all, all);
             for (long a = 0; a < nc; ++a)
@@ -318,9 +325,10 @@ namespace solvers {
         // ---- nu -> tau (one gemm) and the tau-local contraction with G ------------------------------
         nda::blas::gemm(tools.Ttw_bb, Hall, Ht);                          // (nt x nw_b)(nw_b x nk nc^4)
         const cplx pref(-opt.scale / double(nk), 0.0);
+        if (ibz) dSq() = cplx(0.0);
         for (long kp = 0; kp < nk; ++kp) {
           const long k = kpq(iq, kp);                                     // k = k' + q
-          if (k >= nk_ext) continue;                                     // symmetric mesh: IBZ representatives only
+          if (not ibz and k >= nk_ext) continue;                         // symmetric full-mesh path: IBZ representatives only
           for (long it = 0; it < nt; ++it)
             for (long i = 0; i < nc; ++i)
               for (long j = 0; j < nc; ++j) {
@@ -334,9 +342,11 @@ namespace solvers {
                     for (long cp = 0; cp < nc; ++cp)
                       acc += G_CC(it, is, kp, c, cp) * Ht(it, (kp * nc2 + c * nc + i) * nc2 + cp * nc + j);
                 }
-                dSig(it, is, k, i, j) += pref * acc;
+                if (ibz) dSq(it, k, i, j) += pref * acc;
+                else dSig(it, is, k, i, j) += pref * acc;
               }
         }
+        if (ibz) vertex_sym::fold_star_into_ibz(*symc, iq, dSq, dSig(all, is, all, all, all), &n_trev_images, &n_cjg_rot);
         if (opt.nu_diag) {
           // the Gram matrix over nu of the amplitude (all pairs and legs), normalized spectrum, max over units
           nda::matrix<cplx> Gm(nw_b, nw_b);
@@ -355,7 +365,7 @@ namespace solvers {
           if (met and tr > 0.0)
             for (long l = 0; l < nw_b; ++l) met->nu_spec(l) = std::max(met->nu_spec(l), std::max(lam(nw_b - 1 - l), 0.0) / tr);
         }
-        if (met) { ++met->nunits; met->t_con += watch.lap(); met->rss_gb = std::max(met->rss_gb, vertex_ladder_detail::prof_rss_gb()); }
+        if (met) { ++met->nunits; met->n_trev_images = n_trev_images; met->t_con += watch.lap(); met->rss_gb = std::max(met->rss_gb, vertex_ladder_detail::prof_rss_gb()); }
       }
     }
 

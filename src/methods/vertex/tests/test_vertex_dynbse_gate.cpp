@@ -1073,6 +1073,15 @@ namespace bdft_tests {
       // kind: 0 plain GW, 1 B-S Sigma^{C,x} (static rung, bl_drop 1), 2 the pair vertex (col static1, outer static; the eps readout
       // CONSUMES `interp` -- the static nu = 0 ladder readout is window/nosym-only, exactly as the W-int gate's consumer runs),
       // 4 the dynamic band run that dumps the points and the nu0 column (2 iterations, as run_w's A)
+      bool ibz_cur = false;   // P1: the IBZ solve + star fold of the Sigma-side vertex (sym meshes)
+      std::string col_cur = "static1", outer_cur = "static";   // the Sigma-side column / outer W of the kind-2 runs
+      // P1 (2026-09-21): the window of the (S) part. The historic window [0, 4) CUTS the Gamma triplet (bands 3-5 of LiH), so the
+      // C-sector rotations of the symmetric path LEAK (D-matrix leakage 0.25, unitarity defect 0.99, G-rotation residual 4.5e-2
+      // on qe_lih222_sym): the full-mesh sym path is then NOT the exact object (its identity with the B-S Sigma^{C,x} holds
+      // because both use the same lossy rotated legs), while the IBZ path (identity-frame legs at every full-mesh point) is.
+      // COQUI_DYNBSE_TEST_SYMW_NC = 3 | 6 selects a symmetry-closed window ([0, 3): three non-degenerate bands; [0, 6): the
+      // triplet complete), for which the two paths must agree; with NC != 4 the (W) Wannier part (a 4 x 4 mix) is skipped.
+      const long ncw = std::getenv("COQUI_DYNBSE_TEST_SYMW_NC") ? std::atol(std::getenv("COQUI_DYNBSE_TEST_SYMW_NC")) : 4;
       auto run_sw = [&](std::string const &tag, std::shared_ptr<mf::MF> mfw, auto &eriw, int kind, std::string const &points,
                         std::string const &interp, nda::array<std::complex<double>, 2> const *V, bool keep, S5 &Sig) {
         const std::string out = "coqui_d3_sigsw_" + tag;
@@ -1083,7 +1092,7 @@ namespace bdft_tests {
         double e_corr = 0.0;
         std::array<double, 4> m{0.0, 0.0, 0.0, 0.0};
         if (kind == 1) {
-          solvers::vertex_t vtx(&ft, "2nd_exchange", nda::range(0, 4), mfw->nbnd(), "ignore_g0", "secondary", -1, 1e-8, -1.0, -1.0, "static");
+          solvers::vertex_t vtx(&ft, "2nd_exchange", nda::range(0, ncw), mfw->nbnd(), "ignore_g0", "secondary", -1, 1e-8, -1.0, -1.0, "static");
           vtx.set_isdf_points(points, points.empty());
           vtx.set_bl_drop(1);
           if (auto *rm = std::getenv("COQUI_DYNBSE_TEST_RESOLVENT")) vtx.set_ladder_dyn_resolvent(rm);   // P7: inverse | lu
@@ -1092,19 +1101,22 @@ namespace bdft_tests {
           e_corr = std::get<1>(scf_loop(mb_state, dyson, eriw, ft, solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol, 1, false, 1e-9, true));
         } else if (kind == 2) {
           solvers::vertex_t vtx(&ft, "none", nda::range(0, 0), mfw->nbnd());
-          vtx.set_pol_vertex("ladder", "w0_prev", nda::range(0, 4), -1, 1e-8, -1.0, -1.0, -1.0, "none");
+          vtx.set_pol_vertex("ladder", "w0_prev", nda::range(0, ncw), -1, 1e-8, -1.0, -1.0, -1.0, "none");
           vtx.set_ladder_rung("static", 1e-8, 30, 12, -1.0);
           vtx.set_isdf_points(points, points.empty());
           vtx.set_wannier_frame("aux");
           vtx.set_pol_interp(interp, "static");
-          if (V) { auto proj = make_degenerate_projector(*mfw, 0, 4, V, false); vtx.set_wannier_projector(proj, true); }
-          vtx.set_sigma_pair(true, "static1", "static", 1.0, true, false, "right");
+          if (V) { auto proj = make_degenerate_projector(*mfw, 0, ncw, V, false); vtx.set_wannier_projector(proj, true); }
+          vtx.set_sigma_pair(true, col_cur, outer_cur, 1.0, true, false, "right");
+          vtx.set_sigma_pair_ibz(ibz_cur);
+          if (auto *rm = std::getenv("COQUI_DYNBSE_TEST_RESOLVENT")) vtx.set_ladder_dyn_resolvent(rm);   // P7: inverse | lu
+          if (auto *wc = std::getenv("COQUI_DYNBSE_TEST_WCACHE")) vtx.set_wcache_mode(wc);   // P19: replicated | shared
           scr_eri.set_vertex(&vtx);
           e_corr = std::get<1>(scf_loop(mb_state, dyson, eriw, ft, solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol, 1, false, 1e-9, true));
           m = scr_eri.sigma_pair_meter();
         } else if (kind == 4) {
           solvers::vertex_t vtx(&ft, "none", nda::range(0, 0), mfw->nbnd());
-          vtx.set_pol_vertex("ladder", "w0_prev", nda::range(0, 4), -1, 1e-8, -1.0, -1.0, -1.0, "none");
+          vtx.set_pol_vertex("ladder", "w0_prev", nda::range(0, ncw), -1, 1e-8, -1.0, -1.0, -1.0, "none");
           vtx.set_ladder_rung("dynamic", 1e-8, 30, 12, -1.0);
           vtx.set_ladder_dyn_gamma1_only(true); vtx.set_ladder_dyn_dump(true);
           vtx.set_isdf_points("", true); vtx.set_wannier_frame("aux");
@@ -1141,7 +1153,7 @@ namespace bdft_tests {
                 }
         rel = std::sqrt(num) / std::max(std::sqrt(den), 1e-300);
       };
-      const long nb = 4;
+      const long nb = ncw;
       // (W) the Wannier frame on the nosym fixture
       nda::array<std::complex<double>, 2> V(4, 4), I4(4, 4);
       V() = std::complex<double>(0.0); I4() = std::complex<double>(0.0);
@@ -1153,18 +1165,23 @@ namespace bdft_tests {
       givens(0, 1, 0.7, 0.3); givens(1, 2, 1.1, -0.8); givens(2, 3, 0.4, 1.9); givens(0, 3, 0.9, 0.5);
       S5 S_r0, S_p1, S_pi, S_pv, S_a;
       const std::string ptsn = "coqui_d3_sigsw_A.secpts.h5", nu0n = "coqui_d3_sigsw_A.pol_nu0.g2.h5";
-      double ca = run_sw("A", mf, eri, 4, "", "", nullptr, true, S_a);           // band, dynamic: dumps the points + the nu0 column
-      REQUIRE(std::filesystem::exists(ptsn)); REQUIRE(std::filesystem::exists(nu0n));
-      double cr0 = run_sw("R0", mf, eri, 0, "", "", nullptr, false, S_r0);
-      double cp1 = run_sw("P1", mf, eri, 2, ptsn, nu0n, nullptr, false, S_p1);  // band frame on A's points, readout consumes A's column
-      double cpi = run_sw("PI", mf, eri, 2, ptsn, nu0n, &I4, false, S_pi);      // Wannier V = 1 on the same points
-      double cpv = run_sw("PV", mf, eri, 2, ptsn, nu0n, &V, false, S_pv);       // Wannier unitary mix V
-      (void)ca;
-      double relI, mxI, relV, mxV;
-      cdiff(S_pi, S_p1, S_r0, nb, S_r0.shape(2), relI, mxI);
-      cdiff(S_pv, S_p1, S_r0, nb, S_r0.shape(2), relV, mxV);
-      app_log(1, "dynbse_readout LFF-Sigma pair WANNIER gate: band frame vs Wannier V = 1: rel {:.3e} (max |d| {:.2e}); vs a unitary mix V of the window: "
-                 "rel {:.3e} (max |d| {:.2e}); e_corr band {:+.10f} V=1 {:+.10f} V {:+.10f} (R0 {:+.10f})", relI, mxI, relV, mxV, cp1, cpi, cpv, cr0);
+      double relI = 0.0, mxI = 0.0, relV = 0.0, mxV = 0.0, cp1 = 0.0;
+      const bool do_w = (ncw == 4);
+      if (do_w) {
+        double ca = run_sw("A", mf, eri, 4, "", "", nullptr, true, S_a);           // band, dynamic: dumps the points + the nu0 column
+        REQUIRE(std::filesystem::exists(ptsn)); REQUIRE(std::filesystem::exists(nu0n));
+        double cr0 = run_sw("R0", mf, eri, 0, "", "", nullptr, false, S_r0);
+        cp1 = run_sw("P1", mf, eri, 2, ptsn, nu0n, nullptr, false, S_p1);  // band frame on A's points, readout consumes A's column
+        double cpi = run_sw("PI", mf, eri, 2, ptsn, nu0n, &I4, false, S_pi);      // Wannier V = 1 on the same points
+        double cpv = run_sw("PV", mf, eri, 2, ptsn, nu0n, &V, false, S_pv);       // Wannier unitary mix V
+        (void)ca;
+        cdiff(S_pi, S_p1, S_r0, nb, S_r0.shape(2), relI, mxI);
+        cdiff(S_pv, S_p1, S_r0, nb, S_r0.shape(2), relV, mxV);
+        app_log(1, "dynbse_readout LFF-Sigma pair WANNIER gate: band frame vs Wannier V = 1: rel {:.3e} (max |d| {:.2e}); vs a unitary mix V of the window: "
+                   "rel {:.3e} (max |d| {:.2e}); e_corr band {:+.10f} V=1 {:+.10f} V {:+.10f} (R0 {:+.10f})", relI, mxI, relV, mxV, cp1, cpi, cpv, cr0);
+      } else {
+        app_log(1, "dynbse_readout LFF-Sigma pair SYMW: window [0, {}) (COQUI_DYNBSE_TEST_SYMW_NC): the (W) Wannier part is skipped", ncw);
+      }
       // (S) the symmetric mesh
       std::string fx = std::getenv("COQUI_DYNBSE_TEST_SIGPAIR_SYMW"); if (fx == "1" or fx.empty()) fx = "qe_lih222_sym";
       auto mfs = std::make_shared<mf::MF>(mf::default_MF(mpi_context, fx));
@@ -1178,6 +1195,10 @@ namespace bdft_tests {
       double csr0 = run_sw("SR0", mfs, eris, 0, "", "", nullptr, false, S_sr0);
       double csp1 = run_sw("SP1", mfs, eris, 2, ptss, nu0s, nullptr, false, S_sp1);   // the pair vertex on the sym mesh (IBZ externals)
       double csxs = run_sw("SXS", mfs, eris, 1, ptss, "", nullptr, false, S_sxs);     // B-S Sigma^{C,x} on the sym mesh at the same points
+      S5 S_sp1i;
+      ibz_cur = true;
+      double csp1i = run_sw("SP1I", mfs, eris, 2, ptss, nu0s, nullptr, false, S_sp1i);  // P1: the same object from the IBZ solve + star fold
+      ibz_cur = false;
       (void)csa;
       REQUIRE(S_sp1.shape(2) == mfs->nkpts_ibz());
       double relS, mxS;
@@ -1185,9 +1206,71 @@ namespace bdft_tests {
       app_log(1, "dynbse_readout LFF-Sigma pair SYM gate: one rung + static W on the SYMMETRIC mesh vs B-S Sigma^(C,x) (sym): rel Frobenius {:.3e} "
                  "(max |d| {:.2e}); e_corr SP1 {:+.10f} SXS {:+.10f} (SR0 {:+.10f}); nosym P1 {:+.10f} XS-equivalent identity on nosym: see section M",
               relS, mxS, csp1, csxs, csr0, cp1);
-      REQUIRE(relI < 1e-9);
-      REQUIRE(relV < 1e-7);   // the C-space object is gauge-invariant (the W-int point-frame gate holds at 1e-8)
+      if (do_w) { REQUIRE(relI < 1e-9); REQUIRE(relV < 1e-7); }   // the C-space object is gauge-invariant (the W-int point-frame gate holds at 1e-8)
       REQUIRE(relS < 1e-6);   // the symmetric path's own accuracy floor is the C-sector rotation unitarity (~1e-8 class)
+      double relIB, mxIB;
+      cdiff(S_sp1i, S_sp1, S_sr0, nb, mfs->nkpts_ibz(), relIB, mxIB);
+      app_log(1, "dynbse_readout LFF-Sigma pair IBZ gate (P1): the IBZ solve + star fold vs the full-mesh units on {}: rel {:.3e} (max |d| {:.2e}); "
+                 "e_corr {:+.10f} vs {:+.10f}", fx, relIB, mxIB, csp1i, csp1);
+      if (std::getenv("COQUI_DYNBSE_TEST_SYMW_XREF")) {
+        // P1 ARBITER: the NOSYM fixture (its own orbitals at every k, no rotation anywhere) on the SYM run's star-closed points is
+        // the exact full-mesh object in another gauge; the gauge-invariant eigenvalues of the Hermitized C block of dSigma(tau, k)
+        // at the IBZ points (matched by crystal coordinates) decide which sym path -- the full-mesh units or the IBZ fold -- is
+        // closer to it. The two mean fields differ at the 1e-6 level (their GW baselines: R0 vs SR0), the arbiter's floor.
+        S5 S_xr0, S_xp1;
+        double cxr0 = run_sw("XR0", mf, eri, 0, "", "", nullptr, false, S_xr0);
+        double cxp1 = run_sw("XP1", mf, eri, 2, ptss, "", nullptr, false, S_xp1);     // the sym points frozen; the readout solves its own nu0 column
+        auto kn = mf->kpts_crystal(); auto ks = mfs->kpts_crystal();
+        auto eig_of = [&](S5 const &S, S5 const &R, long ik) {   // the sorted eigenvalues of the Hermitized (S - R) C block, every tau
+          std::vector<double> ev;
+          for (long it = 0; it < S.shape(0); ++it) {
+            nda::matrix<std::complex<double>> M(nb, nb);
+            for (long i = 0; i < nb; ++i)
+              for (long j = 0; j < nb; ++j) M(i, j) = 0.5 * ((S(it, 0, ik, i, j) - R(it, 0, ik, i, j)) + std::conj(S(it, 0, ik, j, i) - R(it, 0, ik, j, i)));
+            auto [lam, V] = nda::linalg::eigenelements(M);
+            for (long i = 0; i < nb; ++i) ev.push_back(double(lam(i)));
+          }
+          return ev;
+        };
+        double d_full = 0.0, d_ibz = 0.0, scale = 0.0;
+        for (long ki = 0; ki < mfs->nkpts_ibz(); ++ki) {
+          long kmatch = -1;
+          for (long kk = 0; kk < mf->nkpts() and kmatch < 0; ++kk) {
+            bool same = true;
+            for (int d = 0; d < 3; ++d) { double x = ks(ki, d) - kn(kk, d); x -= std::round(x); if (std::abs(x) > 1e-8) same = false; }
+            if (same) kmatch = kk;
+          }
+          REQUIRE(kmatch >= 0);
+          auto en = eig_of(S_xp1, S_xr0, kmatch), ef = eig_of(S_sp1, S_sr0, ki), ei = eig_of(S_sp1i, S_sr0, ki);
+          for (size_t i = 0; i < en.size(); ++i) {
+            d_full = std::max(d_full, std::abs(ef[i] - en[i])); d_ibz = std::max(d_ibz, std::abs(ei[i] - en[i])); scale = std::max(scale, std::abs(en[i]));
+          }
+        }
+        app_log(1, "dynbse_readout LFF-Sigma pair IBZ ARBITER (P1): eigenvalues of the Hermitized dSigma C block at the IBZ k, nosym exact vs the sym "
+                   "full-mesh units: max |d| {:.3e}, vs the IBZ fold: max |d| {:.3e} (scale {:.3e}); e_corr nosym {:+.10f} (R0 {:+.10f}) sym full "
+                   "{:+.10f} ibz {:+.10f} (SR0 {:+.10f})", d_full, d_ibz, scale, cxp1, cxr0, csp1, csp1i, csr0);
+      }
+      // P1 tolerance: the two sym paths carry the D-matrix accuracy of symmetry_rotation differently (the full-mesh path in the
+      // transported legs of every pair, the IBZ path in the fold of the externals); on qe_lih222_sym with a closed window the
+      // established class of the symmetry machinery is 5e-5 (test_vertex_ibz.cpp: "kernel-accuracy + D-matrix-accuracy +
+      // O(leakage) class", REQUIRE < 5e-3); measured here 1.5e-4 at [0, 3). With the leaking default window [0, 4) the full-mesh
+      // path is off by O(leakage) = 1.8e-2 and the check is informational.
+      const bool closed_window = (ncw == 3 or ncw == 6);
+      if (std::getenv("COQUI_DYNBSE_TEST_SYMW_STATIC_ONLY")) { if (closed_window) REQUIRE(relIB < 5e-3); mpi_context->comm.barrier(); return; }
+      // P1, the dynamic path on the sym mesh: col static_dyn (y = 0 through vertex_sigma_dyn.icc, IBZ solve + fold) must equal
+      // the static path's resummed column (col static) with the same outer W and IBZ fold (the N1 identity on a sym mesh)
+      S5 S_sps, S_spsd;
+      ibz_cur = true; col_cur = "static"; outer_cur = "static";
+      double csps = run_sw("SPS", mfs, eris, 2, ptss, nu0s, nullptr, false, S_sps);
+      col_cur = "static_dyn";
+      double cspsd = run_sw("SPSD", mfs, eris, 2, ptss, nu0s, nullptr, false, S_spsd);
+      ibz_cur = false; col_cur = "static1"; outer_cur = "static";
+      double relSD, mxSD;
+      cdiff(S_spsd, S_sps, S_sr0, nb, mfs->nkpts_ibz(), relSD, mxSD);
+      app_log(1, "dynbse_readout LFF-Sigma dyn IBZ gate (P1): the dynamic path (static_dyn, IBZ solve + fold) vs the static path (static, IBZ) on {}: "
+                 "rel {:.3e} (max |d| {:.2e}); e_corr {:+.10f} vs {:+.10f}", fx, relSD, mxSD, cspsd, csps);
+      if (closed_window) { REQUIRE(relIB < 5e-3); REQUIRE(relSD < 1e-8); }
+      else app_log(1, "dynbse_readout LFF-Sigma IBZ gates (P1): informational at the leaking window [0, 4) (run with COQUI_DYNBSE_TEST_SYMW_NC=3 for the REQUIREs)");
       mpi_context->comm.barrier();
       if (mpi_context->comm.root())
         for (auto const &e : std::filesystem::directory_iterator("."))
