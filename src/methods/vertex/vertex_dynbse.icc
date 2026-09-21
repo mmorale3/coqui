@@ -87,6 +87,9 @@ namespace solvers {
                                           // heuristic (nu != 0 units, highest node first, then nu = 0); "measured": by the wall
                                           // time of the same (s, q, nu) unit in a previous call (unit_cost), unseen units first
       std::map<std::tuple<long, long, long>, double> const *unit_cost = nullptr;   // (is, iq, m) -> seconds (dyn_meter::merge_unit_cost)
+      utils::mpi_context_t<mpi3::communicator> *shm_mpi = nullptr;   // P19: when set, the driver's W_d(q', tau) / W_d(q', 0)
+                                                                     // tables live in ONE node-shared window per NUMA node
+                                                                     // (16 nq nt Nm^2 bytes once per node, not once per rank)
       nda::array<double, 2> const *kcrys = nullptr;  // (nk, 3) crystal coordinates of the k mesh: when given
                                                      // (and ksum_ft), the rung's k-sum runs through kmesh_ft
       bool ksum_ft = true;
@@ -632,7 +635,7 @@ namespace solvers {
     inline void pair_space_ladder_dyn(nda::MemoryArrayOfRank<5> auto const &G_CC,    // (nt,ns,nk,nc,nc)
                                       nda::array<cplx, 4> const &Xb,                 // (ns,nk,Nm,nc)
                                       nda::array<cplx, 3> const &W0b,                // (nq,Nm,Nm)
-                                      nda::array<cplx, 4> const &Wbh,                // (nq,nw_half,Nm,Nm)
+                                      nda::MemoryArrayOfRank<4> auto const &Wbh,     // (nq,nw_half,Nm,Nm): array or view (P19)
                                       nda::array<long, 2> const &kmq, nda::array<long, 2> const &kpq,
                                       vertex_pi::iaft_tools &tools, std::vector<long> const &nu_list,
                                       nda::array<cplx, 4> *Pi_static, nda::array<cplx, 4> *Pi_dyn1,
@@ -761,12 +764,28 @@ namespace solvers {
       // bosonic inu -> tau transform Ttw_bb (nt, nw_b); W_d(s) = W_dyn(s) (its tau form), the
       // constant part of K_d is -W_dyn(inu'=0) acting on the frequency sums.
       const long lpos0 = std::max(tools.m0, tools.w_mirror_b(tools.m0)) - nw_b / 2;
-      nda::array<cplx, 4> Wd_s(nq, nt, Nm, Nm);
-      nda::array<cplx, 3> Wd0(nq, Nm, Nm);
+      // P19: the tables are per rank ("replicated") or node-shared (opt.shm_mpi set): the same unfold, each q' by one rank
+      // of the node, published by a fence -- bitwise the same values
+      const bool shm_w = (opt.shm_mpi != nullptr);
+      nda::array<cplx, 4> Wd_s_own;
+      nda::array<cplx, 3> Wd0_own;
+      std::optional<math::shm::shared_array<nda::array_view<cplx, 4>>> sWd_s;
+      std::optional<math::shm::shared_array<nda::array_view<cplx, 3>>> sWd0;
+      if (shm_w) {
+        sWd_s.emplace(math::shm::make_shared_array<nda::array_view<cplx, 4>>(*opt.shm_mpi, std::array<long, 4>{nq, nt, Nm, Nm}));
+        sWd0.emplace(math::shm::make_shared_array<nda::array_view<cplx, 3>>(*opt.shm_mpi, std::array<long, 3>{nq, Nm, Nm}));
+        sWd_s->win().fence(); sWd0->win().fence();
+      } else {
+        Wd_s_own = nda::array<cplx, 4>(nq, nt, Nm, Nm);
+        Wd0_own = nda::array<cplx, 3>(nq, Nm, Nm);
+      }
+      nda::array_view<cplx, 4> Wd_s = shm_w ? sWd_s->local() : nda::array_view<cplx, 4>(Wd_s_own);
+      nda::array_view<cplx, 3> Wd0 = shm_w ? sWd0->local() : nda::array_view<cplx, 3>(Wd0_own);
       {
         nda::array<cplx, 2> Wq(nw_b, Nm * Nm), Wt(nt, Nm * Nm);
         double dsym = 0.0, wmax = 0.0;
         for (long iqp = 0; iqp < nq; ++iqp) {
+          if (shm_w and iqp % opt.shm_mpi->node_comm.size() != opt.shm_mpi->node_comm.rank()) continue;
           for (long l = 0; l < nw_b; ++l) {
             const long lpos = std::max(l, tools.w_mirror_b(l)) - nw_b / 2;
             for (long P = 0; P < Nm; ++P)
@@ -786,6 +805,7 @@ namespace solvers {
           }
           Wd0(iqp, all, all) = Wbh(iqp, lpos0, all, all);
         }
+        if (shm_w) { sWd_s->win().fence(); sWd0->win().fence(); }   // publish the node-shared tables
         if (met) met->wtau_sym = std::max(met->wtau_sym, (wmax > 0.0) ? dsym / wmax : 0.0);
       }
       // ---- transfer lookup ---------------------------------------------------------------------
@@ -1362,7 +1382,7 @@ namespace solvers {
     utils::check(active() and secondary(), "vertex_t::dynbse_gate: requires an ACTIVE secondary-basis vertex.");
     utils::check(not _wannier, "vertex_t::dynbse_gate: window mode only.");
     utils::check(_W0b_qmm.has_value(), "vertex_t::dynbse_gate: W0bar is absent -- build_w0 must run first.");
-    utils::check(_Wb_qwmm.has_value(),
+    utils::check(has_cached_w(),
                  "vertex_t::dynbse_gate: the W-bar cache is absent -- run update_w and cache_w first.");
     auto MF = thc.MF();
     auto mpi = thc.mpi();
@@ -1382,7 +1402,7 @@ namespace solvers {
     std::vector<long> nus = {tools.m0, tools.m0 + 1};
     const long nnu = long(nus.size());
     auto const &W0b = _W0b_qmm.value();
-    auto const &Wbh = _Wb_qwmm.value();
+    auto Wbh = wb_cache();
     auto max_abs4 = [](nda::array<ComplexType, 4> const &A) {
       double m = 0.0;
       for (auto const &v : A) m = std::max(m, std::abs(v));
@@ -1505,6 +1525,7 @@ namespace solvers {
     {
       vd::dyn_opts o;
       o.kcrys = std::addressof(kc);
+      o.shm_mpi = (_wcache == "shared") ? mpi.get() : nullptr;   // P19: node-shared W_d tables with the shared cache
       o.gap_mask = gap_mask;
       o.static_only = true;
       vd::dyn_meter met;
@@ -1541,6 +1562,7 @@ namespace solvers {
       nda::array<ComplexType, 4> P1(nnu, nq, Nm, Nm);
       vd::dyn_opts o;
       o.kcrys = std::addressof(kc);
+      o.shm_mpi = (_wcache == "shared") ? mpi.get() : nullptr;   // P19: node-shared W_d tables with the shared cache
       o.gap_mask = gap_mask;
       o.one_rung_only = true;
       vd::dyn_meter met;
@@ -1637,6 +1659,7 @@ namespace solvers {
         nda::array<ComplexType, 4> Pn(nnu, nq, Nm, Nm);
         vd::dyn_opts o;
         o.kcrys = std::addressof(kc);
+        o.shm_mpi = (_wcache == "shared") ? mpi.get() : nullptr;   // P19: node-shared W_d tables with the shared cache
         o.gap_mask = gap_mask;
         o.gmres_m = 0;
         o.maxit = nord;
@@ -1710,6 +1733,7 @@ namespace solvers {
       nda::array<ComplexType, 4> Pg(nnu0, nq, Nm, Nm), Pd(nnu0, nq, Nm, Nm), Pd2(nnu0, nq, Nm, Nm), Pg2(nnu0, nq, Nm, Nm);
       vd::dyn_opts o;
       o.kcrys = std::addressof(kc);
+      o.shm_mpi = (_wcache == "shared") ? mpi.get() : nullptr;   // P19: node-shared W_d tables with the shared cache
       o.gmres_m = 4;
       o.maxit = 12;
       vd::dyn_meter met;
@@ -1787,7 +1811,7 @@ namespace solvers {
     utils::check(active() and secondary(), "vertex_t::eval_pol_dynbse_nu0: requires an ACTIVE secondary-basis vertex.");
     // W-int-0: _wannier => the outputs are the MLWF-pair polarization (dumped for coarse->fine interpolation).
     utils::check(_W0b_qmm.has_value(), "vertex_t::eval_pol_dynbse_nu0: W0bar is absent -- build_w0 must run first.");
-    utils::check(_Wb_qwmm.has_value(),
+    utils::check(has_cached_w(),
                  "vertex_t::eval_pol_dynbse_nu0: the W-bar cache is absent -- cache_w must run on this instance "
                  "(the dynamic readout folds THIS iteration's dW).");
     auto MF = thc.MF();
@@ -1806,6 +1830,7 @@ namespace solvers {
     nda::array<ComplexType, 4> Ps(1, nq, nout, nout), P1(1, nq, nout, nout), Pg(1, nq, nout, nout), Pd(1, nq, nout, nout);
     vd::dyn_opts o;
     o.kcrys = std::addressof(kc);
+    o.shm_mpi = (_wcache == "shared") ? mpi.get() : nullptr;   // P19: node-shared W_d tables with the shared cache
     o.tol = _dyn_tol; o.maxit = _dyn_maxit; o.gmres_m = _dyn_gmres; o.sign_ks = _dyn_sign;
     o.rhs_block = _dyn_rhs_block;
     o.dense_rung = _dyn_dense;
@@ -1826,7 +1851,7 @@ namespace solvers {
     // D3/D4 configuration at inu = 0: the shared aux grid with the Dsq/Dcb tables, no mask (the
     // union grid / in-gap mask / twisted-pair basis are the inu != 0 machinery of D2e, still open)
     vd::dyn_meter met;
-    vd::pair_space_ladder_dyn(G_CC, _Xb_skma, _W0b_qmm.value(), _Wb_qwmm.value(), kmq, kpq, tools, nu0,
+    vd::pair_space_ladder_dyn(G_CC, _Xb_skma, _W0b_qmm.value(), wb_cache(), kmq, kpq, tools, nu0,
                               &Ps, nullptr, &Pg, &Pd, mpi->comm.rank(), mpi->comm.size(), o, &met, symc);
     // the pure one dynamic rung (T_s = 0, one application) as its own column
     {
@@ -1834,7 +1859,7 @@ namespace solvers {
       o1.one_rung_only = true;
       if (_dyn_dump) o1.dump_prefix = mb_state.coqui_prefix + ".dynunits.nu0r1.g" + std::to_string(gen);
       vd::dyn_meter met1;
-      vd::pair_space_ladder_dyn(G_CC, _Xb_skma, _W0b_qmm.value(), _Wb_qwmm.value(), kmq, kpq, tools, nu0,
+      vd::pair_space_ladder_dyn(G_CC, _Xb_skma, _W0b_qmm.value(), wb_cache(), kmq, kpq, tools, nu0,
                                 nullptr, &P1, nullptr, nullptr, mpi->comm.rank(), mpi->comm.size(), o1, &met1, symc);
     }
     for (auto *A : {&Ps, &P1, &Pg, &Pd}) mpi->comm.all_reduce_in_place_n(A->data(), A->size(), std::plus<>{});
@@ -1919,7 +1944,7 @@ namespace solvers {
     utils::check(not _wannier or _wannier_frame != "pair",
                  "vertex_t::eval_pol_dynbse_cut: Wannier mode in the aux/point frame only (the pair frame is inu = 0 only).");
     utils::check(_W0b_qmm.has_value(), "vertex_t::eval_pol_dynbse_cut: W0bar is absent -- build_w0 must run first.");
-    utils::check(_Wb_qwmm.has_value(), "vertex_t::eval_pol_dynbse_cut: the W-bar cache is absent -- cache_w must run.");
+    utils::check(has_cached_w(), "vertex_t::eval_pol_dynbse_cut: the W-bar cache is absent -- cache_w must run.");
     auto MF = thc.MF();
     auto mpi = thc.mpi();
     nda::array<ComplexType, 5> G_CC;
@@ -1944,6 +1969,7 @@ namespace solvers {
     o.bubble_only = bubble_only;
     if (bubble_only) app_log(1, "  [scGW-tilde T2] pol_vertex_dyn_bubble_only: ONLY the window bubble column Pi_bub = (spin/nk) D^dag Cb D is evaluated (no rung, no solve).");
     o.kcrys = std::addressof(kc);
+    o.shm_mpi = (_wcache == "shared") ? mpi.get() : nullptr;   // P19: node-shared W_d tables with the shared cache
     o.tol = _dyn_tol; o.maxit = _dyn_maxit; o.gmres_m = std::max<long>(_dyn_gmres, 12); o.sign_ks = _dyn_sign;
     o.rhs_block = _dyn_rhs_block;
     o.dense_rung = _dyn_dense;
@@ -1968,7 +1994,7 @@ namespace solvers {
     o.readout_tol = 1e-6;
     o.q_subset = std::addressof(qsel);
     vd::dyn_meter met;
-    vd::pair_space_ladder_dyn(G_CC, _Xb_skma, _W0b_qmm.value(), _Wb_qwmm.value(), kmq, kpq, tools, nus,
+    vd::pair_space_ladder_dyn(G_CC, _Xb_skma, _W0b_qmm.value(), wb_cache(), kmq, kpq, tools, nus,
                               &Ps, nullptr, &Pg, &Pd, mpi->comm.rank(), mpi->comm.size(), o, &met, symc);
     if (_dyn_cut_r1 and not bubble_only) {
       vd::dyn_opts o1 = o;
@@ -1976,7 +2002,7 @@ namespace solvers {
       o1.Pi_bub = nullptr;
       if (_dyn_dump) o1.dump_prefix = mb_state.coqui_prefix + ".dynunits.cutr1.g" + std::to_string(gen);
       vd::dyn_meter met1;
-      vd::pair_space_ladder_dyn(G_CC, _Xb_skma, _W0b_qmm.value(), _Wb_qwmm.value(), kmq, kpq, tools, nus,
+      vd::pair_space_ladder_dyn(G_CC, _Xb_skma, _W0b_qmm.value(), wb_cache(), kmq, kpq, tools, nus,
                                 nullptr, &P1, nullptr, nullptr, mpi->comm.rank(), mpi->comm.size(), o1, &met1, symc);
     } else {
       // pol_vertex_dyn_cut_r1 = false: the one-bare-rung column is not computed (Pi_dyn1 below = Pi_static)
@@ -2044,7 +2070,7 @@ namespace solvers {
     utils::check(opt.outer == "dynamic" or opt.outer == "static", "vertex_t::eval_sigma_pair_dyn: unknown outer W \"{}\".", opt.outer);
     auto MF = thc.MF();
     auto mpi = thc.mpi();
-    if (not _Wb_qwmm.has_value()) {
+    if (not has_cached_w()) {
       app_log(1, "  [LFF-Sigma dyn] folding this iteration's W into the W-bar cache (cache_w on demand).");
       cache_w(mb_state, thc);
     }
@@ -2173,6 +2199,7 @@ namespace solvers {
     }
     vd::dyn_opts o;
     o.kcrys = std::addressof(kc);
+    o.shm_mpi = (_wcache == "shared") ? mpi.get() : nullptr;   // P19: node-shared W_d tables with the shared cache
     o.tol = _dyn_tol; o.maxit = _dyn_maxit; o.gmres_m = std::max<long>(_dyn_gmres, 12); o.sign_ks = opt.sign_ks;
     o.rhs_block = _dyn_rhs_block;
     o.dense_rung = _dyn_dense;
@@ -2193,7 +2220,7 @@ namespace solvers {
     o.q_subset = std::addressof(qs);
     o.sigma = std::addressof(hook);
     vd::dyn_meter dmet;
-    vd::pair_space_ladder_dyn(G_CC, _Xb_skma, _W0b_qmm.value(), _Wb_qwmm.value(), kmq, kpq, tools, nus,
+    vd::pair_space_ladder_dyn(G_CC, _Xb_skma, _W0b_qmm.value(), wb_cache(), kmq, kpq, tools, nus,
                               nullptr, nullptr, nullptr, nullptr, mpi->comm.rank(), mpi->comm.size(), o, &dmet, symc);
     mpi->comm.all_reduce_in_place_n(hook.S_cst.data(), hook.S_cst.size(), std::plus<>{});
     mpi->comm.all_reduce_in_place_n(hook.RT.data(), hook.RT.size(), std::plus<>{});

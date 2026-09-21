@@ -3325,7 +3325,7 @@ namespace solvers {
     //   - neither present: FIRST ITERATION -- the rung reduces to the bare
     //     interaction Z.
     const bool sec = secondary();
-    const bool use_wcache = sec and _Wb_qwmm.has_value();
+    const bool use_wcache = sec and has_cached_w();
     // Step 1a (notes/vertex_parallelization_v2_plan.md Step 1): a dynamic-W source is
     // present iff we are NOT consuming the W-bar cache and mb_state carries dW. In the
     // GLOBAL path we build the full replicated Wdyn_qwPQ (Np^2) below; in the SECONDARY
@@ -3646,7 +3646,7 @@ namespace solvers {
       // bitwise identical to mirror-then-fold). eta[dW] diagnostics for this rung
       // were logged at fill time (cache_w); eta[Z] above covers the bare core.
       if (use_wcache) {
-        auto const& Wbh = _Wb_qwmm.value();
+        auto Wbh = wb_cache();
         const long nw_half = (tools.nw_b % 2 == 0) ? tools.nw_b / 2 : tools.nw_b / 2 + 1;
         utils::check(Wbh.shape(0) == nqpts_ibz and Wbh.shape(1) == nw_half and
                      Wbh.shape(2) == _Nm and Wbh.shape(3) == _Nm,
@@ -4183,8 +4183,23 @@ namespace solvers {
     // the two omega slices the eta diagnostic reads, for every q (replicated, small)
     nda::array<ComplexType, 4> W_diag(eta_diag ? nqpts_ibz : 0, 2, eta_diag ? Np : 0, eta_diag ? Np : 0);
     if (eta_diag) W_diag() = ComplexType(0.0);
-    _Wb_qwmm.emplace(nda::array<ComplexType, 4>(nqpts_ibz, nw_half, _Nm, _Nm));
-    _Wb_qwmm.value()() = ComplexType(0.0);
+    // P19: the storage -- one array per rank ("replicated", the historic path: each q folded by ONE rank globally and
+    // gathered by a zero-padded all_reduce), or one node-shared window per NUMA node ("shared": each q folded by one rank
+    // PER NODE into the shared window, no all_reduce; the same fold_core gemms, bitwise the same values).
+    const bool shm_cache = (_wcache == "shared");
+    _Wb_qwmm.reset(); _Wb_shm.reset();
+    if (shm_cache) {
+      _Wb_shm = std::make_shared<math::shm::shared_array<nda::array_view<ComplexType, 4>>>(
+          math::shm::make_shared_array<nda::array_view<ComplexType, 4>>(*mpi, std::array<long, 4>{nqpts_ibz, nw_half, _Nm, _Nm}));
+      _Wb_shm->win().fence();
+      if (mpi->node_comm.root()) _Wb_shm->local()() = ComplexType(0.0);
+      _Wb_shm->win().fence();
+    } else {
+      _Wb_qwmm.emplace(nda::array<ComplexType, 4>(nqpts_ibz, nw_half, _Nm, _Nm));
+      _Wb_qwmm.value()() = ComplexType(0.0);
+    }
+    nda::array_view<ComplexType, 4> Wb = shm_cache ? _Wb_shm->local() : nda::array_view<ComplexType, 4>(_Wb_qwmm.value());
+    const bool diag_writer = shm_cache ? (mpi->internode_comm.rank() == 0) : true;   // the eta slices: one writer per q globally
     {
       bool head_logged = false;
       nda::array<ComplexType, 3> W_w(nw_half, Np, Np);
@@ -4194,7 +4209,7 @@ namespace solvers {
         // the collective per-q gather (every rank participates; the owner keeps the slab)
         nda::array<ComplexType, 3> W_t = vertex_redist_detail::gather_dW_one_q(
             mb_state.dW_qtPQ.value(), mpi->comm, iq, nt_half, Np);
-        if (iq % mpi->comm.size() != mpi->comm.rank()) continue;
+        if (shm_cache ? (iq % mpi->node_comm.size() != mpi->node_comm.rank()) : (iq % mpi->comm.size() != mpi->comm.rank())) continue;
         ++my_nfold;
         if (head_ok and iq == iq_gamma) {
           if (_bl_head_static_all and _rung == linear_rung) {
@@ -4223,7 +4238,7 @@ namespace solvers {
         }
         // tau -> omega on the PH-sym half mesh (per q, on its owner: the same call as before)
         _ft->tau_to_w_PHsym(W_t, W_w);
-        if (eta_diag) {
+        if (eta_diag and diag_writer) {
           W_diag(iq, 0, all, all) = W_w(lpos0, all, all);
           W_diag(iq, 1, all, all) = W_w(lposm, all, all);
         }
@@ -4231,12 +4246,16 @@ namespace solvers {
         auto t_q = _t_qmP(iq, all, all);
         for (long lp = 0; lp < nw_half; ++lp)
           vertex_secondary_detail::fold_core(t_q, W_w(lp, all, all), tmp,
-                                             _Wb_qwmm.value()(iq, lp, all, all));
+                                             Wb(iq, lp, all, all));
       }
       (void)head_logged;
-      // exact partition gathers (zero-padded all_reduce): bit-identical
-      mpi->comm.all_reduce_in_place_n(_Wb_qwmm.value().data(), _Wb_qwmm.value().size(),
-                                      std::plus<>{});
+      if (shm_cache) {
+        _Wb_shm->win().fence();   // publish the node-shared cache (every q written by exactly one rank of the node)
+      } else {
+        // exact partition gathers (zero-padded all_reduce): bit-identical
+        mpi->comm.all_reduce_in_place_n(_Wb_qwmm.value().data(), _Wb_qwmm.value().size(),
+                                        std::plus<>{});
+      }
       if (eta_diag) mpi->comm.all_reduce_in_place_n(W_diag.data(), W_diag.size(), std::plus<>{});
       const long total_fold = mpi->comm.all_reduce_value(my_nfold, std::plus<>{});
       app_log(2, "  Refinement 2 W-bar fold distributed over {} ranks: this rank folded "

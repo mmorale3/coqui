@@ -680,6 +680,11 @@ namespace solvers {
     // rotation (the same unfolding point as the kernels' planned IBZ support) -- no
     // layout change needed, only the accessor.
     std::optional<nda::array<ComplexType, 4>> _Wb_qwmm;
+    // P19 (vertex_perf_plan.md, 2026-09-21): pol_vertex_wcache = "shared" keeps ONE copy of the cache per NUMA node
+    // (math::shm::shared_array, the Xhat_shm pattern of vertex_sym) instead of one per rank; every consumer reads the
+    // cache through wb_cache(), a view onto whichever storage is in use. "replicated" (default) = the historic per-rank array.
+    std::string _wcache = "replicated";
+    std::shared_ptr<math::shm::shared_array<nda::array_view<ComplexType, 4>>> _Wb_shm;
     // internal/test switch: when false, cache_w is never invoked by scr_coulomb and
     // the scf driver retains dW (needs_dw_retention), so eval_Pi_C takes the legacy
     // fold-at-consumption branch -- the pre-cache behavior, kept as the permanent
@@ -1306,8 +1311,21 @@ namespace solvers {
     bool w0_skip_gamma() const { return _div_treatment == "v1_skip"; }
 
     // W-bar iteration cache accessors (notes/wbar_cache.md)
-    bool has_cached_w() const { return _Wb_qwmm.has_value(); }
-    void reset_w_cache() { _Wb_qwmm.reset(); }
+    bool has_cached_w() const { return _Wb_qwmm.has_value() or _Wb_shm != nullptr; }
+    void reset_w_cache() { _Wb_qwmm.reset(); _Wb_shm.reset(); }
+    /** pol_vertex_wcache (default "replicated"): the storage of the W-bar cache -- one array per rank, or (P19, "shared")
+     *  one node-shared window per NUMA node (16 nq_ibz nw_half N_m^2 bytes once per node instead of once per rank). */
+    void set_wcache_mode(std::string const &m) {
+      utils::check(m == "replicated" or m == "shared", "vertex_t::set_wcache_mode: pol_vertex_wcache must be replicated | shared (got \"{}\").", m);
+      _wcache = m;
+    }
+    std::string const &wcache_mode() const { return _wcache; }
+    /** the W-bar cache (nq_ibz, nw_half, N_m, N_m) as a view onto its storage (replicated array or node-shared window) */
+    nda::array_view<ComplexType, 4> wb_cache() {
+      utils::check(has_cached_w(), "vertex_t::wb_cache: the W-bar cache is absent -- cache_w must run first.");
+      if (_Wb_shm) return _Wb_shm->local();
+      return nda::array_view<ComplexType, 4>(_Wb_qwmm.value());
+    }
     // legacy/compat switch (see the _w_cache_enabled comment); disabling also drops
     // any cached data so the next eval_Pi_C takes the retained-dW branch
     void set_w_cache_enabled(bool on) {

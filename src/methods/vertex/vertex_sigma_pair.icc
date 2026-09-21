@@ -73,7 +73,7 @@ namespace solvers {
     inline void eval_pair_sigma(nda::MemoryArrayOfRank<5> auto const &G_CC,    // (nt,ns,nk,nc,nc) full BZ
                                 nda::array<cplx, 4> const &Xb,                 // (ns,nk,Nm,nc)
                                 nda::array<cplx, 3> const &W0b,                // (nq,Nm,Nm)
-                                nda::array<cplx, 4> const *Wbh,                // (nq,nw_half,Nm,Nm) or nullptr
+                                nda::array_view<cplx, 4> const *Wbh,           // (nq,nw_half,Nm,Nm) or nullptr (a view: P19)
                                 nda::array<long, 2> const &kmq, nda::array<long, 2> const &kpq,
                                 vertex_pi::iaft_tools const &tools, long rank, long nproc,
                                 vertex_t::sigma_pair_opts const &opt, nda::array<cplx, 5> &dSig,
@@ -375,7 +375,7 @@ namespace solvers {
     utils::check(_W0b_qmm.has_value(), "vertex_t::eval_sigma_pair: W0bar is absent -- build_w0 must run first.");
     auto MF = thc.MF();
     auto mpi = thc.mpi();
-    if (opt.outer == "dynamic" and not _Wb_qwmm.has_value()) {
+    if (opt.outer == "dynamic" and not has_cached_w()) {
       app_log(1, "  [LFF-Sigma pair] outer W = dynamic: folding this iteration's W into the W-bar cache (cache_w on demand).");
       cache_w(mb_state, thc);
     }
@@ -413,7 +413,9 @@ namespace solvers {
           }
         }
     }
-    vs::eval_pair_sigma(G_CC, _Xb_skma, _W0b_qmm.value(), _Wb_qwmm.has_value() ? std::addressof(_Wb_qwmm.value()) : nullptr,
+    std::optional<nda::array_view<ComplexType, 4>> Wbh_v;
+    if (has_cached_w()) Wbh_v.emplace(wb_cache());
+    vs::eval_pair_sigma(G_CC, _Xb_skma, _W0b_qmm.value(), Wbh_v.has_value() ? std::addressof(Wbh_v.value()) : nullptr,
                         kmq, kpq, tools, mpi->comm.rank(), mpi->comm.size(), opt, dSig, &mloc, symc,
                         G_close.has_value() ? std::addressof(G_close.value()) : nullptr);
     mpi->comm.all_reduce_in_place_n(dSig.data(), dSig.size(), std::plus<>{});
