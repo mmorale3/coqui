@@ -90,7 +90,7 @@ inline decltype(auto) default_MF(std::shared_ptr<utils::mpi_context_t<comm_t>>& 
     return default_MF(comm, mf::qe_source, outdir, prefix, ftype);
 
   } else if (src == "qe_si333_sym" or src == "qe_si333_nosym" or
-             src == "qe_si444_sym" or src == "qe_si444_trevonly") {
+             src == "qe_si444_sym" or src == "qe_si444_trevonly" or src == "qe_si444_noinv") {
 
     // 2026-09-22: the Si 3x3x3 pair (C3v AND time-reversal pairs) and the 4x4x4 production mesh
     // (symmetric / time-reversal-only), h5 only (si.coqui.h5 from pw2coqui)

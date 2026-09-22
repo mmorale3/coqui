@@ -425,7 +425,7 @@ namespace solvers {
      * vertex_debug trev_w_check = 1.
      */
     inline void trev_rung_check(auto const &MF, nda::array<ComplexType, 3> const &W_qmm,
-                                std::string_view tag) {
+                                nda::array<ComplexType, 3> const &t_qmP, std::string_view tag) {
       decltype(nda::range::all) all;
       const long nq = W_qmm.shape(0), Nm = W_qmm.shape(1);
       if (nq != MF->nqpts()) {
@@ -459,6 +459,28 @@ namespace solvers {
         hmax = std::max(hmax, dH / scale);
         if (umk) { ++numk; if (rT > tmax_umk) { tmax_umk = rT; q_worst = iq; } }
         else     { ++nplain; tmax_plain = std::max(tmax_plain, rT); }
+      }
+      // the SECONDARY basis is what the downfold W0bar = t W0 t^dag is written in, and the (P2) transpose is exact
+      // only if t(-q) = conj(t(q)). The per-q least squares (gelss with an rcond cut) is conjugation-covariant in
+      // exact arithmetic -- but a singular value sitting at the truncation threshold can retain a DIFFERENT rank at
+      // +q and -q, which breaks the identity outright. Measure it.
+      if (t_qmP.shape(0) == nq) {
+        const long Nmm = t_qmP.shape(1), Npp = t_qmP.shape(2);
+        double tmax = 0.0;
+        long q_t = -1;
+        for (long iq = 0; iq < nq; ++iq) {
+          const long iqm = long(qm(iq));
+          double num = 0.0, den = 0.0;
+          for (long m = 0; m < Nmm; ++m)
+            for (long P = 0; P < Npp; ++P) {
+              num += std::norm(t_qmP(iqm, m, P) - std::conj(t_qmP(iq, m, P)));
+              den += std::norm(t_qmP(iq, m, P));
+            }
+          const double r = std::sqrt(num / std::max(den, 1e-300));
+          if (r > tmax) { tmax = r; q_t = iq; }
+        }
+        app_log(1, "[trev_w_check] {}: the secondary transfer basis -- max_q ||t(-q) - conj(t(q))||_F / ||t(q)||_F = "
+                   "{:.3e} (worst q {}). The PQ-transpose rule assumes this is zero.", tag, tmax, q_t);
       }
       const double w0 = (q_worst >= 0) ? qcrys(q_worst, 0) : 0.0;
       const double w1 = (q_worst >= 0) ? qcrys(q_worst, 1) : 0.0;
@@ -2685,7 +2707,7 @@ namespace solvers {
       symc = &_sym_secondary.value();
     }
     if (vertex_debug::flag("trev_w_check"))
-      vertex_ladder_detail::trev_rung_check(MF, _W0b_qmm.value(), "W0bar (secondary, nu = 0)");
+      vertex_ladder_detail::trev_rung_check(MF, _W0b_qmm.value(), _t_qmP, "W0bar (secondary, nu = 0)");
 
     vertex_pi::iaft_tools tools(*_ft);
     // DA D-1 (notes/qsgwhat_discrepancy_spec.md Phase 2): the TDA context, built from the

@@ -305,6 +305,80 @@ namespace bdft_tests {
     mpi_context->comm.barrier();
   }
 
+  // ====================================================================================
+  // CROSS-MESH TREV-IMAGE CHECK (2026-09-22). The transport test cannot see an error in the
+  // time-reversal IMAGE columns themselves: on one mesh both of its sides come from
+  // thc::collocation_at_points, which builds a trev image as conj(u_{k_ibz}(S^-1 r)) e^{i k r}
+  // -- self-consistent by construction. This case compares the SAME physical k between TWO
+  // meshes of the same crystal, one where k is a time-reversal image (reconstructed) and one
+  // where it is not (stored, or reached by a rotation -- both paths already verified exact).
+  // The comparison is on the GAUGE-INVARIANT window Gram
+  //     M(P, P') = sum_{a in C} X(k, a, P) conj(X(k, a, P')),
+  // invariant under any unitary mixing inside a window closed under degeneracies, so the
+  // arbitrary per-band phases of two independent QE runs drop out.
+  //   COQUI_IBZ_TEST_FIXTURE  = the mesh under test (default qe_si444_trevonly)
+  //   COQUI_IBZ_TEST_FIXTURE2 = the reference mesh (default qe_si444_noinv)
+  //   COQUI_IBZ_TEST_WINDOW   = the C window (default 0,8)
+  // ====================================================================================
+  TEST_CASE("vertex_ibz_trev_image", "[methods][vertex][ibz]") {
+    auto& mpi_context = utils::make_unit_test_mpi_context();
+    const std::string fxA = std::getenv("COQUI_IBZ_TEST_FIXTURE") ? std::getenv("COQUI_IBZ_TEST_FIXTURE") : "qe_si444_trevonly";
+    const std::string fxB = std::getenv("COQUI_IBZ_TEST_FIXTURE2") ? std::getenv("COQUI_IBZ_TEST_FIXTURE2") : "qe_si444_noinv";
+    long w0 = 0, w1 = 8;
+    if (const char *w = std::getenv("COQUI_IBZ_TEST_WINDOW")) std::sscanf(w, "%ld,%ld", &w0, &w1);
+    nda::range W(w0, w1);
+    decltype(nda::range::all) all;
+    auto mfA = std::make_shared<mf::MF>(ibz_test_detail::make_mf(mpi_context, fxA));
+    auto mfB = std::make_shared<mf::MF>(ibz_test_detail::make_mf(mpi_context, fxB));
+    ptree pt; pt.put("thresh", 1e-4); pt.put("chol_block_size", 1);
+    methods::thc bA(mfA.get(), *mpi_context, pt, false);
+    methods::thc bB(mfB.get(), *mpi_context, pt, false);
+    auto mA = bA.rho_mesh(), mB = bB.rho_mesh();
+    utils::check(mA(0) == mB(0) and mA(1) == mB(1) and mA(2) == mB(2),
+                 "vertex_ibz_trev_image: the two meshes have different density grids ({} {} {} vs {} {} {}).",
+                 mA(0), mA(1), mA(2), mB(0), mB(1), mB(2));
+    const long nnr = mA(0) * mA(1) * mA(2);
+    std::vector<long> pv;
+    for (long n = 3; n < nnr and long(pv.size()) < 40; n += 97) pv.push_back(n);
+    nda::array<long, 1> ipts(long(pv.size()));
+    for (long i = 0; i < ipts.size(); ++i) ipts(i) = pv[size_t(i)];
+    const long Nm = ipts.size(), nW = W.size();
+    const long nkA = mfA->nkpts(), nkB = mfB->nkpts();
+    auto XA = bA.collocation_at_points(ipts, nda::range(0, nkA), W);
+    auto XB = bB.collocation_at_points(ipts, nda::range(0, nkB), W);
+    auto kcA = mfA->kpts_crystal();
+    auto kcB = mfB->kpts_crystal();
+    auto trevA = mfA->kp_trev();
+    nda::array<ComplexType, 2> MA(Nm, Nm), MB(Nm, Nm);
+    double worst_trev = 0.0, worst_plain = 0.0;
+    long k_worst = -1, n_trev = 0, n_plain = 0, n_miss = 0;
+    for (long k = 0; k < nkA; ++k) {
+      long kb = -1;
+      for (long j = 0; j < nkB and kb < 0; ++j) {
+        double d = 0.0;
+        for (int i = 0; i < 3; ++i) { double x = kcA(k, i) - kcB(j, i); x -= std::round(x); d += std::abs(x); }
+        if (d < 1e-6) kb = j;
+      }
+      if (kb < 0) { ++n_miss; continue; }
+      double num = 0.0, den = 0.0;
+      for (long P = 0; P < Nm; ++P)
+        for (long Q = 0; Q < Nm; ++Q) {
+          ComplexType a(0.0), b(0.0);
+          for (long j = 0; j < nW; ++j) { a += XA(0, k, j, P) * std::conj(XA(0, k, j, Q));
+                                          b += XB(0, kb, j, P) * std::conj(XB(0, kb, j, Q)); }
+          num += std::norm(a - b); den += std::norm(b);
+        }
+      const double r = std::sqrt(num / std::max(den, 1e-300));
+      if (trevA(k)) { ++n_trev; if (r > worst_trev) { worst_trev = r; k_worst = k; } }
+      else          { ++n_plain; worst_plain = std::max(worst_plain, r); }
+    }
+    app_log(1, "ibz trev image [{} vs {}]: window [{}, {}), {} points -- the gauge-invariant window Gram agrees to "
+               "{:.3e} on the {} TIME-REVERSAL IMAGES of {} (worst k {}) and to {:.3e} on its {} other k-points "
+               "({} k of {} had no partner in the reference mesh)",
+            fxA, fxB, w0, w1, Nm, worst_trev, n_trev, fxA, k_worst, worst_plain, n_plain, n_miss, nkA);
+    mpi_context->comm.barrier();
+  }
+
   TEST_CASE("vertex_ibz_transport", "[methods][vertex][ibz]") {
     auto& mpi_context = utils::make_unit_test_mpi_context();
     // COQUI_IBZ_TEST_FIXTURE overrides the symmetric fixture (qe_lih223_sym: time-reversal pairs, non-TRIM k, 4-fold operations)
