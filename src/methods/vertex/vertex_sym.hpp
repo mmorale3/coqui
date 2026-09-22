@@ -195,11 +195,15 @@ namespace vertex_sym {
     utils::check(c.qminus.size() == c.nq_full and c.kminus.size() == c.nk_full, "fold_star_into_ibz: the sym context has no qminus / kminus maps.");
     detail::fold_scratch w(nc);
     nda::array<ComplexType, 3> B(nt, nc, nc);
-    // DIAGNOSTIC (2026-09-22, the degenerate-block convention question): vertex_debug sym_fold_dt = 1 applies the TRANSPOSED
-    // C-sector rotation in the fold (Y = D^* B D^T instead of D^dag B D) -- identical for diagonal D (non-degenerate windows),
-    // different inside degenerate blocks; the LiH [0, 6) IBZ gate decides which convention the stored D follows.
+    // THE C-SECTOR ROTATION CONVENTION OF THE FOLD (fixed 2026-09-22 by measurement, on LiH and at production).
+    // A star member's deposit is Y = Dm^dag B Dm with Dm = Dc^T, i.e. Y = conj(Dc) B Dc^T, NOT Dc^dag B Dc. The two agree
+    // wherever Dc is diagonal (a window with no degenerate bands: every gate written before 2026-09-22) and differ inside
+    // degenerate blocks. The discriminator is the anti-Hermitian residual of dSigma BEFORE Hermitization, which the
+    // Hermitization then hides: Si 4^3 noinv C = [0, 8) -- full mesh 1.755e-2, this convention 1.756e-2, the old one
+    // 5.529e-2; LiH [0, 6) IBZ vs full mesh -- 7.5e-4 against 1.7e-2. vertex_debug sym_fold_conv = 0 restores the old form
+    // (1 = this default, 2 = D^*, 3 = D^dag; diagnostic only).
     const bool fold_dt = vertex_debug::flag("sym_fold_dt") or vertex_debug::flag("sym_dt");
-    const long fold_conv = fold_dt ? 1 : long(vertex_debug::number("sym_fold_conv", 0.0));   // 0 D, 1 D^T, 2 D^*, 3 D^dag (diagnostic)
+    const long fold_conv = fold_dt ? 1 : long(vertex_debug::number("sym_fold_conv", 1.0));
     for (long qp = 0; qp < c.nq_full; ++qp) {
       if (c.q_star(qp) != iq) continue;
       const long js = c.q_isym(qp);
