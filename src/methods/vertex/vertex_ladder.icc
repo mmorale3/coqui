@@ -412,6 +412,65 @@ namespace solvers {
     }
 
     /**
+     * DIAGNOSTIC (2026-09-22, the time-reversal hunt): the (P2) identity ON THE CODE'S OWN DATA.
+     * The symmetric path reads a time-reversed transfer from the IBZ store PQ-TRANSPOSED
+     * (notes/vertex_ibz_symmetry.md section 3.3b), which is exact only if the stored rung obeys
+     *     W(-q)_{PQ} = W(q)_{QP}      (and, W being Hermitian, = conj(W(q)_{PQ})).
+     * On a NOSYM mesh every transfer is stored, so the identity can be MEASURED. The suspicion it
+     * tests: -q of a mesh point need not be a plain negation -- on an EVEN mesh the zone-boundary
+     * components fold back with a reciprocal-lattice vector G, and the dictionary at -q is then the
+     * one at -q + G. Si 4^3 (even, the defect) exercises that; Si 3^3 (odd, clean) never does, and
+     * neither does any LiH fixture. Reports the deviation separately for the transfers whose -q is a
+     * plain negation and for those that need an Umklapp shift.
+     * vertex_debug trev_w_check = 1.
+     */
+    inline void trev_rung_check(auto const &MF, nda::array<ComplexType, 3> const &W_qmm,
+                                std::string_view tag) {
+      decltype(nda::range::all) all;
+      const long nq = W_qmm.shape(0), Nm = W_qmm.shape(1);
+      if (nq != MF->nqpts()) {
+        app_log(1, "[trev_w_check] {}: the rung carries {} transfers of {} -- the identity needs the FULL "
+                   "mesh (run it on the nosym mean field).", tag, nq, MF->nqpts());
+        return;
+      }
+      auto qm = MF->qminus();
+      auto kcrys = MF->kpts_crystal();
+      nda::array<double, 2> qcrys(nq, 3);
+      for (long iq = 0; iq < nq; ++iq) {
+        const long k2 = MF->qk_to_k2(int(iq), 0);        // k0 - q (mod G); the build_sym_ctx recipe
+        for (int i = 0; i < 3; ++i) qcrys(iq, i) = kcrys(0, i) - kcrys(k2, i);
+      }
+      double tmax_plain = 0.0, tmax_umk = 0.0, hmax = 0.0;
+      long nplain = 0, numk = 0, q_worst = -1;
+      for (long iq = 0; iq < nq; ++iq) {
+        const long iqm = long(qm(iq));
+        double scale = 0.0, dT = 0.0, dH = 0.0;
+        for (long P = 0; P < Nm; ++P)
+          for (long Q = 0; Q < Nm; ++Q) {
+            scale = std::max(scale, std::abs(W_qmm(iq, P, Q)));
+            dT = std::max(dT, std::abs(W_qmm(iqm, P, Q) - W_qmm(iq, Q, P)));
+            dH = std::max(dH, std::abs(W_qmm(iq, P, Q) - std::conj(W_qmm(iq, Q, P))));
+          }
+        if (scale < 1e-30) continue;
+        // does -q fold back with a reciprocal-lattice vector? (q + (-q) = G, G != 0)
+        bool umk = false;
+        for (int i = 0; i < 3; ++i) if (std::abs(qcrys(iq, i) + qcrys(iqm, i)) > 1e-6) umk = true;
+        const double rT = dT / scale;
+        hmax = std::max(hmax, dH / scale);
+        if (umk) { ++numk; if (rT > tmax_umk) { tmax_umk = rT; q_worst = iq; } }
+        else     { ++nplain; tmax_plain = std::max(tmax_plain, rT); }
+      }
+      const double w0 = (q_worst >= 0) ? qcrys(q_worst, 0) : 0.0;
+      const double w1 = (q_worst >= 0) ? qcrys(q_worst, 1) : 0.0;
+      const double w2 = (q_worst >= 0) ? qcrys(q_worst, 2) : 0.0;
+      app_log(1, "[trev_w_check] {}: ||W(-q) - W(q)^T||_max / ||W(q)||_max over {} transfers -- plain -q ({} of them): "
+                 "{:.3e}; -q folded back by a reciprocal-lattice vector ({} of them): {:.3e} (worst q {} = ({:.3f}, {:.3f}, "
+                 "{:.3f})); the stored rung's anti-Hermitian residual {:.3e}. The symmetric path reads every time-reversed "
+                 "transfer as the PQ-transpose, so these ARE its error bars.",
+              tag, nq, nplain, tmax_plain, numk, tmax_umk, q_worst, w0, w1, w2, hmax);
+    }
+
+    /**
      * C-window G on the FULL BZ (C.2): a plain window slice on nosym meshes; under
      * symmetry the image points are gauge copies of the IBZ blocks (identity D by
      * convention, symmetry.hpp:910) and trev points are the tau-pointwise TRANSPOSE
@@ -2625,6 +2684,8 @@ namespace solvers {
       build_sym_ctx(thc, _Xb_skma, _band_window.first(), _sym_secondary);
       symc = &_sym_secondary.value();
     }
+    if (vertex_debug::flag("trev_w_check"))
+      vertex_ladder_detail::trev_rung_check(MF, _W0b_qmm.value(), "W0bar (secondary, nu = 0)");
 
     vertex_pi::iaft_tools tools(*_ft);
     // DA D-1 (notes/qsgwhat_discrepancy_spec.md Phase 2): the TDA context, built from the

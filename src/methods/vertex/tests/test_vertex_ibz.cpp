@@ -125,6 +125,19 @@ namespace bdft_tests {
       return split_at(c0) or split_at(c1);
     }
 
+    // A fixture SPEC: either a registered default_MF name, or "qe:<outdir>:<prefix>" for an arbitrary
+    // QE mean field on disk (h5). The second form lets the transport / census diagnostics run against a
+    // PRODUCTION mean field (the Si 4^3 symmetric mesh: 6 operations + time reversal, 3-fold rotations AND
+    // 28 time-reversal pairs -- the combination no unit-test fixture has; 2026-09-22 time-reversal hunt).
+    inline mf::MF make_mf(auto &mpi_context, std::string const &spec) {
+      if (spec.rfind("qe:", 0) == 0) {
+        const auto c = spec.find(':', 3);
+        utils::check(c != std::string::npos, "fixture spec \"{}\": expected qe:<outdir>:<prefix>.", spec);
+        return mf::default_MF(mpi_context, mf::qe_source, spec.substr(3, c - 3), spec.substr(c + 1), mf::h5_input_type);
+      }
+      return mf::default_MF(mpi_context, spec);
+    }
+
   } // ibz_test_detail
 
   // ====================================================================================
@@ -212,11 +225,91 @@ namespace bdft_tests {
     }
   }
 
+  // ====================================================================================
+  // TREV CENSUS (2026-09-22): which fixtures exercise the time-reversal branches at all?
+  // The Si 4^3 symmetric P-side path loses 1.5 % of the vertex correction and the noinv
+  // experiment pinned it on time reversal (notes/vertex_perf_plan.md, 2026-09-22 ~04:50).
+  // Two distinct branches carry trev: the trev k IMAGES (conjugated collocation columns,
+  // thc::collocation_at_points / chol_metric_impl_ibz) and the trev TRANSFERS (qp_trev:
+  // the PQ-transposed read of the IBZ-stored rung, memo (P2)). This case counts both per
+  // fixture, so a branch no gate ever runs is visible.  MF-only, seconds.
+  // ====================================================================================
+  TEST_CASE("vertex_ibz_trev_census", "[methods][vertex][ibz]") {
+    auto& mpi_context = utils::make_unit_test_mpi_context();
+    std::vector<std::string> fxs = {"qe_lih222_sym", "qe_lih223_sym", "qe_lih223_inv", "qe_si222_sym"};
+    if (const char *f = std::getenv("COQUI_IBZ_TEST_FIXTURE")) fxs = {std::string(f)};
+    for (auto const &fx : fxs) {
+      auto mf = std::make_shared<mf::MF>(ibz_test_detail::make_mf(mpi_context, fx));
+      const long nk = mf->nkpts(), nkibz = mf->nkpts_ibz(), ntrev = mf->nkpts_trev_pairs();
+      const long nq = mf->nqpts(), nqibz = mf->nqpts_ibz();
+      auto kp_trev = mf->kp_trev();
+      auto qp_trev = mf->qp_trev();
+      auto qp_symm = mf->qp_symm();
+      auto qsymms = mf->qsymms();
+      long nk_trev = 0, n_tail_mismatch = 0;
+      for (long k = 0; k < nk; ++k) {
+        if (kp_trev(k)) ++nk_trev;
+        if (bool(kp_trev(k)) != (k >= nk - ntrev)) ++n_tail_mismatch;   // the "trev images are the last ntrev k" assumption
+      }
+      // transfers: trev with the identity symmetry (pure time reversal) vs trev composed with a rotation
+      long nq_trev = 0, nq_trev_id = 0, nq_trev_rot = 0, nq_rot_only = 0;
+      for (long q = 0; q < nq; ++q) {
+        if (not qp_trev(q)) { if (q >= nqibz) ++nq_rot_only; continue; }
+        ++nq_trev;
+        long js = -1;
+        for (long i = 0; i < qsymms.extent(0); ++i) if (qsymms(i) == qp_symm(q)) js = i;
+        if (js == 0) ++nq_trev_id; else ++nq_trev_rot;
+      }
+      // 2026-09-22: is -k of a time-reversal image a PLAIN negation in the stored crystal coordinates, or does it
+      // fold back with a reciprocal-lattice vector? (an even mesh carries zone-boundary components +-1/2, an odd one
+      // does not -- the difference between the broken Si 4^3 and the clean Si 3^3 / LiH fixtures)
+      auto kc = mf->kpts_crystal();
+      auto trev_pair = mf->kp_trev_pair();
+      long n_umk_k = 0, n_half = 0;
+      std::string ex;
+      for (long k = 0; k < nk; ++k) {
+        bool half = false;
+        for (int i = 0; i < 3; ++i) if (std::abs(std::abs(kc(k, i)) - 0.5) < 1e-6) half = true;
+        if (half) ++n_half;
+        if (not kp_trev(k)) continue;
+        const long p = long(trev_pair(k));
+        double d = 0.0;
+        for (int i = 0; i < 3; ++i) d += std::abs(kc(k, i) + kc(p, i));
+        if (d > 1e-6) {
+          ++n_umk_k;
+          if (ex.empty()) { char b[160]; std::snprintf(b, sizeof(b), " e.g. k %ld (%.3f,%.3f,%.3f) + pair %ld (%.3f,%.3f,%.3f)",
+                                                       k, kc(k,0), kc(k,1), kc(k,2), p, kc(p,0), kc(p,1), kc(p,2)); ex = b; }
+        }
+      }
+      // the same question for the TRANSFERS the symmetric path reads PQ-transposed: q + (-q) = 0 or a lattice vector?
+      auto qmin = mf->qminus();
+      nda::array<double, 2> qcr(nq, 3);
+      for (long iq = 0; iq < nq; ++iq) {
+        const long k2 = mf->qk_to_k2(int(iq), 0);
+        for (int i = 0; i < 3; ++i) qcr(iq, i) = kc(0, i) - kc(k2, i);
+      }
+      long n_umk_q = 0, n_umk_q_trev = 0;
+      for (long iq = 0; iq < nq; ++iq) {
+        double d = 0.0;
+        for (int i = 0; i < 3; ++i) d += std::abs(qcr(iq, i) + qcr(long(qmin(iq)), i));
+        if (d > 1e-6) { ++n_umk_q; if (qp_trev(iq)) ++n_umk_q_trev; }
+      }
+      app_log(1, "trev census [{}]: k {} (IBZ {}, trev pairs {}, kp_trev true {}, tail-order mismatches {}); "
+                 "q {} (IBZ {}, {} ops): trev transfers {} (identity {} + composed with a rotation {}), rotation-only images {}",
+              fx, nk, nkibz, ntrev, nk_trev, n_tail_mismatch, nq, nqibz, qsymms.extent(0), nq_trev, nq_trev_id, nq_trev_rot, nq_rot_only);
+      app_log(1, "trev census [{}]: zone-boundary structure -- {} of {} k have a +-1/2 component; time-reversal pairs whose "
+                 "partner is NOT the plain negation: {}{}; transfers whose -q folds back with a reciprocal-lattice vector: "
+                 "{} of {} ({} of them marked trev)",
+              fx, n_half, nk, n_umk_k, ex, n_umk_q, nq, n_umk_q_trev);
+    }
+    mpi_context->comm.barrier();
+  }
+
   TEST_CASE("vertex_ibz_transport", "[methods][vertex][ibz]") {
     auto& mpi_context = utils::make_unit_test_mpi_context();
     // COQUI_IBZ_TEST_FIXTURE overrides the symmetric fixture (qe_lih223_sym: time-reversal pairs, non-TRIM k, 4-fold operations)
     const std::string fxs = std::getenv("COQUI_IBZ_TEST_FIXTURE") ? std::getenv("COQUI_IBZ_TEST_FIXTURE") : "qe_lih222_sym";
-    auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, fxs));
+    auto mf = std::make_shared<mf::MF>(ibz_test_detail::make_mf(mpi_context, fxs));
     REQUIRE(mf->nkpts() != mf->nkpts_ibz());
     decltype(nda::range::all) all;
     long w0 = 0, w1 = 6;

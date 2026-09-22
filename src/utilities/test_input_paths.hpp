@@ -93,6 +93,22 @@ inline std::tuple<std::string,std::string> utest_filename(std::string src)
     return std::make_tuple(std::string(PROJECT_SOURCE_DIR)+
                                "/tests/unit_test_files/qe/si_kp222_nbnd60/out/",
                            std::string("si"));
+  } else if (src == "qe_si333_sym" or src == "qe_si333_nosym" or
+             src == "qe_si444_sym" or src == "qe_si444_trevonly") {
+    // 2026-09-22 (the time-reversal hunt): Si diamond, 60 bands, force_symmorphic.
+    //   si333_sym      3x3x3, 6 operations AND time-reversal pairs (6 IBZ k of 27) -- the C3v x trev combination
+    //                  the LiH fixtures (involutions only) and qe_si222_sym (no trev pairs) both miss;
+    //   si333_nosym    the same mesh unreduced (27 k) -- its full-mesh reference;
+    //   si444_sym      the PRODUCTION mesh (13 IBZ k of 64, 28 trev pairs) where the symmetric P-side path
+    //                  loses 1.5 % of the ladder correction;
+    //   si444_trevonly the same mesh reduced by TIME REVERSAL ALONE (36 k, no point group).
+    const std::string dir = (src == "qe_si333_sym")   ? "si_kp333_nbnd60_sym"
+                          : (src == "qe_si333_nosym") ? "si_kp333_nbnd60_nosym"
+                          : (src == "qe_si444_sym")   ? "si_kp444_nbnd60_sym"
+                                                      : "si_kp444_nbnd60_trevonly";
+    return std::make_tuple(std::string(PROJECT_SOURCE_DIR)+
+                               "/tests/unit_test_files/qe/" + dir + "/out/",
+                           std::string("si"));
   } else if (src == "qe_si222_so") {
     return std::make_tuple(std::string(PROJECT_SOURCE_DIR)+
                                "/tests/unit_test_files/qe/si_kp222_nbnd8_so/",

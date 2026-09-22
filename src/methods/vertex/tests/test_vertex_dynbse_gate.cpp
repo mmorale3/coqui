@@ -1584,8 +1584,14 @@ namespace bdft_tests {
       // COQUI_DYNBSE_TEST_SYMEPS_FX = lih222 (default) | lih223 (a 2x2x3 mesh: non-TRIM k = +-1/3, time-reversal pairs when the
       // group lacks inversion -- qe_lih223_sym) | lih223inv (inversion only)
       const std::string fxs = std::getenv("COQUI_DYNBSE_TEST_SYMEPS_FX") ? std::getenv("COQUI_DYNBSE_TEST_SYMEPS_FX") : "lih222";
-      const std::string fx_ns = (fxs == "lih222") ? "qe_lih222" : (fxs == "si222") ? "qe_si222_nosym" : "qe_lih223";
-      const std::string fx_s = (fxs == "lih222") ? "qe_lih222_sym" : (fxs == "si222") ? "qe_si222_sym" : (fxs == "lih223inv") ? "qe_lih223_inv" : "qe_lih223_sym";
+      // si333: the C3v x TIME-REVERSAL combination (6 IBZ k of 27) against its own full mesh -- the cheap reproducer of the
+      // Si 4^3 production finding; si444trev: the production mesh reduced by time reversal ALONE (36 k of 64) against the
+      // symmetric one (13 k) -- both added 2026-09-22 for the time-reversal hunt.
+      const std::string fx_ns = (fxs == "lih222") ? "qe_lih222" : (fxs == "si222") ? "qe_si222_nosym"
+                              : (fxs == "si333") ? "qe_si333_nosym" : (fxs == "si444trev") ? "qe_si444_trevonly" : "qe_lih223";
+      const std::string fx_s = (fxs == "lih222") ? "qe_lih222_sym" : (fxs == "si222") ? "qe_si222_sym"
+                             : (fxs == "si333") ? "qe_si333_sym" : (fxs == "si444trev") ? "qe_si444_sym"
+                             : (fxs == "lih223inv") ? "qe_lih223_inv" : "qe_lih223_sym";
       auto [cn, rn, ln, dn] = run_se(fx_ns, "nosym");
       auto [cs, rs, ls, ds] = run_se(fx_s, "sym");
       app_log(1, "dynbse_readout SYMEPS gate (window [0, {}), rung {}): RPA eps_M sym vs nosym rel {:.3e}; the ladder correction Delta: nosym {:+.8f} sym {:+.8f} -> rel {:.3e} of the correction; "
