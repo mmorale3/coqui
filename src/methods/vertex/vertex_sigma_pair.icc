@@ -185,7 +185,7 @@ namespace solvers {
         if (ibz and not g.has_dataset("q_star")) {
           nda::h5_write(g, "q_star", symc->q_star); nda::h5_write(g, "q_isym", symc->q_isym);
           nda::array<long, 1> qt(symc->nq_full); for (long q = 0; q < symc->nq_full; ++q) qt(q) = symc->q_trev(q) ? 1 : 0;
-          nda::h5_write(g, "q_trev", qt); nda::h5_write(g, "krot", symc->krot); nda::h5_write(g, "ktrev_pair", symc->ktrev_pair);
+          nda::h5_write(g, "q_trev", qt); nda::h5_write(g, "krot", symc->krot); nda::h5_write(g, "ktrev_pair", symc->ktrev_pair); nda::h5_write(g, "kminus", symc->kminus);
           nda::h5_write(g, "qminus", symc->qminus); nda::h5_write(g, "Dc", symc->Dc);
           nda::array<long, 2> cj(symc->nsym, symc->nk_full);
           for (long a = 0; a < symc->nsym; ++a) for (long b = 0; b < symc->nk_full; ++b) cj(a, b) = symc->cjg(a, b) ? 1 : 0;

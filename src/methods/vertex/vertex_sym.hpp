@@ -79,8 +79,12 @@ namespace vertex_sym {
     nda::array<long, 2> krot;
     // time-reversal partner of every full-BZ k (kp_trev_pair) and the -q map of every full-BZ transfer (qminus);
     // P1, the star fold of the Sigma-side vertex
-    nda::array<long, 1> ktrev_pair;
+    nda::array<long, 1> ktrev_pair;   // bz_symmetry's pairs: defined (>= 0) ONLY for the points reached by time reversal alone
     nda::array<long, 1> qminus;
+    // the index of -k (mod G) for EVERY full-BZ k (kminus(k) == k at the TRIM points). This, not ktrev_pair, is the map the
+    // star fold needs: on a mesh with time-reversal images ktrev_pair is -1 at every other point (Si 4^3, 6 symmorphic
+    // operations: segfault in minus_transfer_at, 2026-09-21); the LiH fixture has no time-reversal pairs and never saw it.
+    nda::array<long, 1> kminus;
 
     // effective C-window collocation columns: (ns, nsym, nk_full, naux, nc).
     // NODE-SHARED (vertex parallelization M3, change-list item #9): the storage is a
@@ -143,7 +147,7 @@ namespace vertex_sym {
         for (long it = 0; it < nt; ++it) out(it, all, all) = dSq(it, p, all, all);
         return;
       }
-      const long pm = c.ktrev_pair(p);
+      const long pm = c.kminus(p);
       if (pm != p) {                                              // psi_{-p} = psi_p^* : Sigma_{-qs}(p)_{ab} = conj(Sigma_{qs}(-p)_{ab})
         for (long it = 0; it < nt; ++it)
           for (long a = 0; a < nc; ++a)
@@ -178,7 +182,7 @@ namespace vertex_sym {
                  "fold_star_into_ibz: shapes (dSq {} x {} x {} x {}, dSig {} x {} x {} x {}, nk_full {}, nk_ibz {}).",
                  dSq.shape(0), dSq.shape(1), dSq.shape(2), dSq.shape(3), dSig.shape(0), dSig.shape(1), dSig.shape(2), dSig.shape(3),
                  c.nk_full, c.nk_ibz);
-    utils::check(c.qminus.size() == c.nq_full and c.ktrev_pair.size() == c.nk_full, "fold_star_into_ibz: the sym context has no qminus / ktrev_pair maps.");
+    utils::check(c.qminus.size() == c.nq_full and c.kminus.size() == c.nk_full, "fold_star_into_ibz: the sym context has no qminus / kminus maps.");
     detail::fold_scratch w(nc);
     nda::array<ComplexType, 3> B(nt, nc, nc);
     for (long qp = 0; qp < c.nq_full; ++qp) {
@@ -189,7 +193,7 @@ namespace vertex_sym {
       for (long k = 0; k < nk_ibz; ++k) {
         const bool cj = (js != 0) and c.cjg(js, k);
         if (cj and n_cjg) ++(*n_cjg);
-        const long pt = cj ? c.krot(js, c.ktrev_pair(k)) : c.krot(js, k);
+        const long pt = cj ? c.krot(js, c.kminus(k)) : c.krot(js, k);   // the conjugated rotation acts at -k (the full -k map, not ktrev_pair)
         const bool minus = (trev != cj);
         if (minus) detail::minus_transfer_at(c, iq, dSq, pt, B, w, 0);
         else for (long it = 0; it < nt; ++it) B(it, all, all) = dSq(it, pt, all, all);

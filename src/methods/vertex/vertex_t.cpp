@@ -823,6 +823,22 @@ namespace solvers {
         ctx.krot(is, ik) = MF->ks_to_k(int(is), int(ik));
     ctx.ktrev_pair = nda::array<long, 1>(ctx.nk_full);
     for (long ik = 0; ik < ctx.nk_full; ++ik) ctx.ktrev_pair(ik) = long(kp_trev_pair(ik));
+    {
+      // the complete -k map (crystal coordinates, mod G): kp_trev_pair is -1 wherever the point is not a time-reversal image
+      auto kc = MF->kpts_crystal();
+      ctx.kminus = nda::array<long, 1>(ctx.nk_full);
+      ctx.kminus() = -1;
+      for (long ik = 0; ik < ctx.nk_full; ++ik) {
+        for (long jk = 0; jk < ctx.nk_full and ctx.kminus(ik) < 0; ++jk) {
+          double d = 0.0;
+          for (int a = 0; a < 3; ++a) { const double x = kc(ik, a) + kc(jk, a); d += std::abs(x - std::round(x)); }
+          if (d < 1e-8) ctx.kminus(ik) = jk;
+        }
+        utils::check(ctx.kminus(ik) >= 0, "vertex_t::build_sym_ctx: the k mesh has no -k for k-point {} (not a Gamma-centered lattice).", ik);
+        utils::check(kp_trev_pair(ik) < 0 or long(kp_trev_pair(ik)) == ctx.kminus(ik),
+                     "vertex_t::build_sym_ctx: kp_trev_pair({}) = {} is not -k = {}.", ik, kp_trev_pair(ik), ctx.kminus(ik));
+      }
+    }
     ctx.qminus = nda::array<long, 1>(ctx.nq_full);
     {
       auto qm = MF->qminus();
