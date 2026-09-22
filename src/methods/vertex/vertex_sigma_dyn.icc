@@ -111,6 +111,16 @@ namespace solvers {
       bool dump = false;
       nda::array<ComplexType, 6> Hc_n;   // (nw_b, ns, nt, nk, nc, nc): the merged cst + U object per node
       nda::array<ComplexType, 6> HT_n;   // (nw_b, ns, np, nk, nc, nc): the T family's trace proxy per (node, a)
+      // P15 (2026-09-22): the T family's RANDOM SKETCH per (node, a, k). The object the sampled mode reconstructs is
+      // Y_a(m) itself -- every (c i, x j) of it -- while HT_n keeps only the single contraction sum_c Y(c i, c j). The
+      // docstring's justification for that (one shared nu-profile) holds only if Y's nu-dependence factorizes into a
+      // scalar times a nu-independent tensor; it does not (Y(nu) = DW(nu) . famA(nu)^T), so the trace can be blind to
+      // nu-modes the full object has -- the Si 4^3 failure (residual 16 % sampled vs 3 % all-node with the proxy's own
+      // Gram reporting a kept weight of 0.999997). nsk random contractions Om_r(c i, x j) see every mode almost surely,
+      // and cost nsk numbers per (m, a, k) instead of nc^2.
+      long nsk = 0;                      // number of sketch contractions (0 = no sketch written)
+      nda::array<ComplexType, 3> Om;     // (nsk, nc^2, nc^2): the contractions, deterministic (fixed seed)
+      nda::array<ComplexType, 5> HS_n;   // (nw_b, ns, np, nk, nsk)
       // the product route's per-call precomputations (sigma_dyn_precompute)
       bool pre_ok = false;
       nda::array<ComplexType, 5> Gw;     // (nw_f, ns, nk, nc, nc): G on the fermionic Matsubara nodes
@@ -175,6 +185,20 @@ namespace solvers {
         if (dump) {
           Hc_n = nda::array<ComplexType, 6>(nw_b, ns, nt, nk_full, nc, nc); Hc_n() = ComplexType(0.0);
           HT_n = nda::array<ComplexType, 6>(nw_b, ns, np, nk_full, nc, nc); HT_n() = ComplexType(0.0);
+          // P15: the T family's random sketch alongside the trace proxy (vertex_debug sigdyn_sketch = nsk, 0 = off).
+          // It only ADDS a dataset to the dump -- no computed number changes. The consumer picks which Gram to learn
+          // from with vertex_debug sigdyn_gram = trace | sketch (default trace).
+          nsk = long(vertex_debug::number("sigdyn_sketch", 8.0));
+          if (nsk > 0) {
+            const long nc2 = nc * nc;
+            HS_n = nda::array<ComplexType, 5>(nw_b, ns, np, nk_full, nsk); HS_n() = ComplexType(0.0);
+            Om = nda::array<ComplexType, 3>(nsk, nc2, nc2);
+            std::mt19937_64 rng(20260922ull);                       // fixed seed: every rank builds the SAME contractions
+            std::normal_distribution<double> nd(0.0, 1.0);
+            for (long r = 0; r < nsk; ++r)
+              for (long p = 0; p < nc2; ++p)
+                for (long q = 0; q < nc2; ++q) Om(r, p, q) = ComplexType(nd(rng), nd(rng));
+          }
         }
       }
       /** P1: fold the current unit's full-k scratch onto the IBZ accumulators (a no-op unless ibz); called when the unit
@@ -676,13 +700,20 @@ namespace solvers {
                   for (long j = 0; j < nc; ++j) Ym(c * nc + x, i * nc + j) = Y(c * nc + i, x * nc + j);
             nda::blas::gemm(Gmat, Ym, Mj);                                                       // M_aj(i j) = sum_cx g_j(c, x) Y(c i, x j)
             M3(a, all, all) = Mj;
-            if (h.dump)
+            if (h.dump) {
               for (long i = 0; i < nc; ++i)
                 for (long j = 0; j < nc; ++j) {
                   cplx tr(0.0);
                   for (long c = 0; c < nc; ++c) tr += Y(c * nc + i, c * nc + j);
                   h.HT_n(m, is, a, k, i, j) += tr;
                 }
+              for (long r = 0; r < h.nsk; ++r) {                    // P15: the random contractions of the SAME Y
+                cplx acc(0.0);
+                for (long p = 0; p < nc2; ++p)
+                  for (long q = 0; q < nc2; ++q) acc += h.Om(r, p, q) * Y(p, q);
+                h.HS_n(m, is, a, k, r) += acc;
+              }
+            }
             if (not h.sampled) {
               // the j-sums at the coefficient level, then one deposit per (a): RT_a, RU_a; the RU_{n_j} pieces summed over a below
               CT() = cplx(0.0); CUa() = cplx(0.0);

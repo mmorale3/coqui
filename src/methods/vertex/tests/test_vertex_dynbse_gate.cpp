@@ -733,8 +733,12 @@ namespace bdft_tests {
             // an evenly spread set (in node index ~ log nu): nu = 0 and +-4, 8, 12, 16, 20 -> 11 of 41 nodes; K = 6 per basis (least squares)
             // COQUI_DYNBSE_TEST_SIGDYN_SAMPLED=auto: the 11 nodes chosen by the dump's own nu-modes instead (P14b)
             const bool auto_mode = (std::string(std::getenv("COQUI_DYNBSE_TEST_SIGDYN_SAMPLED")) == "auto");
-            sd_fit = "coqui_d3_winj_D1D.sigdyn.h5"; sd_rank = 6;
-            if (auto_mode) sd_auto = 11;
+            // the reconstruction rank and the node count are scannable (P15 work, 2026-09-22): the sketch Gram resolves
+            // MORE nu-modes than the trace proxy, so the rank can become the binding constraint
+            sd_fit = "coqui_d3_winj_D1D.sigdyn.h5";
+            sd_rank = std::getenv("COQUI_DYNBSE_TEST_SIGDYN_RANK") ? std::atol(std::getenv("COQUI_DYNBSE_TEST_SIGDYN_RANK")) : 6;
+            const long nsamp = std::getenv("COQUI_DYNBSE_TEST_SIGDYN_NODES") ? std::atol(std::getenv("COQUI_DYNBSE_TEST_SIGDYN_NODES")) : 11;
+            if (auto_mode) sd_auto = nsamp;
             else { sd_nodes = {m0b}; for (long j : {4l, 8l, 12l, 16l, hm}) { sd_nodes.push_back(m0b + j); sd_nodes.push_back(m0b - j); } }
             auto [cd1s, md1s, dd1s, kd1s] = run_p("D1S", 2, "dyn1", "dynamic", 1.0, S_d1s);
             sd_nodes.clear(); sd_fit.clear(); sd_rank = 0; sd_auto = 0;
@@ -749,7 +753,7 @@ namespace bdft_tests {
                     }
             app_log(1, "dynbse_readout LFF-Sigma SAMPLED gate: dyn1 on {} of {} nodes ({}; K = {}, per-p U/T bases) vs all nodes: rel Frobenius {:.3e} (max |d| {:.3e}); "
                        "e_corr all {:+.10f} sampled {:+.10f} (R0 {:+.10f}); max|dSigma| all {:.6e} sampled {:.6e}; anti-Hermitian all {:.2e} sampled {:.2e}",
-                    11, nwb, auto_mode ? "chosen by the dump's nu-modes, P14b" : "the fixed evenly spread set", 6,
+                    auto_mode ? sd_auto : long(sd_nodes.size()), nwb, auto_mode ? "chosen by the dump's nu-modes, P14b" : "the fixed evenly spread set", sd_rank,
                     std::sqrt(num) / std::max(std::sqrt(den), 1e-300), mx, cd1d, cd1s, cr0s, md1d[0], md1s[0], md1d[1], md1s[1]);
             REQUIRE(den > 0.0);
             REQUIRE(std::sqrt(num) / std::sqrt(den) < 5e-2);

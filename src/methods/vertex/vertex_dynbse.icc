@@ -2308,21 +2308,44 @@ namespace solvers {
           nda::blas::gemm(H2, nda::dagger(H2), Gc);                       // G(m, m') = sum_rows H(m, row) H(m', row)^*
         }
         {
-          nda::h5_read(g, "HT", H);                                        // (nw_b, ns, np, nk, nc, nc): the T family's trace proxy
-          np_ref = H.shape(2);
+          // P15 (2026-09-22): WHICH object the T-family nu-modes are learned from. "trace" (the default, the historic
+          // behaviour) uses HT = sum_c Y(c i, c j), one specific contraction of the object the sampled mode actually
+          // reconstructs; "sketch" uses HS = nsk RANDOM contractions of the same Y, which cannot be blind to a nu-mode
+          // the way a fixed one can. The Si 4^3 sampled vertex fails with the trace proxy while its own Gram reports a
+          // kept weight of 0.999997 -- the proxy is not a faithful guide for the full T family there.
+          const std::string gram_src = vertex_debug::text("sigdyn_gram", "trace");
+          bool use_sketch = (gram_src == "sketch");
+          if (use_sketch and not g.has_dataset("HS")) {
+            app_log(1, "  [LFF-Sigma dyn] P15: vertex_debug sigdyn_gram = sketch, but {} carries no HS dataset "
+                       "(it predates P15) -- falling back to the trace proxy.", opt.dyn_fit_file);
+            use_sketch = false;
+          }
+          nda::array<ComplexType, 5> HSk;
+          if (use_sketch) nda::h5_read(g, "HS", HSk);                      // (nw_b, ns, np, nk, nsk)
+          else            nda::h5_read(g, "HT", H);                        // (nw_b, ns, np, nk, nc, nc)
+          np_ref = use_sketch ? HSk.shape(2) : H.shape(2);
           auto &G3 = GT;
           G3 = nda::array<ComplexType, 3>(np_ref, nw_b, nw_b);
-          const long ns_r = H.shape(1), rows_p = H.shape(3) * H.shape(4) * H.shape(5);
+          const long ns_r = use_sketch ? HSk.shape(1) : H.shape(1);
+          const long rows_p = use_sketch ? HSk.shape(3) * HSk.shape(4) : H.shape(3) * H.shape(4) * H.shape(5);
           nda::array<ComplexType, 2> Hp(nw_b, ns_r * rows_p), Gm(nw_b, nw_b);
           for (long pp = 0; pp < np_ref; ++pp) {
             for (long m = 0; m < nw_b; ++m)
               for (long s = 0; s < ns_r; ++s) {
-                auto src = nda::reshape(H(m, s, pp, all, all, all), std::array<long, 1>{rows_p});
-                for (long r = 0; r < rows_p; ++r) Hp(m, s * rows_p + r) = src(r);
+                if (use_sketch) {
+                  auto src = nda::reshape(HSk(m, s, pp, all, all), std::array<long, 1>{rows_p});
+                  for (long r = 0; r < rows_p; ++r) Hp(m, s * rows_p + r) = src(r);
+                } else {
+                  auto src = nda::reshape(H(m, s, pp, all, all, all), std::array<long, 1>{rows_p});
+                  for (long r = 0; r < rows_p; ++r) Hp(m, s * rows_p + r) = src(r);
+                }
               }
             nda::blas::gemm(Hp, nda::dagger(Hp), Gm);
             G3(pp, all, all) = Gm;
           }
+          if (use_sketch)
+            app_log(1, "  [LFF-Sigma dyn] P15: the T-family nu-modes learned from the RANDOM SKETCH ({} contractions x {} k) "
+                       "instead of the trace proxy.", HSk.shape(4), HSk.shape(3));
         }
       }
       mpi->comm.broadcast_value(np_ref, 0);
@@ -2495,12 +2518,14 @@ namespace solvers {
     if (hook.dump) {
       // L-8: the per-node objects of the all-node run -> <prefix>.sigdyn.h5 (the nu-bases of a later sampled run)
       for (auto *A : {&hook.Hc_n, &hook.HT_n}) mpi->comm.all_reduce_in_place_n(A->data(), A->size(), std::plus<>{});
+      if (hook.HS_n.size() > 0) mpi->comm.all_reduce_in_place_n(hook.HS_n.data(), hook.HS_n.size(), std::plus<>{});   // P15
       if (mpi->comm.root()) {
         const std::string fn = opt.dump_prefix + ".sigdyn.h5";
         h5::file f(fn, 'w');
         h5::group g(f);
         nda::h5_write(g, "Hc", hook.Hc_n);
         nda::h5_write(g, "HT", hook.HT_n);
+        if (hook.HS_n.size() > 0) { nda::h5_write(g, "HS", hook.HS_n); nda::h5_write(g, "Omega", hook.Om); }   // P15: the T family's random sketch
         nda::array<long, 1> nodes(nw_b);
         for (long l = 0; l < nw_b; ++l) nodes(l) = l;
         nda::h5_write(g, "nodes", nodes);
@@ -2518,7 +2543,7 @@ namespace solvers {
         app_log(1, "  [LFF-Sigma dyn] per-node objects written to {} (Hc (nw_b, ns, nt, nk, nc, nc): cst + U; HT (nw_b, ns, np, nk, nc, nc): the T proxy): {:.2f} GB",
                 fn, double(hook.Hc_n.size() + hook.HT_n.size()) * 16.0 / 1e9);
       }
-      hook.Hc_n = nda::array<ComplexType, 6>(); hook.HT_n = nda::array<ComplexType, 6>();
+      hook.Hc_n = nda::array<ComplexType, 6>(); hook.HT_n = nda::array<ComplexType, 6>(); hook.HS_n = nda::array<ComplexType, 5>();
     }
     dmet.reduce(mpi->comm);
     dmet.merge_unit_cost(_dyn_unit_cost);   // P5

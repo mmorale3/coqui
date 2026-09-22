@@ -21,6 +21,7 @@
 
 #include <cmath>
 #include <cstdlib>        // getenv: the read-only T6 R-decay diagnostic gate
+#include <random>          // P15: the deterministic sketch contractions of the Sigma-dyn dump
 #include <unordered_set>
 #include <vector>
 
