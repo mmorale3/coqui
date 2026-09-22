@@ -83,6 +83,16 @@ inline std::tuple<std::string,std::string> utest_filename(std::string src)
     return std::make_tuple(std::string(PROJECT_SOURCE_DIR)+
                                "/tests/unit_test_files/qe/si_kp111_nbnd8/",
                            std::string("pwscf"));
+  } else if (src == "qe_si222_sym") {
+    // 2026-09-22: Si diamond, 2x2x2 Gamma-centered, 60 bands, QE with force_symmorphic (6 operations without inversion, 3-fold
+    // rotations among them; 4 IBZ k of 8) -- the symmetric fixture with NON-INVOLUTIVE operations the LiH fixtures lack
+    return std::make_tuple(std::string(PROJECT_SOURCE_DIR)+
+                               "/tests/unit_test_files/qe/si_kp222_nbnd60_sym/out/",
+                           std::string("si"));
+  } else if (src == "qe_si222_nosym") {
+    return std::make_tuple(std::string(PROJECT_SOURCE_DIR)+
+                               "/tests/unit_test_files/qe/si_kp222_nbnd60/out/",
+                           std::string("si"));
   } else if (src == "qe_si222_so") {
     return std::make_tuple(std::string(PROJECT_SOURCE_DIR)+
                                "/tests/unit_test_files/qe/si_kp222_nbnd8_so/",

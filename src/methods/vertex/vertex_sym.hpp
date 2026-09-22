@@ -55,6 +55,8 @@
 #include "configuration.hpp"
 #include "nda/nda.hpp"
 #include "numerics/shared_array/nda.hpp"
+#include "utilities/check.hpp"
+#include "methods/vertex/vertex_debug.hpp"
 
 namespace methods {
 namespace solvers {
@@ -132,6 +134,14 @@ namespace vertex_sym {
    * otherwise the (non-conjugated) star image of -qs at p, one level deep. Anything else is refused with a message.
    * n_trev / n_cjg count the time-reversal images and the conjugated rotations applied (the log reports them).
    */
+  /** DIAGNOSTIC (2026-09-22, the Si 4^3 time-reversal finding): vertex_debug sym_trev_notrans = 1 reads the IBZ-stored core
+   *  PLAIN (not PQ-transposed) for a time-reversed transfer at every rung read site. The two differ by W vs conj(W) for a
+   *  Hermitian core, invisible on meshes whose k-points are all TRIM (real collocations: every LiH fixture), decisive on Si 4^3. */
+  inline bool trev_read_transposed() {
+    static const bool notrans = vertex_debug::flag("sym_trev_notrans");
+    return not notrans;
+  }
+
   namespace detail {
     struct fold_scratch {
       nda::array<ComplexType, 2> X, Dm, T, Y;
@@ -185,6 +195,11 @@ namespace vertex_sym {
     utils::check(c.qminus.size() == c.nq_full and c.kminus.size() == c.nk_full, "fold_star_into_ibz: the sym context has no qminus / kminus maps.");
     detail::fold_scratch w(nc);
     nda::array<ComplexType, 3> B(nt, nc, nc);
+    // DIAGNOSTIC (2026-09-22, the degenerate-block convention question): vertex_debug sym_fold_dt = 1 applies the TRANSPOSED
+    // C-sector rotation in the fold (Y = D^* B D^T instead of D^dag B D) -- identical for diagonal D (non-degenerate windows),
+    // different inside degenerate blocks; the LiH [0, 6) IBZ gate decides which convention the stored D follows.
+    const bool fold_dt = vertex_debug::flag("sym_fold_dt") or vertex_debug::flag("sym_dt");
+    const long fold_conv = fold_dt ? 1 : long(vertex_debug::number("sym_fold_conv", 0.0));   // 0 D, 1 D^T, 2 D^*, 3 D^dag (diagnostic)
     for (long qp = 0; qp < c.nq_full; ++qp) {
       if (c.q_star(qp) != iq) continue;
       const long js = c.q_isym(qp);
@@ -204,7 +219,9 @@ namespace vertex_sym {
           continue;
         }
         for (long a = 0; a < nc; ++a)
-          for (long j = 0; j < nc; ++j) w.Dm(a, j) = c.Dc(js, k, a, j);
+          for (long j = 0; j < nc; ++j)
+            w.Dm(a, j) = (fold_conv == 1) ? c.Dc(js, k, j, a) : (fold_conv == 2) ? std::conj(c.Dc(js, k, a, j))
+                       : (fold_conv == 3) ? std::conj(c.Dc(js, k, j, a)) : c.Dc(js, k, a, j);
         for (long it = 0; it < nt; ++it) {
           w.X() = B(it, all, all);
           nda::blas::gemm(w.X, w.Dm, w.T);                              // T = B D

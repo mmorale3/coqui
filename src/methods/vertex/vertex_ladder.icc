@@ -1147,7 +1147,7 @@ namespace solvers {
               const long ikppq = kpq(iq, ikp);
               const long jsx = sym ? symc->q_isym(iqx) : 0l;
               const long qsx = sym ? symc->q_star(iqx) : iqx;
-              const bool trx = sym ? bool(symc->q_trev(iqx)) : false;
+              const bool trx = sym ? (bool(symc->q_trev(iqx)) and vertex_sym::trev_read_transposed()) : false;
               vertex_pi::detail::build_U_legs(Xb, symc, nda::range(0, nc), is, ik, ikp,
                                               ikpq, ikppq, jsx, U1, U2);
               if (trx)
@@ -1900,7 +1900,7 @@ namespace solvers {
                   const long iqx = qx_of(ik, ikp);
                   const long jsx = sym ? symc->q_isym(iqx) : 0l;
                   const long qsx = sym ? symc->q_star(iqx) : iqx;
-                  const bool trx = sym ? bool(symc->q_trev(iqx)) : false;
+                  const bool trx = sym ? (bool(symc->q_trev(iqx)) and vertex_sym::trev_read_transposed()) : false;
                   vertex_pi::detail::build_U_legs(Xb, symc, nda::range(0, nc), is, ik, ikp,
                                                   ikpq, ikppq, jsx, U1, U2);
                   if (trx)

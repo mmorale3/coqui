@@ -702,7 +702,7 @@ namespace vertex_pi {
     // rung-transfer access data: IBZ index + trev(=PQ-transpose) flag + symmetry pos.
     auto q_access = [&](long iqx) {
       if (not sym) return std::make_tuple(iqx, false, 0l);
-      return std::make_tuple(symc->q_star(iqx), bool(symc->q_trev(iqx)), symc->q_isym(iqx));
+      return std::make_tuple(symc->q_star(iqx), bool(symc->q_trev(iqx)) and vertex_sym::trev_read_transposed(), symc->q_isym(iqx));
     };
     // rearrange wbar[(p1p1'),(p3p3')] -> wmat[(p1'p3),(p1p3')]
     auto to_wmat = [&](nda::array<ComplexType, 2> const& wbar, auto&& wmat) {
@@ -1172,7 +1172,7 @@ namespace vertex_pi {
       if (skip_rung_gamma and iqx == iq_gamma) continue;
       const long ikmqx = kmq(iqx, ik);
       const long qsx = sym ? symc->q_star(iqx) : iqx;
-      const bool  trx = sym ? bool(symc->q_trev(iqx)) : false;
+      const bool  trx = sym ? (bool(symc->q_trev(iqx)) and vertex_sym::trev_read_transposed()) : false;
       const long  jsx = sym ? symc->q_isym(iqx) : 0l;
 
       // ---- b34: the NO-q side. Depends on (is, ik, qx) only -> hoisted out of the iq

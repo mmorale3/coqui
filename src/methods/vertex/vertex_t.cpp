@@ -1008,6 +1008,11 @@ namespace solvers {
             if (wan)
               nda::blas::gemm(ComplexType(1.0), X_w(is, ksrc, all, all), dloc,
                               ComplexType(0.0), base);
+            else if (vertex_debug::flag("sym_dt"))
+              // DIAGNOSTIC (2026-09-22): the TRANSPOSED C-sector rotation in the effective columns, Xhat = X(ksrc) . Dc^T
+              // (the degenerate-block convention question: identical for diagonal Dc; see vertex_sym.hpp sym_fold_dt)
+              nda::blas::gemm(ComplexType(1.0), X_w(is, ksrc, all, all), nda::transpose(Dc),
+                              ComplexType(0.0), base);
             else
               nda::blas::gemm(ComplexType(1.0), X_w(is, ksrc, all, all), Dc,
                               ComplexType(0.0), base);

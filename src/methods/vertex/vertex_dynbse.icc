@@ -281,7 +281,7 @@ namespace solvers {
       auto Wc = [&](long qp, long P, long Q) -> cplx {              // the class-masked rung at the full-mesh transfer q'
         if (not sym) return Wq(qp)(P, Q);
         if (symc->q_isym(qp) != js) return cplx(0.0);
-        return symc->q_trev(qp) ? Wq(symc->q_star(qp))(Q, P) : Wq(symc->q_star(qp))(P, Q);
+        return (symc->q_trev(qp) and vertex_sym::trev_read_transposed()) ? Wq(symc->q_star(qp))(Q, P) : Wq(symc->q_star(qp))(P, Q);
       };
       for (long n0 = 0; n0 < nR; n0 += nb) {
         const long nbl = std::min(nb, nR - n0);
@@ -523,7 +523,7 @@ namespace solvers {
           continue;
         }
         auto W = Wq(sym ? symc->q_star(q) : q);
-        const bool tr = sym and bool(symc->q_trev(q));
+        const bool tr = sym and bool(symc->q_trev(q)) and vertex_sym::trev_read_transposed();
         for (long P = 0; P < Nm; ++P)
           for (long Q = 0; Q < Nm; ++Q) Wall(rq, P * Nm + Q) = tr ? W(Q, P) : W(P, Q);
       }
@@ -633,7 +633,7 @@ namespace solvers {
           const long ikppq = kpq(iq, ikp);
           const long jsx = sym ? symc->q_isym(iqx) : 0l;
           const long qsx = sym ? symc->q_star(iqx) : iqx;
-          const bool trx = sym ? bool(symc->q_trev(iqx)) : false;
+          const bool trx = sym ? (bool(symc->q_trev(iqx)) and vertex_sym::trev_read_transposed()) : false;
           vertex_pi::detail::build_U_legs(Xb, symc, nda::range(0, nc), is, ik, ikp, ikpq, ikppq, jsx, U1, U2);
           if (trx)
             nda::blas::gemm(nda::transpose(W0b(qsx, all, all)), U2, WU2);

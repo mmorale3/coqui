@@ -89,6 +89,12 @@ inline decltype(auto) default_MF(std::shared_ptr<utils::mpi_context_t<comm_t>>& 
     auto [outdir,prefix] = utils::utest_filename("qe_lih222_sym");
     return default_MF(comm, mf::qe_source, outdir, prefix, ftype);
 
+  } else if (src == "qe_si222_sym" or src == "qe_si222_nosym") {
+
+    // 2026-09-22: the Si 2x2x2 pair with a 3-fold group (h5 only: si.coqui.h5 from pw2coqui)
+    auto [outdir,prefix] = utils::utest_filename(src);
+    return default_MF(comm, mf::qe_source, outdir, prefix, h5_input_type);
+
   } else if (src == "qe_lih223") {
 
     auto [outdir,prefix] = utils::utest_filename("qe_lih223");

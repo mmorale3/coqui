@@ -36,6 +36,8 @@
 //      mesh; sign-flip control at O(1).
 //   4. vertex_ibz_noop_sym: C = empty set reproduces plain sym-scGW bitwise.
 
+#include <cstdio>
+#include <cstdlib>
 #include <cmath>
 #include <complex>
 #include <tuple>
@@ -59,6 +61,8 @@
 #include "methods/SCF/simple_dyson.h"
 #include "methods/SCF/scf_driver.hpp"
 #include "methods/vertex/vertex_t.h"
+#include "utilities/symmetry.hpp"
+#include "methods/ERI/thc.h"
 
 namespace bdft_tests {
 
@@ -171,6 +175,272 @@ namespace bdft_tests {
   }
 
   // ====================================================================================
+  /**
+   * 2026-09-22: the TRANSPORT identity behind the symmetry path, tested numerically on the exact orbitals.
+   * The kernels' effective columns are Xhat(js, k) = X(krot(js, k)) . Dc(js, k) (vertex_t::build_sym_ctx), meant to be the
+   * orbital at k evaluated at the rotated points: psi_{k,b}(S^{-1} r_P) (or S r_P). Both sides are computable exactly: the
+   * collocation of every full-mesh k at an arbitrary point list (thc::collocation_at_points, which rotates the IBZ orbitals
+   * in real space) and at the point list rotated by S (utils::transform_r). The eight candidates {D, D^T, D^*, D^dag} x
+   * {S, S^-1} are compared on the closed window [0, 6) of qe_lih222_sym (a degenerate triplet inside: the conventions
+   * differ ONLY inside degenerate blocks, so the historic [1, 3) gates could not see it). COQUI_IBZ_TEST_WINDOW overrides.
+   */
+  // transform_r's arithmetic without the periodic wrap: returns the wrapped grid index (as transform_r) and the lattice
+  // translation R_lat (integers) it removed, so that psi_k(S r_P) = e^{2 pi i k . R_lat} psi_k(r_wrapped) (Bloch phase)
+  inline void rotate_points_with_wrap(utils::symm_op const &S, nda::array<long, 1> const &mesh, nda::array<long, 1> const &rin,
+                                      nda::array<long, 1> &rout, nda::array<long, 2> &Rlat) {
+    const long NX = mesh(0), NY = mesh(1), NZ = mesh(2), NX2 = NX / 2, NY2 = NY / 2, NZ2 = NZ / 2;
+    rout = nda::array<long, 1>(rin.size()); Rlat = nda::array<long, 2>(rin.size(), 3);
+    for (long i = 0; i < rin.size(); ++i) {
+      // positions as the phase factors take them (rspace_phase_factor / load_basis_subset_fft_grid: n/N with n in [0, N)),
+      // NOT transform_r's symmetric range: the two differ by lattice translations, invisible in the wrapped index but a
+      // Bloch phase e^{2 pi i k.R} on the orbital (a sign at half-integer k)
+      long n = rin(i);
+      long n2 = n % NZ;
+      long n_ = n / NZ;
+      long n1 = n_ % NY;
+      long n0 = n_ / NY;
+      (void)NX2; (void)NY2; (void)NZ2;
+      const double N10 = double(NY) / NX, N01 = double(NX) / NY, N12 = double(NY) / NZ, N21 = double(NZ) / NY, N02 = double(NX) / NZ, N20 = double(NZ) / NX;
+      long ni = long(std::round(S.R(0, 0) * n0 + S.R(0, 1) * N10 * n1 + S.R(0, 2) * N20 * n2));
+      long nj = long(std::round(S.R(1, 0) * N01 * n0 + S.R(1, 1) * n1 + S.R(1, 2) * N21 * n2));
+      long nk_ = long(std::round(S.R(2, 0) * N02 * n0 + S.R(2, 1) * N12 * n1 + S.R(2, 2) * n2));
+      long wi = 0, wj = 0, wk = 0;
+      while (ni < 0) { ni += NX; --wi; } while (nj < 0) { nj += NY; --wj; } while (nk_ < 0) { nk_ += NZ; --wk; }
+      while (ni >= NX) { ni -= NX; ++wi; } while (nj >= NY) { nj -= NY; ++wj; } while (nk_ >= NZ) { nk_ -= NZ; ++wk; }
+      rout(i) = (ni * NY + nj) * NZ + nk_;
+      Rlat(i, 0) = wi; Rlat(i, 1) = wj; Rlat(i, 2) = wk;   // r_rotated = r_wrapped + R_lat (in units of the lattice vectors)
+    }
+  }
+
+  TEST_CASE("vertex_ibz_transport", "[methods][vertex][ibz]") {
+    auto& mpi_context = utils::make_unit_test_mpi_context();
+    // COQUI_IBZ_TEST_FIXTURE overrides the symmetric fixture (qe_lih223_sym: time-reversal pairs, non-TRIM k, 4-fold operations)
+    const std::string fxs = std::getenv("COQUI_IBZ_TEST_FIXTURE") ? std::getenv("COQUI_IBZ_TEST_FIXTURE") : "qe_lih222_sym";
+    auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, fxs));
+    REQUIRE(mf->nkpts() != mf->nkpts_ibz());
+    decltype(nda::range::all) all;
+    long w0 = 0, w1 = 6;
+    if (const char *w = std::getenv("COQUI_IBZ_TEST_WINDOW")) std::sscanf(w, "%ld,%ld", &w0, &w1);
+    nda::range W(w0, w1);
+    const long nW = W.size(), nk = mf->nkpts(), nbnd = mf->nbnd();
+    ptree pt; pt.put("thresh", 1e-4); pt.put("chol_block_size", 1);
+    methods::thc builder(mf.get(), *mpi_context, pt, false);
+    auto mesh = builder.rho_mesh();
+    const long nnr = mesh(0) * mesh(1) * mesh(2);
+    // a spread of grid points (every 97th): the identity must hold at EVERY point, so any set is a test
+    std::vector<long> pv;
+    for (long n = 3; n < nnr and long(pv.size()) < 60; n += 97) pv.push_back(n);
+    nda::array<long, 1> ipts(long(pv.size()));
+    for (long i = 0; i < ipts.size(); ++i) ipts(i) = pv[size_t(i)];
+    const long Nm = ipts.size();
+    auto X = builder.collocation_at_points(ipts, nda::range(0, nk), W);   // (ns, nk, nW, Nm): psi_{k,b}(r_P)
+    auto symms = mf->symm_list();
+    auto qsymms = mf->qsymms();
+    auto kp_trev = mf->kp_trev();
+    const long nsym = qsymms.extent(0);
+    app_log(1, "ibz transport: {} ops, {} k (IBZ {}), window [{}, {}), {} points, {} trev pairs", nsym, nk, mf->nkpts_ibz(), w0, w1, Nm, mf->nkpts_trev_pairs());
+    nda::array<ComplexType, 2> E(nbnd, nW), Dfull(nbnd, nW), Dw(nW, nW), Xr(Nm, nW), cand(Nm, nW);
+    E() = ComplexType(0.0);
+    for (long j = 0; j < nW; ++j) E(w0 + j, j) = ComplexType(1.0);
+    const char *names[4] = {"D", "D^T", "D^*", "D^dag"};
+    double best[8]; for (double &b : best) b = 0.0;
+    for (long js = 1; js < nsym; ++js) {
+      auto op = symms[size_t(qsymms(js))];
+      // the point lists r' = S r_P and r'' = S^-1 r_P (transform_r: r_out = S.R * r_in)
+      nda::array<long, 1> ipS, ipSi;
+      nda::array<long, 2> RS, RSi;
+      utils::symm_op opi = op; opi.R = op.Rinv; opi.Rinv = op.R;
+      rotate_points_with_wrap(op, mesh, ipts, ipS, RS);
+      rotate_points_with_wrap(opi, mesh, ipts, ipSi, RSi);
+      {
+        nda::array<long, 1> chk(ipts);
+        utils::transform_r(op, nda::array<long, 1>::zeros({3}), mesh, chk);
+        long ndiff = 0, nwrap = 0;
+        for (long i = 0; i < Nm; ++i) { if (chk(i) != ipS(i)) ++ndiff; if (RS(i, 0) != 0 or RS(i, 1) != 0 or RS(i, 2) != 0) ++nwrap; }
+        // the order of the operation (R^n = 1)
+        nda::stack_array<double, 3, 3> Rn = op.R, Rp;
+        int order = 1;
+        auto is_id = [](nda::stack_array<double, 3, 3> const &M) { double d = 0.0; for (int i = 0; i < 3; ++i) for (int j = 0; j < 3; ++j) d += std::abs(M(i, j) - (i == j ? 1.0 : 0.0)); return d < 1e-8; };
+        while (not is_id(Rn) and order < 12) { nda::blas::gemm(op.R, Rn, Rp); Rn = Rp; ++order; }
+        app_log(1, "ibz transport: op js {} (symm {}, order {}): R = [{:+.0f} {:+.0f} {:+.0f}; {:+.0f} {:+.0f} {:+.0f}; {:+.0f} {:+.0f} {:+.0f}]; rotated indices vs transform_r differ at {} points; {} of {} points wrapped",
+                js, qsymms(js), order, op.R(0,0), op.R(0,1), op.R(0,2), op.R(1,0), op.R(1,1), op.R(1,2), op.R(2,0), op.R(2,1), op.R(2,2), ndiff, nwrap, Nm);
+      }
+      auto XS0 = builder.collocation_at_points(ipS, nda::range(0, nk), W);    // psi_{k,b}(wrapped S r_P)
+      auto XSi0 = builder.collocation_at_points(ipSi, nda::range(0, nk), W);  // psi_{k,b}(wrapped S^-1 r_P)
+      // the Bloch phase of the removed lattice translation: psi_k(r + R) = e^{2 pi i k.R} psi_k(r)  (k in crystal units)
+      auto kc = mf->kpts_crystal();
+      auto XS = XS0, XSi = XSi0;
+      for (long k = 0; k < nk; ++k)
+        for (long P = 0; P < Nm; ++P) {
+          const double phS = 2.0 * M_PI * (kc(k, 0) * RS(P, 0) + kc(k, 1) * RS(P, 1) + kc(k, 2) * RS(P, 2));
+          const double phSi = 2.0 * M_PI * (kc(k, 0) * RSi(P, 0) + kc(k, 1) * RSi(P, 1) + kc(k, 2) * RSi(P, 2));
+          for (long b = 0; b < nW; ++b) { XS(0, k, b, P) *= std::polar(1.0, phS); XSi(0, k, b, P) *= std::polar(1.0, phSi); }
+        }
+      auto trev_pair = mf->kp_trev_pair();
+      for (long k = 0; k < nk; ++k) {
+        auto [cj, Dsp] = mf->symmetry_rotation(js, k);
+        // time-reversal images (cj): the kernels' column is conj(X(krot(js, pair(k))) . D) (build_sym_ctx) -- tested against the
+        // same transported orbital psi_k(S r_P); the plain points otherwise
+        math::sparse::csrmm(ComplexType(1.0), *Dsp, E, ComplexType(0.0), Dfull);   // D E: (nbnd, nW), rows = all bands
+        for (long a = 0; a < nW; ++a) for (long b = 0; b < nW; ++b) Dw(a, b) = Dfull(w0 + a, b);
+        const long kr = mf->ks_to_k(int(js), int(cj ? long(trev_pair(k)) : k));
+        for (long P = 0; P < Nm; ++P) for (long a = 0; a < nW; ++a) Xr(P, a) = X(0, kr, a, P);   // X(krot(js, k)) or X(krot(js, pair(k)))
+        for (int c = 0; c < 4; ++c) {
+          nda::array<ComplexType, 2> Dc(nW, nW);
+          for (long a = 0; a < nW; ++a)
+            for (long b = 0; b < nW; ++b)
+              Dc(a, b) = (c == 0) ? Dw(a, b) : (c == 1) ? Dw(b, a) : (c == 2) ? std::conj(Dw(a, b)) : std::conj(Dw(b, a));
+          nda::blas::gemm(Xr, Dc, cand);                                     // sum_a X(kr)(P, a) Dc(a, b)
+          if (cj) for (long P = 0; P < Nm; ++P) for (long b = 0; b < nW; ++b) cand(P, b) = std::conj(cand(P, b));   // the trev-image rule
+          for (int t = 0; t < 2; ++t) {
+            double num = 0.0, den = 0.0;
+            for (long P = 0; P < Nm; ++P)
+              for (long b = 0; b < nW; ++b) {
+                const ComplexType ref = t == 0 ? XS(0, k, b, P) : XSi(0, k, b, P);
+                num += std::norm(cand(P, b) - ref); den += std::norm(ref);
+              }
+            const double r = std::sqrt(num / std::max(den, 1e-300));
+            best[c * 2 + t] = std::max(best[c * 2 + t], r);
+            if (c == 0 and t == 1) {
+              // the same comparison up to ONE overall phase per (js, k): 1 - |<cand, ref>| / (|cand| |ref|)
+              ComplexType ov(0.0); double nc_ = 0.0, nr_ = 0.0;
+              for (long P = 0; P < Nm; ++P)
+                for (long b = 0; b < nW; ++b) {
+                  const ComplexType ref = t == 0 ? XS(0, k, b, P) : XSi(0, k, b, P);
+                  ov += std::conj(cand(P, b)) * ref; nc_ += std::norm(cand(P, b)); nr_ += std::norm(ref);
+                }
+              const double ph = 1.0 - std::abs(ov) / std::sqrt(std::max(nc_ * nr_, 1e-300));
+              app_log(1, "ibz transport:   js {} k {}{} (krot {}, kp_to_ibz {}, kp_symm {}): X(krot) . D vs psi_k({} r_P) = {:.3e}; up to a phase {:.3e} (phase {:+.3f} pi)",
+                      js, k, cj ? " [trev image: conj rule]" : "", kr, mf->kp_to_ibz(int(k)), mf->kp_symm(int(k)), t == 0 ? "S" : "S^-1", r, ph, std::arg(ov) / M_PI);
+            }
+          }
+        }
+      }
+    }
+    // setup sanity: band-resolved MODULI (phase- and D-free): |psi_{krot,b}(r_P)| vs |psi_{k,b}(S^{+-1} r_P)| summed over the
+    // window, and the plain |X(k)(S r_P)| vs |X(k)(r_P)| control (must be O(1) different), for the first op and first k
+    {
+      const long js = 1, k = 0, kr = mf->ks_to_k(int(js), int(k));
+      auto op = symms[size_t(qsymms(js))];
+      nda::array<long, 1> ipS(ipts), ipSi(ipts);
+      utils::transform_r(op, nda::array<long, 1>::zeros({3}), mesh, ipS);
+      utils::symm_op opi = op; opi.R = op.Rinv; opi.Rinv = op.R;
+      utils::transform_r(opi, nda::array<long, 1>::zeros({3}), mesh, ipSi);
+      auto XS = builder.collocation_at_points(ipS, nda::range(0, nk), W);
+      auto XSi = builder.collocation_at_points(ipSi, nda::range(0, nk), W);
+      double m1 = 0.0, m2 = 0.0, m3 = 0.0, den = 0.0;
+      for (long P = 0; P < Nm; ++P) {
+        double a = 0.0, bS = 0.0, bSi = 0.0, b0 = 0.0;
+        for (long b = 0; b < nW; ++b) { a += std::norm(X(0, kr, b, P)); bS += std::norm(XS(0, k, b, P)); bSi += std::norm(XSi(0, k, b, P)); b0 += std::norm(X(0, k, b, P)); }
+        m1 += (a - bS) * (a - bS); m2 += (a - bSi) * (a - bSi); m3 += (a - b0) * (a - b0); den += a * a;
+      }
+      app_log(1, "ibz transport: setup check (js 1, k 0 -> krot {}): window density |X(krot)(r_P)|^2 vs |X(k)(S r_P)|^2: {:.3e}, vs |X(k)(S^-1 r_P)|^2: {:.3e}, vs the unrotated |X(k)(r_P)|^2: {:.3e}; ipts[0..3] = {} {} {} -> S: {} {} {}",
+              kr, std::sqrt(m1 / den), std::sqrt(m2 / den), std::sqrt(m3 / den), ipts(0), ipts(1), ipts(2), ipS(0), ipS(1), ipS(2));
+      // the EMPIRICAL transport matrix: least squares X(k)(S^-1 r_P) ~ X(krot)(r_P) . M  (M = pinv(Xr) . XSi), and the stored D
+      nda::array<ComplexType, 2> A(Nm, nW), Bm(Nm, nW), G(nW, nW), Rhs(nW, nW), M(nW, nW);
+      for (long P = 0; P < Nm; ++P) for (long b = 0; b < nW; ++b) { A(P, b) = X(0, kr, b, P); Bm(P, b) = XSi(0, k, b, P); }
+      nda::blas::gemm(nda::dagger(A), A, G); nda::blas::gemm(nda::dagger(A), Bm, Rhs);
+      nda::matrix<ComplexType> Gm(nW, nW); Gm() = G; nda::inverse_in_place(Gm);
+      nda::blas::gemm(Gm, Rhs, M);
+      auto [cj0, Dsp0] = mf->symmetry_rotation(js, k);
+      math::sparse::csrmm(ComplexType(1.0), *Dsp0, E, ComplexType(0.0), Dfull);
+      std::string sm, sd;
+      for (long a = 0; a < nW; ++a) {
+        for (long b = 0; b < nW; ++b) { char buf[40]; std::snprintf(buf, sizeof(buf), "(%6.3f,%6.3f) ", M(a, b).real(), M(a, b).imag()); sm += buf;
+                                        std::snprintf(buf, sizeof(buf), "(%6.3f,%6.3f) ", Dfull(w0 + a, b).real(), Dfull(w0 + a, b).imag()); sd += buf; }
+        sm += "\n      "; sd += "\n      ";
+      }
+      double resM = 0.0, denM = 0.0;
+      nda::blas::gemm(A, M, cand);
+      for (long P = 0; P < Nm; ++P) for (long b = 0; b < nW; ++b) { resM += std::norm(cand(P, b) - Bm(P, b)); denM += std::norm(Bm(P, b)); }
+      app_log(1, "ibz transport: empirical M (X(k)(S^-1 r) = X(krot)(r) M, fit residual {:.3e}):\n      {}\n   stored D(js 1, k 0) window block:\n      {}", std::sqrt(resM / denM), sm, sd);
+    }
+    // point-resolved ratio for (js 1, k 1), band 0 (non-degenerate?): is the mismatch a POINT-dependent phase e^{i G0 . r_P}?
+    {
+      const long js = 1, k = 1, kr = mf->ks_to_k(int(js), int(k));
+      auto op = symms[size_t(qsymms(js))];
+      nda::array<long, 1> ipSi(ipts);
+      utils::symm_op opi = op; opi.R = op.Rinv; opi.Rinv = op.R;
+      utils::transform_r(opi, nda::array<long, 1>::zeros({3}), mesh, ipSi);
+      auto XSi = builder.collocation_at_points(ipSi, nda::range(0, nk), W);
+      auto [cj, Dsp] = mf->symmetry_rotation(js, k);
+      math::sparse::csrmm(ComplexType(1.0), *Dsp, E, ComplexType(0.0), Dfull);
+      for (long a = 0; a < nW; ++a) for (long b = 0; b < nW; ++b) Dw(a, b) = Dfull(w0 + a, b);
+      for (long P = 0; P < Nm; ++P) for (long a = 0; a < nW; ++a) Xr(P, a) = X(0, kr, a, P);
+      nda::blas::gemm(Xr, Dw, cand);
+      auto kc = mf->kpts_crystal();
+      std::string lines;
+      for (long P = 0; P < std::min<long>(Nm, 10); ++P) {
+        const long n = ipts(P), n2 = n % mesh(2), n1 = (n / mesh(2)) % mesh(1), n0 = n / (mesh(2) * mesh(1));
+        const ComplexType ratio = XSi(0, k, 0, P) / cand(P, 0);
+        char buf[200];
+        std::snprintf(buf, sizeof(buf), "\n      P %2ld r = (%2ld,%2ld,%2ld)/(%ld,%ld,%ld): |ratio| %.4f, phase %+.4f pi", P, n0, n1, n2, mesh(0), mesh(1), mesh(2), std::abs(ratio), std::arg(ratio) / M_PI);
+        lines += buf;
+      }
+      app_log(1, "ibz transport: (js 1, k 1 = ({:.2f},{:.2f},{:.2f}) -> krot {} = ({:.2f},{:.2f},{:.2f})) band 0: psi_k(S^-1 r_P) / [X(krot) D](P): {}",
+              kc(k, 0), kc(k, 1), kc(k, 2), kr, kc(kr, 0), kc(kr, 1), kc(kr, 2), lines);
+    }
+    // the DIRECTION of the transfer map vs the k map: the kernels rotate the legs with js = q_isym(q') and read W at q_star(q');
+    // they need q_star(q') = "js applied to q'" in the SAME sense as krot(js, k) = "js applied to k" (see the kernel identity in
+    // notes/vertex_perf_plan.md 2026-09-22). Check on the exact vectors: is q_ibz = k-map(js)(q') or q' = k-map(js)(q_ibz)?
+    {
+      auto Qcart = mf->Qpts();   // Cartesian: to crystal through the lattice vectors (as scr_coulomb's dump does)
+      auto lat = mf->lattv();
+      nda::array<double, 2> qc(Qcart.shape(0), 3);
+      for (long iq = 0; iq < Qcart.shape(0); ++iq)
+        for (int i = 0; i < 3; ++i) { double v = 0.0; for (int j = 0; j < 3; ++j) v += lat(i, j) * Qcart(iq, j); qc(iq, i) = v / (2.0 * M_PI); }
+      auto kcr = mf->kpts_crystal();
+      auto qp_symm = mf->qp_symm();
+      auto qp_to_ibz = mf->qp_to_ibz();
+      auto qp_trev = mf->qp_trev();
+      const long nq = mf->nqpts();
+      long n_fwd = 0, n_bwd = 0, n_tot = 0;
+      for (long q = mf->nqpts_ibz(); q < nq; ++q) {
+        if (qp_trev(q)) continue;
+        long js = -1;
+        for (long i = 0; i < nsym; ++i) if (qsymms(i) == qp_symm(q)) js = i;
+        if (js <= 0) continue;
+        const long qs = qp_to_ibz(q);
+        // the k-map of js on the exact crystal vectors: k -> k . R_js (row) or R_js k (column)? take it from ks_to_k on a k that
+        // shares the vector with q (Gamma-centered meshes: the q list and the k list are the same grid)
+        long kq = -1, kqs = -1;
+        for (long k = 0; k < nk; ++k) {
+          double dq = 0.0, dqs = 0.0;
+          for (int i = 0; i < 3; ++i) { double x = kcr(k, i) - qc(q, i); x -= std::round(x); dq += std::abs(x); double y = kcr(k, i) - qc(qs, i); y -= std::round(y); dqs += std::abs(y); }
+          if (dq < 1e-6) kq = k;
+          if (dqs < 1e-6) kqs = k;
+        }
+        if (kq < 0 or kqs < 0) continue;
+        ++n_tot;
+        if (mf->ks_to_k(int(js), int(kq)) == kqs) ++n_fwd;    // q_ibz = kmap(js)(q')   (what the kernel identity needs)
+        if (mf->ks_to_k(int(js), int(kqs)) == kq) ++n_bwd;    // q'   = kmap(js)(q_ibz) (the opposite direction)
+      }
+      app_log(1, "ibz transport: transfer-map direction on {} non-IBZ, non-trev transfers: q_ibz = kmap(js)(q') for {}, q' = kmap(js)(q_ibz) for {} "
+                 "(involutions satisfy both; a 3-fold group distinguishes them)", n_tot, n_fwd, n_bwd);
+      // the same question through the MF's own q maps: qs_to_q(is, q_ibz) = "index of q_ibz * S_is" (bz_symmetry.hpp) -- is the
+      // star member q' = q_ibz * S_js (js = q_isym(q')), i.e. the SAME action as krot (k -> k * S_js)?
+      long n_same = 0, n_q = 0;
+      for (long q = mf->nqpts_ibz(); q < nq; ++q) {
+        if (qp_trev(q)) continue;
+        long js = -1;
+        for (long i = 0; i < nsym; ++i) if (qsymms(i) == qp_symm(q)) js = i;
+        if (js <= 0) continue;
+        ++n_q;
+        if (mf->qs_to_q(int(js))(qp_to_ibz(q)) == q) ++n_same;
+      }
+      app_log(1, "ibz transport: through qs_to_q: q' = q_ibz * S_js for {} of {} non-IBZ transfers (the SAME action as krot: k' = k * S_js). "
+                 "The kernels rotate the legs of a q' rung by S_js (k -> k * S_js), which maps the rotated transfer to q' * S_js = q_ibz * S_js^2: "
+                 "only an involution lands on q_ibz.", n_same, n_q);
+    }
+    for (int c = 0; c < 4; ++c)
+      app_log(1, "ibz transport: X(krot) . {:<6} vs psi_k(S r_P): {:.3e}   vs psi_k(S^-1 r_P): {:.3e}", names[c], best[c * 2], best[c * 2 + 1]);
+    double mn = 1.0;
+    for (double b : best) mn = std::min(mn, b);
+    app_log(1, "ibz transport: the best candidate reproduces the transported orbital to {:.3e} (the kernels use X(krot) . D against S^-1 r_P)", mn);
+    REQUIRE(mn < 1e-8);
+    mpi_context->comm.barrier();
+  }
+
   TEST_CASE("vertex_ibz_gold", "[methods][vertex][ibz][smoke]") {
 #ifndef ENABLE_DLR
     SUCCEED("vertex_ibz_gold skipped: build has ENABLE_DLR=OFF.");
@@ -228,8 +498,14 @@ namespace bdft_tests {
             ehf_p_ns, ehf_p_s, d_plain_hf, ec_p_ns, ec_p_s, d_plain_ec);
 
     // ---- GOLD: vertex on, production window C = [1, 3), both cuts, 2 iterations ------
-    auto [ehf_v_ns, ec_v_ns, lv_ns] = run("qe_lih222", nda::range(1, 3), 2, "global");
-    auto [ehf_v_s, ec_v_s, lv_s] = run("qe_lih222_sym", nda::range(1, 3), 2, "global");
+    // COQUI_IBZ_TEST_WINDOW = "a,b" overrides the window (2026-09-21: the degenerate-block convention test, e.g. "0,6" or "3,6"
+    // -- [1, 3) holds no degenerate band pair, so the D matrices are diagonal phases there and a transposition inside a
+    // degenerate block would pass unseen; Si 4^3 C = [0, 8) showed a 1.5 % sym-vs-nosym vertex gap, LiH [0, 6) a 1.7e-2 fold gap)
+    nda::range gold_w(1, 3);
+    if (const char *w = std::getenv("COQUI_IBZ_TEST_WINDOW")) { long a = 1, b = 3; std::sscanf(w, "%ld,%ld", &a, &b); gold_w = nda::range(a, b); }
+    app_log(1, "ibz gold: vertex window C = [{}, {})", gold_w.first(), gold_w.last());
+    auto [ehf_v_ns, ec_v_ns, lv_ns] = run("qe_lih222", gold_w, 2, "global");
+    auto [ehf_v_s, ec_v_s, lv_s] = run("qe_lih222_sym", gold_w, 2, "global");
     (void)lv_ns;
     const double d_vert_hf = std::abs(ehf_v_ns - ehf_v_s);
     const double d_vert_ec = std::abs(ec_v_ns - ec_v_s);

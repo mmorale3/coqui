@@ -1543,6 +1543,57 @@ namespace bdft_tests {
       mpi_context->comm.barrier();
       return;
     }
+    if (const char *sw = std::getenv("COQUI_DYNBSE_TEST_SYMEPS")) {
+      // ---- 2026-09-22: the P-side static-ladder eps_M readout, SYM vs NOSYM on LiH at window [0, nc) (nc = the env value) -------
+      // A fast reproducer of the Si 4^3 finding (the symmetric ladder correction 7 % below the full-mesh one): one scGW iteration
+      // from the DFT start on qe_lih222 and on qe_lih222_sym with the static ladder readout (its own point selection on each
+      // mesh), the RPA and +ladder eps_M at q_min compared; the RPA agreement is the mean-field/THC floor, the ladder correction
+      // is what the symmetry path must reproduce. COQUI_DYNBSE_TEST_SYMEPS_RUNG=dynamic adds the dynamic-rung columns.
+      const long ncw = std::atol(sw) > 0 ? std::atol(sw) : 6;
+      const std::string rung = std::getenv("COQUI_DYNBSE_TEST_SYMEPS_RUNG") ? std::getenv("COQUI_DYNBSE_TEST_SYMEPS_RUNG") : "static";
+      auto run_se = [&](std::string const &fx, std::string const &tag) {
+        auto mfw = std::make_shared<mf::MF>(mf::default_MF(mpi_context, fx));
+        thc_reader_t thcw(mfw, make_thc_reader_ptree(mfw->nbnd() * 8, "", "incore", "", "bdft", 1e-10, mfw->ecutrho(), 1, 1024));
+        auto eriw = mb_eri_t(thcw, thcw);
+        const std::string out = "coqui_d3_symeps_" + tag;
+        solvers::hf_t hf; solvers::gw_t gw(&ft, "ignore_g0", out);
+        solvers::scr_coulomb_t scr_eri(&ft, "rpa", "ignore_g0");
+        simple_dyson dyson(mfw.get(), &ft); MBState mb_state(mpi_context, ft, out);
+        iter_scf::iter_scf_t iter_sol("damping");
+        solvers::vertex_t vtx(&ft, "none", nda::range(0, 0), mfw->nbnd());
+        // COQUI_DYNBSE_TEST_SYMEPS_THRESH: the SECONDARY selection threshold (default: the reader's; 1e-13 -> the complete pair
+        // rank, so the two meshes share no truncation error); COQUI_DYNBSE_TEST_SYMEPS_FREEZE=1: the sym run takes the nosym
+        // run's points (the same secondary frame on both meshes)
+        const double sth = std::getenv("COQUI_DYNBSE_TEST_SYMEPS_THRESH") ? std::atof(std::getenv("COQUI_DYNBSE_TEST_SYMEPS_THRESH")) : -1.0;
+        const bool freeze = (tag == "sym") and std::getenv("COQUI_DYNBSE_TEST_SYMEPS_FREEZE");
+        vtx.set_pol_vertex("ladder", "w0_prev", nda::range(0, ncw), -1, 1e-8, sth, -1.0, -1.0, "none");
+        vtx.set_ladder_rung(rung, 1e-8, 30, 12, -1.0);
+        if (rung == "dynamic") vtx.set_ladder_dyn_gamma1_only(true);
+        vtx.set_isdf_points(freeze ? "coqui_d3_symeps_nosym.secpts.h5" : "", not freeze);
+        scr_eri.set_vertex(&vtx);
+        const double e_corr = std::get<1>(scf_loop(mb_state, dyson, eriw, ft, solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol, 1, false, 1e-9, true));
+        auto [er, el] = scr_eri.pol_eps_readout();
+        auto ed = scr_eri.pol_eps_dyn();
+        app_log(1, "dynbse_readout SYMEPS [{}] {} (nk {} IBZ {}, window [0, {}), rung {}): e_corr {:.10f}, eps_M(q_min) RPA {:.8f} +ladder {:.8f} (Delta {:+.8f}); dyn columns {:.6f} {:.6f} {:.6f} {:.6f}",
+                tag, fx, mfw->nkpts(), mfw->nkpts_ibz(), ncw, rung, e_corr, er, el, el - er, ed[0], ed[1], ed[2], ed[3]);
+        mpi_context->comm.barrier();
+        if (mpi_context->comm.root()) { remove((out + ".mbpt.h5").c_str()); for (auto const &e : std::filesystem::directory_iterator(".")) if (e.path().filename().string().rfind(out + ".", 0) == 0 and e.path().filename().string().find(".secpts.h5") == std::string::npos) std::filesystem::remove(e.path()); }
+        mpi_context->comm.barrier();
+        return std::make_tuple(e_corr, er, el, ed);
+      };
+      // COQUI_DYNBSE_TEST_SYMEPS_FX = lih222 (default) | lih223 (a 2x2x3 mesh: non-TRIM k = +-1/3, time-reversal pairs when the
+      // group lacks inversion -- qe_lih223_sym) | lih223inv (inversion only)
+      const std::string fxs = std::getenv("COQUI_DYNBSE_TEST_SYMEPS_FX") ? std::getenv("COQUI_DYNBSE_TEST_SYMEPS_FX") : "lih222";
+      const std::string fx_ns = (fxs == "lih222") ? "qe_lih222" : (fxs == "si222") ? "qe_si222_nosym" : "qe_lih223";
+      const std::string fx_s = (fxs == "lih222") ? "qe_lih222_sym" : (fxs == "si222") ? "qe_si222_sym" : (fxs == "lih223inv") ? "qe_lih223_inv" : "qe_lih223_sym";
+      auto [cn, rn, ln, dn] = run_se(fx_ns, "nosym");
+      auto [cs, rs, ls, ds] = run_se(fx_s, "sym");
+      app_log(1, "dynbse_readout SYMEPS gate (window [0, {}), rung {}): RPA eps_M sym vs nosym rel {:.3e}; the ladder correction Delta: nosym {:+.8f} sym {:+.8f} -> rel {:.3e} of the correction; "
+                 "e_corr {:.10f} vs {:.10f}; Gamma_1 column sym/nosym {:.6f}/{:.6f}",
+              ncw, rung, std::abs(rs - rn) / rn, ln - rn, ls - rs, std::abs((ls - rs) - (ln - rn)) / std::abs(ln - rn), cs, cn, ds[2], dn[2]);
+      mpi_context->comm.barrier();
+      return;
+    }
     if (std::getenv("COQUI_DYNBSE_TEST_WINT_SYM")) {
       // the fixture name is the env value ("1" = qe_lih222_sym; use qe_lih223_sym for a mesh with non-TRIM k-points)
       std::string fx = std::getenv("COQUI_DYNBSE_TEST_WINT_SYM"); if (fx == "1" or fx.empty()) fx = "qe_lih222_sym";
