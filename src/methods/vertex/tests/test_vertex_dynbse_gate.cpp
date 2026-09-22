@@ -193,7 +193,11 @@ namespace bdft_tests {
                           std::getenv("COQUI_DYNBSE_TEST_PREC") ? std::string(std::getenv("COQUI_DYNBSE_TEST_PREC")) : std::string("low"));
     std::string output = "coqui_d3_readout";
 
-    auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_lih222"));
+    // COQUI_DYNBSE_TEST_FX overrides the fixture (default qe_lih222). Added 2026-09-22 for the SAMPLED-Sigma
+    // hunt: the nu-sampled dynamic Sigma vertex is fine on LiH and fails at Si 4^3, and the nu-modes are set by
+    // the pair continuum rather than by the mesh (P13), so qe_si222_nosym is the cheap local reproducer to try.
+    const std::string fx_readout = std::getenv("COQUI_DYNBSE_TEST_FX") ? std::getenv("COQUI_DYNBSE_TEST_FX") : "qe_lih222";
+    auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, fx_readout));
     thc_reader_t thc(mf, make_thc_reader_ptree(mf->nbnd() * 8, "", "incore", "", "bdft",
                                                1e-10, mf->ecutrho(), 1, 1024));
     auto eri = mb_eri_t(thc, thc);
@@ -515,7 +519,10 @@ namespace bdft_tests {
             if (kind == 1 or kind == 3) {
               solvers::vertex_t vtx(&ft, "2nd_exchange", nda::range(0, 4), mfn->nbnd(), "ignore_g0", "secondary", -1, 1e-8, -1.0, -1.0,
                                     kind == 1 ? "static" : "dynamic");
-              vtx.set_isdf_points("coqui_d3_winj_G.secpts.h5", false);
+              // 2026-09-22: section M normally runs on the G stage's frozen secondary points; with that dump absent
+              // (running a sub-gate stand-alone, e.g. the SAMPLED one on a fixture whose INJ chain is not set up)
+              // it selects its own -- the sub-gates below all compare runs with each other, not with the chain.
+              if (std::filesystem::exists("coqui_d3_winj_G.secpts.h5")) vtx.set_isdf_points("coqui_d3_winj_G.secpts.h5", false);
               vtx.set_bl_drop(1);
               if (kind == 3) vtx.set_skip_pi_c(true);   // the G^3 W^2 cut alone on the RPA W: the reference for the one-bare-rung pair column (N2)
               if (auto *rm = std::getenv("COQUI_DYNBSE_TEST_RESOLVENT")) vtx.set_ladder_dyn_resolvent(rm);   // P7: inverse | lu
@@ -527,7 +534,10 @@ namespace bdft_tests {
               solvers::vertex_t vtx(&ft, "none", nda::range(0, 0), mfn->nbnd());
               vtx.set_pol_vertex("ladder", "w0_prev", nda::range(0, 4), -1, 1e-8, -1.0, -1.0, -1.0, "none");
               vtx.set_ladder_rung("static", 1e-8, 30, 12, -1.0);
-              vtx.set_isdf_points("coqui_d3_winj_G.secpts.h5", false);
+              // 2026-09-22: section M normally runs on the G stage's frozen secondary points; with that dump absent
+              // (running a sub-gate stand-alone, e.g. the SAMPLED one on a fixture whose INJ chain is not set up)
+              // it selects its own -- the sub-gates below all compare runs with each other, not with the chain.
+              if (std::filesystem::exists("coqui_d3_winj_G.secpts.h5")) vtx.set_isdf_points("coqui_d3_winj_G.secpts.h5", false);
               vtx.set_sigma_pair(true, col, outer, scale, true, true, side_cur);
               vtx.set_sigma_dyn(sd_dump, sd_nodes, sd_fit, sd_rank);
               if (sd_auto > 0) vtx.set_sigma_dyn_auto_nodes(sd_auto);   // P14b
@@ -542,14 +552,16 @@ namespace bdft_tests {
               if (col == "static" or col == "static1") {   // G1: the P side's own object from the same amplitudes vs the dump's static column
                 nda::array<std::complex<double>, 4> Pc, Ps;
                 { h5::file f(out + ".sigpair.h5", 'r'); h5::group g(f); nda::h5_read(g, "Pi_check", Pc); }
-                { h5::file f("coqui_d3_winj_G.pol_wh_dyn.g1.h5", 'r'); h5::group g(f); nda::h5_read(g, "Pi_static", Ps); }
-                REQUIRE(Pc.shape(1) == Ps.shape(1)); REQUIRE(Pc.shape(2) == Ps.shape(2));
-                double dd = 0.0, nn = 0.0;
-                for (long j = 0; j < Ps.shape(0); ++j)
-                  for (long iq = 0; iq < Ps.shape(1); ++iq)
-                    for (long M = 0; M < Ps.shape(2); ++M)
-                      for (long N = 0; N < Ps.shape(3); ++N) { dd += std::norm(Pc(m0b + j, iq, M, N) - Ps(j, iq, M, N)); nn += std::norm(Ps(j, iq, M, N)); }
-                pichk = std::sqrt(dd / nn);
+                if (std::filesystem::exists("coqui_d3_winj_G.pol_wh_dyn.g1.h5")) {   // absent when a sub-gate runs stand-alone
+                  { h5::file f("coqui_d3_winj_G.pol_wh_dyn.g1.h5", 'r'); h5::group g(f); nda::h5_read(g, "Pi_static", Ps); }
+                  REQUIRE(Pc.shape(1) == Ps.shape(1)); REQUIRE(Pc.shape(2) == Ps.shape(2));
+                  double dd = 0.0, nn = 0.0;
+                  for (long j = 0; j < Ps.shape(0); ++j)
+                    for (long iq = 0; iq < Ps.shape(1); ++iq)
+                      for (long M = 0; M < Ps.shape(2); ++M)
+                        for (long N = 0; N < Ps.shape(3); ++N) { dd += std::norm(Pc(m0b + j, iq, M, N) - Ps(j, iq, M, N)); nn += std::norm(Ps(j, iq, M, N)); }
+                  pichk = std::sqrt(dd / nn);
+                }
               }
             } else {
               e_corr = std::get<1>(scf_loop(mb_state, dyson, erin, ft, solvers::mb_solver_t(&hf, &gw, &scr_eri), &iter_sol, 1, false, 1e-9, true));
@@ -587,7 +599,10 @@ namespace bdft_tests {
               vtx.set_pol_vertex("ladder", "w0_prev", nda::range(0, 4), -1, 1e-8, -1.0, -1.0, -1.0, "none");
               vtx.set_ladder_rung("dynamic", 1e-8, 30, 12, -1.0);
               vtx.set_ladder_dyn_gamma1_only(true); vtx.set_ladder_dyn_all_nu(true);
-              vtx.set_isdf_points("coqui_d3_winj_G.secpts.h5", false);
+              // 2026-09-22: section M normally runs on the G stage's frozen secondary points; with that dump absent
+              // (running a sub-gate stand-alone, e.g. the SAMPLED one on a fixture whose INJ chain is not set up)
+              // it selects its own -- the sub-gates below all compare runs with each other, not with the chain.
+              if (std::filesystem::exists("coqui_d3_winj_G.secpts.h5")) vtx.set_isdf_points("coqui_d3_winj_G.secpts.h5", false);
               vtx.set_sigma_pair(true, "dyn1", "dynamic", 1.0, true, false, "right");
               vtx.set_sigma_share(share);
               scr_eri.set_vertex(&vtx);
@@ -1123,7 +1138,10 @@ namespace bdft_tests {
           vtx.set_pol_vertex("ladder", "w0_prev", nda::range(0, 4), -1, 1e-8, -1.0, -1.0, -1.0, inject);
           vtx.set_ladder_rung("static", 1e-8, 30, 12, -1.0);
           vtx.set_ladder_dyn_gamma1_only(true); vtx.set_ladder_dyn_cut_r1(false);
-          vtx.set_isdf_points("coqui_d3_winj_G.secpts.h5", false); vtx.set_pol_interp("coqui_d3_winj_G.pol_wh_dyn.g1.h5", "gam1");
+          // 2026-09-22: section M normally runs on the G stage's frozen secondary points; with that dump absent
+              // (running a sub-gate stand-alone, e.g. the SAMPLED one on a fixture whose INJ chain is not set up)
+              // it selects its own -- the sub-gates below all compare runs with each other, not with the chain.
+              if (std::filesystem::exists("coqui_d3_winj_G.secpts.h5")) vtx.set_isdf_points("coqui_d3_winj_G.secpts.h5", false); vtx.set_pol_interp("coqui_d3_winj_G.pol_wh_dyn.g1.h5", "gam1");
           vtx.set_sigma_lff(mode, bub, scale, 1e-3, 1.0, "", with_static);   // the strong-mode cutoff (1e-8 admits the bubble's null directions: |Gamma - 1| ~ 1e4)
           if (auto *rm = std::getenv("COQUI_DYNBSE_TEST_RESOLVENT")) vtx.set_ladder_dyn_resolvent(rm);   // P7: inverse | lu
           if (auto *ac = std::getenv("COQUI_DYNBSE_TEST_SIGDYN_ACC")) vtx.set_sigma_dyn_acc(ac);   // P4-C14: split | single
