@@ -4707,6 +4707,20 @@ namespace solvers {
       vertex_secondary_detail::fold_Z_distributed(
           _W0_qPQ.value(), _t_qmP, nqpts_ibz, Np, _Nm, iq_gamma, false, no_head,
           _W0b_qmm.value(), mpi->comm);
+      {
+        // DIAGNOSTIC (2026-09-22): the Hermiticity and the imaginary content of the folded static rung per IBZ q -- the
+        // time-reversed transfers read it PQ-transposed (= conj for a Hermitian core); a non-Hermitian core breaks that identity
+        auto const &Wb = _W0b_qmm.value();
+        double herm_max = 0.0, im_max = 0.0;
+        for (long iq = 0; iq < nqpts_ibz; ++iq) {
+          double dh = 0.0, nn = 0.0, im = 0.0;
+          for (long P = 0; P < _Nm; ++P)
+            for (long Q = 0; Q < _Nm; ++Q) { dh += std::norm(Wb(iq, P, Q) - std::conj(Wb(iq, Q, P))); nn += std::norm(Wb(iq, P, Q)); im += Wb(iq, P, Q).imag() * Wb(iq, P, Q).imag(); }
+          herm_max = std::max(herm_max, std::sqrt(dh / std::max(nn, 1e-300)));
+          im_max = std::max(im_max, std::sqrt(im / std::max(nn, 1e-300)));
+        }
+        app_log(1, "  [W0 fold] W0bar per IBZ q: max ||W - W^dag||_F/||W||_F = {:.3e}, max ||Im W||_F/||W||_F = {:.3e}", herm_max, im_max);
+      }
     } else {
       // GLOBAL-aux reference path (small scale only, plan section 2.5): the "secondary"
       // rung IS the global one, N_m == Np, t = identity. Gather the distributed blocks
