@@ -173,6 +173,53 @@ namespace methods {
           app_log(4, "   - Maximum polynomial fit order: {}", fit_order);
           app_log(4, "   - Maximum number of q-points used for fit per direction: {}", fit_order+1);
           
+          // 2026-09-22 (the Si 4^3 time-reversal finding, notes/vertex_perf_plan.md): the six samples above are
+          // taken from the IBZ q LIST, so WHICH points the fit sees depends on how the mesh was reduced -- and
+          // eps^-1(q) = eps^-1(-q), so +b_i and -b_i are the SAME physical sample. On a Gamma-centered 4^3 mesh the
+          // full list gives +b_i two points (a linear fit in |q|^2) and -b_i one (no extrapolation at all, the
+          // zone-boundary point folds onto the positive side), and the average of the two mixes fit orders; a
+          // time-reversal reduction drops the -b_i half entirely, so every surviving direction extrapolates and the
+          // head jumps (Si 4^3: eps_inf 6.78 -> 8.27, which the ladder turns into 7 % of its correction). With
+          // "axis" in div_treatment the two sides of each axis are MERGED (deduplicated by |q|^2, closest first) and
+          // fitted once, which makes the head independent of the reduction. Opt-in: the default is untouched.
+          const bool axis_fold = (div_treatment.find("axis") != std::string::npos);
+          if (axis_fold) {
+            int naxis = 0;
+            constexpr std::array<const char *, 3> axis_labels = {"b1", "b2", "b3"};
+            for (int ax = 0; ax < 3; ++ax) {
+              if (two_dimension and ax >= 2) continue;
+              std::vector<std::pair<double, int>> merged;   // (|q|^2, index), closest first, one entry per |q|
+              for (int side = 0; side < 2; ++side)
+                for (int idx : closest_indices[2 * ax + side]) {
+                  const double q2 = Q_abs2(idx).real();
+                  bool seen = false;
+                  for (auto const &m : merged) if (std::abs(m.first - q2) < 1e-12) { seen = true; break; }
+                  if (not seen) merged.push_back({q2, idx});
+                }
+              std::sort(merged.begin(), merged.end());
+              if (merged.size() > size_t(fit_order + 1)) merged.resize(size_t(fit_order + 1));
+              if (merged.empty()) continue;
+              nda::array<ComplexType, 1> Q_filtered(merged.size());
+              nda::array<ComplexType, 2> eps_inv_filtered(niw, merged.size());
+              for (size_t i = 0; i < merged.size(); ++i) {
+                Q_filtered(i) = Q_abs2(merged[i].second);
+                eps_inv_filtered(nda::range::all, i) = eps_inv_wq(nda::range::all, merged[i].second);
+              }
+              app_log(2, "\n  Found {} distinct |q| along the {} axis for extrapolation (+/- merged).", merged.size(), axis_labels[ax]);
+              for (int n = 0; n < niw; ++n)
+                eps_inv_q0_w(n) += extrapolate_to_q0(Q_filtered, eps_inv_filtered(n, nda::range::all),
+                                                     int(merged.size()) - 1, (n == 0) ? true : false);
+              ++naxis;
+            }
+            utils::check(naxis > 0, "extrapolate_eps_inv_q0: no valid q-point found for extrapolation on any axis");
+            eps_inv_q0_w /= static_cast<double>(naxis);
+            if (div_treatment.find("metal") != std::string::npos) {
+              app_log(2, "\n Enforcing the static limit of the inverse dielectric function to 0 for metallic systems.\n");
+              eps_inv_q0_w(0) = -1.0;
+            }
+            return eps_inv_q0_w;
+          }
+
           int dim = 0;
           constexpr std::array<const char *, 6> direction_labels = {"+b1", "-b1", "+b2", "-b2", "+b3", "-b3"};
           for (int dir = 0; dir < 6; ++dir) {
