@@ -30,7 +30,10 @@
 #include "utilities/test_common.hpp"
 #include "methods/tests/test_common.hpp"
 #include "utilities/mpi_context.h"
+#include <filesystem>
+
 #include "mean_field/default_MF.hpp"
+#include "methods/GW/g0_div_utils.hpp"   // the q -> 0 head: the reduction-independence gate below
 
 #include "methods/ERI/mb_eri_context.h"
 #include "methods/ERI/eri_utils.hpp"
@@ -407,5 +410,82 @@ namespace bdft_tests {
     }
   }
 #endif
+
+} // bdft_tests
+
+namespace bdft_tests {
+
+  // ====================================================================================
+  // THE q -> 0 HEAD MUST NOT DEPEND ON HOW THE MESH WAS REDUCED (user ruling 2026-09-22:
+  // "we should always use the extrapolated head"; notes/vertex_perf_plan.md, the Si 4^3
+  // time-reversal hunt). eps^-1(q) = eps^-1(-q), so +b_i and -b_i carry the SAME physical
+  // sample: a head built from the IBZ q LIST with a per-DIRECTION fit order sees different
+  // point counts on differently reduced meshes of the same crystal, and moves (Si 4^3:
+  // 6.78 on the full mesh vs 8.27 with the time-reversal reduction, which the ladder turns
+  // into 7 % of its correction). The axis-folded default merges the two sides and fits once.
+  //
+  // Driven on a MODEL eps^-1(q) = -1 + 1/(1 + a |q|^2) evaluated on each mesh's own IBZ q
+  // list, so the exact head is known analytically (-1 + 1 = 0 ... the q -> 0 limit is 0 in
+  // this parameterization, i.e. eps_inv(0) = 0) and the three meshes must agree to the fit's
+  // own accuracy. Requires the untracked Si 4^3 fixtures (qe_si444_*); skipped without them.
+  // ====================================================================================
+  TEST_CASE("gw_head_reduction_independence", "[methods][gw][head]") {
+    auto &mpi_context = utils::make_unit_test_mpi_context();
+    const std::vector<std::string> fx = {"qe_si444_sym", "qe_si444_noinv", "qe_si444_trevonly"};
+    {
+      auto [outdir, prefix] = utils::utest_filename(fx[0]);
+      if (not std::filesystem::exists(outdir + prefix + ".coqui.h5")) {
+        SUCCEED("gw_head_reduction_independence skipped: the Si 4^3 fixtures are not present.");
+        return;
+      }
+    }
+    const double a_model = 3.0;
+    std::vector<double> head_axis, head_perdir;
+    std::vector<long> nq_ibz;
+    for (auto const &f : fx) {
+      auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, f));
+      const long nq = mf->nqpts_ibz();
+      nq_ibz.push_back(nq);
+      nda::array<ComplexType, 2> eps_inv(1, nq);
+      for (long iq = 0; iq < nq; ++iq) {
+        auto q = mf->Qpts_ibz(iq);
+        const double q2 = q(0) * q(0) + q(1) * q(1) + q(2) * q(2);
+        eps_inv(0, iq) = ComplexType(-1.0 + 1.0 / (1.0 + a_model * q2), 0.0);   // smooth, even in q, exact value 0 at q = 0
+      }
+      head_axis.push_back(methods::solvers::div_utils::extrapolate_eps_inv_q0(eps_inv, *mf, "gygi")(0).real());
+      head_perdir.push_back(methods::solvers::div_utils::extrapolate_eps_inv_q0(eps_inv, *mf, "gygi_perdir")(0).real());
+    }
+    double spread_axis = 0.0, spread_perdir = 0.0;
+    for (size_t i = 1; i < head_axis.size(); ++i) {
+      spread_axis = std::max(spread_axis, std::abs(head_axis[i] - head_axis[0]));
+      spread_perdir = std::max(spread_perdir, std::abs(head_perdir[i] - head_perdir[0]));
+    }
+    app_log(1, "gw head: the model eps^-1 head at q -> 0 (exact 0) on {} ({} IBZ q), {} ({}), {} ({}): "
+               "AXIS-FOLDED (the default) {:.6e} / {:.6e} / {:.6e} -> spread {:.2e}; per-direction (historic) "
+               "{:.6e} / {:.6e} / {:.6e} -> spread {:.2e}",
+            fx[0], nq_ibz[0], fx[1], nq_ibz[1], fx[2], nq_ibz[2],
+            head_axis[0], head_axis[1], head_axis[2], spread_axis,
+            head_perdir[0], head_perdir[1], head_perdir[2], spread_perdir);
+    REQUIRE(spread_axis < 1e-10);            // the ruling: one head, whatever the reduction
+    REQUIRE(spread_perdir > 1e-4);           // the defect it replaces is real, not a rounding difference
+    // ... and on a mesh with ONE distinct |q| per axis (every 2x2x2 fixture) the two forms are the SAME fit, so
+    // changing the default cannot move any small-fixture number. Measured, not assumed.
+    {
+      auto mf2 = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_si222_nosym"));
+      const long nq2 = mf2->nqpts_ibz();
+      nda::array<ComplexType, 2> e2(1, nq2);
+      for (long iq = 0; iq < nq2; ++iq) {
+        auto q = mf2->Qpts_ibz(iq);
+        const double q2 = q(0) * q(0) + q(1) * q(1) + q(2) * q(2);
+        e2(0, iq) = ComplexType(-1.0 + 1.0 / (1.0 + a_model * q2), 0.0);
+      }
+      const double h_ax = methods::solvers::div_utils::extrapolate_eps_inv_q0(e2, *mf2, "gygi")(0).real();
+      const double h_pd = methods::solvers::div_utils::extrapolate_eps_inv_q0(e2, *mf2, "gygi_perdir")(0).real();
+      app_log(1, "gw head: on qe_si222_nosym ({} IBZ q, one distinct |q| per axis) the two forms agree: {:.12e} vs {:.12e}",
+              nq2, h_ax, h_pd);
+      REQUIRE(std::abs(h_ax - h_pd) < 1e-14);
+    }
+    mpi_context->comm.barrier();
+  }
 
 } // bdft_tests
