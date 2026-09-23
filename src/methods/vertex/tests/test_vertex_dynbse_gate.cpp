@@ -741,6 +741,7 @@ namespace bdft_tests {
             if (auto_mode) sd_auto = nsamp;
             else { sd_nodes = {m0b}; for (long j : {4l, 8l, 12l, 16l, hm}) { sd_nodes.push_back(m0b + j); sd_nodes.push_back(m0b - j); } }
             auto [cd1s, md1s, dd1s, kd1s] = run_p("D1S", 2, "dyn1", "dynamic", 1.0, S_d1s);
+            const long used_nodes = auto_mode ? sd_auto : long(sd_nodes.size()), used_rank = sd_rank;   // the reset below clears them
             sd_nodes.clear(); sd_fit.clear(); sd_rank = 0; sd_auto = 0;
             double num = 0.0, den = 0.0, mx = 0.0;
             for (long it = 0; it < S_d1d.shape(0); ++it)
@@ -753,7 +754,7 @@ namespace bdft_tests {
                     }
             app_log(1, "dynbse_readout LFF-Sigma SAMPLED gate: dyn1 on {} of {} nodes ({}; K = {}, per-p U/T bases) vs all nodes: rel Frobenius {:.3e} (max |d| {:.3e}); "
                        "e_corr all {:+.10f} sampled {:+.10f} (R0 {:+.10f}); max|dSigma| all {:.6e} sampled {:.6e}; anti-Hermitian all {:.2e} sampled {:.2e}",
-                    auto_mode ? sd_auto : long(sd_nodes.size()), nwb, auto_mode ? "chosen by the dump's nu-modes, P14b" : "the fixed evenly spread set", sd_rank,
+                    used_nodes, nwb, auto_mode ? "chosen by the dump's nu-modes, P14b" : "the fixed evenly spread set", used_rank,
                     std::sqrt(num) / std::max(std::sqrt(den), 1e-300), mx, cd1d, cd1s, cr0s, md1d[0], md1s[0], md1d[1], md1s[1]);
             REQUIRE(den > 0.0);
             REQUIRE(std::sqrt(num) / std::sqrt(den) < 5e-2);
