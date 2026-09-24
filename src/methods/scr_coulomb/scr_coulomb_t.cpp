@@ -247,11 +247,18 @@ namespace solvers {
         }
       }
     }
-    // ISDF-Vertex / scGW-tilde: the vertex and ladder machinery is HOST-only until it is ported
-    // (gpu-merge plan, step 4). Refuse the device path here rather than deep inside a template.
+    // ISDF-Vertex / scGW-tilde on the DEVICE path -- increment G-1, the host bridge
+    // (notes/gpu_port_plan.md section 4): the vertex machinery is host code that reads the host
+    // shared-memory G / Sigma (host-resident on the device path by the gpu design), the host
+    // mirror of W and host copies of Pi. Keep the W mirror alive (update_w's tail builds it only
+    // on request) whenever a vertex is attached; Pi is mirrored inside eval_Pi_qdep's hooks.
+    // The scGW-tilde C4 head (div_treatment = "cvv") has its own host machinery and is not bridged.
     if constexpr (MEM != HOST_MEMORY) {
-      utils::check(_vertex == nullptr or (not _vertex->active() and not _vertex->pol_vertex_active()),
-                   "scr_coulomb_t::update_w<DEVICE_MEMORY>: the ISDF-Vertex / ladder machinery is host-only.");
+      if (_vertex != nullptr and (_vertex->active() or _vertex->pol_vertex_active())) {
+        if (not mb_state.keep_host_W)
+          app_log(1, "  [ISDF-Vertex] device path: keeping the host mirror of W for the vertex (keep_host_W = true).");
+        mb_state.keep_host_W = true;
+      }
       utils::check(_div_treatment != "cvv",
                    "scr_coulomb_t::update_w<DEVICE_MEMORY>: div_treatment = \"cvv\" is host-only.");
     }
@@ -2606,13 +2613,37 @@ namespace solvers {
         inject_pol_ladder(mb_state, thc, dPi);
     };
 
-    // The hooks are HOST-only (the vertex reads host darrays); under DEVICE they are no-ops by
-    // construction -- update_w<DEVICE_MEMORY> already refuses an active vertex, so nothing is lost.
-    auto vertex_hooks_rpa = [&](auto &dPi_rpa) {      // RPA-only Pi: before ANY correction
+    // The hooks are host code on host darrays. Under DEVICE (increment G-1, the host bridge --
+    // notes/gpu_port_plan.md section 4) they run on a HOST MIRROR of Pi: one D2H copy before the
+    // hooks, one H2D copy back after the hooks that modify Pi; the mirror is built only when a hook
+    // has something to do. The same (grid, global shape, block size) reproduces the same local
+    // block on every rank, which the check below pins.
+    const bool vertex_hooks_needed = pol_readout or
+        (_vertex != nullptr and (_vertex->active() or _vertex->needs_w0()));
+    [[maybe_unused]] auto host_mirror_of = [&](auto &dPi) {
+      using math::nda::make_distributed_array;
+      auto h = make_distributed_array<nda::array<ComplexType, 4>>(*dPi.communicator(), dPi.grid(),
+                                                                  dPi.global_shape(), dPi.block_size());
+      utils::check(h.local_shape() == dPi.local_shape() and h.origin() == dPi.origin(),
+                   "eval_Pi_qdep: the host mirror of Pi does not reproduce the device block layout.");
+      h.local() = nda::to_host(dPi.local());
+      return h;
+    };
+    auto vertex_hooks_rpa = [&](auto &dPi_rpa) {      // RPA-only Pi: before ANY correction (read-only hooks)
       if constexpr (MEM == HOST_MEMORY) { build_vertex_W0(dPi_rpa); build_pol_ladder_kernel(dPi_rpa); }
+      else if (vertex_hooks_needed) {
+        auto h = host_mirror_of(dPi_rpa);
+        build_vertex_W0(h); build_pol_ladder_kernel(h);
+      }
     };
     auto vertex_hooks_post = [&](auto &dPi) {         // Pi = Pi_RPA (+ corrections) + Pi^C; injection last
       if constexpr (MEM == HOST_MEMORY) { add_vertex_Pi_C(dPi); inject_pol_tier(dPi); }
+      else if (vertex_hooks_needed) {
+        auto h = host_mirror_of(dPi);
+        add_vertex_Pi_C(h); inject_pol_tier(h);
+        dPi.local() = memory::to_memory_space<MEM>(h.local());
+        utils::device_sync();
+      }
     };
 
     if constexpr (MEM == HOST_MEMORY) {

@@ -132,9 +132,15 @@ namespace methods {
                             mb_state.eps_inv_head.value());
       }
 
-      // ISDF-Vertex / LFF-Sigma consumers: HOST-only (the vertex routines are not ported to the
-      // device yet, notes/vertex_perf_plan.md "gpu port"). On the device path they must be inactive.
-      if constexpr (MEM == HOST_MEMORY) {
+      // ISDF-Vertex / LFF-Sigma consumers: host code on the host shared-memory G / Sigma and the host
+      // mirror of W. On the DEVICE path (increment G-1, notes/gpu_port_plan.md section 4) they run
+      // unchanged: G / Sigma stay host-resident by the gpu design and scr_coulomb_t::update_w keeps
+      // the W mirror (keep_host_W) whenever a vertex is attached.
+      if constexpr (MEM != HOST_MEMORY) {
+        utils::check(_vertex == nullptr or not _vertex->active() or mb_state.dW_qtPQ.has_value(),
+                     "gw_t::evaluate<DEVICE_MEMORY>: the vertex needs the host mirror of W (keep_host_W).");
+      }
+      {
       // ISDF-Vertex: second-order-exchange self-energy cut Sigma^C, accumulated
       // into sSigma_tskij on top of the GW self-energy. When no active vertex is
       // attached this is a strict no-op -- no allocation, no arithmetic -- so the
@@ -251,14 +257,6 @@ namespace methods {
                 b0, b0 + nb, dmax, smax, dmax / std::max(smax, 1e-300));
         mb_state.dSigma_pair_tskab.reset();
       }
-      } else {
-        utils::check(_vertex == nullptr or not _vertex->active(),
-                     "gw_t::evaluate<DEVICE_MEMORY>: the ISDF-Vertex Sigma^C cut is host-only.");
-        utils::check(not mb_state.dWsig_qtPQ.has_value() and not mb_state.dWsig_inf_qPQ.has_value() and
-                     not mb_state.dSigma_pair_tskab.has_value(),
-                     "gw_t::evaluate<DEVICE_MEMORY>: the LFF-Sigma corrections are host-only.");
-        _sigma_lff_dmax = _sigma_lff_smax = _sigma_lff_dfmax = 0.0;
-        _sigma_pair_dmax = _sigma_pair_smax = 0.0;
       }
       _Timer.stop("TOTAL");
 
