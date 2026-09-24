@@ -26,6 +26,9 @@
 #include <vector>
 
 #include "methods/vertex/vertex_debug.hpp"
+#include "nda/nda.hpp"
+#include "nda/blas.hpp"     // before nda/lapack.hpp: its CUDA branch (geqrf_batched) names nda::blas::device,
+                            // which only blas/interface/cublas_interface.hpp declares (CUDA build, gcc 13)
 #include "nda/lapack.hpp"
 #include "nda/linalg/eigenelements.hpp"
 
