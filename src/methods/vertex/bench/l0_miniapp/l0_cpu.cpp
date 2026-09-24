@@ -198,6 +198,173 @@ void l0_ref(inputs const &in, outputs &out, int nthreads) {
   }
 }
 
+
+// ============================================================================================
+// OPTIMIZED: same arithmetic, three changes the miniapp exists to test.
+//   O1  the per-(pole, component) blocks are READ IN PLACE from the gemm output (the reference
+//       copies them out first: ng * ncomp * blk complex per k of pure memory traffic). The
+//       gemm output is (x, c, r, y), so the block is a strided view, not contiguous -- the
+//       scatter loops x outermost and walks (r, y) contiguously inside.
+//   O2  the scalar weights of mulU / mulT depend only on (pole, component), not on (x, r, y):
+//       hoist them out of the element loop, so the inner loop is a fused multiply-add into at
+//       most three contiguous accumulator blocks.
+//   O3  the three accumulator writes of a component are done in one pass over the block, so
+//       each V element is read once instead of once per target.
+// ============================================================================================
+void l0_kernel(inputs const &in, outputs &out, int nthreads, bool materialize_l);
+void l0_opt(inputs const &in, outputs &out, int nthreads) { l0_kernel(in, out, nthreads, false); }
+void l0_prod(inputs const &in, outputs &out, int nthreads) { l0_kernel(in, out, nthreads, true); }
+void l0_kernel(inputs const &in, outputs &out, int nthreads, bool materialize_l) {
+  dims const d = in.d;
+  const long nc = d.nc, nR = d.nR, np = d.np, ng = d.ng, nk = d.nk, ncomp = d.ncomp();
+  const long blk = nc * nR * nc, ry = nR * nc, W = nc * ncomp * nR * nc;
+  const size_t Wz = size_t(W);            // a bare cast of a single identifier parses as a declaration
+  const cplx inu = in.inu;
+  std::fill(out.Ffam.begin(), out.Ffam.end(), cplx(0.0));
+  std::fill(out.Fsum.begin(), out.Fsum.end(), cplx(0.0));
+
+#pragma omp parallel for schedule(dynamic, 1) num_threads(nthreads)
+  for (long ik = 0; ik < nk; ++ik) {
+    std::vector<cplx> Vt(Wz), Pj(Wz), Qj(Wz), Bj(Wz);
+    std::vector<cplx> gjT(size_t(nc * nc)), glT(size_t(nc * nc)), Gh(size_t(nc * nc));
+    std::vector<cplx> mVb(size_t(nc * ncomp * ry)), tVb(size_t(nc * ncomp * ry));   // production's l-pass blocks
+    const size_t asz = size_t(2 * np) * size_t(blk);
+    std::vector<cplx> AU(asz, cplx(0.0)), AT(asz, cplx(0.0)), M2(asz, cplx(0.0)),
+                      A1(asz, cplx(0.0)), A3(asz, cplx(0.0));
+    for (long x = 0; x < nc; ++x)
+      for (long r = 0; r < nR; ++r)
+        for (long y = 0; y < nc; ++y) {
+          Vt[size_t(((x * ncomp + 0) * nR + r) * nc + y)] = in.Xcst[size_t(((ik * nc + x) * nc + y) * nR + r)];
+          for (long a = 0; a < np; ++a) {
+            const size_t xu = size_t((((0 * np + a) * nk + ik) * nc + x) * nc + y) * size_t(nR) + size_t(r);
+            const size_t xt = size_t((((1 * np + a) * nk + ik) * nc + x) * nc + y) * size_t(nR) + size_t(r);
+            Vt[size_t(((x * ncomp + 1 + a) * nR + r) * nc + y)] = in.Xfam[xu];
+            Vt[size_t(((x * ncomp + 1 + np + a) * nR + r) * nc + y)] = in.Xfam[xt];
+          }
+        }
+
+    // O2/O3: one pass over the strided block, up to three contiguous targets, weights hoisted
+    auto scatter3 = [&](cplx const *src, long part, cplx w0, cplx *A0, cplx w1, cplx *A1p, cplx w2, cplx *A2p) {
+      for (long x = 0; x < nc; ++x) {
+        cplx const *v = src + x * ncomp * ry;          // (x, c, ., .) -- c fixed by the caller
+        const long o = x * ry;
+        if (A2p) {
+          for (long e = 0; e < ry; ++e) { const cplx z = v[e]; A0[o + e] += w0 * z; A1p[o + e] += w1 * z; A2p[o + e] += w2 * z; }
+        } else if (A1p) {
+          for (long e = 0; e < ry; ++e) { const cplx z = v[e]; A0[o + e] += w0 * z; A1p[o + e] += w1 * z; }
+        } else {
+          for (long e = 0; e < ry; ++e) A0[o + e] += w0 * v[e];
+        }
+      }
+    };
+    auto base = [&](std::vector<cplx> &A, long part, long node) { return A.data() + size_t((part * np + node) * blk); };
+
+    auto do_pole = [&](long pole, cplx const *Qsrc, cplx const *Bsrc, cplx sU, cplx sT) {
+      const long nj = in.gnode[size_t(pole)];
+      const double ej = in.epsG[size_t(pole)];
+      for (long c = 0; c < ncomp; ++c) {
+        const long part = (c == 0) ? 1 : 0;
+        cplx const *q = Qsrc + c * ry;
+        cplx const *bb = Bsrc + c * ry;
+        // ---- mulU on sU * q ----
+        if (c == 0) scatter3(q, part, sU, base(AU, part, nj), cplx(0.0), nullptr, cplx(0.0), nullptr);
+        else if (c <= np) {
+          const long a = c - 1;
+          if (a == nj) scatter3(q, part, sU, base(M2, part, nj), cplx(0.0), nullptr, cplx(0.0), nullptr);
+          else {
+            const cplx w = sU * cplx(1.0 / (ej - in.eps[size_t(a)]));
+            scatter3(q, part, w, base(AU, part, nj), -w, base(AU, part, a), cplx(0.0), nullptr);
+          }
+        } else {
+          const long a = c - 1 - np;
+          if (a == nj) scatter3(q, part, sU, base(A1, part, nj), cplx(0.0), nullptr, cplx(0.0), nullptr);
+          else {
+            const double ea = in.eps[size_t(a)];
+            const cplx w = cplx(1.0 / (ea - ej)), dd = cplx(ej - ea) + inu;
+            const cplx wd = w / dd, wt = w - inu * wd;
+            scatter3(q, part, sU * wt, base(AT, part, a), -sU * wd, base(AU, part, nj), sU * wd, base(AU, part, a));
+          }
+        }
+        // ---- mulT on sT * b ----
+        if (c == 0) scatter3(bb, part, sT, base(AT, part, nj), cplx(0.0), nullptr, cplx(0.0), nullptr);
+        else if (c <= np) {
+          const long a = c - 1;
+          const double ea = in.eps[size_t(a)];
+          const cplx w = cplx(1.0 / (ea - ej)), dd = cplx(ej - ea) + inu;
+          const cplx wd = w / dd, wt = w - inu * wd;
+          scatter3(bb, part, sT * wt, base(AT, part, nj), sT * wd, base(AU, part, a), -sT * wd, base(AU, part, nj));
+        } else {
+          const long a = c - 1 - np;
+          if (a == nj) scatter3(bb, part, sT, base(A3, part, nj), cplx(0.0), nullptr, cplx(0.0), nullptr);
+          else {
+            const cplx w = sT * cplx(1.0 / (in.eps[size_t(a)] - ej));
+            scatter3(bb, part, w, base(AT, part, a), -w, base(AT, part, nj), cplx(0.0), nullptr);
+          }
+        }
+      }
+    };
+
+    for (long j = 0; j < ng; ++j) {
+      for (long x = 0; x < nc; ++x)
+        for (long y = 0; y < nc; ++y) {
+          gjT[size_t(x * nc + y)] = in.gk[size_t(((j * nk + ik) * nc + y) * nc + x)];
+          glT[size_t(x * nc + y)] = in.gkq[size_t(((j * nk + ik) * nc + y) * nc + x)];
+          Gh[size_t(x * nc + y)] = in.Ghat[size_t(((ik * ng + j) * nc + x) * nc + y)];
+        }
+      gemm_rm(nc, ncomp * nR * nc, nc, gjT.data(), Vt.data(), Pj.data());
+      gemm_rm(nc * ncomp * nR, nc, nc, Pj.data(), Gh.data(), Qj.data());
+      gemm_rm(nc * ncomp * nR, nc, nc, Pj.data(), glT.data(), Bj.data());
+      do_pole(j, Qj.data(), Bj.data(), cplx(1.0), cplx(1.0));       // O1: read in place
+    }
+    for (long l = 0; l < ng; ++l) {
+      for (long x = 0; x < nc; ++x)
+        for (long y = 0; y < nc; ++y) {
+          glT[size_t(x * nc + y)] = in.gkq[size_t(((l * nk + ik) * nc + y) * nc + x)];
+          Gh[size_t(x * nc + y)] = in.Gtil[size_t(((ik * ng + l) * nc + x) * nc + y)];
+        }
+      gemm_rm(nc, ncomp * nR * nc, nc, Gh.data(), Vt.data(), Pj.data());
+      gemm_rm(nc * ncomp * nR, nc, nc, Pj.data(), glT.data(), Qj.data());
+      if (not materialize_l) {
+        do_pole(l, Qj.data(), Qj.data(), cplx(-1.0), inu);          // -U_l R_l and +i nu T_l R_l, scalars folded
+      } else {
+        // the production path: build mV = -R and tV = i nu R into their own blocks first
+        for (long c = 0; c < ncomp; ++c)
+          for (long x = 0; x < nc; ++x)
+            for (long e = 0; e < ry; ++e) {
+              const cplx v = Qj[size_t((x * ncomp + c) * ry + e)];
+              mVb[size_t((x * ncomp + c) * ry + e)] = -v;      // same (x, c, ry) layout do_pole reads
+              tVb[size_t((x * ncomp + c) * ry + e)] = inu * v;
+            }
+        do_pole(l, mVb.data(), tVb.data(), cplx(1.0), cplx(1.0));
+      }
+    }
+
+    for (int part = 0; part < 2; ++part)
+      for (long n = 0; n < np; ++n) {
+        const cplx wh(in.fhalf[size_t(n)]), w1(in.fd1[size_t(n)]);
+        cplx const *au = AU.data() + size_t((part * np + n) * blk);
+        cplx const *at = AT.data() + size_t((part * np + n) * blk);
+        cplx const *m2 = M2.data() + size_t((part * np + n) * blk);
+        for (long x = 0; x < nc; ++x)
+          for (long r = 0; r < nR; ++r)
+            for (long y = 0; y < nc; ++y) {
+              const long e = (x * nR + r) * nc + y;
+              const size_t f0 = size_t((((0 * np + n) * nk + ik) * nc + x) * nc + y) * size_t(nR) + size_t(r);
+              const size_t f1 = size_t((((1 * np + n) * nk + ik) * nc + x) * nc + y) * size_t(nR) + size_t(r);
+              out.Ffam[f0] += au[e];
+              out.Ffam[f1] += at[e];
+              if (part == 0) out.Fsum[size_t(((ik * nc + x) * nc + y) * nR + r)] += wh * au[e] + w1 * m2[e];
+              if (m2[e] != cplx(0.0))
+                for (long c = 0; c < np; ++c) {
+                  const cplx dc = in.Dsq[size_t(n * np + c)];
+                  if (dc == cplx(0.0)) continue;
+                  out.Ffam[size_t((((0 * np + c) * nk + ik) * nc + x) * nc + y) * size_t(nR) + size_t(r)] += dc * m2[e];
+                }
+            }
+      }
+  }
+}
+
 } // namespace l0mini
 
 int main(int argc, char **argv) {
@@ -213,20 +380,41 @@ int main(int argc, char **argv) {
   double gf, gb; cost_model(d, gf, gb);
   std::printf("[cost model] %.1f GFLOP of skinny gemm, %.1f GB of scatter traffic per application\n", gf, gb);
 
+  std::string which = "both";
+  for (int i = 1; i < argc; ++i)
+    if (std::string(argv[i]).rfind("--kernel=", 0) == 0) which = argv[i] + 9;
+
   inputs in; in.build(d);
-  outputs ref; ref.alloc(d);
+  outputs ref, opt; ref.alloc(d); opt.alloc(d);
   const int reps = 3;
-  double best = 1e30;
-  for (int it = 0; it < reps; ++it) {
-    auto t0 = std::chrono::steady_clock::now();
-    l0_ref(in, ref, nthreads);
-    const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    best = std::min(best, s);
-    std::printf("[ref] threads %d, application %d: %.3f s\n", nthreads, it, s);
+  auto bench = [&](const char *tag, void (*fn)(inputs const &, outputs &, int), outputs &o) {
+    double best = 1e30;
+    for (int it = 0; it < reps; ++it) {
+      auto t0 = std::chrono::steady_clock::now();
+      fn(in, o, nthreads);
+      const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+      best = std::min(best, s);
+      std::printf("[%s] threads %d, application %d: %.3f s\n", tag, nthreads, it, s);
+    }
+    double chk = 0.0;
+    for (auto const &z : o.Ffam) chk += std::norm(z);
+    std::printf("[%s] BEST %.3f s -> %.1f GFLOP/s, %.1f GB/s effective; |F|^2 = %.10e\n",
+                tag, best, gf / best, gb / best, chk);
+    return best;
+  };
+  double tref = 0.0, topt = 0.0;
+  // "prod" is the production kernel's structure (views in the j pass, materialised blocks in the l pass);
+  // "opt" folds the l-pass scalars into the weights and drops that materialisation; "ref" is the naive form.
+  outputs prod; prod.alloc(d);
+  double tprod = 0.0;
+  if (which == "ref" or which == "both") tref = bench("ref", l0_ref, ref);
+  if (which == "prod" or which == "both") tprod = bench("prod", l0_prod, prod);
+  if (which == "opt" or which == "both") topt = bench("opt", l0_opt, opt);
+  if (which == "both") {
+    std::printf("[check] opt vs ref  : F %.3e, Fsum %.3e\n", rel_diff(opt.Ffam, ref.Ffam), rel_diff(opt.Fsum, ref.Fsum));
+    std::printf("[check] prod vs ref : F %.3e, Fsum %.3e\n", rel_diff(prod.Ffam, ref.Ffam), rel_diff(prod.Fsum, ref.Fsum));
+    std::printf("[speedup] opt / prod = %.2fx   (THE portable number: prod == what dynbse.hpp does today)\n", tprod / topt);
+    std::printf("[speedup] opt / ref  = %.2fx\n", tref / topt);
   }
-  std::printf("[ref] BEST %.3f s -> %.1f GFLOP/s, %.1f GB/s effective\n", best, gf / best, gb / best);
-  double chk = 0.0;
-  for (auto const &z : ref.Ffam) chk += std::norm(z);
-  std::printf("[ref] |F|^2 = %.10e\n", chk);
   return 0;
 }
