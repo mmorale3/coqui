@@ -149,7 +149,7 @@ namespace methods {
        * @param F_skij
        * @param thc
        */
-      template<nda::MemoryArray AF_t>
+      template<MEMORY_SPACE MEM = HOST_MEMORY, nda::MemoryArray AF_t>
       void thc_hf_Xqindep(const nda::MemoryArrayOfRank<4> auto &Dm_skij,
                           sArray_t<AF_t> &sF_skij, THC_ERI auto &thc,
                           const nda::MemoryArrayOfRank<4> auto &S_skij,

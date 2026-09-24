@@ -413,7 +413,7 @@ inline void ensure_checkpoint(std::shared_ptr<mf::MF> mf, std::string const& out
  *                 (+ _coeffs, _qabs, _eps, _residual). Every existing line and dataset is untouched.
  *  - eps_inf_fit_npts: 3  the number of smallest nonzero |q| used by eps_inf_fit (>= 2).
  */
-template<typename eri_t>
+template<MEMORY_SPACE MEM, typename eri_t>
 void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
 {
   auto mf = eri.corr_eri->get().MF();
@@ -421,6 +421,12 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
   if (mpi->comm.size()%mpi->node_comm.size()!=0) {
     APP_ABORT("MBPT: number of processors on each node should be the same.");
   }
+  // Only the THC corr-ERI path has a device implementation of update_w /
+  // evaluate. For Cholesky corr-ERI, fall back to HOST_MEMORY so scf_loop
+  // resolves to the host instantiation (which is the only one defined).
+  using corr_t = std::decay_t<decltype(eri.corr_eri->get())>;
+  constexpr MEMORY_SPACE SCF_MEM =
+      std::is_same_v<corr_t, thc_reader_t> ? MEM : HOST_MEMORY;
   std::string err = std::string("mbpt - Incorrect input - ");
   auto div_treatment = io::get_value_with_default<std::string>(pt, "div_treatment", "gygi");
   auto hf_div_treatment = io::get_value_with_default<std::string>(pt, "hf_div_treatment", "gygi");
@@ -793,13 +799,13 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
       auto trans_home_cell = io::get_value_with_default<bool>(pt,"translate_home_cell",false);
 
       MBState mb_state(ft, output, mf, wannier_file, trans_home_cell);
-      scf_loop(mb_state, dyson, eri, ft, mb_solver_t(&hf, &gw, &scr_eri),
-               iter_solver.get(), niter, restart, conv_thr, const_mu,
-               greens_func_source, greens_func_iteration);
+      scf_loop<SCF_MEM>(mb_state, dyson, eri, ft, mb_solver_t(&hf, &gw, &scr_eri),
+                    iter_solver.get(), niter, restart, conv_thr, const_mu,
+                    greens_func_source, greens_func_iteration);
 
       auto dump_w_to_h5 = io::get_value_with_default<bool>(pt,"dump_w_to_h5", false);
       if (dump_w_to_h5) {
-        auto& W_qtPQ = mb_state.dW_qtPQ.value();
+        auto& W_qtPQ = mb_state.W_host();
         if (mb_state.mpi->comm.root()) {
           h5::file file("thc_screened_interaction.h5", 'w');
           h5::group grp(file);
@@ -812,13 +818,13 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
     } else {
 
       MBState mb_state(mpi, ft, output);
-      scf_loop(mb_state, dyson, eri, ft, mb_solver_t(&hf, &gw, &scr_eri),
-               iter_solver.get(), niter, restart, conv_thr, const_mu,
-               greens_func_source, greens_func_iteration);
+      scf_loop<SCF_MEM>(mb_state, dyson, eri, ft, mb_solver_t(&hf, &gw, &scr_eri),
+                    iter_solver.get(), niter, restart, conv_thr, const_mu,
+                    greens_func_source, greens_func_iteration);
 
       auto dump_w_to_h5 = io::get_value_with_default<bool>(pt,"dump_w_to_h5", false);
       if (dump_w_to_h5) {
-        auto& W_qtPQ = mb_state.dW_qtPQ.value();
+        auto& W_qtPQ = mb_state.W_host();
         if (mb_state.mpi->comm.root()) {
           h5::file file("thc_screened_interaction.h5", 'w');
           h5::group grp(file);
@@ -1479,7 +1485,7 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
 }
 
 
-template<typename eri_t>
+template<MEMORY_SPACE MEM, typename eri_t>
 void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
           nda::array<ComplexType, 5> const& projector_ksIai,
           nda::array<long, 3> const& band_window,
@@ -1491,6 +1497,9 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
   if (mpi->comm.size()%mpi->node_comm.size()!=0) {
     APP_ABORT("MBPT: number of processors on each node should be the same.");
   }
+  using corr_t = std::decay_t<decltype(eri.corr_eri->get())>;
+  constexpr MEMORY_SPACE SCF_MEM =
+      std::is_same_v<corr_t, thc_reader_t> ? MEM : HOST_MEMORY;
   std::string err = std::string("mbpt - Incorrect input - ");
   auto div_treatment = io::get_value_with_default<std::string>(pt, "div_treatment", "gygi");
   auto hf_div_treatment = io::get_value_with_default<std::string>(pt, "hf_div_treatment", "gygi");
@@ -1845,9 +1854,9 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
       local_polarizabilities.reset();
     }
 
-    scf_loop(mb_state, dyson, eri, ft, mb_solver_t(&hf, &gw, &scr_eri),
-             iter_solver.get(), niter, restart, conv_thr, const_mu,
-             greens_func_source, greens_func_iteration);
+    scf_loop<SCF_MEM>(mb_state, dyson, eri, ft, mb_solver_t(&hf, &gw, &scr_eri),
+                  iter_solver.get(), niter, restart, conv_thr, const_mu,
+                  greens_func_source, greens_func_iteration);
 
   } else if (solver_type == "qpgw") {
 
@@ -2630,17 +2639,29 @@ template void downfolding_2e(
 template void hf_downfold(thc_reader_t&, ptree const&);
 template void gw_downfold(thc_reader_t&, ptree&);
 
-#define MBPT_INST(HF, HARTREE, EXCHANGE, CORR) \
-template void mbpt(std::string, \
+#define MBPT_INST_MEM(MEM, HF, HARTREE, EXCHANGE, CORR) \
+template void mbpt<MEM>(std::string, \
      mb_eri_t<HF, HARTREE, EXCHANGE, CORR>&,    \
      ptree const&);                             \
-template void mbpt(std::string, \
+template void mbpt<MEM>(std::string, \
      mb_eri_t<HF, HARTREE, EXCHANGE, CORR>&, \
      ptree const&,                             \
      nda::array<ComplexType, 5> const&,  \
      nda::array<long, 3> const&,   \
      nda::array<RealType, 2> const&,           \
      std::optional<std::map<std::string, nda::array<ComplexType, 5> > >);
+
+// mbpt internally maps Cholesky-corr to scf_loop<HOST_MEMORY> via SCF_MEM,
+// so DEVICE instantiation is safe for ALL ERI combinations (the body
+// just routes accordingly).
+#if defined(ENABLE_DEVICE)
+#  define MBPT_INST(HF, HARTREE, EXCHANGE, CORR) \
+   MBPT_INST_MEM(HOST_MEMORY, HF, HARTREE, EXCHANGE, CORR) \
+   MBPT_INST_MEM(DEVICE_MEMORY, HF, HARTREE, EXCHANGE, CORR)
+#else
+#  define MBPT_INST(HF, HARTREE, EXCHANGE, CORR) \
+   MBPT_INST_MEM(HOST_MEMORY, HF, HARTREE, EXCHANGE, CORR)
+#endif
 
 // All combinations of thc/chol for 4 eri slots
   MBPT_INST(thc_reader_t, thc_reader_t, thc_reader_t, thc_reader_t)

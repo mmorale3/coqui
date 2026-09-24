@@ -117,7 +117,7 @@ namespace bdft_tests {
           utils::check(kib == kib_src,
                        "scdiag: ks_to_k({}, {}) = {} left the star ({} vs {}).",
                        js, k, ksrc, kib, kib_src);
-          csrmm(cplx(1.0), *Dsp, E, cplx(0.0), Dcols);   // Dcols(nbnd, nb) = D . E
+          csrmm<'N'>(cplx(1.0), *Dsp, E, cplx(0.0), Dcols);   // Dcols(nbnd, nb) = D . E
           // restrict to the measured band block (exact when the block is D-closed)
           nda::array<cplx, 2> Dblk(nb, nb);
           for (long a = 0; a < nb; ++a)

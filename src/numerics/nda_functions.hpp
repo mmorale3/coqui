@@ -322,19 +322,60 @@ void gemv(A const &a, B const &b, C &&c)
 }
 
 template <typename A, typename B, MemoryMatrix C>
-    requires((MemoryMatrix<A> or is_conj_array_expr<A>) and                        
-             (MemoryMatrix<B> or is_conj_array_expr<B>) and                        
+    requires((MemoryMatrix<A> or is_conj_array_expr<A>) and
+             (MemoryMatrix<B> or is_conj_array_expr<B>) and
              have_same_value_type_v<A, B, C> and is_blas_lapack_v<get_value_t<A>>)
-void gemm(A const &a, B const &b, C &&c) 
+void gemm(A const &a, B const &b, C &&c)
 {
   if constexpr (is_conj_array_expr<A>) {
-    auto mat = std::get<0>(a.a); 
+    auto mat = std::get<0>(a.a);
     using T = typename decltype(mat)::value_type;
     gemm(T(1.0),a,b,T(0.0),c);
   } else {
     using T = typename A::value_type;
     gemm(T(1.0),a,b,T(0.0),c);
   }
+}
+
+// Mixed real * complex gemm: real A times complex B into complex C.
+// Reinterprets B and C as 2x-wide real arrays via to_real_view and
+// dispatches to the all-real gemm. Requires C-layout, unit min_stride.
+// Imported from SAFIRE/numerics/nda_functions.hpp.
+template <typename A, MemoryMatrix B, MemoryMatrix C>
+    requires((MemoryMatrix<A> or is_conj_array_expr<A>) and
+             std::is_same_v<std::complex<get_value_t<A>>, get_value_t<B>> and
+             have_same_value_type_v<B, C> and is_blas_lapack_v<get_value_t<A>> and
+             B::is_stride_order_C() and std::decay_t<C>::is_stride_order_C() and
+             mem::have_compatible_addr_space<A, B, C>)
+void gemm(get_value_t<A> alpha, A const &a, B const &b, get_value_t<A> beta, C &&c)
+{
+  constexpr auto addSp = B::storage_t::address_space;
+  using T = get_value_t<A>;
+  using B_t = basic_array_view<T const, 2, C_layout, 'A', default_accessor, borrowed<addSp>>;
+  using C_t = basic_array_view<T,       2, C_layout, 'A', default_accessor, borrowed<addSp>>;
+  utils::check(b.indexmap().min_stride() == 1, "gemm(real,complex,complex): min_stride mismatch on B");
+  utils::check(c.indexmap().min_stride() == 1, "gemm(real,complex,complex): min_stride mismatch on C");
+  std::array<long,2> Bstr    = {b.strides()[0]*2l, 1l};
+  std::array<long,2> Cstr    = {c.strides()[0]*2l, 1l};
+  std::array<long,2> Bshape  = {b.extent(0), 2l*b.extent(1)};
+  std::array<long,2> Cshape  = {c.extent(0), 2l*c.extent(1)};
+  idx_map<2, 0, C_stride_order<2>, layout_prop_e::none> Bidxm(Bshape, Bstr);
+  idx_map<2, 0, C_stride_order<2>, layout_prop_e::none> Cidxm(Cshape, Cstr);
+  B_t b2(Bidxm, reinterpret_cast<T const*>(b.data()));
+  C_t c2(Cidxm, reinterpret_cast<T*>(c.data()));
+  gemm(alpha, a, b2, beta, c2);
+}
+
+template <typename A, MemoryMatrix B, MemoryMatrix C>
+    requires((MemoryMatrix<A> or is_conj_array_expr<A>) and
+             std::is_same_v<std::complex<get_value_t<A>>, get_value_t<B>> and
+             have_same_value_type_v<B, C> and is_blas_lapack_v<get_value_t<A>> and
+             B::is_stride_order_C() and std::decay_t<C>::is_stride_order_C() and
+             mem::have_compatible_addr_space<A, B, C>)
+void gemm(A const &a, B const &b, C &&c)
+{
+  using T = get_value_t<A>;
+  gemm(T(1.0), a, b, T(0.0), std::forward<C>(c));
 }
 
 }

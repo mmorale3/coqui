@@ -179,41 +179,65 @@ long lu_solve(DistributedMatrix auto&& A, DistributedMatrix auto&& B)
 
     auto Al = A.local();
     auto Bl = B.local();
-    ::nda::basic_array<int, 1, ::nda::C_layout, 'A', 
-        ::nda::heap<::nda::mem::get_addr_space<typename dA_t::Array_t>>> ipiv(Al.extent(0));
-    info = ::nda::lapack::getrf(Al,ipiv);
-    if( info != 0 ) {
-      app_warning(" serial lu_solve: getrf info != 0 , info:{}",info); 
-      return info;
-    }
 
-    if constexpr(dB_t::is_stride_order_Fortran()) {
-      info = ::nda::lapack::getrs(Al,Bl,ipiv);
-    } else {
-      if constexpr ( ::nda::mem::get_addr_space<typename dA_t::Array_t> == ::nda::mem::Host ) {
-        ::nda::basic_array<value_type, 2, ::nda::F_layout, 'A', 
-            ::nda::heap<::nda::mem::get_addr_space<typename dB_t::Array_t>>> Bf(Bl); 
-        info = ::nda::lapack::getrs(Al,Bf,ipiv);
-        Bl = Bf;
-      } else {
-        ::nda::basic_array<value_type, 2, ::nda::F_layout, 'A', 
-            ::nda::heap<::nda::mem::get_addr_space<typename dB_t::Array_t>>> Bf(Bl.shape()); 
-        // since it is not clear if tensor backend will always accept mixed layouts, 
-        // I'm creating a view to the transposed array
-        using layout_t = typename ::nda::F_stride_layout::template mapping<2>;
-        layout_t idx_{std::array<long,2>{Bl.extent(1),Bl.extent(0)},
-            std::array<long,2>{Bl.strides()[1],Bl.strides()[0]}};
-        ::nda::basic_array_view<value_type, 2, ::nda::F_stride_layout, 'A', 
-            ::nda::default_accessor, 
-            ::nda::borrowed<::nda::mem::get_addr_space<typename dB_t::Array_t>>> 
-            Bl_f(idx_,Bl.data()); 
-        ::nda::tensor::add(value_type(1.0),Bl_f,"ij",value_type(0.0),Bf,"ji");
-        info = ::nda::lapack::getrs(Al,Bf,ipiv);
-        ::nda::tensor::add(value_type(1.0),Bf,"ij",value_type(0.0),Bl_f,"ji");
+    // `hermitian` means: A is stored in C order and the solve is to be done against A^H. The
+    // distributed branch below implements that by conjugating A in place and handing slate the
+    // transposed view, and least_squares_solve's serial shortcut does the same. This shortcut did
+    // neither, so at one rank it solved A X = B while every other path solved A^H X = B. Invisible
+    // in production -- every caller passes a hermitian A, where the two coincide -- but it made the
+    // flag mean different things at different rank counts. Pinned by
+    // `matrix_array_hermitian_solve_orientation` in tests/test_matrix_array_ops.cpp, which caught
+    // this at 1 rank while passing at 2 and 4.
+    constexpr bool conj_transpose = hermitian and not dA_t::is_stride_order_Fortran();
+
+    // the factorized operand: A^H when conj_transpose, otherwise A as stored
+    auto solve_against = [&](auto&& Am) {
+      ::nda::basic_array<int, 1, ::nda::C_layout, 'A',
+          ::nda::heap<::nda::mem::get_addr_space<typename dA_t::Array_t>>> ipiv(Am.extent(0));
+      long info_ = ::nda::lapack::getrf(Am,ipiv);
+      if( info_ != 0 ) {
+        app_warning(" serial lu_solve: getrf info != 0 , info:{}",info_);
+        return info_;
       }
+
+      if constexpr(dB_t::is_stride_order_Fortran()) {
+        info_ = ::nda::lapack::getrs(Am,Bl,ipiv);
+      } else {
+        if constexpr ( ::nda::mem::get_addr_space<typename dA_t::Array_t> == ::nda::mem::Host ) {
+          ::nda::basic_array<value_type, 2, ::nda::F_layout, 'A',
+              ::nda::heap<::nda::mem::get_addr_space<typename dB_t::Array_t>>> Bf(Bl);
+          info_ = ::nda::lapack::getrs(Am,Bf,ipiv);
+          Bl = Bf;
+        } else {
+          ::nda::basic_array<value_type, 2, ::nda::F_layout, 'A',
+              ::nda::heap<::nda::mem::get_addr_space<typename dB_t::Array_t>>> Bf(Bl.shape());
+          // since it is not clear if tensor backend will always accept mixed layouts,
+          // I'm creating a view to the transposed array
+          using layout_t = typename ::nda::F_stride_layout::template mapping<2>;
+          layout_t idx_{std::array<long,2>{Bl.extent(1),Bl.extent(0)},
+              std::array<long,2>{Bl.strides()[1],Bl.strides()[0]}};
+          ::nda::basic_array_view<value_type, 2, ::nda::F_stride_layout, 'A',
+              ::nda::default_accessor,
+              ::nda::borrowed<::nda::mem::get_addr_space<typename dB_t::Array_t>>>
+              Bl_f(idx_,Bl.data());
+          ::nda::tensor::add(value_type(1.0),Bl_f,"ij",value_type(0.0),Bf,"ji");
+          info_ = ::nda::lapack::getrs(Am,Bf,ipiv);
+          ::nda::tensor::add(value_type(1.0),Bf,"ij",value_type(0.0),Bl_f,"ji");
+        }
+      }
+      if( info_ != 0 )
+        app_warning(" serial lu_solve: getrs info != 0 , info:{}",info_);
+      return info_;
+    };
+
+    if constexpr (conj_transpose) {
+      // conj(A) seen through the transposed view is conj(A)^T = A^H, matching the
+      // distributed branch. Destructive in A, exactly as that branch is.
+      ::nda::tensor::scale(value_type(1.0),Al,::nda::tensor::op::CONJ);
+      info = solve_against(::nda::transpose(Al));
+    } else {
+      info = solve_against(Al);
     }
-    if( info != 0 )
-      app_warning(" serial lu_solve: getri info != 0 , info:{}",info); 
     return info;
   }
 
@@ -448,31 +472,36 @@ void inverse(DistributedMatrix auto&& A)
 
   auto As = detail::to_slate_view<dA_t::is_stride_order_C()>(A);
   if constexpr (::nda::mem::on_host<local_Array_t>) {
+    slate::Options const opts = {
+#if defined(USE_SLATE_HOSTBATCH)
+	{ slate::Option::Target, slate::Target::HostBatch }
+#endif
+	};
     slate::Pivots pivots;
-    long info = slate::getrf ( As , pivots
-#if defined(USE_SLATE_HOSTBATCH)
-	,{ { slate::Option::Target, slate::Target::HostBatch} }
-#endif
-	);
+    long info = slate::getrf ( As , pivots, opts );
     utils::check(info == 0, "inverse: getrf info: {}.", info);
-    slate::getri ( As , pivots 
-#if defined(USE_SLATE_HOSTBATCH)
-	,{ { slate::Option::Target, slate::Target::HostBatch} }
-    utils::check(info == 0, "inverse: getri info: {}.", info);
-#endif
-	);
+    // slate::getri returns void; there is no info to check.
+    slate::getri ( As , pivots, opts );
   } else {
+    slate::Options const opts = {
+        // Set execution target to GPU Devices
+        { slate::Option::Target, slate::Target::Devices },
+        { slate::Option::Lookahead, 1 }};
     slate::Pivots pivots ;
-    long info = slate::getrf ( As , pivots, 
-        // Set execution target to GPU Devices
-        {{ slate::Option::Target, slate::Target::Devices },
-        { slate::Option::Lookahead, 1 }});
+    long info = slate::getrf ( As , pivots, opts );
     utils::check(info == 0, "inverse: getrf info: {}.", info);
-    info = slate::getri ( As , pivots,
-        // Set execution target to GPU Devices
-        {{ slate::Option::Target, slate::Target::Devices },
-        { slate::Option::Lookahead, 1 }} );
-    utils::check(info == 0, "inverse: getri info: {}.", info);
+    // The in-place slate::getri does NOT run on the GPU whatever Target is asked for:
+    // every internal op in impl::getri is hardcoded to Target::HostTask, and it reaches
+    // tiles through A(i,j) == at(i,j,HostNum), which does not exist for a device-resident
+    // matrix. Slate says so itself ("This routine is in-place and does not support GPUs.
+    // There is another one (out-of-place) that does"). So use the out-of-place form,
+    // which is just set(I) + getrs -- both of which have real Target::Devices paths --
+    // and copy the result back over A. Bs mirrors As' distribution exactly (emptyLike)
+    // and slate allocates its tiles from its own device pool.
+    auto Bs = As.emptyLike();
+    Bs.insertLocalTiles( slate::Target::Devices );
+    slate::getri ( As , pivots, Bs, opts );  // Bs = As^{-1}; As keeps its LU factors
+    slate::copy ( Bs, As, opts );            // back into the caller's device memory
   }
 #else
   utils::check(false, "inverse: requires SLATE, compile with ENABLE_SLATE.");

@@ -91,7 +91,7 @@ namespace bdft_tests {
         for (long ik = 0; ik < nk; ++ik) {
           auto [cj, Dsp] = mf.symmetry_rotation(js, ik);
           (void)cj;
-          csrmm(cplx(1.0), *Dsp, E, cplx(0.0), Dcols);
+          csrmm<'N'>(cplx(1.0), *Dsp, E, cplx(0.0), Dcols);
           double m_in = 0.0, m_all = 0.0;
           for (long a = 0; a < nbnd; ++a)
             for (long j = 0; j < nc; ++j) {
@@ -448,7 +448,7 @@ namespace bdft_tests {
         auto [cj, Dsp] = mf->symmetry_rotation(js, k);
         // time-reversal images (cj): the kernels' column is conj(X(krot(js, pair(k))) . D) (build_sym_ctx) -- tested against the
         // same transported orbital psi_k(S r_P); the plain points otherwise
-        math::sparse::csrmm(ComplexType(1.0), *Dsp, E, ComplexType(0.0), Dfull);   // D E: (nbnd, nW), rows = all bands
+        math::sparse::csrmm<'N'>(ComplexType(1.0), *Dsp, E, ComplexType(0.0), Dfull);   // D E: (nbnd, nW), rows = all bands
         for (long a = 0; a < nW; ++a) for (long b = 0; b < nW; ++b) Dw(a, b) = Dfull(w0 + a, b);
         const long kr = mf->ks_to_k(int(js), int(cj ? long(trev_pair(k)) : k));
         for (long P = 0; P < Nm; ++P) for (long a = 0; a < nW; ++a) Xr(P, a) = X(0, kr, a, P);   // X(krot(js, k)) or X(krot(js, pair(k)))
@@ -510,7 +510,7 @@ namespace bdft_tests {
       nda::matrix<ComplexType> Gm(nW, nW); Gm() = G; nda::inverse_in_place(Gm);
       nda::blas::gemm(Gm, Rhs, M);
       auto [cj0, Dsp0] = mf->symmetry_rotation(js, k);
-      math::sparse::csrmm(ComplexType(1.0), *Dsp0, E, ComplexType(0.0), Dfull);
+      math::sparse::csrmm<'N'>(ComplexType(1.0), *Dsp0, E, ComplexType(0.0), Dfull);
       std::string sm, sd;
       for (long a = 0; a < nW; ++a) {
         for (long b = 0; b < nW; ++b) { char buf[40]; std::snprintf(buf, sizeof(buf), "(%6.3f,%6.3f) ", M(a, b).real(), M(a, b).imag()); sm += buf;
@@ -531,7 +531,7 @@ namespace bdft_tests {
       utils::transform_r(opi, nda::array<long, 1>::zeros({3}), mesh, ipSi);
       auto XSi = builder.collocation_at_points(ipSi, nda::range(0, nk), W);
       auto [cj, Dsp] = mf->symmetry_rotation(js, k);
-      math::sparse::csrmm(ComplexType(1.0), *Dsp, E, ComplexType(0.0), Dfull);
+      math::sparse::csrmm<'N'>(ComplexType(1.0), *Dsp, E, ComplexType(0.0), Dfull);
       for (long a = 0; a < nW; ++a) for (long b = 0; b < nW; ++b) Dw(a, b) = Dfull(w0 + a, b);
       for (long P = 0; P < Nm; ++P) for (long a = 0; a < nW; ++a) Xr(P, a) = X(0, kr, a, P);
       nda::blas::gemm(Xr, Dw, cand);

@@ -396,6 +396,11 @@ namespace methods {
 
         decltype(nda::range::all) all;
         constexpr int N = nda::get_rank<Array_primary_t>;
+        // The aux output may live on device while the primary input
+        // is HOST. Both gemms need to share an address space; we run
+        // them in HOST scratch on the host path and stage the second
+        // result into the device-typed O_ikPQ slice on the device path.
+        constexpr bool aux_on_device = ::nda::mem::on_device<Array_aux_t>;
         size_t ns         = O_tskab.shape(N-4);
         size_t nkpts_ibz  = O_tskab.shape(N-3);
         size_t nbnd       = O_tskab.shape(N-2);
@@ -421,7 +426,49 @@ namespace methods {
         int offset = (rank % nbatch < n_large_batch)? 0 : 0 + n_large_batch;
 
         nda::array<ComplexType, 2> Ask_Pb(batch_size, nbnd);
-        //nda::matrix<ComplexType> Xsk_bQ_conj(nbnd, NQ_loc);
+#if defined(ENABLE_DEVICE)
+        // Device-side scratch for the second gemm output, plus the X-factor
+        // cache, all only referenced when ENABLE_DEVICE is on. Wrapping the
+        // declarations themselves with #if is necessary because nda's
+        // mem::check_adr_sp_valid<Device> static_asserts when GPU support
+        // is not compiled in — even `if constexpr` discarded branches
+        // still get parsed and trigger the assert on a CPU-only build.
+        [[maybe_unused]] memory::array<DEVICE_MEMORY, ComplexType, 2> O_PQ_dev;
+        [[maybe_unused]] memory::array<DEVICE_MEMORY, ComplexType, 2> Ask_Pb_dev;
+        [[maybe_unused]] memory::array<DEVICE_MEMORY, ComplexType, 4> Xr_cache;
+        [[maybe_unused]] memory::array<DEVICE_MEMORY, ComplexType, 4> Xl_cache;
+        [[maybe_unused]] memory::array<DEVICE_MEMORY, ComplexType, 2> Oab_dev;
+        if constexpr (aux_on_device) {
+          O_PQ_dev   = memory::array<DEVICE_MEMORY, ComplexType, 2>(batch_size, NQ_loc);
+          Ask_Pb_dev = memory::array<DEVICE_MEMORY, ComplexType, 2>(batch_size, nbnd);
+          // Both X factors are staged once per call so that the first gemm can
+          // run on the device too. It used to run on the host -- one core per
+          // rank at ~100 GF/s against ~14 TF/s device-resident -- and then push
+          // its result across PCIe per (t,s,k). Uploading the (nbnd x nbnd)
+          // input block instead of the (batch x nbnd) result moves the same
+          // order of bytes, so the transform becomes device-resident for free.
+          //
+          // The two caches are kept separate even when ip == iq and the ranges
+          // coincide: sharing the P-sliced factor as the right operand is
+          // exactly the bug fixed in 765754c, and 287 MB per cache here
+          // (nk*Np*nbnd*16 at Si 2x2x2/500b) is not worth the risk.
+          nda::range O_P_rng_all(P_offset, P_offset + NP_loc);
+          nda::range O_Q_rng(Q_offset, Q_offset + NQ_loc);
+          nda::array<ComplexType, 4> Xr_host(ns, nkpts, NQ_loc, nbnd);
+          nda::array<ComplexType, 4> Xl_host(ns, nkpts, NP_loc, nbnd);
+          for (size_t s_ = 0; s_ < ns; ++s_) {
+            for (size_t k_ = 0; k_ < nkpts; ++k_) {
+              auto Xsk_Pa_r = thc.X(s_, iq, k_);
+              Xr_host(s_, k_, all, all) = Xsk_Pa_r(O_Q_rng, all);
+              auto Xsk_Pa_l = thc.X(s_, ip, k_);
+              Xl_host(s_, k_, all, all) = Xsk_Pa_l(O_P_rng_all, all);
+            }
+          }
+          Xr_cache = memory::to_memory_space<DEVICE_MEMORY>(Xr_host);
+          Xl_cache = memory::to_memory_space<DEVICE_MEMORY>(Xl_host);
+          Oab_dev  = memory::array<DEVICE_MEMORY, ComplexType, 2>(nbnd, nbnd);
+        }
+#endif
 
         for (size_t ikP = rank; ikP < dim_i*nkpts*nbatch; ikP += comm_size) {
           // ikP = (i * nkpts + k) * nbatch + PP
@@ -433,19 +480,33 @@ namespace methods {
           nda::range O_P_rng(PP*batch_size + offset, (PP+1)*batch_size + offset);
           nda::range O_Q_rng(Q_offset, Q_offset + NQ_loc);
 
-          // Ask_Pb = Xsk_Pa * Osk_ab
-          auto Xsk_Pa_l = thc.X(s, ip, k);
-          auto Xsk_Pa_r = thc.X(s, iq, k);
-          
-          if(kp_trev(k)) {
-            nda::blas::gemm(Xsk_Pa_l(X_P_rng, all), nda::transpose(O_ikab_4D(i, kp_map(k), all, all)), Ask_Pb);
+          if constexpr (aux_on_device) {
+#if defined(ENABLE_DEVICE)
+            // Both gemms on the device: stage this (i,k) block of the primary
+            // input, contract with the cached left factor, then with the right.
+            // The cache rows for X_P_rng are exactly O_P_rng, since the cache
+            // holds rows [P_offset, P_offset+NP_loc).
+            Oab_dev = O_ikab_4D(i, kp_map(k), all, all);
+            auto Xl = Xl_cache(s, k, O_P_rng, all);
+            if (kp_trev(k)) {
+              nda::blas::gemm(Xl, nda::transpose(Oab_dev), Ask_Pb_dev);
+            } else {
+              nda::blas::gemm(Xl, Oab_dev, Ask_Pb_dev);
+            }
+            nda::blas::gemm(Ask_Pb_dev, nda::dagger(Xr_cache(s, k, all, all)), O_PQ_dev);
+            O_ikPQ_4D(i, k, O_P_rng, all) = O_PQ_dev;
+#endif
           } else {
-            nda::blas::gemm(Xsk_Pa_l(X_P_rng, all), O_ikab_4D(i, kp_map(k), all, all), Ask_Pb);
+            // HOST path unchanged: Ask_Pb = Xsk_Pa * Osk_ab, then * conj(Xsk_Qb)
+            auto Xsk_Pa_l = thc.X(s, ip, k);
+            if(kp_trev(k)) {
+              nda::blas::gemm(Xsk_Pa_l(X_P_rng, all), nda::transpose(O_ikab_4D(i, kp_map(k), all, all)), Ask_Pb);
+            } else {
+              nda::blas::gemm(Xsk_Pa_l(X_P_rng, all), O_ikab_4D(i, kp_map(k), all, all), Ask_Pb);
+            }
+            auto Xsk_Pa_r = thc.X(s, iq, k);
+            nda::blas::gemm(Ask_Pb, nda::dagger(Xsk_Pa_r(O_Q_rng, all)), O_ikPQ_4D(i, k, O_P_rng, all));
           }
-
-          // Osk_PQ = Ask_Pb * conj(Xsk_Qb)
-          //Xsk_bQ_conj = nda::conj(nda::transpose(Xsk_Pa(O_Q_rng, all)));
-          nda::blas::gemm(Ask_Pb, nda::dagger(Xsk_Pa_r(O_Q_rng, all)), O_ikPQ_4D(i, k, O_P_rng, all));
         }
       }
 
@@ -549,6 +610,13 @@ namespace methods {
         decltype(nda::range::all) all;
 
         constexpr int N = nda::get_rank<Array_primary_t>;
+        // The auxiliary input may live on device while the primary output
+        // (a HOST shared-array slice) lives on the host. The two gemms
+        // below must execute in the same address space as O_iPQ; any
+        // result needed for the host MPI reduce + accumulate is staged
+        // back to host once at the end of each (s, k) iteration.
+        constexpr bool aux_on_device = ::nda::mem::on_device<Array_aux_t>;
+        constexpr MEMORY_SPACE WORK_MEM = aux_on_device ? DEVICE_MEMORY : HOST_MEMORY;
 
         size_t nbnd = O_tskab.shape(N-2);
         size_t ns_loc = O_tskPQ.shape(N-4);
@@ -565,28 +633,91 @@ namespace methods {
         auto O_iPQ_3D = nda::reshape(O_tskPQ, shape_t<3>{dim0, NP_loc, NQ_loc});
         auto O_iab_3D = nda::reshape(O_tskab, shape_t<3>{dim0, nbnd, nbnd});
 
-        nda::array<ComplexType, 2> Ask_aQ(nbnd, NQ_loc);
-        //nda::matrix<ComplexType> Xsk_Pa_conj(NP_loc, nbnd);
-        nda::array<ComplexType, 2> Oab_buffer(nbnd, nbnd);
+        memory::array<WORK_MEM, ComplexType, 2> Ask_aQ(nbnd, NQ_loc);
+
+        // X-factor cache: thc.X(s, ip, kp_map(k))(P_rng, all) is constant
+        // across the t axis in the i sweep (each unique (s, k) appears
+        // dim0 / (ns_loc * nk_loc) = nt times). Materialise it on WORK_MEM
+        // once instead of mirroring per i — one bulk H->D copy replaces
+        // nt copies per (s, k).
+        //
+        // The left factor is sliced with P_rng, the right factor with
+        // Q_rng. They coincide only when ip == iq AND this rank's local
+        // (P, Q) block is diagonal (P_rng == Q_rng); sharing the cache on
+        // ip == iq alone silently used X(P_rng) as the right factor on
+        // ranks with off-diagonal or rectangular blocks (wrong data, and
+        // mismatched gemm dims for NP_loc != NQ_loc).
+        const bool same_lr = (ip == iq) and (P_offset == Q_offset) and (NP_loc == NQ_loc);
+        memory::array<WORK_MEM, ComplexType, 4> Xl_cache;
+        memory::array<WORK_MEM, ComplexType, 4> Xr_cache;
+        {
+          nda::array<ComplexType, 4> Xl_host(ns_loc, nk_loc, NP_loc, nbnd);
+          for (size_t s = 0; s < ns_loc; ++s) {
+            for (size_t k = 0; k < nk_loc; ++k) {
+              auto Xsk_Pa_l = thc.X(s, ip, kp_map(k + k_offset));
+              Xl_host(s, k, all, all) = Xsk_Pa_l(P_rng, all);
+            }
+          }
+          Xl_cache = memory::to_memory_space<WORK_MEM>(Xl_host);
+          if (not same_lr) {
+            nda::array<ComplexType, 4> Xr_host(ns_loc, nk_loc, NQ_loc, nbnd);
+            for (size_t s = 0; s < ns_loc; ++s) {
+              for (size_t k = 0; k < nk_loc; ++k) {
+                auto Xsk_Pa_r = thc.X(s, iq, kp_map(k + k_offset));
+                Xr_host(s, k, all, all) = Xsk_Pa_r(Q_rng, all);
+              }
+            }
+            Xr_cache = memory::to_memory_space<WORK_MEM>(Xr_host);
+          }
+        }
+
+        // Buffer all Oab outputs in one (dim0, nbnd, nbnd) tensor and do a
+        // single bulk D->H copy + MPI reduce at the end. The per-iter
+        // to_host + reduce we used to do drains the cuBLAS stream every
+        // iter; this version keeps all gemms in-flight on the GPU and
+        // batches the reduce.
+        memory::array<WORK_MEM, ComplexType, 3> Oab_all(dim0, nbnd, nbnd);
+        nda::array<ComplexType, 3> Oab_all_host;
+        if constexpr (aux_on_device) {
+          Oab_all_host.resize(std::array<long,3>{long(dim0), long(nbnd), long(nbnd)});
+        }
 
         for (size_t i = 0; i < dim0; ++i) {
           // i = (it * ns_loc + is) * nk_loc + ik
           size_t s = (i / nk_loc) % ns_loc;
-          size_t k = i % nk_loc + k_offset;
+          size_t k = i % nk_loc;
 
-          // Ask_aQ = conj(Xsk_Pa) * Osk_PQ
-          auto Xsk_Pa_l = thc.X(s, ip, kp_map(k)); 
-          auto Xsk_Pa_r = ( ip==iq ? Xsk_Pa_l : thc.X(s, iq, kp_map(k))); 
-          //Xsk_Pa_conj = nda::conj(Xsk_Pa(P_rng, all));
-          nda::blas::gemm(nda::dagger(Xsk_Pa_l(P_rng, all)), O_iPQ_3D(i, all, all), Ask_aQ);
+          auto Xl_view = Xl_cache(s, k, all, all);
+          auto Xr_view = same_lr ? Xl_cache(s, k, all, all)
+                                 : Xr_cache(s, k, all, all);
+          auto Oab_i   = Oab_all(i, all, all);
 
-          // Osk_ab = Ask_aQ * Xsk_Qb
-          nda::blas::gemm(Ask_aQ, Xsk_Pa_r(Q_rng, all), Oab_buffer);
-          dim0_comm.reduce_in_place_n(Oab_buffer.data(), Oab_buffer.size(), std::plus<>{}, 0);
-          if (dim0_comm.root()) {
-            O_iab_3D(i, all, all) += scl*Oab_buffer;
-          }
+          nda::blas::gemm(nda::dagger(Xl_view), O_iPQ_3D(i, all, all), Ask_aQ);
+          nda::blas::gemm(Ask_aQ, Xr_view, Oab_i);
         } // i
+
+        if constexpr (aux_on_device) {
+          // One bulk device -> host transfer (drains cuBLAS stream once),
+          // one bulk MPI reduce, then per-i host accumulate on root.
+          Oab_all_host = nda::to_host(Oab_all);
+          dim0_comm.reduce_in_place_n(Oab_all_host.data(), Oab_all_host.size(),
+                                      std::plus<>{}, 0);
+          if (dim0_comm.root()) {
+            for (size_t i = 0; i < dim0; ++i) {
+              O_iab_3D(i, all, all) += scl * Oab_all_host(i, all, all);
+            }
+          }
+        } else {
+          // Host: bulk MPI reduce on Oab_all itself (host buffer), then
+          // accumulate. Bit-identical to per-iter reduce + accumulate.
+          dim0_comm.reduce_in_place_n(Oab_all.data(), Oab_all.size(),
+                                      std::plus<>{}, 0);
+          if (dim0_comm.root()) {
+            for (size_t i = 0; i < dim0; ++i) {
+              O_iab_3D(i, all, all) += scl * Oab_all(i, all, all);
+            }
+          }
+        }
       } // _aux_to_primary_impl
 
     }; // thc_solver_comm

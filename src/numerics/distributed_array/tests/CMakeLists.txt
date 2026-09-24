@@ -4,13 +4,16 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${PROJECT_UNIT_TEST_DIR})
 set(TEST_ID math_distributed_nda)
 
 if(ENABLE_SLATE)
-set( TEST_SRCS 
+set( TEST_SRCS
      test_distributed.cpp
      test_slate.cpp
+     test_matrix_array.cpp
+     test_matrix_array_ops.cpp
    )
 else(ENABLE_SLATE)
-set( TEST_SRCS 
+set( TEST_SRCS
      test_distributed.cpp
+     test_matrix_array.cpp
    )
 endif(ENABLE_SLATE)
 

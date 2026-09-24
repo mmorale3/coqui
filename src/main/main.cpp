@@ -38,6 +38,7 @@
 #include "utilities/mpi_context.h"
 #include "utilities/blas_threads.hpp"
 #include "utilities/omp_threads.hpp"
+#include "arch/arch.h"
 
 #include "mean_field/MF.hpp"
 #include "mean_field/mf_utils.hpp"
@@ -204,6 +205,11 @@ int main(int argc, char** argv)
 
   // setup output loggers
   setup_loggers(world.root(), output_level, debug_level);
+
+  // Bind each MPI rank to its own GPU (calls cudaSetDevice based on
+  // node-local rank). Without this, all ranks on a node default to
+  // device 0, accumulating their allocations on a single GPU.
+  arch::init(world.root(), output_level, debug_level);
 
   std::string welcome(
       std::string("\n ---------------------------------\n") +
@@ -392,10 +398,10 @@ void run(mpi3::communicator &comm, InputParser &parser)
         // consistent eri for all
         if (eri_type == "thc") {
           auto mb_eri = methods::mb_eri_t(*std::get<1>(thc_list[eri_name]));
-          methods::mbpt(cname, mb_eri, pt);
+          methods::mbpt<MEM>(cname, mb_eri, pt);
         } else {
           auto mb_eri = methods::mb_eri_t(*std::get<1>(chol_list[eri_name]));
-          methods::mbpt(cname, mb_eri, pt);
+          methods::mbpt<MEM>(cname, mb_eri, pt);
         }
 
       } else if (hf_eri_type!="") {
@@ -403,16 +409,16 @@ void run(mpi3::communicator &comm, InputParser &parser)
         // separate eri for hf and post-hf
         if (hf_eri_type=="thc" and eri_type=="thc") {
           auto mb_eri = methods::mb_eri_t(*std::get<1>(thc_list[hf_eri_name]), *std::get<1>(thc_list[eri_name]));
-          methods::mbpt(cname, mb_eri, pt);
+          methods::mbpt<MEM>(cname, mb_eri, pt);
         } else if (hf_eri_type=="thc" and eri_type=="cholesky") {
           auto mb_eri = methods::mb_eri_t(*std::get<1>(thc_list[hf_eri_name]), *std::get<1>(chol_list[eri_name]));
-          methods::mbpt(cname, mb_eri, pt);
+          methods::mbpt<MEM>(cname, mb_eri, pt);
         } else if (hf_eri_type=="cholesky" and eri_type=="thc") {
           auto mb_eri = methods::mb_eri_t(*std::get<1>(chol_list[hf_eri_name]), *std::get<1>(thc_list[eri_name]));
-          methods::mbpt(cname, mb_eri, pt);
+          methods::mbpt<MEM>(cname, mb_eri, pt);
         } else {
           auto mb_eri = methods::mb_eri_t(*std::get<1>(chol_list[hf_eri_name]), *std::get<1>(chol_list[eri_name]));
-          methods::mbpt(cname, mb_eri, pt);
+          methods::mbpt<MEM>(cname, mb_eri, pt);
         }
 
       } else if (hartree_eri_type!="" and exchange_eri_type!="") {
@@ -423,25 +429,25 @@ void run(mpi3::communicator &comm, InputParser &parser)
               *std::get<1>(thc_list[hartree_eri_name]),
               *std::get<1>(thc_list[exchange_eri_name]),
               *std::get<1>(thc_list[eri_name]));
-          methods::mbpt(cname, mb_eri, pt);
+          methods::mbpt<MEM>(cname, mb_eri, pt);
         } else if (hartree_eri_type=="cholesky" and exchange_eri_type=="thc" and eri_type=="thc") {
           auto mb_eri = methods::mb_eri_t(
               *std::get<1>(chol_list[hartree_eri_name]),
               *std::get<1>(thc_list[exchange_eri_name]),
               *std::get<1>(thc_list[eri_name]));
-          methods::mbpt(cname, mb_eri, pt);
+          methods::mbpt<MEM>(cname, mb_eri, pt);
         } else if (hartree_eri_type=="thc" and exchange_eri_type=="cholesky" and eri_type=="thc") {
           auto mb_eri = methods::mb_eri_t(
               *std::get<1>(thc_list[hartree_eri_name]),
               *std::get<1>(chol_list[exchange_eri_name]),
               *std::get<1>(thc_list[eri_name]));
-          methods::mbpt(cname, mb_eri, pt);
+          methods::mbpt<MEM>(cname, mb_eri, pt);
         } else if (hartree_eri_type=="cholesky" and exchange_eri_type=="cholesky" and eri_type=="thc") {
           auto mb_eri = methods::mb_eri_t(
               *std::get<1>(chol_list[hartree_eri_name]),
               *std::get<1>(chol_list[exchange_eri_name]),
               *std::get<1>(thc_list[eri_name]));
-          methods::mbpt(cname, mb_eri, pt);
+          methods::mbpt<MEM>(cname, mb_eri, pt);
         } else {
           APP_ABORT("main::run: Unrecognized interaction setup for mbpt. "
                     "hf_eri_type = {}, hartree_eri_type = {}, exchange_eri_type = {}, eri_type = {}",

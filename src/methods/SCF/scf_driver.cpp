@@ -23,6 +23,7 @@
 #include "methods/vertex/vertex_debug.hpp"
 #include <cstdlib>
 #include <filesystem>
+#include <cstdlib>
 #include <optional>
 
 #include "nda/nda.hpp"
@@ -30,6 +31,9 @@
 #include "numerics/shared_array/nda.hpp"
 
 #include "IO/app_loggers.h"
+#include "utilities/device_pool.h"
+#include "utilities/h5_background_writer.hpp"
+#include "utilities/freemem.h"
 
 #include "methods/ERI/mb_eri_context.h"
 #include "methods/tools/chkpt_utils.h"
@@ -40,7 +44,8 @@
 
 namespace methods {
 
-template<typename dyson_type, typename eri_t, typename corr_solver_t>
+template<MEMORY_SPACE MEM,
+         typename dyson_type, typename eri_t, typename corr_solver_t>
 auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_axes_ft::IAFT& FT,
               solvers::mb_solver_t<corr_solver_t> mb_solver, iter_scf::iter_scf_t *iter_solver,
               int niter, bool restart, double conv_tol, bool const_mu,
@@ -53,7 +58,10 @@ auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_ax
                "SCF loop: mpi context of mb_state and mb_eri should be the same!");
   utils::check(&FT == mb_state.ft,
                "SCF loop: imag_axes_ft of mb_state and scf_loop should be the same!");
-  for( auto& v: {"SCF_TOTAL", "DYSON", "MBPT_SOLVERS", "ITERATIVE", "WRITE"} ) {
+  // HERMITIZE and ENERGY exist so the children sum to SCF_TOTAL: without them
+  // ~2% of the loop sat in the gap between the four phase timers.
+  for( auto& v: {"SCF_TOTAL", "DYSON", "MBPT_SOLVERS", "ITERATIVE", "WRITE",
+                 "HERMITIZE", "ENERGY"} ) {
     Timer.add(v);
   }
   // http://patorjk.com/software/taag/#p=display&f=Calvin%20S&t=COQUI%20dyson-scf
@@ -104,7 +112,10 @@ auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_ax
   Timer.start("WRITE");
   if (!restart) { // write metadata and the MF solution
     chkpt::write_metadata(mpi->comm, *mf, FT, dyson.sH0_skij(), dyson.sS_skij(), mb_state.coqui_prefix);
-    chkpt::dump_scf(mpi->comm, 0, sDm_skij, sG_tskij, sF_skij, sSigma_tskij, mu, mb_state.coqui_prefix);
+    // force_sync: read_input_iterations quiesces this write a few lines below, with no compute
+    // in between, so the async path would copy ~8.9 GB and overlap none of it.
+    chkpt::dump_scf(mpi->comm, 0, sDm_skij, sG_tskij, sF_skij, sSigma_tskij, mu,
+                    mb_state.coqui_prefix, "scf", -1, true);
   }
   Timer.stop("WRITE");
 
@@ -123,13 +134,73 @@ auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_ax
   // Determine output iteration
   // 1) The output h5 group is always "scf"
   // 2) The output iteration is scf/final_iter + 1
+  // Every rank reads the file here, but the iteration-0 checkpoint above may
+  // still be in flight on the writing rank, so the join has to be collective:
+  // with only a local join the other ranks sailed past and aborted with
+  // 'h5 group "scf" does not exist'.
+  utils::h5_quiesce_collective(mpi->comm);
   std::tie(mb_state.mbpt_iter, mb_state.df_1e_iter, mb_state.df_2e_iter, mb_state.embed_iter) =
       chkpt::read_input_iterations(mb_state.coqui_prefix+".mbpt.h5");
   long output_iter_init = mb_state.mbpt_iter+1;
   long output_iter = output_iter_init;
+
+  // Reserve the shared device pool for the duration of the SCF loop, so the
+  // scratch that recurs every iteration (the redistribute staging buffers
+  // above all) is served without a cudaMalloc/cudaFree per use. It is taken
+  // here rather than at startup because ERI/THC construction sizes its own
+  // blocking from the free device memory it observes and allocates through the
+  // raw allocator; by now that is done. Inert unless COQUI_DEVICE_POOL_GB is
+  // set, and released when the loop ends.
+  std::optional<utils::device_pool_guard> pool_guard;
+  if constexpr (MEM != HOST_MEMORY) {
+    if (std::size_t pool_bytes = utils::device_pool_size_from_env(); pool_bytes > 0)
+      pool_guard.emplace(pool_bytes, "scf");
+  }
+
+  // Snapshot of the previous iteration's F and Sigma, so simple mixing does not
+  // read them back from the checkpoint it just wrote: that read is 4.4 GB of
+  // serial HDF5 at Si 2x2x2/500b and was ~40 s of the 43 s ITERATIVE phase. One
+  // shm copy per iteration replaces it. Skipped when node memory is tight (the
+  // arrays are 35 GB at kp444/500b), in which case mixing falls back to the
+  // checkpoint read as before. DIIS is unaffected: it needs a history, not just
+  // the previous iterate, and keeps reading the checkpoint.
+  std::optional<sArray_t<Array_view_4D_t>> sF_prev;
+  std::optional<sArray_t<Array_view_5D_t>> sSigma_prev;
+  // COQUI_NO_PREV_SNAPSHOT=1 forces the old behaviour (read the previous iterate
+  // back from the checkpoint), so the two paths can be compared directly.
+  const bool snapshot_disabled = [] {
+    const char* v = std::getenv("COQUI_NO_PREV_SNAPSHOT");
+    return v != nullptr and std::strtol(v, nullptr, 10) != 0;
+  }();
+  if (iter_solver != nullptr and iter_solver->iter_alg() == iter_scf::damping
+      and not snapshot_disabled) {
+    double need_mb = double(sSigma_tskij.local().size() + sF_skij.local().size())
+                     * sizeof(ComplexType) / (1024.0*1024.0);
+    if (double(utils::freemem()) > 3.0*need_mb) {
+      sF_prev.emplace(math::shm::make_shared_array<Array_view_4D_t>(*mpi, sF_skij.shape()));
+      sSigma_prev.emplace(math::shm::make_shared_array<Array_view_5D_t>(*mpi, sSigma_tskij.shape()));
+      app_log(2, "  keeping the previous F/Sigma in memory for mixing ({:.1f} GB/node); "
+                 "the checkpoint read is skipped.", need_mb/1024.0);
+    } else {
+      app_log(2, "  not keeping the previous F/Sigma in memory for mixing: would need "
+                 "{:.1f} GB/node with {:.1f} GB free.", need_mb/1024.0, utils::freemem()/1024.0);
+    }
+  }
+
   // start SCF iteration
   do {
     app_log(1, "\n** Iteration # {} **", output_iter);
+    // Take the snapshot before the solvers overwrite F and Sigma in place.
+    if (sSigma_prev.has_value()) {
+      sF_prev.value().win().fence();
+      sSigma_prev.value().win().fence();
+      if (mpi->node_comm.root()) {
+        sF_prev.value().local()     = sF_skij.local();
+        sSigma_prev.value().local() = sSigma_tskij.local();
+      }
+      sF_prev.value().win().fence();
+      sSigma_prev.value().win().fence();
+    }
     Timer.start("MBPT_SOLVERS");
     // HF
     if (mb_solver.hf != nullptr) {
@@ -157,10 +228,20 @@ auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_ax
     if (mb_solver.corr != nullptr) {
 
       if (mb_solver.scr_eri != nullptr)
-        mb_solver.scr_eri->update_w(mb_state, mb_eri.corr_eri->get(), output_iter);
+        mb_solver.scr_eri->template update_w<MEM>(
+            mb_state, mb_eri.corr_eri->get(), output_iter);
 
       mb_solver.corr->iter() = output_iter;
-      mb_solver.corr->evaluate(mb_state, mb_eri.corr_eri->get());
+      // gw_t::evaluate is MEM-templated; gf2_t::evaluate is not (its
+      // explicit instantiations below are HOST-only). Use a constexpr
+      // branch on the corr solver type so HOST-only solvers still build.
+      if constexpr (std::is_same_v<corr_solver_t, solvers::gw_t>) {
+        mb_solver.corr->template evaluate<MEM>(mb_state, mb_eri.corr_eri->get());
+      } else {
+        static_assert(MEM == HOST_MEMORY,
+                      "scf_loop: only gw_t supports DEVICE_MEMORY today");
+        mb_solver.corr->evaluate(mb_state, mb_eri.corr_eri->get());
+      }
       // deallocate mb_state.dW_qtPQ after this since it's only used in the corr solver and can be very large for GW.
       // Exception (ISDF-Vertex): with an active vertex on the GLOBAL auxiliary basis, keep
       // W alive across the iteration boundary so eval_Pi_qdep (which runs BEFORE this
@@ -174,30 +255,39 @@ auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_ax
       mpi->comm.barrier();
     }
 
+    Timer.start("HERMITIZE");
     if (mpi->node_comm.root()) {
       hermitize_in_tau(sF_skij.local(), "Fock matrix");
       hermitize_in_tau(sSigma_tskij.local(), "dynamic self-energy");
     }
     mpi->comm.barrier();
+    Timer.stop("HERMITIZE");
     Timer.stop("MBPT_SOLVERS");
 
 
     Timer.start("ITERATIVE");
     if (iter_solver != nullptr) {
+      // Hand the in-memory previous iterate to mixing when we kept one; it
+      // falls back to the checkpoint read when we did not.
       std::tie(F_conv, Sigma_conv) = solve_iterative(*mpi, *iter_solver, output_iter,
                                                      mb_state.coqui_prefix,
-                                                     sF_skij, sSigma_tskij, &FT);
+                                                     sF_skij, sSigma_tskij, &FT,
+                                                     {"scf", "F_skij", "Sigma_tskij"},
+                                                     sF_prev.has_value() ? &sF_prev.value() : nullptr,
+                                                     sSigma_prev.has_value() ? &sSigma_prev.value() : nullptr);
     }
     Timer.stop("ITERATIVE");
 
     Timer.start("DYSON");
     // whether to update mu depends on const_mu
     update_G(dyson, *mf, FT, sDm_skij, sG_tskij, sF_skij, sSigma_tskij, mu, const_mu);
+    Timer.start("HERMITIZE");
     if (mpi->node_comm.root()) {
       hermitize_in_tau(sDm_skij.local(), "density matrix");
       hermitize_in_tau(sG_tskij.local(), "Green's function");
     }
     mpi->comm.barrier();
+    Timer.stop("HERMITIZE");
     Timer.stop("DYSON");
     // CAUSALITY METER (vertex_perf_plan.md P22, 2026-09-21; the in-loop form of notes/lff/tools/lff_causality.py): a causal G has
     // -G_ii(tau) >= 0 and a causal Sigma has Sigma_ii(tau) <= 0 on the band diagonal at every (tau, s, k). A too-small
@@ -235,9 +325,11 @@ auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_ax
     }
 
 
+    Timer.start("ENERGY");
     auto k_weight = mf->k_weight();
     auto [e_1e, e_hf] = eval_hf_energy(sDm_skij, sF_skij, dyson.sH0_skij(), k_weight, false);
     double e_corr = (mb_solver.corr != nullptr)? eval_corr_energy(mpi->comm, FT, sG_tskij, sSigma_tskij, k_weight) : 0.0;
+    Timer.stop("ENERGY");
     energies_diff = {e_1e - energies[0], e_hf - energies[1], e_corr - energies[2]};
     energies = {e_1e, e_hf, e_corr, e_1e+e_hf+e_corr};
 
@@ -265,6 +357,13 @@ auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_ax
     Timer.stop("WRITE");
     output_iter++;
   } while (output_iter<output_iter_init+niter and not converged());
+  // The last checkpoint may still be in flight. Everything downstream --
+  // post-processing, embedding, the next driver -- reads this file, and with a
+  // non-threadsafe HDF5 none of it may run concurrently with the writer.
+  Timer.start("WRITE");
+  utils::h5_quiesce_collective(mpi->comm);
+  Timer.stop("WRITE");
+  pool_guard.reset();
   Timer.stop("SCF_TOTAL");
 
   app_log(2, "\n  Dyson-SCF timers");
@@ -273,7 +372,13 @@ auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_ax
   app_log(2, "    Dyson:                {0:.3f} sec", Timer.elapsed("DYSON"));
   app_log(2, "    MBPT solvers:         {0:.3f} sec", Timer.elapsed("MBPT_SOLVERS"));
   app_log(2, "    Iterative alg:        {0:.3f} sec", Timer.elapsed("ITERATIVE"));
-  app_log(2, "    Write:                {0:.3f} sec\n", Timer.elapsed("WRITE"));
+  app_log(2, "    Write:                {0:.3f} sec", Timer.elapsed("WRITE"));
+  app_log(2, "    Energies:             {0:.3f} sec", Timer.elapsed("ENERGY"));
+  // Nested inside DYSON / MBPT_SOLVERS, so not part of the residual below.
+  app_log(2, "    (of which hermitize:  {0:.3f} sec)", Timer.elapsed("HERMITIZE"));
+  app_log(2, "    (unaccounted):        {0:.3f} sec\n",
+          Timer.elapsed("SCF_TOTAL") - Timer.elapsed("DYSON") - Timer.elapsed("MBPT_SOLVERS")
+          - Timer.elapsed("ITERATIVE") - Timer.elapsed("WRITE") - Timer.elapsed("ENERGY"));
 
   app_log(1, "####### SCF routines end #######\n");
   return std::make_tuple(energies[0]+energies[1], energies[2]);
@@ -552,16 +657,29 @@ double qp_scf_loop(
 
 /** Instantiation of public templates **/
 // standard dyson for gw/hf
-#define GW_SCF_LOOP_INST(HF, HARTREE, EXCHANGE, CORR) \
+#define GW_SCF_LOOP_INST_MEM(MEM, HF, HARTREE, EXCHANGE, CORR) \
 template std::tuple<double, double> \
-scf_loop(MBState&, simple_dyson&, \
+scf_loop<MEM>(MBState&, simple_dyson&, \
          mb_eri_t<HF, HARTREE, EXCHANGE, CORR>&, \
          const imag_axes_ft::IAFT&, \
          solvers::mb_solver_t<solvers::gw_t>, \
          iter_scf::iter_scf_t*, \
          int, bool, double, bool, std::string, int);
 
-// All combinations of thc/chol for 4 eri slots
+#define GW_SCF_LOOP_INST(HF, HARTREE, EXCHANGE, CORR) \
+   GW_SCF_LOOP_INST_MEM(HOST_MEMORY, HF, HARTREE, EXCHANGE, CORR)
+
+// DEVICE_MEMORY instantiation only when the corr ERI is THC (the only
+// ERI type whose gw_t::evaluate / scr_coulomb_t::update_w currently has
+// a real device path; the Cholesky overload static_asserts HOST).
+#if defined(ENABLE_DEVICE)
+#  define GW_SCF_LOOP_INST_DEV_THC(HF, HARTREE, EXCHANGE) \
+   GW_SCF_LOOP_INST_MEM(DEVICE_MEMORY, HF, HARTREE, EXCHANGE, thc_reader_t)
+#else
+#  define GW_SCF_LOOP_INST_DEV_THC(HF, HARTREE, EXCHANGE)
+#endif
+
+// All combinations of thc/chol for 4 eri slots (HOST)
 GW_SCF_LOOP_INST(thc_reader_t, thc_reader_t, thc_reader_t, thc_reader_t)
 GW_SCF_LOOP_INST(thc_reader_t, thc_reader_t, thc_reader_t, chol_reader_t)
 GW_SCF_LOOP_INST(thc_reader_t, thc_reader_t, chol_reader_t, thc_reader_t)
@@ -579,7 +697,19 @@ GW_SCF_LOOP_INST(chol_reader_t, chol_reader_t, thc_reader_t, chol_reader_t)
 GW_SCF_LOOP_INST(chol_reader_t, chol_reader_t, chol_reader_t, thc_reader_t)
 GW_SCF_LOOP_INST(chol_reader_t, chol_reader_t, chol_reader_t, chol_reader_t)
 
+// DEVICE instantiations only for CORR=thc_reader_t
+GW_SCF_LOOP_INST_DEV_THC(thc_reader_t, thc_reader_t, thc_reader_t)
+GW_SCF_LOOP_INST_DEV_THC(thc_reader_t, thc_reader_t, chol_reader_t)
+GW_SCF_LOOP_INST_DEV_THC(thc_reader_t, chol_reader_t, thc_reader_t)
+GW_SCF_LOOP_INST_DEV_THC(thc_reader_t, chol_reader_t, chol_reader_t)
+GW_SCF_LOOP_INST_DEV_THC(chol_reader_t, thc_reader_t, thc_reader_t)
+GW_SCF_LOOP_INST_DEV_THC(chol_reader_t, thc_reader_t, chol_reader_t)
+GW_SCF_LOOP_INST_DEV_THC(chol_reader_t, chol_reader_t, thc_reader_t)
+GW_SCF_LOOP_INST_DEV_THC(chol_reader_t, chol_reader_t, chol_reader_t)
+
 #undef GW_SCF_LOOP_INST
+#undef GW_SCF_LOOP_INST_DEV_THC
+#undef GW_SCF_LOOP_INST_MEM
 
 
 // standard dyson for gf2

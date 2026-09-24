@@ -143,10 +143,10 @@ namespace solvers {
                    "cvv unfold_rotate_slice: TR-composed symmetry (cjg) at a non-trev "
                    "k (isym = {}, ksrc = {}).", isym, ksrc);
       // P = D A D^dag via two csrmm's: t1 = D.A; t2 = t1^dag; t1 = D.t2; P = t1^dag.
-      math::sparse::csrmm(ComplexType(1.0), *D, A_src, ComplexType(0.0), t1);
+      math::sparse::csrmm<'N'>(ComplexType(1.0), *D, A_src, ComplexType(0.0), t1);
       for (long i = 0; i < nb; ++i)
         for (long j = 0; j < nb; ++j) t2(i, j) = std::conj(t1(j, i));
-      math::sparse::csrmm(ComplexType(1.0), *D, t2, ComplexType(0.0), t1);
+      math::sparse::csrmm<'N'>(ComplexType(1.0), *D, t2, ComplexType(0.0), t1);
       if (not trev) {              // row = P
         for (long i = 0; i < nb; ++i)
           for (long j = 0; j < nb; ++j) row(i, j) = std::conj(t1(j, i));

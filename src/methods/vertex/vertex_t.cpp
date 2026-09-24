@@ -928,7 +928,7 @@ namespace solvers {
         {
           auto [cj, Dsp] = MF->symmetry_rotation(js, ik);
           ctx.cjg(js, ik) = cj;
-          csrmm(ComplexType(1.0), *Dsp, E, ComplexType(0.0), Dcols);
+          csrmm<'N'>(ComplexType(1.0), *Dsp, E, ComplexType(0.0), Dcols);
           const long ksrc = ctx.krot(js, cj ? long(kp_trev_pair(ik)) : ik);
           // C-window leakage of this rotation (memo (C-leak)); PLAIN block kept --
           // no extra normalization (consumer precedent, projector_boson_t.cpp:108-121).

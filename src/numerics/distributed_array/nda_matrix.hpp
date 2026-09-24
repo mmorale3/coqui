@@ -24,8 +24,11 @@
 
 #include <utility>
 #include <tuple>
-#include "utilities/check.hpp" 
+#include "utilities/check.hpp"
+#include "utilities/freemem.h"
+#include "IO/app_loggers.h"
 #include "nda/nda.hpp"
+#include "nda/tensor.hpp"
 #include "nda/mem/address_space.hpp"
 #include "numerics/distributed_array/detail/concepts.hpp"
 
@@ -253,11 +256,37 @@ class distributed_array
 		    std::array<long,rank> local_size,
 		    std::array<long,rank> origin_,
                     std::array<long,rank> bsize):
-    base(comm_,grid_,gshape,origin_,bsize,local_size),
-    A(local_size)
+    base(comm_,grid_,gshape,origin_,bsize,local_size)
   {
-    // initialize to zero just in case
-    A() = 0;
+    // Diagnostic logging on device for large local allocations only.
+    long bytes = sizeof(value_type);
+    for (int i = 0; i < rank; ++i) bytes *= local_size[i];
+    [[maybe_unused]] bool big = bytes > (1L<<30);
+    if constexpr (!::nda::mem::on_host<Array_t>) {
+      if (big) {
+        std::string ls_str = "(";
+        for (int i = 0; i < rank; ++i) {
+          ls_str += std::to_string(local_size[i]);
+          if (i + 1 < rank) ls_str += ",";
+        }
+        ls_str += ")";
+        app_log(2, "  distributed_array<DEVICE>: local_size={} nominal_bytes={}",
+                ls_str, bytes);
+        utils::memory_report(2, "distributed_array<DEVICE>: before resize");
+      }
+    }
+    A.resize(local_size);
+    if constexpr (!::nda::mem::on_host<Array_t>) {
+      if (big) utils::memory_report(2, "distributed_array<DEVICE>: after resize");
+    }
+    // initialize to zero just in case. Lazy `A() = 0` is host-only;
+    // use tensor::set on device.
+    if constexpr (::nda::mem::on_host<Array_t>) {
+      A() = 0;
+    } else {
+      ::nda::tensor::set(value_type(0), A);
+      if (big) utils::memory_report(2, "distributed_array<DEVICE>: after zero-init");
+    }
     // enforcing slate compatibility for now
   }
 
@@ -401,8 +430,18 @@ class distributed_array_view
 		    ::nda::ArrayOfRank<rank> auto && A_) :
 		    // can't keep a non-const view to a const-view, so need to take arg by mutable ref
     base(comm_,grid_,gshape,origin_,bsize,A_.shape()),
-    A(A_.indexmap(),A_.data()) 
+    A(A_.indexmap(),A_.data())
   {
+    // OwningPolicy (and hence everything downstream that dispatches on address space) comes from
+    // the *template argument*, while all we do here is take A_.data(). Nothing tied the two
+    // together, so naming a different address space than the pointer actually lives in compiled
+    // silently and produced a view that lies about its own memory -- which is how the unified-memory
+    // slate workaround was written, and how a device pointer could reach host BLAS and MPI. Tie them.
+    static_assert(::nda::mem::get_addr_space<std::decay_t<decltype(A_)>> ==
+                  ::nda::mem::get_addr_space<Base_t>,
+                  "distributed_array_view: the address space of the local array does not match the "
+                  "one named by the template argument. Type the view with the array's own address "
+                  "space (e.g. memory::array<MEM,...>) instead of reinterpreting it.");
   }
   
   ~distributed_array_view() {}

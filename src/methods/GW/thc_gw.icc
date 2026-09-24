@@ -4,6 +4,9 @@
 #include <algorithm>
 #include <vector>
 
+#include <optional>
+
+#include "itertools/itertools.hpp"
 #include "mpi3/communicator.hpp"
 #include "nda/nda.hpp"
 #include "nda/blas.hpp"
@@ -26,14 +29,18 @@
 namespace methods {
   namespace solvers {
 
-    template<nda::MemoryArray Array_view_5D_t, typename dArray_4D_t>
+    template<MEMORY_SPACE MEM,
+             nda::MemoryArray Array_view_5D_t, typename dArray_4D_t>
     void gw_t::thc_gw_Xqindep(const nda::MemoryArrayOfRank<5> auto &G_tskij,
                               sArray_t<Array_view_5D_t> &sSigma_tskij,
                               THC_ERI auto &thc, dArray_4D_t &dW_qtPQ,
                               const nda::MemoryArrayOfRank<1> auto &eps_inv_head) {
-      eval_Sigma_all(G_tskij, dW_qtPQ, sSigma_tskij, thc,
-                     (thc.MF()->nqpts() == thc.MF()->nqpts_ibz()? "R" : "k"));
+      eval_Sigma_all<MEM>(G_tskij, dW_qtPQ, sSigma_tskij, thc,
+                          (thc.MF()->nqpts() == thc.MF()->nqpts_ibz()? "R" : "k"));
+      // Untimed until now, and the whole gap between TOTAL and EVALUATE_SIGMA_*.
+      _Timer.start("SIGMA_DIV_CORR");
       Sigma_div_correction(sSigma_tskij, G_tskij, thc, eps_inv_head);
+      _Timer.stop("SIGMA_DIV_CORR");
     }
 
     template<nda::MemoryArray Array_primary_t, nda::MemoryArray Array_aux_t, typename communicator_t>
@@ -67,7 +74,7 @@ namespace methods {
       _Timer.stop("SIGMA_AUX_TO_PRIM");
     }
 
-    template<bool Winp_in_Rspace, bool Wout_in_Rspace,
+    template<MEMORY_SPACE MEM, bool Winp_in_Rspace, bool Wout_in_Rspace,
         nda::MemoryArray Array_5D_t, nda::MemoryArray Array_4D_t,
         typename communicator_t>
     void gw_t::eval_Sigma_all_Rspace(const nda::MemoryArrayOfRank<5> auto &G_tskij,
@@ -89,7 +96,7 @@ namespace methods {
                    dW_qtPQ.local_shape()[0]);
       utils::check(qpools == 1, "gw_t::eval_Sigma_all_Rspace: qpools = {} != 1", qpools);
 
-      using local_Array_5D_t = memory::array<HOST_MEMORY, ComplexType, 5>;
+      using local_Array_5D_t = memory::array<MEM, ComplexType, 5>;
       using local_Arrayv_5D_t = memory::array_view<HOST_MEMORY, ComplexType, 5>;
       using math::nda::make_distributed_array;
 
@@ -136,22 +143,36 @@ namespace methods {
       _Timer.stop("SIGMA_ALLOC_R");
 
       math::shm::shared_array<nda::array_view<ComplexType,2>> sf_Rk(*mpi, {nkpts,nkpts});
+      // Device mirror of the FT coefficient matrix; refreshed on demand to
+      // avoid host/device gemm dispatch.
+      [[maybe_unused]] memory::array<MEM, ComplexType, 2> f_Rk_dev;
+      auto refresh_f = [&]() {
+        if constexpr (MEM != HOST_MEMORY)
+          f_Rk_dev = memory::to_memory_space<MEM>(sf_Rk.local());
+      };
 
       if (nkpts != 1) {
         _Timer.start("SIGMA_FT_R");
-        auto f_Rk = sf_Rk.local();
         utils::k_to_R_coefficients(mpi->comm, nda::range(nkpts), MF->kpts(), MF->lattv(), MF->kp_grid(), sf_Rk);
+        refresh_f();
         auto GR_3D = nda::reshape(dG_sRtPQ.local(), shape_t<3>{ns, nkpts, nt_loc * NP_loc * NQ_loc});
-        nda::matrix<ComplexType> R_buffer(nkpts, nt_loc*NP_loc*NQ_loc);
+        memory::array<MEM, ComplexType, 2> R_buffer(nkpts, nt_loc*NP_loc*NQ_loc);
         for (long s = 0; s < ns; ++s) {
-          nda::blas::gemm(f_Rk, GR_3D(s, nda::ellipsis{}), R_buffer);
+          if constexpr (MEM == HOST_MEMORY)
+            nda::blas::gemm(sf_Rk.local(), GR_3D(s, nda::ellipsis{}), R_buffer);
+          else
+            nda::blas::gemm(f_Rk_dev,      GR_3D(s, nda::ellipsis{}), R_buffer);
           GR_3D(s, nda::ellipsis{}) = R_buffer;
         }
 
         if constexpr (!Winp_in_Rspace) {
           utils::k_to_R_coefficients(mpi->comm, nda::range(nkpts), MF->Qpts(), MF->lattv(), MF->kp_grid(), sf_Rk);
+          refresh_f();
           auto WR_2D = nda::reshape(dW_qtPQ.local(), shape_t<2>{nkpts, nt_loc * NP_loc * NQ_loc});
-          nda::blas::gemm(f_Rk, WR_2D, R_buffer);
+          if constexpr (MEM == HOST_MEMORY)
+            nda::blas::gemm(sf_Rk.local(), WR_2D, R_buffer);
+          else
+            nda::blas::gemm(f_Rk_dev,      WR_2D, R_buffer);
           WR_2D = R_buffer;
         }
         _Timer.stop("SIGMA_FT_R");
@@ -161,33 +182,54 @@ namespace methods {
       auto dSigma_sktPQ = make_distributed_array<local_Array_5D_t>(
           mpi->comm, {1, qpools, tpools, np_P, np_Q}, {ns, nkpts, nt_half, NP, NQ}, {1, bsize[0], bsize[1], bsize[2], bsize[3]});
       _Timer.start("SIGMA_HADPROD_R");
-      auto had_prod2 = nda::map([](ComplexType x, ComplexType y) { return -1.0 * (x * y) ; });
+      // Sigma_R = -G_R * W_R elementwise. On host nda::map is fine; on
+      // device lazy expressions trigger nda's "no expressions with
+      // device arrays" static_assert, so we use tensor::* primitives.
       auto W_RtPQ = dW_qtPQ.local();
       for (long s = 0; s < ns; ++s) {
         auto G_RtPQ = dG_sRtPQ.local()(s, nda::ellipsis{});
         auto Sigma_RtPQ = dSigma_sktPQ.local()(s, nda::ellipsis{});
-        Sigma_RtPQ = had_prod2(G_RtPQ, W_RtPQ);
+        if constexpr (::nda::mem::on_host<decltype(Sigma_RtPQ)>) {
+          auto had_prod2 = nda::map(
+              [](ComplexType x, ComplexType y) { return -1.0 * (x * y); });
+          Sigma_RtPQ = had_prod2(G_RtPQ, W_RtPQ);
+        } else {
+          // Sigma = -G * W: copy G into Sigma, then multiply by W in place,
+          // then negate via scale(-1).
+          Sigma_RtPQ = G_RtPQ;
+          nda::tensor::elementwise(ComplexType(1.0), W_RtPQ,    "RtPQ",
+                                   ComplexType(1.0), Sigma_RtPQ, "RtPQ",
+                                   nda::tensor::op::MUL);
+          nda::tensor::scale(ComplexType(-1.0), Sigma_RtPQ);
+        }
       }
       _Timer.stop("SIGMA_HADPROD_R");
       dG_sRtPQ.reset();
 
       if (nkpts != 1) {
         // FT back to q-space
-        auto f_kR = sf_Rk.local();
         utils::R_to_k_coefficients(mpi->comm, nda::range(nkpts), MF->kpts(), MF->lattv(), MF->kp_grid(), sf_Rk);
+        refresh_f();
 
         _Timer.start("SIGMA_FT_R");
         auto SigmaR_3D = nda::reshape(dSigma_sktPQ.local(), shape_t<3>{ns, nkpts, nt_loc * NP_loc * NQ_loc});
-        nda::matrix <ComplexType> buffer(nkpts, nt_loc*NP_loc*NQ_loc);
+        memory::array<MEM, ComplexType, 2> buffer(nkpts, nt_loc*NP_loc*NQ_loc);
         for (long s = 0; s < ns; ++s) {
-          nda::blas::gemm(f_kR, SigmaR_3D(s, nda::ellipsis{}), buffer);
+          if constexpr (MEM == HOST_MEMORY)
+            nda::blas::gemm(sf_Rk.local(), SigmaR_3D(s, nda::ellipsis{}), buffer);
+          else
+            nda::blas::gemm(f_Rk_dev,      SigmaR_3D(s, nda::ellipsis{}), buffer);
           SigmaR_3D(s, nda::ellipsis{}) = buffer;
         }
 
         if constexpr (!Wout_in_Rspace) {
           utils::R_to_k_coefficients(mpi->comm, nda::range(nkpts), MF->Qpts(), MF->lattv(), MF->kp_grid(), sf_Rk);
+          refresh_f();
           auto WR_2D = nda::reshape(dW_qtPQ.local(), shape_t < 2 > {nkpts, nt_loc * NP_loc * NQ_loc});
-          nda::blas::gemm(f_kR, WR_2D, buffer);
+          if constexpr (MEM == HOST_MEMORY)
+            nda::blas::gemm(sf_Rk.local(), WR_2D, buffer);
+          else
+            nda::blas::gemm(f_Rk_dev,      WR_2D, buffer);
           WR_2D = buffer;
         }
         _Timer.stop("SIGMA_FT_R");
@@ -215,13 +257,16 @@ namespace methods {
       _Timer.stop("EVALUATE_SIGMA_R");
     }
 
-    template<nda::MemoryArray Array_5D_t, nda::MemoryArray Array_4D_t, typename communicator_t>
+    template<MEMORY_SPACE MEM, nda::MemoryArray Array_5D_t, nda::MemoryArray Array_4D_t, typename communicator_t>
     void gw_t::eval_Sigma_all_kspace(const nda::MemoryArrayOfRank<5> auto &G_tskij,
                                      const memory::darray_t<Array_4D_t, communicator_t> &dW_qtPQ,
                                      sArray_t<Array_5D_t> &sSigma_tskij,
                                      THC_ERI auto &thc,
                                      bool minus_t) {
-      using local_Array_4D_t = nda::array<ComplexType, 4>;
+      static_assert(MEM == HOST_MEMORY,
+                    "gw_t::eval_Sigma_all_kspace: device path not yet ported; "
+                    "use the R-space algorithm (default for nqpts==nkpts) for GPU runs.");
+      using local_Array_4D_t = memory::array<MEM, ComplexType, 4>;
       using math::nda::make_distributed_array;
       using math::shm::make_shared_array;
       decltype(nda::range::all) all;
@@ -301,9 +346,7 @@ namespace methods {
 
           _Timer.start("SIGMA_MULTIPLY_DMAT_K");
           if (!minus_t or it_global != nt_half-1) { // to avoid double counting at it_global == nt_half-1
-            using math::sparse::T;                                    // when nt is an odd number
-            using math::sparse::H;
-            using math::sparse::csrmm;
+            using math::sparse::csrmm;                                // when nt is an odd number
             for (long isk=t_intra_comm.rank(); isk<ns*nkpts_ibz; isk+=t_intra_comm.size()) {
               long is = isk / nkpts_ibz;
               long ik = isk % nkpts_ibz;
@@ -314,10 +357,10 @@ namespace methods {
                 auto [cjg,D] = MF->symmetry_rotation(isym,ik);
                 utils::check(not cjg, "Oh oh.");
                 // Sigma_tskij = sum_ab conj(d[isym,k](a,i)) * Sigma_tskab * d[isym,k](b,j)
-                csrmm(ComplexType(1.0),H(*D),sSigma_tskab.local()(tpool_id,is,ik,all,all),
-                      ComplexType(0.0),Tm);
-                csrmm(ComplexType(1.0),T(*D),nda::transpose(Tm),
-                      ComplexType(1.0),nda::transpose(sSigma_tskij.local()(it_global,is,ik,all,all)));
+                csrmm<'H'>(ComplexType(1.0),*D,sSigma_tskab.local()(tpool_id,is,ik,all,all),
+                           ComplexType(0.0),Tm);
+                csrmm<'T'>(ComplexType(1.0),*D,nda::transpose(Tm),
+                           ComplexType(1.0),nda::transpose(sSigma_tskij.local()(it_global,is,ik,all,all)));
               }
             }
           }
@@ -367,6 +410,86 @@ namespace methods {
 
       _Timer.start("SIGMA_HADPROD_K");
       Sigma_skPQ() = 0.0;
+      // Device-safe Hadamard accumulators. On host the inline nda::map
+      // expressions evaluate cleanly; on device they trigger nda's "no
+      // expressions with device arrays" static_assert, so we route the
+      // four had_prod variants through tensor::* primitives via a small
+      // tmp scratch buffer (allocated once outside the loop).
+      using Sigma_t = std::decay_t<decltype(Sigma_skPQ)>;
+      constexpr bool sigma_on_host = ::nda::mem::on_host<Sigma_t>;
+      [[maybe_unused]] memory::array<
+          (sigma_on_host ? HOST_MEMORY : DEVICE_MEMORY), ComplexType, 2>
+        tmp_PQ;
+      if constexpr (not sigma_on_host) {
+        tmp_PQ = memory::array<DEVICE_MEMORY, ComplexType, 2>(Np_loc, Nq_loc);
+      }
+      [[maybe_unused]] auto accum_prod = [&](auto& Sout, auto const& X, auto const& Y,
+                            bool conj_Y, bool conj_result) {
+        if constexpr (sigma_on_host) {
+          if (conj_result) Sout += nda::conj(had_prod2(X, Y));
+          else if (conj_Y)  Sout += had_prod2_conj(X, Y);
+          else              Sout += had_prod2(X, Y);
+        } else {
+          // tmp = X * (conj(Y) if conj_Y else Y)
+          tmp_PQ() = X;
+          if (conj_Y) {
+            nda::tensor::elementwise(ComplexType(1.0), nda::conj(Y), "PQ",
+                                     ComplexType(1.0), tmp_PQ,        "PQ",
+                                     nda::tensor::op::MUL);
+          } else {
+            nda::tensor::elementwise(ComplexType(1.0), Y, "PQ",
+                                     ComplexType(1.0), tmp_PQ, "PQ",
+                                     nda::tensor::op::MUL);
+          }
+          if (conj_result)
+            nda::tensor::scale(ComplexType(1.0), tmp_PQ,
+                               nda::tensor::op::CONJ);
+          // Sout += factor * tmp
+          nda::tensor::elementwise(ComplexType(factor), tmp_PQ, "PQ",
+                                   ComplexType(1.0),    Sout,  "PQ",
+                                   nda::tensor::op::SUM);
+        }
+      };
+      if constexpr (not sigma_on_host) {
+        // DEVICE path (origin/gpu): the pre-T-3b whole-tile loop nest on tensor::* primitives.
+        for (size_t isk=0; isk<ns*nkpts_ibz; isk++) {
+          size_t is = isk/nkpts_ibz;
+          size_t ik = isk%nkpts_ibz;
+          long ks = MF->ks_to_k(isym,ik);
+          auto Sigma_k = Sigma_skPQ(is,ik,nda::ellipsis{});
+
+          for (size_t iq=0; iq<nqs; iq++) {
+            long qp = MF->Qs(isym,iq);   // qpoint index in the 1st BZ which can be mapped to IBZ through isym
+            long qs = MF->qp_to_ibz(qp); // associated qp index in the IBZ
+            auto W_q = W_qtPQ(qs, it, nda::ellipsis{});
+
+            if (qp_trev(qp)) {
+              long ksmqs_m = MF->qk_to_k2(qminus(qs),ks); // ksmqs_m + G = ks + qs = ks - (-qs)
+              if (kp_trev(ksmqs_m)) {
+                auto G_kmq = G_skPQ(is, kp_trev_pair(ksmqs_m), nda::ellipsis{});
+                // Sigma_k += conj(had_prod2(W_q, G_kmq)) = conj(factor * W * G)
+                accum_prod(Sigma_k, W_q, G_kmq, /*conj_Y*/ false, /*conj_result*/ true);
+              } else {
+                auto G_kmq = G_skPQ(is, ksmqs_m, nda::ellipsis{});
+                // Sigma_k += had_prod2_conj(G_kmq, W_q) = factor * G * conj(W)
+                accum_prod(Sigma_k, G_kmq, W_q, /*conj_Y*/ true, /*conj_result*/ false);
+              }
+            } else {
+              long ksmqs = MF->qk_to_k2(qs,ks);
+              if (kp_trev(ksmqs)) {
+                auto G_kmq = G_skPQ(is, kp_trev_pair(ksmqs), nda::ellipsis{});
+                // Sigma_k += had_prod2_conj(W_q, G_kmq) = factor * W * conj(G)
+                accum_prod(Sigma_k, W_q, G_kmq, /*conj_Y*/ true, /*conj_result*/ false);
+              } else {
+                auto G_kmq = G_skPQ(is, ksmqs, nda::ellipsis{});
+                // Sigma_k += had_prod2(G_kmq, W_q) = factor * G * W
+                accum_prod(Sigma_k, G_kmq, W_q, /*conj_Y*/ false, /*conj_result*/ false);
+              } // if ( kp_trev )
+            } // if ( qp_trev )
+          } // iq
+        } // isk
+      } else {
+      // HOST path (scgwt, T-3b): term list + P-blocked threaded accumulate, bitwise-pinned.
 
       // ---------------- T-3b threaded region: the Sigma Hadamard product ----------------
       // notes/coqui_threading_t3a.md section 2.3 ROW 3 / section 3.2. 35% (t4) / 41% (t8) of
@@ -490,6 +613,7 @@ namespace methods {
                        W_qtPQ(T.iqs, it, p_rng, nda::range::all), T.mode);
         }
       }
+      }
 
       /*for (size_t iq=0; iq<nqs; iq++) {
         long qp = MF->Qs(isym,iq);   // qpoint index
@@ -576,27 +700,54 @@ namespace methods {
         auto T_skia_loc = T_skia.local();
         auto chi_head = thc.basis_head()(0, nda::range::all);
         // T^{k}_{ia} = conj(X^{k}_{Pi}) * X^{k}_{Pa} * conj(chi_head(P) )
+        // T^{k}_{ia} = sum_P conj(X^{k}_{Pi}) X^{k}_{Pa} conj(chi_head(P))
+        //            = (Y^T X)_{ia}  with  Y_{Pi} = conj(chi_head(P)) conj(X^{k}_{Pi}),
+        // i.e. one gemm per (s,k). It used to be a scalar loop over (i,a,P):
+        // 9e9 terms at Si 2x2x2/500b, and for fixed (i,a) it walked X(P,i) with
+        // stride nbnd, so it missed cache on essentially every term. Same
+        // arithmetic, expressed as BLAS3: each rank still writes only the (s,k)
+        // blocks it owns and the all-reduce below combines them unchanged.
+        _Timer.start("SIGMA_DIV_T");
         T_skia.win().fence();
-        for (size_t skia = rank; skia < ns * nkpts * nbnd * nbnd; skia += size) {
-          // skia = is * nkpts*nbnd*nbnd + ik * nbnd*nbnd + i * nbnd + a
-          size_t is = skia / (nkpts * nbnd * nbnd);
-          size_t ik = (skia / (nbnd * nbnd)) % nkpts;
-          size_t i = (skia / nbnd) % nbnd;
-          size_t a = skia % nbnd;
-
-          auto Xsk = thc.X(is, 0, ik);
-          for (size_t P = 0; P < NP; ++P) {
-            T_skia_loc(is, ik, i, a) += nda::conj(Xsk(P, i)) * Xsk(P, a) * nda::conj(chi_head(P));
+        {
+          nda::array<ComplexType, 2> Y_Pi(NP, nbnd);
+          for (size_t sk = rank; sk < ns * nkpts; sk += size) {
+            size_t is = sk / nkpts;
+            size_t ik = sk % nkpts;
+            auto Xsk = thc.X(is, 0, ik);                       // (NP, nbnd)
+            for (size_t P = 0; P < NP; ++P) {
+              auto cP = nda::conj(chi_head(P));
+              for (size_t i_ = 0; i_ < nbnd; ++i_) Y_Pi(P, i_) = cP * nda::conj(Xsk(P, i_));
+            }
+            nda::blas::gemm(nda::transpose(Y_Pi), Xsk, T_skia_loc(is, ik, nda::ellipsis{}));
           }
         }
         T_skia.win().fence();
         T_skia.all_reduce();
+        _Timer.stop("SIGMA_DIV_T");
 
         nda::array<ComplexType, 2> buffer_ib(nbnd, nbnd);
 
-        auto sDelta_tskij = make_shared_array<Array_view_5D_t>(*mpi, sSigma_tskij.shape());
-        auto Delta_loc = sDelta_tskij.local();
-        sDelta_tskij.win().fence();
+        // Every (t,s,k) block below is written by exactly one rank, so on a
+        // single node the node's shm copy already holds the complete
+        // correction: the Sigma-sized (4.4 GB at Si 2x2x2/500b) staging buffer,
+        // its all-reduce and the final add are all pure overhead there, and we
+        // accumulate straight into Sigma instead (beta = 1 rather than 0).
+        // Across nodes the buffer is still needed, because each node computes
+        // only its own share and every node needs the whole correction.
+        _Timer.start("SIGMA_DIV_ALLOC");
+        const bool stage_delta = (sSigma_tskij.internode_comm()->size() > 1);
+        std::optional<sArray_t<Array_view_5D_t>> sDelta_tskij;
+        if (stage_delta)
+          sDelta_tskij.emplace(make_shared_array<Array_view_5D_t>(*mpi, sSigma_tskij.shape()));
+        _Timer.stop("SIGMA_DIV_ALLOC");
+
+        auto Delta_loc = (stage_delta)? sDelta_tskij.value().local() : sSigma_tskij.local();
+        auto& out_win = (stage_delta)? sDelta_tskij.value().win() : sSigma_tskij.win();
+        const ComplexType beta = (stage_delta)? ComplexType(0.0) : ComplexType(1.0);
+
+        _Timer.start("SIGMA_DIV_GEMM");
+        out_win.fence();
         for (size_t tsk = rank; tsk < nts * ns * nkpts; tsk += size) {
           // tsk = it * ns*nkpts + is * nkpts + ik
           size_t it = tsk / (ns * nkpts);
@@ -610,14 +761,31 @@ namespace methods {
           auto Delta_ij = Delta_loc(it, is, ik, nda::ellipsis{});
           auto T_ia = T_skia_loc(is, ik, nda::ellipsis{});
           nda::blas::gemm(T_ia, G_ab, buffer_ib);
-          nda::blas::gemm(ComplexType(factor), buffer_ib, nda::dagger(T_skia_loc(is, ik, nda::ellipsis{})), 
-                     ComplexType(0.0), Delta_ij);
+          nda::blas::gemm(ComplexType(factor), buffer_ib, nda::dagger(T_skia_loc(is, ik, nda::ellipsis{})),
+                     beta, Delta_ij);
         }
-        sDelta_tskij.win().fence();
-        sDelta_tskij.all_reduce();
+        out_win.fence();
+        _Timer.stop("SIGMA_DIV_GEMM");
 
-        if (sSigma_tskij.node_comm()->root())
-          sSigma_tskij.local() += sDelta_tskij.local();
+        if (stage_delta) {
+          _Timer.start("SIGMA_DIV_REDUCE");
+          sDelta_tskij.value().all_reduce();
+          _Timer.stop("SIGMA_DIV_REDUCE");
+
+          // Sum into Sigma with every rank on the node, not just its root:
+          // this touches ~13 GB at Si 2x2x2/500b and used to run on one core.
+          _Timer.start("SIGMA_DIV_ADD");
+          int node_rank = sSigma_tskij.node_comm()->rank();
+          int node_size = sSigma_tskij.node_comm()->size();
+          long nelem = long(sSigma_tskij.local().size());
+          auto [i0, i1] = itertools::chunk_range(0, nelem, node_size, node_rank);
+          auto Sigma_1D = nda::reshape(sSigma_tskij.local(), std::array<long, 1>{nelem});
+          auto Delta_1D = nda::reshape(sDelta_tskij.value().local(), std::array<long, 1>{nelem});
+          sSigma_tskij.win().fence();
+          Sigma_1D(nda::range(i0, i1)) += Delta_1D(nda::range(i0, i1));
+          sSigma_tskij.win().fence();
+          _Timer.stop("SIGMA_DIV_ADD");
+        }
         sSigma_tskij.communicator()->barrier();
       } else {
         utils::check(false, "Unsupported divergence treatment: {}", div_treatment);

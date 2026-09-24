@@ -141,7 +141,7 @@
  *
  * Composing with the MO factorizations gives the two collocation matrices of DERIVATION 1
  * (qp_modea.hpp): XCe = X(ks) . D . C(k) and XCi = X(k') . C(kp_to_ibz(k')). Note the ORDER:
- * D multiplies C from the LEFT -- csrmm(1, D, C) -- contracting D's COLUMN index against C's
+ * D multiplies C from the LEFT -- csrmm<'N'>(1, D, C) -- contracting D's COLUMN index against C's
  * primary index, which is the order both in-tree consumers use
  * (projector_boson_t.cpp:108-121; vertex_sym.hpp:36-42, Xhat = X(krot) . Dc).
  *
@@ -2034,7 +2034,7 @@ namespace qp_modea {
         for (long ik = 0; ik < nk_ibz; ++ik) {
           auto [cjg, D] = MF->symmetry_rotation(isym, ik);
           Dd() = ComplexType(0.0);
-          math::sparse::csrmm(ComplexType(1.0), *D, Id, ComplexType(0.0), Dd);
+          math::sparse::csrmm<'N'>(ComplexType(1.0), *D, Id, ComplexType(0.0), Dd);
           double di = 0.0;
           for (long i = 0; i < nbnd; ++i)
             for (long j = 0; j < nbnd; ++j)
@@ -2165,7 +2165,7 @@ namespace qp_modea {
             auto [cjg, D] = MF->symmetry_rotation(isym, ik);
             utils::check(not cjg, "qp_modea (band factors): symmetry_rotation(isym = {}, "
                                   "k = {}) reports the conjugation flag.", isym, ik);
-            math::sparse::csrmm(ComplexType(1.0), *D,
+            math::sparse::csrmm<'N'>(ComplexType(1.0), *D,
                                 nda::make_regular(sMO_skia.local()(is, ik, all, all)),
                                 ComplexType(0.0), DC_b);
             nda::blas::gemm(thc.X(is, 0, ks), DC_b, XCe_b);
@@ -2221,7 +2221,7 @@ namespace qp_modea {
             utils::check(not cjg, "qp_modea: symmetry_rotation(isym = {}, k = {}) reports the "
                                   "conjugation flag, which the GW assembly this map reproduces "
                                   "does not handle either (thc_gw.icc:311).", isym, ik);
-            math::sparse::csrmm(ComplexType(1.0), *D,
+            math::sparse::csrmm<'N'>(ComplexType(1.0), *D,
                                 nda::make_regular(sMO_skia.local()(is, ik, all, all)),
                                 ComplexType(0.0), DC);
             nda::blas::gemm(thc.X(is, 0, ks), DC, XCe);

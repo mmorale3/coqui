@@ -26,6 +26,7 @@
 #include <cctype>
 
 #include "configuration.hpp"
+#include "utilities/h5_background_writer.hpp"
 #include "utilities/check.hpp"
 
 #include "h5/h5.hpp"
@@ -137,6 +138,20 @@ namespace iter_scf {
              max_subsp_size, true, Heff(H));
       initialized = true;
     }
+
+    /**
+     * Present only so that iter_scf_t's variant visit compiles for damping's
+     * in-memory fast path; DIIS needs the whole iterate history rather than just
+     * the previous one, so it always goes through the checkpoint. Never reached:
+     * damping_impl only takes that path when the algorithm is simple damping.
+     */
+    template<nda::MemoryArray Array_H_t, nda::MemoryArray Array_P_t>
+    double solve(Array_H_t &&, Array_P_t const&) {
+      utils::check(false, "diis_t::solve: mixing against an in-memory previous iterate is "
+                          "only implemented for simple damping.");
+      return 0.0;
+    }
+
 
     /**
      * @brief Perform one QP-SCF DIIS step on the effective Hamiltonian.
@@ -340,6 +355,7 @@ namespace iter_scf {
     double get_mu() {
         long iter_from_file;
         std::string filename = mbpt_output + ".mbpt.h5";
+        utils::h5_quiesce();  // see h5_background_writer.hpp
         h5::file file(filename, 'r');
         h5::group grp(file);
         utils::check(grp.has_subgroup("scf"), "Simulation HDF5 file does not have an scf group");

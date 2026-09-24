@@ -27,6 +27,7 @@
 #include "utilities/proc_grid_partition.hpp"
 #include "utilities/functions.hpp"
 #include "utilities/kpoint_utils.hpp"
+#include "utilities/device_pool.h"
 #include "numerics/nda_functions.hpp"
 #include "mean_field/properties.hpp"
 #include "mean_field/distributed_orbital_readers.hpp"
@@ -843,10 +844,20 @@ auto thc::get_ZquG_Cquv_rspace(nda::MemoryArrayOfRank<1> auto const& IPts,
   Z_qur.local() = ComplexType(0.0);
   Timer.stop("ALLOC");
 
+  // Stage markers below: everything from here to the r->G fft used to run with no logging at
+  // all between two app_log(2) calls -- several hundred lines and every allocation in the
+  // routine -- so a failure anywhere inside it could not be placed without a rebuild.
+  app_log(3, "  thc::get_ZquG_Cquv_rspace: Z_qur loop over {} nnr block(s) "
+             "(nnr={}, block size={}, nIpts={}, nspins={})",
+          nblocks_nnr, rho_g.nnr(), nnr_block_size, nIpts, nspins);
+  utils::memory_report(3, "get_ZquG_Cquv_rspace: after Z_qur alloc");
+
   // this loop calculates Z_qur by looping over nnr ranges
   for( long i_nnr=0; i_nnr<nblocks_nnr; ++i_nnr ) {
- 
-    nda::range nnr_range(i_nnr*nnr_block_size,std::min((i_nnr+1)*nnr_block_size,long(rho_g.nnr())));    
+
+    nda::range nnr_range(i_nnr*nnr_block_size,std::min((i_nnr+1)*nnr_block_size,long(rho_g.nnr())));
+    app_log(3, "    nnr block {}/{}: r range [{},{})", i_nnr+1, nblocks_nnr,
+            nnr_range.first(), nnr_range.last());
     // try to avoid all the reallocations!
     // F(R,u,r) = sum_k exp(ikR) Ta(k,u,r)
     // distribution only over (u,r)
@@ -857,9 +868,12 @@ auto thc::get_ZquG_Cquv_rspace(nda::MemoryArrayOfRank<1> auto const& IPts,
     F2D() = ComplexType(0.0);
     Timer.stop("ALLOC");
 
-    // calculate T(u,r) for all kpoints and orbital ranges 
-    for( auto ispin : nda::range(nspins) ) 
+    utils::memory_report(3, "get_ZquG_Cquv_rspace: after F_Rur alloc");
+
+    // calculate T(u,r) for all kpoints and orbital ranges
+    for( auto ispin : nda::range(nspins) )
     {
+      app_log(3, "      spin {}/{}: T(k,u,r)", ispin+1, nspins);
 
       {
         // attempt to find a better processor grid for this step
@@ -944,11 +958,14 @@ auto thc::get_ZquG_Cquv_rspace(nda::MemoryArrayOfRank<1> auto const& IPts,
       }
 
       {
+        app_log(3, "      spin {}/{}: Z(q,u,r) = sum_R exp(-iqR) F(R,u,r), then redistribute",
+                ispin+1, nspins);
         Timer.start("ALLOC");
         auto Zq{make_distributed_array<local_Array_t>(mpi->comm,{1,1,mpi->comm.size()},
                 {nqpts_ibz,nIpts,nnr_range.size()})};
         Timer.stop("ALLOC");
-  
+        utils::memory_report(3, "get_ZquG_Cquv_rspace: after Zq alloc");
+
         Timer.start("ZUR");
         auto Z2D = nda::reshape(Zq.local(), shape_t<2>{nqpts_ibz,nIpts*Zq.local_shape()[2]});
         auto Qm = nda::make_regular(mf->Qpts_ibz());
@@ -980,7 +997,10 @@ auto thc::get_ZquG_Cquv_rspace(nda::MemoryArrayOfRank<1> auto const& IPts,
 
   } // nnr_range
 
-  // quv distributed array 
+  app_log(3, "  thc::get_ZquG_Cquv_rspace: Z_qur done; building C_quv (r->v collocation)");
+  utils::memory_report(3, "get_ZquG_Cquv_rspace: Z_qur loop complete");
+
+  // quv distributed array
   Timer.start("ALLOC");
   auto C_quv{make_distributed_array<local_uArray_t>(mpi->comm,pgrid,
                 {nqpts_ibz,nIpts,nIpts},{block_size[0],block_size[1],block_size[1]})};
@@ -1164,7 +1184,9 @@ auto thc::get_ZquG_Cquv_fft(nda::MemoryArrayOfRank<1> auto const& IPts,
     if constexpr (MEM==HOST_MEMORY) {
       mem0 = long(utils::freemem());
     } else {
-      mem0 = long(utils::freemem_device());
+      // pool-aware: the unused part of a live device pool is reclaimable,
+      // and blocks too large for the pool bypass it entirely.
+      mem0 = long(utils::freemem_device_effective());
     }
     double mem=0.0;
     // the largest memory usage is in get_ZquG_Cquv, so using just that
@@ -1277,7 +1299,7 @@ auto thc::get_ZquG_Cquv_fft(nda::MemoryArrayOfRank<1> auto const& IPts,
     if constexpr (MEM==HOST_MEMORY) {
       mem = long(utils::freemem());
     } else {
-      mem = long(utils::freemem_device());
+      mem = long(utils::freemem_device_effective());
     }
     // 75% of available memory in units of ComplexType
     mem *= memory_frac * 1024.0 * 1024.0 / sizeof(ComplexType);        
@@ -1444,7 +1466,16 @@ auto thc::get_ZquG_Cquv_fft(nda::MemoryArrayOfRank<1> auto const& IPts,
         for( auto i : nda::range(nI) )
           iu_loc(i) = Z_qug.origin()[1] + b0 + i;
         if(nI<nI_per_blk)
-          iu_for_Xb(nda::range(nI,nI_per_blk)) = -1;
+          // Pad THIS RANK's slice. This used to index iu_for_Xb absolutely, i.e. positions
+          // [nI,nI_per_blk) of the global array, which belong to rank 0. Since the reduction
+          // below is a SUM, a rank with a partial block silently subtracted 1 from one of
+          // rank 0's interpolating-point indices: with nIpts=1275 on 4 ranks (nI_per_blk=319,
+          // ranks 0-2 hold 319 points, rank 3 holds 318) rank 3 wrote -1 at absolute index
+          // 318, turning rank 0's iu_for_Xb[318] from 318 into 317. Row 318 of C_quv then
+          // duplicated row 317, making C non-symmetric and exactly rank deficient
+          // (cond 1.4e19 vs 4.5e11), which in turn made the ISDF solve non-unique.
+          // GPU-only: the HOST path goes through get_ZquG_Cquv_fft_shared_memory.
+          iu_loc(nda::range(nI,nI_per_blk)) = -1;
         mpi->comm.all_reduce_in_place_n(iu_for_Xb.data(),iu_for_Xb.size(),std::plus<>{});
       }
       auto Tkur = memory::array_view<MEM,ComplexType,2>({nkloc, nI*rho_g.nnr()},buffer1.data());

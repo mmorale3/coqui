@@ -22,6 +22,7 @@
 #ifndef COQUI_SCF_COMMON_HPP
 #define COQUI_SCF_COMMON_HPP
 
+#include <cmath>
 #include "configuration.hpp"
 #include "utilities/mpi_context.h"
 #include "nda/nda.hpp"
@@ -52,12 +53,25 @@ auto bracket_mu_root(double old_mu, double delta, eval_t &&eval_f)
   -> std::tuple<double, double, double, double> {
   
   double f_old = eval_f(old_mu);
+  // A wrong Sigma makes N(mu) monotone-but-never-crossing, or NaN. Both used to spin here: the
+  // bracketing walk had no limit, and a NaN falls through every comparison, so the search returned
+  // a NaN mu without a word. Cap the walk and fail loudly (origin/gpu ec3f7ab, ported to the refactored
+  // search): 200 steps of delta = 40 a.u. at the default delta, far beyond any real band.
+  constexpr int max_bracket_steps = 200;
+  utils::check(std::isfinite(f_old),
+               "update_mu: nelec is not finite at the starting mu = {}. The self-energy or the "
+               "eigenspectra are corrupt; the chemical potential search cannot proceed.", old_mu);
 
   if (f_old >= 0.0) {
     double mu_hi = old_mu;
     double mu_lo = old_mu - delta;
     double f_lo = eval_f(mu_lo);
+    int nstep = 0;
     while (f_lo > 0.0) {
+      utils::check(++nstep <= max_bracket_steps,
+                   "update_mu: failed to bracket the electron count from below after {} steps of {} a.u. "
+                   "(mu = {}, nelec - target = {}). N(mu) is not decreasing towards the target -- check "
+                   "the self-energy.", max_bracket_steps, delta, mu_lo, f_lo);
       mu_lo -= delta;
       f_lo = eval_f(mu_lo);
     }
@@ -67,7 +81,12 @@ auto bracket_mu_root(double old_mu, double delta, eval_t &&eval_f)
   double mu_lo = old_mu;
   double mu_hi = old_mu + delta;
   double f_hi = eval_f(mu_hi);
+  int nstep = 0;
   while (f_hi < 0.0) {
+    utils::check(++nstep <= max_bracket_steps,
+                 "update_mu: failed to bracket the electron count from above after {} steps of {} a.u. "
+                 "(mu = {}, nelec - target = {}). N(mu) is not increasing towards the target -- check "
+                 "the self-energy.", max_bracket_steps, delta, mu_hi, f_hi);
     mu_hi += delta;
     f_hi = eval_f(mu_hi);
   }
@@ -89,7 +108,13 @@ auto update_mu_bisection_impl(double old_mu, double tol, double delta, eval_t &&
   
   double mu_mid = 0.5 * (mu_lo + mu_hi);
   double f_mid = eval_f(mu_mid);
+  constexpr int max_bisect_steps = 200;   // 40 a.u. / 2^200; tol is never this small
+  int nbisect = 0;
   while (std::abs(f_mid) >= tol) {
+    utils::check(++nbisect <= max_bisect_steps,
+                 "update_mu: bisection did not reach mu_tol = {} in {} steps; bracket is [{}, {}] and "
+                 "nelec - target = {}. N(mu) is likely discontinuous at the target.",
+                 tol, max_bisect_steps, mu_lo, mu_hi, f_mid);
     if (f_mid >= 0.0) {
       mu_hi = mu_mid;
     } else {
@@ -98,6 +123,10 @@ auto update_mu_bisection_impl(double old_mu, double tol, double delta, eval_t &&
     mu_mid = 0.5 * (mu_lo + mu_hi);
     f_mid = eval_f(mu_mid);
   }
+  // Every comparison against a NaN is false, so a NaN appearing after the start would walk out as the answer.
+  utils::check(std::isfinite(mu_mid) and std::isfinite(f_mid),
+               "update_mu: search converged to a non-finite result (mu = {}, nelec - target = {}). The "
+               "self-energy or the eigenspectra are corrupt.", mu_mid, f_mid);
   return {mu_mid, f_mid};
 }
 
@@ -512,17 +541,25 @@ double solve_iterative(utils::mpi_context_t<comm_t> &context, iter_scf::iter_scf
  * @param restart      - [INPUT] whether this is a restart SCF
  * @return - maximum norm of the SCF error for F and Sigma
  */
+/**
+ * @param sF_prev      - [INPUT] previous iterate of F, if the caller still has it
+ * @param sSigma_prev  - [INPUT] previous iterate of Sigma, likewise
+ * When both are given, simple mixing uses them instead of reading them back from
+ * the checkpoint (4.4 GB of serial HDF5 per iteration at Si 2x2x2/500b).
+ */
 template<typename comm_t, typename X_t, typename Xt_t>
 auto solve_iterative(utils::mpi_context_t<comm_t> &context, iter_scf::iter_scf_t& iter_solver,
                      long iteration, std::string h5_prefix, X_t &sF_skij, Xt_t &sSigma_tskij,
                      const imag_axes_ft::IAFT *FT,
-                     std::array<std::string,3> dataset={"scf", "F_skij", "Sigma_tskij"})
+                     std::array<std::string,3> dataset={"scf", "F_skij", "Sigma_tskij"},
+                     X_t const* sF_prev = nullptr, Xt_t const* sSigma_prev = nullptr)
   -> std::tuple<double, double>;
 
 template<typename MPI_Context_t, typename X_t, typename Xt_t>
 auto damping_impl(MPI_Context_t &context, iter_scf::iter_scf_t& iter_solver,
                   long iteration, std::string h5_prefix, X_t &sF_skij, Xt_t &sSigma_tskij,
-                  std::array<std::string,3> datasets={"scf", "F_skij", "Sigma_tskij"})
+                  std::array<std::string,3> datasets={"scf", "F_skij", "Sigma_tskij"},
+                  X_t const* sF_prev = nullptr, Xt_t const* sSigma_prev = nullptr)
 -> std::tuple<double, double>;
 
 template<typename MPI_Context_t, typename X_t, typename Xt_t>

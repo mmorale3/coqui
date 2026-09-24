@@ -57,6 +57,15 @@ std::size_t freemem_device()
 #endif
 }
 
+void device_sync()
+{
+#if defined(ENABLE_CUDA)
+  cudaDeviceSynchronize();
+#elif defined(ENABLE_HIP)
+  hipDeviceSynchronize();
+#endif
+}
+
 void memory_report(int io_lvl, std::string message)
 {
   if(message.size() > 0) app_log(io_lvl,"  memory report: " + message); 

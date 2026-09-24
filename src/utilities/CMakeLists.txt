@@ -27,6 +27,7 @@ SET(UTILITIES
   parser.cpp
   harmonics.cpp
   freemem.cpp
+  device_pool.cpp
   mpi_context.cpp
 )
 ADD_LIBRARY(utils ${UTILITIES})

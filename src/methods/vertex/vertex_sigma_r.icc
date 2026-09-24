@@ -434,14 +434,12 @@ namespace vertex_detail {
               for (long b = 0; b < nbnd; ++b)
                 Sigma_r_tskab(it, is, ik, a, b) += res(a, b);
           } else {
-            using math::sparse::T;
-            using math::sparse::H;
             using math::sparse::csrmm;
             auto [cjg, D] = MF->symmetry_rotation(isym, ik);
             utils::check(not cjg, "eval_sigma_C_response_sym: unexpected conjugated "
                                   "symmetry rotation at (isym = {}, ik = {}).", isym, ik);
-            csrmm(ComplexType(1.0), H(*D), res, ComplexType(0.0), Tm);
-            csrmm(ComplexType(1.0), T(*D), nda::transpose(Tm), ComplexType(1.0),
+            csrmm<'H'>(ComplexType(1.0), *D, res, ComplexType(0.0), Tm);
+            csrmm<'T'>(ComplexType(1.0), *D, nda::transpose(Tm), ComplexType(1.0),
                   nda::transpose(Sigma_r_tskab(it, is, ik, all, all)));
           }
         }

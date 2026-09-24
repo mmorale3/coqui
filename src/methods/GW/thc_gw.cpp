@@ -45,6 +45,7 @@
 
 namespace methods {
   namespace solvers {
+    template<MEMORY_SPACE MEM>
     void gw_t::evaluate(MBState &mb_state, THC_ERI auto const& thc, bool verbose) {
       if (verbose) {
         //http://patorjk.com/software/taag/#p=display&f=Calvin%20S&t=COQUI%20thc-gw
@@ -69,8 +70,16 @@ namespace methods {
                    "gw_t::evaluate: sG_tskij is not initialized in MBState.");
       utils::check(mb_state.sSigma_tskij.has_value(),
                      "gw_t::evaluate: sSigma_tskij is not initialized in MBState.");
+      // Either copy of W will do: the device path keeps only dW_qtPQ_dev and
+      // skips the host mirror (which nothing here reads), so requiring the host
+      // one aborted every device run.
+#if defined(ENABLE_DEVICE)
+      utils::check(mb_state.dW_qtPQ.has_value() or mb_state.dW_qtPQ_dev.has_value(),
+                   "gw_t::evaluate: neither dW_qtPQ nor dW_qtPQ_dev is initialized in MBState.");
+#else
       utils::check(mb_state.dW_qtPQ.has_value(),
                    "gw_t::evaluate: dW_qtPQ is not initialized in MBState.");
+#endif
       utils::check(_ft->nt_f() == _ft->nt_b(),
                    "thc-gw: We assume nt_f == nt_b at least for now. \n"
                    "        And we assume tau sampling for fermions and bosons are the same.");
@@ -92,14 +101,40 @@ namespace methods {
                      "EVALUATE_W",
                      "EVALUATE_SIGMA_K", "SIGMA_ALLOC_K", "SIGMA_HADPROD_K", "SIGMA_MULTIPLY_DMAT_K",
                      "EVALUATE_SIGMA_R", "SIGMA_ALLOC_R", "SIGMA_FT_R", "SIGMA_HADPROD_R",
-                     "IMAG_FT_TtoW", "IMAG_FT_WtoT", "FT_REDISTRIBUTE"} ) {
+                     "IMAG_FT_TtoW", "IMAG_FT_WtoT", "FT_REDISTRIBUTE",
+                     "SIGMA_DIV_CORR", "SIGMA_DIV_T", "SIGMA_DIV_ALLOC", "SIGMA_DIV_GEMM",
+                     "SIGMA_DIV_REDUCE", "SIGMA_DIV_ADD"} ) {
         _Timer.add(v);
       }
 
       _Timer.start("TOTAL");
-      thc_gw_Xqindep(mb_state.sG_tskij.value().local(), mb_state.sSigma_tskij.value(), thc,
-                     mb_state.dW_qtPQ.value(), mb_state.eps_inv_head.value());
+#if defined(ENABLE_DEVICE)
+      if constexpr (MEM == DEVICE_MEMORY) {
+        // Prefer the device-resident dW set by scr_coulomb_t::update_w<DEVICE>;
+        // this skips a full host->device mirror of dW per SCF iter.
+        if (mb_state.dW_qtPQ_dev.has_value()) {
+          thc_gw_Xqindep<MEM>(mb_state.sG_tskij.value().local(),
+                              mb_state.sSigma_tskij.value(), thc,
+                              mb_state.dW_qtPQ_dev.value(),
+                              mb_state.eps_inv_head.value());
+        } else {
+          thc_gw_Xqindep<MEM>(mb_state.sG_tskij.value().local(),
+                              mb_state.sSigma_tskij.value(), thc,
+                              mb_state.dW_qtPQ.value(),
+                              mb_state.eps_inv_head.value());
+        }
+      } else
+#endif
+      {
+        thc_gw_Xqindep<MEM>(mb_state.sG_tskij.value().local(),
+                            mb_state.sSigma_tskij.value(), thc,
+                            mb_state.dW_qtPQ.value(),
+                            mb_state.eps_inv_head.value());
+      }
 
+      // ISDF-Vertex / LFF-Sigma consumers: HOST-only (the vertex routines are not ported to the
+      // device yet, notes/vertex_perf_plan.md "gpu port"). On the device path they must be inactive.
+      if constexpr (MEM == HOST_MEMORY) {
       // ISDF-Vertex: second-order-exchange self-energy cut Sigma^C, accumulated
       // into sSigma_tskij on top of the GW self-energy. When no active vertex is
       // attached this is a strict no-op -- no allocation, no arithmetic -- so the
@@ -216,6 +251,15 @@ namespace methods {
                 b0, b0 + nb, dmax, smax, dmax / std::max(smax, 1e-300));
         mb_state.dSigma_pair_tskab.reset();
       }
+      } else {
+        utils::check(_vertex == nullptr or not _vertex->active(),
+                     "gw_t::evaluate<DEVICE_MEMORY>: the ISDF-Vertex Sigma^C cut is host-only.");
+        utils::check(not mb_state.dWsig_qtPQ.has_value() and not mb_state.dWsig_inf_qPQ.has_value() and
+                     not mb_state.dSigma_pair_tskab.has_value(),
+                     "gw_t::evaluate<DEVICE_MEMORY>: the LFF-Sigma corrections are host-only.");
+        _sigma_lff_dmax = _sigma_lff_smax = _sigma_lff_dfmax = 0.0;
+        _sigma_pair_dmax = _sigma_pair_smax = 0.0;
+      }
       _Timer.stop("TOTAL");
 
       print_thc_gw_timers();
@@ -276,7 +320,9 @@ namespace methods {
                      "EVALUATE_W",
                      "EVALUATE_SIGMA_K", "SIGMA_ALLOC_K", "SIGMA_HADPROD_K", "SIGMA_MULTIPLY_DMAT_K",
                      "EVALUATE_SIGMA_R", "SIGMA_ALLOC_R", "SIGMA_FT_R", "SIGMA_HADPROD_R",
-                     "IMAG_FT_TtoW", "IMAG_FT_WtoT", "FT_REDISTRIBUTE"} ) {
+                     "IMAG_FT_TtoW", "IMAG_FT_WtoT", "FT_REDISTRIBUTE",
+                     "SIGMA_DIV_CORR", "SIGMA_DIV_T", "SIGMA_DIV_ALLOC", "SIGMA_DIV_GEMM",
+                     "SIGMA_DIV_REDUCE", "SIGMA_DIV_ADD"} ) {
         _Timer.add(v);
       }
 
@@ -296,7 +342,8 @@ namespace methods {
       sSigma_tskij.communicator()->barrier();
     }
 
-    template<nda::MemoryArray Array_5D_t, nda::MemoryArray Array_4D_t, typename communicator_t>
+    template<MEMORY_SPACE MEM,
+             nda::MemoryArray Array_5D_t, nda::MemoryArray Array_4D_t, typename communicator_t>
     void gw_t::eval_Sigma_all(const nda::MemoryArrayOfRank<5> auto &G_tskij,
                         memory::darray_t<Array_4D_t, communicator_t> &dW_qtPQ,
                         sArray_t<Array_5D_t> &sSigma_tskij,
@@ -309,17 +356,44 @@ namespace methods {
         app_log(2, "    - processor grid for G: (t, k, P, Q) = ({}, {}, {}, {})", tpools, qpools, np_P, np_Q);
         app_log(2, "    - processor grid for W: (t, q, P, Q) = ({}, {}, {}, {})\n", tpools, qpools, np_P, np_Q);
 
-        eval_Sigma_all_Rspace<false, true>(G_tskij, dW_qtPQ, sSigma_tskij, thc, false);
-        eval_Sigma_all_Rspace<true, false>(G_tskij, dW_qtPQ, sSigma_tskij, thc, true);
+        // If the input dW is already on the target MEM (the caller passed
+        // mb_state.dW_qtPQ_dev), use it directly. Otherwise — backwards-
+        // compat path — mirror host dW to MEM once for the two FT
+        // round-trips and discard on return.
+        constexpr bool dW_already_on_target =
+            (MEM == HOST_MEMORY && nda::mem::on_host<Array_4D_t>) ||
+            (MEM == DEVICE_MEMORY && nda::mem::on_device<Array_4D_t>) ||
+            (MEM == UNIFIED_MEMORY && nda::mem::on_unified<Array_4D_t>);
+        if constexpr (dW_already_on_target) {
+          eval_Sigma_all_Rspace<MEM, false, true>(G_tskij, dW_qtPQ, sSigma_tskij, thc, false);
+          eval_Sigma_all_Rspace<MEM, true, false>(G_tskij, dW_qtPQ, sSigma_tskij, thc, true);
+        } else {
+          using local_Array_4D_dev = memory::array<MEM, ComplexType, 4>;
+          using math::nda::make_distributed_array;
+          auto pgrid_h = dW_qtPQ.grid();
+          auto bsize_h = dW_qtPQ.block_size();
+          auto gshape_h = dW_qtPQ.global_shape();
+          auto dW_dev = make_distributed_array<local_Array_4D_dev>(
+              *dW_qtPQ.communicator(), pgrid_h, gshape_h, bsize_h);
+          dW_dev.local() = dW_qtPQ.local();
+          eval_Sigma_all_Rspace<MEM, false, true>(G_tskij, dW_dev, sSigma_tskij, thc, false);
+          eval_Sigma_all_Rspace<MEM, true, false>(G_tskij, dW_dev, sSigma_tskij, thc, true);
+        }
       } else if (alg == "k") {
         auto [qpools, tpools, np_P, np_Q] = dW_qtPQ.grid();
         app_log(2, "  Evaluation of GW self-energy:");
         app_log(2, "    - processor grid for W: (t, q, P, Q) = ({}, {}, {}, {})\n", tpools, qpools, np_P, np_Q);
 
-        eval_Sigma_all_kspace(G_tskij, dW_qtPQ, sSigma_tskij, thc, false);
-        eval_Sigma_all_kspace(G_tskij, dW_qtPQ, sSigma_tskij, thc, true);
-        // collect terms from all processors
-        sSigma_tskij.all_reduce();
+        if constexpr (MEM == HOST_MEMORY) {
+          eval_Sigma_all_kspace<MEM>(G_tskij, dW_qtPQ, sSigma_tskij, thc, false);
+          eval_Sigma_all_kspace<MEM>(G_tskij, dW_qtPQ, sSigma_tskij, thc, true);
+          // collect terms from all processors
+          sSigma_tskij.all_reduce();
+        } else {
+          utils::check(false, "gw_t::eval_Sigma_all: device path supports only "
+                              "the R-space algorithm (alg=\"R\"). Set "
+                              "kpts==qpts to dispatch the R-space variant.");
+        }
       } else {
         utils::check(false, "Unkown algorithm for GW self-energy: {}. either \"R\" or \"k\"", alg);
       }
@@ -335,14 +409,17 @@ namespace methods {
     template void gw_t::evaluate(const Arrv &, sArray_t<Arrv> &, const thc_reader_t &, scr_coulomb_t*, bool);
     template void gw_t::evaluate(const Arrv2 &, sArray_t<Arrv> &, const thc_reader_t &, scr_coulomb_t*, bool);
 
-    template void gw_t::evaluate(MBState&, const thc_reader_t&, bool);
+    template void gw_t::evaluate<HOST_MEMORY>(MBState&, const thc_reader_t&, bool);
+#if defined(ENABLE_DEVICE)
+    template void gw_t::evaluate<DEVICE_MEMORY>(MBState&, const thc_reader_t&, bool);
+#endif
 
-    template void gw_t::eval_Sigma_all(const Arr &, memory::darray_t<Arr4D, mpi3::communicator> &, sArray_t<Arrv> &,
-          thc_reader_t&, std::string); 
-    template void gw_t::eval_Sigma_all(const Arrv &, memory::darray_t<Arr4D, mpi3::communicator> &, sArray_t<Arrv> &,
-          thc_reader_t&, std::string); 
-    template void gw_t::eval_Sigma_all(const Arrv2 &, memory::darray_t<Arr4D, mpi3::communicator> &, sArray_t<Arrv> &,
-          thc_reader_t&, std::string); 
+    template void gw_t::eval_Sigma_all<HOST_MEMORY>(const Arr &, memory::darray_t<Arr4D, mpi3::communicator> &, sArray_t<Arrv> &,
+          thc_reader_t&, std::string);
+    template void gw_t::eval_Sigma_all<HOST_MEMORY>(const Arrv &, memory::darray_t<Arr4D, mpi3::communicator> &, sArray_t<Arrv> &,
+          thc_reader_t&, std::string);
+    template void gw_t::eval_Sigma_all<HOST_MEMORY>(const Arrv2 &, memory::darray_t<Arr4D, mpi3::communicator> &, sArray_t<Arrv> &,
+          thc_reader_t&, std::string);
 
   }
 }
