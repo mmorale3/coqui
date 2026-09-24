@@ -57,6 +57,7 @@
 #include "mpi3/environment.hpp"
 #include "mpi3/communicator.hpp"
 
+#include "nda/blas.hpp"   // before nda/lapack.hpp: its CUDA branch names nda::blas::device (cublas_interface.hpp)
 #include "nda/lapack.hpp"
 
 #include "utilities/test_common.hpp"

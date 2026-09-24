@@ -26,6 +26,7 @@
 #include <string>
 
 #include "nda/nda.hpp"
+#include "nda/blas.hpp"   // before nda/lapack.hpp: its CUDA branch names nda::blas::device (cublas_interface.hpp)
 #include "nda/lapack.hpp"
 
 #include "numerics/nda_functions.hpp"
