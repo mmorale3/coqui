@@ -105,16 +105,278 @@ __global__ void scatter_kernel(kdims d, int which_pass, cd inu,
   }
 }
 
-// ---- phase D: assemble AU/AT (+ the sparse confluent tables) into F and Fsum ------------------
-__global__ void assemble_kernel(kdims d, long ik, double const *__restrict__ fhalf,
-                                double const *__restrict__ fd1, cd const *__restrict__ Dsq,
-                                cd const *__restrict__ AU, cd const *__restrict__ AT, cd const *__restrict__ M2,
-                                cd *__restrict__ Ffam, cd *__restrict__ Fsum) {
-  const long np = d.np, blk = d.blk, nc = d.nc, nR = d.nR, nk = d.nk;
-  const long n = blockIdx.x, part = blockIdx.y;
+
+// ---- phase C, v2: one block per COMPONENT, the poles looped inside ---------------------------
+// v1 launches (pole, component) blocks and atomically accumulates every term. For a fixed
+// component c the a-indexed target A[c-1] is the SAME block for all ng poles, so v1 pays ng
+// atomics per address there. v2 makes c the grid and walks the poles inside the block, holding
+// the a-indexed contribution in registers and issuing ONE atomic at the end -- ng times fewer
+// atomics on that target. The nj-indexed terms keep their atomics (nj varies with the pole).
+// Requires all poles' gemm outputs resident (ng * W complex each for Q and B).
+__global__ void scatter_kernel_v2(kdims d, int which_pass, cd inu,
+                                  cd const *__restrict__ Qall, cd const *__restrict__ Ball,
+                                  double const *__restrict__ eps, double const *__restrict__ epsG,
+                                  long const *__restrict__ gnode,
+                                  cd *__restrict__ AU, cd *__restrict__ AT, cd *__restrict__ M2,
+                                  cd *__restrict__ A1, cd *__restrict__ A3) {
+  const long c = blockIdx.x;
+  const long np = d.np, ng = d.ng, blk = d.blk, ncomp = d.ncomp;
+  const long W = d.nc * ncomp * d.nR * d.nc;
+  const int part = (c == 0) ? 1 : 0;
+  const long abase = (long(part) * np) * blk;
+  const long aU = (c >= 1 && c <= np) ? c - 1 : ((c > np) ? c - 1 - np : -1);
+  const bool U_is_a = (c >= 1 && c <= np);
+  for (long e = threadIdx.x; e < blk; e += blockDim.x) {
+    const long x = e / (d.nR * d.nc), rem = e % (d.nR * d.nc);
+    const long src = (x * ncomp + c) * d.nR * d.nc + rem;
+    cd accU = make_cuDoubleComplex(0.0, 0.0), accT = accU;    // the a-indexed reductions, in registers
+    for (long pole = 0; pole < ng; ++pole) {
+      const long nj = gnode[pole];
+      const double ej = epsG[pole];
+      cd q = Qall[pole * W + src];
+      cd b = (which_pass == 0) ? Ball[pole * W + src] : q;
+      cd vU = q, vT = b;
+      if (which_pass == 1) { vU = make_cuDoubleComplex(-q.x, -q.y); vT = inu * q; }
+      if (c == 0) { atomic_add(&AU[abase + nj * blk + e], vU); atomic_add(&AT[abase + nj * blk + e], vT); continue; }
+      if (U_is_a) {
+        const long a = aU;
+        if (a == nj) atomic_add(&M2[abase + nj * blk + e], vU);
+        else {
+          const double w = 1.0 / (ej - eps[a]);
+          atomic_add(&AU[abase + nj * blk + e], scal(w, vU));
+          accU = accU + scal(-w, vU);
+        }
+        const double ea = eps[a];
+        const cd w2 = make_cuDoubleComplex(1.0 / (ea - ej), 0.0);
+        const cd dd = make_cuDoubleComplex(ej - ea + inu.x, inu.y);
+        const cd wd = cuCdiv(w2, dd);
+        const cd wt = make_cuDoubleComplex(w2.x - (inu * wd).x, w2.y - (inu * wd).y);
+        atomic_add(&AT[abase + nj * blk + e], wt * vT);
+        accU = accU + wd * vT;
+        atomic_add(&AU[abase + nj * blk + e], make_cuDoubleComplex(-(wd * vT).x, -(wd * vT).y));
+      } else {
+        const long a = aU;
+        if (a == nj) atomic_add(&A1[abase + nj * blk + e], vU);
+        else {
+          const double ea = eps[a];
+          const cd w = make_cuDoubleComplex(1.0 / (ea - ej), 0.0);
+          const cd dd = make_cuDoubleComplex(ej - ea + inu.x, inu.y);
+          const cd wd = cuCdiv(w, dd);
+          const cd wt = make_cuDoubleComplex(w.x - (inu * wd).x, w.y - (inu * wd).y);
+          accT = accT + wt * vU;
+          atomic_add(&AU[abase + nj * blk + e], make_cuDoubleComplex(-(wd * vU).x, -(wd * vU).y));
+          accU = accU + wd * vU;
+        }
+        if (a == nj) atomic_add(&A3[abase + nj * blk + e], vT);
+        else {
+          const double w = 1.0 / (eps[a] - ej);
+          accT = accT + scal(w, vT);
+          atomic_add(&AT[abase + nj * blk + e], scal(-w, vT));
+        }
+      }
+    }
+    if (aU >= 0) {
+      if (accU.x != 0.0 || accU.y != 0.0) atomic_add(&AU[abase + aU * blk + e], accU);
+      if (accT.x != 0.0 || accT.y != 0.0) atomic_add(&AT[abase + aU * blk + e], accT);
+    }
+  }
+}
+
+// ---- phase C, v3: v2 plus the (pole, component) weights precomputed in SHARED memory ---------
+// v2 recomputes w, wd, wt -- including a complex division -- inside the element loop, so every
+// thread redoes them for each of the blk/blockDim elements it owns. They depend only on
+// (pole, component), so one warp can build the table for all ng poles at block entry and the
+// element loop then only multiplies. ng * 4 complex = 5 KB at ng = 80, well inside a block's
+// shared memory even at nc = 16.
+extern __shared__ cd smem[];
+__global__ void scatter_kernel_v3(kdims d, int which_pass, cd inu,
+                                  cd const *__restrict__ Qall, cd const *__restrict__ Ball,
+                                  double const *__restrict__ eps, double const *__restrict__ epsG,
+                                  long const *__restrict__ gnode,
+                                  cd *__restrict__ AU, cd *__restrict__ AT, cd *__restrict__ M2,
+                                  cd *__restrict__ A1, cd *__restrict__ A3) {
+  const long c = blockIdx.x;
+  const long np = d.np, ng = d.ng, blk = d.blk, ncomp = d.ncomp;
+  const long W = d.nc * ncomp * d.nR * d.nc;
+  const int part = (c == 0) ? 1 : 0;
+  const long abase = (long(part) * np) * blk;
+  const long aU = (c >= 1 && c <= np) ? c - 1 : ((c > np) ? c - 1 - np : -1);
+  const bool U_is_a = (c >= 1 && c <= np);
+  // shared tables: [0] w_a (the U . U weight), [1] wt, [2] wd, [3] w_T (the T . T weight)
+  cd *sw = smem;
+  for (long pole = threadIdx.x; pole < ng; pole += blockDim.x) {
+    const double ej = epsG[pole];
+    if (aU >= 0) {
+      const double ea = eps[aU];
+      const cd w2 = make_cuDoubleComplex(1.0 / (ea - ej), 0.0);
+      const cd dd = make_cuDoubleComplex(ej - ea + inu.x, inu.y);
+      const cd wd = cuCdiv(w2, dd);
+      sw[pole * 4 + 0] = make_cuDoubleComplex(1.0 / (ej - ea), 0.0);
+      sw[pole * 4 + 1] = make_cuDoubleComplex(w2.x - (inu * wd).x, w2.y - (inu * wd).y);
+      sw[pole * 4 + 2] = wd;
+      sw[pole * 4 + 3] = make_cuDoubleComplex(1.0 / (ea - ej), 0.0);
+    }
+  }
+  __syncthreads();
+  for (long e = threadIdx.x; e < blk; e += blockDim.x) {
+    const long x = e / (d.nR * d.nc), rem = e % (d.nR * d.nc);
+    const long src = (x * ncomp + c) * d.nR * d.nc + rem;
+    cd accU = make_cuDoubleComplex(0.0, 0.0), accT = accU;
+    for (long pole = 0; pole < ng; ++pole) {
+      const long nj = gnode[pole];
+      cd q = Qall[pole * W + src];
+      cd b = (which_pass == 0) ? Ball[pole * W + src] : q;
+      cd vU = q, vT = b;
+      if (which_pass == 1) { vU = make_cuDoubleComplex(-q.x, -q.y); vT = inu * q; }
+      if (c == 0) { atomic_add(&AU[abase + nj * blk + e], vU); atomic_add(&AT[abase + nj * blk + e], vT); continue; }
+      const cd wUU = sw[pole * 4 + 0], wt = sw[pole * 4 + 1], wd = sw[pole * 4 + 2], wTT = sw[pole * 4 + 3];
+      if (U_is_a) {
+        if (aU == nj) atomic_add(&M2[abase + nj * blk + e], vU);
+        else { atomic_add(&AU[abase + nj * blk + e], wUU * vU); accU = accU + make_cuDoubleComplex(-(wUU * vU).x, -(wUU * vU).y); }
+        atomic_add(&AT[abase + nj * blk + e], wt * vT);
+        accU = accU + wd * vT;
+        atomic_add(&AU[abase + nj * blk + e], make_cuDoubleComplex(-(wd * vT).x, -(wd * vT).y));
+      } else {
+        if (aU == nj) { atomic_add(&A1[abase + nj * blk + e], vU); atomic_add(&A3[abase + nj * blk + e], vT); }
+        else {
+          accT = accT + wt * vU;
+          atomic_add(&AU[abase + nj * blk + e], make_cuDoubleComplex(-(wd * vU).x, -(wd * vU).y));
+          accU = accU + wd * vU;
+          accT = accT + wTT * vT;
+          atomic_add(&AT[abase + nj * blk + e], make_cuDoubleComplex(-(wTT * vT).x, -(wTT * vT).y));
+        }
+      }
+    }
+    if (aU >= 0) {
+      if (accU.x != 0.0 || accU.y != 0.0) atomic_add(&AU[abase + aU * blk + e], accU);
+      if (accT.x != 0.0 || accT.y != 0.0) atomic_add(&AT[abase + aU * blk + e], accT);
+    }
+  }
+}
+
+// ============================================================================================
+// K-BATCHED PATH. v2's scatter grid is just ncomp blocks (319 x 256 = 82 k threads against an
+// H100's ~233 k resident), so a single k-point underfills the device by ~3x, and the gemm batch
+// is only ng deep. Processing K k-points together multiplies both: grid (ncomp, K) and a
+// cuBLAS batch of ng*K. The cost is memory -- P/Q/B scale with K -- so K is chosen at run time
+// from cudaMemGetInfo (see pick_kbatch). The per-k arrays get a leading K index; K = 1 is the
+// previous behaviour.
+// cublasZgemmStridedBatched cannot express "A varies with (k, pole), B varies with k only", so
+// the batched-pointer form is used.
+// ============================================================================================
+__global__ void pack_kernel_kb(kdims d, long ik0, long K, cd const *__restrict__ Xfam,
+                               cd const *__restrict__ Xcst, cd *__restrict__ Vt) {
+  const long kb = blockIdx.y, ik = ik0 + kb;
+  const long nc = d.nc, nR = d.nR, np = d.np, nk = d.nk, ncomp = d.ncomp;
+  const long W = nc * ncomp * nR * nc, tot = nc * nR * nc;
+  if (kb >= K) return;
+  cd *V = Vt + kb * W;
+  for (long e = blockIdx.x * blockDim.x + threadIdx.x; e < tot; e += gridDim.x * blockDim.x) {
+    const long x = e / (nR * nc), r = (e / nc) % nR, y = e % nc;
+    V[((x * ncomp + 0) * nR + r) * nc + y] = Xcst[((ik * nc + x) * nc + y) * nR + r];
+    for (long a = 0; a < np; ++a) {
+      const long xu = (((0 * np + a) * nk + ik) * nc + x) * nc * nR + y * nR + r;
+      const long xt = (((1 * np + a) * nk + ik) * nc + x) * nc * nR + y * nR + r;
+      V[((x * ncomp + 1 + a) * nR + r) * nc + y] = Xfam[xu];
+      V[((x * ncomp + 1 + np + a) * nR + r) * nc + y] = Xfam[xt];
+    }
+  }
+}
+
+__global__ void poleT_kernel_kb(kdims d, long ik0, long K, cd const *__restrict__ src, bool transpose,
+                                long nk, cd *__restrict__ dst, bool per_k_major) {
+  const long kb = blockIdx.y, ik = ik0 + kb;
+  const long nc = d.nc, ng = d.ng;
+  if (kb >= K) return;
+  cd *D = dst + kb * ng * nc * nc;
+  for (long e = blockIdx.x * blockDim.x + threadIdx.x; e < ng * nc * nc; e += gridDim.x * blockDim.x) {
+    const long j = e / (nc * nc), x = (e / nc) % nc, y = e % nc;
+    const long s = per_k_major ? ((ik * ng + j) * nc + (transpose ? y : x)) * nc + (transpose ? x : y)
+                               : (((j * nk + ik) * nc + (transpose ? y : x)) * nc + (transpose ? x : y));
+    D[(j * nc + x) * nc + y] = src[s];
+  }
+}
+
+__global__ void scatter_kernel_kb(kdims d, long K, int which_pass, cd inu,
+                                  cd const *__restrict__ Qall, cd const *__restrict__ Ball,
+                                  double const *__restrict__ eps, double const *__restrict__ epsG,
+                                  long const *__restrict__ gnode,
+                                  cd *__restrict__ AU, cd *__restrict__ AT, cd *__restrict__ M2,
+                                  cd *__restrict__ A1, cd *__restrict__ A3) {
+  const long c = blockIdx.x, kb = blockIdx.y;
+  if (kb >= K) return;
+  const long np = d.np, ng = d.ng, blk = d.blk, ncomp = d.ncomp;
+  const long W = d.nc * ncomp * d.nR * d.nc, asz = 2 * np * blk;
+  const int part = (c == 0) ? 1 : 0;
+  const long abase = kb * asz + (long(part) * np) * blk;
+  const long aU = (c >= 1 && c <= np) ? c - 1 : ((c > np) ? c - 1 - np : -1);
+  const bool U_is_a = (c >= 1 && c <= np);
+  cd const *Qk = Qall + kb * ng * W;
+  cd const *Bk = Ball + kb * ng * W;
+  for (long e = threadIdx.x; e < blk; e += blockDim.x) {
+    const long x = e / (d.nR * d.nc), rem = e % (d.nR * d.nc);
+    const long src = (x * ncomp + c) * d.nR * d.nc + rem;
+    cd accU = make_cuDoubleComplex(0.0, 0.0), accT = accU;
+    for (long pole = 0; pole < ng; ++pole) {
+      const long nj = gnode[pole];
+      const double ej = epsG[pole];
+      cd q = Qk[pole * W + src];
+      cd b = (which_pass == 0) ? Bk[pole * W + src] : q;
+      cd vU = q, vT = b;
+      if (which_pass == 1) { vU = make_cuDoubleComplex(-q.x, -q.y); vT = inu * q; }
+      if (c == 0) { atomic_add(&AU[abase + nj * blk + e], vU); atomic_add(&AT[abase + nj * blk + e], vT); continue; }
+      if (U_is_a) {
+        const long a = aU;
+        if (a == nj) atomic_add(&M2[abase + nj * blk + e], vU);
+        else {
+          const double w = 1.0 / (ej - eps[a]);
+          atomic_add(&AU[abase + nj * blk + e], scal(w, vU));
+          accU = accU + scal(-w, vU);
+        }
+        const double ea = eps[a];
+        const cd w2 = make_cuDoubleComplex(1.0 / (ea - ej), 0.0);
+        const cd dd = make_cuDoubleComplex(ej - ea + inu.x, inu.y);
+        const cd wd = cuCdiv(w2, dd);
+        const cd wt = make_cuDoubleComplex(w2.x - (inu * wd).x, w2.y - (inu * wd).y);
+        atomic_add(&AT[abase + nj * blk + e], wt * vT);
+        accU = accU + wd * vT;
+        atomic_add(&AU[abase + nj * blk + e], make_cuDoubleComplex(-(wd * vT).x, -(wd * vT).y));
+      } else {
+        const long a = aU;
+        if (a == nj) { atomic_add(&A1[abase + nj * blk + e], vU); atomic_add(&A3[abase + nj * blk + e], vT); }
+        else {
+          const double ea = eps[a];
+          const cd w = make_cuDoubleComplex(1.0 / (ea - ej), 0.0);
+          const cd dd = make_cuDoubleComplex(ej - ea + inu.x, inu.y);
+          const cd wd = cuCdiv(w, dd);
+          const cd wt = make_cuDoubleComplex(w.x - (inu * wd).x, w.y - (inu * wd).y);
+          accT = accT + wt * vU;
+          atomic_add(&AU[abase + nj * blk + e], make_cuDoubleComplex(-(wd * vU).x, -(wd * vU).y));
+          accU = accU + wd * vU;
+          const double w3 = 1.0 / (eps[a] - ej);
+          accT = accT + scal(w3, vT);
+          atomic_add(&AT[abase + nj * blk + e], scal(-w3, vT));
+        }
+      }
+    }
+    if (aU >= 0) {
+      if (accU.x != 0.0 || accU.y != 0.0) atomic_add(&AU[abase + aU * blk + e], accU);
+      if (accT.x != 0.0 || accT.y != 0.0) atomic_add(&AT[abase + aU * blk + e], accT);
+    }
+  }
+}
+
+__global__ void assemble_kernel_kb(kdims d, long ik0, long K, double const *__restrict__ fhalf,
+                                   double const *__restrict__ fd1, cd const *__restrict__ Dsq,
+                                   cd const *__restrict__ AU, cd const *__restrict__ AT, cd const *__restrict__ M2,
+                                   cd *__restrict__ Ffam, cd *__restrict__ Fsum) {
+  const long np = d.np, blk = d.blk, nc = d.nc, nR = d.nR, nk = d.nk, asz = 2 * np * blk;
+  const long n = blockIdx.x, part = blockIdx.y, kb = blockIdx.z;
+  if (kb >= K) return;
+  const long ik = ik0 + kb;
   for (long e = threadIdx.x; e < blk; e += blockDim.x) {
     const long x = e / (nR * nc), r = (e / nc) % nR, y = e % nc;
-    const long ia = (part * np + n) * blk + e;
+    const long ia = kb * asz + (part * np + n) * blk + e;
     const cd u = AU[ia], t = AT[ia], m = M2[ia];
     const long f0 = (((0 * np + n) * nk + ik) * nc + x) * nc * nR + y * nR + r;
     const long f1 = (((1 * np + n) * nk + ik) * nc + x) * nc * nR + y * nR + r;
@@ -134,7 +396,22 @@ __global__ void assemble_kernel(kdims d, long ik, double const *__restrict__ fha
   }
 }
 
-// ---- pack Vt for one k: (x, comp, r, y) ------------------------------------------------------
+// fill the cuBLAS batched-pointer arrays (index i = kb * ng + j)
+__global__ void fill_ptrs(long K, long ng, long W, long nc2, cd *Vt, cd *gjT, cd *glT, cd *Gh,
+                          cd *Pj, cd *Qj, cd *Bj, cd **pVt, cd **pGjT, cd **pGlT, cd **pGh,
+                          cd **pPj, cd **pQj, cd **pBj) {
+  const long i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= K * ng) return;
+  const long kb = i / ng;
+  pVt[i] = Vt + kb * W;          // shared by the ng poles of one k: only a pointer array can say this
+  pGjT[i] = gjT + i * nc2;
+  pGlT[i] = glT + i * nc2;
+  pGh[i] = Gh + i * nc2;
+  pPj[i] = Pj + i * W;
+  pQj[i] = Qj + i * W;
+  pBj[i] = Bj + i * W;
+}
+
 __global__ void pack_kernel(kdims d, long ik, cd const *__restrict__ Xfam, cd const *__restrict__ Xcst,
                             cd *__restrict__ Vt) {
   const long nc = d.nc, nR = d.nR, np = d.np, nk = d.nk, ncomp = d.ncomp;
@@ -189,58 +466,114 @@ int main(int argc, char **argv) {
   CU(cudaMemcpy(dgn, in.gnode.data(), in.gnode.size() * sizeof(long), cudaMemcpyHostToDevice));
 
   cd *dVt, *dPj, *dQj, *dBj, *dgjT, *dglT, *dGh, *dAU, *dAT, *dM2, *dA1, *dA3, *dF, *dFs;
-  CU(cudaMalloc(&dVt, W * sizeof(cd)));
-  CU(cudaMalloc(&dPj, ng * W * sizeof(cd)));      // one Pj per pole: the batch
-  CU(cudaMalloc(&dQj, ng * W * sizeof(cd)));
-  CU(cudaMalloc(&dBj, ng * W * sizeof(cd)));
-  CU(cudaMalloc(&dgjT, ng * nc * nc * sizeof(cd)));
-  CU(cudaMalloc(&dglT, ng * nc * nc * sizeof(cd)));
-  CU(cudaMalloc(&dGh, ng * nc * nc * sizeof(cd)));
   const size_t asz = size_t(2 * np) * size_t(blk);
-  for (cd **p : {&dAU, &dAT, &dM2, &dA1, &dA3}) CU(cudaMalloc(p, asz * sizeof(cd)));
   CU(cudaMalloc(&dF, size_t(2 * np * nk * nc * nc * nR) * sizeof(cd)));
   CU(cudaMalloc(&dFs, size_t(nk * nc * nc * nR) * sizeof(cd)));
+  // (the K-dependent allocations happen after K is chosen, below)
 
+  {
+    const double gbX = double(2 * np * nk * nc * nc * nR) * 16e-9, gbP = double(3 * ng * W) * 16e-9;
+    const double gbA = double(5 * 2 * np * blk) * 16e-9;
+    size_t freeb = 0, totb = 0; CU(cudaMemGetInfo(&freeb, &totb));
+    std::printf("[memory] X %.2f GB + F %.2f GB + P/Q/B %.2f GB + accumulators %.2f GB + misc = %.2f GB; "
+                "device has %.1f GB free of %.1f GB\n", gbX, gbX, gbP, gbA, 2 * gbX + gbP + gbA + 0.05,
+                double(freeb) * 1e-9, double(totb) * 1e-9);
+  }
+
+  // ---- dynamic batch size: the largest K whose working set fits the device ------------------
+  // fixed (independent of K): X, F, the pole tables, Dsq, Fsum.  per k: Vt + 3 * ng * W (P/Q/B)
+  // + 5 accumulators + ng pole matrices. The ultimate implementation has to do exactly this, and
+  // at kp666 / nc 16 it is what keeps the problem on the device at all.
+  long Kbatch = 0;
+  for (int i = 1; i < argc; ++i)
+    if (std::string(argv[i]).rfind("--kbatch=", 0) == 0) Kbatch = std::atol(argv[i] + 9);
+  {
+    size_t freeb = 0, totb = 0; CU(cudaMemGetInfo(&freeb, &totb));
+    const double per_k = double(W + 3 * ng * W + 5 * 2 * np * blk + ng * nc * nc) * 16.0;
+    const double fixed = double(2 * (2 * np * nk * nc * nc * nR) + nk * nc * nc * nR + np * np
+                                + 4 * ng * nk * nc * nc) * 16.0;
+    const double budget = 0.85 * double(freeb) - fixed;      // leave 15 % for cuBLAS workspace etc.
+    const long Kfit = std::max(1L, long(budget / per_k));
+    if (Kbatch <= 0) Kbatch = std::min(nk, Kfit);
+    std::printf("[kbatch] per-k working set %.2f GB, fixed %.2f GB, free %.1f GB -> K fits %ld, using K = %ld\n",
+                per_k * 1e-9, fixed * 1e-9, double(freeb) * 1e-9, Kfit, Kbatch);
+    if (Kbatch > Kfit) std::printf("[kbatch] WARNING: requested K exceeds what fits; expect an allocation failure\n");
+  }
   cublasHandle_t h; CUB(cublasCreate(&h));
   const cd one = make_cuDoubleComplex(1.0, 0.0), zero = make_cuDoubleComplex(0.0, 0.0);
   const cd inu = make_cuDoubleComplex(in.inu.real(), in.inu.imag());
 
+  int variant = 1;
+  for (int i = 1; i < argc; ++i)
+    if (std::string(argv[i]).rfind("--scatter=", 0) == 0) variant = std::atoi(argv[i] + 10);
+  cudaEvent_t e0, e1; CU(cudaEventCreate(&e0)); CU(cudaEventCreate(&e1));
+  double t_pack = 0, t_gemm = 0, t_scat = 0, t_asm = 0, t_zero = 0;
+  auto tic = [&]() { CU(cudaEventRecord(e0)); };
+  auto toc = [&](double &acc) { CU(cudaEventRecord(e1)); CU(cudaEventSynchronize(e1));
+                                float ms = 0; CU(cudaEventElapsedTime(&ms, e0, e1)); acc += ms * 1e-3; };
+
+  // ---- K-dependent allocations ------------------------------------------------------------
+  CU(cudaMalloc(&dVt, size_t(Kbatch) * W * sizeof(cd)));
+  CU(cudaMalloc(&dPj, size_t(Kbatch) * ng * W * sizeof(cd)));
+  CU(cudaMalloc(&dQj, size_t(Kbatch) * ng * W * sizeof(cd)));
+  CU(cudaMalloc(&dBj, size_t(Kbatch) * ng * W * sizeof(cd)));
+  CU(cudaMalloc(&dgjT, size_t(Kbatch) * ng * nc * nc * sizeof(cd)));
+  CU(cudaMalloc(&dglT, size_t(Kbatch) * ng * nc * nc * sizeof(cd)));
+  CU(cudaMalloc(&dGh, size_t(Kbatch) * ng * nc * nc * sizeof(cd)));
+  for (cd **p : {&dAU, &dAT, &dM2, &dA1, &dA3}) CU(cudaMalloc(p, size_t(Kbatch) * asz * sizeof(cd)));
+  cd **pVt, **pGjT, **pGlT, **pGh, **pPj, **pQj, **pBj;
+  const size_t nptr = size_t(Kbatch) * size_t(ng);
+  for (cd ***p : {&pVt, &pGjT, &pGlT, &pGh, &pPj, &pQj, &pBj}) CU(cudaMalloc(p, nptr * sizeof(cd *)));
+  fill_ptrs<<<unsigned((nptr + 255) / 256), 256>>>(Kbatch, ng, W, nc * nc, dVt, dgjT, dglT, dGh,
+                                                   dPj, dQj, dBj, pVt, pGjT, pGlT, pGh, pPj, pQj, pBj);
+  CU(cudaDeviceSynchronize());
+
   auto run_once = [&]() {
+    t_pack = t_gemm = t_scat = t_asm = t_zero = 0.0;
     CU(cudaMemset(dF, 0, size_t(2 * np * nk * nc * nc * nR) * sizeof(cd)));
     CU(cudaMemset(dFs, 0, size_t(nk * nc * nc * nR) * sizeof(cd)));
-    for (long ik = 0; ik < nk; ++ik) {
-      for (cd *p : {dAU, dAT, dM2, dA1, dA3}) CU(cudaMemset(p, 0, asz * sizeof(cd)));
-      pack_kernel<<<64, 256>>>(kd, ik, dX, dXc, dVt);
-      // cuBLAS is column-major; our row-major C = A B is computed as C^T = B^T A^T.
-      // Pj(nc, W/nc) = gjT(nc,nc) Vt(nc, W/nc)  -> batched over the ng poles (Vt shared, stride 0)
-      poleT_kernel<<<32, 256>>>(kd, ik, dgk, true, nk, dgjT, false);
-      poleT_kernel<<<32, 256>>>(kd, ik, dgkq, true, nk, dglT, false);
-      poleT_kernel<<<32, 256>>>(kd, ik, dGhat, false, nk, dGh, true);
-      const int Ncols = int(ncomp * nR * nc);
-      CUB(cublasZgemmStridedBatched(h, CUBLAS_OP_N, CUBLAS_OP_N, Ncols, int(nc), int(nc),
-                                    &one, dVt, Ncols, 0, dgjT, int(nc), nc * nc,
-                                    &zero, dPj, Ncols, W, int(ng)));
-      // Qj((nc ncomp nR), nc) = Pj2 Ghat ; Bj = Pj2 gkq^T   (row-major M x 8 by 8 x 8)
-      const int Mrows = int(nc * ncomp * nR);
-      CUB(cublasZgemmStridedBatched(h, CUBLAS_OP_N, CUBLAS_OP_N, int(nc), Mrows, int(nc),
-                                    &one, dGh, int(nc), nc * nc, dPj, int(nc), W,
-                                    &zero, dQj, int(nc), W, int(ng)));
-      CUB(cublasZgemmStridedBatched(h, CUBLAS_OP_N, CUBLAS_OP_N, int(nc), Mrows, int(nc),
-                                    &one, dglT, int(nc), nc * nc, dPj, int(nc), W,
-                                    &zero, dBj, int(nc), W, int(ng)));
-      dim3 grid{unsigned(ng), unsigned(ncomp), 1u};   // braces: dim3 g(unsigned(x), ...) parses as a declaration
-      scatter_kernel<<<grid, 256>>>(kd, 0, inu, dQj, dBj, deps, depsG, dgn, dAU, dAT, dM2, dA1, dA3);
-      // the l pass: Pl = Gtil Vt, Rl = Pl gkq^T
-      poleT_kernel<<<32, 256>>>(kd, ik, dGtil, false, nk, dGh, true);
-      CUB(cublasZgemmStridedBatched(h, CUBLAS_OP_N, CUBLAS_OP_N, Ncols, int(nc), int(nc),
-                                    &one, dVt, Ncols, 0, dGh, int(nc), nc * nc,
-                                    &zero, dPj, Ncols, W, int(ng)));
-      CUB(cublasZgemmStridedBatched(h, CUBLAS_OP_N, CUBLAS_OP_N, int(nc), Mrows, int(nc),
-                                    &one, dglT, int(nc), nc * nc, dPj, int(nc), W,
-                                    &zero, dQj, int(nc), W, int(ng)));
-      scatter_kernel<<<grid, 256>>>(kd, 1, inu, dQj, dQj, deps, depsG, dgn, dAU, dAT, dM2, dA1, dA3);
-      dim3 ag{unsigned(np), 2u, 1u};
-      assemble_kernel<<<ag, 256>>>(kd, ik, dfh, dfd1, dDsq, dAU, dAT, dM2, dF, dFs);
+    const int Ncols = int(ncomp * nR * nc), Mrows = int(nc * ncomp * nR);
+    for (long ik0 = 0; ik0 < nk; ik0 += Kbatch) {
+      const long K = std::min(Kbatch, nk - ik0);
+      const int nb = int(K * ng);
+      tic();
+      for (cd *p : {dAU, dAT, dM2, dA1, dA3}) CU(cudaMemset(p, 0, size_t(K) * asz * sizeof(cd)));
+      toc(t_zero);
+      tic();
+      pack_kernel_kb<<<dim3(64u, unsigned(K), 1u), 256>>>(kd, ik0, K, dX, dXc, dVt);
+      poleT_kernel_kb<<<dim3(32u, unsigned(K), 1u), 256>>>(kd, ik0, K, dgk, true, nk, dgjT, false);
+      poleT_kernel_kb<<<dim3(32u, unsigned(K), 1u), 256>>>(kd, ik0, K, dgkq, true, nk, dglT, false);
+      poleT_kernel_kb<<<dim3(32u, unsigned(K), 1u), 256>>>(kd, ik0, K, dGhat, false, nk, dGh, true);
+      toc(t_pack);
+      tic();
+      CUB(cublasZgemmBatched(h, CUBLAS_OP_N, CUBLAS_OP_N, Ncols, int(nc), int(nc), &one,
+                             (const cd **)pVt, Ncols, (const cd **)pGjT, int(nc), &zero, pPj, Ncols, nb));
+      CUB(cublasZgemmBatched(h, CUBLAS_OP_N, CUBLAS_OP_N, int(nc), Mrows, int(nc), &one,
+                             (const cd **)pGh, int(nc), (const cd **)pPj, int(nc), &zero, pQj, int(nc), nb));
+      CUB(cublasZgemmBatched(h, CUBLAS_OP_N, CUBLAS_OP_N, int(nc), Mrows, int(nc), &one,
+                             (const cd **)pGlT, int(nc), (const cd **)pPj, int(nc), &zero, pBj, int(nc), nb));
+      toc(t_gemm);
+      tic();
+      scatter_kernel_kb<<<dim3(unsigned(ncomp), unsigned(K), 1u), 256>>>(kd, K, 0, inu, dQj, dBj, deps, depsG,
+                                                                        dgn, dAU, dAT, dM2, dA1, dA3);
+      toc(t_scat);
+      tic();
+      poleT_kernel_kb<<<dim3(32u, unsigned(K), 1u), 256>>>(kd, ik0, K, dGtil, false, nk, dGh, true);
+      toc(t_pack);
+      tic();
+      CUB(cublasZgemmBatched(h, CUBLAS_OP_N, CUBLAS_OP_N, Ncols, int(nc), int(nc), &one,
+                             (const cd **)pVt, Ncols, (const cd **)pGh, int(nc), &zero, pPj, Ncols, nb));
+      CUB(cublasZgemmBatched(h, CUBLAS_OP_N, CUBLAS_OP_N, int(nc), Mrows, int(nc), &one,
+                             (const cd **)pGlT, int(nc), (const cd **)pPj, int(nc), &zero, pQj, int(nc), nb));
+      toc(t_gemm);
+      tic();
+      scatter_kernel_kb<<<dim3(unsigned(ncomp), unsigned(K), 1u), 256>>>(kd, K, 1, inu, dQj, dQj, deps, depsG,
+                                                                        dgn, dAU, dAT, dM2, dA1, dA3);
+      toc(t_scat);
+      tic();
+      assemble_kernel_kb<<<dim3(unsigned(np), 2u, unsigned(K)), 256>>>(kd, ik0, K, dfh, dfd1, dDsq,
+                                                                       dAU, dAT, dM2, dF, dFs);
+      toc(t_asm);
     }
     CU(cudaDeviceSynchronize());
   };
@@ -254,7 +587,12 @@ int main(int argc, char **argv) {
     best = std::min(best, s);
     std::printf("[gpu] application %d: %.3f s\n", it, s);
   }
-  std::printf("[gpu] BEST %.3f s -> %.1f GFLOP/s, %.1f GB/s effective\n", best, gf / best, gb / best);
+  std::printf("[gpu] BEST %.3f s -> %.1f GFLOP/s, %.1f GB/s effective (k-batch %ld)\n", best, gf / best, gb / best, Kbatch);
+  const double tt = t_zero + t_pack + t_gemm + t_scat + t_asm;
+  std::printf("[gpu profile] zero %.3f s (%.0f%%), pack+poleT %.3f s (%.0f%%), cuBLAS gemms %.3f s (%.0f%%), "
+              "scatter %.3f s (%.0f%%), assemble %.3f s (%.0f%%); sum %.3f s\n",
+              t_zero, 100*t_zero/tt, t_pack, 100*t_pack/tt, t_gemm, 100*t_gemm/tt,
+              t_scat, 100*t_scat/tt, t_asm, 100*t_asm/tt, tt);
   std::vector<cplx> Fh(size_t(2 * np * nk * nc * nc * nR));
   CU(cudaMemcpy(Fh.data(), dF, Fh.size() * sizeof(cd), cudaMemcpyDeviceToHost));
   double chk = 0.0; for (auto const &z : Fh) chk += std::norm(z);
