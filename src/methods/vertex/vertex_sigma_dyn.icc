@@ -163,11 +163,22 @@ namespace solvers {
         nk = nk_ext;
         utils::check(R_T.size() == 0 or R_T.shape(0) == np, "sigma_dyn_hook: the reference dump's np ({}) differs from this run's ({}).",
                      R_T.size() == 0 ? 0 : R_T.shape(0), np);
-        if (R_T.size() > 0 and eps_ref.size() > 0)
+        if (R_T.size() > 0 and eps_ref.size() > 0) {
+          // The DLR node SELECTION is machine-dependent at identical (beta, wmax, prec): the pd1d dump made on rusty's
+          // Genoa nodes has pole node 1 = -3.85775 where an Ice Lake GPU node builds -3.90730 (2026-09-25, P-1 of the
+          // gpu port), so a dump transfers only within one machine. sigdyn_grid_tol (default 1e-10 = the identity)
+          // relaxes the check for TIMING experiments only: the nu-bases are then applied to slightly different nodes.
+          const double gtol = vertex_debug::number("sigdyn_grid_tol", 1e-10);   // vertex_debug: sigdyn_grid_tol
+          double gmax = 0.0;
+          for (long a = 0; a < np; ++a) gmax = std::max(gmax, std::abs(eps_ref(a) - b.eps(a)) / (1.0 + std::abs(b.eps(a))));
           for (long a = 0; a < np; ++a)
-            utils::check(std::abs(eps_ref(a) - b.eps(a)) <= 1e-10 * (1.0 + std::abs(b.eps(a))),
+            utils::check(std::abs(eps_ref(a) - b.eps(a)) <= gtol * (1.0 + std::abs(b.eps(a))),
                          "sigma_dyn_hook: pole node {} of the reference dump is {} vs {} in this run (the nu-bases transfer across k meshes, "
-                         "not across imaginary-axis grids).", a, eps_ref(a), b.eps(a));
+                         "not across imaginary-axis grids; sigdyn_grid_tol = {}).", a, eps_ref(a), b.eps(a), gtol);
+          if (gtol > 1e-10)
+            app_log(1, "  [LFF-Sigma dyn] WARNING: sigdyn_grid_tol = {:.1e} relaxes the pole-node identity of the reference dump "
+                       "(max relative node mismatch {:.3e}); the reconstructed Sigma is a TIMING proxy, not physics.", gtol, gmax);
+        }
         S_cst = nda::array<ComplexType, 5>(nt, ns, nk, nc, nc); S_cst() = ComplexType(0.0);
         if (not single_acc) {
           RT = nda::array<ComplexType, 6>(nt, ns, nk, np, nc, nc); RT() = ComplexType(0.0);
