@@ -154,9 +154,10 @@ namespace bdft_tests {
         // Column coupling would show up at the size of the coefficients; the batched and the
         // per-column paths are the same algorithm on the same data, but the BLAS may use different
         // kernels for 4 columns and for 1 (MKL does), so bit-for-bit is not a property of the
-        // algorithm: measured 0.0 with OpenBLAS/clang, roundoff with MKL/gcc on rusty.
+        // algorithm: measured 0.0 with OpenBLAS/clang, 3.0e-12 relative with MKL/gcc on rusty
+        // (the multi-RHS and the single-RHS least-squares solves round differently).
         INFO("column " << j << ": batched vs per-column |dc|_max = " << d << ", |c|_max = " << cmax);
-        REQUIRE(d <= 1e-12 * std::max(cmax, 1.0));
+        REQUIRE(d <= 1e-10 * std::max(cmax, 1.0));
       }
     }
 
