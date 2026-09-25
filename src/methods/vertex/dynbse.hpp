@@ -879,6 +879,9 @@ namespace dynbse {
     const long ncomp = 1 + 2 * np;
     double tfold = tfold_ratio();
     tfold = vertex_debug::number("dynbse_tfold", tfold);   // vertex_debug: dynbse_tfold (experiment override)
+    // P26 (notes/vertex_perf_plan.md, the L0 miniapp): PB = poles per tile of the traffic restructuring below;
+    // 4 was the best of {4, 8, 16, 40} at 96 threads (1.37x), 1 keeps the tile machinery with one pole per tile.
+    const long PB = std::max(1l, long(vertex_debug::number("dynbse_l0_pb", 4.0)));   // vertex_debug: dynbse_l0_pb
 #pragma omp parallel for schedule(dynamic, 1) num_threads(utils::omp_threads())
     for (long ik = 0; ik < nk; ++ik) {
       nda::array<cplx, 3> Ghat(ng, nc, nc), Gtil(ng, nc, nc);
@@ -886,80 +889,104 @@ namespace dynbse {
       // accumulators over all columns: (part, node, x, r, y)
       nda::array<cplx, 5> AU(2, np, nc, nR, nc), AT(2, np, nc, nR, nc), M2(2, np, nc, nR, nc), A1(2, np, nc, nR, nc),
           A3(2, np, nc, nR, nc);   // (part, node, x, r, y): the order of the V blocks
-      nda::array<cplx, 4> Vt(nc, ncomp, nR, nc), Sv(ncomp, nR, nc, nc);
-      nda::array<cplx, 2> Pj(nc, ncomp * nR * nc), Qj(nc * ncomp * nR, nc), Bj(nc * ncomp * nR, nc);
-      nda::array<cplx, 2> Sl_out(ncomp * nR * nc, nc), Slt(nc, ncomp * nR * nc), Rl(nc, ncomp * nR * nc);
-      nda::array<cplx, 3> mV(nc, nR, nc), tV(nc, nR, nc);
+      // TILED TRAFFIC (P26, ported from bench/l0_miniapp l0_tiled, measured 1.32-1.37x at 96 threads, 1.15x at 3):
+      // in mulU / mulT the component c selects the node a = c - 1 (or c - 1 - np), so every (pole, component) did a
+      // read-modify-write of TWO node blocks -- A[nj], fixed by the pole, and A[a], sweeping the node axis as c
+      // runs: a cold RMW 2 ng ncomp times per k, the kernel's DRAM traffic. The gemms of a TILE of PB poles are
+      // done first (Qt / Bt), then the component loop runs OUTSIDE and the tile's poles INSIDE: the a-indexed
+      // targets become a reduction over the tile in the accU / accT buffers, flushed once per component, and the
+      // nj-indexed targets touch only the tile's PB blocks. Every per-term product is the production arithmetic
+      // (the l pass's mV = -R and tV = i nu R are reproduced by (-w) R == w (-R) bitwise and by pre-scaling);
+      // only the ORDER in which the a-indexed targets accumulate over the poles changes (roundoff).
+      const long W = nc * ncomp * nR * nc, blk = nc * nR * nc, ry = nR * nc;
+      nda::array<cplx, 4> Vt(nc, ncomp, nR, nc);
+      nda::array<cplx, 2> Pj(nc, ncomp * nR * nc);
+      nda::array<cplx, 2> Qt(PB, W), Bt(PB, W);          // the tile's gemm outputs, pole-major, (x, c, r, y) inside
+      nda::array<cplx, 1> accU(blk), accT(blk);          // the a-indexed reductions over the tile
       AU() = cplx(0.0); AT() = cplx(0.0); M2() = cplx(0.0); A1() = cplx(0.0); A3() = cplx(0.0);
-      // ---- the elementary multiplications on a (x, r, y) block ----------------------------------
-      auto mulU = [&](long j, long c, auto const &V, int part) {
+      auto base = [&](nda::array<cplx, 5> &A, long part, long node) { return A.data() + (part * np + node) * blk; };
+      // dst(x, r, y) (+= | -=) [w *] [pre *] src(x, c, r, y) over the (nc, nR, nc) block c of a pole's output, in the
+      // production's arithmetic: `scaled` = the weight multiplies, `prescale` = the l pass's i nu multiplies FIRST.
+      auto axpy_blk = [&](cplx *dst, cplx const *src, long c, bool sub, bool scaled, cplx w, bool prescale, cplx pre) {
+        for (long x = 0; x < nc; ++x) {
+          cplx const *v = src + (x * ncomp + c) * ry;
+          cplx *o = dst + x * ry;
+          if (not scaled and not prescale) {
+            if (sub) for (long e = 0; e < ry; ++e) o[e] -= v[e];
+            else     for (long e = 0; e < ry; ++e) o[e] += v[e];
+          } else if (scaled and not prescale) {
+            if (sub) for (long e = 0; e < ry; ++e) o[e] -= w * v[e];
+            else     for (long e = 0; e < ry; ++e) o[e] += w * v[e];
+          } else if (not scaled) {
+            if (sub) for (long e = 0; e < ry; ++e) o[e] -= pre * v[e];
+            else     for (long e = 0; e < ry; ++e) o[e] += pre * v[e];
+          } else {
+            if (sub) for (long e = 0; e < ry; ++e) o[e] -= w * (pre * v[e]);
+            else     for (long e = 0; e < ry; ++e) o[e] += w * (pre * v[e]);
+          }
+        }
+      };
+      bool used_U = false, used_T = false;   // the a-indexed buffers received something for this component
+      // ---- the elementary multiplications on the (x, r, y) block c of a pole's output ------------------------
+      // The a-indexed targets go to accU / accT (flushed per component with the sign of the range: the U range
+      // decrements AU[a], the T range increments AU[a] and AT[a] -- the production's signs); the nj-indexed
+      // targets are updated in place. `neg`: the production's mulU on -V (the l pass), folded into the weights.
+      auto mulU_t = [&](long j, long c, cplx const *V, int part, bool neg) {
         const long nj = P.gnode(j);
         const double ej = P.epsG(j);
         if (c == 0) {                                   // U_j . C
-          for (long x = 0; x < nc; ++x) for (long r = 0; r < nR; ++r) for (long y = 0; y < nc; ++y)
-            AU(part, nj, x, r, y) += V(x, r, y);
+          axpy_blk(base(AU, part, nj), V, c, neg, false, {}, false, {});
         } else if (c <= np) {                           // U_j . U_a
           const long a = c - 1;
           if (a == nj) {
-            for (long x = 0; x < nc; ++x) for (long r = 0; r < nR; ++r) for (long y = 0; y < nc; ++y)
-              M2(part, nj, x, r, y) += V(x, r, y);
+            axpy_blk(base(M2, part, nj), V, c, neg, false, {}, false, {});
           } else {
             const cplx w = cplx(1.0 / (ej - b.eps(a)));
-            for (long x = 0; x < nc; ++x) for (long r = 0; r < nR; ++r) for (long y = 0; y < nc; ++y) {
-              const cplx v = w * V(x, r, y);
-              AU(part, nj, x, r, y) += v;
-              AU(part, a, x, r, y) -= v;
-            }
+            const cplx wn = neg ? -w : w;
+            axpy_blk(base(AU, part, nj), V, c, false, true, wn, false, {});          // AU[nj] += w v
+            axpy_blk(accU.data(), V, c, false, true, wn, false, {}); used_U = true;   // AU[a]  -= w v
           }
         } else {                                        // U_j . T_a
           const long a = c - 1 - np;
           if (a == nj) {                                // U_j T_j = R1_j
-            for (long x = 0; x < nc; ++x) for (long r = 0; r < nR; ++r) for (long y = 0; y < nc; ++y)
-              A1(part, nj, x, r, y) += V(x, r, y);
+            axpy_blk(base(A1, part, nj), V, c, neg, false, {}, false, {});
           } else {
             const double ea = b.eps(a);
             const cplx w = cplx(1.0 / (ea - ej));
             const cplx d = cplx(ej - ea) + inu;
             const cplx wd = w / d;
             const cplx wt = w - inu * wd;
-            for (long x = 0; x < nc; ++x) for (long r = 0; r < nR; ++r) for (long y = 0; y < nc; ++y) {
-              const cplx v = V(x, r, y);
-              AT(part, a, x, r, y) += wt * v;
-              AU(part, nj, x, r, y) -= wd * v;
-              AU(part, a, x, r, y) += wd * v;
-            }
+            const cplx wtn = neg ? -wt : wt, wdn = neg ? -wd : wd;
+            axpy_blk(accT.data(), V, c, false, true, wtn, false, {}); used_T = true;  // AT[a]  += wt v
+            axpy_blk(base(AU, part, nj), V, c, true, true, wdn, false, {});           // AU[nj] -= wd v
+            axpy_blk(accU.data(), V, c, false, true, wdn, false, {}); used_U = true;  // AU[a]  += wd v
           }
         }
       };
-      auto mulT = [&](long l, long c, auto const &V, int part) {
+      // `pre_on`: the production's mulT on i nu V (the l pass), the pre-scale applied first as it was there.
+      auto mulT_t = [&](long l, long c, cplx const *V, int part, bool pre_on) {
         const long nl = P.gnode(l);
         const double el = P.epsG(l);
         if (c == 0) {                                   // T_l . C
-          for (long x = 0; x < nc; ++x) for (long r = 0; r < nR; ++r) for (long y = 0; y < nc; ++y)
-            AT(part, nl, x, r, y) += V(x, r, y);
+          axpy_blk(base(AT, part, nl), V, c, false, false, {}, pre_on, inu);
         } else if (c <= np) {                           // T_l . U_a
           const long a = c - 1;
           if (a == nl) {                                // U_l T_l = R1_l
-            for (long x = 0; x < nc; ++x) for (long r = 0; r < nR; ++r) for (long y = 0; y < nc; ++y)
-              A1(part, nl, x, r, y) += V(x, r, y);
+            axpy_blk(base(A1, part, nl), V, c, false, false, {}, pre_on, inu);
           } else {
             const double ea = b.eps(a);
             const cplx w = cplx(1.0 / (el - ea));
             const cplx d = cplx(ea - el) + inu;
             const cplx wd = w / d;
             const cplx wt = w - inu * wd;
-            for (long x = 0; x < nc; ++x) for (long r = 0; r < nR; ++r) for (long y = 0; y < nc; ++y) {
-              const cplx v = V(x, r, y);
-              AT(part, nl, x, r, y) += wt * v;
-              AU(part, a, x, r, y) -= wd * v;
-              AU(part, nl, x, r, y) += wd * v;
-            }
+            axpy_blk(base(AT, part, nl), V, c, false, true, wt, pre_on, inu);        // AT[nl] += wt v
+            axpy_blk(accU.data(), V, c, false, true, wd, pre_on, inu); used_U = true; // AU[a]  -= wd v
+            axpy_blk(base(AU, part, nl), V, c, false, true, wd, pre_on, inu);        // AU[nl] += wd v
           }
         } else {                                        // T_l . T_a
           const long a = c - 1 - np;
           if (a == nl) {                                // T_l^2 = R3_l
-            for (long x = 0; x < nc; ++x) for (long r = 0; r < nR; ++r) for (long y = 0; y < nc; ++y)
-              A3(part, nl, x, r, y) += V(x, r, y);
+            axpy_blk(base(A3, part, nl), V, c, false, false, {}, pre_on, inu);
           } else {
             const double ea = b.eps(a);
             const double g = el - ea;
@@ -967,13 +994,10 @@ namespace dynbse {
             const cplx dla = cplx(el - ea) + inu, dal = cplx(ea - el) + inu;
             const cplx wla = w2 / dla, wal = w2 / dal;
             const cplx ctl = w2 - inu * wal, cta = w2 - inu * wla, cul = wal - wla, cua = wla - wal;
-            for (long x = 0; x < nc; ++x) for (long r = 0; r < nR; ++r) for (long y = 0; y < nc; ++y) {
-              const cplx v = V(x, r, y);
-              AT(part, nl, x, r, y) += ctl * v;
-              AT(part, a, x, r, y) += cta * v;
-              AU(part, nl, x, r, y) += cul * v;
-              AU(part, a, x, r, y) += cua * v;
-            }
+            axpy_blk(base(AT, part, nl), V, c, false, true, ctl, pre_on, inu);       // AT[nl] += ctl v
+            axpy_blk(accT.data(), V, c, false, true, cta, pre_on, inu); used_T = true; // AT[a] += cta v
+            axpy_blk(base(AU, part, nl), V, c, false, true, cul, pre_on, inu);       // AU[nl] += cul v
+            axpy_blk(accU.data(), V, c, false, true, cua, pre_on, inu); used_U = true; // AU[a] += cua v
           }
         }
       };
@@ -995,54 +1019,71 @@ namespace dynbse {
         for (long y = 0; y < nc; ++y)
           for (long r = 0; r < nR; ++r) {
             const cplx cv = X.cst(ik, x, y, r);
-            Vt(x, 0, r, y) = cv; Sv(0, r, x, y) = cv;
+            Vt(x, 0, r, y) = cv;
             anyc = anyc or (cv != cplx(0.0));
             for (long a = 0; a < np; ++a) {
               const cplx u = X.fam(0, a, ik, x, y, r), t = X.fam(1, a, ik, x, y, r);
-              Vt(x, 1 + a, r, y) = u; Sv(1 + a, r, x, y) = u;
-              Vt(x, 1 + np + a, r, y) = t; Sv(1 + np + a, r, x, y) = t;
+              Vt(x, 1 + a, r, y) = u;
+              Vt(x, 1 + np + a, r, y) = t;
               anyv = anyv or (u != cplx(0.0)) or (t != cplx(0.0));
             }
           }
       if (anyc or anyv) {
         auto Vt2 = nda::reshape(Vt, std::array<long, 2>{nc, ncomp * nR * nc});
-        auto Sv2 = nda::reshape(Sv, std::array<long, 2>{ncomp * nR * nc, nc});
+        auto Pj2 = nda::reshape(Pj, std::array<long, 2>{nc * ncomp * nR, nc});
         auto part_of = [&](long c) { return (c == 0) ? 1 : 0; };
-        for (long j = 0; j < ng; ++j) {
-          for (long x = 0; x < nc; ++x)
-            for (long y = 0; y < nc; ++y) { gjT(x, y) = P.gk(j, ik, y, x); glT(x, y) = P.gkq(j, ik, y, x); }
-          nda::blas::gemm(gjT, Vt2, Pj);                                        // (p1', (c r y))
-          auto Pj2 = nda::reshape(Pj, std::array<long, 2>{nc * ncomp * nR, nc});
-          nda::blas::gemm(Pj2, Ghat(j, all, all), Qj);                          // Q_j(c, r): ((p1' c r), p3)
-          nda::blas::gemm(Pj2, glT, Bj);                                        // B_j(c, r)
-          auto Q4 = nda::reshape(Qj, std::array<long, 4>{nc, ncomp, nR, nc});
-          auto B4 = nda::reshape(Bj, std::array<long, 4>{nc, ncomp, nR, nc});
-          for (long c = 0; c < ncomp; ++c) {
-            if (c == 0 and not anyc) continue;
-            mulU(j, c, Q4(all, c, all, all), part_of(c));     // + U_j . Q_j
-            mulT(j, c, B4(all, c, all, all), part_of(c));     // + T_j . B_j
-          }
-        }
-        for (long l = 0; l < ng; ++l) {
-          for (long x = 0; x < nc; ++x)
-            for (long y = 0; y < nc; ++y) glT(x, y) = P.gkq(l, ik, y, x);
-          nda::blas::gemm(Gtil(l, all, all), Vt2, Pj);                          // (p1', (c r y))
-          auto Pl2 = nda::reshape(Pj, std::array<long, 2>{nc * ncomp * nR, nc});
-          nda::blas::gemm(Pl2, glT, Qj);                                        // R_l(c, r): ((p1' c r), p3)
-          auto R4 = nda::reshape(Qj, std::array<long, 4>{nc, ncomp, nR, nc});
-          for (long c = 0; c < ncomp; ++c) {
-            if (c == 0 and not anyc) continue;
-            for (long x = 0; x < nc; ++x)
-              for (long r = 0; r < nR; ++r)
-                for (long y = 0; y < nc; ++y) {
-                  const cplx v = R4(x, c, r, y);
-                  mV(x, r, y) = -v;
-                  tV(x, r, y) = inu * v;
+        // pass 0 = the j loop (+ U_j . Q_j, + T_j . B_j); pass 1 = the l loop (- U_l . R_l, + i nu T_l . R_l)
+        for (int pass = 0; pass < 2; ++pass)
+          for (long p0 = 0; p0 < ng; p0 += PB) {
+            const long nt = std::min(PB, ng - p0);
+            for (long t = 0; t < nt; ++t) {                 // the tile's gemms
+              const long pole = p0 + t;
+              for (long x = 0; x < nc; ++x)
+                for (long y = 0; y < nc; ++y) { gjT(x, y) = P.gk(pole, ik, y, x); glT(x, y) = P.gkq(pole, ik, y, x); }
+              nda::array_view<cplx, 2> Qv(std::array<long, 2>{nc * ncomp * nR, nc}, Qt.data() + t * W);
+              if (pass == 0) {
+                nda::array_view<cplx, 2> Bv(std::array<long, 2>{nc * ncomp * nR, nc}, Bt.data() + t * W);
+                nda::blas::gemm(gjT, Vt2, Pj);                                    // (p1', (c r y))
+                nda::blas::gemm(Pj2, Ghat(pole, all, all), Qv);                   // Q_j(c, r): ((p1' c r), p3)
+                nda::blas::gemm(Pj2, glT, Bv);                                    // B_j(c, r)
+              } else {
+                nda::blas::gemm(Gtil(pole, all, all), Vt2, Pj);                   // (p1', (c r y))
+                nda::blas::gemm(Pj2, glT, Qv);                                    // R_l(c, r): ((p1' c r), p3)
+              }
+            }
+            for (long c = 0; c < ncomp; ++c) {              // the tile's scatter, component outside
+              if (c == 0 and not anyc) continue;
+              const int part = part_of(c);
+              const long a = (c == 0) ? -1 : ((c <= np) ? c - 1 : c - 1 - np);
+              used_U = false; used_T = false;
+              if (a >= 0) { std::fill_n(accU.data(), blk, cplx(0.0)); std::fill_n(accT.data(), blk, cplx(0.0)); }
+              for (long t = 0; t < nt; ++t) {
+                const long pole = p0 + t;
+                cplx const *Q = Qt.data() + t * W;
+                if (pass == 0) {
+                  mulU_t(pole, c, Q, part, false);                       // + U_j . Q_j
+                  mulT_t(pole, c, Bt.data() + t * W, part, false);       // + T_j . B_j
+                } else {
+                  mulU_t(pole, c, Q, part, true);                        // - U_l . R_l
+                  mulT_t(pole, c, Q, part, true);                        // + i nu T_l . R_l
                 }
-            mulU(l, c, mV, part_of(c));                     // - U_l . R_l
-            mulT(l, c, tV, part_of(c));                     // + i nu T_l . R_l
+              }
+              if (a >= 0) {                                 // flush the a-indexed reductions, production signs
+                if (used_U) {
+                  cplx *dst = base(AU, part, a);
+                  cplx const *s = accU.data();
+                  if (c <= np) for (long e = 0; e < blk; ++e) dst[e] -= s[e];
+                  else         for (long e = 0; e < blk; ++e) dst[e] += s[e];
+                }
+                if (used_T) {
+                  utils::check(c > np, "dynbse::l0_apply_shift_cols: an AT[a] contribution in the U range.");
+                  cplx *dst = base(AT, part, a);
+                  cplx const *s = accT.data();
+                  for (long e = 0; e < blk; ++e) dst[e] += s[e];
+                }
+              }
+            }
           }
-        }
       }
       // ---- assemble --------------------------------------------------------------------------
       for (int part = 0; part < 2; ++part) {
