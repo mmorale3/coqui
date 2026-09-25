@@ -929,7 +929,7 @@ namespace dynbse {
    *  instead of nR sets. Gated against l0_apply_ref by the toy tests (L)/(G) at inu != 0. */
   inline void l0_apply_shift_cols(freq_basis const &b, pair_poles const &P, shift_tables const &st,
                                   tf_vector const &X, tf_vector &F, nda::array<cplx, 4> &Fsum,
-                                  nda::array<cplx, 3> const *Cb_cst) {
+                                  nda::array<cplx, 3> const *Cb_cst, [[maybe_unused]] bool force_host = false) {
     decltype(nda::range::all) all;
     const cplx inu = st.inu;
     const long np = b.np, nk = P.nk, nc = P.nc, ng = P.ng, nR = X.nR, nc2 = nc * nc;
@@ -940,7 +940,7 @@ namespace dynbse {
     double tfold = tfold_ratio();
     tfold = vertex_debug::number("dynbse_tfold", tfold);   // vertex_debug: dynbse_tfold (experiment override)
 #if defined(ENABLE_CUDA)
-    if (l0_device_enabled()) {
+    if (l0_device_enabled() and not force_host) {   // force_host: the A/B gate of the toy tests
       l0_apply_shift_cols_device(b, P, st, X, F, Fsum, Cb_cst, tfold);
       return;
     }
@@ -1807,16 +1807,18 @@ namespace dynbse {
    */
   inline void l0_apply(freq_basis const &b, pair_poles const &P, cplx inu, bool shared,
                        tf_vector const &X, tf_vector &F, nda::array<cplx, 4> &Fsum,
-                       nda::array<cplx, 3> const *Cb_cst = nullptr, shift_tables const *st = nullptr) {
+                       nda::array<cplx, 3> const *Cb_cst = nullptr, shift_tables const *st = nullptr,
+                       bool force_host = false) {
     decltype(nda::range::all) all;
     // inu != 0: the {U, T} twisted-pair basis (D2e). The {U, S} branches below this dispatch are
-    // the inu = 0 (folded, single-family) path only.
+    // the inu = 0 (folded, single-family) path only. force_host: the host L0 kernel even when the device
+    // one is enabled (the device-vs-host A/B gate of the toy tests, gpu port 5b).
     if (inu != cplx(0.0)) {
       utils::check(st != nullptr and st->inu == inu,
                    "dynbse::l0_apply: inu != 0 needs the shift tables built for this inu (build_shift_tables).");
       for (long j = 0; j < P.ng; ++j)
         utils::check(P.gnode(j) < b.np and (not shared or P.gnode(j) < b.np_fit), "dynbse::l0_apply: G node map out of range.");
-      if (l0_cols_state()) l0_apply_shift_cols(b, P, *st, X, F, Fsum, Cb_cst);
+      if (l0_cols_state()) l0_apply_shift_cols(b, P, *st, X, F, Fsum, Cb_cst, force_host);
       else l0_apply_shift(b, P, *st, X, F, Fsum, Cb_cst);
       return;
     }

@@ -713,6 +713,26 @@ namespace bdft_tests {
           }
           db::l0_apply_ref(bb, PP, inu, sh, Xs, Fa, Sa);
           db::l0_apply(bb, PP, inu, sh, Xr, Fb, Sb, nullptr, stGp);
+          // gpu port 5b: the device kernel against the HOST kernel on the same input -- far tighter than
+          // grouped-vs-ref (whose 1e-9 class is the shift tables' fit): the two differ by the atomics' roundoff
+          if (l0_on_device() and not nu0) {
+            db::tf_vector Fh(npp, nk, nc, 3);
+            nda::array<cplx, 4> Sh(nk, nc, nc, 3);
+            db::l0_apply(bb, PP, inu, sh, Xr, Fh, Sh, nullptr, stGp, /*force_host=*/true);
+            double dh = 0.0, hs = 0.0, dhs = 0.0, hss = 0.0;
+            for (long i = 0; i < long(Fh.fam.size()); ++i) {
+              dh = std::max(dh, std::abs(Fb.fam.data()[i] - Fh.fam.data()[i]));
+              hs = std::max(hs, std::abs(Fh.fam.data()[i]));
+            }
+            for (long i = 0; i < long(Sh.size()); ++i) {
+              dhs = std::max(dhs, std::abs(Sb.data()[i] - Sh.data()[i]));
+              hss = std::max(hss, std::abs(Sh.data()[i]));
+            }
+            app_log(1, "dynbse (G) inu = {:.3f}i [{}]: device vs host kernel |dF| {:.3e} (scale {:.3e}), |dFsum| {:.3e} "
+                       "(scale {:.3e})", inu.imag(), tag, dh, hs, dhs, hss);
+            REQUIRE(dh <= 1e-12 * std::max(hs, 1e-3));
+            REQUIRE(dhs <= 1e-12 * std::max(hss, 1e-3));
+          }
           double df = 0.0, sf = 0.0, ds = 0.0, ss = 0.0;
           if (nu0) {
             for (long i = 0; i < long(Fa.fam.size()); ++i) {
