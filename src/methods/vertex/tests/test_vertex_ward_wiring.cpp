@@ -24,6 +24,7 @@
 #undef NDEBUG
 
 #include <cmath>
+#include <limits>
 #include <complex>
 #include <string>
 #include <tuple>
@@ -97,7 +98,14 @@ namespace bdft_tests {
     REQUIRE(h1 == h0);
     REQUIRE(c1 == c0);
     REQUIRE(r1 == r0);
-    REQUIRE(l1 == l0);            // Sigma = 0 => Delta chi0 = 0 exactly => bitwise
+    // Sigma = 0 => Delta chi0 = 0 exactly, so the two readouts are the same arithmetic. They are NOT
+    // bitwise reproducible across two scf_loop runs in one process, though: the eps readout wobbles
+    // at the ulp level run to run on the pre-merge tree already (ba23dbf, OMP_NUM_THREADS=1, 2 ranks,
+    // measured 2026-09-24: eps RPA 1.753605413982423 / ...4253 / ...4253 and +ladder ...5243 / ...526
+    // / ...5267 over three runs; source not identified, upstream of the readout since e_corr is
+    // stable to 17 digits). Under ctest load the bitwise form caught that wobble (2 ulp). A few ulp
+    // is the gate; a routing defect would show at the size of the ladder correction (~2e-8 here).
+    REQUIRE(std::abs(l1 - l0) <= 8.0 * std::numeric_limits<double>::epsilon() * std::abs(l0));
     REQUIRE(d0 == -1.0);          // the bare run reports no +DeltaLambda column
     REQUIRE(d1 == r1);            // the Lambda column collapses onto RPA (adds exact zeros)
 
