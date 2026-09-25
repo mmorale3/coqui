@@ -880,7 +880,8 @@ namespace dynbse {
    *  Cb_cst term (a small per-k contraction) stays on the host. F and Fsum come back filled. */
   inline void l0_apply_shift_cols_device(freq_basis const &b, pair_poles const &P, shift_tables const &st,
                                          tf_vector const &X, tf_vector &F, nda::array<cplx, 4> &Fsum,
-                                         nda::array<cplx, 3> const *Cb_cst, double tfold) {
+                                         nda::array<cplx, 3> const *Cb_cst, double tfold,
+                                         std::vector<long> const &act) {   // the active components (P-3a)
     const cplx inu = st.inu;
     const long np = b.np, nk = P.nk, nc = P.nc, ng = P.ng, nR = X.nR, nc2 = nc * nc;
     nda::array<cplx, 4> Ghat(nk, ng, nc, nc), Gtil(nk, ng, nc, nc);
@@ -901,9 +902,9 @@ namespace dynbse {
     for (long n = 0; n < np; ++n) fd1(n) = b.fd[size_t(n)].f1;
     bool anyc = false;
     for (auto const &v : X.cst) if (v != cplx(0.0)) { anyc = true; break; }
-    dynbse_cuda::l0_dims d{np, b.np_fit, nk, nc, ng, nR};
+    dynbse_cuda::l0_dims d{np, b.np_fit, nk, nc, ng, nR, long(act.size())};
     dynbse_cuda::l0_tables t;
-    t.Xfam = X.fam.data(); t.Xcst = X.cst.data();
+    t.Xfam = X.fam.data(); t.Xcst = X.cst.data(); t.act = act.data();
     t.gk = P.gk.data(); t.gkq = P.gkq.data(); t.Ghat = Ghat.data(); t.Gtil = Gtil.data();
     t.eps = b.eps.data(); t.epsG = P.epsG.data(); t.gnode = P.gnode.data();
     t.fhalf = b.fhalf.data(); t.fd1 = fd1.data();
@@ -939,9 +940,36 @@ namespace dynbse {
     const long ncomp = 1 + 2 * np;
     double tfold = tfold_ratio();
     tfold = vertex_debug::number("dynbse_tfold", tfold);   // vertex_debug: dynbse_tfold (experiment override)
+    // THE ACTIVE COMPONENTS (gpu port P-3a, 2026-09-25): the input's components c (0 = the constant, 1 + f np + a =
+    // node a of family f) that carry content anywhere; the packing, the batched gemms and the scatter run over this
+    // list only. A frequency-CONSTANT input (L_s's second call, both calls of L_s d) is then ONE component instead
+    // of 1 + 2 np -- the gemms' free dimension and the scatter shrink by that factor; a K_d output (every component
+    // set) is unchanged. `pos` is the inverse map (global c -> packed position, -1 if absent). vertex_debug
+    // dynbse_l0_active = 0 packs every component (the old path, for A/B).
+    std::vector<long> act;
+    act.reserve(size_t(ncomp));
+    {
+      const bool all_active = (vertex_debug::number("dynbse_l0_active", 1.0) == 0.0);   // vertex_debug: dynbse_l0_active
+      bool anyc_g = all_active;
+      if (not anyc_g) for (auto const &v : X.cst) if (v != cplx(0.0)) { anyc_g = true; break; }
+      if (anyc_g) act.push_back(0);
+      for (long f = 0; f < 2; ++f)
+        for (long a = 0; a < np; ++a) {
+          bool anya = all_active;
+          if (not anya) {
+            auto va = X.fam(f, a, all, all, all, all);
+            for (auto const &v : va) if (v != cplx(0.0)) { anya = true; break; }
+          }
+          if (anya) act.push_back(1 + f * np + a);
+        }
+    }
+    const long nca = long(act.size());
+    if (nca == 0) return;                          // nothing to apply (F and Fsum are zero)
+    std::vector<long> pos(size_t(ncomp), -1);
+    for (long il = 0; il < nca; ++il) pos[size_t(act[size_t(il)])] = il;
 #if defined(ENABLE_CUDA)
     if (l0_device_enabled() and not force_host) {   // force_host: the A/B gate of the toy tests
-      l0_apply_shift_cols_device(b, P, st, X, F, Fsum, Cb_cst, tfold);
+      l0_apply_shift_cols_device(b, P, st, X, F, Fsum, Cb_cst, tfold, act);
       return;
     }
 #endif
@@ -964,9 +992,9 @@ namespace dynbse {
       // nj-indexed targets touch only the tile's PB blocks. Every per-term product is the production arithmetic
       // (the l pass's mV = -R and tV = i nu R are reproduced by (-w) R == w (-R) bitwise and by pre-scaling);
       // only the ORDER in which the a-indexed targets accumulate over the poles changes (roundoff).
-      const long W = nc * ncomp * nR * nc, blk = nc * nR * nc, ry = nR * nc;
-      nda::array<cplx, 4> Vt(nc, ncomp, nR, nc);
-      nda::array<cplx, 2> Pj(nc, ncomp * nR * nc);
+      const long W = nc * nca * nR * nc, blk = nc * nR * nc, ry = nR * nc;   // nca active components packed
+      nda::array<cplx, 4> Vt(nc, nca, nR, nc);
+      nda::array<cplx, 2> Pj(nc, nca * nR * nc);
       nda::array<cplx, 2> Qt(PB, W), Bt(PB, W);          // the tile's gemm outputs, pole-major, (x, c, r, y) inside
       nda::array<cplx, 1> accU(blk), accT(blk);          // the a-indexed reductions over the tile
       AU() = cplx(0.0); AT() = cplx(0.0); M2() = cplx(0.0); A1() = cplx(0.0); A3() = cplx(0.0);
@@ -974,8 +1002,9 @@ namespace dynbse {
       // dst(x, r, y) (+= | -=) [w *] [pre *] src(x, c, r, y) over the (nc, nR, nc) block c of a pole's output, in the
       // production's arithmetic: `scaled` = the weight multiplies, `prescale` = the l pass's i nu multiplies FIRST.
       auto axpy_blk = [&](cplx *dst, cplx const *src, long c, bool sub, bool scaled, cplx w, bool prescale, cplx pre) {
+        const long cl = pos[size_t(c)];               // the packed position of the global component c
         for (long x = 0; x < nc; ++x) {
-          cplx const *v = src + (x * ncomp + c) * ry;
+          cplx const *v = src + (x * nca + cl) * ry;
           cplx *o = dst + x * ry;
           if (not scaled and not prescale) {
             if (sub) for (long e = 0; e < ry; ++e) o[e] -= v[e];
@@ -1079,24 +1108,33 @@ namespace dynbse {
               Gtil(l, x, y) += w * P.gk(j, ik, y, x);
             }
         }
-      // the input components: C (comp 0), U_a (1..np), T_a (np+1..2np), for all columns
+      // the input components: C (comp 0), U_a (1..np), T_a (np+1..2np), for all columns -- the ACTIVE ones only,
+      // packed at their positions in `act`
       bool anyc = false, anyv = false;
-      for (long x = 0; x < nc; ++x)
-        for (long y = 0; y < nc; ++y)
-          for (long r = 0; r < nR; ++r) {
-            const cplx cv = X.cst(ik, x, y, r);
-            Vt(x, 0, r, y) = cv;
-            anyc = anyc or (cv != cplx(0.0));
-            for (long a = 0; a < np; ++a) {
-              const cplx u = X.fam(0, a, ik, x, y, r), t = X.fam(1, a, ik, x, y, r);
-              Vt(x, 1 + a, r, y) = u;
-              Vt(x, 1 + np + a, r, y) = t;
-              anyv = anyv or (u != cplx(0.0)) or (t != cplx(0.0));
-            }
-          }
+      for (long il = 0; il < nca; ++il) {
+        const long c = act[size_t(il)];
+        if (c == 0) {
+          for (long x = 0; x < nc; ++x)
+            for (long y = 0; y < nc; ++y)
+              for (long r = 0; r < nR; ++r) {
+                const cplx cv = X.cst(ik, x, y, r);
+                Vt(x, il, r, y) = cv;
+                anyc = anyc or (cv != cplx(0.0));
+              }
+        } else {
+          const long f = (c - 1) / np, a = (c - 1) % np;
+          for (long x = 0; x < nc; ++x)
+            for (long y = 0; y < nc; ++y)
+              for (long r = 0; r < nR; ++r) {
+                const cplx u = X.fam(f, a, ik, x, y, r);
+                Vt(x, il, r, y) = u;
+                anyv = anyv or (u != cplx(0.0));
+              }
+        }
+      }
       if (anyc or anyv) {
-        auto Vt2 = nda::reshape(Vt, std::array<long, 2>{nc, ncomp * nR * nc});
-        auto Pj2 = nda::reshape(Pj, std::array<long, 2>{nc * ncomp * nR, nc});
+        auto Vt2 = nda::reshape(Vt, std::array<long, 2>{nc, nca * nR * nc});
+        auto Pj2 = nda::reshape(Pj, std::array<long, 2>{nc * nca * nR, nc});
         auto part_of = [&](long c) { return (c == 0) ? 1 : 0; };
         // pass 0 = the j loop (+ U_j . Q_j, + T_j . B_j); pass 1 = the l loop (- U_l . R_l, + i nu T_l . R_l)
         for (int pass = 0; pass < 2; ++pass)
@@ -1106,9 +1144,9 @@ namespace dynbse {
               const long pole = p0 + t;
               for (long x = 0; x < nc; ++x)
                 for (long y = 0; y < nc; ++y) { gjT(x, y) = P.gk(pole, ik, y, x); glT(x, y) = P.gkq(pole, ik, y, x); }
-              nda::array_view<cplx, 2> Qv(std::array<long, 2>{nc * ncomp * nR, nc}, Qt.data() + t * W);
+              nda::array_view<cplx, 2> Qv(std::array<long, 2>{nc * nca * nR, nc}, Qt.data() + t * W);
               if (pass == 0) {
-                nda::array_view<cplx, 2> Bv(std::array<long, 2>{nc * ncomp * nR, nc}, Bt.data() + t * W);
+                nda::array_view<cplx, 2> Bv(std::array<long, 2>{nc * nca * nR, nc}, Bt.data() + t * W);
                 nda::blas::gemm(gjT, Vt2, Pj);                                    // (p1', (c r y))
                 nda::blas::gemm(Pj2, Ghat(pole, all, all), Qv);                   // Q_j(c, r): ((p1' c r), p3)
                 nda::blas::gemm(Pj2, glT, Bv);                                    // B_j(c, r)
@@ -1117,7 +1155,8 @@ namespace dynbse {
                 nda::blas::gemm(Pj2, glT, Qv);                                    // R_l(c, r): ((p1' c r), p3)
               }
             }
-            for (long c = 0; c < ncomp; ++c) {              // the tile's scatter, component outside
+            for (long il = 0; il < nca; ++il) {             // the tile's scatter, ACTIVE component outside
+              const long c = act[size_t(il)];
               if (c == 0 and not anyc) continue;
               const int part = part_of(c);
               const long a = (c == 0) ? -1 : ((c <= np) ? c - 1 : c - 1 - np);

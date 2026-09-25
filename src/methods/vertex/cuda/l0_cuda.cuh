@@ -46,12 +46,14 @@ namespace methods::solvers::dynbse_cuda {
 
   struct l0_dims {
     long np = 0, np_fit = 0, nk = 0, nc = 0, ng = 0, nR = 0;
+    long nca = 0;                 // the number of ACTIVE input components packed (P-3a); 1 + 2 np = all
   };
 
   /** host pointers to C-contiguous data, shapes as in dynbse.hpp */
   struct l0_tables {
     cplx const *Xfam = nullptr;     // (2, np, nk, nc, nc, nR)
     cplx const *Xcst = nullptr;     // (nk, nc, nc, nR)
+    long const *act = nullptr;      // (nca) the ACTIVE input components, global c = 0 (constant) | 1 + f np + a (P-3a)
     cplx const *gk = nullptr;       // (ng, nk, nc, nc)
     cplx const *gkq = nullptr;      // (ng, nk, nc, nc)
     cplx const *Ghat = nullptr;     // (nk, ng, nc, nc)  sum_{l != j} gkq(l)^T / (epsG_j - epsG_l + inu)

@@ -733,6 +733,48 @@ namespace bdft_tests {
             REQUIRE(dh <= 1e-12 * std::max(hs, 1e-3));
             REQUIRE(dhs <= 1e-12 * std::max(hss, 1e-3));
           }
+          // gpu port P-3a: a frequency-CONSTANT input takes the active-component fast path (one packed component
+          // instead of 1 + 2 np) -- it must reproduce the reference at the gate's class and, on a CUDA build, the
+          // host kernel on the same input to roundoff. (A constant-only input is the same vector in the {U,S} and
+          // the twisted bases, so the reference needs no conversion.)
+          {
+            db::tf_vector Xk(npp, nk, nc, 3), Fk(npp, nk, nc, 3), Fkr(npp, nk, nc, 3);
+            nda::array<cplx, 4> Sk(nk, nc, nc, 3), Skr(nk, nc, nc, 3);
+            Xk.cst() = Xr.cst;
+            db::l0_apply_ref(bb, PP, inu, sh, Xk, Fkr, Skr);
+            db::l0_apply(bb, PP, inu, sh, Xk, Fk, Sk, nullptr, stGp);
+            double dk = 0.0, sk = 0.0, dks = 0.0, sks = 0.0;
+            for (long i = 0; i < long(Fk.fam.size()); ++i) {
+              dk = std::max(dk, std::abs(Fk.fam.data()[i] - Fkr.fam.data()[i]));
+              sk = std::max(sk, std::abs(Fkr.fam.data()[i]));
+            }
+            for (long i = 0; i < long(Sk.size()); ++i) {
+              dks = std::max(dks, std::abs(Sk.data()[i] - Skr.data()[i]));
+              sks = std::max(sks, std::abs(Skr.data()[i]));
+            }
+            app_log(1, "dynbse (G) inu = {:.3f}i [{}]: constant-only input (fast path) vs ref |dF| {:.3e} (scale {:.3e}), "
+                       "|dFsum| {:.3e} (scale {:.3e})", inu.imag(), tag, dk, sk, dks, sks);
+            REQUIRE(dk < (nu0 ? 1e-11 : 1e-7) * std::max(sk, 1e-3));
+            REQUIRE(dks < (nu0 ? 1e-11 : 1e-7) * std::max(sks, 1e-3));
+            if (l0_on_device() and not nu0) {
+              db::tf_vector Fkh(npp, nk, nc, 3);
+              nda::array<cplx, 4> Skh(nk, nc, nc, 3);
+              db::l0_apply(bb, PP, inu, sh, Xk, Fkh, Skh, nullptr, stGp, /*force_host=*/true);
+              double dkh = 0.0, skh = 0.0, dkhs = 0.0, skhs = 0.0;
+              for (long i = 0; i < long(Fk.fam.size()); ++i) {
+                dkh = std::max(dkh, std::abs(Fk.fam.data()[i] - Fkh.fam.data()[i]));
+                skh = std::max(skh, std::abs(Fkh.fam.data()[i]));
+              }
+              for (long i = 0; i < long(Sk.size()); ++i) {
+                dkhs = std::max(dkhs, std::abs(Sk.data()[i] - Skh.data()[i]));
+                skhs = std::max(skhs, std::abs(Skh.data()[i]));
+              }
+              app_log(1, "dynbse (G) inu = {:.3f}i [{}]: constant-only input, device vs host kernel |dF| {:.3e} (scale {:.3e}), "
+                         "|dFsum| {:.3e} (scale {:.3e})", inu.imag(), tag, dkh, skh, dkhs, skhs);
+              REQUIRE(dkh <= 1e-12 * std::max(skh, 1e-3));
+              REQUIRE(dkhs <= 1e-12 * std::max(skhs, 1e-3));
+            }
+          }
           double df = 0.0, sf = 0.0, ds = 0.0, ss = 0.0;
           if (nu0) {
             for (long i = 0; i < long(Fa.fam.size()); ++i) {

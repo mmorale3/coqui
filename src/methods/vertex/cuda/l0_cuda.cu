@@ -63,24 +63,29 @@ namespace methods::solvers::dynbse_cuda {
       atomicAdd(reinterpret_cast<double *>(p) + 1, v.y);
     }
 
-    struct kdims { long nc, nR, np, ng, ncomp, blk, nk, np_fit; };
+    // nca = the number of ACTIVE input components packed into Vt (P-3a); act[il] = their global component index
+    // c (0 = the constant, 1 + f np + a = node a of family f). A frequency-constant input packs one component.
+    struct kdims { long nc, nR, np, ng, nca, blk, nk, np_fit; long const *act; };
 
-    // ---- pack X of K k-points into Vt(k; x, c, r, y): components C (0), U_a (1..np), T_a (np+1..2np) ----
+    // ---- pack the ACTIVE components of X of K k-points into Vt(k; x, il, r, y) ----------------------
     __global__ void pack_kernel(kdims d, long ik0, long K, cd const *__restrict__ Xfam,
                                 cd const *__restrict__ Xcst, cd *__restrict__ Vt) {
       const long kb = blockIdx.y, ik = ik0 + kb;
-      const long nc = d.nc, nR = d.nR, np = d.np, nk = d.nk, ncomp = d.ncomp;
-      const long W = nc * ncomp * nR * nc, tot = nc * nR * nc;
+      const long nc = d.nc, nR = d.nR, np = d.np, nk = d.nk, nca = d.nca;
+      const long W = nc * nca * nR * nc, tot = nc * nR * nc;
       if (kb >= K) return;
       cd *V = Vt + kb * W;
       for (long e = blockIdx.x * blockDim.x + threadIdx.x; e < tot; e += gridDim.x * blockDim.x) {
         const long x = e / (nR * nc), r = (e / nc) % nR, y = e % nc;
-        V[((x * ncomp + 0) * nR + r) * nc + y] = Xcst[((ik * nc + x) * nc + y) * nR + r];
-        for (long a = 0; a < np; ++a) {
-          const long xu = (((0 * np + a) * nk + ik) * nc + x) * nc * nR + y * nR + r;
-          const long xt = (((1 * np + a) * nk + ik) * nc + x) * nc * nR + y * nR + r;
-          V[((x * ncomp + 1 + a) * nR + r) * nc + y] = Xfam[xu];
-          V[((x * ncomp + 1 + np + a) * nR + r) * nc + y] = Xfam[xt];
+        for (long il = 0; il < nca; ++il) {
+          const long c = d.act[il];
+          cd v;
+          if (c == 0) v = Xcst[((ik * nc + x) * nc + y) * nR + r];
+          else {
+            const long f = (c - 1) / np, a = (c - 1) % np;
+            v = Xfam[(((f * np + a) * nk + ik) * nc + x) * nc * nR + y * nR + r];
+          }
+          V[((x * nca + il) * nR + r) * nc + y] = v;
         }
       }
     }
@@ -129,11 +134,12 @@ namespace methods::solvers::dynbse_cuda {
                                    long const *__restrict__ gnode,
                                    cd *__restrict__ AU, cd *__restrict__ AT, cd *__restrict__ M2,
                                    cd *__restrict__ A1, cd *__restrict__ A3) {
-      const long c = blockIdx.x, kb = blockIdx.y;
+      const long il = blockIdx.x, kb = blockIdx.y;   // il: the packed position; c: the global component
       if (kb >= K) return;
+      const long c = d.act[il];
       if (c == 0 && skip_cst) return;
-      const long np = d.np, ng = d.ng, blk = d.blk, ncomp = d.ncomp;
-      const long W = d.nc * ncomp * d.nR * d.nc, asz = 2 * np * blk;
+      const long np = d.np, ng = d.ng, blk = d.blk, nca = d.nca;
+      const long W = d.nc * nca * d.nR * d.nc, asz = 2 * np * blk;
       const int part = (c == 0) ? 1 : 0;
       const long abase = kb * asz + (long(part) * np) * blk;
       const bool isU = (c >= 1 && c <= np), isT = (c > np);
@@ -143,7 +149,7 @@ namespace methods::solvers::dynbse_cuda {
       cd const *Bk = Ball + kb * ng * W;
       for (long e = threadIdx.x; e < blk; e += blockDim.x) {
         const long x = e / (d.nR * d.nc), rem = e % (d.nR * d.nc);
-        const long src = (x * ncomp + c) * d.nR * d.nc + rem;
+        const long src = (x * nca + il) * d.nR * d.nc + rem;
         cd accU = make_cuDoubleComplex(0.0, 0.0), accT = accU;
         for (long pole = 0; pole < ng; ++pole) {
           const long nj = gnode[pole];
@@ -325,14 +331,17 @@ namespace methods::solvers::dynbse_cuda {
 
   long l0_apply_shift_cols(l0_dims const &d, l0_tables const &t, cplx *Ffam_h, cplx *Fsum_h,
                            double free_bytes) {
-    const long np = d.np, nk = d.nk, nc = d.nc, ng = d.ng, nR = d.nR, ncomp = 1 + 2 * np;
-    const long blk = nc * nR * nc, W = nc * ncomp * nR * nc, nc2 = nc * nc;
+    const long np = d.np, nk = d.nk, nc = d.nc, ng = d.ng, nR = d.nR, nca = d.nca;
+    const long blk = nc * nR * nc, W = nc * nca * nR * nc, nc2 = nc * nc;
     const size_t asz = size_t(2 * np) * size_t(blk);
     const size_t nF = size_t(2 * np) * nk * nc * nc * nR, nFs = size_t(nk) * nc * nc * nR;
-    if (nk == 0 || np == 0) return 0;
-    kdims kd{nc, nR, np, ng, ncomp, blk, nk, d.np_fit};
+    if (nk == 0 || np == 0 || nca == 0) return 0;
+    if (nca < 1 || nca > 1 + 2 * np || t.act == nullptr)
+      APP_ABORT(std::string(" l0_cuda: the active-component list is missing or out of range (nca = ") + std::to_string(nca) + ").");
 
     // ---- fixed device data ------------------------------------------------------------------------
+    long *dact = upload(t.act, size_t(nca), "act");
+    kdims kd{nc, nR, np, ng, nca, blk, nk, d.np_fit, dact};
     cd *dX = upload_c(t.Xfam, size_t(2 * np) * nk * nc * nc * nR, "Xfam");
     cd *dXc = upload_c(t.Xcst, nFs, "Xcst");
     cd *dgk = upload_c(t.gk, size_t(ng) * nk * nc2, "gk");
@@ -420,7 +429,7 @@ namespace methods::solvers::dynbse_cuda {
     cub_check(cublasCreate(&h), "cublasCreate");
     const cd one = make_cuDoubleComplex(1.0, 0.0), zero = make_cuDoubleComplex(0.0, 0.0);
     const cd inu = make_cuDoubleComplex(t.inu.real(), t.inu.imag());
-    const int Ncols = int(ncomp * nR * nc), Mrows = int(nc * ncomp * nR);
+    const int Ncols = int(nca * nR * nc), Mrows = int(nc * nca * nR);
 
     for (long ik0 = 0; ik0 < nk; ik0 += K) {
       const long Kb = std::min(K, nk - ik0);
@@ -439,7 +448,7 @@ namespace methods::solvers::dynbse_cuda {
                                    (const cd **)pGh, int(nc), (const cd **)pPj, int(nc), &zero, pQj, int(nc), nb), "gemm Qj");
       cub_check(cublasZgemmBatched(h, CUBLAS_OP_N, CUBLAS_OP_N, int(nc), Mrows, int(nc), &one,
                                    (const cd **)pGlT, int(nc), (const cd **)pPj, int(nc), &zero, pBj, int(nc), nb), "gemm Bj");
-      scatter_kernel<<<dim3(unsigned(ncomp), unsigned(Kb), 1u), 256>>>(kd, Kb, 0, inu, t.skip_cst, dQj, dBj,
+      scatter_kernel<<<dim3(unsigned(nca), unsigned(Kb), 1u), 256>>>(kd, Kb, 0, inu, t.skip_cst, dQj, dBj,
                                                                        deps, depsG, dgn, dAU, dAT, dM2, dA1, dA3);
       launch_check("scatter_kernel pass 0");
       // pass 1: P_l = Gtil_l Vt, R_l = P_l gkq_l^T
@@ -449,7 +458,7 @@ namespace methods::solvers::dynbse_cuda {
                                    (const cd **)pVt, Ncols, (const cd **)pGh, int(nc), &zero, pPj, Ncols, nb), "gemm Pl");
       cub_check(cublasZgemmBatched(h, CUBLAS_OP_N, CUBLAS_OP_N, int(nc), Mrows, int(nc), &one,
                                    (const cd **)pGlT, int(nc), (const cd **)pPj, int(nc), &zero, pQj, int(nc), nb), "gemm Rl");
-      scatter_kernel<<<dim3(unsigned(ncomp), unsigned(Kb), 1u), 256>>>(kd, Kb, 1, inu, t.skip_cst, dQj, dQj,
+      scatter_kernel<<<dim3(unsigned(nca), unsigned(Kb), 1u), 256>>>(kd, Kb, 1, inu, t.skip_cst, dQj, dQj,
                                                                        deps, depsG, dgn, dAU, dAT, dM2, dA1, dA3);
       launch_check("scatter_kernel pass 1");
       assemble_kernel<<<dim3(unsigned(np), 2u, unsigned(Kb)), 256>>>(kd, ik0, Kb, t.sum_part1, dfh, dfd1, dDsq,
@@ -470,7 +479,7 @@ namespace methods::solvers::dynbse_cuda {
     cu_check(cudaMemcpy(Fsum_h, dFs, nFs * sizeof(cd), cudaMemcpyDeviceToHost), "Fsum d2h");
 
     cub_check(cublasDestroy(h), "cublasDestroy");
-    for (void *p : {(void *)dX, (void *)dXc, (void *)dgk, (void *)dgkq, (void *)dGhat, (void *)dGtil, (void *)deps,
+    for (void *p : {(void *)dact, (void *)dX, (void *)dXc, (void *)dgk, (void *)dgkq, (void *)dGhat, (void *)dGtil, (void *)deps,
                     (void *)depsG, (void *)dgn, (void *)dfh, (void *)dfd1, (void *)dDsq, (void *)dDcb, (void *)dDqt,
                     (void *)ds1, (void *)ds3, (void *)dr1u, (void *)dr3u, (void *)dr3t, (void *)dR1U, (void *)dR1T,
                     (void *)dR3U, (void *)dR3T, (void *)dF, (void *)dFs, (void *)derr, (void *)dVt, (void *)dPj,
