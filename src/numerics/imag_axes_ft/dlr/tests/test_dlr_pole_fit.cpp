@@ -146,9 +146,17 @@ namespace bdft_tests {
         nda::array<cplx, 2> Fj(pf.nt, 1);
         for (long i = 0; i < pf.nt; ++i) Fj(i, 0) = Fb(i, j);
         auto cj = pf.coeffs(Fj);
-        double d = 0;
-        for (long p = 0; p < pf.np; ++p) d = std::max(d, std::abs(cb(p, j) - cj(p, 0)));
-        REQUIRE(d == 0.0);
+        double d = 0, cmax = 0;
+        for (long p = 0; p < pf.np; ++p) {
+          d = std::max(d, std::abs(cb(p, j) - cj(p, 0)));
+          cmax = std::max(cmax, std::abs(cj(p, 0)));
+        }
+        // Column coupling would show up at the size of the coefficients; the batched and the
+        // per-column paths are the same algorithm on the same data, but the BLAS may use different
+        // kernels for 4 columns and for 1 (MKL does), so bit-for-bit is not a property of the
+        // algorithm: measured 0.0 with OpenBLAS/clang, roundoff with MKL/gcc on rusty.
+        INFO("column " << j << ": batched vs per-column |dc|_max = " << d << ", |c|_max = " << cmax);
+        REQUIRE(d <= 1e-12 * std::max(cmax, 1.0));
       }
     }
 

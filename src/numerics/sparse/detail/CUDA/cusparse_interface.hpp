@@ -22,6 +22,7 @@
 #ifndef SPARSE_CUDA_GPU_HPP
 #define SPARSE_CUDA_GPU_HPP
 
+#include <algorithm>
 #include <type_traits>
 #include <cassert>
 #include <vector>
@@ -72,7 +73,10 @@ void csrmv(char oper_A,typename A::value_type alpha, A const& a, X const &x, typ
   CUSPARSE_CHECK( cusparseSpMV_bufferSize, handle, op_A, 
                   &alpha, cuA, cuX, &beta, cuY, cusparse_datatype<value_type>,
                   CUSPARSE_SPMV_ALG_DEFAULT, &bufferSize) 
-  memory::buffered_array<MEM,char,1> buffer(bufferSize,char(0));
+  // cuSPARSE reports bufferSize = 0 for small problems; a zero-length device array is a null
+  // pointer and nda's value-init then calls cudaMemset(nullptr, 0, 0) -> cudaErrorInvalidValue
+  // (test_csr_blas on rusty, CUDA 12.5). Always allocate at least one byte.
+  memory::buffered_array<MEM,char,1> buffer(std::max<size_t>(bufferSize, size_t(1)),char(0));
 
   // execute preprocess (optional)
 //  CUSPARSE_CHECK( cusparseSpMV_preprocess, handle, op_A, 
@@ -149,7 +153,7 @@ void csrmm(char oper_A, char oper_B, typename A::value_type alpha, A const& a, B
   CUSPARSE_CHECK( cusparseSpMM_bufferSize, handle, op_A, op_B, 
                   &alpha, cuA, cuB, &beta, cuC, cusparse_datatype<value_type>,
                   CUSPARSE_SPMM_CSR_ALG2, &bufferSize)
-  memory::buffered_array<MEM,char,1> buffer(bufferSize,char{0});
+  memory::buffered_array<MEM,char,1> buffer(std::max<size_t>(bufferSize, size_t(1)),char{0});   // >= 1 byte, see csrmv
   
   // execute preprocess (optional)
   CUSPARSE_CHECK( cusparseSpMM_preprocess, handle, op_A, op_B, 
