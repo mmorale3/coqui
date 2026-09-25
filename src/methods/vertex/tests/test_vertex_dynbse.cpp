@@ -744,9 +744,30 @@ namespace bdft_tests {
             db::l0_apply_ref(bb, PP, inu, sh, Xk, Fkr, Skr);
             db::l0_apply(bb, PP, inu, sh, Xk, Fk, Sk, nullptr, stGp);
             double dk = 0.0, sk = 0.0, dks = 0.0, sks = 0.0;
-            for (long i = 0; i < long(Fk.fam.size()); ++i) {
-              dk = std::max(dk, std::abs(Fk.fam.data()[i] - Fkr.fam.data()[i]));
-              sk = std::max(sk, std::abs(Fkr.fam.data()[i]));
+            if (nu0) {
+              for (long i = 0; i < long(Fk.fam.size()); ++i) {
+                dk = std::max(dk, std::abs(Fk.fam.data()[i] - Fkr.fam.data()[i]));
+                sk = std::max(sk, std::abs(Fkr.fam.data()[i]));
+              }
+            } else {
+              // as the main gate: pointwise values at a few fermionic frequencies, each output in its own basis
+              // (the reference's family 1 is S_c, the grouped code's is T_c = U_c S_c)
+              for (long k = 0; k < nk; ++k)
+                for (long n : {0l, 2l, 9l, -5l, 40l})
+                  for (long rr = 0; rr < 3; ++rr) {
+                    const cplx z = I_ * cplx((2.0 * n + 1.0) * M_PI / beta);
+                    for (long x = 0; x < nc; ++x)
+                      for (long y = 0; y < nc; ++y) {
+                        cplx va(0.0), vb(0.0);
+                        for (long c = 0; c < npp; ++c) {
+                          const cplx u = 1.0 / (z - bb.eps(c)), sS = 1.0 / (z + inu - bb.eps(c));
+                          va += Fkr.fam(0, c, k, x, y, rr) * u + Fkr.fam(1, c, k, x, y, rr) * sS;
+                          vb += Fk.fam(0, c, k, x, y, rr) * u + Fk.fam(1, c, k, x, y, rr) * u * sS;
+                        }
+                        dk = std::max(dk, std::abs(va - vb));
+                        sk = std::max(sk, std::abs(va));
+                      }
+                  }
             }
             for (long i = 0; i < long(Sk.size()); ++i) {
               dks = std::max(dks, std::abs(Sk.data()[i] - Skr.data()[i]));
