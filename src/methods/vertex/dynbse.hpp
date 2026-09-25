@@ -88,6 +88,10 @@
 #include "IO/app_loggers.h"
 #include "nda/nda.hpp"
 #include "nda/blas.hpp"
+#if defined(ENABLE_CUDA)
+#include "utilities/device_pool.h"        // freemem_device_effective: the k-batch budget of the device L0
+#include "methods/vertex/cuda/l0_cuda.cuh"
+#endif
 #include "nda/lapack.hpp"
 #include "numerics/nda_functions.hpp"
 #include "numerics/imag_axes_ft/IAFT.hpp"
@@ -864,6 +868,62 @@ namespace dynbse {
   inline double &tfold_ratio_ref() { static double r = 0.0; return r; }
   inline double tfold_ratio() { return tfold_ratio_ref(); }
 
+#if defined(ENABLE_CUDA)
+  /** gpu port 5b (notes/gpu_port_plan.md section 5): the device L0 is the default on a CUDA build;
+   *  vertex_debug dynbse_l0_device = 0 keeps the host kernel (the A/B reference). */
+  inline bool l0_device_enabled() {
+    static const bool v = (vertex_debug::number("dynbse_l0_device", 1.0) != 0.0);   // vertex_debug: dynbse_l0_device
+    return v;
+  }
+  /** l0_apply_shift_cols on the device: the pole matrices Ghat / Gtil are formed here (O(ng^2 nc^2) per k,
+   *  negligible), everything else is handed to dynbse_cuda::l0_apply_shift_cols as plain pointers; the
+   *  Cb_cst term (a small per-k contraction) stays on the host. F and Fsum come back filled. */
+  inline void l0_apply_shift_cols_device(freq_basis const &b, pair_poles const &P, shift_tables const &st,
+                                         tf_vector const &X, tf_vector &F, nda::array<cplx, 4> &Fsum,
+                                         nda::array<cplx, 3> const *Cb_cst, double tfold) {
+    const cplx inu = st.inu;
+    const long np = b.np, nk = P.nk, nc = P.nc, ng = P.ng, nR = X.nR, nc2 = nc * nc;
+    nda::array<cplx, 4> Ghat(nk, ng, nc, nc), Gtil(nk, ng, nc, nc);
+    Ghat() = cplx(0.0);
+    Gtil() = cplx(0.0);
+    for (long ik = 0; ik < nk; ++ik)
+      for (long j = 0; j < ng; ++j)
+        for (long l = 0; l < ng; ++l) {
+          if (j == l) continue;
+          const cplx w = cplx(1.0) / (cplx(P.epsG(j) - P.epsG(l)) + inu);
+          for (long x = 0; x < nc; ++x)
+            for (long y = 0; y < nc; ++y) {
+              Ghat(ik, j, x, y) += w * P.gkq(l, ik, y, x);
+              Gtil(ik, l, x, y) += w * P.gk(j, ik, y, x);
+            }
+        }
+    nda::array<double, 1> fd1(np);
+    for (long n = 0; n < np; ++n) fd1(n) = b.fd[size_t(n)].f1;
+    bool anyc = false;
+    for (auto const &v : X.cst) if (v != cplx(0.0)) { anyc = true; break; }
+    dynbse_cuda::l0_dims d{np, b.np_fit, nk, nc, ng, nR};
+    dynbse_cuda::l0_tables t;
+    t.Xfam = X.fam.data(); t.Xcst = X.cst.data();
+    t.gk = P.gk.data(); t.gkq = P.gkq.data(); t.Ghat = Ghat.data(); t.Gtil = Gtil.data();
+    t.eps = b.eps.data(); t.epsG = P.epsG.data(); t.gnode = P.gnode.data();
+    t.fhalf = b.fhalf.data(); t.fd1 = fd1.data();
+    t.Dsq = b.Dsq.data(); t.Dcb = b.Dcb.data(); t.Dqt = b.Dqt.data();
+    t.s1 = st.s1.data(); t.s3 = st.s3.data(); t.r1u = st.r1u.data(); t.r3u = st.r3u.data(); t.r3t = st.r3t.data();
+    t.R1U = st.R1U.data(); t.R1T = st.R1T.data(); t.R3U = st.R3U.data(); t.R3T = st.R3T.data();
+    t.inu = inu; t.tfold = tfold; t.sum_part1 = (Cb_cst == nullptr); t.skip_cst = not anyc;
+    const double free_bytes = 1.0e6 * double(utils::freemem_device_effective());
+    dynbse_cuda::l0_apply_shift_cols(d, t, F.fam.data(), Fsum.data(), free_bytes);
+    if (Cb_cst != nullptr and anyc)
+      for (long ik = 0; ik < nk; ++ik)
+        for (long r = 0; r < nR; ++r)
+          for (long p = 0; p < nc2; ++p) {
+            cplx sacc(0.0);
+            for (long pp = 0; pp < nc2; ++pp) sacc += (*Cb_cst)(ik, p, pp) * X.cst(ik, pp / nc, pp % nc, r);
+            Fsum(ik, p / nc, p % nc, r) += sacc;
+          }
+  }
+#endif
+
   /** l0_apply_shift with the RHS columns batched into the gemms (the inu != 0 twin of l0_apply_cols): the
    *  same terms and tables, per (k, G node) ONE (nc x nc)(nc x ncomp nR nc) gemm and its two follow-ups
    *  instead of nR sets. Gated against l0_apply_ref by the toy tests (L)/(G) at inu != 0. */
@@ -879,6 +939,12 @@ namespace dynbse {
     const long ncomp = 1 + 2 * np;
     double tfold = tfold_ratio();
     tfold = vertex_debug::number("dynbse_tfold", tfold);   // vertex_debug: dynbse_tfold (experiment override)
+#if defined(ENABLE_CUDA)
+    if (l0_device_enabled()) {
+      l0_apply_shift_cols_device(b, P, st, X, F, Fsum, Cb_cst, tfold);
+      return;
+    }
+#endif
     // P26 (notes/vertex_perf_plan.md, the L0 miniapp): PB = poles per tile of the traffic restructuring below;
     // 4 was the best of {4, 8, 16, 40} at 96 threads (1.37x), 1 keeps the tile machinery with one pole per tile.
     const long PB = std::max(1l, long(vertex_debug::number("dynbse_l0_pb", 4.0)));   // vertex_debug: dynbse_l0_pb
