@@ -1,8 +1,13 @@
 
 # Runs unit tests
+# Prefix command for the NON-MPI unit tests (they still initialize MPI). Empty by default; under a slurm
+# allocation set it to a launcher, e.g. -DCOQUI_UNIT_TEST_LAUNCHER="/path/srun_mpiexec.sh;-n;1", so that
+# they run as their own step with a PMI environment instead of directly on the node that runs ctest.
+SET( COQUI_UNIT_TEST_LAUNCHER "" CACHE STRING "prefix command (;-separated list) for the non-MPI unit tests" )
+
 FUNCTION( ADD_UNIT_TEST TESTNAME TEST_BINARY )
     MESSAGE( STATUS "Adding test ${TESTNAME}")
-    ADD_TEST(NAME ${TESTNAME} COMMAND ${TEST_BINARY} ${ARGN})
+    ADD_TEST(NAME ${TESTNAME} COMMAND ${COQUI_UNIT_TEST_LAUNCHER} ${TEST_BINARY} ${ARGN})
     SET_TESTS_PROPERTIES( ${TESTNAME} PROPERTIES ENVIRONMENT OMP_NUM_THREADS=1 )
     SET_PROPERTY(TEST ${TESTNAME} APPEND PROPERTY LABELS "unit")
 ENDFUNCTION()
