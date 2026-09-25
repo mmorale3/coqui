@@ -148,22 +148,41 @@ void csrmm(char oper_A, char oper_B, typename A::value_type alpha, A const& a, B
   memory::buffered_array<MEM,int_type,1> ofs(m+1,int_type(0));
   auto cuA = cuCSR(a,ofs,batchCountB);
 
-  // allocate an external buffer if needed
+  // allocate an external buffer if needed. CSR_ALG2 (deterministic) is preferred, but cuSPARSE rejects
+  // it for some (op, layout, index-type) combinations with CUSPARSE_STATUS_INVALID_VALUE /
+  // NOT_SUPPORTED at the bufferSize query (test_sparse on rusty, CUDA 12.5: the row-major B / C of
+  // csrmm<'N'>); fall back to ALG_DEFAULT, which cuSPARSE resolves per layout, for that call.
   size_t bufferSize = 0;
-  CUSPARSE_CHECK( cusparseSpMM_bufferSize, handle, op_A, op_B, 
-                  &alpha, cuA, cuB, &beta, cuC, cusparse_datatype<value_type>,
-                  CUSPARSE_SPMM_CSR_ALG2, &bufferSize)
+  cusparseSpMMAlg_t alg = CUSPARSE_SPMM_CSR_ALG2;
+  {
+    auto st = cusparseSpMM_bufferSize(handle, op_A, op_B, &alpha, cuA, cuB, &beta, cuC,
+                                      cusparse_datatype<value_type>, alg, &bufferSize);
+    if (st == CUSPARSE_STATUS_INVALID_VALUE or st == CUSPARSE_STATUS_NOT_SUPPORTED) {
+      alg = CUSPARSE_SPMM_ALG_DEFAULT;
+      bufferSize = 0;
+      st = cusparseSpMM_bufferSize(handle, op_A, op_B, &alpha, cuA, cuB, &beta, cuC,
+                                   cusparse_datatype<value_type>, alg, &bufferSize);
+    }
+    utils::check(st == CUSPARSE_STATUS_SUCCESS,
+                 "cusparseSpMM_bufferSize failed (op_A {}, op_B {}, m {}, n {}, B {}x{} ld {} {}, C {}x{} ld {}): {} ({})",
+                 oper_A, oper_B, m, n, b.extent(0), b.extent(1),
+                 std::decay_t<B>::is_stride_order_C() ? b.strides()[0] : b.strides()[1],
+                 std::decay_t<B>::is_stride_order_C() ? "row-major" : "col-major",
+                 c.extent(0), c.extent(1),
+                 std::decay_t<C>::is_stride_order_C() ? c.strides()[0] : c.strides()[1],
+                 int(st), std::string(cusparseGetErrorString(st)));
+  }
   memory::buffered_array<MEM,char,1> buffer(std::max<size_t>(bufferSize, size_t(1)),char{0});   // >= 1 byte, see csrmv
   
   // execute preprocess (optional)
   CUSPARSE_CHECK( cusparseSpMM_preprocess, handle, op_A, op_B, 
                   &alpha, cuA, cuB, &beta, cuC, cusparse_datatype<value_type>,
-                  CUSPARSE_SPMM_CSR_ALG2, (void*) buffer.data() )
+                  alg, (void*) buffer.data() )
   
   // execute SpMM
   CUSPARSE_CHECK( cusparseSpMM, handle, op_A, op_B, 
                   &alpha, cuA, cuB, &beta, cuC, cusparse_datatype<value_type>,
-                  CUSPARSE_SPMM_CSR_ALG2, (void*) buffer.data() )
+                  alg, (void*) buffer.data() )
   
   CUSPARSE_CHECK( cusparseDestroySpMat, cuA )
   CUSPARSE_CHECK( cusparseDestroyDnMat, cuB )
