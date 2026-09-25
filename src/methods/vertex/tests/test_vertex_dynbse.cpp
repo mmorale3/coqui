@@ -55,6 +55,16 @@ namespace bdft_tests {
 
   namespace wl = methods::solvers::ward_legs;
   namespace db = methods::solvers::dynbse;
+  /** gpu port 5b: on a CUDA build the L0 kernel runs on the device by default (vertex_debug
+   *  dynbse_l0_device), whose scatter accumulates with atomics -- two identical applications then agree to
+   *  a few ulp, not bitwise. The bitwise gates below keep their anchor on the host kernel. */
+  inline bool l0_on_device() {
+#if defined(ENABLE_CUDA)
+    return db::l0_device_enabled();
+#else
+    return false;
+#endif
+  }
 
   // ---------------- the toy unit ----------------------------------------------------------
   struct dyn_toy {
@@ -756,7 +766,9 @@ namespace bdft_tests {
           REQUIRE(df < (nu0 ? 1e-11 : 1e-7) * sf);           // inu != 0: the tables' fit class
           REQUIRE(ds < (nu0 ? 1e-11 : 1e-7) * std::max(ss, 1e-3));
           REQUIRE(dc < 1e-9 * std::max(ss, 1e-3));
-          REQUIRE(dfc == 0.0);
+          // the Cb_cst override does not touch F: bitwise on the host kernel; the device kernel's atomics
+          // reorder the scatter between two applications (rusty A100, 2026-09-24: |dF| 3.6e-14 at scale 13.7)
+          REQUIRE(dfc <= (l0_on_device() ? 1e-12 * sf : 0.0));
         };
         compare(b, P, false, "union set");
         // the shared set: G refit on the aux grid (as run_solver's fitted path)
@@ -838,7 +850,7 @@ namespace bdft_tests {
                 dG, dG1, dG0, sg.res.iterations, sg.res.converged, sg.res.contraction, hg);
         REQUIRE(dG < 1e-7);
         REQUIRE(dG1 < 1e-12);
-        REQUIRE(dG0 == 0.0);
+        REQUIRE(dG0 <= (l0_on_device() ? 1e-12 : 0.0));   // same static limit; see l0_on_device()
         REQUIRE(sg.res.converged);
       }
       // (D) the fitted, shared-grid pathway
