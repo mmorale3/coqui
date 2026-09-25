@@ -521,20 +521,24 @@ public:
   auto operator()() { return *this; }
   auto operator()() const { return *this; }
 
+  // The row pointers for the device backends (cuCSR copies them into its own offsets buffer). The device
+  // copies row_begin_dev_ / row_end_dev_ are maintained for DEVICE_MEMORY only (every constructor above), so
+  // UNIFIED_MEMORY returns the host arrays like csr_matrix_view does -- returning the never-filled device
+  // copies handed cuCSR a size-0 view (test_sparse/csr_blas<double, UNIFIED_MEMORY>: SIGSEGV in cudaMemcpy2D).
   auto row_begin_device() const {
-    if constexpr (MEM==HOST_MEMORY) {
-      return row_begin_();
-    } else {
+    if constexpr (MEM==DEVICE_MEMORY) {
       return row_begin_dev_();
-    } 
+    } else {
+      return row_begin_();
+    }
   }
   auto row_end_device() const {
-    if constexpr (MEM==HOST_MEMORY) {
-      return row_end_();
-    } else {
+    if constexpr (MEM==DEVICE_MEMORY) {
       return row_end_dev_();
+    } else {
+      return row_end_();
     }
-  } 
+  }
 };
 
 } // namespace sparse
