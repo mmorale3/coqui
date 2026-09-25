@@ -364,18 +364,54 @@ namespace methods::solvers::dynbse_cuda {
     long K = std::max(1L, std::min(nk, long(budget / per_k)));
     if (budget < per_k) K = 1;                           // one k must fit; the allocation will say if not
 
-    cd *dVt = alloc<cd>(size_t(K) * W, "Vt");
-    cd *dPj = alloc<cd>(size_t(K) * ng * W, "Pj"), *dQj = alloc<cd>(size_t(K) * ng * W, "Qj");
-    cd *dBj = alloc<cd>(size_t(K) * ng * W, "Bj");
-    cd *dgjT = alloc<cd>(size_t(K) * ng * nc2, "gjT"), *dglT = alloc<cd>(size_t(K) * ng * nc2, "glT");
-    cd *dGh = alloc<cd>(size_t(K) * ng * nc2, "Gh");
-    cd *dAU = alloc<cd>(size_t(K) * asz, "AU"), *dAT = alloc<cd>(size_t(K) * asz, "AT");
-    cd *dM2 = alloc<cd>(size_t(K) * asz, "M2"), *dA1 = alloc<cd>(size_t(K) * asz, "A1");
-    cd *dA3 = alloc<cd>(size_t(K) * asz, "A3");
-    const size_t nptr = size_t(K) * size_t(ng);
-    cd **pVt = alloc<cd *>(nptr, "ptrs"), **pGjT = alloc<cd *>(nptr, "ptrs"), **pGlT = alloc<cd *>(nptr, "ptrs");
-    cd **pGh = alloc<cd *>(nptr, "ptrs"), **pPj = alloc<cd *>(nptr, "ptrs"), **pQj = alloc<cd *>(nptr, "ptrs");
-    cd **pBj = alloc<cd *>(nptr, "ptrs");
+    // The per-batch working set, allocated with a RETRY: the budget above assumes an exclusive device, but
+    // several ranks may share one GPU (P-1 of the gpu port, 2026-09-25: two ranks sized their batches from
+    // the same cudaMemGetInfo at the same instant and the second cudaMalloc of Pj failed with
+    // cudaErrorMemoryAllocation). On a failed allocation everything of the attempt is freed and K is halved,
+    // down to K = 1, which must fit (abort otherwise).
+    cd *dVt = nullptr, *dPj = nullptr, *dQj = nullptr, *dBj = nullptr, *dgjT = nullptr, *dglT = nullptr, *dGh = nullptr;
+    cd *dAU = nullptr, *dAT = nullptr, *dM2 = nullptr, *dA1 = nullptr, *dA3 = nullptr;
+    cd **pVt = nullptr, **pGjT = nullptr, **pGlT = nullptr, **pGh = nullptr, **pPj = nullptr, **pQj = nullptr, **pBj = nullptr;
+    size_t nptr = 0;
+    {
+      auto try_alloc = [&](void **p, size_t bytes) -> bool {
+        const cudaError_t e = cudaMalloc(p, std::max<size_t>(bytes, 1));
+        if (e != cudaSuccess) { (void)cudaGetLastError(); *p = nullptr; return false; }
+        return true;
+      };
+      auto free_all = [&]() {
+        for (void **p : {(void **)&dVt, (void **)&dPj, (void **)&dQj, (void **)&dBj, (void **)&dgjT, (void **)&dglT,
+                         (void **)&dGh, (void **)&dAU, (void **)&dAT, (void **)&dM2, (void **)&dA1, (void **)&dA3,
+                         (void **)&pVt, (void **)&pGjT, (void **)&pGlT, (void **)&pGh, (void **)&pPj, (void **)&pQj,
+                         (void **)&pBj})
+          if (*p != nullptr) { (void)cudaFree(*p); *p = nullptr; }
+      };
+      const long K_first = K;
+      bool ok = false;
+      while (true) {
+        nptr = size_t(K) * size_t(ng);
+        const size_t bW = size_t(K) * W * sizeof(cd), bP = size_t(K) * ng * W * sizeof(cd);
+        const size_t bG = size_t(K) * ng * nc2 * sizeof(cd), bA = size_t(K) * asz * sizeof(cd), bp = nptr * sizeof(cd *);
+        ok = try_alloc((void **)&dVt, bW) and try_alloc((void **)&dPj, bP) and try_alloc((void **)&dQj, bP) and
+             try_alloc((void **)&dBj, bP) and try_alloc((void **)&dgjT, bG) and try_alloc((void **)&dglT, bG) and
+             try_alloc((void **)&dGh, bG) and try_alloc((void **)&dAU, bA) and try_alloc((void **)&dAT, bA) and
+             try_alloc((void **)&dM2, bA) and try_alloc((void **)&dA1, bA) and try_alloc((void **)&dA3, bA) and
+             try_alloc((void **)&pVt, bp) and try_alloc((void **)&pGjT, bp) and try_alloc((void **)&pGlT, bp) and
+             try_alloc((void **)&pGh, bp) and try_alloc((void **)&pPj, bp) and try_alloc((void **)&pQj, bp) and
+             try_alloc((void **)&pBj, bp);
+        if (ok) break;
+        free_all();
+        if (K == 1) break;
+        K = std::max(1L, K / 2);
+      }
+      if (not ok)
+        APP_ABORT(std::string(" l0_cuda: the per-k working set does not fit the device even at K = 1 (per_k = ") +
+                  std::to_string(per_k / 1e9) + " GB, fixed = " + std::to_string(fixed / 1e9) + " GB, free at entry = " +
+                  std::to_string(free_bytes / 1e9) + " GB); the device is shared or too small for this unit.");
+      if (K != K_first)
+        std::fprintf(stderr, "  [l0_cuda] k-batch reduced from %ld to %ld after a device allocation failure (shared GPU?)\n",
+                     K_first, K);
+    }
     fill_ptrs<<<unsigned((nptr + 255) / 256), 256>>>(K, ng, W, nc2, dVt, dgjT, dglT, dGh, dPj, dQj, dBj,
                                                      pVt, pGjT, pGlT, pGh, pPj, pQj, pBj);
     launch_check("fill_ptrs");
