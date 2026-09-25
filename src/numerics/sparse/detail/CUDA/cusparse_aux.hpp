@@ -87,13 +87,19 @@ uint32_t find_alignment(T *p) {
     return sizeof(T);
 }
 
+// The cuSPARSE operation for an op char. For a REAL value type the conjugate transpose is the transpose:
+// cuSPARSE rejects CUSPARSE_OPERATION_CONJUGATE_TRANSPOSE for CUDA_R_32F/64F operands ("conjugate
+// transpose (opA) is not valid for A data type (CUDA_R_64F)", CUSPARSE_STATUS_INVALID_VALUE at the
+// SpMM bufferSize query -- test_sparse/csr_blas<double> on rusty, CUDA 12.5).
+template<typename value_type = std::complex<double>>
 inline auto get_operation(char op) {
+  constexpr bool is_real = std::is_floating_point_v<std::decay_t<value_type>>;
   if (op == 'n' or op == 'N')
     return CUSPARSE_OPERATION_NON_TRANSPOSE;
   else if (op == 't' or op == 'T')
     return CUSPARSE_OPERATION_TRANSPOSE;
-  else if (op == 'c' or op == 'C' or op == 'h' or op == 'H') 
-    return CUSPARSE_OPERATION_CONJUGATE_TRANSPOSE;
+  else if (op == 'c' or op == 'C' or op == 'h' or op == 'H')
+    return is_real ? CUSPARSE_OPERATION_TRANSPOSE : CUSPARSE_OPERATION_CONJUGATE_TRANSPOSE;
   utils::check(false, "Invalid operation op:{}",op);
   return CUSPARSE_OPERATION_NON_TRANSPOSE;
 }

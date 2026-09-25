@@ -65,7 +65,7 @@ void csrmv(char oper_A,typename A::value_type alpha, A const& a, X const &x, typ
   auto cuY = cuDn(y);  
 
   memory::buffered_array<MEM,int_type,1> ofs(m+1,int_type(0));
-  auto op_A = get_operation(oper_A); 
+  auto op_A = get_operation<value_type>(oper_A);
   auto cuA = cuCSR(a,ofs);
    
   // allocate an external buffer if needed
@@ -134,8 +134,8 @@ void csrmm(char oper_A, char oper_B, typename A::value_type alpha, A const& a, B
   
   auto handle = get_cusparse_handle_ptr();
   // not enabled yet. Take as argument if needed and implement custom backend in cpu.
-  auto op_A = get_operation(oper_A); 
-  auto op_B = get_operation(oper_B); 
+  auto op_A = get_operation<value_type>(oper_A);
+  auto op_B = get_operation<value_type>(oper_B);
   auto cuB = cuDn(b);
   auto cuC = cuDn(c);
 
@@ -148,10 +148,11 @@ void csrmm(char oper_A, char oper_B, typename A::value_type alpha, A const& a, B
   memory::buffered_array<MEM,int_type,1> ofs(m+1,int_type(0));
   auto cuA = cuCSR(a,ofs,batchCountB);
 
-  // allocate an external buffer if needed. CSR_ALG2 (deterministic) is preferred, but cuSPARSE rejects
-  // it for some (op, layout, index-type) combinations with CUSPARSE_STATUS_INVALID_VALUE /
-  // NOT_SUPPORTED at the bufferSize query (test_sparse on rusty, CUDA 12.5: the row-major B / C of
-  // csrmm<'N'>); fall back to ALG_DEFAULT, which cuSPARSE resolves per layout, for that call.
+  // allocate an external buffer if needed. CSR_ALG2 (deterministic) is preferred; should cuSPARSE reject it
+  // for an (op, layout) combination with CUSPARSE_STATUS_INVALID_VALUE / NOT_SUPPORTED at the bufferSize
+  // query, fall back to ALG_DEFAULT for that call. (The INVALID_VALUE test_sparse hit on rusty, CUDA 12.5,
+  // was the conjugate transpose of a REAL matrix -- fixed in get_operation<value_type>, not by the
+  // algorithm; the fallback stays as a safety net and its diagnostics name the call.)
   size_t bufferSize = 0;
   cusparseSpMMAlg_t alg = CUSPARSE_SPMM_CSR_ALG2;
   {
