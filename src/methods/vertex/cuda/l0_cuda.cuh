@@ -64,6 +64,7 @@ namespace methods::solvers::dynbse_cuda {
     long const *gnode = nullptr;    // (ng)
     double const *fhalf = nullptr;  // (np)
     double const *fd1 = nullptr;    // (np)   f'(eps_a)
+    double const *fd2 = nullptr;    // (np)   f''(eps_a) -- the nu = 0 kernel's triple poles (unused by the shift kernel)
     cplx const *Dsq = nullptr;      // (np, np)
     cplx const *Dcb = nullptr;      // (np, np)
     cplx const *Dqt = nullptr;      // (np, np)
@@ -90,6 +91,18 @@ namespace methods::solvers::dynbse_cuda {
    */
   long l0_apply_shift_cols(l0_dims const &d, l0_tables const &t, cplx *Ffam, cplx *Fsum,
                            double free_bytes);
+
+  /**
+   * The inu = 0 twin: dynbse::l0_apply_cols on the device (gpu port R3, notes/gpu_port_plan.md section 4c). The two
+   * input families are folded into one on the device (V_a = X.fam(0, a) + X.fam(1, a), the host kernel's order), the
+   * passes are the shift kernel's (P_j = g_j^T V, Q_j = P_j Ghat_j, B_j = P_j gkq_j^T; P_l = Gtil_l V, R_l = P_l gkq_l^T)
+   * with the nu = 0 partial fractions in the scatter (single poles into F1, the confluent U_j^2 U_a into M2 / M3, the
+   * constant part into F1c / M2c) and the nu = 0 assembly (fhalf, f', f''/2, Dsq, Dcb). `act` lists the ACTIVE
+   * folded components: c = 0 the constant, c = 1 + a the node a (nca <= 1 + np). Reads Ghat / Gtil formed at inu = 0
+   * (l == j excluded), eps, epsG, gnode, fhalf, fd1, fd2, Dsq, Dcb; the shift tables, Dqt, inu and tfold are not read.
+   * Same contract, timing split and return as l0_apply_shift_cols.
+   */
+  long l0_apply_cols(l0_dims const &d, l0_tables const &t, cplx *Ffam, cplx *Fsum, double free_bytes);
 
 } // namespace methods::solvers::dynbse_cuda
 

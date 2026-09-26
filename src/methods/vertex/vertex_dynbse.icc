@@ -212,7 +212,7 @@ namespace solvers {
       // device path and its phases; the number of L0 applications and of constant-input ones (the P-3a fast path)
       double t_l0_nu0 = 0.0, t_l0_host = 0.0, t_l0_dev = 0.0;
       double t_l0_prep = 0.0, t_l0_alloc = 0.0, t_l0_h2d = 0.0, t_l0_kernel = 0.0, t_l0_d2h = 0.0;
-      long n_l0 = 0, n_l0_cst = 0, n_l0_nu0 = 0;
+      long n_l0 = 0, n_l0_cst = 0, n_l0_nu0 = 0, n_l0_nu0_dev = 0;   // n_l0_nu0_dev: nu = 0 applications on the device (R3)
       double t_vec = 0.0, t_ws = 0.0;       // O-1: the elementwise passes of the Gamma_1 path, the scratch allocation
       double rss_max_gb = 0.0;
       bool ksum_ft = false;         // the rung's k-sum ran through the mesh Fourier transform
@@ -236,7 +236,7 @@ namespace solvers {
         mx(t_setup); mx(t_kbig); mx(t_cb); mx(t_lu); mx(t_solve); mx(t_read); mx(rss_max_gb);
         mx(t_rung); mx(t_refit); sm(n_apps); mx(t_l0); mx(t_ts); mx(t_orth);
         mx(t_l0_nu0); mx(t_l0_host); mx(t_l0_dev); mx(t_l0_prep); mx(t_l0_alloc); mx(t_l0_h2d); mx(t_l0_kernel); mx(t_l0_d2h);
-        sm(n_l0); sm(n_l0_cst); sm(n_l0_nu0);
+        sm(n_l0); sm(n_l0_cst); sm(n_l0_nu0); sm(n_l0_nu0_dev);
         mx(t_vec); mx(t_ws);
       }
       /** the L0 split as one log line (the slowest rank's times, the summed counts); O-1 adds the host-traffic
@@ -245,12 +245,12 @@ namespace solvers {
         char buf[640];
         const double rest = t_solve - t_rung - t_refit - t_l0 - t_ts - t_orth - t_vec - t_ws;
         std::snprintf(buf, sizeof(buf),
-                      "L0 split on the slowest rank: nu=0 kernel %.1f s, host kernel %.1f s, device path %.1f s "
+                      "L0 split on the slowest rank: nu=0 host kernel %.1f s, host kernel %.1f s, device path %.1f s "
                       "(prep %.1f, alloc %.1f, H2D %.1f, kernel %.1f, D2H %.1f); %ld L0 applications (%ld constant-input, "
-                      "%ld at nu=0); rung %.1f s, refit %.1f s, T_s %.1f s, Arnoldi %.1f s, vector ops %.1f s, scratch "
-                      "alloc %.1f s, rest of the solve %.1f s (deposits, readout, K_d's own copies)",
+                      "%ld at nu=0 of which %ld on the device); rung %.1f s, refit %.1f s, T_s %.1f s, Arnoldi %.1f s, "
+                      "vector ops %.1f s, scratch alloc %.1f s, rest of the solve %.1f s (deposits, readout, K_d's own copies)",
                       t_l0_nu0, t_l0_host, t_l0_dev, t_l0_prep, t_l0_alloc, t_l0_h2d, t_l0_kernel, t_l0_d2h, n_l0, n_l0_cst,
-                      n_l0_nu0, t_rung, t_refit, t_ts, t_orth, t_vec, t_ws, rest);
+                      n_l0_nu0, n_l0_nu0_dev, t_rung, t_refit, t_ts, t_orth, t_vec, t_ws, rest);
         return std::string(buf);
       }
     };
@@ -1452,6 +1452,7 @@ namespace solvers {
               met->t_l0_prep += stt.t_l0_prep; met->t_l0_alloc += stt.t_l0_alloc; met->t_l0_h2d += stt.t_l0_h2d;
               met->t_l0_kernel += stt.t_l0_kernel; met->t_l0_d2h += stt.t_l0_d2h;
               met->n_l0 += stt.n_l0; met->n_l0_cst += stt.n_l0_cst; met->n_l0_nu0 += stt.n_l0_nu0;
+              met->n_l0_nu0_dev += stt.n_l0_nu0_dev;
               met->t_vec += stt.t_vec; met->t_ws += stt.t_ws;
             }
             it_unit = std::max(it_unit, res.iterations);

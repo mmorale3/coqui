@@ -714,8 +714,9 @@ namespace bdft_tests {
           db::l0_apply_ref(bb, PP, inu, sh, Xs, Fa, Sa);
           db::l0_apply(bb, PP, inu, sh, Xr, Fb, Sb, nullptr, stGp);
           // gpu port 5b: the device kernel against the HOST kernel on the same input -- far tighter than
-          // grouped-vs-ref (whose 1e-9 class is the shift tables' fit): the two differ by the atomics' roundoff
-          if (l0_on_device() and not nu0) {
+          // grouped-vs-ref (whose 1e-9 class is the shift tables' fit): the two differ by the atomics' roundoff.
+          // R3 (2026-09-26): at inu = 0 this is the device nu = 0 kernel (l0_apply_cols_device) vs the host one.
+          if (l0_on_device()) {
             db::tf_vector Fh(npp, nk, nc, 3);
             nda::array<cplx, 4> Sh(nk, nc, nc, 3);
             db::l0_apply(bb, PP, inu, sh, Xr, Fh, Sh, nullptr, stGp, /*force_host=*/true);
@@ -777,7 +778,7 @@ namespace bdft_tests {
                        "|dFsum| {:.3e} (scale {:.3e})", inu.imag(), tag, dk, sk, dks, sks);
             REQUIRE(dk < (nu0 ? 1e-11 : 1e-7) * std::max(sk, 1e-3));
             REQUIRE(dks < (nu0 ? 1e-11 : 1e-7) * std::max(sks, 1e-3));
-            if (l0_on_device() and not nu0) {
+            if (l0_on_device()) {
               db::tf_vector Fkh(npp, nk, nc, 3);
               nda::array<cplx, 4> Skh(nk, nc, nc, 3);
               db::l0_apply(bb, PP, inu, sh, Xk, Fkh, Skh, nullptr, stGp, /*force_host=*/true);

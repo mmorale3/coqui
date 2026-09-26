@@ -126,7 +126,7 @@ namespace dynbse {
     double t_l0 = 0.0, t_ts = 0.0, t_orth = 0.0;
     double t_l0_nu0 = 0.0, t_l0_host = 0.0, t_l0_dev = 0.0;
     double t_l0_prep = 0.0, t_l0_alloc = 0.0, t_l0_h2d = 0.0, t_l0_kernel = 0.0, t_l0_d2h = 0.0;
-    long n_l0 = 0, n_l0_cst = 0, n_l0_nu0 = 0;
+    long n_l0 = 0, n_l0_cst = 0, n_l0_nu0 = 0, n_l0_nu0_dev = 0;   // n_l0_nu0_dev: nu = 0 applications on the device (R3)
     // O-1 (gpu port, 2026-09-26): the host-traffic split of the Gamma_1 path outside the kernels -- the elementwise
     // passes over tf_vectors (copies, zeroing, axpy; t_vec) and the (re)allocation + first touch of the solver's
     // scratch (t_ws). Both were untimed and dominated the "rest" of the Sigma-side solve (46 % at Si kp444 / C = 8).
@@ -134,7 +134,7 @@ namespace dynbse {
     void reset() {
       t_l0 = t_ts = t_orth = 0.0;
       t_l0_nu0 = t_l0_host = t_l0_dev = t_l0_prep = t_l0_alloc = t_l0_h2d = t_l0_kernel = t_l0_d2h = 0.0;
-      n_l0 = n_l0_cst = n_l0_nu0 = 0;
+      n_l0 = n_l0_cst = n_l0_nu0 = n_l0_nu0_dev = 0;
       t_vec = t_ws = 0.0;
     }
   };
@@ -980,6 +980,60 @@ namespace dynbse {
     t.timing = tdev;
     stt.t_l0_prep += wall_now() - tw_prep;
     dynbse_cuda::l0_apply_shift_cols(d, t, F.fam.data(), Fsum.data(), free_bytes);
+    stt.t_l0_alloc += tdev[0]; stt.t_l0_h2d += tdev[1]; stt.t_l0_kernel += tdev[2]; stt.t_l0_d2h += tdev[3];
+    const double tw_cst = wall_now();
+    if (Cb_cst != nullptr and anyc)
+      for (long ik = 0; ik < nk; ++ik)
+        for (long r = 0; r < nR; ++r)
+          for (long p = 0; p < nc2; ++p) {
+            cplx sacc(0.0);
+            for (long pp = 0; pp < nc2; ++pp) sacc += (*Cb_cst)(ik, p, pp) * X.cst(ik, pp / nc, pp % nc, r);
+            Fsum(ik, p / nc, p % nc, r) += sacc;
+          }
+    stt.t_l0_prep += wall_now() - tw_cst;          // the host-side Cb_cst term counts as prep
+  }
+
+  /** l0_apply_cols on the device (gpu port R3, 2026-09-26): the inu = 0 twin of l0_apply_shift_cols_device. Ghat /
+   *  Gtil are formed at inu = 0 exactly as the host kernel forms them (l == j excluded: the confluent U_j^2 is the
+   *  kernel's own pass), the family fold X.fam(0) + X.fam(1) happens in the device pack, f' / f'' feed the double and
+   *  triple poles; the Cb_cst term (a small per-k contraction) stays on the host as in the host kernel. `act` lists
+   *  the active folded components (0 = the constant, 1 + a = node a). F and Fsum come back filled. */
+  inline void l0_apply_cols_device(freq_basis const &b, pair_poles const &P, tf_vector const &X, tf_vector &F,
+                                   nda::array<cplx, 4> &Fsum, nda::array<cplx, 3> const *Cb_cst,
+                                   std::vector<long> const &act) {
+    auto &stt = solve_timers_state();
+    const double tw_prep = wall_now();
+    const long np = b.np, nk = P.nk, nc = P.nc, ng = P.ng, nR = X.nR, nc2 = nc * nc;
+    nda::array<cplx, 4> Ghat(nk, ng, nc, nc), Gtil(nk, ng, nc, nc);
+    Ghat() = cplx(0.0);
+    Gtil() = cplx(0.0);
+    for (long ik = 0; ik < nk; ++ik)
+      for (long j = 0; j < ng; ++j)
+        for (long l = 0; l < ng; ++l) {
+          if (j == l) continue;
+          const cplx w = cplx(1.0) / cplx(P.epsG(j) - P.epsG(l));
+          for (long x = 0; x < nc; ++x)
+            for (long y = 0; y < nc; ++y) {
+              Ghat(ik, j, x, y) += w * P.gkq(l, ik, y, x);
+              Gtil(ik, l, x, y) += w * P.gk(j, ik, y, x);
+            }
+        }
+    nda::array<double, 1> fd1(np), fd2(np);
+    for (long n = 0; n < np; ++n) { fd1(n) = b.fd[size_t(n)].f1; fd2(n) = b.fd[size_t(n)].f2; }
+    const bool anyc = (not act.empty() and act[0] == 0);
+    dynbse_cuda::l0_dims d{np, b.np_fit, nk, nc, ng, nR, long(act.size())};
+    dynbse_cuda::l0_tables t;
+    t.Xfam = X.fam.data(); t.Xcst = X.cst.data(); t.act = act.data();
+    t.gk = P.gk.data(); t.gkq = P.gkq.data(); t.Ghat = Ghat.data(); t.Gtil = Gtil.data();
+    t.eps = b.eps.data(); t.epsG = P.epsG.data(); t.gnode = P.gnode.data();
+    t.fhalf = b.fhalf.data(); t.fd1 = fd1.data(); t.fd2 = fd2.data();
+    t.Dsq = b.Dsq.data(); t.Dcb = b.Dcb.data();
+    t.inu = cplx(0.0); t.tfold = 0.0; t.sum_part1 = (Cb_cst == nullptr); t.skip_cst = not anyc;
+    const double free_bytes = 1.0e6 * double(utils::freemem_device_effective());
+    double tdev[4] = {0.0, 0.0, 0.0, 0.0};        // alloc, H2D, kernel, D2H (filled by the driver)
+    t.timing = tdev;
+    stt.t_l0_prep += wall_now() - tw_prep;
+    dynbse_cuda::l0_apply_cols(d, t, F.fam.data(), Fsum.data(), free_bytes);
     stt.t_l0_alloc += tdev[0]; stt.t_l0_h2d += tdev[1]; stt.t_l0_kernel += tdev[2]; stt.t_l0_d2h += tdev[3];
     const double tw_cst = wall_now();
     if (Cb_cst != nullptr and anyc)
@@ -1953,6 +2007,37 @@ namespace dynbse {
         stt0.n_l0 += 1;
         stt0.n_l0_nu0 += 1;
         if (x_fam_zero) stt0.n_l0_cst += 1;        // the nu = 0 kernel skips the family block for a constant input
+#if defined(ENABLE_CUDA)
+        if (l0_device_enabled() and not force_host) {   // R3: the nu = 0 kernel on the device (force_host: the A/B gate)
+          // the ACTIVE folded components (the P-3a list of l0_apply_shift_cols, folded: 0 = the constant, 1 + a = node
+          // a of X.fam(0) + X.fam(1)); vertex_debug dynbse_l0_active = 0 packs every component; x_fam_zero skips
+          // the family scan
+          std::vector<long> act;
+          act.reserve(size_t(1 + np_));
+          const bool all_active = (vertex_debug::number("dynbse_l0_active", 1.0) == 0.0);   // vertex_debug: dynbse_l0_active
+          bool anyc_g = all_active;
+          if (not anyc_g) for (auto const &v : X.cst) if (v != cplx(0.0)) { anyc_g = true; break; }
+          if (anyc_g) act.push_back(0);
+          for (long a = 0; a < np_; ++a) {
+            bool anya = all_active;
+            if (not anya and not x_fam_zero)
+              for (long f = 0; f < 2 and not anya; ++f) {
+                auto va = X.fam(f, a, all, all, all, all);
+                for (auto const &v : va) if (v != cplx(0.0)) { anya = true; break; }
+              }
+            if (anya) act.push_back(1 + a);
+          }
+          if (act.empty()) {                       // nothing to apply: the outputs are zero (the host kernel's contract)
+            F.zero();
+            Fsum() = cplx(0.0);
+          } else {
+            l0_apply_cols_device(b, P, X, F, Fsum, Cb_cst, act);   // overwrites F and Fsum
+          }
+          stt0.n_l0_nu0_dev += 1;
+          stt0.t_l0_dev += wall_now() - tw0;
+          return;
+        }
+#endif
         l0_apply_cols(b, P, X, F, Fsum, Cb_cst, x_fam_zero);
         stt0.t_l0_nu0 += wall_now() - tw0;
       }

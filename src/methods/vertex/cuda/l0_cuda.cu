@@ -69,7 +69,8 @@ namespace methods::solvers::dynbse_cuda {
     struct kdims { long nc, nR, np, ng, nca, blk, nk, np_fit; long const *act; };
 
     // ---- pack the ACTIVE components of X of K k-points into Vt(k; x, il, r, y) ----------------------
-    __global__ void pack_kernel(kdims d, long ik0, long K, cd const *__restrict__ Xfam,
+    // fold (the nu = 0 kernel): component c = 1 + a is the FOLDED family X.fam(0, a) + X.fam(1, a).
+    __global__ void pack_kernel(kdims d, long ik0, long K, bool fold, cd const *__restrict__ Xfam,
                                 cd const *__restrict__ Xcst, cd *__restrict__ Vt) {
       const long kb = blockIdx.y, ik = ik0 + kb;
       const long nc = d.nc, nR = d.nR, np = d.np, nk = d.nk, nca = d.nca;
@@ -82,7 +83,11 @@ namespace methods::solvers::dynbse_cuda {
           const long c = d.act[il];
           cd v;
           if (c == 0) v = Xcst[((ik * nc + x) * nc + y) * nR + r];
-          else {
+          else if (fold) {                              // nu = 0: V_a = fam(0, a) + fam(1, a), the host kernel's order
+            const long a = c - 1;
+            const long i0 = ((a * nk + ik) * nc + x) * nc * nR + y * nR + r;
+            v = Xfam[i0] + Xfam[i0 + np * nk * nc * nc * nR];
+          } else {
             const long f = (c - 1) / np, a = (c - 1) % np;
             v = Xfam[(((f * np + a) * nk + ik) * nc + x) * nc * nR + y * nR + r];
           }
@@ -283,6 +288,144 @@ namespace methods::solvers::dynbse_cuda {
       }
     }
 
+    // ---- the nu = 0 scatter: dynbse.hpp's l0_apply_cols on the (x, r, y) block c of every pole's output ----
+    // grid (nca, K), one thread per element, the ng poles looped inside. which_pass 0: the j loop -- Q_j(a) (the
+    // single poles: F1(nj) += Q/(ej - ea), F1(a) -= ..., or M2(nj) += Q at a == nj) and B_j(a) (the confluent
+    // U_j^2 U_a: M2(nj) += B/(ej - ea), F1(nj) -= B/(ea - ej)^2, F1(a) += ..., or M3(nj) += B at a == nj);
+    // 1: the l loop on R_l(a) (F1(nl) -= R/(el - ea), F1(a) += ..., or M2(nl) -= R at a == nl), Ball unused.
+    // The constant component (c == 0) lands in the part-1 slots of F1 / M2 (= the host kernel's F1c / M2c):
+    // F1c(nj) += Qc_j, M2c(nj) += Bc_j, F1c(nl) -= Rc_l. The a-indexed target F1(a) is reduced in registers over
+    // the poles and added once (one atomic), the nj-indexed targets are atomics as in the shift kernel.
+    __global__ void scatter_nu0_kernel(kdims d, long K, int which_pass, bool skip_cst,
+                                       cd const *__restrict__ Qall, cd const *__restrict__ Ball,
+                                       double const *__restrict__ eps, double const *__restrict__ epsG,
+                                       long const *__restrict__ gnode,
+                                       cd *__restrict__ F1, cd *__restrict__ M2, cd *__restrict__ M3) {
+      const long il = blockIdx.x, kb = blockIdx.y;   // il: the packed position; c: the global folded component
+      if (kb >= K) return;
+      const long c = d.act[il];
+      if (c == 0 && skip_cst) return;
+      const long np = d.np, ng = d.ng, blk = d.blk, nca = d.nca;
+      const long W = d.nc * nca * d.nR * d.nc, asz = 2 * np * blk;
+      const int part = (c == 0) ? 1 : 0;
+      const long abase = kb * asz + (long(part) * np) * blk;
+      const long a = (c == 0) ? -1 : c - 1;
+      const double ea = (a >= 0) ? eps[a] : 0.0;
+      cd const *Qk = Qall + kb * ng * W;
+      cd const *Bk = Ball + kb * ng * W;
+      for (long e = threadIdx.x; e < blk; e += blockDim.x) {
+        const long x = e / (d.nR * d.nc), rem = e % (d.nR * d.nc);
+        const long src = (x * nca + il) * d.nR * d.nc + rem;
+        cd acc1 = make_cuDoubleComplex(0.0, 0.0);                     // F1(a) over the poles
+        for (long pole = 0; pole < ng; ++pole) {
+          const long nj = gnode[pole];
+          const double ej = epsG[pole];
+          const cd q = Qk[pole * W + src];
+          cd *F1nj = &F1[abase + nj * blk + e], *M2nj = &M2[abase + nj * blk + e];
+          if (which_pass == 0) {
+            // ---- the j side: Q_j(a) = g_j^T V_a Ghat_j ----
+            if (c == 0) {                                             // Qc_j -> F1c(nj)
+              atomic_add(F1nj, q);
+            } else if (a == nj) {
+              atomic_add(M2nj, q);
+            } else {
+              const double w = 1.0 / (ej - ea);
+              atomic_add(F1nj, scal(w, q));
+              acc1 = acc1 - scal(w, q);
+            }
+            // ---- the confluent U_j^2 x U_a: B_j(a) = g_j^T V_a gkq_j^T ----
+            const cd bq = Bk[pole * W + src];
+            if (c == 0) {                                             // Bc_j -> M2c(nj)
+              atomic_add(M2nj, bq);
+            } else if (a == nj) {
+              atomic_add(&M3[abase + nj * blk + e], bq);
+            } else {
+              const double dd = ea - ej;
+              const double c2 = 1.0 / (ej - ea), c1 = 1.0 / (dd * dd);
+              atomic_add(M2nj, scal(c2, bq));
+              atomic_add(F1nj, neg(scal(c1, bq)));
+              acc1 = acc1 + scal(c1, bq);
+            }
+          } else {
+            // ---- the l side: R_l(a) = Gtil_l V_a gkq_l^T ----
+            if (c == 0) {                                             // Rc_l -> -F1c(nl)
+              atomic_add(F1nj, neg(q));
+            } else if (a == nj) {
+              atomic_add(M2nj, neg(q));
+            } else {
+              const double w = 1.0 / (ej - ea);
+              atomic_add(F1nj, neg(scal(w, q)));
+              acc1 = acc1 + scal(w, q);
+            }
+          }
+        }
+        if (a >= 0 && nonzero(acc1)) atomic_add(&F1[abase + a * blk + e], acc1);
+      }
+    }
+
+    // ---- the nu = 0 assembly of dynbse.hpp's l0_apply_cols: F1 / F1c / M2 / M2c / M3 -> F, Fsum ---------
+    // grid (np, K): one block per (node n, k); one thread per (x, r, y). Part 0 of F1 / M2 is the family's
+    // (F1, M2), part 1 the constant's (F1c, M2c); M3 has part 0 only.
+    __global__ void assemble_nu0_kernel(kdims d, long ik0, long K, bool sum_part1,
+                                        double const *__restrict__ fhalf, double const *__restrict__ fd1,
+                                        double const *__restrict__ fd2,
+                                        cd const *__restrict__ Dsq, cd const *__restrict__ Dcb,
+                                        cd const *__restrict__ F1, cd const *__restrict__ M2, cd const *__restrict__ M3,
+                                        cd *__restrict__ Ffam, cd *__restrict__ Fsum, int *__restrict__ err) {
+      const long np = d.np, blk = d.blk, nc = d.nc, nR = d.nR, nk = d.nk, asz = 2 * np * blk;
+      const long n = blockIdx.x, kb = blockIdx.y;
+      if (kb >= K) return;
+      const long ik = ik0 + kb;
+      for (long e = threadIdx.x; e < blk; e += blockDim.x) {
+        const long x = e / (nR * nc), r = (e / nc) % nR, y = e % nc;
+        const long i0 = kb * asz + n * blk + e, i1 = kb * asz + (np + n) * blk + e;
+        const cd u = F1[i0], uc = F1[i1], m = M2[i0], mc = M2[i1], m3 = M3[i0];
+        const long f0n = (((0 * np + n) * nk + ik) * nc + x) * nc * nR + y * nR + r;
+        const long f1n = (((1 * np + n) * nk + ik) * nc + x) * nc * nR + y * nR + r;
+        const long fs = ((ik * nc + x) * nc + y) * nR + r;
+        // the single poles: F.fam(0, n) += F1 + F1c; Fsum += fhalf F1 (+ fhalf F1c unless Cb_cst supplies it)
+        atomic_add(&Ffam[f0n], u + uc);
+        atomic_add(&Fsum[fs], scal(fhalf[n], u));
+        if (sum_part1) atomic_add(&Fsum[fs], scal(fhalf[n], uc));
+        // the double poles U_n^2 (the family's and the constant's): f' into the sum, Dsq into family 0 on the DLR
+        // set, the S family (family 1) at a node outside it
+        if (nonzero(m)) {
+          atomic_add(&Fsum[fs], scal(fd1[n], m));
+          if (n < d.np_fit) {
+            for (long c = 0; c < np; ++c) {
+              const cd dc = Dsq[n * np + c];
+              if (!nonzero(dc)) continue;
+              atomic_add(&Ffam[(((0 * np + c) * nk + ik) * nc + x) * nc * nR + y * nR + r], dc * m);
+            }
+          } else {
+            atomic_add(&Ffam[f1n], m);
+          }
+        }
+        if (nonzero(mc)) {
+          if (sum_part1) atomic_add(&Fsum[fs], scal(fd1[n], mc));
+          if (n < d.np_fit) {
+            for (long c = 0; c < np; ++c) {
+              const cd dc = Dsq[n * np + c];
+              if (!nonzero(dc)) continue;
+              atomic_add(&Ffam[(((0 * np + c) * nk + ik) * nc + x) * nc * nR + y * nR + r], dc * mc);
+            }
+          } else {
+            atomic_add(&Ffam[f1n], mc);
+          }
+        }
+        // the triple poles U_n^3: f''/2 into the sum, Dcb into family 0 (a node outside the DLR set is an error)
+        if (nonzero(m3)) {
+          if (n >= d.np_fit) { atomicOr(err, 1); continue; }
+          atomic_add(&Fsum[fs], scal(0.5 * fd2[n], m3));
+          for (long c = 0; c < np; ++c) {
+            const cd dc = Dcb[n * np + c];
+            if (!nonzero(dc)) continue;
+            atomic_add(&Ffam[(((0 * np + c) * nk + ik) * nc + x) * nc * nR + y * nR + r], dc * m3);
+          }
+        }
+      }
+    }
+
     // ---- the small-nu fold (D2f): T_a with |eps_a| >= ratio |nu| folded into the U family ------------
     // grid (np, K): after the assembly of this batch (a separate launch, so every contribution to
     // F.fam(1, a) is in). Reads family 1, writes family 0 (atomics) and zeroes its own family-1 slot.
@@ -328,17 +471,21 @@ namespace methods::solvers::dynbse_cuda {
       return p;
     }
 
-  } // namespace
-
-  long l0_apply_shift_cols(l0_dims const &d, l0_tables const &t, cplx *Ffam_h, cplx *Fsum_h,
-                           double free_bytes) {
+    // ---- the driver shared by the two kernels: nu0 = false the shift kernel (inu != 0), true the nu = 0 kernel ----
+    // The uploads, the k-batch sizing with its allocation retry, the pack / pole / gemm passes and the timing split
+    // are common; the scatter, the assembly and the fold differ. In nu0 mode the shift tables, Dqt and the fold are
+    // not read (uploaded as empty), fd2 is; the components are the folded ones (nca <= 1 + np).
+    long run_l0(l0_dims const &d, l0_tables const &t, cplx *Ffam_h, cplx *Fsum_h, double free_bytes, bool nu0) {
     const long np = d.np, nk = d.nk, nc = d.nc, ng = d.ng, nR = d.nR, nca = d.nca;
     const long blk = nc * nR * nc, W = nc * nca * nR * nc, nc2 = nc * nc;
     const size_t asz = size_t(2 * np) * size_t(blk);
     const size_t nF = size_t(2 * np) * nk * nc * nc * nR, nFs = size_t(nk) * nc * nc * nR;
+    const long nca_max = nu0 ? 1 + np : 1 + 2 * np;
     if (nk == 0 || np == 0 || nca == 0) return 0;
-    if (nca < 1 || nca > 1 + 2 * np || t.act == nullptr)
+    if (nca < 1 || nca > nca_max || t.act == nullptr)
       APP_ABORT(std::string(" l0_cuda: the active-component list is missing or out of range (nca = ") + std::to_string(nca) + ").");
+    if (nu0 && t.fd2 == nullptr) APP_ABORT(std::string(" l0_cuda: the nu = 0 kernel needs the fd2 table."));
+    const size_t nsh1 = nu0 ? 0 : size_t(np), nsh2 = nu0 ? 0 : size_t(np) * np;   // the shift tables' upload sizes
 
     // wall clock for the optional timing split (t.timing: alloc, H2D, kernel, D2H)
     auto dnow = []() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
@@ -356,14 +503,15 @@ namespace methods::solvers::dynbse_cuda {
     double *deps = upload(t.eps, size_t(np), "eps"), *depsG = upload(t.epsG, size_t(ng), "epsG");
     long *dgn = upload(t.gnode, size_t(ng), "gnode");
     double *dfh = upload(t.fhalf, size_t(np), "fhalf"), *dfd1 = upload(t.fd1, size_t(np), "fd1");
+    double *dfd2 = upload(t.fd2, nu0 ? size_t(np) : 0, "fd2");
     cd *dDsq = upload_c(t.Dsq, size_t(np) * np, "Dsq");
     cd *dDcb = upload_c(t.Dcb, size_t(np) * np, "Dcb");
-    cd *dDqt = upload_c(t.Dqt, size_t(np) * np, "Dqt");
-    cd *ds1 = upload_c(t.s1, size_t(np), "s1"), *ds3 = upload_c(t.s3, size_t(np), "s3");
-    cd *dr1u = upload_c(t.r1u, size_t(np), "r1u"), *dr3u = upload_c(t.r3u, size_t(np), "r3u");
-    cd *dr3t = upload_c(t.r3t, size_t(np), "r3t");
-    cd *dR1U = upload_c(t.R1U, size_t(np) * np, "R1U"), *dR1T = upload_c(t.R1T, size_t(np) * np, "R1T");
-    cd *dR3U = upload_c(t.R3U, size_t(np) * np, "R3U"), *dR3T = upload_c(t.R3T, size_t(np) * np, "R3T");
+    cd *dDqt = upload_c(t.Dqt, nsh2, "Dqt");
+    cd *ds1 = upload_c(t.s1, nsh1, "s1"), *ds3 = upload_c(t.s3, nsh1, "s3");
+    cd *dr1u = upload_c(t.r1u, nsh1, "r1u"), *dr3u = upload_c(t.r3u, nsh1, "r3u");
+    cd *dr3t = upload_c(t.r3t, nsh1, "r3t");
+    cd *dR1U = upload_c(t.R1U, nsh2, "R1U"), *dR1T = upload_c(t.R1T, nsh2, "R1T");
+    cd *dR3U = upload_c(t.R3U, nsh2, "R3U"), *dR3T = upload_c(t.R3T, nsh2, "R3T");
     cd *dF = alloc<cd>(nF, "F"), *dFs = alloc<cd>(nFs, "Fsum");
     cu_check(cudaMemset(dF, 0, nF * sizeof(cd)), "memset F");
     cu_check(cudaMemset(dFs, 0, nFs * sizeof(cd)), "memset Fsum");
@@ -443,7 +591,7 @@ namespace methods::solvers::dynbse_cuda {
       const long Kb = std::min(K, nk - ik0);
       const int nb = int(Kb * ng);
       for (cd *p : {dAU, dAT, dM2, dA1, dA3}) cu_check(cudaMemset(p, 0, size_t(Kb) * asz * sizeof(cd)), "memset acc");
-      pack_kernel<<<dim3(64u, unsigned(Kb), 1u), 256>>>(kd, ik0, Kb, dX, dXc, dVt);
+      pack_kernel<<<dim3(64u, unsigned(Kb), 1u), 256>>>(kd, ik0, Kb, nu0, dX, dXc, dVt);
       launch_check("pack_kernel");
       poleT_kernel<<<dim3(32u, unsigned(Kb), 1u), 256>>>(kd, ik0, Kb, dgk, true, false, dgjT);
       poleT_kernel<<<dim3(32u, unsigned(Kb), 1u), 256>>>(kd, ik0, Kb, dgkq, true, false, dglT);
@@ -456,7 +604,11 @@ namespace methods::solvers::dynbse_cuda {
                                    (const cd **)pGh, int(nc), (const cd **)pPj, int(nc), &zero, pQj, int(nc), nb), "gemm Qj");
       cub_check(cublasZgemmBatched(h, CUBLAS_OP_N, CUBLAS_OP_N, int(nc), Mrows, int(nc), &one,
                                    (const cd **)pGlT, int(nc), (const cd **)pPj, int(nc), &zero, pBj, int(nc), nb), "gemm Bj");
-      scatter_kernel<<<dim3(unsigned(nca), unsigned(Kb), 1u), 256>>>(kd, Kb, 0, inu, t.skip_cst, dQj, dBj,
+      if (nu0)
+        scatter_nu0_kernel<<<dim3(unsigned(nca), unsigned(Kb), 1u), 256>>>(kd, Kb, 0, t.skip_cst, dQj, dBj,
+                                                                           deps, depsG, dgn, dAU, dM2, dA3);
+      else
+        scatter_kernel<<<dim3(unsigned(nca), unsigned(Kb), 1u), 256>>>(kd, Kb, 0, inu, t.skip_cst, dQj, dBj,
                                                                        deps, depsG, dgn, dAU, dAT, dM2, dA1, dA3);
       launch_check("scatter_kernel pass 0");
       // pass 1: P_l = Gtil_l Vt, R_l = P_l gkq_l^T
@@ -466,14 +618,22 @@ namespace methods::solvers::dynbse_cuda {
                                    (const cd **)pVt, Ncols, (const cd **)pGh, int(nc), &zero, pPj, Ncols, nb), "gemm Pl");
       cub_check(cublasZgemmBatched(h, CUBLAS_OP_N, CUBLAS_OP_N, int(nc), Mrows, int(nc), &one,
                                    (const cd **)pGlT, int(nc), (const cd **)pPj, int(nc), &zero, pQj, int(nc), nb), "gemm Rl");
-      scatter_kernel<<<dim3(unsigned(nca), unsigned(Kb), 1u), 256>>>(kd, Kb, 1, inu, t.skip_cst, dQj, dQj,
+      if (nu0)
+        scatter_nu0_kernel<<<dim3(unsigned(nca), unsigned(Kb), 1u), 256>>>(kd, Kb, 1, t.skip_cst, dQj, dQj,
+                                                                           deps, depsG, dgn, dAU, dM2, dA3);
+      else
+        scatter_kernel<<<dim3(unsigned(nca), unsigned(Kb), 1u), 256>>>(kd, Kb, 1, inu, t.skip_cst, dQj, dQj,
                                                                        deps, depsG, dgn, dAU, dAT, dM2, dA1, dA3);
       launch_check("scatter_kernel pass 1");
-      assemble_kernel<<<dim3(unsigned(np), 2u, unsigned(Kb)), 256>>>(kd, ik0, Kb, t.sum_part1, dfh, dfd1, dDsq,
-                                                                     ds1, ds3, dr1u, dr3u, dr3t, dR1U, dR1T, dR3U, dR3T,
-                                                                     dAU, dAT, dM2, dA1, dA3, dF, dFs, derr);
+      if (nu0)
+        assemble_nu0_kernel<<<dim3(unsigned(np), unsigned(Kb), 1u), 256>>>(kd, ik0, Kb, t.sum_part1, dfh, dfd1, dfd2,
+                                                                           dDsq, dDcb, dAU, dM2, dA3, dF, dFs, derr);
+      else
+        assemble_kernel<<<dim3(unsigned(np), 2u, unsigned(Kb)), 256>>>(kd, ik0, Kb, t.sum_part1, dfh, dfd1, dDsq,
+                                                                       ds1, ds3, dr1u, dr3u, dr3t, dR1U, dR1T, dR3U, dR3T,
+                                                                       dAU, dAT, dM2, dA1, dA3, dF, dFs, derr);
       launch_check("assemble_kernel");
-      if (t.tfold > 0.0) {
+      if (t.tfold > 0.0 && !nu0) {
         tfold_kernel<<<dim3(unsigned(np), unsigned(Kb), 1u), 256>>>(kd, ik0, Kb, inu, t.tfold, deps, dDsq, dDcb, dDqt, dF);
         launch_check("tfold_kernel");
       }
@@ -483,7 +643,8 @@ namespace methods::solvers::dynbse_cuda {
     int err = 0;
     cu_check(cudaMemcpy(&err, derr, sizeof(int), cudaMemcpyDeviceToHost), "err");
     if (err != 0)
-      APP_ABORT(std::string(" dynbse::l0_apply_shift_cols (device): a confluent product at a node outside the DLR set."));
+      APP_ABORT(std::string(nu0 ? " dynbse::l0_apply_cols (device): a confluent triple pole at a node outside the DLR set."
+                                : " dynbse::l0_apply_shift_cols (device): a confluent product at a node outside the DLR set."));
     cu_check(cudaMemcpy(Ffam_h, dF, nF * sizeof(cd), cudaMemcpyDeviceToHost), "F d2h");
     cu_check(cudaMemcpy(Fsum_h, dFs, nFs * sizeof(cd), cudaMemcpyDeviceToHost), "Fsum d2h");
     const double tt4 = dnow();                       // end of the downloads (D2H)
@@ -496,7 +657,7 @@ namespace methods::solvers::dynbse_cuda {
 
     cub_check(cublasDestroy(h), "cublasDestroy");
     for (void *p : {(void *)dact, (void *)dX, (void *)dXc, (void *)dgk, (void *)dgkq, (void *)dGhat, (void *)dGtil, (void *)deps,
-                    (void *)depsG, (void *)dgn, (void *)dfh, (void *)dfd1, (void *)dDsq, (void *)dDcb, (void *)dDqt,
+                    (void *)depsG, (void *)dgn, (void *)dfh, (void *)dfd1, (void *)dfd2, (void *)dDsq, (void *)dDcb, (void *)dDqt,
                     (void *)ds1, (void *)ds3, (void *)dr1u, (void *)dr3u, (void *)dr3t, (void *)dR1U, (void *)dR1T,
                     (void *)dR3U, (void *)dR3T, (void *)dF, (void *)dFs, (void *)derr, (void *)dVt, (void *)dPj,
                     (void *)dQj, (void *)dBj, (void *)dgjT, (void *)dglT, (void *)dGh, (void *)dAU, (void *)dAT,
@@ -504,6 +665,16 @@ namespace methods::solvers::dynbse_cuda {
                     (void *)pPj, (void *)pQj, (void *)pBj})
       cu_check(cudaFree(p), "cudaFree");
     return K;
+    }
+
+  } // namespace
+
+  long l0_apply_shift_cols(l0_dims const &d, l0_tables const &t, cplx *Ffam_h, cplx *Fsum_h, double free_bytes) {
+    return run_l0(d, t, Ffam_h, Fsum_h, free_bytes, false);
+  }
+
+  long l0_apply_cols(l0_dims const &d, l0_tables const &t, cplx *Ffam_h, cplx *Fsum_h, double free_bytes) {
+    return run_l0(d, t, Ffam_h, Fsum_h, free_bytes, true);
   }
 
 } // namespace methods::solvers::dynbse_cuda
