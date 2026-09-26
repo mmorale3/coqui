@@ -54,6 +54,7 @@ namespace methods::solvers::dynbse_cuda {
     cplx const *Xfam = nullptr;     // (2, np, nk, nc, nc, nR)
     cplx const *Xcst = nullptr;     // (nk, nc, nc, nR)
     long const *act = nullptr;      // (nca) the ACTIVE input components, global c = 0 (constant) | 1 + f np + a (P-3a)
+    double *timing = nullptr;       // optional (4): the driver ADDS its wall times -- [0] alloc, [1] H2D, [2] kernel, [3] D2H
     cplx const *gk = nullptr;       // (ng, nk, nc, nc)
     cplx const *gkq = nullptr;      // (ng, nk, nc, nc)
     cplx const *Ghat = nullptr;     // (nk, ng, nc, nc)  sum_{l != j} gkq(l)^T / (epsG_j - epsG_l + inu)

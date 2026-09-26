@@ -208,6 +208,11 @@ namespace solvers {
       double t_rung = 0.0, t_refit = 0.0;   // inside the solve: the rung applications (all tau nodes), the tau refits
       double t_l0 = 0.0, t_ts = 0.0, t_orth = 0.0;   // the L0 pole algebra, the static-resolvent gemms, the Arnoldi dots
       long n_apps = 0;                      // K_d applications (all units, all blocks)
+      // the L0 split (gpu port, 2026-09-25; see dynbse::solve_timers): nu = 0 kernel, nu != 0 host kernel, nu != 0
+      // device path and its phases; the number of L0 applications and of constant-input ones (the P-3a fast path)
+      double t_l0_nu0 = 0.0, t_l0_host = 0.0, t_l0_dev = 0.0;
+      double t_l0_prep = 0.0, t_l0_alloc = 0.0, t_l0_h2d = 0.0, t_l0_kernel = 0.0, t_l0_d2h = 0.0;
+      long n_l0 = 0, n_l0_cst = 0;
       double rss_max_gb = 0.0;
       bool ksum_ft = false;         // the rung's k-sum ran through the mesh Fourier transform
       nda::array<double, 2> unit_diag;   // per unit (nunits_all x 13): is iq m apps conv stag rconv |Ritz| refit shift-fit
@@ -229,6 +234,19 @@ namespace solvers {
         sm(it_sum); sm(nunits); sm(nconv);
         mx(t_setup); mx(t_kbig); mx(t_cb); mx(t_lu); mx(t_solve); mx(t_read); mx(rss_max_gb);
         mx(t_rung); mx(t_refit); sm(n_apps); mx(t_l0); mx(t_ts); mx(t_orth);
+        mx(t_l0_nu0); mx(t_l0_host); mx(t_l0_dev); mx(t_l0_prep); mx(t_l0_alloc); mx(t_l0_h2d); mx(t_l0_kernel); mx(t_l0_d2h);
+        sm(n_l0); sm(n_l0_cst);
+      }
+      /** the L0 split as one log line (the slowest rank's times, the summed counts) */
+      std::string l0_split_line() const {
+        char buf[512];
+        std::snprintf(buf, sizeof(buf),
+                      "L0 split on the slowest rank: nu=0 kernel %.1f s, host kernel %.1f s, device path %.1f s "
+                      "(prep %.1f, alloc %.1f, H2D %.1f, kernel %.1f, D2H %.1f); %ld L0 applications (%ld constant-input); "
+                      "rung %.1f s, refit %.1f s, T_s %.1f s, Arnoldi %.1f s",
+                      t_l0_nu0, t_l0_host, t_l0_dev, t_l0_prep, t_l0_alloc, t_l0_h2d, t_l0_kernel, t_l0_d2h, n_l0, n_l0_cst,
+                      t_rung, t_refit, t_ts, t_orth);
+        return std::string(buf);
       }
     };
 
@@ -1422,6 +1440,10 @@ namespace solvers {
             if (met) {
               auto const &stt = db::solve_timers_state();
               met->t_l0 += stt.t_l0; met->t_ts += stt.t_ts; met->t_orth += stt.t_orth;
+              met->t_l0_nu0 += stt.t_l0_nu0; met->t_l0_host += stt.t_l0_host; met->t_l0_dev += stt.t_l0_dev;
+              met->t_l0_prep += stt.t_l0_prep; met->t_l0_alloc += stt.t_l0_alloc; met->t_l0_h2d += stt.t_l0_h2d;
+              met->t_l0_kernel += stt.t_l0_kernel; met->t_l0_d2h += stt.t_l0_d2h;
+              met->n_l0 += stt.n_l0; met->n_l0_cst += stt.n_l0_cst;
             }
             it_unit = std::max(it_unit, res.iterations);
             conv_unit = conv_unit and res.converged;
@@ -2076,6 +2098,7 @@ namespace solvers {
             met.t_solve - met.t_rung - met.t_refit - met.t_l0 - met.t_ts - met.t_orth, met.n_apps,
             (met.n_apps > 0) ? met.t_solve * double(mpi->comm.size()) / double(met.n_apps) : 0.0, met.rss_max_gb,
             utils::omp_threads());
+    app_log(1, "  [scGW-tilde T2] {}", met.l0_split_line());
     if (met.ritz_max >= 1.0)
       app_log(1, "  [scGW-tilde T2] WARNING: the dynamic remainder's watchdog is >= 1 on some unit -- the resummed "
                  "column is not to be trusted there; Gamma_1 is the reportable number.");
@@ -2198,6 +2221,7 @@ namespace solvers {
             met.fit_err_G, met.refit_err_max, r.t_total, met.t_solve, met.t_rung, met.t_refit, met.t_l0, met.t_ts, met.t_orth,
             met.t_solve - met.t_rung - met.t_refit - met.t_l0 - met.t_ts - met.t_orth, met.n_apps, met.rss_max_gb,
             utils::omp_threads());
+    app_log(1, "  [scGW-tilde T2] {}", met.l0_split_line());
     if (met.unit_diag.size() > 0) {
       app_log(2, "  [dynbse cut units]   s   q  node  apps conv stag rconv    |Ritz|     refit   shift-fit  shift-cond  last-readout-step  (table mode {}, fold ratio {})", o.table_mode, o.tfold);
       for (long u = 0; u < met.unit_diag.shape(0); ++u) {
@@ -2586,6 +2610,7 @@ namespace solvers {
             opt.col, opt.outer, opt.scale, dmet.nunits, long(nus.size()), nw_b, o.gmres_m, o.rhs_block, _band_window.first(), _band_window.last(), _Xb_skma.shape(2),
             hook.np, dmax, mloc.dsig_herm, opt.hermitize ? "Hermitized" : "NOT Hermitized", hook.ks_herm, hook.amax, hook.ymax, e_fit,
             dmet.fit_err_G, dmet.refit_err_max, dmet.ritz_max, mloc.all_converged, mloc.t_total, dmet.t_solve, hook.t_sig, dmet.rss_max_gb);
+    app_log(1, "  [LFF-Sigma dyn] {}", dmet.l0_split_line());
     if (hook.conv_kf >= 0.0)
       app_log(1, "  [LFF-Sigma dyn] product-route checks: w_to_tau[U_a] vs +KF {:.2e} / vs -KF {:.2e}; tau_to_w[G] vs pole-fit G {:.2e}; "
                  "max |fam1| on extension nodes {:.2e}{}", hook.conv_kf, hook.conv_kf_neg, hook.conv_g, hook.fam1_ext,

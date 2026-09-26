@@ -22,6 +22,7 @@
 // and, like numerics/device_kernels/cuda, reports through APP_ABORT with a std::string.
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -339,6 +340,10 @@ namespace methods::solvers::dynbse_cuda {
     if (nca < 1 || nca > 1 + 2 * np || t.act == nullptr)
       APP_ABORT(std::string(" l0_cuda: the active-component list is missing or out of range (nca = ") + std::to_string(nca) + ").");
 
+    // wall clock for the optional timing split (t.timing: alloc, H2D, kernel, D2H)
+    auto dnow = []() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
+    const double tt0 = dnow();
+
     // ---- fixed device data ------------------------------------------------------------------------
     long *dact = upload(t.act, size_t(nca), "act");
     kdims kd{nc, nR, np, ng, nca, blk, nk, d.np_fit, dact};
@@ -364,6 +369,8 @@ namespace methods::solvers::dynbse_cuda {
     cu_check(cudaMemset(dFs, 0, nFs * sizeof(cd)), "memset Fsum");
     int *derr = alloc<int>(1, "err");
     cu_check(cudaMemset(derr, 0, sizeof(int)), "memset err");
+    cu_check(cudaDeviceSynchronize(), "uploads");
+    const double tt1 = dnow();                       // end of the fixed uploads (H2D)
 
     // ---- the k-batch: the largest K whose working set fits the memory we were given --------------
     // per k: Vt + 3 ng W (P/Q/B) + 5 accumulators + 3 ng nc^2 pole operands, 16 B each
@@ -421,6 +428,7 @@ namespace methods::solvers::dynbse_cuda {
         std::fprintf(stderr, "  [l0_cuda] k-batch reduced from %ld to %ld after a device allocation failure (shared GPU?)\n",
                      K_first, K);
     }
+    const double tt2 = dnow();                       // end of the per-k allocations (alloc)
     fill_ptrs<<<unsigned((nptr + 255) / 256), 256>>>(K, ng, W, nc2, dVt, dgjT, dglT, dGh, dPj, dQj, dBj,
                                                      pVt, pGjT, pGlT, pGh, pPj, pQj, pBj);
     launch_check("fill_ptrs");
@@ -471,12 +479,20 @@ namespace methods::solvers::dynbse_cuda {
       }
     }
     cu_check(cudaDeviceSynchronize(), "l0 batches");
+    const double tt3 = dnow();                       // end of the batches (kernel)
     int err = 0;
     cu_check(cudaMemcpy(&err, derr, sizeof(int), cudaMemcpyDeviceToHost), "err");
     if (err != 0)
       APP_ABORT(std::string(" dynbse::l0_apply_shift_cols (device): a confluent product at a node outside the DLR set."));
     cu_check(cudaMemcpy(Ffam_h, dF, nF * sizeof(cd), cudaMemcpyDeviceToHost), "F d2h");
     cu_check(cudaMemcpy(Fsum_h, dFs, nFs * sizeof(cd), cudaMemcpyDeviceToHost), "Fsum d2h");
+    const double tt4 = dnow();                       // end of the downloads (D2H)
+    if (t.timing != nullptr) {
+      t.timing[0] += tt2 - tt1;   // alloc (incl. retries)
+      t.timing[1] += tt1 - tt0;   // H2D
+      t.timing[2] += tt3 - tt2;   // kernel (pack, gemms, scatter, assemble, fold; to the sync)
+      t.timing[3] += tt4 - tt3;   // D2H
+    }
 
     cub_check(cublasDestroy(h), "cublasDestroy");
     for (void *p : {(void *)dact, (void *)dX, (void *)dXc, (void *)dgk, (void *)dgkq, (void *)dGhat, (void *)dGtil, (void *)deps,

@@ -114,6 +114,28 @@ namespace dynbse {
     return n;
   }
 
+  /** wall-time sinks of the solver internals (seconds, cumulative; the driver resets and reads them per
+   *  unit): the L0 pair-pole applications, the static-resolvent gemms (T_s, Cb), the Arnoldi
+   *  orthogonalization, and (gpu port, 2026-09-25) the SPLIT of the L0 applications: the nu = 0 kernel
+   *  (l0_apply_cols, host), the nu != 0 host kernel, the nu != 0 device path and its phases -- prep (Ghat/Gtil,
+   *  tables, the Cb_cst term on the host), alloc (the per-k working set, incl. retries), H2D (the fixed uploads),
+   *  kernel (pack + batched gemms + scatter + assemble + fold, to the device sync), D2H (F, Fsum) -- with the
+   *  counts of applications and of constant-input applications (the P-3a fast path). Not thread-safe by design:
+   *  the solver runs outside any omp region. */
+  struct solve_timers {
+    double t_l0 = 0.0, t_ts = 0.0, t_orth = 0.0;
+    double t_l0_nu0 = 0.0, t_l0_host = 0.0, t_l0_dev = 0.0;
+    double t_l0_prep = 0.0, t_l0_alloc = 0.0, t_l0_h2d = 0.0, t_l0_kernel = 0.0, t_l0_d2h = 0.0;
+    long n_l0 = 0, n_l0_cst = 0;
+    void reset() {
+      t_l0 = t_ts = t_orth = 0.0;
+      t_l0_nu0 = t_l0_host = t_l0_dev = t_l0_prep = t_l0_alloc = t_l0_h2d = t_l0_kernel = t_l0_d2h = 0.0;
+      n_l0 = n_l0_cst = 0;
+    }
+  };
+  inline solve_timers &solve_timers_state() { static solve_timers t; return t; }
+  inline double wall_now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+
   /** stable n_B(e) = 1/(exp(beta e) - 1), e != 0 */
   inline double nB(double beta, double e) {
     if (e > 0.0) {
@@ -882,6 +904,8 @@ namespace dynbse {
                                          tf_vector const &X, tf_vector &F, nda::array<cplx, 4> &Fsum,
                                          nda::array<cplx, 3> const *Cb_cst, double tfold,
                                          std::vector<long> const &act) {   // the active components (P-3a)
+    auto &stt = solve_timers_state();
+    const double tw_prep = wall_now();
     const cplx inu = st.inu;
     const long np = b.np, nk = P.nk, nc = P.nc, ng = P.ng, nR = X.nR, nc2 = nc * nc;
     nda::array<cplx, 4> Ghat(nk, ng, nc, nc), Gtil(nk, ng, nc, nc);
@@ -913,7 +937,12 @@ namespace dynbse {
     t.R1U = st.R1U.data(); t.R1T = st.R1T.data(); t.R3U = st.R3U.data(); t.R3T = st.R3T.data();
     t.inu = inu; t.tfold = tfold; t.sum_part1 = (Cb_cst == nullptr); t.skip_cst = not anyc;
     const double free_bytes = 1.0e6 * double(utils::freemem_device_effective());
+    double tdev[4] = {0.0, 0.0, 0.0, 0.0};        // alloc, H2D, kernel, D2H (filled by the driver)
+    t.timing = tdev;
+    stt.t_l0_prep += wall_now() - tw_prep;
     dynbse_cuda::l0_apply_shift_cols(d, t, F.fam.data(), Fsum.data(), free_bytes);
+    stt.t_l0_alloc += tdev[0]; stt.t_l0_h2d += tdev[1]; stt.t_l0_kernel += tdev[2]; stt.t_l0_d2h += tdev[3];
+    const double tw_cst = wall_now();
     if (Cb_cst != nullptr and anyc)
       for (long ik = 0; ik < nk; ++ik)
         for (long r = 0; r < nR; ++r)
@@ -922,6 +951,7 @@ namespace dynbse {
             for (long pp = 0; pp < nc2; ++pp) sacc += (*Cb_cst)(ik, p, pp) * X.cst(ik, pp / nc, pp % nc, r);
             Fsum(ik, p / nc, p % nc, r) += sacc;
           }
+    stt.t_l0_prep += wall_now() - tw_cst;          // the host-side Cb_cst term counts as prep
   }
 #endif
 
@@ -967,9 +997,14 @@ namespace dynbse {
     if (nca == 0) return;                          // nothing to apply (F and Fsum are zero)
     std::vector<long> pos(size_t(ncomp), -1);
     for (long il = 0; il < nca; ++il) pos[size_t(act[size_t(il)])] = il;
+    auto &stt_l0 = solve_timers_state();           // the L0 split (see solve_timers)
+    const double tw_l0 = wall_now();
+    stt_l0.n_l0 += 1;
+    if (nca == 1 and act[0] == 0) stt_l0.n_l0_cst += 1;
 #if defined(ENABLE_CUDA)
     if (l0_device_enabled() and not force_host) {   // force_host: the A/B gate of the toy tests
       l0_apply_shift_cols_device(b, P, st, X, F, Fsum, Cb_cst, tfold, act);
+      stt_l0.t_l0_dev += wall_now() - tw_l0;
       return;
     }
 #endif
@@ -1285,6 +1320,7 @@ namespace dynbse {
             Fsum(ik, p / nc, p % nc, r) += sacc;
           }
     }
+    stt_l0.t_l0_host += wall_now() - tw_l0;
   }
 
   /**
@@ -1866,7 +1902,13 @@ namespace dynbse {
       for (long j = 0; j < P.ng; ++j)
         utils::check(P.gnode(j) < np_ and (not shared or P.gnode(j) < b.np_fit), "dynbse::l0_apply: G node map out of range.");
       utils::check(X.np == np_ and X.nk == P.nk and X.nc == P.nc, "dynbse::l0_apply: shape mismatch.");
-      l0_apply_cols(b, P, X, F, Fsum, Cb_cst);
+      {
+        auto &stt0 = solve_timers_state();          // the nu = 0 kernel's share of the L0 split
+        const double tw0 = wall_now();
+        stt0.n_l0 += 1;
+        l0_apply_cols(b, P, X, F, Fsum, Cb_cst);
+        stt0.t_l0_nu0 += wall_now() - tw0;
+      }
       return;
     }
     const long np = b.np, nk = P.nk, nc = P.nc, ng = P.ng, nR = X.nR, nc2 = nc * nc;
@@ -2598,15 +2640,8 @@ namespace dynbse {
     }
   }
 
-  /** wall-time sinks of the solver internals (seconds, cumulative; the driver resets and reads them per
-   *  unit): the L0 pair-pole applications, the static-resolvent gemms (T_s, Cb), the Arnoldi
-   *  orthogonalization. Not thread-safe by design: the solver runs outside any omp region. */
-  struct solve_timers {
-    double t_l0 = 0.0, t_ts = 0.0, t_orth = 0.0;
-    void reset() { t_l0 = t_ts = t_orth = 0.0; }
-  };
-  inline solve_timers &solve_timers_state() { static solve_timers t; return t; }
-  inline double wall_now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+  // solve_timers, solve_timers_state() and wall_now() are defined at the top of this namespace (the L0 kernels
+  // above accumulate into them).
 
   inline void ls_apply(freq_basis const &b, pair_poles const &P, static_resolvent const &S, cplx inu,
                        bool shared, nda::array<cplx, 4> const &Dc, tf_vector const &y,
