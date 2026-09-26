@@ -126,11 +126,16 @@ namespace dynbse {
     double t_l0 = 0.0, t_ts = 0.0, t_orth = 0.0;
     double t_l0_nu0 = 0.0, t_l0_host = 0.0, t_l0_dev = 0.0;
     double t_l0_prep = 0.0, t_l0_alloc = 0.0, t_l0_h2d = 0.0, t_l0_kernel = 0.0, t_l0_d2h = 0.0;
-    long n_l0 = 0, n_l0_cst = 0;
+    long n_l0 = 0, n_l0_cst = 0, n_l0_nu0 = 0;
+    // O-1 (gpu port, 2026-09-26): the host-traffic split of the Gamma_1 path outside the kernels -- the elementwise
+    // passes over tf_vectors (copies, zeroing, axpy; t_vec) and the (re)allocation + first touch of the solver's
+    // scratch (t_ws). Both were untimed and dominated the "rest" of the Sigma-side solve (46 % at Si kp444 / C = 8).
+    double t_vec = 0.0, t_ws = 0.0;
     void reset() {
       t_l0 = t_ts = t_orth = 0.0;
       t_l0_nu0 = t_l0_host = t_l0_dev = t_l0_prep = t_l0_alloc = t_l0_h2d = t_l0_kernel = t_l0_d2h = 0.0;
-      n_l0 = n_l0_cst = 0;
+      n_l0 = n_l0_cst = n_l0_nu0 = 0;
+      t_vec = t_ws = 0.0;
     }
   };
   inline solve_timers &solve_timers_state() { static solve_timers t; return t; }
@@ -474,6 +479,29 @@ namespace dynbse {
    * A two-family vector with a frequency-constant part, for all k, pairs (matrix form) and
    * right-hand sides: fam(2, np, nk, nc, nc, nR) + cst(nk, nc, nc, nR).
    */
+  // O-1 (gpu port, 2026-09-26): the elementwise passes over the solver's big vectors (0.7 GB per tf_vector at Si
+  // kp444 / C = 8, 9 GB at kp666 / C = 16) ran as single-threaded nda expressions; they now run over the flat data
+  // with the kernels' thread count. Elementwise, so bitwise identical to the serial loops. Not for use inside an
+  // omp region (the solver runs outside any).
+  inline void par_zero(cplx *d, long n) {
+#pragma omp parallel for schedule(static) num_threads(utils::omp_threads())
+    for (long i = 0; i < n; ++i) d[i] = cplx(0.0);
+  }
+  inline void par_copy(cplx *d, cplx const *s, long n) {
+#pragma omp parallel for schedule(static) num_threads(utils::omp_threads())
+    for (long i = 0; i < n; ++i) d[i] = s[i];
+  }
+  /** d = a + b (d may alias a or b) */
+  inline void par_add(cplx *d, cplx const *a, cplx const *b, long n) {
+#pragma omp parallel for schedule(static) num_threads(utils::omp_threads())
+    for (long i = 0; i < n; ++i) d[i] = a[i] + b[i];
+  }
+  /** d = a - b (d may alias a or b) */
+  inline void par_sub(cplx *d, cplx const *a, cplx const *b, long n) {
+#pragma omp parallel for schedule(static) num_threads(utils::omp_threads())
+    for (long i = 0; i < n; ++i) d[i] = a[i] - b[i];
+  }
+
   struct tf_vector {
     long np = 0, nk = 0, nc = 0, nR = 0;
     nda::array<cplx, 6> fam;
@@ -481,10 +509,21 @@ namespace dynbse {
     tf_vector() = default;
     tf_vector(long np_, long nk_, long nc_, long nR_)
         : np(np_), nk(nk_), nc(nc_), nR(nR_), fam(2, np_, nk_, nc_, nc_, nR_), cst(nk_, nc_, nc_, nR_) {
-      fam() = cplx(0.0);
+      par_zero(fam.data(), fam.size());          // parallel first touch (O-1)
       cst() = cplx(0.0);
     }
-    void zero() { fam() = cplx(0.0); cst() = cplx(0.0); }
+    void zero() { par_zero(fam.data(), fam.size()); cst() = cplx(0.0); }
+    void zero_fam() { par_zero(fam.data(), fam.size()); }
+    /** fam <- o.fam, cst <- o.cst (same shape) */
+    void assign(tf_vector const &o) {
+      par_copy(fam.data(), o.fam.data(), fam.size());
+      cst() = o.cst;
+    }
+    /** this = a - b elementwise (same shapes; this may alias a or b) */
+    void sub(tf_vector const &a, tf_vector const &b) {
+      par_sub(fam.data(), a.fam.data(), b.fam.data(), fam.size());
+      par_sub(cst.data(), a.cst.data(), b.cst.data(), cst.size());
+    }
     double norm2() const {
       double n = 0.0;
       for (auto const &v : fam) n += std::norm(v);
@@ -960,7 +999,8 @@ namespace dynbse {
    *  instead of nR sets. Gated against l0_apply_ref by the toy tests (L)/(G) at inu != 0. */
   inline void l0_apply_shift_cols(freq_basis const &b, pair_poles const &P, shift_tables const &st,
                                   tf_vector const &X, tf_vector &F, nda::array<cplx, 4> &Fsum,
-                                  nda::array<cplx, 3> const *Cb_cst, [[maybe_unused]] bool force_host = false) {
+                                  nda::array<cplx, 3> const *Cb_cst, [[maybe_unused]] bool force_host = false,
+                                  bool x_fam_zero = false) {
     decltype(nda::range::all) all;
     const cplx inu = st.inu;
     const long np = b.np, nk = P.nk, nc = P.nc, ng = P.ng, nR = X.nR, nc2 = nc * nc;
@@ -975,7 +1015,8 @@ namespace dynbse {
     // list only. A frequency-CONSTANT input (L_s's second call, both calls of L_s d) is then ONE component instead
     // of 1 + 2 np -- the gemms' free dimension and the scatter shrink by that factor; a K_d output (every component
     // set) is unchanged. `pos` is the inverse map (global c -> packed position, -1 if absent). vertex_debug
-    // dynbse_l0_active = 0 packs every component (the old path, for A/B).
+    // dynbse_l0_active = 0 packs every component (the old path, for A/B). x_fam_zero (O-1): the caller vouches
+    // that X.fam is zero, so the family scan (a full read of X) is skipped.
     std::vector<long> act;
     act.reserve(size_t(ncomp));
     {
@@ -986,7 +1027,7 @@ namespace dynbse {
       for (long f = 0; f < 2; ++f)
         for (long a = 0; a < np; ++a) {
           bool anya = all_active;
-          if (not anya) {
+          if (not anya and not x_fam_zero) {
             auto va = X.fam(f, a, all, all, all, all);
             for (auto const &v : va) if (v != cplx(0.0)) { anya = true; break; }
           }
@@ -1586,7 +1627,7 @@ namespace dynbse {
    *  toy test (L). Host threads over k as in l0_apply. */
   inline bool &l0_cols_state() { static bool v = true; return v; }
   inline void l0_apply_cols(freq_basis const &b, pair_poles const &P, tf_vector const &X, tf_vector &F,
-                            nda::array<cplx, 4> &Fsum, nda::array<cplx, 3> const *Cb_cst) {
+                            nda::array<cplx, 4> &Fsum, nda::array<cplx, 3> const *Cb_cst, bool x_fam_zero = false) {
     decltype(nda::range::all) all;
     const long np = b.np, nk = P.nk, nc = P.nc, ng = P.ng, nR = X.nR, nc2 = nc * nc;
     F.zero();
@@ -1625,17 +1666,19 @@ namespace dynbse {
             C(x, r, y) = v;
             anyc = anyc or (v != cplx(0.0));
           }
-      // the single input family at inu = 0 (both families folded)
+      // the single input family at inu = 0 (both families folded); x_fam_zero (O-1): the caller vouches that
+      // X.fam is zero -- no packing, the family block below is skipped (the constant part alone runs)
       bool anyv = false;
-      for (long a = 0; a < np; ++a)
-        for (long x = 0; x < nc; ++x)
-          for (long y = 0; y < nc; ++y)
-            for (long r = 0; r < nR; ++r) {
-              const cplx v = X.fam(0, a, ik, x, y, r) + X.fam(1, a, ik, x, y, r);
-              Vt(x, a, r, y) = v;
-              Sv(a, r, x, y) = v;
-              anyv = anyv or (v != cplx(0.0));
-            }
+      if (not x_fam_zero)
+        for (long a = 0; a < np; ++a)
+          for (long x = 0; x < nc; ++x)
+            for (long y = 0; y < nc; ++y)
+              for (long r = 0; r < nR; ++r) {
+                const cplx v = X.fam(0, a, ik, x, y, r) + X.fam(1, a, ik, x, y, r);
+                Vt(x, a, r, y) = v;
+                Sv(a, r, x, y) = v;
+                anyv = anyv or (v != cplx(0.0));
+              }
       if (anyv) {
         auto Vt2 = nda::reshape(Vt, std::array<long, 2>{nc, np * nR * nc});
         auto Sv2 = nda::reshape(Sv, std::array<long, 2>{np * nR * nc, nc});
@@ -1883,7 +1926,9 @@ namespace dynbse {
   inline void l0_apply(freq_basis const &b, pair_poles const &P, cplx inu, bool shared,
                        tf_vector const &X, tf_vector &F, nda::array<cplx, 4> &Fsum,
                        nda::array<cplx, 3> const *Cb_cst = nullptr, shift_tables const *st = nullptr,
-                       bool force_host = false) {
+                       bool force_host = false, bool x_fam_zero = false) {
+    // x_fam_zero (O-1, 2026-09-26): the caller vouches that X.fam is zero (a frequency-constant input); the batched
+    // kernels then skip the family scan / packing instead of reading the whole vector to find that out.
     decltype(nda::range::all) all;
     // inu != 0: the {U, T} twisted-pair basis (D2e). The {U, S} branches below this dispatch are
     // the inu = 0 (folded, single-family) path only. force_host: the host L0 kernel even when the device
@@ -1893,7 +1938,7 @@ namespace dynbse {
                    "dynbse::l0_apply: inu != 0 needs the shift tables built for this inu (build_shift_tables).");
       for (long j = 0; j < P.ng; ++j)
         utils::check(P.gnode(j) < b.np and (not shared or P.gnode(j) < b.np_fit), "dynbse::l0_apply: G node map out of range.");
-      if (l0_cols_state()) l0_apply_shift_cols(b, P, *st, X, F, Fsum, Cb_cst, force_host);
+      if (l0_cols_state()) l0_apply_shift_cols(b, P, *st, X, F, Fsum, Cb_cst, force_host, x_fam_zero);
       else l0_apply_shift(b, P, *st, X, F, Fsum, Cb_cst);
       return;
     }
@@ -1906,7 +1951,9 @@ namespace dynbse {
         auto &stt0 = solve_timers_state();          // the nu = 0 kernel's share of the L0 split
         const double tw0 = wall_now();
         stt0.n_l0 += 1;
-        l0_apply_cols(b, P, X, F, Fsum, Cb_cst);
+        stt0.n_l0_nu0 += 1;
+        if (x_fam_zero) stt0.n_l0_cst += 1;        // the nu = 0 kernel skips the family block for a constant input
+        l0_apply_cols(b, P, X, F, Fsum, Cb_cst, x_fam_zero);
         stt0.t_l0_nu0 += wall_now() - tw0;
       }
       return;
@@ -2643,23 +2690,56 @@ namespace dynbse {
   // solve_timers, solve_timers_state() and wall_now() are defined at the top of this namespace (the L0 kernels
   // above accumulate into them).
 
+  /** O-1 (gpu port, 2026-09-26): the working set of ls_apply, allocated ONCE per solve (or per unit) instead of
+   *  per call. Before, every call built four fresh tf_vectors (X, F, Xc, F2: 0.7 GB each at Si kp444 / C = 8, 9 GB
+   *  at kp666 / C = 16) plus the T_s work arrays, paying the mmap first touch and the zeroing every time; with two
+   *  calls per RHS block of Gamma_1 that was ~6 GB of page-faulted writes per block before any arithmetic.
+   *  Xc.fam is never written: it stays zero from construction (Xc is the frequency-constant input by design). */
+  struct ls_scratch {
+    long np = -1, nk = -1, nc = -1, nR = -1, D = -1;
+    tf_vector X, F, Xc, F2;
+    nda::array<cplx, 4> Fsum, F2sum;
+    nda::array<cplx, 2> fs, cs, cb, z;
+    nda::matrix<cplx, nda::F_layout> Y;
+    void size(long np_, long nk_, long nc_, long nR_, long D_) {
+      if (np_ == np and nk_ == nk and nc_ == nc and nR_ == nR and D_ == D) return;
+      const double tw = wall_now();
+      np = np_; nk = nk_; nc = nc_; nR = nR_; D = D_;
+      X = tf_vector(np, nk, nc, nR); F = tf_vector(np, nk, nc, nR);
+      Xc = tf_vector(np, nk, nc, nR); F2 = tf_vector(np, nk, nc, nR);
+      Fsum = nda::array<cplx, 4>(nk, nc, nc, nR); F2sum = nda::array<cplx, 4>(nk, nc, nc, nR);
+      fs = nda::array<cplx, 2>(D, nR); cs = nda::array<cplx, 2>(D, nR); cb = nda::array<cplx, 2>(D, nR);
+      z = nda::array<cplx, 2>(D, nR);
+      Y = nda::matrix<cplx, nda::F_layout>(D, nR);
+      solve_timers_state().t_ws += wall_now() - tw;
+    }
+  };
+
+  /** Gamma = L_s y (with the external leg Dc): F = L0 (Dc + y), c = T_s F^sum, Gamma = F + L0 c.
+   *  ws (O-1): the caller's scratch (null = a local one, allocated per call as before). y_fam_zero (O-1): the
+   *  caller vouches that y.fam is zero (L_s d: the first call of every block) -- the family copy into X and the
+   *  kernels' family scan / packing are skipped; the arithmetic is unchanged. */
   inline void ls_apply(freq_basis const &b, pair_poles const &P, static_resolvent const &S, cplx inu,
                        bool shared, nda::array<cplx, 4> const &Dc, tf_vector const &y,
                        tf_vector &Gamma, nda::array<cplx, 4> &Gsum,
-                       nda::array<cplx, 3> const *Cb_cst = nullptr, shift_tables const *st = nullptr) {
+                       nda::array<cplx, 3> const *Cb_cst = nullptr, shift_tables const *st = nullptr,
+                       ls_scratch *ws = nullptr, bool y_fam_zero = false) {
     decltype(nda::range::all) all;
     auto &stt = solve_timers_state();
     const long nk = P.nk, nc = P.nc, nc2 = nc * nc, nR = y.nR, D = S.D;
-    tf_vector X(b.np, nk, nc, nR);
-    X.fam() = y.fam;
-    X.cst() = Dc + y.cst;
-    tf_vector F(b.np, nk, nc, nR);
-    nda::array<cplx, 4> Fsum(nk, nc, nc, nR);
+    ls_scratch local;
+    ls_scratch &w = (ws != nullptr) ? *ws : local;
+    w.size(b.np, nk, nc, nR, D);
+    tf_vector &X = w.X, &F = w.F, &Xc = w.Xc, &F2 = w.F2;
+    nda::array<cplx, 4> &Fsum = w.Fsum, &F2sum = w.F2sum;
+    nda::array<cplx, 2> &fs = w.fs, &cs = w.cs, &cb = w.cb;
     double tw = wall_now();
-    l0_apply(b, P, inu, shared, X, F, Fsum, Cb_cst, st);
+    if (y_fam_zero) X.zero_fam(); else par_copy(X.fam.data(), y.fam.data(), X.fam.size());
+    X.cst() = Dc + y.cst;
+    stt.t_vec += wall_now() - tw; tw = wall_now();
+    l0_apply(b, P, inu, shared, X, F, Fsum, Cb_cst, st, false, y_fam_zero);
     stt.t_l0 += wall_now() - tw; tw = wall_now();
     // c = T_s Fsum  (D x nR)
-    nda::array<cplx, 2> fs(D, nR), cs(D, nR), cb(D, nR);
     for (long ik = 0; ik < nk; ++ik)
       for (long p = 0; p < nc2; ++p)
         for (long r = 0; r < nR; ++r) fs(ik * nc2 + p, r) = Fsum(ik, p / nc, p % nc, r);
@@ -2671,11 +2751,11 @@ namespace dynbse {
       } else {
         utils::check(S.own_ks or S.Ks != nullptr, "dynbse::ls_apply: the LU resolvent has no static rung.");
         nda::array<cplx, 2> const &Ksr = S.own_ks ? S.Cb : *S.Ks;
-        nda::matrix<cplx, nda::F_layout> Y(D, nR);          // getrs wants a Fortran-layout right-hand side
+        nda::matrix<cplx, nda::F_layout> &Y = w.Y;          // getrs wants a Fortran-layout right-hand side
         Y() = fs;
         const int info = nda::lapack::getrs(S.Mlu, Y, S.ipiv);
         utils::check(info == 0, "dynbse::ls_apply: getrs failed (info {}).", info);
-        nda::array<cplx, 2> z(D, nR);
+        nda::array<cplx, 2> &z = w.z;
         z() = Y;
         nda::blas::gemm(Ksr, z, cs);
         for (long ik = 0; ik < nk; ++ik) {
@@ -2689,20 +2769,18 @@ namespace dynbse {
       nda::blas::gemm(S.Cb, cs, cb);
     }
     stt.t_ts += wall_now() - tw; tw = wall_now();
-    tf_vector Xc(b.np, nk, nc, nR);
     for (long ik = 0; ik < nk; ++ik)
       for (long p = 0; p < nc2; ++p)
         for (long r = 0; r < nR; ++r) Xc.cst(ik, p / nc, p % nc, r) = cs(ik * nc2 + p, r);
-    tf_vector F2(b.np, nk, nc, nR);
-    nda::array<cplx, 4> F2sum(nk, nc, nc, nR);
-    l0_apply(b, P, inu, shared, Xc, F2, F2sum, Cb_cst, st);
-    stt.t_l0 += wall_now() - tw;
-    Gamma.fam() = F.fam + F2.fam;
+    l0_apply(b, P, inu, shared, Xc, F2, F2sum, Cb_cst, st, false, true);
+    stt.t_l0 += wall_now() - tw; tw = wall_now();
+    par_add(Gamma.fam.data(), F.fam.data(), F2.fam.data(), Gamma.fam.size());
     Gamma.cst() = cplx(0.0);
     for (long ik = 0; ik < nk; ++ik)
       for (long p = 0; p < nc2; ++p)
         for (long r = 0; r < nR; ++r)
           Gsum(ik, p / nc, p % nc, r) = Fsum(ik, p / nc, p % nc, r) + cb(ik * nc2 + p, r);
+    stt.t_vec += wall_now() - tw;
     (void)all;
   }
 
@@ -2766,9 +2844,10 @@ namespace dynbse {
     tf_vector y(np, nk, nc, nR), Gamma(np, nk, nc, nR), ynew(np, nk, nc, nR);
     tf_vector yprev(np, nk, nc, nR), ynew_prev(np, nk, nc, nR);
     nda::array<cplx, 4> Gsum(nk, nc, nc, nR);
+    ls_scratch ws;                 // O-1: one working set for every ls_apply of this solve
     double dprev = -1.0;
     for (long it = 0; it <= maxit; ++it) {
-      ls_apply(b, P, S, inu, shared, Dc, y, Gamma, Gsum, Cb_cst, st);
+      ls_apply(b, P, S, inu, shared, Dc, y, Gamma, Gsum, Cb_cst, st, &ws, it == 0);
       if (it == 0) out.Gsum0 = Gsum;
       if (it == 1) { out.Gsum1 = Gsum; if (keep_y) { out.has_y = true; out.y1 = y; } }
       out.Gsum = Gsum;
@@ -2808,7 +2887,7 @@ namespace dynbse {
         if (m_ >= 4 and h[m_ - 1] > 0.7 * h[m_ - 2] and h[m_ - 2] > 0.7 * h[m_ - 3] and h[m_ - 3] > 0.7 * h[m_ - 4]
             and h[m_ - 1] < 1e-3) {
           out.stagnated = true;
-          ls_apply(b, P, S, inu, shared, Dc, ynew, Gamma, Gsum, Cb_cst, st);
+          ls_apply(b, P, S, inu, shared, Dc, ynew, Gamma, Gsum, Cb_cst, st, &ws);
           out.Gsum = Gsum;
           out.iterations = it + 1;
           if (keep_y) out.y = ynew;
@@ -2844,7 +2923,7 @@ namespace dynbse {
       dprev = d;
       if (out.residual <= tol) {
         // one more L_s application on the converged y gives the final Gamma
-        ls_apply(b, P, S, inu, shared, Dc, y, Gamma, Gsum, Cb_cst, st);
+        ls_apply(b, P, S, inu, shared, Dc, y, Gamma, Gsum, Cb_cst, st, &ws);
         out.Gsum = Gsum;
         out.iterations = it + 1;
         out.converged = true;
@@ -2899,20 +2978,25 @@ namespace dynbse {
     out.Gsum0 = nda::array<cplx, 4>(nk, nc, nc, nR);
     nda::array<cplx, 4> Dzero(nk, nc, nc, nR), Gsum(nk, nc, nc, nR);
     Dzero() = cplx(0.0);
-    tf_vector y(np, nk, nc, nR), Gamma(np, nk, nc, nR), rhs(np, nk, nc, nR), w(np, nk, nc, nR), r(np, nk, nc, nR);
+    // O-1 (2026-09-26): y, Gamma, rhs are all the Gamma_1 path needs; w, r and the Krylov vectors are built past the
+    // gamma1_only return (before, two dead 0.7-9 GB vectors were allocated and zeroed per RHS block). ls_scratch:
+    // one working set for every ls_apply of this solve.
+    tf_vector y(np, nk, nc, nR), Gamma(np, nk, nc, nR), rhs(np, nk, nc, nR);
+    ls_scratch ws;
     // the operator: A v = v - K_d L_s v   (L_s v with a zero external leg)
     auto apply_A = [&](tf_vector const &v, tf_vector &Av) {
-      ls_apply(b, P, S, inu, shared, Dzero, v, Gamma, Gsum, Cb_cst, st);
+      ls_apply(b, P, S, inu, shared, Dzero, v, Gamma, Gsum, Cb_cst, st, &ws);
       const double fe = kd(Gamma, Gsum, Av);
       out.fit_err_max = std::max(out.fit_err_max, fe);
-      Av.fam() = v.fam - Av.fam;
-      Av.cst() = v.cst - Av.cst;
+      const double tw = wall_now();
+      Av.sub(v, Av);
+      solve_timers_state().t_vec += wall_now() - tw;
     };
-    // rhs = K_d L_s D ; the static limit and the first iterate
-    ls_apply(b, P, S, inu, shared, Dc, y, Gamma, Gsum, Cb_cst, st);
+    // rhs = K_d L_s D ; the static limit and the first iterate (y = 0 here: L_s d, a frequency-constant input)
+    ls_apply(b, P, S, inu, shared, Dc, y, Gamma, Gsum, Cb_cst, st, &ws, true);
     out.Gsum0 = Gsum;
     out.fit_err_max = std::max(out.fit_err_max, kd(Gamma, Gsum, rhs));
-    ls_apply(b, P, S, inu, shared, Dc, rhs, Gamma, Gsum, Cb_cst, st);
+    ls_apply(b, P, S, inu, shared, Dc, rhs, Gamma, Gsum, Cb_cst, st, &ws);
     out.Gsum1 = Gsum;
     if (keep_y) { out.has_y = true; out.y1 = rhs; }
     // Gamma_1 = static + one dynamic rung on static-ladder legs = D^dag L_s K_d L_s D, which is exactly the
@@ -2920,6 +3004,7 @@ namespace dynbse {
     // skipping the ~10-25 resummation applications (5-8x cheaper). out.Gsum is set to Gsum1 so the resummed
     // slot carries a defined value (the caller logs that resummation was skipped).
     if (gamma1_only) { out.Gsum = Gsum; out.iterations = 1; out.converged = true; if (keep_y) out.y = rhs; return out; }
+    tf_vector w(np, nk, nc, nR), r(np, nk, nc, nR);
     nda::array<cplx, 1> rhs_norm2(nR), dots(nR), sc(nR);
     tf_dots(rhs, rhs, rhs_norm2, metric);
     std::vector<tf_vector> V;
@@ -2940,18 +3025,16 @@ namespace dynbse {
     nda::array<cplx, 2> Pprev(nR, nR);
     bool have_prev = false;
     auto readout_of = [&]() {
-      ls_apply(b, P, S, inu, shared, Dc, y, Gamma, Gsum, Cb_cst, st);
+      ls_apply(b, P, S, inu, shared, Dc, y, Gamma, Gsum, Cb_cst, st, &ws);
       return collapse(Dc, Gsum);
     };
     while (not done and it < maxit) {
       // r = rhs - A y   (y = 0 on the first cycle of a cold start: r = rhs without the application)
       if (it == 0 and y0 == nullptr) {
-        r.fam() = rhs.fam;
-        r.cst() = rhs.cst;
+        r.assign(rhs);
       } else {
         apply_A(y, w);
-        r.fam() = rhs.fam - w.fam;
-        r.cst() = rhs.cst - w.cst;
+        r.sub(rhs, w);
       }
       tf_dots(r, r, dots, metric);
       double rel = 0.0;
@@ -3136,7 +3219,7 @@ namespace dynbse {
     }
     out.iterations = it;
     out.converged = done;
-    ls_apply(b, P, S, inu, shared, Dc, y, Gamma, Gsum, Cb_cst, st);
+    ls_apply(b, P, S, inu, shared, Dc, y, Gamma, Gsum, Cb_cst, st, &ws);
     out.Gsum = Gsum;
     if (keep_y) out.y = y;
     return out;
