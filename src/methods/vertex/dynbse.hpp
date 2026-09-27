@@ -265,11 +265,27 @@ namespace dynbse {
         for (long i = 0; i < nt; ++i) Ut(k, i) = U(i, k);
         for (long p = 0; p < np; ++p) Vs(p, k) = VT(k, p) / sig(k);
       }
+      Utc = nda::array<cplx, 2>(n_kept, nt); Vsc = nda::array<cplx, 2>(np, n_kept); Kmatc = nda::array<cplx, 2>(nt, np);
+      for (long k = 0; k < n_kept; ++k) for (long i = 0; i < nt; ++i) Utc(k, i) = cplx(Ut(k, i));
+      for (long p = 0; p < np; ++p) for (long k = 0; k < n_kept; ++k) Vsc(p, k) = cplx(Vs(p, k));
+      for (long i = 0; i < nt; ++i) for (long p = 0; p < np; ++p) Kmatc(i, p) = cplx(Kmat(i, p));
     }
-    /** residues of tau-grid data (nt, d) -> (np, d) */
+    // complex copies of Ut / Vs / Kmat for the gemm route of coeffs / fit_error (gpu port 2026-09-27: the scalar triple loops
+    // below were ~10 % of the Sigma-side solve at Si kp444 -- d = nk nc^2 nR = 131 072 columns per refit -- single-threaded)
+    nda::array<cplx, 2> Utc, Vsc, Kmatc;
+    /** residues of tau-grid data (nt, d) -> (np, d): c = Vs (Ut F) -- two gemms for complex data (the refit of K_d), the
+     *  original loop otherwise (real data: the basis build's tables). The gemm sums in another order: rounding class. */
     nda::array<cplx, 2> coeffs(nda::MemoryArrayOfRank<2> auto const &F) const {
       const long d = F.shape(1);
       nda::array<cplx, 2> c(np, d);
+      if constexpr (std::is_same_v<nda::get_value_t<decltype(F)>, cplx>) {
+        if (Utc.size() > 0 and not vertex_debug::flag("dynbse_refit_loop")) {   // vertex_debug: dynbse_refit_loop (the old loop, A/B)
+          nda::array<cplx, 2> g(n_kept, d);
+          nda::blas::gemm(Utc, F, g);
+          nda::blas::gemm(Vsc, g, c);
+          return c;
+        }
+      }
       c() = cplx(0.0);
       for (long jd = 0; jd < d; ++jd)
         for (long k = 0; k < n_kept; ++k) {
@@ -282,6 +298,21 @@ namespace dynbse {
     double fit_error(nda::MemoryArrayOfRank<2> auto const &F, nda::array<cplx, 2> const &c) const {
       const long d = F.shape(1);
       double num = 0.0, den = 0.0;
+      if constexpr (std::is_same_v<nda::get_value_t<decltype(F)>, cplx>) {
+        if (Kmatc.size() > 0 and not vertex_debug::flag("dynbse_refit_loop")) {
+          nda::array<cplx, 2> rec(nt, d);
+          nda::blas::gemm(Kmatc, c, rec);                    // the reconstruction on the tau grid
+          auto const *pr = rec.data();
+#pragma omp parallel for reduction(max : num, den) num_threads(utils::omp_threads())
+          for (long i = 0; i < nt; ++i)
+            for (long jd = 0; jd < d; ++jd) {
+              const cplx f = F(i, jd);
+              num = std::max(num, std::abs(f - pr[i * d + jd]));
+              den = std::max(den, std::abs(f));
+            }
+          return (den > 0.0) ? num / den : num;
+        }
+      }
       for (long i = 0; i < nt; ++i)
         for (long jd = 0; jd < d; ++jd) {
           cplx rec(0.0);
@@ -991,6 +1022,49 @@ namespace dynbse {
             Fsum(ik, p / nc, p % nc, r) += sacc;
           }
     stt.t_l0_prep += wall_now() - tw_cst;          // the host-side Cb_cst term counts as prep
+  }
+
+  /** the L0 tables of one (s, q, nu) unit for the device unit engine (gpu port 4d): the pole matrices Ghat / Gtil at this inu
+   *  (l == j excluded, as both host kernels form them), f' / f'', and the shift tables at inu != 0. The returned l0_tables
+   *  point into `store` (and into b / P / st), so `store` must outlive its use. */
+  struct l0_table_store {
+    nda::array<cplx, 4> Ghat, Gtil;
+    nda::array<double, 1> fd1, fd2;
+  };
+  inline dynbse_cuda::l0_tables make_l0_tables(freq_basis const &b, pair_poles const &P, shift_tables const *st, cplx inu,
+                                               double tfold, l0_table_store &store) {
+    const long np = b.np, nk = P.nk, nc = P.nc, ng = P.ng;
+    store.Ghat = nda::array<cplx, 4>(nk, ng, nc, nc); store.Gtil = nda::array<cplx, 4>(nk, ng, nc, nc);
+    store.Ghat() = cplx(0.0); store.Gtil() = cplx(0.0);
+    for (long ik = 0; ik < nk; ++ik)
+      for (long j = 0; j < ng; ++j)
+        for (long l = 0; l < ng; ++l) {
+          if (j == l) continue;
+          const cplx w = cplx(1.0) / (cplx(P.epsG(j) - P.epsG(l)) + inu);
+          for (long x = 0; x < nc; ++x)
+            for (long y = 0; y < nc; ++y) {
+              store.Ghat(ik, j, x, y) += w * P.gkq(l, ik, y, x);
+              store.Gtil(ik, l, x, y) += w * P.gk(j, ik, y, x);
+            }
+        }
+    store.fd1 = nda::array<double, 1>(np); store.fd2 = nda::array<double, 1>(np);
+    for (long n = 0; n < np; ++n) { store.fd1(n) = b.fd[size_t(n)].f1; store.fd2(n) = b.fd[size_t(n)].f2; }
+    dynbse_cuda::l0_tables t;
+    t.gk = P.gk.data(); t.gkq = P.gkq.data(); t.Ghat = store.Ghat.data(); t.Gtil = store.Gtil.data();
+    t.eps = b.eps.data(); t.epsG = P.epsG.data(); t.gnode = P.gnode.data();
+    t.fhalf = b.fhalf.data(); t.fd1 = store.fd1.data(); t.fd2 = store.fd2.data();
+    t.Dsq = b.Dsq.data(); t.Dcb = b.Dcb.data();
+    if (inu != cplx(0.0)) {
+      utils::check(st != nullptr and st->inu == inu, "dynbse::make_l0_tables: inu != 0 needs this node's shift tables.");
+      t.Dqt = b.Dqt.data();
+      t.s1 = st->s1.data(); t.s3 = st->s3.data(); t.r1u = st->r1u.data(); t.r3u = st->r3u.data(); t.r3t = st->r3t.data();
+      t.R1U = st->R1U.data(); t.R1T = st->R1T.data(); t.R3U = st->R3U.data(); t.R3T = st->R3T.data();
+      t.tfold = tfold;
+    } else {
+      t.tfold = 0.0;
+    }
+    t.inu = inu;
+    return t;
   }
 
   /** l0_apply_cols on the device (gpu port R3, 2026-09-26): the inu = 0 twin of l0_apply_shift_cols_device. Ghat /
@@ -2808,7 +2882,9 @@ namespace dynbse {
                        bool shared, nda::array<cplx, 4> const &Dc, tf_vector const &y,
                        tf_vector &Gamma, nda::array<cplx, 4> &Gsum,
                        nda::array<cplx, 3> const *Cb_cst = nullptr, shift_tables const *st = nullptr,
-                       ls_scratch *ws = nullptr, bool y_fam_zero = false) {
+                       ls_scratch *ws = nullptr, bool y_fam_zero = false, bool want_gamma = true) {
+    // want_gamma (gpu port 4d, 2026-09-27): false when the caller reads only Gsum -- then L0 of the T_s image (whose only use
+    // is Gamma's second term) and the Gamma sum are skipped; Gsum = Fsum + Cb T_s Fsum is unchanged
     decltype(nda::range::all) all;
     auto &stt = solve_timers_state();
     const long nk = P.nk, nc = P.nc, nc2 = nc * nc, nR = y.nR, D = S.D;
@@ -2854,13 +2930,15 @@ namespace dynbse {
       nda::blas::gemm(S.Cb, cs, cb);
     }
     stt.t_ts += wall_now() - tw; tw = wall_now();
-    for (long ik = 0; ik < nk; ++ik)
-      for (long p = 0; p < nc2; ++p)
-        for (long r = 0; r < nR; ++r) Xc.cst(ik, p / nc, p % nc, r) = cs(ik * nc2 + p, r);
-    l0_apply(b, P, inu, shared, Xc, F2, F2sum, Cb_cst, st, false, true);
-    stt.t_l0 += wall_now() - tw; tw = wall_now();
-    par_add(Gamma.fam.data(), F.fam.data(), F2.fam.data(), Gamma.fam.size());
-    Gamma.cst() = cplx(0.0);
+    if (want_gamma) {
+      for (long ik = 0; ik < nk; ++ik)
+        for (long p = 0; p < nc2; ++p)
+          for (long r = 0; r < nR; ++r) Xc.cst(ik, p / nc, p % nc, r) = cs(ik * nc2 + p, r);
+      l0_apply(b, P, inu, shared, Xc, F2, F2sum, Cb_cst, st, false, true);
+      stt.t_l0 += wall_now() - tw; tw = wall_now();
+      par_add(Gamma.fam.data(), F.fam.data(), F2.fam.data(), Gamma.fam.size());
+      Gamma.cst() = cplx(0.0);
+    }
     for (long ik = 0; ik < nk; ++ik)
       for (long p = 0; p < nc2; ++p)
         for (long r = 0; r < nR; ++r)
@@ -3081,7 +3159,7 @@ namespace dynbse {
     ls_apply(b, P, S, inu, shared, Dc, y, Gamma, Gsum, Cb_cst, st, &ws, true);
     out.Gsum0 = Gsum;
     out.fit_err_max = std::max(out.fit_err_max, kd(Gamma, Gsum, rhs));
-    ls_apply(b, P, S, inu, shared, Dc, rhs, Gamma, Gsum, Cb_cst, st, &ws);
+    ls_apply(b, P, S, inu, shared, Dc, rhs, Gamma, Gsum, Cb_cst, st, &ws, false, /*want_gamma=*/false);   // only Gsum1 is read
     out.Gsum1 = Gsum;
     if (keep_y) { out.has_y = true; out.y1 = rhs; }
     // Gamma_1 = static + one dynamic rung on static-ladder legs = D^dag L_s K_d L_s D, which is exactly the

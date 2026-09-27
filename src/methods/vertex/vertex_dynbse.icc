@@ -1187,6 +1187,20 @@ namespace solvers {
       nda::array<cplx, 2> Kd0;
       std::optional<db::pair_poles> Pcache;
       std::map<long, db::shift_tables> stab_cache;         // the twisted-pair tables depend on the nu node alone
+#if defined(ENABLE_CUDA)
+      // THE DEVICE-RESIDENT UNIT (gpu port plan 4d, 2026-09-27): the Gamma_1 block -- both ls_apply's (L0, T_s through a
+      // cuSOLVER LU of 1 - Cb K_s) and K_d (the DLR expansion, the dense tau rungs, the refit) -- runs on the device with
+      // the (s, q) rung objects resident; the host uploads the external leg block and reads Gsum0 / Gsum1 (+ y1 for the
+      // Sigma deposits). Scope: the dense rung, the Gamma_1-only GMRES path, the unmasked basis, the batched L0; anything
+      // else keeps the host path. vertex_debug dynbse_dev_unit = 0 disables it (the A/B).
+      std::unique_ptr<dynbse_cuda::unit_engine, void (*)(dynbse_cuda::unit_engine *)> ue(nullptr, dynbse_cuda::ue_destroy);
+      const bool ue_want = db::l0_device_enabled() and vertex_debug::number("dynbse_dev_unit", 1.0) != 0.0 and   // vertex_debug: dynbse_dev_unit
+                           opt.dense_rung and opt.gmres_m > 0 and opt.gamma1_only and not opt.static_only and
+                           not opt.one_rung_only and db::l0_cols_state() and not b.npf_mask and
+                           not (opt.sigma != nullptr and opt.sigma->col == "dyn");
+      bool ue_tried = false;
+      db::l0_table_store ue_store;
+#endif
       if (met) { met->unit_diag = nda::array<double, 2>(nunits_all, 13); met->unit_diag() = 0.0; }
       for (long u = next_unit(pos); u >= 0; u = next_unit(pos)) {
         ++units_taken;
@@ -1339,6 +1353,21 @@ namespace solvers {
           Pcache.emplace(db::make_pair_poles(tools.beta, epsG, gk, gkq, gnode0, (gmap.size() > 0) ? &gmap : nullptr));
         }
         last_sq = sq;
+#if defined(ENABLE_CUDA)
+        if (ue_want and not ue_tried) {                   // created at the first transfer: ndist and the pole count are known
+          ue_tried = true;
+          dynbse_cuda::ue_config uc;
+          uc.np = np; uc.np_fit = b.np_fit; uc.nk = nk; uc.nc = nc; uc.ng = Pcache->ng; uc.nt = nt; uc.nR_max = nrb;
+          uc.ndist = ndist; uc.n_kept = b.pf.n_kept;
+          char why[256] = {0};
+          ue.reset(dynbse_cuda::ue_create(uc, 1.0e6 * double(utils::freemem_device_effective()), why, 256));
+          if (ue) dynbse_cuda::ue_set_basis(ue.get(), b.KF.data(), b.KF2.data(), b.pf.Ut.data(), b.pf.Vs.data(), b.pf.Kmat.data());
+          if (rank == 0)
+            app_log(1, "  [dynbse] device-resident unit: {} ({:.1f} GB estimated){}{}", ue ? "ON" : "OFF, the host path runs",
+                    dynbse_cuda::ue_bytes(uc) / 1e9, ue ? "" : " -- ", ue ? "" : why);
+        }
+        if (ue) dynbse_cuda::ue_set_rung(ue.get(), Ks.data(), Kd_s.data(), Kd0.data(), trep.data(), scale_k);
+#endif
         }                                                 // end of the (s, q) build (D-0)
         if (met) met->t_kbig += watch.lap();
         if (opt.sigma != nullptr) ++opt.sigma->nunits;
@@ -1472,6 +1501,15 @@ namespace solvers {
               S.Ts() = cplx(0.0);
             }
           } else {
+#if defined(ENABLE_CUDA)
+            if (ue) {                                    // the device LU of 1 - Cb K_s; the host resolvent is not built
+              double tfold_u = db::tfold_ratio();
+              tfold_u = vertex_debug::number("dynbse_tfold", tfold_u);
+              auto tl = db::make_l0_tables(b, P, stp, inu, tfold_u, ue_store);
+              const int info = dynbse_cuda::ue_set_unit(ue.get(), Cb_k.data(), tl, inu == cplx(0.0), 0.0);
+              utils::check(info == 0, "pair_space_ladder_dyn: the device getrf of (1 - Cb K_s) failed (info {}).", info);
+            } else
+#endif
             S = db::build_static_resolvent_from(Cb_k, Ks, opt.resolvent);
           }
           if (met) met->t_lu += watch.lap();
@@ -1500,6 +1538,23 @@ namespace solvers {
               for (long M = 0; M < nout; ++M)
                 for (long N = 0; N < nR; ++N) (*out)(jn, iq, M, N0 + N) = cplx(spinfac / double(nk)) * Pblk(M, N);
             };
+#if defined(ENABLE_CUDA)
+            if (ue) {
+              res = db::dyson_result{};
+              res.Gsum0 = nda::array<cplx, 4>(nk, nc, nc, nR);
+              res.Gsum1 = nda::array<cplx, 4>(nk, nc, nc, nR);
+              if (keep_y) { res.y1 = db::tf_vector(np, nk, nc, nR); res.has_y = true; }
+              double tim[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+              res.fit_err_max = dynbse_cuda::ue_gamma1(ue.get(), nR, Dblk.data(), res.Gsum0.data(), res.Gsum1.data(),
+                                                       keep_y ? res.y1.fam.data() : nullptr, keep_y ? res.y1.cst.data() : nullptr, tim);
+              res.Gsum = res.Gsum1; res.iterations = 1; res.converged = true;
+              if (met) {
+                met->t_l0 += tim[0]; met->t_l0_dev += tim[0]; met->t_ts += tim[1]; met->t_rung += tim[2] + tim[7];
+                met->t_refit += tim[3]; met->t_vec += tim[4]; met->t_l0_h2d += tim[5]; met->t_l0_d2h += tim[6];
+                ++met->n_apps; met->n_l0 += 3;
+              }
+            } else
+#endif
             if (opt.static_only) {
               db::tf_vector y0(np, nk, nc, nR), Gamma(np, nk, nc, nR);
               nda::array<cplx, 4> Gsum(nk, nc, nc, nR);

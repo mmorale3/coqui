@@ -104,6 +104,45 @@ namespace methods::solvers::dynbse_cuda {
    */
   long l0_apply_cols(l0_dims const &d, l0_tables const &t, cplx *Ffam, cplx *Fsum, double free_bytes);
 
+  // =====================================================================================================================
+  // THE DEVICE-RESIDENT UNIT (gpu port plan section 4d, 2026-09-27; user directive: "the gpu execution should only use
+  // the host for trivially fast things"). One engine per rank holds, ON THE DEVICE:
+  //   run-wide   the frequency basis (KF, KF2 on the tau grid, the refit maps Ut / Vs / Kmat of the active pole fit)
+  //   (s, q)     the static rung K_s, the dense dynamic rungs K_d(s_r) (PH-sym representatives) and K_d(0)
+  //   (s, q, nu) Cb_k, the LU of M = 1 - Cb K_s (cuSOLVER), the L0 tables (a resident L0 plan)
+  //   block      every tf_vector of the Gamma_1 path (X, F, F2, Gamma, y) and the tau buffers of K_d
+  // and runs the Gamma_1 block  ls_apply(D, 0) -> K_d -> ls_apply(D, y1)  without host arithmetic; the host uploads D
+  // (D x nR) and downloads Gsum0 / Gsum1 (D x nR) and, when the Sigma deposits still run on the host, y1.
+  // ALL host-facing arrays keep the host's ROW-MAJOR layouts (D = nk nc^2):
+  //   tf fam (2, np, D, nR), tf cst / Fsum / Gsum / D-block (D, nR), K_s / K_d0 (D, D), K_d(s) (ndist, D, D),
+  //   Cb_k (nk, nc^2, nc^2), KF / KF2 (nt, np), Ut (n_kept, nt), Vs (np, n_kept), Kmat (nt, np)
+  // so a device buffer can be compared bytewise with its host twin. The LU is of the row-major M's memory (= M^T in
+  // column-major terms) and every solve uses op T -- the same factorization LAPACK's getrf computes on that buffer.
+  // =====================================================================================================================
+  struct unit_engine;
+
+  struct ue_config {
+    long np = 0, np_fit = 0, nk = 0, nc = 0, ng = 0, nt = 0, nR_max = 0, ndist = 0, n_kept = 0;
+  };
+
+  /** nullptr when the device cannot hold the working set (the caller keeps the host path); `why` then says what failed */
+  unit_engine *ue_create(ue_config const &c, double free_bytes, char *why, long why_len);
+  void ue_destroy(unit_engine *e);
+  /** bytes the engine needs for a configuration (the caller's feasibility check) */
+  double ue_bytes(ue_config const &c);
+
+  /** run-wide: KF, KF2 (nt, np) real; the active refit: Ut (n_kept, nt), Vs (np, n_kept), Kmat (nt, np) real */
+  void ue_set_basis(unit_engine *e, double const *KF, double const *KF2, double const *Ut, double const *Vs, double const *Kmat);
+  /** per (s, q): K_s (D, D), K_d(s_r) (ndist, D, D), K_d(0) (D, D); trep (nt) maps a tau node to its representative */
+  void ue_set_rung(unit_engine *e, cplx const *Ks, cplx const *Kds, cplx const *Kd0, long const *trep, cplx scale_k);
+  /** per (s, q, nu): Cb_k (nk, nc^2, nc^2); the L0 tables (host pointers; Xfam / Xcst / act of t are ignored); returns the
+   *  getrf info of M = 1 - Cb K_s (0 = success). tfold and inu come in t; nu0 selects the nu = 0 kernel. */
+  int ue_set_unit(unit_engine *e, cplx const *Cbk, l0_tables const &t, bool nu0, double free_bytes);
+  /** the Gamma_1 block of width nR: Dblk (D, nR) in; Gsum0, Gsum1 (D, nR) out; y1fam (2, np, D, nR) and y1cst (D, nR)
+   *  out when non-null (the host deposits). Returns the worst tau-refit error of K_d. timing (8): [0] L0, [1] T_s,
+   *  [2] rung, [3] refit, [4] vector ops, [5] H2D, [6] D2H, [7] the DLR expansion gemm -- all ADDED, seconds. */
+  double ue_gamma1(unit_engine *e, long nR, cplx const *Dblk, cplx *Gsum0, cplx *Gsum1, cplx *y1fam, cplx *y1cst, double *timing);
+
 } // namespace methods::solvers::dynbse_cuda
 
 #endif

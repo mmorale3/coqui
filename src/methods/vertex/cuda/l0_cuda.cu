@@ -28,6 +28,8 @@
 #include <vector>
 #include <cuComplex.h>
 #include <cublas_v2.h>
+#include <cusolverDn.h>
+#include <cstring>
 #include <cuda_runtime.h>
 #include "IO/AppAbort.hpp"
 #include "methods/vertex/cuda/l0_cuda.cuh"
@@ -675,6 +677,527 @@ namespace methods::solvers::dynbse_cuda {
 
   long l0_apply_cols(l0_dims const &d, l0_tables const &t, cplx *Ffam_h, cplx *Fsum_h, double free_bytes) {
     return run_l0(d, t, Ffam_h, Fsum_h, free_bytes, true);
+  }
+
+
+  // =====================================================================================================================
+  // THE DEVICE-RESIDENT UNIT (l0_cuda.cuh, gpu port plan section 4d). Part 1: the resident L0 plan -- the kernels above,
+  // driven on DEVICE buffers with the tables uploaded once per unit and the working set allocated once per engine.
+  // =====================================================================================================================
+  namespace {
+
+    // any-nonzero flag per input component: c = 0 the constant block (cst, n elements), c = 1 + f np + a the family block
+    // (f, a) of fam (each n = D nR elements). grid = ncomp blocks.
+    __global__ void comp_flags_kernel(long np, long n, cd const *__restrict__ cst, cd const *__restrict__ fam, int *__restrict__ flags) {
+      const long c = blockIdx.x;
+      cd const *src = (c == 0) ? cst : (fam == nullptr ? nullptr : fam + (c - 1) * n);
+      __shared__ int any;
+      if (threadIdx.x == 0) any = 0;
+      __syncthreads();
+      if (src != nullptr)
+        for (long e = threadIdx.x; e < n && !any; e += blockDim.x)
+          if (nonzero(src[e])) any = 1;          // benign race: every writer writes 1
+      __syncthreads();
+      if (threadIdx.x == 0) flags[c] = any;
+      (void)np;
+    }
+    __global__ void add2_kernel(long n, cd const *__restrict__ a, cd const *__restrict__ b, cd *__restrict__ out) {
+      for (long e = blockIdx.x * long(blockDim.x) + threadIdx.x; e < n; e += long(gridDim.x) * blockDim.x) out[e] = a[e] + b[e];
+    }
+    __global__ void add_identity_kernel(long D, cd *__restrict__ M) {
+      for (long i = blockIdx.x * long(blockDim.x) + threadIdx.x; i < D; i += long(gridDim.x) * blockDim.x)
+        M[i * D + i] = M[i * D + i] + real(1.0);
+    }
+    // max |a - b| and max |a| over n elements into red[0], red[1] (non-negative doubles: the bit patterns order like the values)
+    __global__ void maxdiff_kernel(long n, cd const *__restrict__ a, cd const *__restrict__ b, unsigned long long *__restrict__ red) {
+      double num = 0.0, den = 0.0;
+      for (long e = blockIdx.x * long(blockDim.x) + threadIdx.x; e < n; e += long(gridDim.x) * blockDim.x) {
+        num = fmax(num, cuCabs(a[e] - b[e]));
+        den = fmax(den, cuCabs(a[e]));
+      }
+      atomicMax(&red[0], (unsigned long long)__double_as_longlong(num));
+      atomicMax(&red[1], (unsigned long long)__double_as_longlong(den));
+    }
+    inline unsigned grid_for(long n) { return unsigned(std::min<long>((n + 255) / 256, 65535)); }
+
+    template <typename T>
+    T *dalloc(size_t n, char const *what) {
+      T *p = nullptr;
+      cu_check(cudaMalloc(&p, std::max<size_t>(n, 1) * sizeof(T)), what);
+      return p;
+    }
+    template <typename T>
+    void h2d(T *d, T const *h, size_t n, char const *what) {
+      if (n > 0 && h != nullptr) cu_check(cudaMemcpy(d, h, n * sizeof(T), cudaMemcpyHostToDevice), what);
+    }
+    inline void h2d_c(cd *d, cplx const *h, size_t n, char const *what) { h2d(d, reinterpret_cast<cd const *>(h), n, what); }
+    inline double wnow() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+
+  } // namespace
+
+  /** the resident L0 plan: every table buffer at its maximal size (both kernels), the working set for nca_max = 1 + 2 np
+   *  components and nR_max columns, the k-batch K fixed at creation */
+  struct l0_plan {
+    long np = 0, np_fit = 0, nk = 0, nc = 0, ng = 0, nR_max = 0, nca_max = 0, K = 1;
+    bool nu0 = false;
+    cd inu = make_cuDoubleComplex(0.0, 0.0);
+    double tfold = 0.0;
+    long *dact = nullptr;
+    cd *dgk = nullptr, *dgkq = nullptr, *dGhat = nullptr, *dGtil = nullptr;
+    double *deps = nullptr, *depsG = nullptr, *dfh = nullptr, *dfd1 = nullptr, *dfd2 = nullptr;
+    long *dgn = nullptr;
+    cd *dDsq = nullptr, *dDcb = nullptr, *dDqt = nullptr, *ds1 = nullptr, *ds3 = nullptr, *dr1u = nullptr, *dr3u = nullptr,
+       *dr3t = nullptr, *dR1U = nullptr, *dR1T = nullptr, *dR3U = nullptr, *dR3T = nullptr;
+    int *derr = nullptr;
+    cd *dVt = nullptr, *dPj = nullptr, *dQj = nullptr, *dBj = nullptr, *dgjT = nullptr, *dglT = nullptr, *dGh = nullptr;
+    cd *dAU = nullptr, *dAT = nullptr, *dM2 = nullptr, *dA1 = nullptr, *dA3 = nullptr;
+    cd **pVt = nullptr, **pGjT = nullptr, **pGlT = nullptr, **pGh = nullptr, **pPj = nullptr, **pQj = nullptr, **pBj = nullptr;
+    cublasHandle_t h = nullptr;
+    // per-k bytes of the working set at (nca_max, nR_max)
+    static double per_k_bytes(long np, long nc, long ng, long nR) {
+      const long nca = 1 + 2 * np, W = nc * nca * nR * nc, blk = nc * nR * nc, asz = 2 * np * blk;
+      return double(W + 3 * ng * W + 5 * asz + 3 * ng * nc * nc) * 16.0 + double(7 * ng) * 8.0;
+    }
+    static double fixed_bytes(long np, long nk, long nc, long ng) {
+      const double nc2 = double(nc * nc);
+      return (2.0 * ng * nk * nc2 * 2.0 + 10.0 * np * np + 6.0 * np) * 16.0 + 1.0 + 2.0 * np * 8.0;
+    }
+    l0_plan(long np_, long np_fit_, long nk_, long nc_, long ng_, long nR_max_, double free_bytes)
+        : np(np_), np_fit(np_fit_), nk(nk_), nc(nc_), ng(ng_), nR_max(nR_max_), nca_max(1 + 2 * np_) {
+      const size_t nc2 = size_t(nc * nc);
+      dact = dalloc<long>(size_t(nca_max), "plan act");
+      dgk = dalloc<cd>(size_t(ng) * nk * nc2, "plan gk"); dgkq = dalloc<cd>(size_t(ng) * nk * nc2, "plan gkq");
+      dGhat = dalloc<cd>(size_t(nk) * ng * nc2, "plan Ghat"); dGtil = dalloc<cd>(size_t(nk) * ng * nc2, "plan Gtil");
+      deps = dalloc<double>(size_t(np), "plan eps"); depsG = dalloc<double>(size_t(ng), "plan epsG");
+      dfh = dalloc<double>(size_t(np), "plan fhalf"); dfd1 = dalloc<double>(size_t(np), "plan fd1"); dfd2 = dalloc<double>(size_t(np), "plan fd2");
+      dgn = dalloc<long>(size_t(ng), "plan gnode");
+      for (cd **pp : {&dDsq, &dDcb, &dDqt, &dR1U, &dR1T, &dR3U, &dR3T}) *pp = dalloc<cd>(size_t(np) * np, "plan np x np");
+      for (cd **pp : {&ds1, &ds3, &dr1u, &dr3u, &dr3t}) *pp = dalloc<cd>(size_t(np), "plan np");
+      derr = dalloc<int>(1, "plan err");
+      const long W = nc * nca_max * nR_max * nc, blk = nc * nR_max * nc;
+      const size_t asz = size_t(2 * np) * size_t(blk);
+      const double pk = per_k_bytes(np, nc, ng, nR_max);
+      K = std::max(1L, std::min(nk, long((0.85 * free_bytes - fixed_bytes(np, nk, nc, ng)) / pk)));
+      // allocate with the same halving retry as run_l0 (a shared device)
+      auto try_alloc = [&](void **p, size_t bytes) -> bool {
+        const cudaError_t e = cudaMalloc(p, std::max<size_t>(bytes, 1));
+        if (e != cudaSuccess) { (void)cudaGetLastError(); *p = nullptr; return false; }
+        return true;
+      };
+      auto free_ws = [&]() {
+        for (void **p : {(void **)&dVt, (void **)&dPj, (void **)&dQj, (void **)&dBj, (void **)&dgjT, (void **)&dglT, (void **)&dGh,
+                         (void **)&dAU, (void **)&dAT, (void **)&dM2, (void **)&dA1, (void **)&dA3, (void **)&pVt, (void **)&pGjT,
+                         (void **)&pGlT, (void **)&pGh, (void **)&pPj, (void **)&pQj, (void **)&pBj})
+          if (*p != nullptr) { (void)cudaFree(*p); *p = nullptr; }
+      };
+      bool ok = false;
+      while (true) {
+        const size_t nptr = size_t(K) * size_t(ng);
+        const size_t bW = size_t(K) * W * sizeof(cd), bP = size_t(K) * ng * W * sizeof(cd);
+        const size_t bG = size_t(K) * ng * nc2 * sizeof(cd), bA = size_t(K) * asz * sizeof(cd), bp = nptr * sizeof(cd *);
+        ok = try_alloc((void **)&dVt, bW) and try_alloc((void **)&dPj, bP) and try_alloc((void **)&dQj, bP) and
+             try_alloc((void **)&dBj, bP) and try_alloc((void **)&dgjT, bG) and try_alloc((void **)&dglT, bG) and
+             try_alloc((void **)&dGh, bG) and try_alloc((void **)&dAU, bA) and try_alloc((void **)&dAT, bA) and
+             try_alloc((void **)&dM2, bA) and try_alloc((void **)&dA1, bA) and try_alloc((void **)&dA3, bA) and
+             try_alloc((void **)&pVt, bp) and try_alloc((void **)&pGjT, bp) and try_alloc((void **)&pGlT, bp) and
+             try_alloc((void **)&pGh, bp) and try_alloc((void **)&pPj, bp) and try_alloc((void **)&pQj, bp) and
+             try_alloc((void **)&pBj, bp);
+        if (ok) break;
+        free_ws();
+        if (K == 1) break;
+        K = std::max(1L, K / 2);
+      }
+      if (not ok) APP_ABORT(std::string(" l0_plan: the L0 working set does not fit the device even at K = 1."));
+      cub_check(cublasCreate(&h), "plan cublasCreate");
+    }
+    ~l0_plan() {
+      if (h) (void)cublasDestroy(h);
+      for (void *p : {(void *)dact, (void *)dgk, (void *)dgkq, (void *)dGhat, (void *)dGtil, (void *)deps, (void *)depsG, (void *)dfh,
+                      (void *)dfd1, (void *)dfd2, (void *)dgn, (void *)dDsq, (void *)dDcb, (void *)dDqt, (void *)dR1U, (void *)dR1T,
+                      (void *)dR3U, (void *)dR3T, (void *)ds1, (void *)ds3, (void *)dr1u, (void *)dr3u, (void *)dr3t, (void *)derr,
+                      (void *)dVt, (void *)dPj, (void *)dQj, (void *)dBj, (void *)dgjT, (void *)dglT, (void *)dGh, (void *)dAU,
+                      (void *)dAT, (void *)dM2, (void *)dA1, (void *)dA3, (void *)pVt, (void *)pGjT, (void *)pGlT, (void *)pGh,
+                      (void *)pPj, (void *)pQj, (void *)pBj})
+        if (p) (void)cudaFree(p);
+    }
+    /** the unit's tables (host pointers, the layouts of l0_tables); nu0 selects the nu = 0 kernel */
+    void load(l0_tables const &t, bool nu0_) {
+      nu0 = nu0_;
+      const size_t nc2 = size_t(nc * nc);
+      h2d_c(dgk, t.gk, size_t(ng) * nk * nc2, "plan gk"); h2d_c(dgkq, t.gkq, size_t(ng) * nk * nc2, "plan gkq");
+      h2d_c(dGhat, t.Ghat, size_t(nk) * ng * nc2, "plan Ghat"); h2d_c(dGtil, t.Gtil, size_t(nk) * ng * nc2, "plan Gtil");
+      h2d(deps, t.eps, size_t(np), "plan eps"); h2d(depsG, t.epsG, size_t(ng), "plan epsG"); h2d(dgn, t.gnode, size_t(ng), "plan gnode");
+      h2d(dfh, t.fhalf, size_t(np), "plan fhalf"); h2d(dfd1, t.fd1, size_t(np), "plan fd1");
+      if (nu0) h2d(dfd2, t.fd2, size_t(np), "plan fd2");
+      h2d_c(dDsq, t.Dsq, size_t(np) * np, "plan Dsq"); h2d_c(dDcb, t.Dcb, size_t(np) * np, "plan Dcb");
+      if (not nu0) {
+        h2d_c(dDqt, t.Dqt, size_t(np) * np, "plan Dqt");
+        h2d_c(ds1, t.s1, size_t(np), "plan s1"); h2d_c(ds3, t.s3, size_t(np), "plan s3");
+        h2d_c(dr1u, t.r1u, size_t(np), "plan r1u"); h2d_c(dr3u, t.r3u, size_t(np), "plan r3u"); h2d_c(dr3t, t.r3t, size_t(np), "plan r3t");
+        h2d_c(dR1U, t.R1U, size_t(np) * np, "plan R1U"); h2d_c(dR1T, t.R1T, size_t(np) * np, "plan R1T");
+        h2d_c(dR3U, t.R3U, size_t(np) * np, "plan R3U"); h2d_c(dR3T, t.R3T, size_t(np) * np, "plan R3T");
+      }
+      inu = make_cuDoubleComplex(t.inu.real(), t.inu.imag());
+      tfold = t.tfold;
+    }
+    /** F = L0 X on DEVICE buffers (F, Fs overwritten); act_h = the active components (host), sum_part1 as l0_tables */
+    void apply(long nR, long nca, long const *act_h, bool skip_cst, bool sum_part1, cd const *Xfam, cd const *Xcst, cd *F, cd *Fs) {
+      const long nc2 = nc * nc, D = nk * nc2;
+      const size_t nF = size_t(2 * np) * D * nR, nFs = size_t(D) * nR;
+      cu_check(cudaMemset(F, 0, nF * sizeof(cd)), "plan memset F");
+      cu_check(cudaMemset(Fs, 0, nFs * sizeof(cd)), "plan memset Fs");
+      if (nca == 0) return;                                        // nothing to apply: F and Fs are zero
+      if (nca > (nu0 ? 1 + np : 1 + 2 * np)) APP_ABORT(std::string(" l0_plan::apply: too many active components."));
+      h2d(dact, act_h, size_t(nca), "plan act");
+      kdims kd{nc, nR, np, ng, nca, nc * nR * nc, nk, np_fit, dact};
+      const long blk = nc * nR * nc, W = nc * nca * nR * nc;
+      const size_t asz = size_t(2 * np) * size_t(blk);
+      const size_t nptr = size_t(K) * size_t(ng);
+      fill_ptrs<<<unsigned((nptr + 255) / 256), 256>>>(K, ng, W, nc2, dVt, dgjT, dglT, dGh, dPj, dQj, dBj,
+                                                       pVt, pGjT, pGlT, pGh, pPj, pQj, pBj);
+      launch_check("plan fill_ptrs");
+      cu_check(cudaMemset(derr, 0, sizeof(int)), "plan memset err");
+      const cd one = make_cuDoubleComplex(1.0, 0.0), zero = make_cuDoubleComplex(0.0, 0.0);
+      const int Ncols = int(nca * nR * nc), Mrows = int(nc * nca * nR);
+      for (long ik0 = 0; ik0 < nk; ik0 += K) {
+        const long Kb = std::min(K, nk - ik0);
+        const int nb = int(Kb * ng);
+        for (cd *p : {dAU, dAT, dM2, dA1, dA3}) cu_check(cudaMemset(p, 0, size_t(Kb) * asz * sizeof(cd)), "plan memset acc");
+        pack_kernel<<<dim3(64u, unsigned(Kb), 1u), 256>>>(kd, ik0, Kb, nu0, Xfam, Xcst, dVt);
+        launch_check("plan pack_kernel");
+        poleT_kernel<<<dim3(32u, unsigned(Kb), 1u), 256>>>(kd, ik0, Kb, dgk, true, false, dgjT);
+        poleT_kernel<<<dim3(32u, unsigned(Kb), 1u), 256>>>(kd, ik0, Kb, dgkq, true, false, dglT);
+        poleT_kernel<<<dim3(32u, unsigned(Kb), 1u), 256>>>(kd, ik0, Kb, dGhat, false, true, dGh);
+        launch_check("plan poleT_kernel");
+        cub_check(cublasZgemmBatched(h, CUBLAS_OP_N, CUBLAS_OP_N, Ncols, int(nc), int(nc), &one,
+                                     (const cd **)pVt, Ncols, (const cd **)pGjT, int(nc), &zero, pPj, Ncols, nb), "plan gemm Pj");
+        cub_check(cublasZgemmBatched(h, CUBLAS_OP_N, CUBLAS_OP_N, int(nc), Mrows, int(nc), &one,
+                                     (const cd **)pGh, int(nc), (const cd **)pPj, int(nc), &zero, pQj, int(nc), nb), "plan gemm Qj");
+        cub_check(cublasZgemmBatched(h, CUBLAS_OP_N, CUBLAS_OP_N, int(nc), Mrows, int(nc), &one,
+                                     (const cd **)pGlT, int(nc), (const cd **)pPj, int(nc), &zero, pBj, int(nc), nb), "plan gemm Bj");
+        if (nu0)
+          scatter_nu0_kernel<<<dim3(unsigned(nca), unsigned(Kb), 1u), 256>>>(kd, Kb, 0, skip_cst, dQj, dBj, deps, depsG, dgn, dAU, dM2, dA3);
+        else
+          scatter_kernel<<<dim3(unsigned(nca), unsigned(Kb), 1u), 256>>>(kd, Kb, 0, inu, skip_cst, dQj, dBj, deps, depsG, dgn,
+                                                                         dAU, dAT, dM2, dA1, dA3);
+        launch_check("plan scatter pass 0");
+        poleT_kernel<<<dim3(32u, unsigned(Kb), 1u), 256>>>(kd, ik0, Kb, dGtil, false, true, dGh);
+        launch_check("plan poleT_kernel Gtil");
+        cub_check(cublasZgemmBatched(h, CUBLAS_OP_N, CUBLAS_OP_N, Ncols, int(nc), int(nc), &one,
+                                     (const cd **)pVt, Ncols, (const cd **)pGh, int(nc), &zero, pPj, Ncols, nb), "plan gemm Pl");
+        cub_check(cublasZgemmBatched(h, CUBLAS_OP_N, CUBLAS_OP_N, int(nc), Mrows, int(nc), &one,
+                                     (const cd **)pGlT, int(nc), (const cd **)pPj, int(nc), &zero, pQj, int(nc), nb), "plan gemm Rl");
+        if (nu0)
+          scatter_nu0_kernel<<<dim3(unsigned(nca), unsigned(Kb), 1u), 256>>>(kd, Kb, 1, skip_cst, dQj, dQj, deps, depsG, dgn, dAU, dM2, dA3);
+        else
+          scatter_kernel<<<dim3(unsigned(nca), unsigned(Kb), 1u), 256>>>(kd, Kb, 1, inu, skip_cst, dQj, dQj, deps, depsG, dgn,
+                                                                         dAU, dAT, dM2, dA1, dA3);
+        launch_check("plan scatter pass 1");
+        if (nu0)
+          assemble_nu0_kernel<<<dim3(unsigned(np), unsigned(Kb), 1u), 256>>>(kd, ik0, Kb, sum_part1, dfh, dfd1, dfd2, dDsq, dDcb,
+                                                                             dAU, dM2, dA3, F, Fs, derr);
+        else
+          assemble_kernel<<<dim3(unsigned(np), 2u, unsigned(Kb)), 256>>>(kd, ik0, Kb, sum_part1, dfh, dfd1, dDsq, ds1, ds3, dr1u,
+                                                                         dr3u, dr3t, dR1U, dR1T, dR3U, dR3T, dAU, dAT, dM2, dA1, dA3,
+                                                                         F, Fs, derr);
+        launch_check("plan assemble_kernel");
+        if (tfold > 0.0 && !nu0) {
+          tfold_kernel<<<dim3(unsigned(np), unsigned(Kb), 1u), 256>>>(kd, ik0, Kb, inu, tfold, deps, dDsq, dDcb, dDqt, F);
+          launch_check("plan tfold_kernel");
+        }
+      }
+      int err = 0;
+      cu_check(cudaMemcpy(&err, derr, sizeof(int), cudaMemcpyDeviceToHost), "plan err");
+      if (err != 0) APP_ABORT(std::string(" l0_plan::apply: a confluent product at a node outside the DLR set."));
+    }
+  };
+
+  // ---- Part 2: the engine (l0_cuda.cuh). Column-major cuBLAS on the host's ROW-MAJOR memory: a row-major (r x c) block is the
+  // column-major (c x r) transpose, so the host's C = A B is issued as C^T = B^T A^T on the same buffers.
+  struct unit_engine {
+    ue_config c;
+    long D = 0, nc2 = 0;
+    cublasHandle_t cb = nullptr;
+    cusolverDnHandle_t cs = nullptr;
+    cd *KF = nullptr, *KF2 = nullptr, *Ut = nullptr, *Vs = nullptr, *Kmat = nullptr;                // basis (complex)
+    cd *Ks = nullptr, *Kds = nullptr, *Kd0 = nullptr;                                               // (s, q)
+    std::vector<long> trep;
+    cd scale = make_cuDoubleComplex(1.0, 0.0);
+    cd *Cbk = nullptr, *M = nullptr, *work = nullptr;                                               // (s, q, nu)
+    int *ipiv = nullptr, *dinfo = nullptr, lwork = 0;
+    bool nu0 = false, unit_ok = false;
+    cd *Xcst = nullptr, *Ffam = nullptr, *Fsum = nullptr, *F2fam = nullptr, *F2sum = nullptr, *Gfam = nullptr, *Gsum = nullptr;
+    cd *yfam = nullptr, *ycst = nullptr, *Dblk = nullptr, *Y = nullptr, *csb = nullptr, *cbb = nullptr;
+    cd *Fs = nullptr, *Ys = nullptr, *g = nullptr, *coef = nullptr, *rec = nullptr;
+    cd **pA = nullptr, **pB = nullptr, **pC = nullptr;
+    int *flags = nullptr;
+    unsigned long long *red = nullptr;
+    l0_plan *l0 = nullptr;
+    std::vector<int> hflags;
+  };
+
+  double ue_bytes(ue_config const &c) {
+    const double D = double(c.nk * c.nc * c.nc), W = D * double(c.nR_max), np = double(c.np);
+    const double fam = 2.0 * np * W, cst = W;
+    double b = 0.0;
+    b += (3.0 + double(c.ndist)) * D * D;                                   // K_s, K_d0, M, K_d(s_r)
+    b += 3.0 * fam + 6.0 * cst + D * double(c.nR_max);                      // Ffam, F2fam, Gfam, yfam (y is one of them) + csts + Y
+    b += fam;                                                               // yfam
+    b += 2.0 * double(c.nt) * W + double(c.nt) * W + double(c.n_kept) * W + np * W;   // Fs, Ys, rec, g, coef
+    b += double(c.nk * c.nc * c.nc * c.nc * c.nc);                          // Cb_k
+    b *= 16.0;
+    b += l0_plan::fixed_bytes(c.np, c.nk, c.nc, c.ng) + l0_plan::per_k_bytes(c.np, c.nc, c.ng, c.nR_max);   // L0 at K = 1
+    return b * 1.05 + 512.0e6;                                              // cuSOLVER / cuBLAS workspaces
+  }
+
+  unit_engine *ue_create(ue_config const &c, double free_bytes, char *why, long why_len) {
+    const double need = ue_bytes(c);
+    if (need > 0.9 * free_bytes) {
+      std::snprintf(why, size_t(why_len), "needs %.1f GB of device memory, %.1f GB free", need / 1e9, free_bytes / 1e9);
+      return nullptr;
+    }
+    auto *e = new unit_engine;
+    e->c = c;
+    e->nc2 = c.nc * c.nc;
+    e->D = c.nk * e->nc2;
+    const size_t D = size_t(e->D), W = D * size_t(c.nR_max), np = size_t(c.np), nt = size_t(c.nt);
+    cub_check(cublasCreate(&e->cb), "ue cublasCreate");
+    if (cusolverDnCreate(&e->cs) != CUSOLVER_STATUS_SUCCESS) APP_ABORT(std::string(" ue_create: cusolverDnCreate failed."));
+    e->KF = dalloc<cd>(nt * np, "ue KF"); e->KF2 = dalloc<cd>(nt * np, "ue KF2");
+    e->Ut = dalloc<cd>(size_t(c.n_kept) * nt, "ue Ut"); e->Vs = dalloc<cd>(np * size_t(c.n_kept), "ue Vs");
+    e->Kmat = dalloc<cd>(nt * np, "ue Kmat");
+    e->Ks = dalloc<cd>(D * D, "ue Ks"); e->Kd0 = dalloc<cd>(D * D, "ue Kd0");
+    e->Kds = dalloc<cd>(size_t(c.ndist) * D * D, "ue Kds");
+    e->Cbk = dalloc<cd>(size_t(c.nk) * e->nc2 * e->nc2, "ue Cbk"); e->M = dalloc<cd>(D * D, "ue M");
+    e->ipiv = dalloc<int>(D, "ue ipiv"); e->dinfo = dalloc<int>(1, "ue info");
+    if (cusolverDnZgetrf_bufferSize(e->cs, int(D), int(D), e->M, int(D), &e->lwork) != CUSOLVER_STATUS_SUCCESS)
+      APP_ABORT(std::string(" ue_create: getrf_bufferSize failed."));
+    e->work = dalloc<cd>(size_t(std::max(e->lwork, 1)), "ue getrf work");
+    for (cd **pp : {&e->Ffam, &e->F2fam, &e->Gfam, &e->yfam}) *pp = dalloc<cd>(2 * np * W, "ue fam");
+    for (cd **pp : {&e->Xcst, &e->Fsum, &e->F2sum, &e->Gsum, &e->ycst, &e->Dblk, &e->Y, &e->csb, &e->cbb}) *pp = dalloc<cd>(W, "ue cst");
+    e->Fs = dalloc<cd>(nt * W, "ue Fs"); e->Ys = dalloc<cd>(nt * W, "ue Ys"); e->rec = dalloc<cd>(nt * W, "ue rec");
+    e->g = dalloc<cd>(size_t(c.n_kept) * W, "ue g"); e->coef = dalloc<cd>(np * W, "ue coef");
+    e->pA = dalloc<cd *>(nt, "ue pA"); e->pB = dalloc<cd *>(nt, "ue pB"); e->pC = dalloc<cd *>(nt, "ue pC");
+    e->flags = dalloc<int>(1 + 2 * np, "ue flags"); e->hflags.assign(1 + 2 * np, 0);
+    e->red = dalloc<unsigned long long>(2, "ue red");
+    size_t fr = 0, tot = 0;
+    cu_check(cudaMemGetInfo(&fr, &tot), "ue memgetinfo");
+    e->l0 = new l0_plan(c.np, c.np_fit, c.nk, c.nc, c.ng, c.nR_max, double(fr));
+    return e;
+  }
+
+  void ue_destroy(unit_engine *e) {
+    if (e == nullptr) return;
+    delete e->l0;
+    if (e->cb) (void)cublasDestroy(e->cb);
+    if (e->cs) (void)cusolverDnDestroy(e->cs);
+    for (void *p : {(void *)e->KF, (void *)e->KF2, (void *)e->Ut, (void *)e->Vs, (void *)e->Kmat, (void *)e->Ks, (void *)e->Kds,
+                    (void *)e->Kd0, (void *)e->Cbk, (void *)e->M, (void *)e->work, (void *)e->ipiv, (void *)e->dinfo, (void *)e->Xcst,
+                    (void *)e->Ffam, (void *)e->Fsum, (void *)e->F2fam, (void *)e->F2sum, (void *)e->Gfam, (void *)e->Gsum,
+                    (void *)e->yfam, (void *)e->ycst, (void *)e->Dblk, (void *)e->Y, (void *)e->csb, (void *)e->cbb, (void *)e->Fs,
+                    (void *)e->Ys, (void *)e->g, (void *)e->coef, (void *)e->rec, (void *)e->pA, (void *)e->pB, (void *)e->pC,
+                    (void *)e->flags, (void *)e->red})
+      if (p) (void)cudaFree(p);
+    delete e;
+  }
+
+  void ue_set_basis(unit_engine *e, double const *KFh, double const *KF2h, double const *Uth, double const *Vsh, double const *Kmath) {
+    auto up = [](cd *d, double const *h, size_t n, char const *what) {
+      std::vector<cd> v(n);
+      for (size_t i = 0; i < n; ++i) v[i] = make_cuDoubleComplex(h[i], 0.0);
+      h2d(d, v.data(), n, what);
+    };
+    const size_t nt = size_t(e->c.nt), np = size_t(e->c.np), nk_ = size_t(e->c.n_kept);
+    up(e->KF, KFh, nt * np, "ue KF"); up(e->KF2, KF2h, nt * np, "ue KF2");
+    up(e->Ut, Uth, nk_ * nt, "ue Ut"); up(e->Vs, Vsh, np * nk_, "ue Vs"); up(e->Kmat, Kmath, nt * np, "ue Kmat");
+  }
+
+  void ue_set_rung(unit_engine *e, cplx const *Ksh, cplx const *Kdsh, cplx const *Kd0h, long const *treph, cplx scale_k) {
+    const size_t D = size_t(e->D);
+    h2d_c(e->Ks, Ksh, D * D, "ue Ks"); h2d_c(e->Kd0, Kd0h, D * D, "ue Kd0");
+    h2d_c(e->Kds, Kdsh, size_t(e->c.ndist) * D * D, "ue Kds");
+    e->trep.assign(treph, treph + e->c.nt);
+    e->scale = make_cuDoubleComplex(scale_k.real(), scale_k.imag());
+    e->unit_ok = false;
+  }
+
+  int ue_set_unit(unit_engine *e, cplx const *Cbkh, l0_tables const &t, bool nu0, double free_bytes) {
+    (void)free_bytes;
+    const long D = e->D, nc2 = e->nc2, nk = e->c.nk;
+    h2d_c(e->Cbk, Cbkh, size_t(nk) * nc2 * nc2, "ue Cbk");
+    e->l0->load(t, nu0);
+    e->nu0 = nu0;
+    // M = 1 - Cb K_s, one block row per k: (M_k)^T (D x nc2) = -(K_s rows of k)^T (D x nc2) . Cb_k^T (nc2 x nc2)
+    const cd mone = make_cuDoubleComplex(-1.0, 0.0), zero = make_cuDoubleComplex(0.0, 0.0);
+    cub_check(cublasZgemmStridedBatched(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(D), int(nc2), int(nc2), &mone,
+                                        e->Ks, int(D), (long long)(nc2 * D), e->Cbk, int(nc2), (long long)(nc2 * nc2), &zero,
+                                        e->M, int(D), (long long)(nc2 * D), int(nk)), "ue M = -Cb Ks");
+    add_identity_kernel<<<grid_for(D), 256>>>(D, e->M);
+    launch_check("ue add_identity");
+    // the LU of the memory (column-major M^T): LAPACK's getrf on the host buffer computes the same factorization
+    if (cusolverDnZgetrf(e->cs, int(D), int(D), e->M, int(D), e->work, e->ipiv, e->dinfo) != CUSOLVER_STATUS_SUCCESS)
+      APP_ABORT(std::string(" ue_set_unit: cusolverDnZgetrf failed."));
+    int info = 0;
+    cu_check(cudaMemcpy(&info, e->dinfo, sizeof(int), cudaMemcpyDeviceToHost), "ue getrf info");
+    e->unit_ok = (info == 0);
+    return info;
+  }
+
+  namespace {
+    // the active component list of an L0 input (the host kernels' P-3a scan): flags over (cst, fam) on the device, the
+    // list on the host. nu0: component 1 + a is the FOLDED family (fam0 or fam1 of node a non-zero).
+    long ue_active(unit_engine *e, long nR, cd const *cst, cd const *fam, std::vector<long> &act) {
+      const long np = e->c.np, n = e->D * nR, ncomp = (fam == nullptr) ? 1 : 1 + 2 * np;
+      comp_flags_kernel<<<unsigned(ncomp), 256>>>(np, n, cst, fam, e->flags);
+      launch_check("ue comp_flags");
+      cu_check(cudaMemcpy(e->hflags.data(), e->flags, size_t(ncomp) * sizeof(int), cudaMemcpyDeviceToHost), "ue flags");
+      act.clear();
+      if (e->hflags[0]) act.push_back(0);
+      if (fam != nullptr) {
+        if (e->nu0) {
+          for (long a = 0; a < np; ++a) if (e->hflags[size_t(1 + a)] or e->hflags[size_t(1 + np + a)]) act.push_back(1 + a);
+        } else {
+          for (long c = 1; c < 1 + 2 * np; ++c) if (e->hflags[size_t(c)]) act.push_back(c);
+        }
+      }
+      return long(act.size());
+    }
+    // Fsum_k (nc2 x nR) (+)= Cb_k (nc2 x nc2) . X_k (nc2 x nR) for every k (row-major blocks of D x nR)
+    void ue_cb_times(unit_engine *e, long nR, cd const *X, cd *out, bool accumulate) {
+      const long nc2 = e->nc2, nk = e->c.nk;
+      const cd one = make_cuDoubleComplex(1.0, 0.0), beta = make_cuDoubleComplex(accumulate ? 1.0 : 0.0, 0.0);
+      cub_check(cublasZgemmStridedBatched(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(nR), int(nc2), int(nc2), &one,
+                                          X, int(nR), (long long)(nc2 * nR), e->Cbk, int(nc2), (long long)(nc2 * nc2), &beta,
+                                          out, int(nR), (long long)(nc2 * nR), int(nk)), "ue Cb . X");
+    }
+    // L0 of (fam, cst) into (F, Fs), then the constant part's frequency sum through Cb (the production Cb_cst route)
+    void ue_l0(unit_engine *e, long nR, cd const *fam, cd const *cst, cd *F, cd *Fs, double *tl0) {
+      std::vector<long> act;
+      const double t0 = wnow();
+      const long nca = ue_active(e, nR, cst, fam, act);
+      const bool anyc = (not act.empty() and act[0] == 0);
+      e->l0->apply(nR, nca, act.data(), not anyc, false, fam, cst, F, Fs);
+      if (anyc) ue_cb_times(e, nR, cst, Fs, true);
+      cu_check(cudaDeviceSynchronize(), "ue l0");
+      *tl0 += wnow() - t0;
+    }
+    // c = T_s Fs = K_s M^-1 Fs (into csb), cb = Cb c (into cbb)
+    void ue_ts(unit_engine *e, long nR, cd const *Fs, double *tts) {
+      const double t0 = wnow();
+      const long D = e->D;
+      const cd one = make_cuDoubleComplex(1.0, 0.0), zero = make_cuDoubleComplex(0.0, 0.0);
+      cub_check(cublasZgeam(e->cb, CUBLAS_OP_T, CUBLAS_OP_N, int(D), int(nR), &one, Fs, int(nR), &zero, e->Y, int(D), e->Y, int(D)),
+                "ue transpose Fs");
+      if (cusolverDnZgetrs(e->cs, CUBLAS_OP_T, int(D), int(nR), e->M, int(D), e->ipiv, e->Y, int(D), e->dinfo) != CUSOLVER_STATUS_SUCCESS)
+        APP_ABORT(std::string(" ue_ts: cusolverDnZgetrs failed."));
+      cub_check(cublasZgemm(e->cb, CUBLAS_OP_T, CUBLAS_OP_N, int(nR), int(D), int(D), &one, e->Y, int(D), e->Ks, int(D), &zero,
+                            e->csb, int(nR)), "ue K_s z");
+      ue_cb_times(e, nR, e->csb, e->cbb, false);
+      cu_check(cudaDeviceSynchronize(), "ue ts");
+      *tts += wnow() - t0;
+    }
+    // y = K_d(Gamma, Gsum): the families to tau (DLR), the dense rung per tau node, the refit, the constant part. Returns the
+    // worst refit error (the host's max over families of max|Ys - rec| / max|Ys|).
+    double ue_kd(unit_engine *e, long nR, cd const *Gfam, cd const *Gs, cd *yfam, cd *ycst, double *tim) {
+      const long D = e->D, np = e->c.np, nt = e->c.nt, nk_ = e->c.n_kept, W = D * nR;
+      const cd one = make_cuDoubleComplex(1.0, 0.0), zero = make_cuDoubleComplex(0.0, 0.0);
+      const cd mscale = make_cuDoubleComplex(-e->scale.x, -e->scale.y);
+      double fe = 0.0;
+      cu_check(cudaMemset(yfam, 0, size_t(2 * np) * W * sizeof(cd)), "ue memset y");
+      const long nfam = e->nu0 ? 1 : 2;
+      for (long fam = 0; fam < nfam; ++fam) {
+        double t0 = wnow();
+        // Fs^T (W x nt) = fam^T (W x np) . KF^T (np x nt)   [+ fam1 . KF2 at nu = 0]
+        for (long ff = fam; ff < (e->nu0 ? 2 : fam + 1); ++ff) {
+          const cd beta = (ff == fam) ? zero : one;
+          cd const *KFx = (ff == 1 and e->nu0) ? e->KF2 : e->KF;
+          cub_check(cublasZgemm(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(W), int(nt), int(np), &one, Gfam + size_t(ff) * np * W, int(W),
+                                KFx, int(np), &beta, e->Fs, int(W)), "ue Fs = KF fam");
+        }
+        cu_check(cudaDeviceSynchronize(), "ue dlr");
+        tim[7] += wnow() - t0; t0 = wnow();
+        // the dense rung: Ys_i^T (nR x D) = scale Fs_i^T (nR x D) . K_d(rep_i)^T (D x D)
+        std::vector<cd *> hA(size_t(nt)), hB(size_t(nt)), hC(size_t(nt));
+        for (long i = 0; i < nt; ++i) {
+          hA[size_t(i)] = e->Fs + size_t(i) * W;
+          hB[size_t(i)] = e->Kds + size_t(e->trep[size_t(i)]) * size_t(D) * size_t(D);
+          hC[size_t(i)] = e->Ys + size_t(i) * W;
+        }
+        h2d(e->pA, hA.data(), size_t(nt), "ue pA"); h2d(e->pB, hB.data(), size_t(nt), "ue pB"); h2d(e->pC, hC.data(), size_t(nt), "ue pC");
+        cub_check(cublasZgemmBatched(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(nR), int(D), int(D), &e->scale, (const cd **)e->pA, int(nR),
+                                     (const cd **)e->pB, int(D), &zero, e->pC, int(nR), int(nt)), "ue rung");
+        cu_check(cudaDeviceSynchronize(), "ue rung");
+        tim[2] += wnow() - t0; t0 = wnow();
+        // the refit: g^T = Ys^T Ut^T, c^T = g^T Vs^T, rec^T = c^T Kmat^T; err = max|Ys - rec| / max|Ys|
+        cub_check(cublasZgemm(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(W), int(nk_), int(nt), &one, e->Ys, int(W), e->Ut, int(nt), &zero,
+                              e->g, int(W)), "ue g");
+        cub_check(cublasZgemm(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(W), int(np), int(nk_), &one, e->g, int(W), e->Vs, int(nk_), &zero,
+                              e->coef, int(W)), "ue coef");
+        cub_check(cublasZgemm(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(W), int(nt), int(np), &one, e->coef, int(W), e->Kmat, int(np), &zero,
+                              e->rec, int(W)), "ue rec");
+        cu_check(cudaMemset(e->red, 0, 2 * sizeof(unsigned long long)), "ue red");
+        maxdiff_kernel<<<grid_for(nt * W), 256>>>(nt * W, e->Ys, e->rec, e->red);
+        launch_check("ue maxdiff");
+        unsigned long long r[2] = {0, 0};
+        cu_check(cudaMemcpy(r, e->red, sizeof(r), cudaMemcpyDeviceToHost), "ue red d2h");
+        double num = 0.0, den = 0.0;
+        std::memcpy(&num, &r[0], sizeof(double)); std::memcpy(&den, &r[1], sizeof(double));
+        fe = std::max(fe, (den > 0.0) ? num / den : num);
+        // the scatter: y.fam(fam, p < np_fit) = c(p): the same row-major layout, one copy
+        cu_check(cudaMemcpy(yfam + size_t(fam) * np * W, e->coef, size_t(e->c.np_fit) * W * sizeof(cd), cudaMemcpyDeviceToDevice), "ue scatter");
+        cu_check(cudaDeviceSynchronize(), "ue refit");
+        tim[3] += wnow() - t0;
+      }
+      // the constant part: y.cst = -scale K_d(0) Gsum
+      const double t0 = wnow();
+      cub_check(cublasZgemm(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(nR), int(D), int(D), &mscale, Gs, int(nR), e->Kd0, int(D), &zero,
+                            ycst, int(nR)), "ue y.cst");
+      cu_check(cudaDeviceSynchronize(), "ue kd0");
+      tim[2] += wnow() - t0;
+      return fe;
+    }
+  } // namespace
+
+  double ue_gamma1(unit_engine *e, long nR, cplx const *Dblkh, cplx *Gsum0h, cplx *Gsum1h, cplx *y1famh, cplx *y1csth, double *tim) {
+    if (not e->unit_ok) APP_ABORT(std::string(" ue_gamma1: the unit's LU failed or was not set."));
+    if (nR > e->c.nR_max) APP_ABORT(std::string(" ue_gamma1: block wider than the engine's nR_max."));
+    const long D = e->D, np = e->c.np, W = D * nR;
+    double t0 = wnow();
+    h2d_c(e->Dblk, Dblkh, size_t(W), "ue Dblk");
+    tim[5] += wnow() - t0;
+    // ---- ls_apply(D, y = 0): F = L0 D, c = T_s Fsum, Gamma = F + L0 c, Gsum = Fsum + Cb c
+    ue_l0(e, nR, nullptr, e->Dblk, e->Ffam, e->Fsum, &tim[0]);
+    ue_ts(e, nR, e->Fsum, &tim[1]);
+    ue_l0(e, nR, nullptr, e->csb, e->F2fam, e->F2sum, &tim[0]);
+    t0 = wnow();
+    add2_kernel<<<grid_for(2 * np * W), 256>>>(2 * np * W, e->Ffam, e->F2fam, e->Gfam);
+    add2_kernel<<<grid_for(W), 256>>>(W, e->Fsum, e->cbb, e->Gsum);
+    launch_check("ue gamma");
+    cu_check(cudaDeviceSynchronize(), "ue gamma");
+    tim[4] += wnow() - t0; t0 = wnow();
+    cu_check(cudaMemcpy(Gsum0h, e->Gsum, size_t(W) * sizeof(cd), cudaMemcpyDeviceToHost), "ue Gsum0");
+    tim[6] += wnow() - t0;
+    // ---- y1 = K_d(Gamma, Gsum)
+    const double fe = ue_kd(e, nR, e->Gfam, e->Gsum, e->yfam, e->ycst, tim);
+    // ---- ls_apply(D, y1): only Gsum1 = Fsum + Cb T_s Fsum is read by the Gamma_1 output (its Gamma is not), so the
+    // second L0 (on the T_s image) is skipped
+    t0 = wnow();
+    add2_kernel<<<grid_for(W), 256>>>(W, e->Dblk, e->ycst, e->Xcst);
+    launch_check("ue X.cst");
+    cu_check(cudaDeviceSynchronize(), "ue xcst");
+    tim[4] += wnow() - t0;
+    ue_l0(e, nR, e->yfam, e->Xcst, e->Ffam, e->Fsum, &tim[0]);
+    ue_ts(e, nR, e->Fsum, &tim[1]);
+    t0 = wnow();
+    add2_kernel<<<grid_for(W), 256>>>(W, e->Fsum, e->cbb, e->Gsum);
+    launch_check("ue gsum1");
+    cu_check(cudaDeviceSynchronize(), "ue gsum1");
+    tim[4] += wnow() - t0; t0 = wnow();
+    cu_check(cudaMemcpy(Gsum1h, e->Gsum, size_t(W) * sizeof(cd), cudaMemcpyDeviceToHost), "ue Gsum1");
+    if (y1famh != nullptr) cu_check(cudaMemcpy(y1famh, e->yfam, size_t(2 * np) * W * sizeof(cd), cudaMemcpyDeviceToHost), "ue y1 fam");
+    if (y1csth != nullptr) cu_check(cudaMemcpy(y1csth, e->ycst, size_t(W) * sizeof(cd), cudaMemcpyDeviceToHost), "ue y1 cst");
+    tim[6] += wnow() - t0;
+    return fe;
   }
 
 } // namespace methods::solvers::dynbse_cuda
