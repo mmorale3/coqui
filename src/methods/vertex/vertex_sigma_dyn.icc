@@ -837,8 +837,8 @@ namespace solvers {
     };
     /** the run-wide tables to the engine (runs sigma_dyn_precompute first); false (why) = the device cannot hold the accumulators */
     inline bool sigma_dyn_device_init(sigma_dyn_hook &h, sigma_dyn_dev &d, dynbse_cuda::unit_engine *ue, dynbse::freq_basis const &b,
-                                      nda::MemoryArrayOfRank<5> auto const &G_CC, dynbse::pair_poles const &P, long Nm,
-                                      vertex_pi::iaft_tools const &tools, std::string &why) {
+                                      nda::MemoryArrayOfRank<5> auto const &G_CC, long nk_p, long nc_p, long ng,
+                                      nda::array<double, 1> const &epsG, long Nm, vertex_pi::iaft_tools const &tools, std::string &why) {
       using cplx = ComplexType;
       if (not h.pre_ok) sigma_dyn_precompute(h, b, G_CC, tools);
       const long nt = G_CC.shape(0), ns = G_CC.shape(1), nk = G_CC.shape(2), nc = G_CC.shape(3), np = b.np, nw_f = h.Gw.shape(0);
@@ -848,11 +848,10 @@ namespace solvers {
       nda::array<cplx, 2> Ttw(tools.ft->Ttw_ff());
       utils::check(Ttw.shape(0) == nt and Ttw.shape(1) == nw_f, "sigma_dyn_device_init: Ttw_ff is ({}, {}), expected ({}, {}).",
                    Ttw.shape(0), Ttw.shape(1), nt, nw_f);
-      utils::check(P.nk == nk and P.nc == nc, "sigma_dyn_device_init: the pair poles' (nk, nc) differ from G's.");
+      utils::check(nk_p == nk and nc_p == nc and epsG.shape(0) == ng, "sigma_dyn_device_init: the pair sizes differ from G's.");
       dynbse_cuda::sd_config c;
-      c.nt = nt; c.nw_f = nw_f; c.ns = ns; c.nk = nk; c.nc = nc; c.np = np; c.np_fit = b.np_fit; c.ng = P.ng; c.Nm = Nm;
+      c.nt = nt; c.nw_f = nw_f; c.ns = ns; c.nk = nk; c.nc = nc; c.np = np; c.np_fit = b.np_fit; c.ng = ng; c.Nm = Nm;
       char buf[256] = {0};
-      nda::array<double, 1> epsG(P.epsG);
       d.on = dynbse_cuda::ue_sd_init(ue, c, Ttw.data(), Uw.data(), h.Gw.data(), b.eps.data(), epsG.data(),
                                      1.0e6 * double(utils::freemem_device_effective()), buf, 256);
       why = buf;

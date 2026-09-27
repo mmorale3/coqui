@@ -1206,6 +1206,7 @@ namespace solvers {
       db::l0_table_store ue_store;
       sigma_dyn_dev sd_dev;                                // D-3: the Sigma deposits on the engine (off = the host deposits)
 #endif
+      bool kb_dev = false;                                 // D-1b: the rungs are built on the device (the host K_d arrays stay empty)
       if (met) { met->unit_diag = nda::array<double, 2>(nunits_all, 13); met->unit_diag() = 0.0; }
       for (long u = next_unit(pos); u >= 0; u = next_unit(pos)) {
         ++units_taken;
@@ -1283,6 +1284,77 @@ namespace solvers {
                 for (long N = 0; N < Nm; ++N) Dc(k, a, bb2, N) = Xb(is, k, N, a) * std::conj(Xb(is, kq, N, bb2));
           }
         }
+        // the tau representatives of the dense rung (PH-symmetric: one block per mirror pair); transfer-independent
+        std::vector<long> reps;
+        std::fill(trep.begin(), trep.end(), -1);
+        ndist = 0;
+        if (opt.dense_rung) {
+          for (long i = 0; i < nt; ++i) {
+            const long im = tools.t_mirror(i);
+            const long r0 = std::min(i, im);
+            long slot = -1;
+            for (long r = 0; r < long(reps.size()); ++r) if (reps[size_t(r)] == r0) { slot = r; break; }
+            if (slot < 0) { slot = long(reps.size()); reps.push_back(r0); }
+            trep[size_t(i)] = slot;
+          }
+          ndist = long(reps.size());
+        }
+#if defined(ENABLE_CUDA)
+        if (ue_want and not ue_tried) {                   // created at the first transfer (ndist is known), before its rungs
+          ue_tried = true;
+          dynbse_cuda::ue_config uc;
+          uc.np = np; uc.np_fit = b.np_fit; uc.nk = nk; uc.nc = nc; uc.ng = ng; uc.nt = nt; uc.nR_max = nrb;
+          uc.ndist = ndist; uc.n_kept = b.pf.n_kept; uc.nout = nout;
+          char why[256] = {0};
+          ue.reset(dynbse_cuda::ue_create(uc, 1.0e6 * double(utils::freemem_device_effective()), why, 256));
+          if (ue) {                                       // the basis' DLR refit at its fixed rank (basis_coeffs, npf_mask off)
+            auto const &pf = b.pf;
+            utils::check(pf.np == b.np_fit and pf.nt == nt and pf.n_kept == b.pf.n_kept,
+                         "pair_space_ladder_dyn: the DLR refit's size ({}, {}) differs from the basis' ({}, {}).", pf.np, pf.nt, b.np_fit, nt);
+            nda::array<cplx, 2> Utk(pf.n_kept, nt), Vsk(pf.np, pf.n_kept), Kck(pf.Kc);
+            Utk() = pf.Ut(nda::range(0, pf.n_kept), all);
+            Vsk() = pf.Vs(all, nda::range(0, pf.n_kept));
+            dynbse_cuda::ue_set_basis(ue.get(), b.KF.data(), b.KF2.data(), Utk.data(), Vsk.data(), Kck.data());
+          }
+          if (rank == 0)
+            app_log(1, "  [dynbse] device-resident unit: {} ({:.1f} GB estimated){}{}", ue ? "ON" : "OFF, the host path runs",
+                    dynbse_cuda::ue_bytes(uc) / 1e9, ue ? "" : " -- ", ue ? "" : why);
+          // D-1b: the rungs built on the device (nosym meshes); vertex_debug dynbse_dev_kbig = 0 keeps the host builds (the A/B)
+          if (ue and not sym and vertex_debug::number("dynbse_dev_kbig", 1.0) != 0.0) {   // vertex_debug: dynbse_dev_kbig
+            nda::array<cplx, 4> Wreps(ndist, nq, Nm, Nm);
+            for (long r = 0; r < ndist; ++r) Wreps(r, all, all, all) = Wd_s(all, reps[size_t(r)], all, all);
+            nda::array<cplx, 3> W0c(W0b), Wd0c(Wd0);
+            nda::array<long, 2> qxc(qx_of);
+            nda::array<cplx, 4> Xc(Xb);
+            char whyk[256] = {0};
+            kb_dev = dynbse_cuda::ue_kb_init(ue.get(), ns, nq, Nm, Xc.data(), qxc.data(), W0c.data(), Wd0c.data(), Wreps.data(), ndist,
+                                             1.0e6 * double(utils::freemem_device_effective()), whyk, 256);
+            if (rank == 0)
+              app_log(1, "  [dynbse] device rung builds (K_s, K_d(s), K_d0): {}{}", kb_dev ? "ON" : "OFF, built on the host -- ",
+                      kb_dev ? "" : whyk);
+          }
+          if (ue and opt.sigma != nullptr and not wan and sigma_dyn_device_ok(*opt.sigma)) {
+            std::string why_sd;
+            const bool ok = sigma_dyn_device_init(*opt.sigma, sd_dev, ue.get(), b, G_CC, nk, nc, ng, epsG, Nm, tools, why_sd);
+            if (rank == 0)
+              app_log(1, "  [dynbse] device Sigma deposits: {}{}", ok ? "ON (accumulators resident, flushed at checkpoints and the end)"
+                                                                        : "OFF, the host deposits run -- ", ok ? "" : why_sd);
+            if (ok) sd_flush_hook = [&]() { sigma_dyn_device_flush(*opt.sigma, sd_dev, ue.get()); };
+          }
+        }
+        if (kb_dev) {
+          double herm[2] = {0.0, 0.0}, tkb = 0.0;
+          dynbse_cuda::ue_kb_build(ue.get(), is, &kpq(iq, 0), trep.data(), scale_k, herm, &tkb);
+          if (opt.sigma != nullptr) {
+            opt.sigma->ks_herm = std::max(opt.sigma->ks_herm, (herm[1] > 0.0) ? herm[0] / herm[1] : 0.0);
+            if (not sd_dev.on) dynbse_cuda::ue_get_ks(ue.get(), Ks.data());   // the host deposits read K_s
+          }
+          if (rank == 0 and units_taken == 1)
+            app_log(2, "  [dynbse] dense tau rungs: {} distinct PH-sym tau nodes of {}, {:.2f} GB on the device (built there in {:.2f} s)",
+                    ndist, nt, double(ndist) * double(D) * double(D) * 16.0 / 1.0e9, tkb);
+        } else
+#endif
+        {
         build_kbig(Xb, W0b, is, iq, kpq, qx_of, Kbig, symc);
         Ks() = Kbig * scale_k;
         if (opt.sigma != nullptr) {
@@ -1294,20 +1366,8 @@ namespace solvers {
             }
           opt.sigma->ks_herm = std::max(opt.sigma->ks_herm, (kmx > 0.0) ? dh / kmx : 0.0);
         }
-        // the dense per-tau rungs K_d(s) (PH-symmetric: one block per mirror pair) and the constant part
-        std::fill(trep.begin(), trep.end(), -1);
-        ndist = 0;
+        // the dense per-tau rungs K_d(s) and the constant part
         if (opt.dense_rung) {
-          std::vector<long> reps;
-          for (long i = 0; i < nt; ++i) {
-            const long im = tools.t_mirror(i);
-            const long r0 = std::min(i, im);
-            long slot = -1;
-            for (long r = 0; r < long(reps.size()); ++r) if (reps[size_t(r)] == r0) { slot = r; break; }
-            if (slot < 0) { slot = long(reps.size()); reps.push_back(r0); }
-            trep[size_t(i)] = slot;
-          }
-          ndist = long(reps.size());
           Kd_s = nda::array<cplx, 3>(ndist, D, D);
           Kd0 = nda::array<cplx, 2>(D, D);
 #pragma omp parallel for schedule(dynamic, 1) num_threads(nthr)
@@ -1348,6 +1408,7 @@ namespace solvers {
                     is, iq, ndist, sv, n4, n8);
           }
         }
+        }
         // the pair poles of this transfer (shared grid: gnode identity)
         {
           nda::array<cplx, 4> gk(ng, nk, nc, nc), gkq(ng, nk, nc, nc);
@@ -1359,36 +1420,8 @@ namespace solvers {
         }
         last_sq = sq;
 #if defined(ENABLE_CUDA)
-        if (ue_want and not ue_tried) {                   // created at the first transfer: ndist and the pole count are known
-          ue_tried = true;
-          dynbse_cuda::ue_config uc;
-          uc.np = np; uc.np_fit = b.np_fit; uc.nk = nk; uc.nc = nc; uc.ng = Pcache->ng; uc.nt = nt; uc.nR_max = nrb;
-          uc.ndist = ndist; uc.n_kept = b.pf.n_kept; uc.nout = nout;
-          char why[256] = {0};
-          ue.reset(dynbse_cuda::ue_create(uc, 1.0e6 * double(utils::freemem_device_effective()), why, 256));
-          if (ue) {                                       // the basis' DLR refit at its fixed rank (basis_coeffs, npf_mask off)
-            auto const &pf = b.pf;
-            utils::check(pf.np == b.np_fit and pf.nt == nt and pf.n_kept == b.pf.n_kept,
-                         "pair_space_ladder_dyn: the DLR refit's size ({}, {}) differs from the basis' ({}, {}).", pf.np, pf.nt, b.np_fit, nt);
-            nda::array<cplx, 2> Utk(pf.n_kept, nt), Vsk(pf.np, pf.n_kept), Kck(pf.Kc);
-            Utk() = pf.Ut(nda::range(0, pf.n_kept), all);
-            Vsk() = pf.Vs(all, nda::range(0, pf.n_kept));
-            dynbse_cuda::ue_set_basis(ue.get(), b.KF.data(), b.KF2.data(), Utk.data(), Vsk.data(), Kck.data());
-          }
-          if (rank == 0)
-            app_log(1, "  [dynbse] device-resident unit: {} ({:.1f} GB estimated){}{}", ue ? "ON" : "OFF, the host path runs",
-                    dynbse_cuda::ue_bytes(uc) / 1e9, ue ? "" : " -- ", ue ? "" : why);
-          if (ue and opt.sigma != nullptr and not wan and sigma_dyn_device_ok(*opt.sigma)) {
-            std::string why_sd;
-            const bool ok = sigma_dyn_device_init(*opt.sigma, sd_dev, ue.get(), b, G_CC, *Pcache, Nm, tools, why_sd);
-            if (rank == 0)
-              app_log(1, "  [dynbse] device Sigma deposits: {}{}", ok ? "ON (accumulators resident, flushed at checkpoints and the end)"
-                                                                        : "OFF, the host deposits run -- ", ok ? "" : why_sd);
-            if (ok) sd_flush_hook = [&]() { sigma_dyn_device_flush(*opt.sigma, sd_dev, ue.get()); };
-          }
-        }
         if (ue) {
-          dynbse_cuda::ue_set_rung(ue.get(), Ks.data(), Kd_s.data(), Kd0.data(), trep.data(), scale_k);
+          if (not kb_dev) dynbse_cuda::ue_set_rung(ue.get(), Ks.data(), Kd_s.data(), Kd0.data(), trep.data(), scale_k);
           dynbse_cuda::ue_set_legs(ue.get(), Dc.data());
         }
 #endif

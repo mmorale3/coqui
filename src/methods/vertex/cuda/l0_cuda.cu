@@ -960,9 +960,23 @@ namespace methods::solvers::dynbse_cuda {
     std::vector<void *> allocs;
   };
 
+  // D-1b: the rung builds' device state (ue_kb_*)
+  struct kb_state {
+    bool on = false;
+    long ns = 0, nq = 0, Nm = 0, nrep = 0, KC = 0;
+    cd *X = nullptr, *W0 = nullptr, *Wd0 = nullptr, *Wds = nullptr;
+    long *kq = nullptr;
+    cd *U1 = nullptr, *U2 = nullptr, *WU2 = nullptr, *wb = nullptr;
+    cd **pA = nullptr, **pB = nullptr, **pC = nullptr;
+    std::vector<cd *> hA, hB, hC;
+    std::vector<long> qx;
+    std::vector<void *> allocs;
+  };
+
   struct unit_engine {
     ue_config c;
     sd_state sd;
+    kb_state kb;
     cd *Gs0 = nullptr;                                       // Gsum0 of the last block (the Sigma columns static_dyn / dyn1_bare)
     cd *Gr1 = nullptr;                                       // the one-bare-rung Gsum of the last block (when requested)
     cd *Dcj = nullptr, *CbD = nullptr, *Vr = nullptr, *Pr = nullptr;   // conj(legs) (D, nout); the readout scratch
@@ -1055,6 +1069,8 @@ namespace methods::solvers::dynbse_cuda {
                     (void *)e->Pr})
       if (p) (void)cudaFree(p);
     for (void *p : e->sd.allocs)
+      if (p) (void)cudaFree(p);
+    for (void *p : e->kb.allocs)
       if (p) (void)cudaFree(p);
     delete e;
   }
@@ -1586,6 +1602,144 @@ namespace methods::solvers::dynbse_cuda {
     pull(s.S, S_cst, nS);
     if (RT != nullptr) pull(s.RT, RT, nA);
     if (RU != nullptr) pull(s.RU, RU, nA);
+  }
+
+
+  // =====================================================================================================================
+  // D-1b: the rung builds (l0_cuda.cuh). b = (k - k0) nk + k' over a chunk of k; U1 / U2 / WU2 (b, Nm, nc2) and wb (b, nc2, nc2)
+  // row-major; X is the spin slice (nk, Nm, nc).
+  // =====================================================================================================================
+  namespace {
+    __global__ void kb_legs_kernel(long ik0, long nki, long nk, long Nm, long nc, cd const *__restrict__ X, long const *__restrict__ kq,
+                                   cd *__restrict__ U1, cd *__restrict__ U2) {
+      const long nc2 = nc * nc, tot = nki * nk * Nm * nc2;
+      for (long e = blockIdx.x * long(blockDim.x) + threadIdx.x; e < tot; e += long(gridDim.x) * blockDim.x) {
+        const long pq = e % nc2;
+        long t = e / nc2;
+        const long P = t % Nm;
+        t /= Nm;
+        const long ikp = t % nk, ik = ik0 + t / nk;
+        const long a = pq / nc, bb = pq % nc;
+        U1[e] = X[(ikp * Nm + P) * nc + a] * cuConj(X[(ik * Nm + P) * nc + bb]);
+        U2[e] = X[(kq[ik] * Nm + P) * nc + a] * cuConj(X[(kq[ikp] * Nm + P) * nc + bb]);
+      }
+    }
+    // K(k' nc2 + (p1 nc + p3'), k nc2 + (p1' nc + p3)) = alpha wb[b](p1 nc + p1', p3 nc + p3') -- a bijection onto K's elements
+    __global__ void kb_scatter_kernel(long ik0, long nki, long nk, long nc, cd alpha, cd const *__restrict__ wb, cd *__restrict__ K) {
+      const long nc2 = nc * nc, D = nk * nc2, tot = nki * nk * nc2 * nc2;
+      for (long e = blockIdx.x * long(blockDim.x) + threadIdx.x; e < tot; e += long(gridDim.x) * blockDim.x) {
+        const long col = e % nc2, row = (e / nc2) % nc2, b = e / (nc2 * nc2);
+        const long ik = ik0 + b / nk, ikp = b % nk;
+        const long p1 = row / nc, p1p = row % nc, p3 = col / nc, p3p = col % nc;
+        K[(ikp * nc2 + p1 * nc + p3p) * D + ik * nc2 + p1p * nc + p3] = alpha * wb[e];
+      }
+    }
+    __global__ void herm_kernel(long D, cd const *__restrict__ K, unsigned long long *__restrict__ red) {
+      double num = 0.0, den = 0.0;
+      const long tot = D * D;
+      for (long e = blockIdx.x * long(blockDim.x) + threadIdx.x; e < tot; e += long(gridDim.x) * blockDim.x) {
+        const long i = e / D, j = e % D;
+        num = fmax(num, cuCabs(K[e] - cuConj(K[j * D + i])));
+        den = fmax(den, cuCabs(K[e]));
+      }
+      num = block_max(num);
+      den = block_max(den);
+      if (threadIdx.x == 0) {
+        atomicMax(&red[0], (unsigned long long)__double_as_longlong(num));
+        atomicMax(&red[1], (unsigned long long)__double_as_longlong(den));
+      }
+    }
+  } // namespace
+
+  bool ue_kb_init(unit_engine *e, long ns, long nq, long Nm, cplx const *Xb, long const *qx_of, cplx const *W0h, cplx const *Wd0h,
+                  cplx const *Wdsh, long nrep, double free_bytes, char *why, long why_len) {
+    auto &k = e->kb;
+    const long nk = e->c.nk, nc2 = e->nc2;
+    if (nrep != e->c.ndist) {
+      std::snprintf(why, size_t(why_len), "rep count %ld differs from the engine's ndist %ld", nrep, e->c.ndist);
+      return false;
+    }
+    const double tables = double(ns * nk * Nm * e->c.nc) + double(nq * Nm * Nm) * (2.0 + double(nrep));
+    const double per_k = double(nk) * (3.0 * double(Nm * nc2) + double(nc2 * nc2));
+    const double need = 16.0 * (tables + per_k) + 64.0e6;
+    if (need > 0.9 * free_bytes) {
+      std::snprintf(why, size_t(why_len), "needs %.1f GB of device memory, %.1f GB free", need / 1e9, free_bytes / 1e9);
+      return false;
+    }
+    k.ns = ns; k.nq = nq; k.Nm = Nm; k.nrep = nrep;
+    k.KC = long(std::min<double>(double(nk), std::max(1.0, std::floor(std::min(0.5 * (0.9 * free_bytes - need), 4.0e9) / (16.0 * per_k)))));
+    auto al = [&](size_t n, char const *what) { cd *p = dalloc<cd>(n, what); k.allocs.push_back(p); return p; };
+    k.X = al(size_t(ns * nk * Nm * e->c.nc), "kb X");
+    k.W0 = al(size_t(nq * Nm * Nm), "kb W0"); k.Wd0 = al(size_t(nq * Nm * Nm), "kb Wd0");
+    k.Wds = al(size_t(nrep * nq * Nm * Nm), "kb Wds");
+    const size_t chunk = size_t(k.KC * nk);
+    k.U1 = al(chunk * size_t(Nm * nc2), "kb U1"); k.U2 = al(chunk * size_t(Nm * nc2), "kb U2");
+    k.WU2 = al(chunk * size_t(Nm * nc2), "kb WU2"); k.wb = al(chunk * size_t(nc2 * nc2), "kb wb");
+    k.kq = dalloc<long>(size_t(nk), "kb kq"); k.allocs.push_back(k.kq);
+    k.pA = dalloc<cd *>(chunk, "kb pA"); k.pB = dalloc<cd *>(chunk, "kb pB"); k.pC = dalloc<cd *>(chunk, "kb pC");
+    for (void *p : {(void *)k.pA, (void *)k.pB, (void *)k.pC}) k.allocs.push_back(p);
+    k.hA.assign(chunk, nullptr); k.hB.assign(chunk, nullptr); k.hC.assign(chunk, nullptr);
+    h2d_c(k.X, Xb, size_t(ns * nk * Nm * e->c.nc), "kb X");
+    h2d_c(k.W0, W0h, size_t(nq * Nm * Nm), "kb W0"); h2d_c(k.Wd0, Wd0h, size_t(nq * Nm * Nm), "kb Wd0");
+    h2d_c(k.Wds, Wdsh, size_t(nrep * nq * Nm * Nm), "kb Wds");
+    k.qx.assign(qx_of, qx_of + nk * nk);
+    for (long v : k.qx)
+      if (v < 0 or v >= nq) { std::snprintf(why, size_t(why_len), "qx_of out of range"); return false; }
+    k.on = true;
+    return true;
+  }
+
+  void ue_kb_build(unit_engine *e, long is, long const *kpq_row, long const *trep, cplx scale_k, double *herm, double *timing) {
+    auto &k = e->kb;
+    if (not k.on) APP_ABORT(std::string(" ue_kb_build: the rung builds were not initialized."));
+    const double t0 = wnow();
+    const long nk = e->c.nk, nc = e->c.nc, nc2 = e->nc2, Nm = k.Nm, D = e->D;
+    const cd one = make_cuDoubleComplex(1.0, 0.0), zero = make_cuDoubleComplex(0.0, 0.0);
+    h2d(k.kq, kpq_row, size_t(nk), "kb kq");
+    cd const *Xs = k.X + size_t(is) * nk * Nm * nc;
+    const cd sk = make_cuDoubleComplex(scale_k.real(), scale_k.imag());
+    for (long ik0 = 0; ik0 < nk; ik0 += k.KC) {
+      const long nki = std::min(k.KC, nk - ik0), nb = nki * nk;
+      kb_legs_kernel<<<grid_for(nb * Nm * nc2), 256>>>(ik0, nki, nk, Nm, nc, Xs, k.kq, k.U1, k.U2);
+      launch_check("kb legs");
+      // the W tables of this transfer: W0 -> K_s (x scale_k), Wd0 -> K_d0, Wd(rep r) -> K_d(r)
+      for (long t = -2; t < k.nrep; ++t) {
+        cd const *Wt = (t == -2) ? k.W0 : ((t == -1) ? k.Wd0 : k.Wds + size_t(t) * k.nq * Nm * Nm);
+        cd *Kt = (t == -2) ? e->Ks : ((t == -1) ? e->Kd0 : e->Kds + size_t(t) * D * D);
+        for (long b = 0; b < nb; ++b) {
+          const long ik = ik0 + b / nk, ikp = b % nk;
+          k.hA[size_t(b)] = k.U2 + size_t(b) * Nm * nc2;
+          k.hB[size_t(b)] = const_cast<cd *>(Wt) + size_t(k.qx[size_t(ik * nk + ikp)]) * Nm * Nm;
+          k.hC[size_t(b)] = k.WU2 + size_t(b) * Nm * nc2;
+        }
+        h2d(k.pA, k.hA.data(), size_t(nb), "kb pA"); h2d(k.pB, k.hB.data(), size_t(nb), "kb pB"); h2d(k.pC, k.hC.data(), size_t(nb), "kb pC");
+        // WU2 = W(qx) U2: column-major (nc2 x Nm) = U2^T-view (nc2 x Nm) . W^T-view (Nm x Nm)
+        cub_check(cublasZgemmBatched(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(nc2), int(Nm), int(Nm), &one, (const cd **)k.pA, int(nc2),
+                                     (const cd **)k.pB, int(Nm), &zero, k.pC, int(nc2), int(nb)), "kb W U2");
+        // wb = U1^T WU2: column-major (nc2 x nc2) = WU2-view (nc2 x Nm) . U1-view^T (Nm x nc2)
+        cub_check(cublasZgemmStridedBatched(e->cb, CUBLAS_OP_N, CUBLAS_OP_T, int(nc2), int(nc2), int(Nm), &one, k.WU2, int(nc2),
+                                            (long long)(Nm * nc2), k.U1, int(nc2), (long long)(Nm * nc2), &zero, k.wb, int(nc2),
+                                            (long long)(nc2 * nc2), int(nb)), "kb U1^T W U2");
+        kb_scatter_kernel<<<grid_for(nb * nc2 * nc2), 256>>>(ik0, nki, nk, nc, (t == -2) ? sk : one, k.wb, Kt);
+        launch_check("kb scatter");
+      }
+    }
+    // the Sigma hook's |K_s - K_s^dag| meter
+    cu_check(cudaMemset(e->red, 0, 2 * sizeof(unsigned long long)), "kb red");
+    herm_kernel<<<grid_red(D * D), 256>>>(D, e->Ks, e->red);
+    launch_check("kb herm");
+    unsigned long long r[2] = {0, 0};
+    cu_check(cudaMemcpy(r, e->red, sizeof(r), cudaMemcpyDeviceToHost), "kb herm d2h");
+    std::memcpy(&herm[0], &r[0], sizeof(double)); std::memcpy(&herm[1], &r[1], sizeof(double));
+    e->trep.assign(trep, trep + e->c.nt);
+    e->scale = sk;
+    e->unit_ok = false;
+    cu_check(cudaDeviceSynchronize(), "kb build");
+    timing[0] += wnow() - t0;
+  }
+
+  void ue_get_ks(unit_engine *e, cplx *Ks) {
+    cu_check(cudaMemcpy(Ks, e->Ks, size_t(e->D) * size_t(e->D) * sizeof(cd), cudaMemcpyDeviceToHost), "ue Ks d2h");
   }
 
 

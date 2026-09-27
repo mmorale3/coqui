@@ -153,6 +153,21 @@ namespace methods::solvers::dynbse_cuda {
   double ue_gamma1(unit_engine *e, long nR, cplx const *Dblk, cplx *Gsum0, cplx *Gsum1, cplx *y1fam, cplx *y1cst, double *timing,
                    bool want_r1 = false);
 
+  // ---- D-1b: THE RUNG BUILDS ON THE DEVICE (vertex_dynbse.icc::build_kbig, nosym meshes). Per (s, q) every dense rung
+  // K[W](k' nc2 + (p1 nc + p3'), k nc2 + (p1' nc + p3)) = [U1^T W(qx(k, k')) U2](p1 nc + p1', p3 nc + p3') with the pair legs
+  // U1(P, p1 nc + p1') = X(k', P, p1) conj(X(k, P, p1')), U2(P, p3 nc + p3') = X(k+q, P, p3) conj(X(k'+q, P, p3')) is built
+  // straight into the engine: K_s = scale_k K[W0], K_d(r) = K[Wd(rep r)], K_d0 = K[Wd0] -- two batched gemms per W table and
+  // (k-chunk) and a scatter kernel; no host rung arrays, no per-transfer upload of the ~10 GB K_d stack.
+  /** run-wide: Xb (ns, nk, Nm, nc), qx_of (nk, nk), W0 (nq, Nm, Nm), Wd0 (nq, Nm, Nm), Wds (nrep, nq, Nm, Nm) (the tau
+   *  representatives' W in the driver's rep order). false (why) = no room: the host builds and ue_set_rung uploads. */
+  bool ue_kb_init(unit_engine *e, long ns, long nq, long Nm, cplx const *Xb, long const *qx_of, cplx const *W0, cplx const *Wd0,
+                  cplx const *Wds, long nrep, double free_bytes, char *why, long why_len);
+  /** per (s, q): K_s, K_d(r), K_d0 built on the device (replaces ue_set_rung); trep (nt) as in ue_set_rung. timing (1) ADDED.
+   *  herm (2) out: max |K_s - K_s^dag|, max |K_s| (the Sigma hook's meter). */
+  void ue_kb_build(unit_engine *e, long is, long const *kpq_row, long const *trep, cplx scale_k, double *herm, double *timing);
+  /** D2H of the resident K_s (D, D) for host consumers (the host Sigma deposits) */
+  void ue_get_ks(unit_engine *e, cplx *Ks);
+
   // ---- D-3: THE SIGMA DEPOSITS ON THE DEVICE (vertex_sigma_dyn.icc::sigma_dyn_accumulate, the production path: the product
   // route, split accumulators, no IBZ fold, no dump, the DW legs). They read the engine's resident output of the last
   // ue_gamma1 (Gsum0 / Gsum1, y1 = (fam, cst)) and K_s, deposit into device-resident S_cst / RT / RU, and are flushed (ADDED)
