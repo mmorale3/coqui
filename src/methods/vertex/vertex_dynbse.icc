@@ -1095,8 +1095,30 @@ namespace solvers {
         order.clear();
         for (long g : gorder)
           for (long jn = 0; jn < nnu; ++jn) order.push_back(g * nnu + jn);
-        if (rank == 0) app_log(2, "  [dynbse] unit hand-out by transfer groups: {} groups of {} nu nodes", ngrp, nnu);
       }
+      // the hand-out CHUNKS over `order` (2026-09-27): a whole transfer group per hand-out leaves ranks idle when the number of
+      // groups is not a large multiple of the rank count (the conv_vertex coarse dumps: 64 groups of 40 nodes on 56 ranks ->
+      // 8 ranks take a second group while 48 wait); each group is therefore split into nsplit contiguous sub-chunks of about
+      // `target` units, with target sized for >= ~4 chunks per rank. The (s, q) objects are then built once per CHUNK (a
+      // rank that draws two sub-chunks of the same transfer in a row still reuses them).
+      std::vector<long> cbeg, clen;
+      if (group_sched) {
+        const long ngrp = nunits_all / nnu;
+        const long target = std::max(1l, std::min(nnu, nunits_all / std::max(1l, 4 * nproc)));
+        const long nsplit = (nnu + target - 1) / target;
+        for (long g = 0; g < ngrp; ++g)
+          for (long sc = 0; sc < nsplit; ++sc) {
+            const long b0 = g * nnu + (sc * nnu) / nsplit, b1 = g * nnu + ((sc + 1) * nnu) / nsplit;
+            if (b1 > b0) { cbeg.push_back(b0); clen.push_back(b1 - b0); }
+          }
+        if (rank == 0)
+          app_log(2, "  [dynbse] unit hand-out by transfer groups: {} groups of {} nu nodes, split into {} chunks of <= {} units ({} ranks)",
+                  ngrp, nnu, long(cbeg.size()), (nnu + nsplit - 1) / nsplit, nproc);
+      } else {
+        cbeg.resize(size_t(nunits_all)); clen.assign(size_t(nunits_all), 1);
+        for (long p0 = 0; p0 < nunits_all; ++p0) cbeg[size_t(p0)] = p0;
+      }
+      const long nchunks = long(cbeg.size());
       const bool dyn_sched = (opt.sched_comm != MPI_COMM_NULL);
       MPI_Win win = MPI_WIN_NULL;
       long *counter = nullptr;
@@ -1105,24 +1127,24 @@ namespace solvers {
         if (rank == 0) *counter = 0;
         MPI_Win_fence(0, win);
       }
-      const long stride = group_sched ? nnu : 1;          // the hand-out unit: a transfer group or a single unit
-      long grp_base = 0, grp_pos = stride;                 // this rank's current group (exhausted at start)
+      long ch_beg = 0, ch_len = 0, ch_pos = 0;             // this rank's current chunk (empty at start)
       auto next_unit = [&](long &pos) -> long {   // returns the unit index, or -1 when the list is exhausted
-        if (grp_pos >= stride) {                            // fetch the next group (or single unit)
+        if (ch_pos >= ch_len) {                             // fetch the next chunk (a single unit without the group hand-out)
           long got = 0;
           if (dyn_sched) {
+            const long one = 1;
             MPI_Win_lock(MPI_LOCK_SHARED, 0, 0, win);
-            MPI_Fetch_and_op(&stride, &got, MPI_LONG, 0, 0, MPI_SUM, win);
+            MPI_Fetch_and_op(&one, &got, MPI_LONG, 0, 0, MPI_SUM, win);
             MPI_Win_unlock(0, win);
           } else {
             got = pos;
-            pos += nproc * stride;
+            pos += nproc;
           }
-          if (got >= nunits_all) return -1;
-          grp_base = got; grp_pos = 0;
+          if (got >= nchunks) return -1;
+          ch_beg = cbeg[size_t(got)]; ch_len = clen[size_t(got)]; ch_pos = 0;
         }
-        const long idx = grp_base + grp_pos++;
-        return (idx < nunits_all) ? (group_sched or dyn_sched ? order[size_t(idx)] : idx) : -1;
+        const long idx = ch_beg + ch_pos++;
+        return (group_sched or dyn_sched) ? order[size_t(idx)] : idx;
       };
       // ---- per-unit dump / restart --------------------------------------------------------------
       // record: 5 longs {is, iq, m, Nm, 4} + 4 x Nm^2 complex (static, dyn1, gam1, dyn; zeros when not requested)
@@ -1153,7 +1175,7 @@ namespace solvers {
           app_log(1, "  [dynbse] unit dump \"{}.r*.bin\": {} finished units found (loaded, not re-solved)", opt.dump_prefix, nrec);
         dump_out.open(opt.dump_prefix + ".r" + std::to_string(rank) + ".bin", std::ios::binary | std::ios::app);
       }
-      long pos = rank * stride;
+      long pos = rank;                                    // the static hand-out's chunk index
       long units_taken = 0;
       db::tfold_ratio_ref() = opt.tfold;
       // the (s, q) cache (D-0): built when the unit's transfer differs from the last one built; with the group hand-out
