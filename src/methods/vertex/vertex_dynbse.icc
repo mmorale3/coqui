@@ -2109,6 +2109,10 @@ namespace solvers {
             (met.n_apps > 0) ? met.t_solve * double(mpi->comm.size()) / double(met.n_apps) : 0.0, met.rss_max_gb,
             utils::omp_threads());
     app_log(1, "  [scGW-tilde T2] {}", met.l0_split_line());
+    app_log(1, "  [scGW-tilde T2] unit split on the slowest rank: setup {:.1f} s, K_big build {:.1f} s, Cb {:.1f} s, LU {:.1f} s, solve {:.1f} s, "
+               "readout {:.1f} s; wall {:.1f} s -> unaccounted {:.1f} s (dumps, reductions, scheduling)",
+            met.t_setup, met.t_kbig, met.t_cb, met.t_lu, met.t_solve, met.t_read, r.t_total,
+            r.t_total - met.t_setup - met.t_kbig - met.t_cb - met.t_lu - met.t_solve - met.t_read);
     if (met.ritz_max >= 1.0)
       app_log(1, "  [scGW-tilde T2] WARNING: the dynamic remainder's watchdog is >= 1 on some unit -- the resummed "
                  "column is not to be trusted there; Gamma_1 is the reportable number.");
