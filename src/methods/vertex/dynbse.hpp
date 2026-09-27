@@ -1007,6 +1007,8 @@ namespace dynbse {
     t.R1U = st.R1U.data(); t.R1T = st.R1T.data(); t.R3U = st.R3U.data(); t.R3T = st.R3T.data();
     t.inu = inu; t.tfold = tfold; t.sum_part1 = (Cb_cst == nullptr); t.skip_cst = not anyc;
     t.fused = int(vertex_debug::number("dynbse_l0_fused", 2.0));        // vertex_debug: dynbse_l0_fused (0 = batched gemms + scatter, 1 = two fused passes, 2 = one merged pass)
+    t.fz_cfg = int(vertex_debug::number("dynbse_l0_fz_cfg", 42.0));     // vertex_debug: dynbse_l0_fz_cfg (81 | 82 | 42 | 43 | 44)
+    t.fz_bench = int(vertex_debug::number("dynbse_l0_fz_bench", 0.0)); // vertex_debug: dynbse_l0_fz_bench
     t.asm_gemm = int(vertex_debug::number("dynbse_l0_asm_gemm", 1.0));  // vertex_debug: dynbse_l0_asm_gemm (0 = the atomic nu = 0 assembly)
     const double free_bytes = 1.0e6 * double(utils::freemem_device_effective());
     double tdev[4] = {0.0, 0.0, 0.0, 0.0};        // alloc, H2D, kernel, D2H (filled by the driver)
@@ -1106,6 +1108,8 @@ namespace dynbse {
     t.Dsq = b.Dsq.data(); t.Dcb = b.Dcb.data();
     t.inu = cplx(0.0); t.tfold = 0.0; t.sum_part1 = (Cb_cst == nullptr); t.skip_cst = not anyc;
     t.fused = int(vertex_debug::number("dynbse_l0_fused", 2.0));        // vertex_debug: dynbse_l0_fused (0 = batched gemms + scatter, 1 = two fused passes, 2 = one merged pass)
+    t.fz_cfg = int(vertex_debug::number("dynbse_l0_fz_cfg", 42.0));     // vertex_debug: dynbse_l0_fz_cfg (81 | 82 | 42 | 43 | 44)
+    t.fz_bench = int(vertex_debug::number("dynbse_l0_fz_bench", 0.0)); // vertex_debug: dynbse_l0_fz_bench
     t.asm_gemm = int(vertex_debug::number("dynbse_l0_asm_gemm", 1.0));  // vertex_debug: dynbse_l0_asm_gemm (0 = the atomic nu = 0 assembly)
     const double free_bytes = 1.0e6 * double(utils::freemem_device_effective());
     double tdev[4] = {0.0, 0.0, 0.0, 0.0};        // alloc, H2D, kernel, D2H (filled by the driver)

@@ -524,8 +524,11 @@ namespace methods::solvers::dynbse_cuda {
     template <bool NU0>
     struct fz_acc { static constexpr int n = NU0 ? 5 : 7; };
 
-    template <bool NU0, int CHG>
-    __global__ void fused_pass_kernel(kdims d, long ik0, long K, int pass, cd inu, bool skip_cst, int S, int G,
+    // MINB blocks of 256 threads per SM: the register budget (ncu p1gpu_ncu9: at 176 registers / thread ONE block fitted,
+    // 12.5 % occupancy, 75 % of the cycles without an eligible warp -- latency-bound, not FP64-bound)
+    template <bool NU0, int CHG, int MINB>
+    __global__ void __launch_bounds__(256, MINB)
+    fused_pass_kernel(kdims d, long ik0, long K, int pass, cd inu, bool skip_cst, int S, int G,
                                       cd const *__restrict__ Vt, cd const *__restrict__ gk, cd const *__restrict__ gkq,
                                       cd const *__restrict__ Ghat, cd const *__restrict__ Gtil, cd const *__restrict__ coef,
                                       long const *__restrict__ gnode,
@@ -563,16 +566,16 @@ namespace methods::solvers::dynbse_cuda {
           Vs[i] = Vk[((x * nca + il0 + cl) * nR + r) * nc + y];
         }
         // this thread's components: cl = g CHG + m
-        long cm[CHG], am[CHG];
+        int cm[CHG], am[CHG];                              // component index (<= 2 np) and its node: 32-bit (registers)
         bool vm[CHG];
 #pragma unroll
         for (int m = 0; m < CHG; ++m) {
           const int cl = g * CHG + m;
           vm[m] = inb and (cl < nch);
-          const long c = vm[m] ? d.act[il0 + cl] : 0;
+          const int c = vm[m] ? int(d.act[il0 + cl]) : 0;
           if (vm[m] and c == 0 and skip_cst) vm[m] = false;
           cm[m] = c;
-          am[m] = (c == 0) ? -1 : (NU0 ? c - 1 : ((c <= np) ? c - 1 : c - 1 - np));
+          am[m] = (c == 0) ? -1 : (NU0 ? c - 1 : ((c <= int(np)) ? c - 1 : c - 1 - int(np)));
         }
         cd aU[CHG], aT[CHG];
 #pragma unroll
@@ -765,32 +768,82 @@ namespace methods::solvers::dynbse_cuda {
       const long nc2 = nc * nc, CH = long(G) * CHG, nacc = nu0 ? 5 : 7;
       return size_t(CH * nc2 + 4 * nc2 + CH * FZ_NCOEF + nacc * long(G) * S * nc) * sizeof(cd);
     }
-    constexpr int FZ_CHG = 8;
+    // the fused kernel's variants: cfg = 10 CHG + MINB (components per thread x minimum 256-thread blocks per SM)
+    template <bool NU0, int CHG, int MINB>
+    void fz_launch(dim3 grid, unsigned threads, kdims kd, long ik0, long Kb, int pass, cd inu, bool skip_cst, int S, int G,
+                   cd const *Vt, cd const *gk, cd const *gkq, cd const *Ghat, cd const *Gtil, cd const *coef, long const *gnode,
+                   cd *AU, cd *AT, cd *M2, cd *A1, cd *A3) {
+      const size_t sm = fz_smem_bytes(NU0, kd.nc, S, G, CHG);
+      if (sm > 48 * 1024)
+        cu_check(cudaFuncSetAttribute(fused_pass_kernel<NU0, CHG, MINB>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(sm)), "fz attr");
+      fused_pass_kernel<NU0, CHG, MINB><<<grid, threads, sm>>>(kd, ik0, Kb, pass, inu, skip_cst, S, G, Vt, gk, gkq, Ghat, Gtil, coef,
+                                                              gnode, AU, AT, M2, A1, A3);
+    }
+    constexpr int FZ_CFGS[] = {81, 82, 42, 43, 44};
+    template <bool NU0>
+    void fz_dispatch(int cfg, dim3 grid, unsigned threads, kdims kd, long ik0, long Kb, int pass, cd inu, bool skip_cst, int S, int G,
+                     cd const *Vt, cd const *gk, cd const *gkq, cd const *Ghat, cd const *Gtil, cd const *coef, long const *gnode,
+                     cd *AU, cd *AT, cd *M2, cd *A1, cd *A3) {
+#define FZ_CASE(C, M) case 10 * C + M: \
+      fz_launch<NU0, C, M>(grid, threads, kd, ik0, Kb, pass, inu, skip_cst, S, G, Vt, gk, gkq, Ghat, Gtil, coef, gnode, AU, AT, M2, A1, A3); break;
+      switch (cfg) {
+        FZ_CASE(8, 1) FZ_CASE(8, 2) FZ_CASE(4, 2) FZ_CASE(4, 3) FZ_CASE(4, 4)
+        default: APP_ABORT(std::string(" l0_cuda: unknown fused-L0 variant (dynbse_l0_fz_cfg: 81 | 82 | 42 | 43 | 44)."));
+      }
+#undef FZ_CASE
+    }
     // both fused passes of one k-batch: merge = true runs them as ONE pass (pass 2: the pass-1 products formed alongside
-    // the pass-0 ones, one scatter of the sums -- half the scatter, the syncs and the target writes)
+    // the pass-0 ones, one scatter of the sums -- half the scatter, the syncs and the target writes). bench: time every
+    // variant once on this k-batch (the first call per nu class; the accumulators are re-zeroed after) and print the table.
     void fused_passes(kdims kd, long ik0, long Kb, bool nu0, cd inu, bool skip_cst, cd const *Vt, cd const *gk, cd const *gkq,
                       cd const *Ghat, cd const *Gtil, cd const *coef, long const *gnode, cd *AU, cd *AT, cd *M2, cd *A1, cd *A3,
-                      bool merge = true) {
+                      bool merge = true, int cfg = 42, bool bench = false) {
       const int S = fz_segment(kd.nc);
       if (S > 32) APP_ABORT(std::string(" l0_cuda: the fused L0 passes need nc <= 32."));
       const int slots = S * int(kd.nc);
       const int G = std::max(1, 256 / slots);
       const unsigned threads = unsigned(((G * slots + 31) / 32) * 32);   // whole warps: the shuffles take the full mask
-      const size_t sm = fz_smem_bytes(nu0, kd.nc, S, G, FZ_CHG);
-      if (sm > 48 * 1024) {
-        if (nu0) cu_check(cudaFuncSetAttribute(fused_pass_kernel<true, FZ_CHG>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(sm)), "fz attr");
-        else     cu_check(cudaFuncSetAttribute(fused_pass_kernel<false, FZ_CHG>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(sm)), "fz attr");
-      }
+      if (threads > 256) APP_ABORT(std::string(" l0_cuda: the fused L0 passes are built for <= 256 threads (nc <= 16); set vertex_debug dynbse_l0_fused = 0."));
       const dim3 grid(unsigned(kd.nR), unsigned(Kb), 1u);
-      for (int pass = (merge ? 2 : 0); pass < (merge ? 3 : 2); ++pass) {
-        if (nu0)
-          fused_pass_kernel<true, FZ_CHG><<<grid, threads, sm>>>(kd, ik0, Kb, pass, inu, skip_cst, S, G, Vt, gk, gkq, Ghat, Gtil, coef,
-                                                                 gnode, AU, AT, M2, A1, A3);
-        else
-          fused_pass_kernel<false, FZ_CHG><<<grid, threads, sm>>>(kd, ik0, Kb, pass, inu, skip_cst, S, G, Vt, gk, gkq, Ghat, Gtil, coef,
-                                                                  gnode, AU, AT, M2, A1, A3);
-        launch_check(pass == 0 ? "fused pass 0" : pass == 1 ? "fused pass 1" : "fused merged pass");
+      auto run = [&](int c) {
+        for (int pass = (merge ? 2 : 0); pass < (merge ? 3 : 2); ++pass) {
+          if (nu0) fz_dispatch<true>(c, grid, threads, kd, ik0, Kb, pass, inu, skip_cst, S, G, Vt, gk, gkq, Ghat, Gtil, coef, gnode, AU, AT, M2, A1, A3);
+          else     fz_dispatch<false>(c, grid, threads, kd, ik0, Kb, pass, inu, skip_cst, S, G, Vt, gk, gkq, Ghat, Gtil, coef, gnode, AU, AT, M2, A1, A3);
+          launch_check(pass == 0 ? "fused pass 0" : pass == 1 ? "fused pass 1" : "fused merged pass");
+        }
+      };
+      static bool benched[2] = {false, false};
+      if (bench and not benched[nu0 ? 1 : 0]) {
+        benched[nu0 ? 1 : 0] = true;
+        const size_t accb = size_t(Kb) * size_t(2 * kd.np * kd.blk) * sizeof(cd);
+        auto zero = [&] { for (cd *p : {AU, AT, M2, A1, A3}) cu_check(cudaMemsetAsync(p, 0, accb, 0), "fz bench zero"); };
+        cudaEvent_t e0, e1;
+        cu_check(cudaEventCreate(&e0), "fz bench ev");
+        cu_check(cudaEventCreate(&e1), "fz bench ev");
+        std::string line;
+        for (int c : FZ_CFGS) {
+          float best = 1e30f;
+          for (int rep = 0; rep < 2; ++rep) {
+            zero();
+            cu_check(cudaEventRecord(e0, 0), "fz bench rec");
+            run(c);
+            cu_check(cudaEventRecord(e1, 0), "fz bench rec");
+            cu_check(cudaEventSynchronize(e1), "fz bench sync");
+            float ms = 0.0f;
+            cu_check(cudaEventElapsedTime(&ms, e0, e1), "fz bench time");
+            best = std::min(best, ms);
+          }
+          char b[64];
+          std::snprintf(b, sizeof(b), " %d: %.2f ms", c, best);
+          line += b;
+        }
+        std::fprintf(stderr, "  [l0 fused bench] nu0 %d, nc %ld nR %ld np %ld ng %ld nca %ld K %ld, merge %d -- cfg (10 CHG + MINB):%s\n",
+                     int(nu0), kd.nc, kd.nR, kd.np, kd.ng, kd.nca, Kb, int(merge), line.c_str());
+        cu_check(cudaEventDestroy(e0), "fz bench ev");
+        cu_check(cudaEventDestroy(e1), "fz bench ev");
+        zero();
       }
+      run(cfg);
     }
     void build_coef(bool nu0, long np, long ng, cd inu, double const *eps, double const *epsG, cd *coef) {
       const long n = (nu0 ? np : 2 * np) * ng;
@@ -971,7 +1024,8 @@ namespace methods::solvers::dynbse_cuda {
       pack_kernel<<<dim3(64u, unsigned(Kb), 1u), 256>>>(kd, ik0, Kb, nu0, dX, dXc, dVt);
       launch_check("pack_kernel");
       if (fused) {
-        fused_passes(kd, ik0, Kb, nu0, inu, t.skip_cst, dVt, dgk, dgkq, dGhat, dGtil, dcoef, dgn, dAU, dAT, dM2, dA1, dA3, merge);
+        fused_passes(kd, ik0, Kb, nu0, inu, t.skip_cst, dVt, dgk, dgkq, dGhat, dGtil, dcoef, dgn, dAU, dAT, dM2, dA1, dA3, merge,
+                     t.fz_cfg, t.fz_bench != 0);
       } else {
       poleT_kernel<<<dim3(32u, unsigned(Kb), 1u), 256>>>(kd, ik0, Kb, dgk, true, false, dgjT);
       poleT_kernel<<<dim3(32u, unsigned(Kb), 1u), 256>>>(kd, ik0, Kb, dgkq, true, false, dglT);
@@ -1151,6 +1205,8 @@ namespace methods::solvers::dynbse_cuda {
     bool nu0 = false;
     bool fused = true, asmg = true;                  // the fused passes; the nu = 0 gemm assembly
     bool merge = true;                               // the fused passes as one merged pass
+    int fz_cfg = 42;                                 // the fused kernel's variant (10 CHG + MINB)
+    bool fz_bench = false;                           // time every variant on the first k-batch per nu class
     cd *dcoef = nullptr, *dT = nullptr;
     cd inu = make_cuDoubleComplex(0.0, 0.0);
     double tfold = 0.0;
@@ -1288,7 +1344,8 @@ namespace methods::solvers::dynbse_cuda {
         pack_kernel<<<dim3(64u, unsigned(Kb), 1u), 256>>>(kd, ik0, Kb, nu0, Xfam, Xcst, dVt);
         launch_check("plan pack_kernel");
         if (fused) {
-          fused_passes(kd, ik0, Kb, nu0, inu, skip_cst, dVt, dgk, dgkq, dGhat, dGtil, dcoef, dgn, dAU, dAT, dM2, dA1, dA3, merge);
+          fused_passes(kd, ik0, Kb, nu0, inu, skip_cst, dVt, dgk, dgkq, dGhat, dGtil, dcoef, dgn, dAU, dAT, dM2, dA1, dA3, merge,
+                       fz_cfg, fz_bench);
         } else {
         poleT_kernel<<<dim3(32u, unsigned(Kb), 1u), 256>>>(kd, ik0, Kb, dgk, true, false, dgjT);
         poleT_kernel<<<dim3(32u, unsigned(Kb), 1u), 256>>>(kd, ik0, Kb, dgkq, true, false, dglT);
@@ -1453,6 +1510,8 @@ namespace methods::solvers::dynbse_cuda {
     size_t fr = 0, tot = 0;
     cu_check(cudaMemGetInfo(&fr, &tot), "ue memgetinfo");
     e->l0 = new l0_plan(c.np, c.np_fit, c.nk, c.nc, c.ng, c.nR_max, double(fr), c.l0_fused != 0, c.l0_asm_gemm != 0, c.l0_fused == 2);
+    e->l0->fz_cfg = c.l0_fz_cfg;
+    e->l0->fz_bench = (c.l0_fz_bench != 0);
     return e;
   }
 

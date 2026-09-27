@@ -85,6 +85,8 @@ namespace methods::solvers::dynbse_cuda {
     // products formed in registers / shared memory, no materialized Pj / Qj / Bj, no atomics), 0 = the batched-gemm +
     // scatter passes; asm_gemm 1 = the nu = 0 assembly's Dsq / Dcb re-expansions as one gemm per k-batch (0 = atomics)
     int fused = 2;                     // 0 = batched gemms + scatter, 1 = the two fused passes, 2 = one merged pass
+    int fz_cfg = 42;                   // the fused kernel's variant: 10 x components per thread + minimum blocks per SM
+    int fz_bench = 0;                  // 1: time every variant on the first k-batch per nu class (stderr table)
     int asm_gemm = 1;
   };
 
@@ -130,6 +132,7 @@ namespace methods::solvers::dynbse_cuda {
     long np = 0, np_fit = 0, nk = 0, nc = 0, ng = 0, nt = 0, nR_max = 0, ndist = 0, n_kept = 0;
     long nout = 0;                  // the external-leg / readout dimension (aux N_m, or the Wannier pair count)
     int l0_fused = 2, l0_asm_gemm = 1;   // the resident L0 plan's kernels (l0_tables::fused / asm_gemm)
+    int l0_fz_cfg = 42, l0_fz_bench = 0; // l0_tables::fz_cfg / fz_bench
   };
 
   /** nullptr when the device cannot hold the working set (the caller keeps the host path); `why` then says what failed */
