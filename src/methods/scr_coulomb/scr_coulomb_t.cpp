@@ -1867,6 +1867,26 @@ namespace solvers {
     // readout is already replicated-Np^2-heavy (Z_qPQ)
     nda::array<ComplexType, 2> W_rpa(qnu_meter ? Np : 0, qnu_meter ? Np : 0);
     nda::array<ComplexType, 2> W_lad(qnu_meter ? Np : 0, qnu_meter ? Np : 0);
+    // gpu port 2026-09-27: the single-frequency Dysons of this readout on the device. Up to seven (Np^3 gemm + inverse +
+    // gemm) per q, replicated on every rank, were ~36 s of host work per iteration in p1gpu_n3m. The head contraction reads
+    // only (A^-1 - I) Z c, so the device solves A x = Z c (getrf + one-column getrs; A = I - Z (P0 + add)) instead of forming
+    // A^-1: the same quantity in another rounding. vertex_debug eps_readout_device = 0 keeps the host path; the q-nu meter
+    // (which needs the full dW) keeps it too.
+#if defined(ENABLE_DEVICE)
+    const bool eps_dev = not qnu_meter and methods::vertex_debug::number("eps_readout_device", 1.0) != 0.0;   // vertex_debug: eps_readout_device
+    using eps_dmat_t = memory::array<DEVICE_MEMORY, ComplexType, 2>;
+    std::optional<eps_dmat_t> eZd, eAd, eMd, eId;
+    std::optional<memory::array<DEVICE_MEMORY, int, 1>> eipd;
+    nda::array<ComplexType, 1> eyZc(eps_dev ? Np : 0);
+    if (eps_dev) {
+      nda::array<ComplexType, 2> Ih(Np, Np);
+      Ih() = ComplexType(0.0);
+      for (long P = 0; P < Np; ++P) Ih(P, P) = ComplexType(1.0);
+      eId.emplace(memory::to_memory_space<DEVICE_MEMORY>(Ih));
+      eMd.emplace(Np, Np);
+      eipd.emplace(Np);
+    }
+#endif
     for (long iq = 0; iq < nq; ++iq) {
       auto qpts = MF->Qpts_ibz(iq);
       const double q_abs2 = qpts(0) * qpts(0) + qpts(1) * qpts(1) + qpts(2) * qpts(2);
@@ -1896,7 +1916,34 @@ namespace solvers {
       }
       const double factor = (q_abs2 / fpi) * MF->volume();
       chi_c = nda::conj(Chi_bar(iq, all));
+#if defined(ENABLE_DEVICE)
+      if (eps_dev) {                                             // this q's Z on the device, y = Z c on the host
+        nda::array<ComplexType, 2> Zq(Z_qPQ(iq, all, all));
+        eZd.emplace(memory::to_memory_space<DEVICE_MEMORY>(Zq));
+        nda::blas::gemv(Zq, chi_c, eyZc);
+      }
+#endif
       auto eps_of = [&](nda::array<ComplexType, 2> const *add, nda::array<ComplexType, 2> *dW_out) {
+#if defined(ENABLE_DEVICE)
+        if (eps_dev and dW_out == nullptr) {
+          nda::array<ComplexType, 2> Ah(Pi0_qPQ(iq, all, all));
+          if (add != nullptr) Ah += *add;
+          eAd.emplace(memory::to_memory_space<DEVICE_MEMORY>(Ah));
+          (*eMd)() = *eId;
+          nda::blas::gemm(ComplexType(-1.0), *eZd, *eAd, ComplexType(1.0), *eMd);   // M = I - Z (P0 + add)
+          int info = nda::lapack::getrf(*eMd, *eipd);
+          utils::check(info == 0, "pol_ladder_eps_readout: device getrf of I - Z P failed (info {}).", info);
+          nda::matrix<ComplexType, nda::F_layout> yh(Np, 1);
+          for (long P = 0; P < Np; ++P) yh(P, 0) = eyZc(P);
+          auto xd = memory::to_memory_space<DEVICE_MEMORY>(yh);
+          info = nda::lapack::getrs(*eMd, xd, *eipd);
+          utils::check(info == 0, "pol_ladder_eps_readout: device getrs failed (info {}).", info);
+          auto xh = memory::to_memory_space<HOST_MEMORY>(xd);
+          for (long P = 0; P < Np; ++P) buf(P) = xh(P, 0) - eyZc(P);   // (A^-1 - I) Z c
+          const ComplexType eih = factor * nda::blas::dot(Chi_bar(iq, all), buf);
+          return 1.0 / (1.0 + eih.real());
+        }
+#endif
         // A = I - Z (P0 [+ add]);  dW = (A^{-1} - I) Z;  head contraction
         A() = Pi0_qPQ(iq, all, all);
         if (add != nullptr) A += *add;
