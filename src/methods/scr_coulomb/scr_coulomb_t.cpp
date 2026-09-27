@@ -1328,10 +1328,10 @@ namespace solvers {
       double rss_ev = comm.all_reduce_value(rss_eval, boost::mpi3::max<>{});
       double rss_e0 = comm.all_reduce_value(rss_in, boost::mpi3::max<>{});
       app_log(1, "  [ladder-prof inject] iteration {}: ladder eval = {:.2f} s of {:.2f} s "
-                 "injection ({:.1f}%); upfold+nu->tau = {:.2f} s, meters = {:.2f} s; "
+                 "injection ({:.1f}%); upfold+nu->tau = {:.2f} s{}, meters = {:.2f} s; "
                  "cumulative ladder eval = {:.2f} s over {} iterations",
               ladder_meter::ncalls, t_eval, t_tot,
-              100.0 * t_eval / std::max(t_tot, 1e-300), t_upfold, t_diag,
+              100.0 * t_eval / std::max(t_tot, 1e-300), t_upfold, up_dev ? " (on the device)" : "", t_diag,
               ladder_meter::cum_eval, ladder_meter::ncalls);
       app_log(1, "  [ladder-prof inject] MaxRSS GB (max over ranks): entry {:.2f} -> "
                  "after ladder eval {:.2f} -> exit {:.2f}", rss_e0, rss_ev, rss_mx);
@@ -1917,6 +1917,8 @@ namespace solvers {
       const double factor = (q_abs2 / fpi) * MF->volume();
       chi_c = nda::conj(Chi_bar(iq, all));
 #if defined(ENABLE_DEVICE)
+      if (eps_dev and iq == (nq > 1 ? 1 : 0))
+        app_log(2, "  [scGW-tilde L2] eps readout: the single-frequency Dysons run on the device (solve A x = Z c).");
       if (eps_dev) {                                             // this q's Z on the device, y = Z c on the host
         nda::array<ComplexType, 2> Zq(Z_qPQ(iq, all, all));
         eZd.emplace(memory::to_memory_space<DEVICE_MEMORY>(Zq));
