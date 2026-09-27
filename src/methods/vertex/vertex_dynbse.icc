@@ -2621,6 +2621,13 @@ namespace solvers {
             hook.np, dmax, mloc.dsig_herm, opt.hermitize ? "Hermitized" : "NOT Hermitized", hook.ks_herm, hook.amax, hook.ymax, e_fit,
             dmet.fit_err_G, dmet.refit_err_max, dmet.ritz_max, mloc.all_converged, mloc.t_total, dmet.t_solve, hook.t_sig, dmet.rss_max_gb);
     app_log(1, "  [LFF-Sigma dyn] {}", dmet.l0_split_line());
+    // the per-unit work OUTSIDE the solve (gpu port, 2026-09-26: n3j left 45 % of the Sigma-side wall unaccounted): the same
+    // meter fields the P-side summary prints -- setup (the unit's tables, scratch, shift tables), the K_big THC contraction,
+    // the Cb tau-route chi0, the static-resolvent LU, the readout; the remainder is the deposits + dumps + scheduling
+    app_log(1, "  [LFF-Sigma dyn] unit split on the slowest rank: setup {:.1f} s, K_big build {:.1f} s, Cb {:.1f} s, LU {:.1f} s, solve {:.1f} s, "
+               "readout {:.1f} s, deposits {:.1f} s; wall {:.1f} s -> unaccounted {:.1f} s (dumps, nu-basis fit, reductions, scheduling)",
+            dmet.t_setup, dmet.t_kbig, dmet.t_cb, dmet.t_lu, dmet.t_solve, dmet.t_read, hook.t_sig, mloc.t_total,
+            mloc.t_total - dmet.t_setup - dmet.t_kbig - dmet.t_cb - dmet.t_lu - dmet.t_solve - dmet.t_read - hook.t_sig);
     if (hook.conv_kf >= 0.0)
       app_log(1, "  [LFF-Sigma dyn] product-route checks: w_to_tau[U_a] vs +KF {:.2e} / vs -KF {:.2e}; tau_to_w[G] vs pole-fit G {:.2e}; "
                  "max |fam1| on extension nodes {:.2e}{}", hook.conv_kf, hook.conv_kf_neg, hook.conv_g, hook.fam1_ext,
