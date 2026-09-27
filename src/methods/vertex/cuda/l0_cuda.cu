@@ -862,10 +862,10 @@ namespace methods::solvers::dynbse_cuda {
     cd *dR1U = upload_c(t.R1U, nsh2, "R1U"), *dR1T = upload_c(t.R1T, nsh2, "R1T");
     cd *dR3U = upload_c(t.R3U, nsh2, "R3U"), *dR3T = upload_c(t.R3T, nsh2, "R3T");
     cd *dF = alloc<cd>(nF, "F"), *dFs = alloc<cd>(nFs, "Fsum");
-    cu_check(cudaMemset(dF, 0, nF * sizeof(cd)), "memset F");
-    cu_check(cudaMemset(dFs, 0, nFs * sizeof(cd)), "memset Fsum");
+    cu_check(cudaMemsetAsync(dF, 0, nF * sizeof(cd), 0), "memset F");
+    cu_check(cudaMemsetAsync(dFs, 0, nFs * sizeof(cd), 0), "memset Fsum");
     int *derr = alloc<int>(1, "err");
-    cu_check(cudaMemset(derr, 0, sizeof(int)), "memset err");
+    cu_check(cudaMemsetAsync(derr, 0, sizeof(int), 0), "memset err");
     cu_check(cudaDeviceSynchronize(), "uploads");
     const double tt1 = dnow();                       // end of the fixed uploads (H2D)
 
@@ -951,7 +951,8 @@ namespace methods::solvers::dynbse_cuda {
     for (long ik0 = 0; ik0 < nk; ik0 += K) {
       const long Kb = std::min(K, nk - ik0);
       const int nb = int(Kb * ng);
-      for (cd *p : {dAU, dAT, dM2, dA1, dA3}) cu_check(cudaMemset(p, 0, size_t(Kb) * asz * sizeof(cd)), "memset acc");
+      for (cd *p : {dAU, dAT, dM2, dA1, dA3})              // at nu = 0 only AU, M2, A3 are written and read
+        if (not nu0 or (p != dAT and p != dA1)) cu_check(cudaMemsetAsync(p, 0, size_t(Kb) * asz * sizeof(cd), 0), "memset acc");
       pack_kernel<<<dim3(64u, unsigned(Kb), 1u), 256>>>(kd, ik0, Kb, nu0, dX, dXc, dVt);
       launch_check("pack_kernel");
       if (fused) {
@@ -1244,8 +1245,8 @@ namespace methods::solvers::dynbse_cuda {
     void apply(long nR, long nca, long const *act_h, bool skip_cst, bool sum_part1, cd const *Xfam, cd const *Xcst, cd *F, cd *Fs) {
       const long nc2 = nc * nc, D = nk * nc2;
       const size_t nF = size_t(2 * np) * D * nR, nFs = size_t(D) * nR;
-      cu_check(cudaMemset(F, 0, nF * sizeof(cd)), "plan memset F");
-      cu_check(cudaMemset(Fs, 0, nFs * sizeof(cd)), "plan memset Fs");
+      cu_check(cudaMemsetAsync(F, 0, nF * sizeof(cd), 0), "plan memset F");
+      cu_check(cudaMemsetAsync(Fs, 0, nFs * sizeof(cd), 0), "plan memset Fs");
       if (nca == 0) return;                                        // nothing to apply: F and Fs are zero
       if (nca > (nu0 ? 1 + np : 1 + 2 * np)) APP_ABORT(std::string(" l0_plan::apply: too many active components."));
       h2d(dact, act_h, size_t(nca), "plan act");
@@ -1258,13 +1259,14 @@ namespace methods::solvers::dynbse_cuda {
                                                          pVt, pGjT, pGlT, pGh, pPj, pQj, pBj);
         launch_check("plan fill_ptrs");
       }
-      cu_check(cudaMemset(derr, 0, sizeof(int)), "plan memset err");
+      cu_check(cudaMemsetAsync(derr, 0, sizeof(int), 0), "plan memset err");
       const cd one = make_cuDoubleComplex(1.0, 0.0), zero = make_cuDoubleComplex(0.0, 0.0);
       const int Ncols = int(nca * nR * nc), Mrows = int(nc * nca * nR);
       for (long ik0 = 0; ik0 < nk; ik0 += K) {
         const long Kb = std::min(K, nk - ik0);
         const int nb = int(Kb * ng);
-        for (cd *p : {dAU, dAT, dM2, dA1, dA3}) cu_check(cudaMemset(p, 0, size_t(Kb) * asz * sizeof(cd)), "plan memset acc");
+        for (cd *p : {dAU, dAT, dM2, dA1, dA3})            // at nu = 0 only AU, M2, A3 are written and read
+          if (not nu0 or (p != dAT and p != dA1)) cu_check(cudaMemsetAsync(p, 0, size_t(Kb) * asz * sizeof(cd), 0), "plan memset acc");
         pack_kernel<<<dim3(64u, unsigned(Kb), 1u), 256>>>(kd, ik0, Kb, nu0, Xfam, Xcst, dVt);
         launch_check("plan pack_kernel");
         if (fused) {
@@ -1558,7 +1560,7 @@ namespace methods::solvers::dynbse_cuda {
       const cd one = make_cuDoubleComplex(1.0, 0.0), zero = make_cuDoubleComplex(0.0, 0.0);
       const cd mscale = make_cuDoubleComplex(-e->scale.x, -e->scale.y);
       double fe = 0.0;
-      cu_check(cudaMemset(yfam, 0, size_t(2 * np) * W * sizeof(cd)), "ue memset y");
+      cu_check(cudaMemsetAsync(yfam, 0, size_t(2 * np) * W * sizeof(cd), 0), "ue memset y");
       const long nfam = e->nu0 ? 1 : 2;
       for (long fam = 0; fam < nfam; ++fam) {
         double t0 = wnow();
@@ -1591,7 +1593,7 @@ namespace methods::solvers::dynbse_cuda {
                               e->coef, int(W)), "ue coef");
         cub_check(cublasZgemm(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(W), int(nt), int(npf), &one, e->coef, int(W), e->Kmat, int(npf), &zero,
                               e->rec, int(W)), "ue rec");
-        cu_check(cudaMemset(e->red, 0, 2 * sizeof(unsigned long long)), "ue red");
+        cu_check(cudaMemsetAsync(e->red, 0, 2 * sizeof(unsigned long long), 0), "ue red");
         maxdiff_kernel<<<grid_red(nt * W), 256>>>(nt * W, e->Ys, e->rec, e->red);
         launch_check("ue maxdiff");
         unsigned long long r[2] = {0, 0};
@@ -1768,9 +1770,9 @@ namespace methods::solvers::dynbse_cuda {
     s.Mb = al(size_t(s.AC * nk * ng * nc2), "sd M");
     const size_t nS = size_t(nt * ns * nk * nc2);
     s.S = al(nS, "sd S"); s.RT = al(nS * size_t(np), "sd RT"); s.RU = al(nS * size_t(np), "sd RU");
-    cu_check(cudaMemset(s.S, 0, nS * sizeof(cd)), "sd zero S");
-    cu_check(cudaMemset(s.RT, 0, nS * size_t(np) * sizeof(cd)), "sd zero RT");
-    cu_check(cudaMemset(s.RU, 0, nS * size_t(np) * sizeof(cd)), "sd zero RU");
+    cu_check(cudaMemsetAsync(s.S, 0, nS * sizeof(cd), 0), "sd zero S");
+    cu_check(cudaMemsetAsync(s.RT, 0, nS * size_t(np) * sizeof(cd), 0), "sd zero RT");
+    cu_check(cudaMemsetAsync(s.RU, 0, nS * size_t(np) * sizeof(cd), 0), "sd zero RU");
     s.qcap = std::max({nt * nk, s.AC * nk, nk * ng});
     s.qA = dalloc<cd *>(size_t(s.qcap), "sd qA"); s.qB = dalloc<cd *>(size_t(s.qcap), "sd qB"); s.qC = dalloc<cd *>(size_t(s.qcap), "sd qC");
     for (void *p : {(void *)s.qA, (void *)s.qB, (void *)s.qC}) s.allocs.push_back(p);
@@ -1846,7 +1848,7 @@ namespace methods::solvers::dynbse_cuda {
     cub_check(cublasZgemm(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(nR), int(D), int(D), &one, Gs, int(nR), e->Ks, int(D),
                           with_y ? &one : &zero, s.Acst, int(nR)), "sd Acst");
     // the meters: max |A_cst|, max |y fam|, max |fam1 on an extension node|
-    cu_check(cudaMemset(s.red, 0, 4 * sizeof(unsigned long long)), "sd red");
+    cu_check(cudaMemsetAsync(s.red, 0, 4 * sizeof(unsigned long long), 0), "sd red");
     maxabs_kernel<<<grid_red(W), 256>>>(W, s.Acst, s.red);
     if (with_y) {
       maxabs_kernel<<<grid_red(2 * np * W), 256>>>(2 * np * W, e->yfam, s.red + 1);
@@ -1978,7 +1980,7 @@ namespace methods::solvers::dynbse_cuda {
         cu_check(cudaMemcpy(tmp.data(), d + o, m * sizeof(cd), cudaMemcpyDeviceToHost), "sd flush d2h");
         for (size_t i = 0; i < m; ++i) h[o + i] += tmp[i];
       }
-      cu_check(cudaMemset(d, 0, n * sizeof(cd)), "sd flush zero");
+      cu_check(cudaMemsetAsync(d, 0, n * sizeof(cd), 0), "sd flush zero");
     };
     pull(s.S, S_cst, nS);
     if (RT != nullptr) pull(s.RT, RT, nA);
@@ -2106,7 +2108,7 @@ namespace methods::solvers::dynbse_cuda {
       }
     }
     // the Sigma hook's |K_s - K_s^dag| meter
-    cu_check(cudaMemset(e->red, 0, 2 * sizeof(unsigned long long)), "kb red");
+    cu_check(cudaMemsetAsync(e->red, 0, 2 * sizeof(unsigned long long), 0), "kb red");
     herm_kernel<<<grid_red(D * D), 256>>>(D, e->Ks, e->red);
     launch_check("kb herm");
     unsigned long long r[2] = {0, 0};
@@ -2142,7 +2144,7 @@ namespace methods::solvers::dynbse_cuda {
     if (n <= 0) return 0.0;
     unsigned long long *slot = nullptr;
     cu_check(cudaMalloc(&slot, sizeof(unsigned long long)), "dev_maxabs slot");
-    cu_check(cudaMemset(slot, 0, sizeof(unsigned long long)), "dev_maxabs zero");
+    cu_check(cudaMemsetAsync(slot, 0, sizeof(unsigned long long), 0), "dev_maxabs zero");
     maxabs_kernel<<<grid_red(n), 256>>>(n, reinterpret_cast<cd const *>(x), slot);
     launch_check("dev_maxabs");
     unsigned long long r = 0;
@@ -2236,7 +2238,7 @@ namespace methods::solvers::dynbse_cuda {
       cub_check(cublasZgemm(h, CUBLAS_OP_N, CUBLAS_OP_N, int(nb), int(nt), int(npf), &one, dec, int(nb), dK, int(npf), &zero, drec,
                             int(nb)), "fin rec");
       unsigned long long *red = dalloc<unsigned long long>(2, "fin red");
-      cu_check(cudaMemset(red, 0, 2 * sizeof(unsigned long long)), "fin red zero");
+      cu_check(cudaMemsetAsync(red, 0, 2 * sizeof(unsigned long long), 0), "fin red zero");
       maxdiff_kernel<<<grid_red(nt * nb), 256>>>(nt * nb, dE, drec, red);
       launch_check("fin fit error");
       unsigned long long r[2] = {0, 0};
