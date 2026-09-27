@@ -5031,6 +5031,12 @@ namespace solvers {
     _Timer.start("W0_BARRIER");
     mpi->comm.barrier();
     _Timer.stop("W0_BARRIER");
+    // gpu port 2026-09-27: the stage walls (p1gpu_n3s: 15 s of the RPA hook left in build_w0 once its Dysons ran on the device;
+    // the head stage carries the one-time secondary-basis build)
+    app_log(1, "  [build_w0 wall, cumulative] layout {:.1f} s, Pi0 row {:.1f} s, Dysons {:.1f} s, head (+ the lazy secondary basis) "
+               "{:.1f} s, assemble {:.1f} s, fold {:.1f} s, barrier {:.1f} s", _Timer.elapsed("W0_LAYOUT"), _Timer.elapsed("W0_PI0_ROW"),
+            _Timer.elapsed("W0_DYSON"), _Timer.elapsed("W0_HEAD"), _Timer.elapsed("W0_ASSEMBLE"), _Timer.elapsed("W0_FOLD"),
+            _Timer.elapsed("W0_BARRIER"));
   }
 
   // template instantiations
