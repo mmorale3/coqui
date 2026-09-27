@@ -485,11 +485,18 @@ namespace solvers {
 
     mb_state.screen_type = _screen_type;
 
+    // gpu port 2026-09-27: wall clock of the vertex-side blocks of update_w (the TEMP_UW timers do not separate them)
+    auto uw_wall = [] { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
     if (pol_dyn_readout) {
+      const double w0 = uw_wall();
       _pol_vtx->cache_w(mb_state, thc);
+      const double w1 = uw_wall();
       pol_ladder_eps_readout(mb_state, thc, _pol_pi0_qPQ, std::addressof(eps_inv_head_q));
+      app_log(1, "  [update_w wall] readout instance: W-bar cache fill {:.1f} s, eps readout (incl. the dynamic-rung driver) {:.1f} s",
+              w1 - w0, uw_wall() - w1);
     }
 
+    const double w_dump0 = uw_wall();
     _Timer.start("TEMP_UW_dump_eps_inv_head");
     if (h5_iter>=0) {
       // This writes the same file, the same scf/iter<N> group and from the same
@@ -549,15 +556,19 @@ namespace solvers {
     // lag as the retained-dW path); the scf driver then frees dW unconditionally in
     // this mode (needs_dw_retention() == false -- plain-GW memory profile).
     // (dynamic rung only: the static modes retired the cache -- see needs_dw_retention)
+    const double w_c0 = uw_wall();
     if (_vertex != nullptr and _vertex->active() and _vertex->rung() == dynamic_rung
         and _vertex->secondary() and _vertex->w_cache_enabled())
       _vertex->cache_w(mb_state, thc);
+    const double w_c1 = uw_wall();
 
     // LFF-Sigma (Route 1): the vertex correction of W for Sigma ONLY, from THIS iteration's W -- after every other
     // consumer of dW (the kernel cache above included), so W, W-bar and the readout are exactly those without the knob.
     if (_vertex != nullptr and _vertex->sigma_lff_enabled()) build_sigma_lff(mb_state, thc, t_pgrid, t_bsize);
     // LFF-Sigma Route 2 (L-6): the pair-resolved static-ladder vertex in Sigma, on the readout instance (same placement)
     if (_vertex != nullptr and _vertex->sigma_pair_enabled()) build_sigma_pair(mb_state, thc);
+    app_log(1, "  [update_w wall] from the eps-head dump to the vertex caches {:.1f} s; the user vertex's W-bar cache fill {:.1f} s; "
+               "the Sigma vertex (LFF / pair) {:.1f} s", w_c0 - w_dump0, w_c1 - w_c0, uw_wall() - w_c1);
 
     print_timers();
   }
