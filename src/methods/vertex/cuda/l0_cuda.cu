@@ -1117,7 +1117,7 @@ namespace methods::solvers::dynbse_cuda {
         cu_check(cudaDeviceSynchronize(), "ue dlr");
         tim[7] += wnow() - t0; t0 = wnow();
         // the dense rung: Ys_i^T (nR x D) = scale Fs_i^T (nR x D) . K_d(rep_i)^T (D x D)
-        std::vector<cd *> hA(size_t(nt)), hB(size_t(nt)), hC(size_t(nt));
+        std::vector<cd *> hA(static_cast<size_t>(nt)), hB(static_cast<size_t>(nt)), hC(static_cast<size_t>(nt));
         for (long i = 0; i < nt; ++i) {
           hA[size_t(i)] = e->Fs + size_t(i) * W;
           hB[size_t(i)] = e->Kds + size_t(e->trep[size_t(i)]) * size_t(D) * size_t(D);
