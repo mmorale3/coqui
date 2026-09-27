@@ -131,8 +131,9 @@ namespace methods::solvers::dynbse_cuda {
   /** bytes the engine needs for a configuration (the caller's feasibility check) */
   double ue_bytes(ue_config const &c);
 
-  /** run-wide: KF, KF2 (nt, np) real; the active refit: Ut (n_kept, nt), Vs (np, n_kept), Kmat (nt, np) real */
-  void ue_set_basis(unit_engine *e, double const *KF, double const *KF2, double const *Ut, double const *Vs, double const *Kmat);
+  /** run-wide: KF, KF2 (nt, np) real; the basis' DLR refit (imag_axes_ft::dlr_pole_fit at its fixed rank, the np_fit DLR
+   *  nodes): Ut (n_kept, nt) = its first n_kept rows, Vs (np_fit, n_kept) = its first n_kept columns (compacted), Kc (nt, np_fit) */
+  void ue_set_basis(unit_engine *e, double const *KF, double const *KF2, cplx const *Ut, cplx const *Vs, cplx const *Kc);
   /** per (s, q): K_s (D, D), K_d(s_r) (ndist, D, D), K_d(0) (D, D); trep (nt) maps a tau node to its representative */
   void ue_set_rung(unit_engine *e, cplx const *Ks, cplx const *Kds, cplx const *Kd0, long const *trep, cplx scale_k);
   /** per (s, q, nu): Cb_k (nk, nc^2, nc^2); the L0 tables (host pointers; Xfam / Xcst / act of t are ignored); returns the
@@ -142,6 +143,37 @@ namespace methods::solvers::dynbse_cuda {
    *  out when non-null (the host deposits). Returns the worst tau-refit error of K_d. timing (8): [0] L0, [1] T_s,
    *  [2] rung, [3] refit, [4] vector ops, [5] H2D, [6] D2H, [7] the DLR expansion gemm -- all ADDED, seconds. */
   double ue_gamma1(unit_engine *e, long nR, cplx const *Dblk, cplx *Gsum0, cplx *Gsum1, cplx *y1fam, cplx *y1cst, double *timing);
+
+  // ---- D-3: THE SIGMA DEPOSITS ON THE DEVICE (vertex_sigma_dyn.icc::sigma_dyn_accumulate, the production path: the product
+  // route, split accumulators, no IBZ fold, no dump, the DW legs). They read the engine's resident output of the last
+  // ue_gamma1 (Gsum0 / Gsum1, y1 = (fam, cst)) and K_s, deposit into device-resident S_cst / RT / RU, and are flushed (ADDED)
+  // into the host accumulators before a checkpoint and at the end of the run. Per block (width nR, D = nk nc^2):
+  //   A_cst = K_s Gs + y.cst;  DW(k; c i, r) = sum_M conj(Dc(k, c, i, M)) W(r, M);
+  //   A_w(n) = A_cst + sum_a U_a(i w_n) fam0_a (+ U_a^2 fam1_a at nu = 0);  F_w(n, k; c y r) = sum_x G(n, k)_{c x} A_w(n, k; x y r);
+  //   F_t = [w(tau) Ttw_ff] F_w;  S_cst(tau, s, kpq(k)) += sum_{c r} DW(k; c i, r) F_t(tau, k; c j, r)
+  //   T family (nu != 0): Y_a(k; c i, x j) = sum_r DW(k; c i, r) fam1_a(k; x j, r);  M_aj(k; i j) = sum_{c x} g_j(k; c, x) Y_a(c i, x j);
+  //   RT_a -= WkT_a M_a,  RU_a += WkU_a M_a,  RU_{gnode(j)} -= sum_a WkU(a, j) M_aj   (batched cuBLAS over (a, k) / (k, j))
+  // =====================================================================================================================
+  struct sd_config {
+    long nt = 0, nw_f = 0, ns = 0, nk = 0, nc = 0, np = 0, np_fit = 0, ng = 0, Nm = 0;
+  };
+  /** run-wide: Ttw_ff (nt, nw_f) the fermionic w -> tau matrix; Uw (nw_f, np) = 1 / (i w_n - e_a); Gw (nw_f, ns, nk, nc, nc)
+   *  G on the fermionic nodes; eps (np), epsG (ng) for the confluence check. Allocates and zeroes the accumulators. false
+   *  (with `why`) when the device cannot hold them -- the caller then keeps the host deposits. */
+  bool ue_sd_init(unit_engine *e, sd_config const &c, cplx const *Ttw, cplx const *Uw, cplx const *Gw, double const *eps,
+                  double const *epsG, double free_bytes, char *why, long why_len);
+  /** per (s, q): the external legs Dc (nk, nc, nc, Nm), the row kpq(iq, :) (nk), the G residues gk (ng, nk, nc, nc), gnode (ng) */
+  void ue_sd_set_sq(unit_engine *e, cplx const *Dc, long const *kpq_row, cplx const *gk, long const *gnode);
+  /** per unit (node m): the cst + U deposit weights w (nt); the T-family tables WkT (np, ng, nt) (RT_a -= sum_j WkT M_aj) and
+   *  WkU (np, ng, nt) (RU_a += sum_j WkU M_aj, RU_{n_j} -= sum_a WkU M_aj); both nullptr = no T family at this unit */
+  void ue_sd_set_unit(unit_engine *e, cplx const *w, cplx const *WkT, cplx const *WkU);
+  /** per block, right after ue_gamma1 of the same block: col 0 = static_dyn (Gsum0, no y), 1 = dyn1_bare (Gsum0 + y1),
+   *  2 = dyn1 (Gsum1 + y1); Wblk (nR, Nm) the block's rows of the outer W; meters (3) max-accumulated: max |A_cst|,
+   *  max |y fam|, max |fam1| on an extension node a >= np_fit; timing (1) ADDED. Aborts on a confluent U_j T_a. */
+  void ue_sd_block(unit_engine *e, long is, long nR, int col, cplx const *Wblk, bool use_U, bool use_T, double *meters,
+                   double *timing);
+  /** ADD the device accumulators into the host ones -- S_cst (nt, ns, nk, nc, nc), RT / RU (nt, ns, nk, np, nc, nc) -- and zero them */
+  void ue_sd_flush(unit_engine *e, cplx *S_cst, cplx *RT, cplx *RU);
 
 } // namespace methods::solvers::dynbse_cuda
 

@@ -459,6 +459,33 @@ namespace solvers {
     }
 
     /** one RHS block of one unit: deposit the block's contribution to S_cst / RT (see the file header; the product route) */
+    /** the sampled mode's W_kappa(a, j, tau) = sum_m' Ttw(tau, m') R_a(m', m) kappa_aj(m') of node m (cached in h.wk) */
+    inline nda::array<ComplexType, 3> const &sigma_dyn_wk_table(sigma_dyn_hook &h, dynbse::freq_basis const &b, dynbse::pair_poles const &P,
+                                                                long m, long nt, vertex_pi::iaft_tools const &tools) {
+      using cplx = ComplexType;
+      auto itw = h.wk.find(m);
+      if (itw == h.wk.end()) {
+        const long np = b.np, ng = P.ng;
+        utils::check(h.R_T.size() > 0, "sigma_dyn_accumulate: sampled mode without the T-family reconstruction.");
+        const long nw_b = tools.nw_b;
+        nda::array<cplx, 3> W(np, ng, nt);
+        W() = cplx(0.0);
+        nda::array<cplx, 1> inu_all(nw_b);
+        for (long mm = 0; mm < nw_b; ++mm) inu_all(mm) = tools.ft->omega(tools.wn_b(mm));
+        for (long a = 0; a < np; ++a)
+          for (long mm = 0; mm < nw_b; ++mm) {
+            const cplx r = h.R_T(a, mm, m);
+            if (r == cplx(0.0)) continue;
+            for (long j = 0; j < ng; ++j) {
+              const cplx rk = r / (inu_all(mm) - cplx(b.eps(a) - P.epsG(j)));
+              for (long it = 0; it < nt; ++it) W(a, j, it) += tools.Ttw_bb(it, mm) * rk;
+            }
+          }
+        itw = h.wk.emplace(m, std::move(W)).first;
+      }
+      return itw->second;
+    }
+
     inline void sigma_dyn_accumulate(sigma_dyn_hook &h, dynbse::freq_basis const &b, dynbse::pair_poles const &P, ComplexType inu,
                                      dynbse::dyson_result const &res, nda::array<ComplexType, 2> const &Ks,
                                      nda::array<ComplexType, 4> const &Dc, long N0, long N1,
@@ -629,26 +656,7 @@ namespace solvers {
       if (yv != nullptr and not nu0 and h.use_T) {
         nda::array<cplx, 3> const *Wk = nullptr;
         if (h.sampled) {
-          auto itw = h.wk.find(m);
-          if (itw == h.wk.end()) {
-            utils::check(h.R_T.size() > 0, "sigma_dyn_accumulate: sampled mode without the T-family reconstruction.");
-            const long nw_b = tools.nw_b;
-            nda::array<cplx, 3> W(np, ng, nt);
-            W() = cplx(0.0);
-            nda::array<cplx, 1> inu_all(nw_b);
-            for (long mm = 0; mm < nw_b; ++mm) inu_all(mm) = tools.ft->omega(tools.wn_b(mm));
-            for (long a = 0; a < np; ++a)
-              for (long mm = 0; mm < nw_b; ++mm) {
-                const cplx r = h.R_T(a, mm, m);
-                if (r == cplx(0.0)) continue;
-                for (long j = 0; j < ng; ++j) {
-                  const cplx rk = r / (inu_all(mm) - cplx(b.eps(a) - P.epsG(j)));
-                  for (long it = 0; it < nt; ++it) W(a, j, it) += tools.Ttw_bb(it, mm) * rk;
-                }
-              }
-            itw = h.wk.emplace(m, std::move(W)).first;
-          }
-          Wk = &itw->second;
+          Wk = &sigma_dyn_wk_table(h, b, P, m, nt, tools);
           if (h.single_acc and h.wkT.find(m) == h.wkT.end()) {
             // P4-C14: W_kappa with M_a (the T pieces) and K_F(., a) (the U pieces) folded in, per sampled node
             sigma_dyn_single_tables(h, tools);
@@ -809,6 +817,121 @@ namespace solvers {
       ++h.nblocks;
       h.t_sig += watch.lap();
     }
+
+#if defined(ENABLE_CUDA)
+    /** D-3 (gpu port plan 4d, 2026-09-27): THE DEPOSITS ON THE DEVICE ENGINE. sigma_dyn_accumulate's production path -- the
+     *  product route, split accumulators, no IBZ fold, no dump, the DW legs, col static_dyn | dyn1_bare | dyn1 -- as batched
+     *  cuBLAS on the engine's resident Gamma_1 output (dynbse_cuda::ue_sd_*); the accumulators live on the device and are
+     *  ADDED into the hook's before every checkpoint write and at the end of the driver call. The arithmetic is the host's
+     *  with the order of a few products changed (w(tau) folded into the w -> tau matrix, the j-sums of the all-node T
+     *  family inside the gemms): rounding class. vertex_debug dynbse_dev_sigma = 0 keeps the host deposits (the A/B). */
+    inline bool sigma_dyn_device_ok(sigma_dyn_hook const &h) {
+      const bool legs_wm = (vertex_debug::text("sigdyn_legs", "dw") == "wm");
+      return vertex_debug::number("dynbse_dev_sigma", 1.0) != 0.0 and not h.poles and not h.ibz and not h.dump and   // vertex_debug: dynbse_dev_sigma
+             not h.single_acc and not legs_wm and (h.col == "static_dyn" or h.col == "dyn1_bare" or h.col == "dyn1");
+    }
+    struct sigma_dyn_dev {
+      bool on = false;
+      long is = -1, iq = -1, m = -1;
+      ComplexType inu = ComplexType(-1.0, -1.0);
+    };
+    /** the run-wide tables to the engine (runs sigma_dyn_precompute first); false (why) = the device cannot hold the accumulators */
+    inline bool sigma_dyn_device_init(sigma_dyn_hook &h, sigma_dyn_dev &d, dynbse_cuda::unit_engine *ue, dynbse::freq_basis const &b,
+                                      nda::MemoryArrayOfRank<5> auto const &G_CC, dynbse::pair_poles const &P, long Nm,
+                                      vertex_pi::iaft_tools const &tools, std::string &why) {
+      using cplx = ComplexType;
+      if (not h.pre_ok) sigma_dyn_precompute(h, b, G_CC, tools);
+      const long nt = G_CC.shape(0), ns = G_CC.shape(1), nk = G_CC.shape(2), nc = G_CC.shape(3), np = b.np, nw_f = h.Gw.shape(0);
+      nda::array<cplx, 2> Uw(nw_f, np);
+      for (long n = 0; n < nw_f; ++n)
+        for (long a = 0; a < np; ++a) Uw(n, a) = cplx(1.0) / (h.iw(n) - b.eps(a));
+      nda::array<cplx, 2> Ttw(tools.ft->Ttw_ff());
+      utils::check(Ttw.shape(0) == nt and Ttw.shape(1) == nw_f, "sigma_dyn_device_init: Ttw_ff is ({}, {}), expected ({}, {}).",
+                   Ttw.shape(0), Ttw.shape(1), nt, nw_f);
+      utils::check(P.nk == nk and P.nc == nc, "sigma_dyn_device_init: the pair poles' (nk, nc) differ from G's.");
+      dynbse_cuda::sd_config c;
+      c.nt = nt; c.nw_f = nw_f; c.ns = ns; c.nk = nk; c.nc = nc; c.np = np; c.np_fit = b.np_fit; c.ng = P.ng; c.Nm = Nm;
+      char buf[256] = {0};
+      nda::array<double, 1> epsG(P.epsG);
+      d.on = dynbse_cuda::ue_sd_init(ue, c, Ttw.data(), Uw.data(), h.Gw.data(), b.eps.data(), epsG.data(),
+                                     1.0e6 * double(utils::freemem_device_effective()), buf, 256);
+      why = buf;
+      return d.on;
+    }
+    /** one block's deposits (right after the engine's ue_gamma1 of the same block): the device twin of sigma_dyn_accumulate */
+    inline void sigma_dyn_accumulate_device(sigma_dyn_hook &h, sigma_dyn_dev &d, dynbse_cuda::unit_engine *ue, dynbse::freq_basis const &b,
+                                            dynbse::pair_poles const &P, ComplexType inu, nda::array<ComplexType, 4> const &Dc,
+                                            long N0, long N1, nda::array<ComplexType, 2> const &Wout, nda::array<long, 2> const &kpq,
+                                            long is, long iq, long m, vertex_pi::iaft_tools const &tools) {
+      using cplx = ComplexType;
+      vertex_ladder_detail::prof_watch watch;
+      if (not h.nodes_active.empty() and h.nodes_active.count(m) == 0) return;   // P3: a node outside the Sigma node set
+      utils::check(h.pre_ok and h.eps_pre.shape(0) == b.eps.shape(0) and nda::max_element(nda::abs(h.eps_pre - b.eps)) == 0.0,
+                   "sigma_dyn_accumulate_device: the unit's node set differs from the first unit's.");
+      const long nt = h.S_cst.shape(0), nk = P.nk, nc = P.nc, np = b.np, ng = P.ng, Nm = Dc.shape(3), nR = N1 - N0;
+      const bool nu0 = (inu == cplx(0.0));
+      utils::check(Wout.shape(0) == Nm and Wout.shape(1) == Nm, "sigma_dyn_accumulate_device: W-out is not (Nm, Nm).");
+      if (h.conv_g < 0.0) {   // the host's convention meter: tau_to_w[G_CC] against the pole-fit G of this unit (spin is)
+        const long nw_f = h.Gw.shape(0);
+        double dm = 0.0, sc = 0.0;
+        for (long n = 0; n < nw_f; ++n)
+          for (long ik = 0; ik < nk; ++ik)
+            for (long c = 0; c < nc; ++c)
+              for (long x = 0; x < nc; ++x) {
+                cplx gp(0.0);
+                for (long j = 0; j < ng; ++j) gp += P.gk(j, ik, c, x) / (h.iw(n) - P.epsG(j));
+                dm = std::max(dm, std::abs(gp - h.Gw(n, is, ik, c, x)));
+                sc = std::max(sc, std::abs(h.Gw(n, is, ik, c, x)));
+              }
+        h.conv_g = (sc > 0.0) ? dm / sc : dm;
+      }
+      if (is != d.is or iq != d.iq) {                     // the transfer's legs, pair map and G residues
+        dynbse_cuda::ue_sd_set_sq(ue, Dc.data(), &kpq(iq, 0), P.gk.data(), P.gnode.data());
+        d.is = is; d.iq = iq;
+      }
+      const int col = (h.col == "static_dyn") ? 0 : ((h.col == "dyn1_bare") ? 1 : 2);
+      if (m != d.m or inu != d.inu) {                     // the node's weights and T-family tables
+        nda::array<cplx, 1> w(nt);
+        for (long it = 0; it < nt; ++it) w(it) = h.wc(tools, it, m);
+        const bool T = (col != 0 and not nu0 and h.use_T);
+        nda::array<cplx, 3> WkT, WkU;
+        if (T) {
+          WkT = nda::array<cplx, 3>(np, ng, nt);
+          WkU = nda::array<cplx, 3>(np, ng, nt);
+          nda::array<cplx, 3> const *Wk = h.sampled ? &sigma_dyn_wk_table(h, b, P, m, nt, tools) : nullptr;
+          for (long a = 0; a < np; ++a)
+            for (long j = 0; j < ng; ++j) {
+              const double dd = b.eps(a) - P.epsG(j);
+              const cplx kap = cplx(1.0) / (inu - cplx(dd));
+              const cplx kapd = (std::abs(dd) > 1e-10) ? kap / cplx(dd) : cplx(0.0);
+              if (Wk != nullptr) {                          // sampled: RT -= W_kappa M, RU += W_kappa / Delta M (the host's dinv)
+                const cplx dinv = (kap != cplx(0.0)) ? kapd / kap : cplx(0.0);
+                for (long it = 0; it < nt; ++it) { WkT(a, j, it) = (*Wk)(a, j, it); WkU(a, j, it) = dinv * (*Wk)(a, j, it); }
+              } else {                                      // all nodes: w = Ttw(tau, m), kappa and kappa / Delta at this node
+                for (long it = 0; it < nt; ++it) {
+                  const cplx tw = tools.Ttw_bb(it, m);
+                  WkT(a, j, it) = tw * kap;
+                  WkU(a, j, it) = tw * kapd;
+                }
+              }
+            }
+        }
+        dynbse_cuda::ue_sd_set_unit(ue, w.data(), T ? WkT.data() : nullptr, T ? WkU.data() : nullptr);
+        d.m = m; d.inu = inu;
+      }
+      double met[3] = {h.amax, h.ymax, h.fam1_ext};
+      double t = 0.0;
+      dynbse_cuda::ue_sd_block(ue, is, nR, col, Wout.data() + N0 * Nm, h.use_U, h.use_T, met, &t);
+      h.amax = met[0]; h.ymax = met[1]; h.fam1_ext = met[2];
+      ++h.nblocks;
+      h.t_sig += watch.lap();
+    }
+    /** the device accumulators ADDED into the hook's (and zeroed on the device) */
+    inline void sigma_dyn_device_flush(sigma_dyn_hook &h, sigma_dyn_dev const &d, dynbse_cuda::unit_engine *ue) {
+      if (not d.on or ue == nullptr) return;
+      dynbse_cuda::ue_sd_flush(ue, h.S_cst.data(), h.RT.data(), h.RU.data());
+    }
+#endif
 
     /** the assembly after the all-reduce of the accumulators: dSig (nt, ns, nk, nc, nc) = -(scale/nk) [S_cst + sum_p K_F RU_p + Sigma_T] */
     inline void sigma_dyn_finish(sigma_dyn_hook const &h, double scale, long nk_norm, nda::array<ComplexType, 5> &dSig,

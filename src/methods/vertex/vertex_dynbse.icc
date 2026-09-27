@@ -41,6 +41,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -961,7 +962,9 @@ namespace solvers {
           app_log(1, "  [LFF-Sigma dyn] Sigma checkpoint \"{}.r*.h5\": {} files, {} finished units loaded (skipped); interval {:.1f} min",
                   opt.sigma_ckpt, tot_files, tot_units, opt.sigma_ckpt_minutes);
       }
+      std::function<void()> sd_flush_hook;                       // D-3: the device Sigma accumulators into the hook's
       auto write_sig_ckpt = [&]() {
+        if (sd_flush_hook) sd_flush_hook();                      // (also at the final call below, checkpoints or not)
         if (not sig_ckpt) return;
         opt.sigma->flush_unit();
         const std::string fn = opt.sigma_ckpt + ".r" + std::to_string(rank) + ".h5";
@@ -1200,6 +1203,7 @@ namespace solvers {
                            not (opt.sigma != nullptr and opt.sigma->col == "dyn");
       bool ue_tried = false;
       db::l0_table_store ue_store;
+      sigma_dyn_dev sd_dev;                                // D-3: the Sigma deposits on the engine (off = the host deposits)
 #endif
       if (met) { met->unit_diag = nda::array<double, 2>(nunits_all, 13); met->unit_diag() = 0.0; }
       for (long u = next_unit(pos); u >= 0; u = next_unit(pos)) {
@@ -1361,10 +1365,26 @@ namespace solvers {
           uc.ndist = ndist; uc.n_kept = b.pf.n_kept;
           char why[256] = {0};
           ue.reset(dynbse_cuda::ue_create(uc, 1.0e6 * double(utils::freemem_device_effective()), why, 256));
-          if (ue) dynbse_cuda::ue_set_basis(ue.get(), b.KF.data(), b.KF2.data(), b.pf.Ut.data(), b.pf.Vs.data(), b.pf.Kmat.data());
+          if (ue) {                                       // the basis' DLR refit at its fixed rank (basis_coeffs, npf_mask off)
+            auto const &pf = b.pf;
+            utils::check(pf.np == b.np_fit and pf.nt == nt and pf.n_kept == b.pf.n_kept,
+                         "pair_space_ladder_dyn: the DLR refit's size ({}, {}) differs from the basis' ({}, {}).", pf.np, pf.nt, b.np_fit, nt);
+            nda::array<cplx, 2> Utk(pf.n_kept, nt), Vsk(pf.np, pf.n_kept), Kck(pf.Kc);
+            Utk() = pf.Ut(nda::range(0, pf.n_kept), all);
+            Vsk() = pf.Vs(all, nda::range(0, pf.n_kept));
+            dynbse_cuda::ue_set_basis(ue.get(), b.KF.data(), b.KF2.data(), Utk.data(), Vsk.data(), Kck.data());
+          }
           if (rank == 0)
             app_log(1, "  [dynbse] device-resident unit: {} ({:.1f} GB estimated){}{}", ue ? "ON" : "OFF, the host path runs",
                     dynbse_cuda::ue_bytes(uc) / 1e9, ue ? "" : " -- ", ue ? "" : why);
+          if (ue and opt.sigma != nullptr and not wan and sigma_dyn_device_ok(*opt.sigma)) {
+            std::string why_sd;
+            const bool ok = sigma_dyn_device_init(*opt.sigma, sd_dev, ue.get(), b, G_CC, *Pcache, Nm, tools, why_sd);
+            if (rank == 0)
+              app_log(1, "  [dynbse] device Sigma deposits: {}{}", ok ? "ON (accumulators resident, flushed at checkpoints and the end)"
+                                                                        : "OFF, the host deposits run -- ", ok ? "" : why_sd);
+            if (ok) sd_flush_hook = [&]() { sigma_dyn_device_flush(*opt.sigma, sd_dev, ue.get()); };
+          }
         }
         if (ue) dynbse_cuda::ue_set_rung(ue.get(), Ks.data(), Kd_s.data(), Kd0.data(), trep.data(), scale_k);
 #endif
@@ -1543,10 +1563,11 @@ namespace solvers {
               res = db::dyson_result{};
               res.Gsum0 = nda::array<cplx, 4>(nk, nc, nc, nR);
               res.Gsum1 = nda::array<cplx, 4>(nk, nc, nc, nR);
-              if (keep_y) { res.y1 = db::tf_vector(np, nk, nc, nR); res.has_y = true; }
+              const bool y_host = keep_y and not sd_dev.on;     // D-3: the device deposits read y1 where it is
+              if (y_host) { res.y1 = db::tf_vector(np, nk, nc, nR); res.has_y = true; }
               double tim[8] = {0, 0, 0, 0, 0, 0, 0, 0};
               res.fit_err_max = dynbse_cuda::ue_gamma1(ue.get(), nR, Dblk.data(), res.Gsum0.data(), res.Gsum1.data(),
-                                                       keep_y ? res.y1.fam.data() : nullptr, keep_y ? res.y1.cst.data() : nullptr, tim);
+                                                       y_host ? res.y1.fam.data() : nullptr, y_host ? res.y1.cst.data() : nullptr, tim);
               res.Gsum = res.Gsum1; res.iterations = 1; res.converged = true;
               if (met) {
                 met->t_l0 += tim[0]; met->t_l0_dev += tim[0]; met->t_ts += tim[1]; met->t_rung += tim[2] + tim[7];
@@ -1597,6 +1618,11 @@ namespace solvers {
                 for (long M = 0; M < Nm; ++M)
                   for (long N = 0; N < Nm; ++N) Wout(M, N) += Wbh(iq, lp, M, N) - Wd0(iq, M, N);
               }
+#if defined(ENABLE_CUDA)
+              if (sd_dev.on)
+                sigma_dyn_accumulate_device(*opt.sigma, sd_dev, ue.get(), b, P, inu, Dc, N0, N1, Wout, kpq, is, iq, m, tools);
+              else
+#endif
               sigma_dyn_accumulate(*opt.sigma, b, P, inu, res, Ks, Dc, N0, N1, Wout, G_CC, kpq, is, iq, m, tools);
             }
             readout(res.Gsum0, Pi_static);
@@ -2756,9 +2782,9 @@ namespace solvers {
     // meter fields the P-side summary prints -- setup (the unit's tables, scratch, shift tables), the K_big THC contraction,
     // the Cb tau-route chi0, the static-resolvent LU, the readout; the remainder is the deposits + dumps + scheduling
     app_log(1, "  [LFF-Sigma dyn] unit split on the slowest rank: setup {:.1f} s, K_big build {:.1f} s, Cb {:.1f} s, LU {:.1f} s, solve {:.1f} s, "
-               "readout {:.1f} s, deposits {:.1f} s; wall {:.1f} s -> unaccounted {:.1f} s (dumps, nu-basis fit, reductions, scheduling)",
+               "readout {:.1f} s (deposits {:.1f} s, inside the solve); wall {:.1f} s -> unaccounted {:.1f} s (dumps, nu-basis fit, reductions, scheduling)",
             dmet.t_setup, dmet.t_kbig, dmet.t_cb, dmet.t_lu, dmet.t_solve, dmet.t_read, hook.t_sig, mloc.t_total,
-            mloc.t_total - dmet.t_setup - dmet.t_kbig - dmet.t_cb - dmet.t_lu - dmet.t_solve - dmet.t_read - hook.t_sig);
+            mloc.t_total - dmet.t_setup - dmet.t_kbig - dmet.t_cb - dmet.t_lu - dmet.t_solve - dmet.t_read);
     if (hook.conv_kf >= 0.0)
       app_log(1, "  [LFF-Sigma dyn] product-route checks: w_to_tau[U_a] vs +KF {:.2e} / vs -KF {:.2e}; tau_to_w[G] vs pole-fit G {:.2e}; "
                  "max |fam1| on extension nodes {:.2e}{}", hook.conv_kf, hook.conv_kf_neg, hook.conv_g, hook.fam1_ext,
