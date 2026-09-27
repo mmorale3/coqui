@@ -28,6 +28,7 @@
 #include <optional>
 #include <sys/resource.h>
 #include "methods/vertex/vertex_debug.hpp"
+#include "utilities/omp_threads.hpp"
 #include "utilities/h5_background_writer.hpp"
 #include "utilities/freemem.h"
 #include "methods/ERI/thc_reader_t.hpp"
@@ -1193,7 +1194,12 @@ namespace solvers {
 
     // ||P^RPA||_max BEFORE the +=, on the same grid (the comparison the ratio reports)
     double nR = 0.0;
-    for (auto const &v : Pi_loc) nR = std::max(nR, std::abs(v));
+    {                                                   // a max over the local block: threaded, order-independent (bitwise)
+      ComplexType const *pl = Pi_loc.data();
+      const long npl = long(Pi_loc.size());
+#pragma omp parallel for reduction(max:nR) num_threads(utils::omp_threads())
+      for (long e = 0; e < npl; ++e) nR = std::max(nR, std::abs(pl[e]));
+    }
 
     nda::array<ComplexType, 3> A(nw_h, nPl, nQl), B(nt_h, nPl, nQl);
     nda::array<ComplexType, 2> tq_Q(Nm, nQl), td_P(nPl, Nm), tmp(Nm, nQl);
@@ -1273,6 +1279,24 @@ namespace solvers {
       }
       const double tu1 = up_now();
       t_up_gemm += tu1 - tu0;
+      if (not qnu_meter) {
+        // the += into the host mirror of Pi and the max meters, threaded (elementwise adds and max reductions: bitwise
+        // the serial loop's values; p1gpu_n3o: 14.6 s of the upfold wall single-threaded)
+        double mloc = 0.0;
+        const long t0r = t_rng.first();
+#pragma omp parallel for collapse(2) reduction(max:mloc) num_threads(utils::omp_threads())
+        for (long it = 0; it < ntl; ++it)
+          for (long i = 0; i < nPl; ++i)
+            for (long j = 0; j < nQl; ++j) {
+              const ComplexType v = B(t0r + it, i, j);
+              mloc = std::max(mloc, std::abs(v));
+              Pi_loc(it, iql, i, j) += v;
+            }
+        nC = std::max(nC, mloc);
+        qmax[size_t(iq)] = std::max(qmax[size_t(iq)], mloc);
+        t_up_add += up_now() - tu1;
+        continue;
+      }
       for (long it = 0; it < ntl; ++it)
         for (long i = 0; i < nPl; ++i)
           for (long j = 0; j < nQl; ++j) {
@@ -3125,20 +3149,52 @@ namespace solvers {
       for (long i = 0; i < 3; ++i) { double v = 0.0; for (long j = 0; j < 3; ++j) v += lat(i, j) * Q(iq, j); qc[i] = v / (2.0 * M_PI); }
     };
     const std::string col = "Pi_" + colname;
+    // gpu port 2026-09-27: every rank read its GB-class column from ceph on every call (the ~20 s "ladder eval" of the
+    // injection in p1gpu_n3o). Now the root reads, the others receive a broadcast, and the q-matched result is cached for
+    // the run (the file is an input: fixed content).
+    const std::string ckey = _pol_vtx->pol_interp_file() + "|" + col + "|" + std::to_string(nq_g);
+    const bool use_cache = (methods::vertex_debug::number("interp_cache", 1.0) != 0.0);   // vertex_debug: interp_cache
+    if (use_cache) {
+      auto it = _interp_col_cache.find(ckey);
+      if (it != _interp_col_cache.end()) return it->second;
+    }
+    auto &comm = thc.mpi()->comm;
     nda::array<double, 2> qf;
     nda::array<ComplexType, 4> Pf;
     nda::array<long, 1> nu_f;
     double beta_f = -1.0;
     {
-      h5::file f(_pol_vtx->pol_interp_file(), 'r');
-      h5::group g(f);
-      utils::check(g.has_dataset("nu_half"),
+      std::array<long, 7> shp{0, 0, 0, 0, 0, 0, 0};    // qf (2), Pf (4), nu_f (1)
+      int has_nu = 1;
+      if (comm.root()) {
+        h5::file f(_pol_vtx->pol_interp_file(), 'r');
+        h5::group g(f);
+        has_nu = g.has_dataset("nu_half") ? 1 : 0;
+        if (has_nu) {
+          nda::h5_read(g, "q", qf);
+          nda::h5_read(g, col, Pf);
+          nda::h5_read(g, "nu_half", nu_f);
+          if (g.has_dataset("beta")) h5::h5_read(g, "beta", beta_f);
+          shp = {qf.shape(0), qf.shape(1), Pf.shape(0), Pf.shape(1), Pf.shape(2), Pf.shape(3), long(nu_f.size())};
+        }
+      }
+      comm.broadcast_n(&has_nu, 1, 0);
+      utils::check(has_nu == 1,
                    "inject_pol_ladder: {} carries no nu_half axis -- an inu = 0-only dump cannot feed the W-Dyson "
                    "(dump the coarse run's whalf / all-nu columns).", _pol_vtx->pol_interp_file());
-      nda::h5_read(g, "q", qf);
-      nda::h5_read(g, col, Pf);
-      nda::h5_read(g, "nu_half", nu_f);
-      if (g.has_dataset("beta")) h5::h5_read(g, "beta", beta_f);
+      comm.broadcast_n(shp.data(), 7, 0);
+      comm.broadcast_n(&beta_f, 1, 0);
+      if (not comm.root()) {
+        qf = nda::array<double, 2>(shp[0], shp[1]);
+        Pf = nda::array<ComplexType, 4>(shp[2], shp[3], shp[4], shp[5]);
+        nu_f = nda::array<long, 1>(shp[6]);
+      }
+      comm.broadcast_n(qf.data(), qf.size(), 0);
+      comm.broadcast_n(nu_f.data(), nu_f.size(), 0);
+      {                                                 // the column in chunks (MPI counts are int)
+        const size_t n = size_t(Pf.size()), chunk = size_t(1) << 26;
+        for (size_t o = 0; o < n; o += chunk) comm.broadcast_n(Pf.data() + o, std::min(chunk, n - o), 0);
+      }
     }
     utils::check(long(nu_f.size()) == nw_h_ft, "inject_pol_ladder: {} has {} half nodes, this run's IAFT has {} -- the "
                  "coarse and fine runs must share beta / basis / precision.", _pol_vtx->pol_interp_file(), nu_f.size(), nw_h_ft);
@@ -3163,6 +3219,7 @@ namespace solvers {
                    qc[0], qc[1], qc[2], _pol_vtx->pol_interp_file());
       Pl(all, iq, all, all) = Pf(all, hit, all, all);
     }
+    if (use_cache) _interp_col_cache[ckey] = Pl;
     return Pl;
   }
 

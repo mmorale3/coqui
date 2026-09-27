@@ -583,6 +583,29 @@ namespace solvers {
                          nda::MemoryArrayOfRank<2> auto const& t_mP,
                          nda::MemoryArrayOfRank<2> auto const& A_PQ) {
       const long Npair = B_Im.shape(0), Np = C_IP.shape(1);
+#if defined(ENABLE_DEVICE)
+      // gpu port 2026-09-27: at Si kp444 C = 8 (N_pair = 4096, the size cap) this diagnostic was ~29 G complex MACs per
+      // (q, slice), replicated on every rank -- 305 s of the readout instance's cache_w in p1gpu_n3o. On the device: the
+      // same four gemms, D = WA - WC by a beta = -1 gemm, the two Frobenius norms as dotc. Rounding class.
+      if (vertex_debug::number("eta_device", 1.0) != 0.0) {   // vertex_debug: eta_device
+        using dmat_t = memory::array<DEVICE_MEMORY, ComplexType, 2>;
+        auto Bd = memory::to_memory_space<DEVICE_MEMORY>(B_Im);
+        auto Cd = memory::to_memory_space<DEVICE_MEMORY>(C_IP);
+        nda::array<ComplexType, 2> th(t_mP), Ah(A_PQ);
+        auto td = memory::to_memory_space<DEVICE_MEMORY>(th);
+        auto Ad = memory::to_memory_space<DEVICE_MEMORY>(Ah);
+        dmat_t Cfd(Npair, Np), Ed(Npair, Np), Dd(Npair, Npair);
+        nda::blas::gemm(Bd, td, Cfd);                                                   // fitted pair rows B t
+        nda::blas::gemm(Cd, Ad, Ed);
+        nda::blas::gemm(Ed, nda::dagger(Cd), Dd);                                       // WC
+        auto Df = nda::reshape(Dd, std::array<long, 1>{Npair * Npair});
+        const double den = std::real(nda::blas::dotc(Df, Df));
+        nda::blas::gemm(Cfd, Ad, Ed);
+        nda::blas::gemm(ComplexType(1.0), Ed, nda::dagger(Cfd), ComplexType(-1.0), Dd);  // WA - WC
+        const double num = std::real(nda::blas::dotc(Df, Df));
+        return std::sqrt(num) / std::max(std::sqrt(den), 1e-300);
+      }
+#endif
       nda::array<ComplexType, 2> Cf(Npair, Np);        // fitted pair rows B t
       nda::blas::gemm(B_Im, t_mP, Cf);
       nda::array<ComplexType, 2> E(Npair, Np), WC(Npair, Npair), WA(Npair, Npair);

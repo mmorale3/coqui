@@ -22,6 +22,7 @@
 #ifndef COQUI_SCR_COULOMB_T_H
 #define COQUI_SCR_COULOMB_T_H
 
+#include <map>
 #include "configuration.hpp"
 #include "nda/nda.hpp"
 #include "nda/h5.hpp"
@@ -337,6 +338,9 @@ namespace solvers {
     // injection and the Sigma vertex share; every check of the W-int-4f consumer applies)
     nda::array<ComplexType, 4> read_pol_interp_column(std::string const &col, long nq_g, long nw_h_ft,
                                                       nda::array<long, 1> const &nu_half, THC_ERI auto &thc);
+    // the q-matched columns already read this run, keyed by "<file>|<col>|<nq>" (the file is an input of the run: its
+    // content is fixed, so every later injection / Sigma build reuses the first read; vertex_debug interp_cache = 0 re-reads)
+    std::map<std::string, nda::array<ComplexType, 4>> _interp_col_cache;
     // {the local vertex scalar tr(P dPi P)/tr(P Pi_0 P) at (q_1, nu_0), |dW~|_F/|dW|_F, eps_inv_head_sig(tau_0), eps_inv_head(tau_0)} of the last build
     std::array<double, 4> _sig_lff_meter{0.0, 0.0, 0.0, 0.0};
     // {max |dSigma_pair|, anti-Hermitian residual, |K_s - K_s^dag|/|K_s|, wall s} of the last build_sigma_pair
