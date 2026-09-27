@@ -2561,6 +2561,42 @@ namespace solvers {
     // ---- L-8: the nu-SAMPLED mode: the deposit weights Tt = Ttw . Phi_all . pinv(Phi_S) from a reference dump's nu-bases ----
     const bool auto_nodes = (opt.dyn_nodes.empty() and opt.dyn_auto_nodes > 0);   // P14b
     const bool sampled = not opt.dyn_nodes.empty() or auto_nodes;
+    // gpu port 2026-09-27 (p1gpu_n3q: 7.5 s of the Sigma call's preparation per iteration, most of it re-reading ~1 GB of
+    // the reference dump for the same Gram matrices): the sampled-mode products are a function of the dump and the grid
+    // only -- reuse them while the dump (path, size, mtime), the node options and Ttw are unchanged.
+    // vertex_debug sigdyn_bases_cache = 0 rebuilds them every call.
+    std::string skey;
+    if (sampled) {
+      long fsz = -1, fmt = -1;
+      if (mpi->comm.root()) {
+        std::error_code ec;
+        fsz = long(std::filesystem::file_size(opt.dyn_fit_file, ec));
+        if (ec) fsz = -1;
+        auto t = std::filesystem::last_write_time(opt.dyn_fit_file, ec);
+        fmt = ec ? -1 : long(t.time_since_epoch().count());
+      }
+      mpi->comm.broadcast_value(fsz, 0);
+      mpi->comm.broadcast_value(fmt, 0);
+      skey = opt.dyn_fit_file + "|" + std::to_string(fsz) + "|" + std::to_string(fmt) + "|" + std::to_string(opt.dyn_auto_nodes) + "|" +
+             std::to_string(opt.dyn_fit_rank) + "|" + vertex_debug::text("sigdyn_gram", "trace") + "|" + std::to_string(nw_b) + "|" +
+             std::to_string(nt_l) + "|";
+      for (long m : opt.dyn_nodes) skey += std::to_string(m) + ",";
+      auto const *c = static_cast<vd::sigdyn_sampled_cache const *>(_sigdyn_sampled.get());
+      bool hit = (c != nullptr and vertex_debug::number("sigdyn_bases_cache", 1.0) != 0.0 and c->key == skey and   // vertex_debug: sigdyn_bases_cache
+                  c->Ttw.shape() == tools.Ttw_bb.shape());
+      if (hit)
+        for (long i = 0; i < long(c->Ttw.size()) and hit; ++i) hit = (c->Ttw.data()[i] == tools.Ttw_bb.data()[i]);
+      if (hit) {
+        nus = c->nus;
+        hook.eps_ref = c->eps_ref;
+        hook.W_cst = c->W_cst;
+        hook.R_T = c->R_T;
+        hook.sampled = true;
+        app_log(1, "  [LFF-Sigma dyn] SAMPLED mode: {} of {} nodes, nu-bases REUSED from the previous call ({} unchanged) --{}",
+                nus.size(), nw_b, opt.dyn_fit_file, c->log);
+        return;
+      }
+    }
     if (sampled) {
       utils::check(not opt.dyn_fit_file.empty(), "vertex_t::eval_sigma_pair_dyn: the sampled mode needs the reference dump (pol_vertex_sigma_dyn_fit_file).");
       utils::check(not opt.dyn_dump, "vertex_t::eval_sigma_pair_dyn: the dump is written by the ALL-node run, not by a sampled one.");
@@ -2711,6 +2747,15 @@ namespace solvers {
       std::string spec_log(buf);
       hook.sampled = true;
       app_log(1, "  [LFF-Sigma dyn] SAMPLED mode: {} of {} nodes, nu-bases from {} --{}", nS, nw_b, opt.dyn_fit_file, spec_log);
+      auto c = std::make_shared<vd::sigdyn_sampled_cache>();
+      c->key = skey;
+      c->Ttw = nda::array<ComplexType, 2>(tools.Ttw_bb);
+      c->nus = nus;
+      c->eps_ref = hook.eps_ref;
+      c->W_cst = hook.W_cst;
+      c->R_T = hook.R_T;
+      c->log = spec_log;
+      _sigdyn_sampled = c;
     } else {
       nus.resize(static_cast<size_t>(nw_b));
       for (long l = 0; l < nw_b; ++l) nus[size_t(l)] = l;

@@ -60,6 +60,18 @@ namespace methods {
 namespace solvers {
   namespace vertex_dynbse_detail {
 
+    // the sampled-mode products of prepare_sigma_dyn_hook that depend on the reference dump and the grid only (not on G, W or
+    // the iteration): reused while the key (the dump, its size and mtime, the node options) and the transform Ttw agree
+    struct sigdyn_sampled_cache {
+      std::string key;
+      nda::array<ComplexType, 2> Ttw;
+      std::vector<long> nus;
+      nda::array<double, 1> eps_ref;
+      nda::array<ComplexType, 2> W_cst;
+      nda::array<ComplexType, 3> R_T;
+      std::string log;
+    };
+
     struct sigma_dyn_hook {
       std::string col = "dyn1";          // static_dyn | dyn1_bare | dyn1 | dyn
       std::string outer = "dynamic";     // the outer W-bar: "dynamic" (W-bar_0 + W-bar_d(nu)) | "static" (W-bar_0)
@@ -958,10 +970,43 @@ namespace solvers {
       utils::check(h.np == np and h.RT.shape(3) == np and h.RU.shape(3) == np, "sigma_dyn_finish: node count mismatch.");
       // the T family: E_a(tau) = K_F(tau, a) RT_a(tau) (every node a), refit onto the vertex nodes, times U_a by partial fractions
       const long nb = ns * nk * np * nc2;
-      nda::array<cplx, 2> E(nt, nb);
       bool anyT = false;
       for (auto const &v : h.RT) if (v != cplx(0.0)) { anyT = true; break; }
       e_fit_err = 0.0;
+#if defined(ENABLE_CUDA)
+      // gpu port 2026-09-27 (p1gpu_n3q: 6.2 s per iteration here, the scalar contraction below single-node OMP): the same
+      // finish on the device -- the refit as ONE linear map Cmap (the fit applied to the identity; the gemm association
+      // differs from coeffs(E) by rounding), its reconstruction kernel for the error meter, and the partial-fraction sum as
+      // one strided-batched gemm over (s, k). vertex_debug sigdyn_finish_device = 0 keeps the host finish.
+      if (vertex_debug::number("sigdyn_finish_device", 1.0) != 0.0) {   // vertex_debug: sigdyn_finish_device
+        nda::array<cplx, 2> Id(nt, nt), Cmap;
+        Id() = cplx(0.0);
+        for (long i = 0; i < nt; ++i) Id(i, i) = cplx(1.0);
+        nda::array<double, 2> Kmap;
+        if (refit == "union") {
+          dynbse::node_pole_fit upf;
+          upf.build(b.beta, b.s, b.eps, refit_rtol);
+          Cmap = upf.coeffs(Id);
+          Kmap = upf.Kmat;
+        } else {
+          Cmap = dynbse::basis_coeffs(b, Id);
+          Kmap = b.npf_mask ? b.npf_mask->Kmat : b.pf.Kmat;
+        }
+        utils::check(Cmap.shape(0) == npf and Cmap.shape(1) == nt and Kmap.shape(0) == nt and Kmap.shape(1) == npf,
+                     "sigma_dyn_finish: the refit map is ({}, {}) / its kernel ({}, {}), expected ({}, {}) / ({}, {}).",
+                     Cmap.shape(0), Cmap.shape(1), Kmap.shape(0), Kmap.shape(1), npf, nt, nt, npf);
+        nda::array<double, 3> Tpp_d(nt, np, npf);
+        for (long it = 0; it < nt; ++it)
+          for (long a = 0; a < np; ++a)
+            for (long pp = 0; pp < npf; ++pp)
+              Tpp_d(it, a, pp) = (a == pp) ? b.KF2(it, a) : (b.KF(it, a) - b.KF(it, pp)) / (b.eps(a) - b.eps(pp));
+        nda::array<double, 2> KFc(b.KF);
+        dynbse_cuda::sd_finish(nt, ns * nk, np, npf, nc2, KFc.data(), Tpp_d.data(), Cmap.data(), Kmap.data(), h.S_cst.data(),
+                               h.RT.data(), h.RU.data(), anyT, cplx(-scale / double(nk_norm), 0.0), dSig.data(), &e_fit_err);
+        return;
+      }
+#endif
+      nda::array<cplx, 2> E(nt, nb);
       nda::array<cplx, 2> ec;
       if (anyT) {
         for (long it = 0; it < nt; ++it) {

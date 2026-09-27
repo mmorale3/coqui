@@ -706,6 +706,9 @@ namespace vertex_pi { struct iaft_tools; }
     // P3: the Sigma hook shared between the P-side driver call and the Sigma-side call of one update (type-erased: the hook
     // type is defined in vertex_sigma_dyn.icc); armed by arm_shared_sigma_hook, consumed by eval_sigma_pair_dyn
     std::shared_ptr<void> _shared_hook;
+    // gpu port 2026-09-27: the sampled-mode nu-bases of the Sigma hook (a function of the reference dump and the grid only),
+    // kept across iterations (type-erased: vertex_dynbse_detail::sigdyn_sampled_cache, vertex_sigma_dyn.icc)
+    std::shared_ptr<void> _sigdyn_sampled;
     std::vector<long> _shared_hook_nodes;        // the full Sigma node set the hook was prepared for
     std::string _shared_hook_col, _shared_hook_outer;
     // P19 (vertex_perf_plan.md, 2026-09-21): pol_vertex_wcache = "shared" keeps ONE copy of the cache per NUMA node

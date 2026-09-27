@@ -214,6 +214,15 @@ namespace methods::solvers::dynbse_cuda {
   /** a[i * ld + i] += s for i < n */
   void dev_add_diag(cplx *a, long n, long ld, double s);
 
+  /** the Sigma hook's finish (vertex_sigma_dyn.icc::sigma_dyn_finish, product route) on the device; HOST pointers, row-major:
+   *  dSig(it; isk, ij) = pref [S_cst + sum_p KF(it, p) RU(it; isk, p, ij) + sum_{a, pp} Tpp(it; a, pp) ec(pp; isk, a, ij)],
+   *  ec = Cmap . E with E(it; isk, a, ij) = KF(it, a) RT(it; isk, a, ij) (only when anyT); *fit_err = max|E - Kmap ec| / max|E|
+   *  (0 without T). KF (nt, np), Tpp (nt, np, npf), Cmap (npf, nt), Kmap (nt, npf); S_cst / dSig (nt, nsk, nc2), RT / RU
+   *  (nt, nsk, np, nc2). */
+  void sd_finish(long nt, long nsk, long np, long npf, long nc2, double const *KF, double const *Tpp, cplx const *Cmap,
+                 double const *Kmap, cplx const *S_cst, cplx const *RT, cplx const *RU, bool anyT, cplx pref, cplx *dSig,
+                 double *fit_err);
+
 } // namespace methods::solvers::dynbse_cuda
 
 #endif

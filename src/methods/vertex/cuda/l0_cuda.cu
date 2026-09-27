@@ -2167,5 +2167,112 @@ namespace methods::solvers::dynbse_cuda {
     cu_check(cudaDeviceSynchronize(), "dev_add_diag");
   }
 
+  // ---- the Sigma hook's finish (vertex_sigma_dyn.icc::sigma_dyn_finish) on the device -----------------------------------
+  namespace {
+    // E(it; isk, a, ij) = KF(it, a) RT(it; isk, a, ij), in place
+    __global__ void fin_scale_kf_kernel(long nt, long nsk, long np, long nc2, double const *__restrict__ KF, cd *__restrict__ E) {
+      const long tot = nt * nsk * np * nc2;
+      for (long e = blockIdx.x * long(blockDim.x) + threadIdx.x; e < tot; e += long(gridDim.x) * blockDim.x) {
+        const long it = e / (nsk * np * nc2), a = (e / nc2) % np;
+        E[e] = scal(KF[it * np + a], E[e]);
+      }
+    }
+    // ecP(isk; a, pp, ij) = ec(pp; isk, a, ij)
+    __global__ void fin_permute_kernel(long npf, long nsk, long np, long nc2, cd const *__restrict__ ec, cd *__restrict__ ecP) {
+      const long tot = npf * nsk * np * nc2, nb = nsk * np * nc2;
+      for (long e = blockIdx.x * long(blockDim.x) + threadIdx.x; e < tot; e += long(gridDim.x) * blockDim.x) {
+        const long ij = e % nc2;
+        long r = e / nc2;
+        const long pp = r % npf;
+        r /= npf;
+        const long a = r % np, isk = r / np;
+        ecP[e] = ec[pp * nb + (isk * np + a) * nc2 + ij];
+      }
+    }
+    // out(it; isk, ij) = S(it; isk, ij) + sum_p KF(it, p) RU(it; isk, p, ij)
+    __global__ void fin_u_kernel(long nt, long nsk, long np, long nc2, double const *__restrict__ KF, cd const *__restrict__ S,
+                                 cd const *__restrict__ RU, cd *__restrict__ out) {
+      const long tot = nt * nsk * nc2;
+      for (long e = blockIdx.x * long(blockDim.x) + threadIdx.x; e < tot; e += long(gridDim.x) * blockDim.x) {
+        const long ij = e % nc2, r = e / nc2, isk = r % nsk, it = r / nsk;
+        cd acc = S[e];
+        cd const *ru = RU + ((it * nsk + isk) * np) * nc2 + ij;
+        for (long p = 0; p < np; ++p) acc = acc + scal(KF[it * np + p], ru[p * nc2]);
+        out[e] = acc;
+      }
+    }
+  } // namespace
+
+  void sd_finish(long nt, long nsk, long np, long npf, long nc2, double const *KF, double const *Tpp, cplx const *Cmap,
+                 double const *Kmap, cplx const *S_cst, cplx const *RT, cplx const *RU, bool anyT, cplx pref, cplx *dSig,
+                 double *fit_err) {
+    const long nb = nsk * np * nc2, nS = nt * nsk * nc2;
+    cublasHandle_t h = nullptr;
+    cub_check(cublasCreate(&h), "fin handle");
+    double *dKF = upload<double>(KF, size_t(nt * np), "fin KF");
+    cd *dS = upload_c(S_cst, size_t(nS), "fin S");
+    cd *dRU = upload_c(RU, size_t(nt * nb), "fin RU");
+    cd *dOut = dalloc<cd>(size_t(nS), "fin out");
+    fin_u_kernel<<<grid_for(nS), 256>>>(nt, nsk, np, nc2, dKF, dS, dRU, dOut);
+    launch_check("fin U");
+    cu_check(cudaFree(dRU), "fin free RU");
+    cu_check(cudaFree(dS), "fin free S");
+    *fit_err = 0.0;
+    if (anyT) {
+      const cd one = make_cuDoubleComplex(1.0, 0.0), zero = make_cuDoubleComplex(0.0, 0.0);
+      cd *dE = upload_c(RT, size_t(nt * nb), "fin RT");
+      fin_scale_kf_kernel<<<grid_for(nt * nb), 256>>>(nt, nsk, np, nc2, dKF, dE);
+      launch_check("fin E");
+      // ec (npf x nb) = Cmap (npf x nt) . E (nt x nb): column-major ec^T = E^T . Cmap^T
+      cd *dC = upload_c(Cmap, size_t(npf * nt), "fin Cmap");
+      cd *dec = dalloc<cd>(size_t(npf * nb), "fin ec");
+      cub_check(cublasZgemm(h, CUBLAS_OP_N, CUBLAS_OP_N, int(nb), int(npf), int(nt), &one, dE, int(nb), dC, int(nt), &zero, dec,
+                            int(nb)), "fin ec");
+      // the refit error: max |E - Kmap ec| / max |E|
+      std::vector<cplx> Kc(size_t(nt * npf));
+      for (long i = 0; i < nt * npf; ++i) Kc[size_t(i)] = cplx(Kmap[i], 0.0);
+      cd *dK = upload_c(Kc.data(), Kc.size(), "fin Kmap");
+      cd *drec = dalloc<cd>(size_t(nt * nb), "fin rec");
+      cub_check(cublasZgemm(h, CUBLAS_OP_N, CUBLAS_OP_N, int(nb), int(nt), int(npf), &one, dec, int(nb), dK, int(npf), &zero, drec,
+                            int(nb)), "fin rec");
+      unsigned long long *red = dalloc<unsigned long long>(2, "fin red");
+      cu_check(cudaMemset(red, 0, 2 * sizeof(unsigned long long)), "fin red zero");
+      maxdiff_kernel<<<grid_red(nt * nb), 256>>>(nt * nb, dE, drec, red);
+      launch_check("fin fit error");
+      unsigned long long r[2] = {0, 0};
+      cu_check(cudaMemcpy(r, red, sizeof(r), cudaMemcpyDeviceToHost), "fin red d2h");
+      double num = 0.0, den = 0.0;
+      std::memcpy(&num, &r[0], sizeof(double));
+      std::memcpy(&den, &r[1], sizeof(double));
+      *fit_err = (den > 0.0) ? num / den : num;
+      cu_check(cudaFree(red), "fin free red");
+      cu_check(cudaFree(drec), "fin free rec");
+      cu_check(cudaFree(dK), "fin free K");
+      cu_check(cudaFree(dC), "fin free C");
+      cu_check(cudaFree(dE), "fin free E");
+      // ecP(isk; a, pp, ij), then out(it; isk, ij) += sum_{(a, pp)} Tpp(it; a, pp) ecP(isk; (a, pp), ij): one strided batched
+      // gemm over isk -- column-major out_isk^T (nc2 x nt, ld nsk nc2) += ecP_isk^T (nc2 x R) . Tpp^T (R x nt), R = np npf
+      cd *decP = dalloc<cd>(size_t(npf * nb), "fin ecP");
+      fin_permute_kernel<<<grid_for(npf * nb), 256>>>(npf, nsk, np, nc2, dec, decP);
+      launch_check("fin permute");
+      cu_check(cudaFree(dec), "fin free ec");
+      const long R = np * npf;
+      std::vector<cplx> Tc(size_t(nt * R));
+      for (long i = 0; i < nt * R; ++i) Tc[size_t(i)] = cplx(Tpp[i], 0.0);
+      cd *dT = upload_c(Tc.data(), Tc.size(), "fin Tpp");
+      cub_check(cublasZgemmStridedBatched(h, CUBLAS_OP_N, CUBLAS_OP_N, int(nc2), int(nt), int(R), &one, decP, int(nc2),
+                                          (long long)(R * nc2), dT, int(R), 0LL, &one, dOut, int(nsk * nc2), (long long)nc2,
+                                          int(nsk)), "fin T");
+      cu_check(cudaFree(dT), "fin free T");
+      cu_check(cudaFree(decP), "fin free ecP");
+    }
+    const cd pr = make_cuDoubleComplex(pref.real(), pref.imag());
+    cub_check(cublasZscal(h, int(nS), &pr, dOut, 1), "fin scale");
+    cu_check(cudaMemcpy(dSig, dOut, size_t(nS) * sizeof(cd), cudaMemcpyDeviceToHost), "fin d2h");
+    cu_check(cudaFree(dOut), "fin free out");
+    cu_check(cudaFree(dKF), "fin free KF");
+    cub_check(cublasDestroy(h), "fin handle destroy");
+  }
+
 
 } // namespace methods::solvers::dynbse_cuda
