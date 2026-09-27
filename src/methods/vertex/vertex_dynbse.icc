@@ -1077,6 +1077,10 @@ namespace solvers {
       // are built ONCE per group (the cache in the loop below) instead of once per unit; `order` becomes group-major
       // (groups in the order of their earliest unit in the cost-sorted list, nu ascending inside). Every unit is still an
       // independent solve, so the results are unchanged; vertex_debug dynbse_group_sched = 0 restores the per-unit hand-out.
+      // Gate (2026-09-26, Mac, 2 ranks, the gate binary's dynbse_readout): cache + groups ON vs OFF differ by at most 2.1e-9
+      // relative over the 37 logged readout numbers, while the OFF configuration run twice differs by 4.3e-9 -- the change is
+      // inside the run-to-run floor of the dynamically scheduled solve (the unit-to-rank assignment changes the reduction order;
+      // the resummed GMRES numbers carry the 1e-9 floor recorded in vertex_perf_plan.md). Not bitwise, by that mechanism.
       const bool group_sched = (vertex_debug::number("dynbse_group_sched", 1.0) != 0.0) and nnu > 1 and nunits_all % nnu == 0;   // vertex_debug: dynbse_group_sched
       if (group_sched) {
         const long ngrp = nunits_all / nnu;
