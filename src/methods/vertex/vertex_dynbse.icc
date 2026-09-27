@@ -2795,9 +2795,11 @@ namespace solvers {
     o.sigma = std::addressof(hook);
     if (opt.dyn_ckpt_minutes > 0.0) { o.sigma_ckpt = mb_state.coqui_prefix + ".sigdyn_ckpt"; o.sigma_ckpt_minutes = opt.dyn_ckpt_minutes; }   // P20
     vd::dyn_meter dmet;
+    const double sw_pre = twatch.peek();                              // gpu port 2026-09-27: the Sigma call's phase walls
     if (not nus.empty())
       vd::pair_space_ladder_dyn(G_CC, _Xb_skma, _W0b_qmm.value(), wb_cache(), kmq, kpq, tools, nus,
                                 nullptr, nullptr, nullptr, nullptr, mpi->comm.rank(), mpi->comm.size(), o, &dmet, symc);
+    const double sw_drv = twatch.peek();
     hook.flush_unit();                                               // P1: the last unit's star fold
     mpi->comm.all_reduce_in_place_n(hook.S_cst.data(), hook.S_cst.size(), std::plus<>{});
     if (hook.RT.size() > 0) mpi->comm.all_reduce_in_place_n(hook.RT.data(), hook.RT.size(), std::plus<>{});   // P4-C14: empty in the single mode
@@ -2840,7 +2842,11 @@ namespace solvers {
     hook.t_sig = mpi->comm.all_reduce_value(hook.t_sig, boost::mpi3::max<>{});
     hook.nunits = mpi->comm.all_reduce_value(hook.nunits, std::plus<>{});
     double e_fit = 0.0;
+    const double sw_red = twatch.peek();
     vd::sigma_dyn_finish(hook, opt.scale, MF->nkpts(), dSig, e_fit, opt.dyn_refit, opt.dyn_refit_rtol);   // P12
+    app_log(1, "  [LFF-Sigma dyn] call walls: preparation (hook, sampled-mode bases) {:.1f} s, the driver {:.1f} s, "
+               "the accumulator reductions + dump {:.1f} s, the finish {:.1f} s", sw_pre, sw_drv - sw_pre, sw_red - sw_drv,
+            twatch.peek() - sw_red);
     const long nt = dSig.shape(0), ns = dSig.shape(1), nk = dSig.shape(2), nc = dSig.shape(3);
     double dmax = 0.0, dherm = 0.0;
     for (long it = 0; it < nt; ++it)

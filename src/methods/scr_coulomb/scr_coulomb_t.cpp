@@ -2752,20 +2752,35 @@ namespace solvers {
       h.local() = nda::to_host(dPi.local());
       return h;
     };
+    // gpu port 2026-09-27: wall clock of the Pi hooks (the profile left ~30 s of eval_Pi_qdep unattributed)
+    auto hk_wall = [] { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
     auto vertex_hooks_rpa = [&](auto &dPi_rpa) {      // RPA-only Pi: before ANY correction (read-only hooks)
       if constexpr (MEM == HOST_MEMORY) { build_vertex_W0(dPi_rpa); build_pol_ladder_kernel(dPi_rpa); }
       else if (vertex_hooks_needed) {
+        const double w0 = hk_wall();
         auto h = host_mirror_of(dPi_rpa);
-        build_vertex_W0(h); build_pol_ladder_kernel(h);
+        const double w1 = hk_wall();
+        build_vertex_W0(h);
+        const double w2 = hk_wall();
+        build_pol_ladder_kernel(h);
+        app_log(1, "  [eval_Pi wall] RPA hooks: host mirror of Pi {:.1f} s, build_vertex_W0 {:.1f} s, the ladder kernel "
+                   "(build_w0 + nu0 row + folds + cuts) {:.1f} s", w1 - w0, w2 - w1, hk_wall() - w2);
       }
     };
     auto vertex_hooks_post = [&](auto &dPi) {         // Pi = Pi_RPA (+ corrections) + Pi^C; injection last
       if constexpr (MEM == HOST_MEMORY) { add_vertex_Pi_C(dPi); inject_pol_tier(dPi); }
       else if (vertex_hooks_needed) {
+        const double w0 = hk_wall();
         auto h = host_mirror_of(dPi);
-        add_vertex_Pi_C(h); inject_pol_tier(h);
+        const double w1 = hk_wall();
+        add_vertex_Pi_C(h);
+        const double w2 = hk_wall();
+        inject_pol_tier(h);
+        const double w3 = hk_wall();
         dPi.local() = memory::to_memory_space<MEM>(h.local());
         utils::device_sync();
+        app_log(1, "  [eval_Pi wall] post hooks: host mirror of Pi {:.1f} s, add_vertex_Pi_C {:.1f} s, the injection {:.1f} s, "
+                   "the copy back {:.1f} s", w1 - w0, w2 - w1, w3 - w2, hk_wall() - w3);
       }
     };
 
