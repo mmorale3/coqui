@@ -4234,29 +4234,37 @@ namespace solvers {
     {
       bool head_logged = false;
       long my_nfold = 0;
-      // gpu port 2026-09-27 (p1gpu_n3m: this fill took 317 s of host work per iteration -- 64 zero-padded 335 MB all-reduces
-      // of the per-q gather plus the host transform and fold gemms): under DEVICE every rank folds the q it OWNS in the
-      // device-resident dW (update_w's dW_qtPQ_dev; no gather), the PH-sym tau -> nu transform and the two fold gemms per
-      // node run through cuBLAS, and only the (nw_half, N_m, N_m) result per q comes down. Needs whole (t, P, Q) slabs per
-      // q on every rank (the q-only grid); else the host loop below. vertex_debug cache_w_device = 0 keeps the host loop.
+      // gpu port 2026-09-27 (p1gpu_n3m/n: this fill took 317-338 s per iteration: 64 zero-padded 335 MB all-reduces of the
+      // per-q gather below plus the host transform and fold gemms). The replicated-cache path now REDISTRIBUTES the
+      // distributed dW once into whole-q slabs (q-only grid, one all-to-all) and every rank folds the q it then owns --
+      // on the host with the same transform + fold_core calls (bitwise the old values: the data only moved), or under
+      // DEVICE on the device (upload per q, the PH-sym tau -> nu transform and the two fold gemms per node through cuBLAS,
+      // only (nw_half, N_m, N_m) per q comes down). vertex_debug cache_w_redist = 0 restores the per-q gather loop,
+      // cache_w_device = 0 keeps the redistributed folds on the host. The node-shared cache keeps the gather loop.
       bool fill_dev = false;
+      const bool fill_redist = (not shm_cache and nqpts_ibz >= long(mpi->comm.size()) and
+                                vertex_debug::number("cache_w_redist", 1.0) != 0.0);   // vertex_debug: cache_w_redist
+      if (fill_redist) {
+        auto dWq = math::nda::make_distributed_array<nda::array<ComplexType, 4>>(
+            mpi->comm, {long(mpi->comm.size()), 1l, 1l, 1l}, {nqpts_ibz, nt_half, Np, Np}, {1l, 1l, 1l, 1l});
+        math::nda::redistribute(mb_state.dW_qtPQ.value(), dWq);
+        auto loc = dWq.local();
+        const long q0 = dWq.origin()[0], nql = dWq.local_shape()[0];
 #if defined(ENABLE_DEVICE)
-      if (not shm_cache and mb_state.dW_qtPQ_dev.has_value() and
-          vertex_debug::number("cache_w_device", 1.0) != 0.0) {   // vertex_debug: cache_w_device
-        auto ls = mb_state.dW_qtPQ_dev.value().local_shape();
-        const int full = (ls[1] == nt_half and ls[2] == Np and ls[3] == Np) ? 1 : 0;
-        fill_dev = (mpi->comm.all_reduce_value(full, boost::mpi3::min<>{}) == 1);
-      }
-      if (fill_dev) {
-        auto &dWd = mb_state.dW_qtPQ_dev.value();
-        auto loc = dWd.local();
-        const long q0 = dWd.origin()[0], nql = dWd.local_shape()[0];
-        memory::array<DEVICE_MEMORY, ComplexType, 3> Wt_d(nt_half, Np, Np), Ww_d(nw_half, Np, Np), out_d(nw_half, _Nm, _Nm);
-        memory::array<DEVICE_MEMORY, ComplexType, 2> tmp_d(_Nm, Np);
+        fill_dev = (vertex_debug::number("cache_w_device", 1.0) != 0.0);   // vertex_debug: cache_w_device
+#endif
+        nda::array<ComplexType, 3> W_head;                // the Gamma slab with the head inserted (one q)
+        nda::array<ComplexType, 3> W_w(fill_dev ? 0 : nw_half, fill_dev ? 0 : Np, fill_dev ? 0 : Np);
+        nda::array<ComplexType, 2> tmp(fill_dev ? 0 : _Nm, fill_dev ? 0 : Np);
+#if defined(ENABLE_DEVICE)
+        std::optional<memory::array<DEVICE_MEMORY, ComplexType, 3>> Ww_d, out_d;
+        std::optional<memory::array<DEVICE_MEMORY, ComplexType, 2>> tmp_d;
+        if (fill_dev) { Ww_d.emplace(nw_half, Np, Np); out_d.emplace(nw_half, _Nm, _Nm); tmp_d.emplace(_Nm, Np); }
+#endif
         for (long iql = 0; iql < nql; ++iql) {
           const long iq = q0 + iql;
           ++my_nfold;
-          Wt_d() = loc(iql, all, all, all);                // a scratch copy: the head insertion must not touch dW
+          bool use_head = false;
           if (head_ok and iq == iq_gamma) {
             if (_bl_head_static_all and _rung == linear_rung) {
               app_log(1, "  cache_w head insertion [H1 STATIC]: dynamic piece SKIPPED for the "
@@ -4266,10 +4274,10 @@ namespace solvers {
               utils::check(eps.shape(0) == nt_half,
                            "vertex_t::cache_w: eps_inv_head size {} != nt_half = {}.",
                            eps.shape(0), nt_half);
-              nda::array<ComplexType, 3> Wt_h(memory::to_memory_space<HOST_MEMORY>(Wt_d));   // one q: a host round trip
+              W_head = nda::array<ComplexType, 3>(loc(iql, all, all, all));
               for (long it = 0; it < nt_half; ++it)
-                Wt_h(it, all, all) += ComplexType(eps(it).real()) * H_PQ;
-              Wt_d = memory::to_memory_space<DEVICE_MEMORY>(Wt_h);
+                W_head(it, all, all) += ComplexType(eps(it).real()) * H_PQ;
+              use_head = true;
               app_log(1, "  cache_w head insertion: dynamic piece applied to dW(Gamma, tau) "
                          "with eps_inv_head(tau=0) = {}\n"
                          "  (SAME-iteration eps_inv_head, captured at fill time)",
@@ -4281,22 +4289,38 @@ namespace solvers {
             }
             head_logged = true;
           }
-          _ft->tau_to_w_PHsym(Wt_d, Ww_d);
-          if (eta_diag and diag_writer) {
-            W_diag(iq, 0, all, all) = nda::array<ComplexType, 2>(memory::to_memory_space<HOST_MEMORY>(Ww_d(lpos0, all, all)));
-            W_diag(iq, 1, all, all) = nda::array<ComplexType, 2>(memory::to_memory_space<HOST_MEMORY>(Ww_d(lposm, all, all)));
+          auto t_q = _t_qmP(iq, all, all);
+          if (not fill_dev) {
+            if (use_head) _ft->tau_to_w_PHsym(W_head, W_w);
+            else _ft->tau_to_w_PHsym(loc(iql, all, all, all), W_w);
+            if (eta_diag and diag_writer) {
+              W_diag(iq, 0, all, all) = W_w(lpos0, all, all);
+              W_diag(iq, 1, all, all) = W_w(lposm, all, all);
+            }
+            for (long lp = 0; lp < nw_half; ++lp)
+              vertex_secondary_detail::fold_core(t_q, W_w(lp, all, all), tmp, Wb(iq, lp, all, all));
           }
-          nda::array<ComplexType, 2> t_h(_t_qmP(iq, all, all));
-          auto t_d = memory::to_memory_space<DEVICE_MEMORY>(t_h);
-          for (long lp = 0; lp < nw_half; ++lp) {         // fold_core's two gemms: (t W) then (t W) t^dag
-            nda::blas::gemm(t_d, Ww_d(lp, all, all), tmp_d);
-            nda::blas::gemm(tmp_d, nda::dagger(t_d), out_d(lp, all, all));
+#if defined(ENABLE_DEVICE)
+          else {
+            auto Wt_d = use_head ? memory::to_memory_space<DEVICE_MEMORY>(W_head)
+                                 : memory::to_memory_space<DEVICE_MEMORY>(nda::array<ComplexType, 3>(loc(iql, all, all, all)));
+            _ft->tau_to_w_PHsym(Wt_d, *Ww_d);
+            if (eta_diag and diag_writer) {
+              W_diag(iq, 0, all, all) = nda::array<ComplexType, 2>(memory::to_memory_space<HOST_MEMORY>((*Ww_d)(lpos0, all, all)));
+              W_diag(iq, 1, all, all) = nda::array<ComplexType, 2>(memory::to_memory_space<HOST_MEMORY>((*Ww_d)(lposm, all, all)));
+            }
+            nda::array<ComplexType, 2> t_h(t_q);
+            auto t_d = memory::to_memory_space<DEVICE_MEMORY>(t_h);
+            for (long lp = 0; lp < nw_half; ++lp) {       // fold_core's two gemms: (t W) then (t W) t^dag
+              nda::blas::gemm(t_d, (*Ww_d)(lp, all, all), *tmp_d);
+              nda::blas::gemm(*tmp_d, nda::dagger(t_d), (*out_d)(lp, all, all));
+            }
+            Wb(iq, all, all, all) = nda::array<ComplexType, 3>(memory::to_memory_space<HOST_MEMORY>(*out_d));
           }
-          Wb(iq, all, all, all) = nda::array<ComplexType, 3>(memory::to_memory_space<HOST_MEMORY>(out_d));
+#endif
         }
       }
-#endif
-      if (not fill_dev) {
+      if (not fill_redist) {
       nda::array<ComplexType, 3> W_w(nw_half, Np, Np);
       nda::array<ComplexType, 2> tmp(_Nm, Np);
       for (long iq = 0; iq < nqpts_ibz; ++iq) {
@@ -4355,7 +4379,7 @@ namespace solvers {
       const long total_fold = mpi->comm.all_reduce_value(my_nfold, std::plus<>{});
       app_log(2, "  Refinement 2 W-bar fold distributed over {} ranks: this rank folded "
                  "{} of {} q-points (~1/P work; one q of W alive per rank){}.", mpi->comm.size(), my_nfold,
-              total_fold, fill_dev ? " -- ON THE DEVICE, each rank its own q of the device dW" : "");
+              total_fold, fill_redist ? (fill_dev ? " -- redistributed to whole-q slabs, folded ON THE DEVICE" : " -- redistributed to whole-q slabs") : "");
     }
 
     // ---- eta(q) diagnostics on the rung ACTUALLY cached (test-scale gate) ------------
