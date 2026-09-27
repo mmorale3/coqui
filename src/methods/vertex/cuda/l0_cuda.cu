@@ -768,7 +768,9 @@ namespace methods::solvers::dynbse_cuda {
       const long nc2 = nc * nc, CH = long(G) * CHG, nacc = nu0 ? 5 : 7;
       return size_t(CH * nc2 + 4 * nc2 + CH * FZ_NCOEF + nacc * long(G) * S * nc) * sizeof(cd);
     }
-    // the fused kernel's variants: cfg = 10 CHG + MINB (components per thread x minimum 256-thread blocks per SM)
+    // the fused kernel's variants: cfg = 10 CHG + MINB (components per thread x minimum 256-thread blocks per SM). H100 PCIe,
+    // Si kp444 C = 8 (p1gpu_n3w / n3x): 81 34 ms, 82 25 ms, 42 11.6 ms, 43 9.9 ms, 44 9.3 ms per k-batch; the Sigma-side L0
+    // 68.8 s at 42 vs 65.0 s at 44 over a run -> 44 (4 blocks / SM, 80 registers, spills) is the default
     template <bool NU0, int CHG, int MINB>
     void fz_launch(dim3 grid, unsigned threads, kdims kd, long ik0, long Kb, int pass, cd inu, bool skip_cst, int S, int G,
                    cd const *Vt, cd const *gk, cd const *gkq, cd const *Ghat, cd const *Gtil, cd const *coef, long const *gnode,
@@ -797,7 +799,7 @@ namespace methods::solvers::dynbse_cuda {
     // variant once on this k-batch (the first call per nu class; the accumulators are re-zeroed after) and print the table.
     void fused_passes(kdims kd, long ik0, long Kb, bool nu0, cd inu, bool skip_cst, cd const *Vt, cd const *gk, cd const *gkq,
                       cd const *Ghat, cd const *Gtil, cd const *coef, long const *gnode, cd *AU, cd *AT, cd *M2, cd *A1, cd *A3,
-                      bool merge = true, int cfg = 42, bool bench = false) {
+                      bool merge = true, int cfg = 44, bool bench = false) {
       const int S = fz_segment(kd.nc);
       if (S > 32) APP_ABORT(std::string(" l0_cuda: the fused L0 passes need nc <= 32."));
       const int slots = S * int(kd.nc);
@@ -813,7 +815,8 @@ namespace methods::solvers::dynbse_cuda {
         }
       };
       static bool benched[2] = {false, false};
-      if (bench and not benched[nu0 ? 1 : 0]) {
+      // a representative batch: >= 16 active components (the first batch of a run can be constant-only; p1gpu_n3w benched nca 1)
+      if (bench and not benched[nu0 ? 1 : 0] and kd.nca >= std::min<long>(16, 1 + kd.np)) {
         benched[nu0 ? 1 : 0] = true;
         const size_t accb = size_t(Kb) * size_t(2 * kd.np * kd.blk) * sizeof(cd);
         auto zero = [&] { for (cd *p : {AU, AT, M2, A1, A3}) cu_check(cudaMemsetAsync(p, 0, accb, 0), "fz bench zero"); };
@@ -1205,7 +1208,7 @@ namespace methods::solvers::dynbse_cuda {
     bool nu0 = false;
     bool fused = true, asmg = true;                  // the fused passes; the nu = 0 gemm assembly
     bool merge = true;                               // the fused passes as one merged pass
-    int fz_cfg = 42;                                 // the fused kernel's variant (10 CHG + MINB)
+    int fz_cfg = 44;                                 // the fused kernel's variant (10 CHG + MINB)
     bool fz_bench = false;                           // time every variant on the first k-batch per nu class
     cd *dcoef = nullptr, *dT = nullptr;
     cd inu = make_cuDoubleComplex(0.0, 0.0);
