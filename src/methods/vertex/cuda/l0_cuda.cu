@@ -456,6 +456,353 @@ namespace methods::solvers::dynbse_cuda {
       }
     }
 
+    // =================================================================================================================
+    // THE FUSED OUTPUT-STATIONARY L0 PASSES (gpu port 2026-09-27; notes/gpu_port_plan.md section 4e). The nsys / ncu
+    // profile of the batched-gemm + scatter passes: the per-pole 8 x 8 gemms are memory-bound on the materialized
+    // Pj / Qj / Bj (ng K W elements each, ~260 GB of traffic per expensive application) and the scatter kernels are
+    // L2-atomic-bound (every component adds into the same pole-indexed targets). Here one block per (r, k) owns every
+    // accumulator element e = (x', r, y') of its slice -- no atomics -- and forms the per-pole products in registers:
+    //   pass 0: P(y, x') = sum_x V(x, y) gk_j(x, x'),  Q(x', y') = sum_y Ghat_j(y, y') P(y, x'),
+    //           B(x', y') = sum_y gkq_j(y', y) P(y, x')                      (the gemms Pj, Qj, Bj of the old pass)
+    //   pass 1: P(y, x') = sum_x V(x, y) Gtil_j(x', x),  R(x', y') = sum_y gkq_j(y', y) P(y, x')   (Pl, Rl)
+    // Threads: G groups of S x nc slots (S = the power of two >= nc, the shuffle segment); thread (x', y') of a group
+    // computes P(y = y', x') and gets P(y, x') for every y from its segment by shuffles. The groups split the
+    // components of a chunk (CHG each). Per (chunk, pole j): the pole's tables and the chunk's partial-fraction
+    // coefficients (coef_kernel: the scatter kernels' own expressions) in shared memory; the pole-indexed targets
+    // (at nj = gnode[j]) accumulate over the group's components in registers, are summed over the groups in shared
+    // memory and added once; the component-indexed targets (at the component's node a) accumulate over the poles in
+    // registers and are added once per chunk, the groups in turn. Every term is the scatter's product with the
+    // scatter's coefficient; only the summation order differs from the old passes (rounding class).
+    // =================================================================================================================
+    constexpr int FZ_NCOEF = 6;
+
+    // the partial-fraction coefficients per (row, pole j), rows: nu != 0 -- [0, np) the U_a components
+    // {w (mulU, real), wt, wd (mulT on U_a)}, [np, 2np) the T_a components {wt, wd (mulU on T_a), ctl, cta, cul, cua};
+    // nu = 0 -- [0, np) the folded components {w, c2, c1} (real). a == gnode(j) (confluent) entries are never read.
+    __global__ void coef_kernel(bool nu0, long np, long ng, cd inu, double const *__restrict__ eps, double const *__restrict__ epsG,
+                                cd *__restrict__ coef) {
+      const long nrow = nu0 ? np : 2 * np;
+      const long i = blockIdx.x * long(blockDim.x) + threadIdx.x;
+      if (i >= nrow * ng) return;
+      const long row = i / ng, j = i % ng, a = row % np;
+      const bool isT = (not nu0) and row >= np;
+      const double ea = eps[a], ej = epsG[j];
+      cd *o = coef + i * FZ_NCOEF;
+      for (int k = 0; k < FZ_NCOEF; ++k) o[k] = make_cuDoubleComplex(0.0, 0.0);
+      if (ea == ej) return;                               // the confluent case (a == nj): handled without coefficients
+      if (nu0) {
+        const double dd = ea - ej;
+        o[0] = real(1.0 / (ej - ea));                     // w  (Q_j and R_l)
+        o[1] = real(1.0 / (ej - ea));                     // c2 (B_j -> M2)
+        o[2] = real(1.0 / (dd * dd));                     // c1 (B_j -> F1)
+      } else if (not isT) {
+        o[0] = real(1.0 / (ej - ea));                     // mulU on U_a: w
+        const cd w = real(1.0 / (ej - ea));               // mulT on U_a
+        const cd dd = real(ea - ej) + inu;
+        const cd wd = w / dd;
+        const cd wt = w - inu * wd;
+        o[1] = wt; o[2] = wd;
+      } else {
+        const cd w = real(1.0 / (ea - ej));               // mulU on T_a
+        const cd dd = real(ej - ea) + inu;
+        const cd wd = w / dd;
+        const cd wt = w - inu * wd;
+        o[0] = wt; o[1] = wd;
+        const double g = ej - ea;                         // mulT on T_a
+        const cd w2 = real(1.0 / (g * g));
+        const cd dla = real(ej - ea) + inu, dal = real(ea - ej) + inu;
+        const cd wla = w2 / dla, wal = w2 / dal;
+        o[2] = w2 - inu * wal;                            // ctl
+        o[3] = w2 - inu * wla;                            // cta
+        o[4] = wal - wla;                                 // cul
+        o[5] = wla - wal;                                 // cua
+      }
+    }
+
+    // the accumulator targets of a pass (nu != 0: AU AT M2 A1 A3 of part 0 at nj, AU AT of part 1 at nj;
+    // nu = 0: F1 M2 M3 of part 0 at nj, F1 M2 of part 1 at nj -- F1 lives in AU, M3 in A3)
+    template <bool NU0>
+    struct fz_acc { static constexpr int n = NU0 ? 5 : 7; };
+
+    template <bool NU0, int CHG>
+    __global__ void fused_pass_kernel(kdims d, long ik0, long K, int pass, cd inu, bool skip_cst, int S, int G,
+                                      cd const *__restrict__ Vt, cd const *__restrict__ gk, cd const *__restrict__ gkq,
+                                      cd const *__restrict__ Ghat, cd const *__restrict__ Gtil, cd const *__restrict__ coef,
+                                      long const *__restrict__ gnode,
+                                      cd *__restrict__ AU, cd *__restrict__ AT, cd *__restrict__ M2, cd *__restrict__ A1,
+                                      cd *__restrict__ A3) {
+      extern __shared__ double2 fz_smem[];
+      constexpr int NACC = fz_acc<NU0>::n;
+      const long nc = d.nc, nR = d.nR, np = d.np, ng = d.ng, nca = d.nca, nk = d.nk, blk = d.blk, nc2 = nc * nc;
+      const long r = blockIdx.x, kb = blockIdx.y;
+      if (kb >= K) return;
+      const long ik = ik0 + kb;
+      const int slots = S * int(nc);
+      const int t = int(threadIdx.x);
+      const bool inb = (t < G * slots);                   // the padding threads (to a whole warp) only take part in the shuffles
+      const int g = inb ? t / slots : 0, q = inb ? t % slots : 0, xp = q / S, yp = q % S;
+      const bool act = inb and (yp < nc);
+      const long e = act ? (long(xp) * nR + r) * nc + yp : 0;
+      const long W = nc * nca * nR * nc, asz = 2 * np * blk;
+      const int CH = G * CHG;
+      cd *Vs = fz_smem;                                   // (CH, nc, nc): the chunk's V(x, y) at this r
+      cd *T1 = Vs + CH * nc2;                             // gk_j (pass 0) | Gtil_j (pass 1)
+      cd *T2 = T1 + nc2;                                  // Ghat_j (pass 0)
+      cd *T3 = T2 + nc2;                                  // gkq_j, TRANSPOSED (bank-conflict-free reads)
+      cd *Cf = T3 + nc2;                                  // (CH, FZ_NCOEF): the chunk's coefficients at pole j
+      cd *Red = Cf + CH * FZ_NCOEF;                       // (NACC, G, slots): the pole-indexed partial sums
+      cd const *Vk = Vt + kb * W;
+      const cd zero = make_cuDoubleComplex(0.0, 0.0);
+      const cd *Ghk = Ghat + (ik * ng) * nc2, *Gtk = Gtil + (ik * ng) * nc2;
+      for (long il0 = 0; il0 < nca; il0 += CH) {
+        const int nch = int(min(long(CH), nca - il0));
+        __syncthreads();                                  // the previous chunk's reads of Vs are done
+        for (long i = t; i < long(nch) * nc2; i += blockDim.x) {
+          const long cl = i / nc2, xy = i % nc2, x = xy / nc, y = xy % nc;
+          Vs[i] = Vk[((x * nca + il0 + cl) * nR + r) * nc + y];
+        }
+        // this thread's components: cl = g CHG + m
+        long cm[CHG], am[CHG];
+        bool vm[CHG];
+#pragma unroll
+        for (int m = 0; m < CHG; ++m) {
+          const int cl = g * CHG + m;
+          vm[m] = inb and (cl < nch);
+          const long c = vm[m] ? d.act[il0 + cl] : 0;
+          if (vm[m] and c == 0 and skip_cst) vm[m] = false;
+          cm[m] = c;
+          am[m] = (c == 0) ? -1 : (NU0 ? c - 1 : ((c <= np) ? c - 1 : c - 1 - np));
+        }
+        cd aU[CHG], aT[CHG];
+#pragma unroll
+        for (int m = 0; m < CHG; ++m) { aU[m] = zero; aT[m] = zero; }
+        for (long j = 0; j < ng; ++j) {
+          __syncthreads();                                // Vs loaded; the previous pole's reads of T / Cf / Red done
+          for (long i = t; i < nc2; i += blockDim.x) {
+            if (pass == 0) { T1[i] = gk[(j * nk + ik) * nc2 + i]; T2[i] = Ghk[j * nc2 + i]; }
+            else T1[i] = Gtk[j * nc2 + i];
+            T3[(i % nc) * nc + i / nc] = gkq[(j * nk + ik) * nc2 + i];   // transposed: T3[y nc + y'] = gkq_j(y', y)
+          }
+          for (long i = t; i < long(nch) * FZ_NCOEF; i += blockDim.x) {
+            const long cl = i / FZ_NCOEF, kk = i % FZ_NCOEF, c = d.act[il0 + cl];
+            const long row = (c == 0) ? -1 : (NU0 ? c - 1 : c - 1);   // nu != 0: U_a rows [0, np), T_a rows [np, 2np) = c - 1
+            Cf[i] = (row >= 0) ? coef[(row * ng + j) * FZ_NCOEF + kk] : zero;
+          }
+          __syncthreads();
+          const long nj = gnode[j];
+          cd p[NACC];
+#pragma unroll
+          for (int k = 0; k < NACC; ++k) p[k] = zero;
+#pragma unroll
+          for (int m = 0; m < CHG; ++m) {
+            const int cl = g * CHG + m;
+            const int clr = (cl < nch) ? cl : 0;          // a valid smem row for the (discarded) padding components
+            // P(y = y', x'): lane y' of the segment
+            cd P = zero;
+            if (act) {
+              cd const *Vc = Vs + clr * nc2;
+              if (pass == 0) for (long x = 0; x < nc; ++x) P = P + Vc[x * nc + yp] * T1[x * nc + xp];
+              else           for (long x = 0; x < nc; ++x) P = P + Vc[x * nc + yp] * T1[xp * nc + x];
+            }
+            cd Qv = zero, Bv = zero;
+            for (long y = 0; y < nc; ++y) {               // every lane of the warp shuffles (no divergence)
+              const double px = __shfl_sync(0xffffffffu, P.x, int(y), S);
+              const double py = __shfl_sync(0xffffffffu, P.y, int(y), S);
+              const cd Py = make_cuDoubleComplex(px, py);
+              if (act) {
+                if (pass == 0) Qv = Qv + T2[y * nc + yp] * Py;
+                Bv = Bv + T3[y * nc + yp] * Py;          // B (pass 0) | R (pass 1): gkq_j(y', y) P(y, x')
+              }
+            }
+            if (not (act and vm[m])) continue;
+            const long c = cm[m], a = am[m];
+            cd const *cf = Cf + clr * FZ_NCOEF;
+            if (NU0) {
+              if (pass == 0) {
+                if (c == 0) { p[3] = p[3] + Qv; p[4] = p[4] + Bv; }                    // F1c(nj), M2c(nj)
+                else if (a == nj) { p[1] = p[1] + Qv; p[2] = p[2] + Bv; }             // M2(nj), M3(nj)
+                else {
+                  const double w = cf[0].x, c2 = cf[1].x, c1 = cf[2].x;
+                  p[0] = p[0] + scal(w, Qv); aU[m] = aU[m] - scal(w, Qv);
+                  p[1] = p[1] + scal(c2, Bv); p[0] = p[0] + neg(scal(c1, Bv)); aU[m] = aU[m] + scal(c1, Bv);
+                }
+              } else {
+                if (c == 0) p[3] = p[3] + neg(Bv);                                    // F1c(nl) -= R
+                else if (a == nj) p[1] = p[1] + neg(Bv);                              // M2(nl) -= R
+                else { const double w = cf[0].x; p[0] = p[0] + neg(scal(w, Bv)); aU[m] = aU[m] + scal(w, Bv); }
+              }
+            } else {
+              const cd vU = (pass == 0) ? Qv : neg(Bv);                               // U_j . Q_j | -U_l . R_l
+              const cd vT = (pass == 0) ? Bv : inu * Bv;                              // T_j . B_j | i nu T_l . R_l
+              if (c == 0) { p[5] = p[5] + vU; p[6] = p[6] + vT; }                     // AU(nj), AT(nj) of part 1
+              else if (c <= np) {                                                     // U_a
+                if (a == nj) { p[2] = p[2] + vU; p[3] = p[3] + vT; }                  // M2(nj); A1(nj) (U_l T_l)
+                else {
+                  const double w = cf[0].x;
+                  p[0] = p[0] + scal(w, vU); aU[m] = aU[m] - scal(w, vU);
+                  const cd wt = cf[1], wd = cf[2];
+                  p[1] = p[1] + wt * vT; aU[m] = aU[m] - wd * vT; p[0] = p[0] + wd * vT;
+                }
+              } else {                                                                 // T_a
+                if (a == nj) { p[3] = p[3] + vU; p[4] = p[4] + vT; }                  // A1(nj) (U_j T_j); A3(nj)
+                else {
+                  const cd wt = cf[0], wd = cf[1];
+                  aT[m] = aT[m] + wt * vU; p[0] = p[0] + neg(wd * vU); aU[m] = aU[m] + wd * vU;
+                  p[1] = p[1] + cf[2] * vT; aT[m] = aT[m] + cf[3] * vT;
+                  p[0] = p[0] + cf[4] * vT; aU[m] = aU[m] + cf[5] * vT;
+                }
+              }
+            }
+          }
+          // the pole-indexed targets: sum over the groups, one add per element
+          if (inb) {
+#pragma unroll
+            for (int k = 0; k < NACC; ++k) Red[(k * G + g) * slots + q] = p[k];
+          }
+          __syncthreads();
+          if (g == 0 and act) {
+            const long i0 = kb * asz + nj * blk + e, i1 = kb * asz + (np + nj) * blk + e;
+#pragma unroll
+            for (int k = 0; k < NACC; ++k) {
+              cd s2 = zero;
+              for (int gg = 0; gg < G; ++gg) s2 = s2 + Red[(k * G + gg) * slots + q];
+              if (not nonzero(s2)) continue;
+              cd *dst;
+              if (NU0) dst = (k == 0) ? &AU[i0] : (k == 1) ? &M2[i0] : (k == 2) ? &A3[i0] : (k == 3) ? &AU[i1] : &M2[i1];
+              else     dst = (k == 0) ? &AU[i0] : (k == 1) ? &AT[i0] : (k == 2) ? &M2[i0] : (k == 3) ? &A1[i0]
+                           : (k == 4) ? &A3[i0] : (k == 5) ? &AU[i1] : &AT[i1];
+              *dst = *dst + s2;
+            }
+          }
+        }
+        // the component-indexed targets (at the component's node a, part 0): the groups in turn
+        for (int gg = 0; gg < G; ++gg) {
+          __syncthreads();
+          if (inb and g == gg and act) {
+#pragma unroll
+            for (int m = 0; m < CHG; ++m) {
+              if (not vm[m] or am[m] < 0) continue;
+              const long ia = kb * asz + am[m] * blk + e;
+              if (nonzero(aU[m])) AU[ia] = AU[ia] + aU[m];
+              if (not NU0 and nonzero(aT[m])) AT[ia] = AT[ia] + aT[m];
+            }
+          }
+        }
+      }
+    }
+
+    // ---- the nu = 0 assembly without its Dsq / Dcb re-expansions (those are one gemm per k-batch, below): one thread
+    // per (k, e) looping the nodes n, so Fsum is summed in a register and Ffam(0 | 1, n) is written by one thread each
+    __global__ void assemble_nu0_elem_kernel(kdims d, long ik0, long K, bool sum_part1,
+                                             double const *__restrict__ fhalf, double const *__restrict__ fd1,
+                                             double const *__restrict__ fd2,
+                                             cd const *__restrict__ F1, cd const *__restrict__ M2, cd const *__restrict__ M3,
+                                             cd *__restrict__ Ffam, cd *__restrict__ Fsum, int *__restrict__ err) {
+      const long np = d.np, blk = d.blk, nc = d.nc, nR = d.nR, nk = d.nk, asz = 2 * np * blk;
+      const long kb = blockIdx.y;
+      if (kb >= K) return;
+      const long ik = ik0 + kb;
+      for (long e = blockIdx.x * long(blockDim.x) + threadIdx.x; e < blk; e += long(gridDim.x) * blockDim.x) {
+        const long x = e / (nR * nc), r = (e / nc) % nR, y = e % nc;
+        const long fs = ((ik * nc + x) * nc + y) * nR + r;
+        cd sacc = make_cuDoubleComplex(0.0, 0.0);
+        for (long n = 0; n < np; ++n) {
+          const long i0 = kb * asz + n * blk + e, i1 = kb * asz + (np + n) * blk + e;
+          const cd u = F1[i0], uc = F1[i1], m = M2[i0], mc = M2[i1], m3 = M3[i0];
+          const long f0n = (((0 * np + n) * nk + ik) * nc + x) * nc * nR + y * nR + r;
+          const long f1n = (((1 * np + n) * nk + ik) * nc + x) * nc * nR + y * nR + r;
+          if (nonzero(u) or nonzero(uc)) Ffam[f0n] = Ffam[f0n] + (u + uc);
+          sacc = sacc + scal(fhalf[n], u);
+          if (sum_part1) sacc = sacc + scal(fhalf[n], uc);
+          if (nonzero(m)) {
+            sacc = sacc + scal(fd1[n], m);
+            if (n >= d.np_fit) Ffam[f1n] = Ffam[f1n] + m;
+          }
+          if (nonzero(mc)) {
+            if (sum_part1) sacc = sacc + scal(fd1[n], mc);
+            if (n >= d.np_fit) Ffam[f1n] = Ffam[f1n] + mc;
+          }
+          if (nonzero(m3)) {
+            if (n >= d.np_fit) { atomicOr(err, 1); continue; }
+            sacc = sacc + scal(0.5 * fd2[n], m3);
+          }
+        }
+        if (nonzero(sacc)) Fsum[fs] = Fsum[fs] + sacc;
+      }
+    }
+    // T(kb; c, e) (the gemm's output, (np, blk) per k) added into Ffam(0, c, ik, x, y, r)
+    __global__ void nu0_reexp_add_kernel(kdims d, long ik0, long K, cd const *__restrict__ T, cd *__restrict__ Ffam) {
+      const long np = d.np, blk = d.blk, nc = d.nc, nR = d.nR, nk = d.nk;
+      const long kb = blockIdx.y;
+      if (kb >= K) return;
+      const long ik = ik0 + kb, tot = np * blk;
+      for (long i = blockIdx.x * long(blockDim.x) + threadIdx.x; i < tot; i += long(gridDim.x) * blockDim.x) {
+        const long c = i / blk, e = i % blk;
+        const cd v = T[kb * tot + i];
+        if (not nonzero(v)) continue;
+        const long x = e / (nR * nc), r = (e / nc) % nR, y = e % nc;
+        const long f = (((0 * np + c) * nk + ik) * nc + x) * nc * nR + y * nR + r;
+        Ffam[f] = Ffam[f] + v;
+      }
+    }
+
+    // host helpers shared by run_l0 and the resident plan
+    inline int fz_segment(long nc) { int S = 1; while (S < nc) S <<= 1; return S; }
+    inline size_t fz_smem_bytes(bool nu0, long nc, int S, int G, int CHG) {
+      const long nc2 = nc * nc, CH = long(G) * CHG, nacc = nu0 ? 5 : 7;
+      return size_t(CH * nc2 + 3 * nc2 + CH * FZ_NCOEF + nacc * long(G) * S * nc) * sizeof(cd);
+    }
+    constexpr int FZ_CHG = 8;
+    // the coefficient table (the pass's partial fractions, per apply: inu is fixed) + both fused passes of one k-batch
+    void fused_passes(kdims kd, long ik0, long Kb, bool nu0, cd inu, bool skip_cst, cd const *Vt, cd const *gk, cd const *gkq,
+                      cd const *Ghat, cd const *Gtil, cd const *coef, long const *gnode, cd *AU, cd *AT, cd *M2, cd *A1, cd *A3) {
+      const int S = fz_segment(kd.nc);
+      if (S > 32) APP_ABORT(std::string(" l0_cuda: the fused L0 passes need nc <= 32."));
+      const int slots = S * int(kd.nc);
+      const int G = std::max(1, 256 / slots);
+      const unsigned threads = unsigned(((G * slots + 31) / 32) * 32);   // whole warps: the shuffles take the full mask
+      const size_t sm = fz_smem_bytes(nu0, kd.nc, S, G, FZ_CHG);
+      if (sm > 48 * 1024) {
+        if (nu0) cu_check(cudaFuncSetAttribute(fused_pass_kernel<true, FZ_CHG>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(sm)), "fz attr");
+        else     cu_check(cudaFuncSetAttribute(fused_pass_kernel<false, FZ_CHG>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(sm)), "fz attr");
+      }
+      const dim3 grid(unsigned(kd.nR), unsigned(Kb), 1u);
+      for (int pass = 0; pass < 2; ++pass) {
+        if (nu0)
+          fused_pass_kernel<true, FZ_CHG><<<grid, threads, sm>>>(kd, ik0, Kb, pass, inu, skip_cst, S, G, Vt, gk, gkq, Ghat, Gtil, coef,
+                                                                 gnode, AU, AT, M2, A1, A3);
+        else
+          fused_pass_kernel<false, FZ_CHG><<<grid, threads, sm>>>(kd, ik0, Kb, pass, inu, skip_cst, S, G, Vt, gk, gkq, Ghat, Gtil, coef,
+                                                                  gnode, AU, AT, M2, A1, A3);
+        launch_check(pass == 0 ? "fused pass 0" : "fused pass 1");
+      }
+    }
+    void build_coef(bool nu0, long np, long ng, cd inu, double const *eps, double const *epsG, cd *coef) {
+      const long n = (nu0 ? np : 2 * np) * ng;
+      coef_kernel<<<unsigned((n + 255) / 256), 256>>>(nu0, np, ng, inu, eps, epsG, coef);
+      launch_check("coef_kernel");
+    }
+    // the nu = 0 assembly with the Dsq / Dcb re-expansions as gemms: T(kb; c, e) = sum_{n < np_fit} [Dsq(n, c) (M2 + M2c)(n, e)
+    // + Dcb(n, c) M3(n, e)] (column-major (blk x np) per k = the row-major (np, blk) block), then added into Ffam(0, c)
+    void assemble_nu0_gemm(cublasHandle_t h, kdims kd, long ik0, long Kb, bool sum_part1, double const *fh, double const *fd1,
+                           double const *fd2, cd const *Dsq, cd const *Dcb, cd const *F1, cd const *M2, cd const *M3, cd *T,
+                           cd *Ffam, cd *Fsum, int *err) {
+      const long np = kd.np, blk = kd.blk, npf = kd.np_fit, asz = 2 * np * blk;
+      assemble_nu0_elem_kernel<<<dim3(unsigned((blk + 255) / 256), unsigned(Kb), 1u), 256>>>(kd, ik0, Kb, sum_part1, fh, fd1, fd2,
+                                                                                            F1, M2, M3, Ffam, Fsum, err);
+      launch_check("assemble_nu0_elem");
+      const cd one = make_cuDoubleComplex(1.0, 0.0), zero = make_cuDoubleComplex(0.0, 0.0);
+      // part 0 (the family's M2), part 1 (the constant's M2c), M3 (part 0) with Dcb
+      cub_check(cublasZgemmStridedBatched(h, CUBLAS_OP_N, CUBLAS_OP_T, int(blk), int(np), int(npf), &one, M2, int(blk), (long long)asz,
+                                          Dsq, int(np), 0LL, &zero, T, int(blk), (long long)(np * blk), int(Kb)), "reexp M2");
+      cub_check(cublasZgemmStridedBatched(h, CUBLAS_OP_N, CUBLAS_OP_T, int(blk), int(np), int(npf), &one, M2 + np * blk, int(blk),
+                                          (long long)asz, Dsq, int(np), 0LL, &one, T, int(blk), (long long)(np * blk), int(Kb)), "reexp M2c");
+      cub_check(cublasZgemmStridedBatched(h, CUBLAS_OP_N, CUBLAS_OP_T, int(blk), int(np), int(npf), &one, M3, int(blk), (long long)asz,
+                                          Dcb, int(np), 0LL, &one, T, int(blk), (long long)(np * blk), int(Kb)), "reexp M3");
+      nu0_reexp_add_kernel<<<dim3(unsigned(std::min<long>((np * blk + 255) / 256, 4096)), unsigned(Kb), 1u), 256>>>(kd, ik0, Kb, T, Ffam);
+      launch_check("nu0_reexp_add");
+    }
+
     template <typename T>
     T *upload(T const *h, size_t n, char const *what) {
       T *p = nullptr;
@@ -523,8 +870,11 @@ namespace methods::solvers::dynbse_cuda {
     const double tt1 = dnow();                       // end of the fixed uploads (H2D)
 
     // ---- the k-batch: the largest K whose working set fits the memory we were given --------------
-    // per k: Vt + 3 ng W (P/Q/B) + 5 accumulators + 3 ng nc^2 pole operands, 16 B each
-    const double per_k = double(W + 3 * ng * W + 5 * long(asz) + 3 * ng * nc2) * 16.0;
+    // per k: Vt + 3 ng W (P/Q/B) + 5 accumulators + 3 ng nc^2 pole operands, 16 B each; the fused passes keep no P/Q/B
+    // and no pole operands, the nu = 0 gemm assembly adds its (np, blk) re-expansion block
+    const bool fused = (t.fused != 0), asmg = nu0 and (t.asm_gemm != 0);
+    const double per_k = double(W + (fused ? 0 : 3 * ng * W) + 5 * long(asz) + (fused ? 0 : 3 * ng * nc2) +
+                                (asmg ? np * blk : 0)) * 16.0;
     const double fixed = double(nF * 2 + nFs * 2 + size_t(2 * ng) * nk * nc2 * 2 + 3 * size_t(np) * np) * 16.0;
     const double budget = 0.85 * free_bytes - fixed;     // 15 % held back for the cuBLAS workspace
     long K = std::max(1L, std::min(nk, long(budget / per_k)));
@@ -536,7 +886,7 @@ namespace methods::solvers::dynbse_cuda {
     // cudaErrorMemoryAllocation). On a failed allocation everything of the attempt is freed and K is halved,
     // down to K = 1, which must fit (abort otherwise).
     cd *dVt = nullptr, *dPj = nullptr, *dQj = nullptr, *dBj = nullptr, *dgjT = nullptr, *dglT = nullptr, *dGh = nullptr;
-    cd *dAU = nullptr, *dAT = nullptr, *dM2 = nullptr, *dA1 = nullptr, *dA3 = nullptr;
+    cd *dAU = nullptr, *dAT = nullptr, *dM2 = nullptr, *dA1 = nullptr, *dA3 = nullptr, *dT = nullptr;
     cd **pVt = nullptr, **pGjT = nullptr, **pGlT = nullptr, **pGh = nullptr, **pPj = nullptr, **pQj = nullptr, **pBj = nullptr;
     size_t nptr = 0;
     {
@@ -547,7 +897,7 @@ namespace methods::solvers::dynbse_cuda {
       };
       auto free_all = [&]() {
         for (void **p : {(void **)&dVt, (void **)&dPj, (void **)&dQj, (void **)&dBj, (void **)&dgjT, (void **)&dglT,
-                         (void **)&dGh, (void **)&dAU, (void **)&dAT, (void **)&dM2, (void **)&dA1, (void **)&dA3,
+                         (void **)&dGh, (void **)&dAU, (void **)&dAT, (void **)&dM2, (void **)&dA1, (void **)&dA3, (void **)&dT,
                          (void **)&pVt, (void **)&pGjT, (void **)&pGlT, (void **)&pGh, (void **)&pPj, (void **)&pQj,
                          (void **)&pBj})
           if (*p != nullptr) { (void)cudaFree(*p); *p = nullptr; }
@@ -556,12 +906,14 @@ namespace methods::solvers::dynbse_cuda {
       bool ok = false;
       while (true) {
         nptr = size_t(K) * size_t(ng);
-        const size_t bW = size_t(K) * W * sizeof(cd), bP = size_t(K) * ng * W * sizeof(cd);
-        const size_t bG = size_t(K) * ng * nc2 * sizeof(cd), bA = size_t(K) * asz * sizeof(cd), bp = nptr * sizeof(cd *);
+        const size_t bW = size_t(K) * W * sizeof(cd), bP = fused ? 16 : size_t(K) * ng * W * sizeof(cd);
+        const size_t bG = fused ? 16 : size_t(K) * ng * nc2 * sizeof(cd), bA = size_t(K) * asz * sizeof(cd);
+        const size_t bp = fused ? 16 : nptr * sizeof(cd *), bT = asmg ? size_t(K) * np * blk * sizeof(cd) : 16;
         ok = try_alloc((void **)&dVt, bW) and try_alloc((void **)&dPj, bP) and try_alloc((void **)&dQj, bP) and
              try_alloc((void **)&dBj, bP) and try_alloc((void **)&dgjT, bG) and try_alloc((void **)&dglT, bG) and
              try_alloc((void **)&dGh, bG) and try_alloc((void **)&dAU, bA) and try_alloc((void **)&dAT, bA) and
              try_alloc((void **)&dM2, bA) and try_alloc((void **)&dA1, bA) and try_alloc((void **)&dA3, bA) and
+             try_alloc((void **)&dT, bT) and
              try_alloc((void **)&pVt, bp) and try_alloc((void **)&pGjT, bp) and try_alloc((void **)&pGlT, bp) and
              try_alloc((void **)&pGh, bp) and try_alloc((void **)&pPj, bp) and try_alloc((void **)&pQj, bp) and
              try_alloc((void **)&pBj, bp);
@@ -579,15 +931,22 @@ namespace methods::solvers::dynbse_cuda {
                      K_first, K);
     }
     const double tt2 = dnow();                       // end of the per-k allocations (alloc)
-    fill_ptrs<<<unsigned((nptr + 255) / 256), 256>>>(K, ng, W, nc2, dVt, dgjT, dglT, dGh, dPj, dQj, dBj,
-                                                     pVt, pGjT, pGlT, pGh, pPj, pQj, pBj);
-    launch_check("fill_ptrs");
+    if (not fused) {
+      fill_ptrs<<<unsigned((nptr + 255) / 256), 256>>>(K, ng, W, nc2, dVt, dgjT, dglT, dGh, dPj, dQj, dBj,
+                                                       pVt, pGjT, pGlT, pGh, pPj, pQj, pBj);
+      launch_check("fill_ptrs");
+    }
 
     cublasHandle_t h;
     cub_check(cublasCreate(&h), "cublasCreate");
     const cd one = make_cuDoubleComplex(1.0, 0.0), zero = make_cuDoubleComplex(0.0, 0.0);
     const cd inu = make_cuDoubleComplex(t.inu.real(), t.inu.imag());
     const int Ncols = int(nca * nR * nc), Mrows = int(nc * nca * nR);
+    cd *dcoef = nullptr;
+    if (fused) {
+      dcoef = alloc<cd>(size_t(nu0 ? np : 2 * np) * ng * FZ_NCOEF, "coef");
+      build_coef(nu0, np, ng, inu, deps, depsG, dcoef);
+    }
 
     for (long ik0 = 0; ik0 < nk; ik0 += K) {
       const long Kb = std::min(K, nk - ik0);
@@ -595,6 +954,9 @@ namespace methods::solvers::dynbse_cuda {
       for (cd *p : {dAU, dAT, dM2, dA1, dA3}) cu_check(cudaMemset(p, 0, size_t(Kb) * asz * sizeof(cd)), "memset acc");
       pack_kernel<<<dim3(64u, unsigned(Kb), 1u), 256>>>(kd, ik0, Kb, nu0, dX, dXc, dVt);
       launch_check("pack_kernel");
+      if (fused) {
+        fused_passes(kd, ik0, Kb, nu0, inu, t.skip_cst, dVt, dgk, dgkq, dGhat, dGtil, dcoef, dgn, dAU, dAT, dM2, dA1, dA3);
+      } else {
       poleT_kernel<<<dim3(32u, unsigned(Kb), 1u), 256>>>(kd, ik0, Kb, dgk, true, false, dgjT);
       poleT_kernel<<<dim3(32u, unsigned(Kb), 1u), 256>>>(kd, ik0, Kb, dgkq, true, false, dglT);
       poleT_kernel<<<dim3(32u, unsigned(Kb), 1u), 256>>>(kd, ik0, Kb, dGhat, false, true, dGh);
@@ -627,7 +989,10 @@ namespace methods::solvers::dynbse_cuda {
         scatter_kernel<<<dim3(unsigned(nca), unsigned(Kb), 1u), 256>>>(kd, Kb, 1, inu, t.skip_cst, dQj, dQj,
                                                                        deps, depsG, dgn, dAU, dAT, dM2, dA1, dA3);
       launch_check("scatter_kernel pass 1");
-      if (nu0)
+      }
+      if (nu0 and asmg)
+        assemble_nu0_gemm(h, kd, ik0, Kb, t.sum_part1, dfh, dfd1, dfd2, dDsq, dDcb, dAU, dM2, dA3, dT, dF, dFs, derr);
+      else if (nu0)
         assemble_nu0_kernel<<<dim3(unsigned(np), unsigned(Kb), 1u), 256>>>(kd, ik0, Kb, t.sum_part1, dfh, dfd1, dfd2,
                                                                            dDsq, dDcb, dAU, dM2, dA3, dF, dFs, derr);
       else
@@ -664,8 +1029,8 @@ namespace methods::solvers::dynbse_cuda {
                     (void *)dR3U, (void *)dR3T, (void *)dF, (void *)dFs, (void *)derr, (void *)dVt, (void *)dPj,
                     (void *)dQj, (void *)dBj, (void *)dgjT, (void *)dglT, (void *)dGh, (void *)dAU, (void *)dAT,
                     (void *)dM2, (void *)dA1, (void *)dA3, (void *)pVt, (void *)pGjT, (void *)pGlT, (void *)pGh,
-                    (void *)pPj, (void *)pQj, (void *)pBj})
-      cu_check(cudaFree(p), "cudaFree");
+                    (void *)pPj, (void *)pQj, (void *)pBj, (void *)dT, (void *)dcoef})
+      if (p) cu_check(cudaFree(p), "cudaFree");
     return K;
     }
 
@@ -768,6 +1133,8 @@ namespace methods::solvers::dynbse_cuda {
   struct l0_plan {
     long np = 0, np_fit = 0, nk = 0, nc = 0, ng = 0, nR_max = 0, nca_max = 0, K = 1;
     bool nu0 = false;
+    bool fused = true, asmg = true;                  // the fused passes; the nu = 0 gemm assembly
+    cd *dcoef = nullptr, *dT = nullptr;
     cd inu = make_cuDoubleComplex(0.0, 0.0);
     double tfold = 0.0;
     long *dact = nullptr;
@@ -781,17 +1148,18 @@ namespace methods::solvers::dynbse_cuda {
     cd *dAU = nullptr, *dAT = nullptr, *dM2 = nullptr, *dA1 = nullptr, *dA3 = nullptr;
     cd **pVt = nullptr, **pGjT = nullptr, **pGlT = nullptr, **pGh = nullptr, **pPj = nullptr, **pQj = nullptr, **pBj = nullptr;
     cublasHandle_t h = nullptr;
-    // per-k bytes of the working set at (nca_max, nR_max)
-    static double per_k_bytes(long np, long nc, long ng, long nR) {
+    // per-k bytes of the working set at (nca_max, nR_max) (the fused passes keep no Pj / Qj / Bj, no pole operands)
+    static double per_k_bytes(long np, long nc, long ng, long nR, bool fused = false, bool asmg = false) {
       const long nca = 1 + 2 * np, W = nc * nca * nR * nc, blk = nc * nR * nc, asz = 2 * np * blk;
-      return double(W + 3 * ng * W + 5 * asz + 3 * ng * nc * nc) * 16.0 + double(7 * ng) * 8.0;
+      return double(W + (fused ? 0 : 3 * ng * W) + 5 * asz + (fused ? 0 : 3 * ng * nc * nc) + (asmg ? np * blk : 0)) * 16.0 +
+             (fused ? 0.0 : double(7 * ng) * 8.0);
     }
     static double fixed_bytes(long np, long nk, long nc, long ng) {
       const double nc2 = double(nc * nc);
-      return (2.0 * ng * nk * nc2 * 2.0 + 10.0 * np * np + 6.0 * np) * 16.0 + 1.0 + 2.0 * np * 8.0;
+      return (2.0 * ng * nk * nc2 * 2.0 + 10.0 * np * np + 6.0 * np + 12.0 * np * ng) * 16.0 + 1.0 + 2.0 * np * 8.0;
     }
-    l0_plan(long np_, long np_fit_, long nk_, long nc_, long ng_, long nR_max_, double free_bytes)
-        : np(np_), np_fit(np_fit_), nk(nk_), nc(nc_), ng(ng_), nR_max(nR_max_), nca_max(1 + 2 * np_) {
+    l0_plan(long np_, long np_fit_, long nk_, long nc_, long ng_, long nR_max_, double free_bytes, bool fused_ = true, bool asmg_ = true)
+        : np(np_), np_fit(np_fit_), nk(nk_), nc(nc_), ng(ng_), nR_max(nR_max_), nca_max(1 + 2 * np_), fused(fused_), asmg(asmg_) {
       const size_t nc2 = size_t(nc * nc);
       dact = dalloc<long>(size_t(nca_max), "plan act");
       dgk = dalloc<cd>(size_t(ng) * nk * nc2, "plan gk"); dgkq = dalloc<cd>(size_t(ng) * nk * nc2, "plan gkq");
@@ -804,7 +1172,8 @@ namespace methods::solvers::dynbse_cuda {
       derr = dalloc<int>(1, "plan err");
       const long W = nc * nca_max * nR_max * nc, blk = nc * nR_max * nc;
       const size_t asz = size_t(2 * np) * size_t(blk);
-      const double pk = per_k_bytes(np, nc, ng, nR_max);
+      const double pk = per_k_bytes(np, nc, ng, nR_max, fused, asmg);
+      dcoef = dalloc<cd>(size_t(2 * np) * ng * FZ_NCOEF, "plan coef");
       K = std::max(1L, std::min(nk, long((0.85 * free_bytes - fixed_bytes(np, nk, nc, ng)) / pk)));
       // allocate with the same halving retry as run_l0 (a shared device)
       auto try_alloc = [&](void **p, size_t bytes) -> bool {
@@ -814,19 +1183,21 @@ namespace methods::solvers::dynbse_cuda {
       };
       auto free_ws = [&]() {
         for (void **p : {(void **)&dVt, (void **)&dPj, (void **)&dQj, (void **)&dBj, (void **)&dgjT, (void **)&dglT, (void **)&dGh,
-                         (void **)&dAU, (void **)&dAT, (void **)&dM2, (void **)&dA1, (void **)&dA3, (void **)&pVt, (void **)&pGjT,
-                         (void **)&pGlT, (void **)&pGh, (void **)&pPj, (void **)&pQj, (void **)&pBj})
+                         (void **)&dAU, (void **)&dAT, (void **)&dM2, (void **)&dA1, (void **)&dA3, (void **)&dT, (void **)&pVt,
+                         (void **)&pGjT, (void **)&pGlT, (void **)&pGh, (void **)&pPj, (void **)&pQj, (void **)&pBj})
           if (*p != nullptr) { (void)cudaFree(*p); *p = nullptr; }
       };
       bool ok = false;
       while (true) {
         const size_t nptr = size_t(K) * size_t(ng);
-        const size_t bW = size_t(K) * W * sizeof(cd), bP = size_t(K) * ng * W * sizeof(cd);
-        const size_t bG = size_t(K) * ng * nc2 * sizeof(cd), bA = size_t(K) * asz * sizeof(cd), bp = nptr * sizeof(cd *);
+        const size_t bW = size_t(K) * W * sizeof(cd), bP = fused ? 16 : size_t(K) * ng * W * sizeof(cd);
+        const size_t bG = fused ? 16 : size_t(K) * ng * nc2 * sizeof(cd), bA = size_t(K) * asz * sizeof(cd);
+        const size_t bp = fused ? 16 : nptr * sizeof(cd *), bT = asmg ? size_t(K) * np * blk * sizeof(cd) : 16;
         ok = try_alloc((void **)&dVt, bW) and try_alloc((void **)&dPj, bP) and try_alloc((void **)&dQj, bP) and
              try_alloc((void **)&dBj, bP) and try_alloc((void **)&dgjT, bG) and try_alloc((void **)&dglT, bG) and
              try_alloc((void **)&dGh, bG) and try_alloc((void **)&dAU, bA) and try_alloc((void **)&dAT, bA) and
              try_alloc((void **)&dM2, bA) and try_alloc((void **)&dA1, bA) and try_alloc((void **)&dA3, bA) and
+             try_alloc((void **)&dT, bT) and
              try_alloc((void **)&pVt, bp) and try_alloc((void **)&pGjT, bp) and try_alloc((void **)&pGlT, bp) and
              try_alloc((void **)&pGh, bp) and try_alloc((void **)&pPj, bp) and try_alloc((void **)&pQj, bp) and
              try_alloc((void **)&pBj, bp);
@@ -845,7 +1216,7 @@ namespace methods::solvers::dynbse_cuda {
                       (void *)dR3U, (void *)dR3T, (void *)ds1, (void *)ds3, (void *)dr1u, (void *)dr3u, (void *)dr3t, (void *)derr,
                       (void *)dVt, (void *)dPj, (void *)dQj, (void *)dBj, (void *)dgjT, (void *)dglT, (void *)dGh, (void *)dAU,
                       (void *)dAT, (void *)dM2, (void *)dA1, (void *)dA3, (void *)pVt, (void *)pGjT, (void *)pGlT, (void *)pGh,
-                      (void *)pPj, (void *)pQj, (void *)pBj})
+                      (void *)pPj, (void *)pQj, (void *)pBj, (void *)dT, (void *)dcoef})
         if (p) (void)cudaFree(p);
     }
     /** the unit's tables (host pointers, the layouts of l0_tables); nu0 selects the nu = 0 kernel */
@@ -867,6 +1238,7 @@ namespace methods::solvers::dynbse_cuda {
       }
       inu = make_cuDoubleComplex(t.inu.real(), t.inu.imag());
       tfold = t.tfold;
+      if (fused) build_coef(nu0, np, ng, inu, deps, depsG, dcoef);   // the unit's partial fractions (inu is the unit's)
     }
     /** F = L0 X on DEVICE buffers (F, Fs overwritten); act_h = the active components (host), sum_part1 as l0_tables */
     void apply(long nR, long nca, long const *act_h, bool skip_cst, bool sum_part1, cd const *Xfam, cd const *Xcst, cd *F, cd *Fs) {
@@ -881,9 +1253,11 @@ namespace methods::solvers::dynbse_cuda {
       const long blk = nc * nR * nc, W = nc * nca * nR * nc;
       const size_t asz = size_t(2 * np) * size_t(blk);
       const size_t nptr = size_t(K) * size_t(ng);
-      fill_ptrs<<<unsigned((nptr + 255) / 256), 256>>>(K, ng, W, nc2, dVt, dgjT, dglT, dGh, dPj, dQj, dBj,
-                                                       pVt, pGjT, pGlT, pGh, pPj, pQj, pBj);
-      launch_check("plan fill_ptrs");
+      if (not fused) {
+        fill_ptrs<<<unsigned((nptr + 255) / 256), 256>>>(K, ng, W, nc2, dVt, dgjT, dglT, dGh, dPj, dQj, dBj,
+                                                         pVt, pGjT, pGlT, pGh, pPj, pQj, pBj);
+        launch_check("plan fill_ptrs");
+      }
       cu_check(cudaMemset(derr, 0, sizeof(int)), "plan memset err");
       const cd one = make_cuDoubleComplex(1.0, 0.0), zero = make_cuDoubleComplex(0.0, 0.0);
       const int Ncols = int(nca * nR * nc), Mrows = int(nc * nca * nR);
@@ -893,6 +1267,9 @@ namespace methods::solvers::dynbse_cuda {
         for (cd *p : {dAU, dAT, dM2, dA1, dA3}) cu_check(cudaMemset(p, 0, size_t(Kb) * asz * sizeof(cd)), "plan memset acc");
         pack_kernel<<<dim3(64u, unsigned(Kb), 1u), 256>>>(kd, ik0, Kb, nu0, Xfam, Xcst, dVt);
         launch_check("plan pack_kernel");
+        if (fused) {
+          fused_passes(kd, ik0, Kb, nu0, inu, skip_cst, dVt, dgk, dgkq, dGhat, dGtil, dcoef, dgn, dAU, dAT, dM2, dA1, dA3);
+        } else {
         poleT_kernel<<<dim3(32u, unsigned(Kb), 1u), 256>>>(kd, ik0, Kb, dgk, true, false, dgjT);
         poleT_kernel<<<dim3(32u, unsigned(Kb), 1u), 256>>>(kd, ik0, Kb, dgkq, true, false, dglT);
         poleT_kernel<<<dim3(32u, unsigned(Kb), 1u), 256>>>(kd, ik0, Kb, dGhat, false, true, dGh);
@@ -921,7 +1298,10 @@ namespace methods::solvers::dynbse_cuda {
           scatter_kernel<<<dim3(unsigned(nca), unsigned(Kb), 1u), 256>>>(kd, Kb, 1, inu, skip_cst, dQj, dQj, deps, depsG, dgn,
                                                                          dAU, dAT, dM2, dA1, dA3);
         launch_check("plan scatter pass 1");
-        if (nu0)
+        }
+        if (nu0 and asmg)
+          assemble_nu0_gemm(h, kd, ik0, Kb, sum_part1, dfh, dfd1, dfd2, dDsq, dDcb, dAU, dM2, dA3, dT, F, Fs, derr);
+        else if (nu0)
           assemble_nu0_kernel<<<dim3(unsigned(np), unsigned(Kb), 1u), 256>>>(kd, ik0, Kb, sum_part1, dfh, dfd1, dfd2, dDsq, dDcb,
                                                                              dAU, dM2, dA3, F, Fs, derr);
         else
@@ -1012,7 +1392,8 @@ namespace methods::solvers::dynbse_cuda {
     b += 2.0 * double(c.nt) * W + double(c.nt) * W + double(c.n_kept) * W + np * W;   // Fs, Ys, rec, g, coef
     b += double(c.nk * c.nc * c.nc * c.nc * c.nc);                          // Cb_k
     b *= 16.0;
-    b += l0_plan::fixed_bytes(c.np, c.nk, c.nc, c.ng) + l0_plan::per_k_bytes(c.np, c.nc, c.ng, c.nR_max);   // L0 at K = 1
+    b += l0_plan::fixed_bytes(c.np, c.nk, c.nc, c.ng) +
+         l0_plan::per_k_bytes(c.np, c.nc, c.ng, c.nR_max, c.l0_fused != 0, c.l0_asm_gemm != 0);   // L0 at K = 1
     return b * 1.05 + 512.0e6;                                              // cuSOLVER / cuBLAS workspaces
   }
 
@@ -1051,7 +1432,7 @@ namespace methods::solvers::dynbse_cuda {
     e->red = dalloc<unsigned long long>(2, "ue red");
     size_t fr = 0, tot = 0;
     cu_check(cudaMemGetInfo(&fr, &tot), "ue memgetinfo");
-    e->l0 = new l0_plan(c.np, c.np_fit, c.nk, c.nc, c.ng, c.nR_max, double(fr));
+    e->l0 = new l0_plan(c.np, c.np_fit, c.nk, c.nc, c.ng, c.nR_max, double(fr), c.l0_fused != 0, c.l0_asm_gemm != 0);
     return e;
   }
 

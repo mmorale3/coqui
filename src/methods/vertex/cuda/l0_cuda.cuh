@@ -81,6 +81,11 @@ namespace methods::solvers::dynbse_cuda {
     double tfold = 0.0;             // the small-nu fold ratio (<= 0: off)
     bool sum_part1 = true;          // assemble: Fsum receives part 1 (the constant component) too
     bool skip_cst = false;          // the constant component is exactly zero: skip c = 0
+    // gpu port 2026-09-27 (the nsys / ncu profile of the device L0): 1 = the FUSED output-stationary passes (the per-pole
+    // products formed in registers / shared memory, no materialized Pj / Qj / Bj, no atomics), 0 = the batched-gemm +
+    // scatter passes; asm_gemm 1 = the nu = 0 assembly's Dsq / Dcb re-expansions as one gemm per k-batch (0 = atomics)
+    int fused = 1;
+    int asm_gemm = 1;
   };
 
   /**
@@ -124,6 +129,7 @@ namespace methods::solvers::dynbse_cuda {
   struct ue_config {
     long np = 0, np_fit = 0, nk = 0, nc = 0, ng = 0, nt = 0, nR_max = 0, ndist = 0, n_kept = 0;
     long nout = 0;                  // the external-leg / readout dimension (aux N_m, or the Wannier pair count)
+    int l0_fused = 1, l0_asm_gemm = 1;   // the resident L0 plan's kernels (l0_tables::fused / asm_gemm)
   };
 
   /** nullptr when the device cannot hold the working set (the caller keeps the host path); `why` then says what failed */
