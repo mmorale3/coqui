@@ -1322,7 +1322,7 @@ namespace solvers {
           dynbse_cuda::ue_config uc;
           uc.np = np; uc.np_fit = b.np_fit; uc.nk = nk; uc.nc = nc; uc.ng = ng; uc.nt = nt; uc.nR_max = nrb;
           uc.ndist = ndist; uc.n_kept = b.pf.n_kept; uc.nout = nout;
-          uc.l0_fused = int(vertex_debug::number("dynbse_l0_fused", 1.0));        // vertex_debug: dynbse_l0_fused
+          uc.l0_fused = int(vertex_debug::number("dynbse_l0_fused", 2.0));        // vertex_debug: dynbse_l0_fused (0 | 1 | 2 = merged)
           uc.l0_asm_gemm = int(vertex_debug::number("dynbse_l0_asm_gemm", 1.0));  // vertex_debug: dynbse_l0_asm_gemm
           char why[256] = {0};
           ue.reset(dynbse_cuda::ue_create(uc, 1.0e6 * double(utils::freemem_device_effective()), why, 256));

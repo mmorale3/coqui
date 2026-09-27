@@ -549,7 +549,8 @@ namespace methods::solvers::dynbse_cuda {
       cd *T1 = Vs + CH * nc2;                             // gk_j (pass 0) | Gtil_j (pass 1)
       cd *T2 = T1 + nc2;                                  // Ghat_j (pass 0)
       cd *T3 = T2 + nc2;                                  // gkq_j, TRANSPOSED (bank-conflict-free reads)
-      cd *Cf = T3 + nc2;                                  // (CH, FZ_NCOEF): the chunk's coefficients at pole j
+      cd *T4 = T3 + nc2;                                  // Gtil_j (the merged pass 2)
+      cd *Cf = T4 + nc2;                                  // (CH, FZ_NCOEF): the chunk's coefficients at pole j
       cd *Red = Cf + CH * FZ_NCOEF;                       // (NACC, G, slots): the pole-indexed partial sums
       cd const *Vk = Vt + kb * W;
       const cd zero = make_cuDoubleComplex(0.0, 0.0);
@@ -579,8 +580,9 @@ namespace methods::solvers::dynbse_cuda {
         for (long j = 0; j < ng; ++j) {
           __syncthreads();                                // Vs loaded; the previous pole's reads of T / Cf / Red done
           for (long i = t; i < nc2; i += blockDim.x) {
-            if (pass == 0) { T1[i] = gk[(j * nk + ik) * nc2 + i]; T2[i] = Ghk[j * nc2 + i]; }
+            if (pass != 1) { T1[i] = gk[(j * nk + ik) * nc2 + i]; T2[i] = Ghk[j * nc2 + i]; }
             else T1[i] = Gtk[j * nc2 + i];
+            if (pass == 2) T4[i] = Gtk[j * nc2 + i];
             T3[(i % nc) * nc + i / nc] = gkq[(j * nk + ik) * nc2 + i];   // transposed: T3[y nc + y'] = gkq_j(y', y)
           }
           for (long i = t; i < long(nch) * FZ_NCOEF; i += blockDim.x) {
@@ -597,28 +599,39 @@ namespace methods::solvers::dynbse_cuda {
           for (int m = 0; m < CHG; ++m) {
             const int cl = g * CHG + m;
             const int clr = (cl < nch) ? cl : 0;          // a valid smem row for the (discarded) padding components
-            // P(y = y', x'): lane y' of the segment
-            cd P = zero;
+            // P(y = y', x'): lane y' of the segment (pass 1: the G-tilde P; the merged pass 2 forms both, P and P1)
+            cd P = zero, P1 = zero;
             if (act) {
               cd const *Vc = Vs + clr * nc2;
-              if (pass == 0) for (long x = 0; x < nc; ++x) P = P + Vc[x * nc + yp] * T1[x * nc + xp];
+              if (pass != 1) for (long x = 0; x < nc; ++x) P = P + Vc[x * nc + yp] * T1[x * nc + xp];
               else           for (long x = 0; x < nc; ++x) P = P + Vc[x * nc + yp] * T1[xp * nc + x];
+              if (pass == 2) for (long x = 0; x < nc; ++x) P1 = P1 + Vc[x * nc + yp] * T4[xp * nc + x];
             }
-            cd Qv = zero, Bv = zero;
+            cd Qv = zero, Bv = zero, Xv = zero;
             for (long y = 0; y < nc; ++y) {               // every lane of the warp shuffles (no divergence)
               const double px = __shfl_sync(0xffffffffu, P.x, int(y), S);
               const double py = __shfl_sync(0xffffffffu, P.y, int(y), S);
               const cd Py = make_cuDoubleComplex(px, py);
+              cd P1y = zero;
+              if (pass == 2) {
+                const double qx = __shfl_sync(0xffffffffu, P1.x, int(y), S);
+                const double qy = __shfl_sync(0xffffffffu, P1.y, int(y), S);
+                P1y = make_cuDoubleComplex(qx, qy);
+              }
               if (act) {
-                if (pass == 0) Qv = Qv + T2[y * nc + yp] * Py;
-                Bv = Bv + T3[y * nc + yp] * Py;          // B (pass 0) | R (pass 1): gkq_j(y', y) P(y, x')
+                if (pass != 1) Qv = Qv + T2[y * nc + yp] * Py;
+                Bv = Bv + T3[y * nc + yp] * Py;          // B (pass 0, 2) | R (pass 1): gkq_j(y', y) P(y, x')
+                if (pass == 2) Xv = Xv + T3[y * nc + yp] * P1y;   // R of the merged pass
               }
             }
             if (not (act and vm[m])) continue;
+            // the merged pass: the scatter is linear in the pass-0 pair (Q, B) and in pass 1's R with the same coefficients
+            // and targets (pass 1 enters as vU = -R, vT = i nu R; at nu = 0 as Q -> -R), so one scatter of the sums
+            if (NU0 and pass == 2) Qv = Qv - Xv;
             const long c = cm[m], a = am[m];
             cd const *cf = Cf + clr * FZ_NCOEF;
             if (NU0) {
-              if (pass == 0) {
+              if (pass != 1) {
                 if (c == 0) { p[3] = p[3] + Qv; p[4] = p[4] + Bv; }                    // F1c(nj), M2c(nj)
                 else if (a == nj) { p[1] = p[1] + Qv; p[2] = p[2] + Bv; }             // M2(nj), M3(nj)
                 else {
@@ -632,8 +645,8 @@ namespace methods::solvers::dynbse_cuda {
                 else { const double w = cf[0].x; p[0] = p[0] + neg(scal(w, Bv)); aU[m] = aU[m] + scal(w, Bv); }
               }
             } else {
-              const cd vU = (pass == 0) ? Qv : neg(Bv);                               // U_j . Q_j | -U_l . R_l
-              const cd vT = (pass == 0) ? Bv : inu * Bv;                              // T_j . B_j | i nu T_l . R_l
+              const cd vU = (pass == 0) ? Qv : (pass == 1) ? neg(Bv) : Qv - Xv;       // U_j . Q_j | -U_l . R_l | both
+              const cd vT = (pass == 0) ? Bv : (pass == 1) ? inu * Bv : Bv + inu * Xv; // T_j . B_j | i nu T_l . R_l | both
               if (c == 0) { p[5] = p[5] + vU; p[6] = p[6] + vT; }                     // AU(nj), AT(nj) of part 1
               else if (c <= np) {                                                     // U_a
                 if (a == nj) { p[2] = p[2] + vU; p[3] = p[3] + vT; }                  // M2(nj); A1(nj) (U_l T_l)
@@ -750,12 +763,14 @@ namespace methods::solvers::dynbse_cuda {
     inline int fz_segment(long nc) { int S = 1; while (S < nc) S <<= 1; return S; }
     inline size_t fz_smem_bytes(bool nu0, long nc, int S, int G, int CHG) {
       const long nc2 = nc * nc, CH = long(G) * CHG, nacc = nu0 ? 5 : 7;
-      return size_t(CH * nc2 + 3 * nc2 + CH * FZ_NCOEF + nacc * long(G) * S * nc) * sizeof(cd);
+      return size_t(CH * nc2 + 4 * nc2 + CH * FZ_NCOEF + nacc * long(G) * S * nc) * sizeof(cd);
     }
     constexpr int FZ_CHG = 8;
-    // the coefficient table (the pass's partial fractions, per apply: inu is fixed) + both fused passes of one k-batch
+    // both fused passes of one k-batch: merge = true runs them as ONE pass (pass 2: the pass-1 products formed alongside
+    // the pass-0 ones, one scatter of the sums -- half the scatter, the syncs and the target writes)
     void fused_passes(kdims kd, long ik0, long Kb, bool nu0, cd inu, bool skip_cst, cd const *Vt, cd const *gk, cd const *gkq,
-                      cd const *Ghat, cd const *Gtil, cd const *coef, long const *gnode, cd *AU, cd *AT, cd *M2, cd *A1, cd *A3) {
+                      cd const *Ghat, cd const *Gtil, cd const *coef, long const *gnode, cd *AU, cd *AT, cd *M2, cd *A1, cd *A3,
+                      bool merge = true) {
       const int S = fz_segment(kd.nc);
       if (S > 32) APP_ABORT(std::string(" l0_cuda: the fused L0 passes need nc <= 32."));
       const int slots = S * int(kd.nc);
@@ -767,14 +782,14 @@ namespace methods::solvers::dynbse_cuda {
         else     cu_check(cudaFuncSetAttribute(fused_pass_kernel<false, FZ_CHG>, cudaFuncAttributeMaxDynamicSharedMemorySize, int(sm)), "fz attr");
       }
       const dim3 grid(unsigned(kd.nR), unsigned(Kb), 1u);
-      for (int pass = 0; pass < 2; ++pass) {
+      for (int pass = (merge ? 2 : 0); pass < (merge ? 3 : 2); ++pass) {
         if (nu0)
           fused_pass_kernel<true, FZ_CHG><<<grid, threads, sm>>>(kd, ik0, Kb, pass, inu, skip_cst, S, G, Vt, gk, gkq, Ghat, Gtil, coef,
                                                                  gnode, AU, AT, M2, A1, A3);
         else
           fused_pass_kernel<false, FZ_CHG><<<grid, threads, sm>>>(kd, ik0, Kb, pass, inu, skip_cst, S, G, Vt, gk, gkq, Ghat, Gtil, coef,
                                                                   gnode, AU, AT, M2, A1, A3);
-        launch_check(pass == 0 ? "fused pass 0" : "fused pass 1");
+        launch_check(pass == 0 ? "fused pass 0" : pass == 1 ? "fused pass 1" : "fused merged pass");
       }
     }
     void build_coef(bool nu0, long np, long ng, cd inu, double const *eps, double const *epsG, cd *coef) {
@@ -872,7 +887,7 @@ namespace methods::solvers::dynbse_cuda {
     // ---- the k-batch: the largest K whose working set fits the memory we were given --------------
     // per k: Vt + 3 ng W (P/Q/B) + 5 accumulators + 3 ng nc^2 pole operands, 16 B each; the fused passes keep no P/Q/B
     // and no pole operands, the nu = 0 gemm assembly adds its (np, blk) re-expansion block
-    const bool fused = (t.fused != 0), asmg = nu0 and (t.asm_gemm != 0);
+    const bool fused = (t.fused != 0), merge = (t.fused == 2), asmg = nu0 and (t.asm_gemm != 0);
     const double per_k = double(W + (fused ? 0 : 3 * ng * W) + 5 * long(asz) + (fused ? 0 : 3 * ng * nc2) +
                                 (asmg ? np * blk : 0)) * 16.0;
     const double fixed = double(nF * 2 + nFs * 2 + size_t(2 * ng) * nk * nc2 * 2 + 3 * size_t(np) * np) * 16.0;
@@ -956,7 +971,7 @@ namespace methods::solvers::dynbse_cuda {
       pack_kernel<<<dim3(64u, unsigned(Kb), 1u), 256>>>(kd, ik0, Kb, nu0, dX, dXc, dVt);
       launch_check("pack_kernel");
       if (fused) {
-        fused_passes(kd, ik0, Kb, nu0, inu, t.skip_cst, dVt, dgk, dgkq, dGhat, dGtil, dcoef, dgn, dAU, dAT, dM2, dA1, dA3);
+        fused_passes(kd, ik0, Kb, nu0, inu, t.skip_cst, dVt, dgk, dgkq, dGhat, dGtil, dcoef, dgn, dAU, dAT, dM2, dA1, dA3, merge);
       } else {
       poleT_kernel<<<dim3(32u, unsigned(Kb), 1u), 256>>>(kd, ik0, Kb, dgk, true, false, dgjT);
       poleT_kernel<<<dim3(32u, unsigned(Kb), 1u), 256>>>(kd, ik0, Kb, dgkq, true, false, dglT);
@@ -1135,6 +1150,7 @@ namespace methods::solvers::dynbse_cuda {
     long np = 0, np_fit = 0, nk = 0, nc = 0, ng = 0, nR_max = 0, nca_max = 0, K = 1;
     bool nu0 = false;
     bool fused = true, asmg = true;                  // the fused passes; the nu = 0 gemm assembly
+    bool merge = true;                               // the fused passes as one merged pass
     cd *dcoef = nullptr, *dT = nullptr;
     cd inu = make_cuDoubleComplex(0.0, 0.0);
     double tfold = 0.0;
@@ -1159,8 +1175,10 @@ namespace methods::solvers::dynbse_cuda {
       const double nc2 = double(nc * nc);
       return (2.0 * ng * nk * nc2 * 2.0 + 10.0 * np * np + 6.0 * np + 12.0 * np * ng) * 16.0 + 1.0 + 2.0 * np * 8.0;
     }
-    l0_plan(long np_, long np_fit_, long nk_, long nc_, long ng_, long nR_max_, double free_bytes, bool fused_ = true, bool asmg_ = true)
-        : np(np_), np_fit(np_fit_), nk(nk_), nc(nc_), ng(ng_), nR_max(nR_max_), nca_max(1 + 2 * np_), fused(fused_), asmg(asmg_) {
+    l0_plan(long np_, long np_fit_, long nk_, long nc_, long ng_, long nR_max_, double free_bytes, bool fused_ = true, bool asmg_ = true,
+            bool merge_ = true)
+        : np(np_), np_fit(np_fit_), nk(nk_), nc(nc_), ng(ng_), nR_max(nR_max_), nca_max(1 + 2 * np_), fused(fused_), asmg(asmg_),
+          merge(merge_) {
       const size_t nc2 = size_t(nc * nc);
       dact = dalloc<long>(size_t(nca_max), "plan act");
       dgk = dalloc<cd>(size_t(ng) * nk * nc2, "plan gk"); dgkq = dalloc<cd>(size_t(ng) * nk * nc2, "plan gkq");
@@ -1270,7 +1288,7 @@ namespace methods::solvers::dynbse_cuda {
         pack_kernel<<<dim3(64u, unsigned(Kb), 1u), 256>>>(kd, ik0, Kb, nu0, Xfam, Xcst, dVt);
         launch_check("plan pack_kernel");
         if (fused) {
-          fused_passes(kd, ik0, Kb, nu0, inu, skip_cst, dVt, dgk, dgkq, dGhat, dGtil, dcoef, dgn, dAU, dAT, dM2, dA1, dA3);
+          fused_passes(kd, ik0, Kb, nu0, inu, skip_cst, dVt, dgk, dgkq, dGhat, dGtil, dcoef, dgn, dAU, dAT, dM2, dA1, dA3, merge);
         } else {
         poleT_kernel<<<dim3(32u, unsigned(Kb), 1u), 256>>>(kd, ik0, Kb, dgk, true, false, dgjT);
         poleT_kernel<<<dim3(32u, unsigned(Kb), 1u), 256>>>(kd, ik0, Kb, dgkq, true, false, dglT);
@@ -1434,7 +1452,7 @@ namespace methods::solvers::dynbse_cuda {
     e->red = dalloc<unsigned long long>(2, "ue red");
     size_t fr = 0, tot = 0;
     cu_check(cudaMemGetInfo(&fr, &tot), "ue memgetinfo");
-    e->l0 = new l0_plan(c.np, c.np_fit, c.nk, c.nc, c.ng, c.nR_max, double(fr), c.l0_fused != 0, c.l0_asm_gemm != 0);
+    e->l0 = new l0_plan(c.np, c.np_fit, c.nk, c.nc, c.ng, c.nR_max, double(fr), c.l0_fused != 0, c.l0_asm_gemm != 0, c.l0_fused == 2);
     return e;
   }
 
