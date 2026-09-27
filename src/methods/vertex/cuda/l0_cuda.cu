@@ -2282,9 +2282,9 @@ namespace methods::solvers::dynbse_cuda {
     }
   } // namespace
 
-  void sd_finish(long nt, long nsk, long np, long npf, long nc2, double const *KF, double const *Tpp, cplx const *Cmap,
-                 double const *Kmap, cplx const *S_cst, cplx const *RT, cplx const *RU, bool anyT, cplx pref, cplx *dSig,
-                 double *fit_err) {
+  void sd_finish(long nt, long nsk, long np, long npf, long nc2, double const *KF, double const *Tpp, long nkept, cplx const *Ut,
+                 cplx const *Vs, double const *Kmap, cplx const *S_cst, cplx const *RT, cplx const *RU, bool anyT, cplx pref,
+                 cplx *dSig, double *fit_err) {
     const long nb = nsk * np * nc2, nS = nt * nsk * nc2;
     cublasHandle_t h = nullptr;
     cub_check(cublasCreate(&h), "fin handle");
@@ -2302,11 +2302,17 @@ namespace methods::solvers::dynbse_cuda {
       cd *dE = upload_c(RT, size_t(nt * nb), "fin RT");
       fin_scale_kf_kernel<<<grid_for(nt * nb), 256>>>(nt, nsk, np, nc2, dKF, dE);
       launch_check("fin E");
-      // ec (npf x nb) = Cmap (npf x nt) . E (nt x nb): column-major ec^T = E^T . Cmap^T
-      cd *dC = upload_c(Cmap, size_t(npf * nt), "fin Cmap");
+      // ec (npf x nb) = Vs (npf x nkept) . [Ut (nkept x nt) . E (nt x nb)]: the fit's two factors applied in turn, as on the
+      // host -- the explicit product Vs Ut carries rounding ~eps / s_min whatever the data (p1gpu_n3s: E_corr moved 2.6e-8)
+      cd *dU = upload_c(Ut, size_t(nkept * nt), "fin Ut");
+      cd *dV = upload_c(Vs, size_t(npf * nkept), "fin Vs");
+      cd *dg = dalloc<cd>(size_t(nkept * nb), "fin g");
       cd *dec = dalloc<cd>(size_t(npf * nb), "fin ec");
-      cub_check(cublasZgemm(h, CUBLAS_OP_N, CUBLAS_OP_N, int(nb), int(npf), int(nt), &one, dE, int(nb), dC, int(nt), &zero, dec,
+      cub_check(cublasZgemm(h, CUBLAS_OP_N, CUBLAS_OP_N, int(nb), int(nkept), int(nt), &one, dE, int(nb), dU, int(nt), &zero, dg,
+                            int(nb)), "fin g");
+      cub_check(cublasZgemm(h, CUBLAS_OP_N, CUBLAS_OP_N, int(nb), int(npf), int(nkept), &one, dg, int(nb), dV, int(nkept), &zero, dec,
                             int(nb)), "fin ec");
+      cu_check(cudaFree(dg), "fin free g");
       // the refit error: max |E - Kmap ec| / max |E|
       std::vector<cplx> Kc(size_t(nt * npf));
       for (long i = 0; i < nt * npf; ++i) Kc[size_t(i)] = cplx(Kmap[i], 0.0);
@@ -2327,7 +2333,8 @@ namespace methods::solvers::dynbse_cuda {
       cu_check(cudaFree(red), "fin free red");
       cu_check(cudaFree(drec), "fin free rec");
       cu_check(cudaFree(dK), "fin free K");
-      cu_check(cudaFree(dC), "fin free C");
+      cu_check(cudaFree(dU), "fin free Ut");
+      cu_check(cudaFree(dV), "fin free Vs");
       cu_check(cudaFree(dE), "fin free E");
       // ecP(isk; a, pp, ij), then out(it; isk, ij) += sum_{(a, pp)} Tpp(it; a, pp) ecP(isk; (a, pp), ij): one strided batched
       // gemm over isk -- column-major out_isk^T (nc2 x nt, ld nsk nc2) += ecP_isk^T (nc2 x R) . Tpp^T (R x nt), R = np npf

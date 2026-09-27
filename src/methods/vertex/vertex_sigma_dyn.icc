@@ -975,34 +975,44 @@ namespace solvers {
       e_fit_err = 0.0;
 #if defined(ENABLE_CUDA)
       // gpu port 2026-09-27 (p1gpu_n3q: 6.2 s per iteration here, the scalar contraction below single-node OMP): the same
-      // finish on the device -- the refit as ONE linear map Cmap (the fit applied to the identity; the gemm association
-      // differs from coeffs(E) by rounding), its reconstruction kernel for the error meter, and the partial-fraction sum as
-      // one strided-batched gemm over (s, k). vertex_debug sigdyn_finish_device = 0 keeps the host finish.
+      // finish on the device -- the refit through the fit's own two factors (Ut then Vs, as coeffs(E) applies them; the
+      // explicit product Vs Ut moved E_corr by 2.6e-8 in p1gpu_n3s: its rounding ~eps / s_min does not scale with the data),
+      // its reconstruction kernel for the error meter, and the partial-fraction sum as one strided-batched gemm over (s, k).
+      // vertex_debug sigdyn_finish_device = 0 keeps the host finish.
       if (vertex_debug::number("sigdyn_finish_device", 1.0) != 0.0) {   // vertex_debug: sigdyn_finish_device
-        nda::array<cplx, 2> Id(nt, nt), Cmap;
-        Id() = cplx(0.0);
-        for (long i = 0; i < nt; ++i) Id(i, i) = cplx(1.0);
+        nda::array<cplx, 2> Utk, Vsk;
         nda::array<double, 2> Kmap;
+        auto from_node_fit = [&](dynbse::node_pole_fit const &f) {
+          Utk = nda::array<cplx, 2>(f.n_kept, nt);
+          Vsk = nda::array<cplx, 2>(f.np, f.n_kept);
+          for (long k = 0; k < f.n_kept; ++k) for (long i = 0; i < nt; ++i) Utk(k, i) = cplx(f.Ut(k, i));
+          for (long p = 0; p < f.np; ++p) for (long k = 0; k < f.n_kept; ++k) Vsk(p, k) = cplx(f.Vs(p, k));
+          Kmap = f.Kmat;
+        };
         if (refit == "union") {
           dynbse::node_pole_fit upf;
           upf.build(b.beta, b.s, b.eps, refit_rtol);
-          Cmap = upf.coeffs(Id);
-          Kmap = upf.Kmat;
+          from_node_fit(upf);
+        } else if (b.npf_mask) {
+          from_node_fit(*b.npf_mask);
         } else {
-          Cmap = dynbse::basis_coeffs(b, Id);
-          Kmap = b.npf_mask ? b.npf_mask->Kmat : b.pf.Kmat;
+          const long nkp = b.pf.n_kept;
+          Utk = nda::array<cplx, 2>(b.pf.Ut(nda::range(0, nkp), nda::range::all));
+          Vsk = nda::array<cplx, 2>(b.pf.Vs(nda::range::all, nda::range(0, nkp)));
+          Kmap = b.pf.Kmat;
         }
-        utils::check(Cmap.shape(0) == npf and Cmap.shape(1) == nt and Kmap.shape(0) == nt and Kmap.shape(1) == npf,
-                     "sigma_dyn_finish: the refit map is ({}, {}) / its kernel ({}, {}), expected ({}, {}) / ({}, {}).",
-                     Cmap.shape(0), Cmap.shape(1), Kmap.shape(0), Kmap.shape(1), npf, nt, nt, npf);
+        utils::check(Vsk.shape(0) == npf and Utk.shape(1) == nt and Utk.shape(0) == Vsk.shape(1) and Kmap.shape(0) == nt and
+                     Kmap.shape(1) == npf, "sigma_dyn_finish: the refit factors are ({}, {}) / ({}, {}), its kernel ({}, {}); npf {}, nt {}.",
+                     Utk.shape(0), Utk.shape(1), Vsk.shape(0), Vsk.shape(1), Kmap.shape(0), Kmap.shape(1), npf, nt);
         nda::array<double, 3> Tpp_d(nt, np, npf);
         for (long it = 0; it < nt; ++it)
           for (long a = 0; a < np; ++a)
             for (long pp = 0; pp < npf; ++pp)
               Tpp_d(it, a, pp) = (a == pp) ? b.KF2(it, a) : (b.KF(it, a) - b.KF(it, pp)) / (b.eps(a) - b.eps(pp));
         nda::array<double, 2> KFc(b.KF);
-        dynbse_cuda::sd_finish(nt, ns * nk, np, npf, nc2, KFc.data(), Tpp_d.data(), Cmap.data(), Kmap.data(), h.S_cst.data(),
-                               h.RT.data(), h.RU.data(), anyT, cplx(-scale / double(nk_norm), 0.0), dSig.data(), &e_fit_err);
+        dynbse_cuda::sd_finish(nt, ns * nk, np, npf, nc2, KFc.data(), Tpp_d.data(), long(Utk.shape(0)), Utk.data(), Vsk.data(),
+                               Kmap.data(), h.S_cst.data(), h.RT.data(), h.RU.data(), anyT, cplx(-scale / double(nk_norm), 0.0),
+                               dSig.data(), &e_fit_err);
         return;
       }
 #endif
