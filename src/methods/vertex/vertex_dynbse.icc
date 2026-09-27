@@ -1255,6 +1255,13 @@ namespace solvers {
               if (outs[c] != nullptr)
                 for (long M = 0; M < nout; ++M)
                   for (long N = 0; N < nout; ++N) (*outs[c])(jn_unit, iq, M, N) = blk[size_t((c * nout + M) * nout + N)];
+            if (met and Pi_dyn1 != nullptr and not opt.one_rung_only) {
+              // the one-bare-rung slot of a Gamma_1-pass record is filled only when that pass fused it (device unit); an all-zero
+              // block means the caller's separate one-rung pass must supply the column
+              bool any = false;
+              for (long e = 0; e < nout * nout and not any; ++e) any = (blk[size_t(nout * nout + e)] != cplx(0.0));
+              if (any) ++met->r1_fused; else ++met->r1_missing;
+            }
             if (met) { ++met->nunits; ++met->nconv; }
             continue;
           }
@@ -2271,7 +2278,7 @@ namespace solvers {
     // unit ran every unit (gpu 4d), else by a second pass (which re-zeroes P1)
     const long r1_miss_a = mpi->comm.all_reduce_value(met.r1_missing, std::plus<>{});
     if (r1_miss_a == 0)
-      app_log(1, "  [scGW-tilde T2] the one-bare-rung column came with the Gamma_1 pass (device-resident unit): no second driver pass.");
+      app_log(1, "  [scGW-tilde T2] the one-bare-rung column came with the Gamma_1 pass (device-resident unit, or its unit dump): no second driver pass.");
     else {
       vd::dyn_opts o1 = o;
       o1.one_rung_only = true;
@@ -2428,7 +2435,7 @@ namespace solvers {
     if (o.sigma != nullptr) { o.sigma->flush_unit(); o.sigma = nullptr; }   // P3: the last unit's star fold; the cut_r1 pass carries no hook
     const long r1_miss_b = want_r1_cut ? mpi->comm.all_reduce_value(met.r1_missing, std::plus<>{}) : 0l;
     if (want_r1_cut and r1_miss_b == 0) {
-      app_log(1, "  [scGW-tilde T2] the one-bare-rung column came with the main pass (device-resident unit): no cut_r1 driver pass.");
+      app_log(1, "  [scGW-tilde T2] the one-bare-rung column came with the main pass (device-resident unit, or its unit dump): no cut_r1 driver pass.");
     } else if (want_r1_cut) {
       vd::dyn_opts o1 = o;
       o1.one_rung_only = true;
