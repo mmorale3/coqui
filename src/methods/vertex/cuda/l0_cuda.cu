@@ -2123,5 +2123,49 @@ namespace methods::solvers::dynbse_cuda {
     cu_check(cudaMemcpy(Ks, e->Ks, size_t(e->D) * size_t(e->D) * sizeof(cd), cudaMemcpyDeviceToHost), "ue Ks d2h");
   }
 
+  // ---- small device utilities for the host translation units (scr_coulomb_t's Pi hooks, vertex_t::build_w0) -----------
+  namespace {
+    __global__ void add_rows_kernel(long rows, long n, cd *__restrict__ y, long ldy, cd const *__restrict__ x, long ldx) {
+      const long tot = rows * n;
+      for (long e = blockIdx.x * long(blockDim.x) + threadIdx.x; e < tot; e += long(gridDim.x) * blockDim.x) {
+        const long r = e / n, i = e - r * n;
+        y[r * ldy + i] = y[r * ldy + i] + x[r * ldx + i];
+      }
+    }
+    __global__ void add_diag_kernel(long n, long ld, cd *__restrict__ a, double s) {
+      for (long i = blockIdx.x * long(blockDim.x) + threadIdx.x; i < n; i += long(gridDim.x) * blockDim.x)
+        a[i * ld + i] = a[i * ld + i] + real(s);
+    }
+  } // namespace
+
+  double dev_maxabs(cplx const *x, long n) {
+    if (n <= 0) return 0.0;
+    unsigned long long *slot = nullptr;
+    cu_check(cudaMalloc(&slot, sizeof(unsigned long long)), "dev_maxabs slot");
+    cu_check(cudaMemset(slot, 0, sizeof(unsigned long long)), "dev_maxabs zero");
+    maxabs_kernel<<<grid_red(n), 256>>>(n, reinterpret_cast<cd const *>(x), slot);
+    launch_check("dev_maxabs");
+    unsigned long long r = 0;
+    cu_check(cudaMemcpy(&r, slot, sizeof(r), cudaMemcpyDeviceToHost), "dev_maxabs d2h");
+    cu_check(cudaFree(slot), "dev_maxabs free");
+    double m = 0.0;
+    std::memcpy(&m, &r, sizeof(double));
+    return m;
+  }
+
+  void dev_add_rows(cplx *y, long ldy, cplx const *x, long ldx, long rows, long n) {
+    if (rows <= 0 or n <= 0) return;
+    add_rows_kernel<<<grid_for(rows * n), 256>>>(rows, n, reinterpret_cast<cd *>(y), ldy, reinterpret_cast<cd const *>(x), ldx);
+    launch_check("dev_add_rows");
+    cu_check(cudaDeviceSynchronize(), "dev_add_rows");
+  }
+
+  void dev_add_diag(cplx *a, long n, long ld, double s) {
+    if (n <= 0) return;
+    add_diag_kernel<<<grid_for(n), 256>>>(n, ld, reinterpret_cast<cd *>(a), s);
+    launch_check("dev_add_diag");
+    cu_check(cudaDeviceSynchronize(), "dev_add_diag");
+  }
+
 
 } // namespace methods::solvers::dynbse_cuda

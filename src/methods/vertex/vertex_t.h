@@ -205,28 +205,19 @@ namespace vertex_pi { struct iaft_tools; }
      *                    single-frequency machinery (dyson_W_in_place's algebra,
      *                    div_utils::eps_inv_head_w) applies verbatim.
      */
-    template<typename dArray_in_t, typename RArr_t, typename dArray_out_t>
-    void extract_nu0_row(dArray_in_t const &dA_tqPQ, RArr_t const &R_t,
-                         dArray_out_t &dA0_1qPQ) {
+    /// step (a) alone: this rank's partial on the SOURCE (q,P,Q) partition, global (nt_procs, nq, Np, Np) on the source
+    /// grid. The device hooks (scr_coulomb_t::eval_Pi_qdep) form the same partial on the device and hand it to
+    /// finish_nu0_row.
+    template<typename dArray_in_t, typename RArr_t>
+    auto nu0_row_partial(dArray_in_t const &dA_tqPQ, RArr_t const &R_t) {
       using Arr4 = nda::array<ComplexType, 4>;
       auto comm = dA_tqPQ.communicator();
       auto gs = dA_tqPQ.global_shape();      // (nt_half, nq, Np, Np)
       auto grd = dA_tqPQ.grid();             // (nt_procs, nq_procs, np_P, np_Q)
       auto bsz = dA_tqPQ.block_size();
-      auto og = dA0_1qPQ.global_shape();     // (1, nq, Np, Np)
-      auto ogr = dA0_1qPQ.grid();            // (1, 1, nP, nQ)
-      auto obs = dA0_1qPQ.block_size();
       utils::check(R_t.shape(0) == gs[0],
                    "vertex_w0_detail::extract_nu0_row: transform row length {} != nt_half "
                    "= {}.", R_t.shape(0), gs[0]);
-      utils::check(og[0] == 1 and og[1] == gs[1] and og[2] == gs[2] and og[3] == gs[3],
-                   "vertex_w0_detail::extract_nu0_row: output global shape ({}, {}, {}, {}) "
-                   "!= (1, {}, {}, {}).", og[0], og[1], og[2], og[3], gs[1], gs[2], gs[3]);
-      utils::check(ogr[0] == 1 and ogr[1] == 1,
-                   "vertex_w0_detail::extract_nu0_row: the output frequency and q axes must "
-                   "NOT be split (grid = {{{}, {}, {}, {}}}).",
-                   ogr[0], ogr[1], ogr[2], ogr[3]);
-
       const long ntp = grd[0];               // number of tau-PROCESSOR groups
       // (a) my partial, on the SOURCE (q,P,Q) partition verbatim (same grid, same
       //     shapes, same block sizes on axes 1..3) => pure local write, no comm.
@@ -251,12 +242,31 @@ namespace vertex_pi { struct iaft_tools; }
                 p(0, iq, ip, jq) += c * A(it, iq, ip, jq);
         }
       }
+      return dpart;
+    }
+
+    /// steps (b) + (c): the nt_procs partials (nu0_row_partial's layout) -> the output row
+    template<typename dPart_t, typename dArray_out_t>
+    void finish_nu0_row(dPart_t &dpart, dArray_out_t &dA0_1qPQ) {
+      using Arr4 = nda::array<ComplexType, 4>;
+      auto comm = dpart.communicator();
+      auto gs = dpart.global_shape();        // (nt_procs, nq, Np, Np)
+      const long ntp = gs[0];
+      auto og = dA0_1qPQ.global_shape();     // (1, nq, Np, Np)
+      auto ogr = dA0_1qPQ.grid();            // (1, 1, nP, nQ)
+      auto obs = dA0_1qPQ.block_size();
+      utils::check(og[0] == 1 and og[1] == gs[1] and og[2] == gs[2] and og[3] == gs[3],
+                   "vertex_w0_detail::extract_nu0_row: output global shape ({}, {}, {}, {}) "
+                   "!= (1, {}, {}, {}).", og[0], og[1], og[2], og[3], gs[1], gs[2], gs[3]);
+      utils::check(ogr[0] == 1 and ogr[1] == 1,
+                   "vertex_w0_detail::extract_nu0_row: the output frequency and q axes must "
+                   "NOT be split (grid = {{{}, {}, {}, {}}}).",
+                   ogr[0], ogr[1], ogr[2], ogr[3]);
       // (b) one redistribute: t-processor axis -> unsplit, (P,Q) -> the output partition.
       auto dgath = math::nda::make_distributed_array<Arr4>(
           *comm, ogr, {ntp, og[1], og[2], og[3]}, {1, obs[1], obs[2], obs[3]});
       if (comm->size() == 1) dgath.local() = dpart.local();
       else math::nda::redistribute(dpart, dgath);
-      dpart.reset();
       // (c) sum the nt_procs partials in index order (exact: disjoint tau partition).
       auto g = dgath.local();
       auto out = dA0_1qPQ.local();
@@ -271,6 +281,14 @@ namespace vertex_pi { struct iaft_tools; }
           for (long ip = 0; ip < ols[2]; ++ip)
             for (long jq = 0; jq < ols[3]; ++jq)
               out(0, iq, ip, jq) += g(j, iq, ip, jq);
+    }
+
+    template<typename dArray_in_t, typename RArr_t, typename dArray_out_t>
+    void extract_nu0_row(dArray_in_t const &dA_tqPQ, RArr_t const &R_t,
+                         dArray_out_t &dA0_1qPQ) {
+      auto dpart = nu0_row_partial(dA_tqPQ, R_t);
+      finish_nu0_row(dpart, dA0_1qPQ);
+      dpart.reset();
     }
 
   } // vertex_w0_detail
@@ -554,11 +572,13 @@ namespace vertex_pi { struct iaft_tools; }
      *
      * @param mb_state      - [INPUT/OUTPUT] MBState (G, and the head data)
      * @param thc           - [INPUT] THC-ERI (Z, basis_head, basis_bar_head)
-     * @param dPi_rpa_tqPQ  - [INPUT] RPA-ONLY polarizability, global (nt_half, nq, Np, Np)
+     * @param dPi_rpa_tqPQ  - [INPUT] RPA-ONLY polarizability, global (nt_half, nq, Np, Np); with nu0_partial, the
+     *                        per-tau-group partial of its i.nu = 0 row instead (vertex_w0_detail::nu0_row_partial's
+     *                        layout, global (nt_procs, nq, Np, Np) -- the DEVICE hooks form it on the device)
      */
     template<typename dArray_t>
     void build_w0(MBState &mb_state, THC_ERI auto const &thc,
-                  dArray_t const &dPi_rpa_tqPQ);
+                  dArray_t const &dPi_rpa_tqPQ, bool nu0_partial = false);
 
     /**
      * Install the general Wannier projector U(s,k) from a projector_t (WANNIER
@@ -1359,6 +1379,10 @@ namespace vertex_pi { struct iaft_tools; }
     bool active() const {
       return enabled() and _band_window.size() > 0 and (not _wannier or _M > 0);
     }
+    // gpu port: whether a method of this instance reads the host mirror mb_state.dW_qtPQ on the DEVICE path --
+    // Sigma^C and the no-cache Pi^C of the dynamic / linear rungs. The static rung reads W0-bar only, and the W-bar
+    // cache fill (cache_w) reads the device W (mb_state.dW_qtPQ_dev), so neither keeps the mirror alive.
+    bool reads_host_W() const { return active() and _rung != static_rung; }
 
     // IBZ symmetry diagnostics (notes/vertex_ibz_symmetry.md section 6):
     // measured C-window D-matrix leakage of the symmetry rotations (0 until the

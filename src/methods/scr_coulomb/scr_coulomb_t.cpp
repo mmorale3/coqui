@@ -38,6 +38,9 @@
 #include "methods/vertex/vertex_sigma_interp.hpp"
 #include "methods/vertex/nu_sampling.hpp"
 #include "methods/vertex/vertex_secondary_fold.hpp"
+#if defined(ENABLE_CUDA)
+#include "methods/vertex/cuda/l0_cuda.cuh"   // dev_maxabs / dev_add_rows: the Pi hooks on the device Pi
+#endif
 #include "utilities/proc_grid_partition.hpp"
 #include "nda/linalg/eigenelements.hpp"
 #include "hamiltonian/one_body_hamiltonian.hpp"   // scGW-tilde C4: H0 for the CVV velocity
@@ -256,11 +259,19 @@ namespace solvers {
     // mirror of W and host copies of Pi. Keep the W mirror alive (update_w's tail builds it only
     // on request) whenever a vertex is attached; Pi is mirrored inside eval_Pi_qdep's hooks.
     // The scGW-tilde C4 head (div_treatment = "cvv") has its own host machinery and is not bridged.
+    // gpu port 2026-09-27: only the consumers that still read the host mirror keep it -- the dynamic / linear rungs'
+    // Sigma^C and no-cache Pi^C (vertex_t::reads_host_W) and the Route-1 LFF-Sigma build. The W-bar cache fill reads the
+    // device W, the static rung reads W0-bar, the readout instance reads its own cache: a static-rung / pol-vertex run
+    // drops the 20 GB mirror (its allocation and the bulk D->H copy). vertex_debug keep_host_W = 1 restores the mirror.
     if constexpr (MEM != HOST_MEMORY) {
       if (_vertex != nullptr and (_vertex->active() or _vertex->pol_vertex_active())) {
-        if (not mb_state.keep_host_W)
+        const bool host_W = _vertex->reads_host_W() or _vertex->sigma_lff_enabled() or
+                            methods::vertex_debug::number("keep_host_W", 0.0) != 0.0;   // vertex_debug: keep_host_W
+        if (host_W and not mb_state.keep_host_W)
           app_log(1, "  [ISDF-Vertex] device path: keeping the host mirror of W for the vertex (keep_host_W = true).");
-        mb_state.keep_host_W = true;
+        else if (not host_W and not mb_state.keep_host_W)
+          app_log(2, "  [ISDF-Vertex] device path: no vertex consumer reads the host mirror of W -- not kept (keep_host_W = false).");
+        if (host_W) mb_state.keep_host_W = true;
       }
       utils::check(_div_treatment != "cvv",
                    "scr_coulomb_t::update_w<DEVICE_MEMORY>: div_treatment = \"cvv\" is host-only.");
@@ -1191,17 +1202,27 @@ namespace solvers {
     const long ntl = long(t_rng.size()), nql = long(q_rng.size());
     const long nPl = long(P_rng.size()), nQl = long(Q_rng.size());
     auto Pi_loc = dPi_tqPQ.local();
+    // gpu port 2026-09-27: Pi may be the DEVICE darray itself (eval_Pi_qdep's device hooks): the upfold result is then
+    // added on the device and nothing of Pi crosses to the host (no mirror, no copy back)
+    constexpr bool pi_dev = not nda::mem::on_host<Array_t>;
+#if !defined(ENABLE_CUDA)
+    if constexpr (pi_dev) utils::check(false, "inject_pol_ladder: a device Pi needs the CUDA helpers (ENABLE_CUDA).");
+#endif
 
     // ||P^RPA||_max BEFORE the +=, on the same grid (the comparison the ratio reports)
     double nR = 0.0;
-    {                                                   // a max over the local block: threaded, order-independent (bitwise)
+    if constexpr (pi_dev) {
+#if defined(ENABLE_CUDA)
+      nR = methods::solvers::dynbse_cuda::dev_maxabs(Pi_loc.data(), long(Pi_loc.size()));
+#endif
+    } else {                                            // a max over the local block: threaded, order-independent (bitwise)
       ComplexType const *pl = Pi_loc.data();
       const long npl = long(Pi_loc.size());
 #pragma omp parallel for reduction(max:nR) num_threads(utils::omp_threads())
       for (long e = 0; e < npl; ++e) nR = std::max(nR, std::abs(pl[e]));
     }
 
-    nda::array<ComplexType, 3> A(nw_h, nPl, nQl), B(nt_h, nPl, nQl);
+    nda::array<ComplexType, 3> A(pi_dev ? 0 : nw_h, nPl, nQl), B(pi_dev ? 0 : nt_h, nPl, nQl);   // host blocks (host Pi)
     nda::array<ComplexType, 2> tq_Q(Nm, nQl), td_P(nPl, Nm), tmp(Nm, nQl);
     double nC = 0.0;
     std::vector<double> qmax(size_t(nq_g), 0.0);
@@ -1224,8 +1245,9 @@ namespace solvers {
     // the += into the (host-mirror) Pi. vertex_debug inject_device = 0 keeps the host gemms (the A/B). The q-nu meter needs
     // the frequency block on the host: it keeps the host path.
 #if defined(ENABLE_DEVICE)
+    utils::check(not (pi_dev and qnu_meter), "inject_pol_ladder: the q-nu meter needs the host Pi (the caller mirrors it).");
     const bool up_dev = (nq_own > 0) and not qnu_meter and
-                        methods::vertex_debug::number("inject_device", 1.0) != 0.0;   // vertex_debug: inject_device
+                        (pi_dev or methods::vertex_debug::number("inject_device", 1.0) != 0.0);   // vertex_debug: inject_device
     std::optional<memory::array<DEVICE_MEMORY, ComplexType, 3>> tmp_d, A_d, B_d;
     if (up_dev) {
       tmp_d.emplace(nw_h, Nm, nQl); A_d.emplace(nw_h, nPl, nQl); B_d.emplace(nt_h, nPl, nQl);
@@ -1256,7 +1278,7 @@ namespace solvers {
         auto A2d = nda::reshape(*A_d, shape_t<2>{nw_h, nPl * nQl});
         auto B2d = nda::reshape(*B_d, shape_t<2>{nt_h, nPl * nQl});
         _ft->w_to_tau_PHsym(A2d, B2d);
-        B = nda::array<ComplexType, 3>(memory::to_memory_space<HOST_MEMORY>(*B_d));
+        if constexpr (not pi_dev) B = nda::array<ComplexType, 3>(memory::to_memory_space<HOST_MEMORY>(*B_d));
 #endif
       } else {
       // upfold ONLY the local block: dP(P, Q) = sum_MN conj(t_MP) Pl_MN t_NQ (the
@@ -1279,6 +1301,19 @@ namespace solvers {
       }
       const double tu1 = up_now();
       t_up_gemm += tu1 - tu0;
+      if constexpr (pi_dev) {
+#if defined(ENABLE_CUDA)
+        // this rank's tau rows of the transformed block, straight into the device Pi (rows it, stride nql nPl nQl)
+        const long blk = nPl * nQl;
+        ComplexType const *Bt = (*B_d).data() + t_rng.first() * blk;
+        const double mloc = methods::solvers::dynbse_cuda::dev_maxabs(Bt, ntl * blk);
+        methods::solvers::dynbse_cuda::dev_add_rows(Pi_loc.data() + iql * blk, nql * blk, Bt, blk, ntl, blk);
+        nC = std::max(nC, mloc);
+        qmax[size_t(iq)] = std::max(qmax[size_t(iq)], mloc);
+#endif
+        t_up_add += up_now() - tu1;
+        continue;
+      } else {
       if (not qnu_meter) {
         // the += into the host mirror of Pi and the max meters, threaded (elementwise adds and max reductions: bitwise
         // the serial loop's values; p1gpu_n3o: 14.6 s of the upfold wall single-threaded)
@@ -1312,6 +1347,7 @@ namespace solvers {
             Pi_loc(it, iql, i, j) += v;
           }
       t_up_add += up_now() - tu1;
+      }   // host Pi
     }
     const double t_upfold = lwatch.lap();
     auto &comm = *dPi_tqPQ.communicator();
@@ -2754,8 +2790,87 @@ namespace solvers {
     };
     // gpu port 2026-09-27: wall clock of the Pi hooks (the profile left ~30 s of eval_Pi_qdep unattributed)
     auto hk_wall = [] { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
+    // gpu port 2026-09-27 (p1gpu_n3q: 45 s of these hooks per iteration, 2 x 5 s of them the two 11 GB host mirrors): the
+    // hooks on the DEVICE Pi. The RPA hooks read Pi only through its i.nu = 0 row (both build_w0s, the readout baseline):
+    // each rank forms its tau-group partial of the row on the device (one gemm, nq Np^2 / nt_procs comes down) and the
+    // row is finished from it (vertex_w0_detail::finish_nu0_row; build_w0 then runs its Dysons on the device too). The
+    // post hook's injection adds the upfolded ladder into the device Pi. The rounding of the tau sum is cuBLAS's instead
+    // of the host loop's. Hooks without a device form keep the mirror: the eps cuts (report-only), the LFF bubble
+    // "full", an ACTIVE vertex's Pi^C, the q-nu meter. vertex_debug pi_hooks_device = 0 restores the mirrors.
+#if defined(ENABLE_CUDA)
+    const bool hooks_dev = methods::vertex_debug::number("pi_hooks_device", 1.0) != 0.0;   // vertex_debug: pi_hooks_device
+#else
+    const bool hooks_dev = false;
+#endif
+    const bool rpa_hooks_dev = hooks_dev and
+        not (pol_readout and (_vertex->eps_cut_nq() > 0 or
+                              (_vertex->sigma_lff_enabled() and _vertex->sigma_lff_bub() == "full")));
+    // (add_vertex_Pi_C does something only for an ACTIVE non-static vertex; that one keeps the mirror)
+    const bool post_hooks_dev = hooks_dev and
+                                not (_vertex != nullptr and _vertex->active() and _vertex->rung() != static_rung) and
+                                not (_vertex != nullptr and _vertex->ladder_qnu_meter());
+    // this rank's tau-group partial of the i.nu = 0 row, formed on the device (vertex_w0_detail::nu0_row_partial's layout)
+    [[maybe_unused]] auto nu0_partial_device = [&](auto &dPi) {
+      using math::nda::make_distributed_array;
+      auto R = solvers::vertex_w0_detail::nu0_transform_row(*_ft);
+      auto gs = dPi.global_shape();
+      auto grd = dPi.grid();
+      auto bsz = dPi.block_size();
+      utils::check(R.shape(0) == gs[0], "eval_Pi_qdep: the nu = 0 row has {} tau nodes, Pi {}.", R.shape(0), gs[0]);
+      auto part = make_distributed_array<nda::array<ComplexType, 4>>(*dPi.communicator(), grd, {grd[0], gs[1], gs[2], gs[3]},
+                                                                     {1, bsz[1], bsz[2], bsz[3]});
+      auto ls = dPi.local_shape();
+      auto pls = part.local_shape();
+      utils::check(pls[0] == 1 and pls[1] == ls[1] and pls[2] == ls[2] and pls[3] == ls[3],
+                   "eval_Pi_qdep: the nu = 0 partial does not mirror the device block of Pi.");
+      const long t0 = dPi.origin()[0], ntl = ls[0], rest = ls[1] * ls[2] * ls[3];
+      auto pl = part.local();
+      if (ntl > 0 and rest > 0) {
+        nda::array<ComplexType, 2> Rl(1, ntl);
+        for (long it = 0; it < ntl; ++it) Rl(0, it) = R(t0 + it);
+        auto Rd = memory::to_memory_space<MEM>(Rl);
+        memory::array<MEM, ComplexType, 2> yd(1, rest);
+        auto A2 = nda::reshape(dPi.local(), shape_t<2>{ntl, rest});
+        nda::blas::gemm(Rd, A2, yd);                                    // sum_t R(t) Pi(t, q, P, Q)
+        auto yh = memory::to_memory_space<HOST_MEMORY>(yd);
+        std::copy_n(yh.data(), rest, pl.data());
+      } else {
+        pl() = ComplexType(0.0);
+      }
+      return part;
+    };
+    // the replicated i.nu = 0 row (gather_nu0_row's result) from those partials
+    [[maybe_unused]] auto nu0_row_from_partial = [&](auto &part) {
+      auto gs = part.global_shape();
+      nda::array<ComplexType, 3> out(gs[1], gs[2], gs[3]);
+      out() = ComplexType(0.0);
+      auto q_rng = part.local_range(1);
+      auto P_rng = part.local_range(2);
+      auto Q_rng = part.local_range(3);
+      auto pl = part.local();
+      for (long iq = 0; iq < long(q_rng.size()); ++iq)
+        for (long iP = 0; iP < long(P_rng.size()); ++iP)
+          for (long iQ = 0; iQ < long(Q_rng.size()); ++iQ)
+            out(q_rng.first() + iq, P_rng.first() + iP, Q_rng.first() + iQ) = pl(0, iq, iP, iQ);
+      part.communicator()->all_reduce_in_place_n(out.data(), out.size(), std::plus<>{});
+      return out;
+    };
     auto vertex_hooks_rpa = [&](auto &dPi_rpa) {      // RPA-only Pi: before ANY correction (read-only hooks)
       if constexpr (MEM == HOST_MEMORY) { build_vertex_W0(dPi_rpa); build_pol_ladder_kernel(dPi_rpa); }
+      else if (vertex_hooks_needed and rpa_hooks_dev) {
+        const double w0 = hk_wall();
+        auto part = nu0_partial_device(dPi_rpa);
+        const double w1 = hk_wall();
+        if (_vertex != nullptr and _vertex->needs_w0()) _vertex->build_w0(mb_state, thc, part, true);
+        const double w2 = hk_wall();
+        if (pol_readout) {
+          ensure_pol_vertex(thc);
+          _pol_vtx->build_w0(mb_state, thc, part, true);
+          _pol_pi0_qPQ = nu0_row_from_partial(part);    // the readout's RPA baseline
+        }
+        app_log(1, "  [eval_Pi wall] RPA hooks on the DEVICE Pi: the i.nu = 0 row partial {:.1f} s, build_vertex_W0 {:.1f} s, "
+                   "the ladder kernel (build_w0 + nu0 row) {:.1f} s", w1 - w0, w2 - w1, hk_wall() - w2);
+      }
       else if (vertex_hooks_needed) {
         const double w0 = hk_wall();
         auto h = host_mirror_of(dPi_rpa);
@@ -2769,6 +2884,12 @@ namespace solvers {
     };
     auto vertex_hooks_post = [&](auto &dPi) {         // Pi = Pi_RPA (+ corrections) + Pi^C; injection last
       if constexpr (MEM == HOST_MEMORY) { add_vertex_Pi_C(dPi); inject_pol_tier(dPi); }
+      else if (vertex_hooks_needed and post_hooks_dev) {
+        // add_vertex_Pi_C is a no-op here (no active non-static vertex: post_hooks_dev); the injection adds into the device Pi
+        const double w0 = hk_wall();
+        inject_pol_tier(dPi);
+        app_log(1, "  [eval_Pi wall] post hooks on the DEVICE Pi: the injection {:.1f} s", hk_wall() - w0);
+      }
       else if (vertex_hooks_needed) {
         const double w0 = hk_wall();
         auto h = host_mirror_of(dPi);

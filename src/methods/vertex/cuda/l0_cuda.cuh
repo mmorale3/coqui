@@ -206,6 +206,14 @@ namespace methods::solvers::dynbse_cuda {
   /** ADD the device accumulators into the host ones -- S_cst (nt, ns, nk, nc, nc), RT / RU (nt, ns, nk, np, nc, nc) -- and zero them */
   void ue_sd_flush(unit_engine *e, cplx *S_cst, cplx *RT, cplx *RU);
 
+  // ---- small device utilities for the host translation units (all pointers are DEVICE pointers; synchronous) ----------
+  /** max_i |x_i| over n elements (0 for n <= 0) */
+  double dev_maxabs(cplx const *x, long n);
+  /** y[r * ldy + i] += x[r * ldx + i] for r < rows, i < n */
+  void dev_add_rows(cplx *y, long ldy, cplx const *x, long ldx, long rows, long n);
+  /** a[i * ld + i] += s for i < n */
+  void dev_add_diag(cplx *a, long n, long ld, double s);
+
 } // namespace methods::solvers::dynbse_cuda
 
 #endif

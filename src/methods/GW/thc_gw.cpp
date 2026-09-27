@@ -135,9 +135,9 @@ namespace methods {
       // ISDF-Vertex / LFF-Sigma consumers: host code on the host shared-memory G / Sigma and the host
       // mirror of W. On the DEVICE path (increment G-1, notes/gpu_port_plan.md section 4) they run
       // unchanged: G / Sigma stay host-resident by the gpu design and scr_coulomb_t::update_w keeps
-      // the W mirror (keep_host_W) whenever a vertex is attached.
+      // the W mirror (keep_host_W) whenever an attached vertex reads it (vertex_t::reads_host_W).
       if constexpr (MEM != HOST_MEMORY) {
-        utils::check(_vertex == nullptr or not _vertex->active() or mb_state.dW_qtPQ.has_value(),
+        utils::check(_vertex == nullptr or not _vertex->reads_host_W() or mb_state.dW_qtPQ.has_value(),
                      "gw_t::evaluate<DEVICE_MEMORY>: the vertex needs the host mirror of W (keep_host_W).");
       }
       {

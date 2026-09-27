@@ -4103,7 +4103,14 @@ namespace solvers {
     utils::check(active() and secondary(),
                  "vertex_t::cache_w: requires an ACTIVE vertex in isdf mode \"secondary\" "
                  "(the global path retains the full dW instead; notes/wbar_cache.md).");
-    utils::check(mb_state.dW_qtPQ.has_value(),
+    // gpu port 2026-09-27: on the DEVICE path the source is the device W (mb_state.dW_qtPQ_dev) whenever it is present;
+    // update_w then keeps no host mirror for this consumer (vertex_t::reads_host_W).
+#if defined(ENABLE_DEVICE)
+    const bool have_dev_W = mb_state.dW_qtPQ_dev.has_value();
+#else
+    const bool have_dev_W = false;
+#endif
+    utils::check(mb_state.dW_qtPQ.has_value() or have_dev_W,
                  "vertex_t::cache_w: dW_qtPQ is not initialized in MBState -- cache_w "
                  "must run at the scr_coulomb_t::update_w tail, after the new W is stored.");
     utils::check(mb_state.sG_tskij.has_value(),
@@ -4130,7 +4137,11 @@ namespace solvers {
     vertex_pi::iaft_tools tools(*_ft);
     const long nw_b = tools.nw_b;
     const long nw_half = (nw_b % 2 == 0) ? nw_b / 2 : nw_b / 2 + 1;
+#if defined(ENABLE_DEVICE)
+    auto gs = mb_state.dW_qtPQ.has_value() ? mb_state.dW_qtPQ.value().global_shape() : mb_state.dW_qtPQ_dev.value().global_shape();
+#else
     auto gs = mb_state.dW_qtPQ.value().global_shape();
+#endif
     const long nt_half = gs[1];
     utils::check(gs[0] == nqpts_ibz and gs[2] == Np and gs[3] == Np,
                  "vertex_t::cache_w: unexpected dW_qtPQ global shape ({}, {}, {}, {}).",
@@ -4267,15 +4278,19 @@ namespace solvers {
       bool fill_dev = false;
       const bool fill_redist = (not shm_cache and nqpts_ibz >= long(mpi->comm.size()) and
                                 vertex_debug::number("cache_w_redist", 1.0) != 0.0);   // vertex_debug: cache_w_redist
-      if (fill_redist) {
-        auto dWq = math::nda::make_distributed_array<nda::array<ComplexType, 4>>(
-            mpi->comm, {long(mpi->comm.size()), 1l, 1l, 1l}, {nqpts_ibz, nt_half, Np, Np}, {1l, 1l, 1l, 1l});
-        math::nda::redistribute(mb_state.dW_qtPQ.value(), dWq);
-        auto loc = dWq.local();
-        const long q0 = dWq.origin()[0], nql = dWq.local_shape()[0];
 #if defined(ENABLE_DEVICE)
-        fill_dev = (vertex_debug::number("cache_w_device", 1.0) != 0.0);   // vertex_debug: cache_w_device
+      if (fill_redist) fill_dev = (vertex_debug::number("cache_w_device", 1.0) != 0.0);   // vertex_debug: cache_w_device
 #endif
+      // the source of the redistribution: the device W (device-to-device, no host mirror) when the folds run there too
+      const bool src_dev = fill_dev and have_dev_W;
+      // every other path reads the host mirror: materialize it on demand when update_w kept none
+#if defined(ENABLE_DEVICE)
+      if (not src_dev and not mb_state.dW_qtPQ.has_value()) {
+        app_log(1, "  cache_w: the fold runs on the host -- materializing the host mirror of W from the device W.");
+        (void)mb_state.W_host();
+      }
+#endif
+      if (fill_redist) {
         nda::array<ComplexType, 3> W_head;                // the Gamma slab with the head inserted (one q)
         nda::array<ComplexType, 3> W_w(fill_dev ? 0 : nw_half, fill_dev ? 0 : Np, fill_dev ? 0 : Np);
         nda::array<ComplexType, 2> tmp(fill_dev ? 0 : _Nm, fill_dev ? 0 : Np);
@@ -4284,63 +4299,88 @@ namespace solvers {
         std::optional<memory::array<DEVICE_MEMORY, ComplexType, 2>> tmp_d;
         if (fill_dev) { Ww_d.emplace(nw_half, Np, Np); out_d.emplace(nw_half, _Nm, _Nm); tmp_d.emplace(_Nm, Np); }
 #endif
-        for (long iql = 0; iql < nql; ++iql) {
-          const long iq = q0 + iql;
-          ++my_nfold;
-          bool use_head = false;
-          if (head_ok and iq == iq_gamma) {
-            if (_bl_head_static_all and _rung == linear_rung) {
-              app_log(1, "  cache_w head insertion [H1 STATIC]: dynamic piece SKIPPED for the "
-                         "cached B-L rung (dW is analytic-head-free).");
-            } else if (mb_state.eps_inv_head.has_value()) {
-              auto& eps = mb_state.eps_inv_head.value();
-              utils::check(eps.shape(0) == nt_half,
-                           "vertex_t::cache_w: eps_inv_head size {} != nt_half = {}.",
-                           eps.shape(0), nt_half);
-              W_head = nda::array<ComplexType, 3>(loc(iql, all, all, all));
-              for (long it = 0; it < nt_half; ++it)
-                W_head(it, all, all) += ComplexType(eps(it).real()) * H_PQ;
-              use_head = true;
-              app_log(1, "  cache_w head insertion: dynamic piece applied to dW(Gamma, tau) "
-                         "with eps_inv_head(tau=0) = {}\n"
-                         "  (SAME-iteration eps_inv_head, captured at fill time)",
-                      eps(0).real());
-            } else {
-              app_log(1, "  [WARNING] cache_w: dW is present but eps_inv_head is not in "
-                         "MBState -- the DYNAMIC head\n"
-                         "            piece is skipped for the cached rung.");
+        // the folds of the whole-q slabs this rank owns; loc is the host or (src_dev) the device slab view
+        auto fold_slabs = [&](auto loc, long q0, long nql) {
+          constexpr bool loc_host = nda::mem::on_host<std::decay_t<decltype(loc)>>;
+          for (long iql = 0; iql < nql; ++iql) {
+            const long iq = q0 + iql;
+            ++my_nfold;
+            bool use_head = false;
+            if (head_ok and iq == iq_gamma) {
+              if (_bl_head_static_all and _rung == linear_rung) {
+                app_log(1, "  cache_w head insertion [H1 STATIC]: dynamic piece SKIPPED for the "
+                           "cached B-L rung (dW is analytic-head-free).");
+              } else if (mb_state.eps_inv_head.has_value()) {
+                auto& eps = mb_state.eps_inv_head.value();
+                utils::check(eps.shape(0) == nt_half,
+                             "vertex_t::cache_w: eps_inv_head size {} != nt_half = {}.",
+                             eps.shape(0), nt_half);
+                if constexpr (loc_host) W_head = nda::array<ComplexType, 3>(loc(iql, all, all, all));
+                else W_head = nda::array<ComplexType, 3>(memory::to_memory_space<HOST_MEMORY>(loc(iql, all, all, all)));
+                for (long it = 0; it < nt_half; ++it)
+                  W_head(it, all, all) += ComplexType(eps(it).real()) * H_PQ;
+                use_head = true;
+                app_log(1, "  cache_w head insertion: dynamic piece applied to dW(Gamma, tau) "
+                           "with eps_inv_head(tau=0) = {}\n"
+                           "  (SAME-iteration eps_inv_head, captured at fill time)",
+                        eps(0).real());
+              } else {
+                app_log(1, "  [WARNING] cache_w: dW is present but eps_inv_head is not in "
+                           "MBState -- the DYNAMIC head\n"
+                           "            piece is skipped for the cached rung.");
+              }
+              head_logged = true;
             }
-            head_logged = true;
-          }
-          auto t_q = _t_qmP(iq, all, all);
-          if (not fill_dev) {
-            if (use_head) _ft->tau_to_w_PHsym(W_head, W_w);
-            else _ft->tau_to_w_PHsym(loc(iql, all, all, all), W_w);
-            if (eta_diag and diag_writer) {
-              W_diag(iq, 0, all, all) = W_w(lpos0, all, all);
-              W_diag(iq, 1, all, all) = W_w(lposm, all, all);
+            auto t_q = _t_qmP(iq, all, all);
+            if (not fill_dev) {
+              if constexpr (loc_host) {
+                if (use_head) _ft->tau_to_w_PHsym(W_head, W_w);
+                else _ft->tau_to_w_PHsym(loc(iql, all, all, all), W_w);
+                if (eta_diag and diag_writer) {
+                  W_diag(iq, 0, all, all) = W_w(lpos0, all, all);
+                  W_diag(iq, 1, all, all) = W_w(lposm, all, all);
+                }
+                for (long lp = 0; lp < nw_half; ++lp)
+                  vertex_secondary_detail::fold_core(t_q, W_w(lp, all, all), tmp, Wb(iq, lp, all, all));
+              }
             }
-            for (long lp = 0; lp < nw_half; ++lp)
-              vertex_secondary_detail::fold_core(t_q, W_w(lp, all, all), tmp, Wb(iq, lp, all, all));
-          }
 #if defined(ENABLE_DEVICE)
-          else {
-            auto Wt_d = use_head ? memory::to_memory_space<DEVICE_MEMORY>(W_head)
-                                 : memory::to_memory_space<DEVICE_MEMORY>(nda::array<ComplexType, 3>(loc(iql, all, all, all)));
-            _ft->tau_to_w_PHsym(Wt_d, *Ww_d);
-            if (eta_diag and diag_writer) {
-              W_diag(iq, 0, all, all) = nda::array<ComplexType, 2>(memory::to_memory_space<HOST_MEMORY>((*Ww_d)(lpos0, all, all)));
-              W_diag(iq, 1, all, all) = nda::array<ComplexType, 2>(memory::to_memory_space<HOST_MEMORY>((*Ww_d)(lposm, all, all)));
+            else {
+              // the tau slab on the device: uploaded (host source, or the Gamma slab with its head), else the slab itself
+              std::optional<memory::array<DEVICE_MEMORY, ComplexType, 3>> Wt_up;
+              if (use_head) Wt_up.emplace(memory::to_memory_space<DEVICE_MEMORY>(W_head));
+              else if constexpr (loc_host)
+                Wt_up.emplace(memory::to_memory_space<DEVICE_MEMORY>(nda::array<ComplexType, 3>(loc(iql, all, all, all))));
+              if (Wt_up.has_value()) _ft->tau_to_w_PHsym(*Wt_up, *Ww_d);
+              else if constexpr (not loc_host) _ft->tau_to_w_PHsym(loc(iql, all, all, all), *Ww_d);
+              if (eta_diag and diag_writer) {
+                W_diag(iq, 0, all, all) = nda::array<ComplexType, 2>(memory::to_memory_space<HOST_MEMORY>((*Ww_d)(lpos0, all, all)));
+                W_diag(iq, 1, all, all) = nda::array<ComplexType, 2>(memory::to_memory_space<HOST_MEMORY>((*Ww_d)(lposm, all, all)));
+              }
+              nda::array<ComplexType, 2> t_h(t_q);
+              auto t_d = memory::to_memory_space<DEVICE_MEMORY>(t_h);
+              for (long lp = 0; lp < nw_half; ++lp) {       // fold_core's two gemms: (t W) then (t W) t^dag
+                nda::blas::gemm(t_d, (*Ww_d)(lp, all, all), *tmp_d);
+                nda::blas::gemm(*tmp_d, nda::dagger(t_d), (*out_d)(lp, all, all));
+              }
+              Wb(iq, all, all, all) = nda::array<ComplexType, 3>(memory::to_memory_space<HOST_MEMORY>(*out_d));
             }
-            nda::array<ComplexType, 2> t_h(t_q);
-            auto t_d = memory::to_memory_space<DEVICE_MEMORY>(t_h);
-            for (long lp = 0; lp < nw_half; ++lp) {       // fold_core's two gemms: (t W) then (t W) t^dag
-              nda::blas::gemm(t_d, (*Ww_d)(lp, all, all), *tmp_d);
-              nda::blas::gemm(*tmp_d, nda::dagger(t_d), (*out_d)(lp, all, all));
-            }
-            Wb(iq, all, all, all) = nda::array<ComplexType, 3>(memory::to_memory_space<HOST_MEMORY>(*out_d));
-          }
 #endif
+          }
+        };
+#if defined(ENABLE_DEVICE)
+        if (src_dev) {
+          auto dWq = math::nda::make_distributed_array<memory::array<DEVICE_MEMORY, ComplexType, 4>>(
+              mpi->comm, {long(mpi->comm.size()), 1l, 1l, 1l}, {nqpts_ibz, nt_half, Np, Np}, {1l, 1l, 1l, 1l});
+          math::nda::redistribute(mb_state.dW_qtPQ_dev.value(), dWq);
+          fold_slabs(dWq.local(), dWq.origin()[0], dWq.local_shape()[0]);
+        } else
+#endif
+        {
+          auto dWq = math::nda::make_distributed_array<nda::array<ComplexType, 4>>(
+              mpi->comm, {long(mpi->comm.size()), 1l, 1l, 1l}, {nqpts_ibz, nt_half, Np, Np}, {1l, 1l, 1l, 1l});
+          math::nda::redistribute(mb_state.dW_qtPQ.value(), dWq);
+          fold_slabs(dWq.local(), dWq.origin()[0], dWq.local_shape()[0]);
         }
       }
       if (not fill_redist) {
@@ -4402,7 +4442,8 @@ namespace solvers {
       const long total_fold = mpi->comm.all_reduce_value(my_nfold, std::plus<>{});
       app_log(2, "  Refinement 2 W-bar fold distributed over {} ranks: this rank folded "
                  "{} of {} q-points (~1/P work; one q of W alive per rank){}.", mpi->comm.size(), my_nfold,
-              total_fold, fill_redist ? (fill_dev ? " -- redistributed to whole-q slabs, folded ON THE DEVICE" : " -- redistributed to whole-q slabs") : "");
+              total_fold, fill_redist ? (src_dev ? " -- the device W redistributed to whole-q device slabs, folded ON THE DEVICE"
+                                     : fill_dev ? " -- redistributed to whole-q slabs, folded ON THE DEVICE" : " -- redistributed to whole-q slabs") : "");
     }
 
     // ---- eta(q) diagnostics on the rung ACTUALLY cached (test-scale gate) ------------
@@ -4499,7 +4540,7 @@ namespace solvers {
 
   template<typename dArray_t>
   void vertex_t::build_w0(MBState &mb_state, THC_ERI auto const &thc,
-                          dArray_t const &dPi_rpa_tqPQ) {
+                          dArray_t const &dPi_rpa_tqPQ, bool nu0_partial) {
     vertex_timer_detail::scoped_timer _tm_total(_Timer, "BUILD_W0");
     decltype(nda::range::all) all;
     using Arr3 = nda::array<ComplexType, 3>;
@@ -4518,10 +4559,11 @@ namespace solvers {
     const long Np = thc.Np();
     auto gs = dPi_rpa_tqPQ.global_shape();
     const long nt_half_ft = (_ft->nt_b() % 2 == 0) ? _ft->nt_b() / 2 : _ft->nt_b() / 2 + 1;
-    utils::check(gs[1] == nqpts_ibz and gs[2] == Np and gs[3] == Np and gs[0] == nt_half_ft,
+    utils::check(gs[1] == nqpts_ibz and gs[2] == Np and gs[3] == Np and
+                 (nu0_partial ? gs[0] == dPi_rpa_tqPQ.grid()[0] : gs[0] == nt_half_ft),
                  "vertex_t::build_w0: unexpected Pi_RPA global shape ({}, {}, {}, {}); "
                  "expected ({}, {}, {}, {}).",
-                 gs[0], gs[1], gs[2], gs[3], nt_half_ft, nqpts_ibz, Np, Np);
+                 gs[0], gs[1], gs[2], gs[3], nu0_partial ? dPi_rpa_tqPQ.grid()[0] : nt_half_ft, nqpts_ibz, Np, Np);
 
     // ITERATION-LOCAL lifetime (plan section 2.3): drop last iteration's objects up
     // front, so no static-rung state can ever be read across an iteration boundary
@@ -4534,7 +4576,7 @@ namespace solvers {
                "polarizability -- no lag,\n"
                "  no Pi^C content (decision D2). Grid (nt_half, nq, Np) = ({}, {}, {}), "
                "rung mode = {}.",
-            gs[0], nqpts_ibz, Np, rung_str());
+            nt_half_ft, nqpts_ibz, Np, rung_str());
 
     // Stage timers PARTITION BUILD_W0 (see the SIG_* note in eval_Sigma_C). build_w0 came
     // back as 29 % of all vertex time in the first profile with no internal breakdown, so
@@ -4582,7 +4624,9 @@ namespace solvers {
     // ---- step 1: the i.nu = 0 row of Pi_RPA on that layout ---------------------------
     auto dW0_1qPQ = make_distributed_array<Arr4>(
         mpi->comm, f0_pgrid, {1, nqpts_ibz, Np, Np}, f0_bsize);
-    {
+    if (nu0_partial) {        // the caller formed step (a) (on the device): finish the row from its partial
+      vertex_w0_detail::finish_nu0_row(const_cast<dArray_t &>(dPi_rpa_tqPQ), dW0_1qPQ);
+    } else {
       auto R_t = vertex_w0_detail::nu0_transform_row(*_ft);
       vertex_w0_detail::extract_nu0_row(dPi_rpa_tqPQ, R_t, dW0_1qPQ);
     }
@@ -4600,7 +4644,60 @@ namespace solvers {
     auto Q_rng = dW0_1qPQ.local_range(3);
     utils::check(dZ.local_range(1) == P_rng and dZ.local_range(2) == Q_rng,
                  "vertex_t::build_w0: Z and Pi0 do not share the (P,Q) block partition.");
-    {
+    // gpu port 2026-09-27: under CUDA the per-q Dysons run on the device -- q split over the ranks (one redistribute of
+    // the Pi0 row there and of dW0 back, nq Np^2 each), M = I - Z Pi0 by one gemm, getrf + getrs against the identity
+    // for eps^{-1} (its max-abs is the conditioning meter), dW0 = (eps^{-1} - I) Z by one gemm. The host path's SLATE
+    // multiply / inverse / multiply on the (P,Q) grid computes the same quantities in another rounding.
+    // vertex_debug w0_dyson_device = 0 keeps SLATE.
+#if defined(ENABLE_CUDA)
+    const bool dyson_dev = (nqpts_ibz >= np_ranks) and
+                           vertex_debug::number("w0_dyson_device", 1.0) != 0.0;   // vertex_debug: w0_dyson_device
+#else
+    const bool dyson_dev = false;
+#endif
+    if (dyson_dev) {
+#if defined(ENABLE_CUDA)
+      namespace dcu = methods::solvers::dynbse_cuda;
+      auto dq = make_distributed_array<Arr4>(mpi->comm, {1, np_ranks, 1, 1}, {1, nqpts_ibz, Np, Np}, {1, 1, 1, 1});
+      math::nda::redistribute(dW0_1qPQ, dq);
+      auto dZq = thc.template dZ<DEVICE_MEMORY>({np_ranks, 1, 1}, {1, 1, 1});
+      utils::check(dZq.local_range(0) == dq.local_range(1),
+                   "vertex_t::build_w0: the q-split Z and Pi0 do not share the q partition.");
+      auto qloc = dq.local();
+      const long q0 = dq.origin()[1], nql = dq.local_shape()[1];
+      nda::array<ComplexType, 2> Ih(Np, Np);
+      nda::matrix<ComplexType, nda::F_layout> IhF(Np, Np);
+      Ih() = ComplexType(0.0); IhF() = ComplexType(0.0);
+      for (long P = 0; P < Np; ++P) { Ih(P, P) = ComplexType(1.0); IhF(P, P) = ComplexType(1.0); }
+      auto Id = memory::to_memory_space<DEVICE_MEMORY>(Ih);
+      memory::array<DEVICE_MEMORY, ComplexType, 2> Md(Np, Np), Od(Np, Np);
+      memory::array<DEVICE_MEMORY, int, 1> ipd(Np);
+      double epsinv_max = 0.0;
+      long epsinv_q = -1;
+      for (long iql = 0; iql < nql; ++iql) {
+        auto Zd = dZq.local()(iql, all, all);
+        auto Pd = memory::to_memory_space<DEVICE_MEMORY>(Arr2(qloc(0, iql, all, all)));
+        Md() = Id;
+        nda::blas::gemm(ComplexType(-1.0), Zd, Pd, ComplexType(1.0), Md);   // M = I - Z.Pi0
+        int info = nda::lapack::getrf(Md, ipd);
+        utils::check(info == 0, "vertex_t::build_w0: device getrf of I - Z.Pi0 failed at q = {} (info {}).", q0 + iql, info);
+        auto Xd = memory::to_memory_space<DEVICE_MEMORY>(IhF);
+        info = nda::lapack::getrs(Md, Xd, ipd);                            // X = eps^{-1}
+        utils::check(info == 0, "vertex_t::build_w0: device getrs failed at q = {} (info {}).", q0 + iql, info);
+        const double m = dcu::dev_maxabs(Xd.data(), Np * Np);
+        if (m > epsinv_max) { epsinv_max = m; epsinv_q = q0 + iql; }
+        dcu::dev_add_diag(Xd.data(), Np, Np, -1.0);                        // eps^{-1} - I
+        nda::blas::gemm(Xd, Zd, Od);                                       // dW0 = (eps^{-1} - I) Z
+        qloc(0, iql, all, all) = Arr2(memory::to_memory_space<HOST_MEMORY>(Od));
+      }
+      math::nda::redistribute(dq, dW0_1qPQ);
+      double gmax = mpi->comm.all_reduce_value(epsinv_max, boost::mpi3::max<>{});
+      long q_of_max = (epsinv_max == gmax) ? epsinv_q : -1;
+      q_of_max = mpi->comm.all_reduce_value(q_of_max, boost::mpi3::max<>{});
+      app_log(2, "  [ISDF-Vertex] W0 conditioning: max_q ||[I - Z.Pi_RPA(i.nu=0)]^-1||_max "
+                 "= {:.4e} (worst q = {}; the single-frequency Dysons on the device)", gmax, q_of_max);
+#endif
+    } else {
       auto pgrid2 = std::array<long, 2>{w0_pgrid[1], w0_pgrid[2]};
       auto bsize2 = std::array<long, 2>{w0_bsize[1], w0_bsize[2]};
       auto dPi_PQ = make_distributed_array<Arr2>(mpi->comm, pgrid2, {Np, Np}, bsize2, true);
@@ -4640,7 +4737,7 @@ namespace solvers {
         app_log(2, "  [ISDF-Vertex] W0 conditioning: max_q ||[I - Z.Pi_RPA(i.nu=0)]^-1||_max "
                    "= {:.4e} (worst q = {})", gmax, q_of_max);
       }
-    }
+    }   // SLATE path
 
     _Timer.stop("W0_DYSON");
     _Timer.start("W0_HEAD");
@@ -4942,7 +5039,7 @@ namespace solvers {
   template long vertex_t::ensure_secondary_basis(MBState&, const thc_reader_t&);
   template void vertex_t::build_w0(
       MBState&, const thc_reader_t&,
-      memory::darray_t<memory::array<HOST_MEMORY, ComplexType, 4>, mpi3::communicator> const&);
+      memory::darray_t<memory::array<HOST_MEMORY, ComplexType, 4>, mpi3::communicator> const&, bool);
 
   template memory::darray_t<memory::array<HOST_MEMORY, ComplexType, 4>, mpi3::communicator>
   vertex_t::eval_Pi_C(MBState&, const thc_reader_t&,
