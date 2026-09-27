@@ -701,6 +701,9 @@ namespace methods::solvers::dynbse_cuda {
       if (threadIdx.x == 0) flags[c] = any;
       (void)np;
     }
+    __global__ void conj_kernel(long n, cd *__restrict__ x) {
+      for (long e = blockIdx.x * long(blockDim.x) + threadIdx.x; e < n; e += long(gridDim.x) * blockDim.x) x[e] = cuConj(x[e]);
+    }
     __global__ void add2_kernel(long n, cd const *__restrict__ a, cd const *__restrict__ b, cd *__restrict__ out) {
       for (long e = blockIdx.x * long(blockDim.x) + threadIdx.x; e < n; e += long(gridDim.x) * blockDim.x) out[e] = a[e] + b[e];
     }
@@ -944,7 +947,7 @@ namespace methods::solvers::dynbse_cuda {
     bool on = false, has_T = false;
     sd_config c;
     long AC = 0, qcap = 0;                                   // the a-chunk of the T family; the pointer-array capacity
-    cd *Ttw = nullptr, *TtwW = nullptr, *Uw = nullptr, *Uw2 = nullptr, *Gw = nullptr, *Dcj = nullptr, *gk = nullptr;
+    cd *Ttw = nullptr, *TtwW = nullptr, *Uw = nullptr, *Uw2 = nullptr, *Gw = nullptr, *gk = nullptr;
     cd *WkT = nullptr, *WkU = nullptr, *Wblk = nullptr, *Acst = nullptr, *DW = nullptr, *DWp = nullptr;
     cd *Aw = nullptr, *Fw = nullptr, *Ft = nullptr, *Y = nullptr, *Ym = nullptr, *Mb = nullptr;
     cd *S = nullptr, *RT = nullptr, *RU = nullptr;           // the accumulators (host layouts)
@@ -961,6 +964,9 @@ namespace methods::solvers::dynbse_cuda {
     ue_config c;
     sd_state sd;
     cd *Gs0 = nullptr;                                       // Gsum0 of the last block (the Sigma columns static_dyn / dyn1_bare)
+    cd *Gr1 = nullptr;                                       // the one-bare-rung Gsum of the last block (when requested)
+    cd *Dcj = nullptr, *CbD = nullptr, *Vr = nullptr, *Pr = nullptr;   // conj(legs) (D, nout); the readout scratch
+    bool legs_ok = false, cbd_ok = false, r1_ok = false;
     long D = 0, nc2 = 0;
     cublasHandle_t cb = nullptr;
     cusolverDnHandle_t cs = nullptr;
@@ -986,7 +992,8 @@ namespace methods::solvers::dynbse_cuda {
     const double fam = 2.0 * np * W, cst = W;
     double b = 0.0;
     b += (3.0 + double(c.ndist)) * D * D;                                   // K_s, K_d0, M, K_d(s_r)
-    b += 3.0 * fam + 7.0 * cst + D * double(c.nR_max);                      // Ffam, F2fam, Gfam, yfam (y is one of them) + csts + Y + Gs0
+    b += 3.0 * fam + 10.0 * cst + D * double(c.nR_max);                     // Ffam, F2fam, Gfam, yfam + csts + Y + Gs0 / Gr1 / CbD / Vr
+    b += D * double(c.nout) + double(c.nout * c.nR_max);                    // the legs, the readout block
     b += fam;                                                               // yfam
     b += 2.0 * double(c.nt) * W + double(c.nt) * W + double(c.n_kept) * W + np * W;   // Fs, Ys, rec, g, coef
     b += double(c.nk * c.nc * c.nc * c.nc * c.nc);                          // Cb_k
@@ -1019,7 +1026,10 @@ namespace methods::solvers::dynbse_cuda {
       APP_ABORT(std::string(" ue_create: getrf_bufferSize failed."));
     e->work = dalloc<cd>(size_t(std::max(e->lwork, 1)), "ue getrf work");
     for (cd **pp : {&e->Ffam, &e->F2fam, &e->Gfam, &e->yfam}) *pp = dalloc<cd>(2 * np * W, "ue fam");
-    for (cd **pp : {&e->Xcst, &e->Fsum, &e->F2sum, &e->Gsum, &e->ycst, &e->Dblk, &e->Y, &e->csb, &e->cbb, &e->Gs0}) *pp = dalloc<cd>(W, "ue cst");
+    for (cd **pp : {&e->Xcst, &e->Fsum, &e->F2sum, &e->Gsum, &e->ycst, &e->Dblk, &e->Y, &e->csb, &e->cbb, &e->Gs0, &e->Gr1, &e->CbD, &e->Vr})
+      *pp = dalloc<cd>(W, "ue cst");
+    e->Dcj = dalloc<cd>(D * size_t(std::max(c.nout, 1l)), "ue legs");
+    e->Pr = dalloc<cd>(size_t(std::max(c.nout, 1l)) * size_t(c.nR_max), "ue readout");
     e->Fs = dalloc<cd>(nt * W, "ue Fs"); e->Ys = dalloc<cd>(nt * W, "ue Ys"); e->rec = dalloc<cd>(nt * W, "ue rec");
     e->g = dalloc<cd>(size_t(c.n_kept) * W, "ue g"); e->coef = dalloc<cd>(np * W, "ue coef");
     e->pA = dalloc<cd *>(nt, "ue pA"); e->pB = dalloc<cd *>(nt, "ue pB"); e->pC = dalloc<cd *>(nt, "ue pC");
@@ -1041,7 +1051,8 @@ namespace methods::solvers::dynbse_cuda {
                     (void *)e->Ffam, (void *)e->Fsum, (void *)e->F2fam, (void *)e->F2sum, (void *)e->Gfam, (void *)e->Gsum,
                     (void *)e->yfam, (void *)e->ycst, (void *)e->Dblk, (void *)e->Y, (void *)e->csb, (void *)e->cbb, (void *)e->Fs,
                     (void *)e->Ys, (void *)e->g, (void *)e->coef, (void *)e->rec, (void *)e->pA, (void *)e->pB, (void *)e->pC,
-                    (void *)e->flags, (void *)e->red, (void *)e->Gs0})
+                    (void *)e->flags, (void *)e->red, (void *)e->Gs0, (void *)e->Gr1, (void *)e->Dcj, (void *)e->CbD, (void *)e->Vr,
+                    (void *)e->Pr})
       if (p) (void)cudaFree(p);
     for (void *p : e->sd.allocs)
       if (p) (void)cudaFree(p);
@@ -1206,15 +1217,56 @@ namespace methods::solvers::dynbse_cuda {
     }
   } // namespace
 
-  double ue_gamma1(unit_engine *e, long nR, cplx const *Dblkh, cplx *Gsum0h, cplx *Gsum1h, cplx *y1famh, cplx *y1csth, double *tim) {
+  void ue_set_legs(unit_engine *e, cplx const *Dc) {
+    const long n = e->D * e->c.nout;
+    h2d_c(e->Dcj, Dc, size_t(n), "ue legs");
+    conj_kernel<<<grid_for(n), 256>>>(n, e->Dcj);
+    launch_check("ue legs conj");
+    e->legs_ok = true;
+  }
+
+  void ue_readout(unit_engine *e, long nR, int which, cplx *P, double *timing) {
+    if (not e->legs_ok) APP_ABORT(std::string(" ue_readout: the legs of this transfer were not set."));
+    if (which == 2 and not e->r1_ok) APP_ABORT(std::string(" ue_readout: the one-bare-rung column was not computed for this block."));
+    const double t0 = wnow();
+    const long D = e->D, nout = e->c.nout;
+    const cd one = make_cuDoubleComplex(1.0, 0.0), zero = make_cuDoubleComplex(0.0, 0.0), mone = make_cuDoubleComplex(-1.0, 0.0);
+    if (not e->cbd_ok) { ue_cb_times(e, nR, e->Dblk, e->CbD, false); e->cbd_ok = true; }
+    cd const *G = (which == 0) ? e->Gs0 : ((which == 1) ? e->Gsum : e->Gr1);
+    // V = G - Cb D (D x nR row-major = column-major nR x D); P^T (nR x nout) = V^T . conj(Dc)
+    cub_check(cublasZgeam(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(nR), int(D), &one, G, int(nR), &mone, e->CbD, int(nR), e->Vr, int(nR)),
+              "ue readout V");
+    cub_check(cublasZgemm(e->cb, CUBLAS_OP_N, CUBLAS_OP_T, int(nR), int(nout), int(D), &one, e->Vr, int(nR), e->Dcj, int(nout), &zero,
+                          e->Pr, int(nR)), "ue readout D^dag V");
+    cu_check(cudaMemcpy(P, e->Pr, size_t(nout * nR) * sizeof(cd), cudaMemcpyDeviceToHost), "ue readout d2h");
+    timing[0] += wnow() - t0;
+  }
+
+  double ue_gamma1(unit_engine *e, long nR, cplx const *Dblkh, cplx *Gsum0h, cplx *Gsum1h, cplx *y1famh, cplx *y1csth, double *tim,
+                   bool want_r1) {
     if (not e->unit_ok) APP_ABORT(std::string(" ue_gamma1: the unit's LU failed or was not set."));
     if (nR > e->c.nR_max) APP_ABORT(std::string(" ue_gamma1: block wider than the engine's nR_max."));
     const long D = e->D, np = e->c.np, W = D * nR;
     double t0 = wnow();
     h2d_c(e->Dblk, Dblkh, size_t(W), "ue Dblk");
+    e->cbd_ok = false;
     tim[5] += wnow() - t0;
     // ---- ls_apply(D, y = 0): F = L0 D, c = T_s Fsum, Gamma = F + L0 c, Gsum = Fsum + Cb c
     ue_l0(e, nR, nullptr, e->Dblk, e->Ffam, e->Fsum, &tim[0]);
+    e->r1_ok = want_r1;
+    if (want_r1) {
+      // the ONE BARE dynamic rung (T_s = 0, one application): y_r1 = K_d(F, Fsum) of L0 D, Gsum_r1 = Fsum[L0(y_r1; D + y_r1.cst)].
+      // F / Fsum are only read; y and F2 are scratch here (both are rewritten below). Its refit error is not reported (the
+      // host pass's meter was discarded too).
+      (void)ue_kd(e, nR, e->Ffam, e->Fsum, e->yfam, e->ycst, tim);
+      t0 = wnow();
+      add2_kernel<<<grid_for(W), 256>>>(W, e->Dblk, e->ycst, e->Xcst);
+      launch_check("ue r1 X.cst");
+      cu_check(cudaDeviceSynchronize(), "ue r1 xcst");
+      tim[4] += wnow() - t0;
+      ue_l0(e, nR, e->yfam, e->Xcst, e->F2fam, e->F2sum, &tim[0]);
+      cu_check(cudaMemcpy(e->Gr1, e->F2sum, size_t(W) * sizeof(cd), cudaMemcpyDeviceToDevice), "ue Gr1");
+    }
     ue_ts(e, nR, e->Fsum, &tim[1]);
     ue_l0(e, nR, nullptr, e->csb, e->F2fam, e->F2sum, &tim[0]);
     t0 = wnow();
@@ -1224,7 +1276,7 @@ namespace methods::solvers::dynbse_cuda {
     cu_check(cudaDeviceSynchronize(), "ue gamma");
     cu_check(cudaMemcpy(e->Gs0, e->Gsum, size_t(W) * sizeof(cd), cudaMemcpyDeviceToDevice), "ue Gs0");
     tim[4] += wnow() - t0; t0 = wnow();
-    cu_check(cudaMemcpy(Gsum0h, e->Gsum, size_t(W) * sizeof(cd), cudaMemcpyDeviceToHost), "ue Gsum0");
+    if (Gsum0h != nullptr) cu_check(cudaMemcpy(Gsum0h, e->Gsum, size_t(W) * sizeof(cd), cudaMemcpyDeviceToHost), "ue Gsum0");
     tim[6] += wnow() - t0;
     // ---- y1 = K_d(Gamma, Gsum)
     const double fe = ue_kd(e, nR, e->Gfam, e->Gsum, e->yfam, e->ycst, tim);
@@ -1242,7 +1294,7 @@ namespace methods::solvers::dynbse_cuda {
     launch_check("ue gsum1");
     cu_check(cudaDeviceSynchronize(), "ue gsum1");
     tim[4] += wnow() - t0; t0 = wnow();
-    cu_check(cudaMemcpy(Gsum1h, e->Gsum, size_t(W) * sizeof(cd), cudaMemcpyDeviceToHost), "ue Gsum1");
+    if (Gsum1h != nullptr) cu_check(cudaMemcpy(Gsum1h, e->Gsum, size_t(W) * sizeof(cd), cudaMemcpyDeviceToHost), "ue Gsum1");
     if (y1famh != nullptr) cu_check(cudaMemcpy(y1famh, e->yfam, size_t(2 * np) * W * sizeof(cd), cudaMemcpyDeviceToHost), "ue y1 fam");
     if (y1csth != nullptr) cu_check(cudaMemcpy(y1csth, e->ycst, size_t(W) * sizeof(cd), cudaMemcpyDeviceToHost), "ue y1 cst");
     tim[6] += wnow() - t0;
@@ -1257,9 +1309,6 @@ namespace methods::solvers::dynbse_cuda {
   //   S (nt, ns, nk, nc, nc), RT / RU (nt, ns, nk, np, nc, nc), WkT / WkU (np, ng, nt), Gw (ns, nw_f, nk, nc, nc)
   // =====================================================================================================================
   namespace {
-    __global__ void sd_conj_kernel(long n, cd *__restrict__ x) {
-      for (long e = blockIdx.x * long(blockDim.x) + threadIdx.x; e < n; e += long(gridDim.x) * blockDim.x) x[e] = cuConj(x[e]);
-    }
     __global__ void sd_bcast_kernel(long nw, long n, cd const *__restrict__ src, cd *__restrict__ dst) {
       const long tot = nw * n;
       for (long e = blockIdx.x * long(blockDim.x) + threadIdx.x; e < tot; e += long(gridDim.x) * blockDim.x) dst[e] = src[e % n];
@@ -1298,7 +1347,7 @@ namespace methods::solvers::dynbse_cuda {
     const long nt = c.nt, nw = c.nw_f, ns = c.ns, nk = c.nk, nc2 = e->nc2, np = c.np, ng = c.ng, Nm = c.Nm, D = e->D, R = e->c.nR_max;
     const double W = double(D) * double(R);
     const double acc = double(nt * ns * nk * nc2) * (1.0 + 2.0 * double(np));
-    const double blk = W * (3.0 + 2.0 * double(nw) + double(nt)) + double(R * Nm) + double(nk * nc2 * Nm) + double(ng * nk * nc2) +
+    const double blk = W * (3.0 + 2.0 * double(nw) + double(nt)) + double(R * Nm) + double(ng * nk * nc2) +
                        double(ns * nw * nk * nc2) + 2.0 * double(nt * nw) + 2.0 * double(nw * np) + 2.0 * double(np * ng * nt);
     const double per_a = double(nk) * (2.0 * double(nc2 * nc2) + double(ng * nc2));
     const double need = 16.0 * (acc + blk + per_a) + 64.0e6;
@@ -1313,7 +1362,7 @@ namespace methods::solvers::dynbse_cuda {
     s.Ttw = al(size_t(nt * nw), "sd Ttw"); s.TtwW = al(size_t(nt * nw), "sd TtwW");
     s.Uw = al(size_t(nw * np), "sd Uw"); s.Uw2 = al(size_t(nw * np), "sd Uw2");
     s.Gw = al(size_t(ns * nw * nk * nc2), "sd Gw");
-    s.Dcj = al(size_t(nk * nc2 * Nm), "sd Dc"); s.gk = al(size_t(ng * nk * nc2), "sd gk");
+    s.gk = al(size_t(ng * nk * nc2), "sd gk");
     s.WkT = al(size_t(np * ng * nt), "sd WkT"); s.WkU = al(size_t(np * ng * nt), "sd WkU");
     s.Wblk = al(size_t(R * Nm), "sd Wblk");
     s.Acst = al(Wz, "sd Acst"); s.DW = al(Wz, "sd DW"); s.DWp = al(Wz, "sd DWp");
@@ -1352,12 +1401,9 @@ namespace methods::solvers::dynbse_cuda {
     return true;
   }
 
-  void ue_sd_set_sq(unit_engine *e, cplx const *Dc, long const *kpq_row, cplx const *gkh, long const *gnode) {
+  void ue_sd_set_sq(unit_engine *e, long const *kpq_row, cplx const *gkh, long const *gnode) {
     auto &s = e->sd;
-    const long n = s.c.nk * e->nc2 * s.c.Nm;
-    h2d_c(s.Dcj, Dc, size_t(n), "sd Dc");
-    sd_conj_kernel<<<grid_for(n), 256>>>(n, s.Dcj);
-    launch_check("sd conj");
+    if (e->c.nout != s.c.Nm) APP_ABORT(std::string(" ue_sd_set_sq: the deposits need the aux legs (nout == N_m)."));
     h2d_c(s.gk, gkh, size_t(s.c.ng * s.c.nk * e->nc2), "sd gk");
     s.kpq.assign(kpq_row, kpq_row + s.c.nk);
     s.gnode.assign(gnode, gnode + s.c.ng);
@@ -1411,7 +1457,8 @@ namespace methods::solvers::dynbse_cuda {
     }
     launch_check("sd meters");
     // (2) DW^T (nR x nk nc2) = W_blk (nR x Nm) . conj(Dc)^T (Nm x nk nc2); DWp = its (k, i, c, r) order
-    cub_check(cublasZgemm(e->cb, CUBLAS_OP_T, CUBLAS_OP_N, int(nR), int(nk * nc2), int(Nm), &one, s.Wblk, int(Nm), s.Dcj, int(Nm),
+    if (not e->legs_ok) APP_ABORT(std::string(" ue_sd_block: the legs of this transfer were not set."));
+    cub_check(cublasZgemm(e->cb, CUBLAS_OP_T, CUBLAS_OP_N, int(nR), int(nk * nc2), int(Nm), &one, s.Wblk, int(Nm), e->Dcj, int(Nm),
                           &zero, s.DW, int(nR)), "sd DW");
     sd_perm_dw_kernel<<<grid_for(W), 256>>>(nk, nc, nR, s.DW, s.DWp);
     launch_check("sd perm DW");

@@ -205,6 +205,7 @@ namespace solvers {
       double wtau_sym = 0.0;                  // max |W_d(s) - W_d(beta - s)| / max |W_d|
       double ritz_max = 0.0;                  // watchdog: max over units of |Ritz(K_d L_s)| / contraction
       long it_max = 0, it_sum = 0, nunits = 0, nconv = 0;
+      long r1_fused = 0, r1_missing = 0;      // units whose one-bare-rung column came from the device unit / was requested but not produced
       double t_setup = 0.0, t_kbig = 0.0, t_cb = 0.0, t_lu = 0.0, t_solve = 0.0, t_read = 0.0;
       double t_rung = 0.0, t_refit = 0.0;   // inside the solve: the rung applications (all tau nodes), the tau refits
       double t_l0 = 0.0, t_ts = 0.0, t_orth = 0.0;   // the L0 pole algebra, the static-resolvent gemms, the Arnoldi dots
@@ -233,7 +234,7 @@ namespace solvers {
         auto sm = [&](long &v) { v = comm.all_reduce_value(v, std::plus<>{}); };
         mx(fit_err_G); mx(rr_G); mx(dsq_err); mx(refit_err_max); mx(wtau_sym); mx(ritz_max);
         it_max = comm.all_reduce_value(it_max, boost::mpi3::max<>{});
-        sm(it_sum); sm(nunits); sm(nconv);
+        sm(it_sum); sm(nunits); sm(nconv); sm(r1_fused); sm(r1_missing);
         mx(t_setup); mx(t_kbig); mx(t_cb); mx(t_lu); mx(t_solve); mx(t_read); mx(rss_max_gb);
         mx(t_rung); mx(t_refit); sm(n_apps); mx(t_l0); mx(t_ts); mx(t_orth);
         mx(t_l0_nu0); mx(t_l0_host); mx(t_l0_dev); mx(t_l0_prep); mx(t_l0_alloc); mx(t_l0_h2d); mx(t_l0_kernel); mx(t_l0_d2h);
@@ -1362,7 +1363,7 @@ namespace solvers {
           ue_tried = true;
           dynbse_cuda::ue_config uc;
           uc.np = np; uc.np_fit = b.np_fit; uc.nk = nk; uc.nc = nc; uc.ng = Pcache->ng; uc.nt = nt; uc.nR_max = nrb;
-          uc.ndist = ndist; uc.n_kept = b.pf.n_kept;
+          uc.ndist = ndist; uc.n_kept = b.pf.n_kept; uc.nout = nout;
           char why[256] = {0};
           ue.reset(dynbse_cuda::ue_create(uc, 1.0e6 * double(utils::freemem_device_effective()), why, 256));
           if (ue) {                                       // the basis' DLR refit at its fixed rank (basis_coeffs, npf_mask off)
@@ -1386,7 +1387,10 @@ namespace solvers {
             if (ok) sd_flush_hook = [&]() { sigma_dyn_device_flush(*opt.sigma, sd_dev, ue.get()); };
           }
         }
-        if (ue) dynbse_cuda::ue_set_rung(ue.get(), Ks.data(), Kd_s.data(), Kd0.data(), trep.data(), scale_k);
+        if (ue) {
+          dynbse_cuda::ue_set_rung(ue.get(), Ks.data(), Kd_s.data(), Kd0.data(), trep.data(), scale_k);
+          dynbse_cuda::ue_set_legs(ue.get(), Dc.data());
+        }
 #endif
         }                                                 // end of the (s, q) build (D-0)
         if (met) met->t_kbig += watch.lap();
@@ -1543,31 +1547,44 @@ namespace solvers {
             size_scratch(nR);
             db::solve_timers_state().reset();
             Dblk() = Dc(all, all, all, nda::range(N0, N1));
-            // Cb D (the bubble's pair block) for the "rungs >= 1" subtraction
-            for (long k = 0; k < nk; ++k)
-              for (long r = 0; r < nc2; ++r)
-                for (long N = 0; N < nR; ++N) {
-                  cplx acc(0.0);
-                  for (long c = 0; c < nc2; ++c) acc += Cb_k(k, r, c) * Dblk(k, c / nc, c % nc, N);
-                  CbD(k, r / nc, r % nc, N) = acc;
-                }
+            // Cb D (the bubble's pair block) for the "rungs >= 1" subtraction -- built at the first host readout of the block
+            bool cbd_ok = false;
             auto readout = [&](nda::array<cplx, 4> const &Gsum, nda::array<cplx, 4> *out) {
               if (out == nullptr) return;
+              if (not cbd_ok) {
+                for (long k = 0; k < nk; ++k)
+                  for (long r = 0; r < nc2; ++r)
+                    for (long N = 0; N < nR; ++N) {
+                      cplx acc(0.0);
+                      for (long c = 0; c < nc2; ++c) acc += Cb_k(k, r, c) * Dblk(k, c / nc, c % nc, N);
+                      CbD(k, r / nc, r % nc, N) = acc;
+                    }
+                cbd_ok = true;
+              }
               Vout() = Gsum - CbD;
               auto Pblk = db::collapse(Dc, Vout);                    // (nout, nR): the full left leg (aux or Wannier pair)
               for (long M = 0; M < nout; ++M)
                 for (long N = 0; N < nR; ++N) (*out)(jn, iq, M, N0 + N) = cplx(spinfac / double(nk)) * Pblk(M, N);
             };
+            // the one-bare-rung column rides the device unit (D-2 r1) when requested outside a one_rung_only pass
+            const bool want_r1 = (Pi_dyn1 != nullptr and not opt.one_rung_only);
+            bool have_r1 = false;
 #if defined(ENABLE_CUDA)
             if (ue) {
+              have_r1 = want_r1;
               res = db::dyson_result{};
-              res.Gsum0 = nda::array<cplx, 4>(nk, nc, nc, nR);
-              res.Gsum1 = nda::array<cplx, 4>(nk, nc, nc, nR);
+              // the readouts run on the device (ue_readout); Gsum0 / Gsum1 / y1 come down only for the HOST Sigma deposits
               const bool y_host = keep_y and not sd_dev.on;     // D-3: the device deposits read y1 where it is
-              if (y_host) { res.y1 = db::tf_vector(np, nk, nc, nR); res.has_y = true; }
+              if (y_host) {
+                res.Gsum0 = nda::array<cplx, 4>(nk, nc, nc, nR);
+                res.Gsum1 = nda::array<cplx, 4>(nk, nc, nc, nR);
+                res.y1 = db::tf_vector(np, nk, nc, nR); res.has_y = true;
+              }
               double tim[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-              res.fit_err_max = dynbse_cuda::ue_gamma1(ue.get(), nR, Dblk.data(), res.Gsum0.data(), res.Gsum1.data(),
-                                                       y_host ? res.y1.fam.data() : nullptr, y_host ? res.y1.cst.data() : nullptr, tim);
+              res.fit_err_max = dynbse_cuda::ue_gamma1(ue.get(), nR, Dblk.data(), y_host ? res.Gsum0.data() : nullptr,
+                                                       y_host ? res.Gsum1.data() : nullptr,
+                                                       y_host ? res.y1.fam.data() : nullptr, y_host ? res.y1.cst.data() : nullptr, tim,
+                                                       have_r1);
               res.Gsum = res.Gsum1; res.iterations = 1; res.converged = true;
               if (met) {
                 met->t_l0 += tim[0]; met->t_l0_dev += tim[0]; met->t_ts += tim[1]; met->t_rung += tim[2] + tim[7];
@@ -1625,6 +1642,25 @@ namespace solvers {
 #endif
               sigma_dyn_accumulate(*opt.sigma, b, P, inu, res, Ks, Dc, N0, N1, Wout, G_CC, kpq, is, iq, m, tools);
             }
+#if defined(ENABLE_CUDA)
+            if (ue) {
+              // the readouts on the device: D^dag (G - Cb D) per column, only the (nout x nR) block comes down
+              nda::array<cplx, 2> Pb(nout, nR);
+              double trd = 0.0;
+              auto place = [&](nda::array<cplx, 4> *out) {
+                if (out == nullptr) return;
+                for (long M = 0; M < nout; ++M)
+                  for (long N = 0; N < nR; ++N) (*out)(jn, iq, M, N0 + N) = cplx(spinfac / double(nk)) * Pb(M, N);
+              };
+              if (Pi_static != nullptr) { dynbse_cuda::ue_readout(ue.get(), nR, 0, Pb.data(), &trd); place(Pi_static); }
+              if (Pi_gam1 != nullptr or Pi_dyn != nullptr) {   // gamma1_only: the resummed slot repeats Gamma_1
+                dynbse_cuda::ue_readout(ue.get(), nR, 1, Pb.data(), &trd);
+                place(Pi_gam1); place(Pi_dyn);
+              }
+              if (have_r1) { dynbse_cuda::ue_readout(ue.get(), nR, 2, Pb.data(), &trd); place(Pi_dyn1); }
+            } else
+#endif
+            {
             readout(res.Gsum0, Pi_static);
             if (opt.one_rung_only) {
               // Gsum1 = Cb D + sum L0 K_d L0 D  (T_s = 0): the pure one dynamic rung
@@ -1634,6 +1670,8 @@ namespace solvers {
               // gamma1_only: res.Gsum == res.Gsum1, so the resummed slot repeats Gamma_1 (logged by the caller)
               readout(res.Gsum, Pi_dyn);
             }
+            }
+            if (met and want_r1 and N0 == 0) { if (have_r1) ++met->r1_fused; else ++met->r1_missing; }   // counted per unit
           }
           if (dump_out.is_open()) {
             const long hdr[5] = {is, iq, m, nout, 4};
@@ -2195,9 +2233,13 @@ namespace solvers {
     // union grid / in-gap mask / twisted-pair basis are the inu != 0 machinery of D2e, still open)
     vd::dyn_meter met;
     vd::pair_space_ladder_dyn(G_CC, _Xb_skma, _W0b_qmm.value(), wb_cache(), kmq, kpq, tools, nu0,
-                              &Ps, nullptr, &Pg, &Pd, mpi->comm.rank(), mpi->comm.size(), o, &met, symc);
-    // the pure one dynamic rung (T_s = 0, one application) as its own column
-    {
+                              &Ps, &P1, &Pg, &Pd, mpi->comm.rank(), mpi->comm.size(), o, &met, symc);
+    // the pure one dynamic rung (T_s = 0, one application) as its own column: produced by the pass above when the device-resident
+    // unit ran every unit (gpu 4d), else by a second pass (which re-zeroes P1)
+    const long r1_miss_a = mpi->comm.all_reduce_value(met.r1_missing, std::plus<>{});
+    if (r1_miss_a == 0)
+      app_log(1, "  [scGW-tilde T2] the one-bare-rung column came with the Gamma_1 pass (device-resident unit): no second driver pass.");
+    else {
       vd::dyn_opts o1 = o;
       o1.one_rung_only = true;
       if (_dyn_dump) o1.dump_prefix = mb_state.coqui_prefix + ".dynunits.nu0r1.g" + std::to_string(gen);
@@ -2347,10 +2389,14 @@ namespace solvers {
       o.sigma = std::static_pointer_cast<vd::sigma_dyn_hook>(_shared_hook).get();
     }
     vd::dyn_meter met;
+    const bool want_r1_cut = (_dyn_cut_r1 and not bubble_only);
     vd::pair_space_ladder_dyn(G_CC, _Xb_skma, _W0b_qmm.value(), wb_cache(), kmq, kpq, tools, nus,
-                              &Ps, nullptr, &Pg, &Pd, mpi->comm.rank(), mpi->comm.size(), o, &met, symc);
+                              &Ps, want_r1_cut ? &P1 : nullptr, &Pg, &Pd, mpi->comm.rank(), mpi->comm.size(), o, &met, symc);
     if (o.sigma != nullptr) { o.sigma->flush_unit(); o.sigma = nullptr; }   // P3: the last unit's star fold; the cut_r1 pass carries no hook
-    if (_dyn_cut_r1 and not bubble_only) {
+    const long r1_miss_b = want_r1_cut ? mpi->comm.all_reduce_value(met.r1_missing, std::plus<>{}) : 0l;
+    if (want_r1_cut and r1_miss_b == 0) {
+      app_log(1, "  [scGW-tilde T2] the one-bare-rung column came with the main pass (device-resident unit): no cut_r1 driver pass.");
+    } else if (want_r1_cut) {
       vd::dyn_opts o1 = o;
       o1.one_rung_only = true;
       o1.Pi_bub = nullptr;

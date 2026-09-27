@@ -886,7 +886,8 @@ namespace solvers {
         h.conv_g = (sc > 0.0) ? dm / sc : dm;
       }
       if (is != d.is or iq != d.iq) {                     // the transfer's legs, pair map and G residues
-        dynbse_cuda::ue_sd_set_sq(ue, Dc.data(), &kpq(iq, 0), P.gk.data(), P.gnode.data());
+        utils::check(Dc.shape(3) == Wout.shape(0), "sigma_dyn_accumulate_device: the legs are not the aux ones.");
+        dynbse_cuda::ue_sd_set_sq(ue, &kpq(iq, 0), P.gk.data(), P.gnode.data());
         d.is = is; d.iq = iq;
       }
       const int col = (h.col == "static_dyn") ? 0 : ((h.col == "dyn1_bare") ? 1 : 2);

@@ -123,6 +123,7 @@ namespace methods::solvers::dynbse_cuda {
 
   struct ue_config {
     long np = 0, np_fit = 0, nk = 0, nc = 0, ng = 0, nt = 0, nR_max = 0, ndist = 0, n_kept = 0;
+    long nout = 0;                  // the external-leg / readout dimension (aux N_m, or the Wannier pair count)
   };
 
   /** nullptr when the device cannot hold the working set (the caller keeps the host path); `why` then says what failed */
@@ -139,10 +140,18 @@ namespace methods::solvers::dynbse_cuda {
   /** per (s, q, nu): Cb_k (nk, nc^2, nc^2); the L0 tables (host pointers; Xfam / Xcst / act of t are ignored); returns the
    *  getrf info of M = 1 - Cb K_s (0 = success). tfold and inu come in t; nu0 selects the nu = 0 kernel. */
   int ue_set_unit(unit_engine *e, cplx const *Cbk, l0_tables const &t, bool nu0, double free_bytes);
-  /** the Gamma_1 block of width nR: Dblk (D, nR) in; Gsum0, Gsum1 (D, nR) out; y1fam (2, np, D, nR) and y1cst (D, nR)
+  /** per (s, q): the external legs Dc (nk, nc, nc, nout) -- the readout's left leg and the Sigma deposits' legs */
+  void ue_set_legs(unit_engine *e, cplx const *Dc);
+  /** a readout of the last ue_gamma1 block: which = 0 Gsum0 | 1 Gsum1 | 2 the one-bare-rung Gsum (when requested there);
+   *  P (nout, nR) row-major = D^dag (G - Cb D) (the host's collapse(Dc, G - CbD)); timing (1) ADDED */
+  void ue_readout(unit_engine *e, long nR, int which, cplx *P, double *timing);
+  /** the Gamma_1 block of width nR: Dblk (D, nR) in; Gsum0, Gsum1 (D, nR) out (each may be null: no D2H); y1fam (2, np, D, nR) and y1cst (D, nR)
    *  out when non-null (the host deposits). Returns the worst tau-refit error of K_d. timing (8): [0] L0, [1] T_s,
-   *  [2] rung, [3] refit, [4] vector ops, [5] H2D, [6] D2H, [7] the DLR expansion gemm -- all ADDED, seconds. */
-  double ue_gamma1(unit_engine *e, long nR, cplx const *Dblk, cplx *Gsum0, cplx *Gsum1, cplx *y1fam, cplx *y1cst, double *timing);
+   *  [2] rung, [3] refit, [4] vector ops, [5] H2D, [6] D2H, [7] the DLR expansion gemm -- all ADDED, seconds.
+   *  want_r1: also the ONE BARE dynamic rung column (the host's one_rung_only pass: T_s = 0, one application) from the same
+   *  resident L0 D -- one extra K_d and L0 instead of a second driver pass; kept on the device for ue_readout(which = 2). */
+  double ue_gamma1(unit_engine *e, long nR, cplx const *Dblk, cplx *Gsum0, cplx *Gsum1, cplx *y1fam, cplx *y1cst, double *timing,
+                   bool want_r1 = false);
 
   // ---- D-3: THE SIGMA DEPOSITS ON THE DEVICE (vertex_sigma_dyn.icc::sigma_dyn_accumulate, the production path: the product
   // route, split accumulators, no IBZ fold, no dump, the DW legs). They read the engine's resident output of the last
@@ -162,8 +171,9 @@ namespace methods::solvers::dynbse_cuda {
    *  (with `why`) when the device cannot hold them -- the caller then keeps the host deposits. */
   bool ue_sd_init(unit_engine *e, sd_config const &c, cplx const *Ttw, cplx const *Uw, cplx const *Gw, double const *eps,
                   double const *epsG, double free_bytes, char *why, long why_len);
-  /** per (s, q): the external legs Dc (nk, nc, nc, Nm), the row kpq(iq, :) (nk), the G residues gk (ng, nk, nc, nc), gnode (ng) */
-  void ue_sd_set_sq(unit_engine *e, cplx const *Dc, long const *kpq_row, cplx const *gk, long const *gnode);
+  /** per (s, q): the row kpq(iq, :) (nk), the G residues gk (ng, nk, nc, nc), gnode (ng); the legs are the engine's (ue_set_legs,
+   *  nout == Nm) */
+  void ue_sd_set_sq(unit_engine *e, long const *kpq_row, cplx const *gk, long const *gnode);
   /** per unit (node m): the cst + U deposit weights w (nt); the T-family tables WkT (np, ng, nt) (RT_a -= sum_j WkT M_aj) and
    *  WkU (np, ng, nt) (RU_a += sum_j WkU M_aj, RU_{n_j} -= sum_a WkU M_aj); both nullptr = no T family at this unit */
   void ue_sd_set_unit(unit_engine *e, cplx const *w, cplx const *WkT, cplx const *WkU);
