@@ -25,7 +25,9 @@
 #include <fstream>
 #include <iomanip>
 #include <chrono>
+#include <optional>
 #include <sys/resource.h>
+#include "methods/vertex/vertex_debug.hpp"
 #include "utilities/h5_background_writer.hpp"
 #include "utilities/freemem.h"
 #include "methods/ERI/thc_reader_t.hpp"
@@ -1211,6 +1213,20 @@ namespace solvers {
     }
     // a rank with an empty local block still joins the reductions below
     const long nq_own = (nPl > 0 and nQl > 0 and ntl > 0) ? nql : 0;
+    // gpu port 2026-09-27: under DEVICE the upfold and the nu -> tau transform run on the device (the same gemms through
+    // cuBLAS; ~130 G complex MACs per rank at Si kp444, 43 s of host gemms in p1gpu_n3l); only the tau block comes down for
+    // the += into the (host-mirror) Pi. vertex_debug inject_device = 0 keeps the host gemms (the A/B). The q-nu meter needs
+    // the frequency block on the host: it keeps the host path.
+#if defined(ENABLE_DEVICE)
+    const bool up_dev = (nq_own > 0) and not qnu_meter and
+                        methods::vertex_debug::number("inject_device", 1.0) != 0.0;   // vertex_debug: inject_device
+    std::optional<memory::array<DEVICE_MEMORY, ComplexType, 3>> tmp_d, A_d, B_d;
+    if (up_dev) {
+      tmp_d.emplace(nw_h, Nm, nQl); A_d.emplace(nw_h, nPl, nQl); B_d.emplace(nt_h, nPl, nQl);
+    }
+#else
+    const bool up_dev = false;
+#endif
     for (long iql = 0; iql < nq_own; ++iql) {
       const long iq = q_rng.first() + iql;
       auto tq = tmap(iq, all, all);
@@ -1218,6 +1234,22 @@ namespace solvers {
         for (long j = 0; j < nQl; ++j) tq_Q(m, j) = tq(m, Q_rng.first() + j);
         for (long i = 0; i < nPl; ++i) td_P(i, m) = std::conj(tq(m, P_rng.first() + i));
       }
+      if (up_dev) {
+#if defined(ENABLE_DEVICE)
+        nda::array<ComplexType, 3> Plq(Pl(all, iq, all, all));
+        auto Pl_d = memory::to_memory_space<DEVICE_MEMORY>(Plq);
+        auto tqQ_d = memory::to_memory_space<DEVICE_MEMORY>(tq_Q);
+        auto tdP_d = memory::to_memory_space<DEVICE_MEMORY>(td_P);
+        for (long j = 0; j < nw_h; ++j) {
+          nda::blas::gemm(Pl_d(j, all, all), tqQ_d, (*tmp_d)(j, all, all));
+          nda::blas::gemm(tdP_d, (*tmp_d)(j, all, all), (*A_d)(j, all, all));
+        }
+        auto A2d = nda::reshape(*A_d, shape_t<2>{nw_h, nPl * nQl});
+        auto B2d = nda::reshape(*B_d, shape_t<2>{nt_h, nPl * nQl});
+        _ft->w_to_tau_PHsym(A2d, B2d);
+        B = nda::array<ComplexType, 3>(memory::to_memory_space<HOST_MEMORY>(*B_d));
+#endif
+      } else {
       // upfold ONLY the local block: dP(P, Q) = sum_MN conj(t_MP) Pl_MN t_NQ (the
       // adjoint/no-leak map -- two thin gemms, never the full Np x Np)
       for (long j = 0; j < nw_h; ++j) {
@@ -1235,6 +1267,7 @@ namespace solvers {
       auto A2 = nda::reshape(A, shape_t<2>{nw_h, nPl * nQl});
       auto B2 = nda::reshape(B, shape_t<2>{nt_h, nPl * nQl});
       _ft->w_to_tau_PHsym(A2, B2);
+      }
       for (long it = 0; it < ntl; ++it)
         for (long i = 0; i < nPl; ++i)
           for (long j = 0; j < nQl; ++j) {
