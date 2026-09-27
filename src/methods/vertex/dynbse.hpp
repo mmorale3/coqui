@@ -2949,15 +2949,26 @@ namespace dynbse {
 
   // the readout block D^dag Gsum (the physical observable of the iteration)
   inline nda::array<cplx, 2> collapse(nda::array<cplx, 4> const &Dleft, nda::array<cplx, 4> const &Gsum) {
-    const long nk = Gsum.shape(0), nc = Gsum.shape(1), nR = Gsum.shape(3), nL = Dleft.shape(3);
+    // P (nL, nR) = D^dag G over the pair index (k, a, b): one gemm (gpu port 2026-09-27; the scalar five-deep loop was ~0.3 s
+    // per unit at the Si kp444 bubble shape nL = nR = 156, D = 4096). The summation order changes: rounding class.
+    const long nk = Gsum.shape(0), nc = Gsum.shape(1), nR = Gsum.shape(3), nL = Dleft.shape(3), D = nk * nc * nc;
     nda::array<cplx, 2> P(nL, nR);
-    P() = cplx(0.0);
-    for (long rl = 0; rl < nL; ++rl)
-      for (long r = 0; r < nR; ++r)
-        for (long ik = 0; ik < nk; ++ik)
-          for (long a = 0; a < nc; ++a)
-            for (long bb = 0; bb < nc; ++bb)
-              P(rl, r) += std::conj(Dleft(ik, a, bb, rl)) * Gsum(ik, a, bb, r);
+    if (vertex_debug::flag("dynbse_collapse_loop")) {   // vertex_debug: dynbse_collapse_loop (the old loop, A/B)
+      P() = cplx(0.0);
+      for (long rl = 0; rl < nL; ++rl)
+        for (long r = 0; r < nR; ++r)
+          for (long ik = 0; ik < nk; ++ik)
+            for (long a = 0; a < nc; ++a)
+              for (long bb = 0; bb < nc; ++bb)
+                P(rl, r) += std::conj(Dleft(ik, a, bb, rl)) * Gsum(ik, a, bb, r);
+      return P;
+    }
+    nda::array<cplx, 2> Dh(nL, D);
+    auto D2 = nda::reshape(Dleft, std::array<long, 2>{D, nL});
+    for (long row = 0; row < D; ++row)
+      for (long rl = 0; rl < nL; ++rl) Dh(rl, row) = std::conj(D2(row, rl));
+    auto G2 = nda::reshape(Gsum, std::array<long, 2>{D, nR});
+    nda::blas::gemm(Dh, G2, P);
     return P;
   }
 

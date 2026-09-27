@@ -690,9 +690,19 @@ namespace solvers {
                 for (long b = 0; b < nc; ++b)
                   Pf(s, (p1p * nc + p3) * nc2 + (a * nc + b)) = G_CC(sm, is, ik, a, p1p) * G_CC(s, is, ikpq, p3, b);
         }
-        nda::blas::gemm(cplx(-1.0), tools.Twt_bb, Pf, cplx(0.0), Bf);
-        for (long r = 0; r < nc2; ++r)
-          for (long c = 0; c < nc2; ++c) Cb(ik, r, c) = Bf(m, r * nc2 + c);
+        // only the bosonic row m is kept: Cb(k) = -Twt_bb(m, :) . Pf (a gemv; the full (nw_b x nt)(nt x nc2^2) gemm computed
+        // nw_b rows to keep one -- gpu port 2026-09-27). vertex_debug dynbse_cb_gemm restores it (the A/B; rounding class)
+        if (vertex_debug::flag("dynbse_cb_gemm")) {   // vertex_debug: dynbse_cb_gemm
+          nda::blas::gemm(cplx(-1.0), tools.Twt_bb, Pf, cplx(0.0), Bf);
+          for (long r = 0; r < nc2; ++r)
+            for (long c = 0; c < nc2; ++c) Cb(ik, r, c) = Bf(m, r * nc2 + c);
+        } else {
+          nda::array<cplx, 1> tw(nt), cb(nc2 * nc2);
+          for (long s = 0; s < nt; ++s) tw(s) = tools.Twt_bb(m, s);
+          nda::blas::gemv(cplx(-1.0), nda::transpose(Pf), tw, cplx(0.0), cb);
+          for (long r = 0; r < nc2; ++r)
+            for (long c = 0; c < nc2; ++c) Cb(ik, r, c) = cb(r * nc2 + c);
+        }
       }
     }
 
