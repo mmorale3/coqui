@@ -1227,8 +1227,11 @@ namespace solvers {
 #else
     const bool up_dev = false;
 #endif
+    double t_up_gemm = 0.0, t_up_add = 0.0;               // the split of t_upfold: transform (host or device) / the += loop
+    auto up_now = [] { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
     for (long iql = 0; iql < nq_own; ++iql) {
       const long iq = q_rng.first() + iql;
+      const double tu0 = up_now();
       auto tq = tmap(iq, all, all);
       for (long m = 0; m < Nm; ++m) {
         for (long j = 0; j < nQl; ++j) tq_Q(m, j) = tq(m, Q_rng.first() + j);
@@ -1268,6 +1271,8 @@ namespace solvers {
       auto B2 = nda::reshape(B, shape_t<2>{nt_h, nPl * nQl});
       _ft->w_to_tau_PHsym(A2, B2);
       }
+      const double tu1 = up_now();
+      t_up_gemm += tu1 - tu0;
       for (long it = 0; it < ntl; ++it)
         for (long i = 0; i < nPl; ++i)
           for (long j = 0; j < nQl; ++j) {
@@ -1282,6 +1287,7 @@ namespace solvers {
             }
             Pi_loc(it, iql, i, j) += v;
           }
+      t_up_add += up_now() - tu1;
     }
     const double t_upfold = lwatch.lap();
     auto &comm = *dPi_tqPQ.communicator();
@@ -1328,10 +1334,10 @@ namespace solvers {
       double rss_ev = comm.all_reduce_value(rss_eval, boost::mpi3::max<>{});
       double rss_e0 = comm.all_reduce_value(rss_in, boost::mpi3::max<>{});
       app_log(1, "  [ladder-prof inject] iteration {}: ladder eval = {:.2f} s of {:.2f} s "
-                 "injection ({:.1f}%); upfold+nu->tau = {:.2f} s{}, meters = {:.2f} s; "
+                 "injection ({:.1f}%); upfold+nu->tau = {:.2f} s{} [transform {:.2f} s, += into Pi {:.2f} s], meters = {:.2f} s; "
                  "cumulative ladder eval = {:.2f} s over {} iterations",
               ladder_meter::ncalls, t_eval, t_tot,
-              100.0 * t_eval / std::max(t_tot, 1e-300), t_upfold, up_dev ? " (on the device)" : "", t_diag,
+              100.0 * t_eval / std::max(t_tot, 1e-300), t_upfold, up_dev ? " (on the device)" : "", t_up_gemm, t_up_add, t_diag,
               ladder_meter::cum_eval, ladder_meter::ncalls);
       app_log(1, "  [ladder-prof inject] MaxRSS GB (max over ranks): entry {:.2f} -> "
                  "after ladder eval {:.2f} -> exit {:.2f}", rss_e0, rss_ev, rss_mx);
