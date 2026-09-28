@@ -1019,6 +1019,7 @@ namespace solvers {
       // device-vs-host difference.
       std::unique_ptr<dynbse_cuda::rung_stream, void (*)(dynbse_cuda::rung_stream *)> rs(nullptr, dynbse_cuda::rs_destroy);
       long rs_sq = -1;
+      bool rs_res = false;                           // the transformed tables resident (slot i = tau node i, slot nt = W_d0)
       double rs_t[5] = {0.0, 0.0, 0.0, 0.0, 0.0};   // [0] W transforms, [1] legs in, [2] FFT + product, [3] legs out, [4] H2D/D2H
       if (not opt.dense_rung and not opt.bubble_only and vertex_debug::flag("dynbse_dev_stream")) {
         std::string why_rs;
@@ -1029,15 +1030,25 @@ namespace solvers {
           dynbse_cuda::rs_config rc;
           rc.ns = ns; rc.nk = nk; rc.nq = nq; rc.Nm = Nm; rc.nc = nc;
           rc.nb = std::max(1l, long(vertex_debug::number("dynbse_dev_stream_nb", 16.0)));
+          rc.ntab = nt + 1;           // every tau table + W_d0 transformed once per driver call (fixed here), else per call
           for (int a = 0; a < 3; ++a) rc.ndim[a] = kft.ndim[a];
           char why[256] = {0};
           rs.reset(dynbse_cuda::rs_create(rc, nrb, kft.lex_k.data(), kft.lex_q.data(), Xb.data(),
                                           1.0e6 * double(utils::freemem_device_effective()), why, 256));
           if (not rs) why_rs = why;
-          else if (rank == 0)
-            app_log(1, "  [dynbse] streaming THC rung on the DEVICE: ON (nb {}, {:.2f} GB; mesh {} x {} x {}, Nm {}, nc {})",
-                    dynbse_cuda::rs_nb(rs.get()), dynbse_cuda::rs_bytes(rc, nrb) / 1.0e9, rc.ndim[0], rc.ndim[1], rc.ndim[2],
-                    Nm, nc);
+          else {
+            rs_res = (dynbse_cuda::rs_ntab(rs.get()) == nt + 1);
+            if (rs_res) {
+              for (long i = 0; i < nt; ++i) dynbse_cuda::rs_load_w(rs.get(), i, Wd_s.data() + i * Nm * Nm, nt * Nm * Nm, rs_t);
+              dynbse_cuda::rs_load_w(rs.get(), nt, Wd0.data(), Nm * Nm, rs_t);
+            }
+            if (rank == 0) {
+              rc.ntab = dynbse_cuda::rs_ntab(rs.get());
+              app_log(1, "  [dynbse] streaming THC rung on the DEVICE: ON (nb {}, {} rung tables {}, {:.2f} GB; mesh {} x {} x {}, "
+                         "Nm {}, nc {})", dynbse_cuda::rs_nb(rs.get()), rc.ntab, rs_res ? "resident" : "(reloaded per call)",
+                      dynbse_cuda::rs_bytes(rc, nrb) / 1.0e9, rc.ndim[0], rc.ndim[1], rc.ndim[2], Nm, nc);
+            }
+          }
         }
         if (not rs and rank == 0) app_log(1, "  [dynbse] streaming THC rung on the DEVICE: OFF -- {}", why_rs);
       }
@@ -1568,8 +1579,9 @@ namespace solvers {
                 if (rs_sq != is * nq + iq) { dynbse_cuda::rs_set_sq(rs.get(), is, &kpq(iq, 0)); rs_sq = is * nq + iq; }
                 const long NN = Nm * Nm;
                 for (long i = 0; i < nt; ++i) {
-                  dynbse_cuda::rs_set_w(rs.get(), Wd_s.data() + i * NN, nt * NN, rs_t);
-                  dynbse_cuda::rs_apply(rs.get(), scale_k, Fs(i, all, all, all).data(), Ys(i, all, all, all).data(), nR, rs_t + 1);
+                  if (not rs_res) dynbse_cuda::rs_load_w(rs.get(), 0, Wd_s.data() + i * NN, nt * NN, rs_t);
+                  dynbse_cuda::rs_apply(rs.get(), rs_res ? i : 0, scale_k, Fs(i, all, all, all).data(), Ys(i, all, all, all).data(),
+                                        nR, rs_t + 1);
                 }
                 if (dbg and kd_calls == 0 and vertex_debug::flag("dynbse_dev_stream_check")) {
                   // the device rung against the host one on the same inputs (the gate: a few ulp of the scale)
@@ -1629,8 +1641,8 @@ namespace solvers {
 #if defined(ENABLE_CUDA)
             if (rs) {
               if (rs_sq != is * nq + iq) { dynbse_cuda::rs_set_sq(rs.get(), is, &kpq(iq, 0)); rs_sq = is * nq + iq; }
-              dynbse_cuda::rs_set_w(rs.get(), Wd0.data(), Nm * Nm, rs_t);
-              dynbse_cuda::rs_apply(rs.get(), -scale_k, Fs3.data(), Os3.data(), nR, rs_t + 1);
+              if (not rs_res) dynbse_cuda::rs_load_w(rs.get(), 0, Wd0.data(), Nm * Nm, rs_t);
+              dynbse_cuda::rs_apply(rs.get(), rs_res ? nt : 0, -scale_k, Fs3.data(), Os3.data(), nR, rs_t + 1);
               if (dbg and kd_calls == 0 and vertex_debug::flag("dynbse_dev_stream_check")) {
                 nda::array<cplx, 3> Oh(nk, nc2, nR);
                 rung_apply(Wq_0, -scale_k, Fs3, Oh, is, iq);

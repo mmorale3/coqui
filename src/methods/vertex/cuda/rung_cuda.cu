@@ -136,12 +136,12 @@ namespace methods::solvers::dynbse_cuda {
     // the element counts of the buffers at block width nb (F / out staging at nR_max columns)
     struct rs_sizes {
       long X, legs, Y, Ah, A, Fk, B, O2, Fio;
-      rs_sizes(rs_config const &c, long nb, long nR_max) {
+      rs_sizes(rs_config const &c, long nb, long nR_max, long ntab) {
         const long nk = c.nk, Nm = c.Nm, nc = c.nc;
         X = c.ns * nk * Nm * nc;
         legs = nk * Nm * nc;
         Y = std::max(nk * Nm * Nm * nb, c.nq * Nm * Nm);      // also the W staging buffer
-        Ah = nk * Nm * Nm;
+        Ah = std::max(1l, ntab) * nk * Nm * Nm;
         A = nk * Nm * nb * nc;
         Fk = nk * nc * nb * nc;
         B = nk * nc * nb * Nm;
@@ -151,8 +151,8 @@ namespace methods::solvers::dynbse_cuda {
       double elems() const { return double(X + 4 * legs + Y + Ah + A + Fk + B + O2 + 2 * Fio); }
     };
     // the cuFFT work areas are not known before the plans exist: budget one data-sized area for the block transform
-    double rs_bytes_nb(rs_config const &c, long nb, long nR_max) {
-      rs_sizes s(c, nb, nR_max);
+    double rs_bytes_nb(rs_config const &c, long nb, long nR_max, long ntab) {
+      rs_sizes s(c, nb, nR_max, ntab);
       return 16.0 * (s.elems() + double(s.Y)) + 8.0 * double(3 * c.nk + c.nq) + 64.0e6;
     }
 
@@ -160,7 +160,7 @@ namespace methods::solvers::dynbse_cuda {
 
   struct rung_stream {
     rs_config c;
-    long nb = 1, nR_max = 0, is_cur = -1;
+    long nb = 1, nR_max = 0, is_cur = -1, ntab = 1;
     cublasHandle_t cb = nullptr;
     cufftHandle plan_y = 0, plan_w = 0;
     void *fft_work = nullptr;
@@ -169,9 +169,12 @@ namespace methods::solvers::dynbse_cuda {
     cd *Y = nullptr, *Ah = nullptr, *A = nullptr, *Fk = nullptr, *B = nullptr, *O2 = nullptr, *F = nullptr, *out = nullptr;
   };
 
-  double rs_bytes(rs_config const &c, long nR_max) { return rs_bytes_nb(c, std::max(1l, std::min(c.nb, nR_max)), nR_max); }
+  double rs_bytes(rs_config const &c, long nR_max) {
+    return rs_bytes_nb(c, std::max(1l, std::min(c.nb, nR_max)), nR_max, std::max(1l, c.ntab));
+  }
 
   long rs_nb(rung_stream const *e) { return e ? e->nb : 0; }
+  long rs_ntab(rung_stream const *e) { return e ? e->ntab : 0; }
 
   rung_stream *rs_create(rs_config const &c, long nR_max, long const *lex_k, long const *lex_q, cplx const *Xb,
                          double free_bytes, char *why, long why_len) {
@@ -181,18 +184,21 @@ namespace methods::solvers::dynbse_cuda {
     };
     if (c.nk <= 0 || c.Nm <= 0 || c.nc <= 0 || c.ns <= 0 || nR_max <= 0) return fail("empty configuration");
     if (long(c.ndim[0]) * c.ndim[1] * c.ndim[2] != c.nk || c.nq != c.nk) return fail("not a full nosym mesh");
-    long nb = std::max(1l, std::min(c.nb, nR_max));
-    while (nb > 1 && rs_bytes_nb(c, nb, nR_max) > 0.9 * free_bytes) nb = std::max(1l, nb / 2);
-    if (rs_bytes_nb(c, nb, nR_max) > 0.9 * free_bytes) {
+    // the resident tables first (they remove every per-application W upload and transform), else one slot
+    long nb = std::max(1l, std::min(c.nb, nR_max)), ntab = std::max(1l, c.ntab);
+    if (rs_bytes_nb(c, nb, nR_max, ntab) > 0.9 * free_bytes) ntab = 1;
+    while (nb > 1 && rs_bytes_nb(c, nb, nR_max, ntab) > 0.9 * free_bytes) nb = std::max(1l, nb / 2);
+    if (rs_bytes_nb(c, nb, nR_max, ntab) > 0.9 * free_bytes) {
       char b[160];
-      std::snprintf(b, sizeof(b), "needs %.2f GB at nb = 1, %.2f GB free", rs_bytes_nb(c, 1, nR_max) / 1e9, free_bytes / 1e9);
+      std::snprintf(b, sizeof(b), "needs %.2f GB at nb = 1, %.2f GB free", rs_bytes_nb(c, 1, nR_max, 1) / 1e9, free_bytes / 1e9);
       return fail(b);
     }
     auto *e = new rung_stream;
     e->c = c;
     e->nb = nb;
+    e->ntab = ntab;
     e->nR_max = nR_max;
-    rs_sizes s(c, nb, nR_max);
+    rs_sizes s(c, nb, nR_max, ntab);
     auto dalloc = [&](auto *&p, long n, char const *what) {
       rs_cu(cudaMalloc(reinterpret_cast<void **>(&p), size_t(std::max(1l, n)) * sizeof(*p)), what);
     };
@@ -272,20 +278,22 @@ namespace methods::solvers::dynbse_cuda {
     e->is_cur = is;
   }
 
-  void rs_set_w(rung_stream *e, cplx const *W, long ldq, double *timing) {
+  void rs_load_w(rung_stream *e, long slot, cplx const *W, long ldq, double *timing) {
     auto const &c = e->c;
+    if (slot < 0 || slot >= e->ntab) APP_ABORT(" rung_cuda: rs_load_w slot out of range.");
     const double t0 = now();
     const long NN = c.Nm * c.Nm;
+    cd *Ah = e->Ah + slot * c.nk * NN;
     // staging: q rows of NN elements at host pitch ldq into Y (contiguous), then into the mesh rows of Ah
     rs_cu(cudaMemcpy2D(e->Y, size_t(NN) * sizeof(cd), W, size_t(ldq) * sizeof(cd), size_t(NN) * sizeof(cd), size_t(c.nq),
                        cudaMemcpyHostToDevice),
           "W H2D");
-    wgather_kernel<<<nblocks(c.nq * NN), TPB>>>(c.nq, NN, e->Y, e->lex_q, e->Ah);
+    wgather_kernel<<<nblocks(c.nq * NN), TPB>>>(c.nq, NN, e->Y, e->lex_q, Ah);
     rs_cu(cudaGetLastError(), "wgather_kernel");
     // A(R) = sum_q e^{+i q.R} W(q): the unnormalized backward transform (FFTW_BACKWARD == CUFFT_INVERSE), then the 1/nk of
     // the forward-backward pair folded in (the host multiplies by a * inv_nk)
-    rs_fft(cufftExecZ2Z(e->plan_w, e->Ah, e->Ah, CUFFT_INVERSE), "exec w");
-    scale_kernel<<<nblocks(c.nk * NN), TPB>>>(c.nk * NN, 1.0 / double(c.nk), e->Ah);
+    rs_fft(cufftExecZ2Z(e->plan_w, Ah, Ah, CUFFT_INVERSE), "exec w");
+    scale_kernel<<<nblocks(c.nk * NN), TPB>>>(c.nk * NN, 1.0 / double(c.nk), Ah);
     rs_cu(cudaGetLastError(), "scale_kernel");
     if (timing) {
       rs_cu(cudaDeviceSynchronize(), "set_w sync");
@@ -293,8 +301,10 @@ namespace methods::solvers::dynbse_cuda {
     }
   }
 
-  void rs_apply(rung_stream *e, cplx scale, cplx const *F, cplx *out, long nR, double *timing) {
+  void rs_apply(rung_stream *e, long slot, cplx scale, cplx const *F, cplx *out, long nR, double *timing) {
     auto const &c = e->c;
+    if (slot < 0 || slot >= e->ntab) APP_ABORT(" rung_cuda: rs_apply slot out of range.");
+    cd const *Ah = e->Ah + slot * c.nk * c.Nm * c.Nm;
     if (nR > e->nR_max) APP_ABORT(" rung_cuda: rs_apply block wider than the engine's nR_max.");
     if (e->is_cur < 0) APP_ABORT(" rung_cuda: rs_apply before rs_set_sq.");
     const long nk = c.nk, Nm = c.Nm, nc = c.nc, nb = e->nb, M = Nm * nb * Nm;
@@ -320,7 +330,7 @@ namespace methods::solvers::dynbse_cuda {
       lap(0);
       // ---- the k-sum: forward transform, the product with A, backward transform ------------------------------------
       rs_fft(cufftExecZ2Z(e->plan_y, e->Y, e->Y, CUFFT_FORWARD), "exec y fwd");
-      wmul_kernel<<<nblocks(nk * M), TPB>>>(nk, Nm, nb, e->Y, e->Ah);
+      wmul_kernel<<<nblocks(nk * M), TPB>>>(nk, Nm, nb, e->Y, Ah);
       rs_cu(cudaGetLastError(), "wmul_kernel");
       rs_fft(cufftExecZ2Z(e->plan_y, e->Y, e->Y, CUFFT_INVERSE), "exec y inv");
       lap(1);

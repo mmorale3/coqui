@@ -44,6 +44,7 @@ namespace methods::solvers::dynbse_cuda {
   struct rs_config {
     long ns = 0, nk = 0, nq = 0, Nm = 0, nc = 0;
     long nb = 16;                   // columns per FFT block (reduced to fit the budget; >= 1)
+    long ntab = 1;                  // resident transformed rung tables (slots); 1 when the requested count does not fit
     int ndim[3] = {0, 0, 0};        // the mesh (ndim[0] ndim[1] ndim[2] == nk), lex row = (m0 n1 + m1) n2 + m2
   };
 
@@ -54,16 +55,17 @@ namespace methods::solvers::dynbse_cuda {
   rung_stream *rs_create(rs_config const &c, long nR_max, long const *lex_k, long const *lex_q, cplx const *Xb,
                          double free_bytes, char *why, long why_len);
   void rs_destroy(rung_stream *e);
-  /** the nb the engine settled on */
+  /** the nb and the number of resident table slots the engine settled on */
   long rs_nb(rung_stream const *e);
+  long rs_ntab(rung_stream const *e);
   /** per (s, q): the four leg tables from the row kpq(iq, :) (nk) */
   void rs_set_sq(rung_stream *e, long is, long const *kpq_row);
-  /** a rung table W(q, P, Q) at host W + q ldq (row-major Nm x Nm per q): A = its transform / nk, resident until the
-   *  next call. timing (1) ADDED: seconds. */
-  void rs_set_w(rung_stream *e, cplx const *W, long ldq, double *timing);
-  /** out (nk, nc^2, nR) = scale K[W] F (nk, nc^2, nR), both HOST row-major (out overwritten). timing (4) ADDED:
+  /** a rung table W(q, P, Q) at host W + q ldq (row-major Nm x Nm per q) into slot (< rs_ntab): A = its transform / nk,
+   *  resident until the slot is reloaded. timing (1) ADDED: seconds. */
+  void rs_load_w(rung_stream *e, long slot, cplx const *W, long ldq, double *timing);
+  /** out (nk, nc^2, nR) = scale K[W_slot] F (nk, nc^2, nR), both HOST row-major (out overwritten). timing (4) ADDED:
    *  [0] legs in, [1] FFT + product, [2] legs out + scatter, [3] H2D + D2H. */
-  void rs_apply(rung_stream *e, cplx scale, cplx const *F, cplx *out, long nR, double *timing);
+  void rs_apply(rung_stream *e, long slot, cplx scale, cplx const *F, cplx *out, long nR, double *timing);
 
 } // namespace methods::solvers::dynbse_cuda
 
