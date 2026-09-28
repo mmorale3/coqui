@@ -889,6 +889,12 @@ namespace bdft_tests {
         }
       }
     }
+    // at a larger toy nc (COQUI_DYNBSE_TOY_NC) only the kernel sections above run: the solver + dense-oracle comparison below
+    // is sized for nc = 2 (its explicit Matsubara system grows as (nk 2N nc^2)^3 and ran past 90 min at nc = 6)
+    if (std::getenv("COQUI_DYNBSE_TOY_NC") != nullptr and T.nc != 2) {
+      app_log(1, "dynbse_oracle: toy nc = {}: the (L) / (K) / (G) kernel sections only (the solver oracle needs nc = 2)", T.nc);
+      return;
+    }
     for (cplx inu : {cplx(0.0), I_ * cplx(2.0 * M_PI * 2.0 / beta)}) {
       app_log(1, "dynbse: ---- inu = {:.4f} i ----", inu.imag());
       // the solver on the exact node set (fast) first
