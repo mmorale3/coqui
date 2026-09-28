@@ -139,6 +139,9 @@ namespace methods::solvers::dynbse_cuda {
     long nres = -1;
     int partial_ok = 0;
     double reserve_bytes = 0.0;
+    // 1: one rung pass per RHS block for the one-bare-rung input and the Gamma_1 input, both frequency families packed side
+    // by side (every K_d(s_r) read once per block, each non-resident one rebuilt once); dropped when its buffers would cost residency
+    int rung_fuse = 1;
   };
 
   /** nullptr when the device cannot hold the working set (the caller keeps the host path); `why` then says what failed */
@@ -148,6 +151,8 @@ namespace methods::solvers::dynbse_cuda {
   double ue_bytes(ue_config const &c);
   /** the resident tau rungs of an engine (== ndist: all), and the non-resident rebuilds so far (count, wall seconds) */
   long ue_nres(unit_engine const *e);
+  /** whether the engine runs the fused rung pass (ue_config::rung_fuse, kept when it fit the budget) */
+  bool ue_rung_fused(unit_engine const *e);
   void ue_rebuild_stats(unit_engine const *e, long *n, double *seconds);
 
   /** run-wide: KF, KF2 (nt, np) real; the basis' DLR refit (imag_axes_ft::dlr_pole_fit at its fixed rank, the np_fit DLR

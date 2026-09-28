@@ -1332,6 +1332,7 @@ namespace solvers {
           // vertex_debug dynbse_dev_nres = n forces n resident rungs (the A/B of the rebuild path), -1 = the most that fit.
           const bool kb_want = (not sym and vertex_debug::number("dynbse_dev_kbig", 1.0) != 0.0);
           uc.nres = long(vertex_debug::number("dynbse_dev_nres", -1.0));   // vertex_debug: dynbse_dev_nres
+          uc.rung_fuse = int(vertex_debug::number("dynbse_dev_rung_fuse", 1.0));   // vertex_debug: dynbse_dev_rung_fuse (the fused rung pass)
           uc.partial_ok = kb_want ? 1 : 0;
           {
             const double kb_need = 16.0 * (double(ns * nk * Nm * nc) + double(nq * Nm * Nm) * (2.0 + double(ndist)) +
@@ -1359,12 +1360,13 @@ namespace solvers {
           }
           if (rank == 0) {
             dynbse_cuda::ue_config ucr = uc;
-            if (ue) ucr.nres = dynbse_cuda::ue_nres(ue.get());
+            if (ue) { ucr.nres = dynbse_cuda::ue_nres(ue.get()); ucr.rung_fuse = dynbse_cuda::ue_rung_fused(ue.get()) ? 1 : 0; }
             const std::string resid = (ue and ucr.nres < ndist)
                 ? "; tau rungs resident " + std::to_string(ucr.nres) + " of " + std::to_string(ndist) +
                   ", the rest rebuilt on the device per application" : std::string();
-            app_log(1, "  [dynbse] device-resident unit: {} ({:.1f} GB estimated{}, {:.1f} GB reserved){}{}", ue ? "ON" : "OFF, the host path runs",
-                    dynbse_cuda::ue_bytes(ucr) / 1e9, resid, uc.reserve_bytes / 1e9, ue ? "" : " -- ", ue ? "" : why);
+            app_log(1, "  [dynbse] device-resident unit: {} ({:.1f} GB estimated{}, {:.1f} GB reserved{}){}{}", ue ? "ON" : "OFF, the host path runs",
+                    dynbse_cuda::ue_bytes(ucr) / 1e9, resid, uc.reserve_bytes / 1e9,
+                    (ue and ucr.rung_fuse) ? "; fused rung pass" : "", ue ? "" : " -- ", ue ? "" : why);
           }
           // D-1b: the rungs built on the device (nosym meshes); vertex_debug dynbse_dev_kbig = 0 keeps the host builds (the A/B)
           if (ue and not sym and vertex_debug::number("dynbse_dev_kbig", 1.0) != 0.0) {   // vertex_debug: dynbse_dev_kbig

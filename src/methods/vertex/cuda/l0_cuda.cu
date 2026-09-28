@@ -1142,6 +1142,21 @@ namespace methods::solvers::dynbse_cuda {
     __global__ void conj_kernel(long n, cd *__restrict__ x) {
       for (long e = blockIdx.x * long(blockDim.x) + threadIdx.x; e < n; e += long(gridDim.x) * blockDim.x) x[e] = cuConj(x[e]);
     }
+    // the fused rung pass's packing: Fbig[(i D + d) ncol + off + r] = Fs[(i D + d) nR + r] (and back)
+    __global__ void pack_cols_kernel(long nt, long D, long nR, long ncol, long off, cd const *__restrict__ Fs, cd *__restrict__ Fbig) {
+      const long tot = nt * D * nR;
+      for (long e = blockIdx.x * long(blockDim.x) + threadIdx.x; e < tot; e += long(gridDim.x) * blockDim.x) {
+        const long id = e / nR, r = e - id * nR;
+        Fbig[id * ncol + off + r] = Fs[e];
+      }
+    }
+    __global__ void unpack_cols_kernel(long nt, long D, long nR, long ncol, long off, cd const *__restrict__ Ybig, cd *__restrict__ Ys) {
+      const long tot = nt * D * nR;
+      for (long e = blockIdx.x * long(blockDim.x) + threadIdx.x; e < tot; e += long(gridDim.x) * blockDim.x) {
+        const long id = e / nR, r = e - id * nR;
+        Ys[e] = Ybig[id * ncol + off + r];
+      }
+    }
     __global__ void add2_kernel(long n, cd const *__restrict__ a, cd const *__restrict__ b, cd *__restrict__ out) {
       for (long e = blockIdx.x * long(blockDim.x) + threadIdx.x; e < n; e += long(gridDim.x) * blockDim.x) out[e] = a[e] + b[e];
     }
@@ -1466,6 +1481,9 @@ namespace methods::solvers::dynbse_cuda {
     cd *Kscr = nullptr, *Fs2 = nullptr, *Ys2 = nullptr;      // the rebuild scratch; the second family's rung buffers
     long nrebuild = 0;
     double t_rebuild = 0.0;
+    // the fused rung pass: the one-bare-rung y, and the packed (tau, D, inputs x families x nR) rung buffers
+    bool fuse = false;
+    cd *yfam1 = nullptr, *ycst1 = nullptr, *Fbig = nullptr, *Ybig = nullptr;
   };
 
   double ue_bytes(ue_config const &c) {
@@ -1475,7 +1493,8 @@ namespace methods::solvers::dynbse_cuda {
     const bool partial = (nres < c.ndist);
     double b = 0.0;
     b += (3.0 + double(nres) + (partial ? 1.0 : 0.0)) * D * D;             // K_s, K_d0, M, the resident K_d(s_r) [+ the scratch]
-    if (partial) b += 2.0 * double(c.nt) * W;                              // Fs2, Ys2
+    if (partial and not c.rung_fuse) b += 2.0 * double(c.nt) * W;         // Fs2, Ys2 (ue_kd_partial)
+    if (c.rung_fuse) b += fam + cst + 2.0 * 4.0 * double(c.nt) * W;         // yfam1, ycst1, Fbig, Ybig (2 inputs x 2 families)
     b += 3.0 * fam + 10.0 * cst + D * double(c.nR_max);                     // Ffam, F2fam, Gfam, yfam + csts + Y + Gs0 / Gr1 / CbD / Vr
     b += D * double(c.nout) + double(c.nout * c.nR_max);                    // the legs, the readout block
     b += fam;                                                               // yfam
@@ -1492,29 +1511,35 @@ namespace methods::solvers::dynbse_cuda {
     // nres < 0 keeps every tau rung resident when that fits, else (partial_ok) the most that fit
     ue_config c = c_in;
     const double avail = 0.9 * free_bytes - std::max(0.0, c_in.reserve_bytes);
-    c.nres = (c_in.nres < 0) ? c_in.ndist : std::min(c_in.nres, c_in.ndist);
-    if (c.nres < c.ndist and not c_in.partial_ok) {
-      std::snprintf(why, size_t(why_len), "a partial rung residency (%ld of %ld) needs the device rung builds", c.nres, c.ndist);
-      return nullptr;
+    // the candidates in order: every rung resident (fused rung pass if asked, then without it), then the partial residencies
+    // (the most resident first, fused before unfused); an explicit nres only tries that residency
+    std::vector<std::pair<long, int>> cand;
+    auto add = [&](long n) {
+      if (c_in.rung_fuse) cand.push_back({n, 1});
+      cand.push_back({n, 0});
+    };
+    if (c_in.nres >= 0) add(std::min(c_in.nres, c_in.ndist));
+    else {
+      add(c_in.ndist);
+      if (c_in.partial_ok) for (long n = c_in.ndist - 1; n >= 0; --n) add(n);
     }
-    if (ue_bytes(c) > avail) {
-      if (c_in.nres >= 0 or not c_in.partial_ok) {
-        std::snprintf(why, size_t(why_len), "needs %.1f GB of device memory, %.1f GB available (%.1f GB free, %.1f GB reserved)%s",
-                      ue_bytes(c) / 1e9, avail / 1e9, free_bytes / 1e9, c_in.reserve_bytes / 1e9,
-                      c_in.partial_ok ? "" : "; a partial rung residency needs the device rung builds");
-        return nullptr;
-      }
-      long n = c.ndist - 1;
-      for (; n >= 0; --n) { c.nres = n; if (ue_bytes(c) <= avail) break; }
-      if (n < 0) {
-        std::snprintf(why, size_t(why_len), "needs %.1f GB of device memory even with no tau rung resident, %.1f GB available",
-                      ue_bytes(c) / 1e9, avail / 1e9);
-        return nullptr;
-      }
+    bool found = false;
+    for (auto const &[n, f] : cand) {
+      if (n < c_in.ndist and not c_in.partial_ok) continue;
+      c.nres = n; c.rung_fuse = f;
+      if (ue_bytes(c) <= avail) { found = true; break; }
+    }
+    if (not found) {
+      c.nres = (c_in.nres < 0) ? c_in.ndist : std::min(c_in.nres, c_in.ndist); c.rung_fuse = 0;
+      std::snprintf(why, size_t(why_len), "needs %.1f GB of device memory, %.1f GB available (%.1f GB free, %.1f GB reserved)%s",
+                    ue_bytes(c) / 1e9, avail / 1e9, free_bytes / 1e9, c_in.reserve_bytes / 1e9,
+                    c_in.partial_ok ? " even with the least rung residency" : "; a partial rung residency needs the device rung builds");
+      return nullptr;
     }
     auto *e = new unit_engine;
     e->c = c;
     e->nres = c.nres;
+    e->fuse = (c.rung_fuse != 0);
     e->nc2 = c.nc * c.nc;
     e->D = c.nk * e->nc2;
     const size_t D = size_t(e->D), W = D * size_t(c.nR_max), np = size_t(c.np), nt = size_t(c.nt);
@@ -1527,7 +1552,11 @@ namespace methods::solvers::dynbse_cuda {
     e->Kds = dalloc<cd>(size_t(std::max(e->nres, 1l)) * D * D, "ue Kds");
     if (e->nres < c.ndist) {
       e->Kscr = dalloc<cd>(D * D, "ue K scratch");
-      e->Fs2 = dalloc<cd>(nt * W, "ue Fs2"); e->Ys2 = dalloc<cd>(nt * W, "ue Ys2");
+      if (not e->fuse) { e->Fs2 = dalloc<cd>(nt * W, "ue Fs2"); e->Ys2 = dalloc<cd>(nt * W, "ue Ys2"); }
+    }
+    if (e->fuse) {
+      e->yfam1 = dalloc<cd>(2 * np * W, "ue yfam1"); e->ycst1 = dalloc<cd>(W, "ue ycst1");
+      e->Fbig = dalloc<cd>(4 * nt * W, "ue Fbig"); e->Ybig = dalloc<cd>(4 * nt * W, "ue Ybig");
     }
     e->Cbk = dalloc<cd>(size_t(c.nk) * e->nc2 * e->nc2, "ue Cbk"); e->M = dalloc<cd>(D * D, "ue M");
     e->ipiv = dalloc<int>(D, "ue ipiv"); e->dinfo = dalloc<int>(1, "ue info");
@@ -1563,7 +1592,8 @@ namespace methods::solvers::dynbse_cuda {
                     (void *)e->yfam, (void *)e->ycst, (void *)e->Dblk, (void *)e->Y, (void *)e->csb, (void *)e->cbb, (void *)e->Fs,
                     (void *)e->Ys, (void *)e->g, (void *)e->coef, (void *)e->rec, (void *)e->pA, (void *)e->pB, (void *)e->pC,
                     (void *)e->flags, (void *)e->red, (void *)e->Gs0, (void *)e->Gr1, (void *)e->Dcj, (void *)e->CbD, (void *)e->Vr,
-                    (void *)e->Pr, (void *)e->Kscr, (void *)e->Fs2, (void *)e->Ys2})
+                    (void *)e->Pr, (void *)e->Kscr, (void *)e->Fs2, (void *)e->Ys2, (void *)e->yfam1, (void *)e->ycst1,
+                    (void *)e->Fbig, (void *)e->Ybig})
       if (p) (void)cudaFree(p);
     for (void *p : e->sd.allocs)
       if (p) (void)cudaFree(p);
@@ -1584,6 +1614,7 @@ namespace methods::solvers::dynbse_cuda {
   }
 
   long ue_nres(unit_engine const *e) { return e->nres; }
+  bool ue_rung_fused(unit_engine const *e) { return e->fuse; }
   void ue_rebuild_stats(unit_engine const *e, long *n, double *seconds) { *n = e->nrebuild; *seconds = e->t_rebuild; }
 
   void ue_set_rung(unit_engine *e, cplx const *Ksh, cplx const *Kdsh, cplx const *Kd0h, long const *treph, cplx scale_k) {
@@ -1747,6 +1778,97 @@ namespace methods::solvers::dynbse_cuda {
       return fe;
     }
 
+    // THE FUSED RUNG PASS (larger spaces): the rung of nin inputs (the one-bare-rung input and the Gamma_1 input of a block)
+    // and every frequency family in ONE pass -- each K_d(s_r) is read once for nin nfam nR packed columns, each non-resident
+    // representative is rebuilt once. Per column the same products as ue_kd; the refit per (input, family); fe_out per input.
+    void ue_kd_multi(unit_engine *e, long nR, long nin, cd const *const *Gfam, cd const *const *Gs, cd *const *yfam,
+                     cd *const *ycst, double *fe_out, double *tim) {
+      const long D = e->D, np = e->c.np, nt = e->c.nt, nk_ = e->c.n_kept, W = D * nR;
+      const cd one = make_cuDoubleComplex(1.0, 0.0), zero = make_cuDoubleComplex(0.0, 0.0);
+      const cd mscale = make_cuDoubleComplex(-e->scale.x, -e->scale.y);
+      const long nfam = e->nu0 ? 1 : 2, ncol = nin * nfam * nR;
+      if (nin * nfam > 4) APP_ABORT(std::string(" ue_kd_multi: more than 4 packed (input, family) blocks."));
+      double t0 = wnow();
+      for (long x = 0; x < nin; ++x) {
+        cu_check(cudaMemsetAsync(yfam[x], 0, size_t(2 * np) * W * sizeof(cd), 0), "ue memset y");
+        for (long fam = 0; fam < nfam; ++fam) {
+          for (long ff = fam; ff < (e->nu0 ? 2 : fam + 1); ++ff) {
+            const cd beta = (ff == fam) ? zero : one;
+            cd const *KFx = (ff == 1 and e->nu0) ? e->KF2 : e->KF;
+            cub_check(cublasZgemm(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(W), int(nt), int(np), &one, Gfam[x] + size_t(ff) * np * W, int(W),
+                                  KFx, int(np), &beta, e->Fs, int(W)), "ue Fs = KF fam");
+          }
+          pack_cols_kernel<<<grid_for(nt * W), 256>>>(nt, D, nR, ncol, (x * nfam + fam) * nR, e->Fs, e->Fbig);
+          launch_check("ue pack");
+        }
+      }
+      cu_check(cudaDeviceSynchronize(), "ue dlr");
+      tim[7] += wnow() - t0; t0 = wnow();
+      // the rung: Ybig_i^T (ncol x D) = scale Fbig_i^T (ncol x D) . K_d(rep_i)^T (D x D)
+      std::vector<long> res;
+      for (long i = 0; i < nt; ++i) if (e->trep[size_t(i)] < e->nres) res.push_back(i);
+      if (not res.empty()) {
+        std::vector<cd *> hA(res.size()), hB(res.size()), hC(res.size());
+        for (size_t j = 0; j < res.size(); ++j) {
+          const long i = res[j];
+          hA[j] = e->Fbig + size_t(i) * D * ncol;
+          hB[j] = e->Kds + size_t(e->trep[size_t(i)]) * size_t(D) * size_t(D);
+          hC[j] = e->Ybig + size_t(i) * D * ncol;
+        }
+        h2d(e->pA, hA.data(), res.size(), "ue pA"); h2d(e->pB, hB.data(), res.size(), "ue pB"); h2d(e->pC, hC.data(), res.size(), "ue pC");
+        cub_check(cublasZgemmBatched(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(ncol), int(D), int(D), &e->scale, (const cd **)e->pA, int(ncol),
+                                     (const cd **)e->pB, int(D), &zero, e->pC, int(ncol), int(res.size())), "ue fused rung");
+      }
+      for (long r = e->nres; r < e->c.ndist; ++r) {
+        const double tb = wnow();
+        cd *K = e->Kscr;
+        kb_build_tables(e, &r, &K, 1, one);
+        cu_check(cudaDeviceSynchronize(), "ue rebuild");
+        e->t_rebuild += wnow() - tb;
+        ++e->nrebuild;
+        for (long i = 0; i < nt; ++i)
+          if (e->trep[size_t(i)] == r)
+            cub_check(cublasZgemm(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(ncol), int(D), int(D), &e->scale, e->Fbig + size_t(i) * D * ncol,
+                                  int(ncol), K, int(D), &zero, e->Ybig + size_t(i) * D * ncol, int(ncol)), "ue fused rung (rebuilt)");
+      }
+      cu_check(cudaDeviceSynchronize(), "ue rung");
+      tim[2] += wnow() - t0;
+      // the refit per (input, family), then the constant parts
+      for (long x = 0; x < nin; ++x) {
+        double fe = 0.0;
+        for (long fam = 0; fam < nfam; ++fam) {
+          t0 = wnow();
+          unpack_cols_kernel<<<grid_for(nt * W), 256>>>(nt, D, nR, ncol, (x * nfam + fam) * nR, e->Ybig, e->Ys);
+          launch_check("ue unpack");
+          cub_check(cublasZgemm(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(W), int(nk_), int(nt), &one, e->Ys, int(W), e->Ut, int(nt), &zero,
+                                e->g, int(W)), "ue g");
+          const long npf = e->c.np_fit;
+          cub_check(cublasZgemm(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(W), int(npf), int(nk_), &one, e->g, int(W), e->Vs, int(nk_), &zero,
+                                e->coef, int(W)), "ue coef");
+          cub_check(cublasZgemm(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(W), int(nt), int(npf), &one, e->coef, int(W), e->Kmat, int(npf), &zero,
+                                e->rec, int(W)), "ue rec");
+          cu_check(cudaMemsetAsync(e->red, 0, 2 * sizeof(unsigned long long), 0), "ue red");
+          maxdiff_kernel<<<grid_red(nt * W), 256>>>(nt * W, e->Ys, e->rec, e->red);
+          launch_check("ue maxdiff");
+          unsigned long long rr[2] = {0, 0};
+          cu_check(cudaMemcpy(rr, e->red, sizeof(rr), cudaMemcpyDeviceToHost), "ue red d2h");
+          double num = 0.0, den = 0.0;
+          std::memcpy(&num, &rr[0], sizeof(double)); std::memcpy(&den, &rr[1], sizeof(double));
+          fe = std::max(fe, (den > 0.0) ? num / den : num);
+          cu_check(cudaMemcpy(yfam[x] + size_t(fam) * np * W, e->coef, size_t(e->c.np_fit) * W * sizeof(cd), cudaMemcpyDeviceToDevice),
+                   "ue scatter");
+          cu_check(cudaDeviceSynchronize(), "ue refit");
+          tim[3] += wnow() - t0;
+        }
+        fe_out[x] = fe;
+        t0 = wnow();
+        cub_check(cublasZgemm(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(nR), int(D), int(D), &mscale, Gs[x], int(nR), e->Kd0, int(D), &zero,
+                              ycst[x], int(nR)), "ue y.cst");
+        cu_check(cudaDeviceSynchronize(), "ue kd0");
+        tim[2] += wnow() - t0;
+      }
+    }
+
     double ue_kd(unit_engine *e, long nR, cd const *Gfam, cd const *Gs, cd *yfam, cd *ycst, double *tim) {
       const long D = e->D, np = e->c.np, nt = e->c.nt, nk_ = e->c.n_kept, W = D * nR;
       const cd one = make_cuDoubleComplex(1.0, 0.0), zero = make_cuDoubleComplex(0.0, 0.0);
@@ -1843,6 +1965,57 @@ namespace methods::solvers::dynbse_cuda {
     h2d_c(e->Dblk, Dblkh, size_t(W), "ue Dblk");
     e->cbd_ok = false;
     tim[5] += wnow() - t0;
+    if (e->fuse) {
+      // THE FUSED FLOW (larger spaces): ls_apply(D) first, then ONE rung pass for the one-bare-rung input (F, Fsum of L0 D)
+      // and the Gamma_1 input (Gamma, Gsum) -- the same operations as below, in another order (the one-rung input and its
+      // second L0 only read / write scratch the Gamma_1 path does not use until after the rung)
+      ue_l0(e, nR, nullptr, e->Dblk, e->Ffam, e->Fsum, &tim[0]);
+      e->r1_ok = want_r1;
+      ue_ts(e, nR, e->Fsum, &tim[1]);
+      ue_l0(e, nR, nullptr, e->csb, e->F2fam, e->F2sum, &tim[0]);
+      t0 = wnow();
+      add2_kernel<<<grid_for(2 * np * W), 256>>>(2 * np * W, e->Ffam, e->F2fam, e->Gfam);
+      add2_kernel<<<grid_for(W), 256>>>(W, e->Fsum, e->cbb, e->Gsum);
+      launch_check("ue gamma");
+      cu_check(cudaDeviceSynchronize(), "ue gamma");
+      cu_check(cudaMemcpy(e->Gs0, e->Gsum, size_t(W) * sizeof(cd), cudaMemcpyDeviceToDevice), "ue Gs0");
+      tim[4] += wnow() - t0; t0 = wnow();
+      if (Gsum0h != nullptr) cu_check(cudaMemcpy(Gsum0h, e->Gsum, size_t(W) * sizeof(cd), cudaMemcpyDeviceToHost), "ue Gsum0");
+      tim[6] += wnow() - t0;
+      cd const *gin[2]; cd const *sin[2]; cd *yo[2]; cd *co[2];
+      long nin = 0;
+      if (want_r1) { gin[nin] = e->Ffam; sin[nin] = e->Fsum; yo[nin] = e->yfam1; co[nin] = e->ycst1; ++nin; }
+      const long ig = nin;
+      gin[nin] = e->Gfam; sin[nin] = e->Gsum; yo[nin] = e->yfam; co[nin] = e->ycst; ++nin;
+      double fes[2] = {0.0, 0.0};
+      ue_kd_multi(e, nR, nin, gin, sin, yo, co, fes, tim);
+      if (want_r1) {                                      // Gsum_r1 = Fsum[L0(y_r1; D + y_r1.cst)]
+        t0 = wnow();
+        add2_kernel<<<grid_for(W), 256>>>(W, e->Dblk, e->ycst1, e->Xcst);
+        launch_check("ue r1 X.cst");
+        cu_check(cudaDeviceSynchronize(), "ue r1 xcst");
+        tim[4] += wnow() - t0;
+        ue_l0(e, nR, e->yfam1, e->Xcst, e->F2fam, e->F2sum, &tim[0]);
+        cu_check(cudaMemcpy(e->Gr1, e->F2sum, size_t(W) * sizeof(cd), cudaMemcpyDeviceToDevice), "ue Gr1");
+      }
+      t0 = wnow();
+      add2_kernel<<<grid_for(W), 256>>>(W, e->Dblk, e->ycst, e->Xcst);
+      launch_check("ue X.cst");
+      cu_check(cudaDeviceSynchronize(), "ue xcst");
+      tim[4] += wnow() - t0;
+      ue_l0(e, nR, e->yfam, e->Xcst, e->Ffam, e->Fsum, &tim[0]);
+      ue_ts(e, nR, e->Fsum, &tim[1]);
+      t0 = wnow();
+      add2_kernel<<<grid_for(W), 256>>>(W, e->Fsum, e->cbb, e->Gsum);
+      launch_check("ue gsum1");
+      cu_check(cudaDeviceSynchronize(), "ue gsum1");
+      tim[4] += wnow() - t0; t0 = wnow();
+      if (Gsum1h != nullptr) cu_check(cudaMemcpy(Gsum1h, e->Gsum, size_t(W) * sizeof(cd), cudaMemcpyDeviceToHost), "ue Gsum1");
+      if (y1famh != nullptr) cu_check(cudaMemcpy(y1famh, e->yfam, size_t(2 * np) * W * sizeof(cd), cudaMemcpyDeviceToHost), "ue y1 fam");
+      if (y1csth != nullptr) cu_check(cudaMemcpy(y1csth, e->ycst, size_t(W) * sizeof(cd), cudaMemcpyDeviceToHost), "ue y1 cst");
+      tim[6] += wnow() - t0;
+      return fes[ig];
+    }
     // ---- ls_apply(D, y = 0): F = L0 D, c = T_s Fsum, Gamma = F + L0 c, Gsum = Fsum + Cb c
     ue_l0(e, nR, nullptr, e->Dblk, e->Ffam, e->Fsum, &tim[0]);
     e->r1_ok = want_r1;
