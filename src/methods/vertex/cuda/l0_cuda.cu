@@ -33,6 +33,7 @@
 #include <cuda_runtime.h>
 #include "IO/AppAbort.hpp"
 #include "methods/vertex/cuda/l0_cuda.cuh"
+#include "methods/vertex/cuda/rung_cuda.cuh"
 
 namespace methods::solvers::dynbse_cuda {
 
@@ -1484,15 +1485,19 @@ namespace methods::solvers::dynbse_cuda {
     // the fused rung pass: the one-bare-rung y, and the packed (tau, D, inputs x families x nR) rung buffers
     bool fuse = false;
     cd *yfam1 = nullptr, *ycst1 = nullptr, *Fbig = nullptr, *Ybig = nullptr;
+    // stream mode (R1(b)): the rung through the caller's streaming engine; slot i = tau node i, slot nt = W_d0
+    bool stream = false;
+    rung_stream *rs = nullptr;
   };
 
   double ue_bytes(ue_config const &c) {
     const double D = double(c.nk * c.nc * c.nc), W = D * double(c.nR_max), np = double(c.np);
     const double fam = 2.0 * np * W, cst = W;
-    const long nres = (c.nres < 0 or c.nres >= c.ndist) ? c.ndist : c.nres;
-    const bool partial = (nres < c.ndist);
+    const long nres = c.stream ? 0 : ((c.nres < 0 or c.nres >= c.ndist) ? c.ndist : c.nres);
+    const bool partial = (not c.stream and nres < c.ndist);
     double b = 0.0;
-    b += (3.0 + double(nres) + (partial ? 1.0 : 0.0)) * D * D;             // K_s, K_d0, M, the resident K_d(s_r) [+ the scratch]
+    if (c.stream) b += 2.0 * D * D;                                        // K_s, M (the rung streams: no K_d on the device)
+    else b += (3.0 + double(nres) + (partial ? 1.0 : 0.0)) * D * D;        // K_s, K_d0, M, the resident K_d(s_r) [+ the scratch]
     if (partial and not c.rung_fuse) b += 2.0 * double(c.nt) * W;         // Fs2, Ys2 (ue_kd_partial)
     if (c.rung_fuse) b += fam + cst + 2.0 * 4.0 * double(c.nt) * W;         // yfam1, ycst1, Fbig, Ybig (2 inputs x 2 families)
     b += 3.0 * fam + 10.0 * cst + D * double(c.nR_max);                     // Ffam, F2fam, Gfam, yfam + csts + Y + Gs0 / Gr1 / CbD / Vr
@@ -1518,14 +1523,15 @@ namespace methods::solvers::dynbse_cuda {
       if (c_in.rung_fuse) cand.push_back({n, 1});
       cand.push_back({n, 0});
     };
-    if (c_in.nres >= 0) add(std::min(c_in.nres, c_in.ndist));
+    if (c_in.stream) cand.push_back({0l, 0});           // stream mode: no rung residency, no fused pass
+    else if (c_in.nres >= 0) add(std::min(c_in.nres, c_in.ndist));
     else {
       add(c_in.ndist);
       if (c_in.partial_ok) for (long n = c_in.ndist - 1; n >= 0; --n) add(n);
     }
     bool found = false;
     for (auto const &[n, f] : cand) {
-      if (n < c_in.ndist and not c_in.partial_ok) continue;
+      if (not c_in.stream and n < c_in.ndist and not c_in.partial_ok) continue;
       c.nres = n; c.rung_fuse = f;
       if (ue_bytes(c) <= avail) { found = true; break; }
     }
@@ -1538,6 +1544,8 @@ namespace methods::solvers::dynbse_cuda {
     }
     auto *e = new unit_engine;
     e->c = c;
+    e->stream = (c.stream != 0);
+    if (e->stream) { c.ndist = 0; c.nres = 0; c.rung_fuse = 0; e->c = c; }
     e->nres = c.nres;
     e->fuse = (c.rung_fuse != 0);
     e->nc2 = c.nc * c.nc;
@@ -1548,8 +1556,8 @@ namespace methods::solvers::dynbse_cuda {
     e->KF = dalloc<cd>(nt * np, "ue KF"); e->KF2 = dalloc<cd>(nt * np, "ue KF2");
     e->Ut = dalloc<cd>(size_t(c.n_kept) * nt, "ue Ut"); e->Vs = dalloc<cd>(size_t(c.np_fit) * size_t(c.n_kept), "ue Vs");
     e->Kmat = dalloc<cd>(nt * size_t(c.np_fit), "ue Kc");
-    e->Ks = dalloc<cd>(D * D, "ue Ks"); e->Kd0 = dalloc<cd>(D * D, "ue Kd0");
-    e->Kds = dalloc<cd>(size_t(std::max(e->nres, 1l)) * D * D, "ue Kds");
+    e->Ks = dalloc<cd>(D * D, "ue Ks"); e->Kd0 = dalloc<cd>(e->stream ? 1 : D * D, "ue Kd0");
+    e->Kds = dalloc<cd>(e->stream ? 1 : size_t(std::max(e->nres, 1l)) * D * D, "ue Kds");
     if (e->nres < c.ndist) {
       e->Kscr = dalloc<cd>(D * D, "ue K scratch");
       if (not e->fuse) { e->Fs2 = dalloc<cd>(nt * W, "ue Fs2"); e->Ys2 = dalloc<cd>(nt * W, "ue Ys2"); }
@@ -1616,12 +1624,19 @@ namespace methods::solvers::dynbse_cuda {
   long ue_nres(unit_engine const *e) { return e->nres; }
   bool ue_rung_fused(unit_engine const *e) { return e->fuse; }
   void ue_rebuild_stats(unit_engine const *e, long *n, double *seconds) { *n = e->nrebuild; *seconds = e->t_rebuild; }
+  void ue_set_stream(unit_engine *e, rung_stream *rs) {
+    if (not e->stream) APP_ABORT(std::string(" ue_set_stream: the engine was not created in stream mode."));
+    e->rs = rs;
+  }
 
   void ue_set_rung(unit_engine *e, cplx const *Ksh, cplx const *Kdsh, cplx const *Kd0h, long const *treph, cplx scale_k) {
     if (e->nres < e->c.ndist) APP_ABORT(std::string(" ue_set_rung: a partially resident engine needs the device rung builds."));
     const size_t D = size_t(e->D);
-    h2d_c(e->Ks, Ksh, D * D, "ue Ks"); h2d_c(e->Kd0, Kd0h, D * D, "ue Kd0");
-    h2d_c(e->Kds, Kdsh, size_t(e->c.ndist) * D * D, "ue Kds");
+    h2d_c(e->Ks, Ksh, D * D, "ue Ks");
+    if (not e->stream) {                                     // stream mode: Kds / Kd0 are the caller's empty arrays
+      h2d_c(e->Kd0, Kd0h, D * D, "ue Kd0");
+      h2d_c(e->Kds, Kdsh, size_t(e->c.ndist) * D * D, "ue Kds");
+    }
     e->trep.assign(treph, treph + e->c.nt);
     e->scale = make_cuDoubleComplex(scale_k.real(), scale_k.imag());
     e->unit_ok = false;
@@ -1892,12 +1907,19 @@ namespace methods::solvers::dynbse_cuda {
         std::vector<cd *> hA(static_cast<size_t>(nt)), hB(static_cast<size_t>(nt)), hC(static_cast<size_t>(nt));
         for (long i = 0; i < nt; ++i) {
           hA[size_t(i)] = e->Fs + size_t(i) * W;
-          hB[size_t(i)] = e->Kds + size_t(e->trep[size_t(i)]) * size_t(D) * size_t(D);
+          hB[size_t(i)] = e->stream ? nullptr : e->Kds + size_t(e->trep[size_t(i)]) * size_t(D) * size_t(D);
           hC[size_t(i)] = e->Ys + size_t(i) * W;
         }
+        if (e->stream) {
+          // R1(b): Ys_i (D, nR) = scale K[W_d(s_i)] Fs_i through the streaming rung (slot i = tau node i)
+          if (e->rs == nullptr) APP_ABORT(std::string(" ue_kd: stream mode without a rung_stream (ue_set_stream)."));
+          for (long i = 0; i < nt; ++i)
+            rs_apply_dev(e->rs, i, cplx(e->scale.x, e->scale.y), e->Fs + size_t(i) * W, e->Ys + size_t(i) * W, nR, nullptr);
+        } else {
         h2d(e->pA, hA.data(), size_t(nt), "ue pA"); h2d(e->pB, hB.data(), size_t(nt), "ue pB"); h2d(e->pC, hC.data(), size_t(nt), "ue pC");
         cub_check(cublasZgemmBatched(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(nR), int(D), int(D), &e->scale, (const cd **)e->pA, int(nR),
                                      (const cd **)e->pB, int(D), &zero, e->pC, int(nR), int(nt)), "ue rung");
+        }
         cu_check(cudaDeviceSynchronize(), "ue rung");
         tim[2] += wnow() - t0; t0 = wnow();
         // the refit: g^T = Ys^T Ut^T, c^T = g^T Vs^T, rec^T = c^T Kmat^T; err = max|Ys - rec| / max|Ys|
@@ -1923,6 +1945,9 @@ namespace methods::solvers::dynbse_cuda {
       }
       // the constant part: y.cst = -scale K_d(0) Gsum
       const double t0 = wnow();
+      if (e->stream)
+        rs_apply_dev(e->rs, nt, cplx(mscale.x, mscale.y), Gs, ycst, nR, nullptr);   // slot nt = W_d0
+      else
       cub_check(cublasZgemm(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(nR), int(D), int(D), &mscale, Gs, int(nR), e->Kd0, int(D), &zero,
                             ycst, int(nR)), "ue y.cst");
       cu_check(cudaDeviceSynchronize(), "ue kd0");
@@ -2490,6 +2515,7 @@ namespace methods::solvers::dynbse_cuda {
     // K_s, K_d0 and the RESIDENT K_d(s_r) (the others are rebuilt per rung application, ue_kd)
     std::vector<long> ts = {-2, -1};
     std::vector<cd *> Kts = {e->Ks, e->Kd0};
+    if (e->stream) { ts.pop_back(); Kts.pop_back(); }        // stream mode: K_s only (the rung streams)
     for (long r = 0; r < e->nres; ++r) { ts.push_back(r); Kts.push_back(e->Kds + size_t(r) * size_t(D) * size_t(D)); }
     kb_build_tables(e, ts.data(), Kts.data(), long(ts.size()), sk);
     // the Sigma hook's |K_s - K_s^dag| meter

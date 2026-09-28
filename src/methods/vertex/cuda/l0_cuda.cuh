@@ -142,7 +142,12 @@ namespace methods::solvers::dynbse_cuda {
     // 1: one rung pass per RHS block for the one-bare-rung input and the Gamma_1 input, both frequency families packed side
     // by side (every K_d(s_r) read once per block, each non-resident one rebuilt once); dropped when its buffers would cost residency
     int rung_fuse = 1;
+    // R1(b) (2026-09-28): the STREAMING THC rung (rung_cuda.cu) instead of the dense tau rungs -- no K_d(s) / K_d0 on the
+    // device (ndist = 0, no partial residency, no fused pass); the rung and the constant part run through the rung_stream
+    // handed over by ue_set_stream (its transformed tables resident). K_s and the LU of M stay dense (T_s).
+    int stream = 0;
   };
+  struct rung_stream;
 
   /** nullptr when the device cannot hold the working set (the caller keeps the host path); `why` then says what failed */
   unit_engine *ue_create(ue_config const &c, double free_bytes, char *why, long why_len);
@@ -154,6 +159,8 @@ namespace methods::solvers::dynbse_cuda {
   /** whether the engine runs the fused rung pass (ue_config::rung_fuse, kept when it fit the budget) */
   bool ue_rung_fused(unit_engine const *e);
   void ue_rebuild_stats(unit_engine const *e, long *n, double *seconds);
+  /** stream mode: the streaming rung the engine applies (owned by the caller; its (s, q) legs set by the caller, rs_set_sq) */
+  void ue_set_stream(unit_engine *e, rung_stream *rs);
 
   /** run-wide: KF, KF2 (nt, np) real; the basis' DLR refit (imag_axes_ft::dlr_pole_fit at its fixed rank, the np_fit DLR
    *  nodes): Ut (n_kept, nt) = its first n_kept rows, Vs (np_fit, n_kept) = its first n_kept columns (compacted), Kc (nt, np_fit) */

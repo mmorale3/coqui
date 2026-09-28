@@ -301,29 +301,28 @@ namespace methods::solvers::dynbse_cuda {
     }
   }
 
-  void rs_apply(rung_stream *e, long slot, cplx scale, cplx const *F, cplx *out, long nR, double *timing) {
+  namespace {
+    // the rung on device buffers F (nk, nc^2, nR) -> out (nk, nc^2, nR); tt (3) ADDED: legs in, FFT + product, legs out
+    void rs_apply_core(rung_stream *e, long slot, cplx scale, cd const *Fd, cd *outd, long nR, double *tt) {
     auto const &c = e->c;
     if (slot < 0 || slot >= e->ntab) APP_ABORT(" rung_cuda: rs_apply slot out of range.");
     cd const *Ah = e->Ah + slot * c.nk * c.Nm * c.Nm;
     if (nR > e->nR_max) APP_ABORT(" rung_cuda: rs_apply block wider than the engine's nR_max.");
     if (e->is_cur < 0) APP_ABORT(" rung_cuda: rs_apply before rs_set_sq.");
     const long nk = c.nk, Nm = c.Nm, nc = c.nc, nb = e->nb, M = Nm * nb * Nm;
-    const long nio = nk * nc * nc * nR;
-    double t = now(), tt[4] = {0.0, 0.0, 0.0, 0.0};
-    auto lap = [&](int slot) {
-      if (!timing) return;
+    double t = now();
+    auto lap = [&](int k) {
+      if (!tt) return;
       rs_cu(cudaDeviceSynchronize(), "apply sync");
       const double t1 = now();
-      tt[slot] += t1 - t;
+      tt[k] += t1 - t;
       t = t1;
     };
-    rs_cu(cudaMemcpy(e->F, F, size_t(nio) * sizeof(cd), cudaMemcpyHostToDevice), "F H2D");
-    lap(3);
     const cd sc = make_cuDoubleComplex(scale.real(), scale.imag());
     for (long n0 = 0; n0 < nR; n0 += nb) {
       const long nbl = std::min(nb, nR - n0);
       // ---- legs in: Y(R, (P n Q)) = sum_p3 [sum_p1' conj X(k, P, p1') F(k, p1' p3, n)] X(k+q, Q, p3) ---------------
-      packF_kernel<<<nblocks(nk * nc * nb * nc), TPB>>>(nk, nc, nb, nR, n0, nbl, e->F, e->kinv, e->Fk);
+      packF_kernel<<<nblocks(nk * nc * nb * nc), TPB>>>(nk, nc, nb, nR, n0, nbl, Fd, e->kinv, e->Fk);
       rs_cu(cudaGetLastError(), "packF_kernel");
       gemm_rm(e->cb, Nm, nb * nc, nc, e->XcL, Nm * nc, e->Fk, nc * nb * nc, e->A, Nm * nb * nc, nk, "legs in A");
       gemm_rm(e->cb, Nm * nb, Nm, nc, e->A, Nm * nb * nc, e->XkqT, nc * Nm, e->Y, M, nk, "legs in Y");
@@ -337,14 +336,29 @@ namespace methods::solvers::dynbse_cuda {
       // ---- legs out: B(p1, (n Q)) = X(k', ., p1)^T Z; O2((p1 n), p3') = B2 conj X(k'+q, ., p3') ----------------------
       gemm_rm(e->cb, nc, nb * Nm, Nm, e->XkT, nc * Nm, e->Y, M, e->B, nc * nb * Nm, nk, "legs out B");
       gemm_rm(e->cb, nc * nb, nc, Nm, e->B, nc * nb * Nm, e->XcqL, Nm * nc, e->O2, nc * nb * nc, nk, "legs out O2");
-      scatter_kernel<<<nblocks(nk * nc * nbl * nc), TPB>>>(nk, nc, nb, nR, n0, nbl, sc, e->O2, e->kinv, e->out);
+      scatter_kernel<<<nblocks(nk * nc * nbl * nc), TPB>>>(nk, nc, nb, nR, n0, nbl, sc, e->O2, e->kinv, outd);
       rs_cu(cudaGetLastError(), "scatter_kernel");
       lap(2);
     }
+    }
+  } // namespace
+
+  void rs_apply(rung_stream *e, long slot, cplx scale, cplx const *F, cplx *out, long nR, double *timing) {
+    auto const &c = e->c;
+    if (nR > e->nR_max) APP_ABORT(" rung_cuda: rs_apply block wider than the engine's nR_max.");
+    const long nio = c.nk * c.nc * c.nc * nR;
+    double t = now();
+    rs_cu(cudaMemcpy(e->F, F, size_t(nio) * sizeof(cd), cudaMemcpyHostToDevice), "F H2D");
+    double tio = now() - t;
+    rs_apply_core(e, slot, scale, e->F, e->out, nR, timing);
+    t = now();
     rs_cu(cudaMemcpy(out, e->out, size_t(nio) * sizeof(cd), cudaMemcpyDeviceToHost), "out D2H");
-    lap(3);
-    if (timing)
-      for (int i = 0; i < 4; ++i) timing[i] += tt[i];
+    tio += now() - t;
+    if (timing) timing[3] += tio;
+  }
+
+  void rs_apply_dev(rung_stream *e, long slot, cplx scale, void const *F_dev, void *out_dev, long nR, double *timing) {
+    rs_apply_core(e, slot, scale, static_cast<cd const *>(F_dev), static_cast<cd *>(out_dev), nR, timing);
   }
 
 } // namespace methods::solvers::dynbse_cuda

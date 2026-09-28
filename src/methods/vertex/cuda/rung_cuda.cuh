@@ -66,6 +66,8 @@ namespace methods::solvers::dynbse_cuda {
   /** out (nk, nc^2, nR) = scale K[W_slot] F (nk, nc^2, nR), both HOST row-major (out overwritten). timing (4) ADDED:
    *  [0] legs in, [1] FFT + product, [2] legs out + scatter, [3] H2D + D2H. */
   void rs_apply(rung_stream *e, long slot, cplx scale, cplx const *F, cplx *out, long nR, double *timing);
+  /** rs_apply on DEVICE pointers (the device-resident unit's tau buffers): same layouts, no transfers; timing slot [3] unused */
+  void rs_apply_dev(rung_stream *e, long slot, cplx scale, void const *F_dev, void *out_dev, long nR, double *timing);
 
 } // namespace methods::solvers::dynbse_cuda
 

@@ -1251,8 +1251,11 @@ namespace solvers {
       // Sigma deposits). Scope: the dense rung, the Gamma_1-only GMRES path, the unmasked basis, the batched L0; anything
       // else keeps the host path. vertex_debug dynbse_dev_unit = 0 disables it (the A/B).
       std::unique_ptr<dynbse_cuda::unit_engine, void (*)(dynbse_cuda::unit_engine *)> ue(nullptr, dynbse_cuda::ue_destroy);
+      // R1(b): the streaming rung inside the device-resident unit (dense_rung = false with the device streaming rung and its
+      // tables resident); vertex_debug dynbse_dev_stream_unit = 0 keeps the host-driven streaming path (the A/B)
+      const bool ue_stream = (not opt.dense_rung and rs and rs_res and vertex_debug::number("dynbse_dev_stream_unit", 1.0) != 0.0);
       const bool ue_want = db::l0_device_enabled() and vertex_debug::number("dynbse_dev_unit", 1.0) != 0.0 and   // vertex_debug: dynbse_dev_unit
-                           opt.dense_rung and opt.gmres_m > 0 and opt.gamma1_only and not opt.static_only and
+                           (opt.dense_rung or ue_stream) and opt.gmres_m > 0 and opt.gamma1_only and not opt.static_only and
                            not opt.one_rung_only and db::l0_cols_state() and not b.npf_mask and
                            not (opt.sigma != nullptr and opt.sigma->col == "dyn");
       bool ue_tried = false;
@@ -1376,6 +1379,8 @@ namespace solvers {
           const bool kb_want = (not sym and vertex_debug::number("dynbse_dev_kbig", 1.0) != 0.0);
           uc.nres = long(vertex_debug::number("dynbse_dev_nres", -1.0));   // vertex_debug: dynbse_dev_nres
           uc.rung_fuse = int(vertex_debug::number("dynbse_dev_rung_fuse", 1.0));   // vertex_debug: dynbse_dev_rung_fuse (the fused rung pass)
+          uc.stream = ue_stream ? 1 : 0;
+          if (ue_stream) { uc.rung_fuse = 0; uc.nres = 0; }
           uc.partial_ok = kb_want ? 1 : 0;
           {
             const double kb_need = 16.0 * (double(ns * nk * Nm * nc) + double(nq * Nm * Nm) * (2.0 + double(ndist)) +
@@ -1400,6 +1405,7 @@ namespace solvers {
             Utk() = pf.Ut(nda::range(0, pf.n_kept), all);
             Vsk() = pf.Vs(all, nda::range(0, pf.n_kept));
             dynbse_cuda::ue_set_basis(ue.get(), b.KF.data(), b.KF2.data(), Utk.data(), Vsk.data(), Kck.data());
+            if (ue_stream) dynbse_cuda::ue_set_stream(ue.get(), rs.get());
           }
           if (rank == 0) {
             dynbse_cuda::ue_config ucr = uc;
@@ -1407,9 +1413,9 @@ namespace solvers {
             const std::string resid = (ue and ucr.nres < ndist)
                 ? "; tau rungs resident " + std::to_string(ucr.nres) + " of " + std::to_string(ndist) +
                   ", the rest rebuilt on the device per application" : std::string();
-            app_log(1, "  [dynbse] device-resident unit: {} ({:.1f} GB estimated{}, {:.1f} GB reserved{}){}{}", ue ? "ON" : "OFF, the host path runs",
+            app_log(1, "  [dynbse] device-resident unit: {} ({:.1f} GB estimated{}, {:.1f} GB reserved{}{}){}{}", ue ? "ON" : "OFF, the host path runs",
                     dynbse_cuda::ue_bytes(ucr) / 1e9, resid, uc.reserve_bytes / 1e9,
-                    (ue and ucr.rung_fuse) ? "; fused rung pass" : "", ue ? "" : " -- ", ue ? "" : why);
+                    (ue and ucr.rung_fuse) ? "; fused rung pass" : "", ue_stream ? "; STREAMING rung" : "", ue ? "" : " -- ", ue ? "" : why);
           }
           // D-1b: the rungs built on the device (nosym meshes); vertex_debug dynbse_dev_kbig = 0 keeps the host builds (the A/B)
           if (ue and not sym and vertex_debug::number("dynbse_dev_kbig", 1.0) != 0.0) {   // vertex_debug: dynbse_dev_kbig
@@ -1519,6 +1525,7 @@ namespace solvers {
         last_sq = sq;
 #if defined(ENABLE_CUDA)
         if (ue) {
+          if (ue_stream and rs_sq != is * nq + iq) { dynbse_cuda::rs_set_sq(rs.get(), is, &kpq(iq, 0)); rs_sq = is * nq + iq; }
           if (not kb_dev) dynbse_cuda::ue_set_rung(ue.get(), Ks.data(), Kd_s.data(), Kd0.data(), trep.data(), scale_k);
           dynbse_cuda::ue_set_legs(ue.get(), Dc.data());
         }
