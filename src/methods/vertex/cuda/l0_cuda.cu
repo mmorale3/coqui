@@ -1431,6 +1431,8 @@ namespace methods::solvers::dynbse_cuda {
     std::vector<cd *> hA, hB, hC;
     std::vector<long> qx;
     std::vector<void *> allocs;
+    long is = 0;                                             // the transfer whose legs / kq are set (ue_kb_build)
+    long legs_ik0 = -1;                                      // the k chunk whose legs U1 / U2 hold (-1: none valid)
   };
 
   struct unit_engine {
@@ -1459,13 +1461,21 @@ namespace methods::solvers::dynbse_cuda {
     unsigned long long *red = nullptr;
     l0_plan *l0 = nullptr;
     std::vector<int> hflags;
+    // partial residency (larger spaces): K_d(s_r) resident for r < nres; r >= nres rebuilt into Kscr per rung application
+    long nres = 0;
+    cd *Kscr = nullptr, *Fs2 = nullptr, *Ys2 = nullptr;      // the rebuild scratch; the second family's rung buffers
+    long nrebuild = 0;
+    double t_rebuild = 0.0;
   };
 
   double ue_bytes(ue_config const &c) {
     const double D = double(c.nk * c.nc * c.nc), W = D * double(c.nR_max), np = double(c.np);
     const double fam = 2.0 * np * W, cst = W;
+    const long nres = (c.nres < 0 or c.nres >= c.ndist) ? c.ndist : c.nres;
+    const bool partial = (nres < c.ndist);
     double b = 0.0;
-    b += (3.0 + double(c.ndist)) * D * D;                                   // K_s, K_d0, M, K_d(s_r)
+    b += (3.0 + double(nres) + (partial ? 1.0 : 0.0)) * D * D;             // K_s, K_d0, M, the resident K_d(s_r) [+ the scratch]
+    if (partial) b += 2.0 * double(c.nt) * W;                              // Fs2, Ys2
     b += 3.0 * fam + 10.0 * cst + D * double(c.nR_max);                     // Ffam, F2fam, Gfam, yfam + csts + Y + Gs0 / Gr1 / CbD / Vr
     b += D * double(c.nout) + double(c.nout * c.nR_max);                    // the legs, the readout block
     b += fam;                                                               // yfam
@@ -1477,14 +1487,34 @@ namespace methods::solvers::dynbse_cuda {
     return b * 1.05 + 512.0e6;                                              // cuSOLVER / cuBLAS workspaces
   }
 
-  unit_engine *ue_create(ue_config const &c, double free_bytes, char *why, long why_len) {
-    const double need = ue_bytes(c);
-    if (need > 0.9 * free_bytes) {
-      std::snprintf(why, size_t(why_len), "needs %.1f GB of device memory, %.1f GB free", need / 1e9, free_bytes / 1e9);
+  unit_engine *ue_create(ue_config const &c_in, double free_bytes, char *why, long why_len) {
+    // the budget: 90 % of the free memory minus what the caller reserves (the rung-build tables, the Sigma accumulators);
+    // nres < 0 keeps every tau rung resident when that fits, else (partial_ok) the most that fit
+    ue_config c = c_in;
+    const double avail = 0.9 * free_bytes - std::max(0.0, c_in.reserve_bytes);
+    c.nres = (c_in.nres < 0) ? c_in.ndist : std::min(c_in.nres, c_in.ndist);
+    if (c.nres < c.ndist and not c_in.partial_ok) {
+      std::snprintf(why, size_t(why_len), "a partial rung residency (%ld of %ld) needs the device rung builds", c.nres, c.ndist);
       return nullptr;
+    }
+    if (ue_bytes(c) > avail) {
+      if (c_in.nres >= 0 or not c_in.partial_ok) {
+        std::snprintf(why, size_t(why_len), "needs %.1f GB of device memory, %.1f GB available (%.1f GB free, %.1f GB reserved)%s",
+                      ue_bytes(c) / 1e9, avail / 1e9, free_bytes / 1e9, c_in.reserve_bytes / 1e9,
+                      c_in.partial_ok ? "" : "; a partial rung residency needs the device rung builds");
+        return nullptr;
+      }
+      long n = c.ndist - 1;
+      for (; n >= 0; --n) { c.nres = n; if (ue_bytes(c) <= avail) break; }
+      if (n < 0) {
+        std::snprintf(why, size_t(why_len), "needs %.1f GB of device memory even with no tau rung resident, %.1f GB available",
+                      ue_bytes(c) / 1e9, avail / 1e9);
+        return nullptr;
+      }
     }
     auto *e = new unit_engine;
     e->c = c;
+    e->nres = c.nres;
     e->nc2 = c.nc * c.nc;
     e->D = c.nk * e->nc2;
     const size_t D = size_t(e->D), W = D * size_t(c.nR_max), np = size_t(c.np), nt = size_t(c.nt);
@@ -1494,7 +1524,11 @@ namespace methods::solvers::dynbse_cuda {
     e->Ut = dalloc<cd>(size_t(c.n_kept) * nt, "ue Ut"); e->Vs = dalloc<cd>(size_t(c.np_fit) * size_t(c.n_kept), "ue Vs");
     e->Kmat = dalloc<cd>(nt * size_t(c.np_fit), "ue Kc");
     e->Ks = dalloc<cd>(D * D, "ue Ks"); e->Kd0 = dalloc<cd>(D * D, "ue Kd0");
-    e->Kds = dalloc<cd>(size_t(c.ndist) * D * D, "ue Kds");
+    e->Kds = dalloc<cd>(size_t(std::max(e->nres, 1l)) * D * D, "ue Kds");
+    if (e->nres < c.ndist) {
+      e->Kscr = dalloc<cd>(D * D, "ue K scratch");
+      e->Fs2 = dalloc<cd>(nt * W, "ue Fs2"); e->Ys2 = dalloc<cd>(nt * W, "ue Ys2");
+    }
     e->Cbk = dalloc<cd>(size_t(c.nk) * e->nc2 * e->nc2, "ue Cbk"); e->M = dalloc<cd>(D * D, "ue M");
     e->ipiv = dalloc<int>(D, "ue ipiv"); e->dinfo = dalloc<int>(1, "ue info");
     if (cusolverDnZgetrf_bufferSize(e->cs, int(D), int(D), e->M, int(D), &e->lwork) != CUSOLVER_STATUS_SUCCESS)
@@ -1529,7 +1563,7 @@ namespace methods::solvers::dynbse_cuda {
                     (void *)e->yfam, (void *)e->ycst, (void *)e->Dblk, (void *)e->Y, (void *)e->csb, (void *)e->cbb, (void *)e->Fs,
                     (void *)e->Ys, (void *)e->g, (void *)e->coef, (void *)e->rec, (void *)e->pA, (void *)e->pB, (void *)e->pC,
                     (void *)e->flags, (void *)e->red, (void *)e->Gs0, (void *)e->Gr1, (void *)e->Dcj, (void *)e->CbD, (void *)e->Vr,
-                    (void *)e->Pr})
+                    (void *)e->Pr, (void *)e->Kscr, (void *)e->Fs2, (void *)e->Ys2})
       if (p) (void)cudaFree(p);
     for (void *p : e->sd.allocs)
       if (p) (void)cudaFree(p);
@@ -1549,7 +1583,11 @@ namespace methods::solvers::dynbse_cuda {
     h2d_c(e->Ut, Uth, nk_ * nt, "ue Ut"); h2d_c(e->Vs, Vsh, npf * nk_, "ue Vs"); h2d_c(e->Kmat, Kch, nt * npf, "ue Kc");
   }
 
+  long ue_nres(unit_engine const *e) { return e->nres; }
+  void ue_rebuild_stats(unit_engine const *e, long *n, double *seconds) { *n = e->nrebuild; *seconds = e->t_rebuild; }
+
   void ue_set_rung(unit_engine *e, cplx const *Ksh, cplx const *Kdsh, cplx const *Kd0h, long const *treph, cplx scale_k) {
+    if (e->nres < e->c.ndist) APP_ABORT(std::string(" ue_set_rung: a partially resident engine needs the device rung builds."));
     const size_t D = size_t(e->D);
     h2d_c(e->Ks, Ksh, D * D, "ue Ks"); h2d_c(e->Kd0, Kd0h, D * D, "ue Kd0");
     h2d_c(e->Kds, Kdsh, size_t(e->c.ndist) * D * D, "ue Kds");
@@ -1635,13 +1673,88 @@ namespace methods::solvers::dynbse_cuda {
     }
     // y = K_d(Gamma, Gsum): the families to tau (DLR), the dense rung per tau node, the refit, the constant part. Returns the
     // worst refit error (the host's max over families of max|Ys - rec| / max|Ys|).
+    void kb_build_tables(unit_engine *e, long const *ts, cd *const *Kts, long nts, cd sk);   // below, with the rung builds
+
+    // the partially resident rung (larger spaces): the tau-domain inputs of every family first, then the rung per
+    // representative -- the resident ones batched, each non-resident one rebuilt ONCE into the scratch and applied to both
+    // families -- then the refit per family. The same products as the resident path (one gemm per (family, tau node)).
+    double ue_kd_partial(unit_engine *e, long nR, cd const *Gfam, cd *yfam, double *tim) {
+      const long D = e->D, np = e->c.np, nt = e->c.nt, nk_ = e->c.n_kept, W = D * nR;
+      const cd one = make_cuDoubleComplex(1.0, 0.0), zero = make_cuDoubleComplex(0.0, 0.0);
+      const long nfam = e->nu0 ? 1 : 2;
+      cd *Fsf[2] = {e->Fs, e->Fs2}, *Ysf[2] = {e->Ys, e->Ys2};
+      double fe = 0.0, t0 = wnow();
+      for (long fam = 0; fam < nfam; ++fam)
+        for (long ff = fam; ff < (e->nu0 ? 2 : fam + 1); ++ff) {
+          const cd beta = (ff == fam) ? zero : one;
+          cd const *KFx = (ff == 1 and e->nu0) ? e->KF2 : e->KF;
+          cub_check(cublasZgemm(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(W), int(nt), int(np), &one, Gfam + size_t(ff) * np * W, int(W),
+                                KFx, int(np), &beta, Fsf[fam], int(W)), "ue Fs = KF fam");
+        }
+      cu_check(cudaDeviceSynchronize(), "ue dlr");
+      tim[7] += wnow() - t0; t0 = wnow();
+      std::vector<long> res;                              // the tau nodes whose representative is resident
+      for (long i = 0; i < nt; ++i) if (e->trep[size_t(i)] < e->nres) res.push_back(i);
+      for (long fam = 0; fam < nfam and not res.empty(); ++fam) {
+        std::vector<cd *> hA(res.size()), hB(res.size()), hC(res.size());
+        for (size_t j = 0; j < res.size(); ++j) {
+          const long i = res[j];
+          hA[j] = Fsf[fam] + size_t(i) * W;
+          hB[j] = e->Kds + size_t(e->trep[size_t(i)]) * size_t(D) * size_t(D);
+          hC[j] = Ysf[fam] + size_t(i) * W;
+        }
+        h2d(e->pA, hA.data(), res.size(), "ue pA"); h2d(e->pB, hB.data(), res.size(), "ue pB"); h2d(e->pC, hC.data(), res.size(), "ue pC");
+        cub_check(cublasZgemmBatched(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(nR), int(D), int(D), &e->scale, (const cd **)e->pA, int(nR),
+                                     (const cd **)e->pB, int(D), &zero, e->pC, int(nR), int(res.size())), "ue rung (resident)");
+      }
+      for (long r = e->nres; r < e->c.ndist; ++r) {
+        const double tb = wnow();
+        cd *K = e->Kscr;
+        kb_build_tables(e, &r, &K, 1, one);
+        cu_check(cudaDeviceSynchronize(), "ue rebuild");
+        e->t_rebuild += wnow() - tb;
+        ++e->nrebuild;
+        for (long i = 0; i < nt; ++i) {
+          if (e->trep[size_t(i)] != r) continue;
+          for (long fam = 0; fam < nfam; ++fam)
+            cub_check(cublasZgemm(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(nR), int(D), int(D), &e->scale, Fsf[fam] + size_t(i) * W, int(nR),
+                                  K, int(D), &zero, Ysf[fam] + size_t(i) * W, int(nR)), "ue rung (rebuilt)");
+        }
+      }
+      cu_check(cudaDeviceSynchronize(), "ue rung");
+      tim[2] += wnow() - t0;
+      for (long fam = 0; fam < nfam; ++fam) {
+        t0 = wnow();
+        cub_check(cublasZgemm(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(W), int(nk_), int(nt), &one, Ysf[fam], int(W), e->Ut, int(nt), &zero,
+                              e->g, int(W)), "ue g");
+        const long npf = e->c.np_fit;
+        cub_check(cublasZgemm(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(W), int(npf), int(nk_), &one, e->g, int(W), e->Vs, int(nk_), &zero,
+                              e->coef, int(W)), "ue coef");
+        cub_check(cublasZgemm(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(W), int(nt), int(npf), &one, e->coef, int(W), e->Kmat, int(npf), &zero,
+                              e->rec, int(W)), "ue rec");
+        cu_check(cudaMemsetAsync(e->red, 0, 2 * sizeof(unsigned long long), 0), "ue red");
+        maxdiff_kernel<<<grid_red(nt * W), 256>>>(nt * W, Ysf[fam], e->rec, e->red);
+        launch_check("ue maxdiff");
+        unsigned long long rr[2] = {0, 0};
+        cu_check(cudaMemcpy(rr, e->red, sizeof(rr), cudaMemcpyDeviceToHost), "ue red d2h");
+        double num = 0.0, den = 0.0;
+        std::memcpy(&num, &rr[0], sizeof(double)); std::memcpy(&den, &rr[1], sizeof(double));
+        fe = std::max(fe, (den > 0.0) ? num / den : num);
+        cu_check(cudaMemcpy(yfam + size_t(fam) * np * W, e->coef, size_t(e->c.np_fit) * W * sizeof(cd), cudaMemcpyDeviceToDevice), "ue scatter");
+        cu_check(cudaDeviceSynchronize(), "ue refit");
+        tim[3] += wnow() - t0;
+      }
+      return fe;
+    }
+
     double ue_kd(unit_engine *e, long nR, cd const *Gfam, cd const *Gs, cd *yfam, cd *ycst, double *tim) {
       const long D = e->D, np = e->c.np, nt = e->c.nt, nk_ = e->c.n_kept, W = D * nR;
       const cd one = make_cuDoubleComplex(1.0, 0.0), zero = make_cuDoubleComplex(0.0, 0.0);
       const cd mscale = make_cuDoubleComplex(-e->scale.x, -e->scale.y);
       double fe = 0.0;
       cu_check(cudaMemsetAsync(yfam, 0, size_t(2 * np) * W * sizeof(cd), 0), "ue memset y");
-      const long nfam = e->nu0 ? 1 : 2;
+      const long nfam = (e->nres < e->c.ndist) ? 0 : (e->nu0 ? 1 : 2);   // the partial path below replaces the family loop
+      if (e->nres < e->c.ndist) fe = ue_kd_partial(e, nR, Gfam, yfam, tim);
       for (long fam = 0; fam < nfam; ++fam) {
         double t0 = wnow();
         // Fs^T (W x nt) = fam^T (W x np) . KF^T (np x nt)   [+ fam1 . KF2 at nu = 0]
@@ -2152,41 +2265,60 @@ namespace methods::solvers::dynbse_cuda {
     return true;
   }
 
+  namespace {
+    // the rung tables ts (-2: K_s (x sk), -1: K_d0, r >= 0: K_d(s_r)) of the transfer set by ue_kb_build, into Kts
+    void kb_build_tables(unit_engine *e, long const *ts, cd *const *Kts, long nts, cd sk) {
+      auto &k = e->kb;
+      const long nk = e->c.nk, nc = e->c.nc, nc2 = e->nc2, Nm = k.Nm;
+      const cd one = make_cuDoubleComplex(1.0, 0.0), zero = make_cuDoubleComplex(0.0, 0.0);
+      cd const *Xs = k.X + size_t(k.is) * nk * Nm * nc;
+      for (long ik0 = 0; ik0 < nk; ik0 += k.KC) {
+        const long nki = std::min(k.KC, nk - ik0), nb = nki * nk;
+        if (k.legs_ik0 != ik0) {                           // the legs of this k chunk (kept while one chunk covers the mesh)
+          kb_legs_kernel<<<grid_for(nb * Nm * nc2), 256>>>(ik0, nki, nk, Nm, nc, Xs, k.kq, k.U1, k.U2);
+          launch_check("kb legs");
+          k.legs_ik0 = ik0;
+        }
+        // the W tables of this transfer: W0 -> K_s (x scale_k), Wd0 -> K_d0, Wd(rep r) -> K_d(r)
+        for (long it = 0; it < nts; ++it) {
+          const long t = ts[it];
+          cd const *Wt = (t == -2) ? k.W0 : ((t == -1) ? k.Wd0 : k.Wds + size_t(t) * k.nq * Nm * Nm);
+          cd *Kt = Kts[it];
+          for (long b = 0; b < nb; ++b) {
+            const long ik = ik0 + b / nk, ikp = b % nk;
+            k.hA[size_t(b)] = k.U2 + size_t(b) * Nm * nc2;
+            k.hB[size_t(b)] = const_cast<cd *>(Wt) + size_t(k.qx[size_t(ik * nk + ikp)]) * Nm * Nm;
+            k.hC[size_t(b)] = k.WU2 + size_t(b) * Nm * nc2;
+          }
+          h2d(k.pA, k.hA.data(), size_t(nb), "kb pA"); h2d(k.pB, k.hB.data(), size_t(nb), "kb pB"); h2d(k.pC, k.hC.data(), size_t(nb), "kb pC");
+          // WU2 = W(qx) U2: column-major (nc2 x Nm) = U2^T-view (nc2 x Nm) . W^T-view (Nm x Nm)
+          cub_check(cublasZgemmBatched(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(nc2), int(Nm), int(Nm), &one, (const cd **)k.pA, int(nc2),
+                                       (const cd **)k.pB, int(Nm), &zero, k.pC, int(nc2), int(nb)), "kb W U2");
+          // wb = U1^T WU2: column-major (nc2 x nc2) = WU2-view (nc2 x Nm) . U1-view^T (Nm x nc2)
+          cub_check(cublasZgemmStridedBatched(e->cb, CUBLAS_OP_N, CUBLAS_OP_T, int(nc2), int(nc2), int(Nm), &one, k.WU2, int(nc2),
+                                              (long long)(Nm * nc2), k.U1, int(nc2), (long long)(Nm * nc2), &zero, k.wb, int(nc2),
+                                              (long long)(nc2 * nc2), int(nb)), "kb U1^T W U2");
+          kb_scatter_kernel<<<grid_for(nb * nc2 * nc2), 256>>>(ik0, nki, nk, nc, (t == -2) ? sk : one, k.wb, Kt);
+          launch_check("kb scatter");
+        }
+      }
+    }
+  } // namespace
+
   void ue_kb_build(unit_engine *e, long is, long const *kpq_row, long const *trep, cplx scale_k, double *herm, double *timing) {
     auto &k = e->kb;
     if (not k.on) APP_ABORT(std::string(" ue_kb_build: the rung builds were not initialized."));
     const double t0 = wnow();
-    const long nk = e->c.nk, nc = e->c.nc, nc2 = e->nc2, Nm = k.Nm, D = e->D;
-    const cd one = make_cuDoubleComplex(1.0, 0.0), zero = make_cuDoubleComplex(0.0, 0.0);
+    const long nk = e->c.nk, D = e->D;
     h2d(k.kq, kpq_row, size_t(nk), "kb kq");
-    cd const *Xs = k.X + size_t(is) * nk * Nm * nc;
+    k.is = is;
+    k.legs_ik0 = -1;
     const cd sk = make_cuDoubleComplex(scale_k.real(), scale_k.imag());
-    for (long ik0 = 0; ik0 < nk; ik0 += k.KC) {
-      const long nki = std::min(k.KC, nk - ik0), nb = nki * nk;
-      kb_legs_kernel<<<grid_for(nb * Nm * nc2), 256>>>(ik0, nki, nk, Nm, nc, Xs, k.kq, k.U1, k.U2);
-      launch_check("kb legs");
-      // the W tables of this transfer: W0 -> K_s (x scale_k), Wd0 -> K_d0, Wd(rep r) -> K_d(r)
-      for (long t = -2; t < k.nrep; ++t) {
-        cd const *Wt = (t == -2) ? k.W0 : ((t == -1) ? k.Wd0 : k.Wds + size_t(t) * k.nq * Nm * Nm);
-        cd *Kt = (t == -2) ? e->Ks : ((t == -1) ? e->Kd0 : e->Kds + size_t(t) * D * D);
-        for (long b = 0; b < nb; ++b) {
-          const long ik = ik0 + b / nk, ikp = b % nk;
-          k.hA[size_t(b)] = k.U2 + size_t(b) * Nm * nc2;
-          k.hB[size_t(b)] = const_cast<cd *>(Wt) + size_t(k.qx[size_t(ik * nk + ikp)]) * Nm * Nm;
-          k.hC[size_t(b)] = k.WU2 + size_t(b) * Nm * nc2;
-        }
-        h2d(k.pA, k.hA.data(), size_t(nb), "kb pA"); h2d(k.pB, k.hB.data(), size_t(nb), "kb pB"); h2d(k.pC, k.hC.data(), size_t(nb), "kb pC");
-        // WU2 = W(qx) U2: column-major (nc2 x Nm) = U2^T-view (nc2 x Nm) . W^T-view (Nm x Nm)
-        cub_check(cublasZgemmBatched(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(nc2), int(Nm), int(Nm), &one, (const cd **)k.pA, int(nc2),
-                                     (const cd **)k.pB, int(Nm), &zero, k.pC, int(nc2), int(nb)), "kb W U2");
-        // wb = U1^T WU2: column-major (nc2 x nc2) = WU2-view (nc2 x Nm) . U1-view^T (Nm x nc2)
-        cub_check(cublasZgemmStridedBatched(e->cb, CUBLAS_OP_N, CUBLAS_OP_T, int(nc2), int(nc2), int(Nm), &one, k.WU2, int(nc2),
-                                            (long long)(Nm * nc2), k.U1, int(nc2), (long long)(Nm * nc2), &zero, k.wb, int(nc2),
-                                            (long long)(nc2 * nc2), int(nb)), "kb U1^T W U2");
-        kb_scatter_kernel<<<grid_for(nb * nc2 * nc2), 256>>>(ik0, nki, nk, nc, (t == -2) ? sk : one, k.wb, Kt);
-        launch_check("kb scatter");
-      }
-    }
+    // K_s, K_d0 and the RESIDENT K_d(s_r) (the others are rebuilt per rung application, ue_kd)
+    std::vector<long> ts = {-2, -1};
+    std::vector<cd *> Kts = {e->Ks, e->Kd0};
+    for (long r = 0; r < e->nres; ++r) { ts.push_back(r); Kts.push_back(e->Kds + size_t(r) * size_t(D) * size_t(D)); }
+    kb_build_tables(e, ts.data(), Kts.data(), long(ts.size()), sk);
     // the Sigma hook's |K_s - K_s^dag| meter
     cu_check(cudaMemsetAsync(e->red, 0, 2 * sizeof(unsigned long long), 0), "kb red");
     herm_kernel<<<grid_red(D * D), 256>>>(D, e->Ks, e->red);

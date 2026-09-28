@@ -133,13 +133,22 @@ namespace methods::solvers::dynbse_cuda {
     long nout = 0;                  // the external-leg / readout dimension (aux N_m, or the Wannier pair count)
     int l0_fused = 2, l0_asm_gemm = 1;   // the resident L0 plan's kernels (l0_tables::fused / asm_gemm)
     int l0_fz_cfg = 44, l0_fz_bench = 0; // l0_tables::fz_cfg / fz_bench
+    // larger spaces (2026-09-27): the dense tau rungs K_d(s_r) resident on the device, nres of ndist (-1 = the most that fit
+    // the budget); the others are rebuilt from the W tables for every rung application (needs the device rung builds,
+    // partial_ok = 1). reserve_bytes = device memory the engine must leave free (the rung-build tables, the Sigma accumulators).
+    long nres = -1;
+    int partial_ok = 0;
+    double reserve_bytes = 0.0;
   };
 
   /** nullptr when the device cannot hold the working set (the caller keeps the host path); `why` then says what failed */
   unit_engine *ue_create(ue_config const &c, double free_bytes, char *why, long why_len);
   void ue_destroy(unit_engine *e);
-  /** bytes the engine needs for a configuration (the caller's feasibility check) */
+  /** bytes the engine needs for a configuration (the caller's feasibility check; nres < 0 counts every rung resident) */
   double ue_bytes(ue_config const &c);
+  /** the resident tau rungs of an engine (== ndist: all), and the non-resident rebuilds so far (count, wall seconds) */
+  long ue_nres(unit_engine const *e);
+  void ue_rebuild_stats(unit_engine const *e, long *n, double *seconds);
 
   /** run-wide: KF, KF2 (nt, np) real; the basis' DLR refit (imag_axes_ft::dlr_pole_fit at its fixed rank, the np_fit DLR
    *  nodes): Ut (n_kept, nt) = its first n_kept rows, Vs (np_fit, n_kept) = its first n_kept columns (compacted), Kc (nt, np_fit) */

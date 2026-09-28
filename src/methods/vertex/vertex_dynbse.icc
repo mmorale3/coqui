@@ -1326,6 +1326,26 @@ namespace solvers {
           uc.l0_fz_cfg = int(vertex_debug::number("dynbse_l0_fz_cfg", 44.0));     // vertex_debug: dynbse_l0_fz_cfg
           uc.l0_fz_bench = int(vertex_debug::number("dynbse_l0_fz_bench", 0.0)); // vertex_debug: dynbse_l0_fz_bench
           uc.l0_asm_gemm = int(vertex_debug::number("dynbse_l0_asm_gemm", 1.0));  // vertex_debug: dynbse_l0_asm_gemm
+          // larger spaces (2026-09-27): the dense tau rungs may be only partly resident -- the rest are rebuilt on the device for
+          // every rung application, which needs the device rung builds (nosym meshes); the engine keeps room for those tables
+          // and, on the Sigma side, for the device deposit accumulators (their own feasibility checks run after it).
+          // vertex_debug dynbse_dev_nres = n forces n resident rungs (the A/B of the rebuild path), -1 = the most that fit.
+          const bool kb_want = (not sym and vertex_debug::number("dynbse_dev_kbig", 1.0) != 0.0);
+          uc.nres = long(vertex_debug::number("dynbse_dev_nres", -1.0));   // vertex_debug: dynbse_dev_nres
+          uc.partial_ok = kb_want ? 1 : 0;
+          {
+            const double kb_need = 16.0 * (double(ns * nk * Nm * nc) + double(nq * Nm * Nm) * (2.0 + double(ndist)) +
+                                           4.0 * double(nk) * (3.0 * double(Nm * nc2) + double(nc2 * nc2))) + 64.0e6;
+            double sd_need = 0.0;
+            if (opt.sigma != nullptr and not wan and sigma_dyn_device_ok(*opt.sigma)) {
+              const double nw = double(tools.nt_f), W = double(D) * double(nrb), npd = double(np), ngd = double(ng);
+              const double acc = double(nt * ns * nk * nc2) * (1.0 + 2.0 * npd);
+              const double blk = W * (3.0 + 2.0 * nw + double(nt)) + double(nrb * Nm) + ngd * double(nk * nc2) +
+                                 double(ns) * nw * double(nk * nc2) + 2.0 * double(nt) * nw + 2.0 * nw * npd + 2.0 * npd * ngd * double(nt);
+              sd_need = 16.0 * (acc + blk + double(nk) * (2.0 * double(nc2 * nc2) + ngd * double(nc2))) + 64.0e6;
+            }
+            uc.reserve_bytes = ((kb_want ? kb_need : 0.0) + sd_need) / 0.9 + 0.5e9;
+          }
           char why[256] = {0};
           ue.reset(dynbse_cuda::ue_create(uc, 1.0e6 * double(utils::freemem_device_effective()), why, 256));
           if (ue) {                                       // the basis' DLR refit at its fixed rank (basis_coeffs, npf_mask off)
@@ -1337,9 +1357,15 @@ namespace solvers {
             Vsk() = pf.Vs(all, nda::range(0, pf.n_kept));
             dynbse_cuda::ue_set_basis(ue.get(), b.KF.data(), b.KF2.data(), Utk.data(), Vsk.data(), Kck.data());
           }
-          if (rank == 0)
-            app_log(1, "  [dynbse] device-resident unit: {} ({:.1f} GB estimated){}{}", ue ? "ON" : "OFF, the host path runs",
-                    dynbse_cuda::ue_bytes(uc) / 1e9, ue ? "" : " -- ", ue ? "" : why);
+          if (rank == 0) {
+            dynbse_cuda::ue_config ucr = uc;
+            if (ue) ucr.nres = dynbse_cuda::ue_nres(ue.get());
+            const std::string resid = (ue and ucr.nres < ndist)
+                ? "; tau rungs resident " + std::to_string(ucr.nres) + " of " + std::to_string(ndist) +
+                  ", the rest rebuilt on the device per application" : std::string();
+            app_log(1, "  [dynbse] device-resident unit: {} ({:.1f} GB estimated{}, {:.1f} GB reserved){}{}", ue ? "ON" : "OFF, the host path runs",
+                    dynbse_cuda::ue_bytes(ucr) / 1e9, resid, uc.reserve_bytes / 1e9, ue ? "" : " -- ", ue ? "" : why);
+          }
           // D-1b: the rungs built on the device (nosym meshes); vertex_debug dynbse_dev_kbig = 0 keeps the host builds (the A/B)
           if (ue and not sym and vertex_debug::number("dynbse_dev_kbig", 1.0) != 0.0) {   // vertex_debug: dynbse_dev_kbig
             nda::array<cplx, 4> Wreps(ndist, nq, Nm, Nm);
@@ -1353,6 +1379,12 @@ namespace solvers {
             if (rank == 0)
               app_log(1, "  [dynbse] device rung builds (K_s, K_d(s), K_d0): {}{}", kb_dev ? "ON" : "OFF, built on the host -- ",
                       kb_dev ? "" : whyk);
+          }
+          if (ue and not kb_dev and dynbse_cuda::ue_nres(ue.get()) < ndist) {   // the rebuilds need the device rung builds
+            if (rank == 0)
+              app_log(1, "  [dynbse] device-resident unit: OFF after all -- {} of {} tau rungs resident needs the device rung "
+                         "builds, which are off; the host path runs", dynbse_cuda::ue_nres(ue.get()), ndist);
+            ue.reset();
           }
           if (ue and opt.sigma != nullptr and not wan and sigma_dyn_device_ok(*opt.sigma)) {
             std::string why_sd;
@@ -1791,6 +1823,16 @@ namespace solvers {
           }
         }
       }
+#if defined(ENABLE_CUDA)
+      if (ue and dynbse_cuda::ue_nres(ue.get()) < ndist) {   // larger spaces: what the partial rung residency cost this rank
+        long nrb_ = 0;
+        double trb = 0.0;
+        dynbse_cuda::ue_rebuild_stats(ue.get(), &nrb_, &trb);
+        if (rank == 0)
+          app_log(1, "  [dynbse] partial rung residency ({} of {} tau rungs resident): {} rung rebuilds on rank 0, {:.1f} s ({:.1f} ms each)",
+                  dynbse_cuda::ue_nres(ue.get()), ndist, nrb_, trb, nrb_ > 0 ? 1e3 * trb / double(nrb_) : 0.0);
+      }
+#endif
       write_sig_ckpt();                                         // P20: the finished run's accumulators (a restart loads them)
       if (dyn_sched) {
         MPI_Win_fence(0, win);
