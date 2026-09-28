@@ -99,6 +99,9 @@ namespace bdft_tests {
 
   inline dyn_toy make_dyn_toy(double zscale, double mscale) {
     dyn_toy T;
+    // larger spaces (2026-09-27): COQUI_DYNBSE_TOY_NC = n runs the toys at nc = n -- a non-power-of-two nc exercises the fused
+    // L0's padded lanes (segment S = 16 > nc = 12, the production C = 12), which nc = 2 / 4 / 8 never reach
+    if (auto *e = std::getenv("COQUI_DYNBSE_TOY_NC")) { T.nc = std::max(1l, std::atol(e)); T.nc2 = T.nc * T.nc; }
     T.t = {make_toy(T.nc, {-1.5, 1.5}, {0.3, 0.3}, 41u), make_toy(T.nc, {-1.5, 1.5}, {0.3, 0.3}, 43u)};
     T.kmk = nda::array<long, 2>(T.nk, T.nk);
     for (long k = 0; k < T.nk; ++k)
