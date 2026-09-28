@@ -45,6 +45,11 @@ namespace methods::solvers::dynbse_cuda {
     long ns = 0, nk = 0, nq = 0, Nm = 0, nc = 0;
     long nb = 16;                   // columns per FFT block (reduced to fit the budget; >= 1)
     long ntab = 1;                  // resident transformed rung tables (slots); 1 when the requested count does not fit
+    int layout = 2;                 // 2 (default): the FUSED k-sum -- one kernel per (n, Q) column: legs in, the separable 3-D mesh
+                                    //    DFT in shared memory, the product with A, the inverse DFT, legs out; no (nk Nm^2 nb) buffer;
+                                    // 1: buffers (P n Q, R), contiguous cuFFT transforms, custom leg kernels;
+                                    // 0: (R, P n Q) as the host route (strided cuFFT, cuBLAS legs). A100, Si kp444 C = 12, Nm 291,
+                                    //    nR 32 (bench/rung_miniapp): 57.7 / 51.0 / 38.8 ms per application for layouts 0 / 1 / 2
     int ndim[3] = {0, 0, 0};        // the mesh (ndim[0] ndim[1] ndim[2] == nk), lex row = (m0 n1 + m1) n2 + m2
   };
 

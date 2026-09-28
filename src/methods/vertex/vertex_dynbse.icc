@@ -1030,6 +1030,7 @@ namespace solvers {
           dynbse_cuda::rs_config rc;
           rc.ns = ns; rc.nk = nk; rc.nq = nq; rc.Nm = Nm; rc.nc = nc;
           rc.nb = std::max(1l, long(vertex_debug::number("dynbse_dev_stream_nb", 16.0)));
+          rc.layout = int(vertex_debug::number("dynbse_dev_stream_layout", 2.0));   // 2 fused k-sum | 1 contiguous cuFFT | 0 strided
           rc.ntab = nt + 1;           // every tau table + W_d0 transformed once per driver call (fixed here), else per call
           for (int a = 0; a < 3; ++a) rc.ndim[a] = kft.ndim[a];
           char why[256] = {0};
@@ -1044,8 +1045,8 @@ namespace solvers {
             }
             if (rank == 0) {
               rc.ntab = dynbse_cuda::rs_ntab(rs.get());
-              app_log(1, "  [dynbse] streaming THC rung on the DEVICE: ON (nb {}, {} rung tables {}, {:.2f} GB; mesh {} x {} x {}, "
-                         "Nm {}, nc {})", dynbse_cuda::rs_nb(rs.get()), rc.ntab, rs_res ? "resident" : "(reloaded per call)",
+              app_log(1, "  [dynbse] streaming THC rung on the DEVICE: ON (layout {}, nb {}, {} rung tables {}, {:.2f} GB; mesh {} x {} x {}, "
+                         "Nm {}, nc {})", rc.layout, dynbse_cuda::rs_nb(rs.get()), rc.ntab, rs_res ? "resident" : "(reloaded per call)",
                       dynbse_cuda::rs_bytes(rc, nrb) / 1.0e9, rc.ndim[0], rc.ndim[1], rc.ndim[2], Nm, nc);
             }
           }
