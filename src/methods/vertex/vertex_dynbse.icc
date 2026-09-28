@@ -1010,6 +1010,38 @@ namespace solvers {
         if (use_ft) thc_rung_apply_ft(Xb, is_, iq_, kpq, kft, Wfn, sc, Fin, Oout, nb, symc);   // P6: symc (nullptr on nosym)
         else thc_rung_apply(Xb, is_, iq_, kpq, qx_of, Wfn, sc, Fin, Oout, nb, symc);
       };
+#if defined(ENABLE_CUDA)
+      // R1(b) step 1 (2026-09-28, notes/gpu_port_plan.md 4h): the STREAMING THC rung on the device. vertex_debug
+      // dynbse_dev_stream = 1 runs the streaming path's rung applications (dense_rung = false) through rs_apply instead of
+      // thc_rung_apply_ft -- nosym full meshes with the FFT k-sum only (else the host route, with the reason logged);
+      // dynbse_dev_stream_nb = the FFT block width (default 16, halved to fit); dynbse_dev_stream_check = 1: the first kd
+      // call of every rank's first unit also runs the host rung on two tau nodes and the constant part, and logs the
+      // device-vs-host difference.
+      std::unique_ptr<dynbse_cuda::rung_stream, void (*)(dynbse_cuda::rung_stream *)> rs(nullptr, dynbse_cuda::rs_destroy);
+      long rs_sq = -1;
+      double rs_t[5] = {0.0, 0.0, 0.0, 0.0, 0.0};   // [0] W transforms, [1] legs in, [2] FFT + product, [3] legs out, [4] H2D/D2H
+      if (not opt.dense_rung and not opt.bubble_only and vertex_debug::flag("dynbse_dev_stream")) {
+        std::string why_rs;
+        if (not use_ft or not kft.fft) why_rs = "no FFT mesh transform (the host rung runs)";
+        else if (sym) why_rs = "symmetric mesh (the per-class device pass is not written yet; the host rung runs)";
+        else if (kft.Uq.shape(1) != nq) why_rs = "transfer count mismatch";
+        else {
+          dynbse_cuda::rs_config rc;
+          rc.ns = ns; rc.nk = nk; rc.nq = nq; rc.Nm = Nm; rc.nc = nc;
+          rc.nb = std::max(1l, long(vertex_debug::number("dynbse_dev_stream_nb", 16.0)));
+          for (int a = 0; a < 3; ++a) rc.ndim[a] = kft.ndim[a];
+          char why[256] = {0};
+          rs.reset(dynbse_cuda::rs_create(rc, nrb, kft.lex_k.data(), kft.lex_q.data(), Xb.data(),
+                                          1.0e6 * double(utils::freemem_device_effective()), why, 256));
+          if (not rs) why_rs = why;
+          else if (rank == 0)
+            app_log(1, "  [dynbse] streaming THC rung on the DEVICE: ON (nb {}, {:.2f} GB; mesh {} x {} x {}, Nm {}, nc {})",
+                    dynbse_cuda::rs_nb(rs.get()), dynbse_cuda::rs_bytes(rc, nrb) / 1.0e9, rc.ndim[0], rc.ndim[1], rc.ndim[2],
+                    Nm, nc);
+        }
+        if (not rs and rank == 0) app_log(1, "  [dynbse] streaming THC rung on the DEVICE: OFF -- {}", why_rs);
+      }
+#endif
       // host threads (the omp_threads knob; the global OMP_NUM_THREADS stays 1 per the T-3b contract): the
       // tau nodes of a rung application are independent; the body holds no MPI, no HDF5, no shared writes
       // (each tau writes its own Ys slice; the rung buffers are per call)
@@ -1531,11 +1563,41 @@ namespace solvers {
                 nda::blas::gemm(scale_k, Kd_s(trep[size_t(i)], all, all), Fi, cplx(0.0), Oi);
               }
             } else {
+#if defined(ENABLE_CUDA)
+              if (rs) {
+                if (rs_sq != is * nq + iq) { dynbse_cuda::rs_set_sq(rs.get(), is, &kpq(iq, 0)); rs_sq = is * nq + iq; }
+                const long NN = Nm * Nm;
+                for (long i = 0; i < nt; ++i) {
+                  dynbse_cuda::rs_set_w(rs.get(), Wd_s.data() + i * NN, nt * NN, rs_t);
+                  dynbse_cuda::rs_apply(rs.get(), scale_k, Fs(i, all, all, all).data(), Ys(i, all, all, all).data(), nR, rs_t + 1);
+                }
+                if (dbg and kd_calls == 0 and vertex_debug::flag("dynbse_dev_stream_check")) {
+                  // the device rung against the host one on the same inputs (the gate: a few ulp of the scale)
+                  double dmax = 0.0, hmax = 0.0;
+                  nda::array<cplx, 3> Oh(nk, nc2, nR);
+                  for (long i : {0l, nt / 2}) {
+                    auto Fi = Fs(i, all, all, all);
+                    rung_apply(Wq_s(i), scale_k, Fi, Oh, is, iq);
+                    auto Oi = Ys(i, all, all, all);
+                    for (long k = 0; k < nk; ++k)
+                      for (long r = 0; r < nc2; ++r)
+                        for (long N = 0; N < nR; ++N) {
+                          dmax = std::max(dmax, std::abs(Oi(k, r, N) - Oh(k, r, N)));
+                          hmax = std::max(hmax, std::abs(Oh(k, r, N)));
+                        }
+                  }
+                  app_log(1, "  [dynbse] device streaming rung check (fam {}, tau nodes 0 and {}): max|dev - host| {:.3e}, "
+                             "max|host| {:.3e}, relative {:.3e}", fam, nt / 2, dmax, hmax, (hmax > 0.0) ? dmax / hmax : dmax);
+                }
+              } else
+#endif
+              {
 #pragma omp parallel for schedule(dynamic, 1) num_threads(nthr)
               for (long i = 0; i < nt; ++i) {
                 auto Fi = Fs(i, all, all, all);
                 auto Oi = Ys(i, all, all, all);
                 rung_apply(Wq_s(i), scale_k, Fi, Oi, is, iq);
+              }
               }
             }
             if (met) met->t_rung += kwatch.lap();
@@ -1564,6 +1626,26 @@ namespace solvers {
             auto O2 = nda::reshape(Os3, std::array<long, 2>{D, nR});
             nda::blas::gemm(-scale_k, Kd0, F2, cplx(0.0), O2);
           } else {
+#if defined(ENABLE_CUDA)
+            if (rs) {
+              if (rs_sq != is * nq + iq) { dynbse_cuda::rs_set_sq(rs.get(), is, &kpq(iq, 0)); rs_sq = is * nq + iq; }
+              dynbse_cuda::rs_set_w(rs.get(), Wd0.data(), Nm * Nm, rs_t);
+              dynbse_cuda::rs_apply(rs.get(), -scale_k, Fs3.data(), Os3.data(), nR, rs_t + 1);
+              if (dbg and kd_calls == 0 and vertex_debug::flag("dynbse_dev_stream_check")) {
+                nda::array<cplx, 3> Oh(nk, nc2, nR);
+                rung_apply(Wq_0, -scale_k, Fs3, Oh, is, iq);
+                double dmax = 0.0, hmax = 0.0;
+                for (long k = 0; k < nk; ++k)
+                  for (long r = 0; r < nc2; ++r)
+                    for (long N = 0; N < nR; ++N) {
+                      dmax = std::max(dmax, std::abs(Os3(k, r, N) - Oh(k, r, N)));
+                      hmax = std::max(hmax, std::abs(Oh(k, r, N)));
+                    }
+                app_log(1, "  [dynbse] device streaming rung check (the constant part K_d0): max|dev - host| {:.3e}, max|host| "
+                           "{:.3e}, relative {:.3e}", dmax, hmax, (hmax > 0.0) ? dmax / hmax : dmax);
+              }
+            } else
+#endif
             rung_apply(Wq_0, -scale_k, Fs3, Os3, is, iq);
           }
           for (long k = 0; k < nk; ++k)
@@ -1834,6 +1916,11 @@ namespace solvers {
           app_log(1, "  [dynbse] partial rung residency ({} of {} tau rungs resident): {} rung rebuilds on rank 0, {:.1f} s ({:.1f} ms each)",
                   dynbse_cuda::ue_nres(ue.get()), ndist, nrb_, trb, nrb_ > 0 ? 1e3 * trb / double(nrb_) : 0.0);
       }
+#endif
+#if defined(ENABLE_CUDA)
+      if (rs and rank == 0)
+        app_log(1, "  [dynbse] device streaming rung on rank 0: W transforms {:.1f} s, legs in {:.1f} s, FFT + product {:.1f} s, "
+                   "legs out {:.1f} s, H2D/D2H {:.1f} s", rs_t[0], rs_t[1], rs_t[2], rs_t[3], rs_t[4]);
 #endif
       write_sig_ckpt();                                         // P20: the finished run's accumulators (a restart loads them)
       if (dyn_sched) {
