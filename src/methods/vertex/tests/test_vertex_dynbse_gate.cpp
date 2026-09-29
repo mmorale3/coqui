@@ -1240,6 +1240,11 @@ namespace bdft_tests {
       // 4 the dynamic band run that dumps the points and the nu0 column (2 iterations, as run_w's A)
       bool ibz_cur = false;   // P1: the IBZ solve + star fold of the Sigma-side vertex (sym meshes)
       std::string col_cur = "static1", outer_cur = "static";   // the Sigma-side column / outer W of the kind-2 runs
+      // 2026-09-29 (user: "fix wannier in sigma"): COQUI_DYNBSE_TEST_SIGPAIR_WAN_DYN = 1 runs the (W) gauge gate on the DYNAMIC pair
+      // Sigma vertex (col dyn1, outer dynamic = eval_sigma_pair_dyn with the Wannier closure U^T G U^* and the rotation back) and
+      // stops after it (the Wannier dynamic path is nosym-only; the (S) part is the static column's)
+      const bool wan_dyn = (std::getenv("COQUI_DYNBSE_TEST_SIGPAIR_WAN_DYN") != nullptr);
+      if (wan_dyn) { col_cur = "dyn1"; outer_cur = "dynamic"; }
       // P1 (2026-09-21): the window of the (S) part. The historic window [0, 4) CUTS the Gamma triplet (bands 3-5 of LiH), so the
       // C-sector rotations of the symmetric path LEAK (D-matrix leakage 0.25, unitarity defect 0.99, G-rotation residual 4.5e-2
       // on qe_lih222_sym): the full-mesh sym path is then NOT the exact object (its identity with the B-S Sigma^{C,x} holds
@@ -1349,6 +1354,14 @@ namespace bdft_tests {
                    "rel {:.3e} (max |d| {:.2e}); e_corr band {:+.10f} V=1 {:+.10f} V {:+.10f} (R0 {:+.10f})", relI, mxI, relV, mxV, cp1, cpi, cpv, cr0);
       } else {
         app_log(1, "dynbse_readout LFF-Sigma pair SYMW: window [0, {}) (COQUI_DYNBSE_TEST_SYMW_NC): the (W) Wannier part is skipped", ncw);
+      }
+      if (wan_dyn) {
+        REQUIRE(do_w);
+        app_log(1, "dynbse_readout LFF-Sigma pair WANNIER DYNAMIC gate (col {}, outer {}): V = 1 rel {:.3e}, unitary mix V rel {:.3e}",
+                col_cur, outer_cur, relI, relV);
+        REQUIRE(relI < 1e-9);
+        REQUIRE(relV < 1e-7);
+        return;
       }
       // (S) the symmetric mesh
       std::string fx = std::getenv("COQUI_DYNBSE_TEST_SIGPAIR_SYMW"); if (fx == "1" or fx.empty()) fx = "qe_lih222_sym";

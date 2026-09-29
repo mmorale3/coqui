@@ -841,6 +841,32 @@ namespace solvers {
                 for (long bb2 = 0; bb2 < nc; ++bb2) gC(is, p, k, a, bb2) = c(p, a * nc + bb2);
           }
       }
+      // WANNIER MODE (2026-09-29, the Sigma hook's closure): the closure G = U^T G_W U^* (hook.G_close, set by the Sigma entry
+      // points) fitted on the SAME basis and G node set as gC -- its residues are the closure's g_j; the pair propagator keeps gC
+      if (opt.sigma != nullptr and opt.sigma->wannier_closure()) {
+        auto const &Gc = opt.sigma->G_close;
+        utils::check(not sym and Gc.shape(0) == nt and Gc.shape(1) == ns and Gc.shape(2) == nk and Gc.shape(3) == nc and Gc.shape(4) == nc,
+                     "pair_space_ladder_dyn: the Wannier closure G ({} x {} x {} x {} x {}) does not match G_CC's layout "
+                     "({} x {} x {} x {} x {}; nosym meshes only).", Gc.shape(0), Gc.shape(1), Gc.shape(2), Gc.shape(3), Gc.shape(4),
+                     nt, ns, nk, nc, nc);
+        opt.sigma->gC_close = nda::array<cplx, 5>(ns, ng, nk, nc, nc);
+        double fe_c = 0.0;
+        nda::array<cplx, 2> Fg(nt, nc2);
+        for (long is = 0; is < ns; ++is)
+          for (long k = 0; k < nk; ++k) {
+            for (long i = 0; i < nt; ++i)
+              for (long a = 0; a < nc; ++a)
+                for (long bb2 = 0; bb2 < nc; ++bb2) Fg(i, a * nc + bb2) = Gc(i, is, k, a, bb2);
+            auto c = use_npf ? npf.coeffs(Fg) : db::basis_coeffs(b, Fg);
+            fe_c = std::max(fe_c, use_npf ? npf.fit_error(Fg, c) : db::basis_fit_error(b, Fg, c));
+            for (long p = 0; p < ng; ++p)
+              for (long a = 0; a < nc; ++a)
+                for (long bb2 = 0; bb2 < nc; ++bb2) opt.sigma->gC_close(is, p, k, a, bb2) = c(p, a * nc + bb2);
+          }
+        if (rank == 0)
+          app_log(1, "  [dynbse] Wannier-mode Sigma closure: U^T G_W U^* fitted on the ladder's G node set ({} nodes), fit error {:.2e}",
+                  ng, fe_c);
+      }
       if (rank == 0)
         app_log(2, "  [dynbse] node set: {} ({} vertex nodes, {} G nodes ({} in-gap nodes masked at |eps| < {:.4f} Ha), "
                    "{} total); G fit error {:.2e}, residue ratio {:.2f}",
@@ -1440,7 +1466,9 @@ namespace solvers {
           }
           if (ue and opt.sigma != nullptr and not wan and sigma_dyn_device_ok(*opt.sigma)) {
             std::string why_sd;
-            const bool ok = sigma_dyn_device_init(*opt.sigma, sd_dev, ue.get(), b, G_CC, nk, nc, ng, epsG, Nm, tools, why_sd);
+            const bool ok = opt.sigma->wannier_closure()   // Wannier mode: the deposits' closure G
+                ? sigma_dyn_device_init(*opt.sigma, sd_dev, ue.get(), b, opt.sigma->G_close, nk, nc, ng, epsG, Nm, tools, why_sd)
+                : sigma_dyn_device_init(*opt.sigma, sd_dev, ue.get(), b, G_CC, nk, nc, ng, epsG, Nm, tools, why_sd);
             if (rank == 0)
               app_log(1, "  [dynbse] device Sigma deposits: {}{}", ok ? "ON (accumulators resident, flushed at checkpoints and the end)"
                                                                         : "OFF, the host deposits run -- ", ok ? "" : why_sd);
@@ -1830,7 +1858,12 @@ namespace solvers {
                 sigma_dyn_accumulate_device(*opt.sigma, sd_dev, ue.get(), b, P, inu, Dc, N0, N1, Wout, kpq, is, iq, m, tools);
               else
 #endif
-              sigma_dyn_accumulate(*opt.sigma, b, P, inu, res, Ks, Dc, N0, N1, Wout, G_CC, kpq, is, iq, m, tools);
+              {
+              if (opt.sigma->wannier_closure())   // Wannier mode: the closure G (U^T G_W U^*), not the ladder's G_CC
+                sigma_dyn_accumulate(*opt.sigma, b, P, inu, res, Ks, Dc, N0, N1, Wout, opt.sigma->G_close, kpq, is, iq, m, tools);
+              else
+                sigma_dyn_accumulate(*opt.sigma, b, P, inu, res, Ks, Dc, N0, N1, Wout, G_CC, kpq, is, iq, m, tools);
+              }
             }
 #if defined(ENABLE_CUDA)
             if (ue) {
@@ -1947,6 +1980,57 @@ namespace solvers {
         MPI_Win_fence(0, win);
         MPI_Win_free(&win);
       }
+    }
+
+    /** WANNIER MODE (2026-09-29): the Sigma closure's G, U^T G_W U^* (eval_sigma_pair's G_close, L-6c), from the loop's
+     *  band-window G (G_W, nW = |window| bands) and the projector U(s, k) = U_skia(s, k, :, :) (nW x M); full-BZ k axis. */
+    inline void wannier_closure_G(nda::MemoryArrayOfRank<5> auto const &G_tskij, nda::range band_window, bool sym_mesh,
+                                  auto const &kp_to_ibz, auto const &kp_trev, nda::array<ComplexType, 4> const &U_skia,
+                                  long nt, long ns, long nk_full, long M, nda::array<ComplexType, 5> &out) {
+      decltype(nda::range::all) all;
+      const long nW = long(band_window.size());
+      utils::check(U_skia.shape(0) == ns and U_skia.shape(1) >= nk_full and U_skia.shape(2) == nW and U_skia.shape(3) == M,
+                   "wannier_closure_G: projector ({}, {}, {}, {}) vs (ns {}, nk {}, nW {}, M {}).", U_skia.shape(0), U_skia.shape(1),
+                   U_skia.shape(2), U_skia.shape(3), ns, nk_full, nW, M);
+      nda::array<ComplexType, 5> Gw(nt, ns, nk_full, nW, nW);
+      vertex_ladder_detail::expand_G_CC_fullbz(G_tskij, band_window, sym_mesh, kp_to_ibz, kp_trev, Gw);
+      out = nda::array<ComplexType, 5>(nt, ns, nk_full, M, M);
+      nda::array<ComplexType, 2> Ut(M, nW), Uc(nW, M), S(nW, nW), T1(M, nW), R(M, M);
+      for (long is = 0; is < ns; ++is)
+        for (long k = 0; k < nk_full; ++k) {
+          for (long a = 0; a < nW; ++a)
+            for (long m = 0; m < M; ++m) { Ut(m, a) = U_skia(is, k, a, m); Uc(a, m) = std::conj(U_skia(is, k, a, m)); }
+          for (long it = 0; it < nt; ++it) {
+            S() = Gw(it, is, k, all, all);
+            nda::blas::gemm(Ut, S, T1);                                     // U^T G
+            nda::blas::gemm(T1, Uc, R);                                     // (U^T G) U^*
+            out(it, is, k, all, all) = R;
+          }
+        }
+    }
+
+    /** WANNIER MODE: the closure-convention block dSigma_bar = U^T dSigma U^* (M x M) back to the band window with U^* dSigma_bar U^T
+     *  (the inverse of that map, as eval_sigma_pair; NOT U dSigma_bar U^dag) -- dSig (nt, ns, nk, M, M) -> (nt, ns, nk, nW, nW) */
+    inline void wannier_sigma_to_window(nda::array<ComplexType, 5> &dSig, nda::array<ComplexType, 4> const &U_skia) {
+      decltype(nda::range::all) all;
+      const long nt = dSig.shape(0), ns = dSig.shape(1), nk = dSig.shape(2), M = dSig.shape(3), nW = U_skia.shape(2);
+      utils::check(U_skia.shape(0) == ns and U_skia.shape(1) >= nk and U_skia.shape(3) == M,
+                   "wannier_sigma_to_window: projector ({}, {}, {}, {}) vs dSigma (ns {}, nk {}, M {}).", U_skia.shape(0), U_skia.shape(1),
+                   U_skia.shape(2), U_skia.shape(3), ns, nk, M);
+      nda::array<ComplexType, 5> dSb(nt, ns, nk, nW, nW);
+      nda::array<ComplexType, 2> Uc(nW, M), Ut(M, nW), T1(nW, M), S(M, M), Sb(nW, nW);
+      for (long is = 0; is < ns; ++is)
+        for (long k = 0; k < nk; ++k) {
+          for (long a = 0; a < nW; ++a)
+            for (long m = 0; m < M; ++m) { Uc(a, m) = std::conj(U_skia(is, k, a, m)); Ut(m, a) = U_skia(is, k, a, m); }
+          for (long it = 0; it < nt; ++it) {
+            S() = dSig(it, is, k, all, all);
+            nda::blas::gemm(Uc, S, T1);                                    // U^* dSigma_bar
+            nda::blas::gemm(T1, Ut, Sb);                                   // (U^* dSigma_bar) U^T
+            dSb(it, is, k, all, all) = Sb;
+          }
+        }
+      dSig = std::move(dSb);
     }
 
   } // namespace vertex_dynbse_detail
@@ -2682,6 +2766,11 @@ namespace solvers {
     std::vector<long> nus;
     auto hook = std::make_shared<vd::sigma_dyn_hook>();
     prepare_sigma_dyn_hook(*hook, opt, thc, tools, symc, sym_, nus);
+    if (_wannier) {                                                  // Wannier mode: the closure G (see eval_sigma_pair_dyn)
+      utils::check(not sym_, "vertex_t::arm_shared_sigma_hook: the Wannier-mode dynamic Sigma vertex runs on nosym meshes only.");
+      vd::wannier_closure_G(mb_state.sG_tskij.value().local(), _band_window, MF->nkpts() != MF->nkpts_ibz(), MF->kp_to_ibz(),
+                            MF->kp_trev(), _U_skia, G_CC.shape(0), G_CC.shape(1), G_CC.shape(2), G_CC.shape(3), hook->G_close);
+    }
     // the P-side nodes that belong to the Sigma node set are deposited by the P-side call
     std::vector<long> shared;
     for (long m : p_nodes) if (std::find(nus.begin(), nus.end(), m) != nus.end()) shared.push_back(m);
@@ -2927,7 +3016,9 @@ namespace solvers {
     namespace vd = vertex_dynbse_detail;
     vertex_ladder_detail::prof_watch twatch;
     utils::check(active() and secondary(), "vertex_t::eval_sigma_pair_dyn: requires an ACTIVE secondary-basis vertex (the readout instance).");
-    utils::check(not _wannier, "vertex_t::eval_sigma_pair_dyn: the dynamic pair-resolved Sigma vertex runs in the band (window) frame only.");
+    // Wannier mode (2026-09-29, user: "fix wannier in sigma"): the contraction runs in the MLWF frame (the ladder's G_CC and legs
+    // X_bar = X U), the closure with U^T G_W U^* (hook.G_close, fitted next to gC by the driver), and dSigma is rotated back to the
+    // band window with U^* dSigma U^T -- eval_sigma_pair's L-6c conventions; nosym meshes (the 4^3 coarse runs) only.
     utils::check(_W0b_qmm.has_value(), "vertex_t::eval_sigma_pair_dyn: W0bar is absent -- build_w0 must run first.");
     utils::check(opt.col == "static_dyn" or opt.col == "dyn1_bare" or opt.col == "dyn1" or opt.col == "dyn",
                  "vertex_t::eval_sigma_pair_dyn: unknown column \"{}\" (static_dyn | dyn1_bare | dyn1 | dyn).", opt.col);
@@ -2971,6 +3062,13 @@ namespace solvers {
       prepare_sigma_dyn_hook(*hook_h, opt, thc, tools, symc, sym_, nus);
     }
     vd::sigma_dyn_hook &hook = *hook_h;
+    if (_wannier and not hook.wannier_closure()) {
+      utils::check(not sym_, "vertex_t::eval_sigma_pair_dyn: the Wannier-mode dynamic Sigma vertex runs on nosym meshes only.");
+      vd::wannier_closure_G(mb_state.sG_tskij.value().local(), _band_window, MF->nkpts() != MF->nkpts_ibz(), MF->kp_to_ibz(),
+                            MF->kp_trev(), _U_skia, G_CC.shape(0), G_CC.shape(1), G_CC.shape(2), G_CC.shape(3), hook.G_close);
+      app_log(1, "  [LFF-Sigma dyn] Wannier mode: the closure G = U^T G_W U^* (M = {} MLWFs, band window [{}, {}))", G_CC.shape(3),
+              _band_window.first(), _band_window.last());
+    }
     vd::dyn_opts o;
     o.kcrys = std::addressof(kc);
     o.shm_mpi = (_wcache == "shared") ? mpi.get() : nullptr;   // P19: node-shared W_d tables with the shared cache
@@ -3044,6 +3142,11 @@ namespace solvers {
     double e_fit = 0.0;
     const double sw_red = twatch.peek();
     vd::sigma_dyn_finish(hook, opt.scale, MF->nkpts(), dSig, e_fit, opt.dyn_refit, opt.dyn_refit_rtol);   // P12
+    if (_wannier) {                                                  // the MLWF-frame block back to the band window (before the meters)
+      vd::wannier_sigma_to_window(dSig, _U_skia);
+      app_log(1, "  [LFF-Sigma dyn] Wannier mode: dSigma rotated from the MLWF frame to the band window [{}, {}) (nW = {}).",
+              _band_window.first(), _band_window.last(), dSig.shape(3));
+    }
     app_log(1, "  [LFF-Sigma dyn] call walls: preparation (hook, sampled-mode bases) {:.1f} s, the driver {:.1f} s, "
                "the accumulator reductions + dump {:.1f} s, the finish {:.1f} s", sw_pre, sw_drv - sw_pre, sw_red - sw_drv,
             twatch.peek() - sw_red);
