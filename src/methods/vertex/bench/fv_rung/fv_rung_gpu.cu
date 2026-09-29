@@ -44,12 +44,6 @@ __global__ void unstack(const dc *Ys, dc *Y, long D, long nt, long nR) {
   }
 }
 
-static double relerr(std::vector<cplx> const &a, std::vector<cplx> const &b) {
-  double e = 0, n = 0;
-  for (size_t i = 0; i < a.size(); ++i) { e += std::norm(a[i] - b[i]); n += std::norm(b[i]); }
-  return std::sqrt(e / n);
-}
-
 int main(int argc, char **argv) {
   if (argc < 2) { std::printf("usage: fv_rung_gpu <bench.h5> [nR=32] [napply=3] [variants=dense,dense2,freqR,spatial]\n"); return 1; }
   const long nR = argc > 2 ? std::atol(argv[2]) : 32;
