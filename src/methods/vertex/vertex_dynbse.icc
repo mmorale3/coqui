@@ -895,6 +895,58 @@ namespace solvers {
         if (shm_w) { sWd_s->win().fence(); sWd0->win().fence(); }   // publish the node-shared tables
         if (met) met->wtau_sym = std::max(met->wtau_sym, (wmax > 0.0) ? dsym / wmax : 0.0);
       }
+      // ---- factorize-vertex: the FREQUENCY-FACTORIZED dense rung (vertex_debug dyn_rung_rank = R > 0) -------------------
+      // W_dyn(q', tau_i) ~ sum_{r<R} c_r(tau_i) A_r(q') with UNIVERSAL (q'-independent) time functions c_r: the top-R
+      // eigenvectors of the (nt x nt) Gram of the per-q'-normalized tau data (Si 4^3 / C = 12: R = 6 -> 2.5e-5 in the kernel
+      // metric; notes/step1_factorization_findings.md), A_r(q') = sum_i c_r(tau_i)^* W_dyn(q', tau_i). The rung is then R
+      // dense matrices K_r = build_kbig(A_r) instead of one per PH-representative tau node, applied to ALL tau nodes of an
+      // application at once: Y(:, (i, N)) = sum_r K_r c_r(tau_i) F(:, (i, N)) -- R x the flops of the per-tau gemms, but
+      // compute-bound (the per-tau (D x D)(D x nR) gemms are bandwidth-bound) and R/ndist of the memory and the builds.
+      const long rrank = opt.dense_rung ? long(vertex_debug::number("dyn_rung_rank", 0.0)) : 0l;   // vertex_debug: dyn_rung_rank
+      nda::array<cplx, 2> c_tr;                   // (nt, R)
+      nda::array<cplx, 4> A_rq;                   // (R, nq, Nm, Nm)
+      if (rrank > 0) {
+        utils::check(rrank <= nt, "pair_space_ladder_dyn: dyn_rung_rank {} > nt {}.", rrank, nt);
+        nda::matrix<cplx> Gm(nt, nt);
+        Gm() = cplx(0.0);
+        for (long iqp = 0; iqp < nq; ++iqp) {
+          auto Wq = nda::reshape(Wd_s(iqp, all, all, all), std::array<long, 2>{nt, Nm * Nm});
+          double nmax = 0.0;
+          for (long i = 0; i < nt; ++i) {
+            double n2 = 0.0;
+            for (long x = 0; x < Nm * Nm; ++x) n2 += std::norm(Wq(i, x));
+            nmax = std::max(nmax, n2);
+          }
+          if (nmax <= 0.0) continue;
+          nda::blas::gemm(cplx(1.0 / nmax), Wq, nda::dagger(Wq), cplx(1.0), Gm);   // M M^dag: its eigenvectors = the left singular vectors
+        }
+        for (long i = 0; i < nt; ++i)
+          for (long j = 0; j < i; ++j) { auto a = 0.5 * (Gm(i, j) + std::conj(Gm(j, i))); Gm(i, j) = a; Gm(j, i) = std::conj(a); }
+        auto [lam, V] = nda::linalg::eigenelements(Gm);   // ascending
+        double tr = 0.0, tail = 0.0;
+        for (long i = 0; i < nt; ++i) tr += std::max(double(lam(i)), 0.0);
+        for (long i = 0; i < nt - rrank; ++i) tail += std::max(double(lam(i)), 0.0);
+        c_tr = nda::array<cplx, 2>(nt, rrank);
+        for (long r = 0; r < rrank; ++r)
+          for (long i = 0; i < nt; ++i) c_tr(i, r) = V(i, nt - 1 - r);
+        A_rq = nda::array<cplx, 4>(rrank, nq, Nm, Nm);
+        nda::array<cplx, 2> cH(rrank, nt);
+        for (long r = 0; r < rrank; ++r)
+          for (long i = 0; i < nt; ++i) cH(r, i) = std::conj(c_tr(i, r));
+        for (long iqp = 0; iqp < nq; ++iqp) {
+          auto Wq = nda::reshape(Wd_s(iqp, all, all, all), std::array<long, 2>{nt, Nm * Nm});
+          nda::array<cplx, 2> Ar(rrank, Nm * Nm);
+          nda::blas::gemm(cH, Wq, Ar);
+          for (long r = 0; r < rrank; ++r)
+            A_rq(r, iqp, all, all) = nda::reshape(Ar(r, all), std::array<long, 2>{Nm, Nm});
+        }
+        if (rank == 0)
+          app_log(1, "  [factorize-vertex] frequency-factorized dense rung: R = {} universal time functions of {} tau nodes "
+                     "(Gram tail {:.2e} of the trace, sqrt = the rms relative truncation of the normalized tau data); "
+                     "K_d memory {:.2f} GB per unit instead of {} per-tau matrices",
+                  rrank, nt, tail / std::max(tr, 1e-300), std::sqrt(tail / std::max(tr, 1e-300)),
+                  double(rrank) * double(D) * double(D) * 16.0 / 1.0e9, nt / 2);
+      }
       // ---- transfer lookup ---------------------------------------------------------------------
       nda::array<long, 2> qx_of(nk, nk);
       qx_of() = -1;
@@ -1209,7 +1261,7 @@ namespace solvers {
       // else keeps the host path. vertex_debug dynbse_dev_unit = 0 disables it (the A/B).
       std::unique_ptr<dynbse_cuda::unit_engine, void (*)(dynbse_cuda::unit_engine *)> ue(nullptr, dynbse_cuda::ue_destroy);
       const bool ue_want = db::l0_device_enabled() and vertex_debug::number("dynbse_dev_unit", 1.0) != 0.0 and   // vertex_debug: dynbse_dev_unit
-                           opt.dense_rung and opt.gmres_m > 0 and opt.gamma1_only and not opt.static_only and
+                           opt.dense_rung and rrank == 0 and opt.gmres_m > 0 and opt.gamma1_only and not opt.static_only and
                            not opt.one_rung_only and db::l0_cols_state() and not b.npf_mask and
                            not (opt.sigma != nullptr and opt.sigma->col == "dyn");
       bool ue_tried = false;
@@ -1389,19 +1441,19 @@ namespace solvers {
         }
         // the dense per-tau rungs K_d(s) and the constant part
         if (opt.dense_rung) {
-          Kd_s = nda::array<cplx, 3>(ndist, D, D);
+          Kd_s = nda::array<cplx, 3>(rrank > 0 ? rrank : ndist, D, D);
           Kd0 = nda::array<cplx, 2>(D, D);
 #pragma omp parallel for schedule(dynamic, 1) num_threads(nthr)
-          for (long r = 0; r < ndist; ++r) {
-            auto Wr = Wd_s(all, reps[size_t(r)], all, all);
+          for (long r = 0; r < (rrank > 0 ? rrank : ndist); ++r) {
             auto Kr = Kd_s(r, all, all);
-            build_kbig(Xb, Wr, is, iq, kpq, qx_of, Kr, symc);
+            if (rrank > 0) build_kbig(Xb, A_rq(r, all, all, all), is, iq, kpq, qx_of, Kr, symc);   // factorize-vertex: K_r
+            else build_kbig(Xb, Wd_s(all, reps[size_t(r)], all, all), is, iq, kpq, qx_of, Kr, symc);
           }
           build_kbig(Xb, Wd0, is, iq, kpq, qx_of, Kd0, symc);
           if (rank == 0 and units_taken == 1)
             app_log(2, "  [dynbse] dense tau rungs: {} distinct PH-sym tau nodes of {}, {:.2f} GB per rank", ndist, nt,
                     double(ndist) * double(D) * double(D) * 16.0 / 1.0e9);
-          if (rank == 0 and units_taken == 1 and vertex_debug::flag("rung_rank")) {
+          if (rank == 0 and units_taken == 1 and rrank == 0 and vertex_debug::flag("rung_rank")) {
             // P10 measurement (vertex_perf_plan.md; vertex_debug rung_rank = 1): the tau rank of the dense rung -- the singular
             // values of the (ndist x D^2) stack [K_d(s_r)]_r; a low-rank-over-tau rung (P10) pays only if the rank at 1e-8 is
             // well below ndist. Logged once, for the first unit of rank 0 (an (ndist x ndist) Gram eigenproblem).
@@ -1488,7 +1540,32 @@ namespace solvers {
               nda::blas::gemm(cplx(1.0), KFc, fam2, cplx(1.0), Fs2);
             }
             vertex_ladder_detail::prof_watch kwatch;
-            if (opt.dense_rung) {
+            if (opt.dense_rung and rrank > 0) {
+              // factorize-vertex: Ys(i) = scale_k sum_r c_r(s_i) K_r Fs(i) for ALL tau nodes: the (i, N) columns are split
+              // into nthr contiguous chunks; each thread gathers its c_r-scaled chunk (D x w) and runs R gemms
+              // (D x D)(D x w) into a private accumulator (sequential BLAS inside; K = D keeps them compute-bound)
+              const long ncol = nt * nR;
+              const long nch = std::min(nthr, ncol);
+#pragma omp parallel for schedule(static, 1) num_threads(nthr)
+              for (long ch = 0; ch < nch; ++ch) {
+                const long c0 = (ncol * ch) / nch, c1 = (ncol * (ch + 1)) / nch, w = c1 - c0;
+                nda::array<cplx, 2> Fr(D, w), Yr(D, w);
+                Yr() = cplx(0.0);
+                for (long r = 0; r < rrank; ++r) {
+                  for (long y = 0; y < D; ++y)
+                    for (long cc = 0; cc < w; ++cc) {
+                      const long col = c0 + cc, i = col / nR, N = col % nR;
+                      Fr(y, cc) = c_tr(i, r) * Fs(i, y / nc2, y % nc2, N);
+                    }
+                  nda::blas::gemm(scale_k, Kd_s(r, all, all), Fr, cplx(1.0), Yr);
+                }
+                for (long y = 0; y < D; ++y)
+                  for (long cc = 0; cc < w; ++cc) {
+                    const long col = c0 + cc, i = col / nR, N = col % nR;
+                    Ys(i, y / nc2, y % nc2, N) = Yr(y, cc);
+                  }
+              }
+            } else if (opt.dense_rung) {
               // Ys(i) = scale_k K_d(s_i) Fs(i): nt gemms (D x D)(D x nR) on the mirrored blocks
 #pragma omp parallel for schedule(dynamic, 1) num_threads(nthr)
               for (long i = 0; i < nt; ++i) {
