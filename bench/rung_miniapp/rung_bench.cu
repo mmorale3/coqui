@@ -53,6 +53,7 @@ int main(int argc, char **argv) {
   auto qidx = [&](long k, long kp) { long v[3], a = k, b = kp; for (int d = 2; d >= 0; --d) { v[d] = ((a % n[d]) - (b % n[d]) + n[d]) % n[d]; a /= n[d]; b /= n[d]; }
     return (v[0] * n[1] + v[1]) * n[2] + v[2]; };
   double dmax = 0, smax = 0;
+  if (getenv("RS_NOCHECK")) { rs_destroy(e); printf("spot check skipped (RS_NOCHECK)\n"); return 0; }
   for (long t = 0; t < 3; ++t) {
     const long kp = (t * 7) % nk, p1 = t % nc, p3p = (t * 5) % nc, N = (t * 11) % nR;
     cplx acc(0);
