@@ -4459,6 +4459,27 @@ namespace solvers {
               ns * nkpts * nc * nc);
     }
 
+    // ---- factorize-vertex: REPLACE the cache by an externally approximated rung (accuracy studies of factorized W-bar) ----
+    // vertex_debug wbar_load = <file.h5> reads Wbar_qwmm (nq_ibz, nw_half, N_m, N_m) (the wbar_dump layout) into the cache.
+    if (auto wl = vertex_debug::get("wbar_load"); wl and not wl->empty()) {
+      nda::array<ComplexType, 4> Wl;
+      {
+        h5::file f(*wl, 'r');
+        h5::group g(f);
+        nda::h5_read(g, "Wbar_qwmm", Wl);
+      }
+      utils::check(Wl.shape() == Wb.shape(), "vertex_t::cache_w: wbar_load {} has shape ({}, {}, {}, {}) != the cache's.", *wl,
+                   Wl.shape(0), Wl.shape(1), Wl.shape(2), Wl.shape(3));
+      if (shm_cache) {
+        _Wb_shm->win().fence();
+        if (mpi->node_comm.root()) Wb() = Wl;
+        _Wb_shm->win().fence();
+      } else {
+        Wb() = Wl;
+      }
+      app_log(1, "  [factorize-vertex] Wbar cache REPLACED by {} (wbar_load)", *wl);
+    }
+
     // ---- factorize-vertex: dump the cached rung for offline factorization studies ----------
     // vertex_debug wbar_dump = 1 writes <prefix>.wbar.h5 (rank 0): the cache Wbar_dyn(q, nu >= 0) on the PH-sym half mesh,
     // the secondary collocation Xb(s, k, N, a), the momentum maps, the bosonic grid + transforms, and the analytic q -> 0
