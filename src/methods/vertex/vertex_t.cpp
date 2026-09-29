@@ -4459,6 +4459,52 @@ namespace solvers {
               ns * nkpts * nc * nc);
     }
 
+    // ---- factorize-vertex: dump the cached rung for offline factorization studies ----------
+    // vertex_debug wbar_dump = 1 writes <prefix>.wbar.h5 (rank 0): the cache Wbar_dyn(q, nu >= 0) on the PH-sym half mesh,
+    // the secondary collocation Xb(s, k, N, a), the momentum maps, the bosonic grid + transforms, and the analytic q -> 0
+    // head separately (Hbar = t H t^dag at Gamma and its tau-weights eps_inv_head, already INCLUDED in Wbar at Gamma).
+    // wbar_dump_exit = 1 ends the run right after the dump (skips the readout / Sigma of the iteration).
+    if (vertex_debug::flag("wbar_dump")) {
+      nda::array<ComplexType, 2> Hbar(_Nm, _Nm);
+      Hbar() = ComplexType(0.0);
+      if (head_ok) {
+        nda::array<ComplexType, 2> tmp(_Nm, Np);
+        vertex_secondary_detail::fold_core(_t_qmP(iq_gamma, all, all), H_PQ, tmp, Hbar);
+      }
+      if (mpi->comm.root()) {
+        const std::string fn = mb_state.coqui_prefix + ".wbar.h5";
+        h5::file f(fn, 'w');
+        h5::group g(f);
+        nda::h5_write(g, "Wbar_qwmm", nda::array<ComplexType, 4>(Wb));   // (nq_ibz, nw_half, N_m, N_m)
+        nda::h5_write(g, "Xb_skma", _Xb_skma);                            // (ns, nk, N_m, nc)
+        nda::h5_write(g, "kmq", kmq);                                     // (nq_ibz, nk): k - q
+        nda::h5_write(g, "Qpts", nda::array<double, 2>(MF->Qpts()));
+        nda::h5_write(g, "kpts", nda::array<double, 2>(MF->kpts()));
+        nda::h5_write(g, "wn_b", tools.wn_b);                             // (nw_b) bosonic Matsubara integers
+        nda::h5_write(g, "Ttw_bb", tools.Ttw_bb);                         // (nt, nw_b)
+        nda::h5_write(g, "Twt_bb", tools.Twt_bb);                         // (nw_b, nt)
+        nda::h5_write(g, "tau", tools.s_phys);                            // (nt) physical tau
+        nda::h5_write(g, "Hbar_gamma", Hbar);
+        if (mb_state.eps_inv_head.has_value())
+          nda::h5_write(g, "eps_inv_head_t", nda::array<ComplexType, 1>(mb_state.eps_inv_head.value()));
+        h5::h5_write(g, "beta", tools.beta);
+        h5::h5_write(g, "nw_half", nw_half);
+        h5::h5_write(g, "iq_gamma", iq_gamma);
+        h5::h5_write(g, "head_ok", long(head_ok ? 1 : 0));
+        h5::h5_write(g, "window_first", long(_band_window.first()));
+        h5::h5_write(g, "window_size", long(_band_window.size()));
+        h5::h5_write(g, "nm", _Nm);
+        app_log(1, "  [factorize-vertex] Wbar cache dumped to {} ((nq, nw_half, N_m, N_m) = ({}, {}, {}, {}), head {})",
+                fn, nqpts_ibz, nw_half, _Nm, _Nm, head_ok);
+      }
+      mpi->comm.barrier();
+      if (vertex_debug::flag("wbar_dump_exit")) {
+        app_log(1, "  [factorize-vertex] wbar_dump_exit: ending the run after the Wbar dump.");
+        MPI_Finalize();
+        std::_Exit(0);
+      }
+    }
+
     // ---- footprint: the memory point of the exercise ---------------------------------
     const double to_mb = 16.0 / (1024.0 * 1024.0);   // complex<double>
     const double cache_mb = double(nqpts_ibz) * double(nw_half) * double(_Nm) * double(_Nm) * to_mb;
