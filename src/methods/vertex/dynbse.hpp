@@ -3409,6 +3409,110 @@ namespace dynbse {
 
   /** the readout block: P(r', r) = sum_k sum_{ab} conj(Dleft(k, a, b, r')) Gsum(k, a, b, r) */
 
+
+  // =====================================================================================================================
+  // factorize-vertex: the DRESSED-LEG Gamma_1 readout (P side). Exact identity (notes/step1_factorization_findings.md):
+  //   d^dag (L_s d + L_s [K_d * L_s d])^sum = d^dag Cb d~ + e~^dag (L0 y1)^sum,   y1 = K_d * (L0 d~),
+  //   d~ = (1 - K_s Cb)^-1 d = d + T_s Cb d,   e~ = (1 - Cb K_s)^-dag d = d + T_s^dag Cb^dag d.
+  // (L0 y1)^sum contracted with e~ never needs L0 on the frequency-dependent y1: with the left pole function
+  //   lambda(z) = G(k, z) conj(e~) G(k+q, z + inu) = sum_n U_n (Q_n - R_n) + sum_n T_n (inu R_n + B_n)   [inu != 0]
+  //                                                 = sum_n U_n (Q_n - R_n) + sum_n U_n^2 B_n            [inu == 0]
+  //   (Q_n = g_n e Gh_n, R_n = Gt_n e g'_n, B_n = g_n e g'_n, Gh_n = sum_{l != n} g'_l / D_nl, Gt_n = sum_{j != n} g_j / D_jn,
+  //    D_jl = eps_j - eps_l + inu; g = the G(k) residues, g' = the G(k+q) residues)
+  // the frequency sum is sum_fl sum_n <C^fl_n, Z^fl_n> with Z^fl_n = sum_fy sum_a H[fl][fy](n, a) y1^fy_a (closed-form
+  // Matsubara Grams of the pole families), and moving the matrices onto Z:
+  //   e~^dag (L0 y1)^sum = sum_k e~^dag(k) [ Zt(k) + Cb(k) y1.cst(k) ],
+  //   Zt = sum_n g_n^T Z^U_n Gh_n^T - Gt_n^T Z^U_n g'_n^T + inu Gt_n^T Z^T_n g'_n^T + g_n^T Z^T_n g'_n^T   (Z^T -> Z^{U2} at nu = 0)
+  // =====================================================================================================================
+  struct dressed_grams {
+    long ng = 0, np = 0;
+    nda::array<cplx, 4> H;        // (2 fl, ng, 2 fy, np): fl = {U_n, T_n | U_n^2}, fy = {U_a, T_a}
+  };
+  inline dressed_grams build_dressed_grams(freq_basis const &b, pair_poles const &P, cplx inu) {
+    dressed_grams g;
+    g.ng = P.ng; g.np = b.np;
+    g.H = nda::array<cplx, 4>(2, P.ng, 2, b.np);
+    g.H() = cplx(0.0);
+    const bool nu0 = (inu == cplx(0.0));
+    const double nu = inu.imag(), beta = b.beta;
+    for (long n = 0; n < P.ng; ++n) {
+      auto const &fn = P.fdG[size_t(n)];
+      const double en = P.epsG(n);
+      for (long a = 0; a < b.np; ++a) {
+        auto const &fa = b.fd[size_t(a)];
+        const double D = en - b.eps(a), df = fn.f - fa.f;
+        const bool conf = std::abs(D) <= 1e-12 * (1.0 + std::abs(en));
+        const double suu = conf ? fn.f1 : df / D;                       // [U_n U_a]
+        g.H(0, n, 0, a) = suu;
+        if (nu0) {
+          // [U_n^2 U_a] = d/de_n [U_n U_a] = f'_n / D - (f_n - f_a) / D^2  (series for small beta D; conf: f''/2)
+          if (conf) g.H(1, n, 0, a) = 0.5 * fn.f2;
+          else if (std::abs(beta * D) < 1e-3) g.H(1, n, 0, a) = 0.5 * fn.f2 - D * fn.f3 / 6.0;
+          else g.H(1, n, 0, a) = fn.f1 / D - df / (D * D);
+        } else {
+          const cplx iv(0.0, nu);
+          g.H(0, n, 1, a) = conf ? cplx(fn.f1) / iv : cplx(df) / (D * (D + iv));          // [U_n T_a]
+          g.H(1, n, 0, a) = conf ? cplx(fn.f1) / iv : -cplx(df) / (D * (D - iv));         // [T_n U_a]
+          g.H(1, n, 1, a) = conf ? cplx(-2.0 * fn.f1 / (nu * nu)) : cplx(-2.0 * df / (D * (D * D + nu * nu)));   // [T_n T_a]
+        }
+      }
+    }
+    return g;
+  }
+
+  /** out[a'][b'][N] += alpha sum_{a,b} A(a, a') Z[a][b][N] B(b', b)  (i.e. A^T Z B^T per column N); Z, out: (nc, nc, nR) */
+  inline void pair_sandwich_add(nda::MemoryArrayOfRank<2> auto const &A, cplx const *Z, nda::MemoryArrayOfRank<2> auto const &B,
+                                cplx alpha, cplx *out, long nc, long nR, nda::array<cplx, 2> &W1) {
+    // W1[a][b'][N] = sum_b B(b', b) Z[a][b][N]
+    for (long a = 0; a < nc; ++a) {
+      nda::array_view<cplx const, 2> Za({nc, nR}, Z + a * nc * nR);
+      auto Wa = W1(nda::range(a * nc, (a + 1) * nc), nda::range::all);
+      nda::blas::gemm(B, Za, Wa);
+    }
+    // out[a'][(b', N)] += alpha sum_a A(a, a') W1[a][(b', N)]
+    nda::array_view<cplx, 2> O({nc, nc * nR}, out);
+    auto W2 = nda::reshape(W1, std::array<long, 2>{nc, nc * nR});
+    nda::blas::gemm(alpha, nda::transpose(A), W2, cplx(1.0), O);
+  }
+
+  /** Zt(k) = the operator side of e~^dag (L0 y1)^sum without the constant part (see the block comment above). */
+  inline void dressed_zt(freq_basis const &b, pair_poles const &P, dressed_grams const &g, cplx inu, tf_vector const &y,
+                         nda::array<cplx, 4> &Zt) {
+    decltype(nda::range::all) all;
+    const long nk = P.nk, nc = P.nc, ng = P.ng, np = b.np, nR = y.nR, W = nk * nc * nc * nR;
+    const bool nu0 = (inu == cplx(0.0));
+    // Z^fl_n = sum_fy sum_a H[fl][fy](n, a) y^fy_a : one gemm (2 ng x 2 np)(2 np x W)
+    nda::array<cplx, 2> Z(2 * ng, W);
+    {
+      auto H2 = nda::reshape(g.H, std::array<long, 2>{2 * ng, 2 * np});
+      auto Y2 = nda::reshape(y.fam, std::array<long, 2>{2 * np, W});
+      nda::blas::gemm(H2, Y2, Z);
+    }
+    Zt() = cplx(0.0);
+#pragma omp parallel for schedule(dynamic, 1) num_threads(utils::omp_threads())
+    for (long k = 0; k < nk; ++k) {
+      nda::array<cplx, 2> Gh(nc, nc), Gt(nc, nc), W1(nc * nc, nR);
+      cplx *out = &Zt(k, 0, 0, 0);
+      for (long n = 0; n < ng; ++n) {
+        // the pole-summed legs of node n
+        Gh() = cplx(0.0); Gt() = cplx(0.0);
+        for (long l = 0; l < ng; ++l) {
+          if (l == n) continue;
+          Gh += P.gkq(l, k, all, all) / (P.epsG(n) - P.epsG(l) + inu);
+          Gt += P.gk(l, k, all, all) / (P.epsG(l) - P.epsG(n) + inu);
+        }
+        auto gn = P.gk(n, k, all, all);
+        auto gpn = P.gkq(n, k, all, all);
+        cplx const *ZU = &Z(n, 0) + k * nc * nc * nR;
+        cplx const *ZT = &Z(ng + n, 0) + k * nc * nc * nR;
+        pair_sandwich_add(gn, ZU, Gh, cplx(1.0), out, nc, nR, W1);
+        pair_sandwich_add(Gt, ZU, gpn, cplx(-1.0), out, nc, nR, W1);
+        if (not nu0) pair_sandwich_add(Gt, ZT, gpn, inu, out, nc, nR, W1);
+        pair_sandwich_add(gn, ZT, gpn, cplx(1.0), out, nc, nR, W1);        // T_n B_n (inu != 0) or U_n^2 B_n (inu == 0)
+      }
+    }
+  }
+
 } // namespace dynbse
 } // namespace solvers
 } // namespace methods

@@ -1261,7 +1261,8 @@ namespace solvers {
       // else keeps the host path. vertex_debug dynbse_dev_unit = 0 disables it (the A/B).
       std::unique_ptr<dynbse_cuda::unit_engine, void (*)(dynbse_cuda::unit_engine *)> ue(nullptr, dynbse_cuda::ue_destroy);
       const bool ue_want = db::l0_device_enabled() and vertex_debug::number("dynbse_dev_unit", 1.0) != 0.0 and   // vertex_debug: dynbse_dev_unit
-                           opt.dense_rung and rrank == 0 and opt.gmres_m > 0 and opt.gamma1_only and not opt.static_only and
+                           opt.dense_rung and rrank == 0 and not vertex_debug::flag("dyn_dressed") and opt.gmres_m > 0 and
+                           opt.gamma1_only and not opt.static_only and
                            not opt.one_rung_only and db::l0_cols_state() and not b.npf_mask and
                            not (opt.sigma != nullptr and opt.sigma->col == "dyn");
       bool ue_tried = false;
@@ -1668,6 +1669,45 @@ namespace solvers {
             S = db::build_static_resolvent_from(Cb_k, Ks, opt.resolvent);
           }
           if (met) met->t_lu += watch.lap();
+          // ---- factorize-vertex: the DRESSED-LEG Gamma_1 readout (vertex_debug dyn_dressed = 1; dynbse.hpp block comment) ----
+          // e~ = d + T_s^dag Cb^dag d for all nout left legs, once per unit
+          const bool dressed = vertex_debug::flag("dyn_dressed") and opt.gamma1_only and not opt.one_rung_only and
+                               not opt.static_only and opt.sigma == nullptr and not S.zero;   // vertex_debug: dyn_dressed
+          nda::array<cplx, 4> Et;                               // (nk, nc, nc, nout)
+          std::optional<db::dressed_grams> dgram;
+          double t_dressed = 0.0;
+          if (dressed) {
+            const double tw0 = db::wall_now();
+#if defined(ENABLE_CUDA)
+            utils::check(not ue, "pair_space_ladder_dyn: dyn_dressed runs on the host path (the device unit must be off).");
+#endif
+            Et = nda::array<cplx, 4>(nk, nc, nc, nout);
+            nda::array<cplx, 2> w(D, nout), v(D, nout);
+            for (long k = 0; k < nk; ++k) {                                   // w = Cb^dag d (Cb block diagonal)
+              auto Dk = nda::reshape(Dc(k, all, all, all), std::array<long, 2>{nc2, nout});
+              auto wk = w(nda::range(k * nc2, (k + 1) * nc2), all);
+              nda::blas::gemm(nda::dagger(Cb_k(k, all, all)), Dk, wk);
+            }
+            if (S.mode == "lu") {                                             // T_s^dag w = M^-dag K_s^dag w,  M = 1 - Cb K_s
+              nda::array<cplx, 2> const &Ksr = S.own_ks ? S.Cb : *S.Ks;
+              nda::blas::gemm(nda::dagger(Ksr), w, v);
+              // the stored LU is LAPACK's factorization of M^T (C layout): M^-dag v = conj(M^-T conj(v)), op 'N' on that storage
+              nda::matrix<cplx, nda::F_layout> Yc(D, nout);
+              for (long i = 0; i < D; ++i)
+                for (long c = 0; c < nout; ++c) Yc(i, c) = std::conj(v(i, c));
+              const int info = nda::lapack::getrs(nda::transpose(S.Mlu), Yc, S.ipiv);
+              utils::check(info == 0, "pair_space_ladder_dyn: dressed getrs failed (info {}).", info);
+              for (long i = 0; i < D; ++i)
+                for (long c = 0; c < nout; ++c) v(i, c) = std::conj(Yc(i, c));
+            } else {
+              nda::blas::gemm(nda::dagger(S.Ts), w, v);
+            }
+            for (long k = 0; k < nk; ++k)
+              for (long r = 0; r < nc2; ++r)
+                for (long c = 0; c < nout; ++c) Et(k, r / nc, r % nc, c) = Dc(k, r / nc, r % nc, c) + v(k * nc2 + r, c);
+            dgram.emplace(db::build_dressed_grams(b, P, inu));
+            t_dressed += db::wall_now() - tw0;
+          }
           // ---- the RHS column blocks: each block is an independent solve of width nR ----------
           db::dyson_result res;          // the unit's aggregate over its blocks (histories: the last block)
           long it_unit = 0;
@@ -1724,7 +1764,61 @@ namespace solvers {
               }
             } else
 #endif
-            if (opt.static_only) {
+            if (dressed) {
+              const double tw0 = db::wall_now();
+              // d~ = d + T_s Cb d (the ls_apply resolvent arithmetic on a constant input)
+              nda::array<cplx, 2> fs(D, nR), cs(D, nR);
+              for (long k = 0; k < nk; ++k) {
+                auto Dk = nda::reshape(Dblk(k, all, all, all), std::array<long, 2>{nc2, nR});
+                auto fk = fs(nda::range(k * nc2, (k + 1) * nc2), all);
+                nda::blas::gemm(Cb_k(k, all, all), Dk, fk);
+              }
+              if (S.mode == "lu") {
+                nda::array<cplx, 2> const &Ksr = S.own_ks ? S.Cb : *S.Ks;
+                nda::matrix<cplx, nda::F_layout> Y(D, nR);
+                Y() = fs;
+                const int info = nda::lapack::getrs(S.Mlu, Y, S.ipiv);
+                utils::check(info == 0, "pair_space_ladder_dyn: dressed getrs failed (info {}).", info);
+                nda::array<cplx, 2> z(Y);
+                nda::blas::gemm(Ksr, z, cs);
+              } else {
+                nda::blas::gemm(S.Ts, fs, cs);
+              }
+              db::tf_vector X(np, nk, nc, nR), rv(np, nk, nc, nR), y1(np, nk, nc, nR);
+              for (long k = 0; k < nk; ++k)
+                for (long r = 0; r < nc2; ++r)
+                  for (long N = 0; N < nR; ++N) X.cst(k, r / nc, r % nc, N) = Dblk(k, r / nc, r % nc, N) + cs(k * nc2 + r, N);
+              nda::array<cplx, 4> rsum(nk, nc, nc, nR);
+              t_dressed += db::wall_now() - tw0;
+              double tw = db::wall_now();
+              db::l0_apply(b, P, inu, shared, X, rv, rsum, &Cb_k, stp, false, true);   // r = L0 d~, rsum = Cb d~ (tau route)
+              if (met) { met->t_l0 += db::wall_now() - tw; ++met->n_l0; ++met->n_l0_cst; }
+              const double fe = kd(rv, rsum, y1);
+              tw = db::wall_now();
+              nda::array<cplx, 4> Zt(nk, nc, nc, nR);
+              db::dressed_zt(b, P, *dgram, inu, y1, Zt);
+              for (long k = 0; k < nk; ++k) {                                  // + Cb y1.cst
+                auto yk = nda::reshape(y1.cst(k, all, all, all), std::array<long, 2>{nc2, nR});
+                auto zk = nda::reshape(Zt(k, all, all, all), std::array<long, 2>{nc2, nR});
+                nda::blas::gemm(cplx(1.0), Cb_k(k, all, all), yk, cplx(1.0), zk);
+              }
+              auto Pd = db::collapse(Et, Zt);                                  // (nout, nR): e~^dag (L0 y1)^sum
+              t_dressed += db::wall_now() - tw;
+              res = db::dyson_result{};
+              res.Gsum0 = rsum;                                                // the static column: (L_s d)^sum = Cb d~
+              res.Gsum1 = rsum;                                                // placeholder: Pi_gam1 is written below from Pd
+              res.Gsum = rsum;
+              res.iterations = 1; res.converged = true; res.fit_err_max = fe;
+              readout(res.Gsum0, Pi_static);
+              for (auto *out : {Pi_gam1, Pi_dyn}) {
+                if (out == nullptr) continue;
+                readout(res.Gsum0, out);
+                for (long M = 0; M < nout; ++M)
+                  for (long N = 0; N < nR; ++N) (*out)(jn, iq, M, N0 + N) += cplx(spinfac / double(nk)) * Pd(M, N);
+              }
+              if (met) met->t_vec += t_dressed;
+              t_dressed = 0.0;
+            } else if (opt.static_only) {
               db::tf_vector y0(np, nk, nc, nR), Gamma(np, nk, nc, nR);
               nda::array<cplx, 4> Gsum(nk, nc, nc, nR);
               db::ls_apply(b, P, S, inu, shared, Dblk, y0, Gamma, Gsum, &Cb_k, stp);
@@ -1791,7 +1885,7 @@ namespace solvers {
               if (have_r1) { dynbse_cuda::ue_readout(ue.get(), nR, 2, Pb.data(), &trd); place(Pi_dyn1); }
             } else
 #endif
-            {
+            if (not dressed) {   // factorize-vertex: the dressed-leg branch wrote its columns already
             readout(res.Gsum0, Pi_static);
             if (opt.one_rung_only) {
               // Gsum1 = Cb D + sum L0 K_d L0 D  (T_s = 0): the pure one dynamic rung
