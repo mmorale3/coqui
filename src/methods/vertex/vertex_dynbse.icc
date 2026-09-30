@@ -1262,7 +1262,7 @@ namespace solvers {
       // else keeps the host path. vertex_debug dynbse_dev_unit = 0 disables it (the A/B).
       std::unique_ptr<dynbse_cuda::unit_engine, void (*)(dynbse_cuda::unit_engine *)> ue(nullptr, dynbse_cuda::ue_destroy);
       const bool ue_want = db::l0_device_enabled() and vertex_debug::number("dynbse_dev_unit", 1.0) != 0.0 and   // vertex_debug: dynbse_dev_unit
-                           opt.dense_rung and rrank == 0 and not vertex_debug::flag("dyn_dressed") and opt.gmres_m > 0 and
+                           opt.dense_rung and rrank == 0 and opt.gmres_m > 0 and
                            opt.gamma1_only and not opt.static_only and
                            not opt.one_rung_only and db::l0_cols_state() and not b.npf_mask and
                            not (opt.sigma != nullptr and opt.sigma->col == "dyn");
@@ -1680,12 +1680,21 @@ namespace solvers {
           std::optional<db::dressed_grams> dgram;
           double t_dressed = 0.0;
           double t_dr_e = 0.0, t_dr_d = 0.0, t_dr_z = 0.0, t_dr_c = 0.0;   // e~ build, d~, Zt, collapse
-          if (dressed) {
+          bool dressed_dev = false;
+#if defined(ENABLE_CUDA)
+          if (dressed and ue) {
+            // the device unit: grams / legs from the host, e~ built and kept on the device
+            dgram.emplace(db::build_dressed_grams(b, P, inu));
+            char whyd[256] = {0};
+            dressed_dev = dynbse_cuda::ue_dressed_prepare(ue.get(), P.ng, dgram->H.data(), dgram->Gh.data(), dgram->Gt.data(),
+                                                          P.gk.data(), P.gkq.data(), ts_zero, whyd, 256);
+            utils::check(dressed_dev, "pair_space_ladder_dyn: the device dressed-leg readout could not be prepared: {}", whyd);
+            if (rank == 0 and units_taken == 1) app_log(1, "  [factorize-vertex] dressed-leg Gamma_1 readout ON THE DEVICE UNIT");
+          }
+#endif
+          if (dressed and not dressed_dev) {
             const double tw0 = db::wall_now();
             utils::apply_blas_threads(nthr);                  // the serial BLAS3 of the dressed legs: the rank's threads
-#if defined(ENABLE_CUDA)
-            utils::check(not ue, "pair_space_ladder_dyn: dyn_dressed runs on the host path (the device unit must be off).");
-#endif
             Et = nda::array<cplx, 4>(nk, nc, nc, nout);
             nda::array<cplx, 2> w(ts_zero ? 0 : D, ts_zero ? 0 : nout), v(D, nout);
             v() = cplx(0.0);
@@ -1751,7 +1760,21 @@ namespace solvers {
             const bool want_r1 = (Pi_dyn1 != nullptr and not opt.one_rung_only);
             bool have_r1 = false;
 #if defined(ENABLE_CUDA)
-            if (ue) {
+            std::optional<nda::array<cplx, 2>> Pd_dev, Pr1_dev;            // factorize-vertex: the device dressed-leg columns
+            if (ue and dressed_dev) {
+              have_r1 = want_r1;
+              res = db::dyson_result{};
+              Pd_dev.emplace(nout, nR); Pr1_dev.emplace(nout, nR);
+              double tim[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+              res.fit_err_max = dynbse_cuda::ue_gamma1_dressed(ue.get(), nR, Dblk.data(), inu, ts_zero, have_r1, Pd_dev->data(),
+                                                               Pr1_dev->data(), tim);
+              res.iterations = 1; res.converged = true;
+              if (met) {
+                met->t_l0 += tim[0]; met->t_l0_dev += tim[0]; met->t_ts += tim[1]; met->t_rung += tim[2] + tim[7];
+                met->t_refit += tim[3]; met->t_vec += tim[4]; met->t_l0_h2d += tim[5]; met->t_l0_d2h += tim[6];
+                ++met->n_apps; met->n_l0 += have_r1 ? 2 : 1;
+              }
+            } else if (ue) {
               have_r1 = want_r1;
               res = db::dyson_result{};
               // the readouts run on the device (ue_readout); Gsum0 / Gsum1 / y1 come down only for the HOST Sigma deposits
@@ -1905,12 +1928,22 @@ namespace solvers {
                 for (long M = 0; M < nout; ++M)
                   for (long N = 0; N < nR; ++N) (*out)(jn, iq, M, N0 + N) = cplx(spinfac / double(nk)) * Pb(M, N);
               };
+              if (dressed_dev) {
+                // static column on the device (Gs0 = Cb d~); Gamma_1 = static + e~^dag (L0 y1)^sum; the one bare rung = D^dag (L0 K_d L0 D)^sum
+                dynbse_cuda::ue_readout(ue.get(), nR, 0, Pb.data(), &trd);
+                if (Pi_static != nullptr) place(Pi_static);
+                for (long M = 0; M < nout; ++M)
+                  for (long N = 0; N < nR; ++N) Pb(M, N) += (*Pd_dev)(M, N);
+                place(Pi_gam1); place(Pi_dyn);
+                if (have_r1) { Pb() = *Pr1_dev; place(Pi_dyn1); }
+              } else {
               if (Pi_static != nullptr) { dynbse_cuda::ue_readout(ue.get(), nR, 0, Pb.data(), &trd); place(Pi_static); }
               if (Pi_gam1 != nullptr or Pi_dyn != nullptr) {   // gamma1_only: the resummed slot repeats Gamma_1
                 dynbse_cuda::ue_readout(ue.get(), nR, 1, Pb.data(), &trd);
                 place(Pi_gam1); place(Pi_dyn);
               }
               if (have_r1) { dynbse_cuda::ue_readout(ue.get(), nR, 2, Pb.data(), &trd); place(Pi_dyn1); }
+              }
             } else
 #endif
             if (not dressed) {   // factorize-vertex: the dressed-leg branch wrote its columns already

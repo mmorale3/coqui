@@ -226,6 +226,15 @@ namespace methods::solvers::dynbse_cuda {
                  cplx const *Vs, double const *Kmap, cplx const *S_cst, cplx const *RT, cplx const *RU, bool anyT, cplx pref,
                  cplx *dSig, double *fit_err);
 
+  // ---- factorize-vertex: the DRESSED-LEG Gamma_1 readout on the device (l0_cuda.cu block comment). Per unit, after ue_set_unit and
+  // ue_set_legs: H (2 ng, 2 np) the pole-family Grams, Gh / Gt / gk / gkq (ng, nk, nc, nc); ts_zero = the one-bare-rung pass (e~ = D).
+  bool ue_dressed_prepare(unit_engine *e, long ng, cplx const *H, cplx const *Gh, cplx const *Gt, cplx const *gk, cplx const *gkq,
+                          bool ts_zero, char *why, long why_len);
+  /** per block: Pd (nout, nR) = e~^dag (L0 K_d L0 d~)^sum (host pointer, row-major); the static column's Gsum stays on the device
+   *  (ue_readout(which = 0)); want_r1: also the one-bare-rung column Pr1 (nout, nR) = D^dag (L0 K_d L0 D)^sum. Returns the refit error. */
+  double ue_gamma1_dressed(unit_engine *e, long nR, cplx const *Dblk, cplx inu, bool ts_zero, bool want_r1, cplx *Pd, cplx *Pr1,
+                           double *timing);
+
 } // namespace methods::solvers::dynbse_cuda
 
 #endif

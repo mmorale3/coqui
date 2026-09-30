@@ -1433,10 +1433,21 @@ namespace methods::solvers::dynbse_cuda {
     std::vector<void *> allocs;
   };
 
+  // factorize-vertex: the dressed-leg Gamma_1 readout on the device (ue_dressed_prepare / ue_gamma1_dressed)
+  struct dressed_state {
+    bool on = false;
+    long ng = 0, nR_max = 0;
+    cd *H = nullptr, *Gh = nullptr, *Gt = nullptr, *gk = nullptr, *gkq = nullptr;   // (2ng, 2np); (ng, nk, nc, nc) x 4
+    cd *Etj = nullptr;                                     // conj(e~) (D, nout) row-major (the Dcj layout)
+    cd *Z = nullptr, *Zc = nullptr, *Sa = nullptr, *Sbc = nullptr, *Zt = nullptr;   // (2ng, W); (ng, W) x 3; (W)
+    std::vector<void *> allocs;
+  };
+
   struct unit_engine {
     ue_config c;
     sd_state sd;
     kb_state kb;
+    dressed_state dr;
     cd *Gs0 = nullptr;                                       // Gsum0 of the last block (the Sigma columns static_dyn / dyn1_bare)
     cd *Gr1 = nullptr;                                       // the one-bare-rung Gsum of the last block (when requested)
     cd *Dcj = nullptr, *CbD = nullptr, *Vr = nullptr, *Pr = nullptr;   // conj(legs) (D, nout); the readout scratch
@@ -1534,6 +1545,8 @@ namespace methods::solvers::dynbse_cuda {
     for (void *p : e->sd.allocs)
       if (p) (void)cudaFree(p);
     for (void *p : e->kb.allocs)
+      if (p) (void)cudaFree(p);
+    for (void *p : e->dr.allocs)
       if (p) (void)cudaFree(p);
     delete e;
   }
@@ -2361,6 +2374,168 @@ namespace methods::solvers::dynbse_cuda {
     cu_check(cudaFree(dOut), "fin free out");
     cu_check(cudaFree(dKF), "fin free KF");
     cub_check(cublasDestroy(h), "fin handle destroy");
+  }
+
+
+  // =====================================================================================================================
+  // factorize-vertex: THE DRESSED-LEG GAMMA_1 READOUT ON THE DEVICE (the host twin: vertex_dynbse.icc dyn_dressed branch,
+  // dynbse.hpp build_dressed_grams / dressed_zt). Per block: d~ = D + T_s Cb D, r = L0 d~, y1 = K_d(r), then
+  //   Zt = sum_n [ g_n^T Z^U_n Gh_n^T + (Gt_n^T (inu Z^T_n - Z^U_n) + g_n^T Z^T_n) g'_n^T ] + Cb y1.cst,  Z = H y1.fam,
+  //   Pd (nout, nR) = e~^dag Zt.   e~ is built once per unit in conjugate space: conj(e~) = conj(D) + M^-T K_s^T Cb^T conj(D)
+  //   (the device LU is of the column-major M^T, so the solve is getrs OP_N). No L0 on the frequency-dependent y1.
+  // =====================================================================================================================
+  namespace {
+    __global__ void dr_zc_kernel(long n, cd iv, cd const *__restrict__ ZT, cd const *__restrict__ ZU, cd *__restrict__ Zc) {
+      for (long e = blockIdx.x * long(blockDim.x) + threadIdx.x; e < n; e += long(gridDim.x) * blockDim.x)
+        Zc[e] = cuCsub(cuCmul(iv, ZT[e]), ZU[e]);
+    }
+    // Zt[k][a'][b'][N] = sum_n sum_b Sa[n][k][a'][b][N] Gh[n][k][b'][b] + Sbc[n][k][a'][b][N] gkq[n][k][b'][b]
+    __global__ void dr_rsand_kernel(long ng, long nk, long nc, long nR, cd const *__restrict__ Sa, cd const *__restrict__ Sbc,
+                                    cd const *__restrict__ Gh, cd const *__restrict__ gkq, cd *__restrict__ Zt) {
+      const long tot = nk * nc * nc * nR;
+      for (long e = blockIdx.x * long(blockDim.x) + threadIdx.x; e < tot; e += long(gridDim.x) * blockDim.x) {
+        const long N = e % nR;
+        long t = e / nR;
+        const long bp = t % nc;
+        t /= nc;
+        const long ap = t % nc, k = t / nc;
+        cd acc = make_cuDoubleComplex(0.0, 0.0);
+        for (long n = 0; n < ng; ++n) {
+          const long bs = (((n * nk + k) * nc + ap) * nc) * nR + N, bb = ((n * nk + k) * nc + bp) * nc;
+          for (long b = 0; b < nc; ++b) {
+            acc = cuCadd(acc, cuCmul(Sa[bs + b * nR], Gh[bb + b]));
+            acc = cuCadd(acc, cuCmul(Sbc[bs + b * nR], gkq[bb + b]));
+          }
+        }
+        Zt[e] = acc;
+      }
+    }
+    // Zt (D, nR) from y1 = (fam, cst) of width nR
+    void dr_zt(unit_engine *e, long nR, cplx inu, cd const *yfam, cd const *ycst) {
+      auto &d = e->dr;
+      const long ng = d.ng, np = e->c.np, nk = e->c.nk, nc = e->c.nc, nc2 = e->nc2, W = e->D * nR;
+      const cd one = make_cuDoubleComplex(1.0, 0.0), zero = make_cuDoubleComplex(0.0, 0.0);
+      // Z (2ng, W) = H (2ng, 2np) . yfam (2np, W)   [row-major; column-major Z^T = yfam^T H^T]
+      cub_check(cublasZgemm(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(W), int(2 * ng), int(2 * np), &one, yfam, int(W), d.H, int(2 * np),
+                            &zero, d.Z, int(W)), "dr Z = H y");
+      cd const *ZU = d.Z, *ZT = d.Z + size_t(ng) * W;
+      dr_zc_kernel<<<grid_for(ng * W), 256>>>(ng * W, make_cuDoubleComplex(inu.real(), inu.imag()), ZT, ZU, d.Zc);
+      launch_check("dr Zc");
+      // S[n][k] (nc x nc nR) = A[n][k]^T Z[n][k] over the (n, k) batch: column-major S^T = Z^T A (A's storage = A^T -> OP_T)
+      const long bnk = ng * nk, sz = nc2 * nR;
+      auto sbatch = [&](cd const *Zx, cd const *A, cd beta, cd *S, char const *what) {
+        cub_check(cublasZgemmStridedBatched(e->cb, CUBLAS_OP_N, CUBLAS_OP_T, int(nc * nR), int(nc), int(nc), &one, Zx, int(nc * nR),
+                                            (long long)sz, A, int(nc), (long long)nc2, &beta, S, int(nc * nR), (long long)sz,
+                                            int(bnk)), what);
+      };
+      sbatch(ZU, d.gk, zero, d.Sa, "dr Sa = g^T ZU");
+      sbatch(ZT, d.gk, zero, d.Sbc, "dr Sbc = g^T ZT");
+      sbatch(d.Zc, d.Gt, one, d.Sbc, "dr Sbc += Gt^T (inu ZT - ZU)");
+      dr_rsand_kernel<<<grid_for(W), 256>>>(ng, nk, nc, nR, d.Sa, d.Sbc, d.Gh, d.gkq, d.Zt);
+      launch_check("dr rsand");
+      ue_cb_times(e, nR, ycst, d.Zt, true);                  // + Cb y1.cst
+    }
+    // Ph (nout, nR) row-major = Lj^dag-collapse: P^T (nR x nout) = Zt^T-view . Lj (the ue_readout arithmetic with the legs Lj)
+    void dr_collapse(unit_engine *e, long nR, cd const *Zt, cd const *Lj, cplx *Ph) {
+      const long D = e->D, nout = e->c.nout;
+      const cd one = make_cuDoubleComplex(1.0, 0.0), zero = make_cuDoubleComplex(0.0, 0.0);
+      cub_check(cublasZgemm(e->cb, CUBLAS_OP_N, CUBLAS_OP_T, int(nR), int(nout), int(D), &one, Zt, int(nR), Lj, int(nout), &zero,
+                            e->Pr, int(nR)), "dr collapse");
+      cu_check(cudaMemcpy(Ph, e->Pr, size_t(nout * nR) * sizeof(cd), cudaMemcpyDeviceToHost), "dr collapse d2h");
+    }
+  } // namespace
+
+  bool ue_dressed_prepare(unit_engine *e, long ng, cplx const *Hh, cplx const *Ghh, cplx const *Gth, cplx const *gkh,
+                          cplx const *gkqh, bool ts_zero, char *why, long why_len) {
+    auto &d = e->dr;
+    const long np = e->c.np, nk = e->c.nk, nc2 = e->nc2, D = e->D, nout = e->c.nout, R = e->c.nR_max;
+    const size_t W = size_t(D) * size_t(R);
+    if (not e->legs_ok) { std::snprintf(why, size_t(why_len), "the legs are not set"); return false; }
+    if (not d.on or d.ng != ng) {
+      for (void *p : d.allocs) if (p) (void)cudaFree(p);
+      d.allocs.clear();
+      const double need = 16.0 * (double(4 * ng * np) + 4.0 * double(ng * nk * nc2) + double(D * nout) * 3.0 +
+                                  double(W) * (2.0 * ng + 3.0 * ng + 1.0));
+      size_t fr = 0, tot = 0;
+      cu_check(cudaMemGetInfo(&fr, &tot), "dr memgetinfo");
+      if (need > 0.9 * double(fr)) {
+        std::snprintf(why, size_t(why_len), "needs %.1f GB of device memory, %.1f GB free", need / 1e9, double(fr) / 1e9);
+        return false;
+      }
+      auto al = [&](size_t n, char const *w) { cd *p = dalloc<cd>(n, w); d.allocs.push_back(p); return p; };
+      d.H = al(size_t(4 * ng * np), "dr H");
+      d.Gh = al(size_t(ng * nk * nc2), "dr Gh"); d.Gt = al(size_t(ng * nk * nc2), "dr Gt");
+      d.gk = al(size_t(ng * nk * nc2), "dr gk"); d.gkq = al(size_t(ng * nk * nc2), "dr gkq");
+      d.Etj = al(size_t(D * nout), "dr Etj");
+      d.Z = al(2 * size_t(ng) * W, "dr Z"); d.Zc = al(size_t(ng) * W, "dr Zc");
+      d.Sa = al(size_t(ng) * W, "dr Sa"); d.Sbc = al(size_t(ng) * W, "dr Sbc"); d.Zt = al(W, "dr Zt");
+      d.ng = ng; d.nR_max = R; d.on = true;
+    }
+    h2d_c(d.H, Hh, size_t(4 * ng * np), "dr H"); h2d_c(d.Gh, Ghh, size_t(ng * nk * nc2), "dr Gh");
+    h2d_c(d.Gt, Gth, size_t(ng * nk * nc2), "dr Gt"); h2d_c(d.gk, gkh, size_t(ng * nk * nc2), "dr gk");
+    h2d_c(d.gkq, gkqh, size_t(ng * nk * nc2), "dr gkq");
+    if (ts_zero) {
+      cu_check(cudaMemcpy(d.Etj, e->Dcj, size_t(D * nout) * sizeof(cd), cudaMemcpyDeviceToDevice), "dr Etj = Dcj");
+      return true;
+    }
+    if (not e->unit_ok) { std::snprintf(why, size_t(why_len), "the unit's LU is not set"); return false; }
+    // conjugate space, column-major (D x nout): X0 = Dcj^T; w = blockdiag(Cb^T) X0; u = K_s^T w; u <- M^-T u; X0 += u; Etj = X0^T
+    const cd one = make_cuDoubleComplex(1.0, 0.0), zero = make_cuDoubleComplex(0.0, 0.0);
+    cd *X0 = dalloc<cd>(size_t(D * nout), "dr X0"), *w = dalloc<cd>(size_t(D * nout), "dr w"), *u = dalloc<cd>(size_t(D * nout), "dr u");
+    cub_check(cublasZgeam(e->cb, CUBLAS_OP_T, CUBLAS_OP_N, int(D), int(nout), &one, e->Dcj, int(nout), &zero, X0, int(D), X0, int(D)),
+              "dr X0");
+    cub_check(cublasZgemmStridedBatched(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(nc2), int(nout), int(nc2), &one, e->Cbk, int(nc2),
+                                        (long long)(nc2 * nc2), X0, int(D), (long long)nc2, &zero, w, int(D), (long long)nc2, int(nk)),
+              "dr w = Cb^T X0");
+    cub_check(cublasZgemm(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(D), int(nout), int(D), &one, e->Ks, int(D), w, int(D), &zero, u, int(D)),
+              "dr u = Ks^T w");
+    if (cusolverDnZgetrs(e->cs, CUBLAS_OP_N, int(D), int(nout), e->M, int(D), e->ipiv, u, int(D), e->dinfo) != CUSOLVER_STATUS_SUCCESS)
+      APP_ABORT(std::string(" ue_dressed_prepare: cusolverDnZgetrs failed."));
+    cub_check(cublasZgeam(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(D), int(nout), &one, X0, int(D), &one, u, int(D), X0, int(D)), "dr X0 += u");
+    cub_check(cublasZgeam(e->cb, CUBLAS_OP_T, CUBLAS_OP_N, int(nout), int(D), &one, X0, int(D), &zero, d.Etj, int(nout), d.Etj, int(nout)),
+              "dr Etj");
+    cu_check(cudaDeviceSynchronize(), "dr prepare");
+    for (cd *p : {X0, w, u}) (void)cudaFree(p);
+    return true;
+  }
+
+  double ue_gamma1_dressed(unit_engine *e, long nR, cplx const *Dblkh, cplx inu, bool ts_zero, bool want_r1, cplx *Pdh, cplx *Pr1h,
+                           double *tim) {
+    if (not e->dr.on) APP_ABORT(std::string(" ue_gamma1_dressed: ue_dressed_prepare was not called."));
+    if (nR > e->c.nR_max) APP_ABORT(std::string(" ue_gamma1_dressed: block wider than the engine's nR_max."));
+    const long W = e->D * nR;
+    double t0 = wnow();
+    h2d_c(e->Dblk, Dblkh, size_t(W), "dr Dblk");
+    e->cbd_ok = false;
+    tim[5] += wnow() - t0;
+    // d~ = D + T_s Cb D  (into Xcst)
+    if (ts_zero) {
+      cu_check(cudaMemcpy(e->Xcst, e->Dblk, size_t(W) * sizeof(cd), cudaMemcpyDeviceToDevice), "dr d~ = D");
+    } else {
+      ue_cb_times(e, nR, e->Dblk, e->Xcst, false);
+      ue_ts(e, nR, e->Xcst, &tim[1]);
+      add2_kernel<<<grid_for(W), 256>>>(W, e->Dblk, e->csb, e->Xcst);
+      launch_check("dr d~");
+    }
+    // r = L0 d~ (Fsum = Cb d~: the static column's Gsum), y1 = K_d(r)
+    ue_l0(e, nR, nullptr, e->Xcst, e->Ffam, e->Fsum, &tim[0]);
+    cu_check(cudaMemcpy(e->Gs0, e->Fsum, size_t(W) * sizeof(cd), cudaMemcpyDeviceToDevice), "dr Gs0");
+    const double fe = ue_kd(e, nR, e->Ffam, e->Fsum, e->yfam, e->ycst, tim);
+    t0 = wnow();
+    dr_zt(e, nR, inu, e->yfam, e->ycst);
+    dr_collapse(e, nR, e->dr.Zt, e->dr.Etj, Pdh);
+    tim[4] += wnow() - t0;
+    e->r1_ok = false;
+    if (want_r1 and not ts_zero) {
+      // the one bare dynamic rung (T_s = 0): d~ = e~ = D
+      ue_l0(e, nR, nullptr, e->Dblk, e->Ffam, e->Fsum, &tim[0]);
+      (void)ue_kd(e, nR, e->Ffam, e->Fsum, e->yfam, e->ycst, tim);
+      t0 = wnow();
+      dr_zt(e, nR, inu, e->yfam, e->ycst);
+      dr_collapse(e, nR, e->dr.Zt, e->Dcj, Pr1h);
+      tim[4] += wnow() - t0;
+    }
+    return fe;
   }
 
 
