@@ -3427,6 +3427,7 @@ namespace dynbse {
   struct dressed_grams {
     long ng = 0, np = 0;
     nda::array<cplx, 4> H;        // (2 fl, ng, 2 fy, np): fl = {U_n, T_n | U_n^2}, fy = {U_a, T_a}
+    nda::array<cplx, 4> Gh, Gt;   // (ng, nk, nc, nc): the pole-summed legs Gh_n(k) = sum_{l != n} g'_l / D_nl, Gt_n(k) = sum_{j != n} g_j / D_jn
   };
   inline dressed_grams build_dressed_grams(freq_basis const &b, pair_poles const &P, cplx inu) {
     dressed_grams g;
@@ -3457,6 +3458,22 @@ namespace dynbse {
         }
       }
     }
+    // the pole-summed legs (per unit: they depend on (q, inu) and k only)
+    const long nk = P.nk, nc = P.nc;
+    g.Gh = nda::array<cplx, 4>(P.ng, nk, nc, nc); g.Gt = nda::array<cplx, 4>(P.ng, nk, nc, nc);
+    g.Gh() = cplx(0.0); g.Gt() = cplx(0.0);
+#pragma omp parallel for collapse(2) num_threads(utils::omp_threads())
+    for (long n = 0; n < P.ng; ++n)
+      for (long k = 0; k < nk; ++k)
+        for (long l = 0; l < P.ng; ++l) {
+          if (l == n) continue;
+          const cplx wh = 1.0 / (P.epsG(n) - P.epsG(l) + inu), wt = 1.0 / (P.epsG(l) - P.epsG(n) + inu);
+          for (long a = 0; a < nc; ++a)
+            for (long c = 0; c < nc; ++c) {
+              g.Gh(n, k, a, c) += wh * P.gkq(l, k, a, c);
+              g.Gt(n, k, a, c) += wt * P.gk(l, k, a, c);
+            }
+        }
     return g;
   }
 
@@ -3476,31 +3493,29 @@ namespace dynbse {
   }
 
   /** Zt(k) = the operator side of e~^dag (L0 y1)^sum without the constant part (see the block comment above). */
-  inline void dressed_zt(freq_basis const &b, pair_poles const &P, dressed_grams const &g, cplx inu, tf_vector const &y,
+  /** Z^fl_n = sum_fy sum_a H[fl][fy](n, a) y^fy_a : one gemm (2 ng x 2 np)(2 np x W) -- call with threaded BLAS */
+  inline nda::array<cplx, 2> dressed_z(freq_basis const &b, pair_poles const &P, dressed_grams const &g, tf_vector const &y) {
+    const long ng = P.ng, np = b.np, W = P.nk * P.nc * P.nc * y.nR;
+    nda::array<cplx, 2> Z(2 * ng, W);
+    auto H2 = nda::reshape(g.H, std::array<long, 2>{2 * ng, 2 * np});
+    auto Y2 = nda::reshape(y.fam, std::array<long, 2>{2 * np, W});
+    nda::blas::gemm(H2, Y2, Z);
+    return Z;
+  }
+  /** the per-k sandwiches (omp threads, sequential BLAS inside) */
+  inline void dressed_zt(pair_poles const &P, dressed_grams const &g, cplx inu, nda::array<cplx, 2> const &Z, long nR,
                          nda::array<cplx, 4> &Zt) {
     decltype(nda::range::all) all;
-    const long nk = P.nk, nc = P.nc, ng = P.ng, np = b.np, nR = y.nR, W = nk * nc * nc * nR;
+    const long nk = P.nk, nc = P.nc, ng = P.ng;
     const bool nu0 = (inu == cplx(0.0));
-    // Z^fl_n = sum_fy sum_a H[fl][fy](n, a) y^fy_a : one gemm (2 ng x 2 np)(2 np x W)
-    nda::array<cplx, 2> Z(2 * ng, W);
-    {
-      auto H2 = nda::reshape(g.H, std::array<long, 2>{2 * ng, 2 * np});
-      auto Y2 = nda::reshape(y.fam, std::array<long, 2>{2 * np, W});
-      nda::blas::gemm(H2, Y2, Z);
-    }
     Zt() = cplx(0.0);
 #pragma omp parallel for schedule(dynamic, 1) num_threads(utils::omp_threads())
     for (long k = 0; k < nk; ++k) {
-      nda::array<cplx, 2> Gh(nc, nc), Gt(nc, nc), W1(nc * nc, nR);
+      nda::array<cplx, 2> W1(nc * nc, nR);
       cplx *out = &Zt(k, 0, 0, 0);
       for (long n = 0; n < ng; ++n) {
-        // the pole-summed legs of node n
-        Gh() = cplx(0.0); Gt() = cplx(0.0);
-        for (long l = 0; l < ng; ++l) {
-          if (l == n) continue;
-          Gh += P.gkq(l, k, all, all) / (P.epsG(n) - P.epsG(l) + inu);
-          Gt += P.gk(l, k, all, all) / (P.epsG(l) - P.epsG(n) + inu);
-        }
+        auto Gh = g.Gh(n, k, all, all);
+        auto Gt = g.Gt(n, k, all, all);
         auto gn = P.gk(n, k, all, all);
         auto gpn = P.gkq(n, k, all, all);
         cplx const *ZU = &Z(n, 0) + k * nc * nc * nR;

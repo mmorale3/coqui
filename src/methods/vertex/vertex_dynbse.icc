@@ -1,5 +1,6 @@
 #ifndef COQUI_VERTEX_DYNBSE_ICC
 #define COQUI_VERTEX_DYNBSE_ICC
+#include "utilities/blas_threads.hpp"   // factorize-vertex: the dressed-leg BLAS3 on the rank's threads
 
 /**
  * scGW-tilde Tier 2, FULL FREQUENCY: the resummed DYNAMIC-rung BSE polarization in the ladder's
@@ -1676,8 +1677,10 @@ namespace solvers {
           nda::array<cplx, 4> Et;                               // (nk, nc, nc, nout)
           std::optional<db::dressed_grams> dgram;
           double t_dressed = 0.0;
+          double t_dr_e = 0.0, t_dr_d = 0.0, t_dr_z = 0.0, t_dr_c = 0.0;   // e~ build, d~, Zt, collapse
           if (dressed) {
             const double tw0 = db::wall_now();
+            utils::apply_blas_threads(nthr);                  // the serial BLAS3 of the dressed legs: the rank's threads
 #if defined(ENABLE_CUDA)
             utils::check(not ue, "pair_space_ladder_dyn: dyn_dressed runs on the host path (the device unit must be off).");
 #endif
@@ -1706,7 +1709,9 @@ namespace solvers {
               for (long r = 0; r < nc2; ++r)
                 for (long c = 0; c < nout; ++c) Et(k, r / nc, r % nc, c) = Dc(k, r / nc, r % nc, c) + v(k * nc2 + r, c);
             dgram.emplace(db::build_dressed_grams(b, P, inu));
+            utils::apply_blas_threads(std::max(1l, utils::blas_threads()));
             t_dressed += db::wall_now() - tw0;
+            t_dr_e += db::wall_now() - tw0;
           }
           // ---- the RHS column blocks: each block is an independent solve of width nR ----------
           db::dyson_result res;          // the unit's aggregate over its blocks (histories: the last block)
@@ -1766,6 +1771,7 @@ namespace solvers {
 #endif
             if (dressed) {
               const double tw0 = db::wall_now();
+              utils::apply_blas_threads(nthr);
               // d~ = d + T_s Cb d (the ls_apply resolvent arithmetic on a constant input)
               nda::array<cplx, 2> fs(D, nR), cs(D, nR);
               for (long k = 0; k < nk; ++k) {
@@ -1789,21 +1795,35 @@ namespace solvers {
                 for (long r = 0; r < nc2; ++r)
                   for (long N = 0; N < nR; ++N) X.cst(k, r / nc, r % nc, N) = Dblk(k, r / nc, r % nc, N) + cs(k * nc2 + r, N);
               nda::array<cplx, 4> rsum(nk, nc, nc, nR);
+              utils::apply_blas_threads(std::max(1l, utils::blas_threads()));
               t_dressed += db::wall_now() - tw0;
+              t_dr_d += db::wall_now() - tw0;
               double tw = db::wall_now();
               db::l0_apply(b, P, inu, shared, X, rv, rsum, &Cb_k, stp, false, true);   // r = L0 d~, rsum = Cb d~ (tau route)
               if (met) { met->t_l0 += db::wall_now() - tw; ++met->n_l0; ++met->n_l0_cst; }
               const double fe = kd(rv, rsum, y1);
               tw = db::wall_now();
               nda::array<cplx, 4> Zt(nk, nc, nc, nR);
-              db::dressed_zt(b, P, *dgram, inu, y1, Zt);
+              utils::apply_blas_threads(nthr);                            // the Gram product Z = H y: one big threaded gemm
+              auto Zg = db::dressed_z(b, P, *dgram, y1);
+              utils::apply_blas_threads(1);                               // the per-k sandwiches: omp threads, sequential BLAS
+              db::dressed_zt(P, *dgram, inu, Zg, nR, Zt);
+              utils::apply_blas_threads(nthr);
+              t_dr_z += db::wall_now() - tw;
+              const double tc0 = db::wall_now();
               for (long k = 0; k < nk; ++k) {                                  // + Cb y1.cst
                 auto yk = nda::reshape(y1.cst(k, all, all, all), std::array<long, 2>{nc2, nR});
                 auto zk = nda::reshape(Zt(k, all, all, all), std::array<long, 2>{nc2, nR});
                 nda::blas::gemm(cplx(1.0), Cb_k(k, all, all), yk, cplx(1.0), zk);
               }
               auto Pd = db::collapse(Et, Zt);                                  // (nout, nR): e~^dag (L0 y1)^sum
+              utils::apply_blas_threads(std::max(1l, utils::blas_threads()));
+              t_dr_c += db::wall_now() - tc0;
               t_dressed += db::wall_now() - tw;
+              if (rank == 0 and units_taken == 1 and N1 == nout)
+                app_log(1, "  [factorize-vertex] dressed-leg Gamma_1, first unit on rank 0: e~ build {:.2f} s, d~ {:.2f} s, Zt (Gram gemm + "
+                           "sandwiches) {:.2f} s, Cb y.cst + collapse {:.2f} s ({} RHS blocks)", t_dr_e, t_dr_d, t_dr_z, t_dr_c,
+                        (nout + nrb - 1) / nrb);
               res = db::dyson_result{};
               res.Gsum0 = rsum;                                                // the static column: (L_s d)^sum = Cb d~
               res.Gsum1 = rsum;                                                // placeholder: Pi_gam1 is written below from Pd
