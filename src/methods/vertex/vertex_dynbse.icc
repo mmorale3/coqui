@@ -1717,7 +1717,14 @@ namespace solvers {
               utils::check(info == 0, "pair_space_ladder_dyn: the device getrf of (1 - Cb K_s) failed (info {}).", info);
             } else
 #endif
-            S = db::build_static_resolvent_from(Cb_k, Ks, opt.resolvent);
+            {
+              // factorize-vertex: the dense getrf / inverse outside any omp region -- on the rank's threads (vertex_debug dyn_lu_threads = 0
+              // keeps the configured BLAS threads)
+              const bool lu_thr = (vertex_debug::number("dyn_lu_threads", 1.0) != 0.0);   // vertex_debug: dyn_lu_threads
+              if (lu_thr) utils::apply_blas_threads(nthr);
+              S = db::build_static_resolvent_from(Cb_k, Ks, opt.resolvent);
+              if (lu_thr) utils::apply_blas_threads(std::max(1l, utils::blas_threads()));
+            }
           }
           if (met) met->t_lu += watch.lap();
           // ---- factorize-vertex: the DRESSED-LEG Gamma_1 readout (vertex_debug dyn_dressed = 1; dynbse.hpp block comment) ----
