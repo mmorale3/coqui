@@ -33,6 +33,8 @@
 #include "nda/linalg/eigenelements.hpp"
 
 #include "utilities/check.hpp"
+#include "utilities/omp_threads.hpp"   // factorize-vertex: the L2 BLAS threads
+#include "utilities/blas_threads.hpp"
 #include "utilities/proc_grid_partition.hpp"  // Impl 2b: {1,nP,nQ} grid for distributed Z fold
 #include "numerics/sparse/csr_blas.hpp"   // csrmm for the symmetry D-matrix blocks
 #include "methods/ERI/thc_reader_t.hpp"

@@ -932,6 +932,13 @@ namespace solvers {
                                   ward_args const *ward = nullptr) {
       prof_watch pwatch;
       if (prof) prof->rss_entry = prof_rss_gb();
+      // factorize-vertex: this path has no omp regions -- its dense BLAS/LAPACK (the (D, D) getrf, the rung and projection
+      // gemms) runs on the rank's threads instead of the configured blas_threads (vertex_debug l2_blas_threads = 0 restores)
+      struct blas_thr_guard {
+        bool on = false;
+        explicit blas_thr_guard(long n) : on(n > 1) { if (on) utils::apply_blas_threads(n); }
+        ~blas_thr_guard() { if (on) utils::apply_blas_threads(std::max(1l, utils::blas_threads())); }
+      } l2_thr((vertex_debug::number("l2_blas_threads", 1.0) != 0.0) ? utils::omp_threads() : 1);   // vertex_debug: l2_blas_threads
       decltype(nda::range::all) all;
       const long nt = G_CC.shape(0), ns = G_CC.shape(1), nk = G_CC.shape(2);
       const long nc = G_CC.shape(3), Nm = Xb.shape(2);
