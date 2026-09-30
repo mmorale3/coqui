@@ -2567,7 +2567,7 @@ namespace methods::solvers::dynbse_cuda {
   }
 
   double ue_gamma1_dressed(unit_engine *e, long nR, cplx const *Dblkh, cplx inu, bool ts_zero, bool want_r1, cplx *Pdh, cplx *Pr1h,
-                           double *tim) {
+                           double *tim, bool want_gsum1) {
     if (not e->dr.on) APP_ABORT(std::string(" ue_gamma1_dressed: ue_dressed_prepare was not called."));
     if (nR > e->c.nR_max) APP_ABORT(std::string(" ue_gamma1_dressed: block wider than the engine's nR_max."));
     const long W = e->D * nR;
@@ -2592,6 +2592,19 @@ namespace methods::solvers::dynbse_cuda {
     dr_zt(e, nR, inu, e->yfam, e->ycst);
     dr_collapse(e, nR, e->dr.Zt, e->dr.Etj, Pdh);
     tim[4] += wnow() - t0;
+    if (want_gsum1) {
+      // the Sigma deposits (ue_sd_block) read Gsum1 = Cb d~ + L + Cb T_s L, L = (L0 y1)^sum = Zt, and y1 = (yfam, ycst) in place
+      if (ts_zero) {
+        add2_kernel<<<grid_for(W), 256>>>(W, e->Gs0, e->dr.Zt, e->Gsum);
+      } else {
+        ue_ts(e, nR, e->dr.Zt, &tim[1]);
+        add2_kernel<<<grid_for(W), 256>>>(W, e->Gs0, e->dr.Zt, e->Gsum);
+        add2_kernel<<<grid_for(W), 256>>>(W, e->Gsum, e->cbb, e->Gsum);
+      }
+      launch_check("dr Gsum1");
+      cu_check(cudaDeviceSynchronize(), "dr gsum1");
+      want_r1 = false;                                     // (the r1 pass would overwrite y1 before the deposits)
+    }
     e->r1_ok = false;
     if (want_r1 and not ts_zero) {
       // the one bare dynamic rung (T_s = 0): d~ = e~ = D

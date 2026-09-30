@@ -1715,7 +1715,7 @@ namespace solvers {
           double t_dr_e = 0.0, t_dr_d = 0.0, t_dr_z = 0.0, t_dr_c = 0.0;   // e~ build, d~, Zt, collapse
           bool dressed_dev = false;
 #if defined(ENABLE_CUDA)
-          if (dressed and ue and opt.sigma == nullptr) {
+          if (dressed and ue and (opt.sigma == nullptr or sd_dev.on)) {   // (Sigma: the device deposits read Gsum1 / y1 in place)
             // the device unit: grams / legs from the host, e~ built and kept on the device
             dgram.emplace(db::build_dressed_grams(b, P, inu));
             char whyd[256] = {0};
@@ -1807,8 +1807,9 @@ namespace solvers {
               res = db::dyson_result{};
               Pd_dev.emplace(nout, nR); Pr1_dev.emplace(nout, nR);
               double tim[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+              if (opt.sigma != nullptr) have_r1 = false;
               res.fit_err_max = dynbse_cuda::ue_gamma1_dressed(ue.get(), nR, Dblk.data(), inu, ts_zero, have_r1, Pd_dev->data(),
-                                                               Pr1_dev->data(), tim);
+                                                               Pr1_dev->data(), tim, opt.sigma != nullptr);
               res.iterations = 1; res.converged = true;
               if (met) {
                 met->t_l0 += tim[0]; met->t_l0_dev += tim[0]; met->t_ts += tim[1]; met->t_rung += tim[2] + tim[7];

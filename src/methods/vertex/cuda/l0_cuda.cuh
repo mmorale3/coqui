@@ -233,7 +233,7 @@ namespace methods::solvers::dynbse_cuda {
   /** per block: Pd (nout, nR) = e~^dag (L0 K_d L0 d~)^sum (host pointer, row-major); the static column's Gsum stays on the device
    *  (ue_readout(which = 0)); want_r1: also the one-bare-rung column Pr1 (nout, nR) = D^dag (L0 K_d L0 D)^sum. Returns the refit error. */
   double ue_gamma1_dressed(unit_engine *e, long nR, cplx const *Dblk, cplx inu, bool ts_zero, bool want_r1, cplx *Pd, cplx *Pr1,
-                           double *timing);
+                           double *timing, bool want_gsum1 = false);
 
   /** factorize-vertex: the rung form of ue_kd: rung_pair = the two PH-mirror nodes of a representative in one gemm (default); rr = R > 0:
    *  the frequency-factorized rung (the engine's K_d slots hold K_r = K[A_r], ndist = R), ctr (nt, R) row-major the time functions. */
