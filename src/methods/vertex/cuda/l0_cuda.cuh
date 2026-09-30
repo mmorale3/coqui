@@ -235,6 +235,10 @@ namespace methods::solvers::dynbse_cuda {
   double ue_gamma1_dressed(unit_engine *e, long nR, cplx const *Dblk, cplx inu, bool ts_zero, bool want_r1, cplx *Pd, cplx *Pr1,
                            double *timing);
 
+  /** factorize-vertex: the rung form of ue_kd: rung_pair = the two PH-mirror nodes of a representative in one gemm (default); rr = R > 0:
+   *  the frequency-factorized rung (the engine's K_d slots hold K_r = K[A_r], ndist = R), ctr (nt, R) row-major the time functions. */
+  void ue_set_rung_mode(unit_engine *e, bool rung_pair, long rr, cplx const *ctr);
+
 } // namespace methods::solvers::dynbse_cuda
 
 #endif

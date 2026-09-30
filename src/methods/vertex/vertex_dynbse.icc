@@ -1249,6 +1249,9 @@ namespace solvers {
       // every rank sees each transfer's nu nodes contiguously, so the objects are built once per group
       long last_sq = -1;
       std::vector<long> trep(static_cast<size_t>(nt), -1);
+      std::vector<std::pair<long, long>> rep_nodes;     // factorize-vertex: the (one or two) tau nodes of each representative
+      // factorize-vertex: mirror-pair rung gemms (vertex_debug dyn_rung_pair = 0 restores the per-node gemms)
+      const bool rung_pair = (vertex_debug::number("dyn_rung_pair", 1.0) != 0.0);   // vertex_debug: dyn_rung_pair
       long ndist = 0;
       nda::array<cplx, 3> Kd_s;
       nda::array<cplx, 2> Kd0;
@@ -1262,7 +1265,7 @@ namespace solvers {
       // else keeps the host path. vertex_debug dynbse_dev_unit = 0 disables it (the A/B).
       std::unique_ptr<dynbse_cuda::unit_engine, void (*)(dynbse_cuda::unit_engine *)> ue(nullptr, dynbse_cuda::ue_destroy);
       const bool ue_want = db::l0_device_enabled() and vertex_debug::number("dynbse_dev_unit", 1.0) != 0.0 and   // vertex_debug: dynbse_dev_unit
-                           opt.dense_rung and rrank == 0 and opt.gmres_m > 0 and
+                           opt.dense_rung and opt.gmres_m > 0 and
                            opt.gamma1_only and not opt.static_only and
                            not opt.one_rung_only and db::l0_cols_state() and not b.npf_mask and
                            not (opt.sigma != nullptr and opt.sigma->col == "dyn");
@@ -1369,19 +1372,27 @@ namespace solvers {
             trep[size_t(i)] = slot;
           }
           ndist = long(reps.size());
+          rep_nodes.assign(size_t(ndist), {-1l, -1l});
+          for (long i = 0; i < nt; ++i) {
+            auto &pr = rep_nodes[size_t(trep[size_t(i)])];
+            if (pr.first < 0) pr.first = i; else pr.second = i;
+          }
         }
 #if defined(ENABLE_CUDA)
         if (ue_want and not ue_tried) {                   // created at the first transfer (ndist is known), before its rungs
           ue_tried = true;
           dynbse_cuda::ue_config uc;
           uc.np = np; uc.np_fit = b.np_fit; uc.nk = nk; uc.nc = nc; uc.ng = ng; uc.nt = nt; uc.nR_max = nrb;
-          uc.ndist = ndist; uc.n_kept = b.pf.n_kept; uc.nout = nout;
+          uc.ndist = (rrank > 0) ? rrank : ndist; uc.n_kept = b.pf.n_kept; uc.nout = nout;   // factorize-vertex: R rung slots
           uc.l0_fused = int(vertex_debug::number("dynbse_l0_fused", 2.0));        // vertex_debug: dynbse_l0_fused (0 | 1 | 2 = merged)
           uc.l0_fz_cfg = int(vertex_debug::number("dynbse_l0_fz_cfg", 44.0));     // vertex_debug: dynbse_l0_fz_cfg
           uc.l0_fz_bench = int(vertex_debug::number("dynbse_l0_fz_bench", 0.0)); // vertex_debug: dynbse_l0_fz_bench
           uc.l0_asm_gemm = int(vertex_debug::number("dynbse_l0_asm_gemm", 1.0));  // vertex_debug: dynbse_l0_asm_gemm
           char why[256] = {0};
           ue.reset(dynbse_cuda::ue_create(uc, 1.0e6 * double(utils::freemem_device_effective()), why, 256));
+          if (ue) {                                       // factorize-vertex: the rung form (mirror pairs / frequency-factorized)
+            dynbse_cuda::ue_set_rung_mode(ue.get(), rung_pair, rrank, rrank > 0 ? c_tr.data() : nullptr);
+          }
           if (ue) {                                       // the basis' DLR refit at its fixed rank (basis_coeffs, npf_mask off)
             auto const &pf = b.pf;
             utils::check(pf.np == b.np_fit and pf.nt == nt and pf.n_kept == b.pf.n_kept,
@@ -1396,13 +1407,15 @@ namespace solvers {
                     dynbse_cuda::ue_bytes(uc) / 1e9, ue ? "" : " -- ", ue ? "" : why);
           // D-1b: the rungs built on the device (nosym meshes); vertex_debug dynbse_dev_kbig = 0 keeps the host builds (the A/B)
           if (ue and not sym and vertex_debug::number("dynbse_dev_kbig", 1.0) != 0.0) {   // vertex_debug: dynbse_dev_kbig
-            nda::array<cplx, 4> Wreps(ndist, nq, Nm, Nm);
-            for (long r = 0; r < ndist; ++r) Wreps(r, all, all, all) = Wd_s(all, reps[size_t(r)], all, all);
+            const long nrep_dev = (rrank > 0) ? rrank : ndist;     // factorize-vertex: K_r = K[A_r] in the rung slots
+            nda::array<cplx, 4> Wreps(nrep_dev, nq, Nm, Nm);
+            for (long r = 0; r < nrep_dev; ++r)
+              Wreps(r, all, all, all) = (rrank > 0) ? nda::array<cplx, 3>(A_rq(r, all, all, all)) : nda::array<cplx, 3>(Wd_s(all, reps[size_t(r)], all, all));
             nda::array<cplx, 3> W0c(W0b), Wd0c(Wd0);
             nda::array<long, 2> qxc(qx_of);
             nda::array<cplx, 4> Xc(Xb);
             char whyk[256] = {0};
-            kb_dev = dynbse_cuda::ue_kb_init(ue.get(), ns, nq, Nm, Xc.data(), qxc.data(), W0c.data(), Wd0c.data(), Wreps.data(), ndist,
+            kb_dev = dynbse_cuda::ue_kb_init(ue.get(), ns, nq, Nm, Xc.data(), qxc.data(), W0c.data(), Wd0c.data(), Wreps.data(), nrep_dev,
                                              1.0e6 * double(utils::freemem_device_effective()), whyk, 256);
             if (rank == 0)
               app_log(1, "  [dynbse] device rung builds (K_s, K_d(s), K_d0): {}{}", kb_dev ? "ON" : "OFF, built on the host -- ",
@@ -1566,6 +1579,22 @@ namespace solvers {
                     const long col = c0 + cc, i = col / nR, N = col % nR;
                     Ys(i, y / nc2, y % nc2, N) = Yr(y, cc);
                   }
+              }
+            } else if (opt.dense_rung and rung_pair) {
+              // factorize-vertex: the two PH-mirror nodes of a representative share K_d(rep): ONE gemm (D x D)(D x 2 nR) per
+              // representative (half the K_d traffic of the per-node gemms; the per-tau form is bandwidth-bound in production)
+#pragma omp parallel for schedule(dynamic, 1) num_threads(nthr)
+              for (long r = 0; r < ndist; ++r) {
+                const long i0 = rep_nodes[size_t(r)].first, i1 = rep_nodes[size_t(r)].second;
+                const long nb = (i1 < 0) ? 1 : 2, w = nb * nR;
+                nda::array<cplx, 2> F2(D, w), Y2(D, w);
+                for (long y = 0; y < D; ++y)
+                  for (long bb = 0; bb < nb; ++bb)
+                    for (long N = 0; N < nR; ++N) F2(y, bb * nR + N) = Fs(bb ? i1 : i0, y / nc2, y % nc2, N);
+                nda::blas::gemm(scale_k, Kd_s(r, all, all), F2, cplx(0.0), Y2);
+                for (long y = 0; y < D; ++y)
+                  for (long bb = 0; bb < nb; ++bb)
+                    for (long N = 0; N < nR; ++N) Ys(bb ? i1 : i0, y / nc2, y % nc2, N) = Y2(y, bb * nR + N);
               }
             } else if (opt.dense_rung) {
               // Ys(i) = scale_k K_d(s_i) Fs(i): nt gemms (D x D)(D x nR) on the mirrored blocks

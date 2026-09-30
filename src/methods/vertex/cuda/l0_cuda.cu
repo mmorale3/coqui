@@ -1142,6 +1142,27 @@ namespace methods::solvers::dynbse_cuda {
     __global__ void conj_kernel(long n, cd *__restrict__ x) {
       for (long e = blockIdx.x * long(blockDim.x) + threadIdx.x; e < n; e += long(gridDim.x) * blockDim.x) x[e] = cuConj(x[e]);
     }
+    // factorize-vertex: tau-slice permutation Fs (nt, D, nR) <-> P (D, nt, nR) with slot order slot_of[i]
+    __global__ void rung_perm_kernel(long nt, long D, long nR, long const *__restrict__ slot_of, cd const *__restrict__ Fs,
+                                     cd *__restrict__ P, bool inverse) {
+      const long tot = nt * D * nR;
+      for (long e = blockIdx.x * long(blockDim.x) + threadIdx.x; e < tot; e += long(gridDim.x) * blockDim.x) {
+        const long N = e % nR;
+        long t = e / nR;
+        const long y = t % D, i = t / D;                 // e indexes Fs (i, y, N)
+        const long pe = (y * nt + slot_of[i]) * nR + N;
+        if (inverse) P[e] = Fs[pe]; else P[pe] = Fs[e];    // inverse: P := unpermuted(Fs)
+      }
+    }
+    // Pr[(y nt + slot) nR + N] = c(node_of[slot], r) P[...]   (c: (nt, R) row-major)
+    __global__ void rung_cscale_kernel(long nt, long D, long nR, long R, long r, long const *__restrict__ node_of,
+                                       cd const *__restrict__ c, cd const *__restrict__ P, cd *__restrict__ Pr) {
+      const long tot = nt * D * nR;
+      for (long e = blockIdx.x * long(blockDim.x) + threadIdx.x; e < tot; e += long(gridDim.x) * blockDim.x) {
+        const long slot = (e / nR) % nt;
+        Pr[e] = cuCmul(c[node_of[slot] * R + r], P[e]);
+      }
+    }
     __global__ void add2_kernel(long n, cd const *__restrict__ a, cd const *__restrict__ b, cd *__restrict__ out) {
       for (long e = blockIdx.x * long(blockDim.x) + threadIdx.x; e < n; e += long(gridDim.x) * blockDim.x) out[e] = a[e] + b[e];
     }
@@ -1448,6 +1469,10 @@ namespace methods::solvers::dynbse_cuda {
     sd_state sd;
     kb_state kb;
     dressed_state dr;
+    // factorize-vertex: the mirror-pair rung (rung_pair) and the frequency-factorized rung (rr = R > 0: Kds holds K_r, ctr (nt, R))
+    bool rung_pair = true;
+    long rr = 0;
+    cd *ctr = nullptr;
     cd *Gs0 = nullptr;                                       // Gsum0 of the last block (the Sigma columns static_dyn / dyn1_bare)
     cd *Gr1 = nullptr;                                       // the one-bare-rung Gsum of the last block (when requested)
     cd *Dcj = nullptr, *CbD = nullptr, *Vr = nullptr, *Pr = nullptr;   // conj(legs) (D, nout); the readout scratch
@@ -1548,6 +1573,7 @@ namespace methods::solvers::dynbse_cuda {
       if (p) (void)cudaFree(p);
     for (void *p : e->dr.allocs)
       if (p) (void)cudaFree(p);
+    if (e->ctr) (void)cudaFree(e->ctr);
     delete e;
   }
 
@@ -1666,6 +1692,46 @@ namespace methods::solvers::dynbse_cuda {
         }
         cu_check(cudaDeviceSynchronize(), "ue dlr");
         tim[7] += wnow() - t0; t0 = wnow();
+        if (e->rr > 0 or e->rung_pair) {
+          // factorize-vertex: permute the tau slices to P (D, nt, nR) with the mirror pairs in adjacent slots (P in rec), rung into
+          // Fs (free after the permutation), un-permute into Ys. rr: Y = sum_r K_r (c_r . P); pair: one gemm (2 nR wide) per rep.
+          const long ndist = e->c.ndist;
+          std::vector<long> slot_of(size_t(nt), -1), node_of(size_t(nt), -1), first(size_t(ndist), -1), cnt(size_t(ndist), 0);
+          long ns = 0;
+          for (long rr_ = 0; rr_ < ndist; ++rr_)
+            for (long i = 0; i < nt; ++i)
+              if (e->rr > 0 ? (rr_ == 0) : (e->trep[size_t(i)] == rr_)) {
+                if (e->rr > 0) { slot_of[size_t(i)] = i; node_of[size_t(i)] = i; continue; }
+                if (first[size_t(rr_)] < 0) first[size_t(rr_)] = ns;
+                ++cnt[size_t(rr_)];
+                slot_of[size_t(i)] = ns; node_of[size_t(ns)] = i; ++ns;
+              }
+          long *dslot = reinterpret_cast<long *>(e->g), *dnode = dslot + nt;   // (the refit scratch g is free here)
+          h2d(dslot, slot_of.data(), size_t(nt), "rung slot_of"); h2d(dnode, node_of.data(), size_t(nt), "rung node_of");
+          rung_perm_kernel<<<grid_for(nt * W), 256>>>(nt, D, nR, dslot, e->Fs, e->rec, false);
+          launch_check("rung perm");
+          const long ld = nt * nR;
+          if (e->rr > 0) {
+            cu_check(cudaMemsetAsync(e->Fs, 0, size_t(nt) * W * sizeof(cd), 0), "rung zero");
+            for (long r = 0; r < e->rr; ++r) {
+              rung_cscale_kernel<<<grid_for(nt * W), 256>>>(nt, D, nR, e->rr, r, dnode, e->ctr, e->rec, e->Ys);
+              launch_check("rung cscale");
+              cub_check(cublasZgemm(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(ld), int(D), int(D), &e->scale, e->Ys, int(ld),
+                                    e->Kds + size_t(r) * size_t(D) * size_t(D), int(D), &one, e->Fs, int(ld)), "rung K_r");
+            }
+          } else {
+            for (long rr_ = 0; rr_ < ndist; ++rr_) {
+              const long off = first[size_t(rr_)] * nR;
+              cub_check(cublasZgemm(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(cnt[size_t(rr_)] * nR), int(D), int(D), &e->scale, e->rec + off,
+                                    int(ld), e->Kds + size_t(rr_) * size_t(D) * size_t(D), int(D), &zero, e->Fs + off, int(ld)),
+                        "rung pair");
+            }
+          }
+          rung_perm_kernel<<<grid_for(nt * W), 256>>>(nt, D, nR, dslot, e->Fs, e->Ys, true);
+          launch_check("rung unperm");
+          cu_check(cudaDeviceSynchronize(), "ue rung");
+          tim[2] += wnow() - t0; t0 = wnow();
+        } else {
         // the dense rung: Ys_i^T (nR x D) = scale Fs_i^T (nR x D) . K_d(rep_i)^T (D x D)
         std::vector<cd *> hA(static_cast<size_t>(nt)), hB(static_cast<size_t>(nt)), hC(static_cast<size_t>(nt));
         for (long i = 0; i < nt; ++i) {
@@ -1678,6 +1744,7 @@ namespace methods::solvers::dynbse_cuda {
                                      (const cd **)e->pB, int(D), &zero, e->pC, int(nR), int(nt)), "ue rung");
         cu_check(cudaDeviceSynchronize(), "ue rung");
         tim[2] += wnow() - t0; t0 = wnow();
+        }
         // the refit: g^T = Ys^T Ut^T, c^T = g^T Vs^T, rec^T = c^T Kmat^T; err = max|Ys - rec| / max|Ys|
         cub_check(cublasZgemm(e->cb, CUBLAS_OP_N, CUBLAS_OP_N, int(W), int(nk_), int(nt), &one, e->Ys, int(W), e->Ut, int(nt), &zero,
                               e->g, int(W)), "ue g");
@@ -2538,5 +2605,15 @@ namespace methods::solvers::dynbse_cuda {
     return fe;
   }
 
+
+  void ue_set_rung_mode(unit_engine *e, bool rung_pair, long rr, cplx const *ctr_h) {
+    e->rung_pair = rung_pair;
+    e->rr = rr;
+    if (rr > 0) {
+      if (e->ctr) (void)cudaFree(e->ctr);
+      e->ctr = dalloc<cd>(size_t(e->c.nt * rr), "rung ctr");
+      h2d_c(e->ctr, ctr_h, size_t(e->c.nt * rr), "rung ctr");
+    }
+  }
 
 } // namespace methods::solvers::dynbse_cuda
