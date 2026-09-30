@@ -1672,8 +1672,10 @@ namespace solvers {
           if (met) met->t_lu += watch.lap();
           // ---- factorize-vertex: the DRESSED-LEG Gamma_1 readout (vertex_debug dyn_dressed = 1; dynbse.hpp block comment) ----
           // e~ = d + T_s^dag Cb^dag d for all nout left legs, once per unit
-          const bool dressed = vertex_debug::flag("dyn_dressed") and opt.gamma1_only and not opt.one_rung_only and
-                               not opt.static_only and opt.sigma == nullptr and not S.zero;   // vertex_debug: dyn_dressed
+          // (the one-bare-rung pass is the same readout with T_s = 0: d~ = e~ = d)
+          const bool dressed = vertex_debug::flag("dyn_dressed") and (opt.gamma1_only or opt.one_rung_only) and
+                               not opt.static_only and opt.sigma == nullptr;                  // vertex_debug: dyn_dressed
+          const bool ts_zero = opt.one_rung_only;
           nda::array<cplx, 4> Et;                               // (nk, nc, nc, nout)
           std::optional<db::dressed_grams> dgram;
           double t_dressed = 0.0;
@@ -1685,7 +1687,9 @@ namespace solvers {
             utils::check(not ue, "pair_space_ladder_dyn: dyn_dressed runs on the host path (the device unit must be off).");
 #endif
             Et = nda::array<cplx, 4>(nk, nc, nc, nout);
-            nda::array<cplx, 2> w(D, nout), v(D, nout);
+            nda::array<cplx, 2> w(ts_zero ? 0 : D, ts_zero ? 0 : nout), v(D, nout);
+            v() = cplx(0.0);
+            if (not ts_zero) {
             for (long k = 0; k < nk; ++k) {                                   // w = Cb^dag d (Cb block diagonal)
               auto Dk = nda::reshape(Dc(k, all, all, all), std::array<long, 2>{nc2, nout});
               auto wk = w(nda::range(k * nc2, (k + 1) * nc2), all);
@@ -1705,6 +1709,7 @@ namespace solvers {
             } else {
               nda::blas::gemm(nda::dagger(S.Ts), w, v);
             }
+            }                                                                 // (not ts_zero)
             for (long k = 0; k < nk; ++k)
               for (long r = 0; r < nc2; ++r)
                 for (long c = 0; c < nout; ++c) Et(k, r / nc, r % nc, c) = Dc(k, r / nc, r % nc, c) + v(k * nc2 + r, c);
@@ -1774,6 +1779,8 @@ namespace solvers {
               utils::apply_blas_threads(nthr);
               // d~ = d + T_s Cb d (the ls_apply resolvent arithmetic on a constant input)
               nda::array<cplx, 2> fs(D, nR), cs(D, nR);
+              cs() = cplx(0.0);
+              if (not ts_zero) {
               for (long k = 0; k < nk; ++k) {
                 auto Dk = nda::reshape(Dblk(k, all, all, all), std::array<long, 2>{nc2, nR});
                 auto fk = fs(nda::range(k * nc2, (k + 1) * nc2), all);
@@ -1790,6 +1797,7 @@ namespace solvers {
               } else {
                 nda::blas::gemm(S.Ts, fs, cs);
               }
+              }                                                               // (not ts_zero)
               db::tf_vector X(np, nk, nc, nR), rv(np, nk, nc, nR), y1(np, nk, nc, nR);
               for (long k = 0; k < nk; ++k)
                 for (long r = 0; r < nc2; ++r)
@@ -1830,7 +1838,7 @@ namespace solvers {
               res.Gsum = rsum;
               res.iterations = 1; res.converged = true; res.fit_err_max = fe;
               readout(res.Gsum0, Pi_static);
-              for (auto *out : {Pi_gam1, Pi_dyn}) {
+              for (auto *out : {opt.one_rung_only ? Pi_dyn1 : Pi_gam1, opt.one_rung_only ? nullptr : Pi_dyn}) {
                 if (out == nullptr) continue;
                 readout(res.Gsum0, out);
                 for (long M = 0; M < nout; ++M)
