@@ -1925,6 +1925,38 @@ namespace solvers {
                 app_log(1, "  [factorize-vertex] dressed-leg Gamma_1, first unit on rank 0: e~ build {:.2f} s, d~ {:.2f} s, Zt (Gram gemm + "
                            "sandwiches) {:.2f} s, Cb y.cst + collapse {:.2f} s ({} RHS blocks)", t_dr_e, t_dr_d, t_dr_z, t_dr_c,
                         (nout + nrb - 1) / nrb);
+              // factorize-vertex: the one-bare-rung column in this unit (T_s = 0: d~ = e~ = d, the same Grams) -- a second rung
+              // application on the resident K_d instead of the caller's second driver pass with its K_d rebuilds
+              // (vertex_debug dyn_r1_fuse = 0 restores the second pass)
+              const bool r1_host = want_r1 and not ts_zero and opt.sigma == nullptr and
+                                   (vertex_debug::number("dyn_r1_fuse", 1.0) != 0.0);   // vertex_debug: dyn_r1_fuse
+              nda::array<cplx, 4> rsum_r1;
+              nda::array<cplx, 2> Pr1;
+              double fe_r1 = 0.0;
+              if (r1_host) {
+                db::tf_vector Xr1(np, nk, nc, nR), rv_r1(np, nk, nc, nR), y_r1(np, nk, nc, nR);
+                Xr1.cst() = Dblk;
+                rsum_r1 = nda::array<cplx, 4>(nk, nc, nc, nR);
+                double tw1 = db::wall_now();
+                db::l0_apply(b, P, inu, shared, Xr1, rv_r1, rsum_r1, &Cb_k, stp, false, true);   // L0 d, Cb d
+                if (met) { met->t_l0 += db::wall_now() - tw1; ++met->n_l0; ++met->n_l0_cst; }
+                fe_r1 = kd(rv_r1, rsum_r1, y_r1);
+                tw1 = db::wall_now();
+                nda::array<cplx, 4> Zr1(nk, nc, nc, nR);
+                utils::apply_blas_threads(nthr);
+                auto Zg1 = db::dressed_z(b, P, *dgram, y_r1);
+                utils::apply_blas_threads(1);
+                db::dressed_zt(P, *dgram, inu, Zg1, nR, Zr1);
+                utils::apply_blas_threads(nthr);
+                for (long k = 0; k < nk; ++k) {
+                  auto yk = nda::reshape(y_r1.cst(k, all, all, all), std::array<long, 2>{nc2, nR});
+                  auto zk = nda::reshape(Zr1(k, all, all, all), std::array<long, 2>{nc2, nR});
+                  nda::blas::gemm(cplx(1.0), Cb_k(k, all, all), yk, cplx(1.0), zk);
+                }
+                Pr1 = db::collapse(Dc, Zr1);                                   // d^dag (L0 K_d L0 d)^sum
+                utils::apply_blas_threads(std::max(1l, utils::blas_threads()));
+                t_dressed += db::wall_now() - tw1;
+              }
               res = db::dyson_result{};
               res.Gsum0 = rsum;                                                // the static column: (L_s d)^sum = Cb d~
               res.Gsum1 = rsum;                                                // (P side: Pi_gam1 is written below from Pd)
@@ -1965,13 +1997,19 @@ namespace solvers {
                 utils::apply_blas_threads(std::max(1l, utils::blas_threads()));
                 t_dressed += db::wall_now() - tws;
               }
-              res.iterations = 1; res.converged = true; res.fit_err_max = fe;
+              res.iterations = 1; res.converged = true; res.fit_err_max = std::max(fe, fe_r1);
               readout(res.Gsum0, Pi_static);
               for (auto *out : {opt.one_rung_only ? Pi_dyn1 : Pi_gam1, opt.one_rung_only ? nullptr : Pi_dyn}) {
                 if (out == nullptr) continue;
                 readout(res.Gsum0, out);
                 for (long M = 0; M < nout; ++M)
                   for (long N = 0; N < nR; ++N) (*out)(jn, iq, M, N0 + N) += cplx(spinfac / double(nk)) * Pd(M, N);
+              }
+              if (r1_host) {                                                   // as the T_s = 0 pass writes it
+                readout(rsum_r1, Pi_dyn1);
+                for (long M = 0; M < nout; ++M)
+                  for (long N = 0; N < nR; ++N) (*Pi_dyn1)(jn, iq, M, N0 + N) += cplx(spinfac / double(nk)) * Pr1(M, N);
+                have_r1 = true;
               }
               if (met) met->t_vec += t_dressed;
               t_dressed = 0.0;
