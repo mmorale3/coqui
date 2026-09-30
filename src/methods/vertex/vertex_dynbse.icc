@@ -3128,6 +3128,12 @@ namespace solvers {
       hook_h = std::make_shared<vd::sigma_dyn_hook>();
       prepare_sigma_dyn_hook(*hook_h, opt, thc, tools, symc, sym_, nus);
     }
+    // factorize-vertex (A/B TESTS ONLY): truncate the Sigma-side units to the first N transfers / nu nodes -- the Sigma correction is
+    // then incomplete but defined identically for any two runs with the same keys (vertex_debug sigdyn_test_nq / sigdyn_test_nnu)
+    if (const long tq = long(vertex_debug::number("sigdyn_test_nq", 0.0)); tq > 0 and tq < nq) qs.resize(size_t(tq));
+    if (const long tn = long(vertex_debug::number("sigdyn_test_nnu", 0.0)); tn > 0 and size_t(tn) < nus.size()) nus.resize(size_t(tn));
+    if (vertex_debug::number("sigdyn_test_nq", 0.0) > 0 or vertex_debug::number("sigdyn_test_nnu", 0.0) > 0)
+      app_log(1, "  [factorize-vertex] Sigma-side A/B TEST truncation: {} transfers x {} nu nodes (NOT a physical Sigma)", qs.size(), nus.size());
     vd::sigma_dyn_hook &hook = *hook_h;
     vd::dyn_opts o;
     o.kcrys = std::addressof(kc);
