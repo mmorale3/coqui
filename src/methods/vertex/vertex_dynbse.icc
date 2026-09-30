@@ -1702,8 +1702,12 @@ namespace solvers {
           // ---- factorize-vertex: the DRESSED-LEG Gamma_1 readout (vertex_debug dyn_dressed = 1; dynbse.hpp block comment) ----
           // e~ = d + T_s^dag Cb^dag d for all nout left legs, once per unit
           // (the one-bare-rung pass is the same readout with T_s = 0: d~ = e~ = d)
+          // the Sigma side: the columns built from (Gsum0, Gsum1, y1) are supported (Gsum1 = Cb d~ + (1 + Cb T_s)(L0 y1)^sum, the
+          // full pair vector (L0 y1)^sum = Zt + Cb y1.cst from the same Grams); the resummed "dyn" column is not
+          const bool sig_ok = (opt.sigma == nullptr) or (opt.sigma->col == "dyn1" or opt.sigma->col == "dyn1_bare" or
+                                                         opt.sigma->col == "static_dyn");
           const bool dressed = vertex_debug::flag("dyn_dressed") and (opt.gamma1_only or opt.one_rung_only) and
-                               not opt.static_only and opt.sigma == nullptr;                  // vertex_debug: dyn_dressed
+                               not opt.static_only and sig_ok;                                  // vertex_debug: dyn_dressed
           const bool ts_zero = opt.one_rung_only;
           nda::array<cplx, 4> Et;                               // (nk, nc, nc, nout)
           std::optional<db::dressed_grams> dgram;
@@ -1711,7 +1715,7 @@ namespace solvers {
           double t_dr_e = 0.0, t_dr_d = 0.0, t_dr_z = 0.0, t_dr_c = 0.0;   // e~ build, d~, Zt, collapse
           bool dressed_dev = false;
 #if defined(ENABLE_CUDA)
-          if (dressed and ue) {
+          if (dressed and ue and opt.sigma == nullptr) {
             // the device unit: grams / legs from the host, e~ built and kept on the device
             dgram.emplace(db::build_dressed_grams(b, P, inu));
             char whyd[256] = {0};
@@ -1721,7 +1725,15 @@ namespace solvers {
             if (rank == 0 and units_taken == 1) app_log(1, "  [factorize-vertex] dressed-leg Gamma_1 readout ON THE DEVICE UNIT");
           }
 #endif
-          if (dressed and not dressed_dev) {
+#if defined(ENABLE_CUDA)
+          const bool host_unit = not ue;
+#else
+          const bool host_unit = true;
+#endif
+          if (dressed and not dressed_dev and not host_unit and rank == 0 and units_taken == 1)
+            app_log(1, "  [factorize-vertex] dyn_dressed with the Sigma hook on the device unit is not implemented: the standard device "
+                       "Gamma_1 path runs");
+          if (dressed and not dressed_dev and host_unit) {
             const double tw0 = db::wall_now();
             utils::apply_blas_threads(nthr);                  // the serial BLAS3 of the dressed legs: the rank's threads
             Et = nda::array<cplx, 4>(nk, nc, nc, nout);
@@ -1886,8 +1898,44 @@ namespace solvers {
                         (nout + nrb - 1) / nrb);
               res = db::dyson_result{};
               res.Gsum0 = rsum;                                                // the static column: (L_s d)^sum = Cb d~
-              res.Gsum1 = rsum;                                                // placeholder: Pi_gam1 is written below from Pd
+              res.Gsum1 = rsum;                                                // (P side: Pi_gam1 is written below from Pd)
               res.Gsum = rsum;
+              if (opt.sigma != nullptr) {
+                // Sigma side: Gsum1 = Cb d~ + L + Cb T_s L, L = (L0 y1)^sum = Zt (+ Cb y1.cst, already in Zt); y1 kept
+                const double tws = db::wall_now();
+                utils::apply_blas_threads(nthr);
+                nda::array<cplx, 2> Lm(D, nR), cl(D, nR);
+                for (long k = 0; k < nk; ++k)
+                  for (long r = 0; r < nc2; ++r)
+                    for (long N = 0; N < nR; ++N) Lm(k * nc2 + r, N) = Zt(k, r / nc, r % nc, N);
+                cl() = cplx(0.0);
+                if (not ts_zero) {
+                  if (S.mode == "lu") {
+                    nda::array<cplx, 2> const &Ksr = S.own_ks ? S.Cb : *S.Ks;
+                    nda::matrix<cplx, nda::F_layout> Y(D, nR);
+                    Y() = Lm;
+                    const int info = nda::lapack::getrs(S.Mlu, Y, S.ipiv);
+                    utils::check(info == 0, "pair_space_ladder_dyn: dressed Sigma getrs failed (info {}).", info);
+                    nda::array<cplx, 2> z(Y);
+                    nda::blas::gemm(Ksr, z, cl);
+                  } else {
+                    nda::blas::gemm(S.Ts, Lm, cl);
+                  }
+                }
+                res.Gsum1 = nda::array<cplx, 4>(nk, nc, nc, nR);
+                for (long k = 0; k < nk; ++k) {
+                  auto ck = cl(nda::range(k * nc2, (k + 1) * nc2), all);
+                  nda::array<cplx, 2> cbc(nc2, nR);
+                  nda::blas::gemm(Cb_k(k, all, all), ck, cbc);
+                  for (long r = 0; r < nc2; ++r)
+                    for (long N = 0; N < nR; ++N)
+                      res.Gsum1(k, r / nc, r % nc, N) = rsum(k, r / nc, r % nc, N) + Lm(k * nc2 + r, N) + cbc(r, N);
+                }
+                res.Gsum = res.Gsum1;
+                res.y1 = std::move(y1); res.has_y = true;
+                utils::apply_blas_threads(std::max(1l, utils::blas_threads()));
+                t_dressed += db::wall_now() - tws;
+              }
               res.iterations = 1; res.converged = true; res.fit_err_max = fe;
               readout(res.Gsum0, Pi_static);
               for (auto *out : {opt.one_rung_only ? Pi_dyn1 : Pi_gam1, opt.one_rung_only ? nullptr : Pi_dyn}) {
