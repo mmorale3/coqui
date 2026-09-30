@@ -942,7 +942,7 @@ namespace solvers {
         }
         if (rank == 0)
           app_log(1, "  [factorize-vertex] frequency-factorized dense rung: R = {} universal time functions of {} tau nodes "
-                     "(Gram tail {:.2e} of the trace, sqrt = the rms relative truncation of the normalized tau data); "
+                     "(Gram tail {:.2e} of the trace; rms relative truncation of the normalized tau data {:.2e}); "
                      "K_d memory {:.2f} GB per unit instead of {} per-tau matrices",
                   rrank, nt, tail / std::max(tr, 1e-300), std::sqrt(tail / std::max(tr, 1e-300)),
                   double(rrank) * double(D) * double(D) * 16.0 / 1.0e9, nt / 2);
