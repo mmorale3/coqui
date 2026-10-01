@@ -593,6 +593,66 @@ namespace solvers {
       return worst;
     }
 
+    /** audit C4: the SAME (M,N) asymmetry metric as hermitize_mn, MEASURE-ONLY. The bare-leg readouts
+     *  (eval_pol_ladder_nu0 / _whalf without Ward legs) never Hermitized their output and still do not -- starting
+     *  to would change every bare-leg answer -- but their asymmetry is now measured and reported under the same
+     *  tolerance as the Ward path's, so neither path hides a non-Hermitian Pi^lad. */
+    inline double asym_mn(nda::array<ComplexType, 4> const &P) {
+      const long n0 = P.shape(0), n1 = P.shape(1), Nm = P.shape(2);
+      double worst = 0.0;
+      for (long j = 0; j < n0; ++j)
+        for (long iq = 0; iq < n1; ++iq) {
+          double asym = 0.0, scale = 0.0;
+          for (long m = 0; m < Nm; ++m)
+            for (long n = m; n < Nm; ++n) {
+              const ComplexType a = P(j, iq, m, n), b = std::conj(P(j, iq, n, m));
+              asym = std::max(asym, std::abs(a - b));
+              scale = std::max({scale, std::abs(a), std::abs(b)});
+            }
+          if (scale > 0.0) worst = std::max(worst, asym / scale);
+        }
+      return worst;
+    }
+
+    /** audit C4: ONE tolerance for the (M,N) asymmetry of the ladder outputs on BOTH leg paths. Above it the readout
+     *  is visibly non-Hermitian in the aux pair -- the Ward path projects it away (hermitize_mn), the bare path keeps
+     *  it -- so the run says so instead of carrying it silently. */
+    inline constexpr double mn_asym_warn_tol = 1e-6;
+    inline void warn_mn_asym(double asym, const char *what, const char *who, bool hermitized) {
+      if (asym > mn_asym_warn_tol)
+        app_log(1, "  [WARNING] ladder ({}): {} is (M,N)-asymmetric by {:.3e} (max_blocks |P - P^dag|_max / |P|_max, "
+                   "tolerance {:.0e}); {}.\n"
+                   "            A Hermitian pair kernel gives a Hermitian Pi^lad(q, i nu) to round-off: an asymmetry "
+                   "this large points at the rung\n"
+                   "            (trev / q_star reads, the W0bar symmetry) or the legs, not at the solve.",
+                who, what, asym, mn_asym_warn_tol,
+                hermitized ? "it WAS projected to its Hermitian part (the Ward-leg policy)"
+                           : "it is NOT Hermitized on the bare-leg path (historic behaviour, unchanged)");
+    }
+
+    /** audit C3: the rho(Xh Kt) power iteration (I3 watchdog) caps at 20 sweeps / 1e-3 relative change; a node whose
+     *  iteration hit the cap has an UNCONVERGED lambda_max, and lambda_max feeds the lambda < 1 abort gate of the
+     *  caller. lam_dchg(jn) = the last relative change |lam - lam_prev| / lam of such a node (0 = converged). */
+    inline void warn_lam_unconverged(nda::array<double, 1> const &lam_dchg, nda::array<double, 1> const &lam_max,
+                                     std::vector<long> const &nu_list, long nw_b, const char *who) {
+      long nbad = 0, jw = -1;
+      double worst = 0.0;
+      for (long j = 0; j < lam_dchg.shape(0); ++j)
+        if (lam_dchg(j) > 0.0) {
+          ++nbad;
+          if (lam_dchg(j) > worst) { worst = lam_dchg(j); jw = j; }
+        }
+      if (nbad == 0) return;
+      app_log(1, "  [WARNING] ladder ({}): the lambda_max power iteration hit its 20-sweep cap WITHOUT reaching the 1e-3 "
+                 "relative change at {} of {} nu nodes;\n"
+                 "            worst last relative change {:.3e} at n_nu = {} (lambda_max there = {:.6f}). lambda_max is then "
+                 "an UNCONVERGED estimate\n"
+                 "            of rho(Xh Kt) -- the lambda < 1 stability gate reads it; treat values near 1 with care (the "
+                 "resolvent itself is an exact LU solve and is unaffected).",
+              who, nbad, lam_dchg.shape(0), worst, (jw >= 0) ? nu_list[jw] - nw_b / 2 : 0l,
+              (jw >= 0) ? lam_max(jw) : 0.0);
+    }
+
     /**
      * The ward context from the loop's state: aux-grid DLR pole fits (iaft_tools::
      * pole_coeffs, the regularized map of dlr_pole_fit.hpp) of G and Sigma_c on the FULL
@@ -929,7 +989,11 @@ namespace solvers {
                                   // DA D-1: nullptr = no truncation = bitwise historic path
                                   tda_ctx const *tda = nullptr,
                                   // Tier 1.5: nullptr = bare legs = bitwise historic path
-                                  ward_args const *ward = nullptr) {
+                                  ward_args const *ward = nullptr,
+                                  // audit C3: (nnu) or null -- the power iteration's last relative change at the
+                                  // nodes where it hit the sweep cap (0 = converged); needs lam_max, max-reduced
+                                  // like it by the caller
+                                  nda::array<double, 1> *lam_dchg = nullptr) {
       prof_watch pwatch;
       if (prof) prof->rss_entry = prof_rss_gb();
       // factorize-vertex: this path has no omp regions -- its dense BLAS/LAPACK (the (D, D) getrf, the rung and projection
@@ -1043,6 +1107,12 @@ namespace solvers {
                      "pair_space_ladder: lam_max has {} rows, expected nnu = {}.",
                      lam_max->shape(0), nnu);
         (*lam_max)() = 0.0;
+      }
+      if (lam_dchg != nullptr) {
+        utils::check(lam_max != nullptr and lam_dchg->shape(0) == nnu,
+                     "pair_space_ladder: lam_dchg needs lam_max and nnu = {} rows (has {}).", nnu,
+                     lam_dchg->shape(0));
+        (*lam_dchg)() = 0.0;
       }
 
       // qx lookup: kmq(qx, k) = k'  =>  qx_of(k, k')
@@ -1462,17 +1532,24 @@ namespace solvers {
               const double seed = 1.0 / std::sqrt(double(Dsz));
               for (long i = 0; i < Dsz; ++i) pv(i) = ComplexType(seed, 0.0);
               double lam = 0.0, lam_prev = -1.0;
+              // audit C3: the stop test is unchanged (bitwise the same lam); conv / dchg only RECORD whether the
+              // 20-sweep cap was hit before the 1e-3 test was met, and the last relative change there.
+              bool conv = false;
+              double dchg = 0.0;
               for (int itp = 0; itp < 20; ++itp) {
                 nda::blas::gemv(Rm, pv, pw);
                 double n2 = 0.0;
                 for (long i = 0; i < Dsz; ++i) n2 += std::norm(pw(i));
                 lam = std::sqrt(n2);
-                if (lam <= 0.0) break;
+                if (lam <= 0.0) { conv = true; break; }
                 for (long i = 0; i < Dsz; ++i) pv(i) = pw(i) / lam;
-                if (lam_prev > 0.0 and std::abs(lam - lam_prev) <= 1e-3 * lam) break;
+                if (lam_prev > 0.0) dchg = std::abs(lam - lam_prev) / lam;
+                if (lam_prev > 0.0 and std::abs(lam - lam_prev) <= 1e-3 * lam) { conv = true; break; }
                 lam_prev = lam;
               }
               (*lam_max)(jn) = std::max((*lam_max)(jn), lam);
+              if (not conv and lam_dchg != nullptr)
+                (*lam_dchg)(jn) = std::max((*lam_dchg)(jn), std::max(dchg, 1e-300));
             }
             pph.end();
             // the resolvent depends on XK only -- formed here so BOTH RHS blocks (the
@@ -1644,6 +1721,11 @@ namespace solvers {
     inline long resolve_ladder_solve_grid(long g_knob, double budget_gb, long Dsz, long Nm,
                                           long nab, long nk, long nc2, long nproc,
                                           long node_sz, const char *tag) {
+      // audit E: a negative knob used to fall through to the AUTO branch below (set_ladder_solve rejects it at
+      // input time; this guards every other caller of the resolver, e.g. tests that set the member directly).
+      utils::check(g_knob >= 0,
+                   "ladder_solve_grid = {} ({} path) is invalid: 0 = auto, 1 = per-rank LAPACK, > 1 = SLATE "
+                   "grid.", g_knob, tag);
       if (g_knob > 0) {
         utils::check(nproc % g_knob == 0,
                      "ladder_solve_grid = {} does not divide the communicator size {} "
@@ -1651,9 +1733,19 @@ namespace solvers {
         return g_knob;
       }
       const double m1 = ladder_mem_gb(1, Dsz, Nm, nab, nk, nc2);
-      if (m1 <= budget_gb or nproc == 1) {
+      if (m1 <= budget_gb) {
         app_log(2, "  [ladder-B {}] solve grid AUTO -> g = 1 (per-rank LAPACK): estimated "
                    "{:.3f} GB/rank <= budget {:.3f} GB (D = {}, N_m = {}, nab = {}).",
+                tag, m1, budget_gb, Dsz, Nm, nab);
+        return 1;
+      }
+      if (nproc == 1) {
+        // audit E: this branch used to print the "<= budget" line above although the estimate is OVER the budget.
+        // Placement only (the per-rank solve is the same exact solve), hence a WARNING and not an abort.
+        app_log(1, "  [WARNING] [ladder-B {}] solve grid AUTO -> g = 1 (per-rank LAPACK) on a SINGLE rank although "
+                   "the estimated {:.3f} GB/rank EXCEEDS the budget {:.3f} GB\n"
+                   "            (D = {}, N_m = {}, nab = {}): no distributed grid can be formed on one rank. Run on "
+                   "more ranks (and ladder_solve_grid = 0 or > 1) if this runs out of memory.",
                 tag, m1, budget_gb, Dsz, Nm, nab);
         return 1;
       }
@@ -1668,7 +1760,7 @@ namespace solvers {
       if (g == 0) g = first_fit(ladder_divisors(nproc));
       if (g == 0) {
         g = nproc;
-        app_log(1, "  [ladder-B {}] solve grid AUTO: no g fits the {:.3f} GB/rank budget "
+        app_log(1, "  [WARNING] [ladder-B {}] solve grid AUTO: no g fits the {:.3f} GB/rank budget "
                    "(g = 1 needs {:.3f} GB, the widest grid g = {} needs {:.3f} GB) -- "
                    "using the widest grid. Raise ladder_solve_budget_gb or the rank count.",
                 tag, budget_gb, m1, nproc, ladder_mem_gb(nproc, Dsz, Nm, nab, nk, nc2));
@@ -1739,7 +1831,9 @@ namespace solvers {
                                         nda::array<ComplexType, 4> *Pi_lad_loc = nullptr,
                                         ladder_prof *prof = nullptr,
                                         // DA D-1: nullptr = bitwise historic path
-                                        tda_ctx const *tda = nullptr) {
+                                        tda_ctx const *tda = nullptr,
+                                        // audit C3: as pair_space_ladder (needs lam_max; grid-root writes)
+                                        nda::array<double, 1> *lam_dchg = nullptr) {
       using math::nda::make_distributed_array;
       using dmat_t = nda::array<ComplexType, 2, nda::F_layout>;
       using shp2 = std::array<long, 2>;
@@ -1815,6 +1909,12 @@ namespace solvers {
                      "pair_space_ladder_slate: lam_max has {} rows, expected nnu = {}.",
                      lam_max->shape(0), nnu);
         (*lam_max)() = 0.0;
+      }
+      if (lam_dchg != nullptr) {
+        utils::check(lam_max != nullptr and lam_dchg->shape(0) == nnu,
+                     "pair_space_ladder_slate: lam_dchg needs lam_max and nnu = {} rows (has {}).", nnu,
+                     lam_dchg->shape(0));
+        (*lam_dchg)() = 0.0;
       }
 
       // qx lookup: kmq(qx, k) = k'  =>  qx_of(k, k')   (pair_space_ladder verbatim)
@@ -2035,6 +2135,8 @@ namespace solvers {
             const double seed = 1.0 / std::sqrt(double(Dsz));
             V1.value().local()() = ComplexType(seed, 0.0);
             double lam = 0.0, lam_prev = -1.0;
+            bool conv = false;     // audit C3: recorded only, the stop test is unchanged
+            double dchg = 0.0;
             for (int itp = 0; itp < 20; ++itp) {
               math::nda::slate_ops::multiply(Rm, V1.value(), V2.value());
               double n2 = 0.0;
@@ -2042,17 +2144,20 @@ namespace solvers {
               n2 = gcomm.all_reduce_value(n2, std::plus<>{});
               n2 /= double(py);   // py identical column copies
               lam = std::sqrt(n2);
-              if (lam <= 0.0) break;
+              if (lam <= 0.0) { conv = true; break; }
               {
                 auto v2 = V2.value().local();
                 auto v1 = V1.value().local();
                 for (long i = 0; i < v2.shape(0); ++i)
                   for (long j = 0; j < v2.shape(1); ++j) v1(i, j) = v2(i, j) / lam;
               }
-              if (lam_prev > 0.0 and std::abs(lam - lam_prev) <= 1e-3 * lam) break;
+              if (lam_prev > 0.0) dchg = std::abs(lam - lam_prev) / lam;
+              if (lam_prev > 0.0 and std::abs(lam - lam_prev) <= 1e-3 * lam) { conv = true; break; }
               lam_prev = lam;
             }
             if (grank == 0) (*lam_max)(jn) = std::max((*lam_max)(jn), lam);
+            if (grank == 0 and not conv and lam_dchg != nullptr)
+              (*lam_dchg)(jn) = std::max((*lam_dchg)(jn), std::max(dchg, 1e-300));
           }
           pph.end();
 
@@ -2495,7 +2600,9 @@ namespace solvers {
 
     /**
      * P4b: the truncated-NEUMANN pair-space ladder on the R-space kernel (design note
-     * section 4b.1): S_{j+1} = M(V + S_j), M = Xh K~ (apply-only), V = Xh D; the
+     * section 4b.1): S_{j+1} = M(V - S_j), M = Xh K~ (apply-only), V = Xh D -- the
+     * alternating series of the derived resolvent (1 + M)^-1 M V (audit E: it read
+     * S_{j+1} = M(V + S_j), the retired (1 - M)^-1 sign, until 2026-10-01); the
      * truncation order j IS the explicit rung count, and the j = 1 observable with an
      * untruncated kernel is the anchor BITWISE (gate G-P4a). The (s, iq) pairs
      * round-robin over (rank, nproc) exactly as pair_space_ladder (the caller
@@ -2514,7 +2621,10 @@ namespace solvers {
                                      nda::array<ComplexType, 4> *Pi_onerung,
                                      nda::array<ComplexType, 4> *Pi_ladder,
                                      long rank = 0, long nproc = 1,
-                                     long *max_rungs_used = nullptr) {
+                                     long *max_rungs_used = nullptr,
+                                     // audit E: (s, q, nu) units whose resummation (Pi_ladder requested) reached
+                                     // max_rungs without meeting neu_tol -- rank-local, the caller sum-reduces
+                                     long *n_unconverged = nullptr) {
       decltype(nda::range::all) all;
       const long nt = G_CC.shape(0), ns = G_CC.shape(1), nk = G_CC.shape(2);
       const long nc = G_CC.shape(3), Nm = Xb.shape(2);
@@ -2526,6 +2636,7 @@ namespace solvers {
       if (Pi_onerung != nullptr) (*Pi_onerung)() = ComplexType(0.0);
       if (Pi_ladder != nullptr) (*Pi_ladder)() = ComplexType(0.0);
       if (max_rungs_used != nullptr) *max_rungs_used = 0;
+      if (n_unconverged != nullptr) *n_unconverged = 0;
 
       nda::array<ComplexType, 3> Dmat(nk, nc2, Nm), Dcj(nk, nc2, Nm);
       nda::array<ComplexType, 4> Cb(nk, nnu, nc2, nc2);
@@ -2575,12 +2686,20 @@ namespace solvers {
           S() = ComplexType(0.0);
           term() = V;
           double s_nrm2 = 0.0;
+          bool conv = false;
           for (long j = 1; j <= max_rungs; ++j) {
             vertex_ladder_detail::apply_kernel_rs(ker, Xb, is, kpq, iq, kpts, term, KX);
+            // audit E -- THE RESOLVENT SIGN (gate-only path). The dense kernel resums
+            //   (1 + M)^-1 M V = sum_{j >= 1} (-1)^{j+1} M^j V,   M = +Xh Kt (Rm = +XK, alpha = +1/nk;
+            // notes/dynbse/l2_resolvent_sign_derivation.md, 2026-09-11), so the Neumann terms ALTERNATE:
+            // term_1 = +M V and term_j = -M term_{j-1} for j >= 2. This path still summed (+M)^j, i.e. the
+            // retired (1 - Xh Kt)^-1 -- exact at first order only, which is why G-P4a (j = 1) passed while
+            // G-P4b compared against the wrong resolvent. The j = 1 term (alpha = +1/nk) is unchanged.
+            const ComplexType alpha_j((j == 1 ? 1.0 : -1.0) / double(nk), 0.0);
             for (long ik = 0; ik < nk; ++ik) {
               auto Tr = termn(nda::range(ik * nc2, (ik + 1) * nc2), all);
               auto Kr = KX(nda::range(ik * nc2, (ik + 1) * nc2), all);
-              nda::blas::gemm(ComplexType(1.0 / nk), Cb(ik, jn, all, all), Kr,
+              nda::blas::gemm(alpha_j, Cb(ik, jn, all, all), Kr,
                               ComplexType(0.0), Tr);
             }
             S += termn;
@@ -2595,8 +2714,9 @@ namespace solvers {
             for (auto const &v : S) s_nrm2 += std::norm(v);
             term() = termn;
             if (max_rungs_used != nullptr) *max_rungs_used = std::max(*max_rungs_used, j);
-            if (std::sqrt(t2) < neu_tol * std::max(std::sqrt(s_nrm2), 1e-300)) break;
+            if (std::sqrt(t2) < neu_tol * std::max(std::sqrt(s_nrm2), 1e-300)) { conv = true; break; }
           }
+          if (not conv and Pi_ladder != nullptr and n_unconverged != nullptr) ++(*n_unconverged);
           if (Pi_ladder != nullptr) {
             auto Pl = (*Pi_ladder)(jn, iq, all, all);
             nda::blas::gemm(ComplexType(-spinfac), nda::transpose(Dstack_c), S,
@@ -2758,6 +2878,14 @@ namespace solvers {
     // profiling meters (spec section 2b: the lighter set on the readout path)
     vertex_ladder_detail::ladder_prof prof;
     vertex_ladder_detail::prof_watch cwatch, twatch;
+    // audit E: this readout has no solve-grid dispatch (it is the per-rank resolvent always); a knob that asks for
+    // anything else is ignored here -- placement / memory only (the same exact dense solve), hence a WARNING.
+    if (_ladder_solve_grid != 1)
+      app_log(1, "  [WARNING] eval_pol_ladder_nu0: ladder_solve_grid = {} ({}) is NOT applied on the inu = 0 readout "
+                 "path -- it always runs the per-rank LAPACK resolvent (D = {}, one (D, D) operator per solving rank; "
+                 "ladder_solve_budget_gb = {:.3f} is not consulted). Same answer, different memory footprint.",
+              _ladder_solve_grid, (_ladder_solve_grid == 0) ? "AUTO" : "SLATE grid", nc * nc * nk,
+              _ladder_solve_budget_gb);
     if (mpi->internode_comm.size() > 1)
       vertex_ladder_detail::pair_space_ladder(G_CC, _Xb_skma, _W0b_qmm.value(), kmq,
                                               kpq, tools, nu0, nullptr, &Pl,
@@ -2783,10 +2911,17 @@ namespace solvers {
       const double asym_l = vertex_ladder_detail::hermitize_mn(Pl);
       const double asym_d = vertex_ladder_detail::hermitize_mn(Pd);
       vertex_ladder_detail::log_ward_meters(wmeter, asym_l, asym_d, nu0, tools.nw_b, "nu0");
+      vertex_ladder_detail::warn_mn_asym(asym_l, "Pi^lad (Ward legs)", "nu0", true);
+      vertex_ladder_detail::warn_mn_asym(asym_d, "Delta P^Lambda", "nu0", true);
       if (Pi_dlam != nullptr) {
         *Pi_dlam = nda::array<ComplexType, 3>(nq_ext, Nm, Nm);
         (*Pi_dlam)() = Pd(0, all, all, all);
       }
+    } else {
+      // audit C4: the bare-leg readout -- measured with the Ward path's metric and tolerance, NOT Hermitized
+      const double asym_l = vertex_ladder_detail::asym_mn(Pl);
+      app_log(2, "  [qpGW L2] ladder (nu0, bare legs): max (M,N) asymmetry {:.3e} (not Hermitized).", asym_l);
+      vertex_ladder_detail::warn_mn_asym(asym_l, "Pi^lad (bare legs)", "nu0", false);
     }
     vertex_ladder_detail::prof_report(prof, mpi->comm, "nu0");
     nda::array<ComplexType, 3> out(nq_ext, Nm, Nm);
@@ -2899,6 +3034,14 @@ namespace solvers {
     const long nq_ext = MF->nqpts_ibz(), Nm = _Xb_skma.shape(2);
     nda::array<ComplexType, 4> Pl(nw_half, nq_ext, Nm, Nm);
     if (lam_max != nullptr) *lam_max = nda::array<double, 1>(nw_half);
+    // audit C3: the non-convergence record of the lambda_max power iteration (only with lam_max)
+    nda::array<double, 1> lam_dchg(lam_max != nullptr ? nw_half : 0);
+    nda::array<double, 1> *lam_dchg_p = (lam_max != nullptr) ? std::addressof(lam_dchg) : nullptr;
+    auto report_lam = [&]() {
+      if (lam_dchg_p == nullptr) return;
+      mpi->comm.all_reduce_in_place_n(lam_dchg.data(), lam_dchg.size(), boost::mpi3::max<>{});
+      vertex_ladder_detail::warn_lam_unconverged(lam_dchg, *lam_max, nu_h, nw_b, "whalf");
+    };
     // Tier 1.5: the ward legs (nullptr = bare = the bitwise historic path)
     std::optional<ward_legs::ward_ctx> wctx;
     vertex_ladder_detail::ward_args wargs;
@@ -2934,7 +3077,7 @@ namespace solvers {
       vertex_ladder_detail::pair_space_ladder_slate(G_CC, _Xb_skma, _W0b_qmm.value(), kmq,
                                                     kpq, tools, nu_h, &Pl, mpi->comm,
                                                     g_slv, symc, lam_max, nullptr, nullptr,
-                                                    &prof, tdap);
+                                                    &prof, tdap, lam_dchg_p);
       cwatch.lap();
       mpi->comm.barrier();
       prof.t_barrier = cwatch.lap();
@@ -2944,6 +3087,14 @@ namespace solvers {
                                         boost::mpi3::max<>{});
       prof.t_reduce = cwatch.lap();
       prof.t_call = twatch.lap();
+      report_lam();
+      {
+        // audit C4: the bare-leg readout (Ward legs abort on this path above): measured, not Hermitized
+        const double asym_l = vertex_ladder_detail::asym_mn(Pl);
+        app_log(2, "  [qpGW Q3] ladder (whalf-slate, bare legs): max (M,N) asymmetry {:.3e} (not Hermitized).",
+                asym_l);
+        vertex_ladder_detail::warn_mn_asym(asym_l, "Pi^lad (bare legs)", "whalf-slate", false);
+      }
       vertex_ladder_detail::prof_report(prof, mpi->comm, "whalf-slate");
       return Pl;
     }
@@ -2955,13 +3106,15 @@ namespace solvers {
                                               mpi->internode_comm.rank(),
                                               mpi->internode_comm.size(), symc,
                                               std::addressof(mpi->node_comm), lam_max,
-                                              nullptr, nullptr, nullptr, &prof, tdap, wp);
+                                              nullptr, nullptr, nullptr, &prof, tdap, wp,
+                                              lam_dchg_p);
     else
       vertex_ladder_detail::pair_space_ladder(G_CC, _Xb_skma, _W0b_qmm.value(), kmq,
                                               kpq, tools, nu_h, nullptr, &Pl,
                                               mpi->comm.rank(), mpi->comm.size(), symc,
                                               nullptr, lam_max,
-                                              nullptr, nullptr, nullptr, &prof, tdap, wp);
+                                              nullptr, nullptr, nullptr, &prof, tdap, wp,
+                                              lam_dchg_p);
     cwatch.lap();
     // the idle-rank meter: a rank that finished its (s,q) units early waits here. The
     // all_reduce below already synchronizes, so this only SPLITS an existing wait.
@@ -2973,13 +3126,21 @@ namespace solvers {
                                       boost::mpi3::max<>{});
     prof.t_reduce = cwatch.lap();
     prof.t_call = twatch.lap();
+    report_lam();
     if (wp != nullptr) {
       mpi->comm.all_reduce_in_place_n(Pd.data(), Pd.size(), std::plus<>{});
       wmeter.reduce_max(mpi->comm);
       const double asym_l = vertex_ladder_detail::hermitize_mn(Pl);
       const double asym_d = vertex_ladder_detail::hermitize_mn(Pd);
       vertex_ladder_detail::log_ward_meters(wmeter, asym_l, asym_d, nu_h, nw_b, "whalf");
+      vertex_ladder_detail::warn_mn_asym(asym_l, "Pi^lad (Ward legs)", "whalf", true);
+      vertex_ladder_detail::warn_mn_asym(asym_d, "Delta P^Lambda", "whalf", true);
       if (Pi_dlam != nullptr) *Pi_dlam = Pd;
+    } else {
+      // audit C4: the bare-leg readout -- measured with the Ward path's metric and tolerance, NOT Hermitized
+      const double asym_l = vertex_ladder_detail::asym_mn(Pl);
+      app_log(2, "  [qpGW Q3] ladder (whalf, bare legs): max (M,N) asymmetry {:.3e} (not Hermitized).", asym_l);
+      vertex_ladder_detail::warn_mn_asym(asym_l, "Pi^lad (bare legs)", "whalf", false);
     }
     vertex_ladder_detail::prof_report(prof, mpi->comm, "whalf");
     return Pl;
@@ -3012,12 +3173,33 @@ namespace solvers {
     utils::check(_W0b_qmm.has_value(),
                  "vertex_t::eval_pol_ladder_loc_whalf: W0bar is absent -- build_w0 must "
                  "run first (same iteration).");
+    // audit A11: this is the double-counting term of the SAME resummed ladder the D-space readout
+    // (eval_pol_ladder_whalf) injects, so it must carry the same kernel. With Ward legs the D-space ladder
+    // also carries the zero-rung Delta P^Lambda on its legs (eq 27); the E-leg analog of that term is not
+    // implemented here, so the subtraction would remove a DIFFERENT object than the one injected.
+    utils::check(not ladder_ward_legs(),
+                 "vertex_t::eval_pol_ladder_loc_whalf: pol_vertex_legs = \"ward\" is not supported by the "
+                 "orbital-ladder double-counting term (Q4-C3b): the D-space ladder carries the zero-rung "
+                 "Delta P^Lambda on its Ward legs, whose E-leg (orbital) analog is not implemented, so the "
+                 "subtracted local ladder would not match the injected one. Run the orbital DC with "
+                 "pol_vertex_legs = \"bare\", or without the orbital-ladder DC.");
     auto MF = thc.MF();
     auto mpi = thc.mpi();
     nda::array<ComplexType, 5> G_CC;
     nda::array<long, 2> kmq, kpq;
     vertex_sym::sym_ctx const *symc = nullptr;
     ladder_inputs(mb_state, thc, G_CC, kmq, kpq, symc);
+    // audit A11: the TDA coupling mask of the D-space ladder (eval_pol_ladder_whalf), built from the SAME G_CC.
+    // It used to be dropped here, so with ladder_tda the subtracted local ladder was the UNTRUNCATED one while
+    // the injected ladder was truncated. nullptr unless the knob is on => the historic path, bitwise.
+    std::optional<vertex_ladder_detail::tda_ctx> tdac;
+    vertex_ladder_detail::tda_ctx const *tdap = nullptr;
+    if (_ladder_tda) {
+      tdac = vertex_ladder_detail::build_tda_ctx(G_CC, *_ft);
+      tdap = std::addressof(tdac.value());
+      app_log(1, "  [DA D-1] TDA ON: the coupling mask is applied to the orbital-ladder double-counting term "
+                 "(whalf-loc) as well -- the same kernel as the injected D-space ladder.");
+    }
 
     const long ns = G_CC.shape(1), nk = G_CC.shape(2), nc = subspace_rank();
     utils::check(U_skia.shape(0) == ns and U_skia.shape(1) == nk and
@@ -3042,6 +3224,11 @@ namespace solvers {
     // output is the one thing the distributed path cannot serve -- it needs the full
     // (nk, nk, nc2, nc2) K store, which is the (D, D)-class object this path exists to
     // avoid -- so a one-rung request stays on the per-rank path (it is a gate-only output).
+    if (Pi_onerung_loc != nullptr and _ladder_solve_grid != 1)
+      app_log(1, "  [WARNING] eval_pol_ladder_loc_whalf: the one-rung orbital output is requested, so "
+                 "ladder_solve_grid = {} ({}) is NOT applied -- the per-rank LAPACK path runs (it needs the full "
+                 "(nk, nk) K store). Same answer, different memory footprint.", _ladder_solve_grid,
+              (_ladder_solve_grid == 0) ? "AUTO" : "SLATE grid");
     const long g_slv = (Pi_onerung_loc != nullptr)
         ? 1l
         : vertex_ladder_detail::resolve_ladder_solve_grid(
@@ -3054,7 +3241,8 @@ namespace solvers {
       vertex_ladder_detail::ladder_slate_thread_guard(g_slv, "ladder whalf-loc");
       vertex_ladder_detail::pair_space_ladder_slate(G_CC, _Xb_skma, _W0b_qmm.value(), kmq,
                                                     kpq, tools, nu_h, nullptr, mpi->comm,
-                                                    g_slv, symc, nullptr, &U_skia, &Ploc);
+                                                    g_slv, symc, nullptr, &U_skia, &Ploc,
+                                                    nullptr, tdap);   // audit A11: + TDA
       mpi->comm.all_reduce_in_place_n(Ploc.data(), Ploc.size(), std::plus<>{});
       return Ploc;
     }
@@ -3064,13 +3252,15 @@ namespace solvers {
                                               mpi->internode_comm.rank(),
                                               mpi->internode_comm.size(), symc,
                                               std::addressof(mpi->node_comm), nullptr,
-                                              &U_skia, &Ploc, Pi_onerung_loc);
+                                              &U_skia, &Ploc, Pi_onerung_loc,
+                                              nullptr, tdap);   // audit A11: + TDA
     else
       vertex_ladder_detail::pair_space_ladder(G_CC, _Xb_skma, _W0b_qmm.value(), kmq,
                                               kpq, tools, nu_h, nullptr, nullptr,
                                               mpi->comm.rank(), mpi->comm.size(), symc,
                                               nullptr, nullptr,
-                                              &U_skia, &Ploc, Pi_onerung_loc);
+                                              &U_skia, &Ploc, Pi_onerung_loc,
+                                              nullptr, tdap);   // audit A11: + TDA
     mpi->comm.all_reduce_in_place_n(Ploc.data(), Ploc.size(), std::plus<>{});
     if (Pi_onerung_loc != nullptr)
       mpi->comm.all_reduce_in_place_n(Pi_onerung_loc->data(), Pi_onerung_loc->size(),
@@ -3991,13 +4181,22 @@ namespace solvers {
     auto ker0 = vertex_ladder_detail::build_kernel_rs(_W0b_qmm.value(), Qpts,
                                                       MF->lattv(), MF->kp_grid(), 0.0);
     nda::array<ComplexType, 4> P1r(1, nq, Nm, Nm), Plr(1, nq, Nm, Nm);
-    long ju = 0;
+    long ju = 0, nun0 = 0;
     vertex_ladder_detail::pair_space_ladder_rs(G_CC, _Xb_skma, ker0, kpq, kpts, tools,
                                                nu0, 1e-12, 200, &P1r, &Plr, rank, size,
-                                               &ju);
+                                               &ju, &nun0);
     mpi->comm.all_reduce_in_place_n(P1r.data(), P1r.size(), std::plus<>{});
     mpi->comm.all_reduce_in_place_n(Plr.data(), Plr.size(), std::plus<>{});
     out.rungs_used = mpi->comm.all_reduce_value(ju, boost::mpi3::max<>{});
+    // audit E: a Neumann series that reaches the rung cap is NOT the resolvent G-P4b compares against
+    auto warn_unconv = [&](long nun, const char *what) {
+      nun = mpi->comm.all_reduce_value(nun, std::plus<>{});
+      if (nun > 0)
+        app_log(1, "  [WARNING] [scGW-tilde P4] {}: {} (s, q, nu) unit(s) reached the 200-rung cap without meeting "
+                   "the 1e-12 Neumann tolerance -- the series is truncated there (rho(Xh Kt) close to or above 1?), "
+                   "so its residual against the direct resolvent measures the truncation, not the kernel.", what, nun);
+    };
+    warn_unconv(nun0, "rs(tol=0) Neumann");
 
     auto rel = [&](auto const &A, auto const &Bref) {
       double n2 = 0.0, d2 = 0.0;
@@ -4031,10 +4230,13 @@ namespace solvers {
                                                       MF->lattv(), MF->kp_grid(), 0.0,
                                                       1e-300);
     nda::array<ComplexType, 4> P1s(1, nq, Nm, Nm), Pls(1, nq, Nm, Nm);
+    long nuns = 0;
     vertex_ladder_detail::pair_space_ladder_rs(G_CC, _Xb_skma, kers, kpq, kpts, tools,
-                                               nu0, 1e-12, 200, &P1s, &Pls, rank, size);
+                                               nu0, 1e-12, 200, &P1s, &Pls, rank, size,
+                                               nullptr, &nuns);
     mpi->comm.all_reduce_in_place_n(P1s.data(), P1s.size(), std::plus<>{});
     mpi->comm.all_reduce_in_place_n(Pls.data(), Pls.size(), std::plus<>{});
+    warn_unconv(nuns, "sampled (P,Q) Neumann");
     out.pq_all_j1_resid = rel(P1s, P1d);
     out.pq_all_neumann_resid = rel(Pls, Pld);
     {

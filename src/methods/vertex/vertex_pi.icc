@@ -1082,6 +1082,12 @@ namespace vertex_pi {
     utils::check(C0 + Nb <= nbnd,
                  "vertex_pi::pi_dyn_factorized: C = [{}, {}) exceeds the band range {}.",
                  C0, C0 + Nb, nbnd);
+    // audit E: the external fold below reads X_skPa(is, k, P, b) for EVERY band b < nbnd of G (and every full-BZ
+    // k of G's k axis); a collocation carrying fewer bands / k-points would be read out of bounds, not refused.
+    utils::check(X_skPa.shape(0) == ns and X_skPa.shape(1) == nk and X_skPa.shape(3) == nbnd,
+                 "vertex_pi::pi_dyn_factorized: X_skPa is ({}, {}, {}, {}), expected ({}, {}, Np, {}) -- the "
+                 "collocation must carry G's spin, full-BZ k and band axes.", X_skPa.shape(0), X_skPa.shape(1),
+                 X_skPa.shape(2), X_skPa.shape(3), ns, nk, nbnd);
 
     // symmetry bookkeeping -- identical contract to pi_c_accumulate_w
     const bool sym = (symc != nullptr and symc->active);
