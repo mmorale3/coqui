@@ -407,7 +407,7 @@ namespace solvers {
               star += " (" + std::to_string(qp) + ", js " + std::to_string(symc->q_isym(qp)) + (symc->q_trev(qp) ? ", trev" : "") +
                       ", cjg at " + std::to_string(ncj) + " IBZ k)";
             }
-          app_log(1, "  [P1 diag] unit is {} iq {}: max |dSq| {:.3e}, anti-Hermitian at the IBZ k {:.3e}, at the other k {:.3e}; qminus {}; star:{}",
+          app_log(1, "  [Sigma vertex, pair] IBZ diagnostic, unit is {} iq {}: max |dSq| {:.3e}, anti-Hermitian at the IBZ k {:.3e}, at the other k {:.3e}; qminus {}; star:{}",
                   is, iq, mx, ah_ibz, ah_out, symc->qminus(iq), star);
         }
         if (opt.nu_diag) {
@@ -449,7 +449,7 @@ namespace solvers {
     auto MF = thc.MF();
     auto mpi = thc.mpi();
     if (opt.outer == "dynamic" and not has_cached_w()) {
-      app_log(1, "  [LFF-Sigma pair] outer W = dynamic: folding this iteration's W into the W-bar cache (cache_w on demand).");
+      app_log(1, "  [Sigma vertex, pair] outer W = dynamic: folding this iteration's W into the W-bar cache (cache_w on demand).");
       cache_w(mb_state, thc);
     }
     nda::array<ComplexType, 5> G_CC;
@@ -527,7 +527,7 @@ namespace solvers {
           }
         }
       dSig = std::move(dSb);
-      app_log(1, "  [LFF-Sigma pair] Wannier mode: dSigma rotated from the MLWF frame (M = {}) to the band window [{}, {}) (nW = {}).",
+      app_log(1, "  [Sigma vertex, pair] Wannier mode: dSigma rotated from the MLWF frame (M = {}) to the band window [{}, {}) (nW = {}).",
               M, _band_window.first(), _band_window.last(), nW);
     }
     const long ncb = dSig.shape(3);
@@ -576,7 +576,7 @@ namespace solvers {
                     mloc.nu_spec.size() > 2 ? mloc.nu_spec(2) : 0.0, mloc.nu_spec.size() > 3 ? mloc.nu_spec(3) : 0.0);
       spec = buf;
     }
-    app_log(1, "  [LFF-Sigma pair] col {} outer {} junction {} scale {}: {} (s, q) units on {} bosonic nodes (C = [{}, {}), N_m = {}): "
+    app_log(1, "  [Sigma vertex, pair] col {} outer {} junction {} scale {}: {} (s, q) units on {} bosonic nodes (C = [{}, {}), N_m = {}): "
                "max |dSigma(tau)| = {:.4e}, anti-Hermitian residual {:.3e} ({}), |K_s - K_s^dag|/|K_s| = {:.2e}; wall {:.1f} s "
                "(slowest rank: rung {:.1f}, Cb {:.1f}, LU {:.1f}, amplitude {:.1f}, contraction {:.1f}), RSS {:.2f} GB{}",
             opt.col, opt.outer, opt.side, opt.scale, mloc.nunits, tools.nw_b, _band_window.first(), _band_window.last(), _Xb_skma.shape(2),

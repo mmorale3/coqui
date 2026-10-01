@@ -218,11 +218,11 @@ namespace solvers {
     // so a physically screened rung exists from iteration 1 by construction.
     if (has_active_vertex() and _vertex->rung() == dynamic_rung
         and not vertex_has_rung(mb_state)) {
-      app_log(1, "  [ISDF-Vertex] bootstrap: no screened W is available yet, so Pi^C would "
+      app_log(1, "  [vertex] bootstrap: no screened W is available yet, so Pi^C would "
                  "use the BARE\n"
-                 "                rung W = Z. Solving the RPA problem first and re-running "
+                 "           rung W = Z. Solving the RPA problem first and re-running "
                  "this update\n"
-                 "                with the vertex attached (one extra RPA + Dyson solve, "
+                 "           with the vertex attached (one extra RPA + Dyson solve, "
                  "this iteration only).\n");
       auto *vtx = _vertex;
       _vertex = nullptr;                      // RPA-only pass (no Pi^C, no cache_w)
@@ -260,9 +260,9 @@ namespace solvers {
         const bool host_W = _vertex->reads_host_W() or _vertex->sigma_lff_enabled() or
                             methods::vertex_debug::number("keep_host_W", 0.0) != 0.0;   // vertex_debug: keep_host_W
         if (host_W and not mb_state.keep_host_W)
-          app_log(1, "  [ISDF-Vertex] device path: keeping the host mirror of W for the vertex (keep_host_W = true).");
+          app_log(1, "  [vertex] device path: keeping the host mirror of W for the vertex (keep_host_W = true).");
         else if (not host_W and not mb_state.keep_host_W)
-          app_log(2, "  [ISDF-Vertex] device path: no vertex consumer reads the host mirror of W -- not kept (keep_host_W = false).");
+          app_log(2, "  [vertex] device path: no vertex consumer reads the host mirror of W -- not kept (keep_host_W = false).");
         if (host_W) mb_state.keep_host_W = true;
       }
       utils::check(_div_treatment != "cvv",
@@ -570,7 +570,7 @@ namespace solvers {
     // Sigma vertex, pair-resolved form: the static-ladder vertex in Sigma, on the readout instance (same placement)
     if (_vertex != nullptr and _vertex->sigma_pair_enabled()) build_sigma_pair(mb_state, thc);
     app_log(1, "  [update_w wall] from the eps-head dump to the vertex caches {:.1f} s; the user vertex's W-bar cache fill {:.1f} s; "
-               "the Sigma vertex (LFF / pair) {:.1f} s", w_c0 - w_dump0, w_c1 - w_c0, uw_wall() - w_c1);
+               "the Sigma vertex (pol_vertex_sigma = lff / pair) {:.1f} s", w_c0 - w_dump0, w_c1 - w_c0, uw_wall() - w_c1);
 
     print_timers();
   }
@@ -641,7 +641,7 @@ namespace solvers {
     // site), so both coincide.
     const std::string pol_div = _vertex->div_treatment();
     if (pol_div != _div_treatment)
-      app_log(1, "  [scGW-tilde L2] readout instance q -> 0 policy = \"{}\" (vertex_div_treatment) -- the GW/W "
+      app_log(1, "  [vertex ladder] readout instance q -> 0 policy = \"{}\" (vertex_div_treatment) -- the GW/W "
                  "div_treatment \"{}\" is untouched.", pol_div, _div_treatment);
     _pol_vtx = std::make_shared<vertex_t>(
         _ft, "2nd_exchange", w, thc.MF()->nbnd(), pol_div, "secondary",
@@ -657,7 +657,7 @@ namespace solvers {
     // so the pol-vertex/dynbse runs in the mesh-independent Wannier-pair frame (coarse->fine interpolation).
     if (_vertex->wannier()) {
       _pol_vtx->adopt_wannier(*_vertex);
-      app_log(1, "  [scGW-tilde L2] readout instance inherits the Wannier projector (M = {}): the vertex "
+      app_log(1, "  [vertex ladder] readout instance inherits the Wannier projector (M = {}): the vertex "
                  "polarization is produced in the MLWF-pair frame.", _vertex->subspace_rank());
     }
     // the ladder solve-grid knobs live on the knob carrier; the READOUT
@@ -706,14 +706,14 @@ namespace solvers {
     _pol_vtx->set_sigma_share(_vertex->sigma_share());
     // print the EFFECTIVE window (after a Wannier adoption it is the projector's W_rng, not pol_vertex_band_window)
     // and the readout's own q -> 0 policy
-    app_log(1, "  [scGW-tilde L2] ladder readout instance: C window = [{}, {}){}, "
+    app_log(1, "  [vertex ladder] ladder readout instance: C window = [{}, {}){}, "
                "secondary rank knob = {}, div_treatment = {} (kernel head follows "
                "build_w0's policy; W0bar is SAME-iteration -- coincides with "
-               "pol_vertex_kernel = \"w0_prev\" at a fixed point, R4 note).",
+               "pol_vertex_kernel = \"w0_prev\" at a fixed point).",
             _pol_vtx->band_window().first(), _pol_vtx->band_window().last(),
             _pol_vtx->wannier() ? " (the Wannier projector's W_rng)" : "", _vertex->pol_isdf_rank(),
             _pol_vtx->div_treatment());
-    app_log(1, "  [scGW-tilde L2] DA Phase-2 knobs on the readout instance: ladder_tda = "
+    app_log(1, "  [vertex ladder] ladder-kernel options on the readout instance: ladder_tda = "
                "{}, ladder_head_scale = {:.6g}, ladder_qnu_meter = {}.",
             _vertex->ladder_tda() ? "true" : "false", _vertex->ladder_head_scale(),
             _vertex->ladder_qnu_meter() ? "true" : "false");
@@ -868,7 +868,7 @@ namespace solvers {
     utils::check(proj_boson.nImps() == 1,
                  "scr_coulomb_t::accumulate_pi_lad_loc: P^lad_loc is implemented for a "
                  "SINGLE impurity only (nImps = {}); the upfold it is the adjoint of is "
-                 "single-impurity too (edmft_pi.icc:74/78).", proj_boson.nImps());
+                 "single-impurity too (edmft_pi.icc).", proj_boson.nImps());
     mf::MF &mf = *thc.MF();
     const long nw_h = Pl.shape(0), Nm = Pl.shape(2);
     const long nImpOrbs = proj_boson.nImpOrbs(), nab = nImpOrbs * nImpOrbs;
@@ -934,11 +934,11 @@ namespace solvers {
       _pol_dc_bubble_max = thc.mpi()->comm.all_reduce_value(dmax, boost::mpi3::max<>{});
       if (_pol_dc_bubble_max > 0.0)
         _pol_lad_loc_ratio = _pol_lad_loc_max / _pol_dc_bubble_max;
-      app_log(1, "  [qpGW Q4] ||P^lad_loc||_max = {:.4e} vs ||P_dc,bubble||_max = {:.4e} "
+      app_log(1, "  [orbital ladder] ||P^lad_loc||_max = {:.4e} vs ||P_dc,bubble||_max = {:.4e} "
                  "(ratio {:.3e})", _pol_lad_loc_max, _pol_dc_bubble_max, _pol_lad_loc_ratio);
     } else {
       _pol_dc_bubble_max = -1.0;
-      app_log(1, "  [qpGW Q4] ||P^lad_loc||_max = {:.4e} (no bubble P_dc present to "
+      app_log(1, "  [orbital ladder] ||P^lad_loc||_max = {:.4e} (no bubble P_dc present to "
                  "compare against)", _pol_lad_loc_max);
     }
   }
@@ -986,7 +986,7 @@ namespace solvers {
     auto const &W_rng = proj_boson.W_rng()[0];
     auto bw = _pol_vtx->band_window();
     if (W_rng.first() < bw.first() or W_rng.last() > bw.last()) {
-      app_log(1, "\n  [WARNING] Q4-C3b: the eq-7 ladder DC (orbital convention) was NOT "
+      app_log(1, "\n  [WARNING] [orbital ladder] the local ladder double-counting term (orbital convention) was NOT "
                  "produced.\n            The bosonic projector's band window [{}, {}) is "
                  "not contained in the\n            ladder (C) window [{}, {}), so the "
                  "local projection would drop bands the\n            ladder never "
@@ -1018,7 +1018,7 @@ namespace solvers {
         for (long m = 0; m < norb; ++m)
           for (long j = 0; j < W_rng.size(); ++j)
             U_skia(is, ik, m, off + j) = C_skIai(is, ik, 0, m, j);
-    app_log(2, "  [qpGW Q4-C3b] MLWF ladder legs: projector window [{}, {}) inside the "
+    app_log(2, "  [orbital ladder] MLWF ladder legs: projector window [{}, {}) inside the "
                "ladder window [{}, {}) (offset {}), {} impurity orbitals.",
             W_rng.first(), W_rng.last(), bw.first(), bw.last(), off, norb);
 
@@ -1065,11 +1065,11 @@ namespace solvers {
     _pol_lad_loc_orb_ratio = -1.0;
     if (mb_state.sPi_dc_wabcd and _pol_dc_bubble_max > 0.0) {
       _pol_lad_loc_orb_ratio = _pol_lad_loc_orb_max / _pol_dc_bubble_max;
-      app_log(1, "  [qpGW Q4-C3b] ||P^lad_loc,orb||_max = {:.4e} vs ||P_dc,bubble||_max = "
+      app_log(1, "  [orbital ladder] ||P^lad_loc,orb||_max = {:.4e} vs ||P_dc,bubble||_max = "
                  "{:.4e} (ratio {:.3e})", _pol_lad_loc_orb_max, _pol_dc_bubble_max,
               _pol_lad_loc_orb_ratio);
     } else {
-      app_log(1, "  [qpGW Q4-C3b] ||P^lad_loc,orb||_max = {:.4e} (no bubble P_dc present "
+      app_log(1, "  [orbital ladder] ||P^lad_loc,orb||_max = {:.4e} (no bubble P_dc present "
                  "to compare against)", _pol_lad_loc_orb_max);
     }
   }
@@ -1108,7 +1108,7 @@ namespace solvers {
                  "inject_pol_ladder: the ladder instance is absent (ensure_pol_vertex).");
     utils::check(_vertex != nullptr and not _vertex->active(),
                  "inject_pol_ladder: an ACTIVE vertex_type injects its own Pi^C -- the "
-                 "combination double counts (ruling R-Q3-3).");
+                 "combination double counts; use either the active vertex_type or the ladder injection, not both.");
     auto [nt_h, nq_g, Np, NQ_g] = dPi_tqPQ.global_shape();
 
     ladder_meter::watch lwatch, ltot;
@@ -1143,7 +1143,7 @@ namespace solvers {
       const std::string col = "Pi_" + _pol_vtx->pol_interp_col();
       Pl = read_pol_interp_column(_pol_vtx->pol_interp_col(), nq_g, nw_h_ft, nu_half, thc);   // the read shared with the Sigma vertex
       lam = nda::array<double, 1>(nw_h_ft); lam() = 0.0;
-      app_log(1, "  [W-int-4f] W-Dyson injection consumes {} from {} ({} half nodes x {} q matched; frozen points, N_m = {}).",
+      app_log(1, "  [vertex Wannier] W-Dyson injection consumes {} from {} ({} half nodes x {} q matched; frozen points, N_m = {}).",
               col, _pol_vtx->pol_interp_file(), nw_h_ft, nq_g, _pol_vtx->secondary_rank());
     } else {
       Pl = _pol_vtx->eval_pol_ladder_whalf(mb_state, thc, &lam, ward_legs ? std::addressof(Pd) : nullptr);
@@ -1173,7 +1173,7 @@ namespace solvers {
       h5::h5_write(g, "window_first", long(_pol_vtx->pol_band_window().first()));
       h5::h5_write(g, "window_size", long(_pol_vtx->pol_band_window().size()));
       if (_pol_vtx->secondary_points().size() > 0) nda::h5_write(g, "ipts", _pol_vtx->secondary_points());
-      app_log(1, "  [W-int-4f] full-frequency ladder injection object written to {} ({} half nodes x {} q x {} x {}).",
+      app_log(1, "  [vertex Wannier] full-frequency ladder injection object written to {} ({} half nodes x {} q x {} x {}).",
               fn, nw_h, nq_g, Nm, Nm);
     }
     utils::check(Pl.shape(1) == nq_g and tmap.shape(0) == nq_g and tmap.shape(1) == Nm
@@ -1396,7 +1396,7 @@ namespace solvers {
       app_log(1, "  [ladder-prof inject] MaxRSS GB (max over ranks): entry {:.2f} -> "
                  "after ladder eval {:.2f} -> exit {:.2f}", rss_e0, rss_ev, rss_mx);
     }
-    app_log(1, "  [qpGW Q3] ladder injected into P ({} PH-sym nu nodes, N_m = {}): "
+    app_log(1, "  [ladder injection] ladder injected into P ({} PH-sym nu nodes, N_m = {}): "
                "||P^lad||_max = {:.4e} vs ||P^RPA||_max = {:.4e} (ratio {:.3e}); "
                "transform round trip r_rt = {:.3e}",
             nw_h, Nm, nC, nR, _pol_lad_ratio, _pol_r_rt);
@@ -1404,7 +1404,7 @@ namespace solvers {
       std::ostringstream oss;
       oss << std::scientific << std::setprecision(2);
       for (long q = 0; q < nq_g; ++q) oss << (q ? " " : "") << qmax[size_t(q)];
-      app_log(1, "  [qpGW Q3] ||P^lad||_max by transfer q (q=0 is Gamma): {}", oss.str());
+      app_log(1, "  [ladder injection] ||P^lad||_max by transfer q (q=0 is Gamma): {}", oss.str());
     }
     // ---- (q, nu) meter report: WHERE IN (q, nu) THE INJECTED CORRECTION LIVES ----------
     if (qnu_meter) {
@@ -1423,11 +1423,11 @@ namespace solvers {
       }
       double tot_w = 0.0;
       for (auto v : lad_qw) tot_w += v;
-      app_log(1, "\n  [DA D-7] (q, nu) DECOMPOSITION of the injected P^lad "
+      app_log(1, "\n  [ladder q-nu meter] (q, nu) DECOMPOSITION of the injected P^lad "
                  "(global THC aux basis, Frobenius norms).");
-      app_log(1, "  [DA D-7]   q-marginal (sum over the {} PH-sym nu nodes), and the "
+      app_log(1, "  [ladder q-nu meter]   q-marginal (sum over the {} PH-sym nu nodes), and the "
                  "tau-summed strength relative to P^RPA:", nw_h);
-      app_log(1, "  [DA D-7]   {:>4} {:>12} {:>6} {:>14} {:>10} {:>14} {:>14} {:>10}",
+      app_log(1, "  [ladder q-nu meter]   {:>4} {:>12} {:>6} {:>14} {:>10} {:>14} {:>14} {:>10}",
               "iq", "|q|^2", "mult", "||P^lad(q)||", "share", "||P^lad(q)||_t",
               "||P^RPA(q)||_t", "ratio");
       for (long q = 0; q < nq_g; ++q) {
@@ -1439,7 +1439,7 @@ namespace solvers {
         }
         auto qp = MF->Qpts_ibz(q);
         const double q2 = qp(0) * qp(0) + qp(1) * qp(1) + qp(2) * qp(2);
-        app_log(1, "  [DA D-7]   {:>4} {:>12.5e} {:>6} {:>14.6e} {:>10.4f} {:>14.6e} "
+        app_log(1, "  [ladder q-nu meter]   {:>4} {:>12.5e} {:>6} {:>14.6e} {:>10.4f} {:>14.6e} "
                    "{:>14.6e} {:>10.4e}",
                 q, q2, mult[size_t(q)], std::sqrt(sw),
                 (tot_w > 0.0 ? sw / tot_w : 0.0), std::sqrt(st), std::sqrt(sr),
@@ -1453,7 +1453,7 @@ namespace solvers {
           for (long q = 0; q < nq_g; ++q) s += lad_qw[size_t(q * nw_h + j)];
           o2 << (j ? " " : "") << std::sqrt(s);
         }
-        app_log(1, "  [DA D-7]   nu-marginal ||P^lad(nu)|| (PH-sym half grid, node 0 = "
+        app_log(1, "  [ladder q-nu meter]   nu-marginal ||P^lad(nu)|| (PH-sym half grid, node 0 = "
                    "i.nu = 0): {}", o2.str());
       }
       for (long q = 0; q < nq_g; ++q) {
@@ -1461,18 +1461,18 @@ namespace solvers {
         o3 << std::scientific << std::setprecision(3);
         for (long j = 0; j < nw_h; ++j)
           o3 << (j ? " " : "") << std::sqrt(lad_qw[size_t(q * nw_h + j)]);
-        app_log(1, "  [DA D-7]   ||P^lad(q = {}, nu)||: {}", q, o3.str());
+        app_log(1, "  [ladder q-nu meter]   ||P^lad(q = {}, nu)||: {}", q, o3.str());
       }
       app_log(1, "");
     }
-    app_log(1, "  [qpGW Q3] ladder resolvent margin: lambda_max(inu = 0) = {:.6f}, "
+    app_log(1, "  [ladder injection] ladder resolvent margin: lambda_max(inu = 0) = {:.6f}, "
                "max over nu = {:.6f}{}", _pol_lam_nu0, _pol_lam_max,
             (_pol_lam_max > 0.9) ? "   [WARNING: approaching the particle-hole "
                                    "instability -- the resolvent is losing margin]" : "");
     utils::check(std::isfinite(_pol_lam_max) and _pol_lam_max < 1.0,
                  "inject_pol_ladder: the ladder kernel's spectral radius rho(Xh Kt) = {} "
-                 "has reached 1 -- eq 6's resolvent (1 - chi0 Xi)^-1 is singular "
-                 "(particle-hole instability). The BSE tier is outside its regime here; "
+                 "has reached 1 -- the ladder resolvent (1 - chi0 Xi)^-1 is singular "
+                 "(particle-hole instability). The static-ladder (BSE) approximation is outside its regime here; "
                  "reduce the ladder C window.", _pol_lam_max);
     if (nC > nR)
       app_log(1, "  [WARNING] the ladder polarization EXCEEDS the RPA polarization it "
@@ -1554,7 +1554,7 @@ namespace solvers {
         chosen = nusamp::pivot_nodes(G, Kn, std::vector<long>{0L, nw_h - 1});
         std::string lst;
         for (long n : chosen) lst += std::to_string(n) + " ";
-        app_log(1, "  [LFF L-3] automatic sampled nodes ({} of {}, from the {} column of {}): {}", chosen.size(), nw_h, col,
+        app_log(1, "  [Sigma vertex] automatic sampled nodes ({} of {}, from the {} column of {}): {}", chosen.size(), nw_h, col,
                 _pol_vtx->ladder_dyn_fit_file(), lst);
       }
       long nch = long(chosen.size());
@@ -1569,7 +1569,7 @@ namespace solvers {
     for (long j : nodes)
       utils::check(j >= 0 and j < nw_h, "dump_pol_dyn_all_nu: pol_vertex_dyn_all_nu_nodes entry {} outside [0, {}).", j, nw_h);
     const bool subset = (long(nodes.size()) != nw_h);
-    app_log(1, "  [W-int-4f] all-nu dynamic-rung dump: {} of {} half nodes x {} transfers (Gamma_1-only = {}, bubble_only = {}).",
+    app_log(1, "  [vertex Wannier] all-nu dynamic-rung dump: {} of {} half nodes x {} transfers (Gamma_1-only = {}, bubble_only = {}).",
             nodes.size(), nw_h, nq, _pol_vtx->ladder_dyn_gamma1_only(), bub_only);
     std::optional<vertex_t::dynbse_cut_result> rd;   // the dynamic columns on the sampled nodes
     if (not bub_only) {
@@ -1631,7 +1631,7 @@ namespace solvers {
           utils::check(nu_f.size() == nw_h, "dump_pol_dyn_all_nu: the fit file {} has {} half nodes, this run {}.", fit_file, nu_f.size(), nw_h);
           for (long j = 0; j < nw_h; ++j)
             utils::check(nu_f(j) == nu_half(j), "dump_pol_dyn_all_nu: the fit file's half node {} is Matsubara index {}, {} here.", j, nu_f(j), nu_half(j));
-          app_log(1, "  [LFF L-3] on-demand fit: {} sampled nodes -> all {} nodes in the nu-basis of {} ({} modes per column).",
+          app_log(1, "  [Sigma vertex] on-demand fit: {} sampled nodes -> all {} nodes in the nu-basis of {} ({} modes per column).",
                   nodes.size(), nw_h, fit_file, Kfit);
         }
         const long NS = long(nodes.size()), ncol = nq * Nm * Nm;
@@ -1653,7 +1653,7 @@ namespace solvers {
           }
           utils::check(long(mu_tab.size()) == nw_h, "dump_pol_dyn_all_nu: {} has {} mu values, this run has {} half nodes.",
                        mu_file, mu_tab.size(), nw_h);
-          app_log(1, "  [LFF mu] resummation factor from {}: Pi_dyn = mu(nu) Pi_gam1 with mu(0) = {:.4f}, mu(nu_max) = {:.4f}.",
+          app_log(1, "  [Sigma vertex, mu] resummation factor from {}: Pi_dyn = mu(nu) Pi_gam1 with mu(0) = {:.4f}, mu(nu_max) = {:.4f}.",
                   mu_file, mu_tab.front(), mu_tab.back());
         }
         nda::array<ComplexType, 4> P_gam1;   // the written Gamma_1 column (kept for the mu-scaled Pi_dyn)
@@ -1698,16 +1698,16 @@ namespace solvers {
               fitted = true;
               double pmax = 0.0;
               for (auto const &v : P) pmax = std::max(pmax, std::abs(v));
-              app_log(1, "  [LFF L-3]   {}: {} modes carry {:.6f} of the basis column's |.|^2 ({} form); residual at the sampled nodes {:.2e}; "
+              app_log(1, "  [Sigma vertex]   {}: {} modes carry {:.6f} of the basis column's |.|^2 ({} form); residual at the sampled nodes {:.2e}; "
                          "max |P| {:.3e}", names[c], Kfit, lkept, fmode, (ns > 0.0) ? std::sqrt(rs / ns) : 0.0, pmax);
             } else {
-              app_log(1, "  [LFF L-3]   {}: not in the fit file -- written at the sampled nodes only.", names[c]);
+              app_log(1, "  [Sigma vertex]   {}: not in the fit file -- written at the sampled nodes only.", names[c]);
             }
           }
           if (c == 2 and not mu_tab.empty()) P_gam1 = P;
           if (c == 3 and not mu_tab.empty()) {
             for (long j = 0; j < nw_h; ++j) P(j, all, all, all) = ComplexType(mu_tab[size_t(j)]) * P_gam1(j, all, all, all);
-            app_log(1, "  [LFF mu]   Pi_dyn written as mu(nu) x Pi_gam1 ({} nodes).", nw_h);
+            app_log(1, "  [Sigma vertex, mu]   Pi_dyn written as mu(nu) x Pi_gam1 ({} nodes).", nw_h);
           }
           nda::h5_write(g, names[c], P);
           (void)fitted;
@@ -1728,11 +1728,11 @@ namespace solvers {
       h5::h5_write(g, "window_size", long(_pol_vtx->pol_band_window().size()));
       if (_pol_vtx->secondary_points().size() > 0) nda::h5_write(g, "ipts", _pol_vtx->secondary_points());
       if (rd.has_value())
-        app_log(1, "  [W-int-4f] all-nu dynamic-rung columns written to {} ({} half nodes ({} sampled) x {} q x {} x {} + the window "
+        app_log(1, "  [vertex Wannier] all-nu dynamic-rung columns written to {} ({} half nodes ({} sampled) x {} q x {} x {} + the window "
                    "bubble Pi_bub; watchdog max |Ritz| {:.3f}, all converged {}).", fn, nw_h, nodes.size(), nq, Nm, Nm,
                 rd->ritz_max, rd->all_converged);
       else
-        app_log(1, "  [W-int-4f] bubble_only: the window bubble column Pi_bub written to {} ({} half nodes x {} q x {} x {}; no "
+        app_log(1, "  [vertex Wannier] bubble_only: the window bubble column Pi_bub written to {} ({} half nodes x {} q x {} x {}; no "
                    "dynamic columns).", fn, nw_h, nq, Nm, Nm);
     }
   }
@@ -1754,7 +1754,7 @@ namespace solvers {
     auto MF = thc.MF();
     const long nq = Pi0_qPQ.shape(0), Np = Pi0_qPQ.shape(1);
     if (MF->nqpts_ibz() == 1) {
-      app_log(1, "  [scGW-tilde L2] ladder readout skipped: nqpts_ibz == 1 (no finite "
+      app_log(1, "  [vertex ladder] ladder readout skipped: nqpts_ibz == 1 (no finite "
                  "q for the eps_M head).");
       return;
     }
@@ -1768,7 +1768,7 @@ namespace solvers {
       auto dres = _pol_vtx->eval_pol_dynbse_nu0(mb_state, thc, _pol_dyn_calls);
       _pol_dyn_ritz = dres.ritz_max;
       if (_pol_vtx->ladder_dyn_all_nu()) dump_pol_dyn_all_nu(mb_state, thc, _pol_dyn_calls);
-      app_log(1, "  [scGW-tilde T2] Wannier-vertex DUMP: Pi_loc(q) produced in the MLWF-pair frame "
+      app_log(1, "  [dynamic vertex] Wannier-vertex DUMP: Pi_loc(q) produced in the MLWF-pair frame "
                  "({} q x {} x {}) -- dumped for coarse->fine interpolation; the aux eps readout is bypassed.",
               dres.Pi_gam1.shape(0), dres.Pi_gam1.shape(1), dres.Pi_gam1.shape(2));
       return;
@@ -1798,7 +1798,7 @@ namespace solvers {
       utils::check(Pl_qmm.shape(0) == nq,
                    "pol_ladder_eps_readout: cached inu = 0 ladder row has {} q rows, "
                    "expected {}.", Pl_qmm.shape(0), nq);
-      app_log(2, "  [scGW-tilde L2] eps_M readout: reusing the injection's inu = 0 ladder "
+      app_log(2, "  [vertex ladder] eps_M readout: reusing the injection's inu = 0 ladder "
                  "row (no second pair-space ladder pass).");
     } else if (not _pol_vtx->pol_interp_file().empty()) {
       // the fine-mesh CONSUMER. Pi(q)_{MN} on THIS mesh's q list
@@ -1843,7 +1843,7 @@ namespace solvers {
                                "from {} (interpolate onto the full fine mesh).", qc[0], qc[1], qc[2], _pol_vtx->pol_interp_file());
         Pl_qmm(iq, all, all) = Pf(hit, all, all);
       }
-      app_log(1, "  [W-int-4] eps readout consumes {} from {} ({} q matched on this mesh's q list; frozen points, "
+      app_log(1, "  [vertex Wannier] eps readout consumes {} from {} ({} q matched on this mesh's q list; frozen points, "
                  "N_m = {}).", col, _pol_vtx->pol_interp_file(), nq, Nm_v);
     } else {
       Pl_qmm = _pol_vtx->eval_pol_ladder_nu0(mb_state, thc,
@@ -1867,7 +1867,7 @@ namespace solvers {
         utils::check(dres->Pi_dyn.shape(0) == nq and dres->Pi_dyn.shape(1) == Nm,
                      "pol_ladder_eps_readout: dynamic-rung block shape mismatch.");
       else
-        app_log(1, "  [scGW-tilde T2] Wannier mode: dynamic-rung eps columns SKIPPED (Pi_loc dumped for interpolation).");
+        app_log(1, "  [dynamic vertex] Wannier mode: dynamic-rung eps columns SKIPPED (Pi_loc dumped for interpolation).");
       _pol_dyn_ritz = dres->ritz_max;
     }
 
@@ -1975,7 +1975,7 @@ namespace solvers {
       chi_c = nda::conj(Chi_bar(iq, all));
 #if defined(ENABLE_DEVICE)
       if (eps_dev and iq == (nq > 1 ? 1 : 0))
-        app_log(2, "  [scGW-tilde L2] eps readout: the single-frequency Dysons run on the device (solve A x = Z c).");
+        app_log(2, "  [vertex ladder] eps readout: the single-frequency Dysons run on the device (solve A x = Z c).");
       if (eps_dev) {                                             // this q's Z on the device, y = Z c on the host
         nda::array<ComplexType, 2> Zq(Z_qPQ(iq, all, all));
         eZd.emplace(memory::to_memory_space<DEVICE_MEMORY>(Zq));
@@ -2044,15 +2044,15 @@ namespace solvers {
         if (is_gamma) continue;                                   // no head at Gamma
       }
       if (ward_legs)
-        app_log(2, "  [scGW-tilde L2]   q {} (|q|^2 = {:.4e}): eps_M RPA = {:.6f}, "
+        app_log(2, "  [vertex ladder]   q {} (|q|^2 = {:.4e}): eps_M RPA = {:.6f}, "
                    "+DeltaLambda = {:.6f}, +ladder(Lambda legs) = {:.6f}", iq, q_abs2, e_rpa,
                 e_dlm, e_lad);
       else if (dyn_rung)
-        app_log(2, "  [scGW-tilde L2]   q {} (|q|^2 = {:.4e}): eps_M RPA = {:.6f}, +ladder(L2) = {:.6f}, "
+        app_log(2, "  [vertex ladder]   q {} (|q|^2 = {:.4e}): eps_M RPA = {:.6f}, +ladder(static) = {:.6f}, "
                    "+static(dynbse driver) = {:.6f}, +static+Pi^C_dyn = {:.6f}, +Gamma1 = {:.6f}, +resummed = {:.6f}",
                 iq, q_abs2, e_rpa, e_lad, e_ds, e_dp, e_dg, e_dy);
       else
-        app_log(2, "  [scGW-tilde L2]   q {} (|q|^2 = {:.4e}): eps_M RPA = {:.6f}, "
+        app_log(2, "  [vertex ladder]   q {} (|q|^2 = {:.4e}): eps_M RPA = {:.6f}, "
                    "+ladder = {:.6f}", iq, q_abs2, e_rpa, e_lad);
       if (q_abs2 < qmin_abs2) {
         qmin_abs2 = q_abs2;
@@ -2064,45 +2064,44 @@ namespace solvers {
       }
     }
     if (qnu_meter) {
-      app_log(1, "\n  [DA D-7] per-q DYSON-W CHANGE driven by P^lad (i.nu = 0). "
+      app_log(1, "\n  [ladder q-nu meter] per-q DYSON-W CHANGE driven by P^lad (i.nu = 0). "
                  "dW = (eps^-1 - I) Z; the\n"
-                 "  [DA D-7] Gamma row carries no eps_M head by construction (marked -).");
-      app_log(1, "  [DA D-7]   {:>4} {:>12} {:>14} {:>12} {:>12} {:>12}",
+                 "  [ladder q-nu meter] Gamma row carries no eps_M head by construction (marked -).");
+      app_log(1, "  [ladder q-nu meter]   {:>4} {:>12} {:>14} {:>12} {:>12} {:>12}",
               "iq", "|q|^2", "||dW_lad||_F", "rel to dW", "eps_M(RPA)", "D eps_M");
       for (long iq = 0; iq < nq; ++iq) {
         auto qp2 = MF->Qpts_ibz(iq);
         const double q2 = qp2(0) * qp2(0) + qp2(1) * qp2(1) + qp2(2) * qp2(2);
         if (eps_r[size_t(iq)] < 0.0)
-          app_log(1, "  [DA D-7]   {:>4} {:>12.5e} {:>14.6e} {:>12.5e} {:>12} {:>12}",
+          app_log(1, "  [ladder q-nu meter]   {:>4} {:>12.5e} {:>14.6e} {:>12.5e} {:>12} {:>12}",
                   iq, q2, dw_abs[size_t(iq)], dw_rel[size_t(iq)], "-", "-");
         else
-          app_log(1, "  [DA D-7]   {:>4} {:>12.5e} {:>14.6e} {:>12.5e} {:>12.6f} "
+          app_log(1, "  [ladder q-nu meter]   {:>4} {:>12.5e} {:>14.6e} {:>12.5e} {:>12.6f} "
                      "{:>+12.6f}", iq, q2, dw_abs[size_t(iq)], dw_rel[size_t(iq)],
                   eps_r[size_t(iq)], deps[size_t(iq)]);
       }
       app_log(1, "");
     }
     if (iq_min >= 0) {
-      app_log(1, "  [scGW-tilde L2] ladder eps_M readout (inu = 0, q_min = {}): "
-                 "RPA = {:.6f}, +ladder = {:.6f} (Delta = {:+.6f}; gate L2-b watches "
-                 "the DIRECTION)", iq_min, eps_rpa_qmin, eps_lad_qmin,
+      app_log(1, "  [vertex ladder] ladder eps_M readout (inu = 0, q_min = {}): "
+                 "RPA = {:.6f}, +ladder = {:.6f} (Delta = {:+.6f}; the sign of Delta is "
+                 "the direction of the ladder correction)", iq_min, eps_rpa_qmin, eps_lad_qmin,
               eps_lad_qmin - eps_rpa_qmin);
       _pol_eps_rpa = eps_rpa_qmin;
       _pol_eps_ladder = eps_lad_qmin;
       _pol_eps_dlam = eps_dlm_qmin;
       if (ward_legs)
-        app_log(1, "  [scGW-tilde T1.5] Tier-1.5 eps_M readout (inu = 0, q_min = {}): RPA = "
+        app_log(1, "  [Ward legs] eps_M readout with the Ward (Lambda) legs (inu = 0, q_min = {}): RPA = "
                    "{:.6f}, +DeltaLambda (chi0_Lambda alone) = {:.6f}, +ladder on Lambda legs "
-                   "(eq 27 composite) = {:.6f}  [G-j targets at Si 4^3: ~4.8 / 5.4-5.6]",
+                   "= {:.6f}",
                 iq_min, eps_rpa_qmin, eps_dlm_qmin, eps_lad_qmin);
       if (dyn_rung) {
         _pol_eps_dyn_static = eps_ds_qmin; _pol_eps_dyn_pc = eps_dp_qmin;
         _pol_eps_dyn_gam1 = eps_dg_qmin; _pol_eps_dyn = eps_dy_qmin;
-        app_log(1, "  [scGW-tilde T2] dynamic-rung eps_M readout (inu = 0, q_min = {}): RPA = {:.6f}, "
-                   "+ladder(L2, resolvent 1 + Xh Kt) = {:.6f}, +static ladder (dynbse driver; must equal L2) = {:.6f}, "
+        app_log(1, "  [dynamic vertex] dynamic-rung eps_M readout (inu = 0, q_min = {}): RPA = {:.6f}, "
+                   "+ladder(static, resolvent 1 + Xh Kt) = {:.6f}, +static ladder (dynbse driver; must equal the previous column) = {:.6f}, "
                    "+static+Pi^C_dyn (one dynamic rung) = {:.6f}, +Gamma_1 (static-dressed one dynamic rung) "
-                   "= {:.6f}, +RESUMMED dynamic-rung ladder = {:.6f}  [references at Si 4^3 q_min, C = [0,8): RPA 4.028, "
-                   "static 4.699 (former 1 - Xh Kt resolvent 4.443), resummed 5.399, G0W0-class 5.747]; watchdog max "
+                   "= {:.6f}, +RESUMMED dynamic-rung ladder = {:.6f}; watchdog max "
                    "|Ritz(K_d L_s)| = {:.3f}, converged {}",
                 iq_min, eps_rpa_qmin, eps_lad_qmin, eps_ds_qmin, eps_dp_qmin, eps_dg_qmin, eps_dy_qmin,
                 dres->ritz_max, dres->all_converged);
@@ -2169,7 +2168,7 @@ namespace solvers {
           return 1.0 / (1.0 + eih.real());
         };
         app_log(1, "\n  [eps-cut] call {}: eps_M(q_i, i nu_j) on the PH-sym bosonic half grid; columns: RPA, "
-                   "+ladder (static L2, resolvent 1 + Xh Kt){}, loop-side (the loop's own eps^-1 head{}){}",
+                   "+ladder (static, resolvent 1 + Xh Kt){}, loop-side (the loop's own eps^-1 head{}){}",
                 _pol_cut_calls, ward_legs ? ", +DeltaLambda (chi0_Lambda alone)" : "",
                 have_loop ? "" : ": absent",
                 dyn_rung ? ", then the dynamic-rung columns: +static (dynbse driver), +static+Pi^C_dyn, +Gamma_1, +resummed" : "");
@@ -2249,7 +2248,7 @@ namespace solvers {
       for (long it = 0; it < nt_h; ++it) et(it, 0) = (*eps_inv_head_q)(it, iq_min);
       _ft->tau_to_w_PHsym(et, ew);            // inu = 0 = index 0 of the PH-sym half grid
       _pol_eps_loop = 1.0 / (1.0 + ew(0, 0).real());
-      app_log(1, "  [qpGW Q3] loop-side eps_M(q_min = {}, inu = 0) from the tau Dyson = "
+      app_log(1, "  [ladder injection] loop-side eps_M(q_min = {}, inu = 0) from the tau Dyson = "
                  "{:.9f}; readout route (+ladder) = {:.9f} (deviation = {:.3e})",
               iq_min, _pol_eps_loop, eps_lad_qmin,
               std::abs(_pol_eps_loop - eps_lad_qmin));
@@ -2671,7 +2670,7 @@ namespace solvers {
       // The linear rung injects its P^{C,L} here.
       if (_vertex != nullptr and _vertex->rung() == static_rung) return;
       if (_vertex != nullptr and _vertex->active() and _vertex->skip_pi_c()) {
-        app_log(1, "  [ISDF-Vertex] TEST switch set_skip_pi_c: the Pi^C cut is OMITTED (P = RPA); Sigma^C alone (a gate reference, not a theory).");
+        app_log(1, "  [vertex] TEST switch set_skip_pi_c: the Pi^C cut is OMITTED (P = RPA); Sigma^C alone (a test reference, not a conserving theory).");
         return;
       }
       if (_vertex != nullptr and _vertex->active()) {
@@ -2687,7 +2686,7 @@ namespace solvers {
         for (auto const &v : dPi.local()) nR = std::max(nR, std::abs(v));
         nC = thc.mpi()->comm.all_reduce_value(nC, boost::mpi3::max<>{});
         nR = thc.mpi()->comm.all_reduce_value(nR, boost::mpi3::max<>{});
-        app_log(1, "  [ISDF-Vertex] ||Pi^C||_max = {:.4e} vs ||Pi_RPA||_max = {:.4e} "
+        app_log(1, "  [vertex] ||Pi^C||_max = {:.4e} vs ||Pi_RPA||_max = {:.4e} "
                    "(ratio {:.3e})", nC, nR, nC / std::max(nR, 1e-300));
         // PER-q BREAKDOWN. The analytic q->0 head is inserted ONLY at Gamma, yet the worst
         // dielectric cell can be a NON-Gamma transfer: Pi^C's INTERNAL rung sum runs
@@ -2716,7 +2715,7 @@ namespace solvers {
           std::ostringstream oss;
           oss << std::scientific << std::setprecision(2);
           for (long q = 0; q < nq_g; ++q) oss << (q ? " " : "") << qmax[size_t(q)];
-          app_log(1, "  [ISDF-Vertex] ||Pi^C||_max by transfer q (q=0 is Gamma): {}",
+          app_log(1, "  [vertex] ||Pi^C||_max by transfer q (q=0 is Gamma): {}",
                   oss.str());
         }
         if (nC > nR)
@@ -3394,7 +3393,7 @@ namespace solvers {
     _sig_pi0_qwmm.emplace(nda::array<ComplexType, 4>(nq, nw_h, Nm, Nm));
     for (long iq = 0; iq < nq; ++iq)
       for (long j = 0; j < nw_h; ++j) _sig_pi0_qwmm.value()(iq, j, all, all) = Pb(iq, nw_b / 2 + j, all, all);
-    app_log(1, "  [LFF-Sigma] pol_vertex_sigma_bub = \"full\": the loop's RPA Pi folded to the frozen secondary frame, "
+    app_log(1, "  [Sigma vertex] pol_vertex_sigma_bub = \"full\": the loop's RPA Pi folded to the frozen secondary frame, "
                "(nq, nw_half, N_m) = ({}, {}, {}).", nq, nw_h, Nm);
   }
 
@@ -3467,7 +3466,7 @@ namespace solvers {
       h5::h5_write(g, "side", o.side);
       h5::h5_write(g, "col", o.col);
       h5::h5_write(g, "outer", o.outer);
-      app_log(1, "  [LFF-Sigma pair] diagnostics written to {} (Pi_check (nw_b, nq, N_m, N_m), nu_spec, dSigma_tskab)", fn);
+      app_log(1, "  [Sigma vertex, pair] diagnostics written to {} (Pi_check (nw_b, nq, N_m, N_m), nu_spec, dSigma_tskab)", fn);
     }
     mb_state.dSigma_pair_tskab.emplace(std::move(dS));
     mb_state.sigma_pair_window = {_pol_vtx->band_window().first(), long(_pol_vtx->band_window().size())};
@@ -3759,16 +3758,16 @@ namespace solvers {
       if (mb_state.eps_inv_head.has_value() and long(mb_state.eps_inv_head.value().shape(0)) == nt_h) h0 = head_nu0(mb_state.eps_inv_head.value());
     }
     _sig_lff_meter = {v_q1, r_max, h0_sig, h0};
-    app_log(1, "  [LFF-Sigma] instantaneous part |dW~_inf|_F / |Z|_F = {:.3e} (the local vertex at the tail node: {:+.4f}; {}); "
+    app_log(1, "  [Sigma vertex] instantaneous part |dW~_inf|_F / |Z|_F = {:.3e} (the local vertex at the tail node: {:+.4f}; {}); "
                "heads at i nu = 0: eps^-1 - 1 = {:+.5f} (loop), correction {:+.5f} (expected sign = that of the vertex at q_1: {:+.4f})",
             r_inf, v_tail, _vertex->sigma_lff_static() ? "-> the static self-energy" : "DROPPED (pol_vertex_sigma_static = false)",
             h0, h0_sig, v_q1);
-    app_log(1, "  [LFF-Sigma] local vertex scalar tr(P dPi P)/tr(P Pi_0 P) at nu_0: q_1 {:+.4f}, Gamma {:+.4f}; tr(Pi_0)/tr(B_dump) at nu_0: q_1 {:.4f}, Gamma {:.4f}"
+    app_log(1, "  [Sigma vertex] local vertex scalar tr(P dPi P)/tr(P Pi_0 P) at nu_0: q_1 {:+.4f}, Gamma {:+.4f}; tr(Pi_0)/tr(B_dump) at nu_0: q_1 {:.4f}, Gamma {:.4f}"
                " (1 by definition for the window bubble)", v_q1, v_q0, pb_q1, pb_q0);
     _sig_lff_meter[0] = v_q1;
-    app_log(1, "  [LFF-Sigma] dW~ = {} x Herm[(Z + dW) t^dag G1 t], G1 = {} (column {}), N_m = {}, {} half nodes x {} q; frame metric cond(t t^dag) {:.2e}:\n"
-               "              |G1| rms max {:.3e} (q_1, nu_0: {:.3e}; Gamma, nu_0: {:.3e}); |dW~|_F / |dW|_F all (q, nu) {:.3e} (q_1, nu_0: {:.3e});\n"
-               "              Pi_0^-1 cut {} of {} modes at most (tol {:.1e}); heads at i nu = 0: correction {:+.5f} vs the loop's {:+.5f} "
+    app_log(1, "  [Sigma vertex] dW~ = {} x Herm[(Z + dW) t^dag G1 t], G1 = {} (column {}), N_m = {}, {} half nodes x {} q; frame metric cond(t t^dag) {:.2e}:\n"
+               "                 |G1| rms max {:.3e} (q_1, nu_0: {:.3e}; Gamma, nu_0: {:.3e}); |dW~|_F / |dW|_F all (q, nu) {:.3e} (q_1, nu_0: {:.3e});\n"
+               "                 Pi_0^-1 cut {} of {} modes at most (tol {:.1e}); heads at i nu = 0: correction {:+.5f} vs the loop's {:+.5f} "
                "(ratio {:.3f}, head scale {}); wall read {:.1f} s, metric+Z {:.1f} s, G1 {:.1f} s, blocks+head {:.1f} s",
             scale, full_bub ? "Pib^-1 M dPi (full RPA bubble folded)" : "M^-1 B^-1 dPi (window bubble)", col, Nm, nw_h, nq, mcond_max,
             g_max, g_q1, g_q0, r_max, r_q1, ncut_max, Nm, tol, h0_sig, h0,

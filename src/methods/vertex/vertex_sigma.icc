@@ -399,7 +399,7 @@ namespace vertex_detail {
     if (Ww_override != nullptr) {
       utils::check(rung_mode == 2,
                    "eval_sigma_C: Ww_override is only meaningful for rung_mode = 2 "
-                   "(B-L linear); got {}.", rung_mode);
+                   "(linear rung); got {}.", rung_mode);
       auto ws = Ww_override->shape();
       utils::check(ws[0] == nq_w and ws[1] == nw_b and ws[2] == Np and ws[3] == Np,
                    "eval_sigma_C: Ww_override shape ({}, {}, {}, {}) != (nq_w, nw_b, Np, "

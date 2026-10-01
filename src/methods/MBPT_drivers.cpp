@@ -133,13 +133,13 @@ namespace mbpt_vertex_audit {
     // a vertex requested with an EMPTY subspace C would be a no-op (plain scGW / RPA screening): abort
     utils::check(not v.enabled() or v.active(),
                  "{}: vertex_type = \"{}\" is requested but the vertex subspace C is EMPTY (vertex_band_window = [{}, {})): "
-                 "the vertex would silently contribute nothing (audit D7). Set a non-empty vertex_band_window (or a "
+                 "the vertex would silently contribute nothing. Set a non-empty vertex_band_window (or a "
                  "vertex_wannier_file), or vertex_type = \"none\".", driver, v.vertex_type(), v.band_window().first(),
                  v.band_window().last());
     utils::check(not v.pol_vertex_enabled() or v.pol_vertex_active(),
                  "{}: pol_vertex = \"{}\" (pol_vertex_inject = \"{}\") is requested but the ladder window "
                  "pol_vertex_band_window = [{}, {}) is EMPTY (it inherits vertex_band_window when absent): the ladder would "
-                 "silently do nothing (audit D7). Set a non-empty pol_vertex_band_window (in Wannier mode: the projector's "
+                 "silently do nothing. Set a non-empty pol_vertex_band_window (in Wannier mode: the projector's "
                  "band window), or pol_vertex = \"none\" and pol_vertex_inject = \"none\".", driver, v.pol_vertex(),
                  v.pol_vertex_inject(), v.pol_band_window().first(), v.pol_band_window().last());
     // the Sigma-side vertex (pol_vertex_sigma) is built from the ladder machinery; without the pol vertex the knob
@@ -148,7 +148,7 @@ namespace mbpt_vertex_audit {
     io::tolower(sig_mode);
     utils::check(sig_mode == "none" or v.pol_vertex_enabled(),
                  "{}: pol_vertex_sigma = \"{}\" needs the ladder machinery (pol_vertex = \"ladder\" with a non-empty "
-                 "pol_vertex_band_window), but pol_vertex = \"none\": the Sigma vertex would never be built (audit A15).",
+                 "pol_vertex_band_window), but pol_vertex = \"none\": the Sigma vertex would never be built. Set pol_vertex = \"ladder\" or pol_vertex_sigma = \"none\".",
                  driver, sig_mode);
     // keys that only act on the Sigma^C / Pi^C vertex (vertex_type): set without it they would be ignored
     if (not v.enabled()) {
@@ -175,7 +175,7 @@ namespace mbpt_vertex_audit {
       auto vt = io::get_value_with_default<std::string>(pt, "vertex_type", "none");
       io::tolower(vt);
       utils::check(vt == "none", "{}: vertex_type = \"{}\" is not supported in the evgw/qpgw drivers (they carry only the "
-                   "pol-vertex ladder). Remove it from the input (audit A14).", driver, vt);
+                   "pol-vertex ladder). Remove it from the input.", driver, vt);
     }
     for (auto const *key : {"vertex_rung", "vertex_isdf", "vertex_scale", "vertex_ramp_iters",
                             "vertex_pidyn", "vertex_pidyn_tol", "vertex_bl_head_projection", "vertex_bl_static_head",
@@ -183,7 +183,7 @@ namespace mbpt_vertex_audit {
       utils::check(not io::check_child_exists(pt, key),
                    "{}: {} is not supported in the evgw/qpgw drivers (these drivers carry only the pol-vertex ladder, "
                    "vertex_type = \"none\"; the key belongs to the Sigma^C / Pi^C vertex of the [gw] driver). Remove it from "
-                   "the input (audit A14).", driver, key);
+                   "the input.", driver, key);
     // honoured exactly as in the [gw] sites:
     //  - vertex_div_treatment: the carrier's q -> 0 policy, which the readout instance takes
     auto vertex_div_treatment = io::get_value_with_default<std::string>(pt,"vertex_div_treatment","");
@@ -204,8 +204,8 @@ namespace mbpt_vertex_audit {
         auto embed_file = io::get_value_with_default<std::string>(pt,"wannier_file","");
         utils::check(embed_file == vertex_wannier_file,
                      "vertex_wannier_file = \"{}\" differs from the gw_edmft embedding "
-                     "wannier_file = \"{}\": one projector P per run is required (demand "
-                     "D2, notes/wannier_projector_theory.md section 1.5); use the SAME "
+                     "wannier_file = \"{}\": one projector P per run is required (the vertex "
+                     "and the embedding must share the same Wannier orbitals); use the SAME "
                      "wan.h5 for both.", vertex_wannier_file, embed_file);
       }
       auto vtx_trans_home = io::get_value_with_default<bool>(pt,"translate_home_cell",false);
@@ -897,8 +897,8 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
           auto embed_file = io::get_value_with_default<std::string>(pt,"wannier_file","");
           utils::check(embed_file == vertex_wannier_file,
                        "vertex_wannier_file = \"{}\" differs from the gw_edmft embedding "
-                       "wannier_file = \"{}\": one projector P per run is required (demand "
-                       "D2, notes/wannier_projector_theory.md section 1.5); use the SAME "
+                       "wannier_file = \"{}\": one projector P per run is required (the vertex "
+                       "and the embedding must share the same Wannier orbitals); use the SAME "
                        "wan.h5 for both.", vertex_wannier_file, embed_file);
         }
         auto vtx_trans_home = io::get_value_with_default<bool>(pt,"translate_home_cell",false);
@@ -922,8 +922,8 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt)
           auto embed_file = io::get_value_with_default<std::string>(pt,"wannier_file","");
           utils::check(embed_file == vertex_wannier_file,
                        "vertex_wannier_file = \"{}\" differs from the gw_edmft embedding "
-                       "wannier_file = \"{}\": one projector P per run is required (demand "
-                       "D2, notes/wannier_projector_theory.md section 1.5); use the SAME "
+                       "wannier_file = \"{}\": one projector P per run is required (the vertex "
+                       "and the embedding must share the same Wannier orbitals); use the SAME "
                        "wan.h5 for both.", vertex_wannier_file, embed_file);
         }
         auto vtx_trans_home = io::get_value_with_default<bool>(pt,"translate_home_cell",false);
@@ -1964,8 +1964,8 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
           auto embed_file = io::get_value_with_default<std::string>(pt,"wannier_file","");
           utils::check(embed_file == vertex_wannier_file,
                        "vertex_wannier_file = \"{}\" differs from the gw_edmft embedding "
-                       "wannier_file = \"{}\": one projector P per run is required (demand "
-                       "D2, notes/wannier_projector_theory.md section 1.5); use the SAME "
+                       "wannier_file = \"{}\": one projector P per run is required (the vertex "
+                       "and the embedding must share the same Wannier orbitals); use the SAME "
                        "wan.h5 for both.", vertex_wannier_file, embed_file);
         }
         auto vtx_trans_home = io::get_value_with_default<bool>(pt,"translate_home_cell",false);
@@ -1989,8 +1989,8 @@ void mbpt(std::string solver_type, eri_t &eri, ptree const& pt,
           auto embed_file = io::get_value_with_default<std::string>(pt,"wannier_file","");
           utils::check(embed_file == vertex_wannier_file,
                        "vertex_wannier_file = \"{}\" differs from the gw_edmft embedding "
-                       "wannier_file = \"{}\": one projector P per run is required (demand "
-                       "D2, notes/wannier_projector_theory.md section 1.5); use the SAME "
+                       "wannier_file = \"{}\": one projector P per run is required (the vertex "
+                       "and the embedding must share the same Wannier orbitals); use the SAME "
                        "wan.h5 for both.", vertex_wannier_file, embed_file);
         }
         auto vtx_trans_home = io::get_value_with_default<bool>(pt,"translate_home_cell",false);
