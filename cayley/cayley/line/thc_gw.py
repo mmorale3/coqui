@@ -1,0 +1,130 @@
+"""GW kernels on the tilted line in the THC/ISDF basis (numpy prototype of option D).
+
+All energies are measured from the line centre mu. Pole data for G: per k, energies e_m (mu-relative) and vectors v_m
+(nb,) with G(k, zeta) = sum_m v_m v_m^dagger /(zeta - e_m); sector by the sign of e_m.
+
+Time ray (particle sector): t = s e^{-i theta_t};  G~^>(k,t)_PQ = [X(k) (sum_{m>} v_m v_m^dag e^{-i e_m t}) X(k)^dag]_PQ.
+Polarization (sign/normalization validated against the Casida transition sum, V1):
+    Pi^>(q,t)_PQ = (2/Nk) sum_k G~^>(k,t)_PQ * conj(G~^<(k-q,t))_PQ,   G~^<(k,t) = X(k)(sum_{m<} v_m v_m^dag e^{-i e_m t})X(k)^dag
+    Pi^>(q,zeta) = -i int_0^inf dt e^{i zeta t} Pi^>(q,t);   Pi(zeta) = Pi^>(zeta) + conj(Pi^>(-conj(zeta)))  (elementwise)
+Screened interaction: W(q,zeta) = ([1 - Z Pi(zeta)]^-1 - 1) Z at the bosonic line nodes, refit with BosonicLineBasis
+    W_PQ(zeta) = sum_j [ w_j,PQ/(zeta - nu_j) - w_j,QP/(zeta + nu_j) ],   W^>(t) = sum_j w_j e^{-i nu_j t},  W^<(t) = -sum_j w_j^T e^{+i nu_j t}.
+Self-energy per sector (contracted to orbitals immediately):
+    Sigma~^>(k,t) = (1/Nk) sum_q G~^>(k-q,t) * W^>(q,t);   Sigma^>_ab(k,zeta) = -i int dt e^{i zeta t} [X(k)^dag Sigma~^>(k,t) X(k)]_ab
+    Sigma~^<(k,t) = (1/Nk) sum_q G~^<(k-q,t) * W^<(q,t)  on the hole ray t = s e^{+i theta_t}.
+Static part: F = V_H[Dm] + Sigma_x[Dm] with the THC Z (ignore_g0 heads are inside Z), spin-restricted (Dm per spin).
+"""
+import numpy as np
+from .timeray import TimeRay
+from .line_dlr import LineBasis, BosonicLineBasis
+
+
+class LineGW:
+    def __init__(self, X, Z, qk_to_k2, nk, mu, theta, theta_t, bos_basis, ferm_zeta, t_chunk=8, ray_decades=36.0, ray_kw=None):
+        """X: (nk, Np, nb) THC collocation; Z: (nq, Np, Np); qk_to_k2[iq, ik] = index of k - q; mu: absolute centre.
+        bos_basis: BosonicLineBasis (mu-relative); ferm_zeta: mu-relative fermionic line nodes for Sigma/G.
+        The time rays are built per call from the current pole spectrum (smallest |e_m| sets s_max)."""
+        self.X, self.Z, self.qk, self.nk, self.mu = X, Z, qk_to_k2, nk, mu
+        self.Np, self.nb = X.shape[1], X.shape[2]
+        self.theta, self.theta_t = theta, theta_t
+        self.bos, self.fz = bos_basis, np.asarray(ferm_zeta, complex)
+        self.t_chunk, self.ray_decades, self.ray_kw = t_chunk, ray_decades, (ray_kw or {})
+        # bosonic evaluation points: nodes and their mirrors (for the reflection formula)
+        zb = self.bos.zeta
+        self.zb_all = np.concatenate([zb, -np.conj(zb)])
+        self.poles = None
+
+    # ---------------------------------------------------------------- pole data
+    def set_poles(self, e, v):
+        """e: (nk, M) mu-relative energies; v: (nk, nb, M) vectors (columns), G(k) = sum_m v_m v_m^dag/(zeta - e_m)."""
+        self.poles = (np.asarray(e), np.asarray(v))
+        emin = min(np.abs(e[e > 0]).min(), np.abs(e[e < 0]).min())
+        self.ray_p = TimeRay.for_spectrum(self.theta_t, emin, decades=self.ray_decades, sector='>', **self.ray_kw)
+        self.ray_h = TimeRay.for_spectrum(self.theta_t, emin, decades=self.ray_decades, sector='<', **self.ray_kw)
+
+    @classmethod
+    def poles_from_hamiltonian(cls, H, mu):
+        """Diagonalize H (nk, nb, nb) -> (e - mu, v)."""
+        e, v = np.linalg.eigh(H)
+        return e - mu, v
+
+    def gtilde(self, ik, t, sector):
+        """G~(k, t) (nt, Np, Np) for the given sector on complex times t (nt,)."""
+        e, v = self.poles
+        m = e[ik] > 0 if sector == '>' else e[ik] < 0
+        Xv = self.X[ik] @ v[ik][:, m]                                   # (Np, M)
+        ph = np.exp(-1j * e[ik][m][None, :] * t[:, None])              # (nt, M)
+        return np.einsum('tm,pm,qm->tpq', ph, Xv, Xv.conj())
+
+    # ---------------------------------------------------------------- polarization and W
+    def polarization(self, iq, zeta=None):
+        """Pi(q, zeta) (nz, Np, Np) at mu-relative points zeta (default: bosonic nodes), via Pi^> on zeta and mirrors."""
+        zeta = self.zb_all if zeta is None else np.asarray(zeta, complex)
+        zall = np.concatenate([zeta, -np.conj(zeta)])
+        ray = self.ray_p
+        F = ray.transform_matrix(zall)                                  # (2nz, nt)
+        Pp = np.zeros((len(zall), self.Np, self.Np), complex)
+        for i0 in range(0, len(ray), self.t_chunk):
+            t = ray.t[i0:i0 + self.t_chunk]
+            acc = np.zeros((len(t), self.Np, self.Np), complex)
+            for ik in range(self.nk):
+                acc += self.gtilde(ik, t, '>') * np.conj(self.gtilde(self.qk[iq, ik], t, '<'))
+            acc *= 2.0 / self.nk
+            Pp += np.einsum('zt,tpq->zpq', F[:, i0:i0 + self.t_chunk], acc)
+        nz = len(zeta)
+        return Pp[:nz] + np.conj(Pp[nz:])                               # Pi^>(zeta) + conj(Pi^>(-conj zeta))
+
+    def dyson_w(self, iq, Pi):
+        """W(q, zeta_i) = ([1 - Z Pi]^-1 - 1) Z for each node; (nz, Np, Np)."""
+        Z = self.Z[iq]; I = np.eye(self.Np)
+        return np.array([np.linalg.solve(I - Z @ P, Z) - Z for P in Pi])
+
+    def screened_interaction(self, iq, Pi=None):
+        """Residues w_j(q) (r, Np, Np) of the symmetric real-pole fit of W(q) on the bosonic nodes; also returns W at the nodes."""
+        if Pi is None: Pi = self.polarization(iq, self.bos.zeta)
+        W = self.dyson_w(iq, Pi)
+        return self.bos.fit(self.bos.zeta, W), W
+
+    # ---------------------------------------------------------------- self-energy
+    def sigma(self, ik, wres, zeta=None):
+        """Sigma_c(k, zeta)_ab (nz, nb, nb), zeta mu-relative (default fermionic nodes); wres: list over q of residues (r, Np, Np)."""
+        zeta = self.fz if zeta is None else np.asarray(zeta, complex)
+        out = np.zeros((len(zeta), self.nb, self.nb), complex)
+        Xk = self.X[ik]
+        for sector, ray in (('>', self.ray_p), ('<', self.ray_h)):
+            F = ray.transform_matrix(zeta)
+            for i0 in range(0, len(ray), self.t_chunk):
+                t = ray.t[i0:i0 + self.t_chunk]
+                acc = np.zeros((len(t), self.Np, self.Np), complex)
+                Ew = self.bos.time_exponentials(t, sector)              # (nt, r)
+                for iq in range(self.nk):
+                    w = wres[iq] if sector == '>' else np.transpose(wres[iq], (0, 2, 1))
+                    Wt = np.einsum('tj,jpq->tpq', Ew, w)
+                    acc += self.gtilde(self.qk[iq, ik], t, sector) * Wt
+                acc /= self.nk
+                S_ab = np.einsum('pa,tpq,qb->tab', Xk.conj(), acc, Xk)
+                out += np.einsum('zt,tab->zab', F[:, i0:i0 + self.t_chunk], S_ab)
+        return out
+
+    # ---------------------------------------------------------------- static part
+    def density_matrix(self):
+        """Dm(k) = sum_{m<} v_m v_m^dag (per spin, T=0)."""
+        e, v = self.poles
+        return np.array([v[ik][:, e[ik] < 0] @ v[ik][:, e[ik] < 0].conj().T for ik in range(self.nk)])
+
+    def hartree_exchange(self, Dm, iq0=0):
+        """F = V_H + Sigma_x (nk, nb, nb) in the THC basis; Dm per spin (closed shell: total density = 2 Dm).
+        V_H,ab(k) = (2/Nk) sum_k' X_P(k,a)^* X_P(k,b) Z_PQ(0) [X(k') Dm(k') X(k')^dag]_QQ ;
+        Sigma_x,ab(k) = -(1/Nk) sum_q X_P(k,a)^* [X(k-q) Dm(k-q) X(k-q)^dag]_PQ Z_PQ(q) X_Q(k,b)."""
+        Dt = np.array([self.X[k] @ Dm[k] @ self.X[k].conj().T for k in range(self.nk)])        # (nk, Np, Np)
+        rho = np.einsum('kqq->q', Dt) * (2.0 / self.nk)                                           # aux density (total)
+        vh = self.Z[iq0] @ rho                                                                   # (Np,)
+        F = np.zeros((self.nk, self.nb, self.nb), complex)
+        for ik in range(self.nk):
+            Xk = self.X[ik]
+            F[ik] += np.einsum('pa,p,pb->ab', Xk.conj(), vh, Xk)
+            Sx = np.zeros((self.Np, self.Np), complex)
+            for iq in range(self.nk):
+                Sx += Dt[self.qk[iq, ik]] * self.Z[iq]
+            F[ik] -= np.einsum('pa,pq,qb->ab', Xk.conj(), Sx, Xk) / self.nk
+        return F
