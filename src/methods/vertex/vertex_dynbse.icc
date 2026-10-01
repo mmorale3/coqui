@@ -38,6 +38,7 @@
 #include <tuple>
 #include <set>
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -907,6 +908,15 @@ namespace solvers {
       // the HYBRID: the per-tau dense rung (fast application) BUILT from R factorized matrices, K_d(tau_rep) = sum_r c_r(tau_rep) K_r
       // (R build_kbig calls + ndist R axpys instead of ndist build_kbig calls; vertex_debug dyn_rung_build_rank = R)
       const long brank = (opt.dense_rung and rrank == 0) ? long(vertex_debug::number("dyn_rung_build_rank", 0.0)) : 0l;
+      {   // audit A9: a requested rung rank that this path cannot honour aborts (it used to be zeroed silently)
+        const long rr_req = long(vertex_debug::number("dyn_rung_rank", 0.0)), br_req = long(vertex_debug::number("dyn_rung_build_rank", 0.0));
+        utils::check(opt.dense_rung or (rr_req == 0 and br_req == 0),
+                     "pair_space_ladder_dyn: vertex_debug dyn_rung_rank / dyn_rung_build_rank ({} / {}) need the dense rung "
+                     "(pol_vertex_dyn_dense = true); the streaming rung ignores them. ABORTING.", rr_req, br_req);
+        utils::check(not (rr_req > 0 and br_req > 0),
+                     "pair_space_ladder_dyn: dyn_rung_rank = {} and dyn_rung_build_rank = {} are exclusive (the factorized rung or "
+                     "the hybrid build). ABORTING.", rr_req, br_req);
+      }
       const long frank = std::max(rrank, brank);          // the rank of the universal time functions computed below
       nda::array<cplx, 2> c_tr;                   // (nt, R)
       nda::array<cplx, 4> A_rq;                   // (R, nq, Nm, Nm)
@@ -982,6 +992,48 @@ namespace solvers {
       // ---- P20: the Sigma-accumulator checkpoint -----------------------------------------------
       std::set<std::tuple<long, long, long>> sig_done;         // units whose deposits are already in the accumulators (all ranks)
       std::vector<std::array<long, 3>> sig_mine;                 // the units whose deposits sit in THIS rank's accumulators
+      // ---- audit A1 / A4: the INPUT FINGERPRINT of this call (G, the legs, W0, a sample of W-bar_d, the solver options, the nu
+      // list, the dressed / rung settings, the Sigma hook's columns). It names the Sigma checkpoint and the unit dumps, so files
+      // written for another scGW iteration, another configuration or other inputs can never be loaded (they used to be:
+      // the checkpoint of iteration 1 was reloaded as "done" by every later iteration). A restart of the SAME state finds them.
+      std::string fp_hex;
+      {
+        std::uint64_t hsh = 1469598103934665603ull;
+        auto mix = [&](void const *p, size_t nb) {
+          auto const *c = static_cast<unsigned char const *>(p);
+          for (size_t i = 0; i < nb; ++i) { hsh ^= c[i]; hsh *= 1099511628211ull; }
+        };
+        auto mixd = [&](double v) { mix(&v, sizeof(v)); };
+        auto mixl = [&](long v) { mix(&v, sizeof(v)); };
+        auto mixs = [&](std::string const &v) { mix(v.data(), v.size()); mixl(long(v.size())); };
+        auto mixc = [&](cplx v) { mixd(v.real()); mixd(v.imag()); };
+        for (long i0 = 0; i0 < G_CC.shape(0); ++i0)
+          for (long i1 = 0; i1 < G_CC.shape(1); ++i1)
+            for (long i2 = 0; i2 < G_CC.shape(2); ++i2)
+              for (long i3 = 0; i3 < G_CC.shape(3); ++i3)
+                for (long i4 = 0; i4 < G_CC.shape(4); ++i4) mixc(G_CC(i0, i1, i2, i3, i4));
+        mix(Xb.data(), size_t(Xb.size()) * sizeof(cplx));
+        mix(W0b.data(), size_t(W0b.size()) * sizeof(cplx));
+        for (long iq = 0; iq < Wbh.shape(0); ++iq)            // W-bar_d: a strided sample (every q, nu; diagonal + one off-diagonal)
+          for (long w = 0; w < Wbh.shape(1); ++w)
+            for (long i = 0; i < Wbh.shape(2); ++i) { mixc(Wbh(iq, w, i, i)); mixc(Wbh(iq, w, i, (7 * i + 3) % Wbh.shape(3))); }
+        for (long m : nu_list) mixl(m);
+        mixd(opt.tol); mixl(opt.maxit); mixl(opt.gmres_m); mixl(opt.one_rung_only); mixl(opt.gamma1_only); mixd(opt.sign_ks);
+        mixl(opt.static_only); mixl(opt.union_nodes); mixd(opt.readout_tol); mixd(opt.vmask_lo); mixd(opt.vmask_hi);
+        mixl(opt.wannier_pairs); mixd(opt.tfold); mixl(opt.table_mode); mixl(opt.union_stride); mixl(opt.dense_rung);
+        mixd(opt.gap_mask); mixs(opt.resolvent); mixl(rrank); mixl(brank);
+        mixs(vertex_debug::number("dyn_dressed", -1.0) >= 0.0 ? std::string(vertex_debug::number("dyn_dressed", -1.0) != 0.0 ? "on" : "off")
+                                                              : dyn_dressed_state());
+        mixs(vertex_debug::list());                           // every vertex_debug switch (over-strict on performance switches: safe)
+        if (opt.q_subset != nullptr) for (long q : *opt.q_subset) mixl(q);
+        if (opt.sigma != nullptr) {
+          mixs(opt.sigma->col); mixs(opt.sigma->outer); mixl(opt.sigma->sampled); mixl(opt.sigma->single_acc);
+          mixl(opt.sigma->use_U); mixl(opt.sigma->use_T); mixl(opt.sigma->poles);
+        }
+        char buf[24];
+        std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(hsh));
+        fp_hex = buf;
+      }
       std::vector<std::string> sig_consumed;                     // checkpoint files beyond this run's rank count, merged into this rank's
       double t_ckpt_last = db::wall_now();
       const bool sig_ckpt = (opt.sigma != nullptr and not opt.sigma_ckpt.empty());
@@ -989,7 +1041,7 @@ namespace solvers {
         namespace fs = std::filesystem;
         long nfiles = 0, nloaded = 0;
         for (long r = rank;; r += nproc) {
-          const std::string fn = opt.sigma_ckpt + ".r" + std::to_string(r) + ".h5";
+          const std::string fn = opt.sigma_ckpt + ".fp" + fp_hex + ".r" + std::to_string(r) + ".h5";
           if (not fs::exists(fn)) break;
           h5::file f(fn, 'r');
           h5::group g(f);
@@ -1035,7 +1087,7 @@ namespace solvers {
         if (sd_flush_hook) sd_flush_hook();                      // (also at the final call below, checkpoints or not)
         if (not sig_ckpt) return;
         opt.sigma->flush_unit();
-        const std::string fn = opt.sigma_ckpt + ".r" + std::to_string(rank) + ".h5";
+        const std::string fn = opt.sigma_ckpt + ".fp" + fp_hex + ".r" + std::to_string(rank) + ".h5";
         nda::array<long, 2> done(long(sig_mine.size()), 3);
         for (long i = 0; i < done.shape(0); ++i) for (int c = 0; c < 3; ++c) done(i, c) = sig_mine[size_t(i)][size_t(c)];
         {
@@ -1224,7 +1276,7 @@ namespace solvers {
       std::ofstream dump_out;
       if (not opt.dump_prefix.empty()) {
         namespace fs = std::filesystem;
-        const fs::path pfx(opt.dump_prefix);
+        const fs::path pfx(opt.dump_prefix + ".fp" + fp_hex);   // audit A4: the input fingerprint names the dumps
         const std::string stem = pfx.filename().string() + ".r";
         const fs::path dir = pfx.parent_path().empty() ? fs::path(".") : pfx.parent_path();
         long nrec = 0;
@@ -1235,17 +1287,26 @@ namespace solvers {
             std::ifstream in(e.path(), std::ios::binary);
             while (in) {
               long hdr[5];
-              if (not in.read(reinterpret_cast<char *>(hdr), sizeof(hdr))) break;
-              if (hdr[3] != nout or hdr[4] != 4) break;
+              if (not in.read(reinterpret_cast<char *>(hdr), sizeof(hdr))) break;   // clean end of file
+              // audit A4: a malformed record aborts (it used to stop reading the file silently); a record cut short by a killed
+              // writer at the END of the file is the one tolerated case (its unit is re-solved), and it is logged
+              utils::check(hdr[3] == nout and hdr[4] == 4, "pair_space_ladder_dyn: malformed unit-dump record in {} (header {} {} {} {} {}, "
+                           "expected nout {} and 4 columns). ABORTING: delete the dump files to recompute.", e.path().string(), hdr[0],
+                           hdr[1], hdr[2], hdr[3], hdr[4], nout);
               std::vector<cplx> blk(static_cast<size_t>(4 * nout * nout));
-              if (not in.read(reinterpret_cast<char *>(blk.data()), std::streamsize(blk.size() * sizeof(cplx)))) break;
+              if (not in.read(reinterpret_cast<char *>(blk.data()), std::streamsize(blk.size() * sizeof(cplx)))) {
+                app_log(1, "  [dynbse] WARNING: unit-dump {} ends with a truncated record (unit s {} q {} nu node {}): it is re-solved",
+                        e.path().string(), hdr[0], hdr[1], hdr[2]);
+                break;
+              }
               dumped[std::make_tuple(hdr[0], hdr[1], hdr[2])] = std::move(blk);
               ++nrec;
             }
           }
         if (rank == 0)
-          app_log(1, "  [dynbse] unit dump \"{}.r*.bin\": {} finished units found (loaded, not re-solved)", opt.dump_prefix, nrec);
-        dump_out.open(opt.dump_prefix + ".r" + std::to_string(rank) + ".bin", std::ios::binary | std::ios::app);
+          app_log(1, "  [dynbse] unit dump \"{}.r*.bin\": {} finished units found for this input fingerprint (loaded, not re-solved)",
+                  pfx.string(), nrec);
+        dump_out.open(pfx.string() + ".r" + std::to_string(rank) + ".bin", std::ios::binary | std::ios::app);
       }
       long pos = rank;                                    // the static hand-out's chunk index
       long units_taken = 0;
@@ -1282,6 +1343,11 @@ namespace solvers {
                                                              opt.sigma->col == "static_dyn");
       const bool dressed_fits = (opt.gamma1_only or opt.one_rung_only) and not opt.static_only and dressed_sig_ok;
       const bool dressed_req = (dressed_mode != "off") and dressed_fits;
+      // audit A3: pol_vertex_dyn_gamma1_only on the Neumann path (gmres = 0) would run the full resummation while the caller
+      // logs it as skipped -- abort (the dressed / one-rung / static paths do not reach the Neumann solver)
+      utils::check(not (opt.gamma1_only and opt.gmres_m <= 0 and not opt.static_only and not opt.one_rung_only and not dressed_req),
+                   "pair_space_ladder_dyn: pol_vertex_dyn_gamma1_only = true with the Neumann solver (pol_vertex_dyn_gmres = 0) is not "
+                   "implemented (the Neumann path runs the full resummation). ABORTING: use pol_vertex_dyn_gmres > 0.");
       const std::string dressed_why = (opt.sigma != nullptr and not dressed_sig_ok) ? "Sigma column " + opt.sigma->col
                                                                                    : std::string("the full GMRES resummation");
       utils::check(not (dressed_mode == "on" and not opt.static_only and not dressed_fits),
@@ -1477,7 +1543,13 @@ namespace solvers {
             const long nrep_dev = (rrank > 0) ? rrank : ndist;     // factorize-vertex: K_r = K[A_r] in the rung slots
             nda::array<cplx, 4> Wreps(nrep_dev, nq, Nm, Nm);
             for (long r = 0; r < nrep_dev; ++r)
-              Wreps(r, all, all, all) = (rrank > 0) ? nda::array<cplx, 3>(A_rq(r, all, all, all)) : nda::array<cplx, 3>(Wd_s(all, reps[size_t(r)], all, all));
+              if (rrank > 0) Wreps(r, all, all, all) = A_rq(r, all, all, all);
+              else if (brank > 0) {
+                // audit A8: the hybrid build on the device -- K is linear in W, so building from W_hyb(rep) = sum_r c_r(rep) A_r is
+                // the host hybrid K_d(rep) = sum_r c_r(rep) K[A_r] to rounding (it used to build the exact per-rep rung here)
+                Wreps(r, all, all, all) = cplx(0.0);
+                for (long rf = 0; rf < brank; ++rf) Wreps(r, all, all, all) += c_tr(reps[size_t(r)], rf) * A_rq(rf, all, all, all);
+              } else Wreps(r, all, all, all) = Wd_s(all, reps[size_t(r)], all, all);
             nda::array<cplx, 3> W0c(W0b), Wd0c(Wd0);
             nda::array<long, 2> qxc(qx_of);
             nda::array<cplx, 4> Xc(Xb);
@@ -1606,6 +1678,13 @@ namespace solvers {
             gkq(all, k, all, all) = gC(is, all, kpq(iq, k), all, all);
           }
           Pcache.emplace(db::make_pair_poles(tools.beta, epsG, gk, gkq, gnode0, (gmap.size() > 0) ? &gmap : nullptr));
+          // audit A10: an ACCIDENTAL degeneracy eps(a) == epsG(j) with a != gnode(j) (duplicate / coinciding nodes) aborts: the fused
+          // device L0 would zero those terms silently, the other kernels would divide by zero
+          for (long a = 0; a < b.np; ++a)
+            for (long j = 0; j < Pcache->ng; ++j)
+              utils::check(not (b.eps(a) == Pcache->epsG(j) and a != Pcache->gnode(j)),
+                           "pair_space_ladder_dyn: vertex node {} (eps {:.17g}) coincides with G pole {} which is attached to node {} -- a "
+                           "degenerate node set (duplicate nodes). ABORTING.", a, b.eps(a), j, Pcache->gnode(j));
         }
         last_sq = sq;
 #if defined(ENABLE_CUDA)
@@ -3015,6 +3094,9 @@ namespace solvers {
       return 0;
     }
     utils::check(not _dyn_dump, "vertex_t::arm_shared_sigma_hook: pol_vertex_sigma_share and the unit dump/restart are exclusive.");
+    // audit A2: the shared hook keeps this run's P-side deposits while a Sigma checkpoint would add an earlier run's on top
+    utils::check(not (opt.dyn_ckpt_minutes > 0.0), "vertex_t::arm_shared_sigma_hook: pol_vertex_sigma_share and the Sigma checkpoint "
+                 "(pol_vertex_sigma_dyn_ckpt_minutes > 0) are exclusive (the P-side deposits would be counted twice on a restart). ABORTING.");
     auto MF = thc.MF();
     if (not has_cached_w()) cache_w(mb_state, thc);
     nda::array<ComplexType, 5> G_CC;
@@ -3137,12 +3219,14 @@ namespace solvers {
           // the way a fixed one can. The Si 4^3 sampled vertex fails with the trace proxy while its own Gram reports a
           // kept weight of 0.999997 -- the proxy is not a faithful guide for the full T family there.
           const std::string gram_src = vertex_debug::text("sigdyn_gram", "trace");
-          bool use_sketch = (gram_src == "sketch");
-          if (use_sketch and not g.has_dataset("HS")) {
-            app_log(1, "  [LFF-Sigma dyn] P15: vertex_debug sigdyn_gram = sketch, but {} carries no HS dataset "
-                       "(it predates P15) -- falling back to the trace proxy.", opt.dyn_fit_file);
-            use_sketch = false;
-          }
+          utils::check(gram_src == "trace" or gram_src == "sketch", "LFF-Sigma dyn: vertex_debug sigdyn_gram = \"{}\" is not trace | sketch.", gram_src);
+          const bool use_sketch = (gram_src == "sketch");
+          // audit A7: the sketch request on a dump without HS aborts (it used to fall back to the trace proxy, which is documented
+          // to fail on Si 4^3)
+          utils::check(not use_sketch or g.has_dataset("HS"),
+                       "LFF-Sigma dyn: vertex_debug sigdyn_gram = sketch, but {} carries no HS dataset (it predates P15). ABORTING "
+                       "instead of falling back to the trace proxy: regenerate the dump or set sigdyn_gram = trace explicitly.",
+                       opt.dyn_fit_file);
           nda::array<ComplexType, 5> HSk;
           if (use_sketch) nda::h5_read(g, "HS", HSk);                      // (nw_b, ns, np, nk, nsk)
           else            nda::h5_read(g, "HT", H);                        // (nw_b, ns, np, nk, nc, nc)

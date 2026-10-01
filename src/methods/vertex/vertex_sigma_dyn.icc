@@ -196,13 +196,21 @@ namespace solvers {
           RT = nda::array<ComplexType, 6>(nt, ns, nk, np, nc, nc); RT() = ComplexType(0.0);
           RU = nda::array<ComplexType, 6>(nt, ns, nk, np, nc, nc); RU() = ComplexType(0.0);
         }
-        poles = (vertex_debug::text("sigdyn_route", "product") == "poles");   // vertex_debug: sigdyn_route = poles | product
+        {   // audit A5/A6: unknown values abort (they used to fall through silently)
+          const std::string route = vertex_debug::text("sigdyn_route", "product");   // vertex_debug: sigdyn_route = poles | product
+          utils::check(route == "poles" or route == "product", "sigma_dyn_hook: vertex_debug sigdyn_route = \"{}\" is not poles | product.", route);
+          poles = (route == "poles");
+        }
         utils::check(not (poles and single_acc), "sigma_dyn_hook: the pole route needs the split accumulators (pol_vertex_sigma_dyn_acc = split).");
         vt_ok = false; wkT.clear(); wkU.clear();
         wk.clear();
-        if (auto fam = vertex_debug::get("sigdyn_families"); fam.has_value()) {   // vertex_debug: sigdyn_families = U | T | UT
+        if (auto fam = vertex_debug::get("sigdyn_families"); fam.has_value()) {   // vertex_debug: sigdyn_families = UT | U | T (all | cstU | cstT)
           const std::string fs(*fam);
-          use_U = (fs == "all" or fs == "cstU"); use_T = (fs == "all" or fs == "cstT");
+          const bool fa = (fs == "all" or fs == "UT"), fu = (fs == "cstU" or fs == "U"), ft = (fs == "cstT" or fs == "T");
+          utils::check(fa or fu or ft, "sigma_dyn_hook: vertex_debug sigdyn_families = \"{}\" is not UT | U | T (all | cstU | cstT).", fs);
+          use_U = fa or fu; use_T = fa or ft;
+          app_log(1, "  [LFF-Sigma dyn] WARNING: vertex_debug sigdyn_families = {} -- the Sigma deposits keep the constant part{}{} only "
+                     "(a test truncation, not the physical Sigma)", fs, use_U ? " + U" : "", use_T ? " + T" : "");
         }
         basis = b;
         if (dump) {
@@ -512,6 +520,9 @@ namespace solvers {
       const long ng = P.ng, npf = b.np_fit;
       utils::check(h.np == np, "sigma_dyn_accumulate: basis size changed ({} vs {}).", np, h.np);
       utils::check(not h.poles or not h.ibz, "sigma_dyn_accumulate: the pole route has no IBZ fold.");
+      utils::check(not h.poles or (not h.sampled and h.nodes_active.empty()),
+                   "sigma_dyn_accumulate: the pole route (vertex_debug sigdyn_route = poles) supports neither the sampled Sigma weights nor "
+                   "the shared P3 node set; ABORTING (it would ignore them).");   // audit A6
       if (h.poles) { sigma_dyn_accumulate_poles(h, b, P, inu, res, Ks, Dc, N0, N1, Wout, G_CC, kpq, is, iq, m, tools); return; }
       if (not h.nodes_active.empty() and h.nodes_active.count(m) == 0) return;   // P3: a node outside the Sigma node set (the P-side call)
       h.begin_block(is, iq, m);
