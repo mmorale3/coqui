@@ -48,7 +48,7 @@ class LineSCGW:
                     wq = wres[iq] if sector == '>' else np.transpose(wres[iq], (0, 2, 1))
                     acc += gw.gtilde(self.qk[iq, ik], t, sector) * np.einsum('tj,jpq->tpq', Ew, wq)
                 acc /= nk
-                S += np.einsum('zt,tab->zab', F[:, i0:i0 + gw.t_chunk], np.einsum('pa,tpq,qb->tab', Xk.conj(), acc, Xk))
+                S += np.einsum('zt,tab->zab', F[:, i0:i0 + gw.t_chunk], (Xk.conj().T @ acc) @ Xk)
             out.append(S)
         return out
 

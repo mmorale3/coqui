@@ -45,7 +45,7 @@ def sigma_sector(ik, sector):
             wq = wres[iq] if sector == '>' else np.transpose(wres[iq], (0, 2, 1))
             acc += gw.gtilde(ck.qk_to_k2[iq, ik], t, sector) * np.einsum('tj,jpq->tpq', Ew, wq)
         acc /= nk
-        out += np.einsum('zt,tab->zab', F[:, i0:i0 + gw.t_chunk], np.einsum('pa,tpq,qb->tab', Xk.conj(), acc, Xk))
+        out += np.einsum('zt,tab->zab', F[:, i0:i0 + gw.t_chunk], (Xk.conj().T @ acc) @ Xk)
     return out
 Sp = sigma_sector(ik, '>'); Sh = sigma_sector(ik, '<'); Sl = Sp + Sh
 Sx = cas.sigma_z(ik, mu0 + fz)

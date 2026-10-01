@@ -45,7 +45,9 @@ def chemical_potential(e, v, nk, nelec, k_weight=None):
 def compress_sectors(basis_p, basis_h, zeta, e, v):
     """Compressed matrix-coefficient real-pole representation of the Lehmann G per sector by LS fit on the line nodes.
     Returns (w_all, coef_all) with sector by sign of w (hole poles first)."""
-    Gp = np.einsum('zm,im,jm->zij', 1.0 / (zeta[:, None] - e[e > 0][None, :]), v[:, e > 0], v[:, e > 0].conj())
-    Gh = np.einsum('zm,im,jm->zij', 1.0 / (zeta[:, None] - e[e < 0][None, :]), v[:, e < 0], v[:, e < 0].conj())
+    def lehmann(mask):
+        K = 1.0 / (zeta[:, None] - e[mask][None, :]); vm = v[:, mask]
+        return (vm[None, :, :] * K[:, None, :]) @ vm.conj().T                  # (nz, nb, nb)
+    Gp = lehmann(e > 0); Gh = lehmann(e < 0)
     cp = basis_p.fit(zeta, Gp); ch = basis_h.fit(zeta, Gh)
     return np.concatenate([basis_h.w, basis_p.w]), np.concatenate([ch, cp], axis=0)

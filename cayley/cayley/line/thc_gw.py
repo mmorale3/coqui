@@ -61,7 +61,7 @@ class LineGW:
         ph = np.exp(-1j * e[ik][m][None, :] * t[:, None])              # (nt, M)
         Gt = np.einsum('tm,mij->tij', ph, coef[ik][m])                  # (nt, nb, nb)
         Xk = self.X[ik]
-        return np.einsum('pi,tij,qj->tpq', Xk, Gt, Xk.conj())
+        return (Xk @ Gt) @ Xk.conj().T                                  # (nt, Np, Np): two GEMMs per t
 
     def g_line(self, ik, zeta, sector=None):
         """G(k, zeta) (nz, nb, nb) from the pole data (any complex zeta off the real axis)."""
@@ -116,7 +116,7 @@ class LineGW:
                     Wt = np.einsum('tj,jpq->tpq', Ew, w)
                     acc += self.gtilde(self.qk[iq, ik], t, sector) * Wt
                 acc /= self.nk
-                S_ab = np.einsum('pa,tpq,qb->tab', Xk.conj(), acc, Xk)
+                S_ab = (Xk.conj().T @ acc) @ Xk                           # (nt, nb, nb)
                 out += np.einsum('zt,tab->zab', F[:, i0:i0 + self.t_chunk], S_ab)
         return out
 
@@ -136,9 +136,9 @@ class LineGW:
         F = np.zeros((self.nk, self.nb, self.nb), complex)
         for ik in range(self.nk):
             Xk = self.X[ik]
-            F[ik] += np.einsum('pa,p,pb->ab', Xk.conj(), vh, Xk)
+            F[ik] += (Xk.conj() * vh[:, None]).T @ Xk
             Sx = np.zeros((self.Np, self.Np), complex)
             for iq in range(self.nk):
                 Sx += Dt[self.qk[iq, ik]] * self.Z[iq]
-            F[ik] -= np.einsum('pa,pq,qb->ab', Xk.conj(), Sx, Xk) / self.nk
+            F[ik] -= (Xk.conj().T @ Sx @ Xk) / self.nk
         return F
