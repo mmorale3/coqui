@@ -124,6 +124,16 @@ namespace solvers {
         utils::check(kmq.shape(0) == nq and kpq.shape(0) == nq and kmq.shape(1) == nk,
                      "vertex_sigma_pair: nosym mesh expected (nq = {}, kmq {} x {}).", nq, kmq.shape(0), kmq.shape(1));
       utils::check(nt == tools.nt_f, "vertex_sigma_pair: G tau axis {} != nt_f {}.", nt, tools.nt_f);
+      // audit E: the full-mesh symmetric path writes Pi_check for the external transfers iq < nq (= nq_ibz) and dSigma for
+      // the external k < nk_ext (= nk_ibz) as if those leading points of the FULL lists were the IBZ representatives
+      // themselves (identity-mapped). Assert it instead of assuming it (the k side is asserted by the caller, which owns
+      // the k maps: vertex_t::eval_sigma_pair).
+      if (sym)
+        for (long q = 0; q < nq; ++q)
+          utils::check(symc->q_star(q) == q and not symc->q_trev(q) and symc->q_isym(q) == 0,
+                       "vertex_sigma_pair: the full transfer list does not start with the IBZ transfers (q = {}: star {}, "
+                       "trev {}, isym {}); the IBZ-first layout this kernel indexes by is violated.", q, symc->q_star(q),
+                       int(symc->q_trev(q)), symc->q_isym(q));
       if (dyn_outer) {
         utils::check(Wbh != nullptr and Wbh->shape(0) == nq and Wbh->shape(1) == nw_half and Wbh->shape(2) == Nm and
                      Wbh->shape(3) == Nm, "vertex_sigma_pair: the W-bar cache is absent or mis-shaped (outer = dynamic).");
@@ -197,7 +207,9 @@ namespace solvers {
       for (long u = rank; u < nunits; u += nproc) {
         const long is = u / nq_units, iq = u % nq_units;
         const long qsx = (sym and not ibz) ? symc->q_star(iq) : iq;            // the stored (IBZ) transfer of this unit's external q
-        const bool trx = (sym and not ibz) ? bool(symc->q_trev(iq)) : false;   // read W-bar(q) PQ-transposed for a time-reversal transfer
+        // read W-bar(q) PQ-transposed for a time-reversal transfer; audit A13: honours vertex_debug sym_trev_notrans like
+        // the rung read of this same unit (build_kbig) and every Pi-side read -- unset, this is the historic expression
+        const bool trx = (sym and not ibz) ? (bool(symc->q_trev(iq)) and vertex_sym::trev_read_transposed()) : false;
         // ---- the external legs (pair densities) of this transfer ------------------------------------
         // symmetric mesh: W-bar(q) is stored at q_star in the aux frame of the mapping symmetry q_isym(q), so the legs
         // that couple the pair to it are the EFFECTIVE columns Xhat(is, jsym, k) (rotation into that frame + the trev
@@ -447,6 +459,17 @@ namespace solvers {
     ladder_inputs(mb_state, thc, G_CC, kmq, kpq, symc);   // full-BZ G_CC / kmq / kpq (MLWF frame in Wannier mode) + symc on a sym mesh
     const bool sym = (symc != nullptr and symc->active);
     utils::check(sym or MF->nkpts() == MF->nkpts_ibz(), "vertex_t::eval_sigma_pair: a symmetry-reduced mesh without a symmetry context.");
+    if (sym) {
+      // audit E: dSigma's external k axis is the first nk_ibz points of the FULL list (eval_pair_sigma's `k >= nk_ext`
+      // skip and the dSig(., ., k) writes) -- valid only if those points ARE the IBZ representatives, identity-mapped
+      auto k2i = MF->kp_to_ibz();
+      auto ktr = MF->kp_trev();
+      for (long k = 0; k < MF->nkpts_ibz(); ++k)
+        utils::check(long(k2i(k)) == k and not bool(ktr(k)),
+                     "vertex_t::eval_sigma_pair: the full k list does not start with the IBZ points (k = {}: kp_to_ibz {}, "
+                     "trev {}); the IBZ-first layout the Sigma pair vertex indexes its externals by is violated.", k,
+                     long(k2i(k)), int(bool(ktr(k))));
+    }
     utils::check(not sym or opt.Pi_check == nullptr or opt.Pi_check->shape(1) == MF->nqpts_ibz(),
                  "vertex_t::eval_sigma_pair: Pi_check must carry nq_ibz rows on a symmetric mesh.");
     vertex_pi::iaft_tools tools(*_ft);                 // the LOOP's grid: Sigma(tau) lives there

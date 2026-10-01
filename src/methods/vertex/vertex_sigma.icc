@@ -285,9 +285,13 @@ namespace vertex_detail {
                  "eval_sigma_C: invalid iq_gamma = {} (nq = {}).", iq_gamma, nq);
 
     // rung-transfer access: IBZ storage row + trev(=PQ-transpose) flag + qsymms pos.
+    // audit A13: the trev flag honours vertex_debug sym_trev_notrans exactly as the Pi-side read sites do
+    // (vertex_pi.icc q_access, pair_space_ladder) -- with the switch unset trev_read_transposed() is true and this
+    // is the historic expression; with it set, Pi and Sigma now read the SAME (plain) core instead of different ones.
     auto q_access = [&](long iqx) {
       if (not sym) return std::make_tuple(iqx, false, 0l);
-      return std::make_tuple(symc->q_star(iqx), bool(symc->q_trev(iqx)), symc->q_isym(iqx));
+      return std::make_tuple(symc->q_star(iqx), bool(symc->q_trev(iqx)) and vertex_sym::trev_read_transposed(),
+                             symc->q_isym(iqx));
     };
 
     // ---- RUNG PAIR SYMMETRY: W_{PQ}(q) == W_{QP}(-q) ----------------------
@@ -304,11 +308,25 @@ namespace vertex_detail {
     // non-conserving self-energy. It is worth one O(nq Np^2) pass to say so out loud.
     // (Only measurable on the full transfer mesh; under IBZ symmetry the stored rows are
     // the irreducible ones and the -q partner is reconstructed inside the loop.)
+    //
+    // audit D6 (2026-10-01): a violation now ABORTS -- a non-conserving Sigma^C is an answer-changing defect, not a
+    // cosmetic one. vertex_debug sigma_allow_nonconserving = 1 is the explicit override (the run then continues with
+    // the WARNING, e.g. the illegal-rung positive control of test_vertex_fdoracle "vertex_slotprobe"). Read per call
+    // (not cached) so a test can scope it. On IBZ meshes the check cannot run and that is said at level 1.
+    const bool allow_nonconserving = vertex_debug::flag("sigma_allow_nonconserving");   // vertex_debug: sigma_allow_nonconserving
     if (sym)
-      app_log(2, "  eval_sigma_C: rung pair-symmetry check SKIPPED (IBZ storage: the -q "
-                 "partner is not a stored row).\n"
-                 "               Absence of a warning below is NOT evidence the rung is "
-                 "legal -- cross-check on a nosym mesh.");
+      app_log(1, "  eval_sigma_C: rung pair-symmetry check W_PQ(q) = W_QP(-q) CANNOT be performed on this IBZ mesh "
+                 "(the -q partner is not a stored row).\n"
+                 "               Absence of an abort is NOT evidence the rung is legal (Sigma^C = dPhi/dG) -- "
+                 "cross-check on a nosym mesh.");
+    auto rung_pair_fail = [&](const char *what, double rel) {
+      utils::check(allow_nonconserving,
+                   "eval_sigma_C: the {} rung violates W_PQ(q) = W_QP(-q) by {:.3e} (relative, tolerance 1e-8). The "
+                   "four G-cuts of Phi_2 are then NOT equal, so Sigma^C is NOT dPhi/dG and the result is not "
+                   "conserving. Check the q = -q transfers (Gamma / zone boundary), where the relation forces a "
+                   "SYMMETRIC block, not merely a Hermitian one. To run anyway (diagnostics only), set "
+                   "vertex_debug = \"sigma_allow_nonconserving=1\".", what, rel);
+    };
     auto rung_pair_asym = [&](auto const &Aq, const char *what) {
       if (sym) return;                       // IBZ storage: -q is not a stored row
       double d = 0.0, sc = 0.0;
@@ -323,7 +341,8 @@ namespace vertex_detail {
       const double rel = (sc > 0.0) ? d / sc : 0.0;
       app_log(3, "  eval_sigma_C: rung pair symmetry |{}_PQ(q) - {}_QP(-q)|/|{}| = {:.3e}",
               what, what, what, rel);
-      if (rel > 1e-8)
+      if (rel > 1e-8) {
+        rung_pair_fail(what, rel);   // audit D6: aborts unless sigma_allow_nonconserving
         app_log(1, "  [WARNING] eval_sigma_C: the {} rung violates W_PQ(q) = W_QP(-q) by "
                    "{:.3e} (relative).\n"
                    "            The four G-cuts of Phi_2 are then NOT equal, so Sigma^C is "
@@ -331,7 +350,9 @@ namespace vertex_detail {
                    "            result is not conserving. Check the q = -q transfers "
                    "(Gamma / zone boundary), where\n"
                    "            the relation forces a SYMMETRIC block, not merely a "
-                   "Hermitian one.", what, rel);
+                   "Hermitian one. (Continuing: vertex_debug sigma_allow_nonconserving is set.)",
+                what, rel);
+      }
     };
     rung_pair_asym(Z_qPQ, "Z");
 
@@ -437,11 +458,13 @@ namespace vertex_detail {
       const double rel = (sc > 0.0) ? d / sc : 0.0;
       app_log(3, "  eval_sigma_C: rung pair symmetry |W_PQ(q,inu) - W_QP(-q,inu)|/|W| = "
                  "{:.3e}", rel);
-      if (rel > 1e-8)
+      if (rel > 1e-8) {
+        rung_pair_fail("DYNAMIC (W(q, inu))", rel);   // audit D6: aborts unless sigma_allow_nonconserving
         app_log(1, "  [WARNING] eval_sigma_C: the DYNAMIC rung violates "
                    "W_PQ(q,inu) = W_QP(-q,inu) by {:.3e} (relative).\n"
-                   "            Sigma^C is then NOT dPhi/dG -- see the Z-rung warning "
-                   "above for what this costs.", rel);
+                   "            Sigma^C is then NOT dPhi/dG and the result is not conserving. "
+                   "(Continuing: vertex_debug sigma_allow_nonconserving is set.)", rel);
+      }
     }
 
     // ---- layout helpers ---------------------------------------------------
@@ -502,6 +525,17 @@ namespace vertex_detail {
     AccSw() = ComplexType(0.0);
     AccSt() = ComplexType(0.0);
 
+    // audit E: the slot probe is a process-wide TEST hook that silently replaces G lines (B/C/D) and drops whole
+    // S-terms (only_term) -- say so whenever any field is set, so a leaked probe can never pass for a production
+    // Sigma^C.
+    if (sigma_C_slot_probe.B != nullptr or sigma_C_slot_probe.C != nullptr or sigma_C_slot_probe.D != nullptr or
+        sigma_C_slot_probe.only_term != 0 or sigma_C_slot_probe.qx_St != nullptr or sigma_C_slot_probe.gA != nullptr)
+      app_log(1, "  [WARNING] eval_sigma_C: the TEST-ONLY sigma_C_slot_probe is armed (G-line overrides B/C/D = {}/{}/{}, "
+                 "only_term = {} [0 = all S-terms], qx_St meter {}, gA capture {}) -- this Sigma^C is a probe "
+                 "evaluation, not the physical one.",
+              sigma_C_slot_probe.B != nullptr ? "on" : "off", sigma_C_slot_probe.C != nullptr ? "on" : "off",
+              sigma_C_slot_probe.D != nullptr ? "on" : "off", sigma_C_slot_probe.only_term,
+              sigma_C_slot_probe.qx_St != nullptr ? "on" : "off", sigma_C_slot_probe.gA != nullptr ? "on" : "off");
     // ---- T1 per-q_x slot-probe meter (test-only; both pointers null in production) ----
     if (sigma_C_slot_probe.qx_St != nullptr) {
       sigma_C_slot_probe.qx_St->resize(nq, ns * nk_ext, nt, nbnd, nbnd);

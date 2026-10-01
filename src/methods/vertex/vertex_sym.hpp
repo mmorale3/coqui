@@ -56,6 +56,7 @@
 #include "nda/nda.hpp"
 #include "numerics/shared_array/nda.hpp"
 #include "utilities/check.hpp"
+#include "IO/app_loggers.h"
 #include "methods/vertex/vertex_debug.hpp"
 
 namespace methods {
@@ -137,8 +138,24 @@ namespace vertex_sym {
   /** DIAGNOSTIC (2026-09-22, the Si 4^3 time-reversal finding): vertex_debug sym_trev_notrans = 1 reads the IBZ-stored core
    *  PLAIN (not PQ-transposed) for a time-reversed transfer at every rung read site. The two differ by W vs conj(W) for a
    *  Hermitian core, invisible on meshes whose k-points are all TRIM (real collocations: every LiH fixture), decisive on Si 4^3. */
+  /** audit A13 (2026-10-01): the switch alters the answer on any mesh with a non-TRIM time-reversed transfer, so it is
+   *  no longer silent -- the first read logs a level-1 WARNING (it was env-settable via COQUI_SYM_TREV_NOTRANS and never
+   *  logged) -- and EVERY rung / W-bar read site honours it, Sigma included (vertex_sigma.icc q_access and
+   *  vertex_sigma_pair.icc's outer W-bar now; vertex_dynbse.icc / build_kbig already did), so Pi and Sigma never run on
+   *  different rungs. Callers reach this only for a transfer whose q_trev is set (they short-circuit on it), so the
+   *  WARNING appears exactly when the switch changes something. */
   inline bool trev_read_transposed() {
-    static const bool notrans = vertex_debug::flag("sym_trev_notrans");
+    static const bool notrans = [] {
+      const bool on = vertex_debug::flag("sym_trev_notrans");   // vertex_debug: sym_trev_notrans (DIAGNOSTIC)
+      if (on)
+        app_log(1, "  [WARNING] vertex_debug sym_trev_notrans is set: the IBZ-stored rung / W-bar core is read PLAIN "
+                   "(NOT PQ-transposed) for every\n"
+                   "            time-reversed transfer at every read site (Pi ladder, Pi^C, Sigma^C, the Sigma pair "
+                   "vertex, the dynamic rung). DIAGNOSTIC\n"
+                   "            switch (the Si 4^3 time-reversal finding, 2026-09-22): it CHANGES the answer on any "
+                   "mesh with non-TRIM k-points; unset it for production.");
+      return on;
+    }();
     return not notrans;
   }
 
