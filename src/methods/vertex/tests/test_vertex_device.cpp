@@ -19,17 +19,16 @@
  */
 
 /**
- * ISDF-Vertex on the DEVICE path -- the gate of increment G-1, the host bridge
- * (notes/gpu_port_plan.md section 4). Built only with ENABLE_DEVICE.
+ * ISDF-Vertex on the DEVICE path: the host bridge. Built only with ENABLE_DEVICE.
  *
  * The same two-iteration LiH-222 scGW is run through scf_loop<HOST_MEMORY> and
  * scf_loop<DEVICE_MEMORY>, once without a vertex and once with an ACTIVE dynamic-rung
  * 2nd-exchange vertex on the window [0, 2). On the device path the GW solver keeps W and
  * Pi on the device while the vertex runs on host copies (keep_host_W, the Pi mirror of
- * eval_Pi_qdep's hooks). The gate: the device run reproduces the host run -- e_corr and
+ * eval_Pi_qdep's hooks). Expected: the device run reproduces the host run -- e_corr and
  * the full Sigma(tau) -- to the same tolerance with the vertex ON as it does with the
- * vertex OFF (the vertex-OFF pair measures the device GW's own agreement, which is not
- * this increment's to answer).
+ * vertex OFF (the vertex-OFF pair measures the device GW's own host/device agreement,
+ * which bounds what the vertex bridge can be asked to reach).
  */
 
 #undef NDEBUG

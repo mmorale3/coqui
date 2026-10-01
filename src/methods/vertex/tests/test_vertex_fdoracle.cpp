@@ -1,7 +1,7 @@
 /**
- * INCREMENT S5 -- the FUNCTIONAL-DERIVATIVE ORACLE for Formulation B-S.
+ * The FUNCTIONAL-DERIVATIVE ORACLE for Formulation B-S.
  *
- * The parent theory's conservation test verified "two cuts of one Phi". B-S needs a
+ * The conservation test (test_vertex_conservation.cpp) verifies "two cuts of one Phi". B-S needs a
  * different statement, because its W-cut vanishes identically and ALL of the vertex
  * physics sits in the self-energy: what must be verified is "ONE TOTAL DERIVATIVE of one
  * Phi". For an arbitrary perturbation dG,
@@ -15,23 +15,19 @@
  * identity T[Sigma^{C,x}, G] = 4 Phi -- so no separate Phi evaluator is needed, and the
  * two sides of the oracle share one normalization by construction.
  *
- * This is the test with teeth for the S0 routing corrections
- * (verification/static_vertex_routing_report.md section 3): the notes' UNTRANSPOSED
+ * The oracle is sensitive to the static-vertex routing: an UNTRANSPOSED
  * W0 . Pi . W0 sandwich fails it by ~20 %, and dropping or sign-flipping Sigma^{C,r}
  * fails it by the response share.
  *
  * TOY DATA -- deliberately REALITY-SYMMETRIC (X(-k) = conj X(k), G(-k) = G(k)^T,
- * Z(-q) = Z(q)^T Hermitian), i.e. the symmetries a real crystal has. Rationale, recorded
- * so it is not silently re-litigated (plan, "S5 test-data ruling"):
+ * Z(-q) = Z(q)^T Hermitian), i.e. the symmetries a real crystal has. Rationale:
  *   * a FULLY ASYMMETRIC toy would separate ^T from conj in the sandwich, but there the
- *     single-Eq.-(10)-pattern Sigma^x that CoQui implements is itself off by 17 %, so
+ *     single-cut-pattern Sigma^x that CoQui implements is itself off by ~17 %, so
  *     the oracle would fail for a reason unrelated to Sigma^{C,r};
- *   * production data IS symmetric, so ^T vs conj cannot change any physical result --
- *     that distinction is settled by the Python arbiter (verify_static_cuts.py) and
- *     needs no C++ re-derivation;
- *   * the correction that DOES change physics -- the untransposed sandwich -- is wrong
- *     by 20 % even on symmetric data, so this toy keeps full teeth against it.
- * dG is non-Hermitian (the parent's convention-discriminating control) while still
+ *   * production data IS symmetric, so ^T vs conj cannot change any physical result;
+ *   * an untransposed sandwich is wrong by ~20 % even on symmetric data, so this toy
+ *     stays sensitive to it.
+ * dG is non-Hermitian (a convention-discriminating control) while still
  * respecting the k-reality symmetry, which is what keeps Sigma^x exact.
  *
  * ns = 2 throughout: with one stored spin channel the RPA bubble and the Pi^C kernel
@@ -100,9 +96,9 @@ namespace bdft_tests {
      * zone-boundary points of an even mesh). There it forces M(q) to be REAL SYMMETRIC,
      * not merely Hermitian. Writing the +q and -q blocks in a single pass silently
      * violates it exactly there -- both writes land on the same element and the last one
-     * wins -- which is how the B-L oracles came to be fed an ILLEGAL rung.
+     * wins, producing an ILLEGAL rung.
      *
-     * Why it matters, and why nothing else notices: Sigma^C is the Eq.-(10) pattern, i.e.
+     * Why it matters, and why nothing else notices: Sigma^C is a single-cut pattern, i.e.
      * ONE of the four ways to cut a G line out of Phi_2. It equals dPhi/dG only because
      * the diagram's C4 rotation makes all four cuts equal -- and that rotation TRANSPOSES
      * a rung's (row pair, col pair). So the four cuts are equal iff the rung obeys the
@@ -110,8 +106,8 @@ namespace bdft_tests {
      * with no other symptom: the W-side oracle, the Euler identities and the
      * Sigma-vs-reference pins are all blind to it.
      *
-     * The model's own Z_qPQ has always been built correctly (it uses a REAL draw at the
-     * self-inverse q); only the B-L perturbations did not. Use rung_sym_err() to assert it.
+     * The model's Z_qPQ uses a REAL draw at the self-inverse q, and make_rung() below
+     * builds legal perturbations. Use rung_sym_err() to assert it.
      */
     inline nda::array<cplx, 3> make_rung(unsigned long seed, double scale) {
       rng_t rg(seed);
@@ -269,9 +265,9 @@ namespace bdft_tests {
     auto &mpi_context = utils::make_unit_test_mpi_context();
     auto comm = mpi_context->comm;
 
-    // The oracle's tolerance class is BASIS-eps (plan, S5 gate): Phi is a product of
-    // three/four tau-objects, so the residual is set by how well the basis represents
-    // those products, not by machine precision. Swept so that dependence is on record.
+    // The oracle's tolerance class is BASIS-eps: Phi is a product of three/four
+    // tau-objects, so the residual is set by how well the basis represents those
+    // products, not by machine precision. Both precisions are run to expose that dependence.
     std::string prec = GENERATE(std::string("medium"), std::string("high"));
     imag_axes_ft::IAFT ft(beta, wmax, imag_axes_ft::dlr_basis, prec);
     iaft_tools tools(ft);
@@ -444,8 +440,7 @@ namespace bdft_tests {
     // --- the perturbation: NON-Hermitian, but respecting the k-reality symmetry ----------
     // dG must be a GENUINE tau-FUNCTION, not per-node noise. Random values on the sparse
     // nodes are not representable in the basis at all -- they are mesh-dependent, so both
-    // Phi and its derivative would change when the DLR precision changes (measured: the
-    // residual got WORSE from medium to high, and dPhi/dl itself moved by 60 %). Build it
+    // Phi and its derivative would change when the DLR precision changes. Build it
     // instead from the same pole machinery as G, with DIFFERENT poles and arbitrary
     // (NON-Hermitian) amplitudes -- representable to eps and mesh-independent.
     nda::array<cplx, 5> dG(nt, ns, nk, nbnd, nbnd);
@@ -509,7 +504,7 @@ namespace bdft_tests {
     // --- the oracle ----------------------------------------------------------------------
     // h sweep: a centered difference converges as h^2, so if the residual falls by ~100x
     // per decade it is TRUNCATION (dG is not small compared with G's tau decay), not a
-    // routing error. Reported before the gate so the distinction is on the record.
+    // routing error.
     const double h = 1e-6;
     const cplx dphi_fd = (phi_of(shifted(h)) - phi_of(shifted(-h))) / (2.0 * h);
 
@@ -563,7 +558,7 @@ namespace bdft_tests {
             std::abs(t_r) / std::abs(t_x));
     REQUIRE(std::abs(dphi_fd) > 1e-10);
     REQUIRE(std::abs(t_r) > 1e-3 * std::abs(t_x));   // the response term must MATTER
-    REQUIRE(rel < 1e-7);                             // ** THE TEST WITH TEETH **
+    REQUIRE(rel < 1e-7);                             // the functional-derivative oracle
     // The SPLIT is asserted too, so a failure says WHICH cut is wrong:
     //   the explicit lines alone (W0 frozen) must reproduce T[Sigma^x, P_C dG P_C], and
     //   the remainder must be exactly T[Sigma^{C,r}, dG].
@@ -571,7 +566,7 @@ namespace bdft_tests {
     REQUIRE(std::abs(t_r - (dphi_fd - dphi_expl)) / std::abs(t_r) < 1e-7);
     // mesh-independence: dPhi/dl is a property of the FUNCTIONAL, so it must not move
     // with the DLR precision. (It does if dG is per-node noise instead of a representable
-    // tau-function -- which is exactly how the first draft of this test was wrong.)
+    // tau-function, hence the pole construction of dG above.)
 
     // --- the FOLDED single-transfer form must be IDENTICAL -------------------------------
     // sum_q [Dw(q)_AB Gt(k-q)_BA + Dw(q)_BA Gt(k+q)_BA] = sum_q [Dw(q)+Dw(-q)^T]_AB Gt(k-q)_BA
@@ -599,10 +594,10 @@ namespace bdft_tests {
       REQUIRE(num < 1e-13 * den);
     }
 
-    // --- EULER IDENTITIES (i)-(iii)  [O6] ------------------------------------------------
+    // --- EULER IDENTITIES (i)-(iii) -------------------------------------------------------
     // These tie the THREE kernels together (Sigma^x, Pi^{C,0}, Sigma^{C,r}) through one
-    // Phi, so they are cross-kernel checks, not restatements of the oracle. Trace
-    // DIRECTIONS are the corrected ones of the S0 report section 3.3.
+    // Phi, so they are cross-kernel checks, not restatements of the oracle. The trace
+    // DIRECTIONS below (transposed / -q symmetrized) are the ones the identities require.
     const cplx phi_hat = 0.25 * pairing(Sx, G0, ncw, ncw);
     {
       // (i) Phi is degree-4 HOMOGENEOUS in the explicit G's (the content of euler1; the
@@ -628,7 +623,7 @@ namespace bdft_tests {
           }
       e2 /= double(nk);
       const double rel2 = std::abs(e2 + 4.0 * phi_hat) / std::abs(4.0 * phi_hat);
-      // the notes' UNCORRECTED direction (plain Pi_IJ W0_IJ) must NOT satisfy it
+      // the untransposed direction (plain Pi_IJ W0_IJ) must NOT satisfy it
       cplx e2n(0.0);
       for (long q = 0; q < nk; ++q)
         for (long P = 0; P < Np; ++P)
@@ -678,8 +673,8 @@ namespace bdft_tests {
     REQUIRE(std::abs(dphi_fd - t_x) / std::abs(dphi_fd) > 1e-3);
     // (b) sign-flip Sigma^r -> breaks by twice the response share
     REQUIRE(std::abs(dphi_fd - (t_x - t_r)) / std::abs(dphi_fd) > 1e-3);
-    // (c) the NOTES' sandwich: untransposed W0 . Pi(q) . W0, unsymmetrized. This is the
-    //     S0 correction; it must fail even on this symmetric toy.
+    // (c) the untransposed, unsymmetrized sandwich W0 . Pi(q) . W0: it must fail even on
+    //     this symmetric toy.
     {
       nda::array<cplx, 3> Dw_notes(nk, Np, Np);
       for (long q = 0; q < nk; ++q) {
@@ -707,15 +702,16 @@ namespace bdft_tests {
       REQUIRE(rel_n > 1e-3);
     }
 
-    // --- T-4: THE ORACLE UNDER A COMPLEX WANNIER GAUGE (plan note, erratum E-S2) --------
+    // --- THE ORACLE UNDER A COMPLEX WANNIER GAUGE ----------------------------------------
     // Feed the SAME functional through the production Wannier substitutions with a
     // FULL-RANK complex unitary V on the window (range(P) unchanged, so Phi is the same
     // functional): Xbar = X(:,C) V, Gbar = V^dag G_CC V, kernel at strict C-C. The
     // conserving pairing is stated in the KERNEL'S OWN (Wannier) labels,
     // T[Sbar^x, V^dag dG_CC V]; with the CHAIN-RULE injection this equals the band-label
-    // pairing exactly (associativity), so the oracle gate carries over unchanged. The
-    // OPERATOR-sandwich reading (V Sbar V^dag paired against dG_CC) is the documented
-    // trap (wannier_projector_theory section 2.7) and must break at O(1).
+    // pairing exactly (associativity), so the oracle check carries over unchanged. The
+    // OPERATOR-sandwich reading (V Sbar V^dag paired against dG_CC) is NOT equivalent
+    // (the same-index pairing is not invariant under a complex unitary sandwich) and must
+    // break at O(1).
     {
       const long M = ncw;
       nda::array<cplx, 2> V(M, M);
@@ -770,7 +766,7 @@ namespace bdft_tests {
       // (1) Phi evaluated in the kernel's own Wannier labels == the band-label Phi
       const cplx phi_w = 0.25 * pairing(Sxb, rot_G(G0), M, M);
       // (2) the WANNIER-label explicit pairing reproduces the band one exactly, and the
-      //     full oracle gate carries over
+      //     full oracle check carries over
       const cplx t_x_w = pairing(Sxb, rot_G(dG), M, M);
       const double rel_w = std::abs(dphi_fd - (t_x_w + t_r)) / std::abs(dphi_fd);
       // (3) POSITIVE CONTROL: the operator-sandwich band injection V Sbar V^dag
@@ -796,41 +792,39 @@ namespace bdft_tests {
               std::abs(t_x_w - t_x) / std::abs(t_x), rel_w, rel_bad);
       REQUIRE(std::abs(phi_w - phi_hat) < 1e-9 * std::abs(phi_hat));
       REQUIRE(std::abs(t_x_w - t_x) < 1e-9 * std::abs(t_x));
-      REQUIRE(rel_w < 1e-7);                     // the oracle, in Wannier labels (E-S2)
-      REQUIRE(rel_bad > 1e-2);                   // the section-2.7 trap, made a control
+      REQUIRE(rel_w < 1e-7);                     // the oracle, in Wannier labels
+      REQUIRE(rel_bad > 1e-2);                   // the operator-sandwich reading, as a control
     }
 #endif
   }
 
   /**
-   * INCREMENT S9 -- the W-SIDE FUNCTIONAL-DERIVATIVE ORACLE for Formulation B-L.
+   * The W-SIDE FUNCTIONAL-DERIVATIVE ORACLE for Formulation B-L.
    *
-   * WHY THIS EXISTS (and why its absence mattered). S9 shipped WITHOUT its mandated gate:
-   * the file above covers B-S only (its W-cut vanishes identically), so until now NOTHING
-   * verified that B-L's two cuts are consistent cuts of one functional. Every other B-L
-   * test in the suite is loose (finiteness / magnitude bands), relative (sym-vs-nosym) or
-   * trivial (C = empty). A wrong WEIGHT in P^{C,L} -- the one term that distinguishes B-L
-   * from B-S -- passes all of them, and shows up only as bad physics in production. It did:
-   * on Si kp222 B-L departs from B-S by 7.5x with the opposite sign and goes unstable at
-   * iteration 8, while B-S (which is gated) converges cleanly.
+   * WHY. The B-S oracle above cannot see B-L's W-cut (the B-S W-cut vanishes
+   * identically), so this case verifies that B-L's two cuts are consistent cuts of one
+   * functional. Other B-L tests are loose (finiteness / magnitude bands), relative
+   * (sym-vs-nosym) or trivial (C = empty): a wrong WEIGHT in P^{C,L} -- the one term that
+   * distinguishes B-L from B-S -- passes all of them and shows up only as unphysical
+   * results (wrong sign, SCF instability) in production.
    *
-   * THE IDENTITY (theoryB_static eq:Woracle):
+   * THE IDENTITY:
    *
    *   d/dl Phi_2^{C,L}[G, W + l dW]|_0
    *       = -1/2 * (1/(Nk beta)) sum_{q,nu} sum_{IJ} P^{C,L}_{IJ}(q,inu) dW_{JI}(q,inu)
    *
-   * It "pins the FULL weight of P^{C,L} -- the discriminator against the half-weight trap
-   * (the naive Variant-F functional fails it by exactly a factor 2)".
+   * It pins the FULL weight of P^{C,L}: a functional carrying P^{C,L} at half weight
+   * fails it by exactly a factor 2.
    *
    * WHAT MAKES IT SHARP. The two sides come from DIFFERENT kernels: the left from the
    * Sigma kernel (eval_sigma_C_g3w2, rung_mode = 2) through the Euler identity
-   * eq:eulerBL1, T[Sigma^{C,L}, G] = 4 Phi; the right from the Pi kernel
+   * T[Sigma^{C,L}, G] = 4 Phi; the right from the Pi kernel
    * (pi_c_accumulate_w with the static rung W0 and NO dynamic rung, which is exactly what
    * vertex_t::eval_Pi_C injects for B-L). Nothing forces them to agree unless the relative
    * normalization of the two cuts is right.
    *
    * TWO STRUCTURAL SIMPLIFICATIONS, both exact:
-   *  (1) Phi_2^{C,L} is AFFINE in W (degree 1 + degree 0, eq:hierarchy), so the identity
+   *  (1) Phi_2^{C,L} is AFFINE in W (degree 1 + degree 0), so the identity
    *      holds with NO finite-difference truncation at all: Phi(l) - Phi(0) = l * dPhi/dl
    *      exactly, for any l. The residual is pure basis-eps, not h^2. Affinity is itself
    *      asserted below -- if it ever fails, the W-dependence is not what the theory says.
@@ -889,7 +883,7 @@ namespace bdft_tests {
     // simplification (2) above); the model's Z already carries exactly that symmetry.
     auto const &W0 = mdl.Z_qPQ;
 
-    // ---- Sigma^{C,L}: the THREE explicit terms of eq:sigmaBL --------------------------
+    // ---- Sigma^{C,L}: the THREE explicit terms ----------------------------------------
     //   W_x W_y -> W0_x W_y + W_x W0_y - W0_x W0_y,
     // which is what rung_mode = 2 computes from (Z-slot = W0, dynamic rung = dW = W - W0):
     // its S3/S1/S2 reductions are W0_x W0_y, W0_x dW_y, dW_x W0_y. Externals stay FREE
@@ -905,7 +899,7 @@ namespace bdft_tests {
       return S;
     };
 
-    // Phi_2^{C,L} from the Euler identity eq:eulerBL1: T[Sigma^{C,L}, G] = 4 Phi.
+    // Phi_2^{C,L} from the Euler identity T[Sigma^{C,L}, G] = 4 Phi.
     // Uses the SAME kernel the production path uses, so the two sides of the oracle share
     // one normalization by construction -- as in the B-S case.
     auto phi_BL = [&](nda::array<cplx, 4> const &dW_qw) {
@@ -913,7 +907,7 @@ namespace bdft_tests {
       return 0.25 * pairing(S, G0, ncw, ncw);
     };
 
-    // ---- P^{C,L}(q, i.nu) = the static-rung Pi^C at FULL weight (eq:PCL) --------------
+    // ---- P^{C,L}(q, i.nu) = the static-rung Pi^C at FULL weight ----------------------
     // EXACTLY the call vertex_t::eval_Pi_C makes for vertex_rung = "linear": rung W0bar,
     // Wdyn = nullptr. Fed the C-C block, because the Pi kernel contracts its external
     // orbital legs into the aux indices (all eight labels of Phi are in C).
@@ -1026,9 +1020,9 @@ namespace bdft_tests {
     REQUIRE(std::abs(rhs) > 1e-10);          // the RHS must not be vacuously zero
     REQUIRE(rel < 1e-6);
 
-    // ---- POSITIVE CONTROLS (theoryB_static section BLconservation) -------------------
-    // "replace P^{C,L} -> 1/2 P^{C,L} -> the W-oracle breaks by 2". If this control does
-    // NOT break, the test is blind to the very trap it exists to catch.
+    // ---- POSITIVE CONTROLS -------------------------------------------------------------
+    // replacing P^{C,L} -> 1/2 P^{C,L} must break the W-oracle by exactly 2. If this control
+    // does NOT break, the test is blind to the half-weight error it exists to catch.
     {
       nda::array<cplx, 4> Phalf(PCL_w);
       Phalf() *= 0.5;
@@ -1052,8 +1046,8 @@ namespace bdft_tests {
   }
 
   /**
-   * DIAGNOSTIC (temporary): pin the MIXED reductions S1/S2 against the ALREADY-PINNED
-   * doubly-instantaneous reduction S3.
+   * DIAGNOSTIC: pin the MIXED reductions S1/S2 against the doubly-instantaneous
+   * reduction S3 (pinned independently by the B-S tests).
    *
    * S1/S2 are BILINEAR in (x-rung, y-rung) exactly as S3 is, and the kernel is LINEAR in
    * the Z slot separately for each rung. So if the "dynamic" rung handed to rung_mode = 2
@@ -1066,9 +1060,9 @@ namespace bdft_tests {
    * while   S1[W0,D] + S2[D,W0] = linear(Z = W0, dW = D) - static(W0).
    *
    * The two right-hand sides use DISJOINT code paths (S3 only vs S1/S2 only) but must be
-   * the same object. A mismatch convicts the ORBITAL/MOMENTUM ROUTING of S1/S2 (the
-   * frequency algebra is trivial here -- D is a constant); a match exonerates the routing
-   * and moves the suspicion to the frequency handling of a genuinely dynamic rung.
+   * the same object. A mismatch isolates a defect in the ORBITAL/MOMENTUM ROUTING of S1/S2
+   * (the frequency algebra is trivial here -- D is a constant); a match leaves only the
+   * frequency handling of a genuinely dynamic rung to be tested elsewhere.
    */
   TEST_CASE("vertex_mixpin", "[methods][vertex][fdoracle][bl]") {
 #ifndef ENABLE_DLR
@@ -1143,13 +1137,12 @@ namespace bdft_tests {
    * invariant under the diagram's C4 rotation of its slots -- so this test measures all
    * four cuts SEPARATELY (via sigma_C_slot_probe) instead of only their average.
    *
-   * WHY IT EXISTS. The G-side oracle sees only the average, so when it fails it cannot say
-   * WHICH cut moved. Run slot-resolved, the failure fingerprint is unmistakable: the
-   * profile came out in arithmetic progression along the 4-cycle, invariant under exactly
-   * the reflection that transposes the LEGAL rung and broken under the one that transposes
-   * the illegal one. That identified the culprit -- rungs violating W_PQ(q) = W_QP(-q) at
-   * the self-inverse transfer -- in one measurement, after the aggregate oracle had been
-   * misread as convicting the mixed Sigma terms (eq:mixgw), which are in fact exact.
+   * WHY. The G-side oracle sees only the average, so when it fails it cannot say WHICH
+   * cut moved. Slot-resolved, the failure fingerprint is distinctive: a rung violating
+   * W_PQ(q) = W_QP(-q) at a self-inverse transfer gives a profile in arithmetic
+   * progression along the 4-cycle, invariant under the reflection that transposes a
+   * LEGAL rung and broken under the one that transposes the illegal one. This separates
+   * an illegal rung from an error in the mixed Sigma terms.
    *
    * The test covers B-S (S3) and both B-L mixed reductions (S1, S2), with constant and
    * nu-dependent rungs, and carries the illegal-rung positive control at the end.
@@ -1338,9 +1331,9 @@ namespace bdft_tests {
 
     // ---- POSITIVE CONTROL: an ILLEGAL rung MUST break the flatness -------------------
     // Hermitian per q and dW(-q) = dW(q)^T away from the zone centre, but NOT symmetric
-    // at the self-inverse q -- i.e. exactly what a single-pass +q/-q write produces, and
-    // exactly the defect that made the B-L G-side oracle read 1.118e-01. If this control
-    // stops firing, the probe has gone blind to the thing it exists to catch.
+    // at the self-inverse q -- i.e. exactly what a single-pass +q/-q write produces (it
+    // breaks the B-L G-side oracle at O(10%)). If this control stops firing, the probe has
+    // lost sensitivity to the defect it exists to catch.
     {
       nda::array<cplx, 3> Bad(Dconst);
       for (long q = 0; q < nk; ++q) {
@@ -1352,8 +1345,8 @@ namespace bdft_tests {
           }
       }
       REQUIRE(rung_sym_err(Bad) > 1e-3);              // it really is illegal
-      // audit D6: eval_sigma_C now ABORTS on an illegal rung unless sigma_allow_nonconserving is set -- the control needs
-      // the old warn-and-continue behaviour, scoped to this block
+      // eval_sigma_C aborts on an illegal rung unless the vertex_debug key sigma_allow_nonconserving is set; the control
+      // enables it (warn and continue) for this block only
       vertex_debug::set("sigma_allow_nonconserving=1");
       const double broke = profile("S3, ILLEGAL Z (CONTROL, must NOT be flat)", 3, Bad,
                                    nullptr);
@@ -1364,26 +1357,28 @@ namespace bdft_tests {
   }
 
   /**
-   * INCREMENT S9 -- the G-SIDE FUNCTIONAL-DERIVATIVE ORACLE for Formulation B-L.
+   * The G-SIDE FUNCTIONAL-DERIVATIVE ORACLE for Formulation B-L.
    *
    * The companion to the W-side oracle above. That one pins P^{C,L}'s weight against the
    * explicit Sigma terms; this one pins the REMAINING B-L object, the response self-energy
    *
-   *   Delta w^L(q) := W0(q) [ pi^dyn(q) - Pi^C(q, tau=0) ] W0(q)     (eq:deltawL)
+   *   Delta w^L(q) := W0(q) [ pi^dyn(q) - Pi^C(q, tau=0) ] W0(q)
    *
    * which the W-side oracle cannot see at all (it is a G-side object, born from the chain
-   * rule through W0[G]). theoryB_static eq:eulerBL1 + the G-side oracle:
+   * rule through W0[G]). With Phi from the Euler identity T[Sigma^{C,L}, G] = 4 Phi, the
+   * G-side oracle reads
    *
    *   d/dl Phi_2^{C,L}[G + l dG, W]|_0
    *       = T[ Sigma^{C,L}, P_C dG P_C ]  +  T[ Sigma^{L,r}, dG ]
    *
-   * with Sigma^{C,L} the THREE explicit terms of eq:sigmaBL and Sigma^{L,r} the response.
+   * with Sigma^{C,L} the THREE explicit terms (W0_x W_y + W_x W0_y - W0_x W0_y) and
+   * Sigma^{L,r} the response.
    *
-   * THE ESSENTIAL SUBTLETY, and the reason this test has teeth: W (the physical screened
+   * THE ESSENTIAL SUBTLETY, and what makes this test sensitive: W (the physical screened
    * interaction) is held FIXED while G varies, but the KERNEL W0[G] is a functional of G,
    * so the fluctuation dW = W - W0[G] VARIES WITH G. Every place W0 appears -- the two
    * mixed rungs, the -W0 W0 term, and dW itself -- contributes to the chain rule, and
-   * X^L (eq:XL) is exactly the sum of those rung derivatives. If Delta w^L had the wrong
+   * X^L is exactly the sum of those rung derivatives. If Delta w^L had the wrong
    * sign, the wrong factor, or the wrong Pi combination, the residual here is O(1).
    *
    * This is also the ONLY test that exercises pi^dyn inside a conservation statement
@@ -1534,7 +1529,7 @@ namespace bdft_tests {
       return S;
     };
 
-    // Phi_2^{C,L}[G, W] via Euler (eq:eulerBL1), with W0 and dW BOTH following G
+    // Phi_2^{C,L}[G, W] via the Euler identity, with W0 and dW BOTH following G
     auto phi_BL_of = [&](nda::array<cplx, 5> const &G) {
       auto W0 = W0_from_G(G);
       auto S = sigma_BL(G, W0, dW_of(W0));
@@ -1637,7 +1632,7 @@ namespace bdft_tests {
     auto Pi0 = piC0_tau0(G0, W0);
     auto Pdyn = pidyn(G0);
 
-    // Pi^L = pi^dyn - Pi^{C,0}(tau=0), then Delta w^L = W0 Pi^L W0 (eq:deltawL)
+    // Pi^L = pi^dyn - Pi^{C,0}(tau=0), then Delta w^L = W0 Pi^L W0
     nda::array<cplx, 3> PiL(nk, Np, Np);
     for (long q = 0; q < nk; ++q)
       for (long P = 0; P < Np; ++P)
@@ -1679,9 +1674,9 @@ namespace bdft_tests {
             t_resp.real(), t_resp.imag(), remainder.real(), remainder.imag(),
             std::abs(t_resp) / std::max(std::abs(remainder), 1e-30));
     // ---- ISOLATION: with dW == 0 only S3 = Sigma^x survives, so the explicit split MUST
-    //      fall back to the B-S result (which passes at ~1e-10). If the zero-dW split is
-    //      clean while the full one is not, the discrepancy is entirely in the MIXED terms
-    //      S1/S2 -- i.e. eq:mixgw, which open item O7 flags as hand-derived, O1 risk class.
+    //      fall back to the B-S result (which holds to basis accuracy). If the zero-dW split
+    //      is clean while the full one is not, the discrepancy is entirely in the MIXED
+    //      terms S1/S2.
     double rel_S3 = 0.0;
     {
       nda::array<cplx, 4> dWz(nk, nw_b, Np, Np);
@@ -1711,22 +1706,22 @@ namespace bdft_tests {
     // ---- THE q -> 0 HEAD-CHANNEL PROJECTION IS NOT A FUNCTIONAL DERIVATIVE ------------
     // vertex_t::eval_Sigma_C (vertex_t.cpp, the _bl_head_projection block) deletes the
     // rank-1 head component chi chi^dag from the response middle factor at q = Gamma
-    // BEFORE build_delta_w. On Si that removes 66 % of max|Pi(Gamma)| and changes
-    // Sigma^(L,r) by 9.7x, so it is not a round-off cleanup -- it is a modification of the
-    // theory. It is also applied to the SIGMA CUT ONLY: eval_Pi_C's P^{C,L}, which feeds
-    // the Dyson equation, keeps its head channel.
+    // BEFORE build_delta_w. On real systems that can remove a large fraction of
+    // max|Pi(Gamma)| and change Sigma^(L,r) substantially, so it is not a round-off
+    // cleanup -- it is a modification of the theory. It is also applied to the SIGMA CUT
+    // ONLY: eval_Pi_C's P^{C,L}, which feeds the Dyson equation, keeps its head channel.
     //
-    // This block asks the only question that settles whether that is legal: does the
-    // PROJECTED Sigma^(L,r) still satisfy the B-L G-side identity? The identity above
-    // holds for the unprojected middle factor at ~1e-11. Pi^L is what the chain rule
+    // This block asks whether the PROJECTED Sigma^(L,r) still satisfies the B-L G-side
+    // identity. The identity above holds for the unprojected middle factor to basis
+    // accuracy. Pi^L is what the chain rule
     // through W0[G] produces, so deleting any part of it must show up as a residual --
     // unless the deleted part is annihilated downstream, which is exactly what a
     // "harmless projection" would mean.
     //
     // The toy model has no basis_head, so chi here is SYNTHETIC. That is sufficient: the
     // claim under test is about deleting a rank-1 channel from Pi^L, not about which
-    // direction chi points. chi is given a non-trivial complex phase (Si's head is not
-    // real; LiH's is) and H is built exactly as vertex_head_detail::build_head_rank1 does,
+    // direction chi points. chi is given a non-trivial complex phase (a head vector is
+    // complex in general) and H is built exactly as vertex_head_detail::build_head_rank1 does,
     // H_PQ = c * Re[conj(chi_P) chi_Q], including the Re[.].
     {
       nda::array<cplx, 1> chi(Np);
@@ -1778,14 +1773,13 @@ namespace bdft_tests {
               (std::abs(t_resp) > 0.0 ? std::abs(t_resp_p) / std::abs(t_resp) : 0.0),
               rel, rel_p);
       // THE ASSERTION: projecting the head channel out of Pi^L BREAKS the B-L G-side
-      // functional-derivative identity. If this ever stops firing, the projection has
-      // become a no-op (or the oracle has gone blind) and that must be understood before
-      // the projection can be defended as a legal approximation.
+      // functional-derivative identity. If this stops firing, either the projection has
+      // become a no-op or the oracle has lost sensitivity.
       REQUIRE(rel_p > 1e-3);
     }
 
     // ---- POSITIVE CONTROLS -----------------------------------------------------------
-    // "drop the -Sx term of eq:sigmaBL -> the G-oracle breaks" and the response controls.
+    // dropping or sign-flipping the response Sigma^(L,r) must break the G-oracle.
     {
       const double r_drop = std::abs(dphi_fd - t_expl) / std::abs(dphi_fd);
       app_log(1, "fdoracle_bl_gside [{}]: CONTROL drop Sigma^(L,r) -> rel = {:.3e} "
@@ -1800,8 +1794,8 @@ namespace bdft_tests {
               prec, r_flip);
       REQUIRE(r_flip > 1e-3);
     }
-    {   // the notes' UNTRANSPOSED sandwich: Delta w^L built from Pi^L without the
-        // transpose/symmetrization -- the S0 routing correction, re-checked for B-L
+    {   // the UNTRANSPOSED sandwich: Delta w^L built from Pi^L without the
+        // transpose/symmetrization (reported, not asserted)
       nda::array<cplx, 3> DwNT(nk, Np, Np);
       DwNT() = cplx(0.0);
       for (long q = 0; q < nk; ++q)

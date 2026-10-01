@@ -21,17 +21,15 @@
 // ISDF-Vertex: ABSOLUTE normalization / sign cross-check of Sigma^C against CoQui's
 // own bare second-order exchange (GF2 "gf2" exchange channel).
 //
-// WHY THIS TEST EXISTS. Everything that pins Sigma^C today is INTERNAL:
-//   - the dense double-Matsubara arbiter reproduces theoryB Eq. 22 -- but Eq. 22 is
-//     the object under test, so a wrong power of 1/N_k or 1/beta in the NOTES is
-//     reproduced faithfully by both sides;
+// WHY THIS TEST EXISTS. The other Sigma^C tests are INTERNAL consistency checks:
+//   - the dense double-Matsubara oracle evaluates the same closed-form Sigma^C
+//     expression the kernel implements, so a wrong power of 1/N_k or 1/beta in that
+//     expression is reproduced faithfully by both sides;
 //   - the conservation identity Tr[Sigma^C G] + Tr[P^C W] = 0 fixes the RELATIVE
 //     normalization of the two cuts and cancels any factor COMMON to both;
 //   - C = empty set is trivially satisfied by any prefactor.
-// So the absolute scale and overall sign of Phi_2^C have never been checked against
-// an independently written kernel. verified-cut-verdicts flagged exactly this cross-
-// check ("Sigma^C at C = full, W -> v vs CoQui's pyscf-pinned bare-GF2 exchange") as
-// RECOMMENDED BEFORE PRODUCTION; it was deferred and never run.
+// None of them fixes the absolute scale and overall sign of Phi_2^C; this test checks
+// them against an independently written kernel.
 //
 // THE CHECK. Set C = the FULL band range and give the vertex the BARE rung (no
 // dynamic W in MBState => the kernel uses W = Z). Then Phi_2^C degenerates to the
@@ -79,17 +77,17 @@ namespace bdft_tests {
   namespace gf2xchk_detail {
 
     // best-fit complex scale of A onto B plus the residual after that scale:
-    // INCREMENT S3 NOTE -- this test is ALSO the absolute pin of the B-S explicit term
-    // Sigma^{C,x}, by exact composition rather than by a duplicate run:
+    //   lambda = <B, A> / <B, B>,  resid = ||A - lambda B|| / ||A||
+    //
+    // This test is ALSO the absolute pin of the B-S explicit term Sigma^{C,x}, by exact
+    // composition rather than by a duplicate run:
     //   * with dW == 0 the rung here is W = Z, and B-S's static rung is W0 = Z + dW(0),
     //     so W0 == Z: the two theories coincide term by term;
     //   * test_vertex_sigma / SECTION("static_rung_W0") pin (2) shows the static-rung
     //     kernel path is BIT-IDENTICAL (max|delta| = 0, not merely close) to the
     //     dynamic path evaluated at dW == 0 with the same rung core.
-    // Hence lambda = 1 established below transfers to Sigma^{C,x} exactly. Re-running
-    // this 5400 s test through the static driver would re-derive a bit-identical number.
-    // If the static path is ever changed, pin (2) of static_rung_W0 is what breaks.
-    //   lambda = <B, A> / <B, B>,  resid = ||A - lambda B|| / ||A||
+    // Hence lambda = 1 established below transfers to Sigma^{C,x} exactly. If the static
+    // path is ever changed, pin (2) of static_rung_W0 is what breaks.
     struct fit_t { cplx lambda; double resid, normA, normB; };
 
     template<typename A5, typename B5>

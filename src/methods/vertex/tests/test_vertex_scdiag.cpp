@@ -18,29 +18,28 @@
  * ==========================================================================
  */
 
-// ISDF-Vertex SELF-CONSISTENCY DIAGNOSTIC.
+// ISDF-Vertex self-consistency diagnostics.
 //
-// Background: the Si kp444/M8 production runs show (a) the G_CC G-rotation
-// (little-group) residual jumping 5e-9 (iter-1) -> 0.49 (iter-2) and saturating at
-// O(1), and (b) the scGW+vertex loop diverging from iter-3. The existing IBZ test
-// only compares SECONDARY vs GLOBAL at 2 iterations, so a defect shared by both
-// paths -- or one that lives in the plain scGW baseline -- is invisible to it.
+// The IBZ tests compare the secondary vs the global basis over a few iterations, so a
+// symmetry defect shared by both paths -- or one that lives in the plain scGW
+// baseline -- is invisible to them. This file supplies the controls:
+//   0. vertex_scdiag_transfer_map_consistency: the k-point maps used by the kernels
+//      carry the stored momentum transfer.
+//   1. vertex_scdiag_baseline_symmetry: the little-group residual of the self-
+//      consistent G with the vertex off. G(k) must commute with the representation
+//      of the little group of k -- this is a property of any correct Sigma, so a
+//      large value here points to the plain scGW path, not the vertex.
+//   2. vertex_scdiag_vertex_symmetry: the same residual with the vertex on, at
+//      1-4 iterations, global basis, on a symmetry-closed window (no D-matrix
+//      leakage), so the window-truncation confound is removed.
+//   3. vertex_scdiag_trajectory: sym vs nosym e_corr trajectory over several
+//      iterations. A symmetry defect that is invisible in a 2-iteration energy
+//      comparison shows up as a growing sym-vs-nosym gap.
+//   4. vertex_scdiag_dielectric_stability: e_corr as the window C grows
+//      (characterization of the stable envelope of eps = I - Z.Pi).
 //
-// This file supplies the MISSING CONTROLS:
-//   1. vertex_scdiag_baseline_symmetry: the little-group residual of the SELF-
-//      CONSISTENT G with the vertex OFF. G(k) must commute with the representation
-//      of the little group of k -- this is a property of ANY correct Sigma, so a
-//      large value here indicts the plain scGW path, not the vertex.
-//   2. vertex_scdiag_vertex_symmetry: the same residual with the vertex ON, at
-//      1/2/4 iterations, global basis, on a symmetry-CLOSED window (D-leak = 0)
-//      so the window-truncation confound is removed.
-//   3. vertex_scdiag_trajectory: sym vs nosym e_corr TRAJECTORY over several
-//      iterations. A symmetry defect that is invisible in the 2-iteration energy
-//      (the gold check tolerates 25% of the vertex shift) shows up as a growing
-//      sym-vs-nosym gap.
-//
-// The residual is measured on the FULL band block (the vertex diagnostic uses the
-// C block only), so it is independent of the C-window truncation.
+// The residual is measured on the full band block (the vertex's own diagnostic uses
+// the C block only), so it is independent of the C-window truncation.
 
 #include <cmath>
 #include <complex>
@@ -81,7 +80,7 @@ namespace bdft_tests {
      * any band-basis operator is the IBZ block VERBATIM (transposed for trev k) --
      * the stored orbitals at an image point are the canonically rotated IBZ orbitals.
      * MF->symmetry_rotation(js, k) is d(R, k)(a,b) = <psi(k.R, a) | S psi(k, b)>
-     * (utilities/symmetry.hpp:770); composing the canonical rotations of k and of
+     * (utilities/symmetry.hpp); composing the canonical rotations of k and of
      * ks_to_k(js, k) makes it the band representation of an element of the LITTLE
      * GROUP of kp_to_ibz(k). Any correct self-energy therefore satisfies
      *
@@ -263,19 +262,18 @@ namespace bdft_tests {
                  "little-group residual: full band block = {:.3e}, C = [1,3) = {:.3e}",
               nit, r.e_corr, r.grot_full, r.grot_win);
       REQUIRE(std::isfinite(r.e_corr));
-      // MEASURED FLOOR (not a gate): a correct Sigma is little-group covariant, but the
-      // diagnostic is limited by the accuracy of the D matrices themselves (numerically
-      // computed overlaps, truncated at nbnd). On LiH-222 that floor is ~1e-3 -- which is
-      // why LiH cannot resolve the Si M8 signal (0.49 vs a 3.3e-4 plain-scGW baseline).
-      // The value is REPORTED here so the vertex run can be compared against it.
+      // Loose bound only: a correct Sigma is little-group covariant, but the diagnostic
+      // is limited by the accuracy of the D matrices themselves (numerically computed
+      // overlaps, truncated at nbnd). On LiH-222 that floor is ~1e-3. The value is
+      // reported so the vertex run can be compared against it.
       REQUIRE(r.grot_full < 1.0);
     }
   }
 
   // ====================================================================================
-  // CONTROL 2: does the VERTEX keep it? Symmetry-CLOSED window (D-leak = 0 measured on
-  // qe_lih222_sym for C = [1,3)), global basis -- no window-leakage, no secondary-basis
-  // conditioning confound. Any growth vs CONTROL 1 is the vertex.
+  // CONTROL 2: does the VERTEX keep it? Symmetry-closed window (no D-matrix leakage on
+  // qe_lih222_sym for C = [1,3)), global basis -- no window leakage, no secondary-basis
+  // conditioning confound. Any growth vs CONTROL 1 is due to the vertex.
   // ====================================================================================
   TEST_CASE("vertex_scdiag_vertex_symmetry", "[methods][vertex][scdiag]") {
     auto &mpi_context = utils::make_unit_test_mpi_context();
@@ -291,21 +289,21 @@ namespace bdft_tests {
                  "running max = {:.3e}",
               nit, r.e_corr, r.grot_full, r.grot_win, r.vtx_grot);
       REQUIRE(std::isfinite(r.e_corr));
-      // BOOTSTRAP GATE. Pi^C is a functional of the SCREENED W; before the update_w
-      // bootstrap it silently used the BARE rung on the first iteration of every run,
-      // which on Si kp444 C = [0,8) put iteration 1 at eps_inf 19.6 against a converged
-      // RPA 5.35 and poisoned the whole trajectory. Zero tolerance.
+      // Pi^C is a functional of the screened W; update_w bootstraps W before the first
+      // Pi^C evaluation, so the bare-rung fallback must never be taken (using the bare
+      // rung grossly overestimates the screening on the first iteration and spoils the
+      // whole trajectory). Zero tolerance.
       REQUIRE(r.bare_rung == 0);
       resid.push_back(r.grot_full);
     }
-    // the vertex must not manufacture a symmetry violation ORDERS above the plain-scGW
-    // floor measured by vertex_scdiag_baseline_symmetry (LiH-222: ~1.6e-3 at niter 1).
+    // the vertex must not produce a symmetry violation orders of magnitude above the
+    // plain-scGW floor of vertex_scdiag_baseline_symmetry (~1e-3 on LiH-222).
     REQUIRE(resid.back() < 1e-1);
   }
 
   // ====================================================================================
-  // CONTROL 3: sym vs nosym e_corr over a LONGER trajectory. The gold check compares
-  // 2 iterations with a 25%-of-shift tolerance; a defect that compounds shows here.
+  // CONTROL 3: sym vs nosym e_corr over a longer trajectory. A defect that compounds
+  // over iterations shows up here even if a 2-iteration comparison misses it.
   // ====================================================================================
   TEST_CASE("vertex_scdiag_trajectory", "[methods][vertex][scdiag]") {
     auto &mpi_context = utils::make_unit_test_mpi_context();
@@ -331,15 +329,12 @@ namespace bdft_tests {
 
 
   // ====================================================================================
-  // LOCAL REPRODUCTION of the Si divergence.
+  // DIELECTRIC STABILITY vs the size of the vertex.
   //
-  // The Si failure has been expensive to study because the only systems that showed it
-  // were cluster-scale. The mechanism (notes/vertex_divergence_diagnosis.md section 2) is
-  // that P^C -- unlike the RPA polarization, which is negative semi-definite on the
-  // imaginary axis -- can push eps = I - Z.Pi through zero, after which
-  // dyson_W_in_place's inverse is meaningless and Sigma explodes on the NEXT iteration.
-  // If that is right, the failure is driven by the SIZE of the vertex, so widening C on
-  // LiH-222 should reproduce it on a laptop.
+  // P^C -- unlike the RPA polarization, which is negative semi-definite on the imaginary
+  // axis -- can push eps = I - Z.Pi through zero, after which dyson_W_in_place's inverse
+  // is meaningless and Sigma explodes on the next iteration. This instability is driven
+  // by the size of the vertex, so widening C on a small system (LiH-222) probes it.
   //
   // Reports, per window and per iteration: e_corr, and (from the update_w log) the
   // dielectric conditioning max_(q,i.nu) ||[I - Z.Pi]^-1||_max. A window that stays
@@ -358,11 +353,10 @@ namespace bdft_tests {
                  "e_corr = {:.12f} {}",
               w.first(), w.last(), w.size(), r.e_corr,
               std::isfinite(r.e_corr) ? "" : "  <-- NOT FINITE");
-      // CHARACTERIZATION, NOT A GATE. The whole point of widening C here is to walk
-      // OUT of the regime where eps = I - Z.Pi stays positive definite, so a window that
-      // blows up is the test doing its job, not a regression. Only the vertex-off case
-      // is gated (it must always be finite and well conditioned); the rest is reported,
-      // and the per-iteration "dielectric conditioning" line above attributes it.
+      // Characterization only: widening C deliberately leaves the regime where
+      // eps = I - Z.Pi stays positive definite, so a window that blows up is expected,
+      // not a regression. Only the vertex-off case is required to be finite; the rest is
+      // reported, with the per-iteration "dielectric conditioning" log line.
       if (w.size() == 0) REQUIRE(std::isfinite(r.e_corr));
     }
   }

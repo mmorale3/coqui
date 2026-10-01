@@ -36,33 +36,30 @@
 #include "methods/mb_state/mb_state.hpp"
 
 /**
- * INCREMENT B (notes/ladder_b_integration_design.md; spec notes/ladder_opt_spec.md
- * "Increment B", Gate B): the DISTRIBUTED (SLATE) solve path of the pair-space ladder.
+ * The DISTRIBUTED (SLATE) solve path of the pair-space ladder.
  *
  * The knob is ladder_solve_grid = g, the number of ranks that cooperate on ONE (s,q,nu)
- * resolvent. g = 1 is the historic per-rank LAPACK path; g > 1 tiles the (D,D) operator
+ * resolvent. g = 1 is the per-rank LAPACK path; g > 1 tiles the (D,D) operator
  * over a g-rank process grid, builds the owned tiles locally (each owner RECOMPUTING its
  * (N_m x nc2) legs rather than communicating them), runs ONE slate_ops::lu_solve per
  * (q,nu) with both RHS families as a single multi-RHS block, and estimates lambda_max by
  * the same 20-step power iteration made distributed.
  *
- * Gates here (measure first, then gate):
- *   B-1  eval_pol_ladder_whalf at g = 2 vs g = 1: max|dP| / max|P| <= 1e-12. This is
- *        Gate B's "fixture ladder observables" comparison; g = 1 vs the pre-B tree is the
- *        bitwise-class statement pinned by the commit-point suites (nothing on the g = 1
- *        path is touched -- the dispatch resolves g and falls through).
- *   B-2  the WHALF GATE cloned at g = 2: ladder_whalf_gate's node_map_resid compares the
- *        half-grid evaluator (SLATE at g = 2) against a FULL-mesh pair_space_ladder
- *        reference (always the per-rank kernel), so it is an independent A/B of the two
- *        solve paths through the production entry point. Bitwise 0 at g = 1.
- *   B-3  lambda_max: the SAME 20-step protocol, distributed. Reported, and gated only at
+ * Checks (the labels tag the corresponding log lines):
+ *   B-1  eval_pol_ladder_whalf at g >= 2 vs g = 1: max|dP| / max|P| <= 1e-12. At g = 1
+ *        the dispatch resolves g and falls through to the unchanged per-rank path.
+ *   B-2  ladder_whalf_gate at g >= 2: its node_map_resid compares the half-grid evaluator
+ *        (SLATE at g) against a FULL-mesh pair_space_ladder reference (always the
+ *        per-rank kernel), so it is an independent comparison of the two solve paths
+ *        through the production entry point. Exactly 0 at g = 1.
+ *   B-3  lambda_max: the SAME 20-step protocol, distributed. Reported, and checked only at
  *        the protocol's own resolution -- the iteration breaks on a 1e-3 RELATIVE change,
  *        so the estimate is a 1e-3-converged number by construction, not a 1e-12 one.
- *   B-4  the Q4-C3b E-family (the second RHS family) at g = 2 vs g = 1, on synthetic MLWF
- *        legs: the multi-RHS block carries [D | E] through ONE factorization.
+ *   B-4  the E-family (the second RHS family, orbital legs) at g >= 2 vs g = 1, on
+ *        synthetic MLWF legs: the multi-RHS block carries [D | E] through ONE factorization.
  *
  * ==========================================================================================
- * HOW TO RUN (Catch2 v2 traps) -- MEASURED, do not "improve" the command
+ * HOW TO RUN (Catch2 v2 caveats)
  * ==========================================================================================
  *
  *     KMP_DUPLICATE_LIB_OK=TRUE OMP_NUM_THREADS=1 \
@@ -94,9 +91,8 @@ namespace bdft_tests {
     const std::string div = "ignore_g0";
     const nda::range window(1, 3);
 
-    // ---- one short qpGW run with the ladder READOUT on (the qpgw_bse recipe, trimmed to
-    // 3 iterations: every gate below is an A/B of two solve paths on ONE state, so a
-    // converged loop buys nothing) --------------------------------------------------
+    // ---- one short qpGW run with the ladder READOUT on (3 iterations: every check below
+    // compares two solve paths on ONE state, so a converged loop is not needed) ---------
     solvers::hf_t hf;
     solvers::gw_t gw(&ft, div, output);
     solvers::scr_coulomb_t scr_eri(&ft, "rpa", div);
@@ -115,7 +111,7 @@ namespace bdft_tests {
     mpi_context->comm.barrier();
 
     // the extra screening step: puts G and W0bar on the SAME state, which is what the
-    // ladder entry points read (the qpgw_bse/c3b recipe)
+    // ladder entry points read
     {
       using math::shm::make_shared_array;
       double mu = update_mu(0.0, *mf, mb_state.sE_ska.value(), ft.beta());
@@ -168,9 +164,9 @@ namespace bdft_tests {
       REQUIRE(scale_P > 0.0);         // non-vacuous: the ladder is not identically zero
       REQUIRE(rel_P <= 1e-12);
 
-      // B-3: the watchdog. The 20-step power iteration breaks on a 1e-3 relative change,
-      // so the estimate is only defined to that resolution -- gate at 1e-2 relative and
-      // REPORT the measured deviation.
+      // B-3: the lambda_max watchdog. The 20-step power iteration breaks on a 1e-3
+      // relative change, so the estimate is only defined to that resolution -- check at
+      // 1e-2 relative and REPORT the deviation.
       double dlam = 0.0, lscale = 0.0;
       for (long j = 0; j < lam1.shape(0); ++j) {
         dlam = std::max(dlam, std::abs(lam1(j) - lam2(j)));
@@ -203,7 +199,7 @@ namespace bdft_tests {
     }
 
     // ====================================================================================
-    // B-2: the WHALF GATE cloned at g = 2 (node_map_resid is the SLATE-vs-per-rank A/B)
+    // B-2: ladder_whalf_gate at each g (node_map_resid compares SLATE vs per-rank)
     // ====================================================================================
     pv->set_ladder_solve(1, 8.0);
     auto d1 = pv->ladder_whalf_gate(mb_state, thc, 2.0);
@@ -220,7 +216,7 @@ namespace bdft_tests {
     }
 
     // ====================================================================================
-    // B-4: the second RHS family (Q4-C3b E legs) through the SAME factorization
+    // B-4: the second RHS family (orbital E legs) through the SAME factorization
     // ====================================================================================
     {
       const long ns = mf->nspin(), nk = mf->nkpts(), nc = window.size();

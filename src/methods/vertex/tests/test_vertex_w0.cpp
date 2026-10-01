@@ -19,37 +19,34 @@
  */
 
 /**
- * STATIC VERTEX (B-S / B-L), increment S2 -- the W0[G] rung infrastructure
- * (notes/static_vertex_implementation_plan.md sections 2.2, 4 "S2", 5).
+ * STATIC VERTEX (B-S / B-L) -- the W0[G] rung infrastructure.
  *
  *   W0(q) = [1 - v P^0_RPA[G]]^{-1} v  at  i.nu = 0  =  Z(q) + dW(q, i.nu = 0)
  *
  * built inside update_w from the SAME-ITERATION RPA polarizability, before any Pi^C is
- * added (decision D2: no iteration lag, no lag cache). This file is the S2 gate:
+ * added (no iteration lag, no lag cache). Tests:
  *
  *  1. vertex_w0_transform_row -- nu0_transform_row reproduces index 0 of
- *     IAFT::tau_to_w_PHsym EXACTLY (the verified static-slice convention of
- *     gf2_t::get_static_W / dW0, thc_gf2.icc:239-247).
- *  2. vertex_w0_selfslice -- GATE (i): on a plain-GW state (P = RPA only) the built W0
- *     equals the i.nu = 0 row of the FULLY SOLVED W(q, i.nu) to machine precision. This
- *     is Eq. selfslice of the theory notes: in B-S the two coincide exactly (in B-L they
- *     do not, because the run's own W then carries P^{C,L}).
- *  3. vertex_w0_head_policies -- GATE (ii): all three vertex_div_treatment values at
+ *     IAFT::tau_to_w_PHsym EXACTLY (the static-slice convention of
+ *     gf2_t::get_static_W / dW0 in thc_gf2.icc).
+ *  2. vertex_w0_selfslice -- (i): on a plain-GW state (P = RPA only) the built W0
+ *     equals the i.nu = 0 row of the FULLY SOLVED W(q, i.nu) to machine precision. In
+ *     B-S the two coincide exactly (in B-L they do not, because the run's own W then
+ *     carries P^{C,L}).
+ *  3. vertex_w0_head_policies -- (ii): all three vertex_div_treatment values at
  *     i.nu = 0. "v1_skip" and "ignore_g0" store the same regularized body (and differ
  *     only in the kernel-side Gamma skip flag); the gygi class adds EXACTLY the analytic
  *     rank-1 head Nk*xi_M*[1 + Re eps^-1_head(i.nu=0)]*chi chi^dag at Gamma and nothing
  *     anywhere else.
  *  4. vertex_w0_update_w_seam -- the production seam: a STATIC-rung vertex gets W0/W0bar
  *     built by update_w automatically, the resulting RPA W is BIT-IDENTICAL to the
- *     vertex-free one (no bootstrap, no Pi^C injection -- plan sections 2.1/2.2), and
- *     nothing is retained across the iteration boundary.
- *  5. vertex_w0_fold -- GATE (iv): W0bar == the replicated t(q) W0(q) t(q)^dag, in the
- *     secondary path (Refinement 2) and in the global-aux reference path (t = identity,
- *     N_m == Np).
+ *     vertex-free one (no bootstrap, no Pi^C injection), and nothing is retained across
+ *     the iteration boundary.
+ *  5. vertex_w0_fold -- (iv): W0bar == the replicated t(q) W0(q) t(q)^dag, in the
+ *     secondary path and in the global-aux reference path (t = identity, N_m == Np).
  *
- * GATE (iii) -- the forced-(P,Q)-split distributed build vs a replicated reference -- is
- * the vertex_w0_row_fold_distributed case of test_vertex_dfold.cpp (per the plan's test
- * table: "vertex_dfold (W0 fold forced-(P,Q)-split case -- S2"), where the (P,Q) grid can
+ * (iii) -- the forced-(P,Q)-split distributed build vs a replicated reference -- is the
+ * vertex_w0_row_fold_distributed case of test_vertex_dfold.cpp, where the (P,Q) grid can
  * be forced independently of the physics.
  */
 
@@ -163,9 +160,9 @@ namespace bdft_tests {
   }
 
   // ====================================================================================
-  // INCREMENT S4: the tau = 0 ROW (plan section 2.4; decision D3 resolved DLR-only).
+  // The tau = 0 ROW (DLR only).
   //
-  // Gate: against an ANALYTIC reference. A pure exponential A(tau) = e^{-E tau} has a
+  // Tested against an ANALYTIC reference. A pure exponential A(tau) = e^{-E tau} has a
   // delta spectral function at E, so it is DLR-representable to eps for |E| < wmax, and
   // its equal-time value is known exactly: A(tau = 0) = 1 (and sum_p c_p for a
   // superposition). Two independent legs:
@@ -197,8 +194,8 @@ namespace bdft_tests {
     // satisfies A_E(beta) = A_E(0) exactly and has a delta spectral function at +-E, so
     // it is DLR-representable to eps for |E| < wmax. (A bare e^{-E tau} is NOT periodic;
     // its bosonic Matsubara representation has a slowly decaying tail that the sparse
-    // bosonic nodes cannot capture, and leg (b) then saturates around 3e-7 while leg (a)
-    // keeps converging -- measured, and the reason this probe is the periodic one.)
+    // bosonic nodes cannot capture, so leg (b) would saturate around 3e-7 while leg (a)
+    // keeps converging.)
     const std::vector<double> Es = {0.5, 1.3, 2.1};
     const std::vector<double> cs = {1.0, 0.6, -0.3};
     auto tau_rel = ft.tau_mesh_b();          // [-1, 1] convention
@@ -271,14 +268,14 @@ namespace bdft_tests {
 
 #ifdef ENABLE_DLR
   // The cases below each stand up their own physical state: one plain scGW iteration on
-  // LiH-222, so mb_state carries a consistent G (the same isolation the refinement2 /
+  // LiH-222, so mb_state carries a consistent G (the same isolation the secondary-basis /
   // conservation / wcache tests use).
 
   // ====================================================================================
-  // 2. GATE (i): plain-GW SELF-SLICE identity (Eq. selfslice)
+  // 2. (i): plain-GW SELF-SLICE identity
   TEST_CASE("vertex_w0_selfslice", "[methods][vertex][w0]") {
     auto& mpi_context = utils::make_unit_test_mpi_context();
-    // wmax = 6.0: the vertex [A-comp] headroom requirement (pi design section 4b)
+    // wmax = 6.0: the frequency headroom the vertex kernels require
     imag_axes_ft::IAFT ft(1000, 6.0, imag_axes_ft::dlr_basis, "low");
     std::string output = "coqui_vertex_w0_selfslice";
 
@@ -311,9 +308,7 @@ namespace bdft_tests {
 
     // ---- the object under test: W0 from that SAME Pi_RPA -----------------------------
     // built on a DYNAMIC-rung vertex on purpose: build_w0 is mode-agnostic infrastructure
-    // (the mode gate is needs_w0() at the update_w seam, exercised separately below), and
-    // the S1 "kernels not implemented" abort of the static modes still stands at the
-    // kernel entry points.
+    // (the mode check is needs_w0() at the update_w seam, exercised separately below).
     solvers::vertex_t vtx(&ft, "2nd_exchange", nda::range(1, 3), mf->nbnd(),
                           "ignore_g0", "global");
     REQUIRE(vtx.active());
@@ -357,7 +352,7 @@ namespace bdft_tests {
   }
 
   // ====================================================================================
-  // 3. GATE (ii): the three q->0 head policies at i.nu = 0
+  // 3. (ii): the three q->0 head policies at i.nu = 0
   TEST_CASE("vertex_w0_head_policies", "[methods][vertex][w0]") {
     auto& mpi_context = utils::make_unit_test_mpi_context();
     imag_axes_ft::IAFT ft(1000, 6.0, imag_axes_ft::dlr_basis, "low");
@@ -412,9 +407,9 @@ namespace bdft_tests {
     //
     // The head H_PQ ~ conj(chi_P) chi_Q is rank-1 and Hermitian by construction, but
     // H_QP == H_PQ only if chi(Gamma) is real up to ONE global phase. Nothing in the code
-    // enforces that -- it is a property of the THC basis at Gamma. Measured here on real
-    // LiH data (2026-07-30) it holds; this gate keeps it that way, because a violation
-    // would silently de-conserve BOTH B-S and B-L with no other symptom.
+    // enforces that -- it is a property of the THC basis at Gamma. A violation would
+    // silently de-conserve BOTH B-S and B-L with no other symptom. The departure is logged
+    // here for information; the enforced invariant is checked on the assembled W0 below.
     {
       const long Np_h = chi.shape(1);
       double d = 0.0, sc = 0.0;
@@ -454,7 +449,7 @@ namespace bdft_tests {
     // Sigma^C non-Hermitian, and in B-L the error compounds through the Dyson equation.
     //
     // Asserted on the ASSEMBLED W0 for EVERY policy -- including gygi, whose head is the one
-    // that used to break it on bases where chi(Gamma) is not real (Si). This is a structural
+    // that can break it on bases where chi(Gamma) is not real (e.g. Si). This is a structural
     // invariant of the rung, not a property of any one system's basis, so it belongs here
     // rather than on the head alone.
     {
@@ -474,18 +469,17 @@ namespace bdft_tests {
                    "[{}] = {:.3e}", tag[i], rel);
         REQUIRE(sc > 0.0);
         // Tolerance is ROUND-OFF, not zero: W0 = [1 - Z P0]^{-1} Z is a numerical solve, so
-        // even the head-free policies land at ~2e-9 here. (That floor is itself the seed
-        // behind B-S's persistent Im(e_corr)/Re(e_corr) ~ 2e-9, which stays put because B-S
-        // does not feed P back into the Dyson equation.) What must NOT happen is the head
-        // ADDING asymmetry on top -- that is a systematic O(1e-2..1) effect, caught here
-        // with orders of magnitude to spare.
+        // even the head-free policies land at ~1e-9. (That floor also seeds the small
+        // Im(e_corr)/Re(e_corr) of B-S, which does not feed P back into the Dyson equation.)
+        // What must NOT happen is the head ADDING asymmetry on top -- a systematic
+        // O(1e-2..1) effect, caught here with orders of magnitude to spare.
         REQUIRE(rel < 1e-7);
       }
     }
 
     // v1_skip and ignore_g0 store the SAME regularized body -- the v1 fallback acts in
     // the kernel (the Gamma cell of the rung transfer is skipped there), not on the
-    // stored array. The only difference is the flag the S3+ kernels read off the handle.
+    // stored array. The only difference is the flag the kernels read off the handle.
     REQUIRE(not head_skip);
     REQUIRE(not head_ig);
     REQUIRE(gskip_skip);
@@ -536,7 +530,7 @@ namespace bdft_tests {
   }
 
   // ====================================================================================
-  // 4. the production update_w seam (plan sections 2.1/2.2/2.3)
+  // 4. the production update_w seam
   TEST_CASE("vertex_w0_update_w_seam", "[methods][vertex][w0]") {
     auto& mpi_context = utils::make_unit_test_mpi_context();
     imag_axes_ft::IAFT ft(1000, 6.0, imag_axes_ft::dlr_basis, "low");
@@ -577,7 +571,7 @@ namespace bdft_tests {
     }
 
     // ---- B: the same update_w with a STATIC-rung vertex attached ---------------------
-    // Mode wiring (plan section 2.1): no bootstrap (a physical static rung exists from
+    // Mode wiring: no bootstrap (a physical static rung exists from
     // iteration 1 by construction), no Pi^C injection (B-S has P = RPA), no W-bar cache
     // and no dW retention. So the screened interaction must come out BIT-IDENTICAL and
     // the only new state is W0 / W0bar.
@@ -589,12 +583,12 @@ namespace bdft_tests {
     REQUIRE(not vstat.has_w0());
     scr_eri.set_vertex(&vstat);
     REQUIRE(scr_eri.has_active_vertex());
-    // static/linear: the dW-retention exception and the W-bar cache are RETIRED
+    // static/linear rungs need neither dW retention nor the W-bar cache
     REQUIRE(not scr_eri.needs_dw_retention());
 
     scr_eri.update_w(mb_state, thc, -1);
     REQUIRE(vstat.has_w0());
-    REQUIRE(not vstat.has_cached_w());          // the W-bar cache stays retired
+    REQUIRE(not vstat.has_cached_w());          // no W-bar cache for a static rung
     {
       auto const& dW = mb_state.dW_qtPQ.value();
       nda::array<ComplexType, 4> dW_new(nqpts_ibz, nt_half, Np, Np);
@@ -635,8 +629,8 @@ namespace bdft_tests {
     vstat.reset_w0();
     REQUIRE(not vstat.has_w0());
 
-    // a DYNAMIC-rung vertex must NOT build W0 at all (zero new arithmetic on the
-    // Formulation-B path).
+    // a DYNAMIC-rung vertex must NOT build W0 at all (zero extra arithmetic on the
+    // dynamic-rung path).
     solvers::vertex_t vdyn(&ft, "2nd_exchange", nda::range(1, 3), mf->nbnd(),
                            "ignore_g0", "global");
     REQUIRE(not vdyn.needs_w0());
@@ -646,7 +640,7 @@ namespace bdft_tests {
   }
 
   // ====================================================================================
-  // 5. GATE (iv): W0bar == the replicated t(q) W0(q) t(q)^dag
+  // 5. (iv): W0bar == the replicated t(q) W0(q) t(q)^dag
   TEST_CASE("vertex_w0_fold", "[methods][vertex][w0]") {
     auto& mpi_context = utils::make_unit_test_mpi_context();
     imag_axes_ft::IAFT ft(1000, 6.0, imag_axes_ft::dlr_basis, "low");
@@ -693,7 +687,7 @@ namespace bdft_tests {
       REQUIRE(worst == 0.0);
     }
 
-    // ---- SECONDARY path (Refinement 2): W0bar = t W0 t^dag ---------------------------
+    // ---- SECONDARY path: W0bar = t W0 t^dag -------------------------------------------
     {
       solvers::vertex_t vtx(&ft, "2nd_exchange", nda::range(1, 3), mf->nbnd(),
                             "gygi", "secondary", 32, 1e-8);

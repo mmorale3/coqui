@@ -1,59 +1,51 @@
 /**
- * P2.1 / eq:pibardynfact -- gate for the FACTORIZED equal-time dynamic-rung polarization
- * (vertex_pi::pi_dyn_factorized).
+ * Test of the FACTORIZED equal-time dynamic-rung polarization (vertex_pi::pi_dyn_factorized).
  *
- * WHAT IS BEING PROVED. B-L's response middle factor needs only
+ * B-L's response middle factor needs only
  *
- *     pi^dyn(q) = (1/beta) sum_nu Pi^{C,dyn}(q, i nu) = Pi^{C,dyn}(q, tau = 0),
+ *     pi^dyn(q) = (1/beta) sum_nu Pi^{C,dyn}(q, i nu) = Pi^{C,dyn}(q, tau = 0).
  *
- * and the production route obtained it by running the FULL dynamic-rung Pi^C kernel over
- * all nw_b frequencies -- twisted pairs, DLR pole algebra and all -- and then keeping only
- * the tau = 0 row. That slot measured 98.9 % of B-L's vertex time
- * (notes/vertex_optimization_plan.md P2.1). Theory eq:pibardynfact says the external
- * frequency sum closes the (12) and (34) G-pairs and leaves ONE bosonic pairing of two
- * ordinary bubbles against W -- no pole algebra at all (open item O7: "nothing in section
- * BL needs pole algebra").
+ * The kernel route obtains it by running the FULL dynamic-rung Pi^C kernel over all nw_b
+ * frequencies -- twisted pairs, DLR pole algebra and all -- and then keeping only the
+ * tau = 0 row. The external frequency sum, however, closes the (12) and (34) G-pairs and
+ * leaves ONE bosonic pairing of two ordinary bubbles against W -- no pole algebra at all.
  *
- * This file makes the switch-over a PROVABLE REFACTOR rather than a physics change: the new
- * primitive is compared against R0-contracted output of the existing, separately-pinned
+ * This file shows that the factorized primitive is a pure refactor rather than a physics
+ * change: it is compared against R0-contracted output of the separately-tested
  * kernel (pinned by dense_cross_check / pin_rpa_bubble in test_vertex_pi.cpp) on IDENTICAL
  * inputs. The two implementations route indices completely differently -- (12)/(34) at the
  * rung frequency versus (14)/(23) at the external frequency -- so agreement is a real
  * cross-check and not a tautology.
  *
- * The routing itself is pinned to machine precision independently, on a cyclic Matsubara
- * model where the identity is pure algebra: notes/pins/pin_pibardynfact.py reports
- * rel 1.5e-15 at three transfers and REJECTS all five plausible mis-readings (swapped
- * bubbles, either bubble transposed, the (14)/(23) grouping, bubbles at q instead of qx)
- * at O(1). What this file adds is that the C++ implementation -- packing, prefactor,
- * external fold, trev/PQ handling -- realizes that pinned routing.
+ * On a cyclic Matsubara model the routing identity is pure algebra: it holds to machine
+ * precision, and every plausible mis-reading (swapped bubbles, either bubble transposed,
+ * the (14)/(23) grouping, bubbles at q instead of qx) fails at O(1). This file checks that
+ * the C++ implementation -- packing, prefactor, external fold, trev/PQ handling -- realizes
+ * that routing.
  *
  * SECTIONS
- *  - static_rung            the POLE-FREE gate: a frequency-independent rung, so neither
+ *  - static_rung            the POLE-FREE check: a frequency-independent rung, so neither
  *                           side touches the aux pole basis. Any disagreement here is
  *                           packing/prefactor/fold, isolated from every pole question.
  *  - static_rung_nonhermitian  the same with a rung carrying NO pair symmetry. A Hermitian
  *                           or symmetric rung makes several distinct transpose readings
- *                           coincide; this is the case that separates them, and it is the
- *                           O7 risk class.
- *  - dynamic_rung           the real refactor gate: the reference runs phase 2's
+ *                           coincide; this is the case that separates them.
+ *  - dynamic_rung           the main check: the reference runs the kernel's phase-2
  *                           twisted-pair pole algebra; the new primitive does not.
  *  - dynamic_rung_nonhermitian  both at once.
  *  - rung_linearity         pi^dyn is linear in the rung => (Z, Wdyn) must equal
  *                           (Z, none) + (0, Wdyn). Pins the Wl = Z + Wdyn assembly.
  *  - rank_split             the (tuple x q_ext) partials sum to the serial result.
  *  - floor_tracks_dlr_eps   the residual ~1e-10 above is a REPRESENTABILITY floor, not a
- *                           routing bug: it must fall with the basis tolerance. Measured
- *                           ~30*eps at this grid.
- *  - production_grid_attribution  the same at LiH-222's grid parameters (beta = 1000,
- *                           wmax = 6), where the floor is ~2000*eps and the production
- *                           check-mode gate reads 3.6e-3. Attributes it: NOT the pole
- *                           algebra (excess factor 0.80), and splits each route's own
- *                           convergence error. See the conclusions block in that section --
- *                           it carries a retraction and the honest accuracy trade-off.
- *  - no_pole_basis          the primitive leaves the pole machinery UNINITIALIZED, i.e. the
- *                           removal of B-L's only contact with the conditioning defect is
- *                           structural and not merely incidental.
+ *                           routing bug: it must fall with the basis tolerance (~30*eps
+ *                           at this grid).
+ *  - production_grid_attribution  the same at production-like grid parameters (beta = 1000,
+ *                           wmax = 6), where the floor is ~2000*eps. Shows that the
+ *                           deviation is NOT the pole algebra, and splits each route's own
+ *                           convergence error (see the conclusions block in that section).
+ *  - no_pole_basis          the primitive leaves the pole machinery UNINITIALIZED, i.e. B-L's
+ *                           independence from the pole-fit conditioning is structural and
+ *                           not merely incidental.
  */
 
 #include <cmath>
@@ -223,7 +215,7 @@ namespace bdft_tests {
     REQUIRE(R0.shape(0) == nw_b);
 
     // ---- the reference: the existing kernel on the frequency mesh, then the tau = 0 row.
-    // This is EXACTLY what vertex_t.cpp does today (pi_c_accumulate_w followed by tau0_of).
+    // This is the kernel route of vertex_t.cpp (pi_c_accumulate_w followed by tau0_of).
     auto reference = [&](nda::array<cplx, 3> const& Zc,
                         nda::array<cplx, 4> const* Wd) {
       iaft_tools tools(ft);                    // fresh: the reference may build poles
@@ -242,7 +234,7 @@ namespace bdft_tests {
       return out;
     };
 
-    // ---- the new primitive
+    // ---- the factorized primitive
     auto factorized = [&](nda::array<cplx, 3> const& Zc,
                           nda::array<cplx, 4> const* Wd,
                           long rank = 0, long nproc = 1) {
@@ -270,10 +262,9 @@ namespace bdft_tests {
     // side, b34(i nu_x) wbar b12(i nu_x) on the other -- each evaluated through the same
     // tau = 0 transform row. So the agreement floor is the bosonic REPRESENTABILITY of the
     // two integrands on the sparse grid (ft eps = 1e-11 here), not machine epsilon. Every
-    // mis-reading the routing pin rejects is O(1), so this separates them by >= 8 orders.
-    // MEASURED on this toy (2026-07-30): 2.2e-10 / 1.4e-10 (static, Hermitian / no pair
-    // symmetry) and 2.9e-10 / 1.9e-10 (dynamic), i.e. absolute deviations of ~1e-12 on
-    // objects of size ~4e-3. tol is set ~30x above the worst measurement.
+    // routing mis-reading is O(1), so this separates them by >= 8 orders. On this toy the
+    // relative deviations are a few 1e-10 for all four rung variants (absolute ~1e-12 on
+    // objects of size ~4e-3); tol leaves ~30x headroom.
     const double tol = 1e-8;
 
     SECTION("static_rung") {
@@ -313,7 +304,7 @@ namespace bdft_tests {
     }
 
     SECTION("dynamic_rung") {
-      // THE REFACTOR GATE. The reference runs the twisted-pair DLR pole algebra over all
+      // The main check. The reference runs the twisted-pair DLR pole algebra over all
       // nw_b frequencies and throws away everything but tau = 0; the new primitive never
       // enters that algebra.
       auto Wd = mdl.Wdyn(iaft_tools(ft));
@@ -393,7 +384,7 @@ namespace bdft_tests {
     }
 
     SECTION("floor_tracks_dlr_eps") {
-      // WHY THIS SECTION EXISTS. Every gate above lands at ~1e-10, not at machine epsilon,
+      // Every check above lands at ~1e-10, not at machine epsilon,
       // and the claim is that this is the bosonic REPRESENTABILITY of two different
       // integrands on the sparse grid. That claim is load-bearing: it is what makes the
       // residual difference benign, and vertex_t's "check"-mode abort message asks the
@@ -401,9 +392,8 @@ namespace bdft_tests {
       // rather than asserting it in prose. A routing bug is eps-INDEPENDENT; a
       // representability floor tracks eps. Measure the scaling.
       //
-      // This also CALIBRATES the production numbers: physics runs use prec = "low"
-      // (eps = 1e-6), where the floor is correspondingly ~1e-5 of pi^dyn -- which is what
-      // shows up as a ~3e-5 relative movement of B-L's vertex shift on LiH-222.
+      // This also calibrates production runs: at prec = "low" (eps = 1e-6) the floor is
+      // correspondingly ~1e-5 of pi^dyn.
       // Uses the NO-pair-symmetry rung so the scan is run on the discriminating case.
       auto dev_at = [&](double eps) {
         imag_axes_ft::IAFT f(beta, wmax, imag_axes_ft::dlr_basis, eps);
@@ -444,11 +434,10 @@ namespace bdft_tests {
     }
 
     SECTION("production_grid_attribution") {
-      // WHY. On LiH-222 -- beta = 1000, wmax = 6, prec = "low" (eps = 1e-6) -- the
-      // production check-mode gate measured |factorized - kernel| / |kernel| = 3.6e-3 on
-      // pi^dyn. That is 120x above the ~30*eps floor the beta = 20 scan above shows, so
-      // "it's representability" does not explain it, and vertex_t's own abort message
-      // forbids raising a tolerance without deciding WHICH route is at fault. Decide it.
+      // On a production-like grid -- beta = 1000, wmax = 6, prec = "low" (eps = 1e-6) --
+      // |factorized - kernel| / |kernel| on pi^dyn is ~1e-3, far above the ~30*eps floor
+      // the beta = 20 scan above shows, and vertex_t's check-mode abort message asks which
+      // route is at fault. This section decides it.
       //
       // THE DISCRIMINATOR is the STATIC rung at the SAME grid. With a frequency-independent
       // rung the reference route is phase 1 only, and phase 1 is pole-free (phase 2 is
@@ -456,8 +445,8 @@ namespace bdft_tests {
       //   static deviation  = the floor SHARED by the two routings (two different exact
       //                       Matsubara sums, each read through the same tau = 0 row)
       //   dynamic deviation = that floor PLUS whatever the kernel's twisted-pair pole
-      //                       algebra adds -- the map whose worst-case residue
-      //                       amplification this grid reports as ~1e7.
+      //                       algebra adds -- a map whose worst-case residue
+      //                       amplification on this grid is ~1e7.
       // dynamic >> static at one grid therefore attributes the excess to the route being
       // REMOVED, not to the primitive being added.
       const double bta = 1000.0, wmx = 6.0;
@@ -511,7 +500,7 @@ namespace bdft_tests {
               s6, s9, s12);
 
       // ---- WHICH ROUTE IS THE MORE ACCURATE ONE -------------------------------------------
-      // The eps = 1e-12 pair agree to ~5e-9, so they share a common limit and either can
+      // The eps = 1e-12 pair agree to ~1e-8, so they share a common limit and either can
       // serve as the converged reference. Measuring EACH route's own drift from that limit
       // splits the disagreement above and settles which one carries it -- something no
       // route-vs-route comparison can do.
@@ -523,33 +512,21 @@ namespace bdft_tests {
       app_log(1, "pibardynfact production_grid_attribution: own error vs the eps = 1e-12 "
                  "limit -- factorized {:.3e} (1e-6) / {:.3e} (1e-9); kernel {:.3e} (1e-6) / "
                  "{:.3e} (1e-9)", ef6, ef9, ek6, ek9);
-      // ---- MEASURED 2026-07-30 (beta = 1000, wmax = 6, static rung) -----------------------
-      //   route-vs-route          eps = 1e-6  2.04e-3   1e-9  3.96e-5   1e-12  4.64e-9
-      //   own error vs 1e-12      factorized  2.21e-3         4.08e-5
-      //                           kernel      1.07e-3         1.97e-5
-      //   pole excess factor (dynamic / static route-vs-route) = 0.80
-      //
-      // THREE CONCLUSIONS, all evidence-based:
+      // ---- EXPECTED BEHAVIOR on this grid ------------------------------------------------
       //
       // 1. The disagreement is a REPRESENTABILITY FLOOR, not a routing bug: it falls by
       //    ~5 orders as eps tightens by 6, and both routes converge to one common value.
       //    Its prefactor grows with beta*wmax (~30*eps at beta*wmax = 160, ~2000*eps at
-      //    6000), which is why the beta = 20 toy showed 2.5e-5 and LiH-222 shows ~2e-3.
+      //    6000).
       //
-      // 2. RETRACTION of the natural first guess. "The kernel's pole fit -- worst-case
-      //    residue amplification ~1e6-1e7 on this grid -- must be what LiH's 3.6e-3 is made
-      //    of" is WRONG. The excess factor is 0.80: the dynamic comparison is if anything
-      //    slightly BETTER than the pole-free one. The twisted-pair pole algebra contributes
-      //    essentially nothing here.
+      // 2. The kernel's pole fit is NOT the source, despite its large worst-case residue
+      //    amplification on this grid: the dynamic-rung comparison is no worse than the
+      //    pole-free one, so the twisted-pair pole algebra contributes essentially nothing.
       //
-      // 3. THE HONEST TRADE-OFF. The factorized route carries about TWICE the tau = 0
-      //    discretization error of the kernel route at a given DLR tolerance (2.2e-3 vs
-      //    1.1e-3 at eps = 1e-6). Both scale linearly in eps. So eq:pibardynfact buys ~300x
-      //    on the dominant stage at the price of a factor ~2 in this quantity's grid error --
-      //    and the pre-existing consequence, which is what actually matters, is that at
-      //    prec = "low" pi^dyn is only good to ~1e-3 BY EITHER ROUTE. If B-L needs better,
-      //    the lever is prec, not the route. Physics impact on LiH-222 is measured
-      //    separately in test_vertex_static_e2e: the vertex shift moves ~3e-5 relative.
+      // 3. TRADE-OFF. The factorized route carries about TWICE the tau = 0 discretization
+      //    error of the kernel route at a given DLR tolerance; both scale linearly in eps.
+      //    At prec = "low" pi^dyn is good to ~1e-3 BY EITHER ROUTE; if B-L needs better,
+      //    the lever is prec, not the route.
       REQUIRE(std::isfinite(s6));
       REQUIRE(std::isfinite(d6));
       REQUIRE(std::isfinite(ef6));
@@ -561,9 +538,8 @@ namespace bdft_tests {
       REQUIRE(s6 / s12 > 1e3);
       // at a converged basis the two routings agree to the level the beta = 20 scan reaches
       REQUIRE(s12 < 1e-7);
-      // each route's own convergence, and the factor-2 trade-off. If the factorized route
-      // ever drifts to >10x the kernel's error, conclusion 3 has changed and the DEFAULT
-      // route needs revisiting -- that is what this assertion guards.
+      // each route's own convergence, and the factor-~2 trade-off of point 3: the
+      // factorized route's error must stay within 10x the kernel's.
       REQUIRE(ef6 < 1e-2);
       REQUIRE(ek6 < 1e-2);
       REQUIRE(ef9 < 1e-3);
@@ -573,10 +549,9 @@ namespace bdft_tests {
     }
 
     SECTION("no_pole_basis") {
-      // O7's structural claim, made mechanical: the factorized primitive must never
-      // initialize the auxiliary DLR pole basis. That is what removes B-L's only contact
-      // with the parent project's open pole-conditioning defect (amplification 5.52e+06),
-      // so it deserves an assertion rather than a comment.
+      // The factorized primitive must never initialize the auxiliary DLR pole basis. That
+      // keeps B-L independent of the pole fit's conditioning (residue amplification of
+      // order 1e6-1e7), so it is asserted rather than assumed.
       auto Wd = mdl.Wdyn(iaft_tools(ft));
       iaft_tools tools(ft);
       REQUIRE(tools.poles_ready == false);

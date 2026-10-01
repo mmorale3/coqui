@@ -19,16 +19,16 @@
  */
 
 /**
- * Tests for the ISDF-Vertex Pi^C kernel (Phase 1d), see notes/pi_c_kernel_design.md.
+ * Tests for the ISDF-Vertex Pi^C kernel.
  *
- *  - residue_calibration: pins the Matsubara residue algebra of the dense reference
+ *  - residue_calibration: checks the Matsubara residue algebra of the dense reference
  *    against explicit truncated sums (self-calibration of the arbiter).
- *  - pin_rpa_bubble: reproduces the code's RPA tau-Hadamard bubble (rpa_pi.icc:305-336
- *    formula) through the Pi^C frequency machinery -- pins the code-Pi sign/index/mirror
- *    mapping chain of the design doc (section 2).
- *  - dense_cross_check: brute-force orbital/pole-space evaluation of the verified Eq. 13
- *    (prefactor -1) with analytic bosonic rung sums and an explicit fermionic frequency
- *    window, vs the THC kernel. The arbiter test.
+ *  - pin_rpa_bubble: reproduces the code's RPA tau-Hadamard bubble (the rpa_pi.icc
+ *    formula) through the Pi^C frequency machinery -- fixes the sign / index / beta-tau
+ *    mirror mapping between the Pi^C conventions and the RPA Pi of the code.
+ *  - dense_cross_check: brute-force orbital/pole-space evaluation of the orbital Pi^C
+ *    expression (prefactor -1) with analytic bosonic rung sums and an explicit fermionic
+ *    frequency window, vs the THC kernel. The arbiter test.
  *  - structure: chi(beta-tau) = chi^T(tau) on the kernel output; hermiticity reported.
  *  - lih_smoke: one 2-iteration THC-scGW run on LiH-222 (nosym) with the vertex active:
  *    finite results, stable W-Dyson, vertex visibly changes e_corr.
@@ -329,7 +329,7 @@ namespace bdft_tests {
         }
       }
 
-      // (a) the code's tau-Hadamard bubble (rpa_pi.icc:305-336 with conj(Gtilde)=Gtilde^T)
+      // (a) the code's tau-Hadamard bubble (as in rpa_pi.icc, with conj(Gtilde)=Gtilde^T)
       nda::array<cplx, 4> Pi_code(nt_half, nk, Np, Np);
       Pi_code() = cplx(0.0);
       for (long it = 0; it < nt_half; ++it)
@@ -342,8 +342,8 @@ namespace bdft_tests {
                     std::conj(Gt_kPQ(ikmq, it, P, Q)) * Gt_kPQ(k, nt - it - 1, P, Q);
           }
 
-      // (b) the same object through the Pi^C pairing primitive (design doc section 2/4):
-      //     Pi_notes(inu) = +(2/Nk)(1/beta) sum_{k,w} Gt(k+q, w+nu)_PQ Gt(k, w)_QP
+      // (b) the same object through the Pi^C pairing primitive:
+      //     Pi(inu) = +(2/Nk)(1/beta) sum_{k,w} Gt(k+q, w+nu)_PQ Gt(k, w)_QP
       //                   = -(2/Nk) sum_k [Twt_bb . prod](m),
       //     prod(s)_PQ = Gt(k+q, s)_PQ * Gt(k, beta-s)_QP,
       //     then w_to_tau and the beta-tau mirror.
@@ -563,18 +563,15 @@ namespace bdft_tests {
     }
 
     SECTION("static_rung_W0") {
-      // INCREMENT S4 (notes/static_vertex_implementation_plan.md section 2.4).
+      // B-S/B-L's polarization object is Pi^{C,0}: the same kernel with the rung matrix
+      // Z -> W0bar and no dynamic rung. The kernel supports this exactly -- Wdyn_qwPQ is
+      // a pointer and the dynamic phase returns immediately when it is null -- so the
+      // static rung is a call-site choice, not a new contraction.
       //
-      // B-S/B-L's polarization object is Pi^{C,0}: the SAME kernel with the rung matrix
-      // Z -> W0bar and NO dynamic rung. The kernel already supports this exactly --
-      // Wdyn_qwPQ is a pointer and phase 2 returns immediately when it is null -- so the
-      // static rung is a call-site change, not a new contraction.
-      //
-      // Pin (the S3 pattern): the static path (Wdyn = nullptr) must agree with the FULL
-      // kernel run at an explicitly ZERO dynamic rung and the same core. That composes
-      // with the dense_cross_check arbiter above -- which pins the kernel's algebra
-      // against a brute-force orbital/pole-space evaluation of Eq. 13 -- to carry that
-      // arbiter's authority onto the static-rung case, without a second dense reference.
+      // Check: the static path (Wdyn = nullptr) must agree with the full kernel run at an
+      // explicitly zero dynamic rung and the same core. Combined with dense_cross_check
+      // above (which validates the kernel against a brute-force orbital/pole-space
+      // evaluation), this validates the static-rung case without a second dense reference.
       nda::array<cplx, 3> W0_qPQ(nk, Np, Np);
       for (long iq = 0; iq < nk; ++iq) {
         nda::array<cplx, 2> A(Np, Np);
@@ -615,7 +612,7 @@ namespace bdft_tests {
       REQUIRE(den > 1e-10);
       REQUIRE(num <= 1e-14 * den);
 
-      // the tau = 0 row of the S4 primitive, applied to Pi^{C,0}: finite, and equal to the
+      // the tau = 0 transform row, applied to Pi^{C,0}: finite, and equal to the
       // bosonic w -> tau transform evaluated at tau = 0 (the object Delta w consumes).
       auto Rt0 = solvers::vertex_w0_detail::tau0_transform_row(ft);
       REQUIRE(Rt0.shape(0) == nw_b);
@@ -634,13 +631,13 @@ namespace bdft_tests {
     }
 
     SECTION("wannier_gauge") {
-      // KERNEL-LEVEL gauge oracle (notes/wannier_projector_theory.md section 6.2):
-      // the Pi^C output is an aux x aux object (no orbital indices survive). Under a
-      // Wannier re-mixing U -> U V (V an M x M unitary, M == Nb here so range(P) is the
-      // whole window), the kernel INPUTS transform as Xbar -> Xbar V, Gbar -> V^dag G V.
-      // Pi^C depends on range(P) ONLY => Pi_wannier(V) must EQUAL Pi_window bitwise-close
-      // for every unitary V. This replicates the production vertex_t Wannier threading
-      // (build_Xbar / downfold_G feeding the same kernel with C = [0, M)) but at O(seconds).
+      // Kernel-level gauge test: the Pi^C output is an aux x aux object (no orbital
+      // indices survive). Under a Wannier re-mixing U -> U V (V an M x M unitary, M == Nb
+      // here so range(P) is the whole window), the kernel inputs transform as
+      // Xbar -> Xbar V, Gbar -> V^dag G V. Pi^C depends on range(P) only => Pi_wannier(V)
+      // must equal Pi_window to rounding for every unitary V. This replicates the vertex_t
+      // Wannier data flow (build_Xbar / downfold_G feeding the same kernel with
+      // C = [0, M)) at a fraction of the cost.
       const long M = Nb;                       // full-window rotation (range(P) invariant)
       auto run_gauge = [&](nda::array<cplx, 2> const& V, nda::array<cplx, 4>& Pi_out) {
         // Xbar(is,ik,P,a) = sum_{j in C} X(is,ik,P, C.first()+j) V(j,a)     (Np x M)
@@ -687,7 +684,7 @@ namespace bdft_tests {
         return std::make_pair(num, den);
       };
       REQUIRE(std::isfinite(nda::sum(nda::abs(Pi_ref))));
-      // (a) real orthogonal V: real-U sector -- must be exact (degenerate-class).
+      // (a) real orthogonal V.
       {
         rng_t rr(31);
         auto Vc = unitary(M, rr);
@@ -724,7 +721,8 @@ namespace bdft_tests {
                 num, den, num / den);
         REQUIRE(num / den < 1e-10);
       }
-      // (c) GENUINE off-diagonal COMPLEX unitary V -- the sharp check (the bug).
+      // (c) genuine off-diagonal complex unitary V -- the sharpest check (catches any
+      //     conj/transpose misplacement).
       {
         rng_t rr(53);
         auto Vc = unitary(M, rr);
@@ -737,13 +735,12 @@ namespace bdft_tests {
     }
 
     SECTION("static_rung_wannier_gauge") {
-      // T-2 of notes/wannier_static_vertex_plan.md (section 3): Pi^{C,0} -- B-S's
-      // response ingredient and B-L's Dyson polarization P^{C,L} -- depends on
-      // range(P) ONLY, exactly like the dynamic Pi^C: it is aux-emitted with every
-      // orbital slot contracted against the projected collocation, and the rung
+      // Pi^{C,0} -- B-S's response ingredient and B-L's Dyson polarization P^{C,L} --
+      // depends on range(P) only, exactly like the dynamic Pi^C: it is aux-emitted with
+      // every orbital slot contracted against the projected collocation, and the rung
       // (here the static W0bar) is an orbital-blind aux matrix that the gauge never
-      // touches. Same oracle as "wannier_gauge", rung Z -> W0bar, NO dynamic rung
-      // (the production static call path: Wdyn = nullptr).
+      // touches. Same test as "wannier_gauge", rung Z -> W0bar, no dynamic rung
+      // (the static call path: Wdyn = nullptr).
       nda::array<cplx, 3> W0_qPQ(nk, Np, Np);
       for (long iq = 0; iq < nk; ++iq) {
         nda::array<cplx, 2> A(Np, Np);
@@ -847,9 +844,9 @@ namespace bdft_tests {
       // Pi_MN(q, beta-tau) to Pi_NM(-q, tau) and involve the physical symmetries of W
       // (W(-q) = W^T(q)); the deliberately asymmetric random toy (independent random
       // X(k), h(k), Z(q), M(q)) does NOT possess them, so same-q mirror/hermiticity
-      // deviations below are expected and are reported for the record only. Value
-      // correctness is pinned by dense_cross_check/pin_rpa_bubble; the physical-system
-      // PH storage convention mirrors rpa_pi (design doc section 2, rule 3).
+      // deviations below are expected and are only reported. Value correctness is
+      // checked by dense_cross_check/pin_rpa_bubble; the physical-system PH storage
+      // convention mirrors rpa_pi.
       double scale = 0, d_mirrorT = 0, d_mirror = 0, d_herm = 0;
       long n_bad = 0;
       for (long it = 0; it < nt; ++it)
@@ -879,9 +876,9 @@ namespace bdft_tests {
     // wmax: the vertex's dynamic-rung intermediates (twisted-pair x wbar~ triple products)
     // carry spectral rates up to ~3x the physical scale (~1.2 for LiH nbnd=16), so the
     // basis needs ~3-4x headroom -- the same [A-comp] requirement as the double
-    // convolution (iaft_dconv.hpp). wmax = 1.2 (the plain-GW choice) is NOT sufficient
+    // convolution (iaft_dconv.hpp). wmax = 1.2 (the plain-GW choice) is not sufficient
     // here and produces uncontrolled cancellation loss; the GW parts are insensitive
-    // (test_thc_gw passes with wmax = 12 as well).
+    // to the larger wmax.
     imag_axes_ft::IAFT ft(1000, 6.0, imag_axes_ft::dlr_basis, "low");
     std::string output = "coqui_vertex_smoke";
 
@@ -930,7 +927,7 @@ namespace bdft_tests {
                             with_vertex ? policy : "ignore_g0");
       if (vtx.enabled()) {
         // Pi-cut isolation: attach the vertex to the screened-interaction solver only.
-        // (Production runs both cuts -- Phi-derivability; MBPT_drivers enforces that.
+        // (Production runs use both cuts -- Phi-derivability; MBPT_drivers enforces that.
         // This unit test isolates Pi^C so its outcome does not depend on the Sigma^C
         // kernel, which has its own test target.)
         scr_eri.set_vertex(&vtx);
@@ -943,17 +940,17 @@ namespace bdft_tests {
       double pi_max = -1.0, pi_max_gygi = -1.0;
       if (with_vertex) {
         // With an active vertex the scf driver keeps dW alive across iterations
-        // (scf_driver.cpp W-lifetime exception), so iteration 2 above already ran the
-        // dynamic rung. Additionally rebuild W from the final G and drive the
-        // dynamic-rung Pi^C path directly at production scale (beta = 1000, DLR "low").
+        // (see scf_driver.cpp), so iteration 2 above already ran the dynamic rung.
+        // Additionally rebuild W from the final G and drive the dynamic-rung Pi^C path
+        // directly at a realistic scale (beta = 1000, DLR "low").
         scr_eri.update_w(mb_state, thc, -1);
         REQUIRE(mb_state.dW_qtPQ.has_value());
         pi_max = eval_pi_max(vtx, mb_state);
         app_log(1, "vertex_pi_lih_smoke [{}]: dynamic-rung Pi^C max|.| = {}", policy, pi_max);
         REQUIRE(pi_max > 0.0);
-        // bounded magnitude is the q->0 regression guard (the historic uncontrolled
-        // run reached ~7e15 -- root-caused to wmax headroom, notes/pi_c_kernel_design 4b;
-        // the Gamma cell itself is regular, notes/q0_head_treatment.md section 1)
+        // bounded magnitude guards against q->0 / insufficient-wmax blow-ups (an
+        // undersized wmax produces values many orders of magnitude larger; the Gamma
+        // cell itself is regular)
         REQUIRE(pi_max < 1e6);
         if (also_gygi) {
           REQUIRE(mb_state.eps_inv_head.has_value());

@@ -1,24 +1,23 @@
 /**
- * scGW-tilde Tier 1.5, increment T15-b (notes/tier15_ward_legs_plan.md sections 5-6): the
- * WIRING of the discrete-Ward leg vertex into the ladder readout, on the qe_lih222 fixture
+ * Wiring of the discrete-Ward leg vertex into the ladder readout, on the qe_lih222 fixture
  * with the production pol-only attachment (vertex_type = "none", pol_vertex = "ladder").
  *
  *  ward_wiring_readout
- *    G-i fixture leg: at scf iteration 1 the stored Sigma is ZERO, so legs = "ward" must
- *    reproduce legs = "bare" BITWISE (loop energies, RPA and +ladder readouts, and the
- *    +DeltaLambda column collapses onto the RPA one). At iteration 2 Sigma != 0: the loop
+ *    At scf iteration 1 the stored Sigma is zero, so legs = "ward" must reproduce
+ *    legs = "bare" (loop energies and RPA readout bitwise, +ladder readout to a few ulp, and
+ *    the +DeltaLambda column collapses onto the RPA one). At iteration 2 Sigma != 0: the loop
  *    stays bitwise (the readout is report-only), the RPA column is bitwise, and the
  *    Lambda legs move the +ladder column and populate a finite +DeltaLambda column.
  *
  *  ward_wiring_gates (vertex_t::ward_legs_gate on the readout instance, C = all 16 bands)
  *    bub_pin      : the pair kernel's bare zero-rung bubble IS the secondary-basis RPA
  *                   bubble (machine class) -- the normalization of Delta P^Lambda;
- *    fit errors   : the aux-grid DLR pole fits of G / Sigma_c (reported; hard gate 1e-2);
- *    G-g fixture  : the vertex-traced pair propagator at Gamma, bare O(1) vs Lambda --
+ *    fit errors   : the aux-grid DLR pole fits of G / Sigma_c (reported; asserted < 1e-2);
+ *    Ward check   : the vertex-traced pair propagator at Gamma, bare O(1) vs Lambda --
  *                   fit class at the full window (asserted < 1e-2 of bare, logged);
  *    pole-vs-tau  : the pole route's representation error on real data (logged);
  *    Hermiticity  : the (M,N) asymmetry before the projection (logged).
- *    A second run at C = [0, 4) reports the window-truncated G-g meter (no assertion).
+ *    A second run at C = [0, 4) reports the window-truncated Ward check (no assertion).
  */
 
 #undef NDEBUG
@@ -90,7 +89,7 @@ namespace bdft_tests {
       return std::make_tuple(e_hf, e_corr, er, el, ed);
     };
 
-    // ---- G-i fixture leg: iteration 1 sees Sigma = 0 => ward == bare BITWISE ------------
+    // ---- iteration 1 sees Sigma = 0 => ward == bare -----------------------------------------
     auto [h0, c0, r0, l0, d0] = run("bare", 1);
     auto [h1, c1, r1, l1, d1] = run("ward", 1);
     app_log(1, "ward_wiring_readout iter 1: bare e_corr {} eps RPA {} +ladder {} ; ward e_corr "
@@ -98,13 +97,11 @@ namespace bdft_tests {
     REQUIRE(h1 == h0);
     REQUIRE(c1 == c0);
     REQUIRE(r1 == r0);
-    // Sigma = 0 => Delta chi0 = 0 exactly, so the two readouts are the same arithmetic. They are NOT
-    // bitwise reproducible across two scf_loop runs in one process, though: the eps readout wobbles
-    // at the ulp level run to run on the pre-merge tree already (ba23dbf, OMP_NUM_THREADS=1, 2 ranks,
-    // measured 2026-09-24: eps RPA 1.753605413982423 / ...4253 / ...4253 and +ladder ...5243 / ...526
-    // / ...5267 over three runs; source not identified, upstream of the readout since e_corr is
-    // stable to 17 digits). Under ctest load the bitwise form caught that wobble (2 ulp). A few ulp
-    // is the gate; a routing defect would show at the size of the ladder correction (~2e-8 here).
+    // Sigma = 0 => Delta chi0 = 0 exactly, so the two readouts are the same arithmetic. The +ladder
+    // readout is nevertheless not bitwise reproducible across two scf_loop runs in one process (it
+    // varies at the ulp level from run to run, upstream of the readout; e_corr is stable to 17
+    // digits), so a few ulp is the tolerance. A routing defect would show at the size of the ladder
+    // correction (~2e-8 here).
     REQUIRE(std::abs(l1 - l0) <= 8.0 * std::numeric_limits<double>::epsilon() * std::abs(l0));
     REQUIRE(d0 == -1.0);          // the bare run reports no +DeltaLambda column
     REQUIRE(d1 == r1);            // the Lambda column collapses onto RPA (adds exact zeros)
@@ -164,7 +161,7 @@ namespace bdft_tests {
       return g;
     };
 
-    // full band window: no truncation, so the G-g meter is pure fit class
+    // full band window: no truncation, so the Ward check is pure fit class
     auto g = gate_at(nda::range(0, mf->nbnd()), 2);
     app_log(1, "ward_wiring_gates [C = all {} bands]: bub_pin {:.3e}; fit_err G {:.3e} Sigma "
                "{:.3e} (rr {:.3g} / {:.3g}); Gamma-trace bare/Lambda nu0 {:.3e}/{:.3e}, nu1 "
@@ -175,16 +172,16 @@ namespace bdft_tests {
             g.gamma_bare[2], g.gamma_lam[2], g.pole_vs_tau, g.asym_ladder, g.asym_dlam,
             g.dlam_max, g.ladder_max);
     REQUIRE(g.bub_pin >= 0.0);
-    REQUIRE(g.bub_pin < 1e-7);                        // the zero-rung normalization pin (7.5e-9 measured: the PH-sym transform floor)
+    REQUIRE(g.bub_pin < 1e-7);                        // the zero-rung normalization pin (limited by the PH-sym transform floor)
     REQUIRE(g.fit_err_G < 1e-2);
     REQUIRE(g.fit_err_S < 1e-2);
-    REQUIRE(g.gamma_bare[1] > 0.0);                   // the bare bubble violates C1 at O(1)
+    REQUIRE(g.gamma_bare[1] > 0.0);                   // the bare bubble violates the q = 0 Ward identity at O(1)
     REQUIRE(g.gamma_lam[1] < 1e-2 * g.gamma_bare[1]); // Lambda restores it to fit class
     REQUIRE(g.gamma_lam[2] < 1e-2 * g.gamma_bare[2]);
     REQUIRE(g.dlam_max > 0.0);
     REQUIRE(std::isfinite(g.ladder_max));
 
-    // a proper window: the G-g meter now reports the window truncation's C1 violation
+    // a proper window: the Ward check now reports the violation caused by the window truncation
     auto gw4 = gate_at(nda::range(0, 4), 2);
     app_log(1, "ward_wiring_gates [C = [0,4) of {}]: bub_pin {:.3e}; Gamma-trace bare/Lambda "
                "nu1 {:.3e}/{:.3e} (ratio {:.3e}); pole-vs-tau {:.3e}; |dlam| {:.3e}",
@@ -192,9 +189,9 @@ namespace bdft_tests {
             gw4.gamma_lam[1] / gw4.gamma_bare[1], gw4.pole_vs_tau, gw4.dlam_max);
     REQUIRE(gw4.bub_pin < 1e-7);
 
-    // the state after ONE iteration (the first GW Sigma and the G it produced -- NOT the
-    // Sigma = 0 start: that is the update_w-time readout leg above, which is bitwise). The
-    // second, independent (G, Sigma) pair for the fixture G-g and the pins.
+    // the state after ONE iteration (the first GW Sigma and the G it produced -- not the
+    // Sigma = 0 start covered by the readout test above): a second, independent (G, Sigma)
+    // pair for the Ward check and the pins.
     auto g1 = gate_at(nda::range(0, mf->nbnd()), 1);
     app_log(1, "ward_wiring_gates [C = all, after 1 iteration]: bub_pin {:.3e}; fit_err G "
                "{:.3e}; pole-vs-tau {:.3e}; Gamma-trace bare/Lambda nu1 {:.3e}/{:.3e}; |dlam| {:.3e}",

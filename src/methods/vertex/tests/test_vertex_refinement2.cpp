@@ -19,8 +19,9 @@
  */
 
 /**
- * ISDF-Vertex Refinement 2: secondary ISDF basis with the Option-A downfold
- * (notes/refinement2_optionA.md; theoryB.pdf Sec. 11).
+ * ISDF-Vertex: the secondary ISDF basis. The rung is downfolded to the secondary
+ * basis, Wbar = t W t^dag, with the transfer t fitted so that B t ~= C, where B / C are
+ * the C-window pair matrices in the secondary / primary ISDF bases.
  *
  *  - vertex_refinement2_toy: transfer-algebra unit checks on a synthetic THC model
  *    (independently-coded pair matrices B/C, truncated-SVD t, fold/upfold):
@@ -33,7 +34,7 @@
  *    reduced rank.
  *  - vertex_refinement2_lih: LiH-222 (nosym), C = [1,3). One restricted-range ISDF
  *    point selection (max = 32 = the pair rank nc^2 nk); nested rank scan
- *    N_m in {8, 16, 24, 32}: eta(q, nu) table (Eq. 40), monotone decreasing and
+ *    N_m in {8, 16, 24, 32}: eta(q, nu) table, monotone decreasing and
  *    small at full rank. Kernel-level secondary-vs-global agreement at N_m = 32 on
  *    the physical (G, W) state; no-leak; conservation identity in the secondary path
  *    under ignore_g0 AND gygi (the head-augmented W^(Gamma) downfolds through t).
@@ -87,8 +88,8 @@ namespace bdft_tests {
   namespace r2 {
 
     // ------------- transfer algebra, INDEPENDENTLY coded (guards vertex_t.cpp) -------
-    // Pair rows at transfer q in the kernels' pinned in/out rule (pi design section 2
-    // rule 1): I = ((is*nk + ik)*nc + o)*nc + i,
+    // Pair rows at transfer q in the kernels' in/out index convention:
+    // I = ((is*nk + ik)*nc + o)*nc + i,
     //   A(I, u) = X(is, k - q, u, orb0 + i) * conj(X(is, k, u, orb0 + o)).
     inline nda::array<cplx, 2> pair_matrix(nda::array<cplx, 4> const& X_skua, long orb0,
                                            long nc, nda::array<long, 2> const& kmq,
@@ -159,7 +160,7 @@ namespace bdft_tests {
       return out;
     }
 
-    // eta(q, .) of theoryB Eq. 40 for one core A: ||(Bt)A(Bt)^dag - CAC^dag||_F/||.||_F
+    // downfold error eta(q, .) for one core A: ||(Bt)A(Bt)^dag - CAC^dag||_F / ||CAC^dag||_F
     template<typename AArr>
     double eta(nda::array<cplx, 2> const& B, nda::array<cplx, 2> const& C,
                nda::array<cplx, 2> const& t, AArr const& A) {
@@ -190,7 +191,7 @@ namespace bdft_tests {
       return std::sqrt(num) / std::max(std::sqrt(den), 1e-300);
     }
 
-    // ------------- conservation pairings (conservation notes section 1.6/1.8) --------
+    // ------------- conservation pairings ----------------------------------------------
     // S_SigmaG: the conserving SAME-INDEX pairing sum_ab Sig_ab G_ab.
     template<typename SArr, typename GArr>
     cplx trace_sigma_G(iaft_tools const& tools, SArr const& Sig, GArr const& G) {
@@ -452,7 +453,7 @@ namespace bdft_tests {
       t_q.push_back(std::move(t));
     }
 
-    // ---- no-leak identity (Eq. 39) at full AND reduced rank: pure algebra -------------
+    // ---- no-leak identity at full AND reduced rank: pure algebra ----------------------
     for (long Nm : {Nm_full, long(6)}) {
       nda::array<cplx, 4> Xb_r(r2::ns, r2::nk, Nm, nc);
       Xb_r = Xb(r_all, r_all, nda::range(0, Nm), r_all);
@@ -495,8 +496,8 @@ namespace bdft_tests {
     nda::array<cplx, 5> G_CC(nt, r2::ns, r2::nk, nc, nc);
     G_CC = G(r_all, r_all, r_all, r2::Cw(), r2::Cw());
 
-    // G~ = P_C G P_C for the GLOBAL Pi reference (the exact all-C cut, conservation
-    // notes section 1.2 -- the object the secondary path computes by construction)
+    // G~ = P_C G P_C for the GLOBAL Pi reference (the exact all-C cut -- the object the
+    // secondary path computes by construction)
     nda::array<cplx, 5> Gproj(nt, r2::ns, r2::nk, r2::nbnd, r2::nbnd);
     Gproj() = cplx(0.0);
     Gproj(r_all, r_all, r_all, r2::Cw(), r2::Cw()) = G_CC;
@@ -617,7 +618,8 @@ namespace bdft_tests {
     SUCCEED("vertex_refinement2_lih skipped: build has ENABLE_DLR=OFF.");
 #else
     auto& mpi_context = utils::make_unit_test_mpi_context();
-    // wmax = 6.0: the vertex [A-comp] headroom requirement (pi design section 4b)
+    // wmax = 6.0: the headroom the vertex needs so that products of tau-objects (pair and
+    // triple products) stay within the IAFT basis span
     imag_axes_ft::IAFT ft(1000, 6.0, imag_axes_ft::dlr_basis, "low");
     std::string output = "coqui_vertex_r2";
 
@@ -630,7 +632,7 @@ namespace bdft_tests {
 
     // ---------------- state: one plain scGW iteration + RPA-W rebuild ------------------
     // (the identity/agreement checks are algebraic in (G, W): any consistent pair is
-    // valid; same isolation choice as the conservation test)
+    // valid; same setup as test_vertex_conservation)
     solvers::hf_t hf;
     solvers::gw_t gw(&ft, "ignore_g0", output);
     solvers::scr_coulomb_t scr_eri(&ft, "rpa", "ignore_g0");
@@ -839,7 +841,7 @@ namespace bdft_tests {
       REQUIRE(scc > 1e-12);
       // NmB is the selection's returned count = the NUMERICAL rank of the C pair
       // metric, so the downfold is complete to the svd_tol class there regardless of
-      // the counting rank 32 (measured: rel = 4.7e-9 at N_m = 24)
+      // the counting rank 32; the 1e-4 bound leaves wide headroom above that class
       REQUIRE(dmax < 1e-4 * scc);
     }
 
@@ -872,7 +874,7 @@ namespace bdft_tests {
                  "max|Pi_upfold - Pi_glob| = {}, rel = {}",
               NmB, smax, dmax, dmax / std::max(smax, 1e-300));
       REQUIRE(smax > 1e-12);
-      // see the Sigma^C note above (measured: rel = 8.9e-10 at N_m = 24)
+      // same bound and reasoning as for Sigma^C above
       REQUIRE(dmax < 1e-4 * smax);
     }
 
@@ -1029,7 +1031,6 @@ namespace bdft_tests {
     // strict externals: identical functional; at the TOP secondary rank (the selection
     // returns the NUMERICAL rank of the C pair metric, <= the counting rank 32) global
     // and secondary must agree to the downfold/kernel accuracy class.
-    // Measured (N_m = 24 returned): |Delta e_hf| = 2e-15, |Delta e_corr| = 2.2e-15.
     if (nm_32 < 32)
       app_log(1, "r2 e2e: [NOTE] selection returned N_m = {} < 32 (numerical pair-metric "
                  "rank); the downfold is complete there.", nm_32);

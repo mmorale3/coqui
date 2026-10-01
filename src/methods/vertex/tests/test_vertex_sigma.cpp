@@ -19,18 +19,17 @@
  */
 
 /**
- * Tests for the ISDF-Vertex Sigma^C kernel (Phase 1c), see
- * notes/sigma_c_kernel_design.md.
+ * Tests for the ISDF-Vertex Sigma^C kernel.
  *
  *  - fused_vs_batched: the fused orbital-window channel-algebra kernel vs a
  *    reference that loops double_boson_conv over orbital tuples x (a,b) with
  *    independently-coded orbital W blocks. Same algebra => near machine
- *    precision. Pins the entire family fusion, index routing and both
+ *    precision. Covers the entire family fusion, index routing and both
  *    instantaneous paths.
  *  - dense_matsubara_arbiter: single (k,qx,qy) combo, dynamic-only W, dense
- *    truncated double Matsubara sums of the verified orbital spec (prefactor
+ *    truncated double Matsubara sums of the orbital expression (prefactor
  *    +1) with analytic pole evaluations, vs the batched-primitive reference
- *    (which fused_vs_batched ties to the fused kernel). Pins the +1 sign, the
+ *    (which fused_vs_batched ties to the fused kernel). Checks the +1 sign, the
  *    THC dictionary and the 1/beta^2 normalization.
  *  - instantaneous_reduction: both rungs instantaneous (W_dyn = 0) vs an
  *    independently-coded bare second-order-exchange tau-contraction
@@ -209,7 +208,7 @@ namespace bdft_tests {
       }
     };
 
-    // ---- independently-coded orbital W blocks (the section-1 dictionary) --------------
+    // ---- independently-coded orbital W blocks (THC -> orbital dictionary) -------------
     // Wx block: (b, p1, p3, p3') from core A_PQ at (k, k-qx | k+qy, k-qx+qy)
     inline nda::array<cplx, 4> orb_Wx(model_t const& m, nda::array<cplx, 2> const& A,
                                       long ik, long ikmqx, long ikpqy, long ikmqxpqy) {
@@ -329,9 +328,9 @@ namespace bdft_tests {
     const cplx I(0.0, 1.0);
 
     SECTION("fused_vs_batched") {
-      // both q->0 policies are pinned (notes/q0_head_treatment.md section 3):
-      //   skip = true  : v1_skip -- the toy's Gamma (q-index 0) dropped on both rungs
-      //   skip = false : v2 -- all q included (references updated consistently)
+      // both q->0 policies are tested:
+      //   skip = true  : "v1_skip" -- the toy's Gamma (q-index 0) dropped on both rungs
+      //   skip = false : default -- all q included (reference built consistently)
       auto Wt = mdl.Wdyn_tau(ft);
       for (bool skip : {true, false}) {
         nda::array<cplx, 5> Sig(nt, ns, nk, nbnd, nbnd);
@@ -369,8 +368,9 @@ namespace bdft_tests {
     SECTION("dense_matsubara_arbiter") {
       // single combo, dynamic-only W. Reference = batched primitive (tied to the fused
       // kernel at machine precision by fused_vs_batched); arbiter = dense truncated
-      // double Matsubara sum of the +1-prefactor orbital spec with analytic pole
-      // evaluations of all five factors.
+      // double Matsubara sum of the +1-prefactor orbital expression with analytic pole
+      // evaluations of all five factors. The 1e-4 tolerance covers the truncation of the
+      // dense sums at |m| <= 512 (W_dyn decays only as 1/nu^2).
       const long ik = 1, iqx = 1, iqy = 2;
       const long ikmqx = mdl.kmq(iqx, ik);
       const long ikpqy = mdl.kmq(mdl.qmin(iqy), ik);
@@ -469,7 +469,7 @@ namespace bdft_tests {
       // with C(beta-tau) by INDEX reflection on the symmetric tau mesh.
       nda::array<cplx, 4> Wt0(nk, nt, Np, Np);
       Wt0() = cplx(0.0);
-      const bool skip = false;   // v2 policy: all q included (v1_skip is pinned above)
+      const bool skip = false;   // default policy: all q included (v1_skip is tested above)
       nda::array<cplx, 5> Sig(nt, ns, nk, nbnd, nbnd);
       solvers::vertex_detail::eval_sigma_C_g3w2_nosym(ft, comm, C(), G, mdl.X_skPa, Wt0,
                                                       mdl.Z_qPQ, mdl.kmq, mdl.qmin,
@@ -521,19 +521,16 @@ namespace bdft_tests {
     }
 
     SECTION("static_rung_W0") {
-      // INCREMENT S3 (notes/static_vertex_implementation_plan.md; O1 closed by
-      // verification/static_vertex_routing_report.md section 2.1).
-      //
-      // B-S's explicit term is the DOUBLY-INSTANTANEOUS reduction of this same kernel
+      // B-S's explicit term is the doubly-instantaneous reduction of this same kernel
       // with both rungs equal to the static screen W0bar:
       //     Sigma^{C,x}(tau) = -(1/Nk^2) sum_{qx,qy} cx_b cy_a B(tau) C(beta-tau) D(tau)
-      // (eq:sigmaxtau). Two independent pins:
-      //   (1) against the SAME independently-coded tau-contraction reference used by
+      // Two independent checks:
+      //   (1) against the same independently-coded tau-contraction reference used by
       //       "instantaneous_reduction" above, with the rung Z -> W0bar;
-      //   (2) static_rung == the dynamic path run with dW == 0 and Z = W0bar. This is
-      //       the structural pin that families I-V and S1/S2 really are identically
-      //       zero for a frequency-independent rung -- i.e. that skipping them (and all
-      //       the pole machinery with them) is EXACT, not an approximation.
+      //   (2) static_rung == the dynamic path run with dW == 0 and Z = W0bar. This
+      //       verifies that the dynamic-rung families (I-V and S1/S2) vanish identically
+      //       for a frequency-independent rung, i.e. that skipping them (and all the
+      //       pole machinery with them) is exact, not an approximation.
       //
       // W0bar is a deterministic Hermitian core, independent of mdl.Z_qPQ, so this is
       // not an accidental re-run of the Z-only test.
@@ -624,19 +621,19 @@ namespace bdft_tests {
     }
 
     SECTION("wannier_gauge") {
-      // KERNEL-LEVEL complex-U gauge oracle (notes/wannier_projector_theory.md section 6.2).
-      // Sigma^C in the C-block is gauge-COVARIANT: the Sigma kernel emits Sbar(a,b) with the
-      // external band leg a on the NON-conjugated collocation leg and b on the CONJUGATED
+      // Kernel-level complex-U gauge test.
+      // Sigma^C in the C-block is gauge-covariant: the Sigma kernel emits Sbar(a,b) with the
+      // external band leg a on the non-conjugated collocation leg and b on the conjugated
       // leg, so under a Wannier re-mixing U -> U V (Xbar -> Xbar V, Gbar -> V^dag G V) it
       // transforms as Sbar(V)_ab = sum_cd V_ca Sbar(id)_cd conj(V_db) = (V^T Sbar V*)_ab
-      // (proven exactly by the earlier diagnostic; ratio[a,b] = e^{i(phi_a-phi_b)} for a
-      // diagonal V). The gauge-INVARIANT band-space injection is therefore the CHAIN-RULE
-      // sandwich Sigma^C_ij = sum_ab conj(U_ia) Sbar_ab U_jb = (conj(U) Sbar U^T)_ij
-      // (== vertex_wannier_detail::upfold_Sigma), NOT the naive operator sandwich
-      // U Sbar U^dag (which leaks at O(1e-4) for a COMPLEX off-diagonal V; this was the
-      // bug). This replicates the production vertex_t threading (build_Xbar / downfold_G
-      // feeding the SAME kernel with C = [0,M)) at O(seconds). M == ncw => range(P) is the
-      // whole window, so every unitary V leaves Sigma^C invariant to kernel accuracy.
+      // (for a diagonal V the element-wise ratio is e^{i(phi_a-phi_b)}). The gauge-invariant
+      // band-space injection is therefore the chain-rule sandwich
+      // Sigma^C_ij = sum_ab conj(U_ia) Sbar_ab U_jb = (conj(U) Sbar U^T)_ij
+      // (== vertex_wannier_detail::upfold_Sigma), not the naive operator sandwich
+      // U Sbar U^dag, which is not invariant for a complex off-diagonal V. This replicates
+      // the vertex_t data flow (build_Xbar / downfold_G feeding the same kernel with
+      // C = [0,M)) at a fraction of the cost. M == ncw => range(P) is the whole window, so
+      // every unitary V leaves Sigma^C invariant to kernel accuracy.
       auto Wt = mdl.Wdyn_tau(ft);
       const long M = ncw;
       auto run_gauge = [&](nda::array<cplx, 2> const& V, nda::array<cplx, 5>& Sig_block) {
@@ -664,15 +661,10 @@ namespace bdft_tests {
                                                         /*skip*/ false, Sig_block);
       };
       nda::array<cplx, 5> Sbar_ref, Sbar_V;
-      // Back-rotate Sbar_V by the PRODUCTION injection and compare to Sbar_ref (the
-      // injected object for V = id). The Sigma kernel emits Sbar(a,b) with external a on
-      // the NON-conjugated collocation leg and b on the CONJUGATED leg, so its covariance
-      // is Sbar(V)_ab = e^{i(phi_a - phi_b)} Sbar(id)_ab under a diagonal gauge (the
-      // element-wise ratio equals e^{i(phi_a-phi_b)} exactly -- verified during the debug).
-      // The gauge-invariant band injection is therefore the CHAIN-RULE sandwich
-      // Sigma^C_ij = sum_ab conj(U_ia) Sbar_ab U_jb (= vertex_wannier_detail::upfold_Sigma,
-      // conj(U) Sbar U^T), NOT the operator sandwich U Sbar U^dag. In-window (U -> V) the
-      // invariance check is conj(V) Sbar(V) V^T == Sbar(id):
+      // Back-rotate Sbar_V by the chain-rule injection (conj(U) Sbar U^T, as in
+      // vertex_wannier_detail::upfold_Sigma) and compare to Sbar_ref (the injected object
+      // for V = id). In-window (U -> V) the invariance check is
+      // conj(V) Sbar(V) V^T == Sbar(id):
       auto inject_dev = [&](nda::array<cplx, 5> const& Sbar, nda::array<cplx, 2> const& V) {
         double num = 0, den = 0;
         for (long it = 0; it < nt; ++it)
@@ -722,24 +714,21 @@ namespace bdft_tests {
         REQUIRE(den > 1e-10);
         REQUIRE(num / den < 1e-9);
       };
-      check(Vre, "REAL orthogonal V ");   // real-U sector: exact (degenerate class)
-      check(Vph, "DIAGONAL phase V  ");   // per-orbital phases: the M>=2 diagonal razor
-      check(Vco, "COMPLEX off-diag V");   // genuine complex mixing: the sharp check (the bug)
+      check(Vre, "REAL orthogonal V ");   // real U: both sandwiches coincide
+      check(Vph, "DIAGONAL phase V  ");   // per-orbital phases (needs M >= 2)
+      check(Vco, "COMPLEX off-diag V");   // genuine complex mixing: the sharpest check
     }
 
     SECTION("static_rung_wannier_gauge") {
-      // T-2 of notes/wannier_static_vertex_plan.md (section 3.1): the STATIC (B-S,
-      // rung_mode = 1) and LINEAR (B-L, rung_mode = 2) Sigma paths inherit the dynamic
-      // kernel's gauge covariance Sbar(V) = V^T Sbar(id) conj(V) MECHANICALLY -- the
-      // rung enters as an orbital-blind aux matrix, so its frequency content (the
+      // The static (B-S, rung_mode = 1) and linear (B-L, rung_mode = 2) Sigma paths
+      // inherit the dynamic kernel's gauge covariance Sbar(V) = V^T Sbar(id) conj(V):
+      // the rung enters as an orbital-blind aux matrix, so its frequency content (the
       // static W0bar alone, or W0bar + the dynamic partner of the B-L mixed terms)
-      // cannot enter the covariance. This oracle feeds the SAME production
-      // substitutions (Xbar = X V, Gbar = V^dag G V, C' = [0, M)) to eval_sigma_C_g3w2
-      // at rung_mode 1 and 2 and REQUIREs the chain-rule back-rotation
-      // conj(V) Sbar(V) V^T == Sbar(id) at kernel accuracy -- the same discriminator
-      // that convicted the operator sandwich on the dynamic path, now gating the
-      // static seams. Zero production-code changes are expected to be needed: the
-      // static call sites reuse the (Gbar, Xbar) substitutions verbatim.
+      // cannot enter the covariance. This test feeds the same substitutions
+      // (Xbar = X V, Gbar = V^dag G V, C' = [0, M)) to eval_sigma_C_g3w2 at rung_mode
+      // 1 and 2 and requires the chain-rule back-rotation conj(V) Sbar(V) V^T ==
+      // Sbar(id) at kernel accuracy, as in "wannier_gauge" above. The static call
+      // sites reuse the (Gbar, Xbar) substitutions of the dynamic path.
       nda::array<cplx, 3> W0_qPQ(nk, Np, Np);
       for (long iq = 0; iq < nk; ++iq) {
         nda::array<cplx, 2> A(Np, Np);
@@ -781,7 +770,7 @@ namespace bdft_tests {
             mdl.kmq, mdl.qmin, /*iq_gamma*/ 0, /*skip*/ false, rmode,
             static_cast<nda::array<ComplexType, 4> const*>(nullptr), nullptr, Sig_block);
       };
-      // the three test unitaries (the wannier_gauge set)
+      // identity plus the three test unitaries of "wannier_gauge"
       nda::array<cplx, 2> Vid(M, M), Vre(M, M), Vph(M, M), Vco(M, M);
       {
         Vid() = cplx(0.0);
@@ -842,9 +831,10 @@ namespace bdft_tests {
     SUCCEED("vertex_sigma_lih_smoke skipped: build has ENABLE_DLR=OFF.");
 #else
     auto& mpi_context = utils::make_unit_test_mpi_context();
-    // wmax = 6.0: the vertex kernels' [A-comp] intermediates need ~3x headroom over the
+    // wmax = 6.0: the vertex kernels' [A-comp] intermediates (pointwise products /
+    // shifted composites, see iaft_dconv.hpp) need ~3x headroom over the
     // LiH spectral range (~1.2) once the Gamma cell of the dynamic rung is included
-    // (v2 q->0 policy) -- the pi-design section 4b requirement, applied uniformly.
+    // (default q->0 policy).
     imag_axes_ft::IAFT ft(1000, 6.0, imag_axes_ft::dlr_basis, "low");
     std::string output = "coqui_vertex_sigma_smoke";
 
@@ -876,11 +866,10 @@ namespace bdft_tests {
     REQUIRE(std::isfinite(e_corr));
 
     // isolate Sigma^C on the resulting state: rebuild W, then for each q->0 policy
-    // (notes/q0_head_treatment.md section 3) snapshot Sigma, add Sigma^C, and inspect
-    // the difference -- the v1-skip vs v2 comparison table. The vertex is DETACHED from
-    // scr_eri for this rebuild so the isolated checks run against a pure-RPA screened W
-    // -- they probe MY Sigma^C kernel only, independent of the Pi^C kernel's state
-    // (the in-loop path above already exercised the combined both-cuts flow).
+    // snapshot Sigma, add Sigma^C, and inspect the difference. The vertex is detached
+    // from scr_eri for this rebuild so the isolated checks run against a pure-RPA
+    // screened W -- they probe the Sigma^C kernel only, independent of the Pi^C kernel's
+    // state (the in-loop path above already exercised the combined both-cuts flow).
     scr_eri.set_vertex(nullptr);
     scr_eri.update_w(mb_state, thc, -1);
     REQUIRE(mb_state.dW_qtPQ.has_value());
@@ -918,7 +907,7 @@ namespace bdft_tests {
       REQUIRE(d_herm < 0.5 * scale);
       SigC.emplace_back(std::move(dSig));
     }
-    // policy deltas for the comparison table (finite-size-correction sized, not O(scale))
+    // policy deltas (finite-size-correction sized, not O(scale))
     {
       auto max_abs_diff = [](auto const& A, auto const& B) {
         double d = 0;

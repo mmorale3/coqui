@@ -18,13 +18,14 @@
  * ==========================================================================
  */
 
-// scGW-tilde increment C0, gate C0-a (notes/scgwt_implementation_plan.md): with the
-// scGW-tilde knobs OFF (or present but inert) the scGW loop reproduces the pre-scgwt
-// tree BIT-FOR-BIT. Mirrors test_vertex_noop: the scaffolding guarantees inertness
-// structurally (pol_vertex = "none" or an empty ladder C-window stores knobs and touches
-// nothing; cvv_rspace_tol is stored and unconsumed until C4; div_treatment = "cvv"
-// aborts at parse), and this test asserts it END TO END on LiH-222 by running the
-// identical scGW loop three ways --
+// scGW-tilde (polarization-vertex / ladder) tests on LiH-222.
+//
+// scgwt_noop_knobs_off: with the scGW-tilde knobs OFF (or present but inert) the scGW
+// loop reproduces plain scGW BIT-FOR-BIT. Mirrors test_vertex_noop: inertness is
+// structural (pol_vertex = "none" or an empty ladder C-window stores knobs and touches
+// nothing; cvv_rspace_tol is consumed only under div_treatment = "cvv", which is not
+// used here), and this test asserts it END TO END by running the identical scGW loop
+// three ways --
 //   (a) baseline: no scgwt call at all,
 //   (b) inert ladder, production wiring for vertex_type = "none" (vertex NOT attached),
 //   (c) inert ladder on an enabled-but-empty vertex, attached to BOTH solver seams --
@@ -86,7 +87,7 @@ namespace bdft_tests {
       REQUIRE(v.pol_vertex_enabled());
       REQUIRE(not v.pol_vertex_active());   // empty window => inert, no abort
 
-      // the CVV head scaffold stores its knob
+      // the CVV head stores its knob
       solvers::cvv_head_t cvv(&ft, 3.14e-7);
       REQUIRE(cvv.rspace_tol() == 3.14e-7);
     }
@@ -103,8 +104,8 @@ namespace bdft_tests {
       solvers::vertex_t vtx(&ft, with_empty_vertex ? "2nd_exchange" : "none",
                             nda::range(0, 0), mf->nbnd());
       if (with_inert_ladder) {
-        // enabled-but-EMPTY ladder + a non-default (unconsumed until C4) cvv tolerance:
-        // both must be exact no-ops.
+        // enabled-but-EMPTY ladder + a non-default cvv tolerance (unconsumed without
+        // div_treatment = "cvv"): both must be exact no-ops.
         vtx.set_pol_vertex("ladder", "w0_prev", nda::range(0, 0), -1, 1e-8, -1.0, -1.0, -1.0);
         scr_eri.set_cvv_rspace_tol(3.14e-7);
       }
@@ -147,15 +148,12 @@ namespace bdft_tests {
 #ifndef ENABLE_DLR
     SUCCEED("scgwt_ladder_l1 skipped: build has ENABLE_DLR=OFF.");
 #else
-    // Increment L1 gates (notes/scgwt_implementation_plan.md):
-    //  L1-a  upfold(Pi-bar^0) vs the C-masked GLOBAL-basis Hadamard bubble -- the
-    //        secondary representation error of the pair bubble (eta-class; full-rank
-    //        N_m = nc^2 nk here, so it must sit at the representation floor).
-    //  L1-b  THE BIT-ANCHOR: Pi-bar^0 K-bar Pi-bar^0 vs the implemented static-rung
-    //        Pi^C (pi_c_accumulate_w phase 1 with W0bar), kernel candidates W0bar(q)
-    //        vs <W0bar>_qx, ONE fitted scalar allowed. Whatever (candidate, alpha)
-    //        matches near-bitwise is THE pinned convention for L2. The bars below are
-    //        provisional -- the FIRST RUN's printed numbers are the deliverable.
+    // Pair-space ladder diagnostics (vertex_t::ladder_l1_gates) on a static-rung state:
+    //  l1a  upfold(Pi-bar^0) vs the C-masked GLOBAL-basis Hadamard bubble -- the
+    //       secondary representation error of the pair bubble (eta-class; full-rank
+    //       N_m = nc^2 nk here, so it must sit at the representation floor).
+    //  l1b  the one-rung anchor: Pi-bar^0 K-bar Pi-bar^0 vs the implemented static-rung
+    //       Pi^C (pi_c_accumulate_w phase 1 with W0bar); see the assertion below.
     auto& mpi_context = utils::make_unit_test_mpi_context();
     imag_axes_ft::IAFT ft(1000, 6.0, imag_axes_ft::dlr_basis, "low");
     std::string output = "coqui_scgwt_l1";
@@ -182,11 +180,11 @@ namespace bdft_tests {
     app_log(1, "scgwt_ladder_l1: B-S secondary state e_hf = {}, e_corr = {}", e_hf, e_corr);
 
     auto diag = vtx.ladder_l1_gates(mb_state, thc);
-    // L1-a: the pair-density bubble is correct at the representation floor
-    // (measured 1.9e-05 on this fixture).
+    // l1a: the pair-density bubble is correct at the representation floor (the bound is
+    // loose: on this full-rank fixture eta is orders of magnitude below it).
     REQUIRE(diag.l1a_eta >= 0.0);
     REQUIRE(diag.l1a_eta < 0.05);
-    // L1-b [THE BIT-ANCHOR]: the pair-space one-rung rebuild
+    // l1b [the one-rung anchor]: the pair-space one-rung rebuild
     //   pref sum_{k,k'} b23(k')^T K(k,k')^T b41(k)
     // is an algebraic REARRANGEMENT of pi_c_accumulate_w phase 1's own sums
     // (vertex_ladder.icc header for the derivation), so it must reproduce the
@@ -195,19 +193,19 @@ namespace bdft_tests {
                "= {:.3e} (max one-rung {:.3e}, max ladder {:.3e})",
             diag.l1b_resid, diag.ladder_frac, diag.onerung_max, diag.ladder_max);
     REQUIRE(diag.l1b_resid < 1e-10);
-    // L2 preview: the resummed ladder exists, is finite, and its >= 2-rung content is
-    // a sane fraction (the physics numbers are L2's gates, on real readouts).
+    // the resummed ladder exists, is finite, and its >= 2-rung content is a sane
+    // fraction (its physical effect is checked on the eps_M readout tests).
     REQUIRE(diag.ladder_frac >= 0.0);
     REQUIRE(std::isfinite(diag.ladder_max));
     REQUIRE(diag.ladder_max > 0.0);
 
-    // ---- P4 gates (the compressed/matrix-free ladder; design note section 4b.1) ----
-    //  G-P4a: the R-space kernel at tol_L = 0 is the EXACT WS round trip, so the
-    //         matrix-free j = 1 observable must equal the direct one-rung (== the
-    //         L1-b anchor) at machine precision;
-    //  G-P4b: the converged Neumann ladder must equal the direct resolvent;
-    //  meter: a tol_L = 0.5 kernel genuinely drops shells and its j = 1 error is
-    //         visibly larger (the monotone truncation meter).
+    // ---- the compressed / matrix-free ladder (vertex_t::ladder_p4_gates) -----------
+    //  j1:      the R-space kernel at tol_L = 0 is the EXACT WS round trip, so the
+    //           matrix-free j = 1 observable must equal the direct one-rung (== the
+    //           l1b anchor) at machine precision;
+    //  neumann: the converged Neumann ladder must equal the direct resolvent;
+    //  meter:   a tol_L = 0.5 kernel genuinely drops shells and its j = 1 error is
+    //           visibly larger (the monotone truncation meter).
     auto d4 = vtx.ladder_p4_gates(mb_state, thc);
     app_log(1, "scgwt_ladder_l1: P4 j1 = {:.3e}, neumann = {:.3e} ({} rungs), "
                "trunc meter: dropped = {:.3e}, j1_trunc = {:.3e}",
@@ -218,9 +216,9 @@ namespace bdft_tests {
     REQUIRE(d4.rungs_used >= 1);
     REQUIRE(d4.dropped_frac_test > 0.0);
     REQUIRE(d4.j1_resid_trunc > d4.j1_resid);
-    //  sampled kept-(P,Q) apply (design 4b.1 step (ii)): with ALL pairs kept the
-    //  sampled contractions must sit in the same machine-precision class as the dense
-    //  apply (the T2/A1 gemms become nc-length dots -- FP-accumulation class only);
+    //  sampled kept-(P,Q) apply: with ALL pairs kept the sampled contractions must sit
+    //  in the same machine-precision class as the dense apply (the dense GEMMs become
+    //  nc-length dots -- FP-accumulation differences only);
     //  a tau_PQ = 0.5 list must genuinely drop pairs and its j = 1 error must sit
     //  above the all-kept floor (the monotone pair meter).
     app_log(1, "scgwt_ladder_l1: P4 sampled (P,Q): all-kept j1 = {:.3e}, neumann = "
@@ -235,7 +233,7 @@ namespace bdft_tests {
     REQUIRE(d4.pq_kept_frac_test < 1.0);
     REQUIRE(d4.pq_j1_resid_trunc > d4.pq_all_j1_resid);
 
-    // ---- P3 gate (C.3): node-group scheduling invariance --------------------------
+    // ---- node-group scheduling invariance (vertex_t::ladder_p3_gate) --------------
     // The grouped assembly is disjoint writes + a zeros-elsewhere all_reduce, so
     // every scheduling variant must reproduce the replicated reference BITWISE.
     auto d3 = vtx.ladder_p3_gate(mb_state, thc);
@@ -256,12 +254,12 @@ namespace bdft_tests {
 #ifndef ENABLE_DLR
     SUCCEED("scgwt_ladder_l2_readout skipped: build has ENABLE_DLR=OFF.");
 #else
-    // Increment L2 (stance i): the ladder eps_M READOUT on a pol-vertex-only run
-    // (vertex_type = "none", pol_vertex = "ladder"). Two gates:
+    // The ladder eps_M READOUT on a pol-vertex-only run (vertex_type = "none",
+    // pol_vertex = "ladder"). Two checks:
     //   (1) NO-PERTURBATION: the readout is report-only, so e_hf/e_corr must be
     //       EXACTLY those of the plain scGW run (bitwise -- the loop is untouched).
     //   (2) the readout produced finite eps_M values and the ladder moved eps_M
-    //       (the DIRECTION is gate L2-b's business, on the Si readouts; logged here).
+    //       (the DIRECTION is only logged here, not asserted).
     auto& mpi_context = utils::make_unit_test_mpi_context();
     imag_axes_ft::IAFT ft(1000, 6.0, imag_axes_ft::dlr_basis, "low");
     std::string output = "coqui_scgwt_l2";
@@ -314,8 +312,8 @@ namespace bdft_tests {
 #ifndef ENABLE_DLR
     SUCCEED("scgwt_ladder_ibz skipped: build has ENABLE_DLR=OFF.");
 #else
-    // C.2: the IBZ-symmetry lift of the pair-space ladder's EXTERNAL q axis (the
-    // EXACT path + the L2 readout; the rs kernel stays nosym-guarded). Two gates:
+    // The IBZ-symmetry lift of the pair-space ladder's EXTERNAL q axis (the EXACT path
+    // + the eps_M readout; the R-space kernel is restricted to nosym). Two checks:
     //  (a) THE ANCHOR IDENTITY UNDER SYMMETRY: on qe_lih222_sym the one-rung rebuild
     //      must reproduce pi_c_accumulate_w with the SAME symmetry context threaded
     //      through both -- an algebraic rearrangement with a SHARED leg builder, so
@@ -327,7 +325,7 @@ namespace bdft_tests {
     auto& mpi_context = utils::make_unit_test_mpi_context();
     imag_axes_ft::IAFT ft(1000, 6.0, imag_axes_ft::dlr_basis, "low");
 
-    // ---- (a) the sym anchor gate -----------------------------------------------------
+    // ---- (a) the one-rung anchor under symmetry ---------------------------------------
     {
       std::string output = "coqui_scgwt_ibz_a";
       auto mf = std::make_shared<mf::MF>(mf::default_MF(mpi_context, "qe_lih222_sym"));
@@ -398,8 +396,8 @@ namespace bdft_tests {
     REQUIRE(el_sy > 0.0);
     REQUIRE(std::isfinite(el_sy));
     REQUIRE(el_sy != er_sy);                            // the ladder moved eps_M
-    // cross-variant agreement: representation-floor class (measured 2026-08-12:
-    // RPA 3.3e-5 rel, +ladder 2.9e-5 rel, Delta agreement 4e-3 rel; bars at ~30x)
+    // cross-variant agreement: representation-floor class (bounds ~30x above the
+    // typical sym-vs-nosym deviation of eps_M and of the ladder shift Delta)
     REQUIRE(std::abs(er_sy - er_ns) < 1e-3 * er_ns);
     REQUIRE(std::abs(el_sy - el_ns) < 1e-3 * el_ns);
     REQUIRE(((el_sy - er_sy) > 0.0) == ((el_ns - er_ns) > 0.0));   // same direction

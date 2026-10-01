@@ -19,21 +19,21 @@
  */
 
 /**
- * ISDF-Vertex Refinement 2: W-bar iteration cache (notes/wbar_cache.md).
+ * ISDF-Vertex: the W-bar iteration cache.
  *
  * In the secondary path the vertex caches the DOWNFOLDED dynamic rung
  * Wbar(q, nu) = t(q) [dW folded to the bosonic mesh] t(q)^dag at update_w time
  * (head-augmented under gygi with the SAME-iteration eps_inv_head), so the scf
  * driver can free mb_state.dW_qtPQ unconditionally (plain-GW memory profile);
- * the cache is consumed by the NEXT iteration's eval_Pi_C -- the identical
- * one-iteration lag as the retained-dW behavior it replaces.
+ * the cache is consumed by the NEXT iteration's eval_Pi_C -- the same
+ * one-iteration lag as the retained-dW (legacy) consumption.
  *
  *  - vertex_wcache_e2e: 2-iteration LiH-222 scGW (both cuts), secondary path with
- *    the cache vs the legacy retained-dW semantics (set_w_cache_enabled(false) --
- *    the verbatim pre-cache code path): e_hf/e_corr identical to <= 1e-14
+ *    the cache vs the legacy retained-dW consumption (set_w_cache_enabled(false),
+ *    which folds dW at eval time): e_hf/e_corr identical to <= 1e-14
  *    (bitwise expected: same arithmetic, different scheduling). Memory behavior:
  *    after the loop mb_state.dW_qtPQ is FREED with the cache, RETAINED in legacy
- *    mode and on the global path (unchanged).
+ *    mode and on the global path.
  *  - vertex_wcache_identity: eval_Pi_C on one physical (G, W) LiH state, cached
  *    vs legacy consumption, bitwise; under ignore_g0 AND gygi (the cached
  *    head-augmented Wbar(Gamma) vs the legacy at-consumption augmentation).
@@ -76,7 +76,8 @@ namespace bdft_tests {
     SUCCEED("vertex_wcache_e2e skipped: build has ENABLE_DLR=OFF.");
 #else
     auto& mpi_context = utils::make_unit_test_mpi_context();
-    // wmax = 6.0: the vertex [A-comp] headroom requirement (pi design section 4b)
+    // wmax = 6.0: the headroom the vertex needs so that products of tau-objects (pair and
+    // triple products) stay within the IAFT basis span
     imag_axes_ft::IAFT ft(1000, 6.0, imag_axes_ft::dlr_basis, "low");
     std::string output = "coqui_vertex_wcache_e2e";
 
@@ -137,18 +138,18 @@ namespace bdft_tests {
     REQUIRE(nm_c == nm_leg);
     // MACHINE-IDENTITY: the cached consumption is algebraically identical to the
     // retained-dW consumption (same dW, same eps_inv_head, same transform, same
-    // fold order; the mirror copy commutes with the fold bitwise) -- see the memo.
+    // fold order; the mirror copy commutes with the fold bitwise).
     REQUIRE(std::abs(e_hf_c - e_hf_leg) <= 1e-14 * std::abs(e_hf_leg));
     REQUIRE(std::abs(e_corr_c - e_corr_leg) <= 1e-14);
     // MEMORY BEHAVIOR at the retention site (scf_driver.cpp): with the cache the
     // secondary path frees dW every iteration (plain-GW profile); the legacy switch
-    // and the global path retain it (unchanged).
+    // and the global path retain it.
     REQUIRE(not dw_c);
     REQUIRE(dw_leg);
     REQUIRE(dw_g);
 #else
-    // pre-change recording build: the legacy run above IS the current production
-    // behavior; both modes retain dW.
+    // without VERTEX_WCACHE_API only the retained-dW consumption exists; both modes
+    // retain dW.
     REQUIRE(dw_leg);
     REQUIRE(dw_g);
 #endif
@@ -170,8 +171,8 @@ namespace bdft_tests {
     auto eri = mb_eri_t(thc, thc);
 
     // physical state: one plain scGW iteration, then an RPA-W rebuild so that
-    // mb_state holds a CONSISTENT (G, dW, eps_inv_head) triple (the same isolation
-    // as the refinement2/conservation tests)
+    // mb_state holds a CONSISTENT (G, dW, eps_inv_head) triple (the same setup as
+    // test_vertex_refinement2 / test_vertex_conservation)
     solvers::hf_t hf;
     solvers::gw_t gw(&ft, "ignore_g0", output);
     solvers::scr_coulomb_t scr_eri(&ft, "rpa", "ignore_g0");
@@ -252,9 +253,9 @@ namespace bdft_tests {
       app_log(1, "wcache id [{}]: max|Pi^C(legacy)| = {}, max|cached - legacy| = {} "
                  "(bitwise expected)", div, g[0], g[1]);
       REQUIRE(g[0] > 1e-12);
-      // MACHINE-IDENTITY of the consumption (memo section 2): same arithmetic on the
-      // same data; only the scheduling moved. 1e-14 headroom per the task spec --
-      // the measured value is expected to be exactly 0.
+      // MACHINE-IDENTITY of the consumption: same arithmetic on the same data; only
+      // the scheduling moved. The difference is expected to be exactly 0; the 1e-14
+      // relative bound is headroom only.
       REQUIRE(g[1] <= 1e-14 * g[0]);
 
       // reset_w_cache restores the legacy branch (A reproduced)
@@ -265,7 +266,7 @@ namespace bdft_tests {
     check_policy("ignore_g0");
     // gygi: the cached Wbar(Gamma) carries the head augmentation folded at FILL time
     // with the same-iteration eps_inv_head -- must be bitwise the legacy at-eval
-    // augmentation (q0_head_treatment.md; wbar_cache.md section 2).
+    // augmentation.
     check_policy("gygi");
 
     if (mpi_context->comm.root()) remove((output + ".mbpt.h5").c_str());
