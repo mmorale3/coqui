@@ -1352,8 +1352,12 @@ namespace bdft_tests {
           }
       }
       REQUIRE(rung_sym_err(Bad) > 1e-3);              // it really is illegal
+      // audit D6: eval_sigma_C now ABORTS on an illegal rung unless sigma_allow_nonconserving is set -- the control needs
+      // the old warn-and-continue behaviour, scoped to this block
+      vertex_debug::set("sigma_allow_nonconserving=1");
       const double broke = profile("S3, ILLEGAL Z (CONTROL, must NOT be flat)", 3, Bad,
                                    nullptr);
+      vertex_debug::registry().erase("sigma_allow_nonconserving");
       REQUIRE(broke > 1e-3);
     }
 #endif
