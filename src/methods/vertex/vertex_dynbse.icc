@@ -782,8 +782,18 @@ namespace solvers {
       // overrides for experiments)
       double vlo = opt.vmask_lo, vhi = opt.vmask_hi;
       if (auto vm = vertex_debug::get("dynbse_vmask"); vm.has_value()) {   // vertex_debug: dynbse_vmask = lo,hi  (Ha about mu)
-        vlo = std::atof(vm->c_str());
-        if (const char *cm = std::strchr(vm->c_str(), ',')) vhi = std::atof(cm + 1);
+        // audit E: strict parse (atof turned a typo into 0) and a WARNING that the input mask is overridden
+        const std::string v(*vm);
+        const size_t cm = v.find(',');
+        size_t e1 = 0, e2 = 0;
+        try {
+          vlo = std::stod(v.substr(0, cm), &e1);
+          vhi = (cm == std::string::npos) ? vhi : std::stod(v.substr(cm + 1), &e2);
+        } catch (...) { e1 = std::string::npos; }
+        utils::check(e1 == (cm == std::string::npos ? v.size() : cm) and (cm == std::string::npos or e2 == v.size() - cm - 1),
+                     "pair_space_ladder_dyn: vertex_debug dynbse_vmask = \"{}\" is not \"lo,hi\" (Ha about mu).", v);
+        if (rank == 0)
+          app_log(1, "  [dynbse] WARNING: vertex_debug dynbse_vmask = {} overrides pol_vertex_dyn_vmask ({}, {})", v, opt.vmask_lo, opt.vmask_hi);
       }
       const bool vmasked = (vhi > vlo);
       if (vmasked) db::mask_freq_basis(b, vlo, vhi);
@@ -3043,7 +3053,7 @@ namespace solvers {
     o.gap_mask = 0.0;
     // EXPERIMENT (small-nu spurious mode): COQUI_DYNBSE_UNION=0 runs the cut on the SHARED node set
     // (exact confluent algebra + the twisted R1/R3 tables) instead of the union grid.
-    if (auto u = vertex_debug::get("dynbse_union"); u.has_value()) o.union_nodes = (std::atoi(u->c_str()) != 0);   // vertex_debug: dynbse_union = 0 | 1
+    if (const double u = vertex_debug::number("dynbse_union", -1.0); u >= 0.0) o.union_nodes = (u != 0.0);   // vertex_debug: dynbse_union = 0 | 1 (strict parse)
     o.readout_tol = 1e-6;
     o.q_subset = std::addressof(qsel);
     if (_shared_hook != nullptr and not bubble_only) {   // P3: the Sigma hook armed by arm_shared_sigma_hook rides the main solve
@@ -3460,7 +3470,7 @@ namespace solvers {
     o.schedule = _dyn_schedule; o.unit_cost = std::addressof(_dyn_unit_cost);   // P5
     o.union_nodes = true;
     o.gap_mask = 0.0;
-    if (auto u = vertex_debug::get("dynbse_union"); u.has_value()) o.union_nodes = (std::atoi(u->c_str()) != 0);   // vertex_debug: dynbse_union = 0 | 1
+    if (const double u = vertex_debug::number("dynbse_union", -1.0); u >= 0.0) o.union_nodes = (u != 0.0);   // vertex_debug: dynbse_union = 0 | 1 (strict parse)
     o.readout_tol = 1e-6;
     o.q_subset = std::addressof(qs);
     o.sigma = std::addressof(hook);

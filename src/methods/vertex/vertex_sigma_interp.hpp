@@ -166,15 +166,6 @@ namespace vertex_sigma_interp {
               proj_unitarity_warn_tol);
   }
 
-  /** audit A12: the pre-audit signature (col / outer only) cannot record the configuration the fine run must check --
-   *  refused at run time with the caller change spelled out, rather than writing a dump the consumer would refuse. */
-  template<typename comm_t>
-  inline void dump_sigma_pair_wannier(mf::MF &, projector_t const &, nda::array<cplx, 5> const &, long, nda::array<double, 1> const &,
-                                      double, comm_t &, std::string const &fn, std::string const &, std::string const &) {
-    utils::check(false, "dump_sigma_pair_wannier ({}): called without the full Sigma-vertex configuration (audit A12). The caller "
-                        "(scr_coulomb_t::build_sigma_pair) must pass vertex_sigma_interp::cfg_of(opts, sigma_pair_dynamic()) in place "
-                        "of (col, outer).", fn);
-  }
 
   /** the fine run: dSigma(tau, k_ibz) on the fine window from the coarse dump (replaces the solve). cfg = THIS run's Sigma-vertex
    *  configuration (compared with the dump's; audit A12); met, when given, receives the measured residuals (audit C5). */
@@ -346,16 +337,6 @@ namespace vertex_sigma_interp {
     return out;
   }
 
-  /** audit A12: the pre-audit signature cannot check the dump against this run's configuration -- refused at run time with the
-   *  caller change spelled out (the fine run would otherwise consume a dump of unknown provenance). */
-  template<typename comm_t>
-  inline nda::array<cplx, 5> interpolate_sigma_pair(mf::MF &, projector_t const &, std::string const &file, nda::array<double, 1> const &,
-                                                     double, long, long, comm_t &) {
-    utils::check(false, "interpolate_sigma_pair ({}): called without this run's Sigma-vertex configuration (audit A12), so the dump "
-                        "cannot be checked. The caller (scr_coulomb_t::build_sigma_pair) must pass vertex_sigma_interp::cfg_of(opts, "
-                        "sigma_pair_dynamic()) and an interp_meter, and report the meter's herm_resid as dsig_herm.", file);
-    return nda::array<cplx, 5>();
-  }
 
 } // vertex_sigma_interp
 } // solvers

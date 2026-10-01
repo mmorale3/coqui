@@ -159,7 +159,13 @@ namespace mbpt_vertex_audit {
   template<typename MF_ptr_t>
   inline void carrier_vertex_keys(solvers::vertex_t &carrier, solvers::scr_coulomb_t &scr_eri, MF_ptr_t const& mf,
                                   ptree const& pt, std::string const& driver, std::string const& screen_type) {
-    for (auto const *key : {"vertex_type", "vertex_rung", "vertex_isdf", "vertex_scale", "vertex_ramp_iters",
+    {   // vertex_type = "none" spelled out explicitly is what these drivers run anyway: only a real request aborts
+      auto vt = io::get_value_with_default<std::string>(pt, "vertex_type", "none");
+      io::tolower(vt);
+      utils::check(vt == "none", "{}: vertex_type = \"{}\" is not supported in the evgw/qpgw drivers (they carry only the "
+                   "pol-vertex ladder). Remove it from the input (audit A14).", driver, vt);
+    }
+    for (auto const *key : {"vertex_rung", "vertex_isdf", "vertex_scale", "vertex_ramp_iters",
                             "vertex_pidyn", "vertex_pidyn_tol", "vertex_bl_head_projection", "vertex_bl_static_head",
                             "vertex_bl_w0_head_from_w", "vertex_bl_pidyn_const_rung", "vertex_bl_head_static_all"})
       utils::check(not io::check_child_exists(pt, key),

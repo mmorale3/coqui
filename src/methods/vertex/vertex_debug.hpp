@@ -54,7 +54,7 @@ namespace vertex_debug {
         "dynbse_l0_fz_bench", "dynbse_l0_fz_cfg", "dynbse_l0_pb", "dynbse_refit_loop", "dynbse_ritz", "dynbse_sq_cache",
         "dynbse_tfold", "dynbse_tkeep", "dynbse_union", "dynbse_vmask", "eps_readout_device", "eta_device",
         "inject_device", "interp_cache", "kd_blas_threads", "keep_host_w", "l2_blas_threads", "pi_hooks_device",
-        "rung_rank", "scf_causality_meter", "sigdyn_bases_cache", "sigdyn_blas_threads", "sigdyn_families",
+        "rung_rank", "scf_causality_meter", "sigma_allow_nonconserving", "sigdyn_bases_cache", "sigdyn_blas_threads", "sigdyn_families",
         "sigdyn_finish_device", "sigdyn_gram", "sigdyn_grid_tol", "sigdyn_legs", "sigdyn_route", "sigdyn_sketch",
         "sigdyn_test_nnu", "sigdyn_test_nq", "sigpair_ibz_diag", "sigpair_ibz_dump", "sym_dt", "sym_fold_conv",
         "sym_fold_dt", "sym_trev_notrans", "trev_w_check", "vertex_rdecay", "w0_dyson_device", "wbar_dump",
