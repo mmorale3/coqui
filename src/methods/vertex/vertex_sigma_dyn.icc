@@ -542,6 +542,10 @@ namespace solvers {
       else utils::check(false, "sigma_dyn_accumulate: unknown column \"{}\".", h.col);
       if (yv != nullptr) utils::check(res.has_y and yv->nR == nR, "sigma_dyn_accumulate: the solver did not keep y (col {}).", h.col);
       // ---- A_cst = K_s Gsum + y.cst  (D x nR) ----------------------------------------------------------------
+      // factorize-vertex: the serial section below (K_s Gsum, the leg-W contraction, the U-family gemm, the tau image) on the
+      // rank's threads -- it ran on blas_threads (1); restored before the omp-over-k' legs (vertex_debug sigdyn_blas_threads = 0)
+      static const bool sd_thr = (vertex_debug::number("sigdyn_blas_threads", 1.0) != 0.0);   // vertex_debug: sigdyn_blas_threads
+      if (sd_thr) utils::apply_blas_threads(utils::omp_threads());
       nda::array<cplx, 2> gs(D, nR), Acst(D, nR);
       for (long ik = 0; ik < nk; ++ik)
         for (long p = 0; p < nc2; ++p)
@@ -616,6 +620,7 @@ namespace solvers {
                 for (long r = 0; r < nR; ++r) Fw(n, (ik * nc2 + c * nc + y) * nR + r) = Wv(c, y * nR + r);
           }
         tools.ft->w_to_tau(Fw, Ft, imag_axes_ft::fermion);
+        if (sd_thr) utils::apply_blas_threads(std::max(1l, utils::blas_threads()));
         // the legs per (tau, k'): B(c y, M) = sum_r F_t(c y, r) W(r, M);  H(i, j) = sum_c sum_M D^*(c i, M) B(c j, M)
         // P11: OpenMP over k' -- every k' deposits into its own external k = kpq(iq, k') (a bijection), the inputs are
         // read-only, the scratch is per iteration: no races, bitwise the serial order per k

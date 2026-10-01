@@ -1548,6 +1548,10 @@ namespace solvers {
           y.zero();
           double fe = 0.0;
           const long nR = F.nR;           // the RHS block width of this solve
+          // factorize-vertex: the gemms OUTSIDE the omp regions below (the tau expansion KF . fam, the DLR refit, the constant
+          // part K_d0 . Fsum) on the rank's threads -- they ran on blas_threads (1) (vertex_debug kd_blas_threads = 0 restores)
+          static const bool kd_thr = (vertex_debug::number("kd_blas_threads", 1.0) != 0.0);   // vertex_debug: kd_blas_threads
+          auto bthr = [&](bool on) { if (kd_thr) utils::apply_blas_threads(on ? nthr : std::max(1l, utils::blas_threads())); };
           utils::check(nR == nR_cur and y.nR == nR and Fsum.shape(3) == nR, "pair_space_ladder_dyn: kd block width mismatch.");
           const bool nu0 = (inu_cur == cplx(0.0));
           const bool dbg = (rank == 0 and units_taken == 1);
@@ -1569,12 +1573,14 @@ namespace solvers {
             // O-1: the family goes into the gemm as a reshaped view (before: a 0.3-4.5 GB copy into a fresh array
             // per family per application)
             nda::array<cplx, 2> KFc(nt, np);
+            bthr(true);
             for (long ff = fam; ff < (nu0 ? 2 : fam + 1); ++ff) {
               auto fam2 = nda::reshape(F.fam(ff, nda::ellipsis{}), std::array<long, 2>{np, nk * nc2 * nR});
               for (long i = 0; i < nt; ++i)
                 for (long p = 0; p < np; ++p) KFc(i, p) = cplx((ff == 1 and nu0) ? b.KF2(i, p) : b.KF(i, p));
               nda::blas::gemm(cplx(1.0), KFc, fam2, cplx(1.0), Fs2);
             }
+            bthr(false);
             vertex_ladder_detail::prof_watch kwatch;
             if (opt.dense_rung and rrank > 0) {
               // factorize-vertex: Ys(i) = scale_k sum_r c_r(s_i) K_r Fs(i) for ALL tau nodes: the (i, N) columns are split
@@ -1636,8 +1642,10 @@ namespace solvers {
             if (met) met->t_rung += kwatch.lap();
             auto Ys2 = nda::reshape(Ys, std::array<long, 2>{nt, nk * nc2 * nR});
             Yc2() = Ys2;
+            bthr(true);
             auto c = db::basis_coeffs(b, Yc2);
             const double fef = db::basis_fit_error(b, Yc2, c);
+            bthr(false);
             if (met) met->t_refit += kwatch.lap();
             fe = std::max(fe, fef);
             if (dbg)
@@ -1657,7 +1665,9 @@ namespace solvers {
           if (opt.dense_rung) {
             auto F2 = nda::reshape(Fs3, std::array<long, 2>{D, nR});
             auto O2 = nda::reshape(Os3, std::array<long, 2>{D, nR});
+            bthr(true);
             nda::blas::gemm(-scale_k, Kd0, F2, cplx(0.0), O2);
+            bthr(false);
           } else {
             rung_apply(Wq_0, -scale_k, Fs3, Os3, is, iq);
           }
