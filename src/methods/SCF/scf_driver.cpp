@@ -243,13 +243,13 @@ auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_ax
         mb_solver.corr->evaluate(mb_state, mb_eri.corr_eri->get());
       }
       // deallocate mb_state.dW_qtPQ after this since it's only used in the corr solver and can be very large for GW.
-      // Exception (ISDF-Vertex): with an active vertex on the GLOBAL auxiliary basis, keep
+      // Exception (vertex): with an active dynamic-rung vertex on the GLOBAL auxiliary basis, keep
       // W alive across the iteration boundary so eval_Pi_qdep (which runs BEFORE this
       // iteration's update_w) can evaluate Pi^C with the previous iteration's screened rung
       // (one-iteration lag; converges to the same self-consistent fixed point). With the
-      // SECONDARY basis (Refinement 2) the vertex caches the DOWNFOLDED rung
-      // Wbar = t W t^dag at update_w time instead (vertex_t::cache_w, notes/wbar_cache.md),
-      // so dW is freed unconditionally here -- restoring the plain-GW memory profile.
+      // SECONDARY basis the vertex caches the DOWNFOLDED rung
+      // Wbar = t W t^dag at update_w time instead (vertex_t::cache_w),
+      // so dW is freed here -- the plain-GW memory profile (see needs_dw_retention).
       if (mb_solver.scr_eri == nullptr or not mb_solver.scr_eri->needs_dw_retention())
         mb_state.dW_qtPQ.reset();
       mpi->comm.barrier();
@@ -289,12 +289,12 @@ auto scf_loop(MBState &mb_state, dyson_type &dyson, eri_t &mb_eri, const imag_ax
     mpi->comm.barrier();
     Timer.stop("HERMITIZE");
     Timer.stop("DYSON");
-    // CAUSALITY METER (vertex_perf_plan.md P22, 2026-09-21; the in-loop form of notes/lff/tools/lff_causality.py): a causal G has
+    // CAUSALITY METER: a causal G has
     // -G_ii(tau) >= 0 and a causal Sigma has Sigma_ii(tau) <= 0 on the band diagonal at every (tau, s, k). A too-small
-    // imaginary-axis window leaves a small NON-causal residue that a Dyson loop with semicore states amplifies geometrically
-    // (MgO drift, AlAs / LiF divergence at the 1.5 x bandwidth window). Logged every iteration (level 2), at level 1 when the
+    // imaginary-axis window leaves a small NON-causal residue that a Dyson loop with semicore states can amplify
+    // geometrically (drift or divergence of the scf loop). Logged every iteration (level 2), at level 1 when the
     // residue exceeds 1e-6 or grows by more than 3x per iteration. vertex_debug = "scf_causality_meter=0" disables it.
-    if (vertex_debug::number("scf_causality_meter", 1.0) != 0.0) {   // strict parse: "off" / "false" disable it too (audit)   // vertex_debug: scf_causality_meter = 0 disables it
+    if (vertex_debug::number("scf_causality_meter", 1.0) != 0.0) {   // strict parse: "off" / "false" disable it too   // vertex_debug: scf_causality_meter = 0 disables it
       double gmin = 1e300, smax = -1e300;
       long nviol = 0;
       if (mpi->node_comm.root()) {

@@ -310,32 +310,32 @@ namespace solvers {
     long _eps_inf_fit_npts = 3;
     utils::TimerManager _Timer;
 
-    // optional second-order-exchange vertex correction (ISDF-Vertex, not owned).
+    // optional second-order-exchange vertex correction (not owned).
     // nullptr or an inactive vertex leaves the RPA polarizability untouched.
     vertex_t* _vertex = nullptr;
 
-    // scGW-tilde L2 (pol_vertex = "ladder", READOUT-ONLY -- stance i of the proposal):
-    // a PRIVATE static-rung secondary vertex built from the pol_* knobs of _vertex,
-    // used only to build W0bar + the pair-space ladder for the eps_M report. It is
-    // never attached to the Sigma side and nothing is injected into P (that is
-    // increment L3, gated on ruling R1). shared_ptr: vertex_t is fwd-declared here.
+    // pol_vertex = "ladder": a PRIVATE static-rung secondary vertex (the READOUT instance)
+    // built from the pol_* knobs of _vertex. It builds W0bar + the pair-space ladder for
+    // the eps_M readout and, when enabled, the ladder injection into P and the Sigma
+    // vertex. shared_ptr: vertex_t is fwd-declared here.
     std::shared_ptr<vertex_t> _pol_vtx;
     // lazily construct _pol_vtx from _vertex's pol_* knobs
     void ensure_pol_vertex(THC_ERI auto &thc);
     // replicated (nq, Np, Np) copy of the inu = 0 row of the RPA Pi (PH-sym tau axis
     // contracted with vertex_w0_detail::nu0_transform_row) -- the eps-Dyson input.
-    // Np^2-per-q replicated: readout-scale only (documented memory note).
+    // Np^2-per-q replicated: readout-scale only.
     template<nda::MemoryArrayOfRank<4> Array_t, typename communicator_t>
     nda::array<ComplexType, 3> gather_nu0_row(memory::darray_t<Array_t, communicator_t> &dPi_tqPQ);
-    // LFF-Sigma (Route 1, notes/lff_aux_plan.md 2026-09-19): build mb_state.dWsig_qtPQ / eps_inv_head_sig -- the
+    // Sigma vertex, pol_vertex_sigma = "lff": build mb_state.dWsig_qtPQ / eps_inv_head_sig -- the
     // vertex correction of W seen by Sigma only -- from the interp file's dPi (+ Pi_0) in the frozen secondary frame
     // and THIS iteration's W (update_w tail; t_pgrid / t_bsize = the (t, q, P, Q) layout of the loop's dPi).
     void build_sigma_lff(MBState &mb_state, THC_ERI auto &thc, std::array<long, 4> t_pgrid, std::array<long, 4> t_bsize);
-    // LFF-Sigma Route 2 (L-6): the pair-resolved static-ladder vertex self-energy, evaluated on the READOUT instance
-    // (frozen secondary frame; W-bar_0 of this update, the W-bar cache on demand) and published as mb_state.dSigma_pair_tskab
+    // Sigma vertex, pol_vertex_sigma = "pair": the pair-resolved static-ladder vertex self-energy, evaluated on the
+    // READOUT instance (frozen secondary frame; W-bar_0 of this update, the W-bar cache on demand) and published as
+    // mb_state.dSigma_pair_tskab
     void build_sigma_pair(MBState &mb_state, THC_ERI auto &thc);
     // the interp file's column "Pi_<col>", q-matched to this mesh: (nw_half, nq, N_m, N_m), replicated (the read the
-    // injection and the Sigma vertex share; every check of the W-int-4f consumer applies)
+    // injection and the Sigma vertex share, with all of the consumer's consistency checks)
     nda::array<ComplexType, 4> read_pol_interp_column(std::string const &col, long nq_g, long nw_h_ft,
                                                       nda::array<long, 1> const &nu_half, THC_ERI auto &thc);
     // the q-matched columns already read this run, keyed by "<file>|<col>|<nq>" (the file is an input of the run: its
@@ -350,7 +350,7 @@ namespace solvers {
     template<nda::MemoryArrayOfRank<4> Array_t, typename communicator_t>
     void fold_rpa_pi_secondary(memory::darray_t<Array_t, communicator_t> &dPi_tqPQ, THC_ERI auto &thc);
     std::optional<nda::array<ComplexType, 4>> _sig_pi0_qwmm;
-    // eps(q_i, i nu) cuts (2026-09-11, pol_eps_cut > 0): the selected IBZ transfers (q_min plus
+    // eps(q_i, i nu) cuts (pol_eps_cut > 0): the selected IBZ transfers (q_min plus
     // evenly spaced |q| ranks, chosen once) and -- on RANK 0 ONLY -- the RPA Pi rows
     // (n_sel, nw_half, Np, Np) on every PH-sym bosonic half node, gathered at the same point
     // as _pol_pi0_qPQ (the PURE-RPA point) and consumed by the readout's cut report.
@@ -363,18 +363,17 @@ namespace solvers {
     nda::array<double, 2> _pol_eps_cut_qmin;
     template<nda::MemoryArrayOfRank<4> Array_t, typename communicator_t>
     void gather_cut_rows(THC_ERI auto &thc, memory::darray_t<Array_t, communicator_t> &dPi_tqPQ);
-    // Q4 (R-Q4-3): the PURE-RPA inu = 0 row stashed by eval_Pi_qdep at the point where the
+    // the PURE-RPA inu = 0 row stashed by eval_Pi_qdep at the point where the
     // ladder kernel is built. update_w's readout consumes it instead of gathering after
     // the corrections -- in edmft mode the post-correction Pi is NOT the readout baseline
-    // (the kernel is W-bar_0[P^RPA], R-Q3-1). Empty until the first ladder-readout pass.
+    // (the kernel is W-bar_0[P^RPA]). Empty until the first ladder-readout pass.
     nda::array<ComplexType, 3> _pol_pi0_qPQ;
-    // OPTIMIZATION INCREMENT A.1 (notes/ladder_opt_spec.md; profiling results section 1.2,
-    // shortlist item 1): the injection's inu = 0 ladder row, (nq_ibz, N_m, N_m), stashed by
+    // the injection's inu = 0 ladder row, (nq_ibz, N_m, N_m), stashed by
     // inject_pol_ladder and CONSUMED by pol_ladder_eps_readout instead of re-running the
     // whole pair-space ladder. eval_pol_ladder_whalf evaluates nu_h[j] = nw_b/2 + j and
-    // eval_pol_ladder_nu0 evaluates {nw_b/2}, so half node 0 IS the readout's node (the
-    // ladder_whalf_gate node_map_resid pins it); both calls sit in ONE update_w with the
-    // same G and the same W0bar (verified end-to-end: between eval_Pi_qdep and the readout
+    // eval_pol_ladder_nu0 evaluates {nw_b/2}, so half node 0 IS the readout's node
+    // (checked by ladder_whalf_gate); both calls sit in ONE update_w with the
+    // same G and the same W0bar (between eval_Pi_qdep and the readout
     // only dyson_W_from_Pi_tau / eps_inv_head_t / eval_cvv_eps_inv_head run, all read-only
     // on mb_state.sG_tskij, and _W0b_qmm is written only inside vertex_t::build_w0, which
     // runs once per iteration BEFORE the injection).
@@ -383,106 +382,106 @@ namespace solvers {
     // reaches eval_Pi_qdep directly, and that row must not survive into a later update_w),
     // and cleared again on consumption. Absent => the readout falls back to its own
     // eval_pol_ladder_nu0 call, which therefore stays fully functional for standalone
-    // callers (injection disabled, gates, tests).
+    // callers (injection disabled, tests).
     std::optional<nda::array<ComplexType, 3>> _pol_nu0_row;
-    // Tier 1.5: the inu = 0 row of Delta P^Lambda from the same whalf pass (legs = "ward")
+    // the inu = 0 row of Delta P^Lambda from the same whalf pass (legs = "ward")
     std::optional<nda::array<ComplexType, 3>> _pol_nu0_dlam;
-    // the L2 readout: ladder at nu = 0, upfold via the readout vertex's t(q), redo the
+    // the ladder eps_M readout: ladder at nu = 0, upfold via the readout vertex's t(q), redo the
     // single-frequency Dyson with P0 and P0 + dP_ladder, report eps_M(q) both ways.
     // eps_inv_head_q (the loop's OWN q-resolved eps^-1 head on the PH-sym tau half grid,
     // div-treatment independent) is optional: when given, the SAME q_min is converted to
-    // eps_M at inu = 0 and stored as the loop-side leg of gate Q3-b(i).
+    // eps_M at inu = 0 and stored as the loop-side value (_pol_eps_loop).
     void pol_ladder_eps_readout(MBState &mb_state, THC_ERI auto &thc,
                                 nda::array<ComplexType, 3> const &Pi0_qPQ,
                                 nda::array<ComplexType, 2> const *eps_inv_head_q = nullptr);
     // last readout values at q_min (RPA, +ladder); -1 before the first readout
     double _pol_eps_rpa = -1.0, _pol_eps_ladder = -1.0;
-    long _pol_inj_calls = 0;   // W-int-4f: injection call counter (the .pol_wh.g<n>.h5 dump generation)
-    double _pol_eps_dlam = -1.0;   // Tier 1.5: eps_M with chi0_Lambda alone (RPA + Delta P^Lambda)
-    // scGW-tilde Tier 2 full frequency (D3): the dynamic-rung columns at q_min, inu = 0
+    long _pol_inj_calls = 0;   // injection call counter (the .pol_wh.g<n>.h5 dump generation)
+    double _pol_eps_dlam = -1.0;   // eps_M with chi0_Lambda alone (RPA + Delta P^Lambda)
+    // the dynamic-rung columns at q_min, inu = 0
     double _pol_eps_dyn_static = -1.0, _pol_eps_dyn_pc = -1.0, _pol_eps_dyn_gam1 = -1.0, _pol_eps_dyn = -1.0;
     double _pol_dyn_ritz = -1.0;
-    // Q3: the LOOP's own eps_M(q_min, inu = 0) from eps_inv_head_q -- the other route of
-    // the Q3-b(i) identity (tau-Dyson of the injected Pi vs the readout's single-frequency
+    // the LOOP's own eps_M(q_min, inu = 0) from eps_inv_head_q -- the other evaluation route
+    // of the same quantity (tau-Dyson of the injected Pi vs the readout's single-frequency
     // Dyson). -1 before the first readout.
     double _pol_eps_loop = -1.0;
 
-    // Q3 I2 (notes/q3_bse_tier_spec.md section 4): inject the resummed ladder into the
+    // dump_pol_dyn_all_nu: the dynamic-rung ladder on all transfers x all PH-sym half nodes, written for
+    // coarse -> fine interpolation (<prefix>.pol_wh_dyn.g<gen>.h5).
+    // inject_pol_ladder: inject the resummed ladder into the
     // RPA polarizability IN PLACE -- P_latt = P^RPA + P^lad. The upfold and the nu -> tau
     // transform run on the LOCAL (P, Q) block only; no replicated (nu|t, q, Np, Np) array
-    // is ever formed. Called from update_w between the readout's build_w0 hook and the
-    // Dyson (ordering pinned by R-Q3-3).
-    void dump_pol_dyn_all_nu(MBState &mb_state, THC_ERI auto &thc, long gen);   // W-int-4f coarse side
+    // is ever formed. Called from eval_Pi_qdep as its last hook, after the readout's
+    // build_w0 and before the Dyson.
+    void dump_pol_dyn_all_nu(MBState &mb_state, THC_ERI auto &thc, long gen);
     template<nda::MemoryArrayOfRank<4> Array_t, typename communicator_t>
     void inject_pol_ladder(MBState &mb_state, THC_ERI auto &thc,
                            memory::darray_t<Array_t, communicator_t> &dPi_tqPQ);
-    // Q3 injection meters of the last update_w: the watchdog rho(Xh Kt) at inu = 0 and its
+    // injection meters of the last update_w: the watchdog rho(Xh Kt) at inu = 0 and its
     // max over nu, the nu -> tau -> nu round-trip residual, and ||P^lad||/||P^RPA||.
     double _pol_lam_nu0 = -1.0, _pol_lam_max = -1.0;
     double _pol_r_rt = -1.0, _pol_lad_ratio = -1.0;
 
-    // Q4 C3 (notes/q4_edmft_skeleton_spec.md, ruling R-Q4-2): the ladder half of the eq-7
-    // bosonic DC, P^lad_loc = (1/N_q) sum_q B(q)^dag [t^dag Pl t](q) B(q). Stored on
+    // the ladder half of the bosonic double counting (THC-adjoint form, a diagnostic),
+    // P^lad_loc = (1/N_q) sum_q B(q)^dag [t^dag Pl t](q) B(q). Stored on
     // mb_state.sPi_lad_loc_wabcd; run from inject_pol_ladder whenever a bosonic projector
     // is present. Single impurity (the upfold it is the adjoint of is single-impurity).
     void accumulate_pi_lad_loc(MBState &mb_state, THC_ERI auto &thc,
                                nda::array<ComplexType, 4> const &Pl,
                                nda::array<ComplexType, 3> const &tmap);
-    // ||P^lad_loc||_max, ||P_dc,bubble||_max and their ratio at the last injection
-    // (gate Q4-c3(iii)); -1 when never measured / no bubble P_dc was present.
+    // ||P^lad_loc||_max, ||P_dc,bubble||_max and their ratio at the last injection;
+    // -1 when never measured / no bubble P_dc was present.
     double _pol_lad_loc_max = -1.0, _pol_dc_bubble_max = -1.0, _pol_lad_loc_ratio = -1.0;
 
-    // Q4-C3b (notes/q4_c3b_orbital_ladder_dc_spec.md): the eq-7 ladder DC PROPER -- the
+    // the ladder double counting PROPER -- the
     // orbital/chi-convention local part of the same lattice ladder, on
     // mb_state.sPi_lad_loc_orb_wabcd. Extracts the MLWF legs U(k) from
     // proj_boson.proj_fermi() (window containment checked), evaluates the E-leg ladder and
     // q-averages it with the SAME star/trev rule as accumulate_pi_lad_loc.
     void accumulate_pi_lad_loc_orb(MBState &mb_state, THC_ERI auto &thc);
     // ||P^lad_loc,orb||_max and its ratio to ||P_dc,bubble||_max at the last injection
-    // (gate G4: the amendment predicts O(1), i.e. a ratio of order 1); -1 when never
-    // measured / no bubble P_dc was present.
+    // (expected to be of order 1); -1 when never measured / no bubble P_dc was present.
     double _pol_lad_loc_orb_max = -1.0, _pol_lad_loc_orb_ratio = -1.0;
 
   public:
-    // scGW-tilde L2: the last ladder eps_M readout (RPA, +ladder) at q_min
+    // the last ladder eps_M readout (RPA, +ladder) at q_min
     std::pair<double, double> pol_eps_readout() const {
       return {_pol_eps_rpa, _pol_eps_ladder};
     }
-    // Tier 1.5: the "+DeltaLambda" column (RPA + the zero-rung Lambda term) at q_min;
+    // the "+DeltaLambda" column (RPA + the zero-rung Lambda term) at q_min;
     // -1 unless pol_vertex_legs = "ward"
     double pol_eps_dlam() const { return _pol_eps_dlam; }
-    /** Tier 2 (D3): eps_M(q_min, inu = 0) with the dynamic-rung ladder columns: {static
+    /** eps_M(q_min, inu = 0) with the dynamic-rung ladder columns: {static
      *  (sign-corrected), static + one dynamic rung, Gamma_1, resummed}; -1 when not run. */
     std::array<double, 4> pol_eps_dyn() const {
       return {_pol_eps_dyn_static, _pol_eps_dyn_pc, _pol_eps_dyn_gam1, _pol_eps_dyn};
     }
     double pol_dyn_ritz() const { return _pol_dyn_ritz; }
-    // Q3: the loop-side eps_M(q_min, inu = 0) of the same iteration (gate Q3-b(i))
+    // the loop-side eps_M(q_min, inu = 0) of the same iteration
     double pol_eps_loop() const { return _pol_eps_loop; }
     /** eps(q_i, i nu) cuts: the last cut at q_min on rank 0, (nw_half, 8) columns
      *  {RPA, +ladder, +DeltaLambda (-1 unless legs = ward), loop-side (-1 if absent), then the
      *  dynamic-rung columns static / static+dyn1 / Gamma_1 / resummed (-1 unless rung = dynamic)};
      *  empty on other ranks and before the first cut. */
     nda::array<double, 2> const &pol_eps_cut_qmin() const { return _pol_eps_cut_qmin; }
-    // Q3: the last injection's watchdog / meter values (gate Q3-c); -1 if never injected
+    // the last injection's watchdog / meter values; -1 if never injected
     double pol_lambda_nu0() const { return _pol_lam_nu0; }
     double pol_lambda_max() const { return _pol_lam_max; }
     double pol_round_trip() const { return _pol_r_rt; }
     double pol_ladder_ratio() const { return _pol_lad_ratio; }
-    // Q4 C3 gate (iii): the ladder column of the cancellation-load meter
+    // the ladder column of the double-counting cancellation-load meter
     double pol_lad_loc_max() const { return _pol_lad_loc_max; }
     double pol_dc_bubble_max() const { return _pol_dc_bubble_max; }
     double pol_lad_loc_ratio() const { return _pol_lad_loc_ratio; }
-    // Q4-C3b gate G4: the scale of the eq-7 ladder DC proper
+    // the scale of the orbital-convention ladder double counting
     double pol_lad_loc_orb_max() const { return _pol_lad_loc_orb_max; }
     double pol_lad_loc_orb_ratio() const { return _pol_lad_loc_orb_ratio; }
-    // Q3 gates (spec section 5 Q3-c/Q3-d): the PRIVATE ladder instance, so a test can
-    // re-run the anchor identity on the very state the loop used. nullptr before the
-    // first update_w with an active pol vertex.
+    // the PRIVATE ladder instance, so a test can re-run checks on the very state the loop
+    // used. nullptr before the first update_w with an active pol vertex.
     vertex_t* pol_vertex_instance() { return _pol_vtx.get(); }
-    // LFF-Sigma meters of the last build_sigma_lff (gate + logs)
+    // meters of the last build_sigma_lff (tests + logs)
     std::array<double, 4> sigma_lff_meter() const { return _sig_lff_meter; }
-    // LFF-Sigma pair (L-6) meters of the last build_sigma_pair (gate + logs)
+    // meters of the last build_sigma_pair (tests + logs)
     std::array<double, 4> sigma_pair_meter() const { return _sig_pair_meter; }
 
   private:
@@ -531,7 +530,7 @@ namespace solvers {
     // boundary so Pi^C can use the previous iteration's screened W: an active vertex
     // on the GLOBAL auxiliary basis (or with the W-bar cache disabled). With the
     // SECONDARY basis the downfolded rung is cached at the update_w tail instead
-    // (vertex_t::cache_w, notes/wbar_cache.md) and dW is freed unconditionally --
+    // (vertex_t::cache_w) and dW is freed unconditionally --
     // plain-GW memory profile. Defined in the .cpp.
     bool needs_dw_retention() const;
     // true iff an attached active vertex already has a SCREENED rung available for
